@@ -1,0 +1,84 @@
+{
+  "observations": [],
+  "latestAdmissionDiagnostics": {
+    "disabled": false,
+    "matrixAdmissionInvoked": true,
+    "lastAdmissionAt": "2026-06-11T03:31:52.676Z",
+    "lastScanBatchId": "2026-06-11T03:31:52.676Z",
+    "candidatesSeen": 20,
+    "candidatesEvaluated": 20,
+    "observationsCreated": 0,
+    "duplicateSuppressed": 0,
+    "rejectedTotal": 2430,
+    "rejectedByReason": [
+      {
+        "reason": "MISSING_STOP_LOSS",
+        "count": 400
+      },
+      {
+        "reason": "MISSING_TP1",
+        "count": 400
+      },
+      {
+        "reason": "COST_R_ABOVE_LIMIT",
+        "count": 340
+      },
+      {
+        "reason": "NOT_CONTROLLER_ALIGNED",
+        "count": 320
+      },
+      {
+        "reason": "STOP_DISTANCE_BELOW_VARIANT_ADJUSTED_GUARD",
+        "count": 320
+      },
+      {
+        "reason": "STOP_DISTANCE_BELOW_LIMIT",
+        "count": 220
+      },
+      {
+        "reason": "SYMBOL_NOT_INCLUDED",
+        "count": 114
+      },
+      {
+        "reason": "DIRECTION_MISMATCH",
+        "count": 80
+      },
+      {
+        "reason": "REGIME_FAMILY_MISMATCH",
+        "count": 60
+      },
+      {
+        "reason": "TREND_ALIGNMENT_MISMATCH",
+        "count": 60
+      },
+      {
+        "reason": "KRONOS_AGREEMENT_MISMATCH",
+        "count": 40
+      },
+      {
+        "reason": "WHALE_AGREEMENT_MISMATCH",
+        "count": 40
+      },
+      {
+        "reason": "HORIZON_CONFLICT_MISMATCH",
+        "count": 20
+      },
+      {
+        "reason": "SYMBOL_EXCLUDED",
+        "count": 16
+      }
+    ],
+    "fieldMissingCounts": {
+      "costR": 20,
+      "stopDistanceBps": 20,
+      "trendAligned": 20,
+      "horizonConflict": 20,
+      "stopLoss": 20,
+      "takeProfitLevels": 20
+    },
+    "env": {
+      "PARALLEL_SHADOW_EXPERIMENTS_DISABLED": null,
+      "EXPERIMENT_MATRIX_DISABLED": null
+    }
+  }
+}

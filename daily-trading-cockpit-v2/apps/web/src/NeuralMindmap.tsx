@@ -1,0 +1,744 @@
+import { useEffect, useMemo, useState } from 'react';
+import './neural-mindmap.css';
+
+type NeuralHealth = 'HEALTHY' | 'ACTIVE' | 'WARNING' | 'CRITICAL' | 'IDLE' | 'COLLECTING' | 'QUARANTINE';
+type NeuralDiagnosisCategory =
+  | 'HEALTHY_FLOW'
+  | 'COLLECTING_EVIDENCE'
+  | 'IDLE'
+  | 'LATENCY'
+  | 'DEGRADED_INPUT'
+  | 'CAPACITY_PRESSURE'
+  | 'QUARANTINE'
+  | 'HARD_FAIL'
+  | 'DESTRUCTIVE_ECONOMICS'
+  | 'BLOCKING_CONDITION';
+
+interface NeuralNode {
+  id: string;
+  label: string;
+  kind: string;
+  health: NeuralHealth;
+  active: boolean;
+  metric: string;
+  diagnosisCategory: NeuralDiagnosisCategory;
+  diagnosisSummary: string;
+  diagnosisFacts: string[];
+  detail: string[];
+}
+
+interface NeuralLane {
+  id: string;
+  label: string;
+  health: NeuralHealth;
+  evidenceHealth: NeuralHealth;
+  active: boolean;
+  open: number;
+  closed: number;
+  netAvgR: number | null;
+  pf: number | null;
+  wr: number | null;
+  headlinePnl: number;
+  diagnosticPnl: number;
+  totalPnl: number;
+  startingEquity: number;
+  totalPnlPct: number | null;
+  headlinePnlPct: number | null;
+  status: string;
+  reason: string;
+}
+
+interface NeuralTelemetry {
+  version: string;
+  generatedAt: string;
+  staleAfterSec: number;
+  controller: {
+    regime: string | null;
+    mode: string;
+    bias: string;
+    confidence: string;
+    allowsLong: boolean;
+    allowsShort: boolean;
+    allowsNewEntries: boolean;
+    reasons: string[];
+  };
+  safety: { liveBlocked: true; microPilotAllowed: false; paperOnly: true };
+  scan: {
+    status: string;
+    running: boolean;
+    lastFinishedAt: string | null;
+    totalMs: number | null;
+    slowestStage: string | null;
+    slowestStageMs: number | null;
+    timeoutSymbols: number;
+    degradedProviders: string[];
+    backgroundLagSec: number | null;
+  };
+  paper: {
+    total: number;
+    open: number;
+    closed: number;
+    wins: number;
+    losses: number;
+    headlinePnl: number;
+    diagnosticPnl: number;
+    totalPnl: number;
+    todayPnl: number;
+    headlineNetAvgR: number | null;
+    headlinePF: number | null;
+    headlineWR: number | null;
+  };
+  mixed: {
+    activeLane: string | null;
+    activeLanes: string[];
+    tradingMode: string;
+    admission: string;
+    occupancyMode: string;
+    stalePassHealth: string;
+    budgetProfile: string;
+    guardrailStatus: string;
+    recommendedAction: string;
+    waitForCapacity: number;
+  };
+  nodes: NeuralNode[];
+  lanes: NeuralLane[];
+  alerts: Array<{ severity: 'WARNING' | 'CRITICAL'; source: string; message: string }>;
+}
+
+interface NeuralMindmapProps {
+  onOpenScanner: () => void;
+  onOpenPerformance: () => void;
+}
+
+interface Point {
+  x: number;
+  y: number;
+}
+
+interface ProcessGuide {
+  purpose: string;
+  steps: string[];
+  healthyMeans: string;
+  inspectWhenBad: string[];
+}
+
+const NODE_POSITIONS: Record<string, Point> = {
+  binance: { x: 110, y: 160 },
+  kronos: { x: 110, y: 300 },
+  external: { x: 110, y: 440 },
+  scan: { x: 330, y: 300 },
+  scoring: { x: 520, y: 300 },
+  controller: { x: 700, y: 230 },
+  'lane-router': { x: 700, y: 390 },
+  occupancy: { x: 880, y: 390 },
+  paper: { x: 1245, y: 300 },
+  outcomes: { x: 1245, y: 470 },
+  guardrail: { x: 880, y: 600 },
+  'live-lock': { x: 700, y: 650 },
+};
+
+const CORE_EDGES: Array<[string, string]> = [
+  ['binance', 'scan'],
+  ['kronos', 'scan'],
+  ['external', 'scan'],
+  ['scan', 'scoring'],
+  ['scoring', 'controller'],
+  ['controller', 'lane-router'],
+  ['lane-router', 'occupancy'],
+  ['occupancy', 'guardrail'],
+  ['guardrail', 'lane-router'],
+  ['paper', 'outcomes'],
+  ['outcomes', 'controller'],
+  ['live-lock', 'controller'],
+  ['live-lock', 'paper'],
+];
+
+const HEALTH_LABELS: Record<NeuralHealth, string> = {
+  HEALTHY: 'Healthy',
+  ACTIVE: 'Active flow',
+  WARNING: 'Degraded',
+  CRITICAL: 'Blocked / failing',
+  IDLE: 'Idle',
+  COLLECTING: 'Collecting evidence',
+  QUARANTINE: 'Quarantined (benched)',
+};
+
+const PROCESS_GUIDES: Record<string, ProcessGuide> = {
+  binance: {
+    purpose: 'Supplies candles and market state for every symbol entering the scan.',
+    steps: ['Request symbol candles', 'Apply timeout and retry policy', 'Validate latest candle', 'Forward usable symbols to the scan'],
+    healthyMeans: 'All required symbols returned valid, recent candles inside the timeout budget.',
+    inspectWhenBad: ['Check timeout symbol count', 'Inspect candle failure reasons', 'Check Binance retry and provider wait time'],
+  },
+  kronos: {
+    purpose: 'Adds forecast direction, probability, horizon agreement, and forecast risk.',
+    steps: ['Build forecast input window', 'Call Kronos sidecar', 'Validate prediction shape', 'Attach forecast evidence to candidate'],
+    healthyMeans: 'Forecasts return within budget and valid horizon evidence is available.',
+    inspectWhenBad: ['Check Kronos forecast duration', 'Check sidecar reachability', 'Inspect prediction failure or model-busy counts'],
+  },
+  external: {
+    purpose: 'Collects external signal overlays without blocking the whole scan when a provider degrades.',
+    steps: ['Request configured providers', 'Apply per-provider timeout', 'Use safe fallback when available', 'Attach missing-data markers'],
+    healthyMeans: 'Providers respond inside their timeout and no circuit breaker is active.',
+    inspectWhenBad: ['Inspect degraded provider names', 'Check external fetch duration', 'Check circuit-breaker skip cycles'],
+  },
+  scan: {
+    purpose: 'Coordinates symbol fetches and produces the latest ranked market candidate batch.',
+    steps: ['Fan out symbol fetches', 'Accept healthy partial results', 'Build candidate inputs', 'Publish scan batch and timing diagnostics'],
+    healthyMeans: 'The scan completes inside its normal latency band without hang markers or excessive symbol failures.',
+    inspectWhenBad: ['Inspect slowest stage', 'Inspect failed symbols', 'Check hang markers and provider degradation'],
+  },
+  scoring: {
+    purpose: 'Scores direction, opportunity, danger, confidence, liquidity, and volatility.',
+    steps: ['Normalize candidate inputs', 'Compute directional scores', 'Apply evidence and conflict diagnostics', 'Rank candidate set'],
+    healthyMeans: 'Scoring completes quickly and every candidate has valid decision metadata.',
+    inspectWhenBad: ['Check missing candidate metadata', 'Inspect source conflicts', 'Check candidate scoring duration'],
+  },
+  controller: {
+    purpose: 'Converts the current regime into directional posture and entry permissions.',
+    steps: ['Classify market regime', 'Choose directional bias', 'Set controller mode', 'Publish allowed directions and confidence'],
+    healthyMeans: 'Regime classification is known and the posture is internally consistent.',
+    inspectWhenBad: ['Inspect regime reason codes', 'Check whether mode and bias agree', 'Check whether entry permission is intentionally restricted'],
+  },
+  'lane-router': {
+    purpose: 'Maps qualified candidates into strategy lanes appropriate for the current regime.',
+    steps: ['Read controller posture', 'Evaluate lane qualification', 'Apply mixed-router rescue rules', 'Select active paper lane set'],
+    healthyMeans: 'Qualified candidates map to an eligible lane with an explicit route reason.',
+    inspectWhenBad: ['Check active lane list', 'Inspect qualification and route decision', 'Check whether a lane is quarantined'],
+  },
+  occupancy: {
+    purpose: 'Prevents an otherwise good signal from overcrowding the paper book.',
+    steps: ['Count open and stale positions', 'Check symbol and direction concentration', 'Compare against active budget', 'Allow, reduce risk, or wait'],
+    healthyMeans: 'The book is inside budget and qualified signals retain capacity.',
+    inspectWhenBad: ['Check open versus stale counts', 'Check WAIT_FOR_CAPACITY reason', 'Inspect per-symbol and directional pressure'],
+  },
+  paper: {
+    purpose: 'Creates and tracks paper-only orders after routing and admission.',
+    steps: ['Validate paper opportunity', 'Apply paper risk multiplier', 'Create deduplicated paper order', 'Track open and closed lifecycle'],
+    healthyMeans: 'Orders are created only from eligible admissions and resolve without data failures.',
+    inspectWhenBad: ['Check paper data failures', 'Inspect no-order reason', 'Check order provenance and dedupe'],
+  },
+  outcomes: {
+    purpose: 'Resolves open paper orders against candle paths and records their outcomes.',
+    steps: ['Queue open orders', 'Fetch resolution candles', 'Walk fill and exit path', 'Persist paper outcome metrics'],
+    healthyMeans: 'The background queue completes with low lag and no resolution errors.',
+    inspectWhenBad: ['Check queue lag', 'Inspect outcome-checker status', 'Inspect last background error'],
+  },
+  guardrail: {
+    purpose: 'Monitors the paper-only mixed budget experiment and recommends keep, review, or rollback.',
+    steps: ['Count profile decisions', 'Aggregate closed OOS results', 'Evaluate PF, net R, WR, and capacity pressure', 'Publish recommended action'],
+    healthyMeans: 'Enough OOS exists and profile economics remain positive with acceptable capacity pressure.',
+    inspectWhenBad: ['Read guardrail reasons', 'Check OOS sample size', 'Check PF, net average R, and capacity spike'],
+  },
+  'live-lock': {
+    purpose: 'Keeps every experiment isolated from live trading and exchange execution.',
+    steps: ['Force paper-only scope', 'Block live execution', 'Disable micro-pilot', 'Expose lock state to operators'],
+    healthyMeans: 'liveBlocked remains true and microPilotAllowed remains false.',
+    inspectWhenBad: ['Stop the process immediately', 'Verify environment safety flags', 'Audit exchange call paths'],
+  },
+};
+
+function compactLaneLabel(label: string): string {
+  return label.slice(0, 24);
+}
+
+function fmtNumber(value: number | null, digits = 2): string {
+  if (value === null || !Number.isFinite(value)) return 'n/a';
+  if (value === Infinity) return 'inf';
+  return value.toFixed(digits);
+}
+
+function fmtR(value: number | null): string {
+  if (value === null || !Number.isFinite(value)) return 'n/a';
+  return `${value >= 0 ? '+' : ''}${value.toFixed(3)}R`;
+}
+
+function fmtMoney(value: number): string {
+  return `NT$ ${Math.round(value).toLocaleString('id-ID')}`;
+}
+
+function fmtPct(value: number | null): string {
+  if (value === null || !Number.isFinite(value)) return 'n/a';
+  return `${value >= 0 ? '+' : ''}${value.toFixed(1)}%`;
+}
+
+function fmtMs(value: number | null): string {
+  if (value === null || !Number.isFinite(value)) return 'n/a';
+  return value >= 1000 ? `${(value / 1000).toFixed(value >= 10_000 ? 1 : 2)}s` : `${Math.round(value)}ms`;
+}
+
+function laneDiagnosis(lane: NeuralLane): string {
+  if (lane.totalPnl > 0) return 'This lane is profitable on paper, so the lane field renders it green.';
+  if (lane.totalPnl < 0) return 'This lane is losing money on paper, so the lane field renders it red.';
+  if (lane.closed > 0 || lane.open > 0) return 'This lane has activity, but realized paper profit is still flat.';
+  return 'This lane has not built realized paper performance yet.';
+}
+
+function laneMetricLabel(lane: NeuralLane): string {
+  if (lane.totalPnl > 0 && lane.totalPnlPct !== null) {
+    return `${fmtPct(lane.totalPnlPct)} / n=${lane.closed}`;
+  }
+  return `${fmtMoney(lane.totalPnl)} / n=${lane.closed}`;
+}
+
+function edgePath(from: Point, to: Point): string {
+  const bend = Math.max(45, Math.abs(to.x - from.x) * 0.42);
+  return `M ${from.x} ${from.y} C ${from.x + bend} ${from.y}, ${to.x - bend} ${to.y}, ${to.x} ${to.y}`;
+}
+
+function healthRank(health: NeuralHealth): number {
+  // QUARANTINE is a benched/neutral state, not a fault — ranks below WARNING so it never inflates
+  // the critical/warning counts.
+  return health === 'CRITICAL' ? 5 : health === 'WARNING' ? 4 : health === 'ACTIVE' ? 3 : health === 'HEALTHY' ? 2 : 1;
+}
+
+function healthDiagnosis(health: NeuralHealth): string {
+  if (health === 'CRITICAL') return 'A hard failure, quarantine, destructive economics, or blocking condition is active.';
+  if (health === 'WARNING') return 'The component is operating with degraded input, latency, or capacity pressure.';
+  if (health === 'COLLECTING') return 'The component is functioning, but evidence is not mature enough for a stable verdict.';
+  if (health === 'QUARANTINE') return 'The lane is benched (no new admissions) but still measured via the VM simulation; it can graduate back if its evidence turns healthy.';
+  if (health === 'IDLE') return 'The component is intentionally inactive under the current regime or workflow.';
+  if (health === 'ACTIVE') return 'The component is healthy and currently carrying decision flow.';
+  return 'The component is healthy and no material fault is currently reported.';
+}
+
+const DIAGNOSIS_LABELS: Record<NeuralDiagnosisCategory, string> = {
+  HEALTHY_FLOW: 'Healthy flow',
+  COLLECTING_EVIDENCE: 'Collecting evidence',
+  IDLE: 'Idle',
+  LATENCY: 'Latency',
+  DEGRADED_INPUT: 'Degraded input',
+  CAPACITY_PRESSURE: 'Capacity pressure',
+  QUARANTINE: 'Quarantine',
+  HARD_FAIL: 'Hard fail',
+  DESTRUCTIVE_ECONOMICS: 'Destructive economics',
+  BLOCKING_CONDITION: 'Blocking condition',
+};
+
+export default function NeuralMindmap({ onOpenScanner, onOpenPerformance }: NeuralMindmapProps) {
+  const [telemetry, setTelemetry] = useState<NeuralTelemetry | null>(null);
+  const [selectedId, setSelectedId] = useState('controller');
+  const [autoRefresh, setAutoRefresh] = useState(true);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [lastReceivedAt, setLastReceivedAt] = useState<number | null>(null);
+
+  async function loadTelemetry() {
+    try {
+      const response = await fetch('/api/shadow/neural-map', { cache: 'no-store' });
+      if (!response.ok) throw new Error(`Telemetry request failed (${response.status})`);
+      const next = await response.json() as NeuralTelemetry;
+      setTelemetry(next);
+      setLastReceivedAt(Date.now());
+      setError(null);
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : 'Neural telemetry unavailable');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    void loadTelemetry();
+  }, []);
+
+  useEffect(() => {
+    if (!autoRefresh) return undefined;
+    const timer = window.setInterval(() => void loadTelemetry(), 5_000);
+    return () => window.clearInterval(timer);
+  }, [autoRefresh]);
+
+  const lanePositions = useMemo(() => {
+    const positions = new Map<string, Point>();
+    const lanes = telemetry?.lanes ?? [];
+    const gap = lanes.length > 1 ? Math.min(88, 430 / (lanes.length - 1)) : 0;
+    lanes.forEach((lane, index) => positions.set(lane.id, { x: 1055, y: 100 + index * gap }));
+    return positions;
+  }, [telemetry?.lanes]);
+
+  const nodesById = useMemo(
+    () => new Map((telemetry?.nodes ?? []).map((node) => [node.id, node])),
+    [telemetry?.nodes],
+  );
+
+  const selectedNode = nodesById.get(selectedId) ?? null;
+  const selectedLane = telemetry?.lanes.find((lane) => lane.id === selectedId) ?? null;
+  const selectedGuide = selectedNode ? PROCESS_GUIDES[selectedNode.id] : null;
+  const newestAgeSec = lastReceivedAt === null ? Infinity : Math.round((Date.now() - lastReceivedAt) / 1000);
+  const stale = newestAgeSec > (telemetry?.staleAfterSec ?? 30) || Boolean(error);
+  const criticalCount = (telemetry?.nodes.filter((node) => node.health === 'CRITICAL').length ?? 0) +
+    (telemetry?.lanes.filter((lane) => lane.health === 'CRITICAL').length ?? 0);
+  const warningCount = (telemetry?.nodes.filter((node) => node.health === 'WARNING').length ?? 0) +
+    (telemetry?.lanes.filter((lane) => lane.health === 'WARNING').length ?? 0);
+
+  const neuralEdges = useMemo(() => {
+    if (!telemetry) return [];
+    const laneEdges: Array<[string, string]> = [];
+    for (const lane of telemetry.lanes) {
+      laneEdges.push(['occupancy', lane.id], [lane.id, 'paper']);
+    }
+    return [...CORE_EDGES, ...laneEdges];
+  }, [telemetry]);
+
+  function positionOf(id: string): Point | null {
+    return NODE_POSITIONS[id] ?? lanePositions.get(id) ?? null;
+  }
+
+  function healthOf(id: string): NeuralHealth {
+    return nodesById.get(id)?.health ?? telemetry?.lanes.find((lane) => lane.id === id)?.health ?? 'IDLE';
+  }
+
+  const selectedConnections = useMemo(() => {
+    if (!telemetry || (!selectedNode && !selectedLane)) return { inputs: [] as string[], outputs: [] as string[] };
+    const id = selectedNode?.id ?? selectedLane?.id ?? '';
+    const edges = [
+      ...CORE_EDGES,
+      ...telemetry.lanes.flatMap((lane): Array<[string, string]> => [['occupancy', lane.id], [lane.id, 'paper']]),
+    ];
+    const labelOf = (nodeId: string) =>
+      nodesById.get(nodeId)?.label ?? telemetry.lanes.find((lane) => lane.id === nodeId)?.label ?? nodeId;
+    return {
+      inputs: edges.filter(([, to]) => to === id).map(([from]) => labelOf(from)),
+      outputs: edges.filter(([from]) => from === id).map(([, to]) => labelOf(to)),
+    };
+  }, [nodesById, selectedLane, selectedNode, telemetry]);
+
+  return (
+    <div className="neural-shell">
+      <header className="neural-topbar">
+        <div className="neural-brand">
+          <span className={`neural-live-dot ${stale ? 'is-stale' : ''}`} />
+          <div>
+            <p>Kronos system intelligence</p>
+            <h1>Neural Map</h1>
+          </div>
+        </div>
+        <nav className="neural-nav" aria-label="Dashboard views">
+          <button type="button" className="is-current">Neural Map</button>
+          <button type="button" onClick={onOpenScanner}>Scanner</button>
+          <button type="button" onClick={onOpenPerformance}>Performance</button>
+        </nav>
+        <div className="neural-actions">
+          <label className="neural-toggle">
+            <input type="checkbox" checked={autoRefresh} onChange={(event) => setAutoRefresh(event.target.checked)} />
+            <span />
+            Live
+          </label>
+          <button type="button" className="neural-icon-button" title="Refresh telemetry" aria-label="Refresh telemetry" onClick={() => void loadTelemetry()}>
+            ↻
+          </button>
+        </div>
+      </header>
+
+      <section className="neural-statusbar">
+        <div>
+          <span>Regime</span>
+          <strong>{telemetry?.controller.regime ?? 'Connecting'}</strong>
+          <small>{telemetry?.controller.mode ?? 'UNKNOWN'} / {telemetry?.controller.bias ?? 'UNKNOWN'}</small>
+        </div>
+        <div>
+          <span>System pulse</span>
+          <strong className={criticalCount > 0 ? 'tone-critical' : warningCount > 0 ? 'tone-warning' : 'tone-healthy'}>
+            {criticalCount > 0 ? `${criticalCount} critical` : warningCount > 0 ? `${warningCount} degraded` : 'Nominal'}
+          </strong>
+          <small>{stale ? 'telemetry stale' : `updated ${new Date(telemetry?.generatedAt ?? Date.now()).toLocaleTimeString()}`}</small>
+        </div>
+        <div>
+          <span>Paper brain</span>
+          <strong>{telemetry ? `${telemetry.paper.open} open / ${telemetry.paper.closed} closed` : 'Loading'}</strong>
+          <small>{telemetry ? `${telemetry.paper.wins}W ${telemetry.paper.losses}L` : 'paper only'}</small>
+        </div>
+        <div>
+          <span>Total paper PnL</span>
+          <strong className={(telemetry?.paper.totalPnl ?? 0) >= 0 ? 'tone-healthy' : 'tone-critical'}>
+            {telemetry ? fmtMoney(telemetry.paper.totalPnl) : 'n/a'}
+          </strong>
+          <small>today {telemetry ? fmtMoney(telemetry.paper.todayPnl) : 'n/a'}</small>
+        </div>
+        <div>
+          <span>Safety</span>
+          <strong className="tone-healthy">Live blocked</strong>
+          <small>micro-pilot disabled</small>
+        </div>
+      </section>
+
+      {error && (
+        <div className="neural-error">
+          <strong>Telemetry link interrupted</strong>
+          <span>{error}. The last known state remains visible.</span>
+        </div>
+      )}
+
+      <main className="neural-workspace">
+        <section className="neural-canvas-panel" aria-label="Live bot neural system map">
+          {loading && !telemetry ? (
+            <div className="neural-loading"><span />Connecting to bot telemetry...</div>
+          ) : (
+            <div className="neural-canvas-scroll">
+              <svg className="neural-map" viewBox="0 0 1380 760" role="img" aria-label="Animated neural map of bot inputs, controller, lanes, and paper execution">
+                <defs>
+                  <pattern id="neural-grid" width="36" height="36" patternUnits="userSpaceOnUse">
+                    <path d="M 36 0 L 0 0 0 36" className="neural-grid-line" />
+                  </pattern>
+                </defs>
+                <rect width="1380" height="760" fill="url(#neural-grid)" />
+                <text x="65" y="60" className="neural-zone-label">INPUT LAYER</text>
+                <text x="292" y="60" className="neural-zone-label">INFERENCE PIPELINE</text>
+                <text x="655" y="60" className="neural-zone-label">DECISION CORE</text>
+                <text x="1008" y="60" className="neural-zone-label">LANE FIELD</text>
+                <text x="1190" y="60" className="neural-zone-label">PAPER OUTPUT</text>
+
+                <g className="neural-edges">
+                  {neuralEdges.map(([fromId, toId], index) => {
+                    const from = positionOf(fromId);
+                    const to = positionOf(toId);
+                    if (!from || !to) return null;
+                    const sourceHealth = healthOf(fromId);
+                    const targetHealth = healthOf(toId);
+                    const health = healthRank(targetHealth) > healthRank(sourceHealth) ? targetHealth : sourceHealth;
+                    const path = edgePath(from, to);
+                    const flowing = nodesById.get(fromId)?.active || nodesById.get(toId)?.active ||
+                      telemetry?.lanes.find((lane) => (lane.id === fromId || lane.id === toId) && lane.active);
+                    return (
+                      <g key={`${fromId}-${toId}`} className={`neural-edge health-${health.toLowerCase()} ${flowing ? 'is-flowing' : ''}`}>
+                        <path d={path} className="neural-edge-base" />
+                        <path d={path} className="neural-edge-signal" style={{ animationDelay: `${index * -0.19}s` }} />
+                      </g>
+                    );
+                  })}
+                </g>
+
+                {(telemetry?.nodes ?? []).map((node) => {
+                  const point = positionOf(node.id);
+                  if (!point) return null;
+                  const central = node.id === 'controller';
+                  return (
+                    <g
+                      key={node.id}
+                      className={`neural-node health-${node.health.toLowerCase()} ${node.active ? 'is-active' : ''} ${selectedId === node.id ? 'is-selected' : ''}`}
+                      transform={`translate(${point.x} ${point.y})`}
+                      role="button"
+                      tabIndex={0}
+                      aria-label={`${node.label}: ${node.metric}`}
+                      onClick={() => setSelectedId(node.id)}
+                      onKeyDown={(event) => {
+                        if (event.key === 'Enter' || event.key === ' ') setSelectedId(node.id);
+                      }}
+                    >
+                      <circle className="neural-node-halo" r={central ? 62 : 48} />
+                      <circle className="neural-node-core" r={central ? 48 : 38} />
+                      <circle className="neural-node-pulse" r={central ? 53 : 43} />
+                      <text y={central ? -5 : -4} className="neural-node-title">{node.label}</text>
+                      <text y={central ? 16 : 15} className="neural-node-metric">{node.metric.slice(0, 22)}</text>
+                    </g>
+                  );
+                })}
+
+                {(telemetry?.lanes ?? []).map((lane) => {
+                  const point = lanePositions.get(lane.id);
+                  if (!point) return null;
+                  return (
+                    <g
+                      key={lane.id}
+                      className={`neural-lane health-${lane.health.toLowerCase()} ${lane.active ? 'is-active' : ''} ${selectedId === lane.id ? 'is-selected' : ''}`}
+                      transform={`translate(${point.x} ${point.y})`}
+                      role="button"
+                      tabIndex={0}
+                      aria-label={`${lane.label}: ${lane.status}`}
+                      onClick={() => setSelectedId(lane.id)}
+                      onKeyDown={(event) => {
+                        if (event.key === 'Enter' || event.key === ' ') setSelectedId(lane.id);
+                      }}
+                    >
+                      <rect x="-80" y="-29" width="160" height="58" rx="5" className="neural-lane-body" />
+                      <circle cx="-62" cy="0" r="5" className="neural-lane-led" />
+                      <text x="-48" y="-5" className="neural-lane-title">{compactLaneLabel(lane.label)}</text>
+                      <text x="-48" y="14" className="neural-lane-metric">{laneMetricLabel(lane)}</text>
+                    </g>
+                  );
+                })}
+              </svg>
+            </div>
+          )}
+          <div className="neural-legend">
+            {(Object.keys(HEALTH_LABELS) as NeuralHealth[]).map((health) => (
+              <span key={health}><i className={`health-${health.toLowerCase()}`} />{HEALTH_LABELS[health]}</span>
+            ))}
+          </div>
+        </section>
+
+        <aside className="neural-inspector">
+          <div className="neural-inspector-heading">
+            <span>{selectedLane ? 'Lane intelligence' : selectedNode?.kind ?? 'System node'}</span>
+            <strong>{selectedLane?.label ?? selectedNode?.label ?? 'Select a node'}</strong>
+            {(selectedLane || selectedNode) && (
+              <em className={`health-${(selectedLane?.health ?? selectedNode?.health ?? 'IDLE').toLowerCase()}`}>
+                {HEALTH_LABELS[selectedLane?.health ?? selectedNode?.health ?? 'IDLE']}
+              </em>
+            )}
+          </div>
+
+          {selectedNode && (
+            <>
+              <div className={`neural-diagnosis health-${selectedNode.health.toLowerCase()}`}>
+                <span>Diagnosis</span>
+                <strong>{selectedNode.diagnosisSummary}</strong>
+                <p>{`Condition class: ${DIAGNOSIS_LABELS[selectedNode.diagnosisCategory]}`}</p>
+              </div>
+              <div className="neural-inspector-section">
+                <h2>Live checks</h2>
+                <dl>
+                  <div><dt>Condition class</dt><dd>{DIAGNOSIS_LABELS[selectedNode.diagnosisCategory]}</dd></div>
+                  <div><dt>Current state</dt><dd>{selectedNode.metric}</dd></div>
+                  <div><dt>Flow</dt><dd>{selectedNode.active ? 'Active now' : 'Standby'}</dd></div>
+                  {selectedNode.diagnosisFacts.map((detail, index) => (
+                    <div key={`${detail}-${index}`}>
+                      <dt>Check {index + 1}</dt>
+                      <dd>{detail}</dd>
+                    </div>
+                  ))}
+                </dl>
+              </div>
+              {selectedGuide && (
+                <>
+                  <div className="neural-inspector-section">
+                    <h2>What this node does</h2>
+                    <p>{selectedGuide.purpose}</p>
+                  </div>
+                  <div className="neural-inspector-section">
+                    <h2>Process trace</h2>
+                    <ol className="neural-process-list">
+                      {selectedGuide.steps.map((step, index) => (
+                        <li key={step}><span>{index + 1}</span><p>{step}</p></li>
+                      ))}
+                    </ol>
+                  </div>
+                  <div className="neural-inspector-section">
+                    <h2>Healthy condition</h2>
+                    <p>{selectedGuide.healthyMeans}</p>
+                  </div>
+                  {(selectedNode.health === 'WARNING' || selectedNode.health === 'CRITICAL') && (
+                    <div className="neural-inspector-section">
+                      <h2>Inspect next</h2>
+                      <ul className="neural-check-list">
+                        {selectedGuide.inspectWhenBad.map((item) => <li key={item}>{item}</li>)}
+                      </ul>
+                    </div>
+                  )}
+                </>
+              )}
+            </>
+          )}
+
+          {selectedLane && (
+            <>
+              <div className={`neural-diagnosis health-${selectedLane.health.toLowerCase()}`}>
+                <span>Lane diagnosis</span>
+                <strong>{laneDiagnosis(selectedLane)}</strong>
+                <p>Lane color now follows realized paper PnL. Evidence status stays visible as separate context.</p>
+              </div>
+              <div className="neural-inspector-section">
+                <dl>
+                  <div><dt>Evidence status</dt><dd>{selectedLane.status}</dd></div>
+                  <div><dt>Evidence health</dt><dd>{HEALTH_LABELS[selectedLane.evidenceHealth]}</dd></div>
+                  <div><dt>Open / closed</dt><dd>{selectedLane.open} / {selectedLane.closed}</dd></div>
+                  <div><dt>Net Avg R</dt><dd className={(selectedLane.netAvgR ?? 0) >= 0 ? 'tone-healthy' : 'tone-critical'}>{fmtR(selectedLane.netAvgR)}</dd></div>
+                  <div><dt>PF / WR</dt><dd>{fmtNumber(selectedLane.pf)} / {selectedLane.wr === null ? 'n/a' : `${(selectedLane.wr * 100).toFixed(1)}%`}</dd></div>
+                  <div><dt>Headline PnL</dt><dd>{fmtMoney(selectedLane.headlinePnl)}</dd></div>
+                  <div><dt>Diagnostic PnL</dt><dd>{fmtMoney(selectedLane.diagnosticPnl)}</dd></div>
+                  <div><dt>Total paper PnL</dt><dd className={selectedLane.totalPnl >= 0 ? 'tone-healthy' : 'tone-critical'}>{fmtMoney(selectedLane.totalPnl)}</dd></div>
+                  <div><dt>Growth from start</dt><dd className={selectedLane.totalPnl >= 0 ? 'tone-healthy' : 'tone-critical'}>{fmtPct(selectedLane.totalPnlPct)}</dd></div>
+                  <div><dt>Starting equity</dt><dd>{fmtMoney(selectedLane.startingEquity)}</dd></div>
+                </dl>
+              </div>
+              <div className="neural-inspector-section">
+                <h2>Why this state</h2>
+                <p>{selectedLane.reason}</p>
+              </div>
+              <div className="neural-inspector-section">
+                <h2>Lane process</h2>
+                <ol className="neural-process-list">
+                  <li><span>1</span><p>Candidate qualifies for this lane geometry.</p></li>
+                  <li><span>2</span><p>Router and occupancy admission evaluate the signal.</p></li>
+                  <li><span>3</span><p>Eligible paper orders receive lane metadata and risk sizing.</p></li>
+                  <li><span>4</span><p>Closed outcomes update lane evidence and paper PnL separately.</p></li>
+                </ol>
+              </div>
+            </>
+          )}
+
+          {(selectedNode || selectedLane) && (
+            <div className="neural-inspector-section">
+              <h2>Connections</h2>
+              <dl>
+                <div><dt>Receives from</dt><dd>{selectedConnections.inputs.join(', ') || 'External state'}</dd></div>
+                <div><dt>Sends to</dt><dd>{selectedConnections.outputs.join(', ') || 'Operator telemetry'}</dd></div>
+              </dl>
+            </div>
+          )}
+
+          <div className="neural-inspector-section">
+            <h2>Controller decision</h2>
+            <dl>
+              <div><dt>Long / short</dt><dd>{telemetry?.controller.allowsLong ? 'ON' : 'OFF'} / {telemetry?.controller.allowsShort ? 'ON' : 'OFF'}</dd></div>
+              <div><dt>New entries</dt><dd>{telemetry?.controller.allowsNewEntries ? 'Allowed' : 'Controlled'}</dd></div>
+              <div><dt>Mixed admission</dt><dd>{telemetry?.mixed.admission ?? 'n/a'}</dd></div>
+              <div><dt>Budget</dt><dd>{telemetry?.mixed.budgetProfile ?? 'n/a'}</dd></div>
+            </dl>
+          </div>
+
+          <div className="neural-inspector-section">
+            <h2>Scan latency</h2>
+            <dl>
+              <div><dt>Total</dt><dd>{fmtMs(telemetry?.scan.totalMs ?? null)}</dd></div>
+              <div><dt>Slowest stage</dt><dd>{telemetry?.scan.slowestStage ?? 'n/a'} {fmtMs(telemetry?.scan.slowestStageMs ?? null)}</dd></div>
+              <div><dt>Timeout symbols</dt><dd>{telemetry?.scan.timeoutSymbols ?? 0}</dd></div>
+              <div><dt>Queue lag</dt><dd>{telemetry?.scan.backgroundLagSec == null ? 'n/a' : `${telemetry.scan.backgroundLagSec.toFixed(0)}s`}</dd></div>
+            </dl>
+          </div>
+        </aside>
+      </main>
+
+      <section className="neural-bottom-grid">
+        <div className="neural-alerts">
+          <header><span>Active diagnostics</span><strong>{telemetry?.alerts.length ?? 0}</strong></header>
+          {(telemetry?.alerts.length ?? 0) === 0 ? (
+            <p className="neural-all-clear">No critical telemetry alerts. Evidence collection states can still require attention.</p>
+          ) : telemetry?.alerts.slice(0, 6).map((alert, index) => (
+            <button key={`${alert.source}-${index}`} type="button" onClick={() => {
+              const match = telemetry.nodes.find((node) => node.label === alert.source);
+              if (match) setSelectedId(match.id);
+            }}>
+              <i className={`health-${alert.severity.toLowerCase()}`} />
+              <span><strong>{alert.source}</strong>{alert.message}</span>
+            </button>
+          ))}
+        </div>
+
+        <div className="neural-lane-strip">
+          <header><span>Lane performance field</span><strong>{telemetry?.lanes.length ?? 0} lanes</strong></header>
+          <div className="neural-lane-table-wrap">
+            <table>
+              <thead><tr><th>Lane</th><th>Evidence</th><th>Paper PnL</th><th>Growth</th><th>Open</th><th>n</th><th>Net Avg R</th><th>PF</th><th>WR</th></tr></thead>
+              <tbody>
+                {telemetry?.lanes.map((lane) => (
+                  <tr key={lane.id} className={lane.active ? 'is-active' : ''} onClick={() => setSelectedId(lane.id)}>
+                    <td><i className={`health-${lane.health.toLowerCase()}`} />{compactLaneLabel(lane.label)}</td>
+                    <td>{lane.status}</td>
+                    <td className={lane.totalPnl >= 0 ? 'tone-healthy' : 'tone-critical'}>{fmtMoney(lane.totalPnl)}</td>
+                    <td className={lane.totalPnl >= 0 ? 'tone-healthy' : 'tone-critical'}>{fmtPct(lane.totalPnlPct)}</td>
+                    <td>{lane.open}</td>
+                    <td>{lane.closed}</td>
+                    <td>{fmtR(lane.netAvgR)}</td>
+                    <td>{fmtNumber(lane.pf)}</td>
+                    <td>{lane.wr === null ? 'n/a' : `${(lane.wr * 100).toFixed(1)}%`}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+    </div>
+  );
+}

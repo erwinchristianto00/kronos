@@ -1,0 +1,21 @@
+import type { AtrPlan, BollingerBands, Candle, FibonacciLevels, TimeframeIndicatorSnapshot, Direction } from "./types.js";
+export declare function roundPrice(value: number, reference?: number): number;
+export declare function clamp(value: number, min: number, max: number): number;
+export declare function round(value: number, precision?: number): number;
+export declare function average(values: number[]): number;
+export declare function sma(values: number[], period: number): number;
+export declare function ema(values: number[], period: number): number;
+export declare function standardDeviation(values: number[]): number;
+export declare function rsi(values: number[], period?: number): number;
+export declare function macd(values: number[]): {
+    macd: number;
+    signal: number;
+    histogram: number;
+};
+export declare function bollingerBands(values: number[], period?: number): BollingerBands;
+export declare function trueRanges(candles: Candle[]): number[];
+export declare function atr(candles: Candle[], period?: number): number;
+export declare function vwap(candles: Candle[]): number;
+export declare function calculateTimeframeIndicators(candles: Candle[], timeframe: "5m" | "15m" | "1h", now?: number): TimeframeIndicatorSnapshot;
+export declare function calculateFibonacciLevels(candles: Candle[]): FibonacciLevels;
+export declare function buildAtrPlan(price: number, atrValue: number, atrPercent: number, direction: Direction, fib: FibonacciLevels): AtrPlan;

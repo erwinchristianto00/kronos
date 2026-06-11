@@ -1,0 +1,21 @@
+{
+  "observations": [],
+  "latestRefreshDiagnostics": {
+    "generatedAt": "2026-06-11T03:31:52.638Z",
+    "triggerSource": "SCAN_CYCLE",
+    "selectionBatchId": "kronos-counterfactual-2026-06-11T03:31:52.638Z",
+    "candidatesConsidered": 0,
+    "observationsCreated": 0,
+    "observationsSuppressedAsDuplicate": 0,
+    "observationsSkippedForInsufficientState": 0,
+    "observationsResolvedThisRefresh": 0,
+    "observationsFailedResolution": 0,
+    "laneCreatedCounts": {
+      "KRONOS_DISAGREEMENT_COUNTERFACTUAL": 0,
+      "LIVE_SOURCE_CONFLICT_COUNTERFACTUAL": 0
+    },
+    "notes": [
+      "Report-only Kronos counterfactual lane. Isolated from live trading, scoring, ranking, readiness, and external overlay tapes."
+    ]
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "criteria": {
+    "version": "BASE_ROUTE_STOP175_CURRENT_GUARD_FROZEN_V1",
+    "frozenAt": "2026-06-07T10:31:33.523Z",
+    "criteria": {
+      "guardEra": "RISK_HYGIENE_GUARD_V1",
+      "minStopDistanceBps": 175,
+      "policyVersion": "base-route-anchor-consistent-v2",
+      "description": "Frozen prospective tape mirroring qualifying current-guard closes (riskHygieneGuardMinStopDistanceBps=175, anchor-consistent V2). Criteria frozen at first mirror; report-only; never influences live behavior."
+    }
+  },
+  "observations": []
+}

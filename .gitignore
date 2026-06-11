@@ -1,0 +1,67 @@
+﻿# dependencies
+node_modules/
+**/node_modules/
+
+# env / secrets
+.env
+.env.*
+**/.env
+**/.env.*
+!.env.example
+!**/.env.example
+
+# Claude local config
+.claude/
+**/.claude/
+
+# logs
+logs/
+**/logs/
+*.log
+*.err.log
+*.out.log
+npm-debug.log*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+**/.vscode/
+
+# temp/cache/runtime output
+tmp/
+temp/
+.cache/
+**/tmp/
+**/temp/
+**/.cache/
+**/tmp_klines/
+**/artifacts/
+
+# generated scans / local outputs
+scan-output.txt
+**/scan-output.txt
+UsersAdminAppDataLocalTempkronos_avail.json
+recs.json
+pet-runs/
+
+# root runtime data - do not commit for now
+/data/
+
+# Kronos runtime data archive
+daily-trading-cockpit-v2/data/archive/
+daily-trading-cockpit-v2/data/*.jsonl
+daily-trading-cockpit-v2/data/*history*.jsonl
+daily-trading-cockpit-v2/data/*scan*.jsonl
+
+# API runtime/generated data
+daily-trading-cockpit-v2/apps/api/data/*.jsonl
+daily-trading-cockpit-v2/apps/api/data/*.bak
+daily-trading-cockpit-v2/apps/api/scripts/*output.json
+
+# embedded vendor repo
+daily-trading-cockpit-v2/services/kronos/vendor/Kronos/
+
+# temp files
+*.tmp
+**/*.tmp

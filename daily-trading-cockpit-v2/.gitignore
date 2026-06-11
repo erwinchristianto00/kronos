@@ -1,0 +1,10 @@
+node_modules
+dist
+.vite
+.pytest_cache
+__pycache__
+.venv
+coverage
+*.log
+apps/api/data/notification-state.json
+.DS_Store

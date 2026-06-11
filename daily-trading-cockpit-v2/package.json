@@ -1,0 +1,20 @@
+{
+  "name": "daily-trading-cockpit-v2",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build -w @dtc/shared && npm run build -w @dtc/api && npm run build -w @dtc/web",
+    "test": "npm run test -w @dtc/shared && npm run test -w @dtc/api",
+    "dev": "kill-port 3101 5173 && concurrently \"npm run dev -w @dtc/api\" \"npm run dev -w @dtc/web\"",
+    "dev:full": "powershell -ExecutionPolicy Bypass -File ./scripts/dev-full.ps1"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1",
+    "kill-port": "^2.0.1",
+    "typescript": "^5.9.3"
+  }
+}

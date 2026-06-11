@@ -1,0 +1,959 @@
+.neural-shell {
+  min-height: 100vh;
+  padding: 18px;
+  color: #e7eef8;
+  background: #071016;
+}
+
+.neural-topbar {
+  min-height: 64px;
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) auto minmax(220px, 1fr);
+  align-items: center;
+  gap: 18px;
+  border-bottom: 1px solid #20313a;
+}
+
+.neural-brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.neural-brand p,
+.neural-brand h1 {
+  margin: 0;
+  letter-spacing: 0;
+}
+
+.neural-brand p {
+  color: #7d929f;
+  font: 600 10px/1.3 "IBM Plex Mono", "Cascadia Code", monospace;
+  text-transform: uppercase;
+}
+
+.neural-brand h1 {
+  margin-top: 3px;
+  font-size: 19px;
+  line-height: 1;
+}
+
+.neural-live-dot {
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  background: #46dc9a;
+  box-shadow: 0 0 0 5px rgba(70, 220, 154, 0.1), 0 0 18px rgba(70, 220, 154, 0.7);
+  animation: neural-breathe 1.8s ease-in-out infinite;
+}
+
+.neural-live-dot.is-stale {
+  background: #f15b68;
+  box-shadow: 0 0 0 5px rgba(241, 91, 104, 0.1), 0 0 18px rgba(241, 91, 104, 0.7);
+}
+
+.neural-nav {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  padding: 3px;
+  border: 1px solid #263942;
+  background: #0b171d;
+  border-radius: 6px;
+}
+
+.neural-nav button {
+  min-height: 32px;
+  padding: 0 13px;
+  border: 0;
+  border-radius: 4px;
+  color: #8297a3;
+  background: transparent;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.neural-nav button:hover,
+.neural-nav button.is-current {
+  color: #e6f4ee;
+  background: #17302c;
+}
+
+.neural-actions {
+  justify-self: end;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.neural-toggle {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: #a8bac3;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.neural-toggle input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.neural-toggle span {
+  position: relative;
+  width: 30px;
+  height: 16px;
+  border-radius: 10px;
+  background: #273941;
+}
+
+.neural-toggle span::after {
+  content: "";
+  position: absolute;
+  width: 12px;
+  height: 12px;
+  left: 2px;
+  top: 2px;
+  border-radius: 50%;
+  background: #81949e;
+  transition: transform 160ms ease, background 160ms ease;
+}
+
+.neural-toggle input:checked + span {
+  background: #164c3b;
+}
+
+.neural-toggle input:checked + span::after {
+  transform: translateX(14px);
+  background: #51e3a3;
+}
+
+.neural-icon-button {
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  border: 1px solid #2a3d45;
+  border-radius: 5px;
+  color: #b6c7cf;
+  background: #0c181e;
+  cursor: pointer;
+  font-size: 20px;
+  line-height: 1;
+}
+
+.neural-icon-button:hover {
+  color: #51e3a3;
+  border-color: #34715d;
+}
+
+.neural-statusbar {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  border-bottom: 1px solid #20313a;
+}
+
+.neural-statusbar > div {
+  min-width: 0;
+  padding: 13px 17px;
+  border-right: 1px solid #20313a;
+}
+
+.neural-statusbar > div:last-child {
+  border-right: 0;
+}
+
+.neural-statusbar span,
+.neural-statusbar strong,
+.neural-statusbar small {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.neural-statusbar span {
+  color: #70858f;
+  font: 600 10px/1.3 "IBM Plex Mono", "Cascadia Code", monospace;
+  text-transform: uppercase;
+}
+
+.neural-statusbar strong {
+  margin-top: 5px;
+  font-size: 15px;
+}
+
+.neural-statusbar small {
+  margin-top: 3px;
+  color: #8ba0aa;
+  font-size: 11px;
+}
+
+.tone-healthy {
+  color: #5ce4a6 !important;
+}
+
+.tone-warning {
+  color: #f3bf5a !important;
+}
+
+.tone-critical {
+  color: #ff707a !important;
+}
+
+.neural-error {
+  display: flex;
+  gap: 10px;
+  padding: 9px 14px;
+  border-bottom: 1px solid rgba(241, 91, 104, 0.35);
+  color: #ff9ca3;
+  background: rgba(91, 26, 32, 0.4);
+  font-size: 12px;
+}
+
+.neural-workspace {
+  min-height: 660px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 380px;
+  border-bottom: 1px solid #20313a;
+}
+
+.neural-canvas-panel {
+  position: relative;
+  min-width: 0;
+  min-height: 660px;
+  overflow: hidden;
+  background: #081319;
+}
+
+.neural-canvas-scroll {
+  width: 100%;
+  height: 100%;
+  overflow: auto hidden;
+}
+
+.neural-map {
+  display: block;
+  width: 100%;
+  min-width: 1060px;
+  height: 100%;
+  min-height: 660px;
+}
+
+.neural-grid-line {
+  fill: none;
+  stroke: #13242b;
+  stroke-width: 1;
+}
+
+.neural-zone-label {
+  fill: #506670;
+  font: 600 10px "IBM Plex Mono", "Cascadia Code", monospace;
+  letter-spacing: 0;
+}
+
+.neural-edge-base,
+.neural-edge-signal {
+  fill: none;
+  stroke-width: 1.35;
+}
+
+.neural-edge-base {
+  stroke: #20363e;
+}
+
+.neural-edge-signal {
+  stroke: #4ecda0;
+  stroke-dasharray: 3 13;
+  opacity: 0.4;
+}
+
+.neural-edge.is-flowing .neural-edge-signal {
+  opacity: 0.9;
+  animation: neural-flow 1.5s linear infinite;
+}
+
+.neural-edge.health-warning .neural-edge-signal {
+  stroke: #eab95d;
+}
+
+.neural-edge.health-critical .neural-edge-signal {
+  stroke: #ef6370;
+  stroke-width: 2;
+}
+
+.neural-edge.health-idle .neural-edge-signal,
+.neural-edge.health-collecting .neural-edge-signal {
+  stroke: #69808b;
+  opacity: 0.24;
+}
+
+.neural-node,
+.neural-lane {
+  cursor: pointer;
+  outline: none;
+}
+
+.neural-node-core {
+  fill: #0c1b21;
+  stroke: #4ecda0;
+  stroke-width: 1.5;
+}
+
+.neural-node-halo {
+  fill: rgba(62, 187, 143, 0.035);
+  stroke: rgba(78, 205, 160, 0.14);
+  stroke-width: 1;
+}
+
+.neural-node-pulse {
+  fill: none;
+  stroke: #4ecda0;
+  stroke-width: 1;
+  opacity: 0;
+}
+
+.neural-node.is-active .neural-node-pulse {
+  animation: neural-node-pulse 2.2s ease-out infinite;
+}
+
+.neural-node.is-selected .neural-node-core,
+.neural-lane.is-selected .neural-lane-body {
+  stroke-width: 3;
+}
+
+.neural-node-title {
+  fill: #dce9e7;
+  font: 600 11px "IBM Plex Sans", "Segoe UI", sans-serif;
+  text-anchor: middle;
+  pointer-events: none;
+}
+
+.neural-node-metric {
+  fill: #7f989f;
+  font: 9px "IBM Plex Mono", "Cascadia Code", monospace;
+  text-anchor: middle;
+  pointer-events: none;
+}
+
+.neural-node.health-warning .neural-node-core,
+.neural-node.health-warning .neural-node-pulse {
+  stroke: #eab95d;
+}
+
+.neural-node.health-warning .neural-node-halo {
+  stroke: rgba(234, 185, 93, 0.22);
+}
+
+.neural-node.health-critical .neural-node-core,
+.neural-node.health-critical .neural-node-pulse {
+  stroke: #ef6370;
+}
+
+.neural-node.health-critical .neural-node-halo {
+  fill: rgba(239, 99, 112, 0.06);
+  stroke: rgba(239, 99, 112, 0.28);
+}
+
+.neural-node.health-idle .neural-node-core,
+.neural-node.health-collecting .neural-node-core {
+  stroke: #60747e;
+}
+
+.neural-lane-body {
+  fill: #0d1b21;
+  stroke: #405660;
+  stroke-width: 1.2;
+}
+
+.neural-lane-led {
+  fill: #60747e;
+}
+
+.neural-lane-title {
+  fill: #cfdee1;
+  font: 600 9px "IBM Plex Sans", "Segoe UI", sans-serif;
+}
+
+.neural-lane-metric {
+  fill: #7f969f;
+  font: 9px "IBM Plex Mono", "Cascadia Code", monospace;
+}
+
+.neural-lane.health-healthy .neural-lane-body,
+.neural-lane.health-active .neural-lane-body {
+  stroke: #4ecda0;
+}
+
+.neural-lane.health-healthy .neural-lane-led,
+.neural-lane.health-active .neural-lane-led {
+  fill: #50dca1;
+}
+
+.neural-lane.health-warning .neural-lane-body {
+  stroke: #eab95d;
+}
+
+.neural-lane.health-warning .neural-lane-led {
+  fill: #eab95d;
+}
+
+.neural-lane.health-critical .neural-lane-body {
+  fill: #231318;
+  stroke: #ef6370;
+}
+
+.neural-lane.health-critical .neural-lane-led {
+  fill: #ef6370;
+  filter: drop-shadow(0 0 5px #ef6370);
+}
+
+/* Quarantine = benched, still collecting. Distinct violet — never red/green (those = active). */
+.neural-lane.health-quarantine .neural-lane-body {
+  fill: #1c1830;
+  stroke: #a78bfa;
+  stroke-dasharray: 6 4;
+}
+
+.neural-lane.health-quarantine .neural-lane-led {
+  fill: #a78bfa;
+  filter: drop-shadow(0 0 4px #a78bfa);
+}
+
+.neural-lane.is-active .neural-lane-led {
+  animation: neural-breathe 1.5s ease-in-out infinite;
+}
+
+.neural-legend {
+  position: absolute;
+  left: 14px;
+  bottom: 12px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 11px;
+  padding: 7px 9px;
+  border: 1px solid #22353d;
+  border-radius: 5px;
+  background: rgba(6, 16, 21, 0.9);
+}
+
+.neural-legend span {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  color: #8498a2;
+  font-size: 9px;
+}
+
+.neural-legend i,
+.neural-alerts i,
+.neural-lane-table-wrap i {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #60747e;
+}
+
+i.health-healthy,
+i.health-active {
+  background: #50dca1;
+}
+
+i.health-warning {
+  background: #eab95d;
+}
+
+i.health-critical {
+  background: #ef6370;
+}
+
+i.health-collecting {
+  background: #67a8c1;
+}
+
+i.health-quarantine {
+  background: #a78bfa;
+}
+
+.neural-inspector {
+  min-width: 0;
+  border-left: 1px solid #20313a;
+  background: #0a151b;
+  overflow-y: auto;
+}
+
+.neural-inspector-heading,
+.neural-inspector-section {
+  padding: 18px;
+  border-bottom: 1px solid #20313a;
+}
+
+.neural-diagnosis {
+  padding: 16px 18px;
+  border-bottom: 1px solid #20313a;
+  border-left: 4px solid #60747e;
+  background: #0d1a20;
+}
+
+.neural-diagnosis.health-healthy,
+.neural-diagnosis.health-active {
+  border-left-color: #50dca1;
+}
+
+.neural-diagnosis.health-warning {
+  border-left-color: #eab95d;
+  background: #211c12;
+}
+
+.neural-diagnosis.health-critical {
+  border-left-color: #ef6370;
+  background: #251418;
+}
+
+.neural-diagnosis.health-collecting {
+  border-left-color: #67a8c1;
+}
+
+.neural-diagnosis.health-quarantine {
+  border-left-color: #a78bfa;
+  background: #161427;
+}
+
+.neural-diagnosis span,
+.neural-diagnosis strong {
+  display: block;
+}
+
+.neural-diagnosis span {
+  color: #7d929c;
+  font: 600 10px/1.3 "IBM Plex Mono", "Cascadia Code", monospace;
+  text-transform: uppercase;
+}
+
+.neural-diagnosis strong {
+  margin-top: 6px;
+  color: #e1ebee;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.neural-diagnosis p {
+  margin: 7px 0 0;
+  color: #96aab2;
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.neural-inspector-heading span,
+.neural-inspector-heading strong {
+  display: block;
+}
+
+.neural-inspector-heading span,
+.neural-inspector-section h2 {
+  color: #70858f;
+  font: 600 10px/1.3 "IBM Plex Mono", "Cascadia Code", monospace;
+  text-transform: uppercase;
+}
+
+.neural-inspector-heading strong {
+  margin-top: 7px;
+  font-size: 17px;
+  overflow-wrap: anywhere;
+}
+
+.neural-inspector-heading em {
+  display: inline-flex;
+  margin-top: 10px;
+  padding-left: 10px;
+  border-left: 3px solid currentColor;
+  font-style: normal;
+  font-size: 11px;
+}
+
+.neural-inspector-heading em.health-healthy,
+.neural-inspector-heading em.health-active {
+  color: #50dca1;
+}
+
+.neural-inspector-heading em.health-warning {
+  color: #eab95d;
+}
+
+.neural-inspector-heading em.health-critical {
+  color: #ef6370;
+}
+
+.neural-inspector-heading em.health-idle,
+.neural-inspector-heading em.health-collecting {
+  color: #7191a0;
+}
+
+.neural-inspector-heading em.health-quarantine {
+  color: #a78bfa;
+}
+
+.neural-inspector-section h2 {
+  margin: 0 0 12px;
+}
+
+.neural-inspector-section p {
+  margin: 0;
+  color: #afc0c8;
+  font-size: 12px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+.neural-inspector-section dl {
+  display: grid;
+  gap: 10px;
+  margin: 0;
+}
+
+.neural-inspector-section dl > div {
+  display: grid;
+  grid-template-columns: minmax(90px, 0.9fr) minmax(0, 1.1fr);
+  gap: 10px;
+}
+
+.neural-inspector-section dt {
+  color: #70858f;
+  font-size: 11px;
+}
+
+.neural-inspector-section dd {
+  min-width: 0;
+  margin: 0;
+  color: #d2dee2;
+  font: 11px/1.4 "IBM Plex Mono", "Cascadia Code", monospace;
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+
+.neural-process-list,
+.neural-check-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.neural-process-list {
+  display: grid;
+  gap: 8px;
+}
+
+.neural-process-list li {
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr);
+  gap: 9px;
+  align-items: start;
+}
+
+.neural-process-list li > span {
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  border: 1px solid #35505a;
+  border-radius: 50%;
+  color: #59d9a4;
+  font: 10px "IBM Plex Mono", "Cascadia Code", monospace;
+  background: #0b171c;
+}
+
+.neural-process-list p {
+  padding-top: 2px;
+}
+
+.neural-check-list {
+  display: grid;
+  gap: 8px;
+}
+
+.neural-check-list li {
+  position: relative;
+  padding-left: 15px;
+  color: #b5c5cb;
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.neural-check-list li::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 6px;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: #eab95d;
+}
+
+.neural-loading {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 15px;
+  color: #8297a2;
+  font-size: 12px;
+}
+
+.neural-loading span {
+  width: 30px;
+  height: 30px;
+  border: 2px solid #263b44;
+  border-top-color: #4ecda0;
+  border-radius: 50%;
+  animation: neural-spin 0.9s linear infinite;
+}
+
+.neural-bottom-grid {
+  display: grid;
+  grid-template-columns: minmax(280px, 0.34fr) minmax(0, 0.66fr);
+  min-height: 220px;
+}
+
+.neural-alerts {
+  border-right: 1px solid #20313a;
+}
+
+.neural-alerts header,
+.neural-lane-strip header {
+  height: 42px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 14px;
+  border-bottom: 1px solid #20313a;
+  color: #81949d;
+  font-size: 11px;
+  text-transform: uppercase;
+}
+
+.neural-alerts header strong,
+.neural-lane-strip header strong {
+  color: #b9c9cf;
+}
+
+.neural-alerts button {
+  width: 100%;
+  display: grid;
+  grid-template-columns: 8px minmax(0, 1fr);
+  gap: 9px;
+  align-items: start;
+  padding: 11px 14px;
+  border: 0;
+  border-bottom: 1px solid #17272e;
+  color: #9dafb7;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.neural-alerts button:hover {
+  background: #0e1c22;
+}
+
+.neural-alerts button i {
+  margin-top: 4px;
+}
+
+.neural-alerts button strong {
+  display: block;
+  margin-bottom: 3px;
+  color: #d4e0e4;
+  font-size: 11px;
+}
+
+.neural-alerts button span {
+  font-size: 10px;
+  line-height: 1.4;
+}
+
+.neural-all-clear {
+  padding: 16px;
+  margin: 0;
+  color: #7f959f;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.neural-lane-strip {
+  min-width: 0;
+}
+
+.neural-lane-table-wrap {
+  overflow-x: auto;
+}
+
+.neural-lane-table-wrap table {
+  width: 100%;
+  min-width: 660px;
+  border-collapse: collapse;
+  font-size: 10px;
+}
+
+.neural-lane-table-wrap th,
+.neural-lane-table-wrap td {
+  height: 31px;
+  padding: 0 11px;
+  border-bottom: 1px solid #17272e;
+  color: #91a5ae;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.neural-lane-table-wrap th {
+  color: #657b85;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+
+.neural-lane-table-wrap th:first-child,
+.neural-lane-table-wrap td:first-child,
+.neural-lane-table-wrap th:nth-child(2),
+.neural-lane-table-wrap td:nth-child(2) {
+  text-align: left;
+}
+
+.neural-lane-table-wrap tbody tr {
+  cursor: pointer;
+}
+
+.neural-lane-table-wrap tbody tr:hover,
+.neural-lane-table-wrap tbody tr.is-active {
+  background: #0e201f;
+}
+
+.neural-lane-table-wrap td:first-child i {
+  margin-right: 7px;
+}
+
+@keyframes neural-flow {
+  to { stroke-dashoffset: -32; }
+}
+
+@keyframes neural-node-pulse {
+  0% { opacity: 0.8; transform: scale(0.88); }
+  75%, 100% { opacity: 0; transform: scale(1.28); }
+}
+
+@keyframes neural-breathe {
+  0%, 100% { opacity: 0.55; }
+  50% { opacity: 1; }
+}
+
+@keyframes neural-spin {
+  to { transform: rotate(360deg); }
+}
+
+@media (max-width: 1050px) {
+  .neural-topbar {
+    grid-template-columns: 1fr auto;
+  }
+
+  .neural-nav {
+    grid-row: 2;
+    grid-column: 1 / -1;
+    justify-self: stretch;
+    margin-bottom: 10px;
+  }
+
+  .neural-nav button {
+    flex: 1;
+  }
+
+  .neural-statusbar {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .neural-statusbar > div:nth-child(3) {
+    border-right: 0;
+  }
+
+  .neural-statusbar > div:nth-child(n + 4) {
+    border-top: 1px solid #20313a;
+  }
+
+  .neural-workspace {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .neural-inspector {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    border-left: 0;
+    border-top: 1px solid #20313a;
+  }
+
+  .neural-inspector-heading {
+    grid-row: span 2;
+  }
+}
+
+@media (max-width: 720px) {
+  .neural-shell {
+    padding: 10px;
+  }
+
+  .neural-topbar {
+    gap: 10px;
+  }
+
+  .neural-actions {
+    gap: 8px;
+  }
+
+  .neural-statusbar {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .neural-statusbar > div {
+    border-top: 1px solid #20313a;
+  }
+
+  .neural-statusbar > div:nth-child(2n) {
+    border-right: 0;
+  }
+
+  .neural-statusbar > div:last-child {
+    grid-column: 1 / -1;
+  }
+
+  .neural-canvas-panel,
+  .neural-map {
+    min-height: 560px;
+  }
+
+  .neural-inspector {
+    grid-template-columns: 1fr;
+  }
+
+  .neural-inspector-heading {
+    grid-row: auto;
+  }
+
+  .neural-bottom-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .neural-alerts {
+    border-right: 0;
+    border-bottom: 1px solid #20313a;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .neural-edge-signal,
+  .neural-node-pulse,
+  .neural-live-dot,
+  .neural-lane-led {
+    animation: none !important;
+  }
+}

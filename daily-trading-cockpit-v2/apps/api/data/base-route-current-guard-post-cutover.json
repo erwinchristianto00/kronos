@@ -1,0 +1,14 @@
+{
+  "boundary": {
+    "laneVersion": "BASE_ROUTE_STOP175_CURRENT_GUARD_POST_CUTOVER_V1",
+    "cutoverTimestamp": "2026-05-26T15:00:00.000Z",
+    "reason": "Segment 1 classified OLD_BATCH by pathology audit.",
+    "frozenAt": "2026-05-29T07:02:06.528Z",
+    "derivedFrom": {
+      "pathologyVerdict": "OLD_BATCH",
+      "freshValidAtLock": 53,
+      "seg1NAtLock": 17,
+      "seg1LastClosedAt": "2026-05-26T15:00:00.000Z"
+    }
+  }
+}
