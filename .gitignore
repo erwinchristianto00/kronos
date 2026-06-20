@@ -48,8 +48,10 @@ pet-runs/
 # root runtime data - do not commit for now
 /data/
 
-# Kronos runtime data archive
-daily-trading-cockpit-v2/data/archive/
+# runtime data (machine-specific bot state — never commit/deploy; the VPS keeps
+# its own accumulated edge/paper/live state, and deploy rsync excludes these dirs)
+daily-trading-cockpit-v2/data/
+daily-trading-cockpit-v2/apps/api/data/
 daily-trading-cockpit-v2/data/*.jsonl
 daily-trading-cockpit-v2/data/*history*.jsonl
 daily-trading-cockpit-v2/data/*scan*.jsonl
