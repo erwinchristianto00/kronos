@@ -152,6 +152,42 @@ describe("current-guard-variant-matrix", () => {
     expect(deriveVariantGeometry(makeSignal(), defOf("CG_WIDE_FAST_SHORT")).kind).toBe("rejected");
   });
 
+  // [CWFL] CG_WIDE_FAST_LONG: the LONG mirror of CG_WIDE_FAST_SHORT (fast-exit disambiguation).
+  it("[CWFL] CG_WIDE_FAST_LONG floors stop at 300bps, TP at 0.5R, long-only", () => {
+    const geo = deriveVariantGeometry(makeSignal(), defOf("CG_WIDE_FAST_LONG"));
+    expect(geo.kind).toBe("ok");
+    if (geo.kind !== "ok") throw new Error("expected ok");
+    expect(geo.stopDistanceBps).toBeCloseTo(300, 6);
+    expect(geo.stopLoss).toBeCloseTo(97, 6);
+    expect((geo.takeProfitLevels[0] - 100) / (100 - geo.stopLoss)).toBeCloseTo(0.5, 6);
+    const shortSig = makeSignal({ direction: "SHORT", stopLoss: 102, tp1: 96 });
+    expect(deriveVariantGeometry(shortSig, defOf("CG_WIDE_FAST_LONG")).kind).toBe("rejected");
+  });
+
+  // [CTF] CG_TIGHT_FAST_05: native stop (floor 175 ≤ raw 200 → not widened), fast 0.5R TP, both directions.
+  it("[CTF] CG_TIGHT_FAST_05 keeps the native stop (no widening) with a fast 0.5R TP", () => {
+    const geo = deriveVariantGeometry(makeSignal(), defOf("CG_TIGHT_FAST_05"));
+    expect(geo.kind).toBe("ok");
+    if (geo.kind !== "ok") throw new Error("expected ok");
+    expect(geo.stopDistanceBps).toBeCloseTo(200, 6); // floor 175 < raw 200 → native, not widened
+    expect((geo.takeProfitLevels[0] - 100) / (100 - geo.stopLoss)).toBeCloseTo(0.5, 6);
+    // direction-agnostic: SHORT also derives
+    const shortSig = makeSignal({ direction: "SHORT", stopLoss: 102, tp1: 96 });
+    expect(deriveVariantGeometry(shortSig, defOf("CG_TIGHT_FAST_05")).kind).toBe("ok");
+  });
+
+  // [CBE] CG_BE_AFTER_05: wide 300bps stop, 0.5R trigger, trail-after exit, both directions.
+  it("[CBE] CG_BE_AFTER_05 floors stop at 300bps with a 0.5R trigger, both directions", () => {
+    const geo = deriveVariantGeometry(makeSignal(), defOf("CG_BE_AFTER_05"));
+    expect(geo.kind).toBe("ok");
+    if (geo.kind !== "ok") throw new Error("expected ok");
+    expect(geo.stopDistanceBps).toBeCloseTo(300, 6);
+    expect((geo.takeProfitLevels[0] - 100) / (100 - geo.stopLoss)).toBeCloseTo(0.5, 6);
+    expect(defOf("CG_BE_AFTER_05").exitRule).toBe("trail_after_tp1");
+    const shortSig = makeSignal({ direction: "SHORT", stopLoss: 102, tp1: 96 });
+    expect(deriveVariantGeometry(shortSig, defOf("CG_BE_AFTER_05")).kind).toBe("ok");
+  });
+
   // [LG-3] Long-only research lanes reject SHORT signals.
   it("[LG-3] LG_* lanes are long-only (rejected on SHORT)", () => {
     const shortSig = makeSignal({ direction: "SHORT", stopLoss: 102, tp1: 96 });

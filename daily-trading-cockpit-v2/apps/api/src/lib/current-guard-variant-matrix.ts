@@ -56,7 +56,15 @@ export type VariantMatrixVariantId =
   // Long-only reward-geometry research lanes (GPT deep-research candidates): wide stop floor
   // + 1.2R TP, attacking the "too little realised reward vs cost" long failure mode.
   | "LG_R12_STOP250_FULL"
-  | "LG_R12_STOP300_FULL";
+  | "LG_R12_STOP300_FULL"
+  // Fast-exit / tight-stop research lanes (2026-06-20 audit hypotheses): the forward
+  // diagnostic + VM data showed wide-stop slow-TP full exits bleed (PF ~0.3-0.4) while
+  // the one fast 0.5R variant (CG_WIDE_FAST_SHORT) was the best (+0.20R). These test
+  // "fast/tight beats wide/slow" from three angles, to be PROVEN out-of-sample before
+  // any promotion (not tuned to the small post-reset sample).
+  | "CG_WIDE_FAST_LONG"
+  | "CG_TIGHT_FAST_05"
+  | "CG_BE_AFTER_05";
 
 export const BULL_TREND_VARIANT_ID = "BL_TREND_R15_STOP200_FULL" as const;
 export const BULL_SCALEOUT_VARIANT_ID = "BL_TREND_SCALEOUT_STOP200" as const;
@@ -300,6 +308,60 @@ export const VARIANT_MATRIX_DEFINITIONS: readonly VariantMatrixVariantDefinition
       "mean-revert up, so a far TP (runner) loses badly (−0.47R) while banking quickly at 0.5R is " +
       "honestly positive (+0.055R, ~71% WR). SHORT-only; the wide-stop 1R short stays vetoed by the " +
       "lane edge gate.",
+  },
+  {
+    // Hypothesis A (disambiguation): is CG_WIDE_FAST_SHORT's edge the FAST 0.5R
+    // exit, or the SHORT direction? This is its exact LONG mirror — same wide stop
+    // + 0.5R fast TP, LONG-only. If it proves positive OOS too, the edge is the
+    // geometry (fast exit), not the direction. NOTE: the VM source population is
+    // ~99% SHORT, so this lane accrues OOS slowly — it's a probe for when long
+    // shadow positions close, not a fast-maturing lane.
+    id: "CG_WIDE_FAST_LONG",
+    label: "LONG fast-TP: wide >=300bps stop, near 0.5R TP",
+    exitRule: "tp1_full",
+    fillMode: "taker",
+    costModel: "taker",
+    stopFloorBps: 300,
+    tpRewardMultiple: 0.5,
+    longOnly: true,
+    description:
+      "Disambiguation lane: the exact LONG mirror of CG_WIDE_FAST_SHORT (wide >=300bps stop, fast 0.5R " +
+      "target). Tests whether the fast-exit edge is geometric (works both directions) or short-specific. " +
+      "Prove OOS before any read — small forward sample expected (short-biased source population).",
+  },
+  {
+    // Hypothesis B (cut the tail): the bleeding variants are wide-stop slow-TP full
+    // exits (PF ~0.3). This keeps the NATIVE ~175bps stop (no widening) and banks
+    // fast at 0.5R — the tightest-stop + fastest-exit combo the geometry allows, to
+    // test whether the wide-stop tail (not the entry) is what kills the longs.
+    id: "CG_TIGHT_FAST_05",
+    label: "Tight native stop (~175bps) + fast 0.5R TP",
+    exitRule: "tp1_full",
+    fillMode: "taker",
+    costModel: "taker",
+    stopFloorBps: 175,
+    tpRewardMultiple: 0.5,
+    description:
+      "Native ~175bps stop (no widening) with a fast 0.5R full-exit target. Attacks the wide-stop tail " +
+      "directly: if PF improves vs the wide-stop variants, the loss driver is stop width, not entry. " +
+      "Direction-agnostic; prove OOS before promotion.",
+  },
+  {
+    // Hypothesis C (remove risk early): instead of a full exit at 0.5R, move the
+    // stop to breakeven once 0.5R is touched and ride the runner. Tests whether the
+    // fast variants leave upside on the table that a free runner can capture without
+    // re-introducing the wide-stop tail.
+    id: "CG_BE_AFTER_05",
+    label: "Breakeven after 0.5R touch, ride the runner",
+    exitRule: "trail_after_tp1",
+    fillMode: "taker",
+    costModel: "taker",
+    stopFloorBps: 300,
+    tpRewardMultiple: 0.5,
+    description:
+      "Wide >=300bps stop, 0.5R trigger: on a 0.5R touch move the stop to breakeven and ride the exact " +
+      "candle path. Tests early risk-removal + free upside vs the fast full-exit. Direction-agnostic; " +
+      "prove OOS before promotion.",
   },
 ];
 

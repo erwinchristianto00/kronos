@@ -390,9 +390,11 @@ describe("paper-opportunity-allocator", () => {
       baseInputs({ vmReport, candidates: [makeCandidate()] }),
     );
     expect(report.candidatesEvaluated).toBe(1);
-    // 7 = the 6 bidirectional CG lanes + the new shortOnly CG_WIDE_FAST_SHORT.
-    expect(report.laneEvaluationsCreated).toBe(7);
-    expect(report.byLane.length).toBe(7);
+    // 9 = the 6 bidirectional CG lanes + shortOnly CG_WIDE_FAST_SHORT + the 2 new
+    // direction-agnostic fast-exit research lanes (CG_TIGHT_FAST_05, CG_BE_AFTER_05).
+    // (CG_WIDE_FAST_LONG is longOnly → not SHORT-eligible.)
+    expect(report.laneEvaluationsCreated).toBe(9);
+    expect(report.byLane.length).toBe(9);
   });
 
   // [2]
