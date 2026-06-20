@@ -221,6 +221,14 @@ export interface PaperOpportunityAllocatorReport {
   diagnosticEligibleCount: number;
   createdHeadline: number;
   createdDiagnostic: number;
+  cgWideOpenCount: number;
+  cgWideMaxOpen: number;
+  cgWideStaleOpenCount: number;
+  cgWideMaxStaleOpen: number;
+  cgWideMaxPerSymbolOpen: number;
+  cgWideMaxPerDirectionOpen: number;
+  cgWideElevatedOpenThreshold: number;
+  cgWideCapacityPressure: "NORMAL" | "ELEVATED" | "FULL";
 
   // ── rejected-candidate diagnostic sampler (V1) — forensic-only ─────────────
   /** True when PAPER_REJECT_DIAGNOSTIC_CONTINUE=1 (sampler armed this batch). */
@@ -307,7 +315,7 @@ export interface PaperOpportunityAllocatorInputs {
   /**
    * Enables full variant-matrix paper collection: admits a DIAGNOSTIC_ONLY paper order for each
    * of VARIANT_MATRIX_DIAGNOSTIC_IDS (baseline / scaleout / no-fib500 / maker) in BOTH directions,
-   * capped per variant per scan. Headline stays the promoted CG_WIDE lane only. Default off.
+   * capped per variant per scan. Headline stays on the canonical scaleout lane. Default off.
    */
   paperVariantMatrixDiagnosticEnabled?: boolean;
   /** Per-variant cap on variant-matrix diagnostic orders per scan (default 3). */
@@ -406,7 +414,7 @@ const DEFAULT_VARIANT_DIAGNOSTIC_MAX_PER_SCAN = 3;
  * halted, rendered violet in the neural map) once it has a confident sample AND a clearly negative
  * realized paper netAvgR — i.e. "let it run, then bench confirmed losers" (the CG_TRAIL discipline,
  * automated). Based on the lane's OWN paper economics per laneId, never the VM-sim row, and only for
- * VARIANT_MATRIX_DIAGNOSTIC lanes (the headline CG_WIDE lanes are never auto-quarantined). Tunable.
+ * VARIANT_MATRIX_DIAGNOSTIC lanes (headline lanes are handled by the allocator policy). Tunable.
  */
 const AUTO_QUARANTINE_MIN_CLOSED = 40;
 const AUTO_QUARANTINE_MAX_NETAVGR = -0.03;
@@ -479,6 +487,48 @@ function isAdmissionTargetLaneId(laneId: string | null | undefined): boolean {
 
 /** Cost-in-R ceiling: above this the geometry/candidate cannot pay for itself. */
 const CANDIDATE_MAX_COST_R = 0.5;
+const CG_WIDE_STALE_HOURS = 30;
+const OPEN_PAPER_STATUSES = new Set<string>([
+  "CREATED",
+  "PAPER_SUBMITTED",
+  "PAPER_FILLED",
+  "PAPER_PARTIAL",
+]);
+
+function isOpenPaperOrder(order: PaperOrder): boolean {
+  return OPEN_PAPER_STATUSES.has(order.paperStatus);
+}
+
+function isCgWideLaneId(laneId: string | null | undefined): boolean {
+  return typeof laneId === "string" && laneId.endsWith(":CG_WIDE_STOP_TP_WIDE");
+}
+
+function paperOrderOpenHours(order: PaperOrder, nowMs: number): number | null {
+  const openedMs = new Date(order.openedAt).getTime();
+  if (!Number.isFinite(openedMs) || !Number.isFinite(nowMs)) return null;
+  return (nowMs - openedMs) / 3_600_000;
+}
+
+function cgWideCapacityRejectReason(args: {
+  orders: readonly PaperOrder[];
+  nowMs: number;
+  symbol: string;
+  direction: Direction;
+  maxWideOpen: number;
+  maxWideStale: number;
+  maxPerSymbolOpen: number;
+  maxPerDirectionOpen: number;
+}): string | null {
+  const openWide = args.orders.filter((order) => isOpenPaperOrder(order) && isCgWideLaneId(order.selectedLaneId));
+  const staleWide = openWide.filter((order) => (paperOrderOpenHours(order, args.nowMs) ?? 0) >= CG_WIDE_STALE_HOURS);
+  const perSymbol = openWide.filter((order) => order.symbol === args.symbol);
+  const perDirection = openWide.filter((order) => order.direction === args.direction);
+  if (openWide.length >= args.maxWideOpen) return "CG_WIDE_MAX_OPEN_REACHED";
+  if (staleWide.length >= args.maxWideStale) return "CG_WIDE_MAX_STALE_REACHED";
+  if (perSymbol.length >= args.maxPerSymbolOpen) return "CG_WIDE_MAX_PER_SYMBOL_REACHED";
+  if (perDirection.length >= args.maxPerDirectionOpen) return "CG_WIDE_MAX_PER_DIRECTION_REACHED";
+  return null;
+}
 
 // ─── rejected-candidate diagnostic sampler (V1) ─────────────────────────────
 /** Default cap on DIAGNOSTIC_ONLY orders sampled from rejected candidates per scan. */
@@ -971,6 +1021,19 @@ export function buildPaperOpportunityAllocatorReport(
   const symbolHistoricalNetMap = inputs.symbolHistoricalNetMap ?? {};
   const activeMixedBudget = getActiveMixedPaperBudgetProfileConfig();
   const currentPaperOrders = inputs.currentPaperOrders ?? [];
+  const cgWideBudget = activeMixedBudget.budget;
+  const openCgWideOrders = currentPaperOrders.filter((order) => isOpenPaperOrder(order) && isCgWideLaneId(order.selectedLaneId));
+  const staleCgWideOpenCount = openCgWideOrders.filter(
+    (order) => (paperOrderOpenHours(order, nowMs) ?? 0) >= CG_WIDE_STALE_HOURS,
+  ).length;
+  const cgWideElevatedOpenThreshold = Math.floor(cgWideBudget.maxWideOpen * 0.75);
+  const cgWideCapacityPressure =
+    openCgWideOrders.length >= cgWideBudget.maxWideOpen ||
+    staleCgWideOpenCount >= cgWideBudget.maxWideStale
+      ? "FULL"
+      : openCgWideOrders.length >= cgWideElevatedOpenThreshold
+        ? "ELEVATED"
+        : "NORMAL";
 
   // ── rejected-candidate diagnostic sampler (V1) config ──────────────────────
   const rejectDiagnosticContinue = inputs.paperRejectDiagnosticContinue === true;
@@ -1045,6 +1108,14 @@ export function buildPaperOpportunityAllocatorReport(
     diagnosticEligibleCount: 0,
     createdHeadline: 0,
     createdDiagnostic: 0,
+    cgWideOpenCount: openCgWideOrders.length,
+    cgWideMaxOpen: cgWideBudget.maxWideOpen,
+    cgWideStaleOpenCount: staleCgWideOpenCount,
+    cgWideMaxStaleOpen: cgWideBudget.maxWideStale,
+    cgWideMaxPerSymbolOpen: cgWideBudget.maxPerSymbolOpen,
+    cgWideMaxPerDirectionOpen: cgWideBudget.maxPerDirectionOpen,
+    cgWideElevatedOpenThreshold,
+    cgWideCapacityPressure,
     rejectedDiagnosticSamplerActive: false,
     rejectedDiagnosticSampled: 0,
     rejectedDiagnosticReasons: [],
@@ -1248,6 +1319,22 @@ export function buildPaperOpportunityAllocatorReport(
       // admits as HEADLINE when the candidate is headline-quality, else falls back to
       // DIAGNOSTIC_ONLY (rather than being rejected). Applies to BOTH directions.
       const cgWidePriorityCollection = cgWidePriority && def.id === "CG_WIDE_STOP_TP_WIDE";
+      if (def.id === "CG_WIDE_STOP_TP_WIDE") {
+        const cgWideCapacityReason = cgWideCapacityRejectReason({
+          orders: currentPaperOrders,
+          nowMs,
+          symbol,
+          direction,
+          maxWideOpen: cgWideBudget.maxWideOpen,
+          maxWideStale: cgWideBudget.maxWideStale,
+          maxPerSymbolOpen: cgWideBudget.maxPerSymbolOpen,
+          maxPerDirectionOpen: cgWideBudget.maxPerDirectionOpen,
+        });
+        if (cgWideCapacityReason) {
+          recordReject(symbol, direction, def.id, cgWideCapacityReason, rowFresh, rowNet);
+          continue;
+        }
+      }
       // Diagnostic collection paths admit regardless of the lane's own economics row (they exist
       // to COLLECT that economics honestly). Regime/direction-compat gates below still apply.
       const skipEconomics =
@@ -1898,7 +1985,29 @@ export function buildPaperOpportunityAllocatorBriefLines(
       `  createdHeadline=${report.createdHeadline} createdDiagnostic=${report.createdDiagnostic}`,
   );
   L.push(
-    `   longPaperLane=${LONG_WIDE_PAPER_LANE_ID}` +
+    `   paperAccounting: headlineCreated=${report.createdHeadline}` +
+      ` diagnosticCreated=${report.createdDiagnostic}` +
+      ` note=${report.createdHeadline === 0 && report.createdDiagnostic > 0 ? "DIAGNOSTIC_ONLY_COLLECTION" : "HEADLINE_AND_DIAGNOSTIC_SPLIT"}`,
+  );
+  L.push(
+    `   cgWideCapacity: open=${report.cgWideOpenCount}/${report.cgWideMaxOpen}` +
+      ` stale=${report.cgWideStaleOpenCount}/${report.cgWideMaxStaleOpen}` +
+      ` perSymbolMax=${report.cgWideMaxPerSymbolOpen}` +
+      ` perDirectionMax=${report.cgWideMaxPerDirectionOpen}` +
+      ` warningAt=${report.cgWideElevatedOpenThreshold}` +
+      ` pressure=${report.cgWideCapacityPressure}`,
+  );
+  L.push(
+    `   longHeadlineLane=CG_LONG_VARIANT_MATRIX:${HEADLINE_VARIANT_ID}` +
+      ` status=${
+        report.controllerMode === "LONG_ONLY" && report.regimeFamily === "BULLISH"
+          ? "ACTIVE"
+          : "STANDBY"
+      }` +
+      ` mode=HEADLINE evidence=FORWARD_OOS_COLLECTION`,
+  );
+  L.push(
+    `   longDiagnosticLane=${LONG_WIDE_PAPER_LANE_ID}` +
       ` status=${
         (
           report.controllerMode === "LONG_ONLY" &&

@@ -1545,6 +1545,58 @@ describe("paper-opportunity-allocator", () => {
     expect(otherN).toBe(0);
   });
 
+  it("[P7-3o] CG_WIDE priority respects the 26-open occupancy cap and renders explicit capacity", async () => {
+    const dir = tmpDir();
+    const vmReport = await buildWinningVmReport(dir);
+    const now = new Date().toISOString();
+    const openWide = Array.from({ length: 26 }, (_, i) => ({
+      paperOrderId: `wide-open-${i}`,
+      sourceType: "SCAN_CANDIDATE_LANE_ALLOCATOR",
+      sourceCandidateId: `wide-open-${i}`,
+      scanBatchId: "seed-batch",
+      sourceObservationId: `wide-open-${i}`,
+      sourceSignalId: `wide-open-${i}`,
+      dedupeKey: `wide-open-${i}`,
+      createdAt: now,
+      updatedAt: now,
+      openedAt: now,
+      symbol: `SYM${i}USDT`,
+      direction: "SHORT",
+      selectedLaneId: "CG_VARIANT_MATRIX:CG_WIDE_STOP_TP_WIDE",
+      paperOrderMode: "DIAGNOSTIC_ONLY",
+      paperStatus: "PAPER_SUBMITTED",
+      reportOnly: true,
+      paperOnly: true,
+    } as unknown as PaperOrder));
+
+    const report = buildPaperOpportunityAllocatorReport(
+      baseInputs({
+        vmReport,
+        candidates: [makeCandidate()],
+        paperCgWidePriority: true,
+        currentPaperOrders: openWide,
+      }),
+    );
+
+    expect(report.selectedOpportunities.some((o) => o.variantId === "CG_WIDE_STOP_TP_WIDE")).toBe(false);
+    expect(report.topRejects.map((row) => row.key)).toContain("CG_WIDE_MAX_OPEN_REACHED");
+    expect(report.cgWideOpenCount).toBe(26);
+    expect(report.cgWideMaxOpen).toBe(26);
+    expect(report.cgWideMaxPerSymbolOpen).toBe(2);
+    expect(report.cgWideMaxPerDirectionOpen).toBe(24);
+    expect(report.cgWideMaxStaleOpen).toBe(16);
+    expect(report.cgWideElevatedOpenThreshold).toBe(19);
+    expect(report.cgWideCapacityPressure).toBe("FULL");
+
+    const lines = buildPaperOpportunityAllocatorBriefLines(report);
+    expect(lines.some((line) => line.includes("longPaperLane="))).toBe(false);
+    expect(lines.some((line) => line.includes("longHeadlineLane=CG_LONG_VARIANT_MATRIX:CG_SCALEOUT_TP1_TRAIL"))).toBe(true);
+    expect(lines.some((line) => line.includes("longDiagnosticLane=CG_LONG_VARIANT_MATRIX:CG_WIDE_STOP_TP_WIDE"))).toBe(true);
+    expect(lines.some((line) => line.includes("paperAccounting: headlineCreated=0"))).toBe(true);
+    expect(lines.some((line) => line.includes("cgWideCapacity: open=26/26"))).toBe(true);
+    expect(lines.some((line) => line.includes("warningAt=19 pressure=FULL"))).toBe(true);
+  });
+
   // [P7-4]
   it("[P7-4] DIAGNOSTIC_ONLY orders are excluded from headline net/PF/WR accounting", async () => {
     const dir = tmpDir();
