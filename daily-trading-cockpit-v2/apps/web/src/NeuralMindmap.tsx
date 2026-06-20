@@ -47,6 +47,14 @@ interface NeuralLane {
   diagnosticUnrealizedR: number | null;
   headlineUnrealizedPnl: number | null;
   headlineUnrealizedR: number | null;
+  openMaxFavorablePnl: number | null;
+  openMaxFavorableR: number | null;
+  openAvgDistanceToTpPct: number | null;
+  openNearestDistanceToTpPct: number | null;
+  openAvgEntryPrice: number | null;
+  openAvgMarkPrice: number | null;
+  openAvgTakeProfitPrice: number | null;
+  openMarkedSymbolCount: number;
   startingEquity: number;
   totalPnlPct: number | null;
   headlinePnlPct: number | null;
@@ -95,6 +103,10 @@ interface NeuralTelemetry {
     diagnosticUnrealizedR: number | null;
     headlineUnrealizedPnl: number | null;
     headlineUnrealizedR: number | null;
+    openMaxFavorablePnl: number | null;
+    openMaxFavorableR: number | null;
+    openAvgDistanceToTpPct: number | null;
+    openNearestDistanceToTpPct: number | null;
     unrealizedMarkCount: number;
     unrealizedMissingPriceCount: number;
     unrealizedPriceSource: string | null;
@@ -275,9 +287,22 @@ function fmtUsdt(value: number | null): string {
   return `${value >= 0 ? '+' : ''}${value.toFixed(2)} USDT`;
 }
 
+function fmtPrice(value: number | null): string {
+  if (value === null || !Number.isFinite(value)) return 'n/a';
+  if (Math.abs(value) >= 100) return value.toFixed(2);
+  if (Math.abs(value) >= 1) return value.toFixed(4);
+  return value.toFixed(6);
+}
+
 function fmtPct(value: number | null): string {
   if (value === null || !Number.isFinite(value)) return 'n/a';
   return `${value >= 0 ? '+' : ''}${value.toFixed(1)}%`;
+}
+
+function fmtGapPct(value: number | null): string {
+  if (value === null || !Number.isFinite(value)) return 'n/a';
+  if (value <= 0) return `${value.toFixed(2)}% hit`;
+  return `${value.toFixed(2)}%`;
 }
 
 function fmtMs(value: number | null): string {
@@ -534,7 +559,7 @@ export default function NeuralMindmap() {
           <strong>{telemetry ? `${telemetry.paper.open} open / ${telemetry.paper.closed} closed` : 'Loading'}</strong>
           <small>
             {telemetry
-              ? `diag open ${fmtUsdt(telemetry.paper.diagnosticUnrealizedPnl)} (${telemetry.paper.unrealizedMarkCount}/${telemetry.paper.open} marked)`
+              ? `diag open ${fmtUsdt(telemetry.paper.diagnosticUnrealizedPnl)} · TP avg ${fmtGapPct(telemetry.paper.openAvgDistanceToTpPct)}`
               : 'paper only'}
           </small>
         </div>
@@ -750,8 +775,12 @@ export default function NeuralMindmap() {
                   <div><dt>Open / closed</dt><dd>{selectedLane.open} / {selectedLane.closed}</dd></div>
                   <div><dt>Net Avg R</dt><dd className={(selectedLane.netAvgR ?? 0) >= 0 ? 'tone-healthy' : 'tone-critical'}>{fmtR(selectedLane.netAvgR)}</dd></div>
                   <div><dt>PF / WR</dt><dd>{fmtNumber(selectedLane.pf)} / {selectedLane.wr === null ? 'n/a' : `${(selectedLane.wr * 100).toFixed(1)}%`}</dd></div>
+                  <div><dt>Avg entry / mark</dt><dd>{fmtPrice(selectedLane.openAvgEntryPrice)} / {fmtPrice(selectedLane.openAvgMarkPrice)}</dd></div>
+                  <div><dt>Avg TP / gap</dt><dd>{fmtPrice(selectedLane.openAvgTakeProfitPrice)} / {fmtGapPct(selectedLane.openAvgDistanceToTpPct)}</dd></div>
+                  <div><dt>Nearest TP gap</dt><dd>{fmtGapPct(selectedLane.openNearestDistanceToTpPct)} across {selectedLane.openMarkedSymbolCount} symbols</dd></div>
                   <div><dt>Paper evidence PnL</dt><dd>{fmtMoney(selectedLane.totalPnl)}</dd></div>
                   <div><dt>Diagnostic open MTM</dt><dd className={(selectedLane.diagnosticUnrealizedPnl ?? 0) >= 0 ? 'tone-healthy' : 'tone-critical'}>{fmtUsdt(selectedLane.diagnosticUnrealizedPnl)} / {fmtR(selectedLane.diagnosticUnrealizedR)}</dd></div>
+                  <div><dt>Max favorable open</dt><dd className={(selectedLane.openMaxFavorablePnl ?? 0) >= 0 ? 'tone-healthy' : 'tone-critical'}>{fmtUsdt(selectedLane.openMaxFavorablePnl)} / {fmtR(selectedLane.openMaxFavorableR)}</dd></div>
                   <div><dt>All open MTM</dt><dd className={(selectedLane.openUnrealizedPnl ?? 0) >= 0 ? 'tone-healthy' : 'tone-critical'}>{fmtUsdt(selectedLane.openUnrealizedPnl)} / {fmtR(selectedLane.openUnrealizedR)}</dd></div>
                   <div><dt>Binance mirrored</dt><dd>{selectedLiveLane ? `${selectedLiveLane.sourceOrderCount} orders / ${selectedLiveLane.symbols.length} symbols` : 'not open'}</dd></div>
                   <div><dt>Binance notional</dt><dd>{selectedLiveLane ? `${selectedLiveLane.notionalUsd.toFixed(2)} USDT` : '0.00 USDT'}</dd></div>
@@ -859,7 +888,7 @@ export default function NeuralMindmap() {
           <header><span>Lane performance field</span><strong>{telemetry?.lanes.length ?? 0} lanes</strong></header>
           <div className="neural-lane-table-wrap">
             <table>
-              <thead><tr><th>Lane</th><th>Evidence</th><th>Diag MTM</th><th>Binance PnL</th><th>Growth</th><th>Mirrored</th><th>n</th><th>Net Avg R</th><th>PF</th><th>WR</th></tr></thead>
+              <thead><tr><th>Lane</th><th>Evidence</th><th>TP Gap</th><th>Diag MTM</th><th>MFE</th><th>Binance PnL</th><th>Growth</th><th>Mirrored</th><th>n</th><th>Net Avg R</th><th>PF</th><th>WR</th></tr></thead>
               <tbody>
                 {telemetry?.lanes.map((lane) => {
                   const liveLane = liveAccount?.lanes.find((item) => item.laneId === lane.id);
@@ -871,7 +900,9 @@ export default function NeuralMindmap() {
                     <tr key={lane.id} className={lane.active ? 'is-active' : ''} onClick={() => setSelectedId(lane.id)}>
                       <td><i className={`health-${healthOf(lane.id).toLowerCase()}`} />{compactLaneLabel(lane.label)}</td>
                       <td>{lane.status}</td>
+                      <td>{fmtGapPct(lane.openAvgDistanceToTpPct)}</td>
                       <td className={(lane.diagnosticUnrealizedPnl ?? 0) >= 0 ? 'tone-healthy' : 'tone-critical'}>{fmtUsdt(lane.diagnosticUnrealizedPnl)}</td>
+                      <td className={(lane.openMaxFavorablePnl ?? 0) >= 0 ? 'tone-healthy' : 'tone-critical'}>{fmtUsdt(lane.openMaxFavorablePnl)}</td>
                       <td className={livePnl >= 0 ? 'tone-healthy' : 'tone-critical'}>{`${livePnl >= 0 ? '+' : ''}${livePnl.toFixed(2)} USDT`}</td>
                       <td className={livePnl >= 0 ? 'tone-healthy' : 'tone-critical'}>{fmtPct(liveGrowth)}</td>
                       <td>{liveLane?.sourceOrderCount ?? 0}</td>

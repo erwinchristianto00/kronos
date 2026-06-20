@@ -75,6 +75,14 @@ export interface NeuralMapLane {
   diagnosticUnrealizedR: number | null;
   headlineUnrealizedPnl: number | null;
   headlineUnrealizedR: number | null;
+  openMaxFavorablePnl: number | null;
+  openMaxFavorableR: number | null;
+  openAvgDistanceToTpPct: number | null;
+  openNearestDistanceToTpPct: number | null;
+  openAvgEntryPrice: number | null;
+  openAvgMarkPrice: number | null;
+  openAvgTakeProfitPrice: number | null;
+  openMarkedSymbolCount: number;
   /** True when the lane's PnL comes ENTIRELY from DIAGNOSTIC_ONLY orders (zero headline closed). */
   pnlIsDiagnosticOnly: boolean;
   startingEquity: number;
@@ -135,6 +143,10 @@ export interface NeuralMapTelemetry {
     diagnosticUnrealizedR: number | null;
     headlineUnrealizedPnl: number | null;
     headlineUnrealizedR: number | null;
+    openMaxFavorablePnl: number | null;
+    openMaxFavorableR: number | null;
+    openAvgDistanceToTpPct: number | null;
+    openNearestDistanceToTpPct: number | null;
     unrealizedMarkCount: number;
     unrealizedMissingPriceCount: number;
     unrealizedPriceSource: string | null;
@@ -185,9 +197,15 @@ export interface NeuralMapTelemetryInput {
 
 const CLOSED = new Set(["PAPER_CLOSED_WIN", "PAPER_CLOSED_LOSS"]);
 const OPEN = new Set(["CREATED", "PAPER_SUBMITTED"]);
+const MARK_CANDLE_MS = 5 * 60 * 1000;
 
 export interface PaperMarkPriceClient {
-  getCandles(symbol: string, interval: string, limit: number): Promise<Array<{ close: number }>>;
+  getCandles(symbol: string, interval: string, limit: number): Promise<Array<{
+    openTime?: number;
+    high?: number;
+    low?: number;
+    close: number;
+  }>>;
 }
 
 interface PaperUnrealizedLane {
@@ -198,6 +216,14 @@ interface PaperUnrealizedLane {
   diagnosticR: number;
   headlinePnl: number;
   headlineR: number;
+  maxFavorablePnl: number;
+  maxFavorableR: number;
+  avgDistanceToTpPct: number | null;
+  nearestDistanceToTpPct: number | null;
+  avgEntryPrice: number | null;
+  avgMarkPrice: number | null;
+  avgTakeProfitPrice: number | null;
+  symbolCount: number;
 }
 
 export interface PaperUnrealizedSnapshot {
@@ -211,6 +237,10 @@ export interface PaperUnrealizedSnapshot {
   diagnosticR: number;
   headlinePnl: number;
   headlineR: number;
+  maxFavorablePnl: number;
+  maxFavorableR: number;
+  avgDistanceToTpPct: number | null;
+  nearestDistanceToTpPct: number | null;
   lanes: Record<string, PaperUnrealizedLane>;
 }
 
@@ -231,18 +261,42 @@ export async function buildPaperUnrealizedSnapshot(
   const openOrders = orders.filter((order) => OPEN.has(order.paperStatus));
   const symbols = Array.from(new Set(openOrders.map((order) => order.symbol).filter(Boolean))).sort();
   const prices = new Map<string, number>();
+  const candlesBySymbol = new Map<string, Awaited<ReturnType<PaperMarkPriceClient["getCandles"]>>>();
+  const nowMs = new Date(generatedAt).getTime();
 
   await Promise.all(symbols.map(async (symbol) => {
     try {
-      const candles = await priceClient.getCandles(symbol, "5m", 1);
+      const oldestOpenedAt = Math.min(
+        ...openOrders
+          .filter((order) => order.symbol === symbol)
+          .map((order) => new Date(order.openedAt).getTime())
+          .filter(Number.isFinite),
+      );
+      const lookbackCandles = Number.isFinite(oldestOpenedAt) && Number.isFinite(nowMs)
+        ? Math.ceil(Math.max(0, nowMs - oldestOpenedAt) / MARK_CANDLE_MS) + 5
+        : 1;
+      const candles = await priceClient.getCandles(symbol, "5m", Math.min(Math.max(1, lookbackCandles), 1000));
       const latest = candles.at(-1)?.close;
+      candlesBySymbol.set(symbol, candles);
       if (finite(latest) && latest > 0) prices.set(symbol, latest);
     } catch {
       // Missing one mark price should degrade that symbol only, not the whole dashboard.
     }
   }));
 
-  const lanes: Record<string, PaperUnrealizedLane> = {};
+  type LaneAccum = Omit<PaperUnrealizedLane,
+    "avgDistanceToTpPct" | "nearestDistanceToTpPct" | "avgEntryPrice" | "avgMarkPrice" | "avgTakeProfitPrice" | "symbolCount"
+  > & {
+    distanceToTpPctSum: number;
+    distanceToTpPctCount: number;
+    nearestDistanceToTpPct: number | null;
+    entryPriceSum: number;
+    markPriceSum: number;
+    takeProfitPriceSum: number;
+    priceCount: number;
+    symbols: Set<string>;
+  };
+  const lanes: Record<string, LaneAccum> = {};
   let markCount = 0;
   let missingPriceCount = 0;
   let totalPnl = 0;
@@ -251,19 +305,40 @@ export async function buildPaperUnrealizedSnapshot(
   let diagnosticR = 0;
   let headlinePnl = 0;
   let headlineR = 0;
+  let maxFavorablePnl = 0;
+  let maxFavorableR = 0;
+  let distanceToTpPctSum = 0;
+  let distanceToTpPctCount = 0;
+  let nearestDistanceToTpPct: number | null = null;
 
   for (const order of openOrders) {
     const markPrice = prices.get(order.symbol);
     const entryPrice = order.entryPrice;
+    const takeProfitPrice = order.takeProfitLevels[0];
     const notional = order.plannedPositionNotional;
     const riskAmount = order.plannedRiskAmount;
-    if (!finite(markPrice) || !finite(entryPrice) || entryPrice <= 0 || !finite(notional)) {
+    if (!finite(markPrice) || !finite(entryPrice) || entryPrice <= 0 || !finite(notional) || !finite(takeProfitPrice)) {
       missingPriceCount += 1;
       continue;
     }
     const quantity = notional / entryPrice;
     const pnl = (order.direction === "SHORT" ? entryPrice - markPrice : markPrice - entryPrice) * quantity;
     const r = finite(riskAmount) && riskAmount > 0 ? pnl / riskAmount : 0;
+    const openedAtMs = new Date(order.openedAt).getTime();
+    const candles = candlesBySymbol.get(order.symbol) ?? [];
+    const favorablePrice = candles.reduce((best, candle) => {
+      if (finite(candle.openTime) && candle.openTime < openedAtMs - MARK_CANDLE_MS) return best;
+      const candidate = order.direction === "SHORT" ? candle.low : candle.high;
+      if (!finite(candidate)) return best;
+      if (!finite(best)) return candidate;
+      return order.direction === "SHORT" ? Math.min(best, candidate) : Math.max(best, candidate);
+    }, markPrice);
+    const maxPnl = (order.direction === "SHORT" ? entryPrice - favorablePrice : favorablePrice - entryPrice) * quantity;
+    const maxR = finite(riskAmount) && riskAmount > 0 ? maxPnl / riskAmount : 0;
+    const distanceToTpPct =
+      order.direction === "SHORT"
+        ? ((markPrice - takeProfitPrice) / markPrice) * 100
+        : ((takeProfitPrice - markPrice) / markPrice) * 100;
     const diagnostic = isDiagnosticPaperOrder(order);
     const lane = lanes[order.selectedLaneId] ?? {
       open: 0,
@@ -273,14 +348,45 @@ export async function buildPaperUnrealizedSnapshot(
       diagnosticR: 0,
       headlinePnl: 0,
       headlineR: 0,
+      maxFavorablePnl: 0,
+      maxFavorableR: 0,
+      distanceToTpPctSum: 0,
+      distanceToTpPctCount: 0,
+      nearestDistanceToTpPct: null,
+      entryPriceSum: 0,
+      markPriceSum: 0,
+      takeProfitPriceSum: 0,
+      priceCount: 0,
+      symbols: new Set<string>(),
     };
 
     markCount += 1;
     totalPnl += pnl;
     totalR += r;
+    maxFavorablePnl += maxPnl;
+    maxFavorableR += maxR;
+    if (finite(distanceToTpPct)) {
+      distanceToTpPctSum += distanceToTpPct;
+      distanceToTpPctCount += 1;
+      nearestDistanceToTpPct =
+        nearestDistanceToTpPct === null ? distanceToTpPct : Math.min(nearestDistanceToTpPct, distanceToTpPct);
+    }
     lane.open += 1;
     lane.pnl += pnl;
     lane.r += r;
+    lane.maxFavorablePnl += maxPnl;
+    lane.maxFavorableR += maxR;
+    lane.entryPriceSum += entryPrice;
+    lane.markPriceSum += markPrice;
+    lane.takeProfitPriceSum += takeProfitPrice;
+    lane.priceCount += 1;
+    lane.symbols.add(order.symbol);
+    if (finite(distanceToTpPct)) {
+      lane.distanceToTpPctSum += distanceToTpPct;
+      lane.distanceToTpPctCount += 1;
+      lane.nearestDistanceToTpPct =
+        lane.nearestDistanceToTpPct === null ? distanceToTpPct : Math.min(lane.nearestDistanceToTpPct, distanceToTpPct);
+    }
 
     if (diagnostic) {
       diagnosticPnl += pnl;
@@ -296,6 +402,27 @@ export async function buildPaperUnrealizedSnapshot(
     lanes[order.selectedLaneId] = lane;
   }
 
+  const renderedLanes: Record<string, PaperUnrealizedLane> = {};
+  for (const [laneId, lane] of Object.entries(lanes)) {
+    renderedLanes[laneId] = {
+      open: lane.open,
+      pnl: lane.pnl,
+      r: lane.r,
+      diagnosticPnl: lane.diagnosticPnl,
+      diagnosticR: lane.diagnosticR,
+      headlinePnl: lane.headlinePnl,
+      headlineR: lane.headlineR,
+      maxFavorablePnl: lane.maxFavorablePnl,
+      maxFavorableR: lane.maxFavorableR,
+      avgDistanceToTpPct: lane.distanceToTpPctCount > 0 ? lane.distanceToTpPctSum / lane.distanceToTpPctCount : null,
+      nearestDistanceToTpPct: lane.nearestDistanceToTpPct,
+      avgEntryPrice: lane.priceCount > 0 ? lane.entryPriceSum / lane.priceCount : null,
+      avgMarkPrice: lane.priceCount > 0 ? lane.markPriceSum / lane.priceCount : null,
+      avgTakeProfitPrice: lane.priceCount > 0 ? lane.takeProfitPriceSum / lane.priceCount : null,
+      symbolCount: lane.symbols.size,
+    };
+  }
+
   return {
     generatedAt,
     priceSource: "BINANCE_5M_CLOSE",
@@ -307,7 +434,11 @@ export async function buildPaperUnrealizedSnapshot(
     diagnosticR,
     headlinePnl,
     headlineR,
-    lanes,
+    maxFavorablePnl,
+    maxFavorableR,
+    avgDistanceToTpPct: distanceToTpPctCount > 0 ? distanceToTpPctSum / distanceToTpPctCount : null,
+    nearestDistanceToTpPct,
+    lanes: renderedLanes,
   };
 }
 
@@ -697,6 +828,14 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
       diagnosticUnrealizedR: unrealized?.diagnosticR ?? null,
       headlineUnrealizedPnl: unrealized?.headlinePnl ?? null,
       headlineUnrealizedR: unrealized?.headlineR ?? null,
+      openMaxFavorablePnl: unrealized?.maxFavorablePnl ?? null,
+      openMaxFavorableR: unrealized?.maxFavorableR ?? null,
+      openAvgDistanceToTpPct: unrealized?.avgDistanceToTpPct ?? null,
+      openNearestDistanceToTpPct: unrealized?.nearestDistanceToTpPct ?? null,
+      openAvgEntryPrice: unrealized?.avgEntryPrice ?? null,
+      openAvgMarkPrice: unrealized?.avgMarkPrice ?? null,
+      openAvgTakeProfitPrice: unrealized?.avgTakeProfitPrice ?? null,
+      openMarkedSymbolCount: unrealized?.symbolCount ?? 0,
       pnlIsDiagnosticOnly,
       startingEquity: input.paper.startingEquity,
       totalPnlPct: pnlPct(economics.totalPnl, input.paper.startingEquity),
@@ -964,6 +1103,10 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
       diagnosticUnrealizedR: input.paperUnrealized?.diagnosticR ?? null,
       headlineUnrealizedPnl: input.paperUnrealized?.headlinePnl ?? null,
       headlineUnrealizedR: input.paperUnrealized?.headlineR ?? null,
+      openMaxFavorablePnl: input.paperUnrealized?.maxFavorablePnl ?? null,
+      openMaxFavorableR: input.paperUnrealized?.maxFavorableR ?? null,
+      openAvgDistanceToTpPct: input.paperUnrealized?.avgDistanceToTpPct ?? null,
+      openNearestDistanceToTpPct: input.paperUnrealized?.nearestDistanceToTpPct ?? null,
       unrealizedMarkCount: input.paperUnrealized?.markCount ?? 0,
       unrealizedMissingPriceCount: input.paperUnrealized?.missingPriceCount ?? input.paper.open,
       unrealizedPriceSource: input.paperUnrealized?.priceSource ?? null,
