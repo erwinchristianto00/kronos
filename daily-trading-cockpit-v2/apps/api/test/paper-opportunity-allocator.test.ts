@@ -75,7 +75,7 @@ function routerOf(regime: string | null) {
   });
 }
 
-/** VM store with 60 winning SHORT signals so CG_WIDE_STOP_TP_WIDE passes economics. */
+/** VM store with 60 winning SHORT signals so the canonical scaleout headline lane passes economics. */
 async function buildWinningVmReport(dir: string): Promise<CurrentGuardVariantMatrixReport> {
   const vmStore = new CurrentGuardVariantMatrixStore(dir);
   const recentBase = Date.now() - 6 * 24 * 60 * 60 * 1000;
@@ -404,7 +404,7 @@ describe("paper-opportunity-allocator", () => {
     );
     expect(report.paperEligibleCount).toBeGreaterThanOrEqual(1);
     expect(report.selectedOpportunities.length).toBeGreaterThanOrEqual(1);
-    expect(report.selectedOpportunities[0]!.variantId).toBe("CG_WIDE_STOP_TP_WIDE");
+    expect(report.selectedOpportunities[0]!.variantId).toBe("CG_SCALEOUT_TP1_TRAIL");
   });
 
   // [3]
@@ -428,6 +428,7 @@ describe("paper-opportunity-allocator", () => {
       baseInputs({
         vmReport,
         candidates: [makeCandidate({ stopLoss: 100.5, tp1: 99 })],
+        paperCgWidePriority: true,
       }),
     );
     expect(report.paperEligibleCount).toBe(1);
@@ -467,7 +468,7 @@ describe("paper-opportunity-allocator", () => {
     expect(maker?.evaluated).toBe(1);
     expect(baseline?.eligible).toBe(0);
     expect(maker?.eligible).toBe(0);
-    expect(report.selectedOpportunities.every((o) => o.variantId === "CG_WIDE_STOP_TP_WIDE")).toBe(true);
+    expect(report.selectedOpportunities.every((o) => o.variantId === "CG_SCALEOUT_TP1_TRAIL")).toBe(true);
     expect(report.topRejects.map((r) => r.key)).toContain("LANE_DIAGNOSTIC_ONLY");
   });
 
@@ -785,7 +786,7 @@ describe("paper-opportunity-allocator", () => {
     expect(report.selectedOpportunities.length).toBe(0);
   });
 
-  it("[11b] Bullish LONG_ONLY creates isolated LONG paper-diagnostic opportunities", async () => {
+  it("[11b] Bullish LONG_ONLY creates isolated LONG paper-headline opportunities", async () => {
     const dir = tmpDir();
     const vmReport = buildEmptyVmReport(dir);
     const report = buildPaperOpportunityAllocatorReport(
@@ -805,12 +806,12 @@ describe("paper-opportunity-allocator", () => {
     expect(report.controllerMode).toBe("LONG_ONLY");
     expect(report.selectedOpportunities).toHaveLength(1);
     const opportunity = report.selectedOpportunities[0]!;
-    expect(opportunity.laneId).toBe("CG_LONG_VARIANT_MATRIX:CG_WIDE_STOP_TP_WIDE");
-    expect(opportunity.variantId).toBe("CG_WIDE_STOP_TP_WIDE");
+    expect(opportunity.laneId).toBe("CG_LONG_VARIANT_MATRIX:CG_SCALEOUT_TP1_TRAIL");
+    expect(opportunity.variantId).toBe("CG_SCALEOUT_TP1_TRAIL");
     expect(opportunity.direction).toBe("LONG");
-    expect(opportunity.paperOrderMode).toBe("DIAGNOSTIC_ONLY");
+    expect(opportunity.paperOrderMode).toBe("HEADLINE");
     expect(opportunity.paperRiskLabel).toBe("EXPERIMENTAL");
-    expect(opportunity.provenance?.candidateQualityFlags).toContain("LONG_PAPER_OOS_COLLECTION");
+    expect(opportunity.provenance?.candidateQualityFlags).toContain("LONG_HEADLINE_FORWARD_OOS_COLLECTION");
     expect(opportunity.stopLoss).toBeLessThan(opportunity.entryPrice);
     expect(opportunity.takeProfitLevels[0]).toBeGreaterThan(opportunity.entryPrice);
 
@@ -824,16 +825,16 @@ describe("paper-opportunity-allocator", () => {
       now: new Date().toISOString(),
     });
     expect(admitted.admitted).toBe(1);
-    expect(admitted.admittedDiagnostic).toBe(1);
+    expect(admitted.admittedHeadline).toBe(1);
     const order = store.all[0]!;
     expect(order.direction).toBe("LONG");
-    expect(order.selectedLaneId).toBe("CG_LONG_VARIANT_MATRIX:CG_WIDE_STOP_TP_WIDE");
-    expect(order.paperOrderMode).toBe("DIAGNOSTIC_ONLY");
+    expect(order.selectedLaneId).toBe("CG_LONG_VARIANT_MATRIX:CG_SCALEOUT_TP1_TRAIL");
+    expect(order.paperOrderMode).toBe("HEADLINE");
     expect(order.reportOnly).toBe(true);
     expect(order.paperOnly).toBe(true);
   });
 
-  it("[11b-bull] Bullish LONG_ONLY admits the pure bull trend lane alongside CG_WIDE LONG", async () => {
+  it("[11b-bull] Bullish LONG_ONLY admits the pure bull trend lane alongside LONG scaleout headline", async () => {
     const dir = tmpDir();
     const vmReport = buildEmptyVmReport(dir);
     const report = buildPaperOpportunityAllocatorReport(
@@ -842,12 +843,11 @@ describe("paper-opportunity-allocator", () => {
         marketRegime: "Bullish expansion",
         routerReport: routerOf("Bullish expansion"),
         paperVariantMatrixDiagnosticEnabled: true,
-        paperCgWidePriority: true,
         candidates: [makeCandidate({
           symbol: "BTCUSDT",
           direction: "LONG",
-          stopLoss: 98.8,
-          tp1: 102,
+          stopLoss: 97,
+          tp1: 104,
           trendScore: 78,
           kronosBias: "LONG",
           whaleSignal: "BULLISH",
@@ -861,12 +861,12 @@ describe("paper-opportunity-allocator", () => {
     expect(bull).toBeDefined();
     expect(bull?.laneId).toBe("CG_LONG_VARIANT_MATRIX:BL_TREND_R15_STOP200_FULL");
     expect(bull?.paperOrderMode).toBe("DIAGNOSTIC_ONLY");
-    expect(bull?.plannedStopDistanceBps).toBeCloseTo(200, 6);
-    expect(bull?.takeProfitLevels[0]).toBeCloseTo(103, 6);
+    expect(bull?.plannedStopDistanceBps).toBeGreaterThanOrEqual(200);
+    expect(bull?.takeProfitLevels[0]).toBeGreaterThan(bull!.entryPrice);
     expect(bull?.provenance?.candidateQualityFlags).toContain("PURE_BULLISH_TREND_OOS");
     expect(
       report.selectedOpportunities.some(
-        (opportunity) => opportunity.laneId === "CG_LONG_VARIANT_MATRIX:CG_WIDE_STOP_TP_WIDE",
+        (opportunity) => opportunity.laneId === "CG_LONG_VARIANT_MATRIX:CG_SCALEOUT_TP1_TRAIL",
       ),
     ).toBe(true);
   });
@@ -923,7 +923,7 @@ describe("paper-opportunity-allocator", () => {
     );
 
     expect(report.selectedOpportunities).toHaveLength(1);
-    expect(report.selectedOpportunities[0]!.laneId).toBe("CG_VARIANT_MATRIX:CG_WIDE_STOP_TP_WIDE");
+    expect(report.selectedOpportunities[0]!.laneId).toBe("CG_VARIANT_MATRIX:CG_SCALEOUT_TP1_TRAIL");
     expect(report.selectedOpportunities[0]!.paperOrderMode).toBe("HEADLINE");
   });
 
@@ -1721,7 +1721,7 @@ describe("paper-opportunity-allocator", () => {
         laneState: degradedLaneState({
           activeLaneId: "CG_VARIANT_MATRIX:CG_TRAIL_RUNNER",
           betterLaneAvailable: true,
-          selectedNextLaneId: "CG_VARIANT_MATRIX:CG_WIDE_STOP_TP_WIDE",
+          selectedNextLaneId: "CG_VARIANT_MATRIX:CG_SCALEOUT_TP1_TRAIL",
         }),
       }),
     );

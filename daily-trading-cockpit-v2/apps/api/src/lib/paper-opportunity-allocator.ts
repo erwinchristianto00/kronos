@@ -365,24 +365,24 @@ export interface PaperOpportunityAllocatorInputs {
 // ─── lane policy ──────────────────────────────────────────────────────────────
 
 /**
- * Headline admission remains limited to the wide-stop lane. The trail challenger
+ * Headline admission is anchored on the proven scaleout exit. The trail challenger
  * is modeled accurately by the paper resolver, but can only enter the bounded
  * DIAGNOSTIC_ONLY learning sleeve.
  *
- * NOTE: the active HEADLINE strategy is the proven scaleout exit, selected via the
- * variant-matrix admission path (PAPER_ELIGIBLE_VARIANT_IDS in paper-execution-router).
- * Any full-exit (CG_WIDE) order this allocator still admits as HEADLINE is reclassified to
- * DIAGNOSTIC_ONLY each pass by reclassifyDemotedFullExitHeadlineOrders(), so the full-exit
- * lane can never pollute the scaleout headline metrics.
+ * Long-only forward OOS collection also uses the same scaleout exit family so the
+ * bullish paper lane can create true HEADLINE paper orders when a candidate clears
+ * the quality gates, instead of being hard-forced into diagnostic-only forever.
  */
 const PAPER_ADMISSIBLE_LANE_IDS: readonly VariantMatrixVariantId[] = [
   "CG_WIDE_STOP_TP_WIDE",
+  "CG_SCALEOUT_TP1_TRAIL",
   "CG_TRAIL_AFTER_TP1",
 ];
 const PAPER_CHALLENGER_LANE_ID: VariantMatrixVariantId = "CG_TRAIL_AFTER_TP1";
+const HEADLINE_VARIANT_ID: VariantMatrixVariantId = "CG_SCALEOUT_TP1_TRAIL";
 /**
  * Variants admitted as DIAGNOSTIC_ONLY paper sleeves in BOTH directions when the full
- * variant-matrix paper collection is enabled. CG_WIDE_STOP_TP_WIDE stays the HEADLINE lane and
+ * variant-matrix paper collection is enabled. CG_SCALEOUT_TP1_TRAIL stays the HEADLINE lane and
  * CG_TRAIL_AFTER_TP1 stays the quarantine-able challenger — so neither is listed here. The
  * resolver honestly resolves every exit/fill rule (tp1_full, scaleout, maker no-fill) via
  * walkVariantPath, so these never silently mis-resolve. All stay excluded from headline net/PF/WR.
@@ -473,8 +473,9 @@ const NEAR_MISS_REASONS = new Set<string>([
   "LANE_NO_EVIDENCE",
 ]);
 
-/** The single lane id the allocator can admit a paper order into. */
-const ADMISSION_TARGET_LANE_ID = "CG_VARIANT_MATRIX:CG_WIDE_STOP_TP_WIDE";
+function isAdmissionTargetLaneId(laneId: string | null | undefined): boolean {
+  return laneId === `CG_VARIANT_MATRIX:${HEADLINE_VARIANT_ID}` || laneId === `CG_LONG_VARIANT_MATRIX:${HEADLINE_VARIANT_ID}`;
+}
 
 /** Cost-in-R ceiling: above this the geometry/candidate cannot pay for itself. */
 const CANDIDATE_MAX_COST_R = 0.5;
@@ -616,7 +617,7 @@ function decideLaneAdmission(
 
   // A better lane that IS the allocator's admission target → resume HEADLINE
   // admission there (the degraded active lane was a different lane).
-  if (betterLane && laneState.selectedNextLaneId === ADMISSION_TARGET_LANE_ID) {
+  if (betterLane && isAdmissionTargetLaneId(laneState.selectedNextLaneId)) {
     return {
       laneAdmissionStatus: "ACTIVE",
       rotationAction: "ROTATE_TO_BETTER_LANE",
@@ -1197,9 +1198,23 @@ export function buildPaperOpportunityAllocatorReport(
       // Full variant-matrix diagnostic collection: admit the 4 non-headline, non-challenger
       // variants as DIAGNOSTIC_ONLY sleeves (both directions). Bypasses the benchmark-only and
       // not-paper-modeled rejections below; economics gates are skipped (it's diagnostic).
-      const variantDiagnosticCollection =
-        variantMatrixDiagnosticEnabled && VARIANT_MATRIX_DIAGNOSTIC_IDS.includes(def.id);
       const bullTrendCollection = def.bullishOnly === true;
+      const longPaperCollection =
+        direction === "LONG" &&
+        def.id === "CG_WIDE_STOP_TP_WIDE" &&
+        regimeFamily === "MIXED";
+      const longHeadlineCollection =
+        direction === "LONG" &&
+        def.id === HEADLINE_VARIANT_ID &&
+        controllerMode === "LONG_ONLY" &&
+        regimeFamily === "BULLISH";
+      const variantDiagnosticCollection =
+        variantMatrixDiagnosticEnabled &&
+        VARIANT_MATRIX_DIAGNOSTIC_IDS.includes(def.id) &&
+        (
+          def.id !== HEADLINE_VARIANT_ID ||
+          (laneDecision.batchOrderMode !== "HEADLINE" && !longHeadlineCollection)
+        );
       if (BENCHMARK_ONLY_LANE_IDS.includes(def.id) && !variantDiagnosticCollection) {
         recordReject(symbol, direction, def.id, "LANE_DIAGNOSTIC_ONLY", rowFresh, rowNet);
         continue;
@@ -1228,13 +1243,6 @@ export function buildPaperOpportunityAllocatorReport(
         continue;
       }
 
-      const longPaperCollection =
-        direction === "LONG" &&
-        def.id === "CG_WIDE_STOP_TP_WIDE" &&
-        (
-          (controllerMode === "LONG_ONLY" && regimeFamily === "BULLISH") ||
-          regimeFamily === "MIXED"
-        );
       // CG_WIDE priority collection: the operator prioritizes CG_WIDE on its realized paper
       // performance, so it bypasses the VM-sim economics veto AND the degraded-lane gate, and
       // admits as HEADLINE when the candidate is headline-quality, else falls back to
@@ -1244,6 +1252,7 @@ export function buildPaperOpportunityAllocatorReport(
       // to COLLECT that economics honestly). Regime/direction-compat gates below still apply.
       const skipEconomics =
         longPaperCollection ||
+        longHeadlineCollection ||
         variantDiagnosticCollection ||
         cgWidePriorityCollection;
 
@@ -1291,6 +1300,15 @@ export function buildPaperOpportunityAllocatorReport(
         recordReject(symbol, direction, def.id, "ECONOMICS_FAILS_PLUS10BPS_STRESS", rowFresh, rowNet);
         continue;
       }
+      if (
+        def.id === "CG_WIDE_STOP_TP_WIDE" &&
+        !cgWidePriorityCollection &&
+        !longPaperCollection &&
+        regimeFamily !== "MIXED"
+      ) {
+        recordReject(symbol, direction, def.id, "FULL_EXIT_COMPARISON_ONLY", rowFresh, rowNet);
+        continue;
+      }
 
       // Freshness (anti-lookahead) — uses the SOURCE scan timestamp.
       if (!Number.isFinite(scanFinishedMs) || nowMs - scanFinishedMs > maxAge) {
@@ -1304,6 +1322,8 @@ export function buildPaperOpportunityAllocatorReport(
 
       const laneId = longPaperCollection
         ? LONG_WIDE_PAPER_LANE_ID
+        : longHeadlineCollection
+          ? `CG_LONG_VARIANT_MATRIX:${HEADLINE_VARIANT_ID}`
         : variantDiagnosticCollection && direction === "LONG"
           ? `CG_LONG_VARIANT_MATRIX:${def.id}`
           : `CG_VARIANT_MATRIX:${def.id}`;
@@ -1567,6 +1587,9 @@ export function buildPaperOpportunityAllocatorReport(
               : "LONG_PAPER_OOS_COLLECTION",
           );
         }
+        if (longHeadlineCollection) {
+          provenance.candidateQualityFlags.push("LONG_HEADLINE_FORWARD_OOS_COLLECTION");
+        }
         if (challengerDiagnosticCollection) {
           provenance.candidateQualityFlags.push("TRAIL_CHALLENGER_FORWARD_OOS");
         }
@@ -1631,6 +1654,35 @@ export function buildPaperOpportunityAllocatorReport(
           continue;
         }
         orderMode = "DIAGNOSTIC_ONLY";
+      } else if (longHeadlineCollection) {
+        if (laneDecision.batchOrderMode === "HEADLINE") {
+          if (!verdict.headlineOk) {
+            const reason = verdict.reason ?? "CANDIDATE_REJECTED";
+            recordReject(symbol, direction, def.id, reason, rowFresh, rowNet);
+            if (
+              rejectDiagnosticContinue &&
+              verdict.diagnosticEligible &&
+              REJECT_DIAGNOSTIC_SAMPLEABLE_REASONS.has(reason)
+            ) {
+              rejectDiagnosticPool.push({
+                opportunity: buildOpportunity("DIAGNOSTIC_ONLY"),
+                reason,
+                symbol,
+                laneId: def.id,
+                rank: typeof c.rank === "number" && Number.isFinite(c.rank) ? c.rank : null,
+                freshValid: rowFresh,
+              });
+            }
+            continue;
+          }
+          orderMode = "HEADLINE";
+        } else {
+          if (!verdict.diagnosticEligible) {
+            recordReject(symbol, direction, def.id, verdict.reason ?? "CANDIDATE_REJECTED_HARD", rowFresh, rowNet);
+            continue;
+          }
+          orderMode = "DIAGNOSTIC_ONLY";
+        }
       } else if (longPaperCollection) {
         if (!verdict.diagnosticEligible) {
           recordReject(symbol, direction, def.id, verdict.reason ?? "CANDIDATE_REJECTED_HARD", rowFresh, rowNet);
