@@ -1258,6 +1258,26 @@ export async function registerShadowRoutes(
         const _rbc = opts.binanceClient;
         try {
           const cgvmStoreForResolve = getCurrentGuardVariantMatrixStore();
+          // Mirror freshly-closed shadow positions into the variant-matrix tape
+          // BEFORE resolving. This is the headless driver for OOS growth: the
+          // resolver below only resolves what is already in the store, and the
+          // mirror step previously ran ONLY inside the heavy dashboard-audit-summary
+          // endpoint — which the 24/7 ticker never calls. Without this, freshly
+          // closed shadow positions are never recorded, the store stays empty, and
+          // freshValid/OOS never advances headless (lanes never mature → no
+          // headline). Report-only; deduped by the store; never throws.
+          if (process.env.CURRENT_GUARD_VARIANT_MATRIX_DISABLED !== "1" && shadowEngine) {
+            try {
+              const cutoverTs = getPostCutoverStore().getBoundary()?.cutoverTimestamp ?? null;
+              const cgvmSignals = selectVariantMatrixSignals(
+                shadowEngine.getAllPositions(),
+                cutoverTs ?? undefined,
+              );
+              mirrorVariantMatrixSignals(cgvmSignals, cgvmStoreForResolve, new Date().toISOString());
+            } catch {
+              /* mirror must never break the brief */
+            }
+          }
           const resolverPromise = resolveVariantMatrixObservations(cgvmStoreForResolve, {
             getKlines: async (symbol: string, interval: string, klineOpts: { startTime: number; endTime: number; limit: number }) => {
               const candles = await _rbc.getCandles(symbol, interval, klineOpts.limit, {
