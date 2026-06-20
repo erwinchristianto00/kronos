@@ -1409,6 +1409,13 @@ i.health-diagnostic {
   gap: 8px;
 }
 
+.neural-section-note {
+  margin: 0 0 8px;
+  font-size: 11px;
+  line-height: 1.4;
+  color: #8a9bb0;
+}
+
 .neural-oos-bar {
   flex: 1;
   height: 6px;

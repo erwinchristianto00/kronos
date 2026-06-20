@@ -3,6 +3,7 @@ import {
   BULL_SCALEOUT_VARIANT_ID,
   BULL_TREND_VARIANT_ID,
   VARIANT_MATRIX_DEFINITIONS,
+  WATCHABLE_MIN_FRESH,
   type CurrentGuardVariantMatrixReport,
 } from "./current-guard-variant-matrix.js";
 import type { MixedBudgetForwardValidationReport, MixedRegimeReport, OpenOrderStaleAudit } from "./mixed-regime-router.js";
@@ -58,6 +59,12 @@ export interface NeuralMapLane {
   active: boolean;
   open: number;
   closed: number;
+  /** VM-sim freshValid (CLOSED_WIN+CLOSED_LOSS) for this lane's geometry, vs the
+   *  threshold to leave SHADOW_ONLY. This is the REAL per-lane OOS maturity meter,
+   *  distinct from the mixed-regime guardrail OOS (inactive outside a Mixed regime).
+   *  null for paper-evidence lanes that have no VM row. */
+  oosFreshValid: number | null;
+  oosThreshold: number;
   netAvgR: number | null;
   pf: number | null;
   wr: number | null;
@@ -903,6 +910,8 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
       active: !quarantined && (activeLaneIds.has(id) || economics.open > 0),
       open: economics.open,
       closed: evidenceRow?.freshValid ?? economics.closed,
+      oosFreshValid: evidenceRow?.freshValid ?? null,
+      oosThreshold: WATCHABLE_MIN_FRESH,
       netAvgR,
       pf: evidenceRow?.pf ?? economics.pf,
       wr: evidenceRow?.wr ?? economics.wr,

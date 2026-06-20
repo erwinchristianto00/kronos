@@ -43,6 +43,8 @@ interface NeuralLane {
   active: boolean;
   open: number;
   closed: number;
+  oosFreshValid: number | null;
+  oosThreshold: number;
   netAvgR: number | null;
   pf: number | null;
   wr: number | null;
@@ -993,6 +995,31 @@ export default function NeuralMindmap() {
                 <strong>{selectedLiveLane ? 'Lane color follows Binance unrealized PnL.' : laneDiagnosis(selectedLane)}</strong>
                 <p>Paper evidence remains separate; execution equity, exposure, and current PnL come from Binance testnet.</p>
               </div>
+              {selectedLane.oosFreshValid !== null && (
+                <div className="neural-inspector-section">
+                  <h2>OOS maturity (this lane)</h2>
+                  <dl>
+                    <div>
+                      <dt>Validated</dt>
+                      <dd>{selectedLane.oosFreshValid} / {selectedLane.oosThreshold} fresh closes</dd>
+                    </div>
+                    <div>
+                      <dt>Progress</dt>
+                      <dd>
+                        <div className="neural-oos-bar">
+                          <div
+                            className={`neural-oos-fill ${selectedLane.oosFreshValid >= selectedLane.oosThreshold ? 'is-complete' : ''}`}
+                            style={{ width: `${Math.min(100, (selectedLane.oosFreshValid / Math.max(1, selectedLane.oosThreshold)) * 100).toFixed(1)}%` }}
+                          />
+                        </div>
+                        {selectedLane.oosFreshValid >= selectedLane.oosThreshold
+                          ? 'Mature — headline-eligible'
+                          : `${Math.floor((selectedLane.oosFreshValid / Math.max(1, selectedLane.oosThreshold)) * 100)}% — still collecting (direction-agnostic geometry validation)`}
+                      </dd>
+                    </div>
+                  </dl>
+                </div>
+              )}
               <div className="neural-inspector-section">
                 <dl>
                   <div><dt>Evidence status</dt><dd>{selectedLane.status}</dd></div>
@@ -1044,7 +1071,8 @@ export default function NeuralMindmap() {
 
           {telemetry && telemetry.mixed.oosThreshold > 0 && (
             <div className="neural-inspector-section">
-              <h2>OOS evidence progress</h2>
+              <h2>Mixed-regime OOS guardrail</h2>
+              <p className="neural-section-note">Only accrues during a <strong>Mixed</strong> regime. 0 here while the regime is Bullish/Bearish is expected — per-lane geometry maturity is the meter above.</p>
               <dl>
                 <div>
                   <dt>Collected</dt>
