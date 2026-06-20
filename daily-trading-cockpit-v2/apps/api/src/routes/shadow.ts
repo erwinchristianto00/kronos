@@ -165,7 +165,7 @@ import {
   getRegimeDirectionControllerSnapshotStore,
   buildSnapshotFromReport,
 } from "../lib/regime-direction-controller-snapshot.js";
-import { buildNeuralMapTelemetry } from "../lib/neural-map-telemetry.js";
+import { buildNeuralMapTelemetry, buildPaperUnrealizedSnapshot } from "../lib/neural-map-telemetry.js";
 import {
   buildOosValidationSnapshot,
   createOosValidationSnapshotLoggerController,
@@ -1064,6 +1064,7 @@ export async function registerShadowRoutes(
     const paperStore = getPaperExecutionRouterStore();
     const orders = paperStore.getState().orders;
     const paper = buildPaperPerformanceReport(paperStore);
+    const paperUnrealized = await buildPaperUnrealizedSnapshot(orders, opts.binanceClient, generatedAt);
     const variantMatrix = buildCurrentGuardVariantMatrixReport(
       getCurrentGuardVariantMatrixStore(),
       { capturedAt: generatedAt },
@@ -1092,6 +1093,7 @@ export async function registerShadowRoutes(
       scanStatus,
       scanTiming: getLatestScanTimingDiagnostics(),
       paper,
+      paperUnrealized,
       orders,
       variantMatrix,
       mixed,

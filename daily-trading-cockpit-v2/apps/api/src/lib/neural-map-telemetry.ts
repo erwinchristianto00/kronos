@@ -69,6 +69,12 @@ export interface NeuralMapLane {
   headlinePnl: number;
   diagnosticPnl: number;
   totalPnl: number;
+  openUnrealizedPnl: number | null;
+  openUnrealizedR: number | null;
+  diagnosticUnrealizedPnl: number | null;
+  diagnosticUnrealizedR: number | null;
+  headlineUnrealizedPnl: number | null;
+  headlineUnrealizedR: number | null;
   /** True when the lane's PnL comes ENTIRELY from DIAGNOSTIC_ONLY orders (zero headline closed). */
   pnlIsDiagnosticOnly: boolean;
   startingEquity: number;
@@ -123,6 +129,15 @@ export interface NeuralMapTelemetry {
     headlinePnl: number;
     diagnosticPnl: number;
     totalPnl: number;
+    openUnrealizedPnl: number | null;
+    openUnrealizedR: number | null;
+    diagnosticUnrealizedPnl: number | null;
+    diagnosticUnrealizedR: number | null;
+    headlineUnrealizedPnl: number | null;
+    headlineUnrealizedR: number | null;
+    unrealizedMarkCount: number;
+    unrealizedMissingPriceCount: number;
+    unrealizedPriceSource: string | null;
     todayPnl: number;
     headlineNetAvgR: number | null;
     headlinePF: number | null;
@@ -158,6 +173,7 @@ export interface NeuralMapTelemetryInput {
   mixed: MixedRegimeReport;
   mixedValidation: MixedBudgetForwardValidationReport;
   staleAudit: OpenOrderStaleAudit;
+  paperUnrealized?: PaperUnrealizedSnapshot | null;
   /**
    * Lane ids that are quarantined (benched: no new admissions, still measured via the VM
    * simulation). Rendered with the distinct QUARANTINE color instead of red/green — green/red
@@ -170,8 +186,129 @@ export interface NeuralMapTelemetryInput {
 const CLOSED = new Set(["PAPER_CLOSED_WIN", "PAPER_CLOSED_LOSS"]);
 const OPEN = new Set(["CREATED", "PAPER_SUBMITTED"]);
 
+export interface PaperMarkPriceClient {
+  getCandles(symbol: string, interval: string, limit: number): Promise<Array<{ close: number }>>;
+}
+
+interface PaperUnrealizedLane {
+  open: number;
+  pnl: number;
+  r: number;
+  diagnosticPnl: number;
+  diagnosticR: number;
+  headlinePnl: number;
+  headlineR: number;
+}
+
+export interface PaperUnrealizedSnapshot {
+  generatedAt: string;
+  priceSource: "BINANCE_5M_CLOSE";
+  markCount: number;
+  missingPriceCount: number;
+  totalPnl: number;
+  totalR: number;
+  diagnosticPnl: number;
+  diagnosticR: number;
+  headlinePnl: number;
+  headlineR: number;
+  lanes: Record<string, PaperUnrealizedLane>;
+}
+
 function finite(value: number | null | undefined): value is number {
   return typeof value === "number" && Number.isFinite(value);
+}
+
+function isDiagnosticPaperOrder(order: PaperOrder): boolean {
+  return order.paperOrderMode === "DIAGNOSTIC_ONLY" || order.diagnosticLabel === "BACKFILL_DIAGNOSTIC";
+}
+
+export async function buildPaperUnrealizedSnapshot(
+  orders: PaperOrder[],
+  priceClient: PaperMarkPriceClient | null | undefined,
+  generatedAt = new Date().toISOString(),
+): Promise<PaperUnrealizedSnapshot | null> {
+  if (!priceClient) return null;
+  const openOrders = orders.filter((order) => OPEN.has(order.paperStatus));
+  const symbols = Array.from(new Set(openOrders.map((order) => order.symbol).filter(Boolean))).sort();
+  const prices = new Map<string, number>();
+
+  await Promise.all(symbols.map(async (symbol) => {
+    try {
+      const candles = await priceClient.getCandles(symbol, "5m", 1);
+      const latest = candles.at(-1)?.close;
+      if (finite(latest) && latest > 0) prices.set(symbol, latest);
+    } catch {
+      // Missing one mark price should degrade that symbol only, not the whole dashboard.
+    }
+  }));
+
+  const lanes: Record<string, PaperUnrealizedLane> = {};
+  let markCount = 0;
+  let missingPriceCount = 0;
+  let totalPnl = 0;
+  let totalR = 0;
+  let diagnosticPnl = 0;
+  let diagnosticR = 0;
+  let headlinePnl = 0;
+  let headlineR = 0;
+
+  for (const order of openOrders) {
+    const markPrice = prices.get(order.symbol);
+    const entryPrice = order.entryPrice;
+    const notional = order.plannedPositionNotional;
+    const riskAmount = order.plannedRiskAmount;
+    if (!finite(markPrice) || !finite(entryPrice) || entryPrice <= 0 || !finite(notional)) {
+      missingPriceCount += 1;
+      continue;
+    }
+    const quantity = notional / entryPrice;
+    const pnl = (order.direction === "SHORT" ? entryPrice - markPrice : markPrice - entryPrice) * quantity;
+    const r = finite(riskAmount) && riskAmount > 0 ? pnl / riskAmount : 0;
+    const diagnostic = isDiagnosticPaperOrder(order);
+    const lane = lanes[order.selectedLaneId] ?? {
+      open: 0,
+      pnl: 0,
+      r: 0,
+      diagnosticPnl: 0,
+      diagnosticR: 0,
+      headlinePnl: 0,
+      headlineR: 0,
+    };
+
+    markCount += 1;
+    totalPnl += pnl;
+    totalR += r;
+    lane.open += 1;
+    lane.pnl += pnl;
+    lane.r += r;
+
+    if (diagnostic) {
+      diagnosticPnl += pnl;
+      diagnosticR += r;
+      lane.diagnosticPnl += pnl;
+      lane.diagnosticR += r;
+    } else {
+      headlinePnl += pnl;
+      headlineR += r;
+      lane.headlinePnl += pnl;
+      lane.headlineR += r;
+    }
+    lanes[order.selectedLaneId] = lane;
+  }
+
+  return {
+    generatedAt,
+    priceSource: "BINANCE_5M_CLOSE",
+    markCount,
+    missingPriceCount,
+    totalPnl,
+    totalR,
+    diagnosticPnl,
+    diagnosticR,
+    headlinePnl,
+    headlineR,
+    lanes,
+  };
 }
 
 function fmtMs(value: number | null | undefined): string {
@@ -499,6 +636,7 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
   const lanes = laneIds.map((id): NeuralMapLane => {
     const row = rowsById.get(id);
     const economics = laneEconomics(input.orders, id);
+    const unrealized = input.paperUnrealized?.lanes[id] ?? null;
     // LONG lanes are admitted from fresh scan candidates into the paper book.
     // Once that book has evidence, it is the honest source of truth; the VM row
     // is a separate current-guard simulation and must not pin progress at n=0.
@@ -553,6 +691,12 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
       headlinePnl: economics.headlinePnl,
       diagnosticPnl: economics.diagnosticPnl,
       totalPnl: economics.totalPnl,
+      openUnrealizedPnl: unrealized?.pnl ?? null,
+      openUnrealizedR: unrealized?.r ?? null,
+      diagnosticUnrealizedPnl: unrealized?.diagnosticPnl ?? null,
+      diagnosticUnrealizedR: unrealized?.diagnosticR ?? null,
+      headlineUnrealizedPnl: unrealized?.headlinePnl ?? null,
+      headlineUnrealizedR: unrealized?.headlineR ?? null,
       pnlIsDiagnosticOnly,
       startingEquity: input.paper.startingEquity,
       totalPnlPct: pnlPct(economics.totalPnl, input.paper.startingEquity),
@@ -814,6 +958,15 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
       headlinePnl: input.paper.realizedPaperPnl,
       diagnosticPnl: input.paper.diagnosticRealizedPaperPnl,
       totalPnl: input.paper.totalRealizedPaperPnl,
+      openUnrealizedPnl: input.paperUnrealized?.totalPnl ?? null,
+      openUnrealizedR: input.paperUnrealized?.totalR ?? null,
+      diagnosticUnrealizedPnl: input.paperUnrealized?.diagnosticPnl ?? null,
+      diagnosticUnrealizedR: input.paperUnrealized?.diagnosticR ?? null,
+      headlineUnrealizedPnl: input.paperUnrealized?.headlinePnl ?? null,
+      headlineUnrealizedR: input.paperUnrealized?.headlineR ?? null,
+      unrealizedMarkCount: input.paperUnrealized?.markCount ?? 0,
+      unrealizedMissingPriceCount: input.paperUnrealized?.missingPriceCount ?? input.paper.open,
+      unrealizedPriceSource: input.paperUnrealized?.priceSource ?? null,
       todayPnl: input.paper.taipeiDailyTotalPnl,
       headlineNetAvgR: input.paper.headlineNetAvgR,
       headlinePF: input.paper.headlinePF,

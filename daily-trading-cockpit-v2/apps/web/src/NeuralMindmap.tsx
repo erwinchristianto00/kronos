@@ -41,6 +41,12 @@ interface NeuralLane {
   headlinePnl: number;
   diagnosticPnl: number;
   totalPnl: number;
+  openUnrealizedPnl: number | null;
+  openUnrealizedR: number | null;
+  diagnosticUnrealizedPnl: number | null;
+  diagnosticUnrealizedR: number | null;
+  headlineUnrealizedPnl: number | null;
+  headlineUnrealizedR: number | null;
   startingEquity: number;
   totalPnlPct: number | null;
   headlinePnlPct: number | null;
@@ -83,6 +89,15 @@ interface NeuralTelemetry {
     headlinePnl: number;
     diagnosticPnl: number;
     totalPnl: number;
+    openUnrealizedPnl: number | null;
+    openUnrealizedR: number | null;
+    diagnosticUnrealizedPnl: number | null;
+    diagnosticUnrealizedR: number | null;
+    headlineUnrealizedPnl: number | null;
+    headlineUnrealizedR: number | null;
+    unrealizedMarkCount: number;
+    unrealizedMissingPriceCount: number;
+    unrealizedPriceSource: string | null;
     todayPnl: number;
     headlineNetAvgR: number | null;
     headlinePF: number | null;
@@ -255,6 +270,11 @@ function fmtMoney(value: number): string {
   return `NT$ ${Math.round(value).toLocaleString('id-ID')}`;
 }
 
+function fmtUsdt(value: number | null): string {
+  if (value === null || !Number.isFinite(value)) return 'n/a';
+  return `${value >= 0 ? '+' : ''}${value.toFixed(2)} USDT`;
+}
+
 function fmtPct(value: number | null): string {
   if (value === null || !Number.isFinite(value)) return 'n/a';
   return `${value >= 0 ? '+' : ''}${value.toFixed(1)}%`;
@@ -266,6 +286,9 @@ function fmtMs(value: number | null): string {
 }
 
 function laneDiagnosis(lane: NeuralLane): string {
+  if (lane.diagnosticUnrealizedPnl !== null && lane.diagnosticUnrealizedPnl !== 0) {
+    return `Open diagnostic mark-to-market is ${fmtUsdt(lane.diagnosticUnrealizedPnl)} (${fmtR(lane.diagnosticUnrealizedR)}). Closed evidence remains separate.`;
+  }
   if (lane.totalPnl > 0) return 'This lane is profitable on paper, so the lane field renders it green.';
   if (lane.totalPnl < 0) return 'This lane is losing money on paper, so the lane field renders it red.';
   if (lane.closed > 0 || lane.open > 0) return 'This lane has activity, but realized paper profit is still flat.';
@@ -280,6 +303,9 @@ function laneMetricLabel(
   if (liveLane) {
     const growth = accountEquity && accountEquity > 0 ? (liveLane.unrealizedPnl / accountEquity) * 100 : null;
     return `${fmtPct(growth)} / ${liveLane.sourceOrderCount} live`;
+  }
+  if (lane.diagnosticUnrealizedPnl !== null && lane.open > 0) {
+    return `${fmtUsdt(lane.diagnosticUnrealizedPnl)} / open`;
   }
   if (lane.totalPnl > 0 && lane.totalPnlPct !== null) {
     return `${fmtPct(lane.totalPnlPct)} / n=${lane.closed}`;
@@ -506,7 +532,11 @@ export default function NeuralMindmap() {
         <div>
           <span>Paper brain</span>
           <strong>{telemetry ? `${telemetry.paper.open} open / ${telemetry.paper.closed} closed` : 'Loading'}</strong>
-          <small>{telemetry ? `${telemetry.paper.wins}W ${telemetry.paper.losses}L` : 'paper only'}</small>
+          <small>
+            {telemetry
+              ? `diag open ${fmtUsdt(telemetry.paper.diagnosticUnrealizedPnl)} (${telemetry.paper.unrealizedMarkCount}/${telemetry.paper.open} marked)`
+              : 'paper only'}
+          </small>
         </div>
         <div>
           <span>Binance unrealized PnL</span>
@@ -721,6 +751,8 @@ export default function NeuralMindmap() {
                   <div><dt>Net Avg R</dt><dd className={(selectedLane.netAvgR ?? 0) >= 0 ? 'tone-healthy' : 'tone-critical'}>{fmtR(selectedLane.netAvgR)}</dd></div>
                   <div><dt>PF / WR</dt><dd>{fmtNumber(selectedLane.pf)} / {selectedLane.wr === null ? 'n/a' : `${(selectedLane.wr * 100).toFixed(1)}%`}</dd></div>
                   <div><dt>Paper evidence PnL</dt><dd>{fmtMoney(selectedLane.totalPnl)}</dd></div>
+                  <div><dt>Diagnostic open MTM</dt><dd className={(selectedLane.diagnosticUnrealizedPnl ?? 0) >= 0 ? 'tone-healthy' : 'tone-critical'}>{fmtUsdt(selectedLane.diagnosticUnrealizedPnl)} / {fmtR(selectedLane.diagnosticUnrealizedR)}</dd></div>
+                  <div><dt>All open MTM</dt><dd className={(selectedLane.openUnrealizedPnl ?? 0) >= 0 ? 'tone-healthy' : 'tone-critical'}>{fmtUsdt(selectedLane.openUnrealizedPnl)} / {fmtR(selectedLane.openUnrealizedR)}</dd></div>
                   <div><dt>Binance mirrored</dt><dd>{selectedLiveLane ? `${selectedLiveLane.sourceOrderCount} orders / ${selectedLiveLane.symbols.length} symbols` : 'not open'}</dd></div>
                   <div><dt>Binance notional</dt><dd>{selectedLiveLane ? `${selectedLiveLane.notionalUsd.toFixed(2)} USDT` : '0.00 USDT'}</dd></div>
                   <div><dt>Binance unrealized</dt><dd className={(selectedLiveLane?.unrealizedPnl ?? 0) >= 0 ? 'tone-healthy' : 'tone-critical'}>{selectedLiveLane ? `${selectedLiveLane.unrealizedPnl >= 0 ? '+' : ''}${selectedLiveLane.unrealizedPnl.toFixed(2)} USDT` : '0.00 USDT'}</dd></div>
@@ -827,7 +859,7 @@ export default function NeuralMindmap() {
           <header><span>Lane performance field</span><strong>{telemetry?.lanes.length ?? 0} lanes</strong></header>
           <div className="neural-lane-table-wrap">
             <table>
-              <thead><tr><th>Lane</th><th>Evidence</th><th>Binance PnL</th><th>Growth</th><th>Mirrored</th><th>n</th><th>Net Avg R</th><th>PF</th><th>WR</th></tr></thead>
+              <thead><tr><th>Lane</th><th>Evidence</th><th>Diag MTM</th><th>Binance PnL</th><th>Growth</th><th>Mirrored</th><th>n</th><th>Net Avg R</th><th>PF</th><th>WR</th></tr></thead>
               <tbody>
                 {telemetry?.lanes.map((lane) => {
                   const liveLane = liveAccount?.lanes.find((item) => item.laneId === lane.id);
@@ -839,6 +871,7 @@ export default function NeuralMindmap() {
                     <tr key={lane.id} className={lane.active ? 'is-active' : ''} onClick={() => setSelectedId(lane.id)}>
                       <td><i className={`health-${healthOf(lane.id).toLowerCase()}`} />{compactLaneLabel(lane.label)}</td>
                       <td>{lane.status}</td>
+                      <td className={(lane.diagnosticUnrealizedPnl ?? 0) >= 0 ? 'tone-healthy' : 'tone-critical'}>{fmtUsdt(lane.diagnosticUnrealizedPnl)}</td>
                       <td className={livePnl >= 0 ? 'tone-healthy' : 'tone-critical'}>{`${livePnl >= 0 ? '+' : ''}${livePnl.toFixed(2)} USDT`}</td>
                       <td className={livePnl >= 0 ? 'tone-healthy' : 'tone-critical'}>{fmtPct(liveGrowth)}</td>
                       <td>{liveLane?.sourceOrderCount ?? 0}</td>
