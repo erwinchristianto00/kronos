@@ -588,34 +588,36 @@ export default function NeuralMindmap() {
     }
   }
 
-  async function realizePaperOpen() {
-    const confirm = window.prompt('Type REALIZE_PAPER_OPEN to close all open PAPER trades at current mark. This does not close live Binance positions.');
-    if (confirm !== 'REALIZE_PAPER_OPEN') {
-      setRealizeStatus('Cancelled. Paper trades were not changed.');
+  async function captureDiagnosticProfit() {
+    const confirm = window.prompt('Type CAPTURE_DIAG_PROFIT to close profitable diagnostic PAPER trades using Binance mark. This does not close live Binance positions.');
+    if (confirm !== 'CAPTURE_DIAG_PROFIT') {
+      setRealizeStatus('Cancelled. Diagnostic paper trades were not changed.');
       return;
     }
     try {
-      setRealizeStatus('Closing open paper trades at current mark...');
+      setRealizeStatus('Capturing profitable diagnostic MTM using Binance mark...');
       const response = await fetch('/api/shadow/paper-controls/realize-open', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ confirm }),
+        body: JSON.stringify({ confirm, mode: 'PROFITABLE_DIAGNOSTIC' }),
       });
       const result = await response.json() as {
         ok?: boolean;
         reason?: string;
+        mode?: string;
         closed?: number;
         skipped?: number;
+        skippedNonProfit?: number;
         realizedPnl?: number;
         realizedR?: number;
       };
       if (!response.ok || result.ok === false) throw new Error(result.reason ?? `Realize failed (${response.status})`);
       setRealizeStatus(
-        `Realized ${result.closed ?? 0} paper trades: ${fmtUsdt(result.realizedPnl ?? 0)} / ${fmtR(result.realizedR ?? 0)}. Skipped ${result.skipped ?? 0}.`,
+        `Captured ${result.closed ?? 0} profitable diagnostic trades: ${fmtUsdt(result.realizedPnl ?? 0)} / ${fmtR(result.realizedR ?? 0)}. Skipped ${result.skipped ?? 0} missing mark, ${result.skippedNonProfit ?? 0} not profitable.`,
       );
       void loadTelemetry();
     } catch (nextError) {
-      setRealizeStatus(nextError instanceof Error ? nextError.message : 'Unable to realize paper trades');
+      setRealizeStatus(nextError instanceof Error ? nextError.message : 'Unable to capture diagnostic profit');
     }
   }
 
@@ -751,8 +753,8 @@ export default function NeuralMindmap() {
           </small>
         </div>
         <div className="neural-realize-box">
-          <button type="button" onClick={() => void realizePaperOpen()}>Close all paper open</button>
-          <p>Books all open paper trades at current mark. It can realize losses too and does not touch live Binance positions.</p>
+          <button type="button" onClick={() => void captureDiagnosticProfit()}>Capture diag profit</button>
+          <p>Closes only profitable diagnostic paper MTM using Binance mark. Non-profitable diagnostics stay open; live Binance positions are untouched.</p>
         </div>
         {(controlStatus || realizeStatus) && (
           <div className="neural-control-status">

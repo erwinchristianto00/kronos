@@ -1152,10 +1152,12 @@ export async function registerShadowRoutes(
     };
   });
 
-  app.post<{ Body: { confirm?: string; lane?: string } }>("/api/shadow/paper-controls/realize-open", async (request, reply) => {
-    if (request.body?.confirm !== "REALIZE_PAPER_OPEN") {
+  app.post<{ Body: { confirm?: string; lane?: string; mode?: "ALL" | "PROFITABLE_DIAGNOSTIC" } }>("/api/shadow/paper-controls/realize-open", async (request, reply) => {
+    const mode = request.body?.mode ?? (request.body?.confirm === "CAPTURE_DIAG_PROFIT" ? "PROFITABLE_DIAGNOSTIC" : "ALL");
+    const expectedConfirm = mode === "PROFITABLE_DIAGNOSTIC" ? "CAPTURE_DIAG_PROFIT" : "REALIZE_PAPER_OPEN";
+    if (request.body?.confirm !== expectedConfirm) {
       reply.code(400);
-      return { ok: false, reason: "manual paper close requires confirm=REALIZE_PAPER_OPEN" };
+      return { ok: false, reason: `manual paper close requires confirm=${expectedConfirm}` };
     }
     if (!opts.binanceClient) {
       reply.code(503);
@@ -1163,9 +1165,12 @@ export async function registerShadowRoutes(
     }
     const laneFilter = request.body?.lane;
     const openStatuses = new Set(["CREATED", "PAPER_SUBMITTED"]);
+    const isDiagnosticOrder = (order: { paperOrderMode?: string; diagnosticLabel?: string | null }) =>
+      order.paperOrderMode === "DIAGNOSTIC_ONLY" || order.diagnosticLabel === "BACKFILL_DIAGNOSTIC";
     const paperStore = getPaperExecutionRouterStore();
     const orders = paperStore.getState().orders.filter((order) =>
       openStatuses.has(order.paperStatus) &&
+      (mode !== "PROFITABLE_DIAGNOSTIC" || isDiagnosticOrder(order)) &&
       (!laneFilter || order.selectedLaneId === laneFilter),
     );
     const symbols = Array.from(new Set(orders.map((order) => order.symbol))).sort();
@@ -1182,6 +1187,7 @@ export async function registerShadowRoutes(
 
     let closed = 0;
     let skipped = 0;
+    let skippedNonProfit = 0;
     let realizedPnl = 0;
     let realizedR = 0;
     for (const order of orders) {
@@ -1196,13 +1202,19 @@ export async function registerShadowRoutes(
       const costR = order.plannedStopDistanceBps > 0 ? -(22 / order.plannedStopDistanceBps) : 0;
       const netR = grossR + costR;
       const netPnlAmount = netR * order.plannedRiskAmount;
+      if (mode === "PROFITABLE_DIAGNOSTIC" && netPnlAmount <= 0) {
+        skippedNonProfit += 1;
+        continue;
+      }
       paperStore.update(order.paperOrderId, {
         paperStatus: netR > 0 ? "PAPER_CLOSED_WIN" : "PAPER_CLOSED_LOSS",
         grossR,
         costR,
         netR,
         netPnlAmount,
-        closeReason: "PAPER_MANUAL_REALIZE_ALL",
+        closeReason: mode === "PROFITABLE_DIAGNOSTIC"
+          ? "PAPER_MANUAL_DIAGNOSTIC_TP_CAPTURE_BINANCE_MARK"
+          : "PAPER_MANUAL_REALIZE_ALL",
         updatedAt: new Date().toISOString(),
       });
       closed += 1;
@@ -1210,7 +1222,7 @@ export async function registerShadowRoutes(
       realizedR += netR;
     }
 
-    return { ok: true, closed, skipped, realizedPnl, realizedR, lane: laneFilter ?? "ALL" };
+    return { ok: true, mode, closed, skipped, skippedNonProfit, realizedPnl, realizedR, lane: laneFilter ?? "ALL" };
   });
 
   // ── Compact operator brief (report-only read, no writes, no behavior changes) ──
