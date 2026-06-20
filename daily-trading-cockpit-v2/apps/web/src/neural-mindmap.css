@@ -917,15 +917,71 @@ i.health-diagnostic {
 
 @media (max-width: 720px) {
   .neural-shell {
-    padding: 10px;
+    min-height: 100svh;
+    padding: 8px;
   }
 
   .neural-topbar {
-    gap: 10px;
+    min-height: auto;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: start;
+    gap: 8px;
+    padding-bottom: 8px;
+  }
+
+  .neural-brand {
+    min-width: 0;
+    gap: 9px;
+  }
+
+  .neural-brand h1 {
+    font-size: 17px;
+    line-height: 1.08;
+  }
+
+  .neural-brand p {
+    font-size: 9px;
+  }
+
+  .neural-live-dot {
+    flex: 0 0 auto;
+    margin-top: 2px;
+  }
+
+  .neural-nav {
+    display: none;
   }
 
   .neural-actions {
+    align-items: flex-start;
     gap: 8px;
+  }
+
+  .neural-toggle {
+    min-height: 40px;
+    gap: 6px;
+    font-size: 11px;
+  }
+
+  .neural-toggle span {
+    width: 34px;
+    height: 20px;
+    border-radius: 999px;
+  }
+
+  .neural-toggle span::after {
+    width: 16px;
+    height: 16px;
+  }
+
+  .neural-toggle input:checked + span::after {
+    transform: translateX(14px);
+  }
+
+  .neural-icon-button {
+    width: 40px;
+    height: 40px;
+    border-radius: 8px;
   }
 
   .neural-statusbar {
@@ -933,6 +989,8 @@ i.health-diagnostic {
   }
 
   .neural-statusbar > div {
+    min-height: 72px;
+    padding: 10px 11px;
     border-top: 1px solid #20313a;
   }
 
@@ -940,21 +998,115 @@ i.health-diagnostic {
     border-right: 0;
   }
 
-  .neural-statusbar > div:last-child {
-    grid-column: 1 / -1;
+  .neural-statusbar span {
+    font-size: 9px;
   }
 
-  .neural-canvas-panel,
+  .neural-statusbar strong,
+  .neural-statusbar small {
+    white-space: normal;
+  }
+
+  .neural-statusbar strong {
+    font-size: 13px;
+    line-height: 1.2;
+  }
+
+  .neural-statusbar small {
+    font-size: 10px;
+    line-height: 1.35;
+  }
+
+  .neural-workspace {
+    min-height: 0;
+  }
+
+  .neural-canvas-panel {
+    min-height: min(62svh, 560px);
+  }
+
+  .neural-canvas-panel::before,
+  .neural-canvas-panel::after {
+    content: "";
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    z-index: 2;
+    width: 28px;
+    pointer-events: none;
+  }
+
+  .neural-canvas-panel::before {
+    left: 0;
+    background: linear-gradient(90deg, #081319 0%, rgba(8, 19, 25, 0) 100%);
+  }
+
+  .neural-canvas-panel::after {
+    right: 0;
+    background: linear-gradient(270deg, #081319 0%, rgba(8, 19, 25, 0) 100%);
+  }
+
+  .neural-canvas-scroll {
+    overflow-x: auto;
+    overflow-y: hidden;
+    -webkit-overflow-scrolling: touch;
+    scroll-snap-type: x proximity;
+    touch-action: pan-x pan-y;
+  }
+
   .neural-map {
-    min-height: 560px;
+    width: 920px;
+    min-width: 920px;
+    height: 500px;
+    min-height: 500px;
+    scroll-snap-align: start;
+  }
+
+  .neural-legend {
+    left: 10px;
+    right: 10px;
+    bottom: 10px;
+    z-index: 3;
+    flex-wrap: nowrap;
+    max-width: calc(100% - 20px);
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    padding: 7px 8px;
+  }
+
+  .neural-legend span {
+    flex: 0 0 auto;
   }
 
   .neural-inspector {
     grid-template-columns: 1fr;
+    overflow: visible;
   }
 
   .neural-inspector-heading {
     grid-row: auto;
+  }
+
+  .neural-inspector-heading,
+  .neural-inspector-section {
+    padding: 14px 12px;
+  }
+
+  .neural-diagnosis {
+    padding: 14px 12px;
+  }
+
+  .neural-inspector-section dl {
+    gap: 12px;
+  }
+
+  .neural-inspector-section dl > div {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 3px;
+  }
+
+  .neural-inspector-section dd {
+    text-align: left;
   }
 
   .neural-bottom-grid {
@@ -964,6 +1116,28 @@ i.health-diagnostic {
   .neural-alerts {
     border-right: 0;
     border-bottom: 1px solid #20313a;
+  }
+
+  .neural-alerts header,
+  .neural-lane-strip header {
+    padding: 0 12px;
+  }
+
+  .neural-alerts button {
+    padding: 12px;
+  }
+
+  .neural-lane-table-wrap {
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .neural-lane-table-wrap table {
+    min-width: 620px;
+  }
+
+  .neural-lane-table-wrap th,
+  .neural-lane-table-wrap td {
+    padding: 0 9px;
   }
 }
 
