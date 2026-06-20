@@ -27,6 +27,14 @@ interface NeuralNode {
   detail: string[];
 }
 
+interface TpAssessment {
+  activeTpPct: number;
+  roundTripCostPct: number;
+  netTpAfterCostPct: number;
+  verdict: 'TOO_TIGHT_AFTER_COST' | 'LOW_EDGE_AFTER_COST' | 'OK' | 'STRETCHED' | 'TOO_FAR_VS_MFE';
+  reason: string;
+}
+
 interface NeuralLane {
   id: string;
   label: string;
@@ -54,6 +62,11 @@ interface NeuralLane {
   openAvgEntryPrice: number | null;
   openAvgMarkPrice: number | null;
   openAvgTakeProfitPrice: number | null;
+  openAvgMfePct: number | null;
+  openP75MfePct: number | null;
+  openP90MfePct: number | null;
+  openAvgConfiguredTpPct: number | null;
+  openTpAssessment: TpAssessment | null;
   openMarkedSymbolCount: number;
   startingEquity: number;
   totalPnlPct: number | null;
@@ -107,6 +120,11 @@ interface NeuralTelemetry {
     openMaxFavorableR: number | null;
     openAvgDistanceToTpPct: number | null;
     openNearestDistanceToTpPct: number | null;
+    openAvgMfePct: number | null;
+    openP75MfePct: number | null;
+    openP90MfePct: number | null;
+    openAvgConfiguredTpPct: number | null;
+    openTpAssessment: TpAssessment | null;
     unrealizedMarkCount: number;
     unrealizedMissingPriceCount: number;
     unrealizedPriceSource: string | null;
@@ -132,6 +150,16 @@ interface NeuralTelemetry {
   nodes: NeuralNode[];
   lanes: NeuralLane[];
   alerts: Array<{ severity: 'WARNING' | 'CRITICAL'; source: string; message: string }>;
+}
+
+interface PaperControls {
+  controls: { cgWideTpPct: number | null; updatedAt: string | null };
+  cgWideTp: {
+    activeTpPct: number;
+    defaultTpPct: number;
+    roundTripCostPct: number;
+    assessment: TpAssessment | null;
+  };
 }
 
 interface Point {
@@ -305,6 +333,20 @@ function fmtGapPct(value: number | null): string {
   return `${value.toFixed(2)}%`;
 }
 
+function fmtPlainPct(value: number | null): string {
+  if (value === null || !Number.isFinite(value)) return 'n/a';
+  return `${value.toFixed(2)}%`;
+}
+
+function tpVerdictLabel(assessment: TpAssessment | null | undefined): string {
+  if (!assessment) return 'n/a';
+  if (assessment.verdict === 'TOO_FAR_VS_MFE') return 'Too far vs MFE';
+  if (assessment.verdict === 'STRETCHED') return 'Stretched';
+  if (assessment.verdict === 'TOO_TIGHT_AFTER_COST') return 'Too tight';
+  if (assessment.verdict === 'LOW_EDGE_AFTER_COST') return 'Thin after cost';
+  return 'OK after cost';
+}
+
 function fmtMs(value: number | null): string {
   if (value === null || !Number.isFinite(value)) return 'n/a';
   return value >= 1000 ? `${(value / 1000).toFixed(value >= 10_000 ? 1 : 2)}s` : `${Math.round(value)}ms`;
@@ -399,6 +441,10 @@ export default function NeuralMindmap() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [lastReceivedAt, setLastReceivedAt] = useState<number | null>(null);
+  const [paperControls, setPaperControls] = useState<PaperControls | null>(null);
+  const [tpDraft, setTpDraft] = useState('3.00');
+  const [controlStatus, setControlStatus] = useState<string | null>(null);
+  const [realizeStatus, setRealizeStatus] = useState<string | null>(null);
 
   async function loadTelemetry() {
     try {
@@ -436,9 +482,22 @@ export default function NeuralMindmap() {
     }
   }
 
+  async function loadPaperControls() {
+    try {
+      const response = await fetch('/api/shadow/paper-controls', { cache: 'no-store' });
+      if (!response.ok) throw new Error(`Controls request failed (${response.status})`);
+      const next = await response.json() as PaperControls;
+      setPaperControls(next);
+      setTpDraft(next.cgWideTp.activeTpPct.toFixed(2));
+    } catch (nextError) {
+      setControlStatus(nextError instanceof Error ? nextError.message : 'controls unavailable');
+    }
+  }
+
   useEffect(() => {
     void loadTelemetry();
     void loadLiveAccount();
+    void loadPaperControls();
   }, []);
 
   useEffect(() => {
@@ -473,6 +532,13 @@ export default function NeuralMindmap() {
     (telemetry?.lanes.filter((lane) => lane.health === 'CRITICAL').length ?? 0);
   const warningCount = (telemetry?.nodes.filter((node) => node.health === 'WARNING').length ?? 0) +
     (telemetry?.lanes.filter((lane) => lane.health === 'WARNING').length ?? 0);
+  const paperTpAssessment = telemetry?.paper.openTpAssessment ?? paperControls?.cgWideTp.assessment ?? null;
+  const activeTpPct = paperControls?.cgWideTp.activeTpPct ?? 3;
+  const draftTpPct = Number(tpDraft);
+  const draftNetAfterCostPct = Number.isFinite(draftTpPct)
+    ? draftTpPct - (paperControls?.cgWideTp.roundTripCostPct ?? 0.22)
+    : null;
+  const canSaveTp = Number.isFinite(draftTpPct) && draftTpPct >= 0.05 && draftTpPct <= 10;
 
   const neuralEdges = useMemo(() => {
     if (!telemetry) return [];
@@ -499,6 +565,58 @@ export default function NeuralMindmap() {
       return lane.health;
     }
     return nodesById.get(id)?.health ?? 'IDLE';
+  }
+
+  async function saveCgWideTp(nextValue: number | null) {
+    try {
+      setControlStatus('Saving CG WIDE TP...');
+      const response = await fetch('/api/shadow/paper-controls/cg-wide-tp', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cgWideTpPct: nextValue }),
+      });
+      const next = await response.json() as (PaperControls & { ok?: boolean; reason?: string });
+      if (!response.ok || next.ok === false) throw new Error(next.reason ?? `Save failed (${response.status})`);
+      setPaperControls(next);
+      setTpDraft(next.cgWideTp.activeTpPct.toFixed(2));
+      setControlStatus(nextValue === null
+        ? 'CG WIDE TP reset to default 3.00%. New paper admissions use default target.'
+        : `CG WIDE TP set to ${next.cgWideTp.activeTpPct.toFixed(2)}%. New paper admissions use this target.`);
+      void loadTelemetry();
+    } catch (nextError) {
+      setControlStatus(nextError instanceof Error ? nextError.message : 'Unable to save TP control');
+    }
+  }
+
+  async function realizePaperOpen() {
+    const confirm = window.prompt('Type REALIZE_PAPER_OPEN to close all open PAPER trades at current mark. This does not close live Binance positions.');
+    if (confirm !== 'REALIZE_PAPER_OPEN') {
+      setRealizeStatus('Cancelled. Paper trades were not changed.');
+      return;
+    }
+    try {
+      setRealizeStatus('Closing open paper trades at current mark...');
+      const response = await fetch('/api/shadow/paper-controls/realize-open', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ confirm }),
+      });
+      const result = await response.json() as {
+        ok?: boolean;
+        reason?: string;
+        closed?: number;
+        skipped?: number;
+        realizedPnl?: number;
+        realizedR?: number;
+      };
+      if (!response.ok || result.ok === false) throw new Error(result.reason ?? `Realize failed (${response.status})`);
+      setRealizeStatus(
+        `Realized ${result.closed ?? 0} paper trades: ${fmtUsdt(result.realizedPnl ?? 0)} / ${fmtR(result.realizedR ?? 0)}. Skipped ${result.skipped ?? 0}.`,
+      );
+      void loadTelemetry();
+    } catch (nextError) {
+      setRealizeStatus(nextError instanceof Error ? nextError.message : 'Unable to realize paper trades');
+    }
   }
 
   const selectedConnections = useMemo(() => {
@@ -588,6 +706,61 @@ export default function NeuralMindmap() {
           <span>{error}. The last known state remains visible.</span>
         </div>
       )}
+
+      <section className="neural-control-panel" aria-label="CG WIDE TP control">
+        <div className={`neural-tp-verdict verdict-${paperTpAssessment?.verdict.toLowerCase().replace(/_/g, '-') ?? 'unknown'}`}>
+          <span>CG WIDE TP assessment</span>
+          <strong>{tpVerdictLabel(paperTpAssessment)}</strong>
+          <p>{paperTpAssessment?.reason ?? 'Waiting for paper control telemetry.'}</p>
+        </div>
+        <div className="neural-tp-metrics">
+          <div><span>Current TP</span><strong>{fmtPlainPct(activeTpPct)}</strong><small>{paperControls?.controls.cgWideTpPct === null ? 'default' : 'manual override'}</small></div>
+          <div><span>Fee + slippage est.</span><strong>{fmtPlainPct(paperControls?.cgWideTp.roundTripCostPct ?? 0.22)}</strong><small>round trip estimate</small></div>
+          <div><span>Net after cost</span><strong className={(paperTpAssessment?.netTpAfterCostPct ?? 0) >= 0 ? 'tone-healthy' : 'tone-critical'}>{fmtPlainPct(paperTpAssessment?.netTpAfterCostPct ?? null)}</strong><small>TP minus cost</small></div>
+          <div><span>MFE p75 / p90</span><strong>{fmtPlainPct(telemetry?.paper.openP75MfePct ?? null)} / {fmtPlainPct(telemetry?.paper.openP90MfePct ?? null)}</strong><small>open paper excursion</small></div>
+        </div>
+        <div className="neural-tp-editor">
+          <label>
+            <span>Set future CG WIDE TP</span>
+            <input
+              type="range"
+              min="0.05"
+              max="10"
+              step="0.05"
+              value={Number.isFinite(draftTpPct) ? draftTpPct : activeTpPct}
+              onChange={(event) => setTpDraft(Number(event.target.value).toFixed(2))}
+            />
+          </label>
+          <div className="neural-tp-manual">
+            <input
+              type="number"
+              min="0.05"
+              max="10"
+              step="0.05"
+              inputMode="decimal"
+              value={tpDraft}
+              onChange={(event) => setTpDraft(event.target.value)}
+              aria-label="Manual CG WIDE TP percent"
+            />
+            <button type="button" disabled={!canSaveTp} onClick={() => void saveCgWideTp(draftTpPct)}>Apply TP</button>
+            <button type="button" className="is-secondary" onClick={() => void saveCgWideTp(null)}>Reset 3%</button>
+          </div>
+          <small>
+            Draft net after cost: <b className={(draftNetAfterCostPct ?? 0) >= 0 ? 'tone-healthy' : 'tone-critical'}>{fmtPlainPct(draftNetAfterCostPct)}</b>.
+            Applies to new CG WIDE paper admissions only.
+          </small>
+        </div>
+        <div className="neural-realize-box">
+          <button type="button" onClick={() => void realizePaperOpen()}>Close all paper open</button>
+          <p>Books all open paper trades at current mark. It can realize losses too and does not touch live Binance positions.</p>
+        </div>
+        {(controlStatus || realizeStatus) && (
+          <div className="neural-control-status">
+            {controlStatus && <span>{controlStatus}</span>}
+            {realizeStatus && <span>{realizeStatus}</span>}
+          </div>
+        )}
+      </section>
 
       <main className="neural-workspace">
         <section className="neural-canvas-panel" aria-label="Live bot neural system map">
@@ -778,6 +951,8 @@ export default function NeuralMindmap() {
                   <div><dt>Avg entry / mark</dt><dd>{fmtPrice(selectedLane.openAvgEntryPrice)} / {fmtPrice(selectedLane.openAvgMarkPrice)}</dd></div>
                   <div><dt>Avg TP / gap</dt><dd>{fmtPrice(selectedLane.openAvgTakeProfitPrice)} / {fmtGapPct(selectedLane.openAvgDistanceToTpPct)}</dd></div>
                   <div><dt>Nearest TP gap</dt><dd>{fmtGapPct(selectedLane.openNearestDistanceToTpPct)} across {selectedLane.openMarkedSymbolCount} symbols</dd></div>
+                  <div><dt>MFE avg / p90</dt><dd>{fmtPlainPct(selectedLane.openAvgMfePct)} / {fmtPlainPct(selectedLane.openP90MfePct)}</dd></div>
+                  <div><dt>TP quality</dt><dd>{tpVerdictLabel(selectedLane.openTpAssessment)} · TP {fmtPlainPct(selectedLane.openAvgConfiguredTpPct)}</dd></div>
                   <div><dt>Paper evidence PnL</dt><dd>{fmtMoney(selectedLane.totalPnl)}</dd></div>
                   <div><dt>Diagnostic open MTM</dt><dd className={(selectedLane.diagnosticUnrealizedPnl ?? 0) >= 0 ? 'tone-healthy' : 'tone-critical'}>{fmtUsdt(selectedLane.diagnosticUnrealizedPnl)} / {fmtR(selectedLane.diagnosticUnrealizedR)}</dd></div>
                   <div><dt>Max favorable open</dt><dd className={(selectedLane.openMaxFavorablePnl ?? 0) >= 0 ? 'tone-healthy' : 'tone-critical'}>{fmtUsdt(selectedLane.openMaxFavorablePnl)} / {fmtR(selectedLane.openMaxFavorableR)}</dd></div>

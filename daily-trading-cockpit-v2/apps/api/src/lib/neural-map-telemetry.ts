@@ -7,6 +7,7 @@ import {
 } from "./current-guard-variant-matrix.js";
 import type { MixedBudgetForwardValidationReport, MixedRegimeReport, OpenOrderStaleAudit } from "./mixed-regime-router.js";
 import type { PaperOrder, PaperPerformanceReport } from "./paper-execution-router.js";
+import { assessPaperTp, cgWideTpPctFromOrder } from "./paper-trading-controls.js";
 import type { RegimeDirectionControllerReport } from "./regime-direction-controller.js";
 import type { ScanTimingDiagnostics } from "./scan-timing-diagnostics.js";
 
@@ -82,6 +83,17 @@ export interface NeuralMapLane {
   openAvgEntryPrice: number | null;
   openAvgMarkPrice: number | null;
   openAvgTakeProfitPrice: number | null;
+  openAvgMfePct: number | null;
+  openP75MfePct: number | null;
+  openP90MfePct: number | null;
+  openAvgConfiguredTpPct: number | null;
+  openTpAssessment: {
+    activeTpPct: number;
+    roundTripCostPct: number;
+    netTpAfterCostPct: number;
+    verdict: "TOO_TIGHT_AFTER_COST" | "LOW_EDGE_AFTER_COST" | "OK" | "STRETCHED" | "TOO_FAR_VS_MFE";
+    reason: string;
+  } | null;
   openMarkedSymbolCount: number;
   /** True when the lane's PnL comes ENTIRELY from DIAGNOSTIC_ONLY orders (zero headline closed). */
   pnlIsDiagnosticOnly: boolean;
@@ -147,6 +159,11 @@ export interface NeuralMapTelemetry {
     openMaxFavorableR: number | null;
     openAvgDistanceToTpPct: number | null;
     openNearestDistanceToTpPct: number | null;
+    openAvgMfePct: number | null;
+    openP75MfePct: number | null;
+    openP90MfePct: number | null;
+    openAvgConfiguredTpPct: number | null;
+    openTpAssessment: NeuralMapLane["openTpAssessment"];
     unrealizedMarkCount: number;
     unrealizedMissingPriceCount: number;
     unrealizedPriceSource: string | null;
@@ -223,6 +240,11 @@ interface PaperUnrealizedLane {
   avgEntryPrice: number | null;
   avgMarkPrice: number | null;
   avgTakeProfitPrice: number | null;
+  avgMfePct: number | null;
+  p75MfePct: number | null;
+  p90MfePct: number | null;
+  avgConfiguredTpPct: number | null;
+  tpAssessment: NeuralMapLane["openTpAssessment"];
   symbolCount: number;
 }
 
@@ -241,6 +263,11 @@ export interface PaperUnrealizedSnapshot {
   maxFavorableR: number;
   avgDistanceToTpPct: number | null;
   nearestDistanceToTpPct: number | null;
+  avgMfePct: number | null;
+  p75MfePct: number | null;
+  p90MfePct: number | null;
+  avgConfiguredTpPct: number | null;
+  tpAssessment: NeuralMapLane["openTpAssessment"];
   lanes: Record<string, PaperUnrealizedLane>;
 }
 
@@ -250,6 +277,37 @@ function finite(value: number | null | undefined): value is number {
 
 function isDiagnosticPaperOrder(order: PaperOrder): boolean {
   return order.paperOrderMode === "DIAGNOSTIC_ONLY" || order.diagnosticLabel === "BACKFILL_DIAGNOSTIC";
+}
+
+function percentile(values: number[], p: number): number | null {
+  const sorted = values.filter(finite).slice().sort((a, b) => a - b);
+  if (sorted.length === 0) return null;
+  return sorted[Math.min(sorted.length - 1, Math.floor((sorted.length - 1) * p))] ?? null;
+}
+
+function avg(values: number[]): number | null {
+  const xs = values.filter(finite);
+  return xs.length > 0 ? xs.reduce((sum, value) => sum + value, 0) / xs.length : null;
+}
+
+function assessTpAgainstMfe(activeTpPct: number | null, p75MfePct: number | null, p90MfePct: number | null): NeuralMapLane["openTpAssessment"] {
+  const base = assessPaperTp(activeTpPct);
+  if (!base) return null;
+  if (finite(p90MfePct) && p90MfePct > 0 && base.activeTpPct > p90MfePct * 1.25) {
+    return {
+      ...base,
+      verdict: "TOO_FAR_VS_MFE",
+      reason: `TP is above observed p90 MFE (${p90MfePct.toFixed(2)}%), so most open trades have not offered that much profit.`,
+    };
+  }
+  if (finite(p75MfePct) && p75MfePct > 0 && base.activeTpPct > p75MfePct) {
+    return {
+      ...base,
+      verdict: "STRETCHED",
+      reason: `TP is above observed p75 MFE (${p75MfePct.toFixed(2)}%); it may still work, but capture is less frequent.`,
+    };
+  }
+  return base;
 }
 
 export async function buildPaperUnrealizedSnapshot(
@@ -294,6 +352,8 @@ export async function buildPaperUnrealizedSnapshot(
     markPriceSum: number;
     takeProfitPriceSum: number;
     priceCount: number;
+    mfePcts: number[];
+    configuredTpPcts: number[];
     symbols: Set<string>;
   };
   const lanes: Record<string, LaneAccum> = {};
@@ -310,6 +370,8 @@ export async function buildPaperUnrealizedSnapshot(
   let distanceToTpPctSum = 0;
   let distanceToTpPctCount = 0;
   let nearestDistanceToTpPct: number | null = null;
+  const allMfePcts: number[] = [];
+  const allConfiguredTpPcts: number[] = [];
 
   for (const order of openOrders) {
     const markPrice = prices.get(order.symbol);
@@ -335,6 +397,10 @@ export async function buildPaperUnrealizedSnapshot(
     }, markPrice);
     const maxPnl = (order.direction === "SHORT" ? entryPrice - favorablePrice : favorablePrice - entryPrice) * quantity;
     const maxR = finite(riskAmount) && riskAmount > 0 ? maxPnl / riskAmount : 0;
+    const mfePct = order.direction === "SHORT"
+      ? ((entryPrice - favorablePrice) / entryPrice) * 100
+      : ((favorablePrice - entryPrice) / entryPrice) * 100;
+    const configuredTpPct = cgWideTpPctFromOrder(order);
     const distanceToTpPct =
       order.direction === "SHORT"
         ? ((markPrice - takeProfitPrice) / markPrice) * 100
@@ -357,6 +423,8 @@ export async function buildPaperUnrealizedSnapshot(
       markPriceSum: 0,
       takeProfitPriceSum: 0,
       priceCount: 0,
+      mfePcts: [],
+      configuredTpPcts: [],
       symbols: new Set<string>(),
     };
 
@@ -365,6 +433,8 @@ export async function buildPaperUnrealizedSnapshot(
     totalR += r;
     maxFavorablePnl += maxPnl;
     maxFavorableR += maxR;
+    if (finite(mfePct)) allMfePcts.push(mfePct);
+    if (finite(configuredTpPct)) allConfiguredTpPcts.push(configuredTpPct);
     if (finite(distanceToTpPct)) {
       distanceToTpPctSum += distanceToTpPct;
       distanceToTpPctCount += 1;
@@ -380,6 +450,8 @@ export async function buildPaperUnrealizedSnapshot(
     lane.markPriceSum += markPrice;
     lane.takeProfitPriceSum += takeProfitPrice;
     lane.priceCount += 1;
+    if (finite(mfePct)) lane.mfePcts.push(mfePct);
+    if (finite(configuredTpPct)) lane.configuredTpPcts.push(configuredTpPct);
     lane.symbols.add(order.symbol);
     if (finite(distanceToTpPct)) {
       lane.distanceToTpPctSum += distanceToTpPct;
@@ -404,6 +476,9 @@ export async function buildPaperUnrealizedSnapshot(
 
   const renderedLanes: Record<string, PaperUnrealizedLane> = {};
   for (const [laneId, lane] of Object.entries(lanes)) {
+    const avgConfiguredTpPct = avg(lane.configuredTpPcts);
+    const p75MfePct = percentile(lane.mfePcts, 0.75);
+    const p90MfePct = percentile(lane.mfePcts, 0.9);
     renderedLanes[laneId] = {
       open: lane.open,
       pnl: lane.pnl,
@@ -419,9 +494,17 @@ export async function buildPaperUnrealizedSnapshot(
       avgEntryPrice: lane.priceCount > 0 ? lane.entryPriceSum / lane.priceCount : null,
       avgMarkPrice: lane.priceCount > 0 ? lane.markPriceSum / lane.priceCount : null,
       avgTakeProfitPrice: lane.priceCount > 0 ? lane.takeProfitPriceSum / lane.priceCount : null,
+      avgMfePct: avg(lane.mfePcts),
+      p75MfePct,
+      p90MfePct,
+      avgConfiguredTpPct,
+      tpAssessment: assessTpAgainstMfe(avgConfiguredTpPct, p75MfePct, p90MfePct),
       symbolCount: lane.symbols.size,
     };
   }
+  const avgConfiguredTpPct = avg(allConfiguredTpPcts);
+  const p75MfePct = percentile(allMfePcts, 0.75);
+  const p90MfePct = percentile(allMfePcts, 0.9);
 
   return {
     generatedAt,
@@ -438,6 +521,11 @@ export async function buildPaperUnrealizedSnapshot(
     maxFavorableR,
     avgDistanceToTpPct: distanceToTpPctCount > 0 ? distanceToTpPctSum / distanceToTpPctCount : null,
     nearestDistanceToTpPct,
+    avgMfePct: avg(allMfePcts),
+    p75MfePct,
+    p90MfePct,
+    avgConfiguredTpPct,
+    tpAssessment: assessTpAgainstMfe(avgConfiguredTpPct, p75MfePct, p90MfePct),
     lanes: renderedLanes,
   };
 }
@@ -835,6 +923,11 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
       openAvgEntryPrice: unrealized?.avgEntryPrice ?? null,
       openAvgMarkPrice: unrealized?.avgMarkPrice ?? null,
       openAvgTakeProfitPrice: unrealized?.avgTakeProfitPrice ?? null,
+      openAvgMfePct: unrealized?.avgMfePct ?? null,
+      openP75MfePct: unrealized?.p75MfePct ?? null,
+      openP90MfePct: unrealized?.p90MfePct ?? null,
+      openAvgConfiguredTpPct: unrealized?.avgConfiguredTpPct ?? null,
+      openTpAssessment: unrealized?.tpAssessment ?? null,
       openMarkedSymbolCount: unrealized?.symbolCount ?? 0,
       pnlIsDiagnosticOnly,
       startingEquity: input.paper.startingEquity,
@@ -1107,6 +1200,11 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
       openMaxFavorableR: input.paperUnrealized?.maxFavorableR ?? null,
       openAvgDistanceToTpPct: input.paperUnrealized?.avgDistanceToTpPct ?? null,
       openNearestDistanceToTpPct: input.paperUnrealized?.nearestDistanceToTpPct ?? null,
+      openAvgMfePct: input.paperUnrealized?.avgMfePct ?? null,
+      openP75MfePct: input.paperUnrealized?.p75MfePct ?? null,
+      openP90MfePct: input.paperUnrealized?.p90MfePct ?? null,
+      openAvgConfiguredTpPct: input.paperUnrealized?.avgConfiguredTpPct ?? null,
+      openTpAssessment: input.paperUnrealized?.tpAssessment ?? null,
       unrealizedMarkCount: input.paperUnrealized?.markCount ?? 0,
       unrealizedMissingPriceCount: input.paperUnrealized?.missingPriceCount ?? input.paper.open,
       unrealizedPriceSource: input.paperUnrealized?.priceSource ?? null,

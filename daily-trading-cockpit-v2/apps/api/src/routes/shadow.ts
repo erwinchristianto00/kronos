@@ -167,6 +167,12 @@ import {
 } from "../lib/regime-direction-controller-snapshot.js";
 import { buildNeuralMapTelemetry, buildPaperUnrealizedSnapshot } from "../lib/neural-map-telemetry.js";
 import {
+  assessPaperTp,
+  readPaperTradingControls,
+  roundTripCostPct,
+  writePaperTradingControls,
+} from "../lib/paper-trading-controls.js";
+import {
   buildOosValidationSnapshot,
   createOosValidationSnapshotLoggerController,
   getOosValidationSnapshotStore,
@@ -1109,6 +1115,102 @@ export async function registerShadowRoutes(
           : []),
       ],
     });
+  });
+
+  app.get("/api/shadow/paper-controls", async () => {
+    const controls = readPaperTradingControls();
+    const activeTpPct = controls.cgWideTpPct ?? 3;
+    return {
+      controls,
+      cgWideTp: {
+        activeTpPct,
+        defaultTpPct: 3,
+        assessment: assessPaperTp(activeTpPct),
+        roundTripCostPct: roundTripCostPct(),
+      },
+    };
+  });
+
+  app.post<{ Body: { cgWideTpPct?: number | null } }>("/api/shadow/paper-controls/cg-wide-tp", async (request, reply) => {
+    const raw = request.body?.cgWideTpPct;
+    const next = raw === null || raw === undefined ? null : Number(raw);
+    if (next !== null && (!Number.isFinite(next) || next < 0.05 || next > 10)) {
+      reply.code(400);
+      return { ok: false, reason: "cgWideTpPct must be null or a number between 0.05 and 10" };
+    }
+    const controls = writePaperTradingControls({ cgWideTpPct: next });
+    const activeTpPct = controls.cgWideTpPct ?? 3;
+    return {
+      ok: true,
+      controls,
+      cgWideTp: {
+        activeTpPct,
+        defaultTpPct: 3,
+        assessment: assessPaperTp(activeTpPct),
+        roundTripCostPct: roundTripCostPct(),
+      },
+    };
+  });
+
+  app.post<{ Body: { confirm?: string; lane?: string } }>("/api/shadow/paper-controls/realize-open", async (request, reply) => {
+    if (request.body?.confirm !== "REALIZE_PAPER_OPEN") {
+      reply.code(400);
+      return { ok: false, reason: "manual paper close requires confirm=REALIZE_PAPER_OPEN" };
+    }
+    if (!opts.binanceClient) {
+      reply.code(503);
+      return { ok: false, reason: "BINANCE_UNAVAILABLE" };
+    }
+    const laneFilter = request.body?.lane;
+    const openStatuses = new Set(["CREATED", "PAPER_SUBMITTED"]);
+    const paperStore = getPaperExecutionRouterStore();
+    const orders = paperStore.getState().orders.filter((order) =>
+      openStatuses.has(order.paperStatus) &&
+      (!laneFilter || order.selectedLaneId === laneFilter),
+    );
+    const symbols = Array.from(new Set(orders.map((order) => order.symbol))).sort();
+    const latest = new Map<string, number>();
+    await Promise.all(symbols.map(async (symbol) => {
+      try {
+        const candles = await opts.binanceClient!.getCandles(symbol, "5m", 1);
+        const close = candles.at(-1)?.close;
+        if (typeof close === "number" && Number.isFinite(close) && close > 0) latest.set(symbol, close);
+      } catch {
+        // Symbol-level mark failure is counted below.
+      }
+    }));
+
+    let closed = 0;
+    let skipped = 0;
+    let realizedPnl = 0;
+    let realizedR = 0;
+    for (const order of orders) {
+      const mark = latest.get(order.symbol);
+      const entry = order.entryPrice;
+      const risk = order.direction === "LONG" ? entry - order.stopLoss : order.stopLoss - entry;
+      if (!(typeof mark === "number" && Number.isFinite(mark) && entry > 0 && risk > 0)) {
+        skipped += 1;
+        continue;
+      }
+      const grossR = order.direction === "SHORT" ? (entry - mark) / risk : (mark - entry) / risk;
+      const costR = order.plannedStopDistanceBps > 0 ? -(22 / order.plannedStopDistanceBps) : 0;
+      const netR = grossR + costR;
+      const netPnlAmount = netR * order.plannedRiskAmount;
+      paperStore.update(order.paperOrderId, {
+        paperStatus: netR > 0 ? "PAPER_CLOSED_WIN" : "PAPER_CLOSED_LOSS",
+        grossR,
+        costR,
+        netR,
+        netPnlAmount,
+        closeReason: "PAPER_MANUAL_REALIZE_ALL",
+        updatedAt: new Date().toISOString(),
+      });
+      closed += 1;
+      realizedPnl += netPnlAmount;
+      realizedR += netR;
+    }
+
+    return { ok: true, closed, skipped, realizedPnl, realizedR, lane: laneFilter ?? "ALL" };
   });
 
   // ── Compact operator brief (report-only read, no writes, no behavior changes) ──

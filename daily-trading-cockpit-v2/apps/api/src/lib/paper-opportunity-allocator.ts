@@ -68,6 +68,7 @@ import {
   getActiveMixedPaperBudgetProfileConfig,
   type MixedRegimeReport,
 } from "./mixed-regime-router.js";
+import { cgWideTargetFromEntry, readPaperTradingControls } from "./paper-trading-controls.js";
 
 // ─── public report types ──────────────────────────────────────────────────────
 
@@ -1012,6 +1013,7 @@ export function buildPaperOpportunityAllocatorReport(
   const nowMs = new Date(inputs.now).getTime();
   const scanFinishedMs = new Date(inputs.scanFinishedAt).getTime();
   const paperStartMs = inputs.paperStartAt ? new Date(inputs.paperStartAt).getTime() : null;
+  const paperControls = readPaperTradingControls();
 
   const regimeOk = regimeAllowsPaperLane(controllerMode, regimeFamily, paperValidationAllowed) || regimeFamily === "MIXED";
 
@@ -1661,6 +1663,13 @@ export function buildPaperOpportunityAllocatorReport(
       }
 
       const buildOpportunity = (mode: PaperOrderMode): PaperOpportunity => {
+        const manualCgWideTarget =
+          def.id === "CG_WIDE_STOP_TP_WIDE"
+            ? cgWideTargetFromEntry(geo.entryPrice, direction, paperControls.cgWideTpPct)
+            : null;
+        const takeProfitLevels = manualCgWideTarget !== null
+          ? [manualCgWideTarget]
+          : geo.takeProfitLevels.slice();
         // Diagnostic-collection lanes are OOS-unconfirmed by definition; null-safe because long
         // variant lanes have no short VM-sim row.
         const oosUnconfirmed =
@@ -1697,6 +1706,9 @@ export function buildPaperOpportunityAllocatorReport(
               : "VARIANT_MATRIX_DIAGNOSTIC_OOS",
           );
         }
+        if (manualCgWideTarget !== null) {
+          provenance.candidateQualityFlags.push(`MANUAL_CG_WIDE_TP_${paperControls.cgWideTpPct?.toFixed(2)}PCT`);
+        }
         return {
           sourceCandidateId,
           scanBatchId: inputs.scanBatchId,
@@ -1708,7 +1720,7 @@ export function buildPaperOpportunityAllocatorReport(
           controllerMode,
           entryPrice: geo.entryPrice,
           stopLoss: geo.stopLoss,
-          takeProfitLevels: geo.takeProfitLevels.slice(),
+          takeProfitLevels,
           variantExitRule: def.exitRule,
           fillMode: def.fillMode,
           plannedStopDistanceBps: geo.stopDistanceBps,
