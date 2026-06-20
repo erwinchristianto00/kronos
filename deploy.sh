@@ -29,11 +29,11 @@ echo "==> 2/3  rsync code -> VPS (data/ untouched)"
 rsync -az --delete \
   --exclude '.git' --exclude 'node_modules' --exclude 'data' \
   --exclude '.venv' --exclude 'vendor' --exclude 'dist' --exclude '.env' \
-  -e "ssh -i $SSH_KEY" \
+  -e "ssh -i $SSH_KEY -o StrictHostKeyChecking=accept-new" \
   "$PROJECT/" "$VPS:$REMOTE_DIR/"
 
 echo "==> 3/3  build + restart on VPS"
-ssh -i "$SSH_KEY" "$VPS" "cd $REMOTE_DIR \
+ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new "$VPS" "cd $REMOTE_DIR \
   && mkdir -p apps/api/data data \
   && npm install --no-audit --no-fund \
   && npm run build \
