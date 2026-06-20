@@ -1587,12 +1587,15 @@ describe("paper-opportunity-allocator", () => {
     expect(report.cgWideMaxStaleOpen).toBe(16);
     expect(report.cgWideElevatedOpenThreshold).toBe(19);
     expect(report.cgWideCapacityPressure).toBe("FULL");
+    expect(report.headlineOpenCount).toBe(0);
+    expect(report.diagnosticOpenCount).toBe(26);
 
     const lines = buildPaperOpportunityAllocatorBriefLines(report);
     expect(lines.some((line) => line.includes("longPaperLane="))).toBe(false);
     expect(lines.some((line) => line.includes("longHeadlineLane=CG_LONG_VARIANT_MATRIX:CG_SCALEOUT_TP1_TRAIL"))).toBe(true);
     expect(lines.some((line) => line.includes("longDiagnosticLane=CG_LONG_VARIANT_MATRIX:CG_WIDE_STOP_TP_WIDE"))).toBe(true);
     expect(lines.some((line) => line.includes("paperAccounting: headlineCreated=0"))).toBe(true);
+    expect(lines.some((line) => line.includes("headlineOpen=0 diagnosticCreated=0 diagnosticOpen=26 note=DIAGNOSTIC_OPEN_ONLY"))).toBe(true);
     expect(lines.some((line) => line.includes("cgWideCapacity: open=26/26"))).toBe(true);
     expect(lines.some((line) => line.includes("warningAt=19 pressure=FULL"))).toBe(true);
   });

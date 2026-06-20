@@ -221,6 +221,8 @@ export interface PaperOpportunityAllocatorReport {
   diagnosticEligibleCount: number;
   createdHeadline: number;
   createdDiagnostic: number;
+  headlineOpenCount: number;
+  diagnosticOpenCount: number;
   cgWideOpenCount: number;
   cgWideMaxOpen: number;
   cgWideStaleOpenCount: number;
@@ -1023,6 +1025,12 @@ export function buildPaperOpportunityAllocatorReport(
   const currentPaperOrders = inputs.currentPaperOrders ?? [];
   const cgWideBudget = activeMixedBudget.budget;
   const openCgWideOrders = currentPaperOrders.filter((order) => isOpenPaperOrder(order) && isCgWideLaneId(order.selectedLaneId));
+  const headlineOpenCount = currentPaperOrders.filter(
+    (order) => isOpenPaperOrder(order) && order.paperOrderMode === "HEADLINE",
+  ).length;
+  const diagnosticOpenCount = currentPaperOrders.filter(
+    (order) => isOpenPaperOrder(order) && order.paperOrderMode === "DIAGNOSTIC_ONLY",
+  ).length;
   const staleCgWideOpenCount = openCgWideOrders.filter(
     (order) => (paperOrderOpenHours(order, nowMs) ?? 0) >= CG_WIDE_STALE_HOURS,
   ).length;
@@ -1108,6 +1116,8 @@ export function buildPaperOpportunityAllocatorReport(
     diagnosticEligibleCount: 0,
     createdHeadline: 0,
     createdDiagnostic: 0,
+    headlineOpenCount,
+    diagnosticOpenCount,
     cgWideOpenCount: openCgWideOrders.length,
     cgWideMaxOpen: cgWideBudget.maxWideOpen,
     cgWideStaleOpenCount: staleCgWideOpenCount,
@@ -1973,6 +1983,14 @@ export function buildPaperOpportunityAllocatorBriefLines(
   report: PaperOpportunityAllocatorReport,
 ): string[] {
   const L: string[] = [];
+  const paperAccountingNote =
+    report.headlineOpenCount === 0 && report.diagnosticOpenCount > 0
+      ? "DIAGNOSTIC_OPEN_ONLY"
+      : report.createdHeadline === 0 && report.createdDiagnostic > 0
+        ? "DIAGNOSTIC_ONLY_COLLECTION"
+        : report.headlineOpenCount === 0 && report.diagnosticOpenCount === 0
+          ? "NO_OPEN_PAPER_ORDERS"
+          : "HEADLINE_AND_DIAGNOSTIC_SPLIT";
   L.push(
     `   allocator: candidatesSeen=${report.candidatesSeen} evaluated=${report.candidatesEvaluated}` +
       ` laneEvals=${report.laneEvaluationsCreated} eligible=${report.paperEligibleCount}` +
@@ -1986,8 +2004,10 @@ export function buildPaperOpportunityAllocatorBriefLines(
   );
   L.push(
     `   paperAccounting: headlineCreated=${report.createdHeadline}` +
+      ` headlineOpen=${report.headlineOpenCount}` +
       ` diagnosticCreated=${report.createdDiagnostic}` +
-      ` note=${report.createdHeadline === 0 && report.createdDiagnostic > 0 ? "DIAGNOSTIC_ONLY_COLLECTION" : "HEADLINE_AND_DIAGNOSTIC_SPLIT"}`,
+      ` diagnosticOpen=${report.diagnosticOpenCount}` +
+      ` note=${paperAccountingNote}`,
   );
   L.push(
     `   cgWideCapacity: open=${report.cgWideOpenCount}/${report.cgWideMaxOpen}` +
