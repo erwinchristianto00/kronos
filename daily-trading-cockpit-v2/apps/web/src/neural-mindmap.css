@@ -386,6 +386,12 @@
 }
 
 .neural-realize-box button {
+  border-color: #34715d;
+  color: #071016;
+  background: #50dca1;
+}
+
+.neural-realize-box button.is-exchange-danger {
   border-color: #8b313a;
   color: #ffe8ea;
   background: #8f2733;

@@ -429,6 +429,93 @@ export class LiveExecutionEngine {
     await this.engageKillSwitch(`manual: ${reason}`);
   }
 
+  /** Operator panic flatten: cancel every visible Binance USD-M order and reduce-only close every exchange position. */
+  async flattenAllExchangePositions(reason: string): Promise<{
+    ok: boolean;
+    env: string;
+    canceledOrderSymbols: string[];
+    canceledAlgoSymbols: string[];
+    flattened: Array<{ symbol: string; side: "BUY" | "SELL"; quantity: number; orderId: number | null }>;
+    failed: Array<{ symbol: string; action: string; reason: string }>;
+  }> {
+    const st = this.store.getState();
+    this.armed = false;
+    st.killedAt = this.nowIso();
+    st.killReason = `manual exchange flatten: ${reason}`;
+
+    const failed: Array<{ symbol: string; action: string; reason: string }> = [];
+    const canceledOrderSymbols: string[] = [];
+    const canceledAlgoSymbols: string[] = [];
+    const flattened: Array<{ symbol: string; side: "BUY" | "SELL"; quantity: number; orderId: number | null }> = [];
+
+    const [positions, openOrders, openAlgoOrders] = await Promise.all([
+      this.client.getPositions(),
+      this.client.getOpenOrders(),
+      this.client.getOpenAlgoOrders(),
+    ]);
+    const symbols = new Set<string>();
+    for (const pos of positions) {
+      if (Math.abs(pos.positionAmt) > 0) symbols.add(pos.symbol);
+    }
+    for (const order of openOrders) symbols.add(order.symbol);
+    for (const order of openAlgoOrders) symbols.add(order.symbol);
+
+    for (const symbol of Array.from(symbols).sort()) {
+      try {
+        await this.client.cancelAllOrders(symbol);
+        canceledOrderSymbols.push(symbol);
+      } catch (error) {
+        failed.push({ symbol, action: "cancelAllOrders", reason: (error as Error).message });
+      }
+      try {
+        await this.client.cancelAllAlgoOrders(symbol);
+        canceledAlgoSymbols.push(symbol);
+      } catch (error) {
+        failed.push({ symbol, action: "cancelAllAlgoOrders", reason: (error as Error).message });
+      }
+
+      const pos = positions.find((candidate) => candidate.symbol === symbol);
+      const quantity = Math.abs(pos?.positionAmt ?? 0);
+      if (quantity <= 0) continue;
+      const side: "BUY" | "SELL" = (pos?.positionAmt ?? 0) > 0 ? "SELL" : "BUY";
+      try {
+        const order = await this.client.placeOrder({
+          symbol,
+          side,
+          type: "MARKET",
+          quantity,
+          reduceOnly: true,
+          newClientOrderId: `dtc-flatten-${Date.now().toString(36)}-${symbol.slice(0, 8)}`,
+        });
+        flattened.push({ symbol, side, quantity, orderId: order.orderId ?? null });
+      } catch (error) {
+        failed.push({ symbol, action: "marketReduceOnly", reason: (error as Error).message });
+      }
+    }
+
+    const affectedSymbols = new Set([...symbols]);
+    for (const intent of st.intents) {
+      if (!OPEN_INTENT_STATES.has(intent.state) || !affectedSymbols.has(intent.symbol)) continue;
+      intent.state = "KILLED";
+      intent.closeReason = `EXCHANGE_FLATTEN: ${reason}`;
+      intent.closedAt = this.nowIso();
+      intent.updatedAt = this.nowIso();
+      if (failed.some((item) => item.symbol === intent.symbol)) {
+        intent.lastError = `exchange flatten had symbol-level failures; check /api/live/status`;
+      }
+    }
+    this.store.save();
+
+    return {
+      ok: failed.length === 0,
+      env: this.client.env,
+      canceledOrderSymbols,
+      canceledAlgoSymbols,
+      flattened,
+      failed,
+    };
+  }
+
   /** Clears a latched kill (deliberate operator action via route). */
   resetKill(): void {
     const st = this.store.getState();

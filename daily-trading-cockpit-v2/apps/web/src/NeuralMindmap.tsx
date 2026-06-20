@@ -621,6 +621,43 @@ export default function NeuralMindmap() {
     }
   }
 
+  async function flattenBinanceExchange() {
+    const confirm = window.prompt('DANGER: type FLATTEN_BINANCE_ALL to cancel Binance USD-M orders and market-close ALL exchange positions.');
+    if (confirm !== 'FLATTEN_BINANCE_ALL') {
+      setRealizeStatus('Cancelled. Binance exchange positions were not changed.');
+      return;
+    }
+    try {
+      setRealizeStatus('Flattening Binance exchange positions...');
+      const response = await fetch('/api/live/flatten-exchange', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ confirm, reason: 'dashboard operator flatten' }),
+      });
+      const result = await response.json() as {
+        ok?: boolean;
+        reason?: string;
+        env?: string;
+        flattened?: Array<{ symbol: string; quantity: number }>;
+        canceledOrderSymbols?: string[];
+        canceledAlgoSymbols?: string[];
+        failed?: Array<{ symbol: string; action: string; reason: string }>;
+      };
+      if (!response.ok || result.ok === false) {
+        const failures = result.failed?.map((item) => `${item.symbol}:${item.action}`).join(', ');
+        throw new Error(result.reason ?? failures ?? `Flatten failed (${response.status})`);
+      }
+      setRealizeStatus(
+        `Binance ${result.env ?? 'exchange'} flattened ${result.flattened?.length ?? 0} positions; canceled ${result.canceledOrderSymbols?.length ?? 0} order symbols and ${result.canceledAlgoSymbols?.length ?? 0} algo symbols. Kill-switch latched.`,
+      );
+      void loadLiveAccount();
+      void loadTelemetry();
+    } catch (nextError) {
+      setRealizeStatus(nextError instanceof Error ? nextError.message : 'Unable to flatten Binance exchange');
+      void loadLiveAccount();
+    }
+  }
+
   const selectedConnections = useMemo(() => {
     if (!telemetry || (!selectedNode && !selectedLane)) return { inputs: [] as string[], outputs: [] as string[] };
     const id = selectedNode?.id ?? selectedLane?.id ?? '';
@@ -755,6 +792,8 @@ export default function NeuralMindmap() {
         <div className="neural-realize-box">
           <button type="button" onClick={() => void captureDiagnosticProfit()}>Capture diag profit</button>
           <p>Closes only profitable diagnostic paper MTM using Binance mark. Non-profitable diagnostics stay open; live Binance positions are untouched.</p>
+          <button type="button" className="is-exchange-danger" onClick={() => void flattenBinanceExchange()}>Close Binance exchange</button>
+          <p>Cancels visible Binance USD-M orders and market reduce-only closes every exchange position. This latches the kill-switch.</p>
         </div>
         {(controlStatus || realizeStatus) && (
           <div className="neural-control-status">

@@ -66,6 +66,25 @@ export async function registerLiveRoutes(
     return { ok: true, armed: engine.isArmed(), status: engine.getStatus() };
   });
 
+  app.post("/api/live/flatten-exchange", async (request, reply) => {
+    if (!engine) {
+      reply.code(503);
+      return { ok: false, reason: "live execution disabled" };
+    }
+    const body = (request.body ?? {}) as { confirm?: string; reason?: string };
+    if (body.confirm !== "FLATTEN_BINANCE_ALL") {
+      reply.code(400);
+      return {
+        ok: false,
+        reason:
+          'exchange flatten requires body {"confirm":"FLATTEN_BINANCE_ALL"} — cancels ALL visible Binance USD-M orders and MARKET reduce-only closes ALL exchange positions',
+      };
+    }
+    const result = await engine.flattenAllExchangePositions(body.reason ?? "operator exchange flatten");
+    if (!result.ok) reply.code(502);
+    return { ...result, armed: engine.isArmed(), status: engine.getStatus() };
+  });
+
   app.get("/api/live/balance", async (_request, reply) => {
     if (!engine) {
       reply.code(503);
