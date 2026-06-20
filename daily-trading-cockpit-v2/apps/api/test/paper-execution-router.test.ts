@@ -16,6 +16,11 @@ import {
   buildPaperExecutionRouterBriefLines,
   PAPER_ADMISSION_MAX_AGE_MS,
   DEFAULT_PAPER_EQUITY,
+  HEADLINE_MAX_OPEN,
+  HEADLINE_MAX_PER_SYMBOL,
+  HEADLINE_MAX_PER_DIRECTION,
+  isOpenHeadlineOrder,
+  headlineConcentrationRejectReason,
   type PaperOrder,
   type PaperKlineTuple,
   type PaperResolverClient,
@@ -1629,6 +1634,60 @@ describe("paper-execution-router drawdown circuit-breaker", () => {
     store.updateEquityPeakAndBreaker(eqStart + 5 * perR - 12 * perR, plus(t0, MIN)); // 12R dd
     expect(store.isAdmissionHalted(plus(t0, MIN))).toBe(false);
     expect(store.getBreakerState().breakerHaltUntil).toBeNull();
+  });
+});
+
+describe("headline concentration caps (anti-correlation safety)", () => {
+  const openLong = (symbol: string, i: number) =>
+    makePaperOrder({ paperOrderId: `h-${symbol}-${i}`, symbol, direction: "LONG", paperStatus: "CREATED" });
+
+  it("isOpenHeadlineOrder counts only open, non-diagnostic, non-backfill orders", () => {
+    expect(isOpenHeadlineOrder(makePaperOrder({ paperStatus: "CREATED" }))).toBe(true);
+    expect(isOpenHeadlineOrder(makePaperOrder({ paperStatus: "PAPER_SUBMITTED" }))).toBe(true);
+    expect(isOpenHeadlineOrder(makePaperOrder({ paperOrderMode: "DIAGNOSTIC_ONLY" }))).toBe(false);
+    expect(isOpenHeadlineOrder(makePaperOrder({ diagnosticLabel: "BACKFILL_DIAGNOSTIC" }))).toBe(false);
+    expect(isOpenHeadlineOrder(makePaperOrder({ paperStatus: "PAPER_RESOLVED", netR: 1 }))).toBe(false);
+  });
+
+  it("allows admission when under all caps", () => {
+    expect(headlineConcentrationRejectReason([], "BTCUSDT", "LONG")).toBeNull();
+    expect(headlineConcentrationRejectReason([openLong("BTCUSDT", 0)], "BTCUSDT", "LONG")).toBeNull();
+  });
+
+  it("blocks a 3rd open headline order on the same symbol (per-symbol cap)", () => {
+    const open = Array.from({ length: HEADLINE_MAX_PER_SYMBOL }, (_, i) => openLong("BTCUSDT", i));
+    expect(headlineConcentrationRejectReason(open, "BTCUSDT", "LONG")).toBe("HEADLINE_MAX_PER_SYMBOL_REACHED");
+    // a different symbol is still fine
+    expect(headlineConcentrationRejectReason(open, "ETHUSDT", "LONG")).toBeNull();
+  });
+
+  it("blocks the per-direction cap (correlated one-sided basket)", () => {
+    // distinct symbols so the per-symbol cap is never the trigger
+    const open = Array.from({ length: HEADLINE_MAX_PER_DIRECTION }, (_, i) => openLong(`SYM${i}USDT`, i));
+    expect(headlineConcentrationRejectReason(open, "NEWUSDT", "LONG")).toBe("HEADLINE_MAX_PER_DIRECTION_REACHED");
+    // opposite direction still has room
+    expect(headlineConcentrationRejectReason(open, "NEWUSDT", "SHORT")).toBeNull();
+  });
+
+  it("blocks the total open cap (portfolio heat) before per-direction when mixed", () => {
+    const half = Math.ceil(HEADLINE_MAX_OPEN / 2);
+    const open = [
+      ...Array.from({ length: half }, (_, i) => openLong(`L${i}USDT`, i)),
+      ...Array.from({ length: HEADLINE_MAX_OPEN - half }, (_, i) =>
+        makePaperOrder({ paperOrderId: `s-${i}`, symbol: `S${i}USDT`, direction: "SHORT", paperStatus: "CREATED" }),
+      ),
+    ];
+    expect(open.length).toBe(HEADLINE_MAX_OPEN);
+    expect(headlineConcentrationRejectReason(open, "NEWUSDT", "SHORT")).toBe("HEADLINE_MAX_OPEN_REACHED");
+  });
+
+  it("does NOT count diagnostic probes — they never hit the cap", () => {
+    const probes = Array.from({ length: 10 }, (_, i) =>
+      makePaperOrder({ paperOrderId: `d-${i}`, symbol: "BTCUSDT", direction: "LONG", paperOrderMode: "DIAGNOSTIC_ONLY" }),
+    );
+    const openHeadline = probes.filter(isOpenHeadlineOrder);
+    expect(openHeadline).toHaveLength(0);
+    expect(headlineConcentrationRejectReason(openHeadline, "BTCUSDT", "LONG")).toBeNull();
   });
 });
 

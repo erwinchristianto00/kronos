@@ -203,6 +203,12 @@
   color: #ff707a !important;
 }
 
+/* Measurement / diagnostic values — NOT real wins or losses, so they are shown in
+   a neutral cyan rather than green/red, to avoid reading as profit/loss. */
+.tone-measure {
+  color: #6fb7c9 !important;
+}
+
 .neural-error {
   display: flex;
   gap: 10px;

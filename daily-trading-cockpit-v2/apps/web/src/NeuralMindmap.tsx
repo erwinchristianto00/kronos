@@ -71,6 +71,7 @@ interface NeuralLane {
   startingEquity: number;
   totalPnlPct: number | null;
   headlinePnlPct: number | null;
+  pnlIsDiagnosticOnly: boolean;
   status: string;
   reason: string;
 }
@@ -372,7 +373,9 @@ function laneMetricLabel(
     return `${fmtPct(growth)} / ${liveLane.sourceOrderCount} live`;
   }
   if (lane.diagnosticUnrealizedPnl !== null && lane.open > 0) {
-    return `${fmtUsdt(lane.diagnosticUnrealizedPnl)} / open`;
+    // Measurement, not a real position — label it so the open mark-to-market on
+    // diagnostic probes does not read as a real loss.
+    return `meas ${fmtUsdt(lane.diagnosticUnrealizedPnl)} / open`;
   }
   if (lane.totalPnl > 0 && lane.totalPnlPct !== null) {
     return `${fmtPct(lane.totalPnlPct)} / n=${lane.closed}`;
@@ -532,6 +535,12 @@ export default function NeuralMindmap() {
     (telemetry?.lanes.filter((lane) => lane.health === 'CRITICAL').length ?? 0);
   const warningCount = (telemetry?.nodes.filter((node) => node.health === 'WARNING').length ?? 0) +
     (telemetry?.lanes.filter((lane) => lane.health === 'WARNING').length ?? 0);
+  // Real paper P&L = HEADLINE only (realized + unrealized). Diagnostic probes are
+  // measurement, never mirror to live, and are reported separately below.
+  const paperRealPnl = telemetry
+    ? telemetry.paper.headlinePnl + (telemetry.paper.headlineUnrealizedPnl ?? 0)
+    : 0;
+  const paperRealTone = paperRealPnl > 0 ? 'tone-healthy' : paperRealPnl < 0 ? 'tone-critical' : 'tone-measure';
   const paperTpAssessment = telemetry?.paper.openTpAssessment ?? paperControls?.cgWideTp.assessment ?? null;
   const activeTpPct = paperControls?.cgWideTp.activeTpPct ?? 3;
   const draftTpPct = Number(tpDraft);
@@ -712,11 +721,13 @@ export default function NeuralMindmap() {
           <small>{stale ? 'telemetry stale' : `updated ${new Date(telemetry?.generatedAt ?? Date.now()).toLocaleTimeString()}`}</small>
         </div>
         <div>
-          <span>Paper brain</span>
-          <strong>{telemetry ? `${telemetry.paper.open} open / ${telemetry.paper.closed} closed` : 'Loading'}</strong>
+          <span>Paper P&amp;L (real)</span>
+          <strong className={paperRealTone}>
+            {telemetry ? `${fmtUsdt(paperRealPnl)} headline` : 'Loading'}
+          </strong>
           <small>
             {telemetry
-              ? `diag open ${fmtUsdt(telemetry.paper.diagnosticUnrealizedPnl)} · TP avg ${fmtGapPct(telemetry.paper.openAvgDistanceToTpPct)}`
+              ? `${telemetry.paper.open} open · meas ${fmtUsdt(telemetry.paper.diagnosticUnrealizedPnl)} (not real)`
               : 'paper only'}
           </small>
         </div>
@@ -994,10 +1005,11 @@ export default function NeuralMindmap() {
                   <div><dt>Nearest TP gap</dt><dd>{fmtGapPct(selectedLane.openNearestDistanceToTpPct)} across {selectedLane.openMarkedSymbolCount} symbols</dd></div>
                   <div><dt>MFE avg / p90</dt><dd>{fmtPlainPct(selectedLane.openAvgMfePct)} / {fmtPlainPct(selectedLane.openP90MfePct)}</dd></div>
                   <div><dt>TP quality</dt><dd>{tpVerdictLabel(selectedLane.openTpAssessment)} · TP {fmtPlainPct(selectedLane.openAvgConfiguredTpPct)}</dd></div>
-                  <div><dt>Paper evidence PnL</dt><dd>{fmtMoney(selectedLane.totalPnl)}</dd></div>
-                  <div><dt>Diagnostic open MTM</dt><dd className={(selectedLane.diagnosticUnrealizedPnl ?? 0) >= 0 ? 'tone-healthy' : 'tone-critical'}>{fmtUsdt(selectedLane.diagnosticUnrealizedPnl)} / {fmtR(selectedLane.diagnosticUnrealizedR)}</dd></div>
-                  <div><dt>Max favorable open</dt><dd className={(selectedLane.openMaxFavorablePnl ?? 0) >= 0 ? 'tone-healthy' : 'tone-critical'}>{fmtUsdt(selectedLane.openMaxFavorablePnl)} / {fmtR(selectedLane.openMaxFavorableR)}</dd></div>
-                  <div><dt>All open MTM</dt><dd className={(selectedLane.openUnrealizedPnl ?? 0) >= 0 ? 'tone-healthy' : 'tone-critical'}>{fmtUsdt(selectedLane.openUnrealizedPnl)} / {fmtR(selectedLane.openUnrealizedR)}</dd></div>
+                  <div><dt>Headline PnL (real)</dt><dd className={(() => { const v = selectedLane.headlinePnl + (selectedLane.headlineUnrealizedPnl ?? 0); return v > 0 ? 'tone-healthy' : v < 0 ? 'tone-critical' : 'tone-measure'; })()}>{fmtUsdt(selectedLane.headlinePnl + (selectedLane.headlineUnrealizedPnl ?? 0))} / {fmtR((selectedLane.netAvgR ?? 0) === 0 && selectedLane.closed === 0 ? null : selectedLane.headlineUnrealizedR)}{selectedLane.pnlIsDiagnosticOnly ? ' · flat (no real trades yet)' : ''}</dd></div>
+                  <div><dt>Paper evidence PnL</dt><dd className={selectedLane.pnlIsDiagnosticOnly ? 'tone-measure' : undefined}>{fmtMoney(selectedLane.totalPnl)}{selectedLane.pnlIsDiagnosticOnly ? ' · diagnostic' : ''}</dd></div>
+                  <div><dt>Diagnostic open MTM <small>(measurement)</small></dt><dd className="tone-measure">{fmtUsdt(selectedLane.diagnosticUnrealizedPnl)} / {fmtR(selectedLane.diagnosticUnrealizedR)}</dd></div>
+                  <div><dt>Max favorable open</dt><dd className="tone-measure">{fmtUsdt(selectedLane.openMaxFavorablePnl)} / {fmtR(selectedLane.openMaxFavorableR)}</dd></div>
+                  <div><dt>All open MTM</dt><dd className={selectedLane.pnlIsDiagnosticOnly ? 'tone-measure' : (selectedLane.openUnrealizedPnl ?? 0) >= 0 ? 'tone-healthy' : 'tone-critical'}>{fmtUsdt(selectedLane.openUnrealizedPnl)} / {fmtR(selectedLane.openUnrealizedR)}</dd></div>
                   <div><dt>Binance mirrored</dt><dd>{selectedLiveLane ? `${selectedLiveLane.sourceOrderCount} orders / ${selectedLiveLane.symbols.length} symbols` : 'not open'}</dd></div>
                   <div><dt>Binance notional</dt><dd>{selectedLiveLane ? `${selectedLiveLane.notionalUsd.toFixed(2)} USDT` : '0.00 USDT'}</dd></div>
                   <div><dt>Binance unrealized</dt><dd className={(selectedLiveLane?.unrealizedPnl ?? 0) >= 0 ? 'tone-healthy' : 'tone-critical'}>{selectedLiveLane ? `${selectedLiveLane.unrealizedPnl >= 0 ? '+' : ''}${selectedLiveLane.unrealizedPnl.toFixed(2)} USDT` : '0.00 USDT'}</dd></div>
@@ -1117,8 +1129,8 @@ export default function NeuralMindmap() {
                       <td><i className={`health-${healthOf(lane.id).toLowerCase()}`} />{compactLaneLabel(lane.label)}</td>
                       <td>{lane.status}</td>
                       <td>{fmtGapPct(lane.openAvgDistanceToTpPct)}</td>
-                      <td className={(lane.diagnosticUnrealizedPnl ?? 0) >= 0 ? 'tone-healthy' : 'tone-critical'}>{fmtUsdt(lane.diagnosticUnrealizedPnl)}</td>
-                      <td className={(lane.openMaxFavorablePnl ?? 0) >= 0 ? 'tone-healthy' : 'tone-critical'}>{fmtUsdt(lane.openMaxFavorablePnl)}</td>
+                      <td className="tone-measure">{fmtUsdt(lane.diagnosticUnrealizedPnl)}</td>
+                      <td className="tone-measure">{fmtUsdt(lane.openMaxFavorablePnl)}</td>
                       <td className={livePnl >= 0 ? 'tone-healthy' : 'tone-critical'}>{`${livePnl >= 0 ? '+' : ''}${livePnl.toFixed(2)} USDT`}</td>
                       <td className={livePnl >= 0 ? 'tone-healthy' : 'tone-critical'}>{fmtPct(liveGrowth)}</td>
                       <td>{liveLane?.sourceOrderCount ?? 0}</td>

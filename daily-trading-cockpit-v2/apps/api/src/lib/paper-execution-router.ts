@@ -1142,6 +1142,51 @@ function _buildAllocatorOrder(
   }, now);
 }
 
+// ─── Global HEADLINE concentration caps (anti-correlation safety) ─────────────
+// HEADLINE paper orders are the only ones that mirror to live, so the set of OPEN
+// HEADLINE orders == real (or live-bound) exposure. Each risks plannedRiskR=1
+// (~1% of equity), so capping the TOTAL open count doubles as a portfolio-heat
+// cap (e.g. 50 ≈ 50% peak heat — the heat-shadow sweep shows ~30–50% keeps
+// drawdown small vs ~117% uncapped). Per-symbol/per-direction caps stop a
+// correlated basket (e.g. "182 long alts", or the same symbol opened across many
+// lane variants) from going live all at once, where one correlated dump would
+// hit every position together.
+//
+// DIAGNOSTIC_ONLY probes are measurement only and NEVER mirror to live, so they
+// are deliberately NOT capped here (that is a separate, opt-in lever). Tunable
+// via env; 0/empty falls back to the defaults below.
+export const HEADLINE_MAX_OPEN = Number(process.env.HEADLINE_MAX_OPEN) || 50;
+export const HEADLINE_MAX_PER_SYMBOL = Number(process.env.HEADLINE_MAX_PER_SYMBOL) || 2;
+export const HEADLINE_MAX_PER_DIRECTION = Number(process.env.HEADLINE_MAX_PER_DIRECTION) || 30;
+
+const HEADLINE_OPEN_STATUSES = new Set<PaperOrder["paperStatus"]>(["CREATED", "PAPER_SUBMITTED"]);
+
+/** An OPEN order that counts toward real/live-bound exposure (headline, not a
+ *  diagnostic probe or backfill, and still open). */
+export function isOpenHeadlineOrder(o: PaperOrder): boolean {
+  return (
+    (o.paperOrderMode ?? "HEADLINE") !== "DIAGNOSTIC_ONLY" &&
+    o.diagnosticLabel !== "BACKFILL_DIAGNOSTIC" &&
+    HEADLINE_OPEN_STATUSES.has(o.paperStatus)
+  );
+}
+
+/** Returns a reject reason if admitting one more open HEADLINE order for this
+ *  (symbol, direction) would breach a global concentration cap, else null.
+ *  `openHeadline` must already be filtered to open headline orders. */
+export function headlineConcentrationRejectReason(
+  openHeadline: readonly PaperOrder[],
+  symbol: string,
+  direction: "LONG" | "SHORT",
+): string | null {
+  if (openHeadline.length >= HEADLINE_MAX_OPEN) return "HEADLINE_MAX_OPEN_REACHED";
+  if (openHeadline.filter((o) => o.direction === direction).length >= HEADLINE_MAX_PER_DIRECTION)
+    return "HEADLINE_MAX_PER_DIRECTION_REACHED";
+  if (openHeadline.filter((o) => o.symbol === symbol).length >= HEADLINE_MAX_PER_SYMBOL)
+    return "HEADLINE_MAX_PER_SYMBOL_REACHED";
+  return null;
+}
+
 /**
  * Admits allocator-selected scan-candidate opportunities as paper orders.
  * Bypasses the variant-matrix observation tape entirely — the source is a
@@ -1240,6 +1285,25 @@ export function admitPaperOpportunities(
         : 1;
     order.plannedPositionNotional = size.plannedPositionNotional * occupancyRiskMultiplier;
     order.operationalSafetyStatus = "OK";
+
+    // Global concentration cap — HEADLINE only (diagnostic probes are measurement,
+    // never mirror to live, so they are not capped). Drops the over-cap headline
+    // candidate rather than downgrading it, so correlated/duplicate exposure can't
+    // pile up live. Counts orders already added earlier in THIS batch too.
+    if ((order.paperOrderMode ?? "HEADLINE") !== "DIAGNOSTIC_ONLY") {
+      const openHeadline = store.all.filter(isOpenHeadlineOrder);
+      const concentrationReason = headlineConcentrationRejectReason(
+        openHeadline,
+        order.symbol,
+        order.direction,
+      );
+      if (concentrationReason) {
+        result.rejected += 1;
+        result.skippedReasons.push(`${concentrationReason}:${o.sourceCandidateId}`);
+        continue;
+      }
+    }
+
     store.add(order);
     result.admitted += 1;
     if ((order.paperOrderMode ?? "HEADLINE") === "DIAGNOSTIC_ONLY") {
