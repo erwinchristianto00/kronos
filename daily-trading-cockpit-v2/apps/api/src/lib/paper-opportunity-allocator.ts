@@ -32,6 +32,8 @@
 import type { Candidate, Direction } from "@dtc/shared";
 
 import {
+  BULL_SCALEOUT_VARIANT_ID,
+  BULL_TREND_VARIANT_ID,
   VARIANT_MATRIX_DEFINITIONS,
   deriveVariantGeometry,
   stopDistanceBpsOf,
@@ -336,6 +338,20 @@ export interface PaperOpportunityAllocatorInputs {
    * only to stamp `symbolHistoricalNet` provenance; advisory, never gates.
    */
   symbolHistoricalNetMap?: Record<string, number | null>;
+  /**
+   * Optional lane-level honest-edge gate (RegimeEdgeMemoryStore). When supplied,
+   * a candidate whose (regime × direction × lane) edge is PROVEN-NEGATIVE is
+   * rejected — so a losing lane (wide-stop SHORT, −0.25R) cannot trade while a
+   * positive lane (tight/fast-TP SHORT) in the same direction does. Cold-start
+   * lanes pass. Omitted ⇒ no lane gate (back-compat for tests).
+   */
+  laneEdgeGate?: {
+    laneVerdict(
+      regimeRaw: string | null | undefined,
+      direction: "LONG" | "SHORT",
+      lane: string,
+    ): { allowed: boolean; reasonCode: string };
+  };
   /** Current paper book used only for Mixed Regime occupancy-budget admission. */
   currentPaperOrders?: PaperOrder[];
   /**
@@ -377,6 +393,8 @@ const VARIANT_MATRIX_DIAGNOSTIC_IDS: readonly VariantMatrixVariantId[] = [
   "CG_NO_FIB500_ENTRYSET",
   "CG_MAKER_LIMIT_SIM",
   // Long-only reward-geometry research lanes (GPT deep-research candidates).
+  BULL_TREND_VARIANT_ID,
+  BULL_SCALEOUT_VARIANT_ID,
   "LG_R12_STOP250_FULL",
   "LG_R12_STOP300_FULL",
 ];
@@ -430,6 +448,7 @@ export function computeAutoQuarantinedVariantLanes(orders: readonly PaperOrder[]
  * least 15% as far from entry as the stop.
  */
 const TRAIL_MIN_TP1_STOP_RATIO = 0.15;
+const BULL_TREND_MIN_SCORE = 60;
 const BENCHMARK_ONLY_LANE_IDS: readonly VariantMatrixVariantId[] = [
   "CG_BASELINE_CURRENT",
   "CG_MAKER_LIMIT_SIM",
@@ -437,8 +456,9 @@ const BENCHMARK_ONLY_LANE_IDS: readonly VariantMatrixVariantId[] = [
 
 export function paperOpportunityStopFloorRejection(
   stopDistanceBps: number,
+  minimumBps = WIDE_STOP_MIN_BPS,
 ): "STOP_DISTANCE_BELOW_FLOOR" | null {
-  return Number.isFinite(stopDistanceBps) && stopDistanceBps >= WIDE_STOP_MIN_BPS
+  return Number.isFinite(stopDistanceBps) && stopDistanceBps >= minimumBps
     ? null
     : "STOP_DISTANCE_BELOW_FLOOR";
 }
@@ -747,6 +767,7 @@ function regimeAllowsPaperLane(
 ): boolean {
   if (controllerMode === "LONG_ONLY") return regimeFamily === "BULLISH";
   if (controllerMode === "NO_TRADE_CHOP") return false;
+  if (controllerMode === "NO_TRADE_NEGATIVE_EDGE") return false;
   if (controllerMode === "UNKNOWN") return false;
   if (regimeFamily === "UNKNOWN") return false;
   if (controllerMode === "VALIDATION_ONLY" || regimeFamily === "MIXED") {
@@ -773,6 +794,9 @@ function candidateEntryPrice(c: Candidate): number | null {
 function directionCompatibleWithMode(direction: "LONG" | "SHORT", controllerMode: string): boolean {
   if (controllerMode === "SHORT_ONLY") return direction === "SHORT";
   if (controllerMode === "LONG_ONLY") return direction === "LONG";
+  if (controllerMode === "NO_TRADE_CHOP" || controllerMode === "NO_TRADE_NEGATIVE_EDGE" || controllerMode === "UNKNOWN") {
+    return false; // no direction is admissible under a no-trade posture
+  }
   return true; // BOTH_ALLOWED, VALIDATION_ONLY, etc.
 }
 
@@ -1175,6 +1199,7 @@ export function buildPaperOpportunityAllocatorReport(
       // not-paper-modeled rejections below; economics gates are skipped (it's diagnostic).
       const variantDiagnosticCollection =
         variantMatrixDiagnosticEnabled && VARIANT_MATRIX_DIAGNOSTIC_IDS.includes(def.id);
+      const bullTrendCollection = def.bullishOnly === true;
       if (BENCHMARK_ONLY_LANE_IDS.includes(def.id) && !variantDiagnosticCollection) {
         recordReject(symbol, direction, def.id, "LANE_DIAGNOSTIC_ONLY", rowFresh, rowNet);
         continue;
@@ -1187,9 +1212,19 @@ export function buildPaperOpportunityAllocatorReport(
         recordReject(symbol, direction, def.id, "LANE_NOT_PAPER_MODELED", rowFresh, rowNet);
         continue;
       }
-      const stopFloorRejection = paperOpportunityStopFloorRejection(geo.stopDistanceBps);
+      const stopFloorRejection = paperOpportunityStopFloorRejection(
+        geo.stopDistanceBps,
+        def.stopFloorBps ?? WIDE_STOP_MIN_BPS,
+      );
       if (stopFloorRejection) {
         recordReject(symbol, direction, def.id, stopFloorRejection, rowFresh, rowNet);
+        continue;
+      }
+      if (
+        def.bullishOnly &&
+        !(direction === "LONG" && controllerMode === "LONG_ONLY" && regimeFamily === "BULLISH")
+      ) {
+        recordReject(symbol, direction, def.id, "BULL_TREND_REQUIRES_BULLISH_LONG_ONLY", rowFresh, rowNet);
         continue;
       }
 
@@ -1220,6 +1255,17 @@ export function buildPaperOpportunityAllocatorReport(
       if (!directionCompatibleWithMode(direction, controllerMode)) {
         recordReject(symbol, direction, def.id, "DIRECTION_INCOMPATIBLE_WITH_MODE", rowFresh, rowNet);
         continue;
+      }
+      // Lane-level honest-edge veto: reject a lane whose (regime × direction × lane)
+      // edge is proven-negative, even when the direction is allowed. This is what
+      // lets a positive SHORT lane (tight/fast-TP) trade while the losing wide-stop
+      // SHORT lane stays blocked — capturing edge the coarse direction gate missed.
+      if (inputs.laneEdgeGate) {
+        const lv = inputs.laneEdgeGate.laneVerdict(inputs.marketRegime, direction, def.id);
+        if (!lv.allowed) {
+          recordReject(symbol, direction, def.id, "EDGE_LANE_PROVEN_NEGATIVE", rowFresh, rowNet);
+          continue;
+        }
       }
       if (!row && !skipEconomics) {
         recordReject(symbol, direction, def.id, "LANE_NO_EVIDENCE", rowFresh, rowNet);
@@ -1261,6 +1307,10 @@ export function buildPaperOpportunityAllocatorReport(
         : variantDiagnosticCollection && direction === "LONG"
           ? `CG_LONG_VARIANT_MATRIX:${def.id}`
           : `CG_VARIANT_MATRIX:${def.id}`;
+      if (bullTrendCollection && laneId !== `CG_LONG_VARIANT_MATRIX:${def.id}`) {
+        recordReject(symbol, direction, def.id, "BULL_TREND_LANE_ID_MISMATCH", rowFresh, rowNet);
+        continue;
+      }
       const sourceCandidateId = `${symbol}-${direction}`;
       const dedupeKey = allocatorDedupeKey({
         scanBatchId: inputs.scanBatchId,
@@ -1308,6 +1358,37 @@ export function buildPaperOpportunityAllocatorReport(
       if (variantDiagnosticCollection && autoQuarantinedVariantLanes.has(laneId)) {
         recordReject(symbol, direction, def.id, "VARIANT_LANE_AUTO_QUARANTINED", rowFresh, rowNet);
         continue;
+      }
+
+      // Pure-bullish lane gates. Missing optional external evidence is allowed,
+      // but explicit contradiction is not. This keeps collection moving while
+      // isolating it from weak-trend and contra-flow LONG candidates.
+      if (bullTrendCollection) {
+        if (!Number.isFinite(c.trendScore) || c.trendScore < BULL_TREND_MIN_SCORE) {
+          recordReject(symbol, direction, def.id, "BULL_TREND_SCORE_BELOW_60", rowFresh, rowNet);
+          continue;
+        }
+        const kronosBias = _str(c.kronosBias);
+        if (kronosBias === "SHORT") {
+          recordReject(symbol, direction, def.id, "BULL_TREND_KRONOS_CONTRA", rowFresh, rowNet);
+          continue;
+        }
+        const whaleSignal = _str(c.whale?.signal);
+        if (whaleSignal === "BEARISH") {
+          recordReject(symbol, direction, def.id, "BULL_TREND_WHALE_CONTRA", rowFresh, rowNet);
+          continue;
+        }
+        const symbolSlotOccupied = currentPaperOrders.some(
+          (order) =>
+            order.symbol === symbol &&
+            order.direction === "LONG" &&
+            order.selectedLaneId === laneId &&
+            (order.paperStatus === "CREATED" || order.paperStatus === "PAPER_SUBMITTED"),
+        );
+        if (symbolSlotOccupied) {
+          recordReject(symbol, direction, def.id, "BULL_TREND_SYMBOL_SLOT_OCCUPIED", rowFresh, rowNet);
+          continue;
+        }
       }
 
       // ── CG_TRAIL_AFTER_TP1 challenger quality gates ───────────────────────────
@@ -1490,7 +1571,11 @@ export function buildPaperOpportunityAllocatorReport(
           provenance.candidateQualityFlags.push("TRAIL_CHALLENGER_FORWARD_OOS");
         }
         if (variantDiagnosticCollection) {
-          provenance.candidateQualityFlags.push("VARIANT_MATRIX_DIAGNOSTIC_OOS");
+          provenance.candidateQualityFlags.push(
+            bullTrendCollection
+              ? "PURE_BULLISH_TREND_OOS"
+              : "VARIANT_MATRIX_DIAGNOSTIC_OOS",
+          );
         }
         return {
           sourceCandidateId,
@@ -1694,7 +1779,7 @@ export function buildPaperOpportunityAllocatorReport(
   // Keep CG_WIDE at >= cgWideTargetShare of admitted opportunities this scan by trimming the
   // diagnostic (non-CG_WIDE) sleeves. Round-robin across lanes so the surviving diagnostics stay
   // varied. Only trims when CG_WIDE actually admitted (never starves the book of all orders).
-  if (cgWidePriority) {
+  if (cgWidePriority && regimeFamily !== "BULLISH") {
     const isWide = (o: PaperOpportunity): boolean => o.variantId === "CG_WIDE_STOP_TP_WIDE";
     const wide = report.selectedOpportunities.filter(isWide);
     const others = report.selectedOpportunities.filter((o) => !isWide(o));

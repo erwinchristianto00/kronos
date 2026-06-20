@@ -66,6 +66,53 @@ export async function registerLiveRoutes(
     return { ok: true, armed: engine.isArmed(), status: engine.getStatus() };
   });
 
+  app.get("/api/live/balance", async (_request, reply) => {
+    if (!engine) {
+      reply.code(503);
+      return { ok: false, reason: "live execution disabled" };
+    }
+    try {
+      const balance = await engine.getUsdtBalance();
+      if (!balance) return { ok: true, walletBalance: null, availableBalance: null };
+      return { ok: true, ...balance };
+    } catch (err) {
+      reply.code(502);
+      return { ok: false, reason: err instanceof Error ? err.message : "balance fetch failed" };
+    }
+  });
+
+  app.get("/api/live/account", async (_request, reply) => {
+    if (!engine) {
+      reply.code(503);
+      return { ok: false, reason: "live execution disabled" };
+    }
+    try {
+      return { ok: true, ...(await engine.getAccountSnapshot()) };
+    } catch (err) {
+      reply.code(502);
+      return { ok: false, reason: err instanceof Error ? err.message : "account snapshot failed" };
+    }
+  });
+
+  app.post("/api/live/sync-testnet", async (request, reply) => {
+    if (!engine) {
+      reply.code(503);
+      return { ok: false, reason: "live execution disabled" };
+    }
+    const body = (request.body ?? {}) as { confirm?: string };
+    const status = engine.getStatus();
+    if (status.env !== "testnet") {
+      reply.code(409);
+      return { ok: false, reason: "manual mirror sync is testnet-only" };
+    }
+    if (body.confirm !== "SYNC_TESTNET") {
+      reply.code(400);
+      return { ok: false, reason: 'sync requires body {"confirm":"SYNC_TESTNET"}' };
+    }
+    await engine.tick();
+    return { ok: true, status: engine.getStatus(), account: await engine.getAccountSnapshot() };
+  });
+
   app.post("/api/live/reset-kill", async (request, reply) => {
     if (!engine) {
       reply.code(503);

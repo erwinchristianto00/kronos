@@ -45,14 +45,21 @@ type Direction = "LONG" | "SHORT";
 export type VariantMatrixVariantId =
   | "CG_BASELINE_CURRENT"
   | "CG_WIDE_STOP_TP_WIDE"
+  | "CG_WIDE_LONG_RUNNER"
+  | "CG_WIDE_FAST_SHORT"
   | "CG_TRAIL_AFTER_TP1"
   | "CG_SCALEOUT_TP1_TRAIL"
   | "CG_NO_FIB500_ENTRYSET"
   | "CG_MAKER_LIMIT_SIM"
+  | "BL_TREND_R15_STOP200_FULL"
+  | "BL_TREND_SCALEOUT_STOP200"
   // Long-only reward-geometry research lanes (GPT deep-research candidates): wide stop floor
   // + 1.2R TP, attacking the "too little realised reward vs cost" long failure mode.
   | "LG_R12_STOP250_FULL"
   | "LG_R12_STOP300_FULL";
+
+export const BULL_TREND_VARIANT_ID = "BL_TREND_R15_STOP200_FULL" as const;
+export const BULL_SCALEOUT_VARIANT_ID = "BL_TREND_SCALEOUT_STOP200" as const;
 
 export type VariantExitRule = "tp1_full" | "trail_after_tp1" | "scaleout_tp1_trail";
 export type VariantFillMode = "taker" | "maker_limit";
@@ -99,7 +106,14 @@ const STALE_OPEN_WARN_MS = 72 * 60 * 60 * 1000; // 72 h
 const MFE_MAE_CAP_R = 20;
 
 // --- Anti-overfit gate thresholds (Part 5) ---
-export const WATCHABLE_MIN_FRESH = 50;
+// WATCHABLE = COLLECTING→WATCHABLE gate: how many honest closes a lane needs
+// before it leaves SHADOW_ONLY and can trade HEADLINE/live. Env-tunable
+// (WATCHABLE_MIN_FRESH) so collection speed can be dialed without a rebuild —
+// lower = faster to real trades but thinner evidence. Was 50, then 20; default 20
+// here, the running system/VPS sets it lower in .env for the fresh-start collection
+// sprint. STABLE/PROMOTION stay high so FULL promotion still needs depth, and the
+// edge gate keeps its own EDGE_MIN_SAMPLES=30 before it will veto/allow a slice.
+export const WATCHABLE_MIN_FRESH = Number(process.env.WATCHABLE_MIN_FRESH) || 20;
 export const STABLE_MIN_FRESH = 100;
 export const PROMOTION_MIN_FRESH = 200;
 export const NET_STRONG_R = 0.05;
@@ -128,6 +142,17 @@ export interface VariantMatrixVariantDefinition {
   tpRewardMultiple?: number;
   /** Variant only admits/derives on LONG signals (rejected on SHORT). */
   longOnly?: boolean;
+  /** Variant only admits/derives on SHORT signals (rejected on LONG). */
+  shortOnly?: boolean;
+  /** Variant is only collected while the controller is explicitly BULLISH + LONG_ONLY. */
+  bullishOnly?: boolean;
+  /**
+   * Per-variant max-hold (hours) before the resolver marks the position to market.
+   * Omitted ⇒ the global PAPER_MAX_HOLD_MS (72h). Let-it-run lanes (wide stop +
+   * far TP) extend this so a slow winner is given room to trend instead of being
+   * cut at 72h.
+   */
+  maxHoldHours?: number;
 }
 
 export const VARIANT_MATRIX_DEFINITIONS: readonly VariantMatrixVariantDefinition[] = [
@@ -180,6 +205,36 @@ export const VARIANT_MATRIX_DEFINITIONS: readonly VariantMatrixVariantDefinition
     description: "Post-only limit at entry: fills only on a pullback to entry within the fill window, else NO_FILL; maker cost.",
   },
   {
+    id: BULL_TREND_VARIANT_ID,
+    label: "Bull trend: stop >=200bps, TP 1.5R (full exit)",
+    exitRule: "tp1_full",
+    fillMode: "taker",
+    costModel: "taker",
+    stopFloorBps: 200,
+    tpRewardMultiple: 1.5,
+    longOnly: true,
+    bullishOnly: true,
+    description:
+      "Pure bullish trend lane: 200bps minimum breathing room with a 1.5R full-exit target. " +
+      "At the floor, the 300bps target stays below the observed ~450bps long-move cliff while " +
+      "improving payoff asymmetry and keeping 22bps round-trip cost near 0.11R.",
+  },
+  {
+    id: BULL_SCALEOUT_VARIANT_ID,
+    label: "Bull trend: stop >=200bps, scaleout 50% at 1R + BE runner",
+    exitRule: "scaleout_tp1_trail",
+    fillMode: "taker",
+    costModel: "taker",
+    stopFloorBps: 200,
+    tpRewardMultiple: 1.0,
+    longOnly: true,
+    bullishOnly: true,
+    description:
+      "A/B sibling of the bull trend lane under identical entry gates: lock 50% at 1R and trail " +
+      "the runner at breakeven — the exit family that is proven on the SHORT book. Tests whether " +
+      "the long failure mode (losers run to stop, winners exit small) is an exit problem.",
+  },
+  {
     id: "LG_R12_STOP250_FULL",
     label: "Long: stop ≥250bps, TP 1.2R (full exit)",
     exitRule: "tp1_full",
@@ -200,6 +255,51 @@ export const VARIANT_MATRIX_DEFINITIONS: readonly VariantMatrixVariantDefinition
     tpRewardMultiple: 1.2,
     longOnly: true,
     description: "Reward-geometry research (GPT #2): same 300bps breathing room as the proven CG_WIDE long lane, but bank 1.2R instead of 1.0R. Pure 'monetise more of the move' test.",
+  },
+  {
+    // Placed last among the long lanes deliberately: on a no-evidence score tie
+    // it must NOT preempt the established BL_TREND collection default (stable
+    // sort preserves input order). Once it earns better paper economics the
+    // ranker selects it on score — competing on evidence, not list position.
+    id: "CG_WIDE_LONG_RUNNER",
+    label: "LONG let-it-run: wide >=300bps stop, far 3R TP, ~6-day hold",
+    exitRule: "tp1_full",
+    fillMode: "taker",
+    costModel: "taker",
+    stopFloorBps: 300, // same breathing room as CG_WIDE; also routes through the wide-geometry path
+    tpRewardMultiple: 3,
+    maxHoldHours: 144,
+    longOnly: true,
+    description:
+      "The honest improvement of the wide-stop thesis. CG_WIDE's old 1R payoff loses (1:1 needs " +
+      ">50% WR, the book gets ~35%): it banks small at 1R while eating full stops. The exit search " +
+      "(scripts/cgwide-exit-search.ts) re-resolved every historical CG_WIDE order under let-it-run " +
+      "geometry and found LONG edge climbs monotonically with TP distance and hold (1R −0.03 → 3R " +
+      "−6d +0.107R) — longs trend and get marked-to-market above water — while SHORT stays negative " +
+      "under every geometry. So this lane keeps the wide stop but places a FAR 3R target and holds " +
+      "~6 days, LONG-only. Direction is enforced here (longOnly) and by the regime edge gate.",
+  },
+  {
+    // The SHORT mirror of the long-runner improvement — but the OPPOSITE geometry.
+    // The short exit search (scripts/cgwide-short-search.ts) showed shorts get
+    // catastrophically worse with a far TP (runner 2-3R ≈ −0.47R) because this
+    // market mean-reverts UP against shorts; the WINNER is taking profit FAST
+    // (wide stop, TP at 0.5R ≈ +0.055R, ~71% WR — grab the quick move before the
+    // bounce). So this lane keeps the wide >=300bps stop but banks at 0.5R,
+    // SHORT-only. Placed last so it never preempts a default lane on a score tie.
+    id: "CG_WIDE_FAST_SHORT",
+    label: "SHORT fast-TP: wide >=300bps stop, near 0.5R TP",
+    exitRule: "tp1_full",
+    fillMode: "taker",
+    costModel: "taker",
+    stopFloorBps: 300,
+    tpRewardMultiple: 0.5,
+    shortOnly: true,
+    description:
+      "Fast-take-profit SHORT: wide >=300bps stop with a near 0.5R target. Shorts in this universe " +
+      "mean-revert up, so a far TP (runner) loses badly (−0.47R) while banking quickly at 0.5R is " +
+      "honestly positive (+0.055R, ~71% WR). SHORT-only; the wide-stop 1R short stays vetoed by the " +
+      "lane edge gate.",
   },
 ];
 
@@ -527,6 +627,10 @@ export function deriveVariantGeometry(
 
   // Long-only research lanes never derive on SHORT signals.
   if (def.longOnly && dir !== "LONG") {
+    return { kind: "rejected" };
+  }
+  // Short-only lanes never derive on LONG signals.
+  if (def.shortOnly && dir !== "SHORT") {
     return { kind: "rejected" };
   }
 

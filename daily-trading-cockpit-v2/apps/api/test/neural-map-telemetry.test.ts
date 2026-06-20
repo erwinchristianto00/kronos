@@ -395,7 +395,7 @@ describe("neural map telemetry", () => {
     expect(result.lanes.find((lane) => lane.id === "CG_LONG_VARIANT_MATRIX:CG_WIDE_STOP_TP_WIDE")?.active).toBe(true);
   });
 
-  it("downgrades negative diagnostic PnL alerts when the lane evidence remains watchable", () => {
+  it("classifies a diagnostic-only loss as DIAGNOSTIC (neutral) — no critical/warning alert", () => {
     const input = baseInput();
     input.orders = [{
       id: "trail-loss",
@@ -432,7 +432,11 @@ describe("neural map telemetry", () => {
       pf: 2.3,
     });
     const result = buildNeuralMapTelemetry(input);
-    expect(result.alerts.some((alert) => alert.source === "CG_TRAIL SHORT" && alert.severity === "CRITICAL")).toBe(false);
-    expect(result.alerts.some((alert) => alert.source === "CG_TRAIL SHORT" && alert.severity === "WARNING")).toBe(true);
+    // A diagnostic-only loss is NEUTRAL: the lane is classified DIAGNOSTIC (own color in the
+    // map) and raises NO alert — it is reject-sampler measurement, not a real failure/warning.
+    expect(result.alerts.some((alert) => alert.source === "CG_TRAIL SHORT")).toBe(false);
+    const trailLane = result.lanes.find((lane) => lane.label === "CG_TRAIL SHORT");
+    expect(trailLane?.health).toBe("DIAGNOSTIC");
+    expect(trailLane?.pnlIsDiagnosticOnly).toBe(true);
   });
 });

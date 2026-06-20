@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import './neural-mindmap.css';
 
-type NeuralHealth = 'HEALTHY' | 'ACTIVE' | 'WARNING' | 'CRITICAL' | 'IDLE' | 'COLLECTING' | 'QUARANTINE';
+type NeuralHealth = 'HEALTHY' | 'ACTIVE' | 'WARNING' | 'CRITICAL' | 'IDLE' | 'COLLECTING' | 'QUARANTINE' | 'DIAGNOSTIC';
 type NeuralDiagnosisCategory =
   | 'HEALTHY_FLOW'
   | 'COLLECTING_EVIDENCE'
@@ -99,15 +99,12 @@ interface NeuralTelemetry {
     guardrailStatus: string;
     recommendedAction: string;
     waitForCapacity: number;
+    oosCount: number;
+    oosThreshold: number;
   };
   nodes: NeuralNode[];
   lanes: NeuralLane[];
   alerts: Array<{ severity: 'WARNING' | 'CRITICAL'; source: string; message: string }>;
-}
-
-interface NeuralMindmapProps {
-  onOpenScanner: () => void;
-  onOpenPerformance: () => void;
 }
 
 interface Point {
@@ -157,10 +154,11 @@ const HEALTH_LABELS: Record<NeuralHealth, string> = {
   HEALTHY: 'Healthy',
   ACTIVE: 'Active flow',
   WARNING: 'Degraded',
-  CRITICAL: 'Blocked / failing',
+  CRITICAL: 'Failing (real loss)',
   IDLE: 'Idle',
   COLLECTING: 'Collecting evidence',
-  QUARANTINE: 'Quarantined (benched)',
+  QUARANTINE: 'Blocked / benched (intentional)',
+  DIAGNOSTIC: 'Diagnostic probe (not real trades)',
 };
 
 const PROCESS_GUIDES: Record<string, ProcessGuide> = {
@@ -274,7 +272,15 @@ function laneDiagnosis(lane: NeuralLane): string {
   return 'This lane has not built realized paper performance yet.';
 }
 
-function laneMetricLabel(lane: NeuralLane): string {
+function laneMetricLabel(
+  lane: NeuralLane,
+  liveLane: LiveLaneExposure | undefined,
+  accountEquity: number | null | undefined,
+): string {
+  if (liveLane) {
+    const growth = accountEquity && accountEquity > 0 ? (liveLane.unrealizedPnl / accountEquity) * 100 : null;
+    return `${fmtPct(growth)} / ${liveLane.sourceOrderCount} live`;
+  }
   if (lane.totalPnl > 0 && lane.totalPnlPct !== null) {
     return `${fmtPct(lane.totalPnlPct)} / n=${lane.closed}`;
   }
@@ -293,10 +299,11 @@ function healthRank(health: NeuralHealth): number {
 }
 
 function healthDiagnosis(health: NeuralHealth): string {
-  if (health === 'CRITICAL') return 'A hard failure, quarantine, destructive economics, or blocking condition is active.';
+  if (health === 'CRITICAL') return 'FAILING — losing real money on HEADLINE trades (genuinely bad, needs attention).';
+  if (health === 'DIAGNOSTIC') return 'Diagnostic probes only — these are reject-sampler measurements on candidates the gate ALREADY rejected, NOT real trades. Red/loss here is expected and harmless; it is how the system measures what it correctly avoids.';
   if (health === 'WARNING') return 'The component is operating with degraded input, latency, or capacity pressure.';
   if (health === 'COLLECTING') return 'The component is functioning, but evidence is not mature enough for a stable verdict.';
-  if (health === 'QUARANTINE') return 'The lane is benched (no new admissions) but still measured via the VM simulation; it can graduate back if its evidence turns healthy.';
+  if (health === 'QUARANTINE') return 'BLOCKED / benched on purpose (no new admissions) — gated by the edge memory or safety policy, not a failure. Still measured via the VM simulation; it graduates back if its evidence turns healthy.';
   if (health === 'IDLE') return 'The component is intentionally inactive under the current regime or workflow.';
   if (health === 'ACTIVE') return 'The component is healthy and currently carrying decision flow.';
   return 'The component is healthy and no material fault is currently reported.';
@@ -315,8 +322,27 @@ const DIAGNOSIS_LABELS: Record<NeuralDiagnosisCategory, string> = {
   BLOCKING_CONDITION: 'Blocking condition',
 };
 
-export default function NeuralMindmap({ onOpenScanner, onOpenPerformance }: NeuralMindmapProps) {
+interface LiveLaneExposure {
+  laneId: string;
+  sourceOrderCount: number;
+  symbols: string[];
+  notionalUsd: number;
+  unrealizedPnl: number;
+}
+
+interface LiveAccount {
+  walletBalance: number | null;
+  availableBalance: number | null;
+  unrealizedPnl: number;
+  accountEquity: number | null;
+  openPositionCount: number;
+  openOrderCount: number;
+  lanes: LiveLaneExposure[];
+}
+
+export default function NeuralMindmap() {
   const [telemetry, setTelemetry] = useState<NeuralTelemetry | null>(null);
+  const [liveAccount, setLiveAccount] = useState<LiveAccount | null>(null);
   const [selectedId, setSelectedId] = useState('controller');
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [loading, setLoading] = useState(true);
@@ -338,13 +364,38 @@ export default function NeuralMindmap({ onOpenScanner, onOpenPerformance }: Neur
     }
   }
 
+  async function loadLiveAccount() {
+    try {
+      const response = await fetch('/api/live/account', { cache: 'no-store' });
+      if (!response.ok) return;
+      const data = await response.json() as { ok: boolean } & Partial<LiveAccount>;
+      if (data.ok) {
+        setLiveAccount({
+          walletBalance: data.walletBalance ?? null,
+          availableBalance: data.availableBalance ?? null,
+          unrealizedPnl: data.unrealizedPnl ?? 0,
+          accountEquity: data.accountEquity ?? null,
+          openPositionCount: data.openPositionCount ?? 0,
+          openOrderCount: data.openOrderCount ?? 0,
+          lanes: data.lanes ?? [],
+        });
+      }
+    } catch {
+      // non-critical — silently skip if engine is down
+    }
+  }
+
   useEffect(() => {
     void loadTelemetry();
+    void loadLiveAccount();
   }, []);
 
   useEffect(() => {
     if (!autoRefresh) return undefined;
-    const timer = window.setInterval(() => void loadTelemetry(), 5_000);
+    const timer = window.setInterval(() => {
+      void loadTelemetry();
+      void loadLiveAccount();
+    }, 5_000);
     return () => window.clearInterval(timer);
   }, [autoRefresh]);
 
@@ -363,6 +414,7 @@ export default function NeuralMindmap({ onOpenScanner, onOpenPerformance }: Neur
 
   const selectedNode = nodesById.get(selectedId) ?? null;
   const selectedLane = telemetry?.lanes.find((lane) => lane.id === selectedId) ?? null;
+  const selectedLiveLane = liveAccount?.lanes.find((lane) => lane.laneId === selectedLane?.id) ?? null;
   const selectedGuide = selectedNode ? PROCESS_GUIDES[selectedNode.id] : null;
   const newestAgeSec = lastReceivedAt === null ? Infinity : Math.round((Date.now() - lastReceivedAt) / 1000);
   const stale = newestAgeSec > (telemetry?.staleAfterSec ?? 30) || Boolean(error);
@@ -385,7 +437,17 @@ export default function NeuralMindmap({ onOpenScanner, onOpenPerformance }: Neur
   }
 
   function healthOf(id: string): NeuralHealth {
-    return nodesById.get(id)?.health ?? telemetry?.lanes.find((lane) => lane.id === id)?.health ?? 'IDLE';
+    const lane = telemetry?.lanes.find((candidate) => candidate.id === id);
+    if (lane) {
+      const liveLane = liveAccount?.lanes.find((candidate) => candidate.laneId === lane.id);
+      if (liveLane) {
+        if (liveLane.unrealizedPnl > 0) return 'ACTIVE';
+        if (liveLane.unrealizedPnl < 0) return 'CRITICAL';
+        return 'COLLECTING';
+      }
+      return lane.health;
+    }
+    return nodesById.get(id)?.health ?? 'IDLE';
   }
 
   const selectedConnections = useMemo(() => {
@@ -415,8 +477,6 @@ export default function NeuralMindmap({ onOpenScanner, onOpenPerformance }: Neur
         </div>
         <nav className="neural-nav" aria-label="Dashboard views">
           <button type="button" className="is-current">Neural Map</button>
-          <button type="button" onClick={onOpenScanner}>Scanner</button>
-          <button type="button" onClick={onOpenPerformance}>Performance</button>
         </nav>
         <div className="neural-actions">
           <label className="neural-toggle">
@@ -449,16 +509,21 @@ export default function NeuralMindmap({ onOpenScanner, onOpenPerformance }: Neur
           <small>{telemetry ? `${telemetry.paper.wins}W ${telemetry.paper.losses}L` : 'paper only'}</small>
         </div>
         <div>
-          <span>Total paper PnL</span>
-          <strong className={(telemetry?.paper.totalPnl ?? 0) >= 0 ? 'tone-healthy' : 'tone-critical'}>
-            {telemetry ? fmtMoney(telemetry.paper.totalPnl) : 'n/a'}
+          <span>Binance unrealized PnL</span>
+          <strong className={(liveAccount?.unrealizedPnl ?? 0) >= 0 ? 'tone-healthy' : 'tone-critical'}>
+            {liveAccount ? `${liveAccount.unrealizedPnl >= 0 ? '+' : ''}${liveAccount.unrealizedPnl.toFixed(2)} USDT` : 'n/a'}
           </strong>
-          <small>today {telemetry ? fmtMoney(telemetry.paper.todayPnl) : 'n/a'}</small>
+          <small>{liveAccount ? `${liveAccount.openPositionCount} positions / ${liveAccount.openOrderCount} exits` : 'testnet execution'}</small>
+        </div>
+        <div>
+          <span>Binance equity</span>
+          <strong>{liveAccount?.accountEquity != null ? `${liveAccount.accountEquity.toFixed(2)} USDT` : 'Loading'}</strong>
+          <small>{liveAccount?.availableBalance != null ? `${liveAccount.availableBalance.toFixed(2)} available` : 'testnet'}</small>
         </div>
         <div>
           <span>Safety</span>
-          <strong className="tone-healthy">Live blocked</strong>
-          <small>micro-pilot disabled</small>
+          <strong className="tone-healthy">Testnet mirror</strong>
+          <small>{liveAccount ? `${liveAccount.openPositionCount} protected positions` : 'loading account'}</small>
         </div>
       </section>
 
@@ -486,7 +551,7 @@ export default function NeuralMindmap({ onOpenScanner, onOpenPerformance }: Neur
                 <text x="292" y="60" className="neural-zone-label">INFERENCE PIPELINE</text>
                 <text x="655" y="60" className="neural-zone-label">DECISION CORE</text>
                 <text x="1008" y="60" className="neural-zone-label">LANE FIELD</text>
-                <text x="1190" y="60" className="neural-zone-label">PAPER OUTPUT</text>
+                <text x="1190" y="60" className="neural-zone-label">TESTNET OUTPUT</text>
 
                 <g className="neural-edges">
                   {neuralEdges.map(([fromId, toId], index) => {
@@ -512,6 +577,10 @@ export default function NeuralMindmap({ onOpenScanner, onOpenPerformance }: Neur
                   const point = positionOf(node.id);
                   if (!point) return null;
                   const central = node.id === 'controller';
+                  const nodeLabel = node.id === 'live-lock' && liveAccount ? 'Binance Testnet' : node.label;
+                  const nodeMetric = node.id === 'live-lock' && liveAccount
+                    ? `${liveAccount.openPositionCount} POSITIONS`
+                    : node.metric;
                   return (
                     <g
                       key={node.id}
@@ -519,7 +588,7 @@ export default function NeuralMindmap({ onOpenScanner, onOpenPerformance }: Neur
                       transform={`translate(${point.x} ${point.y})`}
                       role="button"
                       tabIndex={0}
-                      aria-label={`${node.label}: ${node.metric}`}
+                      aria-label={`${nodeLabel}: ${nodeMetric}`}
                       onClick={() => setSelectedId(node.id)}
                       onKeyDown={(event) => {
                         if (event.key === 'Enter' || event.key === ' ') setSelectedId(node.id);
@@ -528,8 +597,8 @@ export default function NeuralMindmap({ onOpenScanner, onOpenPerformance }: Neur
                       <circle className="neural-node-halo" r={central ? 62 : 48} />
                       <circle className="neural-node-core" r={central ? 48 : 38} />
                       <circle className="neural-node-pulse" r={central ? 53 : 43} />
-                      <text y={central ? -5 : -4} className="neural-node-title">{node.label}</text>
-                      <text y={central ? 16 : 15} className="neural-node-metric">{node.metric.slice(0, 22)}</text>
+                      <text y={central ? -5 : -4} className="neural-node-title">{nodeLabel}</text>
+                      <text y={central ? 16 : 15} className="neural-node-metric">{nodeMetric.slice(0, 22)}</text>
                     </g>
                   );
                 })}
@@ -537,10 +606,11 @@ export default function NeuralMindmap({ onOpenScanner, onOpenPerformance }: Neur
                 {(telemetry?.lanes ?? []).map((lane) => {
                   const point = lanePositions.get(lane.id);
                   if (!point) return null;
+                  const displayHealth = healthOf(lane.id);
                   return (
                     <g
                       key={lane.id}
-                      className={`neural-lane health-${lane.health.toLowerCase()} ${lane.active ? 'is-active' : ''} ${selectedId === lane.id ? 'is-selected' : ''}`}
+                      className={`neural-lane health-${displayHealth.toLowerCase()} ${lane.active ? 'is-active' : ''} ${selectedId === lane.id ? 'is-selected' : ''}`}
                       transform={`translate(${point.x} ${point.y})`}
                       role="button"
                       tabIndex={0}
@@ -553,7 +623,13 @@ export default function NeuralMindmap({ onOpenScanner, onOpenPerformance }: Neur
                       <rect x="-80" y="-29" width="160" height="58" rx="5" className="neural-lane-body" />
                       <circle cx="-62" cy="0" r="5" className="neural-lane-led" />
                       <text x="-48" y="-5" className="neural-lane-title">{compactLaneLabel(lane.label)}</text>
-                      <text x="-48" y="14" className="neural-lane-metric">{laneMetricLabel(lane)}</text>
+                      <text x="-48" y="14" className="neural-lane-metric">
+                        {laneMetricLabel(
+                          lane,
+                          liveAccount?.lanes.find((liveLane) => liveLane.laneId === lane.id),
+                          liveAccount?.accountEquity,
+                        )}
+                      </text>
                     </g>
                   );
                 })}
@@ -634,8 +710,8 @@ export default function NeuralMindmap({ onOpenScanner, onOpenPerformance }: Neur
             <>
               <div className={`neural-diagnosis health-${selectedLane.health.toLowerCase()}`}>
                 <span>Lane diagnosis</span>
-                <strong>{laneDiagnosis(selectedLane)}</strong>
-                <p>Lane color now follows realized paper PnL. Evidence status stays visible as separate context.</p>
+                <strong>{selectedLiveLane ? 'Lane color follows Binance unrealized PnL.' : laneDiagnosis(selectedLane)}</strong>
+                <p>Paper evidence remains separate; execution equity, exposure, and current PnL come from Binance testnet.</p>
               </div>
               <div className="neural-inspector-section">
                 <dl>
@@ -644,11 +720,11 @@ export default function NeuralMindmap({ onOpenScanner, onOpenPerformance }: Neur
                   <div><dt>Open / closed</dt><dd>{selectedLane.open} / {selectedLane.closed}</dd></div>
                   <div><dt>Net Avg R</dt><dd className={(selectedLane.netAvgR ?? 0) >= 0 ? 'tone-healthy' : 'tone-critical'}>{fmtR(selectedLane.netAvgR)}</dd></div>
                   <div><dt>PF / WR</dt><dd>{fmtNumber(selectedLane.pf)} / {selectedLane.wr === null ? 'n/a' : `${(selectedLane.wr * 100).toFixed(1)}%`}</dd></div>
-                  <div><dt>Headline PnL</dt><dd>{fmtMoney(selectedLane.headlinePnl)}</dd></div>
-                  <div><dt>Diagnostic PnL</dt><dd>{fmtMoney(selectedLane.diagnosticPnl)}</dd></div>
-                  <div><dt>Total paper PnL</dt><dd className={selectedLane.totalPnl >= 0 ? 'tone-healthy' : 'tone-critical'}>{fmtMoney(selectedLane.totalPnl)}</dd></div>
-                  <div><dt>Growth from start</dt><dd className={selectedLane.totalPnl >= 0 ? 'tone-healthy' : 'tone-critical'}>{fmtPct(selectedLane.totalPnlPct)}</dd></div>
-                  <div><dt>Starting equity</dt><dd>{fmtMoney(selectedLane.startingEquity)}</dd></div>
+                  <div><dt>Paper evidence PnL</dt><dd>{fmtMoney(selectedLane.totalPnl)}</dd></div>
+                  <div><dt>Binance mirrored</dt><dd>{selectedLiveLane ? `${selectedLiveLane.sourceOrderCount} orders / ${selectedLiveLane.symbols.length} symbols` : 'not open'}</dd></div>
+                  <div><dt>Binance notional</dt><dd>{selectedLiveLane ? `${selectedLiveLane.notionalUsd.toFixed(2)} USDT` : '0.00 USDT'}</dd></div>
+                  <div><dt>Binance unrealized</dt><dd className={(selectedLiveLane?.unrealizedPnl ?? 0) >= 0 ? 'tone-healthy' : 'tone-critical'}>{selectedLiveLane ? `${selectedLiveLane.unrealizedPnl >= 0 ? '+' : ''}${selectedLiveLane.unrealizedPnl.toFixed(2)} USDT` : '0.00 USDT'}</dd></div>
+                  <div><dt>Account equity</dt><dd>{liveAccount?.accountEquity != null ? `${liveAccount.accountEquity.toFixed(2)} USDT` : 'n/a'}</dd></div>
                 </dl>
               </div>
               <div className="neural-inspector-section">
@@ -673,6 +749,38 @@ export default function NeuralMindmap({ onOpenScanner, onOpenPerformance }: Neur
               <dl>
                 <div><dt>Receives from</dt><dd>{selectedConnections.inputs.join(', ') || 'External state'}</dd></div>
                 <div><dt>Sends to</dt><dd>{selectedConnections.outputs.join(', ') || 'Operator telemetry'}</dd></div>
+              </dl>
+            </div>
+          )}
+
+          {telemetry && telemetry.mixed.oosThreshold > 0 && (
+            <div className="neural-inspector-section">
+              <h2>OOS evidence progress</h2>
+              <dl>
+                <div>
+                  <dt>Collected</dt>
+                  <dd>{telemetry.mixed.oosCount} / {telemetry.mixed.oosThreshold} trades</dd>
+                </div>
+                <div>
+                  <dt>Progress</dt>
+                  <dd>
+                    <div className="neural-oos-bar">
+                      <div
+                        className={`neural-oos-fill ${telemetry.mixed.oosCount >= telemetry.mixed.oosThreshold ? 'is-complete' : ''}`}
+                        style={{ width: `${Math.min(100, (telemetry.mixed.oosCount / telemetry.mixed.oosThreshold) * 100).toFixed(1)}%` }}
+                      />
+                    </div>
+                    <span className="neural-oos-pct">
+                      {telemetry.mixed.oosCount >= telemetry.mixed.oosThreshold
+                        ? 'Ready'
+                        : `${Math.floor((telemetry.mixed.oosCount / telemetry.mixed.oosThreshold) * 100)}%`}
+                    </span>
+                  </dd>
+                </div>
+                <div>
+                  <dt>Status</dt>
+                  <dd>{telemetry.mixed.guardrailStatus}</dd>
+                </div>
               </dl>
             </div>
           )}
@@ -719,21 +827,28 @@ export default function NeuralMindmap({ onOpenScanner, onOpenPerformance }: Neur
           <header><span>Lane performance field</span><strong>{telemetry?.lanes.length ?? 0} lanes</strong></header>
           <div className="neural-lane-table-wrap">
             <table>
-              <thead><tr><th>Lane</th><th>Evidence</th><th>Paper PnL</th><th>Growth</th><th>Open</th><th>n</th><th>Net Avg R</th><th>PF</th><th>WR</th></tr></thead>
+              <thead><tr><th>Lane</th><th>Evidence</th><th>Binance PnL</th><th>Growth</th><th>Mirrored</th><th>n</th><th>Net Avg R</th><th>PF</th><th>WR</th></tr></thead>
               <tbody>
-                {telemetry?.lanes.map((lane) => (
-                  <tr key={lane.id} className={lane.active ? 'is-active' : ''} onClick={() => setSelectedId(lane.id)}>
-                    <td><i className={`health-${lane.health.toLowerCase()}`} />{compactLaneLabel(lane.label)}</td>
-                    <td>{lane.status}</td>
-                    <td className={lane.totalPnl >= 0 ? 'tone-healthy' : 'tone-critical'}>{fmtMoney(lane.totalPnl)}</td>
-                    <td className={lane.totalPnl >= 0 ? 'tone-healthy' : 'tone-critical'}>{fmtPct(lane.totalPnlPct)}</td>
-                    <td>{lane.open}</td>
-                    <td>{lane.closed}</td>
-                    <td>{fmtR(lane.netAvgR)}</td>
-                    <td>{fmtNumber(lane.pf)}</td>
-                    <td>{lane.wr === null ? 'n/a' : `${(lane.wr * 100).toFixed(1)}%`}</td>
-                  </tr>
-                ))}
+                {telemetry?.lanes.map((lane) => {
+                  const liveLane = liveAccount?.lanes.find((item) => item.laneId === lane.id);
+                  const livePnl = liveLane?.unrealizedPnl ?? 0;
+                  const liveGrowth = liveAccount?.accountEquity && liveAccount.accountEquity > 0
+                    ? (livePnl / liveAccount.accountEquity) * 100
+                    : null;
+                  return (
+                    <tr key={lane.id} className={lane.active ? 'is-active' : ''} onClick={() => setSelectedId(lane.id)}>
+                      <td><i className={`health-${healthOf(lane.id).toLowerCase()}`} />{compactLaneLabel(lane.label)}</td>
+                      <td>{lane.status}</td>
+                      <td className={livePnl >= 0 ? 'tone-healthy' : 'tone-critical'}>{`${livePnl >= 0 ? '+' : ''}${livePnl.toFixed(2)} USDT`}</td>
+                      <td className={livePnl >= 0 ? 'tone-healthy' : 'tone-critical'}>{fmtPct(liveGrowth)}</td>
+                      <td>{liveLane?.sourceOrderCount ?? 0}</td>
+                      <td>{lane.closed}</td>
+                      <td>{fmtR(lane.netAvgR)}</td>
+                      <td>{fmtNumber(lane.pf)}</td>
+                      <td>{lane.wr === null ? 'n/a' : `${(lane.wr * 100).toFixed(1)}%`}</td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>

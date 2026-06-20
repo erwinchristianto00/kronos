@@ -40,9 +40,11 @@ export function resolveLiveBinanceBaseUrl(env: LiveBinanceEnv): string {
 
 const REQUEST_TIMEOUT_MS = 6_000;
 const RECV_WINDOW_MS = 5_000;
-const MAX_CLOCK_SKEW_MS = 1_000;
+// Guard stays below RECV_WINDOW_MS so offset-compensated timestamps still land inside Binance's window.
+const MAX_CLOCK_SKEW_MS = 4_000;
 const GET_MAX_RETRIES = 2;
-const TIME_SYNC_TTL_MS = 5 * 60 * 1000; // re-sync server time every 5 min
+// Sync every 60 s so the offset stays fresh even on hosts with fast clock drift.
+const TIME_SYNC_TTL_MS = 60_000;
 
 // ─── errors ──────────────────────────────────────────────────────────────────
 
@@ -123,6 +125,18 @@ export interface FuturesOrder {
   updateTime: number;
 }
 
+export interface FuturesAlgoOrder {
+  symbol: string;
+  algoId: number;
+  clientAlgoId: string;
+  algoStatus: string;
+  orderType: string;
+  side: "BUY" | "SELL";
+  quantity: number;
+  triggerPrice: number;
+  actualOrderId: number | null;
+}
+
 export interface FuturesUserTrade {
   symbol: string;
   orderId: number;
@@ -145,6 +159,17 @@ export interface PlaceOrderParams {
   timeInForce?: "GTC" | "IOC" | "FOK";
   /** Engine-supplied idempotency key (derived from the paper order id). */
   newClientOrderId?: string;
+  workingType?: "CONTRACT_PRICE" | "MARK_PRICE";
+}
+
+export interface PlaceAlgoOrderParams {
+  symbol: string;
+  side: "BUY" | "SELL";
+  type: "STOP_MARKET" | "TAKE_PROFIT_MARKET";
+  quantity: number;
+  triggerPrice: number;
+  reduceOnly?: boolean;
+  clientAlgoId?: string;
   workingType?: "CONTRACT_PRICE" | "MARK_PRICE";
 }
 
@@ -285,7 +310,7 @@ export class BinanceFuturesPrivateClient {
     const qs = buildQueryString({
       ...params,
       recvWindow: RECV_WINDOW_MS,
-      timestamp: this.nowMs() + this.serverTimeOffsetMs,
+      timestamp: Math.round(this.nowMs() + this.serverTimeOffsetMs),
     });
     const url = `${this.baseUrl}${path}?${qs}&signature=${signQueryString(qs, this.apiSecret)}`;
 
@@ -418,6 +443,16 @@ export class BinanceFuturesPrivateClient {
     return Array.isArray(parsed) ? parsed.map((o) => this.mapOrder(o)) : [];
   }
 
+  async getOpenAlgoOrders(symbol?: string): Promise<FuturesAlgoOrder[]> {
+    const parsed = await this.requestSigned("GET", "/fapi/v1/openAlgoOrders", symbol ? { symbol } : {});
+    return Array.isArray(parsed) ? parsed.map((order) => this.mapAlgoOrder(order)) : [];
+  }
+
+  async queryAlgoOrder(algoId: number): Promise<FuturesAlgoOrder> {
+    const parsed = await this.requestSigned("GET", "/fapi/v1/algoOrder", { algoId });
+    return this.mapAlgoOrder(parsed);
+  }
+
   async queryOrder(symbol: string, orderId: number): Promise<FuturesOrder> {
     const parsed = await this.requestSigned("GET", "/fapi/v1/order", { symbol, orderId });
     return this.mapOrder(parsed);
@@ -440,12 +475,35 @@ export class BinanceFuturesPrivateClient {
     return this.mapOrder(parsed);
   }
 
+  async placeAlgoOrder(params: PlaceAlgoOrderParams): Promise<FuturesAlgoOrder> {
+    const parsed = await this.requestSigned("POST", "/fapi/v1/algoOrder", {
+      algoType: "CONDITIONAL",
+      symbol: params.symbol,
+      side: params.side,
+      type: params.type,
+      quantity: params.quantity,
+      triggerPrice: params.triggerPrice,
+      reduceOnly: params.reduceOnly,
+      clientAlgoId: params.clientAlgoId,
+      workingType: params.workingType,
+    });
+    return this.mapAlgoOrder(parsed);
+  }
+
   async cancelOrder(symbol: string, orderId: number): Promise<void> {
     await this.requestSigned("DELETE", "/fapi/v1/order", { symbol, orderId });
   }
 
+  async cancelAlgoOrder(algoId: number): Promise<void> {
+    await this.requestSigned("DELETE", "/fapi/v1/algoOrder", { algoId });
+  }
+
   async cancelAllOrders(symbol: string): Promise<void> {
     await this.requestSigned("DELETE", "/fapi/v1/allOpenOrders", { symbol });
+  }
+
+  async cancelAllAlgoOrders(symbol: string): Promise<void> {
+    await this.requestSigned("DELETE", "/fapi/v1/algoOpenOrders", { symbol });
   }
 
   async getUserTrades(symbol: string, opts: { startTime?: number; limit?: number } = {}): Promise<FuturesUserTrade[]> {
@@ -483,6 +541,22 @@ export class BinanceFuturesPrivateClient {
       executedQty: toNum(o.executedQty),
       avgPrice: toNum(o.avgPrice),
       updateTime: toNum(o.updateTime),
+    };
+  }
+
+  private mapAlgoOrder(raw: unknown): FuturesAlgoOrder {
+    const order = raw as Record<string, unknown>;
+    const actualOrderId = toNum(order.actualOrderId);
+    return {
+      symbol: String(order.symbol ?? ""),
+      algoId: toNum(order.algoId),
+      clientAlgoId: String(order.clientAlgoId ?? ""),
+      algoStatus: String(order.algoStatus ?? order.status ?? ""),
+      orderType: String(order.orderType ?? order.type ?? ""),
+      side: order.side === "SELL" ? "SELL" : "BUY",
+      quantity: toNum(order.quantity),
+      triggerPrice: toNum(order.triggerPrice),
+      actualOrderId: actualOrderId > 0 ? actualOrderId : null,
     };
   }
 }

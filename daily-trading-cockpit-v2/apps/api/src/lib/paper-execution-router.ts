@@ -93,6 +93,13 @@ export type RotationAction =
 
 export const PAPER_ADMISSION_MAX_AGE_MS = 10 * 60 * 1000; // 10 min
 export const PAPER_ORDER_EXPIRY_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+// Max-hold time-stop. A position that has hit neither TP nor SL within the 72h
+// signal horizon has lost its thesis: it is force-closed at the last observed
+// close (mark-to-market) and BOOKED as win/loss. Without this, wide-stop losers
+// drift unresolved (PAPER_SUBMITTED) past 72h and never reach the ledger — the
+// "phantom equity" bug where the book shows only realized winners. 72h matches
+// FASTTP_HORIZON_HOURS / SIGNAL_DECAY_HORIZON_HOURS / the STALE-open warn bucket.
+export const PAPER_MAX_HOLD_MS = 72 * 60 * 60 * 1000; // 72 h
 export const DEFAULT_PAPER_EQUITY = 2000;
 const RISK_PCT = 1; // 1% of equity per trade — never changed
 const DEFAULT_PAPER_MAX_NOTIONAL_CAP = 50_000;
@@ -1268,6 +1275,25 @@ function _rewardR(direction: "LONG" | "SHORT", entry: number, tp: number, risk: 
  * guarantees the scaleout headline resolves as scaleout_tp1_trail even for orders admitted before the
  * exit rule was persisted.
  */
+/**
+ * Per-order max-hold before the resolver marks to market. Lanes can extend the
+ * default (e.g. CG_WIDE's let-it-run geometry holds ~6 days so a slow winner
+ * gets room to trend) via `maxHoldHours` on their variant definition. Always
+ * kept below PAPER_ORDER_EXPIRY_MS so the max-hold MTM books P&L before the
+ * fetch-failure expiry backstop can fire.
+ */
+function maxHoldMsForOrder(order: PaperOrder): number {
+  const laneId = order.selectedLaneId;
+  if (typeof laneId === "string" && laneId.includes(":")) {
+    const suffix = laneId.slice(laneId.indexOf(":") + 1);
+    const def = VARIANT_MATRIX_DEFINITIONS.find((d) => d.id === suffix);
+    if (def?.maxHoldHours != null && def.maxHoldHours > 0) {
+      return Math.min(def.maxHoldHours * 60 * 60 * 1000, PAPER_ORDER_EXPIRY_MS - CANDLE_MS);
+    }
+  }
+  return PAPER_MAX_HOLD_MS;
+}
+
 function effectiveExitRuleForOrder(order: PaperOrder): VariantExitRule {
   if (order.variantExitRule) return order.variantExitRule;
   const laneId = order.selectedLaneId;
@@ -1471,7 +1497,29 @@ export async function resolvePaperOrders(
           resolved += 1;
           continue;
         }
-        // UNRESOLVED — revisit on the next pass.
+        // UNRESOLVED. Apply the per-lane max-hold time-stop as the inline path:
+        // mark-to-market at the last candle close and BOOK it, so a filled but
+        // never-resolved order cannot drift past the horizon uncounted.
+        if (nowMs - openedAtMs >= maxHoldMsForOrder(order)) {
+          const lastCandle = candles[candles.length - 1];
+          const lastClose = lastCandle ? Number(lastCandle[4]) : E;
+          const exitFill = _exitFill(dir, Number.isFinite(lastClose) ? lastClose : E, executionModel.stopSlippageBps);
+          const grossR = _rewardR(dir, Ef, exitFill, risk);
+          const costR = _computePaperCostR(order.plannedStopDistanceBps);
+          const netR = grossR + costR;
+          store.update(order.paperOrderId, {
+            paperStatus: netR > 0 ? "PAPER_CLOSED_WIN" : "PAPER_CLOSED_LOSS",
+            grossR,
+            costR,
+            netR,
+            netPnlAmount: netR * order.plannedRiskAmount,
+            closeReason: "MAX_HOLD_MTM",
+            updatedAt: new Date().toISOString(),
+          });
+          resolved += 1;
+          continue;
+        }
+        // Still within horizon — revisit on the next pass.
         store.update(order.paperOrderId, { paperStatus: "PAPER_SUBMITTED", updatedAt: new Date().toISOString() });
         continue;
       }
@@ -1670,6 +1718,30 @@ export async function resolvePaperOrders(
           netR,
           netPnlAmount: netR * order.plannedRiskAmount,
           closeReason: "TRAIL_PATH_END",
+          updatedAt: new Date().toISOString(),
+        });
+        resolved += 1;
+        found = true;
+      }
+
+      // Max-hold time-stop: neither TP nor SL hit within the lane's hold horizon
+      // → force-exit at the last observed close (mark-to-market) and BOOK the
+      // result, so wide-stop losers cannot drift unresolved and silently inflate
+      // equity (phantom-equity bug). Symmetric: a position marked above water
+      // books a win, below water a loss. Let-it-run lanes (CG_WIDE) extend the
+      // horizon so a slow trending winner is given room instead of cut at 72h.
+      if (!found && nowMs - openedAtMs >= maxHoldMsForOrder(order)) {
+        const exitFill = _exitFill(dir, lastPathClose, executionModel.stopSlippageBps);
+        const grossR = _rewardR(dir, Ef, exitFill, risk);
+        const costR = _computePaperCostR(order.plannedStopDistanceBps);
+        const netR = grossR + costR;
+        store.update(order.paperOrderId, {
+          paperStatus: netR > 0 ? "PAPER_CLOSED_WIN" : "PAPER_CLOSED_LOSS",
+          grossR,
+          costR,
+          netR,
+          netPnlAmount: netR * order.plannedRiskAmount,
+          closeReason: "MAX_HOLD_MTM",
           updatedAt: new Date().toISOString(),
         });
         resolved += 1;

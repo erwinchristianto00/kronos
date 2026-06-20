@@ -27,6 +27,7 @@ export type RegimeDirectionMode =
   | "SHORT_ONLY"
   | "BOTH_ALLOWED"
   | "NO_TRADE_CHOP"
+  | "NO_TRADE_NEGATIVE_EDGE"
   | "WAIT_RETEST_AFTER_DUMP"
   | "WAIT_RETEST_AFTER_PUMP"
   | "VALIDATION_ONLY"
@@ -45,10 +46,37 @@ export interface RegimeDirectionControllerInputPrimaryLane {
   microPilotReady?: boolean;
 }
 
+/**
+ * Honest-edge gate dependency. Any object that can return a per-(regime ×
+ * direction) verdict satisfies this — RegimeEdgeMemoryStore does structurally.
+ * Kept as a narrow interface so the controller stays pure and testable and does
+ * not import the persistent store.
+ */
+export interface DirectionEdgeGate {
+  verdict(
+    regimeRaw: string | null | undefined,
+    direction: "LONG" | "SHORT",
+  ): { allowed: boolean; reasonCode: string; stat: { n: number; avgNetR: number; winRate: number } };
+  /**
+   * Optional: true when some LANE in this regime×direction is proven-positive,
+   * even if the direction aggregate is negative. When it returns true the
+   * direction is NOT vetoed (a tradeable lane exists) — the allocator's
+   * lane-level veto then admits only that positive lane.
+   */
+  hasPositiveLane?(regimeRaw: string | null | undefined, direction: "LONG" | "SHORT"): boolean;
+}
+
 export interface RegimeDirectionControllerInput {
   currentRegime?: string | null;
   adaptiveDirectionBias?: string | null;
   primaryValidationLane?: RegimeDirectionControllerInputPrimaryLane | null;
+  /**
+   * Optional honest-edge gate. When provided, a direction the regime mapping
+   * would allow is HARD-VETOED if its proven historical edge is non-positive —
+   * so the controller can never authorize a losing direction on a momentary
+   * trend vote. Omitted → pure naive mapping (back-compat for report-only callers).
+   */
+  edgeGate?: DirectionEdgeGate | null;
 }
 
 export interface RegimeDirectionControllerReportPrimaryLane {
@@ -70,6 +98,9 @@ export interface RegimeDirectionControllerReport {
   allowsNewEntries: boolean;
   requiresRetest: boolean;
 
+  /** True when the honest-edge gate vetoed at least one regime-allowed direction. */
+  edgeGated: boolean;
+
   reasonCodes: string[];
   warnings: string[];
 
@@ -80,6 +111,8 @@ export interface RegimeDirectionControllerReport {
 
 const REPORT_ONLY_WARNING = "controller is report-only; no behavior influence";
 const MIXED_WARNING = "mixed regime should not force directional conviction";
+const EDGE_VETO_WARNING =
+  "every regime-allowed direction has proven-negative honest edge — no new entries until a slice proves positive";
 const MISMATCH_WARNING =
   "primary validation lane is cross-regime — collection only, not live execution";
 
@@ -324,6 +357,49 @@ export function buildRegimeDirectionControllerReport(
     warnings.push(mapping.warning);
   }
 
+  // ── Honest-edge gate ────────────────────────────────────────────────────
+  // Prune any regime-allowed direction whose proven historical edge is
+  // non-positive. This is the smart layer: it stops the chain from authorizing
+  // a direction that loses money just because the regime label points that way
+  // (e.g. bullish-expansion LONG at −1.0R/trade). Cold-start slices (too few
+  // samples) pass through per the no-shadow policy but are flagged.
+  let controllerMode = mapping.controllerMode;
+  let directionalBias = mapping.directionalBias;
+  let allowsLong = mapping.allowsLong;
+  let allowsShort = mapping.allowsShort;
+  let allowsNewEntries = mapping.allowsNewEntries;
+  let edgeGated = false;
+  if (input.edgeGate && currentRegimeTrimmed) {
+    const gate = input.edgeGate;
+    // Veto a direction only when its aggregate edge is non-positive AND no lane
+    // in that slice is proven-positive. A positive lane (e.g. tight-stop SHORT)
+    // keeps the direction open even if the aggregate is dragged negative by a
+    // losing lane — the allocator's lane-level veto then admits only that lane.
+    const directionVetoed = (dir: "LONG" | "SHORT"): boolean => {
+      const v = gate.verdict(currentRegimeTrimmed, dir);
+      const rescuedByLane = !v.allowed && gate.hasPositiveLane?.(currentRegimeTrimmed, dir) === true;
+      reasonCodes.push(rescuedByLane ? `EDGE_LANE_RESCUE_${dir}` : `${v.reasonCode}_${dir}`);
+      return !v.allowed && !rescuedByLane;
+    };
+    if (allowsLong && directionVetoed("LONG")) {
+      allowsLong = false;
+      edgeGated = true;
+    }
+    if (allowsShort && directionVetoed("SHORT")) {
+      allowsShort = false;
+      edgeGated = true;
+    }
+    // A trend mode that would admit entries but just lost its only tradeable
+    // direction collapses to a no-trade posture — nothing is admitted on a
+    // proven-loser slice.
+    if (allowsNewEntries && !allowsLong && !allowsShort) {
+      controllerMode = "NO_TRADE_NEGATIVE_EDGE";
+      directionalBias = "NEUTRAL";
+      allowsNewEntries = false;
+      warnings.push(EDGE_VETO_WARNING);
+    }
+  }
+
   const { report: primaryLaneReport, alignment } = buildPrimaryLaneReport(
     currentRegimeTrimmed,
     input.primaryValidationLane ?? null,
@@ -338,13 +414,14 @@ export function buildRegimeDirectionControllerReport(
 
   return {
     currentRegime: currentRegimeTrimmed,
-    controllerMode: mapping.controllerMode,
-    directionalBias: mapping.directionalBias,
+    controllerMode,
+    directionalBias,
     confidence: mapping.confidence,
-    allowsLong: mapping.allowsLong,
-    allowsShort: mapping.allowsShort,
-    allowsNewEntries: mapping.allowsNewEntries,
+    allowsLong,
+    allowsShort,
+    allowsNewEntries,
     requiresRetest: mapping.requiresRetest,
+    edgeGated,
     reasonCodes,
     warnings,
     currentValidationPrimaryLane: primaryLaneReport,

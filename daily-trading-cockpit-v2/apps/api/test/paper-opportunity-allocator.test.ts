@@ -139,6 +139,8 @@ interface CandOverrides {
   noExecutionPlan?: boolean;
   kronosBias?: string | null;
   whaleSignal?: string | null;
+  trendScore?: number;
+  directionConflict?: boolean;
 }
 
 /**
@@ -173,6 +175,8 @@ function makeCandidate(o: CandOverrides = {}): Candidate {
     },
     indicators: { fiveMinute: { latestClose: 100 } },
     sourceConflict: o.sourceConflict ?? false,
+    directionConflict: o.directionConflict ?? false,
+    trendScore: o.trendScore ?? 75,
     selectedExecutionPlan: plan,
     ...(o.kronosBias !== undefined ? { kronosBias: o.kronosBias } : {}),
     ...(o.whaleSignal !== undefined ? { whale: { signal: o.whaleSignal, score: 60 } } : {}),
@@ -379,15 +383,16 @@ function seedWin(store: PaperExecutionRouterStore, over: Partial<PaperOrder> = {
 
 describe("paper-opportunity-allocator", () => {
   // [1]
-  it("[1] evaluates every candidate across all 6 lanes", async () => {
+  it("[1] evaluates every candidate across all SHORT-eligible lanes", async () => {
     const dir = tmpDir();
     const vmReport = await buildWinningVmReport(dir);
     const report = buildPaperOpportunityAllocatorReport(
       baseInputs({ vmReport, candidates: [makeCandidate()] }),
     );
     expect(report.candidatesEvaluated).toBe(1);
-    expect(report.laneEvaluationsCreated).toBe(6);
-    expect(report.byLane.length).toBe(6);
+    // 7 = the 6 bidirectional CG lanes + the new shortOnly CG_WIDE_FAST_SHORT.
+    expect(report.laneEvaluationsCreated).toBe(7);
+    expect(report.byLane.length).toBe(7);
   });
 
   // [2]
@@ -826,6 +831,83 @@ describe("paper-opportunity-allocator", () => {
     expect(order.paperOrderMode).toBe("DIAGNOSTIC_ONLY");
     expect(order.reportOnly).toBe(true);
     expect(order.paperOnly).toBe(true);
+  });
+
+  it("[11b-bull] Bullish LONG_ONLY admits the pure bull trend lane alongside CG_WIDE LONG", async () => {
+    const dir = tmpDir();
+    const vmReport = buildEmptyVmReport(dir);
+    const report = buildPaperOpportunityAllocatorReport(
+      baseInputs({
+        vmReport,
+        marketRegime: "Bullish expansion",
+        routerReport: routerOf("Bullish expansion"),
+        paperVariantMatrixDiagnosticEnabled: true,
+        paperCgWidePriority: true,
+        candidates: [makeCandidate({
+          symbol: "BTCUSDT",
+          direction: "LONG",
+          stopLoss: 98.8,
+          tp1: 102,
+          trendScore: 78,
+          kronosBias: "LONG",
+          whaleSignal: "BULLISH",
+        })],
+      }),
+    );
+
+    const bull = report.selectedOpportunities.find(
+      (opportunity) => opportunity.variantId === "BL_TREND_R15_STOP200_FULL",
+    );
+    expect(bull).toBeDefined();
+    expect(bull?.laneId).toBe("CG_LONG_VARIANT_MATRIX:BL_TREND_R15_STOP200_FULL");
+    expect(bull?.paperOrderMode).toBe("DIAGNOSTIC_ONLY");
+    expect(bull?.plannedStopDistanceBps).toBeCloseTo(200, 6);
+    expect(bull?.takeProfitLevels[0]).toBeCloseTo(103, 6);
+    expect(bull?.provenance?.candidateQualityFlags).toContain("PURE_BULLISH_TREND_OOS");
+    expect(
+      report.selectedOpportunities.some(
+        (opportunity) => opportunity.laneId === "CG_LONG_VARIANT_MATRIX:CG_WIDE_STOP_TP_WIDE",
+      ),
+    ).toBe(true);
+  });
+
+  it("[11b-bull-gates] pure bull trend lane rejects weak trend and contra evidence", async () => {
+    const dir = tmpDir();
+    const vmReport = buildEmptyVmReport(dir);
+    const common = {
+      vmReport,
+      marketRegime: "Bullish expansion",
+      routerReport: routerOf("Bullish expansion"),
+      paperVariantMatrixDiagnosticEnabled: true,
+    };
+
+    const weak = buildPaperOpportunityAllocatorReport(
+      baseInputs({
+        ...common,
+        candidates: [makeCandidate({ direction: "LONG", stopLoss: 98, tp1: 103, trendScore: 59 })],
+      }),
+    );
+    expect(
+      weak.selectedOpportunities.some((opportunity) => opportunity.variantId === "BL_TREND_R15_STOP200_FULL"),
+    ).toBe(false);
+    expect(weak.topRejects.map((row) => row.key)).toContain("BULL_TREND_SCORE_BELOW_60");
+
+    const contra = buildPaperOpportunityAllocatorReport(
+      baseInputs({
+        ...common,
+        candidates: [makeCandidate({
+          direction: "LONG",
+          stopLoss: 98,
+          tp1: 103,
+          trendScore: 80,
+          kronosBias: "SHORT",
+        })],
+      }),
+    );
+    expect(
+      contra.selectedOpportunities.some((opportunity) => opportunity.variantId === "BL_TREND_R15_STOP200_FULL"),
+    ).toBe(false);
+    expect(contra.topRejects.map((row) => row.key)).toContain("BULL_TREND_KRONOS_CONTRA");
   });
 
   it("[11c] LONG collection does not alter bearish SHORT lane admission", async () => {

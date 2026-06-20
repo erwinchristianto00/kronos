@@ -10,6 +10,7 @@
     "build": "npm run build -w @dtc/shared && npm run build -w @dtc/api && npm run build -w @dtc/web",
     "test": "npm run test -w @dtc/shared && npm run test -w @dtc/api",
     "dev": "kill-port 3101 5173 && concurrently \"npm run dev -w @dtc/api\" \"npm run dev -w @dtc/web\"",
+    "dev:all": "bash scripts/dev-all.sh",
     "dev:full": "powershell -ExecutionPolicy Bypass -File ./scripts/dev-full.ps1"
   },
   "devDependencies": {

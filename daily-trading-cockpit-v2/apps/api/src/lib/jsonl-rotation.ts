@@ -20,12 +20,38 @@ import {
   existsSync,
   mkdirSync,
   openSync,
+  readdirSync,
   readSync,
   renameSync,
   statSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { dirname, basename, resolve } from "node:path";
+
+/**
+ * Delete old archives so the archive dir cannot grow unbounded. scan-history*
+ * rotates ~every scan (~100MB each); without pruning the archive dir grew ~1GB/h
+ * and would fill a VPS disk in ~a day. Keeps the newest `keep` archives for this
+ * base (env SCAN_HISTORY_ARCHIVE_KEEP, default 3) and unlinks the rest. Never throws.
+ */
+function pruneArchives(archiveDir: string, base: string, keep: number): void {
+  try {
+    const prefix = `${base}.`;
+    const files = readdirSync(archiveDir)
+      .filter((f) => f.startsWith(prefix) && f.endsWith(".jsonl"))
+      .sort(); // names embed an ISO timestamp → lexical sort == chronological
+    for (const f of files.slice(0, Math.max(0, files.length - keep))) {
+      try {
+        unlinkSync(resolve(archiveDir, f));
+      } catch {
+        // best-effort; never block rotation
+      }
+    }
+  } catch {
+    // archive dir unreadable — ignore
+  }
+}
 
 export interface RotationOptions {
   /** Default 100MB. Files smaller than this are not rotated. */
@@ -181,6 +207,9 @@ export function rotateJsonlIfNeeded(
         error: err instanceof Error ? err.message : String(err),
       };
     }
+
+    // Bound the archive dir — without this it grows unbounded (~1GB/h) and fills disk.
+    pruneArchives(archiveDir, base, Number(process.env.SCAN_HISTORY_ARCHIVE_KEEP) || 3);
 
     const tailContent = tail.length > 0 ? tail.join("\n") + "\n" : "";
     try {

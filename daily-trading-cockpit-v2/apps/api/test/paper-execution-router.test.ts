@@ -1017,6 +1017,180 @@ describe("paper-execution-router", () => {
     expect(klinesFetched).toBe(false);
   });
 
+  // [25a] Max-hold time-stop: a >72h LONG that never hit TP/SL and drifted BELOW
+  // entry is force-closed mark-to-market as a LOSS (phantom-equity fix). Before
+  // this, wide-stop losers drifted as PAPER_SUBMITTED forever and never hit the
+  // ledger, so the book showed only realized winners.
+  it("[25a] >72h order with no TP/SL hit, underwater → PAPER_CLOSED_LOSS via MAX_HOLD_MTM", async () => {
+    const dir = tmpDir();
+    const store = new PaperExecutionRouterStore(dir);
+    store.ensurePaperStartAt(new Date(Date.now() - 73 * 60 * 60 * 1000).toISOString());
+
+    const openedAt = new Date(Date.now() - 73 * 60 * 60 * 1000).toISOString();
+    const signalMs = new Date(openedAt).getTime();
+    store.add(
+      makePaperOrder({
+        paperOrderId: "maxhold-loss-1",
+        dedupeKey: "maxhold-loss-1:lane",
+        sourceObservationId: "obs-maxhold-loss-1",
+        openedAt,
+        symbol: "ETHUSDT",
+        direction: "LONG",
+        entryPrice: 100,
+        stopLoss: 97, // risk 3, wide stop never touched
+        takeProfitLevels: [106], // TP never touched
+        plannedStopDistanceBps: 300,
+        paperStatus: "CREATED",
+      }),
+    );
+
+    // Price drifts in 98–99.5 for the whole walk: never <=97 (stop), never >=106 (TP).
+    // Last close 98.5 → MTM grossR = (98.5-100)/3 ≈ -0.5R → LOSS.
+    const mockBinance: PaperResolverClient = {
+      getKlines: async (_s, interval) => {
+        if (interval === "1m") return [];
+        return [
+          [signalMs, "0", "99.5", "98.0", "99.0", "0", signalMs + 300_000] as PaperKlineTuple,
+          [signalMs + 300_000, "0", "99.4", "98.2", "98.7", "0", signalMs + 600_000] as PaperKlineTuple,
+          [signalMs + 600_000, "0", "99.2", "98.0", "98.5", "0", signalMs + 900_000] as PaperKlineTuple,
+        ];
+      },
+    };
+
+    await resolvePaperOrders(store, mockBinance);
+    const order = store.all.find((o) => o.paperOrderId === "maxhold-loss-1")!;
+    expect(order.paperStatus).toBe("PAPER_CLOSED_LOSS");
+    expect(order.closeReason).toBe("MAX_HOLD_MTM");
+    expect(order.netR).not.toBeNull();
+    expect(order.netR!).toBeLessThan(0);
+    expect(order.netPnlAmount).not.toBeNull();
+  });
+
+  // [25b] Symmetric: a >72h order marked ABOVE water (favorable but TP not reached)
+  // books a WIN — proving the time-stop is symmetric, not loss-only.
+  it("[25b] >72h order with no TP/SL hit, in profit → PAPER_CLOSED_WIN via MAX_HOLD_MTM", async () => {
+    const dir = tmpDir();
+    const store = new PaperExecutionRouterStore(dir);
+    store.ensurePaperStartAt(new Date(Date.now() - 73 * 60 * 60 * 1000).toISOString());
+
+    const openedAt = new Date(Date.now() - 73 * 60 * 60 * 1000).toISOString();
+    const signalMs = new Date(openedAt).getTime();
+    store.add(
+      makePaperOrder({
+        paperOrderId: "maxhold-win-1",
+        dedupeKey: "maxhold-win-1:lane",
+        sourceObservationId: "obs-maxhold-win-1",
+        openedAt,
+        symbol: "ETHUSDT",
+        direction: "LONG",
+        entryPrice: 100,
+        stopLoss: 97, // risk 3
+        takeProfitLevels: [106], // never reached
+        plannedStopDistanceBps: 50, // tight cost so a small favorable MTM stays net-positive
+        paperStatus: "CREATED",
+      }),
+    );
+
+    // Drifts up to ~104 but never tags 106 (TP) nor 97 (stop). Last close 104 →
+    // MTM grossR = (104-100)/3 ≈ +1.33R, easily net-positive.
+    const mockBinance: PaperResolverClient = {
+      getKlines: async (_s, interval) => {
+        if (interval === "1m") return [];
+        return [
+          [signalMs, "0", "102.0", "99.5", "101.5", "0", signalMs + 300_000] as PaperKlineTuple,
+          [signalMs + 300_000, "0", "104.5", "101.0", "104.0", "0", signalMs + 600_000] as PaperKlineTuple,
+        ];
+      },
+    };
+
+    await resolvePaperOrders(store, mockBinance);
+    const order = store.all.find((o) => o.paperOrderId === "maxhold-win-1")!;
+    expect(order.paperStatus).toBe("PAPER_CLOSED_WIN");
+    expect(order.closeReason).toBe("MAX_HOLD_MTM");
+    expect(order.netR!).toBeGreaterThan(0);
+  });
+
+  // [25c] Guard: an order YOUNGER than the 72h horizon that has not hit TP/SL is
+  // NOT force-closed — it stays PAPER_SUBMITTED to keep resolving. The time-stop
+  // must only fire past the horizon, never cut live positions short.
+  it("[25c] order younger than 72h with no TP/SL hit stays PAPER_SUBMITTED (no premature MTM)", async () => {
+    const dir = tmpDir();
+    const store = new PaperExecutionRouterStore(dir);
+    store.ensurePaperStartAt(new Date(Date.now() - 60_000).toISOString());
+
+    const openedAt = new Date(Date.now() - 5 * 60_000).toISOString(); // 5 min old
+    const signalMs = new Date(openedAt).getTime();
+    store.add(
+      makePaperOrder({
+        paperOrderId: "young-open-1",
+        dedupeKey: "young-open-1:lane",
+        sourceObservationId: "obs-young-open-1",
+        openedAt,
+        symbol: "ETHUSDT",
+        direction: "LONG",
+        entryPrice: 100,
+        stopLoss: 97,
+        takeProfitLevels: [106],
+        plannedStopDistanceBps: 300,
+        paperStatus: "CREATED",
+      }),
+    );
+
+    const mockBinance: PaperResolverClient = {
+      getKlines: async (_s, interval) => {
+        if (interval === "1m") return [];
+        return [
+          [signalMs, "0", "99.5", "98.0", "99.0", "0", signalMs + 300_000] as PaperKlineTuple,
+        ];
+      },
+    };
+
+    await resolvePaperOrders(store, mockBinance);
+    const order = store.all.find((o) => o.paperOrderId === "young-open-1")!;
+    expect(order.paperStatus).toBe("PAPER_SUBMITTED");
+    expect(order.netR).toBeNull();
+  });
+
+  // [25d] Per-lane max-hold: a CG_WIDE_LONG_RUNNER order (144h hold) at 73h is
+  // NOT marked to market — it gets the full let-it-run horizon, unlike a default
+  // 72h lane which would close it. Proves maxHoldHours is honored per lane.
+  it("[25d] CG_WIDE_LONG_RUNNER order at 73h stays open (144h hold), not MAX_HOLD_MTM", async () => {
+    const dir = tmpDir();
+    const store = new PaperExecutionRouterStore(dir);
+    store.ensurePaperStartAt(new Date(Date.now() - 73 * 60 * 60 * 1000).toISOString());
+
+    const openedAt = new Date(Date.now() - 73 * 60 * 60 * 1000).toISOString();
+    const signalMs = new Date(openedAt).getTime();
+    store.add(
+      makePaperOrder({
+        paperOrderId: "runner-open-1",
+        dedupeKey: "runner-open-1:lane",
+        sourceObservationId: "obs-runner-open-1",
+        openedAt,
+        symbol: "ETHUSDT",
+        direction: "LONG",
+        selectedLaneId: "CG_LONG_VARIANT_MATRIX:CG_WIDE_LONG_RUNNER",
+        entryPrice: 100,
+        stopLoss: 97,
+        takeProfitLevels: [109],
+        plannedStopDistanceBps: 300,
+        paperStatus: "CREATED",
+      }),
+    );
+
+    const mockBinance: PaperResolverClient = {
+      getKlines: async (_s, interval) => {
+        if (interval === "1m") return [];
+        return [[signalMs, "0", "99.5", "98.0", "99.0", "0", signalMs + 300_000] as PaperKlineTuple];
+      },
+    };
+
+    await resolvePaperOrders(store, mockBinance);
+    const order = store.all.find((o) => o.paperOrderId === "runner-open-1")!;
+    expect(order.paperStatus).toBe("PAPER_SUBMITTED"); // 73h < 144h → still riding
+    expect(order.netR).toBeNull();
+  });
+
   // [26] Duplicate observation → no duplicate paper order
   it("[26] duplicate source observation does not create duplicate paper order", () => {
     const dir = tmpDir();

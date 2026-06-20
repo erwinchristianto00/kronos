@@ -1,0 +1,52 @@
+# Caddy: one front door for the dashboard — auto-HTTPS + password, reachable from
+# anywhere (phone included) without an SSH tunnel. Caddy serves the built dashboard
+# and proxies /api to the trading API, so you do NOT also need the `dtc-web` pm2
+# process or an open 5173 port. Open only 80 + 443 in the firewall.
+#
+# Fill these before use:
+#   - replace dash.example.duckdns.org with YOUR free domain (see deploy/README.md)
+#   - replace the basicauth user + hash (generate with:  caddy hash-password )
+#   - replace /home/ubuntu/... if your repo lives elsewhere
+
+dash.example.duckdns.org {
+	# Password gate for the whole dashboard. Generate the hash with:
+	#   caddy hash-password           (it prompts for the password)
+	basicauth {
+		admin REPLACE_WITH_BCRYPT_HASH
+	}
+
+	# /api/* → the trading API (localhost only)
+	handle /api/* {
+		reverse_proxy 127.0.0.1:3101
+	}
+
+	# everything else → the built single-page dashboard
+	handle {
+		root * /home/ubuntu/daily-trading-cockpit-v2/apps/web/dist
+		try_files {path} /index.html
+		file_server
+	}
+
+	encode gzip
+}
+
+# ── IP-only fallback (no domain) ────────────────────────────────────────────
+# No free domain? Comment the block above and use this instead — Caddy serves a
+# self-signed cert on the VM's public IP (browser shows a one-time warning).
+# Replace the IP. Auto-HTTPS via Let's Encrypt needs a real domain, so this uses
+# Caddy's internal CA.
+#
+# https://<VM_PUBLIC_IP> {
+# 	tls internal
+# 	basicauth {
+# 		admin REPLACE_WITH_BCRYPT_HASH
+# 	}
+# 	handle /api/* {
+# 		reverse_proxy 127.0.0.1:3101
+# 	}
+# 	handle {
+# 		root * /home/ubuntu/daily-trading-cockpit-v2/apps/web/dist
+# 		try_files {path} /index.html
+# 		file_server
+# 	}
+# }

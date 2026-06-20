@@ -1,11 +1,28 @@
 import type { CoreScanAutoRefreshStatus } from "./core-scan-auto-refresh.js";
-import type { CurrentGuardVariantMatrixReport } from "./current-guard-variant-matrix.js";
+import {
+  BULL_SCALEOUT_VARIANT_ID,
+  BULL_TREND_VARIANT_ID,
+  VARIANT_MATRIX_DEFINITIONS,
+  type CurrentGuardVariantMatrixReport,
+} from "./current-guard-variant-matrix.js";
 import type { MixedBudgetForwardValidationReport, MixedRegimeReport, OpenOrderStaleAudit } from "./mixed-regime-router.js";
 import type { PaperOrder, PaperPerformanceReport } from "./paper-execution-router.js";
 import type { RegimeDirectionControllerReport } from "./regime-direction-controller.js";
 import type { ScanTimingDiagnostics } from "./scan-timing-diagnostics.js";
 
-export type NeuralHealth = "HEALTHY" | "ACTIVE" | "WARNING" | "CRITICAL" | "IDLE" | "COLLECTING" | "QUARANTINE";
+// Distinguish the three "red-looking" states the operator kept conflating:
+//   CRITICAL   = FAILING — real headline loss (genuinely bad)
+//   QUARANTINE = BLOCKED — benched by the gate / safety (intentional, not bad)
+//   DIAGNOSTIC = probe-only PnL (reject-sampler measurements, NOT real trades — neutral)
+export type NeuralHealth =
+  | "HEALTHY"
+  | "ACTIVE"
+  | "WARNING"
+  | "CRITICAL"
+  | "IDLE"
+  | "COLLECTING"
+  | "QUARANTINE"
+  | "DIAGNOSTIC";
 export type NeuralNodeKind = "INPUT" | "PROCESS" | "CONTROLLER" | "LANE" | "OUTPUT" | "SAFETY";
 export type NeuralDiagnosisCategory =
   | "HEALTHY_FLOW"
@@ -122,6 +139,8 @@ export interface NeuralMapTelemetry {
     guardrailStatus: string;
     recommendedAction: string;
     waitForCapacity: number;
+    oosCount: number;
+    oosThreshold: number;
   };
   nodes: NeuralMapNode[];
   lanes: NeuralMapLane[];
@@ -194,12 +213,27 @@ function laneEconomics(orders: PaperOrder[], laneId: string) {
 function laneLabel(id: string): string {
   if (id === "CG_VARIANT_MATRIX:CG_WIDE_STOP_TP_WIDE") return "CG_WIDE SHORT";
   if (id === "CG_LONG_VARIANT_MATRIX:CG_WIDE_STOP_TP_WIDE") return "CG_WIDE LONG";
+  if (id === "CG_LONG_VARIANT_MATRIX:CG_WIDE_LONG_RUNNER") return "CG_WIDE RUNNER 3R";
+  if (id === "CG_VARIANT_MATRIX:CG_WIDE_FAST_SHORT") return "CG_WIDE FAST 0.5R";
+  if (id === `CG_LONG_VARIANT_MATRIX:${BULL_TREND_VARIANT_ID}`) return "BULL TREND 1.5R";
+  if (id === `CG_LONG_VARIANT_MATRIX:${BULL_SCALEOUT_VARIANT_ID}`) return "BULL SCALEOUT";
+  if (id === "CG_LONG_VARIANT_MATRIX:LG_R12_STOP250_FULL") return "LONG R1.2 STOP250";
+  if (id === "CG_LONG_VARIANT_MATRIX:LG_R12_STOP300_FULL") return "LONG R1.2 STOP300";
+  if (id === "CG_LONG_VARIANT_MATRIX:CG_BASELINE_CURRENT") return "CG_BASELINE LONG";
+  if (id === "CG_LONG_VARIANT_MATRIX:CG_SCALEOUT_TP1_TRAIL") return "CG_SCALEOUT LONG";
+  if (id === "CG_LONG_VARIANT_MATRIX:CG_NO_FIB500_ENTRYSET") return "CG_NO_FIB500 LONG";
+  if (id === "CG_LONG_VARIANT_MATRIX:CG_MAKER_LIMIT_SIM") return "CG_MAKER LONG";
   if (id === "CG_VARIANT_MATRIX:CG_TRAIL_AFTER_TP1") return "CG_TRAIL SHORT";
   if (id === "CG_VARIANT_MATRIX:CG_BASELINE_CURRENT") return "CG_BASELINE SHORT";
   if (id === "CG_VARIANT_MATRIX:CG_SCALEOUT_TP1_TRAIL") return "CG_SCALEOUT SHORT";
   if (id === "CG_VARIANT_MATRIX:CG_NO_FIB500_ENTRYSET") return "CG_NO_FIB500 SHORT";
   if (id === "CG_VARIANT_MATRIX:CG_MAKER_LIMIT_SIM") return "CG_MAKER SHORT";
-  return id.replace("CG_VARIANT_MATRIX:", "").replaceAll("_", " ");
+  // Fallback: strip BOTH lane prefixes (CG_LONG_VARIANT_MATRIX must be tried
+  // first — it contains CG_VARIANT_MATRIX as a substring only after "LONG_").
+  return id
+    .replace("CG_LONG_VARIANT_MATRIX:", "")
+    .replace("CG_VARIANT_MATRIX:", "")
+    .replaceAll("_", " ");
 }
 
 function healthFromLane(status: string, closed: number, netAvgR: number | null): NeuralHealth {
@@ -445,10 +479,16 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
     ]),
   ).values()).join(", ");
 
-  const variantLaneIds = new Set(input.variantMatrix.rows.map((row) => `CG_VARIANT_MATRIX:${row.variantId}`));
+  const variantLaneId = (variantId: string): string => {
+    const definition = VARIANT_MATRIX_DEFINITIONS.find((candidate) => candidate.id === variantId);
+    return definition?.longOnly
+      ? `CG_LONG_VARIANT_MATRIX:${variantId}`
+      : `CG_VARIANT_MATRIX:${variantId}`;
+  };
+  const variantLaneIds = new Set(input.variantMatrix.rows.map((row) => variantLaneId(row.variantId)));
   const orderLaneIds = new Set(input.orders.map((order) => order.selectedLaneId).filter(Boolean));
   const laneIds = Array.from(new Set([...variantLaneIds, ...orderLaneIds]));
-  const rowsById = new Map(input.variantMatrix.rows.map((row) => [`CG_VARIANT_MATRIX:${row.variantId}`, row]));
+  const rowsById = new Map(input.variantMatrix.rows.map((row) => [variantLaneId(row.variantId), row]));
   const activeLaneIds = new Set([
     ...input.mixed.activeMixedLanes,
     ...(input.paper.currentBatchActiveLane ? [input.paper.currentBatchActiveLane] : []),
@@ -459,15 +499,21 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
   const lanes = laneIds.map((id): NeuralMapLane => {
     const row = rowsById.get(id);
     const economics = laneEconomics(input.orders, id);
-    const netAvgR = row?.netAvgR ?? economics.netAvgR;
+    // LONG lanes are admitted from fresh scan candidates into the paper book.
+    // Once that book has evidence, it is the honest source of truth; the VM row
+    // is a separate current-guard simulation and must not pin progress at n=0.
+    const usePaperEvidence = id.startsWith("CG_LONG_VARIANT_MATRIX:") &&
+      (economics.open > 0 || economics.closed > 0);
+    const evidenceRow = usePaperEvidence ? undefined : row;
+    const netAvgR = evidenceRow?.netAvgR ?? economics.netAvgR;
     // Per-field source honesty (audit finding): when a VM row exists, the stats block
     // (netAvgR/pf/wr/closed) is the SIMULATION row, not paper-realized — tag it so a sim netAvgR
     // rendered next to paper PnL dollars can never read as one dataset. Lanes without a VM row
     // (e.g. CG_LONG_VARIANT_MATRIX:*) show paper-realized stats under the same fields.
-    const statsSource: "VM_SIM" | "PAPER_BOOK" = row ? "VM_SIM" : "PAPER_BOOK";
+    const statsSource: "VM_SIM" | "PAPER_BOOK" = evidenceRow ? "VM_SIM" : "PAPER_BOOK";
     const pnlIsDiagnosticOnly = economics.headlineClosed === 0 && economics.diagnosticPnl !== 0;
-    const status = row?.status ?? (economics.closed > 0 ? "PAPER_EVIDENCE" : "COLLECTING");
-    const evidenceHealth = healthFromLane(status, row?.freshValid ?? economics.closed, netAvgR);
+    const status = evidenceRow?.status ?? (economics.closed > 0 ? "PAPER_EVIDENCE" : "COLLECTING");
+    const evidenceHealth = healthFromLane(status, evidenceRow?.freshValid ?? economics.closed, netAvgR);
     // Quarantined lanes are benched (no new admissions) but still measured via the VM sim, so
     // they bypass the red/green performance color (reserved for ACTIVE lanes) and show the
     // distinct QUARANTINE color. Their VM-sim evidenceHealth stays visible so improvement is
@@ -482,22 +528,27 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
       ? (graduationReady
           ? `Quarantined (benched) — VM-sim improving to ${fmtR(netAvgR)}; graduation candidate, watch for promotion`
           : `Quarantined (benched, no new admissions) — still collecting VM-sim evidence (${fmtR(netAvgR)})`)
-      : (row?.statusReason ?? (economics.open > 0 ? `${economics.open} paper order(s) open` : "paper evidence lane"));
+      : (evidenceRow?.statusReason ?? (economics.open > 0 ? `${economics.open} paper order(s) open` : "paper evidence lane"));
     const sourceTag = statsSource === "VM_SIM" ? "[stats: VM-sim]" : "[stats: paper realized]";
     const diagTag = pnlIsDiagnosticOnly ? " [PnL: diagnostic-only — excluded from headline]" : "";
     return {
       id,
       label: laneLabel(id),
+      // BLOCKED (quarantine) and DIAGNOSTIC-only lanes never take the red/green
+      // performance color — red is reserved for REAL headline losses (FAILING), so
+      // an intentionally-benched lane or a diagnostic-probe lane is not mistaken for one.
       health: quarantined
         ? "QUARANTINE"
-        : performanceHealthFromLane(colorPnl, row?.freshValid ?? economics.closed, economics.open),
+        : pnlIsDiagnosticOnly
+          ? "DIAGNOSTIC"
+          : performanceHealthFromLane(colorPnl, evidenceRow?.freshValid ?? economics.closed, economics.open),
       evidenceHealth,
       active: !quarantined && (activeLaneIds.has(id) || economics.open > 0),
       open: economics.open,
-      closed: row?.freshValid ?? economics.closed,
+      closed: evidenceRow?.freshValid ?? economics.closed,
       netAvgR,
-      pf: row?.pf ?? economics.pf,
-      wr: row?.wr ?? economics.wr,
+      pf: evidenceRow?.pf ?? economics.pf,
+      wr: evidenceRow?.wr ?? economics.wr,
       statsSource,
       headlinePnl: economics.headlinePnl,
       diagnosticPnl: economics.diagnosticPnl,
@@ -655,7 +706,7 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
     }),
     makeNode({
       id: "paper",
-      label: "Paper Execution",
+      label: "Lane Signal Book",
       kind: "OUTPUT",
       health: input.paper.dataFailure > 0 ? "WARNING" : "ACTIVE",
       active: input.paper.open > 0,
@@ -779,6 +830,8 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
       guardrailStatus: guardrail.status,
       recommendedAction: guardrail.recommendedAction,
       waitForCapacity: mixedActive ? input.mixed.waitForCapacityCount : 0,
+      oosCount: guardrail.closedUnderProfileCount,
+      oosThreshold: guardrail.oosThreshold,
     },
     nodes,
     lanes,

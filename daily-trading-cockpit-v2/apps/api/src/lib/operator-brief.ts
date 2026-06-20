@@ -17,6 +17,7 @@ import {
   buildPaperProvenanceBriefLines,
   buildPaperLatencyBriefLines,
   type PaperPerformanceReport,
+  type PaperOrder,
   type PaperProvenanceAudit,
   type ShadowLoserFingerprintGateReport,
   type PaperLatencyDiagnostics,
@@ -57,6 +58,8 @@ export interface OperatorBriefInputs {
   gateReport: LiveTradingGateReport;
   /** Optional paper-execution-router performance report — when present, renders section 10. */
   paperReport?: PaperPerformanceReport | null;
+  /** Full paper book for adaptive LONG-lane maturity accounting. */
+  paperOrders?: readonly PaperOrder[];
   /** Optional paper-opportunity-allocator report — when present, appends allocator diagnostics to section 10. */
   allocatorReport?: PaperOpportunityAllocatorReport | null;
   /** Optional provenance audit (Part 2) — when present with shadowGateReport, appends provenance/gate lines to section 10. */
@@ -221,7 +224,12 @@ export function buildOperatorBrief(inputs: OperatorBriefInputs): string {
 
   // ── 2. CURRENT DECISION ──────────────────────────────────────────────────
   const router = buildAdaptiveLaneRouterReport({
-    generatedAt, regimeReport, postCutoverReport: pc, variantMatrixReport: vm, gateReport,
+    generatedAt,
+    regimeReport,
+    postCutoverReport: pc,
+    variantMatrixReport: vm,
+    gateReport,
+    paperOrders: inputs.paperOrders,
   });
 
   L.push("2. CURRENT DECISION");

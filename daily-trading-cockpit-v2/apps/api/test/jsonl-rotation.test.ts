@@ -1,5 +1,6 @@
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
@@ -65,6 +66,26 @@ describe("rotateJsonlIfNeeded", () => {
 
     // Archive file should exist.
     expect(existsSync(result.archivePath!)).toBe(true);
+  });
+
+  it("prunes old archives on rotation, keeping only the newest N", () => {
+    const dir = mkTmp();
+    const archiveDir = join(dir, "archive");
+    mkdirSync(archiveDir, { recursive: true });
+    // Pre-seed 5 old archives with sortable (chronological) timestamp names.
+    for (let i = 1; i <= 5; i++) {
+      writeFileSync(join(archiveDir, `scan-history.jsonl.2026-06-1${i}T00-00-00-000Z.jsonl`), "old\n");
+    }
+    process.env.SCAN_HISTORY_ARCHIVE_KEEP = "3";
+    const file = join(dir, "scan-history.jsonl");
+    writeFileSync(file, "x".repeat(2000) + "\n", "utf-8");
+    const result = rotateJsonlIfNeeded(file, { thresholdBytes: 100, tailLines: 5 });
+    expect(result.rotated).toBe(true);
+    const archives = readdirSync(archiveDir).filter(
+      (f) => f.startsWith("scan-history.jsonl.") && f.endsWith(".jsonl"),
+    );
+    expect(archives.length).toBe(3); // 5 old + 1 new = 6 → pruned to newest 3
+    delete process.env.SCAN_HISTORY_ARCHIVE_KEEP;
   });
 
   it("returns BELOW_THRESHOLD when file is small", () => {

@@ -1798,7 +1798,9 @@ export function renderMixedCapacityBudgetSimulation(report: MixedCapacityBudgetS
 }
 
 // ── forward-monitoring guardrail (WARNING-level; report-only; never auto-rolls-back) ──
-const GUARDRAIL_MIN_OOS = 30;
+// Min closed OOS before the mixed-regime budget leaves COLLECTING_OOS and can admit
+// headline. Env-tunable (GUARDRAIL_MIN_OOS) for the fresh-start collection sprint.
+const GUARDRAIL_MIN_OOS = Number(process.env.GUARDRAIL_MIN_OOS) || 30;
 const GUARDRAIL_PF_HEALTHY = 1.5;
 const GUARDRAIL_PF_FLOOR = 1.0;
 const GUARDRAIL_WR_COLLAPSE = 0.4; // 40% WR floor (informational contributor)

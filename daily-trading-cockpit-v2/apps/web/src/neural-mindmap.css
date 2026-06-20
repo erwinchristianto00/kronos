@@ -422,6 +422,20 @@
   filter: drop-shadow(0 0 4px #a78bfa);
 }
 
+/* Diagnostic = probe-only measurements (reject-sampled candidates), NOT real trades.
+   Distinct dim cyan — never red — so a losing diagnostic lane is not mistaken for a failure. */
+.neural-lane.health-diagnostic .neural-lane-body {
+  fill: #102325;
+  stroke: #38bdf8;
+  stroke-dasharray: 2 4;
+  opacity: 0.85;
+}
+
+.neural-lane.health-diagnostic .neural-lane-led {
+  fill: #38bdf8;
+  filter: drop-shadow(0 0 4px #38bdf8);
+}
+
 .neural-lane.is-active .neural-lane-led {
   animation: neural-breathe 1.5s ease-in-out infinite;
 }
@@ -476,6 +490,10 @@ i.health-collecting {
 
 i.health-quarantine {
   background: #a78bfa;
+}
+
+i.health-diagnostic {
+  background: #38bdf8;
 }
 
 .neural-inspector {
@@ -956,4 +974,38 @@ i.health-quarantine {
   .neural-lane-led {
     animation: none !important;
   }
+}
+
+/* ── OOS progress bar ──────────────────────────────────────────────────────── */
+.neural-inspector-section dd:has(.neural-oos-bar) {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.neural-oos-bar {
+  flex: 1;
+  height: 6px;
+  background: rgba(255 255 255 / 0.08);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.neural-oos-fill {
+  height: 100%;
+  background: #3b82f6;
+  border-radius: 3px;
+  transition: width 0.4s ease;
+  min-width: 2px;
+}
+
+.neural-oos-fill.is-complete {
+  background: #22c55e;
+}
+
+.neural-oos-pct {
+  font-size: 11px;
+  color: #7fa8c8;
+  min-width: 36px;
+  text-align: right;
 }

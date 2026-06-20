@@ -123,6 +123,35 @@ describe("current-guard-variant-matrix", () => {
     expect((geo.takeProfitLevels[0] - 100) / (100 - geo.stopLoss)).toBeCloseTo(1.2, 6);
   });
 
+  // [CWLR] CG_WIDE_LONG_RUNNER: wide 300bps stop, far 3R TP, long-only.
+  it("[CWLR] CG_WIDE_LONG_RUNNER floors stop at 300bps, places TP at 3R, long-only", () => {
+    const geo = deriveVariantGeometry(makeSignal(), defOf("CG_WIDE_LONG_RUNNER"));
+    expect(geo.kind).toBe("ok");
+    if (geo.kind !== "ok") throw new Error("expected ok");
+    expect(geo.stopDistanceBps).toBeCloseTo(300, 6);
+    expect(geo.stopLoss).toBeCloseTo(97, 6); // 100*(1-300/10000)
+    // TP at 3× the floored risk (far target — the let-it-run payoff)
+    expect((geo.takeProfitLevels[0] - 100) / (100 - geo.stopLoss)).toBeCloseTo(3, 6);
+    expect(geo.takeProfitLevels[0]).toBeCloseTo(109, 6); // 100 + 3*3
+    // rejects SHORT
+    const shortSig = makeSignal({ direction: "SHORT", stopLoss: 102, tp1: 96 });
+    expect(deriveVariantGeometry(shortSig, defOf("CG_WIDE_LONG_RUNNER")).kind).toBe("rejected");
+  });
+
+  // [CWFS] CG_WIDE_FAST_SHORT: wide 300bps stop, near 0.5R TP, short-only.
+  it("[CWFS] CG_WIDE_FAST_SHORT floors stop at 300bps, TP at 0.5R, short-only", () => {
+    const shortSig = makeSignal({ direction: "SHORT", stopLoss: 101, tp1: 98 });
+    const geo = deriveVariantGeometry(shortSig, defOf("CG_WIDE_FAST_SHORT"));
+    expect(geo.kind).toBe("ok");
+    if (geo.kind !== "ok") throw new Error("expected ok");
+    expect(geo.stopDistanceBps).toBeCloseTo(300, 6);
+    expect(geo.stopLoss).toBeCloseTo(103, 6); // 100*(1+300/10000) — SHORT stop above entry
+    // TP at 0.5× risk below entry (fast take)
+    expect((100 - geo.takeProfitLevels[0]) / (geo.stopLoss - 100)).toBeCloseTo(0.5, 6);
+    // rejects LONG
+    expect(deriveVariantGeometry(makeSignal(), defOf("CG_WIDE_FAST_SHORT")).kind).toBe("rejected");
+  });
+
   // [LG-3] Long-only research lanes reject SHORT signals.
   it("[LG-3] LG_* lanes are long-only (rejected on SHORT)", () => {
     const shortSig = makeSignal({ direction: "SHORT", stopLoss: 102, tp1: 96 });
@@ -130,6 +159,22 @@ describe("current-guard-variant-matrix", () => {
     expect(deriveVariantGeometry(shortSig, defOf("LG_R12_STOP300_FULL")).kind).toBe("rejected");
     // still derive fine on LONG
     expect(deriveVariantGeometry(makeSignal(), defOf("LG_R12_STOP250_FULL")).kind).toBe("ok");
+  });
+
+  it("[BL-1] pure bullish trend lane uses a 200bps stop floor and 1.5R target", () => {
+    const geo = deriveVariantGeometry(makeSignal(), defOf("BL_TREND_R15_STOP200_FULL"));
+    expect(geo.kind).toBe("ok");
+    if (geo.kind !== "ok") throw new Error("expected ok");
+    expect(geo.stopDistanceBps).toBeCloseTo(200, 6);
+    expect(geo.stopLoss).toBeCloseTo(98, 6);
+    expect(geo.takeProfitLevels[0]).toBeCloseTo(103, 6);
+    expect((geo.takeProfitLevels[0] - 100) / (100 - geo.stopLoss)).toBeCloseTo(1.5, 6);
+    expect(geo.costR).toBeCloseTo(TAKER_ROUNDTRIP_BPS / 200, 6);
+  });
+
+  it("[BL-2] pure bullish trend lane rejects SHORT geometry", () => {
+    const shortSignal = makeSignal({ direction: "SHORT", stopLoss: 102, tp1: 97 });
+    expect(deriveVariantGeometry(shortSignal, defOf("BL_TREND_R15_STOP200_FULL")).kind).toBe("rejected");
   });
 
   // 2. Wide stop + wide TP improves payoff geometry.

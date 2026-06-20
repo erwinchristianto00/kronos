@@ -218,3 +218,74 @@ describe("regime direction controller (Phase 1, REPORT-ONLY)", () => {
     expect(report.controllerMode).not.toBe("BOTH_ALLOWED");
   });
 });
+
+describe("regime direction controller — honest-edge gate", () => {
+  // A fake gate returning a fixed verdict per direction.
+  const gateOf = (verdicts: Partial<Record<"LONG" | "SHORT", boolean>>) => ({
+    verdict(_regime: string | null | undefined, direction: "LONG" | "SHORT") {
+      const allowed = verdicts[direction] ?? true;
+      return {
+        allowed,
+        reasonCode: allowed ? "EDGE_PROVEN_POSITIVE" : "EDGE_PROVEN_NEGATIVE",
+        stat: { n: 400, avgNetR: allowed ? 0.2 : -0.1, winRate: 50 },
+      };
+    },
+  });
+
+  it("vetoes a proven-negative LONG in Bullish expansion → NO_TRADE_NEGATIVE_EDGE, no new entries", () => {
+    const report = buildRegimeDirectionControllerReport({
+      currentRegime: "Bullish expansion",
+      edgeGate: gateOf({ LONG: false }),
+    });
+    expect(report.controllerMode).toBe("NO_TRADE_NEGATIVE_EDGE");
+    expect(report.allowsLong).toBe(false);
+    expect(report.allowsNewEntries).toBe(false);
+    expect(report.directionalBias).toBe("NEUTRAL");
+    expect(report.edgeGated).toBe(true);
+    expect(report.reasonCodes).toContain("EDGE_PROVEN_NEGATIVE_LONG");
+  });
+
+  it("keeps LONG_ONLY when the gate allows the proven-positive LONG", () => {
+    const report = buildRegimeDirectionControllerReport({
+      currentRegime: "Bullish expansion",
+      edgeGate: gateOf({ LONG: true }),
+    });
+    expect(report.controllerMode).toBe("LONG_ONLY");
+    expect(report.allowsLong).toBe(true);
+    expect(report.allowsNewEntries).toBe(true);
+    expect(report.edgeGated).toBe(false);
+    expect(report.reasonCodes).toContain("EDGE_PROVEN_POSITIVE_LONG");
+  });
+
+  it("vetoes a proven-negative SHORT in Bearish expansion → NO_TRADE_NEGATIVE_EDGE", () => {
+    const report = buildRegimeDirectionControllerReport({
+      currentRegime: "Bearish expansion",
+      edgeGate: gateOf({ SHORT: false }),
+    });
+    expect(report.controllerMode).toBe("NO_TRADE_NEGATIVE_EDGE");
+    expect(report.allowsShort).toBe(false);
+    expect(report.allowsNewEntries).toBe(false);
+  });
+
+  it("no edge gate → pure naive mapping unchanged (back-compat)", () => {
+    const report = buildRegimeDirectionControllerReport({ currentRegime: "Bullish expansion" });
+    expect(report.controllerMode).toBe("LONG_ONLY");
+    expect(report.edgeGated).toBe(false);
+  });
+
+  it("lane rescue: negative SHORT aggregate is NOT vetoed when a positive lane exists", () => {
+    const gate = {
+      verdict(_r: string | null | undefined, _d: "LONG" | "SHORT") {
+        return { allowed: false, reasonCode: "EDGE_PROVEN_NEGATIVE", stat: { n: 2000, avgNetR: -0.2, winRate: 35 } };
+      },
+      hasPositiveLane(_r: string | null | undefined, d: "LONG" | "SHORT") {
+        return d === "SHORT"; // a positive SHORT lane exists
+      },
+    };
+    const report = buildRegimeDirectionControllerReport({ currentRegime: "Bearish expansion", edgeGate: gate });
+    expect(report.controllerMode).toBe("SHORT_ONLY"); // not NO_TRADE — rescued by the lane
+    expect(report.allowsShort).toBe(true);
+    expect(report.allowsNewEntries).toBe(true);
+    expect(report.reasonCodes).toContain("EDGE_LANE_RESCUE_SHORT");
+  });
+});

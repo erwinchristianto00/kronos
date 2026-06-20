@@ -4,6 +4,7 @@ import { mkdtempSync, existsSync } from "node:fs";
 import { join } from "node:path";
 
 import {
+  BULL_TREND_PAPER_LANE_ID,
   buildAdaptiveLaneRouterReport,
   rankCandidateLanes,
   classifyLaneMaturity,
@@ -162,8 +163,8 @@ describe("adaptive-lane-router", () => {
   });
 
   // 7. n<50 stays COLLECTING and cannot be STABLE_CANDIDATE.
-  it("[7] freshValid < 50 stays COLLECTING regardless of stats", () => {
-    const small = makeLane({ freshValid: 30, netAvgR: 0.3, pf: 2.0, oosAllPositive: true });
+  it("[7] freshValid below WATCHABLE threshold stays COLLECTING regardless of stats", () => {
+    const small = makeLane({ freshValid: 10, netAvgR: 0.3, pf: 2.0, oosAllPositive: true });
     const m = classifyLaneMaturity(small, false);
     expect(m).toBe("COLLECTING");
     expect(m).not.toBe("STABLE_CANDIDATE");
@@ -234,19 +235,17 @@ describe("adaptive-lane-router", () => {
     expect(vmStore.all.length).toBe(before);
   });
 
-  // 13. Bullish LONG_ONLY → CG lanes are SHORT and must not be selected.
-  it("[13] bullish LONG_ONLY: no CG lane selected; COLLECT_LONG_EVIDENCE; BEARISH map still shows CG advisory", () => {
+  // 13. Bullish LONG_ONLY selects the isolated pure-bull collection lane.
+  it("[13] bullish LONG_ONLY selects BULL_TREND collection while retaining bearish advisories", () => {
     const r = buildAdaptiveLaneRouterReport(routerInputs("Bullish expansion"));
     expect(r.regimeFamily).toBe("BULLISH");
     expect(r.controllerMode).toBe("LONG_ONLY");
-    // No direction-compatible lane exists → selected null.
-    expect(r.selectedCurrentLane).toBe("CG_LONG_VARIANT_MATRIX:CG_WIDE_STOP_TP_WIDE");
+    expect(r.selectedCurrentLane).toBe(BULL_TREND_PAPER_LANE_ID);
     expect(r.collectionAction).toBeNull();
     expect(r.currentPermission).toBe("SHADOW_ONLY");
     expect(r.rankedCandidates[0]!.directionBias).toBe("LONG");
     expect(r.rankedCandidates[0]!.maturity).toBe("INSUFFICIENT");
-    // BULL per-regime is consistent: no LONG lane → NO_TRADE.
-    expect(r.perRegimePolicy.BULLISH.recommendedLaneId).toBe("CG_LONG_VARIANT_MATRIX:CG_WIDE_STOP_TP_WIDE");
+    expect(r.perRegimePolicy.BULLISH.recommendedLaneId).toBe(BULL_TREND_PAPER_LANE_ID);
     expect(r.perRegimePolicy.BULLISH.permission).toBe("SHADOW_ONLY");
     // BEARISH per-regime still shows the CG advisory lane (SHORT qualifies for BEAR).
     expect(r.perRegimePolicy.BEARISH.recommendedLaneId).not.toBeNull();
@@ -255,15 +254,42 @@ describe("adaptive-lane-router", () => {
     expect(r.microPilotAllowed).toBe(false);
   });
 
+  it("[13b] bullish lane maturity counts realized paper OOS, not the zero-sample VM row", () => {
+    const now = "2026-06-12T00:00:00.000Z";
+    const paperOrders = Array.from({ length: 12 }, (_, index) => ({
+      selectedLaneId: BULL_TREND_PAPER_LANE_ID,
+      paperStatus: index < 8 ? "PAPER_CLOSED_WIN" : "PAPER_CLOSED_LOSS",
+      netR: index < 8 ? 1.39 : -1.11,
+      plannedStopDistanceBps: 200,
+      symbol: `SYM${index % 4}USDT`,
+      updatedAt: new Date(Date.parse(now) + index * 60_000).toISOString(),
+    }));
+    const r = buildAdaptiveLaneRouterReport({
+      ...routerInputs("Bullish expansion"),
+      paperOrders: paperOrders as never,
+    });
+    const bull = [
+      ...r.rankedCandidates,
+      ...r.experimentalUpsideCandidates,
+      ...r.collectingWatchlist,
+    ].find((candidate) => candidate.laneId === BULL_TREND_PAPER_LANE_ID);
+    expect(bull?.freshValid).toBe(12);
+    expect(bull?.netAvgR).toBeGreaterThan(0);
+    expect(bull?.pf).toBeGreaterThan(1);
+    expect(bull?.maturity).toBe("COLLECTING");
+    expect(r.experimentalUpsideCandidates.map((candidate) => candidate.laneId)).toContain(
+      BULL_TREND_PAPER_LANE_ID,
+    );
+  });
+
   // 14. Regime map BULL / current selection consistency: no contradiction.
-  it("[14] regime-map BULL=NO_TRADE is consistent with selected=null under LONG_ONLY", () => {
+  it("[14] regime-map BULL is consistent with the selected pure-bull lane", () => {
     const r = buildAdaptiveLaneRouterReport(routerInputs("Bullish expansion"));
     // The contradiction (BULL→NO_TRADE but a lane was selected) must not exist.
     expect(r.perRegimePolicy.BULLISH.permission).toBe("SHADOW_ONLY");
     expect(r.perRegimePolicy.BULLISH.recommendedLaneId).toBe(r.selectedCurrentLane);
     // Bearish advisory must show the CG lanes so the per-regime map is useful.
     expect(r.perRegimePolicy.BEARISH.recommendedLaneId).not.toBeNull();
-    // No LONG lane in the pipeline yet.
     expect(r.rankedCandidates.every((c) => c.directionBias === "LONG")).toBe(true);
   });
 
@@ -392,12 +418,12 @@ describe("adaptive-lane-router", () => {
     expect(brief.split("\n").length).toBeLessThanOrEqual(OPERATOR_BRIEF_MAX_LINES);
   });
 
-  // [22] Lane n<50 with negative economics → isWatchlist=true, placed in collectingWatchlist
-  it("[22] lane n<50 with negative netAvgR → isWatchlist=true, placed in collectingWatchlist", () => {
+  // [22] Lane below WATCHABLE threshold with negative economics → isWatchlist=true, in collectingWatchlist
+  it("[22] immature lane with negative netAvgR → isWatchlist=true, placed in collectingWatchlist", () => {
     const negLane = makeLane({
       laneId: "NEGATIVE_ECON_LANE",
       directionBias: "SHORT",
-      freshValid: 30,
+      freshValid: 10,
       netAvgR: -0.05,
       pf: 0.9,
       oosAllPositive: false,
@@ -440,7 +466,7 @@ describe("adaptive-lane-router", () => {
     const negLane = makeLane({
       laneId: "WATCHLIST_ONLY_LANE",
       directionBias: "SHORT",
-      freshValid: 20,
+      freshValid: 10,
       netAvgR: -0.1,
       pf: 0.8,
       oosAllPositive: false,

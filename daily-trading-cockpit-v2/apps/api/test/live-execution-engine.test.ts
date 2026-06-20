@@ -4,13 +4,23 @@ import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import { BinanceFuturesPrivateError, type FuturesOrder, type FuturesSymbolFilters, type FuturesUserTrade, type PlaceOrderParams } from "../src/lib/binance-futures-private.js";
+import {
+  BinanceFuturesPrivateError,
+  type FuturesAlgoOrder,
+  type FuturesOrder,
+  type FuturesSymbolFilters,
+  type FuturesUserTrade,
+  type PlaceAlgoOrderParams,
+  type PlaceOrderParams,
+} from "../src/lib/binance-futures-private.js";
 import {
   LiveExecutionEngine,
   LiveExecutionStore,
   computeLiveOrderPlan,
   parseLiveExecutionConfig,
   roundDownToStep,
+  roundStopToSafeSide,
+  roundUpToStep,
   type LiveExecutionConfig,
   type LivePrivateClient,
   type PaperStoreReader,
@@ -49,6 +59,12 @@ class FakeLiveClient {
   trades: FuturesUserTrade[] = [];
   hedge = false;
   failNextTicks = 0;
+  /** When set, non-reduce MARKET entries fill at this avgPrice (else 2000) — used to simulate gap-through. */
+  marketFillPrice: number | null = null;
+  /** When set, every placeAlgoOrder throws a Binance rejection with this code (e.g. -2021). */
+  algoErrorCode: number | null = null;
+  /** When set, each reduce-only MARKET flatten books a userTrade with this realizedPnl on its own order id. */
+  flattenRealizedPnl: number | null = null;
   private nextOrderId = 1000;
 
   async ensureTimeSync(): Promise<void> {
@@ -64,13 +80,13 @@ class FakeLiveClient {
     return new Map([["ETHUSDT", FILTERS]]);
   }
   async getBalances() {
-    return [];
+    return [{ asset: "USDT", balance: 5000, availableBalance: 4500 }];
   }
   async getPositions(symbol?: string) {
     const out = [];
     for (const [sym, amt] of this.positionsBySymbol) {
       if (symbol && sym !== symbol) continue;
-      out.push({ symbol: sym, positionAmt: amt, entryPrice: 0, unRealizedProfit: 0, leverage: 2, marginType: "ISOLATED" });
+      out.push({ symbol: sym, positionAmt: amt, entryPrice: 2000, unRealizedProfit: 0, leverage: 2, marginType: "ISOLATED" });
     }
     return out;
   }
@@ -82,6 +98,22 @@ class FakeLiveClient {
   async getOpenOrders() {
     return [];
   }
+  async getOpenAlgoOrders() {
+    return [];
+  }
+  async queryAlgoOrder(_algoId: number): Promise<FuturesAlgoOrder> {
+    return {
+      symbol: "ETHUSDT",
+      algoId: _algoId,
+      clientAlgoId: "",
+      algoStatus: "NEW",
+      orderType: "STOP_MARKET",
+      side: "BUY",
+      quantity: 0,
+      triggerPrice: 0,
+      actualOrderId: _algoId,
+    };
+  }
   async queryOrder(_symbol: string, orderId: number): Promise<FuturesOrder> {
     return this.stubOrder({ orderId, status: this.orderStatusById.get(orderId) ?? "NEW" });
   }
@@ -89,17 +121,57 @@ class FakeLiveClient {
     this.placed.push(p);
     const orderId = this.nextOrderId++;
     if (p.type === "MARKET" && !p.reduceOnly) {
-      this.positionsBySymbol.set(p.symbol, (p.side === "BUY" ? 1 : -1) * p.quantity);
+      this.positionsBySymbol.set(
+        p.symbol,
+        (this.positionsBySymbol.get(p.symbol) ?? 0) + (p.side === "BUY" ? 1 : -1) * p.quantity,
+      );
     }
     if (p.type === "MARKET" && p.reduceOnly) {
       this.positionsBySymbol.set(p.symbol, 0);
+      if (this.flattenRealizedPnl != null) {
+        this.trades.push({ symbol: p.symbol, orderId, price: 0, qty: p.quantity, realizedPnl: this.flattenRealizedPnl, commission: 0, commissionAsset: "USDT", time: 1 });
+      }
     }
-    return this.stubOrder({ orderId, status: "FILLED", avgPrice: p.type === "MARKET" ? 2000 : 0 });
+    const entryFill = this.marketFillPrice ?? 2000;
+    return this.stubOrder({ orderId, status: "FILLED", avgPrice: p.type === "MARKET" && !p.reduceOnly ? entryFill : 0 });
+  }
+  async placeAlgoOrder(p: PlaceAlgoOrderParams): Promise<FuturesAlgoOrder> {
+    if (this.algoErrorCode != null) {
+      throw new BinanceFuturesPrivateError("binance_error", `algo rejected ${this.algoErrorCode}`, { binanceCode: this.algoErrorCode, httpStatus: 400 });
+    }
+    this.placed.push({
+      symbol: p.symbol,
+      side: p.side,
+      type: p.type,
+      quantity: p.quantity,
+      stopPrice: p.triggerPrice,
+      reduceOnly: p.reduceOnly,
+      workingType: p.workingType,
+      newClientOrderId: p.clientAlgoId,
+    });
+    const algoId = this.nextOrderId++;
+    return {
+      symbol: p.symbol,
+      algoId,
+      clientAlgoId: p.clientAlgoId ?? "",
+      algoStatus: "NEW",
+      orderType: p.type,
+      side: p.side,
+      quantity: p.quantity,
+      triggerPrice: p.triggerPrice,
+      actualOrderId: null,
+    };
   }
   async cancelOrder(symbol: string, orderId: number): Promise<void> {
     this.canceled.push({ symbol, orderId });
   }
+  async cancelAlgoOrder(orderId: number): Promise<void> {
+    this.canceled.push({ symbol: "ETHUSDT", orderId });
+  }
   async cancelAllOrders(symbol: string): Promise<void> {
+    this.cancelAllSymbols.push(symbol);
+  }
+  async cancelAllAlgoOrders(symbol: string): Promise<void> {
     this.cancelAllSymbols.push(symbol);
   }
   async getUserTrades(): Promise<FuturesUserTrade[]> {
@@ -160,6 +232,7 @@ function makeConfig(overrides: Partial<LiveExecutionConfig> = {}): LiveExecution
     maxDrawdownUsd: 40,
     maxLeverage: 2,
     maxNotionalPerTrade: 250,
+    mirrorAllPaperOrders: false,
     autoArm: false,
     mainnetConfirmed: false,
     configErrors: [],
@@ -216,6 +289,21 @@ describe("parseLiveExecutionConfig", () => {
       parseLiveExecutionConfig({ LIVE_EXECUTION_ENABLED: "1", LIVE_BINANCE_ENV: "mainnet", LIVE_BINANCE_API_KEY: "k", LIVE_BINANCE_API_SECRET: "s", LIVE_AUTO_ARM: "1", LIVE_MAINNET_CONFIRM: "I_UNDERSTAND_REAL_MONEY" }).autoArm,
     ).toBe(false);
   });
+
+  it("mirror-all is testnet-only", () => {
+    const base = {
+      LIVE_EXECUTION_ENABLED: "1",
+      LIVE_BINANCE_API_KEY: "k",
+      LIVE_BINANCE_API_SECRET: "s",
+      LIVE_MIRROR_ALL_PAPER: "1",
+    };
+    expect(parseLiveExecutionConfig({ ...base, LIVE_BINANCE_ENV: "testnet" }).mirrorAllPaperOrders).toBe(true);
+    expect(parseLiveExecutionConfig({
+      ...base,
+      LIVE_BINANCE_ENV: "mainnet",
+      LIVE_MAINNET_CONFIRM: "I_UNDERSTAND_REAL_MONEY",
+    }).mirrorAllPaperOrders).toBe(false);
+  });
 });
 
 // ── sizing ───────────────────────────────────────────────────────────────────
@@ -264,6 +352,16 @@ describe("computeLiveOrderPlan", () => {
   it("roundDownToStep avoids float artifacts", () => {
     expect(roundDownToStep(0.0500000001, 0.001)).toBeCloseTo(0.05, 12);
     expect(roundDownToStep(2.5000000004, 0.1)).toBeCloseTo(2.5, 12);
+  });
+
+  it("roundStopToSafeSide rounds the stop AWAY from the fill (SHORT up, LONG down) — never -2021", () => {
+    // The adversarial case: coarse tick + tiny stop distance. A SHORT buy-stop at 50005 must round
+    // UP to 50010 (strictly above the 50000 fill), NOT down to 50000 (== fill → -2021).
+    expect(roundStopToSafeSide("SHORT", 50005, 10)).toBe(50010);
+    // A LONG sell-stop rounds DOWN, staying strictly below the fill.
+    expect(roundStopToSafeSide("LONG", 49995, 10)).toBe(49990);
+    expect(roundUpToStep(50000.0001, 10)).toBe(50010);
+    expect(roundUpToStep(50000, 10)).toBe(50000); // exact multiple is unchanged
   });
 });
 
@@ -349,6 +447,42 @@ describe("LiveExecutionEngine", () => {
     expect(client.placed.filter((p) => p.type === "MARKET" && !p.reduceOnly).length).toBe(1);
   });
 
+  it("testnet mirror-all backfills diagnostic lanes and nets same-symbol orders", async () => {
+    const orders = [
+      paperOrder({
+        paperOrderId: "paper-lane-a",
+        selectedLaneId: "LANE_A",
+        paperOrderMode: "DIAGNOSTIC_ONLY",
+        createdAt: "2000-01-01T00:00:00.000Z",
+      } as Partial<PaperOrder>),
+      paperOrder({
+        paperOrderId: "paper-lane-b",
+        selectedLaneId: "LANE_B",
+        paperOrderMode: "DIAGNOSTIC_ONLY",
+        createdAt: "2000-01-01T00:01:00.000Z",
+      } as Partial<PaperOrder>),
+    ];
+    const { engine, client, store } = makeEngine({
+      paper: makePaperStore(orders),
+      config: { mirrorAllPaperOrders: true },
+    });
+    await engine.arm();
+    await engine.tick();
+
+    const entries = client.placed.filter((order) => order.type === "MARKET" && !order.reduceOnly);
+    expect(entries).toHaveLength(1);
+    expect(entries[0]!.quantity).toBeCloseTo(0.1, 9);
+    expect(store.getState().intents[0]!.sourcePaperOrders).toEqual([
+      { paperOrderId: "paper-lane-a", laneId: "LANE_A", qty: 0.05 },
+      { paperOrderId: "paper-lane-b", laneId: "LANE_B", qty: 0.05 },
+    ]);
+
+    const account = await engine.getAccountSnapshot();
+    expect(account.openPositionCount).toBe(1);
+    expect(account.accountEquity).toBe(5000);
+    expect(account.lanes.map((lane) => lane.laneId)).toEqual(["LANE_A", "LANE_B"]);
+  });
+
   it("kill-switch on daily loss: cancels, flattens, disarms, latches", async () => {
     const order = paperOrder();
     const { engine, client, store } = makeEngine({ paper: makePaperStore([order]) });
@@ -404,5 +538,165 @@ describe("LiveExecutionEngine", () => {
     const result = await engine.arm();
     expect(result.ok).toBe(false);
     expect(result.reason).toMatch(/hedge/);
+  });
+
+  // ── churn regression (the INJUSDT −$865 incident) ──────────────────────────
+
+  it("Fault A: protective stop is placed at the repriced fill, not the stale paper stop (no -2021)", async () => {
+    // LONG paper: entry 2000, stop 1900 (5%). But the live MARKET fills at 1850 — already BELOW
+    // the paper stop. The old code placed the sell-stop at 1900 (above the fill) → Binance -2021.
+    const order = paperOrder({ direction: "LONG", entryPrice: 2000, stopLoss: 1900, takeProfitLevels: [2100] } as Partial<PaperOrder>);
+    const client = new FakeLiveClient();
+    client.marketFillPrice = 1850;
+    const { engine, store } = makeEngine({ client, paper: makePaperStore([order]) });
+    await engine.arm();
+    await engine.tick();
+
+    const stop = client.placed.find((p) => p.type === "STOP_MARKET");
+    expect(stop).toBeDefined();
+    // Repriced stop = 1850 × (1 − 0.05) = 1757.5 — strictly BELOW the fill (correct side), not 1900.
+    expect(stop!.stopPrice!).toBeLessThan(1850);
+    expect(stop!.stopPrice!).toBeCloseTo(1757.5, 1);
+    expect(store.getState().intents[0]!.state).toBe("OPEN");
+  });
+
+  it("Fault B: a paper order whose open keeps failing is quarantined — bounded retries, not infinite churn", async () => {
+    const order = paperOrder({
+      direction: "LONG",
+      entryPrice: 2000,
+      stopLoss: 1900,
+      takeProfitLevels: [2100],
+      paperStatus: "PAPER_SUBMITTED",
+    } as Partial<PaperOrder>);
+    const client = new FakeLiveClient();
+    client.algoErrorCode = -2021; // protective stop always rejected → emergency flatten → ERROR every attempt
+    // mirrorAll reproduces the real incident: it BYPASSES the createdAt watermark (the first line of
+    // defence), so only the attempt latch can stop the churn.
+    const { engine } = makeEngine({ client, paper: makePaperStore([order]), config: { mirrorAllPaperOrders: true } });
+    await engine.arm();
+
+    // The original bug re-opened every tick forever; the latch must cap it at MAX_MIRROR_ATTEMPTS.
+    for (let i = 0; i < 10; i += 1) await engine.tick();
+    const entries = client.placed.filter((p) => p.type === "MARKET" && !p.reduceOnly);
+    expect(entries.length).toBeLessThanOrEqual(2);
+    expect(engine.getStatus().quarantinedPaperOrders).toBe(1);
+  });
+
+  it("Fault C: an emergency flatten books its realized loss into the ledger and loss streak", async () => {
+    const order = paperOrder({
+      direction: "LONG",
+      entryPrice: 2000,
+      stopLoss: 1900,
+      takeProfitLevels: [2100],
+      paperStatus: "PAPER_SUBMITTED",
+    } as Partial<PaperOrder>);
+    const client = new FakeLiveClient();
+    client.algoErrorCode = -2021;
+    client.flattenRealizedPnl = -3; // the reduce-only flatten realizes a $3 loss
+    const { engine, store } = makeEngine({ client, paper: makePaperStore([order]) });
+    await engine.arm();
+    await engine.tick();
+
+    // The old catch block flattened SILENTLY — the breakers never saw it. Now they must.
+    expect(store.getState().consecutiveLosses).toBe(1);
+    expect(store.getState().dailyLedger.realizedPnlUsd).toBeCloseTo(-3, 6);
+    expect(store.getState().dailyLedger.losses).toBe(1);
+  });
+
+  it("five churn flattens trip the consecutive-loss kill-switch (defense in depth with the latch)", async () => {
+    // Five distinct freefall paper orders, each flattening at a loss, must reach the 5-loss kill.
+    const orders = Array.from({ length: 6 }, (_unused, i) =>
+      paperOrder({
+        paperOrderId: `paper-churn-${i}`,
+        symbol: `SYM${i}USDT`,
+        direction: "LONG",
+        entryPrice: 2000,
+        stopLoss: 1900,
+        takeProfitLevels: [2100],
+        paperStatus: "PAPER_SUBMITTED",
+      } as Partial<PaperOrder>),
+    );
+    const client = new FakeLiveClient();
+    // Each symbol needs a filter; reuse ETH filters for all by overriding getExchangeFilters.
+    client.getExchangeFilters = async () =>
+      new Map(orders.map((o) => [o.symbol, { ...FILTERS, symbol: o.symbol }]));
+    client.algoErrorCode = -2021;
+    client.flattenRealizedPnl = -3;
+    const { engine, store } = makeEngine({
+      client,
+      paper: makePaperStore(orders),
+      // Raise the daily/drawdown limits so this test isolates the CONSECUTIVE-loss breaker
+      // specifically (with defaults the daily-loss breaker would trip first — also correct).
+      config: { mirrorAllPaperOrders: true, maxConcurrentPositions: 10, maxConsecutiveLosses: 5, dailyMaxLossUsd: 999, maxDrawdownUsd: 999 },
+    });
+    await engine.arm();
+    await engine.tick(); // opens (and flattens) all six → ≥5 consecutive losses recorded
+    await engine.tick(); // next tick: killSwitchTrip sees the streak and engages
+
+    expect(store.getState().killedAt).not.toBeNull();
+    expect(store.getState().killReason).toMatch(/consecutive losses/);
+    expect(engine.isArmed()).toBe(false);
+  });
+
+  it("a failed addToIntent flattens the now-naked position (never left OPEN with a canceled stop) and latches the add", async () => {
+    // Tick 1 opens p1 cleanly. Then a second same-symbol same-direction signal arrives and the
+    // add's replacement stop is rejected -2021 — the position is naked the instant the old stop
+    // is canceled, so it MUST be flattened, not left OPEN.
+    const orders: PaperOrder[] = [
+      paperOrder({
+        paperOrderId: "p1",
+        direction: "LONG",
+        entryPrice: 2000,
+        stopLoss: 1900,
+        takeProfitLevels: [2100],
+        paperStatus: "PAPER_SUBMITTED",
+        createdAt: "2099-01-02T00:00:00.000Z",
+      } as Partial<PaperOrder>),
+    ];
+    const client = new FakeLiveClient();
+    const { engine, store } = makeEngine({ client, paper: makePaperStore(orders), config: { mirrorAllPaperOrders: true } });
+    await engine.arm();
+    await engine.tick();
+    expect(store.getState().intents[0]!.state).toBe("OPEN");
+    const placedBefore = client.placed.length;
+
+    orders.push(
+      paperOrder({
+        paperOrderId: "p2",
+        direction: "LONG",
+        entryPrice: 2000,
+        stopLoss: 1900,
+        takeProfitLevels: [2100],
+        paperStatus: "PAPER_SUBMITTED",
+        createdAt: "2099-01-02T01:00:00.000Z",
+      } as Partial<PaperOrder>),
+    );
+    client.algoErrorCode = -2021; // the add's replacement stop is rejected
+    client.flattenRealizedPnl = -2;
+    await engine.tick();
+
+    const intent = store.getState().intents[0]!;
+    expect(intent.state).toBe("ERROR"); // NOT left OPEN with a canceled stop
+    expect(intent.closeReason).toBe("EMERGENCY_FLATTEN_ADD_FAILED");
+    const after = client.placed.slice(placedBefore);
+    expect(after.some((p) => p.type === "MARKET" && p.reduceOnly)).toBe(true); // position flattened
+    expect(store.getState().consecutiveLosses).toBeGreaterThanOrEqual(1); // loss booked
+    expect(store.getState().mirrorAttempts.p2 ?? 0).toBeGreaterThanOrEqual(1); // add path latched
+  });
+
+  it("auto-arm does NOT punch through a latched kill on restart", () => {
+    const store = new LiveExecutionStore(tmp());
+    store.getState().killedAt = "2099-01-01T00:00:00.000Z";
+    store.getState().killReason = "test latch survives restart";
+    store.save();
+    const engine = new LiveExecutionEngine({
+      config: makeConfig({ autoArm: true }),
+      client: new FakeLiveClient() as unknown as LivePrivateClient,
+      store,
+      paperStore: makePaperStore([]),
+      nowIso: () => "2099-01-02T12:00:00.000Z",
+    });
+    // A restart with auto-arm on must stay disarmed while the kill is latched.
+    expect(engine.isArmed()).toBe(false);
   });
 });

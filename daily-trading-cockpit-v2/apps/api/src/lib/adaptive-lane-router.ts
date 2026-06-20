@@ -15,22 +15,26 @@
 
 import type { RegimeDirectionControllerReport, RegimeDirectionMode } from "./regime-direction-controller.js";
 import type { PostCutoverReport } from "./frozen-current-guard-post-cutover.js";
-import type { CurrentGuardVariantMatrixReport } from "./current-guard-variant-matrix.js";
-import type { LiveTradingGateReport } from "./live-trading-gate.js";
-import type { ShadowLaneScoreboard } from "./shadow-lane-scoreboard.js";
 import {
-  WATCHABLE_MIN_FRESH,
-  STABLE_MIN_FRESH,
-  PROMOTION_MIN_FRESH,
-  NET_STRONG_R,
-  PF_STRONG,
-  PAYOFF_STABLE,
+  BULL_TREND_VARIANT_ID,
   MAX_DRAWDOWN_R_LIMIT,
   MAX_TOP_SYMBOL_SHARE,
+  NET_STRONG_R,
+  PAYOFF_STABLE,
+  PF_STRONG,
+  PROMOTION_MIN_FRESH,
+  STABLE_MIN_FRESH,
+  VARIANT_MATRIX_DEFINITIONS,
+  WATCHABLE_MIN_FRESH,
+  type CurrentGuardVariantMatrixReport,
 } from "./current-guard-variant-matrix.js";
+import type { LiveTradingGateReport } from "./live-trading-gate.js";
+import type { PaperOrder } from "./paper-execution-router.js";
+import type { ShadowLaneScoreboard } from "./shadow-lane-scoreboard.js";
 
 export const ADAPTIVE_LANE_ROUTER_LANE = "ADAPTIVE_LANE_ROUTER_V1" as const;
 export const LONG_WIDE_PAPER_LANE_ID = "CG_LONG_VARIANT_MATRIX:CG_WIDE_STOP_TP_WIDE" as const;
+export const BULL_TREND_PAPER_LANE_ID = `CG_LONG_VARIANT_MATRIX:${BULL_TREND_VARIANT_ID}` as const;
 
 // ── public enums ──────────────────────────────────────────────────────────────
 
@@ -460,7 +464,11 @@ function buildRegimePolicyEntry(regime: RegimeFamily, ranked: RankedCandidate[])
 
   // MIXED: qualifying only contains NEUTRAL lanes. Also include bearish/SHORT
   // lanes as advisory (with a mismatch flag) so the map is still informative.
-  const allForMixed = ranked.filter((l) => l.directionBias !== "UNKNOWN");
+  const allForMixed = ranked.filter(
+    (lane) =>
+      lane.directionBias !== "UNKNOWN" &&
+      (lane.regimeFamily === "ANY" || lane.regimeFamily === "MIXED"),
+  );
   const mixedTop = (mature ?? qualifying[0]) || allForMixed[0] || null;
   return {
     regime,
@@ -490,7 +498,7 @@ function computeCurrentPermission(
   // Even without a direction-compatible lane we stay in shadow-collecting mode,
   // not a hard NO_TRADE stop — the other-direction lanes keep collecting.
   if (!selected) return "SHADOW_ONLY";
-  if (mode === "LONG_ONLY" && selected.laneId === LONG_WIDE_PAPER_LANE_ID) return "SHADOW_ONLY";
+  if (mode === "LONG_ONLY" && selected.directionBias === "LONG") return "SHADOW_ONLY";
   const mr = maturityRank(selected.maturity);
   if (mr >= 3 /* STABLE+ */ && infraReady && !liveBlocked) return "PAPER_ELIGIBLE"; // never while blocked
   if (mr >= 1 /* COLLECTING+ */) return "SHADOW_ONLY";
@@ -521,45 +529,127 @@ function laneFromPostCutover(pc: PostCutoverReport): CandidateLane {
   };
 }
 
-function lanesFromVariantMatrix(vm: CurrentGuardVariantMatrixReport): CandidateLane[] {
-  return vm.rows.map((row) => ({
-    laneId: `CG_VARIANT_MATRIX:${row.variantId}`,
-    source: "VARIANT_MATRIX",
-    // Variant-matrix lanes replay current-guard signals whose evidence is
-    // primarily bearish/short-regime; treat them as SHORT unless proven bullish.
-    directionBias: "SHORT" as const,
-    regimeFamily: "ANY" as const,
-    freshValid: row.freshValid,
-    netAvgR: row.netAvgR,
-    pf: row.pf,
-    wr: row.wr,
-    payoffRatio: row.payoffRatio,
-    oosAllPositive: row.allThreeOosPositive,
-    plus10bpsPositive: row.plus10bpsStillPositive,
-    maxDrawdownR: row.approxMaxDrawdownR,
-    topSymbolShare: row.topSymbolPnlShare,
-    status: row.status,
-    blockers: row.blockers ?? [],
-  }));
+function paperEvidenceForLane(
+  laneId: string,
+  orders: readonly PaperOrder[],
+): Partial<CandidateLane> | null {
+  const closed = orders
+    .filter(
+      (order) =>
+        order.selectedLaneId === laneId &&
+        (order.paperStatus === "PAPER_CLOSED_WIN" || order.paperStatus === "PAPER_CLOSED_LOSS") &&
+        typeof order.netR === "number" &&
+        Number.isFinite(order.netR),
+    )
+    .sort((a, b) => a.updatedAt.localeCompare(b.updatedAt));
+  if (closed.length === 0) return null;
+
+  const nets = closed.map((order) => order.netR as number);
+  const wins = nets.filter((value) => value > 0);
+  const losses = nets.filter((value) => value < 0);
+  const positive = wins.reduce((sum, value) => sum + value, 0);
+  const negative = losses.reduce((sum, value) => sum + Math.abs(value), 0);
+  const netAvgR = nets.reduce((sum, value) => sum + value, 0) / nets.length;
+  const stressedNetAvgR = closed.reduce((sum, order) => {
+    const stressR = order.plannedStopDistanceBps > 0 ? 10 / order.plannedStopDistanceBps : 0;
+    return sum + (order.netR as number) - stressR;
+  }, 0) / closed.length;
+  const averageWin = wins.length > 0 ? positive / wins.length : 0;
+  const averageLoss = losses.length > 0 ? negative / losses.length : 0;
+
+  let cumulative = 0;
+  let peak = 0;
+  let maxDrawdownR = 0;
+  for (const net of nets) {
+    cumulative += net;
+    peak = Math.max(peak, cumulative);
+    maxDrawdownR = Math.max(maxDrawdownR, peak - cumulative);
+  }
+
+  const thirds = [0, 1, 2].map((index) => {
+    const start = Math.floor((closed.length * index) / 3);
+    const end = Math.floor((closed.length * (index + 1)) / 3);
+    const slice = nets.slice(start, end);
+    return slice.length > 0 ? slice.reduce((sum, value) => sum + value, 0) / slice.length : null;
+  });
+  const pnlBySymbol = new Map<string, number>();
+  for (const order of closed) {
+    pnlBySymbol.set(order.symbol, (pnlBySymbol.get(order.symbol) ?? 0) + (order.netR as number));
+  }
+  const positiveSymbolPnl = [...pnlBySymbol.values()].filter((value) => value > 0);
+  const positiveTotal = positiveSymbolPnl.reduce((sum, value) => sum + value, 0);
+  const topSymbolShare = positiveTotal > 0
+    ? Math.max(...positiveSymbolPnl, 0) / positiveTotal
+    : null;
+
+  return {
+    freshValid: closed.length,
+    netAvgR,
+    pf: negative > 0 ? positive / negative : positive > 0 ? Infinity : null,
+    wr: wins.length / closed.length,
+    payoffRatio: averageLoss > 0 ? averageWin / averageLoss : averageWin > 0 ? Infinity : null,
+    oosAllPositive: closed.length >= 3 && thirds.every((value) => value !== null && value > 0),
+    plus10bpsPositive: stressedNetAvgR > 0,
+    maxDrawdownR,
+    topSymbolShare,
+    status: "COLLECTING",
+    blockers: closed.length < WATCHABLE_MIN_FRESH
+      ? [`paper OOS below WATCHABLE threshold (n=${closed.length}/${WATCHABLE_MIN_FRESH})`]
+      : [],
+  };
 }
 
-function longPaperCollectionLane(): CandidateLane {
+function lanesFromVariantMatrix(
+  vm: CurrentGuardVariantMatrixReport,
+  paperOrders: readonly PaperOrder[],
+): CandidateLane[] {
+  return vm.rows.map((row) => {
+    const definition = VARIANT_MATRIX_DEFINITIONS.find((candidate) => candidate.id === row.variantId);
+    const longOnly = definition?.longOnly === true;
+    const laneId = longOnly
+        ? `CG_LONG_VARIANT_MATRIX:${row.variantId}`
+        : `CG_VARIANT_MATRIX:${row.variantId}`;
+    const paperEvidence = longOnly ? paperEvidenceForLane(laneId, paperOrders) : null;
+    return {
+      laneId,
+      source: "VARIANT_MATRIX",
+      // Generic current-guard rows are bearish/SHORT evidence. Explicit long-only
+      // definitions get an isolated LONG+BULLISH lane and never borrow SHORT stats.
+      directionBias: longOnly ? "LONG" as const : "SHORT" as const,
+      regimeFamily: longOnly ? "BULLISH" as const : "ANY" as const,
+      freshValid: paperEvidence?.freshValid ?? row.freshValid,
+      netAvgR: paperEvidence?.netAvgR ?? row.netAvgR,
+      pf: paperEvidence?.pf ?? row.pf,
+      wr: paperEvidence?.wr ?? row.wr,
+      payoffRatio: paperEvidence?.payoffRatio ?? row.payoffRatio,
+      oosAllPositive: paperEvidence?.oosAllPositive ?? row.allThreeOosPositive,
+      plus10bpsPositive: paperEvidence?.plus10bpsPositive ?? row.plus10bpsStillPositive,
+      maxDrawdownR: paperEvidence?.maxDrawdownR ?? row.approxMaxDrawdownR,
+      topSymbolShare: paperEvidence?.topSymbolShare ?? row.topSymbolPnlShare,
+      status: paperEvidence?.status ?? row.status,
+      blockers: paperEvidence?.blockers ?? row.blockers ?? [],
+    };
+  });
+}
+
+function longPaperCollectionLane(paperOrders: readonly PaperOrder[]): CandidateLane {
+  const paperEvidence = paperEvidenceForLane(LONG_WIDE_PAPER_LANE_ID, paperOrders);
   return {
     laneId: LONG_WIDE_PAPER_LANE_ID,
     source: "LONG_PAPER_DIAGNOSTIC",
     directionBias: "LONG",
     regimeFamily: "BULLISH",
-    freshValid: 0,
-    netAvgR: null,
-    pf: null,
-    wr: null,
-    payoffRatio: null,
-    oosAllPositive: false,
-    plus10bpsPositive: false,
-    maxDrawdownR: null,
-    topSymbolShare: null,
-    status: "COLLECTING",
-    blockers: ["LONG OOS evidence below WATCHABLE threshold (n<50)"],
+    freshValid: paperEvidence?.freshValid ?? 0,
+    netAvgR: paperEvidence?.netAvgR ?? null,
+    pf: paperEvidence?.pf ?? null,
+    wr: paperEvidence?.wr ?? null,
+    payoffRatio: paperEvidence?.payoffRatio ?? null,
+    oosAllPositive: paperEvidence?.oosAllPositive ?? false,
+    plus10bpsPositive: paperEvidence?.plus10bpsPositive ?? false,
+    maxDrawdownR: paperEvidence?.maxDrawdownR ?? null,
+    topSymbolShare: paperEvidence?.topSymbolShare ?? null,
+    status: paperEvidence?.status ?? "COLLECTING",
+    blockers: paperEvidence?.blockers ?? ["LONG OOS evidence below WATCHABLE threshold (n<50)"],
   };
 }
 
@@ -593,6 +683,8 @@ export interface AdaptiveLaneRouterInputs {
   variantMatrixReport?: CurrentGuardVariantMatrixReport;
   gateReport: LiveTradingGateReport;
   scoreboardReport?: ShadowLaneScoreboard;
+  /** Optional paper book used as the authoritative OOS source for LONG lanes. */
+  paperOrders?: readonly PaperOrder[];
 }
 
 export function buildAdaptiveLaneRouterReport(
@@ -612,8 +704,9 @@ export function buildAdaptiveLaneRouterReport(
   // Build candidate lanes from the evidence reports.
   const candidates: CandidateLane[] = [];
   if (postCutoverReport) candidates.push(laneFromPostCutover(postCutoverReport));
-  if (variantMatrixReport) candidates.push(...lanesFromVariantMatrix(variantMatrixReport));
-  candidates.push(longPaperCollectionLane());
+  const paperOrders = inputs.paperOrders ?? [];
+  if (variantMatrixReport) candidates.push(...lanesFromVariantMatrix(variantMatrixReport, paperOrders));
+  candidates.push(longPaperCollectionLane(paperOrders));
   if (inputs.scoreboardReport) candidates.push(...legacyLanesFromScoreboard(inputs.scoreboardReport));
 
   const { ranked, experimental, collectingWatchlist, rejected } = rankCandidateLanes(candidates, {
@@ -640,7 +733,7 @@ export function buildAdaptiveLaneRouterReport(
       `(compatible with ${controllerMode}); maturity=${selected.maturity}` +
       `, n=${selected.freshValid}; advisory ${currentPermission}.`
     : controllerMode === "LONG_ONLY"
-    ? `No LONG-compatible lane is selectable yet; ${LONG_WIDE_PAPER_LANE_ID} remains paper-diagnostic evidence collection only.`
+    ? `No LONG-compatible lane is selectable yet; ${BULL_TREND_PAPER_LANE_ID} and ${LONG_WIDE_PAPER_LANE_ID} remain paper-diagnostic evidence collection only.`
     : controllerMode === "SHORT_ONLY"
     ? "No mature SHORT-compatible lane exists. Collecting SHORT evidence."
     : `No compatible candidate lane meets the WATCHABLE gates under mode ${controllerMode}; collecting evidence.`;
@@ -675,13 +768,9 @@ export function buildAdaptiveLaneRouterReport(
 
   // Next required evidence — scan ALL advisory lanes regardless of current mode.
   const nextRequiredEvidence: string[] = [];
-  if (
-    controllerMode === "LONG_ONLY" &&
-    selected?.laneId === LONG_WIDE_PAPER_LANE_ID &&
-    maturityRank(selected.maturity) < 2
-  ) {
+  if (controllerMode === "LONG_ONLY" && selected?.directionBias === "LONG" && maturityRank(selected.maturity) < 2) {
     nextRequiredEvidence.push(
-      `${LONG_WIDE_PAPER_LANE_ID}: collect LONG paper OOS ${selected.freshValid}/${WATCHABLE_MIN_FRESH} -> WATCHABLE`,
+      `${selected.laneId}: collect bullish LONG paper OOS ${selected.freshValid}/${WATCHABLE_MIN_FRESH} -> WATCHABLE`,
     );
   } else if (collectionAction === "COLLECT_LONG_EVIDENCE") {
     nextRequiredEvidence.push("No LONG-compatible lane available — collect LONG evidence.");

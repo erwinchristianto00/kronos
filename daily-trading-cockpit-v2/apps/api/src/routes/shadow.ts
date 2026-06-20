@@ -38,6 +38,7 @@ import {
 } from "../lib/frozen-current-guard-post-cutover.js";
 import { buildDashboardAuditSummaryReport, type DashboardAuditSummaryEra } from "../lib/dashboard-audit-summary.js";
 import { buildRegimeDirectionControllerReport } from "../lib/regime-direction-controller.js";
+import { getRegimeEdgeMemory } from "../lib/regime-edge-memory.js";
 import { buildLiveTradingGateReport } from "../lib/live-trading-gate.js";
 import { buildOperatorBrief } from "../lib/operator-brief.js";
 import { buildAdaptiveLaneRouterReport } from "../lib/adaptive-lane-router.js";
@@ -1120,10 +1121,15 @@ export async function registerShadowRoutes(
       const generatedAt = new Date().toISOString();
       const scanStatus = opts.coreScanAutoRefreshController?.getStatus() ?? null;
       const currentRegime = scanStatus?.lastAutoRefreshResultSummary?.marketRegime ?? null;
+      // Honest-edge gate: the controllerMode this produces flows into the
+      // adaptive lane router → paper allocator → admission, so a direction with
+      // proven-negative honest edge is hard-vetoed before any order is created.
+      const edgeMemory = getRegimeEdgeMemory();
       const regimeReport = buildRegimeDirectionControllerReport({
         currentRegime,
         adaptiveDirectionBias: null,
         primaryValidationLane: null,
+        edgeGate: edgeMemory,
       });
       // ── ?resolve=1: bounded resolver run before building brief ─────────────
       // When resolve=1 is supplied and a Binance client is available, the
@@ -1199,6 +1205,7 @@ export async function registerShadowRoutes(
             postCutoverReport,
             variantMatrixReport,
             gateReport,
+            paperOrders: paperStore.all,
           });
           const paperNow = new Date().toISOString();
           const paperValidationAllowed = process.env.PAPER_VALIDATION_ALLOWED === "1";
@@ -1310,6 +1317,10 @@ export async function registerShadowRoutes(
               marketRegime: cached?.marketRegime ?? null,
               vmReport: variantMatrixReport,
               routerReport: _paperRouter,
+              // Lane-level honest-edge veto: rejects proven-negative lanes (wide-stop
+              // SHORT) while letting positive lanes (tight/fast-TP SHORT) in the same
+              // direction admit — captures the edge the coarse direction gate missed.
+              laneEdgeGate: edgeMemory,
               now: paperNow,
               // On the first paper run, anchor at the current source scan rather
               // than a later brief timestamp so the fresh scan is not mislabeled
@@ -1453,6 +1464,14 @@ export async function registerShadowRoutes(
             new Promise<null>((res) => { setTimeout(() => res(null), 8_000); }),
           ]);
           if (result !== null) paperReport = result;
+
+          // Feed the honest-edge gate: rebuild the live aggregate from the
+          // post-resolve store so newly-closed orders update each (regime ×
+          // direction) slice. Idempotent; the frozen seed prior is untouched.
+          try {
+            edgeMemory.updateFromClosedOrders(paperStore.getState().orders);
+            edgeMemory.save();
+          } catch { /* edge-memory update is report-only; never break the brief */ }
 
           // ── Single post-resolve snapshot reconciliation (Section 10 consistency) ──
           // The resolver mutates the paper store (orders close), so the allocator
@@ -1607,6 +1626,7 @@ export async function registerShadowRoutes(
         variantMatrixReport,
         gateReport,
         paperReport,
+        paperOrders: getPaperExecutionRouterStore().all,
         allocatorReport,
         provenanceAudit,
         shadowGateReport,
