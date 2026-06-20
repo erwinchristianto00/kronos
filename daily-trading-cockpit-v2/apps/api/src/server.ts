@@ -1,10 +1,7 @@
-import { config as loadDotenv } from "dotenv";
-import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
-
-// Load .env from repo root before anything reads process.env
-const __dirname = dirname(fileURLToPath(import.meta.url));
-loadDotenv({ path: resolve(__dirname, "../../../.env"), override: false });
+// MUST be the first import: loads .env before any module evaluates a top-level
+// process.env read (ESM imports are hoisted, so an inline dotenv config() placed
+// after an app import runs too late — see load-env.ts).
+import "./load-env.js";
 
 import { buildApp } from "./app.js";
 
