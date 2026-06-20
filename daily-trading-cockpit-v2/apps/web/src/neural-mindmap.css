@@ -419,6 +419,156 @@
   margin: 0;
 }
 
+.neural-milestone-panel {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+  border-bottom: 1px solid #20313a;
+  background:
+    radial-gradient(circle at 88% 18%, rgba(255, 208, 92, 0.08), transparent 26%),
+    linear-gradient(180deg, #09141a 0%, #0b171d 100%);
+}
+
+.neural-milestone-summary,
+.neural-milestone-grid > div,
+.neural-milestone-table-wrap {
+  border: 1px solid #243740;
+  border-radius: 8px;
+  background: rgba(7, 16, 22, 0.76);
+}
+
+.neural-milestone-summary {
+  padding: 14px;
+}
+
+.neural-milestone-summary span,
+.neural-milestone-grid span {
+  display: block;
+  color: #70858f;
+  font: 600 10px/1.3 "IBM Plex Mono", "Cascadia Code", monospace;
+  text-transform: uppercase;
+}
+
+.neural-milestone-summary strong {
+  display: block;
+  margin-top: 8px;
+  color: #e6f4ee;
+  font-size: 17px;
+  line-height: 1.15;
+}
+
+.neural-milestone-summary p {
+  margin: 8px 0 0;
+  color: #9ab0b9;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.neural-milestone-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.neural-milestone-grid > div {
+  min-width: 0;
+  padding: 12px;
+}
+
+.neural-milestone-grid strong,
+.neural-milestone-grid small {
+  display: block;
+}
+
+.neural-milestone-grid strong {
+  margin-top: 6px;
+  color: #e3edf0;
+  font: 600 13px/1.3 "IBM Plex Mono", "Cascadia Code", monospace;
+}
+
+.neural-milestone-grid small {
+  margin-top: 4px;
+  color: #8398a2;
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.neural-milestone-table-wrap {
+  overflow-x: auto;
+}
+
+.neural-milestone-table-wrap table {
+  width: 100%;
+  min-width: 980px;
+  border-collapse: collapse;
+  font-size: 10px;
+}
+
+.neural-milestone-table-wrap th,
+.neural-milestone-table-wrap td {
+  padding: 10px 12px;
+  border-bottom: 1px solid #17272e;
+  color: #98adb6;
+  text-align: left;
+  vertical-align: top;
+}
+
+.neural-milestone-table-wrap th {
+  color: #6f8690;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+
+.neural-milestone-table-wrap tbody tr {
+  cursor: pointer;
+}
+
+.neural-milestone-table-wrap tbody tr:hover {
+  background: #0e1c22;
+}
+
+.neural-stage-pill {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  padding: 0 8px;
+  border: 1px solid #35505a;
+  border-radius: 999px;
+  color: #cfe2e7;
+  font: 600 10px/1 "IBM Plex Mono", "Cascadia Code", monospace;
+  background: #102126;
+}
+
+.neural-stage-pill.stage-collecting {
+  border-color: #516872;
+  color: #b8c8ce;
+}
+
+.neural-stage-pill.stage-paper_evidence {
+  border-color: #3c76a8;
+  color: #9bd4ff;
+  background: #0e2430;
+}
+
+.neural-stage-pill.stage-headline_ready,
+.neural-stage-pill.stage-headline_active {
+  border-color: #34715d;
+  color: #c8f3df;
+  background: #10241f;
+}
+
+.neural-stage-pill.stage-stable_candidate {
+  border-color: #d0a646;
+  color: #ffe3a4;
+  background: #2a2110;
+}
+
+.neural-stage-pill.stage-promotion_candidate {
+  border-color: #e3924b;
+  color: #ffd8b8;
+  background: #311c11;
+}
+
 .neural-workspace {
   min-height: 660px;
   display: grid;
@@ -1109,6 +1259,10 @@ i.health-diagnostic {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
+  .neural-milestone-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .neural-workspace {
     grid-template-columns: minmax(0, 1fr);
   }
@@ -1231,6 +1385,25 @@ i.health-diagnostic {
     grid-template-columns: 1fr;
     gap: 8px;
     padding: 8px;
+  }
+
+  .neural-milestone-panel {
+    gap: 8px;
+    padding: 8px;
+  }
+
+  .neural-milestone-summary,
+  .neural-milestone-grid > div {
+    padding: 12px;
+  }
+
+  .neural-milestone-grid {
+    grid-template-columns: 1fr;
+    gap: 8px;
+  }
+
+  .neural-milestone-table-wrap {
+    -webkit-overflow-scrolling: touch;
   }
 
   .neural-tp-verdict,

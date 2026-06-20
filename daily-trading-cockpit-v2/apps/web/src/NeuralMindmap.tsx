@@ -177,6 +177,14 @@ interface ProcessGuide {
   inspectWhenBad: string[];
 }
 
+type MilestoneStage =
+  | 'COLLECTING'
+  | 'PAPER_EVIDENCE'
+  | 'HEADLINE_READY'
+  | 'HEADLINE_ACTIVE'
+  | 'STABLE_CANDIDATE'
+  | 'PROMOTION_CANDIDATE';
+
 const NODE_POSITIONS: Record<string, Point> = {
   binance: { x: 110, y: 160 },
   kronos: { x: 110, y: 300 },
@@ -420,6 +428,65 @@ const DIAGNOSIS_LABELS: Record<NeuralDiagnosisCategory, string> = {
   BLOCKING_CONDITION: 'Blocking condition',
 };
 
+const STABLE_MIN_FRESH = 100;
+const PROMOTION_MIN_FRESH = 200;
+const HEADLINE_PF_FLOOR = 1.2;
+
+function stageLabel(stage: MilestoneStage): string {
+  if (stage === 'PROMOTION_CANDIDATE') return 'Promotion candidate';
+  if (stage === 'STABLE_CANDIDATE') return 'Stable candidate';
+  if (stage === 'HEADLINE_ACTIVE') return 'Headline active';
+  if (stage === 'HEADLINE_READY') return 'Headline ready';
+  if (stage === 'PAPER_EVIDENCE') return 'Paper evidence';
+  return 'Collecting';
+}
+
+function laneMilestone(lane: NeuralLane): { stage: MilestoneStage; reason: string } {
+  const watchableMin = lane.oosThreshold > 0 ? lane.oosThreshold : 10;
+  const freshValid = lane.oosFreshValid ?? lane.closed;
+  const status = lane.status.toUpperCase();
+  const headlineReady =
+    freshValid >= watchableMin &&
+    (lane.netAvgR ?? 0) > 0 &&
+    (lane.pf ?? 0) > HEADLINE_PF_FLOOR &&
+    !status.includes('REJECT');
+
+  if (status.includes('PROMOTION_CANDIDATE')) {
+    return {
+      stage: 'PROMOTION_CANDIDATE',
+      reason: `fresh-valid ${freshValid} >= ${PROMOTION_MIN_FRESH} and OOS stability is already confirmed.`,
+    };
+  }
+  if (status.includes('STABLE_CANDIDATE')) {
+    return {
+      stage: 'STABLE_CANDIDATE',
+      reason: `fresh-valid ${freshValid} >= ${STABLE_MIN_FRESH} with positive OOS stability, but promotion is not complete yet.`,
+    };
+  }
+  if (headlineReady && lane.active) {
+    return {
+      stage: 'HEADLINE_ACTIVE',
+      reason: `fresh-valid ${freshValid}/${watchableMin}, net ${fmtR(lane.netAvgR)}, PF ${fmtNumber(lane.pf)}: this lane is currently eligible and active for headline paper admissions.`,
+    };
+  }
+  if (headlineReady) {
+    return {
+      stage: 'HEADLINE_READY',
+      reason: `fresh-valid ${freshValid}/${watchableMin}, net ${fmtR(lane.netAvgR)}, PF ${fmtNumber(lane.pf)}: this lane is eligible for headline paper, even if not the active lane right now.`,
+    };
+  }
+  if (lane.closed > 0 || lane.open > 0) {
+    return {
+      stage: 'PAPER_EVIDENCE',
+      reason: `There is paper evidence, but it still misses the watchable/headline gate: fresh-valid ${freshValid}/${watchableMin}, net ${fmtR(lane.netAvgR)}, PF ${fmtNumber(lane.pf)}.`,
+    };
+  }
+  return {
+    stage: 'COLLECTING',
+    reason: `No real paper evidence yet. Needs fresh-valid ${watchableMin}+ before it can leave collecting.`,
+  };
+}
+
 interface LiveLaneExposure {
   laneId: string;
   sourceOrderCount: number;
@@ -550,6 +617,11 @@ export default function NeuralMindmap() {
     ? draftTpPct - (paperControls?.cgWideTp.roundTripCostPct ?? 0.22)
     : null;
   const canSaveTp = Number.isFinite(draftTpPct) && draftTpPct >= 0.05 && draftTpPct <= 10;
+  const milestoneRows = useMemo(
+    () => (telemetry?.lanes ?? []).map((lane) => ({ lane, milestone: laneMilestone(lane) })),
+    [telemetry?.lanes],
+  );
+  const watchableThreshold = telemetry?.lanes.find((lane) => lane.oosThreshold > 0)?.oosThreshold ?? 10;
 
   const neuralEdges = useMemo(() => {
     if (!telemetry) return [];
@@ -814,6 +886,68 @@ export default function NeuralMindmap() {
             {realizeStatus && <span>{realizeStatus}</span>}
           </div>
         )}
+      </section>
+
+      <section className="neural-milestone-panel" aria-label="Lane maturity thresholds">
+        <div className="neural-milestone-summary">
+          <span>Promotion ladder</span>
+          <strong>Collecting → Paper evidence → Headline → Stable → Promotion</strong>
+          <p>
+            Runtime thresholds on VPS now: watchable/headline floor <b>{watchableThreshold}</b> fresh-valid,
+            stable candidate <b>{STABLE_MIN_FRESH}</b>, promotion candidate <b>{PROMOTION_MIN_FRESH}</b>.
+            Live exchange trading still needs live gate pass plus infra readiness.
+          </p>
+        </div>
+        <div className="neural-milestone-grid">
+          <div>
+            <span>Collecting</span>
+            <strong>{watchableThreshold} fresh-valid</strong>
+            <small>Below this, lane is still collecting OOS.</small>
+          </div>
+          <div>
+            <span>Headline ready</span>
+            <strong>{watchableThreshold}+ / PF&gt;1.2 / net&gt;0</strong>
+            <small>Plus `+10bps` stress pass and non-reject economics gate.</small>
+          </div>
+          <div>
+            <span>Stable candidate</span>
+            <strong>{STABLE_MIN_FRESH}+ OOS all positive</strong>
+            <small>Also needs stronger payoff, net, PF, and drawdown shape.</small>
+          </div>
+          <div>
+            <span>Live-ready gate</span>
+            <strong>{PROMOTION_MIN_FRESH}+ infra pass</strong>
+            <small>Promotion candidate alone is still not enough for real live trading.</small>
+          </div>
+        </div>
+        <div className="neural-milestone-table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Lane</th>
+                <th>Stage</th>
+                <th>Fresh Valid</th>
+                <th>Net Avg R</th>
+                <th>PF</th>
+                <th>Live now?</th>
+                <th>Why</th>
+              </tr>
+            </thead>
+            <tbody>
+              {milestoneRows.map(({ lane, milestone }) => (
+                <tr key={`milestone-${lane.id}`} onClick={() => setSelectedId(lane.id)}>
+                  <td>{compactLaneLabel(lane.label)}</td>
+                  <td><span className={`neural-stage-pill stage-${milestone.stage.toLowerCase()}`}>{stageLabel(milestone.stage)}</span></td>
+                  <td>{lane.oosFreshValid ?? lane.closed} / {lane.oosThreshold}</td>
+                  <td className={(lane.netAvgR ?? 0) >= 0 ? 'tone-healthy' : 'tone-critical'}>{fmtR(lane.netAvgR)}</td>
+                  <td>{fmtNumber(lane.pf)}</td>
+                  <td>{milestone.stage === 'PROMOTION_CANDIDATE' ? 'Gate only' : milestone.stage === 'HEADLINE_ACTIVE' ? 'Paper headline' : 'Not yet'}</td>
+                  <td>{milestone.reason}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       </section>
 
       <main className="neural-workspace">
