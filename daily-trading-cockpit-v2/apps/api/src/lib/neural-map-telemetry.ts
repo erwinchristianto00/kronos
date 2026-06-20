@@ -74,6 +74,16 @@ export interface NeuralMapLane {
    * VM-sim netAvgR rendered next to paper PnL dollars reads as one dataset (audit finding).
    */
   statsSource: "VM_SIM" | "PAPER_BOOK";
+  payoffRatio: number | null;
+  plus10bpsStillPositive: boolean | null;
+  allThreeOosPositive: boolean | null;
+  approxMaxDrawdownR: number | null;
+  topSymbolPnlShare: number | null;
+  calendarDays: number | null;
+  distinctRegimes: number | null;
+  infraReady: boolean | null;
+  blockers: string[];
+  cautions: string[];
   headlinePnl: number;
   diagnosticPnl: number;
   totalPnl: number;
@@ -875,6 +885,9 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
     // rendered next to paper PnL dollars can never read as one dataset. Lanes without a VM row
     // (e.g. CG_LONG_VARIANT_MATRIX:*) show paper-realized stats under the same fields.
     const statsSource: "VM_SIM" | "PAPER_BOOK" = evidenceRow ? "VM_SIM" : "PAPER_BOOK";
+    const infraReady = row
+      ? input.variantMatrix.killSwitchReady && input.variantMatrix.orderReconciliationReady && input.variantMatrix.exchangeHealthReady
+      : null;
     const pnlIsDiagnosticOnly = economics.headlineClosed === 0 && economics.diagnosticPnl !== 0;
     const status = evidenceRow?.status ?? (economics.closed > 0 ? "PAPER_EVIDENCE" : "COLLECTING");
     const evidenceHealth = healthFromLane(status, evidenceRow?.freshValid ?? economics.closed, netAvgR);
@@ -916,6 +929,16 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
       pf: evidenceRow?.pf ?? economics.pf,
       wr: evidenceRow?.wr ?? economics.wr,
       statsSource,
+      payoffRatio: row?.payoffRatio ?? null,
+      plus10bpsStillPositive: row?.plus10bpsStillPositive ?? null,
+      allThreeOosPositive: row?.allThreeOosPositive ?? null,
+      approxMaxDrawdownR: row?.approxMaxDrawdownR ?? null,
+      topSymbolPnlShare: row?.topSymbolPnlShare ?? null,
+      calendarDays: row?.calendarDays ?? null,
+      distinctRegimes: row?.distinctRegimes ?? null,
+      infraReady,
+      blockers: row?.blockers ?? [],
+      cautions: row?.cautions ?? [],
       headlinePnl: economics.headlinePnl,
       diagnosticPnl: economics.diagnosticPnl,
       totalPnl: economics.totalPnl,

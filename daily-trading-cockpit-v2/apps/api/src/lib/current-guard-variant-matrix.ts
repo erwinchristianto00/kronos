@@ -1372,6 +1372,9 @@ export interface CurrentGuardVariantMatrixReport {
   resolverDiagnostics: VariantMatrixResolverDiagnostics;
   /** Report-only synthetic regime-adaptive lane (full-exit in strong trend, scaleout in chop). */
   regimeAdaptiveSynthetic: RegimeAdaptiveSyntheticReport;
+  killSwitchReady: boolean;
+  orderReconciliationReady: boolean;
+  exchangeHealthReady: boolean;
   /** Always true. The variant matrix never authorizes live trading. */
   liveBlocked: true;
   /** Always false. The variant matrix never enables a micro pilot. */
@@ -1836,6 +1839,9 @@ export function buildCurrentGuardVariantMatrixReport(
     bestBeatsBaseline,
     resolverDiagnostics,
     regimeAdaptiveSynthetic: buildRegimeAdaptiveSyntheticReport(all),
+    killSwitchReady: infra.killSwitchReady,
+    orderReconciliationReady: infra.orderReconciliationReady,
+    exchangeHealthReady: infra.exchangeHealthReady,
     liveBlocked: true,
     microPilotAllowed: false,
     notes,

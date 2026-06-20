@@ -49,6 +49,16 @@ interface NeuralLane {
   pf: number | null;
   wr: number | null;
   statsSource: 'VM_SIM' | 'PAPER_BOOK';
+  payoffRatio: number | null;
+  plus10bpsStillPositive: boolean | null;
+  allThreeOosPositive: boolean | null;
+  approxMaxDrawdownR: number | null;
+  topSymbolPnlShare: number | null;
+  calendarDays: number | null;
+  distinctRegimes: number | null;
+  infraReady: boolean | null;
+  blockers: string[];
+  cautions: string[];
   headlinePnl: number;
   diagnosticPnl: number;
   totalPnl: number;
@@ -185,6 +195,13 @@ type MilestoneStage =
   | 'HEADLINE_ACTIVE'
   | 'STABLE_CANDIDATE'
   | 'PROMOTION_CANDIDATE';
+
+interface StageProgress {
+  nextStage: string;
+  progressPct: number;
+  blockers: string[];
+  checklist: string[];
+}
 
 const NODE_POSITIONS: Record<string, Point> = {
   binance: { x: 110, y: 160 },
@@ -488,6 +505,112 @@ function laneMilestone(lane: NeuralLane): { stage: MilestoneStage; reason: strin
   };
 }
 
+function ratioProgress(value: number | null, target: number): number {
+  if (value === null || !Number.isFinite(value) || target <= 0) return 0;
+  return Math.max(0, Math.min(1, value / target));
+}
+
+function booleanProgress(value: boolean | null): number {
+  return value ? 1 : 0;
+}
+
+function thresholdProgress(value: number | null, target: number, comparator: 'gte' | 'gt'): number {
+  if (value === null || !Number.isFinite(value)) return 0;
+  if (comparator === 'gte') return Math.max(0, Math.min(1, value / target));
+  if (value > target) return 1;
+  if (target === 0) return value > 0 ? 1 : 0;
+  return Math.max(0, Math.min(1, value / target));
+}
+
+function inverseThresholdProgress(value: number | null, limit: number): number {
+  if (value === null || !Number.isFinite(value)) return 0;
+  if (value <= limit) return 1;
+  if (value <= 0) return 1;
+  return Math.max(0, Math.min(1, limit / value));
+}
+
+function pctShare(value: number | null): string {
+  if (value === null || !Number.isFinite(value)) return 'n/a';
+  return `${(value * 100).toFixed(1)}%`;
+}
+
+function stageProgress(lane: NeuralLane): StageProgress {
+  const freshValid = lane.oosFreshValid ?? lane.closed;
+  const telemetryStatus = lane.status.toUpperCase();
+  const blockers = lane.blockers ?? [];
+
+  if (telemetryStatus.includes('PROMOTION_CANDIDATE')) {
+    const liveBlockers = [
+      lane.infraReady === false ? 'live infra gates not ready' : null,
+      'still report-only until explicit manual approval',
+    ].filter((item): item is string => Boolean(item));
+    return {
+      nextStage: 'Live approval',
+      progressPct: liveBlockers.length > 1 ? 50 : 100,
+      blockers: liveBlockers,
+      checklist: [
+        `fresh-valid ${freshValid}/${PROMOTION_MIN_FRESH}`,
+        `calendar ${fmtNumber(lane.calendarDays, 1)}/${fmtNumber(5, 1)} days`,
+        `regimes ${lane.distinctRegimes ?? 0}/2`,
+      ],
+    };
+  }
+
+  if (telemetryStatus.includes('STABLE_CANDIDATE')) {
+    const requirements = [
+      { label: `fresh-valid ${freshValid}/${PROMOTION_MIN_FRESH}`, met: freshValid >= PROMOTION_MIN_FRESH, progress: ratioProgress(freshValid, PROMOTION_MIN_FRESH) },
+      { label: `all OOS thirds positive`, met: lane.allThreeOosPositive === true, progress: booleanProgress(lane.allThreeOosPositive) },
+      { label: `netAvgR > 0.05`, met: (lane.netAvgR ?? Number.NEGATIVE_INFINITY) > 0.05, progress: thresholdProgress(lane.netAvgR, 0.05, 'gt') },
+      { label: `PF > ${HEADLINE_PF_FLOOR}`, met: (lane.pf ?? Number.NEGATIVE_INFINITY) > HEADLINE_PF_FLOOR, progress: thresholdProgress(lane.pf, HEADLINE_PF_FLOOR, 'gt') },
+      { label: `payoff >= 0.75`, met: (lane.payoffRatio ?? Number.NEGATIVE_INFINITY) >= 0.75, progress: thresholdProgress(lane.payoffRatio, 0.75, 'gte') },
+      { label: `drawdown <= 5R`, met: lane.approxMaxDrawdownR !== null && lane.approxMaxDrawdownR <= 5, progress: inverseThresholdProgress(lane.approxMaxDrawdownR, 5) },
+      { label: `top-symbol share <= 40%`, met: lane.topSymbolPnlShare !== null && lane.topSymbolPnlShare <= 0.4, progress: inverseThresholdProgress(lane.topSymbolPnlShare, 0.4) },
+      { label: `calendar days >= 5`, met: (lane.calendarDays ?? 0) >= 5, progress: ratioProgress(lane.calendarDays, 5) },
+      { label: `distinct regimes >= 2`, met: (lane.distinctRegimes ?? 0) >= 2, progress: ratioProgress(lane.distinctRegimes, 2) },
+      { label: `infra gates ready`, met: lane.infraReady === true, progress: booleanProgress(lane.infraReady) },
+    ];
+    return {
+      nextStage: 'Promotion candidate',
+      progressPct: Math.round((requirements.reduce((sum, item) => sum + item.progress, 0) / requirements.length) * 100),
+      blockers: blockers.length > 0 ? blockers : requirements.filter((item) => !item.met).map((item) => item.label),
+      checklist: requirements.map((item) => item.label),
+    };
+  }
+
+  if (telemetryStatus.includes('WATCHABLE')) {
+    const requirements = [
+      { label: `fresh-valid ${freshValid}/${STABLE_MIN_FRESH}`, met: freshValid >= STABLE_MIN_FRESH, progress: ratioProgress(freshValid, STABLE_MIN_FRESH) },
+      { label: `all OOS thirds positive`, met: lane.allThreeOosPositive === true, progress: booleanProgress(lane.allThreeOosPositive) },
+      { label: `netAvgR > 0.05`, met: (lane.netAvgR ?? Number.NEGATIVE_INFINITY) > 0.05, progress: thresholdProgress(lane.netAvgR, 0.05, 'gt') },
+      { label: `PF > ${HEADLINE_PF_FLOOR}`, met: (lane.pf ?? Number.NEGATIVE_INFINITY) > HEADLINE_PF_FLOOR, progress: thresholdProgress(lane.pf, HEADLINE_PF_FLOOR, 'gt') },
+      { label: `payoff >= 0.75`, met: (lane.payoffRatio ?? Number.NEGATIVE_INFINITY) >= 0.75, progress: thresholdProgress(lane.payoffRatio, 0.75, 'gte') },
+      { label: `drawdown <= 5R`, met: lane.approxMaxDrawdownR !== null && lane.approxMaxDrawdownR <= 5, progress: inverseThresholdProgress(lane.approxMaxDrawdownR, 5) },
+      { label: `top-symbol share <= 40%`, met: lane.topSymbolPnlShare !== null && lane.topSymbolPnlShare <= 0.4, progress: inverseThresholdProgress(lane.topSymbolPnlShare, 0.4) },
+    ];
+    return {
+      nextStage: 'Stable candidate',
+      progressPct: Math.round((requirements.reduce((sum, item) => sum + item.progress, 0) / requirements.length) * 100),
+      blockers: blockers.length > 0 ? blockers : requirements.filter((item) => !item.met).map((item) => item.label),
+      checklist: requirements.map((item) => item.label),
+    };
+  }
+
+  const requirements = [
+    { label: `fresh-valid ${freshValid}/${lane.oosThreshold}`, met: freshValid >= lane.oosThreshold, progress: ratioProgress(freshValid, lane.oosThreshold) },
+    { label: `netAvgR > 0`, met: (lane.netAvgR ?? Number.NEGATIVE_INFINITY) > 0, progress: thresholdProgress(lane.netAvgR, 0.01, 'gt') },
+    { label: `PF > ${HEADLINE_PF_FLOOR}`, met: (lane.pf ?? Number.NEGATIVE_INFINITY) > HEADLINE_PF_FLOOR, progress: thresholdProgress(lane.pf, HEADLINE_PF_FLOOR, 'gt') },
+    { label: `payoff >= 0.5`, met: (lane.payoffRatio ?? Number.NEGATIVE_INFINITY) >= 0.5, progress: thresholdProgress(lane.payoffRatio, 0.5, 'gte') },
+    { label: `+10bps stress stays positive`, met: lane.plus10bpsStillPositive === true, progress: booleanProgress(lane.plus10bpsStillPositive) },
+    { label: `top-symbol share <= 40%`, met: lane.topSymbolPnlShare !== null && lane.topSymbolPnlShare <= 0.4, progress: inverseThresholdProgress(lane.topSymbolPnlShare, 0.4) },
+  ];
+  return {
+    nextStage: 'Headline / watchable',
+    progressPct: Math.round((requirements.reduce((sum, item) => sum + item.progress, 0) / requirements.length) * 100),
+    blockers: blockers.length > 0 ? blockers : requirements.filter((item) => !item.met).map((item) => item.label),
+    checklist: requirements.map((item) => item.label),
+  };
+}
+
 interface LiveLaneExposure {
   laneId: string;
   sourceOrderCount: number;
@@ -598,6 +721,7 @@ export default function NeuralMindmap() {
   const selectedNode = nodesById.get(selectedId) ?? null;
   const selectedLane = telemetry?.lanes.find((lane) => lane.id === selectedId) ?? null;
   const selectedLaneMilestone = selectedLane ? laneMilestone(selectedLane) : null;
+  const selectedLaneProgress = selectedLane ? stageProgress(selectedLane) : null;
   const selectedLiveLane = liveAccount?.lanes.find((lane) => lane.laneId === selectedLane?.id) ?? null;
   const selectedGuide = selectedNode ? PROCESS_GUIDES[selectedNode.id] : null;
   const newestAgeSec = lastReceivedAt === null ? Infinity : Math.round((Date.now() - lastReceivedAt) / 1000);
@@ -620,7 +744,7 @@ export default function NeuralMindmap() {
     : null;
   const canSaveTp = Number.isFinite(draftTpPct) && draftTpPct >= 0.05 && draftTpPct <= 10;
   const milestoneRows = useMemo(
-    () => (telemetry?.lanes ?? []).map((lane) => ({ lane, milestone: laneMilestone(lane) })),
+    () => (telemetry?.lanes ?? []).map((lane) => ({ lane, milestone: laneMilestone(lane), progress: stageProgress(lane) })),
     [telemetry?.lanes],
   );
   const watchableThreshold = telemetry?.lanes.find((lane) => lane.oosThreshold > 0)?.oosThreshold ?? 10;
@@ -931,26 +1055,28 @@ export default function NeuralMindmap() {
                 <th>Lane</th>
                 <th>Telemetry</th>
                 <th>UI Stage</th>
+                <th>Next Stage</th>
+                <th>Progress</th>
                 <th>Fresh Valid</th>
                 <th>Net Avg R</th>
                 <th>PF</th>
                 <th>Stats</th>
-                <th>Live now?</th>
-                <th>Why</th>
+                <th>Missing</th>
               </tr>
             </thead>
             <tbody>
-              {milestoneRows.map(({ lane, milestone }) => (
+              {milestoneRows.map(({ lane, milestone, progress }) => (
                 <tr key={`milestone-${lane.id}`} onClick={() => setSelectedId(lane.id)}>
                   <td>{compactLaneLabel(lane.label)}</td>
                   <td>{lane.status}</td>
                   <td><span className={`neural-stage-pill stage-${milestone.stage.toLowerCase()}`}>{stageLabel(milestone.stage)}</span></td>
+                  <td>{progress.nextStage}</td>
+                  <td>{progress.progressPct}%</td>
                   <td>{lane.oosFreshValid ?? lane.closed} / {lane.oosThreshold}</td>
                   <td className={(lane.netAvgR ?? 0) >= 0 ? 'tone-healthy' : 'tone-critical'}>{fmtR(lane.netAvgR)}</td>
                   <td>{fmtNumber(lane.pf)}</td>
                   <td>{lane.statsSource === 'VM_SIM' ? 'VM sim' : 'Paper book'}</td>
-                  <td>{milestone.stage === 'PROMOTION_CANDIDATE' ? 'Gate only' : milestone.stage === 'HEADLINE_ACTIVE' ? 'Paper headline' : 'Not yet'}</td>
-                  <td>{milestone.reason}</td>
+                  <td>{progress.blockers.slice(0, 2).join(' | ') || 'None'}</td>
                 </tr>
               ))}
             </tbody>
@@ -1166,11 +1292,17 @@ export default function NeuralMindmap() {
                 <dl>
                   <div><dt>Evidence status</dt><dd>{selectedLane.status}</dd></div>
                   <div><dt>UI stage</dt><dd>{selectedLaneMilestone ? stageLabel(selectedLaneMilestone.stage) : 'n/a'}</dd></div>
+                  <div><dt>Next stage</dt><dd>{selectedLaneProgress?.nextStage ?? 'n/a'}</dd></div>
+                  <div><dt>Progress</dt><dd>{selectedLaneProgress ? `${selectedLaneProgress.progressPct}%` : 'n/a'}</dd></div>
                   <div><dt>Evidence health</dt><dd>{HEALTH_LABELS[selectedLane.evidenceHealth]}</dd></div>
                   <div><dt>Stats source</dt><dd>{selectedLane.statsSource === 'VM_SIM' ? 'Variant-matrix simulation' : 'Paper book'}</dd></div>
                   <div><dt>Open / closed</dt><dd>{selectedLane.open} / {selectedLane.closed}</dd></div>
                   <div><dt>Net Avg R</dt><dd className={(selectedLane.netAvgR ?? 0) >= 0 ? 'tone-healthy' : 'tone-critical'}>{fmtR(selectedLane.netAvgR)}</dd></div>
                   <div><dt>PF / WR</dt><dd>{fmtNumber(selectedLane.pf)} / {selectedLane.wr === null ? 'n/a' : `${(selectedLane.wr * 100).toFixed(1)}%`}</dd></div>
+                  <div><dt>Payoff / +10bps</dt><dd>{fmtNumber(selectedLane.payoffRatio)} / {selectedLane.plus10bpsStillPositive == null ? 'n/a' : selectedLane.plus10bpsStillPositive ? 'pass' : 'fail'}</dd></div>
+                  <div><dt>OOS thirds / regimes</dt><dd>{selectedLane.allThreeOosPositive == null ? 'n/a' : selectedLane.allThreeOosPositive ? 'all positive' : 'not yet'} / {selectedLane.distinctRegimes ?? 'n/a'}</dd></div>
+                  <div><dt>Drawdown / concentration</dt><dd>{fmtR(selectedLane.approxMaxDrawdownR)} / {pctShare(selectedLane.topSymbolPnlShare)}</dd></div>
+                  <div><dt>Calendar / infra</dt><dd>{selectedLane.calendarDays === null ? 'n/a' : `${selectedLane.calendarDays.toFixed(1)}d`} / {selectedLane.infraReady == null ? 'n/a' : selectedLane.infraReady ? 'ready' : 'not ready'}</dd></div>
                   <div><dt>Avg entry / mark</dt><dd>{fmtPrice(selectedLane.openAvgEntryPrice)} / {fmtPrice(selectedLane.openAvgMarkPrice)}</dd></div>
                   <div><dt>Avg TP / gap</dt><dd>{fmtPrice(selectedLane.openAvgTakeProfitPrice)} / {fmtGapPct(selectedLane.openAvgDistanceToTpPct)}</dd></div>
                   <div><dt>Nearest TP gap</dt><dd>{fmtGapPct(selectedLane.openNearestDistanceToTpPct)} across {selectedLane.openMarkedSymbolCount} symbols</dd></div>
@@ -1192,6 +1324,15 @@ export default function NeuralMindmap() {
                 <p>{selectedLane.reason}</p>
                 {selectedLaneMilestone && <p>{selectedLaneMilestone.reason}</p>}
               </div>
+              {selectedLaneProgress && (
+                <div className="neural-inspector-section">
+                  <h2>Next stage blockers</h2>
+                  <p>{selectedLaneProgress.nextStage} is currently {selectedLaneProgress.progressPct}% complete.</p>
+                  <ul className="neural-check-list">
+                    {(selectedLaneProgress.blockers.length > 0 ? selectedLaneProgress.blockers : ['No blocker currently visible in telemetry.']).map((item) => <li key={item}>{item}</li>)}
+                  </ul>
+                </div>
+              )}
               <div className="neural-inspector-section">
                 <h2>Lane process</h2>
                 <ol className="neural-process-list">
