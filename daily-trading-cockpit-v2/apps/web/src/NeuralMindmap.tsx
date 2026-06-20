@@ -48,6 +48,7 @@ interface NeuralLane {
   netAvgR: number | null;
   pf: number | null;
   wr: number | null;
+  statsSource: 'VM_SIM' | 'PAPER_BOOK';
   headlinePnl: number;
   diagnosticPnl: number;
   totalPnl: number;
@@ -445,45 +446,45 @@ function laneMilestone(lane: NeuralLane): { stage: MilestoneStage; reason: strin
   const watchableMin = lane.oosThreshold > 0 ? lane.oosThreshold : 10;
   const freshValid = lane.oosFreshValid ?? lane.closed;
   const status = lane.status.toUpperCase();
-  const headlineReady =
-    freshValid >= watchableMin &&
-    (lane.netAvgR ?? 0) > 0 &&
-    (lane.pf ?? 0) > HEADLINE_PF_FLOOR &&
-    !status.includes('REJECT');
-
   if (status.includes('PROMOTION_CANDIDATE')) {
     return {
       stage: 'PROMOTION_CANDIDATE',
-      reason: `fresh-valid ${freshValid} >= ${PROMOTION_MIN_FRESH} and OOS stability is already confirmed.`,
+      reason: `Telemetry status is PROMOTION_CANDIDATE: fresh-valid ${freshValid} is already in the promotable tier, pending manual live approval and infra gates.`,
     };
   }
   if (status.includes('STABLE_CANDIDATE')) {
     return {
       stage: 'STABLE_CANDIDATE',
-      reason: `fresh-valid ${freshValid} >= ${STABLE_MIN_FRESH} with positive OOS stability, but promotion is not complete yet.`,
+      reason: `Telemetry status is STABLE_CANDIDATE: fresh-valid ${freshValid} is stable, but promotion gates are not complete yet.`,
     };
   }
-  if (headlineReady && lane.active) {
-    return {
-      stage: 'HEADLINE_ACTIVE',
-      reason: `fresh-valid ${freshValid}/${watchableMin}, net ${fmtR(lane.netAvgR)}, PF ${fmtNumber(lane.pf)}: this lane is currently eligible and active for headline paper admissions.`,
-    };
-  }
-  if (headlineReady) {
+  if (status.includes('WATCHABLE')) {
+    if (lane.active) {
+      return {
+        stage: 'HEADLINE_ACTIVE',
+        reason: `Telemetry status is WATCHABLE and this lane is currently active, so it is the live headline paper lane now.`,
+      };
+    }
     return {
       stage: 'HEADLINE_READY',
-      reason: `fresh-valid ${freshValid}/${watchableMin}, net ${fmtR(lane.netAvgR)}, PF ${fmtNumber(lane.pf)}: this lane is eligible for headline paper, even if not the active lane right now.`,
+      reason: `Telemetry status is WATCHABLE: fresh-valid ${freshValid}/${watchableMin}, net ${fmtR(lane.netAvgR)}, PF ${fmtNumber(lane.pf)}. Eligible for headline paper, but not the active lane right now.`,
+    };
+  }
+  if (status.includes('REJECT')) {
+    return {
+      stage: lane.closed > 0 || lane.open > 0 ? 'PAPER_EVIDENCE' : 'COLLECTING',
+      reason: `Telemetry status is REJECT: there may be evidence on tape, but current fresh-valid economics still fail the watchable/headline gate.`,
     };
   }
   if (lane.closed > 0 || lane.open > 0) {
     return {
       stage: 'PAPER_EVIDENCE',
-      reason: `There is paper evidence, but it still misses the watchable/headline gate: fresh-valid ${freshValid}/${watchableMin}, net ${fmtR(lane.netAvgR)}, PF ${fmtNumber(lane.pf)}.`,
+      reason: `Telemetry still says COLLECTING, but paper evidence already exists. It has not reached WATCHABLE yet: fresh-valid ${freshValid}/${watchableMin}, net ${fmtR(lane.netAvgR)}, PF ${fmtNumber(lane.pf)}.`,
     };
   }
   return {
     stage: 'COLLECTING',
-    reason: `No real paper evidence yet. Needs fresh-valid ${watchableMin}+ before it can leave collecting.`,
+    reason: `No real paper evidence yet. Telemetry is still COLLECTING and needs fresh-valid ${watchableMin}+ before it can become WATCHABLE.`,
   };
 }
 
@@ -596,6 +597,7 @@ export default function NeuralMindmap() {
 
   const selectedNode = nodesById.get(selectedId) ?? null;
   const selectedLane = telemetry?.lanes.find((lane) => lane.id === selectedId) ?? null;
+  const selectedLaneMilestone = selectedLane ? laneMilestone(selectedLane) : null;
   const selectedLiveLane = liveAccount?.lanes.find((lane) => lane.laneId === selectedLane?.id) ?? null;
   const selectedGuide = selectedNode ? PROCESS_GUIDES[selectedNode.id] : null;
   const newestAgeSec = lastReceivedAt === null ? Infinity : Math.round((Date.now() - lastReceivedAt) / 1000);
@@ -895,7 +897,9 @@ export default function NeuralMindmap() {
           <p>
             Runtime thresholds on VPS now: watchable/headline floor <b>{watchableThreshold}</b> fresh-valid,
             stable candidate <b>{STABLE_MIN_FRESH}</b>, promotion candidate <b>{PROMOTION_MIN_FRESH}</b>.
-            Live exchange trading still needs live gate pass plus infra readiness.
+            The table below now shows both the raw telemetry status from the engine and the UI grouping,
+            so it no longer looks like two different truths. Live exchange trading still needs live gate
+            pass plus infra readiness.
           </p>
         </div>
         <div className="neural-milestone-grid">
@@ -925,10 +929,12 @@ export default function NeuralMindmap() {
             <thead>
               <tr>
                 <th>Lane</th>
-                <th>Stage</th>
+                <th>Telemetry</th>
+                <th>UI Stage</th>
                 <th>Fresh Valid</th>
                 <th>Net Avg R</th>
                 <th>PF</th>
+                <th>Stats</th>
                 <th>Live now?</th>
                 <th>Why</th>
               </tr>
@@ -937,10 +943,12 @@ export default function NeuralMindmap() {
               {milestoneRows.map(({ lane, milestone }) => (
                 <tr key={`milestone-${lane.id}`} onClick={() => setSelectedId(lane.id)}>
                   <td>{compactLaneLabel(lane.label)}</td>
+                  <td>{lane.status}</td>
                   <td><span className={`neural-stage-pill stage-${milestone.stage.toLowerCase()}`}>{stageLabel(milestone.stage)}</span></td>
                   <td>{lane.oosFreshValid ?? lane.closed} / {lane.oosThreshold}</td>
                   <td className={(lane.netAvgR ?? 0) >= 0 ? 'tone-healthy' : 'tone-critical'}>{fmtR(lane.netAvgR)}</td>
                   <td>{fmtNumber(lane.pf)}</td>
+                  <td>{lane.statsSource === 'VM_SIM' ? 'VM sim' : 'Paper book'}</td>
                   <td>{milestone.stage === 'PROMOTION_CANDIDATE' ? 'Gate only' : milestone.stage === 'HEADLINE_ACTIVE' ? 'Paper headline' : 'Not yet'}</td>
                   <td>{milestone.reason}</td>
                 </tr>
@@ -1157,7 +1165,9 @@ export default function NeuralMindmap() {
               <div className="neural-inspector-section">
                 <dl>
                   <div><dt>Evidence status</dt><dd>{selectedLane.status}</dd></div>
+                  <div><dt>UI stage</dt><dd>{selectedLaneMilestone ? stageLabel(selectedLaneMilestone.stage) : 'n/a'}</dd></div>
                   <div><dt>Evidence health</dt><dd>{HEALTH_LABELS[selectedLane.evidenceHealth]}</dd></div>
+                  <div><dt>Stats source</dt><dd>{selectedLane.statsSource === 'VM_SIM' ? 'Variant-matrix simulation' : 'Paper book'}</dd></div>
                   <div><dt>Open / closed</dt><dd>{selectedLane.open} / {selectedLane.closed}</dd></div>
                   <div><dt>Net Avg R</dt><dd className={(selectedLane.netAvgR ?? 0) >= 0 ? 'tone-healthy' : 'tone-critical'}>{fmtR(selectedLane.netAvgR)}</dd></div>
                   <div><dt>PF / WR</dt><dd>{fmtNumber(selectedLane.pf)} / {selectedLane.wr === null ? 'n/a' : `${(selectedLane.wr * 100).toFixed(1)}%`}</dd></div>
@@ -1180,6 +1190,7 @@ export default function NeuralMindmap() {
               <div className="neural-inspector-section">
                 <h2>Why this state</h2>
                 <p>{selectedLane.reason}</p>
+                {selectedLaneMilestone && <p>{selectedLaneMilestone.reason}</p>}
               </div>
               <div className="neural-inspector-section">
                 <h2>Lane process</h2>
