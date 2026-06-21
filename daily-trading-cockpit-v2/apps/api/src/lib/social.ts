@@ -63,7 +63,12 @@ interface RedditListingResponse {
 }
 
 const PROVIDERS = new Set(["none", "custom", "reddit", "feargreed"]);
-const CACHE_TTL_MS = 5 * 60 * 1000;
+// Sentiment cache TTL. feargreed (the default provider) is a DAILY market index, so
+// a 5-min TTL meant a re-fetch on every ~7-min scan — each one exposed to the
+// external-fetch timeout, and a single transient slow response degraded the provider
+// (circuit-breaker skips 3 scans → "External Signals" node goes WARNING). 30 min keeps
+// it fresh enough while fetching ~once per several scans. Env-tunable.
+const CACHE_TTL_MS = Number(process.env.SOCIAL_SENTIMENT_CACHE_TTL_MS) || 30 * 60 * 1000;
 const REDDIT_TOKEN_URL = "https://www.reddit.com/api/v1/access_token";
 const REDDIT_API_BASE = "https://oauth.reddit.com";
 

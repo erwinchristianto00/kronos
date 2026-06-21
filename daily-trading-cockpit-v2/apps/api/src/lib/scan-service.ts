@@ -30,7 +30,11 @@ export const UNIVERSE = [
 ] as const;
 const SYMBOL_FETCH_CONCURRENCY = 5;
 const DEFAULT_CANDLE_FETCH_TIMEOUT_MS = 10_000;
-const DEFAULT_EXTERNAL_SIGNAL_FETCH_TIMEOUT_MS = 2_500;
+// Per-provider external-signal fetch timeout. 2.5s was too tight for the occasional
+// cold-TLS / transient spike on feargreed (normally ~1s from the VPS), which tripped
+// the circuit breaker and degraded the "External Signals" node. 4s tolerates the spike
+// without meaningfully slowing the scan (the fetch is cached for 30 min anyway). Env-tunable.
+const DEFAULT_EXTERNAL_SIGNAL_FETCH_TIMEOUT_MS = Number(process.env.EXTERNAL_SIGNAL_FETCH_TIMEOUT_MS) || 4_000;
 const DEFAULT_TOTAL_SYMBOL_FETCH_TIMEOUT_MS = 15_000;
 const DEFAULT_SYMBOL_FAILURE_RATE_THRESHOLD = 0.8;
 const DEFAULT_PROVIDER_TIMEOUT_STREAK_THRESHOLD = 2;
