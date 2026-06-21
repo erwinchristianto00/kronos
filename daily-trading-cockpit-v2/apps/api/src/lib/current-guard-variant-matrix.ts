@@ -103,6 +103,14 @@ export const TAKER_ROUNDTRIP_BPS = REALISTIC_ROUND_TRIP_FEE_SLIP_BPS; // 22 (fee
 // ~2bps/side; we add a conservative buffer so we never over-claim the maker edge.
 export const MAKER_ROUNDTRIP_BPS = REALISTIC_FEE_BPS_PER_SIDE + 1; // 6 (conservative maker round-trip)
 export const STRESS_EXTRA_BPS = 10; // +10bps slippage stress test
+// Stop-out exits slip MORE than TP/limit exits: a stop-market order fills during a
+// fast ADVERSE move (volatility / liquidation cascade), so a CLOSED_LOSS pays extra
+// slippage beyond the flat round-trip. The old flat cost model missed this asymmetry,
+// which made low-win-rate lanes look as cheap as high-WR ones. Modeling it honestly
+// (extra cost ONLY on losers) lets the gate self-select cost-robust lanes — the
+// slippage stress test showed the fast-0.5R lanes survive realistic costs while the
+// SCALEOUT/baseline/aggregate "edge" is phantom. Env-tunable; applied at resolution.
+export const STOP_OUT_SLIPPAGE_BPS = Number(process.env.STOP_OUT_SLIPPAGE_BPS) || 12;
 
 // --- Geometry constants ---
 export const WIDE_STOP_MIN_BPS = 300; // Paper-admissible wide/trail variants require >= 300bps stops
@@ -1208,10 +1216,19 @@ export async function resolveVariantMatrixObservations(
           const grossR = walk.grossR ?? 0;
           const resolvedAtMs = walk.closedAtMs ?? nowMs;
           const effectiveOpenedAtMs = walk.openedAtMs ?? openedAtMs;
+          // Stop-out (CLOSED_LOSS) pays extra slippage beyond the flat round-trip;
+          // fold it into costR so netR = grossR - costR stays consistent and avgCostR
+          // reports the honest loser cost.
+          const stopOutSlipR =
+            walk.status === "CLOSED_LOSS"
+              ? STOP_OUT_SLIPPAGE_BPS / (obs.stopDistanceBps || WIDE_STOP_MIN_BPS)
+              : 0;
+          const effectiveCostR = (obs.costR ?? 0) + stopOutSlipR;
           store.update(obs.observationId, {
             status: walk.status,
             grossR,
-            netR: grossR - (obs.costR ?? 0),
+            costR: effectiveCostR,
+            netR: grossR - effectiveCostR,
             resolvedAt: new Date(resolvedAtMs).toISOString(),
             durationMinutes: Math.max(0, Math.round((resolvedAtMs - effectiveOpenedAtMs) / 60000)),
             maxMfeR: walk.maxMfeR,
