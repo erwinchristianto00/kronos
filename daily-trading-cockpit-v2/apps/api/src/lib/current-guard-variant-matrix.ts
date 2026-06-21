@@ -129,6 +129,18 @@ export const PF_STRONG = 1.2;
 export const PF_FLOOR = 1.0;
 export const PAYOFF_WATCH = 0.5;
 export const PAYOFF_STABLE = 0.75;
+// Payoff floor to AUTHORIZE a lane (STABLE_CANDIDATE / PROMOTION_CANDIDATE). Was
+// PAYOFF_STABLE (0.75), which structurally rejected high-win-rate / low-payoff
+// scalp edges — e.g. the fast 0.5R variants run ~0.53 payoff with 81-88% WR and
+// PF 2-8, genuinely net-positive, but a 0.75 floor benches them forever regardless
+// of sample. The other STABLE gates (net>NET_STRONG_R, PF>PF_STRONG, all-three-OOS-
+// thirds positive, +10bps, drawdown, top-symbol share) over a ≥100-sample ALREADY
+// prove the edge is real and not high-WR luck, so the payoff SHAPE shouldn't veto a
+// proven edge. Lowered to PAYOFF_WATCH (0.5) — "trade the edge you proved". NOTE:
+// this only affects lane STATUS; headline/live admission stays gated by liveBlocked
+// (hard invariant) + infra readiness, so this is prep, not an immediate unblock.
+// Env-tunable.
+export const PAYOFF_AUTHORIZE = Number(process.env.PAYOFF_AUTHORIZE_FLOOR) || PAYOFF_WATCH;
 export const MAX_DRAWDOWN_R_LIMIT = 5;
 export const MAX_TOP_SYMBOL_SHARE = 0.4;
 export const PROMOTION_MIN_CALENDAR_DAYS = 5;
@@ -1545,7 +1557,7 @@ function deriveVariantStatus(
     row.allThreeOosPositive &&
     net !== null && net > NET_STRONG_R &&
     pf !== null && pf > PF_STRONG &&
-    payoff !== null && payoff >= PAYOFF_STABLE &&
+    payoff !== null && payoff >= PAYOFF_AUTHORIZE &&
     drawdownOk && shareOk &&
     (row.calendarDays ?? 0) >= PROMOTION_MIN_CALENDAR_DAYS &&
     row.distinctRegimes >= PROMOTION_MIN_DISTINCT_REGIMES &&
@@ -1565,7 +1577,7 @@ function deriveVariantStatus(
     row.allThreeOosPositive &&
     net !== null && net > NET_STRONG_R &&
     pf !== null && pf > PF_STRONG &&
-    payoff !== null && payoff >= PAYOFF_STABLE &&
+    payoff !== null && payoff >= PAYOFF_AUTHORIZE &&
     drawdownOk && shareOk
   ) {
     if (row.freshValid < PROMOTION_MIN_FRESH) blockers.push(`freshValid ${row.freshValid} < ${PROMOTION_MIN_FRESH} for promotion`);
@@ -1591,7 +1603,7 @@ function deriveVariantStatus(
   ) {
     if (row.freshValid < STABLE_MIN_FRESH) blockers.push(`freshValid ${row.freshValid} < ${STABLE_MIN_FRESH} for stable`);
     if (!row.allThreeOosPositive) blockers.push("not all OOS thirds positive");
-    if (payoff < PAYOFF_STABLE) blockers.push(`payoff ${payoff.toFixed(2)} < ${PAYOFF_STABLE}`);
+    if (payoff < PAYOFF_AUTHORIZE) blockers.push(`payoff ${payoff.toFixed(2)} < ${PAYOFF_AUTHORIZE}`);
     return {
       status: "WATCHABLE",
       statusReason: `freshValid=${row.freshValid}, net=${net.toFixed(3)}R PF=${pf.toFixed(2)} payoff=${payoff.toFixed(2)} — watchable`,
