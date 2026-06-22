@@ -407,21 +407,28 @@ export const VARIANT_MATRIX_DEFINITIONS: readonly VariantMatrixVariantDefinition
       "prove OOS before promotion.",
   },
   {
-    // Operator-requested (2026-06-22): attack the "touched a good high then faded to
-    // flat/negative" leak directly. Same baseline entry/geometry as CG_BASELINE_CURRENT
-    // (raw stop + raw TP, no widening) so this is a clean A/B of EXIT STYLE on identical
-    // signals: tp1_full (let it run to TP or stop) vs mfe_giveback (bank a faded winner).
-    // Placed LAST so a no-evidence score tie never lets it preempt an established lane.
+    // Operator-requested (2026-06-22): bank a "touched a good high then faded to flat/negative"
+    // trade instead of round-tripping to a stop.
+    // RE-TARGETED 2026-06-23: the first cut paired the giveback with BASELINE (~1R TP) geometry and
+    // the eval proved it INERT — 0 giveback exits over 79 closes (all TP/SL), netAvgR identical to
+    // baseline. Reason: arm at 0.75R is only 0.25R below a ~1R TP, so an armed trade just completes
+    // to TP before it can retrace. The giveback only has room when the TP is FAR. So this now uses a
+    // WIDE stop (>=300bps) + FAR 3R TP: trades can run up to a high MFE (e.g. 2R), and the giveback
+    // banks the faded peak (~1R) instead of round-tripping to the stop or waiting for a rarely-hit 3R.
+    // The meaningful A/B is now vs the let-it-run wide lanes (CG_WIDE_LONG_RUNNER / CG_WIDE_STOP_TP_WIDE)
+    // on the SAME far-TP geometry: does banking the fade beat riding to TP/stop?
     id: "CG_MFE_GIVEBACK",
-    label: "MFE-giveback exit (lock the faded winner)",
+    label: "MFE-giveback exit (wide stop, 3R TP — bank the faded runner)",
     exitRule: "mfe_giveback",
     fillMode: "taker",
     costModel: "taker",
+    stopFloorBps: 300,
+    tpRewardMultiple: 3,
     description:
-      "Baseline entry/geometry, but once up >= MFE_GIVEBACK_ARM_R it exits on a retrace to " +
-      "peak*(1-MFE_GIVEBACK_FRAC) of the favorable move — converting 'reached a high then round-tripped " +
-      "to a stop' into a banked partial gain. Hard stop + far TP still bound it. Direction-agnostic A/B " +
-      "vs the tp1_full baseline; prove OOS before any promotion.",
+      "Wide >=300bps stop + far 3R TP. Once up >= MFE_GIVEBACK_ARM_R it exits on a retrace to " +
+      "peak*(1-MFE_GIVEBACK_FRAC) of favorable — converting 'ran up to a high MFE then round-tripped' " +
+      "into a banked partial gain. The far TP gives the giveback room to operate (baseline ~1R TP made " +
+      "it inert). Direction-agnostic; A/B vs the let-it-run wide lanes. Prove OOS before promotion.",
   },
 ];
 

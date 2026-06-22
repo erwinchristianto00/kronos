@@ -367,6 +367,17 @@ describe("current-guard-variant-matrix", () => {
     expect(result.resolutionSource).toBe("MFE_GIVEBACK_EXIT");
   });
 
+  it("[MFEG5] CG_MFE_GIVEBACK uses FAR-TP geometry so the giveback can actually fire (not baseline)", () => {
+    const def = defOf("CG_MFE_GIVEBACK");
+    expect(def.exitRule).toBe("mfe_giveback");
+    // Re-targeted to wide stop + far 3R TP: the baseline ~1R TP made the giveback inert (0 fires).
+    expect(def.stopFloorBps).toBe(300);
+    expect(def.tpRewardMultiple).toBe(3);
+    // Geometry must place the TP far above the arm (0.75R) so an armed trade has room to fade.
+    const geo = deriveVariantGeometry(makeSignal({ direction: "SHORT", stopLoss: 102, tp1: 99 }), def);
+    expect(geo.kind).toBe("ok");
+  });
+
   // 5. No-fib500 rejects and counts.
   it("[5] no-fib500 variant rejects fib_500_entry signals (and accepts others)", () => {
     const fibSignal = makeSignal({ entryVariant: "fib_500_entry" });
