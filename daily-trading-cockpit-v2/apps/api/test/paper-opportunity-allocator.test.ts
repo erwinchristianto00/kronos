@@ -769,7 +769,10 @@ describe("paper-opportunity-allocator", () => {
       }),
     );
     expect(report.selectedOpportunities).toHaveLength(0);
-    expect(report.topRejects.map((r) => r.key)).toContain("MIXED_REJECT");
+    // SEI is a high-beta alt → the LONG_LARGE_CAP_ONLY gate rejects it before the mixed-toxic
+    // path. Either rejection satisfies the intent (toxic high-beta LONG → no order).
+    const rejectKeys = report.topRejects.map((r) => r.key);
+    expect(rejectKeys.some((k) => k === "MIXED_REJECT" || k === "LONG_HIGH_BETA_ALT_NO_EDGE")).toBe(true);
   });
 
   // [11]

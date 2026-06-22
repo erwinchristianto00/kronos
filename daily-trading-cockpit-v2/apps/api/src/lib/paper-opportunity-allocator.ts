@@ -533,6 +533,14 @@ function cgWideCapacityRejectReason(args: {
   return null;
 }
 
+// Long large-cap-only gate. The 2026-06-21 forward audit decomposed the -$3.3k
+// diagnostic loss: it is ~entirely high-beta-alt LONGs (avgR -0.66R, n=246) — small
+// alts chop/revert and hit stops even in an up market (BTC +1.58% over the window),
+// while large-cap longs are ~flat and the top majors (SOL/ETH/BNB) actually trend.
+// SHORTS are unaffected (the fade edge works on alts, ~86% WR). So we block LONGs on
+// high-beta alts (paperIsHighBetaAlt). Env-tunable; disable with LONG_LARGE_CAP_ONLY=0.
+const LONG_LARGE_CAP_ONLY = process.env.LONG_LARGE_CAP_ONLY !== "0";
+
 // ─── rejected-candidate diagnostic sampler (V1) ─────────────────────────────
 /** Default cap on DIAGNOSTIC_ONLY orders sampled from rejected candidates per scan. */
 const DEFAULT_REJECT_DIAGNOSTIC_MAX_PER_SCAN = 3;
@@ -1362,6 +1370,13 @@ export function buildPaperOpportunityAllocatorReport(
       }
       if (!directionCompatibleWithMode(direction, controllerMode)) {
         recordReject(symbol, direction, def.id, "DIRECTION_INCOMPATIBLE_WITH_MODE", rowFresh, rowNet);
+        continue;
+      }
+      // High-beta-alt LONGs have no edge (chop/revert → stop, even in up markets) and
+      // are the bulk of the diagnostic loss; large-cap longs are ~flat, majors trend.
+      // Shorts unaffected (fade works on alts). See LONG_LARGE_CAP_ONLY note above.
+      if (LONG_LARGE_CAP_ONLY && direction === "LONG" && paperIsHighBetaAlt(symbol)) {
+        recordReject(symbol, direction, def.id, "LONG_HIGH_BETA_ALT_NO_EDGE", rowFresh, rowNet);
         continue;
       }
       // Lane-level honest-edge veto: reject a lane whose (regime × direction × lane)
