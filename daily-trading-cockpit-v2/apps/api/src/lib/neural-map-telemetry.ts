@@ -128,6 +128,15 @@ export interface NeuralMapAlert {
   message: string;
 }
 
+export interface DiagnosticDirectionStats {
+  closed: number;
+  open: number;
+  realizedPnl: number;
+  unrealizedPnl: number | null;
+  netAvgR: number | null;
+  wr: number | null;
+}
+
 export interface NeuralMapTelemetry {
   version: "neural-map-v1";
   generatedAt: string;
@@ -189,6 +198,16 @@ export interface NeuralMapTelemetry {
     headlineNetAvgR: number | null;
     headlinePF: number | null;
     headlineWR: number | null;
+    /**
+     * Diagnostic (measurement-only) performance split by trade direction. closed/open/realizedPnl/
+     * netAvgR/wr come from the orders themselves (DIAGNOSTIC_ONLY, by direction); unrealizedPnl is the
+     * open mark-to-market for that direction. Lets the operator see SHORT vs LONG edge separately —
+     * scoped to diagnostic orders only, so the counts always match the diagnostic dollar figure.
+     */
+    diagnosticByDirection: {
+      LONG: DiagnosticDirectionStats;
+      SHORT: DiagnosticDirectionStats;
+    };
   };
   mixed: {
     activeLane: string | null;
@@ -297,6 +316,11 @@ export interface PaperUnrealizedSnapshot {
   totalR: number;
   diagnosticPnl: number;
   diagnosticR: number;
+  /** Open diagnostic mark-to-market split by direction (mark-priced orders only). */
+  diagnosticByDirection: {
+    LONG: { pnl: number; r: number; open: number };
+    SHORT: { pnl: number; r: number; open: number };
+  };
   headlinePnl: number;
   headlineR: number;
   maxFavorablePnl: number;
@@ -427,6 +451,10 @@ export async function buildPaperUnrealizedSnapshot(
   let totalR = 0;
   let diagnosticPnl = 0;
   let diagnosticR = 0;
+  const diagByDir = {
+    LONG: { pnl: 0, r: 0, open: 0 },
+    SHORT: { pnl: 0, r: 0, open: 0 },
+  };
   let headlinePnl = 0;
   let headlineR = 0;
   let maxFavorablePnl = 0;
@@ -529,6 +557,10 @@ export async function buildPaperUnrealizedSnapshot(
       diagnosticR += r;
       lane.diagnosticPnl += pnl;
       lane.diagnosticR += r;
+      const dir = order.direction === "SHORT" ? "SHORT" : "LONG";
+      diagByDir[dir].pnl += pnl;
+      diagByDir[dir].r += r;
+      diagByDir[dir].open += 1;
     } else {
       headlinePnl += pnl;
       headlineR += r;
@@ -579,6 +611,7 @@ export async function buildPaperUnrealizedSnapshot(
     totalR,
     diagnosticPnl,
     diagnosticR,
+    diagnosticByDirection: diagByDir,
     headlinePnl,
     headlineR,
     maxFavorablePnl,
@@ -891,6 +924,27 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
   const candleFailures = timing?.symbols.filter((symbol) => symbol.failureStage?.includes("candle")).length ?? 0;
   const background = timing?.backgroundQueue;
   const guardrail = input.mixedValidation.guardrail;
+
+  // Diagnostic performance split by trade direction (SHORT vs LONG). Computed from the orders
+  // themselves so the counts/realized PnL are diagnostic-scoped (they always reconcile with the
+  // diagnostic dollar figure) — the previous tile mixed the diagnostic $ with TOTAL open/closed
+  // counts. Open mark-to-market per direction comes from the unrealized snapshot.
+  const diagnosticDirStats = (dir: "LONG" | "SHORT"): DiagnosticDirectionStats => {
+    const diag = input.orders.filter((o) => isDiagnosticPaperOrder(o) && o.direction === dir);
+    const closed = diag.filter((o) => CLOSED.has(o.paperStatus));
+    const open = diag.filter((o) => OPEN.has(o.paperStatus));
+    const nets = closed.map((o) => o.netR).filter(finite);
+    const wins = closed.filter((o) => o.paperStatus === "PAPER_CLOSED_WIN").length;
+    return {
+      closed: closed.length,
+      open: open.length,
+      realizedPnl: closed.reduce((s, o) => s + (o.netPnlAmount ?? 0), 0),
+      unrealizedPnl: input.paperUnrealized?.diagnosticByDirection?.[dir]?.pnl ?? null,
+      netAvgR: nets.length ? nets.reduce((s, v) => s + v, 0) / nets.length : null,
+      wr: closed.length ? wins / closed.length : null,
+    };
+  };
+  const diagnosticByDirection = { LONG: diagnosticDirStats("LONG"), SHORT: diagnosticDirStats("SHORT") };
   const mixedActive = input.mixed.regimeIsMixed;
   const activeAdmission = mixedActive ? input.mixed.admissionResult : "INACTIVE";
   const activeOccupancyMode = mixedActive ? input.mixed.occupancyMode : "INACTIVE";
@@ -1310,6 +1364,7 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
       headlineNetAvgR: input.paper.headlineNetAvgR,
       headlinePF: input.paper.headlinePF,
       headlineWR: input.paper.headlineWR,
+      diagnosticByDirection,
     },
     mixed: {
       activeLane: input.mixed.activeMixedLane,

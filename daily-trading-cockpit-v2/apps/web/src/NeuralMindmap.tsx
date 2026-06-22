@@ -91,6 +91,15 @@ interface NeuralLane {
   reason: string;
 }
 
+interface DiagnosticDirectionStats {
+  closed: number;
+  open: number;
+  realizedPnl: number;
+  unrealizedPnl: number | null;
+  netAvgR: number | null;
+  wr: number | null;
+}
+
 interface NeuralTelemetry {
   version: string;
   generatedAt: string;
@@ -148,6 +157,10 @@ interface NeuralTelemetry {
     headlineNetAvgR: number | null;
     headlinePF: number | null;
     headlineWR: number | null;
+    diagnosticByDirection: {
+      LONG: DiagnosticDirectionStats;
+      SHORT: DiagnosticDirectionStats;
+    };
   };
   mixed: {
     activeLane: string | null;
@@ -768,6 +781,15 @@ export default function NeuralMindmap() {
     : 0;
   const paperRealTone = paperRealPnl > 0 ? 'tone-healthy' : paperRealPnl < 0 ? 'tone-critical' : 'tone-measure';
   const paperTpAssessment = telemetry?.paper.openTpAssessment ?? paperControls?.cgWideTp.assessment ?? null;
+  const diagDir = telemetry?.paper.diagnosticByDirection ?? null;
+  // Diagnostic totals derived from the per-direction split so the headline number and the
+  // open/closed counts always reconcile with the SHORT+LONG breakdown shown below it.
+  const diagRealizedTotal = diagDir ? diagDir.SHORT.realizedPnl + diagDir.LONG.realizedPnl : 0;
+  const diagClosedTotal = diagDir ? diagDir.SHORT.closed + diagDir.LONG.closed : 0;
+  const diagOpenTotal = diagDir ? diagDir.SHORT.open + diagDir.LONG.open : 0;
+  const diagUnrealTotal = diagDir
+    ? (diagDir.SHORT.unrealizedPnl ?? 0) + (diagDir.LONG.unrealizedPnl ?? 0)
+    : 0;
   const activeTpPct = paperControls?.cgWideTp.activeTpPct ?? 3;
   const draftTpPct = Number(tpDraft);
   const draftNetAfterCostPct = Number.isFinite(draftTpPct)
@@ -963,12 +985,25 @@ export default function NeuralMindmap() {
         <div>
           <span>Diagnostic P&amp;L (measurement)</span>
           <strong className="tone-measure">
-            {telemetry ? fmtUsdt(telemetry.paper.diagnosticPnl) : 'Loading'}
+            {telemetry ? `${fmtUsdt(diagRealizedTotal)} · ${diagClosedTotal} closed / ${diagOpenTotal} open` : 'Loading'}
           </strong>
           <small>
-            {telemetry
-              ? `${telemetry.paper.closed} closed / ${telemetry.paper.open} open · ${fmtUsdt(telemetry.paper.diagnosticUnrealizedPnl)} open MTM · not real`
-              : 'paper only'}
+            {telemetry && diagDir ? (
+              <span className="diag-dir-split">
+                {(['SHORT', 'LONG'] as const).map((dir) => {
+                  const d = diagDir[dir];
+                  const tone = d.closed < 1 ? 'tone-measure' : (d.netAvgR ?? 0) > 0 ? 'tone-healthy' : 'tone-critical';
+                  return (
+                    <span key={dir} className="diag-dir-row">
+                      <b>{dir}</b>{' '}
+                      <span className={tone}>{fmtUsdt(d.realizedPnl)}</span>{' realized · '}
+                      {d.closed}cl/{d.open}op · {fmtR(d.netAvgR)} · {d.wr != null ? `${Math.round(d.wr * 100)}% WR` : '—'} · {fmtUsdt(d.unrealizedPnl)} MTM
+                    </span>
+                  );
+                })}
+                <span className="diag-dir-foot">{fmtUsdt(diagUnrealTotal)} open MTM total · not real money</span>
+              </span>
+            ) : 'paper only'}
           </small>
         </div>
         <div>

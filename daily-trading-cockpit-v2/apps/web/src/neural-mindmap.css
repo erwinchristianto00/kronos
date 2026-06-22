@@ -209,6 +209,31 @@
   color: #6fb7c9 !important;
 }
 
+/* Diagnostic P&L tile — SHORT/LONG breakdown stacks vertically (overrides the single-line
+   nowrap/ellipsis of .neural-statusbar small). */
+.neural-statusbar small .diag-dir-split {
+  display: block;
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+}
+.diag-dir-row {
+  display: block;
+  white-space: normal;
+  line-height: 1.45;
+}
+.diag-dir-row b {
+  color: #cdd9df;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+.diag-dir-foot {
+  display: block;
+  margin-top: 2px;
+  color: #70858f;
+  white-space: normal;
+}
+
 .neural-error {
   display: flex;
   gap: 10px;

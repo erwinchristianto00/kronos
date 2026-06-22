@@ -281,6 +281,55 @@ describe("neural map telemetry", () => {
     expect(result.alerts.some((a) => a.source === lane!.label && a.severity === "CRITICAL")).toBe(false);
   });
 
+  it("splits diagnostic P&L by direction (SHORT vs LONG) with diagnostic-scoped counts", () => {
+    const input = baseInput();
+    const order = (id: string, dir: "LONG" | "SHORT", status: string, pnl: number, netR: number | null) => ({
+      id,
+      observationId: `obs-${id}`,
+      sourceObservationKey: `BTCUSDT|${dir}|2026-06-06T11:00:00.000Z|${id}`,
+      sourceType: "ALLOCATOR_LANE",
+      selectedLaneId: "CG_VARIANT_MATRIX:CG_WIDE_STOP_TP_WIDE",
+      symbol: "BTCUSDT",
+      direction: dir,
+      regime: "Bearish pressure",
+      entryPrice: 100,
+      stopLoss: 103,
+      takeProfitLevels: [97],
+      paperStatus: status,
+      plannedStopDistanceBps: 300,
+      openedAt: "2026-06-06T11:00:00.000Z",
+      updatedAt: "2026-06-06T12:00:00.000Z",
+      paperOrderMode: "DIAGNOSTIC_ONLY",
+      paperRiskLabel: "NORMAL",
+      netPnlAmount: pnl,
+      grossR: 1,
+      costR: -0.07,
+      netR,
+      closeReason: "x",
+      reportOnly: true,
+      paperOnly: true,
+    });
+    input.orders = [
+      order("s1", "SHORT", "PAPER_CLOSED_WIN", 10, 0.5),
+      order("s2", "SHORT", "PAPER_CLOSED_LOSS", -20, -1.0),
+      order("s3", "SHORT", "CREATED", 0, null),
+      order("l1", "LONG", "PAPER_CLOSED_LOSS", -5, -0.2),
+      order("l2", "LONG", "PAPER_SUBMITTED", 0, null),
+      order("l3", "LONG", "PAPER_SUBMITTED", 0, null),
+    ] as never[];
+    const d = buildNeuralMapTelemetry(input).paper.diagnosticByDirection;
+    // SHORT: 2 closed (1W/1L), 1 open, realized -10, wr 0.5, netAvgR (0.5-1.0)/2 = -0.25
+    expect(d.SHORT).toMatchObject({ closed: 2, open: 1, realizedPnl: -10 });
+    expect(d.SHORT.wr).toBeCloseTo(0.5, 5);
+    expect(d.SHORT.netAvgR).toBeCloseTo(-0.25, 5);
+    // LONG: 1 closed (L), 2 open, realized -5, wr 0, netAvgR -0.2
+    expect(d.LONG).toMatchObject({ closed: 1, open: 2, realizedPnl: -5 });
+    expect(d.LONG.wr).toBe(0);
+    expect(d.LONG.netAvgR).toBeCloseTo(-0.2, 5);
+    // Per-direction realized reconciles with the diagnostic dollar total.
+    expect(d.SHORT.realizedPnl + d.LONG.realizedPnl).toBe(-15);
+  });
+
   it("does not render hypothetical mixed occupancy as an active warning outside Mixed", () => {
     const input = baseInput();
     input.controller.currentRegime = "Bullish expansion";
