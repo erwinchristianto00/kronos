@@ -40,11 +40,35 @@ try {
 // engine already ticks on its own timer. PAPER_AUTO_CYCLE=0 disables.
 if (process.env.PAPER_AUTO_CYCLE !== "0") {
   const intervalMin = Math.max(1, Number(process.env.PAPER_AUTO_CYCLE_MINUTES ?? 7));
+  const timeoutMs = Math.max(5_000, Number(process.env.PAPER_AUTO_CYCLE_TIMEOUT_MS ?? 45_000));
   const url = `http://127.0.0.1:${port}/api/shadow/operator-brief?paper=1&resolve=1`;
+  let paperCycleInFlight = false;
   const tick = (): void => {
-    fetch(url).catch((e) => console.warn(`[API] paper-cycle tick failed: ${(e as Error).message}`));
+    if (paperCycleInFlight) {
+      console.warn("[API] paper-cycle tick skipped: previous tick still running");
+      return;
+    }
+    paperCycleInFlight = true;
+    const startedAt = Date.now();
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    fetch(url, { signal: controller.signal })
+      .then((res) => {
+        if (!res.ok) {
+          console.warn(`[API] paper-cycle tick returned HTTP ${res.status}`);
+        }
+      })
+      .catch((e) => console.warn(`[API] paper-cycle tick failed: ${(e as Error).message}`))
+      .finally(() => {
+        clearTimeout(timer);
+        paperCycleInFlight = false;
+        const elapsedMs = Date.now() - startedAt;
+        if (elapsedMs > timeoutMs * 0.8) {
+          console.warn(`[API] paper-cycle tick slow: ${elapsedMs}ms`);
+        }
+      });
   };
   setTimeout(tick, 60_000); // first run after a scan has populated candidates
   setInterval(tick, intervalMin * 60_000);
-  console.log(`[API] PAPER_AUTO_CYCLE on — paper admission+resolution every ${intervalMin}min`);
+  console.log(`[API] PAPER_AUTO_CYCLE on — paper admission+resolution every ${intervalMin}min (timeout ${timeoutMs}ms)`);
 }

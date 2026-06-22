@@ -1300,6 +1300,16 @@ export async function registerShadowRoutes(
                 c.openTime + 300000,
               ] as VariantMatrixKlineTuple);
             },
+          }, {
+            maxObservations: (() => {
+              const n = Number(process.env.VARIANT_MATRIX_RESOLVER_MAX_OBSERVATIONS_PER_RUN);
+              return Number.isFinite(n) && n > 0 ? Math.floor(n) : 25;
+            })(),
+            maxRuntimeMs: (() => {
+              const n = Number(process.env.VARIANT_MATRIX_RESOLVER_MAX_RUNTIME_MS);
+              return Number.isFinite(n) && n > 0 ? Math.floor(n) : 6_000;
+            })(),
+            yieldEvery: 1,
           });
           await Promise.race([resolverPromise, new Promise<void>((res) => { setTimeout(res, 8_000); })]);
         } catch { /* resolve=1 failure must never break the brief */ }

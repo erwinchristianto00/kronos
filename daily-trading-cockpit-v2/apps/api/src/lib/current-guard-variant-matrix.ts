@@ -1120,18 +1120,39 @@ export async function walkVariantPath(
 export async function resolveVariantMatrixObservations(
   store: CurrentGuardVariantMatrixStore,
   binanceClient: VariantMatrixBinanceClient,
+  opts: { maxObservations?: number; maxRuntimeMs?: number; yieldEvery?: number } = {},
 ): Promise<{ resolved: number; expired: number; dataFailures: number; errors: number }> {
   let resolved = 0;
   let expired = 0;
   let dataFailures = 0;
   let errors = 0;
   const nowMs = Date.now();
+  const startedMs = nowMs;
+  const maxObservations =
+    typeof opts.maxObservations === "number" && Number.isFinite(opts.maxObservations) && opts.maxObservations > 0
+      ? Math.floor(opts.maxObservations)
+      : Number.POSITIVE_INFINITY;
+  const maxRuntimeMs =
+    typeof opts.maxRuntimeMs === "number" && Number.isFinite(opts.maxRuntimeMs) && opts.maxRuntimeMs > 0
+      ? Math.floor(opts.maxRuntimeMs)
+      : Number.POSITIVE_INFINITY;
+  const yieldEvery =
+    typeof opts.yieldEvery === "number" && Number.isFinite(opts.yieldEvery) && opts.yieldEvery > 0
+      ? Math.floor(opts.yieldEvery)
+      : 1;
+  let processed = 0;
   const twoHoursMs = 2 * 60 * 60 * 1000;
   const candleCache = new Map<string, KlineTuple[]>();
 
   try {
     for (const obs of store.all) {
       if (obs.status !== "OPEN") continue;
+      if (processed >= maxObservations) break;
+      if (Date.now() - startedMs >= maxRuntimeMs) break;
+      processed += 1;
+      if (processed % yieldEvery === 0) {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
 
       // Compute age outside the try block so it is always available.
       const openedAtMs = toMs(obs.openedAt) ?? toMs(obs.createdAt) ?? nowMs;
