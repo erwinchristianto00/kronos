@@ -492,6 +492,57 @@ describe("current-guard-variant-matrix", () => {
     expect(existsSync(join(dir, "shadow-positions.json"))).toBe(false);
   });
 
+  // [RESLV] Regression: the expiry backlog must NOT starve resolvable obs behind it.
+  // Previously the resolver expired stale obs INSIDE the budgeted loop, so a front-loaded
+  // backlog consumed every run's budget and nothing ever closed. Phase 1 now bulk-expires
+  // stale obs for free, leaving the fetch budget for real resolution.
+  it("[RESLV] drains the stale backlog AND resolves a young obs behind it under a tiny budget", async () => {
+    const store = new CurrentGuardVariantMatrixStore(tmpDir());
+    const staleIso = new Date(Date.now() - 40 * 86400000).toISOString(); // >7d → must expire
+    const youngIso = new Date(Date.now() - 1 * 86400000).toISOString(); //  <7d → resolvable
+    // 5 stale signals mirrored FIRST → their obs sit at the FRONT of the store.
+    const stale = Array.from({ length: 5 }, (_, i) =>
+      makeSignal({ sourceSignalId: `stale-${i}`, symbol: `STALE${i}USDT`, openedAt: staleIso }),
+    );
+    mirrorVariantMatrixSignals(stale, store, staleIso);
+    // 1 young, resolvable signal mirrored AFTER → its obs sit BEHIND the backlog.
+    mirrorVariantMatrixSignals(
+      [makeSignal({ sourceSignalId: "young", symbol: "YOUNGUSDT", openedAt: youngIso })],
+      store,
+      youngIso,
+    );
+    const staleOpenBefore = store.all.filter((o) => o.status === "OPEN" && o.openedAt === staleIso).length;
+    expect(staleOpenBefore).toBeGreaterThan(10);
+
+    // Window-aware mock: clean TP at each obs's own signal candle (startTime + CANDLE_MS).
+    const mock = {
+      getKlines: async (
+        _s: string,
+        interval: string,
+        o: { startTime: number; endTime: number; limit: number },
+      ): Promise<KlineTuple[]> => {
+        if (interval === "1m") return [];
+        const open = o.startTime + 300000;
+        return [
+          candle(o.startTime, 100.2, 99.9, 100),
+          candle(open, 104.5, 100.1, 104), // TP (T=104), no SL
+          candle(open + 300000, 105, 103, 104.5),
+        ];
+      },
+    };
+    // Tiny budget: under the OLD code these 3 slots would be eaten by the front backlog and the
+    // young obs would never resolve. Phase 1 frees the budget for real work.
+    const r = await resolveVariantMatrixObservations(store, mock, { maxObservations: 3 });
+
+    // Whole backlog expired in this one run (cheap bulk sweep, not budget-limited)…
+    expect(store.all.filter((o) => o.status === "OPEN" && o.openedAt === staleIso).length).toBe(0);
+    expect(r.expired).toBe(staleOpenBefore);
+    // …AND the young obs actually closed despite sitting behind the backlog.
+    const closed = store.all.filter((o) => o.status === "CLOSED_WIN" || o.status === "CLOSED_LOSS");
+    expect(closed.length).toBeGreaterThanOrEqual(1);
+    expect(closed.every((o) => o.openedAt === youngIso)).toBe(true);
+  });
+
   // Bonus: selection filter (uses the documented ShadowPosition shape).
   it("selectVariantMatrixSignals keeps only stop175 + V2 closed-filled positions", () => {
     const ok = {

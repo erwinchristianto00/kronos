@@ -1301,13 +1301,17 @@ export async function registerShadowRoutes(
               ] as VariantMatrixKlineTuple);
             },
           }, {
+            // Budget is now spent on REAL fetch-walks only (the expiry backlog is drained for free
+            // in the resolver's Phase 1 bulk sweep), so we can afford a deeper per-run budget to
+            // clear the ~2k young-obs backlog in hours. The resolver self-bounds + persists each
+            // resolution incrementally, so even if the 8s brief race abandons it, progress is saved.
             maxObservations: (() => {
               const n = Number(process.env.VARIANT_MATRIX_RESOLVER_MAX_OBSERVATIONS_PER_RUN);
-              return Number.isFinite(n) && n > 0 ? Math.floor(n) : 25;
+              return Number.isFinite(n) && n > 0 ? Math.floor(n) : 100;
             })(),
             maxRuntimeMs: (() => {
               const n = Number(process.env.VARIANT_MATRIX_RESOLVER_MAX_RUNTIME_MS);
-              return Number.isFinite(n) && n > 0 ? Math.floor(n) : 6_000;
+              return Number.isFinite(n) && n > 0 ? Math.floor(n) : 20_000;
             })(),
             yieldEvery: 1,
           });

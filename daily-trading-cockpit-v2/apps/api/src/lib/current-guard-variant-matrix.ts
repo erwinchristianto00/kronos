@@ -600,6 +600,25 @@ export class CurrentGuardVariantMatrixStore {
     this.save();
   }
 
+  /** Apply many patches in-memory and persist ONCE. The resolver uses this to drain the
+   *  expiry backlog (hundreds–thousands of stale OPEN obs) in a single save instead of one
+   *  O(n) file write per observation — the per-update save was the bottleneck that let the
+   *  expiry backlog starve every resolvable observation behind it. */
+  bulkUpdate(updates: Array<{ observationId: string; patch: Partial<CurrentGuardVariantMatrixObservation> }>): void {
+    if (updates.length === 0) return;
+    const indexById = new Map<string, number>();
+    this.observations.forEach((obs, i) => indexById.set(obs.observationId, i));
+    const ts = new Date().toISOString();
+    let touched = 0;
+    for (const { observationId, patch } of updates) {
+      const idx = indexById.get(observationId);
+      if (idx === undefined) continue;
+      this.observations[idx] = { ...this.observations[idx]!, ...patch, updatedAt: patch.updatedAt ?? ts };
+      touched += 1;
+    }
+    if (touched > 0) this.save();
+  }
+
   hasObservation(sourceObservationKey: string, variantId: VariantMatrixVariantId): boolean {
     return this.observations.some(
       (obs) => obs.sourceObservationKey === sourceObservationKey && obs.variantId === variantId,
@@ -1212,8 +1231,45 @@ export async function resolveVariantMatrixObservations(
   const candleCache = new Map<string, KlineTuple[]>();
 
   try {
+    // ── Phase 1: cheap bulk expiry sweep (no I/O, NOT counted against the fetch budget). ──
+    // Stale (>EXPIRY_MS) OPEN observations are marked EXPIRED in ONE save. Previously the expiry
+    // gate lived inside the single resolve loop and consumed the per-run budget (`processed`), so a
+    // large stale backlog at the FRONT of the insertion-ordered store drained every run before it
+    // reached a single resolvable observation — the store grew to thousands of OPEN obs and NOTHING
+    // ever closed. Draining expiries up-front in one pass keeps the fetch budget for real work.
+    const staleIds: string[] = [];
     for (const obs of store.all) {
       if (obs.status !== "OPEN") continue;
+      const openedAtMs = toMs(obs.openedAt) ?? toMs(obs.createdAt) ?? nowMs;
+      if (nowMs - openedAtMs > EXPIRY_MS) staleIds.push(obs.observationId);
+    }
+    if (staleIds.length > 0) {
+      store.bulkUpdate(
+        staleIds.map((observationId) => ({
+          observationId,
+          patch: {
+            status: "EXPIRED" as const,
+            resolvedAt: new Date(nowMs).toISOString(),
+            resolutionSource: "EXPIRED_UNRESOLVED",
+            intrabarResolutionStatus: "INTRABAR_UNAVAILABLE" as const,
+            isFreshValid: null,
+          },
+        })),
+      );
+      expired += staleIds.length;
+      resolved += staleIds.length;
+    }
+
+    // ── Phase 2: fetch-walk the remaining young OPEN obs, OLDEST-first (the most forward candles
+    //    → the best resolution yield), bounded by maxObservations / maxRuntimeMs so each run
+    //    COMPLETES and persists within the caller's window instead of being abandoned mid-flight. ──
+    const young = store.all
+      .filter((o) => o.status === "OPEN")
+      .sort(
+        (a, b) =>
+          (toMs(a.openedAt) ?? toMs(a.createdAt) ?? 0) - (toMs(b.openedAt) ?? toMs(b.createdAt) ?? 0),
+      );
+    for (const obs of young) {
       if (processed >= maxObservations) break;
       if (Date.now() - startedMs >= maxRuntimeMs) break;
       processed += 1;
@@ -1224,28 +1280,7 @@ export async function resolveVariantMatrixObservations(
       // Compute age outside the try block so it is always available.
       const openedAtMs = toMs(obs.openedAt) ?? toMs(obs.createdAt) ?? nowMs;
 
-      // ── Part 1: Expiry gate — checked BEFORE candle fetch. ───────────────
-      // This guarantees stale observations are marked EXPIRED even when the
-      // candle fetch or candle walk would throw (e.g. network error, missing
-      // historical data). The expiry check never requires I/O.
-      if (nowMs - openedAtMs > EXPIRY_MS) {
-        try {
-          store.update(obs.observationId, {
-            status: "EXPIRED",
-            resolvedAt: new Date(nowMs).toISOString(),
-            resolutionSource: "EXPIRED_UNRESOLVED",
-            intrabarResolutionStatus: "INTRABAR_UNAVAILABLE",
-            isFreshValid: null,
-          });
-          expired += 1;
-          resolved += 1;
-        } catch {
-          errors += 1;
-        }
-        continue; // skip candle fetch entirely
-      }
-
-      // ── Candle fetch + path walk (only for non-expired observations) ─────
+      // ── Candle fetch + path walk ─────
       try {
         const closedAtMs = toMs(obs.resolvedAt) ?? null;
         const endBound = Math.min((closedAtMs ?? nowMs) + twoHoursMs, nowMs + twoHoursMs);
