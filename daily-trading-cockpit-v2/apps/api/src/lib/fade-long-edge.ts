@@ -268,3 +268,27 @@ export async function runFadeLongCycle(opts: {
   store.save();
   return { scanned, newEntries, resolved, report: buildFadeLongReport(store.all) };
 }
+
+let cycleInFlight = false;
+export function isFadeLongCycleInFlight(): boolean {
+  return cycleInFlight;
+}
+
+/** Overlap-guarded wrapper: returns null immediately if a cycle is already running. Lets the
+ *  operator-brief fire the cycle fire-and-forget (it surfaces via the separate neural-map endpoint,
+ *  so the brief must never block on it) without two cycles racing on the singleton store. */
+export async function runFadeLongCycleGuarded(opts: {
+  store: FadeLongStore;
+  universe: readonly string[];
+  fetchCandles: (symbol: string) => Promise<Candle[]>;
+  now: number;
+  maxSymbols?: number;
+}): Promise<FadeLongCycleResult | null> {
+  if (cycleInFlight) return null;
+  cycleInFlight = true;
+  try {
+    return await runFadeLongCycle(opts);
+  } finally {
+    cycleInFlight = false;
+  }
+}

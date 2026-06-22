@@ -6,6 +6,7 @@ import {
   resolveFadeLong,
   buildFadeLongReport,
   runFadeLongCycle,
+  runFadeLongCycleGuarded,
   FadeLongStore,
   FADE_LONG_RSI_THRESHOLD,
   type FadeLongObservation,
@@ -208,6 +209,18 @@ describe("runFadeLongCycle", () => {
     const reloaded = new FadeLongStore(file);
     expect(reloaded.all.length).toBe(1);
     expect(reloaded.all[0].symbol).toBe("WLDUSDT");
+  });
+
+  it("runs via the overlap-guarded wrapper and returns a result when free", async () => {
+    const store = new FadeLongStore(join(tmpdir(), `fade-long-test-guard-${process.pid}.json`));
+    const r = await runFadeLongCycleGuarded({
+      store,
+      universe: ["XXXUSDT"],
+      fetchCandles: async () => [],
+      now: 5_000,
+    });
+    expect(r).not.toBeNull();
+    expect(r!.scanned).toBe(0);
   });
 
   it("skips symbols whose candle fetch throws without aborting the cycle", async () => {
