@@ -1307,6 +1307,51 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
     }
   }
 
+  // ── Resolution-stall detector (2026-06-22) ──────────────────────────────────
+  // The resolver was once silently frozen for days (VM closed 0 for 18d; the paper book stuck at
+  // ~4 closed / 570 open from a too-small .env budget). This surfaces a WARNING the moment
+  // resolution falls behind a large backlog — so a freeze from ANY cause (code, env over-throttle,
+  // candle-fetch failure, resolver not running) is VISIBLE on the dashboard, not silent. All
+  // WARNING (never red CRITICAL): nothing here is real money. Thresholds env-tunable.
+  const nowParsedMs = Date.parse(generatedAt);
+  const rd = input.variantMatrix.resolverDiagnostics;
+  const STALL_RUN_AGE_MIN = Number(process.env.RESOLVER_STALL_RUN_AGE_MIN) || 30;
+  const STALL_STALE_OPEN = Number(process.env.RESOLVER_STALL_STALE_OPEN) || 150;
+  const vmRunAgeMin = rd.lastRunAt ? (nowParsedMs - Date.parse(rd.lastRunAt)) / 60_000 : null;
+  if (vmRunAgeMin !== null && Number.isFinite(vmRunAgeMin) && vmRunAgeMin > STALL_RUN_AGE_MIN) {
+    alerts.push({
+      severity: "WARNING",
+      source: "Resolver Stalled",
+      message: `variant-matrix resolver last ran ${Math.round(vmRunAgeMin)}m ago (>${STALL_RUN_AGE_MIN}m) — observations are not being closed`,
+    });
+  } else if (rd.staleOpenCount >= STALL_STALE_OPEN) {
+    alerts.push({
+      severity: "WARNING",
+      source: "Resolver Stalled",
+      message: `${rd.staleOpenCount} observations stale-open >72h (oldest ${rd.oldestOpenAgeHours ?? "?"}h) — VM resolution is falling behind the backlog`,
+    });
+  }
+  // Paper book: no per-run resolver meta is exposed, so detect a sustained freeze structurally —
+  // a large open backlog whose OLDEST order is aging toward the 7d expiry while almost nothing has
+  // closed (healthy wide-geometry still closes a meaningful share as orders mature; a frozen
+  // resolver closes ~0). Distinguishes "stalled" from "slow-by-design".
+  const PAPER_STALL_OPEN = Number(process.env.PAPER_STALL_OPEN_BACKLOG) || 300;
+  const PAPER_STALL_AGE_H = Number(process.env.PAPER_STALL_OLDEST_AGE_H) || 120;
+  const openPaperOrders = input.orders.filter((o) => OPEN.has(o.paperStatus));
+  if (openPaperOrders.length >= PAPER_STALL_OPEN && input.paper.closed < openPaperOrders.length * 0.03) {
+    const ages = openPaperOrders
+      .map((o) => nowParsedMs - Date.parse(o.openedAt))
+      .filter((n) => Number.isFinite(n) && n >= 0);
+    const oldestAgeH = ages.length ? Math.max(...ages) / 3_600_000 : 0;
+    if (oldestAgeH > PAPER_STALL_AGE_H) {
+      alerts.push({
+        severity: "WARNING",
+        source: "Paper Resolver Stalled",
+        message: `${openPaperOrders.length} open / only ${input.paper.closed} closed, oldest ${Math.round(oldestAgeH)}h (near 7d expiry) — paper resolution has stalled`,
+      });
+    }
+  }
+
   return {
     version: "neural-map-v1",
     generatedAt,

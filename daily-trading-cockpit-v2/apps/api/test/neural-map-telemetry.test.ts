@@ -330,6 +330,52 @@ describe("neural map telemetry", () => {
     expect(d.SHORT.realizedPnl + d.LONG.realizedPnl).toBe(-15);
   });
 
+  it("flags a stalled VM resolver (not running, or backlog aging) and stays quiet when healthy", () => {
+    // Healthy baseline (lastRunAt null, staleOpenCount 0) → no stall alert.
+    expect(buildNeuralMapTelemetry(baseInput()).alerts.some((a) => a.source === "Resolver Stalled")).toBe(false);
+
+    // (a) Resolver hasn't run in > 30 min.
+    const a = baseInput();
+    a.generatedAt = "2026-06-06T12:00:00.000Z";
+    a.variantMatrix.resolverDiagnostics = { ...a.variantMatrix.resolverDiagnostics, lastRunAt: "2026-06-06T11:00:00.000Z" };
+    const ra = buildNeuralMapTelemetry(a).alerts.find((x) => x.source === "Resolver Stalled");
+    expect(ra).toBeDefined();
+    expect(ra!.severity).toBe("WARNING");
+
+    // (b) Resolver ran recently but a large backlog is stale-open (>72h).
+    const b = baseInput();
+    b.generatedAt = "2026-06-06T12:00:00.000Z";
+    b.variantMatrix.resolverDiagnostics = {
+      ...b.variantMatrix.resolverDiagnostics,
+      lastRunAt: "2026-06-06T11:56:00.000Z",
+      staleOpenCount: 200,
+      oldestOpenAgeHours: 150,
+    };
+    expect(buildNeuralMapTelemetry(b).alerts.some((x) => x.source === "Resolver Stalled")).toBe(true);
+  });
+
+  it("flags a stalled PAPER resolver (big backlog, oldest near expiry, ~0 closed)", () => {
+    const prev = process.env.PAPER_STALL_OPEN_BACKLOG;
+    process.env.PAPER_STALL_OPEN_BACKLOG = "3";
+    try {
+      const input = baseInput();
+      input.generatedAt = "2026-06-10T00:00:00.000Z";
+      input.paper.closed = 0;
+      const oldIso = "2026-06-04T00:00:00.000Z"; // 6 days (144h) before generatedAt > 120h
+      const mk = (status: string, dir: "LONG" | "SHORT") => ({
+        paperStatus: status, openedAt: oldIso, direction: dir, paperOrderMode: "DIAGNOSTIC_ONLY",
+        diagnosticLabel: null, selectedLaneId: "X", netPnlAmount: null, netR: null,
+      });
+      input.orders = [mk("CREATED", "SHORT"), mk("CREATED", "SHORT"), mk("PAPER_SUBMITTED", "LONG")] as never[];
+      const alert = buildNeuralMapTelemetry(input).alerts.find((a) => a.source === "Paper Resolver Stalled");
+      expect(alert).toBeDefined();
+      expect(alert!.severity).toBe("WARNING");
+    } finally {
+      if (prev === undefined) delete process.env.PAPER_STALL_OPEN_BACKLOG;
+      else process.env.PAPER_STALL_OPEN_BACKLOG = prev;
+    }
+  });
+
   it("does not render hypothetical mixed occupancy as an active warning outside Mixed", () => {
     const input = baseInput();
     input.controller.currentRegime = "Bullish expansion";
