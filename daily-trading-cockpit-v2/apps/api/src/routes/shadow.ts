@@ -1305,13 +1305,16 @@ export async function registerShadowRoutes(
             // in the resolver's Phase 1 bulk sweep), so we can afford a deeper per-run budget to
             // clear the ~2k young-obs backlog in hours. The resolver self-bounds + persists each
             // resolution incrementally, so even if the 8s brief race abandons it, progress is saved.
+            // SANITY FLOOR (2026-06-22): a too-small env override (it was set to 25/6 on the VPS,
+            // which silently froze resolution for days) is clamped UP so resolution can never stall.
+            // Env can still tune HIGHER; it just can't cripple the resolver below a workable minimum.
             maxObservations: (() => {
               const n = Number(process.env.VARIANT_MATRIX_RESOLVER_MAX_OBSERVATIONS_PER_RUN);
-              return Number.isFinite(n) && n > 0 ? Math.floor(n) : 100;
+              return Number.isFinite(n) && n > 0 ? Math.max(40, Math.floor(n)) : 100;
             })(),
             maxRuntimeMs: (() => {
               const n = Number(process.env.VARIANT_MATRIX_RESOLVER_MAX_RUNTIME_MS);
-              return Number.isFinite(n) && n > 0 ? Math.floor(n) : 20_000;
+              return Number.isFinite(n) && n > 0 ? Math.max(8_000, Math.floor(n)) : 20_000;
             })(),
             yieldEvery: 1,
           });
@@ -1637,13 +1640,15 @@ export async function registerShadowRoutes(
             // barely resolving and piling toward the 7-day expiry). Budget is now spent only on
             // real fetch-walks (expiry sweep is free), so a deeper bound drains the book; the
             // runtime cap keeps it from monopolizing the event loop.
+            // SANITY FLOOR (2026-06-22): clamp a too-small env override UP (the VPS had this at 6,
+            // which froze the paper book at ~4 closed / 570 open for days). Tunable higher, never lower.
             resolverMaxOrders: (() => {
               const n = Number(process.env.PAPER_RESOLVER_MAX_ORDERS_PER_RUN);
-              return Number.isFinite(n) && n > 0 ? Math.floor(n) : 80;
+              return Number.isFinite(n) && n > 0 ? Math.max(40, Math.floor(n)) : 80;
             })(),
             resolverMaxRuntimeMs: (() => {
               const n = Number(process.env.PAPER_RESOLVER_MAX_RUNTIME_MS);
-              return Number.isFinite(n) && n > 0 ? Math.floor(n) : 12_000;
+              return Number.isFinite(n) && n > 0 ? Math.max(8_000, Math.floor(n)) : 12_000;
             })(),
           });
           const result = await Promise.race([
