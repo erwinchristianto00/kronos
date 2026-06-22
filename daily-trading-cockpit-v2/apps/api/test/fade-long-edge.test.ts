@@ -65,10 +65,9 @@ describe("detectFadeLongEntry", () => {
   });
 
   it("emits a fade-long observation on the fresh oversold cross bar", () => {
-    const obs = detectFadeLongEntry("WLDUSDT", candles.slice(0, crossIdx + 1), 5_000, "Bullish expansion");
+    const obs = detectFadeLongEntry("WLDUSDT", candles.slice(0, crossIdx + 1), 5_000);
     expect(obs).not.toBeNull();
     expect(obs!.symbol).toBe("WLDUSDT");
-    expect(obs!.regimeAtEntry).toBe("Bullish expansion");
     expect(obs!.rsiAtEntry).toBeLessThan(FADE_LONG_RSI_THRESHOLD);
     expect(obs!.stopLoss).toBeLessThan(obs!.entryPrice);
     expect(obs!.takeProfit).toBeGreaterThan(obs!.entryPrice);
@@ -90,7 +89,6 @@ function openObs(): FadeLongObservation {
   return {
     observationId: "fadelong:TST:1000",
     symbol: "TSTUSDT",
-    regimeAtEntry: "Bullish expansion",
     rsiAtEntry: 25,
     entryPrice: entry,
     stopLoss: entry * (1 - 0.015), // 98.5, risk = 1.5
@@ -165,17 +163,6 @@ describe("buildFadeLongReport", () => {
     expect(r.netAvgR).toBeCloseTo((0.35 + 0.35 - 1.23) / 3, 5);
     expect(r.pf).toBeCloseTo(0.7 / 1.23, 5);
     expect(r.status).toBe("COLLECTING"); // 3 < WATCHABLE threshold
-    expect(r.byRegime).toEqual([
-      {
-        regime: "Bullish expansion",
-        freshValid: 3,
-        open: 1,
-        expired: 1,
-        netAvgR: expect.closeTo((0.35 + 0.35 - 1.23) / 3, 5),
-        wr: expect.closeTo(2 / 3, 5),
-        totalNetR: expect.closeTo(0.35 + 0.35 - 1.23, 5),
-      },
-    ]);
   });
 });
 
@@ -202,13 +189,11 @@ describe("runFadeLongCycle", () => {
       universe: ["WLDUSDT"],
       fetchCandles: async () => cycle1Candles,
       now: 1000 + 100 * 60000,
-      regimeAtEntry: "Bearish pressure",
     });
     expect(r1.scanned).toBe(1);
     expect(r1.newEntries).toBe(1);
     expect(store.all.length).toBe(1);
     expect(store.all[0].status).toBe("OPEN");
-    expect(store.all[0].regimeAtEntry).toBe("Bearish pressure");
 
     // Re-running the same candles must NOT create a duplicate observation.
     const r2 = await runFadeLongCycle({
@@ -216,7 +201,6 @@ describe("runFadeLongCycle", () => {
       universe: ["WLDUSDT"],
       fetchCandles: async () => cycle1Candles,
       now: 1000 + 101 * 60000,
-      regimeAtEntry: "Mixed",
     });
     expect(r2.newEntries).toBe(0);
     expect(store.all.length).toBe(1);
@@ -225,7 +209,6 @@ describe("runFadeLongCycle", () => {
     const reloaded = new FadeLongStore(file);
     expect(reloaded.all.length).toBe(1);
     expect(reloaded.all[0].symbol).toBe("WLDUSDT");
-    expect(reloaded.all[0].regimeAtEntry).toBe("Bearish pressure");
   });
 
   it("runs via the overlap-guarded wrapper and returns a result when free", async () => {

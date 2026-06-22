@@ -16,11 +16,6 @@ dash.example.duckdns.org {
 	}
 
 	# /api/* → the trading API (localhost only)
-	handle /api/shadow/neural-map {
-		root * /home/ubuntu/daily-trading-cockpit-v2/apps/api/data
-		rewrite * /neural-map-last-good.json
-		file_server
-	}
 	handle /api/* {
 		reverse_proxy 127.0.0.1:3101
 	}
@@ -45,11 +40,6 @@ dash.example.duckdns.org {
 # 	tls internal
 # 	basicauth {
 # 		admin REPLACE_WITH_BCRYPT_HASH
-# 	}
-# 	handle /api/shadow/neural-map {
-# 		root * /home/ubuntu/daily-trading-cockpit-v2/apps/api/data
-# 		rewrite * /neural-map-last-good.json
-# 		file_server
 # 	}
 # 	handle /api/* {
 # 		reverse_proxy 127.0.0.1:3101

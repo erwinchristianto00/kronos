@@ -41,18 +41,8 @@ try {
 if (process.env.PAPER_AUTO_CYCLE !== "0") {
   const intervalMin = Math.max(1, Number(process.env.PAPER_AUTO_CYCLE_MINUTES ?? 7));
   const url = `http://127.0.0.1:${port}/api/shadow/operator-brief?paper=1&resolve=1`;
-  let paperCycleInFlight = false;
   const tick = (): void => {
-    if (paperCycleInFlight) return;
-    paperCycleInFlight = true;
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), Number(process.env.PAPER_AUTO_CYCLE_TIMEOUT_MS ?? 45_000));
-    fetch(url, { signal: controller.signal })
-      .catch((e) => console.warn(`[API] paper-cycle tick failed: ${(e as Error).message}`))
-      .finally(() => {
-        clearTimeout(timeout);
-        paperCycleInFlight = false;
-      });
+    fetch(url).catch((e) => console.warn(`[API] paper-cycle tick failed: ${(e as Error).message}`));
   };
   setTimeout(tick, 60_000); // first run after a scan has populated candidates
   setInterval(tick, intervalMin * 60_000);

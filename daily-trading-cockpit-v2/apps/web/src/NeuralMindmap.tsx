@@ -167,15 +167,6 @@ interface NeuralTelemetry {
     freshValid: number;
     open: number;
     expired: number;
-    byRegime: Array<{
-      regime: string;
-      freshValid: number;
-      open: number;
-      expired: number;
-      netAvgR: number | null;
-      wr: number | null;
-      totalNetR: number;
-    }>;
     oosThreshold: number;
     status: 'COLLECTING' | 'WATCHABLE';
     netAvgR: number | null;
@@ -650,18 +641,6 @@ interface LiveAccount {
   lanes: LiveLaneExposure[];
 }
 
-async function fetchJsonWithTimeout<T>(url: string, timeoutMs = 30_000): Promise<T> {
-  const controller = new AbortController();
-  const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const response = await fetch(url, { cache: 'no-store', signal: controller.signal });
-    if (!response.ok) throw new Error(`${url} failed (${response.status})`);
-    return await response.json() as T;
-  } finally {
-    window.clearTimeout(timeout);
-  }
-}
-
 export default function NeuralMindmap() {
   const [telemetry, setTelemetry] = useState<NeuralTelemetry | null>(null);
   const [liveAccount, setLiveAccount] = useState<LiveAccount | null>(null);
@@ -677,13 +656,14 @@ export default function NeuralMindmap() {
 
   async function loadTelemetry() {
     try {
-      const next = await fetchJsonWithTimeout<NeuralTelemetry>('/api/shadow/neural-map');
+      const response = await fetch('/api/shadow/neural-map', { cache: 'no-store' });
+      if (!response.ok) throw new Error(`Telemetry request failed (${response.status})`);
+      const next = await response.json() as NeuralTelemetry;
       setTelemetry(next);
       setLastReceivedAt(Date.now());
       setError(null);
     } catch (nextError) {
-      const message = nextError instanceof Error ? nextError.message : 'Neural telemetry unavailable';
-      setError(telemetry ? null : message);
+      setError(nextError instanceof Error ? nextError.message : 'Neural telemetry unavailable');
     } finally {
       setLoading(false);
     }
@@ -733,7 +713,7 @@ export default function NeuralMindmap() {
     const timer = window.setInterval(() => {
       void loadTelemetry();
       void loadLiveAccount();
-    }, 30_000);
+    }, 5_000);
     return () => window.clearInterval(timer);
   }, [autoRefresh]);
 
@@ -757,7 +737,7 @@ export default function NeuralMindmap() {
   const selectedLiveLane = liveAccount?.lanes.find((lane) => lane.laneId === selectedLane?.id) ?? null;
   const selectedGuide = selectedNode ? PROCESS_GUIDES[selectedNode.id] : null;
   const newestAgeSec = lastReceivedAt === null ? Infinity : Math.round((Date.now() - lastReceivedAt) / 1000);
-  const stale = newestAgeSec > (telemetry?.staleAfterSec ?? 30) || Boolean(error && !telemetry);
+  const stale = newestAgeSec > (telemetry?.staleAfterSec ?? 30) || Boolean(error);
   const criticalCount = (telemetry?.nodes.filter((node) => node.health === 'CRITICAL').length ?? 0) +
     (telemetry?.lanes.filter((lane) => lane.health === 'CRITICAL').length ?? 0);
   const warningCount = (telemetry?.nodes.filter((node) => node.health === 'WARNING').length ?? 0) +
@@ -984,13 +964,9 @@ export default function NeuralMindmap() {
               : 'Loading'}
           </strong>
           <small>
-            {(() => {
-              const fl = telemetry?.fadeLong;
-              if (!fl) return 'RSI<30 measurement lane';
-              const topRegime = fl.byRegime?.[0];
-              const regimeLabel = topRegime ? ` · ${topRegime.regime}: ${topRegime.freshValid} OOS/${topRegime.open} open` : '';
-              return `${fl.freshValid}/${fl.oosThreshold} OOS · ${fl.open} open · ${fl.status === 'WATCHABLE' ? 'watchable' : 'collecting'}${regimeLabel} · not real`;
-            })()}
+            {telemetry?.fadeLong
+              ? `${telemetry.fadeLong.freshValid}/${telemetry.fadeLong.oosThreshold} OOS · ${telemetry.fadeLong.open} open · ${telemetry.fadeLong.status === 'WATCHABLE' ? 'watchable' : 'collecting'} · not real`
+              : 'RSI<30 measurement lane'}
           </small>
         </div>
         <div>
