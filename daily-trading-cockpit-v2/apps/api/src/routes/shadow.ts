@@ -1633,13 +1633,17 @@ export async function registerShadowRoutes(
                 ? allocatorReport?.selectedOpportunities[0]?.laneId ?? null
                 : null,
             executionModel: _paperExecModel,
+            // 8/run was far too tight for a live book of ~200+ open orders (it left the book
+            // barely resolving and piling toward the 7-day expiry). Budget is now spent only on
+            // real fetch-walks (expiry sweep is free), so a deeper bound drains the book; the
+            // runtime cap keeps it from monopolizing the event loop.
             resolverMaxOrders: (() => {
               const n = Number(process.env.PAPER_RESOLVER_MAX_ORDERS_PER_RUN);
-              return Number.isFinite(n) && n > 0 ? Math.floor(n) : 8;
+              return Number.isFinite(n) && n > 0 ? Math.floor(n) : 80;
             })(),
             resolverMaxRuntimeMs: (() => {
               const n = Number(process.env.PAPER_RESOLVER_MAX_RUNTIME_MS);
-              return Number.isFinite(n) && n > 0 ? Math.floor(n) : 6_000;
+              return Number.isFinite(n) && n > 0 ? Math.floor(n) : 12_000;
             })(),
           });
           const result = await Promise.race([

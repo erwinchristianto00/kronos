@@ -900,6 +900,65 @@ describe("paper-execution-router", () => {
     expect(order!.netR).not.toBeNull();
   });
 
+  // [RESLV-paper] Regression: a stale-expiry backlog must NOT consume the per-run resolution
+  // budget. The paper resolver was bounded (maxOrders) with expiries still counted against that
+  // budget, so a front-loaded backlog of >7d orders would eat every slot and starve resolvable
+  // orders behind it — the same starvation class fixed in the variant-matrix resolver.
+  it("[RESLV-paper] expiry backlog does not starve a resolvable order under a tiny budget", async () => {
+    const dir = tmpDir();
+    const store = new PaperExecutionRouterStore(dir);
+    store.ensurePaperStartAt(new Date(Date.now() - 60_000).toISOString());
+    const staleIso = new Date(Date.now() - 40 * 86400000).toISOString(); // >7d → must expire
+    const youngIso = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(); // <7d → resolvable
+    // Stale orders added FIRST → they sit at the FRONT of the book.
+    for (let i = 0; i < 5; i++) {
+      store.add(
+        makePaperOrder({
+          paperOrderId: `stale-${i}`,
+          dedupeKey: `stale-${i}:lane`,
+          sourceObservationId: `obs-stale-${i}`,
+          openedAt: staleIso,
+          createdAt: staleIso,
+        }),
+      );
+    }
+    // Young, resolvable SHORT order (entry 100 / TP 96) BEHIND the backlog.
+    store.add(
+      makePaperOrder({
+        paperOrderId: "young-win",
+        dedupeKey: "young-win:lane",
+        sourceObservationId: "obs-young",
+        openedAt: youngIso,
+        createdAt: youngIso,
+        symbol: "ETHUSDT",
+        direction: "SHORT",
+        entryPrice: 100,
+        stopLoss: 103,
+        takeProfitLevels: [96],
+        plannedStopDistanceBps: 300,
+      }),
+    );
+    const mockBinance: PaperResolverClient = {
+      getKlines: async (_s, interval, opts) => {
+        if (interval === "1m") return [];
+        const signalMs = opts.startTime + 300_000;
+        return [
+          [signalMs - 300_000, "0", "100.2", "99.9", "100", "0", signalMs] as PaperKlineTuple,
+          [signalMs, "0", "100.5", "95.5", "96", "0", signalMs + 300_000] as PaperKlineTuple, // SHORT TP
+        ];
+      },
+    };
+    // maxOrders:1 — under the OLD code the 5 stale expiries would eat the budget and the young
+    // order would never resolve. With the fix, expiries are swept for free.
+    await resolvePaperOrders(store, mockBinance, undefined, { maxOrders: 1 });
+
+    const stale = store.all.filter((o) => o.paperOrderId.startsWith("stale-"));
+    expect(stale.length).toBe(5);
+    expect(stale.every((o) => o.paperStatus === "PAPER_EXPIRED")).toBe(true);
+    const young = store.all.find((o) => o.paperOrderId === "young-win");
+    expect(young!.paperStatus).toBe("PAPER_CLOSED_WIN");
+  });
+
   // [24a] scaleout_tp1_trail resolves via the canonical engine — banks 0.5R partial, NOT tp1_full.
   it("[24a] scaleout exit resolves to blended ~0.5*reward (not collapsed to tp1_full)", async () => {
     const dir = tmpDir();

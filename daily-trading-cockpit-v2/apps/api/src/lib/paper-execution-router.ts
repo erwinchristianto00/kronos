@@ -1485,15 +1485,14 @@ export async function resolvePaperOrders(
 
   for (const order of store.all.slice()) {
     if (order.paperStatus !== "CREATED" && order.paperStatus !== "PAPER_SUBMITTED") continue;
-    if (processed >= maxOrders) break;
     if (Date.now() - startedMs >= maxRuntimeMs) break;
-    processed += 1;
-    if (processed % yieldEvery === 0) {
-      await new Promise<void>((resolve) => setImmediate(resolve));
-    }
     const openedAtMs = new Date(order.openedAt).getTime();
 
-    // Expiry BEFORE candle fetch
+    // Expiry sweep — cheap (no candle fetch), so it must NOT consume the per-run fetch budget.
+    // Counting expiries against `processed` (the prior behaviour) let a backlog of expiry-eligible
+    // orders at the FRONT of the book eat the whole maxOrders budget and starve the resolvable
+    // orders behind them — the same starvation class fixed in the variant-matrix resolver. Orders
+    // are insertion-ordered (oldest first), so expiry-eligible ones are always at the front.
     if (nowMs - openedAtMs > PAPER_ORDER_EXPIRY_MS) {
       store.update(order.paperOrderId, {
         paperStatus: "PAPER_EXPIRED",
@@ -1503,6 +1502,13 @@ export async function resolvePaperOrders(
       expired += 1;
       resolved += 1;
       continue;
+    }
+
+    // The budget applies ONLY to real fetch-walk resolution.
+    if (processed >= maxOrders) break;
+    processed += 1;
+    if (processed % yieldEvery === 0) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
     }
 
     try {
