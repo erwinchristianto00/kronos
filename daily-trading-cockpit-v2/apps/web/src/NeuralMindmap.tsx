@@ -650,7 +650,7 @@ interface LiveAccount {
   lanes: LiveLaneExposure[];
 }
 
-async function fetchJsonWithTimeout<T>(url: string, timeoutMs = 12_000): Promise<T> {
+async function fetchJsonWithTimeout<T>(url: string, timeoutMs = 30_000): Promise<T> {
   const controller = new AbortController();
   const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -682,7 +682,8 @@ export default function NeuralMindmap() {
       setLastReceivedAt(Date.now());
       setError(null);
     } catch (nextError) {
-      setError(nextError instanceof Error ? nextError.message : 'Neural telemetry unavailable');
+      const message = nextError instanceof Error ? nextError.message : 'Neural telemetry unavailable';
+      setError(telemetry ? null : message);
     } finally {
       setLoading(false);
     }
@@ -732,7 +733,7 @@ export default function NeuralMindmap() {
     const timer = window.setInterval(() => {
       void loadTelemetry();
       void loadLiveAccount();
-    }, 5_000);
+    }, 30_000);
     return () => window.clearInterval(timer);
   }, [autoRefresh]);
 
@@ -756,7 +757,7 @@ export default function NeuralMindmap() {
   const selectedLiveLane = liveAccount?.lanes.find((lane) => lane.laneId === selectedLane?.id) ?? null;
   const selectedGuide = selectedNode ? PROCESS_GUIDES[selectedNode.id] : null;
   const newestAgeSec = lastReceivedAt === null ? Infinity : Math.round((Date.now() - lastReceivedAt) / 1000);
-  const stale = newestAgeSec > (telemetry?.staleAfterSec ?? 30) || Boolean(error);
+  const stale = newestAgeSec > (telemetry?.staleAfterSec ?? 30) || Boolean(error && !telemetry);
   const criticalCount = (telemetry?.nodes.filter((node) => node.health === 'CRITICAL').length ?? 0) +
     (telemetry?.lanes.filter((lane) => lane.health === 'CRITICAL').length ?? 0);
   const warningCount = (telemetry?.nodes.filter((node) => node.health === 'WARNING').length ?? 0) +

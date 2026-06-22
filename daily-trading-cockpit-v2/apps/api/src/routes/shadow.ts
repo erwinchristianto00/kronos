@@ -1,5 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import { buildStrategyExperienceRecords, buildStrategyIntelligenceFoundationReport } from "@dtc/shared";
+import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { dirname } from "node:path";
 
 import type { ShadowExecutionEngine } from "../lib/shadow-engine.js";
 import { buildExpansionReport } from "../lib/expansion-report.js";
@@ -251,6 +253,25 @@ function withTimeoutFallback<T>(promise: Promise<T>, timeoutMs: number, fallback
 let neuralMapResponseCache: NeuralMapTelemetry | null = null;
 let neuralMapResponseCacheAt = 0;
 let neuralMapResponseInFlight: Promise<NeuralMapTelemetry> | null = null;
+const NEURAL_MAP_LAST_GOOD_FILE = "data/neural-map-last-good.json";
+
+function readLastGoodNeuralMap(): NeuralMapTelemetry | null {
+  try {
+    if (!existsSync(NEURAL_MAP_LAST_GOOD_FILE)) return null;
+    return JSON.parse(readFileSync(NEURAL_MAP_LAST_GOOD_FILE, "utf-8")) as NeuralMapTelemetry;
+  } catch {
+    return null;
+  }
+}
+
+function writeLastGoodNeuralMap(snapshot: NeuralMapTelemetry): void {
+  try {
+    mkdirSync(dirname(NEURAL_MAP_LAST_GOOD_FILE), { recursive: true });
+    writeFileSync(NEURAL_MAP_LAST_GOOD_FILE, JSON.stringify(snapshot), "utf-8");
+  } catch {
+    // Dashboard fallback persistence must never affect API responses.
+  }
+}
 
 export async function registerShadowRoutes(
   app: FastifyInstance,
@@ -1075,7 +1096,15 @@ export async function registerShadowRoutes(
 
   app.get("/api/shadow/neural-map", async () => {
     const now = Date.now();
-    if (neuralMapResponseCache && now - neuralMapResponseCacheAt < 5_000) return neuralMapResponseCache;
+    if (neuralMapResponseCache && now - neuralMapResponseCacheAt < Number(process.env.NEURAL_MAP_CACHE_MS || 60_000)) {
+      return neuralMapResponseCache;
+    }
+    const lastGood = readLastGoodNeuralMap();
+    if (lastGood) {
+      neuralMapResponseCache = lastGood;
+      neuralMapResponseCacheAt = now;
+      return lastGood;
+    }
     if (neuralMapResponseInFlight) {
       if (neuralMapResponseCache) return neuralMapResponseCache;
       return neuralMapResponseInFlight;
@@ -1153,6 +1182,7 @@ export async function registerShadowRoutes(
     });
     neuralMapResponseCache = response;
     neuralMapResponseCacheAt = Date.now();
+    writeLastGoodNeuralMap(response);
     return response;
     })();
     try {
