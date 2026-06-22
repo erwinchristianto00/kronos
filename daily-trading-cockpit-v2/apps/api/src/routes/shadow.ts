@@ -165,7 +165,11 @@ import {
   getRegimeDirectionControllerSnapshotStore,
   buildSnapshotFromReport,
 } from "../lib/regime-direction-controller-snapshot.js";
-import { buildNeuralMapTelemetry, buildPaperUnrealizedSnapshot } from "../lib/neural-map-telemetry.js";
+import {
+  buildNeuralMapTelemetry,
+  buildPaperUnrealizedSnapshot,
+  type NeuralMapTelemetry,
+} from "../lib/neural-map-telemetry.js";
 import {
   assessPaperTp,
   readPaperTradingControls,
@@ -233,6 +237,20 @@ function parsePositiveIntEnv(value: string | undefined, fallback: number): numbe
   const parsed = Number.parseInt(value ?? "", 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
+
+function withTimeoutFallback<T>(promise: Promise<T>, timeoutMs: number, fallback: T): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | null = null;
+  const timeoutPromise = new Promise<T>((resolve) => {
+    timeout = setTimeout(() => resolve(fallback), timeoutMs);
+  });
+  return Promise.race([promise, timeoutPromise]).finally(() => {
+    if (timeout) clearTimeout(timeout);
+  });
+}
+
+let neuralMapResponseCache: NeuralMapTelemetry | null = null;
+let neuralMapResponseCacheAt = 0;
+let neuralMapResponseInFlight: Promise<NeuralMapTelemetry> | null = null;
 
 export async function registerShadowRoutes(
   app: FastifyInstance,
@@ -1056,6 +1074,14 @@ export async function registerShadowRoutes(
   });
 
   app.get("/api/shadow/neural-map", async () => {
+    const now = Date.now();
+    if (neuralMapResponseCache && now - neuralMapResponseCacheAt < 5_000) return neuralMapResponseCache;
+    if (neuralMapResponseInFlight) {
+      if (neuralMapResponseCache) return neuralMapResponseCache;
+      return neuralMapResponseInFlight;
+    }
+
+    neuralMapResponseInFlight = (async () => {
     const generatedAt = new Date().toISOString();
     const cached = getLatestScanCandidates();
     const scanStatus = opts.coreScanAutoRefreshController?.getStatus() ?? null;
@@ -1071,7 +1097,11 @@ export async function registerShadowRoutes(
     const paperStore = getPaperExecutionRouterStore();
     const orders = paperStore.getState().orders;
     const paper = buildPaperPerformanceReport(paperStore);
-    const paperUnrealized = await buildPaperUnrealizedSnapshot(orders, opts.binanceClient, generatedAt);
+    const paperUnrealized = await withTimeoutFallback(
+      buildPaperUnrealizedSnapshot(orders, opts.binanceClient, generatedAt),
+      Number(process.env.NEURAL_MAP_UNREALIZED_TIMEOUT_MS || 4_000),
+      null,
+    );
     const variantMatrix = buildCurrentGuardVariantMatrixReport(
       getCurrentGuardVariantMatrixStore(),
       { capturedAt: generatedAt },
@@ -1098,7 +1128,7 @@ export async function registerShadowRoutes(
     });
     const mixedValidation = buildMixedBudgetForwardValidation(orders, generatedAt);
     const staleAudit = buildOpenOrderStaleAudit(orders, Date.now());
-    return buildNeuralMapTelemetry({
+    const response = buildNeuralMapTelemetry({
       generatedAt,
       controller,
       scanStatus,
@@ -1121,6 +1151,15 @@ export async function registerShadowRoutes(
           : []),
       ],
     });
+    neuralMapResponseCache = response;
+    neuralMapResponseCacheAt = Date.now();
+    return response;
+    })();
+    try {
+      return await neuralMapResponseInFlight;
+    } finally {
+      neuralMapResponseInFlight = null;
+    }
   });
 
   app.get("/api/shadow/paper-controls", async () => {
