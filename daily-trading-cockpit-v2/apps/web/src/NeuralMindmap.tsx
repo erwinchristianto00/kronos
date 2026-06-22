@@ -936,7 +936,7 @@ export default function NeuralMindmap() {
           </strong>
           <small>
             {telemetry
-              ? `cumulative · ${fmtUsdt(telemetry.paper.diagnosticUnrealizedPnl)} open · not real money`
+              ? `${telemetry.paper.closed} closed / ${telemetry.paper.open} open · ${fmtUsdt(telemetry.paper.diagnosticUnrealizedPnl)} open MTM · not real`
               : 'paper only'}
           </small>
         </div>
