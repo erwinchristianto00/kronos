@@ -408,6 +408,13 @@ const VARIANT_MATRIX_DIAGNOSTIC_IDS: readonly VariantMatrixVariantId[] = [
   BULL_SCALEOUT_VARIANT_ID,
   "LG_R12_STOP250_FULL",
   "LG_R12_STOP300_FULL",
+  // 2026-06-23: the SHORT-fade edge is real (78-80% WR) but TP placement decides payoff — the
+  // VM-sim ladder showed the fast 0.5R exit is the sweet spot (CG_WIDE_FAST_SHORT +0.139R) while
+  // the raw tiny TP nets ~flat (+0.017R) and a far 1R TP loses (-0.181R, shorts don't reach it in
+  // this up-mean-reverting market). Admit the 0.5R fast-short into the paper book (DIAGNOSTIC,
+  // shortOnly) so the proven geometry accrues REAL paper economics — the measurement-first step
+  // before it can be promoted to the headline short lane (gated by liveBlocked).
+  "CG_WIDE_FAST_SHORT",
 ];
 /** Per-variant cap on DIAGNOSTIC_ONLY variant-matrix orders sampled per scan (keeps the book bounded). */
 const DEFAULT_VARIANT_DIAGNOSTIC_MAX_PER_SCAN = 3;
