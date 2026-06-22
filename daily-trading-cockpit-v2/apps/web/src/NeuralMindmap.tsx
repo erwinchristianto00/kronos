@@ -926,8 +926,17 @@ export default function NeuralMindmap() {
             {telemetry ? `${fmtUsdt(paperRealPnl)} headline` : 'Loading'}
           </strong>
           <small>
+            {telemetry ? `${telemetry.paper.open} open positions` : 'paper only'}
+          </small>
+        </div>
+        <div>
+          <span>Diagnostic P&amp;L (measurement)</span>
+          <strong className="tone-measure">
+            {telemetry ? fmtUsdt(telemetry.paper.diagnosticPnl) : 'Loading'}
+          </strong>
+          <small>
             {telemetry
-              ? `${telemetry.paper.open} open · meas ${fmtUsdt(telemetry.paper.diagnosticUnrealizedPnl)} (not real)`
+              ? `cumulative · ${fmtUsdt(telemetry.paper.diagnosticUnrealizedPnl)} open · not real money`
               : 'paper only'}
           </small>
         </div>
