@@ -90,6 +90,22 @@ describe("rotateJsonlIfNeeded", () => {
     expect(kept.length).toBeLessThan(80);
   });
 
+  it("drops an oversize tail line instead of rewriting a file above the byte cap", () => {
+    const dir = mkTmp();
+    const file = join(dir, "scan-history.jsonl");
+    writeFileSync(file, `${JSON.stringify({ id: "small", payload: "ok" })}\n${"x".repeat(64 * 1024)}\n`, "utf-8");
+
+    const result = rotateJsonlIfNeeded(file, {
+      thresholdBytes: 1024,
+      tailLines: 10,
+      tailBytes: 4 * 1024,
+    });
+
+    expect(result.rotated).toBe(true);
+    expect(result.linesKept).toBe(0);
+    expect(statSync(file).size).toBe(0);
+  });
+
   it("prunes old archives on rotation, keeping only the newest N", () => {
     const dir = mkTmp();
     const archiveDir = join(dir, "archive");

@@ -106,6 +106,10 @@ function readTailLinesSync(filePath: string, tailLines: number, tailBytes: numbe
     const pushLine = (line: string): void => {
       if (byteLimitReached || line.length === 0) return;
       const lineBytes = Buffer.byteLength(line, "utf-8") + 1;
+      if (lineBytes > tailBytes) {
+        byteLimitReached = true;
+        return;
+      }
       if (collected.length > 0 && collectedBytes + lineBytes > tailBytes) {
         byteLimitReached = true;
         return;

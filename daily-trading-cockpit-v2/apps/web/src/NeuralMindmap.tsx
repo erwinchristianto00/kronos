@@ -1,5 +1,7 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import './neural-mindmap.css';
+
+const TELEMETRY_TIMEOUT_MS = 15_000;
 
 type NeuralHealth = 'HEALTHY' | 'ACTIVE' | 'WARNING' | 'CRITICAL' | 'IDLE' | 'COLLECTING' | 'QUARANTINE' | 'DIAGNOSTIC';
 type NeuralDiagnosisCategory =
@@ -653,18 +655,35 @@ export default function NeuralMindmap() {
   const [tpDraft, setTpDraft] = useState('3.00');
   const [controlStatus, setControlStatus] = useState<string | null>(null);
   const [realizeStatus, setRealizeStatus] = useState<string | null>(null);
+  const telemetryInFlightRef = useRef(false);
+  const hasTelemetryRef = useRef(false);
 
   async function loadTelemetry() {
+    if (telemetryInFlightRef.current) return;
+    telemetryInFlightRef.current = true;
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), TELEMETRY_TIMEOUT_MS);
     try {
-      const response = await fetch('/api/shadow/neural-map', { cache: 'no-store' });
+      const response = await fetch('/api/shadow/neural-map', {
+        cache: 'no-store',
+        signal: controller.signal,
+      });
       if (!response.ok) throw new Error(`Telemetry request failed (${response.status})`);
       const next = await response.json() as NeuralTelemetry;
       setTelemetry(next);
+      hasTelemetryRef.current = true;
       setLastReceivedAt(Date.now());
       setError(null);
     } catch (nextError) {
-      setError(nextError instanceof Error ? nextError.message : 'Neural telemetry unavailable');
+      const message = nextError instanceof Error ? nextError.message : String(nextError);
+      const aborted = nextError instanceof Error &&
+        (nextError.name === 'AbortError' || message.toLowerCase().includes('aborted'));
+      if (!aborted || !hasTelemetryRef.current) {
+        setError(aborted ? 'Telemetry request timed out; retrying' : message || 'Neural telemetry unavailable');
+      }
     } finally {
+      window.clearTimeout(timeout);
+      telemetryInFlightRef.current = false;
       setLoading(false);
     }
   }

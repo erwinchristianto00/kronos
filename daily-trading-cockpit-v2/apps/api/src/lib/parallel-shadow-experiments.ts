@@ -6,7 +6,7 @@
  * positions, route selection, readiness, scoring, or live behavior.
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 
 import {
@@ -28,6 +28,12 @@ export const PARALLEL_SHADOW_EXPERIMENT_LANE =
   "PARALLEL_SHADOW_EXPERIMENT_MATRIX_V1" as const;
 export const PARALLEL_SHADOW_EXPERIMENT_POLICY_VERSION =
   "parallel-shadow-experiment-matrix-v1" as const;
+
+function writeJsonAtomic(file: string, value: unknown): void {
+  const tmp = `${file}.tmp`;
+  writeFileSync(tmp, JSON.stringify(value), "utf-8");
+  renameSync(tmp, file);
+}
 
 export type ParallelExperimentId =
   | "BASE_BROAD_COST20_STOP150"
@@ -285,18 +291,10 @@ export class ParallelShadowExperimentStore {
 
   save(): void {
     try {
-      writeFileSync(
-        this.file,
-        JSON.stringify(
-          {
-            observations: this.observations,
-            latestAdmissionDiagnostics: this.latestDiagnostics,
-          },
-          null,
-          2,
-        ),
-        "utf-8",
-      );
+      writeJsonAtomic(this.file, {
+        observations: this.observations,
+        latestAdmissionDiagnostics: this.latestDiagnostics,
+      });
     } catch {
       // report-only storage failures must never affect the app
     }

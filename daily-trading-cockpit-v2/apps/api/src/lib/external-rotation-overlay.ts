@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 
@@ -18,6 +18,12 @@ import {
   type OperativeCollectionPriority,
 } from "./adaptive-profit-policy.js";
 import type { CrossIntelligenceSupport } from "./lane-toxic-symbol-evaluator.js";
+
+function writeJsonAtomic(file: string, value: unknown): void {
+  const tmp = `${file}.tmp`;
+  writeFileSync(tmp, JSON.stringify(value), "utf-8");
+  renameSync(tmp, file);
+}
 
 export type ExternalRotationOverlayGroup =
   | "STRATEGY_FIT_SHORTLIST"
@@ -241,7 +247,7 @@ export class JsonExternalRotationOverlayStore implements ExternalRotationOverlay
   }
 
   writeState(state: ExternalRotationOverlayStoreState): void {
-    writeFileSync(this.file, JSON.stringify(state, null, 2), "utf-8");
+    writeJsonAtomic(this.file, state);
   }
 
   readAll(): ExternalRotationOverlayObservation[] {

@@ -18,10 +18,16 @@
  *  - reportOnly: true always set
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 
 import { computeControllerAlignedGuardThreshold } from "./regime-controller-aligned-shadow.js";
+
+function writeJsonAtomic(file: string, value: unknown): void {
+  const tmp = `${file}.tmp`;
+  writeFileSync(tmp, JSON.stringify(value), "utf-8");
+  renameSync(tmp, file);
+}
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -177,7 +183,7 @@ export class FilteredEdgeShadowStore {
 
   save(): void {
     try {
-      writeFileSync(this.file, JSON.stringify(this.positions, null, 2), "utf-8");
+      writeJsonAtomic(this.file, this.positions);
     } catch {
       // storage failures must never throw — this lane is report-only
     }

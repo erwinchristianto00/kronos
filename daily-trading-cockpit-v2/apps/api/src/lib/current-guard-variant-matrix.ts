@@ -24,10 +24,16 @@
  *    manual approval.
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 
 import { type ShadowPosition } from "@dtc/shared";
+
+function writeJsonAtomic(file: string, value: unknown): void {
+  const tmp = `${file}.tmp`;
+  writeFileSync(tmp, JSON.stringify(value), "utf-8");
+  renameSync(tmp, file);
+}
 
 import {
   BASE_ROUTE_POLICY_VERSION_V2,
@@ -532,7 +538,7 @@ export class CurrentGuardVariantMatrixStore {
     try {
       const state: VariantMatrixStoreState = { observations: this.observations };
       if (this.resolverMetaInternal) state.resolverMeta = this.resolverMetaInternal;
-      writeFileSync(this.file, JSON.stringify(state, null, 2), "utf-8");
+      writeJsonAtomic(this.file, state);
     } catch {
       // report-only storage failures must never affect the app
     }

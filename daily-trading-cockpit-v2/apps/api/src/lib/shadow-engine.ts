@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -70,6 +70,12 @@ function roundMetric(value: number): number {
 
 function finiteOrNull(value: number | null | undefined): number | null {
   return value !== null && value !== undefined && Number.isFinite(value) ? value : null;
+}
+
+function writeJsonAtomic(file: string, value: unknown): void {
+  const tmp = `${file}.tmp`;
+  writeFileSync(tmp, JSON.stringify(value), "utf-8");
+  renameSync(tmp, file);
 }
 
 function entryZoneTolerance(price: number): number {
@@ -968,7 +974,7 @@ export class ShadowExecutionEngine {
   }
 
   private writePositions(positions: ShadowPosition[]) {
-    writeFileSync(this.positionsFile, JSON.stringify(positions, null, 2), "utf-8");
+    writeJsonAtomic(this.positionsFile, positions);
   }
 
   private readLog(): ShadowExecutionEvent[] {
@@ -979,7 +985,7 @@ export class ShadowExecutionEngine {
   }
 
   private writeLog(log: ShadowExecutionEvent[]) {
-    writeFileSync(this.logFile, JSON.stringify(log, null, 2), "utf-8");
+    writeJsonAtomic(this.logFile, log);
   }
 
   async processScan(result: ScanResult): Promise<void> {

@@ -19,9 +19,15 @@
  * implements price-based resolution.
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { randomUUID } from "node:crypto";
+
+function writeJsonAtomic(file: string, value: unknown): void {
+  const tmp = `${file}.tmp`;
+  writeFileSync(tmp, JSON.stringify(value), "utf-8");
+  renameSync(tmp, file);
+}
 
 import type { RegimeDirectionControllerReport } from "./regime-direction-controller.js";
 import { BASE_ROUTE_POLICY_VERSION_V2 } from "./shadow-engine.js";
@@ -175,7 +181,7 @@ export class RegimeControllerAlignedShadowStore {
       if (!existsSync(dir)) {
         mkdirSync(dir, { recursive: true });
       }
-      writeFileSync(this.filePath, JSON.stringify(state, null, 2), "utf-8");
+      writeJsonAtomic(this.filePath, state);
     } catch {
       // storage failures must never throw — this lane is report-only
     }
