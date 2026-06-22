@@ -307,21 +307,29 @@ export class BinanceFuturesPrivateClient {
   ): Promise<unknown> {
     await this.ensureTimeSync();
     this.assertClockSkewOk();
-    const qs = buildQueryString({
-      ...params,
-      recvWindow: RECV_WINDOW_MS,
-      timestamp: Math.round(this.nowMs() + this.serverTimeOffsetMs),
-    });
-    const url = `${this.baseUrl}${path}?${qs}&signature=${signQueryString(qs, this.apiSecret)}`;
+    const buildSignedUrl = (): string => {
+      const qs = buildQueryString({
+        ...params,
+        recvWindow: RECV_WINDOW_MS,
+        timestamp: Math.round(this.nowMs() + this.serverTimeOffsetMs),
+      });
+      return `${this.baseUrl}${path}?${qs}&signature=${signQueryString(qs, this.apiSecret)}`;
+    };
 
     if (method === "GET") {
       let lastError: unknown;
       for (let attempt = 0; attempt <= GET_MAX_RETRIES; attempt++) {
         try {
-          return await this.rawRequest("GET", url, true);
+          return await this.rawRequest("GET", buildSignedUrl(), true);
         } catch (error) {
           lastError = error;
           const type = error instanceof BinanceFuturesPrivateError ? error.failureType : "network";
+          if (error instanceof BinanceFuturesPrivateError && error.binanceCode === -1021 && attempt < GET_MAX_RETRIES) {
+            await this.forceTimeSync();
+            this.assertClockSkewOk();
+            await new Promise((r) => setTimeout(r, 150 * (attempt + 1)));
+            continue;
+          }
           if (!RETRYABLE_GET_FAILURES.has(type) || attempt === GET_MAX_RETRIES) throw error;
           await new Promise((r) => setTimeout(r, 150 * (attempt + 1)));
         }
@@ -329,13 +337,24 @@ export class BinanceFuturesPrivateClient {
       throw lastError;
     }
     // POST/DELETE: exactly one attempt — the engine owns retries via idempotent client ids.
-    return this.rawRequest(method, url, true);
+    try {
+      return await this.rawRequest(method, buildSignedUrl(), true);
+    } catch (error) {
+      if (error instanceof BinanceFuturesPrivateError && error.binanceCode === -1021) {
+        await this.forceTimeSync();
+      }
+      throw error;
+    }
   }
 
   // ── time sync / skew guard ─────────────────────────────────────────────────
 
   async ensureTimeSync(): Promise<void> {
     if (this.nowMs() - this.lastTimeSyncAtMs < TIME_SYNC_TTL_MS) return;
+    await this.forceTimeSync();
+  }
+
+  private async forceTimeSync(): Promise<void> {
     const before = this.nowMs();
     const parsed = await this.requestPublic("/fapi/v1/time");
     const after = this.nowMs();

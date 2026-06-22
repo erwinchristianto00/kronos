@@ -1619,6 +1619,14 @@ export async function registerShadowRoutes(
                 ? allocatorReport?.selectedOpportunities[0]?.laneId ?? null
                 : null,
             executionModel: _paperExecModel,
+            resolverMaxOrders: (() => {
+              const n = Number(process.env.PAPER_RESOLVER_MAX_ORDERS_PER_RUN);
+              return Number.isFinite(n) && n > 0 ? Math.floor(n) : 8;
+            })(),
+            resolverMaxRuntimeMs: (() => {
+              const n = Number(process.env.PAPER_RESOLVER_MAX_RUNTIME_MS);
+              return Number.isFinite(n) && n > 0 ? Math.floor(n) : 6_000;
+            })(),
           });
           const result = await Promise.race([
             paperRunPromise,

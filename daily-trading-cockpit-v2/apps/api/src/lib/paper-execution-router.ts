@@ -1461,15 +1461,36 @@ export async function resolvePaperOrders(
   store: PaperExecutionRouterStore,
   binanceClient: PaperResolverClient,
   executionModel: PaperExecutionModel = PAPER_EXECUTION_MODEL_IDEAL,
+  opts: { maxOrders?: number; maxRuntimeMs?: number; yieldEvery?: number } = {},
 ): Promise<{ resolved: number; expired: number; dataFailures: number; errors: number }> {
   const nowMs = Date.now();
+  const startedMs = nowMs;
+  const maxOrders =
+    typeof opts.maxOrders === "number" && Number.isFinite(opts.maxOrders) && opts.maxOrders > 0
+      ? Math.floor(opts.maxOrders)
+      : Number.POSITIVE_INFINITY;
+  const maxRuntimeMs =
+    typeof opts.maxRuntimeMs === "number" && Number.isFinite(opts.maxRuntimeMs) && opts.maxRuntimeMs > 0
+      ? Math.floor(opts.maxRuntimeMs)
+      : Number.POSITIVE_INFINITY;
+  const yieldEvery =
+    typeof opts.yieldEvery === "number" && Number.isFinite(opts.yieldEvery) && opts.yieldEvery > 0
+      ? Math.floor(opts.yieldEvery)
+      : 1;
   let resolved = 0;
   let expired = 0;
   let dataFailures = 0;
   let errors = 0;
+  let processed = 0;
 
   for (const order of store.all.slice()) {
     if (order.paperStatus !== "CREATED" && order.paperStatus !== "PAPER_SUBMITTED") continue;
+    if (processed >= maxOrders) break;
+    if (Date.now() - startedMs >= maxRuntimeMs) break;
+    processed += 1;
+    if (processed % yieldEvery === 0) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
     const openedAtMs = new Date(order.openedAt).getTime();
 
     // Expiry BEFORE candle fetch
@@ -3853,6 +3874,9 @@ export interface PaperRunInputs {
   allocatorActiveLaneId?: string | null;
   /** Live-execution fidelity for resolution fills. Defaults to IDEAL (zero slippage). */
   executionModel?: PaperExecutionModel;
+  /** Bounds one resolver pass so the operator brief cannot monopolize the API event loop. */
+  resolverMaxOrders?: number;
+  resolverMaxRuntimeMs?: number;
 }
 
 export async function runPaperAdmissionAndResolution(
@@ -3915,7 +3939,11 @@ export async function runPaperAdmissionAndResolution(
   store.reclassifyDemotedFullExitHeadlineOrders();
 
   const executionModel = inputs.executionModel ?? PAPER_EXECUTION_MODEL_IDEAL;
-  await resolvePaperOrders(store, binanceClient, executionModel);
+  await resolvePaperOrders(store, binanceClient, executionModel, {
+    maxOrders: inputs.resolverMaxOrders,
+    maxRuntimeMs: inputs.resolverMaxRuntimeMs,
+    yieldEvery: 1,
+  });
 
   // Measurement only: record the daily portfolio-heat shadow snapshot (how bounding total
   // simultaneous risk would trade profit vs drawdown/ruin). Never gates, never trades; wrapped
