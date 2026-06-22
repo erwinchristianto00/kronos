@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -254,8 +254,7 @@ export class SignalTracker {
 
   private ensureRawHistorySeeded(): void {
     if (!existsSync(this.rawHistoryFile) && existsSync(this.historyFile)) {
-      const legacyContent = readFileSync(this.historyFile, "utf-8");
-      writeFileSync(this.rawHistoryFile, legacyContent, "utf-8");
+      copyFileSync(this.historyFile, this.rawHistoryFile);
     }
   }
 
@@ -278,9 +277,10 @@ export class SignalTracker {
       const thresholdBytes =
         Number(process.env.SCAN_HISTORY_ROTATION_THRESHOLD_BYTES) || 100 * 1024 * 1024;
       const tailLines = Number(process.env.SCAN_HISTORY_ROTATION_TAIL_LINES) || 10_000;
+      const tailBytes = Number(process.env.SCAN_HISTORY_ROTATION_TAIL_BYTES) || 25 * 1024 * 1024;
       for (const targetPath of [this.historyFile, this.rawHistoryFile]) {
         try {
-          const result = rotateJsonlIfNeeded(targetPath, { thresholdBytes, tailLines });
+          const result = rotateJsonlIfNeeded(targetPath, { thresholdBytes, tailLines, tailBytes });
           if (result.rotated) {
             console.warn(
               `[tracker] rotated ${targetPath}: archived ${result.fromSize ?? "?"} bytes → ${result.archivePath ?? "?"}; kept ${result.linesKept ?? 0} lines`,

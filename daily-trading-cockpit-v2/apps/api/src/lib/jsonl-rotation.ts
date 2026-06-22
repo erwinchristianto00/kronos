@@ -8,8 +8,9 @@
  * STREAMING / CHUNKED READ (CRITICAL):
  *   Uses a backward chunk reader (read fixed-size chunks from the end of the
  *   file with a file descriptor) to capture the last N lines without ever
- *   loading the full file as a single string. This avoids regression to the
- *   string-size bug we are fixing.
+ *   loading the full file as a single string. The retained tail is also capped
+ *   by bytes because scan-history lines can be large enough that "last N lines"
+ *   still exceeds the rotation threshold and re-triggers rotation every scan.
  *
  * NEVER THROWS — returns RotationResult with `error` field on failure so
  * callers (tracker.persistScan, etc.) can safely ignore rotation failures.
@@ -58,6 +59,8 @@ export interface RotationOptions {
   thresholdBytes?: number;
   /** Default 10000. Last N lines of the source file are retained. */
   tailLines?: number;
+  /** Default 25MB. Retained tail is capped by bytes, not just line count. */
+  tailBytes?: number;
   /** Default <dirname>/archive */
   archiveDir?: string;
   /** Chunk size used by the backward chunked reader. Default 1MB. */
@@ -76,6 +79,7 @@ export interface RotationResult {
 
 const DEFAULT_THRESHOLD_BYTES = 100 * 1024 * 1024;
 const DEFAULT_TAIL_LINES = 10_000;
+const DEFAULT_TAIL_BYTES = 25 * 1024 * 1024;
 const DEFAULT_READ_CHUNK_SIZE = 1024 * 1024;
 
 function safeIsoForFilename(): string {
@@ -87,8 +91,8 @@ function safeIsoForFilename(): string {
  * Read the last `tailLines` non-empty lines of a file using a backward
  * chunked reader. Never loads the full file as a single string.
  */
-function readTailLinesSync(filePath: string, tailLines: number, chunkSize: number): string[] {
-  if (tailLines <= 0) return [];
+function readTailLinesSync(filePath: string, tailLines: number, tailBytes: number, chunkSize: number): string[] {
+  if (tailLines <= 0 || tailBytes <= 0) return [];
   const fd = openSync(filePath, "r");
   try {
     const size = statSync(filePath).size;
@@ -97,7 +101,22 @@ function readTailLinesSync(filePath: string, tailLines: number, chunkSize: numbe
     let pos = size;
     let leftover = "";
     const collected: string[] = [];
-    while (pos > 0 && collected.length < tailLines) {
+    let collectedBytes = 0;
+    let byteLimitReached = false;
+    const pushLine = (line: string): void => {
+      if (byteLimitReached || line.length === 0) return;
+      const lineBytes = Buffer.byteLength(line, "utf-8") + 1;
+      if (collected.length > 0 && collectedBytes + lineBytes > tailBytes) {
+        byteLimitReached = true;
+        return;
+      }
+      collected.push(line);
+      collectedBytes += lineBytes;
+      if (collected.length >= tailLines || collectedBytes >= tailBytes) {
+        byteLimitReached = true;
+      }
+    };
+    while (pos > 0 && collected.length < tailLines && !byteLimitReached) {
       const toRead = Math.min(chunkSize, pos);
       pos -= toRead;
       const bytes = readSync(fd, buf, 0, toRead, pos);
@@ -112,14 +131,13 @@ function readTailLinesSync(filePath: string, tailLines: number, chunkSize: numbe
       // Walk lines back-to-front so we collect newest first.
       for (let i = lines.length - 1; i >= 0; i--) {
         const line = lines[i]!;
-        if (line.length === 0) continue;
-        collected.push(line);
-        if (collected.length >= tailLines) break;
+        pushLine(line);
+        if (byteLimitReached) break;
       }
     }
     // If we still have room AND there's a leftover at the start, include it.
-    if (collected.length < tailLines && leftover.length > 0) {
-      collected.push(leftover);
+    if (collected.length < tailLines && leftover.length > 0 && !byteLimitReached) {
+      pushLine(leftover);
     }
     // collected is newest-first; reverse so we return oldest-first like the source.
     return collected.reverse();
@@ -151,6 +169,7 @@ export function rotateJsonlIfNeeded(
 ): RotationResult {
   const thresholdBytes = opts.thresholdBytes ?? DEFAULT_THRESHOLD_BYTES;
   const tailLines = opts.tailLines ?? DEFAULT_TAIL_LINES;
+  const tailBytes = opts.tailBytes ?? DEFAULT_TAIL_BYTES;
   const readChunkSize = opts.readChunkSize ?? DEFAULT_READ_CHUNK_SIZE;
   try {
     if (!existsSync(filePath)) {
@@ -189,7 +208,7 @@ export function rotateJsonlIfNeeded(
 
     let tail: string[];
     try {
-      tail = readTailLinesSync(filePath, tailLines, readChunkSize);
+      tail = readTailLinesSync(filePath, tailLines, tailBytes, readChunkSize);
     } catch (err) {
       return {
         rotated: false,

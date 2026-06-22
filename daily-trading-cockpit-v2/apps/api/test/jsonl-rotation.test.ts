@@ -68,6 +68,28 @@ describe("rotateJsonlIfNeeded", () => {
     expect(existsSync(result.archivePath!)).toBe(true);
   });
 
+  it("caps retained tail by bytes so large JSONL lines do not keep re-triggering rotation", () => {
+    const dir = mkTmp();
+    const file = join(dir, "scan-history.jsonl");
+    const lines: string[] = [];
+    for (let i = 0; i < 80; i++) {
+      lines.push(JSON.stringify({ id: i, payload: "x".repeat(2048) }));
+    }
+    writeFileSync(file, lines.join("\n") + "\n", "utf-8");
+
+    const result = rotateJsonlIfNeeded(file, {
+      thresholdBytes: 10 * 1024,
+      tailLines: 80,
+      tailBytes: 12 * 1024,
+    });
+
+    expect(result.rotated).toBe(true);
+    expect(statSync(file).size).toBeLessThanOrEqual(13 * 1024);
+    const kept = readFileSync(file, "utf-8").trim().split("\n").map((line) => JSON.parse(line) as { id: number });
+    expect(kept.at(-1)?.id).toBe(79);
+    expect(kept.length).toBeLessThan(80);
+  });
+
   it("prunes old archives on rotation, keeping only the newest N", () => {
     const dir = mkTmp();
     const archiveDir = join(dir, "archive");
