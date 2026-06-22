@@ -256,6 +256,31 @@ describe("neural map telemetry", () => {
     expect(result.alerts.some((alert) => alert.source === "Mixed Budget Guardrail" && alert.severity === "CRITICAL")).toBe(true);
   });
 
+  it("downgrades a value-destructive shadow (VM-sim) lane to WARNING, not a red CRITICAL", () => {
+    const input = baseInput();
+    // Make the VM-sim row value-destructive → the lane's evidenceHealth becomes CRITICAL…
+    input.variantMatrix.rows[0] = {
+      ...input.variantMatrix.rows[0]!,
+      status: "REJECT",
+      statusReason: "freshValid=10 net=-0.05R — value-destructive",
+      freshValid: 10,
+      resolved: 10,
+      netAvgR: -0.05,
+      pf: 0.7,
+    };
+    // …but with NO headline orders, so the lane has zero real money on the line (liveBlocked).
+    input.orders = [] as never[];
+    const result = buildNeuralMapTelemetry(input);
+    const lane = result.lanes.find((l) => l.evidenceHealth === "CRITICAL");
+    expect(lane).toBeDefined();
+    expect(lane!.headlinePnl).toBe(0);
+    const laneAlert = result.alerts.find((a) => a.source === lane!.label);
+    expect(laneAlert).toBeDefined();
+    // A losing shadow/diagnostic measurement is a WARNING, never a red CRITICAL incident.
+    expect(laneAlert!.severity).toBe("WARNING");
+    expect(result.alerts.some((a) => a.source === lane!.label && a.severity === "CRITICAL")).toBe(false);
+  });
+
   it("does not render hypothetical mixed occupancy as an active warning outside Mixed", () => {
     const input = baseInput();
     input.controller.currentRegime = "Bullish expansion";

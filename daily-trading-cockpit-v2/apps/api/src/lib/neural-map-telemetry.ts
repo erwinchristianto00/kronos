@@ -1229,7 +1229,19 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
   }
   for (const lane of lanes.slice(0, 7)) {
     if (lane.evidenceHealth === "CRITICAL") {
-      alerts.push({ severity: "CRITICAL", source: lane.label, message: lane.reason });
+      // A lane whose VM-sim evidence is "value-destructive" (negative netAvgR over a small sample,
+      // or a REJECTed variant) is an EXPECTED measurement outcome on a shadow-only lane — the gate
+      // correctly benching a losing geometry, with ZERO real money at stake (liveBlocked). Escalating
+      // that to a red CRITICAL "incident" is a false alarm (it lit the dashboard pulse red for three
+      // brand-new variants at exactly 10 simulated closes). Only an actual realized HEADLINE (real-
+      // money) loss is CRITICAL; a pure simulation/diagnostic measurement is at most a WARNING — and
+      // never louder than the paper-economics path below, which is already only a WARNING.
+      const realHeadlineLoss = (lane.headlinePnl ?? 0) < 0;
+      alerts.push({
+        severity: realHeadlineLoss ? "CRITICAL" : "WARNING",
+        source: lane.label,
+        message: realHeadlineLoss ? lane.reason : `${lane.reason} (shadow measurement — no real money)`,
+      });
       continue;
     }
     if (lane.health === "CRITICAL" && lane.totalPnl < 0) {
