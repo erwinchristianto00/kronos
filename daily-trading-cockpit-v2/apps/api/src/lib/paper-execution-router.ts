@@ -1545,14 +1545,15 @@ export async function resolvePaperOrders(
       const exitRule = effectiveExitRuleForOrder(order);
       const fillMode: VariantFillMode = order.fillMode ?? "taker";
 
-      // Scaleout and maker_limit are resolved by the canonical VM-sim engine (walkVariantPath)
-      // so the paper book uses the SAME honest intrabar reconstruction as the research view.
-      // This prevents silent mis-resolution — scaleout must NOT collapse to tp1_full, and a
+      // Scaleout, mfe_giveback, and maker_limit are resolved by the canonical VM-sim engine
+      // (walkVariantPath) so the paper book uses the SAME honest intrabar reconstruction as the
+      // research view. This prevents silent mis-resolution — scaleout must NOT collapse to
+      // tp1_full, an mfe_giveback exit must run its peak-retrace logic (not a full TP/stop), and a
       // maker post-only entry must NOT collapse to a taker fill (no-fill risk is real). tp1_full
       // and trail_after_tp1 keep their existing inline paths untouched. The walk uses ideal
       // E/S/T (slippage 0 under PAPER_EXECUTION_MODEL_IDEAL, which is the only model in use);
       // costR is applied on top exactly as the inline paths do. No fabricated profit.
-      if (exitRule === "scaleout_tp1_trail" || fillMode === "maker_limit") {
+      if (exitRule === "scaleout_tp1_trail" || exitRule === "mfe_giveback" || fillMode === "maker_limit") {
         const walk = await walkVariantPath(
           { direction: dir, entryPrice: E, stopLoss: S, target: T, exitRule, fillMode, openedAtMs, candles, makerFillWindowCandles: MAKER_FILL_WINDOW_CANDLES },
           (fillCandleOpenMs) => _resolve1mForPaper(binanceClient, order.symbol, fillCandleOpenMs, dir, E, S, T),

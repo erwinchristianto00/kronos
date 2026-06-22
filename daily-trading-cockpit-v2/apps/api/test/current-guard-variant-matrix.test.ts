@@ -291,6 +291,82 @@ describe("current-guard-variant-matrix", () => {
     expect(result.status).toBe("CLOSED_WIN");
   });
 
+  // MFE-giveback exit (defaults: arm 0.75R, giveback 0.5 of peak). Entry 100 / stop 98 → risk 2 → 1R = 2 price.
+  it("[MFEG1] arms after a 1.5R peak then banks 0.75R on the retrace (no intrabar lookahead)", async () => {
+    const candles: KlineTuple[] = [
+      // signal candle peaks at +1.5R (high 103) but giveback CANNOT trigger off this same candle's high
+      candle(SIGNAL_OPEN_MS, 103, 100.5, 102),
+      // next candle retraces to the giveback level 100 + 2*(1.5*0.5)=101.5 (low 101 <= 101.5), no stop/TP
+      candle(SIGNAL_OPEN_MS + 300000, 102, 101, 101.5),
+    ];
+    const result = await walkVariantPath({
+      direction: "LONG",
+      entryPrice: 100,
+      stopLoss: 98,
+      target: 104, // far TP at 2R — not reached
+      exitRule: "mfe_giveback",
+      fillMode: "taker",
+      openedAtMs: SIGNAL_OPEN_MS,
+      candles,
+    });
+    expect(result.status).toBe("CLOSED_WIN");
+    expect(result.grossR).toBeCloseTo(0.75, 6); // peak 1.5R * (1 - 0.5)
+    expect(result.resolutionSource).toBe("MFE_GIVEBACK_EXIT");
+  });
+
+  it("[MFEG2] never arms (straight to stop) → CLOSED_LOSS -1, no giveback", async () => {
+    const candles: KlineTuple[] = [candle(SIGNAL_OPEN_MS, 100.5, 97.5, 98)]; // +0.25R peak then stop
+    const result = await walkVariantPath({
+      direction: "LONG",
+      entryPrice: 100,
+      stopLoss: 98,
+      target: 104,
+      exitRule: "mfe_giveback",
+      fillMode: "taker",
+      openedAtMs: SIGNAL_OPEN_MS,
+      candles,
+    });
+    expect(result.status).toBe("CLOSED_LOSS");
+    expect(result.grossR).toBe(-1);
+  });
+
+  it("[MFEG3] a clean run to the far TP still takes full reward (giveback does not cap winners)", async () => {
+    const candles: KlineTuple[] = [candle(SIGNAL_OPEN_MS, 104.5, 100.5, 104)]; // tags TP 104 on the signal candle
+    const result = await walkVariantPath({
+      direction: "LONG",
+      entryPrice: 100,
+      stopLoss: 98,
+      target: 104, // fullRewardR = (104-100)/2 = 2
+      exitRule: "mfe_giveback",
+      fillMode: "taker",
+      openedAtMs: SIGNAL_OPEN_MS,
+      candles,
+    });
+    expect(result.status).toBe("CLOSED_WIN");
+    expect(result.grossR).toBeCloseTo(2, 6);
+    expect(result.resolutionSource).toBe("CANDLE_WALK_TP");
+  });
+
+  it("[MFEG4] SHORT symmetry: arms after a 1.5R peak then banks 0.75R on the retrace up", async () => {
+    const candles: KlineTuple[] = [
+      candle(SIGNAL_OPEN_MS, 99.5, 97, 98), // short entry 100/stop 102; favorable low 97 = +1.5R
+      candle(SIGNAL_OPEN_MS + 300000, 99, 98, 98.5), // retrace up to level 100 - 2*0.75 = 98.5 (high 99 >= 98.5)
+    ];
+    const result = await walkVariantPath({
+      direction: "SHORT",
+      entryPrice: 100,
+      stopLoss: 102,
+      target: 96, // far TP at 2R — not reached
+      exitRule: "mfe_giveback",
+      fillMode: "taker",
+      openedAtMs: SIGNAL_OPEN_MS,
+      candles,
+    });
+    expect(result.status).toBe("CLOSED_WIN");
+    expect(result.grossR).toBeCloseTo(0.75, 6);
+    expect(result.resolutionSource).toBe("MFE_GIVEBACK_EXIT");
+  });
+
   // 5. No-fib500 rejects and counts.
   it("[5] no-fib500 variant rejects fib_500_entry signals (and accepts others)", () => {
     const fibSignal = makeSignal({ entryVariant: "fib_500_entry" });

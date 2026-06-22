@@ -70,12 +70,16 @@ export type VariantMatrixVariantId =
   // any promotion (not tuned to the small post-reset sample).
   | "CG_WIDE_FAST_LONG"
   | "CG_TIGHT_FAST_05"
-  | "CG_BE_AFTER_05";
+  | "CG_BE_AFTER_05"
+  // MFE-giveback exit (operator-requested): baseline geometry, but lock in a faded winner by
+  // exiting on a retrace from peak favorable. Direct A/B vs the tp1_full baseline on identical
+  // signals; direction-agnostic (the leak hits both books).
+  | "CG_MFE_GIVEBACK";
 
 export const BULL_TREND_VARIANT_ID = "BL_TREND_R15_STOP200_FULL" as const;
 export const BULL_SCALEOUT_VARIANT_ID = "BL_TREND_SCALEOUT_STOP200" as const;
 
-export type VariantExitRule = "tp1_full" | "trail_after_tp1" | "scaleout_tp1_trail";
+export type VariantExitRule = "tp1_full" | "trail_after_tp1" | "scaleout_tp1_trail" | "mfe_giveback";
 export type VariantFillMode = "taker" | "maker_limit";
 
 export type VariantObservationStatus =
@@ -117,6 +121,19 @@ export const STRESS_EXTRA_BPS = 10; // +10bps slippage stress test
 // slippage stress test showed the fast-0.5R lanes survive realistic costs while the
 // SCALEOUT/baseline/aggregate "edge" is phantom. Env-tunable; applied at resolution.
 export const STOP_OUT_SLIPPAGE_BPS = Number(process.env.STOP_OUT_SLIPPAGE_BPS) || 12;
+
+// --- MFE-giveback exit (operator-requested 2026-06-22) ---
+// The audit + operator both flagged the same leak: trades reach a good MFE (touched
+// a high) but the exit isn't captured, then fade back to flat/negative. The mfe_giveback
+// exit rule locks that in: once the trade is up >= MFE_GIVEBACK_ARM_R (in R), it trails a
+// "giveback" exit at peak*(1-MFE_GIVEBACK_FRAC) of the favorable move — so a faded winner
+// banks a partial gain instead of round-tripping to a stop. The hard stop and the far TP
+// still bound the trade (a straight-to-TP winner takes full reward; a never-favorable trade
+// stops at -1). The peak used to arm/level EXCLUDES the current candle, so there is no
+// intrabar lookahead (a candle that spikes up then retraces cannot trigger off its own spike).
+// Env-tunable so the arm/giveback can be swept without a rebuild.
+export const MFE_GIVEBACK_ARM_R = Number(process.env.MFE_GIVEBACK_ARM_R) || 0.75;
+export const MFE_GIVEBACK_FRAC = Number(process.env.MFE_GIVEBACK_FRAC) || 0.5;
 
 // --- Geometry constants ---
 export const WIDE_STOP_MIN_BPS = 300; // Paper-admissible wide/trail variants require >= 300bps stops
@@ -388,6 +405,23 @@ export const VARIANT_MATRIX_DEFINITIONS: readonly VariantMatrixVariantDefinition
       "Wide >=300bps stop, 0.5R trigger: on a 0.5R touch move the stop to breakeven and ride the exact " +
       "candle path. Tests early risk-removal + free upside vs the fast full-exit. Direction-agnostic; " +
       "prove OOS before promotion.",
+  },
+  {
+    // Operator-requested (2026-06-22): attack the "touched a good high then faded to
+    // flat/negative" leak directly. Same baseline entry/geometry as CG_BASELINE_CURRENT
+    // (raw stop + raw TP, no widening) so this is a clean A/B of EXIT STYLE on identical
+    // signals: tp1_full (let it run to TP or stop) vs mfe_giveback (bank a faded winner).
+    // Placed LAST so a no-evidence score tie never lets it preempt an established lane.
+    id: "CG_MFE_GIVEBACK",
+    label: "MFE-giveback exit (lock the faded winner)",
+    exitRule: "mfe_giveback",
+    fillMode: "taker",
+    costModel: "taker",
+    description:
+      "Baseline entry/geometry, but once up >= MFE_GIVEBACK_ARM_R it exits on a retrace to " +
+      "peak*(1-MFE_GIVEBACK_FRAC) of the favorable move — converting 'reached a high then round-tripped " +
+      "to a stop' into a banked partial gain. Hard stop + far TP still bound it. Direction-agnostic A/B " +
+      "vs the tp1_full baseline; prove OOS before any promotion.",
   },
 ];
 
@@ -1043,6 +1077,9 @@ export async function walkVariantPath(
     const cClose = candleClose(candle);
     const cCloseTime = candleCloseTime(candle);
     const cOpen = candleOpen(candle);
+    // Peak favorable BEFORE folding in this candle — used by mfe_giveback so the giveback
+    // level cannot be triggered by the same candle's own new high (no intrabar lookahead).
+    const peakBefore = maxMfeR;
     updatePath(high, low);
 
     const slHitAtStop = (stop: number) => (dir === "LONG" ? low <= stop : high >= stop);
@@ -1064,6 +1101,30 @@ export async function walkVariantPath(
       }
       if (slHit) return finalize("CLOSED_LOSS", -1, cCloseTime, "CANDLE_WALK_SL", "VALID_5M_ORDERED", true);
       if (tpHit) return finalize("CLOSED_WIN", fullRewardR, cCloseTime, "CANDLE_WALK_TP", "VALID_5M_ORDERED", true);
+      continue;
+    }
+
+    if (exitRule === "mfe_giveback") {
+      // Hard stop and far TP still bound the trade (SL-first on an ambiguous same-candle).
+      const slHit = slHitAtStop(S);
+      if (slHit && tpHit) {
+        const decided = resolve1m ? await resolve1m(cOpen) : null;
+        if (decided === "TP") return finalize("CLOSED_WIN", fullRewardR, cCloseTime, "INTRABAR_1M_TP", "RESOLVED_BY_1M", true);
+        return finalize("CLOSED_LOSS", -1, cCloseTime, "AMBIGUOUS_SL_FIRST", decided === "SL" ? "RESOLVED_BY_1M" : "AMBIGUOUS_SAME_CANDLE_SL_FIRST", true);
+      }
+      if (slHit) return finalize("CLOSED_LOSS", -1, cCloseTime, "CANDLE_WALK_SL", "VALID_5M_ORDERED", true);
+      if (tpHit) return finalize("CLOSED_WIN", fullRewardR, cCloseTime, "CANDLE_WALK_TP", "VALID_5M_ORDERED", true);
+      // Giveback trail: once the PRIOR peak (excludes this candle) has armed, exit when this
+      // candle retraces to peak*(1-frac) of the favorable move.
+      if (peakBefore >= MFE_GIVEBACK_ARM_R) {
+        const exitR = peakBefore * (1 - MFE_GIVEBACK_FRAC);
+        const givebackLevel = dir === "LONG" ? E + risk * exitR : E - risk * exitR;
+        const retraced = dir === "LONG" ? low <= givebackLevel : high >= givebackLevel;
+        if (retraced) {
+          const status = exitR > 0 ? "CLOSED_WIN" : "CLOSED_LOSS";
+          return finalize(status, exitR, cCloseTime, "MFE_GIVEBACK_EXIT", "VALID_5M_ORDERED", true);
+        }
+      }
       continue;
     }
 
@@ -1243,13 +1304,17 @@ export async function resolveVariantMatrixObservations(
           const grossR = walk.grossR ?? 0;
           const resolvedAtMs = walk.closedAtMs ?? nowMs;
           const effectiveOpenedAtMs = walk.openedAtMs ?? openedAtMs;
-          // Stop-out (CLOSED_LOSS) pays extra slippage beyond the flat round-trip;
-          // fold it into costR so netR = grossR - costR stays consistent and avgCostR
-          // reports the honest loser cost.
-          const stopOutSlipR =
-            walk.status === "CLOSED_LOSS"
-              ? STOP_OUT_SLIPPAGE_BPS / (obs.stopDistanceBps || WIDE_STOP_MIN_BPS)
-              : 0;
+          // Stop-out exits pay extra slippage beyond the flat round-trip; fold it into costR so
+          // netR = grossR - costR stays consistent and avgCostR reports the honest cost. This
+          // applies to a CLOSED_LOSS (hit the hard stop) AND to an MFE_GIVEBACK_EXIT: a giveback
+          // fires on a retrace AGAINST the position, i.e. a sell-stop below (long) / buy-stop above
+          // (short), which fills during an adverse move and slips like a stop — even though it
+          // banks a small win. Not costing it would over-claim the giveback edge.
+          const stopTriggeredExit =
+            walk.status === "CLOSED_LOSS" || walk.resolutionSource === "MFE_GIVEBACK_EXIT";
+          const stopOutSlipR = stopTriggeredExit
+            ? STOP_OUT_SLIPPAGE_BPS / (obs.stopDistanceBps || WIDE_STOP_MIN_BPS)
+            : 0;
           const effectiveCostR = (obs.costR ?? 0) + stopOutSlipR;
           store.update(obs.observationId, {
             status: walk.status,
