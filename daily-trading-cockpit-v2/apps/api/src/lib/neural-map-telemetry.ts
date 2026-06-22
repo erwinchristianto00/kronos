@@ -254,6 +254,7 @@ export interface NeuralMapTelemetryInput {
 const CLOSED = new Set(["PAPER_CLOSED_WIN", "PAPER_CLOSED_LOSS"]);
 const OPEN = new Set(["CREATED", "PAPER_SUBMITTED"]);
 const MARK_CANDLE_MS = 5 * 60 * 1000;
+const DEFAULT_MARK_FETCH_TIMEOUT_MS = 2_500;
 
 export interface PaperMarkPriceClient {
   getCandles(symbol: string, interval: string, limit: number): Promise<Array<{
@@ -314,6 +315,25 @@ function finite(value: number | null | undefined): value is number {
   return typeof value === "number" && Number.isFinite(value);
 }
 
+function markFetchTimeoutMs(): number {
+  const raw = Number(process.env.NEURAL_MAP_MARK_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : DEFAULT_MARK_FETCH_TIMEOUT_MS;
+}
+
+async function withMarkFetchTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T | null> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  try {
+    return await Promise.race([
+      promise.catch(() => null),
+      new Promise<null>((resolve) => {
+        timer = setTimeout(() => resolve(null), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 function isDiagnosticPaperOrder(order: PaperOrder): boolean {
   return order.paperOrderMode === "DIAGNOSTIC_ONLY" || order.diagnosticLabel === "BACKFILL_DIAGNOSTIC";
 }
@@ -360,6 +380,7 @@ export async function buildPaperUnrealizedSnapshot(
   const prices = new Map<string, number>();
   const candlesBySymbol = new Map<string, Awaited<ReturnType<PaperMarkPriceClient["getCandles"]>>>();
   const nowMs = new Date(generatedAt).getTime();
+  const markTimeoutMs = markFetchTimeoutMs();
 
   await Promise.all(symbols.map(async (symbol) => {
     try {
@@ -372,7 +393,11 @@ export async function buildPaperUnrealizedSnapshot(
       const lookbackCandles = Number.isFinite(oldestOpenedAt) && Number.isFinite(nowMs)
         ? Math.ceil(Math.max(0, nowMs - oldestOpenedAt) / MARK_CANDLE_MS) + 5
         : 1;
-      const candles = await priceClient.getCandles(symbol, "5m", Math.min(Math.max(1, lookbackCandles), 1000));
+      const candles = await withMarkFetchTimeout(
+        priceClient.getCandles(symbol, "5m", Math.min(Math.max(1, lookbackCandles), 1000)),
+        markTimeoutMs,
+      );
+      if (!candles) return;
       const latest = candles.at(-1)?.close;
       candlesBySymbol.set(symbol, candles);
       if (finite(latest) && latest > 0) prices.set(symbol, latest);

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildNeuralMapTelemetry } from "../src/lib/neural-map-telemetry.js";
+import { buildNeuralMapTelemetry, buildPaperUnrealizedSnapshot } from "../src/lib/neural-map-telemetry.js";
 
 function baseInput(): Parameters<typeof buildNeuralMapTelemetry>[0] {
   return {
@@ -438,5 +438,50 @@ describe("neural map telemetry", () => {
     const trailLane = result.lanes.find((lane) => lane.label === "CG_TRAIL SHORT");
     expect(trailLane?.health).toBe("DIAGNOSTIC");
     expect(trailLane?.pnlIsDiagnosticOnly).toBe(true);
+  });
+
+  it("does not let a hanging Binance mark fetch block neural-map unrealized telemetry", async () => {
+    const previousTimeout = process.env.NEURAL_MAP_MARK_TIMEOUT_MS;
+    process.env.NEURAL_MAP_MARK_TIMEOUT_MS = "5";
+    try {
+      const started = Date.now();
+      const snapshot = await buildPaperUnrealizedSnapshot([
+        {
+          id: "open-1",
+          observationId: "obs-open-1",
+          sourceObservationKey: "BTCUSDT|LONG|2026-06-06T11:00:00.000Z",
+          sourceType: "ALLOCATOR_LANE",
+          selectedLaneId: "CG_LONG_VARIANT_MATRIX:CG_WIDE_STOP_TP_WIDE",
+          symbol: "BTCUSDT",
+          direction: "LONG",
+          regime: "Bullish expansion",
+          entryPrice: 100,
+          stopLoss: 97,
+          takeProfitLevels: [103],
+          paperStatus: "CREATED",
+          plannedPositionNotional: 1000,
+          plannedRiskAmount: 30,
+          plannedStopDistanceBps: 300,
+          openedAt: "2026-06-06T11:00:00.000Z",
+          updatedAt: "2026-06-06T12:00:00.000Z",
+          paperOrderMode: "DIAGNOSTIC_ONLY",
+          paperRiskLabel: "EXPERIMENTAL",
+          reportOnly: true,
+          paperOnly: true,
+        } as never,
+      ], {
+        getCandles: async () => new Promise<never>(() => undefined),
+      }, "2026-06-06T12:00:00.000Z");
+
+      expect(Date.now() - started).toBeLessThan(250);
+      expect(snapshot).toMatchObject({
+        markCount: 0,
+        missingPriceCount: 1,
+        totalPnl: 0,
+      });
+    } finally {
+      if (previousTimeout === undefined) delete process.env.NEURAL_MAP_MARK_TIMEOUT_MS;
+      else process.env.NEURAL_MAP_MARK_TIMEOUT_MS = previousTimeout;
+    }
   });
 });

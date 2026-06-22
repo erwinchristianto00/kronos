@@ -8,7 +8,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "dev": "npm run build -w @dtc/shared && tsx watch src/server.ts",
-    "test": "npm run build -w @dtc/shared && vitest run --no-file-parallelism --pool=threads --maxWorkers=1 --minWorkers=1"
+    "test": "npm run build -w @dtc/shared && vitest run --no-file-parallelism --pool=threads --maxWorkers=1"
   },
   "dependencies": {
     "@dtc/shared": "0.1.0",
@@ -18,8 +18,8 @@
   },
   "devDependencies": {
     "@types/node": "^24.10.1",
-    "tsx": "^4.20.6",
+    "tsx": "^4.22.4",
     "typescript": "^5.9.3",
-    "vitest": "^3.2.4"
+    "vitest": "^4.1.9"
   }
 }
