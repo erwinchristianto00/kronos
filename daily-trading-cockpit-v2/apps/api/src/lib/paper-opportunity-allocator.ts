@@ -1375,6 +1375,12 @@ export function buildPaperOpportunityAllocatorReport(
       // High-beta-alt LONGs have no edge (chop/revert → stop, even in up markets) and
       // are the bulk of the diagnostic loss; large-cap longs are ~flat, majors trend.
       // Shorts unaffected (fade works on alts). See LONG_LARGE_CAP_ONLY note above.
+      // NOTE (2026-06-22): do NOT relax this gate to "enable the fade-long edge" — the
+      // scanner candidates here are all CHASE entries (entryDrift ~+4 ATR, no dips), which
+      // is exactly why alt-longs bleed. The new oversold dip-buy edge lives in its own
+      // measurement lane (fade-long-edge.ts), NOT this allocator path; relaxing the gate
+      // would only re-admit the losing chase-longs. The gate stays until the fade lane
+      // matures and earns its own admission path.
       if (LONG_LARGE_CAP_ONLY && direction === "LONG" && paperIsHighBetaAlt(symbol)) {
         recordReject(symbol, direction, def.id, "LONG_HIGH_BETA_ALT_NO_EDGE", rowFresh, rowNet);
         continue;

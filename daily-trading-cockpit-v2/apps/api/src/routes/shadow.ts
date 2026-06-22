@@ -205,6 +205,7 @@ import {
   type CurrentGuardVariantMatrixReport,
   type KlineTuple as VariantMatrixKlineTuple,
 } from "../lib/current-guard-variant-matrix.js";
+import { getFadeLongStore, runFadeLongCycle, buildFadeLongReport } from "../lib/fade-long-edge.js";
 import { getCandidateFunnelLog } from "../lib/accelerated-evidence-candidate-funnel-log.js";
 import {
   buildPortfolioTrendShadowReport,
@@ -1075,6 +1076,10 @@ export async function registerShadowRoutes(
       getCurrentGuardVariantMatrixStore(),
       { capturedAt: generatedAt },
     );
+    const fadeLong =
+      process.env.FADE_LONG_EDGE_DISABLED === "1"
+        ? null
+        : buildFadeLongReport(getFadeLongStore().all);
     const mixed = buildMixedRegimeReport({
       regime,
       candidates: (cached?.candidates ?? []).map((candidate) => ({
@@ -1102,6 +1107,7 @@ export async function registerShadowRoutes(
       paperUnrealized,
       orders,
       variantMatrix,
+      fadeLong,
       mixed,
       mixedValidation,
       staleAudit,
@@ -1297,6 +1303,29 @@ export async function registerShadowRoutes(
           });
           await Promise.race([resolverPromise, new Promise<void>((res) => { setTimeout(res, 8_000); })]);
         } catch { /* resolve=1 failure must never break the brief */ }
+
+        // ── Fade-long edge: independent oversold (RSI<30) dip-buy measurement lane ──
+        // The bot's scanner only produces CHASE longs (no dips), which have no edge on alts.
+        // This lane records the symmetric long-fade (BUY oversold) on the universe and resolves
+        // it by candle-walk, accruing OOS exactly like the variant-matrix lanes. Report-only;
+        // does NOT pass through the allocator, paper book, live engine, or any strategy gate.
+        // Bounded by a 10 s race; any error is swallowed so the brief always renders.
+        if (process.env.FADE_LONG_EDGE_DISABLED !== "1") {
+          try {
+            const _flc = opts.binanceClient;
+            const fadeInterval = process.env.FADE_LONG_INTERVAL || "15m";
+            const fadeCyclePromise = runFadeLongCycle({
+              store: getFadeLongStore(),
+              universe: [...CURRENT_SCANNER_UNIVERSE],
+              now: Date.now(),
+              fetchCandles: async (symbol: string) => _flc.getCandles(symbol, fadeInterval, 120),
+            });
+            await Promise.race([
+              fadeCyclePromise.catch(() => undefined),
+              new Promise<void>((res) => { setTimeout(res, 10_000); }),
+            ]);
+          } catch { /* fade-long cycle must never break the brief */ }
+        }
       }
       let postCutoverReport: PostCutoverReport | undefined;
       try {

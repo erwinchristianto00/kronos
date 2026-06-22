@@ -6,6 +6,7 @@ import {
   WATCHABLE_MIN_FRESH,
   type CurrentGuardVariantMatrixReport,
 } from "./current-guard-variant-matrix.js";
+import type { FadeLongReport } from "./fade-long-edge.js";
 import type { MixedBudgetForwardValidationReport, MixedRegimeReport, OpenOrderStaleAudit } from "./mixed-regime-router.js";
 import type { PaperOrder, PaperPerformanceReport } from "./paper-execution-router.js";
 import { assessPaperTp, cgWideTpPctFromOrder } from "./paper-trading-controls.js";
@@ -205,6 +206,24 @@ export interface NeuralMapTelemetry {
   };
   nodes: NeuralMapNode[];
   lanes: NeuralMapLane[];
+  /**
+   * Fade-long edge: the oversold (RSI<30) dip-buy measurement lane. The scanner only emits CHASE
+   * longs (no dips) which have no edge on alts; this is the symmetric long-fade, measured on the
+   * universe and resolved by candle-walk. Report-only — accrues OOS like a variant lane, independent
+   * of the allocator/paper book. null when the lane is disabled or the store is empty.
+   */
+  fadeLong: {
+    freshValid: number;
+    open: number;
+    expired: number;
+    oosThreshold: number;
+    status: "COLLECTING" | "WATCHABLE";
+    netAvgR: number | null;
+    grossAvgR: number | null;
+    pf: number | null;
+    wr: number | null;
+    totalNetR: number;
+  } | null;
   alerts: NeuralMapAlert[];
 }
 
@@ -216,6 +235,9 @@ export interface NeuralMapTelemetryInput {
   paper: PaperPerformanceReport;
   orders: PaperOrder[];
   variantMatrix: CurrentGuardVariantMatrixReport;
+  /** Pre-built fade-long report (from buildFadeLongReport over the fade-long store). Optional —
+   *  when omitted the telemetry's fadeLong field is null. */
+  fadeLong?: FadeLongReport | null;
   mixed: MixedRegimeReport;
   mixedValidation: MixedBudgetForwardValidationReport;
   staleAudit: OpenOrderStaleAudit;
@@ -1266,6 +1288,20 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
     },
     nodes,
     lanes,
+    fadeLong: input.fadeLong
+      ? {
+          freshValid: input.fadeLong.freshValid,
+          open: input.fadeLong.open,
+          expired: input.fadeLong.expired,
+          oosThreshold: input.fadeLong.watchableThreshold,
+          status: input.fadeLong.status,
+          netAvgR: input.fadeLong.netAvgR,
+          grossAvgR: input.fadeLong.grossAvgR,
+          pf: input.fadeLong.pf,
+          wr: input.fadeLong.wr,
+          totalNetR: input.fadeLong.totalNetR,
+        }
+      : null,
     alerts,
   };
 }

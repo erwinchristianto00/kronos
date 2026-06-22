@@ -163,6 +163,18 @@ interface NeuralTelemetry {
   };
   nodes: NeuralNode[];
   lanes: NeuralLane[];
+  fadeLong: {
+    freshValid: number;
+    open: number;
+    expired: number;
+    oosThreshold: number;
+    status: 'COLLECTING' | 'WATCHABLE';
+    netAvgR: number | null;
+    grossAvgR: number | null;
+    pf: number | null;
+    wr: number | null;
+    totalNetR: number;
+  } | null;
   alerts: Array<{ severity: 'WARNING' | 'CRITICAL'; source: string; message: string }>;
 }
 
@@ -938,6 +950,23 @@ export default function NeuralMindmap() {
             {telemetry
               ? `${telemetry.paper.closed} closed / ${telemetry.paper.open} open · ${fmtUsdt(telemetry.paper.diagnosticUnrealizedPnl)} open MTM · not real`
               : 'paper only'}
+          </small>
+        </div>
+        <div>
+          <span>Fade-long edge <small>(oversold dip-buy)</small></span>
+          <strong className={(() => {
+            const fl = telemetry?.fadeLong;
+            if (!fl || fl.freshValid < fl.oosThreshold) return 'tone-measure';
+            return (fl.netAvgR ?? 0) > 0 ? 'tone-healthy' : 'tone-critical';
+          })()}>
+            {telemetry?.fadeLong
+              ? `${fmtR(telemetry.fadeLong.netAvgR)} net · ${telemetry.fadeLong.wr != null ? `${Math.round(telemetry.fadeLong.wr * 100)}% WR` : '—'}`
+              : 'Loading'}
+          </strong>
+          <small>
+            {telemetry?.fadeLong
+              ? `${telemetry.fadeLong.freshValid}/${telemetry.fadeLong.oosThreshold} OOS · ${telemetry.fadeLong.open} open · ${telemetry.fadeLong.status === 'WATCHABLE' ? 'watchable' : 'collecting'} · not real`
+              : 'RSI<30 measurement lane'}
           </small>
         </div>
         <div>
