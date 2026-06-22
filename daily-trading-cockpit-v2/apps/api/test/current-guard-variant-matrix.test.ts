@@ -374,8 +374,18 @@ describe("current-guard-variant-matrix", () => {
     expect(def.stopFloorBps).toBe(300);
     expect(def.tpRewardMultiple).toBe(3);
     // Geometry must place the TP far above the arm (0.75R) so an armed trade has room to fade.
-    const geo = deriveVariantGeometry(makeSignal({ direction: "SHORT", stopLoss: 102, tp1: 99 }), def);
+    // entry 100 / stop 102 (200bps) → floored to 300bps stop, TP at 3R = 9 below entry (91).
+    const geo = deriveVariantGeometry(makeSignal({ direction: "SHORT", stopLoss: 102, tp1: 99 }), def) as Extract<
+      ReturnType<typeof deriveVariantGeometry>,
+      { kind: "ok" }
+    >;
     expect(geo.kind).toBe("ok");
+    expect(geo.stopDistanceBps).toBeCloseTo(300, 0);
+    const rewardR = Math.abs((geo.takeProfitLevels[0]! - 100) / (100 - geo.stopLoss));
+    expect(rewardR).toBeCloseTo(3, 1); // far TP — the giveback now has room to operate
+    // Direction-agnostic: it must derive far-TP on LONG signals too (not longOnly-rejected).
+    const geoLong = deriveVariantGeometry(makeSignal({ direction: "LONG", stopLoss: 98, tp1: 101 }), def);
+    expect(geoLong.kind).toBe("ok");
   });
 
   // 5. No-fib500 rejects and counts.
