@@ -22,6 +22,11 @@ export const FADE_LONG_RSI_THRESHOLD = Number(process.env.FADE_LONG_RSI_THRESHOL
 export const FADE_LONG_STOP_PCT = Number(process.env.FADE_LONG_STOP_PCT) || 0.015; // 1.5% stop below entry
 export const FADE_LONG_TP_PCT = Number(process.env.FADE_LONG_TP_PCT) || 0.0075; // +0.75% mean-revert bounce target
 export const FADE_LONG_MAX_HOLD_BARS = Number(process.env.FADE_LONG_MAX_HOLD_BARS) || 8; // 2h on 15m
+// How many recent closed bars each cycle scans for fresh oversold crosses. The cycle runs every
+// ~7min but a cross is only "fresh" on ONE bar; checking only the latest bar silently missed almost
+// every cross (80 real crosses → 0 recorded). Scanning a lookback window means any successful run
+// captures every cross in the window (deduped by bar), robust to cadence + intermittent fetch load.
+export const FADE_LONG_LOOKBACK_BARS = Number(process.env.FADE_LONG_LOOKBACK_BARS) || 24; // ~6h on 15m
 const FADE_LONG_EXPIRY_MS = 7 * 24 * 60 * 60 * 1000;
 
 /** Wilder RSI on close prices. Returns array aligned to closes (null until enough data). */
@@ -64,36 +69,69 @@ export interface FadeLongObservation {
   resolvedAt: string | null;
 }
 
-/** Detect a fresh oversold fade-long entry from a symbol's candles (RSI crosses DOWN < threshold
- *  on the latest closed bar). Returns null when not a fresh oversold cross. */
-export function detectFadeLongEntry(symbol: string, candles: Candle[], nowMs: number): FadeLongObservation | null {
-  if (candles.length < FADE_LONG_RSI_PERIOD + 2) return null;
-  const closes = candles.map((c) => c.close);
-  const rsi = computeRSI(closes);
-  const i = closes.length - 1;
-  const r = rsi[i];
-  const rPrev = rsi[i - 1];
-  if (r === null || r >= FADE_LONG_RSI_THRESHOLD) return null;
-  // Fresh cross only (prev bar not already oversold) so we don't re-signal every bar of a deep dip.
-  if (rPrev !== null && rPrev < FADE_LONG_RSI_THRESHOLD) return null;
-  const entry = closes[i];
-  if (!(entry > 0)) return null;
+/** Build a fade-long observation for the fresh oversold cross at bar index `i` (entry = that bar's
+ *  close). openedAt is the BAR's time (not "now") so a cross detected from the lookback window
+ *  resolves by walking the candles AFTER it — not from the cycle's wall-clock. */
+function buildFadeLongObs(symbol: string, candles: Candle[], i: number, rsiAtEntry: number): FadeLongObservation {
+  const entry = candles[i]!.close;
+  const openedAtMs = candles[i]!.openTime;
   return {
-    observationId: `fadelong:${symbol}:${candles[i].openTime}`,
+    observationId: `fadelong:${symbol}:${openedAtMs}`,
     symbol,
-    rsiAtEntry: r,
+    rsiAtEntry,
     entryPrice: entry,
     stopLoss: entry * (1 - FADE_LONG_STOP_PCT),
     takeProfit: entry * (1 + FADE_LONG_TP_PCT),
     stopDistanceBps: FADE_LONG_STOP_PCT * 10000,
-    openedAt: new Date(nowMs).toISOString(),
-    openedAtMs: nowMs,
+    openedAt: new Date(openedAtMs).toISOString(),
+    openedAtMs,
     status: "OPEN",
     grossR: null,
     netR: null,
     costR: null,
     resolvedAt: null,
   };
+}
+
+/** Is bar index `i` a FRESH oversold cross (RSI crosses DOWN < threshold; prev bar not already
+ *  oversold, so a deep multi-bar dip yields one signal, not one per bar)? */
+function isFreshOversoldCross(rsi: (number | null)[], closes: number[], i: number): boolean {
+  const r = rsi[i];
+  const rPrev = rsi[i - 1];
+  if (r === null || r >= FADE_LONG_RSI_THRESHOLD) return false;
+  if (rPrev === null || rPrev < FADE_LONG_RSI_THRESHOLD) return false;
+  return closes[i]! > 0;
+}
+
+/** Detect a fresh oversold fade-long entry on the LATEST closed bar (or null). Kept for the unit
+ *  tests / single-bar callers; the cycle uses {@link detectFadeLongEntries} over a lookback window. */
+export function detectFadeLongEntry(symbol: string, candles: Candle[], _nowMs: number): FadeLongObservation | null {
+  if (candles.length < FADE_LONG_RSI_PERIOD + 2) return null;
+  const closes = candles.map((c) => c.close);
+  const rsi = computeRSI(closes);
+  const i = closes.length - 1;
+  if (!isFreshOversoldCross(rsi, closes, i)) return null;
+  return buildFadeLongObs(symbol, candles, i, rsi[i] as number);
+}
+
+/** Scan the last `lookbackBars` closed bars for fresh oversold crosses, returning one observation
+ *  per cross. This is what the cycle uses: the old single-latest-bar check silently missed almost
+ *  every transient cross (a cross is "fresh" on only one bar, caught only if a 7-min tick landed
+ *  exactly while that bar was newest). Scanning the window makes each run catch every recent cross. */
+export function detectFadeLongEntries(
+  symbol: string,
+  candles: Candle[],
+  lookbackBars = FADE_LONG_LOOKBACK_BARS,
+): FadeLongObservation[] {
+  if (candles.length < FADE_LONG_RSI_PERIOD + 2) return [];
+  const closes = candles.map((c) => c.close);
+  const rsi = computeRSI(closes);
+  const out: FadeLongObservation[] = [];
+  const start = Math.max(FADE_LONG_RSI_PERIOD + 1, closes.length - Math.max(1, lookbackBars));
+  for (let i = start; i < closes.length; i += 1) {
+    if (isFreshOversoldCross(rsi, closes, i)) out.push(buildFadeLongObs(symbol, candles, i, rsi[i] as number));
+  }
+  return out;
 }
 
 function netOf(grossR: number, stopDistanceBps: number, isLoss: boolean): { costR: number; netR: number } {
@@ -254,8 +292,12 @@ export async function runFadeLongCycle(opts: {
     const closed = candles.length > 1 ? candles.slice(0, -1) : candles;
     if (closed.length === 0) continue;
     scanned++;
-    const entry = detectFadeLongEntry(symbol, closed, now);
-    if (entry && store.add(entry)) newEntries++;
+    // Scan the whole lookback window (not just the latest bar) so a single successful run captures
+    // every recent fresh oversold cross — deduped by bar via the store. This is the fix for the
+    // cycle silently recording 0 across 80 real crosses.
+    for (const entry of detectFadeLongEntries(symbol, closed)) {
+      if (store.add(entry)) newEntries++;
+    }
     for (const obs of store.all) {
       if (obs.symbol !== symbol || obs.status !== "OPEN") continue;
       const patch = resolveFadeLong(obs, closed, now);

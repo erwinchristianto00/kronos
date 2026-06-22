@@ -3,6 +3,7 @@ import type { Candle } from "@dtc/shared";
 import {
   computeRSI,
   detectFadeLongEntry,
+  detectFadeLongEntries,
   resolveFadeLong,
   buildFadeLongReport,
   runFadeLongCycle,
@@ -81,6 +82,46 @@ describe("detectFadeLongEntry", () => {
 
   it("returns null when the prior bar was already oversold (no fresh cross)", () => {
     expect(detectFadeLongEntry("WLDUSDT", candles.slice(0, crossIdx + 2), 5_000)).toBeNull();
+  });
+});
+
+describe("detectFadeLongEntries (lookback scanner — the cycle's detector)", () => {
+  // rise → dip below 30 (cross #1) → recover above 30 → dip below 30 again (cross #2)
+  function twoCrossCloses(): number[] {
+    const closes: number[] = [];
+    let p = 100;
+    for (let i = 0; i < 20; i++) { p *= 1.005; closes.push(p); } // RSI high
+    for (let i = 0; i < 12; i++) { p *= 0.975; closes.push(p); } // cross #1 (<30)
+    for (let i = 0; i < 16; i++) { p *= 1.013; closes.push(p); } // recover (>30)
+    for (let i = 0; i < 12; i++) { p *= 0.975; closes.push(p); } // cross #2 (<30)
+    return closes;
+  }
+
+  it("[FLSCAN] catches EVERY fresh cross in the window, not just the latest bar", () => {
+    const closes = twoCrossCloses();
+    const candles = closes.map((c, i) => mkCandle(1000 + i * 900_000, c)); // 15m bars
+    const rsi = computeRSI(closes, 14);
+    let expected = 0;
+    for (let i = 1; i < rsi.length; i++) {
+      if (rsi[i] !== null && rsi[i - 1] !== null && (rsi[i - 1] as number) >= FADE_LONG_RSI_THRESHOLD && (rsi[i] as number) < FADE_LONG_RSI_THRESHOLD) expected++;
+    }
+    expect(expected).toBeGreaterThanOrEqual(2); // the series genuinely has multiple crosses
+
+    const entries = detectFadeLongEntries("XUSDT", candles, candles.length);
+    expect(entries.length).toBe(expected); // scanner finds ALL of them…
+    // …each tagged to its own bar (distinct ids) with that bar's close as entry.
+    expect(new Set(entries.map((e) => e.observationId)).size).toBe(entries.length);
+    for (const e of entries) {
+      expect(e.openedAtMs).toBeGreaterThan(0);
+      expect(e.stopLoss).toBeLessThan(e.entryPrice);
+      expect(e.rsiAtEntry).toBeLessThan(FADE_LONG_RSI_THRESHOLD);
+    }
+  });
+
+  it("[FLSCAN] returns [] when no bar in the window is a fresh cross", () => {
+    const rising = Array.from({ length: 40 }, (_, i) => 100 + i); // strictly up → RSI ~100, never <30
+    const candles = rising.map((c, i) => mkCandle(1000 + i * 900_000, c));
+    expect(detectFadeLongEntries("XUSDT", candles, candles.length)).toEqual([]);
   });
 });
 
