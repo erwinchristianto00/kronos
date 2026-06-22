@@ -650,6 +650,18 @@ interface LiveAccount {
   lanes: LiveLaneExposure[];
 }
 
+async function fetchJsonWithTimeout<T>(url: string, timeoutMs = 12_000): Promise<T> {
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, { cache: 'no-store', signal: controller.signal });
+    if (!response.ok) throw new Error(`${url} failed (${response.status})`);
+    return await response.json() as T;
+  } finally {
+    window.clearTimeout(timeout);
+  }
+}
+
 export default function NeuralMindmap() {
   const [telemetry, setTelemetry] = useState<NeuralTelemetry | null>(null);
   const [liveAccount, setLiveAccount] = useState<LiveAccount | null>(null);
@@ -665,9 +677,7 @@ export default function NeuralMindmap() {
 
   async function loadTelemetry() {
     try {
-      const response = await fetch('/api/shadow/neural-map', { cache: 'no-store' });
-      if (!response.ok) throw new Error(`Telemetry request failed (${response.status})`);
-      const next = await response.json() as NeuralTelemetry;
+      const next = await fetchJsonWithTimeout<NeuralTelemetry>('/api/shadow/neural-map');
       setTelemetry(next);
       setLastReceivedAt(Date.now());
       setError(null);
@@ -976,7 +986,7 @@ export default function NeuralMindmap() {
             {(() => {
               const fl = telemetry?.fadeLong;
               if (!fl) return 'RSI<30 measurement lane';
-              const topRegime = fl.byRegime[0];
+              const topRegime = fl.byRegime?.[0];
               const regimeLabel = topRegime ? ` · ${topRegime.regime}: ${topRegime.freshValid} OOS/${topRegime.open} open` : '';
               return `${fl.freshValid}/${fl.oosThreshold} OOS · ${fl.open} open · ${fl.status === 'WATCHABLE' ? 'watchable' : 'collecting'}${regimeLabel} · not real`;
             })()}
