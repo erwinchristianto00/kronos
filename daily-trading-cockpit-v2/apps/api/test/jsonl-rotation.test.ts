@@ -119,6 +119,27 @@ describe("rotateJsonlIfNeeded", () => {
     expect(result.reason).toBe("BELOW_THRESHOLD");
   });
 
+  it("still prunes stale archives when active file is below threshold", () => {
+    const dir = mkTmp();
+    const archiveDir = join(dir, "archive");
+    mkdirSync(archiveDir, { recursive: true });
+    for (let i = 1; i <= 5; i++) {
+      writeFileSync(join(archiveDir, `scan-history.jsonl.2026-06-1${i}T00-00-00-000Z.jsonl`), "old\n");
+    }
+    process.env.SCAN_HISTORY_ARCHIVE_KEEP = "2";
+    const file = join(dir, "scan-history.jsonl");
+    writeFileSync(file, "tiny\n", "utf-8");
+
+    const result = rotateJsonlIfNeeded(file, { thresholdBytes: 1024 * 1024 });
+
+    expect(result.rotated).toBe(false);
+    const archives = readdirSync(archiveDir).filter(
+      (f) => f.startsWith("scan-history.jsonl.") && f.endsWith(".jsonl"),
+    );
+    expect(archives.length).toBe(2);
+    delete process.env.SCAN_HISTORY_ARCHIVE_KEEP;
+  });
+
   it("returns FILE_NOT_FOUND when file doesn't exist", () => {
     const dir = mkTmp();
     const file = join(dir, "missing.jsonl");

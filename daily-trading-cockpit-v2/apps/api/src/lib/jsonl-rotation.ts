@@ -188,6 +188,10 @@ export function rotateJsonlIfNeeded(
     }
 
     if (stat.size < thresholdBytes) {
+      const dir = dirname(filePath);
+      const base = basename(filePath);
+      const archiveDir = opts.archiveDir ?? resolve(dir, "archive");
+      pruneArchives(archiveDir, base, Number(process.env.SCAN_HISTORY_ARCHIVE_KEEP) || 3);
       return { rotated: false, reason: "BELOW_THRESHOLD", fromSize: stat.size };
     }
 
