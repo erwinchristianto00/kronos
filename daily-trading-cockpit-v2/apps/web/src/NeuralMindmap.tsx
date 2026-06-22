@@ -167,6 +167,15 @@ interface NeuralTelemetry {
     freshValid: number;
     open: number;
     expired: number;
+    byRegime: Array<{
+      regime: string;
+      freshValid: number;
+      open: number;
+      expired: number;
+      netAvgR: number | null;
+      wr: number | null;
+      totalNetR: number;
+    }>;
     oosThreshold: number;
     status: 'COLLECTING' | 'WATCHABLE';
     netAvgR: number | null;
@@ -964,9 +973,13 @@ export default function NeuralMindmap() {
               : 'Loading'}
           </strong>
           <small>
-            {telemetry?.fadeLong
-              ? `${telemetry.fadeLong.freshValid}/${telemetry.fadeLong.oosThreshold} OOS · ${telemetry.fadeLong.open} open · ${telemetry.fadeLong.status === 'WATCHABLE' ? 'watchable' : 'collecting'} · not real`
-              : 'RSI<30 measurement lane'}
+            {(() => {
+              const fl = telemetry?.fadeLong;
+              if (!fl) return 'RSI<30 measurement lane';
+              const topRegime = fl.byRegime[0];
+              const regimeLabel = topRegime ? ` · ${topRegime.regime}: ${topRegime.freshValid} OOS/${topRegime.open} open` : '';
+              return `${fl.freshValid}/${fl.oosThreshold} OOS · ${fl.open} open · ${fl.status === 'WATCHABLE' ? 'watchable' : 'collecting'}${regimeLabel} · not real`;
+            })()}
           </small>
         </div>
         <div>

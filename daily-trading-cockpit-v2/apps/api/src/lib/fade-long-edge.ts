@@ -50,6 +50,7 @@ export function computeRSI(closes: number[], period = FADE_LONG_RSI_PERIOD): (nu
 export interface FadeLongObservation {
   observationId: string;
   symbol: string;
+  regimeAtEntry: string | null;
   rsiAtEntry: number;
   entryPrice: number;
   stopLoss: number;
@@ -66,7 +67,12 @@ export interface FadeLongObservation {
 
 /** Detect a fresh oversold fade-long entry from a symbol's candles (RSI crosses DOWN < threshold
  *  on the latest closed bar). Returns null when not a fresh oversold cross. */
-export function detectFadeLongEntry(symbol: string, candles: Candle[], nowMs: number): FadeLongObservation | null {
+export function detectFadeLongEntry(
+  symbol: string,
+  candles: Candle[],
+  nowMs: number,
+  regimeAtEntry: string | null = null,
+): FadeLongObservation | null {
   if (candles.length < FADE_LONG_RSI_PERIOD + 2) return null;
   const closes = candles.map((c) => c.close);
   const rsi = computeRSI(closes);
@@ -81,6 +87,7 @@ export function detectFadeLongEntry(symbol: string, candles: Candle[], nowMs: nu
   return {
     observationId: `fadelong:${symbol}:${candles[i].openTime}`,
     symbol,
+    regimeAtEntry,
     rsiAtEntry: r,
     entryPrice: entry,
     stopLoss: entry * (1 - FADE_LONG_STOP_PCT),
@@ -139,12 +146,23 @@ export interface FadeLongReport {
   freshValid: number;
   open: number;
   expired: number;
+  byRegime: FadeLongRegimeReport[];
   netAvgR: number | null;
   grossAvgR: number | null;
   pf: number | null;
   wr: number | null;
   watchableThreshold: number;
   status: "COLLECTING" | "WATCHABLE";
+  totalNetR: number;
+}
+
+export interface FadeLongRegimeReport {
+  regime: string;
+  freshValid: number;
+  open: number;
+  expired: number;
+  netAvgR: number | null;
+  wr: number | null;
   totalNetR: number;
 }
 
@@ -159,10 +177,36 @@ export function buildFadeLongReport(observations: readonly FadeLongObservation[]
   const pfDen = -nets.filter((r) => r < 0).reduce((a, b) => a + b, 0);
   const freshValid = resolved.length;
   const mean = (xs: number[]) => (xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : null);
+  const byRegime = Array.from(
+    observations.reduce((map, obs) => {
+      const key = obs.regimeAtEntry?.trim() || "UNKNOWN";
+      const existing = map.get(key) ?? [];
+      existing.push(obs);
+      map.set(key, existing);
+      return map;
+    }, new Map<string, FadeLongObservation[]>()),
+  )
+    .map(([regime, rows]) => {
+      const regimeResolved = rows.filter(
+        (o) => (o.status === "CLOSED_WIN" || o.status === "CLOSED_LOSS") && typeof o.netR === "number",
+      );
+      const regimeNets = regimeResolved.map((o) => o.netR as number);
+      return {
+        regime,
+        freshValid: regimeResolved.length,
+        open: rows.filter((o) => o.status === "OPEN").length,
+        expired: rows.filter((o) => o.status === "EXPIRED").length,
+        netAvgR: mean(regimeNets),
+        wr: regimeResolved.length ? regimeNets.filter((r) => r > 0).length / regimeResolved.length : null,
+        totalNetR: regimeNets.reduce((a, b) => a + b, 0),
+      };
+    })
+    .sort((a, b) => b.freshValid - a.freshValid || b.open - a.open || a.regime.localeCompare(b.regime));
   return {
     freshValid,
     open: observations.filter((o) => o.status === "OPEN").length,
     expired: observations.filter((o) => o.status === "EXPIRED").length,
+    byRegime,
     netAvgR: mean(nets),
     grossAvgR: mean(grosses),
     pf: pfDen > 0 ? pfNum / pfDen : pfNum > 0 ? 999 : null,
@@ -234,6 +278,7 @@ export async function runFadeLongCycle(opts: {
   universe: readonly string[];
   fetchCandles: (symbol: string) => Promise<Candle[]>;
   now: number;
+  regimeAtEntry?: string | null;
   maxSymbols?: number;
 }): Promise<FadeLongCycleResult> {
   const { store, universe, fetchCandles, now } = opts;
@@ -254,7 +299,7 @@ export async function runFadeLongCycle(opts: {
     const closed = candles.length > 1 ? candles.slice(0, -1) : candles;
     if (closed.length === 0) continue;
     scanned++;
-    const entry = detectFadeLongEntry(symbol, closed, now);
+    const entry = detectFadeLongEntry(symbol, closed, now, opts.regimeAtEntry ?? null);
     if (entry && store.add(entry)) newEntries++;
     for (const obs of store.all) {
       if (obs.symbol !== symbol || obs.status !== "OPEN") continue;
@@ -282,6 +327,7 @@ export async function runFadeLongCycleGuarded(opts: {
   universe: readonly string[];
   fetchCandles: (symbol: string) => Promise<Candle[]>;
   now: number;
+  regimeAtEntry?: string | null;
   maxSymbols?: number;
 }): Promise<FadeLongCycleResult | null> {
   if (cycleInFlight) return null;

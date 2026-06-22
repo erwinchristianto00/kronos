@@ -216,6 +216,15 @@ export interface NeuralMapTelemetry {
     freshValid: number;
     open: number;
     expired: number;
+    byRegime: Array<{
+      regime: string;
+      freshValid: number;
+      open: number;
+      expired: number;
+      netAvgR: number | null;
+      wr: number | null;
+      totalNetR: number;
+    }>;
     oosThreshold: number;
     status: "COLLECTING" | "WATCHABLE";
     netAvgR: number | null;
@@ -1293,6 +1302,7 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
           freshValid: input.fadeLong.freshValid,
           open: input.fadeLong.open,
           expired: input.fadeLong.expired,
+          byRegime: input.fadeLong.byRegime,
           oosThreshold: input.fadeLong.watchableThreshold,
           status: input.fadeLong.status,
           netAvgR: input.fadeLong.netAvgR,

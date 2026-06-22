@@ -1319,6 +1319,7 @@ export async function registerShadowRoutes(
             store: getFadeLongStore(),
             universe: [...CURRENT_SCANNER_UNIVERSE],
             now: Date.now(),
+            regimeAtEntry: currentRegime,
             fetchCandles: async (symbol: string) => _flc.getCandles(symbol, fadeInterval, 120),
           }).catch(() => undefined);
         }
