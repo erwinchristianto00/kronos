@@ -40,6 +40,11 @@ import { buildDashboardAuditSummaryReport, type DashboardAuditSummaryEra } from 
 import { buildRegimeDirectionControllerReport } from "../lib/regime-direction-controller.js";
 import { getRegimeEdgeMemory } from "../lib/regime-edge-memory.js";
 import { buildLiveTradingGateReport } from "../lib/live-trading-gate.js";
+import {
+  buildExchangeHealthReadinessReport,
+  EXCHANGE_HEALTH_MAX_DATA_AGE_MS,
+  type ExchangeHealthReadinessReport,
+} from "../lib/exchange-health-readiness.js";
 import { buildOperatorBrief } from "../lib/operator-brief.js";
 import { buildAdaptiveLaneRouterReport } from "../lib/adaptive-lane-router.js";
 import {
@@ -1389,9 +1394,28 @@ export async function registerShadowRoutes(
           variantMatrixReport = buildCurrentGuardVariantMatrixReport(getCurrentGuardVariantMatrixStore());
         }
       } catch { /* variant matrix unavailable */ }
+      // ── infraReady gate 1/3: exchange-health readiness (v1, report-only) ──────────────────────
+      // Computed from data already in hand (scan freshness + microstructure feeds). ANDed with
+      // killSwitch + orderReconciliation (both still false), so infraReady STAYS false → admission
+      // behavior is unchanged. Guarded: any failure → undefined → exchangeHealthReady false (= now).
+      let exchangeHealthReadiness: ExchangeHealthReadinessReport | undefined;
+      try {
+        const _ehScan = getLatestScanCandidates();
+        const _ehScanMs = _ehScan?.scanFinishedAt ? new Date(_ehScan.scanFinishedAt).getTime() : null;
+        let _ehMicro: MicrostructureCollectorReport | undefined;
+        try {
+          _ehMicro = await buildMicrostructureCollectorReport(getMicrostructureSnapshotStore());
+        } catch { /* microstructure optional */ }
+        exchangeHealthReadiness = buildExchangeHealthReadinessReport(_ehMicro, generatedAt, {
+          reachable: _ehScanMs != null && Date.now() - _ehScanMs <= EXCHANGE_HEALTH_MAX_DATA_AGE_MS,
+          marketDataAgeMs: _ehScanMs != null ? Date.now() - _ehScanMs : null,
+          clockSkewMs: null, // advisory; wired when the signed client surfaces lastMeasuredSkewMs
+        });
+      } catch { /* exchange-health readiness must never break the brief */ }
       const gateReport = buildLiveTradingGateReport({
         postCutoverReport,
         currentGuardVariantMatrixReport: variantMatrixReport,
+        exchangeHealthReadiness,
       });
       // ── ?paper=1: bounded paper admission + resolver run ─────────────────
       // When paper=1 is supplied and a Binance client is available, run the

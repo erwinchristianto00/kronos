@@ -25,12 +25,27 @@ export interface ExchangeHealthCheck {
   currentValue?: string;
 }
 
+/** v1 live inputs — the CRITICAL real-time health signals computed each operator-brief (≈7-min
+ *  cadence = the monitoring loop). Optional: when omitted the report behaves like the original spec
+ *  (ready stays false). All fields cheaply derivable from data already in hand (no new hot-path I/O). */
+export interface ExchangeHealthLiveInputs {
+  reachable: boolean; // exchange responding (recent scan/candle data flowed)
+  marketDataAgeMs: number | null; // now − latest scan finish; null if unknown
+  clockSkewMs: number | null; // |server−local| from the signed client; null if unmeasured (advisory)
+}
+export const EXCHANGE_HEALTH_MAX_DATA_AGE_MS = Number(process.env.EXCHANGE_HEALTH_MAX_DATA_AGE_MS) || 15 * 60 * 1000;
+export const EXCHANGE_HEALTH_MAX_CLOCK_SKEW_MS = Number(process.env.EXCHANGE_HEALTH_MAX_CLOCK_SKEW_MS) || 1500;
+
 export interface ExchangeHealthReadinessReport {
   reportOnly: true;
   module: typeof EXCHANGE_HEALTH_READINESS_MODULE;
   computedAt: string;
-  implemented: boolean; // partial — true only if ALL checks available
-  ready: false; // always false (need ALL + monitoring loop)
+  implemented: boolean; // partial — true only if ALL 12 spec checks have data
+  /** v1 gate: true only when the CRITICAL real-time checks pass (reachable + fresh market data +
+   *  feeds present + clock OK). Still ANDed with killSwitch + orderReconciliation in infraReady, so
+   *  this alone can never enable live. false whenever live inputs are absent. */
+  ready: boolean;
+  readyReasons: string[]; // why not ready (empty when ready)
   checks: ExchangeHealthCheck[];
   availableCount: number;
   missingChecks: string[];
@@ -45,6 +60,7 @@ function pct(v: number | null | undefined): string {
 export function buildExchangeHealthReadinessReport(
   microstructure: MicrostructureCollectorReport | undefined,
   capturedAt?: string,
+  live?: ExchangeHealthLiveInputs,
 ): ExchangeHealthReadinessReport {
   const computedAt = capturedAt ?? new Date().toISOString();
 
@@ -143,20 +159,68 @@ export function buildExchangeHealthReadinessReport(
     },
   ];
 
+  // ── v1 live CRITICAL checks (computed each brief = the ≈7-min monitoring cadence) ──────────────
+  const marketDataFresh =
+    !!live && live.marketDataAgeMs != null && live.marketDataAgeMs >= 0 && live.marketDataAgeMs <= EXCHANGE_HEALTH_MAX_DATA_AGE_MS;
+  const feedsPresent = bookTickerAvail > 0 && depthAvail > 0;
+  const reachable = !!live && live.reachable;
+  // clock skew is advisory: only blocks when it has been MEASURED and is out of tolerance.
+  const clockMeasured = !!live && live.clockSkewMs != null;
+  const clockOk = !clockMeasured || (live!.clockSkewMs as number) <= EXCHANGE_HEALTH_MAX_CLOCK_SKEW_MS;
+  if (live) {
+    checks.push(
+      {
+        name: "exchange_reachable",
+        description: "Exchange responded with fresh market data this cycle.",
+        available: reachable,
+        source: "AC_MICROSTRUCTURE",
+        currentValue: reachable ? "reachable" : "no recent data",
+      },
+      {
+        name: "market_data_freshness",
+        description: "Age of the latest scan/candle close vs the staleness ceiling.",
+        available: marketDataFresh,
+        source: "AC_MICROSTRUCTURE",
+        currentValue:
+          live.marketDataAgeMs != null ? `${Math.round(live.marketDataAgeMs / 1000)}s old` : "unknown",
+      },
+      {
+        name: "clock_sync",
+        description: "Signed-client clock skew vs server time (advisory until measured).",
+        available: clockOk,
+        source: clockMeasured ? "AC_MICROSTRUCTURE" : "NOT_AVAILABLE",
+        currentValue: clockMeasured ? `${Math.round(live.clockSkewMs as number)}ms skew` : "not measured",
+      },
+    );
+  }
+
   const availableCount = checks.filter((c) => c.available).length;
   const missingChecks = checks.filter((c) => !c.available).map((c) => c.name);
   const implemented = checks.every((c) => c.available);
 
-  const summary =
-    `Exchange health PARTIAL: ${availableCount}/${checks.length} checks have data from AC microstructure; ` +
-    `${missingChecks.length} missing. No monitoring/alerting loop. NOT ready.`;
+  // v1 readiness: the CRITICAL real-time checks. ANDed with killSwitch + orderReconciliation in
+  // infraReady, so this alone can NEVER enable live trading.
+  const readyReasons: string[] = [];
+  if (!live) readyReasons.push("no live inputs (report-only spec mode)");
+  else {
+    if (!reachable) readyReasons.push("exchange not reachable / no recent data");
+    if (!marketDataFresh) readyReasons.push("market data stale or unknown");
+    if (!feedsPresent) readyReasons.push("microstructure book/depth feeds incomplete");
+    if (clockMeasured && !clockOk) readyReasons.push(`clock skew ${Math.round(live.clockSkewMs as number)}ms over tolerance`);
+  }
+  const ready = readyReasons.length === 0 && !!live;
+
+  const summary = ready
+    ? `Exchange health v1 READY: reachable + market data fresh + feeds present + clock ok (${availableCount}/${checks.length} checks have data).`
+    : `Exchange health NOT ready: ${readyReasons.join("; ") || `${missingChecks.length} checks missing`}.`;
 
   return {
     reportOnly: true,
     module: EXCHANGE_HEALTH_READINESS_MODULE,
     computedAt,
     implemented,
-    ready: false,
+    ready,
+    readyReasons,
     checks,
     availableCount,
     missingChecks,
