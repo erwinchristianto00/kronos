@@ -45,6 +45,10 @@ import {
   EXCHANGE_HEALTH_MAX_DATA_AGE_MS,
   type ExchangeHealthReadinessReport,
 } from "../lib/exchange-health-readiness.js";
+import {
+  buildOrderReconciliationReadinessReport,
+  type OrderReconciliationReadinessReport,
+} from "../lib/order-reconciliation-readiness.js";
 import { buildOperatorBrief } from "../lib/operator-brief.js";
 import { buildAdaptiveLaneRouterReport } from "../lib/adaptive-lane-router.js";
 import {
@@ -250,6 +254,9 @@ export async function registerShadowRoutes(
     coreScanAutoRefreshController?: CoreScanAutoRefreshController;
     kronosCounterfactualStore?: KronosCounterfactualStore;
     notificationService?: NotificationService;
+    /** Lazy getter for the live-execution engine (created after this registration). Used READ-ONLY
+     *  (sync getStatus, no I/O) to compute the order-reconciliation readiness gate. */
+    liveEngineGetter?: () => { getStatus: () => unknown } | null;
   } = {},
 ): Promise<void> {
   const overlayStore = new JsonExternalRotationOverlayStore(opts.externalOverlayDataDir ?? "data");
@@ -1412,10 +1419,38 @@ export async function registerShadowRoutes(
           clockSkewMs: null, // advisory; wired when the signed client surfaces lastMeasuredSkewMs
         });
       } catch { /* exchange-health readiness must never break the brief */ }
+      // ── infraReady gate 2/3: order-reconciliation readiness (v1, report-only) ─────────────────
+      // READS the live engine's in-memory getStatus() (sync, no I/O) — the engine already reconciles
+      // open intents vs the exchange each tick. ready only when the reconcile loop ran recently with
+      // 0 drift/errors. ANDed with killSwitch (still false) → infraReady STAYS false → non-breaking.
+      let orderReconciliationReadiness: OrderReconciliationReadinessReport | undefined;
+      try {
+        const _liveStatus = opts.liveEngineGetter?.()?.getStatus() as
+          | {
+              enabled?: boolean;
+              health?: { lastTickAt?: string | number | null; lastTickError?: string | null };
+              reconcileIssues?: unknown[];
+              openIntents?: unknown[];
+            }
+          | null
+          | undefined;
+        if (_liveStatus) {
+          const _lt = _liveStatus.health?.lastTickAt;
+          const _ltMs = typeof _lt === "number" ? _lt : typeof _lt === "string" ? new Date(_lt).getTime() : null;
+          orderReconciliationReadiness = buildOrderReconciliationReadinessReport(generatedAt, {
+            engineEnabled: _liveStatus.enabled === true,
+            lastTickAgeMs: _ltMs != null && Number.isFinite(_ltMs) ? Date.now() - _ltMs : null,
+            reconcileIssueCount: Array.isArray(_liveStatus.reconcileIssues) ? _liveStatus.reconcileIssues.length : 0,
+            lastTickError: _liveStatus.health?.lastTickError ?? null,
+            openIntentCount: Array.isArray(_liveStatus.openIntents) ? _liveStatus.openIntents.length : 0,
+          });
+        }
+      } catch { /* order-reconciliation readiness must never break the brief */ }
       const gateReport = buildLiveTradingGateReport({
         postCutoverReport,
         currentGuardVariantMatrixReport: variantMatrixReport,
         exchangeHealthReadiness,
+        orderReconciliationReadiness,
       });
       // ── ?paper=1: bounded paper admission + resolver run ─────────────────
       // When paper=1 is supplied and a Binance client is available, run the

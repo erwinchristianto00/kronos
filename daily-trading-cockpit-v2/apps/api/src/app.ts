@@ -96,11 +96,15 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
   const coreScanAutoRefreshController = await registerScanRoute(app, scanService, tracker, outcomeChecker, shadowEngine, { binanceClient, performanceProvider });
   await registerKronosRoutes(app, kronosClient, binanceClient);
   await registerOutcomesRoutes(app, tracker, performanceProvider);
+  // Declared here (assigned below) so the shadow routes can READ the live engine's in-memory
+  // status (sync getStatus, no I/O) for the order-reconciliation readiness gate, via a lazy getter.
+  let liveEngine: LiveExecutionEngine | null = null;
   await registerShadowRoutes(app, shadowEngine, {
     binanceClient,
     metadataFetchImpl: options.fetchImpl,
     coreScanAutoRefreshController,
     notificationService,
+    liveEngineGetter: () => liveEngine,
   });
   await registerNotificationRoutes(app, notificationService);
 
@@ -108,7 +112,6 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
   // no private client is constructed, no loop runs, nothing else in the app changes.
   // Strategy code is untouched — the engine only READS the paper store's decisions.
   const liveConfig = parseLiveExecutionConfig();
-  let liveEngine: LiveExecutionEngine | null = null;
   if (liveConfig.enabled && liveConfig.configErrors.length === 0 && liveConfig.env) {
     const liveClient = new BinanceFuturesPrivateClient({
       apiKey: liveConfig.apiKey,

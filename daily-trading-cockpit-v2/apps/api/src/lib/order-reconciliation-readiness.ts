@@ -18,12 +18,28 @@ export interface OrderLifecycleStage {
   requiredLedgerFields: string[];
 }
 
+/** v1 live inputs from the live-execution engine's in-memory getStatus() (sync, no I/O). When
+ *  omitted the report behaves like the original spec (ready stays false). The engine already
+ *  reconciles open intents vs the exchange each tick and records drift in reconcileIssues. */
+export interface OrderReconciliationLiveInputs {
+  engineEnabled: boolean; // live engine constructed + its tick/reconcile loop runs
+  lastTickAgeMs: number | null; // now − lastTickAt; null if never ticked
+  reconcileIssueCount: number; // outstanding drift/orphan issues from the last reconcile
+  lastTickError: string | null; // last engine-tick error (null = clean)
+  openIntentCount: number; // live intents the engine is tracking (its ledger)
+}
+export const ORDER_RECON_MAX_TICK_AGE_MS = Number(process.env.ORDER_RECON_MAX_TICK_AGE_MS) || 5 * 60 * 1000;
+
 export interface OrderReconciliationReadinessReport {
   reportOnly: true;
   module: typeof ORDER_RECONCILIATION_READINESS_MODULE;
   computedAt: string;
-  implemented: false;
-  ready: false;
+  implemented: boolean;
+  /** v1 gate: true only when the engine's reconcile loop is running RECENTLY with NO outstanding
+   *  drift/errors. ANDed with killSwitch + exchangeHealth in infraReady, so it can't enable live
+   *  alone. false whenever live inputs are absent. */
+  ready: boolean;
+  readyReasons: string[];
   lifecycleStages: OrderLifecycleStage[];
   requiredLedgerFields: string[]; // aggregate unique
   requiredExchangeChecks: string[];
@@ -133,24 +149,41 @@ const RISKS_IF_MISSING: readonly string[] = [
 
 export function buildOrderReconciliationReadinessReport(
   capturedAt?: string,
+  live?: OrderReconciliationLiveInputs,
 ): OrderReconciliationReadinessReport {
   const computedAt = capturedAt ?? new Date().toISOString();
-  const lifecycleStages: OrderLifecycleStage[] = LIFECYCLE_STAGES.map((s) => ({
-    ...s,
-    tracked: false,
-  }));
+  // When the live engine is enabled it tracks the full order lifecycle + reconciles each tick, so
+  // the lifecycle stages are "tracked". Without live inputs this is the original report-only spec.
+  const tracked = !!live && live.engineEnabled;
+  const lifecycleStages: OrderLifecycleStage[] = LIFECYCLE_STAGES.map((s) => ({ ...s, tracked }));
+
+  const readyReasons: string[] = [];
+  if (!live) readyReasons.push("no live engine status (report-only spec mode)");
+  else {
+    if (!live.engineEnabled) readyReasons.push("live engine not enabled (reconcile loop not running)");
+    else if (live.lastTickAgeMs == null) readyReasons.push("engine has not ticked yet");
+    else if (live.lastTickAgeMs > ORDER_RECON_MAX_TICK_AGE_MS) {
+      readyReasons.push(`last reconcile ${Math.round(live.lastTickAgeMs / 1000)}s ago > ${Math.round(ORDER_RECON_MAX_TICK_AGE_MS / 1000)}s`);
+    }
+    if (live.reconcileIssueCount > 0) readyReasons.push(`${live.reconcileIssueCount} unresolved reconcile issue(s)`);
+    if (live.lastTickError) readyReasons.push(`last tick error: ${live.lastTickError}`);
+  }
+  const ready = readyReasons.length === 0 && !!live;
+  const implemented = tracked;
 
   return {
     reportOnly: true,
     module: ORDER_RECONCILIATION_READINESS_MODULE,
     computedAt,
-    implemented: false,
-    ready: false,
+    implemented,
+    ready,
+    readyReasons,
     lifecycleStages,
     requiredLedgerFields: [...REQUIRED_LEDGER_FIELDS],
     requiredExchangeChecks: [...REQUIRED_EXCHANGE_CHECKS],
     risksIfMissing: [...RISKS_IF_MISSING],
-    summary:
-      "Order reconciliation NOT implemented. Required before any micro-pilot. Paper-only system has no order lifecycle.",
+    summary: ready
+      ? `Order reconciliation v1 READY: engine reconcile loop running, ${live!.openIntentCount} open intent(s), 0 unresolved drift.`
+      : `Order reconciliation NOT ready: ${readyReasons.join("; ")}.`,
   };
 }

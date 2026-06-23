@@ -28,4 +28,38 @@ describe("AF order reconciliation readiness", () => {
     expect(r.requiredExchangeChecks.length).toBeGreaterThan(0);
     expect(r.risksIfMissing.length).toBeGreaterThan(0);
   });
+
+  // ── v1 live readiness (gate 2 of infraReady) ──
+  const ok = { engineEnabled: true, lastTickAgeMs: 30_000, reconcileIssueCount: 0, lastTickError: null, openIntentCount: 0 };
+
+  it("[LIVE] ready=true when engine reconcile loop ran recently with 0 drift/errors", () => {
+    const r = buildOrderReconciliationReadinessReport(undefined, ok);
+    expect(r.ready).toBe(true);
+    expect(r.implemented).toBe(true);
+    expect(r.lifecycleStages.every((s) => s.tracked === true)).toBe(true);
+  });
+
+  it("[LIVE] ready=false when engine not enabled", () => {
+    expect(buildOrderReconciliationReadinessReport(undefined, { ...ok, engineEnabled: false }).ready).toBe(false);
+  });
+
+  it("[LIVE] ready=false when reconcile is stale", () => {
+    const r = buildOrderReconciliationReadinessReport(undefined, { ...ok, lastTickAgeMs: 30 * 60_000 });
+    expect(r.ready).toBe(false);
+    expect(r.readyReasons.some((x) => x.toLowerCase().includes("reconcile"))).toBe(true);
+  });
+
+  it("[LIVE] ready=false when there are unresolved reconcile issues", () => {
+    const r = buildOrderReconciliationReadinessReport(undefined, { ...ok, reconcileIssueCount: 2 });
+    expect(r.ready).toBe(false);
+    expect(r.readyReasons.some((x) => x.includes("reconcile issue"))).toBe(true);
+  });
+
+  it("[LIVE] ready=false on a tick error", () => {
+    expect(buildOrderReconciliationReadinessReport(undefined, { ...ok, lastTickError: "boom" }).ready).toBe(false);
+  });
+
+  it("[LIVE] no live inputs → ready=false (report-only spec mode)", () => {
+    expect(buildOrderReconciliationReadinessReport().ready).toBe(false);
+  });
 });
