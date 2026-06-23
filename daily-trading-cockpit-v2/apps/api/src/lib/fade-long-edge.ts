@@ -457,6 +457,9 @@ export async function runFadeLongCycle(opts: {
   fetchCandles: (symbol: string) => Promise<Candle[]>;
   now: number;
   maxSymbols?: number;
+  /** When false (regime not bullish), do NOT open new dip-buys — only resolve open ones. The
+   *  oversold dip-buy bleeds in choppy/bearish regimes (dips keep dipping); restrict it to bullish. */
+  allowNewEntries?: boolean;
 }): Promise<FadeLongCycleResult> {
   const { store, universe, fetchCandles, now } = opts;
   const symbols = opts.maxSymbols ? universe.slice(0, opts.maxSymbols) : universe;
@@ -481,32 +484,35 @@ export async function runFadeLongCycle(opts: {
     candlesBySymbol.set(symbol, closed);
   }
 
-  const detectedEntries: FadeLongObservation[] = [];
-  for (const [symbol, closed] of candlesBySymbol) {
-    // Scan the whole lookback window (not just the latest bar) so a single successful run captures
-    // every recent fresh oversold cross — deduped by bar via the store. This is the fix for the
-    // cycle silently recording 0 across 80 real crosses.
-    detectedEntries.push(...detectFadeLongEntries(symbol, closed));
-  }
+  // Open new dip-buys ONLY in a bullish regime (caller-gated). Resolution of OPEN obs always runs.
+  if (opts.allowNewEntries !== false) {
+    const detectedEntries: FadeLongObservation[] = [];
+    for (const [symbol, closed] of candlesBySymbol) {
+      // Scan the whole lookback window (not just the latest bar) so a single successful run captures
+      // every recent fresh oversold cross — deduped by bar via the store. This is the fix for the
+      // cycle silently recording 0 across 80 real crosses.
+      detectedEntries.push(...detectFadeLongEntries(symbol, closed));
+    }
 
-  const signalClusterByBar = new Map<number, number>();
-  for (const entry of detectedEntries) {
-    signalClusterByBar.set(entry.openedAtMs, (signalClusterByBar.get(entry.openedAtMs) ?? 0) + 1);
-  }
+    const signalClusterByBar = new Map<number, number>();
+    for (const entry of detectedEntries) {
+      signalClusterByBar.set(entry.openedAtMs, (signalClusterByBar.get(entry.openedAtMs) ?? 0) + 1);
+    }
 
-  for (const entry of detectedEntries) {
-    const antiCrash = buildFadeLongAntiCrashSnapshot({
-      candlesBySymbol,
-      atMs: entry.openedAtMs,
-      freshSignalCluster: signalClusterByBar.get(entry.openedAtMs) ?? 1,
-    });
-    const taggedEntry: FadeLongObservation = { ...entry, antiCrash };
-    const added = store.add(taggedEntry);
-    if (added) {
-      newEntries++;
-    } else {
-      const existing = store.all.find((obs) => obs.observationId === entry.observationId);
-      if (existing && !existing.antiCrash) store.update(existing.observationId, { antiCrash });
+    for (const entry of detectedEntries) {
+      const antiCrash = buildFadeLongAntiCrashSnapshot({
+        candlesBySymbol,
+        atMs: entry.openedAtMs,
+        freshSignalCluster: signalClusterByBar.get(entry.openedAtMs) ?? 1,
+      });
+      const taggedEntry: FadeLongObservation = { ...entry, antiCrash };
+      const added = store.add(taggedEntry);
+      if (added) {
+        newEntries++;
+      } else {
+        const existing = store.all.find((obs) => obs.observationId === entry.observationId);
+        if (existing && !existing.antiCrash) store.update(existing.observationId, { antiCrash });
+      }
     }
   }
 
@@ -538,6 +544,7 @@ export async function runFadeLongCycleGuarded(opts: {
   fetchCandles: (symbol: string) => Promise<Candle[]>;
   now: number;
   maxSymbols?: number;
+  allowNewEntries?: boolean;
 }): Promise<FadeLongCycleResult | null> {
   if (cycleInFlight) return null;
   cycleInFlight = true;

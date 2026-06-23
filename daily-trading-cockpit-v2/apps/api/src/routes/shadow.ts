@@ -1335,6 +1335,10 @@ export async function registerShadowRoutes(
         // FIRE-AND-FORGET: the lane is surfaced by the SEPARATE neural-map endpoint, not this
         // brief, so we must NOT block the (already heavy) brief on ~20 sequential candle fetches.
         // Overlap-guarded so the 7-min ticker can't stack two cycles on the singleton store.
+        // Long edges (fade-long dip-buy + H6 trend) only OPEN new positions in a bullish regime —
+        // both bleed in choppy/bearish (dips keep dipping; uptrends don't persist). Resolution of
+        // existing obs still runs regardless. `currentRegime` is the scan's market-regime label.
+        const regimeAllowsLong = typeof currentRegime === "string" && /bull/i.test(currentRegime);
         if (process.env.FADE_LONG_EDGE_DISABLED !== "1") {
           const _flc = opts.binanceClient;
           const fadeInterval = process.env.FADE_LONG_INTERVAL || "15m";
@@ -1342,6 +1346,7 @@ export async function registerShadowRoutes(
             store: getFadeLongStore(),
             universe: [...CURRENT_SCANNER_UNIVERSE],
             now: Date.now(),
+            allowNewEntries: regimeAllowsLong,
             fetchCandles: async (symbol: string) => _flc.getCandles(symbol, fadeInterval, 120),
           }).catch(() => undefined);
         }
@@ -1355,6 +1360,7 @@ export async function registerShadowRoutes(
             store: getH6TrendStore(),
             universe: [...CURRENT_SCANNER_UNIVERSE],
             now: Date.now(),
+            allowNewEntries: regimeAllowsLong,
             fetchCandles: async (symbol: string) => _h6c.getCandles(symbol, H6_TREND_INTERVAL, 200),
           }).catch(() => undefined);
         }

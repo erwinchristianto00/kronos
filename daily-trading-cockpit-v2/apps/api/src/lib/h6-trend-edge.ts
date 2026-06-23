@@ -30,6 +30,14 @@ export const H6_TREND_EMA_FAST_PERIOD = envNum("H6_TREND_EMA_FAST_PERIOD", 30); 
 export const H6_TREND_EMA_SLOW_PERIOD = envNum("H6_TREND_EMA_SLOW_PERIOD", 90); // trend-agreement filter
 export const H6_TREND_ATR_PERIOD = envNum("H6_TREND_ATR_PERIOD", 14);
 export const H6_TREND_ATR_TRAIL_MULT = Number(process.env.H6_TREND_ATR_TRAIL_MULT) || 2.5; // chandelier offset
+// Research A/B: a tighter trail to bank more of the favorable move. The early read showed trades
+// reach avg MFE ~+0.9R but net negative — the 2.5-ATR trail gives the move back. This variant runs
+// the SAME entries through a tighter 1.5-ATR trail so, once n matures, we have the exit A/B ready.
+export const H6_TREND_TIGHT_TRAIL_MULT = Number(process.env.H6_TREND_TIGHT_TRAIL_MULT) || 1.5;
+export const H6_TREND_TRAIL_VARIANTS: ReadonlyArray<{ id: "std" | "tight"; mult: number }> = [
+  { id: "std", mult: H6_TREND_ATR_TRAIL_MULT },
+  { id: "tight", mult: H6_TREND_TIGHT_TRAIL_MULT },
+];
 // ROC threshold (percent). Default 0 = "momentum positive". Env-tunable to demand stronger momentum.
 export const H6_TREND_ROC_THRESHOLD = Number(process.env.H6_TREND_ROC_THRESHOLD ?? 0);
 // Max bars to hold before mark-to-market (56 bars ≈ 14 days on 6h) — bounds a trend that never trails out.
@@ -89,6 +97,12 @@ export interface H6TrendObservation {
   observationId: string;
   symbol: string;
   direction: "LONG";
+  /** Exit-geometry A/B on the SAME entry: "std" (2.5-ATR trail) vs "tight" (1.5-ATR). Older obs
+   *  without this field are treated as "std". */
+  variant?: "std" | "tight";
+  /** ATR-trail multiple for this obs (= stopDistanceBps geometry). Resolution derives the trail
+   *  offset from entry−initialStop, so this is informational; defaults to std for older obs. */
+  trailMult?: number;
   rocAtEntry: number;
   atrAtEntry: number;
   entryPrice: number;
@@ -125,14 +139,26 @@ function isFreshTrendEntry(
   return ok(i) && !ok(i - 1);
 }
 
-function buildH6TrendObs(symbol: string, candles: Candle[], i: number, roc: number, atr: number): H6TrendObservation {
+function buildH6TrendObs(
+  symbol: string,
+  candles: Candle[],
+  i: number,
+  roc: number,
+  atr: number,
+  variant: "std" | "tight",
+  trailMult: number,
+): H6TrendObservation {
   const entry = candles[i]!.close;
   const openedAtMs = candles[i]!.openTime;
-  const initialStop = entry - H6_TREND_ATR_TRAIL_MULT * atr;
+  const initialStop = entry - trailMult * atr;
+  // "std" keeps the original id (dedupes against pre-A/B obs → no double-count); "tight" is namespaced.
+  const observationId = variant === "std" ? `h6trend:${symbol}:${openedAtMs}` : `h6trend:${variant}:${symbol}:${openedAtMs}`;
   return {
-    observationId: `h6trend:${symbol}:${openedAtMs}`,
+    observationId,
     symbol,
     direction: "LONG",
+    variant,
+    trailMult,
     rocAtEntry: roc,
     atrAtEntry: atr,
     entryPrice: entry,
@@ -164,7 +190,10 @@ export function detectH6TrendEntries(symbol: string, candles: Candle[]): H6Trend
     const a = atr[i];
     if (a === null || !(a > 0)) continue;
     if (isFreshTrendEntry(closes, emaFast, emaSlow, roc, i)) {
-      out.push(buildH6TrendObs(symbol, candles, i, roc[i] as number, a));
+      // Emit one obs per exit-trail A/B variant on this same entry (std + tight).
+      for (const v of H6_TREND_TRAIL_VARIANTS) {
+        out.push(buildH6TrendObs(symbol, candles, i, roc[i] as number, a, v.id, v.mult));
+      }
     }
   }
   return out;
@@ -202,8 +231,9 @@ export function resolveH6Trend(
   const bars = Math.min(fwd.length, H6_TREND_MAX_HOLD_BARS);
   for (let k = 0; k < bars; k++) {
     const c = fwd[k];
-    // trail from highs strictly BEFORE this bar (no lookahead)
-    const trailStop = highestHigh - H6_TREND_ATR_TRAIL_MULT * obs.atrAtEntry;
+    // trail from highs strictly BEFORE this bar (no lookahead). Offset = the obs's own stop distance
+    // (entry−initialStop = trailMult×ATR), so std (2.5) and tight (1.5) each trail by their own width.
+    const trailStop = highestHigh - risk;
     if (c.low <= trailStop) {
       const grossR = (trailStop - obs.entryPrice) / risk;
       const reason = trailStop <= obs.initialStop ? "INITIAL_STOP" : "TRAIL_STOP";
@@ -224,6 +254,13 @@ export function resolveH6Trend(
 }
 
 // ── report ─────────────────────────────────────────────────────────────────
+export interface H6TrendVariantStats {
+  freshValid: number;
+  netAvgR: number | null;
+  pf: number | null;
+  wr: number | null;
+  avgMaxFavorableR: number | null;
+}
 export interface H6TrendReport {
   freshValid: number;
   open: number;
@@ -236,32 +273,50 @@ export interface H6TrendReport {
   watchableThreshold: number;
   status: "COLLECTING" | "WATCHABLE";
   totalNetR: number;
+  /** Research A/B sibling: the tight-trail (1.5-ATR) variant on the SAME entries. The top-level
+   *  fields above are the "std" (2.5-ATR) lane (so the dashboard tile shows the primary). */
+  tight: H6TrendVariantStats;
 }
 
-export function buildH6TrendReport(observations: readonly H6TrendObservation[]): H6TrendReport {
+const _mean = (xs: number[]) => (xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : null);
+function h6VariantStats(observations: readonly H6TrendObservation[]): H6TrendVariantStats {
   const resolved = observations.filter(
     (o) => (o.status === "CLOSED_WIN" || o.status === "CLOSED_LOSS") && typeof o.netR === "number",
   );
   const nets = resolved.map((o) => o.netR as number);
-  const grosses = resolved.map((o) => (typeof o.grossR === "number" ? o.grossR : 0));
   const mfes = resolved.map((o) => o.maxFavorableR).filter((r): r is number => typeof r === "number");
-  const wins = nets.filter((r) => r > 0).length;
   const pfNum = nets.filter((r) => r > 0).reduce((a, b) => a + b, 0);
   const pfDen = -nets.filter((r) => r < 0).reduce((a, b) => a + b, 0);
-  const mean = (xs: number[]) => (xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : null);
-  const freshValid = resolved.length;
   return {
-    freshValid,
-    open: observations.filter((o) => o.status === "OPEN").length,
-    expired: observations.filter((o) => o.status === "EXPIRED").length,
-    netAvgR: mean(nets),
-    grossAvgR: mean(grosses),
+    freshValid: resolved.length,
+    netAvgR: _mean(nets),
     pf: pfDen > 0 ? pfNum / pfDen : pfNum > 0 ? Infinity : null,
-    wr: freshValid > 0 ? wins / freshValid : null,
-    avgMaxFavorableR: mean(mfes),
+    wr: resolved.length > 0 ? nets.filter((r) => r > 0).length / resolved.length : null,
+    avgMaxFavorableR: _mean(mfes),
+  };
+}
+
+export function buildH6TrendReport(observations: readonly H6TrendObservation[]): H6TrendReport {
+  // Top-level = the "std" lane (obs with no variant predate the A/B → counted as std).
+  const std = observations.filter((o) => (o.variant ?? "std") === "std");
+  const tight = observations.filter((o) => o.variant === "tight");
+  const s = h6VariantStats(std);
+  const resolvedStd = std.filter(
+    (o) => (o.status === "CLOSED_WIN" || o.status === "CLOSED_LOSS") && typeof o.netR === "number",
+  );
+  return {
+    freshValid: s.freshValid,
+    open: std.filter((o) => o.status === "OPEN").length,
+    expired: std.filter((o) => o.status === "EXPIRED").length,
+    netAvgR: s.netAvgR,
+    grossAvgR: _mean(resolvedStd.map((o) => (typeof o.grossR === "number" ? o.grossR : 0))),
+    pf: s.pf,
+    wr: s.wr,
+    avgMaxFavorableR: s.avgMaxFavorableR,
     watchableThreshold: WATCHABLE_MIN_FRESH,
-    status: freshValid >= WATCHABLE_MIN_FRESH ? "WATCHABLE" : "COLLECTING",
-    totalNetR: nets.reduce((a, b) => a + b, 0),
+    status: s.freshValid >= WATCHABLE_MIN_FRESH ? "WATCHABLE" : "COLLECTING",
+    totalNetR: resolvedStd.map((o) => o.netR as number).reduce((a, b) => a + b, 0),
+    tight: h6VariantStats(tight),
   };
 }
 
@@ -327,6 +382,9 @@ export async function runH6TrendCycle(opts: {
   fetchCandles: (symbol: string) => Promise<Candle[]>;
   now: number;
   maxSymbols?: number;
+  /** When false (e.g. regime is not bullish), do NOT open new entries — only resolve open ones.
+   *  Trend/dip longs only have an edge in a bullish regime; this gates new positions to that. */
+  allowNewEntries?: boolean;
 }): Promise<H6TrendCycleResult> {
   const { store, universe, fetchCandles, now } = opts;
   const symbols = opts.maxSymbols ? universe.slice(0, opts.maxSymbols) : universe;
@@ -351,9 +409,12 @@ export async function runH6TrendCycle(opts: {
     candlesBySymbol.set(symbol, closed);
   }
 
-  for (const [symbol, closed] of candlesBySymbol) {
-    for (const entry of detectH6TrendEntries(symbol, closed)) {
-      if (store.add(entry)) newEntries++;
+  // Open new entries ONLY in a bullish regime (caller-gated). Resolution of OPEN obs always runs.
+  if (opts.allowNewEntries !== false) {
+    for (const [symbol, closed] of candlesBySymbol) {
+      for (const entry of detectH6TrendEntries(symbol, closed)) {
+        if (store.add(entry)) newEntries++;
+      }
     }
   }
 
@@ -383,6 +444,7 @@ export async function runH6TrendCycleGuarded(opts: {
   fetchCandles: (symbol: string) => Promise<Candle[]>;
   now: number;
   maxSymbols?: number;
+  allowNewEntries?: boolean;
 }): Promise<H6TrendCycleResult | null> {
   if (cycleInFlight) return null;
   cycleInFlight = true;

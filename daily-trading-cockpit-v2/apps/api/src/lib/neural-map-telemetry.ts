@@ -264,6 +264,8 @@ export interface NeuralMapTelemetry {
     wr: number | null;
     avgMaxFavorableR: number | null;
     totalNetR: number;
+    /** Research A/B sibling: tight-trail (1.5-ATR) variant on the same entries. */
+    tight: { freshValid: number; netAvgR: number | null; pf: number | null; wr: number | null; avgMaxFavorableR: number | null };
   } | null;
   alerts: NeuralMapAlert[];
 }
@@ -1482,6 +1484,7 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
           wr: input.h6Trend.wr,
           avgMaxFavorableR: input.h6Trend.avgMaxFavorableR,
           totalNetR: input.h6Trend.totalNetR,
+          tight: input.h6Trend.tight,
         }
       : null,
     alerts,

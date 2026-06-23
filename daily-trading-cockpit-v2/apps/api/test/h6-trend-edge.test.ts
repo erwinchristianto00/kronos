@@ -7,9 +7,13 @@ import {
   detectH6TrendEntries,
   resolveH6Trend,
   buildH6TrendReport,
+  runH6TrendCycle,
+  H6TrendStore,
   type H6TrendObservation,
   H6_TREND_ATR_TRAIL_MULT,
 } from "../src/lib/h6-trend-edge.js";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const BAR = 6 * 60 * 60 * 1000;
 function mk(i: number, close: number, high?: number, low?: number): Candle {
@@ -46,13 +50,14 @@ describe("h6-trend-edge detection", () => {
       return mk(90 + k, c, c + 1, c - 1);
     });
     const entries = detectH6TrendEntries("BTCUSDT", [...flat, ...ramp]);
-    expect(entries.length).toBeGreaterThanOrEqual(1);
     expect(entries.every((e) => e.direction === "LONG")).toBe(true);
-    // "fresh" semantics: a sustained ramp yields ONE entry, not one per bar.
-    expect(entries.length).toBe(1);
-    const e = entries[0];
-    expect(e.initialStop).toBeLessThan(e.entryPrice); // long stop below entry
-    expect(e.stopDistanceBps).toBeGreaterThan(0);
+    // one fresh entry bar → one obs per exit A/B variant (std + tight), not one per bar.
+    expect(entries.length).toBe(2);
+    expect(entries.map((e) => e.variant).sort()).toEqual(["std", "tight"]);
+    const std = entries.find((e) => e.variant === "std")!;
+    const tight = entries.find((e) => e.variant === "tight")!;
+    expect(std.initialStop).toBeLessThan(std.entryPrice); // long stop below entry
+    expect(tight.stopDistanceBps).toBeLessThan(std.stopDistanceBps); // tight trail = closer stop
 
     // A purely flat series has no uptrend → no entries.
     const allFlat = Array.from({ length: 130 }, (_, i) => mk(i, 100, 100.5, 99.5));
@@ -121,5 +126,22 @@ describe("h6-trend-edge resolution", () => {
     expect(rep.open).toBe(1);
     expect(rep.wr).toBeCloseTo(0.5, 6);
     expect(rep.netAvgR).toBeCloseTo((2.9 - 1.1) / 2, 6);
+    expect(rep.tight).toBeDefined(); // A/B sibling present
+  });
+
+  it("[REGIME-GATE] cycle opens NO new entries when allowNewEntries=false", async () => {
+    const flat = Array.from({ length: 90 }, (_, i) => mk(i, 100, 100.5, 99.5));
+    const ramp = Array.from({ length: 40 }, (_, k) => { const c = 101 + k; return mk(90 + k, c, c + 1, c - 1); });
+    const candles = [...flat, ...ramp, mk(130, 142, 143, 141)]; // last (in-progress) bar dropped by the cycle
+    const fetchCandles = async () => candles;
+    // Not bullish → no new entries.
+    const blocked = new H6TrendStore(join(tmpdir(), `h6gate-blocked-${Date.now()}`));
+    const r1 = await runH6TrendCycle({ store: blocked, universe: ["BTCUSDT"], fetchCandles, now: 200 * BAR, allowNewEntries: false });
+    expect(r1.newEntries).toBe(0);
+    expect(blocked.all.length).toBe(0);
+    // Bullish (allowed) → entries open (std + tight).
+    const open = new H6TrendStore(join(tmpdir(), `h6gate-open-${Date.now()}`));
+    const r2 = await runH6TrendCycle({ store: open, universe: ["BTCUSDT"], fetchCandles, now: 200 * BAR, allowNewEntries: true });
+    expect(r2.newEntries).toBeGreaterThan(0);
   });
 });
