@@ -1337,8 +1337,11 @@ export async function registerShadowRoutes(
         // Overlap-guarded so the 7-min ticker can't stack two cycles on the singleton store.
         // Long edges (fade-long dip-buy + H6 trend) only OPEN new positions in a bullish regime —
         // both bleed in choppy/bearish (dips keep dipping; uptrends don't persist). Resolution of
-        // existing obs still runs regardless. `currentRegime` is the scan's market-regime label.
-        const regimeAllowsLong = typeof currentRegime === "string" && /bull/i.test(currentRegime);
+        // existing obs still runs regardless. Use the SAME regime source as the neural-map controller
+        // (the cached scan's marketRegime — `currentRegime`/scanStatus is frequently null) so the gate
+        // tracks the real regime, not a null field that would freeze longs forever.
+        const longRegime = getLatestScanCandidates()?.marketRegime ?? currentRegime;
+        const regimeAllowsLong = typeof longRegime === "string" && /bull/i.test(longRegime);
         if (process.env.FADE_LONG_EDGE_DISABLED !== "1") {
           const _flc = opts.binanceClient;
           const fadeInterval = process.env.FADE_LONG_INTERVAL || "15m";
