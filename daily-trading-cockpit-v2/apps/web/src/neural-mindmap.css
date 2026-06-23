@@ -1230,6 +1230,16 @@ i.health-diagnostic {
   background: #0e201f;
 }
 
+/* Quarantined lane row — violet wash (matches the SVG node quarantine accent #a78bfa). The
+   per-cell Net Avg R red/green tone still shows on top. Wins over hover/is-active via order. */
+.neural-lane-table-wrap tbody tr.is-quarantined,
+.neural-lane-table-wrap tbody tr.is-quarantined:hover {
+  background: rgba(167, 139, 250, 0.16);
+}
+.neural-lane-table-wrap tbody tr.is-quarantined td {
+  border-bottom-color: rgba(167, 139, 250, 0.28);
+}
+
 .neural-lane-table-wrap td:first-child i {
   margin-right: 7px;
 }

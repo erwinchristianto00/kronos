@@ -1616,7 +1616,7 @@ export default function NeuralMindmap() {
                     ? (livePnl / liveAccount.accountEquity) * 100
                     : null;
                   return (
-                    <tr key={lane.id} className={lane.active ? 'is-active' : ''} onClick={() => setSelectedId(lane.id)}>
+                    <tr key={lane.id} className={`${lane.active ? 'is-active' : ''}${lane.health === 'QUARANTINE' ? ' is-quarantined' : ''}`} onClick={() => setSelectedId(lane.id)}>
                       <td><i className={`health-${healthOf(lane.id).toLowerCase()}`} />{compactLaneLabel(lane.label)}</td>
                       <td>{lane.status}</td>
                       <td>{fmtGapPct(lane.openAvgDistanceToTpPct)}</td>
@@ -1625,8 +1625,10 @@ export default function NeuralMindmap() {
                       <td className={livePnl >= 0 ? 'tone-healthy' : 'tone-critical'}>{`${livePnl >= 0 ? '+' : ''}${livePnl.toFixed(2)} USDT`}</td>
                       <td className={livePnl >= 0 ? 'tone-healthy' : 'tone-critical'}>{fmtPct(liveGrowth)}</td>
                       <td>{liveLane?.sourceOrderCount ?? 0}</td>
-                      <td>{lane.closed}</td>
-                      <td>{fmtR(lane.netAvgR)}</td>
+                      {/* N mirrors the Promotion Ladder's FRESH VALID source exactly (oosFreshValid ?? closed) */}
+                      <td>{lane.oosFreshValid ?? lane.closed}</td>
+                      {/* Net Avg R coloured by profit/loss; null (n/a) stays neutral */}
+                      <td className={lane.netAvgR == null ? '' : lane.netAvgR >= 0 ? 'tone-healthy' : 'tone-critical'}>{fmtR(lane.netAvgR)}</td>
                       <td>{fmtNumber(lane.pf)}</td>
                       <td>{lane.wr === null ? 'n/a' : `${(lane.wr * 100).toFixed(1)}%`}</td>
                     </tr>
