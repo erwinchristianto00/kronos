@@ -398,6 +398,36 @@ describe("paper-opportunity-allocator", () => {
     expect(report.byLane.length).toBe(10);
   });
 
+  it("[DCAP] caps the open diagnostic book per-symbol (suppress concentration)", async () => {
+    const dir = tmpDir();
+    const vmReport = await buildWinningVmReport(dir);
+    const atCap = (n: number) => {
+      const s = new PaperExecutionRouterStore(tmpDir());
+      return Array.from({ length: n }, () =>
+        seedClosed(s, {
+          symbol: "BTCUSDT",
+          direction: "SHORT",
+          paperOrderMode: "DIAGNOSTIC_ONLY",
+          paperStatus: "CREATED",
+          selectedLaneId: "CG_VARIANT_MATRIX:CG_BASELINE_CURRENT",
+        }),
+      );
+    };
+    const run = (n: number) =>
+      buildPaperOpportunityAllocatorReport(
+        baseInputs({
+          vmReport,
+          paperVariantMatrixDiagnosticEnabled: true,
+          candidates: [makeCandidate({ symbol: "BTCUSDT", direction: "SHORT" })],
+          currentPaperOrders: atCap(n),
+        }),
+      );
+    // At the 50-open-per-symbol cap, new BTCUSDT diagnostic admissions are rejected…
+    expect(run(50).topRejects.map((r) => r.key)).toContain("DIAGNOSTIC_SYMBOL_OPEN_CAP_REACHED");
+    // …well under the cap it does not fire.
+    expect(run(5).topRejects.map((r) => r.key)).not.toContain("DIAGNOSTIC_SYMBOL_OPEN_CAP_REACHED");
+  });
+
   // [2]
   it("[2] creates a paper opportunity without any pre-existing observation", async () => {
     const dir = tmpDir();

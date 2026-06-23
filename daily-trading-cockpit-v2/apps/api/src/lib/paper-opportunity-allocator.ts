@@ -418,6 +418,12 @@ const VARIANT_MATRIX_DIAGNOSTIC_IDS: readonly VariantMatrixVariantId[] = [
 ];
 /** Per-variant cap on DIAGNOSTIC_ONLY variant-matrix orders sampled per scan (keeps the book bounded). */
 const DEFAULT_VARIANT_DIAGNOSTIC_MAX_PER_SCAN = 3;
+/** Standing caps on the OPEN diagnostic book: per (variant×direction) lane and per symbol. ~13 active
+ *  diagnostic laneIds × 60 ≈ 800 total — matched to the resolver's ~3h sweep throughput (OOS velocity
+ *  is resolution-bound, so more open past this is bloat). Per-symbol 50 stops one coin dominating
+ *  (one hit ~290). Env-tunable. */
+const PAPER_DIAGNOSTIC_MAX_OPEN_PER_LANE = Number(process.env.PAPER_DIAGNOSTIC_MAX_OPEN_PER_LANE) || 60;
+const PAPER_DIAGNOSTIC_MAX_OPEN_PER_SYMBOL = Number(process.env.PAPER_DIAGNOSTIC_MAX_OPEN_PER_SYMBOL) || 50;
 
 /**
  * Auto-quarantine thresholds for variant diagnostic lanes. A lane is auto-quarantined (admission
@@ -1048,6 +1054,20 @@ export function buildPaperOpportunityAllocatorReport(
   const diagnosticOpenCount = currentPaperOrders.filter(
     (order) => isOpenPaperOrder(order) && order.paperOrderMode === "DIAGNOSTIC_ONLY",
   ).length;
+  // Open DIAGNOSTIC book caps (2026-06-23): the diagnostic sleeve has no total cap (the HEADLINE
+  // caps are headline-only, never bind under liveBlocked), so it balloons (+~105/h → ~15k steady
+  // state) and over-concentrates (one symbol hit ~290 open). OOS velocity is bounded by RESOLUTION
+  // throughput, not open count, so a bigger book past the resolver's sweep capacity is pure bloat.
+  // Per-lane + per-symbol caps bound it at ~800 and rebalance concentration WITHOUT a global admit
+  // freeze (over-full lanes/symbols stop, under-provisioned ones keep filling). Counts mutate as we
+  // admit this scan. Pure measurement — no real money (live is separately capped at MAX_CONCURRENT).
+  const diagnosticOpenByLane = new Map<string, number>();
+  const diagnosticOpenBySymbol = new Map<string, number>();
+  for (const order of currentPaperOrders) {
+    if (!isOpenPaperOrder(order) || order.paperOrderMode !== "DIAGNOSTIC_ONLY") continue;
+    diagnosticOpenByLane.set(order.selectedLaneId, (diagnosticOpenByLane.get(order.selectedLaneId) ?? 0) + 1);
+    diagnosticOpenBySymbol.set(order.symbol, (diagnosticOpenBySymbol.get(order.symbol) ?? 0) + 1);
+  }
   const staleCgWideOpenCount = openCgWideOrders.filter(
     (order) => (paperOrderOpenHours(order, nowMs) ?? 0) >= CG_WIDE_STALE_HOURS,
   ).length;
@@ -1500,6 +1520,17 @@ export function buildPaperOpportunityAllocatorReport(
         recordReject(symbol, direction, def.id, "VARIANT_DIAGNOSTIC_CAP_REACHED", rowFresh, rowNet);
         continue;
       }
+      // Standing open-book caps: bound the diagnostic sleeve at ~800 + cap per-symbol concentration.
+      if (variantDiagnosticCollection) {
+        if ((diagnosticOpenBySymbol.get(symbol) ?? 0) >= PAPER_DIAGNOSTIC_MAX_OPEN_PER_SYMBOL) {
+          recordReject(symbol, direction, def.id, "DIAGNOSTIC_SYMBOL_OPEN_CAP_REACHED", rowFresh, rowNet);
+          continue;
+        }
+        if ((diagnosticOpenByLane.get(laneId) ?? 0) >= PAPER_DIAGNOSTIC_MAX_OPEN_PER_LANE) {
+          recordReject(symbol, direction, def.id, "DIAGNOSTIC_LANE_OPEN_CAP_REACHED", rowFresh, rowNet);
+          continue;
+        }
+      }
       // Auto-quarantine: a variant lane that is confidently net-negative in realized paper stops
       // admitting new orders (and renders violet). "Let it run, then bench confirmed losers."
       if (variantDiagnosticCollection && autoQuarantinedVariantLanes.has(laneId)) {
@@ -1885,6 +1916,9 @@ export function buildPaperOpportunityAllocatorReport(
       }
       if (variantDiagnosticCollection) {
         variantDiagnosticSelected.set(def.id, (variantDiagnosticSelected.get(def.id) ?? 0) + 1);
+        // keep the standing open-book caps accurate within this scan
+        diagnosticOpenByLane.set(laneId, (diagnosticOpenByLane.get(laneId) ?? 0) + 1);
+        diagnosticOpenBySymbol.set(symbol, (diagnosticOpenBySymbol.get(symbol) ?? 0) + 1);
       }
       laneRollup(def.id).eligible += 1;
       symbolRollup(symbol).eligible += 1;
