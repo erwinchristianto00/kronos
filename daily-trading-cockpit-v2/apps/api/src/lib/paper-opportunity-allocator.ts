@@ -424,6 +424,12 @@ const DEFAULT_VARIANT_DIAGNOSTIC_MAX_PER_SCAN = 3;
  *  (one hit ~290). Env-tunable. */
 const PAPER_DIAGNOSTIC_MAX_OPEN_PER_LANE = Number(process.env.PAPER_DIAGNOSTIC_MAX_OPEN_PER_LANE) || 60;
 const PAPER_DIAGNOSTIC_MAX_OPEN_PER_SYMBOL = Number(process.env.PAPER_DIAGNOSTIC_MAX_OPEN_PER_SYMBOL) || 50;
+/** Hard GLOBAL ceiling on the open diagnostic book. The per-lane/per-symbol caps alone summed to
+ *  ~1455 (selectedLaneId includes direction → ~24 lane×dir combos × 60), well past the ~800 target,
+ *  because they don't bound the TOTAL. Below this the per-lane/per-symbol caps still rebalance
+ *  concentration; AT this ceiling diagnostic admission hard-stops until the resolver drains it back
+ *  under. OOS velocity is resolution-bound, so 800 is plenty. Env-tunable. */
+const PAPER_DIAGNOSTIC_MAX_OPEN_TOTAL = Number(process.env.PAPER_DIAGNOSTIC_MAX_OPEN_TOTAL) || 800;
 
 /**
  * Auto-quarantine thresholds for variant diagnostic lanes. A lane is auto-quarantined (admission
@@ -1058,9 +1064,11 @@ export function buildPaperOpportunityAllocatorReport(
   // caps are headline-only, never bind under liveBlocked), so it balloons (+~105/h → ~15k steady
   // state) and over-concentrates (one symbol hit ~290 open). OOS velocity is bounded by RESOLUTION
   // throughput, not open count, so a bigger book past the resolver's sweep capacity is pure bloat.
-  // Per-lane + per-symbol caps bound it at ~800 and rebalance concentration WITHOUT a global admit
-  // freeze (over-full lanes/symbols stop, under-provisioned ones keep filling). Counts mutate as we
-  // admit this scan. Pure measurement — no real money (live is separately capped at MAX_CONCURRENT).
+  // A global total ceiling (PAPER_DIAGNOSTIC_MAX_OPEN_TOTAL=800) bounds the book; per-lane + per-symbol
+  // caps rebalance concentration BELOW it (over-full lanes/symbols stop, under-provisioned keep filling).
+  // Counts mutate as we admit this scan. Pure measurement — no real money (live is separately capped at
+  // MAX_CONCURRENT). diagnosticOpenRunning tracks the total across this scan's admissions.
+  let diagnosticOpenRunning = diagnosticOpenCount;
   const diagnosticOpenByLane = new Map<string, number>();
   const diagnosticOpenBySymbol = new Map<string, number>();
   for (const order of currentPaperOrders) {
@@ -1520,8 +1528,12 @@ export function buildPaperOpportunityAllocatorReport(
         recordReject(symbol, direction, def.id, "VARIANT_DIAGNOSTIC_CAP_REACHED", rowFresh, rowNet);
         continue;
       }
-      // Standing open-book caps: bound the diagnostic sleeve at ~800 + cap per-symbol concentration.
+      // Standing open-book caps: global total ceiling (~800) + per-symbol/per-lane concentration.
       if (variantDiagnosticCollection) {
+        if (diagnosticOpenRunning >= PAPER_DIAGNOSTIC_MAX_OPEN_TOTAL) {
+          recordReject(symbol, direction, def.id, "DIAGNOSTIC_TOTAL_OPEN_CAP_REACHED", rowFresh, rowNet);
+          continue;
+        }
         if ((diagnosticOpenBySymbol.get(symbol) ?? 0) >= PAPER_DIAGNOSTIC_MAX_OPEN_PER_SYMBOL) {
           recordReject(symbol, direction, def.id, "DIAGNOSTIC_SYMBOL_OPEN_CAP_REACHED", rowFresh, rowNet);
           continue;
@@ -1917,6 +1929,7 @@ export function buildPaperOpportunityAllocatorReport(
       if (variantDiagnosticCollection) {
         variantDiagnosticSelected.set(def.id, (variantDiagnosticSelected.get(def.id) ?? 0) + 1);
         // keep the standing open-book caps accurate within this scan
+        diagnosticOpenRunning += 1;
         diagnosticOpenByLane.set(laneId, (diagnosticOpenByLane.get(laneId) ?? 0) + 1);
         diagnosticOpenBySymbol.set(symbol, (diagnosticOpenBySymbol.get(symbol) ?? 0) + 1);
       }

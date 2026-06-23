@@ -429,6 +429,38 @@ describe("paper-opportunity-allocator", () => {
     expect(run(5).topRejects.map((r) => r.key)).not.toContain("DIAGNOSTIC_SYMBOL_OPEN_CAP_REACHED");
   });
 
+  it("[DTOT] global total ceiling (800) hard-stops diagnostic admission regardless of lane/symbol spread", async () => {
+    const dir = tmpDir();
+    const vmReport = await buildWinningVmReport(dir);
+    // Spread orders across 100 symbols (≤8 each, under the 50 per-symbol cap) and 20 lanes (≤40 each,
+    // under the 60 per-lane cap) so NEITHER sub-cap binds — only the global total can fire.
+    const book = (n: number) => {
+      const s = new PaperExecutionRouterStore(tmpDir());
+      return Array.from({ length: n }, (_, i) =>
+        seedClosed(s, {
+          symbol: `SYM${i % 100}USDT`,
+          direction: "SHORT",
+          paperOrderMode: "DIAGNOSTIC_ONLY",
+          paperStatus: "CREATED",
+          selectedLaneId: `CG_VARIANT_MATRIX:DUMMY${i % 20}`,
+        }),
+      );
+    };
+    const run = (n: number) =>
+      buildPaperOpportunityAllocatorReport(
+        baseInputs({
+          vmReport,
+          paperVariantMatrixDiagnosticEnabled: true,
+          candidates: [makeCandidate({ symbol: "BTCUSDT", direction: "SHORT" })],
+          currentPaperOrders: book(n),
+        }),
+      );
+    // At 800 total open, a fresh candidate (its own symbol/lane empty) is still rejected by the total cap.
+    expect(run(800).topRejects.map((r) => r.key)).toContain("DIAGNOSTIC_TOTAL_OPEN_CAP_REACHED");
+    // Well under the ceiling, the total cap does not fire.
+    expect(run(100).topRejects.map((r) => r.key)).not.toContain("DIAGNOSTIC_TOTAL_OPEN_CAP_REACHED");
+  }, 20000); // builds ~900 full orders + two allocator passes — generous timeout under parallel-suite load
+
   // [2]
   it("[2] creates a paper opportunity without any pre-existing observation", async () => {
     const dir = tmpDir();
