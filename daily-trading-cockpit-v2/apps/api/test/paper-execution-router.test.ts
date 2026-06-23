@@ -1882,6 +1882,31 @@ describe("headline concentration caps (anti-correlation safety)", () => {
     expect(openHeadline).toHaveLength(0);
     expect(headlineConcentrationRejectReason(openHeadline, "BTCUSDT", "LONG")).toBeNull();
   });
+
+  // [PRUNE] bound the paper store: keep newest N DIAGNOSTIC closed; never touch HEADLINE/OPEN.
+  it("[PRUNE] pruneClosedDiagnostic keeps newest N diagnostic closed, preserves headline + open", () => {
+    const store = new PaperExecutionRouterStore(tmpDir());
+    for (let i = 0; i < 5; i++) {
+      store.add(makePaperOrder({
+        paperOrderId: `diag-${i}`,
+        dedupeKey: `diag-${i}`,
+        paperOrderMode: "DIAGNOSTIC_ONLY",
+        paperStatus: "PAPER_CLOSED_WIN",
+        updatedAt: `2026-06-1${i}T00:00:00.000Z`, // diag-4 newest
+      }));
+    }
+    store.add(makePaperOrder({ paperOrderId: "open-1", dedupeKey: "open-1", paperOrderMode: "DIAGNOSTIC_ONLY", paperStatus: "CREATED" }));
+    store.add(makePaperOrder({ paperOrderId: "hl-1", dedupeKey: "hl-1", paperOrderMode: "HEADLINE", paperStatus: "PAPER_CLOSED_LOSS", updatedAt: "2026-06-01T00:00:00.000Z" }));
+
+    expect(store.pruneClosedDiagnostic(2)).toBe(3); // 5 diag closed → keep 2 → prune 3
+    const ids = store.all.map((o) => o.paperOrderId);
+    expect(ids).toContain("diag-4"); // newest kept
+    expect(ids).toContain("diag-3");
+    expect(ids).not.toContain("diag-0"); // oldest dropped
+    expect(ids).toContain("open-1"); // OPEN untouched
+    expect(ids).toContain("hl-1"); // HEADLINE (real ledger) NEVER pruned
+    expect(store.pruneClosedDiagnostic(100)).toBe(0); // below cap → no-op
+  });
 });
 
 // Eliminate "unused import" lint complaints

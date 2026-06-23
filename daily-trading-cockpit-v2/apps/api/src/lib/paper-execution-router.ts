@@ -101,6 +101,10 @@ export const PAPER_ORDER_EXPIRY_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 // FASTTP_HORIZON_HOURS / SIGNAL_DECAY_HORIZON_HOURS / the STALE-open warn bucket.
 export const PAPER_MAX_HOLD_MS = 72 * 60 * 60 * 1000; // 72 h
 export const DEFAULT_PAPER_EQUITY = 2000;
+/** Max DIAGNOSTIC closed orders retained in the paper store (rolling measurement window). The
+ *  store loads fully each resolve cycle, so unbounded closed-order growth is a memory/latency risk
+ *  (the OOM class). HEADLINE (real-ledger) + OPEN orders are NEVER pruned by this. Env-tunable. */
+export const PAPER_MAX_CLOSED_DIAGNOSTIC = Number(process.env.PAPER_MAX_CLOSED_DIAGNOSTIC) || 4000;
 const RISK_PCT = 1; // 1% of equity per trade — never changed
 const DEFAULT_PAPER_MAX_NOTIONAL_CAP = 50_000;
 const PAPER_TAKER_COST_BPS = 22; // mirrors TAKER_ROUNDTRIP_BPS from CG variant matrix
@@ -487,6 +491,33 @@ export class PaperExecutionRouterStore {
   add(order: PaperOrder): void {
     this.state.orders.push(order);
     this.save();
+  }
+
+  /** Bound memory: DIAGNOSTIC closed orders only feed the ROLLING diagnostic measurement view
+   *  (per-lane net/PF/WR + diagnostic P&L tile) — the VM matrix is the authoritative OOS spine, and
+   *  the HEADLINE ledger (real money) is NEVER pruned here. Keeps the newest `maxClosed` diagnostic
+   *  closed orders (by updatedAt) and drops older ones. OPEN orders (resolver inputs) and ALL
+   *  non-diagnostic orders are untouched. Pruned orders' signals are from old scan batches, so their
+   *  dedupeKeys can't collide with fresh candidates → no re-admission. No-op below the cap (so it
+   *  changes nothing today; current diagnostic-closed count is well under it). Returns count pruned. */
+  pruneClosedDiagnostic(maxClosed: number): number {
+    const isClosedDiag = (o: PaperOrder): boolean =>
+      (o.paperStatus === "PAPER_CLOSED_WIN" || o.paperStatus === "PAPER_CLOSED_LOSS") &&
+      o.paperOrderMode === "DIAGNOSTIC_ONLY";
+    const closedDiag = this.state.orders.filter(isClosedDiag);
+    if (closedDiag.length <= maxClosed) return 0;
+    const tsOf = (o: PaperOrder): number => {
+      const ms = new Date(o.updatedAt ?? o.createdAt ?? 0).getTime();
+      return Number.isFinite(ms) ? ms : 0;
+    };
+    const keep = new Set(
+      closedDiag.sort((a, b) => tsOf(b) - tsOf(a)).slice(0, maxClosed).map((o) => o.paperOrderId),
+    );
+    const before = this.state.orders.length;
+    this.state.orders = this.state.orders.filter((o) => !isClosedDiag(o) || keep.has(o.paperOrderId));
+    const pruned = before - this.state.orders.length;
+    if (pruned > 0) this.save();
+    return pruned;
   }
 
   update(orderId: string, patch: Partial<PaperOrder>): void {
@@ -1937,6 +1968,10 @@ export async function resolvePaperOrders(
       errors += 1;
     }
   }
+
+  // Bound memory: prune old DIAGNOSTIC closed orders beyond the rolling-window cap (HEADLINE/OPEN
+  // untouched). No-op while under the cap, so it changes nothing today.
+  store.pruneClosedDiagnostic(PAPER_MAX_CLOSED_DIAGNOSTIC);
 
   return { resolved, expired, dataFailures, errors };
 }
