@@ -242,6 +242,7 @@ export interface NeuralMapTelemetry {
     pf: number | null;
     wr: number | null;
     totalNetR: number;
+    antiCrash: FadeLongReport["antiCrash"];
   } | null;
   alerts: NeuralMapAlert[];
 }
@@ -1439,6 +1440,7 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
           pf: input.fadeLong.pf,
           wr: input.fadeLong.wr,
           totalNetR: input.fadeLong.totalNetR,
+          antiCrash: input.fadeLong.antiCrash,
         }
       : null,
     alerts,

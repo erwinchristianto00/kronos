@@ -4,6 +4,7 @@ import {
   computeRSI,
   detectFadeLongEntry,
   detectFadeLongEntries,
+  buildFadeLongAntiCrashSnapshot,
   resolveFadeLong,
   buildFadeLongReport,
   runFadeLongCycle,
@@ -125,6 +126,44 @@ describe("detectFadeLongEntries (lookback scanner — the cycle's detector)", ()
   });
 });
 
+describe("buildFadeLongAntiCrashSnapshot", () => {
+  it("flags market-wide dump breadth as would-block measurement metadata", () => {
+    const candlesBySymbol = new Map<string, Candle[]>();
+    const symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "WLDUSDT", "INJUSDT", "DOGEUSDT", "OPUSDT", "NEARUSDT"];
+    for (const symbol of symbols) {
+      candlesBySymbol.set(symbol, [100, 99.8, 99.5, 99.1, 98.7].map((close, i) => mkCandle(1000 + i * 900_000, close)));
+    }
+
+    const snapshot = buildFadeLongAntiCrashSnapshot({
+      candlesBySymbol,
+      atMs: 1000 + 4 * 900_000,
+      freshSignalCluster: 7,
+    });
+
+    expect(snapshot.wouldBlock).toBe(true);
+    expect(snapshot.down1hPct).toBe(100);
+    expect(snapshot.median1hReturnPct).toBeLessThan(-0.5);
+    expect(snapshot.reasons).toContain("MARKET_WIDE_1H_DUMP");
+    expect(snapshot.reasons).toContain("BTC_ETH_BOTH_BREAKING_DOWN");
+    expect(snapshot.reasons).toContain("OVERSOLD_SIGNAL_CLUSTER");
+  });
+
+  it("does not block when breadth sample is too small", () => {
+    const candlesBySymbol = new Map<string, Candle[]>([
+      ["BTCUSDT", [100, 99, 98, 97, 96].map((close, i) => mkCandle(1000 + i * 900_000, close))],
+    ]);
+
+    const snapshot = buildFadeLongAntiCrashSnapshot({
+      candlesBySymbol,
+      atMs: 1000 + 4 * 900_000,
+      freshSignalCluster: 1,
+    });
+
+    expect(snapshot.wouldBlock).toBe(false);
+    expect(snapshot.reasons).toContain("BREADTH_SAMPLE_TOO_SMALL");
+  });
+});
+
 function openObs(): FadeLongObservation {
   const entry = 100;
   return {
@@ -204,6 +243,7 @@ describe("buildFadeLongReport", () => {
     expect(r.netAvgR).toBeCloseTo((0.35 + 0.35 - 1.23) / 3, 5);
     expect(r.pf).toBeCloseTo(0.7 / 1.23, 5);
     expect(r.status).toBe("COLLECTING"); // 3 < WATCHABLE threshold
+    expect(r.antiCrash.tagged).toBe(0);
   });
 });
 
@@ -235,6 +275,8 @@ describe("runFadeLongCycle", () => {
     expect(r1.newEntries).toBe(1);
     expect(store.all.length).toBe(1);
     expect(store.all[0].status).toBe("OPEN");
+    expect(store.all[0].antiCrash).toBeTruthy();
+    expect(store.all[0].antiCrash?.wouldBlock).toBe(false);
 
     // Re-running the same candles must NOT create a duplicate observation.
     const r2 = await runFadeLongCycle({

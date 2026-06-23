@@ -189,6 +189,29 @@ interface NeuralTelemetry {
     pf: number | null;
     wr: number | null;
     totalNetR: number;
+    antiCrash: {
+      tagged: number;
+      wouldBlock: number;
+      pass: number;
+      blockedClosed: number;
+      blockedNetAvgR: number | null;
+      blockedWR: number | null;
+      passClosed: number;
+      passNetAvgR: number | null;
+      passWR: number | null;
+      latest: {
+        universeCount: number;
+        down15mPct: number | null;
+        down1hPct: number | null;
+        median15mReturnPct: number | null;
+        median1hReturnPct: number | null;
+        btc1hReturnPct: number | null;
+        eth1hReturnPct: number | null;
+        freshSignalCluster: number;
+        wouldBlock: boolean;
+        reasons: string[];
+      } | null;
+    };
   } | null;
   alerts: Array<{ severity: 'WARNING' | 'CRITICAL'; source: string; message: string }>;
 }
@@ -1021,6 +1044,15 @@ export default function NeuralMindmap() {
             {telemetry?.fadeLong
               ? `${telemetry.fadeLong.freshValid}/${telemetry.fadeLong.oosThreshold} OOS · ${telemetry.fadeLong.open} open · ${telemetry.fadeLong.status === 'WATCHABLE' ? 'watchable' : 'collecting'} · not real`
               : 'RSI<30 measurement lane'}
+            {telemetry?.fadeLong?.antiCrash ? (
+              <span className="diag-dir-foot">
+                anti-crash shadow: {telemetry.fadeLong.antiCrash.wouldBlock}/{telemetry.fadeLong.antiCrash.tagged} would-block
+                {telemetry.fadeLong.antiCrash.passClosed > 0 ? ` · pass ${fmtR(telemetry.fadeLong.antiCrash.passNetAvgR)} n=${telemetry.fadeLong.antiCrash.passClosed}` : ''}
+                {telemetry.fadeLong.antiCrash.latest
+                  ? ` · latest ${telemetry.fadeLong.antiCrash.latest.wouldBlock ? 'warning' : 'clear'} (${fmtPct(telemetry.fadeLong.antiCrash.latest.down1hPct)} 1h down breadth)`
+                  : ''}
+              </span>
+            ) : null}
           </small>
         </div>
         <div>

@@ -29,6 +29,33 @@ export const FADE_LONG_MAX_HOLD_BARS = Number(process.env.FADE_LONG_MAX_HOLD_BAR
 export const FADE_LONG_LOOKBACK_BARS = Number(process.env.FADE_LONG_LOOKBACK_BARS) || 24; // ~6h on 15m
 const FADE_LONG_EXPIRY_MS = 7 * 24 * 60 * 60 * 1000;
 
+function envNum(name: string, fallback: number): number {
+  const n = Number(process.env[name]);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+export const FADE_LONG_ANTI_CRASH_MIN_BREADTH_SYMBOLS = envNum("FADE_LONG_ANTI_CRASH_MIN_BREADTH_SYMBOLS", 8);
+export const FADE_LONG_ANTI_CRASH_DOWN_1H_PCT = envNum("FADE_LONG_ANTI_CRASH_DOWN_1H_PCT", 70);
+export const FADE_LONG_ANTI_CRASH_CLUSTER_DOWN_1H_PCT = envNum("FADE_LONG_ANTI_CRASH_CLUSTER_DOWN_1H_PCT", 60);
+export const FADE_LONG_ANTI_CRASH_MEDIAN_1H_RETURN_PCT = envNum("FADE_LONG_ANTI_CRASH_MEDIAN_1H_RETURN_PCT", -0.5);
+export const FADE_LONG_ANTI_CRASH_BTC_ETH_1H_RETURN_PCT = envNum("FADE_LONG_ANTI_CRASH_BTC_ETH_1H_RETURN_PCT", -0.5);
+export const FADE_LONG_ANTI_CRASH_SIGNAL_CLUSTER_MIN = envNum("FADE_LONG_ANTI_CRASH_SIGNAL_CLUSTER_MIN", 6);
+
+export interface FadeLongAntiCrashSnapshot {
+  version: "fade-long-anti-crash-v1";
+  capturedAt: string;
+  universeCount: number;
+  down15mPct: number | null;
+  down1hPct: number | null;
+  median15mReturnPct: number | null;
+  median1hReturnPct: number | null;
+  btc1hReturnPct: number | null;
+  eth1hReturnPct: number | null;
+  freshSignalCluster: number;
+  wouldBlock: boolean;
+  reasons: string[];
+}
+
 /** Wilder RSI on close prices. Returns array aligned to closes (null until enough data). */
 export function computeRSI(closes: number[], period = FADE_LONG_RSI_PERIOD): (number | null)[] {
   const out: (number | null)[] = new Array(closes.length).fill(null);
@@ -67,6 +94,12 @@ export interface FadeLongObservation {
   netR: number | null;
   costR: number | null;
   resolvedAt: string | null;
+  /**
+   * Measurement-only anti-crash/breadth label at the signal bar. This is NOT a
+   * hard gate; it lets us compare "would have blocked" vs pass cohorts before
+   * turning any crash filter into live behavior.
+   */
+  antiCrash?: FadeLongAntiCrashSnapshot | null;
 }
 
 /** Build a fade-long observation for the fresh oversold cross at bar index `i` (entry = that bar's
@@ -134,6 +167,114 @@ export function detectFadeLongEntries(
   return out;
 }
 
+function finite(n: unknown): n is number {
+  return typeof n === "number" && Number.isFinite(n);
+}
+
+function median(xs: number[]): number | null {
+  const values = xs.filter(finite).sort((a, b) => a - b);
+  if (!values.length) return null;
+  const mid = Math.floor(values.length / 2);
+  return values.length % 2 === 0 ? (values[mid - 1]! + values[mid]!) / 2 : values[mid]!;
+}
+
+function candleIndexAtOrBefore(candles: readonly Candle[], atMs: number): number {
+  let out = -1;
+  for (let i = 0; i < candles.length; i += 1) {
+    if (candles[i]!.openTime <= atMs) out = i;
+    else break;
+  }
+  return out;
+}
+
+function returnPct(candles: readonly Candle[], endIdx: number, lookbackBars: number): number | null {
+  const startIdx = endIdx - lookbackBars;
+  if (startIdx < 0) return null;
+  const start = candles[startIdx]?.close;
+  const end = candles[endIdx]?.close;
+  if (!(finite(start) && start > 0 && finite(end))) return null;
+  return ((end - start) / start) * 100;
+}
+
+export function buildFadeLongAntiCrashSnapshot(args: {
+  candlesBySymbol: ReadonlyMap<string, readonly Candle[]>;
+  atMs: number;
+  freshSignalCluster: number;
+}): FadeLongAntiCrashSnapshot {
+  const oneBarReturns: number[] = [];
+  const oneHourReturns: number[] = [];
+  let btc1hReturnPct: number | null = null;
+  let eth1hReturnPct: number | null = null;
+
+  for (const [symbol, candles] of args.candlesBySymbol) {
+    const idx = candleIndexAtOrBefore(candles, args.atMs);
+    if (idx < 1) continue;
+    const r15 = returnPct(candles, idx, 1);
+    const r1h = returnPct(candles, idx, 4);
+    if (r15 !== null) oneBarReturns.push(r15);
+    if (r1h !== null) {
+      oneHourReturns.push(r1h);
+      if (symbol === "BTCUSDT") btc1hReturnPct = r1h;
+      if (symbol === "ETHUSDT") eth1hReturnPct = r1h;
+    }
+  }
+
+  const down15mPct = oneBarReturns.length
+    ? (oneBarReturns.filter((r) => r < 0).length / oneBarReturns.length) * 100
+    : null;
+  const down1hPct = oneHourReturns.length
+    ? (oneHourReturns.filter((r) => r < 0).length / oneHourReturns.length) * 100
+    : null;
+  const median15mReturnPct = median(oneBarReturns);
+  const median1hReturnPct = median(oneHourReturns);
+  const reasons: string[] = [];
+
+  if (oneHourReturns.length < FADE_LONG_ANTI_CRASH_MIN_BREADTH_SYMBOLS) {
+    reasons.push("BREADTH_SAMPLE_TOO_SMALL");
+  } else {
+    if (
+      down1hPct !== null &&
+      median1hReturnPct !== null &&
+      down1hPct >= FADE_LONG_ANTI_CRASH_DOWN_1H_PCT &&
+      median1hReturnPct <= FADE_LONG_ANTI_CRASH_MEDIAN_1H_RETURN_PCT
+    ) {
+      reasons.push("MARKET_WIDE_1H_DUMP");
+    }
+    if (
+      btc1hReturnPct !== null &&
+      eth1hReturnPct !== null &&
+      median1hReturnPct !== null &&
+      btc1hReturnPct <= FADE_LONG_ANTI_CRASH_BTC_ETH_1H_RETURN_PCT &&
+      eth1hReturnPct <= FADE_LONG_ANTI_CRASH_BTC_ETH_1H_RETURN_PCT &&
+      median1hReturnPct <= 0
+    ) {
+      reasons.push("BTC_ETH_BOTH_BREAKING_DOWN");
+    }
+    if (
+      down1hPct !== null &&
+      args.freshSignalCluster >= FADE_LONG_ANTI_CRASH_SIGNAL_CLUSTER_MIN &&
+      down1hPct >= FADE_LONG_ANTI_CRASH_CLUSTER_DOWN_1H_PCT
+    ) {
+      reasons.push("OVERSOLD_SIGNAL_CLUSTER");
+    }
+  }
+
+  return {
+    version: "fade-long-anti-crash-v1",
+    capturedAt: new Date(args.atMs).toISOString(),
+    universeCount: oneHourReturns.length,
+    down15mPct,
+    down1hPct,
+    median15mReturnPct,
+    median1hReturnPct,
+    btc1hReturnPct,
+    eth1hReturnPct,
+    freshSignalCluster: args.freshSignalCluster,
+    wouldBlock: reasons.some((reason) => reason !== "BREADTH_SAMPLE_TOO_SMALL"),
+    reasons,
+  };
+}
+
 function netOf(grossR: number, stopDistanceBps: number, isLoss: boolean): { costR: number; netR: number } {
   const costR = TAKER_ROUNDTRIP_BPS / stopDistanceBps + (isLoss ? STOP_OUT_SLIPPAGE_BPS / stopDistanceBps : 0);
   return { costR, netR: grossR - costR };
@@ -184,6 +325,18 @@ export interface FadeLongReport {
   watchableThreshold: number;
   status: "COLLECTING" | "WATCHABLE";
   totalNetR: number;
+  antiCrash: {
+    tagged: number;
+    wouldBlock: number;
+    pass: number;
+    blockedClosed: number;
+    blockedNetAvgR: number | null;
+    blockedWR: number | null;
+    passClosed: number;
+    passNetAvgR: number | null;
+    passWR: number | null;
+    latest: FadeLongAntiCrashSnapshot | null;
+  };
 }
 
 export function buildFadeLongReport(observations: readonly FadeLongObservation[]): FadeLongReport {
@@ -197,6 +350,25 @@ export function buildFadeLongReport(observations: readonly FadeLongObservation[]
   const pfDen = -nets.filter((r) => r < 0).reduce((a, b) => a + b, 0);
   const freshValid = resolved.length;
   const mean = (xs: number[]) => (xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : null);
+  const cohortStats = (cohort: readonly FadeLongObservation[]) => {
+    const closed = cohort.filter(
+      (o) => (o.status === "CLOSED_WIN" || o.status === "CLOSED_LOSS") && typeof o.netR === "number",
+    );
+    const rs = closed.map((o) => o.netR as number);
+    return {
+      closed: closed.length,
+      netAvgR: mean(rs),
+      wr: closed.length ? closed.filter((o) => (o.netR ?? 0) > 0).length / closed.length : null,
+    };
+  };
+  const antiCrashTagged = observations.filter((o) => o.antiCrash);
+  const antiCrashBlocked = antiCrashTagged.filter((o) => o.antiCrash?.wouldBlock);
+  const antiCrashPass = antiCrashTagged.filter((o) => o.antiCrash && !o.antiCrash.wouldBlock);
+  const blockedStats = cohortStats(antiCrashBlocked);
+  const passStats = cohortStats(antiCrashPass);
+  const latestAntiCrash = antiCrashTagged
+    .slice()
+    .sort((a, b) => b.openedAtMs - a.openedAtMs)[0]?.antiCrash ?? null;
   return {
     freshValid,
     open: observations.filter((o) => o.status === "OPEN").length,
@@ -208,6 +380,18 @@ export function buildFadeLongReport(observations: readonly FadeLongObservation[]
     watchableThreshold: WATCHABLE_MIN_FRESH,
     status: freshValid >= WATCHABLE_MIN_FRESH ? "WATCHABLE" : "COLLECTING",
     totalNetR: nets.reduce((a, b) => a + b, 0),
+    antiCrash: {
+      tagged: antiCrashTagged.length,
+      wouldBlock: antiCrashBlocked.length,
+      pass: antiCrashPass.length,
+      blockedClosed: blockedStats.closed,
+      blockedNetAvgR: blockedStats.netAvgR,
+      blockedWR: blockedStats.wr,
+      passClosed: passStats.closed,
+      passNetAvgR: passStats.netAvgR,
+      passWR: passStats.wr,
+      latest: latestAntiCrash,
+    },
   };
 }
 
@@ -279,6 +463,8 @@ export async function runFadeLongCycle(opts: {
   let scanned = 0;
   let newEntries = 0;
   let resolved = 0;
+  const candlesBySymbol = new Map<string, Candle[]>();
+
   for (const symbol of symbols) {
     let candles: Candle[];
     try {
@@ -292,12 +478,39 @@ export async function runFadeLongCycle(opts: {
     const closed = candles.length > 1 ? candles.slice(0, -1) : candles;
     if (closed.length === 0) continue;
     scanned++;
+    candlesBySymbol.set(symbol, closed);
+  }
+
+  const detectedEntries: FadeLongObservation[] = [];
+  for (const [symbol, closed] of candlesBySymbol) {
     // Scan the whole lookback window (not just the latest bar) so a single successful run captures
     // every recent fresh oversold cross — deduped by bar via the store. This is the fix for the
     // cycle silently recording 0 across 80 real crosses.
-    for (const entry of detectFadeLongEntries(symbol, closed)) {
-      if (store.add(entry)) newEntries++;
+    detectedEntries.push(...detectFadeLongEntries(symbol, closed));
+  }
+
+  const signalClusterByBar = new Map<number, number>();
+  for (const entry of detectedEntries) {
+    signalClusterByBar.set(entry.openedAtMs, (signalClusterByBar.get(entry.openedAtMs) ?? 0) + 1);
+  }
+
+  for (const entry of detectedEntries) {
+    const antiCrash = buildFadeLongAntiCrashSnapshot({
+      candlesBySymbol,
+      atMs: entry.openedAtMs,
+      freshSignalCluster: signalClusterByBar.get(entry.openedAtMs) ?? 1,
+    });
+    const taggedEntry: FadeLongObservation = { ...entry, antiCrash };
+    const added = store.add(taggedEntry);
+    if (added) {
+      newEntries++;
+    } else {
+      const existing = store.all.find((obs) => obs.observationId === entry.observationId);
+      if (existing && !existing.antiCrash) store.update(existing.observationId, { antiCrash });
     }
+  }
+
+  for (const [symbol, closed] of candlesBySymbol) {
     for (const obs of store.all) {
       if (obs.symbol !== symbol || obs.status !== "OPEN") continue;
       const patch = resolveFadeLong(obs, closed, now);
