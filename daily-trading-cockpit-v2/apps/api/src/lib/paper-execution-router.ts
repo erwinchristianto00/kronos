@@ -1358,6 +1358,54 @@ function maxHoldMsForOrder(order: PaperOrder): number {
   return PAPER_MAX_HOLD_MS;
 }
 
+function paperOrderOpenedAtMs(order: PaperOrder, fallbackMs: number): number {
+  const openedAtMs = new Date(order.openedAt).getTime();
+  return Number.isFinite(openedAtMs) ? openedAtMs : fallbackMs;
+}
+
+function latestCloseTouchesExit(order: PaperOrder, close: number): boolean {
+  if (!(Number.isFinite(close) && close > 0)) return false;
+  const tp = order.takeProfitLevels[0];
+  const sl = order.stopLoss;
+  if (!(typeof tp === "number" && Number.isFinite(tp) && typeof sl === "number" && Number.isFinite(sl))) {
+    return false;
+  }
+  return order.direction === "LONG"
+    ? close >= tp || close <= sl
+    : close <= tp || close >= sl;
+}
+
+async function findOrdersAtExitNow(
+  orders: PaperOrder[],
+  binanceClient: PaperResolverClient,
+  nowMs: number,
+): Promise<Set<string>> {
+  const symbols = Array.from(new Set(orders.map((order) => order.symbol))).sort();
+  const latestCloseBySymbol = new Map<string, number>();
+  await Promise.all(symbols.map(async (symbol) => {
+    try {
+      const candles = await binanceClient.getKlines(symbol, "5m", {
+        startTime: nowMs - 3 * CANDLE_MS,
+        endTime: nowMs,
+        limit: 3,
+      });
+      const close = Number(candles.at(-1)?.[4]);
+      if (Number.isFinite(close) && close > 0) latestCloseBySymbol.set(symbol, close);
+    } catch {
+      // Ranking hint only. Exact candle-walk resolution below remains authoritative.
+    }
+  }));
+
+  const touched = new Set<string>();
+  for (const order of orders) {
+    const close = latestCloseBySymbol.get(order.symbol);
+    if (close !== undefined && latestCloseTouchesExit(order, close)) {
+      touched.add(order.paperOrderId);
+    }
+  }
+  return touched;
+}
+
 function effectiveExitRuleForOrder(order: PaperOrder): VariantExitRule {
   if (order.variantExitRule) return order.variantExitRule;
   const laneId = order.selectedLaneId;
@@ -1483,16 +1531,13 @@ export async function resolvePaperOrders(
   let errors = 0;
   let processed = 0;
 
-  for (const order of store.all.slice()) {
-    if (order.paperStatus !== "CREATED" && order.paperStatus !== "PAPER_SUBMITTED") continue;
-    if (Date.now() - startedMs >= maxRuntimeMs) break;
-    const openedAtMs = new Date(order.openedAt).getTime();
+  const openOrders = store.all
+    .slice()
+    .filter((order) => order.paperStatus === "CREATED" || order.paperStatus === "PAPER_SUBMITTED");
 
-    // Expiry sweep — cheap (no candle fetch), so it must NOT consume the per-run fetch budget.
-    // Counting expiries against `processed` (the prior behaviour) let a backlog of expiry-eligible
-    // orders at the FRONT of the book eat the whole maxOrders budget and starve the resolvable
-    // orders behind them — the same starvation class fixed in the variant-matrix resolver. Orders
-    // are insertion-ordered (oldest first), so expiry-eligible ones are always at the front.
+  const processableOrders: PaperOrder[] = [];
+  for (const order of openOrders) {
+    const openedAtMs = paperOrderOpenedAtMs(order, nowMs);
     if (nowMs - openedAtMs > PAPER_ORDER_EXPIRY_MS) {
       store.update(order.paperOrderId, {
         paperStatus: "PAPER_EXPIRED",
@@ -1503,6 +1548,28 @@ export async function resolvePaperOrders(
       resolved += 1;
       continue;
     }
+    processableOrders.push(order);
+  }
+
+  const atExitNow = Number.isFinite(maxOrders) && processableOrders.length > maxOrders
+    ? await findOrdersAtExitNow(processableOrders, binanceClient, nowMs)
+    : new Set<string>();
+  const rankedOrders = processableOrders
+    .map((order) => {
+      const openedAtMs = paperOrderOpenedAtMs(order, nowMs);
+      const rank = nowMs - openedAtMs >= maxHoldMsForOrder(order)
+        ? 0
+        : atExitNow.has(order.paperOrderId)
+          ? 1
+          : 2;
+      return { order, openedAtMs, rank };
+    })
+    .sort((a, b) => a.rank - b.rank || a.openedAtMs - b.openedAtMs);
+
+  for (const item of rankedOrders) {
+    const order = item.order;
+    if (Date.now() - startedMs >= maxRuntimeMs) break;
+    const openedAtMs = item.openedAtMs;
 
     // The budget applies ONLY to real fetch-walk resolution.
     if (processed >= maxOrders) break;
