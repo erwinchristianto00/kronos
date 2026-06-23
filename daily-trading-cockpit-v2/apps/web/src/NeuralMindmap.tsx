@@ -214,6 +214,19 @@ interface NeuralTelemetry {
       } | null;
     };
   } | null;
+  h6Trend: {
+    freshValid: number;
+    open: number;
+    expired: number;
+    oosThreshold: number;
+    status: 'COLLECTING' | 'WATCHABLE';
+    netAvgR: number | null;
+    grossAvgR: number | null;
+    pf: number | null;
+    wr: number | null;
+    avgMaxFavorableR: number | null;
+    totalNetR: number;
+  } | null;
   alerts: Array<{ severity: 'WARNING' | 'CRITICAL'; source: string; message: string }>;
 }
 
@@ -1072,6 +1085,26 @@ export default function NeuralMindmap() {
                   ? ` · latest ${telemetry.fadeLong.antiCrash.latest.wouldBlock ? 'warning' : 'clear'} (${fmtPct(telemetry.fadeLong.antiCrash.latest.down1hPct)} 1h down breadth)`
                   : ''}
               </span>
+            ) : null}
+          </small>
+        </div>
+        <div>
+          <span>H6 trend edge <small>(trend-gated long)</small></span>
+          <strong className={(() => {
+            const h6 = telemetry?.h6Trend;
+            if (!h6 || h6.freshValid < h6.oosThreshold) return 'tone-measure';
+            return (h6.netAvgR ?? 0) > 0 ? 'tone-healthy' : 'tone-critical';
+          })()}>
+            {telemetry?.h6Trend
+              ? `${fmtR(telemetry.h6Trend.netAvgR)} net · ${telemetry.h6Trend.wr != null ? `${Math.round(telemetry.h6Trend.wr * 100)}% WR` : '—'}`
+              : 'Loading'}
+          </strong>
+          <small>
+            {telemetry?.h6Trend
+              ? `${telemetry.h6Trend.freshValid}/${telemetry.h6Trend.oosThreshold} OOS · ${telemetry.h6Trend.open} open · ${telemetry.h6Trend.status === 'WATCHABLE' ? 'watchable' : 'collecting'} · not real`
+              : '6h momentum + uptrend, ATR trail'}
+            {telemetry?.h6Trend && telemetry.h6Trend.avgMaxFavorableR != null ? (
+              <span className="diag-dir-foot">avg MFE {fmtR(telemetry.h6Trend.avgMaxFavorableR)} · PF {telemetry.h6Trend.pf != null ? telemetry.h6Trend.pf.toFixed(2) : '—'}</span>
             ) : null}
           </small>
         </div>

@@ -206,6 +206,7 @@ import {
   type KlineTuple as VariantMatrixKlineTuple,
 } from "../lib/current-guard-variant-matrix.js";
 import { getFadeLongStore, runFadeLongCycleGuarded, buildFadeLongReport } from "../lib/fade-long-edge.js";
+import { getH6TrendStore, runH6TrendCycleGuarded, buildH6TrendReport, H6_TREND_INTERVAL } from "../lib/h6-trend-edge.js";
 import { getCandidateFunnelLog } from "../lib/accelerated-evidence-candidate-funnel-log.js";
 import {
   buildPortfolioTrendShadowReport,
@@ -1080,6 +1081,10 @@ export async function registerShadowRoutes(
       process.env.FADE_LONG_EDGE_DISABLED === "1"
         ? null
         : buildFadeLongReport(getFadeLongStore().all);
+    const h6Trend =
+      process.env.H6_TREND_EDGE_DISABLED === "1"
+        ? null
+        : buildH6TrendReport(getH6TrendStore().all);
     const mixed = buildMixedRegimeReport({
       regime,
       candidates: (cached?.candidates ?? []).map((candidate) => ({
@@ -1108,6 +1113,7 @@ export async function registerShadowRoutes(
       orders,
       variantMatrix,
       fadeLong,
+      h6Trend,
       mixed,
       mixedValidation,
       staleAudit,
@@ -1337,6 +1343,19 @@ export async function registerShadowRoutes(
             universe: [...CURRENT_SCANNER_UNIVERSE],
             now: Date.now(),
             fetchCandles: async (symbol: string) => _flc.getCandles(symbol, fadeInterval, 120),
+          }).catch(() => undefined);
+        }
+        // H6 trend-following LONG lane — the trend-gated long edge (momentum + uptrend structure,
+        // ATR chandelier trail). Same fire-and-forget discipline: report-only, surfaced by the
+        // neural-map endpoint, never blocks the brief. 6h candles ⇒ ~200 bars covers EMA90 history
+        // plus forward bars for the trail walk. Prove OOS before any read.
+        if (process.env.H6_TREND_EDGE_DISABLED !== "1") {
+          const _h6c = opts.binanceClient;
+          void runH6TrendCycleGuarded({
+            store: getH6TrendStore(),
+            universe: [...CURRENT_SCANNER_UNIVERSE],
+            now: Date.now(),
+            fetchCandles: async (symbol: string) => _h6c.getCandles(symbol, H6_TREND_INTERVAL, 200),
           }).catch(() => undefined);
         }
       }

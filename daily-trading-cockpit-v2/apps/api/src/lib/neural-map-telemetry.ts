@@ -7,6 +7,7 @@ import {
   type CurrentGuardVariantMatrixReport,
 } from "./current-guard-variant-matrix.js";
 import type { FadeLongReport } from "./fade-long-edge.js";
+import type { H6TrendReport } from "./h6-trend-edge.js";
 import type { MixedBudgetForwardValidationReport, MixedRegimeReport, OpenOrderStaleAudit } from "./mixed-regime-router.js";
 import type { PaperOrder, PaperPerformanceReport } from "./paper-execution-router.js";
 import { assessPaperTp, cgWideTpPctFromOrder } from "./paper-trading-controls.js";
@@ -248,6 +249,22 @@ export interface NeuralMapTelemetry {
     totalNetR: number;
     antiCrash: FadeLongReport["antiCrash"];
   } | null;
+  /** H6 trend-following LONG lane (momentum + uptrend gate, ATR chandelier trail). Independent
+   *  measurement edge like fadeLong — report-only, outside the allocator/paper book. null when
+   *  disabled or empty. */
+  h6Trend: {
+    freshValid: number;
+    open: number;
+    expired: number;
+    oosThreshold: number;
+    status: "COLLECTING" | "WATCHABLE";
+    netAvgR: number | null;
+    grossAvgR: number | null;
+    pf: number | null;
+    wr: number | null;
+    avgMaxFavorableR: number | null;
+    totalNetR: number;
+  } | null;
   alerts: NeuralMapAlert[];
 }
 
@@ -262,6 +279,8 @@ export interface NeuralMapTelemetryInput {
   /** Pre-built fade-long report (from buildFadeLongReport over the fade-long store). Optional —
    *  when omitted the telemetry's fadeLong field is null. */
   fadeLong?: FadeLongReport | null;
+  /** Pre-built H6 trend report (from buildH6TrendReport). Optional — null when omitted. */
+  h6Trend?: H6TrendReport | null;
   mixed: MixedRegimeReport;
   mixedValidation: MixedBudgetForwardValidationReport;
   staleAudit: OpenOrderStaleAudit;
@@ -1448,6 +1467,21 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
           wr: input.fadeLong.wr,
           totalNetR: input.fadeLong.totalNetR,
           antiCrash: input.fadeLong.antiCrash,
+        }
+      : null,
+    h6Trend: input.h6Trend
+      ? {
+          freshValid: input.h6Trend.freshValid,
+          open: input.h6Trend.open,
+          expired: input.h6Trend.expired,
+          oosThreshold: input.h6Trend.watchableThreshold,
+          status: input.h6Trend.status,
+          netAvgR: input.h6Trend.netAvgR,
+          grossAvgR: input.h6Trend.grossAvgR,
+          pf: input.h6Trend.pf,
+          wr: input.h6Trend.wr,
+          avgMaxFavorableR: input.h6Trend.avgMaxFavorableR,
+          totalNetR: input.h6Trend.totalNetR,
         }
       : null,
     alerts,
