@@ -1248,7 +1248,15 @@ export async function registerShadowRoutes(
       const era: DashboardAuditSummaryEra = rawEra === "ALL_TIME" ? "ALL_TIME" : "POST_CALIBRATION";
       const generatedAt = new Date().toISOString();
       const scanStatus = opts.coreScanAutoRefreshController?.getStatus() ?? null;
-      const currentRegime = scanStatus?.lastAutoRefreshResultSummary?.marketRegime ?? null;
+      // Regime must be the regime OF THE CANDIDATES THIS PATH ADMITS — the allocator below evaluates
+      // getLatestScanCandidates() (the cached scan), so gate on that scan's marketRegime FIRST (same
+      // resolution the neural-map controller uses), falling back to the auto-refresh summary. Using
+      // scanStatus-only diverged from the admitted candidates AND could be null (→ controllerMode
+      // UNKNOWN → regimeOk=false → the WHOLE paper admission freezes for that cycle).
+      const currentRegime =
+        getLatestScanCandidates()?.marketRegime ??
+        scanStatus?.lastAutoRefreshResultSummary?.marketRegime ??
+        null;
       // Honest-edge gate: the controllerMode this produces flows into the
       // adaptive lane router → paper allocator → admission, so a direction with
       // proven-negative honest edge is hard-vetoed before any order is created.
@@ -1337,11 +1345,9 @@ export async function registerShadowRoutes(
         // Overlap-guarded so the 7-min ticker can't stack two cycles on the singleton store.
         // Long edges (fade-long dip-buy + H6 trend) only OPEN new positions in a bullish regime —
         // both bleed in choppy/bearish (dips keep dipping; uptrends don't persist). Resolution of
-        // existing obs still runs regardless. Use the SAME regime source as the neural-map controller
-        // (the cached scan's marketRegime — `currentRegime`/scanStatus is frequently null) so the gate
-        // tracks the real regime, not a null field that would freeze longs forever.
-        const longRegime = getLatestScanCandidates()?.marketRegime ?? currentRegime;
-        const regimeAllowsLong = typeof longRegime === "string" && /bull/i.test(longRegime);
+        // existing obs still runs regardless. `currentRegime` is now cached-first (the regime of the
+        // scan candidates), so it's the right, populated signal.
+        const regimeAllowsLong = typeof currentRegime === "string" && /bull/i.test(currentRegime);
         if (process.env.FADE_LONG_EDGE_DISABLED !== "1") {
           const _flc = opts.binanceClient;
           const fadeInterval = process.env.FADE_LONG_INTERVAL || "15m";
