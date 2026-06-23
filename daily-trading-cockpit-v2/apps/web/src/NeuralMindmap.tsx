@@ -504,6 +504,13 @@ const HEADLINE_PF_FLOOR = 1.2;
 // default 0.3). It was hardcoded 0.75 here — stricter than the real gate — so lanes the backend
 // promotes showed a FALSE red "payoff" blocker. Keep in sync with the backend default.
 const PAYOFF_FLOOR = 0.3;
+// Mirrors the backend DRAWDOWN_R_TO_CUM_SHARE (0.3): the drawdown cap scales with a lane's banked
+// cumulative R, so a proven lane isn't permanently benched by the monotonic all-time max drawdown.
+const DRAWDOWN_R_TO_CUM_SHARE = 0.3;
+function drawdownCapR(lane: NeuralLane): number {
+  const cumR = (lane.netAvgR ?? 0) * (lane.oosFreshValid ?? 0);
+  return Math.max(5, DRAWDOWN_R_TO_CUM_SHARE * cumR);
+}
 
 function stageLabel(stage: MilestoneStage): string {
   if (stage === 'PROMOTION_CANDIDATE') return 'Promotion candidate';
@@ -626,7 +633,7 @@ function stageProgress(lane: NeuralLane): StageProgress {
       { label: `netAvgR > 0.05`, met: (lane.netAvgR ?? Number.NEGATIVE_INFINITY) > 0.05, progress: thresholdProgress(lane.netAvgR, 0.05, 'gt') },
       { label: `PF > ${HEADLINE_PF_FLOOR}`, met: (lane.pf ?? Number.NEGATIVE_INFINITY) > HEADLINE_PF_FLOOR, progress: thresholdProgress(lane.pf, HEADLINE_PF_FLOOR, 'gt') },
       { label: `payoff >= ${PAYOFF_FLOOR}`, met: (lane.payoffRatio ?? Number.NEGATIVE_INFINITY) >= PAYOFF_FLOOR, progress: thresholdProgress(lane.payoffRatio, PAYOFF_FLOOR, 'gte') },
-      { label: `drawdown <= 5R`, met: lane.approxMaxDrawdownR !== null && lane.approxMaxDrawdownR <= 5, progress: inverseThresholdProgress(lane.approxMaxDrawdownR, 5) },
+      { label: `drawdown <= ${drawdownCapR(lane).toFixed(1)}R`, met: lane.approxMaxDrawdownR !== null && lane.approxMaxDrawdownR <= drawdownCapR(lane), progress: inverseThresholdProgress(lane.approxMaxDrawdownR, drawdownCapR(lane)) },
       { label: `top-symbol share <= 40%`, met: lane.topSymbolPnlShare !== null && lane.topSymbolPnlShare <= 0.4, progress: inverseThresholdProgress(lane.topSymbolPnlShare, 0.4) },
       { label: `calendar days >= 5`, met: (lane.calendarDays ?? 0) >= 5, progress: ratioProgress(lane.calendarDays, 5) },
       { label: `distinct regimes >= 2`, met: (lane.distinctRegimes ?? 0) >= 2, progress: ratioProgress(lane.distinctRegimes, 2) },
@@ -647,7 +654,7 @@ function stageProgress(lane: NeuralLane): StageProgress {
       { label: `netAvgR > 0.05`, met: (lane.netAvgR ?? Number.NEGATIVE_INFINITY) > 0.05, progress: thresholdProgress(lane.netAvgR, 0.05, 'gt') },
       { label: `PF > ${HEADLINE_PF_FLOOR}`, met: (lane.pf ?? Number.NEGATIVE_INFINITY) > HEADLINE_PF_FLOOR, progress: thresholdProgress(lane.pf, HEADLINE_PF_FLOOR, 'gt') },
       { label: `payoff >= ${PAYOFF_FLOOR}`, met: (lane.payoffRatio ?? Number.NEGATIVE_INFINITY) >= PAYOFF_FLOOR, progress: thresholdProgress(lane.payoffRatio, PAYOFF_FLOOR, 'gte') },
-      { label: `drawdown <= 5R`, met: lane.approxMaxDrawdownR !== null && lane.approxMaxDrawdownR <= 5, progress: inverseThresholdProgress(lane.approxMaxDrawdownR, 5) },
+      { label: `drawdown <= ${drawdownCapR(lane).toFixed(1)}R`, met: lane.approxMaxDrawdownR !== null && lane.approxMaxDrawdownR <= drawdownCapR(lane), progress: inverseThresholdProgress(lane.approxMaxDrawdownR, drawdownCapR(lane)) },
       { label: `top-symbol share <= 40%`, met: lane.topSymbolPnlShare !== null && lane.topSymbolPnlShare <= 0.4, progress: inverseThresholdProgress(lane.topSymbolPnlShare, 0.4) },
     ];
     return {

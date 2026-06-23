@@ -179,6 +179,13 @@ export const PAYOFF_WATCH = Number(process.env.PAYOFF_WATCH_FLOOR) || 0.3;
 export const PAYOFF_STABLE = 0.75;
 export const PAYOFF_AUTHORIZE = Number(process.env.PAYOFF_AUTHORIZE_FLOOR) || PAYOFF_WATCH;
 export const MAX_DRAWDOWN_R_LIMIT = 5;
+// The drawdown cap SCALES with a lane's proven profitability: a lane that has banked a large
+// cumulative R can tolerate a proportionally larger peak-to-trough R drawdown. approxMaxDrawdownR is
+// a monotonic all-time max, so an absolute 5R cap permanently benched the bot's best high-WR/
+// low-payoff lanes (bank 0.5R, lose 1R ⇒ naturally bigger R-holes) after a single normal retrace.
+// effective cap = max(MAX_DRAWDOWN_R_LIMIT, DRAWDOWN_R_TO_CUM_SHARE × cumulativeNetR) — the absolute
+// floor still binds for small/unproven/losing samples; the scale only ever RELAXES for proven lanes.
+export const DRAWDOWN_R_TO_CUM_SHARE = Number(process.env.DRAWDOWN_R_TO_CUM_SHARE) || 0.3;
 export const MAX_TOP_SYMBOL_SHARE = 0.4;
 export const PROMOTION_MIN_CALENDAR_DAYS = 5;
 export const PROMOTION_MIN_DISTINCT_REGIMES = 2;
@@ -1742,7 +1749,11 @@ export function deriveVariantStatus(
     };
   }
 
-  const drawdownOk = dd === null || dd <= MAX_DRAWDOWN_R_LIMIT;
+  // Drawdown cap scales with the lane's banked cumulative R (see DRAWDOWN_R_TO_CUM_SHARE); the
+  // absolute floor still binds for small/losing samples (cumulativeNetR<=0 ⇒ floor).
+  const cumulativeNetR = (net ?? 0) * row.freshValid;
+  const drawdownLimitR = Math.max(MAX_DRAWDOWN_R_LIMIT, DRAWDOWN_R_TO_CUM_SHARE * cumulativeNetR);
+  const drawdownOk = dd === null || dd <= drawdownLimitR;
   const shareOk = share === null || share <= MAX_TOP_SYMBOL_SHARE;
   const infraReady = infra.killSwitchReady && infra.orderReconciliationReady && infra.exchangeHealthReady;
 
@@ -1803,7 +1814,7 @@ export function deriveVariantStatus(
     // lane that already clears freshValid≥100 + OOS + payoff but is held back ONLY by drawdown shows
     // WATCHABLE with an EMPTY blocker list — the operator can't see why it won't advance to STABLE.
     if (row.freshValid >= STABLE_MIN_FRESH && !drawdownOk && dd !== null) {
-      blockers.push(`drawdown ${dd.toFixed(1)}R > ${MAX_DRAWDOWN_R_LIMIT}R cap (sole gate left below STABLE)`);
+      blockers.push(`drawdown ${dd.toFixed(1)}R > ${drawdownLimitR.toFixed(1)}R cap (sole gate left below STABLE)`);
     }
     return {
       status: "WATCHABLE",

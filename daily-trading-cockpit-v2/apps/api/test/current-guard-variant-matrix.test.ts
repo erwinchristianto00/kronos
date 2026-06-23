@@ -439,10 +439,11 @@ describe("current-guard-variant-matrix", () => {
     expect(deriveVariantStatus({ ...row, payoffRatio: 0.2 }, infra).status).not.toBe("STABLE_CANDIDATE");
   });
 
-  // [DDBLK] A lane that clears every STABLE gate EXCEPT drawdown must land in WATCHABLE *with the
-  // drawdown reason surfaced* — previously it fell through with an EMPTY blocker list, so the
-  // operator could not see why a freshValid≥100 lane refused to advance.
-  it("[DDBLK] WATCHABLE lane blocked only by drawdown surfaces the drawdown blocker (no silent stall)", () => {
+  // [DDBLK] Scaled drawdown cap = max(5R, 0.3 × cumulative net R). A PROVEN lane (banked +36R)
+  // tolerates a proportionally larger drawdown so it advances to STABLE; a lane that exceeds even the
+  // scaled cap stays WATCHABLE *with the drawdown reason surfaced* (no silent stall, empty-blocker bug);
+  // and the 5R floor still protects small/unproven lanes.
+  it("[DDBLK] drawdown cap scales with cumulative R; blocker is surfaced when it still binds", () => {
     const row = {
       variantId: "CG_WIDE_FAST_SHORT", label: "x", exitRule: "tp1_full", fillMode: "taker", costModel: "taker",
       total: 134, open: 0, resolved: 134, freshValid: 134, rejected: 0, noFill: 0, expired: 0, dataFailure: 0,
@@ -454,11 +455,16 @@ describe("current-guard-variant-matrix", () => {
       allThreeOosPositive: true, rolling: [],
     } as Parameters<typeof deriveVariantStatus>[0];
     const infra = { killSwitchReady: false, orderReconciliationReady: false, exchangeHealthReady: false };
-    const result = deriveVariantStatus(row, infra);
-    expect(result.status).toBe("WATCHABLE"); // drawdown 7.76 > 5 keeps it out of STABLE
-    expect(result.blockers.some((b) => b.toLowerCase().includes("drawdown"))).toBe(true);
-    // and once the drawdown is within cap, it advances to STABLE.
-    expect(deriveVariantStatus({ ...row, approxMaxDrawdownR: 3 }, infra).status).toBe("STABLE_CANDIDATE");
+    // cumulativeNetR = 0.27 × 134 = 36.2 → cap = max(5, 0.3×36.2) = 10.85R; dd 7.76 < 10.85 → STABLE.
+    expect(deriveVariantStatus(row, infra).status).toBe("STABLE_CANDIDATE");
+    // dd above even the scaled cap → WATCHABLE, and the drawdown blocker is surfaced (not empty).
+    const blocked = deriveVariantStatus({ ...row, approxMaxDrawdownR: 15 }, infra);
+    expect(blocked.status).toBe("WATCHABLE");
+    expect(blocked.blockers.some((b) => b.toLowerCase().includes("drawdown"))).toBe(true);
+    // 5R floor still binds for a marginal lane: cum = 0.06×100 = 6 → cap = max(5, 1.8) = 5; dd 6 > 5.
+    const marginal = deriveVariantStatus({ ...row, netAvgR: 0.06, freshValid: 100, approxMaxDrawdownR: 6 }, infra);
+    expect(marginal.status).toBe("WATCHABLE");
+    expect(marginal.blockers.some((b) => b.toLowerCase().includes("drawdown"))).toBe(true);
   });
 
   // 5. No-fib500 rejects and counts.
