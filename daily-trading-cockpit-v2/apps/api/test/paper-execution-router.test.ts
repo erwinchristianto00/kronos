@@ -1025,6 +1025,74 @@ describe("paper-execution-router", () => {
     expect(store.all.find((o) => o.paperOrderId === "old-mid")!.paperStatus).toBe("PAPER_SUBMITTED");
   });
 
+  it("[RESLV-paper] recently checked unresolved orders rotate behind untouched historical exits", async () => {
+    const dir = tmpDir();
+    const store = new PaperExecutionRouterStore(dir);
+    store.ensurePaperStartAt(new Date(Date.now() - 60_000).toISOString());
+    const oldIso = new Date(Date.now() - 6 * 60 * 60 * 1000).toISOString();
+    const youngIso = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+    const recentlyCheckedIso = new Date().toISOString();
+    store.add(
+      makePaperOrder({
+        paperOrderId: "old-rechecked-mid",
+        dedupeKey: "old-rechecked-mid:lane",
+        sourceObservationId: "obs-old-rechecked-mid",
+        openedAt: oldIso,
+        createdAt: oldIso,
+        updatedAt: recentlyCheckedIso,
+        symbol: "OLDUSDT",
+        direction: "SHORT",
+        entryPrice: 100,
+        stopLoss: 103,
+        takeProfitLevels: [96],
+        paperStatus: "PAPER_SUBMITTED",
+      }),
+    );
+    store.add(
+      makePaperOrder({
+        paperOrderId: "young-historical-tp",
+        dedupeKey: "young-historical-tp:lane",
+        sourceObservationId: "obs-young-historical-tp",
+        openedAt: youngIso,
+        createdAt: youngIso,
+        updatedAt: youngIso,
+        symbol: "WINUSDT",
+        direction: "SHORT",
+        entryPrice: 100,
+        stopLoss: 103,
+        takeProfitLevels: [96],
+        paperStatus: "CREATED",
+      }),
+    );
+    const exactFetchSymbols: string[] = [];
+    const mockBinance: PaperResolverClient = {
+      getKlines: async (symbol, interval, opts) => {
+        if (interval === "1m") return [];
+        if (opts.limit <= 3) {
+          return [[opts.endTime - 300_000, "0", "101", "99", "100", "0", opts.endTime] as PaperKlineTuple];
+        }
+        exactFetchSymbols.push(symbol);
+        const signalMs = opts.startTime + 300_000;
+        if (symbol === "WINUSDT") {
+          return [
+            [signalMs - 300_000, "0", "100.2", "99.9", "100", "0", signalMs] as PaperKlineTuple,
+            [signalMs, "0", "100.5", "95.5", "96", "0", signalMs + 300_000] as PaperKlineTuple,
+          ];
+        }
+        return [
+          [signalMs - 300_000, "0", "100.5", "99.5", "100", "0", signalMs] as PaperKlineTuple,
+          [signalMs, "0", "101", "99", "100", "0", signalMs + 300_000] as PaperKlineTuple,
+        ];
+      },
+    };
+
+    await resolvePaperOrders(store, mockBinance, undefined, { maxOrders: 1 });
+
+    expect(exactFetchSymbols).toEqual(["WINUSDT"]);
+    expect(store.all.find((o) => o.paperOrderId === "young-historical-tp")!.paperStatus).toBe("PAPER_CLOSED_WIN");
+    expect(store.all.find((o) => o.paperOrderId === "old-rechecked-mid")!.paperStatus).toBe("PAPER_SUBMITTED");
+  });
+
   // [24a] scaleout_tp1_trail resolves via the canonical engine — banks 0.5R partial, NOT tp1_full.
   it("[24a] scaleout exit resolves to blended ~0.5*reward (not collapsed to tp1_full)", async () => {
     const dir = tmpDir();

@@ -1551,20 +1551,31 @@ export async function resolvePaperOrders(
     processableOrders.push(order);
   }
 
-  const atExitNow = Number.isFinite(maxOrders) && processableOrders.length > maxOrders
+  const atExitNow = processableOrders.length > 0
     ? await findOrdersAtExitNow(processableOrders, binanceClient, nowMs)
     : new Set<string>();
   const rankedOrders = processableOrders
     .map((order) => {
       const openedAtMs = paperOrderOpenedAtMs(order, nowMs);
+      const updatedAtMs = new Date(order.updatedAt).getTime();
       const rank = nowMs - openedAtMs >= maxHoldMsForOrder(order)
         ? 0
         : atExitNow.has(order.paperOrderId)
           ? 1
           : 2;
-      return { order, openedAtMs, rank };
+      return {
+        order,
+        openedAtMs,
+        lastCheckedAtMs: Number.isFinite(updatedAtMs) ? updatedAtMs : openedAtMs,
+        rank,
+      };
     })
-    .sort((a, b) => a.rank - b.rank || a.openedAtMs - b.openedAtMs);
+    .sort((a, b) => {
+      if (a.rank !== b.rank) return a.rank - b.rank;
+      const aSortMs = a.rank === 2 ? a.lastCheckedAtMs : a.openedAtMs;
+      const bSortMs = b.rank === 2 ? b.lastCheckedAtMs : b.openedAtMs;
+      return aSortMs - bSortMs || a.openedAtMs - b.openedAtMs;
+    });
 
   for (const item of rankedOrders) {
     const order = item.order;
