@@ -19,12 +19,32 @@ export interface KillSwitchControl {
   riskIfMissing: string;
 }
 
+/** v1 live inputs from the live-execution engine config/state (READ-ONLY — reading these does NOT
+ *  arm, activate, or flatten anything). The engine already ENFORCES these controls (kill() flattens
+ *  reduce-only + disarms; reconcile-mismatch + error-streak auto-disarm); this gate only reports
+ *  whether they are wired AND configured to REAL thresholds (the VPS sets limits to 999999 = off). */
+export interface KillSwitchLiveInputs {
+  engineEnabled: boolean;
+  dailyMaxLossUsd: number | null;
+  maxDrawdownUsd: number | null;
+  maxConsecutiveLosses: number | null;
+}
+/** A configured limit ≥ this is treated as OFF (the operator parks limits at 999999 = "biarin dulu"). */
+export const KILL_SWITCH_OFF_SENTINEL = Number(process.env.KILL_SWITCH_OFF_SENTINEL) || 999999;
+
 export interface KillSwitchReadinessReport {
   reportOnly: true;
   module: typeof KILL_SWITCH_READINESS_MODULE;
   computedAt: string;
-  implemented: false;
-  ready: false;
+  implemented: boolean;
+  /** v1 gate: true only when the engine is enabled AND the CRITICAL capital-protection limits
+   *  (daily loss, drawdown, consecutive losses) are set to REAL active values + the safety machinery
+   *  (manual kill, error-streak + reconcile-mismatch auto-disarm) is wired. The execution-quality
+   *  stops (spread/slippage/volatility/stale-data spikes) are advisory and do NOT block v1 ready.
+   *  ANDed with exchangeHealth + orderReconciliation in infraReady, and infraReady is itself ANDed
+   *  with !liveBlocked — so this can NEVER enable live trading on its own. false without live inputs. */
+  ready: boolean;
+  readyReasons: string[];
   controls: KillSwitchControl[];
   missingControls: string[]; // names of unimplemented controls
   summary: string;
@@ -95,21 +115,59 @@ const CONTROLS: ReadonlyArray<Omit<KillSwitchControl, "implemented">> = [
 
 export function buildKillSwitchReadinessReport(
   capturedAt?: string,
+  live?: KillSwitchLiveInputs,
 ): KillSwitchReadinessReport {
   const computedAt = capturedAt ?? new Date().toISOString();
+  const limitActive = (v: number | null | undefined): boolean =>
+    typeof v === "number" && Number.isFinite(v) && v > 0 && v < KILL_SWITCH_OFF_SENTINEL;
+  const en = !!live && live.engineEnabled;
+  const dailyOk = en && limitActive(live!.dailyMaxLossUsd);
+  const drawdownOk = en && limitActive(live!.maxDrawdownUsd);
+  const streakOk = en && typeof live!.maxConsecutiveLosses === "number" && live!.maxConsecutiveLosses > 0 && live!.maxConsecutiveLosses < 1000;
+
+  // Map each spec control to its real engine state. The engine ENFORCES the first six (config limits
+  // + hardcoded auto-disarm/manual-kill); the execution-quality stops are not yet wired in the engine.
+  const implementedByName: Record<string, boolean> = {
+    daily_max_loss_limit: dailyOk,
+    max_drawdown_stop: drawdownOk,
+    max_consecutive_losses: streakOk,
+    exchange_error_stop: en, // engine auto-disarms on error streak
+    manual_emergency_stop: en, // engine.kill() flattens + disarms
+    auto_disable_on_reconciliation_mismatch: en, // engine auto-disarms on ledger mismatch
+    spread_spike_stop: false,
+    slippage_spike_stop: false,
+    abnormal_volatility_stop: false,
+    stale_data_stop: false,
+  };
   const controls: KillSwitchControl[] = CONTROLS.map((c) => ({
     ...c,
-    implemented: false,
+    implemented: implementedByName[c.name] ?? false,
   }));
   const missingControls = controls.filter((c) => !c.implemented).map((c) => c.name);
-  const summary = `Kill switch NOT implemented. ${missingControls.length}/${controls.length} controls missing. Required before any micro-pilot.`;
+
+  // v1 ready: engine enabled + critical capital-protection limits active + safety machinery wired.
+  const readyReasons: string[] = [];
+  if (!live) readyReasons.push("no live engine config (report-only spec mode)");
+  else {
+    if (!en) readyReasons.push("live engine not enabled");
+    if (!dailyOk) readyReasons.push("daily-max-loss limit OFF (set LIVE_DAILY_MAX_LOSS_USD to a real value)");
+    if (!drawdownOk) readyReasons.push("max-drawdown limit OFF (set LIVE_MAX_DRAWDOWN_USD to a real value)");
+    if (!streakOk) readyReasons.push("max-consecutive-losses limit not set");
+  }
+  const ready = readyReasons.length === 0 && !!live;
+  const implemented = controls.every((c) => c.implemented);
+
+  const summary = ready
+    ? `Kill switch v1 READY: engine enabled, daily-loss/drawdown/streak limits active, manual-kill + auto-disarm wired (${controls.filter((c) => c.implemented).length}/${controls.length} controls; execution-quality stops advisory).`
+    : `Kill switch NOT ready: ${readyReasons.join("; ") || `${missingControls.length}/${controls.length} controls missing`}.`;
 
   return {
     reportOnly: true,
     module: KILL_SWITCH_READINESS_MODULE,
     computedAt,
-    implemented: false,
-    ready: false,
+    implemented,
+    ready,
+    readyReasons,
     controls,
     missingControls,
     summary,

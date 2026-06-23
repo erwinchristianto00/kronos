@@ -49,6 +49,10 @@ import {
   buildOrderReconciliationReadinessReport,
   type OrderReconciliationReadinessReport,
 } from "../lib/order-reconciliation-readiness.js";
+import {
+  buildKillSwitchReadinessReport,
+  type KillSwitchReadinessReport,
+} from "../lib/micro-pilot-kill-switch-readiness.js";
 import { buildOperatorBrief } from "../lib/operator-brief.js";
 import { buildAdaptiveLaneRouterReport } from "../lib/adaptive-lane-router.js";
 import {
@@ -1423,7 +1427,12 @@ export async function registerShadowRoutes(
       // READS the live engine's in-memory getStatus() (sync, no I/O) — the engine already reconciles
       // open intents vs the exchange each tick. ready only when the reconcile loop ran recently with
       // 0 drift/errors. ANDed with killSwitch (still false) → infraReady STAYS false → non-breaking.
+      // ── infraReady gates 2/3 + 3/3: order-reconciliation + kill-switch readiness (v1, report-only) ─
+      // Both READ the live engine's in-memory getStatus() (sync, no I/O — reading does NOT arm,
+      // activate, or flatten anything). ANDed with exchangeHealth in infraReady, which is itself
+      // ANDed with !liveBlocked → infraReady STAYS false → non-breaking.
       let orderReconciliationReadiness: OrderReconciliationReadinessReport | undefined;
+      let killSwitchReadiness: KillSwitchReadinessReport | undefined;
       try {
         const _liveStatus = opts.liveEngineGetter?.()?.getStatus() as
           | {
@@ -1431,6 +1440,7 @@ export async function registerShadowRoutes(
               health?: { lastTickAt?: string | number | null; lastTickError?: string | null };
               reconcileIssues?: unknown[];
               openIntents?: unknown[];
+              limits?: { dailyMaxLossUsd?: number; maxDrawdownUsd?: number; maxConsecutiveLosses?: number };
             }
           | null
           | undefined;
@@ -1444,13 +1454,20 @@ export async function registerShadowRoutes(
             lastTickError: _liveStatus.health?.lastTickError ?? null,
             openIntentCount: Array.isArray(_liveStatus.openIntents) ? _liveStatus.openIntents.length : 0,
           });
+          killSwitchReadiness = buildKillSwitchReadinessReport(generatedAt, {
+            engineEnabled: _liveStatus.enabled === true,
+            dailyMaxLossUsd: _liveStatus.limits?.dailyMaxLossUsd ?? null,
+            maxDrawdownUsd: _liveStatus.limits?.maxDrawdownUsd ?? null,
+            maxConsecutiveLosses: _liveStatus.limits?.maxConsecutiveLosses ?? null,
+          });
         }
-      } catch { /* order-reconciliation readiness must never break the brief */ }
+      } catch { /* live-readiness gates must never break the brief */ }
       const gateReport = buildLiveTradingGateReport({
         postCutoverReport,
         currentGuardVariantMatrixReport: variantMatrixReport,
         exchangeHealthReadiness,
         orderReconciliationReadiness,
+        killSwitchReadiness,
       });
       // ── ?paper=1: bounded paper admission + resolver run ─────────────────
       // When paper=1 is supplied and a Binance client is available, run the
