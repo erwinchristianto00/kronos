@@ -12,6 +12,7 @@ import {
   getCurrentGuardVariantMatrixStore,
   _resetCurrentGuardVariantMatrixStoreForTests,
   deriveVariantGeometry,
+  deriveVariantStatus,
   walkVariantPath,
   buildVariantMatrixObservationsForSignal,
   mirrorVariantMatrixSignals,
@@ -386,6 +387,24 @@ describe("current-guard-variant-matrix", () => {
     // Direction-agnostic: it must derive far-TP on LONG signals too (not longOnly-rejected).
     const geoLong = deriveVariantGeometry(makeSignal({ direction: "LONG", stopLoss: 98, tp1: 101 }), def);
     expect(geoLong.kind).toBe("ok");
+  });
+
+  it("[PROMO] a proven high-WR low-payoff (~0.4) lane reaches STABLE; the 0.5 payoff floor used to bench it", () => {
+    const row = {
+      variantId: "CG_WIDE_FAST_SHORT", label: "x", exitRule: "tp1_full", fillMode: "taker", costModel: "taker",
+      total: 130, open: 0, resolved: 130, freshValid: 110, rejected: 0, noFill: 0, expired: 0, dataFailure: 0,
+      netAvgR: 0.15, grossAvgR: 0.2, pf: 1.8, wr: 0.8, avgWinR: 0.4, avgLossR: -1,
+      payoffRatio: 0.4, breakEvenWR: 1 / 3, actualWR: 0.8, avgCostR: 0.1, costDragR: 0.1,
+      noFillRate: 0, expiredRate: 0, avgHoldingMinutes: 60, approxMaxDrawdownR: 1, maxAdverseStreak: 1,
+      topSymbolPnlShare: 0.2, plus10bpsNetAvgR: 0.1, plus10bpsStillPositive: true,
+      calendarDays: 6, distinctRegimes: 2, byRegime: [], byEntryVariant: [], oosThirds: null,
+      allThreeOosPositive: true, rolling: [],
+    } as Parameters<typeof deriveVariantStatus>[0];
+    const infra = { killSwitchReady: false, orderReconciliationReady: false, exchangeHealthReady: false };
+    // payoff 0.4 (win ~0.5R / lose ~1R, 80% WR) clears net/PF/OOS/+10bps — must now reach STABLE.
+    expect(deriveVariantStatus(row, infra).status).toBe("STABLE_CANDIDATE");
+    // …but a genuinely degenerate payoff is still vetoed (isolates the floor at 0.3).
+    expect(deriveVariantStatus({ ...row, payoffRatio: 0.2 }, infra).status).not.toBe("STABLE_CANDIDATE");
   });
 
   // 5. No-fib500 rejects and counts.

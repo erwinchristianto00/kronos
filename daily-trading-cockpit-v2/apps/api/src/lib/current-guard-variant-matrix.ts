@@ -158,19 +158,18 @@ export const PROMOTION_MIN_FRESH = 200;
 export const NET_STRONG_R = 0.05;
 export const PF_STRONG = 1.2;
 export const PF_FLOOR = 1.0;
-export const PAYOFF_WATCH = 0.5;
+// Payoff floor for WATCHABLE/STABLE/PROMOTION. 2026-06-23: lowered 0.5 → 0.3 after auditing
+// "why nothing promotes". The fast 0.5R exit lanes — the bot's actual money-makers (CG_WIDE_FAST_SHORT
+// net +0.18R/PF 2.0, CG_TIGHT_FAST_05 net +0.16R/PF 1.8, all OOS thirds positive, +10bps positive) —
+// run payoff ~0.38-0.41 in reality (win ~0.5R, lose ~1R, but win ~80%), NOT the ~0.53 the prior comment
+// guessed. So a 0.5 floor benched the BEST edges at the FIRST rung (WATCHABLE) → nothing could ever
+// climb the ladder. The other gates (net>NET_STRONG_R, PF>PF_STRONG, all-three-OOS-thirds positive,
+// +10bps, drawdown, top-symbol share) already prove the edge is real and not high-WR luck, so the
+// payoff SHAPE must not veto a proven high-WR edge. 0.3 still rejects truly degenerate shapes (with
+// PF>1.2 that implies WR>~77%). Only affects lane STATUS; headline/live stays gated by liveBlocked +
+// infra readiness. Env-tunable.
+export const PAYOFF_WATCH = Number(process.env.PAYOFF_WATCH_FLOOR) || 0.3;
 export const PAYOFF_STABLE = 0.75;
-// Payoff floor to AUTHORIZE a lane (STABLE_CANDIDATE / PROMOTION_CANDIDATE). Was
-// PAYOFF_STABLE (0.75), which structurally rejected high-win-rate / low-payoff
-// scalp edges — e.g. the fast 0.5R variants run ~0.53 payoff with 81-88% WR and
-// PF 2-8, genuinely net-positive, but a 0.75 floor benches them forever regardless
-// of sample. The other STABLE gates (net>NET_STRONG_R, PF>PF_STRONG, all-three-OOS-
-// thirds positive, +10bps, drawdown, top-symbol share) over a ≥100-sample ALREADY
-// prove the edge is real and not high-WR luck, so the payoff SHAPE shouldn't veto a
-// proven edge. Lowered to PAYOFF_WATCH (0.5) — "trade the edge you proved". NOTE:
-// this only affects lane STATUS; headline/live admission stays gated by liveBlocked
-// (hard invariant) + infra readiness, so this is prep, not an immediate unblock.
-// Env-tunable.
 export const PAYOFF_AUTHORIZE = Number(process.env.PAYOFF_AUTHORIZE_FLOOR) || PAYOFF_WATCH;
 export const MAX_DRAWDOWN_R_LIMIT = 5;
 export const MAX_TOP_SYMBOL_SHARE = 0.4;
@@ -1675,7 +1674,7 @@ function roundTripBpsForCostModel(costModel: VariantFillMode): number {
   return costModel === "maker_limit" ? MAKER_ROUNDTRIP_BPS : TAKER_ROUNDTRIP_BPS;
 }
 
-function deriveVariantStatus(
+export function deriveVariantStatus(
   row: Omit<CurrentGuardVariantMatrixRow, "status" | "statusReason" | "blockers" | "cautions">,
   infra: { killSwitchReady: boolean; orderReconciliationReady: boolean; exchangeHealthReady: boolean },
 ): { status: VariantMatrixStatus; statusReason: string; blockers: string[]; cautions: string[] } {
