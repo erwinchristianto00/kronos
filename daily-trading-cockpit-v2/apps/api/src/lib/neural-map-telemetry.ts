@@ -78,6 +78,10 @@ export interface NeuralMapLane {
   payoffRatio: number | null;
   plus10bpsStillPositive: boolean | null;
   allThreeOosPositive: boolean | null;
+  /** Per-third chronological OOS net avg R [oldest, middle, newest] — the breakdown behind
+   *  allThreeOosPositive, so the promotion table shows WHICH third drags a lane below STABLE.
+   *  null until a lane has >=3 freshValid obs. */
+  oosThirds: [number | null, number | null, number | null] | null;
   approxMaxDrawdownR: number | null;
   topSymbolPnlShare: number | null;
   calendarDays: number | null;
@@ -1041,6 +1045,9 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
       payoffRatio: row?.payoffRatio ?? null,
       plus10bpsStillPositive: row?.plus10bpsStillPositive ?? null,
       allThreeOosPositive: row?.allThreeOosPositive ?? null,
+      oosThirds: row?.oosThirds
+        ? [row.oosThirds[0]?.netAvgR ?? null, row.oosThirds[1]?.netAvgR ?? null, row.oosThirds[2]?.netAvgR ?? null]
+        : null,
       approxMaxDrawdownR: row?.approxMaxDrawdownR ?? null,
       topSymbolPnlShare: row?.topSymbolPnlShare ?? null,
       calendarDays: row?.calendarDays ?? null,

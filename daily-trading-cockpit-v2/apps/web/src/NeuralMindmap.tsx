@@ -54,6 +54,7 @@ interface NeuralLane {
   payoffRatio: number | null;
   plus10bpsStillPositive: boolean | null;
   allThreeOosPositive: boolean | null;
+  oosThirds: [number | null, number | null, number | null] | null;
   approxMaxDrawdownR: number | null;
   topSymbolPnlShare: number | null;
   calendarDays: number | null;
@@ -499,6 +500,10 @@ const DIAGNOSIS_LABELS: Record<NeuralDiagnosisCategory, string> = {
 const STABLE_MIN_FRESH = 100;
 const PROMOTION_MIN_FRESH = 200;
 const HEADLINE_PF_FLOOR = 1.2;
+// Mirrors the backend gate floors (current-guard-variant-matrix.ts PAYOFF_WATCH/PAYOFF_AUTHORIZE,
+// default 0.3). It was hardcoded 0.75 here — stricter than the real gate — so lanes the backend
+// promotes showed a FALSE red "payoff" blocker. Keep in sync with the backend default.
+const PAYOFF_FLOOR = 0.3;
 
 function stageLabel(stage: MilestoneStage): string {
   if (stage === 'PROMOTION_CANDIDATE') return 'Promotion candidate';
@@ -584,6 +589,14 @@ function pctShare(value: number | null): string {
   return `${(value * 100).toFixed(1)}%`;
 }
 
+// Renders the chronological OOS thirds [oldest / middle / newest] so the promotion table shows
+// WHICH third drags a lane below STABLE — e.g. "all OOS thirds positive (+0.07 / −0.03 / +0.06)".
+function oosThirdsLabel(thirds: NeuralLane['oosThirds']): string {
+  if (!thirds) return '';
+  const parts = thirds.map((v) => (v === null ? '—' : fmtR(v)));
+  return ` (${parts.join(' / ')})`;
+}
+
 function stageProgress(lane: NeuralLane): StageProgress {
   const freshValid = lane.oosFreshValid ?? lane.closed;
   const telemetryStatus = lane.status.toUpperCase();
@@ -609,10 +622,10 @@ function stageProgress(lane: NeuralLane): StageProgress {
   if (telemetryStatus.includes('STABLE_CANDIDATE')) {
     const requirements = [
       { label: `fresh-valid ${freshValid}/${PROMOTION_MIN_FRESH}`, met: freshValid >= PROMOTION_MIN_FRESH, progress: ratioProgress(freshValid, PROMOTION_MIN_FRESH) },
-      { label: `all OOS thirds positive`, met: lane.allThreeOosPositive === true, progress: booleanProgress(lane.allThreeOosPositive) },
+      { label: `all OOS thirds positive${oosThirdsLabel(lane.oosThirds)}`, met: lane.allThreeOosPositive === true, progress: booleanProgress(lane.allThreeOosPositive) },
       { label: `netAvgR > 0.05`, met: (lane.netAvgR ?? Number.NEGATIVE_INFINITY) > 0.05, progress: thresholdProgress(lane.netAvgR, 0.05, 'gt') },
       { label: `PF > ${HEADLINE_PF_FLOOR}`, met: (lane.pf ?? Number.NEGATIVE_INFINITY) > HEADLINE_PF_FLOOR, progress: thresholdProgress(lane.pf, HEADLINE_PF_FLOOR, 'gt') },
-      { label: `payoff >= 0.75`, met: (lane.payoffRatio ?? Number.NEGATIVE_INFINITY) >= 0.75, progress: thresholdProgress(lane.payoffRatio, 0.75, 'gte') },
+      { label: `payoff >= ${PAYOFF_FLOOR}`, met: (lane.payoffRatio ?? Number.NEGATIVE_INFINITY) >= PAYOFF_FLOOR, progress: thresholdProgress(lane.payoffRatio, PAYOFF_FLOOR, 'gte') },
       { label: `drawdown <= 5R`, met: lane.approxMaxDrawdownR !== null && lane.approxMaxDrawdownR <= 5, progress: inverseThresholdProgress(lane.approxMaxDrawdownR, 5) },
       { label: `top-symbol share <= 40%`, met: lane.topSymbolPnlShare !== null && lane.topSymbolPnlShare <= 0.4, progress: inverseThresholdProgress(lane.topSymbolPnlShare, 0.4) },
       { label: `calendar days >= 5`, met: (lane.calendarDays ?? 0) >= 5, progress: ratioProgress(lane.calendarDays, 5) },
@@ -630,10 +643,10 @@ function stageProgress(lane: NeuralLane): StageProgress {
   if (telemetryStatus.includes('WATCHABLE')) {
     const requirements = [
       { label: `fresh-valid ${freshValid}/${STABLE_MIN_FRESH}`, met: freshValid >= STABLE_MIN_FRESH, progress: ratioProgress(freshValid, STABLE_MIN_FRESH) },
-      { label: `all OOS thirds positive`, met: lane.allThreeOosPositive === true, progress: booleanProgress(lane.allThreeOosPositive) },
+      { label: `all OOS thirds positive${oosThirdsLabel(lane.oosThirds)}`, met: lane.allThreeOosPositive === true, progress: booleanProgress(lane.allThreeOosPositive) },
       { label: `netAvgR > 0.05`, met: (lane.netAvgR ?? Number.NEGATIVE_INFINITY) > 0.05, progress: thresholdProgress(lane.netAvgR, 0.05, 'gt') },
       { label: `PF > ${HEADLINE_PF_FLOOR}`, met: (lane.pf ?? Number.NEGATIVE_INFINITY) > HEADLINE_PF_FLOOR, progress: thresholdProgress(lane.pf, HEADLINE_PF_FLOOR, 'gt') },
-      { label: `payoff >= 0.75`, met: (lane.payoffRatio ?? Number.NEGATIVE_INFINITY) >= 0.75, progress: thresholdProgress(lane.payoffRatio, 0.75, 'gte') },
+      { label: `payoff >= ${PAYOFF_FLOOR}`, met: (lane.payoffRatio ?? Number.NEGATIVE_INFINITY) >= PAYOFF_FLOOR, progress: thresholdProgress(lane.payoffRatio, PAYOFF_FLOOR, 'gte') },
       { label: `drawdown <= 5R`, met: lane.approxMaxDrawdownR !== null && lane.approxMaxDrawdownR <= 5, progress: inverseThresholdProgress(lane.approxMaxDrawdownR, 5) },
       { label: `top-symbol share <= 40%`, met: lane.topSymbolPnlShare !== null && lane.topSymbolPnlShare <= 0.4, progress: inverseThresholdProgress(lane.topSymbolPnlShare, 0.4) },
     ];

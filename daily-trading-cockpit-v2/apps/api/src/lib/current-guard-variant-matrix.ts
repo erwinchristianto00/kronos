@@ -74,7 +74,14 @@ export type VariantMatrixVariantId =
   // MFE-giveback exit (operator-requested): baseline geometry, but lock in a faded winner by
   // exiting on a retrace from peak favorable. Direct A/B vs the tp1_full baseline on identical
   // signals; direction-agnostic (the leak hits both books).
-  | "CG_MFE_GIVEBACK";
+  | "CG_MFE_GIVEBACK"
+  // "Sentil" lanes (2026-06-23): the OOS-thirds audit showed baseline/maker just barely miss
+  // all-three-positive (one tiny-negative middle third in the OOS2 whipsaw) while the fast 0.5R
+  // lanes pass. These take the EXACT baseline/maker entry+stop and change ONLY the TP to a fast
+  // 0.5R (stopFloorBps:1 is a non-binding sentinel) — isolating TP placement as the single
+  // variable, to test whether banking before the bounce flips them all-OOS-positive.
+  | "CG_BASELINE_FAST_05"
+  | "CG_MAKER_FAST_05";
 
 export const BULL_TREND_VARIANT_ID = "BL_TREND_R15_STOP200_FULL" as const;
 export const BULL_SCALEOUT_VARIANT_ID = "BL_TREND_SCALEOUT_STOP200" as const;
@@ -428,6 +435,44 @@ export const VARIANT_MATRIX_DEFINITIONS: readonly VariantMatrixVariantDefinition
       "peak*(1-MFE_GIVEBACK_FRAC) of favorable — converting 'ran up to a high MFE then round-tripped' " +
       "into a banked partial gain. The far TP gives the giveback room to operate (baseline ~1R TP made " +
       "it inert). Direction-agnostic; A/B vs the let-it-run wide lanes. Prove OOS before promotion.",
+  },
+  {
+    // "Sentil" #1 (2026-06-23): CG_BASELINE_CURRENT with ONLY the TP moved to a fast 0.5R. The
+    // OOS-thirds audit showed baseline's sole negative third is OOS2 (-0.026, the mid-window
+    // whipsaw) — the fast lanes turned that same window strongly positive by banking before the
+    // bounce. stopFloorBps:1 is a NON-BINDING sentinel: targetStopBps = max(rawStop, 1) = rawStop
+    // (raw stops are always >1bps), so the entry AND stop stay identical to CG_BASELINE_CURRENT —
+    // the only changed variable is TP placement (tiny raw tp1 → 0.5R). A clean isolation of "is
+    // baseline's miss purely a TP-placement problem?". Direction-agnostic; prove OOS before promotion.
+    id: "CG_BASELINE_FAST_05",
+    label: "Baseline entry + fast 0.5R TP (raw stop)",
+    exitRule: "tp1_full",
+    fillMode: "taker",
+    costModel: "taker",
+    stopFloorBps: 1,
+    tpRewardMultiple: 0.5,
+    description:
+      "Sentil of CG_BASELINE_CURRENT: identical raw entry+stop (stopFloorBps:1 never binds), TP moved " +
+      "to a fast 0.5R full exit. Isolates TP placement as the single variable to test whether banking " +
+      "before the OOS2 mid-window bounce flips baseline to all-three-OOS-positive.",
+  },
+  {
+    // "Sentil" #2 (2026-06-23): CG_MAKER_LIMIT_SIM with the same fast 0.5R TP. Maker posted the best
+    // raw net (+0.065) thanks to the lower maker cost; pairing that cheap fill with the proven
+    // fast-bank exit is the most promising combo — capture the OOS2 down-move cheaply and bank before
+    // the revert. Same non-binding stopFloorBps:1 sentinel keeps the raw stop; only fill/cost (maker)
+    // and TP (0.5R) differ from CG_BASELINE_FAST_05. Direction-agnostic; prove OOS before promotion.
+    id: "CG_MAKER_FAST_05",
+    label: "Maker entry + fast 0.5R TP (raw stop, maker cost)",
+    exitRule: "tp1_full",
+    fillMode: "maker_limit",
+    costModel: "maker_limit",
+    stopFloorBps: 1,
+    tpRewardMultiple: 0.5,
+    description:
+      "Sentil of CG_MAKER_LIMIT_SIM: post-only maker fill (no-fill risk) + maker cost, raw entry+stop " +
+      "(stopFloorBps:1 never binds), TP moved to a fast 0.5R full exit. Tests the cheapest-cost + " +
+      "fastest-bank combo — the most promising path to a robustly positive short edge.",
   },
 ];
 
@@ -1754,6 +1799,12 @@ export function deriveVariantStatus(
     if (row.freshValid < STABLE_MIN_FRESH) blockers.push(`freshValid ${row.freshValid} < ${STABLE_MIN_FRESH} for stable`);
     if (!row.allThreeOosPositive) blockers.push("not all OOS thirds positive");
     if (payoff < PAYOFF_AUTHORIZE) blockers.push(`payoff ${payoff.toFixed(2)} < ${PAYOFF_AUTHORIZE}`);
+    // Surface the STABLE-gate fails that DON'T appear in this branch's `if` condition. Without this a
+    // lane that already clears freshValid≥100 + OOS + payoff but is held back ONLY by drawdown shows
+    // WATCHABLE with an EMPTY blocker list — the operator can't see why it won't advance to STABLE.
+    if (row.freshValid >= STABLE_MIN_FRESH && !drawdownOk && dd !== null) {
+      blockers.push(`drawdown ${dd.toFixed(1)}R > ${MAX_DRAWDOWN_R_LIMIT}R cap (sole gate left below STABLE)`);
+    }
     return {
       status: "WATCHABLE",
       statusReason: `freshValid=${row.freshValid}, net=${net.toFixed(3)}R PF=${pf.toFixed(2)} payoff=${payoff.toFixed(2)} — watchable`,

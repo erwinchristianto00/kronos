@@ -189,6 +189,38 @@ describe("current-guard-variant-matrix", () => {
     expect(deriveVariantGeometry(shortSig, defOf("CG_BE_AFTER_05")).kind).toBe("ok");
   });
 
+  // [SNTL] CG_BASELINE_FAST_05 / CG_MAKER_FAST_05: raw stop preserved (floor 1 never binds),
+  // only the TP moves to 0.5R. Baseline=taker, maker=cheaper maker cost. Both direction-agnostic.
+  it("[SNTL] baseline/maker sentil lanes keep the RAW stop and move only the TP to 0.5R", () => {
+    const blFast = deriveVariantGeometry(makeSignal(), defOf("CG_BASELINE_FAST_05"));
+    const baseline = deriveVariantGeometry(makeSignal(), defOf(BASELINE_VARIANT_ID));
+    expect(blFast.kind).toBe("ok");
+    expect(baseline.kind).toBe("ok");
+    if (blFast.kind !== "ok" || baseline.kind !== "ok") throw new Error("expected ok");
+    // raw stop is IDENTICAL to baseline (floor 1 is non-binding); only the TP changes.
+    expect(blFast.stopLoss).toBe(baseline.stopLoss); // 98, unchanged
+    expect(blFast.stopDistanceBps).toBeCloseTo(200, 6);
+    expect((blFast.takeProfitLevels[0] - 100) / (100 - blFast.stopLoss)).toBeCloseTo(0.5, 6);
+    expect(blFast.costR).toBeCloseTo(TAKER_ROUNDTRIP_BPS / 200, 6); // same taker cost as baseline
+
+    // maker sentil: same geometry, but the maker cost model is cheaper than taker.
+    const mkFast = deriveVariantGeometry(makeSignal(), defOf("CG_MAKER_FAST_05"));
+    expect(mkFast.kind).toBe("ok");
+    if (mkFast.kind !== "ok") throw new Error("expected ok");
+    expect(mkFast.stopLoss).toBe(baseline.stopLoss);
+    expect((mkFast.takeProfitLevels[0] - 100) / (100 - mkFast.stopLoss)).toBeCloseTo(0.5, 6);
+    expect(mkFast.costR).toBeLessThan(blFast.costR); // maker rebate < taker fee
+    expect(defOf("CG_MAKER_FAST_05").fillMode).toBe("maker_limit");
+
+    // direction-agnostic: SHORT also derives, raw stop preserved.
+    const shortSig = makeSignal({ direction: "SHORT", stopLoss: 102, tp1: 96 });
+    const blShort = deriveVariantGeometry(shortSig, defOf("CG_BASELINE_FAST_05"));
+    expect(blShort.kind).toBe("ok");
+    if (blShort.kind !== "ok") throw new Error("expected ok");
+    expect(blShort.stopLoss).toBe(102); // raw short stop unchanged
+    expect((100 - blShort.takeProfitLevels[0]) / (blShort.stopLoss - 100)).toBeCloseTo(0.5, 6);
+  });
+
   // [LG-3] Long-only research lanes reject SHORT signals.
   it("[LG-3] LG_* lanes are long-only (rejected on SHORT)", () => {
     const shortSig = makeSignal({ direction: "SHORT", stopLoss: 102, tp1: 96 });
@@ -405,6 +437,28 @@ describe("current-guard-variant-matrix", () => {
     expect(deriveVariantStatus(row, infra).status).toBe("STABLE_CANDIDATE");
     // …but a genuinely degenerate payoff is still vetoed (isolates the floor at 0.3).
     expect(deriveVariantStatus({ ...row, payoffRatio: 0.2 }, infra).status).not.toBe("STABLE_CANDIDATE");
+  });
+
+  // [DDBLK] A lane that clears every STABLE gate EXCEPT drawdown must land in WATCHABLE *with the
+  // drawdown reason surfaced* — previously it fell through with an EMPTY blocker list, so the
+  // operator could not see why a freshValid≥100 lane refused to advance.
+  it("[DDBLK] WATCHABLE lane blocked only by drawdown surfaces the drawdown blocker (no silent stall)", () => {
+    const row = {
+      variantId: "CG_WIDE_FAST_SHORT", label: "x", exitRule: "tp1_full", fillMode: "taker", costModel: "taker",
+      total: 134, open: 0, resolved: 134, freshValid: 134, rejected: 0, noFill: 0, expired: 0, dataFailure: 0,
+      netAvgR: 0.27, grossAvgR: 0.3, pf: 3.2, wr: 0.8, avgWinR: 0.4, avgLossR: -1,
+      payoffRatio: 0.4, breakEvenWR: 1 / 3, actualWR: 0.8, avgCostR: 0.1, costDragR: 0.1,
+      noFillRate: 0, expiredRate: 0, avgHoldingMinutes: 60, approxMaxDrawdownR: 7.76, maxAdverseStreak: 1,
+      topSymbolPnlShare: 0.18, plus10bpsNetAvgR: 0.1, plus10bpsStillPositive: true,
+      calendarDays: 3, distinctRegimes: 3, byRegime: [], byEntryVariant: [], oosThirds: null,
+      allThreeOosPositive: true, rolling: [],
+    } as Parameters<typeof deriveVariantStatus>[0];
+    const infra = { killSwitchReady: false, orderReconciliationReady: false, exchangeHealthReady: false };
+    const result = deriveVariantStatus(row, infra);
+    expect(result.status).toBe("WATCHABLE"); // drawdown 7.76 > 5 keeps it out of STABLE
+    expect(result.blockers.some((b) => b.toLowerCase().includes("drawdown"))).toBe(true);
+    // and once the drawdown is within cap, it advances to STABLE.
+    expect(deriveVariantStatus({ ...row, approxMaxDrawdownR: 3 }, infra).status).toBe("STABLE_CANDIDATE");
   });
 
   // 5. No-fib500 rejects and counts.
