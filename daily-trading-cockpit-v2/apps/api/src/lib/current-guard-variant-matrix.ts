@@ -147,6 +147,9 @@ export const WIDE_STOP_MIN_BPS = 300; // Paper-admissible wide/trail variants re
 export const MAKER_FILL_WINDOW_CANDLES = 12; // 1h on 5m candles to get a maker fill
 const CANDLE_MS = 5 * 60 * 1000;
 const EXPIRY_MS = 7 * 24 * 60 * 60 * 1000;
+/** Max EXPIRED observations retained for the diagnostic count display; older ones are pruned from
+ *  the store each resolve pass (they feed no stat). Bounds memory after the born-stale gate. */
+const VM_MAX_EXPIRED_OBS = Number(process.env.VM_MAX_EXPIRED_OBS) || 500;
 /** Open observations older than this threshold are surfaced as "stale" in diagnostics. */
 const STALE_OPEN_WARN_MS = 72 * 60 * 60 * 1000; // 72 h
 const MFE_MAE_CAP_R = 20;
@@ -682,6 +685,26 @@ export class CurrentGuardVariantMatrixStore {
       (obs) => obs.sourceObservationKey === sourceObservationKey && obs.variantId === variantId,
     );
   }
+
+  /** Bound memory: EXPIRED observations only feed the diagnostic `expired` COUNT — never
+   *  freshValid/net/PF/OOS/drawdown/promotion. Keep the newest `maxExpired` for the count display
+   *  and drop the rest (zero measurement impact). The born-stale mirror gate prevents pruned
+   *  EXPIRED from re-appearing (their signals are openedAt>EXPIRY → skipped at mirror), so this
+   *  one-time clears the churn backlog AND bounds the store going forward. Returns count pruned. */
+  pruneExpired(maxExpired: number): number {
+    const expired = this.observations.filter((obs) => obs.status === "EXPIRED");
+    if (expired.length <= maxExpired) return 0;
+    const tsOf = (o: CurrentGuardVariantMatrixObservation) =>
+      toMs(o.resolvedAt) ?? toMs(o.updatedAt) ?? toMs(o.createdAt) ?? 0;
+    const keep = new Set(
+      expired.sort((a, b) => tsOf(b) - tsOf(a)).slice(0, maxExpired).map((o) => o.observationId),
+    );
+    const before = this.observations.length;
+    this.observations = this.observations.filter((obs) => obs.status !== "EXPIRED" || keep.has(obs.observationId));
+    const pruned = before - this.observations.length;
+    if (pruned > 0) this.save();
+    return pruned;
+  }
 }
 
 let singleton: CurrentGuardVariantMatrixStore | null = null;
@@ -965,11 +988,24 @@ export function mirrorVariantMatrixSignals(
   signals: VariantMatrixSignal[],
   store: CurrentGuardVariantMatrixStore,
   nowIso = new Date().toISOString(),
-): { mirrored: number; duplicates: number } {
+): { mirrored: number; duplicates: number; skippedStale: number } {
   let mirrored = 0;
   let duplicates = 0;
+  let skippedStale = 0;
+  const nowMs = toMs(nowIso) ?? Date.now();
   const toAdd: CurrentGuardVariantMatrixObservation[] = [];
   for (const signal of signals) {
+    // Skip BORN-STALE signals: a signal whose openedAt is already past EXPIRY_MS produces obs that
+    // the resolver's Phase-1 sweep expires WITHOUT ever walking them (openedAt>EXPIRY → marked
+    // EXPIRED, never resolved). Such obs never reach freshValid — they were pure churn (audit:
+    // 6350 obs / ~1056/day, 100% of all expiries, ~53% of the store). Gating here yields zero
+    // measurement loss (born-stale never counted) while shrinking the store, memory, and resolver
+    // load. Recent signals (≤EXPIRY_MS) still mirror + resolve normally.
+    const openedMs = toMs(signal.openedAt);
+    if (openedMs !== null && nowMs - openedMs > EXPIRY_MS) {
+      skippedStale += 1;
+      continue;
+    }
     const candidates = buildVariantMatrixObservationsForSignal(signal, nowIso);
     for (const obs of candidates) {
       if (store.hasObservation(obs.sourceObservationKey, obs.variantId)) {
@@ -986,7 +1022,7 @@ export function mirrorVariantMatrixSignals(
     }
   }
   store.addMany(toAdd);
-  return { mirrored, duplicates };
+  return { mirrored, duplicates, skippedStale };
 }
 
 // ---------------------------------------------------------------------------
@@ -1317,6 +1353,10 @@ export async function resolveVariantMatrixObservations(
       expired += staleIds.length;
       resolved += staleIds.length;
     }
+
+    // ── Phase 1b: bound memory — prune EXPIRED beyond the retain cap (feeds no stat). The born-stale
+    //    mirror gate stops new EXPIRED at the source; this clears the accumulated churn backlog. ──
+    store.pruneExpired(VM_MAX_EXPIRED_OBS);
 
     // ── Phase 2: fetch-walk the remaining young OPEN obs, OLDEST-first (the most forward candles
     //    → the best resolution yield), bounded by maxObservations / maxRuntimeMs so each run

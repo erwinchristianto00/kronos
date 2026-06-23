@@ -705,7 +705,10 @@ describe("current-guard-variant-matrix", () => {
     // openedAt = 8 days ago, comfortably past the 7-day expiry window.
     const oldMs = Date.now() - 8 * 24 * 60 * 60 * 1000;
     const signal = makeSignal({ openedAt: new Date(oldMs).toISOString() });
-    mirrorVariantMatrixSignals([signal], store, new Date().toISOString());
+    // Inject the aged obs directly (the mirror gate now skips born-stale signals at the source);
+    // this simulates an obs created fresh that has since aged past EXPIRY — the case the Phase-1
+    // sweep must still handle.
+    store.addMany(buildVariantMatrixObservationsForSignal(signal));
 
     let klineCallCount = 0;
     const trackingBinance = {
@@ -742,7 +745,9 @@ describe("current-guard-variant-matrix", () => {
       symbol: "BTCUSDT",
       openedAt: new Date(freshMs).toISOString(),
     });
-    mirrorVariantMatrixSignals([oldSignal], store, new Date().toISOString());
+    // Old obs injected directly (mirror gate skips born-stale at the source); simulates an obs that
+    // aged past EXPIRY while OPEN. Fresh obs goes through the normal mirror path (passes the gate).
+    store.addMany(buildVariantMatrixObservationsForSignal(oldSignal));
     mirrorVariantMatrixSignals([freshSignal], store, new Date().toISOString());
 
     const throwingBinance = {
@@ -812,6 +817,42 @@ describe("current-guard-variant-matrix", () => {
     // A nextAction hint must be provided when stale observations exist.
     expect(report.resolverDiagnostics.nextAction).not.toBeNull();
     expect(report.resolverDiagnostics.nextAction).toContain("resolve=1");
+  });
+
+  // [STALE-GATE] mirror SKIPS born-stale signals (openedAt past EXPIRY) — they'd only be
+  // Phase-1-expired without ever resolving (pure churn). Fresh signals still mirror.
+  it("[STALE-GATE] mirror skips born-stale signals (openedAt > EXPIRY), keeps fresh ones", () => {
+    const store = new CurrentGuardVariantMatrixStore(tmpDir());
+    const now = new Date().toISOString();
+    const stale = makeSignal({ sourceSignalId: "stale", symbol: "STALEUSDT", openedAt: new Date(Date.now() - 8 * 86400000).toISOString() });
+    const fresh = makeSignal({ sourceSignalId: "fresh", symbol: "FRESHUSDT", openedAt: new Date(Date.now() - 3600000).toISOString() });
+    const res = mirrorVariantMatrixSignals([stale, fresh], store, now);
+    expect(res.skippedStale).toBeGreaterThan(0); // the stale signal was skipped
+    expect(store.all.some((o) => o.symbol === "STALEUSDT")).toBe(false); // no born-stale obs created
+    expect(store.all.some((o) => o.symbol === "FRESHUSDT")).toBe(true); // fresh obs created
+  });
+
+  // [PRUNE-EXP] pruneExpired bounds the store — drops oldest EXPIRED beyond the cap, never touches
+  // OPEN / CLOSED (which feed the stats).
+  it("[PRUNE-EXP] pruneExpired keeps newest N EXPIRED, drops older, preserves OPEN/CLOSED", () => {
+    const store = new CurrentGuardVariantMatrixStore(tmpDir());
+    const base = buildVariantMatrixObservationsForSignal(makeSignal())[0]!;
+    const mk = (id: string, status: string, ts: string) =>
+      ({ ...base, observationId: id, sourceObservationKey: id, status, resolvedAt: ts, openedAt: ts } as typeof base);
+    store.addMany([
+      mk("exp-old1", "EXPIRED", "2026-06-01T00:00:00.000Z"),
+      mk("exp-old2", "EXPIRED", "2026-06-02T00:00:00.000Z"),
+      mk("exp-new", "EXPIRED", "2026-06-20T00:00:00.000Z"),
+      mk("win", "CLOSED_WIN", "2026-06-10T00:00:00.000Z"),
+      mk("open", "OPEN", "2026-06-22T00:00:00.000Z"),
+    ]);
+    const pruned = store.pruneExpired(1); // keep only the newest 1 EXPIRED
+    expect(pruned).toBe(2);
+    const ids = store.all.map((o) => o.observationId);
+    expect(ids).toContain("exp-new"); // newest EXPIRED kept
+    expect(ids).not.toContain("exp-old1"); // older EXPIRED dropped
+    expect(ids).toContain("win"); // CLOSED untouched
+    expect(ids).toContain("open"); // OPEN untouched
   });
 
   // [15] Resolver meta is persisted after a run and readable from subsequent report diagnostics.
