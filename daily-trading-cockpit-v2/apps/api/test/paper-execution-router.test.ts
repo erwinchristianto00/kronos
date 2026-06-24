@@ -339,6 +339,7 @@ describe("paper-execution-router", () => {
     const order = store.all.find((o) => o.paperStatus === "CREATED");
     expect(order).toBeDefined();
     expect(order!.openedAt).toBe(freshOpenedAt);
+    expect(order!.paperOrderMode).toBe("HEADLINE");
   });
 
   // [10] Bearish SHORT_ONLY + scaleout (headline) eligible

@@ -1661,7 +1661,7 @@ describe("paper-opportunity-allocator", () => {
 
     const lines = buildPaperOpportunityAllocatorBriefLines(report);
     expect(lines.some((line) => line.includes("longPaperLane="))).toBe(false);
-    expect(lines.some((line) => line.includes("longHeadlineLane=CG_LONG_VARIANT_MATRIX:CG_SCALEOUT_TP1_TRAIL"))).toBe(true);
+    expect(lines.some((line) => line.includes("headlineLanes=CG_VARIANT_MATRIX:CG_SCALEOUT_TP1_TRAIL"))).toBe(true);
     expect(lines.some((line) => line.includes("longDiagnosticLane=CG_LONG_VARIANT_MATRIX:CG_WIDE_STOP_TP_WIDE"))).toBe(true);
     expect(lines.some((line) => line.includes("paperAccounting: headlineCreated=0"))).toBe(true);
     expect(lines.some((line) => line.includes("headlineOpen=0 diagnosticCreated=0 diagnosticOpen=26 note=DIAGNOSTIC_OPEN_ONLY"))).toBe(true);

@@ -34,6 +34,7 @@ import type {
   CurrentGuardVariantMatrixStore,
   CurrentGuardVariantMatrixObservation,
   CurrentGuardVariantMatrixReport,
+  VariantMatrixVariantId,
   VariantExitRule,
   VariantFillMode,
 } from "./current-guard-variant-matrix.js";
@@ -128,26 +129,54 @@ function getPaperEquityFromEnv(): number {
 
 export const PAPER_EQUITY = getPaperEquityFromEnv();
 
-// Variant policy: hard-coded allow-list. The headline lane is the proven scaleout exit
-// (CG_SCALEOUT_TP1_TRAIL) — the only wide-family exit that is net-positive AND OOS-clean on the
-// forward tape. Full-exit (CG_WIDE_STOP_TP_WIDE) is net-negative with a catastrophic drawdown and
-// is no longer headline; it continues as a DIAGNOSTIC_ONLY comparison lane.
-// Overridable via PAPER_HEADLINE_VARIANT_ID (the SAME env the allocator reads, so both admission
-// paths stay coordinated on one headline lane). Lets a deliberately configured testnet-live
-// instance promote a proven STABLE diagnostic lane (e.g. CG_WIDE_FAST_SHORT) to headline. An unknown
-// id falls back to the default — never silently selects a non-existent lane.
-const PAPER_ELIGIBLE_VARIANT_IDS: readonly string[] = (() => {
-  const override = process.env.PAPER_HEADLINE_VARIANT_ID?.trim();
-  if (!override) return ["CG_SCALEOUT_TP1_TRAIL"];
-  if (!VARIANT_MATRIX_DEFINITIONS.some((d) => d.id === override)) {
-    console.warn(
-      `[paper-router] PAPER_HEADLINE_VARIANT_ID="${override}" is not a known variant id — ` +
-        `falling back to CG_SCALEOUT_TP1_TRAIL`,
-    );
-    return ["CG_SCALEOUT_TP1_TRAIL"];
+const DEFAULT_PAPER_ELIGIBLE_VARIANT_IDS: readonly VariantMatrixVariantId[] = ["CG_SCALEOUT_TP1_TRAIL"];
+
+function parseHeadlineVariantIds(envName: string, raw: string | undefined): VariantMatrixVariantId[] {
+  const known = new Set(VARIANT_MATRIX_DEFINITIONS.map((d) => d.id));
+  const parsed = (raw ?? "")
+    .split(/[,\s]+/)
+    .map((id) => id.trim())
+    .filter(Boolean);
+  const out: VariantMatrixVariantId[] = [];
+  const rejected: string[] = [];
+  for (const id of parsed) {
+    if (!known.has(id as VariantMatrixVariantId)) {
+      rejected.push(id);
+      continue;
+    }
+    if (!out.includes(id as VariantMatrixVariantId)) out.push(id as VariantMatrixVariantId);
   }
-  return [override];
+  if (rejected.length > 0) {
+    console.warn(`[paper-router] ${envName} ignored unknown variant id(s): ${rejected.join(", ")}`);
+  }
+  return out;
+}
+
+// Variant policy: default production keeps the single proven scaleout headline. A deliberately
+// configured testnet-live instance may promote an explicit comma-separated allowlist via
+// PAPER_HEADLINE_VARIANT_IDS (or the legacy singular PAPER_HEADLINE_VARIANT_ID). Unknown ids are
+// ignored; if none survive validation, fall back to the default rather than silently trading nothing.
+const PAPER_ELIGIBLE_VARIANT_IDS: readonly VariantMatrixVariantId[] = (() => {
+  const plural = process.env.PAPER_HEADLINE_VARIANT_IDS?.trim();
+  const singular = process.env.PAPER_HEADLINE_VARIANT_ID?.trim();
+  const raw = plural || singular;
+  if (!raw) return DEFAULT_PAPER_ELIGIBLE_VARIANT_IDS;
+  const parsed = parseHeadlineVariantIds(plural ? "PAPER_HEADLINE_VARIANT_IDS" : "PAPER_HEADLINE_VARIANT_ID", raw);
+  if (parsed.length === 0) {
+    console.warn("[paper-router] headline override had no known variant ids; falling back to CG_SCALEOUT_TP1_TRAIL");
+    return DEFAULT_PAPER_ELIGIBLE_VARIANT_IDS;
+  }
+  return parsed;
 })();
+
+const PAPER_HEADLINE_REQUIRE_STABLE =
+  process.env.PAPER_HEADLINE_REQUIRE_STABLE === "1" ||
+  (process.env.PAPER_HEADLINE_VARIANT_IDS?.trim() ? process.env.PAPER_HEADLINE_REQUIRE_STABLE !== "0" : false);
+
+function isConfiguredPaperHeadlineVariant(variantId: string): boolean {
+  return PAPER_ELIGIBLE_VARIANT_IDS.includes(variantId as VariantMatrixVariantId);
+}
+
 const PAPER_REJECT_VARIANT_IDS: readonly string[] = [
   "CG_BASELINE_CURRENT",
   "CG_MAKER_LIMIT_SIM",
@@ -821,20 +850,25 @@ function regimeAllowsPaper(
   return true;
 }
 
-export function selectEligiblePaperLane(
+export function selectEligiblePaperLanes(
   inputs: SelectEligiblePaperLaneInputs,
-): PaperEligibleLane | null {
+): PaperEligibleLane[] {
   const { vmReport, controllerMode, regimeFamily } = inputs;
   const paperValidationAllowed = inputs.paperValidationAllowed === true;
   if (!regimeAllowsPaper(controllerMode, regimeFamily, paperValidationAllowed)) {
-    return null;
+    return [];
   }
 
+  const out: PaperEligibleLane[] = [];
   for (const variantId of PAPER_ELIGIBLE_VARIANT_IDS) {
-    if (PAPER_REJECT_VARIANT_IDS.includes(variantId)) continue;
+    if (PAPER_REJECT_VARIANT_IDS.includes(variantId) && !isConfiguredPaperHeadlineVariant(variantId)) continue;
     const row = vmReport.rows.find((r) => r.variantId === variantId);
     if (!row) continue;
-    if (row.status === "REJECT") continue;
+    if (PAPER_HEADLINE_REQUIRE_STABLE) {
+      if (row.status !== "STABLE_CANDIDATE") continue;
+    } else if (row.status === "REJECT") {
+      continue;
+    }
     if (row.freshValid < 50) continue;
     if ((row.netAvgR ?? 0) <= 0) continue;
     // PF can be null when there are no losses; treat as "infinite, passes".
@@ -846,7 +880,7 @@ export function selectEligiblePaperLane(
     const oosUnconfirmed = !row.allThreeOosPositive;
     const isExperimental = oosUnconfirmed;
     const paperRiskLabel: PaperRiskLabel = oosUnconfirmed ? "EXPERIMENTAL" : "NORMAL";
-    return {
+    out.push({
       laneId: `CG_VARIANT_MATRIX:${variantId}`,
       variantId,
       freshValid: row.freshValid,
@@ -855,9 +889,15 @@ export function selectEligiblePaperLane(
       isExperimental,
       oosUnconfirmed,
       paperRiskLabel,
-    };
+    });
   }
-  return null;
+  return out;
+}
+
+export function selectEligiblePaperLane(
+  inputs: SelectEligiblePaperLaneInputs,
+): PaperEligibleLane | null {
+  return selectEligiblePaperLanes(inputs)[0] ?? null;
 }
 
 // ─── admission ──────────────────────────────────────────────────────────────
@@ -925,6 +965,7 @@ function _buildBaseOrder(
     oosUnconfirmed: eligibleLane.oosUnconfirmed,
     infraNotReady,
     paperRiskLabel: eligibleLane.paperRiskLabel,
+    paperOrderMode: "HEADLINE",
     operationalSafetyStatus: "OK",
     diagnosticLabel: null,
     paperStatus: "CREATED",
@@ -4023,7 +4064,7 @@ export async function runPaperAdmissionAndResolution(
   const paperValidationAllowed = inputs.paperValidationAllowed === true;
   store.ensurePaperStartAt(now);
 
-  const eligibleLane = selectEligiblePaperLane({
+  const eligibleLanes = selectEligiblePaperLanes({
     vmReport,
     controllerMode: routerReport.controllerMode,
     regimeFamily: routerReport.regimeFamily,
@@ -4038,18 +4079,20 @@ export async function runPaperAdmissionAndResolution(
   const admissionHalted = store.isAdmissionHalted(now);
   if (admissionHalted) {
     noOrderReason = `portfolio drawdown circuit-breaker halt until ${store.getBreakerState().breakerHaltUntil}`;
-  } else if (eligibleLane) {
-    admitPaperOrders({
-      store,
-      vmStore,
-      eligibleLane,
-      routerReport,
-      gateReport,
-      now,
-      admissionMaxAgeMs: inputs.admissionMaxAgeMs,
-      paperEquity: inputs.paperEquity,
-      maxNotionalCap: inputs.maxNotionalCap,
-    });
+  } else if (eligibleLanes.length > 0) {
+    for (const eligibleLane of eligibleLanes) {
+      admitPaperOrders({
+        store,
+        vmStore,
+        eligibleLane,
+        routerReport,
+        gateReport,
+        now,
+        admissionMaxAgeMs: inputs.admissionMaxAgeMs,
+        paperEquity: inputs.paperEquity,
+        maxNotionalCap: inputs.maxNotionalCap,
+      });
+    }
   } else if (allocatorActiveLaneId === null) {
     noOrderReason = `no eligible paper lane under mode=${routerReport.controllerMode} regime=${routerReport.regimeFamily}`;
   }
@@ -4111,8 +4154,9 @@ export async function runPaperAdmissionAndResolution(
     /* breaker bookkeeping is best-effort */
   }
 
+  const primaryEligibleLane = eligibleLanes[0] ?? null;
   const effectiveActiveLaneId =
-    eligibleLane?.laneId ??
+    primaryEligibleLane?.laneId ??
     allocatorActiveLaneId ??
     store.getState().activeLaneId ??
     null;
@@ -4129,8 +4173,8 @@ export async function runPaperAdmissionAndResolution(
   // The legacy selector owns this persisted field only when it selected a lane.
   // Allocator Mixed context is report-only here and must not introduce a new
   // store mutation beyond normal paper order creation.
-  if (eligibleLane) {
-    store.setActiveLane(eligibleLane.laneId, rotationResult.currentLaneConfidence);
+  if (primaryEligibleLane) {
+    store.setActiveLane(primaryEligibleLane.laneId, rotationResult.currentLaneConfidence);
   }
 
   return buildPaperPerformanceReport(store, {

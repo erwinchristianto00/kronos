@@ -386,24 +386,43 @@ export interface PaperOpportunityAllocatorInputs {
  */
 const DEFAULT_HEADLINE_VARIANT_ID: VariantMatrixVariantId = "CG_SCALEOUT_TP1_TRAIL";
 /**
- * The single lane whose orders are emitted as HEADLINE (the only mode the live engine mirrors).
- * Overridable via PAPER_HEADLINE_VARIANT_ID so a deliberately configured testnet-live instance can
- * promote a proven STABLE diagnostic lane (e.g. CG_WIDE_FAST_SHORT) to headline without affecting
- * the default diagnostic instance. An unknown id falls back to the default (never silently trades a
- * non-existent lane).
+ * The lane(s) whose orders may be emitted as HEADLINE (the only mode the live engine mirrors).
+ * PAPER_HEADLINE_VARIANT_IDS lets a deliberately configured testnet-live instance promote a small
+ * STABLE allowlist without affecting the default diagnostic instance. Unknown ids are ignored; if
+ * none survive validation we fall back to the default rather than silently trading nothing.
  */
-const HEADLINE_VARIANT_ID: VariantMatrixVariantId = (() => {
-  const override = process.env.PAPER_HEADLINE_VARIANT_ID?.trim();
-  if (!override) return DEFAULT_HEADLINE_VARIANT_ID;
-  if (!VARIANT_MATRIX_DEFINITIONS.some((d) => d.id === override)) {
-    console.warn(
-      `[allocator] PAPER_HEADLINE_VARIANT_ID="${override}" is not a known variant id — ` +
-        `falling back to ${DEFAULT_HEADLINE_VARIANT_ID}`,
-    );
-    return DEFAULT_HEADLINE_VARIANT_ID;
+const HEADLINE_VARIANT_IDS: readonly VariantMatrixVariantId[] = (() => {
+  const raw = process.env.PAPER_HEADLINE_VARIANT_IDS?.trim() || process.env.PAPER_HEADLINE_VARIANT_ID?.trim();
+  if (!raw) return [DEFAULT_HEADLINE_VARIANT_ID];
+  const known = new Set(VARIANT_MATRIX_DEFINITIONS.map((d) => d.id));
+  const rejected: string[] = [];
+  const out: VariantMatrixVariantId[] = [];
+  for (const id of raw.split(/[,\s]+/).map((part) => part.trim()).filter(Boolean)) {
+    if (!known.has(id as VariantMatrixVariantId)) {
+      rejected.push(id);
+      continue;
+    }
+    if (!out.includes(id as VariantMatrixVariantId)) out.push(id as VariantMatrixVariantId);
   }
-  return override as VariantMatrixVariantId;
+  if (rejected.length > 0) {
+    console.warn(`[allocator] headline override ignored unknown variant id(s): ${rejected.join(", ")}`);
+  }
+  if (out.length === 0) {
+    console.warn(`[allocator] headline override had no known variant ids — falling back to ${DEFAULT_HEADLINE_VARIANT_ID}`);
+    return [DEFAULT_HEADLINE_VARIANT_ID];
+  }
+  return out;
 })();
+
+const PAPER_HEADLINE_ALLOWLIST_ACTIVE = Boolean(process.env.PAPER_HEADLINE_VARIANT_IDS?.trim());
+const PAPER_HEADLINE_REQUIRE_STABLE =
+  process.env.PAPER_HEADLINE_REQUIRE_STABLE === "1" ||
+  (process.env.PAPER_HEADLINE_VARIANT_IDS?.trim() ? process.env.PAPER_HEADLINE_REQUIRE_STABLE !== "0" : false);
+
+function isHeadlineVariantId(id: VariantMatrixVariantId): boolean {
+  return HEADLINE_VARIANT_IDS.includes(id);
+}
+
 const PAPER_ADMISSIBLE_LANE_IDS: readonly VariantMatrixVariantId[] = (() => {
   const base: VariantMatrixVariantId[] = [
     "CG_WIDE_STOP_TP_WIDE",
@@ -411,9 +430,11 @@ const PAPER_ADMISSIBLE_LANE_IDS: readonly VariantMatrixVariantId[] = (() => {
     "CG_TRAIL_AFTER_TP1",
   ];
   // The headline lane MUST be admissible — it's the only lane that can reach PAPER_ELIGIBLE
-  // (→ HEADLINE orders → mirrored live). When PAPER_HEADLINE_VARIANT_ID promotes a diagnostic
-  // STABLE lane, fold it in so it isn't rejected as LANE_NOT_PAPER_MODELED.
-  if (!base.includes(HEADLINE_VARIANT_ID)) base.push(HEADLINE_VARIANT_ID);
+  // (→ HEADLINE orders → mirrored live). When the testnet override promotes diagnostic STABLE
+  // lanes, fold them in so they aren't rejected as LANE_NOT_PAPER_MODELED.
+  for (const id of HEADLINE_VARIANT_IDS) {
+    if (!base.includes(id)) base.push(id);
+  }
   return base;
 })();
 const PAPER_CHALLENGER_LANE_ID: VariantMatrixVariantId = "CG_TRAIL_AFTER_TP1";
@@ -530,7 +551,9 @@ const NEAR_MISS_REASONS = new Set<string>([
 ]);
 
 function isAdmissionTargetLaneId(laneId: string | null | undefined): boolean {
-  return laneId === `CG_VARIANT_MATRIX:${HEADLINE_VARIANT_ID}` || laneId === `CG_LONG_VARIANT_MATRIX:${HEADLINE_VARIANT_ID}`;
+  return HEADLINE_VARIANT_IDS.some(
+    (id) => laneId === `CG_VARIANT_MATRIX:${id}` || laneId === `CG_LONG_VARIANT_MATRIX:${id}`,
+  );
 }
 
 /** Cost-in-R ceiling: above this the geometry/candidate cannot pay for itself. */
@@ -1326,6 +1349,9 @@ export function buildPaperOpportunityAllocatorReport(
       const row = inputs.vmReport.rows.find((r) => r.variantId === def.id) ?? null;
       const rowFresh = row?.freshValid ?? null;
       const rowNet = row?.netAvgR ?? null;
+      const headlineVariant = isHeadlineVariantId(def.id);
+      const headlineStableOk =
+        !PAPER_HEADLINE_REQUIRE_STABLE || row?.status === "STABLE_CANDIDATE";
 
       const geo = deriveVariantGeometry(signal, def);
       if (geo.kind === "rejected") {
@@ -1357,17 +1383,23 @@ export function buildPaperOpportunityAllocatorReport(
         regimeFamily === "MIXED";
       const longHeadlineCollection =
         direction === "LONG" &&
-        def.id === HEADLINE_VARIANT_ID &&
+        headlineVariant &&
+        headlineStableOk &&
         controllerMode === "LONG_ONLY" &&
         regimeFamily === "BULLISH";
       const variantDiagnosticCollection =
         variantMatrixDiagnosticEnabled &&
         VARIANT_MATRIX_DIAGNOSTIC_IDS.includes(def.id) &&
         (
-          def.id !== HEADLINE_VARIANT_ID ||
+          !headlineVariant ||
+          !headlineStableOk ||
           (laneDecision.batchOrderMode !== "HEADLINE" && !longHeadlineCollection)
         );
-      if (BENCHMARK_ONLY_LANE_IDS.includes(def.id) && !variantDiagnosticCollection) {
+      if (
+        BENCHMARK_ONLY_LANE_IDS.includes(def.id) &&
+        !variantDiagnosticCollection &&
+        !(headlineVariant && headlineStableOk && laneDecision.batchOrderMode === "HEADLINE")
+      ) {
         recordReject(symbol, direction, def.id, "LANE_DIAGNOSTIC_ONLY", rowFresh, rowNet);
         continue;
       }
@@ -1504,7 +1536,7 @@ export function buildPaperOpportunityAllocatorReport(
       const laneId = longPaperCollection
         ? LONG_WIDE_PAPER_LANE_ID
         : longHeadlineCollection
-          ? `CG_LONG_VARIANT_MATRIX:${HEADLINE_VARIANT_ID}`
+          ? `CG_LONG_VARIANT_MATRIX:${def.id}`
         : variantDiagnosticCollection && direction === "LONG"
           ? `CG_LONG_VARIANT_MATRIX:${def.id}`
           : `CG_VARIANT_MATRIX:${def.id}`;
@@ -1861,6 +1893,10 @@ export function buildPaperOpportunityAllocatorReport(
         }
         orderMode = "DIAGNOSTIC_ONLY";
       } else if (longHeadlineCollection) {
+        if (!headlineStableOk) {
+          recordReject(symbol, direction, def.id, "HEADLINE_LANE_NOT_STABLE_CANDIDATE", rowFresh, rowNet);
+          continue;
+        }
         if (laneDecision.batchOrderMode === "HEADLINE") {
           if (!verdict.headlineOk) {
             const reason = verdict.reason ?? "CANDIDATE_REJECTED";
@@ -1896,6 +1932,14 @@ export function buildPaperOpportunityAllocatorReport(
         }
         orderMode = "DIAGNOSTIC_ONLY";
       } else if (laneDecision.batchOrderMode === "HEADLINE") {
+        if (PAPER_HEADLINE_ALLOWLIST_ACTIVE && !headlineVariant) {
+          recordReject(symbol, direction, def.id, "HEADLINE_LANE_NOT_CONFIGURED", rowFresh, rowNet);
+          continue;
+        }
+        if (headlineVariant && !headlineStableOk) {
+          recordReject(symbol, direction, def.id, "HEADLINE_LANE_NOT_STABLE_CANDIDATE", rowFresh, rowNet);
+          continue;
+        }
         if (!verdict.headlineOk) {
           // CG_WIDE priority: a candidate that fails the stricter HEADLINE gate but is still
           // diagnostic-eligible is collected as DIAGNOSTIC_ONLY rather than rejected — so the
@@ -2131,7 +2175,7 @@ export function buildPaperOpportunityAllocatorBriefLines(
       ` pressure=${report.cgWideCapacityPressure}`,
   );
   L.push(
-    `   longHeadlineLane=CG_LONG_VARIANT_MATRIX:${HEADLINE_VARIANT_ID}` +
+    `   headlineLanes=${HEADLINE_VARIANT_IDS.map((id) => `CG_VARIANT_MATRIX:${id}`).join(",")}` +
       ` status=${
         report.controllerMode === "LONG_ONLY" && report.regimeFamily === "BULLISH"
           ? "ACTIVE"
