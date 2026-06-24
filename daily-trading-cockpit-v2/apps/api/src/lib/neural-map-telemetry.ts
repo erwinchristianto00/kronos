@@ -266,6 +266,8 @@ export interface NeuralMapTelemetry {
     totalNetR: number;
     /** Research A/B sibling: tight-trail (1.5-ATR) variant on the same entries. */
     tight: { freshValid: number; netAvgR: number | null; pf: number | null; wr: number | null; avgMaxFavorableR: number | null };
+    /** Focused long profit-generator candidate: tight-trail × large-cap × bullish regime. */
+    tightLargeCap: { freshValid: number; netAvgR: number | null; pf: number | null; wr: number | null; avgMaxFavorableR: number | null };
   } | null;
   alerts: NeuralMapAlert[];
 }
@@ -1485,6 +1487,7 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
           avgMaxFavorableR: input.h6Trend.avgMaxFavorableR,
           totalNetR: input.h6Trend.totalNetR,
           tight: input.h6Trend.tight,
+          tightLargeCap: input.h6Trend.tightLargeCap,
         }
       : null,
     alerts,

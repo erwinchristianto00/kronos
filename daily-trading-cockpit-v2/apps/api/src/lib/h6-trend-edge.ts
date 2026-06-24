@@ -103,6 +103,9 @@ export interface H6TrendObservation {
   /** ATR-trail multiple for this obs (= stopDistanceBps geometry). Resolution derives the trail
    *  offset from entry−initialStop, so this is informational; defaults to std for older obs. */
   trailMult?: number;
+  /** Symbol is a large-cap major (LONG_LARGE_CAP finding: majors trend, high-beta alts chop). The
+   *  focused long candidate = tight trail × large-cap, the cohort surfaced for the bull-regime edge. */
+  isLargeCap?: boolean;
   rocAtEntry: number;
   atrAtEntry: number;
   entryPrice: number;
@@ -139,6 +142,23 @@ function isFreshTrendEntry(
   return ok(i) && !ok(i - 1);
 }
 
+// Large-cap majors — mirrors PAPER_LARGE_CAP_BASES (paper-execution-router.ts). Kept local so this
+// edge module stays self-contained. LONG_LARGE_CAP finding: majors trend, high-beta alts chop.
+const H6_LARGE_CAP_BASES: ReadonlySet<string> = new Set([
+  "BTC", "ETH", "BNB", "SOL", "XRP", "ADA", "DOGE", "TRX", "AVAX",
+  "DOT", "LINK", "MATIC", "LTC", "BCH", "ATOM", "ETC", "XLM",
+]);
+export function h6IsLargeCap(symbol: string): boolean {
+  let s = (symbol || "").toUpperCase();
+  for (const q of ["USDT", "USDC", "BUSD", "USD", "PERP"]) {
+    if (s.endsWith(q) && s.length > q.length) {
+      s = s.slice(0, -q.length);
+      break;
+    }
+  }
+  return H6_LARGE_CAP_BASES.has(s);
+}
+
 function buildH6TrendObs(
   symbol: string,
   candles: Candle[],
@@ -159,6 +179,7 @@ function buildH6TrendObs(
     direction: "LONG",
     variant,
     trailMult,
+    isLargeCap: h6IsLargeCap(symbol),
     rocAtEntry: roc,
     atrAtEntry: atr,
     entryPrice: entry,
@@ -276,6 +297,9 @@ export interface H6TrendReport {
   /** Research A/B sibling: the tight-trail (1.5-ATR) variant on the SAME entries. The top-level
    *  fields above are the "std" (2.5-ATR) lane (so the dashboard tile shows the primary). */
   tight: H6TrendVariantStats;
+  /** THE focused long profit-generator candidate: tight trail × LARGE-CAP only (majors trend; alts
+   *  chop) × bullish regime (cycle-gated). The thing to watch when the regime turns bull. */
+  tightLargeCap: H6TrendVariantStats;
 }
 
 const _mean = (xs: number[]) => (xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : null);
@@ -317,6 +341,7 @@ export function buildH6TrendReport(observations: readonly H6TrendObservation[]):
     status: s.freshValid >= WATCHABLE_MIN_FRESH ? "WATCHABLE" : "COLLECTING",
     totalNetR: resolvedStd.map((o) => o.netR as number).reduce((a, b) => a + b, 0),
     tight: h6VariantStats(tight),
+    tightLargeCap: h6VariantStats(tight.filter((o) => o.isLargeCap === true)),
   };
 }
 

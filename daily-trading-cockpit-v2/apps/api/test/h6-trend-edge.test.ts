@@ -9,6 +9,7 @@ import {
   buildH6TrendReport,
   runH6TrendCycle,
   H6TrendStore,
+  h6IsLargeCap,
   type H6TrendObservation,
   H6_TREND_ATR_TRAIL_MULT,
 } from "../src/lib/h6-trend-edge.js";
@@ -127,6 +128,33 @@ describe("h6-trend-edge resolution", () => {
     expect(rep.wr).toBeCloseTo(0.5, 6);
     expect(rep.netAvgR).toBeCloseTo((2.9 - 1.1) / 2, 6);
     expect(rep.tight).toBeDefined(); // A/B sibling present
+    expect(rep.tightLargeCap).toBeDefined(); // focused long candidate present
+  });
+
+  it("[LARGECAP] h6IsLargeCap classifies majors vs high-beta alts", () => {
+    expect(h6IsLargeCap("BTCUSDT")).toBe(true);
+    expect(h6IsLargeCap("ETHUSDC")).toBe(true);
+    expect(h6IsLargeCap("SOLUSDT")).toBe(true);
+    expect(h6IsLargeCap("INJUSDT")).toBe(false);
+    expect(h6IsLargeCap("WLDUSDT")).toBe(false);
+  });
+
+  it("[LCTIGHT] tightLargeCap cohort = tight-trail obs on large-cap symbols only", () => {
+    const mk = (sym: string, lc: boolean): H6TrendObservation => ({
+      ...obs(),
+      observationId: `t-${sym}`,
+      symbol: sym,
+      variant: "tight",
+      isLargeCap: lc,
+      status: "CLOSED_WIN",
+      grossR: 1,
+      netR: 0.9,
+      maxFavorableR: 1,
+    });
+    const rep = buildH6TrendReport([mk("BTCUSDT", true), mk("INJUSDT", false)]);
+    expect(rep.tight.freshValid).toBe(2); // both are tight
+    expect(rep.tightLargeCap.freshValid).toBe(1); // only the large-cap one
+    expect(rep.tightLargeCap.netAvgR).toBeCloseTo(0.9, 6);
   });
 
   it("[REGIME-GATE] cycle opens NO new entries when allowNewEntries=false", async () => {

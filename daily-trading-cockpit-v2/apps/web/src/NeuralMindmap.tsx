@@ -227,6 +227,7 @@ interface NeuralTelemetry {
     avgMaxFavorableR: number | null;
     totalNetR: number;
     tight: { freshValid: number; netAvgR: number | null; pf: number | null; wr: number | null; avgMaxFavorableR: number | null };
+    tightLargeCap: { freshValid: number; netAvgR: number | null; pf: number | null; wr: number | null; avgMaxFavorableR: number | null };
   } | null;
   alerts: Array<{ severity: 'WARNING' | 'CRITICAL'; source: string; message: string }>;
 }
@@ -1109,6 +1110,9 @@ export default function NeuralMindmap() {
             ) : null}
             {telemetry?.h6Trend?.tight ? (
               <span className="diag-dir-foot">A/B tight-trail: {fmtR(telemetry.h6Trend.tight.netAvgR)} net · {telemetry.h6Trend.tight.wr != null ? `${Math.round(telemetry.h6Trend.tight.wr * 100)}% WR` : '—'} · n={telemetry.h6Trend.tight.freshValid} (research)</span>
+            ) : null}
+            {telemetry?.h6Trend?.tightLargeCap ? (
+              <span className="diag-dir-foot">⭐ long candidate (tight×large-cap×bull): {fmtR(telemetry.h6Trend.tightLargeCap.netAvgR)} net · {telemetry.h6Trend.tightLargeCap.wr != null ? `${Math.round(telemetry.h6Trend.tightLargeCap.wr * 100)}% WR` : '—'} · n={telemetry.h6Trend.tightLargeCap.freshValid}</span>
             ) : null}
           </small>
         </div>
