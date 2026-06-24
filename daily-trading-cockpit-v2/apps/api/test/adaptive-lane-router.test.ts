@@ -10,6 +10,7 @@ import {
   classifyLaneMaturity,
   normalizeRegimeFamily,
   directionCompatibleWithMode,
+  resolveLiveBlocked,
   type CandidateLane,
   type LaneRankingContext,
 } from "../src/lib/adaptive-lane-router.js";
@@ -20,6 +21,28 @@ import {
   CurrentGuardVariantMatrixStore,
 } from "../src/lib/current-guard-variant-matrix.js";
 import { buildRegimeDirectionControllerReport } from "../src/lib/regime-direction-controller.js";
+
+describe("resolveLiveBlocked — the live ceiling (testnet-only unblock, mainnet hard-locked)", () => {
+  const T = "I_UNDERSTAND_TESTNET_ORDERS";
+  it("[LB-DEFAULT] blocks when no env is set (preserves the original hard invariant)", () => {
+    expect(resolveLiveBlocked({})).toBe(true);
+  });
+  it("[LB-TESTNET] unblocks ONLY with the exact token AND testnet env", () => {
+    expect(resolveLiveBlocked({ LIVE_UNBLOCK_TESTNET: T, LIVE_BINANCE_ENV: "testnet" })).toBe(false);
+    // case-insensitive env
+    expect(resolveLiveBlocked({ LIVE_UNBLOCK_TESTNET: T, LIVE_BINANCE_ENV: "TESTNET" })).toBe(false);
+  });
+  it("[LB-MAINNET] mainnet can NEVER unblock, even with the token", () => {
+    expect(resolveLiveBlocked({ LIVE_UNBLOCK_TESTNET: T, LIVE_BINANCE_ENV: "mainnet" })).toBe(true);
+    expect(resolveLiveBlocked({ LIVE_UNBLOCK_TESTNET: T, LIVE_BINANCE_ENV: "production" })).toBe(true);
+    expect(resolveLiveBlocked({ LIVE_UNBLOCK_TESTNET: T })).toBe(true); // no env → blocked
+  });
+  it("[LB-TOKEN] testnet without the exact token stays blocked", () => {
+    expect(resolveLiveBlocked({ LIVE_BINANCE_ENV: "testnet" })).toBe(true);
+    expect(resolveLiveBlocked({ LIVE_UNBLOCK_TESTNET: "yes", LIVE_BINANCE_ENV: "testnet" })).toBe(true);
+    expect(resolveLiveBlocked({ LIVE_UNBLOCK_TESTNET: "", LIVE_BINANCE_ENV: "testnet" })).toBe(true);
+  });
+});
 import {
   buildOperatorBrief,
   OPERATOR_BRIEF_MAX_LINES,

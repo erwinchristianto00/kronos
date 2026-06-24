@@ -384,13 +384,39 @@ export interface PaperOpportunityAllocatorInputs {
  * bullish paper lane can create true HEADLINE paper orders when a candidate clears
  * the quality gates, instead of being hard-forced into diagnostic-only forever.
  */
-const PAPER_ADMISSIBLE_LANE_IDS: readonly VariantMatrixVariantId[] = [
-  "CG_WIDE_STOP_TP_WIDE",
-  "CG_SCALEOUT_TP1_TRAIL",
-  "CG_TRAIL_AFTER_TP1",
-];
+const DEFAULT_HEADLINE_VARIANT_ID: VariantMatrixVariantId = "CG_SCALEOUT_TP1_TRAIL";
+/**
+ * The single lane whose orders are emitted as HEADLINE (the only mode the live engine mirrors).
+ * Overridable via PAPER_HEADLINE_VARIANT_ID so a deliberately configured testnet-live instance can
+ * promote a proven STABLE diagnostic lane (e.g. CG_WIDE_FAST_SHORT) to headline without affecting
+ * the default diagnostic instance. An unknown id falls back to the default (never silently trades a
+ * non-existent lane).
+ */
+const HEADLINE_VARIANT_ID: VariantMatrixVariantId = (() => {
+  const override = process.env.PAPER_HEADLINE_VARIANT_ID?.trim();
+  if (!override) return DEFAULT_HEADLINE_VARIANT_ID;
+  if (!VARIANT_MATRIX_DEFINITIONS.some((d) => d.id === override)) {
+    console.warn(
+      `[allocator] PAPER_HEADLINE_VARIANT_ID="${override}" is not a known variant id — ` +
+        `falling back to ${DEFAULT_HEADLINE_VARIANT_ID}`,
+    );
+    return DEFAULT_HEADLINE_VARIANT_ID;
+  }
+  return override as VariantMatrixVariantId;
+})();
+const PAPER_ADMISSIBLE_LANE_IDS: readonly VariantMatrixVariantId[] = (() => {
+  const base: VariantMatrixVariantId[] = [
+    "CG_WIDE_STOP_TP_WIDE",
+    "CG_SCALEOUT_TP1_TRAIL",
+    "CG_TRAIL_AFTER_TP1",
+  ];
+  // The headline lane MUST be admissible — it's the only lane that can reach PAPER_ELIGIBLE
+  // (→ HEADLINE orders → mirrored live). When PAPER_HEADLINE_VARIANT_ID promotes a diagnostic
+  // STABLE lane, fold it in so it isn't rejected as LANE_NOT_PAPER_MODELED.
+  if (!base.includes(HEADLINE_VARIANT_ID)) base.push(HEADLINE_VARIANT_ID);
+  return base;
+})();
 const PAPER_CHALLENGER_LANE_ID: VariantMatrixVariantId = "CG_TRAIL_AFTER_TP1";
-const HEADLINE_VARIANT_ID: VariantMatrixVariantId = "CG_SCALEOUT_TP1_TRAIL";
 /**
  * Variants admitted as DIAGNOSTIC_ONLY paper sleeves in BOTH directions when the full
  * variant-matrix paper collection is enabled. CG_SCALEOUT_TP1_TRAIL stays the HEADLINE lane and

@@ -132,7 +132,22 @@ export const PAPER_EQUITY = getPaperEquityFromEnv();
 // (CG_SCALEOUT_TP1_TRAIL) — the only wide-family exit that is net-positive AND OOS-clean on the
 // forward tape. Full-exit (CG_WIDE_STOP_TP_WIDE) is net-negative with a catastrophic drawdown and
 // is no longer headline; it continues as a DIAGNOSTIC_ONLY comparison lane.
-const PAPER_ELIGIBLE_VARIANT_IDS: readonly string[] = ["CG_SCALEOUT_TP1_TRAIL"] as const;
+// Overridable via PAPER_HEADLINE_VARIANT_ID (the SAME env the allocator reads, so both admission
+// paths stay coordinated on one headline lane). Lets a deliberately configured testnet-live
+// instance promote a proven STABLE diagnostic lane (e.g. CG_WIDE_FAST_SHORT) to headline. An unknown
+// id falls back to the default — never silently selects a non-existent lane.
+const PAPER_ELIGIBLE_VARIANT_IDS: readonly string[] = (() => {
+  const override = process.env.PAPER_HEADLINE_VARIANT_ID?.trim();
+  if (!override) return ["CG_SCALEOUT_TP1_TRAIL"];
+  if (!VARIANT_MATRIX_DEFINITIONS.some((d) => d.id === override)) {
+    console.warn(
+      `[paper-router] PAPER_HEADLINE_VARIANT_ID="${override}" is not a known variant id — ` +
+        `falling back to CG_SCALEOUT_TP1_TRAIL`,
+    );
+    return ["CG_SCALEOUT_TP1_TRAIL"];
+  }
+  return [override];
+})();
 const PAPER_REJECT_VARIANT_IDS: readonly string[] = [
   "CG_BASELINE_CURRENT",
   "CG_MAKER_LIMIT_SIM",

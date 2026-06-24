@@ -483,12 +483,27 @@ function buildRegimePolicyEntry(regime: RegimeFamily, ranked: RankedCandidate[])
 
 // ── current permission ───────────────────────────────────────────────────────────
 
+/**
+ * The live ceiling. TRUE = no lane may ever reach PAPER_ELIGIBLE; everything caps at SHADOW_ONLY.
+ *
+ * SAFETY INVARIANT: this can ONLY be lifted on TESTNET, and only with an explicit acknowledgement
+ * token. Any non-testnet env (mainnet included) is ALWAYS blocked regardless of the token — the
+ * live ceiling is hard there and cannot be flipped by an env var. Default (no env set) is blocked.
+ * This preserves the original `const liveBlocked = true` behavior everywhere except a deliberately
+ * configured testnet-live instance.
+ */
+export function resolveLiveBlocked(env: NodeJS.ProcessEnv = process.env): boolean {
+  const tokenOk = env.LIVE_UNBLOCK_TESTNET === "I_UNDERSTAND_TESTNET_ORDERS";
+  const isTestnet = (env.LIVE_BINANCE_ENV ?? "").trim().toLowerCase() === "testnet";
+  return !(tokenOk && isTestnet);
+}
+
 function computeCurrentPermission(
   mode: RegimeDirectionMode | string,
   selected: RankedCandidate | null,
   infraReady: boolean,
 ): RouterPermission {
-  const liveBlocked = true; // hard invariant
+  const liveBlocked = resolveLiveBlocked(); // hard invariant unless testnet + explicit token
 
   if (mode === "NO_TRADE_CHOP" || mode === "UNKNOWN") return "NO_TRADE";
   if (mode === "VALIDATION_ONLY" || mode === "WAIT_RETEST_AFTER_DUMP" || mode === "WAIT_RETEST_AFTER_PUMP") {
