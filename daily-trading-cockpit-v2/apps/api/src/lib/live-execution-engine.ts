@@ -863,18 +863,49 @@ export class LiveExecutionEngine {
             }
             const runnerQty = Math.abs(amt);
             const breakeven = intent.filledEntryPrice ?? intent.plannedEntryPrice;
-            const beOrder = await this.client.placeAlgoOrder({
-              symbol: intent.symbol,
-              side: intent.direction === "LONG" ? "SELL" : "BUY",
-              type: "STOP_MARKET",
-              quantity: runnerQty,
-              triggerPrice: breakeven,
-              reduceOnly: true,
-              workingType: "CONTRACT_PRICE",
-              clientAlgoId: `dtc-${intent.paperOrderId.slice(-18)}-be`,
-            });
-            intent.beStopOrderId = beOrder.algoId;
-            intent.state = "TP1_FILLED_BE_SET";
+            try {
+              const beOrder = await this.client.placeAlgoOrder({
+                symbol: intent.symbol,
+                side: intent.direction === "LONG" ? "SELL" : "BUY",
+                type: "STOP_MARKET",
+                quantity: runnerQty,
+                triggerPrice: breakeven,
+                reduceOnly: true,
+                workingType: "CONTRACT_PRICE",
+                clientAlgoId: `dtc-${intent.paperOrderId.slice(-18)}-be`,
+              });
+              intent.beStopOrderId = beOrder.algoId;
+              intent.state = "TP1_FILLED_BE_SET";
+            } catch (error) {
+              if (!(error instanceof BinanceFuturesPrivateError) || error.binanceCode !== -2021) {
+                throw error;
+              }
+              const flat = await this.client.placeOrder({
+                symbol: intent.symbol,
+                side: intent.direction === "LONG" ? "SELL" : "BUY",
+                type: "MARKET",
+                quantity: runnerQty,
+                reduceOnly: true,
+                newClientOrderId: `dtc-${intent.paperOrderId.slice(-18)}-be-x`,
+              });
+              try {
+                await this.client.cancelAllOrders(intent.symbol);
+                await this.client.cancelAllAlgoOrders(intent.symbol);
+              } catch {
+                // best-effort cleanup after the runner is already closed.
+              }
+              const net = await this.realizedFromTrades(intent.symbol, intent.createdAt, [
+                intent.entryOrderId,
+                intent.tp1OrderId,
+                flat.orderId,
+              ]);
+              intent.realizedPnlUsd = net;
+              intent.feesUsd = null;
+              intent.state = "CLOSED";
+              intent.closedAt = this.nowIso();
+              intent.closeReason = "BREAKEVEN_ALREADY_TOUCHED_MARKET_CLOSE";
+              this.applyRealizedToLedger(net);
+            }
             intent.updatedAt = this.nowIso();
             dirty = true;
           }

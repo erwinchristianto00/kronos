@@ -422,6 +422,30 @@ describe("LiveExecutionEngine", () => {
     expect(store.getState().consecutiveLosses).toBe(0);
   });
 
+  it("market-closes the runner when breakeven stop placement would immediately trigger", async () => {
+    const order = paperOrder();
+    const { engine, client, store } = makeEngine({ paper: makePaperStore([order]) });
+    expect((await engine.arm()).ok).toBe(true);
+    await engine.tick();
+
+    const intent = store.getState().intents[0]!;
+    client.orderStatusById.set(intent.tp1OrderId!, "FILLED");
+    client.positionsBySymbol.set("ETHUSDT", -0.025);
+    client.algoErrorCode = -2021;
+    client.flattenRealizedPnl = 0.12;
+
+    await engine.tick();
+
+    const closed = store.getState().intents[0]!;
+    expect(closed.state).toBe("CLOSED");
+    expect(closed.closeReason).toBe("BREAKEVEN_ALREADY_TOUCHED_MARKET_CLOSE");
+    expect(closed.realizedPnlUsd).toBeCloseTo(0.12, 6);
+    const flat = client.placed.at(-1)!;
+    expect(flat.type).toBe("MARKET");
+    expect(flat.reduceOnly).toBe(true);
+    expect(flat.quantity).toBeCloseTo(0.025, 9);
+  });
+
   it("skips DIAGNOSTIC_ONLY orders, stale watermark orders, and respects the paper breaker halt", async () => {
     const diag = paperOrder({ paperOrderMode: "DIAGNOSTIC_ONLY" } as Partial<PaperOrder>);
     const stale = paperOrder({ createdAt: "2000-01-01T00:00:00.000Z" } as Partial<PaperOrder>);

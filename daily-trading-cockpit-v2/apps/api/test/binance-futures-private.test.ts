@@ -78,4 +78,84 @@ describe("binance-futures-private signing", () => {
       expect((error as BinanceFuturesPrivateError).binanceCode).toBe(-2019);
     }
   });
+
+  it("normalizes mutable order quantity and price params to exchange filters before signing", async () => {
+    const urls: string[] = [];
+    const fetchImpl = (async (url: RequestInfo | URL) => {
+      const u = String(url);
+      urls.push(u);
+      if (u.includes("/fapi/v1/time")) {
+        return new Response(JSON.stringify({ serverTime: Date.now() }), { status: 200 });
+      }
+      if (u.includes("/fapi/v1/exchangeInfo")) {
+        return new Response(JSON.stringify({
+          symbols: [{
+            symbol: "DOGEUSDT",
+            pricePrecision: 5,
+            quantityPrecision: 0,
+            filters: [
+              { filterType: "PRICE_FILTER", tickSize: "0.0000100" },
+              { filterType: "LOT_SIZE", stepSize: "1", minQty: "1" },
+              { filterType: "MIN_NOTIONAL", notional: "5" },
+            ],
+          }],
+        }), { status: 200 });
+      }
+      if (u.includes("/fapi/v1/algoOrder")) {
+        return new Response(JSON.stringify({
+          symbol: "DOGEUSDT",
+          algoId: 2,
+          clientAlgoId: "algo",
+          algoStatus: "NEW",
+          orderType: "STOP_MARKET",
+          side: "BUY",
+          quantity: "12",
+          triggerPrice: "0.12346",
+        }), { status: 200 });
+      }
+      return new Response(JSON.stringify({
+        symbol: "DOGEUSDT",
+        orderId: 1,
+        clientOrderId: "limit",
+        status: "NEW",
+        type: "LIMIT",
+        side: "BUY",
+        reduceOnly: false,
+        price: "0.12345",
+        stopPrice: "0",
+        origQty: "12",
+        executedQty: "0",
+        avgPrice: "0",
+        updateTime: 0,
+      }), { status: 200 });
+    }) as typeof fetch;
+
+    const client = new BinanceFuturesPrivateClient({ apiKey: "k", apiSecret: "s", env: "testnet", fetchImpl });
+    await client.placeOrder({
+      symbol: "DOGEUSDT",
+      side: "BUY",
+      type: "LIMIT",
+      quantity: 12.345678,
+      price: 0.123456789,
+      timeInForce: "GTC",
+      newClientOrderId: "limit",
+    });
+    await client.placeAlgoOrder({
+      symbol: "DOGEUSDT",
+      side: "BUY",
+      type: "STOP_MARKET",
+      quantity: 12.345678,
+      triggerPrice: 0.123456789,
+      reduceOnly: true,
+      clientAlgoId: "algo",
+    });
+
+    const orderUrl = urls.find((u) => u.includes("/fapi/v1/order?")) ?? "";
+    const algoUrl = urls.find((u) => u.includes("/fapi/v1/algoOrder?")) ?? "";
+    expect(orderUrl).toContain("quantity=12");
+    expect(orderUrl).toContain("price=0.12345");
+    expect(algoUrl).toContain("quantity=12");
+    expect(algoUrl).toContain("triggerPrice=0.12346");
+    expect(urls.filter((u) => u.includes("/fapi/v1/exchangeInfo"))).toHaveLength(1);
+  });
 });

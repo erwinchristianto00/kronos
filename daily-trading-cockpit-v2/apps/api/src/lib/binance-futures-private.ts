@@ -180,6 +180,41 @@ function toNum(value: unknown): number {
   return Number.isFinite(n) ? n : 0;
 }
 
+function decimalsForStep(step: number, fallback: number): number {
+  if (!(step > 0)) return Math.max(0, fallback);
+  const text = step.toString().toLowerCase();
+  const exponent = text.match(/e-(\d+)$/);
+  if (exponent) return Math.min(12, Number(exponent[1]));
+  const dot = text.indexOf(".");
+  return dot === -1 ? 0 : Math.min(12, text.length - dot - 1);
+}
+
+function roundToStep(value: number, step: number, mode: "down" | "up"): number {
+  if (!(step > 0) || !Number.isFinite(value)) return value;
+  const rawSteps = value / step;
+  const steps = mode === "up" ? Math.ceil(rawSteps - 1e-9) : Math.floor(rawSteps + 1e-9);
+  const decimals = decimalsForStep(step, 8);
+  return Number((steps * step).toFixed(decimals));
+}
+
+function formatToStep(value: number, step: number, mode: "down" | "up", precisionFallback: number): string | number {
+  if (!Number.isFinite(value)) return value;
+  const rounded = roundToStep(value, step, mode);
+  const decimals = decimalsForStep(step, precisionFallback);
+  const fixed = rounded.toFixed(decimals);
+  return fixed.includes(".") ? fixed.replace(/(\.\d*?)0+$/, "$1").replace(/\.$/, "") : fixed;
+}
+
+function triggerRoundMode(type: PlaceOrderParams["type"] | PlaceAlgoOrderParams["type"], side: "BUY" | "SELL"): "down" | "up" {
+  if (type === "STOP_MARKET") {
+    return side === "BUY" ? "up" : "down";
+  }
+  if (type === "TAKE_PROFIT_MARKET") {
+    return side === "BUY" ? "down" : "up";
+  }
+  return "down";
+}
+
 /**
  * Deterministic querystring: insertion order, URL-encoded. Exported for the signing
  * unit test (signature must be reproducible against a known HMAC vector).
@@ -220,6 +255,7 @@ export class BinanceFuturesPrivateClient {
   private serverTimeOffsetMs = 0;
   private lastTimeSyncAtMs = 0;
   private lastMeasuredSkewMs = 0;
+  private exchangeFiltersCache: Map<string, FuturesSymbolFilters> | null = null;
 
   constructor(options: BinanceFuturesPrivateClientOptions) {
     this.apiKey = options.apiKey;
@@ -384,6 +420,7 @@ export class BinanceFuturesPrivateClient {
   // ── public endpoints ───────────────────────────────────────────────────────
 
   async getExchangeFilters(): Promise<Map<string, FuturesSymbolFilters>> {
+    if (this.exchangeFiltersCache) return new Map(this.exchangeFiltersCache);
     const parsed = await this.requestPublic("/fapi/v1/exchangeInfo");
     const symbols = (parsed as { symbols?: unknown })?.symbols;
     const out = new Map<string, FuturesSymbolFilters>();
@@ -409,7 +446,13 @@ export class BinanceFuturesPrivateClient {
         quantityPrecision: sym.quantityPrecision ?? 8,
       });
     }
-    return out;
+    this.exchangeFiltersCache = out;
+    return new Map(out);
+  }
+
+  private async getSymbolFilters(symbol: string): Promise<FuturesSymbolFilters | null> {
+    const filters = await this.getExchangeFilters();
+    return filters.get(symbol) ?? null;
   }
 
   // ── signed endpoints ───────────────────────────────────────────────────────
@@ -478,13 +521,23 @@ export class BinanceFuturesPrivateClient {
   }
 
   async placeOrder(params: PlaceOrderParams): Promise<FuturesOrder> {
+    const filters = await this.getSymbolFilters(params.symbol);
+    const quantity = filters
+      ? formatToStep(params.quantity, filters.stepSize, "down", filters.quantityPrecision)
+      : params.quantity;
+    const price = filters && params.price !== undefined
+      ? formatToStep(params.price, filters.tickSize, "down", filters.pricePrecision)
+      : params.price;
+    const stopPrice = filters && params.stopPrice !== undefined
+      ? formatToStep(params.stopPrice, filters.tickSize, triggerRoundMode(params.type, params.side), filters.pricePrecision)
+      : params.stopPrice;
     const parsed = await this.requestSigned("POST", "/fapi/v1/order", {
       symbol: params.symbol,
       side: params.side,
       type: params.type,
-      quantity: params.quantity,
-      price: params.price,
-      stopPrice: params.stopPrice,
+      quantity,
+      price,
+      stopPrice,
       reduceOnly: params.reduceOnly,
       timeInForce: params.type === "LIMIT" ? params.timeInForce ?? "GTC" : undefined,
       newClientOrderId: params.newClientOrderId,
@@ -495,13 +548,20 @@ export class BinanceFuturesPrivateClient {
   }
 
   async placeAlgoOrder(params: PlaceAlgoOrderParams): Promise<FuturesAlgoOrder> {
+    const filters = await this.getSymbolFilters(params.symbol);
+    const quantity = filters
+      ? formatToStep(params.quantity, filters.stepSize, "down", filters.quantityPrecision)
+      : params.quantity;
+    const triggerPrice = filters
+      ? formatToStep(params.triggerPrice, filters.tickSize, triggerRoundMode(params.type, params.side), filters.pricePrecision)
+      : params.triggerPrice;
     const parsed = await this.requestSigned("POST", "/fapi/v1/algoOrder", {
       algoType: "CONDITIONAL",
       symbol: params.symbol,
       side: params.side,
       type: params.type,
-      quantity: params.quantity,
-      triggerPrice: params.triggerPrice,
+      quantity,
+      triggerPrice,
       reduceOnly: params.reduceOnly,
       clientAlgoId: params.clientAlgoId,
       workingType: params.workingType,
