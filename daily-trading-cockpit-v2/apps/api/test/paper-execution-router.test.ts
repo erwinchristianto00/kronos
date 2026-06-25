@@ -9,6 +9,7 @@ import {
   computePaperPositionSize,
   selectEligiblePaperLane,
   admitPaperOrders,
+  admitPaperOpportunities,
   resolvePaperOrders,
   evaluatePaperLaneRotation,
   runPaperAdmissionAndResolution,
@@ -26,6 +27,7 @@ import {
   type PaperResolverClient,
   type PaperEligibleLane,
 } from "../src/lib/paper-execution-router.js";
+import { H6_TREND_PAPER_LANE_ID } from "../src/lib/h6-trend-edge.js";
 import {
   buildAdaptiveLaneRouterReport,
 } from "../src/lib/adaptive-lane-router.js";
@@ -341,6 +343,63 @@ describe("paper-execution-router", () => {
     expect(order).toBeDefined();
     expect(order!.openedAt).toBe(freshOpenedAt);
     expect(order!.paperOrderMode).toBe("HEADLINE");
+  });
+
+  it("[9b] H6 paper opportunity admits exactly one headline paper order by stable source id", () => {
+    const dir = tmpDir();
+    const store = new PaperExecutionRouterStore(dir);
+    const now = new Date();
+    const openedAt = new Date(now.getTime() - 2 * 60_000).toISOString();
+    store.ensurePaperStartAt(new Date(now.getTime() - 5 * 60_000).toISOString());
+    const opportunity = {
+      sourceCandidateId: "h6trend:BTCUSDT:123",
+      scanBatchId: "h6trend",
+      symbol: "BTCUSDT",
+      direction: "LONG" as const,
+      regime: "Bullish expansion",
+      laneId: H6_TREND_PAPER_LANE_ID,
+      variantId: H6_TREND_PAPER_LANE_ID,
+      controllerMode: "LONG_ONLY",
+      entryPrice: 100,
+      stopLoss: 95,
+      takeProfitLevels: [104],
+      variantExitRule: "scaleout_tp1_trail" as const,
+      fillMode: "taker" as const,
+      plannedStopDistanceBps: 500,
+      oosUnconfirmed: true,
+      paperRiskLabel: "EXPERIMENTAL" as const,
+      paperOrderMode: "HEADLINE" as const,
+      openedAt,
+      provenance: null,
+      provenanceFieldMissing: [],
+    };
+
+    const first = admitPaperOpportunities({
+      store,
+      opportunities: [opportunity],
+      routerReport: routerOf("Bullish expansion"),
+      gateReport: emptyGate(),
+      now: now.toISOString(),
+    });
+    const second = admitPaperOpportunities({
+      store,
+      opportunities: [opportunity],
+      routerReport: routerOf("Bullish expansion"),
+      gateReport: emptyGate(),
+      now: now.toISOString(),
+    });
+
+    expect(first).toMatchObject({ admitted: 1, admittedDiagnostic: 0, admittedHeadline: 1 });
+    expect(second).toMatchObject({ admitted: 0, duplicateSuppressed: 1 });
+    const order = store.all.find((o) => o.selectedLaneId === H6_TREND_PAPER_LANE_ID);
+    expect(order).toMatchObject({
+      symbol: "BTCUSDT",
+      direction: "LONG",
+      openedAt,
+      paperStatus: "CREATED",
+      paperOrderMode: "HEADLINE",
+      variantExitRule: "scaleout_tp1_trail",
+    });
   });
 
   // [10] Bearish SHORT_ONLY + scaleout (headline) eligible

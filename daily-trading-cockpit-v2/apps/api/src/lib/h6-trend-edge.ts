@@ -11,13 +11,14 @@
 // Like fade-long, this is the new entry signal the chase-based scanner can't produce. It records
 // pullback-continuation entries on the universe each cycle (6h candles) and resolves them by
 // candle-walk with a TP1 + ATR-runner exit, accumulating OOS exactly like a variant lane. Honest cost model
-// (round-trip bps / stop bps + stop-out slippage on losers). Report-only — never touches the
-// allocator, paper book, live engine, or any strategy gate. All knobs env-tunable. PROVE OOS
-// before any read — literature ≠ this bot's edge (the +0.178R bullish-long seed didn't hold).
+// (round-trip bps / stop bps + stop-out slippage on losers). A paper adapter mirrors fresh canonical
+// std observations into the paper book so H6 can build the same lane-performance evidence as the
+// other paper lanes. Live remains gated by the live engine and explicit paper-order mode.
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import type { Candle } from "@dtc/shared";
 import { TAKER_ROUNDTRIP_BPS, STOP_OUT_SLIPPAGE_BPS, WATCHABLE_MIN_FRESH } from "./current-guard-variant-matrix.js";
+import type { PaperOpportunity } from "./paper-execution-router.js";
 
 function envNum(name: string, fallback: number): number {
   const n = Number(process.env[name]);
@@ -52,11 +53,17 @@ export const H6_TREND_MIN_TAKER_BUY_SELL_RATIO = Number(process.env.H6_TREND_MIN
 export const H6_TREND_BTC_DOMINANCE_MAX_RISE_PCT = Number(process.env.H6_TREND_BTC_DOMINANCE_MAX_RISE_PCT ?? 0.25);
 export const H6_TREND_TP1_R = Number(process.env.H6_TREND_TP1_R ?? 0.8);
 export const H6_TREND_TP1_EXIT_PCT = Number(process.env.H6_TREND_TP1_EXIT_PCT ?? 0.5);
+export const H6_TREND_PAPER_LANE_ID = "H6_TREND_CONTINUATION_LONG" as const;
+export const H6_TREND_PAPER_VARIANT_ID = H6_TREND_PAPER_LANE_ID;
 // Max bars to hold before mark-to-market (56 bars ≈ 14 days on 6h) — bounds a trend that never trails out.
 export const H6_TREND_MAX_HOLD_BARS = envNum("H6_TREND_MAX_HOLD_BARS", 56);
 // Recent closed bars scanned each cycle for fresh trend entries (40 ≈ 10 days on 6h). A wide window
 // bootstraps resolvable OOS (older entries already have forward bars to walk); deduped by bar.
 export const H6_TREND_LOOKBACK_BARS = envNum("H6_TREND_LOOKBACK_BARS", 40);
+export const H6_TREND_PAPER_ADMISSION_MAX_AGE_MS = envNum(
+  "H6_TREND_PAPER_ADMISSION_MAX_AGE_MS",
+  7 * 60 * 60 * 1000,
+);
 const H6_TREND_EXPIRY_MS = 21 * 24 * 60 * 60 * 1000; // trends hold longer than fade-long's 7d
 
 export type H6TrendGateStatus = "PASS" | "FAIL" | "UNAVAILABLE";
@@ -473,6 +480,59 @@ function buildH6TrendObs(
     exitReason: null,
     resolvedAt: null,
   };
+}
+
+export function buildH6TrendPaperOpportunities(
+  observations: readonly H6TrendObservation[],
+  opts: {
+    now: string;
+    regime: string | null;
+    controllerMode: string;
+    maxAgeMs?: number;
+    paperOrderMode?: "HEADLINE" | "DIAGNOSTIC_ONLY";
+  },
+): PaperOpportunity[] {
+  const nowMs = Date.parse(opts.now);
+  const maxAgeMs = opts.maxAgeMs ?? H6_TREND_PAPER_ADMISSION_MAX_AGE_MS;
+  const orderMode =
+    opts.paperOrderMode ??
+    (process.env.H6_TREND_PAPER_ORDER_MODE === "DIAGNOSTIC_ONLY" || process.env.H6_TREND_PAPER_DIAGNOSTIC === "1"
+      ? "DIAGNOSTIC_ONLY"
+      : "HEADLINE");
+  const out: PaperOpportunity[] = [];
+
+  for (const obs of observations) {
+    if (obs.status !== "OPEN") continue;
+    if ((obs.variant ?? "std") !== "std") continue;
+    if (!Number.isFinite(nowMs) || nowMs - obs.openedAtMs > maxAgeMs) continue;
+    const risk = obs.entryPrice - obs.initialStop;
+    if (!(risk > 0) || !(obs.entryPrice > 0) || !(obs.stopDistanceBps > 0)) continue;
+    const tp1R = obs.exitPolicy?.tp1R ?? H6_TREND_TP1_R;
+    out.push({
+      sourceCandidateId: obs.observationId,
+      scanBatchId: "h6trend",
+      symbol: obs.symbol,
+      direction: "LONG",
+      regime: opts.regime,
+      laneId: H6_TREND_PAPER_LANE_ID,
+      variantId: H6_TREND_PAPER_VARIANT_ID,
+      controllerMode: opts.controllerMode,
+      entryPrice: obs.entryPrice,
+      stopLoss: obs.initialStop,
+      takeProfitLevels: [obs.entryPrice + tp1R * risk],
+      variantExitRule: "scaleout_tp1_trail",
+      fillMode: "taker",
+      plannedStopDistanceBps: obs.stopDistanceBps,
+      oosUnconfirmed: true,
+      paperRiskLabel: "EXPERIMENTAL",
+      paperOrderMode: orderMode,
+      openedAt: obs.openedAt,
+      provenance: null,
+      provenanceFieldMissing: [],
+    });
+  }
+
+  return out;
 }
 
 /** Scan the lookback window for pullback-continuation entries on confirmed-closed bars. */

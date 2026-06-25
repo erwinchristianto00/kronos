@@ -7,7 +7,7 @@ import {
   type CurrentGuardVariantMatrixReport,
 } from "./current-guard-variant-matrix.js";
 import type { FadeLongReport } from "./fade-long-edge.js";
-import type { H6TrendReport } from "./h6-trend-edge.js";
+import { H6_TREND_PAPER_LANE_ID, type H6TrendReport } from "./h6-trend-edge.js";
 import type { MixedBudgetForwardValidationReport, MixedRegimeReport, OpenOrderStaleAudit } from "./mixed-regime-router.js";
 import type { PaperOrder, PaperPerformanceReport } from "./paper-execution-router.js";
 import { assessPaperTp, cgWideTpPctFromOrder } from "./paper-trading-controls.js";
@@ -54,8 +54,6 @@ export interface NeuralMapNode {
 }
 
 export type NeuralLaneStatsSource = "VM_SIM" | "PAPER_BOOK" | "H6_RESEARCH";
-
-const H6_TREND_LANE_ID = "H6_TREND_CONTINUATION_LONG";
 
 export interface NeuralMapLane {
   id: string;
@@ -698,7 +696,7 @@ function laneEconomics(orders: PaperOrder[], laneId: string) {
 }
 
 function laneLabel(id: string): string {
-  if (id === H6_TREND_LANE_ID) return "H6 TREND LONG";
+  if (id === H6_TREND_PAPER_LANE_ID) return "H6 TREND LONG";
   if (id === "CG_VARIANT_MATRIX:CG_WIDE_STOP_TP_WIDE") return "CG_WIDE SHORT";
   if (id === "CG_LONG_VARIANT_MATRIX:CG_WIDE_STOP_TP_WIDE") return "CG_WIDE LONG";
   if (id === "CG_LONG_VARIANT_MATRIX:CG_WIDE_LONG_RUNNER") return "CG_WIDE RUNNER 3R";
@@ -760,7 +758,7 @@ function buildH6TrendLane(report: H6TrendReport, startingEquity: number): Neural
     finite(netAvgR) && netAvgR <= 0 ? `netAvgR ${fmtR(netAvgR)} <= 0` : null,
     finite(report.pf) && report.pf <= 1.2 ? `PF ${report.pf.toFixed(2)} <= 1.20` : null,
     report.open === 0 ? "no current H6 full-context gate pass" : null,
-    "report-only H6 research lane; not wired to paper/live allocator",
+    "paper adapter waits for a fresh canonical H6 std signal",
   ].filter((item): item is string => Boolean(item));
   const cautions = [
     `exit ${report.exitPolicy.version}: TP1 ${Math.round(report.exitPolicy.tp1ExitPct * 100)}% at +${report.exitPolicy.tp1R.toFixed(1)}R, BE stop, ATR runner`,
@@ -771,8 +769,8 @@ function buildH6TrendLane(report: H6TrendReport, startingEquity: number): Neural
   ].filter((item): item is string => Boolean(item));
 
   return {
-    id: H6_TREND_LANE_ID,
-    label: laneLabel(H6_TREND_LANE_ID),
+    id: H6_TREND_PAPER_LANE_ID,
+    label: laneLabel(H6_TREND_PAPER_LANE_ID),
     health,
     evidenceHealth,
     active: report.open > 0,
@@ -822,7 +820,7 @@ function buildH6TrendLane(report: H6TrendReport, startingEquity: number): Neural
     totalPnlPct: null,
     headlinePnlPct: null,
     status,
-    reason: `H6 trend-continuation LONG research lane [stats: H6 research]; ${report.open} open / ${closed} closed. No paper/live orders are created by this lane.`,
+    reason: `H6 trend-continuation LONG research fallback [stats: H6 research]; ${report.open} open / ${closed} closed. Paper performance appears here after the paper adapter admits a fresh H6 signal.`,
   };
 }
 
@@ -1196,7 +1194,9 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
       reason: `${baseReason} ${sourceTag}${diagTag}`,
     };
   });
-  const h6Lane = input.h6Trend ? buildH6TrendLane(input.h6Trend, input.paper.startingEquity) : null;
+  const h6Lane = input.h6Trend && !laneIds.includes(H6_TREND_PAPER_LANE_ID)
+    ? buildH6TrendLane(input.h6Trend, input.paper.startingEquity)
+    : null;
   const lanes = [
     ...paperAndVmLanes,
     ...(h6Lane ? [h6Lane] : []),

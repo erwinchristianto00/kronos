@@ -8,11 +8,13 @@ import {
   detectH6TrendEntries,
   resolveH6Trend,
   buildH6TrendReport,
+  buildH6TrendPaperOpportunities,
   runH6TrendCycle,
   H6TrendStore,
   h6IsLargeCap,
   type H6TrendObservation,
   H6_TREND_ATR_TRAIL_MULT,
+  H6_TREND_PAPER_LANE_ID,
 } from "../src/lib/h6-trend-edge.js";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -177,6 +179,47 @@ describe("h6-trend-edge resolution", () => {
     expect(rep.tight).toBeDefined(); // A/B sibling present
     expect(rep.tightLargeCap).toBeDefined(); // focused long candidate present
     expect(rep.exitPolicy.version).toBe("tp1-50-be-atr-runner-v1");
+  });
+
+  it("[PAPER] converts fresh canonical H6 std observations into one paper opportunity", () => {
+    const openedAtMs = 10 * BAR;
+    const std = {
+      ...obs(),
+      observationId: `h6trend:BTCUSDT:${openedAtMs}`,
+      openedAtMs,
+      openedAt: new Date(openedAtMs).toISOString(),
+      variant: "std" as const,
+    };
+    const tight = {
+      ...std,
+      observationId: `h6trend:tight:BTCUSDT:${openedAtMs}`,
+      variant: "tight" as const,
+    };
+    const old = {
+      ...std,
+      observationId: "h6trend:BTCUSDT:old",
+      openedAtMs: 0,
+      openedAt: new Date(0).toISOString(),
+    };
+
+    const opportunities = buildH6TrendPaperOpportunities([std, tight, old], {
+      now: new Date(openedAtMs + 60_000).toISOString(),
+      regime: "Bullish expansion",
+      controllerMode: "LONG_ONLY",
+    });
+
+    expect(opportunities).toHaveLength(1);
+    expect(opportunities[0]).toMatchObject({
+      sourceCandidateId: std.observationId,
+      scanBatchId: "h6trend",
+      laneId: H6_TREND_PAPER_LANE_ID,
+      variantId: H6_TREND_PAPER_LANE_ID,
+      direction: "LONG",
+      paperOrderMode: "HEADLINE",
+      variantExitRule: "scaleout_tp1_trail",
+      openedAt: std.openedAt,
+    });
+    expect(opportunities[0]!.takeProfitLevels[0]).toBeCloseTo(104, 6);
   });
 
   it("[LARGECAP] h6IsLargeCap classifies majors vs high-beta alts", () => {

@@ -219,7 +219,14 @@ import {
   type KlineTuple as VariantMatrixKlineTuple,
 } from "../lib/current-guard-variant-matrix.js";
 import { getFadeLongStore, runFadeLongCycleGuarded, buildFadeLongReport, FADE_LONG_RESEARCH_QUARANTINED } from "../lib/fade-long-edge.js";
-import { getH6TrendStore, runH6TrendCycleGuarded, buildH6TrendReport, H6_TREND_INTERVAL } from "../lib/h6-trend-edge.js";
+import {
+  getH6TrendStore,
+  runH6TrendCycleGuarded,
+  buildH6TrendReport,
+  buildH6TrendPaperOpportunities,
+  H6_TREND_INTERVAL,
+  H6_TREND_PAPER_ADMISSION_MAX_AGE_MS,
+} from "../lib/h6-trend-edge.js";
 import { getCandidateFunnelLog } from "../lib/accelerated-evidence-candidate-funnel-log.js";
 import {
   buildPortfolioTrendShadowReport,
@@ -1688,6 +1695,37 @@ export async function registerShadowRoutes(
               allocatorReport.duplicateSuppressed += admitResult.duplicateSuppressed;
               admissionTrace.createdHeadline = admitResult.admittedHeadline;
               admissionTrace.createdDiagnostic = admitResult.admittedDiagnostic;
+            }
+
+            if (process.env.H6_TREND_PAPER_ENABLED !== "0") {
+              const h6Opportunities = buildH6TrendPaperOpportunities(getH6TrendStore().all, {
+                now: paperNow,
+                regime: regimeReport?.currentRegime ?? cached?.marketRegime ?? null,
+                controllerMode: _paperRouter.controllerMode,
+                maxAgeMs: H6_TREND_PAPER_ADMISSION_MAX_AGE_MS,
+              });
+              if (h6Opportunities.length > 0) {
+                if (!admissionTrace.paperAdmissionStartedAt) {
+                  admissionTrace.paperAdmissionStartedAt = new Date().toISOString();
+                }
+                const h6AdmitResult = admitPaperOpportunities({
+                  store: paperStore,
+                  opportunities: h6Opportunities,
+                  routerReport: _paperRouter,
+                  gateReport,
+                  now: paperNow,
+                  admissionMaxAgeMs: H6_TREND_PAPER_ADMISSION_MAX_AGE_MS,
+                });
+                admissionTrace.paperAdmissionFinishedAt = new Date().toISOString();
+                admissionTrace.createdHeadline += h6AdmitResult.admittedHeadline;
+                admissionTrace.createdDiagnostic += h6AdmitResult.admittedDiagnostic;
+                if (allocatorReport) {
+                  allocatorReport.paperOrdersCreated += h6AdmitResult.admitted;
+                  allocatorReport.createdHeadline += h6AdmitResult.admittedHeadline;
+                  allocatorReport.createdDiagnostic += h6AdmitResult.admittedDiagnostic;
+                  allocatorReport.duplicateSuppressed += h6AdmitResult.duplicateSuppressed;
+                }
+              }
             }
             // Report-only provenance audit + loser-fingerprint gate simulation are
             // intentionally NOT computed here. They (and the activeLane* metrics

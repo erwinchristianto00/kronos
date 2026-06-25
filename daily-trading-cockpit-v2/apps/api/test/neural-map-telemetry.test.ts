@@ -602,7 +602,7 @@ describe("neural map telemetry", () => {
       totalPnl: 0,
       health: "WARNING",
     });
-    expect(h6?.reason).toContain("No paper/live orders");
+    expect(h6?.reason).toContain("Paper performance appears here after the paper adapter admits");
     expect(h6?.blockers).toContain("no current H6 full-context gate pass");
     expect(h6?.cautions.some((item) => item.includes("TP1 50% at +0.8R"))).toBe(true);
   });
