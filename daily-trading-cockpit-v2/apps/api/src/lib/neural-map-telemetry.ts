@@ -53,6 +53,10 @@ export interface NeuralMapNode {
   detail: string[];
 }
 
+export type NeuralLaneStatsSource = "VM_SIM" | "PAPER_BOOK" | "H6_RESEARCH";
+
+const H6_TREND_LANE_ID = "H6_TREND_CONTINUATION_LONG";
+
 export interface NeuralMapLane {
   id: string;
   label: string;
@@ -71,11 +75,10 @@ export interface NeuralMapLane {
   pf: number | null;
   wr: number | null;
   /**
-   * Where netAvgR/pf/wr/closed come from: "VM_SIM" = the variant-matrix simulation row,
-   * "PAPER_BOOK" = realized paper orders. The two are DIFFERENT measurements — without this tag a
-   * VM-sim netAvgR rendered next to paper PnL dollars reads as one dataset (audit finding).
+   * Where netAvgR/pf/wr/closed come from. The sources are DIFFERENT measurements — without this tag
+   * a sim/research netAvgR rendered next to paper PnL dollars reads as one dataset (audit finding).
    */
-  statsSource: "VM_SIM" | "PAPER_BOOK";
+  statsSource: NeuralLaneStatsSource;
   payoffRatio: number | null;
   plus10bpsStillPositive: boolean | null;
   allThreeOosPositive: boolean | null;
@@ -695,6 +698,7 @@ function laneEconomics(orders: PaperOrder[], laneId: string) {
 }
 
 function laneLabel(id: string): string {
+  if (id === H6_TREND_LANE_ID) return "H6 TREND LONG";
   if (id === "CG_VARIANT_MATRIX:CG_WIDE_STOP_TP_WIDE") return "CG_WIDE SHORT";
   if (id === "CG_LONG_VARIANT_MATRIX:CG_WIDE_STOP_TP_WIDE") return "CG_WIDE LONG";
   if (id === "CG_LONG_VARIANT_MATRIX:CG_WIDE_LONG_RUNNER") return "CG_WIDE RUNNER 3R";
@@ -739,6 +743,87 @@ function performanceHealthFromLane(totalPnl: number, closed: number, open: numbe
   if (totalPnl > 0) return open > 0 ? "ACTIVE" : "HEALTHY";
   if (totalPnl < 0) return "CRITICAL";
   return closed > 0 || open > 0 ? "COLLECTING" : "IDLE";
+}
+
+function buildH6TrendLane(report: H6TrendReport, startingEquity: number): NeuralMapLane {
+  const closed = report.freshValid;
+  const status = report.status;
+  const netAvgR = report.netAvgR;
+  const evidenceHealth = healthFromLane(status, closed, netAvgR);
+  const health: NeuralHealth =
+    report.open > 0 ? "ACTIVE" :
+    closed === 0 ? "IDLE" :
+    evidenceHealth === "CRITICAL" ? "WARNING" :
+    evidenceHealth;
+  const blockers = [
+    closed < report.watchableThreshold ? `fresh-valid ${closed}/${report.watchableThreshold}` : null,
+    finite(netAvgR) && netAvgR <= 0 ? `netAvgR ${fmtR(netAvgR)} <= 0` : null,
+    finite(report.pf) && report.pf <= 1.2 ? `PF ${report.pf.toFixed(2)} <= 1.20` : null,
+    report.open === 0 ? "no current H6 full-context gate pass" : null,
+    "report-only H6 research lane; not wired to paper/live allocator",
+  ].filter((item): item is string => Boolean(item));
+  const cautions = [
+    `exit ${report.exitPolicy.version}: TP1 ${Math.round(report.exitPolicy.tp1ExitPct * 100)}% at +${report.exitPolicy.tp1R.toFixed(1)}R, BE stop, ATR runner`,
+    report.avgMaxFavorableR !== null ? `avg MFE ${fmtR(report.avgMaxFavorableR)}` : null,
+    report.tp1HitRate !== null ? `TP1 hit ${(report.tp1HitRate * 100).toFixed(1)}%` : null,
+    report.tight.freshValid > 0 ? `tight A/B ${fmtR(report.tight.netAvgR)} net, n=${report.tight.freshValid}` : null,
+    report.tightLargeCap.freshValid > 0 ? `large-cap bull cohort ${fmtR(report.tightLargeCap.netAvgR)} net, n=${report.tightLargeCap.freshValid}` : null,
+  ].filter((item): item is string => Boolean(item));
+
+  return {
+    id: H6_TREND_LANE_ID,
+    label: laneLabel(H6_TREND_LANE_ID),
+    health,
+    evidenceHealth,
+    active: report.open > 0,
+    open: report.open,
+    closed,
+    oosFreshValid: closed,
+    oosThreshold: report.watchableThreshold,
+    netAvgR,
+    pf: report.pf,
+    wr: report.wr,
+    statsSource: "H6_RESEARCH",
+    payoffRatio: null,
+    plus10bpsStillPositive: null,
+    allThreeOosPositive: null,
+    oosThirds: null,
+    approxMaxDrawdownR: null,
+    topSymbolPnlShare: null,
+    calendarDays: null,
+    distinctRegimes: null,
+    infraReady: null,
+    blockers,
+    cautions,
+    headlinePnl: 0,
+    diagnosticPnl: 0,
+    totalPnl: 0,
+    openUnrealizedPnl: null,
+    openUnrealizedR: null,
+    diagnosticUnrealizedPnl: null,
+    diagnosticUnrealizedR: null,
+    headlineUnrealizedPnl: null,
+    headlineUnrealizedR: null,
+    openMaxFavorablePnl: null,
+    openMaxFavorableR: null,
+    openAvgDistanceToTpPct: null,
+    openNearestDistanceToTpPct: null,
+    openAvgEntryPrice: null,
+    openAvgMarkPrice: null,
+    openAvgTakeProfitPrice: null,
+    openAvgMfePct: null,
+    openP75MfePct: null,
+    openP90MfePct: null,
+    openAvgConfiguredTpPct: null,
+    openTpAssessment: null,
+    openMarkedSymbolCount: 0,
+    pnlIsDiagnosticOnly: false,
+    startingEquity,
+    totalPnlPct: null,
+    headlinePnlPct: null,
+    status,
+    reason: `H6 trend-continuation LONG research lane [stats: H6 research]; ${report.open} open / ${closed} closed. No paper/live orders are created by this lane.`,
+  };
 }
 
 function pnlPct(pnl: number, startingEquity: number): number | null {
@@ -1008,7 +1093,7 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
   ]);
   const quarantinedLaneIds = new Set(input.quarantinedLaneIds ?? []);
 
-  const lanes = laneIds.map((id): NeuralMapLane => {
+  const paperAndVmLanes = laneIds.map((id): NeuralMapLane => {
     const row = rowsById.get(id);
     const economics = laneEconomics(input.orders, id);
     const unrealized = input.paperUnrealized?.lanes[id] ?? null;
@@ -1023,7 +1108,7 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
     // (netAvgR/pf/wr/closed) is the SIMULATION row, not paper-realized — tag it so a sim netAvgR
     // rendered next to paper PnL dollars can never read as one dataset. Lanes without a VM row
     // (e.g. CG_LONG_VARIANT_MATRIX:*) show paper-realized stats under the same fields.
-    const statsSource: "VM_SIM" | "PAPER_BOOK" = evidenceRow ? "VM_SIM" : "PAPER_BOOK";
+    const statsSource: NeuralLaneStatsSource = evidenceRow ? "VM_SIM" : "PAPER_BOOK";
     const infraReady = row
       ? input.variantMatrix.killSwitchReady && input.variantMatrix.orderReconciliationReady && input.variantMatrix.exchangeHealthReady
       : null;
@@ -1110,7 +1195,12 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
       status: quarantined ? "QUARANTINED" : status,
       reason: `${baseReason} ${sourceTag}${diagTag}`,
     };
-  }).sort((a, b) => Number(b.active) - Number(a.active) || b.closed - a.closed);
+  });
+  const h6Lane = input.h6Trend ? buildH6TrendLane(input.h6Trend, input.paper.startingEquity) : null;
+  const lanes = [
+    ...paperAndVmLanes,
+    ...(h6Lane ? [h6Lane] : []),
+  ].sort((a, b) => Number(b.active) - Number(a.active) || b.closed - a.closed);
 
   const inputHealth: NeuralHealth = scanFailed || hangMarkers.length > 0 ? "CRITICAL" : timeoutSymbols > 0 ? "WARNING" : "HEALTHY";
   const externalHealth: NeuralHealth = degradedProviders.length > 0 || providerFailures > 0 ? "WARNING" : "HEALTHY";

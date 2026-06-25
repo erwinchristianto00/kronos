@@ -50,7 +50,7 @@ interface NeuralLane {
   netAvgR: number | null;
   pf: number | null;
   wr: number | null;
-  statsSource: 'VM_SIM' | 'PAPER_BOOK';
+  statsSource: 'VM_SIM' | 'PAPER_BOOK' | 'H6_RESEARCH';
   payoffRatio: number | null;
   plus10bpsStillPositive: boolean | null;
   allThreeOosPositive: boolean | null;
@@ -90,6 +90,18 @@ interface NeuralLane {
   pnlIsDiagnosticOnly: boolean;
   status: string;
   reason: string;
+}
+
+function statsSourceShortLabel(source: NeuralLane['statsSource']): string {
+  if (source === 'VM_SIM') return 'VM sim';
+  if (source === 'H6_RESEARCH') return 'H6 research';
+  return 'Paper book';
+}
+
+function statsSourceLongLabel(source: NeuralLane['statsSource']): string {
+  if (source === 'VM_SIM') return 'Variant-matrix simulation';
+  if (source === 'H6_RESEARCH') return 'H6 trend research';
+  return 'Paper book';
 }
 
 interface DiagnosticDirectionStats {
@@ -451,6 +463,9 @@ function fmtMs(value: number | null): string {
 }
 
 function laneDiagnosis(lane: NeuralLane): string {
+  if (lane.statsSource === 'H6_RESEARCH') {
+    return 'H6 trend-continuation is a report-only research lane. It measures R-based evidence and gate quality, but it does not create paper/live orders yet.';
+  }
   if (lane.diagnosticUnrealizedPnl !== null && lane.diagnosticUnrealizedPnl !== 0) {
     return `Open diagnostic mark-to-market is ${fmtUsdt(lane.diagnosticUnrealizedPnl)} (${fmtR(lane.diagnosticUnrealizedR)}). Closed evidence remains separate.`;
   }
@@ -473,6 +488,9 @@ function laneMetricLabel(
     // Measurement, not a real position — label it so the open mark-to-market on
     // diagnostic probes does not read as a real loss.
     return `meas ${fmtUsdt(lane.diagnosticUnrealizedPnl)} / open`;
+  }
+  if (lane.statsSource === 'H6_RESEARCH') {
+    return `${fmtR(lane.netAvgR)} / n=${lane.closed}`;
   }
   if (lane.totalPnl > 0 && lane.totalPnlPct !== null) {
     return `${fmtPct(lane.totalPnlPct)} / n=${lane.closed}`;
@@ -1253,7 +1271,7 @@ export default function NeuralMindmap() {
                   <td>{lane.oosFreshValid ?? lane.closed} / {lane.oosThreshold}</td>
                   <td className={(lane.netAvgR ?? 0) >= 0 ? 'tone-healthy' : 'tone-critical'}>{fmtR(lane.netAvgR)}</td>
                   <td>{fmtNumber(lane.pf)}</td>
-                  <td>{lane.statsSource === 'VM_SIM' ? 'VM sim' : 'Paper book'}</td>
+                  <td>{statsSourceShortLabel(lane.statsSource)}</td>
                   <td>{progress.blockers.slice(0, 2).join(' | ') || 'None'}</td>
                 </tr>
               ))}
@@ -1473,7 +1491,7 @@ export default function NeuralMindmap() {
                   <div><dt>Next stage</dt><dd>{selectedLaneProgress?.nextStage ?? 'n/a'}</dd></div>
                   <div><dt>Progress</dt><dd>{selectedLaneProgress ? `${selectedLaneProgress.progressPct}%` : 'n/a'}</dd></div>
                   <div><dt>Evidence health</dt><dd>{HEALTH_LABELS[selectedLane.evidenceHealth]}</dd></div>
-                  <div><dt>Stats source</dt><dd>{selectedLane.statsSource === 'VM_SIM' ? 'Variant-matrix simulation' : 'Paper book'}</dd></div>
+                  <div><dt>Stats source</dt><dd>{statsSourceLongLabel(selectedLane.statsSource)}</dd></div>
                   <div><dt>Open / closed</dt><dd>{selectedLane.open} / {selectedLane.closed}</dd></div>
                   <div><dt>Net Avg R</dt><dd className={(selectedLane.netAvgR ?? 0) >= 0 ? 'tone-healthy' : 'tone-critical'}>{fmtR(selectedLane.netAvgR)}</dd></div>
                   <div><dt>PF / WR</dt><dd>{fmtNumber(selectedLane.pf)} / {selectedLane.wr === null ? 'n/a' : `${(selectedLane.wr * 100).toFixed(1)}%`}</dd></div>
