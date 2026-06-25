@@ -232,6 +232,7 @@ function makeConfig(overrides: Partial<LiveExecutionConfig> = {}): LiveExecution
     maxDrawdownUsd: 40,
     maxLeverage: 2,
     maxNotionalPerTrade: 250,
+    maxPaperOrderAgeMs: 24 * 60 * 60 * 1000,
     mirrorAllPaperOrders: false,
     autoArm: false,
     mainnetConfirmed: false,
@@ -244,6 +245,7 @@ function makeEngine(opts: {
   client?: FakeLiveClient;
   paper?: PaperStoreReader;
   config?: Partial<LiveExecutionConfig>;
+  isPaperOrderLiveEligible?: (order: PaperOrder, nowIso: string) => boolean;
   nowIso?: () => string;
 } = {}) {
   const client = opts.client ?? new FakeLiveClient();
@@ -253,6 +255,7 @@ function makeEngine(opts: {
     client: client as unknown as LivePrivateClient,
     store,
     paperStore: opts.paper ?? makePaperStore([]),
+    isPaperOrderLiveEligible: opts.isPaperOrderLiveEligible,
     nowIso: opts.nowIso ?? (() => "2099-01-02T12:00:00.000Z"),
   });
   return { engine, client, store };
@@ -458,6 +461,49 @@ describe("LiveExecutionEngine", () => {
     await halted.engine.arm();
     await halted.engine.tick();
     expect(halted.client.placed.length).toBe(0);
+  });
+
+  it("skips stale HEADLINE paper orders on live mirror re-arm", async () => {
+    const stale = paperOrder({
+      paperOrderId: "paper-stale",
+      createdAt: "2099-01-02T11:00:00.000Z",
+    } as Partial<PaperOrder>);
+    const { engine, client } = makeEngine({
+      paper: makePaperStore([stale]),
+      config: { maxPaperOrderAgeMs: 5 * 60 * 1000 },
+      nowIso: () => "2099-01-02T12:00:00.000Z",
+    });
+    await engine.arm();
+    await engine.tick();
+    expect(client.placed.length).toBe(0);
+  });
+
+  it("mirrors only paper orders whose lane is still live-eligible at mirror time", async () => {
+    const unstable = paperOrder({
+      paperOrderId: "paper-unstable",
+      selectedLaneId: "CG_VARIANT_MATRIX:CG_MAKER_LIMIT_SIM",
+    } as Partial<PaperOrder>);
+    const stable = paperOrder({
+      paperOrderId: "paper-stable",
+      selectedLaneId: "CG_VARIANT_MATRIX:CG_WIDE_FAST_SHORT",
+      symbol: "BTCUSDT",
+    } as Partial<PaperOrder>);
+    const client = new FakeLiveClient();
+    client.getExchangeFilters = async () =>
+      new Map([
+        ["ETHUSDT", FILTERS],
+        ["BTCUSDT", { ...FILTERS, symbol: "BTCUSDT" }],
+      ]);
+    const { engine } = makeEngine({
+      client,
+      paper: makePaperStore([unstable, stable]),
+      isPaperOrderLiveEligible: (order) => order.selectedLaneId.endsWith("CG_WIDE_FAST_SHORT"),
+    });
+    await engine.arm();
+    await engine.tick();
+    const entries = client.placed.filter((p) => p.type === "MARKET" && !p.reduceOnly);
+    expect(entries).toHaveLength(1);
+    expect(entries[0]!.symbol).toBe("BTCUSDT");
   });
 
   it("respects max concurrent positions and one-symbol-at-a-time", async () => {

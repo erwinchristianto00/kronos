@@ -53,6 +53,11 @@ export interface LiveExecutionConfig {
   maxDrawdownUsd: number;
   maxLeverage: number;
   maxNotionalPerTrade: number;
+  /**
+   * Normal live mirror freshness window for paper HEADLINE orders. Prevents a re-arm from
+   * backfilling hours-old paper signals whose market context has already drifted.
+   */
+  maxPaperOrderAgeMs: number;
   /** Testnet-only: mirror every open paper order, including diagnostic lanes and pre-restart orders. */
   mirrorAllPaperOrders: boolean;
   autoArm: boolean;
@@ -94,6 +99,7 @@ export function parseLiveExecutionConfig(env: NodeJS.ProcessEnv = process.env): 
     maxDrawdownUsd: envNum(env.LIVE_MAX_DRAWDOWN_USD, 40),
     maxLeverage: Math.floor(envNum(env.LIVE_MAX_LEVERAGE, 2)),
     maxNotionalPerTrade: envNum(env.LIVE_MAX_NOTIONAL_PER_TRADE, 250),
+    maxPaperOrderAgeMs: Math.floor(envNum(env.LIVE_MAX_PAPER_ORDER_AGE_MS, 10 * 60 * 1000)),
     mirrorAllPaperOrders: env.LIVE_MIRROR_ALL_PAPER === "1" && liveEnv === "testnet",
     autoArm: env.LIVE_AUTO_ARM === "1" && liveEnv === "testnet", // mainnet NEVER auto-arms
     mainnetConfirmed,
@@ -356,6 +362,7 @@ export interface LiveExecutionEngineOptions {
   client: LivePrivateClient;
   store: LiveExecutionStore;
   paperStore: PaperStoreReader;
+  isPaperOrderLiveEligible?: (order: PaperOrder, nowIso: string) => boolean;
   nowIso?: () => string;
 }
 
@@ -376,6 +383,7 @@ export class LiveExecutionEngine {
   private readonly client: LivePrivateClient;
   private readonly store: LiveExecutionStore;
   private readonly paperStore: PaperStoreReader;
+  private readonly isPaperOrderLiveEligible: (order: PaperOrder, nowIso: string) => boolean;
   private readonly nowIso: () => string;
 
   /** In-memory ONLY — restart always boots disarmed. */
@@ -394,6 +402,7 @@ export class LiveExecutionEngine {
     this.client = options.client;
     this.store = options.store;
     this.paperStore = options.paperStore;
+    this.isPaperOrderLiveEligible = options.isPaperOrderLiveEligible ?? (() => true);
     this.nowIso = options.nowIso ?? (() => new Date().toISOString());
     // Auto-arm must NOT punch through a latched kill: a restart preserves the kill until an
     // explicit resetKill(). (arm() already enforces this; the constructor path bypassed it.)
@@ -581,6 +590,7 @@ export class LiveExecutionEngine {
         maxDrawdownUsd: this.config.maxDrawdownUsd,
         maxLeverage: this.config.maxLeverage,
         maxNotionalPerTrade: this.config.maxNotionalPerTrade,
+        maxPaperOrderAgeMs: this.config.maxPaperOrderAgeMs,
         mirrorAllPaperOrders: this.config.mirrorAllPaperOrders,
       },
     };
@@ -1044,7 +1054,10 @@ export class LiveExecutionEngine {
     const candidates = this.paperStore.all
       .filter(
         (o) =>
-          (this.config.mirrorAllPaperOrders || o.paperOrderMode === "HEADLINE") &&
+          (this.config.mirrorAllPaperOrders ||
+            (o.paperOrderMode === "HEADLINE" &&
+              this.isFreshPaperOrder(o, now) &&
+              this.isPaperOrderLiveEligible(o, now))) &&
           o.diagnosticLabel == null &&
           MIRRORABLE_PAPER_STATUSES.has(o.paperStatus) &&
           (this.config.mirrorAllPaperOrders || o.createdAt > st.lastSeenCreatedAt) &&
@@ -1117,6 +1130,13 @@ export class LiveExecutionEngine {
     } else if (pruned) {
       this.store.save();
     }
+  }
+
+  private isFreshPaperOrder(order: PaperOrder, nowIso: string): boolean {
+    const createdMs = new Date(order.createdAt).getTime();
+    const nowMs = new Date(nowIso).getTime();
+    if (!Number.isFinite(createdMs) || !Number.isFinite(nowMs)) return false;
+    return nowMs - createdMs <= this.config.maxPaperOrderAgeMs;
   }
 
   private combinedPlan(

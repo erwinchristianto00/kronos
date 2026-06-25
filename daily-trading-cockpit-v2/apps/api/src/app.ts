@@ -23,6 +23,10 @@ import {
   parseLiveExecutionConfig,
 } from "./lib/live-execution-engine.js";
 import { getPaperExecutionRouterStore } from "./lib/paper-execution-router.js";
+import {
+  buildCurrentGuardVariantMatrixReport,
+  getCurrentGuardVariantMatrixStore,
+} from "./lib/current-guard-variant-matrix.js";
 
 export interface AppOptions {
   fetchImpl?: typeof fetch;
@@ -124,6 +128,12 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       client: liveClient,
       store: new LiveExecutionStore(),
       paperStore: getPaperExecutionRouterStore(),
+      isPaperOrderLiveEligible: (order) => {
+        const report = buildCurrentGuardVariantMatrixReport(getCurrentGuardVariantMatrixStore());
+        const laneVariantId = order.selectedLaneId.split(":").pop() ?? order.selectedLaneId;
+        const row = report.rows.find((candidate) => candidate.variantId === laneVariantId);
+        return row?.status === "STABLE_CANDIDATE";
+      },
     });
     if (!isTest) liveEngine.start();
   }
