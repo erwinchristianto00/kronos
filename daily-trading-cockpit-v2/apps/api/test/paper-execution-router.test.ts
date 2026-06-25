@@ -161,12 +161,13 @@ function makeVmObs(args: {
   entryPrice?: number;
   stopLoss?: number;
   tps?: number[];
+  variantId?: string;
 }): any {
   const symbol = args.symbol ?? "ETHUSDT";
   const direction = args.direction ?? "SHORT";
   return {
     observationId: args.observationId,
-    variantId: "CG_WIDE_STOP_TP_WIDE",
+    variantId: args.variantId ?? "CG_WIDE_STOP_TP_WIDE",
     variantVersion: "current-guard-variant-matrix-v1",
     sourceSignalId: `sig-${args.observationId}`,
     sourceObservationKey: `${symbol}|${direction}|${args.openedAt}`,
@@ -517,6 +518,35 @@ describe("paper-execution-router", () => {
     const gate = emptyGate();
     expect(gate.liveBlocked).toBe(true);
     expect(gate.microPilotAllowed).toBe(false);
+  });
+
+  it("[17c] allocator-only admission does not write SOURCE_STALE rejects from the variant tape", async () => {
+    const dir = tmpDir();
+    const vmStore = await buildWinningVmStore(dir);
+    const vmReport = buildCurrentGuardVariantMatrixReport(vmStore, { capturedAt: new Date().toISOString() });
+    const staleOpenedAt = new Date(Date.now() - PAPER_ADMISSION_MAX_AGE_MS - 60_000).toISOString();
+    vmStore.add(makeVmObs({
+      observationId: "stale-scaleout-obs",
+      openedAt: staleOpenedAt,
+      variantId: "CG_SCALEOUT_TP1_TRAIL",
+    }));
+    const store = new PaperExecutionRouterStore(dir);
+
+    const report = await runPaperAdmissionAndResolution({
+      store,
+      vmStore,
+      routerReport: routerOf("Bearish pressure"),
+      vmReport,
+      gateReport: emptyGate(),
+      binanceClient: { getKlines: async () => [] },
+      now: new Date().toISOString(),
+      allocatorOnlyAdmission: true,
+      allocatorActiveLaneId: "CG_VARIANT_MATRIX:CG_SCALEOUT_TP1_TRAIL",
+    });
+
+    expect(store.all.some((o) => o.closeReason === "SOURCE_STALE")).toBe(false);
+    expect(store.all.some((o) => o.diagnosticLabel === "SOURCE_TOO_OLD_FOR_PAPER_ADMISSION")).toBe(false);
+    expect(report.activeLane).toBe("CG_VARIANT_MATRIX:CG_SCALEOUT_TP1_TRAIL");
   });
 
   // [18] Loss does not trigger hard daily stop

@@ -1497,6 +1497,7 @@ export async function registerShadowRoutes(
           });
           const paperNow = new Date().toISOString();
           const paperValidationAllowed = process.env.PAPER_VALIDATION_ALLOWED === "1";
+          const paperAllocatorOnlyAdmission = process.env.PAPER_ALLOCATOR_ONLY_ADMISSION === "1";
 
           // ── Paper opportunity allocator (fresh scan candidates × paper lanes) ──
           // Evaluate the most recent cached /api/scan candidates directly so paper
@@ -1716,6 +1717,7 @@ export async function registerShadowRoutes(
                   ),
                 };
 
+          const allocatorSelectedLaneId = allocatorReport?.selectedOpportunities[0]?.laneId ?? null;
           const paperRunPromise = runPaperAdmissionAndResolution({
             store: paperStore,
             vmStore: getCurrentGuardVariantMatrixStore(),
@@ -1742,9 +1744,10 @@ export async function registerShadowRoutes(
             now: paperNow,
             paperValidationAllowed,
             allocatorActiveLaneId:
-              _paperRouter.regimeFamily === "MIXED"
-                ? allocatorReport?.selectedOpportunities[0]?.laneId ?? null
+              paperAllocatorOnlyAdmission || _paperRouter.regimeFamily === "MIXED"
+                ? allocatorSelectedLaneId
                 : null,
+            allocatorOnlyAdmission: paperAllocatorOnlyAdmission,
             executionModel: _paperExecModel,
             // 8/run was far too tight for a live book of ~200+ open orders (it left the book
             // barely resolving and piling toward the 7-day expiry). Budget is now spent only on

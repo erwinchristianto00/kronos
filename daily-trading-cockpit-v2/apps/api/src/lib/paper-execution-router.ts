@@ -4048,6 +4048,11 @@ export interface PaperRunInputs {
    * or clearing the report lane after allocator admission.
    */
   allocatorActiveLaneId?: string | null;
+  /**
+   * When true, new paper orders are admitted only from allocator-selected fresh scan
+   * opportunities. The legacy variant-matrix tape remains resolver/backlog input only.
+   */
+  allocatorOnlyAdmission?: boolean;
   /** Live-execution fidelity for resolution fills. Defaults to IDEAL (zero slippage). */
   executionModel?: PaperExecutionModel;
   /** Bounds one resolver pass so the operator brief cannot monopolize the API event loop. */
@@ -4072,6 +4077,8 @@ export async function runPaperAdmissionAndResolution(
   });
 
   const allocatorActiveLaneId = inputs.allocatorActiveLaneId ?? null;
+  const allocatorOnlyAdmission = inputs.allocatorOnlyAdmission === true;
+  const variantTapeAdmissionLanes = allocatorOnlyAdmission ? [] : eligibleLanes;
   let noOrderReason: string | null = null;
   // Portfolio drawdown circuit-breaker: when tripped, halt NEW paper admission (both the
   // variant-matrix path here and the allocator path in admitPaperOpportunities). Paper-only;
@@ -4079,8 +4086,8 @@ export async function runPaperAdmissionAndResolution(
   const admissionHalted = store.isAdmissionHalted(now);
   if (admissionHalted) {
     noOrderReason = `portfolio drawdown circuit-breaker halt until ${store.getBreakerState().breakerHaltUntil}`;
-  } else if (eligibleLanes.length > 0) {
-    for (const eligibleLane of eligibleLanes) {
+  } else if (variantTapeAdmissionLanes.length > 0) {
+    for (const eligibleLane of variantTapeAdmissionLanes) {
       admitPaperOrders({
         store,
         vmStore,
@@ -4093,6 +4100,8 @@ export async function runPaperAdmissionAndResolution(
         maxNotionalCap: inputs.maxNotionalCap,
       });
     }
+  } else if (allocatorOnlyAdmission && allocatorActiveLaneId === null) {
+    noOrderReason = "allocator-only admission waiting for fresh scan opportunity";
   } else if (allocatorActiveLaneId === null) {
     noOrderReason = `no eligible paper lane under mode=${routerReport.controllerMode} regime=${routerReport.regimeFamily}`;
   }
@@ -4154,7 +4163,7 @@ export async function runPaperAdmissionAndResolution(
     /* breaker bookkeeping is best-effort */
   }
 
-  const primaryEligibleLane = eligibleLanes[0] ?? null;
+  const primaryEligibleLane = variantTapeAdmissionLanes[0] ?? null;
   const effectiveActiveLaneId =
     primaryEligibleLane?.laneId ??
     allocatorActiveLaneId ??
