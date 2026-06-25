@@ -1,4 +1,4 @@
-// Fade-long edge (mean-reversion BUY-THE-DIP) — a real signal lane, NOT a shadow validator.
+// Fade-long edge (mean-reversion BUY-THE-DIP) — quarantined research lane, NOT a shadow validator.
 //
 // The 2026-06-22 audit proved the bot's LONG side has no edge because every long CHASES
 // (entryDrift median +4 ATR, zero dips) in a mean-reverting market → 49% stop out, even
@@ -8,16 +8,16 @@
 // on the very high-beta alts that bled as chase-longs (WLD +1.61%, FET +0.55%). So the alt-long
 // bleed was a CHASE problem, not the alts.
 //
-// This module is the new entry signal the chase-based scanner can't produce. It records oversold
-// fade-long observations on the universe each cycle and resolves them by candle-walk, accumulating
-// OOS exactly like a variant lane. Geometry + cost mirror the variant matrix (honest costR =
-// round-trip bps / stop bps, extra stop-out slippage on losers). All knobs env-tunable.
+// The follow-up audit concluded that generic RSI dip-buy is solving the wrong long problem: it
+// needs panic/washout/reclaim structure, not naked oversold. Keep the module for historical OOS and
+// future panic-reclaim research, but quarantine it by default so it no longer competes with H6.
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import type { Candle } from "@dtc/shared";
 import { TAKER_ROUNDTRIP_BPS, STOP_OUT_SLIPPAGE_BPS, WATCHABLE_MIN_FRESH } from "./current-guard-variant-matrix.js";
 
 export const FADE_LONG_RSI_PERIOD = 14;
+export const FADE_LONG_RESEARCH_QUARANTINED = process.env.FADE_LONG_RESEARCH_QUARANTINED !== "0";
 export const FADE_LONG_RSI_THRESHOLD = Number(process.env.FADE_LONG_RSI_THRESHOLD) || 30;
 export const FADE_LONG_STOP_PCT = Number(process.env.FADE_LONG_STOP_PCT) || 0.015; // 1.5% stop below entry
 export const FADE_LONG_TP_PCT = Number(process.env.FADE_LONG_TP_PCT) || 0.0075; // +0.75% mean-revert bounce target

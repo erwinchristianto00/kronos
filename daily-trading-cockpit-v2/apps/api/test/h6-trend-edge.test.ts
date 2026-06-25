@@ -4,6 +4,7 @@ import {
   computeEMA,
   computeROC,
   computeATR,
+  computeADX,
   detectH6TrendEntries,
   resolveH6Trend,
   buildH6TrendReport,
@@ -17,8 +18,32 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const BAR = 6 * 60 * 60 * 1000;
-function mk(i: number, close: number, high?: number, low?: number): Candle {
-  return { openTime: i * BAR, open: close, high: high ?? close + 1, low: low ?? close - 1, close, volume: 1 };
+function mk(i: number, close: number, high?: number, low?: number, open = close, volume = 1): Candle {
+  return { openTime: i * BAR, open, high: high ?? close + 1, low: low ?? close - 1, close, volume };
+}
+
+function trendCandles(count: number, base = 100, step = 1, volume = 100): Candle[] {
+  return Array.from({ length: count }, (_, i) => {
+    const close = base + i * step;
+    return mk(i, close, close + 1, close - 1, close - 0.2, volume);
+  });
+}
+
+function bullContext() {
+  return {
+    dailyCandles: trendCandles(260, 100, 1, 100),
+    h4Candles: trendCandles(120, 100, 0.8, 100),
+    fundingRate: 0.0001,
+    openInterestChangePercent: 0.4,
+    takerBuySellRatio: 1.15,
+  };
+}
+
+function h6PullbackSetup(): Candle[] {
+  const candles = trendCandles(130, 100, 1, 100);
+  // Final bar reclaims EMA20 after a pullback wick; this is the H6 v2 entry shape.
+  candles[129] = mk(129, 230, 232, 214, 225, 500);
+  return candles;
 }
 
 describe("h6-trend-edge indicators", () => {
@@ -39,18 +64,19 @@ describe("h6-trend-edge indicators", () => {
     const atr = computeATR(candles, 14);
     expect(atr[13]).toBeNull();
     expect(atr[20]).toBeGreaterThan(0);
+
+    const adx = computeADX(candles, 14);
+    expect(adx[27]).not.toBeNull();
+    expect(adx[49]).toBeGreaterThan(20);
   });
 });
 
 describe("h6-trend-edge detection", () => {
-  it("[DETECT] fires a fresh LONG entry on a base→uptrend, none on a flat series", () => {
-    // 90 flat bars (EMAs converge to 100) then a steady ramp up.
-    const flat = Array.from({ length: 90 }, (_, i) => mk(i, 100, 100.5, 99.5));
-    const ramp = Array.from({ length: 40 }, (_, k) => {
-      const c = 101 + k; // 101..140
-      return mk(90 + k, c, c + 1, c - 1);
+  it("[DETECT] fires a LONG entry only on bull-trend pullback reclaim with participation context", () => {
+    const entries = detectH6TrendEntries("BTCUSDT", h6PullbackSetup(), {
+      context: bullContext(),
+      requireFullContext: true,
     });
-    const entries = detectH6TrendEntries("BTCUSDT", [...flat, ...ramp]);
     expect(entries.every((e) => e.direction === "LONG")).toBe(true);
     // one fresh entry bar → one obs per exit A/B variant (std + tight), not one per bar.
     expect(entries.length).toBe(2);
@@ -59,10 +85,27 @@ describe("h6-trend-edge detection", () => {
     const tight = entries.find((e) => e.variant === "tight")!;
     expect(std.initialStop).toBeLessThan(std.entryPrice); // long stop below entry
     expect(tight.stopDistanceBps).toBeLessThan(std.stopDistanceBps); // tight trail = closer stop
+    expect(std.entryGate?.checks.dailyEma50Gt200).toBe("PASS");
+    expect(std.entryGate?.checks.pullbackToEma20).toBe("PASS");
+    expect(std.exitPolicy?.version).toBe("tp1-50-be-atr-runner-v1");
 
     // A purely flat series has no uptrend → no entries.
     const allFlat = Array.from({ length: 130 }, (_, i) => mk(i, 100, 100.5, 99.5));
     expect(detectH6TrendEntries("BTCUSDT", allFlat).length).toBe(0);
+  });
+
+  it("[GATE] rejects full-context entries when funding or participation fails", () => {
+    const entries = detectH6TrendEntries("BTCUSDT", h6PullbackSetup(), {
+      context: { ...bullContext(), fundingRate: -0.001 },
+      requireFullContext: true,
+    });
+    expect(entries.length).toBe(0);
+
+    const weakOi = detectH6TrendEntries("BTCUSDT", h6PullbackSetup(), {
+      context: { ...bullContext(), openInterestChangePercent: -0.2 },
+      requireFullContext: true,
+    });
+    expect(weakOi.length).toBe(0);
   });
 });
 
@@ -88,13 +131,17 @@ describe("h6-trend-edge resolution", () => {
     resolvedAt: null,
   });
 
-  it("[TRAIL] banks a winner when price runs up then pierces the chandelier trail", () => {
+  it("[TRAIL] banks TP1 partial, moves runner to breakeven, then exits the ATR runner", () => {
     // rise to 120 (trail = 120-5 = 115), then a bar low 114 < 115 → exit at 115, grossR = (115-100)/5 = 3
     const fwd = [mk(1, 104, 105, 101), mk(2, 109, 110, 104), mk(3, 119, 120, 109), mk(4, 116, 120, 114)];
     const patch = resolveH6Trend(obs(), fwd, 5 * BAR);
     expect(patch?.status).toBe("CLOSED_WIN");
     expect(patch?.exitReason).toBe("TRAIL_STOP");
-    expect(patch?.grossR).toBeCloseTo(3, 6);
+    // 50% at +0.8R and 50% runner at +3R = +1.9R blended.
+    expect(patch?.grossR).toBeCloseTo(1.9, 6);
+    expect(patch?.tp1Hit).toBe(true);
+    expect(patch?.partialRealizedR).toBeCloseTo(0.4, 6);
+    expect(patch?.runnerRealizedR).toBeCloseTo(3, 6);
   });
 
   it("[STOP] takes -1R at the initial stop", () => {
@@ -129,6 +176,7 @@ describe("h6-trend-edge resolution", () => {
     expect(rep.netAvgR).toBeCloseTo((2.9 - 1.1) / 2, 6);
     expect(rep.tight).toBeDefined(); // A/B sibling present
     expect(rep.tightLargeCap).toBeDefined(); // focused long candidate present
+    expect(rep.exitPolicy.version).toBe("tp1-50-be-atr-runner-v1");
   });
 
   it("[LARGECAP] h6IsLargeCap classifies majors vs high-beta alts", () => {
@@ -158,18 +206,17 @@ describe("h6-trend-edge resolution", () => {
   });
 
   it("[REGIME-GATE] cycle opens NO new entries when allowNewEntries=false", async () => {
-    const flat = Array.from({ length: 90 }, (_, i) => mk(i, 100, 100.5, 99.5));
-    const ramp = Array.from({ length: 40 }, (_, k) => { const c = 101 + k; return mk(90 + k, c, c + 1, c - 1); });
-    const candles = [...flat, ...ramp, mk(130, 142, 143, 141)]; // last (in-progress) bar dropped by the cycle
+    const candles = [...h6PullbackSetup(), mk(130, 231, 233, 229, 230, 100)]; // last (in-progress) bar dropped by the cycle
     const fetchCandles = async () => candles;
+    const fetchContext = async () => bullContext();
     // Not bullish → no new entries.
     const blocked = new H6TrendStore(join(tmpdir(), `h6gate-blocked-${Date.now()}`));
-    const r1 = await runH6TrendCycle({ store: blocked, universe: ["BTCUSDT"], fetchCandles, now: 200 * BAR, allowNewEntries: false });
+    const r1 = await runH6TrendCycle({ store: blocked, universe: ["BTCUSDT"], fetchCandles, fetchContext, now: 200 * BAR, allowNewEntries: false });
     expect(r1.newEntries).toBe(0);
     expect(blocked.all.length).toBe(0);
     // Bullish (allowed) → entries open (std + tight).
     const open = new H6TrendStore(join(tmpdir(), `h6gate-open-${Date.now()}`));
-    const r2 = await runH6TrendCycle({ store: open, universe: ["BTCUSDT"], fetchCandles, now: 200 * BAR, allowNewEntries: true });
+    const r2 = await runH6TrendCycle({ store: open, universe: ["BTCUSDT"], fetchCandles, fetchContext, now: 200 * BAR, allowNewEntries: true });
     expect(r2.newEntries).toBeGreaterThan(0);
   });
 });

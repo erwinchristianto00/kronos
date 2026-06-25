@@ -225,9 +225,12 @@ interface NeuralTelemetry {
     pf: number | null;
     wr: number | null;
     avgMaxFavorableR: number | null;
+    tp1HitRate: number | null;
     totalNetR: number;
-    tight: { freshValid: number; netAvgR: number | null; pf: number | null; wr: number | null; avgMaxFavorableR: number | null };
-    tightLargeCap: { freshValid: number; netAvgR: number | null; pf: number | null; wr: number | null; avgMaxFavorableR: number | null };
+    entryPolicy: { name: string; required: string[]; sourceOptional: string[] };
+    exitPolicy: { tp1R: number; tp1ExitPct: number; breakevenAfterTp1: true; runner: string };
+    tight: { freshValid: number; netAvgR: number | null; pf: number | null; wr: number | null; avgMaxFavorableR: number | null; tp1HitRate: number | null };
+    tightLargeCap: { freshValid: number; netAvgR: number | null; pf: number | null; wr: number | null; avgMaxFavorableR: number | null; tp1HitRate: number | null };
   } | null;
   alerts: Array<{ severity: 'WARNING' | 'CRITICAL'; source: string; message: string }>;
 }
@@ -1065,54 +1068,44 @@ export default function NeuralMindmap() {
           </small>
         </div>
         <div>
-          <span>Fade-long edge <small>(oversold dip-buy)</small></span>
-          <strong className={(() => {
-            const fl = telemetry?.fadeLong;
-            if (!fl || fl.freshValid < fl.oosThreshold) return 'tone-measure';
-            return (fl.netAvgR ?? 0) > 0 ? 'tone-healthy' : 'tone-critical';
-          })()}>
-            {telemetry?.fadeLong
-              ? `${fmtR(telemetry.fadeLong.netAvgR)} net · ${telemetry.fadeLong.wr != null ? `${Math.round(telemetry.fadeLong.wr * 100)}% WR` : '—'}`
-              : 'Loading'}
-          </strong>
-          <small>
-            {telemetry?.fadeLong
-              ? `${telemetry.fadeLong.freshValid}/${telemetry.fadeLong.oosThreshold} OOS · ${telemetry.fadeLong.open} open · ${telemetry.fadeLong.status === 'WATCHABLE' ? 'watchable' : 'collecting'} · not real`
-              : 'RSI<30 measurement lane'}
-            {telemetry?.fadeLong?.antiCrash ? (
-              <span className="diag-dir-foot">
-                anti-crash shadow: {telemetry.fadeLong.antiCrash.wouldBlock}/{telemetry.fadeLong.antiCrash.tagged} would-block
-                {telemetry.fadeLong.antiCrash.passClosed > 0 ? ` · pass ${fmtR(telemetry.fadeLong.antiCrash.passNetAvgR)} n=${telemetry.fadeLong.antiCrash.passClosed}` : ''}
-                {telemetry.fadeLong.antiCrash.latest
-                  ? ` · latest ${telemetry.fadeLong.antiCrash.latest.wouldBlock ? 'warning' : 'clear'} (${fmtPct(telemetry.fadeLong.antiCrash.latest.down1hPct)} 1h down breadth)`
-                  : ''}
-              </span>
-            ) : null}
-          </small>
-        </div>
-        <div>
-          <span>H6 trend edge <small>(trend-gated long)</small></span>
+          <span>H6 trend-continuation long <small>(primary long research)</small></span>
           <strong className={(() => {
             const h6 = telemetry?.h6Trend;
-            if (!h6 || h6.freshValid < h6.oosThreshold) return 'tone-measure';
-            return (h6.netAvgR ?? 0) > 0 ? 'tone-healthy' : 'tone-critical';
+            const primary = h6?.tightLargeCap?.freshValid ? h6.tightLargeCap : h6;
+            if (!h6 || !primary || primary.freshValid < h6.oosThreshold) return 'tone-measure';
+            return (primary.netAvgR ?? 0) > 0 ? 'tone-healthy' : 'tone-critical';
           })()}>
-            {telemetry?.h6Trend
-              ? `${fmtR(telemetry.h6Trend.netAvgR)} net · ${telemetry.h6Trend.wr != null ? `${Math.round(telemetry.h6Trend.wr * 100)}% WR` : '—'}`
-              : 'Loading'}
+            {(() => {
+              const h6 = telemetry?.h6Trend;
+              const primary = h6?.tightLargeCap?.freshValid ? h6.tightLargeCap : h6;
+              return h6 && primary
+                ? `${fmtR(primary.netAvgR)} net · ${primary.wr != null ? `${Math.round(primary.wr * 100)}% WR` : '—'}`
+                : 'Loading';
+            })()}
           </strong>
           <small>
             {telemetry?.h6Trend
               ? `${telemetry.h6Trend.freshValid}/${telemetry.h6Trend.oosThreshold} OOS · ${telemetry.h6Trend.open} open · ${telemetry.h6Trend.status === 'WATCHABLE' ? 'watchable' : 'collecting'} · not real`
-              : '6h momentum + uptrend, ATR trail'}
+              : 'bull impulse + pullback + participation gates'}
+            {telemetry?.h6Trend ? (
+              <span className="diag-dir-foot">
+                gates: daily/4H trend · ADX&gt;25 · volume&gt;MA20 · funding/OI/taker participation
+              </span>
+            ) : null}
+            {telemetry?.h6Trend?.exitPolicy ? (
+              <span className="diag-dir-foot">
+                exit: TP1 {Math.round(telemetry.h6Trend.exitPolicy.tp1ExitPct * 100)}% at +{telemetry.h6Trend.exitPolicy.tp1R.toFixed(1)}R · BE stop · ATR runner
+                {telemetry.h6Trend.tp1HitRate != null ? ` · TP1 hit ${Math.round(telemetry.h6Trend.tp1HitRate * 100)}%` : ''}
+              </span>
+            ) : null}
             {telemetry?.h6Trend && telemetry.h6Trend.avgMaxFavorableR != null ? (
               <span className="diag-dir-foot">avg MFE {fmtR(telemetry.h6Trend.avgMaxFavorableR)} · PF {telemetry.h6Trend.pf != null ? telemetry.h6Trend.pf.toFixed(2) : '—'}</span>
             ) : null}
             {telemetry?.h6Trend?.tight ? (
-              <span className="diag-dir-foot">A/B tight-trail: {fmtR(telemetry.h6Trend.tight.netAvgR)} net · {telemetry.h6Trend.tight.wr != null ? `${Math.round(telemetry.h6Trend.tight.wr * 100)}% WR` : '—'} · n={telemetry.h6Trend.tight.freshValid} (research)</span>
+              <span className="diag-dir-foot">tight runner A/B: {fmtR(telemetry.h6Trend.tight.netAvgR)} net · {telemetry.h6Trend.tight.wr != null ? `${Math.round(telemetry.h6Trend.tight.wr * 100)}% WR` : '—'} · n={telemetry.h6Trend.tight.freshValid}</span>
             ) : null}
             {telemetry?.h6Trend?.tightLargeCap ? (
-              <span className="diag-dir-foot">⭐ long candidate (tight×large-cap×bull): {fmtR(telemetry.h6Trend.tightLargeCap.netAvgR)} net · {telemetry.h6Trend.tightLargeCap.wr != null ? `${Math.round(telemetry.h6Trend.tightLargeCap.wr * 100)}% WR` : '—'} · n={telemetry.h6Trend.tightLargeCap.freshValid}</span>
+              <span className="diag-dir-foot">focused cohort tight×large-cap×bull: {fmtR(telemetry.h6Trend.tightLargeCap.netAvgR)} net · {telemetry.h6Trend.tightLargeCap.wr != null ? `${Math.round(telemetry.h6Trend.tightLargeCap.wr * 100)}% WR` : '—'} · n={telemetry.h6Trend.tightLargeCap.freshValid}</span>
             ) : null}
           </small>
         </div>

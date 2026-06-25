@@ -263,11 +263,14 @@ export interface NeuralMapTelemetry {
     pf: number | null;
     wr: number | null;
     avgMaxFavorableR: number | null;
+    tp1HitRate: number | null;
     totalNetR: number;
+    entryPolicy: H6TrendReport["entryPolicy"];
+    exitPolicy: H6TrendReport["exitPolicy"];
     /** Research A/B sibling: tight-trail (1.5-ATR) variant on the same entries. */
-    tight: { freshValid: number; netAvgR: number | null; pf: number | null; wr: number | null; avgMaxFavorableR: number | null };
+    tight: { freshValid: number; netAvgR: number | null; pf: number | null; wr: number | null; avgMaxFavorableR: number | null; tp1HitRate: number | null };
     /** Focused long profit-generator candidate: tight-trail × large-cap × bullish regime. */
-    tightLargeCap: { freshValid: number; netAvgR: number | null; pf: number | null; wr: number | null; avgMaxFavorableR: number | null };
+    tightLargeCap: { freshValid: number; netAvgR: number | null; pf: number | null; wr: number | null; avgMaxFavorableR: number | null; tp1HitRate: number | null };
   } | null;
   alerts: NeuralMapAlert[];
 }
@@ -1485,7 +1488,10 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
           pf: input.h6Trend.pf,
           wr: input.h6Trend.wr,
           avgMaxFavorableR: input.h6Trend.avgMaxFavorableR,
+          tp1HitRate: input.h6Trend.tp1HitRate,
           totalNetR: input.h6Trend.totalNetR,
+          entryPolicy: input.h6Trend.entryPolicy,
+          exitPolicy: input.h6Trend.exitPolicy,
           tight: input.h6Trend.tight,
           tightLargeCap: input.h6Trend.tightLargeCap,
         }

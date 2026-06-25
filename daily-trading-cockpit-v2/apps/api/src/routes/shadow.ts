@@ -218,7 +218,7 @@ import {
   type CurrentGuardVariantMatrixReport,
   type KlineTuple as VariantMatrixKlineTuple,
 } from "../lib/current-guard-variant-matrix.js";
-import { getFadeLongStore, runFadeLongCycleGuarded, buildFadeLongReport } from "../lib/fade-long-edge.js";
+import { getFadeLongStore, runFadeLongCycleGuarded, buildFadeLongReport, FADE_LONG_RESEARCH_QUARANTINED } from "../lib/fade-long-edge.js";
 import { getH6TrendStore, runH6TrendCycleGuarded, buildH6TrendReport, H6_TREND_INTERVAL } from "../lib/h6-trend-edge.js";
 import { getCandidateFunnelLog } from "../lib/accelerated-evidence-candidate-funnel-log.js";
 import {
@@ -1094,7 +1094,7 @@ export async function registerShadowRoutes(
       { capturedAt: generatedAt },
     );
     const fadeLong =
-      process.env.FADE_LONG_EDGE_DISABLED === "1"
+      process.env.FADE_LONG_EDGE_DISABLED === "1" || FADE_LONG_RESEARCH_QUARANTINED
         ? null
         : buildFadeLongReport(getFadeLongStore().all);
     const h6Trend =
@@ -1364,7 +1364,7 @@ export async function registerShadowRoutes(
         // existing obs still runs regardless. `currentRegime` is now cached-first (the regime of the
         // scan candidates), so it's the right, populated signal.
         const regimeAllowsLong = typeof currentRegime === "string" && /bull/i.test(currentRegime);
-        if (process.env.FADE_LONG_EDGE_DISABLED !== "1") {
+        if (process.env.FADE_LONG_EDGE_DISABLED !== "1" && !FADE_LONG_RESEARCH_QUARANTINED) {
           const _flc = opts.binanceClient;
           const fadeInterval = process.env.FADE_LONG_INTERVAL || "15m";
           void runFadeLongCycleGuarded({
@@ -1387,6 +1387,21 @@ export async function registerShadowRoutes(
             now: Date.now(),
             allowNewEntries: regimeAllowsLong,
             fetchCandles: async (symbol: string) => _h6c.getCandles(symbol, H6_TREND_INTERVAL, 200),
+            fetchContext: async (symbol: string) => {
+              const [daily, h4, flow] = await Promise.allSettled([
+                _h6c.getCandles(symbol, "1d", 260),
+                _h6c.getCandles(symbol, "4h", 120),
+                _h6c.getFuturesFlow(symbol),
+              ]);
+              const flowValue = flow.status === "fulfilled" ? flow.value : null;
+              return {
+                dailyCandles: daily.status === "fulfilled" ? daily.value : undefined,
+                h4Candles: h4.status === "fulfilled" ? h4.value : undefined,
+                fundingRate: flowValue?.fundingRate ?? null,
+                openInterestChangePercent: flowValue?.openInterestChangePercent ?? null,
+                takerBuySellRatio: flowValue?.takerBuySellRatio ?? null,
+              };
+            },
           }).catch(() => undefined);
         }
       }
