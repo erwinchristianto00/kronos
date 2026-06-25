@@ -29,6 +29,15 @@ import {
 } from "../lib/regime-direction-controller-snapshot.js";
 import { buildRegimeDirectionControllerReport } from "../lib/regime-direction-controller.js";
 import {
+  buildCurrentGuardVariantMatrixReport,
+  getCurrentGuardVariantMatrixStore,
+} from "../lib/current-guard-variant-matrix.js";
+import {
+  isRealtimeShortMirrorEnabled,
+  runRealtimeShortMirror,
+  REALTIME_SHORT_LANE_VARIANT_ID,
+} from "../lib/realtime-short-mirror.js";
+import {
   RegimeControllerAlignedShadowStore,
   admitToControllerAlignedShadow,
   computeControllerAlignedGuardThreshold,
@@ -357,6 +366,48 @@ export async function registerScanRoute(
       }
     } else {
       timing.recordNotInvokedStage("kronosCounterfactual");
+    }
+    // --- Real-time short live-mirror ("mode 2") ---
+    // Emits FRESH (openedAt = now) short HEADLINE orders into the dedicated mirror store so the
+    // live engine can mirror the stable short edge to the exchange without the lagged
+    // VM-observation staleness. Env-gated (REALTIME_SHORT_MIRROR_ENABLED=1), short-only,
+    // stable-lane-only, capped per cycle. Wrapped so it can NEVER break the scan.
+    if (isRealtimeShortMirrorEnabled()) {
+      timing.startStage("realtimeShortMirror");
+      try {
+        const vmReport = buildCurrentGuardVariantMatrixReport(getCurrentGuardVariantMatrixStore());
+        const stableShortLaneActive =
+          vmReport.rows.find((r) => r.variantId === REALTIME_SHORT_LANE_VARIANT_ID)?.status ===
+          "STABLE_CANDIDATE";
+        const controllerMode = buildRegimeDirectionControllerReport({
+          currentRegime: result.marketRegime,
+        }).controllerMode;
+        runRealtimeShortMirror({
+          candidates: top10WithPlan.map((c) => ({
+            symbol: c.symbol,
+            direction: (c.finalDirection === "SHORT" ? "SHORT" : "LONG") as "LONG" | "SHORT",
+            currentPrice: candidateCurrentPrice(c),
+            stopLoss:
+              typeof c.stopLoss === "number" && Number.isFinite(c.stopLoss) && c.stopLoss > 0
+                ? c.stopLoss
+                : null,
+            takeProfitLevels: [c.takeProfits?.tp1, c.takeProfits?.tp2, c.takeProfits?.tp3].filter(
+              (v): v is number => typeof v === "number" && Number.isFinite(v) && v > 0,
+            ),
+            stopDistanceBps: c.selectedExecutionPlan?.stopDistanceBps ?? null,
+          })),
+          regime: result.marketRegime,
+          controllerMode,
+          stableShortLaneActive,
+          now: new Date().toISOString(),
+        });
+      } catch {
+        // mirror emission must never break the scan
+      } finally {
+        timing.finishStage("realtimeShortMirror");
+      }
+    } else {
+      timing.recordNotInvokedStage("realtimeShortMirror");
     }
     // --- Report-only: regime direction controller scan-cycle snapshot ---
     // Lightweight snapshot using only marketRegime (other inputs unavailable

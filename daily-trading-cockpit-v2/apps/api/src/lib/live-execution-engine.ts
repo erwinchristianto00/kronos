@@ -146,6 +146,15 @@ export function roundStopToSafeSide(direction: "LONG" | "SHORT", stop: number, t
 }
 
 /**
+ * Minimum TP distance from entry for a LIVE order. A TP tighter than this can't clear round-trip
+ * costs (taker fees ~0.04%×2 + spread), so the trade is structurally a loser. This is a
+ * defense-in-depth gate: it blocks the malformed ~0.14% geometry that churned the early mode-2
+ * shorts — regardless of which source produced the order. Coherent lane geometry (0.5R on a
+ * >=300bps stop) sits at >=1.5%, far above this floor, so legitimate orders are never blocked.
+ */
+const MIN_TP_DISTANCE_PCT = 0.003; // 30bps
+
+/**
  * Pure sizing: risk a fixed USD amount over the paper geometry's stop distance, round
  * to the symbol's exchange filters, enforce notional caps. Mirrors the paper sizing
  * formula (risk / stopDistancePct) but with LIVE risk config, never paper's 1%.
@@ -164,6 +173,11 @@ export function computeLiveOrderPlan(
   const stopRightSide = signal.direction === "LONG" ? stopLoss < entryPrice : stopLoss > entryPrice;
   const tpRightSide = signal.direction === "LONG" ? tp1 > entryPrice : tp1 < entryPrice;
   if (!stopRightSide || !tpRightSide) return fail("stop/tp on wrong side of entry");
+  // Defense-in-depth: refuse a TP too tight to clear round-trip costs (the malformed mode-2 geometry).
+  const tpDistancePct = Math.abs(entryPrice - tp1) / entryPrice;
+  if (tpDistancePct < MIN_TP_DISTANCE_PCT) {
+    return fail(`tp too close to clear costs (${(tpDistancePct * 100).toFixed(2)}% < ${(MIN_TP_DISTANCE_PCT * 100).toFixed(2)}%)`);
+  }
 
   const rawNotional = config.riskUsdPerTrade / stopDistancePct;
   const notionalUsd = Math.min(rawNotional, config.maxNotionalPerTrade);
@@ -1147,11 +1161,17 @@ export class LiveExecutionEngine {
     const qty = roundDownToStep(planned.reduce((sum, item) => sum + item.plan.qty, 0), filters.stepSize);
     const stops = planned.map((item) => item.plan.stopPrice);
     const targets = planned.map((item) => item.plan.tp1Price);
+    // Exit sizing follows the source lane's exitRule. "tp1_full" banks 100% at TP1 (no runner) —
+    // required by CG_WIDE_FAST_SHORT, whose edge depends on the full 0.5R bank (a runner round-trips
+    // up and loses). All other lanes keep the scaleout_tp1_trail default (50% at TP1, trail the rest).
+    // When tp1Qty == qty, a TP1 fill flattens the position and manageLifecycle settles it via the
+    // "position flat ⇒ closed" path (the BE/trail branch is skipped because there is no runner).
+    const fullExitAtTp1 = planned[0]!.paper.variantExitRule === "tp1_full";
     return {
       ok: qty >= filters.minQty,
       reason: qty >= filters.minQty ? null : "aggregate quantity below exchange minimum",
       qty,
-      tp1Qty: roundDownToStep(qty / 2, filters.stepSize),
+      tp1Qty: fullExitAtTp1 ? qty : roundDownToStep(qty / 2, filters.stepSize),
       notionalUsd: planned.reduce((sum, item) => sum + item.plan.notionalUsd, 0),
       stopPrice: direction === "LONG" ? Math.max(...stops) : Math.min(...stops),
       tp1Price: direction === "LONG" ? Math.min(...targets) : Math.max(...targets),

@@ -24,6 +24,10 @@ import {
 } from "./lib/live-execution-engine.js";
 import { getPaperExecutionRouterStore } from "./lib/paper-execution-router.js";
 import {
+  getRealtimeShortMirrorStore,
+  isRealtimeShortMirrorEnabled,
+} from "./lib/realtime-short-mirror.js";
+import {
   buildCurrentGuardVariantMatrixReport,
   getCurrentGuardVariantMatrixStore,
 } from "./lib/current-guard-variant-matrix.js";
@@ -127,7 +131,12 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       config: liveConfig,
       client: liveClient,
       store: new LiveExecutionStore(),
-      paperStore: getPaperExecutionRouterStore(),
+      // "Mode 2" (REALTIME_SHORT_MIRROR_ENABLED=1): the engine mirrors ONLY the dedicated
+      // real-time short store — fresh, short-only, stable-lane orders — and never the
+      // measurement paper book. Flag off → unchanged (reads the normal paper book).
+      paperStore: isRealtimeShortMirrorEnabled()
+        ? getRealtimeShortMirrorStore()
+        : getPaperExecutionRouterStore(),
       isPaperOrderLiveEligible: (order) => {
         const report = buildCurrentGuardVariantMatrixReport(getCurrentGuardVariantMatrixStore());
         const laneVariantId = order.selectedLaneId.split(":").pop() ?? order.selectedLaneId;

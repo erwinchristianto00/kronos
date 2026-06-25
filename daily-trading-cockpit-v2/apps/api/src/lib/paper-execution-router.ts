@@ -77,7 +77,10 @@ export type PaperOrderMode = "HEADLINE" | "DIAGNOSTIC_ONLY";
  */
 export type PaperOrderSourceType =
   | "VARIANT_MATRIX_OBSERVATION"
-  | "SCAN_CANDIDATE_LANE_ALLOCATOR";
+  | "SCAN_CANDIDATE_LANE_ALLOCATOR"
+  // Real-time short live-mirror ("mode 2"): fresh scanner short emitted straight to the
+  // dedicated mirror store with openedAt = now. See lib/realtime-short-mirror.ts.
+  | "REALTIME_SHORT_MIRROR";
 export type PaperDiagnosticLabel =
   | "BACKFILL_DIAGNOSTIC"
   | "SOURCE_TOO_OLD_FOR_PAPER_ADMISSION"

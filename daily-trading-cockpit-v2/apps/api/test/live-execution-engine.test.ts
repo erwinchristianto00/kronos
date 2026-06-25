@@ -352,6 +352,25 @@ describe("computeLiveOrderPlan", () => {
     expect(wrongSide.ok).toBe(false);
   });
 
+  it("rejects a TP too tight to clear round-trip costs (the malformed mode-2 geometry)", () => {
+    // SHORT: entry 2000, stop 2100 (5%), tp1 1997 = 0.15% below entry → can't beat fees.
+    const tooTight = computeLiveOrderPlan(
+      { direction: "SHORT", entryPrice: 2000, stopLoss: 2100, tp1: 1997 },
+      { riskUsdPerTrade: 5, maxNotionalPerTrade: 250 },
+      FILTERS,
+    );
+    expect(tooTight.ok).toBe(false);
+    expect(tooTight.reason).toMatch(/tp too close/i);
+
+    // Coherent 0.5R geometry (tp1 1950 = 2.5% below entry) passes the gate.
+    const coherent = computeLiveOrderPlan(
+      { direction: "SHORT", entryPrice: 2000, stopLoss: 2100, tp1: 1950 },
+      { riskUsdPerTrade: 5, maxNotionalPerTrade: 250 },
+      FILTERS,
+    );
+    expect(coherent.ok).toBe(true);
+  });
+
   it("roundDownToStep avoids float artifacts", () => {
     expect(roundDownToStep(0.0500000001, 0.001)).toBeCloseTo(0.05, 12);
     expect(roundDownToStep(2.5000000004, 0.1)).toBeCloseTo(2.5, 12);
@@ -376,6 +395,31 @@ describe("LiveExecutionEngine", () => {
     await engine.tick();
     expect(client.placed.length).toBe(0);
     expect(engine.isArmed()).toBe(false);
+  });
+
+  it("tp1_full lane banks 100% at TP1 — full-qty LIMIT, settles flat with no runner/breakeven replace", async () => {
+    const order = paperOrder({ variantExitRule: "tp1_full" });
+    const { engine, client, store } = makeEngine({ paper: makePaperStore([order]) });
+    expect((await engine.arm()).ok).toBe(true);
+
+    // Tick 1: mirror — the TP1 LIMIT is the FULL position (0.05), not half (0.025 for scaleout).
+    await engine.tick();
+    expect(client.placed.map((p) => p.type)).toEqual(["MARKET", "STOP_MARKET", "LIMIT"]);
+    const [, stop, tp1] = client.placed;
+    expect(stop!.quantity).toBeCloseTo(0.05, 9); // stop still protects the full position
+    expect(tp1!.quantity).toBeCloseTo(0.05, 9); // FULL exit at TP1
+    const intent = store.getState().intents[0]!;
+
+    // TP1 fills the whole position → flat → settles directly via the "position flat" path.
+    client.orderStatusById.set(intent.tp1OrderId!, "FILLED");
+    client.positionsBySymbol.set("ETHUSDT", 0);
+    client.trades = [
+      { symbol: "ETHUSDT", orderId: intent.tp1OrderId!, price: 1900, qty: 0.05, realizedPnl: 5, commission: 0.04, commissionAsset: "USDT", time: 1 },
+    ];
+    const placedBefore = client.placed.length;
+    await engine.tick();
+    expect(store.getState().intents[0]!.state).toBe("CLOSED");
+    expect(client.placed.length).toBe(placedBefore); // NO breakeven STOP_MARKET — there is no runner
   });
 
   it("full lifecycle: mirror → entry+stop+tp1 → TP1 fill ⇒ breakeven replace → close ⇒ settled", async () => {
