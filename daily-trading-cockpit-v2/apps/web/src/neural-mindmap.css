@@ -150,7 +150,7 @@
 
 .neural-statusbar {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   border-bottom: 1px solid #20313a;
 }
 
@@ -169,9 +169,10 @@
 .neural-statusbar small {
   display: block;
   min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow: visible;
+  text-overflow: clip;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 .neural-statusbar span {
@@ -183,12 +184,14 @@
 .neural-statusbar strong {
   margin-top: 5px;
   font-size: 15px;
+  line-height: 1.18;
 }
 
 .neural-statusbar small {
   margin-top: 3px;
   color: #8ba0aa;
   font-size: 11px;
+  line-height: 1.38;
 }
 
 .tone-healthy {
@@ -242,206 +245,6 @@
   color: #ff9ca3;
   background: rgba(91, 26, 32, 0.4);
   font-size: 12px;
-}
-
-.neural-control-panel {
-  display: grid;
-  grid-template-columns: minmax(220px, 0.9fr) minmax(320px, 1.35fr) minmax(320px, 1.35fr) minmax(220px, 0.75fr);
-  gap: 12px;
-  align-items: stretch;
-  padding: 14px;
-  border-bottom: 1px solid #20313a;
-  background:
-    radial-gradient(circle at 12% 12%, rgba(80, 220, 161, 0.08), transparent 34%),
-    linear-gradient(135deg, #08151a 0%, #0b171d 52%, #111b1d 100%);
-}
-
-.neural-tp-verdict,
-.neural-tp-metrics,
-.neural-tp-editor,
-.neural-realize-box,
-.neural-control-status {
-  min-width: 0;
-  border: 1px solid #243740;
-  border-radius: 8px;
-  background: rgba(7, 16, 22, 0.76);
-}
-
-.neural-tp-verdict {
-  padding: 13px 14px;
-  border-left: 4px solid #50dca1;
-}
-
-.neural-tp-verdict.verdict-stretched {
-  border-left-color: #eab95d;
-}
-
-.neural-tp-verdict.verdict-too-far-vs-mfe,
-.neural-tp-verdict.verdict-too-tight-after-cost,
-.neural-tp-verdict.verdict-low-edge-after-cost {
-  border-left-color: #ef6370;
-}
-
-.neural-tp-verdict span,
-.neural-tp-metrics span,
-.neural-tp-editor label > span {
-  display: block;
-  color: #70858f;
-  font: 600 10px/1.3 "IBM Plex Mono", "Cascadia Code", monospace;
-  text-transform: uppercase;
-}
-
-.neural-tp-verdict strong {
-  display: block;
-  margin-top: 8px;
-  color: #e6f4ee;
-  font-size: 18px;
-  line-height: 1.1;
-}
-
-.neural-tp-verdict p,
-.neural-realize-box p,
-.neural-tp-editor small,
-.neural-control-status span {
-  margin: 7px 0 0;
-  color: #94a8b1;
-  font-size: 11px;
-  line-height: 1.45;
-}
-
-.neural-tp-metrics {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-}
-
-.neural-tp-metrics > div {
-  min-width: 0;
-  padding: 12px;
-  border-right: 1px solid #20313a;
-  border-bottom: 1px solid #20313a;
-}
-
-.neural-tp-metrics > div:nth-child(2n) {
-  border-right: 0;
-}
-
-.neural-tp-metrics > div:nth-last-child(-n + 2) {
-  border-bottom: 0;
-}
-
-.neural-tp-metrics strong,
-.neural-tp-metrics small {
-  display: block;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.neural-tp-metrics strong {
-  margin-top: 6px;
-  color: #e0ecef;
-  font: 600 13px/1.2 "IBM Plex Mono", "Cascadia Code", monospace;
-}
-
-.neural-tp-metrics small {
-  margin-top: 3px;
-  color: #7f939c;
-  font-size: 10px;
-}
-
-.neural-tp-editor {
-  display: grid;
-  gap: 11px;
-  padding: 13px;
-}
-
-.neural-tp-editor input[type="range"] {
-  width: 100%;
-  accent-color: #50dca1;
-}
-
-.neural-tp-manual {
-  display: grid;
-  grid-template-columns: minmax(82px, 0.6fr) minmax(92px, 0.7fr) minmax(92px, 0.7fr);
-  gap: 8px;
-}
-
-.neural-tp-manual input {
-  min-width: 0;
-  height: 34px;
-  padding: 0 10px;
-  border: 1px solid #2a3d45;
-  border-radius: 6px;
-  color: #e6f4ee;
-  background: #0a151b;
-  font: 600 12px "IBM Plex Mono", "Cascadia Code", monospace;
-}
-
-.neural-tp-manual button,
-.neural-realize-box button {
-  min-height: 34px;
-  border: 1px solid #34715d;
-  border-radius: 6px;
-  color: #071016;
-  background: #50dca1;
-  cursor: pointer;
-  font-weight: 700;
-  font-size: 11px;
-}
-
-.neural-tp-manual button:hover,
-.neural-realize-box button:hover {
-  filter: brightness(1.06);
-}
-
-.neural-tp-manual button:disabled {
-  cursor: not-allowed;
-  color: #72868f;
-  border-color: #263942;
-  background: #142229;
-}
-
-.neural-tp-manual button.is-secondary {
-  color: #b6c7cf;
-  border-color: #2a3d45;
-  background: #0c181e;
-}
-
-.neural-realize-box {
-  display: flex;
-  flex-direction: column;
-  justify-content: center;
-  gap: 8px;
-  padding: 13px;
-}
-
-.neural-realize-box button {
-  border-color: #34715d;
-  color: #071016;
-  background: #50dca1;
-}
-
-.neural-realize-box button.is-exchange-danger {
-  border-color: #8b313a;
-  color: #ffe8ea;
-  background: #8f2733;
-}
-
-.neural-realize-box p {
-  margin: 0;
-}
-
-.neural-control-status {
-  grid-column: 1 / -1;
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px 16px;
-  padding: 9px 12px;
-}
-
-.neural-control-status span {
-  margin: 0;
 }
 
 .neural-milestone-panel {
@@ -552,6 +355,66 @@
   background: #0e1c22;
 }
 
+.neural-milestone-table-wrap tbody tr.is-quarantined,
+.neural-milestone-table-wrap tbody tr.is-quarantined:hover {
+  background: rgba(167, 139, 250, 0.16);
+}
+
+.neural-milestone-table-wrap tbody tr.is-quarantined td {
+  border-bottom-color: rgba(167, 139, 250, 0.28);
+}
+
+.neural-milestone-table-wrap tbody tr.neural-direction-row,
+.neural-lane-table-wrap tbody tr.neural-direction-row {
+  cursor: default;
+  background:
+    linear-gradient(90deg, rgba(78, 205, 160, 0.16), rgba(78, 205, 160, 0.03));
+}
+
+.neural-milestone-table-wrap tbody tr.neural-direction-row:hover,
+.neural-lane-table-wrap tbody tr.neural-direction-row:hover {
+  background:
+    linear-gradient(90deg, rgba(78, 205, 160, 0.16), rgba(78, 205, 160, 0.03));
+}
+
+.neural-direction-row.direction-short {
+  background:
+    linear-gradient(90deg, rgba(87, 184, 255, 0.15), rgba(87, 184, 255, 0.03)) !important;
+}
+
+.neural-direction-row.direction-mixed {
+  background:
+    linear-gradient(90deg, rgba(234, 185, 93, 0.16), rgba(234, 185, 93, 0.03)) !important;
+}
+
+.neural-direction-row td {
+  height: auto !important;
+  padding-top: 9px !important;
+  padding-bottom: 8px !important;
+  text-align: left !important;
+  border-bottom-color: rgba(78, 205, 160, 0.22) !important;
+}
+
+.neural-direction-row span,
+.neural-direction-row small {
+  display: block;
+}
+
+.neural-direction-row span {
+  color: #dcece7;
+  font: 700 10px/1.2 "IBM Plex Mono", "Cascadia Code", monospace;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.neural-direction-row small {
+  margin-top: 3px;
+  color: #87a0aa;
+  font-size: 10px;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
 .neural-stage-pill {
   display: inline-flex;
   align-items: center;
@@ -592,6 +455,12 @@
   border-color: #e3924b;
   color: #ffd8b8;
   background: #311c11;
+}
+
+.neural-stage-pill.stage-quarantined {
+  border-color: #a78bfa;
+  color: #e6dcff;
+  background: rgba(96, 68, 170, 0.28);
 }
 
 .neural-workspace {
@@ -1290,10 +1159,6 @@ i.health-diagnostic {
     border-top: 1px solid #20313a;
   }
 
-  .neural-control-panel {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
   .neural-milestone-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
@@ -1416,12 +1281,6 @@ i.health-diagnostic {
     line-height: 1.35;
   }
 
-  .neural-control-panel {
-    grid-template-columns: 1fr;
-    gap: 8px;
-    padding: 8px;
-  }
-
   .neural-milestone-panel {
     gap: 8px;
     padding: 8px;
@@ -1439,42 +1298,6 @@ i.health-diagnostic {
 
   .neural-milestone-table-wrap {
     -webkit-overflow-scrolling: touch;
-  }
-
-  .neural-tp-verdict,
-  .neural-tp-editor,
-  .neural-realize-box {
-    padding: 12px;
-  }
-
-  .neural-tp-verdict strong {
-    font-size: 16px;
-  }
-
-  .neural-tp-metrics {
-    grid-template-columns: 1fr;
-  }
-
-  .neural-tp-metrics > div,
-  .neural-tp-metrics > div:nth-child(2n),
-  .neural-tp-metrics > div:nth-last-child(-n + 2) {
-    border-right: 0;
-    border-bottom: 1px solid #20313a;
-  }
-
-  .neural-tp-metrics > div:last-child {
-    border-bottom: 0;
-  }
-
-  .neural-tp-manual {
-    grid-template-columns: 1fr;
-  }
-
-  .neural-tp-manual input,
-  .neural-tp-manual button,
-  .neural-realize-box button {
-    min-height: 42px;
-    font-size: 12px;
   }
 
   .neural-workspace {
@@ -1659,7 +1482,7 @@ i.health-diagnostic {
 }
 
 .testnet-statusbar {
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(6, minmax(0, 1fr));
 }
 
 .testnet-grid {
@@ -1694,6 +1517,10 @@ i.health-diagnostic {
   padding: 13px 15px;
   border-color: rgba(243, 191, 90, 0.4);
   background: rgba(65, 45, 16, 0.52);
+}
+
+.testnet-wide-panel {
+  grid-column: 1 / -1;
 }
 
 .testnet-panel > header {

@@ -1,9 +1,11 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
 import './neural-mindmap.css';
 
 const TELEMETRY_TIMEOUT_MS = 15_000;
 
 type NeuralHealth = 'HEALTHY' | 'ACTIVE' | 'WARNING' | 'CRITICAL' | 'IDLE' | 'COLLECTING' | 'QUARANTINE' | 'DIAGNOSTIC';
+const MIXED_DIAGNOSTIC_REGIME_LANE_ID = 'MIXED_DIAGNOSTIC_REGIME';
+type LaneDirectionGroupKey = 'LONG' | 'SHORT' | 'MIXED';
 type NeuralDiagnosisCategory =
   | 'HEALTHY_FLOW'
   | 'COLLECTING_EVIDENCE'
@@ -50,7 +52,7 @@ interface NeuralLane {
   netAvgR: number | null;
   pf: number | null;
   wr: number | null;
-  statsSource: 'VM_SIM' | 'PAPER_BOOK' | 'H6_RESEARCH';
+  statsSource: 'VM_SIM' | 'PAPER_BOOK' | 'H6_RESEARCH' | 'REGIME_DIAGNOSTIC';
   payoffRatio: number | null;
   plus10bpsStillPositive: boolean | null;
   allThreeOosPositive: boolean | null;
@@ -92,15 +94,75 @@ interface NeuralLane {
   reason: string;
 }
 
+interface LaneDirectionSection {
+  key: LaneDirectionGroupKey;
+  label: string;
+  detail: string;
+  lanes: NeuralLane[];
+}
+
+const LANE_DIRECTION_ORDER: LaneDirectionGroupKey[] = ['LONG', 'SHORT', 'MIXED'];
+const LANE_DIRECTION_META: Record<LaneDirectionGroupKey, { label: string; detail: string }> = {
+  LONG: {
+    label: 'LONG lanes',
+    detail: 'Buy-side / bullish continuation / long-only diagnostics',
+  },
+  SHORT: {
+    label: 'SHORT lanes',
+    detail: 'Sell-side / fade-short / short-only diagnostics',
+  },
+  MIXED: {
+    label: 'MIXED / regime',
+    detail: 'Choppy-range lanes and regime aggregates; not directly comparable with directional lanes',
+  },
+};
+
+function laneDirectionGroup(lane: NeuralLane): LaneDirectionGroupKey {
+  const id = lane.id.toUpperCase();
+  const label = lane.label.toUpperCase();
+  if (
+    lane.id === MIXED_DIAGNOSTIC_REGIME_LANE_ID ||
+    lane.statsSource === 'REGIME_DIAGNOSTIC' ||
+    id.includes('MIXED') ||
+    label.includes('MIXED')
+  ) {
+    return 'MIXED';
+  }
+  if (
+    id.startsWith('CG_LONG_VARIANT_MATRIX:') ||
+    id.includes('H6_TREND') ||
+    label.includes(' LONG') ||
+    label.startsWith('LONG ') ||
+    label.includes('BULL')
+  ) {
+    return 'LONG';
+  }
+  return 'SHORT';
+}
+
+function groupLanesByDirection(lanes: NeuralLane[]): LaneDirectionSection[] {
+  return LANE_DIRECTION_ORDER.map((key) => {
+    const meta = LANE_DIRECTION_META[key];
+    return {
+      key,
+      label: meta.label,
+      detail: meta.detail,
+      lanes: lanes.filter((lane) => laneDirectionGroup(lane) === key),
+    };
+  }).filter((section) => section.lanes.length > 0);
+}
+
 function statsSourceShortLabel(source: NeuralLane['statsSource']): string {
   if (source === 'VM_SIM') return 'VM sim';
   if (source === 'H6_RESEARCH') return 'H6 research';
+  if (source === 'REGIME_DIAGNOSTIC') return 'Regime diag';
   return 'Paper book';
 }
 
 function statsSourceLongLabel(source: NeuralLane['statsSource']): string {
   if (source === 'VM_SIM') return 'Variant-matrix simulation';
   if (source === 'H6_RESEARCH') return 'H6 trend research';
+  if (source === 'REGIME_DIAGNOSTIC') return 'Diagnostic orders grouped by regime';
   return 'Paper book';
 }
 
@@ -111,6 +173,63 @@ interface DiagnosticDirectionStats {
   unrealizedPnl: number | null;
   netAvgR: number | null;
   wr: number | null;
+}
+
+function buildMixedDiagnosticRegimeLane(stats: DiagnosticDirectionStats): NeuralLane {
+  return {
+    id: MIXED_DIAGNOSTIC_REGIME_LANE_ID,
+    label: 'MIXED DIAG REGIME',
+    health: stats.closed > 0 || stats.open > 0 ? 'DIAGNOSTIC' : 'IDLE',
+    evidenceHealth: stats.closed > 0 || stats.open > 0 ? 'DIAGNOSTIC' : 'IDLE',
+    active: stats.open > 0,
+    open: stats.open,
+    closed: stats.closed,
+    oosFreshValid: stats.closed,
+    oosThreshold: 10,
+    netAvgR: stats.netAvgR,
+    pf: null,
+    wr: stats.wr,
+    statsSource: 'REGIME_DIAGNOSTIC',
+    payoffRatio: null,
+    plus10bpsStillPositive: null,
+    allThreeOosPositive: null,
+    oosThirds: null,
+    approxMaxDrawdownR: null,
+    topSymbolPnlShare: null,
+    calendarDays: null,
+    distinctRegimes: null,
+    infraReady: null,
+    blockers: ['regime aggregate, not an executable lane', 'do not promote directly'],
+    cautions: ['MIXED is a subset of diagnostic SHORT+LONG, not an added third direction'],
+    headlinePnl: 0,
+    diagnosticPnl: stats.realizedPnl,
+    totalPnl: stats.realizedPnl,
+    openUnrealizedPnl: stats.unrealizedPnl,
+    openUnrealizedR: null,
+    diagnosticUnrealizedPnl: stats.unrealizedPnl,
+    diagnosticUnrealizedR: null,
+    headlineUnrealizedPnl: null,
+    headlineUnrealizedR: null,
+    openMaxFavorablePnl: null,
+    openMaxFavorableR: null,
+    openAvgDistanceToTpPct: null,
+    openNearestDistanceToTpPct: null,
+    openAvgEntryPrice: null,
+    openAvgMarkPrice: null,
+    openAvgTakeProfitPrice: null,
+    openAvgMfePct: null,
+    openP75MfePct: null,
+    openP90MfePct: null,
+    openAvgConfiguredTpPct: null,
+    openTpAssessment: null,
+    openMarkedSymbolCount: stats.open,
+    startingEquity: 0,
+    totalPnlPct: null,
+    headlinePnlPct: null,
+    pnlIsDiagnosticOnly: true,
+    status: 'REGIME_DIAGNOSTIC',
+    reason: 'Diagnostic-only paper orders grouped by Mixed/Choppy/Range regime. Measurement row only, not directly promotable.',
+  };
 }
 
 interface NeuralTelemetry {
@@ -173,6 +292,9 @@ interface NeuralTelemetry {
     diagnosticByDirection: {
       LONG: DiagnosticDirectionStats;
       SHORT: DiagnosticDirectionStats;
+    };
+    diagnosticByRegime?: {
+      MIXED: DiagnosticDirectionStats;
     };
   };
   mixed: {
@@ -245,16 +367,6 @@ interface NeuralTelemetry {
     tightLargeCap: { freshValid: number; netAvgR: number | null; pf: number | null; wr: number | null; avgMaxFavorableR: number | null; tp1HitRate: number | null };
   } | null;
   alerts: Array<{ severity: 'WARNING' | 'CRITICAL'; source: string; message: string }>;
-}
-
-interface PaperControls {
-  controls: { cgWideTpPct: number | null; updatedAt: string | null };
-  cgWideTp: {
-    activeTpPct: number;
-    defaultTpPct: number;
-    roundTripCostPct: number;
-    assessment: TpAssessment | null;
-  };
 }
 
 interface Point {
@@ -557,10 +669,27 @@ function stageLabel(stage: MilestoneStage): string {
   return 'Collecting';
 }
 
+function evidencePillClass(lane: NeuralLane, milestone?: { stage: MilestoneStage }): string {
+  if (lane.health === 'QUARANTINE' || lane.status.toUpperCase().includes('QUARANTIN')) {
+    return 'stage-quarantined';
+  }
+  return `stage-${(milestone ?? laneMilestone(lane)).stage.toLowerCase()}`;
+}
+
+function isQuarantinedLane(lane: NeuralLane): boolean {
+  return lane.health === 'QUARANTINE' || lane.status.toUpperCase().includes('QUARANTIN');
+}
+
 function laneMilestone(lane: NeuralLane): { stage: MilestoneStage; reason: string } {
   const watchableMin = lane.oosThreshold > 0 ? lane.oosThreshold : 10;
   const freshValid = lane.oosFreshValid ?? lane.closed;
   const status = lane.status.toUpperCase();
+  if (lane.id === MIXED_DIAGNOSTIC_REGIME_LANE_ID || lane.statsSource === 'REGIME_DIAGNOSTIC') {
+    return {
+      stage: freshValid > 0 || lane.open > 0 ? 'PAPER_EVIDENCE' : 'COLLECTING',
+      reason: `MIXED is a diagnostic regime aggregate (${freshValid} closed / ${lane.open} open), not an executable lane. It is displayed here for measurement only.`,
+    };
+  }
   if (status.includes('PROMOTION_CANDIDATE')) {
     return {
       stage: 'PROMOTION_CANDIDATE',
@@ -644,6 +773,20 @@ function stageProgress(lane: NeuralLane): StageProgress {
   const freshValid = lane.oosFreshValid ?? lane.closed;
   const telemetryStatus = lane.status.toUpperCase();
   const blockers = lane.blockers ?? [];
+
+  if (lane.id === MIXED_DIAGNOSTIC_REGIME_LANE_ID || lane.statsSource === 'REGIME_DIAGNOSTIC') {
+    return {
+      nextStage: 'Not promotable',
+      progressPct: 100,
+      blockers: blockers.length > 0 ? blockers : ['regime aggregate, not an executable lane'],
+      checklist: [
+        `mixed diagnostic closed ${freshValid}`,
+        `open ${lane.open}`,
+        `netAvgR ${fmtR(lane.netAvgR)}`,
+        'read as regime evidence only',
+      ],
+    };
+  }
 
   if (telemetryStatus.includes('PROMOTION_CANDIDATE')) {
     const liveBlockers = [
@@ -743,10 +886,6 @@ export default function NeuralMindmap() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [lastReceivedAt, setLastReceivedAt] = useState<number | null>(null);
-  const [paperControls, setPaperControls] = useState<PaperControls | null>(null);
-  const [tpDraft, setTpDraft] = useState('3.00');
-  const [controlStatus, setControlStatus] = useState<string | null>(null);
-  const [realizeStatus, setRealizeStatus] = useState<string | null>(null);
   const telemetryInFlightRef = useRef(false);
   const hasTelemetryRef = useRef(false);
 
@@ -801,22 +940,9 @@ export default function NeuralMindmap() {
     }
   }
 
-  async function loadPaperControls() {
-    try {
-      const response = await fetch('/api/shadow/paper-controls', { cache: 'no-store' });
-      if (!response.ok) throw new Error(`Controls request failed (${response.status})`);
-      const next = await response.json() as PaperControls;
-      setPaperControls(next);
-      setTpDraft(next.cgWideTp.activeTpPct.toFixed(2));
-    } catch (nextError) {
-      setControlStatus(nextError instanceof Error ? nextError.message : 'controls unavailable');
-    }
-  }
-
   useEffect(() => {
     void loadTelemetry();
     void loadLiveAccount();
-    void loadPaperControls();
   }, []);
 
   useEffect(() => {
@@ -828,13 +954,18 @@ export default function NeuralMindmap() {
     return () => window.clearInterval(timer);
   }, [autoRefresh]);
 
+  const visualLanes = useMemo(
+    () => (telemetry?.lanes ?? []).filter((lane) => !isQuarantinedLane(lane)),
+    [telemetry?.lanes],
+  );
+
   const lanePositions = useMemo(() => {
     const positions = new Map<string, Point>();
-    const lanes = telemetry?.lanes ?? [];
+    const lanes = visualLanes;
     const gap = lanes.length > 1 ? Math.min(88, 430 / (lanes.length - 1)) : 0;
     lanes.forEach((lane, index) => positions.set(lane.id, { x: 1055, y: 100 + index * gap }));
     return positions;
-  }, [telemetry?.lanes]);
+  }, [visualLanes]);
 
   const nodesById = useMemo(
     () => new Map((telemetry?.nodes ?? []).map((node) => [node.id, node])),
@@ -842,7 +973,25 @@ export default function NeuralMindmap() {
   );
 
   const selectedNode = nodesById.get(selectedId) ?? null;
-  const selectedLane = telemetry?.lanes.find((lane) => lane.id === selectedId) ?? null;
+  // Real paper P&L = HEADLINE only (realized + unrealized). Diagnostic probes are
+  // measurement, never mirror to live, and are reported separately below.
+  const paperRealPnl = telemetry
+    ? telemetry.paper.headlinePnl + (telemetry.paper.headlineUnrealizedPnl ?? 0)
+    : 0;
+  const paperRealTone = paperRealPnl > 0 ? 'tone-healthy' : paperRealPnl < 0 ? 'tone-critical' : 'tone-measure';
+  const diagDir = telemetry?.paper.diagnosticByDirection ?? null;
+  const diagMixed = telemetry?.paper.diagnosticByRegime?.MIXED ?? null;
+  const displayLanes = useMemo(() => {
+    const lanes = telemetry?.lanes ?? [];
+    if (!diagMixed) return lanes;
+    if (lanes.some((lane) => lane.id === MIXED_DIAGNOSTIC_REGIME_LANE_ID)) return lanes;
+    return [buildMixedDiagnosticRegimeLane(diagMixed), ...lanes];
+  }, [diagMixed, telemetry?.lanes]);
+  const laneDirectionSections = useMemo(
+    () => groupLanesByDirection(displayLanes),
+    [displayLanes],
+  );
+  const selectedLane = displayLanes.find((lane) => lane.id === selectedId) ?? null;
   const selectedLaneMilestone = selectedLane ? laneMilestone(selectedLane) : null;
   const selectedLaneProgress = selectedLane ? stageProgress(selectedLane) : null;
   const selectedLiveLane = liveAccount?.lanes.find((lane) => lane.laneId === selectedLane?.id) ?? null;
@@ -853,14 +1002,6 @@ export default function NeuralMindmap() {
     (telemetry?.lanes.filter((lane) => lane.health === 'CRITICAL').length ?? 0);
   const warningCount = (telemetry?.nodes.filter((node) => node.health === 'WARNING').length ?? 0) +
     (telemetry?.lanes.filter((lane) => lane.health === 'WARNING').length ?? 0);
-  // Real paper P&L = HEADLINE only (realized + unrealized). Diagnostic probes are
-  // measurement, never mirror to live, and are reported separately below.
-  const paperRealPnl = telemetry
-    ? telemetry.paper.headlinePnl + (telemetry.paper.headlineUnrealizedPnl ?? 0)
-    : 0;
-  const paperRealTone = paperRealPnl > 0 ? 'tone-healthy' : paperRealPnl < 0 ? 'tone-critical' : 'tone-measure';
-  const paperTpAssessment = telemetry?.paper.openTpAssessment ?? paperControls?.cgWideTp.assessment ?? null;
-  const diagDir = telemetry?.paper.diagnosticByDirection ?? null;
   // Diagnostic totals derived from the per-direction split so the headline number and the
   // open/closed counts always reconcile with the SHORT+LONG breakdown shown below it.
   const diagRealizedTotal = diagDir ? diagDir.SHORT.realizedPnl + diagDir.LONG.realizedPnl : 0;
@@ -869,33 +1010,30 @@ export default function NeuralMindmap() {
   const diagUnrealTotal = diagDir
     ? (diagDir.SHORT.unrealizedPnl ?? 0) + (diagDir.LONG.unrealizedPnl ?? 0)
     : 0;
-  const activeTpPct = paperControls?.cgWideTp.activeTpPct ?? 3;
-  const draftTpPct = Number(tpDraft);
-  const draftNetAfterCostPct = Number.isFinite(draftTpPct)
-    ? draftTpPct - (paperControls?.cgWideTp.roundTripCostPct ?? 0.22)
-    : null;
-  const canSaveTp = Number.isFinite(draftTpPct) && draftTpPct >= 0.05 && draftTpPct <= 10;
-  const milestoneRows = useMemo(
-    () => (telemetry?.lanes ?? []).map((lane) => ({ lane, milestone: laneMilestone(lane), progress: stageProgress(lane) })),
-    [telemetry?.lanes],
+  const milestoneSections = useMemo(
+    () => laneDirectionSections.map((section) => ({
+      ...section,
+      rows: section.lanes.map((lane) => ({ lane, milestone: laneMilestone(lane), progress: stageProgress(lane) })),
+    })),
+    [laneDirectionSections],
   );
   const watchableThreshold = telemetry?.lanes.find((lane) => lane.oosThreshold > 0)?.oosThreshold ?? 10;
 
   const neuralEdges = useMemo(() => {
     if (!telemetry) return [];
     const laneEdges: Array<[string, string]> = [];
-    for (const lane of telemetry.lanes) {
+    for (const lane of visualLanes) {
       laneEdges.push(['occupancy', lane.id], [lane.id, 'paper']);
     }
     return [...CORE_EDGES, ...laneEdges];
-  }, [telemetry]);
+  }, [telemetry, visualLanes]);
 
   function positionOf(id: string): Point | null {
     return NODE_POSITIONS[id] ?? lanePositions.get(id) ?? null;
   }
 
   function healthOf(id: string): NeuralHealth {
-    const lane = telemetry?.lanes.find((candidate) => candidate.id === id);
+    const lane = displayLanes.find((candidate) => candidate.id === id);
     if (lane) {
       const liveLane = liveAccount?.lanes.find((candidate) => candidate.laneId === lane.id);
       if (liveLane) {
@@ -908,111 +1046,20 @@ export default function NeuralMindmap() {
     return nodesById.get(id)?.health ?? 'IDLE';
   }
 
-  async function saveCgWideTp(nextValue: number | null) {
-    try {
-      setControlStatus('Saving CG WIDE TP...');
-      const response = await fetch('/api/shadow/paper-controls/cg-wide-tp', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ cgWideTpPct: nextValue }),
-      });
-      const next = await response.json() as (PaperControls & { ok?: boolean; reason?: string });
-      if (!response.ok || next.ok === false) throw new Error(next.reason ?? `Save failed (${response.status})`);
-      setPaperControls(next);
-      setTpDraft(next.cgWideTp.activeTpPct.toFixed(2));
-      setControlStatus(nextValue === null
-        ? 'CG WIDE TP reset to default 3.00%. New paper admissions use default target.'
-        : `CG WIDE TP set to ${next.cgWideTp.activeTpPct.toFixed(2)}%. New paper admissions use this target.`);
-      void loadTelemetry();
-    } catch (nextError) {
-      setControlStatus(nextError instanceof Error ? nextError.message : 'Unable to save TP control');
-    }
-  }
-
-  async function captureDiagnosticProfit() {
-    const confirm = window.prompt('Type CAPTURE_DIAG_PROFIT to close profitable diagnostic PAPER trades using Binance mark. This does not close live Binance positions.');
-    if (confirm !== 'CAPTURE_DIAG_PROFIT') {
-      setRealizeStatus('Cancelled. Diagnostic paper trades were not changed.');
-      return;
-    }
-    try {
-      setRealizeStatus('Capturing profitable diagnostic MTM using Binance mark...');
-      const response = await fetch('/api/shadow/paper-controls/realize-open', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ confirm, mode: 'PROFITABLE_DIAGNOSTIC' }),
-      });
-      const result = await response.json() as {
-        ok?: boolean;
-        reason?: string;
-        mode?: string;
-        closed?: number;
-        skipped?: number;
-        skippedNonProfit?: number;
-        realizedPnl?: number;
-        realizedR?: number;
-      };
-      if (!response.ok || result.ok === false) throw new Error(result.reason ?? `Realize failed (${response.status})`);
-      setRealizeStatus(
-        `Captured ${result.closed ?? 0} profitable diagnostic trades: ${fmtUsdt(result.realizedPnl ?? 0)} / ${fmtR(result.realizedR ?? 0)}. Skipped ${result.skipped ?? 0} missing mark, ${result.skippedNonProfit ?? 0} not profitable.`,
-      );
-      void loadTelemetry();
-    } catch (nextError) {
-      setRealizeStatus(nextError instanceof Error ? nextError.message : 'Unable to capture diagnostic profit');
-    }
-  }
-
-  async function flattenBinanceExchange() {
-    const confirm = window.prompt('DANGER: type FLATTEN_BINANCE_ALL to cancel Binance USD-M orders and market-close ALL exchange positions.');
-    if (confirm !== 'FLATTEN_BINANCE_ALL') {
-      setRealizeStatus('Cancelled. Binance exchange positions were not changed.');
-      return;
-    }
-    try {
-      setRealizeStatus('Flattening Binance exchange positions...');
-      const response = await fetch('/api/live/flatten-exchange', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ confirm, reason: 'dashboard operator flatten' }),
-      });
-      const result = await response.json() as {
-        ok?: boolean;
-        reason?: string;
-        env?: string;
-        flattened?: Array<{ symbol: string; quantity: number }>;
-        canceledOrderSymbols?: string[];
-        canceledAlgoSymbols?: string[];
-        failed?: Array<{ symbol: string; action: string; reason: string }>;
-      };
-      if (!response.ok || result.ok === false) {
-        const failures = result.failed?.map((item) => `${item.symbol}:${item.action}`).join(', ');
-        throw new Error(result.reason ?? failures ?? `Flatten failed (${response.status})`);
-      }
-      setRealizeStatus(
-        `Binance ${result.env ?? 'exchange'} flattened ${result.flattened?.length ?? 0} positions; canceled ${result.canceledOrderSymbols?.length ?? 0} order symbols and ${result.canceledAlgoSymbols?.length ?? 0} algo symbols. Kill-switch latched.`,
-      );
-      void loadLiveAccount();
-      void loadTelemetry();
-    } catch (nextError) {
-      setRealizeStatus(nextError instanceof Error ? nextError.message : 'Unable to flatten Binance exchange');
-      void loadLiveAccount();
-    }
-  }
-
   const selectedConnections = useMemo(() => {
     if (!telemetry || (!selectedNode && !selectedLane)) return { inputs: [] as string[], outputs: [] as string[] };
     const id = selectedNode?.id ?? selectedLane?.id ?? '';
     const edges = [
       ...CORE_EDGES,
-      ...telemetry.lanes.flatMap((lane): Array<[string, string]> => [['occupancy', lane.id], [lane.id, 'paper']]),
+      ...visualLanes.flatMap((lane): Array<[string, string]> => [['occupancy', lane.id], [lane.id, 'paper']]),
     ];
     const labelOf = (nodeId: string) =>
-      nodesById.get(nodeId)?.label ?? telemetry.lanes.find((lane) => lane.id === nodeId)?.label ?? nodeId;
+      nodesById.get(nodeId)?.label ?? visualLanes.find((lane) => lane.id === nodeId)?.label ?? nodeId;
     return {
       inputs: edges.filter(([, to]) => to === id).map(([from]) => labelOf(from)),
       outputs: edges.filter(([from]) => from === id).map(([, to]) => labelOf(to)),
     };
-  }, [nodesById, selectedLane, selectedNode, telemetry]);
+  }, [nodesById, selectedLane, selectedNode, telemetry, visualLanes]);
 
   return (
     <div className="neural-shell">
@@ -1080,7 +1127,14 @@ export default function NeuralMindmap() {
                     </span>
                   );
                 })}
-                <span className="diag-dir-foot">{fmtUsdt(diagUnrealTotal)} open MTM total · not real money</span>
+                {diagMixed ? (
+                  <span className="diag-dir-row">
+                    <b>MIXED</b>{' '}
+                    <span className={diagMixed.closed < 1 ? 'tone-measure' : (diagMixed.netAvgR ?? 0) > 0 ? 'tone-healthy' : 'tone-critical'}>{fmtUsdt(diagMixed.realizedPnl)}</span>{' realized · '}
+                    {diagMixed.closed}cl/{diagMixed.open}op · {fmtR(diagMixed.netAvgR)} · {diagMixed.wr != null ? `${Math.round(diagMixed.wr * 100)}% WR` : '—'} · {fmtUsdt(diagMixed.unrealizedPnl)} MTM · regime subset
+                  </span>
+                ) : null}
+                <span className="diag-dir-foot">{fmtUsdt(diagUnrealTotal)} open MTM total · MIXED is subset, not added twice · not real money</span>
               </span>
             ) : 'paper only'}
           </small>
@@ -1128,18 +1182,6 @@ export default function NeuralMindmap() {
           </small>
         </div>
         <div>
-          <span>Binance unrealized PnL</span>
-          <strong className={(liveAccount?.unrealizedPnl ?? 0) >= 0 ? 'tone-healthy' : 'tone-critical'}>
-            {liveAccount ? `${liveAccount.unrealizedPnl >= 0 ? '+' : ''}${liveAccount.unrealizedPnl.toFixed(2)} USDT` : 'n/a'}
-          </strong>
-          <small>{liveAccount ? `${liveAccount.openPositionCount} positions / ${liveAccount.openOrderCount} exits` : 'testnet execution'}</small>
-        </div>
-        <div>
-          <span>Binance equity</span>
-          <strong>{liveAccount?.accountEquity != null ? `${liveAccount.accountEquity.toFixed(2)} USDT` : 'Loading'}</strong>
-          <small>{liveAccount?.availableBalance != null ? `${liveAccount.availableBalance.toFixed(2)} available` : 'testnet'}</small>
-        </div>
-        <div>
           <span>Safety</span>
           <strong className="tone-healthy">Testnet mirror</strong>
           <small>{liveAccount ? `${liveAccount.openPositionCount} protected positions` : 'loading account'}</small>
@@ -1152,63 +1194,6 @@ export default function NeuralMindmap() {
           <span>{error}. The last known state remains visible.</span>
         </div>
       )}
-
-      <section className="neural-control-panel" aria-label="CG WIDE TP control">
-        <div className={`neural-tp-verdict verdict-${paperTpAssessment?.verdict.toLowerCase().replace(/_/g, '-') ?? 'unknown'}`}>
-          <span>CG WIDE TP assessment</span>
-          <strong>{tpVerdictLabel(paperTpAssessment)}</strong>
-          <p>{paperTpAssessment?.reason ?? 'Waiting for paper control telemetry.'}</p>
-        </div>
-        <div className="neural-tp-metrics">
-          <div><span>Current TP</span><strong>{fmtPlainPct(activeTpPct)}</strong><small>{paperControls?.controls.cgWideTpPct === null ? 'default' : 'manual override'}</small></div>
-          <div><span>Fee + slippage est.</span><strong>{fmtPlainPct(paperControls?.cgWideTp.roundTripCostPct ?? 0.22)}</strong><small>round trip estimate</small></div>
-          <div><span>Net after cost</span><strong className={(paperTpAssessment?.netTpAfterCostPct ?? 0) >= 0 ? 'tone-healthy' : 'tone-critical'}>{fmtPlainPct(paperTpAssessment?.netTpAfterCostPct ?? null)}</strong><small>TP minus cost</small></div>
-          <div><span>MFE p75 / p90</span><strong>{fmtPlainPct(telemetry?.paper.openP75MfePct ?? null)} / {fmtPlainPct(telemetry?.paper.openP90MfePct ?? null)}</strong><small>open paper excursion</small></div>
-        </div>
-        <div className="neural-tp-editor">
-          <label>
-            <span>Set future CG WIDE TP</span>
-            <input
-              type="range"
-              min="0.05"
-              max="10"
-              step="0.05"
-              value={Number.isFinite(draftTpPct) ? draftTpPct : activeTpPct}
-              onChange={(event) => setTpDraft(Number(event.target.value).toFixed(2))}
-            />
-          </label>
-          <div className="neural-tp-manual">
-            <input
-              type="number"
-              min="0.05"
-              max="10"
-              step="0.05"
-              inputMode="decimal"
-              value={tpDraft}
-              onChange={(event) => setTpDraft(event.target.value)}
-              aria-label="Manual CG WIDE TP percent"
-            />
-            <button type="button" disabled={!canSaveTp} onClick={() => void saveCgWideTp(draftTpPct)}>Apply TP</button>
-            <button type="button" className="is-secondary" onClick={() => void saveCgWideTp(null)}>Reset 3%</button>
-          </div>
-          <small>
-            Draft net after cost: <b className={(draftNetAfterCostPct ?? 0) >= 0 ? 'tone-healthy' : 'tone-critical'}>{fmtPlainPct(draftNetAfterCostPct)}</b>.
-            Applies to new CG WIDE paper admissions only.
-          </small>
-        </div>
-        <div className="neural-realize-box">
-          <button type="button" onClick={() => void captureDiagnosticProfit()}>Capture diag profit</button>
-          <p>Closes only profitable diagnostic paper MTM using Binance mark. Non-profitable diagnostics stay open; live Binance positions are untouched.</p>
-          <button type="button" className="is-exchange-danger" onClick={() => void flattenBinanceExchange()}>Close Binance exchange</button>
-          <p>Cancels visible Binance USD-M orders and market reduce-only closes every exchange position. This latches the kill-switch.</p>
-        </div>
-        {(controlStatus || realizeStatus) && (
-          <div className="neural-control-status">
-            {controlStatus && <span>{controlStatus}</span>}
-            {realizeStatus && <span>{realizeStatus}</span>}
-          </div>
-        )}
-      </section>
 
       <section className="neural-milestone-panel" aria-label="Lane maturity thresholds">
         <div className="neural-milestone-summary">
@@ -1261,19 +1246,33 @@ export default function NeuralMindmap() {
               </tr>
             </thead>
             <tbody>
-              {milestoneRows.map(({ lane, milestone, progress }) => (
-                <tr key={`milestone-${lane.id}`} onClick={() => setSelectedId(lane.id)}>
-                  <td>{compactLaneLabel(lane.label)}</td>
-                  <td>{lane.status}</td>
-                  <td><span className={`neural-stage-pill stage-${milestone.stage.toLowerCase()}`}>{stageLabel(milestone.stage)}</span></td>
-                  <td>{progress.nextStage}</td>
-                  <td>{progress.progressPct}%</td>
-                  <td>{lane.oosFreshValid ?? lane.closed} / {lane.oosThreshold}</td>
-                  <td className={(lane.netAvgR ?? 0) >= 0 ? 'tone-healthy' : 'tone-critical'}>{fmtR(lane.netAvgR)}</td>
-                  <td>{fmtNumber(lane.pf)}</td>
-                  <td>{statsSourceShortLabel(lane.statsSource)}</td>
-                  <td>{progress.blockers.slice(0, 2).join(' | ') || 'None'}</td>
-                </tr>
+              {milestoneSections.map((section) => (
+                <Fragment key={`milestone-section-${section.key}`}>
+                  <tr className={`neural-direction-row direction-${section.key.toLowerCase()}`}>
+                    <td colSpan={10}>
+                      <span>{section.label}</span>
+                      <small>{section.lanes.length} lane{section.lanes.length === 1 ? '' : 's'} · {section.detail}</small>
+                    </td>
+                  </tr>
+                  {section.rows.map(({ lane, milestone, progress }) => (
+                    <tr
+                      key={`milestone-${lane.id}`}
+                      className={isQuarantinedLane(lane) ? 'is-quarantined' : ''}
+                      onClick={() => setSelectedId(lane.id)}
+                    >
+                      <td>{compactLaneLabel(lane.label)}</td>
+                      <td>{lane.status}</td>
+                      <td><span className={`neural-stage-pill ${evidencePillClass(lane, milestone)}`}>{isQuarantinedLane(lane) ? 'Quarantined' : stageLabel(milestone.stage)}</span></td>
+                      <td>{progress.nextStage}</td>
+                      <td>{progress.progressPct}%</td>
+                      <td>{lane.oosFreshValid ?? lane.closed} / {lane.oosThreshold}</td>
+                      <td className={(lane.netAvgR ?? 0) >= 0 ? 'tone-healthy' : 'tone-critical'}>{fmtR(lane.netAvgR)}</td>
+                      <td>{fmtNumber(lane.pf)}</td>
+                      <td>{statsSourceShortLabel(lane.statsSource)}</td>
+                      <td>{progress.blockers.slice(0, 2).join(' | ') || 'None'}</td>
+                    </tr>
+                  ))}
+                </Fragment>
               ))}
             </tbody>
           </table>
@@ -1309,7 +1308,7 @@ export default function NeuralMindmap() {
                     const health = healthRank(targetHealth) > healthRank(sourceHealth) ? targetHealth : sourceHealth;
                     const path = edgePath(from, to);
                     const flowing = nodesById.get(fromId)?.active || nodesById.get(toId)?.active ||
-                      telemetry?.lanes.find((lane) => (lane.id === fromId || lane.id === toId) && lane.active);
+                      visualLanes.find((lane) => (lane.id === fromId || lane.id === toId) && lane.active);
                     return (
                       <g key={`${fromId}-${toId}`} className={`neural-edge health-${health.toLowerCase()} ${flowing ? 'is-flowing' : ''}`}>
                         <path d={path} className="neural-edge-base" />
@@ -1349,7 +1348,7 @@ export default function NeuralMindmap() {
                   );
                 })}
 
-                {(telemetry?.lanes ?? []).map((lane) => {
+                {visualLanes.map((lane) => {
                   const point = lanePositions.get(lane.id);
                   if (!point) return null;
                   const displayHealth = healthOf(lane.id);
@@ -1456,7 +1455,7 @@ export default function NeuralMindmap() {
             <>
               <div className={`neural-diagnosis health-${selectedLane.health.toLowerCase()}`}>
                 <span>Lane diagnosis</span>
-                <strong>{selectedLiveLane ? 'Lane color follows Binance unrealized PnL.' : laneDiagnosis(selectedLane)}</strong>
+                <strong>{selectedLiveLane ? 'Lane color follows mirrored exchange P&L.' : laneDiagnosis(selectedLane)}</strong>
                 <p>Paper evidence remains separate; execution equity, exposure, and current PnL come from Binance testnet.</p>
               </div>
               {selectedLane.oosFreshValid !== null && (
@@ -1623,36 +1622,46 @@ export default function NeuralMindmap() {
         </div>
 
         <div className="neural-lane-strip">
-          <header><span>Lane performance field</span><strong>{telemetry?.lanes.length ?? 0} lanes</strong></header>
+          <header><span>Lane performance field</span><strong>{displayLanes.length} lanes</strong></header>
           <div className="neural-lane-table-wrap">
             <table>
               <thead><tr><th>Lane</th><th>Evidence</th><th>TP Gap</th><th>Diag MTM</th><th>MFE</th><th>Binance PnL</th><th>Growth</th><th>Mirrored</th><th>n</th><th>Net Avg R</th><th>PF</th><th>WR</th></tr></thead>
               <tbody>
-                {telemetry?.lanes.map((lane) => {
-                  const liveLane = liveAccount?.lanes.find((item) => item.laneId === lane.id);
-                  const livePnl = liveLane?.unrealizedPnl ?? 0;
-                  const liveGrowth = liveAccount?.accountEquity && liveAccount.accountEquity > 0
-                    ? (livePnl / liveAccount.accountEquity) * 100
-                    : null;
-                  return (
-                    <tr key={lane.id} className={`${lane.active ? 'is-active' : ''}${lane.health === 'QUARANTINE' ? ' is-quarantined' : ''}`} onClick={() => setSelectedId(lane.id)}>
-                      <td><i className={`health-${healthOf(lane.id).toLowerCase()}`} />{compactLaneLabel(lane.label)}</td>
-                      <td>{lane.status}</td>
-                      <td>{fmtGapPct(lane.openAvgDistanceToTpPct)}</td>
-                      <td className="tone-measure">{fmtUsdt(lane.diagnosticUnrealizedPnl)}</td>
-                      <td className="tone-measure">{fmtUsdt(lane.openMaxFavorablePnl)}</td>
-                      <td className={livePnl >= 0 ? 'tone-healthy' : 'tone-critical'}>{`${livePnl >= 0 ? '+' : ''}${livePnl.toFixed(2)} USDT`}</td>
-                      <td className={livePnl >= 0 ? 'tone-healthy' : 'tone-critical'}>{fmtPct(liveGrowth)}</td>
-                      <td>{liveLane?.sourceOrderCount ?? 0}</td>
-                      {/* N mirrors the Promotion Ladder's FRESH VALID source exactly (oosFreshValid ?? closed) */}
-                      <td>{lane.oosFreshValid ?? lane.closed}</td>
-                      {/* Net Avg R coloured by profit/loss; null (n/a) stays neutral */}
-                      <td className={lane.netAvgR == null ? '' : lane.netAvgR >= 0 ? 'tone-healthy' : 'tone-critical'}>{fmtR(lane.netAvgR)}</td>
-                      <td>{fmtNumber(lane.pf)}</td>
-                      <td>{lane.wr === null ? 'n/a' : `${(lane.wr * 100).toFixed(1)}%`}</td>
+                {laneDirectionSections.map((section) => (
+                  <Fragment key={`lane-section-${section.key}`}>
+                    <tr className={`neural-direction-row direction-${section.key.toLowerCase()}`}>
+                      <td colSpan={12}>
+                        <span>{section.label}</span>
+                        <small>{section.lanes.length} lane{section.lanes.length === 1 ? '' : 's'} · {section.detail}</small>
+                      </td>
                     </tr>
-                  );
-                })}
+                    {section.lanes.map((lane) => {
+                      const liveLane = liveAccount?.lanes.find((item) => item.laneId === lane.id);
+                      const livePnl = liveLane?.unrealizedPnl ?? 0;
+                      const liveGrowth = liveAccount?.accountEquity && liveAccount.accountEquity > 0
+                        ? (livePnl / liveAccount.accountEquity) * 100
+                        : null;
+                      return (
+                        <tr key={lane.id} className={`${lane.active ? 'is-active' : ''}${lane.health === 'QUARANTINE' ? ' is-quarantined' : ''}`} onClick={() => setSelectedId(lane.id)}>
+                          <td><i className={`health-${healthOf(lane.id).toLowerCase()}`} />{compactLaneLabel(lane.label)}</td>
+                          <td><span className={`neural-stage-pill ${evidencePillClass(lane)}`}>{lane.status}</span></td>
+                          <td>{fmtGapPct(lane.openAvgDistanceToTpPct)}</td>
+                          <td className="tone-measure">{fmtUsdt(lane.diagnosticUnrealizedPnl)}</td>
+                          <td className="tone-measure">{fmtUsdt(lane.openMaxFavorablePnl)}</td>
+                          <td className={livePnl >= 0 ? 'tone-healthy' : 'tone-critical'}>{`${livePnl >= 0 ? '+' : ''}${livePnl.toFixed(2)} USDT`}</td>
+                          <td className={livePnl >= 0 ? 'tone-healthy' : 'tone-critical'}>{fmtPct(liveGrowth)}</td>
+                          <td>{liveLane?.sourceOrderCount ?? 0}</td>
+                          {/* N mirrors the Promotion Ladder's FRESH VALID source exactly (oosFreshValid ?? closed) */}
+                          <td>{lane.oosFreshValid ?? lane.closed}</td>
+                          {/* Net Avg R coloured by profit/loss; null (n/a) stays neutral */}
+                          <td className={lane.netAvgR == null ? '' : lane.netAvgR >= 0 ? 'tone-healthy' : 'tone-critical'}>{fmtR(lane.netAvgR)}</td>
+                          <td>{fmtNumber(lane.pf)}</td>
+                          <td>{lane.wr === null ? 'n/a' : `${(lane.wr * 100).toFixed(1)}%`}</td>
+                        </tr>
+                      );
+                    })}
+                  </Fragment>
+                ))}
               </tbody>
             </table>
           </div>
