@@ -1,5 +1,5 @@
 /**
- * Real-time short live-mirror source ("mode 2").
+ * Real-time stable-candidate live-mirror source ("mode 2").
  *
  * The live execution engine mirrors HEADLINE paper orders to the exchange, but only those whose
  * source is FRESH (now − openedAt ≤ 10 min). The CG_WIDE_FAST_SHORT VM lane is a *measurement*
@@ -12,12 +12,11 @@
  * live engine reads. The measurement paper book is never touched → zero pollution of OOS stats.
  *
  * Safety posture (enforced here + re-checked downstream by the engine):
- *   - SHORT only             — LONG candidates dropped; the controller must allow shorts.
- *   - only the stable lane   — orders are tagged CG_VARIANT_MATRIX:CG_WIDE_FAST_SHORT and only
- *                              emitted while that lane is STABLE_CANDIDATE; the engine's
- *                              live-eligibility gate re-checks STABLE at mirror time.
- *   - no stale               — openedAt = now, so the engine's freshness gate passes honestly.
- *   - experimental, env-gated — only runs when REALTIME_SHORT_MIRROR_ENABLED=1 (testnet only).
+ *   - controller-direction gate — LONG/SHORT candidates require the controller to allow that side.
+ *   - stable-candidate only     — only exact STABLE_CANDIDATE VM rows can emit.
+ *   - live-supported geometry   — maker_limit lanes are not mirrored as MARKET orders.
+ *   - no stale                  — openedAt = now, so the engine's freshness gate passes honestly.
+ *   - experimental, env-gated   — only runs when REALTIME_SHORT_MIRROR_ENABLED=1 (testnet only).
  *
  * Report/paper-only: this module never calls the exchange. It writes paper orders; the live
  * engine (kill-switches, max-concurrent, leverage/notional caps) owns all real execution.
@@ -27,19 +26,34 @@ import {
   PAPER_EQUITY,
   type PaperOrder,
 } from "./paper-execution-router.js";
+import {
+  LANE_SELECTOR_V2_LIVE_SUPPORTED_VARIANT_IDS,
+  isLaneSelectorV2SupportedVariantId,
+  laneSelectorV2LaneId,
+  selectLaneV2,
+  type LaneSelectorV2Geometry,
+  type LaneSelectorV2LaneState,
+} from "./lane-selector-v2.js";
+import type { VariantMatrixVariantId } from "./current-guard-variant-matrix.js";
 
 export const REALTIME_SHORT_LANE_VARIANT_ID = "CG_WIDE_FAST_SHORT";
 export const REALTIME_SHORT_SELECTED_LANE_ID = `CG_VARIANT_MATRIX:${REALTIME_SHORT_LANE_VARIANT_ID}`;
 const DEFAULT_MAX_PER_CYCLE = 3;
 
-// CG_WIDE_FAST_SHORT lane geometry (current-guard-variant-matrix.ts): wide >=300bps stop,
-// 0.5R take-profit, exitRule "tp1_full" (bank 100% at TP1). The scanner's own tp1 is computed
-// for a different entry-variant anchor and lands ~0.14% from the live price (RR garbage), so we
-// DERIVE stop + TP from the live entry and the stop DISTANCE — anchor-independent and coherent.
-const STOP_FLOOR_FRAC = 0.03; // 300bps floor (lane stopFloorBps)
-const STOP_CAP_FRAC = 0.12; // guard against anchor-mismatch blow-ups (12% max)
-const TP_REWARD_MULTIPLE = 0.5; // lane tpRewardMultiple
-const REALTIME_SHORT_EXIT_RULE = "tp1_full" as const; // lane exitRule: full exit at TP1, no runner
+export const REALTIME_SHORT_ALLOWED_VARIANT_IDS = LANE_SELECTOR_V2_LIVE_SUPPORTED_VARIANT_IDS;
+
+export function isRealtimeShortAllowedVariantId(id: string | null | undefined): id is VariantMatrixVariantId {
+  return isLaneSelectorV2SupportedVariantId(id);
+}
+
+export function isRealtimeShortAllowedLaneId(laneId: string | null | undefined): boolean {
+  const variantId = laneId?.split(":").pop();
+  return isRealtimeShortAllowedVariantId(variantId);
+}
+
+export function realtimeShortSelectedLaneId(variantId: VariantMatrixVariantId): string {
+  return laneSelectorV2LaneId(variantId);
+}
 
 let _store: PaperExecutionRouterStore | null = null;
 /**
@@ -60,12 +74,6 @@ export function isRealtimeShortMirrorEnabled(env: NodeJS.ProcessEnv = process.en
   return env.REALTIME_SHORT_MIRROR_ENABLED === "1";
 }
 
-/** Controller modes under which it is safe to OPEN shorts. */
-function controllerAllowsShort(mode: string | null | undefined): boolean {
-  const m = (mode ?? "").toUpperCase();
-  return m === "SHORT_ONLY" || m === "BOTH_ALLOWED";
-}
-
 export interface RealtimeShortCandidate {
   symbol: string;
   direction: "LONG" | "SHORT";
@@ -75,12 +83,16 @@ export interface RealtimeShortCandidate {
   stopDistanceBps?: number | null;
 }
 
+export type RealtimeShortLaneState = LaneSelectorV2LaneState;
+
 export interface RealtimeShortMirrorInputs {
   candidates: RealtimeShortCandidate[];
   regime: string | null;
   controllerMode: string | null;
-  /** CG_WIDE_FAST_SHORT must currently be STABLE_CANDIDATE (only stable short lanes). */
-  stableShortLaneActive: boolean;
+  /** Back-compat: CG_WIDE_FAST_SHORT must currently be STABLE_CANDIDATE. Prefer stableShortLanes. */
+  stableShortLaneActive?: boolean;
+  /** Current VM rows for the only live-testnet-allowed short lanes. Must be STABLE_CANDIDATE. */
+  stableShortLanes?: RealtimeShortLaneState[];
   /** ISO timestamp — injected for determinism/testability. */
   now: string;
   maxPerCycle?: number;
@@ -94,6 +106,13 @@ export interface RealtimeShortMirrorResult {
 
 function isPos(n: number | null | undefined): n is number {
   return typeof n === "number" && Number.isFinite(n) && n > 0;
+}
+
+function effectiveLaneStates(inputs: RealtimeShortMirrorInputs): RealtimeShortLaneState[] {
+  if (inputs.stableShortLanes) return inputs.stableShortLanes;
+  return inputs.stableShortLaneActive
+    ? [{ variantId: REALTIME_SHORT_LANE_VARIANT_ID, status: "STABLE_CANDIDATE" }]
+    : [];
 }
 
 /**
@@ -123,15 +142,13 @@ export function runRealtimeShortMirror(
 ): RealtimeShortMirrorResult {
   const result: RealtimeShortMirrorResult = { emitted: 0, skipped: 0, reasons: [] };
   const maxPerCycle = inputs.maxPerCycle ?? DEFAULT_MAX_PER_CYCLE;
+  const laneStates = effectiveLaneStates(inputs);
 
-  // Only stable short lanes: hard gate on CG_WIDE_FAST_SHORT being STABLE.
-  if (!inputs.stableShortLaneActive) {
-    result.reasons.push("stable_short_lane_inactive");
-    return result;
-  }
-  // Never open shorts unless the controller explicitly allows them (no-long, regime-gated).
-  if (!controllerAllowsShort(inputs.controllerMode)) {
-    result.reasons.push(`controller_blocks_short:${(inputs.controllerMode ?? "UNKNOWN").toUpperCase()}`);
+  // Only exact STABLE_CANDIDATE rows can emit into /testnet. WATCHABLE/COLLECTING/REJECT
+  // (or any future "headline active" downgrade label) stops being live-eligible immediately.
+  const hasAnyStableLane = laneStates.some((state) => state.status === "STABLE_CANDIDATE" && isRealtimeShortAllowedVariantId(state.variantId));
+  if (!hasAnyStableLane) {
+    result.reasons.push("stable_lane_inactive");
     return result;
   }
 
@@ -142,31 +159,36 @@ export function runRealtimeShortMirror(
       result.reasons.push(`cap_reached:${c.symbol}`);
       continue;
     }
-    if (c.direction !== "SHORT") {
-      result.skipped += 1;
-      result.reasons.push(`not_short:${c.symbol}`);
-      continue;
-    }
     const entry = c.currentPrice;
     if (!isPos(entry)) {
       result.skipped += 1;
       result.reasons.push(`bad_geometry:${c.symbol}`);
       continue;
     }
-    // Require a real short setup: the scanner's stop must sit ABOVE the live price. If price has
-    // already run up through it, the short is stale/invalid — skip rather than chase.
-    if (!isPos(c.stopLoss) || !(c.stopLoss > entry)) {
+    if (!isPos(c.stopLoss)) {
       result.skipped += 1;
-      result.reasons.push(`no_short_stop:${c.symbol}`);
+      result.reasons.push(`no_stop:${c.symbol}`);
       continue;
     }
-    // Coherent geometry anchored to the LIVE entry: wide stop (>=300bps, floored/capped) + 0.5R TP.
-    const stopDistFrac = Math.min(
-      Math.max((c.stopLoss - entry) / entry, STOP_FLOOR_FRAC),
-      STOP_CAP_FRAC,
-    );
-    const stop = entry * (1 + stopDistFrac); // above entry
-    const tp1 = entry * (1 - TP_REWARD_MULTIPLE * stopDistFrac); // 0.5R below entry
+    const selected = selectLaneV2({
+      candidate: {
+        symbol: c.symbol,
+        direction: c.direction,
+        currentPrice: entry,
+        stopLoss: c.stopLoss,
+        takeProfitLevels: c.takeProfitLevels,
+        stopDistanceBps: c.stopDistanceBps,
+      },
+      laneStates,
+      regime: inputs.regime,
+      controllerMode: inputs.controllerMode,
+      now: inputs.now,
+    });
+    if (!selected.selected) {
+      result.skipped += 1;
+      result.reasons.push(`${selected.rejected[0] ?? "no_live_geometry"}:${c.symbol}`);
+      continue;
+    }
     const dedupeKey = `RTSHORT:${c.symbol}:${bucket}`;
     if (store.hasOrder(dedupeKey)) {
       result.skipped += 1;
@@ -175,7 +197,7 @@ export function runRealtimeShortMirror(
     }
     const paperOrderId = makeRealtimeShortPaperOrderId(c.symbol, inputs.now);
     store.add(
-      buildRealtimeShortOrder(c, entry, stop, tp1, stopDistFrac, inputs, dedupeKey, paperOrderId),
+      buildRealtimeShortOrder(c, selected.selected, inputs, dedupeKey, paperOrderId),
     );
     result.emitted += 1;
   }
@@ -184,16 +206,13 @@ export function runRealtimeShortMirror(
 
 function buildRealtimeShortOrder(
   c: RealtimeShortCandidate,
-  entry: number,
-  stop: number,
-  tp1: number,
-  stopDistFrac: number,
+  geometry: LaneSelectorV2Geometry,
   inputs: RealtimeShortMirrorInputs,
   dedupeKey: string,
   paperOrderId: string,
 ): PaperOrder {
   const now = inputs.now;
-  const stopDistanceBps = stopDistFrac * 10_000; // coherent with the derived stop
+  const { lane, entry, stop, tp1, stopDistanceBps } = geometry;
   // Record-only sizing fields — the live engine recomputes real size from its own config
   // (riskUsdPerTrade / maxNotionalPerTrade). These are forensic only and never executed on.
   const plannedRiskAmount = PAPER_EQUITY * 0.01;
@@ -207,15 +226,16 @@ function buildRealtimeShortOrder(
     updatedAt: now,
     openedAt: now, // FRESH — the whole point: passes the no-stale gate honestly
     symbol: c.symbol,
-    direction: "SHORT",
+    direction: c.direction,
     regime: inputs.regime,
-    controllerMode: inputs.controllerMode ?? "SHORT_ONLY",
-    selectedLaneId: REALTIME_SHORT_SELECTED_LANE_ID,
+    controllerMode: inputs.controllerMode ?? (c.direction === "SHORT" ? "SHORT_ONLY" : "LONG_ONLY"),
+    selectedLaneId: lane.selectedLaneId,
     routerPermission: "HEADLINE",
     entryPrice: entry,
     stopLoss: stop,
     takeProfitLevels: [tp1],
-    variantExitRule: REALTIME_SHORT_EXIT_RULE, // tp1_full → engine banks 100% at TP1 (no runner)
+    variantExitRule: lane.exitRule,
+    fillMode: lane.definition.fillMode,
     plannedStopDistanceBps: stopDistanceBps,
     riskPctOfEquity: 1,
     paperEquity: PAPER_EQUITY,

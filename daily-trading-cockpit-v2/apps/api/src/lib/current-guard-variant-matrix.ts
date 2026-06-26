@@ -1559,6 +1559,12 @@ export interface VariantBreakdownRow {
   key: string;
   n: number;
   netAvgR: number | null;
+  grossAvgR?: number | null;
+  pf?: number | null;
+  wr?: number | null;
+  payoffRatio?: number | null;
+  avgWinR?: number | null;
+  avgLossR?: number | null;
 }
 
 export interface CurrentGuardVariantMatrixRow {
@@ -1604,7 +1610,12 @@ export interface CurrentGuardVariantMatrixRow {
   calendarDays: number | null;
   distinctRegimes: number;
   byRegime: VariantBreakdownRow[];
+  /** Direction cohort performance for the same fresh-valid row population. */
+  byDirection?: VariantBreakdownRow[];
+  /** Coarse regime-family cohort; MIXED answers choppy/range performance directly. */
+  byRegimeFamily?: VariantBreakdownRow[];
   byEntryVariant: VariantBreakdownRow[];
+  bySymbol: VariantBreakdownRow[];
 
   oosThirds: [VariantSegmentStat, VariantSegmentStat, VariantSegmentStat] | null;
   allThreeOosPositive: boolean;
@@ -1743,8 +1754,35 @@ function breakdownRows(
     groups.set(k, arr);
   }
   return Array.from(groups.entries())
-    .map(([key, arr]) => ({ key, n: arr.length, netAvgR: mean(arr.map((o) => o.netR)) }))
+    .map(([key, arr]) => {
+      const netVals = arr.map((o) => o.netR);
+      const wins = arr.filter((o) => (o.netR ?? 0) > 0);
+      const losses = arr.filter((o) => (o.netR ?? 0) <= 0);
+      const avgWinR = mean(wins.map((o) => o.netR));
+      const avgLossR = mean(losses.map((o) => o.netR));
+      return {
+        key,
+        n: arr.length,
+        netAvgR: mean(netVals),
+        grossAvgR: mean(arr.map((o) => o.grossR)),
+        pf: profitFactor(netVals),
+        wr: arr.length > 0 ? wins.length / arr.length : null,
+        payoffRatio: avgWinR !== null && avgLossR !== null && avgLossR < 0 ? avgWinR / Math.abs(avgLossR) : null,
+        avgWinR,
+        avgLossR,
+      };
+    })
     .sort((a, b) => (a.netAvgR ?? 0) - (b.netAvgR ?? 0));
+}
+
+function regimeFamilyKey(regime: string | null | undefined): "BULLISH" | "BEARISH" | "MIXED" | "UNKNOWN" {
+  const label = (regime ?? "").toLowerCase();
+  if (label.includes("mixed") || label.includes("chop") || label.includes("range") || label.includes("rotation") || label.includes("sideways")) {
+    return "MIXED";
+  }
+  if (label.includes("bull")) return "BULLISH";
+  if (label.includes("bear")) return "BEARISH";
+  return "UNKNOWN";
 }
 
 function topSymbolPnlShare(slice: CurrentGuardVariantMatrixObservation[]): number | null {
@@ -1930,7 +1968,10 @@ function buildRow(
   const regimes = new Set(fresh.map((o) => o.regime ?? "UNKNOWN"));
   const distinctRegimes = regimes.size;
   const byRegime = breakdownRows(fresh, (o) => o.regime ?? "UNKNOWN");
+  const byDirection = breakdownRows(fresh, (o) => o.direction);
+  const byRegimeFamily = breakdownRows(fresh, (o) => regimeFamilyKey(o.regime));
   const byEntryVariant = breakdownRows(fresh, (o) => o.entryVariant ?? "unknown");
+  const bySymbol = breakdownRows(fresh, (o) => o.symbol);
 
   let oosThirds: [VariantSegmentStat, VariantSegmentStat, VariantSegmentStat] | null = null;
   let allThreeOosPositive = false;
@@ -1985,7 +2026,10 @@ function buildRow(
     calendarDays: calendarDays(fresh),
     distinctRegimes,
     byRegime,
+    byDirection,
+    byRegimeFamily,
     byEntryVariant,
+    bySymbol,
     oosThirds,
     allThreeOosPositive,
     rolling,

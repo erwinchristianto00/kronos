@@ -7,6 +7,8 @@ import {
   runRealtimeShortMirror,
   isRealtimeShortMirrorEnabled,
   makeRealtimeShortPaperOrderId,
+  realtimeShortSelectedLaneId,
+  REALTIME_SHORT_ALLOWED_VARIANT_IDS,
   REALTIME_SHORT_SELECTED_LANE_ID,
   type RealtimeShortCandidate,
   type RealtimeShortMirrorInputs,
@@ -44,7 +46,7 @@ function inputs(
 }
 
 describe("realtime-short-mirror — fresh short live-mirror source (mode 2)", () => {
-  it("[SHORT-ONLY] emits SHORT candidates and drops LONG ones", () => {
+  it("[DIRECTION-GATE] emits candidates only when controller allows their direction", () => {
     const store = freshStore();
     const res = runRealtimeShortMirror(
       inputs([
@@ -57,7 +59,7 @@ describe("realtime-short-mirror — fresh short live-mirror source (mode 2)", ()
     expect(store.all).toHaveLength(1);
     expect(store.all[0]!.symbol).toBe("BTCUSDT");
     expect(store.all[0]!.direction).toBe("SHORT");
-    expect(res.reasons.some((r) => r.startsWith("not_short:ETHUSDT"))).toBe(true);
+    expect(res.reasons.some((r) => r.startsWith("controller_blocks_LONG:ETHUSDT"))).toBe(true);
   });
 
   it("[FRESH] emitted order is born fresh (openedAt === createdAt === now) so it passes the no-stale gate", () => {
@@ -80,6 +82,89 @@ describe("realtime-short-mirror — fresh short live-mirror source (mode 2)", ()
     expect(o.sourceType).toBe("REALTIME_SHORT_MIRROR");
     expect(o.variantExitRule).toBe("tp1_full"); // bank 100% at TP1
     expect(o.entryPrice).toBe(100);
+  });
+
+  it("[SELECTOR] ranks live-supported stable candidates and emits the best lane geometry", () => {
+    const store = freshStore();
+    const res = runRealtimeShortMirror(
+      inputs([shortCand("BTCUSDT", { currentPrice: 100, stopLoss: 104 })], {
+        stableShortLaneActive: false,
+        stableShortLanes: [
+          { variantId: "CG_WIDE_FAST_SHORT", status: "STABLE_CANDIDATE", freshValid: 200, netAvgR: 0.25, pf: 1.2 },
+          { variantId: "CG_WIDE_STOP_TP_WIDE", status: "STABLE_CANDIDATE", freshValid: 200, netAvgR: 0.3, pf: 1.3 },
+          { variantId: "CG_MFE_GIVEBACK", status: "STABLE_CANDIDATE", freshValid: 200, netAvgR: 0.6, pf: 1.1 },
+        ],
+      }),
+      store,
+    );
+    expect(res.emitted).toBe(1);
+    const o = store.all[0]!;
+    expect(o.selectedLaneId).toBe(realtimeShortSelectedLaneId("CG_MFE_GIVEBACK"));
+    expect(o.variantExitRule).toBe("mfe_giveback");
+    expect(o.takeProfitLevels[0]).toBeCloseTo(88, 6); // 3R against a 4% wide stop
+  });
+
+  it("[ALLOWLIST] refuses downgraded lanes and maker-only lanes even when telemetry says stable", () => {
+    const store = freshStore();
+    const res = runRealtimeShortMirror(
+      inputs([shortCand("BTCUSDT")], {
+        stableShortLaneActive: false,
+        stableShortLanes: [
+          { variantId: "CG_MAKER_LIMIT_SIM", status: "STABLE_CANDIDATE", freshValid: 999, netAvgR: 9, pf: 9 },
+          { variantId: "CG_WIDE_FAST_SHORT", status: "COLLECTING", freshValid: 999, netAvgR: 9, pf: 9 },
+        ],
+      }),
+      store,
+    );
+    expect(res.emitted).toBe(0);
+    expect(store.all).toHaveLength(0);
+    expect(res.reasons).toContain("stable_lane_inactive");
+    expect(REALTIME_SHORT_ALLOWED_VARIANT_IDS).toContain("CG_WIDE_FAST_SHORT");
+    expect(REALTIME_SHORT_ALLOWED_VARIANT_IDS).toContain("CG_WIDE_STOP_TP_WIDE");
+    expect(REALTIME_SHORT_ALLOWED_VARIANT_IDS).toContain("CG_MFE_GIVEBACK");
+    expect(REALTIME_SHORT_ALLOWED_VARIANT_IDS).toContain("CG_TIGHT_FAST_05");
+    expect(REALTIME_SHORT_ALLOWED_VARIANT_IDS).not.toContain("CG_MAKER_LIMIT_SIM");
+  });
+
+  it("[STABLE-ONLY] refuses a previously allowed lane as soon as status is downgraded", () => {
+    const store = freshStore();
+    const res = runRealtimeShortMirror(
+      inputs([shortCand("BTCUSDT")], {
+        stableShortLaneActive: false,
+        stableShortLanes: [
+          { variantId: "CG_WIDE_FAST_SHORT", status: "WATCHABLE", freshValid: 999, netAvgR: 9, pf: 9 },
+          { variantId: "CG_MFE_GIVEBACK", status: "HEADLINE_ACTIVE", freshValid: 999, netAvgR: 9, pf: 9 },
+        ],
+      }),
+      store,
+    );
+    expect(res.emitted).toBe(0);
+    expect(store.all).toHaveLength(0);
+    expect(res.reasons).toContain("stable_lane_inactive");
+  });
+
+  it("[LONG] can emit a stable long lane when the controller allows longs", () => {
+    const store = freshStore();
+    const res = runRealtimeShortMirror(
+      inputs(
+        [{ symbol: "ETHUSDT", direction: "LONG", currentPrice: 100, stopLoss: 97, takeProfitLevels: [110] }],
+        {
+          controllerMode: "LONG_ONLY",
+          stableShortLaneActive: false,
+          stableShortLanes: [
+            { variantId: "CG_WIDE_FAST_LONG", status: "STABLE_CANDIDATE", freshValid: 200, netAvgR: 0.4, pf: 2 },
+            { variantId: "CG_WIDE_FAST_SHORT", status: "STABLE_CANDIDATE", freshValid: 200, netAvgR: 9, pf: 9 },
+          ],
+        },
+      ),
+      store,
+    );
+    expect(res.emitted).toBe(1);
+    const o = store.all[0]!;
+    expect(o.direction).toBe("LONG");
+    expect(o.selectedLaneId).toBe(realtimeShortSelectedLaneId("CG_WIDE_FAST_LONG"));
+    expect(o.stopLoss).toBeCloseTo(97, 6);
+    expect(o.takeProfitLevels[0]).toBeCloseTo(101.5, 6);
   });
 
   it("[GEOMETRY-COHERENT] derives stop + 0.5R TP from the live entry, ignoring the scanner's tp1", () => {
@@ -115,7 +200,7 @@ describe("realtime-short-mirror — fresh short live-mirror source (mode 2)", ()
     const res = runRealtimeShortMirror(inputs([shortCand("BTCUSDT")], { stableShortLaneActive: false }), store);
     expect(res.emitted).toBe(0);
     expect(store.all).toHaveLength(0);
-    expect(res.reasons).toContain("stable_short_lane_inactive");
+    expect(res.reasons).toContain("stable_lane_inactive");
   });
 
   it("[CONTROLLER-GATE] emits only when the controller allows shorts", () => {
@@ -131,7 +216,7 @@ describe("realtime-short-mirror — fresh short live-mirror source (mode 2)", ()
     }
   });
 
-  it("[GEOMETRY] drops shorts without a valid stop above the live price", () => {
+  it("[GEOMETRY] drops candidates without valid executable geometry", () => {
     const store = freshStore();
     const res = runRealtimeShortMirror(
       inputs([
@@ -143,9 +228,9 @@ describe("realtime-short-mirror — fresh short live-mirror source (mode 2)", ()
     );
     expect(res.emitted).toBe(0);
     expect(store.all).toHaveLength(0);
-    expect(res.reasons.some((r) => r.startsWith("no_short_stop:PASTSTOP"))).toBe(true);
+    expect(res.reasons.some((r) => r.startsWith("CG_WIDE_FAST_SHORT:geometry_failed:PASTSTOP"))).toBe(true);
     expect(res.reasons.some((r) => r.startsWith("bad_geometry:NOPRICE"))).toBe(true);
-    expect(res.reasons.some((r) => r.startsWith("no_short_stop:NOSTOP"))).toBe(true);
+    expect(res.reasons.some((r) => r.startsWith("no_stop:NOSTOP"))).toBe(true);
   });
 
   it("[DEDUPE] does not emit the same symbol twice within the same minute bucket", () => {

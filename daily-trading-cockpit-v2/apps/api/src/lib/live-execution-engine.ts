@@ -35,6 +35,11 @@ import {
   type FuturesSymbolFilters,
   type LiveBinanceEnv,
 } from "./binance-futures-private.js";
+import {
+  MFE_GIVEBACK_ARM_R,
+  MFE_GIVEBACK_FRAC,
+  type VariantExitRule,
+} from "./current-guard-variant-matrix.js";
 import type { PaperOrder } from "./paper-execution-router.js";
 
 // ─── config ──────────────────────────────────────────────────────────────────
@@ -225,6 +230,8 @@ export interface LiveIntent {
   beStopOrderId: number | null;
   realizedPnlUsd: number | null;
   feesUsd: number | null;
+  exitRule?: VariantExitRule;
+  maxFavorableR?: number | null;
   createdAt: string;
   updatedAt: string;
   closedAt: string | null;
@@ -629,6 +636,10 @@ export class LiveExecutionEngine {
       direction: "LONG" | "SHORT";
       quantity: number;
       entryPrice: number;
+      markPrice: number | null;
+      targetTpPrice: number | null;
+      targetTpGapPct: number | null;
+      liquidationPrice: number | null;
       unrealizedPnl: number;
       leverage: number;
       sourceOrderCount: number;
@@ -680,11 +691,24 @@ export class LiveExecutionEngine {
         row.unrealizedPnl += position.unRealizedProfit * share;
         laneMap.set(source.laneId, row);
       }
+      const direction = position.positionAmt > 0 ? "LONG" as const : "SHORT" as const;
+      const markPrice = position.markPrice > 0 ? position.markPrice : null;
+      const targetTpPrice = intent && intent.tp1Price > 0 ? intent.tp1Price : null;
+      const targetTpGapPct =
+        markPrice !== null && targetTpPrice !== null
+          ? direction === "LONG"
+            ? ((targetTpPrice - markPrice) / markPrice) * 100
+            : ((markPrice - targetTpPrice) / markPrice) * 100
+          : null;
       return {
         symbol: position.symbol,
-        direction: position.positionAmt > 0 ? "LONG" as const : "SHORT" as const,
+        direction,
         quantity: Math.abs(position.positionAmt),
         entryPrice: position.entryPrice,
+        markPrice,
+        targetTpPrice,
+        targetTpGapPct,
+        liquidationPrice: position.liquidationPrice > 0 ? position.liquidationPrice : null,
         unrealizedPnl: position.unRealizedProfit,
         leverage: position.leverage,
         sourceOrderCount: sources.length,
@@ -865,7 +889,8 @@ export class LiveExecutionEngine {
       if (intent.state !== "OPEN" && intent.state !== "TP1_FILLED_BE_SET") continue;
       try {
         const positions = await this.client.getPositions(intent.symbol);
-        const amt = positions.find((p) => p.symbol === intent.symbol)?.positionAmt ?? 0;
+        const pos = positions.find((p) => p.symbol === intent.symbol);
+        const amt = pos?.positionAmt ?? 0;
 
         // Position flat ⇒ closed (stop, breakeven stop, or full TP fill chain).
         if (Math.abs(amt) < 1e-12) {
@@ -874,8 +899,18 @@ export class LiveExecutionEngine {
           continue;
         }
 
+        if (pos && intent.state === "OPEN" && this.intentExitRule(intent) === "mfe_giveback") {
+          const mfe = await this.manageMfeGiveback(intent, pos, amt);
+          if (mfe.changed) dirty = true;
+          if (mfe.closed) continue;
+        }
+
         // TP1 filled ⇒ move stop to breakeven for the runner (cancel + replace).
-        if (intent.state === "OPEN" && intent.tp1OrderId !== null) {
+        if (
+          intent.state === "OPEN" &&
+          intent.tp1OrderId !== null &&
+          !this.isFullTpExitRule(this.intentExitRule(intent))
+        ) {
           const tp1 = await this.client.queryOrder(intent.symbol, intent.tp1OrderId);
           if (tp1.status === "FILLED") {
             if (intent.stopOrderId !== null) {
@@ -940,6 +975,58 @@ export class LiveExecutionEngine {
       }
     }
     if (dirty) this.store.save();
+  }
+
+  private async manageMfeGiveback(intent: LiveIntent, pos: FuturesPosition, amt: number): Promise<{ changed: boolean; closed: boolean }> {
+    const entry = intent.filledEntryPrice ?? intent.plannedEntryPrice;
+    const risk = Math.abs(entry - intent.stopLossPrice);
+    if (!(entry > 0) || !(risk > 0)) return { changed: false, closed: false };
+    const mark = pos.markPrice > 0 ? pos.markPrice : pos.entryPrice > 0 ? pos.entryPrice : entry;
+    const favorableR = intent.direction === "SHORT" ? (entry - mark) / risk : (mark - entry) / risk;
+    const previousPeak = intent.maxFavorableR ?? 0;
+    const peak = Math.max(previousPeak, favorableR);
+    const changed = peak !== previousPeak;
+    intent.maxFavorableR = peak;
+    if (peak < MFE_GIVEBACK_ARM_R) return { changed, closed: false };
+
+    const exitR = peak * (1 - MFE_GIVEBACK_FRAC);
+    if (favorableR > exitR) return { changed, closed: false };
+
+    try {
+      if (intent.stopOrderId !== null) await this.client.cancelAlgoOrder(intent.stopOrderId);
+      if (intent.tp1OrderId !== null) await this.client.cancelOrder(intent.symbol, intent.tp1OrderId);
+      if (intent.beStopOrderId !== null) await this.client.cancelAlgoOrder(intent.beStopOrderId);
+    } catch {
+      // The reduce-only market close below is the critical safety action; cleanup is best-effort.
+    }
+
+    const flat = await this.client.placeOrder({
+      symbol: intent.symbol,
+      side: amt > 0 ? "SELL" : "BUY",
+      type: "MARKET",
+      quantity: Math.abs(amt),
+      reduceOnly: true,
+      newClientOrderId: `dtc-${intent.paperOrderId.slice(-18)}-mfe`,
+    });
+    try {
+      await this.client.cancelAllOrders(intent.symbol);
+      await this.client.cancelAllAlgoOrders(intent.symbol);
+    } catch {
+      // best-effort residue cleanup after the position has already been closed.
+    }
+    const net = await this.realizedFromTrades(intent.symbol, intent.createdAt, [
+      intent.entryOrderId,
+      intent.tp1OrderId,
+      flat.orderId,
+    ]);
+    intent.realizedPnlUsd = net;
+    intent.feesUsd = null;
+    intent.state = "CLOSED";
+    intent.closedAt = this.nowIso();
+    intent.updatedAt = this.nowIso();
+    intent.closeReason = "MFE_GIVEBACK_EXIT";
+    this.applyRealizedToLedger(net);
+    return { changed: true, closed: true };
   }
 
   private async settleClosedIntent(intent: LiveIntent): Promise<void> {
@@ -1097,10 +1184,14 @@ export class LiveExecutionEngine {
       const oppositeIntent = openIntentsBySymbol.get(first.symbol);
       if (oppositeIntent && oppositeIntent.direction !== first.direction) continue;
       if (!oppositeIntent && slots <= 0) continue;
+      const lanePapers = oppositeIntent
+        ? papers.filter((paper) => this.paperCompatibleWithIntent(oppositeIntent, paper))
+        : papers.filter((paper) => this.paperGeometryKey(paper) === this.paperGeometryKey(first));
+      if (lanePapers.length === 0) continue;
 
       const filters = await this.getFilters(first.symbol);
       if (!filters) continue;
-      const planned = papers.flatMap((paper) => {
+      const planned = lanePapers.flatMap((paper) => {
         const tp1 = paper.takeProfitLevels?.[0];
         if (typeof tp1 !== "number" || !(tp1 > 0)) return [];
         const plan = computeLiveOrderPlan(
@@ -1166,7 +1257,7 @@ export class LiveExecutionEngine {
     // up and loses). All other lanes keep the scaleout_tp1_trail default (50% at TP1, trail the rest).
     // When tp1Qty == qty, a TP1 fill flattens the position and manageLifecycle settles it via the
     // "position flat ⇒ closed" path (the BE/trail branch is skipped because there is no runner).
-    const fullExitAtTp1 = planned[0]!.paper.variantExitRule === "tp1_full";
+    const fullExitAtTp1 = this.isFullTpExitRule(planned[0]!.paper.variantExitRule);
     return {
       ok: qty >= filters.minQty,
       reason: qty >= filters.minQty ? null : "aggregate quantity below exchange minimum",
@@ -1176,6 +1267,29 @@ export class LiveExecutionEngine {
       stopPrice: direction === "LONG" ? Math.max(...stops) : Math.min(...stops),
       tp1Price: direction === "LONG" ? Math.min(...targets) : Math.max(...targets),
     };
+  }
+
+  private paperExitRule(paper: PaperOrder): VariantExitRule {
+    return paper.variantExitRule ?? "scaleout_tp1_trail";
+  }
+
+  private intentExitRule(intent: LiveIntent): VariantExitRule {
+    return intent.exitRule ?? "scaleout_tp1_trail";
+  }
+
+  private isFullTpExitRule(exitRule: VariantExitRule | null | undefined): boolean {
+    return exitRule === "tp1_full" || exitRule === "mfe_giveback";
+  }
+
+  private paperGeometryKey(paper: PaperOrder): string {
+    return `${paper.selectedLaneId ?? "UNKNOWN"}|${this.paperExitRule(paper)}`;
+  }
+
+  private paperCompatibleWithIntent(intent: LiveIntent, paper: PaperOrder): boolean {
+    if (this.paperExitRule(paper) !== this.intentExitRule(intent)) return false;
+    const laneId = paper.selectedLaneId ?? "UNKNOWN";
+    const existingLaneIds = new Set(this.intentSources(intent).map((source) => source.laneId));
+    return existingLaneIds.size === 0 || existingLaneIds.has(laneId);
   }
 
   private repricedGeometry(
@@ -1226,6 +1340,8 @@ export class LiveExecutionEngine {
       beStopOrderId: null,
       realizedPnlUsd: null,
       feesUsd: null,
+      exitRule: this.paperExitRule(paper),
+      maxFavorableR: null,
       createdAt: now,
       updatedAt: now,
       closedAt: null,
@@ -1233,7 +1349,7 @@ export class LiveExecutionEngine {
       lastError: null,
       sourcePaperOrders: planned.map(({ paper: source, plan: sourcePlan }) => ({
         paperOrderId: source.paperOrderId,
-        laneId: source.selectedLaneId,
+        laneId: source.selectedLaneId ?? "UNKNOWN",
         qty: sourcePlan.qty,
       })),
     };
@@ -1376,7 +1492,9 @@ export class LiveExecutionEngine {
       const stopDistancePct = Math.min(oldStopDistancePct, newStopDistancePct);
       const targetDistancePct = Math.min(oldTargetDistancePct, newTargetDistancePct);
       intent.qty = totalQty;
-      intent.tp1Qty = roundDownToStep(totalQty / 2, filters.stepSize);
+      intent.tp1Qty = this.isFullTpExitRule(this.intentExitRule(intent))
+        ? totalQty
+        : roundDownToStep(totalQty / 2, filters.stepSize);
       intent.stopLossPrice = roundStopToSafeSide(
         intent.direction,
         intent.filledEntryPrice * (intent.direction === "LONG" ? 1 - stopDistancePct : 1 + stopDistancePct),
@@ -1389,7 +1507,7 @@ export class LiveExecutionEngine {
         ...this.intentSources(intent),
         ...planned.map(({ paper, plan }) => ({
           paperOrderId: paper.paperOrderId,
-          laneId: paper.selectedLaneId,
+          laneId: paper.selectedLaneId ?? "UNKNOWN",
           qty: plan.qty,
         })),
       ];

@@ -39,6 +39,14 @@ interface TpAssessment {
   reason: string;
 }
 
+interface LaneCohortStats {
+  n: number;
+  netAvgR: number | null;
+  pf: number | null;
+  wr: number | null;
+  payoffRatio: number | null;
+}
+
 interface NeuralLane {
   id: string;
   label: string;
@@ -53,6 +61,11 @@ interface NeuralLane {
   pf: number | null;
   wr: number | null;
   statsSource: 'VM_SIM' | 'PAPER_BOOK' | 'H6_RESEARCH' | 'REGIME_DIAGNOSTIC';
+  cohorts?: {
+    LONG: LaneCohortStats | null;
+    SHORT: LaneCohortStats | null;
+    MIXED: LaneCohortStats | null;
+  };
   payoffRatio: number | null;
   plus10bpsStillPositive: boolean | null;
   allThreeOosPositive: boolean | null;
@@ -190,6 +203,11 @@ function buildMixedDiagnosticRegimeLane(stats: DiagnosticDirectionStats): Neural
     pf: null,
     wr: stats.wr,
     statsSource: 'REGIME_DIAGNOSTIC',
+    cohorts: {
+      LONG: null,
+      SHORT: null,
+      MIXED: { n: stats.closed, netAvgR: stats.netAvgR, pf: null, wr: stats.wr, payoffRatio: null },
+    },
     payoffRatio: null,
     plus10bpsStillPositive: null,
     allThreeOosPositive: null,
@@ -526,6 +544,17 @@ function fmtNumber(value: number | null, digits = 2): string {
 function fmtR(value: number | null): string {
   if (value === null || !Number.isFinite(value)) return 'n/a';
   return `${value >= 0 ? '+' : ''}${value.toFixed(3)}R`;
+}
+
+function fmtCohort(cohort: LaneCohortStats | null | undefined): string {
+  if (!cohort || cohort.n <= 0) return 'n/a';
+  const wr = cohort.wr === null || !Number.isFinite(cohort.wr) ? '—' : `${Math.round(cohort.wr * 100)}%`;
+  return `${cohort.n} · ${fmtR(cohort.netAvgR)} · PF ${fmtNumber(cohort.pf)} · ${wr}`;
+}
+
+function cohortTone(cohort: LaneCohortStats | null | undefined): string {
+  if (!cohort || cohort.n <= 0 || cohort.netAvgR === null || !Number.isFinite(cohort.netAvgR)) return 'tone-measure';
+  return cohort.netAvgR >= 0 ? 'tone-healthy' : 'tone-critical';
 }
 
 function fmtMoney(value: number): string {
@@ -1458,6 +1487,15 @@ export default function NeuralMindmap() {
                 <strong>{selectedLiveLane ? 'Lane color follows mirrored exchange P&L.' : laneDiagnosis(selectedLane)}</strong>
                 <p>Paper evidence remains separate; execution equity, exposure, and current PnL come from Binance testnet.</p>
               </div>
+              <div className="neural-inspector-section">
+                <h2>Performance scorecard</h2>
+                <p className="neural-section-note">Cohorts come from the same lane evidence row: LONG/SHORT are trade direction, MIXED is choppy/range regime family.</p>
+                <dl>
+                  <div><dt>LONG cohort</dt><dd className={cohortTone(selectedLane.cohorts?.LONG)}>{fmtCohort(selectedLane.cohorts?.LONG)}</dd></div>
+                  <div><dt>SHORT cohort</dt><dd className={cohortTone(selectedLane.cohorts?.SHORT)}>{fmtCohort(selectedLane.cohorts?.SHORT)}</dd></div>
+                  <div><dt>MIXED regime</dt><dd className={cohortTone(selectedLane.cohorts?.MIXED)}>{fmtCohort(selectedLane.cohorts?.MIXED)}</dd></div>
+                </dl>
+              </div>
               {selectedLane.oosFreshValid !== null && (
                 <div className="neural-inspector-section">
                   <h2>OOS maturity (this lane)</h2>
@@ -1622,15 +1660,15 @@ export default function NeuralMindmap() {
         </div>
 
         <div className="neural-lane-strip">
-          <header><span>Lane performance field</span><strong>{displayLanes.length} lanes</strong></header>
+          <header><span>Lane performance scorecard</span><strong>{displayLanes.length} lanes</strong></header>
           <div className="neural-lane-table-wrap">
             <table>
-              <thead><tr><th>Lane</th><th>Evidence</th><th>TP Gap</th><th>Diag MTM</th><th>MFE</th><th>Binance PnL</th><th>Growth</th><th>Mirrored</th><th>n</th><th>Net Avg R</th><th>PF</th><th>WR</th></tr></thead>
+              <thead><tr><th>Lane</th><th>Evidence</th><th>Long</th><th>Short</th><th>Mixed regime</th><th>TP Gap</th><th>Diag MTM</th><th>MFE</th><th>Binance PnL</th><th>Growth</th><th>Mirrored</th><th>n</th><th>Net Avg R</th><th>PF</th><th>WR</th></tr></thead>
               <tbody>
                 {laneDirectionSections.map((section) => (
                   <Fragment key={`lane-section-${section.key}`}>
                     <tr className={`neural-direction-row direction-${section.key.toLowerCase()}`}>
-                      <td colSpan={12}>
+                      <td colSpan={15}>
                         <span>{section.label}</span>
                         <small>{section.lanes.length} lane{section.lanes.length === 1 ? '' : 's'} · {section.detail}</small>
                       </td>
@@ -1645,6 +1683,9 @@ export default function NeuralMindmap() {
                         <tr key={lane.id} className={`${lane.active ? 'is-active' : ''}${lane.health === 'QUARANTINE' ? ' is-quarantined' : ''}`} onClick={() => setSelectedId(lane.id)}>
                           <td><i className={`health-${healthOf(lane.id).toLowerCase()}`} />{compactLaneLabel(lane.label)}</td>
                           <td><span className={`neural-stage-pill ${evidencePillClass(lane)}`}>{lane.status}</span></td>
+                          <td className={cohortTone(lane.cohorts?.LONG)}>{fmtCohort(lane.cohorts?.LONG)}</td>
+                          <td className={cohortTone(lane.cohorts?.SHORT)}>{fmtCohort(lane.cohorts?.SHORT)}</td>
+                          <td className={cohortTone(lane.cohorts?.MIXED)}>{fmtCohort(lane.cohorts?.MIXED)}</td>
                           <td>{fmtGapPct(lane.openAvgDistanceToTpPct)}</td>
                           <td className="tone-measure">{fmtUsdt(lane.diagnosticUnrealizedPnl)}</td>
                           <td className="tone-measure">{fmtUsdt(lane.openMaxFavorablePnl)}</td>

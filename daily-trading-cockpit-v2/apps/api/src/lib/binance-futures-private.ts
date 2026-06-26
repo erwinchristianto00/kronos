@@ -104,6 +104,8 @@ export interface FuturesPosition {
   symbol: string;
   positionAmt: number; // signed: >0 long, <0 short
   entryPrice: number;
+  markPrice: number;
+  liquidationPrice: number;
   unRealizedProfit: number;
   leverage: number;
   marginType: string;
@@ -474,6 +476,8 @@ export class BinanceFuturesPrivateClient {
       symbol: String((p as { symbol?: unknown }).symbol ?? ""),
       positionAmt: toNum((p as { positionAmt?: unknown }).positionAmt),
       entryPrice: toNum((p as { entryPrice?: unknown }).entryPrice),
+      markPrice: toNum((p as { markPrice?: unknown }).markPrice),
+      liquidationPrice: toNum((p as { liquidationPrice?: unknown }).liquidationPrice),
       unRealizedProfit: toNum((p as { unRealizedProfit?: unknown }).unRealizedProfit),
       leverage: toNum((p as { leverage?: unknown }).leverage),
       marginType: String((p as { marginType?: unknown }).marginType ?? ""),

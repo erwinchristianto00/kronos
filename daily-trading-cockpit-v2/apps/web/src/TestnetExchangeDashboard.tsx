@@ -51,6 +51,10 @@ interface LiveAccount {
     direction: 'LONG' | 'SHORT';
     quantity: number;
     entryPrice: number;
+    markPrice: number | null;
+    targetTpPrice: number | null;
+    targetTpGapPct: number | null;
+    liquidationPrice: number | null;
     unrealizedPnl: number;
     leverage: number;
     sourceOrderCount: number;
@@ -73,6 +77,18 @@ function signed(value: number | null | undefined, suffix = 'USDT'): string {
 function plain(value: number | null | undefined, suffix = ''): string {
   if (value == null || !Number.isFinite(value)) return 'n/a';
   return `${value.toFixed(2)}${suffix}`;
+}
+
+function price(value: number | null | undefined): string {
+  if (value == null || !Number.isFinite(value) || value <= 0) return 'n/a';
+  if (value >= 1000) return value.toFixed(2);
+  if (value >= 1) return value.toFixed(4);
+  return value.toFixed(6);
+}
+
+function percent(value: number | null | undefined): string {
+  if (value == null || !Number.isFinite(value)) return 'n/a';
+  return `${value >= 0 ? '+' : ''}${value.toFixed(2)}%`;
 }
 
 function tone(value: number | null | undefined): string {
@@ -235,17 +251,21 @@ export default function TestnetExchangeDashboard() {
           <div className="testnet-table-wrap">
             <table>
               <thead>
-                <tr><th>Symbol</th><th>Side</th><th>Qty</th><th>Entry</th><th>Unrealized</th><th>Lev</th><th>Mirrored lane</th></tr>
+                <tr><th>Symbol</th><th>Side</th><th>Qty</th><th>Entry</th><th>Mark</th><th>TP target</th><th>TP gap</th><th>Liq / margin call</th><th>Unrealized</th><th>Lev</th><th>Mirrored lane</th></tr>
               </thead>
               <tbody>
                 {(account?.positions ?? []).length === 0 ? (
-                  <tr><td colSpan={7}>No open Binance testnet positions.</td></tr>
+                  <tr><td colSpan={11}>No open Binance testnet positions.</td></tr>
                 ) : account!.positions.map((position) => (
                   <tr key={position.symbol}>
                     <td>{position.symbol}</td>
                     <td className={position.direction === 'SHORT' ? 'tone-warning' : 'tone-healthy'}>{position.direction}</td>
                     <td>{position.quantity}</td>
-                    <td>{position.entryPrice}</td>
+                    <td>{price(position.entryPrice)}</td>
+                    <td>{price(position.markPrice)}</td>
+                    <td>{price(position.targetTpPrice)}</td>
+                    <td className={tone(position.targetTpGapPct)}>{percent(position.targetTpGapPct)}</td>
+                    <td className="tone-critical">{price(position.liquidationPrice)}</td>
                     <td className={tone(position.unrealizedPnl)}>{signed(position.unrealizedPnl)}</td>
                     <td>{position.leverage}x</td>
                     <td>{position.laneIds.length > 0 ? position.laneIds.map(compactLane).join(', ') : 'unattributed'}</td>

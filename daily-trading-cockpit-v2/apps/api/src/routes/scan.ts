@@ -34,8 +34,8 @@ import {
 } from "../lib/current-guard-variant-matrix.js";
 import {
   isRealtimeShortMirrorEnabled,
+  isRealtimeShortAllowedVariantId,
   runRealtimeShortMirror,
-  REALTIME_SHORT_LANE_VARIANT_ID,
 } from "../lib/realtime-short-mirror.js";
 import {
   RegimeControllerAlignedShadowStore,
@@ -376,9 +376,26 @@ export async function registerScanRoute(
       timing.startStage("realtimeShortMirror");
       try {
         const vmReport = buildCurrentGuardVariantMatrixReport(getCurrentGuardVariantMatrixStore());
-        const stableShortLaneActive =
-          vmReport.rows.find((r) => r.variantId === REALTIME_SHORT_LANE_VARIANT_ID)?.status ===
-          "STABLE_CANDIDATE";
+        const stableShortLanes = vmReport.rows
+          .filter((r) => isRealtimeShortAllowedVariantId(r.variantId))
+          .map((r) => ({
+            variantId: r.variantId,
+            status: r.status,
+            freshValid: r.freshValid,
+            netAvgR: r.netAvgR,
+            pf: r.pf,
+            wr: r.wr,
+            payoffRatio: r.payoffRatio,
+            avgCostR: r.avgCostR,
+            costDragR: r.costDragR,
+            approxMaxDrawdownR: r.approxMaxDrawdownR,
+            topSymbolPnlShare: r.topSymbolPnlShare,
+            plus10bpsStillPositive: r.plus10bpsStillPositive,
+            byRegime: r.byRegime,
+            byDirection: r.byDirection,
+            byRegimeFamily: r.byRegimeFamily,
+            bySymbol: r.bySymbol,
+          }));
         const controllerMode = buildRegimeDirectionControllerReport({
           currentRegime: result.marketRegime,
         }).controllerMode;
@@ -398,7 +415,7 @@ export async function registerScanRoute(
           })),
           regime: result.marketRegime,
           controllerMode,
-          stableShortLaneActive,
+          stableShortLanes,
           now: new Date().toISOString(),
         });
       } catch {

@@ -1062,7 +1062,7 @@ i.health-diagnostic {
 
 .neural-lane-table-wrap table {
   width: 100%;
-  min-width: 960px;
+  min-width: 1320px;
   border-collapse: collapse;
   font-size: 10px;
 }
@@ -1578,7 +1578,7 @@ i.health-diagnostic {
 
 .testnet-table-wrap table {
   width: 100%;
-  min-width: 720px;
+  min-width: 960px;
   border-collapse: collapse;
   font-size: 11px;
 }

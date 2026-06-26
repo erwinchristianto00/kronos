@@ -5,6 +5,7 @@ import {
   VARIANT_MATRIX_DEFINITIONS,
   WATCHABLE_MIN_FRESH,
   type CurrentGuardVariantMatrixReport,
+  type VariantBreakdownRow,
 } from "./current-guard-variant-matrix.js";
 import type { FadeLongReport } from "./fade-long-edge.js";
 import { H6_TREND_PAPER_LANE_ID, type H6TrendReport } from "./h6-trend-edge.js";
@@ -53,7 +54,15 @@ export interface NeuralMapNode {
   detail: string[];
 }
 
-export type NeuralLaneStatsSource = "VM_SIM" | "PAPER_BOOK" | "H6_RESEARCH";
+export type NeuralLaneStatsSource = "VM_SIM" | "PAPER_BOOK" | "H6_RESEARCH" | "REGIME_DIAGNOSTIC";
+
+export interface NeuralLaneCohortStats {
+  n: number;
+  netAvgR: number | null;
+  pf: number | null;
+  wr: number | null;
+  payoffRatio: number | null;
+}
 
 export interface NeuralMapLane {
   id: string;
@@ -77,6 +86,12 @@ export interface NeuralMapLane {
    * a sim/research netAvgR rendered next to paper PnL dollars reads as one dataset (audit finding).
    */
   statsSource: NeuralLaneStatsSource;
+  cohorts: {
+    LONG: NeuralLaneCohortStats | null;
+    SHORT: NeuralLaneCohortStats | null;
+    /** Performance while the market regime family is Mixed/Choppy/Range/Rotation. */
+    MIXED: NeuralLaneCohortStats | null;
+  };
   payoffRatio: number | null;
   plus10bpsStillPositive: boolean | null;
   allThreeOosPositive: boolean | null;
@@ -213,6 +228,9 @@ export interface NeuralMapTelemetry {
     diagnosticByDirection: {
       LONG: DiagnosticDirectionStats;
       SHORT: DiagnosticDirectionStats;
+    };
+    diagnosticByRegime: {
+      MIXED: DiagnosticDirectionStats;
     };
   };
   mixed: {
@@ -353,6 +371,9 @@ export interface PaperUnrealizedSnapshot {
     LONG: { pnl: number; r: number; open: number };
     SHORT: { pnl: number; r: number; open: number };
   };
+  diagnosticByRegime: {
+    MIXED: { pnl: number; r: number; open: number };
+  };
   headlinePnl: number;
   headlineR: number;
   maxFavorablePnl: number;
@@ -369,6 +390,22 @@ export interface PaperUnrealizedSnapshot {
 
 function finite(value: number | null | undefined): value is number {
   return typeof value === "number" && Number.isFinite(value);
+}
+
+function isMixedLikeRegime(regime: string | null | undefined): boolean {
+  const label = (regime ?? "").toLowerCase();
+  return label.includes("mixed") || label.includes("chop") || label.includes("range") || label.includes("rotation") || label.includes("sideways");
+}
+
+function cohortFromBreakdown(row: VariantBreakdownRow | undefined): NeuralLaneCohortStats | null {
+  if (!row || row.n <= 0) return null;
+  return {
+    n: row.n,
+    netAvgR: row.netAvgR ?? null,
+    pf: row.pf ?? null,
+    wr: row.wr ?? null,
+    payoffRatio: row.payoffRatio ?? null,
+  };
 }
 
 function markFetchTimeoutMs(): number {
@@ -487,6 +524,9 @@ export async function buildPaperUnrealizedSnapshot(
     LONG: { pnl: 0, r: 0, open: 0 },
     SHORT: { pnl: 0, r: 0, open: 0 },
   };
+  const diagByRegime = {
+    MIXED: { pnl: 0, r: 0, open: 0 },
+  };
   let headlinePnl = 0;
   let headlineR = 0;
   let maxFavorablePnl = 0;
@@ -593,6 +633,11 @@ export async function buildPaperUnrealizedSnapshot(
       diagByDir[dir].pnl += pnl;
       diagByDir[dir].r += r;
       diagByDir[dir].open += 1;
+      if (isMixedLikeRegime(order.regime)) {
+        diagByRegime.MIXED.pnl += pnl;
+        diagByRegime.MIXED.r += r;
+        diagByRegime.MIXED.open += 1;
+      }
     } else {
       headlinePnl += pnl;
       headlineR += r;
@@ -644,6 +689,7 @@ export async function buildPaperUnrealizedSnapshot(
     diagnosticPnl,
     diagnosticR,
     diagnosticByDirection: diagByDir,
+    diagnosticByRegime: diagByRegime,
     headlinePnl,
     headlineR,
     maxFavorablePnl,
@@ -701,6 +747,7 @@ function laneLabel(id: string): string {
   if (id === "CG_LONG_VARIANT_MATRIX:CG_WIDE_STOP_TP_WIDE") return "CG_WIDE LONG";
   if (id === "CG_LONG_VARIANT_MATRIX:CG_WIDE_LONG_RUNNER") return "CG_WIDE RUNNER 3R";
   if (id === "CG_VARIANT_MATRIX:CG_WIDE_FAST_SHORT") return "CG_WIDE FAST 0.5R";
+  if (id === "CG_LONG_VARIANT_MATRIX:CG_WIDE_FAST_SHORT") return "CG_WIDE FAST 0.5R LONG MIRROR";
   if (id === "CG_LONG_VARIANT_MATRIX:CG_WIDE_FAST_LONG") return "CG_WIDE FAST LONG 0.5R";
   if (id === "CG_VARIANT_MATRIX:CG_TIGHT_FAST_05") return "TIGHT FAST 0.5R SHORT";
   if (id === "CG_LONG_VARIANT_MATRIX:CG_TIGHT_FAST_05") return "TIGHT FAST 0.5R LONG";
@@ -714,6 +761,8 @@ function laneLabel(id: string): string {
   if (id === "CG_LONG_VARIANT_MATRIX:CG_SCALEOUT_TP1_TRAIL") return "CG_SCALEOUT LONG";
   if (id === "CG_LONG_VARIANT_MATRIX:CG_NO_FIB500_ENTRYSET") return "CG_NO_FIB500 LONG";
   if (id === "CG_LONG_VARIANT_MATRIX:CG_MAKER_LIMIT_SIM") return "CG_MAKER LONG";
+  if (id === "CG_LONG_VARIANT_MATRIX:CG_BASELINE_FAST_05") return "BASELINE FAST 0.5R LONG";
+  if (id === "CG_LONG_VARIANT_MATRIX:CG_MAKER_FAST_05") return "MAKER FAST 0.5R LONG";
   if (id === "CG_VARIANT_MATRIX:CG_TRAIL_AFTER_TP1") return "CG_TRAIL SHORT";
   if (id === "CG_VARIANT_MATRIX:CG_BASELINE_CURRENT") return "CG_BASELINE SHORT";
   if (id === "CG_LONG_VARIANT_MATRIX:CG_MFE_GIVEBACK") return "MFE-GIVEBACK LONG";
@@ -782,6 +831,11 @@ function buildH6TrendLane(report: H6TrendReport, startingEquity: number): Neural
     pf: report.pf,
     wr: report.wr,
     statsSource: "H6_RESEARCH",
+    cohorts: {
+      LONG: { n: closed, netAvgR, pf: report.pf, wr: report.wr, payoffRatio: null },
+      SHORT: null,
+      MIXED: null,
+    },
     payoffRatio: null,
     plus10bpsStillPositive: null,
     allThreeOosPositive: null,
@@ -1058,7 +1112,23 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
       wr: closed.length ? wins / closed.length : null,
     };
   };
+  const diagnosticMixedRegimeStats = (): DiagnosticDirectionStats => {
+    const diag = input.orders.filter((o) => isDiagnosticPaperOrder(o) && isMixedLikeRegime(o.regime));
+    const closed = diag.filter((o) => CLOSED.has(o.paperStatus));
+    const open = diag.filter((o) => OPEN.has(o.paperStatus));
+    const nets = closed.map((o) => o.netR).filter(finite);
+    const wins = closed.filter((o) => o.paperStatus === "PAPER_CLOSED_WIN").length;
+    return {
+      closed: closed.length,
+      open: open.length,
+      realizedPnl: closed.reduce((s, o) => s + (o.netPnlAmount ?? 0), 0),
+      unrealizedPnl: input.paperUnrealized?.diagnosticByRegime?.MIXED?.pnl ?? null,
+      netAvgR: nets.length ? nets.reduce((s, v) => s + v, 0) / nets.length : null,
+      wr: closed.length ? wins / closed.length : null,
+    };
+  };
   const diagnosticByDirection = { LONG: diagnosticDirStats("LONG"), SHORT: diagnosticDirStats("SHORT") };
+  const diagnosticByRegime = { MIXED: diagnosticMixedRegimeStats() };
   const mixedActive = input.mixed.regimeIsMixed;
   const activeAdmission = mixedActive ? input.mixed.admissionResult : "INACTIVE";
   const activeOccupancyMode = mixedActive ? input.mixed.occupancyMode : "INACTIVE";
@@ -1130,6 +1200,16 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
       : (evidenceRow?.statusReason ?? (economics.open > 0 ? `${economics.open} paper order(s) open` : "paper evidence lane"));
     const sourceTag = statsSource === "VM_SIM" ? "[stats: VM-sim]" : "[stats: paper realized]";
     const diagTag = pnlIsDiagnosticOnly ? " [PnL: diagnostic-only — excluded from headline]" : "";
+    const directionRows = row?.byDirection ?? [];
+    const regimeFamilyRows = row?.byRegimeFamily ?? [];
+    const paperOnlyLongCohort =
+      !row && id.startsWith("CG_LONG_VARIANT_MATRIX:") && (economics.open > 0 || economics.closed > 0)
+        ? { n: economics.closed, netAvgR: economics.netAvgR, pf: economics.pf, wr: economics.wr, payoffRatio: null }
+        : null;
+    const paperOnlyShortCohort =
+      !row && !id.startsWith("CG_LONG_VARIANT_MATRIX:") && (economics.open > 0 || economics.closed > 0)
+        ? { n: economics.closed, netAvgR: economics.netAvgR, pf: economics.pf, wr: economics.wr, payoffRatio: null }
+        : null;
     return {
       id,
       label: laneLabel(id),
@@ -1151,6 +1231,11 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
       pf: evidenceRow?.pf ?? economics.pf,
       wr: evidenceRow?.wr ?? economics.wr,
       statsSource,
+      cohorts: {
+        LONG: cohortFromBreakdown(directionRows.find((candidate) => candidate.key === "LONG")) ?? paperOnlyLongCohort,
+        SHORT: cohortFromBreakdown(directionRows.find((candidate) => candidate.key === "SHORT")) ?? paperOnlyShortCohort,
+        MIXED: cohortFromBreakdown(regimeFamilyRows.find((candidate) => candidate.key === "MIXED")),
+      },
       payoffRatio: row?.payoffRatio ?? null,
       plus10bpsStillPositive: row?.plus10bpsStillPositive ?? null,
       allThreeOosPositive: row?.allThreeOosPositive ?? null,
@@ -1534,6 +1619,7 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
       headlinePF: input.paper.headlinePF,
       headlineWR: input.paper.headlineWR,
       diagnosticByDirection,
+      diagnosticByRegime,
     },
     mixed: {
       activeLane: input.mixed.activeMixedLane,

@@ -25,6 +25,7 @@ import {
 import { getPaperExecutionRouterStore } from "./lib/paper-execution-router.js";
 import {
   getRealtimeShortMirrorStore,
+  isRealtimeShortAllowedLaneId,
   isRealtimeShortMirrorEnabled,
 } from "./lib/realtime-short-mirror.js";
 import {
@@ -138,6 +139,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         ? getRealtimeShortMirrorStore()
         : getPaperExecutionRouterStore(),
       isPaperOrderLiveEligible: (order) => {
+        if (liveConfig.env === "testnet" && !isRealtimeShortAllowedLaneId(order.selectedLaneId)) return false;
         const report = buildCurrentGuardVariantMatrixReport(getCurrentGuardVariantMatrixStore());
         const laneVariantId = order.selectedLaneId.split(":").pop() ?? order.selectedLaneId;
         const row = report.rows.find((candidate) => candidate.variantId === laneVariantId);

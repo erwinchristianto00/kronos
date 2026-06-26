@@ -462,6 +462,13 @@ const VARIANT_MATRIX_DIAGNOSTIC_IDS: readonly VariantMatrixVariantId[] = [
   // shortOnly) so the proven geometry accrues REAL paper economics — the measurement-first step
   // before it can be promoted to the headline short lane (gated by liveBlocked).
   "CG_WIDE_FAST_SHORT",
+  // 2026-06-26: LONG_ONLY paper mirrors of the short stable-candidate geometries. These are
+  // diagnostic-only long probes: they can open/close paper orders in bullish LONG_ONLY regimes,
+  // but do not become live/headline just because the short side is stable.
+  "CG_TIGHT_FAST_05",
+  "CG_BASELINE_FAST_05",
+  "CG_MAKER_FAST_05",
+  "CG_MFE_GIVEBACK",
 ];
 /** Per-variant cap on DIAGNOSTIC_ONLY variant-matrix orders sampled per scan (keeps the book bounded). */
 const DEFAULT_VARIANT_DIAGNOSTIC_MAX_PER_SCAN = 3;

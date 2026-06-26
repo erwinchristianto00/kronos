@@ -55,6 +55,7 @@ class FakeLiveClient {
   canceled: Array<{ symbol: string; orderId: number }> = [];
   cancelAllSymbols: string[] = [];
   positionsBySymbol = new Map<string, number>();
+  markPriceBySymbol = new Map<string, number>();
   orderStatusById = new Map<number, string>();
   trades: FuturesUserTrade[] = [];
   hedge = false;
@@ -86,7 +87,16 @@ class FakeLiveClient {
     const out = [];
     for (const [sym, amt] of this.positionsBySymbol) {
       if (symbol && sym !== symbol) continue;
-      out.push({ symbol: sym, positionAmt: amt, entryPrice: 2000, unRealizedProfit: 0, leverage: 2, marginType: "ISOLATED" });
+      out.push({
+        symbol: sym,
+        positionAmt: amt,
+        entryPrice: 2000,
+        markPrice: this.markPriceBySymbol.get(sym) ?? 2000,
+        liquidationPrice: 1500,
+        unRealizedProfit: 0,
+        leverage: 2,
+        marginType: "ISOLATED",
+      });
     }
     return out;
   }
@@ -422,6 +432,40 @@ describe("LiveExecutionEngine", () => {
     expect(client.placed.length).toBe(placedBefore); // NO breakeven STOP_MARKET — there is no runner
   });
 
+  it("mfe_giveback lane tracks favorable R and closes on giveback instead of creating a runner", async () => {
+    const order = paperOrder({
+      selectedLaneId: "CG_VARIANT_MATRIX:CG_MFE_GIVEBACK",
+      variantExitRule: "mfe_giveback",
+      takeProfitLevels: [1700], // far 3R target with a 5% stop
+    } as Partial<PaperOrder>);
+    const { engine, client, store } = makeEngine({ paper: makePaperStore([order]) });
+    expect((await engine.arm()).ok).toBe(true);
+
+    await engine.tick();
+    expect(client.placed.map((p) => p.type)).toEqual(["MARKET", "STOP_MARKET", "LIMIT"]);
+    const tp = client.placed.at(-1)!;
+    expect(tp.quantity).toBeCloseTo(0.05, 9); // full far-TP, no 50% runner split
+    expect(tp.price).toBeCloseTo(1700, 9);
+
+    client.markPriceBySymbol.set("ETHUSDT", 1900); // +1R favorable on a short
+    await engine.tick();
+    expect(store.getState().intents[0]!.state).toBe("OPEN");
+    expect(store.getState().intents[0]!.maxFavorableR).toBeCloseTo(1, 6);
+
+    client.markPriceBySymbol.set("ETHUSDT", 1950); // retraces to +0.5R; default giveback threshold
+    client.flattenRealizedPnl = 2.2;
+    await engine.tick();
+
+    const closed = store.getState().intents[0]!;
+    expect(closed.state).toBe("CLOSED");
+    expect(closed.closeReason).toBe("MFE_GIVEBACK_EXIT");
+    expect(closed.realizedPnlUsd).toBeCloseTo(2.2, 6);
+    const flat = client.placed.at(-1)!;
+    expect(flat.type).toBe("MARKET");
+    expect(flat.reduceOnly).toBe(true);
+    expect(store.getState().dailyLedger.wins).toBe(1);
+  });
+
   it("full lifecycle: mirror → entry+stop+tp1 → TP1 fill ⇒ breakeven replace → close ⇒ settled", async () => {
     const order = paperOrder();
     const { engine, client, store } = makeEngine({ paper: makePaperStore([order]) });
@@ -561,7 +605,7 @@ describe("LiveExecutionEngine", () => {
     expect(client.placed.filter((p) => p.type === "MARKET" && !p.reduceOnly).length).toBe(1);
   });
 
-  it("testnet mirror-all backfills diagnostic lanes and nets same-symbol orders", async () => {
+  it("testnet mirror-all keeps one symbol on one lane geometry instead of netting different lanes", async () => {
     const orders = [
       paperOrder({
         paperOrderId: "paper-lane-a",
@@ -585,16 +629,18 @@ describe("LiveExecutionEngine", () => {
 
     const entries = client.placed.filter((order) => order.type === "MARKET" && !order.reduceOnly);
     expect(entries).toHaveLength(1);
-    expect(entries[0]!.quantity).toBeCloseTo(0.1, 9);
+    expect(entries[0]!.quantity).toBeCloseTo(0.05, 9);
     expect(store.getState().intents[0]!.sourcePaperOrders).toEqual([
       { paperOrderId: "paper-lane-a", laneId: "LANE_A", qty: 0.05 },
-      { paperOrderId: "paper-lane-b", laneId: "LANE_B", qty: 0.05 },
     ]);
 
     const account = await engine.getAccountSnapshot();
     expect(account.openPositionCount).toBe(1);
     expect(account.accountEquity).toBe(5000);
-    expect(account.lanes.map((lane) => lane.laneId)).toEqual(["LANE_A", "LANE_B"]);
+    expect(account.positions[0]!.targetTpPrice).toBeCloseTo(1900, 9);
+    expect(account.positions[0]!.targetTpGapPct).toBeCloseTo(5, 9);
+    expect(account.positions[0]!.liquidationPrice).toBe(1500);
+    expect(account.lanes.map((lane) => lane.laneId)).toEqual(["LANE_A"]);
   });
 
   it("kill-switch on daily loss: cancels, flattens, disarms, latches", async () => {
