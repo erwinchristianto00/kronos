@@ -81,7 +81,13 @@ export type VariantMatrixVariantId =
   // 0.5R (stopFloorBps:1 is a non-binding sentinel) — isolating TP placement as the single
   // variable, to test whether banking before the bounce flips them all-OOS-positive.
   | "CG_BASELINE_FAST_05"
-  | "CG_MAKER_FAST_05";
+  | "CG_MAKER_FAST_05"
+  // Experimental high-risk paper lanes (operator-requested): clone proven fast/short
+  // geometries with smaller TP and 10x paper risk sizing. Paper-only diagnostics.
+  | "CG_EXP_LONG_WIDE_FAST_10X"
+  | "CG_EXP_LONG_TIGHT_FAST_10X"
+  | "CG_EXP_SHORT_MFE_GIVEBACK_10X"
+  | "CG_EXP_SHORT_WIDE_FAST_10X";
 
 export const BULL_TREND_VARIANT_ID = "BL_TREND_R15_STOP200_FULL" as const;
 export const BULL_SCALEOUT_VARIANT_ID = "BL_TREND_SCALEOUT_STOP200" as const;
@@ -220,6 +226,12 @@ export interface VariantMatrixVariantDefinition {
    * cut at 72h.
    */
   maxHoldHours?: number;
+  /** Dashboard/provenance label only; leverage changes margin, not price path. */
+  experimentalLeverage?: number;
+  /** Paper-only risk multiplier used by the paper book to model larger size. */
+  paperRiskMultiplier?: number;
+  /** Explicit marker for high-risk diagnostic lanes. */
+  experimentalOnly?: boolean;
 }
 
 export const VARIANT_MATRIX_DEFINITIONS: readonly VariantMatrixVariantDefinition[] = [
@@ -483,6 +495,74 @@ export const VARIANT_MATRIX_DEFINITIONS: readonly VariantMatrixVariantDefinition
       "Sentil of CG_MAKER_LIMIT_SIM: post-only maker fill (no-fill risk) + maker cost, raw entry+stop " +
       "(stopFloorBps:1 never binds), TP moved to a fast 0.5R full exit. Tests the cheapest-cost + " +
       "fastest-bank combo — the most promising path to a robustly positive short edge.",
+  },
+  {
+    id: "CG_EXP_LONG_WIDE_FAST_10X",
+    label: "EXP LONG 10x: wide stop, ultra-fast 0.25R TP",
+    exitRule: "tp1_full",
+    fillMode: "taker",
+    costModel: "taker",
+    stopFloorBps: 300,
+    tpRewardMultiple: 0.25,
+    maxHoldHours: 24,
+    longOnly: true,
+    experimentalLeverage: 10,
+    paperRiskMultiplier: 10,
+    experimentalOnly: true,
+    description:
+      "High-risk paper-only duplicate of CG_WIDE_FAST_LONG: same wide >=300bps stop, but TP is reduced " +
+      "to 0.25R and paper risk is multiplied 10x to model aggressive short-duration sizing. Never live by default.",
+  },
+  {
+    id: "CG_EXP_LONG_TIGHT_FAST_10X",
+    label: "EXP LONG 10x: tight stop, ultra-fast 0.25R TP",
+    exitRule: "tp1_full",
+    fillMode: "taker",
+    costModel: "taker",
+    stopFloorBps: 175,
+    tpRewardMultiple: 0.25,
+    maxHoldHours: 24,
+    longOnly: true,
+    experimentalLeverage: 10,
+    paperRiskMultiplier: 10,
+    experimentalOnly: true,
+    description:
+      "High-risk paper-only duplicate of CG_TIGHT_FAST_05 for LONG: native/tight stop, TP reduced to " +
+      "0.25R, 10x paper risk sizing, 24h max hold. Tests fast scalp capture without touching live execution.",
+  },
+  {
+    id: "CG_EXP_SHORT_MFE_GIVEBACK_10X",
+    label: "EXP SHORT 10x: MFE giveback, 1R cap",
+    exitRule: "mfe_giveback",
+    fillMode: "taker",
+    costModel: "taker",
+    stopFloorBps: 300,
+    tpRewardMultiple: 1,
+    maxHoldHours: 24,
+    shortOnly: true,
+    experimentalLeverage: 10,
+    paperRiskMultiplier: 10,
+    experimentalOnly: true,
+    description:
+      "High-risk paper-only duplicate of MFE-GIVEBACK SHORT: wide stop, TP reduced from 3R to 1R, " +
+      "global MFE-giveback exit still banks retraces, 10x paper risk sizing, 24h max hold.",
+  },
+  {
+    id: "CG_EXP_SHORT_WIDE_FAST_10X",
+    label: "EXP SHORT 10x: wide stop, ultra-fast 0.25R TP",
+    exitRule: "tp1_full",
+    fillMode: "taker",
+    costModel: "taker",
+    stopFloorBps: 300,
+    tpRewardMultiple: 0.25,
+    maxHoldHours: 24,
+    shortOnly: true,
+    experimentalLeverage: 10,
+    paperRiskMultiplier: 10,
+    experimentalOnly: true,
+    description:
+      "High-risk paper-only duplicate of CG_WIDE_FAST_SHORT: same wide stop, TP reduced to 0.25R, " +
+      "10x paper risk sizing, 24h max hold for short-duration scalp measurement.",
   },
 ];
 

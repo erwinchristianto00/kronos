@@ -337,6 +337,8 @@ export interface PaperOrder {
   occupancyMode?: string;
   stalePassHealth?: string;
   riskMultiplierAfterOccupancy?: number;
+  experimentalLeverage?: number;
+  paperRiskMultiplier?: number;
   budgetUsed?: unknown;
   budgetReason?: string;
   reportOnly: true;
@@ -775,15 +777,19 @@ export function computePaperPositionSize(
   paperEquity: number,
   entryPrice: number,
   stopLoss: number,
-  opts: { maxNotionalCap?: number } = {},
+  opts: { maxNotionalCap?: number; riskPct?: number } = {},
 ): PaperPositionSizeResult {
   const cap = opts.maxNotionalCap ?? DEFAULT_PAPER_MAX_NOTIONAL_CAP;
+  const riskPct =
+    typeof opts.riskPct === "number" && Number.isFinite(opts.riskPct) && opts.riskPct > 0
+      ? opts.riskPct
+      : RISK_PCT;
   const stopDistancePct =
     entryPrice > 0 && stopLoss > 0 ? Math.abs(entryPrice - stopLoss) / entryPrice : 0;
   if (!(stopDistancePct > 0) || !Number.isFinite(stopDistancePct)) {
     return {
       ok: false,
-      riskPct: RISK_PCT,
+      riskPct,
       paperEquity,
       plannedRiskAmount: 0,
       plannedPositionNotional: 0,
@@ -792,12 +798,12 @@ export function computePaperPositionSize(
       diagnosticLabel: null,
     };
   }
-  const plannedRiskAmount = paperEquity * (RISK_PCT / 100);
+  const plannedRiskAmount = paperEquity * (riskPct / 100);
   const plannedPositionNotional = plannedRiskAmount / stopDistancePct;
   if (plannedPositionNotional > cap) {
     return {
       ok: false,
-      riskPct: RISK_PCT,
+      riskPct,
       paperEquity,
       plannedRiskAmount,
       plannedPositionNotional,
@@ -808,7 +814,7 @@ export function computePaperPositionSize(
   }
   return {
     ok: true,
-    riskPct: RISK_PCT,
+    riskPct,
     paperEquity,
     plannedRiskAmount,
     plannedPositionNotional,
@@ -1101,6 +1107,8 @@ export interface PaperOpportunity {
   plannedStopDistanceBps: number;
   oosUnconfirmed: boolean;
   paperRiskLabel: PaperRiskLabel;
+  experimentalLeverage?: number;
+  paperRiskMultiplier?: number;
   /**
    * Accounting mode decided by the allocator. HEADLINE only when the active lane
    * is NOT quarantined and the candidate passes candidate-level quality gates;
@@ -1156,6 +1164,23 @@ export function allocatorDedupeKey(o: {
   return `alloc:${o.scanBatchId}:${o.sourceCandidateId}:${o.symbol}:${o.direction}:${o.laneId}`;
 }
 
+function opportunityRiskMultiplier(o: PaperOpportunity): number {
+  const experimental =
+    typeof o.paperRiskMultiplier === "number" &&
+    Number.isFinite(o.paperRiskMultiplier) &&
+    o.paperRiskMultiplier > 0
+      ? o.paperRiskMultiplier
+      : 1;
+  const occupancy =
+    o.admissionResult === "ALLOW_REDUCED" &&
+    o.budgetActivationScope === "PAPER_ONLY" &&
+    typeof o.riskMultiplierAfterOccupancy === "number" &&
+    Number.isFinite(o.riskMultiplierAfterOccupancy)
+      ? Math.max(0, Math.min(1, o.riskMultiplierAfterOccupancy))
+      : 1;
+  return experimental * occupancy;
+}
+
 function _buildAllocatorOrder(
   o: PaperOpportunity,
   routerReport: AdaptiveLaneRouterReport,
@@ -1168,14 +1193,8 @@ function _buildAllocatorOrder(
     !gateReport.orderReconciliationReady ||
     !gateReport.exchangeHealthReady;
   const dedupeKey = allocatorDedupeKey(o);
-  const occupancyRiskMultiplier =
-    o.admissionResult === "ALLOW_REDUCED" &&
-    o.budgetActivationScope === "PAPER_ONLY" &&
-    typeof o.riskMultiplierAfterOccupancy === "number" &&
-    Number.isFinite(o.riskMultiplierAfterOccupancy)
-      ? Math.max(0, Math.min(1, o.riskMultiplierAfterOccupancy))
-      : 1;
-  const effectiveRiskPct = RISK_PCT * occupancyRiskMultiplier;
+  const riskMultiplier = opportunityRiskMultiplier(o);
+  const effectiveRiskPct = RISK_PCT * riskMultiplier;
   return _stampForwardGate({
     paperOrderId: `paper-${randomUUID()}`,
     sourceType: "SCAN_CANDIDATE_LANE_ALLOCATOR",
@@ -1225,6 +1244,8 @@ function _buildAllocatorOrder(
     occupancyMode: o.occupancyMode,
     stalePassHealth: o.stalePassHealth,
     riskMultiplierAfterOccupancy: o.riskMultiplierAfterOccupancy,
+    experimentalLeverage: o.experimentalLeverage,
+    paperRiskMultiplier: o.paperRiskMultiplier,
     budgetUsed: o.budgetUsed,
     budgetReason: o.budgetReason,
     reportOnly: true,
@@ -1353,7 +1374,10 @@ export function admitPaperOpportunities(
     }
 
     // Position size
-    const size = computePaperPositionSize(paperEquity, o.entryPrice, o.stopLoss, { maxNotionalCap });
+    const size = computePaperPositionSize(paperEquity, o.entryPrice, o.stopLoss, {
+      maxNotionalCap,
+      riskPct: RISK_PCT * opportunityRiskMultiplier(o),
+    });
     if (!size.ok) {
       const rej = _buildAllocatorOrder(o, routerReport, gateReport, paperEquity, now);
       rej.diagnosticLabel = size.diagnosticLabel ?? "MISSING_GEOMETRY";
@@ -1367,13 +1391,7 @@ export function admitPaperOpportunities(
     }
 
     const order = _buildAllocatorOrder(o, routerReport, gateReport, paperEquity, now);
-    const occupancyRiskMultiplier =
-      order.admissionResult === "ALLOW_REDUCED" &&
-      order.budgetActivationScope === "PAPER_ONLY" &&
-      typeof order.riskMultiplierAfterOccupancy === "number"
-        ? Math.max(0, Math.min(1, order.riskMultiplierAfterOccupancy))
-        : 1;
-    order.plannedPositionNotional = size.plannedPositionNotional * occupancyRiskMultiplier;
+    order.plannedPositionNotional = size.plannedPositionNotional;
     order.operationalSafetyStatus = "OK";
 
     // Global concentration cap — HEADLINE only (diagnostic probes are measurement,

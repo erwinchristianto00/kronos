@@ -177,6 +177,42 @@ describe("current-guard-variant-matrix", () => {
     expect(deriveVariantGeometry(shortSig, defOf("CG_TIGHT_FAST_05")).kind).toBe("ok");
   });
 
+  it("[EXP10X] experimental fast lanes use smaller TP and 10x paper risk metadata", () => {
+    const wideLongDef = defOf("CG_EXP_LONG_WIDE_FAST_10X");
+    const tightLongDef = defOf("CG_EXP_LONG_TIGHT_FAST_10X");
+    const mfeShortDef = defOf("CG_EXP_SHORT_MFE_GIVEBACK_10X");
+    const wideShortDef = defOf("CG_EXP_SHORT_WIDE_FAST_10X");
+
+    const wideLong = deriveVariantGeometry(makeSignal(), wideLongDef);
+    expect(wideLong.kind).toBe("ok");
+    if (wideLong.kind !== "ok") throw new Error("expected ok");
+    expect(wideLong.stopDistanceBps).toBeCloseTo(300, 6);
+    expect((wideLong.takeProfitLevels[0] - 100) / (100 - wideLong.stopLoss)).toBeCloseTo(0.25, 6);
+    expect(wideLongDef.experimentalLeverage).toBe(10);
+    expect(wideLongDef.paperRiskMultiplier).toBe(10);
+
+    const tightLong = deriveVariantGeometry(makeSignal(), tightLongDef);
+    expect(tightLong.kind).toBe("ok");
+    if (tightLong.kind !== "ok") throw new Error("expected ok");
+    expect(tightLong.stopDistanceBps).toBeCloseTo(200, 6);
+    expect((tightLong.takeProfitLevels[0] - 100) / (100 - tightLong.stopLoss)).toBeCloseTo(0.25, 6);
+
+    const shortSig = makeSignal({ direction: "SHORT", stopLoss: 102, tp1: 96 });
+    const mfeShort = deriveVariantGeometry(shortSig, mfeShortDef);
+    expect(mfeShort.kind).toBe("ok");
+    if (mfeShort.kind !== "ok") throw new Error("expected ok");
+    expect(mfeShortDef.exitRule).toBe("mfe_giveback");
+    expect((100 - mfeShort.takeProfitLevels[0]) / (mfeShort.stopLoss - 100)).toBeCloseTo(1, 6);
+    expect(mfeShortDef.paperRiskMultiplier).toBe(10);
+
+    const wideShort = deriveVariantGeometry(shortSig, wideShortDef);
+    expect(wideShort.kind).toBe("ok");
+    if (wideShort.kind !== "ok") throw new Error("expected ok");
+    expect((100 - wideShort.takeProfitLevels[0]) / (wideShort.stopLoss - 100)).toBeCloseTo(0.25, 6);
+    expect(deriveVariantGeometry(shortSig, wideLongDef).kind).toBe("rejected");
+    expect(deriveVariantGeometry(makeSignal(), wideShortDef).kind).toBe("rejected");
+  });
+
   // [CBE] CG_BE_AFTER_05: wide 300bps stop, 0.5R trigger, trail-after exit, both directions.
   it("[CBE] CG_BE_AFTER_05 floors stop at 300bps with a 0.5R trigger, both directions", () => {
     const geo = deriveVariantGeometry(makeSignal(), defOf("CG_BE_AFTER_05"));

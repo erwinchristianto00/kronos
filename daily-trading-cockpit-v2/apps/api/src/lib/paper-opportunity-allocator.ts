@@ -469,7 +469,22 @@ const VARIANT_MATRIX_DIAGNOSTIC_IDS: readonly VariantMatrixVariantId[] = [
   "CG_BASELINE_FAST_05",
   "CG_MAKER_FAST_05",
   "CG_MFE_GIVEBACK",
+  "CG_EXP_LONG_WIDE_FAST_10X",
+  "CG_EXP_LONG_TIGHT_FAST_10X",
+  "CG_EXP_SHORT_MFE_GIVEBACK_10X",
+  "CG_EXP_SHORT_WIDE_FAST_10X",
 ];
+const EXPERIMENTAL_MIXED_SHORT_LANE_IDS: ReadonlySet<string> = new Set([
+  "CG_VARIANT_MATRIX:CG_EXP_SHORT_MFE_GIVEBACK_10X",
+  "CG_VARIANT_MATRIX:CG_EXP_SHORT_WIDE_FAST_10X",
+]);
+function mixedLaneAllowedByActiveSet(laneId: string, activeMixedLanes: readonly string[]): boolean {
+  if (activeMixedLanes.includes(laneId)) return true;
+  // The 10x short experimental lanes reuse the same Mixed eligibility budget as
+  // CG_WIDE SHORT; they only collect when a real CG_WIDE mixed short would pass.
+  return EXPERIMENTAL_MIXED_SHORT_LANE_IDS.has(laneId) &&
+    activeMixedLanes.includes("CG_VARIANT_MATRIX:CG_WIDE_STOP_TP_WIDE");
+}
 /** Per-variant cap on DIAGNOSTIC_ONLY variant-matrix orders sampled per scan (keeps the book bounded). */
 const DEFAULT_VARIANT_DIAGNOSTIC_MAX_PER_SCAN = 3;
 /** Standing caps on the OPEN diagnostic book: per (variant×direction) lane and per symbol. ~13 active
@@ -1789,7 +1804,7 @@ export function buildPaperOpportunityAllocatorReport(
           !mixedBudgetState ||
           (
             inputs.mixedRegimeReport != null &&
-            !inputs.mixedRegimeReport.activeMixedLanes.includes(laneId)
+            !mixedLaneAllowedByActiveSet(laneId, inputs.mixedRegimeReport.activeMixedLanes)
           ) ||
           (
             mixedBudgetState.admissionResult !== "ALLOW" &&
@@ -1855,6 +1870,12 @@ export function buildPaperOpportunityAllocatorReport(
         if (manualCgWideTarget !== null) {
           provenance.candidateQualityFlags.push(`MANUAL_CG_WIDE_TP_${paperControls.cgWideTpPct?.toFixed(2)}PCT`);
         }
+        if (def.experimentalOnly) {
+          provenance.candidateQualityFlags.push(
+            `EXPERIMENTAL_${def.experimentalLeverage ?? 1}X_PAPER_ONLY`,
+            `PAPER_RISK_MULTIPLIER_${def.paperRiskMultiplier ?? 1}X`,
+          );
+        }
         return {
           sourceCandidateId,
           scanBatchId: inputs.scanBatchId,
@@ -1872,6 +1893,8 @@ export function buildPaperOpportunityAllocatorReport(
           plannedStopDistanceBps: geo.stopDistanceBps,
           oosUnconfirmed,
           paperRiskLabel,
+          experimentalLeverage: def.experimentalLeverage,
+          paperRiskMultiplier: def.paperRiskMultiplier,
           paperOrderMode: mode,
           openedAt: inputs.scanFinishedAt,
           provenance,

@@ -391,13 +391,13 @@ describe("paper-opportunity-allocator", () => {
       baseInputs({ vmReport, candidates: [makeCandidate()] }),
     );
     expect(report.candidatesEvaluated).toBe(1);
-    // 12 = the 6 bidirectional CG lanes + shortOnly CG_WIDE_FAST_SHORT + the 2
+    // 14 = the 6 bidirectional CG lanes + shortOnly CG_WIDE_FAST_SHORT + the 2
     // direction-agnostic fast-exit research lanes (CG_TIGHT_FAST_05, CG_BE_AFTER_05)
     // + the direction-agnostic CG_MFE_GIVEBACK exit lane + the 2 direction-agnostic
-    // sentil lanes (CG_BASELINE_FAST_05, CG_MAKER_FAST_05).
-    // (CG_WIDE_FAST_LONG is longOnly → not SHORT-eligible.)
-    expect(report.laneEvaluationsCreated).toBe(12);
-    expect(report.byLane.length).toBe(12);
+    // sentil lanes (CG_BASELINE_FAST_05, CG_MAKER_FAST_05) + 2 experimental short
+    // 10x paper lanes. (CG_WIDE_FAST_LONG + exp long lanes are longOnly → not SHORT-eligible.)
+    expect(report.laneEvaluationsCreated).toBe(14);
+    expect(report.byLane.length).toBe(14);
   });
 
   it("[DCAP] caps the open diagnostic book per-symbol (suppress concentration)", async () => {

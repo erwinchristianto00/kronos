@@ -246,6 +246,14 @@ describe("paper-execution-router", () => {
     expect(result.plannedPositionNotional).toBeCloseTo(400);
   });
 
+  it("[3b] custom riskPct models 10x paper risk sizing", () => {
+    const result = computePaperPositionSize(2000, 100, 97, { riskPct: 10 });
+    expect(result.ok).toBe(true);
+    expect(result.riskPct).toBe(10);
+    expect(result.plannedRiskAmount).toBeCloseTo(200);
+    expect(result.plannedPositionNotional).toBeCloseTo(200 / 0.03);
+  });
+
   // [4] Zero/invalid stopDistancePct rejects
   it("[4] zero stopDistancePct rejects paper order", () => {
     const samePrice = computePaperPositionSize(2000, 100, 100);
