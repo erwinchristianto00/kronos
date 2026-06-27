@@ -284,6 +284,9 @@ interface LiveExecutionState {
   realizedPeakUsd: number;
   /** paperOrderId → failed live-open attempts. At MAX_MIRROR_ATTEMPTS the order is quarantined. */
   mirrorAttempts: Record<string, number>;
+  /** Last fresh controller snapshot seen by the testnet regime-change harvest. */
+  lastControllerRegime: string | null;
+  lastControllerMode: string | null;
   killedAt: string | null;
   killReason: string | null;
 }
@@ -322,6 +325,8 @@ export class LiveExecutionStore {
       totalRealizedPnlUsd: 0,
       realizedPeakUsd: 0,
       mirrorAttempts: {},
+      lastControllerRegime: null,
+      lastControllerMode: null,
       killedAt: null,
       killReason: null,
     };
@@ -879,10 +884,10 @@ export class LiveExecutionEngine {
       // 3. Manage lifecycle of open intents (TP1 → breakeven, close detection).
       await this.manageLifecycle();
 
-      // 4. Testnet safety harvest: if regime flips, flatten only opposing exposure that
-      // can clear the conservative close-cost estimate. Losing opposing exposure is left
-      // to its stop/TP/giveback logic instead of locking a loss.
-      await this.maybeCloseRegimeOppositionBreakeven();
+      // 4. Testnet safety harvest: on every fresh regime/mode change, flatten any exposure
+      // that can clear the conservative close-cost estimate. Between changes, preserve the
+      // older opposing-direction breakeven harvest so stale contra exposure can still free slots.
+      await this.maybeCloseTestnetRegimeHarvest();
 
       // 5. Mirror new HEADLINE paper orders (only when armed + healthy).
       await this.mirrorNewSignals();
@@ -1114,24 +1119,42 @@ export class LiveExecutionEngine {
     return null;
   }
 
-  private async maybeCloseRegimeOppositionBreakeven(): Promise<void> {
+  private async maybeCloseTestnetRegimeHarvest(): Promise<void> {
     if (this.config.env !== "testnet" || !this.config.testnetRegimeExitEnabled) return;
     const controller = this.currentControllerSnapshot();
     if (!this.controllerSnapshotIsFresh(controller)) return;
-    const opposingDirection = this.opposingDirectionForController(controller?.mode);
-    if (!opposingDirection) return;
+    const currentRegime = controller?.regime ?? null;
+    const currentMode = controller?.mode ?? null;
 
     const st = this.store.getState();
-    const openOpposingIntents = st.intents.filter(
-      (intent) => OPEN_INTENT_STATES.has(intent.state) && intent.direction === opposingDirection,
-    );
-    if (openOpposingIntents.length === 0) return;
+    const previousRegime = st.lastControllerRegime ?? null;
+    const previousMode = st.lastControllerMode ?? null;
+    const hasPreviousController = previousRegime !== null || previousMode !== null;
+    const controllerChanged = hasPreviousController &&
+      (previousRegime !== currentRegime || previousMode !== currentMode);
+    const snapshotChanged = previousRegime !== currentRegime || previousMode !== currentMode;
+    if (snapshotChanged) {
+      st.lastControllerRegime = currentRegime;
+      st.lastControllerMode = currentMode;
+    }
+
+    const openIntents = st.intents.filter((intent) => OPEN_INTENT_STATES.has(intent.state));
+    const opposingDirection = this.opposingDirectionForController(currentMode);
+    const harvestIntents = controllerChanged
+      ? openIntents
+      : opposingDirection
+        ? openIntents.filter((intent) => intent.direction === opposingDirection)
+        : [];
+    if (harvestIntents.length === 0) {
+      if (snapshotChanged) this.store.save();
+      return;
+    }
 
     const positions = await this.client.getPositions();
     const bySymbol = new Map(positions.map((position) => [position.symbol, position]));
-    let dirty = false;
+    let dirty = snapshotChanged;
 
-    for (const intent of openOpposingIntents) {
+    for (const intent of harvestIntents) {
       const pos = bySymbol.get(intent.symbol);
       const amt = pos?.positionAmt ?? 0;
       if (!pos || Math.abs(amt) < 1e-12) continue;
@@ -1166,7 +1189,9 @@ export class LiveExecutionEngine {
       intent.state = "CLOSED";
       intent.closedAt = this.nowIso();
       intent.updatedAt = this.nowIso();
-      intent.closeReason = `REGIME_OPPOSITION_BREAKEVEN_${controller?.mode ?? "UNKNOWN"}`;
+      intent.closeReason = controllerChanged
+        ? `REGIME_CHANGE_HARVEST_${previousMode ?? previousRegime ?? "UNKNOWN"}_TO_${currentMode ?? currentRegime ?? "UNKNOWN"}`
+        : `REGIME_OPPOSITION_BREAKEVEN_${currentMode ?? "UNKNOWN"}`;
       this.applyRealizedToLedger(net);
       dirty = true;
     }

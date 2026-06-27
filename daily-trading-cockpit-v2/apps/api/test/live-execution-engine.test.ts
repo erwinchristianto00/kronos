@@ -650,6 +650,44 @@ describe("LiveExecutionEngine", () => {
     expect(client.placed.length).toBe(placedBefore);
   });
 
+  it("testnet regime-change harvest closes any profitable exposure, not only opposing direction", async () => {
+    const order = paperOrder({
+      direction: "LONG",
+      stopLoss: 1900,
+      takeProfitLevels: [2100],
+    });
+    let controller = {
+      regime: "Bullish expansion",
+      mode: "LONG_ONLY",
+      capturedAt: new Date().toISOString(),
+    };
+    const { engine, client, store } = makeEngine({
+      paper: makePaperStore([order]),
+      getControllerSnapshot: () => controller,
+    });
+    expect((await engine.arm()).ok).toBe(true);
+    await engine.tick();
+    expect(store.getState().intents[0]!.state).toBe("OPEN");
+
+    controller = {
+      regime: "Mixed rotation",
+      mode: "VALIDATION_ONLY",
+      capturedAt: new Date().toISOString(),
+    };
+    client.unrealizedPnlBySymbol.set("ETHUSDT", 1.0); // clears the close-cost estimate.
+    client.flattenRealizedPnl = 0.78;
+    await engine.tick();
+
+    const closed = store.getState().intents[0]!;
+    expect(closed.state).toBe("CLOSED");
+    expect(closed.closeReason).toBe("REGIME_CHANGE_HARVEST_LONG_ONLY_TO_VALIDATION_ONLY");
+    expect(closed.realizedPnlUsd).toBeCloseTo(0.78, 6);
+    const flat = client.placed.at(-1)!;
+    expect(flat.type).toBe("MARKET");
+    expect(flat.reduceOnly).toBe(true);
+    expect(flat.side).toBe("SELL");
+  });
+
   it("skips DIAGNOSTIC_ONLY orders, stale watermark orders, and respects the paper breaker halt", async () => {
     const diag = paperOrder({ paperOrderMode: "DIAGNOSTIC_ONLY" } as Partial<PaperOrder>);
     const stale = paperOrder({ createdAt: "2000-01-01T00:00:00.000Z" } as Partial<PaperOrder>);
