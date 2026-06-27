@@ -411,6 +411,17 @@ function cohortFromBreakdown(row: VariantBreakdownRow | undefined): NeuralLaneCo
   };
 }
 
+function cohortFromPaperBook(economics: ReturnType<typeof laneEconomics>): NeuralLaneCohortStats | null {
+  if (economics.open <= 0 && economics.closed <= 0) return null;
+  return {
+    n: economics.closed,
+    netAvgR: economics.netAvgR,
+    pf: economics.pf,
+    wr: economics.wr,
+    payoffRatio: null,
+  };
+}
+
 function markFetchTimeoutMs(): number {
   const raw = Number(process.env.NEURAL_MAP_MARK_TIMEOUT_MS);
   return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : DEFAULT_MARK_FETCH_TIMEOUT_MS;
@@ -1244,16 +1255,11 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
       : (evidenceRow?.statusReason ?? paperStatus.statusReason);
     const sourceTag = statsSource === "VM_SIM" ? "[stats: VM-sim]" : "[stats: paper realized]";
     const diagTag = pnlIsDiagnosticOnly ? " [PnL: diagnostic-only — excluded from headline]" : "";
-    const directionRows = row?.byDirection ?? [];
-    const regimeFamilyRows = row?.byRegimeFamily ?? [];
-    const paperOnlyLongCohort =
-      !row && id.startsWith("CG_LONG_VARIANT_MATRIX:") && (economics.open > 0 || economics.closed > 0)
-        ? { n: economics.closed, netAvgR: economics.netAvgR, pf: economics.pf, wr: economics.wr, payoffRatio: null }
-        : null;
-    const paperOnlyShortCohort =
-      !row && !id.startsWith("CG_LONG_VARIANT_MATRIX:") && (economics.open > 0 || economics.closed > 0)
-        ? { n: economics.closed, netAvgR: economics.netAvgR, pf: economics.pf, wr: economics.wr, payoffRatio: null }
-        : null;
+    const directionRows = evidenceRow?.byDirection ?? [];
+    const regimeFamilyRows = evidenceRow?.byRegimeFamily ?? [];
+    const paperBookCohort = statsSource === "PAPER_BOOK" ? cohortFromPaperBook(economics) : null;
+    const paperOnlyLongCohort = id.startsWith("CG_LONG_VARIANT_MATRIX:") ? paperBookCohort : null;
+    const paperOnlyShortCohort = !id.startsWith("CG_LONG_VARIANT_MATRIX:") ? paperBookCohort : null;
     return {
       id,
       label: laneLabel(id),

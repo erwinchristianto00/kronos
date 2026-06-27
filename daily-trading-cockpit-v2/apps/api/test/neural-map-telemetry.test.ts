@@ -517,7 +517,23 @@ describe("neural map telemetry", () => {
 
   it("promotes paper-book long lanes to watchable without requiring VM-only fields", () => {
     const input = baseInput();
-    input.variantMatrix.rows = [];
+    input.variantMatrix.rows = [{
+      ...input.variantMatrix.rows[0]!,
+      variantId: "CG_WIDE_FAST_LONG",
+      label: "Wide Fast Long",
+      total: 0,
+      open: 0,
+      resolved: 0,
+      freshValid: 0,
+      netAvgR: null,
+      pf: null,
+      wr: null,
+      byDirection: [],
+      status: "COLLECTING",
+      statusReason: "VM row has not caught up",
+      blockers: ["freshValid 0 < 10"],
+      cautions: [],
+    } as never];
     input.orders = Array.from({ length: 20 }, (_, idx) => ({
       id: `paper-long-win-${idx}`,
       observationId: `obs-long-win-${idx}`,
@@ -551,6 +567,13 @@ describe("neural map telemetry", () => {
       pf: 999_999,
     });
     expect(lane?.netAvgR).toBeCloseTo(0.4, 9);
+    expect(lane?.cohorts.LONG).toMatchObject({
+      n: 20,
+      pf: 999_999,
+      wr: 1,
+    });
+    expect(lane?.cohorts.LONG?.netAvgR).toBeCloseTo(0.4, 9);
+    expect(lane?.cohorts.SHORT).toBeNull();
     expect(lane?.blockers).toEqual(["freshValid 20 < 100 for stable"]);
     expect(lane?.cautions.join(" ")).toContain("VM-only OOS/payoff/stress");
   });
