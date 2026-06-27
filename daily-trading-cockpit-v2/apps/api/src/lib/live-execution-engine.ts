@@ -65,6 +65,8 @@ export interface LiveExecutionConfig {
   maxPaperOrderAgeMs: number;
   /** Testnet-only: mirror every open paper order, including diagnostic lanes and pre-restart orders. */
   mirrorAllPaperOrders: boolean;
+  /** Testnet-only: close a mirrored position early once exchange unrealized PnL reaches this USDT threshold. */
+  testnetTakeProfitUsd: number;
   autoArm: boolean;
   mainnetConfirmed: boolean;
   /** Why the config cannot trade (empty = config valid for its env). */
@@ -106,6 +108,7 @@ export function parseLiveExecutionConfig(env: NodeJS.ProcessEnv = process.env): 
     maxNotionalPerTrade: envNum(env.LIVE_MAX_NOTIONAL_PER_TRADE, 250),
     maxPaperOrderAgeMs: Math.floor(envNum(env.LIVE_MAX_PAPER_ORDER_AGE_MS, 10 * 60 * 1000)),
     mirrorAllPaperOrders: env.LIVE_MIRROR_ALL_PAPER === "1" && liveEnv === "testnet",
+    testnetTakeProfitUsd: liveEnv === "testnet" ? envNum(env.LIVE_TESTNET_TP_USD, 0) : 0,
     autoArm: env.LIVE_AUTO_ARM === "1" && liveEnv === "testnet", // mainnet NEVER auto-arms
     mainnetConfirmed,
     configErrors,
@@ -613,6 +616,7 @@ export class LiveExecutionEngine {
         maxNotionalPerTrade: this.config.maxNotionalPerTrade,
         maxPaperOrderAgeMs: this.config.maxPaperOrderAgeMs,
         mirrorAllPaperOrders: this.config.mirrorAllPaperOrders,
+        testnetTakeProfitUsd: this.config.testnetTakeProfitUsd,
       },
     };
   }
@@ -899,6 +903,10 @@ export class LiveExecutionEngine {
           continue;
         }
 
+        const usdTp = await this.maybeCloseOnTestnetUsdTakeProfit(intent, pos, amt);
+        if (usdTp.changed) dirty = true;
+        if (usdTp.closed) continue;
+
         if (pos && intent.state === "OPEN" && this.intentExitRule(intent) === "mfe_giveback") {
           const mfe = await this.manageMfeGiveback(intent, pos, amt);
           if (mfe.changed) dirty = true;
@@ -975,6 +983,45 @@ export class LiveExecutionEngine {
       }
     }
     if (dirty) this.store.save();
+  }
+
+  private async maybeCloseOnTestnetUsdTakeProfit(
+    intent: LiveIntent,
+    pos: FuturesPosition | undefined,
+    amt: number,
+  ): Promise<{ changed: boolean; closed: boolean }> {
+    const threshold = this.config.env === "testnet" ? this.config.testnetTakeProfitUsd : 0;
+    if (!(threshold > 0)) return { changed: false, closed: false };
+    const unrealized = pos?.unRealizedProfit ?? 0;
+    if (!Number.isFinite(unrealized) || unrealized < threshold) return { changed: false, closed: false };
+
+    const flat = await this.client.placeOrder({
+      symbol: intent.symbol,
+      side: amt > 0 ? "SELL" : "BUY",
+      type: "MARKET",
+      quantity: Math.abs(amt),
+      reduceOnly: true,
+      newClientOrderId: `dtc-${intent.paperOrderId.slice(-18)}-usd`,
+    });
+    try {
+      await this.client.cancelAllOrders(intent.symbol);
+      await this.client.cancelAllAlgoOrders(intent.symbol);
+    } catch {
+      // best-effort residue cleanup after the position has already been closed.
+    }
+    const net = await this.realizedFromTrades(intent.symbol, intent.createdAt, [
+      intent.entryOrderId,
+      intent.tp1OrderId,
+      flat.orderId,
+    ]);
+    intent.realizedPnlUsd = net;
+    intent.feesUsd = null;
+    intent.state = "CLOSED";
+    intent.closedAt = this.nowIso();
+    intent.updatedAt = this.nowIso();
+    intent.closeReason = `TESTNET_USD_TP_${threshold.toFixed(2)}`;
+    this.applyRealizedToLedger(net);
+    return { changed: true, closed: true };
   }
 
   private async manageMfeGiveback(intent: LiveIntent, pos: FuturesPosition, amt: number): Promise<{ changed: boolean; closed: boolean }> {

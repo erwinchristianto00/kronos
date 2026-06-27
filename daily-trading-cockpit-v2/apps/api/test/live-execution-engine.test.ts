@@ -56,6 +56,7 @@ class FakeLiveClient {
   cancelAllSymbols: string[] = [];
   positionsBySymbol = new Map<string, number>();
   markPriceBySymbol = new Map<string, number>();
+  unrealizedPnlBySymbol = new Map<string, number>();
   orderStatusById = new Map<number, string>();
   trades: FuturesUserTrade[] = [];
   hedge = false;
@@ -93,7 +94,7 @@ class FakeLiveClient {
         entryPrice: 2000,
         markPrice: this.markPriceBySymbol.get(sym) ?? 2000,
         liquidationPrice: 1500,
-        unRealizedProfit: 0,
+        unRealizedProfit: this.unrealizedPnlBySymbol.get(sym) ?? 0,
         leverage: 2,
         marginType: "ISOLATED",
       });
@@ -244,6 +245,7 @@ function makeConfig(overrides: Partial<LiveExecutionConfig> = {}): LiveExecution
     maxNotionalPerTrade: 250,
     maxPaperOrderAgeMs: 24 * 60 * 60 * 1000,
     mirrorAllPaperOrders: false,
+    testnetTakeProfitUsd: 0,
     autoArm: false,
     mainnetConfirmed: false,
     configErrors: [],
@@ -316,6 +318,22 @@ describe("parseLiveExecutionConfig", () => {
       LIVE_BINANCE_ENV: "mainnet",
       LIVE_MAINNET_CONFIRM: "I_UNDERSTAND_REAL_MONEY",
     }).mirrorAllPaperOrders).toBe(false);
+  });
+
+  it("testnet USD take-profit is testnet-only and disabled unless configured", () => {
+    const base = {
+      LIVE_EXECUTION_ENABLED: "1",
+      LIVE_BINANCE_API_KEY: "k",
+      LIVE_BINANCE_API_SECRET: "s",
+      LIVE_TESTNET_TP_USD: "20",
+    };
+    expect(parseLiveExecutionConfig({ ...base, LIVE_BINANCE_ENV: "testnet" }).testnetTakeProfitUsd).toBe(20);
+    expect(parseLiveExecutionConfig({
+      ...base,
+      LIVE_BINANCE_ENV: "mainnet",
+      LIVE_MAINNET_CONFIRM: "I_UNDERSTAND_REAL_MONEY",
+    }).testnetTakeProfitUsd).toBe(0);
+    expect(parseLiveExecutionConfig({ ...base, LIVE_BINANCE_ENV: "testnet", LIVE_TESTNET_TP_USD: "0" }).testnetTakeProfitUsd).toBe(0);
   });
 });
 
@@ -535,6 +553,34 @@ describe("LiveExecutionEngine", () => {
     expect(flat.type).toBe("MARKET");
     expect(flat.reduceOnly).toBe(true);
     expect(flat.quantity).toBeCloseTo(0.025, 9);
+  });
+
+  it("testnet USD TP closes a profitable open position before the original TP", async () => {
+    const order = paperOrder();
+    const { engine, client, store } = makeEngine({
+      paper: makePaperStore([order]),
+      config: { testnetTakeProfitUsd: 20 },
+    });
+    expect((await engine.arm()).ok).toBe(true);
+    await engine.tick();
+
+    const intent = store.getState().intents[0]!;
+    client.unrealizedPnlBySymbol.set("ETHUSDT", 20.5);
+    client.flattenRealizedPnl = 20.12;
+    await engine.tick();
+
+    const closed = store.getState().intents[0]!;
+    expect(closed.state).toBe("CLOSED");
+    expect(closed.closeReason).toBe("TESTNET_USD_TP_20.00");
+    expect(closed.realizedPnlUsd).toBeCloseTo(20.12, 6);
+    const flat = client.placed.at(-1)!;
+    expect(flat.type).toBe("MARKET");
+    expect(flat.reduceOnly).toBe(true);
+    expect(flat.side).toBe("BUY");
+    expect(client.cancelAllSymbols).toContain("ETHUSDT");
+    expect(store.getState().dailyLedger.wins).toBe(1);
+    expect(store.getState().consecutiveLosses).toBe(0);
+    expect(client.orderStatusById.get(intent.tp1OrderId!)).toBeUndefined();
   });
 
   it("skips DIAGNOSTIC_ONLY orders, stale watermark orders, and respects the paper breaker halt", async () => {
