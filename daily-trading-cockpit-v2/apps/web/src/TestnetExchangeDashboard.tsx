@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import './neural-mindmap.css';
 
 const REFRESH_MS = 5_000;
+const TESTNET_API_PREFIX = '/testnet/api';
 
 interface LiveStatus {
   enabled: boolean;
@@ -128,8 +129,8 @@ export default function TestnetExchangeDashboard() {
   async function loadExchangeOnly() {
     try {
       const [nextStatus, nextAccount] = await Promise.all([
-        fetchJson<LiveStatus>('/api/live/status'),
-        fetchJson<LiveAccount>('/api/live/account'),
+        fetchJson<LiveStatus>(`${TESTNET_API_PREFIX}/live/status`),
+        fetchJson<LiveAccount>(`${TESTNET_API_PREFIX}/live/account`),
       ]);
       setStatus(nextStatus);
       setAccount(nextAccount);
@@ -220,7 +221,7 @@ export default function TestnetExchangeDashboard() {
           <div>
             <span>Scope</span>
             <strong>Exchange-only testnet view</strong>
-            <p>This page reads only `/api/live/status` and `/api/live/account`. Paper evidence, diagnostics, fade-long, H6 trend, and promotion telemetry are intentionally hidden here.</p>
+            <p>This page reads only `{TESTNET_API_PREFIX}/live/status` and `{TESTNET_API_PREFIX}/live/account`. Paper evidence, diagnostics, fade-long, H6 trend, and promotion telemetry are intentionally hidden here.</p>
           </div>
           <div className="testnet-kpis">
             <div><span>Wallet</span><strong>{plain(account?.walletBalance, ' USDT')}</strong></div>

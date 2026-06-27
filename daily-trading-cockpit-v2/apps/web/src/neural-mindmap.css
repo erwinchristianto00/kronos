@@ -934,6 +934,95 @@ i.health-diagnostic {
   overflow-wrap: anywhere;
 }
 
+.neural-lane-metrics-panel {
+  grid-column: 1 / -1;
+  background:
+    radial-gradient(circle at 95% 0%, rgba(80, 220, 161, 0.08), transparent 30%),
+    #08151b;
+}
+
+.neural-lane-metrics-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 14px;
+  margin-bottom: 12px;
+}
+
+.neural-lane-metrics-header h2 {
+  margin-bottom: 6px;
+}
+
+.neural-lane-card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+  gap: 10px;
+  align-items: start;
+}
+
+.neural-lane-metric-card {
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid #243740;
+  border-radius: 8px;
+  background: rgba(5, 13, 18, 0.78);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
+}
+
+.neural-lane-cohort-card {
+  border-left: 3px solid #67a8c1;
+}
+
+.neural-lane-metric-card h3 {
+  margin: 0 0 9px;
+  color: #849aa3;
+  font: 700 10px/1.3 "IBM Plex Mono", "Cascadia Code", monospace;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.neural-lane-metric-card .neural-section-note {
+  margin-bottom: 10px;
+}
+
+.neural-lane-metric-card dl {
+  gap: 8px;
+}
+
+.neural-lane-metric-card dl > div {
+  grid-template-columns: minmax(88px, 0.92fr) minmax(0, 1.08fr);
+  gap: 9px;
+}
+
+.neural-lane-metric-card dt {
+  line-height: 1.35;
+}
+
+.neural-lane-metric-card dd {
+  line-height: 1.42;
+}
+
+.neural-lane-metric-card dd:has(.neural-oos-bar) {
+  display: block;
+}
+
+.neural-metric-progress {
+  display: grid;
+  gap: 6px;
+  justify-items: stretch;
+}
+
+.neural-metric-progress .neural-oos-bar {
+  width: 100%;
+}
+
+.neural-metric-progress > span:last-child {
+  color: #9ab0b9;
+  font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+  font-size: 10px;
+  line-height: 1.35;
+  text-align: right;
+}
+
 .neural-process-list,
 .neural-check-list {
   margin: 0;
@@ -1287,6 +1376,19 @@ i.health-diagnostic {
   }
 
   .neural-inspector-section dd {
+    text-align: left;
+  }
+
+  .neural-lane-card-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .neural-lane-metric-card dl > div {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 3px;
+  }
+
+  .neural-metric-progress > span:last-child {
     text-align: left;
   }
 

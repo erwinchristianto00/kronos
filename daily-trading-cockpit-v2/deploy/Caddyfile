@@ -15,6 +15,13 @@ dash.example.duckdns.org {
 		admin REPLACE_WITH_BCRYPT_HASH
 	}
 
+	# /testnet/api/* → the Binance testnet mirror API. The strip keeps the API
+	# path shape as /api/live/... after proxying to the testnet API process.
+	handle /testnet/api/* {
+		uri strip_prefix /testnet
+		reverse_proxy 127.0.0.1:3102
+	}
+
 	# /api/* → the trading API (localhost only)
 	handle /api/* {
 		reverse_proxy 127.0.0.1:3101
@@ -40,6 +47,10 @@ dash.example.duckdns.org {
 # 	tls internal
 # 	basicauth {
 # 		admin REPLACE_WITH_BCRYPT_HASH
+# 	}
+# 	handle /testnet/api/* {
+# 		uri strip_prefix /testnet
+# 		reverse_proxy 127.0.0.1:3102
 # 	}
 # 	handle /api/* {
 # 		reverse_proxy 127.0.0.1:3101

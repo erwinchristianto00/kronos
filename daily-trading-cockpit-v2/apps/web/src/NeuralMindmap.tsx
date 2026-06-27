@@ -1063,6 +1063,104 @@ export default function NeuralMindmap() {
   const selectedLaneMilestone = selectedLane ? laneMilestone(selectedLane) : null;
   const selectedLaneProgress = selectedLane ? stageProgress(selectedLane) : null;
   const selectedLiveLane = liveAccount?.lanes.find((lane) => lane.laneId === selectedLane?.id) ?? null;
+  const selectedLaneHeadlinePnl = selectedLane
+    ? selectedLane.headlinePnl + (selectedLane.headlineUnrealizedPnl ?? 0)
+    : 0;
+  const selectedLaneHeadlineTone = selectedLaneHeadlinePnl > 0
+    ? 'tone-healthy'
+    : selectedLaneHeadlinePnl < 0
+      ? 'tone-critical'
+      : 'tone-measure';
+  const selectedLaneOpenTone = selectedLane?.pnlIsDiagnosticOnly
+    ? 'tone-measure'
+    : (selectedLane?.openUnrealizedPnl ?? 0) >= 0
+      ? 'tone-healthy'
+      : 'tone-critical';
+  const selectedLaneOosProgressText = selectedLane?.oosFreshValid == null
+    ? null
+    : selectedLane.oosFreshValid >= selectedLane.oosThreshold
+      ? 'Mature — headline-eligible'
+      : `${Math.floor((selectedLane.oosFreshValid / Math.max(1, selectedLane.oosThreshold)) * 100)}% — still collecting`;
+  const selectedLaneMetricGroups = selectedLane ? [
+    {
+      title: 'Stage',
+      rows: [
+        { label: 'Evidence status', value: selectedLane.status },
+        { label: 'UI stage', value: selectedLaneMilestone ? stageLabel(selectedLaneMilestone.stage) : 'n/a' },
+        { label: 'Next stage', value: selectedLaneProgress?.nextStage ?? 'n/a' },
+        { label: 'Progress', value: selectedLaneProgress ? `${selectedLaneProgress.progressPct}%` : 'n/a' },
+        { label: 'Evidence health', value: HEALTH_LABELS[selectedLane.evidenceHealth] },
+        { label: 'Stats source', value: statsSourceLongLabel(selectedLane.statsSource) },
+      ],
+    },
+    {
+      title: 'Evidence',
+      rows: [
+        { label: 'Open / closed', value: `${selectedLane.open} / ${selectedLane.closed}` },
+        { label: 'Net Avg R', value: fmtR(selectedLane.netAvgR), tone: (selectedLane.netAvgR ?? 0) >= 0 ? 'tone-healthy' : 'tone-critical' },
+        { label: 'PF / WR', value: `${fmtNumber(selectedLane.pf)} / ${selectedLane.wr === null ? 'n/a' : `${(selectedLane.wr * 100).toFixed(1)}%`}` },
+        { label: 'Payoff / +10bps', value: `${fmtNumber(selectedLane.payoffRatio)} / ${selectedLane.plus10bpsStillPositive == null ? 'n/a' : selectedLane.plus10bpsStillPositive ? 'pass' : 'fail'}` },
+        { label: 'OOS thirds / regimes', value: `${selectedLane.allThreeOosPositive == null ? 'n/a' : selectedLane.allThreeOosPositive ? 'all positive' : 'not yet'} / ${selectedLane.distinctRegimes ?? 'n/a'}` },
+        { label: 'Drawdown / concentration', value: `${fmtR(selectedLane.approxMaxDrawdownR)} / ${pctShare(selectedLane.topSymbolPnlShare)}` },
+        { label: 'Calendar / infra', value: `${selectedLane.calendarDays === null ? 'n/a' : `${selectedLane.calendarDays.toFixed(1)}d`} / ${selectedLane.infraReady == null ? 'n/a' : selectedLane.infraReady ? 'ready' : 'not ready'}` },
+      ],
+    },
+    {
+      title: 'OOS maturity',
+      rows: selectedLane.oosFreshValid === null ? [
+        { label: 'Validated', value: 'n/a' },
+      ] : [
+        { label: 'Validated', value: `${selectedLane.oosFreshValid} / ${selectedLane.oosThreshold} fresh closes` },
+        {
+          label: 'Progress',
+          value: (
+            <span className="neural-metric-progress">
+              <span className="neural-oos-bar">
+                <span
+                  className={`neural-oos-fill ${selectedLane.oosFreshValid >= selectedLane.oosThreshold ? 'is-complete' : ''}`}
+                  style={{ width: `${Math.min(100, (selectedLane.oosFreshValid / Math.max(1, selectedLane.oosThreshold)) * 100).toFixed(1)}%` }}
+                />
+              </span>
+              <span>{selectedLaneOosProgressText}</span>
+            </span>
+          ),
+        },
+      ],
+    },
+    {
+      title: 'TP geometry',
+      rows: [
+        { label: 'Avg entry / mark', value: `${fmtPrice(selectedLane.openAvgEntryPrice)} / ${fmtPrice(selectedLane.openAvgMarkPrice)}` },
+        { label: 'Avg TP / gap', value: `${fmtPrice(selectedLane.openAvgTakeProfitPrice)} / ${fmtGapPct(selectedLane.openAvgDistanceToTpPct)}` },
+        { label: 'Nearest TP gap', value: `${fmtGapPct(selectedLane.openNearestDistanceToTpPct)} across ${selectedLane.openMarkedSymbolCount} symbols` },
+        { label: 'MFE avg / p90', value: `${fmtPlainPct(selectedLane.openAvgMfePct)} / ${fmtPlainPct(selectedLane.openP90MfePct)}` },
+        { label: 'TP quality', value: `${tpVerdictLabel(selectedLane.openTpAssessment)} · TP ${fmtPlainPct(selectedLane.openAvgConfiguredTpPct)}` },
+      ],
+    },
+    {
+      title: 'Paper & diagnostics',
+      rows: [
+        {
+          label: 'Headline PnL (real)',
+          value: `${fmtUsdt(selectedLaneHeadlinePnl)} / ${fmtR((selectedLane.netAvgR ?? 0) === 0 && selectedLane.closed === 0 ? null : selectedLane.headlineUnrealizedR)}${selectedLane.pnlIsDiagnosticOnly ? ' · flat' : ''}`,
+          tone: selectedLaneHeadlineTone,
+        },
+        { label: 'Paper evidence PnL', value: `${fmtMoney(selectedLane.totalPnl)}${selectedLane.pnlIsDiagnosticOnly ? ' · diagnostic' : ''}`, tone: selectedLane.pnlIsDiagnosticOnly ? 'tone-measure' : undefined },
+        { label: 'Diagnostic open MTM', value: `${fmtUsdt(selectedLane.diagnosticUnrealizedPnl)} / ${fmtR(selectedLane.diagnosticUnrealizedR)}`, tone: 'tone-measure' },
+        { label: 'Max favorable open', value: `${fmtUsdt(selectedLane.openMaxFavorablePnl)} / ${fmtR(selectedLane.openMaxFavorableR)}`, tone: 'tone-measure' },
+        { label: 'All open MTM', value: `${fmtUsdt(selectedLane.openUnrealizedPnl)} / ${fmtR(selectedLane.openUnrealizedR)}`, tone: selectedLaneOpenTone },
+      ],
+    },
+    {
+      title: 'Binance mirror',
+      rows: [
+        { label: 'Mirrored', value: selectedLiveLane ? `${selectedLiveLane.sourceOrderCount} orders / ${selectedLiveLane.symbols.length} symbols` : 'not open' },
+        { label: 'Notional', value: selectedLiveLane ? `${selectedLiveLane.notionalUsd.toFixed(2)} USDT` : '0.00 USDT' },
+        { label: 'Unrealized', value: selectedLiveLane ? `${selectedLiveLane.unrealizedPnl >= 0 ? '+' : ''}${selectedLiveLane.unrealizedPnl.toFixed(2)} USDT` : '0.00 USDT', tone: (selectedLiveLane?.unrealizedPnl ?? 0) >= 0 ? 'tone-healthy' : 'tone-critical' },
+        { label: 'Account equity', value: liveAccount?.accountEquity != null ? `${liveAccount.accountEquity.toFixed(2)} USDT` : 'n/a' },
+      ],
+    },
+  ] : [];
   const selectedGuide = selectedNode ? PROCESS_GUIDES[selectedNode.id] : null;
   const newestAgeSec = lastReceivedAt === null ? Infinity : Math.round((Date.now() - lastReceivedAt) / 1000);
   const stale = newestAgeSec > (telemetry?.staleAfterSec ?? 30) || Boolean(error);
@@ -1504,70 +1602,37 @@ export default function NeuralMindmap() {
                 <strong>{selectedLiveLane ? 'Lane color follows mirrored exchange P&L.' : laneDiagnosis(selectedLane)}</strong>
                 <p>Paper evidence remains separate; execution equity, exposure, and current PnL come from Binance testnet.</p>
               </div>
-              <div className="neural-inspector-section">
-                <h2>Performance scorecard</h2>
-                <p className="neural-section-note">Cohorts come from the same lane evidence row: LONG/SHORT are trade direction, MIXED is choppy/range regime family.</p>
-                <dl>
-                  <div><dt>LONG cohort</dt><dd className={cohortTone(selectedLane.cohorts?.LONG)}>{fmtCohort(selectedLane.cohorts?.LONG)}</dd></div>
-                  <div><dt>SHORT cohort</dt><dd className={cohortTone(selectedLane.cohorts?.SHORT)}>{fmtCohort(selectedLane.cohorts?.SHORT)}</dd></div>
-                  <div><dt>MIXED regime</dt><dd className={cohortTone(selectedLane.cohorts?.MIXED)}>{fmtCohort(selectedLane.cohorts?.MIXED)}</dd></div>
-                </dl>
-              </div>
-              {selectedLane.oosFreshValid !== null && (
-                <div className="neural-inspector-section">
-                  <h2>OOS maturity (this lane)</h2>
-                  <dl>
-                    <div>
-                      <dt>Validated</dt>
-                      <dd>{selectedLane.oosFreshValid} / {selectedLane.oosThreshold} fresh closes</dd>
-                    </div>
-                    <div>
-                      <dt>Progress</dt>
-                      <dd>
-                        <div className="neural-oos-bar">
-                          <div
-                            className={`neural-oos-fill ${selectedLane.oosFreshValid >= selectedLane.oosThreshold ? 'is-complete' : ''}`}
-                            style={{ width: `${Math.min(100, (selectedLane.oosFreshValid / Math.max(1, selectedLane.oosThreshold)) * 100).toFixed(1)}%` }}
-                          />
-                        </div>
-                        {selectedLane.oosFreshValid >= selectedLane.oosThreshold
-                          ? 'Mature — headline-eligible'
-                          : `${Math.floor((selectedLane.oosFreshValid / Math.max(1, selectedLane.oosThreshold)) * 100)}% — still collecting (direction-agnostic geometry validation)`}
-                      </dd>
-                    </div>
-                  </dl>
+              <div className="neural-inspector-section neural-lane-metrics-panel">
+                <div className="neural-lane-metrics-header">
+                  <div>
+                    <h2>Lane maturity & performance</h2>
+                    <p className="neural-section-note">Same data, split into compact cards so stage, OOS, TP geometry, PnL, and Binance mirror are readable side by side.</p>
+                  </div>
                 </div>
-              )}
-              <div className="neural-inspector-section">
-                <dl>
-                  <div><dt>Evidence status</dt><dd>{selectedLane.status}</dd></div>
-                  <div><dt>UI stage</dt><dd>{selectedLaneMilestone ? stageLabel(selectedLaneMilestone.stage) : 'n/a'}</dd></div>
-                  <div><dt>Next stage</dt><dd>{selectedLaneProgress?.nextStage ?? 'n/a'}</dd></div>
-                  <div><dt>Progress</dt><dd>{selectedLaneProgress ? `${selectedLaneProgress.progressPct}%` : 'n/a'}</dd></div>
-                  <div><dt>Evidence health</dt><dd>{HEALTH_LABELS[selectedLane.evidenceHealth]}</dd></div>
-                  <div><dt>Stats source</dt><dd>{statsSourceLongLabel(selectedLane.statsSource)}</dd></div>
-                  <div><dt>Open / closed</dt><dd>{selectedLane.open} / {selectedLane.closed}</dd></div>
-                  <div><dt>Net Avg R</dt><dd className={(selectedLane.netAvgR ?? 0) >= 0 ? 'tone-healthy' : 'tone-critical'}>{fmtR(selectedLane.netAvgR)}</dd></div>
-                  <div><dt>PF / WR</dt><dd>{fmtNumber(selectedLane.pf)} / {selectedLane.wr === null ? 'n/a' : `${(selectedLane.wr * 100).toFixed(1)}%`}</dd></div>
-                  <div><dt>Payoff / +10bps</dt><dd>{fmtNumber(selectedLane.payoffRatio)} / {selectedLane.plus10bpsStillPositive == null ? 'n/a' : selectedLane.plus10bpsStillPositive ? 'pass' : 'fail'}</dd></div>
-                  <div><dt>OOS thirds / regimes</dt><dd>{selectedLane.allThreeOosPositive == null ? 'n/a' : selectedLane.allThreeOosPositive ? 'all positive' : 'not yet'} / {selectedLane.distinctRegimes ?? 'n/a'}</dd></div>
-                  <div><dt>Drawdown / concentration</dt><dd>{fmtR(selectedLane.approxMaxDrawdownR)} / {pctShare(selectedLane.topSymbolPnlShare)}</dd></div>
-                  <div><dt>Calendar / infra</dt><dd>{selectedLane.calendarDays === null ? 'n/a' : `${selectedLane.calendarDays.toFixed(1)}d`} / {selectedLane.infraReady == null ? 'n/a' : selectedLane.infraReady ? 'ready' : 'not ready'}</dd></div>
-                  <div><dt>Avg entry / mark</dt><dd>{fmtPrice(selectedLane.openAvgEntryPrice)} / {fmtPrice(selectedLane.openAvgMarkPrice)}</dd></div>
-                  <div><dt>Avg TP / gap</dt><dd>{fmtPrice(selectedLane.openAvgTakeProfitPrice)} / {fmtGapPct(selectedLane.openAvgDistanceToTpPct)}</dd></div>
-                  <div><dt>Nearest TP gap</dt><dd>{fmtGapPct(selectedLane.openNearestDistanceToTpPct)} across {selectedLane.openMarkedSymbolCount} symbols</dd></div>
-                  <div><dt>MFE avg / p90</dt><dd>{fmtPlainPct(selectedLane.openAvgMfePct)} / {fmtPlainPct(selectedLane.openP90MfePct)}</dd></div>
-                  <div><dt>TP quality</dt><dd>{tpVerdictLabel(selectedLane.openTpAssessment)} · TP {fmtPlainPct(selectedLane.openAvgConfiguredTpPct)}</dd></div>
-                  <div><dt>Headline PnL (real)</dt><dd className={(() => { const v = selectedLane.headlinePnl + (selectedLane.headlineUnrealizedPnl ?? 0); return v > 0 ? 'tone-healthy' : v < 0 ? 'tone-critical' : 'tone-measure'; })()}>{fmtUsdt(selectedLane.headlinePnl + (selectedLane.headlineUnrealizedPnl ?? 0))} / {fmtR((selectedLane.netAvgR ?? 0) === 0 && selectedLane.closed === 0 ? null : selectedLane.headlineUnrealizedR)}{selectedLane.pnlIsDiagnosticOnly ? ' · flat (no real trades yet)' : ''}</dd></div>
-                  <div><dt>Paper evidence PnL</dt><dd className={selectedLane.pnlIsDiagnosticOnly ? 'tone-measure' : undefined}>{fmtMoney(selectedLane.totalPnl)}{selectedLane.pnlIsDiagnosticOnly ? ' · diagnostic' : ''}</dd></div>
-                  <div><dt>Diagnostic open MTM <small>(measurement)</small></dt><dd className="tone-measure">{fmtUsdt(selectedLane.diagnosticUnrealizedPnl)} / {fmtR(selectedLane.diagnosticUnrealizedR)}</dd></div>
-                  <div><dt>Max favorable open</dt><dd className="tone-measure">{fmtUsdt(selectedLane.openMaxFavorablePnl)} / {fmtR(selectedLane.openMaxFavorableR)}</dd></div>
-                  <div><dt>All open MTM</dt><dd className={selectedLane.pnlIsDiagnosticOnly ? 'tone-measure' : (selectedLane.openUnrealizedPnl ?? 0) >= 0 ? 'tone-healthy' : 'tone-critical'}>{fmtUsdt(selectedLane.openUnrealizedPnl)} / {fmtR(selectedLane.openUnrealizedR)}</dd></div>
-                  <div><dt>Binance mirrored</dt><dd>{selectedLiveLane ? `${selectedLiveLane.sourceOrderCount} orders / ${selectedLiveLane.symbols.length} symbols` : 'not open'}</dd></div>
-                  <div><dt>Binance notional</dt><dd>{selectedLiveLane ? `${selectedLiveLane.notionalUsd.toFixed(2)} USDT` : '0.00 USDT'}</dd></div>
-                  <div><dt>Binance unrealized</dt><dd className={(selectedLiveLane?.unrealizedPnl ?? 0) >= 0 ? 'tone-healthy' : 'tone-critical'}>{selectedLiveLane ? `${selectedLiveLane.unrealizedPnl >= 0 ? '+' : ''}${selectedLiveLane.unrealizedPnl.toFixed(2)} USDT` : '0.00 USDT'}</dd></div>
-                  <div><dt>Account equity</dt><dd>{liveAccount?.accountEquity != null ? `${liveAccount.accountEquity.toFixed(2)} USDT` : 'n/a'}</dd></div>
-                </dl>
+                <div className="neural-lane-card-grid">
+                  <section className="neural-lane-metric-card neural-lane-cohort-card">
+                    <h3>Performance scorecard</h3>
+                    <p className="neural-section-note">LONG/SHORT are direction cohorts; MIXED is the choppy/range regime subset.</p>
+                    <dl>
+                      <div><dt>LONG cohort</dt><dd className={cohortTone(selectedLane.cohorts?.LONG)}>{fmtCohort(selectedLane.cohorts?.LONG)}</dd></div>
+                      <div><dt>SHORT cohort</dt><dd className={cohortTone(selectedLane.cohorts?.SHORT)}>{fmtCohort(selectedLane.cohorts?.SHORT)}</dd></div>
+                      <div><dt>MIXED regime</dt><dd className={cohortTone(selectedLane.cohorts?.MIXED)}>{fmtCohort(selectedLane.cohorts?.MIXED)}</dd></div>
+                    </dl>
+                  </section>
+                  {selectedLaneMetricGroups.map((group) => (
+                    <section className="neural-lane-metric-card" key={group.title}>
+                      <h3>{group.title}</h3>
+                      <dl>
+                        {group.rows.map((row) => (
+                          <div key={`${group.title}-${row.label}`}>
+                            <dt>{row.label}</dt>
+                            <dd className={'tone' in row ? row.tone : undefined}>{row.value}</dd>
+                          </div>
+                        ))}
+                      </dl>
+                    </section>
+                  ))}
+                </div>
               </div>
               <div className="neural-inspector-section">
                 <h2>Why this state</h2>
