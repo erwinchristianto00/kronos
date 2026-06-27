@@ -807,6 +807,7 @@ function laneLabel(id: string): string {
   if (id === "CG_LONG_VARIANT_MATRIX:CG_TIGHT_FAST_05") return "TIGHT FAST 0.5R LONG";
   if (id === "CG_LONG_VARIANT_MATRIX:CG_EXP_LONG_WIDE_FAST_10X") return "EXP 10X LONG WIDE FAST";
   if (id === "CG_LONG_VARIANT_MATRIX:CG_EXP_LONG_TIGHT_FAST_10X") return "EXP 10X LONG TIGHT FAST";
+  if (id === "CG_LONG_VARIANT_MATRIX:CG_EXP_LONG_MFE_GIVEBACK_10X") return "EXP 10X MFE LONG";
   if (id === "CG_VARIANT_MATRIX:CG_EXP_SHORT_MFE_GIVEBACK_10X") return "EXP 10X MFE SHORT";
   if (id === "CG_VARIANT_MATRIX:CG_EXP_SHORT_WIDE_FAST_10X") return "EXP 10X WIDE SHORT";
   if (id === "CG_VARIANT_MATRIX:CG_BE_AFTER_05") return "BE@0.5R SHORT";
@@ -1210,14 +1211,15 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
   };
   const variantLaneIds = new Set(input.variantMatrix.rows.map((row) => variantLaneId(row.variantId)));
   const orderLaneIds = new Set(input.orders.map((order) => order.selectedLaneId).filter(Boolean));
-  const laneIds = Array.from(new Set([...variantLaneIds, ...orderLaneIds]));
+  const quarantinedLaneIds = new Set(input.quarantinedLaneIds ?? []);
+  const laneIds = Array.from(new Set([...variantLaneIds, ...orderLaneIds]))
+    .filter((id) => !quarantinedLaneIds.has(id));
   const rowsById = new Map(input.variantMatrix.rows.map((row) => [variantLaneId(row.variantId), row]));
   const activeLaneIds = new Set([
     ...input.mixed.activeMixedLanes,
     ...(input.paper.currentBatchActiveLane ? [input.paper.currentBatchActiveLane] : []),
     ...(input.paper.activeLane ? [input.paper.activeLane] : []),
   ]);
-  const quarantinedLaneIds = new Set(input.quarantinedLaneIds ?? []);
 
   const paperAndVmLanes = laneIds.map((id): NeuralMapLane => {
     const row = rowsById.get(id);

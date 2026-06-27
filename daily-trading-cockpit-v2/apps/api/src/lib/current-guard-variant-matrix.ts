@@ -86,6 +86,7 @@ export type VariantMatrixVariantId =
   // geometries with smaller TP and 10x paper risk sizing. Paper-only diagnostics.
   | "CG_EXP_LONG_WIDE_FAST_10X"
   | "CG_EXP_LONG_TIGHT_FAST_10X"
+  | "CG_EXP_LONG_MFE_GIVEBACK_10X"
   | "CG_EXP_SHORT_MFE_GIVEBACK_10X"
   | "CG_EXP_SHORT_WIDE_FAST_10X";
 
@@ -147,6 +148,7 @@ export const STOP_OUT_SLIPPAGE_BPS = Number(process.env.STOP_OUT_SLIPPAGE_BPS) |
 // Env-tunable so the arm/giveback can be swept without a rebuild.
 export const MFE_GIVEBACK_ARM_R = Number(process.env.MFE_GIVEBACK_ARM_R) || 0.75;
 export const MFE_GIVEBACK_FRAC = Number(process.env.MFE_GIVEBACK_FRAC) || 0.5;
+export const EXPERIMENTAL_TP_NET_BUFFER_R = Number(process.env.EXPERIMENTAL_TP_NET_BUFFER_R) || 0.02;
 
 // --- Geometry constants ---
 export const WIDE_STOP_MIN_BPS = 300; // Paper-admissible wide/trail variants require >= 300bps stops
@@ -226,7 +228,7 @@ export interface VariantMatrixVariantDefinition {
    * cut at 72h.
    */
   maxHoldHours?: number;
-  /** Dashboard/provenance label only; leverage changes margin, not price path. */
+  /** Paper-only leverage label. Experimental geometry shortens TP while keeping a net-positive cost floor. */
   experimentalLeverage?: number;
   /** Paper-only risk multiplier used by the paper book to model larger size. */
   paperRiskMultiplier?: number;
@@ -529,6 +531,23 @@ export const VARIANT_MATRIX_DEFINITIONS: readonly VariantMatrixVariantDefinition
     description:
       "High-risk paper-only duplicate of CG_TIGHT_FAST_05 for LONG: native/tight stop, TP reduced to " +
       "0.25R, 10x paper risk sizing, 24h max hold. Tests fast scalp capture without touching live execution.",
+  },
+  {
+    id: "CG_EXP_LONG_MFE_GIVEBACK_10X",
+    label: "EXP LONG 10x: MFE giveback, 1R cap",
+    exitRule: "mfe_giveback",
+    fillMode: "taker",
+    costModel: "taker",
+    stopFloorBps: 300,
+    tpRewardMultiple: 1,
+    maxHoldHours: 24,
+    longOnly: true,
+    experimentalLeverage: 10,
+    paperRiskMultiplier: 10,
+    experimentalOnly: true,
+    description:
+      "High-risk paper-only duplicate of MFE-GIVEBACK LONG: wide stop, TP reduced from 3R to 1R, " +
+      "global MFE-giveback exit still banks retraces, 10x paper risk sizing, 24h max hold.",
   },
   {
     id: "CG_EXP_SHORT_MFE_GIVEBACK_10X",
@@ -907,6 +926,43 @@ function computeVariantCostR(roundTripBps: number, stopDistanceBps: number): num
   return roundTripBps / stopDistanceBps;
 }
 
+function variantRoundTripBps(def: VariantMatrixVariantDefinition): number {
+  return def.costModel === "maker_limit" ? MAKER_ROUNDTRIP_BPS : TAKER_ROUNDTRIP_BPS;
+}
+
+function experimentalLeverageDivisor(def: VariantMatrixVariantDefinition): number {
+  const leverage = def.experimentalOnly ? def.experimentalLeverage : null;
+  return typeof leverage === "number" && Number.isFinite(leverage) && leverage > 1 ? leverage : 1;
+}
+
+export function effectiveMfeGivebackArmR(
+  def: VariantMatrixVariantDefinition,
+  stopDistanceBps: number,
+): number {
+  if (def.exitRule !== "mfe_giveback") return MFE_GIVEBACK_ARM_R;
+  const divisor = experimentalLeverageDivisor(def);
+  if (divisor <= 1) return MFE_GIVEBACK_ARM_R;
+  const stopExitCostR = computeVariantCostR(variantRoundTripBps(def) + STOP_OUT_SLIPPAGE_BPS, stopDistanceBps);
+  const minNetPositiveArmR = (stopExitCostR + EXPERIMENTAL_TP_NET_BUFFER_R) / Math.max(1 - MFE_GIVEBACK_FRAC, 0.01);
+  return Math.max(MFE_GIVEBACK_ARM_R / divisor, minNetPositiveArmR);
+}
+
+export function effectiveVariantTpRewardMultiple(
+  def: VariantMatrixVariantDefinition,
+  stopDistanceBps: number,
+): number {
+  const base = def.tpRewardMultiple ?? 1.0;
+  const divisor = experimentalLeverageDivisor(def);
+  if (divisor <= 1) return base;
+  const leveragedTarget = base / divisor;
+  const tpCostFloorR = computeVariantCostR(variantRoundTripBps(def), stopDistanceBps) + EXPERIMENTAL_TP_NET_BUFFER_R;
+  if (def.exitRule !== "mfe_giveback") return Math.max(leveragedTarget, tpCostFloorR);
+  // MFE giveback exits fire on a retrace and pay stop-like slippage. Keep the TP cap above
+  // the arm level so the giveback path still has room to work after leverage compression.
+  const minMfeCapR = effectiveMfeGivebackArmR(def, stopDistanceBps) * 1.5;
+  return Math.max(leveragedTarget, tpCostFloorR, minMfeCapR);
+}
+
 export function deriveVariantGeometry(
   signal: VariantMatrixSignal,
   def: VariantMatrixVariantDefinition,
@@ -921,7 +977,7 @@ export function deriveVariantGeometry(
   if (!(baselineRisk > 0)) return { kind: "failed" };
   const baselineStopBps = (baselineRisk / E) * 10000;
 
-  const roundTripBps = def.costModel === "maker_limit" ? MAKER_ROUNDTRIP_BPS : TAKER_ROUNDTRIP_BPS;
+  const roundTripBps = variantRoundTripBps(def);
 
   if (def.id === "CG_NO_FIB500_ENTRYSET" && signal.entryVariant === "fib_500_entry") {
     return { kind: "rejected" };
@@ -946,8 +1002,8 @@ export function deriveVariantGeometry(
     // the 300bps floor and a 1.0R target; LG_* lanes parameterize both knobs. Never widen the
     // stop without widening the paired target.
     const stopFloorBps = def.stopFloorBps ?? WIDE_STOP_MIN_BPS;
-    const tpRewardMultiple = def.tpRewardMultiple ?? 1.0;
     const targetStopBps = Math.max(baselineStopBps, stopFloorBps);
+    const tpRewardMultiple = effectiveVariantTpRewardMultiple(def, targetStopBps);
     const widenedStop = dir === "LONG" ? E * (1 - targetStopBps / 10000) : E * (1 + targetStopBps / 10000);
     const widenedRisk = dir === "LONG" ? E - widenedStop : widenedStop - E;
     if (!(widenedRisk > 0)) return { kind: "failed" };
@@ -1128,6 +1184,8 @@ export interface VariantWalkInput {
   openedAtMs: number;
   candles: KlineTuple[];
   makerFillWindowCandles?: number;
+  mfeGivebackArmR?: number;
+  mfeGivebackFrac?: number;
 }
 
 export interface VariantWalkResult {
@@ -1158,6 +1216,8 @@ export async function walkVariantPath(
   resolve1m?: (fillCandleOpenMs: number) => Promise<"SL" | "TP" | null>,
 ): Promise<VariantWalkResult> {
   const { direction: dir, entryPrice: E, stopLoss: S, target: T, exitRule, fillMode } = input;
+  const mfeGivebackArmR = input.mfeGivebackArmR ?? MFE_GIVEBACK_ARM_R;
+  const mfeGivebackFrac = input.mfeGivebackFrac ?? MFE_GIVEBACK_FRAC;
   const risk = dir === "LONG" ? E - S : S - E;
   const empty: VariantWalkResult = {
     status: "UNRESOLVED",
@@ -1309,8 +1369,8 @@ export async function walkVariantPath(
       if (tpHit) return finalize("CLOSED_WIN", fullRewardR, cCloseTime, "CANDLE_WALK_TP", "VALID_5M_ORDERED", true);
       // Giveback trail: once the PRIOR peak (excludes this candle) has armed, exit when this
       // candle retraces to peak*(1-frac) of the favorable move.
-      if (peakBefore >= MFE_GIVEBACK_ARM_R) {
-        const exitR = peakBefore * (1 - MFE_GIVEBACK_FRAC);
+      if (peakBefore >= mfeGivebackArmR) {
+        const exitR = peakBefore * (1 - mfeGivebackFrac);
         const givebackLevel = dir === "LONG" ? E + risk * exitR : E - risk * exitR;
         const retraced = dir === "LONG" ? low <= givebackLevel : high >= givebackLevel;
         if (retraced) {
@@ -1499,6 +1559,7 @@ export async function resolveVariantMatrixObservations(
           }
         };
 
+        const variantDef = VARIANT_MATRIX_DEFINITIONS.find((def) => def.id === obs.variantId);
         const walk = await walkVariantPath(
           {
             direction: obs.direction,
@@ -1509,6 +1570,9 @@ export async function resolveVariantMatrixObservations(
             fillMode: obs.fillMode,
             openedAtMs,
             candles,
+            ...(variantDef
+              ? { mfeGivebackArmR: effectiveMfeGivebackArmR(variantDef, obs.stopDistanceBps || WIDE_STOP_MIN_BPS) }
+              : {}),
           },
           resolve1m,
         );

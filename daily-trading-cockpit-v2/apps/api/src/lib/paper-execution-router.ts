@@ -38,7 +38,12 @@ import type {
   VariantExitRule,
   VariantFillMode,
 } from "./current-guard-variant-matrix.js";
-import { walkVariantPath, MAKER_FILL_WINDOW_CANDLES, VARIANT_MATRIX_DEFINITIONS } from "./current-guard-variant-matrix.js";
+import {
+  effectiveMfeGivebackArmR,
+  walkVariantPath,
+  MAKER_FILL_WINDOW_CANDLES,
+  VARIANT_MATRIX_DEFINITIONS,
+} from "./current-guard-variant-matrix.js";
 import type { AdaptiveLaneRouterReport } from "./adaptive-lane-router.js";
 import type { LiveTradingGateReport } from "./live-trading-gate.js";
 import { recordHeatShadowSnapshot } from "./portfolio-heat-shadow.js";
@@ -1455,15 +1460,18 @@ function _rewardR(direction: "LONG" | "SHORT", entry: number, tp: number, risk: 
  * fetch-failure expiry backstop can fire.
  */
 function maxHoldMsForOrder(order: PaperOrder): number {
-  const laneId = order.selectedLaneId;
-  if (typeof laneId === "string" && laneId.includes(":")) {
-    const suffix = laneId.slice(laneId.indexOf(":") + 1);
-    const def = VARIANT_MATRIX_DEFINITIONS.find((d) => d.id === suffix);
-    if (def?.maxHoldHours != null && def.maxHoldHours > 0) {
-      return Math.min(def.maxHoldHours * 60 * 60 * 1000, PAPER_ORDER_EXPIRY_MS - CANDLE_MS);
-    }
+  const def = variantDefinitionForOrder(order);
+  if (def?.maxHoldHours != null && def.maxHoldHours > 0) {
+    return Math.min(def.maxHoldHours * 60 * 60 * 1000, PAPER_ORDER_EXPIRY_MS - CANDLE_MS);
   }
   return PAPER_MAX_HOLD_MS;
+}
+
+function variantDefinitionForOrder(order: PaperOrder) {
+  const laneId = order.selectedLaneId;
+  if (typeof laneId !== "string" || !laneId.includes(":")) return null;
+  const suffix = laneId.slice(laneId.indexOf(":") + 1);
+  return VARIANT_MATRIX_DEFINITIONS.find((d) => d.id === suffix) ?? null;
 }
 
 function paperOrderOpenedAtMs(order: PaperOrder, fallbackMs: number): number {
@@ -1516,12 +1524,8 @@ async function findOrdersAtExitNow(
 
 function effectiveExitRuleForOrder(order: PaperOrder): VariantExitRule {
   if (order.variantExitRule) return order.variantExitRule;
-  const laneId = order.selectedLaneId;
-  if (typeof laneId === "string" && laneId.includes(":")) {
-    const suffix = laneId.slice(laneId.indexOf(":") + 1);
-    const def = VARIANT_MATRIX_DEFINITIONS.find((d) => d.id === suffix);
-    if (def) return def.exitRule;
-  }
+  const def = variantDefinitionForOrder(order);
+  if (def) return def.exitRule;
   return "tp1_full";
 }
 
@@ -1736,6 +1740,7 @@ export async function resolvePaperOrders(
       const Tf = _exitFill(dir, T, executionModel.tpSlippageBps);
       const exitRule = effectiveExitRuleForOrder(order);
       const fillMode: VariantFillMode = order.fillMode ?? "taker";
+      const variantDef = variantDefinitionForOrder(order);
 
       // Scaleout, mfe_giveback, and maker_limit are resolved by the canonical VM-sim engine
       // (walkVariantPath) so the paper book uses the SAME honest intrabar reconstruction as the
@@ -1747,7 +1752,18 @@ export async function resolvePaperOrders(
       // costR is applied on top exactly as the inline paths do. No fabricated profit.
       if (exitRule === "scaleout_tp1_trail" || exitRule === "mfe_giveback" || fillMode === "maker_limit") {
         const walk = await walkVariantPath(
-          { direction: dir, entryPrice: E, stopLoss: S, target: T, exitRule, fillMode, openedAtMs, candles, makerFillWindowCandles: MAKER_FILL_WINDOW_CANDLES },
+          {
+            direction: dir,
+            entryPrice: E,
+            stopLoss: S,
+            target: T,
+            exitRule,
+            fillMode,
+            openedAtMs,
+            candles,
+            makerFillWindowCandles: MAKER_FILL_WINDOW_CANDLES,
+            ...(variantDef ? { mfeGivebackArmR: effectiveMfeGivebackArmR(variantDef, order.plannedStopDistanceBps) } : {}),
+          },
           (fillCandleOpenMs) => _resolve1mForPaper(binanceClient, order.symbol, fillCandleOpenMs, dir, E, S, T),
         );
         if (walk.status === "NO_FILL") {

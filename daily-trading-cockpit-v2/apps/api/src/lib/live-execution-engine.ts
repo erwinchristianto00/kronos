@@ -696,14 +696,25 @@ export class LiveExecutionEngine {
       notionalUsd: number;
       unrealizedPnl: number;
     }>;
+    closedLanes: Array<{
+      laneId: string;
+      closedCount: number;
+      wins: number;
+      losses: number;
+      realizedPnlUsd: number;
+      feesUsd: number;
+      symbols: string[];
+      lastClosedAt: string | null;
+    }>;
   }> {
     const [balance, rawPositions, openOrders] = await Promise.all([
       this.getUsdtBalance(),
       this.client.getPositions(),
       this.client.getOpenOrders(),
     ]);
+    const liveState = this.store.getState();
     const positions = rawPositions.filter((position) => Math.abs(position.positionAmt) > 1e-12);
-    const openIntents = this.store.getState().intents.filter((intent) => OPEN_INTENT_STATES.has(intent.state));
+    const openIntents = liveState.intents.filter((intent) => OPEN_INTENT_STATES.has(intent.state));
     const activeSymbols = Array.from(new Set(openIntents.map((intent) => intent.symbol)));
     const openAlgoOrders = (
       await Promise.all(activeSymbols.map((symbol) => this.client.getOpenAlgoOrders(symbol)))
@@ -764,6 +775,46 @@ export class LiveExecutionEngine {
       };
     });
     const unrealizedPnl = positions.reduce((sum, position) => sum + position.unRealizedProfit, 0);
+    const closedLaneMap = new Map<string, {
+      closedCount: number;
+      wins: number;
+      losses: number;
+      realizedPnlUsd: number;
+      feesUsd: number;
+      symbols: Set<string>;
+      lastClosedAt: string | null;
+    }>();
+    for (const intent of liveState.intents) {
+      if (intent.realizedPnlUsd === null) continue;
+      const sources = this.intentSources(intent);
+      const totalQty = sources.reduce((sum, source) => sum + source.qty, 0);
+      const realized = intent.realizedPnlUsd;
+      const fees = intent.feesUsd ?? 0;
+      const closedAt = intent.closedAt ?? intent.updatedAt;
+      for (const source of sources) {
+        const share = totalQty > 0 ? source.qty / totalQty : 1 / Math.max(sources.length, 1);
+        const allocatedRealized = realized * share;
+        const row = closedLaneMap.get(source.laneId) ?? {
+          closedCount: 0,
+          wins: 0,
+          losses: 0,
+          realizedPnlUsd: 0,
+          feesUsd: 0,
+          symbols: new Set<string>(),
+          lastClosedAt: null,
+        };
+        row.closedCount += 1;
+        if (allocatedRealized > 0) row.wins += 1;
+        if (allocatedRealized < 0) row.losses += 1;
+        row.realizedPnlUsd += allocatedRealized;
+        row.feesUsd += fees * share;
+        row.symbols.add(intent.symbol);
+        if (closedAt && (!row.lastClosedAt || closedAt > row.lastClosedAt)) {
+          row.lastClosedAt = closedAt;
+        }
+        closedLaneMap.set(source.laneId, row);
+      }
+    }
 
     return {
       walletBalance: balance?.walletBalance ?? null,
@@ -780,6 +831,16 @@ export class LiveExecutionEngine {
         notionalUsd: row.notionalUsd,
         unrealizedPnl: row.unrealizedPnl,
       })).sort((left, right) => left.laneId.localeCompare(right.laneId)),
+      closedLanes: Array.from(closedLaneMap, ([laneId, row]) => ({
+        laneId,
+        closedCount: row.closedCount,
+        wins: row.wins,
+        losses: row.losses,
+        realizedPnlUsd: row.realizedPnlUsd,
+        feesUsd: row.feesUsd,
+        symbols: Array.from(row.symbols).sort(),
+        lastClosedAt: row.lastClosedAt,
+      })).sort((left, right) => right.realizedPnlUsd - left.realizedPnlUsd),
     };
   }
 

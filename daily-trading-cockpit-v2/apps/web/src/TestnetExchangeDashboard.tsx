@@ -78,6 +78,16 @@ interface LiveAccount {
     notionalUsd: number;
     unrealizedPnl: number;
   }>;
+  closedLanes?: Array<{
+    laneId: string;
+    closedCount: number;
+    wins: number;
+    losses: number;
+    realizedPnlUsd: number;
+    feesUsd: number;
+    symbols: string[];
+    lastClosedAt: string | null;
+  }>;
 }
 
 function signed(value: number | null | undefined, suffix = 'USDT'): string {
@@ -165,6 +175,7 @@ export default function TestnetExchangeDashboard() {
 
   const stale = lastLoadedAt ? Date.now() - new Date(lastLoadedAt).getTime() > REFRESH_MS * 2.5 : true;
   const healthTone = status?.armed ? 'tone-healthy' : status?.health?.lastTickError ? 'tone-warning' : 'tone-measure';
+  const totalSourceEntries = account?.positions.reduce((sum, position) => sum + position.sourceOrderCount, 0) ?? 0;
 
   return (
     <div className="neural-shell testnet-shell">
@@ -210,7 +221,7 @@ export default function TestnetExchangeDashboard() {
         <div>
           <span>Unrealized P&amp;L</span>
           <strong className={tone(account?.unrealizedPnl)}>{signed(account?.unrealizedPnl)}</strong>
-          <small>{account ? `${account.openPositionCount} exchange positions` : 'loading positions'}</small>
+          <small>{account ? `${account.openPositionCount} positions · ${totalSourceEntries} source entries` : 'loading positions'}</small>
         </div>
         <div>
           <span>Realized P&amp;L</span>
@@ -218,9 +229,9 @@ export default function TestnetExchangeDashboard() {
           <small>today {signed(status?.closedToday?.realizedPnlUsd)}</small>
         </div>
         <div>
-          <span>Open exits</span>
+          <span>Open TP/SL orders</span>
           <strong>{account?.openOrderCount ?? 'n/a'}</strong>
-          <small>{status?.openIntents?.length ?? 0} mirrored intents</small>
+          <small>{status?.openIntents?.length ?? 0} live intents · exits can be 2x positions</small>
         </div>
       </section>
 
@@ -236,7 +247,7 @@ export default function TestnetExchangeDashboard() {
           <div>
             <span>Scope</span>
             <strong>Exchange-only testnet view</strong>
-            <p>This page reads only `{TESTNET_API_PREFIX}/live/status` and `{TESTNET_API_PREFIX}/live/account`. Paper evidence, diagnostics, fade-long, H6 trend, and promotion telemetry are intentionally hidden here.</p>
+            <p>This page reads only `{TESTNET_API_PREFIX}/live/status` and `{TESTNET_API_PREFIX}/live/account`. Binance positions are netted per symbol, so one exchange position can contain multiple source entries from mirrored paper orders.</p>
           </div>
           <div className="testnet-kpis">
             <div><span>Wallet</span><strong>{plain(account?.walletBalance, ' USDT')}</strong></div>
@@ -263,15 +274,15 @@ export default function TestnetExchangeDashboard() {
         )}
 
         <section className="testnet-panel">
-          <header><span>Exchange Positions</span><strong>{account?.positions.length ?? 0}</strong></header>
+          <header><span>Exchange Positions</span><strong>{account ? `${account.positions.length} pos · ${totalSourceEntries} entries` : '0'}</strong></header>
           <div className="testnet-table-wrap">
             <table>
               <thead>
-                <tr><th>Symbol</th><th>Side</th><th>Qty</th><th>Entry</th><th>Mark</th><th>TP target</th><th>TP gap</th><th>Liq / margin call</th><th>Unrealized</th><th>After fee+slip</th><th>Lev</th><th>Mirrored lane</th></tr>
+                <tr><th>Symbol</th><th>Side</th><th>Qty</th><th>Entry</th><th>Mark</th><th>TP target</th><th>TP gap</th><th>Liq / margin call</th><th>Unrealized</th><th>After fee+slip</th><th>Lev</th><th>Source entries</th><th>Mirrored lane</th></tr>
               </thead>
               <tbody>
                 {(account?.positions ?? []).length === 0 ? (
-                  <tr><td colSpan={12}>No open Binance testnet positions.</td></tr>
+                  <tr><td colSpan={13}>No open Binance testnet positions.</td></tr>
                 ) : account!.positions.map((position) => (
                   <tr key={position.symbol}>
                     <td>{position.symbol}</td>
@@ -287,6 +298,7 @@ export default function TestnetExchangeDashboard() {
                       {signed(position.unrealizedAfterEstimatedCloseCostUsd)}
                     </td>
                     <td>{position.leverage}x</td>
+                    <td>{position.sourceOrderCount}</td>
                     <td>{position.laneIds.length > 0 ? position.laneIds.map(compactLane).join(', ') : 'unattributed'}</td>
                   </tr>
                 ))}
@@ -300,7 +312,7 @@ export default function TestnetExchangeDashboard() {
           <div className="testnet-table-wrap">
             <table>
               <thead>
-                <tr><th>Lane</th><th>Orders</th><th>Symbols</th><th>Notional</th><th>Unrealized</th></tr>
+                <tr><th>Lane</th><th>Source entries</th><th>Symbols</th><th>Notional</th><th>Unrealized</th></tr>
               </thead>
               <tbody>
                 {(account?.lanes ?? []).length === 0 ? (
@@ -344,16 +356,29 @@ export default function TestnetExchangeDashboard() {
         </section>
 
         <section className="testnet-panel">
-          <header><span>Engine Notes</span><strong>{status?.health?.errorStreak ?? 0} errors</strong></header>
-          {(status?.reconcileIssues ?? []).length === 0 && !status?.reason && (status?.configErrors ?? []).length === 0 ? (
-            <p className="testnet-empty">No live mirror warnings visible.</p>
-          ) : (
-            <ul className="testnet-note-list">
-              {status?.reason ? <li>{status.reason}</li> : null}
-              {(status?.configErrors ?? []).map((item) => <li key={item}>{item}</li>)}
-              {(status?.reconcileIssues ?? []).slice(-6).map((item) => <li key={item}>{item}</li>)}
-            </ul>
-          )}
+          <header><span>Closed Lane Performance</span><strong>{(account?.closedLanes ?? []).length}</strong></header>
+          <div className="testnet-table-wrap">
+            <table>
+              <thead>
+                <tr><th>Lane</th><th>Closed</th><th>W / L</th><th>Realized</th><th>Fees</th><th>Symbols</th><th>Last close</th></tr>
+              </thead>
+              <tbody>
+                {(account?.closedLanes ?? []).length === 0 ? (
+                  <tr><td colSpan={7}>No closed Binance mirror trades yet.</td></tr>
+                ) : (account?.closedLanes ?? []).map((lane) => (
+                  <tr key={lane.laneId}>
+                    <td>{compactLane(lane.laneId)}</td>
+                    <td>{lane.closedCount}</td>
+                    <td>{lane.wins} / {lane.losses}</td>
+                    <td className={tone(lane.realizedPnlUsd)}>{signed(lane.realizedPnlUsd)}</td>
+                    <td>{plain(lane.feesUsd, ' USDT')}</td>
+                    <td>{lane.symbols.join(', ')}</td>
+                    <td>{timeAgo(lane.lastClosedAt)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         </section>
       </main>
     </div>

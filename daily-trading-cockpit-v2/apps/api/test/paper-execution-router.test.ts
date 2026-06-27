@@ -1236,6 +1236,128 @@ describe("paper-execution-router", () => {
     expect(order.closeReason).toContain("TRAIL_BREAKEVEN");
   });
 
+  it("[24a-exp] every EXP 10x lane can close through its configured resolver path", async () => {
+    const dir = tmpDir();
+    const store = new PaperExecutionRouterStore(dir);
+    store.ensurePaperStartAt(new Date(Date.now() - 60_000).toISOString());
+
+    const openedAtMs = Date.now() - 30 * 60_000;
+    const openedAt = new Date(openedAtMs).toISOString();
+    const mk = (overrides: Partial<PaperOrder>) =>
+      makePaperOrder({
+        openedAt,
+        createdAt: openedAt,
+        updatedAt: openedAt,
+        paperOrderMode: "DIAGNOSTIC_ONLY",
+        plannedStopDistanceBps: 300,
+        experimentalLeverage: 10,
+        paperRiskMultiplier: 10,
+        ...overrides,
+      });
+
+    const orders: PaperOrder[] = [
+      mk({
+        paperOrderId: "exp-long-wide-fast",
+        dedupeKey: "exp-long-wide-fast",
+        sourceObservationId: "exp-long-wide-fast",
+        symbol: "EWFLONG",
+        direction: "LONG",
+        selectedLaneId: "CG_LONG_VARIANT_MATRIX:CG_EXP_LONG_WIDE_FAST_10X",
+        variantExitRule: "tp1_full",
+        entryPrice: 100,
+        stopLoss: 97,
+        takeProfitLevels: [100.75],
+      }),
+      mk({
+        paperOrderId: "exp-long-tight-fast",
+        dedupeKey: "exp-long-tight-fast",
+        sourceObservationId: "exp-long-tight-fast",
+        symbol: "ETLONG",
+        direction: "LONG",
+        selectedLaneId: "CG_LONG_VARIANT_MATRIX:CG_EXP_LONG_TIGHT_FAST_10X",
+        variantExitRule: "tp1_full",
+        entryPrice: 100,
+        stopLoss: 98,
+        plannedStopDistanceBps: 200,
+        takeProfitLevels: [100.5],
+      }),
+      mk({
+        paperOrderId: "exp-long-mfe",
+        dedupeKey: "exp-long-mfe",
+        sourceObservationId: "exp-long-mfe",
+        symbol: "EMFELONG",
+        direction: "LONG",
+        selectedLaneId: "CG_LONG_VARIANT_MATRIX:CG_EXP_LONG_MFE_GIVEBACK_10X",
+        variantExitRule: "mfe_giveback",
+        entryPrice: 100,
+        stopLoss: 97,
+        takeProfitLevels: [103],
+      }),
+      mk({
+        paperOrderId: "exp-short-mfe",
+        dedupeKey: "exp-short-mfe",
+        sourceObservationId: "exp-short-mfe",
+        symbol: "EMFESHORT",
+        direction: "SHORT",
+        selectedLaneId: "CG_VARIANT_MATRIX:CG_EXP_SHORT_MFE_GIVEBACK_10X",
+        variantExitRule: "mfe_giveback",
+        entryPrice: 100,
+        stopLoss: 103,
+        takeProfitLevels: [97],
+      }),
+      mk({
+        paperOrderId: "exp-short-wide-fast",
+        dedupeKey: "exp-short-wide-fast",
+        sourceObservationId: "exp-short-wide-fast",
+        symbol: "EWSHORT",
+        direction: "SHORT",
+        selectedLaneId: "CG_VARIANT_MATRIX:CG_EXP_SHORT_WIDE_FAST_10X",
+        variantExitRule: "tp1_full",
+        entryPrice: 100,
+        stopLoss: 103,
+        takeProfitLevels: [99.25],
+      }),
+    ];
+    orders.forEach((order) => store.add(order));
+
+    const paths: Record<string, PaperKlineTuple[]> = {
+      EWFLONG: [
+        [openedAtMs, "0", "100.8", "99.8", "100.75", "0", openedAtMs + 300_000] as PaperKlineTuple,
+      ],
+      ETLONG: [
+        [openedAtMs, "0", "100.6", "99.8", "100.5", "0", openedAtMs + 300_000] as PaperKlineTuple,
+      ],
+      EMFELONG: [
+        [openedAtMs, "0", "102.4", "100.5", "102", "0", openedAtMs + 300_000] as PaperKlineTuple,
+        [openedAtMs + 300_000, "0", "102", "101.1", "101.2", "0", openedAtMs + 600_000] as PaperKlineTuple,
+      ],
+      EMFESHORT: [
+        [openedAtMs, "0", "99.5", "97.6", "98", "0", openedAtMs + 300_000] as PaperKlineTuple,
+        [openedAtMs + 300_000, "0", "98.8", "98", "98.5", "0", openedAtMs + 600_000] as PaperKlineTuple,
+      ],
+      EWSHORT: [
+        [openedAtMs, "0", "100.2", "99.2", "99.25", "0", openedAtMs + 300_000] as PaperKlineTuple,
+      ],
+    };
+    const mockBinance: PaperResolverClient = {
+      getKlines: async (symbol, interval) => {
+        if (interval === "1m") return [];
+        return paths[symbol] ?? [];
+      },
+    };
+
+    const result = await resolvePaperOrders(store, mockBinance);
+    expect(result.resolved).toBe(5);
+    for (const order of store.all) {
+      expect(order.paperStatus).toBe("PAPER_CLOSED_WIN");
+      expect(order.netR).toBeGreaterThan(0);
+      expect(order.experimentalLeverage).toBe(10);
+      expect(order.paperRiskMultiplier).toBe(10);
+    }
+    expect(store.all.find((o) => o.paperOrderId === "exp-long-mfe")!.closeReason).toBe("MFE_GIVEBACK_EXIT");
+    expect(store.all.find((o) => o.paperOrderId === "exp-short-mfe")!.closeReason).toBe("MFE_GIVEBACK_EXIT");
+  });
+
   // [24b] maker_limit that never pulls back to entry resolves PAPER_NO_FILL (not a taker fill).
   it("[24b] maker_limit with no pullback to entry resolves PAPER_NO_FILL", async () => {
     const dir = tmpDir();

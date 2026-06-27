@@ -400,6 +400,46 @@ describe("paper-opportunity-allocator", () => {
     expect(report.byLane.length).toBe(14);
   });
 
+  it("[EXP10X-open] admits every EXP diagnostic lane for compatible directions", async () => {
+    const dir = tmpDir();
+    const vmReport = await buildWinningVmReport(dir);
+    const longReport = buildPaperOpportunityAllocatorReport(
+      baseInputs({
+        vmReport,
+        marketRegime: "Bullish expansion",
+        routerReport: routerOf("Bullish expansion"),
+        candidates: [makeCandidate({ direction: "LONG", stopLoss: 98, tp1: 103 })],
+        paperVariantMatrixDiagnosticEnabled: true,
+        paperVariantMatrixDiagnosticMaxPerScan: 99,
+      }),
+    );
+    const shortReport = buildPaperOpportunityAllocatorReport(
+      baseInputs({
+        vmReport,
+        candidates: [makeCandidate({ direction: "SHORT", stopLoss: 103, tp1: 96 })],
+        paperVariantMatrixDiagnosticEnabled: true,
+        paperVariantMatrixDiagnosticMaxPerScan: 99,
+      }),
+    );
+
+    const longLaneIds = new Set(longReport.selectedOpportunities.map((o) => o.laneId));
+    expect(longLaneIds.has("CG_LONG_VARIANT_MATRIX:CG_EXP_LONG_WIDE_FAST_10X")).toBe(true);
+    expect(longLaneIds.has("CG_LONG_VARIANT_MATRIX:CG_EXP_LONG_TIGHT_FAST_10X")).toBe(true);
+    expect(longLaneIds.has("CG_LONG_VARIANT_MATRIX:CG_EXP_LONG_MFE_GIVEBACK_10X")).toBe(true);
+
+    const shortLaneIds = new Set(shortReport.selectedOpportunities.map((o) => o.laneId));
+    expect(shortLaneIds.has("CG_VARIANT_MATRIX:CG_EXP_SHORT_MFE_GIVEBACK_10X")).toBe(true);
+    expect(shortLaneIds.has("CG_VARIANT_MATRIX:CG_EXP_SHORT_WIDE_FAST_10X")).toBe(true);
+
+    for (const opportunity of [...longReport.selectedOpportunities, ...shortReport.selectedOpportunities].filter((o) =>
+      o.variantId.includes("CG_EXP_")
+    )) {
+      expect(opportunity.paperOrderMode).toBe("DIAGNOSTIC_ONLY");
+      expect(opportunity.experimentalLeverage).toBe(10);
+      expect(opportunity.paperRiskMultiplier).toBe(10);
+    }
+  });
+
   it("[DCAP] caps the open diagnostic book per-symbol (suppress concentration)", async () => {
     const dir = tmpDir();
     const vmReport = await buildWinningVmReport(dir);
