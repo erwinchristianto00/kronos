@@ -1,5 +1,5 @@
 import { describe, expect, it, beforeEach } from "vitest";
-import { existsSync, readFileSync, rmSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, rmSync } from "node:fs";
 import { resolve } from "node:path";
 import os from "node:os";
 
@@ -153,6 +153,23 @@ describe("regime direction controller snapshot store (REPORT-ONLY)", () => {
     const parsed1 = JSON.parse(lines[1]);
     expect(parsed1.source).toBe("SCAN_CYCLE");
     expect(parsed1.controllerMode).toBe("NO_TRADE_CHOP");
+
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("readLatest returns the newest valid snapshot and skips corrupt trailing lines", () => {
+    const dir = tmpDir();
+    const store = new RegimeDirectionControllerSnapshotStore(dir);
+    const snapA = buildScanCycleSnapshot("Bullish expansion", "2026-01-01T00:00:00.000Z");
+    const snapB = buildScanCycleSnapshot("Bearish expansion", "2026-01-01T00:07:00.000Z");
+
+    store.append(snapA);
+    store.append(snapB);
+    appendFileSync(resolve(dir, "regime-direction-controller-snapshots.jsonl"), "{bad-json\n", "utf-8");
+
+    const latest = store.readLatest();
+    expect(latest?.currentRegime).toBe("Bearish expansion");
+    expect(latest?.controllerMode).toBe("SHORT_ONLY");
 
     rmSync(dir, { recursive: true, force: true });
   });

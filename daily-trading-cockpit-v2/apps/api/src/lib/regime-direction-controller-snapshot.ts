@@ -12,7 +12,7 @@
  *  - The store is append-only: no record is ever mutated or deleted.
  */
 
-import { appendFileSync, mkdirSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 
 import {
@@ -80,6 +80,40 @@ export class RegimeDirectionControllerSnapshotStore {
     } catch {
       // report-only store; write failures must not surface to callers
     }
+  }
+
+  /**
+   * Best-effort read of the latest valid snapshot. Used only as a startup-safe
+   * telemetry fallback before the in-memory scan cache has been repopulated.
+   */
+  readLatest(): RegimeDirectionControllerSnapshot | null {
+    try {
+      const lines = readFileSync(this.file, "utf-8")
+        .split("\n")
+        .map((line) => line.trim())
+        .filter(Boolean);
+      for (let i = lines.length - 1; i >= 0; i -= 1) {
+        try {
+          const parsed = JSON.parse(lines[i]) as Partial<RegimeDirectionControllerSnapshot>;
+          if (
+            parsed &&
+            typeof parsed === "object" &&
+            typeof parsed.capturedAt === "string" &&
+            typeof parsed.controllerMode === "string" &&
+            typeof parsed.directionalBias === "string" &&
+            typeof parsed.confidence === "string" &&
+            Array.isArray(parsed.reasonCodes)
+          ) {
+            return parsed as RegimeDirectionControllerSnapshot;
+          }
+        } catch {
+          // Ignore corrupt trailing lines and keep walking backward.
+        }
+      }
+    } catch {
+      // Missing/unreadable snapshot file is expected on fresh installs.
+    }
+    return null;
   }
 }
 

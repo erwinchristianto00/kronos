@@ -1548,7 +1548,7 @@ i.health-diagnostic {
 
 .testnet-table-wrap table {
   width: 100%;
-  min-width: 960px;
+  min-width: 1120px;
   border-collapse: collapse;
   font-size: 11px;
 }

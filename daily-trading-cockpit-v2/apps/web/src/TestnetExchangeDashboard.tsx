@@ -17,6 +17,14 @@ interface LiveStatus {
     lastTickAt: string | null;
     lastTickError: string | null;
   };
+  controller?: {
+    regime: string | null;
+    mode: string | null;
+    bias?: string | null;
+    confidence?: string | null;
+    reasons?: string[];
+    capturedAt?: string | null;
+  } | null;
   reconcileIssues?: string[];
   watermark?: string;
   quarantinedPaperOrders?: number;
@@ -57,6 +65,8 @@ interface LiveAccount {
     targetTpGapPct: number | null;
     liquidationPrice: number | null;
     unrealizedPnl: number;
+    estimatedCloseCostUsd?: number;
+    unrealizedAfterEstimatedCloseCostUsd?: number;
     leverage: number;
     sourceOrderCount: number;
     laneIds: string[];
@@ -188,6 +198,11 @@ export default function TestnetExchangeDashboard() {
           <small>{status?.env ?? 'loading'} · {status?.enabled === false ? 'disabled' : 'live engine'}</small>
         </div>
         <div>
+          <span>Regime</span>
+          <strong>{status?.controller?.regime ?? 'Loading'}</strong>
+          <small>{status?.controller?.mode ?? 'mode n/a'} · {status?.controller?.bias ?? 'bias n/a'} · {status?.controller?.confidence ?? 'confidence n/a'}</small>
+        </div>
+        <div>
           <span>Binance equity</span>
           <strong>{account?.accountEquity != null ? `${account.accountEquity.toFixed(2)} USDT` : 'Loading'}</strong>
           <small>{account?.availableBalance != null ? `${account.availableBalance.toFixed(2)} available` : 'testnet wallet'}</small>
@@ -252,11 +267,11 @@ export default function TestnetExchangeDashboard() {
           <div className="testnet-table-wrap">
             <table>
               <thead>
-                <tr><th>Symbol</th><th>Side</th><th>Qty</th><th>Entry</th><th>Mark</th><th>TP target</th><th>TP gap</th><th>Liq / margin call</th><th>Unrealized</th><th>Lev</th><th>Mirrored lane</th></tr>
+                <tr><th>Symbol</th><th>Side</th><th>Qty</th><th>Entry</th><th>Mark</th><th>TP target</th><th>TP gap</th><th>Liq / margin call</th><th>Unrealized</th><th>After fee+slip</th><th>Lev</th><th>Mirrored lane</th></tr>
               </thead>
               <tbody>
                 {(account?.positions ?? []).length === 0 ? (
-                  <tr><td colSpan={11}>No open Binance testnet positions.</td></tr>
+                  <tr><td colSpan={12}>No open Binance testnet positions.</td></tr>
                 ) : account!.positions.map((position) => (
                   <tr key={position.symbol}>
                     <td>{position.symbol}</td>
@@ -268,6 +283,9 @@ export default function TestnetExchangeDashboard() {
                     <td className={tone(position.targetTpGapPct)}>{percent(position.targetTpGapPct)}</td>
                     <td className="tone-critical">{price(position.liquidationPrice)}</td>
                     <td className={tone(position.unrealizedPnl)}>{signed(position.unrealizedPnl)}</td>
+                    <td className={tone(position.unrealizedAfterEstimatedCloseCostUsd)}>
+                      {signed(position.unrealizedAfterEstimatedCloseCostUsd)}
+                    </td>
                     <td>{position.leverage}x</td>
                     <td>{position.laneIds.length > 0 ? position.laneIds.map(compactLane).join(', ') : 'unattributed'}</td>
                   </tr>

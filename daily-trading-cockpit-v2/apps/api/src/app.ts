@@ -32,6 +32,9 @@ import {
   buildCurrentGuardVariantMatrixReport,
   getCurrentGuardVariantMatrixStore,
 } from "./lib/current-guard-variant-matrix.js";
+import { getLatestScanCandidates } from "./lib/latest-scan-candidates-cache.js";
+import { buildRegimeDirectionControllerReport } from "./lib/regime-direction-controller.js";
+import { getRegimeDirectionControllerSnapshotStore } from "./lib/regime-direction-controller-snapshot.js";
 
 export interface AppOptions {
   fetchImpl?: typeof fetch;
@@ -144,6 +147,32 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         const laneVariantId = order.selectedLaneId.split(":").pop() ?? order.selectedLaneId;
         const row = report.rows.find((candidate) => candidate.variantId === laneVariantId);
         return row?.status === "STABLE_CANDIDATE";
+      },
+      getControllerSnapshot: () => {
+        const cached = getLatestScanCandidates();
+        const scanStatus = coreScanAutoRefreshController.getStatus();
+        const fallbackSnapshot =
+          cached || scanStatus.lastAutoRefreshResultSummary
+            ? null
+            : getRegimeDirectionControllerSnapshotStore().readLatest();
+        const regime =
+          cached?.marketRegime ??
+          scanStatus.lastAutoRefreshResultSummary?.marketRegime ??
+          fallbackSnapshot?.currentRegime ??
+          null;
+        const controller = buildRegimeDirectionControllerReport({
+          currentRegime: regime,
+          adaptiveDirectionBias: null,
+          primaryValidationLane: null,
+        });
+        return {
+          regime: controller.currentRegime,
+          mode: controller.controllerMode,
+          bias: controller.directionalBias,
+          confidence: controller.confidence,
+          reasons: controller.reasonCodes,
+          capturedAt: cached?.scanFinishedAt ?? scanStatus.lastAutoRefreshFinishedAt ?? fallbackSnapshot?.capturedAt ?? null,
+        };
       },
     });
     if (!isTest) liveEngine.start();

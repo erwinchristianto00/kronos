@@ -246,6 +246,8 @@ function makeConfig(overrides: Partial<LiveExecutionConfig> = {}): LiveExecution
     maxPaperOrderAgeMs: 24 * 60 * 60 * 1000,
     mirrorAllPaperOrders: false,
     testnetTakeProfitUsd: 0,
+    testnetRegimeExitEnabled: true,
+    estimatedCloseCostPct: 0.0022,
     autoArm: false,
     mainnetConfirmed: false,
     configErrors: [],
@@ -258,6 +260,7 @@ function makeEngine(opts: {
   paper?: PaperStoreReader;
   config?: Partial<LiveExecutionConfig>;
   isPaperOrderLiveEligible?: (order: PaperOrder, nowIso: string) => boolean;
+  getControllerSnapshot?: () => { regime: string | null; mode: string | null; capturedAt?: string | null } | null;
   nowIso?: () => string;
 } = {}) {
   const client = opts.client ?? new FakeLiveClient();
@@ -268,6 +271,7 @@ function makeEngine(opts: {
     store,
     paperStore: opts.paper ?? makePaperStore([]),
     isPaperOrderLiveEligible: opts.isPaperOrderLiveEligible,
+    getControllerSnapshot: opts.getControllerSnapshot,
     nowIso: opts.nowIso ?? (() => "2099-01-02T12:00:00.000Z"),
   });
   return { engine, client, store };
@@ -334,6 +338,18 @@ describe("parseLiveExecutionConfig", () => {
       LIVE_MAINNET_CONFIRM: "I_UNDERSTAND_REAL_MONEY",
     }).testnetTakeProfitUsd).toBe(0);
     expect(parseLiveExecutionConfig({ ...base, LIVE_BINANCE_ENV: "testnet", LIVE_TESTNET_TP_USD: "0" }).testnetTakeProfitUsd).toBe(0);
+  });
+
+  it("testnet regime-opposition breakeven exit defaults on and can be disabled", () => {
+    const base = {
+      LIVE_EXECUTION_ENABLED: "1",
+      LIVE_BINANCE_ENV: "testnet",
+      LIVE_BINANCE_API_KEY: "k",
+      LIVE_BINANCE_API_SECRET: "s",
+    };
+    expect(parseLiveExecutionConfig(base).testnetRegimeExitEnabled).toBe(true);
+    expect(parseLiveExecutionConfig({ ...base, LIVE_TESTNET_REGIME_EXIT: "0" }).testnetRegimeExitEnabled).toBe(false);
+    expect(parseLiveExecutionConfig(base).estimatedCloseCostPct).toBeCloseTo(0.0022, 8);
   });
 });
 
@@ -581,6 +597,57 @@ describe("LiveExecutionEngine", () => {
     expect(store.getState().dailyLedger.wins).toBe(1);
     expect(store.getState().consecutiveLosses).toBe(0);
     expect(client.orderStatusById.get(intent.tp1OrderId!)).toBeUndefined();
+  });
+
+  it("testnet regime-opposition exit closes only opposing exposure that clears estimated close cost", async () => {
+    const order = paperOrder(); // SHORT.
+    const { engine, client, store } = makeEngine({
+      paper: makePaperStore([order]),
+      getControllerSnapshot: () => ({
+        regime: "Bullish expansion",
+        mode: "LONG_ONLY",
+        capturedAt: new Date().toISOString(),
+      }),
+    });
+    expect((await engine.arm()).ok).toBe(true);
+    await engine.tick();
+
+    client.markPriceBySymbol.set("ETHUSDT", 1900);
+    client.unrealizedPnlBySymbol.set("ETHUSDT", 1.0); // cost buffer is about 0.21 USDT.
+    client.flattenRealizedPnl = 0.78;
+    await engine.tick();
+
+    const closed = store.getState().intents[0]!;
+    expect(closed.state).toBe("CLOSED");
+    expect(closed.closeReason).toBe("REGIME_OPPOSITION_BREAKEVEN_LONG_ONLY");
+    expect(closed.realizedPnlUsd).toBeCloseTo(0.78, 6);
+    const flat = client.placed.at(-1)!;
+    expect(flat.type).toBe("MARKET");
+    expect(flat.reduceOnly).toBe(true);
+    expect(flat.side).toBe("BUY");
+    expect(store.getState().dailyLedger.wins).toBe(1);
+  });
+
+  it("testnet regime-opposition exit keeps opposing exposure open when estimated net is below breakeven", async () => {
+    const order = paperOrder(); // SHORT.
+    const { engine, client, store } = makeEngine({
+      paper: makePaperStore([order]),
+      getControllerSnapshot: () => ({
+        regime: "Bullish expansion",
+        mode: "LONG_ONLY",
+        capturedAt: new Date().toISOString(),
+      }),
+    });
+    expect((await engine.arm()).ok).toBe(true);
+    await engine.tick();
+
+    client.markPriceBySymbol.set("ETHUSDT", 1900);
+    client.unrealizedPnlBySymbol.set("ETHUSDT", 0.1); // below conservative close-cost buffer.
+    const placedBefore = client.placed.length;
+    await engine.tick();
+
+    expect(store.getState().intents[0]!.state).toBe("OPEN");
+    expect(client.placed.length).toBe(placedBefore);
   });
 
   it("skips DIAGNOSTIC_ONLY orders, stale watermark orders, and respects the paper breaker halt", async () => {

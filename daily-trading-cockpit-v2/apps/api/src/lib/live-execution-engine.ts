@@ -67,10 +67,23 @@ export interface LiveExecutionConfig {
   mirrorAllPaperOrders: boolean;
   /** Testnet-only: close a mirrored position early once exchange unrealized PnL reaches this USDT threshold. */
   testnetTakeProfitUsd: number;
+  /** Testnet-only: close regime-opposing exposure once it can be flattened at estimated breakeven or better. */
+  testnetRegimeExitEnabled: boolean;
+  /** Conservative fee+slippage buffer used for testnet breakeven exits and dashboard net-after-cost. */
+  estimatedCloseCostPct: number;
   autoArm: boolean;
   mainnetConfirmed: boolean;
   /** Why the config cannot trade (empty = config valid for its env). */
   configErrors: string[];
+}
+
+export interface LiveControllerSnapshot {
+  regime: string | null;
+  mode: string | null;
+  bias?: string | null;
+  confidence?: string | null;
+  reasons?: string[];
+  capturedAt?: string | null;
 }
 
 function envNum(raw: string | undefined, fallback: number): number {
@@ -109,6 +122,8 @@ export function parseLiveExecutionConfig(env: NodeJS.ProcessEnv = process.env): 
     maxPaperOrderAgeMs: Math.floor(envNum(env.LIVE_MAX_PAPER_ORDER_AGE_MS, 10 * 60 * 1000)),
     mirrorAllPaperOrders: env.LIVE_MIRROR_ALL_PAPER === "1" && liveEnv === "testnet",
     testnetTakeProfitUsd: liveEnv === "testnet" ? envNum(env.LIVE_TESTNET_TP_USD, 0) : 0,
+    testnetRegimeExitEnabled: liveEnv === "testnet" && env.LIVE_TESTNET_REGIME_EXIT !== "0",
+    estimatedCloseCostPct: envNum(env.LIVE_ESTIMATED_CLOSE_COST_PCT, 0.0022),
     autoArm: env.LIVE_AUTO_ARM === "1" && liveEnv === "testnet", // mainnet NEVER auto-arms
     mainnetConfirmed,
     configErrors,
@@ -387,10 +402,12 @@ export interface LiveExecutionEngineOptions {
   store: LiveExecutionStore;
   paperStore: PaperStoreReader;
   isPaperOrderLiveEligible?: (order: PaperOrder, nowIso: string) => boolean;
+  getControllerSnapshot?: () => LiveControllerSnapshot | null;
   nowIso?: () => string;
 }
 
 const ERROR_STREAK_DISARM = 3;
+const REGIME_EXIT_SNAPSHOT_MAX_AGE_MS = 15 * 60 * 1000;
 const OPEN_INTENT_STATES: ReadonlySet<LiveIntentState> = new Set(["MIRRORED", "ENTRY_PLACED", "OPEN", "TP1_FILLED_BE_SET"]);
 const MIRRORABLE_PAPER_STATUSES: ReadonlySet<string> = new Set(["CREATED", "PAPER_SUBMITTED"]);
 /**
@@ -408,6 +425,7 @@ export class LiveExecutionEngine {
   private readonly store: LiveExecutionStore;
   private readonly paperStore: PaperStoreReader;
   private readonly isPaperOrderLiveEligible: (order: PaperOrder, nowIso: string) => boolean;
+  private readonly getControllerSnapshot: () => LiveControllerSnapshot | null;
   private readonly nowIso: () => string;
 
   /** In-memory ONLY — restart always boots disarmed. */
@@ -427,6 +445,7 @@ export class LiveExecutionEngine {
     this.store = options.store;
     this.paperStore = options.paperStore;
     this.isPaperOrderLiveEligible = options.isPaperOrderLiveEligible ?? (() => true);
+    this.getControllerSnapshot = options.getControllerSnapshot ?? (() => null);
     this.nowIso = options.nowIso ?? (() => new Date().toISOString());
     // Auto-arm must NOT punch through a latched kill: a restart preserves the kill until an
     // explicit resetKill(). (arm() already enforces this; the constructor path bypassed it.)
@@ -455,6 +474,21 @@ export class LiveExecutionEngine {
   disarm(reason: string): void {
     this.armed = false;
     this.reconcileIssues.push(`disarmed: ${reason}`);
+  }
+
+  private currentControllerSnapshot(): LiveControllerSnapshot | null {
+    try {
+      return this.getControllerSnapshot();
+    } catch {
+      return null;
+    }
+  }
+
+  private controllerSnapshotIsFresh(snapshot: LiveControllerSnapshot | null): boolean {
+    if (!snapshot?.capturedAt) return false;
+    const capturedMs = new Date(snapshot.capturedAt).getTime();
+    if (!Number.isFinite(capturedMs)) return false;
+    return Math.abs(Date.now() - capturedMs) <= REGIME_EXIT_SNAPSHOT_MAX_AGE_MS;
   }
 
   /** Manual emergency kill: cancel everything, flatten everything, disarm, latch. */
@@ -580,6 +614,7 @@ export class LiveExecutionEngine {
   getStatus() {
     const st = this.store.getState();
     const openIntents = st.intents.filter((i) => OPEN_INTENT_STATES.has(i.state));
+    const controller = this.currentControllerSnapshot();
     return {
       enabled: this.config.enabled,
       env: this.config.env,
@@ -593,6 +628,7 @@ export class LiveExecutionEngine {
         lastTickAt: this.lastTickAt,
         lastTickError: this.lastTickError,
       },
+      controller,
       reconcileIssues: this.reconcileIssues.slice(-10),
       watermark: st.lastSeenCreatedAt,
       quarantinedPaperOrders: Object.values(st.mirrorAttempts).filter((n) => n >= MAX_MIRROR_ATTEMPTS).length,
@@ -617,6 +653,8 @@ export class LiveExecutionEngine {
         maxPaperOrderAgeMs: this.config.maxPaperOrderAgeMs,
         mirrorAllPaperOrders: this.config.mirrorAllPaperOrders,
         testnetTakeProfitUsd: this.config.testnetTakeProfitUsd,
+        testnetRegimeExitEnabled: this.config.testnetRegimeExitEnabled,
+        estimatedCloseCostPct: this.config.estimatedCloseCostPct,
       },
     };
   }
@@ -645,6 +683,8 @@ export class LiveExecutionEngine {
       targetTpGapPct: number | null;
       liquidationPrice: number | null;
       unrealizedPnl: number;
+      estimatedCloseCostUsd: number;
+      unrealizedAfterEstimatedCloseCostUsd: number;
       leverage: number;
       sourceOrderCount: number;
       laneIds: string[];
@@ -697,6 +737,8 @@ export class LiveExecutionEngine {
       }
       const direction = position.positionAmt > 0 ? "LONG" as const : "SHORT" as const;
       const markPrice = position.markPrice > 0 ? position.markPrice : null;
+      const estimatedCloseCostUsd = this.estimatedCloseCostUsd(position);
+      const unrealizedAfterEstimatedCloseCostUsd = position.unRealizedProfit - estimatedCloseCostUsd;
       const targetTpPrice = intent && intent.tp1Price > 0 ? intent.tp1Price : null;
       const targetTpGapPct =
         markPrice !== null && targetTpPrice !== null
@@ -714,6 +756,8 @@ export class LiveExecutionEngine {
         targetTpGapPct,
         liquidationPrice: position.liquidationPrice > 0 ? position.liquidationPrice : null,
         unrealizedPnl: position.unRealizedProfit,
+        estimatedCloseCostUsd,
+        unrealizedAfterEstimatedCloseCostUsd,
         leverage: position.leverage,
         sourceOrderCount: sources.length,
         laneIds: Array.from(new Set(sources.map((source) => source.laneId))),
@@ -739,6 +783,19 @@ export class LiveExecutionEngine {
     };
   }
 
+  private estimatedCloseCostUsd(position: FuturesPosition): number {
+    const referencePrice =
+      position.markPrice > 0
+        ? position.markPrice
+        : position.entryPrice > 0
+          ? position.entryPrice
+          : 0;
+    if (!(referencePrice > 0) || !Number.isFinite(referencePrice)) return 0;
+    const notional = Math.abs(position.positionAmt) * referencePrice;
+    if (!(notional > 0) || !Number.isFinite(notional)) return 0;
+    return notional * this.config.estimatedCloseCostPct;
+  }
+
   // ── tick orchestration ─────────────────────────────────────────────────────
 
   async tick(): Promise<void> {
@@ -761,7 +818,12 @@ export class LiveExecutionEngine {
       // 3. Manage lifecycle of open intents (TP1 → breakeven, close detection).
       await this.manageLifecycle();
 
-      // 4. Mirror new HEADLINE paper orders (only when armed + healthy).
+      // 4. Testnet safety harvest: if regime flips, flatten only opposing exposure that
+      // can clear the conservative close-cost estimate. Losing opposing exposure is left
+      // to its stop/TP/giveback logic instead of locking a loss.
+      await this.maybeCloseRegimeOppositionBreakeven();
+
+      // 5. Mirror new HEADLINE paper orders (only when armed + healthy).
       await this.mirrorNewSignals();
 
       this.errorStreak = 0;
@@ -982,6 +1044,72 @@ export class LiveExecutionEngine {
         throw error; // counted by the tick error-streak guard
       }
     }
+    if (dirty) this.store.save();
+  }
+
+  private opposingDirectionForController(mode: string | null | undefined): "LONG" | "SHORT" | null {
+    if (mode === "LONG_ONLY") return "SHORT";
+    if (mode === "SHORT_ONLY") return "LONG";
+    return null;
+  }
+
+  private async maybeCloseRegimeOppositionBreakeven(): Promise<void> {
+    if (this.config.env !== "testnet" || !this.config.testnetRegimeExitEnabled) return;
+    const controller = this.currentControllerSnapshot();
+    if (!this.controllerSnapshotIsFresh(controller)) return;
+    const opposingDirection = this.opposingDirectionForController(controller?.mode);
+    if (!opposingDirection) return;
+
+    const st = this.store.getState();
+    const openOpposingIntents = st.intents.filter(
+      (intent) => OPEN_INTENT_STATES.has(intent.state) && intent.direction === opposingDirection,
+    );
+    if (openOpposingIntents.length === 0) return;
+
+    const positions = await this.client.getPositions();
+    const bySymbol = new Map(positions.map((position) => [position.symbol, position]));
+    let dirty = false;
+
+    for (const intent of openOpposingIntents) {
+      const pos = bySymbol.get(intent.symbol);
+      const amt = pos?.positionAmt ?? 0;
+      if (!pos || Math.abs(amt) < 1e-12) continue;
+      const expectedSign = intent.direction === "LONG" ? 1 : -1;
+      if (Math.sign(amt) !== expectedSign) continue;
+
+      const estimatedCloseCostUsd = this.estimatedCloseCostUsd(pos);
+      const netAfterCost = pos.unRealizedProfit - estimatedCloseCostUsd;
+      if (!Number.isFinite(netAfterCost) || netAfterCost < 0) continue;
+
+      const flat = await this.client.placeOrder({
+        symbol: intent.symbol,
+        side: amt > 0 ? "SELL" : "BUY",
+        type: "MARKET",
+        quantity: Math.abs(amt),
+        reduceOnly: true,
+        newClientOrderId: `dtc-${intent.paperOrderId.slice(-18)}-reg`,
+      });
+      try {
+        await this.client.cancelAllOrders(intent.symbol);
+        await this.client.cancelAllAlgoOrders(intent.symbol);
+      } catch {
+        // Position is already flattened; exit-order cleanup remains best-effort.
+      }
+      const net = await this.realizedFromTrades(intent.symbol, intent.createdAt, [
+        intent.entryOrderId,
+        intent.tp1OrderId,
+        flat.orderId,
+      ]);
+      intent.realizedPnlUsd = net;
+      intent.feesUsd = null;
+      intent.state = "CLOSED";
+      intent.closedAt = this.nowIso();
+      intent.updatedAt = this.nowIso();
+      intent.closeReason = `REGIME_OPPOSITION_BREAKEVEN_${controller?.mode ?? "UNKNOWN"}`;
+      this.applyRealizedToLedger(net);
+      dirty = true;
+    }
+
     if (dirty) this.store.save();
   }
 
