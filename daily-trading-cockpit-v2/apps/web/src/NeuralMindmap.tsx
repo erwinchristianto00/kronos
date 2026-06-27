@@ -165,13 +165,6 @@ function groupLanesByDirection(lanes: NeuralLane[]): LaneDirectionSection[] {
   }).filter((section) => section.lanes.length > 0);
 }
 
-function statsSourceShortLabel(source: NeuralLane['statsSource']): string {
-  if (source === 'VM_SIM') return 'VM sim';
-  if (source === 'H6_RESEARCH') return 'H6 research';
-  if (source === 'REGIME_DIAGNOSTIC') return 'Regime diag';
-  return 'Paper book';
-}
-
 function statsSourceLongLabel(source: NeuralLane['statsSource']): string {
   if (source === 'VM_SIM') return 'Variant-matrix simulation';
   if (source === 'H6_RESEARCH') return 'H6 trend research';
@@ -1215,48 +1208,6 @@ export default function NeuralMindmap() {
           </small>
         </div>
         <div>
-          <span>H6 trend-continuation long <small>(primary long research)</small></span>
-          <strong className={(() => {
-            const h6 = telemetry?.h6Trend;
-            const primary = h6?.tightLargeCap?.freshValid ? h6.tightLargeCap : h6;
-            if (!h6 || !primary || primary.freshValid < h6.oosThreshold) return 'tone-measure';
-            return (primary.netAvgR ?? 0) > 0 ? 'tone-healthy' : 'tone-critical';
-          })()}>
-            {(() => {
-              const h6 = telemetry?.h6Trend;
-              const primary = h6?.tightLargeCap?.freshValid ? h6.tightLargeCap : h6;
-              return h6 && primary
-                ? `${fmtR(primary.netAvgR)} net · ${primary.wr != null ? `${Math.round(primary.wr * 100)}% WR` : '—'}`
-                : 'Loading';
-            })()}
-          </strong>
-          <small>
-            {telemetry?.h6Trend
-              ? `${telemetry.h6Trend.freshValid}/${telemetry.h6Trend.oosThreshold} OOS · ${telemetry.h6Trend.open} open · ${telemetry.h6Trend.status === 'WATCHABLE' ? 'watchable' : 'collecting'} · not real`
-              : 'bull impulse + pullback + participation gates'}
-            {telemetry?.h6Trend ? (
-              <span className="diag-dir-foot">
-                gates: daily/4H trend · ADX&gt;25 · volume&gt;MA20 · funding/OI/taker participation
-              </span>
-            ) : null}
-            {telemetry?.h6Trend?.exitPolicy ? (
-              <span className="diag-dir-foot">
-                exit: TP1 {Math.round(telemetry.h6Trend.exitPolicy.tp1ExitPct * 100)}% at +{telemetry.h6Trend.exitPolicy.tp1R.toFixed(1)}R · BE stop · ATR runner
-                {telemetry.h6Trend.tp1HitRate != null ? ` · TP1 hit ${Math.round(telemetry.h6Trend.tp1HitRate * 100)}%` : ''}
-              </span>
-            ) : null}
-            {telemetry?.h6Trend && telemetry.h6Trend.avgMaxFavorableR != null ? (
-              <span className="diag-dir-foot">avg MFE {fmtR(telemetry.h6Trend.avgMaxFavorableR)} · PF {telemetry.h6Trend.pf != null ? telemetry.h6Trend.pf.toFixed(2) : '—'}</span>
-            ) : null}
-            {telemetry?.h6Trend?.tight ? (
-              <span className="diag-dir-foot">tight runner A/B: {fmtR(telemetry.h6Trend.tight.netAvgR)} net · {telemetry.h6Trend.tight.wr != null ? `${Math.round(telemetry.h6Trend.tight.wr * 100)}% WR` : '—'} · n={telemetry.h6Trend.tight.freshValid}</span>
-            ) : null}
-            {telemetry?.h6Trend?.tightLargeCap ? (
-              <span className="diag-dir-foot">focused cohort tight×large-cap×bull: {fmtR(telemetry.h6Trend.tightLargeCap.netAvgR)} net · {telemetry.h6Trend.tightLargeCap.wr != null ? `${Math.round(telemetry.h6Trend.tightLargeCap.wr * 100)}% WR` : '—'} · n={telemetry.h6Trend.tightLargeCap.freshValid}</span>
-            ) : null}
-          </small>
-        </div>
-        <div>
           <span>Safety</span>
           <strong className="tone-healthy">Testnet mirror</strong>
           <small>{liveAccount ? `${liveAccount.openPositionCount} protected positions` : 'loading account'}</small>
@@ -1272,14 +1223,13 @@ export default function NeuralMindmap() {
 
       <section className="neural-milestone-panel" aria-label="Lane maturity thresholds">
         <div className="neural-milestone-summary">
-          <span>Promotion ladder</span>
-          <strong>Collecting → Paper evidence → Headline → Stable → Promotion</strong>
+          <span>Lane maturity &amp; performance field</span>
+          <strong>Promotion ladder + live lane scorecard</strong>
           <p>
             Runtime thresholds on VPS now: watchable/headline floor <b>{watchableThreshold}</b> fresh-valid,
             stable candidate <b>{STABLE_MIN_FRESH}</b>, promotion candidate <b>{PROMOTION_MIN_FRESH}</b>.
-            The table below now shows both the raw telemetry status from the engine and the UI grouping,
-            so it no longer looks like two different truths. Live exchange trading still needs live gate
-            pass plus infra readiness.
+            Maturity and performance are merged below so each lane has one row: stage, missing gate,
+            direction cohorts, TP distance, diagnostic MTM, MFE, and mirrored Binance exposure.
           </p>
         </div>
         <div className="neural-milestone-grid">
@@ -1309,44 +1259,65 @@ export default function NeuralMindmap() {
             <thead>
               <tr>
                 <th>Lane</th>
+                <th>Stage</th>
                 <th>Telemetry</th>
-                <th>UI Stage</th>
-                <th>Next Stage</th>
                 <th>Progress</th>
-                <th>Fresh Valid</th>
-                <th>Net Avg R</th>
-                <th>PF</th>
-                <th>Stats</th>
                 <th>Missing</th>
+                <th>Long</th>
+                <th>Short</th>
+                <th>Mixed</th>
+                <th>TP gap</th>
+                <th>Diag MTM</th>
+                <th>MFE</th>
+                <th>Binance</th>
+                <th>Mirrored</th>
+                <th>Fresh</th>
+                <th>Net R</th>
+                <th>PF</th>
+                <th>WR</th>
               </tr>
             </thead>
             <tbody>
               {milestoneSections.map((section) => (
                 <Fragment key={`milestone-section-${section.key}`}>
                   <tr className={`neural-direction-row direction-${section.key.toLowerCase()}`}>
-                    <td colSpan={10}>
+                    <td colSpan={17}>
                       <span>{section.label}</span>
                       <small>{section.lanes.length} lane{section.lanes.length === 1 ? '' : 's'} · {section.detail}</small>
                     </td>
                   </tr>
-                  {section.rows.map(({ lane, milestone, progress }) => (
-                    <tr
-                      key={`milestone-${lane.id}`}
-                      className={isQuarantinedLane(lane) ? 'is-quarantined' : ''}
-                      onClick={() => setSelectedId(lane.id)}
-                    >
-                      <td>{compactLaneLabel(lane.label)}</td>
-                      <td>{lane.status}</td>
-                      <td><span className={`neural-stage-pill ${evidencePillClass(lane, milestone)}`}>{isQuarantinedLane(lane) ? 'Quarantined' : stageLabel(milestone.stage)}</span></td>
-                      <td>{progress.nextStage}</td>
-                      <td>{progress.progressPct}%</td>
-                      <td>{lane.oosFreshValid ?? lane.closed} / {lane.oosThreshold}</td>
-                      <td className={(lane.netAvgR ?? 0) >= 0 ? 'tone-healthy' : 'tone-critical'}>{fmtR(lane.netAvgR)}</td>
-                      <td>{fmtNumber(lane.pf)}</td>
-                      <td>{statsSourceShortLabel(lane.statsSource)}</td>
-                      <td>{progress.blockers.slice(0, 2).join(' | ') || 'None'}</td>
-                    </tr>
-                  ))}
+                  {section.rows.map(({ lane, milestone, progress }) => {
+                    const liveLane = liveAccount?.lanes.find((item) => item.laneId === lane.id);
+                    const livePnl = liveLane?.unrealizedPnl ?? 0;
+                    const liveGrowth = liveAccount?.accountEquity && liveAccount.accountEquity > 0
+                      ? (livePnl / liveAccount.accountEquity) * 100
+                      : null;
+                    return (
+                      <tr
+                        key={`milestone-${lane.id}`}
+                        className={`${lane.active ? 'is-active' : ''}${isQuarantinedLane(lane) ? ' is-quarantined' : ''}`}
+                        onClick={() => setSelectedId(lane.id)}
+                      >
+                        <td><i className={`health-${healthOf(lane.id).toLowerCase()}`} />{compactLaneLabel(lane.label)}</td>
+                        <td><span className={`neural-stage-pill ${evidencePillClass(lane, milestone)}`}>{isQuarantinedLane(lane) ? 'Quarantined' : stageLabel(milestone.stage)}</span></td>
+                        <td>{lane.status}</td>
+                        <td>{progress.progressPct}%</td>
+                        <td className="neural-missing-cell">{progress.blockers.slice(0, 2).join(' | ') || 'None'}</td>
+                        <td className={cohortTone(lane.cohorts?.LONG)}>{fmtCohort(lane.cohorts?.LONG)}</td>
+                        <td className={cohortTone(lane.cohorts?.SHORT)}>{fmtCohort(lane.cohorts?.SHORT)}</td>
+                        <td className={cohortTone(lane.cohorts?.MIXED)}>{fmtCohort(lane.cohorts?.MIXED)}</td>
+                        <td>{fmtGapPct(lane.openAvgDistanceToTpPct)}</td>
+                        <td className="tone-measure">{fmtUsdt(lane.diagnosticUnrealizedPnl)}</td>
+                        <td className="tone-measure">{fmtUsdt(lane.openMaxFavorablePnl)}</td>
+                        <td className={livePnl >= 0 ? 'tone-healthy' : 'tone-critical'}>{`${livePnl >= 0 ? '+' : ''}${livePnl.toFixed(2)} USDT · ${fmtPct(liveGrowth)}`}</td>
+                        <td>{liveLane?.sourceOrderCount ?? 0}</td>
+                        <td>{lane.oosFreshValid ?? lane.closed} / {lane.oosThreshold}</td>
+                        <td className={lane.netAvgR == null ? '' : lane.netAvgR >= 0 ? 'tone-healthy' : 'tone-critical'}>{fmtR(lane.netAvgR)}</td>
+                        <td>{fmtNumber(lane.pf)}</td>
+                        <td>{lane.wr === null ? 'n/a' : `${(lane.wr * 100).toFixed(1)}%`}</td>
+                      </tr>
+                    );
+                  })}
                 </Fragment>
               ))}
             </tbody>
@@ -1689,71 +1660,6 @@ export default function NeuralMindmap() {
         </aside>
       </main>
 
-      <section className="neural-bottom-grid">
-        <div className="neural-alerts">
-          <header><span>Active diagnostics</span><strong>{telemetry?.alerts.length ?? 0}</strong></header>
-          {(telemetry?.alerts.length ?? 0) === 0 ? (
-            <p className="neural-all-clear">No critical telemetry alerts. Evidence collection states can still require attention.</p>
-          ) : telemetry?.alerts.slice(0, 6).map((alert, index) => (
-            <button key={`${alert.source}-${index}`} type="button" onClick={() => {
-              const match = telemetry.nodes.find((node) => node.label === alert.source);
-              if (match) setSelectedId(match.id);
-            }}>
-              <i className={`health-${alert.severity.toLowerCase()}`} />
-              <span><strong>{alert.source}</strong>{alert.message}</span>
-            </button>
-          ))}
-        </div>
-
-        <div className="neural-lane-strip">
-          <header><span>Lane performance scorecard</span><strong>{displayLanes.length} lanes</strong></header>
-          <div className="neural-lane-table-wrap">
-            <table>
-              <thead><tr><th>Lane</th><th>Evidence</th><th>Long</th><th>Short</th><th>Mixed regime</th><th>TP Gap</th><th>Diag MTM</th><th>MFE</th><th>Binance PnL</th><th>Growth</th><th>Mirrored</th><th>n</th><th>Net Avg R</th><th>PF</th><th>WR</th></tr></thead>
-              <tbody>
-                {laneDirectionSections.map((section) => (
-                  <Fragment key={`lane-section-${section.key}`}>
-                    <tr className={`neural-direction-row direction-${section.key.toLowerCase()}`}>
-                      <td colSpan={15}>
-                        <span>{section.label}</span>
-                        <small>{section.lanes.length} lane{section.lanes.length === 1 ? '' : 's'} · {section.detail}</small>
-                      </td>
-                    </tr>
-                    {section.lanes.map((lane) => {
-                      const liveLane = liveAccount?.lanes.find((item) => item.laneId === lane.id);
-                      const livePnl = liveLane?.unrealizedPnl ?? 0;
-                      const liveGrowth = liveAccount?.accountEquity && liveAccount.accountEquity > 0
-                        ? (livePnl / liveAccount.accountEquity) * 100
-                        : null;
-                      return (
-                        <tr key={lane.id} className={`${lane.active ? 'is-active' : ''}${lane.health === 'QUARANTINE' ? ' is-quarantined' : ''}`} onClick={() => setSelectedId(lane.id)}>
-                          <td><i className={`health-${healthOf(lane.id).toLowerCase()}`} />{compactLaneLabel(lane.label)}</td>
-                          <td><span className={`neural-stage-pill ${evidencePillClass(lane)}`}>{lane.status}</span></td>
-                          <td className={cohortTone(lane.cohorts?.LONG)}>{fmtCohort(lane.cohorts?.LONG)}</td>
-                          <td className={cohortTone(lane.cohorts?.SHORT)}>{fmtCohort(lane.cohorts?.SHORT)}</td>
-                          <td className={cohortTone(lane.cohorts?.MIXED)}>{fmtCohort(lane.cohorts?.MIXED)}</td>
-                          <td>{fmtGapPct(lane.openAvgDistanceToTpPct)}</td>
-                          <td className="tone-measure">{fmtUsdt(lane.diagnosticUnrealizedPnl)}</td>
-                          <td className="tone-measure">{fmtUsdt(lane.openMaxFavorablePnl)}</td>
-                          <td className={livePnl >= 0 ? 'tone-healthy' : 'tone-critical'}>{`${livePnl >= 0 ? '+' : ''}${livePnl.toFixed(2)} USDT`}</td>
-                          <td className={livePnl >= 0 ? 'tone-healthy' : 'tone-critical'}>{fmtPct(liveGrowth)}</td>
-                          <td>{liveLane?.sourceOrderCount ?? 0}</td>
-                          {/* N mirrors the Promotion Ladder's FRESH VALID source exactly (oosFreshValid ?? closed) */}
-                          <td>{lane.oosFreshValid ?? lane.closed}</td>
-                          {/* Net Avg R coloured by profit/loss; null (n/a) stays neutral */}
-                          <td className={lane.netAvgR == null ? '' : lane.netAvgR >= 0 ? 'tone-healthy' : 'tone-critical'}>{fmtR(lane.netAvgR)}</td>
-                          <td>{fmtNumber(lane.pf)}</td>
-                          <td>{lane.wr === null ? 'n/a' : `${(lane.wr * 100).toFixed(1)}%`}</td>
-                        </tr>
-                      );
-                    })}
-                  </Fragment>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      </section>
     </div>
   );
 }

@@ -327,7 +327,7 @@
 
 .neural-milestone-table-wrap table {
   width: 100%;
-  min-width: 980px;
+  min-width: 1780px;
   border-collapse: collapse;
   font-size: 10px;
 }
@@ -339,6 +339,8 @@
   color: #98adb6;
   text-align: left;
   vertical-align: top;
+  line-height: 1.35;
+  white-space: nowrap;
 }
 
 .neural-milestone-table-wrap th {
@@ -355,6 +357,32 @@
   background: #0e1c22;
 }
 
+.neural-milestone-table-wrap tbody tr.is-active {
+  background: #0e201f;
+}
+
+.neural-milestone-table-wrap i {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  margin-right: 7px;
+  border-radius: 50%;
+  background: #60747e;
+}
+
+.neural-milestone-table-wrap td:nth-child(5),
+.neural-milestone-table-wrap td:nth-child(6),
+.neural-milestone-table-wrap td:nth-child(7),
+.neural-milestone-table-wrap td:nth-child(8) {
+  min-width: 138px;
+  max-width: 230px;
+  white-space: normal;
+}
+
+.neural-milestone-table-wrap .neural-missing-cell {
+  color: #b4c2c8;
+}
+
 .neural-milestone-table-wrap tbody tr.is-quarantined,
 .neural-milestone-table-wrap tbody tr.is-quarantined:hover {
   background: rgba(167, 139, 250, 0.16);
@@ -364,15 +392,13 @@
   border-bottom-color: rgba(167, 139, 250, 0.28);
 }
 
-.neural-milestone-table-wrap tbody tr.neural-direction-row,
-.neural-lane-table-wrap tbody tr.neural-direction-row {
+.neural-milestone-table-wrap tbody tr.neural-direction-row {
   cursor: default;
   background:
     linear-gradient(90deg, rgba(78, 205, 160, 0.16), rgba(78, 205, 160, 0.03));
 }
 
-.neural-milestone-table-wrap tbody tr.neural-direction-row:hover,
-.neural-lane-table-wrap tbody tr.neural-direction-row:hover {
+.neural-milestone-table-wrap tbody tr.neural-direction-row:hover {
   background:
     linear-gradient(90deg, rgba(78, 205, 160, 0.16), rgba(78, 205, 160, 0.03));
 }
@@ -464,16 +490,17 @@
 }
 
 .neural-workspace {
-  min-height: 660px;
+  min-height: 0;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 380px;
+  grid-template-columns: minmax(0, 1fr);
+  align-items: start;
   border-bottom: 1px solid #20313a;
 }
 
 .neural-canvas-panel {
   position: relative;
   min-width: 0;
-  min-height: 660px;
+  min-height: 610px;
   overflow: hidden;
   background: #081319;
 }
@@ -489,7 +516,7 @@
   width: 100%;
   min-width: 1060px;
   height: 100%;
-  min-height: 660px;
+  min-height: 610px;
 }
 
 .neural-grid-line {
@@ -711,9 +738,7 @@
   font-size: 9px;
 }
 
-.neural-legend i,
-.neural-alerts i,
-.neural-lane-table-wrap i {
+.neural-legend i {
   display: inline-block;
   width: 7px;
   height: 7px;
@@ -748,20 +773,27 @@ i.health-diagnostic {
 
 .neural-inspector {
   min-width: 0;
-  border-left: 1px solid #20313a;
+  display: grid;
+  grid-template-columns: minmax(250px, 0.8fr) repeat(auto-fit, minmax(250px, 1fr));
+  align-items: stretch;
+  border-top: 1px solid #20313a;
   background: #0a151b;
-  overflow-y: auto;
+  overflow: visible;
 }
 
 .neural-inspector-heading,
 .neural-inspector-section {
-  padding: 18px;
+  min-width: 0;
+  padding: 14px;
   border-bottom: 1px solid #20313a;
+  border-right: 1px solid #20313a;
 }
 
 .neural-diagnosis {
-  padding: 16px 18px;
+  min-width: 0;
+  padding: 14px;
   border-bottom: 1px solid #20313a;
+  border-right: 1px solid #20313a;
   border-left: 4px solid #60747e;
   background: #0d1a20;
 }
@@ -981,138 +1013,6 @@ i.health-diagnostic {
   animation: neural-spin 0.9s linear infinite;
 }
 
-.neural-bottom-grid {
-  display: grid;
-  grid-template-columns: minmax(280px, 0.34fr) minmax(0, 0.66fr);
-  min-height: 220px;
-}
-
-.neural-alerts {
-  border-right: 1px solid #20313a;
-}
-
-.neural-alerts header,
-.neural-lane-strip header {
-  height: 42px;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 0 14px;
-  border-bottom: 1px solid #20313a;
-  color: #81949d;
-  font-size: 11px;
-  text-transform: uppercase;
-}
-
-.neural-alerts header strong,
-.neural-lane-strip header strong {
-  color: #b9c9cf;
-}
-
-.neural-alerts button {
-  width: 100%;
-  display: grid;
-  grid-template-columns: 8px minmax(0, 1fr);
-  gap: 9px;
-  align-items: start;
-  padding: 11px 14px;
-  border: 0;
-  border-bottom: 1px solid #17272e;
-  color: #9dafb7;
-  background: transparent;
-  text-align: left;
-  cursor: pointer;
-}
-
-.neural-alerts button:hover {
-  background: #0e1c22;
-}
-
-.neural-alerts button i {
-  margin-top: 4px;
-}
-
-.neural-alerts button strong {
-  display: block;
-  margin-bottom: 3px;
-  color: #d4e0e4;
-  font-size: 11px;
-}
-
-.neural-alerts button span {
-  font-size: 10px;
-  line-height: 1.4;
-}
-
-.neural-all-clear {
-  padding: 16px;
-  margin: 0;
-  color: #7f959f;
-  font-size: 11px;
-  line-height: 1.5;
-}
-
-.neural-lane-strip {
-  min-width: 0;
-}
-
-.neural-lane-table-wrap {
-  overflow-x: auto;
-}
-
-.neural-lane-table-wrap table {
-  width: 100%;
-  min-width: 1320px;
-  border-collapse: collapse;
-  font-size: 10px;
-}
-
-.neural-lane-table-wrap th,
-.neural-lane-table-wrap td {
-  height: 31px;
-  padding: 0 11px;
-  border-bottom: 1px solid #17272e;
-  color: #91a5ae;
-  text-align: right;
-  white-space: nowrap;
-}
-
-.neural-lane-table-wrap th {
-  color: #657b85;
-  font-weight: 600;
-  text-transform: uppercase;
-}
-
-.neural-lane-table-wrap th:first-child,
-.neural-lane-table-wrap td:first-child,
-.neural-lane-table-wrap th:nth-child(2),
-.neural-lane-table-wrap td:nth-child(2) {
-  text-align: left;
-}
-
-.neural-lane-table-wrap tbody tr {
-  cursor: pointer;
-}
-
-.neural-lane-table-wrap tbody tr:hover,
-.neural-lane-table-wrap tbody tr.is-active {
-  background: #0e201f;
-}
-
-/* Quarantined lane row — violet wash (matches the SVG node quarantine accent #a78bfa). The
-   per-cell Net Avg R red/green tone still shows on top. Wins over hover/is-active via order. */
-.neural-lane-table-wrap tbody tr.is-quarantined,
-.neural-lane-table-wrap tbody tr.is-quarantined:hover {
-  background: rgba(167, 139, 250, 0.16);
-}
-.neural-lane-table-wrap tbody tr.is-quarantined td {
-  border-bottom-color: rgba(167, 139, 250, 0.28);
-}
-
-.neural-lane-table-wrap td:first-child i {
-  margin-right: 7px;
-}
-
 @keyframes neural-flow {
   to { stroke-dashoffset: -32; }
 }
@@ -1169,13 +1069,11 @@ i.health-diagnostic {
 
   .neural-inspector {
     display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    border-left: 0;
-    border-top: 1px solid #20313a;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
   }
 
   .neural-inspector-heading {
-    grid-row: span 2;
+    grid-row: auto;
   }
 }
 
@@ -1392,36 +1290,6 @@ i.health-diagnostic {
     text-align: left;
   }
 
-  .neural-bottom-grid {
-    grid-template-columns: 1fr;
-  }
-
-  .neural-alerts {
-    border-right: 0;
-    border-bottom: 1px solid #20313a;
-  }
-
-  .neural-alerts header,
-  .neural-lane-strip header {
-    padding: 0 12px;
-  }
-
-  .neural-alerts button {
-    padding: 12px;
-  }
-
-  .neural-lane-table-wrap {
-    -webkit-overflow-scrolling: touch;
-  }
-
-  .neural-lane-table-wrap table {
-    min-width: 960px;
-  }
-
-  .neural-lane-table-wrap th,
-  .neural-lane-table-wrap td {
-    padding: 0 9px;
-  }
 }
 
 @media (prefers-reduced-motion: reduce) {
