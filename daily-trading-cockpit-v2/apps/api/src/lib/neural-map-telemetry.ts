@@ -2,6 +2,8 @@ import type { CoreScanAutoRefreshStatus } from "./core-scan-auto-refresh.js";
 import {
   BULL_SCALEOUT_VARIANT_ID,
   BULL_TREND_VARIANT_ID,
+  PF_STRONG,
+  STABLE_MIN_FRESH,
   VARIANT_MATRIX_DEFINITIONS,
   WATCHABLE_MIN_FRESH,
   type CurrentGuardVariantMatrixReport,
@@ -741,6 +743,45 @@ function laneEconomics(orders: PaperOrder[], laneId: string) {
   };
 }
 
+function paperBookStatus(economics: ReturnType<typeof laneEconomics>): {
+  status: string;
+  statusReason: string;
+  blockers: string[];
+  cautions: string[];
+} {
+  const blockers: string[] = [];
+  const freshValid = economics.closed;
+  const net = economics.netAvgR;
+  const pf = economics.pf;
+  const clearsHeadline =
+    freshValid >= WATCHABLE_MIN_FRESH &&
+    net !== null && net > 0 &&
+    pf !== null && pf > PF_STRONG;
+
+  if (clearsHeadline) {
+    if (freshValid < STABLE_MIN_FRESH) blockers.push(`freshValid ${freshValid} < ${STABLE_MIN_FRESH} for stable`);
+    return {
+      status: "WATCHABLE",
+      statusReason: `paper-realized freshValid=${freshValid}, net=${fmtR(net)} PF=${pf === Infinity ? "inf" : pf.toFixed(2)} — headline/watchable`,
+      blockers,
+      cautions: ["paper-book lane: VM-only OOS/payoff/stress fields are not required for headline display"],
+    };
+  }
+
+  if (freshValid < WATCHABLE_MIN_FRESH) blockers.push(`freshValid ${freshValid} < ${WATCHABLE_MIN_FRESH}`);
+  if (net === null || net <= 0) blockers.push("netAvgR not positive");
+  if (pf === null || pf <= PF_STRONG) blockers.push(`PF <= ${PF_STRONG}`);
+
+  return {
+    status: economics.open > 0 || freshValid > 0 ? "PAPER_EVIDENCE" : "COLLECTING",
+    statusReason: economics.open > 0 || freshValid > 0
+      ? `paper-realized evidence: freshValid=${freshValid}, net=${fmtR(net)} PF=${pf === Infinity ? "inf" : pf !== null ? pf.toFixed(2) : "n/a"}`
+      : "no paper-book evidence yet",
+    blockers,
+    cautions: ["paper-book lane: VM-only OOS/payoff/stress fields are not available until a VM row exists"],
+  };
+}
+
 function laneLabel(id: string): string {
   if (id === H6_TREND_PAPER_LANE_ID) return "H6 TREND LONG";
   if (id === "CG_VARIANT_MATRIX:CG_WIDE_STOP_TP_WIDE") return "CG_WIDE SHORT";
@@ -1180,8 +1221,9 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
     const infraReady = row
       ? input.variantMatrix.killSwitchReady && input.variantMatrix.orderReconciliationReady && input.variantMatrix.exchangeHealthReady
       : null;
+    const paperStatus = paperBookStatus(economics);
     const pnlIsDiagnosticOnly = economics.headlineClosed === 0 && economics.diagnosticPnl !== 0;
-    const status = evidenceRow?.status ?? (economics.closed > 0 ? "PAPER_EVIDENCE" : "COLLECTING");
+    const status = evidenceRow?.status ?? paperStatus.status;
     const evidenceHealth = healthFromLane(status, evidenceRow?.freshValid ?? economics.closed, netAvgR);
     // Quarantined lanes are benched (no new admissions) but still measured via the VM sim, so
     // they bypass the red/green performance color (reserved for ACTIVE lanes) and show the
@@ -1197,7 +1239,7 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
       ? (graduationReady
           ? `Quarantined (benched) — VM-sim improving to ${fmtR(netAvgR)}; graduation candidate, watch for promotion`
           : `Quarantined (benched, no new admissions) — still collecting VM-sim evidence (${fmtR(netAvgR)})`)
-      : (evidenceRow?.statusReason ?? (economics.open > 0 ? `${economics.open} paper order(s) open` : "paper evidence lane"));
+      : (evidenceRow?.statusReason ?? paperStatus.statusReason);
     const sourceTag = statsSource === "VM_SIM" ? "[stats: VM-sim]" : "[stats: paper realized]";
     const diagTag = pnlIsDiagnosticOnly ? " [PnL: diagnostic-only — excluded from headline]" : "";
     const directionRows = row?.byDirection ?? [];
@@ -1247,8 +1289,8 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
       calendarDays: row?.calendarDays ?? null,
       distinctRegimes: row?.distinctRegimes ?? null,
       infraReady,
-      blockers: row?.blockers ?? [],
-      cautions: row?.cautions ?? [],
+      blockers: row?.blockers ?? paperStatus.blockers,
+      cautions: row?.cautions ?? paperStatus.cautions,
       headlinePnl: economics.headlinePnl,
       diagnosticPnl: economics.diagnosticPnl,
       totalPnl: economics.totalPnl,

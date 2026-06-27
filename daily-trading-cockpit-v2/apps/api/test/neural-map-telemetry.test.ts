@@ -515,6 +515,46 @@ describe("neural map telemetry", () => {
     expect(result.lanes.find((lane) => lane.id === "CG_LONG_VARIANT_MATRIX:CG_WIDE_STOP_TP_WIDE")?.active).toBe(true);
   });
 
+  it("promotes paper-book long lanes to watchable without requiring VM-only fields", () => {
+    const input = baseInput();
+    input.variantMatrix.rows = [];
+    input.orders = Array.from({ length: 20 }, (_, idx) => ({
+      id: `paper-long-win-${idx}`,
+      observationId: `obs-long-win-${idx}`,
+      sourceObservationKey: `BTCUSDT|LONG|2026-06-06T11:${String(idx).padStart(2, "0")}:00.000Z`,
+      sourceType: "ALLOCATOR_LANE",
+      selectedLaneId: "CG_LONG_VARIANT_MATRIX:CG_WIDE_FAST_LONG",
+      symbol: "BTCUSDT",
+      direction: "LONG",
+      regime: "Bullish expansion",
+      entryPrice: 100,
+      stopLoss: 97,
+      takeProfitLevels: [101.5],
+      paperStatus: "PAPER_CLOSED_WIN",
+      netR: 0.4,
+      netPnlAmount: 4,
+      plannedStopDistanceBps: 300,
+      openedAt: "2026-06-06T11:00:00.000Z",
+      updatedAt: "2026-06-06T12:00:00.000Z",
+      closedAt: "2026-06-06T12:00:00.000Z",
+      paperOrderMode: "HEADLINE",
+      paperRiskLabel: "EXPERIMENTAL",
+      reportOnly: true,
+      paperOnly: true,
+    } as never));
+
+    const lane = buildNeuralMapTelemetry(input).lanes.find((candidate) => candidate.id === "CG_LONG_VARIANT_MATRIX:CG_WIDE_FAST_LONG");
+    expect(lane).toMatchObject({
+      status: "WATCHABLE",
+      statsSource: "PAPER_BOOK",
+      closed: 20,
+      pf: Infinity,
+    });
+    expect(lane?.netAvgR).toBeCloseTo(0.4, 9);
+    expect(lane?.blockers).toEqual(["freshValid 20 < 100 for stable"]);
+    expect(lane?.cautions.join(" ")).toContain("VM-only OOS/payoff/stress");
+  });
+
   it("classifies a diagnostic-only loss as DIAGNOSTIC (neutral) — no critical/warning alert", () => {
     const input = baseInput();
     input.orders = [{

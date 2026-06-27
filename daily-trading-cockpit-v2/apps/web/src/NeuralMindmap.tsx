@@ -536,8 +536,9 @@ function compactLaneLabel(label: string): string {
 }
 
 function fmtNumber(value: number | null, digits = 2): string {
-  if (value === null || !Number.isFinite(value)) return 'n/a';
   if (value === Infinity) return 'inf';
+  if (value === -Infinity) return '-inf';
+  if (value === null || !Number.isFinite(value)) return 'n/a';
   return value.toFixed(digits);
 }
 
@@ -719,6 +720,18 @@ function laneMilestone(lane: NeuralLane): { stage: MilestoneStage; reason: strin
       reason: `MIXED is a diagnostic regime aggregate (${freshValid} closed / ${lane.open} open), not an executable lane. It is displayed here for measurement only.`,
     };
   }
+  if (isPaperBookOnlyLane(lane) && paperBookClearsHeadline(lane)) {
+    if (lane.active) {
+      return {
+        stage: 'HEADLINE_ACTIVE',
+        reason: `Paper-book lane clears headline floor: fresh-valid ${freshValid}/${watchableMin}, net ${fmtR(lane.netAvgR)}, PF ${fmtNumber(lane.pf)}.`,
+      };
+    }
+    return {
+      stage: 'HEADLINE_READY',
+      reason: `Paper-book lane clears headline floor: fresh-valid ${freshValid}/${watchableMin}, net ${fmtR(lane.netAvgR)}, PF ${fmtNumber(lane.pf)}.`,
+    };
+  }
   if (status.includes('PROMOTION_CANDIDATE')) {
     return {
       stage: 'PROMOTION_CANDIDATE',
@@ -759,6 +772,18 @@ function laneMilestone(lane: NeuralLane): { stage: MilestoneStage; reason: strin
     stage: 'COLLECTING',
     reason: `No real paper evidence yet. Telemetry is still COLLECTING and needs fresh-valid ${watchableMin}+ before it can become WATCHABLE.`,
   };
+}
+
+function isPaperBookOnlyLane(lane: NeuralLane): boolean {
+  return lane.statsSource === 'PAPER_BOOK' && lane.oosFreshValid === null;
+}
+
+function paperBookClearsHeadline(lane: NeuralLane): boolean {
+  const freshValid = lane.closed;
+  const watchableMin = lane.oosThreshold > 0 ? lane.oosThreshold : 10;
+  return freshValid >= watchableMin &&
+    (lane.netAvgR ?? Number.NEGATIVE_INFINITY) > 0 &&
+    (lane.pf ?? Number.NEGATIVE_INFINITY) > HEADLINE_PF_FLOOR;
 }
 
 function ratioProgress(value: number | null, target: number): number {
@@ -814,6 +839,26 @@ function stageProgress(lane: NeuralLane): StageProgress {
         `netAvgR ${fmtR(lane.netAvgR)}`,
         'read as regime evidence only',
       ],
+    };
+  }
+
+  if (isPaperBookOnlyLane(lane)) {
+    const headlineReady = paperBookClearsHeadline(lane);
+    const requirements = headlineReady ? [
+      { label: `fresh-valid ${freshValid}/${STABLE_MIN_FRESH}`, met: freshValid >= STABLE_MIN_FRESH, progress: ratioProgress(freshValid, STABLE_MIN_FRESH) },
+      { label: `netAvgR > 0.05`, met: (lane.netAvgR ?? Number.NEGATIVE_INFINITY) > 0.05, progress: thresholdProgress(lane.netAvgR, 0.05, 'gt') },
+      { label: `PF > ${HEADLINE_PF_FLOOR}`, met: (lane.pf ?? Number.NEGATIVE_INFINITY) > HEADLINE_PF_FLOOR, progress: thresholdProgress(lane.pf, HEADLINE_PF_FLOOR, 'gt') },
+      { label: 'paper-book lane: VM-only OOS/payoff/stress gates n/a for headline display', met: true, progress: 1 },
+    ] : [
+      { label: `fresh-valid ${freshValid}/${lane.oosThreshold}`, met: freshValid >= lane.oosThreshold, progress: ratioProgress(freshValid, lane.oosThreshold) },
+      { label: `netAvgR > 0`, met: (lane.netAvgR ?? Number.NEGATIVE_INFINITY) > 0, progress: thresholdProgress(lane.netAvgR, 0.01, 'gt') },
+      { label: `PF > ${HEADLINE_PF_FLOOR}`, met: (lane.pf ?? Number.NEGATIVE_INFINITY) > HEADLINE_PF_FLOOR, progress: thresholdProgress(lane.pf, HEADLINE_PF_FLOOR, 'gt') },
+    ];
+    return {
+      nextStage: headlineReady ? 'Stable candidate' : 'Headline / watchable',
+      progressPct: Math.round((requirements.reduce((sum, item) => sum + item.progress, 0) / requirements.length) * 100),
+      blockers: requirements.filter((item) => !item.met).map((item) => item.label),
+      checklist: requirements.map((item) => item.label),
     };
   }
 
