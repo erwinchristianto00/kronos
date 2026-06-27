@@ -120,6 +120,7 @@ import {
 import {
   buildPaperOpportunityAllocatorReport,
   computeAutoQuarantinedVariantLanes,
+  MANUAL_QUARANTINED_PAPER_LANE_IDS,
   type PaperOpportunityAllocatorReport,
   type AllocatorLaneState,
 } from "../lib/paper-opportunity-allocator.js";
@@ -1141,6 +1142,7 @@ export async function registerShadowRoutes(
       mixedValidation,
       staleAudit,
       quarantinedLaneIds: [
+        ...MANUAL_QUARANTINED_PAPER_LANE_IDS,
         ...(process.env.PAPER_CHALLENGER_QUARANTINED !== "0"
           ? ["CG_VARIANT_MATRIX:CG_TRAIL_AFTER_TP1"]
           : []),

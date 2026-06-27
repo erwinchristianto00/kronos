@@ -485,6 +485,11 @@ const PAPER_DIAGNOSTIC_MAX_OPEN_PER_SYMBOL = Number(process.env.PAPER_DIAGNOSTIC
  *  under. OOS velocity is resolution-bound, so 800 is plenty. Env-tunable. */
 const PAPER_DIAGNOSTIC_MAX_OPEN_TOTAL = Number(process.env.PAPER_DIAGNOSTIC_MAX_OPEN_TOTAL) || 800;
 
+export const MANUAL_QUARANTINED_PAPER_LANE_IDS: readonly string[] = [
+  "CG_LONG_VARIANT_MATRIX:CG_SCALEOUT_TP1_TRAIL",
+  "MIXED_CHOP_RANGE_MR",
+];
+
 /**
  * Auto-quarantine thresholds for variant diagnostic lanes. A lane is auto-quarantined (admission
  * halted, rendered violet in the neural map) once it has a confident sample AND a clearly negative
@@ -1167,6 +1172,7 @@ export function buildPaperOpportunityAllocatorReport(
     inputs.paperVariantAutoQuarantineEnabled === true
       ? new Set(computeAutoQuarantinedVariantLanes(currentPaperOrders))
       : new Set<string>();
+  const manualQuarantinedPaperLanes = new Set(MANUAL_QUARANTINED_PAPER_LANE_IDS);
   const cgWidePriority = inputs.paperCgWidePriority === true;
   const cgWideTargetShare =
     typeof inputs.paperCgWideTargetShare === "number" &&
@@ -1549,6 +1555,10 @@ export function buildPaperOpportunityAllocatorReport(
           : `CG_VARIANT_MATRIX:${def.id}`;
       if (bullTrendCollection && laneId !== `CG_LONG_VARIANT_MATRIX:${def.id}`) {
         recordReject(symbol, direction, def.id, "BULL_TREND_LANE_ID_MISMATCH", rowFresh, rowNet);
+        continue;
+      }
+      if (manualQuarantinedPaperLanes.has(laneId)) {
+        recordReject(symbol, direction, def.id, "LANE_MANUALLY_QUARANTINED", rowFresh, rowNet);
         continue;
       }
       const sourceCandidateId = `${symbol}-${direction}`;

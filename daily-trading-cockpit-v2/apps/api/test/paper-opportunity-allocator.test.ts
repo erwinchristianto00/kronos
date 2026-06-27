@@ -18,6 +18,7 @@ import {
   buildPaperOpportunityAllocatorReport,
   buildPaperOpportunityAllocatorBriefLines,
   computeAutoQuarantinedVariantLanes,
+  MANUAL_QUARANTINED_PAPER_LANE_IDS,
   paperOpportunityStopFloorRejection,
   type PaperOpportunityAllocatorInputs,
   type AllocatorLaneState,
@@ -855,7 +856,7 @@ describe("paper-opportunity-allocator", () => {
     expect(report.selectedOpportunities.length).toBe(0);
   });
 
-  it("[11b] Bullish LONG_ONLY creates isolated LONG paper-headline opportunities", async () => {
+  it("[11b] Bullish LONG_ONLY quarantines the deprecated CG_SCALEOUT LONG headline lane", async () => {
     const dir = tmpDir();
     const vmReport = buildEmptyVmReport(dir);
     const report = buildPaperOpportunityAllocatorReport(
@@ -873,37 +874,16 @@ describe("paper-opportunity-allocator", () => {
     );
 
     expect(report.controllerMode).toBe("LONG_ONLY");
-    expect(report.selectedOpportunities).toHaveLength(1);
-    const opportunity = report.selectedOpportunities[0]!;
-    expect(opportunity.laneId).toBe("CG_LONG_VARIANT_MATRIX:CG_SCALEOUT_TP1_TRAIL");
-    expect(opportunity.variantId).toBe("CG_SCALEOUT_TP1_TRAIL");
-    expect(opportunity.direction).toBe("LONG");
-    expect(opportunity.paperOrderMode).toBe("HEADLINE");
-    expect(opportunity.paperRiskLabel).toBe("EXPERIMENTAL");
-    expect(opportunity.provenance?.candidateQualityFlags).toContain("LONG_HEADLINE_FORWARD_OOS_COLLECTION");
-    expect(opportunity.stopLoss).toBeLessThan(opportunity.entryPrice);
-    expect(opportunity.takeProfitLevels[0]).toBeGreaterThan(opportunity.entryPrice);
-
-    const store = new PaperExecutionRouterStore(dir);
-    store.ensurePaperStartAt(new Date(Date.now() - 60 * 60 * 1000).toISOString());
-    const admitted = admitPaperOpportunities({
-      store,
-      opportunities: report.selectedOpportunities,
-      routerReport: routerOf("Bullish expansion"),
-      gateReport: emptyGate(),
-      now: new Date().toISOString(),
-    });
-    expect(admitted.admitted).toBe(1);
-    expect(admitted.admittedHeadline).toBe(1);
-    const order = store.all[0]!;
-    expect(order.direction).toBe("LONG");
-    expect(order.selectedLaneId).toBe("CG_LONG_VARIANT_MATRIX:CG_SCALEOUT_TP1_TRAIL");
-    expect(order.paperOrderMode).toBe("HEADLINE");
-    expect(order.reportOnly).toBe(true);
-    expect(order.paperOnly).toBe(true);
+    expect(MANUAL_QUARANTINED_PAPER_LANE_IDS).toContain("CG_LONG_VARIANT_MATRIX:CG_SCALEOUT_TP1_TRAIL");
+    expect(
+      report.selectedOpportunities.some(
+        (opportunity) => opportunity.laneId === "CG_LONG_VARIANT_MATRIX:CG_SCALEOUT_TP1_TRAIL",
+      ),
+    ).toBe(false);
+    expect(report.topRejects.map((row) => row.key)).toContain("LANE_MANUALLY_QUARANTINED");
   });
 
-  it("[11b-bull] Bullish LONG_ONLY admits the pure bull trend lane alongside LONG scaleout headline", async () => {
+  it("[11b-bull] Bullish LONG_ONLY can still admit pure bull trend while CG_SCALEOUT LONG is quarantined", async () => {
     const dir = tmpDir();
     const vmReport = buildEmptyVmReport(dir);
     const report = buildPaperOpportunityAllocatorReport(
@@ -937,7 +917,8 @@ describe("paper-opportunity-allocator", () => {
       report.selectedOpportunities.some(
         (opportunity) => opportunity.laneId === "CG_LONG_VARIANT_MATRIX:CG_SCALEOUT_TP1_TRAIL",
       ),
-    ).toBe(true);
+    ).toBe(false);
+    expect(report.topRejects.map((row) => row.key)).toContain("LANE_MANUALLY_QUARANTINED");
   });
 
   it("[11b-bull-gates] pure bull trend lane rejects weak trend and contra evidence", async () => {
