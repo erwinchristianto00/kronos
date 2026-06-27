@@ -108,7 +108,7 @@ export const DEFAULT_PAPER_EQUITY = 2000;
 /** Max DIAGNOSTIC closed orders retained in the paper store (rolling measurement window). The
  *  store loads fully each resolve cycle, so unbounded closed-order growth is a memory/latency risk
  *  (the OOM class). HEADLINE (real-ledger) + OPEN orders are NEVER pruned by this. Env-tunable. */
-export const PAPER_MAX_CLOSED_DIAGNOSTIC = Number(process.env.PAPER_MAX_CLOSED_DIAGNOSTIC) || 4000;
+export const PAPER_MAX_CLOSED_DIAGNOSTIC = Number(process.env.PAPER_MAX_CLOSED_DIAGNOSTIC) || 9_999_999;
 const RISK_PCT = 1; // 1% of equity per trade — never changed
 const DEFAULT_PAPER_MAX_NOTIONAL_CAP = 50_000;
 const PAPER_TAKER_COST_BPS = 22; // mirrors TAKER_ROUNDTRIP_BPS from CG variant matrix
