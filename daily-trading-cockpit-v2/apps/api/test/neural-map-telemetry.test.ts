@@ -548,7 +548,7 @@ describe("neural map telemetry", () => {
       status: "WATCHABLE",
       statsSource: "PAPER_BOOK",
       closed: 20,
-      pf: Infinity,
+      pf: 999_999,
     });
     expect(lane?.netAvgR).toBeCloseTo(0.4, 9);
     expect(lane?.blockers).toEqual(["freshValid 20 < 100 for stable"]);

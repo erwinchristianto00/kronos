@@ -326,6 +326,7 @@ const CLOSED = new Set(["PAPER_CLOSED_WIN", "PAPER_CLOSED_LOSS"]);
 const OPEN = new Set(["CREATED", "PAPER_SUBMITTED"]);
 const MARK_CANDLE_MS = 5 * 60 * 1000;
 const DEFAULT_MARK_FETCH_TIMEOUT_MS = 2_500;
+const PERFECT_PF_SENTINEL = 999_999;
 
 export interface PaperMarkPriceClient {
   getCandles(symbol: string, interval: string, limit: number): Promise<Array<{
@@ -735,7 +736,8 @@ function laneEconomics(orders: PaperOrder[], laneId: string) {
     closed: closed.length,
     headlineClosed: headline.length,
     netAvgR: nets.length > 0 ? nets.reduce((sum, value) => sum + value, 0) / nets.length : null,
-    pf: negative > 0 ? positive / negative : positive > 0 ? Infinity : null,
+    // JSON serializes Infinity as null, so use a large finite sentinel for no-loss profitable lanes.
+    pf: negative > 0 ? positive / negative : positive > 0 ? PERFECT_PF_SENTINEL : null,
     wr: closed.length > 0 ? closed.filter((order) => order.paperStatus === "PAPER_CLOSED_WIN").length / closed.length : null,
     headlinePnl: headline.reduce((sum, order) => sum + (order.netPnlAmount ?? 0), 0),
     diagnosticPnl: diagnostic.reduce((sum, order) => sum + (order.netPnlAmount ?? 0), 0),
@@ -762,7 +764,7 @@ function paperBookStatus(economics: ReturnType<typeof laneEconomics>): {
     if (freshValid < STABLE_MIN_FRESH) blockers.push(`freshValid ${freshValid} < ${STABLE_MIN_FRESH} for stable`);
     return {
       status: "WATCHABLE",
-      statusReason: `paper-realized freshValid=${freshValid}, net=${fmtR(net)} PF=${pf === Infinity ? "inf" : pf.toFixed(2)} — headline/watchable`,
+      statusReason: `paper-realized freshValid=${freshValid}, net=${fmtR(net)} PF=${pf >= PERFECT_PF_SENTINEL ? "inf" : pf.toFixed(2)} — headline/watchable`,
       blockers,
       cautions: ["paper-book lane: VM-only OOS/payoff/stress fields are not required for headline display"],
     };
@@ -775,7 +777,7 @@ function paperBookStatus(economics: ReturnType<typeof laneEconomics>): {
   return {
     status: economics.open > 0 || freshValid > 0 ? "PAPER_EVIDENCE" : "COLLECTING",
     statusReason: economics.open > 0 || freshValid > 0
-      ? `paper-realized evidence: freshValid=${freshValid}, net=${fmtR(net)} PF=${pf === Infinity ? "inf" : pf !== null ? pf.toFixed(2) : "n/a"}`
+      ? `paper-realized evidence: freshValid=${freshValid}, net=${fmtR(net)} PF=${pf !== null && pf >= PERFECT_PF_SENTINEL ? "inf" : pf !== null ? pf.toFixed(2) : "n/a"}`
       : "no paper-book evidence yet",
     blockers,
     cautions: ["paper-book lane: VM-only OOS/payoff/stress fields are not available until a VM row exists"],
@@ -1289,8 +1291,8 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
       calendarDays: row?.calendarDays ?? null,
       distinctRegimes: row?.distinctRegimes ?? null,
       infraReady,
-      blockers: row?.blockers ?? paperStatus.blockers,
-      cautions: row?.cautions ?? paperStatus.cautions,
+      blockers: evidenceRow?.blockers ?? paperStatus.blockers,
+      cautions: evidenceRow?.cautions ?? paperStatus.cautions,
       headlinePnl: economics.headlinePnl,
       diagnosticPnl: economics.diagnosticPnl,
       totalPnl: economics.totalPnl,

@@ -539,6 +539,7 @@ function fmtNumber(value: number | null, digits = 2): string {
   if (value === Infinity) return 'inf';
   if (value === -Infinity) return '-inf';
   if (value === null || !Number.isFinite(value)) return 'n/a';
+  if (value >= 999_999) return 'inf';
   return value.toFixed(digits);
 }
 
