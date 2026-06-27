@@ -37,6 +37,7 @@ import {
   isRealtimeShortAllowedVariantId,
   runRealtimeShortMirror,
 } from "../lib/realtime-short-mirror.js";
+import { estimateLaneSelectorV2Regime } from "../lib/lane-selector-v2.js";
 import {
   RegimeControllerAlignedShadowStore,
   admitToControllerAlignedShadow,
@@ -396,9 +397,14 @@ export async function registerScanRoute(
             byRegimeFamily: r.byRegimeFamily,
             bySymbol: r.bySymbol,
           }));
-        const controllerMode = buildRegimeDirectionControllerReport({
+        const controllerReport = buildRegimeDirectionControllerReport({
           currentRegime: result.marketRegime,
-        }).controllerMode;
+        });
+        const estimatedRegime = estimateLaneSelectorV2Regime({
+          regime: controllerReport.currentRegime,
+          controllerMode: controllerReport.controllerMode,
+          confidence: controllerReport.confidence,
+        });
         runRealtimeShortMirror({
           candidates: top10WithPlan.map((c) => ({
             symbol: c.symbol,
@@ -414,7 +420,9 @@ export async function registerScanRoute(
             stopDistanceBps: c.selectedExecutionPlan?.stopDistanceBps ?? null,
           })),
           regime: result.marketRegime,
-          controllerMode,
+          controllerMode: controllerReport.controllerMode,
+          controllerConfidence: controllerReport.confidence,
+          estimatedRegime,
           stableShortLanes,
           now: new Date().toISOString(),
         });

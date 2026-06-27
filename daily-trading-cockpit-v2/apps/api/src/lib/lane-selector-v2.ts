@@ -76,11 +76,20 @@ export interface LaneSelectorV2ScoreBreakdown {
   total: number;
 }
 
+export interface LaneSelectorV2EstimatedRegime {
+  posture: "EXTENDED_TREND" | "TACTICAL_OR_MIXED";
+  direction: Direction | "MIXED" | null;
+  policy: "WIDE_TREND" | "TACTICAL_70_30";
+  reason: string;
+}
+
 export interface LaneSelectorV2Inputs {
   candidate: LaneSelectorV2Candidate;
   laneStates: LaneSelectorV2LaneState[];
   regime: string | null;
   controllerMode: string | null;
+  controllerConfidence?: string | null;
+  estimatedRegime?: LaneSelectorV2EstimatedRegime | null;
   now: string;
   maxStopDistanceBps?: number;
 }
@@ -99,6 +108,8 @@ export interface LaneSelectorV2Result {
 const DEFAULT_MAX_STOP_DISTANCE_BPS = 1200;
 const MIN_REGIME_SAMPLE = 10;
 const MIN_SYMBOL_SAMPLE = 5;
+const WIDE_TREND_VARIANT_ID: VariantMatrixVariantId = "CG_WIDE_STOP_TP_WIDE";
+const TACTICAL_TIGHT_VARIANT_ID: VariantMatrixVariantId = "CG_TIGHT_FAST_05";
 
 function isFiniteNumber(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value);
@@ -114,7 +125,7 @@ function clamp(value: number, min: number, max: number): number {
 
 export function laneSelectorV2ControllerAllowsDirection(mode: string | null | undefined, direction: Direction): boolean {
   const m = (mode ?? "").toUpperCase();
-  if (m === "BOTH_ALLOWED") return true;
+  if (m === "BOTH_ALLOWED" || m === "VALIDATION_ONLY") return true;
   if (direction === "SHORT") return m === "SHORT_ONLY";
   return m === "LONG_ONLY";
 }
@@ -235,6 +246,75 @@ function buildSignal(candidate: LaneSelectorV2Candidate, regime: string | null, 
   };
 }
 
+export function estimateLaneSelectorV2Regime(input: {
+  regime: string | null;
+  controllerMode: string | null;
+  confidence?: string | null;
+}): LaneSelectorV2EstimatedRegime {
+  const regime = (input.regime ?? "").toLowerCase();
+  const mode = (input.controllerMode ?? "").toUpperCase();
+  const confidence = (input.confidence ?? "").toUpperCase();
+  const mixed =
+    mode === "VALIDATION_ONLY" ||
+    mode === "NO_TRADE_CHOP" ||
+    mode === "BOTH_ALLOWED" ||
+    /mixed|rotation|chop|range|sideways|neutral|unknown/.test(regime);
+  const direction: Direction | "MIXED" | null =
+    mixed
+      ? "MIXED"
+      : mode === "LONG_ONLY" || /bull|long/.test(regime)
+        ? "LONG"
+        : mode === "SHORT_ONLY" || /bear|short/.test(regime)
+          ? "SHORT"
+          : null;
+  const trendLike = /trend|expansion|pressure|continuation|impulse|breakout|strong/.test(regime);
+  const confidenceOk = confidence === "MEDIUM" || confidence === "HIGH";
+  if (direction !== null && direction !== "MIXED" && trendLike && confidenceOk) {
+    return {
+      posture: "EXTENDED_TREND",
+      direction,
+      policy: "WIDE_TREND",
+      reason: `${direction} extended: mode=${mode || "n/a"} confidence=${confidence || "n/a"} regime=${input.regime ?? "n/a"}`,
+    };
+  }
+  return {
+    posture: "TACTICAL_OR_MIXED",
+    direction,
+    policy: "TACTICAL_70_30",
+    reason: `tactical: mode=${mode || "n/a"} confidence=${confidence || "n/a"} regime=${input.regime ?? "n/a"}`,
+  };
+}
+
+function hashBucket0to99(key: string): number {
+  let hash = 2166136261;
+  for (let i = 0; i < key.length; i += 1) {
+    hash ^= key.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return Math.abs(hash >>> 0) % 100;
+}
+
+function tacticalMfeVariant(direction: Direction): VariantMatrixVariantId {
+  return direction === "LONG" ? "CG_EXP_LONG_MFE_GIVEBACK_10X" : "CG_EXP_SHORT_MFE_GIVEBACK_10X";
+}
+
+function policyPreferredVariants(
+  inputs: LaneSelectorV2Inputs,
+  estimated: LaneSelectorV2EstimatedRegime,
+): VariantMatrixVariantId[] {
+  if (
+    estimated.policy === "WIDE_TREND" &&
+    estimated.direction === inputs.candidate.direction
+  ) {
+    return [WIDE_TREND_VARIANT_ID];
+  }
+  const mfe = tacticalMfeVariant(inputs.candidate.direction);
+  const tight = TACTICAL_TIGHT_VARIANT_ID;
+  const minuteBucket = inputs.now.slice(0, 16);
+  const bucket = hashBucket0to99(`${inputs.candidate.symbol}:${inputs.candidate.direction}:${minuteBucket}`);
+  return bucket < 70 ? [mfe, tight] : [tight, mfe];
+}
+
 export function selectLaneV2(inputs: LaneSelectorV2Inputs): LaneSelectorV2Result {
   const rejected: string[] = [];
   const evaluated: LaneSelectorV2Result["evaluated"] = [];
@@ -246,6 +326,7 @@ export function selectLaneV2(inputs: LaneSelectorV2Inputs): LaneSelectorV2Result
   const maxStopDistanceBps = inputs.maxStopDistanceBps ?? DEFAULT_MAX_STOP_DISTANCE_BPS;
   const signal = buildSignal(candidate, inputs.regime, inputs.now);
   let best: LaneSelectorV2Geometry | null = null;
+  const byVariant = new Map<VariantMatrixVariantId, LaneSelectorV2Geometry>();
 
   for (const state of inputs.laneStates) {
     if (state.status !== "STABLE_CANDIDATE") {
@@ -292,9 +373,20 @@ export function selectLaneV2(inputs: LaneSelectorV2Inputs): LaneSelectorV2Result
       score: scored.score,
       scoreBreakdown,
     });
+    byVariant.set(config.variantId, scored);
     if (!best || scored.score > best.score) best = scored;
   }
 
   evaluated.sort((left, right) => right.score - left.score);
+  const estimated = inputs.estimatedRegime ?? estimateLaneSelectorV2Regime({
+    regime: inputs.regime,
+    controllerMode: inputs.controllerMode,
+    confidence: inputs.controllerConfidence,
+  });
+  for (const variantId of policyPreferredVariants(inputs, estimated)) {
+    const policyPick = byVariant.get(variantId);
+    if (policyPick) return { selected: policyPick, rejected, evaluated };
+    rejected.push(`${variantId}:policy_target_unavailable`);
+  }
   return { selected: best, rejected, evaluated };
 }

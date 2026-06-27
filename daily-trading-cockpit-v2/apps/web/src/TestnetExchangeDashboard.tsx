@@ -22,6 +22,12 @@ interface LiveStatus {
     mode: string | null;
     bias?: string | null;
     confidence?: string | null;
+    estimatedRegime?: {
+      posture: 'EXTENDED_TREND' | 'TACTICAL_OR_MIXED';
+      direction: 'LONG' | 'SHORT' | 'MIXED' | null;
+      policy: 'WIDE_TREND' | 'TACTICAL_70_30';
+      reason: string;
+    } | null;
     reasons?: string[];
     capturedAt?: string | null;
   } | null;
@@ -212,6 +218,11 @@ export default function TestnetExchangeDashboard() {
           <span>Regime</span>
           <strong>{status?.controller?.regime ?? 'Loading'}</strong>
           <small>{status?.controller?.mode ?? 'mode n/a'} · {status?.controller?.bias ?? 'bias n/a'} · {status?.controller?.confidence ?? 'confidence n/a'}</small>
+        </div>
+        <div>
+          <span>Estimated regime</span>
+          <strong>{status?.controller?.estimatedRegime?.posture === 'EXTENDED_TREND' ? 'Long/short extended' : 'Tactical / mixed'}</strong>
+          <small>{status?.controller?.estimatedRegime?.policy === 'WIDE_TREND' ? 'STOP WIDE TP WIDE' : '70% EXP MFE 10x · 30% TIGHT FAST'} · {status?.controller?.estimatedRegime?.direction ?? 'n/a'}</small>
         </div>
         <div>
           <span>Binance equity</span>

@@ -35,6 +35,7 @@ import {
 import { getLatestScanCandidates } from "./lib/latest-scan-candidates-cache.js";
 import { buildRegimeDirectionControllerReport } from "./lib/regime-direction-controller.js";
 import { getRegimeDirectionControllerSnapshotStore } from "./lib/regime-direction-controller-snapshot.js";
+import { estimateLaneSelectorV2Regime } from "./lib/lane-selector-v2.js";
 
 export interface AppOptions {
   fetchImpl?: typeof fetch;
@@ -165,11 +166,17 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           adaptiveDirectionBias: null,
           primaryValidationLane: null,
         });
+        const estimatedRegime = estimateLaneSelectorV2Regime({
+          regime: controller.currentRegime,
+          controllerMode: controller.controllerMode,
+          confidence: controller.confidence,
+        });
         return {
           regime: controller.currentRegime,
           mode: controller.controllerMode,
           bias: controller.directionalBias,
           confidence: controller.confidence,
+          estimatedRegime,
           reasons: controller.reasonCodes,
           capturedAt: cached?.scanFinishedAt ?? scanStatus.lastAutoRefreshFinishedAt ?? fallbackSnapshot?.capturedAt ?? null,
         };

@@ -28,10 +28,12 @@ import {
 } from "./paper-execution-router.js";
 import {
   LANE_SELECTOR_V2_LIVE_SUPPORTED_VARIANT_IDS,
+  estimateLaneSelectorV2Regime,
   isLaneSelectorV2SupportedVariantId,
   laneSelectorV2LaneId,
   selectLaneV2,
   type LaneSelectorV2Geometry,
+  type LaneSelectorV2EstimatedRegime,
   type LaneSelectorV2LaneState,
 } from "./lane-selector-v2.js";
 import type { VariantMatrixVariantId } from "./current-guard-variant-matrix.js";
@@ -89,6 +91,8 @@ export interface RealtimeShortMirrorInputs {
   candidates: RealtimeShortCandidate[];
   regime: string | null;
   controllerMode: string | null;
+  controllerConfidence?: string | null;
+  estimatedRegime?: LaneSelectorV2EstimatedRegime | null;
   /** Back-compat: CG_WIDE_FAST_SHORT must currently be STABLE_CANDIDATE. Prefer stableShortLanes. */
   stableShortLaneActive?: boolean;
   /** Current VM rows for the only live-testnet-allowed short lanes. Must be STABLE_CANDIDATE. */
@@ -143,6 +147,11 @@ export function runRealtimeShortMirror(
   const result: RealtimeShortMirrorResult = { emitted: 0, skipped: 0, reasons: [] };
   const maxPerCycle = inputs.maxPerCycle ?? DEFAULT_MAX_PER_CYCLE;
   const laneStates = effectiveLaneStates(inputs);
+  const estimatedRegime = inputs.estimatedRegime ?? estimateLaneSelectorV2Regime({
+    regime: inputs.regime,
+    controllerMode: inputs.controllerMode,
+    confidence: inputs.controllerConfidence,
+  });
 
   // Only exact STABLE_CANDIDATE rows can emit into /testnet. WATCHABLE/COLLECTING/REJECT
   // (or any future "headline active" downgrade label) stops being live-eligible immediately.
@@ -182,6 +191,8 @@ export function runRealtimeShortMirror(
       laneStates,
       regime: inputs.regime,
       controllerMode: inputs.controllerMode,
+      controllerConfidence: inputs.controllerConfidence,
+      estimatedRegime,
       now: inputs.now,
     });
     if (!selected.selected) {

@@ -204,12 +204,12 @@ describe("realtime-short-mirror — fresh short live-mirror source (mode 2)", ()
   });
 
   it("[CONTROLLER-GATE] emits only when the controller allows shorts", () => {
-    for (const mode of ["LONG_ONLY", "NO_TRADE_CHOP", "VALIDATION_ONLY", "UNKNOWN"]) {
+    for (const mode of ["LONG_ONLY", "NO_TRADE_CHOP", "UNKNOWN"]) {
       const store = freshStore();
       const res = runRealtimeShortMirror(inputs([shortCand("BTCUSDT")], { controllerMode: mode }), store);
       expect(res.emitted, `mode=${mode} must block`).toBe(0);
     }
-    for (const mode of ["SHORT_ONLY", "BOTH_ALLOWED"]) {
+    for (const mode of ["SHORT_ONLY", "BOTH_ALLOWED", "VALIDATION_ONLY"]) {
       const store = freshStore();
       const res = runRealtimeShortMirror(inputs([shortCand("BTCUSDT")], { controllerMode: mode }), store);
       expect(res.emitted, `mode=${mode} must allow`).toBe(1);

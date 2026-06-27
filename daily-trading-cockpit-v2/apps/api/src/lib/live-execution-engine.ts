@@ -40,6 +40,7 @@ import {
   MFE_GIVEBACK_FRAC,
   type VariantExitRule,
 } from "./current-guard-variant-matrix.js";
+import type { LaneSelectorV2EstimatedRegime } from "./lane-selector-v2.js";
 import type { PaperOrder } from "./paper-execution-router.js";
 
 // ─── config ──────────────────────────────────────────────────────────────────
@@ -82,6 +83,7 @@ export interface LiveControllerSnapshot {
   mode: string | null;
   bias?: string | null;
   confidence?: string | null;
+  estimatedRegime?: LaneSelectorV2EstimatedRegime | null;
   reasons?: string[];
   capturedAt?: string | null;
 }
