@@ -35,7 +35,10 @@ import {
 import { getLatestScanCandidates } from "./lib/latest-scan-candidates-cache.js";
 import { buildRegimeDirectionControllerReport } from "./lib/regime-direction-controller.js";
 import { getRegimeDirectionControllerSnapshotStore } from "./lib/regime-direction-controller-snapshot.js";
-import { estimateLaneSelectorV2Regime } from "./lib/lane-selector-v2.js";
+import {
+  estimateLaneSelectorV2Regime,
+  isLaneSelectorV2LongWideStopOverride,
+} from "./lib/lane-selector-v2.js";
 
 export interface AppOptions {
   fetchImpl?: typeof fetch;
@@ -143,11 +146,33 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         ? getRealtimeShortMirrorStore()
         : getPaperExecutionRouterStore(),
       isPaperOrderLiveEligible: (order) => {
-        if (liveConfig.env === "testnet" && !isRealtimeShortAllowedLaneId(order.selectedLaneId)) return false;
+        const useTestnetPolicy =
+          liveConfig.env === "testnet" ||
+          (liveConfig.env === "mainnet" && liveConfig.mainnetKeepTestnetPolicy);
+        if (useTestnetPolicy && !isRealtimeShortAllowedLaneId(order.selectedLaneId)) return false;
+        const orderEstimatedRegime = estimateLaneSelectorV2Regime({
+          regime: order.regime,
+          controllerMode: order.controllerMode,
+          confidence: order.controllerConfidence ?? null,
+        });
+        if (
+          useTestnetPolicy &&
+          orderEstimatedRegime.direction === "MIXED" &&
+          order.symbol.toUpperCase() === "NEARUSDT"
+        ) {
+          return false;
+        }
         const report = buildCurrentGuardVariantMatrixReport(getCurrentGuardVariantMatrixStore());
         const laneVariantId = order.selectedLaneId.split(":").pop() ?? order.selectedLaneId;
         const row = report.rows.find((candidate) => candidate.variantId === laneVariantId);
-        return row?.status === "STABLE_CANDIDATE";
+        return (
+          row?.status === "STABLE_CANDIDATE" ||
+          isLaneSelectorV2LongWideStopOverride({
+            variantId: laneVariantId,
+            direction: order.direction,
+            estimatedRegime: orderEstimatedRegime,
+          })
+        );
       },
       getControllerSnapshot: () => {
         const cached = getLatestScanCandidates();

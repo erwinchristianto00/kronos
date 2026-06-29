@@ -228,6 +228,23 @@ import {
   H6_TREND_INTERVAL,
   H6_TREND_PAPER_ADMISSION_MAX_AGE_MS,
 } from "../lib/h6-trend-edge.js";
+import {
+  getCrossSectionalStore,
+  runCrossSectionalCycleGuarded,
+  buildCrossSectionalReport,
+  isCrossSectionalEdgeDisabled,
+  CROSS_SECTIONAL_INTERVAL,
+  CROSS_SECTIONAL_MOMENTUM_BARS,
+} from "../lib/cross-sectional-edge.js";
+import { readFileSync } from "node:fs";
+import { analyzeHardCutCounterfactuals, extractHardCutIntents } from "../lib/hard-cut-counterfactual.js";
+import { isMoonshotLotteryEnabled } from "../lib/moonshot-lottery-lane.js";
+import {
+  getMoonshotStore,
+  runMoonshotCycleGuarded,
+  buildMoonshotReport,
+  MOONSHOT_DEFAULT_MAX_LEVERAGE,
+} from "../lib/moonshot-lottery-cycle.js";
 import { getCandidateFunnelLog } from "../lib/accelerated-evidence-candidate-funnel-log.js";
 import {
   buildPortfolioTrendShadowReport,
@@ -575,6 +592,52 @@ export async function registerShadowRoutes(
       latestRefreshDiagnostics: state.latestRefreshDiagnostics ?? null,
     };
   });
+
+  // Cross-sectional market-neutral measurement lane — report + open/closed baskets (report-only).
+  app.get("/api/shadow/cross-sectional-report", async () => {
+    const store = getCrossSectionalStore();
+    const slim = (o: { openedAt: string; resolvedAt: string | null; netReturn: number | null; grossReturn: number | null; signal: string; longLeg: { symbol: string }[]; shortLeg: { symbol: string }[] }) => ({
+      openedAt: o.openedAt,
+      resolvedAt: o.resolvedAt,
+      signal: o.signal,
+      netReturnPct: o.netReturn != null ? o.netReturn * 100 : null,
+      grossReturnPct: o.grossReturn != null ? o.grossReturn * 100 : null,
+      long: o.longLeg.map((l) => l.symbol),
+      short: o.shortLeg.map((l) => l.symbol),
+    });
+    return {
+      report: buildCrossSectionalReport(store),
+      openBaskets: store.all.filter((o) => o.status === "OPEN").map(slim),
+      recentClosed: store.all.filter((o) => o.status === "CLOSED").slice(-15).map(slim),
+    };
+  });
+
+  // Hard-cut counterfactual: for each anti-bull hard-cut that already fired, replay the forward price
+  // and compare cutting vs riding to the stop — measures whether the 30-min threshold actually helps.
+  // Reads the testnet live engine's intents off the shared VPS filesystem (report-only, no engine touch).
+  app.get("/api/shadow/hard-cut-counterfactual", async () => {
+    const path = process.env.HARD_CUT_CF_INTENTS_PATH
+      ?? "/root/kronos-testnet/daily-trading-cockpit-v2/apps/api/data/live-execution.json";
+    let state: { intents?: unknown[] } | null = null;
+    try {
+      state = JSON.parse(readFileSync(path, "utf-8")) as { intents?: unknown[] };
+    } catch {
+      state = null;
+    }
+    const intents = extractHardCutIntents(state);
+    if (!opts.binanceClient) {
+      return { available: false, reason: "market client unavailable", hardCutsFound: intents.length };
+    }
+    const bc = opts.binanceClient;
+    return analyzeHardCutCounterfactuals(
+      intents,
+      async (symbol, startMs, endMs) => bc.getCandles(symbol, "15m", 200, { startTime: startMs, endTime: endMs }),
+      { windowMs: 12 * 60 * 60_000, nowMs: Date.now() },
+    );
+  });
+
+  // MOONSHOT_LOTTERY_LANE demo report — daily budget state + recent signals/rejects (report-only).
+  app.get("/api/shadow/moonshot-report", async () => buildMoonshotReport(getMoonshotStore(), Date.now()));
 
   app.get("/api/shadow/routing-monitor", async (_request, reply) => {
     if (!shadowEngine) {
@@ -1413,6 +1476,46 @@ export async function registerShadowRoutes(
             },
           }).catch(() => undefined);
         }
+        // Cross-sectional market-neutral measurement lane: rank the universe by N-bar momentum, go
+        // (hypothetically) long-top-k / short-bottom-k at equal notional, measure the forward basket
+        // return. Beta cancels → the P&L is dispersion, which can be positive in BOTH bull and bear.
+        // Report-only, fire-and-forget, env-gated. NOT regime-gated — it's market-neutral by design.
+        if (!isCrossSectionalEdgeDisabled()) {
+          const _xsc = opts.binanceClient;
+          void runCrossSectionalCycleGuarded({
+            store: getCrossSectionalStore(),
+            universe: [...CURRENT_SCANNER_UNIVERSE],
+            now: Date.now(),
+            fetchCandles: async (symbol: string) =>
+              _xsc.getCandles(symbol, CROSS_SECTIONAL_INTERVAL, CROSS_SECTIONAL_MOMENTUM_BARS + 5),
+          }).catch(() => undefined);
+        }
+        // MOONSHOT_LOTTERY_LANE (demo/report-only): cheap prefilter → deep-extract top movers →
+        // score/risk/leverage gate → LOG signals & rejects. Generates SIGNAL objects only; the
+        // existing execution engine would consume them later. Env-gated, fire-and-forget. Demo uses a
+        // default symbol max-leverage/minNotional — real execution MUST re-check the leverage bracket.
+        if (isMoonshotLotteryEnabled() && opts.binanceClient) {
+          const _mbc = opts.binanceClient;
+          void runMoonshotCycleGuarded({
+            universe: [...CURRENT_SCANNER_UNIVERSE],
+            now: Date.now(),
+            store: getMoonshotStore(),
+            ctx: {
+              getCandles1m: async (sym, limit) => (await _mbc.getCandles(sym, "1m", limit)).map((c) => ({ close: c.close, volume: c.volume })),
+              getFlow: async (sym) => _mbc.getFuturesFlow(sym),
+              getDepth: async (sym) => {
+                const d = await _mbc.getDepth(sym, 50);
+                return {
+                  bids: d.bids.map(([p, q]) => [Number(p), Number(q)] as [number, number]),
+                  asks: d.asks.map(([p, q]) => [Number(p), Number(q)] as [number, number]),
+                };
+              },
+              getMarkPrice: async (sym) => (await _mbc.getFuturesPremiumIndex(sym)).markPrice,
+              minNotionalUsd: () => 5, // Binance futures common minNotional; execution re-checks per-symbol
+              maxLeverage: () => MOONSHOT_DEFAULT_MAX_LEVERAGE,
+            },
+          }).catch(() => undefined);
+        }
       }
       let postCutoverReport: PostCutoverReport | undefined;
       try {
@@ -1674,6 +1777,18 @@ export async function registerShadowRoutes(
               paperCgWideTargetShare: (() => {
                 const n = Number(process.env.PAPER_CG_WIDE_TARGET_SHARE);
                 return Number.isFinite(n) && n > 0 && n < 1 ? n : 0.9;
+              })(),
+              // EXP 10x MFE LONG priority: main `/` paper collection should prefer this
+              // long diagnostic lane while bullish LONG_ONLY is active. Paper-only; testnet
+              // live mirror still has its own stable-candidate selector.
+              paperExpLongMfePriority: process.env.PAPER_EXP_LONG_MFE_PRIORITY !== "0",
+              paperExpLongMfeMaxPerScan: (() => {
+                const n = Number(process.env.PAPER_EXP_LONG_MFE_MAX_PER_SCAN);
+                return Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
+              })(),
+              paperExpLongMfeTargetShare: (() => {
+                const n = Number(process.env.PAPER_EXP_LONG_MFE_TARGET_SHARE);
+                return Number.isFinite(n) && n > 0 && n < 1 ? n : undefined;
               })(),
               symbolsWithPositiveCohort: _symbolsWithPositiveCohort,
               symbolHistoricalNetMap: _symbolHistoricalNetMap,

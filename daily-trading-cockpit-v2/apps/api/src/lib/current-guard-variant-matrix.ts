@@ -127,6 +127,13 @@ export const TAKER_ROUNDTRIP_BPS = REALISTIC_ROUND_TRIP_FEE_SLIP_BPS; // 22 (fee
 // ~2bps/side; we add a conservative buffer so we never over-claim the maker edge.
 export const MAKER_ROUNDTRIP_BPS = REALISTIC_FEE_BPS_PER_SIDE + 1; // 6 (conservative maker round-trip)
 export const STRESS_EXTRA_BPS = 10; // +10bps slippage stress test
+// Fresh-feed measurement: an observation is "fresh-valid" only if its entry was placed within this
+// window of now — i.e. a price you could ACTUALLY have taken live. The old engine hardcoded this
+// `true` on every (median-6h-stale) obs, which was misleading; now it means what it says.
+export const FRESH_ENTRY_MAX_MINUTES = 10;
+// Perp funding (paid ~every 8h on notional). The old cost model ignored it, overstating the net of
+// multi-hour/day holds (the wide lanes hold 24h–144h). ~1.5bp/8h is a conservative typical-alt rate.
+export const FUNDING_BPS_PER_8H = 1.5;
 // Stop-out exits slip MORE than TP/limit exits: a stop-market order fills during a
 // fast ADVERSE move (volatility / liquidation cascade), so a CLOSED_LOSS pays extra
 // slippage beyond the flat round-trip. The old flat cost model missed this asymmetry,
@@ -591,6 +598,11 @@ export const BASELINE_VARIANT_ID: VariantMatrixVariantId = "CG_BASELINE_CURRENT"
 // Source qualifying signal (geometry-bearing). The route builds these from
 // qualifying current-guard ShadowPositions; tests build them synthetically.
 // ---------------------------------------------------------------------------
+/** Regime posture at signal time — how long the regime is expected to persist. */
+export type VariantPosture = "TACTICAL" | "EXTENDED";
+/** Direction the regime favors at signal time (independent of the trade's own direction). */
+export type VariantRegimeDirection = "LONG" | "SHORT" | "MIXED";
+
 export interface VariantMatrixSignal {
   sourceSignalId: string;
   symbol: string;
@@ -605,6 +617,9 @@ export interface VariantMatrixSignal {
   entryVariant: string | null;
   openedAt: string;
   closedAt: string | null;
+  /** Regime posture + favored direction at signal time (fresh-feed populates these; null on legacy). */
+  posture?: VariantPosture | null;
+  regimeDirection?: VariantRegimeDirection | null;
 }
 
 export interface CurrentGuardVariantMatrixObservation {
@@ -647,7 +662,15 @@ export interface CurrentGuardVariantMatrixObservation {
   durationMinutes: number | null;
   resolutionSource: string | null;
   intrabarResolutionStatus: VariantIntrabarStatus;
+  // Minutes between the entry (openedAt) and when the observation was recorded (createdAt). The
+  // fresh feed makes this ≈0; the old shadow-position feed made it ~6h median. isFreshValid is now
+  // computed from it at CREATION (lag ≤ FRESH_ENTRY_MAX_MINUTES) — a real live-tradeability flag,
+  // not the old hardcoded `true`.
+  entryLagMinutes: number | null;
   isFreshValid: boolean | null;
+  // Regime posture + favored direction captured at signal time (fresh feed; null on legacy obs).
+  posture: VariantPosture | null;
+  regimeDirection: VariantRegimeDirection | null;
 
   reportOnly: true;
   laneVersion: typeof CURRENT_GUARD_VARIANT_MATRIX_LANE;
@@ -1046,6 +1069,12 @@ export function buildVariantMatrixObservationsForSignal(
   const originalTps = [signal.tp1, signal.tp2, signal.tp3].filter(
     (v): v is number => typeof v === "number" && v > 0,
   );
+  // Entry freshness is decided HERE, at creation (now − entry time), not hardcoded at resolution.
+  const openedMs = toMs(signal.openedAt);
+  const createdMs = toMs(nowIso);
+  const entryLagMinutes =
+    openedMs != null && createdMs != null ? Math.max(0, Math.round((createdMs - openedMs) / 60000)) : null;
+  const isFreshValid = entryLagMinutes != null ? entryLagMinutes <= FRESH_ENTRY_MAX_MINUTES : null;
   const observations: CurrentGuardVariantMatrixObservation[] = [];
   for (const def of VARIANT_MATRIX_DEFINITIONS) {
     const geo = deriveVariantGeometry(signal, def);
@@ -1075,7 +1104,10 @@ export function buildVariantMatrixObservationsForSignal(
       durationMinutes: null,
       resolutionSource: null,
       intrabarResolutionStatus: null,
-      isFreshValid: null,
+      entryLagMinutes,
+      isFreshValid,
+      posture: signal.posture ?? null,
+      regimeDirection: signal.regimeDirection ?? null,
       reportOnly: true as const,
       laneVersion: CURRENT_GUARD_VARIANT_MATRIX_LANE,
     };
@@ -1592,19 +1624,27 @@ export async function resolveVariantMatrixObservations(
           const stopOutSlipR = stopTriggeredExit
             ? STOP_OUT_SLIPPAGE_BPS / (obs.stopDistanceBps || WIDE_STOP_MIN_BPS)
             : 0;
-          const effectiveCostR = (obs.costR ?? 0) + stopOutSlipR;
+          const durationMin = Math.max(0, Math.round((resolvedAtMs - effectiveOpenedAtMs) / 60000));
+          // Funding: perps pay ~every 8h on notional. In R-terms = (periods × bps/8h) / stopDistanceBps.
+          // The old model ignored this, overstating the net of multi-hour/day holds.
+          const fundingPeriods = Math.floor(durationMin / (8 * 60));
+          const fundingR =
+            fundingPeriods > 0
+              ? (fundingPeriods * FUNDING_BPS_PER_8H) / (obs.stopDistanceBps || WIDE_STOP_MIN_BPS)
+              : 0;
+          const effectiveCostR = (obs.costR ?? 0) + stopOutSlipR + fundingR;
           store.update(obs.observationId, {
             status: walk.status,
             grossR,
             costR: effectiveCostR,
             netR: grossR - effectiveCostR,
             resolvedAt: new Date(resolvedAtMs).toISOString(),
-            durationMinutes: Math.max(0, Math.round((resolvedAtMs - effectiveOpenedAtMs) / 60000)),
+            durationMinutes: durationMin,
             maxMfeR: walk.maxMfeR,
             minMaeR: walk.minMaeR,
             resolutionSource: walk.resolutionSource,
             intrabarResolutionStatus: walk.intrabarResolutionStatus,
-            isFreshValid: walk.isFreshValid ?? true,
+            isFreshValid: obs.isFreshValid, // preserve creation-time freshness; never clobber it true
           });
           resolved += 1;
         } else if (walk.status === "NO_FILL") {

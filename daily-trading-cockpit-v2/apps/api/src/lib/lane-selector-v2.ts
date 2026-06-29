@@ -109,7 +109,11 @@ const DEFAULT_MAX_STOP_DISTANCE_BPS = 1200;
 const MIN_REGIME_SAMPLE = 10;
 const MIN_SYMBOL_SAMPLE = 5;
 const WIDE_TREND_VARIANT_ID: VariantMatrixVariantId = "CG_WIDE_STOP_TP_WIDE";
-const TACTICAL_TIGHT_VARIANT_ID: VariantMatrixVariantId = "CG_TIGHT_FAST_05";
+const SHORT_FAST_VARIANT_ID: VariantMatrixVariantId = "CG_WIDE_FAST_SHORT";
+// LONG extended-trend lane: operator re-enabled CG_WIDE_STOP_TP_WIDE (1R wide) as the long lane
+// (2026-06-29) to re-test it live against the rebuilt fresh / measurement. Longs fire only in a
+// confident WIDE_TREND bull (policyBlockReason gates tactical longs off).
+const MIXED_SYMBOL_BLOCKLIST = new Set(["NEARUSDT"]);
 
 function isFiniteNumber(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value);
@@ -155,6 +159,19 @@ export function isLaneSelectorV2SupportedVariantId(id: string | null | undefined
 
 export function laneSelectorV2LaneId(variantId: VariantMatrixVariantId): string {
   return LANE_CONFIGS.get(variantId)?.selectedLaneId ?? `CG_VARIANT_MATRIX:${variantId}`;
+}
+
+export function isLaneSelectorV2LongWideStopOverride(input: {
+  variantId: string | null | undefined;
+  direction: Direction;
+  estimatedRegime: LaneSelectorV2EstimatedRegime;
+}): boolean {
+  return (
+    input.variantId === WIDE_TREND_VARIANT_ID &&
+    input.direction === "LONG" &&
+    input.estimatedRegime.policy === "WIDE_TREND" &&
+    input.estimatedRegime.direction === "LONG"
+  );
 }
 
 function variantSupportsDirection(def: VariantMatrixVariantDefinition, direction: Direction): boolean {
@@ -294,25 +311,47 @@ function hashBucket0to99(key: string): number {
   return Math.abs(hash >>> 0) % 100;
 }
 
-function tacticalMfeVariant(direction: Direction): VariantMatrixVariantId {
-  return direction === "LONG" ? "CG_EXP_LONG_MFE_GIVEBACK_10X" : "CG_EXP_SHORT_MFE_GIVEBACK_10X";
-}
-
 function policyPreferredVariants(
   inputs: LaneSelectorV2Inputs,
   estimated: LaneSelectorV2EstimatedRegime,
 ): VariantMatrixVariantId[] {
+  const minuteBucket = inputs.now.slice(0, 16);
+  const bucket = hashBucket0to99(`${inputs.candidate.symbol}:${inputs.candidate.direction}:${minuteBucket}`);
   if (
     estimated.policy === "WIDE_TREND" &&
-    estimated.direction === inputs.candidate.direction
+    estimated.direction === "LONG" &&
+    inputs.candidate.direction === "LONG"
   ) {
     return [WIDE_TREND_VARIANT_ID];
   }
-  const mfe = tacticalMfeVariant(inputs.candidate.direction);
-  const tight = TACTICAL_TIGHT_VARIANT_ID;
-  const minuteBucket = inputs.now.slice(0, 16);
-  const bucket = hashBucket0to99(`${inputs.candidate.symbol}:${inputs.candidate.direction}:${minuteBucket}`);
-  return bucket < 70 ? [mfe, tight] : [tight, mfe];
+  if (
+    estimated.policy === "WIDE_TREND" &&
+    estimated.direction === "SHORT" &&
+    inputs.candidate.direction === "SHORT"
+  ) {
+    // CG_EXP_SHORT_MFE_GIVEBACK_10X removed by operator 2026-06-29 → 70/30 WIDE/FAST_SHORT split.
+    return bucket < 70
+      ? [WIDE_TREND_VARIANT_ID, SHORT_FAST_VARIANT_ID]
+      : [SHORT_FAST_VARIANT_ID, WIDE_TREND_VARIANT_ID];
+  }
+  if (inputs.candidate.direction === "SHORT") {
+    return bucket < 70
+      ? [WIDE_TREND_VARIANT_ID, SHORT_FAST_VARIANT_ID]
+      : [SHORT_FAST_VARIANT_ID, WIDE_TREND_VARIANT_ID];
+  }
+  return [];
+}
+
+function policyBlockReason(inputs: LaneSelectorV2Inputs, estimated: LaneSelectorV2EstimatedRegime): string | null {
+  if (estimated.direction === "MIXED" && MIXED_SYMBOL_BLOCKLIST.has(inputs.candidate.symbol.toUpperCase())) {
+    return `mixed_symbol_blocked:${inputs.candidate.symbol}`;
+  }
+  if (inputs.candidate.direction === "LONG" && estimated.policy !== "WIDE_TREND") {
+    // Longs fire ONLY in a confident WIDE_TREND bull (CG_WIDE_STOP_TP_WIDE lane); tactical/mixed
+    // longs stay disabled. Re-enabled by operator 2026-06-29 to re-test against the fresh / feed.
+    return "long_tactical_disabled";
+  }
+  return null;
 }
 
 export function selectLaneV2(inputs: LaneSelectorV2Inputs): LaneSelectorV2Result {
@@ -327,9 +366,25 @@ export function selectLaneV2(inputs: LaneSelectorV2Inputs): LaneSelectorV2Result
   const signal = buildSignal(candidate, inputs.regime, inputs.now);
   let best: LaneSelectorV2Geometry | null = null;
   const byVariant = new Map<VariantMatrixVariantId, LaneSelectorV2Geometry>();
+  const estimated = inputs.estimatedRegime ?? estimateLaneSelectorV2Regime({
+    regime: inputs.regime,
+    controllerMode: inputs.controllerMode,
+    confidence: inputs.controllerConfidence,
+  });
+  const blockReason = policyBlockReason(inputs, estimated);
+  if (blockReason) {
+    return { selected: null, rejected: [blockReason], evaluated };
+  }
 
   for (const state of inputs.laneStates) {
-    if (state.status !== "STABLE_CANDIDATE") {
+    const statusAllowed =
+      state.status === "STABLE_CANDIDATE" ||
+      isLaneSelectorV2LongWideStopOverride({
+        variantId: state.variantId,
+        direction: candidate.direction,
+        estimatedRegime: estimated,
+      });
+    if (!statusAllowed) {
       rejected.push(`${state.variantId}:status_${state.status ?? "unknown"}`);
       continue;
     }
@@ -378,15 +433,14 @@ export function selectLaneV2(inputs: LaneSelectorV2Inputs): LaneSelectorV2Result
   }
 
   evaluated.sort((left, right) => right.score - left.score);
-  const estimated = inputs.estimatedRegime ?? estimateLaneSelectorV2Regime({
-    regime: inputs.regime,
-    controllerMode: inputs.controllerMode,
-    confidence: inputs.controllerConfidence,
-  });
-  for (const variantId of policyPreferredVariants(inputs, estimated)) {
+  const preferredVariants = policyPreferredVariants(inputs, estimated);
+  for (const variantId of preferredVariants) {
     const policyPick = byVariant.get(variantId);
     if (policyPick) return { selected: policyPick, rejected, evaluated };
     rejected.push(`${variantId}:policy_target_unavailable`);
+  }
+  if (preferredVariants.length > 0) {
+    return { selected: null, rejected, evaluated };
   }
   return { selected: best, rejected, evaluated };
 }

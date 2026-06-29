@@ -440,6 +440,37 @@ describe("paper-opportunity-allocator", () => {
     }
   });
 
+  it("[EXP10X-long-priority] prioritizes EXP 10x MFE LONG in bullish paper collection", async () => {
+    const dir = tmpDir();
+    const vmReport = await buildWinningVmReport(dir);
+    const report = buildPaperOpportunityAllocatorReport(
+      baseInputs({
+        vmReport,
+        marketRegime: "Bullish expansion",
+        routerReport: routerOf("Bullish expansion"),
+        candidates: [makeCandidate({ direction: "LONG", stopLoss: 98, tp1: 103 })],
+        paperVariantMatrixDiagnosticEnabled: true,
+        paperVariantMatrixDiagnosticMaxPerScan: 99,
+        paperExpLongMfePriority: true,
+      }),
+    );
+
+    expect(report.selectedOpportunities[0]?.laneId).toBe(
+      "CG_LONG_VARIANT_MATRIX:CG_EXP_LONG_MFE_GIVEBACK_10X",
+    );
+    expect(
+      report.selectedOpportunities.some((o) =>
+        o.laneId === "CG_LONG_VARIANT_MATRIX:CG_EXP_LONG_WIDE_FAST_10X"
+      ),
+    ).toBe(false);
+    expect(
+      report.selectedOpportunities.some((o) =>
+        o.laneId === "CG_LONG_VARIANT_MATRIX:CG_EXP_LONG_TIGHT_FAST_10X"
+      ),
+    ).toBe(false);
+    expect(report.selectedOpportunities[0]?.paperOrderMode).toBe("DIAGNOSTIC_ONLY");
+  });
+
   it("[DCAP] caps the open diagnostic book per-symbol (suppress concentration)", async () => {
     const dir = tmpDir();
     const vmReport = await buildWinningVmReport(dir);

@@ -52,6 +52,7 @@ const FILTERS: FuturesSymbolFilters = {
 class FakeLiveClient {
   env = "testnet" as const;
   placed: PlaceOrderParams[] = [];
+  leverageCalls: Array<{ symbol: string; leverage: number }> = [];
   canceled: Array<{ symbol: string; orderId: number }> = [];
   cancelAllSymbols: string[] = [];
   positionsBySymbol = new Map<string, number>();
@@ -65,6 +66,8 @@ class FakeLiveClient {
   marketFillPrice: number | null = null;
   /** When set, every placeAlgoOrder throws a Binance rejection with this code (e.g. -2021). */
   algoErrorCode: number | null = null;
+  /** When true, the aggregate-add MARKET entry (clientOrderId …-a) throws a timeout — simulates the 6s add timeout. */
+  failAddEntry = false;
   /** When set, each reduce-only MARKET flatten books a userTrade with this realizedPnl on its own order id. */
   flattenRealizedPnl: number | null = null;
   private nextOrderId = 1000;
@@ -104,7 +107,9 @@ class FakeLiveClient {
   async isHedgeMode(): Promise<boolean> {
     return this.hedge;
   }
-  async setLeverage(): Promise<void> {}
+  async setLeverage(symbol: string, leverage: number): Promise<void> {
+    this.leverageCalls.push({ symbol, leverage });
+  }
   async setIsolatedMargin(): Promise<void> {}
   async getOpenOrders() {
     return [];
@@ -129,6 +134,9 @@ class FakeLiveClient {
     return this.stubOrder({ orderId, status: this.orderStatusById.get(orderId) ?? "NEW" });
   }
   async placeOrder(p: PlaceOrderParams): Promise<FuturesOrder> {
+    if (this.failAddEntry && p.newClientOrderId?.endsWith("-a")) {
+      throw new Error("request timed out after 6000ms");
+    }
     this.placed.push(p);
     const orderId = this.nextOrderId++;
     if (p.type === "MARKET" && !p.reduceOnly) {
@@ -241,15 +249,18 @@ function makeConfig(overrides: Partial<LiveExecutionConfig> = {}): LiveExecution
     dailyMaxLossUsd: 15,
     maxConsecutiveLosses: 5,
     maxDrawdownUsd: 40,
+    defaultLeverage: 3,
     maxLeverage: 2,
     maxNotionalPerTrade: 250,
     maxPaperOrderAgeMs: 24 * 60 * 60 * 1000,
     mirrorAllPaperOrders: false,
     testnetTakeProfitUsd: 0,
     testnetRegimeExitEnabled: true,
+    testnetRegimeHardCutMs: 0, // hard-cut disabled by default; opted in per-test
     estimatedCloseCostPct: 0.0022,
     autoArm: false,
     mainnetConfirmed: false,
+    mainnetKeepTestnetPolicy: false,
     configErrors: [],
     ...overrides,
   };
@@ -309,6 +320,23 @@ describe("parseLiveExecutionConfig", () => {
     ).toBe(false);
   });
 
+  it("mainnet can explicitly reuse the testnet live-mirror lane policy", () => {
+    const base = {
+      LIVE_EXECUTION_ENABLED: "1",
+      LIVE_BINANCE_ENV: "mainnet",
+      LIVE_BINANCE_API_KEY: "k",
+      LIVE_BINANCE_API_SECRET: "s",
+      LIVE_MAINNET_CONFIRM: "I_UNDERSTAND_REAL_MONEY",
+    };
+    expect(parseLiveExecutionConfig(base).mainnetKeepTestnetPolicy).toBe(false);
+    expect(
+      parseLiveExecutionConfig({
+        ...base,
+        LIVE_MAINNET_KEEP_TESTNET_POLICY: "1",
+      }).mainnetKeepTestnetPolicy,
+    ).toBe(true);
+  });
+
   it("mirror-all is testnet-only", () => {
     const base = {
       LIVE_EXECUTION_ENABLED: "1",
@@ -350,6 +378,19 @@ describe("parseLiveExecutionConfig", () => {
     expect(parseLiveExecutionConfig(base).testnetRegimeExitEnabled).toBe(true);
     expect(parseLiveExecutionConfig({ ...base, LIVE_TESTNET_REGIME_EXIT: "0" }).testnetRegimeExitEnabled).toBe(false);
     expect(parseLiveExecutionConfig(base).estimatedCloseCostPct).toBeCloseTo(0.0022, 8);
+  });
+
+  it("uses a 3x default leverage and caps EXP lanes at LIVE_MAX_LEVERAGE", () => {
+    const cfg = parseLiveExecutionConfig({
+      LIVE_EXECUTION_ENABLED: "1",
+      LIVE_BINANCE_ENV: "testnet",
+      LIVE_BINANCE_API_KEY: "k",
+      LIVE_BINANCE_API_SECRET: "s",
+      LIVE_MAX_LEVERAGE: "10",
+      LIVE_DEFAULT_LEVERAGE: "3",
+    });
+    expect(cfg.maxLeverage).toBe(10);
+    expect(cfg.defaultLeverage).toBe(3);
   });
 });
 
@@ -599,6 +640,85 @@ describe("LiveExecutionEngine", () => {
     expect(client.orderStatusById.get(intent.tp1OrderId!)).toBeUndefined();
   });
 
+  it("mainnet CG_WIDE_LONG_RUNNER closes immediately once unrealized clears estimated close cost", async () => {
+    const order = paperOrder({
+      direction: "LONG",
+      stopLoss: 1900,
+      takeProfitLevels: [2300],
+      selectedLaneId: "CG_VARIANT_MATRIX:CG_WIDE_LONG_RUNNER",
+    } as Partial<PaperOrder>);
+    const { engine, client, store } = makeEngine({
+      paper: makePaperStore([order]),
+      config: { env: "mainnet", mainnetConfirmed: true },
+    });
+    expect((await engine.arm()).ok).toBe(true);
+    await engine.tick();
+
+    const intent = store.getState().intents[0]!;
+    client.unrealizedPnlBySymbol.set("ETHUSDT", 0.25); // estimated close cost is about 0.22 USDT.
+    client.flattenRealizedPnl = 0.03;
+    await engine.tick();
+
+    const closed = store.getState().intents[0]!;
+    expect(closed.state).toBe("CLOSED");
+    expect(closed.closeReason).toBe("LIVE_LONG_RUNNER_BREAKEVEN_AFTER_COST");
+    expect(closed.realizedPnlUsd).toBeCloseTo(0.03, 6);
+    const flat = client.placed.at(-1)!;
+    expect(flat.type).toBe("MARKET");
+    expect(flat.reduceOnly).toBe(true);
+    expect(flat.side).toBe("SELL");
+    expect(client.cancelAllSymbols).toContain("ETHUSDT");
+    expect(store.getState().dailyLedger.wins).toBe(1);
+    expect(intent.tp1OrderId).not.toBeNull();
+  });
+
+  it("mainnet CG_WIDE_LONG_RUNNER stays open while still negative after estimated close cost", async () => {
+    const order = paperOrder({
+      direction: "LONG",
+      stopLoss: 1900,
+      takeProfitLevels: [2300],
+      selectedLaneId: "CG_VARIANT_MATRIX:CG_WIDE_LONG_RUNNER",
+    } as Partial<PaperOrder>);
+    const { engine, client, store } = makeEngine({
+      paper: makePaperStore([order]),
+      config: { env: "mainnet", mainnetConfirmed: true },
+    });
+    expect((await engine.arm()).ok).toBe(true);
+    await engine.tick();
+    const placedBefore = client.placed.length;
+
+    client.unrealizedPnlBySymbol.set("ETHUSDT", 0.20); // below the estimated close-cost buffer.
+    await engine.tick();
+
+    expect(store.getState().intents[0]!.state).toBe("OPEN");
+    expect(client.placed.length).toBe(placedBefore);
+  });
+
+  it("CG_WIDE_FAST_LONG closes once net-positive after cost — covers the 2nd long lane, and on testnet", async () => {
+    // Emergency exit must cover BOTH removed long lanes (not just the runner) and run on testnet too.
+    const order = paperOrder({
+      direction: "LONG",
+      stopLoss: 1900,
+      takeProfitLevels: [2300],
+      selectedLaneId: "CG_VARIANT_MATRIX:CG_WIDE_FAST_LONG",
+    } as Partial<PaperOrder>);
+    const { engine, client, store } = makeEngine({
+      paper: makePaperStore([order]),
+      config: { env: "testnet", testnetTakeProfitUsd: 0 }, // isolate from the testnet USD-TP path
+    });
+    expect((await engine.arm()).ok).toBe(true);
+    await engine.tick();
+
+    client.unrealizedPnlBySymbol.set("ETHUSDT", 0.25); // clears the ~0.22 estimated close-cost buffer
+    client.flattenRealizedPnl = 0.03;
+    await engine.tick();
+
+    const closed = store.getState().intents[0]!;
+    expect(closed.state).toBe("CLOSED");
+    expect(closed.closeReason).toBe("LIVE_LONG_RUNNER_BREAKEVEN_AFTER_COST");
+    expect(closed.realizedPnlUsd).toBeCloseTo(0.03, 6);
+  });
+
   it("testnet regime-opposition exit closes only opposing exposure that clears estimated close cost", async () => {
     const order = paperOrder(); // SHORT.
     const { engine, client, store } = makeEngine({
@@ -626,6 +746,54 @@ describe("LiveExecutionEngine", () => {
     expect(flat.reduceOnly).toBe(true);
     expect(flat.side).toBe("BUY");
     expect(store.getState().dailyLedger.wins).toBe(1);
+  });
+
+  it("anti-bull hard-cut: a RED short is force-closed once the opposing bull is SUSTAINED past the threshold", async () => {
+    let now = "2099-01-02T12:00:00.000Z";
+    const order = paperOrder(); // SHORT.
+    const { engine, client, store } = makeEngine({
+      paper: makePaperStore([order]),
+      nowIso: () => now,
+      config: { testnetRegimeHardCutMs: 30 * 60 * 1000 }, // 30 min sustained opposition
+      getControllerSnapshot: () => ({ regime: "Bullish expansion", mode: "LONG_ONLY", capturedAt: new Date().toISOString() }),
+    });
+    expect((await engine.arm()).ok).toBe(true);
+    await engine.tick(); // opens the short; opposition (LONG_ONLY vs SHORT) starts at T0
+
+    client.markPriceBySymbol.set("ETHUSDT", 2100);
+    client.unrealizedPnlBySymbol.set("ETHUSDT", -2.0); // RED — would normally ride to its stop
+    client.flattenRealizedPnl = -2.0;
+
+    now = "2099-01-02T12:31:00.000Z"; // 31 min later → opposition sustained past 30 min
+    await engine.tick();
+
+    const closed = store.getState().intents[0]!;
+    expect(closed.state).toBe("CLOSED");
+    expect(closed.closeReason).toBe("REGIME_OPPOSITION_HARD_CUT_LONG_ONLY");
+    expect(closed.realizedPnlUsd).toBeCloseTo(-2.0, 6);
+    expect(store.getState().consecutiveLosses).toBeGreaterThanOrEqual(1); // red cut counts as a loss
+  });
+
+  it("anti-bull hard-cut: a RED short is NOT cut while the opposition is still BRIEF (whipsaw guard)", async () => {
+    let now = "2099-01-02T12:00:00.000Z";
+    const order = paperOrder(); // SHORT.
+    const { engine, client, store } = makeEngine({
+      paper: makePaperStore([order]),
+      nowIso: () => now,
+      config: { testnetRegimeHardCutMs: 30 * 60 * 1000 },
+      getControllerSnapshot: () => ({ regime: "Bullish expansion", mode: "LONG_ONLY", capturedAt: new Date().toISOString() }),
+    });
+    expect((await engine.arm()).ok).toBe(true);
+    await engine.tick();
+    client.markPriceBySymbol.set("ETHUSDT", 2100);
+    client.unrealizedPnlBySymbol.set("ETHUSDT", -2.0);
+    const placedBefore = client.placed.length;
+
+    now = "2099-01-02T12:10:00.000Z"; // only 10 min — below the 30-min threshold
+    await engine.tick();
+
+    expect(store.getState().intents[0]!.state).toBe("OPEN"); // left to its stop, not cut
+    expect(client.placed.length).toBe(placedBefore);
   });
 
   it("testnet regime-opposition exit keeps opposing exposure open when estimated net is below breakeven", async () => {
@@ -745,6 +913,38 @@ describe("LiveExecutionEngine", () => {
     expect(entries[0]!.symbol).toBe("BTCUSDT");
   });
 
+  it("sets 10x leverage only for EXP 10x lanes and keeps normal lanes at 3x", async () => {
+    const expOrder = paperOrder({
+      paperOrderId: "paper-exp",
+      selectedLaneId: "CG_VARIANT_MATRIX:CG_EXP_SHORT_MFE_GIVEBACK_10X",
+      symbol: "ETHUSDT",
+      variantExitRule: "mfe_giveback",
+      takeProfitLevels: [1700],
+    } as Partial<PaperOrder>);
+    const normalOrder = paperOrder({
+      paperOrderId: "paper-normal",
+      selectedLaneId: "CG_VARIANT_MATRIX:CG_WIDE_STOP_TP_WIDE",
+      symbol: "BTCUSDT",
+    } as Partial<PaperOrder>);
+    const client = new FakeLiveClient();
+    client.getExchangeFilters = async () =>
+      new Map([
+        ["ETHUSDT", FILTERS],
+        ["BTCUSDT", { ...FILTERS, symbol: "BTCUSDT" }],
+      ]);
+    const { engine } = makeEngine({
+      client,
+      paper: makePaperStore([expOrder, normalOrder]),
+      config: { maxConcurrentPositions: 2, defaultLeverage: 3, maxLeverage: 10 },
+    });
+    await engine.arm();
+    await engine.tick();
+    expect(client.leverageCalls).toEqual([
+      { symbol: "ETHUSDT", leverage: 10 },
+      { symbol: "BTCUSDT", leverage: 3 },
+    ]);
+  });
+
   it("respects max concurrent positions and one-symbol-at-a-time", async () => {
     const orders = [
       paperOrder({ paperOrderId: "paper-a" } as Partial<PaperOrder>),
@@ -782,7 +982,14 @@ describe("LiveExecutionEngine", () => {
     expect(entries).toHaveLength(1);
     expect(entries[0]!.quantity).toBeCloseTo(0.05, 9);
     expect(store.getState().intents[0]!.sourcePaperOrders).toEqual([
-      { paperOrderId: "paper-lane-a", laneId: "LANE_A", qty: 0.05 },
+      {
+        paperOrderId: "paper-lane-a",
+        laneId: "LANE_A",
+        qty: 0.05,
+        regime: null,
+        controllerMode: null,
+        controllerConfidence: null,
+      },
     ]);
 
     const account = await engine.getAccountSnapshot();
@@ -792,6 +999,113 @@ describe("LiveExecutionEngine", () => {
     expect(account.positions[0]!.targetTpGapPct).toBeCloseTo(5, 9);
     expect(account.positions[0]!.liquidationPrice).toBe(1500);
     expect(account.lanes.map((lane) => lane.laneId)).toEqual(["LANE_A"]);
+  });
+
+  it("builds lane performance series by period and regime filter from closed intents", () => {
+    const shortPaper = paperOrder({
+      paperOrderId: "paper-short",
+      selectedLaneId: "LANE_SHORT",
+      regime: "Bearish pressure",
+      controllerMode: "SHORT_ONLY",
+      controllerConfidence: "MEDIUM",
+    } as Partial<PaperOrder>);
+    const longPaper = paperOrder({
+      paperOrderId: "paper-long",
+      selectedLaneId: "LANE_LONG",
+      regime: "Bullish pullback",
+      controllerMode: "LONG_ONLY",
+      controllerConfidence: "LOW",
+    } as Partial<PaperOrder>);
+    const { engine, store } = makeEngine({
+      paper: makePaperStore([shortPaper, longPaper]),
+      nowIso: () => "2099-01-02T12:00:00.000Z",
+    });
+    store.getState().intents.push(
+      {
+        paperOrderId: "paper-short",
+        symbol: "ETHUSDT",
+        direction: "SHORT",
+        state: "CLOSED",
+        qty: 1,
+        tp1Qty: 1,
+        plannedEntryPrice: 2000,
+        stopLossPrice: 2100,
+        tp1Price: 1900,
+        filledEntryPrice: 2000,
+        entryOrderId: 1,
+        stopOrderId: null,
+        tp1OrderId: 2,
+        beStopOrderId: null,
+        realizedPnlUsd: 20,
+        feesUsd: 1,
+        exitRule: "tp1_full",
+        maxFavorableR: null,
+        createdAt: "2099-01-02T10:00:00.000Z",
+        updatedAt: "2099-01-02T11:30:00.000Z",
+        closedAt: "2099-01-02T11:30:00.000Z",
+        closeReason: "TEST",
+        lastError: null,
+        sourcePaperOrders: [{ paperOrderId: "paper-short", laneId: "LANE_SHORT", qty: 1 }],
+      },
+      {
+        paperOrderId: "paper-long",
+        symbol: "BTCUSDT",
+        direction: "LONG",
+        state: "CLOSED",
+        qty: 1,
+        tp1Qty: 1,
+        plannedEntryPrice: 100,
+        stopLossPrice: 95,
+        tp1Price: 105,
+        filledEntryPrice: 100,
+        entryOrderId: 3,
+        stopOrderId: null,
+        tp1OrderId: 4,
+        beStopOrderId: null,
+        realizedPnlUsd: -5,
+        feesUsd: 0.5,
+        exitRule: "tp1_full",
+        maxFavorableR: null,
+        createdAt: "2099-01-02T10:30:00.000Z",
+        updatedAt: "2099-01-02T11:45:00.000Z",
+        closedAt: "2099-01-02T11:45:00.000Z",
+        closeReason: "TEST",
+        lastError: null,
+        sourcePaperOrders: [{ paperOrderId: "paper-long", laneId: "LANE_LONG", qty: 1 }],
+      },
+    );
+
+    const shortExtended = engine.getLanePerformanceSeries({
+      view: "hourly",
+      anchor: "2099-01-02",
+      regime: "short_extended",
+    });
+    expect(shortExtended.view).toBe("hourly");
+    expect(shortExtended.anchor).toBe("2099-01-02");
+    expect(shortExtended.bucketStarts).toHaveLength(24);
+    expect(shortExtended.regimeFilter).toBe("short_extended");
+    expect(shortExtended.lanes).toHaveLength(1);
+    expect(shortExtended.lanes[0]!.laneId).toBe("LANE_SHORT");
+    expect(shortExtended.lanes[0]!.realizedPnlUsd).toBeCloseTo(20, 9);
+    expect(shortExtended.lanes[0]!.regimes[0]).toMatchObject({ family: "SHORT", bucket: "SHORT_EXTENDED", count: 1 });
+
+    const longAll = engine.getLanePerformanceSeries({ view: "daily", anchor: "2099-01", regime: "long" });
+    expect(longAll.period).toBe("fixed");
+    expect(longAll.anchor).toBe("2099-01");
+    expect(longAll.bucketStarts).toHaveLength(31);
+    expect(longAll.lanes).toHaveLength(1);
+    expect(longAll.lanes[0]!.laneId).toBe("LANE_LONG");
+    expect(longAll.lanes[0]!.realizedPnlUsd).toBeCloseTo(-5, 9);
+
+    const weekly = engine.getLanePerformanceSeries({ view: "weekly", anchor: "2099-01", regime: "all" });
+    expect(weekly.bucketStarts).toHaveLength(5);
+
+    const monthly = engine.getLanePerformanceSeries({ view: "monthly", anchor: "2099", regime: "all" });
+    expect(monthly.bucketStarts).toHaveLength(12);
+
+    const yearly = engine.getLanePerformanceSeries({ view: "yearly", anchor: "2099", regime: "all" });
+    expect(yearly.periodLabel).toBe("2095-2099");
+    expect(yearly.bucketStarts).toHaveLength(5);
   });
 
   it("kill-switch on daily loss: cancels, flattens, disarms, latches", async () => {
@@ -993,6 +1307,43 @@ describe("LiveExecutionEngine", () => {
     expect(after.some((p) => p.type === "MARKET" && p.reduceOnly)).toBe(true); // position flattened
     expect(store.getState().consecutiveLosses).toBeGreaterThanOrEqual(1); // loss booked
     expect(store.getState().mirrorAttempts.p2 ?? 0).toBeGreaterThanOrEqual(1); // add path latched
+  });
+
+  it("a failed add ENTRY leaves the position OPEN and protected (no naked window, no flatten) — the add-timeout bleed fix", async () => {
+    // The add MARKET times out BEFORE any stop is cancelled. The original stop+TP still protect the
+    // position, so it must stay OPEN and never be flattened (the old code dumped it at market).
+    const orders: PaperOrder[] = [
+      paperOrder({
+        paperOrderId: "p1", direction: "LONG", entryPrice: 2000, stopLoss: 1900, takeProfitLevels: [2100],
+        paperStatus: "PAPER_SUBMITTED", createdAt: "2099-01-02T00:00:00.000Z",
+      } as Partial<PaperOrder>),
+    ];
+    const client = new FakeLiveClient();
+    const { engine, store } = makeEngine({ client, paper: makePaperStore(orders), config: { mirrorAllPaperOrders: true } });
+    await engine.arm();
+    await engine.tick();
+    const opened = store.getState().intents[0]!;
+    expect(opened.state).toBe("OPEN");
+    const stopId = opened.stopOrderId;
+    const placedBefore = client.placed.length;
+
+    orders.push(
+      paperOrder({
+        paperOrderId: "p2", direction: "LONG", entryPrice: 2000, stopLoss: 1900, takeProfitLevels: [2100],
+        paperStatus: "PAPER_SUBMITTED", createdAt: "2099-01-02T01:00:00.000Z",
+      } as Partial<PaperOrder>),
+    );
+    client.failAddEntry = true; // the aggregate-add MARKET times out
+    await engine.tick();
+
+    const intent = store.getState().intents[0]!;
+    expect(intent.state).toBe("OPEN"); // NOT flattened, NOT ERROR
+    expect(intent.closeReason ?? null).toBeNull(); // no EMERGENCY_FLATTEN_ADD_FAILED
+    expect(intent.stopOrderId).toBe(stopId); // original stop untouched
+    expect(client.canceled.some((c) => c.orderId === stopId)).toBe(false); // stop never cancelled
+    const after = client.placed.slice(placedBefore);
+    expect(after.some((p) => p.type === "MARKET" && p.reduceOnly)).toBe(false); // no flatten
+    expect(intent.lastError ?? "").toMatch(/still protected/i);
   });
 
   it("auto-arm does NOT punch through a latched kill on restart", () => {

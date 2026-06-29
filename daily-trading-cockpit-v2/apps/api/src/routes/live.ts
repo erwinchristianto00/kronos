@@ -113,6 +113,28 @@ export async function registerLiveRoutes(
     }
   });
 
+  app.get("/api/live/lane-performance-series", async (request, reply) => {
+    if (!engine) {
+      reply.code(503);
+      return { ok: false, reason: "live execution disabled" };
+    }
+    const query = (request.query ?? {}) as { view?: string; period?: string; anchor?: string; regime?: string };
+    try {
+      return {
+        ok: true,
+        ...engine.getLanePerformanceSeries({
+          view: query.view,
+          period: query.period,
+          anchor: query.anchor,
+          regime: query.regime,
+        }),
+      };
+    } catch (err) {
+      reply.code(500);
+      return { ok: false, reason: err instanceof Error ? err.message : "lane performance series failed" };
+    }
+  });
+
   app.post("/api/live/sync-testnet", async (request, reply) => {
     if (!engine) {
       reply.code(503);

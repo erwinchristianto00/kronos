@@ -29,6 +29,7 @@ import {
 import {
   LANE_SELECTOR_V2_LIVE_SUPPORTED_VARIANT_IDS,
   estimateLaneSelectorV2Regime,
+  isLaneSelectorV2LongWideStopOverride,
   isLaneSelectorV2SupportedVariantId,
   laneSelectorV2LaneId,
   selectLaneV2,
@@ -40,12 +41,17 @@ import type { VariantMatrixVariantId } from "./current-guard-variant-matrix.js";
 
 export const REALTIME_SHORT_LANE_VARIANT_ID = "CG_WIDE_FAST_SHORT";
 export const REALTIME_SHORT_SELECTED_LANE_ID = `CG_VARIANT_MATRIX:${REALTIME_SHORT_LANE_VARIANT_ID}`;
+const LONG_WIDE_VARIANT_ID = "CG_WIDE_STOP_TP_WIDE"; // LONG lane: re-enabled by operator (1R wide), fires only in WIDE_TREND bull
+const MIXED_SYMBOL_BLOCKLIST = new Set(["NEARUSDT"]);
 const DEFAULT_MAX_PER_CYCLE = 3;
+const DISABLED_LIVE_MIRROR_VARIANT_IDS = new Set<string>(["CG_EXP_SHORT_MFE_GIVEBACK_10X"]);
 
-export const REALTIME_SHORT_ALLOWED_VARIANT_IDS = LANE_SELECTOR_V2_LIVE_SUPPORTED_VARIANT_IDS;
+export const REALTIME_SHORT_ALLOWED_VARIANT_IDS = LANE_SELECTOR_V2_LIVE_SUPPORTED_VARIANT_IDS.filter(
+  (id) => !DISABLED_LIVE_MIRROR_VARIANT_IDS.has(id),
+);
 
 export function isRealtimeShortAllowedVariantId(id: string | null | undefined): id is VariantMatrixVariantId {
-  return isLaneSelectorV2SupportedVariantId(id);
+  return isLaneSelectorV2SupportedVariantId(id) && !DISABLED_LIVE_MIRROR_VARIANT_IDS.has(id);
 }
 
 export function isRealtimeShortAllowedLaneId(laneId: string | null | undefined): boolean {
@@ -112,11 +118,38 @@ function isPos(n: number | null | undefined): n is number {
   return typeof n === "number" && Number.isFinite(n) && n > 0;
 }
 
-function effectiveLaneStates(inputs: RealtimeShortMirrorInputs): RealtimeShortLaneState[] {
-  if (inputs.stableShortLanes) return inputs.stableShortLanes;
-  return inputs.stableShortLaneActive
+function isMixedSymbolBlocked(symbol: string, estimatedRegime: LaneSelectorV2EstimatedRegime): boolean {
+  return estimatedRegime.direction === "MIXED" && MIXED_SYMBOL_BLOCKLIST.has(symbol.toUpperCase());
+}
+
+function effectiveLaneStates(
+  inputs: RealtimeShortMirrorInputs,
+  estimatedRegime: LaneSelectorV2EstimatedRegime,
+): RealtimeShortLaneState[] {
+  const baseRaw = inputs.stableShortLanes
+    ? inputs.stableShortLanes
+    : inputs.stableShortLaneActive
     ? [{ variantId: REALTIME_SHORT_LANE_VARIANT_ID, status: "STABLE_CANDIDATE" }]
     : [];
+  const base = baseRaw.filter((state) => !DISABLED_LIVE_MIRROR_VARIANT_IDS.has(state.variantId));
+  const withLongWideOverride = isLaneSelectorV2LongWideStopOverride({
+    variantId: LONG_WIDE_VARIANT_ID,
+    direction: "LONG",
+    estimatedRegime,
+  })
+    ? (() => {
+        const found = base.some((state) => state.variantId === LONG_WIDE_VARIANT_ID);
+        const lifted = base.map((state) =>
+          state.variantId === LONG_WIDE_VARIANT_ID
+            ? { ...state, status: "STABLE_CANDIDATE" }
+            : state,
+        );
+        return found
+          ? lifted
+          : [{ variantId: LONG_WIDE_VARIANT_ID, status: "STABLE_CANDIDATE" }, ...lifted];
+      })()
+    : base;
+  return withLongWideOverride;
 }
 
 /**
@@ -146,12 +179,12 @@ export function runRealtimeShortMirror(
 ): RealtimeShortMirrorResult {
   const result: RealtimeShortMirrorResult = { emitted: 0, skipped: 0, reasons: [] };
   const maxPerCycle = inputs.maxPerCycle ?? DEFAULT_MAX_PER_CYCLE;
-  const laneStates = effectiveLaneStates(inputs);
   const estimatedRegime = inputs.estimatedRegime ?? estimateLaneSelectorV2Regime({
     regime: inputs.regime,
     controllerMode: inputs.controllerMode,
     confidence: inputs.controllerConfidence,
   });
+  const laneStates = effectiveLaneStates(inputs, estimatedRegime);
 
   // Only exact STABLE_CANDIDATE rows can emit into /testnet. WATCHABLE/COLLECTING/REJECT
   // (or any future "headline active" downgrade label) stops being live-eligible immediately.
@@ -169,6 +202,11 @@ export function runRealtimeShortMirror(
       continue;
     }
     const entry = c.currentPrice;
+    if (isMixedSymbolBlocked(c.symbol, estimatedRegime)) {
+      result.skipped += 1;
+      result.reasons.push(`mixed_symbol_blocked:${c.symbol}`);
+      continue;
+    }
     if (!isPos(entry)) {
       result.skipped += 1;
       result.reasons.push(`bad_geometry:${c.symbol}`);
@@ -240,6 +278,7 @@ function buildRealtimeShortOrder(
     direction: c.direction,
     regime: inputs.regime,
     controllerMode: inputs.controllerMode ?? (c.direction === "SHORT" ? "SHORT_ONLY" : "LONG_ONLY"),
+    controllerConfidence: inputs.controllerConfidence ?? null,
     selectedLaneId: lane.selectedLaneId,
     routerPermission: "HEADLINE",
     entryPrice: entry,

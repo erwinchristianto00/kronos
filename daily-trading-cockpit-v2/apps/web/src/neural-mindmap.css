@@ -154,6 +154,10 @@
   border-bottom: 1px solid #20313a;
 }
 
+.neural-statusbar.is-compact-overview {
+  grid-template-columns: minmax(260px, 0.58fr) minmax(520px, 1.42fr);
+}
+
 .neural-statusbar > div {
   min-width: 0;
   padding: 13px 17px;
@@ -194,6 +198,17 @@
   line-height: 1.38;
 }
 
+.neural-card-subblock {
+  margin-top: 13px;
+  padding-top: 12px;
+  border-top: 1px solid rgba(32, 49, 58, 0.92);
+}
+
+.neural-card-heading {
+  display: grid;
+  gap: 4px;
+}
+
 .tone-healthy {
   color: #5ce4a6 !important;
 }
@@ -210,31 +225,6 @@
    a neutral cyan rather than green/red, to avoid reading as profit/loss. */
 .tone-measure {
   color: #6fb7c9 !important;
-}
-
-/* Diagnostic P&L tile — SHORT/LONG breakdown stacks vertically (overrides the single-line
-   nowrap/ellipsis of .neural-statusbar small). */
-.neural-statusbar small .diag-dir-split {
-  display: block;
-  white-space: normal;
-  overflow: visible;
-  text-overflow: clip;
-}
-.diag-dir-row {
-  display: block;
-  white-space: normal;
-  line-height: 1.45;
-}
-.diag-dir-row b {
-  color: #cdd9df;
-  font-weight: 700;
-  letter-spacing: 0.02em;
-}
-.diag-dir-foot {
-  display: block;
-  margin-top: 2px;
-  color: #70858f;
-  white-space: normal;
 }
 
 .neural-error {
@@ -1140,6 +1130,18 @@ i.health-diagnostic {
     grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 
+  .neural-statusbar.is-compact-overview {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .neural-statusbar.is-compact-overview > div {
+    border-right: 0;
+  }
+
+  .neural-statusbar.is-compact-overview > div + div {
+    border-top: 1px solid #20313a;
+  }
+
   .neural-statusbar > div:nth-child(3) {
     border-right: 0;
   }
@@ -1237,6 +1239,10 @@ i.health-diagnostic {
 
   .neural-statusbar {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .neural-statusbar.is-compact-overview {
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .neural-statusbar > div {
@@ -1572,6 +1578,146 @@ i.health-diagnostic {
   background: #0d1b21;
 }
 
+.testnet-performance-panel {
+  background:
+    radial-gradient(circle at 12% 0%, rgba(92, 228, 166, 0.08), transparent 30%),
+    rgba(7, 16, 22, 0.86);
+}
+
+.testnet-performance-panel > header {
+  align-items: center;
+}
+
+.testnet-filterbar {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.testnet-filterbar label {
+  display: grid;
+  gap: 5px;
+  color: #70858f;
+  font: 700 10px/1.2 "IBM Plex Mono", "Cascadia Code", monospace;
+  text-transform: uppercase;
+}
+
+.testnet-filterbar select,
+.testnet-filterbar input {
+  min-width: 122px;
+  height: 34px;
+  padding: 0 30px 0 10px;
+  border: 1px solid #2b4650;
+  border-radius: 7px;
+  color: #dcece7;
+  background: #08151b;
+  font: 700 12px/1.2 "IBM Plex Mono", "Cascadia Code", monospace;
+}
+
+.testnet-filterbar input {
+  padding-right: 10px;
+}
+
+.testnet-chart-empty {
+  padding: 18px;
+  border-bottom: 1px solid #20313a;
+}
+
+.testnet-chart-wrap {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(220px, 0.28fr);
+  gap: 12px;
+  padding: 14px;
+  border-bottom: 1px solid #20313a;
+}
+
+.testnet-lane-chart {
+  display: block;
+  width: 100%;
+  min-height: 260px;
+}
+
+.testnet-chart-bg {
+  fill: rgba(5, 13, 18, 0.74);
+  stroke: #20313a;
+}
+
+.testnet-chart-grid {
+  stroke: rgba(111, 134, 144, 0.16);
+  stroke-width: 1;
+}
+
+.testnet-chart-zero {
+  stroke: rgba(231, 238, 248, 0.34);
+  stroke-width: 1.2;
+  stroke-dasharray: 5 7;
+}
+
+.testnet-chart-axis,
+.testnet-chart-time {
+  fill: #70858f;
+  font: 700 10px/1.2 "IBM Plex Mono", "Cascadia Code", monospace;
+}
+
+.testnet-chart-time {
+  text-anchor: start;
+}
+
+.testnet-chart-time.middle {
+  text-anchor: middle;
+}
+
+.testnet-chart-time.end {
+  text-anchor: end;
+}
+
+.testnet-chart-legend {
+  align-content: start;
+  display: grid;
+  gap: 8px;
+}
+
+.testnet-chart-legend > div {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 3px 8px;
+  padding: 9px;
+  border: 1px solid #20313a;
+  border-radius: 8px;
+  background: rgba(5, 13, 18, 0.64);
+}
+
+.testnet-chart-legend i {
+  width: 9px;
+  height: 9px;
+  margin-top: 4px;
+  border-radius: 50%;
+  box-shadow: 0 0 16px currentColor;
+}
+
+.testnet-chart-legend span,
+.testnet-chart-legend strong {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.testnet-chart-legend span {
+  color: #a7bac2;
+  font: 700 10px/1.35 "IBM Plex Mono", "Cascadia Code", monospace;
+}
+
+.testnet-chart-legend strong {
+  grid-column: 2;
+  font: 800 12px/1.25 "IBM Plex Mono", "Cascadia Code", monospace;
+}
+
+.testnet-performance-table table {
+  min-width: 1180px;
+}
+
 .testnet-empty,
 .testnet-note-list {
   margin: 0;
@@ -1589,11 +1735,23 @@ i.health-diagnostic {
   .testnet-statusbar,
   .testnet-grid,
   .testnet-hero,
-  .testnet-kpis {
+  .testnet-kpis,
+  .testnet-chart-wrap {
     grid-template-columns: 1fr;
   }
 
   .testnet-grid {
     padding: 10px;
+  }
+
+  .testnet-performance-panel > header,
+  .testnet-filterbar {
+    justify-content: stretch;
+  }
+
+  .testnet-filterbar label,
+  .testnet-filterbar select,
+  .testnet-filterbar input {
+    width: 100%;
   }
 }

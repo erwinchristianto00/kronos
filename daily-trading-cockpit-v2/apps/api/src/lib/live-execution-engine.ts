@@ -40,7 +40,7 @@ import {
   MFE_GIVEBACK_FRAC,
   type VariantExitRule,
 } from "./current-guard-variant-matrix.js";
-import type { LaneSelectorV2EstimatedRegime } from "./lane-selector-v2.js";
+import { estimateLaneSelectorV2Regime, type LaneSelectorV2EstimatedRegime } from "./lane-selector-v2.js";
 import type { PaperOrder } from "./paper-execution-router.js";
 
 // ─── config ──────────────────────────────────────────────────────────────────
@@ -57,6 +57,9 @@ export interface LiveExecutionConfig {
   dailyMaxLossUsd: number;
   maxConsecutiveLosses: number;
   maxDrawdownUsd: number;
+  /** Default leverage used by all non-experimental lanes. */
+  defaultLeverage: number;
+  /** Hard leverage ceiling; only EXP 10x lanes may reach this cap. */
   maxLeverage: number;
   maxNotionalPerTrade: number;
   /**
@@ -70,10 +73,16 @@ export interface LiveExecutionConfig {
   testnetTakeProfitUsd: number;
   /** Testnet-only: close regime-opposing exposure once it can be flattened at estimated breakeven or better. */
   testnetRegimeExitEnabled: boolean;
+  /** Testnet-only anti-bull hard-cut: once opposing exposure (e.g. shorts in a sustained bull) has been
+   *  opposed continuously for this many ms, cut even the RED ones at market instead of riding them to
+   *  full stops. 0 disables. */
+  testnetRegimeHardCutMs: number;
   /** Conservative fee+slippage buffer used for testnet breakeven exits and dashboard net-after-cost. */
   estimatedCloseCostPct: number;
   autoArm: boolean;
   mainnetConfirmed: boolean;
+  /** Mainnet opt-in: reuse the same live-mirror lane policy as /testnet instead of stable-only gates. */
+  mainnetKeepTestnetPolicy: boolean;
   /** Why the config cannot trade (empty = config valid for its env). */
   configErrors: string[];
 }
@@ -93,6 +102,10 @@ function envNum(raw: string | undefined, fallback: number): number {
   return Number.isFinite(n) && n > 0 ? n : fallback;
 }
 
+function boundedLeverage(value: number, maxLeverage: number): number {
+  return Math.max(1, Math.min(Math.floor(value), Math.max(1, Math.floor(maxLeverage))));
+}
+
 export function parseLiveExecutionConfig(env: NodeJS.ProcessEnv = process.env): LiveExecutionConfig {
   const enabled = env.LIVE_EXECUTION_ENABLED === "1";
   const liveEnv = resolveLiveBinanceEnv(env.LIVE_BINANCE_ENV);
@@ -109,6 +122,12 @@ export function parseLiveExecutionConfig(env: NodeJS.ProcessEnv = process.env): 
     }
   }
 
+  const maxLeverage = Math.floor(envNum(env.LIVE_MAX_LEVERAGE, 2));
+  const defaultLeverage = boundedLeverage(
+    envNum(env.LIVE_DEFAULT_LEVERAGE, Math.min(3, maxLeverage)),
+    maxLeverage,
+  );
+
   return {
     enabled,
     env: liveEnv,
@@ -119,15 +138,18 @@ export function parseLiveExecutionConfig(env: NodeJS.ProcessEnv = process.env): 
     dailyMaxLossUsd: envNum(env.LIVE_DAILY_MAX_LOSS_USD, 15),
     maxConsecutiveLosses: Math.floor(envNum(env.LIVE_MAX_CONSECUTIVE_LOSSES, 5)),
     maxDrawdownUsd: envNum(env.LIVE_MAX_DRAWDOWN_USD, 40),
-    maxLeverage: Math.floor(envNum(env.LIVE_MAX_LEVERAGE, 2)),
+    defaultLeverage,
+    maxLeverage,
     maxNotionalPerTrade: envNum(env.LIVE_MAX_NOTIONAL_PER_TRADE, 250),
     maxPaperOrderAgeMs: Math.floor(envNum(env.LIVE_MAX_PAPER_ORDER_AGE_MS, 10 * 60 * 1000)),
     mirrorAllPaperOrders: env.LIVE_MIRROR_ALL_PAPER === "1" && liveEnv === "testnet",
     testnetTakeProfitUsd: liveEnv === "testnet" ? envNum(env.LIVE_TESTNET_TP_USD, 0) : 0,
     testnetRegimeExitEnabled: liveEnv === "testnet" && env.LIVE_TESTNET_REGIME_EXIT !== "0",
+    testnetRegimeHardCutMs: liveEnv === "testnet" ? envNum(env.LIVE_TESTNET_REGIME_HARD_CUT_MS, 30 * 60 * 1000) : 0,
     estimatedCloseCostPct: envNum(env.LIVE_ESTIMATED_CLOSE_COST_PCT, 0.0022),
     autoArm: env.LIVE_AUTO_ARM === "1" && liveEnv === "testnet", // mainnet NEVER auto-arms
     mainnetConfirmed,
+    mainnetKeepTestnetPolicy: liveEnv === "mainnet" && env.LIVE_MAINNET_KEEP_TESTNET_POLICY === "1",
     configErrors,
   };
 }
@@ -265,6 +287,73 @@ export interface LiveIntentSource {
   paperOrderId: string;
   laneId: string;
   qty: number;
+  regime?: string | null;
+  controllerMode?: string | null;
+  controllerConfidence?: string | null;
+}
+
+export type LivePerformanceView = "hourly" | "daily" | "weekly" | "monthly" | "yearly";
+export type LivePerformancePeriod = "fixed";
+export type LivePerformanceRegimeFilter =
+  | "all"
+  | "long"
+  | "short"
+  | "mixed"
+  | "long_extended"
+  | "short_extended"
+  | "long_tactical"
+  | "short_tactical"
+  | "unknown";
+
+type LiveRegimeFamily = "LONG" | "SHORT" | "MIXED" | "UNKNOWN";
+type LiveRegimeBucket =
+  | "LONG_EXTENDED"
+  | "SHORT_EXTENDED"
+  | "LONG_TACTICAL"
+  | "SHORT_TACTICAL"
+  | "MIXED"
+  | "UNKNOWN";
+
+export interface LiveLanePerformanceSeriesPoint {
+  bucketStart: string;
+  realizedPnlUsd: number;
+  cumulativePnlUsd: number;
+  closedCount: number;
+  wins: number;
+  losses: number;
+}
+
+export interface LiveLanePerformanceSeriesLane {
+  laneId: string;
+  realizedPnlUsd: number;
+  feesUsd: number;
+  closedCount: number;
+  wins: number;
+  losses: number;
+  winRatePct: number | null;
+  symbols: string[];
+  regimes: Array<{
+    family: LiveRegimeFamily;
+    bucket: LiveRegimeBucket;
+    count: number;
+  }>;
+  points: LiveLanePerformanceSeriesPoint[];
+}
+
+export interface LiveLanePerformanceSeriesReport {
+  view: LivePerformanceView;
+  period: LivePerformancePeriod;
+  viewLabel: string;
+  periodLabel: string;
+  bucketLabel: string;
+  bucketMs: number | null;
+  since: string;
+  until: string;
+  anchor: string | null;
+  regimeFilter: LivePerformanceRegimeFilter;
+  regimeOptions: Array<{ value: LivePerformanceRegimeFilter; label: string }>;
+  bucketStarts: string[];
+  lanes: LiveLanePerformanceSeriesLane[];
 }
 
 interface LiveDailyLedger {
@@ -289,6 +378,9 @@ interface LiveExecutionState {
   /** Last fresh controller snapshot seen by the testnet regime-change harvest. */
   lastControllerRegime: string | null;
   lastControllerMode: string | null;
+  /** Anti-bull hard-cut: the currently-opposed side and when that opposition began (continuously). */
+  lastOpposingDirection: string | null;
+  opposingSince: string | null;
   killedAt: string | null;
   killReason: string | null;
 }
@@ -329,6 +421,8 @@ export class LiveExecutionStore {
       mirrorAttempts: {},
       lastControllerRegime: null,
       lastControllerMode: null,
+      lastOpposingDirection: null,
+      opposingSince: null,
       killedAt: null,
       killReason: null,
     };
@@ -417,6 +511,39 @@ const ERROR_STREAK_DISARM = 3;
 const REGIME_EXIT_SNAPSHOT_MAX_AGE_MS = 15 * 60 * 1000;
 const OPEN_INTENT_STATES: ReadonlySet<LiveIntentState> = new Set(["MIRRORED", "ENTRY_PLACED", "OPEN", "TP1_FILLED_BE_SET"]);
 const MIRRORABLE_PAPER_STATUSES: ReadonlySet<string> = new Set(["CREATED", "PAPER_SUBMITTED"]);
+// Lanes whose open positions are dumped at market the instant they go net-positive after the
+// estimated close cost (operator emergency-exit). Both removed LONG lanes are covered so any
+// position they already opened escapes at the first profitable tick instead of round-tripping.
+const LIVE_BREAKEVEN_EXIT_LANE_IDS = new Set([
+  "CG_WIDE_LONG_RUNNER",
+  "CG_VARIANT_MATRIX:CG_WIDE_LONG_RUNNER",
+  "CG_WIDE_FAST_LONG",
+  "CG_VARIANT_MATRIX:CG_WIDE_FAST_LONG",
+]);
+const HOUR_MS = 60 * 60 * 1000;
+const DAY_MS = 24 * HOUR_MS;
+const WEEK_MS = 7 * DAY_MS;
+const LIVE_PERFORMANCE_REGIME_OPTIONS: Array<{ value: LivePerformanceRegimeFilter; label: string }> = [
+  { value: "all", label: "All regimes" },
+  { value: "short", label: "Short all" },
+  { value: "long", label: "Long all" },
+  { value: "mixed", label: "Mixed / choppy" },
+  { value: "short_extended", label: "Short extended" },
+  { value: "long_extended", label: "Long extended" },
+  { value: "short_tactical", label: "Short tactical" },
+  { value: "long_tactical", label: "Long tactical" },
+  { value: "unknown", label: "Unknown" },
+];
+const LIVE_PERFORMANCE_VIEWS: Record<LivePerformanceView, {
+  label: string;
+  bucketLabel: string;
+}> = {
+  hourly: { label: "Hourly", bucketLabel: "24 hourly buckets" },
+  daily: { label: "Daily", bucketLabel: "Days in selected month" },
+  weekly: { label: "Weekly", bucketLabel: "Weeks in selected month" },
+  monthly: { label: "Monthly", bucketLabel: "12 monthly buckets" },
+  yearly: { label: "Yearly", bucketLabel: "5 yearly buckets" },
+};
 /**
  * A paper order whose live open fails this many times is quarantined — never re-mirrored.
  * Without this latch a signal that deterministically fails to open (e.g. the protective stop
@@ -425,6 +552,253 @@ const MIRRORABLE_PAPER_STATUSES: ReadonlySet<string> = new Set(["CREATED", "PAPE
  * single transient blip while bounding a churn storm to 2 cycles instead of hundreds.
  */
 const MAX_MIRROR_ATTEMPTS = 2;
+
+function normalizePerformanceView(raw: string | null | undefined): LivePerformanceView {
+  return raw && Object.prototype.hasOwnProperty.call(LIVE_PERFORMANCE_VIEWS, raw)
+    ? raw as LivePerformanceView
+    : "hourly";
+}
+
+function normalizePerformancePeriod(_raw: string | null | undefined): LivePerformancePeriod {
+  return "fixed";
+}
+
+function normalizeRegimeFilter(raw: string | null | undefined): LivePerformanceRegimeFilter {
+  return LIVE_PERFORMANCE_REGIME_OPTIONS.some((option) => option.value === raw)
+    ? raw as LivePerformanceRegimeFilter
+    : "all";
+}
+
+function startOfUtcDay(ms: number): number {
+  const date = new Date(ms);
+  return Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate());
+}
+
+function startOfUtcMonth(ms: number): number {
+  const date = new Date(ms);
+  return Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), 1);
+}
+
+function startOfUtcYear(ms: number): number {
+  const date = new Date(ms);
+  return Date.UTC(date.getUTCFullYear(), 0, 1);
+}
+
+function parseAnchorDay(anchor: string | null | undefined, fallbackMs: number): number {
+  if (anchor && /^\d{4}-\d{2}-\d{2}$/.test(anchor)) {
+    const [year, month, day] = anchor.split("-").map(Number);
+    const parsed = Date.UTC(year, month - 1, day);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return startOfUtcDay(fallbackMs);
+}
+
+function parseAnchorMonth(anchor: string | null | undefined, fallbackMs: number): number {
+  if (anchor && /^\d{4}-\d{2}$/.test(anchor)) {
+    const [year, month] = anchor.split("-").map(Number);
+    const parsed = Date.UTC(year, month - 1, 1);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return startOfUtcMonth(fallbackMs);
+}
+
+function parseAnchorYear(anchor: string | null | undefined, fallbackMs: number): number {
+  if (anchor && /^\d{4}$/.test(anchor)) {
+    const parsed = Date.UTC(Number(anchor), 0, 1);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return startOfUtcYear(fallbackMs);
+}
+
+function parseAnchorEndYear(anchor: string | null | undefined, fallbackMs: number): number {
+  if (anchor && /^\d{4}$/.test(anchor)) {
+    const year = Number(anchor);
+    const parsed = Date.UTC(year - 4, 0, 1);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  const fallbackYear = new Date(fallbackMs).getUTCFullYear();
+  return Date.UTC(fallbackYear - 4, 0, 1);
+}
+
+function addUtcMonths(ms: number, months: number): number {
+  const date = new Date(ms);
+  return Date.UTC(date.getUTCFullYear(), date.getUTCMonth() + months, 1);
+}
+
+function isoDay(ms: number): string {
+  return new Date(ms).toISOString().slice(0, 10);
+}
+
+function isoMonth(ms: number): string {
+  return new Date(ms).toISOString().slice(0, 7);
+}
+
+function isoYear(ms: number): string {
+  return new Date(ms).toISOString().slice(0, 4);
+}
+
+function buildFixedBucketStarts(sinceMs: number, untilMs: number, bucketMs: number): number[] {
+  const out: number[] = [];
+  for (let bucketMsCursor = sinceMs; bucketMsCursor < untilMs; bucketMsCursor += bucketMs) {
+    out.push(bucketMsCursor);
+  }
+  return out;
+}
+
+function bucketStartForMs(ms: number, bucketStartsMs: number[], untilMs: number): number | null {
+  if (ms < bucketStartsMs[0]! || ms >= untilMs) return null;
+  let picked = bucketStartsMs[0]!;
+  for (const bucketStart of bucketStartsMs) {
+    if (bucketStart > ms) break;
+    picked = bucketStart;
+  }
+  return picked;
+}
+
+function performanceWindow(input: {
+  view: LivePerformanceView;
+  anchor?: string | null;
+  nowMs: number;
+}): {
+  sinceMs: number;
+  untilMs: number;
+  anchor: string | null;
+  periodLabel: string;
+  bucketMs: number | null;
+  bucketStartsMs: number[];
+  bucketForMs: (ms: number) => number | null;
+} {
+  const nowDayStart = startOfUtcDay(input.nowMs);
+  if (input.view === "hourly") {
+    const sinceMs = parseAnchorDay(input.anchor, input.nowMs);
+    const untilMs = sinceMs + DAY_MS;
+    const bucketStartsMs = buildFixedBucketStarts(sinceMs, untilMs, HOUR_MS);
+    return {
+      sinceMs,
+      untilMs,
+      anchor: isoDay(sinceMs),
+      periodLabel: isoDay(sinceMs),
+      bucketMs: HOUR_MS,
+      bucketStartsMs,
+      bucketForMs: (ms) => bucketStartForMs(ms, bucketStartsMs, untilMs),
+    };
+  }
+  if (input.view === "monthly") {
+    const sinceMs = parseAnchorYear(input.anchor, input.nowMs);
+    const untilMs = addUtcMonths(sinceMs, 12);
+    const bucketStartsMs = Array.from({ length: 12 }, (_, index) => addUtcMonths(sinceMs, index));
+    return {
+      sinceMs,
+      untilMs,
+      anchor: isoYear(sinceMs),
+      periodLabel: isoYear(sinceMs),
+      bucketMs: null,
+      bucketStartsMs,
+      bucketForMs: (ms) => bucketStartForMs(ms, bucketStartsMs, untilMs),
+    };
+  }
+  if (input.view === "yearly") {
+    const sinceMs = parseAnchorEndYear(input.anchor, input.nowMs);
+    const bucketStartsMs = Array.from({ length: 5 }, (_, index) => Date.UTC(new Date(sinceMs).getUTCFullYear() + index, 0, 1));
+    const untilMs = Date.UTC(new Date(sinceMs).getUTCFullYear() + 5, 0, 1);
+    const startYear = isoYear(sinceMs);
+    const endYear = `${Number(startYear) + 4}`;
+    return {
+      sinceMs,
+      untilMs,
+      anchor: endYear,
+      periodLabel: `${startYear}-${endYear}`,
+      bucketMs: null,
+      bucketStartsMs,
+      bucketForMs: (ms) => bucketStartForMs(ms, bucketStartsMs, untilMs),
+    };
+  }
+  if (input.view === "daily") {
+    const sinceMs = parseAnchorMonth(input.anchor, input.nowMs);
+    const untilMs = addUtcMonths(sinceMs, 1);
+    const bucketStartsMs = buildFixedBucketStarts(sinceMs, untilMs, DAY_MS);
+    return {
+      sinceMs,
+      untilMs,
+      anchor: isoMonth(sinceMs),
+      periodLabel: isoMonth(sinceMs),
+      bucketMs: DAY_MS,
+      bucketStartsMs,
+      bucketForMs: (ms) => bucketStartForMs(ms, bucketStartsMs, untilMs),
+    };
+  }
+  if (input.view === "weekly") {
+    const sinceMs = parseAnchorMonth(input.anchor, input.nowMs);
+    const untilMs = addUtcMonths(sinceMs, 1);
+    const bucketStartsMs = buildFixedBucketStarts(sinceMs, untilMs, WEEK_MS);
+    return {
+      sinceMs,
+      untilMs,
+      anchor: isoMonth(sinceMs),
+      periodLabel: isoMonth(sinceMs),
+      bucketMs: WEEK_MS,
+      bucketStartsMs,
+      bucketForMs: (ms) => bucketStartForMs(ms, bucketStartsMs, untilMs),
+    };
+  }
+  const untilMs = nowDayStart + DAY_MS;
+  const sinceMs = nowDayStart;
+  const bucketStartsMs = buildFixedBucketStarts(sinceMs, untilMs, DAY_MS);
+  return {
+    sinceMs,
+    untilMs,
+    anchor: null,
+    periodLabel: isoDay(sinceMs),
+    bucketMs: DAY_MS,
+    bucketStartsMs,
+    bucketForMs: (ms) => bucketStartForMs(ms, bucketStartsMs, untilMs),
+  };
+}
+
+function classifyLivePerformanceRegime(input: {
+  regime: string | null;
+  controllerMode: string | null;
+  controllerConfidence: string | null;
+}): { family: LiveRegimeFamily; bucket: LiveRegimeBucket } {
+  if (!input.regime && !input.controllerMode) {
+    return { family: "UNKNOWN", bucket: "UNKNOWN" };
+  }
+  const estimated = estimateLaneSelectorV2Regime({
+    regime: input.regime,
+    controllerMode: input.controllerMode,
+    confidence: input.controllerConfidence,
+  });
+  if (estimated.direction === "MIXED") return { family: "MIXED", bucket: "MIXED" };
+  if (estimated.direction === "LONG") {
+    return {
+      family: "LONG",
+      bucket: estimated.posture === "EXTENDED_TREND" ? "LONG_EXTENDED" : "LONG_TACTICAL",
+    };
+  }
+  if (estimated.direction === "SHORT") {
+    return {
+      family: "SHORT",
+      bucket: estimated.posture === "EXTENDED_TREND" ? "SHORT_EXTENDED" : "SHORT_TACTICAL",
+    };
+  }
+  return { family: "UNKNOWN", bucket: "UNKNOWN" };
+}
+
+function regimeFilterMatches(
+  filter: LivePerformanceRegimeFilter,
+  classified: { family: LiveRegimeFamily; bucket: LiveRegimeBucket },
+): boolean {
+  if (filter === "all") return true;
+  if (filter === "long") return classified.family === "LONG";
+  if (filter === "short") return classified.family === "SHORT";
+  if (filter === "mixed") return classified.family === "MIXED";
+  if (filter === "unknown") return classified.family === "UNKNOWN";
+  if (filter === "long_extended") return classified.bucket === "LONG_EXTENDED";
+  if (filter === "short_extended") return classified.bucket === "SHORT_EXTENDED";
+  if (filter === "long_tactical") return classified.bucket === "LONG_TACTICAL";
+  if (filter === "short_tactical") return classified.bucket === "SHORT_TACTICAL";
+  return false;
+}
 
 export class LiveExecutionEngine {
   private readonly config: LiveExecutionConfig;
@@ -444,7 +818,8 @@ export class LiveExecutionEngine {
   private timer: ReturnType<typeof setInterval> | null = null;
   private ticking = false;
   private filtersCache: Map<string, FuturesSymbolFilters> | null = null;
-  private leverageSet = new Set<string>();
+  private leverageBySymbol = new Map<string, number>();
+  private isolatedMarginSet = new Set<string>();
 
   constructor(options: LiveExecutionEngineOptions) {
     this.config = options.config;
@@ -655,6 +1030,7 @@ export class LiveExecutionEngine {
         dailyMaxLossUsd: this.config.dailyMaxLossUsd,
         maxConsecutiveLosses: this.config.maxConsecutiveLosses,
         maxDrawdownUsd: this.config.maxDrawdownUsd,
+        defaultLeverage: this.config.defaultLeverage,
         maxLeverage: this.config.maxLeverage,
         maxNotionalPerTrade: this.config.maxNotionalPerTrade,
         maxPaperOrderAgeMs: this.config.maxPaperOrderAgeMs,
@@ -662,6 +1038,7 @@ export class LiveExecutionEngine {
         testnetTakeProfitUsd: this.config.testnetTakeProfitUsd,
         testnetRegimeExitEnabled: this.config.testnetRegimeExitEnabled,
         estimatedCloseCostPct: this.config.estimatedCloseCostPct,
+        mainnetKeepTestnetPolicy: this.config.mainnetKeepTestnetPolicy,
       },
     };
   }
@@ -722,6 +1099,7 @@ export class LiveExecutionEngine {
     const liveState = this.store.getState();
     const positions = rawPositions.filter((position) => Math.abs(position.positionAmt) > 1e-12);
     const openIntents = liveState.intents.filter((intent) => OPEN_INTENT_STATES.has(intent.state));
+    const paperById = this.paperOrderById();
     const activeSymbols = Array.from(new Set(openIntents.map((intent) => intent.symbol)));
     const openAlgoOrders = (
       await Promise.all(activeSymbols.map((symbol) => this.client.getOpenAlgoOrders(symbol)))
@@ -736,7 +1114,7 @@ export class LiveExecutionEngine {
 
     const positionRows = positions.map((position) => {
       const intent = intentBySymbol.get(position.symbol);
-      const sources = intent ? this.intentSources(intent) : [];
+      const sources = intent ? this.intentSources(intent, paperById) : [];
       const sourceQty = sources.reduce((sum, source) => sum + source.qty, 0);
       const positionNotional = Math.abs(position.positionAmt) * position.entryPrice;
       for (const source of sources) {
@@ -793,7 +1171,7 @@ export class LiveExecutionEngine {
     }>();
     for (const intent of liveState.intents) {
       if (intent.realizedPnlUsd === null) continue;
-      const sources = this.intentSources(intent);
+      const sources = this.intentSources(intent, paperById);
       const totalQty = sources.reduce((sum, source) => sum + source.qty, 0);
       const realized = intent.realizedPnlUsd;
       const fees = intent.feesUsd ?? 0;
@@ -848,6 +1226,147 @@ export class LiveExecutionEngine {
         symbols: Array.from(row.symbols).sort(),
         lastClosedAt: row.lastClosedAt,
       })).sort((left, right) => right.realizedPnlUsd - left.realizedPnlUsd),
+    };
+  }
+
+  getLanePerformanceSeries(options: {
+    view?: string | null;
+    period?: string | null;
+    anchor?: string | null;
+    regime?: string | null;
+  } = {}): LiveLanePerformanceSeriesReport {
+    const view = normalizePerformanceView(options.view);
+    const period = normalizePerformancePeriod(options.period);
+    const viewConfig = LIVE_PERFORMANCE_VIEWS[view];
+    const regimeFilter = normalizeRegimeFilter(options.regime);
+    const untilMs = new Date(this.nowIso()).getTime();
+    const safeNowMs = Number.isFinite(untilMs) ? untilMs : Date.now();
+    const window = performanceWindow({
+      view,
+      anchor: options.anchor,
+      nowMs: safeNowMs,
+    });
+    const bucketStarts = window.bucketStartsMs.map((bucketMs) => new Date(bucketMs).toISOString());
+
+    const paperById = this.paperOrderById();
+    const laneRows = new Map<string, {
+      realizedPnlUsd: number;
+      feesUsd: number;
+      closedCount: number;
+      wins: number;
+      losses: number;
+      symbols: Set<string>;
+      regimeCounts: Map<string, { family: LiveRegimeFamily; bucket: LiveRegimeBucket; count: number }>;
+      buckets: Map<string, Omit<LiveLanePerformanceSeriesPoint, "cumulativePnlUsd">>;
+    }>();
+
+    for (const intent of this.store.getState().intents) {
+      if (intent.realizedPnlUsd === null) continue;
+      const closedAt = intent.closedAt ?? intent.updatedAt;
+      const closedMs = new Date(closedAt).getTime();
+      if (!Number.isFinite(closedMs) || closedMs < window.sinceMs || closedMs >= window.untilMs) continue;
+
+      const bucketStartMs = window.bucketForMs(closedMs);
+      if (bucketStartMs === null) continue;
+      const bucketStart = new Date(bucketStartMs).toISOString();
+      const sources = this.intentSources(intent, paperById);
+      const totalQty = sources.reduce((sum, source) => sum + source.qty, 0);
+      const realized = intent.realizedPnlUsd;
+      const fees = intent.feesUsd ?? 0;
+
+      for (const source of sources) {
+        const share = totalQty > 0 ? source.qty / totalQty : 1 / Math.max(sources.length, 1);
+        const classified = classifyLivePerformanceRegime({
+          regime: source.regime ?? null,
+          controllerMode: source.controllerMode ?? null,
+          controllerConfidence: source.controllerConfidence ?? null,
+        });
+        if (!regimeFilterMatches(regimeFilter, classified)) continue;
+
+        const allocatedRealized = realized * share;
+        const laneId = source.laneId || "UNKNOWN";
+        const row = laneRows.get(laneId) ?? {
+          realizedPnlUsd: 0,
+          feesUsd: 0,
+          closedCount: 0,
+          wins: 0,
+          losses: 0,
+          symbols: new Set<string>(),
+          regimeCounts: new Map<string, { family: LiveRegimeFamily; bucket: LiveRegimeBucket; count: number }>(),
+          buckets: new Map<string, Omit<LiveLanePerformanceSeriesPoint, "cumulativePnlUsd">>(),
+        };
+        row.realizedPnlUsd += allocatedRealized;
+        row.feesUsd += fees * share;
+        row.closedCount += 1;
+        if (allocatedRealized > 0) row.wins += 1;
+        if (allocatedRealized < 0) row.losses += 1;
+        row.symbols.add(intent.symbol);
+
+        const regimeKey = `${classified.family}|${classified.bucket}`;
+        const regimeRow = row.regimeCounts.get(regimeKey) ?? { ...classified, count: 0 };
+        regimeRow.count += 1;
+        row.regimeCounts.set(regimeKey, regimeRow);
+
+        const bucketRow = row.buckets.get(bucketStart) ?? {
+          bucketStart,
+          realizedPnlUsd: 0,
+          closedCount: 0,
+          wins: 0,
+          losses: 0,
+        };
+        bucketRow.realizedPnlUsd += allocatedRealized;
+        bucketRow.closedCount += 1;
+        if (allocatedRealized > 0) bucketRow.wins += 1;
+        if (allocatedRealized < 0) bucketRow.losses += 1;
+        row.buckets.set(bucketStart, bucketRow);
+        laneRows.set(laneId, row);
+      }
+    }
+
+    const lanes = Array.from(laneRows, ([laneId, row]) => {
+      let cumulativePnlUsd = 0;
+      const points = bucketStarts.map((bucketStart) => {
+        const bucket = row.buckets.get(bucketStart) ?? {
+          bucketStart,
+          realizedPnlUsd: 0,
+          closedCount: 0,
+          wins: 0,
+          losses: 0,
+        };
+        cumulativePnlUsd += bucket.realizedPnlUsd;
+        return {
+          ...bucket,
+          cumulativePnlUsd,
+        };
+      });
+      return {
+        laneId,
+        realizedPnlUsd: row.realizedPnlUsd,
+        feesUsd: row.feesUsd,
+        closedCount: row.closedCount,
+        wins: row.wins,
+        losses: row.losses,
+        winRatePct: row.closedCount > 0 ? (row.wins / row.closedCount) * 100 : null,
+        symbols: Array.from(row.symbols).sort(),
+        regimes: Array.from(row.regimeCounts.values()).sort((left, right) => right.count - left.count),
+        points,
+      };
+    }).sort((left, right) => Math.abs(right.realizedPnlUsd) - Math.abs(left.realizedPnlUsd));
+
+    return {
+      view,
+      period,
+      viewLabel: viewConfig.label,
+      periodLabel: window.periodLabel,
+      bucketLabel: viewConfig.bucketLabel,
+      bucketMs: window.bucketMs,
+      since: new Date(window.sinceMs).toISOString(),
+      until: new Date(window.untilMs).toISOString(),
+      anchor: window.anchor,
+      regimeFilter,
+      regimeOptions: LIVE_PERFORMANCE_REGIME_OPTIONS,
+      bucketStarts,
+      lanes,
     };
   }
 
@@ -1037,6 +1556,12 @@ export class LiveExecutionEngine {
         if (usdTp.changed) dirty = true;
         if (usdTp.closed) continue;
 
+        if (pos) {
+          const liveBreakeven = await this.maybeCloseLiveBreakevenLaneAfterCost(intent, pos, amt);
+          if (liveBreakeven.changed) dirty = true;
+          if (liveBreakeven.closed) continue;
+        }
+
         if (pos && intent.state === "OPEN" && this.intentExitRule(intent) === "mfe_giveback") {
           const mfe = await this.manageMfeGiveback(intent, pos, amt);
           if (mfe.changed) dirty = true;
@@ -1115,6 +1640,59 @@ export class LiveExecutionEngine {
     if (dirty) this.store.save();
   }
 
+  private intentHasLiveBreakevenExitLane(intent: LiveIntent): boolean {
+    return this.intentSources(intent).some((source) => {
+      const laneId = source.laneId ?? "";
+      const variantId = laneId.split(":").pop() ?? laneId;
+      return LIVE_BREAKEVEN_EXIT_LANE_IDS.has(laneId) || LIVE_BREAKEVEN_EXIT_LANE_IDS.has(variantId);
+    });
+  }
+
+  private async maybeCloseLiveBreakevenLaneAfterCost(
+    intent: LiveIntent,
+    pos: FuturesPosition,
+    amt: number,
+  ): Promise<{ changed: boolean; closed: boolean }> {
+    // Runs on both real envs (mainnet + testnet) — operator wants the long-lane positions to bail
+    // the instant they're net-positive everywhere they exist.
+    if (this.config.env !== "mainnet" && this.config.env !== "testnet") return { changed: false, closed: false };
+    if (!this.intentHasLiveBreakevenExitLane(intent)) return { changed: false, closed: false };
+    const expectedSign = intent.direction === "LONG" ? 1 : -1;
+    if (Math.sign(amt) !== expectedSign) return { changed: false, closed: false };
+
+    const estimatedCloseCostUsd = this.estimatedCloseCostUsd(pos);
+    const netAfterCost = pos.unRealizedProfit - estimatedCloseCostUsd;
+    if (!Number.isFinite(netAfterCost) || netAfterCost < 0) return { changed: false, closed: false };
+
+    const flat = await this.client.placeOrder({
+      symbol: intent.symbol,
+      side: amt > 0 ? "SELL" : "BUY",
+      type: "MARKET",
+      quantity: Math.abs(amt),
+      reduceOnly: true,
+      newClientOrderId: `dtc-${intent.paperOrderId.slice(-18)}-bev`,
+    });
+    try {
+      await this.client.cancelAllOrders(intent.symbol);
+      await this.client.cancelAllAlgoOrders(intent.symbol);
+    } catch {
+      // Position is already flattened; residue cleanup is best-effort.
+    }
+    const net = await this.realizedFromTrades(intent.symbol, intent.createdAt, [
+      intent.entryOrderId,
+      intent.tp1OrderId,
+      flat.orderId,
+    ]);
+    intent.realizedPnlUsd = net;
+    intent.feesUsd = null;
+    intent.state = "CLOSED";
+    intent.closedAt = this.nowIso();
+    intent.updatedAt = this.nowIso();
+    intent.closeReason = "LIVE_LONG_RUNNER_BREAKEVEN_AFTER_COST";
+    this.applyRealizedToLedger(net);
+    return { changed: true, closed: true };
+  }
+
   private opposingDirectionForController(mode: string | null | undefined): "LONG" | "SHORT" | null {
     if (mode === "LONG_ONLY") return "SHORT";
     if (mode === "SHORT_ONLY") return "LONG";
@@ -1142,13 +1720,26 @@ export class LiveExecutionEngine {
 
     const openIntents = st.intents.filter((intent) => OPEN_INTENT_STATES.has(intent.state));
     const opposingDirection = this.opposingDirectionForController(currentMode);
+    // Anti-bull hard-cut: track how long the SAME opposing side has persisted continuously. Reset the
+    // clock whenever the opposed side changes or clears. Once opposition holds past testnetRegimeHardCutMs
+    // (a sustained bull against our shorts), we cut even the RED opposing positions — they won't recover
+    // in a sustained trend, so riding them to full stops only bleeds more.
+    const opposingChanged = opposingDirection !== st.lastOpposingDirection;
+    if (opposingChanged) {
+      st.lastOpposingDirection = opposingDirection;
+      st.opposingSince = opposingDirection ? this.nowIso() : null;
+    }
+    const hardCut = opposingDirection !== null
+      && this.config.testnetRegimeHardCutMs > 0
+      && st.opposingSince !== null
+      && new Date(this.nowIso()).getTime() - new Date(st.opposingSince).getTime() >= this.config.testnetRegimeHardCutMs;
     const harvestIntents = controllerChanged
       ? openIntents
       : opposingDirection
         ? openIntents.filter((intent) => intent.direction === opposingDirection)
         : [];
     if (harvestIntents.length === 0) {
-      if (snapshotChanged) this.store.save();
+      if (snapshotChanged || opposingChanged) this.store.save();
       return;
     }
 
@@ -1165,7 +1756,10 @@ export class LiveExecutionEngine {
 
       const estimatedCloseCostUsd = this.estimatedCloseCostUsd(pos);
       const netAfterCost = pos.unRealizedProfit - estimatedCloseCostUsd;
-      if (!Number.isFinite(netAfterCost) || netAfterCost < 0) continue;
+      const green = Number.isFinite(netAfterCost) && netAfterCost >= 0;
+      // Cut RED positions ONLY when a sustained bull opposes them (hard-cut), never our own side.
+      const hardCutThis = hardCut && opposingDirection !== null && intent.direction === opposingDirection;
+      if (!green && !hardCutThis) continue; // red & not a sustained-opposition cut → leave to its stop
 
       const flat = await this.client.placeOrder({
         symbol: intent.symbol,
@@ -1191,9 +1785,11 @@ export class LiveExecutionEngine {
       intent.state = "CLOSED";
       intent.closedAt = this.nowIso();
       intent.updatedAt = this.nowIso();
-      intent.closeReason = controllerChanged
-        ? `REGIME_CHANGE_HARVEST_${previousMode ?? previousRegime ?? "UNKNOWN"}_TO_${currentMode ?? currentRegime ?? "UNKNOWN"}`
-        : `REGIME_OPPOSITION_BREAKEVEN_${currentMode ?? "UNKNOWN"}`;
+      intent.closeReason = !green
+        ? `REGIME_OPPOSITION_HARD_CUT_${currentMode ?? "UNKNOWN"}`
+        : controllerChanged
+          ? `REGIME_CHANGE_HARVEST_${previousMode ?? previousRegime ?? "UNKNOWN"}_TO_${currentMode ?? currentRegime ?? "UNKNOWN"}`
+          : `REGIME_OPPOSITION_BREAKEVEN_${currentMode ?? "UNKNOWN"}`;
       this.applyRealizedToLedger(net);
       dirty = true;
     }
@@ -1544,6 +2140,25 @@ export class LiveExecutionEngine {
     return exitRule === "tp1_full" || exitRule === "mfe_giveback";
   }
 
+  private isExperimental10xPaperOrder(paper: PaperOrder): boolean {
+    const laneId = paper.selectedLaneId ?? "";
+    return /(^|:)CG_EXP_.*_10X$/.test(laneId);
+  }
+
+  private leverageForPlanned(planned: Array<{ paper: PaperOrder; plan: LiveOrderPlan }>): number {
+    const allExperimental10x = planned.length > 0 && planned.every(({ paper }) => this.isExperimental10xPaperOrder(paper));
+    return allExperimental10x
+      ? boundedLeverage(this.config.maxLeverage, this.config.maxLeverage)
+      : boundedLeverage(this.config.defaultLeverage, this.config.maxLeverage);
+  }
+
+  private async ensureSymbolLeverage(symbol: string, leverage: number): Promise<void> {
+    const bounded = boundedLeverage(leverage, this.config.maxLeverage);
+    if (this.leverageBySymbol.get(symbol) === bounded) return;
+    await this.client.setLeverage(symbol, bounded);
+    this.leverageBySymbol.set(symbol, bounded);
+  }
+
   private paperGeometryKey(paper: PaperOrder): string {
     return `${paper.selectedLaneId ?? "UNKNOWN"}|${this.paperExitRule(paper)}`;
   }
@@ -1614,6 +2229,9 @@ export class LiveExecutionEngine {
         paperOrderId: source.paperOrderId,
         laneId: source.selectedLaneId ?? "UNKNOWN",
         qty: sourcePlan.qty,
+        regime: source.regime ?? null,
+        controllerMode: source.controllerMode ?? null,
+        controllerConfidence: source.controllerConfidence ?? null,
       })),
     };
     st.intents.push(intent);
@@ -1621,16 +2239,17 @@ export class LiveExecutionEngine {
 
     const idTail = paper.paperOrderId.slice(-18);
     try {
-      // One-time leverage/margin setup per symbol.
-      if (!this.leverageSet.has(paper.symbol)) {
-        await this.client.setLeverage(paper.symbol, this.config.maxLeverage);
+      const leverage = this.leverageForPlanned(planned);
+      await this.ensureSymbolLeverage(paper.symbol, leverage);
+      // One-time isolated margin setup per symbol; leverage itself is lane-specific.
+      if (!this.isolatedMarginSet.has(paper.symbol)) {
         try {
           await this.client.setIsolatedMargin(paper.symbol);
+          this.isolatedMarginSet.add(paper.symbol);
         } catch (error) {
           // isolated is preferred, not required (fails when a position already exists)
           intent.lastError = `isolated margin not set: ${(error as Error).message}`;
         }
-        this.leverageSet.add(paper.symbol);
       }
 
       const entrySide = paper.direction === "LONG" ? "BUY" : "SELL";
@@ -1731,17 +2350,38 @@ export class LiveExecutionEngine {
     const addition = this.combinedPlan(planned, filters);
     if (!addition.ok) return;
     const idTail = planned[0]!.paper.paperOrderId.slice(-18);
-    try {
-      if (intent.stopOrderId !== null) await this.client.cancelAlgoOrder(intent.stopOrderId);
-      if (intent.tp1OrderId !== null) await this.client.cancelOrder(intent.symbol, intent.tp1OrderId);
 
-      const entry = await this.client.placeOrder({
+    // STEP 1 — place the add entry while the EXISTING stop/TP still protect the position. If the
+    // add fails (e.g. a 6s MARKET timeout), the original protection is untouched, so we skip this
+    // add and let a later tick retry — never flattening a healthy (often winning) position. The old
+    // ordering cancelled the stop FIRST, so an add timeout left the position naked and dumped it at
+    // market (EMERGENCY_FLATTEN_ADD_FAILED — the bleed).
+    let entry: FuturesOrder;
+    try {
+      await this.ensureSymbolLeverage(intent.symbol, this.leverageForPlanned(planned));
+      entry = await this.client.placeOrder({
         symbol: intent.symbol,
         side: intent.direction === "LONG" ? "BUY" : "SELL",
         type: "MARKET",
         quantity: addition.qty,
         newClientOrderId: `dtc-${idTail}-a`,
       });
+    } catch (addError) {
+      // Existing stop + TP are still working → the position is safe. Skip the add; do NOT flatten.
+      intent.lastError = `add entry skipped — position still protected: ${(addError as Error).message}`;
+      intent.updatedAt = this.nowIso();
+      this.store.save();
+      if (addError instanceof BinanceFuturesPrivateError && RETRY_FATAL.has(addError.failureType)) {
+        throw addError; // surface to the tick error-streak; the position remains protected
+      }
+      return;
+    }
+
+    // STEP 2 — the add filled. Re-establish protection for the larger position. Only THIS window
+    // (old stop cancelled, before the new one lands) carries naked risk → flatten if it fails.
+    try {
+      if (intent.stopOrderId !== null) await this.client.cancelAlgoOrder(intent.stopOrderId);
+      if (intent.tp1OrderId !== null) await this.client.cancelOrder(intent.symbol, intent.tp1OrderId);
       const oldQty = intent.qty;
       const totalQty = roundDownToStep(oldQty + addition.qty, filters.stepSize);
       const oldFill = intent.filledEntryPrice ?? intent.plannedEntryPrice;
@@ -1772,6 +2412,9 @@ export class LiveExecutionEngine {
           paperOrderId: paper.paperOrderId,
           laneId: paper.selectedLaneId ?? "UNKNOWN",
           qty: plan.qty,
+          regime: paper.regime ?? null,
+          controllerMode: paper.controllerMode ?? null,
+          controllerConfidence: paper.controllerConfidence ?? null,
         })),
       ];
 
@@ -1838,14 +2481,30 @@ export class LiveExecutionEngine {
     }
   }
 
-  private intentSources(intent: LiveIntent): LiveIntentSource[] {
-    if (intent.sourcePaperOrders && intent.sourcePaperOrders.length > 0) return intent.sourcePaperOrders;
-    const paper = this.paperStore.all.find((order) => order.paperOrderId === intent.paperOrderId);
-    return [{
+  private paperOrderById(): Map<string, PaperOrder> {
+    return new Map(this.paperStore.all.map((order) => [order.paperOrderId, order]));
+  }
+
+  private enrichIntentSource(source: LiveIntentSource, paper: PaperOrder | undefined): LiveIntentSource {
+    return {
+      ...source,
+      laneId: source.laneId || paper?.selectedLaneId || "UNKNOWN",
+      regime: source.regime ?? paper?.regime ?? null,
+      controllerMode: source.controllerMode ?? paper?.controllerMode ?? null,
+      controllerConfidence: source.controllerConfidence ?? paper?.controllerConfidence ?? null,
+    };
+  }
+
+  private intentSources(intent: LiveIntent, paperById = this.paperOrderById()): LiveIntentSource[] {
+    if (intent.sourcePaperOrders && intent.sourcePaperOrders.length > 0) {
+      return intent.sourcePaperOrders.map((source) => this.enrichIntentSource(source, paperById.get(source.paperOrderId)));
+    }
+    const paper = paperById.get(intent.paperOrderId);
+    return [this.enrichIntentSource({
       paperOrderId: intent.paperOrderId,
       laneId: paper?.selectedLaneId ?? "UNKNOWN",
       qty: intent.qty,
-    }];
+    }, paper)];
   }
 
   private async getFilters(symbol: string): Promise<FuturesSymbolFilters | null> {

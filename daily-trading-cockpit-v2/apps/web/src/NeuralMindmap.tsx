@@ -385,13 +385,6 @@ interface Point {
   y: number;
 }
 
-interface ProcessGuide {
-  purpose: string;
-  steps: string[];
-  healthyMeans: string;
-  inspectWhenBad: string[];
-}
-
 type MilestoneStage =
   | 'COLLECTING'
   | 'PAPER_EVIDENCE'
@@ -447,81 +440,6 @@ const HEALTH_LABELS: Record<NeuralHealth, string> = {
   COLLECTING: 'Collecting evidence',
   QUARANTINE: 'Blocked / benched (intentional)',
   DIAGNOSTIC: 'Diagnostic probe (not real trades)',
-};
-
-const PROCESS_GUIDES: Record<string, ProcessGuide> = {
-  binance: {
-    purpose: 'Supplies candles and market state for every symbol entering the scan.',
-    steps: ['Request symbol candles', 'Apply timeout and retry policy', 'Validate latest candle', 'Forward usable symbols to the scan'],
-    healthyMeans: 'All required symbols returned valid, recent candles inside the timeout budget.',
-    inspectWhenBad: ['Check timeout symbol count', 'Inspect candle failure reasons', 'Check Binance retry and provider wait time'],
-  },
-  kronos: {
-    purpose: 'Adds forecast direction, probability, horizon agreement, and forecast risk.',
-    steps: ['Build forecast input window', 'Call Kronos sidecar', 'Validate prediction shape', 'Attach forecast evidence to candidate'],
-    healthyMeans: 'Forecasts return within budget and valid horizon evidence is available.',
-    inspectWhenBad: ['Check Kronos forecast duration', 'Check sidecar reachability', 'Inspect prediction failure or model-busy counts'],
-  },
-  external: {
-    purpose: 'Collects external signal overlays without blocking the whole scan when a provider degrades.',
-    steps: ['Request configured providers', 'Apply per-provider timeout', 'Use safe fallback when available', 'Attach missing-data markers'],
-    healthyMeans: 'Providers respond inside their timeout and no circuit breaker is active.',
-    inspectWhenBad: ['Inspect degraded provider names', 'Check external fetch duration', 'Check circuit-breaker skip cycles'],
-  },
-  scan: {
-    purpose: 'Coordinates symbol fetches and produces the latest ranked market candidate batch.',
-    steps: ['Fan out symbol fetches', 'Accept healthy partial results', 'Build candidate inputs', 'Publish scan batch and timing diagnostics'],
-    healthyMeans: 'The scan completes inside its normal latency band without hang markers or excessive symbol failures.',
-    inspectWhenBad: ['Inspect slowest stage', 'Inspect failed symbols', 'Check hang markers and provider degradation'],
-  },
-  scoring: {
-    purpose: 'Scores direction, opportunity, danger, confidence, liquidity, and volatility.',
-    steps: ['Normalize candidate inputs', 'Compute directional scores', 'Apply evidence and conflict diagnostics', 'Rank candidate set'],
-    healthyMeans: 'Scoring completes quickly and every candidate has valid decision metadata.',
-    inspectWhenBad: ['Check missing candidate metadata', 'Inspect source conflicts', 'Check candidate scoring duration'],
-  },
-  controller: {
-    purpose: 'Converts the current regime into directional posture and entry permissions.',
-    steps: ['Classify market regime', 'Choose directional bias', 'Set controller mode', 'Publish allowed directions and confidence'],
-    healthyMeans: 'Regime classification is known and the posture is internally consistent.',
-    inspectWhenBad: ['Inspect regime reason codes', 'Check whether mode and bias agree', 'Check whether entry permission is intentionally restricted'],
-  },
-  'lane-router': {
-    purpose: 'Maps qualified candidates into strategy lanes appropriate for the current regime.',
-    steps: ['Read controller posture', 'Evaluate lane qualification', 'Apply mixed-router rescue rules', 'Select active paper lane set'],
-    healthyMeans: 'Qualified candidates map to an eligible lane with an explicit route reason.',
-    inspectWhenBad: ['Check active lane list', 'Inspect qualification and route decision', 'Check whether a lane is quarantined'],
-  },
-  occupancy: {
-    purpose: 'Prevents an otherwise good signal from overcrowding the paper book.',
-    steps: ['Count open and stale positions', 'Check symbol and direction concentration', 'Compare against active budget', 'Allow, reduce risk, or wait'],
-    healthyMeans: 'The book is inside budget and qualified signals retain capacity.',
-    inspectWhenBad: ['Check open versus stale counts', 'Check WAIT_FOR_CAPACITY reason', 'Inspect per-symbol and directional pressure'],
-  },
-  paper: {
-    purpose: 'Creates and tracks paper-only orders after routing and admission.',
-    steps: ['Validate paper opportunity', 'Apply paper risk multiplier', 'Create deduplicated paper order', 'Track open and closed lifecycle'],
-    healthyMeans: 'Orders are created only from eligible admissions and resolve without data failures.',
-    inspectWhenBad: ['Check paper data failures', 'Inspect no-order reason', 'Check order provenance and dedupe'],
-  },
-  outcomes: {
-    purpose: 'Resolves open paper orders against candle paths and records their outcomes.',
-    steps: ['Queue open orders', 'Fetch resolution candles', 'Walk fill and exit path', 'Persist paper outcome metrics'],
-    healthyMeans: 'The background queue completes with low lag and no resolution errors.',
-    inspectWhenBad: ['Check queue lag', 'Inspect outcome-checker status', 'Inspect last background error'],
-  },
-  guardrail: {
-    purpose: 'Monitors the paper-only mixed budget experiment and recommends keep, review, or rollback.',
-    steps: ['Count profile decisions', 'Aggregate closed OOS results', 'Evaluate PF, net R, WR, and capacity pressure', 'Publish recommended action'],
-    healthyMeans: 'Enough OOS exists and profile economics remain positive with acceptable capacity pressure.',
-    inspectWhenBad: ['Read guardrail reasons', 'Check OOS sample size', 'Check PF, net average R, and capacity spike'],
-  },
-  'live-lock': {
-    purpose: 'Keeps every experiment isolated from live trading and exchange execution.',
-    steps: ['Force paper-only scope', 'Block live execution', 'Disable micro-pilot', 'Expose lock state to operators'],
-    healthyMeans: 'liveBlocked remains true and microPilotAllowed remains false.',
-    inspectWhenBad: ['Stop the process immediately', 'Verify environment safety flags', 'Audit exchange call paths'],
-  },
 };
 
 function compactLaneLabel(label: string): string {
@@ -593,11 +511,6 @@ function tpVerdictLabel(assessment: TpAssessment | null | undefined): string {
   return 'OK after cost';
 }
 
-function fmtMs(value: number | null): string {
-  if (value === null || !Number.isFinite(value)) return 'n/a';
-  return value >= 1000 ? `${(value / 1000).toFixed(value >= 10_000 ? 1 : 2)}s` : `${Math.round(value)}ms`;
-}
-
 function laneDiagnosis(lane: NeuralLane): string {
   if (lane.statsSource === 'H6_RESEARCH') {
     return 'H6 trend-continuation is a report-only research lane. It measures R-based evidence and gate quality, but it does not create paper/live orders yet.';
@@ -644,30 +557,6 @@ function healthRank(health: NeuralHealth): number {
   // the critical/warning counts.
   return health === 'CRITICAL' ? 5 : health === 'WARNING' ? 4 : health === 'ACTIVE' ? 3 : health === 'HEALTHY' ? 2 : 1;
 }
-
-function healthDiagnosis(health: NeuralHealth): string {
-  if (health === 'CRITICAL') return 'FAILING — losing real money on HEADLINE trades (genuinely bad, needs attention).';
-  if (health === 'DIAGNOSTIC') return 'Diagnostic probes only — these are reject-sampler measurements on candidates the gate ALREADY rejected, NOT real trades. Red/loss here is expected and harmless; it is how the system measures what it correctly avoids.';
-  if (health === 'WARNING') return 'The component is operating with degraded input, latency, or capacity pressure.';
-  if (health === 'COLLECTING') return 'The component is functioning, but evidence is not mature enough for a stable verdict.';
-  if (health === 'QUARANTINE') return 'BLOCKED / benched on purpose (no new admissions) — gated by the edge memory or safety policy, not a failure. Still measured via the VM simulation; it graduates back if its evidence turns healthy.';
-  if (health === 'IDLE') return 'The component is intentionally inactive under the current regime or workflow.';
-  if (health === 'ACTIVE') return 'The component is healthy and currently carrying decision flow.';
-  return 'The component is healthy and no material fault is currently reported.';
-}
-
-const DIAGNOSIS_LABELS: Record<NeuralDiagnosisCategory, string> = {
-  HEALTHY_FLOW: 'Healthy flow',
-  COLLECTING_EVIDENCE: 'Collecting evidence',
-  IDLE: 'Idle',
-  LATENCY: 'Latency',
-  DEGRADED_INPUT: 'Degraded input',
-  CAPACITY_PRESSURE: 'Capacity pressure',
-  QUARANTINE: 'Quarantine',
-  HARD_FAIL: 'Hard fail',
-  DESTRUCTIVE_ECONOMICS: 'Destructive economics',
-  BLOCKING_CONDITION: 'Blocking condition',
-};
 
 const STABLE_MIN_FRESH = 100;
 const PROMOTION_MIN_FRESH = 200;
@@ -949,7 +838,7 @@ interface LiveAccount {
 export default function NeuralMindmap() {
   const [telemetry, setTelemetry] = useState<NeuralTelemetry | null>(null);
   const [liveAccount, setLiveAccount] = useState<LiveAccount | null>(null);
-  const [selectedId, setSelectedId] = useState('controller');
+  const [selectedId, setSelectedId] = useState('');
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -1040,13 +929,6 @@ export default function NeuralMindmap() {
     [telemetry?.nodes],
   );
 
-  const selectedNode = nodesById.get(selectedId) ?? null;
-  // Real paper P&L = HEADLINE only (realized + unrealized). Diagnostic probes are
-  // measurement, never mirror to live, and are reported separately below.
-  const paperRealPnl = telemetry
-    ? telemetry.paper.headlinePnl + (telemetry.paper.headlineUnrealizedPnl ?? 0)
-    : 0;
-  const paperRealTone = paperRealPnl > 0 ? 'tone-healthy' : paperRealPnl < 0 ? 'tone-critical' : 'tone-measure';
   const diagDir = telemetry?.paper.diagnosticByDirection ?? null;
   const diagMixed = telemetry?.paper.diagnosticByRegime?.MIXED ?? null;
   const displayLanes = useMemo(() => {
@@ -1161,7 +1043,6 @@ export default function NeuralMindmap() {
       ],
     },
   ] : [];
-  const selectedGuide = selectedNode ? PROCESS_GUIDES[selectedNode.id] : null;
   const newestAgeSec = lastReceivedAt === null ? Infinity : Math.round((Date.now() - lastReceivedAt) / 1000);
   const stale = newestAgeSec > (telemetry?.staleAfterSec ?? 30) || Boolean(error);
   const criticalCount = (telemetry?.nodes.filter((node) => node.health === 'CRITICAL').length ?? 0) +
@@ -1173,9 +1054,6 @@ export default function NeuralMindmap() {
   const diagRealizedTotal = diagDir ? diagDir.SHORT.realizedPnl + diagDir.LONG.realizedPnl : 0;
   const diagClosedTotal = diagDir ? diagDir.SHORT.closed + diagDir.LONG.closed : 0;
   const diagOpenTotal = diagDir ? diagDir.SHORT.open + diagDir.LONG.open : 0;
-  const diagUnrealTotal = diagDir
-    ? (diagDir.SHORT.unrealizedPnl ?? 0) + (diagDir.LONG.unrealizedPnl ?? 0)
-    : 0;
   const milestoneSections = useMemo(
     () => laneDirectionSections.map((section) => ({
       ...section,
@@ -1212,21 +1090,6 @@ export default function NeuralMindmap() {
     return nodesById.get(id)?.health ?? 'IDLE';
   }
 
-  const selectedConnections = useMemo(() => {
-    if (!telemetry || (!selectedNode && !selectedLane)) return { inputs: [] as string[], outputs: [] as string[] };
-    const id = selectedNode?.id ?? selectedLane?.id ?? '';
-    const edges = [
-      ...CORE_EDGES,
-      ...visualLanes.flatMap((lane): Array<[string, string]> => [['occupancy', lane.id], [lane.id, 'paper']]),
-    ];
-    const labelOf = (nodeId: string) =>
-      nodesById.get(nodeId)?.label ?? visualLanes.find((lane) => lane.id === nodeId)?.label ?? nodeId;
-    return {
-      inputs: edges.filter(([, to]) => to === id).map(([from]) => labelOf(from)),
-      outputs: edges.filter(([from]) => from === id).map(([, to]) => labelOf(to)),
-    };
-  }, [nodesById, selectedLane, selectedNode, telemetry, visualLanes]);
-
   return (
     <div className="neural-shell">
       <header className="neural-topbar">
@@ -1252,63 +1115,26 @@ export default function NeuralMindmap() {
         </div>
       </header>
 
-      <section className="neural-statusbar">
-        <div>
-          <span>Regime</span>
-          <strong>{telemetry?.controller.regime ?? 'Connecting'}</strong>
-          <small>{telemetry?.controller.mode ?? 'UNKNOWN'} / {telemetry?.controller.bias ?? 'UNKNOWN'}</small>
-        </div>
-        <div>
+      <section className="neural-statusbar is-compact-overview">
+        <div className="neural-pulse-card">
           <span>System pulse</span>
           <strong className={criticalCount > 0 ? 'tone-critical' : warningCount > 0 ? 'tone-warning' : 'tone-healthy'}>
             {criticalCount > 0 ? `${criticalCount} critical` : warningCount > 0 ? `${warningCount} degraded` : 'Nominal'}
           </strong>
           <small>{stale ? 'telemetry stale' : `updated ${new Date(telemetry?.generatedAt ?? Date.now()).toLocaleTimeString()}`}</small>
+          <div className="neural-card-subblock">
+            <span>Regime</span>
+            <strong>{telemetry?.controller.regime ?? 'Connecting'}</strong>
+            <small>{telemetry?.controller.mode ?? 'UNKNOWN'} / {telemetry?.controller.bias ?? 'UNKNOWN'}</small>
+          </div>
         </div>
-        <div>
-          <span>Paper P&amp;L (real)</span>
-          <strong className={paperRealTone}>
-            {telemetry ? `${fmtUsdt(paperRealPnl)} headline` : 'Loading'}
-          </strong>
-          <small>
-            {telemetry ? `${telemetry.paper.open} open positions` : 'paper only'}
-          </small>
-        </div>
-        <div>
-          <span>Diagnostic P&amp;L (measurement)</span>
-          <strong className="tone-measure">
-            {telemetry ? `${fmtUsdt(diagRealizedTotal)} · ${diagClosedTotal} closed / ${diagOpenTotal} open` : 'Loading'}
-          </strong>
-          <small>
-            {telemetry && diagDir ? (
-              <span className="diag-dir-split">
-                {(['SHORT', 'LONG'] as const).map((dir) => {
-                  const d = diagDir[dir];
-                  const tone = d.closed < 1 ? 'tone-measure' : (d.netAvgR ?? 0) > 0 ? 'tone-healthy' : 'tone-critical';
-                  return (
-                    <span key={dir} className="diag-dir-row">
-                      <b>{dir}</b>{' '}
-                      <span className={tone}>{fmtUsdt(d.realizedPnl)}</span>{' realized · '}
-                      {d.closed}cl/{d.open}op · {fmtR(d.netAvgR)} · {d.wr != null ? `${Math.round(d.wr * 100)}% WR` : '—'} · {fmtUsdt(d.unrealizedPnl)} MTM
-                    </span>
-                  );
-                })}
-                {diagMixed ? (
-                  <span className="diag-dir-row">
-                    <b>MIXED</b>{' '}
-                    <span className={diagMixed.closed < 1 ? 'tone-measure' : (diagMixed.netAvgR ?? 0) > 0 ? 'tone-healthy' : 'tone-critical'}>{fmtUsdt(diagMixed.realizedPnl)}</span>{' realized · '}
-                    {diagMixed.closed}cl/{diagMixed.open}op · {fmtR(diagMixed.netAvgR)} · {diagMixed.wr != null ? `${Math.round(diagMixed.wr * 100)}% WR` : '—'} · {fmtUsdt(diagMixed.unrealizedPnl)} MTM · regime subset
-                  </span>
-                ) : null}
-                <span className="diag-dir-foot">{fmtUsdt(diagUnrealTotal)} open MTM total · MIXED is subset, not added twice · not real money</span>
-              </span>
-            ) : 'paper only'}
-          </small>
-        </div>
-        <div>
-          <span>Safety</span>
-          <strong className="tone-healthy">Testnet mirror</strong>
-          <small>{liveAccount ? `${liveAccount.openPositionCount} protected positions` : 'loading account'}</small>
+        <div className="neural-diagnostic-card">
+          <div className="neural-card-heading">
+            <span>Diagnostic P&amp;L (measurement)</span>
+            <strong className="tone-measure">
+              {telemetry ? `${fmtUsdt(diagRealizedTotal)} · ${diagClosedTotal} closed / ${diagOpenTotal} open` : 'Loading'}
+            </strong>
+          </div>
         </div>
       </section>
 
@@ -1534,66 +1360,14 @@ export default function NeuralMindmap() {
 
         <aside className="neural-inspector">
           <div className="neural-inspector-heading">
-            <span>{selectedLane ? 'Lane intelligence' : selectedNode?.kind ?? 'System node'}</span>
-            <strong>{selectedLane?.label ?? selectedNode?.label ?? 'Select a node'}</strong>
-            {(selectedLane || selectedNode) && (
-              <em className={`health-${(selectedLane?.health ?? selectedNode?.health ?? 'IDLE').toLowerCase()}`}>
-                {HEALTH_LABELS[selectedLane?.health ?? selectedNode?.health ?? 'IDLE']}
+            <span>Lane intelligence</span>
+            <strong>{selectedLane?.label ?? 'Select a lane'}</strong>
+            {selectedLane && (
+              <em className={`health-${selectedLane.health.toLowerCase()}`}>
+                {HEALTH_LABELS[selectedLane.health]}
               </em>
             )}
           </div>
-
-          {selectedNode && (
-            <>
-              <div className={`neural-diagnosis health-${selectedNode.health.toLowerCase()}`}>
-                <span>Diagnosis</span>
-                <strong>{selectedNode.diagnosisSummary}</strong>
-                <p>{`Condition class: ${DIAGNOSIS_LABELS[selectedNode.diagnosisCategory]}`}</p>
-              </div>
-              <div className="neural-inspector-section">
-                <h2>Live checks</h2>
-                <dl>
-                  <div><dt>Condition class</dt><dd>{DIAGNOSIS_LABELS[selectedNode.diagnosisCategory]}</dd></div>
-                  <div><dt>Current state</dt><dd>{selectedNode.metric}</dd></div>
-                  <div><dt>Flow</dt><dd>{selectedNode.active ? 'Active now' : 'Standby'}</dd></div>
-                  {selectedNode.diagnosisFacts.map((detail, index) => (
-                    <div key={`${detail}-${index}`}>
-                      <dt>Check {index + 1}</dt>
-                      <dd>{detail}</dd>
-                    </div>
-                  ))}
-                </dl>
-              </div>
-              {selectedGuide && (
-                <>
-                  <div className="neural-inspector-section">
-                    <h2>What this node does</h2>
-                    <p>{selectedGuide.purpose}</p>
-                  </div>
-                  <div className="neural-inspector-section">
-                    <h2>Process trace</h2>
-                    <ol className="neural-process-list">
-                      {selectedGuide.steps.map((step, index) => (
-                        <li key={step}><span>{index + 1}</span><p>{step}</p></li>
-                      ))}
-                    </ol>
-                  </div>
-                  <div className="neural-inspector-section">
-                    <h2>Healthy condition</h2>
-                    <p>{selectedGuide.healthyMeans}</p>
-                  </div>
-                  {(selectedNode.health === 'WARNING' || selectedNode.health === 'CRITICAL') && (
-                    <div className="neural-inspector-section">
-                      <h2>Inspect next</h2>
-                      <ul className="neural-check-list">
-                        {selectedGuide.inspectWhenBad.map((item) => <li key={item}>{item}</li>)}
-                      </ul>
-                    </div>
-                  )}
-                </>
-              )}
-            </>
-          )}
 
           {selectedLane && (
             <>
@@ -1660,68 +1434,6 @@ export default function NeuralMindmap() {
             </>
           )}
 
-          {(selectedNode || selectedLane) && (
-            <div className="neural-inspector-section">
-              <h2>Connections</h2>
-              <dl>
-                <div><dt>Receives from</dt><dd>{selectedConnections.inputs.join(', ') || 'External state'}</dd></div>
-                <div><dt>Sends to</dt><dd>{selectedConnections.outputs.join(', ') || 'Operator telemetry'}</dd></div>
-              </dl>
-            </div>
-          )}
-
-          {telemetry && telemetry.mixed.oosThreshold > 0 && (
-            <div className="neural-inspector-section">
-              <h2>Mixed-regime OOS guardrail</h2>
-              <p className="neural-section-note">Only accrues during a <strong>Mixed</strong> regime. 0 here while the regime is Bullish/Bearish is expected — per-lane geometry maturity is the meter above.</p>
-              <dl>
-                <div>
-                  <dt>Collected</dt>
-                  <dd>{telemetry.mixed.oosCount} / {telemetry.mixed.oosThreshold} trades</dd>
-                </div>
-                <div>
-                  <dt>Progress</dt>
-                  <dd>
-                    <div className="neural-oos-bar">
-                      <div
-                        className={`neural-oos-fill ${telemetry.mixed.oosCount >= telemetry.mixed.oosThreshold ? 'is-complete' : ''}`}
-                        style={{ width: `${Math.min(100, (telemetry.mixed.oosCount / telemetry.mixed.oosThreshold) * 100).toFixed(1)}%` }}
-                      />
-                    </div>
-                    <span className="neural-oos-pct">
-                      {telemetry.mixed.oosCount >= telemetry.mixed.oosThreshold
-                        ? 'Ready'
-                        : `${Math.floor((telemetry.mixed.oosCount / telemetry.mixed.oosThreshold) * 100)}%`}
-                    </span>
-                  </dd>
-                </div>
-                <div>
-                  <dt>Status</dt>
-                  <dd>{telemetry.mixed.guardrailStatus}</dd>
-                </div>
-              </dl>
-            </div>
-          )}
-
-          <div className="neural-inspector-section">
-            <h2>Controller decision</h2>
-            <dl>
-              <div><dt>Long / short</dt><dd>{telemetry?.controller.allowsLong ? 'ON' : 'OFF'} / {telemetry?.controller.allowsShort ? 'ON' : 'OFF'}</dd></div>
-              <div><dt>New entries</dt><dd>{telemetry?.controller.allowsNewEntries ? 'Allowed' : 'Controlled'}</dd></div>
-              <div><dt>Mixed admission</dt><dd>{telemetry?.mixed.admission ?? 'n/a'}</dd></div>
-              <div><dt>Budget</dt><dd>{telemetry?.mixed.budgetProfile ?? 'n/a'}</dd></div>
-            </dl>
-          </div>
-
-          <div className="neural-inspector-section">
-            <h2>Scan latency</h2>
-            <dl>
-              <div><dt>Total</dt><dd>{fmtMs(telemetry?.scan.totalMs ?? null)}</dd></div>
-              <div><dt>Slowest stage</dt><dd>{telemetry?.scan.slowestStage ?? 'n/a'} {fmtMs(telemetry?.scan.slowestStageMs ?? null)}</dd></div>
-              <div><dt>Timeout symbols</dt><dd>{telemetry?.scan.timeoutSymbols ?? 0}</dd></div>
-              <div><dt>Queue lag</dt><dd>{telemetry?.scan.backgroundLagSec == null ? 'n/a' : `${telemetry.scan.backgroundLagSec.toFixed(0)}s`}</dd></div>
-            </dl>
-          </div>
         </aside>
       </main>
 

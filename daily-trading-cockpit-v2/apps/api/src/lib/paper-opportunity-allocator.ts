@@ -340,6 +340,18 @@ export interface PaperOpportunityAllocatorInputs {
    */
   paperCgWideTargetShare?: number;
   /**
+   * Prioritize the EXP 10x MFE LONG diagnostic lane during bullish LONG_ONLY paper collection.
+   * Paper-only: this does not authorize live trading or bypass exchange/testnet gates.
+   */
+  paperExpLongMfePriority?: boolean;
+  /** Per-scan cap for priority EXP 10x MFE LONG admissions (default 8). */
+  paperExpLongMfeMaxPerScan?: number;
+  /**
+   * Target share of LONG diagnostic admissions kept for EXP 10x MFE LONG when it is available
+   * (0..1, default 0.7). Other diagnostic long lanes are trimmed first.
+   */
+  paperExpLongMfeTargetShare?: number;
+  /**
    * Symbols with positive paper/live cohort evidence — overrides the
    * SYMBOL_NET_NEGATIVE candidate gate for those symbols only.
    */
@@ -438,6 +450,7 @@ const PAPER_ADMISSIBLE_LANE_IDS: readonly VariantMatrixVariantId[] = (() => {
   return base;
 })();
 const PAPER_CHALLENGER_LANE_ID: VariantMatrixVariantId = "CG_TRAIL_AFTER_TP1";
+const EXP_LONG_MFE_PRIORITY_VARIANT_ID: VariantMatrixVariantId = "CG_EXP_LONG_MFE_GIVEBACK_10X";
 /**
  * Variants admitted as DIAGNOSTIC_ONLY paper sleeves in BOTH directions when the full
  * variant-matrix paper collection is enabled. CG_SCALEOUT_TP1_TRAIL stays the HEADLINE lane and
@@ -488,6 +501,7 @@ function mixedLaneAllowedByActiveSet(laneId: string, activeMixedLanes: readonly 
 }
 /** Per-variant cap on DIAGNOSTIC_ONLY variant-matrix orders sampled per scan (keeps the book bounded). */
 const DEFAULT_VARIANT_DIAGNOSTIC_MAX_PER_SCAN = 3;
+const DEFAULT_EXP_LONG_MFE_PRIORITY_MAX_PER_SCAN = 8;
 /** Standing caps on the OPEN diagnostic book: per (variant×direction) lane and per symbol. ~13 active
  *  diagnostic laneIds × 60 ≈ 800 total — matched to the resolver's ~3h sweep throughput (OOS velocity
  *  is resolution-bound, so more open past this is bloat). Per-symbol 50 stops one coin dominating
@@ -502,8 +516,9 @@ const PAPER_DIAGNOSTIC_MAX_OPEN_PER_SYMBOL = Number(process.env.PAPER_DIAGNOSTIC
 const PAPER_DIAGNOSTIC_MAX_OPEN_TOTAL = Number(process.env.PAPER_DIAGNOSTIC_MAX_OPEN_TOTAL) || 800;
 
 export const MANUAL_QUARANTINED_PAPER_LANE_IDS: readonly string[] = [
-  "CG_LONG_VARIANT_MATRIX:CG_SCALEOUT_TP1_TRAIL",
-  "MIXED_CHOP_RANGE_MR",
+  // Cleared 2026-06-29 (operator): re-open ALL previously-quarantined lanes to re-test against the
+  // rebuilt fresh "/" measurement. Auto-quarantine still re-benches confirmed losers once the
+  // AUTO_QUARANTINE_MIN_CLOSED sample accrues — a genuine loser still gets benched on fresh data.
 ];
 
 /**
@@ -1197,6 +1212,20 @@ export function buildPaperOpportunityAllocatorReport(
     inputs.paperCgWideTargetShare < 1
       ? inputs.paperCgWideTargetShare
       : 0.9;
+  const expLongMfePriority = inputs.paperExpLongMfePriority === true;
+  const expLongMfeMaxPerScan =
+    typeof inputs.paperExpLongMfeMaxPerScan === "number" &&
+    Number.isFinite(inputs.paperExpLongMfeMaxPerScan) &&
+    inputs.paperExpLongMfeMaxPerScan > 0
+      ? Math.floor(inputs.paperExpLongMfeMaxPerScan)
+      : DEFAULT_EXP_LONG_MFE_PRIORITY_MAX_PER_SCAN;
+  const expLongMfeTargetShare =
+    typeof inputs.paperExpLongMfeTargetShare === "number" &&
+    Number.isFinite(inputs.paperExpLongMfeTargetShare) &&
+    inputs.paperExpLongMfeTargetShare > 0 &&
+    inputs.paperExpLongMfeTargetShare < 1
+      ? inputs.paperExpLongMfeTargetShare
+      : 0.7;
   const challengerDiagnosticMaxPerScan =
     typeof inputs.paperChallengerDiagnosticMaxPerScan === "number" &&
     Number.isFinite(inputs.paperChallengerDiagnosticMaxPerScan) &&
@@ -1416,6 +1445,12 @@ export function buildPaperOpportunityAllocatorReport(
         headlineStableOk &&
         controllerMode === "LONG_ONLY" &&
         regimeFamily === "BULLISH";
+      const expLongMfePriorityCollection =
+        expLongMfePriority &&
+        direction === "LONG" &&
+        def.id === EXP_LONG_MFE_PRIORITY_VARIANT_ID &&
+        controllerMode === "LONG_ONLY" &&
+        regimeFamily === "BULLISH";
       const variantDiagnosticCollection =
         variantMatrixDiagnosticEnabled &&
         VARIANT_MATRIX_DIAGNOSTIC_IDS.includes(def.id) &&
@@ -1436,7 +1471,11 @@ export function buildPaperOpportunityAllocatorReport(
         recordReject(symbol, direction, def.id, "LANE_NOT_PAPER_MODELED", rowFresh, rowNet);
         continue;
       }
-      if (!PAPER_ADMISSIBLE_LANE_IDS.includes(def.id) && !variantDiagnosticCollection) {
+      if (
+        !PAPER_ADMISSIBLE_LANE_IDS.includes(def.id) &&
+        !variantDiagnosticCollection &&
+        !expLongMfePriorityCollection
+      ) {
         recordReject(symbol, direction, def.id, "LANE_NOT_PAPER_MODELED", rowFresh, rowNet);
         continue;
       }
@@ -1483,6 +1522,7 @@ export function buildPaperOpportunityAllocatorReport(
         longPaperCollection ||
         longHeadlineCollection ||
         variantDiagnosticCollection ||
+        expLongMfePriorityCollection ||
         cgWidePriorityCollection;
 
       // ── CG_WIDE_STOP_TP_WIDE eligibility gates ───────────────────────────
@@ -1566,6 +1606,8 @@ export function buildPaperOpportunityAllocatorReport(
         ? LONG_WIDE_PAPER_LANE_ID
         : longHeadlineCollection
           ? `CG_LONG_VARIANT_MATRIX:${def.id}`
+        : expLongMfePriorityCollection
+          ? `CG_LONG_VARIANT_MATRIX:${def.id}`
         : variantDiagnosticCollection && direction === "LONG"
           ? `CG_LONG_VARIANT_MATRIX:${def.id}`
           : `CG_VARIANT_MATRIX:${def.id}`;
@@ -1599,6 +1641,7 @@ export function buildPaperOpportunityAllocatorReport(
         !longPaperCollection &&
         !challengerDiagnosticCollection &&
         !variantDiagnosticCollection &&
+        !expLongMfePriorityCollection &&
         !cgWidePriorityCollection
       ) {
         recordReject(symbol, direction, def.id, "ACTIVE_LANE_DEGRADED", rowFresh, rowNet);
@@ -1613,14 +1656,23 @@ export function buildPaperOpportunityAllocatorReport(
       }
       // Per-variant per-scan cap for the full variant-matrix diagnostic collection.
       if (
-        variantDiagnosticCollection &&
-        (variantDiagnosticSelected.get(def.id) ?? 0) >= variantMatrixDiagnosticMaxPerScan
+        (variantDiagnosticCollection || expLongMfePriorityCollection) &&
+        (variantDiagnosticSelected.get(def.id) ?? 0) >= (
+          expLongMfePriorityCollection ? expLongMfeMaxPerScan : variantMatrixDiagnosticMaxPerScan
+        )
       ) {
-        recordReject(symbol, direction, def.id, "VARIANT_DIAGNOSTIC_CAP_REACHED", rowFresh, rowNet);
+        recordReject(
+          symbol,
+          direction,
+          def.id,
+          expLongMfePriorityCollection ? "EXP_LONG_MFE_PRIORITY_CAP_REACHED" : "VARIANT_DIAGNOSTIC_CAP_REACHED",
+          rowFresh,
+          rowNet,
+        );
         continue;
       }
       // Standing open-book caps: global total ceiling (~800) + per-symbol/per-lane concentration.
-      if (variantDiagnosticCollection) {
+      if (variantDiagnosticCollection || expLongMfePriorityCollection) {
         if (diagnosticOpenRunning >= PAPER_DIAGNOSTIC_MAX_OPEN_TOTAL) {
           recordReject(symbol, direction, def.id, "DIAGNOSTIC_TOTAL_OPEN_CAP_REACHED", rowFresh, rowNet);
           continue;
@@ -1636,7 +1688,7 @@ export function buildPaperOpportunityAllocatorReport(
       }
       // Auto-quarantine: a variant lane that is confidently net-negative in realized paper stops
       // admitting new orders (and renders violet). "Let it run, then bench confirmed losers."
-      if (variantDiagnosticCollection && autoQuarantinedVariantLanes.has(laneId)) {
+      if ((variantDiagnosticCollection || expLongMfePriorityCollection) && autoQuarantinedVariantLanes.has(laneId)) {
         recordReject(symbol, direction, def.id, "VARIANT_LANE_AUTO_QUARANTINED", rowFresh, rowNet);
         continue;
       }
@@ -1925,7 +1977,7 @@ export function buildPaperOpportunityAllocatorReport(
           continue;
         }
         orderMode = "DIAGNOSTIC_ONLY";
-      } else if (variantDiagnosticCollection) {
+      } else if (expLongMfePriorityCollection || variantDiagnosticCollection) {
         // Full variant-matrix collection: DIAGNOSTIC_ONLY only — must be checked BEFORE the
         // HEADLINE branch so these sleeves never enter headline net/PF/WR accounting.
         if (!verdict.diagnosticEligible) {
@@ -2037,7 +2089,7 @@ export function buildPaperOpportunityAllocatorReport(
         challengerDiagnosticSelected += 1;
         report.challengerDiagnosticSelected = challengerDiagnosticSelected;
       }
-      if (variantDiagnosticCollection) {
+      if (variantDiagnosticCollection || expLongMfePriorityCollection) {
         variantDiagnosticSelected.set(def.id, (variantDiagnosticSelected.get(def.id) ?? 0) + 1);
         // keep the standing open-book caps accurate within this scan
         diagnosticOpenRunning += 1;
@@ -2147,6 +2199,37 @@ export function buildPaperOpportunityAllocatorReport(
         i += 1;
       }
       report.selectedOpportunities = [...wide, ...kept];
+      report.paperEligibleCount = report.selectedOpportunities.length;
+      report.headlineEligibleCount = report.selectedOpportunities.filter(
+        (o) => o.paperOrderMode === "HEADLINE",
+      ).length;
+      report.diagnosticEligibleCount = report.selectedOpportunities.filter(
+        (o) => o.paperOrderMode !== "HEADLINE",
+      ).length;
+    }
+  }
+
+  // ── EXP 10x MFE LONG priority share ──────────────────────────────────────
+  // In bullish LONG_ONLY collection, keep the MFE-giveback experimental long
+  // lane ahead of sibling long diagnostics. This is still DIAGNOSTIC_ONLY and
+  // paper-only; it just accelerates evidence collection for the lane the
+  // operator wants to evaluate next.
+  if (expLongMfePriority && regimeFamily === "BULLISH") {
+    const isPriority = (o: PaperOpportunity): boolean =>
+      o.laneId === `CG_LONG_VARIANT_MATRIX:${EXP_LONG_MFE_PRIORITY_VARIANT_ID}`;
+    const priority = report.selectedOpportunities.filter(isPriority);
+    if (priority.length > 0) {
+      const protectedOthers = report.selectedOpportunities.filter(
+        (o) => isPriority(o) || o.paperOrderMode === "HEADLINE" || o.direction !== "LONG",
+      );
+      const trimmableLongDiagnostics = report.selectedOpportunities.filter(
+        (o) => !isPriority(o) && o.paperOrderMode !== "HEADLINE" && o.direction === "LONG",
+      );
+      const maxOtherLongDiagnostics = Math.floor(
+        (priority.length * (1 - expLongMfeTargetShare)) / expLongMfeTargetShare,
+      );
+      const keptLongDiagnostics = trimmableLongDiagnostics.slice(0, maxOtherLongDiagnostics);
+      report.selectedOpportunities = [...priority, ...protectedOthers.filter((o) => !isPriority(o)), ...keptLongDiagnostics];
       report.paperEligibleCount = report.selectedOpportunities.length;
       report.headlineEligibleCount = report.selectedOpportunities.filter(
         (o) => o.paperOrderMode === "HEADLINE",

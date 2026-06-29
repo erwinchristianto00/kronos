@@ -9,7 +9,6 @@ import {
   makeRealtimeShortPaperOrderId,
   realtimeShortSelectedLaneId,
   REALTIME_SHORT_ALLOWED_VARIANT_IDS,
-  REALTIME_SHORT_SELECTED_LANE_ID,
   type RealtimeShortCandidate,
   type RealtimeShortMirrorInputs,
 } from "../src/lib/realtime-short-mirror.js";
@@ -39,7 +38,12 @@ function inputs(
     candidates,
     regime: "Bearish pressure",
     controllerMode: "SHORT_ONLY",
-    stableShortLaneActive: true,
+    stableShortLaneActive: false,
+    stableShortLanes: [
+      { variantId: "CG_WIDE_STOP_TP_WIDE", status: "STABLE_CANDIDATE", freshValid: 200, netAvgR: 0.3, pf: 1.3 },
+      { variantId: "CG_WIDE_FAST_SHORT", status: "STABLE_CANDIDATE", freshValid: 200, netAvgR: 0.25, pf: 1.2 },
+      { variantId: "CG_EXP_SHORT_MFE_GIVEBACK_10X", status: "STABLE_CANDIDATE", freshValid: 200, netAvgR: 0.2, pf: 1.4 },
+    ],
     now: "2026-06-25T04:00:00.000Z",
     ...over,
   };
@@ -59,6 +63,7 @@ describe("realtime-short-mirror — fresh short live-mirror source (mode 2)", ()
     expect(store.all).toHaveLength(1);
     expect(store.all[0]!.symbol).toBe("BTCUSDT");
     expect(store.all[0]!.direction).toBe("SHORT");
+    // The long is rejected by the controller-direction gate (default inputs aren't a WIDE_TREND bull).
     expect(res.reasons.some((r) => r.startsWith("controller_blocks_LONG:ETHUSDT"))).toBe(true);
   });
 
@@ -78,13 +83,13 @@ describe("realtime-short-mirror — fresh short live-mirror source (mode 2)", ()
     expect(o.paperOrderMode).toBe("HEADLINE");
     expect(o.paperStatus).toBe("CREATED"); // MIRRORABLE
     expect(o.diagnosticLabel).toBeNull();
-    expect(o.selectedLaneId).toBe(REALTIME_SHORT_SELECTED_LANE_ID);
+    expect(o.selectedLaneId).toBe(realtimeShortSelectedLaneId("CG_WIDE_STOP_TP_WIDE"));
     expect(o.sourceType).toBe("REALTIME_SHORT_MIRROR");
     expect(o.variantExitRule).toBe("tp1_full"); // bank 100% at TP1
     expect(o.entryPrice).toBe(100);
   });
 
-  it("[SELECTOR] ranks live-supported stable candidates and emits the best lane geometry", () => {
+  it("[SELECTOR] applies policy before score-only stable candidates", () => {
     const store = freshStore();
     const res = runRealtimeShortMirror(
       inputs([shortCand("BTCUSDT", { currentPrice: 100, stopLoss: 104 })], {
@@ -99,9 +104,48 @@ describe("realtime-short-mirror — fresh short live-mirror source (mode 2)", ()
     );
     expect(res.emitted).toBe(1);
     const o = store.all[0]!;
-    expect(o.selectedLaneId).toBe(realtimeShortSelectedLaneId("CG_MFE_GIVEBACK"));
-    expect(o.variantExitRule).toBe("mfe_giveback");
-    expect(o.takeProfitLevels[0]).toBeCloseTo(88, 6); // 3R against a 4% wide stop
+    expect(o.selectedLaneId).toBe(realtimeShortSelectedLaneId("CG_WIDE_STOP_TP_WIDE"));
+    expect(o.variantExitRule).toBe("tp1_full");
+    expect(o.takeProfitLevels[0]).toBeCloseTo(96, 6); // 1R against a 4% wide stop
+  });
+
+  it("[EXP-MFE-DISABLED] ignores disabled EXP 10x MFE SHORT in the tactical bucket", () => {
+    const store = freshStore();
+    const res = runRealtimeShortMirror(
+      inputs([shortCand("APTUSDT", { currentPrice: 100, stopLoss: 104 })], {
+        // APTUSDT -> secondary bucket; disabled EXP must not be revived by stale/rejected telemetry.
+        stableShortLaneActive: false,
+        controllerConfidence: "LOW",
+        stableShortLanes: [
+          { variantId: "CG_EXP_SHORT_MFE_GIVEBACK_10X", status: "REJECT", freshValid: 38, netAvgR: -0.002, pf: 0.98 },
+          { variantId: "CG_WIDE_STOP_TP_WIDE", status: "STABLE_CANDIDATE", freshValid: 200, netAvgR: 0.3, pf: 1.3 },
+        ],
+      }),
+      store,
+    );
+    expect(res.emitted).toBe(1);
+    const o = store.all[0]!;
+    expect(o.selectedLaneId).toBe(realtimeShortSelectedLaneId("CG_WIDE_STOP_TP_WIDE"));
+    expect(o.variantExitRule).toBe("tp1_full");
+    expect(o.controllerConfidence).toBe("LOW");
+  });
+
+  it("[EXP-MFE-DISABLED] keeps EXP 10x MFE SHORT disabled in the extended bucket", () => {
+    const store = freshStore();
+    const res = runRealtimeShortMirror(
+      inputs([shortCand("DOGEUSDT", { currentPrice: 100, stopLoss: 104 })], {
+        stableShortLaneActive: false,
+        controllerConfidence: "MEDIUM",
+        stableShortLanes: [
+          { variantId: "CG_EXP_SHORT_MFE_GIVEBACK_10X", status: "REJECT", freshValid: 38, netAvgR: -0.002, pf: 0.98 },
+          { variantId: "CG_WIDE_STOP_TP_WIDE", status: "STABLE_CANDIDATE", freshValid: 200, netAvgR: 0.3, pf: 1.3 },
+        ],
+      }),
+      store,
+    );
+    expect(res.emitted).toBe(1);
+    const o = store.all[0]!;
+    expect(o.selectedLaneId).toBe(realtimeShortSelectedLaneId("CG_WIDE_STOP_TP_WIDE"));
   });
 
   it("[ALLOWLIST] refuses downgraded lanes and maker-only lanes even when telemetry says stable", () => {
@@ -123,6 +167,7 @@ describe("realtime-short-mirror — fresh short live-mirror source (mode 2)", ()
     expect(REALTIME_SHORT_ALLOWED_VARIANT_IDS).toContain("CG_WIDE_STOP_TP_WIDE");
     expect(REALTIME_SHORT_ALLOWED_VARIANT_IDS).toContain("CG_MFE_GIVEBACK");
     expect(REALTIME_SHORT_ALLOWED_VARIANT_IDS).toContain("CG_TIGHT_FAST_05");
+    expect(REALTIME_SHORT_ALLOWED_VARIANT_IDS).not.toContain("CG_EXP_SHORT_MFE_GIVEBACK_10X");
     expect(REALTIME_SHORT_ALLOWED_VARIANT_IDS).not.toContain("CG_MAKER_LIMIT_SIM");
   });
 
@@ -143,16 +188,32 @@ describe("realtime-short-mirror — fresh short live-mirror source (mode 2)", ()
     expect(res.reasons).toContain("stable_lane_inactive");
   });
 
-  it("[LONG] can emit a stable long lane when the controller allows longs", () => {
+  it("[MIXED-SYMBOL-GATE] skips NEARUSDT in mixed regimes", () => {
+    const store = freshStore();
+    const res = runRealtimeShortMirror(
+      inputs([shortCand("NEARUSDT")], {
+        regime: "Mixed rotation",
+        controllerMode: "VALIDATION_ONLY",
+        controllerConfidence: "LOW",
+      }),
+      store,
+    );
+    expect(res.emitted).toBe(0);
+    expect(store.all).toHaveLength(0);
+    expect(res.reasons).toContain("mixed_symbol_blocked:NEARUSDT");
+  });
+
+  it("[LONG] emits CG_WIDE_STOP_TP_WIDE long in a WIDE_TREND bull (re-enabled lane)", () => {
     const store = freshStore();
     const res = runRealtimeShortMirror(
       inputs(
         [{ symbol: "ETHUSDT", direction: "LONG", currentPrice: 100, stopLoss: 97, takeProfitLevels: [110] }],
         {
+          regime: "Bullish expansion",
           controllerMode: "LONG_ONLY",
+          controllerConfidence: "MEDIUM",
           stableShortLaneActive: false,
           stableShortLanes: [
-            { variantId: "CG_WIDE_FAST_LONG", status: "STABLE_CANDIDATE", freshValid: 200, netAvgR: 0.4, pf: 2 },
             { variantId: "CG_WIDE_FAST_SHORT", status: "STABLE_CANDIDATE", freshValid: 200, netAvgR: 9, pf: 9 },
           ],
         },
@@ -162,16 +223,18 @@ describe("realtime-short-mirror — fresh short live-mirror source (mode 2)", ()
     expect(res.emitted).toBe(1);
     const o = store.all[0]!;
     expect(o.direction).toBe("LONG");
-    expect(o.selectedLaneId).toBe(realtimeShortSelectedLaneId("CG_WIDE_FAST_LONG"));
-    expect(o.stopLoss).toBeCloseTo(97, 6);
-    expect(o.takeProfitLevels[0]).toBeCloseTo(101.5, 6);
+    expect(o.selectedLaneId).toBe(realtimeShortSelectedLaneId("CG_WIDE_STOP_TP_WIDE"));
+    expect(o.stopLoss).toBeCloseTo(97, 6); // 300bps wide stop
+    expect(o.takeProfitLevels[0]).toBeCloseTo(103, 6); // 1R target
   });
 
   it("[GEOMETRY-COHERENT] derives stop + 0.5R TP from the live entry, ignoring the scanner's tp1", () => {
     const store = freshStore();
     // entry 100, stop 105 (5% > 300bps floor). scanner tp1 of 99.9 must be IGNORED.
     runRealtimeShortMirror(
-      inputs([shortCand("BTCUSDT", { currentPrice: 100, stopLoss: 105, takeProfitLevels: [99.9] })]),
+      inputs([shortCand("XRPUSDT", { currentPrice: 100, stopLoss: 105, takeProfitLevels: [99.9] })], {
+        controllerConfidence: "MEDIUM",
+      }),
       store,
     );
     const o = store.all[0]!;
@@ -187,7 +250,9 @@ describe("realtime-short-mirror — fresh short live-mirror source (mode 2)", ()
     const store = freshStore();
     // raw stop only 0.5% away — must floor to 3% (300bps)
     runRealtimeShortMirror(
-      inputs([shortCand("BTCUSDT", { currentPrice: 100, stopLoss: 100.5 })]),
+      inputs([shortCand("XRPUSDT", { currentPrice: 100, stopLoss: 100.5 })], {
+        controllerConfidence: "MEDIUM",
+      }),
       store,
     );
     const o = store.all[0]!;
@@ -197,7 +262,7 @@ describe("realtime-short-mirror — fresh short live-mirror source (mode 2)", ()
 
   it("[STABLE-GATE] emits nothing when the stable short lane is inactive", () => {
     const store = freshStore();
-    const res = runRealtimeShortMirror(inputs([shortCand("BTCUSDT")], { stableShortLaneActive: false }), store);
+    const res = runRealtimeShortMirror(inputs([shortCand("BTCUSDT")], { stableShortLaneActive: false, stableShortLanes: [] }), store);
     expect(res.emitted).toBe(0);
     expect(store.all).toHaveLength(0);
     expect(res.reasons).toContain("stable_lane_inactive");
@@ -228,7 +293,7 @@ describe("realtime-short-mirror — fresh short live-mirror source (mode 2)", ()
     );
     expect(res.emitted).toBe(0);
     expect(store.all).toHaveLength(0);
-    expect(res.reasons.some((r) => r.startsWith("CG_WIDE_FAST_SHORT:geometry_failed:PASTSTOP"))).toBe(true);
+    expect(res.reasons.some((r) => r.startsWith("CG_WIDE_STOP_TP_WIDE:geometry_failed:PASTSTOP"))).toBe(true);
     expect(res.reasons.some((r) => r.startsWith("bad_geometry:NOPRICE"))).toBe(true);
     expect(res.reasons.some((r) => r.startsWith("no_stop:NOSTOP"))).toBe(true);
   });

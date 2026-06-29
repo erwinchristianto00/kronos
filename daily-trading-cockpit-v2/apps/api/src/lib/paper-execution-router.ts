@@ -286,6 +286,7 @@ export interface PaperOrder {
   direction: "LONG" | "SHORT";
   regime: string | null;
   controllerMode: string;
+  controllerConfidence?: string | null;
   selectedLaneId: string;
   routerPermission: string;
   entryPrice: number;
