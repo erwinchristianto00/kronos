@@ -261,6 +261,9 @@ function makeConfig(overrides: Partial<LiveExecutionConfig> = {}): LiveExecution
     autoArm: false,
     mainnetConfirmed: false,
     mainnetKeepTestnetPolicy: false,
+    mainnetProfitProtection: false,
+    mainnetTpR: 0,
+    mainnetRegimeHardCutMs: 30 * 60 * 1000,
     rescue: {
       enabled: false,
       minAgeMs: 60 * 60 * 1000,
@@ -390,6 +393,29 @@ describe("parseLiveExecutionConfig", () => {
     expect(parseLiveExecutionConfig(base).testnetRegimeExitEnabled).toBe(true);
     expect(parseLiveExecutionConfig({ ...base, LIVE_TESTNET_REGIME_EXIT: "0" }).testnetRegimeExitEnabled).toBe(false);
     expect(parseLiveExecutionConfig(base).estimatedCloseCostPct).toBeCloseTo(0.0022, 8);
+  });
+
+  it("mainnet profit-protection is opt-in and mainnet-only; R-based TP parses", () => {
+    const mainnet = {
+      LIVE_EXECUTION_ENABLED: "1",
+      LIVE_BINANCE_ENV: "mainnet",
+      LIVE_BINANCE_API_KEY: "k",
+      LIVE_BINANCE_API_SECRET: "s",
+      LIVE_MAINNET_CONFIRM: "I_UNDERSTAND_REAL_MONEY",
+    };
+    // Off by default — mainnet historically had NO regime exit / profit bank.
+    expect(parseLiveExecutionConfig(mainnet).mainnetProfitProtection).toBe(false);
+    expect(parseLiveExecutionConfig(mainnet).mainnetTpR).toBe(0);
+    // Opt-in.
+    const on = parseLiveExecutionConfig({ ...mainnet, LIVE_MAINNET_PROFIT_PROTECTION: "1", LIVE_MAINNET_TP_R: "3" });
+    expect(on.mainnetProfitProtection).toBe(true);
+    expect(on.mainnetTpR).toBe(3);
+    expect(on.mainnetRegimeHardCutMs).toBe(30 * 60 * 1000);
+    // The flag does nothing on testnet (mainnet-only).
+    expect(parseLiveExecutionConfig({
+      LIVE_EXECUTION_ENABLED: "1", LIVE_BINANCE_ENV: "testnet", LIVE_BINANCE_API_KEY: "k", LIVE_BINANCE_API_SECRET: "s",
+      LIVE_MAINNET_PROFIT_PROTECTION: "1",
+    }).mainnetProfitProtection).toBe(false);
   });
 
   it("uses a 3x default leverage and caps EXP lanes at LIVE_MAX_LEVERAGE", () => {
@@ -1573,5 +1599,73 @@ describe("regime-flip rescue (LIVE execution)", () => {
     expect(store.getState().intents.find((i) => i.rescue === true)).toBeUndefined();
     expect(client.placed.some((p) => p.side === "SELL" && !p.reduceOnly)).toBe(false);
     expect(store.getState().lastRescuePlan!.flips.length).toBe(1); // planned, just not executed
+  });
+});
+
+describe("mainnet profit protection (opt-in regime harvest on real money)", () => {
+  // A counter-regime SHORT (opposing a LONG_ONLY controller), green after cost, seeded directly.
+  function seedOpposingGreenShort(store: ReturnType<typeof makeEngine>["store"]) {
+    store.getState().intents.push({
+      paperOrderId: "p-eth",
+      symbol: "ETHUSDT",
+      direction: "SHORT",
+      state: "MIRRORED", // seen by the harvest, skipped by manageLifecycle
+      qty: 0.05,
+      tp1Qty: 0,
+      plannedEntryPrice: 2000,
+      stopLossPrice: 2060,
+      tp1Price: 1900,
+      filledEntryPrice: 2000,
+      entryOrderId: 1,
+      stopOrderId: null,
+      tp1OrderId: null,
+      beStopOrderId: null,
+      realizedPnlUsd: null,
+      feesUsd: null,
+      createdAt: "2099-01-02T11:00:00.000Z",
+      updatedAt: "2099-01-02T11:00:00.000Z",
+      closedAt: null,
+      closeReason: null,
+      lastError: null,
+    } as never);
+    store.save();
+  }
+
+  function mainnetEngine(profitProtection: boolean) {
+    const client = new FakeLiveClient();
+    client.positionsBySymbol.set("ETHUSDT", -0.05); // net short
+    client.markPriceBySymbol.set("ETHUSDT", 1900);
+    client.unrealizedPnlBySymbol.set("ETHUSDT", 1.0); // green; est close cost ≈ 0.21
+    client.flattenRealizedPnl = 0.78;
+    const { engine, store } = makeEngine({
+      client,
+      config: { env: "mainnet", mainnetConfirmed: true, mainnetProfitProtection: profitProtection },
+      getControllerSnapshot: () => ({ regime: "Bullish expansion", mode: "LONG_ONLY", capturedAt: new Date().toISOString() }),
+    });
+    return { engine, client, store };
+  }
+
+  it("WITHOUT the opt-in, mainnet leaves a counter-regime green position open (the old, exposed behavior)", async () => {
+    const { engine, client, store } = mainnetEngine(false);
+    seedOpposingGreenShort(store);
+    await engine.tick();
+    expect(store.getState().intents[0]!.state).toBe("MIRRORED"); // not harvested
+    expect(client.placed.length).toBe(0); // no flatten placed
+    expect(engine.getStatus().limits.regimeExitActive).toBe(false);
+  });
+
+  it("WITH the opt-in, mainnet banks the counter-regime green position at breakeven (same harvest as testnet)", async () => {
+    const { engine, client, store } = mainnetEngine(true);
+    seedOpposingGreenShort(store);
+    await engine.tick();
+    const closed = store.getState().intents[0]!;
+    expect(closed.state).toBe("CLOSED");
+    expect(closed.closeReason).toBe("REGIME_OPPOSITION_BREAKEVEN_LONG_ONLY");
+    expect(closed.realizedPnlUsd).toBeCloseTo(0.78, 6);
+    const flat = client.placed.at(-1)!;
+    expect(flat.type).toBe("MARKET");
+    expect(flat.reduceOnly).toBe(true);
+    expect(flat.side).toBe("BUY"); // reduce a short
+    expect(engine.getStatus().limits.regimeExitActive).toBe(true);
   });
 });

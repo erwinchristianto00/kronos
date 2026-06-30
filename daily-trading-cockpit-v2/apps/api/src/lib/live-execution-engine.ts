@@ -92,6 +92,15 @@ export interface LiveExecutionConfig {
   mainnetConfirmed: boolean;
   /** Mainnet opt-in: reuse the same live-mirror lane policy as /testnet instead of stable-only gates. */
   mainnetKeepTestnetPolicy: boolean;
+  /** Mainnet opt-in (LIVE_MAINNET_PROFIT_PROTECTION=1): bring the regime breakeven/hard-cut exit — the
+   *  same loss-limiting harvest that runs on testnet — to mainnet so counter-regime exposure doesn't
+   *  bleed to full stops. Pure risk-reducer (banks scratch-greens, cuts sustained opposing losers). */
+  mainnetProfitProtection: boolean;
+  /** Mainnet R-based profit bank: close a position once unrealized ≥ mainnetTpR × riskUsdPerTrade.
+   *  0 = off (the regime exit alone has no fixed take-profit). R-based, not a blunt absolute-USD cap. */
+  mainnetTpR: number;
+  /** Mainnet anti-bleed hard-cut window (ms) for sustained counter-regime exposure; 0 disables. */
+  mainnetRegimeHardCutMs: number;
   /** Testnet-only regime-flip rescue (flip a stuck counter-regime position to net regime-aligned). */
   rescue: RegimeFlipRescueConfig;
   /** Testnet-only: when true the rescue PLACES orders (flip/flatten); otherwise it only shadow-evaluates.
@@ -164,6 +173,9 @@ export function parseLiveExecutionConfig(env: NodeJS.ProcessEnv = process.env): 
     autoArm: env.LIVE_AUTO_ARM === "1" && liveEnv === "testnet", // mainnet NEVER auto-arms
     mainnetConfirmed,
     mainnetKeepTestnetPolicy: liveEnv === "mainnet" && env.LIVE_MAINNET_KEEP_TESTNET_POLICY === "1",
+    mainnetProfitProtection: liveEnv === "mainnet" && env.LIVE_MAINNET_PROFIT_PROTECTION === "1",
+    mainnetTpR: liveEnv === "mainnet" ? Math.max(0, Number.parseFloat(env.LIVE_MAINNET_TP_R ?? "") || 0) : 0,
+    mainnetRegimeHardCutMs: liveEnv === "mainnet" ? envNum(env.LIVE_MAINNET_REGIME_HARD_CUT_MS, 30 * 60 * 1000) : 0,
     rescue: parseRegimeFlipRescueConfig(env, liveEnv),
     rescueExecute:
       env.LIVE_TESTNET_RESCUE_ENABLED === "1" &&
@@ -1076,6 +1088,12 @@ export class LiveExecutionEngine {
         testnetRegimeExitEnabled: this.config.testnetRegimeExitEnabled,
         estimatedCloseCostPct: this.config.estimatedCloseCostPct,
         mainnetKeepTestnetPolicy: this.config.mainnetKeepTestnetPolicy,
+        mainnetProfitProtection: this.config.mainnetProfitProtection,
+        mainnetTpR: this.config.mainnetTpR,
+        // Effective profit-protection regardless of env, so the dashboard shows what's actually active.
+        regimeExitActive: this.regimeProtectionActive(),
+        regimeHardCutMs: this.regimeHardCutMsEffective(),
+        profitBankThresholdUsd: this.profitBankThresholdUsd(),
       },
       rescue: {
         enabled: this.config.rescue?.enabled ?? false,
@@ -1748,8 +1766,32 @@ export class LiveExecutionEngine {
     return null;
   }
 
+  // ── effective profit-protection (testnet always-on; mainnet via opt-in) ──────
+  /** Regime breakeven/hard-cut harvest is active on testnet (its flag) OR mainnet (profit-protection opt-in). */
+  private regimeProtectionActive(): boolean {
+    return (
+      (this.config.env === "testnet" && this.config.testnetRegimeExitEnabled) ||
+      (this.config.env === "mainnet" && this.config.mainnetProfitProtection)
+    );
+  }
+  /** Effective anti-bleed hard-cut window for the active env (0 = disabled). */
+  private regimeHardCutMsEffective(): number {
+    if (this.config.env === "testnet") return this.config.testnetRegimeHardCutMs;
+    if (this.config.env === "mainnet" && this.config.mainnetProfitProtection) return this.config.mainnetRegimeHardCutMs;
+    return 0;
+  }
+  /** Effective unrealized-USD profit-bank threshold (0 = no fixed take-profit). Testnet: absolute USD.
+   *  Mainnet: R-based (mainnetTpR × riskUsdPerTrade) so it scales with risk rather than a blunt $ cap. */
+  private profitBankThresholdUsd(): number {
+    if (this.config.env === "testnet") return this.config.testnetTakeProfitUsd;
+    if (this.config.env === "mainnet" && this.config.mainnetProfitProtection && this.config.mainnetTpR > 0) {
+      return this.config.mainnetTpR * this.config.riskUsdPerTrade;
+    }
+    return 0;
+  }
+
   private async maybeCloseTestnetRegimeHarvest(): Promise<void> {
-    if (this.config.env !== "testnet" || !this.config.testnetRegimeExitEnabled) return;
+    if (!this.regimeProtectionActive()) return;
     const controller = this.currentControllerSnapshot();
     if (!this.controllerSnapshotIsFresh(controller)) return;
     const currentRegime = controller?.regime ?? null;
@@ -1780,10 +1822,11 @@ export class LiveExecutionEngine {
       st.lastOpposingDirection = opposingDirection;
       st.opposingSince = opposingDirection ? this.nowIso() : null;
     }
+    const hardCutMs = this.regimeHardCutMsEffective();
     const hardCut = opposingDirection !== null
-      && this.config.testnetRegimeHardCutMs > 0
+      && hardCutMs > 0
       && st.opposingSince !== null
-      && new Date(this.nowIso()).getTime() - new Date(st.opposingSince).getTime() >= this.config.testnetRegimeHardCutMs;
+      && new Date(this.nowIso()).getTime() - new Date(st.opposingSince).getTime() >= hardCutMs;
     const harvestIntents = controllerChanged
       ? openIntents
       : opposingDirection
@@ -2069,7 +2112,7 @@ export class LiveExecutionEngine {
     pos: FuturesPosition | undefined,
     amt: number,
   ): Promise<{ changed: boolean; closed: boolean }> {
-    const threshold = this.config.env === "testnet" ? this.config.testnetTakeProfitUsd : 0;
+    const threshold = this.profitBankThresholdUsd();
     if (!(threshold > 0)) return { changed: false, closed: false };
     const unrealized = pos?.unRealizedProfit ?? 0;
     if (!Number.isFinite(unrealized) || unrealized < threshold) return { changed: false, closed: false };
