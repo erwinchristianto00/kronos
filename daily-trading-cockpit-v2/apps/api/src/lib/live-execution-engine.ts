@@ -41,6 +41,15 @@ import {
   type VariantExitRule,
 } from "./current-guard-variant-matrix.js";
 import { estimateLaneSelectorV2Regime, type LaneSelectorV2EstimatedRegime } from "./lane-selector-v2.js";
+import {
+  parseRegimeFlipRescueConfig,
+  planRegimeFlipRescue,
+  type RegimeFlipRescueConfig,
+  type RescueFlipAction,
+  type RescueFlattenAction,
+  type RescuePositionView,
+  type RescueSkip,
+} from "./regime-flip-rescue.js";
 import type { PaperOrder } from "./paper-execution-router.js";
 
 // ─── config ──────────────────────────────────────────────────────────────────
@@ -83,6 +92,11 @@ export interface LiveExecutionConfig {
   mainnetConfirmed: boolean;
   /** Mainnet opt-in: reuse the same live-mirror lane policy as /testnet instead of stable-only gates. */
   mainnetKeepTestnetPolicy: boolean;
+  /** Testnet-only regime-flip rescue (flip a stuck counter-regime position to net regime-aligned). */
+  rescue: RegimeFlipRescueConfig;
+  /** Testnet-only: when true the rescue PLACES orders (flip/flatten); otherwise it only shadow-evaluates.
+   *  LIVE_TESTNET_RESCUE_MODE=live. Forced false unless rescue.enabled (so mainnet can never execute). */
+  rescueExecute: boolean;
   /** Why the config cannot trade (empty = config valid for its env). */
   configErrors: string[];
 }
@@ -150,6 +164,11 @@ export function parseLiveExecutionConfig(env: NodeJS.ProcessEnv = process.env): 
     autoArm: env.LIVE_AUTO_ARM === "1" && liveEnv === "testnet", // mainnet NEVER auto-arms
     mainnetConfirmed,
     mainnetKeepTestnetPolicy: liveEnv === "mainnet" && env.LIVE_MAINNET_KEEP_TESTNET_POLICY === "1",
+    rescue: parseRegimeFlipRescueConfig(env, liveEnv),
+    rescueExecute:
+      env.LIVE_TESTNET_RESCUE_ENABLED === "1" &&
+      env.LIVE_TESTNET_RESCUE_MODE === "live" &&
+      liveEnv === "testnet",
     configErrors,
   };
 }
@@ -281,6 +300,12 @@ export interface LiveIntent {
   lastError: string | null;
   /** Paper orders netted into this one-way Binance symbol position. */
   sourcePaperOrders?: LiveIntentSource[];
+  /** Regime-flip rescue (testnet): true when this intent is the net regime-aligned leg opened by a flip.
+   *  Managed only by the rescue flatten — skipped by normal lifecycle + the regime harvest. */
+  rescue?: boolean;
+  /** Loss already booked to the ledger when the stuck opposing leg was closed at flip (≤ 0). Lets the
+   *  flatten trigger know when the WHOLE venture (booked loss + this live leg) is in profit. */
+  rescuePriorRealizedUsd?: number;
 }
 
 export interface LiveIntentSource {
@@ -383,6 +408,17 @@ interface LiveExecutionState {
   opposingSince: string | null;
   killedAt: string | null;
   killReason: string | null;
+  /** Last regime-flip-rescue evaluation (shadow). What the rescue WOULD flip/flatten this tick. */
+  lastRescuePlan: LiveRescuePlanSnapshot | null;
+}
+
+export interface LiveRescuePlanSnapshot {
+  at: string;
+  mode: "shadow" | "live";
+  opposingDirection: "LONG" | "SHORT" | null;
+  flips: RescueFlipAction[];
+  flattens: RescueFlattenAction[];
+  skips: RescueSkip[];
 }
 
 const LIVE_STATE_VERSION = 1;
@@ -425,6 +461,7 @@ export class LiveExecutionStore {
       opposingSince: null,
       killedAt: null,
       killReason: null,
+      lastRescuePlan: null,
     };
   }
 
@@ -1040,6 +1077,12 @@ export class LiveExecutionEngine {
         estimatedCloseCostPct: this.config.estimatedCloseCostPct,
         mainnetKeepTestnetPolicy: this.config.mainnetKeepTestnetPolicy,
       },
+      rescue: {
+        enabled: this.config.rescue?.enabled ?? false,
+        mode: this.config.rescueExecute ? ("live" as const) : ("shadow" as const),
+        config: this.config.rescue,
+        lastPlan: st.lastRescuePlan,
+      },
     };
   }
 
@@ -1410,6 +1453,10 @@ export class LiveExecutionEngine {
       // older opposing-direction breakeven harvest so stale contra exposure can still free slots.
       await this.maybeCloseTestnetRegimeHarvest();
 
+      // 4.5 Regime-flip rescue (testnet-only, SHADOW): evaluate + record what it would flip/flatten on
+      // stuck counter-regime positions. Places no orders yet (see evaluateRegimeFlipRescue).
+      await this.evaluateRegimeFlipRescue();
+
       // 5. Mirror new HEADLINE paper orders (only when armed + healthy).
       await this.mirrorNewSignals();
 
@@ -1540,6 +1587,8 @@ export class LiveExecutionEngine {
 
     for (const intent of st.intents) {
       if (intent.state !== "OPEN" && intent.state !== "TP1_FILLED_BE_SET") continue;
+      // Rescue legs have no normal stop/TP — they are governed solely by the rescue flatten trigger.
+      if (intent.rescue) continue;
       try {
         const positions = await this.client.getPositions(intent.symbol);
         const pos = positions.find((p) => p.symbol === intent.symbol);
@@ -1718,7 +1767,9 @@ export class LiveExecutionEngine {
       st.lastControllerMode = currentMode;
     }
 
-    const openIntents = st.intents.filter((intent) => OPEN_INTENT_STATES.has(intent.state));
+    // Rescue legs are regime-aligned and governed by the rescue flatten — never harvest them (a regime
+    // flip-back would otherwise let the harvest fight the rescue for the same symbol).
+    const openIntents = st.intents.filter((intent) => OPEN_INTENT_STATES.has(intent.state) && !intent.rescue);
     const opposingDirection = this.opposingDirectionForController(currentMode);
     // Anti-bull hard-cut: track how long the SAME opposing side has persisted continuously. Reset the
     // clock whenever the opposed side changes or clears. Once opposition holds past testnetRegimeHardCutMs
@@ -1795,6 +1846,222 @@ export class LiveExecutionEngine {
     }
 
     if (dirty) this.store.save();
+  }
+
+  /**
+   * Regime-flip rescue (testnet-only).
+   *
+   * Builds one view per engine-owned symbol with live exposure and asks the pure planner what to flip
+   * (a stuck counter-regime position → net regime-aligned) and flatten (a rescued symbol whose combined
+   * venture cleared the target, or whose max-hold elapsed). The plan is persisted to
+   * `state.lastRescuePlan` and surfaced in getStatus.
+   *
+   * SHADOW (default): records the plan, places no orders. LIVE (LIVE_TESTNET_RESCUE_MODE=live, testnet):
+   * executes — flattens always (risk-reducing), flips only when armed (they OPEN exposure). A flip is
+   * reconcile-safe because it CLOSES the stuck opposing intent and registers the resulting net leg as a
+   * dedicated rescue intent, so the next reconcile sees intent.direction == position sign (no disarm).
+   */
+  private async evaluateRegimeFlipRescue(): Promise<void> {
+    const rcfg = this.config.rescue;
+    if (!rcfg?.enabled) return; // testnet-only + flag; parseRegimeFlipRescueConfig forces false on mainnet
+    const controller = this.currentControllerSnapshot();
+    if (!this.controllerSnapshotIsFresh(controller)) return;
+    const opposingDirection = this.opposingDirectionForController(controller?.mode ?? null);
+
+    const st = this.store.getState();
+    const openIntents = st.intents.filter((intent) => OPEN_INTENT_STATES.has(intent.state));
+    if (openIntents.length === 0) {
+      if (st.lastRescuePlan) {
+        st.lastRescuePlan = null;
+        this.store.save();
+      }
+      return;
+    }
+
+    const engineSymbols = new Set(openIntents.map((intent) => intent.symbol));
+    const rescueIntentBySymbol = new Map<string, LiveIntent>();
+    const oldestNonRescueBySymbol = new Map<string, number>();
+    for (const intent of openIntents) {
+      if (intent.rescue) {
+        rescueIntentBySymbol.set(intent.symbol, intent);
+        continue;
+      }
+      const t = new Date(intent.createdAt).getTime();
+      const prev = oldestNonRescueBySymbol.get(intent.symbol);
+      if (prev === undefined || (Number.isFinite(t) && t < prev)) oldestNonRescueBySymbol.set(intent.symbol, t);
+    }
+
+    const positions = await this.client.getPositions();
+    const balance = await this.getUsdtBalance();
+    const nowMs = new Date(this.nowIso()).getTime();
+
+    const views: RescuePositionView[] = [];
+    for (const pos of positions) {
+      if (!engineSymbols.has(pos.symbol)) continue;
+      const amt = pos.positionAmt;
+      if (Math.abs(amt) < 1e-12) continue;
+      const rescueIntent = rescueIntentBySymbol.get(pos.symbol);
+      const inRescue = !!rescueIntent;
+      const estCost = this.estimatedCloseCostUsd(pos);
+      views.push({
+        symbol: pos.symbol,
+        // The netted exchange exposure IS the truth; reconcile enforces intent==position sign.
+        intentDirection: amt > 0 ? "LONG" : "SHORT",
+        positionAmt: amt,
+        markPrice: pos.markPrice,
+        unrealizedUsd: pos.unRealizedProfit,
+        netAfterCostUsd: pos.unRealizedProfit - estCost,
+        openedAtMs: inRescue
+          ? new Date(rescueIntent!.createdAt).getTime()
+          : (oldestNonRescueBySymbol.get(pos.symbol) ?? nowMs),
+        inRescue,
+        priorRealizedUsd: inRescue ? (rescueIntent!.rescuePriorRealizedUsd ?? 0) : 0,
+      });
+    }
+
+    const plan = planRegimeFlipRescue({
+      config: rcfg,
+      opposingDirection,
+      nowMs,
+      availableBalanceUsd: balance?.availableBalance ?? null,
+      positions: views,
+      activeRescueCount: rescueIntentBySymbol.size,
+    });
+
+    if (this.config.rescueExecute) {
+      // Flattens first (reduce-only, risk-reducing) — allowed even while disarmed.
+      for (const action of plan.flattens) {
+        try {
+          await this.executeRescueFlatten(action, rescueIntentBySymbol.get(action.symbol));
+        } catch (error) {
+          this.reconcileIssues.push(`rescue flatten ${action.symbol} failed: ${(error as Error).message}`);
+        }
+      }
+      // Flips OPEN new exposure — only when armed.
+      if (this.armed) {
+        for (const action of plan.flips) {
+          try {
+            await this.executeRescueFlip(action, openIntents.filter((i) => i.symbol === action.symbol && !i.rescue));
+          } catch (error) {
+            this.reconcileIssues.push(`rescue flip ${action.symbol} failed: ${(error as Error).message}`);
+          }
+        }
+      }
+    }
+
+    st.lastRescuePlan = {
+      at: this.nowIso(),
+      mode: this.config.rescueExecute ? "live" : "shadow",
+      opposingDirection,
+      flips: plan.flips,
+      flattens: plan.flattens,
+      skips: plan.skips,
+    };
+    this.store.save();
+  }
+
+  /** Reduce-only close the net rescue leg and settle the rescue intent. Books ONLY the live leg's
+   *  realized (the stuck leg's loss was already booked at flip via rescuePriorRealizedUsd). */
+  private async executeRescueFlatten(action: RescueFlattenAction, rescueIntent: LiveIntent | undefined): Promise<void> {
+    if (!rescueIntent) return;
+    const flat = await this.client.placeOrder({
+      symbol: action.symbol,
+      side: action.side,
+      type: "MARKET",
+      quantity: action.qty,
+      reduceOnly: true,
+      newClientOrderId: `dtc-${rescueIntent.paperOrderId.slice(-14)}-rscx`,
+    });
+    try {
+      await this.client.cancelAllOrders(action.symbol);
+      await this.client.cancelAllAlgoOrders(action.symbol);
+    } catch {
+      // residue cleanup is best-effort after the position is flat
+    }
+    const liveLegRealized = await this.realizedFromTrades(action.symbol, rescueIntent.createdAt, [flat.orderId]);
+    rescueIntent.realizedPnlUsd = liveLegRealized;
+    rescueIntent.feesUsd = null;
+    rescueIntent.state = "CLOSED";
+    rescueIntent.closedAt = this.nowIso();
+    rescueIntent.updatedAt = this.nowIso();
+    rescueIntent.closeReason = action.reason.startsWith("max-hold") ? "RESCUE_MAXHOLD_CUT" : "RESCUE_FLATTEN_TARGET";
+    this.applyRealizedToLedger(liveLegRealized);
+  }
+
+  /** Place the cross-zero flip order, settle+close the stuck opposing intents (booking their realized
+   *  loss), and register the resulting net leg as a dedicated rescue intent so reconcile stays sane. */
+  private async executeRescueFlip(action: RescueFlipAction, opposingIntents: LiveIntent[]): Promise<void> {
+    const filters = await this.getFilters(action.symbol);
+    if (!filters) return;
+    const qty = roundDownToStep(action.flipQty, filters.stepSize);
+    if (!(qty >= filters.minQty)) return;
+    const opposingAbs = opposingIntents.reduce((sum, i) => sum + Math.abs(i.qty), 0);
+    if (!(qty > opposingAbs)) return; // would only reduce, not flip — leave it to the harvest
+
+    try {
+      await this.client.setLeverage(action.symbol, this.config.defaultLeverage);
+    } catch {
+      // leverage already set / best-effort
+    }
+    const flip = await this.client.placeOrder({
+      symbol: action.symbol,
+      side: action.side,
+      type: "MARKET",
+      quantity: qty,
+      reduceOnly: false,
+      newClientOrderId: `dtc-rescue-${action.symbol.toLowerCase().slice(0, 8)}-${this.nowIso().replace(/[^0-9]/g, "").slice(-10)}`,
+    });
+
+    // The flip order closed the opposing leg(s): book their realized loss and close them.
+    let priorRealized = 0;
+    for (const oi of opposingIntents) {
+      const r = await this.realizedFromTrades(action.symbol, oi.createdAt, [oi.entryOrderId, oi.tp1OrderId, flip.orderId]);
+      priorRealized += r;
+      oi.realizedPnlUsd = r;
+      oi.feesUsd = null;
+      oi.state = "CLOSED";
+      oi.closedAt = this.nowIso();
+      oi.updatedAt = this.nowIso();
+      oi.closeReason = "RESCUE_FLIP";
+      this.applyRealizedToLedger(r);
+    }
+    try {
+      await this.client.cancelAllOrders(action.symbol);
+      await this.client.cancelAllAlgoOrders(action.symbol);
+    } catch {
+      // the opposing leg's stop/TP are stale now — best-effort cancel
+    }
+
+    const after = (await this.client.getPositions(action.symbol)).find((p) => p.symbol === action.symbol);
+    const netAmt = after?.positionAmt ?? 0;
+    if (Math.abs(netAmt) < 1e-12) return; // flip fully flattened — venture closed at the flip, no leg to track
+
+    const st = this.store.getState();
+    st.intents.push({
+      paperOrderId: `rescue-${action.symbol}-${this.nowIso()}`,
+      symbol: action.symbol,
+      direction: netAmt > 0 ? "LONG" : "SHORT",
+      state: "OPEN",
+      qty: Math.abs(netAmt),
+      tp1Qty: 0,
+      plannedEntryPrice: after?.entryPrice ?? flip.avgPrice ?? 0,
+      stopLossPrice: 0,
+      tp1Price: 0,
+      filledEntryPrice: flip.avgPrice ?? after?.entryPrice ?? null,
+      entryOrderId: flip.orderId,
+      stopOrderId: null,
+      tp1OrderId: null,
+      beStopOrderId: null,
+      realizedPnlUsd: null,
+      feesUsd: null,
+      createdAt: this.nowIso(),
+      updatedAt: this.nowIso(),
+      closedAt: null,
+      closeReason: null,
+      lastError: null,
+      rescue: true,
+      rescuePriorRealizedUsd: priorRealized,
+    });
   }
 
   private async maybeCloseOnTestnetUsdTakeProfit(

@@ -261,6 +261,18 @@ function makeConfig(overrides: Partial<LiveExecutionConfig> = {}): LiveExecution
     autoArm: false,
     mainnetConfirmed: false,
     mainnetKeepTestnetPolicy: false,
+    rescue: {
+      enabled: false,
+      minAgeMs: 60 * 60 * 1000,
+      minLossUsd: 1,
+      netFraction: 1,
+      maxNotionalUsd: 250,
+      targetUsd: 0,
+      maxSymbols: 2,
+      minAvailableBalanceUsd: 10,
+      maxHoldMs: 24 * 60 * 60 * 1000,
+    },
+    rescueExecute: false,
     configErrors: [],
     ...overrides,
   };
@@ -1360,5 +1372,206 @@ describe("LiveExecutionEngine", () => {
     });
     // A restart with auto-arm on must stay disarmed while the kill is latched.
     expect(engine.isArmed()).toBe(false);
+  });
+});
+
+describe("regime-flip rescue (shadow wiring)", () => {
+  const RESCUE_ON = {
+    enabled: true,
+    minAgeMs: 60 * 60 * 1000,
+    minLossUsd: 1,
+    netFraction: 1,
+    maxNotionalUsd: 1000,
+    targetUsd: 0,
+    maxSymbols: 2,
+    minAvailableBalanceUsd: 10,
+    maxHoldMs: 24 * 60 * 60 * 1000,
+  };
+
+  function seedStuckLong(store: ReturnType<typeof makeEngine>["store"]) {
+    store.getState().intents.push({
+      paperOrderId: "p-xrp",
+      symbol: "XRPUSDT",
+      direction: "LONG",
+      state: "MIRRORED", // skipped by manageLifecycle, still seen by harvest + rescue
+      qty: 236.2,
+      tp1Qty: 0,
+      plannedEntryPrice: 1.0572,
+      stopLossPrice: 1.0,
+      tp1Price: 1.1,
+      filledEntryPrice: 1.0572,
+      entryOrderId: 1,
+      stopOrderId: null,
+      tp1OrderId: null,
+      beStopOrderId: null,
+      realizedPnlUsd: null,
+      feesUsd: null,
+      createdAt: "2099-01-02T10:00:00.000Z", // 2h before nowIso ⇒ older than minAge
+      updatedAt: "2099-01-02T10:00:00.000Z",
+      closedAt: null,
+      closeReason: null,
+      lastError: null,
+    });
+    store.save();
+  }
+
+  it("records a FLIP plan for a stuck counter-regime long, places NO order (shadow)", async () => {
+    const client = new FakeLiveClient();
+    client.positionsBySymbol.set("XRPUSDT", 236.2);
+    client.markPriceBySymbol.set("XRPUSDT", 1.04);
+    client.unrealizedPnlBySymbol.set("XRPUSDT", -4.18);
+    const { engine, store } = makeEngine({
+      client,
+      config: { rescue: RESCUE_ON },
+      getControllerSnapshot: () => ({ regime: "Bearish", mode: "SHORT_ONLY", capturedAt: new Date().toISOString() }),
+    });
+    seedStuckLong(store);
+
+    await engine.tick();
+
+    const plan = store.getState().lastRescuePlan;
+    expect(plan).not.toBeNull();
+    expect(plan!.mode).toBe("shadow");
+    expect(plan!.opposingDirection).toBe("LONG");
+    expect(plan!.flips).toHaveLength(1);
+    expect(plan!.flips[0]!.symbol).toBe("XRPUSDT");
+    expect(plan!.flips[0]!.side).toBe("SELL");
+    // SHADOW: it must not have placed any XRP order this tick.
+    expect(client.placed.some((p) => p.symbol === "XRPUSDT")).toBe(false);
+    expect(engine.getStatus().rescue.enabled).toBe(true);
+  });
+
+  it("stays dormant (no plan, no orders) when the rescue flag is off", async () => {
+    const client = new FakeLiveClient();
+    client.positionsBySymbol.set("XRPUSDT", 236.2);
+    client.markPriceBySymbol.set("XRPUSDT", 1.04);
+    client.unrealizedPnlBySymbol.set("XRPUSDT", -4.18);
+    const { engine, store } = makeEngine({
+      client, // rescue defaults to disabled in makeConfig
+      getControllerSnapshot: () => ({ regime: "Bearish", mode: "SHORT_ONLY", capturedAt: new Date().toISOString() }),
+    });
+    seedStuckLong(store);
+
+    await engine.tick();
+
+    expect(store.getState().lastRescuePlan).toBeNull();
+    expect(client.placed.some((p) => p.symbol === "XRPUSDT")).toBe(false);
+  });
+});
+
+describe("regime-flip rescue (LIVE execution)", () => {
+  const RESCUE_LIVE = {
+    enabled: true,
+    minAgeMs: 60 * 60 * 1000,
+    minLossUsd: 1,
+    netFraction: 1,
+    maxNotionalUsd: 5000, // high enough that the 2× flip isn't capped below the opposing size
+    targetUsd: 0,
+    maxSymbols: 2,
+    minAvailableBalanceUsd: 10,
+    maxHoldMs: 24 * 60 * 60 * 1000,
+  };
+  const SHORT_REGIME = () => ({ regime: "Bearish", mode: "SHORT_ONLY", capturedAt: new Date().toISOString() });
+
+  function pushIntent(store: ReturnType<typeof makeEngine>["store"], over: Record<string, unknown>) {
+    store.getState().intents.push({
+      paperOrderId: "p-x",
+      symbol: "ETHUSDT",
+      direction: "LONG",
+      state: "OPEN",
+      qty: 1.0,
+      tp1Qty: 0,
+      plannedEntryPrice: 2000,
+      stopLossPrice: 1900,
+      tp1Price: 2100,
+      filledEntryPrice: 2000,
+      entryOrderId: 1,
+      stopOrderId: null,
+      tp1OrderId: null,
+      beStopOrderId: null,
+      realizedPnlUsd: null,
+      feesUsd: null,
+      createdAt: "2099-01-02T10:00:00.000Z",
+      updatedAt: "2099-01-02T10:00:00.000Z",
+      closedAt: null,
+      closeReason: null,
+      lastError: null,
+      ...over,
+    } as never);
+    store.save();
+  }
+
+  it("flips a stuck counter-regime LONG to a net SHORT, closes the old intent, and stays armed (reconcile-safe)", async () => {
+    const client = new FakeLiveClient();
+    client.positionsBySymbol.set("ETHUSDT", 1.0);
+    client.markPriceBySymbol.set("ETHUSDT", 1900);
+    client.unrealizedPnlBySymbol.set("ETHUSDT", -5);
+    const { engine, store } = makeEngine({
+      client,
+      config: { rescue: RESCUE_LIVE, rescueExecute: true },
+      getControllerSnapshot: SHORT_REGIME,
+    });
+    expect((await engine.arm()).ok).toBe(true);
+    pushIntent(store, { paperOrderId: "p-eth" });
+
+    await engine.tick(); // flip
+
+    const intents = store.getState().intents;
+    const old = intents.find((i) => i.paperOrderId === "p-eth")!;
+    expect(old.state).toBe("CLOSED");
+    expect(old.closeReason).toBe("RESCUE_FLIP");
+    const rescue = intents.find((i) => i.rescue === true)!;
+    expect(rescue).toBeTruthy();
+    expect(rescue.direction).toBe("SHORT");
+    expect(rescue.qty).toBeCloseTo(1.0, 6); // SELL 2 on a +1 long ⇒ net short 1
+    expect(client.placed.some((p) => p.symbol === "ETHUSDT" && p.side === "SELL" && p.type === "MARKET" && !p.reduceOnly)).toBe(true);
+
+    // The flipped net short matches the rescue intent ⇒ reconcile must not disarm on the next tick.
+    await engine.tick();
+    expect(engine.isArmed()).toBe(true);
+    expect(store.getState().lastRescuePlan!.mode).toBe("live");
+  });
+
+  it("flattens a rescued symbol once the combined venture clears target, booking the live leg", async () => {
+    const client = new FakeLiveClient();
+    client.positionsBySymbol.set("ETHUSDT", -1.0); // already flipped to net short
+    client.markPriceBySymbol.set("ETHUSDT", 1850);
+    client.unrealizedPnlBySymbol.set("ETHUSDT", 10); // short in profit; combined = -4.72 + (10 - 4.07) = +1.21
+    client.flattenRealizedPnl = 10;
+    const { engine, store } = makeEngine({
+      client,
+      config: { rescue: RESCUE_LIVE, rescueExecute: true },
+      getControllerSnapshot: SHORT_REGIME,
+    });
+    expect((await engine.arm()).ok).toBe(true);
+    pushIntent(store, { paperOrderId: "p-resc", direction: "SHORT", rescue: true, rescuePriorRealizedUsd: -4.72, entryOrderId: 50 });
+
+    await engine.tick();
+
+    const r = store.getState().intents.find((i) => i.rescue === true)!;
+    expect(r.state).toBe("CLOSED");
+    expect(r.closeReason).toBe("RESCUE_FLATTEN_TARGET");
+    expect(r.realizedPnlUsd).toBeCloseTo(10, 6);
+    expect(client.placed.some((p) => p.symbol === "ETHUSDT" && p.reduceOnly && p.type === "MARKET")).toBe(true);
+  });
+
+  it("does NOT flip when disarmed (flips open exposure), but the plan is still recorded", async () => {
+    const client = new FakeLiveClient();
+    client.positionsBySymbol.set("ETHUSDT", 1.0);
+    client.markPriceBySymbol.set("ETHUSDT", 1900);
+    client.unrealizedPnlBySymbol.set("ETHUSDT", -5);
+    const { engine, store } = makeEngine({
+      client,
+      config: { rescue: RESCUE_LIVE, rescueExecute: true },
+      getControllerSnapshot: SHORT_REGIME,
+    });
+    // not armed
+    pushIntent(store, { paperOrderId: "p-eth" });
+
+    await engine.tick();
+
+    expect(store.getState().intents.find((i) => i.rescue === true)).toBeUndefined();
+    expect(client.placed.some((p) => p.side === "SELL" && !p.reduceOnly)).toBe(false);
+    expect(store.getState().lastRescuePlan!.flips.length).toBe(1); // planned, just not executed
   });
 });
