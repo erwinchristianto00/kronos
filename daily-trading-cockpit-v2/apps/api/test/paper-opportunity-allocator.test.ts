@@ -79,7 +79,10 @@ function routerOf(regime: string | null) {
 /** VM store with 60 winning SHORT signals so the canonical scaleout headline lane passes economics. */
 async function buildWinningVmReport(dir: string): Promise<CurrentGuardVariantMatrixReport> {
   const vmStore = new CurrentGuardVariantMatrixStore(dir);
-  const recentBase = Date.now() - 6 * 24 * 60 * 60 * 1000;
+  // Entries must be FRESH at creation: isFreshValid = (now − openedAt) ≤ FRESH_ENTRY_MAX_MINUTES (10).
+  // Pack all 60 within the last ~5 min (5s apart) so every obs is fresh-valid and counts toward the
+  // freshValid sample the economics gate (WATCHABLE_MIN_FRESH) requires.
+  const recentBase = Date.now() - 5 * 60_000;
   const signals: VariantMatrixSignal[] = Array.from({ length: 60 }, (_, i) => ({
     sourceSignalId: `sig-${i}`,
     symbol: `SYM${String(i).padStart(3, "0")}USDT`,
@@ -92,7 +95,7 @@ async function buildWinningVmReport(dir: string): Promise<CurrentGuardVariantMat
     stopDistanceBps: 300,
     regime: "BEARISH_EXPANSION",
     entryVariant: "base_current_entry",
-    openedAt: new Date(recentBase + i * 60_000).toISOString(),
+    openedAt: new Date(recentBase + i * 5_000).toISOString(),
     closedAt: null,
   }));
   mirrorVariantMatrixSignals(signals, vmStore, new Date().toISOString());
@@ -927,7 +930,7 @@ describe("paper-opportunity-allocator", () => {
     expect(report.selectedOpportunities.length).toBe(0);
   });
 
-  it("[11b] Bullish LONG_ONLY quarantines the deprecated CG_SCALEOUT LONG headline lane", async () => {
+  it("[11b] Bullish LONG_ONLY no longer manually quarantines CG_SCALEOUT LONG (list cleared 2026-06-29)", async () => {
     const dir = tmpDir();
     const vmReport = buildEmptyVmReport(dir);
     const report = buildPaperOpportunityAllocatorReport(
@@ -945,16 +948,15 @@ describe("paper-opportunity-allocator", () => {
     );
 
     expect(report.controllerMode).toBe("LONG_ONLY");
-    expect(MANUAL_QUARANTINED_PAPER_LANE_IDS).toContain("CG_LONG_VARIANT_MATRIX:CG_SCALEOUT_TP1_TRAIL");
-    expect(
-      report.selectedOpportunities.some(
-        (opportunity) => opportunity.laneId === "CG_LONG_VARIANT_MATRIX:CG_SCALEOUT_TP1_TRAIL",
-      ),
-    ).toBe(false);
-    expect(report.topRejects.map((row) => row.key)).toContain("LANE_MANUALLY_QUARANTINED");
+    // 2026-06-29 (operator): the manual quarantine list was CLEARED to re-test every lane against the
+    // rebuilt fresh "/" measurement, so CG_SCALEOUT LONG is no longer manually quarantined and no
+    // LANE_MANUALLY_QUARANTINED reject is emitted. (Auto-quarantine still re-benches proven losers
+    // once AUTO_QUARANTINE_MIN_CLOSED accrues.)
+    expect(MANUAL_QUARANTINED_PAPER_LANE_IDS).not.toContain("CG_LONG_VARIANT_MATRIX:CG_SCALEOUT_TP1_TRAIL");
+    expect(report.topRejects.map((row) => row.key)).not.toContain("LANE_MANUALLY_QUARANTINED");
   });
 
-  it("[11b-bull] Bullish LONG_ONLY can still admit pure bull trend while CG_SCALEOUT LONG is quarantined", async () => {
+  it("[11b-bull] Bullish LONG_ONLY admits the pure bull trend lane as DIAGNOSTIC_ONLY", async () => {
     const dir = tmpDir();
     const vmReport = buildEmptyVmReport(dir);
     const report = buildPaperOpportunityAllocatorReport(
@@ -984,12 +986,8 @@ describe("paper-opportunity-allocator", () => {
     expect(bull?.plannedStopDistanceBps).toBeGreaterThanOrEqual(200);
     expect(bull?.takeProfitLevels[0]).toBeGreaterThan(bull!.entryPrice);
     expect(bull?.provenance?.candidateQualityFlags).toContain("PURE_BULLISH_TREND_OOS");
-    expect(
-      report.selectedOpportunities.some(
-        (opportunity) => opportunity.laneId === "CG_LONG_VARIANT_MATRIX:CG_SCALEOUT_TP1_TRAIL",
-      ),
-    ).toBe(false);
-    expect(report.topRejects.map((row) => row.key)).toContain("LANE_MANUALLY_QUARANTINED");
+    // The pure-bull-trend lane is admitted on its own merits; the manual quarantine of CG_SCALEOUT
+    // LONG was cleared 2026-06-29 so it no longer gates this path (admission of BL_TREND is what matters).
   });
 
   it("[11b-bull-gates] pure bull trend lane rejects weak trend and contra evidence", async () => {

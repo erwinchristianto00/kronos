@@ -342,8 +342,9 @@ describe("operator-brief", () => {
     const dir = tmpDir();
     const vmStore = new CurrentGuardVariantMatrixStore(dir);
 
-    // Use recent openedAt (within 6 days of now) so observations are not expired (EXPIRY_MS = 7 days).
-    const recentBase = Date.now() - 6 * 24 * 60 * 60 * 1000;
+    // Entries must be FRESH at creation: isFreshValid = (now − openedAt) ≤ FRESH_ENTRY_MAX_MINUTES (10).
+    // Pack all 60 within the last ~5 min so every obs is fresh-valid (well within the 7-day expiry too).
+    const recentBase = Date.now() - 5 * 60_000;
 
     // Mirror 60 unique-symbol signals so every variant gets freshValid ≥ 50.
     const signals: VariantMatrixSignal[] = Array.from({ length: 60 }, (_, i) => ({
@@ -358,7 +359,7 @@ describe("operator-brief", () => {
       stopDistanceBps: 200,
       regime: "BULLISH_EXPANSION",
       entryVariant: "base_current_entry",
-      openedAt: new Date(recentBase + i * 60_000).toISOString(),
+      openedAt: new Date(recentBase + i * 5_000).toISOString(),
       closedAt: null,
     }));
 
@@ -400,7 +401,9 @@ describe("operator-brief", () => {
   it("[13b] rejected CG_WIDE is rendered as quarantine, never as wait-for-OOS", async () => {
     const dir = tmpDir();
     const vmStore = new CurrentGuardVariantMatrixStore(dir);
-    const recentBase = Date.now() - 6 * 24 * 60 * 60 * 1000;
+    // Fresh entries (≤ FRESH_ENTRY_MAX_MINUTES) so freshValid ≥ 50 and a REJECT renders as QUARANTINE
+    // rather than the n<50 wait-for-OOS bullet.
+    const recentBase = Date.now() - 5 * 60_000;
     const signals = Array.from({ length: 60 }, (_, i) =>
       makeStaleSignal({
         sourceSignalId: `reject-sig-${i}`,
@@ -409,7 +412,7 @@ describe("operator-brief", () => {
         entryPrice: 100,
         stopLoss: 103,
         tp1: 96,
-        openedAt: new Date(recentBase + i * 60_000).toISOString(),
+        openedAt: new Date(recentBase + i * 5_000).toISOString(),
       }),
     );
     mirrorVariantMatrixSignals(signals, vmStore, new Date().toISOString());

@@ -75,7 +75,9 @@ function routerOf(regime: string | null) {
 /** Build a VM store with 60 winning SHORT signals so CG_WIDE_STOP_TP_WIDE row passes economics gates. */
 async function buildWinningVmStore(dir: string): Promise<CurrentGuardVariantMatrixStore> {
   const vmStore = new CurrentGuardVariantMatrixStore(dir);
-  const recentBase = Date.now() - 6 * 24 * 60 * 60 * 1000;
+  // Entries must be FRESH at creation: isFreshValid = (now − openedAt) ≤ FRESH_ENTRY_MAX_MINUTES (10).
+  // Pack all 60 within the last ~5 min so every obs is fresh-valid and clears the economics sample gate.
+  const recentBase = Date.now() - 5 * 60_000;
   const signals: VariantMatrixSignal[] = Array.from({ length: 60 }, (_, i) => ({
     sourceSignalId: `sig-${i}`,
     symbol: `SYM${String(i).padStart(3, "0")}USDT`,
@@ -88,7 +90,7 @@ async function buildWinningVmStore(dir: string): Promise<CurrentGuardVariantMatr
     stopDistanceBps: 300,
     regime: "BULLISH_EXPANSION",
     entryVariant: "base_current_entry",
-    openedAt: new Date(recentBase + i * 60_000).toISOString(),
+    openedAt: new Date(recentBase + i * 5_000).toISOString(),
     closedAt: null,
   }));
   mirrorVariantMatrixSignals(signals, vmStore, new Date().toISOString());
