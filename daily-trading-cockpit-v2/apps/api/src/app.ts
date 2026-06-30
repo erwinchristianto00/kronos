@@ -24,6 +24,7 @@ import {
 } from "./lib/live-execution-engine.js";
 import { getPaperExecutionRouterStore } from "./lib/paper-execution-router.js";
 import {
+  FORCE_ELIGIBLE_SHORT_VARIANT_IDS,
   getRealtimeShortMirrorStore,
   isRealtimeShortAllowedLaneId,
   isRealtimeShortMirrorEnabled,
@@ -167,6 +168,11 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         const row = report.rows.find((candidate) => candidate.variantId === laneVariantId);
         return (
           row?.status === "STABLE_CANDIDATE" ||
+          // Operator force-enabled short lanes (e.g. CG_WIDE_FAST_SHORT) trade before STABLE — only
+          // when REALTIME_SHORT_FORCE_FAST_SHORT=1 (off by default ⇒ stable-only gate preserved).
+          (process.env.REALTIME_SHORT_FORCE_FAST_SHORT === "1" &&
+            order.direction === "SHORT" &&
+            FORCE_ELIGIBLE_SHORT_VARIANT_IDS.has(laneVariantId)) ||
           isLaneSelectorV2LongWideStopOverride({
             variantId: laneVariantId,
             direction: order.direction,

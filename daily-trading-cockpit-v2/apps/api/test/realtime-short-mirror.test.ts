@@ -50,6 +50,55 @@ function inputs(
 }
 
 describe("realtime-short-mirror — fresh short live-mirror source (mode 2)", () => {
+  it("[CROWDING-VETO] skips a short into a SHORT-extreme crowd, still fires into a LONG-extreme crowd", () => {
+    // SHORT into a SHORT-crowded-EXTREME book ⇒ vetoed (don't add to the over-short crowd).
+    const vetoed = runRealtimeShortMirror(
+      inputs([shortCand("BTCUSDT")], {
+        crowdingVetoEnabled: true,
+        crowdingBySymbol: { BTCUSDT: { crowdSide: "SHORT", crowdingLevel: "EXTREME" } },
+      }),
+      freshStore(),
+    );
+    expect(vetoed.emitted).toBe(0);
+    expect(vetoed.reasons.some((r) => r.startsWith("crowded_extreme_same_side:BTCUSDT"))).toBe(true);
+
+    // SHORT into a LONG-crowded-EXTREME book ⇒ NOT vetoed — that's the fade we want.
+    const fade = runRealtimeShortMirror(
+      inputs([shortCand("BTCUSDT")], {
+        crowdingVetoEnabled: true,
+        crowdingBySymbol: { BTCUSDT: { crowdSide: "LONG", crowdingLevel: "EXTREME" } },
+      }),
+      freshStore(),
+    );
+    expect(fade.emitted).toBe(1);
+
+    // Veto disabled ⇒ no effect even on a same-side extreme crowd.
+    const off = runRealtimeShortMirror(
+      inputs([shortCand("BTCUSDT")], {
+        crowdingBySymbol: { BTCUSDT: { crowdSide: "SHORT", crowdingLevel: "EXTREME" } },
+      }),
+      freshStore(),
+    );
+    expect(off.emitted).toBe(1);
+  });
+
+  it("[FORCE] CG_WIDE_FAST_SHORT emits even when only WATCHABLE; CG_WIDE_STOP_TP_WIDE stays gated", () => {
+    const store = freshStore();
+    const res = runRealtimeShortMirror(
+      inputs([shortCand("BTCUSDT")], {
+        forceFastShort: true,
+        // Neither short lane is STABLE — CG_WIDE_FAST_SHORT is only WATCHABLE, CG_WIDE_STOP_TP_WIDE COLLECTING.
+        stableShortLanes: [
+          { variantId: "CG_WIDE_STOP_TP_WIDE", status: "COLLECTING", freshValid: 285, netAvgR: 0.02, pf: 1.05 },
+          { variantId: "CG_WIDE_FAST_SHORT", status: "WATCHABLE", freshValid: 378, netAvgR: 0.11, pf: 1.4 },
+        ],
+      }),
+      store,
+    );
+    expect(res.emitted).toBe(1);
+    expect(store.all[0]!.selectedLaneId).toBe(realtimeShortSelectedLaneId("CG_WIDE_FAST_SHORT"));
+  });
+
   it("[DIRECTION-GATE] emits candidates only when controller allows their direction", () => {
     const store = freshStore();
     const res = runRealtimeShortMirror(
@@ -203,7 +252,7 @@ describe("realtime-short-mirror — fresh short live-mirror source (mode 2)", ()
     expect(res.reasons).toContain("mixed_symbol_blocked:NEARUSDT");
   });
 
-  it("[LONG] emits CG_WIDE_STOP_TP_WIDE long in a WIDE_TREND bull (re-enabled lane)", () => {
+  it("[LONG] emits CG_WIDE_FAST_LONG (0.5R) long in a WIDE_TREND bull", () => {
     const store = freshStore();
     const res = runRealtimeShortMirror(
       inputs(
@@ -223,9 +272,9 @@ describe("realtime-short-mirror — fresh short live-mirror source (mode 2)", ()
     expect(res.emitted).toBe(1);
     const o = store.all[0]!;
     expect(o.direction).toBe("LONG");
-    expect(o.selectedLaneId).toBe(realtimeShortSelectedLaneId("CG_WIDE_STOP_TP_WIDE"));
+    expect(o.selectedLaneId).toBe(realtimeShortSelectedLaneId("CG_WIDE_FAST_LONG"));
     expect(o.stopLoss).toBeCloseTo(97, 6); // 300bps wide stop
-    expect(o.takeProfitLevels[0]).toBeCloseTo(103, 6); // 1R target
+    expect(o.takeProfitLevels[0]).toBeCloseTo(101.5, 6); // 0.5R target
   });
 
   it("[GEOMETRY-COHERENT] derives stop + 0.5R TP from the live entry, ignoring the scanner's tp1", () => {

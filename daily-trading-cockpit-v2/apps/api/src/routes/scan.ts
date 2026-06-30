@@ -32,12 +32,12 @@ import {
   buildCurrentGuardVariantMatrixReport,
   getCurrentGuardVariantMatrixStore,
 } from "../lib/current-guard-variant-matrix.js";
-import { runFreshVariantMatrixFeed } from "../lib/fresh-variant-matrix-feed.js";
 import {
   isRealtimeShortMirrorEnabled,
   isRealtimeShortAllowedVariantId,
   runRealtimeShortMirror,
 } from "../lib/realtime-short-mirror.js";
+import { fetchCrowdingSnapshot } from "../lib/derivatives-crowding.js";
 import { estimateLaneSelectorV2Regime } from "../lib/lane-selector-v2.js";
 import {
   RegimeControllerAlignedShadowStore,
@@ -406,6 +406,21 @@ export async function registerScanRoute(
           controllerMode: controllerReport.controllerMode,
           confidence: controllerReport.confidence,
         });
+        // Auto-wired crowding veto: fetch crowd state per candidate so the mirror can skip entries
+        // into a same-side EXTREME crowd. Env-gated (CROWDING_VETO_ENABLED); best-effort.
+        const crowdingVetoEnabled = process.env.CROWDING_VETO_ENABLED === "1";
+        const crowdingBySymbol: Record<string, { crowdSide: string; crowdingLevel: string }> = {};
+        if (crowdingVetoEnabled && opts.binanceClient) {
+          const crowdClient = opts.binanceClient;
+          const crowdNow = new Date().toISOString();
+          const crowdSyms = [...new Set(top10WithPlan.map((c) => c.symbol))];
+          const crowdSnaps = await Promise.all(
+            crowdSyms.map((s) => fetchCrowdingSnapshot(crowdClient, s, crowdNow).catch(() => null)),
+          );
+          for (const snap of crowdSnaps) {
+            if (snap) crowdingBySymbol[snap.symbol] = { crowdSide: snap.crowdSide, crowdingLevel: snap.crowdingLevel };
+          }
+        }
         runRealtimeShortMirror({
           candidates: top10WithPlan.map((c) => ({
             symbol: c.symbol,
@@ -425,6 +440,9 @@ export async function registerScanRoute(
           controllerConfidence: controllerReport.confidence,
           estimatedRegime,
           stableShortLanes,
+          forceFastShort: process.env.REALTIME_SHORT_FORCE_FAST_SHORT === "1",
+          crowdingVetoEnabled,
+          crowdingBySymbol,
           now: new Date().toISOString(),
         });
       } catch {
@@ -436,39 +454,6 @@ export async function registerScanRoute(
       timing.recordNotInvokedStage("realtimeShortMirror");
     }
 
-    // Fresh variant-matrix measurement feed — the live-honest replacement for the stale
-    // shadow-position feed. Samples the scanner's FRESH candidates (BOTH directions) with
-    // openedAt=now + posture tags. Env-gated; ONLY the "/" diagnostic instance sets
-    // FRESH_VM_FEED_ENABLED=1, so live (3102/3103) lane-stability inputs are untouched.
-    if (process.env.FRESH_VM_FEED_ENABLED === "1") {
-      try {
-        const controllerReport = buildRegimeDirectionControllerReport({ currentRegime: result.marketRegime });
-        const store = getCurrentGuardVariantMatrixStore();
-        runFreshVariantMatrixFeed(
-          {
-            candidates: top10WithPlan.map((c) => ({
-              symbol: c.symbol,
-              direction: (c.finalDirection === "SHORT" ? "SHORT" : "LONG") as "LONG" | "SHORT",
-              entryPrice: candidateCurrentPrice(c),
-              stopLoss:
-                typeof c.stopLoss === "number" && Number.isFinite(c.stopLoss) && c.stopLoss > 0 ? c.stopLoss : null,
-              takeProfitLevels: [c.takeProfits?.tp1, c.takeProfits?.tp2, c.takeProfits?.tp3].filter(
-                (v): v is number => typeof v === "number" && Number.isFinite(v) && v > 0,
-              ),
-              stopDistanceBps: c.selectedExecutionPlan?.stopDistanceBps ?? null,
-            })),
-            regime: result.marketRegime,
-            controllerMode: controllerReport.controllerMode,
-            controllerConfidence: controllerReport.confidence,
-            now: new Date().toISOString(),
-          },
-          store,
-        );
-        store.save();
-      } catch {
-        // measurement feed must never break the scan
-      }
-    }
     // --- Report-only: regime direction controller scan-cycle snapshot ---
     // Lightweight snapshot using only marketRegime (other inputs unavailable
     // at scan-cycle time). Full snapshots with all inputs are written by the

@@ -41,10 +41,14 @@ import type { VariantMatrixVariantId } from "./current-guard-variant-matrix.js";
 
 export const REALTIME_SHORT_LANE_VARIANT_ID = "CG_WIDE_FAST_SHORT";
 export const REALTIME_SHORT_SELECTED_LANE_ID = `CG_VARIANT_MATRIX:${REALTIME_SHORT_LANE_VARIANT_ID}`;
-const LONG_WIDE_VARIANT_ID = "CG_WIDE_STOP_TP_WIDE"; // LONG lane: re-enabled by operator (1R wide), fires only in WIDE_TREND bull
+const LONG_WIDE_VARIANT_ID = "CG_WIDE_FAST_LONG"; // LONG lane (operator 2026-06-29): fast 0.5R bank, fires only in WIDE_TREND bull
 const MIXED_SYMBOL_BLOCKLIST = new Set(["NEARUSDT"]);
 const DEFAULT_MAX_PER_CYCLE = 3;
 const DISABLED_LIVE_MIRROR_VARIANT_IDS = new Set<string>(["CG_EXP_SHORT_MFE_GIVEBACK_10X"]);
+// Short lanes the operator force-enables BEFORE they naturally reach STABLE_CANDIDATE — lifted to
+// STABLE here + allowed through the app.ts eligibility gate. 2026-06-29: CG_WIDE_FAST_SHORT only
+// (WATCHABLE, +0.110R — clearly the most deserving); CG_WIDE_STOP_TP_WIDE stays gated until STABLE.
+export const FORCE_ELIGIBLE_SHORT_VARIANT_IDS = new Set<string>(["CG_WIDE_FAST_SHORT"]);
 
 export const REALTIME_SHORT_ALLOWED_VARIANT_IDS = LANE_SELECTOR_V2_LIVE_SUPPORTED_VARIANT_IDS.filter(
   (id) => !DISABLED_LIVE_MIRROR_VARIANT_IDS.has(id),
@@ -103,6 +107,12 @@ export interface RealtimeShortMirrorInputs {
   stableShortLaneActive?: boolean;
   /** Current VM rows for the only live-testnet-allowed short lanes. Must be STABLE_CANDIDATE. */
   stableShortLanes?: RealtimeShortLaneState[];
+  /** Operator force: lift FORCE_ELIGIBLE_SHORT_VARIANT_IDS to STABLE even before they mature. */
+  forceFastShort?: boolean;
+  /** Auto-wire crowding veto: skip entries into a crowd already EXTREME on the SAME side. */
+  crowdingVetoEnabled?: boolean;
+  /** Per-symbol crowd state at signal time (caller fetches); used by the crowding veto. */
+  crowdingBySymbol?: Record<string, { crowdSide: string; crowdingLevel: string }>;
   /** ISO timestamp — injected for determinism/testability. */
   now: string;
   maxPerCycle?: number;
@@ -149,7 +159,21 @@ function effectiveLaneStates(
           : [{ variantId: LONG_WIDE_VARIANT_ID, status: "STABLE_CANDIDATE" }, ...lifted];
       })()
     : base;
-  return withLongWideOverride;
+  // Force-enabled short lanes → lift to STABLE_CANDIDATE so the mirror emits them before they
+  // naturally mature. OFF by default (preserves the stable-only safety gate); the operator turns it
+  // on per-instance via REALTIME_SHORT_FORCE_FAST_SHORT. selectLaneV2's direction gate still blocks
+  // them when shorts aren't allowed.
+  if (!inputs.forceFastShort) return withLongWideOverride;
+  let withForcedShorts = withLongWideOverride;
+  for (const variantId of FORCE_ELIGIBLE_SHORT_VARIANT_IDS) {
+    if (DISABLED_LIVE_MIRROR_VARIANT_IDS.has(variantId)) continue;
+    withForcedShorts = withForcedShorts.some((state) => state.variantId === variantId)
+      ? withForcedShorts.map((state) =>
+          state.variantId === variantId ? { ...state, status: "STABLE_CANDIDATE" } : state,
+        )
+      : [{ variantId, status: "STABLE_CANDIDATE" }, ...withForcedShorts];
+  }
+  return withForcedShorts;
 }
 
 /**
@@ -206,6 +230,17 @@ export function runRealtimeShortMirror(
       result.skipped += 1;
       result.reasons.push(`mixed_symbol_blocked:${c.symbol}`);
       continue;
+    }
+    // Auto-wired crowding veto (research edge #1): don't ADD to a crowd already EXTREME on the same
+    // side as this trade (over-long longs / over-short shorts squeeze the late entrant). Our
+    // short-FADE still fires into a LONG-crowded book (that's the fade we want). Pure risk reducer.
+    if (inputs.crowdingVetoEnabled) {
+      const cr = inputs.crowdingBySymbol?.[c.symbol];
+      if (cr && cr.crowdingLevel === "EXTREME" && cr.crowdSide === c.direction) {
+        result.skipped += 1;
+        result.reasons.push(`crowded_extreme_same_side:${c.symbol}`);
+        continue;
+      }
     }
     if (!isPos(entry)) {
       result.skipped += 1;

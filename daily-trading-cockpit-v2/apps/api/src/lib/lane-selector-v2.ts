@@ -109,6 +109,9 @@ const DEFAULT_MAX_STOP_DISTANCE_BPS = 1200;
 const MIN_REGIME_SAMPLE = 10;
 const MIN_SYMBOL_SAMPLE = 5;
 const WIDE_TREND_VARIANT_ID: VariantMatrixVariantId = "CG_WIDE_STOP_TP_WIDE";
+// LONG extended-trend lane (operator 2026-06-29): fast 0.5R bank instead of the 1R wide. Fires only
+// in a confident WIDE_TREND bull. CG_WIDE_STOP_TP_WIDE stays the SHORT lane (above) only.
+const LONG_LANE_VARIANT_ID: VariantMatrixVariantId = "CG_WIDE_FAST_LONG";
 const SHORT_FAST_VARIANT_ID: VariantMatrixVariantId = "CG_WIDE_FAST_SHORT";
 // LONG extended-trend lane: operator re-enabled CG_WIDE_STOP_TP_WIDE (1R wide) as the long lane
 // (2026-06-29) to re-test it live against the rebuilt fresh / measurement. Longs fire only in a
@@ -167,7 +170,7 @@ export function isLaneSelectorV2LongWideStopOverride(input: {
   estimatedRegime: LaneSelectorV2EstimatedRegime;
 }): boolean {
   return (
-    input.variantId === WIDE_TREND_VARIANT_ID &&
+    input.variantId === LONG_LANE_VARIANT_ID &&
     input.direction === "LONG" &&
     input.estimatedRegime.policy === "WIDE_TREND" &&
     input.estimatedRegime.direction === "LONG"
@@ -322,7 +325,7 @@ function policyPreferredVariants(
     estimated.direction === "LONG" &&
     inputs.candidate.direction === "LONG"
   ) {
-    return [WIDE_TREND_VARIANT_ID];
+    return [LONG_LANE_VARIANT_ID];
   }
   if (
     estimated.policy === "WIDE_TREND" &&

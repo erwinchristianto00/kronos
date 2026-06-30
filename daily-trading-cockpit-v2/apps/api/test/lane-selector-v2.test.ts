@@ -334,7 +334,7 @@ describe("LaneSelectorV2", () => {
     expect(result.rejected).toContain("long_tactical_disabled");
   });
 
-  it("prioritizes CG_WIDE_STOP_TP_WIDE for long in a WIDE_TREND bull (re-enabled lane)", () => {
+  it("prioritizes CG_WIDE_FAST_LONG (0.5R) for long in a WIDE_TREND bull", () => {
     const estimatedRegime = estimateLaneSelectorV2Regime({
       regime: "Bullish expansion",
       controllerMode: "LONG_ONLY",
@@ -355,14 +355,14 @@ describe("LaneSelectorV2", () => {
       estimatedRegime,
       now: "2026-06-25T04:00:00.000Z",
       laneStates: [
-        { variantId: "CG_WIDE_STOP_TP_WIDE", status: "STABLE_CANDIDATE", freshValid: 200, netAvgR: 0.3, pf: 1.4 },
+        { variantId: "CG_WIDE_FAST_LONG", status: "STABLE_CANDIDATE", freshValid: 200, netAvgR: 0.3, pf: 1.4 },
       ],
     });
 
     expect(estimatedRegime.policy).toBe("WIDE_TREND");
-    expect(result.selected?.lane.selectedLaneId).toBe(laneSelectorV2LaneId("CG_WIDE_STOP_TP_WIDE"));
-    // 1R wide geometry: entry 100, stop widened to 300bps = 97, TP at 1R = 103.
+    expect(result.selected?.lane.selectedLaneId).toBe(laneSelectorV2LaneId("CG_WIDE_FAST_LONG"));
+    // fast 0.5R on a 300bps wide stop: entry 100, stop 97, TP = 100 + 0.5×3 = 101.5.
     expect(result.selected?.stop).toBeCloseTo(97, 6);
-    expect(result.selected?.tp1).toBeCloseTo(103, 6);
+    expect(result.selected?.tp1).toBeCloseTo(101.5, 6);
   });
 });
