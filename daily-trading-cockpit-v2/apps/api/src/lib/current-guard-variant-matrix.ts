@@ -620,6 +620,8 @@ export interface VariantMatrixSignal {
   /** Regime posture + favored direction at signal time (fresh-feed populates these; null on legacy). */
   posture?: VariantPosture | null;
   regimeDirection?: VariantRegimeDirection | null;
+  /** Derivatives crowding state at signal time (BUILDING/EXHAUSTING/UNWINDING/NEUTRAL); fresh feed. */
+  crowdingState?: string | null;
 }
 
 export interface CurrentGuardVariantMatrixObservation {
@@ -671,6 +673,7 @@ export interface CurrentGuardVariantMatrixObservation {
   // Regime posture + favored direction captured at signal time (fresh feed; null on legacy obs).
   posture: VariantPosture | null;
   regimeDirection: VariantRegimeDirection | null;
+  crowdingState: string | null;
 
   reportOnly: true;
   laneVersion: typeof CURRENT_GUARD_VARIANT_MATRIX_LANE;
@@ -1108,6 +1111,7 @@ export function buildVariantMatrixObservationsForSignal(
       isFreshValid,
       posture: signal.posture ?? null,
       regimeDirection: signal.regimeDirection ?? null,
+      crowdingState: signal.crowdingState ?? null,
       reportOnly: true as const,
       laneVersion: CURRENT_GUARD_VARIANT_MATRIX_LANE,
     };

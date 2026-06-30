@@ -36,6 +36,8 @@ export interface FreshVariantMatrixFeedInputs {
   regime: string | null;
   controllerMode: string | null;
   controllerConfidence?: string | null;
+  /** Derivatives crowding state per symbol at signal time (caller fetches it); tags each obs. */
+  crowdingBySymbol?: Record<string, string | null>;
   now: string; // ISO
   maxPerCycle?: number;
 }
@@ -152,6 +154,7 @@ export function runFreshVariantMatrixFeed(
       closedAt: null,
       posture,
       regimeDirection,
+      crowdingState: inputs.crowdingBySymbol?.[c.symbol] ?? null,
     };
     const observations = buildVariantMatrixObservationsForSignal(signal, inputs.now);
     store.addMany(observations);
@@ -195,6 +198,7 @@ export interface FreshVariantMatrixReport {
   staleExcluded: number; // resolved but stale entry — counted out of the live read
   medianEntryLagMinutes: number | null;
   byBucket: FreshBucketRow[];
+  byCrowding: Array<{ crowdingState: string; n: number; netAvgR: number; netUsdPer100Risk: number; winRate: number }>;
   lanes: FreshLanePerfRow[];
 }
 
@@ -228,10 +232,13 @@ export function buildFreshVariantMatrixReport(store: CurrentGuardVariantMatrixSt
 
   const byBucketMap = new Map<string, CurrentGuardVariantMatrixObservation[]>();
   const byLaneMap = new Map<string, CurrentGuardVariantMatrixObservation[]>();
+  const byCrowdMap = new Map<string, CurrentGuardVariantMatrixObservation[]>();
   for (const o of fresh) {
     const bKey = `${o.direction}|${o.posture ?? "UNKNOWN"}`;
     (byBucketMap.get(bKey) ?? byBucketMap.set(bKey, []).get(bKey)!).push(o);
     (byLaneMap.get(o.variantId) ?? byLaneMap.set(o.variantId, []).get(o.variantId)!).push(o);
+    const cKey = o.crowdingState ?? "UNTAGGED";
+    (byCrowdMap.get(cKey) ?? byCrowdMap.set(cKey, []).get(cKey)!).push(o);
   }
 
   const byBucket: FreshBucketRow[] = [...byBucketMap.entries()].map(([k, list]) => {
@@ -262,6 +269,17 @@ export function buildFreshVariantMatrixReport(store: CurrentGuardVariantMatrixSt
     };
   }).sort((a, b) => b.n - a.n);
 
+  const byCrowding = [...byCrowdMap.entries()].map(([crowdingState, list]) => {
+    const p = perf(list.map((o) => o.netR!));
+    return {
+      crowdingState,
+      n: list.length,
+      netAvgR: p.netAvgR,
+      netUsdPer100Risk: p.netAvgR * FIXED_RISK_USD,
+      winRate: p.winRate,
+    };
+  }).sort((a, b) => b.n - a.n);
+
   return {
     totalObs: all.length,
     resolved: resolved.length,
@@ -269,6 +287,7 @@ export function buildFreshVariantMatrixReport(store: CurrentGuardVariantMatrixSt
     staleExcluded: resolved.length - fresh.length,
     medianEntryLagMinutes: median(resolved.map((o) => o.entryLagMinutes).filter((x): x is number => x != null)),
     byBucket,
+    byCrowding,
     lanes,
   };
 }

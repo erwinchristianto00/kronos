@@ -21,6 +21,16 @@ function envNumPos(key: string, fallback: number): number {
   return Number.isFinite(v) && v > 0 ? v : fallback;
 }
 
+function envNumNonNeg(key: string, fallback: number): number {
+  const v = Number(process.env[key]);
+  return Number.isFinite(v) && v >= 0 ? v : fallback;
+}
+
+function envSymbolSet(key: string, fallback: string): ReadonlySet<string> {
+  const raw = process.env[key] ?? fallback;
+  return new Set(raw.split(",").map((s) => s.trim().toUpperCase()).filter(Boolean));
+}
+
 const INTERVAL_MS: Record<string, number> = {
   "5m": 5 * 60_000, "15m": 15 * 60_000, "1h": 60 * 60_000, "4h": 4 * 60 * 60_000, "6h": 6 * 60 * 60_000, "1d": 24 * 60 * 60_000,
 };
@@ -30,11 +40,27 @@ export const CROSS_SECTIONAL_MOMENTUM_BARS = envNumPos("CROSS_SECTIONAL_MOMENTUM
 export const CROSS_SECTIONAL_K = envNumPos("CROSS_SECTIONAL_K", 3); // legs per side (long-k / short-k)
 export const CROSS_SECTIONAL_HORIZON_BARS = envNumPos("CROSS_SECTIONAL_HORIZON_BARS", 24); // forward hold (bars)
 export const CROSS_SECTIONAL_ROUNDTRIP_BPS = Number(process.env.CROSS_SECTIONAL_ROUNDTRIP_BPS ?? 12); // per-position round-trip cost
+export const CROSS_SECTIONAL_FILTERED_SIGNAL = `MOM${CROSS_SECTIONAL_MOMENTUM_BARS}_FILTERED`;
+export const CROSS_SECTIONAL_FILTERED_MIN_SCORE_GAP = envNumNonNeg("CROSS_SECTIONAL_FILTERED_MIN_SCORE_GAP", 0.02); // 24h momentum spread floor
+export const CROSS_SECTIONAL_FILTERED_MIN_GROSS_BPS = envNumNonNeg("CROSS_SECTIONAL_FILTERED_MIN_GROSS_BPS", 25); // proof target
+export const CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST = envSymbolSet(
+  "CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST",
+  "SOLUSDT,AVAXUSDT,ETHUSDT,SUIUSDT,ADAUSDT,BNBUSDT,RNDRUSDT",
+);
+export const CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST = envSymbolSet(
+  "CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST",
+  "WLDUSDT,DOGEUSDT,PEPEUSDT,APTUSDT,OPUSDT,SEIUSDT",
+);
+export const CROSS_SECTIONAL_FILTERED_SHORT_BLOCKLIST = envSymbolSet(
+  "CROSS_SECTIONAL_FILTERED_SHORT_BLOCKLIST",
+  "FETUSDT,INJUSDT,NEARUSDT",
+);
 const BAR_MS = INTERVAL_MS[CROSS_SECTIONAL_INTERVAL] ?? INTERVAL_MS["1h"]!;
 export const CROSS_SECTIONAL_HORIZON_MS = CROSS_SECTIONAL_HORIZON_BARS * BAR_MS;
 const EXPIRY_MS = CROSS_SECTIONAL_HORIZON_MS * 3; // give up on a basket missing prices well past its horizon
 
 export type CrossSectionalStatus = "OPEN" | "CLOSED" | "EXPIRED";
+export type CrossSectionalVariant = "RAW" | "FILTERED";
 
 export interface CrossSectionalLeg {
   symbol: string;
@@ -48,10 +74,12 @@ export interface CrossSectionalObservation {
   openedAtMs: number;
   horizonMs: number;
   signal: string;
+  variant?: CrossSectionalVariant;
   k: number;
   longLeg: CrossSectionalLeg[];
   shortLeg: CrossSectionalLeg[];
   status: CrossSectionalStatus;
+  scoreGap?: number | null;
   /** Return on deployed capital after market-beta cancels = the cross-sectional dispersion. */
   grossReturn: number | null;
   costReturn: number | null;
@@ -67,8 +95,27 @@ export interface ScoredSymbol {
   price: number;
 }
 
+interface CrossSectionalBasketOpts {
+  k: number;
+  signal: string;
+  now: string;
+  openedAtMs: number;
+  horizonMs: number;
+  variant?: CrossSectionalVariant;
+  longAllowlist?: ReadonlySet<string> | null;
+  shortAllowlist?: ReadonlySet<string> | null;
+  shortBlocklist?: ReadonlySet<string> | null;
+  minScoreGap?: number;
+}
+
 function mean(xs: number[]): number {
   return xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : 0;
+}
+
+function allowed(symbol: string, allowlist?: ReadonlySet<string> | null, blocklist?: ReadonlySet<string> | null): boolean {
+  const s = symbol.toUpperCase();
+  if (blocklist?.has(s)) return false;
+  return !allowlist || allowlist.size === 0 || allowlist.has(s);
 }
 
 /** N-bar return (ROC) from candles + the latest close. null if not enough history. */
@@ -84,11 +131,19 @@ export function crossSectionalMomentumScore(candles: Candle[], bars: number): { 
 /** Rank scored symbols and build an equal-notional long-top-k / short-bottom-k basket. */
 export function buildCrossSectionalBasket(
   scored: ScoredSymbol[],
-  opts: { k: number; signal: string; now: string; openedAtMs: number; horizonMs: number },
+  opts: CrossSectionalBasketOpts,
 ): CrossSectionalObservation | null {
   const valid = scored.filter((s) => Number.isFinite(s.score) && Number.isFinite(s.price) && s.price > 0);
-  if (valid.length < 2 * opts.k) return null; // need enough names for both legs without overlap
-  const sorted = [...valid].sort((a, b) => b.score - a.score); // strongest first
+  const longPool = valid.filter((s) => allowed(s.symbol, opts.longAllowlist));
+  const longSorted = [...longPool].sort((a, b) => b.score - a.score); // strongest first
+  const selectedLongs = longSorted.slice(0, opts.k);
+  const longSymbols = new Set(selectedLongs.map((s) => s.symbol));
+  const shortPool = valid.filter((s) => !longSymbols.has(s.symbol) && allowed(s.symbol, opts.shortAllowlist, opts.shortBlocklist));
+  const shortSorted = [...shortPool].sort((a, b) => a.score - b.score); // weakest first
+  const selectedShorts = shortSorted.slice(0, opts.k);
+  if (selectedLongs.length < opts.k || selectedShorts.length < opts.k) return null;
+  const scoreGap = selectedLongs[selectedLongs.length - 1]!.score - selectedShorts[selectedShorts.length - 1]!.score;
+  if (opts.minScoreGap !== undefined && scoreGap < opts.minScoreGap) return null;
   const toLeg = (s: ScoredSymbol): CrossSectionalLeg => ({ symbol: s.symbol, entryPrice: s.price, exitPrice: null });
   return {
     observationId: `xsec:${opts.signal}:${opts.openedAtMs}`,
@@ -96,10 +151,12 @@ export function buildCrossSectionalBasket(
     openedAtMs: opts.openedAtMs,
     horizonMs: opts.horizonMs,
     signal: opts.signal,
+    variant: opts.variant ?? "RAW",
     k: opts.k,
-    longLeg: sorted.slice(0, opts.k).map(toLeg),
-    shortLeg: sorted.slice(valid.length - opts.k).map(toLeg),
+    longLeg: selectedLongs.map(toLeg),
+    shortLeg: selectedShorts.map(toLeg),
     status: "OPEN",
+    scoreGap,
     grossReturn: null,
     costReturn: null,
     netReturn: null,
@@ -107,6 +164,22 @@ export function buildCrossSectionalBasket(
     shortLegReturn: null,
     resolvedAt: null,
   };
+}
+
+export function buildFilteredCrossSectionalBasket(
+  scored: ScoredSymbol[],
+  opts: Omit<CrossSectionalBasketOpts, "variant" | "signal" | "longAllowlist" | "shortAllowlist" | "shortBlocklist" | "minScoreGap"> &
+    Partial<Pick<CrossSectionalBasketOpts, "signal" | "longAllowlist" | "shortAllowlist" | "shortBlocklist" | "minScoreGap">>,
+): CrossSectionalObservation | null {
+  return buildCrossSectionalBasket(scored, {
+    ...opts,
+    signal: opts.signal ?? CROSS_SECTIONAL_FILTERED_SIGNAL,
+    variant: "FILTERED",
+    longAllowlist: opts.longAllowlist ?? CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST,
+    shortAllowlist: opts.shortAllowlist ?? CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST,
+    shortBlocklist: opts.shortBlocklist ?? CROSS_SECTIONAL_FILTERED_SHORT_BLOCKLIST,
+    minScoreGap: opts.minScoreGap ?? CROSS_SECTIONAL_FILTERED_MIN_SCORE_GAP,
+  });
 }
 
 /**
@@ -243,6 +316,8 @@ export function _resetCrossSectionalStoreForTests(): void {
 
 export interface CrossSectionalCycleResult {
   opened: number;
+  openedRaw?: number;
+  openedFiltered?: number;
   resolved: number;
   expired: number;
 }
@@ -295,18 +370,34 @@ export async function runCrossSectionalCycle(opts: {
 
   // 2. open at most ONE new basket per interval bucket (the 7-min ticker fires faster than the bars)
   const bucket = Math.floor(opts.now / BAR_MS);
-  const alreadyThisBucket = opts.store.all.some((o) => Math.floor(o.openedAtMs / BAR_MS) === bucket);
-  if (!alreadyThisBucket) {
+  const alreadyThisBucket = (signal: string) => opts.store.all.some((o) => o.signal === signal && Math.floor(o.openedAtMs / BAR_MS) === bucket);
+  const rawSignal = `MOM${CROSS_SECTIONAL_MOMENTUM_BARS}`;
+  if (!alreadyThisBucket(rawSignal)) {
     const basket = buildCrossSectionalBasket(scored, {
       k: CROSS_SECTIONAL_K,
-      signal: `MOM${CROSS_SECTIONAL_MOMENTUM_BARS}`,
+      signal: rawSignal,
+      variant: "RAW",
       now: nowIso,
       openedAtMs: opts.now,
       horizonMs: CROSS_SECTIONAL_HORIZON_MS,
     });
     if (basket) {
       opts.store.add(basket);
-      result.opened = 1;
+      result.opened += 1;
+      result.openedRaw = (result.openedRaw ?? 0) + 1;
+    }
+  }
+  if (!isCrossSectionalFilteredDisabled() && !alreadyThisBucket(CROSS_SECTIONAL_FILTERED_SIGNAL)) {
+    const basket = buildFilteredCrossSectionalBasket(scored, {
+      k: CROSS_SECTIONAL_K,
+      now: nowIso,
+      openedAtMs: opts.now,
+      horizonMs: CROSS_SECTIONAL_HORIZON_MS,
+    });
+    if (basket) {
+      opts.store.add(basket);
+      result.opened += 1;
+      result.openedFiltered = (result.openedFiltered ?? 0) + 1;
     }
   }
 
@@ -336,6 +427,7 @@ export async function runCrossSectionalCycleGuarded(opts: {
 
 export interface CrossSectionalReport {
   signal: string;
+  variant: CrossSectionalVariant;
   horizonBars: number;
   k: number;
   open: number;
@@ -353,15 +445,28 @@ export interface CrossSectionalReport {
   nextResolveInMs: number | null;
   /** the net returns of recent closed baskets, for a distribution sparkline. */
   recentNetReturns: number[];
+  targetGrossReturn: number;
+  edgeReady: boolean;
 }
 
-export function buildCrossSectionalReport(store: CrossSectionalStore, nowMs: number = Date.now()): CrossSectionalReport {
-  const all = store.all;
+function observationVariant(o: Pick<CrossSectionalObservation, "variant" | "signal">): CrossSectionalVariant {
+  return o.variant === "FILTERED" || o.signal === CROSS_SECTIONAL_FILTERED_SIGNAL ? "FILTERED" : "RAW";
+}
+
+export function buildCrossSectionalReport(
+  store: CrossSectionalStore,
+  nowMs: number = Date.now(),
+  opts: { variant?: CrossSectionalVariant; signal?: string } = {},
+): CrossSectionalReport {
+  const variant = opts.variant ?? (opts.signal === CROSS_SECTIONAL_FILTERED_SIGNAL ? "FILTERED" : "RAW");
+  const all = store.all.filter((o) => opts.signal ? o.signal === opts.signal : observationVariant(o) === variant);
   const closed = all.filter((o) => o.status === "CLOSED" && o.netReturn !== null);
   const nets = closed.map((o) => o.netReturn!);
   const gross = closed.map((o) => o.grossReturn ?? 0);
   const m = mean(nets);
   const sd = nets.length > 1 ? Math.sqrt(mean(nets.map((x) => (x - m) ** 2))) : 0;
+  const grossAvg = mean(gross);
+  const targetGrossReturn = (variant === "FILTERED" ? CROSS_SECTIONAL_FILTERED_MIN_GROSS_BPS : CROSS_SECTIONAL_ROUNDTRIP_BPS) / 10_000;
   const openRemaining = all
     .filter((o) => o.status === "OPEN")
     .map((o) => Math.max(0, o.openedAtMs + o.horizonMs - nowMs));
@@ -369,22 +474,47 @@ export function buildCrossSectionalReport(store: CrossSectionalStore, nowMs: num
     lastCycleAt: store.lastCycleAt,
     nextResolveInMs: openRemaining.length ? Math.min(...openRemaining) : null,
     recentNetReturns: nets.slice(-30),
-    signal: `MOM${CROSS_SECTIONAL_MOMENTUM_BARS}`,
+    signal: opts.signal ?? (variant === "FILTERED" ? CROSS_SECTIONAL_FILTERED_SIGNAL : `MOM${CROSS_SECTIONAL_MOMENTUM_BARS}`),
+    variant,
     horizonBars: CROSS_SECTIONAL_HORIZON_BARS,
     k: CROSS_SECTIONAL_K,
     open: all.filter((o) => o.status === "OPEN").length,
     closed: closed.length,
     expired: all.filter((o) => o.status === "EXPIRED").length,
     netAvgReturn: m,
-    grossAvgReturn: mean(gross),
+    grossAvgReturn: grossAvg,
     winRate: closed.length ? closed.filter((o) => o.netReturn! > 0).length / closed.length : 0,
     totalNetReturn: nets.reduce((a, b) => a + b, 0),
     sharpeLike: sd > 0 ? m / sd : null,
     longLegAvgReturn: mean(closed.map((o) => o.longLegReturn ?? 0)),
     shortLegAvgReturn: mean(closed.map((o) => o.shortLegReturn ?? 0)),
+    targetGrossReturn,
+    edgeReady: closed.length >= 20 && grossAvg >= targetGrossReturn && m > 0,
   };
 }
 
 export function isCrossSectionalEdgeDisabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return env.CROSS_SECTIONAL_EDGE_DISABLED === "1";
+}
+
+export function isCrossSectionalFilteredDisabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.CROSS_SECTIONAL_FILTERED_DISABLED === "1";
+}
+
+export function getCrossSectionalFilteredConfig(): {
+  signal: string;
+  minScoreGap: number;
+  targetGrossReturn: number;
+  longAllowlist: string[];
+  shortAllowlist: string[];
+  shortBlocklist: string[];
+} {
+  return {
+    signal: CROSS_SECTIONAL_FILTERED_SIGNAL,
+    minScoreGap: CROSS_SECTIONAL_FILTERED_MIN_SCORE_GAP,
+    targetGrossReturn: CROSS_SECTIONAL_FILTERED_MIN_GROSS_BPS / 10_000,
+    longAllowlist: [...CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST].sort(),
+    shortAllowlist: [...CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST].sort(),
+    shortBlocklist: [...CROSS_SECTIONAL_FILTERED_SHORT_BLOCKLIST].sort(),
+  };
 }

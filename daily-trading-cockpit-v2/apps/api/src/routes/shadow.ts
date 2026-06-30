@@ -232,6 +232,7 @@ import {
   getCrossSectionalStore,
   runCrossSectionalCycleGuarded,
   buildCrossSectionalReport,
+  getCrossSectionalFilteredConfig,
   isCrossSectionalEdgeDisabled,
   CROSS_SECTIONAL_INTERVAL,
   CROSS_SECTIONAL_MOMENTUM_BARS,
@@ -596,19 +597,26 @@ export async function registerShadowRoutes(
   // Cross-sectional market-neutral measurement lane — report + open/closed baskets (report-only).
   app.get("/api/shadow/cross-sectional-report", async () => {
     const store = getCrossSectionalStore();
-    const slim = (o: { openedAt: string; resolvedAt: string | null; netReturn: number | null; grossReturn: number | null; signal: string; longLeg: { symbol: string }[]; shortLeg: { symbol: string }[] }) => ({
+    const slim = (o: { openedAt: string; resolvedAt: string | null; netReturn: number | null; grossReturn: number | null; signal: string; scoreGap?: number | null; longLeg: { symbol: string }[]; shortLeg: { symbol: string }[] }) => ({
       openedAt: o.openedAt,
       resolvedAt: o.resolvedAt,
       signal: o.signal,
+      scoreGap: o.scoreGap ?? null,
       netReturnPct: o.netReturn != null ? o.netReturn * 100 : null,
       grossReturnPct: o.grossReturn != null ? o.grossReturn * 100 : null,
       long: o.longLeg.map((l) => l.symbol),
       short: o.shortLeg.map((l) => l.symbol),
     });
+    const raw = store.all.filter((o) => o.signal !== getCrossSectionalFilteredConfig().signal);
+    const filtered = store.all.filter((o) => o.signal === getCrossSectionalFilteredConfig().signal);
     return {
       report: buildCrossSectionalReport(store),
-      openBaskets: store.all.filter((o) => o.status === "OPEN").map(slim),
-      recentClosed: store.all.filter((o) => o.status === "CLOSED").slice(-15).map(slim),
+      filteredReport: buildCrossSectionalReport(store, Date.now(), { variant: "FILTERED" }),
+      filteredConfig: getCrossSectionalFilteredConfig(),
+      openBaskets: raw.filter((o) => o.status === "OPEN").map(slim),
+      filteredOpenBaskets: filtered.filter((o) => o.status === "OPEN").map(slim),
+      recentClosed: raw.filter((o) => o.status === "CLOSED").slice(-15).map(slim),
+      filteredRecentClosed: filtered.filter((o) => o.status === "CLOSED").slice(-15).map(slim),
     };
   });
 

@@ -3,11 +3,13 @@ import type { Candle } from "@dtc/shared";
 import {
   crossSectionalMomentumScore,
   buildCrossSectionalBasket,
+  buildFilteredCrossSectionalBasket,
   resolveCrossSectional,
   buildCrossSectionalReport,
   runCrossSectionalCycle,
   CrossSectionalStore,
   CROSS_SECTIONAL_HORIZON_MS,
+  CROSS_SECTIONAL_FILTERED_SIGNAL,
   type ScoredSymbol,
   type CrossSectionalObservation,
 } from "../src/lib/cross-sectional-edge.js";
@@ -47,6 +49,50 @@ describe("cross-sectional-edge — market-neutral measurement lane", () => {
     expect(b.longLeg.map((l) => l.symbol)).toEqual(["A"]); // highest score
     expect(b.shortLeg.map((l) => l.symbol)).toEqual(["D"]); // lowest score
     expect(b.status).toBe("OPEN");
+  });
+
+  it("[FILTERED] applies long/short symbol guardrails and score-gap floor", () => {
+    const b = buildFilteredCrossSectionalBasket(
+      scored([
+        ["FETUSDT", 0.12, 10], // high score but not long-allowlisted
+        ["SOLUSDT", 0.10, 20],
+        ["AVAXUSDT", 0.08, 30],
+        ["INJUSDT", -0.20, 40], // weak but short-blocklisted
+        ["WLDUSDT", -0.12, 50],
+        ["DOGEUSDT", -0.08, 60],
+      ]),
+      {
+        k: 2,
+        now: T0,
+        openedAtMs: T0ms,
+        horizonMs: CROSS_SECTIONAL_HORIZON_MS,
+        minScoreGap: 0.05,
+        longAllowlist: new Set(["SOLUSDT", "AVAXUSDT"]),
+        shortAllowlist: new Set(["WLDUSDT", "DOGEUSDT", "INJUSDT"]),
+        shortBlocklist: new Set(["INJUSDT"]),
+      },
+    )!;
+    expect(b.signal).toBe(CROSS_SECTIONAL_FILTERED_SIGNAL);
+    expect(b.variant).toBe("FILTERED");
+    expect(b.longLeg.map((l) => l.symbol)).toEqual(["SOLUSDT", "AVAXUSDT"]);
+    expect(b.shortLeg.map((l) => l.symbol)).toEqual(["WLDUSDT", "DOGEUSDT"]);
+    expect(b.scoreGap).toBeGreaterThanOrEqual(0.05);
+  });
+
+  it("[FILTERED-GAP] refuses low-dispersion baskets", () => {
+    const b = buildFilteredCrossSectionalBasket(
+      scored([["SOLUSDT", 0.021, 20], ["AVAXUSDT", 0.020, 30], ["WLDUSDT", 0.019, 50], ["DOGEUSDT", 0.018, 60]]),
+      {
+        k: 2,
+        now: T0,
+        openedAtMs: T0ms,
+        horizonMs: CROSS_SECTIONAL_HORIZON_MS,
+        minScoreGap: 0.01,
+        longAllowlist: new Set(["SOLUSDT", "AVAXUSDT"]),
+        shortAllowlist: new Set(["WLDUSDT", "DOGEUSDT"]),
+      },
+    );
+    expect(b).toBeNull();
   });
 
   it("[INSUFFICIENT] returns null when there aren't enough names for both legs", () => {
@@ -141,19 +187,23 @@ describe("cross-sectional-edge — market-neutral measurement lane", () => {
 
   it("[REPORT] aggregates net/gross/WR over closed baskets", () => {
     const store = freshStore();
-    const close = (net: number): CrossSectionalObservation => ({
+    const close = (net: number, signal = "MOM", variant: "RAW" | "FILTERED" = "RAW"): CrossSectionalObservation => ({
       observationId: `xsec:MOM:${Math.round(net * 1e6)}`, openedAt: T0, openedAtMs: T0ms, horizonMs: 1000,
-      signal: "MOM", k: 1, longLeg: [], shortLeg: [], status: "CLOSED",
+      signal, variant, k: 1, longLeg: [], shortLeg: [], status: "CLOSED",
       grossReturn: net + 0.001, costReturn: 0.001, netReturn: net, longLegReturn: 0.05, shortLegReturn: 0.05, resolvedAt: T0,
     });
     store.add(close(0.02));
     store.add(close(-0.01));
     store.add(close(0.03));
+    store.add(close(0.50, CROSS_SECTIONAL_FILTERED_SIGNAL, "FILTERED"));
     const rep = buildCrossSectionalReport(store);
     expect(rep.closed).toBe(3);
     expect(rep.winRate).toBeCloseTo(2 / 3, 6);
     expect(rep.totalNetReturn).toBeCloseTo(0.04, 9);
     expect(rep.netAvgReturn).toBeCloseTo(0.04 / 3, 9);
+    const filtered = buildCrossSectionalReport(store, T0ms, { variant: "FILTERED" });
+    expect(filtered.closed).toBe(1);
+    expect(filtered.netAvgReturn).toBeCloseTo(0.5, 9);
   });
 });
 
