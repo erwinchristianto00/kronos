@@ -268,6 +268,7 @@ function makeConfig(overrides: Partial<LiveExecutionConfig> = {}): LiveExecution
     mainnetProfitProtection: false,
     mainnetTpR: 0,
     mainnetRegimeHardCutMs: 30 * 60 * 1000,
+    profitBankNetTargetUsd: 0,
     regimeLossHardCutStopFraction: 0.5,
     rescue: {
       enabled: false,
@@ -423,6 +424,33 @@ describe("parseLiveExecutionConfig", () => {
     expect(overridden.maxCorrelatedAltLongPositions).toBe(2);
     expect(overridden.maxCorrelatedAltShortPositions).toBe(4);
     expect(overridden.regimeLossHardCutStopFraction).toBe(0.35);
+  });
+
+  it("profitBankNetTargetUsd defaults off and parses on either env, explicit 0 stays off", () => {
+    const testnetBase = {
+      LIVE_EXECUTION_ENABLED: "1",
+      LIVE_BINANCE_ENV: "testnet",
+      LIVE_BINANCE_API_KEY: "k",
+      LIVE_BINANCE_API_SECRET: "s",
+    };
+    expect(parseLiveExecutionConfig(testnetBase).profitBankNetTargetUsd).toBe(0);
+    expect(
+      parseLiveExecutionConfig({ ...testnetBase, LIVE_PROFIT_BANK_NET_TARGET_USD: "1" }).profitBankNetTargetUsd,
+    ).toBe(1);
+    expect(
+      parseLiveExecutionConfig({ ...testnetBase, LIVE_PROFIT_BANK_NET_TARGET_USD: "0" }).profitBankNetTargetUsd,
+    ).toBe(0);
+
+    const mainnetBase = {
+      LIVE_EXECUTION_ENABLED: "1",
+      LIVE_BINANCE_ENV: "mainnet",
+      LIVE_BINANCE_API_KEY: "k",
+      LIVE_BINANCE_API_SECRET: "s",
+      LIVE_MAINNET_CONFIRM: "I_UNDERSTAND_REAL_MONEY",
+    };
+    expect(
+      parseLiveExecutionConfig({ ...mainnetBase, LIVE_PROFIT_BANK_NET_TARGET_USD: "1" }).profitBankNetTargetUsd,
+    ).toBe(1);
   });
 
   it("mainnet profit-protection is opt-in and mainnet-only; R-based TP parses", () => {
@@ -696,7 +724,7 @@ describe("LiveExecutionEngine", () => {
 
     const closed = store.getState().intents[0]!;
     expect(closed.state).toBe("CLOSED");
-    expect(closed.closeReason).toBe("TESTNET_USD_TP_20.00");
+    expect(closed.closeReason).toBe("PROFIT_BANK_NET_20.00");
     expect(closed.realizedPnlUsd).toBeCloseTo(20.12, 6);
     const flat = client.placed.at(-1)!;
     expect(flat.type).toBe("MARKET");
@@ -706,6 +734,70 @@ describe("LiveExecutionEngine", () => {
     expect(store.getState().dailyLedger.wins).toBe(1);
     expect(store.getState().consecutiveLosses).toBe(0);
     expect(client.orderStatusById.get(intent.tp1OrderId!)).toBeUndefined();
+  });
+
+  it("profit-bank net target closes a SHORT position (any lane) once net-of-cost clears the flat $1 target", async () => {
+    const order = paperOrder(); // SHORT, no special lane — proves this is no longer LONG/lane-restricted.
+    const { engine, client, store } = makeEngine({
+      paper: makePaperStore([order]),
+      config: { testnetTakeProfitUsd: 0, profitBankNetTargetUsd: 1 },
+    });
+    expect((await engine.arm()).ok).toBe(true);
+    await engine.tick();
+
+    client.unrealizedPnlBySymbol.set("ETHUSDT", 1.25); // clears the ~0.22 estimated close-cost buffer
+    client.flattenRealizedPnl = 1.02;
+    await engine.tick();
+
+    const closed = store.getState().intents[0]!;
+    expect(closed.state).toBe("CLOSED");
+    expect(closed.closeReason).toBe("PROFIT_BANK_NET_1.00");
+    expect(closed.realizedPnlUsd).toBeCloseTo(1.02, 6);
+  });
+
+  it("profit-bank net target stays open when gross unrealized crosses $1 but net-of-cost does not", async () => {
+    const order = paperOrder();
+    const { engine, client, store } = makeEngine({
+      paper: makePaperStore([order]),
+      config: { testnetTakeProfitUsd: 0, profitBankNetTargetUsd: 1 },
+    });
+    expect((await engine.arm()).ok).toBe(true);
+    await engine.tick();
+    const placedBefore = client.placed.length;
+
+    client.unrealizedPnlBySymbol.set("ETHUSDT", 1.1); // gross > 1, but net after the ~0.22 cost buffer is < 1
+    await engine.tick();
+
+    expect(store.getState().intents[0]!.state).toBe("OPEN");
+    expect(client.placed.length).toBe(placedBefore);
+  });
+
+  it("profit-bank net target takes priority over the legacy mainnet R-based threshold when both are set", async () => {
+    const order = paperOrder({
+      direction: "LONG",
+      stopLoss: 1900,
+      takeProfitLevels: [2300],
+    } as Partial<PaperOrder>);
+    const { engine, client, store } = makeEngine({
+      paper: makePaperStore([order]),
+      config: {
+        env: "mainnet",
+        mainnetConfirmed: true,
+        mainnetProfitProtection: true,
+        mainnetTpR: 3, // would require unrealized >= 15 (3 * riskUsdPerTrade=5) — the net target should win instead.
+        profitBankNetTargetUsd: 1,
+      },
+    });
+    expect((await engine.arm()).ok).toBe(true);
+    await engine.tick();
+
+    client.unrealizedPnlBySymbol.set("ETHUSDT", 1.25);
+    client.flattenRealizedPnl = 1.02;
+    await engine.tick();
+
+    const closed = store.getState().intents[0]!;
+    expect(closed.state).toBe("CLOSED");
+    expect(closed.closeReason).toBe("PROFIT_BANK_NET_1.00");
   });
 
   it("mainnet CG_WIDE_LONG_RUNNER closes immediately once unrealized clears estimated close cost", async () => {

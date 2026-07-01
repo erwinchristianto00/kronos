@@ -106,6 +106,10 @@ export interface LiveExecutionConfig {
   mainnetTpR: number;
   /** Mainnet anti-bleed hard-cut window (ms) for sustained counter-regime exposure; 0 disables. */
   mainnetRegimeHardCutMs: number;
+  /** General net-of-estimated-cost profit bank: close ANY open position (either direction, any lane,
+   *  either env) once unrealized PnL minus estimatedCloseCostUsd reaches this USD amount. Takes priority
+   *  over the legacy gross testnetTakeProfitUsd/mainnetTpR thresholds when set. 0 = off. */
+  profitBankNetTargetUsd: number;
   /** Opposing-regime loss cut: close once adverse move reaches this fraction of the entry-to-stop distance. */
   regimeLossHardCutStopFraction: number;
   /** Testnet-only regime-flip rescue (flip a stuck counter-regime position to net regime-aligned). */
@@ -196,6 +200,7 @@ export function parseLiveExecutionConfig(env: NodeJS.ProcessEnv = process.env): 
     mainnetProfitProtection: liveEnv === "mainnet" && env.LIVE_MAINNET_PROFIT_PROTECTION === "1",
     mainnetTpR: liveEnv === "mainnet" ? Math.max(0, Number.parseFloat(env.LIVE_MAINNET_TP_R ?? "") || 0) : 0,
     mainnetRegimeHardCutMs: liveEnv === "mainnet" ? envNum(env.LIVE_MAINNET_REGIME_HARD_CUT_MS, 30 * 60 * 1000) : 0,
+    profitBankNetTargetUsd: Math.max(0, Number.parseFloat(env.LIVE_PROFIT_BANK_NET_TARGET_USD ?? "") || 0),
     regimeLossHardCutStopFraction: envFraction(env.LIVE_REGIME_LOSS_HARD_CUT_STOP_FRACTION, 0.5),
     rescue: parseRegimeFlipRescueConfig(env, liveEnv),
     rescueExecute:
@@ -1164,6 +1169,7 @@ export class LiveExecutionEngine {
         regimeExitActive: this.regimeProtectionActive(),
         regimeHardCutMs: this.regimeHardCutMsEffective(),
         regimeLossHardCutStopFraction: this.config.regimeLossHardCutStopFraction,
+        profitBankNetTargetUsd: this.config.profitBankNetTargetUsd,
         profitBankThresholdUsd: this.profitBankThresholdUsd(),
       },
       rescue: {
@@ -1923,9 +1929,12 @@ export class LiveExecutionEngine {
     if (this.config.env === "mainnet" && this.config.mainnetProfitProtection) return this.config.mainnetRegimeHardCutMs;
     return 0;
   }
-  /** Effective unrealized-USD profit-bank threshold (0 = no fixed take-profit). Testnet: absolute USD.
-   *  Mainnet: R-based (mainnetTpR × riskUsdPerTrade) so it scales with risk rather than a blunt $ cap. */
+  /** Effective NET (after estimated close cost) profit-bank threshold (0 = no fixed take-profit).
+   *  profitBankNetTargetUsd (either env, flat $ amount) takes priority when set — this is the general
+   *  "bank small wins fast" target. Falls back to the legacy gross thresholds: testnet absolute USD,
+   *  or mainnet R-based (mainnetTpR × riskUsdPerTrade) so it scales with risk rather than a blunt $ cap. */
   private profitBankThresholdUsd(): number {
+    if (this.config.profitBankNetTargetUsd > 0) return this.config.profitBankNetTargetUsd;
     if (this.config.env === "testnet") return this.config.testnetTakeProfitUsd;
     if (this.config.env === "mainnet" && this.config.mainnetProfitProtection && this.config.mainnetTpR > 0) {
       return this.config.mainnetTpR * this.config.riskUsdPerTrade;
@@ -2273,8 +2282,9 @@ export class LiveExecutionEngine {
   ): Promise<{ changed: boolean; closed: boolean }> {
     const threshold = this.profitBankThresholdUsd();
     if (!(threshold > 0)) return { changed: false, closed: false };
-    const unrealized = pos?.unRealizedProfit ?? 0;
-    if (!Number.isFinite(unrealized) || unrealized < threshold) return { changed: false, closed: false };
+    if (!pos) return { changed: false, closed: false };
+    const netAfterCost = pos.unRealizedProfit - this.estimatedCloseCostUsd(pos);
+    if (!Number.isFinite(netAfterCost) || netAfterCost < threshold) return { changed: false, closed: false };
 
     const flat = await this.client.placeOrder({
       symbol: intent.symbol,
@@ -2300,7 +2310,7 @@ export class LiveExecutionEngine {
     intent.state = "CLOSED";
     intent.closedAt = this.nowIso();
     intent.updatedAt = this.nowIso();
-    intent.closeReason = `TESTNET_USD_TP_${threshold.toFixed(2)}`;
+    intent.closeReason = `PROFIT_BANK_NET_${threshold.toFixed(2)}`;
     this.applyRealizedToLedger(net);
     return { changed: true, closed: true };
   }
