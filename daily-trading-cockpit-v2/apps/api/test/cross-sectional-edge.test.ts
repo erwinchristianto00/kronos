@@ -4,12 +4,17 @@ import {
   crossSectionalMomentumScore,
   buildCrossSectionalBasket,
   buildFilteredCrossSectionalBasket,
+  buildTrendCrossSectionalBasket,
+  buildMixedCrossSectionalBasket,
   resolveCrossSectional,
   buildCrossSectionalReport,
   runCrossSectionalCycle,
   CrossSectionalStore,
   CROSS_SECTIONAL_HORIZON_MS,
   CROSS_SECTIONAL_FILTERED_SIGNAL,
+  CROSS_SECTIONAL_TREND_SIGNAL,
+  CROSS_SECTIONAL_MIXED_SIGNAL,
+  buildCrossSectionalRegimeContext,
   type ScoredSymbol,
   type CrossSectionalObservation,
 } from "../src/lib/cross-sectional-edge.js";
@@ -149,6 +154,88 @@ describe("cross-sectional-edge — market-neutral measurement lane", () => {
     const r = resolveCrossSectional(b, { A: 110, B: 90 }, new Date(T0ms + 2000).toISOString(), 12);
     expect(r.grossReturn!).toBeCloseTo(0.1, 9);
     expect(r.netReturn!).toBeCloseTo(0.1 - 0.0012, 9); // 12 bps
+  });
+
+  it("[WEIGHTED] trend basket uses side-specific symbols and weighted contributions", () => {
+    const b = buildTrendCrossSectionalBasket(
+      scored([
+        ["FETUSDT", 0.30, 100], // toxic long should be blocked
+        ["SOLUSDT", 0.20, 100],
+        ["ETHUSDT", 0.15, 100],
+        ["AVAXUSDT", -0.40, 100], // toxic short should be blocked
+        ["WLDUSDT", -0.30, 100],
+        ["DOGEUSDT", -0.20, 100],
+      ]),
+      {
+        k: 2,
+        now: T0,
+        openedAtMs: T0ms,
+        horizonMs: CROSS_SECTIONAL_HORIZON_MS,
+        minScoreGap: 0.01,
+        longCapitalWeight: 0.25,
+        shortCapitalWeight: 0.75,
+        weightingModel: "EQUAL_NOTIONAL",
+      },
+    )!;
+    expect(b.signal).toBe(CROSS_SECTIONAL_TREND_SIGNAL);
+    expect(b.longLeg.map((l) => l.symbol)).toEqual(["SOLUSDT", "ETHUSDT"]);
+    expect(b.shortLeg.map((l) => l.symbol)).toEqual(["WLDUSDT", "DOGEUSDT"]);
+    const r = resolveCrossSectional(b, { SOLUSDT: 110, ETHUSDT: 110, WLDUSDT: 90, DOGEUSDT: 90 }, new Date(T0ms + CROSS_SECTIONAL_HORIZON_MS + 1).toISOString(), 0);
+    // Long side contributes 25% * +10%; short side contributes 75% * +10%.
+    expect(r.grossReturn!).toBeCloseTo(0.1, 9);
+  });
+
+  it("[MIXED-MR] mixed variant fades extremes instead of following momentum", () => {
+    const b = buildMixedCrossSectionalBasket(
+      scored([
+        ["SOLUSDT", -0.20, 100],
+        ["ETHUSDT", -0.10, 100],
+        ["WLDUSDT", 0.30, 100],
+        ["DOGEUSDT", 0.20, 100],
+      ]),
+      {
+        k: 2,
+        now: T0,
+        openedAtMs: T0ms,
+        horizonMs: CROSS_SECTIONAL_HORIZON_MS,
+        minScoreGap: 0.01,
+      },
+    )!;
+    expect(b.signal).toBe(CROSS_SECTIONAL_MIXED_SIGNAL);
+    expect(b.strategyFamily).toBe("MEAN_REVERSION");
+    expect(b.longLeg.map((l) => l.symbol)).toEqual(["SOLUSDT", "ETHUSDT"]);
+    expect(b.shortLeg.map((l) => l.symbol)).toEqual(["WLDUSDT", "DOGEUSDT"]);
+  });
+
+  it("[EARLY-EXIT] adaptive basket closes on basket-level TP/SL before horizon", () => {
+    const b = buildCrossSectionalBasket(
+      scored([["A", 0.5, 100], ["B", -0.4, 100]]),
+      { k: 1, signal: "MOM", now: T0, openedAtMs: T0ms, horizonMs: CROSS_SECTIONAL_HORIZON_MS, takeProfitReturn: 0.01, stopLossReturn: 0.01 },
+    )!;
+    const tp = resolveCrossSectional(b, { A: 105, B: 95 }, new Date(T0ms + 60_000).toISOString(), 0);
+    expect(tp.status).toBe("CLOSED");
+    expect(tp.exitReason).toBe("TAKE_PROFIT");
+
+    const b2 = buildCrossSectionalBasket(
+      scored([["A", 0.5, 100], ["B", -0.4, 100]]),
+      { k: 1, signal: "MOM2", now: T0, openedAtMs: T0ms, horizonMs: CROSS_SECTIONAL_HORIZON_MS, takeProfitReturn: 0.01, stopLossReturn: 0.01 },
+    )!;
+    const sl = resolveCrossSectional(b2, { A: 95, B: 105 }, new Date(T0ms + 60_000).toISOString(), 0);
+    expect(sl.status).toBe("CLOSED");
+    expect(sl.exitReason).toBe("STOP_LOSS");
+  });
+
+  it("[REGIME-TAG] stores regime context and cuts adaptive basket on regime flip", () => {
+    const openRegime = buildCrossSectionalRegimeContext({ currentRegime: "Bearish pressure", controllerMode: "SHORT_ONLY", directionalBias: "SHORT", confidence: "MEDIUM" });
+    const nextRegime = buildCrossSectionalRegimeContext({ currentRegime: "Choppy rotation", controllerMode: "VALIDATION_ONLY", directionalBias: "MIXED", confidence: "LOW" });
+    const b = buildCrossSectionalBasket(
+      scored([["A", 0.5, 100], ["B", -0.4, 100]]),
+      { k: 1, signal: "MOM", now: T0, openedAtMs: T0ms, horizonMs: CROSS_SECTIONAL_HORIZON_MS, regimeContext: openRegime, regimeFlipExit: true },
+    )!;
+    expect(b.regimeClassAtOpen).toBe("TREND_SHORT");
+    const r = resolveCrossSectional(b, { A: 100.1, B: 99.9 }, new Date(T0ms + 60_000).toISOString(), 0, { regimeContext: nextRegime });
+    expect(r.status).toBe("CLOSED");
+    expect(r.exitReason).toBe("REGIME_FLIP");
   });
 
   it("[EXPIRE] a basket whose prices stay missing past EXPIRY is EXPIRED, not stuck OPEN", () => {
