@@ -1628,6 +1628,8 @@ describe("paper-opportunity-allocator", () => {
     wide.status = "REJECT";
     wide.netAvgR = -0.24;
     wide.pf = 0.61;
+    wide.byDirection = [];
+    wide.byRegimeFamily = [];
 
     // Without priority → CG_WIDE is vetoed by ECONOMICS_REJECT.
     const off = buildPaperOpportunityAllocatorReport(
@@ -1641,6 +1643,33 @@ describe("paper-opportunity-allocator", () => {
       baseInputs({ vmReport, candidates: [makeCandidate()], paperCgWidePriority: true }),
     );
     expect(on.selectedOpportunities.some((o) => o.variantId === "CG_WIDE_STOP_TP_WIDE")).toBe(true);
+  });
+
+  // [P7-3m2] Aggregate lane REJECT must not kill an unproven direction/regime cohort.
+  // The cohort is admitted as DIAGNOSTIC_ONLY (bounded collection), not HEADLINE, until it matures.
+  it("[P7-3m2] aggregate REJECT opens immature direction cohort as diagnostic collection", async () => {
+    const dir = tmpDir();
+    const vmReport = await buildWinningVmReport(dir);
+    const scaleout = vmReport.rows.find((r) => r.variantId === "CG_SCALEOUT_TP1_TRAIL")!;
+    scaleout.status = "REJECT";
+    scaleout.netAvgR = -0.54;
+    scaleout.pf = 0.31;
+    scaleout.freshValid = 48;
+    scaleout.byDirection = [
+      { key: "LONG", n: 44, netAvgR: -0.62, grossAvgR: -0.55, pf: 0.2, wr: 0.45 },
+      { key: "SHORT", n: 4, netAvgR: 0.12, grossAvgR: 0.24, pf: null, wr: 1 },
+    ];
+    scaleout.byRegimeFamily = [
+      { key: "BEARISH", n: 4, netAvgR: 0.12, grossAvgR: 0.24, pf: null, wr: 1 },
+    ];
+
+    const report = buildPaperOpportunityAllocatorReport(
+      baseInputs({ vmReport, candidates: [makeCandidate({ direction: "SHORT" })] }),
+    );
+    const scaleoutOpp = report.selectedOpportunities.find((o) => o.variantId === "CG_SCALEOUT_TP1_TRAIL");
+    expect(scaleoutOpp).toBeTruthy();
+    expect(scaleoutOpp!.paperOrderMode).toBe("DIAGNOSTIC_ONLY");
+    expect(scaleoutOpp!.provenance.candidateQualityFlags.some((flag) => flag.startsWith("COHORT_DIAGNOSTIC_SHORT_BEARISH_4_OF_"))).toBe(true);
   });
 
   // [P7-3n] CG_WIDE priority trims diagnostics so CG_WIDE keeps the target share.

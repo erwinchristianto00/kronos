@@ -411,6 +411,49 @@ function cohortFromBreakdown(row: VariantBreakdownRow | undefined): NeuralLaneCo
   };
 }
 
+function cohortStressStillPlausible(row: VariantBreakdownRow): boolean {
+  if (!finite(row.grossAvgR)) return true;
+  return row.grossAvgR - 0.1 > 0;
+}
+
+function cohortIsStillExplorable(row: VariantBreakdownRow): boolean {
+  if (!row || row.n <= 0) return false;
+  if (row.n < WATCHABLE_MIN_FRESH) return true;
+  const pf = row.pf ?? null;
+  const pfOk = pf === null || !Number.isFinite(pf) || pf > PF_STRONG;
+  return finite(row.netAvgR) && row.netAvgR > 0 && pfOk && cohortStressStillPlausible(row);
+}
+
+function cohortSummary(row: VariantBreakdownRow): string {
+  const pf = row.pf ?? null;
+  const pfLabel = pf === null || !Number.isFinite(pf) ? "n/a" : pf.toFixed(2);
+  return `${row.key} ${row.n}/${WATCHABLE_MIN_FRESH} ${fmtR(row.netAvgR)} PF ${pfLabel}`;
+}
+
+function cohortSplitDisplay(
+  aggregateStatus: string | null | undefined,
+  directionRows: VariantBreakdownRow[],
+  regimeFamilyRows: VariantBreakdownRow[],
+): { status: string; reason: string; blockers: string[]; cautions: string[] } | null {
+  if (aggregateStatus !== "REJECT") return null;
+  const explorable = [...directionRows, ...regimeFamilyRows]
+    .filter(cohortIsStillExplorable)
+    .sort((a, b) => b.n - a.n)
+    .slice(0, 3);
+  if (explorable.length === 0) return null;
+  return {
+    status: "COHORT_SPLIT",
+    reason: `Aggregate VM-sim is REJECT, but ${explorable.map(cohortSummary).join("; ")} is still cohort-specific evidence. Only matching direction/regime can collect diagnostic paper until mature.`,
+    blockers: [
+      "aggregate economics are rejected; headline remains blocked",
+      "cohort-specific proof must mature independently before promotion",
+    ],
+    cautions: [
+      "This is a split verdict: diagnostic collection is allowed only for the matching positive/under-sampled cohort.",
+    ],
+  };
+}
+
 function cohortFromPaperBook(economics: ReturnType<typeof laneEconomics>): NeuralLaneCohortStats | null {
   if (economics.open <= 0 && economics.closed <= 0) return null;
   return {
@@ -1242,8 +1285,15 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
       : null;
     const paperStatus = paperBookStatus(economics);
     const pnlIsDiagnosticOnly = economics.headlineClosed === 0 && economics.diagnosticPnl !== 0;
-    const status = evidenceRow?.status ?? paperStatus.status;
-    const evidenceHealth = healthFromLane(status, evidenceRow?.freshValid ?? economics.closed, netAvgR);
+    const directionRows = evidenceRow?.byDirection ?? [];
+    const regimeFamilyRows = evidenceRow?.byRegimeFamily ?? [];
+    const cohortDisplay = evidenceRow
+      ? cohortSplitDisplay(evidenceRow.status, directionRows, regimeFamilyRows)
+      : null;
+    const status = cohortDisplay?.status ?? evidenceRow?.status ?? paperStatus.status;
+    const evidenceHealth = cohortDisplay
+      ? "WARNING"
+      : healthFromLane(status, evidenceRow?.freshValid ?? economics.closed, netAvgR);
     // Quarantined lanes are benched (no new admissions) but still measured via the VM sim, so
     // they bypass the red/green performance color (reserved for ACTIVE lanes) and show the
     // distinct QUARANTINE color. Their VM-sim evidenceHealth stays visible so improvement is
@@ -1258,11 +1308,11 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
       ? (graduationReady
           ? `Quarantined (benched) — VM-sim improving to ${fmtR(netAvgR)}; graduation candidate, watch for promotion`
           : `Quarantined (benched, no new admissions) — still collecting VM-sim evidence (${fmtR(netAvgR)})`)
-      : (evidenceRow?.statusReason ?? paperStatus.statusReason);
+      : (cohortDisplay?.reason ?? evidenceRow?.statusReason ?? paperStatus.statusReason);
     const sourceTag = statsSource === "VM_SIM" ? "[stats: VM-sim]" : "[stats: paper realized]";
     const diagTag = pnlIsDiagnosticOnly ? " [PnL: diagnostic-only — excluded from headline]" : "";
-    const directionRows = evidenceRow?.byDirection ?? [];
-    const regimeFamilyRows = evidenceRow?.byRegimeFamily ?? [];
+    const blockers = cohortDisplay?.blockers ?? evidenceRow?.blockers ?? paperStatus.blockers;
+    const cautions = cohortDisplay?.cautions ?? evidenceRow?.cautions ?? paperStatus.cautions;
     const paperBookCohort = statsSource === "PAPER_BOOK" ? cohortFromPaperBook(economics) : null;
     const paperOnlyLongCohort = id.startsWith("CG_LONG_VARIANT_MATRIX:") ? paperBookCohort : null;
     const paperOnlyShortCohort = !id.startsWith("CG_LONG_VARIANT_MATRIX:") ? paperBookCohort : null;
@@ -1303,8 +1353,8 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
       calendarDays: row?.calendarDays ?? null,
       distinctRegimes: row?.distinctRegimes ?? null,
       infraReady,
-      blockers: evidenceRow?.blockers ?? paperStatus.blockers,
-      cautions: evidenceRow?.cautions ?? paperStatus.cautions,
+      blockers,
+      cautions,
       headlinePnl: economics.headlinePnl,
       diagnosticPnl: economics.diagnosticPnl,
       totalPnl: economics.totalPnl,

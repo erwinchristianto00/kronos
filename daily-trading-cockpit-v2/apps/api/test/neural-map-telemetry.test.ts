@@ -129,6 +129,33 @@ describe("neural map telemetry", () => {
     });
   });
 
+  it("shows cohort split instead of blanket reject when a rejected aggregate has explorable cohorts", () => {
+    const input = baseInput();
+    const row = input.variantMatrix.rows[0]!;
+    row.status = "REJECT";
+    row.statusReason = "aggregate negative";
+    row.freshValid = 48;
+    row.netAvgR = -0.49;
+    row.pf = 0.31;
+    row.byDirection = [
+      { key: "LONG", n: 44, netAvgR: -0.545, grossAvgR: -0.44, pf: 0.31, wr: 0.48 },
+      { key: "SHORT", n: 4, netAvgR: 0.121, grossAvgR: 0.24, pf: null, wr: 1 },
+    ];
+    row.byRegimeFamily = [
+      { key: "MIXED", n: 8, netAvgR: 0.329, grossAvgR: 0.43, pf: null, wr: 1 },
+    ];
+
+    const lane = buildNeuralMapTelemetry(input).lanes[0]!;
+    expect(lane.status).toBe("COHORT_SPLIT");
+    expect(lane.evidenceHealth).toBe("WARNING");
+    expect(lane.reason).toContain("Aggregate VM-sim is REJECT");
+    expect(lane.reason).toContain("MIXED 8/");
+    expect(lane.reason).toContain("SHORT 4/");
+    expect(lane.blockers).toContain("cohort-specific proof must mature independently before promotion");
+    expect(lane.cohorts.SHORT?.netAvgR).toBeCloseTo(0.121, 6);
+    expect(lane.cohorts.MIXED?.netAvgR).toBeCloseTo(0.329, 6);
+  });
+
   it("colors a lane by realized profit while preserving evidence health separately", () => {
     const input = baseInput();
     input.orders = [{

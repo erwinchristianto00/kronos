@@ -43,6 +43,8 @@ import {
   type VariantMatrixSignal,
   type VariantMatrixVariantId,
   type CurrentGuardVariantMatrixReport,
+  type CurrentGuardVariantMatrixRow,
+  type VariantBreakdownRow,
 } from "./current-guard-variant-matrix.js";
 import {
   LONG_WIDE_PAPER_LANE_ID,
@@ -586,6 +588,8 @@ export function paperOpportunityStopFloorRejection(
 // Reasons surfaced as "near miss" — geometry/regime/direction ok, only economics failed.
 const NEAR_MISS_REASONS = new Set<string>([
   "ECONOMICS_REJECT",
+  "ECONOMICS_COHORT_REJECT",
+  "ECONOMICS_COHORT_COLLECTING",
   "ECONOMICS_INSUFFICIENT_SAMPLE",
   "ECONOMICS_NEGATIVE_NET",
   "ECONOMICS_PF_BELOW_FLOOR",
@@ -597,6 +601,65 @@ function isAdmissionTargetLaneId(laneId: string | null | undefined): boolean {
   return HEADLINE_VARIANT_IDS.some(
     (id) => laneId === `CG_VARIANT_MATRIX:${id}` || laneId === `CG_LONG_VARIANT_MATRIX:${id}`,
   );
+}
+
+interface LaneEconomicsCohort {
+  source: "DIRECTION" | "REGIME_FAMILY" | "AGGREGATE";
+  freshValid: number;
+  netAvgR: number | null;
+  pf: number | null;
+  plus10bpsStillPositive: boolean | null;
+  status: string | null;
+}
+
+function cohortPlusStressPass(cohort: VariantBreakdownRow): boolean | null {
+  // Breakdown rows do not carry the exact +10bps stress model. Keep them eligible only when
+  // the cohort's gross edge is positive after a conservative 0.10R stress proxy.
+  if (cohort.grossAvgR == null || !Number.isFinite(cohort.grossAvgR)) return null;
+  return cohort.grossAvgR - 0.1 > 0;
+}
+
+function laneEconomicsCohort(
+  row: CurrentGuardVariantMatrixRow,
+  direction: Direction,
+  regimeFamily: string,
+): LaneEconomicsCohort {
+  const directionRow = row.byDirection?.find((candidate) => candidate.key === direction);
+  const regimeRow = row.byRegimeFamily?.find((candidate) => candidate.key === regimeFamily);
+  const candidates = [
+    directionRow ? { source: "DIRECTION" as const, row: directionRow } : null,
+    regimeRow ? { source: "REGIME_FAMILY" as const, row: regimeRow } : null,
+  ].filter(Boolean) as Array<{ source: "DIRECTION" | "REGIME_FAMILY"; row: VariantBreakdownRow }>;
+  const mature = candidates.find((candidate) => candidate.row.n >= WATCHABLE_MIN_FRESH);
+  if (mature) {
+    return {
+      source: mature.source,
+      freshValid: mature.row.n,
+      netAvgR: mature.row.netAvgR ?? null,
+      pf: mature.row.pf ?? null,
+      plus10bpsStillPositive: cohortPlusStressPass(mature.row),
+      status: null,
+    };
+  }
+  const largest = candidates.sort((a, b) => b.row.n - a.row.n)[0];
+  if (largest && largest.row.n > 0) {
+    return {
+      source: largest.source,
+      freshValid: largest.row.n,
+      netAvgR: largest.row.netAvgR ?? null,
+      pf: largest.row.pf ?? null,
+      plus10bpsStillPositive: cohortPlusStressPass(largest.row),
+      status: null,
+    };
+  }
+  return {
+    source: "AGGREGATE",
+    freshValid: row.freshValid,
+    netAvgR: row.netAvgR,
+    pf: row.pf,
+    plus10bpsStillPositive: row.plus10bpsStillPositive,
+    status: row.status,
+  };
 }
 
 /** Cost-in-R ceiling: above this the geometry/candidate cannot pay for itself. */
@@ -1473,6 +1536,7 @@ export function buildPaperOpportunityAllocatorReport(
       }
       if (
         !PAPER_ADMISSIBLE_LANE_IDS.includes(def.id) &&
+        !challengerDiagnosticCollection &&
         !variantDiagnosticCollection &&
         !expLongMfePriorityCollection
       ) {
@@ -1519,6 +1583,7 @@ export function buildPaperOpportunityAllocatorReport(
       // Diagnostic collection paths admit regardless of the lane's own economics row (they exist
       // to COLLECT that economics honestly). Regime/direction-compat gates below still apply.
       const skipEconomics =
+        challengerDiagnosticCollection ||
         longPaperCollection ||
         longHeadlineCollection ||
         variantDiagnosticCollection ||
@@ -1562,24 +1627,52 @@ export function buildPaperOpportunityAllocatorReport(
         recordReject(symbol, direction, def.id, "LANE_NO_EVIDENCE", rowFresh, rowNet);
         continue;
       }
-      if (!skipEconomics && row!.status === "REJECT") {
-        recordReject(symbol, direction, def.id, "ECONOMICS_REJECT", rowFresh, rowNet);
+      const econ = row ? laneEconomicsCohort(row, direction, regimeFamily) : null;
+      const econFresh = econ?.freshValid ?? rowFresh;
+      const econNet = econ?.netAvgR ?? rowNet;
+      let cohortNeedsDiagnosticCollection = false;
+      if (!skipEconomics && econ!.source === "AGGREGATE" && econ!.status === "REJECT") {
+        recordReject(symbol, direction, def.id, "ECONOMICS_REJECT", econFresh, econNet);
         continue;
       }
-      if (!skipEconomics && row!.freshValid < WATCHABLE_MIN_FRESH) {
-        recordReject(symbol, direction, def.id, "ECONOMICS_INSUFFICIENT_SAMPLE", rowFresh, rowNet);
+      if (!skipEconomics && econ!.freshValid < WATCHABLE_MIN_FRESH) {
+        if (econ!.source === "AGGREGATE") {
+          recordReject(symbol, direction, def.id, "ECONOMICS_INSUFFICIENT_SAMPLE", econFresh, econNet);
+          continue;
+        }
+        cohortNeedsDiagnosticCollection = true;
+      }
+      if (!skipEconomics && !cohortNeedsDiagnosticCollection && (econ!.netAvgR ?? 0) <= 0) {
+        recordReject(
+          symbol,
+          direction,
+          def.id,
+          econ!.source === "AGGREGATE" ? "ECONOMICS_NEGATIVE_NET" : "ECONOMICS_COHORT_REJECT",
+          econFresh,
+          econNet,
+        );
         continue;
       }
-      if (!skipEconomics && (row!.netAvgR ?? 0) <= 0) {
-        recordReject(symbol, direction, def.id, "ECONOMICS_NEGATIVE_NET", rowFresh, rowNet);
+      if (!skipEconomics && !cohortNeedsDiagnosticCollection && econ!.pf !== null && Number.isFinite(econ!.pf) && econ!.pf <= PF_STRONG) {
+        recordReject(
+          symbol,
+          direction,
+          def.id,
+          econ!.source === "AGGREGATE" ? "ECONOMICS_PF_BELOW_FLOOR" : "ECONOMICS_COHORT_REJECT",
+          econFresh,
+          econNet,
+        );
         continue;
       }
-      if (!skipEconomics && row!.pf !== null && Number.isFinite(row!.pf) && row!.pf <= PF_STRONG) {
-        recordReject(symbol, direction, def.id, "ECONOMICS_PF_BELOW_FLOOR", rowFresh, rowNet);
-        continue;
-      }
-      if (!skipEconomics && row!.plus10bpsStillPositive !== true) {
-        recordReject(symbol, direction, def.id, "ECONOMICS_FAILS_PLUS10BPS_STRESS", rowFresh, rowNet);
+      if (!skipEconomics && !cohortNeedsDiagnosticCollection && econ!.plus10bpsStillPositive !== true) {
+        recordReject(
+          symbol,
+          direction,
+          def.id,
+          econ!.source === "AGGREGATE" ? "ECONOMICS_FAILS_PLUS10BPS_STRESS" : "ECONOMICS_COHORT_REJECT",
+          econFresh,
+          econNet,
+        );
         continue;
       }
       if (
@@ -1642,7 +1735,8 @@ export function buildPaperOpportunityAllocatorReport(
         !challengerDiagnosticCollection &&
         !variantDiagnosticCollection &&
         !expLongMfePriorityCollection &&
-        !cgWidePriorityCollection
+        !cgWidePriorityCollection &&
+        !cohortNeedsDiagnosticCollection
       ) {
         recordReject(symbol, direction, def.id, "ACTIVE_LANE_DEGRADED", rowFresh, rowNet);
         continue;
@@ -1656,7 +1750,7 @@ export function buildPaperOpportunityAllocatorReport(
       }
       // Per-variant per-scan cap for the full variant-matrix diagnostic collection.
       if (
-        (variantDiagnosticCollection || expLongMfePriorityCollection) &&
+        (variantDiagnosticCollection || expLongMfePriorityCollection || cohortNeedsDiagnosticCollection) &&
         (variantDiagnosticSelected.get(def.id) ?? 0) >= (
           expLongMfePriorityCollection ? expLongMfeMaxPerScan : variantMatrixDiagnosticMaxPerScan
         )
@@ -1672,7 +1766,7 @@ export function buildPaperOpportunityAllocatorReport(
         continue;
       }
       // Standing open-book caps: global total ceiling (~800) + per-symbol/per-lane concentration.
-      if (variantDiagnosticCollection || expLongMfePriorityCollection) {
+      if (variantDiagnosticCollection || expLongMfePriorityCollection || cohortNeedsDiagnosticCollection) {
         if (diagnosticOpenRunning >= PAPER_DIAGNOSTIC_MAX_OPEN_TOTAL) {
           recordReject(symbol, direction, def.id, "DIAGNOSTIC_TOTAL_OPEN_CAP_REACHED", rowFresh, rowNet);
           continue;
@@ -1688,7 +1782,7 @@ export function buildPaperOpportunityAllocatorReport(
       }
       // Auto-quarantine: a variant lane that is confidently net-negative in realized paper stops
       // admitting new orders (and renders violet). "Let it run, then bench confirmed losers."
-      if ((variantDiagnosticCollection || expLongMfePriorityCollection) && autoQuarantinedVariantLanes.has(laneId)) {
+      if ((variantDiagnosticCollection || expLongMfePriorityCollection || cohortNeedsDiagnosticCollection) && autoQuarantinedVariantLanes.has(laneId)) {
         recordReject(symbol, direction, def.id, "VARIANT_LANE_AUTO_QUARANTINED", rowFresh, rowNet);
         continue;
       }
@@ -1920,6 +2014,11 @@ export function buildPaperOpportunityAllocatorReport(
               : "VARIANT_MATRIX_DIAGNOSTIC_OOS",
           );
         }
+        if (cohortNeedsDiagnosticCollection) {
+          provenance.candidateQualityFlags.push(
+            `COHORT_DIAGNOSTIC_${direction}_${regimeFamily}_${econ?.freshValid ?? 0}_OF_${WATCHABLE_MIN_FRESH}`,
+          );
+        }
         if (manualCgWideTarget !== null) {
           provenance.candidateQualityFlags.push(`MANUAL_CG_WIDE_TP_${paperControls.cgWideTpPct?.toFixed(2)}PCT`);
         }
@@ -1977,7 +2076,7 @@ export function buildPaperOpportunityAllocatorReport(
           continue;
         }
         orderMode = "DIAGNOSTIC_ONLY";
-      } else if (expLongMfePriorityCollection || variantDiagnosticCollection) {
+      } else if (expLongMfePriorityCollection || variantDiagnosticCollection || cohortNeedsDiagnosticCollection) {
         // Full variant-matrix collection: DIAGNOSTIC_ONLY only — must be checked BEFORE the
         // HEADLINE branch so these sleeves never enter headline net/PF/WR accounting.
         if (!verdict.diagnosticEligible) {
@@ -2089,7 +2188,7 @@ export function buildPaperOpportunityAllocatorReport(
         challengerDiagnosticSelected += 1;
         report.challengerDiagnosticSelected = challengerDiagnosticSelected;
       }
-      if (variantDiagnosticCollection || expLongMfePriorityCollection) {
+      if (variantDiagnosticCollection || expLongMfePriorityCollection || cohortNeedsDiagnosticCollection) {
         variantDiagnosticSelected.set(def.id, (variantDiagnosticSelected.get(def.id) ?? 0) + 1);
         // keep the standing open-book caps accurate within this scan
         diagnosticOpenRunning += 1;
