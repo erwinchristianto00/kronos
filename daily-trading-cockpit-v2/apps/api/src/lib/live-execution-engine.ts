@@ -50,6 +50,8 @@ import {
   type RescuePositionView,
   type RescueSkip,
 } from "./regime-flip-rescue.js";
+import { fetchCrowdingSnapshot, type CrowdSide, type CrowdingState } from "./derivatives-crowding.js";
+import type { BinanceClient } from "./binance.js";
 import type { PaperOrder } from "./paper-execution-router.js";
 
 // ─── config ──────────────────────────────────────────────────────────────────
@@ -221,6 +223,26 @@ export function roundUpToStep(value: number, step: number): number {
  */
 export function roundStopToSafeSide(direction: "LONG" | "SHORT", stop: number, tickSize: number): number {
   return direction === "LONG" ? roundDownToStep(stop, tickSize) : roundUpToStep(stop, tickSize);
+}
+
+/**
+ * Crowding-gated exit SHADOW classifier (pure, no side effects). What crowding alone would
+ * recommend for a stuck `opposingDirection` position: look at the REGIME-ALIGNED side (the
+ * opposite of the stuck direction) — if that crowd is still BUILDING (funding elevated + OI
+ * rising), the move is likely to continue ⇒ CUT; if it's UNWINDING/EXHAUSTING (crowd covering /
+ * OI falling), a squeeze/bounce is more likely ⇒ HOLD (give the stuck side room to recover).
+ * Mismatched side or NEUTRAL crowding state ⇒ no strong read.
+ */
+export function crowdingExitRecommendation(
+  crowdSide: CrowdSide,
+  crowdingState: CrowdingState,
+  opposingDirection: "LONG" | "SHORT",
+): "CUT" | "HOLD" | "NEUTRAL" {
+  const regimeAlignedSide: CrowdSide = opposingDirection === "LONG" ? "SHORT" : "LONG";
+  if (crowdSide !== regimeAlignedSide) return "NEUTRAL";
+  if (crowdingState === "BUILDING") return "CUT";
+  if (crowdingState === "UNWINDING" || crowdingState === "EXHAUSTING") return "HOLD";
+  return "NEUTRAL";
 }
 
 /**
@@ -422,6 +444,26 @@ interface LiveExecutionState {
   killReason: string | null;
   /** Last regime-flip-rescue evaluation (shadow). What the rescue WOULD flip/flatten this tick. */
   lastRescuePlan: LiveRescuePlanSnapshot | null;
+  /** Crowding-gated exit SHADOW measurement, keyed by symbol. Records what the derivatives-crowding
+   *  signal WOULD recommend (CUT/HOLD/NEUTRAL) at each regime-harvest decision point, alongside what
+   *  the harvest ACTUALLY did — so agreement/disagreement can be measured before ever wiring crowding
+   *  into the real cut/hold decision. Never read by the harvest itself. */
+  crowdingExitShadow: Record<string, CrowdingExitShadowEntry>;
+}
+
+export interface CrowdingExitShadowEntry {
+  symbol: string;
+  at: string;
+  /** Direction of the stuck (opposing) intent this snapshot was taken for. */
+  intentDirection: "LONG" | "SHORT";
+  crowdSide: CrowdSide;
+  crowdingState: CrowdingState;
+  /** What crowding alone would recommend: CUT (regime-aligned crowd still building = continuation),
+   *  HOLD (regime-aligned crowd unwinding/exhausting = squeeze/bounce likely), or NEUTRAL (no read). */
+  recommendation: "CUT" | "HOLD" | "NEUTRAL";
+  /** What the harvest's OWN (unrelated) breakeven/hard-cut logic actually decided this tick, if anything. */
+  actualAction: "CUT" | "HOLD";
+  agree: boolean;
 }
 
 export interface LiveRescuePlanSnapshot {
@@ -474,6 +516,7 @@ export class LiveExecutionStore {
       killedAt: null,
       killReason: null,
       lastRescuePlan: null,
+      crowdingExitShadow: {},
     };
   }
 
@@ -554,6 +597,10 @@ export interface LiveExecutionEngineOptions {
   isPaperOrderLiveEligible?: (order: PaperOrder, nowIso: string) => boolean;
   getControllerSnapshot?: () => LiveControllerSnapshot | null;
   nowIso?: () => string;
+  /** Optional market-data client for the crowding-exit SHADOW measurement (getStatus().crowdingExitShadow).
+   *  Read-only, best-effort: never throws, never changes the harvest's actual cut/hold decision.
+   *  Omit to leave the measurement dormant (no market-data calls). */
+  marketDataClient?: Pick<BinanceClient, "getFuturesFlow">;
 }
 
 const ERROR_STREAK_DISARM = 3;
@@ -857,6 +904,7 @@ export class LiveExecutionEngine {
   private readonly isPaperOrderLiveEligible: (order: PaperOrder, nowIso: string) => boolean;
   private readonly getControllerSnapshot: () => LiveControllerSnapshot | null;
   private readonly nowIso: () => string;
+  private readonly marketDataClient?: Pick<BinanceClient, "getFuturesFlow">;
 
   /** In-memory ONLY — restart always boots disarmed. */
   private armed = false;
@@ -878,6 +926,7 @@ export class LiveExecutionEngine {
     this.isPaperOrderLiveEligible = options.isPaperOrderLiveEligible ?? (() => true);
     this.getControllerSnapshot = options.getControllerSnapshot ?? (() => null);
     this.nowIso = options.nowIso ?? (() => new Date().toISOString());
+    this.marketDataClient = options.marketDataClient;
     // Auto-arm must NOT punch through a latched kill: a restart preserves the kill until an
     // explicit resetKill(). (arm() already enforces this; the constructor path bypassed it.)
     if (this.config.autoArm && this.config.configErrors.length === 0 && !this.store.getState().killedAt) {
@@ -1101,6 +1150,9 @@ export class LiveExecutionEngine {
         config: this.config.rescue,
         lastPlan: st.lastRescuePlan,
       },
+      // Crowding-gated exit — SHADOW only (see recordCrowdingExitShadow). Per-symbol: what crowding
+      // would have recommended (CUT/HOLD) vs. what the harvest actually did, and whether they agree.
+      crowdingExitShadow: st.crowdingExitShadow,
     };
   }
 
@@ -1766,6 +1818,36 @@ export class LiveExecutionEngine {
     return null;
   }
 
+  // ── crowding-gated exit — SHADOW measurement only (never alters cut/hold) ────
+
+  /** Record what crowding WOULD have recommended for this stuck position, alongside what the harvest
+   *  actually did. Best-effort: silently no-ops without a marketDataClient or on any fetch failure —
+   *  must never affect the real cut/hold decision or throw into the harvest loop. */
+  private async recordCrowdingExitShadow(
+    symbol: string,
+    opposingDirection: "LONG" | "SHORT",
+    actualAction: "CUT" | "HOLD",
+  ): Promise<void> {
+    if (!this.marketDataClient) return;
+    try {
+      const snap = await fetchCrowdingSnapshot(this.marketDataClient, symbol, this.nowIso());
+      const recommendation = crowdingExitRecommendation(snap.crowdSide, snap.crowdingState, opposingDirection);
+      const st = this.store.getState();
+      st.crowdingExitShadow[symbol] = {
+        symbol,
+        at: this.nowIso(),
+        intentDirection: opposingDirection,
+        crowdSide: snap.crowdSide,
+        crowdingState: snap.crowdingState,
+        recommendation,
+        actualAction,
+        agree: recommendation === "NEUTRAL" ? true : recommendation === actualAction,
+      };
+    } catch {
+      // market-data hiccup — the shadow measurement can simply miss this tick
+    }
+  }
+
   // ── effective profit-protection (testnet always-on; mainnet via opt-in) ──────
   /** Regime breakeven/hard-cut harvest is active on testnet (its flag) OR mainnet (profit-protection opt-in). */
   private regimeProtectionActive(): boolean {
@@ -1853,6 +1935,11 @@ export class LiveExecutionEngine {
       const green = Number.isFinite(netAfterCost) && netAfterCost >= 0;
       // Cut RED positions ONLY when a sustained bull opposes them (hard-cut), never our own side.
       const hardCutThis = hardCut && opposingDirection !== null && intent.direction === opposingDirection;
+      // SHADOW measurement only — records what crowding would have recommended vs. what actually
+      // happens below; never read by the cut/hold decision itself.
+      if (opposingDirection !== null && intent.direction === opposingDirection) {
+        await this.recordCrowdingExitShadow(intent.symbol, opposingDirection, green || hardCutThis ? "CUT" : "HOLD");
+      }
       if (!green && !hardCutThis) continue; // red & not a sustained-opposition cut → leave to its stop
 
       const flat = await this.client.placeOrder({

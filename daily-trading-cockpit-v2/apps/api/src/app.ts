@@ -140,6 +140,9 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       config: liveConfig,
       client: liveClient,
       store: new LiveExecutionStore(),
+      // Crowding-exit SHADOW measurement only (getStatus().crowdingExitShadow) — read-only market
+      // data, never touches order placement. Reuses the same market-data client scan.ts uses.
+      marketDataClient: binanceClient,
       // "Mode 2" (REALTIME_SHORT_MIRROR_ENABLED=1): the engine mirrors ONLY the dedicated
       // real-time short store — fresh, short-only, stable-lane orders — and never the
       // measurement paper book. Flag off → unchanged (reads the normal paper book).

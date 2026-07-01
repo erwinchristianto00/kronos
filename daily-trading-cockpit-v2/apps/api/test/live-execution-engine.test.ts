@@ -17,6 +17,7 @@ import {
   LiveExecutionEngine,
   LiveExecutionStore,
   computeLiveOrderPlan,
+  crowdingExitRecommendation,
   parseLiveExecutionConfig,
   roundDownToStep,
   roundStopToSafeSide,
@@ -25,6 +26,7 @@ import {
   type LivePrivateClient,
   type PaperStoreReader,
 } from "../src/lib/live-execution-engine.js";
+import type { BinanceClient, FuturesFlowSnapshot } from "../src/lib/binance.js";
 import type { PaperOrder } from "../src/lib/paper-execution-router.js";
 
 // ── fixtures ─────────────────────────────────────────────────────────────────
@@ -288,6 +290,7 @@ function makeEngine(opts: {
   isPaperOrderLiveEligible?: (order: PaperOrder, nowIso: string) => boolean;
   getControllerSnapshot?: () => { regime: string | null; mode: string | null; capturedAt?: string | null } | null;
   nowIso?: () => string;
+  marketDataClient?: Pick<BinanceClient, "getFuturesFlow">;
 } = {}) {
   const client = opts.client ?? new FakeLiveClient();
   const store = new LiveExecutionStore(tmp());
@@ -299,6 +302,7 @@ function makeEngine(opts: {
     isPaperOrderLiveEligible: opts.isPaperOrderLiveEligible,
     getControllerSnapshot: opts.getControllerSnapshot,
     nowIso: opts.nowIso ?? (() => "2099-01-02T12:00:00.000Z"),
+    marketDataClient: opts.marketDataClient,
   });
   return { engine, client, store };
 }
@@ -1667,5 +1671,132 @@ describe("mainnet profit protection (opt-in regime harvest on real money)", () =
     expect(flat.reduceOnly).toBe(true);
     expect(flat.side).toBe("BUY"); // reduce a short
     expect(engine.getStatus().limits.regimeExitActive).toBe(true);
+  });
+});
+
+describe("crowdingExitRecommendation (pure classifier)", () => {
+  it("recommends CUT when the regime-aligned crowd is still BUILDING", () => {
+    // Stuck LONG opposing a SHORT-driving regime: the aligned side is SHORT.
+    expect(crowdingExitRecommendation("SHORT", "BUILDING", "LONG")).toBe("CUT");
+  });
+
+  it("recommends HOLD when the regime-aligned crowd is UNWINDING (squeeze/bounce likely)", () => {
+    expect(crowdingExitRecommendation("SHORT", "UNWINDING", "LONG")).toBe("HOLD");
+  });
+
+  it("recommends HOLD when the regime-aligned crowd is EXHAUSTING", () => {
+    expect(crowdingExitRecommendation("SHORT", "EXHAUSTING", "LONG")).toBe("HOLD");
+  });
+
+  it("recommends NEUTRAL when the regime-aligned crowd is NEUTRAL", () => {
+    expect(crowdingExitRecommendation("SHORT", "NEUTRAL", "LONG")).toBe("NEUTRAL");
+  });
+
+  it("recommends NEUTRAL when the crowd is on the WRONG side (not the regime-aligned side)", () => {
+    // Stuck LONG (opposing SHORT_ONLY): the crowd being LONG-side crowded says nothing about
+    // whether the SHORT-driving trend continues.
+    expect(crowdingExitRecommendation("LONG", "BUILDING", "LONG")).toBe("NEUTRAL");
+  });
+
+  it("mirrors correctly for a stuck SHORT (opposing a LONG_ONLY regime)", () => {
+    // Regime-aligned side for a stuck SHORT is LONG.
+    expect(crowdingExitRecommendation("LONG", "BUILDING", "SHORT")).toBe("CUT");
+    expect(crowdingExitRecommendation("LONG", "UNWINDING", "SHORT")).toBe("HOLD");
+    expect(crowdingExitRecommendation("SHORT", "BUILDING", "SHORT")).toBe("NEUTRAL");
+  });
+});
+
+describe("crowding-exit shadow measurement (SHADOW only — never alters cut/hold)", () => {
+  function fakeFlowClient(flow: Partial<FuturesFlowSnapshot>): Pick<BinanceClient, "getFuturesFlow"> {
+    return {
+      getFuturesFlow: async () => ({
+        fundingRate: null,
+        openInterestChangePercent: null,
+        takerBuySellRatio: null,
+        longShortRatio: null,
+        ...flow,
+      }),
+    };
+  }
+
+  it("records a CUT recommendation that AGREES with an actual hard-cut, without changing the cut", async () => {
+    // Stuck SHORT (ETHUSDT) opposing LONG_ONLY, sustained past the hard-cut window, RED.
+    let now = "2099-01-02T12:00:00.000Z";
+    const order = paperOrder(); // SHORT, ETHUSDT
+    const client = new FakeLiveClient();
+    const { engine, store } = makeEngine({
+      client,
+      paper: makePaperStore([order]),
+      nowIso: () => now,
+      config: { testnetRegimeHardCutMs: 30 * 60 * 1000 },
+      getControllerSnapshot: () => ({ regime: "Bullish expansion", mode: "LONG_ONLY", capturedAt: new Date().toISOString() }),
+      // Regime-aligned side for a stuck SHORT is LONG; LONG-side crowded + OI rising ⇒ BUILDING ⇒ CUT.
+      marketDataClient: fakeFlowClient({ fundingRate: 0.0005, openInterestChangePercent: 2 }),
+    });
+    expect((await engine.arm()).ok).toBe(true);
+    await engine.tick(); // opens the short; opposition starts at T0
+
+    client.markPriceBySymbol.set("ETHUSDT", 2100);
+    client.unrealizedPnlBySymbol.set("ETHUSDT", -2.0); // RED
+    client.flattenRealizedPnl = -2.0;
+
+    now = "2099-01-02T12:31:00.000Z"; // past the 30-min hard-cut
+    await engine.tick();
+
+    const closed = store.getState().intents[0]!;
+    expect(closed.state).toBe("CLOSED");
+    expect(closed.closeReason).toBe("REGIME_OPPOSITION_HARD_CUT_LONG_ONLY"); // the ACTUAL decision — unchanged
+
+    const shadow = engine.getStatus().crowdingExitShadow["ETHUSDT"];
+    expect(shadow).toBeDefined();
+    expect(shadow.recommendation).toBe("CUT");
+    expect(shadow.actualAction).toBe("CUT");
+    expect(shadow.agree).toBe(true);
+  });
+
+  it("records a HOLD recommendation that DISAGREES with an actual hard-cut — still cuts anyway (shadow never overrides)", async () => {
+    let now = "2099-01-02T12:00:00.000Z";
+    const order = paperOrder(); // SHORT, ETHUSDT
+    const client = new FakeLiveClient();
+    const { engine, store } = makeEngine({
+      client,
+      paper: makePaperStore([order]),
+      nowIso: () => now,
+      config: { testnetRegimeHardCutMs: 30 * 60 * 1000 },
+      getControllerSnapshot: () => ({ regime: "Bullish expansion", mode: "LONG_ONLY", capturedAt: new Date().toISOString() }),
+      // LONG-side crowded + OI falling ⇒ UNWINDING ⇒ HOLD recommendation — but the hard-cut fires anyway.
+      marketDataClient: fakeFlowClient({ fundingRate: 0.0005, openInterestChangePercent: -2 }),
+    });
+    expect((await engine.arm()).ok).toBe(true);
+    await engine.tick();
+
+    client.markPriceBySymbol.set("ETHUSDT", 2100);
+    client.unrealizedPnlBySymbol.set("ETHUSDT", -2.0);
+    client.flattenRealizedPnl = -2.0;
+
+    now = "2099-01-02T12:31:00.000Z";
+    await engine.tick();
+
+    // The REAL position is still cut on schedule — the shadow measurement changed nothing.
+    const closed = store.getState().intents[0]!;
+    expect(closed.state).toBe("CLOSED");
+    expect(closed.closeReason).toBe("REGIME_OPPOSITION_HARD_CUT_LONG_ONLY");
+
+    const shadow = engine.getStatus().crowdingExitShadow["ETHUSDT"];
+    expect(shadow.recommendation).toBe("HOLD");
+    expect(shadow.actualAction).toBe("CUT");
+    expect(shadow.agree).toBe(false);
+  });
+
+  it("stays completely dormant (no shadow entries, no calls) without a marketDataClient", async () => {
+    const order = paperOrder();
+    const { engine, store } = makeEngine({
+      paper: makePaperStore([order]),
+      getControllerSnapshot: () => ({ regime: "Bullish expansion", mode: "LONG_ONLY", capturedAt: new Date().toISOString() }),
+      // no marketDataClient
+    });
+    await engine.arm();
+    await engine.tick();
+    expect(store.getState().crowdingExitShadow).toEqual({});
   });
 });
