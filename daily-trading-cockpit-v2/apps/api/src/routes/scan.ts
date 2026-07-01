@@ -28,6 +28,7 @@ import {
   buildScanCycleSnapshot,
 } from "../lib/regime-direction-controller-snapshot.js";
 import { buildRegimeDirectionControllerReport } from "../lib/regime-direction-controller.js";
+import { getRegimeEdgeMemory } from "../lib/regime-edge-memory.js";
 import {
   buildCurrentGuardVariantMatrixReport,
   getCurrentGuardVariantMatrixStore,
@@ -398,8 +399,16 @@ export async function registerScanRoute(
             byRegimeFamily: r.byRegimeFamily,
             bySymbol: r.bySymbol,
           }));
+        // Smart direction gate (2026-07-01): hard-veto a direction whose realized, honestly-accounted
+        // edge (regimeFamily × direction) has proven non-positive at adequate sample (n>=30), unless a
+        // specific lane within it is separately proven positive (hasPositiveLane rescue). Previously
+        // this ran ONLY as a / diagnostic (buildRegimeDirectionControllerReport was called without
+        // edgeGate here) — the mirror's live/testnet order admission was never actually protected by
+        // it. Pure risk-reducer: can only narrow controllerMode (e.g. to NO_TRADE_NEGATIVE_EDGE), never
+        // widen it, so this cannot ADD a trade that wasn't already regime-permitted.
         const controllerReport = buildRegimeDirectionControllerReport({
           currentRegime: result.marketRegime,
+          edgeGate: getRegimeEdgeMemory(),
         });
         const estimatedRegime = estimateLaneSelectorV2Regime({
           regime: controllerReport.currentRegime,
