@@ -36,6 +36,7 @@ import {
 import { getLatestScanCandidates } from "./lib/latest-scan-candidates-cache.js";
 import { buildRegimeDirectionControllerReport } from "./lib/regime-direction-controller.js";
 import { getRegimeDirectionControllerSnapshotStore } from "./lib/regime-direction-controller-snapshot.js";
+import { getRegimeEdgeMemory } from "./lib/regime-edge-memory.js";
 import {
   estimateLaneSelectorV2Regime,
   isLaneSelectorV2LongWideStopOverride,
@@ -195,10 +196,16 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           scanStatus.lastAutoRefreshResultSummary?.marketRegime ??
           fallbackSnapshot?.currentRegime ??
           null;
+        // Smart direction gate wired here too (2026-07-01) so the live engine's OWN view of
+        // regime/direction (feeds the regime breakeven/hard-cut harvest + this status snapshot)
+        // stays consistent with the mode-2 mirror's admission gate (scan.ts) — both read the same
+        // process-wide edge-memory singleton, so a direction proven non-positive collapses to
+        // NO_TRADE_NEGATIVE_EDGE everywhere the engine looks, not just at entry.
         const controller = buildRegimeDirectionControllerReport({
           currentRegime: regime,
           adaptiveDirectionBias: null,
           primaryValidationLane: null,
+          edgeGate: getRegimeEdgeMemory(),
         });
         const estimatedRegime = estimateLaneSelectorV2Regime({
           regime: controller.currentRegime,
