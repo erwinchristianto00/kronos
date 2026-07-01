@@ -1,4 +1,4 @@
-import type { EntryAction, LaneId, MarketContext, Regime, TradingDecision } from "../types.js";
+import type { EntryAction, FeatureSourceMap, LaneId, MarketContext, Regime, TradingDecision } from "../types.js";
 import { buildTradingDecision } from "../decision/buildTradingDecision.js";
 import { getStrategyMode } from "../config/strategyModes.js";
 
@@ -65,6 +65,10 @@ export interface SimTrade {
   netPnl: number;
   holdMinutes: number;
   exitReason: "TP" | "SL" | "MAX_HOLD" | "END_OF_DATA";
+  takeProfitATR: number;
+  stopLossATR: number;
+  atrAtEntry: number;
+  featureSources?: FeatureSourceMap;
 }
 
 export interface RegimePerf {
@@ -168,6 +172,8 @@ interface OpenState {
   entryPrice: number;
   qty: number;
   atr: number;
+  takeProfitATR: number;
+  stopLossATR: number;
   tpPrice: number;
   slPrice: number;
   beArmATR?: number;
@@ -175,6 +181,7 @@ interface OpenState {
   entrySpreadCost: number;
   entryFee: number;
   fundingAccrued: number;
+  featureSources?: FeatureSourceMap;
 }
 
 /**
@@ -259,6 +266,10 @@ export function runBacktest(config: BacktestConfig): BacktestMetrics {
       netPnl: net,
       holdMinutes: (bar.timestamp - open.entryTs) / 60_000,
       exitReason,
+      takeProfitATR: open.takeProfitATR,
+      stopLossATR: open.stopLossATR,
+      atrAtEntry: open.atr,
+      featureSources: open.featureSources,
     });
     open = null;
   };
@@ -352,6 +363,8 @@ export function runBacktest(config: BacktestConfig): BacktestMetrics {
       entryPrice,
       qty,
       atr: bar.atr,
+      takeProfitATR: decision.exit.takeProfitATR,
+      stopLossATR: decision.exit.stopLossATR,
       tpPrice: isLong
         ? entryPrice + decision.exit.takeProfitATR * bar.atr
         : entryPrice - decision.exit.takeProfitATR * bar.atr,
@@ -361,6 +374,7 @@ export function runBacktest(config: BacktestConfig): BacktestMetrics {
       entrySpreadCost,
       entryFee,
       fundingAccrued: 0,
+      featureSources: decision.trace?.featureSources ?? bar.ctx.featureSources,
     };
     tradesToday += 1;
     tradedDays.add(d);

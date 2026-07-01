@@ -55,10 +55,24 @@ describe("buildHistoricalValidationReport", () => {
     expect(report.featureProvenance.breadthSurvivorshipBiasNote).toMatch(/current high-liquidity majors/i);
     expect(report.featureProvenance.featureSourcesSummary.fundingRiskAbnormal?.ASSUMED_BASELINE).toBeGreaterThan(0);
     expect(report.decisionDistribution.totalDecisions).toBeGreaterThan(0);
+    expect(report.decisionDistribution.coverageDays).toBeGreaterThan(0);
+    expect(report.decisionDistribution.tradesPerDay).toBeGreaterThanOrEqual(0);
+    expect(report.decisionDistribution.bearishChoppyTradesPerDay).toBeGreaterThanOrEqual(0);
     expect(report.decisionDistribution.noTradeRatio).toBeGreaterThanOrEqual(0);
+    expect(report.noTradeDiagnostics.noTradeRatio).toBe(report.decisionDistribution.noTradeRatio);
+    expect(report.noTradeDiagnostics.rejectedByCounts).toBeDefined();
+    expect(report.noTradeDiagnostics.missingFundingRiskAbnormalCount).toBe(0);
     expect(report.tradingPerformance.optimistic.feeImpact).toBeGreaterThanOrEqual(0);
     expect(report.tradingPerformance.base.spreadImpact).toBeGreaterThanOrEqual(0);
     expect(report.tradingPerformance.pessimistic.fundingAssumptionNote).toMatch(/assumed baseline/i);
+    expect(Array.isArray(report.tradeLedger)).toBe(true);
+    for (const trade of report.tradeLedger) {
+      expect(trade.symbol).toBe("BTCUSDT");
+      expect(trade.featureSourcesUsedByEntryDecision).toBeDefined();
+      expect(typeof trade.atrAtEntry).toBe("number");
+    }
+    expect(report.laneOpportunityDiagnostics.SHORT_RALLY_FADE).toBeDefined();
+    expect(report.laneOpportunityDiagnostics.BREAKDOWN_RETEST_SHORT?.blockingConditionCounts).toBeDefined();
     expect(report.strategyRejection.byScenario.pessimistic.reasons).toBeDefined();
     expect(typeof report.strategyRejection.pessimisticProfitFactorAbove1_2).toBe("boolean");
     expect(typeof report.walkForward.singlePeriodDependence).toBe("boolean");
