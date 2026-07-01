@@ -27,6 +27,28 @@ export type LaneId =
 
 export type EntryAction = "ENTER_LONG" | "ENTER_SHORT";
 
+export type Timeframe = "1m" | "5m" | "15m" | "1h" | "4h" | "1d";
+
+/**
+ * Multi-timeframe freshness budget. The feature layer stamps, per timeframe, the
+ * close time of the last candle it used and how stale that candle is allowed to
+ * be before the derived flags for that timeframe are untrustworthy. `isContextStale`
+ * (contextIntegrity.ts) compares `lastCandleCloseMs + maxStalenessMs` against
+ * `MarketContext.asOf`.
+ *
+ * TODO(freshness): today this is a single flat check. A richer future version
+ * should (a) let each LANE declare which timeframes it depends on so a stale 4H
+ * only vetoes lanes that read the 4H, and (b) distinguish "no data yet" from
+ * "data went stale" for clearer diagnostics.
+ */
+export interface TimeframeFreshness {
+  timeframe: Timeframe;
+  /** Close time (epoch ms) of the most recent candle used for this timeframe. */
+  lastCandleCloseMs: number;
+  /** Max age (ms) past the candle close before this timeframe is considered stale. */
+  maxStalenessMs: number;
+}
+
 export interface ExitConfig {
   /** Take-profit distance as a multiple of ATR. */
   takeProfitATR: number;
@@ -47,6 +69,36 @@ export interface RiskConfig {
   allowMartingale: boolean;
 }
 
+/** Which gate produced (or blocked) a decision — for logging/telemetry. */
+export type RejectedBy =
+  | "CONTRADICTORY_CONTEXT"
+  | "DATA_STALE"
+  | "REGIME_NO_TRADE"
+  | "NO_TRADE_GUARD"
+  | "RISK_GUARD"
+  | "EXECUTION_GUARD"
+  | "FORBIDDEN_LANE_HARD_GATE"
+  | "NO_VALID_LANE_SETUP";
+
+/**
+ * Structured decision log. Always attached by buildTradingDecision so every
+ * outcome (entry or stand-aside) is fully explainable after the fact. Optional on
+ * the type so decisions built by lower-level helpers still typecheck.
+ */
+export interface DecisionTrace {
+  detectedRegime: Regime;
+  selectedLane: LaneId | null;
+  /** The gate that caused a NO_TRADE (null when an entry was taken). */
+  rejectedBy: RejectedBy | null;
+  /** No-trade guard trigger codes (null when the guard did not fire). */
+  noTradeReason: string[] | null;
+  riskGuardReason: string | null;
+  /** The execution-guard reason from the last lane that was signal-valid but exec-blocked. */
+  executionGuardReason: string | null;
+  /** Contradiction codes detected in the context (empty when none). */
+  contradictions: string[];
+}
+
 export type TradingDecision =
   | {
       action: "ENTER_LONG";
@@ -54,6 +106,7 @@ export type TradingDecision =
       regime: Regime;
       exit: ExitConfig;
       risk: RiskConfig;
+      trace?: DecisionTrace;
     }
   | {
       action: "ENTER_SHORT";
@@ -61,11 +114,13 @@ export type TradingDecision =
       regime: Regime;
       exit: ExitConfig;
       risk: RiskConfig;
+      trace?: DecisionTrace;
     }
   | {
       action: "NO_TRADE";
       regime: Regime;
       reason: Record<string, unknown>;
+      trace?: DecisionTrace;
     };
 
 /**
@@ -152,6 +207,14 @@ export interface MarketContext {
   maxTradesPerDay?: number;
   maxSpreadBps?: number;
   maxSlippageBps?: number;
+
+  // ── Data freshness (multi-timeframe) ─────────────────────────────────────
+  /** Decision timestamp (epoch ms). Freshness checks compare candle ages to this. */
+  asOf?: number;
+  /** Per-timeframe last-close timestamps + staleness budgets (see TimeframeFreshness). */
+  freshness?: TimeframeFreshness[];
+  /** Coarse escape hatch: upstream may set this directly to force a no-trade. */
+  dataStale?: boolean;
 
   // ── Enrichment (filled by buildTradingDecision after detection) ──────────
   regime?: Regime;
