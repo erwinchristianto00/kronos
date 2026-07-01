@@ -35,7 +35,13 @@ const DEFAULT_CANDLE_FETCH_TIMEOUT_MS = 10_000;
 // the circuit breaker and degraded the "External Signals" node. 4s tolerates the spike
 // without meaningfully slowing the scan (the fetch is cached for 30 min anyway). Env-tunable.
 const DEFAULT_EXTERNAL_SIGNAL_FETCH_TIMEOUT_MS = Number(process.env.EXTERNAL_SIGNAL_FETCH_TIMEOUT_MS) || 4_000;
-const DEFAULT_TOTAL_SYMBOL_FETCH_TIMEOUT_MS = 15_000;
+// 2026-07-01: raised 15s -> 24s. Root-caused Kronos's 25% success rate (5/20 forecasts, 15 timeout):
+// a single real inference measured ~7.4s on the VPS, the Kronos client serializes ALL requests
+// through one global concurrency slot (KRONOS_CONCURRENCY=1 in kronos.ts — verified the model server
+// itself cannot parallelize; 3 concurrent /predict calls returned in 6.35s/12.27s/18.89s, i.e. fully
+// serial), yet queueTimeoutMs was capped at 3s — far too short for the 2nd+ symbol in the race to ever
+// get a turn. Raising the total budget gives queueTimeoutMs (below) room to cover a real ~7-8s wait.
+const DEFAULT_TOTAL_SYMBOL_FETCH_TIMEOUT_MS = 24_000;
 const DEFAULT_SYMBOL_FAILURE_RATE_THRESHOLD = 0.8;
 const DEFAULT_PROVIDER_TIMEOUT_STREAK_THRESHOLD = 2;
 const DEFAULT_PROVIDER_CIRCUIT_SKIP_SCANS = 3;
@@ -241,8 +247,12 @@ async function safeKronosPrediction(
   }
 
   try {
-    const requestTimeoutMs = Math.max(1_000, Math.min(8_000, Math.floor(symbolBudgetMs * 0.6)));
-    const queueTimeoutMs = Math.max(250, Math.min(3_000, Math.floor(symbolBudgetMs * 0.25)));
+    // requestTimeoutMs: real inference measured ~7.4s; 9.5s ceiling covers it with margin.
+    const requestTimeoutMs = Math.max(1_000, Math.min(9_500, Math.floor(symbolBudgetMs * 0.55)));
+    // queueTimeoutMs: with KRONOS_CONCURRENCY=1, a symbol 2nd-in-line must wait out the ~7.4s
+    // inference ahead of it before its own turn even starts. The old 3s ceiling killed it before
+    // that wait ever completed, regardless of budget. 10s covers one ahead-of-you inference + margin.
+    const queueTimeoutMs = Math.max(250, Math.min(10_000, Math.floor(symbolBudgetMs * 0.4)));
     return await kronosClient.predict(symbol, "1h", candles1h, {
       requestTimeoutMs,
       queueTimeoutMs,
