@@ -700,10 +700,23 @@ interface VariantMatrixStoreState {
   resolverMeta?: VariantMatrixResolverMeta;
 }
 
+function observationKey(sourceObservationKey: string, variantId: string): string {
+  return `${sourceObservationKey}::${variantId}`;
+}
+
 export class CurrentGuardVariantMatrixStore {
   private readonly file: string;
   private observations: CurrentGuardVariantMatrixObservation[];
   private resolverMetaInternal: VariantMatrixResolverMeta | null;
+  // O(1) duplicate check for hasObservation(), maintained alongside `observations`. Before this,
+  // hasObservation() did a `.some()` linear scan over the WHOLE array — fine at hundreds of obs, but
+  // mirrorVariantMatrixSignals calls it once per candidate observation, and once the store grew past
+  // ~80k (the fresh-VM-feed's higher ingestion rate), a single mirror cycle could do tens of millions
+  // of comparisons synchronously — long enough to starve the event loop's timer queue and make an
+  // `await Promise.race([x, timeout(8000)])` a few lines later actually take 200+ seconds, because the
+  // 8s setTimeout callback itself couldn't fire until the synchronous scan finished. (Observed: every
+  // operator-brief?resolve=1 cycle on / (3101) hanging 190-235s and getting aborted.)
+  private observationKeySet: Set<string>;
 
   constructor(dataDir = "data") {
     this.file = resolve(dataDir, "current-guard-variant-matrix.json");
@@ -715,6 +728,9 @@ export class CurrentGuardVariantMatrixStore {
     const loaded = this._load();
     this.observations = loaded.observations;
     this.resolverMetaInternal = loaded.resolverMeta ?? null;
+    this.observationKeySet = new Set(
+      this.observations.map((obs) => observationKey(obs.sourceObservationKey, obs.variantId)),
+    );
   }
 
   get path(): string {
@@ -766,12 +782,16 @@ export class CurrentGuardVariantMatrixStore {
 
   add(observation: CurrentGuardVariantMatrixObservation): void {
     this.observations.push(observation);
+    this.observationKeySet.add(observationKey(observation.sourceObservationKey, observation.variantId));
     this.save();
   }
 
   addMany(observations: CurrentGuardVariantMatrixObservation[]): void {
     if (observations.length === 0) return;
     this.observations.push(...observations);
+    for (const obs of observations) {
+      this.observationKeySet.add(observationKey(obs.sourceObservationKey, obs.variantId));
+    }
     this.save();
   }
 
@@ -806,9 +826,7 @@ export class CurrentGuardVariantMatrixStore {
   }
 
   hasObservation(sourceObservationKey: string, variantId: VariantMatrixVariantId): boolean {
-    return this.observations.some(
-      (obs) => obs.sourceObservationKey === sourceObservationKey && obs.variantId === variantId,
-    );
+    return this.observationKeySet.has(observationKey(sourceObservationKey, variantId));
   }
 
   /** Bound memory: EXPIRED observations only feed the diagnostic `expired` COUNT — never
@@ -825,7 +843,15 @@ export class CurrentGuardVariantMatrixStore {
       expired.sort((a, b) => tsOf(b) - tsOf(a)).slice(0, maxExpired).map((o) => o.observationId),
     );
     const before = this.observations.length;
-    this.observations = this.observations.filter((obs) => obs.status !== "EXPIRED" || keep.has(obs.observationId));
+    const dropped: CurrentGuardVariantMatrixObservation[] = [];
+    this.observations = this.observations.filter((obs) => {
+      const keepIt = obs.status !== "EXPIRED" || keep.has(obs.observationId);
+      if (!keepIt) dropped.push(obs);
+      return keepIt;
+    });
+    for (const obs of dropped) {
+      this.observationKeySet.delete(observationKey(obs.sourceObservationKey, obs.variantId));
+    }
     const pruned = before - this.observations.length;
     if (pruned > 0) this.save();
     return pruned;
@@ -1499,6 +1525,15 @@ export async function resolveVariantMatrixObservations(
   let processed = 0;
   const twoHoursMs = 2 * 60 * 60 * 1000;
   const candleCache = new Map<string, KlineTuple[]>();
+  // Phase 2 resolutions used to call store.update() per observation — an O(n) full-array
+  // JSON.stringify + writeFileSync EVERY resolution (n = total store size). Harmless when the store
+  // was small; with the fresh-feed's higher ingestion rate the store grew into the tens of thousands
+  // and a single resolver run (up to maxObservations resolutions) could do that many full-array
+  // writes back to back, blocking the whole single-threaded process for minutes (observed: a 79k-obs
+  // store on / made every request time out until the process was restarted). Accumulate patches and
+  // flush with ONE store.bulkUpdate() after the walk — same fix already applied to the Phase 1 expiry
+  // sweep, just extended to cover the resolution loop too.
+  const patches: Array<{ observationId: string; patch: Partial<CurrentGuardVariantMatrixObservation> }> = [];
 
   try {
     // ── Phase 1: cheap bulk expiry sweep (no I/O, NOT counted against the fetch budget). ──
@@ -1637,26 +1672,32 @@ export async function resolveVariantMatrixObservations(
               ? (fundingPeriods * FUNDING_BPS_PER_8H) / (obs.stopDistanceBps || WIDE_STOP_MIN_BPS)
               : 0;
           const effectiveCostR = (obs.costR ?? 0) + stopOutSlipR + fundingR;
-          store.update(obs.observationId, {
-            status: walk.status,
-            grossR,
-            costR: effectiveCostR,
-            netR: grossR - effectiveCostR,
-            resolvedAt: new Date(resolvedAtMs).toISOString(),
-            durationMinutes: durationMin,
-            maxMfeR: walk.maxMfeR,
-            minMaeR: walk.minMaeR,
-            resolutionSource: walk.resolutionSource,
-            intrabarResolutionStatus: walk.intrabarResolutionStatus,
-            isFreshValid: obs.isFreshValid, // preserve creation-time freshness; never clobber it true
+          patches.push({
+            observationId: obs.observationId,
+            patch: {
+              status: walk.status,
+              grossR,
+              costR: effectiveCostR,
+              netR: grossR - effectiveCostR,
+              resolvedAt: new Date(resolvedAtMs).toISOString(),
+              durationMinutes: durationMin,
+              maxMfeR: walk.maxMfeR,
+              minMaeR: walk.minMaeR,
+              resolutionSource: walk.resolutionSource,
+              intrabarResolutionStatus: walk.intrabarResolutionStatus,
+              isFreshValid: obs.isFreshValid, // preserve creation-time freshness; never clobber it true
+            },
           });
           resolved += 1;
         } else if (walk.status === "NO_FILL") {
-          store.update(obs.observationId, {
-            status: "NO_FILL",
-            resolvedAt: new Date(nowMs).toISOString(),
-            resolutionSource: walk.resolutionSource ?? "MAKER_NO_FILL",
-            isFreshValid: null,
+          patches.push({
+            observationId: obs.observationId,
+            patch: {
+              status: "NO_FILL",
+              resolvedAt: new Date(nowMs).toISOString(),
+              resolutionSource: walk.resolutionSource ?? "MAKER_NO_FILL",
+              isFreshValid: null,
+            },
           });
           resolved += 1;
         }
@@ -1674,6 +1715,14 @@ export async function resolveVariantMatrixObservations(
     }
   } catch {
     // outer report-only guard — never propagates
+  }
+
+  // Flush every resolution from this run in ONE write, regardless of how many resolved (see the
+  // `patches` comment above) — even if the outer try aborted partway, whatever resolved so far persists.
+  try {
+    store.bulkUpdate(patches);
+  } catch {
+    // persistence must never break the report-only resolver
   }
 
   // ── Persist resolver metadata so the report builder can surface diagnostics ──

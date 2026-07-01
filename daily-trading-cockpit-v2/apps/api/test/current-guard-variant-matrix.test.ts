@@ -899,6 +899,35 @@ describe("current-guard-variant-matrix", () => {
     expect(ids).not.toContain("exp-old1"); // older EXPIRED dropped
     expect(ids).toContain("win"); // CLOSED untouched
     expect(ids).toContain("open"); // OPEN untouched
+    // The dedup index must drop the pruned entries' keys too, or a legitimate re-mirror of the same
+    // (sourceObservationKey, variantId) would be silently blocked as a false "duplicate" forever.
+    expect(store.hasObservation("exp-old1", base.variantId)).toBe(false);
+    expect(store.hasObservation("exp-new", base.variantId)).toBe(true); // still present, still tracked
+  });
+
+  // [HASOBS-O1] hasObservation must be an O(1) index lookup, not a linear scan — a `.some()` scan
+  // over a large store (mirrorVariantMatrixSignals calls this once per candidate observation) was the
+  // root cause of operator-brief?resolve=1 hanging 190-235s on a store that had grown past ~80k obs:
+  // the synchronous scan work starved the event loop long enough that even an unrelated
+  // `Promise.race([x, setTimeout(8000)])` a few lines later couldn't fire its own timer on schedule.
+  it("[HASOBS-O1] hasObservation reflects add/addMany immediately and stays correct at scale", () => {
+    const store = new CurrentGuardVariantMatrixStore(tmpDir());
+    const base = buildVariantMatrixObservationsForSignal(makeSignal())[0]!;
+    // Seed a large store (representative of the production incident's scale) — the property under
+    // test is CORRECTNESS at this scale, not a timing assertion (which would be flaky in CI).
+    const bulk = Array.from({ length: 5000 }, (_, i) => ({
+      ...base,
+      observationId: `bulk-${i}`,
+      sourceObservationKey: `bulk-src-${i}`,
+    }));
+    store.addMany(bulk);
+    expect(store.hasObservation("bulk-src-2500", base.variantId)).toBe(true);
+    expect(store.hasObservation("never-added", base.variantId)).toBe(false);
+    expect(store.hasObservation("bulk-src-2500", "CG_WIDE_FAST_SHORT")).toBe(
+      base.variantId === "CG_WIDE_FAST_SHORT",
+    ); // wrong variantId for the same source key must not match
+    store.add({ ...base, observationId: "single-add", sourceObservationKey: "single-src" });
+    expect(store.hasObservation("single-src", base.variantId)).toBe(true);
   });
 
   // [15] Resolver meta is persisted after a run and readable from subsequent report diagnostics.
