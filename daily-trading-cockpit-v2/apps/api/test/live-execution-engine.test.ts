@@ -248,6 +248,8 @@ function makeConfig(overrides: Partial<LiveExecutionConfig> = {}): LiveExecution
     apiSecret: "s",
     riskUsdPerTrade: 5,
     maxConcurrentPositions: 3,
+    maxCorrelatedAltLongPositions: 3,
+    maxCorrelatedAltShortPositions: 3,
     dailyMaxLossUsd: 15,
     maxConsecutiveLosses: 5,
     maxDrawdownUsd: 40,
@@ -266,6 +268,7 @@ function makeConfig(overrides: Partial<LiveExecutionConfig> = {}): LiveExecution
     mainnetProfitProtection: false,
     mainnetTpR: 0,
     mainnetRegimeHardCutMs: 30 * 60 * 1000,
+    regimeLossHardCutStopFraction: 0.5,
     rescue: {
       enabled: false,
       minAgeMs: 60 * 60 * 1000,
@@ -397,6 +400,29 @@ describe("parseLiveExecutionConfig", () => {
     expect(parseLiveExecutionConfig(base).testnetRegimeExitEnabled).toBe(true);
     expect(parseLiveExecutionConfig({ ...base, LIVE_TESTNET_REGIME_EXIT: "0" }).testnetRegimeExitEnabled).toBe(false);
     expect(parseLiveExecutionConfig(base).estimatedCloseCostPct).toBeCloseTo(0.0022, 8);
+  });
+
+  it("defaults correlated-alt caps and stop-distance loss hard-cut, with env overrides", () => {
+    const base = {
+      LIVE_EXECUTION_ENABLED: "1",
+      LIVE_BINANCE_ENV: "testnet",
+      LIVE_BINANCE_API_KEY: "k",
+      LIVE_BINANCE_API_SECRET: "s",
+    };
+    const defaults = parseLiveExecutionConfig(base);
+    expect(defaults.maxCorrelatedAltLongPositions).toBe(3);
+    expect(defaults.maxCorrelatedAltShortPositions).toBe(3);
+    expect(defaults.regimeLossHardCutStopFraction).toBe(0.5);
+
+    const overridden = parseLiveExecutionConfig({
+      ...base,
+      LIVE_MAX_CORRELATED_ALT_LONGS: "2",
+      LIVE_MAX_CORRELATED_ALT_SHORTS: "4",
+      LIVE_REGIME_LOSS_HARD_CUT_STOP_FRACTION: "0.35",
+    });
+    expect(overridden.maxCorrelatedAltLongPositions).toBe(2);
+    expect(overridden.maxCorrelatedAltShortPositions).toBe(4);
+    expect(overridden.regimeLossHardCutStopFraction).toBe(0.35);
   });
 
   it("mainnet profit-protection is opt-in and mainnet-only; R-based TP parses", () => {
@@ -796,7 +822,7 @@ describe("LiveExecutionEngine", () => {
     const { engine, client, store } = makeEngine({
       paper: makePaperStore([order]),
       nowIso: () => now,
-      config: { testnetRegimeHardCutMs: 30 * 60 * 1000 }, // 30 min sustained opposition
+      config: { testnetRegimeHardCutMs: 30 * 60 * 1000, regimeLossHardCutStopFraction: 0 }, // isolate timer hard-cut
       getControllerSnapshot: () => ({ regime: "Bullish expansion", mode: "LONG_ONLY", capturedAt: new Date().toISOString() }),
     });
     expect((await engine.arm()).ok).toBe(true);
@@ -822,7 +848,7 @@ describe("LiveExecutionEngine", () => {
     const { engine, client, store } = makeEngine({
       paper: makePaperStore([order]),
       nowIso: () => now,
-      config: { testnetRegimeHardCutMs: 30 * 60 * 1000 },
+      config: { testnetRegimeHardCutMs: 30 * 60 * 1000, regimeLossHardCutStopFraction: 0 },
       getControllerSnapshot: () => ({ regime: "Bullish expansion", mode: "LONG_ONLY", capturedAt: new Date().toISOString() }),
     });
     expect((await engine.arm()).ok).toBe(true);
@@ -835,6 +861,52 @@ describe("LiveExecutionEngine", () => {
     await engine.tick();
 
     expect(store.getState().intents[0]!.state).toBe("OPEN"); // left to its stop, not cut
+    expect(client.placed.length).toBe(placedBefore);
+  });
+
+  it("opposing-regime loss hard-cut closes immediately once loss exceeds 50% of stop distance", async () => {
+    let now = "2099-01-02T12:00:00.000Z";
+    const order = paperOrder(); // SHORT, entry 2000, stop 2100.
+    const { engine, client, store } = makeEngine({
+      paper: makePaperStore([order]),
+      nowIso: () => now,
+      config: { testnetRegimeHardCutMs: 2 * 60 * 60 * 1000, regimeLossHardCutStopFraction: 0.5 },
+      getControllerSnapshot: () => ({ regime: "Bullish expansion", mode: "LONG_ONLY", capturedAt: new Date().toISOString() }),
+    });
+    expect((await engine.arm()).ok).toBe(true);
+    await engine.tick(); // opens the short; 2h timer is nowhere near elapsed.
+
+    client.markPriceBySymbol.set("ETHUSDT", 2051); // 51% of the 100-point stop distance.
+    client.unrealizedPnlBySymbol.set("ETHUSDT", -1.0);
+    client.flattenRealizedPnl = -1.0;
+    now = "2099-01-02T12:01:00.000Z";
+    await engine.tick();
+
+    const closed = store.getState().intents[0]!;
+    expect(closed.state).toBe("CLOSED");
+    expect(closed.closeReason).toBe("REGIME_OPPOSITION_LOSS_HARD_CUT_LONG_ONLY_50PCT_STOP");
+    expect(closed.realizedPnlUsd).toBeCloseTo(-1.0, 6);
+  });
+
+  it("opposing-regime loss hard-cut keeps a red position if it has not reached the stop-distance threshold", async () => {
+    let now = "2099-01-02T12:00:00.000Z";
+    const order = paperOrder(); // SHORT, entry 2000, stop 2100.
+    const { engine, client, store } = makeEngine({
+      paper: makePaperStore([order]),
+      nowIso: () => now,
+      config: { testnetRegimeHardCutMs: 2 * 60 * 60 * 1000, regimeLossHardCutStopFraction: 0.5 },
+      getControllerSnapshot: () => ({ regime: "Bullish expansion", mode: "LONG_ONLY", capturedAt: new Date().toISOString() }),
+    });
+    expect((await engine.arm()).ok).toBe(true);
+    await engine.tick();
+
+    client.markPriceBySymbol.set("ETHUSDT", 2049); // 49% of the stop distance.
+    client.unrealizedPnlBySymbol.set("ETHUSDT", -1.0);
+    const placedBefore = client.placed.length;
+    now = "2099-01-02T12:01:00.000Z";
+    await engine.tick();
+
+    expect(store.getState().intents[0]!.state).toBe("OPEN");
     expect(client.placed.length).toBe(placedBefore);
   });
 
@@ -996,6 +1068,58 @@ describe("LiveExecutionEngine", () => {
     await engine.arm();
     await engine.tick();
     expect(client.placed.filter((p) => p.type === "MARKET" && !p.reduceOnly).length).toBe(1);
+  });
+
+  it("caps correlated alt exposure per direction even when total position cap is high", async () => {
+    const symbols = ["SUIUSDT", "ADAUSDT", "AVAXUSDT", "SOLUSDT", "LINKUSDT", "ETHUSDT"];
+    const client = new FakeLiveClient();
+    client.getExchangeFilters = async () =>
+      new Map(symbols.map((symbol) => [symbol, { ...FILTERS, symbol }]));
+    const orders = [
+      paperOrder({ paperOrderId: "short-sui", symbol: "SUIUSDT", createdAt: "2099-01-02T00:00:01.000Z" } as Partial<PaperOrder>),
+      paperOrder({ paperOrderId: "short-ada", symbol: "ADAUSDT", createdAt: "2099-01-02T00:00:02.000Z" } as Partial<PaperOrder>),
+      paperOrder({ paperOrderId: "short-avax", symbol: "AVAXUSDT", createdAt: "2099-01-02T00:00:03.000Z" } as Partial<PaperOrder>),
+      paperOrder({
+        paperOrderId: "long-sol",
+        symbol: "SOLUSDT",
+        direction: "LONG",
+        stopLoss: 1900,
+        takeProfitLevels: [2100],
+        createdAt: "2099-01-02T00:00:04.000Z",
+      } as Partial<PaperOrder>),
+      paperOrder({
+        paperOrderId: "long-link",
+        symbol: "LINKUSDT",
+        direction: "LONG",
+        stopLoss: 1900,
+        takeProfitLevels: [2100],
+        createdAt: "2099-01-02T00:00:05.000Z",
+      } as Partial<PaperOrder>),
+      // Majors are not counted in the correlated-alt basket.
+      paperOrder({ paperOrderId: "short-eth", symbol: "ETHUSDT", createdAt: "2099-01-02T00:00:06.000Z" } as Partial<PaperOrder>),
+    ];
+    const { engine } = makeEngine({
+      client,
+      paper: makePaperStore(orders),
+      config: {
+        maxConcurrentPositions: 10,
+        maxCorrelatedAltShortPositions: 2,
+        maxCorrelatedAltLongPositions: 1,
+      },
+    });
+
+    await engine.arm();
+    await engine.tick();
+
+    const entries = client.placed.filter((order) => order.type === "MARKET" && !order.reduceOnly);
+    expect(entries.map((order) => `${order.symbol}:${order.side}`)).toEqual([
+      "SUIUSDT:SELL",
+      "ADAUSDT:SELL",
+      "SOLUSDT:BUY",
+      "ETHUSDT:SELL",
+    ]);
+    expect(entries.some((order) => order.symbol === "AVAXUSDT")).toBe(false);
+    expect(entries.some((order) => order.symbol === "LINKUSDT")).toBe(false);
   });
 
   it("testnet mirror-all keeps one symbol on one lane geometry instead of netting different lanes", async () => {
@@ -1294,7 +1418,14 @@ describe("LiveExecutionEngine", () => {
       paper: makePaperStore(orders),
       // Raise the daily/drawdown limits so this test isolates the CONSECUTIVE-loss breaker
       // specifically (with defaults the daily-loss breaker would trip first — also correct).
-      config: { mirrorAllPaperOrders: true, maxConcurrentPositions: 10, maxConsecutiveLosses: 5, dailyMaxLossUsd: 999, maxDrawdownUsd: 999 },
+      config: {
+        mirrorAllPaperOrders: true,
+        maxConcurrentPositions: 10,
+        maxCorrelatedAltLongPositions: 10,
+        maxConsecutiveLosses: 5,
+        dailyMaxLossUsd: 999,
+        maxDrawdownUsd: 999,
+      },
     });
     await engine.arm();
     await engine.tick(); // opens (and flattens) all six → ≥5 consecutive losses recorded
@@ -1452,7 +1583,7 @@ describe("regime-flip rescue (shadow wiring)", () => {
     client.unrealizedPnlBySymbol.set("XRPUSDT", -4.18);
     const { engine, store } = makeEngine({
       client,
-      config: { rescue: RESCUE_ON },
+      config: { rescue: RESCUE_ON, regimeLossHardCutStopFraction: 0 },
       getControllerSnapshot: () => ({ regime: "Bearish", mode: "SHORT_ONLY", capturedAt: new Date().toISOString() }),
     });
     seedStuckLong(store);
@@ -1538,7 +1669,7 @@ describe("regime-flip rescue (LIVE execution)", () => {
     client.unrealizedPnlBySymbol.set("ETHUSDT", -5);
     const { engine, store } = makeEngine({
       client,
-      config: { rescue: RESCUE_LIVE, rescueExecute: true },
+      config: { rescue: RESCUE_LIVE, rescueExecute: true, regimeLossHardCutStopFraction: 0 },
       getControllerSnapshot: SHORT_REGIME,
     });
     expect((await engine.arm()).ok).toBe(true);
@@ -1570,7 +1701,7 @@ describe("regime-flip rescue (LIVE execution)", () => {
     client.flattenRealizedPnl = 10;
     const { engine, store } = makeEngine({
       client,
-      config: { rescue: RESCUE_LIVE, rescueExecute: true },
+      config: { rescue: RESCUE_LIVE, rescueExecute: true, regimeLossHardCutStopFraction: 0 },
       getControllerSnapshot: SHORT_REGIME,
     });
     expect((await engine.arm()).ok).toBe(true);
@@ -1592,7 +1723,7 @@ describe("regime-flip rescue (LIVE execution)", () => {
     client.unrealizedPnlBySymbol.set("ETHUSDT", -5);
     const { engine, store } = makeEngine({
       client,
-      config: { rescue: RESCUE_LIVE, rescueExecute: true },
+      config: { rescue: RESCUE_LIVE, rescueExecute: true, regimeLossHardCutStopFraction: 0 },
       getControllerSnapshot: SHORT_REGIME,
     });
     // not armed
@@ -1728,7 +1859,7 @@ describe("crowding-exit shadow measurement (SHADOW only — never alters cut/hol
       client,
       paper: makePaperStore([order]),
       nowIso: () => now,
-      config: { testnetRegimeHardCutMs: 30 * 60 * 1000 },
+      config: { testnetRegimeHardCutMs: 30 * 60 * 1000, regimeLossHardCutStopFraction: 0 },
       getControllerSnapshot: () => ({ regime: "Bullish expansion", mode: "LONG_ONLY", capturedAt: new Date().toISOString() }),
       // Regime-aligned side for a stuck SHORT is LONG; LONG-side crowded + OI rising ⇒ BUILDING ⇒ CUT.
       marketDataClient: fakeFlowClient({ fundingRate: 0.0005, openInterestChangePercent: 2 }),
@@ -1762,7 +1893,7 @@ describe("crowding-exit shadow measurement (SHADOW only — never alters cut/hol
       client,
       paper: makePaperStore([order]),
       nowIso: () => now,
-      config: { testnetRegimeHardCutMs: 30 * 60 * 1000 },
+      config: { testnetRegimeHardCutMs: 30 * 60 * 1000, regimeLossHardCutStopFraction: 0 },
       getControllerSnapshot: () => ({ regime: "Bullish expansion", mode: "LONG_ONLY", capturedAt: new Date().toISOString() }),
       // LONG-side crowded + OI falling ⇒ UNWINDING ⇒ HOLD recommendation — but the hard-cut fires anyway.
       marketDataClient: fakeFlowClient({ fundingRate: 0.0005, openInterestChangePercent: -2 }),

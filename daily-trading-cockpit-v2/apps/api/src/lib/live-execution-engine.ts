@@ -65,6 +65,9 @@ export interface LiveExecutionConfig {
   apiSecret: string;
   riskUsdPerTrade: number;
   maxConcurrentPositions: number;
+  /** Correlated-alt concentration cap per direction. BTC/ETH are majors; everything else is treated as the correlated alt basket. */
+  maxCorrelatedAltLongPositions: number;
+  maxCorrelatedAltShortPositions: number;
   dailyMaxLossUsd: number;
   maxConsecutiveLosses: number;
   maxDrawdownUsd: number;
@@ -103,6 +106,8 @@ export interface LiveExecutionConfig {
   mainnetTpR: number;
   /** Mainnet anti-bleed hard-cut window (ms) for sustained counter-regime exposure; 0 disables. */
   mainnetRegimeHardCutMs: number;
+  /** Opposing-regime loss cut: close once adverse move reaches this fraction of the entry-to-stop distance. */
+  regimeLossHardCutStopFraction: number;
   /** Testnet-only regime-flip rescue (flip a stuck counter-regime position to net regime-aligned). */
   rescue: RegimeFlipRescueConfig;
   /** Testnet-only: when true the rescue PLACES orders (flip/flatten); otherwise it only shadow-evaluates.
@@ -125,6 +130,17 @@ export interface LiveControllerSnapshot {
 function envNum(raw: string | undefined, fallback: number): number {
   const n = raw === undefined ? NaN : Number.parseFloat(raw);
   return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+function envNonNegativeInt(raw: string | undefined, fallback: number): number {
+  const n = raw === undefined ? NaN : Number.parseFloat(raw);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : fallback;
+}
+
+function envFraction(raw: string | undefined, fallback: number): number {
+  const n = raw === undefined ? NaN : Number.parseFloat(raw);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(0, Math.min(1, n));
 }
 
 function boundedLeverage(value: number, maxLeverage: number): number {
@@ -160,6 +176,8 @@ export function parseLiveExecutionConfig(env: NodeJS.ProcessEnv = process.env): 
     apiSecret,
     riskUsdPerTrade: envNum(env.LIVE_RISK_USD_PER_TRADE, 5),
     maxConcurrentPositions: Math.floor(envNum(env.LIVE_MAX_CONCURRENT_POSITIONS, 3)),
+    maxCorrelatedAltLongPositions: envNonNegativeInt(env.LIVE_MAX_CORRELATED_ALT_LONGS, 3),
+    maxCorrelatedAltShortPositions: envNonNegativeInt(env.LIVE_MAX_CORRELATED_ALT_SHORTS, 3),
     dailyMaxLossUsd: envNum(env.LIVE_DAILY_MAX_LOSS_USD, 15),
     maxConsecutiveLosses: Math.floor(envNum(env.LIVE_MAX_CONSECUTIVE_LOSSES, 5)),
     maxDrawdownUsd: envNum(env.LIVE_MAX_DRAWDOWN_USD, 40),
@@ -178,6 +196,7 @@ export function parseLiveExecutionConfig(env: NodeJS.ProcessEnv = process.env): 
     mainnetProfitProtection: liveEnv === "mainnet" && env.LIVE_MAINNET_PROFIT_PROTECTION === "1",
     mainnetTpR: liveEnv === "mainnet" ? Math.max(0, Number.parseFloat(env.LIVE_MAINNET_TP_R ?? "") || 0) : 0,
     mainnetRegimeHardCutMs: liveEnv === "mainnet" ? envNum(env.LIVE_MAINNET_REGIME_HARD_CUT_MS, 30 * 60 * 1000) : 0,
+    regimeLossHardCutStopFraction: envFraction(env.LIVE_REGIME_LOSS_HARD_CUT_STOP_FRACTION, 0.5),
     rescue: parseRegimeFlipRescueConfig(env, liveEnv),
     rescueExecute:
       env.LIVE_TESTNET_RESCUE_ENABLED === "1" &&
@@ -1125,6 +1144,8 @@ export class LiveExecutionEngine {
       limits: {
         riskUsdPerTrade: this.config.riskUsdPerTrade,
         maxConcurrentPositions: this.config.maxConcurrentPositions,
+        maxCorrelatedAltLongPositions: this.config.maxCorrelatedAltLongPositions,
+        maxCorrelatedAltShortPositions: this.config.maxCorrelatedAltShortPositions,
         dailyMaxLossUsd: this.config.dailyMaxLossUsd,
         maxConsecutiveLosses: this.config.maxConsecutiveLosses,
         maxDrawdownUsd: this.config.maxDrawdownUsd,
@@ -1142,6 +1163,7 @@ export class LiveExecutionEngine {
         // Effective profit-protection regardless of env, so the dashboard shows what's actually active.
         regimeExitActive: this.regimeProtectionActive(),
         regimeHardCutMs: this.regimeHardCutMsEffective(),
+        regimeLossHardCutStopFraction: this.config.regimeLossHardCutStopFraction,
         profitBankThresholdUsd: this.profitBankThresholdUsd(),
       },
       rescue: {
@@ -1818,6 +1840,45 @@ export class LiveExecutionEngine {
     return null;
   }
 
+  private isCorrelatedAltSymbol(symbol: string): boolean {
+    const normalized = symbol.toUpperCase();
+    return normalized.endsWith("USDT") && normalized !== "BTCUSDT" && normalized !== "ETHUSDT";
+  }
+
+  private correlatedAltCap(direction: "LONG" | "SHORT"): number {
+    return direction === "LONG"
+      ? this.config.maxCorrelatedAltLongPositions
+      : this.config.maxCorrelatedAltShortPositions;
+  }
+
+  private correlatedAltOpenCounts(intents: LiveIntent[]): Record<"LONG" | "SHORT", number> {
+    const symbols: Record<"LONG" | "SHORT", Set<string>> = {
+      LONG: new Set(),
+      SHORT: new Set(),
+    };
+    for (const intent of intents) {
+      if (!OPEN_INTENT_STATES.has(intent.state)) continue;
+      if (!this.isCorrelatedAltSymbol(intent.symbol)) continue;
+      symbols[intent.direction].add(intent.symbol);
+    }
+    return {
+      LONG: symbols.LONG.size,
+      SHORT: symbols.SHORT.size,
+    };
+  }
+
+  private stopLossProgressTowardStop(intent: LiveIntent, pos: FuturesPosition): number | null {
+    const intentEntry = intent.filledEntryPrice ?? intent.plannedEntryPrice;
+    const entry = intentEntry > 0 ? intentEntry : pos.entryPrice;
+    const mark = pos.markPrice > 0 ? pos.markPrice : entry;
+    const stop = intent.stopLossPrice;
+    if (!(entry > 0) || !(mark > 0) || !(stop > 0)) return null;
+    const risk = intent.direction === "LONG" ? entry - stop : stop - entry;
+    if (!(risk > 0)) return null;
+    const adverse = intent.direction === "LONG" ? entry - mark : mark - entry;
+    return adverse / risk;
+  }
+
   // ── crowding-gated exit — SHADOW measurement only (never alters cut/hold) ────
 
   /** Record what crowding WOULD have recommended for this stuck position, alongside what the harvest
@@ -1933,14 +1994,23 @@ export class LiveExecutionEngine {
       const estimatedCloseCostUsd = this.estimatedCloseCostUsd(pos);
       const netAfterCost = pos.unRealizedProfit - estimatedCloseCostUsd;
       const green = Number.isFinite(netAfterCost) && netAfterCost >= 0;
-      // Cut RED positions ONLY when a sustained bull opposes them (hard-cut), never our own side.
+      const stopLossProgress = this.stopLossProgressTowardStop(intent, pos);
+      const lossHardCutThis =
+        opposingDirection !== null &&
+        intent.direction === opposingDirection &&
+        this.config.regimeLossHardCutStopFraction > 0 &&
+        stopLossProgress !== null &&
+        stopLossProgress >= this.config.regimeLossHardCutStopFraction;
+      // Cut RED positions ONLY when the current regime opposes them: either by sustained timer
+      // or by adverse progress to stop. The loss-progress cut protects fast flips without waiting
+      // for the time hard-cut window.
       const hardCutThis = hardCut && opposingDirection !== null && intent.direction === opposingDirection;
       // SHADOW measurement only — records what crowding would have recommended vs. what actually
       // happens below; never read by the cut/hold decision itself.
       if (opposingDirection !== null && intent.direction === opposingDirection) {
-        await this.recordCrowdingExitShadow(intent.symbol, opposingDirection, green || hardCutThis ? "CUT" : "HOLD");
+        await this.recordCrowdingExitShadow(intent.symbol, opposingDirection, green || hardCutThis || lossHardCutThis ? "CUT" : "HOLD");
       }
-      if (!green && !hardCutThis) continue; // red & not a sustained-opposition cut → leave to its stop
+      if (!green && !hardCutThis && !lossHardCutThis) continue; // red & not an opposition cut → leave to its stop
 
       const flat = await this.client.placeOrder({
         symbol: intent.symbol,
@@ -1967,7 +2037,9 @@ export class LiveExecutionEngine {
       intent.closedAt = this.nowIso();
       intent.updatedAt = this.nowIso();
       intent.closeReason = !green
-        ? `REGIME_OPPOSITION_HARD_CUT_${currentMode ?? "UNKNOWN"}`
+        ? (lossHardCutThis
+            ? `REGIME_OPPOSITION_LOSS_HARD_CUT_${currentMode ?? "UNKNOWN"}_${Math.round(this.config.regimeLossHardCutStopFraction * 100)}PCT_STOP`
+            : `REGIME_OPPOSITION_HARD_CUT_${currentMode ?? "UNKNOWN"}`)
         : controllerChanged
           ? `REGIME_CHANGE_HARVEST_${previousMode ?? previousRegime ?? "UNKNOWN"}_TO_${currentMode ?? currentRegime ?? "UNKNOWN"}`
           : `REGIME_OPPOSITION_BREAKEVEN_${currentMode ?? "UNKNOWN"}`;
@@ -2424,6 +2496,7 @@ export class LiveExecutionEngine {
       .sort((a, b) => (a.createdAt < b.createdAt ? -1 : 1));
 
     let slots = Math.max(0, this.config.maxConcurrentPositions - openCount);
+    const correlatedAltOpen = this.correlatedAltOpenCounts(st.intents);
     let maxSeen = st.lastSeenCreatedAt;
 
     const grouped = new Map<string, PaperOrder[]>();
@@ -2440,6 +2513,10 @@ export class LiveExecutionEngine {
       const oppositeIntent = openIntentsBySymbol.get(first.symbol);
       if (oppositeIntent && oppositeIntent.direction !== first.direction) continue;
       if (!oppositeIntent && slots <= 0) continue;
+      if (!oppositeIntent && this.isCorrelatedAltSymbol(first.symbol)) {
+        const cap = this.correlatedAltCap(first.direction);
+        if (correlatedAltOpen[first.direction] >= cap) continue;
+      }
       const lanePapers = oppositeIntent
         ? papers.filter((paper) => this.paperCompatibleWithIntent(oppositeIntent, paper))
         : papers.filter((paper) => this.paperGeometryKey(paper) === this.paperGeometryKey(first));
@@ -2471,6 +2548,9 @@ export class LiveExecutionEngine {
         await this.addToIntent(oppositeIntent, planned, filters);
       } else {
         await this.openIntent(planned, filters);
+        if (this.isCorrelatedAltSymbol(first.symbol)) {
+          correlatedAltOpen[first.direction] += 1;
+        }
         slots -= 1;
       }
     }
