@@ -55,6 +55,12 @@ describe("buildHistoricalValidationReport", () => {
     expect(report.featureProvenance.breadthSurvivorshipBiasNote).toMatch(/current high-liquidity majors/i);
     expect(report.featureProvenance.featureSourcesSummary.fundingRiskAbnormal?.ASSUMED_BASELINE).toBeGreaterThan(0);
     expect(report.decisionDistribution.totalDecisions).toBeGreaterThan(0);
+    expect(report.decisionDistribution.enterSignalCount).toBeGreaterThanOrEqual(report.decisionDistribution.closedTradeCount);
+    expect(report.decisionDistribution.actionableEnterSignalCount).toBeGreaterThanOrEqual(report.decisionDistribution.closedTradeCount);
+    expect(report.decisionDistribution.statefulGovernanceSuppressedSignalCount).toBeGreaterThanOrEqual(0);
+    expect(report.decisionDistribution.skippedBecauseCooldown).toBeGreaterThanOrEqual(0);
+    expect(report.decisionDistribution.skippedBecausePositionOpen).toBeGreaterThanOrEqual(0);
+    expect(report.decisionDistribution.positionManagementDecisionCount).toBeGreaterThanOrEqual(0);
     expect(report.decisionDistribution.coverageDays).toBeGreaterThan(0);
     expect(report.decisionDistribution.tradesPerDay).toBeGreaterThanOrEqual(0);
     expect(report.decisionDistribution.bearishChoppyTradesPerDay).toBeGreaterThanOrEqual(0);
@@ -73,6 +79,15 @@ describe("buildHistoricalValidationReport", () => {
     }
     expect(report.laneOpportunityDiagnostics.SHORT_RALLY_FADE).toBeDefined();
     expect(report.laneOpportunityDiagnostics.BREAKDOWN_RETEST_SHORT?.blockingConditionCounts).toBeDefined();
+    expect(report.regimeNoTradeDiagnostics.detectorBranchFailureCounts).toBeDefined();
+    expect(report.regimeNoTradeDiagnostics.dayCountByRegime).toBeDefined();
+    expect(report.regimeDenominatorDiagnostics.NO_TRADE?.decisionCount).toBeGreaterThanOrEqual(0);
+    expect(Array.isArray(report.tradeForensics)).toBe(true);
+    for (const forensic of report.tradeForensics) {
+      expect(forensic.previous3Candles.length).toBeLessThanOrEqual(3);
+      expect(forensic.next3Candles.length).toBeLessThanOrEqual(3);
+      expect(forensic.netPnlAfterCosts.afterFunding).toEqual(expect.any(Number));
+    }
     expect(report.strategyRejection.byScenario.pessimistic.reasons).toBeDefined();
     expect(typeof report.strategyRejection.pessimisticProfitFactorAbove1_2).toBe("boolean");
     expect(typeof report.walkForward.singlePeriodDependence).toBe("boolean");

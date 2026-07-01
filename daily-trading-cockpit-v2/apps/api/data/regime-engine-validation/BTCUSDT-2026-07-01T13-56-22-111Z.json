@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-07-01T13:47:13.380Z",
+  "generatedAt": "2026-07-01T13:56:23.932Z",
   "validationOnly": true,
   "dataCoverage": {
     "symbol": "BTCUSDT",
@@ -232,6 +232,15 @@
   "decisionDistribution": {
     "totalDecisions": 2160,
     "totalTrades": 4,
+    "enterSignalCount": 19,
+    "actionableEnterSignalCount": 5,
+    "statefulGovernanceSuppressedSignalCount": 14,
+    "closedTradeCount": 4,
+    "skippedBecausePositionOpen": 0,
+    "skippedBecauseCooldown": 1,
+    "skippedBecauseMaxTrades": 0,
+    "skippedBecauseExecutionGuard": 0,
+    "positionManagementDecisionCount": 4,
     "coverageDays": 90,
     "tradesPerDay": 0.044444444444444446,
     "bearishChoppyDays": 9,
@@ -1126,6 +1135,1090 @@
       "rejectedByBeforeEntry": "NO_VALID_LANE_SETUP"
     }
   ],
+  "tradeForensics": [
+    {
+      "tradeId": "BTCUSDT-1-1782320400000",
+      "entryCandleContext": {
+        "regime": "BEARISH_CHOPPY_DEFENSIVE",
+        "lane": "MICRO_MEAN_REVERSION",
+        "btcBelow60000": true,
+        "btcBelow62000": true,
+        "supportBroken": true,
+        "liquidationFlushDetected": true,
+        "rsi1h": 19.345583338111695,
+        "rsiShortTf": 11.513176830882955,
+        "spreadBps": 2,
+        "slippageBps": 2,
+        "liquiditySource": "HEURISTIC_SPREAD_VOLUME",
+        "fundingRiskAbnormal": false
+      },
+      "previous3Candles": [
+        {
+          "openTime": "2026-06-24T13:00:00.000Z",
+          "open": 62618.31,
+          "high": 62628.75,
+          "low": 61255.74,
+          "close": 61338.01
+        },
+        {
+          "openTime": "2026-06-24T14:00:00.000Z",
+          "open": 61338,
+          "high": 61456,
+          "low": 60888,
+          "close": 61113.1
+        },
+        {
+          "openTime": "2026-06-24T15:00:00.000Z",
+          "open": 61113.1,
+          "high": 61150.13,
+          "low": 60249.82,
+          "close": 60250
+        }
+      ],
+      "next3Candles": [
+        {
+          "openTime": "2026-06-24T17:00:00.000Z",
+          "open": 59850,
+          "high": 60057.18,
+          "low": 59102.7,
+          "close": 59404
+        },
+        {
+          "openTime": "2026-06-24T18:00:00.000Z",
+          "open": 59404,
+          "high": 59930,
+          "low": 59310.85,
+          "close": 59599.99
+        },
+        {
+          "openTime": "2026-06-24T19:00:00.000Z",
+          "open": 59600,
+          "high": 60000,
+          "low": 59530,
+          "close": 59958.3
+        }
+      ],
+      "previous3CloseMove": -1488.010000000002,
+      "previous3CloseMoveAtr": -2.8673869955403894,
+      "entryAfterExtendedMove": true,
+      "stopHitBy": "CLOSE",
+      "mfe": 189.22500000000582,
+      "mfeAtr": 0.36463552276607425,
+      "mae": 765.2549999999974,
+      "maeAtr": 1.4746421296041359,
+      "netPnlAfterCosts": {
+        "gross": -4.500000000000009,
+        "afterFees": -5.536036947365533,
+        "afterSpread": -5.9504517263117425,
+        "afterSlippage": -6.572073894731057,
+        "afterFunding": -6.592839633678367
+      },
+      "featureSourcesUsed": {
+        "btcBelow60000": [
+          "1h"
+        ],
+        "btcBelow62000": [
+          "1h"
+        ],
+        "btcBreaksBelow55000": [
+          "1h"
+        ],
+        "btcNotBreakingMajorSupport": [
+          "1h"
+        ],
+        "btcClose4hAbove62000": [
+          "4h"
+        ],
+        "btcCloseDailyAbove65000": [
+          "1d"
+        ],
+        "btcBelowKeyResistance": [
+          "1h",
+          "4h"
+        ],
+        "pricePullbackToVWAPOrEMA20": [
+          "1h"
+        ],
+        "rsi1h": [
+          "1h"
+        ],
+        "rsiShortTf": [
+          "15m"
+        ],
+        "rejectionCandle": [
+          "1h"
+        ],
+        "volumeWeakOnBounce": [
+          "1h"
+        ],
+        "volumeExpansion": [
+          "1h"
+        ],
+        "volumeNotDead": [
+          "1h"
+        ],
+        "priceNearLowerRange": [
+          "1h"
+        ],
+        "btcHigherLow": [
+          "1h"
+        ],
+        "higherLowFormed": [
+          "1h"
+        ],
+        "marketStructureBullish": [
+          "4h"
+        ],
+        "liquidationFlushDetected": [
+          "1h"
+        ],
+        "supportBroken": [
+          "1h"
+        ],
+        "closeBelowSupport": [
+          "1h"
+        ],
+        "supportHolds": [
+          "1h"
+        ],
+        "pullbackHolds": [
+          "1h"
+        ],
+        "pullbackToSupport": [
+          "1h"
+        ],
+        "resistanceBroken": [
+          "1h"
+        ],
+        "retestResistanceAsSupport": [
+          "1h"
+        ],
+        "retestOldSupport": [
+          "1h"
+        ],
+        "retestFailed": [
+          "1h"
+        ],
+        "retest62000Hold": [
+          "1h",
+          "4h"
+        ],
+        "btcStillWeak": [
+          "1h",
+          "4h"
+        ],
+        "ethConfirms": [
+          "1h"
+        ],
+        "coinAboveVWAP": [
+          "1h"
+        ],
+        "coinOutperformsBTC": [
+          "1h"
+        ],
+        "marketBreadthWeak": [
+          "SUPPLIED"
+        ],
+        "marketBreadthPositive": [
+          "SUPPLIED"
+        ],
+        "marketBreadthCollapses": [
+          "SUPPLIED"
+        ],
+        "breadthUniverseKind": [
+          "SUPPLIED"
+        ],
+        "breadthUniverseSnapshotMs": [
+          "SUPPLIED"
+        ],
+        "breadthUniverseDescription": [
+          "SUPPLIED"
+        ],
+        "altBreadthImproves": [
+          "SUPPLIED"
+        ],
+        "altBreadthPositive": [
+          "SUPPLIED"
+        ],
+        "liquidityGood": [
+          "HEURISTIC"
+        ],
+        "liquidityTooThin": [
+          "HEURISTIC"
+        ],
+        "liquidityTier": [
+          "SUPPLIED"
+        ],
+        "liquiditySource": [
+          "SUPPLIED"
+        ],
+        "spreadBps": [
+          "SUPPLIED"
+        ],
+        "slippageBps": [
+          "SUPPLIED"
+        ],
+        "fundingRiskAbnormal": [
+          "ASSUMED_BASELINE"
+        ],
+        "volatilityTooHigh": [
+          "SUPPLIED"
+        ],
+        "isDecisionZone": [
+          "SUPPLIED"
+        ],
+        "signalConflict": [
+          "SUPPLIED"
+        ],
+        "dailyLossPct": [
+          "GOVERNANCE"
+        ],
+        "consecutiveLosses": [
+          "GOVERNANCE"
+        ],
+        "openPositions": [
+          "GOVERNANCE"
+        ],
+        "tradesToday": [
+          "GOVERNANCE"
+        ],
+        "regimeConfidence": [
+          "GOVERNANCE"
+        ],
+        "asOf": [
+          "GOVERNANCE"
+        ],
+        "freshness": [
+          "GOVERNANCE"
+        ],
+        "dataStale": [
+          "GOVERNANCE"
+        ]
+      },
+      "heuristicFlagsInvolved": [
+        "closeBelowSupport",
+        "liquidationFlushDetected",
+        "liquidityGood",
+        "liquidityTooThin",
+        "resistanceBroken",
+        "supportBroken",
+        "supportHolds"
+      ]
+    },
+    {
+      "tradeId": "BTCUSDT-2-1782396000000",
+      "entryCandleContext": {
+        "regime": "BEARISH_CHOPPY_DEFENSIVE",
+        "lane": "MICRO_MEAN_REVERSION",
+        "btcBelow60000": true,
+        "btcBelow62000": true,
+        "supportBroken": true,
+        "liquidationFlushDetected": true,
+        "rsi1h": 23.60898639847325,
+        "rsiShortTf": 12.200802769185358,
+        "spreadBps": 2,
+        "slippageBps": 2,
+        "liquiditySource": "HEURISTIC_SPREAD_VOLUME",
+        "fundingRiskAbnormal": false
+      },
+      "previous3Candles": [
+        {
+          "openTime": "2026-06-25T10:00:00.000Z",
+          "open": 61739.29,
+          "high": 61751.07,
+          "low": 61257.79,
+          "close": 61269.94
+        },
+        {
+          "openTime": "2026-06-25T11:00:00.000Z",
+          "open": 61269.95,
+          "high": 61422.52,
+          "low": 61066,
+          "close": 61282.01
+        },
+        {
+          "openTime": "2026-06-25T12:00:00.000Z",
+          "open": 61282,
+          "high": 61761.35,
+          "low": 61080,
+          "close": 61244.01
+        }
+      ],
+      "next3Candles": [
+        {
+          "openTime": "2026-06-25T14:00:00.000Z",
+          "open": 58291.7,
+          "high": 60485.51,
+          "low": 58291.7,
+          "close": 59471.5
+        },
+        {
+          "openTime": "2026-06-25T15:00:00.000Z",
+          "open": 59471.49,
+          "high": 59655.86,
+          "low": 58874.85,
+          "close": 59557.99
+        },
+        {
+          "openTime": "2026-06-25T16:00:00.000Z",
+          "open": 59557.99,
+          "high": 60067,
+          "low": 59157.63,
+          "close": 59312.64
+        }
+      ],
+      "previous3CloseMove": -2979.770000000004,
+      "previous3CloseMoveAtr": -5.149952718501034,
+      "entryAfterExtendedMove": true,
+      "stopHitBy": null,
+      "mfe": 2177.8529490000074,
+      "mfeAtr": 3.763995112105319,
+      "mae": 15.957050999997591,
+      "maeAtr": 0.027578658143647704,
+      "netPnlAfterCosts": {
+        "gross": 2.6982199332988683,
+        "afterFees": 1.7905077971905656,
+        "afterSpread": 1.4274229427472447,
+        "afterSlippage": 0.8827956610822632,
+        "afterFunding": 0.8646684005594301
+      },
+      "featureSourcesUsed": {
+        "btcBelow60000": [
+          "1h"
+        ],
+        "btcBelow62000": [
+          "1h"
+        ],
+        "btcBreaksBelow55000": [
+          "1h"
+        ],
+        "btcNotBreakingMajorSupport": [
+          "1h"
+        ],
+        "btcClose4hAbove62000": [
+          "4h"
+        ],
+        "btcCloseDailyAbove65000": [
+          "1d"
+        ],
+        "btcBelowKeyResistance": [
+          "1h",
+          "4h"
+        ],
+        "pricePullbackToVWAPOrEMA20": [
+          "1h"
+        ],
+        "rsi1h": [
+          "1h"
+        ],
+        "rsiShortTf": [
+          "15m"
+        ],
+        "rejectionCandle": [
+          "1h"
+        ],
+        "volumeWeakOnBounce": [
+          "1h"
+        ],
+        "volumeExpansion": [
+          "1h"
+        ],
+        "volumeNotDead": [
+          "1h"
+        ],
+        "priceNearLowerRange": [
+          "1h"
+        ],
+        "btcHigherLow": [
+          "1h"
+        ],
+        "higherLowFormed": [
+          "1h"
+        ],
+        "marketStructureBullish": [
+          "4h"
+        ],
+        "liquidationFlushDetected": [
+          "1h"
+        ],
+        "supportBroken": [
+          "1h"
+        ],
+        "closeBelowSupport": [
+          "1h"
+        ],
+        "supportHolds": [
+          "1h"
+        ],
+        "pullbackHolds": [
+          "1h"
+        ],
+        "pullbackToSupport": [
+          "1h"
+        ],
+        "resistanceBroken": [
+          "1h"
+        ],
+        "retestResistanceAsSupport": [
+          "1h"
+        ],
+        "retestOldSupport": [
+          "1h"
+        ],
+        "retestFailed": [
+          "1h"
+        ],
+        "retest62000Hold": [
+          "1h",
+          "4h"
+        ],
+        "btcStillWeak": [
+          "1h",
+          "4h"
+        ],
+        "ethConfirms": [
+          "1h"
+        ],
+        "coinAboveVWAP": [
+          "1h"
+        ],
+        "coinOutperformsBTC": [
+          "1h"
+        ],
+        "marketBreadthWeak": [
+          "SUPPLIED"
+        ],
+        "marketBreadthPositive": [
+          "SUPPLIED"
+        ],
+        "marketBreadthCollapses": [
+          "SUPPLIED"
+        ],
+        "breadthUniverseKind": [
+          "SUPPLIED"
+        ],
+        "breadthUniverseSnapshotMs": [
+          "SUPPLIED"
+        ],
+        "breadthUniverseDescription": [
+          "SUPPLIED"
+        ],
+        "altBreadthImproves": [
+          "SUPPLIED"
+        ],
+        "altBreadthPositive": [
+          "SUPPLIED"
+        ],
+        "liquidityGood": [
+          "HEURISTIC"
+        ],
+        "liquidityTooThin": [
+          "HEURISTIC"
+        ],
+        "liquidityTier": [
+          "SUPPLIED"
+        ],
+        "liquiditySource": [
+          "SUPPLIED"
+        ],
+        "spreadBps": [
+          "SUPPLIED"
+        ],
+        "slippageBps": [
+          "SUPPLIED"
+        ],
+        "fundingRiskAbnormal": [
+          "ASSUMED_BASELINE"
+        ],
+        "volatilityTooHigh": [
+          "SUPPLIED"
+        ],
+        "isDecisionZone": [
+          "SUPPLIED"
+        ],
+        "signalConflict": [
+          "SUPPLIED"
+        ],
+        "dailyLossPct": [
+          "GOVERNANCE"
+        ],
+        "consecutiveLosses": [
+          "GOVERNANCE"
+        ],
+        "openPositions": [
+          "GOVERNANCE"
+        ],
+        "tradesToday": [
+          "GOVERNANCE"
+        ],
+        "regimeConfidence": [
+          "GOVERNANCE"
+        ],
+        "asOf": [
+          "GOVERNANCE"
+        ],
+        "freshness": [
+          "GOVERNANCE"
+        ],
+        "dataStale": [
+          "GOVERNANCE"
+        ]
+      },
+      "heuristicFlagsInvolved": [
+        "closeBelowSupport",
+        "liquidationFlushDetected",
+        "liquidityGood",
+        "liquidityTooThin",
+        "resistanceBroken",
+        "supportBroken",
+        "supportHolds"
+      ]
+    },
+    {
+      "tradeId": "BTCUSDT-3-1782666000000",
+      "entryCandleContext": {
+        "regime": "BEARISH_CHOPPY_DEFENSIVE",
+        "lane": "BREAKDOWN_RETEST_SHORT",
+        "btcBelow60000": true,
+        "btcBelow62000": true,
+        "supportBroken": true,
+        "retestFailed": true,
+        "liquidationFlushDetected": false,
+        "rsi1h": 36.193364359705974,
+        "rsiShortTf": 25.127668528144497,
+        "spreadBps": 2,
+        "slippageBps": 2,
+        "liquiditySource": "HEURISTIC_SPREAD_VOLUME",
+        "fundingRiskAbnormal": false
+      },
+      "previous3Candles": [
+        {
+          "openTime": "2026-06-28T13:00:00.000Z",
+          "open": 60293.5,
+          "high": 60293.51,
+          "low": 59963.86,
+          "close": 60071.88
+        },
+        {
+          "openTime": "2026-06-28T14:00:00.000Z",
+          "open": 60071.89,
+          "high": 60250,
+          "low": 60018,
+          "close": 60033
+        },
+        {
+          "openTime": "2026-06-28T15:00:00.000Z",
+          "open": 60033.01,
+          "high": 60130,
+          "low": 59817.28,
+          "close": 59890
+        }
+      ],
+      "next3Candles": [
+        {
+          "openTime": "2026-06-28T17:00:00.000Z",
+          "open": 59690.62,
+          "high": 59848,
+          "low": 59403.77,
+          "close": 59586.01
+        },
+        {
+          "openTime": "2026-06-28T18:00:00.000Z",
+          "open": 59586,
+          "high": 59700,
+          "low": 59502,
+          "close": 59614.46
+        },
+        {
+          "openTime": "2026-06-28T19:00:00.000Z",
+          "open": 59614.46,
+          "high": 59682,
+          "low": 59270.26,
+          "close": 59481.79
+        }
+      ],
+      "previous3CloseMove": -381.25999999999476,
+      "previous3CloseMoveAtr": -1.4218237224566082,
+      "entryAfterExtendedMove": true,
+      "stopHitBy": "WICK",
+      "mfe": 268.9428140000091,
+      "mfeAtr": 1.0029619496654603,
+      "mae": 175.2871859999941,
+      "maeAtr": 0.6536942750287439,
+      "netPnlAfterCosts": {
+        "gross": 0,
+        "afterFees": -3.753144048800146,
+        "afterSpread": -5.254401668320204,
+        "afterSlippage": -7.506288097600292,
+        "afterFunding": -7.581350978576295
+      },
+      "featureSourcesUsed": {
+        "btcBelow60000": [
+          "1h"
+        ],
+        "btcBelow62000": [
+          "1h"
+        ],
+        "btcBreaksBelow55000": [
+          "1h"
+        ],
+        "btcNotBreakingMajorSupport": [
+          "1h"
+        ],
+        "btcClose4hAbove62000": [
+          "4h"
+        ],
+        "btcCloseDailyAbove65000": [
+          "1d"
+        ],
+        "btcBelowKeyResistance": [
+          "1h",
+          "4h"
+        ],
+        "pricePullbackToVWAPOrEMA20": [
+          "1h"
+        ],
+        "rsi1h": [
+          "1h"
+        ],
+        "rsiShortTf": [
+          "15m"
+        ],
+        "rejectionCandle": [
+          "1h"
+        ],
+        "volumeWeakOnBounce": [
+          "1h"
+        ],
+        "volumeExpansion": [
+          "1h"
+        ],
+        "volumeNotDead": [
+          "1h"
+        ],
+        "priceNearLowerRange": [
+          "1h"
+        ],
+        "btcHigherLow": [
+          "1h"
+        ],
+        "higherLowFormed": [
+          "1h"
+        ],
+        "marketStructureBullish": [
+          "4h"
+        ],
+        "liquidationFlushDetected": [
+          "1h"
+        ],
+        "supportBroken": [
+          "1h"
+        ],
+        "closeBelowSupport": [
+          "1h"
+        ],
+        "supportHolds": [
+          "1h"
+        ],
+        "pullbackHolds": [
+          "1h"
+        ],
+        "pullbackToSupport": [
+          "1h"
+        ],
+        "resistanceBroken": [
+          "1h"
+        ],
+        "retestResistanceAsSupport": [
+          "1h"
+        ],
+        "retestOldSupport": [
+          "1h"
+        ],
+        "retestFailed": [
+          "1h"
+        ],
+        "retest62000Hold": [
+          "1h",
+          "4h"
+        ],
+        "btcStillWeak": [
+          "1h",
+          "4h"
+        ],
+        "ethConfirms": [
+          "1h"
+        ],
+        "coinAboveVWAP": [
+          "1h"
+        ],
+        "coinOutperformsBTC": [
+          "1h"
+        ],
+        "marketBreadthWeak": [
+          "SUPPLIED"
+        ],
+        "marketBreadthPositive": [
+          "SUPPLIED"
+        ],
+        "marketBreadthCollapses": [
+          "SUPPLIED"
+        ],
+        "breadthUniverseKind": [
+          "SUPPLIED"
+        ],
+        "breadthUniverseSnapshotMs": [
+          "SUPPLIED"
+        ],
+        "breadthUniverseDescription": [
+          "SUPPLIED"
+        ],
+        "altBreadthImproves": [
+          "SUPPLIED"
+        ],
+        "altBreadthPositive": [
+          "SUPPLIED"
+        ],
+        "liquidityGood": [
+          "HEURISTIC"
+        ],
+        "liquidityTooThin": [
+          "HEURISTIC"
+        ],
+        "liquidityTier": [
+          "SUPPLIED"
+        ],
+        "liquiditySource": [
+          "SUPPLIED"
+        ],
+        "spreadBps": [
+          "SUPPLIED"
+        ],
+        "slippageBps": [
+          "SUPPLIED"
+        ],
+        "fundingRiskAbnormal": [
+          "ASSUMED_BASELINE"
+        ],
+        "volatilityTooHigh": [
+          "SUPPLIED"
+        ],
+        "isDecisionZone": [
+          "SUPPLIED"
+        ],
+        "signalConflict": [
+          "SUPPLIED"
+        ],
+        "dailyLossPct": [
+          "GOVERNANCE"
+        ],
+        "consecutiveLosses": [
+          "GOVERNANCE"
+        ],
+        "openPositions": [
+          "GOVERNANCE"
+        ],
+        "tradesToday": [
+          "GOVERNANCE"
+        ],
+        "regimeConfidence": [
+          "GOVERNANCE"
+        ],
+        "asOf": [
+          "GOVERNANCE"
+        ],
+        "freshness": [
+          "GOVERNANCE"
+        ],
+        "dataStale": [
+          "GOVERNANCE"
+        ]
+      },
+      "heuristicFlagsInvolved": [
+        "closeBelowSupport",
+        "liquidationFlushDetected",
+        "liquidityGood",
+        "liquidityTooThin",
+        "resistanceBroken",
+        "retestFailed",
+        "retestOldSupport",
+        "supportBroken",
+        "supportHolds"
+      ]
+    },
+    {
+      "tradeId": "BTCUSDT-4-1782673200000",
+      "entryCandleContext": {
+        "regime": "BEARISH_CHOPPY_DEFENSIVE",
+        "lane": "BREAKDOWN_RETEST_SHORT",
+        "btcBelow60000": true,
+        "btcBelow62000": true,
+        "supportBroken": true,
+        "retestFailed": true,
+        "liquidationFlushDetected": false,
+        "rsi1h": 34.63749051952975,
+        "rsiShortTf": 23.980290507165094,
+        "spreadBps": 2,
+        "slippageBps": 2,
+        "liquiditySource": "HEURISTIC_SPREAD_VOLUME",
+        "fundingRiskAbnormal": false
+      },
+      "previous3Candles": [
+        {
+          "openTime": "2026-06-28T15:00:00.000Z",
+          "open": 60033.01,
+          "high": 60130,
+          "low": 59817.28,
+          "close": 59890
+        },
+        {
+          "openTime": "2026-06-28T16:00:00.000Z",
+          "open": 59890.35,
+          "high": 59943.9,
+          "low": 59582.34,
+          "close": 59690.62
+        },
+        {
+          "openTime": "2026-06-28T17:00:00.000Z",
+          "open": 59690.62,
+          "high": 59848,
+          "low": 59403.77,
+          "close": 59586.01
+        }
+      ],
+      "next3Candles": [
+        {
+          "openTime": "2026-06-28T19:00:00.000Z",
+          "open": 59614.46,
+          "high": 59682,
+          "low": 59270.26,
+          "close": 59481.79
+        },
+        {
+          "openTime": "2026-06-28T20:00:00.000Z",
+          "open": 59481.78,
+          "high": 59765.9,
+          "low": 59474.28,
+          "close": 59660
+        },
+        {
+          "openTime": "2026-06-28T21:00:00.000Z",
+          "open": 59660,
+          "high": 59796.66,
+          "low": 59333.33,
+          "close": 59445.95
+        }
+      ],
+      "previous3CloseMove": -275.5400000000009,
+      "previous3CloseMoveAtr": -0.9344932254837118,
+      "entryAfterExtendedMove": false,
+      "stopHitBy": "WICK",
+      "mfe": 326.3156620000009,
+      "mfeAtr": 1.1066987570161593,
+      "mae": 85.42433799999708,
+      "maeAtr": 0.28971643010970394,
+      "netPnlAfterCosts": {
+        "gross": 0,
+        "afterFees": -3.4062630310146202,
+        "afterSpread": -4.768768243420468,
+        "afterSlippage": -6.8125260620292405,
+        "afterFunding": -6.880651322649533
+      },
+      "featureSourcesUsed": {
+        "btcBelow60000": [
+          "1h"
+        ],
+        "btcBelow62000": [
+          "1h"
+        ],
+        "btcBreaksBelow55000": [
+          "1h"
+        ],
+        "btcNotBreakingMajorSupport": [
+          "1h"
+        ],
+        "btcClose4hAbove62000": [
+          "4h"
+        ],
+        "btcCloseDailyAbove65000": [
+          "1d"
+        ],
+        "btcBelowKeyResistance": [
+          "1h",
+          "4h"
+        ],
+        "pricePullbackToVWAPOrEMA20": [
+          "1h"
+        ],
+        "rsi1h": [
+          "1h"
+        ],
+        "rsiShortTf": [
+          "15m"
+        ],
+        "rejectionCandle": [
+          "1h"
+        ],
+        "volumeWeakOnBounce": [
+          "1h"
+        ],
+        "volumeExpansion": [
+          "1h"
+        ],
+        "volumeNotDead": [
+          "1h"
+        ],
+        "priceNearLowerRange": [
+          "1h"
+        ],
+        "btcHigherLow": [
+          "1h"
+        ],
+        "higherLowFormed": [
+          "1h"
+        ],
+        "marketStructureBullish": [
+          "4h"
+        ],
+        "liquidationFlushDetected": [
+          "1h"
+        ],
+        "supportBroken": [
+          "1h"
+        ],
+        "closeBelowSupport": [
+          "1h"
+        ],
+        "supportHolds": [
+          "1h"
+        ],
+        "pullbackHolds": [
+          "1h"
+        ],
+        "pullbackToSupport": [
+          "1h"
+        ],
+        "resistanceBroken": [
+          "1h"
+        ],
+        "retestResistanceAsSupport": [
+          "1h"
+        ],
+        "retestOldSupport": [
+          "1h"
+        ],
+        "retestFailed": [
+          "1h"
+        ],
+        "retest62000Hold": [
+          "1h",
+          "4h"
+        ],
+        "btcStillWeak": [
+          "1h",
+          "4h"
+        ],
+        "ethConfirms": [
+          "1h"
+        ],
+        "coinAboveVWAP": [
+          "1h"
+        ],
+        "coinOutperformsBTC": [
+          "1h"
+        ],
+        "marketBreadthWeak": [
+          "SUPPLIED"
+        ],
+        "marketBreadthPositive": [
+          "SUPPLIED"
+        ],
+        "marketBreadthCollapses": [
+          "SUPPLIED"
+        ],
+        "breadthUniverseKind": [
+          "SUPPLIED"
+        ],
+        "breadthUniverseSnapshotMs": [
+          "SUPPLIED"
+        ],
+        "breadthUniverseDescription": [
+          "SUPPLIED"
+        ],
+        "altBreadthImproves": [
+          "SUPPLIED"
+        ],
+        "altBreadthPositive": [
+          "SUPPLIED"
+        ],
+        "liquidityGood": [
+          "HEURISTIC"
+        ],
+        "liquidityTooThin": [
+          "HEURISTIC"
+        ],
+        "liquidityTier": [
+          "SUPPLIED"
+        ],
+        "liquiditySource": [
+          "SUPPLIED"
+        ],
+        "spreadBps": [
+          "SUPPLIED"
+        ],
+        "slippageBps": [
+          "SUPPLIED"
+        ],
+        "fundingRiskAbnormal": [
+          "ASSUMED_BASELINE"
+        ],
+        "volatilityTooHigh": [
+          "SUPPLIED"
+        ],
+        "isDecisionZone": [
+          "SUPPLIED"
+        ],
+        "signalConflict": [
+          "SUPPLIED"
+        ],
+        "dailyLossPct": [
+          "GOVERNANCE"
+        ],
+        "consecutiveLosses": [
+          "GOVERNANCE"
+        ],
+        "openPositions": [
+          "GOVERNANCE"
+        ],
+        "tradesToday": [
+          "GOVERNANCE"
+        ],
+        "regimeConfidence": [
+          "GOVERNANCE"
+        ],
+        "asOf": [
+          "GOVERNANCE"
+        ],
+        "freshness": [
+          "GOVERNANCE"
+        ],
+        "dataStale": [
+          "GOVERNANCE"
+        ]
+      },
+      "heuristicFlagsInvolved": [
+        "closeBelowSupport",
+        "liquidationFlushDetected",
+        "liquidityGood",
+        "liquidityTooThin",
+        "resistanceBroken",
+        "retestFailed",
+        "retestOldSupport",
+        "supportBroken",
+        "supportHolds"
+      ]
+    }
+  ],
   "noTradeDiagnostics": {
     "noTradeRatio": 0.9912037037037037,
     "noTradeCountByReason": {
@@ -1259,6 +2352,85 @@
       "netProfitFactor": 0,
       "averageNetPnl": 0,
       "averageHoldingMinutes": 0
+    }
+  },
+  "regimeNoTradeDiagnostics": {
+    "detectorBranchFailureCounts": {
+      "BEAR_TREND": 2008,
+      "TREND_RECOVERY": 2008,
+      "NEUTRAL_RECOVERY": 2008,
+      "BEARISH_CHOPPY_DEFENSIVE": 2008
+    },
+    "btcBelow60000Count": 0,
+    "btcBelow62000Count": 159,
+    "marketBreadthWeakUnavailableCount": 2008,
+    "marketBreadthWeakFalseCount": 0,
+    "missingRecoveryFlagCounts": {
+      "ethConfirms": 2008,
+      "altBreadthPositive": 2008,
+      "retest62000Hold": 1949,
+      "altBreadthImproves": 2008,
+      "volumeNotDead": 614,
+      "btcHigherLow": 943,
+      "pullbackHolds": 1370,
+      "marketStructureBullish": 1202,
+      "btcCloseDailyAbove65000": 496,
+      "btcClose4hAbove62000": 154
+    },
+    "bearishChoppyAlmostMatchedButFailedCount": 159,
+    "dayCountByRegime": {
+      "BEAR_TREND": 0,
+      "BEARISH_CHOPPY_DEFENSIVE": 9,
+      "NEUTRAL_RECOVERY": 0,
+      "TREND_RECOVERY": 0,
+      "NO_TRADE": 90
+    }
+  },
+  "regimeDenominatorDiagnostics": {
+    "BEAR_TREND": {
+      "decisionCount": 0,
+      "dayCount": 0,
+      "tradeCount": 0,
+      "tradesPerDayInRegime": 0,
+      "profitFactor": 0,
+      "winRate": 0,
+      "averagePnl": 0
+    },
+    "BEARISH_CHOPPY_DEFENSIVE": {
+      "decisionCount": 89,
+      "dayCount": 9,
+      "tradeCount": 4,
+      "tradesPerDayInRegime": 0.4444444444444444,
+      "profitFactor": 0.04106743727797852,
+      "winRate": 0.25,
+      "averagePnl": -5.047543383586191
+    },
+    "NEUTRAL_RECOVERY": {
+      "decisionCount": 0,
+      "dayCount": 0,
+      "tradeCount": 0,
+      "tradesPerDayInRegime": 0,
+      "profitFactor": 0,
+      "winRate": 0,
+      "averagePnl": 0
+    },
+    "TREND_RECOVERY": {
+      "decisionCount": 0,
+      "dayCount": 0,
+      "tradeCount": 0,
+      "tradesPerDayInRegime": 0,
+      "profitFactor": 0,
+      "winRate": 0,
+      "averagePnl": 0
+    },
+    "NO_TRADE": {
+      "decisionCount": 2071,
+      "dayCount": 90,
+      "tradeCount": 0,
+      "tradesPerDayInRegime": 0,
+      "profitFactor": 0,
+      "winRate": 0,
+      "averagePnl": 0
     }
   },
   "strategyRejection": {

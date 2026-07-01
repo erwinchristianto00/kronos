@@ -100,6 +100,15 @@ export interface FeatureProvenanceReport {
 export interface DecisionDistributionReport {
   totalDecisions: number;
   totalTrades: number;
+  enterSignalCount: number;
+  actionableEnterSignalCount: number;
+  statefulGovernanceSuppressedSignalCount: number;
+  closedTradeCount: number;
+  skippedBecausePositionOpen: number;
+  skippedBecauseCooldown: number;
+  skippedBecauseMaxTrades: number;
+  skippedBecauseExecutionGuard: number;
+  positionManagementDecisionCount: number;
   coverageDays: number;
   tradesPerDay: number;
   bearishChoppyDays: number;
@@ -164,6 +173,59 @@ export interface LaneOpportunityDiagnostics {
   averageHoldingMinutes: number;
 }
 
+export interface RegimeNoTradeDiagnosticsReport {
+  detectorBranchFailureCounts: Partial<Record<Regime, number>>;
+  btcBelow60000Count: number;
+  btcBelow62000Count: number;
+  marketBreadthWeakUnavailableCount: number;
+  marketBreadthWeakFalseCount: number;
+  missingRecoveryFlagCounts: Record<string, number>;
+  bearishChoppyAlmostMatchedButFailedCount: number;
+  dayCountByRegime: Partial<Record<Regime, number>>;
+}
+
+export interface RegimeDenominatorDiagnostics {
+  decisionCount: number;
+  dayCount: number;
+  tradeCount: number;
+  tradesPerDayInRegime: number;
+  profitFactor: number;
+  winRate: number;
+  averagePnl: number;
+}
+
+export interface CompactCandle {
+  openTime: string;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+}
+
+export interface TradeForensicSummary {
+  tradeId: string;
+  entryCandleContext: Record<string, unknown>;
+  previous3Candles: CompactCandle[];
+  next3Candles: CompactCandle[];
+  previous3CloseMove: number | null;
+  previous3CloseMoveAtr: number | null;
+  entryAfterExtendedMove: boolean;
+  stopHitBy: "WICK" | "CLOSE" | null;
+  mfe: number;
+  mfeAtr: number;
+  mae: number;
+  maeAtr: number;
+  netPnlAfterCosts: {
+    gross: number;
+    afterFees: number;
+    afterSpread: number;
+    afterSlippage: number;
+    afterFunding: number;
+  };
+  featureSourcesUsed: FeatureSourceMap | undefined;
+  heuristicFlagsInvolved: string[];
+}
+
 export interface ScenarioPerformanceReport {
   totalReturn: number;
   profitFactor: number;
@@ -197,8 +259,11 @@ export interface HistoricalValidationReport {
   decisionDistribution: DecisionDistributionReport;
   tradingPerformance: Record<BacktestCostScenarioName, ScenarioPerformanceReport>;
   tradeLedger: TradeLedgerEntry[];
+  tradeForensics: TradeForensicSummary[];
   noTradeDiagnostics: NoTradeDiagnosticsReport;
   laneOpportunityDiagnostics: Record<string, LaneOpportunityDiagnostics>;
+  regimeNoTradeDiagnostics: RegimeNoTradeDiagnosticsReport;
+  regimeDenominatorDiagnostics: Partial<Record<Regime, RegimeDenominatorDiagnostics>>;
   strategyRejection: StrategyRejectionReport;
   walkForward: {
     folds: number;
@@ -282,6 +347,53 @@ function profitFactor(wins: number, losses: number): number {
   return wins > 0 ? Infinity : 0;
 }
 
+function compactCandle(candle: Candle): CompactCandle {
+  return {
+    openTime: new Date(candle.openTime).toISOString(),
+    open: candle.open,
+    high: candle.high,
+    low: candle.low,
+    close: candle.close,
+  };
+}
+
+function regimeBranches(ctx: MarketContext): Record<Exclude<Regime, "NO_TRADE">, boolean> {
+  return {
+    BEAR_TREND: ctx.btcBreaksBelow55000 === true && ctx.retestFailed === true && ctx.marketBreadthCollapses === true,
+    TREND_RECOVERY:
+      ctx.btcCloseDailyAbove65000 === true &&
+      ctx.pullbackHolds === true &&
+      ctx.marketStructureBullish === true &&
+      ctx.ethConfirms === true &&
+      ctx.altBreadthPositive === true,
+    NEUTRAL_RECOVERY:
+      ctx.btcClose4hAbove62000 === true &&
+      ctx.retest62000Hold === true &&
+      ctx.btcHigherLow === true &&
+      ctx.ethConfirms === true &&
+      ctx.altBreadthImproves === true &&
+      ctx.volumeNotDead === true,
+    BEARISH_CHOPPY_DEFENSIVE: ctx.btcBelow60000 === true || (ctx.btcBelow62000 === true && ctx.marketBreadthWeak === true),
+  };
+}
+
+function addMissingRecoveryFlags(out: Record<string, number>, ctx: MarketContext): void {
+  for (const [name, pass] of Object.entries({
+    btcCloseDailyAbove65000: ctx.btcCloseDailyAbove65000 === true,
+    pullbackHolds: ctx.pullbackHolds === true,
+    marketStructureBullish: ctx.marketStructureBullish === true,
+    ethConfirms: ctx.ethConfirms === true,
+    altBreadthPositive: ctx.altBreadthPositive === true,
+    btcClose4hAbove62000: ctx.btcClose4hAbove62000 === true,
+    retest62000Hold: ctx.retest62000Hold === true,
+    btcHigherLow: ctx.btcHigherLow === true,
+    altBreadthImproves: ctx.altBreadthImproves === true,
+    volumeNotDead: ctx.volumeNotDead === true,
+  })) {
+    if (!pass) addCount(out, name);
+  }
+}
+
 function sourceKey(source: FeatureSource): string {
   return source;
 }
@@ -363,7 +475,15 @@ function performanceReport(metrics: BacktestMetrics, fundingSource: FundingSourc
 type LaneCondition = { name: string; pass: boolean };
 
 function laneConditions(laneId: LaneId, ctx: MarketContext): LaneCondition[] {
-  const laneFloor = { name: "lane_floor", pass: passesLaneFloor(ctx) };
+  const gateConditions = [
+    { name: "spread_gate", pass: ctx.spreadBps <= GUARD_THRESHOLDS.maxSpreadBps },
+    { name: "slippage_gate", pass: ctx.slippageBps <= GUARD_THRESHOLDS.maxSlippageBps },
+    { name: "liquidity_gate", pass: ctx.liquidityTooThin !== true },
+    { name: "funding_gate", pass: ctx.fundingRiskAbnormal !== true },
+    { name: "daily_loss_gate", pass: ctx.dailyLossPct < GUARD_THRESHOLDS.maxDailyLossPct },
+    { name: "consecutive_loss_gate", pass: ctx.consecutiveLosses < GUARD_THRESHOLDS.maxConsecutiveLosses },
+    { name: "lane_floor", pass: passesLaneFloor(ctx) },
+  ];
   switch (laneId) {
     case "SHORT_RALLY_FADE":
       return [
@@ -374,7 +494,7 @@ function laneConditions(laneId: LaneId, ctx: MarketContext): LaneCondition[] {
         { name: "rejection_candle", pass: ctx.rejectionCandle === true },
         { name: "weak_bounce_volume", pass: ctx.volumeWeakOnBounce === true },
         { name: "market_breadth_weak", pass: ctx.marketBreadthWeak === true },
-        laneFloor,
+        ...gateConditions,
       ];
     case "BREAKDOWN_RETEST_SHORT":
       return [
@@ -384,7 +504,7 @@ function laneConditions(laneId: LaneId, ctx: MarketContext): LaneCondition[] {
         { name: "retest_old_support", pass: ctx.retestOldSupport === true },
         { name: "retest_failed", pass: ctx.retestFailed === true },
         { name: "btc_still_weak", pass: ctx.btcStillWeak === true },
-        laneFloor,
+        ...gateConditions,
       ];
     case "MICRO_MEAN_REVERSION":
       return [
@@ -393,7 +513,7 @@ function laneConditions(laneId: LaneId, ctx: MarketContext): LaneCondition[] {
         { name: "rsi_short_tf_below_max", pass: typeof ctx.rsiShortTf === "number" && ctx.rsiShortTf < GUARD_THRESHOLDS.microReversionRsiMax },
         { name: "liquidation_flush_detected", pass: ctx.liquidationFlushDetected === true },
         { name: "btc_not_breaking_major_support", pass: ctx.btcNotBreakingMajorSupport === true },
-        laneFloor,
+        ...gateConditions,
       ];
     case "PULLBACK_LONG_SCALP":
       return [
@@ -403,7 +523,7 @@ function laneConditions(laneId: LaneId, ctx: MarketContext): LaneCondition[] {
         { name: "support_holds", pass: ctx.supportHolds === true },
         { name: "volume_not_dead", pass: ctx.volumeNotDead === true },
         { name: "market_breadth_positive", pass: ctx.marketBreadthPositive === true },
-        laneFloor,
+        ...gateConditions,
       ];
     case "BREAKOUT_RETEST_LONG":
       return [
@@ -413,7 +533,7 @@ function laneConditions(laneId: LaneId, ctx: MarketContext): LaneCondition[] {
         { name: "higher_low_formed", pass: ctx.higherLowFormed === true },
         { name: "market_breadth_positive", pass: ctx.marketBreadthPositive === true },
         { name: "volume_expansion", pass: ctx.volumeExpansion === true },
-        laneFloor,
+        ...gateConditions,
       ];
     case "RELATIVE_STRENGTH_LONG":
       return [
@@ -423,7 +543,7 @@ function laneConditions(laneId: LaneId, ctx: MarketContext): LaneCondition[] {
         { name: "coin_above_vwap", pass: ctx.coinAboveVWAP === true },
         { name: "volume_expansion", pass: ctx.volumeExpansion === true },
         { name: "liquidity_good", pass: ctx.liquidityGood === true },
-        laneFloor,
+        ...gateConditions,
       ];
     default:
       return [];
@@ -512,6 +632,130 @@ function buildTradeLedger(
   }));
 }
 
+function buildRegimeDenominators(
+  decisionCountByRegime: Partial<Record<Regime, number>>,
+  dayKeysByRegime: Record<Regime, Set<number>>,
+  metrics: BacktestMetrics,
+): Partial<Record<Regime, RegimeDenominatorDiagnostics>> {
+  const out: Partial<Record<Regime, RegimeDenominatorDiagnostics>> = {};
+  for (const regime of ["BEAR_TREND", "BEARISH_CHOPPY_DEFENSIVE", "NEUTRAL_RECOVERY", "TREND_RECOVERY", "NO_TRADE"] as Regime[]) {
+    const trades = metrics.trades.filter((trade) => trade.regime === regime);
+    const wins = trades.filter((trade) => trade.netPnl > 0);
+    const losses = trades.filter((trade) => trade.netPnl <= 0);
+    const grossWin = wins.reduce((sum, trade) => sum + trade.netPnl, 0);
+    const grossLoss = losses.reduce((sum, trade) => sum + trade.netPnl, 0);
+    const dayCount = dayKeysByRegime[regime].size;
+    out[regime] = {
+      decisionCount: decisionCountByRegime[regime] ?? 0,
+      dayCount,
+      tradeCount: trades.length,
+      tradesPerDayInRegime: dayCount > 0 ? trades.length / dayCount : 0,
+      profitFactor: profitFactor(grossWin, grossLoss),
+      winRate: trades.length ? wins.length / trades.length : 0,
+      averagePnl: trades.length ? trades.reduce((sum, trade) => sum + trade.netPnl, 0) / trades.length : 0,
+    };
+  }
+  return out;
+}
+
+function heuristicFlags(featureSources: FeatureSourceMap | undefined, ctx: MarketContext | undefined): string[] {
+  const heuristicBySource = Object.entries(featureSources ?? {})
+    .filter(([name, sources]) => sources?.includes("HEURISTIC") && ctx?.[name as keyof MarketContext] !== undefined)
+    .map(([name]) => name);
+  const heuristicByDerivation = [
+    "supportBroken",
+    "closeBelowSupport",
+    "supportHolds",
+    "retestOldSupport",
+    "retestFailed",
+    "resistanceBroken",
+    "retestResistanceAsSupport",
+    "liquidationFlushDetected",
+  ].filter((name) => featureSources?.[name as keyof MarketContext] && ctx?.[name as keyof MarketContext] !== undefined);
+  return [...new Set([...heuristicBySource, ...heuristicByDerivation])].sort();
+}
+
+function buildTradeForensics(
+  symbol: string,
+  metrics: BacktestMetrics,
+  candles: Candle[],
+  contextsByTimestamp: Map<number, MarketContext>,
+): TradeForensicSummary[] {
+  return metrics.trades.map((trade, index) => {
+    const entryIndex = candles.findIndex((candle) => closeTime(candle, "1h") === trade.entryTs);
+    const exitIndex = candles.findIndex((candle) => closeTime(candle, "1h") === trade.exitTs);
+    const entryCandle = candles[Math.max(0, entryIndex)]!;
+    const life = candles.filter((candle) => closeTime(candle, "1h") > trade.entryTs && closeTime(candle, "1h") <= trade.exitTs);
+    const observed = life.length ? life : entryCandle ? [entryCandle] : [];
+    const side = trade.action === "ENTER_LONG" ? "LONG" : "SHORT";
+    const highs = observed.map((candle) => candle.high);
+    const lows = observed.map((candle) => candle.low);
+    const mfe = side === "LONG" ? Math.max(...highs) - trade.entryPrice : trade.entryPrice - Math.min(...lows);
+    const mae = side === "LONG" ? trade.entryPrice - Math.min(...lows) : Math.max(...highs) - trade.entryPrice;
+    const previous3 = entryIndex >= 0 ? candles.slice(Math.max(0, entryIndex - 3), entryIndex) : [];
+    const next3 = entryIndex >= 0 ? candles.slice(entryIndex + 1, entryIndex + 4) : [];
+    const previous3CloseMove = previous3.length
+      ? entryCandle.close - previous3[0]!.close
+      : null;
+    const previous3CloseMoveAtr =
+      previous3CloseMove !== null && trade.atrAtEntry > 0 ? previous3CloseMove / trade.atrAtEntry : null;
+    const exitCandle = exitIndex >= 0 ? candles[exitIndex] : undefined;
+    const stopHitBy =
+      trade.exitReason === "SL" && exitCandle
+        ? side === "LONG"
+          ? exitCandle.close <= trade.exitPrice
+            ? "CLOSE"
+            : "WICK"
+          : exitCandle.close >= trade.exitPrice
+            ? "CLOSE"
+            : "WICK"
+        : null;
+    const afterFees = trade.grossPnl - trade.fees;
+    const afterSpread = afterFees - trade.spreadCost;
+    const afterSlippage = afterSpread - trade.slippageCost;
+    const ctx = contextsByTimestamp.get(trade.entryTs);
+
+    return {
+      tradeId: `${symbol}-${index + 1}-${trade.entryTs}`,
+      entryCandleContext: {
+        regime: trade.regime,
+        lane: trade.lane,
+        btcBelow60000: ctx?.btcBelow60000,
+        btcBelow62000: ctx?.btcBelow62000,
+        marketBreadthWeak: ctx?.marketBreadthWeak,
+        supportBroken: ctx?.supportBroken,
+        retestFailed: ctx?.retestFailed,
+        liquidationFlushDetected: ctx?.liquidationFlushDetected,
+        rsi1h: ctx?.rsi1h,
+        rsiShortTf: ctx?.rsiShortTf,
+        spreadBps: ctx?.spreadBps,
+        slippageBps: ctx?.slippageBps,
+        liquiditySource: ctx?.liquiditySource,
+        fundingRiskAbnormal: ctx?.fundingRiskAbnormal,
+      },
+      previous3Candles: previous3.map(compactCandle),
+      next3Candles: next3.map(compactCandle),
+      previous3CloseMove,
+      previous3CloseMoveAtr,
+      entryAfterExtendedMove: previous3CloseMoveAtr !== null ? Math.abs(previous3CloseMoveAtr) >= 1 : false,
+      stopHitBy,
+      mfe,
+      mfeAtr: trade.atrAtEntry > 0 ? mfe / trade.atrAtEntry : 0,
+      mae,
+      maeAtr: trade.atrAtEntry > 0 ? mae / trade.atrAtEntry : 0,
+      netPnlAfterCosts: {
+        gross: trade.grossPnl,
+        afterFees,
+        afterSpread,
+        afterSlippage,
+        afterFunding: trade.netPnl,
+      },
+      featureSourcesUsed: trade.featureSources,
+      heuristicFlagsInvolved: heuristicFlags(trade.featureSources, ctx),
+    };
+  });
+}
+
 export function buildHistoricalValidationReport(input: HistoricalValidationInput): HistoricalValidationReport {
   const candles = {
     m15: sortCandles(input.candles.m15 ?? []),
@@ -526,14 +770,24 @@ export function buildHistoricalValidationReport(input: HistoricalValidationInput
 
   const bars: BacktestBar[] = [];
   const contexts: MarketContext[] = [];
+  const contextsByTimestamp = new Map<number, MarketContext>();
   const decisionCountByRegime: Partial<Record<Regime, number>> = {};
   const decisionCountByLane: Record<string, number> = {};
   const rejectedByCounts: Record<string, number> = {};
   const noTradeCountByReason: Record<string, number> = {};
   const bearishChoppyDayKeys = new Set<number>();
+  const dayKeysByRegime: Record<Regime, Set<number>> = {
+    BEAR_TREND: new Set<number>(),
+    BEARISH_CHOPPY_DEFENSIVE: new Set<number>(),
+    NEUTRAL_RECOVERY: new Set<number>(),
+    TREND_RECOVERY: new Set<number>(),
+    NO_TRADE: new Set<number>(),
+  };
   const rejectedByBeforeEntry = new Map<number, string | null>();
   const laneDiagnostics = emptyLaneDiagnostics();
   const featureSourcesSummary: Record<string, Record<string, number>> = {};
+  const regimeNoTradeFailedBranches: Partial<Record<Regime, number>> = {};
+  const missingRecoveryFlagCounts: Record<string, number> = {};
   let lastRejectedBy: string | null = null;
   let closedCandleFilterCount = 0;
   let contradictionCount = 0;
@@ -542,6 +796,12 @@ export function buildHistoricalValidationReport(input: HistoricalValidationInput
   let missingFundingRiskAbnormalCount = 0;
   let liquidityTooThinCount = 0;
   let noValidLaneSetupCount = 0;
+  let noTradeBtcBelow60000Count = 0;
+  let noTradeBtcBelow62000Count = 0;
+  let noTradeMarketBreadthWeakUnavailableCount = 0;
+  let noTradeMarketBreadthWeakFalseCount = 0;
+  let bearishChoppyAlmostMatchedButFailedCount = 0;
+  let rawEnterSignalCount = 0;
 
   for (let i = 0; i < candles.h1.length; i += decisionEveryBars) {
     const bar = candles.h1[i]!;
@@ -573,11 +833,28 @@ export function buildHistoricalValidationReport(input: HistoricalValidationInput
       },
     });
     contexts.push(ctx);
+    contextsByTimestamp.set(asOf, ctx);
 
     const decision = buildTradingDecision(ctx);
     addCount(decisionCountByRegime as Record<string, number>, decision.regime);
     addCount(decisionCountByLane, decision.action === "NO_TRADE" ? "NO_TRADE" : decision.lane);
+    if (decision.action !== "NO_TRADE") rawEnterSignalCount += 1;
+    dayKeysByRegime[decision.regime].add(dayKey(asOf));
     if (decision.regime === "BEARISH_CHOPPY_DEFENSIVE") bearishChoppyDayKeys.add(dayKey(asOf));
+    if (decision.trace?.rejectedBy === "REGIME_NO_TRADE") {
+      const branches = regimeBranches(ctx);
+      for (const [regime, matched] of Object.entries(branches)) {
+        if (!matched) addCount(regimeNoTradeFailedBranches as Record<string, number>, regime);
+      }
+      if (ctx.btcBelow60000 === true) noTradeBtcBelow60000Count += 1;
+      if (ctx.btcBelow62000 === true) noTradeBtcBelow62000Count += 1;
+      if (ctx.marketBreadthWeak === undefined) noTradeMarketBreadthWeakUnavailableCount += 1;
+      if (ctx.marketBreadthWeak === false) noTradeMarketBreadthWeakFalseCount += 1;
+      if (ctx.btcBelow62000 === true && ctx.btcBelow60000 !== true && ctx.marketBreadthWeak !== true) {
+        bearishChoppyAlmostMatchedButFailedCount += 1;
+      }
+      addMissingRecoveryFlags(missingRecoveryFlagCounts, ctx);
+    }
     if (ctx.liquidityTooThin === true) liquidityTooThinCount += 1;
     if (decision.trace?.rejectedBy) addCount(rejectedByCounts, decision.trace.rejectedBy);
     if (decision.trace?.rejectedBy === "MISSING_EXECUTION_DATA") missingExecutionDataCount += 1;
@@ -662,6 +939,15 @@ export function buildHistoricalValidationReport(input: HistoricalValidationInput
     decisionDistribution: {
       totalDecisions: bars.length,
       totalTrades: baseMetrics.numTrades,
+      enterSignalCount: rawEnterSignalCount,
+      actionableEnterSignalCount: baseMetrics.diagnostics.enterSignalCount,
+      statefulGovernanceSuppressedSignalCount: Math.max(0, rawEnterSignalCount - baseMetrics.diagnostics.enterSignalCount),
+      closedTradeCount: baseMetrics.diagnostics.closedTradeCount,
+      skippedBecausePositionOpen: baseMetrics.diagnostics.skippedBecausePositionOpen,
+      skippedBecauseCooldown: baseMetrics.diagnostics.skippedBecauseCooldown,
+      skippedBecauseMaxTrades: baseMetrics.diagnostics.skippedBecauseMaxTrades,
+      skippedBecauseExecutionGuard: baseMetrics.diagnostics.skippedBecauseExecutionGuard,
+      positionManagementDecisionCount: baseMetrics.diagnostics.positionManagementDecisionCount,
       coverageDays,
       tradesPerDay: coverageDays > 0 ? baseMetrics.numTrades / coverageDays : 0,
       bearishChoppyDays,
@@ -680,6 +966,7 @@ export function buildHistoricalValidationReport(input: HistoricalValidationInput
       pessimistic: performanceReport(scenarios.pessimistic, fundingSource),
     },
     tradeLedger: buildTradeLedger(input.symbol, scenarios.base, fundingSource, rejectedByBeforeEntry),
+    tradeForensics: buildTradeForensics(input.symbol, scenarios.base, candles.h1, contextsByTimestamp),
     noTradeDiagnostics: {
       noTradeRatio: bars.length > 0 ? (decisionCountByLane.NO_TRADE ?? 0) / bars.length : 0,
       noTradeCountByReason,
@@ -692,6 +979,19 @@ export function buildHistoricalValidationReport(input: HistoricalValidationInput
       noValidLaneSetupCount,
     },
     laneOpportunityDiagnostics: finalizeLaneDiagnostics(laneDiagnostics, scenarios.base),
+    regimeNoTradeDiagnostics: {
+      detectorBranchFailureCounts: regimeNoTradeFailedBranches,
+      btcBelow60000Count: noTradeBtcBelow60000Count,
+      btcBelow62000Count: noTradeBtcBelow62000Count,
+      marketBreadthWeakUnavailableCount: noTradeMarketBreadthWeakUnavailableCount,
+      marketBreadthWeakFalseCount: noTradeMarketBreadthWeakFalseCount,
+      missingRecoveryFlagCounts,
+      bearishChoppyAlmostMatchedButFailedCount,
+      dayCountByRegime: Object.fromEntries(
+        Object.entries(dayKeysByRegime).map(([regime, days]) => [regime, days.size]),
+      ) as Partial<Record<Regime, number>>,
+    },
+    regimeDenominatorDiagnostics: buildRegimeDenominators(decisionCountByRegime, dayKeysByRegime, scenarios.base),
     strategyRejection: {
       byScenario: rejectionByScenario,
       baseline: baselineRejection,

@@ -97,6 +97,18 @@ export interface BacktestMetrics {
   fundingImpact: number; // total funding cost (USD)
   noTradeDays: number;
   trades: SimTrade[];
+  diagnostics: BacktestRunDiagnostics;
+}
+
+export interface BacktestRunDiagnostics {
+  enterSignalCount: number;
+  closedTradeCount: number;
+  skippedBecausePositionOpen: number;
+  skippedBecauseCooldown: number;
+  skippedBecauseMaxTrades: number;
+  skippedBecauseExecutionGuard: number;
+  positionManagementDecisionCount: number;
+  noTradeDecisionCount: number;
 }
 
 const DEFAULT_FEE = (notional: number): number => notional * 0.0005; // 5 bps/side
@@ -211,7 +223,41 @@ export function runBacktest(config: BacktestConfig): BacktestMetrics {
   const allDays = new Set<number>();
 
   const trades: SimTrade[] = [];
+  const diagnostics: BacktestRunDiagnostics = {
+    enterSignalCount: 0,
+    closedTradeCount: 0,
+    skippedBecausePositionOpen: 0,
+    skippedBecauseCooldown: 0,
+    skippedBecauseMaxTrades: 0,
+    skippedBecauseExecutionGuard: 0,
+    positionManagementDecisionCount: 0,
+    noTradeDecisionCount: 0,
+  };
   let open: OpenState | null = null;
+
+  const buildSimContext = (bar: BacktestBar, openPositions: number): MarketContext => {
+    const dailyLossPct =
+      dailyStartEquity > 0 ? Math.max(0, (dailyStartEquity - equity) / dailyStartEquity) * 100 : 0;
+    return {
+      ...bar.ctx,
+      dailyLossPct,
+      consecutiveLosses,
+      openPositions,
+      tradesToday,
+    };
+  };
+
+  const recordDecisionDiagnostic = (decision: TradingDecision): void => {
+    if (decision.action === "NO_TRADE") {
+      diagnostics.noTradeDecisionCount += 1;
+      if (decision.trace?.executionGuardReason) diagnostics.skippedBecauseExecutionGuard += 1;
+      if (decision.trace?.riskGuardReason?.startsWith("MAX_TRADES_PER_DAY")) {
+        diagnostics.skippedBecauseMaxTrades += 1;
+      }
+      return;
+    }
+    diagnostics.enterSignalCount += 1;
+  };
 
   const closeTrade = (
     bar: BacktestBar,
@@ -288,6 +334,7 @@ export function runBacktest(config: BacktestConfig): BacktestMetrics {
 
     // ── manage an open position first ──────────────────────────────────────
     if (open) {
+      diagnostics.positionManagementDecisionCount += 1;
       open.fundingAccrued += fundingModel(bar, Math.abs(open.entryPrice * open.qty));
       const isLong = open.action === "ENTER_LONG";
 
@@ -318,24 +365,29 @@ export function runBacktest(config: BacktestConfig): BacktestMetrics {
       }
       // `mode` referenced to keep cooldown semantics colocated; no-op otherwise.
       void mode;
-      if (open) continue; // still open → nothing else to do this bar.
+      if (open) {
+        const blockedDecision = buildTradingDecision(buildSimContext(bar, 1));
+        if (blockedDecision.action !== "NO_TRADE") {
+          diagnostics.enterSignalCount += 1;
+          diagnostics.skippedBecausePositionOpen += 1;
+        }
+        continue; // still open → nothing else to do this bar.
+      }
     }
 
     // ── flat: consider a new entry ─────────────────────────────────────────
-    if (bar.timestamp < cooldownUntilTs) continue; // in cooldown, stand aside.
+    if (bar.timestamp < cooldownUntilTs) {
+      const blockedDecision = buildTradingDecision(buildSimContext(bar, 0));
+      if (blockedDecision.action !== "NO_TRADE") {
+        diagnostics.enterSignalCount += 1;
+        diagnostics.skippedBecauseCooldown += 1;
+      }
+      continue; // in cooldown, stand aside.
+    }
 
-    const dailyLossPct =
-      dailyStartEquity > 0 ? Math.max(0, (dailyStartEquity - equity) / dailyStartEquity) * 100 : 0;
-
-    const ctx: MarketContext = {
-      ...bar.ctx,
-      dailyLossPct,
-      consecutiveLosses,
-      openPositions: 0,
-      tradesToday,
-    };
-
+    const ctx = buildSimContext(bar, 0);
     const decision: TradingDecision = buildTradingDecision(ctx);
+    recordDecisionDiagnostic(decision);
     if (decision.action === "NO_TRADE") continue;
 
     // Open the trade: adjust the entry against us by the entry-side slippage.
@@ -385,7 +437,8 @@ export function runBacktest(config: BacktestConfig): BacktestMetrics {
     closeTrade(bars[bars.length - 1]!, bars[bars.length - 1]!.price, "END_OF_DATA");
   }
 
-  return summarize(trades, startingEquity, equity, maxDrawdown, allDays.size, tradedDays.size);
+  diagnostics.closedTradeCount = trades.length;
+  return summarize(trades, startingEquity, equity, maxDrawdown, allDays.size, tradedDays.size, diagnostics);
 }
 
 function laneMaxHoldMinutes(lane: LaneId): number {
@@ -414,6 +467,7 @@ function summarize(
   maxDrawdown: number,
   totalDays: number,
   tradedDays: number,
+  diagnostics: BacktestRunDiagnostics,
 ): BacktestMetrics {
   const wins = trades.filter((t) => t.netPnl > 0);
   const losses = trades.filter((t) => t.netPnl <= 0);
@@ -462,6 +516,7 @@ function summarize(
     fundingImpact: trades.reduce((s, t) => s + t.fundingCost, 0),
     noTradeDays: Math.max(0, totalDays - tradedDays),
     trades,
+    diagnostics,
   };
 }
 
