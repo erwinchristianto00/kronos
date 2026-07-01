@@ -233,9 +233,13 @@ import {
   runCrossSectionalCycleGuarded,
   buildCrossSectionalReport,
   getCrossSectionalFilteredConfig,
+  getCrossSectionalAdaptiveConfig,
   isCrossSectionalEdgeDisabled,
   CROSS_SECTIONAL_INTERVAL,
   CROSS_SECTIONAL_MOMENTUM_BARS,
+  buildCrossSectionalRegimeContext,
+  CROSS_SECTIONAL_TREND_SIGNAL,
+  CROSS_SECTIONAL_MIXED_SIGNAL,
 } from "../lib/cross-sectional-edge.js";
 import { readFileSync } from "node:fs";
 import { analyzeHardCutCounterfactuals, extractHardCutIntents } from "../lib/hard-cut-counterfactual.js";
@@ -597,26 +601,65 @@ export async function registerShadowRoutes(
   // Cross-sectional market-neutral measurement lane — report + open/closed baskets (report-only).
   app.get("/api/shadow/cross-sectional-report", async () => {
     const store = getCrossSectionalStore();
-    const slim = (o: { openedAt: string; resolvedAt: string | null; netReturn: number | null; grossReturn: number | null; signal: string; scoreGap?: number | null; longLeg: { symbol: string }[]; shortLeg: { symbol: string }[] }) => ({
+    const slim = (o: {
+      openedAt: string;
+      resolvedAt: string | null;
+      netReturn: number | null;
+      grossReturn: number | null;
+      signal: string;
+      variant?: string;
+      strategyFamily?: string;
+      scoreGap?: number | null;
+      regimeClassAtOpen?: string | null;
+      regimeContext?: { currentRegime: string | null; controllerMode: string | null; directionalBias: string | null; confidence: string | null } | null;
+      exitReason?: string | null;
+      longCapitalWeight?: number | null;
+      shortCapitalWeight?: number | null;
+      weightingModel?: string | null;
+      longLeg: { symbol: string; weight?: number | null }[];
+      shortLeg: { symbol: string; weight?: number | null }[];
+    }) => ({
       openedAt: o.openedAt,
       resolvedAt: o.resolvedAt,
       signal: o.signal,
+      variant: o.variant ?? "RAW",
+      strategyFamily: o.strategyFamily ?? null,
       scoreGap: o.scoreGap ?? null,
+      regimeClass: o.regimeClassAtOpen ?? o.regimeContext?.controllerMode ?? null,
+      regime: o.regimeContext?.currentRegime ?? null,
+      controllerMode: o.regimeContext?.controllerMode ?? null,
+      directionalBias: o.regimeContext?.directionalBias ?? null,
+      exitReason: o.exitReason ?? null,
+      longCapitalWeight: o.longCapitalWeight ?? null,
+      shortCapitalWeight: o.shortCapitalWeight ?? null,
+      weightingModel: o.weightingModel ?? null,
       netReturnPct: o.netReturn != null ? o.netReturn * 100 : null,
       grossReturnPct: o.grossReturn != null ? o.grossReturn * 100 : null,
       long: o.longLeg.map((l) => l.symbol),
       short: o.shortLeg.map((l) => l.symbol),
+      longWeights: o.longLeg.map((l) => ({ symbol: l.symbol, weight: l.weight ?? null })),
+      shortWeights: o.shortLeg.map((l) => ({ symbol: l.symbol, weight: l.weight ?? null })),
     });
-    const raw = store.all.filter((o) => o.signal !== getCrossSectionalFilteredConfig().signal);
+    const filteredSignal = getCrossSectionalFilteredConfig().signal;
+    const raw = store.all.filter((o) => o.signal !== filteredSignal && o.signal !== CROSS_SECTIONAL_TREND_SIGNAL && o.signal !== CROSS_SECTIONAL_MIXED_SIGNAL);
     const filtered = store.all.filter((o) => o.signal === getCrossSectionalFilteredConfig().signal);
+    const trend = store.all.filter((o) => o.signal === CROSS_SECTIONAL_TREND_SIGNAL);
+    const mixed = store.all.filter((o) => o.signal === CROSS_SECTIONAL_MIXED_SIGNAL);
     return {
       report: buildCrossSectionalReport(store),
       filteredReport: buildCrossSectionalReport(store, Date.now(), { variant: "FILTERED" }),
+      trendReport: buildCrossSectionalReport(store, Date.now(), { variant: "TREND_BETA_VOL" }),
+      mixedReport: buildCrossSectionalReport(store, Date.now(), { variant: "MIXED_MEAN_REVERSION" }),
       filteredConfig: getCrossSectionalFilteredConfig(),
+      adaptiveConfig: getCrossSectionalAdaptiveConfig(),
       openBaskets: raw.filter((o) => o.status === "OPEN").map(slim),
       filteredOpenBaskets: filtered.filter((o) => o.status === "OPEN").map(slim),
+      trendOpenBaskets: trend.filter((o) => o.status === "OPEN").map(slim),
+      mixedOpenBaskets: mixed.filter((o) => o.status === "OPEN").map(slim),
       recentClosed: raw.filter((o) => o.status === "CLOSED").slice(-15).map(slim),
       filteredRecentClosed: filtered.filter((o) => o.status === "CLOSED").slice(-15).map(slim),
+      trendRecentClosed: trend.filter((o) => o.status === "CLOSED").slice(-15).map(slim),
+      mixedRecentClosed: mixed.filter((o) => o.status === "CLOSED").slice(-15).map(slim),
     };
   });
 
@@ -1490,10 +1533,21 @@ export async function registerShadowRoutes(
         // Report-only, fire-and-forget, env-gated. NOT regime-gated — it's market-neutral by design.
         if (!isCrossSectionalEdgeDisabled()) {
           const _xsc = opts.binanceClient;
+          const latestRegimeSnapshot = getRegimeDirectionControllerSnapshotStore().readLatest();
+          const crossSectionalRegimeContext = latestRegimeSnapshot
+            ? buildCrossSectionalRegimeContext({
+                currentRegime: latestRegimeSnapshot.currentRegime,
+                controllerMode: latestRegimeSnapshot.controllerMode,
+                directionalBias: latestRegimeSnapshot.directionalBias,
+                confidence: latestRegimeSnapshot.confidence,
+                capturedAt: latestRegimeSnapshot.capturedAt,
+              })
+            : null;
           void runCrossSectionalCycleGuarded({
             store: getCrossSectionalStore(),
             universe: [...CURRENT_SCANNER_UNIVERSE],
             now: Date.now(),
+            regimeContext: crossSectionalRegimeContext,
             fetchCandles: async (symbol: string) =>
               _xsc.getCandles(symbol, CROSS_SECTIONAL_INTERVAL, CROSS_SECTIONAL_MOMENTUM_BARS + 5),
           }).catch(() => undefined);
