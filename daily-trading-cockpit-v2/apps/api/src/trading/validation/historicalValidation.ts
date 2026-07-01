@@ -61,6 +61,10 @@ export interface HistoricalValidationInput {
   symbol: string;
   candles: HistoricalCandleSet;
   breadth?: FeatureAdapterInput["breadth"];
+  breadthByTimestamp?: Map<number, FeatureAdapterInput["breadth"]>;
+  breadthUnavailableCount?: number;
+  breadthMetricsSample?: Record<string, unknown>;
+  breadthUniverseSymbols?: string[];
   microstructure?: ValidationMicrostructureOptions;
   startMs?: number;
   endMs?: number;
@@ -95,6 +99,15 @@ export interface FeatureProvenanceReport {
   breadthUniverseKind: BreadthUniverseKind | "UNAVAILABLE";
   breadthSurvivorshipBiasNote: string;
   featureSourcesSummary: Record<string, Record<string, number>>;
+}
+
+export interface BreadthDiagnosticsReport {
+  source: BreadthSourceSummary;
+  universeKind: BreadthUniverseKind | "UNAVAILABLE";
+  universeSymbols: string[];
+  unavailableDecisionCount: number;
+  survivorshipBiasWarning: string;
+  metricsSample?: Record<string, unknown>;
 }
 
 export interface DecisionDistributionReport {
@@ -226,6 +239,30 @@ export interface TradeForensicSummary {
   heuristicFlagsInvolved: string[];
 }
 
+export interface PnlMathAuditReport {
+  grossPnlFormula: {
+    long: string;
+    short: string;
+  };
+  stopPriceFormula: {
+    longStopLoss: string;
+    shortStopLoss: string;
+    longTakeProfit: string;
+    shortTakeProfit: string;
+  };
+  stopLossAtrAppliedToRealStopPrice: boolean;
+  shortPnlSignConvention: string;
+  slExitGrossPnlCheck: {
+    slTradeCount: number;
+    negativeGrossSlCount: number;
+    zeroGrossSlCount: number;
+    positiveGrossSlCount: number;
+    zeroGrossSlTradeIds: string[];
+    explanation: string | null;
+  };
+  costModelReducesNetPnl: boolean;
+}
+
 export interface ScenarioPerformanceReport {
   totalReturn: number;
   profitFactor: number;
@@ -258,8 +295,10 @@ export interface HistoricalValidationReport {
   featureProvenance: FeatureProvenanceReport;
   decisionDistribution: DecisionDistributionReport;
   tradingPerformance: Record<BacktestCostScenarioName, ScenarioPerformanceReport>;
+  breadthDiagnostics: BreadthDiagnosticsReport;
   tradeLedger: TradeLedgerEntry[];
   tradeForensics: TradeForensicSummary[];
+  pnlMathAudit: PnlMathAuditReport;
   noTradeDiagnostics: NoTradeDiagnosticsReport;
   laneOpportunityDiagnostics: Record<string, LaneOpportunityDiagnostics>;
   regimeNoTradeDiagnostics: RegimeNoTradeDiagnosticsReport;
@@ -425,13 +464,37 @@ function firstLiquiditySource(contexts: MarketContext[]): LiquiditySourceSummary
   return "UNAVAILABLE";
 }
 
+function breadthForTimestamp(input: HistoricalValidationInput, asOf: number): FeatureAdapterInput["breadth"] | undefined {
+  return input.breadthByTimestamp?.get(asOf) ?? input.breadth;
+}
+
+function firstBreadth(input: HistoricalValidationInput): FeatureAdapterInput["breadth"] | undefined {
+  if (input.breadth) return input.breadth;
+  for (const breadth of input.breadthByTimestamp?.values() ?? []) {
+    if (breadth) return breadth;
+  }
+  return undefined;
+}
+
 function breadthBiasNote(input: HistoricalValidationInput): string {
-  const kind = input.breadth?.universeKind;
+  const kind = firstBreadth(input)?.universeKind;
   if (kind === "POINT_IN_TIME") return "Breadth uses a point-in-time universe snapshot.";
-  if (kind === "CURRENT_HIGH_LIQUIDITY_MAJORS") {
-    return "Breadth uses current high-liquidity majors only; results are not representative of the full historical crypto market.";
+  if (kind === "CURRENT_HIGH_LIQUIDITY_MAJORS" || kind === "CURRENT_LIQUID_UNIVERSE") {
+    return "Breadth uses the current liquid scan universe; historical universe snapshots are unavailable, so survivorship bias remains.";
   }
   return "Breadth unavailable; breadth-dependent flags remain undefined and no breadth edge is validated.";
+}
+
+function breadthDiagnostics(input: HistoricalValidationInput): BreadthDiagnosticsReport {
+  const breadth = firstBreadth(input);
+  return {
+    source: breadth ? "SUPPLIED" : "UNAVAILABLE",
+    universeKind: breadth?.universeKind ?? "UNAVAILABLE",
+    universeSymbols: input.breadthUniverseSymbols ?? [],
+    unavailableDecisionCount: input.breadthUnavailableCount ?? 0,
+    survivorshipBiasWarning: breadthBiasNote(input),
+    metricsSample: input.breadthMetricsSample,
+  };
 }
 
 function defaultMicrostructure(symbol: string, bar: Candle, input?: ValidationMicrostructureOptions): FeatureAdapterInput["microstructure"] {
@@ -603,7 +666,7 @@ function buildTradeLedger(
   rejectedByBeforeEntry: Map<number, string | null>,
 ): TradeLedgerEntry[] {
   return metrics.trades.map((trade, index) => ({
-    tradeId: `${symbol}-${index + 1}-${trade.entryTs}`,
+    tradeId: tradeId(symbol, trade, index),
     symbol,
     entryTime: new Date(trade.entryTs).toISOString(),
     exitTime: new Date(trade.exitTs).toISOString(),
@@ -716,7 +779,7 @@ function buildTradeForensics(
     const ctx = contextsByTimestamp.get(trade.entryTs);
 
     return {
-      tradeId: `${symbol}-${index + 1}-${trade.entryTs}`,
+      tradeId: tradeId(symbol, trade, index),
       entryCandleContext: {
         regime: trade.regime,
         lane: trade.lane,
@@ -754,6 +817,48 @@ function buildTradeForensics(
       heuristicFlagsInvolved: heuristicFlags(trade.featureSources, ctx),
     };
   });
+}
+
+function tradeId(symbol: string, trade: BacktestMetrics["trades"][number], index: number): string {
+  return `${symbol}-${index + 1}-${trade.entryTs}`;
+}
+
+function buildPnlMathAudit(symbol: string, metrics: BacktestMetrics): PnlMathAuditReport {
+  const epsilon = 1e-8;
+  const slTrades = metrics.trades.filter((trade) => trade.exitReason === "SL");
+  const negativeGrossSlTrades = slTrades.filter((trade) => trade.grossPnl < -epsilon);
+  const zeroGrossSlTrades = slTrades.filter((trade) => Math.abs(trade.grossPnl) <= epsilon);
+  const positiveGrossSlTrades = slTrades.filter((trade) => trade.grossPnl > epsilon);
+  const zeroGrossSlTradeIds = zeroGrossSlTrades.map((trade) => {
+    const index = metrics.trades.indexOf(trade);
+    return tradeId(symbol, trade, index);
+  });
+  return {
+    grossPnlFormula: {
+      long: "(exitPrice - entryPrice) * qty",
+      short: "(entryPrice - exitPrice) * qty",
+    },
+    stopPriceFormula: {
+      longStopLoss: "entryPrice - stopLossATR * atrAtEntry",
+      shortStopLoss: "entryPrice + stopLossATR * atrAtEntry",
+      longTakeProfit: "entryPrice + takeProfitATR * atrAtEntry",
+      shortTakeProfit: "entryPrice - takeProfitATR * atrAtEntry",
+    },
+    stopLossAtrAppliedToRealStopPrice: metrics.trades.every((trade) => trade.stopLossATR > 0 && trade.atrAtEntry > 0),
+    shortPnlSignConvention: "Short gross PnL is positive when exitPrice is below entryPrice and negative when exitPrice is above entryPrice.",
+    slExitGrossPnlCheck: {
+      slTradeCount: slTrades.length,
+      negativeGrossSlCount: negativeGrossSlTrades.length,
+      zeroGrossSlCount: zeroGrossSlTrades.length,
+      positiveGrossSlCount: positiveGrossSlTrades.length,
+      zeroGrossSlTradeIds,
+      explanation:
+        zeroGrossSlTradeIds.length > 0
+          ? "Zero-gross SL trades are valid only when the breakeven ratchet moved the stop price to entry after the trade first moved favorably; costs can still make net PnL negative."
+          : null,
+    },
+    costModelReducesNetPnl: metrics.trades.every((trade) => trade.netPnl <= trade.grossPnl + epsilon),
+  };
 }
 
 export function buildHistoricalValidationReport(input: HistoricalValidationInput): HistoricalValidationReport {
@@ -823,7 +928,7 @@ export function buildHistoricalValidationReport(input: HistoricalValidationInput
     const ctx = contextFromCandles({
       asOf,
       btc,
-      breadth: input.breadth,
+      breadth: breadthForTimestamp(input, asOf),
       microstructure: defaultMicrostructure(input.symbol, bar, input.microstructure),
       governance: {
         dailyLossPct: 0,
@@ -894,6 +999,7 @@ export function buildHistoricalValidationReport(input: HistoricalValidationInput
   const scenarios = runBacktestCostScenarios({ bars, startingEquity });
   const wf = walkForwardBacktest({ bars, startingEquity }, input.walkForwardFolds ?? 4);
   const fundingSource = firstFundingSource(contexts);
+  const breadth = firstBreadth(input);
   const coverageDays = daysBetween(startMs, endMs);
   const bearishChoppyDays = bearishChoppyDayKeys.size;
   const rejectionCriteria = { chopDays: Math.max(1, bearishChoppyDays) };
@@ -931,8 +1037,8 @@ export function buildHistoricalValidationReport(input: HistoricalValidationInput
     featureProvenance: {
       fundingSource,
       liquiditySource: firstLiquiditySource(contexts),
-      breadthSource: input.breadth ? "SUPPLIED" : "UNAVAILABLE",
-      breadthUniverseKind: input.breadth?.universeKind ?? "UNAVAILABLE",
+      breadthSource: breadth ? "SUPPLIED" : "UNAVAILABLE",
+      breadthUniverseKind: breadth?.universeKind ?? "UNAVAILABLE",
       breadthSurvivorshipBiasNote: breadthBiasNote(input),
       featureSourcesSummary,
     },
@@ -965,8 +1071,10 @@ export function buildHistoricalValidationReport(input: HistoricalValidationInput
       base: performanceReport(scenarios.base, fundingSource),
       pessimistic: performanceReport(scenarios.pessimistic, fundingSource),
     },
+    breadthDiagnostics: breadthDiagnostics(input),
     tradeLedger: buildTradeLedger(input.symbol, scenarios.base, fundingSource, rejectedByBeforeEntry),
     tradeForensics: buildTradeForensics(input.symbol, scenarios.base, candles.h1, contextsByTimestamp),
+    pnlMathAudit: buildPnlMathAudit(input.symbol, scenarios.base),
     noTradeDiagnostics: {
       noTradeRatio: bars.length > 0 ? (decisionCountByLane.NO_TRADE ?? 0) / bars.length : 0,
       noTradeCountByReason,

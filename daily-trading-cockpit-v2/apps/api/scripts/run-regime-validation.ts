@@ -3,6 +3,8 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Candle } from "@dtc/shared";
 import { BinanceClient } from "../src/lib/binance.js";
+import { UNIVERSE as CURRENT_SCANNER_UNIVERSE } from "../src/lib/scan-service.js";
+import { breadthFromCandles } from "../src/trading/features/breadthFromCandles.js";
 import { buildHistoricalValidationReport, type ValidationTimeframe } from "../src/trading/validation/historicalValidation.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -86,10 +88,50 @@ async function main(): Promise<void> {
     fetchHistoricalCandles(client, symbol, "1d", startMs, endMs),
   ]);
 
+  const breadthSymbols = [...new Set(CURRENT_SCANNER_UNIVERSE)].filter((item) => item !== symbol);
+  console.log(`fetching breadth h1 candles universeKind=CURRENT_LIQUID_UNIVERSE symbols=${breadthSymbols.length}`);
+  const breadthCandles = await Promise.all(
+    breadthSymbols.map(async (breadthSymbol) => {
+      try {
+        return {
+          symbol: breadthSymbol,
+          h1: await fetchHistoricalCandles(client, breadthSymbol, "1h", startMs, endMs),
+        };
+      } catch (error: unknown) {
+        console.warn(`breadth_symbol_unavailable=${breadthSymbol} reason=${error instanceof Error ? error.message : String(error)}`);
+        return { symbol: breadthSymbol, h1: [] };
+      }
+    }),
+  );
+  const breadthByTimestamp = new Map<number, NonNullable<Parameters<typeof buildHistoricalValidationReport>[0]["breadth"]>>();
+  let breadthUnavailableCount = 0;
+  let breadthMetricsSample: Record<string, unknown> | undefined;
+  for (const bar of h1) {
+    const asOf = bar.openTime + TF_MS["1h"];
+    const result = breadthFromCandles({
+      asOf,
+      btc: h1,
+      universe: breadthCandles,
+      universeKind: "CURRENT_LIQUID_UNIVERSE",
+      universeDescription:
+        "Current VPS scan universe from apps/api/src/lib/scan-service.ts; not a point-in-time historical universe snapshot.",
+    });
+    if (result.breadth) {
+      breadthByTimestamp.set(asOf, result.breadth);
+      if (result.metrics) breadthMetricsSample = result.metrics as unknown as Record<string, unknown>;
+    } else {
+      breadthUnavailableCount += 1;
+    }
+  }
+
   const report = buildHistoricalValidationReport({
     symbol,
     candles: { m15, h1, h4, d1 },
     startingEquity,
+    breadthByTimestamp,
+    breadthUnavailableCount,
+    breadthMetricsSample,
+    breadthUniverseSymbols: breadthSymbols,
     microstructure: {
       spreadBps: Number(arg("spread-bps") ?? 2),
       slippageBps: Number(arg("slippage-bps") ?? 2),

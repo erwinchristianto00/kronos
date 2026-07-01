@@ -42,6 +42,45 @@ function flatCtx(): MarketContext {
   };
 }
 
+function microLongCtx(): MarketContext {
+  return {
+    dailyLossPct: 0,
+    consecutiveLosses: 0,
+    spreadBps: 2,
+    slippageBps: 2,
+    liquidityGood: true,
+    fundingRiskAbnormal: false,
+    regimeConfidence: 0.9,
+    openPositions: 0,
+    tradesToday: 0,
+    btcBelow60000: true,
+    priceNearLowerRange: true,
+    rsiShortTf: 18,
+    liquidationFlushDetected: true,
+    btcNotBreakingMajorSupport: true,
+  };
+}
+
+function breakdownCtx(): MarketContext {
+  return {
+    dailyLossPct: 0,
+    consecutiveLosses: 0,
+    spreadBps: 2,
+    slippageBps: 2,
+    liquidityGood: true,
+    fundingRiskAbnormal: false,
+    regimeConfidence: 0.9,
+    openPositions: 0,
+    tradesToday: 0,
+    btcBelow60000: true,
+    supportBroken: true,
+    closeBelowSupport: true,
+    retestOldSupport: true,
+    retestFailed: true,
+    btcStillWeak: true,
+  };
+}
+
 // entry bar (short-fade signal) followed by a follow-through bar that resolves it.
 function shortPair(t0: number, resolve: "TP" | "SL"): BacktestBar[] {
   const entry: BacktestBar = {
@@ -60,6 +99,38 @@ function shortPair(t0: number, resolve: "TP" | "SL"): BacktestBar[] {
       ? { timestamp: t0 + MIN, ctx: flatCtx(), price: 99.3, high: 99.9, low: 99.2, atr: 1 }
       : { timestamp: t0 + MIN, ctx: flatCtx(), price: 101, high: 101.2, low: 100.5, atr: 1 };
   return [entry, exit];
+}
+
+function longPair(t0: number, resolve: "TP" | "SL"): BacktestBar[] {
+  const entry: BacktestBar = {
+    timestamp: t0,
+    ctx: microLongCtx(),
+    price: 100,
+    high: 100.1,
+    low: 99.8,
+    atr: 1,
+  };
+  const exit: BacktestBar =
+    resolve === "TP"
+      ? { timestamp: t0 + MIN, ctx: flatCtx(), price: 100.5, high: 100.8, low: 100.1, atr: 1 }
+      : { timestamp: t0 + MIN, ctx: flatCtx(), price: 99.3, high: 99.8, low: 99.2, atr: 1 };
+  return [entry, exit];
+}
+
+function breakdownBreakevenStopPair(t0: number): BacktestBar[] {
+  const entry: BacktestBar = {
+    timestamp: t0,
+    ctx: breakdownCtx(),
+    price: 100,
+    high: 100.1,
+    low: 99.9,
+    atr: 1,
+  };
+  return [
+    entry,
+    // Favorable low arms the 0.4 ATR breakeven ratchet; wick back to entry hits SL at breakeven.
+    { timestamp: t0 + MIN, ctx: flatCtx(), price: 100, high: 100.1, low: 99.3, atr: 1 },
+  ];
 }
 
 describe("runBacktest", () => {
@@ -84,6 +155,52 @@ describe("runBacktest", () => {
     expect(m.trades[0]!.exitReason).toBe("SL");
     expect(m.trades[0]!.netPnl).toBeLessThan(0);
     expect(m.totalReturn).toBeLessThan(0);
+  });
+
+  it("computes long TP gross PnL as positive", () => {
+    const m = runBacktest({ bars: longPair(0, "TP"), startingEquity: 10_000 });
+    expect(m.trades[0]!.action).toBe("ENTER_LONG");
+    expect(m.trades[0]!.exitReason).toBe("TP");
+    expect(m.trades[0]!.grossPnl).toBeGreaterThan(0);
+  });
+
+  it("computes long SL gross PnL as negative", () => {
+    const m = runBacktest({ bars: longPair(0, "SL"), startingEquity: 10_000 });
+    expect(m.trades[0]!.action).toBe("ENTER_LONG");
+    expect(m.trades[0]!.exitReason).toBe("SL");
+    expect(m.trades[0]!.grossPnl).toBeLessThan(0);
+  });
+
+  it("computes short TP gross PnL as positive", () => {
+    const m = runBacktest({ bars: shortPair(0, "TP"), startingEquity: 10_000 });
+    expect(m.trades[0]!.action).toBe("ENTER_SHORT");
+    expect(m.trades[0]!.exitReason).toBe("TP");
+    expect(m.trades[0]!.grossPnl).toBeGreaterThan(0);
+  });
+
+  it("computes short SL gross PnL as negative when the original stop is hit", () => {
+    const m = runBacktest({ bars: shortPair(0, "SL"), startingEquity: 10_000 });
+    expect(m.trades[0]!.action).toBe("ENTER_SHORT");
+    expect(m.trades[0]!.exitReason).toBe("SL");
+    expect(m.trades[0]!.grossPnl).toBeLessThan(0);
+  });
+
+  it("can report a zero-gross SL only after the breakeven stop ratchet is armed", () => {
+    const m = runBacktest({ bars: breakdownBreakevenStopPair(0), startingEquity: 10_000 });
+    expect(m.numTrades).toBe(1);
+    const t = m.trades[0]!;
+    expect(t.lane).toBe("BREAKDOWN_RETEST_SHORT");
+    expect(t.exitReason).toBe("SL");
+    expect(t.exitPrice).toBeCloseTo(t.entryPrice, 8);
+    expect(t.grossPnl).toBeCloseTo(0, 8);
+    expect(t.netPnl).toBeLessThan(0);
+  });
+
+  it("cost model reduces net PnL from gross PnL", () => {
+    const m = runBacktest({ bars: shortPair(0, "TP"), startingEquity: 10_000 });
+    const t = m.trades[0]!;
+    expect(t.fees + t.spreadCost + t.slippageCost + t.fundingCost).toBeGreaterThan(0);
+    expect(t.netPnl).toBeLessThan(t.grossPnl);
   });
 
   it("counts no-trade days and opens nothing on flat context", () => {

@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import type { Candle } from "@dtc/shared";
 import type { FeatureAdapterInput } from "../src/trading/index.js";
 import {
+  breadthFromCandles,
   contextFromCandles,
   detectContradictions,
   buildTradingDecision,
@@ -150,15 +151,15 @@ describe("contextFromCandles", () => {
       breadth: {
         advancersPct: 0.25,
         altAdvancersPct: 0.3,
-        universeKind: "CURRENT_HIGH_LIQUIDITY_MAJORS",
-        universeDescription: "current majors only; not full historical crypto universe",
+        universeKind: "CURRENT_LIQUID_UNIVERSE",
+        universeDescription: "current scan universe only; not full historical crypto universe",
       },
       microstructure: microstructure({ liquidityTooThin: true, spreadBps: 12 }),
       governance: governance(),
     });
     expect(ctx.marketBreadthWeak).toBe(true);
     expect(ctx.marketBreadthPositive).toBe(false);
-    expect(ctx.breadthUniverseKind).toBe("CURRENT_HIGH_LIQUIDITY_MAJORS");
+    expect(ctx.breadthUniverseKind).toBe("CURRENT_LIQUID_UNIVERSE");
     expect(ctx.liquidityTooThin).toBe(true);
     expect(ctx.spreadBps).toBe(12);
   });
@@ -258,5 +259,50 @@ describe("contextFromCandles", () => {
     });
     expect(ctx.marketBreadthWeak).toBe(true);
     expect(ctx.signalConflict).toBe(true);
+  });
+});
+
+describe("breadthFromCandles", () => {
+  const asOf = 2_000_000_000_000;
+
+  it("derives breadth metrics and flags from closed universe candles", () => {
+    const btc = series(Array.from({ length: 60 }, (_, i) => 60_000 + i * 10), asOf - 60 * HOUR, HOUR);
+    const universe = Array.from({ length: 8 }, (_, i) => ({
+      symbol: `ALT${i}USDT`,
+      h1: series(
+        Array.from({ length: 60 }, (_, j) => 100 + j * (i < 6 ? 0.8 : -0.2)),
+        asOf - 60 * HOUR,
+        HOUR,
+      ),
+    }));
+    const result = breadthFromCandles({
+      asOf,
+      btc,
+      universe,
+      universeKind: "CURRENT_LIQUID_UNIVERSE",
+      universeDescription: "test universe",
+      minSymbols: 8,
+    });
+
+    expect(result.unavailableReason).toBeUndefined();
+    expect(result.breadth?.universeKind).toBe("CURRENT_LIQUID_UNIVERSE");
+    expect(result.metrics?.symbolCount).toBe(8);
+    expect(result.metrics?.percentAboveEma20).toBeGreaterThan(0);
+    expect(typeof result.flags?.marketBreadthPositive).toBe("boolean");
+    expect(typeof result.flags?.altBreadthImproves).toBe("boolean");
+  });
+
+  it("does not fabricate breadth when the universe has insufficient lookback", () => {
+    const btc = series(Array.from({ length: 60 }, (_, i) => 60_000 + i * 10), asOf - 60 * HOUR, HOUR);
+    const result = breadthFromCandles({
+      asOf,
+      btc,
+      universe: [{ symbol: "ETHUSDT", h1: series([100, 101], asOf - 2 * HOUR, HOUR) }],
+      universeKind: "CURRENT_LIQUID_UNIVERSE",
+      minSymbols: 8,
+    });
+
+    expect(result.breadth).toBeUndefined();
+    expect(result.unavailableReason).toMatch(/UNIVERSE_LOOKBACK_INSUFFICIENT/);
   });
 });

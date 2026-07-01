@@ -39,4 +39,6 @@ export { relativeStrengthLong } from "./lanes/relativeStrengthLong.js";
 export * from "./backtest/backtestRunner.js";
 export { contextFromCandles, DEFAULT_FEATURE_CONFIG } from "./features/contextFromCandles.js";
 export type { FeatureAdapterInput, FeatureAdapterConfig } from "./features/contextFromCandles.js";
+export { breadthFromCandles } from "./features/breadthFromCandles.js";
+export type { BreadthFromCandlesInput, BreadthFromCandlesOutput, BreadthMetrics, BreadthSymbolCandles } from "./features/breadthFromCandles.js";
 export * from "./validation/historicalValidation.js";

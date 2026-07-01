@@ -36,7 +36,7 @@ describe("buildHistoricalValidationReport", () => {
       breadth: {
         advancersPct: 0.3,
         altAdvancersPct: 0.35,
-        universeKind: "CURRENT_HIGH_LIQUIDITY_MAJORS",
+        universeKind: "CURRENT_LIQUID_UNIVERSE",
       },
       microstructure: {
         spreadBps: 2,
@@ -52,8 +52,9 @@ describe("buildHistoricalValidationReport", () => {
     expect(report.featureProvenance.fundingSource).toBe("ASSUMED_BASELINE");
     expect(report.featureProvenance.liquiditySource).toBe("HEURISTIC_SPREAD_VOLUME");
     expect(report.featureProvenance.breadthSource).toBe("SUPPLIED");
-    expect(report.featureProvenance.breadthSurvivorshipBiasNote).toMatch(/current high-liquidity majors/i);
+    expect(report.featureProvenance.breadthSurvivorshipBiasNote).toMatch(/current liquid scan universe/i);
     expect(report.featureProvenance.featureSourcesSummary.fundingRiskAbnormal?.ASSUMED_BASELINE).toBeGreaterThan(0);
+    expect(report.breadthDiagnostics.universeKind).toBe("CURRENT_LIQUID_UNIVERSE");
     expect(report.decisionDistribution.totalDecisions).toBeGreaterThan(0);
     expect(report.decisionDistribution.enterSignalCount).toBeGreaterThanOrEqual(report.decisionDistribution.closedTradeCount);
     expect(report.decisionDistribution.actionableEnterSignalCount).toBeGreaterThanOrEqual(report.decisionDistribution.closedTradeCount);
@@ -71,6 +72,8 @@ describe("buildHistoricalValidationReport", () => {
     expect(report.tradingPerformance.optimistic.feeImpact).toBeGreaterThanOrEqual(0);
     expect(report.tradingPerformance.base.spreadImpact).toBeGreaterThanOrEqual(0);
     expect(report.tradingPerformance.pessimistic.fundingAssumptionNote).toMatch(/assumed baseline/i);
+    expect(report.pnlMathAudit.grossPnlFormula.short).toMatch(/entryPrice - exitPrice/);
+    expect(report.pnlMathAudit.costModelReducesNetPnl).toBe(true);
     expect(Array.isArray(report.tradeLedger)).toBe(true);
     for (const trade of report.tradeLedger) {
       expect(trade.symbol).toBe("BTCUSDT");

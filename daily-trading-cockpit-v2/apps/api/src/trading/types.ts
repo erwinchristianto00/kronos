@@ -238,9 +238,10 @@ export type FeatureSource =
   | "OVERRIDE"
   | "ASSUMED_BASELINE"
   | "ORDERBOOK_DEPTH"
-  | "HEURISTIC";
+  | "HEURISTIC"
+  | "BREADTH_ADAPTER";
 export type FeatureSourceMap = Partial<Record<keyof MarketContext, FeatureSource[]>>;
-export type BreadthUniverseKind = "POINT_IN_TIME" | "CURRENT_HIGH_LIQUIDITY_MAJORS";
+export type BreadthUniverseKind = "POINT_IN_TIME" | "CURRENT_HIGH_LIQUIDITY_MAJORS" | "CURRENT_LIQUID_UNIVERSE";
 export type LiquidityTier = "MAJOR" | "ALT";
 export type LiquiditySource = "SUPPLIED" | "ORDERBOOK_DEPTH" | "HEURISTIC_SPREAD_VOLUME";
 

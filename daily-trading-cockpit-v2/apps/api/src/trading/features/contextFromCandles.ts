@@ -112,8 +112,8 @@ export interface FeatureAdapterInput {
   /**
    * Breadth summary from the universe scanner (fractions 0..1). Cannot be derived
    * here. For historical backtests, prefer POINT_IN_TIME. If the scanner uses
-   * today's high-liquidity majors, set CURRENT_HIGH_LIQUIDITY_MAJORS so reports
-   * can label the survivorship-bias risk instead of overstating the result.
+   * today's scan/liquid universe, set CURRENT_LIQUID_UNIVERSE so reports can
+   * label the survivorship-bias risk instead of overstating the result.
    */
   breadth?: {
     advancersPct?: number;
