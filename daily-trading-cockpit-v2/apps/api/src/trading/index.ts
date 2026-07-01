@@ -25,6 +25,7 @@ export {
 export type { SafetyRejection } from "./safety.js";
 export {
   detectContradictions,
+  missingExecutionDataReasons,
   stalenessReasons,
   isContextStale,
 } from "./contextIntegrity.js";
@@ -38,3 +39,4 @@ export { relativeStrengthLong } from "./lanes/relativeStrengthLong.js";
 export * from "./backtest/backtestRunner.js";
 export { contextFromCandles, DEFAULT_FEATURE_CONFIG } from "./features/contextFromCandles.js";
 export type { FeatureAdapterInput, FeatureAdapterConfig } from "./features/contextFromCandles.js";
+export * from "./validation/historicalValidation.js";

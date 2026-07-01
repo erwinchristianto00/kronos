@@ -10,6 +10,7 @@ import {
   decisionSafetyRejection,
   validateFrameworkInvariants,
   detectContradictions,
+  missingExecutionDataReasons,
   stalenessReasons,
   isContextStale,
   buildTradingDecision,
@@ -38,6 +39,8 @@ function base(overrides: Partial<MarketContext> = {}): MarketContext {
     consecutiveLosses: 0,
     spreadBps: 2,
     slippageBps: 2,
+    liquidityGood: true,
+    fundingRiskAbnormal: false,
     regimeConfidence: 0.9,
     openPositions: 0,
     tradesToday: 0,
@@ -203,6 +206,32 @@ describe("hard gate: no forbidden entry can escape buildTradingDecision", () => 
         risk: makeRiskConfig(0.15, 1),
       })?.code,
     ).toBe("FORBIDDEN_LANE");
+  });
+});
+
+// ── 5. Required execution/microstructure hard gate ──────────────────────────
+
+describe("required execution/microstructure data", () => {
+  it("detects missing spread, slippage, liquidity, and funding fields", () => {
+    const missing = base({
+      spreadBps: undefined as unknown as number,
+      slippageBps: undefined as unknown as number,
+      liquidityGood: undefined,
+      fundingRiskAbnormal: undefined,
+    });
+    expect(missingExecutionDataReasons(missing)).toEqual([
+      "MISSING_SPREAD_BPS",
+      "MISSING_SLIPPAGE_BPS",
+      "MISSING_LIQUIDITY_GOOD",
+      "MISSING_FUNDING_RISK_ABNORMAL",
+    ]);
+  });
+
+  it("buildTradingDecision stands aside before lane routing when required execution data is missing", () => {
+    const d = buildTradingDecision(fadeSetup({ fundingRiskAbnormal: undefined }));
+    expect(d.action).toBe("NO_TRADE");
+    expect(d.trace?.rejectedBy).toBe("MISSING_EXECUTION_DATA");
+    expect(d.trace?.noTradeReason).toContain("MISSING_FUNDING_RISK_ABNORMAL");
   });
 });
 

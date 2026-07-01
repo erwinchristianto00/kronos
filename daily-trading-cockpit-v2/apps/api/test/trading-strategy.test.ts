@@ -23,6 +23,8 @@ function base(overrides: Partial<MarketContext> = {}): MarketContext {
     consecutiveLosses: 0,
     spreadBps: 2,
     slippageBps: 2,
+    liquidityGood: true,
+    fundingRiskAbnormal: false,
     regimeConfidence: 0.9,
     openPositions: 0,
     tradesToday: 0,

@@ -35,7 +35,7 @@ function bearishBtc(asOf: number) {
 }
 
 function microstructure(overrides: Partial<FeatureAdapterInput["microstructure"]> = {}) {
-  return { spreadBps: 2, slippageBps: 2, ...overrides };
+  return { spreadBps: 2, slippageBps: 2, liquidityGood: true, fundingRiskAbnormal: false, ...overrides };
 }
 function governance(overrides: Partial<FeatureAdapterInput["governance"]> = {}) {
   return { dailyLossPct: 0, consecutiveLosses: 0, openPositions: 0, tradesToday: 0, ...overrides };
@@ -73,8 +73,45 @@ describe("contextFromCandles", () => {
     expect(typeof ctx.rsi1h).toBe("number");
     expect(ctx.asOf).toBe(asOf);
     expect(ctx.freshness?.some((f) => f.timeframe === "1h")).toBe(true);
+    expect(ctx.featureSources?.retestFailed).toEqual(["1h"]);
+    expect(ctx.featureSources?.btcClose4hAbove62000).toEqual(["4h"]);
     // The adapter must never emit a contradictory pair from clean, consistent data.
     expect(detectContradictions(ctx)).toEqual([]);
+  });
+
+  it("ignores future or unfinished candles before deriving flags", () => {
+    const btc = bearishBtc(asOf);
+    const baseCtx = contextFromCandles({
+      asOf,
+      btc,
+      microstructure: microstructure(),
+      governance: governance(),
+    });
+
+    const futureSpike = {
+      openTime: asOf,
+      open: 58_000,
+      high: 80_000,
+      low: 57_000,
+      close: 78_000,
+      volume: 100_000,
+    };
+    const withUnclosed = contextFromCandles({
+      asOf,
+      btc: {
+        ...btc,
+        h1: [...btc.h1, futureSpike],
+      },
+      microstructure: microstructure(),
+      governance: governance(),
+    });
+
+    expect(withUnclosed.btcBelow60000).toBe(baseCtx.btcBelow60000);
+    expect(withUnclosed.btcBelow62000).toBe(baseCtx.btcBelow62000);
+    expect(withUnclosed.rsi1h).toBe(baseCtx.rsi1h);
+    expect(withUnclosed.freshness?.find((f) => f.timeframe === "1h")?.lastCandleCloseMs).toBe(
+      baseCtx.freshness?.find((f) => f.timeframe === "1h")?.lastCandleCloseMs,
+    );
   });
 
   it("leaves un-derivable flags undefined (fail-safe) when inputs are absent", () => {
@@ -110,14 +147,86 @@ describe("contextFromCandles", () => {
     const ctx = contextFromCandles({
       asOf,
       btc: bearishBtc(asOf),
-      breadth: { advancersPct: 0.25, altAdvancersPct: 0.3 },
+      breadth: {
+        advancersPct: 0.25,
+        altAdvancersPct: 0.3,
+        universeKind: "CURRENT_HIGH_LIQUIDITY_MAJORS",
+        universeDescription: "current majors only; not full historical crypto universe",
+      },
       microstructure: microstructure({ liquidityTooThin: true, spreadBps: 12 }),
       governance: governance(),
     });
     expect(ctx.marketBreadthWeak).toBe(true);
     expect(ctx.marketBreadthPositive).toBe(false);
+    expect(ctx.breadthUniverseKind).toBe("CURRENT_HIGH_LIQUIDITY_MAJORS");
     expect(ctx.liquidityTooThin).toBe(true);
     expect(ctx.spreadBps).toBe(12);
+  });
+
+  it("labels fundingRiskAbnormal=false as ASSUMED_BASELINE when funding data is absent by policy", () => {
+    const ctx = contextFromCandles({
+      asOf,
+      btc: bearishBtc(asOf),
+      microstructure: {
+        spreadBps: 2,
+        slippageBps: 2,
+        liquidityGood: true,
+        assumeFundingBaseline: true,
+      },
+      governance: governance(),
+    });
+    expect(ctx.fundingRiskAbnormal).toBe(false);
+    expect(ctx.featureSources?.fundingRiskAbnormal).toEqual(["ASSUMED_BASELINE"]);
+
+    const d = buildTradingDecision(ctx);
+    expect(d.trace?.featureSources?.fundingRiskAbnormal).toEqual(["ASSUMED_BASELINE"]);
+  });
+
+  it("applies stricter liquidity thresholds to alts than BTC/ETH/SOL majors", () => {
+    const shared = {
+      spreadBps: 4,
+      slippageBps: 2,
+      quoteVolumeUsd24h: 80_000_000,
+      orderbookDepthUsd: 1_500_000,
+      fundingRiskAbnormal: false,
+    };
+    const majorCtx = contextFromCandles({
+      asOf,
+      btc: bearishBtc(asOf),
+      microstructure: { ...shared, liquidityTier: "MAJOR" },
+      governance: governance(),
+    });
+    const altCtx = contextFromCandles({
+      asOf,
+      btc: bearishBtc(asOf),
+      microstructure: { ...shared, liquidityTier: "ALT" },
+      governance: governance(),
+    });
+
+    expect(majorCtx.liquidityGood).toBe(true);
+    expect(majorCtx.liquiditySource).toBe("ORDERBOOK_DEPTH");
+    expect(majorCtx.featureSources?.liquidityGood).toEqual(["ORDERBOOK_DEPTH"]);
+    expect(altCtx.liquidityGood).toBe(false);
+    expect(altCtx.liquidityTooThin).toBe(true);
+  });
+
+  it("falls back to a conservative liquidity heuristic when orderbook depth is missing", () => {
+    const ctx = contextFromCandles({
+      asOf,
+      btc: bearishBtc(asOf),
+      microstructure: {
+        spreadBps: 3,
+        slippageBps: 2,
+        liquidityTier: "MAJOR",
+        quoteVolumeUsd24h: 120_000_000,
+        fundingRiskAbnormal: false,
+      },
+      governance: governance(),
+    });
+
+    expect(ctx.liquidityGood).toBe(true);
+    expect(ctx.liquiditySource).toBe("HEURISTIC_SPREAD_VOLUME");
+    expect(ctx.featureSources?.liquidityGood).toEqual(["HEURISTIC"]);
   });
 
   it("end-to-end: adapter output flows into buildTradingDecision and yields a valid decision with a trace", () => {
@@ -133,6 +242,7 @@ describe("contextFromCandles", () => {
     // and it must never be a forbidden entry.
     expect(["ENTER_LONG", "ENTER_SHORT", "NO_TRADE"]).toContain(d.action);
     expect(d.trace?.detectedRegime).toBeDefined();
+    expect(d.trace?.featureSources?.btcBelow60000).toEqual(["1h"]);
     if (d.action !== "NO_TRADE") {
       expect(["SHORT_RALLY_FADE", "BREAKDOWN_RETEST_SHORT", "MICRO_MEAN_REVERSION"]).toContain(d.lane);
     }

@@ -32,8 +32,12 @@ export interface BacktestModels {
   feeModel?: (notional: number) => number;
   /** Round-trip slippage in bps applied to entry+exit. Default: reads bar.ctx.slippageBps. */
   slippageBpsModel?: (bar: BacktestBar) => number;
+  /** Round-trip spread in bps applied to entry+exit. Default: 0 (legacy behavior). */
+  spreadBpsModel?: (bar: BacktestBar) => number;
   /** Funding cost in USD per bar held. Default: 0. */
   fundingModel?: (bar: BacktestBar, notional: number) => number;
+  /** Filled fraction of the intended position. 0 = missed fill, 1 = fully filled. */
+  fillRatioModel?: (bar: BacktestBar, decision: Extract<TradingDecision, { action: EntryAction }>) => number;
 }
 
 export interface BacktestConfig {
@@ -55,6 +59,7 @@ export interface SimTrade {
   qty: number;
   grossPnl: number;
   fees: number;
+  spreadCost: number;
   slippageCost: number;
   fundingCost: number;
   netPnl: number;
@@ -83,6 +88,7 @@ export interface BacktestMetrics {
   longPerformanceByRegime: Partial<Record<Regime, RegimePerf>>;
   shortPerformanceByRegime: Partial<Record<Regime, RegimePerf>>;
   feeImpact: number; // total fees paid (USD)
+  spreadImpact: number; // total spread cost (USD)
   slippageImpact: number; // total slippage cost (USD)
   fundingImpact: number; // total funding cost (USD)
   noTradeDays: number;
@@ -92,6 +98,67 @@ export interface BacktestMetrics {
 const DEFAULT_FEE = (notional: number): number => notional * 0.0005; // 5 bps/side
 const bpsToFrac = (bps: number): number => bps / 10_000;
 const dayKey = (ts: number): number => Math.floor(ts / 86_400_000);
+const clamp01 = (n: number): number => Math.max(0, Math.min(1, Number.isFinite(n) ? n : 0));
+
+export type BacktestCostScenarioName = "optimistic" | "base" | "pessimistic";
+
+export interface BacktestCostScenario {
+  name: BacktestCostScenarioName;
+  models: Required<BacktestModels>;
+}
+
+export function backtestCostScenarios(): BacktestCostScenario[] {
+  const feeBps = (bps: number) => (notional: number): number => notional * bpsToFrac(bps);
+  const plusSlippage = (extraBps: number) => (bar: BacktestBar): number => Math.max(0, bar.ctx.slippageBps) + extraBps;
+  const spread = (multiplier: number) => (bar: BacktestBar): number => Math.max(0, bar.ctx.spreadBps) * multiplier;
+
+  return [
+    {
+      name: "optimistic",
+      models: {
+        feeModel: feeBps(3),
+        slippageBpsModel: (bar) => Math.max(0, bar.ctx.slippageBps),
+        spreadBpsModel: spread(0.5),
+        fundingModel: () => 0,
+        fillRatioModel: () => 1,
+      },
+    },
+    {
+      name: "base",
+      models: {
+        feeModel: feeBps(5),
+        slippageBpsModel: plusSlippage(1),
+        spreadBpsModel: spread(1),
+        fundingModel: (_bar, notional) => notional * 0.00002,
+        fillRatioModel: () => 0.9,
+      },
+    },
+    {
+      name: "pessimistic",
+      models: {
+        feeModel: feeBps(10),
+        slippageBpsModel: plusSlippage(5),
+        spreadBpsModel: spread(1.5),
+        fundingModel: (_bar, notional) => notional * 0.0001,
+        fillRatioModel: () => 0.7,
+      },
+    },
+  ];
+}
+
+export function runBacktestCostScenarios(
+  config: Omit<BacktestConfig, "models"> & { models?: BacktestModels },
+): Record<BacktestCostScenarioName, BacktestMetrics> {
+  const out = {} as Record<BacktestCostScenarioName, BacktestMetrics>;
+  const baseModels = config.models ?? {};
+  for (const scenario of backtestCostScenarios()) {
+    out[scenario.name] = runBacktest({
+      ...config,
+      models: { ...scenario.models, ...baseModels },
+    });
+  }
+  return out;
+}
 
 interface OpenState {
   lane: LaneId;
@@ -105,6 +172,7 @@ interface OpenState {
   slPrice: number;
   beArmATR?: number;
   entrySlippageCost: number;
+  entrySpreadCost: number;
   entryFee: number;
   fundingAccrued: number;
 }
@@ -119,6 +187,8 @@ export function runBacktest(config: BacktestConfig): BacktestMetrics {
   const feeModel = config.models?.feeModel ?? DEFAULT_FEE;
   const fundingModel = config.models?.fundingModel ?? (() => 0);
   const slippageBpsModel = config.models?.slippageBpsModel ?? ((bar) => bar.ctx.slippageBps);
+  const spreadBpsModel = config.models?.spreadBpsModel ?? (() => 0);
+  const fillRatioModel = config.models?.fillRatioModel ?? (() => 1);
   const respectCooldowns = config.respectCooldowns ?? true;
 
   let equity = startingEquity;
@@ -147,11 +217,14 @@ export function runBacktest(config: BacktestConfig): BacktestMetrics {
     const exitNotional = Math.abs(exitPrice * open.qty);
     const exitFee = feeModel(exitNotional);
     const exitSlipBps = slippageBpsModel(bar);
+    const exitSpreadBps = spreadBpsModel(bar);
     const exitSlippageCost = exitNotional * bpsToFrac(exitSlipBps);
+    const exitSpreadCost = exitNotional * bpsToFrac(exitSpreadBps);
     const fees = open.entryFee + exitFee;
     const slippageCost = open.entrySlippageCost + exitSlippageCost;
+    const spreadCost = open.entrySpreadCost + exitSpreadCost;
     const fundingCost = open.fundingAccrued;
-    const net = gross - fees - slippageCost - fundingCost;
+    const net = gross - fees - spreadCost - slippageCost - fundingCost;
 
     equity += net;
     peakEquity = Math.max(peakEquity, equity);
@@ -180,6 +253,7 @@ export function runBacktest(config: BacktestConfig): BacktestMetrics {
       qty: open.qty,
       grossPnl: gross,
       fees,
+      spreadCost,
       slippageCost,
       fundingCost,
       netPnl: net,
@@ -255,16 +329,20 @@ export function runBacktest(config: BacktestConfig): BacktestMetrics {
 
     // Open the trade: adjust the entry against us by the entry-side slippage.
     const entrySlipBps = slippageBpsModel(bar);
+    const entrySpreadBps = spreadBpsModel(bar);
     const isLong = decision.action === "ENTER_LONG";
+    const fillRatio = clamp01(fillRatioModel(bar, decision));
+    if (fillRatio <= 0) continue; // missed maker fill / no executable size.
     const entryPrice = bar.price * (1 + (isLong ? 1 : -1) * bpsToFrac(entrySlipBps));
     const slDistance = decision.exit.stopLossATR * bar.atr;
     if (!(slDistance > 0)) continue; // degenerate ATR — skip.
 
     const riskUsd = equity * (decision.risk.riskPerTradePct / 100);
-    const qty = riskUsd / slDistance;
+    const qty = (riskUsd / slDistance) * fillRatio;
     const entryNotional = Math.abs(entryPrice * qty);
     const entryFee = feeModel(entryNotional);
     const entrySlippageCost = entryNotional * bpsToFrac(entrySlipBps);
+    const entrySpreadCost = entryNotional * bpsToFrac(entrySpreadBps);
 
     open = {
       lane: decision.lane,
@@ -280,6 +358,7 @@ export function runBacktest(config: BacktestConfig): BacktestMetrics {
       slPrice: isLong ? entryPrice - slDistance : entryPrice + slDistance,
       beArmATR: decision.exit.moveStopToBreakevenAfterATR,
       entrySlippageCost,
+      entrySpreadCost,
       entryFee,
       fundingAccrued: 0,
     };
@@ -364,6 +443,7 @@ function summarize(
     longPerformanceByRegime: longByRegime,
     shortPerformanceByRegime: shortByRegime,
     feeImpact: trades.reduce((s, t) => s + t.fees, 0),
+    spreadImpact: trades.reduce((s, t) => s + t.spreadCost, 0),
     slippageImpact: trades.reduce((s, t) => s + t.slippageCost, 0),
     fundingImpact: trades.reduce((s, t) => s + t.fundingCost, 0),
     noTradeDays: Math.max(0, totalDays - tradedDays),

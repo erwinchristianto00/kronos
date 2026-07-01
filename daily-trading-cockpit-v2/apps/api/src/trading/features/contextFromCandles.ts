@@ -1,6 +1,14 @@
 import type { Candle } from "@dtc/shared";
 import { ema, rsi, atr, vwap, average } from "@dtc/shared";
-import type { MarketContext, Timeframe, TimeframeFreshness } from "../types.js";
+import type {
+  BreadthUniverseKind,
+  FeatureSourceMap,
+  LiquiditySource,
+  LiquidityTier,
+  MarketContext,
+  Timeframe,
+  TimeframeFreshness,
+} from "../types.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Feature adapter: historical candles → MarketContext.
@@ -18,9 +26,13 @@ import type { MarketContext, Timeframe, TimeframeFreshness } from "../types.js";
 //     flags and liquidation-flush detection. These approximate discretionary
 //     patterns from swing levels; treat as provisional until validated.
 //   • MUST BE SUPPLIED (never guessed): market breadth, microstructure (spread /
-//     slippage / liquidity / funding), governance counters. Left undefined if not
-//     provided, which is fail-SAFE (a lane requiring an unset flag simply won't
-//     fire).
+//     slippage / liquidity / funding), governance counters. Missing required
+//     execution/microstructure fields fail closed in buildTradingDecision.
+//
+// LOOKAHEAD RULE:
+//   All derived flags below use only candles whose close time is <= `asOf`.
+//   Future candles and the currently-forming candle are filtered out before any
+//   indicator, support/retest, higher-low, or rejection calculation is made.
 //
 // Consistency guarantee: the adapter is written so it never emits a pair of flags
 // that contextIntegrity.detectContradictions would reject (e.g. it derives
@@ -97,15 +109,31 @@ export interface FeatureAdapterInput {
   eth?: { h1: Candle[] };
   /** Optional candles for the specific ALT being evaluated (relative-strength lane). */
   coin?: { h1: Candle[] };
-  /** Breadth summary from the universe scanner (fractions 0..1). Cannot be derived here. */
-  breadth?: { advancersPct?: number; altAdvancersPct?: number };
+  /**
+   * Breadth summary from the universe scanner (fractions 0..1). Cannot be derived
+   * here. For historical backtests, prefer POINT_IN_TIME. If the scanner uses
+   * today's high-liquidity majors, set CURRENT_HIGH_LIQUIDITY_MAJORS so reports
+   * can label the survivorship-bias risk instead of overstating the result.
+   */
+  breadth?: {
+    advancersPct?: number;
+    altAdvancersPct?: number;
+    universeKind?: BreadthUniverseKind;
+    universeSnapshotMs?: number;
+    universeDescription?: string;
+  };
   /** Microstructure — must be supplied (orderbook/exchange, not candles). */
   microstructure: {
     spreadBps: number;
     slippageBps: number;
     liquidityGood?: boolean;
     liquidityTooThin?: boolean;
+    liquidityTier?: LiquidityTier;
+    liquiditySource?: LiquiditySource;
+    quoteVolumeUsd24h?: number;
+    orderbookDepthUsd?: number;
     fundingRiskAbnormal?: boolean;
+    assumeFundingBaseline?: boolean;
     volatilityTooHigh?: boolean;
     isDecisionZone?: boolean;
     signalConflict?: boolean;
@@ -127,6 +155,72 @@ export interface FeatureAdapterInput {
 const closesOf = (c: Candle[]): number[] => c.map((x) => x.close);
 const tail = <T>(a: T[], n: number): T[] => a.slice(-Math.min(n, a.length));
 const lastClose = (c: Candle[]): number => (c.length ? c[c.length - 1]!.close : NaN);
+const candleCloseTime = (c: Candle, tf: Timeframe): number => c.openTime + TF_MS[tf];
+
+function closedCandles(c: Candle[] | undefined, tf: Timeframe, asOf: number): Candle[] {
+  return (c ?? []).filter((x) => candleCloseTime(x, tf) <= asOf);
+}
+
+function finitePositive(n: number | undefined): n is number {
+  return typeof n === "number" && Number.isFinite(n) && n > 0;
+}
+
+interface LiquidityAssessment {
+  liquidityGood?: boolean;
+  liquidityTooThin?: boolean;
+  tier: LiquidityTier;
+  source?: LiquiditySource;
+  featureSource?: "SUPPLIED" | "ORDERBOOK_DEPTH" | "HEURISTIC";
+}
+
+function assessLiquidity(input: FeatureAdapterInput["microstructure"]): LiquidityAssessment {
+  const tier = input.liquidityTier ?? "ALT";
+
+  if (input.liquidityGood !== undefined) {
+    const source = input.liquiditySource ?? "SUPPLIED";
+    return {
+      liquidityGood: input.liquidityGood,
+      liquidityTooThin: input.liquidityTooThin ?? (input.liquidityGood === false ? true : undefined),
+      tier,
+      source,
+      featureSource: source === "ORDERBOOK_DEPTH" ? "ORDERBOOK_DEPTH" : source === "HEURISTIC_SPREAD_VOLUME" ? "HEURISTIC" : "SUPPLIED",
+    };
+  }
+
+  const spreadBps = input.spreadBps;
+  const quoteVolumeUsd24h = input.quoteVolumeUsd24h;
+  const orderbookDepthUsd = input.orderbookDepthUsd;
+  const isMajor = tier === "MAJOR";
+
+  if (finitePositive(orderbookDepthUsd) && finitePositive(quoteVolumeUsd24h)) {
+    const spreadOk = spreadBps <= (isMajor ? 5 : 3);
+    const volumeOk = quoteVolumeUsd24h >= (isMajor ? 50_000_000 : 10_000_000);
+    const depthOk = orderbookDepthUsd >= (isMajor ? 1_000_000 : 250_000);
+    const good = spreadOk && volumeOk && depthOk;
+    return {
+      liquidityGood: good,
+      liquidityTooThin: input.liquidityTooThin ?? !good,
+      tier,
+      source: "ORDERBOOK_DEPTH",
+      featureSource: "ORDERBOOK_DEPTH",
+    };
+  }
+
+  if (finitePositive(quoteVolumeUsd24h)) {
+    const spreadOk = spreadBps <= (isMajor ? 4 : 2);
+    const volumeOk = quoteVolumeUsd24h >= (isMajor ? 100_000_000 : 25_000_000);
+    const good = spreadOk && volumeOk;
+    return {
+      liquidityGood: good,
+      liquidityTooThin: input.liquidityTooThin ?? !good,
+      tier,
+      source: "HEURISTIC_SPREAD_VOLUME",
+      featureSource: "HEURISTIC",
+    };
+  }
+
+  return { liquidityTooThin: input.liquidityTooThin, tier };
+}
 
 function swingHigh(c: Candle[], lookback: number): number {
   return Math.max(...tail(c, lookback).map((x) => x.high));
@@ -178,11 +272,20 @@ function bearishRejection(candle: Candle): boolean {
  */
 export function contextFromCandles(input: FeatureAdapterInput): MarketContext {
   const cfg: FeatureAdapterConfig = { ...DEFAULT_FEATURE_CONFIG, ...input.config };
-  const { btc, asOf } = input;
-  const h1 = btc.h1 ?? [];
-  const h4 = btc.h4 ?? [];
-  const d1 = btc.d1 ?? [];
-  const shortTf = btc.m5 ?? btc.m15 ?? [];
+  const { asOf } = input;
+  const btc = {
+    m5: closedCandles(input.btc.m5, "5m", asOf),
+    m15: closedCandles(input.btc.m15, "15m", asOf),
+    h1: closedCandles(input.btc.h1, "1h", asOf),
+    h4: closedCandles(input.btc.h4, "4h", asOf),
+    d1: closedCandles(input.btc.d1, "1d", asOf),
+  };
+  const ethH1 = closedCandles(input.eth?.h1, "1h", asOf);
+  const coinH1 = closedCandles(input.coin?.h1, "1h", asOf);
+  const h1 = btc.h1;
+  const h4 = btc.h4;
+  const d1 = btc.d1;
+  const shortTf = btc.m5.length > 0 ? btc.m5 : btc.m15;
 
   // Data sufficiency: too few candles ⇒ low confidence + stale (fail-safe).
   const insufficient = h1.length < cfg.emaPeriod + 2 || h4.length < 4 || d1.length < 2;
@@ -226,7 +329,7 @@ export function contextFromCandles(input: FeatureAdapterInput): MarketContext {
   const nearEmaOrVwap =
     nearLevel(priceH1, ema20, cfg.levelTolerancePct) || nearLevel(priceH1, vwapH1, cfg.levelTolerancePct);
   const pricePullbackToVWAPOrEMA20 = nearEmaOrVwap && recentUp ? true : undefined;
-  const coinCloses = input.coin?.h1 ? closesOf(input.coin.h1) : null;
+  const coinCloses = coinH1.length ? closesOf(coinH1) : null;
 
   // ── volume regime ────────────────────────────────────────────────────────
   const avgVol = avgVolume(h1, cfg.window);
@@ -292,17 +395,17 @@ export function contextFromCandles(input: FeatureAdapterInput): MarketContext {
 
   // ── ETH confirmation ─────────────────────────────────────────────────────
   let ethConfirms: boolean | undefined;
-  if (input.eth?.h1 && input.eth.h1.length >= cfg.emaPeriod + 2) {
-    const ethCloses = closesOf(input.eth.h1);
-    ethConfirms = lastClose(input.eth.h1) > ema(ethCloses, cfg.emaPeriod) && rsi(ethCloses, cfg.rsiPeriod) >= 50;
+  if (ethH1.length >= cfg.emaPeriod + 2) {
+    const ethCloses = closesOf(ethH1);
+    ethConfirms = lastClose(ethH1) > ema(ethCloses, cfg.emaPeriod) && rsi(ethCloses, cfg.rsiPeriod) >= 50;
   }
 
   // ── per-coin relative strength ───────────────────────────────────────────
   let coinAboveVWAP: boolean | undefined;
   let coinOutperformsBTC: boolean | undefined;
-  if (input.coin?.h1 && input.coin.h1.length >= cfg.vwapWindow) {
-    const coinPrice = lastClose(input.coin.h1);
-    coinAboveVWAP = coinPrice > rollingVwap(input.coin.h1, cfg.vwapWindow);
+  if (coinH1.length >= cfg.vwapWindow) {
+    const coinPrice = lastClose(coinH1);
+    coinAboveVWAP = coinPrice > rollingVwap(coinH1, cfg.vwapWindow);
     if (coinCloses && h1.length >= cfg.window) {
       const coinRet = coinCloses[coinCloses.length - 1]! / coinCloses[Math.max(0, coinCloses.length - cfg.window)]! - 1;
       const btcRet = priceH1 / closesOf(h1)[Math.max(0, h1.length - cfg.window)]! - 1;
@@ -320,6 +423,15 @@ export function contextFromCandles(input: FeatureAdapterInput): MarketContext {
     b?.altAdvancersPct !== undefined ? b.altAdvancersPct >= cfg.breadthWeakPct : undefined;
   const altBreadthPositive =
     b?.altAdvancersPct !== undefined ? b.altAdvancersPct >= cfg.breadthPositivePct : undefined;
+  const liquidity = assessLiquidity(input.microstructure);
+  const fundingRiskAbnormal =
+    input.microstructure.fundingRiskAbnormal ??
+    (input.microstructure.assumeFundingBaseline === true ? false : undefined);
+  const fundingFeatureSource = input.microstructure.fundingRiskAbnormal !== undefined
+    ? "SUPPLIED"
+    : input.microstructure.assumeFundingBaseline === true
+      ? "ASSUMED_BASELINE"
+      : "SUPPLIED";
 
   // ── freshness ────────────────────────────────────────────────────────────
   const freshness: TimeframeFreshness[] = [];
@@ -338,6 +450,68 @@ export function contextFromCandles(input: FeatureAdapterInput): MarketContext {
 
   const regimeConfidence = input.governance.regimeConfidence ?? (insufficient ? 0.5 : cfg.defaultRegimeConfidence);
 
+  const featureSources: FeatureSourceMap = {
+    btcBelow60000: ["1h"],
+    btcBelow62000: ["1h"],
+    btcBreaksBelow55000: ["1h"],
+    btcNotBreakingMajorSupport: ["1h"],
+    btcClose4hAbove62000: ["4h"],
+    btcCloseDailyAbove65000: ["1d"],
+    btcBelowKeyResistance: ["1h", "4h"],
+    pricePullbackToVWAPOrEMA20: ["1h"],
+    rsi1h: ["1h"],
+    rsiShortTf: btc.m5.length > 0 ? ["5m"] : ["15m"],
+    rejectionCandle: ["1h"],
+    volumeWeakOnBounce: ["1h"],
+    volumeExpansion: ["1h"],
+    volumeNotDead: ["1h"],
+    priceNearLowerRange: ["1h"],
+    btcHigherLow: ["1h"],
+    higherLowFormed: ["1h"],
+    marketStructureBullish: ["4h"],
+    liquidationFlushDetected: ["1h"],
+    supportBroken: ["1h"],
+    closeBelowSupport: ["1h"],
+    supportHolds: ["1h"],
+    pullbackHolds: ["1h"],
+    pullbackToSupport: ["1h"],
+    resistanceBroken: ["1h"],
+    retestResistanceAsSupport: ["1h"],
+    retestOldSupport: ["1h"],
+    retestFailed: ["1h"],
+    retest62000Hold: ["1h", "4h"],
+    btcStillWeak: ["1h", "4h"],
+    ethConfirms: ["1h"],
+    coinAboveVWAP: ["1h"],
+    coinOutperformsBTC: ["1h"],
+    marketBreadthWeak: ["SUPPLIED"],
+    marketBreadthPositive: ["SUPPLIED"],
+    marketBreadthCollapses: ["SUPPLIED"],
+    breadthUniverseKind: ["SUPPLIED"],
+    breadthUniverseSnapshotMs: ["SUPPLIED"],
+    breadthUniverseDescription: ["SUPPLIED"],
+    altBreadthImproves: ["SUPPLIED"],
+    altBreadthPositive: ["SUPPLIED"],
+    liquidityGood: liquidity.featureSource ? [liquidity.featureSource] : ["SUPPLIED"],
+    liquidityTooThin: liquidity.featureSource ? [liquidity.featureSource] : ["SUPPLIED"],
+    liquidityTier: ["SUPPLIED"],
+    liquiditySource: ["SUPPLIED"],
+    spreadBps: ["SUPPLIED"],
+    slippageBps: ["SUPPLIED"],
+    fundingRiskAbnormal: [fundingFeatureSource],
+    volatilityTooHigh: ["SUPPLIED"],
+    isDecisionZone: ["SUPPLIED"],
+    signalConflict: ["SUPPLIED"],
+    dailyLossPct: ["GOVERNANCE"],
+    consecutiveLosses: ["GOVERNANCE"],
+    openPositions: ["GOVERNANCE"],
+    tradesToday: ["GOVERNANCE"],
+    regimeConfidence: ["GOVERNANCE"],
+    asOf: ["GOVERNANCE"],
+    freshness: ["GOVERNANCE"],
+    dataStale: ["GOVERNANCE"],
+  };
+
   const ctx: MarketContext = {
     // macro/structure
     btcBelow60000,
@@ -355,6 +529,9 @@ export function contextFromCandles(input: FeatureAdapterInput): MarketContext {
     marketBreadthWeak,
     marketBreadthPositive,
     marketBreadthCollapses,
+    breadthUniverseKind: b?.universeKind,
+    breadthUniverseSnapshotMs: b?.universeSnapshotMs,
+    breadthUniverseDescription: b?.universeDescription,
     marketStructureBullish,
     volumeNotDead,
     volumeExpansion,
@@ -383,8 +560,10 @@ export function contextFromCandles(input: FeatureAdapterInput): MarketContext {
     btcStableAboveSupport,
     coinOutperformsBTC,
     coinAboveVWAP,
-    liquidityGood: input.microstructure.liquidityGood,
-    liquidityTooThin: input.microstructure.liquidityTooThin,
+    liquidityGood: liquidity.liquidityGood,
+    liquidityTooThin: liquidity.liquidityTooThin,
+    liquidityTier: liquidity.tier,
+    liquiditySource: liquidity.source,
     // governance (required)
     dailyLossPct: input.governance.dailyLossPct,
     consecutiveLosses: input.governance.consecutiveLosses,
@@ -395,13 +574,14 @@ export function contextFromCandles(input: FeatureAdapterInput): MarketContext {
     isDecisionZone: input.microstructure.isDecisionZone,
     volatilityTooHigh: input.microstructure.volatilityTooHigh,
     signalConflict: input.microstructure.signalConflict,
-    fundingRiskAbnormal: input.microstructure.fundingRiskAbnormal,
+    fundingRiskAbnormal,
     // counters
     openPositions: input.governance.openPositions,
     tradesToday: input.governance.tradesToday,
     // freshness
     asOf,
     freshness,
+    featureSources,
     dataStale: insufficient ? true : undefined,
     ...input.overrides,
   };

@@ -73,6 +73,7 @@ export interface RiskConfig {
 export type RejectedBy =
   | "CONTRADICTORY_CONTEXT"
   | "DATA_STALE"
+  | "MISSING_EXECUTION_DATA"
   | "REGIME_NO_TRADE"
   | "NO_TRADE_GUARD"
   | "RISK_GUARD"
@@ -97,6 +98,8 @@ export interface DecisionTrace {
   executionGuardReason: string | null;
   /** Contradiction codes detected in the context (empty when none). */
   contradictions: string[];
+  /** Optional map from flat flags back to their source timeframe(s) or supplied source. */
+  featureSources?: FeatureSourceMap;
 }
 
 export type TradingDecision =
@@ -149,6 +152,10 @@ export interface MarketContext {
   marketBreadthWeak?: boolean;
   marketBreadthPositive?: boolean;
   marketBreadthCollapses?: boolean;
+  /** Breadth universe provenance. CURRENT_HIGH_LIQUIDITY_MAJORS is a documented survivorship-bias risk. */
+  breadthUniverseKind?: BreadthUniverseKind;
+  breadthUniverseSnapshotMs?: number;
+  breadthUniverseDescription?: string;
   marketStructureBullish?: boolean;
   volumeNotDead?: boolean;
   volumeExpansion?: boolean;
@@ -183,6 +190,8 @@ export interface MarketContext {
   coinAboveVWAP?: boolean;
   liquidityGood?: boolean;
   liquidityTooThin?: boolean;
+  liquidityTier?: LiquidityTier;
+  liquiditySource?: LiquiditySource;
 
   // ── Governance / guards (required) ───────────────────────────────────────
   dailyLossPct: number;
@@ -215,10 +224,25 @@ export interface MarketContext {
   freshness?: TimeframeFreshness[];
   /** Coarse escape hatch: upstream may set this directly to force a no-trade. */
   dataStale?: boolean;
+  /** Optional provenance for flattened flags, filled by adapters/backtests when available. */
+  featureSources?: FeatureSourceMap;
 
   // ── Enrichment (filled by buildTradingDecision after detection) ──────────
   regime?: Regime;
 }
+
+export type FeatureSource =
+  | Timeframe
+  | "SUPPLIED"
+  | "GOVERNANCE"
+  | "OVERRIDE"
+  | "ASSUMED_BASELINE"
+  | "ORDERBOOK_DEPTH"
+  | "HEURISTIC";
+export type FeatureSourceMap = Partial<Record<keyof MarketContext, FeatureSource[]>>;
+export type BreadthUniverseKind = "POINT_IN_TIME" | "CURRENT_HIGH_LIQUIDITY_MAJORS";
+export type LiquidityTier = "MAJOR" | "ALT";
+export type LiquiditySource = "SUPPLIED" | "ORDERBOOK_DEPTH" | "HEURISTIC_SPREAD_VOLUME";
 
 /** A lane is a self-contained entry hypothesis. `shouldEnter` must be pure. */
 export interface StrategyLane {

@@ -8,7 +8,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "dev": "npm run build -w @dtc/shared && tsx watch src/server.ts",
-    "test": "npm run build -w @dtc/shared && vitest run --no-file-parallelism --pool=threads --maxWorkers=1"
+    "test": "npm run build -w @dtc/shared && vitest run --no-file-parallelism --pool=threads --maxWorkers=1",
+    "validate:regime": "tsx scripts/run-regime-validation.ts"
   },
   "dependencies": {
     "@dtc/shared": "0.1.0",

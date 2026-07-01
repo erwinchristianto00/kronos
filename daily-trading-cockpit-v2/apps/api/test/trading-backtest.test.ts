@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import type { BacktestBar, MarketContext } from "../src/trading/index.js";
-import { runBacktest, rejectStrategy, walkForwardBacktest } from "../src/trading/index.js";
+import { runBacktest, rejectStrategy, runBacktestCostScenarios, walkForwardBacktest } from "../src/trading/index.js";
 
 const MIN = 60_000;
 
@@ -12,6 +12,8 @@ function fadeCtx(): MarketContext {
     consecutiveLosses: 0,
     spreadBps: 2,
     slippageBps: 2,
+    liquidityGood: true,
+    fundingRiskAbnormal: false,
     regimeConfidence: 0.9,
     openPositions: 0,
     tradesToday: 0,
@@ -32,6 +34,8 @@ function flatCtx(): MarketContext {
     consecutiveLosses: 0,
     spreadBps: 2,
     slippageBps: 2,
+    liquidityGood: true,
+    fundingRiskAbnormal: false,
     regimeConfidence: 0.9,
     openPositions: 0,
     tradesToday: 0,
@@ -70,6 +74,7 @@ describe("runBacktest", () => {
     expect(m.totalReturn).toBeGreaterThan(0);
     expect(m.feeImpact).toBeGreaterThan(0);
     expect(m.slippageImpact).toBeGreaterThan(0);
+    expect(m.spreadImpact).toBe(0);
     expect(m.shortPerformanceByRegime.BEARISH_CHOPPY_DEFENSIVE?.trades).toBe(1);
   });
 
@@ -98,6 +103,23 @@ describe("runBacktest", () => {
     const immediate: BacktestBar = { timestamp: 2 * MIN, ctx: fadeCtx(), price: 100, high: 100.5, low: 99.5, atr: 1 };
     const m = runBacktest({ bars: [...loss, immediate], startingEquity: 10_000, respectCooldowns: true });
     expect(m.numTrades).toBe(1); // only the first (losing) trade
+  });
+
+  it("runs optimistic/base/pessimistic cost scenarios with increasingly brutal costs", () => {
+    const results = runBacktestCostScenarios({
+      bars: shortPair(0, "TP"),
+      startingEquity: 10_000,
+    });
+
+    expect(Object.keys(results).sort()).toEqual(["base", "optimistic", "pessimistic"]);
+    expect(results.base.feeImpact).toBeGreaterThan(results.optimistic.feeImpact);
+    expect(results.pessimistic.feeImpact).toBeGreaterThan(results.base.feeImpact);
+    expect(results.base.spreadImpact).toBeGreaterThan(results.optimistic.spreadImpact);
+    expect(results.pessimistic.spreadImpact).toBeGreaterThan(results.base.spreadImpact);
+    expect(results.base.slippageImpact).toBeGreaterThan(results.optimistic.slippageImpact);
+    expect(results.pessimistic.slippageImpact).toBeGreaterThan(results.base.slippageImpact);
+    expect(results.base.fundingImpact).toBeGreaterThan(0);
+    expect(results.pessimistic.fundingImpact).toBeGreaterThan(results.base.fundingImpact);
   });
 });
 

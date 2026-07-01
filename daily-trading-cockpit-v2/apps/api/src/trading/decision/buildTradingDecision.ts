@@ -11,7 +11,7 @@ import { evaluateNoTrade, noTradeDecision } from "./noTradeGuard.js";
 import { riskGuard } from "../risk/riskGuard.js";
 import { executionGuard } from "../execution/executionGuard.js";
 import { buildLaneDecision } from "../lanes/laneKit.js";
-import { detectContradictions, stalenessReasons } from "../contextIntegrity.js";
+import { detectContradictions, missingExecutionDataReasons, stalenessReasons } from "../contextIntegrity.js";
 import { decisionSafetyRejection } from "../safety.js";
 import { shortRallyFade } from "../lanes/shortRallyFade.js";
 import { breakdownRetestShort } from "../lanes/breakdownRetestShort.js";
@@ -25,14 +25,15 @@ import { relativeStrengthLong } from "../lanes/relativeStrengthLong.js";
 //   1. detect regime
 //   2. enrich context with the regime
 //   3. context integrity     (contradictions → stand aside)
-//   4. freshness             (stale multi-TF data → stand aside)
-//   5. no-trade guard        (hostile environment → stand aside)
-//   6. risk guard            (mode-level caps / cooldown gates)
-//   7. route lanes by regime priority; first lane whose predicate AND execution
+//   4. required execution data (missing microstructure → stand aside)
+//   5. freshness             (stale multi-TF data → stand aside)
+//   6. no-trade guard        (hostile environment → stand aside)
+//   7. risk guard            (mode-level caps / cooldown gates)
+//   8. route lanes by regime priority; first lane whose predicate AND execution
 //      guard pass wins
-//   8. FINAL HARD GATE        (forbidden lane / forbidden risk can NEVER enter,
+//   9. FINAL HARD GATE        (forbidden lane / forbidden risk can NEVER enter,
 //                              even if a lane or the config is wrong)
-//   9. otherwise NO_TRADE "No valid lane setup"
+//   10. otherwise NO_TRADE "No valid lane setup"
 //
 // Every return carries a DecisionTrace so any outcome is fully explainable.
 //
@@ -86,6 +87,7 @@ export function buildTradingDecision(
   const regime = detectRegime(rawCtx);
   const ctx: MarketContext = { ...rawCtx, regime };
   const trace = emptyTrace(regime);
+  trace.featureSources = rawCtx.featureSources;
 
   // 3. context integrity — contradictory inputs mean the feature layer disagrees
   //    with itself; never trust priority resolution over a contradiction.
@@ -97,7 +99,18 @@ export function buildTradingDecision(
     return withTrace(noTradeDecision(ctx, regime, [`CONTRADICTORY_CONTEXT:${contradictions.join(",")}`]), trace);
   }
 
-  // 4. freshness — stale multi-timeframe data cannot be traded on.
+  // 4. required execution data — missing microstructure cannot be traded on.
+  const missingExecution = missingExecutionDataReasons(ctx);
+  if (missingExecution.length > 0) {
+    trace.rejectedBy = "MISSING_EXECUTION_DATA";
+    trace.noTradeReason = missingExecution;
+    return withTrace(
+      noTradeDecision(ctx, regime, [`MISSING_EXECUTION_DATA:${missingExecution.join(",")}`]),
+      trace,
+    );
+  }
+
+  // 5. freshness — stale multi-timeframe data cannot be traded on.
   const stale = stalenessReasons(ctx);
   if (stale.length > 0) {
     trace.rejectedBy = "DATA_STALE";

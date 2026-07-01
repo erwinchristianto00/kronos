@@ -46,6 +46,23 @@ export function detectContradictions(ctx: MarketContext): string[] {
 }
 
 /**
+ * Runtime hard gate for execution/microstructure fields that TypeScript cannot
+ * protect after JSON parsing or test casts. Missing data is worse than bad data:
+ * a future lane could forget its own spread/slippage checks, so the master router
+ * must fail closed before any lane predicate is evaluated.
+ */
+export function missingExecutionDataReasons(ctx: MarketContext): string[] {
+  const reasons: string[] = [];
+
+  if (!Number.isFinite(ctx.spreadBps)) reasons.push("MISSING_SPREAD_BPS");
+  if (!Number.isFinite(ctx.slippageBps)) reasons.push("MISSING_SLIPPAGE_BPS");
+  if (ctx.liquidityGood === undefined) reasons.push("MISSING_LIQUIDITY_GOOD");
+  if (ctx.fundingRiskAbnormal === undefined) reasons.push("MISSING_FUNDING_RISK_ABNORMAL");
+
+  return reasons;
+}
+
+/**
  * Multi-timeframe staleness. A context is stale if it was explicitly flagged
  * (`dataStale`) OR any declared timeframe's candle is older than its budget
  * relative to `asOf`. If `asOf` is absent we cannot age-check, so we only honor
