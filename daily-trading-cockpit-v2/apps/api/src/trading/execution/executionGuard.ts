@@ -27,6 +27,7 @@ export function executionGuard(
     orderType: "maker",
     maxHoldMinutes: exit.maxHoldMinutes,
     moveStopToBreakevenAfterATR: exit.moveStopToBreakevenAfterATR,
+    breakevenStopMode: exit.breakevenStopMode,
   });
 
   if (ctx.spreadBps > exec.maxSpreadBps) return reject(`SPREAD_TOO_WIDE:${ctx.spreadBps}>${exec.maxSpreadBps}`);
@@ -49,5 +50,6 @@ export function executionGuard(
     orderType,
     maxHoldMinutes: exit.maxHoldMinutes,
     moveStopToBreakevenAfterATR: exit.moveStopToBreakevenAfterATR,
+    breakevenStopMode: exit.breakevenStopMode,
   };
 }

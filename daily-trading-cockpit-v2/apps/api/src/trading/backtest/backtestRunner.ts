@@ -1,4 +1,12 @@
-import type { EntryAction, FeatureSourceMap, LaneId, MarketContext, Regime, TradingDecision } from "../types.js";
+import type {
+  BreakevenStopMode,
+  EntryAction,
+  FeatureSourceMap,
+  LaneId,
+  MarketContext,
+  Regime,
+  TradingDecision,
+} from "../types.js";
 import { buildTradingDecision } from "../decision/buildTradingDecision.js";
 import { getStrategyMode } from "../config/strategyModes.js";
 
@@ -46,6 +54,10 @@ export interface BacktestConfig {
   models?: BacktestModels;
   /** Honor mode cooldownAfterLoss / cooldownAfterTwoLosses. Default: true. */
   respectCooldowns?: boolean;
+  /** Test/report override. Strategy exits default to NET_BREAKEVEN when unset. */
+  breakevenStopMode?: BreakevenStopMode;
+  /** Optional extra buffer added to NET_BREAKEVEN cost estimates. Default: 0 bps. */
+  breakevenSafetyBufferBps?: number;
 }
 
 export interface SimTrade {
@@ -68,6 +80,14 @@ export interface SimTrade {
   takeProfitATR: number;
   stopLossATR: number;
   atrAtEntry: number;
+  rawBreakevenPrice: number | null;
+  netBreakevenPrice: number | null;
+  breakevenMode: BreakevenStopMode | null;
+  estimatedCostBufferPrice: number | null;
+  stopMovedToBreakevenAt: number | null;
+  stopMovedToBreakevenReason: string | null;
+  grossPnlAtBreakevenStop: number | null;
+  netPnlAtBreakevenStop: number | null;
   featureSources?: FeatureSourceMap;
 }
 
@@ -112,6 +132,7 @@ export interface BacktestRunDiagnostics {
 }
 
 const DEFAULT_FEE = (notional: number): number => notional * 0.0005; // 5 bps/side
+const DEFAULT_BREAKEVEN_MODE: BreakevenStopMode = "NET_BREAKEVEN";
 const bpsToFrac = (bps: number): number => bps / 10_000;
 const dayKey = (ts: number): number => Math.floor(ts / 86_400_000);
 const clamp01 = (n: number): number => Math.max(0, Math.min(1, Number.isFinite(n) ? n : 0));
@@ -189,6 +210,15 @@ interface OpenState {
   tpPrice: number;
   slPrice: number;
   beArmATR?: number;
+  breakevenMode?: BreakevenStopMode;
+  rawBreakevenPrice: number | null;
+  netBreakevenPrice: number | null;
+  estimatedCostBufferPrice: number | null;
+  estimatedBreakevenCost: number;
+  stopMovedToBreakevenAt: number | null;
+  stopMovedToBreakevenReason: string | null;
+  grossPnlAtBreakevenStop: number | null;
+  netPnlAtBreakevenStop: number | null;
   entrySlippageCost: number;
   entrySpreadCost: number;
   entryFee: number;
@@ -209,6 +239,7 @@ export function runBacktest(config: BacktestConfig): BacktestMetrics {
   const spreadBpsModel = config.models?.spreadBpsModel ?? (() => 0);
   const fillRatioModel = config.models?.fillRatioModel ?? (() => 1);
   const respectCooldowns = config.respectCooldowns ?? true;
+  const breakevenSafetyBufferBps = Math.max(0, config.breakevenSafetyBufferBps ?? 0);
 
   let equity = startingEquity;
   let peakEquity = startingEquity;
@@ -315,6 +346,14 @@ export function runBacktest(config: BacktestConfig): BacktestMetrics {
       takeProfitATR: open.takeProfitATR,
       stopLossATR: open.stopLossATR,
       atrAtEntry: open.atr,
+      rawBreakevenPrice: open.rawBreakevenPrice,
+      netBreakevenPrice: open.netBreakevenPrice,
+      breakevenMode: open.breakevenMode ?? null,
+      estimatedCostBufferPrice: open.estimatedCostBufferPrice,
+      stopMovedToBreakevenAt: open.stopMovedToBreakevenAt,
+      stopMovedToBreakevenReason: open.stopMovedToBreakevenReason,
+      grossPnlAtBreakevenStop: open.grossPnlAtBreakevenStop,
+      netPnlAtBreakevenStop: open.netPnlAtBreakevenStop,
       featureSources: open.featureSources,
     });
     open = null;
@@ -338,13 +377,25 @@ export function runBacktest(config: BacktestConfig): BacktestMetrics {
       open.fundingAccrued += fundingModel(bar, Math.abs(open.entryPrice * open.qty));
       const isLong = open.action === "ENTER_LONG";
 
-      // Breakeven ratchet: once price has moved beArm*ATR in favor, lift SL to entry.
+      // Breakeven ratchet: once price has moved beArm*ATR in favor, lift SL to
+      // raw entry or cost-adjusted net breakeven depending on explicit mode.
       if (open.beArmATR !== undefined) {
         const favMove = isLong ? bar.high - open.entryPrice : open.entryPrice - bar.low;
         if (favMove >= open.beArmATR * open.atr) {
-          open.slPrice = isLong
-            ? Math.max(open.slPrice, open.entryPrice)
-            : Math.min(open.slPrice, open.entryPrice);
+          const target =
+            open.breakevenMode === "RAW_BREAKEVEN"
+              ? open.rawBreakevenPrice ?? open.entryPrice
+              : open.netBreakevenPrice ?? open.entryPrice;
+          const previousSl = open.slPrice;
+          open.slPrice = isLong ? Math.max(open.slPrice, target) : Math.min(open.slPrice, target);
+          if (open.slPrice !== previousSl && open.stopMovedToBreakevenAt === null) {
+            const dir = isLong ? 1 : -1;
+            const grossAtStop = dir * (open.slPrice - open.entryPrice) * open.qty;
+            open.stopMovedToBreakevenAt = bar.timestamp;
+            open.stopMovedToBreakevenReason = `${open.breakevenMode ?? DEFAULT_BREAKEVEN_MODE}:favorable_move>=${open.beArmATR}ATR`;
+            open.grossPnlAtBreakevenStop = grossAtStop;
+            open.netPnlAtBreakevenStop = grossAtStop - open.estimatedBreakevenCost;
+          }
         }
       }
 
@@ -406,6 +457,29 @@ export function runBacktest(config: BacktestConfig): BacktestMetrics {
     const entryFee = feeModel(entryNotional);
     const entrySlippageCost = entryNotional * bpsToFrac(entrySlipBps);
     const entrySpreadCost = entryNotional * bpsToFrac(entrySpreadBps);
+    const estimatedExitFee = feeModel(entryNotional);
+    const estimatedExitSlippageCost = entryNotional * bpsToFrac(entrySlipBps);
+    const estimatedExitSpreadCost = entryNotional * bpsToFrac(entrySpreadBps);
+    const estimatedFundingCost = fundingModel(bar, entryNotional);
+    const breakevenSafetyCost = entryNotional * bpsToFrac(breakevenSafetyBufferBps);
+    const estimatedBreakevenCost =
+      entryFee +
+      entrySlippageCost +
+      entrySpreadCost +
+      estimatedExitFee +
+      estimatedExitSlippageCost +
+      estimatedExitSpreadCost +
+      estimatedFundingCost +
+      breakevenSafetyCost;
+    const estimatedCostBufferPrice = Math.abs(qty) > 0 ? estimatedBreakevenCost / Math.abs(qty) : 0;
+    const rawBreakevenPrice = entryPrice;
+    const netBreakevenPrice = isLong
+      ? entryPrice + estimatedCostBufferPrice
+      : entryPrice - estimatedCostBufferPrice;
+    const breakevenMode =
+      config.breakevenStopMode ??
+      decision.exit.breakevenStopMode ??
+      (decision.exit.moveStopToBreakevenAfterATR !== undefined ? DEFAULT_BREAKEVEN_MODE : undefined);
 
     open = {
       lane: decision.lane,
@@ -422,6 +496,15 @@ export function runBacktest(config: BacktestConfig): BacktestMetrics {
         : entryPrice - decision.exit.takeProfitATR * bar.atr,
       slPrice: isLong ? entryPrice - slDistance : entryPrice + slDistance,
       beArmATR: decision.exit.moveStopToBreakevenAfterATR,
+      breakevenMode,
+      rawBreakevenPrice: decision.exit.moveStopToBreakevenAfterATR !== undefined ? rawBreakevenPrice : null,
+      netBreakevenPrice: decision.exit.moveStopToBreakevenAfterATR !== undefined ? netBreakevenPrice : null,
+      estimatedCostBufferPrice: decision.exit.moveStopToBreakevenAfterATR !== undefined ? estimatedCostBufferPrice : null,
+      estimatedBreakevenCost,
+      stopMovedToBreakevenAt: null,
+      stopMovedToBreakevenReason: null,
+      grossPnlAtBreakevenStop: null,
+      netPnlAtBreakevenStop: null,
       entrySlippageCost,
       entrySpreadCost,
       entryFee,

@@ -74,11 +74,17 @@ describe("buildHistoricalValidationReport", () => {
     expect(report.tradingPerformance.pessimistic.fundingAssumptionNote).toMatch(/assumed baseline/i);
     expect(report.pnlMathAudit.grossPnlFormula.short).toMatch(/entryPrice - exitPrice/);
     expect(report.pnlMathAudit.costModelReducesNetPnl).toBe(true);
+    expect(report.pnlMathAudit.breakevenExitCounts).toEqual(expect.objectContaining({
+      rawBreakevenStopCount: expect.any(Number),
+      netBreakevenStopCount: expect.any(Number),
+      grossBreakevenStopCount: expect.any(Number),
+    }));
     expect(Array.isArray(report.tradeLedger)).toBe(true);
     for (const trade of report.tradeLedger) {
       expect(trade.symbol).toBe("BTCUSDT");
       expect(trade.featureSourcesUsedByEntryDecision).toBeDefined();
       expect(typeof trade.atrAtEntry).toBe("number");
+      expect(["RAW_BREAKEVEN", "NET_BREAKEVEN", null]).toContain(trade.breakevenMode);
     }
     expect(report.laneOpportunityDiagnostics.SHORT_RALLY_FADE).toBeDefined();
     expect(report.laneOpportunityDiagnostics.BREAKDOWN_RETEST_SHORT?.blockingConditionCounts).toBeDefined();

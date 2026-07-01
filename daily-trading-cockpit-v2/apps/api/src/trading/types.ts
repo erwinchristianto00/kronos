@@ -28,6 +28,7 @@ export type LaneId =
 export type EntryAction = "ENTER_LONG" | "ENTER_SHORT";
 
 export type Timeframe = "1m" | "5m" | "15m" | "1h" | "4h" | "1d";
+export type BreakevenStopMode = "RAW_BREAKEVEN" | "NET_BREAKEVEN";
 
 /**
  * Multi-timeframe freshness budget. The feature layer stamps, per timeframe, the
@@ -58,6 +59,8 @@ export interface ExitConfig {
   maxHoldMinutes: number;
   /** Once price has moved this many ATR in favor, ratchet the stop to breakeven. */
   moveStopToBreakevenAfterATR?: number;
+  /** RAW preserves legacy gross breakeven; NET targets cost-adjusted breakeven. */
+  breakevenStopMode?: BreakevenStopMode;
 }
 
 export interface RiskConfig {
@@ -270,6 +273,7 @@ export interface ExecutionDirective {
   orderType: OrderType;
   maxHoldMinutes: number;
   moveStopToBreakevenAfterATR?: number;
+  breakevenStopMode?: BreakevenStopMode;
 }
 
 // ── Strategy mode configuration (per regime) ────────────────────────────────

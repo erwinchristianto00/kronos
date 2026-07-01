@@ -18,6 +18,7 @@ export const shortRallyFade: StrategyLane = {
     stopLossATR: 0.7,
     maxHoldMinutes: 60,
     moveStopToBreakevenAfterATR: 0.35,
+    breakevenStopMode: "NET_BREAKEVEN",
   },
   risk: makeRiskConfig(0.15, 1),
   shouldEnter(ctx: MarketContext): boolean {

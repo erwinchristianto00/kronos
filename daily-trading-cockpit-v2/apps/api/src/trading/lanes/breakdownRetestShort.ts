@@ -18,6 +18,7 @@ export const breakdownRetestShort: StrategyLane = {
     stopLossATR: 0.8,
     maxHoldMinutes: 90,
     moveStopToBreakevenAfterATR: 0.4,
+    breakevenStopMode: "NET_BREAKEVEN",
   },
   risk: makeRiskConfig(0.15, 1),
   shouldEnter(ctx: MarketContext): boolean {

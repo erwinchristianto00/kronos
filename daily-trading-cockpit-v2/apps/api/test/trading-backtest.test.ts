@@ -133,9 +133,53 @@ function breakdownBreakevenStopPair(t0: number): BacktestBar[] {
   ];
 }
 
+function recoveryLongCtx(): MarketContext {
+  return {
+    dailyLossPct: 0,
+    consecutiveLosses: 0,
+    spreadBps: 2,
+    slippageBps: 2,
+    liquidityGood: true,
+    fundingRiskAbnormal: false,
+    regimeConfidence: 0.9,
+    openPositions: 0,
+    tradesToday: 0,
+    btcClose4hAbove62000: true,
+    retest62000Hold: true,
+    btcHigherLow: true,
+    ethConfirms: true,
+    altBreadthImproves: true,
+    volumeNotDead: true,
+    pullbackToSupport: true,
+    supportHolds: true,
+    marketBreadthPositive: true,
+  };
+}
+
+function longBreakevenStopPair(t0: number, lowAfterArm: number): BacktestBar[] {
+  return [
+    {
+      timestamp: t0,
+      ctx: recoveryLongCtx(),
+      price: 100,
+      high: 100.1,
+      low: 99.9,
+      atr: 1,
+    },
+    {
+      timestamp: t0 + MIN,
+      ctx: flatCtx(),
+      price: 100.15,
+      high: 100.5,
+      low: lowAfterArm,
+      atr: 1,
+    },
+  ];
+}
+
 describe("runBacktest", () => {
   it("simulates a winning short-fade trade with honest costs", () => {
-    const m = runBacktest({ bars: shortPair(0, "TP"), startingEquity: 10_000 });
+    const m = runBacktest({ bars: shortPair(0, "TP"), startingEquity: 10_000, breakevenStopMode: "RAW_BREAKEVEN" });
     expect(m.numTrades).toBe(1);
     const t = m.trades[0]!;
     expect(t.action).toBe("ENTER_SHORT");
@@ -172,7 +216,7 @@ describe("runBacktest", () => {
   });
 
   it("computes short TP gross PnL as positive", () => {
-    const m = runBacktest({ bars: shortPair(0, "TP"), startingEquity: 10_000 });
+    const m = runBacktest({ bars: shortPair(0, "TP"), startingEquity: 10_000, breakevenStopMode: "RAW_BREAKEVEN" });
     expect(m.trades[0]!.action).toBe("ENTER_SHORT");
     expect(m.trades[0]!.exitReason).toBe("TP");
     expect(m.trades[0]!.grossPnl).toBeGreaterThan(0);
@@ -185,19 +229,72 @@ describe("runBacktest", () => {
     expect(m.trades[0]!.grossPnl).toBeLessThan(0);
   });
 
-  it("can report a zero-gross SL only after the breakeven stop ratchet is armed", () => {
-    const m = runBacktest({ bars: breakdownBreakevenStopPair(0), startingEquity: 10_000 });
+  it("long raw breakeven can produce net negative after costs", () => {
+    const m = runBacktest({
+      bars: longBreakevenStopPair(0, 100),
+      startingEquity: 10_000,
+      breakevenStopMode: "RAW_BREAKEVEN",
+      models: { fundingModel: () => 0 },
+    });
+    const t = m.trades[0]!;
+    expect(t.action).toBe("ENTER_LONG");
+    expect(t.breakevenMode).toBe("RAW_BREAKEVEN");
+    expect(t.exitReason).toBe("SL");
+    expect(t.grossPnl).toBeCloseTo(0, 8);
+    expect(t.netPnl).toBeLessThan(0);
+  });
+
+  it("short raw breakeven can produce net negative after costs", () => {
+    const m = runBacktest({
+      bars: breakdownBreakevenStopPair(0),
+      startingEquity: 10_000,
+      breakevenStopMode: "RAW_BREAKEVEN",
+      models: { fundingModel: () => 0 },
+    });
     expect(m.numTrades).toBe(1);
     const t = m.trades[0]!;
     expect(t.lane).toBe("BREAKDOWN_RETEST_SHORT");
+    expect(t.breakevenMode).toBe("RAW_BREAKEVEN");
     expect(t.exitReason).toBe("SL");
     expect(t.exitPrice).toBeCloseTo(t.entryPrice, 8);
     expect(t.grossPnl).toBeCloseTo(0, 8);
     expect(t.netPnl).toBeLessThan(0);
   });
 
+  it("long net breakeven produces non-negative net PnL before funding variance", () => {
+    const m = runBacktest({
+      bars: longBreakevenStopPair(0, 100.1),
+      startingEquity: 10_000,
+      models: { fundingModel: () => 0 },
+      breakevenSafetyBufferBps: 1,
+    });
+    const t = m.trades[0]!;
+    expect(t.action).toBe("ENTER_LONG");
+    expect(t.breakevenMode).toBe("NET_BREAKEVEN");
+    expect(t.stopMovedToBreakevenAt).toBe(1 * MIN);
+    expect(t.exitPrice).toBeCloseTo(t.netBreakevenPrice ?? 0, 8);
+    expect(t.grossPnl).toBeGreaterThan(0);
+    expect(t.netPnl).toBeGreaterThanOrEqual(0);
+  });
+
+  it("short net breakeven produces non-negative net PnL before funding variance", () => {
+    const m = runBacktest({
+      bars: breakdownBreakevenStopPair(0),
+      startingEquity: 10_000,
+      models: { fundingModel: () => 0 },
+      breakevenSafetyBufferBps: 1,
+    });
+    const t = m.trades[0]!;
+    expect(t.action).toBe("ENTER_SHORT");
+    expect(t.breakevenMode).toBe("NET_BREAKEVEN");
+    expect(t.stopMovedToBreakevenAt).toBe(1 * MIN);
+    expect(t.exitPrice).toBeCloseTo(t.netBreakevenPrice ?? 0, 8);
+    expect(t.grossPnl).toBeGreaterThan(0);
+    expect(t.netPnl).toBeGreaterThanOrEqual(0);
+  });
+
   it("cost model reduces net PnL from gross PnL", () => {
-    const m = runBacktest({ bars: shortPair(0, "TP"), startingEquity: 10_000 });
+    const m = runBacktest({ bars: shortPair(0, "TP"), startingEquity: 10_000, breakevenStopMode: "RAW_BREAKEVEN" });
     const t = m.trades[0]!;
     expect(t.fees + t.spreadCost + t.slippageCost + t.fundingCost).toBeGreaterThan(0);
     expect(t.netPnl).toBeLessThan(t.grossPnl);

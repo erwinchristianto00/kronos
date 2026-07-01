@@ -19,6 +19,7 @@ export const pullbackLongScalp: StrategyLane = {
     stopLossATR: 0.5,
     maxHoldMinutes: 120,
     moveStopToBreakevenAfterATR: 0.35,
+    breakevenStopMode: "NET_BREAKEVEN",
   },
   risk: makeRiskConfig(0.2, 1),
   shouldEnter(ctx: MarketContext): boolean {

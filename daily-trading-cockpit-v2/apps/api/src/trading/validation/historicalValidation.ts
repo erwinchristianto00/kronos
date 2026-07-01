@@ -22,6 +22,7 @@ import {
 } from "../backtest/backtestRunner.js";
 import type {
   BreadthUniverseKind,
+  BreakevenStopMode,
   DecisionTrace,
   FeatureSource,
   FeatureSourceMap,
@@ -166,6 +167,14 @@ export interface TradeLedgerEntry {
   fundingCost: number;
   fundingAssumption: string | null;
   exitReason: string;
+  rawBreakevenPrice: number | null;
+  netBreakevenPrice: number | null;
+  breakevenMode: BreakevenStopMode | null;
+  estimatedCostBufferPrice: number | null;
+  stopMovedToBreakevenAt: string | null;
+  stopMovedToBreakevenReason: string | null;
+  grossPnlAtBreakevenStop: number | null;
+  netPnlAtBreakevenStop: number | null;
   takeProfitATR: number;
   stopLossATR: number;
   atrAtEntry: number;
@@ -259,6 +268,11 @@ export interface PnlMathAuditReport {
     positiveGrossSlCount: number;
     zeroGrossSlTradeIds: string[];
     explanation: string | null;
+  };
+  breakevenExitCounts: {
+    rawBreakevenStopCount: number;
+    netBreakevenStopCount: number;
+    grossBreakevenStopCount: number;
   };
   costModelReducesNetPnl: boolean;
 }
@@ -687,6 +701,14 @@ function buildTradeLedger(
         ? "fundingRiskAbnormal=false assumed baseline; cost model still applies funding drag"
         : null,
     exitReason: trade.exitReason,
+    rawBreakevenPrice: trade.rawBreakevenPrice,
+    netBreakevenPrice: trade.netBreakevenPrice,
+    breakevenMode: trade.breakevenMode,
+    estimatedCostBufferPrice: trade.estimatedCostBufferPrice,
+    stopMovedToBreakevenAt: iso(trade.stopMovedToBreakevenAt ?? undefined),
+    stopMovedToBreakevenReason: trade.stopMovedToBreakevenReason,
+    grossPnlAtBreakevenStop: trade.grossPnlAtBreakevenStop,
+    netPnlAtBreakevenStop: trade.netPnlAtBreakevenStop,
     takeProfitATR: trade.takeProfitATR,
     stopLossATR: trade.stopLossATR,
     atrAtEntry: trade.atrAtEntry,
@@ -829,6 +851,7 @@ function buildPnlMathAudit(symbol: string, metrics: BacktestMetrics): PnlMathAud
   const negativeGrossSlTrades = slTrades.filter((trade) => trade.grossPnl < -epsilon);
   const zeroGrossSlTrades = slTrades.filter((trade) => Math.abs(trade.grossPnl) <= epsilon);
   const positiveGrossSlTrades = slTrades.filter((trade) => trade.grossPnl > epsilon);
+  const breakevenStopTrades = slTrades.filter((trade) => trade.stopMovedToBreakevenAt !== null);
   const zeroGrossSlTradeIds = zeroGrossSlTrades.map((trade) => {
     const index = metrics.trades.indexOf(trade);
     return tradeId(symbol, trade, index);
@@ -854,8 +877,13 @@ function buildPnlMathAudit(symbol: string, metrics: BacktestMetrics): PnlMathAud
       zeroGrossSlTradeIds,
       explanation:
         zeroGrossSlTradeIds.length > 0
-          ? "Zero-gross SL trades are valid only when the breakeven ratchet moved the stop price to entry after the trade first moved favorably; costs can still make net PnL negative."
+          ? "Zero-gross SL trades should now only appear for RAW_BREAKEVEN mode or exact price coincidences; NET_BREAKEVEN targets enough gross PnL to cover estimated costs before funding variance."
           : null,
+    },
+    breakevenExitCounts: {
+      rawBreakevenStopCount: breakevenStopTrades.filter((trade) => trade.breakevenMode === "RAW_BREAKEVEN").length,
+      netBreakevenStopCount: breakevenStopTrades.filter((trade) => trade.breakevenMode === "NET_BREAKEVEN").length,
+      grossBreakevenStopCount: zeroGrossSlTrades.length,
     },
     costModelReducesNetPnl: metrics.trades.every((trade) => trade.netPnl <= trade.grossPnl + epsilon),
   };
