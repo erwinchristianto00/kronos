@@ -132,13 +132,13 @@ describe("realtime-short-mirror — fresh short live-mirror source (mode 2)", ()
     expect(o.paperOrderMode).toBe("HEADLINE");
     expect(o.paperStatus).toBe("CREATED"); // MIRRORABLE
     expect(o.diagnosticLabel).toBeNull();
-    expect(o.selectedLaneId).toBe(realtimeShortSelectedLaneId("CG_WIDE_STOP_TP_WIDE"));
+    expect(o.selectedLaneId).toBe(realtimeShortSelectedLaneId("CG_WIDE_FAST_SHORT"));
     expect(o.sourceType).toBe("REALTIME_SHORT_MIRROR");
     expect(o.variantExitRule).toBe("tp1_full"); // bank 100% at TP1
     expect(o.entryPrice).toBe(100);
   });
 
-  it("[SELECTOR] applies policy before score-only stable candidates", () => {
+  it("[SELECTOR] applies policy before score-only stable candidates (CG_WIDE_STOP_TP_WIDE cut from the split 2026-07-01)", () => {
     const store = freshStore();
     const res = runRealtimeShortMirror(
       inputs([shortCand("BTCUSDT", { currentPrice: 100, stopLoss: 104 })], {
@@ -153,33 +153,35 @@ describe("realtime-short-mirror — fresh short live-mirror source (mode 2)", ()
     );
     expect(res.emitted).toBe(1);
     const o = store.all[0]!;
-    expect(o.selectedLaneId).toBe(realtimeShortSelectedLaneId("CG_WIDE_STOP_TP_WIDE"));
+    // CG_WIDE_FAST_SHORT wins even though CG_MFE_GIVEBACK and CG_WIDE_STOP_TP_WIDE score higher —
+    // it is the sole SHORT policy target now, full stop, regardless of score.
+    expect(o.selectedLaneId).toBe(realtimeShortSelectedLaneId("CG_WIDE_FAST_SHORT"));
     expect(o.variantExitRule).toBe("tp1_full");
-    expect(o.takeProfitLevels[0]).toBeCloseTo(96, 6); // 1R against a 4% wide stop
+    expect(o.takeProfitLevels[0]).toBeCloseTo(98, 6); // 0.5R against a 4% wide stop
   });
 
-  it("[EXP-MFE-DISABLED] ignores disabled EXP 10x MFE SHORT in the tactical bucket", () => {
+  it("[EXP-MFE-DISABLED] ignores disabled EXP 10x MFE SHORT — CG_WIDE_FAST_SHORT is picked regardless", () => {
     const store = freshStore();
     const res = runRealtimeShortMirror(
       inputs([shortCand("APTUSDT", { currentPrice: 100, stopLoss: 104 })], {
-        // APTUSDT -> secondary bucket; disabled EXP must not be revived by stale/rejected telemetry.
         stableShortLaneActive: false,
         controllerConfidence: "LOW",
         stableShortLanes: [
           { variantId: "CG_EXP_SHORT_MFE_GIVEBACK_10X", status: "REJECT", freshValid: 38, netAvgR: -0.002, pf: 0.98 },
           { variantId: "CG_WIDE_STOP_TP_WIDE", status: "STABLE_CANDIDATE", freshValid: 200, netAvgR: 0.3, pf: 1.3 },
+          { variantId: "CG_WIDE_FAST_SHORT", status: "STABLE_CANDIDATE", freshValid: 200, netAvgR: 0.25, pf: 1.2 },
         ],
       }),
       store,
     );
     expect(res.emitted).toBe(1);
     const o = store.all[0]!;
-    expect(o.selectedLaneId).toBe(realtimeShortSelectedLaneId("CG_WIDE_STOP_TP_WIDE"));
+    expect(o.selectedLaneId).toBe(realtimeShortSelectedLaneId("CG_WIDE_FAST_SHORT"));
     expect(o.variantExitRule).toBe("tp1_full");
     expect(o.controllerConfidence).toBe("LOW");
   });
 
-  it("[EXP-MFE-DISABLED] keeps EXP 10x MFE SHORT disabled in the extended bucket", () => {
+  it("[EXP-MFE-DISABLED] keeps EXP 10x MFE SHORT disabled (extended regime, CG_WIDE_FAST_SHORT picked)", () => {
     const store = freshStore();
     const res = runRealtimeShortMirror(
       inputs([shortCand("DOGEUSDT", { currentPrice: 100, stopLoss: 104 })], {
@@ -188,13 +190,14 @@ describe("realtime-short-mirror — fresh short live-mirror source (mode 2)", ()
         stableShortLanes: [
           { variantId: "CG_EXP_SHORT_MFE_GIVEBACK_10X", status: "REJECT", freshValid: 38, netAvgR: -0.002, pf: 0.98 },
           { variantId: "CG_WIDE_STOP_TP_WIDE", status: "STABLE_CANDIDATE", freshValid: 200, netAvgR: 0.3, pf: 1.3 },
+          { variantId: "CG_WIDE_FAST_SHORT", status: "STABLE_CANDIDATE", freshValid: 200, netAvgR: 0.25, pf: 1.2 },
         ],
       }),
       store,
     );
     expect(res.emitted).toBe(1);
     const o = store.all[0]!;
-    expect(o.selectedLaneId).toBe(realtimeShortSelectedLaneId("CG_WIDE_STOP_TP_WIDE"));
+    expect(o.selectedLaneId).toBe(realtimeShortSelectedLaneId("CG_WIDE_FAST_SHORT"));
   });
 
   it("[ALLOWLIST] refuses downgraded lanes and maker-only lanes even when telemetry says stable", () => {

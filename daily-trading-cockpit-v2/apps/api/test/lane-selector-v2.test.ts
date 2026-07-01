@@ -51,10 +51,10 @@ describe("LaneSelectorV2", () => {
     expect(result.selected).toBeNull();
     expect(result.evaluated[0]!.variantId).toBe("CG_MFE_GIVEBACK");
     expect(result.evaluated[0]!.scoreBreakdown.symbolEdge).toBeGreaterThan(0);
-    expect(result.rejected).toContain("CG_WIDE_STOP_TP_WIDE:policy_target_unavailable");
+    expect(result.rejected).toContain("CG_WIDE_FAST_SHORT:policy_target_unavailable");
   });
 
-  it("keeps STOP WIDE TP WIDE when SHORT_ONLY is an extended trend", () => {
+  it("uses WIDE FAST SHORT when SHORT_ONLY is an extended trend (CG_WIDE_STOP_TP_WIDE cut from the split 2026-07-01)", () => {
     const estimatedRegime = estimateLaneSelectorV2Regime({
       regime: "Bearish pressure",
       controllerMode: "SHORT_ONLY",
@@ -75,15 +75,17 @@ describe("LaneSelectorV2", () => {
       estimatedRegime,
       now: "2026-06-25T04:00:00.000Z",
       laneStates: [
-        { variantId: "CG_WIDE_STOP_TP_WIDE", status: "STABLE_CANDIDATE", freshValid: 200, netAvgR: 0.1, pf: 1.2 },
-        { variantId: "CG_WIDE_FAST_SHORT", status: "STABLE_CANDIDATE", freshValid: 200, netAvgR: 9, pf: 9 },
+        { variantId: "CG_WIDE_STOP_TP_WIDE", status: "STABLE_CANDIDATE", freshValid: 200, netAvgR: 9, pf: 9 },
+        { variantId: "CG_WIDE_FAST_SHORT", status: "STABLE_CANDIDATE", freshValid: 200, netAvgR: 0.1, pf: 1.2 },
         { variantId: "CG_EXP_SHORT_MFE_GIVEBACK_10X", status: "STABLE_CANDIDATE", freshValid: 200, netAvgR: 9, pf: 9 },
         { variantId: "CG_TIGHT_FAST_05", status: "STABLE_CANDIDATE", freshValid: 200, netAvgR: 9, pf: 9 },
       ],
     });
 
     expect(estimatedRegime.policy).toBe("WIDE_TREND");
-    expect(result.selected?.lane.selectedLaneId).toBe(laneSelectorV2LaneId("CG_WIDE_STOP_TP_WIDE"));
+    // CG_WIDE_FAST_SHORT is picked even though CG_WIDE_STOP_TP_WIDE scores far higher here —
+    // it is no longer a preferred candidate at all, regardless of score.
+    expect(result.selected?.lane.selectedLaneId).toBe(laneSelectorV2LaneId("CG_WIDE_FAST_SHORT"));
   });
 
   it("uses WIDE FAST SHORT for the secondary short-extended bucket", () => {
@@ -148,7 +150,7 @@ describe("LaneSelectorV2", () => {
     expect(result.selected?.lane.selectedLaneId).toBe(laneSelectorV2LaneId("CG_WIDE_FAST_SHORT"));
   });
 
-  it("uses STOP WIDE for the 75% primary bucket when SHORT_ONLY is not extended", () => {
+  it("uses WIDE FAST SHORT when SHORT_ONLY is not extended (tactical regime, CG_WIDE_STOP_TP_WIDE no longer a candidate)", () => {
     const estimatedRegime = estimateLaneSelectorV2Regime({
       regime: "Bearish pressure",
       controllerMode: "SHORT_ONLY",
@@ -169,17 +171,18 @@ describe("LaneSelectorV2", () => {
       estimatedRegime,
       now: "2026-06-25T04:00:00.000Z",
       laneStates: [
-        { variantId: "CG_WIDE_STOP_TP_WIDE", status: "STABLE_CANDIDATE", freshValid: 200, netAvgR: 0.1, pf: 1.2 },
+        { variantId: "CG_WIDE_STOP_TP_WIDE", status: "STABLE_CANDIDATE", freshValid: 200, netAvgR: 9, pf: 9 },
+        { variantId: "CG_WIDE_FAST_SHORT", status: "STABLE_CANDIDATE", freshValid: 200, netAvgR: 0.1, pf: 1.2 },
         { variantId: "CG_EXP_SHORT_MFE_GIVEBACK_10X", status: "STABLE_CANDIDATE", freshValid: 200, netAvgR: 9, pf: 9 },
         { variantId: "CG_TIGHT_FAST_05", status: "STABLE_CANDIDATE", freshValid: 200, netAvgR: 9, pf: 9 },
       ],
     });
 
     expect(estimatedRegime.policy).toBe("TACTICAL_70_30");
-    expect(result.selected?.lane.selectedLaneId).toBe(laneSelectorV2LaneId("CG_WIDE_STOP_TP_WIDE"));
+    expect(result.selected?.lane.selectedLaneId).toBe(laneSelectorV2LaneId("CG_WIDE_FAST_SHORT"));
   });
 
-  it("falls back to STOP WIDE when disabled EXP is present in the tactical secondary bucket", () => {
+  it("uses WIDE FAST SHORT in the tactical regime even when EXP MFE also scores well", () => {
     const estimatedRegime = estimateLaneSelectorV2Regime({
       regime: "Bearish pressure",
       controllerMode: "SHORT_ONLY",
@@ -187,7 +190,7 @@ describe("LaneSelectorV2", () => {
     });
     const result = selectLaneV2({
       candidate: {
-        symbol: "DOGEUSDT", // deterministic bucket 99 -> secondary bucket at this minute
+        symbol: "DOGEUSDT",
         direction: "SHORT",
         currentPrice: 100,
         stopLoss: 104,
@@ -201,15 +204,16 @@ describe("LaneSelectorV2", () => {
       now: "2026-06-25T04:00:00.000Z",
       laneStates: [
         { variantId: "CG_WIDE_STOP_TP_WIDE", status: "STABLE_CANDIDATE", freshValid: 200, netAvgR: 9, pf: 9 },
+        { variantId: "CG_WIDE_FAST_SHORT", status: "STABLE_CANDIDATE", freshValid: 200, netAvgR: 0.1, pf: 1.2 },
         { variantId: "CG_EXP_SHORT_MFE_GIVEBACK_10X", status: "STABLE_CANDIDATE", freshValid: 200, netAvgR: 0.1, pf: 1.2 },
       ],
     });
 
     expect(estimatedRegime.policy).toBe("TACTICAL_70_30");
-    expect(result.selected?.lane.selectedLaneId).toBe(laneSelectorV2LaneId("CG_WIDE_STOP_TP_WIDE"));
+    expect(result.selected?.lane.selectedLaneId).toBe(laneSelectorV2LaneId("CG_WIDE_FAST_SHORT"));
   });
 
-  it("falls back to STOP WIDE in short-extended even when EXP MFE is not stable", () => {
+  it("uses WIDE FAST SHORT in short-extended even when EXP MFE is not stable", () => {
     const estimatedRegime = estimateLaneSelectorV2Regime({
       regime: "Bearish pressure",
       controllerMode: "SHORT_ONLY",
@@ -239,11 +243,11 @@ describe("LaneSelectorV2", () => {
     });
 
     expect(estimatedRegime.policy).toBe("WIDE_TREND");
-    expect(result.selected?.lane.selectedLaneId).toBe(laneSelectorV2LaneId("CG_WIDE_STOP_TP_WIDE"));
+    expect(result.selected?.lane.selectedLaneId).toBe(laneSelectorV2LaneId("CG_WIDE_FAST_SHORT"));
     expect(result.rejected).toContain("CG_EXP_SHORT_MFE_GIVEBACK_10X:status_WATCHABLE");
   });
 
-  it("uses STOP WIDE first in mixed short regimes for the 75% primary bucket", () => {
+  it("uses WIDE FAST SHORT in mixed short regimes (tactical policy)", () => {
     const estimatedRegime = estimateLaneSelectorV2Regime({
       regime: "Mixed rotation",
       controllerMode: "VALIDATION_ONLY",
@@ -265,13 +269,14 @@ describe("LaneSelectorV2", () => {
       now: "2026-06-25T04:00:00.000Z",
       laneStates: [
         { variantId: "CG_WIDE_STOP_TP_WIDE", status: "STABLE_CANDIDATE", freshValid: 200, netAvgR: 9, pf: 9 },
+        { variantId: "CG_WIDE_FAST_SHORT", status: "STABLE_CANDIDATE", freshValid: 200, netAvgR: 0.1, pf: 1.2 },
         { variantId: "CG_EXP_SHORT_MFE_GIVEBACK_10X", status: "STABLE_CANDIDATE", freshValid: 200, netAvgR: 0.1, pf: 1.2 },
         { variantId: "CG_TIGHT_FAST_05", status: "STABLE_CANDIDATE", freshValid: 200, netAvgR: 0.1, pf: 1.2 },
       ],
     });
 
     expect(estimatedRegime.policy).toBe("TACTICAL_70_30");
-    expect(result.selected?.lane.selectedLaneId).toBe(laneSelectorV2LaneId("CG_WIDE_STOP_TP_WIDE"));
+    expect(result.selected?.lane.selectedLaneId).toBe(laneSelectorV2LaneId("CG_WIDE_FAST_SHORT"));
   });
 
   it("blocks NEARUSDT in mixed regimes", () => {

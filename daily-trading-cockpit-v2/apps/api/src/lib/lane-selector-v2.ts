@@ -108,10 +108,11 @@ export interface LaneSelectorV2Result {
 const DEFAULT_MAX_STOP_DISTANCE_BPS = 1200;
 const MIN_REGIME_SAMPLE = 10;
 const MIN_SYMBOL_SAMPLE = 5;
-const WIDE_TREND_VARIANT_ID: VariantMatrixVariantId = "CG_WIDE_STOP_TP_WIDE";
 // LONG extended-trend lane (operator 2026-06-29): fast 0.5R bank instead of the 1R wide. Fires only
-// in a confident WIDE_TREND bull. CG_WIDE_STOP_TP_WIDE stays the SHORT lane (above) only.
+// in a confident WIDE_TREND bull.
 const LONG_LANE_VARIANT_ID: VariantMatrixVariantId = "CG_WIDE_FAST_LONG";
+// SHORT lane — sole allocation since 2026-07-01 (CG_WIDE_STOP_TP_WIDE cut from the split; see
+// policyPreferredVariants).
 const SHORT_FAST_VARIANT_ID: VariantMatrixVariantId = "CG_WIDE_FAST_SHORT";
 // LONG extended-trend lane: operator re-enabled CG_WIDE_STOP_TP_WIDE (1R wide) as the long lane
 // (2026-06-29) to re-test it live against the rebuilt fresh / measurement. Longs fire only in a
@@ -305,21 +306,10 @@ export function estimateLaneSelectorV2Regime(input: {
   };
 }
 
-function hashBucket0to99(key: string): number {
-  let hash = 2166136261;
-  for (let i = 0; i < key.length; i += 1) {
-    hash ^= key.charCodeAt(i);
-    hash = Math.imul(hash, 16777619);
-  }
-  return Math.abs(hash >>> 0) % 100;
-}
-
 function policyPreferredVariants(
   inputs: LaneSelectorV2Inputs,
   estimated: LaneSelectorV2EstimatedRegime,
 ): VariantMatrixVariantId[] {
-  const minuteBucket = inputs.now.slice(0, 16);
-  const bucket = hashBucket0to99(`${inputs.candidate.symbol}:${inputs.candidate.direction}:${minuteBucket}`);
   if (
     estimated.policy === "WIDE_TREND" &&
     estimated.direction === "LONG" &&
@@ -327,20 +317,12 @@ function policyPreferredVariants(
   ) {
     return [LONG_LANE_VARIANT_ID];
   }
-  if (
-    estimated.policy === "WIDE_TREND" &&
-    estimated.direction === "SHORT" &&
-    inputs.candidate.direction === "SHORT"
-  ) {
-    // CG_EXP_SHORT_MFE_GIVEBACK_10X removed by operator 2026-06-29 → 70/30 WIDE/FAST_SHORT split.
-    return bucket < 70
-      ? [WIDE_TREND_VARIANT_ID, SHORT_FAST_VARIANT_ID]
-      : [SHORT_FAST_VARIANT_ID, WIDE_TREND_VARIANT_ID];
-  }
+  // 2026-07-01 (operator): CG_WIDE_STOP_TP_WIDE cut from the SHORT split — real-money data showed a
+  // stark testnet-vs-live divergence (testnet +$60.55/459 closed historically, but live -$4.56/22
+  // closed/13.6% WR). CG_WIDE_FAST_SHORT is the only lane confirmed positive on BOTH venues
+  // (testnet +$25.12/87 closed, live +$4.61/7 closed) — 100% SHORT allocation until re-proven.
   if (inputs.candidate.direction === "SHORT") {
-    return bucket < 70
-      ? [WIDE_TREND_VARIANT_ID, SHORT_FAST_VARIANT_ID]
-      : [SHORT_FAST_VARIANT_ID, WIDE_TREND_VARIANT_ID];
+    return [SHORT_FAST_VARIANT_ID];
   }
   return [];
 }
