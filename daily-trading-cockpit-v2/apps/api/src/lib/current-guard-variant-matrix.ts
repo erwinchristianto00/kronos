@@ -689,6 +689,11 @@ export interface VariantMatrixResolverMeta {
   expiredCount: number;
   dataFailureCount: number;
   errorCount: number;
+  /** Rotating Phase-2 start offset so successive budgeted runs cover DIFFERENT slices of the
+   *  OPEN backlog. Oldest-first alone re-walked the same (genuinely unresolvable) oldest
+   *  wide-stop obs every run and never reached the resolvable mid-age cohort — the same
+   *  budget-starvation class as the paper-resolver fair-scheduler fix. */
+  walkCursor?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -1508,6 +1513,9 @@ export async function resolveVariantMatrixObservations(
   let expired = 0;
   let dataFailures = 0;
   let errors = 0;
+  // Rotating Phase-2 cursor (see walkCursor in VariantMatrixResolverMeta).
+  let walkCursorStart = 0;
+  let walked = 0;
   const nowMs = Date.now();
   const startedMs = nowMs;
   const maxObservations =
@@ -1569,19 +1577,27 @@ export async function resolveVariantMatrixObservations(
     //    mirror gate stops new EXPIRED at the source; this clears the accumulated churn backlog. ──
     store.pruneExpired(VM_MAX_EXPIRED_OBS);
 
-    // ── Phase 2: fetch-walk the remaining young OPEN obs, OLDEST-first (the most forward candles
-    //    → the best resolution yield), bounded by maxObservations / maxRuntimeMs so each run
-    //    COMPLETES and persists within the caller's window instead of being abandoned mid-flight. ──
-    const young = store.all
+    // ── Phase 2: fetch-walk the remaining young OPEN obs, oldest-first BUT starting from a
+    //    ROTATING cursor. Pure oldest-first re-walked the same (genuinely unresolvable) oldest
+    //    wide-stop obs every run — with a 90K OPEN backlog the budget never reached the
+    //    resolvable mid-age cohort and CLOSED froze for days. The cursor advances by the number
+    //    processed each run, so successive runs sweep the whole backlog fairly. Bounded by
+    //    maxObservations / maxRuntimeMs so each run COMPLETES and persists. ──
+    const youngSorted = store.all
       .filter((o) => o.status === "OPEN")
       .sort(
         (a, b) =>
           (toMs(a.openedAt) ?? toMs(a.createdAt) ?? 0) - (toMs(b.openedAt) ?? toMs(b.createdAt) ?? 0),
       );
+    const cursorRaw = store.getResolverMeta()?.walkCursor ?? 0;
+    const cursor = youngSorted.length > 0 ? ((cursorRaw % youngSorted.length) + youngSorted.length) % youngSorted.length : 0;
+    walkCursorStart = cursor;
+    const young = [...youngSorted.slice(cursor), ...youngSorted.slice(0, cursor)];
     for (const obs of young) {
       if (processed >= maxObservations) break;
       if (Date.now() - startedMs >= maxRuntimeMs) break;
       processed += 1;
+      walked += 1;
       if (processed % yieldEvery === 0) {
         await new Promise<void>((resolve) => setImmediate(resolve));
       }
@@ -1733,6 +1749,9 @@ export async function resolveVariantMatrixObservations(
       expiredCount: expired,
       dataFailureCount: dataFailures,
       errorCount: errors,
+      // Advance the rotating Phase-2 start by how many obs this run walked, so the
+      // next run picks up where this one stopped instead of re-grinding the front.
+      walkCursor: walkCursorStart + walked,
     });
   } catch {
     // meta-save failure must never break the resolver
