@@ -366,6 +366,31 @@ export default function TestnetExchangeDashboard() {
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [lastLoadedAt, setLastLoadedAt] = useState<string | null>(null);
+  const [copyBusy, setCopyBusy] = useState<string | null>(null);
+  const [copyResult, setCopyResult] = useState<{ id: string; ok: boolean; message: string } | null>(null);
+
+  async function copyToLive(paperOrderId: string) {
+    if (copyBusy) return;
+    setCopyBusy(paperOrderId);
+    setCopyResult(null);
+    try {
+      const response = await fetch(`${TESTNET_API_PREFIX}/live/copy-to-live`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ paperOrderId }),
+      });
+      const body = await response.json();
+      if (!response.ok || body?.ok === false) {
+        setCopyResult({ id: paperOrderId, ok: false, message: body?.reason ?? `copy failed (${response.status})` });
+      } else {
+        setCopyResult({ id: paperOrderId, ok: true, message: `LIVE copied: ${body?.live?.intent?.symbol ?? ''} ${body?.live?.intent?.state ?? 'OPEN'}` });
+      }
+    } catch (copyError) {
+      setCopyResult({ id: paperOrderId, ok: false, message: copyError instanceof Error ? copyError.message : 'copy request failed' });
+    } finally {
+      setCopyBusy(null);
+    }
+  }
 
   async function loadExchangeOnly() {
     try {
@@ -576,14 +601,19 @@ export default function TestnetExchangeDashboard() {
 
         <section className="testnet-panel">
           <header><span>Mirror Intents</span><strong>{status?.openIntents?.length ?? 0}</strong></header>
+          {copyResult && (
+            <p className={copyResult.ok ? 'tone-healthy' : 'tone-critical'} style={{ margin: '4px 0' }}>
+              {copyResult.ok ? '✓' : '✗'} {copyResult.message}
+            </p>
+          )}
           <div className="testnet-table-wrap">
             <table>
               <thead>
-                <tr><th>Symbol</th><th>Side</th><th>State</th><th>Qty</th><th>Paper source</th></tr>
+                <tr><th>Symbol</th><th>Side</th><th>State</th><th>Qty</th><th>Paper source</th><th>Copy</th></tr>
               </thead>
               <tbody>
                 {(status?.openIntents ?? []).length === 0 ? (
-                  <tr><td colSpan={5}>No active live mirror intents.</td></tr>
+                  <tr><td colSpan={6}>No active live mirror intents.</td></tr>
                 ) : status!.openIntents!.map((intent) => (
                   <tr key={intent.paperOrderId}>
                     <td>{intent.symbol}</td>
@@ -591,6 +621,20 @@ export default function TestnetExchangeDashboard() {
                     <td>{intent.state}</td>
                     <td>{intent.qty}</td>
                     <td>{intent.paperOrderId}</td>
+                    <td>
+                      {intent.state === 'OPEN' || intent.state === 'TP1_FILLED_BE_SET' ? (
+                        <button
+                          type="button"
+                          disabled={copyBusy !== null}
+                          onClick={() => void copyToLive(intent.paperOrderId)}
+                          title="Open the EXACT same position (symbol/side/qty/stop/TP geometry) on the REAL mainnet engine. Requires live to be armed."
+                        >
+                          {copyBusy === intent.paperOrderId ? 'Copying…' : '→ LIVE'}
+                        </button>
+                      ) : (
+                        <span className="tone-measure">n/a</span>
+                      )}
+                    </td>
                   </tr>
                 ))}
               </tbody>

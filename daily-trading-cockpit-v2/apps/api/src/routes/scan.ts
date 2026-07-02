@@ -76,6 +76,7 @@ import {
   type MicrostructureCollectionOptions,
 } from "../lib/microstructure-feature-collector.js";
 import type { BinanceClient } from "../lib/binance.js";
+import { isRegimeEngineEnabled, runRegimeEngineCycleGuarded } from "../lib/regime-engine-service.js";
 import {
   getCandidateFunnelLog,
   normalizeFunnelRegimeFamily,
@@ -461,6 +462,14 @@ export async function registerScanRoute(
       }
     } else {
       timing.recordNotInvokedStage("realtimeShortMirror");
+    }
+
+    // --- Report-only: regime switching engine cycle (hypothesis framework) ---
+    // Fire-and-forget: fetches BTC/ETH/universe candles + breadth from Binance,
+    // runs contextFromCandles → buildTradingDecision, and RECORDS the decision.
+    // Never places orders. Env-gated; internally single-flight + min-interval.
+    if (isRegimeEngineEnabled() && opts.binanceClient) {
+      runRegimeEngineCycleGuarded(opts.binanceClient, new Date().toISOString());
     }
 
     // --- Report-only: regime direction controller scan-cycle snapshot ---

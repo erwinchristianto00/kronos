@@ -262,6 +262,7 @@ import {
   getMicrostructureSnapshotStore,
   type MicrostructureCollectorReport,
 } from "../lib/microstructure-feature-collector.js";
+import { buildRegimeEngineReport, isRegimeEngineEnabled } from "../lib/regime-engine-service.js";
 
 const mixedLaneIdForDirection = (direction: string | null | undefined): string =>
   direction === "LONG"
@@ -689,6 +690,14 @@ export async function registerShadowRoutes(
 
   // MOONSHOT_LOTTERY_LANE demo report — daily budget state + recent signals/rejects (report-only).
   app.get("/api/shadow/moonshot-report", async () => buildMoonshotReport(getMoonshotStore(), Date.now()));
+
+  // Regime switching engine — REPORT-ONLY history of what the hypothesis framework
+  // (breadth + contextFromCandles + buildTradingDecision) decides each cycle on
+  // real Binance data. Cycle runs from scan.ts when REGIME_ENGINE_ENABLED=1.
+  app.get("/api/shadow/regime-engine-report", async () => ({
+    enabled: isRegimeEngineEnabled(),
+    ...buildRegimeEngineReport(),
+  }));
 
   app.get("/api/shadow/routing-monitor", async (_request, reply) => {
     if (!shadowEngine) {
