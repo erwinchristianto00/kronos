@@ -473,6 +473,11 @@ interface LiveExecutionState {
    *  the harvest ACTUALLY did — so agreement/disagreement can be measured before ever wiring crowding
    *  into the real cut/hold decision. Never read by the harvest itself. */
   crowdingExitShadow: Record<string, CrowdingExitShadowEntry>;
+  /** Operator lane selection for the live mirror. null = all lanes allowed (default).
+   *  [] = block every new mirror (pause). Entries match a paper order's selectedLaneId
+   *  either as the full id ("CG_VARIANT_MATRIX:CG_WIDE_FAST_SHORT") or its variant
+   *  suffix ("CG_WIDE_FAST_SHORT"). Persisted so a restart keeps the selection. */
+  allowedLaneIds: string[] | null;
 }
 
 export interface CrowdingExitShadowEntry {
@@ -541,6 +546,7 @@ export class LiveExecutionStore {
       killReason: null,
       lastRescuePlan: null,
       crowdingExitShadow: {},
+      allowedLaneIds: null,
     };
   }
 
@@ -1181,6 +1187,15 @@ export class LiveExecutionEngine {
       // Crowding-gated exit — SHADOW only (see recordCrowdingExitShadow). Per-symbol: what crowding
       // would have recommended (CUT/HOLD) vs. what the harvest actually did, and whether they agree.
       crowdingExitShadow: st.crowdingExitShadow,
+      // Operator lane selection for the mirror (POST /api/live/lanes). null = all lanes.
+      laneSelection: {
+        allowedLaneIds: st.allowedLaneIds ?? null,
+        mode: st.allowedLaneIds === null || st.allowedLaneIds === undefined
+          ? ("ALL_LANES" as const)
+          : st.allowedLaneIds.length === 0
+            ? ("PAUSED_ALL" as const)
+            : ("SELECTED" as const),
+      },
     };
   }
 
@@ -2469,6 +2484,157 @@ export class LiveExecutionEngine {
 
   // ── mirroring ──────────────────────────────────────────────────────────────
 
+  /** Operator lane selection: null = all lanes, [] = pause all new mirrors.
+   *  Matches selectedLaneId as full id or variant suffix. */
+  private laneAllowedForMirror(paper: PaperOrder): boolean {
+    const allowed = this.store.getState().allowedLaneIds;
+    if (allowed === null || allowed === undefined) return true;
+    const laneId = paper.selectedLaneId ?? "";
+    const variantId = laneId.split(":").pop() ?? laneId;
+    return allowed.includes(laneId) || allowed.includes(variantId);
+  }
+
+  /**
+   * Operator-triggered copy of a TESTNET position onto THIS engine (the mainnet
+   * instance): same symbol/direction/qty and the same stop/TP geometry relative to
+   * entry (openIntent reprices the absolute levels around the actual live fill).
+   * Reuses the full openIntent machinery — isolated margin, repriced protective
+   * stop, TP sizing by exit rule, and the error-flatten discipline — so a copy can
+   * never exist as an unprotected position. Requires the engine to be ARMED (the
+   * master switch stays the master switch; the button press does not bypass it).
+   */
+  async copyExternalIntent(req: {
+    symbol: string;
+    direction: "LONG" | "SHORT";
+    qty: number;
+    entryPrice: number;
+    stopLossPrice: number;
+    tp1Price: number;
+    exitRule?: VariantExitRule | null;
+    sourceLaneId?: string | null;
+    sourcePaperOrderId?: string | null;
+    sourceEnv?: string | null;
+  }): Promise<{ ok: boolean; reason: string | null; intent?: LiveIntent }> {
+    if (this.store.getState().killedAt) return { ok: false, reason: "kill switch latched" };
+    if (!this.armed) return { ok: false, reason: "live engine is DISARMED — arm it first, then copy" };
+    if (!(req.qty > 0) || !(req.entryPrice > 0) || !(req.stopLossPrice > 0) || !(req.tp1Price > 0)) {
+      return { ok: false, reason: "invalid copy spec (qty/entry/stop/tp must be positive)" };
+    }
+    const stopOk = req.direction === "LONG"
+      ? req.stopLossPrice < req.entryPrice && req.tp1Price > req.entryPrice
+      : req.stopLossPrice > req.entryPrice && req.tp1Price < req.entryPrice;
+    if (!stopOk) return { ok: false, reason: "copy geometry invalid for direction (stop/tp on wrong side)" };
+
+    const st = this.store.getState();
+    const openIntents = st.intents.filter((i) => OPEN_INTENT_STATES.has(i.state));
+    if (openIntents.some((i) => i.symbol === req.symbol)) {
+      return { ok: false, reason: `an intent is already open on ${req.symbol}` };
+    }
+    if (openIntents.length >= this.config.maxConcurrentPositions) {
+      return { ok: false, reason: `max concurrent positions reached (${this.config.maxConcurrentPositions})` };
+    }
+
+    const filters = await this.getFilters(req.symbol);
+    if (!filters) return { ok: false, reason: `no exchange filters for ${req.symbol}` };
+
+    // Copy the testnet qty exactly, capped by the live notional ceiling.
+    const maxQtyByNotional = this.config.maxNotionalPerTrade / req.entryPrice;
+    const qty = roundDownToStep(Math.min(req.qty, maxQtyByNotional), filters.stepSize);
+    if (!(qty >= filters.minQty)) {
+      return { ok: false, reason: `copied quantity ${qty} below exchange minimum ${filters.minQty}` };
+    }
+
+    const copyId = `tncopy-${Date.now().toString(36)}-${req.symbol.slice(0, 6)}`;
+    const exitRule: VariantExitRule = req.exitRule ?? "scaleout_tp1_trail";
+    const syntheticPaper = {
+      paperOrderId: copyId,
+      symbol: req.symbol,
+      direction: req.direction,
+      entryPrice: req.entryPrice,
+      stopLoss: req.stopLossPrice,
+      takeProfitLevels: [req.tp1Price],
+      createdAt: this.nowIso(),
+      paperStatus: "CREATED",
+      paperOrderMode: "HEADLINE",
+      diagnosticLabel: null,
+      variantExitRule: exitRule,
+      fillMode: "taker",
+      selectedLaneId: `TESTNET_COPY:${req.sourceLaneId ?? "MANUAL"}`,
+      regime: null,
+      controllerMode: null,
+      controllerConfidence: null,
+    } as unknown as PaperOrder;
+    const plan: LiveOrderPlan = {
+      ok: true,
+      reason: null,
+      qty,
+      tp1Qty: this.isFullTpExitRule(exitRule) ? qty : roundDownToStep(qty / 2, filters.stepSize),
+      notionalUsd: qty * req.entryPrice,
+      stopPrice: req.stopLossPrice,
+      tp1Price: req.tp1Price,
+    };
+
+    await this.openIntent([{ paper: syntheticPaper, plan }], filters);
+    const intent = this.store.getState().intents.find((i) => i.paperOrderId === copyId);
+    if (!intent) return { ok: false, reason: "copy did not produce an intent (plan rejected)" };
+    if (intent.state === "ERROR") {
+      return { ok: false, reason: intent.lastError ?? "copy open failed (flattened safely)", intent };
+    }
+    return { ok: true, reason: null, intent };
+  }
+
+  /** Full copy spec for an OPEN intent (the testnet side of the copy-to-live relay). */
+  getOpenIntentCopySpec(paperOrderId: string): {
+    ok: boolean;
+    reason: string | null;
+    spec?: {
+      symbol: string;
+      direction: "LONG" | "SHORT";
+      qty: number;
+      entryPrice: number;
+      stopLossPrice: number;
+      tp1Price: number;
+      exitRule: VariantExitRule | null;
+      sourceLaneId: string | null;
+      sourcePaperOrderId: string;
+    };
+  } {
+    const intent = this.store.getState().intents.find((i) => i.paperOrderId === paperOrderId);
+    if (!intent) return { ok: false, reason: `no intent found for ${paperOrderId}` };
+    if (intent.state !== "OPEN" && intent.state !== "TP1_FILLED_BE_SET") {
+      return { ok: false, reason: `intent is ${intent.state}, only OPEN positions can be copied` };
+    }
+    return {
+      ok: true,
+      reason: null,
+      spec: {
+        symbol: intent.symbol,
+        direction: intent.direction,
+        qty: intent.qty,
+        entryPrice: intent.filledEntryPrice ?? intent.plannedEntryPrice,
+        stopLossPrice: intent.stopLossPrice,
+        tp1Price: intent.tp1Price,
+        exitRule: intent.exitRule ?? null,
+        sourceLaneId: this.intentSources(intent)[0]?.laneId ?? null,
+        sourcePaperOrderId: intent.paperOrderId,
+      },
+    };
+  }
+
+  /** Set (and persist) the operator's lane allow-list. null restores "all lanes". */
+  setAllowedLanes(laneIds: string[] | null): { allowedLaneIds: string[] | null } {
+    const st = this.store.getState();
+    if (laneIds === null) {
+      st.allowedLaneIds = null;
+    } else {
+      st.allowedLaneIds = Array.from(
+        new Set(laneIds.map((id) => String(id).trim()).filter((id) => id.length > 0)),
+      );
+    }
+    this.store.save();
+    return { allowedLaneIds: st.allowedLaneIds };
+  }
+
   private async mirrorNewSignals(): Promise<void> {
     if (!this.armed) return;
     const now = this.nowIso();
@@ -2498,6 +2664,7 @@ export class LiveExecutionEngine {
               this.isFreshPaperOrder(o, now) &&
               this.isPaperOrderLiveEligible(o, now))) &&
           o.diagnosticLabel == null &&
+          this.laneAllowedForMirror(o) && // operator lane selection (applies in ALL mirror modes)
           MIRRORABLE_PAPER_STATUSES.has(o.paperStatus) &&
           (this.config.mirrorAllPaperOrders || o.createdAt > st.lastSeenCreatedAt) &&
           !mirrored.has(o.paperOrderId) &&

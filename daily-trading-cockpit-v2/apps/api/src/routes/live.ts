@@ -52,6 +52,123 @@ export async function registerLiveRoutes(
     return { ok: true, armed: engine.isArmed() };
   });
 
+  // RECEIVER (runs on the MAINNET instance): open an exact copy of a testnet
+  // position. Requires {"confirm":"COPY"} and the engine to be ARMED. The stop/TP
+  // geometry is preserved relative to entry; the protective stop is placed before
+  // the intent is considered OPEN (same machinery as the normal mirror).
+  app.post("/api/live/copy-intent", async (request, reply) => {
+    if (!engine) {
+      reply.code(503);
+      return { ok: false, reason: "live execution disabled" };
+    }
+    const body = (request.body ?? {}) as {
+      confirm?: string;
+      symbol?: string;
+      direction?: "LONG" | "SHORT";
+      qty?: number;
+      entryPrice?: number;
+      stopLossPrice?: number;
+      tp1Price?: number;
+      exitRule?: string | null;
+      sourceLaneId?: string | null;
+      sourcePaperOrderId?: string | null;
+      sourceEnv?: string | null;
+    };
+    if (body.confirm !== "COPY") {
+      reply.code(400);
+      return { ok: false, reason: 'copy requires body {"confirm":"COPY", ...spec} — this opens a REAL position' };
+    }
+    if (
+      typeof body.symbol !== "string" ||
+      (body.direction !== "LONG" && body.direction !== "SHORT") ||
+      typeof body.qty !== "number" ||
+      typeof body.entryPrice !== "number" ||
+      typeof body.stopLossPrice !== "number" ||
+      typeof body.tp1Price !== "number"
+    ) {
+      reply.code(400);
+      return { ok: false, reason: "spec requires symbol, direction, qty, entryPrice, stopLossPrice, tp1Price" };
+    }
+    const result = await engine.copyExternalIntent({
+      symbol: body.symbol,
+      direction: body.direction,
+      qty: body.qty,
+      entryPrice: body.entryPrice,
+      stopLossPrice: body.stopLossPrice,
+      tp1Price: body.tp1Price,
+      exitRule: (body.exitRule ?? null) as never,
+      sourceLaneId: body.sourceLaneId ?? null,
+      sourcePaperOrderId: body.sourcePaperOrderId ?? null,
+      sourceEnv: body.sourceEnv ?? null,
+    });
+    if (!result.ok) reply.code(409);
+    return result;
+  });
+
+  // RELAY (runs on the TESTNET instance): the dashboard's per-position "copy to
+  // live" button. Looks up the OPEN testnet intent and forwards its exact spec to
+  // the mainnet instance (LIVE_COPY_TARGET_URL, default the local 3103 process).
+  app.post("/api/live/copy-to-live", async (request, reply) => {
+    if (!engine) {
+      reply.code(503);
+      return { ok: false, reason: "live execution disabled" };
+    }
+    const body = (request.body ?? {}) as { paperOrderId?: string };
+    if (typeof body.paperOrderId !== "string" || body.paperOrderId.length === 0) {
+      reply.code(400);
+      return { ok: false, reason: 'body must be {"paperOrderId":"<open intent id>"}' };
+    }
+    const lookup = engine.getOpenIntentCopySpec(body.paperOrderId);
+    if (!lookup.ok || !lookup.spec) {
+      reply.code(lookup.reason?.startsWith("no intent") ? 404 : 409);
+      return { ok: false, reason: lookup.reason };
+    }
+    const target = process.env.LIVE_COPY_TARGET_URL ?? "http://127.0.0.1:3103";
+    const spec = { confirm: "COPY", ...lookup.spec, sourceEnv: "testnet" };
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 20_000);
+      const response = await fetch(`${target}/api/live/copy-intent`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(spec),
+        signal: controller.signal,
+      });
+      clearTimeout(timer);
+      const payload = (await response.json()) as { ok?: boolean; reason?: string };
+      if (!response.ok || payload.ok === false) {
+        reply.code(response.status === 200 ? 409 : response.status);
+        return { ok: false, reason: payload.reason ?? `live copy failed (${response.status})`, spec };
+      }
+      return { ok: true, spec, live: payload };
+    } catch (error) {
+      reply.code(502);
+      return { ok: false, reason: `live instance unreachable: ${(error as Error).message}`, spec };
+    }
+  });
+
+  // Operator lane selection for the live mirror. Body:
+  //   {"lanes": null}                          → all lanes allowed (default)
+  //   {"lanes": []}                            → pause every new mirror
+  //   {"lanes": ["CG_WIDE_FAST_SHORT", ...]}   → only these lanes may open new positions
+  // Ids match a paper order's selectedLaneId as the full id or its variant suffix.
+  // Affects NEW entries only — existing open positions keep managing/closing normally.
+  app.post("/api/live/lanes", async (request, reply) => {
+    if (!engine) {
+      reply.code(503);
+      return { ok: false, reason: "live execution disabled" };
+    }
+    const body = (request.body ?? {}) as { lanes?: unknown };
+    if (body.lanes !== null && !Array.isArray(body.lanes)) {
+      reply.code(400);
+      return { ok: false, reason: 'body must be {"lanes": null | string[]}' };
+    }
+    const result = engine.setAllowedLanes(
+      body.lanes === null ? null : (body.lanes as unknown[]).map((v) => String(v)),
+    );
+    return { ok: true, ...result };
+  });
+
   app.post("/api/live/kill", async (request, reply) => {
     if (!engine) {
       reply.code(503);

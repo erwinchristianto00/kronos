@@ -2023,3 +2023,123 @@ describe("crowding-exit shadow measurement (SHADOW only — never alters cut/hol
     expect(store.getState().crowdingExitShadow).toEqual({});
   });
 });
+
+describe("operator lane selection (POST /api/live/lanes → setAllowedLanes)", () => {
+  it("null (default) mirrors any lane; a selected list blocks non-matching lanes", async () => {
+    const order = paperOrder({ selectedLaneId: "CG_VARIANT_MATRIX:CG_WIDE_FAST_SHORT" } as Partial<PaperOrder>);
+    const { engine, store } = makeEngine({ paper: makePaperStore([order]) });
+    expect((await engine.arm()).ok).toBe(true);
+
+    // Restrict to a different lane BEFORE the first tick — the order must be skipped.
+    engine.setAllowedLanes(["CG_WIDE_LONG_RUNNER"]);
+    await engine.tick();
+    expect(store.getState().intents.length).toBe(0);
+  });
+
+  it("matches by variant suffix as well as full lane id, and persists in state", async () => {
+    const order = paperOrder({ selectedLaneId: "CG_VARIANT_MATRIX:CG_WIDE_FAST_SHORT" } as Partial<PaperOrder>);
+    const { engine, store } = makeEngine({ paper: makePaperStore([order]) });
+    expect((await engine.arm()).ok).toBe(true);
+
+    const res = engine.setAllowedLanes(["CG_WIDE_FAST_SHORT"]); // suffix form
+    expect(res.allowedLaneIds).toEqual(["CG_WIDE_FAST_SHORT"]);
+    expect(store.getState().allowedLaneIds).toEqual(["CG_WIDE_FAST_SHORT"]);
+    await engine.tick();
+    expect(store.getState().intents.length).toBe(1);
+    expect(engine.getStatus().laneSelection).toEqual({
+      allowedLaneIds: ["CG_WIDE_FAST_SHORT"],
+      mode: "SELECTED",
+    });
+  });
+
+  it("[] pauses every new mirror; null restores all lanes", async () => {
+    const order = paperOrder({ selectedLaneId: "CG_VARIANT_MATRIX:CG_WIDE_FAST_SHORT" } as Partial<PaperOrder>);
+    const { engine, store } = makeEngine({ paper: makePaperStore([order]) });
+    expect((await engine.arm()).ok).toBe(true);
+
+    engine.setAllowedLanes([]);
+    expect(engine.getStatus().laneSelection.mode).toBe("PAUSED_ALL");
+    await engine.tick();
+    expect(store.getState().intents.length).toBe(0);
+
+    engine.setAllowedLanes(null);
+    expect(engine.getStatus().laneSelection.mode).toBe("ALL_LANES");
+    await engine.tick();
+    expect(store.getState().intents.length).toBe(1);
+  });
+});
+
+describe("copyExternalIntent (testnet→live copy button)", () => {
+  const spec = {
+    symbol: "ETHUSDT",
+    direction: "SHORT" as const,
+    qty: 0.05,
+    entryPrice: 2000,
+    stopLossPrice: 2100,
+    tp1Price: 1900,
+    exitRule: "tp1_full" as const,
+    sourceLaneId: "CG_VARIANT_MATRIX:CG_WIDE_FAST_SHORT",
+    sourcePaperOrderId: "paper-src-1",
+    sourceEnv: "testnet",
+  };
+
+  it("refuses while DISARMED (the master switch is not bypassed by the button)", async () => {
+    const { engine, store } = makeEngine();
+    const res = await engine.copyExternalIntent(spec);
+    expect(res.ok).toBe(false);
+    expect(res.reason).toMatch(/DISARMED/);
+    expect(store.getState().intents.length).toBe(0);
+  });
+
+  it("opens an exact copy with protective stop + TP and a TESTNET_COPY lane tag", async () => {
+    const { engine, client, store } = makeEngine();
+    expect((await engine.arm()).ok).toBe(true);
+    const res = await engine.copyExternalIntent(spec);
+    expect(res.ok).toBe(true);
+    const intent = store.getState().intents[0]!;
+    expect(intent.state).toBe("OPEN");
+    expect(intent.symbol).toBe("ETHUSDT");
+    expect(intent.direction).toBe("SHORT");
+    expect(intent.exitRule).toBe("tp1_full");
+    expect(intent.sourcePaperOrders?.[0]?.laneId).toBe("TESTNET_COPY:CG_VARIANT_MATRIX:CG_WIDE_FAST_SHORT");
+    // entry MARKET + protective stop + TP were all placed
+    const types = client.placed.map((p) => p.type);
+    expect(types).toContain("MARKET");
+    expect(intent.stopOrderId).not.toBeNull();
+    expect(intent.tp1OrderId).not.toBeNull();
+    // full-TP exit rule ⇒ tp1Qty equals qty (banks 100% at TP1)
+    expect(intent.tp1Qty).toBeCloseTo(intent.qty, 9);
+  });
+
+  it("refuses a second copy on a symbol that already has an open intent", async () => {
+    const { engine } = makeEngine();
+    expect((await engine.arm()).ok).toBe(true);
+    expect((await engine.copyExternalIntent(spec)).ok).toBe(true);
+    const res = await engine.copyExternalIntent(spec);
+    expect(res.ok).toBe(false);
+    expect(res.reason).toMatch(/already open/);
+  });
+
+  it("refuses invalid geometry (stop on the wrong side for the direction)", async () => {
+    const { engine } = makeEngine();
+    expect((await engine.arm()).ok).toBe(true);
+    const res = await engine.copyExternalIntent({ ...spec, stopLossPrice: 1900, tp1Price: 2100 });
+    expect(res.ok).toBe(false);
+    expect(res.reason).toMatch(/geometry/);
+  });
+
+  it("getOpenIntentCopySpec returns the relay spec for an OPEN intent only", async () => {
+    const order = paperOrder(); // SHORT ETHUSDT 2000/2100/1900
+    const { engine, store } = makeEngine({ paper: makePaperStore([order]) });
+    expect((await engine.arm()).ok).toBe(true);
+    await engine.tick();
+    const intent = store.getState().intents[0]!;
+    expect(intent.state).toBe("OPEN");
+    const lookup = engine.getOpenIntentCopySpec(intent.paperOrderId);
+    expect(lookup.ok).toBe(true);
+    expect(lookup.spec?.symbol).toBe("ETHUSDT");
+    expect(lookup.spec?.qty).toBeCloseTo(intent.qty, 9);
+    expect(lookup.spec?.stopLossPrice).toBe(intent.stopLossPrice);
+    expect(engine.getOpenIntentCopySpec("nope").ok).toBe(false);
+  });
+});
