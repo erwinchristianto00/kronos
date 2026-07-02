@@ -238,6 +238,7 @@ import {
   CROSS_SECTIONAL_INTERVAL,
   CROSS_SECTIONAL_MOMENTUM_BARS,
   buildCrossSectionalRegimeContext,
+  deriveAdaptiveSymbolFilters,
   CROSS_SECTIONAL_TREND_SIGNAL,
   CROSS_SECTIONAL_MIXED_SIGNAL,
 } from "../lib/cross-sectional-edge.js";
@@ -651,8 +652,21 @@ export async function registerShadowRoutes(
       filteredReport: buildCrossSectionalReport(store, Date.now(), { variant: "FILTERED" }),
       trendReport: buildCrossSectionalReport(store, Date.now(), { variant: "TREND_BETA_VOL" }),
       mixedReport: buildCrossSectionalReport(store, Date.now(), { variant: "MIXED_MEAN_REVERSION" }),
-      filteredConfig: getCrossSectionalFilteredConfig(),
+      // filteredConfig shows the EFFECTIVE (auto-updated) lists — what new FILTERED
+      // baskets actually use — so /research always displays the live white/blacklists.
+      filteredConfig: (() => {
+        const adaptive = deriveAdaptiveSymbolFilters(store);
+        return {
+          ...getCrossSectionalFilteredConfig(),
+          longAllowlist: adaptive.longAllowlist,
+          shortAllowlist: adaptive.shortAllowlist,
+          shortBlocklist: adaptive.shortBlocklist,
+        };
+      })(),
       adaptiveConfig: getCrossSectionalAdaptiveConfig(),
+      // Auto-updating symbol filters ACTUALLY used to mint new FILTERED baskets
+      // (env lists = prior, measured per-leg returns promote/demote each cycle) + provenance.
+      adaptiveSymbolFilters: deriveAdaptiveSymbolFilters(store),
       openBaskets: raw.filter((o) => o.status === "OPEN").map(slim),
       filteredOpenBaskets: filtered.filter((o) => o.status === "OPEN").map(slim),
       trendOpenBaskets: trend.filter((o) => o.status === "OPEN").map(slim),

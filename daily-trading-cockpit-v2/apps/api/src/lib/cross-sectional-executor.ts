@@ -35,6 +35,9 @@ const LEG_USD = () => {
   const n = Number.parseFloat(process.env.CROSS_SECTIONAL_EXEC_LEG_USD ?? "");
   return Number.isFinite(n) && n > 0 ? n : 25;
 };
+/** Which measured variant to execute. Default FILTERED (operator: follow the /research
+ *  filtered symbols, whose allow/blocklists now auto-update from measured leg returns). */
+const EXEC_VARIANT = () => process.env.CROSS_SECTIONAL_EXEC_VARIANT ?? "FILTERED";
 /** Only execute signals younger than this — a stale basket's momentum ranking has drifted. */
 const MAX_SIGNAL_AGE_MS = 15 * 60_000;
 const TAKER_FEE_RATE = 0.0005; // 5 bps per side, conservative
@@ -143,6 +146,7 @@ export class CrossSectionalExecutor {
     enabled: boolean;
     allowed: boolean;
     legUsd: number;
+    variant: string;
     openBasket: ExecutorBasket | null;
     closedCount: number;
     totalNetPnlUsd: number;
@@ -155,6 +159,7 @@ export class CrossSectionalExecutor {
       enabled: isCrossSectionalExecEnabled(),
       allowed: this.isAllowed(),
       legUsd: LEG_USD(),
+      variant: EXEC_VARIANT(),
       openBasket: st.baskets.find((b) => b.status === "OPEN") ?? null,
       closedCount: closed.length,
       totalNetPnlUsd: closed.reduce((s, b) => s + (b.netPnlUsd ?? 0), 0),
@@ -224,13 +229,15 @@ export class CrossSectionalExecutor {
     if (st.baskets.some((b) => b.status === "OPEN")) return; // one basket at a time
 
     const nowMs = new Date(this.nowIso()).getTime();
-    // Newest FRESH, still-OPEN RAW signal we haven't executed yet. RAW is the variant
-    // with the measured edge (63 closed, +0.24%/basket net at the time of wiring).
+    // Newest FRESH, still-OPEN signal of the target variant we haven't executed yet.
+    // Default FILTERED: symbol-filtered baskets whose allow/blocklists auto-update from
+    // measured per-leg returns (see deriveAdaptiveSymbolFilters).
+    const targetVariant = EXEC_VARIANT();
     const candidates = this.signalStore.all
       .filter(
         (o: CrossSectionalObservation) =>
           o.status === "OPEN" &&
-          (o.variant ?? "RAW") === "RAW" &&
+          (o.variant ?? "RAW") === targetVariant &&
           o.openedAtMs > st.lastSeenSignalMs &&
           nowMs - o.openedAtMs <= MAX_SIGNAL_AGE_MS,
       )

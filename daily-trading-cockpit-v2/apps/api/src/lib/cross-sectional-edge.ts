@@ -291,6 +291,101 @@ export function buildCrossSectionalBasket(
   };
 }
 
+// ── Auto-updating symbol filters (operator: "ikutin filtered symbol, auto update
+// terus blacklist dan whitelist nya") ────────────────────────────────────────
+//
+// Derives per-symbol allow/blocklists from the MEASURED per-leg performance in the
+// store's CLOSED baskets, using the static env lists as the prior:
+//   • a symbol with ≥ minLegSamples measured legs on a side and NEGATIVE avg return
+//     is DEMOTED (removed from that side's allowlist, added to its blocklist);
+//   • a symbol with ≥ minLegSamples and POSITIVE avg return is PROMOTED into the
+//     side's allowlist.
+// Recomputed every cycle, so the lists track the data instead of a frozen env var.
+
+export interface AdaptiveSymbolFilters {
+  longAllowlist: string[];
+  shortAllowlist: string[];
+  longBlocklist: string[];
+  shortBlocklist: string[];
+  provenance: {
+    closedBaskets: number;
+    minLegSamples: number;
+    promotedLong: string[];
+    promotedShort: string[];
+    demotedLong: string[];
+    demotedShort: string[];
+  };
+}
+
+export function deriveAdaptiveSymbolFilters(
+  store: CrossSectionalStore,
+  opts: { minLegSamples?: number } = {},
+): AdaptiveSymbolFilters {
+  const minLegSamples = opts.minLegSamples ?? 3;
+  const perf = new Map<string, { longN: number; longSum: number; shortN: number; shortSum: number }>();
+  const bump = (symbol: string, side: "long" | "short", ret: number) => {
+    const row = perf.get(symbol) ?? { longN: 0, longSum: 0, shortN: 0, shortSum: 0 };
+    if (side === "long") {
+      row.longN += 1;
+      row.longSum += ret;
+    } else {
+      row.shortN += 1;
+      row.shortSum += ret;
+    }
+    perf.set(symbol, row);
+  };
+
+  let closedBaskets = 0;
+  for (const obs of store.all) {
+    if (obs.status !== "CLOSED") continue;
+    closedBaskets += 1;
+    for (const leg of obs.longLeg) {
+      if (leg.exitPrice !== null && leg.entryPrice > 0) bump(leg.symbol, "long", leg.exitPrice / leg.entryPrice - 1);
+    }
+    for (const leg of obs.shortLeg) {
+      if (leg.exitPrice !== null && leg.entryPrice > 0) bump(leg.symbol, "short", -(leg.exitPrice / leg.entryPrice - 1));
+    }
+  }
+
+  const promotedLong: string[] = [];
+  const promotedShort: string[] = [];
+  const demotedLong: string[] = [];
+  const demotedShort: string[] = [];
+  for (const [symbol, row] of perf) {
+    if (row.longN >= minLegSamples) {
+      if (row.longSum / row.longN > 0) promotedLong.push(symbol);
+      else demotedLong.push(symbol);
+    }
+    if (row.shortN >= minLegSamples) {
+      if (row.shortSum / row.shortN > 0) promotedShort.push(symbol);
+      else demotedShort.push(symbol);
+    }
+  }
+
+  const longAllow = new Set<string>([...CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST, ...promotedLong]);
+  for (const s of demotedLong) longAllow.delete(s);
+  const shortAllow = new Set<string>([...CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST, ...promotedShort]);
+  for (const s of demotedShort) shortAllow.delete(s);
+  const shortBlock = new Set<string>([...CROSS_SECTIONAL_FILTERED_SHORT_BLOCKLIST, ...demotedShort]);
+  for (const s of promotedShort) shortBlock.delete(s); // measured-positive un-blocks an env-era block
+  const longBlock = new Set<string>(demotedLong);
+
+  return {
+    longAllowlist: [...longAllow].sort(),
+    shortAllowlist: [...shortAllow].sort(),
+    longBlocklist: [...longBlock].sort(),
+    shortBlocklist: [...shortBlock].sort(),
+    provenance: {
+      closedBaskets,
+      minLegSamples,
+      promotedLong: promotedLong.sort(),
+      promotedShort: promotedShort.sort(),
+      demotedLong: demotedLong.sort(),
+      demotedShort: demotedShort.sort(),
+    },
+  };
+}
+
 export function buildFilteredCrossSectionalBasket(
   scored: ScoredSymbol[],
   opts: Omit<CrossSectionalBasketOpts, "variant" | "signal" | "longAllowlist" | "shortAllowlist" | "shortBlocklist" | "minScoreGap"> &
@@ -636,12 +731,18 @@ export async function runCrossSectionalCycle(opts: {
     }
   }
   if (!isCrossSectionalFilteredDisabled() && !alreadyThisBucket(CROSS_SECTIONAL_FILTERED_SIGNAL)) {
+    // Auto-updating lists: derived from the store's own measured per-leg performance
+    // (env lists as the prior) — recomputed every cycle, never a frozen env var.
+    const adaptive = deriveAdaptiveSymbolFilters(opts.store);
     const basket = buildFilteredCrossSectionalBasket(scored, {
       k: CROSS_SECTIONAL_K,
       now: nowIso,
       openedAtMs: opts.now,
       horizonMs: CROSS_SECTIONAL_HORIZON_MS,
       regimeContext,
+      longAllowlist: new Set(adaptive.longAllowlist),
+      shortAllowlist: new Set(adaptive.shortAllowlist),
+      shortBlocklist: new Set(adaptive.shortBlocklist),
     });
     if (basket) {
       opts.store.add(basket);

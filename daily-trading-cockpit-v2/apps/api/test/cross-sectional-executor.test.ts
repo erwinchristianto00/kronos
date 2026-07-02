@@ -36,8 +36,8 @@ function signalObs(openedAtMs: number): CrossSectionalObservation {
     openedAt: new Date(openedAtMs).toISOString(),
     openedAtMs,
     horizonMs: 24 * 3_600_000,
-    signal: "MOM24",
-    variant: "RAW",
+    signal: "MOM24_FILTERED",
+    variant: "FILTERED",
     k: 1,
     longLeg: [{ symbol: "SOLUSDT", entryPrice: 100, exitPrice: null }],
     shortLeg: [{ symbol: "ADAUSDT", entryPrice: 0.5, exitPrice: null }],
@@ -94,7 +94,7 @@ function makeExecutor(opts: { client?: FakeExecClient; allowed?: boolean; signal
 }
 
 describe("cross-sectional executor (basket execution, testnet-first)", () => {
-  it("opens the FULL hedged basket from a fresh RAW signal (long buy + short sell, sized per leg USD)", async () => {
+  it("opens the FULL hedged basket from a fresh FILTERED signal (long buy + short sell, sized per leg USD)", async () => {
     const { executor, client, store } = makeExecutor({ signalMs: NOW_MS - 5 * 60_000 });
     await executor.tick();
     const basket = store.getState().baskets[0]!;
@@ -159,5 +159,24 @@ describe("cross-sectional executor (basket execution, testnet-first)", () => {
     expect(basket.netPnlUsd!).toBeLessThan(basket.grossPnlUsd!);
     const closes = client.placed.filter((p) => p.reduceOnly);
     expect(closes.length).toBe(2);
+  });
+});
+
+describe("executor variant targeting", () => {
+  it("ignores RAW signals by default (executes only the FILTERED variant)", async () => {
+    const client = new FakeExecClient();
+    const signalStore = new CrossSectionalStore(resolve(os.tmpdir(), `xsec-exec-${process.pid}-raw`));
+    dirs.push(resolve(os.tmpdir(), `xsec-exec-${process.pid}-raw`));
+    const store = new CrossSectionalExecutorStore(resolve(os.tmpdir(), `xsec-exec-${process.pid}-raw2`));
+    dirs.push(resolve(os.tmpdir(), `xsec-exec-${process.pid}-raw2`));
+    store.getState().lastSeenSignalMs = NOW_MS - 3_600_000;
+    const raw = signalObs(NOW_MS - 5 * 60_000);
+    raw.signal = "MOM24";
+    raw.variant = "RAW";
+    signalStore.add(raw);
+    const executor = new CrossSectionalExecutor({ client, signalStore, store, isAllowed: () => true, nowIso: () => NOW });
+    await executor.tick();
+    expect(store.getState().baskets.length).toBe(0);
+    expect(executor.getStatus().variant).toBe("FILTERED");
   });
 });

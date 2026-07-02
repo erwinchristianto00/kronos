@@ -112,6 +112,11 @@ export interface LiveExecutionConfig {
   profitBankNetTargetUsd: number;
   /** Opposing-regime loss cut: close once adverse move reaches this fraction of the entry-to-stop distance. */
   regimeLossHardCutStopFraction: number;
+  /** Auto-reset of the operator lane selection: when a position opened FROM the selection
+   *  closes with net realized ≤ -this many USD, the whole selection (allocations + allow-list)
+   *  is cleared and control returns to the bot. Small scratch closes (fees-only, e.g. the
+   *  breakeven harvest's −$0.02) stay below the threshold and do NOT reset. */
+  laneSelectionLossResetUsd: number;
   /** Testnet-only regime-flip rescue (flip a stuck counter-regime position to net regime-aligned). */
   rescue: RegimeFlipRescueConfig;
   /** Testnet-only: when true the rescue PLACES orders (flip/flatten); otherwise it only shadow-evaluates.
@@ -202,6 +207,7 @@ export function parseLiveExecutionConfig(env: NodeJS.ProcessEnv = process.env): 
     mainnetRegimeHardCutMs: liveEnv === "mainnet" ? envNum(env.LIVE_MAINNET_REGIME_HARD_CUT_MS, 30 * 60 * 1000) : 0,
     profitBankNetTargetUsd: Math.max(0, Number.parseFloat(env.LIVE_PROFIT_BANK_NET_TARGET_USD ?? "") || 0),
     regimeLossHardCutStopFraction: envFraction(env.LIVE_REGIME_LOSS_HARD_CUT_STOP_FRACTION, 0.5),
+    laneSelectionLossResetUsd: envNum(env.LIVE_LANE_SELECTION_LOSS_RESET_USD, 0.25),
     rescue: parseRegimeFlipRescueConfig(env, liveEnv),
     rescueExecute:
       env.LIVE_TESTNET_RESCUE_ENABLED === "1" &&
@@ -358,6 +364,10 @@ export interface LiveIntent {
   lastError: string | null;
   /** Paper orders netted into this one-way Binance symbol position. */
   sourcePaperOrders?: LiveIntentSource[];
+  /** True when this intent was opened WHILE an operator lane selection/allocation was active
+   *  and its lane matched it — i.e. the position exists because of the operator's manual pick.
+   *  A losing close of such an intent auto-resets the selection (control returns to the bot). */
+  operatorLaneSelection?: boolean;
   /** Regime-flip rescue (testnet): true when this intent is the net regime-aligned leg opened by a flip.
    *  Managed only by the rescue flatten — skipped by normal lifecycle + the regime harvest. */
   rescue?: boolean;
@@ -483,6 +493,12 @@ interface LiveExecutionState {
    *  may open new positions, and each mirrored entry's size is scaled by weightPct/100.
    *  null = off. Persisted so a restart keeps the allocation. */
   laneAllocations: Array<{ laneId: string; weightPct: number }> | null;
+  /** Watermark (closedAt ISO) of operator-selection closes already evaluated by the
+   *  auto-reset rule, so a historical loss can never re-trigger a reset later. */
+  laneSelectionLossWatermark: string | null;
+  /** Last automatic selection reset (a losing operator-selected close returned control
+   *  to the bot). Display-only provenance. */
+  laneSelectionLastAutoReset: { at: string; symbol: string; pnlUsd: number } | null;
 }
 
 export interface CrowdingExitShadowEntry {
@@ -553,6 +569,8 @@ export class LiveExecutionStore {
       crowdingExitShadow: {},
       allowedLaneIds: null,
       laneAllocations: null,
+      laneSelectionLossWatermark: null,
+      laneSelectionLastAutoReset: null,
     };
   }
 
@@ -1205,6 +1223,9 @@ export class LiveExecutionEngine {
             : st.allowedLaneIds.length === 0
               ? ("PAUSED_ALL" as const)
               : ("SELECTED" as const),
+        // Auto-reset rule: a losing operator-selected close beyond this USD clears the selection.
+        lossResetUsd: this.config.laneSelectionLossResetUsd,
+        lastAutoReset: st.laneSelectionLastAutoReset ?? null,
       },
     };
   }
@@ -1579,6 +1600,10 @@ export class LiveExecutionEngine {
       // 4.5 Regime-flip rescue (testnet-only, SHADOW): evaluate + record what it would flip/flatten on
       // stuck counter-regime positions. Places no orders yet (see evaluateRegimeFlipRescue).
       await this.evaluateRegimeFlipRescue();
+
+      // 4.6 Operator lane-selection auto-reset: a LOSING close of a position the operator's
+      // selection opened returns control to the bot (clears allocations + allow-list).
+      this.maybeAutoResetLaneSelection();
 
       // 5. Mirror new HEADLINE paper orders (only when armed + healthy).
       await this.mirrorNewSignals();
@@ -2520,6 +2545,63 @@ export class LiveExecutionEngine {
     return allowed.includes(laneId) || allowed.includes(variantId);
   }
 
+  /** True when an operator selection (weighted allocation OR allow-list) is active AND
+   *  this paper order's lane is one the operator picked — i.e. the resulting position
+   *  exists because of the manual selection, not the bot's normal routing. */
+  private operatorSelectionActiveFor(paper: PaperOrder): boolean {
+    const st = this.store.getState();
+    const hasAllocations = !!st.laneAllocations && st.laneAllocations.length > 0;
+    const hasAllowList = Array.isArray(st.allowedLaneIds) && st.allowedLaneIds.length > 0;
+    if (!hasAllocations && !hasAllowList) return false;
+    return this.laneAllowedForMirror(paper);
+  }
+
+  /**
+   * Auto-reset rule (operator ask): "kalau posisi open dari lane selection yang gw pilih
+   * unrealized-after-slippage-nya minus dan kena close, reset semua lane selection".
+   * Evaluates operator-selection closes past the watermark; a net realized loss beyond
+   * laneSelectionLossResetUsd clears BOTH the weighted allocation and the allow-list.
+   * Profitable (or scratch) closes only advance the watermark — the selection persists
+   * (it lives server-side, so a dashboard relogin never clears it either).
+   */
+  private maybeAutoResetLaneSelection(): void {
+    const st = this.store.getState();
+    const selectionActive =
+      (!!st.laneAllocations && st.laneAllocations.length > 0) ||
+      (Array.isArray(st.allowedLaneIds) && st.allowedLaneIds.length > 0);
+    if (!selectionActive) return;
+
+    const watermark = st.laneSelectionLossWatermark ?? "";
+    const closes = st.intents
+      .filter(
+        (i) =>
+          i.operatorLaneSelection === true &&
+          i.state === "CLOSED" &&
+          i.closedAt !== null &&
+          i.closedAt > watermark &&
+          i.realizedPnlUsd !== null,
+      )
+      .sort((a, b) => (a.closedAt! < b.closedAt! ? -1 : 1));
+    if (closes.length === 0) return;
+
+    let dirty = false;
+    for (const intent of closes) {
+      st.laneSelectionLossWatermark = intent.closedAt;
+      dirty = true;
+      if ((intent.realizedPnlUsd ?? 0) <= -this.config.laneSelectionLossResetUsd) {
+        st.laneAllocations = null;
+        st.allowedLaneIds = null;
+        st.laneSelectionLastAutoReset = {
+          at: this.nowIso(),
+          symbol: intent.symbol,
+          pnlUsd: intent.realizedPnlUsd ?? 0,
+        };
+        break; // selection is gone — control returned to the bot
+      }
+    }
+    if (dirty) this.store.save();
+  }
+
   /** Set (and persist) the weighted lane allocation. null turns allocations off.
    *  Each entry: laneId (full or variant suffix) + weightPct in (0, 100]. Max 4 lanes. */
   setLaneAllocations(
@@ -2941,6 +3023,8 @@ export class LiveExecutionEngine {
       feesUsd: null,
       exitRule: this.paperExitRule(paper),
       maxFavorableR: null,
+      // Tagged so a losing close of an operator-selected position can auto-reset the selection.
+      operatorLaneSelection: this.operatorSelectionActiveFor(paper) || undefined,
       createdAt: now,
       updatedAt: now,
       closedAt: null,

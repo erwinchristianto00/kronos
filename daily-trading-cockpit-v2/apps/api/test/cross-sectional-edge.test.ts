@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import type { Candle } from "@dtc/shared";
 import {
+  deriveAdaptiveSymbolFilters,
   crossSectionalMomentumScore,
   buildCrossSectionalBasket,
   buildFilteredCrossSectionalBasket,
@@ -295,3 +296,55 @@ describe("cross-sectional-edge — market-neutral measurement lane", () => {
 });
 
 const BAR_FUDGE = 60 * 60_000 + 1000; // one 1h bar + a little, to push past the horizon
+
+describe("deriveAdaptiveSymbolFilters — auto-updating allow/blocklists from measured legs", () => {
+
+  function closedObs(id: string, longLegs: Array<[string, number, number]>, shortLegs: Array<[string, number, number]>) {
+    return {
+      observationId: id,
+      openedAt: T0,
+      openedAtMs: T0ms,
+      horizonMs: 3_600_000,
+      signal: "MOM24",
+      variant: "RAW" as const,
+      k: longLegs.length,
+      longLeg: longLegs.map(([symbol, entryPrice, exitPrice]) => ({ symbol, entryPrice, exitPrice })),
+      shortLeg: shortLegs.map(([symbol, entryPrice, exitPrice]) => ({ symbol, entryPrice, exitPrice })),
+      status: "CLOSED" as const,
+      grossReturn: 0, costReturn: 0, netReturn: 0, longLegReturn: 0, shortLegReturn: 0,
+      resolvedAt: T0,
+    };
+  }
+
+  it("promotes measured winners into allowlists and demotes measured losers (env = prior)", () => {
+    const store = freshStore();
+    // SOL long leg: 3 wins (+2% each) → promoted long (already in env allow — stays).
+    // FETUSDT long: 3 losses (-2%) → demoted long (blocked) even though not in env lists.
+    // NEARUSDT short: 3 wins (price fell) → promoted short, UN-blocked from env shortBlocklist.
+    // DOGEUSDT short: 3 losses (price rose) → demoted from env short allowlist + blocklisted.
+    for (let i = 0; i < 3; i++) {
+      store.add(closedObs(`a${i}`, [["SOLUSDT", 100, 102], ["FETUSDT", 1, 0.98]], [["NEARUSDT", 2, 1.9], ["DOGEUSDT", 0.07, 0.075]]) as never);
+    }
+    const f = deriveAdaptiveSymbolFilters(store);
+    expect(f.longAllowlist).toContain("SOLUSDT");
+    expect(f.longAllowlist).not.toContain("FETUSDT");
+    expect(f.longBlocklist).toContain("FETUSDT");
+    expect(f.shortAllowlist).toContain("NEARUSDT"); // measured-positive un-blocks the env-era block
+    expect(f.shortBlocklist).not.toContain("NEARUSDT");
+    expect(f.shortAllowlist).not.toContain("DOGEUSDT");
+    expect(f.shortBlocklist).toContain("DOGEUSDT");
+    expect(f.provenance.closedBaskets).toBe(3);
+    expect(f.provenance.promotedShort).toContain("NEARUSDT");
+    expect(f.provenance.demotedShort).toContain("DOGEUSDT");
+  });
+
+  it("below the min sample size, the env lists pass through unchanged", () => {
+    const store = freshStore();
+    store.add(closedObs("one", [["SOLUSDT", 100, 90]], [["DOGEUSDT", 0.07, 0.08]]) as never); // 1 bad sample each
+    const f = deriveAdaptiveSymbolFilters(store);
+    // n=1 < 3 ⇒ no demotion: env allowlists intact.
+    expect(f.longAllowlist).toContain("SOLUSDT");
+    expect(f.shortAllowlist).toContain("DOGEUSDT");
+    expect(f.longBlocklist).toEqual([]);
+  });
+});

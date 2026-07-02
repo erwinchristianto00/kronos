@@ -270,6 +270,7 @@ function makeConfig(overrides: Partial<LiveExecutionConfig> = {}): LiveExecution
     mainnetRegimeHardCutMs: 30 * 60 * 1000,
     profitBankNetTargetUsd: 0,
     regimeLossHardCutStopFraction: 0.5,
+    laneSelectionLossResetUsd: 0.25,
     rescue: {
       enabled: false,
       minAgeMs: 60 * 60 * 1000,
@@ -2046,7 +2047,7 @@ describe("operator lane selection (POST /api/live/lanes → setAllowedLanes)", (
     expect(store.getState().allowedLaneIds).toEqual(["CG_WIDE_FAST_SHORT"]);
     await engine.tick();
     expect(store.getState().intents.length).toBe(1);
-    expect(engine.getStatus().laneSelection).toEqual({
+    expect(engine.getStatus().laneSelection).toMatchObject({
       allowedLaneIds: ["CG_WIDE_FAST_SHORT"],
       laneAllocations: null,
       mode: "SELECTED",
@@ -2185,5 +2186,76 @@ describe("weighted lane allocation (POST /api/live/lane-allocations)", () => {
     engine.setLaneAllocations([{ laneId: "CG_WIDE_FAST_SHORT", weightPct: 100 }]); // …but allocations take precedence
     await engine.tick();
     expect(store.getState().intents.length).toBe(0);
+  });
+});
+
+describe("lane selection auto-reset on losing operator close", () => {
+  // Open an intent under a 100% allocation on its lane, then close it at a given net PnL.
+  async function openSelectedIntent(pnl: number) {
+    const order = paperOrder({ selectedLaneId: "CG_VARIANT_MATRIX:CG_WIDE_FAST_SHORT" } as Partial<PaperOrder>);
+    const { engine, client, store } = makeEngine({ paper: makePaperStore([order]) });
+    expect((await engine.arm()).ok).toBe(true);
+    engine.setLaneAllocations([{ laneId: "CG_WIDE_FAST_SHORT", weightPct: 100 }]);
+    engine.setAllowedLanes(["CG_WIDE_FAST_SHORT"]); // allocations take precedence, but both should reset
+    await engine.tick();
+    const intent = store.getState().intents[0]!;
+    expect(intent.operatorLaneSelection).toBe(true);
+    // Position disappears from the exchange ⇒ settleClosedIntent books the realized PnL.
+    client.positionsBySymbol.set("ETHUSDT", 0);
+    client.trades = [
+      { orderId: intent.entryOrderId!, realizedPnl: pnl, commission: 0 } as never,
+    ];
+    await engine.tick();
+    return { engine, store };
+  }
+
+  it("a losing close (beyond the threshold) resets BOTH allocation and allow-list", async () => {
+    const { engine, store } = await openSelectedIntent(-2.5);
+    expect(store.getState().intents[0]!.state).toBe("CLOSED");
+    expect(store.getState().laneAllocations).toBeNull();
+    expect(store.getState().allowedLaneIds).toBeNull();
+    const sel = engine.getStatus().laneSelection;
+    expect(sel.mode).toBe("ALL_LANES");
+    expect(sel.lastAutoReset?.symbol).toBe("ETHUSDT");
+    expect(sel.lastAutoReset?.pnlUsd).toBeCloseTo(-2.5, 6);
+  });
+
+  it("a PROFITABLE close leaves the selection persisted (server-side, survives relogin)", async () => {
+    const { engine, store } = await openSelectedIntent(1.8);
+    expect(store.getState().intents[0]!.state).toBe("CLOSED");
+    expect(store.getState().laneAllocations).toEqual([{ laneId: "CG_WIDE_FAST_SHORT", weightPct: 100 }]);
+    expect(engine.getStatus().laneSelection.mode).toBe("WEIGHTED_ALLOCATION");
+    expect(engine.getStatus().laneSelection.lastAutoReset).toBeNull();
+  });
+
+  it("a tiny scratch loss (fees-only, under the threshold) does NOT reset", async () => {
+    const { engine, store } = await openSelectedIntent(-0.02);
+    expect(store.getState().intents[0]!.state).toBe("CLOSED");
+    expect(store.getState().laneAllocations).toEqual([{ laneId: "CG_WIDE_FAST_SHORT", weightPct: 100 }]);
+    expect(engine.getStatus().laneSelection.lastAutoReset).toBeNull();
+  });
+
+  it("a losing close of a NON-selected (bot-routed) position does not reset the selection", async () => {
+    const order = paperOrder({ selectedLaneId: "CG_VARIANT_MATRIX:CG_WIDE_FAST_SHORT" } as Partial<PaperOrder>);
+    const { engine, client, store } = makeEngine({ paper: makePaperStore([order]) });
+    expect((await engine.arm()).ok).toBe(true);
+    await engine.tick(); // opened with NO selection active ⇒ not operator-tagged
+    const intent = store.getState().intents[0]!;
+    expect(intent.operatorLaneSelection).toBeUndefined();
+    // Operator selects a lane AFTER the position opened, then the old position loses.
+    engine.setLaneAllocations([{ laneId: "CG_WIDE_FAST_LONG", weightPct: 100 }]);
+    client.positionsBySymbol.set("ETHUSDT", 0);
+    client.trades = [{ orderId: intent.entryOrderId!, realizedPnl: -3, commission: 0 } as never];
+    await engine.tick();
+    expect(store.getState().intents[0]!.state).toBe("CLOSED");
+    expect(store.getState().laneAllocations).toEqual([{ laneId: "CG_WIDE_FAST_LONG", weightPct: 100 }]);
+  });
+
+  it("the watermark prevents an old processed loss from re-triggering after re-selection", async () => {
+    const { engine, store } = await openSelectedIntent(-2.5);
+    expect(store.getState().laneAllocations).toBeNull(); // reset happened
+    engine.setLaneAllocations([{ laneId: "CG_WIDE_FAST_SHORT", weightPct: 100 }]); // operator re-selects
+    await engine.tick(); // the old CLOSED loss is behind the watermark now
+    expect(store.getState().laneAllocations).toEqual([{ laneId: "CG_WIDE_FAST_SHORT", weightPct: 100 }]);
   });
 });
