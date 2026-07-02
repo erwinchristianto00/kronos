@@ -8,11 +8,12 @@
 import type { FastifyInstance } from "fastify";
 
 import type { LiveExecutionEngine } from "../lib/live-execution-engine.js";
+import type { CrossSectionalExecutor } from "../lib/cross-sectional-executor.js";
 
 export async function registerLiveRoutes(
   app: FastifyInstance,
   engine: LiveExecutionEngine | null,
-  opts: { configErrors?: string[] } = {},
+  opts: { configErrors?: string[]; crossSectionalExecutor?: () => CrossSectionalExecutor | null } = {},
 ): Promise<void> {
   app.get("/api/live/status", async () => {
     if (!engine) {
@@ -167,6 +168,43 @@ export async function registerLiveRoutes(
       body.lanes === null ? null : (body.lanes as unknown[]).map((v) => String(v)),
     );
     return { ok: true, ...result };
+  });
+
+  // Cross-sectional executor status (testnet-first basket execution of the measured lane).
+  app.get("/api/live/cross-sectional-executor", async () => {
+    const executor = opts.crossSectionalExecutor?.() ?? null;
+    if (!executor) {
+      return { enabled: false, reason: "executor disabled (set CROSS_SECTIONAL_EXEC_ENABLED=1 + live execution env)" };
+    }
+    return executor.getStatus();
+  });
+
+  // WEIGHTED lane allocation (manual intervention: e.g. lane1 70% / lane2 30%).
+  // Takes precedence over /api/live/lanes while set. Body:
+  //   {"allocations": null}   → off (back to allow-list / all lanes)
+  //   {"allocations": [{"laneId":"CG_WIDE_FAST_SHORT","weightPct":70},
+  //                    {"laneId":"CG_WIDE_FAST_LONG","weightPct":30}]}
+  // Only listed lanes may open NEW positions; each entry's size is scaled by weightPct.
+  app.post("/api/live/lane-allocations", async (request, reply) => {
+    if (!engine) {
+      reply.code(503);
+      return { ok: false, reason: "live execution disabled" };
+    }
+    const body = (request.body ?? {}) as { allocations?: unknown };
+    if (body.allocations !== null && !Array.isArray(body.allocations)) {
+      reply.code(400);
+      return { ok: false, reason: 'body must be {"allocations": null | [{laneId, weightPct}]}' };
+    }
+    const result = engine.setLaneAllocations(
+      body.allocations === null
+        ? null
+        : (body.allocations as Array<{ laneId?: unknown; weightPct?: unknown }>).map((a) => ({
+            laneId: String(a.laneId ?? ""),
+            weightPct: Number(a.weightPct),
+          })),
+    );
+    if (!result.ok) reply.code(400);
+    return result;
   });
 
   app.post("/api/live/kill", async (request, reply) => {

@@ -18,6 +18,12 @@ import { registerScanRoute } from "./routes/scan.js";
 import { registerShadowRoutes } from "./routes/shadow.js";
 import { BinanceFuturesPrivateClient } from "./lib/binance-futures-private.js";
 import {
+  CrossSectionalExecutor,
+  CrossSectionalExecutorStore,
+  isCrossSectionalExecEnabled,
+} from "./lib/cross-sectional-executor.js";
+import { getCrossSectionalStore } from "./lib/cross-sectional-edge.js";
+import {
   LiveExecutionEngine,
   LiveExecutionStore,
   parseLiveExecutionConfig,
@@ -117,6 +123,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
   // Declared here (assigned below) so the shadow routes can READ the live engine's in-memory
   // status (sync getStatus, no I/O) for the order-reconciliation readiness gate, via a lazy getter.
   let liveEngine: LiveExecutionEngine | null = null;
+  let crossSectionalExecutor: CrossSectionalExecutor | null = null;
   await registerShadowRoutes(app, shadowEngine, {
     binanceClient,
     metadataFetchImpl: options.fetchImpl,
@@ -224,8 +231,30 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       },
     });
     if (!isTest) liveEngine.start();
+
+    // Cross-sectional market-neutral EXECUTOR (testnet-first). Env-gated; on mainnet
+    // it additionally requires the engine to be ARMED, so the flag alone can never
+    // trade real money. Consumes the same store the measurement lane writes.
+    if (isCrossSectionalExecEnabled()) {
+      const engineForGate = liveEngine;
+      crossSectionalExecutor = new CrossSectionalExecutor({
+        client: liveClient,
+        signalStore: getCrossSectionalStore(),
+        store: new CrossSectionalExecutorStore(),
+        isAllowed: () =>
+          liveConfig.env === "testnet" ? true : engineForGate !== null && engineForGate.isArmed(),
+      });
+      if (!isTest) {
+        const execTick = () => void crossSectionalExecutor?.tick();
+        setTimeout(execTick, 90_000); // first run after the first cross-sectional cycle
+        setInterval(execTick, 5 * 60_000);
+      }
+    }
   }
-  await registerLiveRoutes(app, liveEngine, { configErrors: liveConfig.enabled ? liveConfig.configErrors : [] });
+  await registerLiveRoutes(app, liveEngine, {
+    configErrors: liveConfig.enabled ? liveConfig.configErrors : [],
+    crossSectionalExecutor: () => crossSectionalExecutor,
+  });
 
   return app;
 }

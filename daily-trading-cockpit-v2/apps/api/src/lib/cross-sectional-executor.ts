@@ -1,0 +1,328 @@
+/**
+ * Cross-sectional market-neutral EXECUTOR — turns the (measured, edgeReady) RAW
+ * cross-sectional basket signal into REAL exchange positions.
+ *
+ * Design constraints (deliberate):
+ *  - TESTNET-FIRST: enabled via CROSS_SECTIONAL_EXEC_ENABLED=1. On mainnet it
+ *    additionally requires the operator's `isAllowed()` gate (the live engine's
+ *    armed switch) — so the flag alone can never trade real money.
+ *  - The basket is a HEDGE: k longs + k shorts at equal notional. Either the
+ *    WHOLE basket opens or nothing — if any leg fails, every already-opened leg
+ *    is flattened immediately (a partial basket is a naked directional bet).
+ *  - One basket open at a time (v1), small fixed notional per leg, 1x leverage.
+ *  - Exits at the signal's own horizon (default 24 bars = 24h) with MARKET
+ *    reduce-only closes; P&L computed from actual fills minus a taker-fee
+ *    estimate per side. Honest costs, no mark-to-model.
+ *  - Consumes the SAME store the measurement lane writes (getCrossSectionalStore)
+ *    so what executes is exactly what was measured — no separate signal path.
+ */
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+
+import type { BinanceFuturesPrivateClient } from "./binance-futures-private.js";
+import type { CrossSectionalObservation, CrossSectionalStore } from "./cross-sectional-edge.js";
+
+export type CrossSectionalExecClient = Pick<
+  BinanceFuturesPrivateClient,
+  "getExchangeFilters" | "placeOrder" | "setLeverage" | "getPositions"
+>;
+
+export function isCrossSectionalExecEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.CROSS_SECTIONAL_EXEC_ENABLED === "1";
+}
+
+const LEG_USD = () => {
+  const n = Number.parseFloat(process.env.CROSS_SECTIONAL_EXEC_LEG_USD ?? "");
+  return Number.isFinite(n) && n > 0 ? n : 25;
+};
+/** Only execute signals younger than this — a stale basket's momentum ranking has drifted. */
+const MAX_SIGNAL_AGE_MS = 15 * 60_000;
+const TAKER_FEE_RATE = 0.0005; // 5 bps per side, conservative
+
+export interface ExecutorLeg {
+  symbol: string;
+  side: "LONG" | "SHORT";
+  qty: number;
+  entryPrice: number;
+  entryOrderId: number;
+  exitPrice: number | null;
+  exitOrderId: number | null;
+}
+
+export interface ExecutorBasket {
+  basketId: string;
+  sourceObservationId: string;
+  signal: string;
+  variant: string;
+  openedAt: string;
+  closesAtMs: number;
+  legs: ExecutorLeg[];
+  status: "OPEN" | "CLOSED" | "ABORTED";
+  closedAt: string | null;
+  closeReason: string | null;
+  grossPnlUsd: number | null;
+  feeEstimateUsd: number | null;
+  netPnlUsd: number | null;
+}
+
+interface ExecutorState {
+  version: number;
+  baskets: ExecutorBasket[];
+  /** openedAtMs watermark — signals at/below this are never re-executed. */
+  lastSeenSignalMs: number;
+}
+
+export class CrossSectionalExecutorStore {
+  private readonly file: string;
+  private state: ExecutorState;
+
+  constructor(dataDir = "data") {
+    this.file = resolve(dataDir, "cross-sectional-executor.json");
+    try {
+      mkdirSync(dirname(this.file), { recursive: true });
+    } catch {
+      // best-effort
+    }
+    this.state = this._load();
+  }
+
+  private _load(): ExecutorState {
+    try {
+      if (existsSync(this.file)) {
+        const parsed = JSON.parse(readFileSync(this.file, "utf-8"));
+        if (parsed && Array.isArray(parsed.baskets)) return parsed as ExecutorState;
+      }
+    } catch {
+      // corrupt → fresh (positions reconcile against the exchange on next tick)
+    }
+    return { version: 1, baskets: [], lastSeenSignalMs: Date.now() };
+  }
+
+  getState(): ExecutorState {
+    return this.state;
+  }
+
+  save(): void {
+    try {
+      const tmp = `${this.file}.tmp`;
+      writeFileSync(tmp, JSON.stringify(this.state, null, 2), "utf-8");
+      writeFileSync(this.file, JSON.stringify(this.state, null, 2), "utf-8");
+    } catch {
+      // never let a persistence failure break the tick
+    }
+  }
+}
+
+export interface CrossSectionalExecutorOptions {
+  client: CrossSectionalExecClient;
+  signalStore: CrossSectionalStore;
+  store: CrossSectionalExecutorStore;
+  /** Master permission gate. Testnet: () => true. Mainnet: () => engine.isArmed(). */
+  isAllowed: () => boolean;
+  nowIso?: () => string;
+}
+
+export class CrossSectionalExecutor {
+  private readonly client: CrossSectionalExecClient;
+  private readonly signalStore: CrossSectionalStore;
+  private readonly store: CrossSectionalExecutorStore;
+  private readonly isAllowed: () => boolean;
+  private readonly nowIso: () => string;
+  private ticking = false;
+  private lastError: string | null = null;
+
+  constructor(opts: CrossSectionalExecutorOptions) {
+    this.client = opts.client;
+    this.signalStore = opts.signalStore;
+    this.store = opts.store;
+    this.isAllowed = opts.isAllowed;
+    this.nowIso = opts.nowIso ?? (() => new Date().toISOString());
+  }
+
+  getStatus(): {
+    enabled: boolean;
+    allowed: boolean;
+    legUsd: number;
+    openBasket: ExecutorBasket | null;
+    closedCount: number;
+    totalNetPnlUsd: number;
+    lastError: string | null;
+    recent: ExecutorBasket[];
+  } {
+    const st = this.store.getState();
+    const closed = st.baskets.filter((b) => b.status === "CLOSED");
+    return {
+      enabled: isCrossSectionalExecEnabled(),
+      allowed: this.isAllowed(),
+      legUsd: LEG_USD(),
+      openBasket: st.baskets.find((b) => b.status === "OPEN") ?? null,
+      closedCount: closed.length,
+      totalNetPnlUsd: closed.reduce((s, b) => s + (b.netPnlUsd ?? 0), 0),
+      lastError: this.lastError,
+      recent: st.baskets.slice(-10),
+    };
+  }
+
+  /** Single-flight tick: close due baskets, then consider opening a new one. */
+  async tick(): Promise<void> {
+    if (this.ticking) return;
+    this.ticking = true;
+    try {
+      await this.closeDueBaskets();
+      if (this.isAllowed()) await this.maybeOpenBasket();
+      this.lastError = null;
+    } catch (error) {
+      this.lastError = (error as Error).message ?? "tick failed";
+    } finally {
+      this.ticking = false;
+    }
+  }
+
+  private async closeDueBaskets(): Promise<void> {
+    const st = this.store.getState();
+    const nowMs = new Date(this.nowIso()).getTime();
+    for (const basket of st.baskets) {
+      if (basket.status !== "OPEN") continue;
+      if (nowMs < basket.closesAtMs) continue;
+      await this.closeBasket(basket, "HORIZON");
+    }
+  }
+
+  private async closeBasket(basket: ExecutorBasket, reason: string): Promise<void> {
+    let gross = 0;
+    let notionalTouched = 0;
+    for (const leg of basket.legs) {
+      if (leg.exitOrderId !== null) continue; // already closed (retry path)
+      const exitSide = leg.side === "LONG" ? "SELL" : "BUY";
+      const order = await this.client.placeOrder({
+        symbol: leg.symbol,
+        side: exitSide,
+        type: "MARKET",
+        quantity: leg.qty,
+        reduceOnly: true,
+        newClientOrderId: `xsec-${basket.basketId.slice(-12)}-x${basket.legs.indexOf(leg)}`,
+      });
+      leg.exitOrderId = order.orderId;
+      leg.exitPrice = order.avgPrice > 0 ? order.avgPrice : leg.entryPrice;
+      const dir = leg.side === "LONG" ? 1 : -1;
+      gross += dir * (leg.exitPrice - leg.entryPrice) * leg.qty;
+      notionalTouched += leg.entryPrice * leg.qty + leg.exitPrice * leg.qty;
+      this.store.save(); // persist per leg so a crash mid-close can resume
+    }
+    const fees = notionalTouched * TAKER_FEE_RATE;
+    basket.status = "CLOSED";
+    basket.closedAt = this.nowIso();
+    basket.closeReason = reason;
+    basket.grossPnlUsd = gross;
+    basket.feeEstimateUsd = fees;
+    basket.netPnlUsd = gross - fees;
+    this.store.save();
+  }
+
+  private async maybeOpenBasket(): Promise<void> {
+    const st = this.store.getState();
+    if (st.baskets.some((b) => b.status === "OPEN")) return; // one basket at a time
+
+    const nowMs = new Date(this.nowIso()).getTime();
+    // Newest FRESH, still-OPEN RAW signal we haven't executed yet. RAW is the variant
+    // with the measured edge (63 closed, +0.24%/basket net at the time of wiring).
+    const candidates = this.signalStore.all
+      .filter(
+        (o: CrossSectionalObservation) =>
+          o.status === "OPEN" &&
+          (o.variant ?? "RAW") === "RAW" &&
+          o.openedAtMs > st.lastSeenSignalMs &&
+          nowMs - o.openedAtMs <= MAX_SIGNAL_AGE_MS,
+      )
+      .sort((a: CrossSectionalObservation, b: CrossSectionalObservation) => b.openedAtMs - a.openedAtMs);
+    const signal = candidates[0];
+    if (!signal) return;
+
+    // Watermark BEFORE placing orders: a failed basket must not retry forever.
+    st.lastSeenSignalMs = signal.openedAtMs;
+    this.store.save();
+
+    const filters = await this.client.getExchangeFilters();
+    const legUsd = LEG_USD();
+    const plannedLegs: Array<{ symbol: string; side: "LONG" | "SHORT"; qty: number; refPrice: number }> = [];
+    for (const [side, legs] of [["LONG", signal.longLeg], ["SHORT", signal.shortLeg]] as const) {
+      for (const leg of legs) {
+        const f = filters.get(leg.symbol);
+        if (!f || !(leg.entryPrice > 0)) return; // missing filters/price ⇒ skip whole basket
+        const rawQty = legUsd / leg.entryPrice;
+        const qty = Math.floor(rawQty / f.stepSize) * f.stepSize;
+        if (!(qty >= f.minQty)) return; // any un-sizeable leg ⇒ skip whole basket (hedge integrity)
+        plannedLegs.push({ symbol: leg.symbol, side, qty: Number(qty.toFixed(8)), refPrice: leg.entryPrice });
+      }
+    }
+    if (plannedLegs.length !== signal.longLeg.length + signal.shortLeg.length) return;
+
+    const basket: ExecutorBasket = {
+      basketId: `xb-${signal.openedAtMs.toString(36)}`,
+      sourceObservationId: signal.observationId,
+      signal: signal.signal,
+      variant: signal.variant ?? "RAW",
+      openedAt: this.nowIso(),
+      closesAtMs: signal.openedAtMs + signal.horizonMs,
+      legs: [],
+      status: "OPEN",
+      closedAt: null,
+      closeReason: null,
+      grossPnlUsd: null,
+      feeEstimateUsd: null,
+      netPnlUsd: null,
+    };
+
+    try {
+      for (const planned of plannedLegs) {
+        try {
+          await this.client.setLeverage(planned.symbol, 1); // market-neutral: no leverage
+        } catch {
+          // best-effort (already set / position exists)
+        }
+        const order = await this.client.placeOrder({
+          symbol: planned.symbol,
+          side: planned.side === "LONG" ? "BUY" : "SELL",
+          type: "MARKET",
+          quantity: planned.qty,
+          newClientOrderId: `xsec-${basket.basketId.slice(-12)}-e${basket.legs.length}`,
+        });
+        basket.legs.push({
+          symbol: planned.symbol,
+          side: planned.side,
+          qty: planned.qty,
+          entryPrice: order.avgPrice > 0 ? order.avgPrice : planned.refPrice,
+          entryOrderId: order.orderId,
+          exitPrice: null,
+          exitOrderId: null,
+        });
+      }
+      st.baskets.push(basket);
+      this.store.save();
+    } catch (error) {
+      // A partial basket is a NAKED directional bet — flatten whatever opened, record ABORTED.
+      basket.status = "ABORTED";
+      basket.closedAt = this.nowIso();
+      basket.closeReason = `OPEN_FAILED:${(error as Error).message}`;
+      for (const leg of basket.legs) {
+        try {
+          const flat = await this.client.placeOrder({
+            symbol: leg.symbol,
+            side: leg.side === "LONG" ? "SELL" : "BUY",
+            type: "MARKET",
+            quantity: leg.qty,
+            reduceOnly: true,
+            newClientOrderId: `xsec-${basket.basketId.slice(-12)}-a${basket.legs.indexOf(leg)}`,
+          });
+          leg.exitOrderId = flat.orderId;
+          leg.exitPrice = flat.avgPrice > 0 ? flat.avgPrice : leg.entryPrice;
+        } catch {
+          // leave for the operator/reconcile — recorded as ABORTED with legs visible
+        }
+      }
+      st.baskets.push(basket);
+      this.store.save();
+      throw error;
+    }
+  }
+}

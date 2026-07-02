@@ -478,6 +478,11 @@ interface LiveExecutionState {
    *  either as the full id ("CG_VARIANT_MATRIX:CG_WIDE_FAST_SHORT") or its variant
    *  suffix ("CG_WIDE_FAST_SHORT"). Persisted so a restart keeps the selection. */
   allowedLaneIds: string[] | null;
+  /** Operator WEIGHTED lane allocation (manual intervention, e.g. lane1 70% / lane2 30%).
+   *  When set (non-empty) it takes precedence over allowedLaneIds: ONLY the listed lanes
+   *  may open new positions, and each mirrored entry's size is scaled by weightPct/100.
+   *  null = off. Persisted so a restart keeps the allocation. */
+  laneAllocations: Array<{ laneId: string; weightPct: number }> | null;
 }
 
 export interface CrowdingExitShadowEntry {
@@ -547,6 +552,7 @@ export class LiveExecutionStore {
       lastRescuePlan: null,
       crowdingExitShadow: {},
       allowedLaneIds: null,
+      laneAllocations: null,
     };
   }
 
@@ -1187,14 +1193,18 @@ export class LiveExecutionEngine {
       // Crowding-gated exit — SHADOW only (see recordCrowdingExitShadow). Per-symbol: what crowding
       // would have recommended (CUT/HOLD) vs. what the harvest actually did, and whether they agree.
       crowdingExitShadow: st.crowdingExitShadow,
-      // Operator lane selection for the mirror (POST /api/live/lanes). null = all lanes.
+      // Operator lane selection for the mirror (POST /api/live/lanes + /api/live/lane-allocations).
+      // Weighted allocations (when set) take precedence over the plain allow-list.
       laneSelection: {
         allowedLaneIds: st.allowedLaneIds ?? null,
-        mode: st.allowedLaneIds === null || st.allowedLaneIds === undefined
-          ? ("ALL_LANES" as const)
-          : st.allowedLaneIds.length === 0
-            ? ("PAUSED_ALL" as const)
-            : ("SELECTED" as const),
+        laneAllocations: st.laneAllocations ?? null,
+        mode: st.laneAllocations && st.laneAllocations.length > 0
+          ? ("WEIGHTED_ALLOCATION" as const)
+          : st.allowedLaneIds === null || st.allowedLaneIds === undefined
+            ? ("ALL_LANES" as const)
+            : st.allowedLaneIds.length === 0
+              ? ("PAUSED_ALL" as const)
+              : ("SELECTED" as const),
       },
     };
   }
@@ -2484,14 +2494,62 @@ export class LiveExecutionEngine {
 
   // ── mirroring ──────────────────────────────────────────────────────────────
 
-  /** Operator lane selection: null = all lanes, [] = pause all new mirrors.
-   *  Matches selectedLaneId as full id or variant suffix. */
+  /** Weighted allocation lookup: 100 when allocations are off; the lane's weightPct when
+   *  listed; 0 (blocked) when allocations are ON but the lane is not listed. */
+  private laneAllocationWeightPct(paper: PaperOrder): number {
+    const allocations = this.store.getState().laneAllocations;
+    if (!allocations || allocations.length === 0) return 100;
+    const laneId = paper.selectedLaneId ?? "";
+    const variantId = laneId.split(":").pop() ?? laneId;
+    const hit = allocations.find((a) => a.laneId === laneId || a.laneId === variantId);
+    return hit ? hit.weightPct : 0;
+  }
+
+  /** Operator lane selection: weighted allocations (when set) take precedence; else the
+   *  plain allow-list (null = all lanes, [] = pause all new mirrors). Matches
+   *  selectedLaneId as full id or variant suffix. */
   private laneAllowedForMirror(paper: PaperOrder): boolean {
-    const allowed = this.store.getState().allowedLaneIds;
+    const st = this.store.getState();
+    if (st.laneAllocations && st.laneAllocations.length > 0) {
+      return this.laneAllocationWeightPct(paper) > 0;
+    }
+    const allowed = st.allowedLaneIds;
     if (allowed === null || allowed === undefined) return true;
     const laneId = paper.selectedLaneId ?? "";
     const variantId = laneId.split(":").pop() ?? laneId;
     return allowed.includes(laneId) || allowed.includes(variantId);
+  }
+
+  /** Set (and persist) the weighted lane allocation. null turns allocations off.
+   *  Each entry: laneId (full or variant suffix) + weightPct in (0, 100]. Max 4 lanes. */
+  setLaneAllocations(
+    allocations: Array<{ laneId: string; weightPct: number }> | null,
+  ): { ok: boolean; reason: string | null; laneAllocations: Array<{ laneId: string; weightPct: number }> | null } {
+    const st = this.store.getState();
+    if (allocations === null) {
+      st.laneAllocations = null;
+      this.store.save();
+      return { ok: true, reason: null, laneAllocations: null };
+    }
+    if (allocations.length === 0 || allocations.length > 4) {
+      return { ok: false, reason: "allocations must list 1-4 lanes (or null to turn off)", laneAllocations: st.laneAllocations };
+    }
+    const cleaned: Array<{ laneId: string; weightPct: number }> = [];
+    const seen = new Set<string>();
+    for (const a of allocations) {
+      const laneId = String(a.laneId ?? "").trim();
+      const weightPct = Number(a.weightPct);
+      if (laneId.length === 0) return { ok: false, reason: "empty laneId", laneAllocations: st.laneAllocations };
+      if (!Number.isFinite(weightPct) || weightPct <= 0 || weightPct > 100) {
+        return { ok: false, reason: `weightPct for ${laneId} must be in (0, 100]`, laneAllocations: st.laneAllocations };
+      }
+      if (seen.has(laneId)) return { ok: false, reason: `duplicate laneId ${laneId}`, laneAllocations: st.laneAllocations };
+      seen.add(laneId);
+      cleaned.push({ laneId, weightPct: Math.round(weightPct) });
+    }
+    st.laneAllocations = cleaned;
+    this.store.save();
+    return { ok: true, reason: null, laneAllocations: cleaned };
   }
 
   /**
@@ -2709,7 +2767,16 @@ export class LiveExecutionEngine {
           this.config,
           filters,
         );
-        return plan.ok ? [{ paper, plan }] : [];
+        if (!plan.ok) return [];
+        // Operator weighted allocation: scale the entry size by the lane's weight
+        // (e.g. lane1 70% / lane2 30%). combinedPlan re-rounds to stepSize and a
+        // too-small scaled qty fails its minQty check (skipped, not mis-sized).
+        const weightPct = this.laneAllocationWeightPct(paper);
+        const scaled =
+          weightPct === 100
+            ? plan
+            : { ...plan, qty: plan.qty * (weightPct / 100), notionalUsd: plan.notionalUsd * (weightPct / 100) };
+        return [{ paper, plan: scaled }];
       });
       if (planned.length === 0) continue;
 

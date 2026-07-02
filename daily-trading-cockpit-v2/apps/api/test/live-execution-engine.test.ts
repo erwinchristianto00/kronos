@@ -2048,6 +2048,7 @@ describe("operator lane selection (POST /api/live/lanes → setAllowedLanes)", (
     expect(store.getState().intents.length).toBe(1);
     expect(engine.getStatus().laneSelection).toEqual({
       allowedLaneIds: ["CG_WIDE_FAST_SHORT"],
+      laneAllocations: null,
       mode: "SELECTED",
     });
   });
@@ -2141,5 +2142,48 @@ describe("copyExternalIntent (testnet→live copy button)", () => {
     expect(lookup.spec?.qty).toBeCloseTo(intent.qty, 9);
     expect(lookup.spec?.stopLossPrice).toBe(intent.stopLossPrice);
     expect(engine.getOpenIntentCopySpec("nope").ok).toBe(false);
+  });
+});
+
+describe("weighted lane allocation (POST /api/live/lane-allocations)", () => {
+  it("validates entries and persists; status mode becomes WEIGHTED_ALLOCATION", async () => {
+    const { engine, store } = makeEngine();
+    expect(engine.setLaneAllocations([{ laneId: "A", weightPct: 0 }]).ok).toBe(false);
+    expect(engine.setLaneAllocations([{ laneId: "A", weightPct: 101 }]).ok).toBe(false);
+    expect(engine.setLaneAllocations([{ laneId: "A", weightPct: 50 }, { laneId: "A", weightPct: 50 }]).ok).toBe(false);
+    const ok = engine.setLaneAllocations([
+      { laneId: "CG_WIDE_FAST_SHORT", weightPct: 70 },
+      { laneId: "CG_WIDE_FAST_LONG", weightPct: 30 },
+    ]);
+    expect(ok.ok).toBe(true);
+    expect(store.getState().laneAllocations).toEqual([
+      { laneId: "CG_WIDE_FAST_SHORT", weightPct: 70 },
+      { laneId: "CG_WIDE_FAST_LONG", weightPct: 30 },
+    ]);
+    expect(engine.getStatus().laneSelection.mode).toBe("WEIGHTED_ALLOCATION");
+    expect(engine.setLaneAllocations(null).laneAllocations).toBeNull();
+    expect(engine.getStatus().laneSelection.mode).toBe("ALL_LANES");
+  });
+
+  it("scales the mirrored entry size by the lane's weight (70% ⇒ 0.7× qty)", async () => {
+    const order = paperOrder({ selectedLaneId: "CG_VARIANT_MATRIX:CG_WIDE_FAST_SHORT" } as Partial<PaperOrder>);
+    const { engine, store } = makeEngine({ paper: makePaperStore([order]) });
+    expect((await engine.arm()).ok).toBe(true);
+    engine.setLaneAllocations([{ laneId: "CG_WIDE_FAST_SHORT", weightPct: 70 }]);
+    await engine.tick();
+    const intent = store.getState().intents[0]!;
+    // Baseline plan: risk $5 across a 5% stop (2000→2100) ⇒ notional $100 ⇒ qty 0.05.
+    // At 70% ⇒ 0.035 (stepSize 0.001).
+    expect(intent.qty).toBeCloseTo(0.035, 9);
+  });
+
+  it("blocks a lane NOT in the allocation even if the allow-list would permit it", async () => {
+    const order = paperOrder({ selectedLaneId: "CG_VARIANT_MATRIX:CG_WIDE_FAST_LONG" } as Partial<PaperOrder>);
+    const { engine, store } = makeEngine({ paper: makePaperStore([order]) });
+    expect((await engine.arm()).ok).toBe(true);
+    engine.setAllowedLanes(["CG_WIDE_FAST_LONG"]); // allow-list would permit it…
+    engine.setLaneAllocations([{ laneId: "CG_WIDE_FAST_SHORT", weightPct: 100 }]); // …but allocations take precedence
+    await engine.tick();
+    expect(store.getState().intents.length).toBe(0);
   });
 });

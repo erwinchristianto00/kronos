@@ -3,6 +3,17 @@ import './neural-mindmap.css';
 
 const REFRESH_MS = 5_000;
 const TESTNET_API_PREFIX = '/testnet/api';
+// The REAL-MONEY mainnet engine, proxied by Caddy (/live/api/* → 127.0.0.1:3103).
+const LIVE_API_PREFIX = '/live/api';
+// Lanes that actually flow through the live mirror — options for the allocation control.
+const LIVE_LANE_OPTIONS = [
+  'CG_WIDE_FAST_SHORT',
+  'CG_WIDE_FAST_LONG',
+  'CG_WIDE_LONG_RUNNER',
+  'CG_WIDE_STOP_TP_WIDE',
+  'CG_MFE_GIVEBACK',
+  'CG_BE_AFTER_05',
+];
 const PERFORMANCE_VIEW_OPTIONS = [
   { value: 'hourly', label: 'Hourly' },
   { value: 'daily', label: 'Daily' },
@@ -368,6 +379,74 @@ export default function TestnetExchangeDashboard() {
   const [lastLoadedAt, setLastLoadedAt] = useState<string | null>(null);
   const [copyBusy, setCopyBusy] = useState<string | null>(null);
   const [copyResult, setCopyResult] = useState<{ id: string; ok: boolean; message: string } | null>(null);
+  const [liveStatus, setLiveStatus] = useState<{
+    armed?: boolean;
+    laneSelection?: {
+      allowedLaneIds: string[] | null;
+      laneAllocations: Array<{ laneId: string; weightPct: number }> | null;
+      mode: string;
+    };
+  } | null>(null);
+  const [controlBusy, setControlBusy] = useState(false);
+  const [controlMsg, setControlMsg] = useState<{ ok: boolean; message: string } | null>(null);
+  const [allocLane1, setAllocLane1] = useState('CG_WIDE_FAST_SHORT');
+  const [allocLane2, setAllocLane2] = useState('CG_WIDE_FAST_LONG');
+  const [allocWeight1, setAllocWeight1] = useState('70');
+  const [allocWeight2, setAllocWeight2] = useState('30');
+
+  async function refreshLiveStatus() {
+    try {
+      const response = await fetch(`${LIVE_API_PREFIX}/live/status`, { cache: 'no-store' });
+      setLiveStatus(await response.json());
+    } catch {
+      setLiveStatus(null); // live instance unreachable — controls will say so
+    }
+  }
+
+  async function control(url: string, body: unknown, label: string, refresh: () => Promise<void> | void) {
+    if (controlBusy) return;
+    setControlBusy(true);
+    setControlMsg(null);
+    try {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const payload = await response.json();
+      if (!response.ok || payload?.ok === false) {
+        setControlMsg({ ok: false, message: `${label}: ${payload?.reason ?? `failed (${response.status})`}` });
+      } else {
+        setControlMsg({ ok: true, message: `${label}: OK` });
+      }
+    } catch (controlError) {
+      setControlMsg({ ok: false, message: `${label}: ${controlError instanceof Error ? controlError.message : 'request failed'}` });
+    } finally {
+      setControlBusy(false);
+      await refresh();
+    }
+  }
+
+  const armTestnet = () => control(`${TESTNET_API_PREFIX}/live/arm`, { confirm: 'ARM' }, 'Arm testnet', loadExchangeOnly);
+  const disarmTestnet = () => control(`${TESTNET_API_PREFIX}/live/disarm`, {}, 'Disarm testnet', loadExchangeOnly);
+  const armLive = () => {
+    if (!window.confirm('ARM the REAL-MONEY mainnet engine? It will start mirroring signals and accepting copy orders.')) return;
+    void control(`${LIVE_API_PREFIX}/live/arm`, { confirm: 'ARM' }, 'Arm LIVE', refreshLiveStatus);
+  };
+  const disarmLive = () => control(`${LIVE_API_PREFIX}/live/disarm`, {}, 'Disarm LIVE', refreshLiveStatus);
+
+  const applyAllocation = () => {
+    const allocations: Array<{ laneId: string; weightPct: number }> = [];
+    if (allocLane1.trim()) allocations.push({ laneId: allocLane1.trim(), weightPct: Number(allocWeight1) });
+    if (allocLane2.trim()) allocations.push({ laneId: allocLane2.trim(), weightPct: Number(allocWeight2) });
+    if (allocations.length === 0) {
+      setControlMsg({ ok: false, message: 'Allocation: pick at least lane 1' });
+      return;
+    }
+    void control(`${LIVE_API_PREFIX}/live/lane-allocations`, { allocations }, 'Live lane allocation', refreshLiveStatus);
+  };
+  const clearAllocation = () =>
+    control(`${LIVE_API_PREFIX}/live/lane-allocations`, { allocations: null }, 'Clear live allocation', refreshLiveStatus);
 
   async function copyToLive(paperOrderId: string) {
     if (copyBusy) return;
@@ -417,6 +496,7 @@ export default function TestnetExchangeDashboard() {
       setLaneSeries(nextLaneSeries);
       setError(null);
       setLastLoadedAt(new Date().toISOString());
+      void refreshLiveStatus(); // fail-soft: live instance state for the control panel
     } catch (nextError) {
       setError(nextError instanceof Error ? nextError.message : 'Unable to load Binance testnet mirror');
     }
@@ -500,6 +580,52 @@ export default function TestnetExchangeDashboard() {
           <span>Open TP/SL orders</span>
           <strong>{account?.openOrderCount ?? 'n/a'}</strong>
           <small>{status?.openIntents?.length ?? 0} live intents · exits can be 2x positions</small>
+        </div>
+      </section>
+
+      <section className="testnet-panel">
+        <header>
+          <span>Engine Controls</span>
+          <strong>
+            testnet {status?.armed ? 'ARMED' : 'disarmed'} · live {liveStatus?.armed ? 'ARMED' : liveStatus ? 'disarmed' : 'unreachable'}
+          </strong>
+        </header>
+        {controlMsg && (
+          <p className={controlMsg.ok ? 'tone-healthy' : 'tone-critical'} style={{ margin: '4px 0' }}>
+            {controlMsg.ok ? '✓' : '✗'} {controlMsg.message}
+          </p>
+        )}
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 16, alignItems: 'flex-end' }}>
+          <div>
+            <small style={{ display: 'block', marginBottom: 4 }}>Testnet engine</small>
+            <button type="button" disabled={controlBusy || status?.armed === true} onClick={() => void armTestnet()}>Arm</button>{' '}
+            <button type="button" disabled={controlBusy || status?.armed !== true} onClick={() => void disarmTestnet()}>Disarm</button>
+          </div>
+          <div>
+            <small style={{ display: 'block', marginBottom: 4 }}>LIVE engine (real money)</small>
+            <button type="button" disabled={controlBusy || liveStatus?.armed === true} onClick={armLive}>Arm LIVE</button>{' '}
+            <button type="button" disabled={controlBusy || liveStatus?.armed !== true} onClick={() => void disarmLive()}>Disarm LIVE</button>
+          </div>
+          <div>
+            <small style={{ display: 'block', marginBottom: 4 }}>
+              LIVE lane allocation — active: {liveStatus?.laneSelection?.laneAllocations
+                ? liveStatus.laneSelection.laneAllocations.map((a) => `${compactLane(a.laneId)} ${a.weightPct}%`).join(' + ')
+                : liveStatus?.laneSelection?.mode ?? 'n/a'}
+            </small>
+            <select value={allocLane1} onChange={(e) => setAllocLane1(e.target.value)}>
+              {LIVE_LANE_OPTIONS.map((lane) => <option key={lane} value={lane}>{lane}</option>)}
+            </select>{' '}
+            <input type="number" min={1} max={100} value={allocWeight1} onChange={(e) => setAllocWeight1(e.target.value)} style={{ width: 56 }} />%
+            {' + '}
+            <select value={allocLane2} onChange={(e) => setAllocLane2(e.target.value)}>
+              <option value="">(none)</option>
+              {LIVE_LANE_OPTIONS.map((lane) => <option key={lane} value={lane}>{lane}</option>)}
+            </select>{' '}
+            <input type="number" min={0} max={100} value={allocWeight2} onChange={(e) => setAllocWeight2(e.target.value)} style={{ width: 56 }} />%
+            {' '}
+            <button type="button" disabled={controlBusy} onClick={applyAllocation}>Apply</button>{' '}
+            <button type="button" disabled={controlBusy} onClick={() => void clearAllocation()}>Clear</button>
+          </div>
         </div>
       </section>
 
