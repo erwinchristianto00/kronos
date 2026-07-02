@@ -47,13 +47,24 @@ describe("fresh-variant-matrix-feed", () => {
     }
   });
 
-  it("[BOTH-DIRECTIONS + POSTURE] longs AND shorts accrue, tagged with posture + regimeDirection", () => {
+  it("[BOTH-DIRECTIONS + POSTURE] every candidate ALSO emits its mirrored opposite direction", () => {
     const store = tmpStore();
     const res = runFreshVariantMatrixFeed({ candidates: [shortCand("BTCUSDT"), longCand("ETHUSDT")], regime: "Bearish pressure", controllerMode: "SHORT_ONLY", controllerConfidence: "MEDIUM", now: NOW }, store);
-    expect(res.signalsCreated).toBe(2); // long no longer dropped at the measurement layer
-    const dirs = new Set(store.all.map((o) => o.direction));
-    expect(dirs.has("LONG")).toBe(true);
-    expect(dirs.has("SHORT")).toBe(true);
+    // 2 scanner candidates + 2 mirrored opposites = 4 signals (true both-directions sampling;
+    // previously the feed only took the scanner's finalDirection, starving SHORT freshValid).
+    expect(res.signalsCreated).toBe(4);
+    const perSymbolDirs = (sym: string) => new Set(store.all.filter((o) => o.symbol === sym).map((o) => o.direction));
+    expect(perSymbolDirs("BTCUSDT")).toEqual(new Set(["LONG", "SHORT"]));
+    expect(perSymbolDirs("ETHUSDT")).toEqual(new Set(["LONG", "SHORT"]));
+    // Mirrored geometry is reflected around the entry: BTC short (stop 103, tp 98.5)
+    // ⇒ mirrored long stop 97, tp 101.5. Tagged via entryVariant for cohort separation.
+    const mirroredBtcLong = store.all.find((o) => o.symbol === "BTCUSDT" && o.direction === "LONG");
+    expect(mirroredBtcLong?.entryVariant).toBe("FRESH_MIRROR_OPPOSITE");
+    expect(mirroredBtcLong?.originalStopLoss).toBeCloseTo(97, 9);
+    expect(mirroredBtcLong?.originalTakeProfitLevels?.[0]).toBeCloseTo(101.5, 9);
+    // Scanner-direction obs keep entryVariant null.
+    const scannerBtcShort = store.all.find((o) => o.symbol === "BTCUSDT" && o.direction === "SHORT");
+    expect(scannerBtcShort?.entryVariant).toBeNull();
     // Bearish pressure + MEDIUM confidence ⇒ EXTENDED / SHORT regime context, stamped on every obs.
     expect(res.posture).toBe("EXTENDED");
     expect(res.regimeDirection).toBe("SHORT");
@@ -61,6 +72,19 @@ describe("fresh-variant-matrix-feed", () => {
       expect(o.posture).toBe("EXTENDED");
       expect(o.regimeDirection).toBe("SHORT");
     }
+  });
+
+  it("[MIRROR-CAP] the per-cycle cap still bounds total signals (balanced, not doubled)", () => {
+    const store = tmpStore();
+    const many = Array.from({ length: 10 }, (_, i) => longCand(`SYM${i}USDT`));
+    const res = runFreshVariantMatrixFeed(
+      { candidates: many, regime: "Mixed rotation", controllerMode: "VALIDATION_ONLY", controllerConfidence: "LOW", now: NOW, maxPerCycle: 6 },
+      store,
+    );
+    expect(res.signalsCreated).toBe(6); // 3 symbols × both directions — cap unchanged
+    const longs = store.all.filter((o) => o.direction === "LONG").length;
+    const shorts = store.all.filter((o) => o.direction === "SHORT").length;
+    expect(longs).toBe(shorts); // interleaving keeps the mix 50/50
   });
 
   it("[POSTURE] mixed/low-confidence regime ⇒ TACTICAL / MIXED", () => {

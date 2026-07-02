@@ -99,6 +99,38 @@ function geometryDirectionOk(c: FreshFeedCandidate): boolean {
     : c.stopLoss < c.entryPrice && tp1 > c.entryPrice;
 }
 
+/** Marker for synthesized opposite-direction candidates so the two cohorts stay separable. */
+export const FRESH_MIRROR_OPPOSITE_VARIANT = "FRESH_MIRROR_OPPOSITE";
+
+/**
+ * Synthesize the OPPOSITE-direction twin of a candidate: same entry, stop/TPs
+ * reflected to the other side at the same distances. This is what makes the feed
+ * genuinely BOTH-directions — before this, the feed only sampled the scanner's
+ * `finalDirection` (long-biased by construction: anything non-SHORT became LONG),
+ * which is why SHORT freshValid starved (~48 obs vs ~750 LONG). Mirrored obs are
+ * tagged via `entryVariant` so scanner-conviction vs anti-conviction cohorts can
+ * be measured separately.
+ */
+export function mirrorOppositeCandidate(c: FreshFeedCandidate): FreshFeedCandidate | null {
+  if (!geometryDirectionOk(c)) return null;
+  const entry = c.entryPrice as number;
+  const stop = c.stopLoss as number;
+  const mirroredStop = entry + (entry - stop);
+  const mirroredTps = c.takeProfitLevels
+    .map((tp) => entry - (tp - entry))
+    .filter((tp) => Number.isFinite(tp) && tp > 0);
+  if (!(mirroredStop > 0) || mirroredTps.length === 0) return null;
+  return {
+    symbol: c.symbol,
+    direction: c.direction === "LONG" ? "SHORT" : "LONG",
+    entryPrice: entry,
+    stopLoss: mirroredStop,
+    takeProfitLevels: mirroredTps,
+    stopDistanceBps: c.stopDistanceBps ?? null,
+    entryVariant: FRESH_MIRROR_OPPOSITE_VARIANT,
+  };
+}
+
 export function runFreshVariantMatrixFeed(
   inputs: FreshVariantMatrixFeedInputs,
   store: CurrentGuardVariantMatrixStore,
@@ -121,7 +153,17 @@ export function runFreshVariantMatrixFeed(
   // via the store's sourceObservationKey (symbol|direction|openedAt).
   const openedAt = `${inputs.now.slice(0, 16)}:00.000Z`;
 
+  // Interleave [scanner-direction, mirrored-opposite] per symbol UNDER THE SAME CAP:
+  // the per-cycle budget stays constant (no store-growth change) but the direction
+  // mix becomes ~50/50 instead of whatever the (long-biased) scanner emitted.
+  const expanded: FreshFeedCandidate[] = [];
   for (const c of inputs.candidates) {
+    expanded.push(c);
+    const mirrored = mirrorOppositeCandidate(c);
+    if (mirrored) expanded.push(mirrored);
+  }
+
+  for (const c of expanded) {
     if (result.signalsCreated >= maxPerCycle) {
       result.skipped += 1;
       result.reasons.push(`cap_reached:${c.symbol}`);
