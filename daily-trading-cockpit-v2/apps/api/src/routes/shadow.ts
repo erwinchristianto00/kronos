@@ -264,6 +264,9 @@ import {
   type MicrostructureCollectorReport,
 } from "../lib/microstructure-feature-collector.js";
 import { buildRegimeEngineReport, isRegimeEngineEnabled } from "../lib/regime-engine-service.js";
+import { buildFreshVariantMatrixReport } from "../lib/fresh-variant-matrix-feed.js";
+import { buildCrowdingReport } from "../lib/derivatives-crowding.js";
+import { buildRegimeGatedLaneReport, type RgObservation } from "../lib/regime-gated-lane-performance.js";
 
 const mixedLaneIdForDirection = (direction: string | null | undefined): string =>
   direction === "LONG"
@@ -705,6 +708,22 @@ export async function registerShadowRoutes(
   // MOONSHOT_LOTTERY_LANE demo report — daily budget state + recent signals/rejects (report-only).
   app.get("/api/shadow/moonshot-report", async () => buildMoonshotReport(getMoonshotStore(), Date.now()));
 
+  // Fresh VM-feed report — the honest fresh-entry measurement view. Registered on
+  // every instance; only the "/" diagnostic instance (FRESH_VM_FEED_ENABLED=1) has
+  // meaningful fresh intake, elsewhere it just reports whatever the store holds.
+  app.get("/api/shadow/fresh-variant-matrix-report", async () => {
+    return buildFreshVariantMatrixReport(getCurrentGuardVariantMatrixStore());
+  });
+
+  // Derivatives crowding — live funding/OI/taker snapshot per universe symbol.
+  app.get("/api/shadow/crowding-report", async (_request, reply) => {
+    if (!opts.binanceClient) {
+      reply.code(503);
+      return { error: "NO_MARKET_CLIENT", message: "binance market-data client unavailable" };
+    }
+    return buildCrowdingReport(opts.binanceClient, [...CURRENT_SCANNER_UNIVERSE].slice(0, 15), new Date().toISOString());
+  });
+
   // Regime switching engine — REPORT-ONLY history of what the hypothesis framework
   // (breadth + contextFromCandles + buildTradingDecision) decides each cycle on
   // real Binance data. Cycle runs from scan.ts when REGIME_ENGINE_ENABLED=1.
@@ -712,6 +731,20 @@ export async function registerShadowRoutes(
     enabled: isRegimeEngineEnabled(),
     ...buildRegimeEngineReport(),
   }));
+
+  app.get("/api/shadow/regime-gated-lanes", async () => {
+    const observations: RgObservation[] = [];
+    for (const o of getCurrentGuardVariantMatrixStore().all) {
+      if (o.direction !== "LONG" && o.direction !== "SHORT") continue;
+      observations.push({
+        variantId: String(o.variantId),
+        direction: o.direction,
+        regime: o.regime,
+        netR: o.netR,
+      });
+    }
+    return buildRegimeGatedLaneReport(observations);
+  });
 
   app.get("/api/shadow/routing-monitor", async (_request, reply) => {
     if (!shadowEngine) {
@@ -1107,7 +1140,11 @@ export async function registerShadowRoutes(
         })();
         const cgvmNowIso = new Date().toISOString();
         const cgvmSignals = selectVariantMatrixSignals(allPositions, cgvmCutover ?? undefined);
-        mirrorVariantMatrixSignals(cgvmSignals, cgvmStore, cgvmNowIso);
+        // The lagged shadow-position feed is DISABLED where the fresh feed owns the store
+        // ("/" instance, FRESH_VM_FEED_ENABLED=1) — lagged entries are born unusable live.
+        if (process.env.FRESH_VM_FEED_ENABLED !== "1") {
+          mirrorVariantMatrixSignals(cgvmSignals, cgvmStore, cgvmNowIso);
+        }
         if (opts.binanceClient) {
           const _vbc = opts.binanceClient;
           resolveVariantMatrixObservations(cgvmStore, {
@@ -1448,7 +1485,12 @@ export async function registerShadowRoutes(
           // closed shadow positions are never recorded, the store stays empty, and
           // freshValid/OOS never advances headless (lanes never mature → no
           // headline). Report-only; deduped by the store; never throws.
-          if (process.env.CURRENT_GUARD_VARIANT_MATRIX_DISABLED !== "1" && shadowEngine) {
+          if (
+            process.env.CURRENT_GUARD_VARIANT_MATRIX_DISABLED !== "1" &&
+            shadowEngine &&
+            // Lagged shadow-position mirroring is OFF where the fresh feed owns the store.
+            process.env.FRESH_VM_FEED_ENABLED !== "1"
+          ) {
             try {
               const cutoverTs = getPostCutoverStore().getBoundary()?.cutoverTimestamp ?? null;
               const cgvmSignals = selectVariantMatrixSignals(

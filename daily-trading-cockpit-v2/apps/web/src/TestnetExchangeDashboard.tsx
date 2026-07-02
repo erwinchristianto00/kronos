@@ -13,6 +13,7 @@ const LIVE_LANE_OPTIONS = [
   'CG_WIDE_STOP_TP_WIDE',
   'CG_MFE_GIVEBACK',
   'CG_BE_AFTER_05',
+  'CROSS_SECTIONAL_MARKET_NEUTRAL',
 ];
 const PERFORMANCE_VIEW_OPTIONS = [
   { value: 'hourly', label: 'Hourly' },
@@ -34,10 +35,80 @@ const FALLBACK_REGIME_OPTIONS = [
 ];
 const LANE_CHART_COLORS = ['#5ce4a6', '#6fb7c9', '#f3bf5a', '#ff707a', '#a78bfa', '#f59bd3', '#92d36e', '#ff9b6f'];
 
+// Regime tree (operator's naming) ↔ the regime engine's states, with the strategy
+// lane each regime runs and a SUGGESTED live lane-allocation preset. Presets only
+// PREFILL the allocation form — nothing changes until the operator presses Apply.
+// The regime engine itself is REPORT-ONLY (it records decisions, it does not trade).
+const REGIME_TREE: Array<{
+  label: string;
+  engineRegime: string;
+  lane: string;
+  laneNote: string;
+  preset: { lane1: string; w1: string; lane2: string; w2: string };
+}> = [
+  {
+    label: 'Bear Trend',
+    engineRegime: 'BEAR_TREND',
+    lane: 'Trend Short (Breakdown Retest Short)',
+    laneNote: 'break + failed retest continuation',
+    preset: { lane1: 'CG_WIDE_FAST_SHORT', w1: '100', lane2: '', w2: '0' },
+  },
+  {
+    label: 'Bear Choppy',
+    engineRegime: 'BEARISH_CHOPPY_DEFENSIVE',
+    lane: 'Short Rally Fade',
+    laneNote: 'fade weak bounces; micro mean-reversion small',
+    preset: { lane1: 'CG_WIDE_FAST_SHORT', w1: '70', lane2: 'CG_WIDE_FAST_LONG', w2: '30' },
+  },
+  {
+    label: 'Neutral',
+    engineRegime: 'NO_TRADE',
+    lane: 'Mean Reversion (cross-sectional market-neutral)',
+    laneNote: 'basket executor trades this; mirror stays balanced',
+    preset: { lane1: 'CG_WIDE_FAST_LONG', w1: '50', lane2: 'CG_WIDE_FAST_SHORT', w2: '50' },
+  },
+  {
+    label: 'Recovery',
+    engineRegime: 'NEUTRAL_RECOVERY',
+    lane: 'Pullback Long (scalp)',
+    laneNote: 'buy held pullbacks after the 62k reclaim',
+    preset: { lane1: 'CG_WIDE_FAST_LONG', w1: '70', lane2: 'CG_WIDE_FAST_SHORT', w2: '30' },
+  },
+  {
+    label: 'Bull',
+    engineRegime: 'TREND_RECOVERY',
+    lane: 'Trend Following (breakout retest long)',
+    laneNote: 'runner earns its place only in a real trend',
+    preset: { lane1: 'CG_WIDE_FAST_LONG', w1: '70', lane2: 'CG_WIDE_LONG_RUNNER', w2: '30' },
+  },
+];
+
+interface RegimeEngineReport {
+  enabled: boolean;
+  snapshotCount: number;
+  latest: {
+    at: string;
+    btcPrice: number | null;
+    regime: string;
+    action: string;
+    lane: string | null;
+    rejectedBy: string | null;
+    noTradeReason: string[] | null;
+    breadth: { advancersPct: number | null; percentAboveEma20: number | null; btcReturn24h: number | null };
+  } | null;
+  regimeCounts: Record<string, number>;
+  transitions: Array<{ at: string; from: string; to: string }>;
+}
+
 interface LiveStatus {
   enabled: boolean;
   env?: string | null;
   armed?: boolean;
+  laneSelection?: {
+    allowedLaneIds: string[] | null;
+    laneAllocations: Array<{ laneId: string; weightPct: number }> | null;
+    mode: string;
+  };
   killedAt?: string | null;
   killReason?: string | null;
   configErrors?: string[];
@@ -366,6 +437,13 @@ async function fetchJson<T>(url: string): Promise<T> {
 }
 
 export default function TestnetExchangeDashboard() {
+  const isLivePage = window.location.pathname.startsWith('/live');
+  const pageApiPrefix = isLivePage ? LIVE_API_PREFIX : TESTNET_API_PREFIX;
+  const pageName = isLivePage ? 'LIVE' : 'Testnet';
+  const pageSubtitle = isLivePage ? 'Binance mainnet mirror' : 'Binance testnet mirror';
+  const pageScope = isLivePage ? 'Exchange-only LIVE view' : 'Exchange-only testnet view';
+  const walletLabel = isLivePage ? 'mainnet wallet' : 'testnet wallet';
+  const allocationLabel = isLivePage ? 'LIVE lane allocation' : 'Testnet lane allocation';
   const [account, setAccount] = useState<LiveAccount | null>(null);
   const [status, setStatus] = useState<LiveStatus | null>(null);
   const [laneSeries, setLaneSeries] = useState<LanePerformanceSeries | null>(null);
@@ -379,28 +457,20 @@ export default function TestnetExchangeDashboard() {
   const [lastLoadedAt, setLastLoadedAt] = useState<string | null>(null);
   const [copyBusy, setCopyBusy] = useState<string | null>(null);
   const [copyResult, setCopyResult] = useState<{ id: string; ok: boolean; message: string } | null>(null);
-  const [liveStatus, setLiveStatus] = useState<{
-    armed?: boolean;
-    laneSelection?: {
-      allowedLaneIds: string[] | null;
-      laneAllocations: Array<{ laneId: string; weightPct: number }> | null;
-      mode: string;
-    };
-  } | null>(null);
   const [controlBusy, setControlBusy] = useState(false);
   const [controlMsg, setControlMsg] = useState<{ ok: boolean; message: string } | null>(null);
   const [allocLane1, setAllocLane1] = useState('CG_WIDE_FAST_SHORT');
   const [allocLane2, setAllocLane2] = useState('CG_WIDE_FAST_LONG');
   const [allocWeight1, setAllocWeight1] = useState('70');
   const [allocWeight2, setAllocWeight2] = useState('30');
+  const [regimeReport, setRegimeReport] = useState<RegimeEngineReport | null>(null);
 
-  async function refreshLiveStatus() {
-    try {
-      const response = await fetch(`${LIVE_API_PREFIX}/live/status`, { cache: 'no-store' });
-      setLiveStatus(await response.json());
-    } catch {
-      setLiveStatus(null); // live instance unreachable — controls will say so
-    }
+  function applyRegimePreset(preset: { lane1: string; w1: string; lane2: string; w2: string }) {
+    setAllocLane1(preset.lane1);
+    setAllocWeight1(preset.w1);
+    setAllocLane2(preset.lane2);
+    setAllocWeight2(preset.w2);
+    setControlMsg({ ok: true, message: `Preset dimuat ke form ${allocationLabel} — tekan Apply untuk mengaktifkan` });
   }
 
   async function control(url: string, body: unknown, label: string, refresh: () => Promise<void> | void) {
@@ -427,13 +497,11 @@ export default function TestnetExchangeDashboard() {
     }
   }
 
-  const armTestnet = () => control(`${TESTNET_API_PREFIX}/live/arm`, { confirm: 'ARM' }, 'Arm testnet', loadExchangeOnly);
-  const disarmTestnet = () => control(`${TESTNET_API_PREFIX}/live/disarm`, {}, 'Disarm testnet', loadExchangeOnly);
-  const armLive = () => {
-    if (!window.confirm('ARM the REAL-MONEY mainnet engine? It will start mirroring signals and accepting copy orders.')) return;
-    void control(`${LIVE_API_PREFIX}/live/arm`, { confirm: 'ARM' }, 'Arm LIVE', refreshLiveStatus);
+  const armCurrent = () => {
+    if (isLivePage && !window.confirm('ARM the REAL-MONEY mainnet engine? It will start mirroring signals and accepting copy orders.')) return;
+    void control(`${pageApiPrefix}/live/arm`, { confirm: 'ARM' }, `Arm ${pageName}`, loadExchangeOnly);
   };
-  const disarmLive = () => control(`${LIVE_API_PREFIX}/live/disarm`, {}, 'Disarm LIVE', refreshLiveStatus);
+  const disarmCurrent = () => control(`${pageApiPrefix}/live/disarm`, {}, `Disarm ${pageName}`, loadExchangeOnly);
 
   const applyAllocation = () => {
     const allocations: Array<{ laneId: string; weightPct: number }> = [];
@@ -443,10 +511,10 @@ export default function TestnetExchangeDashboard() {
       setControlMsg({ ok: false, message: 'Allocation: pick at least lane 1' });
       return;
     }
-    void control(`${LIVE_API_PREFIX}/live/lane-allocations`, { allocations }, 'Live lane allocation', refreshLiveStatus);
+    void control(`${pageApiPrefix}/live/lane-allocations`, { allocations }, allocationLabel, loadExchangeOnly);
   };
   const clearAllocation = () =>
-    control(`${LIVE_API_PREFIX}/live/lane-allocations`, { allocations: null }, 'Clear live allocation', refreshLiveStatus);
+    control(`${pageApiPrefix}/live/lane-allocations`, { allocations: null }, `Clear ${allocationLabel}`, loadExchangeOnly);
 
   async function copyToLive(paperOrderId: string) {
     if (copyBusy) return;
@@ -487,18 +555,24 @@ export default function TestnetExchangeDashboard() {
       });
       if (anchor) seriesParams.set('anchor', anchor);
       const [nextStatus, nextAccount, nextLaneSeries] = await Promise.all([
-        fetchJson<LiveStatus>(`${TESTNET_API_PREFIX}/live/status`),
-        fetchJson<LiveAccount>(`${TESTNET_API_PREFIX}/live/account`),
-        fetchJson<LanePerformanceSeries>(`${TESTNET_API_PREFIX}/live/lane-performance-series?${seriesParams.toString()}`),
+        fetchJson<LiveStatus>(`${pageApiPrefix}/live/status`),
+        fetchJson<LiveAccount>(`${pageApiPrefix}/live/account`),
+        fetchJson<LanePerformanceSeries>(`${pageApiPrefix}/live/lane-performance-series?${seriesParams.toString()}`),
       ]);
       setStatus(nextStatus);
       setAccount(nextAccount);
       setLaneSeries(nextLaneSeries);
       setError(null);
       setLastLoadedAt(new Date().toISOString());
-      void refreshLiveStatus(); // fail-soft: live instance state for the control panel
+      // Regime engine report — lives on the TESTNET instance (report-only), shown on both pages.
+      try {
+        const regimeResponse = await fetch(`${TESTNET_API_PREFIX}/shadow/regime-engine-report`, { cache: 'no-store' });
+        setRegimeReport(await regimeResponse.json());
+      } catch {
+        setRegimeReport(null); // fail-soft: the panel just says unavailable
+      }
     } catch (nextError) {
-      setError(nextError instanceof Error ? nextError.message : 'Unable to load Binance testnet mirror');
+      setError(nextError instanceof Error ? nextError.message : `Unable to load Binance ${isLivePage ? 'mainnet' : 'testnet'} mirror`);
     }
   }
 
@@ -519,6 +593,7 @@ export default function TestnetExchangeDashboard() {
   const totalSourceEntries = account?.positions.reduce((sum, position) => sum + position.sourceOrderCount, 0) ?? 0;
   const regimeOptions = laneSeries?.regimeOptions ?? FALLBACK_REGIME_OPTIONS;
   const chartTotal = laneSeries?.lanes.reduce((sum, lane) => sum + lane.realizedPnlUsd, 0) ?? 0;
+  const isCrossSectionalPosition = (laneIds: string[]) => laneIds.includes('CROSS_SECTIONAL_MARKET_NEUTRAL');
 
   return (
     <div className="neural-shell testnet-shell">
@@ -526,12 +601,12 @@ export default function TestnetExchangeDashboard() {
         <div className="neural-brand">
           <span className={`neural-live-dot ${stale || error ? 'is-stale' : ''}`} />
           <div>
-            <p>Binance testnet mirror</p>
+            <p>{pageSubtitle}</p>
             <h1>Exchange P&amp;L</h1>
           </div>
         </div>
         <nav className="neural-nav" aria-label="Dashboard views">
-          <button type="button" className="is-current">Testnet</button>
+          <button type="button" className="is-current">{pageName}</button>
         </nav>
         <div className="neural-actions">
           <label className="neural-toggle">
@@ -564,7 +639,7 @@ export default function TestnetExchangeDashboard() {
         <div>
           <span>Binance equity</span>
           <strong>{account?.accountEquity != null ? `${account.accountEquity.toFixed(2)} USDT` : 'Loading'}</strong>
-          <small>{account?.availableBalance != null ? `${account.availableBalance.toFixed(2)} available` : 'testnet wallet'}</small>
+          <small>{account?.availableBalance != null ? `${account.availableBalance.toFixed(2)} available` : walletLabel}</small>
         </div>
         <div>
           <span>Unrealized P&amp;L</span>
@@ -587,7 +662,7 @@ export default function TestnetExchangeDashboard() {
         <header>
           <span>Engine Controls</span>
           <strong>
-            testnet {status?.armed ? 'ARMED' : 'disarmed'} · live {liveStatus?.armed ? 'ARMED' : liveStatus ? 'disarmed' : 'unreachable'}
+            {pageName.toLowerCase()} {status?.armed ? 'ARMED' : 'disarmed'}
           </strong>
         </header>
         {controlMsg && (
@@ -597,20 +672,15 @@ export default function TestnetExchangeDashboard() {
         )}
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 16, alignItems: 'flex-end' }}>
           <div>
-            <small style={{ display: 'block', marginBottom: 4 }}>Testnet engine</small>
-            <button type="button" disabled={controlBusy || status?.armed === true} onClick={() => void armTestnet()}>Arm</button>{' '}
-            <button type="button" disabled={controlBusy || status?.armed !== true} onClick={() => void disarmTestnet()}>Disarm</button>
-          </div>
-          <div>
-            <small style={{ display: 'block', marginBottom: 4 }}>LIVE engine (real money)</small>
-            <button type="button" disabled={controlBusy || liveStatus?.armed === true} onClick={armLive}>Arm LIVE</button>{' '}
-            <button type="button" disabled={controlBusy || liveStatus?.armed !== true} onClick={() => void disarmLive()}>Disarm LIVE</button>
+            <small style={{ display: 'block', marginBottom: 4 }}>{pageName} engine{isLivePage ? ' (real money)' : ''}</small>
+            <button type="button" disabled={controlBusy || status?.armed === true} onClick={armCurrent}>Arm</button>{' '}
+            <button type="button" disabled={controlBusy || status?.armed !== true} onClick={() => void disarmCurrent()}>Disarm</button>
           </div>
           <div>
             <small style={{ display: 'block', marginBottom: 4 }}>
-              LIVE lane allocation — active: {liveStatus?.laneSelection?.laneAllocations
-                ? liveStatus.laneSelection.laneAllocations.map((a) => `${compactLane(a.laneId)} ${a.weightPct}%`).join(' + ')
-                : liveStatus?.laneSelection?.mode ?? 'n/a'}
+              {allocationLabel} — active: {status?.laneSelection?.laneAllocations
+                ? status.laneSelection.laneAllocations.map((a) => `${compactLane(a.laneId)} ${a.weightPct}%`).join(' + ')
+                : status?.laneSelection?.mode ?? 'n/a'}
             </small>
             <select value={allocLane1} onChange={(e) => setAllocLane1(e.target.value)}>
               {LIVE_LANE_OPTIONS.map((lane) => <option key={lane} value={lane}>{lane}</option>)}
@@ -629,6 +699,64 @@ export default function TestnetExchangeDashboard() {
         </div>
       </section>
 
+      <section className="testnet-panel">
+        <header>
+          <span>Regime Engine → Lane Tree</span>
+          <strong>
+            {regimeReport?.latest
+              ? `${regimeReport.latest.regime} · BTC ${price(regimeReport.latest.btcPrice)} · ${regimeReport.snapshotCount} snapshots`
+              : regimeReport?.enabled === false
+                ? 'engine disabled'
+                : 'loading…'}
+          </strong>
+        </header>
+        <p style={{ margin: '4px 0' }} className="tone-measure">
+          Report-only: the engine detects the regime + records what it WOULD do every cycle — it does not trade.
+          Pick a regime&apos;s preset to prefill the lane allocation above, then press Apply.
+          {regimeReport?.latest?.breadth?.advancersPct != null &&
+            ` Breadth: ${(regimeReport.latest.breadth.advancersPct * 100).toFixed(0)}% advancers · ${((regimeReport.latest.breadth.percentAboveEma20 ?? 0) * 100).toFixed(0)}% above EMA20 · BTC 24h ${((regimeReport.latest.breadth.btcReturn24h ?? 0) * 100).toFixed(1)}%.`}
+        </p>
+        <div className="testnet-table-wrap">
+          <table>
+            <thead>
+              <tr><th>Regime</th><th>Engine state</th><th>Strategy lane</th><th>Snapshots</th><th>Allocation preset</th></tr>
+            </thead>
+            <tbody>
+              {REGIME_TREE.map((row) => {
+                const isCurrent = regimeReport?.latest?.regime === row.engineRegime;
+                const count = regimeReport?.regimeCounts?.[row.engineRegime] ?? 0;
+                return (
+                  <tr key={row.engineRegime} style={isCurrent ? { outline: '1px solid #5ce4a6' } : undefined}>
+                    <td className={isCurrent ? 'tone-healthy' : undefined}>
+                      {isCurrent ? '▶ ' : ''}{row.label}
+                    </td>
+                    <td>{row.engineRegime}</td>
+                    <td title={row.laneNote}>{row.lane}</td>
+                    <td>{count}</td>
+                    <td>
+                      <button type="button" disabled={controlBusy} onClick={() => applyRegimePreset(row.preset)}>
+                        {row.preset.lane2
+                          ? `${compactLane(row.preset.lane1)} ${row.preset.w1}% + ${compactLane(row.preset.lane2)} ${row.preset.w2}%`
+                          : `${compactLane(row.preset.lane1)} ${row.preset.w1}%`}
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+        {regimeReport?.latest && (
+          <small className="tone-measure">
+            Latest decision: {regimeReport.latest.action}
+            {regimeReport.latest.lane ? ` (${regimeReport.latest.lane})` : ''}
+            {regimeReport.latest.rejectedBy ? ` — ${regimeReport.latest.rejectedBy}` : ''} at {timeAgo(regimeReport.latest.at)}.
+            {regimeReport.transitions.length > 0 &&
+              ` Last transition: ${regimeReport.transitions[regimeReport.transitions.length - 1]!.from} → ${regimeReport.transitions[regimeReport.transitions.length - 1]!.to}.`}
+          </small>
+        )}
+      </section>
+
       {error && (
         <div className="neural-error">
           <strong>Exchange link interrupted</strong>
@@ -640,8 +768,8 @@ export default function TestnetExchangeDashboard() {
         <section className="testnet-panel testnet-hero">
           <div>
             <span>Scope</span>
-            <strong>Exchange-only testnet view</strong>
-            <p>This page reads only `{TESTNET_API_PREFIX}/live/status` and `{TESTNET_API_PREFIX}/live/account`. Binance positions are netted per symbol, so one exchange position can contain multiple source entries from mirrored paper orders.</p>
+            <strong>{pageScope}</strong>
+            <p>This page reads only `{pageApiPrefix}/live/status` and `{pageApiPrefix}/live/account`. Binance positions are netted per symbol, so one exchange position can contain multiple source entries from mirrored paper orders.</p>
           </div>
           <div className="testnet-kpis">
             <div><span>Wallet</span><strong>{plain(account?.walletBalance, ' USDT')}</strong></div>
@@ -684,8 +812,8 @@ export default function TestnetExchangeDashboard() {
                     <td>{position.quantity}</td>
                     <td>{price(position.entryPrice)}</td>
                     <td>{price(position.markPrice)}</td>
-                    <td>{price(position.targetTpPrice)}</td>
-                    <td className={tone(position.targetTpGapPct)}>{percent(position.targetTpGapPct)}</td>
+                    <td>{position.targetTpPrice == null && isCrossSectionalPosition(position.laneIds) ? 'basket horizon' : price(position.targetTpPrice)}</td>
+                    <td className={tone(position.targetTpGapPct)}>{position.targetTpGapPct == null && isCrossSectionalPosition(position.laneIds) ? 'timed' : percent(position.targetTpGapPct)}</td>
                     <td className="tone-critical">{price(position.liquidationPrice)}</td>
                     <td className={tone(position.unrealizedPnl)}>{signed(position.unrealizedPnl)}</td>
                     <td className={tone(position.unrealizedAfterEstimatedCloseCostUsd)}>
@@ -748,7 +876,7 @@ export default function TestnetExchangeDashboard() {
                     <td>{intent.qty}</td>
                     <td>{intent.paperOrderId}</td>
                     <td>
-                      {intent.state === 'OPEN' || intent.state === 'TP1_FILLED_BE_SET' ? (
+                      {!isLivePage && (intent.state === 'OPEN' || intent.state === 'TP1_FILLED_BE_SET') ? (
                         <button
                           type="button"
                           disabled={copyBusy !== null}

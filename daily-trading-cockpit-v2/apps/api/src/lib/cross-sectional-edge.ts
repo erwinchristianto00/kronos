@@ -50,15 +50,15 @@ export const CROSS_SECTIONAL_BASKET_STOP_LOSS_BPS = envNumNonNeg("CROSS_SECTIONA
 export const CROSS_SECTIONAL_TREND_LONG_CAPITAL_WEIGHT = Math.min(0.9, Math.max(0.1, Number(process.env.CROSS_SECTIONAL_TREND_LONG_CAPITAL_WEIGHT ?? 0.35)));
 export const CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST = envSymbolSet(
   "CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST",
-  "SOLUSDT,AVAXUSDT,ETHUSDT,SUIUSDT,ADAUSDT,BNBUSDT,RNDRUSDT",
+  "ADAUSDT,BNBUSDT,ETHUSDT,OPUSDT,PEPEUSDT,SOLUSDT,SUIUSDT",
 );
 export const CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST = envSymbolSet(
   "CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST",
-  "WLDUSDT,DOGEUSDT,PEPEUSDT,APTUSDT,OPUSDT,SEIUSDT",
+  "DOGEUSDT,OPUSDT,PEPEUSDT,SEIUSDT,WLDUSDT",
 );
 export const CROSS_SECTIONAL_FILTERED_SHORT_BLOCKLIST = envSymbolSet(
   "CROSS_SECTIONAL_FILTERED_SHORT_BLOCKLIST",
-  "FETUSDT,INJUSDT,NEARUSDT",
+  "APTUSDT,AVAXUSDT,FETUSDT,INJUSDT,NEARUSDT,RNDRUSDT",
 );
 export const CROSS_SECTIONAL_TREND_LONG_ALLOWLIST = envSymbolSet(
   "CROSS_SECTIONAL_TREND_LONG_ALLOWLIST",
@@ -295,12 +295,14 @@ export function buildCrossSectionalBasket(
 // terus blacklist dan whitelist nya") ────────────────────────────────────────
 //
 // Derives per-symbol allow/blocklists from the MEASURED per-leg performance in the
-// store's CLOSED baskets, using the static env lists as the prior:
+// store's CLOSED baskets, using the static env lists as the HARD operator ceiling:
 //   • a symbol with ≥ minLegSamples measured legs on a side and NEGATIVE avg return
 //     is DEMOTED (removed from that side's allowlist, added to its blocklist);
-//   • a symbol with ≥ minLegSamples and POSITIVE avg return is PROMOTED into the
-//     side's allowlist.
-// Recomputed every cycle, so the lists track the data instead of a frozen env var.
+//   • positive out-of-list symbols are reported in provenance, but they are NOT
+//     promoted into executable allowlists. Execution must never outrun the operator
+//     allow/block filters shown on /research.
+// Recomputed every cycle, so the lists can demote toxic names while staying inside
+// the explicit filtered universe.
 
 export interface AdaptiveSymbolFilters {
   longAllowlist: string[];
@@ -362,12 +364,11 @@ export function deriveAdaptiveSymbolFilters(
     }
   }
 
-  const longAllow = new Set<string>([...CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST, ...promotedLong]);
+  const longAllow = new Set<string>([...CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST]);
   for (const s of demotedLong) longAllow.delete(s);
-  const shortAllow = new Set<string>([...CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST, ...promotedShort]);
+  const shortAllow = new Set<string>([...CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST]);
   for (const s of demotedShort) shortAllow.delete(s);
   const shortBlock = new Set<string>([...CROSS_SECTIONAL_FILTERED_SHORT_BLOCKLIST, ...demotedShort]);
-  for (const s of promotedShort) shortBlock.delete(s); // measured-positive un-blocks an env-era block
   const longBlock = new Set<string>(demotedLong);
 
   return {

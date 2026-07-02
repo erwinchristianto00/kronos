@@ -77,6 +77,7 @@ import {
 } from "../lib/microstructure-feature-collector.js";
 import type { BinanceClient } from "../lib/binance.js";
 import { isRegimeEngineEnabled, runRegimeEngineCycleGuarded } from "../lib/regime-engine-service.js";
+import { runFreshVariantMatrixFeed } from "../lib/fresh-variant-matrix-feed.js";
 import {
   getCandidateFunnelLog,
   normalizeFunnelRegimeFamily,
@@ -462,6 +463,52 @@ export async function registerScanRoute(
       }
     } else {
       timing.recordNotInvokedStage("realtimeShortMirror");
+    }
+
+    // Fresh variant-matrix measurement feed — the live-honest replacement for the stale
+    // shadow-position feed. Samples the scanner's FRESH candidates with openedAt=now,
+    // posture tags, and the mirrored-opposite direction twin (50/50 mix under the same
+    // cap). Env-gated: ONLY the "/" diagnostic instance sets FRESH_VM_FEED_ENABLED=1,
+    // so live (3102/3103) lane-stability inputs are untouched.
+    if (process.env.FRESH_VM_FEED_ENABLED === "1") {
+      try {
+        const freshController = buildRegimeDirectionControllerReport({ currentRegime: result.marketRegime });
+        const freshStore = getCurrentGuardVariantMatrixStore();
+        // Tag each obs with the derivatives crowding state at signal time (report-only, best-effort).
+        const freshCrowdingBySymbol: Record<string, string | null> = {};
+        if (opts.binanceClient) {
+          const crowdClient = opts.binanceClient;
+          const crowdNow = new Date().toISOString();
+          const crowdSyms = [...new Set(top10WithPlan.map((c) => c.symbol))];
+          const crowdSnaps = await Promise.all(
+            crowdSyms.map((s) => fetchCrowdingSnapshot(crowdClient, s, crowdNow).catch(() => null)),
+          );
+          for (const snap of crowdSnaps) if (snap) freshCrowdingBySymbol[snap.symbol] = snap.crowdingState;
+        }
+        runFreshVariantMatrixFeed(
+          {
+            candidates: top10WithPlan.map((c) => ({
+              symbol: c.symbol,
+              direction: (c.finalDirection === "SHORT" ? "SHORT" : "LONG") as "LONG" | "SHORT",
+              entryPrice: candidateCurrentPrice(c),
+              stopLoss:
+                typeof c.stopLoss === "number" && Number.isFinite(c.stopLoss) && c.stopLoss > 0 ? c.stopLoss : null,
+              takeProfitLevels: [c.takeProfits?.tp1, c.takeProfits?.tp2, c.takeProfits?.tp3].filter(
+                (v): v is number => typeof v === "number" && Number.isFinite(v) && v > 0,
+              ),
+              stopDistanceBps: c.selectedExecutionPlan?.stopDistanceBps ?? null,
+            })),
+            regime: result.marketRegime,
+            controllerMode: freshController.controllerMode,
+            controllerConfidence: freshController.confidence,
+            crowdingBySymbol: freshCrowdingBySymbol,
+            now: new Date().toISOString(),
+          },
+          freshStore,
+        );
+      } catch {
+        // measurement intake must never break the scan
+      }
     }
 
     // --- Report-only: regime switching engine cycle (hypothesis framework) ---

@@ -11,6 +11,7 @@ import {
   runFreshVariantMatrixFeed,
   buildFreshVariantMatrixReport,
   freshFeedRegimeContext,
+  _resetFreshFeedThrottleForTests,
   type FreshFeedCandidate,
 } from "../src/lib/fresh-variant-matrix-feed.js";
 
@@ -22,6 +23,7 @@ function tmpStore(): CurrentGuardVariantMatrixStore {
   return new CurrentGuardVariantMatrixStore(dir);
 }
 afterEach(() => {
+  _resetFreshFeedThrottleForTests();
   for (const d of dirs) try { rmSync(d, { recursive: true, force: true }); } catch { /* noop */ }
   dirs.length = 0;
 });
@@ -74,6 +76,19 @@ describe("fresh-variant-matrix-feed", () => {
     }
   });
 
+  it("[THROTTLE] a second batch within the interval is skipped; after the interval it mints again", () => {
+    const store = tmpStore();
+    const r1 = runFreshVariantMatrixFeed({ candidates: [shortCand("BTCUSDT")], regime: "Mixed rotation", controllerMode: "VALIDATION_ONLY", now: NOW }, store);
+    expect(r1.signalsCreated).toBeGreaterThan(0);
+    // 7 minutes later (same hour window) — throttled, nothing minted.
+    const r2 = runFreshVariantMatrixFeed({ candidates: [shortCand("ETHUSDT")], regime: "Mixed rotation", controllerMode: "VALIDATION_ONLY", now: "2026-06-29T14:37:42.000Z" }, store);
+    expect(r2.signalsCreated).toBe(0);
+    expect(r2.reasons.some((r) => r.startsWith("throttled:"))).toBe(true);
+    // 61 minutes later — a new batch mints.
+    const r3 = runFreshVariantMatrixFeed({ candidates: [shortCand("ETHUSDT")], regime: "Mixed rotation", controllerMode: "VALIDATION_ONLY", now: "2026-06-29T15:31:42.000Z" }, store);
+    expect(r3.signalsCreated).toBeGreaterThan(0);
+  });
+
   it("[MIRROR-CAP] the per-cycle cap still bounds total signals (balanced, not doubled)", () => {
     const store = tmpStore();
     const many = Array.from({ length: 10 }, (_, i) => longCand(`SYM${i}USDT`));
@@ -104,6 +119,7 @@ describe("fresh-variant-matrix-feed", () => {
     const store = tmpStore();
     runFreshVariantMatrixFeed({ candidates: [shortCand("BTCUSDT")], regime: "Bearish pressure", controllerMode: "SHORT_ONLY", now: NOW }, store);
     const before = store.all.length;
+    _resetFreshFeedThrottleForTests(); // isolate dedupe from the intake throttle
     const res2 = runFreshVariantMatrixFeed({ candidates: [shortCand("BTCUSDT")], regime: "Bearish pressure", controllerMode: "SHORT_ONLY", now: "2026-06-29T14:30:58.000Z" }, store);
     expect(res2.signalsCreated).toBe(0);
     expect(res2.reasons.some((r) => r.startsWith("duplicate:BTCUSDT"))).toBe(true);

@@ -2521,28 +2521,36 @@ export class LiveExecutionEngine {
 
   /** Weighted allocation lookup: 100 when allocations are off; the lane's weightPct when
    *  listed; 0 (blocked) when allocations are ON but the lane is not listed. */
-  private laneAllocationWeightPct(paper: PaperOrder): number {
+  laneSelectionWeightPctForLane(laneId: string): number {
     const allocations = this.store.getState().laneAllocations;
     if (!allocations || allocations.length === 0) return 100;
-    const laneId = paper.selectedLaneId ?? "";
     const variantId = laneId.split(":").pop() ?? laneId;
     const hit = allocations.find((a) => a.laneId === laneId || a.laneId === variantId);
     return hit ? hit.weightPct : 0;
+  }
+
+  /** Operator lane selection for non-paper lanes too (e.g. cross-sectional executor).
+   *  Weighted allocations take precedence; otherwise the plain allow-list applies. */
+  laneSelectionAllowsLane(laneId: string): boolean {
+    const st = this.store.getState();
+    if (st.laneAllocations && st.laneAllocations.length > 0) {
+      return this.laneSelectionWeightPctForLane(laneId) > 0;
+    }
+    const allowed = st.allowedLaneIds;
+    if (allowed === null || allowed === undefined) return true;
+    const variantId = laneId.split(":").pop() ?? laneId;
+    return allowed.includes(laneId) || allowed.includes(variantId);
+  }
+
+  private laneAllocationWeightPct(paper: PaperOrder): number {
+    return this.laneSelectionWeightPctForLane(paper.selectedLaneId ?? "");
   }
 
   /** Operator lane selection: weighted allocations (when set) take precedence; else the
    *  plain allow-list (null = all lanes, [] = pause all new mirrors). Matches
    *  selectedLaneId as full id or variant suffix. */
   private laneAllowedForMirror(paper: PaperOrder): boolean {
-    const st = this.store.getState();
-    if (st.laneAllocations && st.laneAllocations.length > 0) {
-      return this.laneAllocationWeightPct(paper) > 0;
-    }
-    const allowed = st.allowedLaneIds;
-    if (allowed === null || allowed === undefined) return true;
-    const laneId = paper.selectedLaneId ?? "";
-    const variantId = laneId.split(":").pop() ?? laneId;
-    return allowed.includes(laneId) || allowed.includes(variantId);
+    return this.laneSelectionAllowsLane(paper.selectedLaneId ?? "");
   }
 
   /** True when an operator selection (weighted allocation OR allow-list) is active AND

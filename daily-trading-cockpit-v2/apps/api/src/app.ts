@@ -18,6 +18,7 @@ import { registerScanRoute } from "./routes/scan.js";
 import { registerShadowRoutes } from "./routes/shadow.js";
 import { BinanceFuturesPrivateClient } from "./lib/binance-futures-private.js";
 import {
+  CROSS_SECTIONAL_MARKET_NEUTRAL_LANE_ID,
   CrossSectionalExecutor,
   CrossSectionalExecutorStore,
   isCrossSectionalExecEnabled,
@@ -242,7 +243,9 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         signalStore: getCrossSectionalStore(),
         store: new CrossSectionalExecutorStore(),
         isAllowed: () =>
-          liveConfig.env === "testnet" ? true : engineForGate !== null && engineForGate.isArmed(),
+          (liveConfig.env === "testnet" ? true : engineForGate !== null && engineForGate.isArmed()) &&
+          (engineForGate?.laneSelectionAllowsLane(CROSS_SECTIONAL_MARKET_NEUTRAL_LANE_ID) ?? true),
+        laneWeightPct: () => engineForGate?.laneSelectionWeightPctForLane(CROSS_SECTIONAL_MARKET_NEUTRAL_LANE_ID) ?? 100,
       });
       if (!isTest) {
         const execTick = () => void crossSectionalExecutor?.tick();

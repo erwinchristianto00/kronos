@@ -54,6 +54,12 @@ export interface FreshVariantMatrixFeedResult {
 const DEFAULT_MAX_PER_CYCLE = 12;
 const FIRST_VARIANT_ID = VARIANT_MATRIX_DEFINITIONS[0]!.id;
 
+/** Intake-throttle watermark (see runFreshVariantMatrixFeed). Test hook resets it. */
+let lastBatchMs = 0;
+export function _resetFreshFeedThrottleForTests(): void {
+  lastBatchMs = 0;
+}
+
 /**
  * Market posture + favored direction at signal time. Self-contained (inlines the lane-selector
  * regime estimator's logic) so the `/` diagnostic instance — whose lane-selector predates
@@ -149,6 +155,21 @@ export function runFreshVariantMatrixFeed(
     reasons: [],
   };
   const maxPerCycle = inputs.maxPerCycle ?? DEFAULT_MAX_PER_CYCLE;
+
+  // INTAKE THROTTLE: at most one batch per interval (default 60 min). The feed used to
+  // mint a batch EVERY 7-min scan cycle (~55K obs/day across 23 variants) — the store
+  // hit 145MB in two days and resolution starved to zero (every save serializes the
+  // whole array). One batch/hour keeps full coverage (obs live for days) at ~1/8th the
+  // intake. Process-local watermark: a restart at worst allows one extra batch.
+  const nowMs = new Date(inputs.now).getTime();
+  const intervalMin = Number.parseFloat(process.env.FRESH_VM_FEED_INTERVAL_MIN ?? "");
+  const intervalMs = (Number.isFinite(intervalMin) && intervalMin > 0 ? intervalMin : 60) * 60_000;
+  if (nowMs - lastBatchMs < intervalMs) {
+    result.skipped = inputs.candidates.length;
+    result.reasons.push(`throttled:next_batch_in_${Math.ceil((lastBatchMs + intervalMs - nowMs) / 60000)}min`);
+    return result;
+  }
+
   // Minute-bucketed entry time: keeps entryLag ≤ ~1min (fresh) AND gives natural per-minute dedupe
   // via the store's sourceObservationKey (symbol|direction|openedAt).
   const openedAt = `${inputs.now.slice(0, 16)}:00.000Z`;
@@ -203,6 +224,9 @@ export function runFreshVariantMatrixFeed(
     result.signalsCreated += 1;
     result.observationsCreated += observations.length;
   }
+  // Only a productive batch advances the throttle — a dry cycle (all dupes/bad
+  // geometry) may retry next cycle instead of burning the whole interval.
+  if (result.signalsCreated > 0) lastBatchMs = nowMs;
   return result;
 }
 

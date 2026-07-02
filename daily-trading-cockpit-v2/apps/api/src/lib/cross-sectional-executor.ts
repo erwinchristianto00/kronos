@@ -9,7 +9,7 @@
  *  - The basket is a HEDGE: k longs + k shorts at equal notional. Either the
  *    WHOLE basket opens or nothing — if any leg fails, every already-opened leg
  *    is flattened immediately (a partial basket is a naked directional bet).
- *  - One basket open at a time (v1), small fixed notional per leg, 1x leverage.
+ *  - One basket open at a time (v1), small fixed notional per leg, 3x leverage by default.
  *  - Exits at the signal's own horizon (default 24 bars = 24h) with MARKET
  *    reduce-only closes; P&L computed from actual fills minus a taker-fee
  *    estimate per side. Honest costs, no mark-to-model.
@@ -20,7 +20,15 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 
 import type { BinanceFuturesPrivateClient } from "./binance-futures-private.js";
-import type { CrossSectionalObservation, CrossSectionalStore } from "./cross-sectional-edge.js";
+import {
+  CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST,
+  CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST,
+  CROSS_SECTIONAL_FILTERED_SHORT_BLOCKLIST,
+  type CrossSectionalObservation,
+  type CrossSectionalStore,
+} from "./cross-sectional-edge.js";
+
+export const CROSS_SECTIONAL_MARKET_NEUTRAL_LANE_ID = "CROSS_SECTIONAL_MARKET_NEUTRAL";
 
 export type CrossSectionalExecClient = Pick<
   BinanceFuturesPrivateClient,
@@ -34,6 +42,10 @@ export function isCrossSectionalExecEnabled(env: NodeJS.ProcessEnv = process.env
 const LEG_USD = () => {
   const n = Number.parseFloat(process.env.CROSS_SECTIONAL_EXEC_LEG_USD ?? "");
   return Number.isFinite(n) && n > 0 ? n : 25;
+};
+const EXEC_LEVERAGE = () => {
+  const n = Number.parseInt(process.env.CROSS_SECTIONAL_EXEC_LEVERAGE ?? "", 10);
+  return Number.isFinite(n) && n >= 1 ? Math.floor(n) : 3;
 };
 /** Which measured variant to execute. Default FILTERED (operator: follow the /research
  *  filtered symbols, whose allow/blocklists now auto-update from measured leg returns). */
@@ -73,6 +85,19 @@ interface ExecutorState {
   baskets: ExecutorBasket[];
   /** openedAtMs watermark — signals at/below this are never re-executed. */
   lastSeenSignalMs: number;
+}
+
+function isFilteredSymbolAllowed(signal: CrossSectionalObservation): boolean {
+  if ((signal.variant ?? "RAW") !== "FILTERED") return true;
+  for (const leg of signal.longLeg) {
+    if (!CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST.has(leg.symbol.toUpperCase())) return false;
+  }
+  for (const leg of signal.shortLeg) {
+    const symbol = leg.symbol.toUpperCase();
+    if (!CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST.has(symbol)) return false;
+    if (CROSS_SECTIONAL_FILTERED_SHORT_BLOCKLIST.has(symbol)) return false;
+  }
+  return true;
 }
 
 export class CrossSectionalExecutorStore {
@@ -122,6 +147,8 @@ export interface CrossSectionalExecutorOptions {
   store: CrossSectionalExecutorStore;
   /** Master permission gate. Testnet: () => true. Mainnet: () => engine.isArmed(). */
   isAllowed: () => boolean;
+  /** Operator lane allocation weight. 100 = normal leg size; 0 = blocked. */
+  laneWeightPct?: () => number;
   nowIso?: () => string;
 }
 
@@ -130,6 +157,7 @@ export class CrossSectionalExecutor {
   private readonly signalStore: CrossSectionalStore;
   private readonly store: CrossSectionalExecutorStore;
   private readonly isAllowed: () => boolean;
+  private readonly laneWeightPct: () => number;
   private readonly nowIso: () => string;
   private ticking = false;
   private lastError: string | null = null;
@@ -139,13 +167,28 @@ export class CrossSectionalExecutor {
     this.signalStore = opts.signalStore;
     this.store = opts.store;
     this.isAllowed = opts.isAllowed;
+    this.laneWeightPct = opts.laneWeightPct ?? (() => 100);
     this.nowIso = opts.nowIso ?? (() => new Date().toISOString());
+  }
+
+  private allocationWeightPct(): number {
+    const pct = Number(this.laneWeightPct());
+    if (!Number.isFinite(pct)) return 100;
+    return Math.max(0, Math.min(100, pct));
+  }
+
+  private effectiveLegUsd(): number {
+    return LEG_USD() * (this.allocationWeightPct() / 100);
   }
 
   getStatus(): {
     enabled: boolean;
     allowed: boolean;
+    laneId: string;
     legUsd: number;
+    baseLegUsd: number;
+    allocationWeightPct: number;
+    leverage: number;
     variant: string;
     openBasket: ExecutorBasket | null;
     closedCount: number;
@@ -158,7 +201,11 @@ export class CrossSectionalExecutor {
     return {
       enabled: isCrossSectionalExecEnabled(),
       allowed: this.isAllowed(),
-      legUsd: LEG_USD(),
+      laneId: CROSS_SECTIONAL_MARKET_NEUTRAL_LANE_ID,
+      legUsd: this.effectiveLegUsd(),
+      baseLegUsd: LEG_USD(),
+      allocationWeightPct: this.allocationWeightPct(),
+      leverage: EXEC_LEVERAGE(),
       variant: EXEC_VARIANT(),
       openBasket: st.baskets.find((b) => b.status === "OPEN") ?? null,
       closedCount: closed.length,
@@ -174,12 +221,29 @@ export class CrossSectionalExecutor {
     this.ticking = true;
     try {
       await this.closeDueBaskets();
+      await this.ensureOpenBasketLeverage();
       if (this.isAllowed()) await this.maybeOpenBasket();
       this.lastError = null;
     } catch (error) {
       this.lastError = (error as Error).message ?? "tick failed";
     } finally {
       this.ticking = false;
+    }
+  }
+
+  private async ensureOpenBasketLeverage(): Promise<void> {
+    const leverage = EXEC_LEVERAGE();
+    const symbols = new Set<string>();
+    for (const basket of this.store.getState().baskets) {
+      if (basket.status !== "OPEN") continue;
+      for (const leg of basket.legs) symbols.add(leg.symbol);
+    }
+    for (const symbol of symbols) {
+      try {
+        await this.client.setLeverage(symbol, leverage);
+      } catch {
+        // best-effort (already set / exchange refused while a close is racing)
+      }
     }
   }
 
@@ -249,8 +313,11 @@ export class CrossSectionalExecutor {
     st.lastSeenSignalMs = signal.openedAtMs;
     this.store.save();
 
+    if (!isFilteredSymbolAllowed(signal)) return;
+
     const filters = await this.client.getExchangeFilters();
-    const legUsd = LEG_USD();
+    const legUsd = this.effectiveLegUsd();
+    if (!(legUsd > 0)) return;
     const plannedLegs: Array<{ symbol: string; side: "LONG" | "SHORT"; qty: number; refPrice: number }> = [];
     for (const [side, legs] of [["LONG", signal.longLeg], ["SHORT", signal.shortLeg]] as const) {
       for (const leg of legs) {
@@ -283,7 +350,7 @@ export class CrossSectionalExecutor {
     try {
       for (const planned of plannedLegs) {
         try {
-          await this.client.setLeverage(planned.symbol, 1); // market-neutral: no leverage
+          await this.client.setLeverage(planned.symbol, EXEC_LEVERAGE());
         } catch {
           // best-effort (already set / position exists)
         }

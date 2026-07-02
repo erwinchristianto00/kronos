@@ -2187,6 +2187,23 @@ describe("weighted lane allocation (POST /api/live/lane-allocations)", () => {
     await engine.tick();
     expect(store.getState().intents.length).toBe(0);
   });
+
+  it("exposes lane-selection helpers for non-paper lanes such as cross-sectional market-neutral", () => {
+    const { engine } = makeEngine();
+    expect(engine.laneSelectionAllowsLane("CROSS_SECTIONAL_MARKET_NEUTRAL")).toBe(true);
+    expect(engine.laneSelectionWeightPctForLane("CROSS_SECTIONAL_MARKET_NEUTRAL")).toBe(100);
+
+    engine.setLaneAllocations([{ laneId: "CG_WIDE_FAST_SHORT", weightPct: 70 }]);
+    expect(engine.laneSelectionAllowsLane("CROSS_SECTIONAL_MARKET_NEUTRAL")).toBe(false);
+    expect(engine.laneSelectionWeightPctForLane("CROSS_SECTIONAL_MARKET_NEUTRAL")).toBe(0);
+
+    engine.setLaneAllocations([
+      { laneId: "CG_WIDE_FAST_SHORT", weightPct: 70 },
+      { laneId: "CROSS_SECTIONAL_MARKET_NEUTRAL", weightPct: 30 },
+    ]);
+    expect(engine.laneSelectionAllowsLane("CROSS_SECTIONAL_MARKET_NEUTRAL")).toBe(true);
+    expect(engine.laneSelectionWeightPctForLane("CROSS_SECTIONAL_MARKET_NEUTRAL")).toBe(30);
+  });
 });
 
 describe("lane selection auto-reset on losing operator close", () => {

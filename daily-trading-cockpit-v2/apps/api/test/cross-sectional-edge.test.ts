@@ -297,7 +297,7 @@ describe("cross-sectional-edge — market-neutral measurement lane", () => {
 
 const BAR_FUDGE = 60 * 60_000 + 1000; // one 1h bar + a little, to push past the horizon
 
-describe("deriveAdaptiveSymbolFilters — auto-updating allow/blocklists from measured legs", () => {
+describe("deriveAdaptiveSymbolFilters — demotes toxic symbols inside hard operator lists", () => {
 
   function closedObs(id: string, longLegs: Array<[string, number, number]>, shortLegs: Array<[string, number, number]>) {
     return {
@@ -316,11 +316,11 @@ describe("deriveAdaptiveSymbolFilters — auto-updating allow/blocklists from me
     };
   }
 
-  it("promotes measured winners into allowlists and demotes measured losers (env = prior)", () => {
+  it("keeps allowlists inside operator filters while demoting measured losers", () => {
     const store = freshStore();
-    // SOL long leg: 3 wins (+2% each) → promoted long (already in env allow — stays).
+    // SOL long leg: 3 wins (+2% each) → remains allowed.
     // FETUSDT long: 3 losses (-2%) → demoted long (blocked) even though not in env lists.
-    // NEARUSDT short: 3 wins (price fell) → promoted short, UN-blocked from env shortBlocklist.
+    // NEARUSDT short: 3 wins (price fell) → provenance records it as positive, but hard block stays.
     // DOGEUSDT short: 3 losses (price rose) → demoted from env short allowlist + blocklisted.
     for (let i = 0; i < 3; i++) {
       store.add(closedObs(`a${i}`, [["SOLUSDT", 100, 102], ["FETUSDT", 1, 0.98]], [["NEARUSDT", 2, 1.9], ["DOGEUSDT", 0.07, 0.075]]) as never);
@@ -329,8 +329,8 @@ describe("deriveAdaptiveSymbolFilters — auto-updating allow/blocklists from me
     expect(f.longAllowlist).toContain("SOLUSDT");
     expect(f.longAllowlist).not.toContain("FETUSDT");
     expect(f.longBlocklist).toContain("FETUSDT");
-    expect(f.shortAllowlist).toContain("NEARUSDT"); // measured-positive un-blocks the env-era block
-    expect(f.shortBlocklist).not.toContain("NEARUSDT");
+    expect(f.shortAllowlist).not.toContain("NEARUSDT"); // hard operator block stays blocked
+    expect(f.shortBlocklist).toContain("NEARUSDT");
     expect(f.shortAllowlist).not.toContain("DOGEUSDT");
     expect(f.shortBlocklist).toContain("DOGEUSDT");
     expect(f.provenance.closedBaskets).toBe(3);

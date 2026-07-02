@@ -8,7 +8,66 @@
 import type { FastifyInstance } from "fastify";
 
 import type { LiveExecutionEngine } from "../lib/live-execution-engine.js";
-import type { CrossSectionalExecutor } from "../lib/cross-sectional-executor.js";
+import {
+  CROSS_SECTIONAL_MARKET_NEUTRAL_LANE_ID,
+  type CrossSectionalExecutor,
+} from "../lib/cross-sectional-executor.js";
+
+type LiveAccountSnapshot = Awaited<ReturnType<LiveExecutionEngine["getAccountSnapshot"]>>;
+
+function annotateCrossSectionalAccount(
+  snapshot: LiveAccountSnapshot,
+  executor: CrossSectionalExecutor | null,
+): LiveAccountSnapshot {
+  const openBasket = executor?.getStatus().openBasket ?? null;
+  if (!openBasket) return snapshot;
+
+  const laneRow = {
+    laneId: CROSS_SECTIONAL_MARKET_NEUTRAL_LANE_ID,
+    sourceOrderCount: 0,
+    symbols: new Set<string>(),
+    notionalUsd: 0,
+    unrealizedPnl: 0,
+  };
+
+  for (const leg of openBasket.legs) {
+    if (leg.exitOrderId !== null) continue;
+    const row = snapshot.positions.find((position) => position.symbol === leg.symbol && position.direction === leg.side);
+    if (!row) continue;
+
+    const positionQty = Number(row.quantity);
+    const share = Number.isFinite(positionQty) && positionQty > 0 ? Math.min(1, leg.qty / positionQty) : 1;
+    row.sourceOrderCount += 1;
+    if (!row.laneIds.includes(CROSS_SECTIONAL_MARKET_NEUTRAL_LANE_ID)) {
+      row.laneIds.push(CROSS_SECTIONAL_MARKET_NEUTRAL_LANE_ID);
+    }
+    laneRow.sourceOrderCount += 1;
+    laneRow.symbols.add(row.symbol);
+    laneRow.notionalUsd += Math.abs(leg.qty * leg.entryPrice);
+    laneRow.unrealizedPnl += row.unrealizedPnl * share;
+  }
+
+  if (laneRow.sourceOrderCount > 0) {
+    const existing = snapshot.lanes.find((lane) => lane.laneId === CROSS_SECTIONAL_MARKET_NEUTRAL_LANE_ID);
+    if (existing) {
+      existing.sourceOrderCount += laneRow.sourceOrderCount;
+      existing.symbols = Array.from(new Set([...existing.symbols, ...laneRow.symbols])).sort();
+      existing.notionalUsd += laneRow.notionalUsd;
+      existing.unrealizedPnl += laneRow.unrealizedPnl;
+    } else {
+      snapshot.lanes.push({
+        laneId: CROSS_SECTIONAL_MARKET_NEUTRAL_LANE_ID,
+        sourceOrderCount: laneRow.sourceOrderCount,
+        symbols: Array.from(laneRow.symbols).sort(),
+        notionalUsd: laneRow.notionalUsd,
+        unrealizedPnl: laneRow.unrealizedPnl,
+      });
+      snapshot.lanes.sort((left, right) => left.laneId.localeCompare(right.laneId));
+    }
+  }
+
+  return snapshot;
+}
 
 export async function registerLiveRoutes(
   app: FastifyInstance,
@@ -261,7 +320,8 @@ export async function registerLiveRoutes(
       return { ok: false, reason: "live execution disabled" };
     }
     try {
-      return { ok: true, ...(await engine.getAccountSnapshot()) };
+      const snapshot = await engine.getAccountSnapshot();
+      return { ok: true, ...annotateCrossSectionalAccount(snapshot, opts.crossSectionalExecutor?.() ?? null) };
     } catch (err) {
       reply.code(502);
       return { ok: false, reason: err instanceof Error ? err.message : "account snapshot failed" };

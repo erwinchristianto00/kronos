@@ -40,7 +40,7 @@ function signalObs(openedAtMs: number): CrossSectionalObservation {
     variant: "FILTERED",
     k: 1,
     longLeg: [{ symbol: "SOLUSDT", entryPrice: 100, exitPrice: null }],
-    shortLeg: [{ symbol: "ADAUSDT", entryPrice: 0.5, exitPrice: null }],
+    shortLeg: [{ symbol: "DOGEUSDT", entryPrice: 0.1, exitPrice: null }],
     status: "OPEN",
     grossReturn: null,
     costReturn: null,
@@ -53,6 +53,7 @@ function signalObs(openedAtMs: number): CrossSectionalObservation {
 
 class FakeExecClient implements CrossSectionalExecClient {
   placed: Array<{ symbol: string; side: string; quantity: number; reduceOnly?: boolean }> = [];
+  leverageCalls: Array<{ symbol: string; leverage: number }> = [];
   failOnSymbol: string | null = null;
   fillPriceBySymbol = new Map<string, number>();
   private orderSeq = 100;
@@ -63,9 +64,13 @@ class FakeExecClient implements CrossSectionalExecClient {
     return new Map([
       ["SOLUSDT", f(0.01, 0.01)],
       ["ADAUSDT", f(1, 1)],
+      ["DOGEUSDT", f(1, 1)],
+      ["RNDRUSDT", f(0.1, 0.1)],
     ]);
   }
-  async setLeverage(): Promise<void> {}
+  async setLeverage(symbol: string, leverage: number): Promise<void> {
+    this.leverageCalls.push({ symbol, leverage });
+  }
   async getPositions(): Promise<never[]> {
     return [];
   }
@@ -76,7 +81,7 @@ class FakeExecClient implements CrossSectionalExecClient {
   }
 }
 
-function makeExecutor(opts: { client?: FakeExecClient; allowed?: boolean; signalMs?: number } = {}) {
+function makeExecutor(opts: { client?: FakeExecClient; allowed?: boolean; laneWeightPct?: number; signalMs?: number } = {}) {
   const client = opts.client ?? new FakeExecClient();
   const signalStore = new CrossSectionalStore(tmpDir());
   const store = new CrossSectionalExecutorStore(tmpDir());
@@ -88,6 +93,7 @@ function makeExecutor(opts: { client?: FakeExecClient; allowed?: boolean; signal
     signalStore,
     store,
     isAllowed: () => opts.allowed ?? true,
+    laneWeightPct: () => opts.laneWeightPct ?? 100,
     nowIso: () => NOW,
   });
   return { executor, client, signalStore, store };
@@ -101,16 +107,26 @@ describe("cross-sectional executor (basket execution, testnet-first)", () => {
     expect(basket.status).toBe("OPEN");
     expect(basket.legs.length).toBe(2);
     const sol = basket.legs.find((l) => l.symbol === "SOLUSDT")!;
-    const ada = basket.legs.find((l) => l.symbol === "ADAUSDT")!;
+    const doge = basket.legs.find((l) => l.symbol === "DOGEUSDT")!;
     expect(sol.side).toBe("LONG");
-    expect(ada.side).toBe("SHORT");
-    // default 25 USD/leg: SOL 25/100=0.25 (step 0.01), ADA 25/0.5=50 (step 1)
+    expect(doge.side).toBe("SHORT");
+    // default 25 USD/leg: SOL 25/100=0.25 (step 0.01), DOGE 25/0.1=250 (step 1)
     expect(sol.qty).toBeCloseTo(0.25, 9);
-    expect(ada.qty).toBeCloseTo(50, 9);
+    expect(doge.qty).toBeCloseTo(250, 9);
     expect(client.placed.map((p) => p.side)).toEqual(["BUY", "SELL"]);
+    expect(client.leverageCalls).toEqual([
+      { symbol: "SOLUSDT", leverage: 3 },
+      { symbol: "DOGEUSDT", leverage: 3 },
+    ]);
     // Watermark advanced — a second tick does NOT reopen the same signal.
     await executor.tick();
     expect(store.getState().baskets.length).toBe(1);
+    expect(client.leverageCalls).toEqual([
+      { symbol: "SOLUSDT", leverage: 3 },
+      { symbol: "DOGEUSDT", leverage: 3 },
+      { symbol: "SOLUSDT", leverage: 3 },
+      { symbol: "DOGEUSDT", leverage: 3 },
+    ]);
   });
 
   it("skips stale signals (older than the freshness window)", async () => {
@@ -125,9 +141,32 @@ describe("cross-sectional executor (basket execution, testnet-first)", () => {
     expect(store.getState().baskets.length).toBe(0);
   });
 
+  it("scales leg size by the operator lane allocation weight", async () => {
+    const { executor, store } = makeExecutor({ laneWeightPct: 40, signalMs: NOW_MS - 5 * 60_000 });
+    expect(executor.getStatus()).toMatchObject({
+      legUsd: 10,
+      baseLegUsd: 25,
+      allocationWeightPct: 40,
+    });
+    await executor.tick();
+    const basket = store.getState().baskets[0]!;
+    expect(basket.legs.find((l) => l.symbol === "SOLUSDT")?.qty).toBeCloseTo(0.1, 9);
+    expect(basket.legs.find((l) => l.symbol === "DOGEUSDT")?.qty).toBeCloseTo(100, 9);
+  });
+
+  it("rejects FILTERED signals whose symbols are outside the hard operator allow/block lists", async () => {
+    const { executor, signalStore, store, client } = makeExecutor();
+    const bad = signalObs(NOW_MS - 5 * 60_000);
+    bad.longLeg = [{ symbol: "RNDRUSDT", entryPrice: 10, exitPrice: null }]; // not in filtered long allow
+    signalStore.add(bad);
+    await executor.tick();
+    expect(store.getState().baskets.length).toBe(0);
+    expect(client.placed.length).toBe(0);
+  });
+
   it("HEDGE INTEGRITY: a failed leg aborts the basket and flattens already-opened legs", async () => {
     const client = new FakeExecClient();
-    client.failOnSymbol = "ADAUSDT"; // long opens, short fails
+    client.failOnSymbol = "DOGEUSDT"; // long opens, short fails
     const { executor, store } = makeExecutor({ client, signalMs: NOW_MS - 5 * 60_000 });
     await executor.tick();
     const basket = store.getState().baskets[0]!;
@@ -142,18 +181,18 @@ describe("cross-sectional executor (basket execution, testnet-first)", () => {
   it("closes the basket at horizon with reduce-only orders and honest net PnL", async () => {
     const client = new FakeExecClient();
     client.fillPriceBySymbol.set("SOLUSDT", 100); // entry fills
-    client.fillPriceBySymbol.set("ADAUSDT", 0.5);
+    client.fillPriceBySymbol.set("DOGEUSDT", 0.1);
     const { executor, store } = makeExecutor({ client, signalMs: NOW_MS - 5 * 60_000 });
     await executor.tick();
-    // Move past the horizon and set exit fills: SOL +2% (long wins), ADA -1% (short wins).
+    // Move past the horizon and set exit fills: SOL +2% (long wins), DOGE -1% (short wins).
     client.fillPriceBySymbol.set("SOLUSDT", 102);
-    client.fillPriceBySymbol.set("ADAUSDT", 0.495);
+    client.fillPriceBySymbol.set("DOGEUSDT", 0.099);
     const basket = store.getState().baskets[0]!;
     basket.closesAtMs = NOW_MS - 1; // due now
     await executor.tick();
     expect(basket.status).toBe("CLOSED");
     expect(basket.closeReason).toBe("HORIZON");
-    // gross = 0.25*(102-100) + 50*(0.5-0.495) = 0.5 + 0.25 = 0.75
+    // gross = 0.25*(102-100) + 250*(0.1-0.099) = 0.5 + 0.25 = 0.75
     expect(basket.grossPnlUsd).toBeCloseTo(0.75, 6);
     expect(basket.feeEstimateUsd!).toBeGreaterThan(0);
     expect(basket.netPnlUsd!).toBeLessThan(basket.grossPnlUsd!);
