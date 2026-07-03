@@ -28,7 +28,9 @@ export const UNIVERSE = [
   "FETUSDT",
   "RNDRUSDT",
 ] as const;
-const SYMBOL_FETCH_CONCURRENCY = 5;
+// Kronos inference is serialized globally (see kronos.ts). Keep scanner concurrency
+// env-tunable so production can avoid queue-timeout storms when Kronos is enabled.
+const SYMBOL_FETCH_CONCURRENCY = positiveEnvInt(process.env.SCAN_SYMBOL_FETCH_CONCURRENCY, 5);
 const DEFAULT_CANDLE_FETCH_TIMEOUT_MS = 10_000;
 // Per-provider external-signal fetch timeout. 2.5s was too tight for the occasional
 // cold-TLS / transient spike on feargreed (normally ~1s from the VPS), which tripped
