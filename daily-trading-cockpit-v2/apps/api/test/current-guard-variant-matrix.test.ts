@@ -737,6 +737,43 @@ describe("current-guard-variant-matrix", () => {
     expect(baseline?.grossR).toBeCloseTo(0.5, 6);
   });
 
+  it("[RESLV-MAXHOLD-PRIORITY] spends tiny budgets on max-hold observations before young backlog", async () => {
+    const store = new CurrentGuardVariantMatrixStore(tmpDir());
+    const oldIso = new Date(Date.now() - 73 * 60 * 60 * 1000).toISOString();
+    const youngIso = new Date(Date.now() - 1 * 60 * 60 * 1000).toISOString();
+    mirrorVariantMatrixSignals(
+      [makeSignal({ sourceSignalId: "old-priority", openedAt: oldIso })],
+      store,
+      oldIso,
+    );
+    mirrorVariantMatrixSignals(
+      [makeSignal({ sourceSignalId: "young-priority", symbol: "YOUNGUSDT", openedAt: youngIso })],
+      store,
+      youngIso,
+    );
+
+    const mock = {
+      getKlines: async (
+        _s: string,
+        interval: string,
+        o: { startTime: number; endTime: number; limit: number },
+      ): Promise<KlineTuple[]> => {
+        if (interval === "1m") return [];
+        const open = o.startTime + 300000;
+        return [
+          candle(o.startTime, 100.2, 99.8, 100),
+          candle(open, 101, 99, 100.5),
+          candle(open + 300000, 101.5, 99.5, 101),
+        ];
+      },
+    };
+
+    await resolveVariantMatrixObservations(store, mock, { maxObservations: 3 });
+    const closed = store.all.filter((o) => o.status === "CLOSED_WIN" || o.status === "CLOSED_LOSS");
+    expect(closed.length).toBe(3);
+    expect(closed.every((o) => o.openedAt === oldIso)).toBe(true);
+  });
+
   // Bonus: selection filter (uses the documented ShadowPosition shape).
   it("selectVariantMatrixSignals keeps only stop175 + V2 closed-filled positions", () => {
     const ok = {

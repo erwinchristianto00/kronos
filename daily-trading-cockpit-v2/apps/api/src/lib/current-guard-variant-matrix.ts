@@ -1514,6 +1514,14 @@ export async function walkVariantPath(
   return empty;
 }
 
+function variantMaxHoldMs(variantId: VariantMatrixVariantId): number {
+  const variantDef = VARIANT_MATRIX_DEFINITIONS.find((def) => def.id === variantId);
+  return Math.min(
+    (variantDef?.maxHoldHours ?? DEFAULT_MAX_HOLD_MS / (60 * 60 * 1000)) * 60 * 60 * 1000,
+    EXPIRY_MS - CANDLE_MS,
+  );
+}
+
 export async function resolveVariantMatrixObservations(
   store: CurrentGuardVariantMatrixStore,
   binanceClient: VariantMatrixBinanceClient,
@@ -1599,10 +1607,18 @@ export async function resolveVariantMatrixObservations(
         (a, b) =>
           (toMs(a.openedAt) ?? toMs(a.createdAt) ?? 0) - (toMs(b.openedAt) ?? toMs(b.createdAt) ?? 0),
       );
+    const maxHoldReady = youngSorted.filter((o) => {
+      const openedAtMs = toMs(o.openedAt) ?? toMs(o.createdAt) ?? nowMs;
+      return nowMs - openedAtMs >= variantMaxHoldMs(o.variantId);
+    });
+    const stillWalking = youngSorted.filter((o) => {
+      const openedAtMs = toMs(o.openedAt) ?? toMs(o.createdAt) ?? nowMs;
+      return nowMs - openedAtMs < variantMaxHoldMs(o.variantId);
+    });
     const cursorRaw = store.getResolverMeta()?.walkCursor ?? 0;
-    const cursor = youngSorted.length > 0 ? ((cursorRaw % youngSorted.length) + youngSorted.length) % youngSorted.length : 0;
+    const cursor = stillWalking.length > 0 ? ((cursorRaw % stillWalking.length) + stillWalking.length) % stillWalking.length : 0;
     walkCursorStart = cursor;
-    const young = [...youngSorted.slice(cursor), ...youngSorted.slice(0, cursor)];
+    const young = [...maxHoldReady, ...stillWalking.slice(cursor), ...stillWalking.slice(0, cursor)];
     for (const obs of young) {
       if (processed >= maxObservations) break;
       if (Date.now() - startedMs >= maxRuntimeMs) break;
@@ -1618,10 +1634,7 @@ export async function resolveVariantMatrixObservations(
       // ── Candle fetch + path walk ─────
       try {
         const variantDef = VARIANT_MATRIX_DEFINITIONS.find((def) => def.id === obs.variantId);
-        const maxHoldMs = Math.min(
-          (variantDef?.maxHoldHours ?? DEFAULT_MAX_HOLD_MS / (60 * 60 * 1000)) * 60 * 60 * 1000,
-          EXPIRY_MS - CANDLE_MS,
-        );
+        const maxHoldMs = variantMaxHoldMs(obs.variantId);
         const maxHoldReached = nowMs - openedAtMs >= maxHoldMs;
         const closedAtMs = toMs(obs.resolvedAt) ?? null;
         const endBound = maxHoldReached
