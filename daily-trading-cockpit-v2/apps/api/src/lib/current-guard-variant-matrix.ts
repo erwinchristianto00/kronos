@@ -2424,7 +2424,7 @@ export function buildCurrentGuardVariantMatrixReport(
   const openObs = all.filter((o) => o.status === "OPEN");
   const staleOpenObs = openObs.filter((o) => {
     const ageMs = nowMs - (toMs(o.openedAt) ?? toMs(o.createdAt) ?? nowMs);
-    return ageMs > STALE_OPEN_WARN_MS;
+    return ageMs > variantMaxHoldMs(o.variantId);
   });
   let oldestOpenAgeHours: number | null = null;
   if (openObs.length > 0) {
@@ -2442,7 +2442,7 @@ export function buildCurrentGuardVariantMatrixReport(
     oldestOpenAgeHours,
     nextAction:
       staleOpenCount > 0
-        ? `${staleOpenCount} OPEN observation(s) >72h; call /api/shadow/dashboard-audit-summary or operator-brief?resolve=1 to expire them.`
+        ? `${staleOpenCount} OPEN observation(s) past lane max-hold; call /api/shadow/dashboard-audit-summary or operator-brief?resolve=1 to force MTM/expire them.`
         : openObs.length > 0
         ? "Open observations pending — resolver runs fire-and-forget on each dashboard call."
         : null,

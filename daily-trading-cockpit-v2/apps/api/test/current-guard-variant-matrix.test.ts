@@ -931,23 +931,34 @@ describe("current-guard-variant-matrix", () => {
     expect(result.resolved).toBe(0);
   });
 
-  // [14] Resolver diagnostics surface staleOpenCount and oldestOpenAgeHours for aged observations.
-  it("[14] resolver diagnostics: staleOpenCount > 0 and oldestOpenAgeHours > 72 for 4-day-old obs", () => {
+  // [14] Resolver diagnostics surface max-hold-overdue observations, not merely >72h runner holds.
+  it("[14] resolver diagnostics: staleOpenCount follows each lane max-hold", () => {
     const dir = tmpDir();
     const store = new CurrentGuardVariantMatrixStore(dir);
-    // Signal opened 4 days ago: older than the 72-h stale threshold, within the 7-day expiry.
-    const staleMs = Date.now() - 4 * 24 * 60 * 60 * 1000;
-    const signal = makeSignal({ openedAt: new Date(staleMs).toISOString() });
-    mirrorVariantMatrixSignals([signal], store, new Date().toISOString());
+
+    const runnerWithinHold = makeSignal({
+      sourceSignalId: "runner-within-hold",
+      openedAt: new Date(Date.now() - 100 * 60 * 60 * 1000).toISOString(),
+    });
+    const runnerPastHold = makeSignal({
+      sourceSignalId: "runner-past-hold",
+      openedAt: new Date(Date.now() - 145 * 60 * 60 * 1000).toISOString(),
+    });
+    store.addMany([
+      buildVariantMatrixObservationsForSignal(runnerWithinHold).find((obs) => obs.variantId === "CG_WIDE_LONG_RUNNER")!,
+      buildVariantMatrixObservationsForSignal(runnerPastHold).find((obs) => obs.variantId === "CG_WIDE_LONG_RUNNER")!,
+    ]);
 
     const report = buildCurrentGuardVariantMatrixReport(store, { capturedAt: new Date().toISOString() });
+    const runnerOpen = store.all.filter((obs) => obs.variantId === "CG_WIDE_LONG_RUNNER" && obs.status === "OPEN");
 
-    expect(report.resolverDiagnostics.staleOpenCount).toBeGreaterThan(0);
+    expect(runnerOpen.length).toBe(2);
+    expect(report.resolverDiagnostics.staleOpenCount).toBe(1);
     expect(report.resolverDiagnostics.oldestOpenAgeHours).not.toBeNull();
-    expect(report.resolverDiagnostics.oldestOpenAgeHours!).toBeGreaterThan(72);
+    expect(report.resolverDiagnostics.oldestOpenAgeHours!).toBeGreaterThan(100);
     // A nextAction hint must be provided when stale observations exist.
     expect(report.resolverDiagnostics.nextAction).not.toBeNull();
-    expect(report.resolverDiagnostics.nextAction).toContain("resolve=1");
+    expect(report.resolverDiagnostics.nextAction).toContain("past lane max-hold");
   });
 
   // [STALE-GATE] mirror SKIPS born-stale signals (openedAt past EXPIRY) — they'd only be
