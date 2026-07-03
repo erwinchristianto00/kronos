@@ -292,6 +292,7 @@
 }
 
 .neural-milestone-summary,
+.neural-decision-card,
 .neural-milestone-grid > div,
 .neural-milestone-table-wrap {
   border: 1px solid #243740;
@@ -324,6 +325,165 @@
   color: #9ab0b9;
   font-size: 12px;
   line-height: 1.5;
+}
+
+.neural-decision-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.neural-decision-card {
+  min-width: 0;
+  overflow: hidden;
+}
+
+.neural-decision-card.context-long {
+  border-color: rgba(78, 205, 160, 0.42);
+}
+
+.neural-decision-card.context-short {
+  border-color: rgba(87, 184, 255, 0.42);
+}
+
+.neural-decision-card.context-mixed {
+  border-color: rgba(234, 185, 93, 0.42);
+}
+
+.neural-decision-card-head {
+  padding: 12px 14px 10px;
+  border-bottom: 1px solid #1d3038;
+  background:
+    radial-gradient(circle at 90% 0%, rgba(78, 205, 160, 0.08), transparent 34%),
+    rgba(10, 22, 28, 0.82);
+}
+
+.neural-decision-card-head span {
+  display: block;
+  color: #728993;
+  font: 700 9px/1.25 "IBM Plex Mono", "Cascadia Code", monospace;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.neural-decision-card-head strong {
+  display: block;
+  margin-top: 6px;
+  color: #edf7f4;
+  font-size: 16px;
+  line-height: 1.1;
+}
+
+.neural-decision-card-head p {
+  margin: 6px 0 0;
+  color: #91a6af;
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.neural-decision-rows {
+  display: grid;
+}
+
+.neural-decision-row {
+  display: grid;
+  gap: 4px;
+  width: 100%;
+  padding: 10px 12px;
+  border: 0;
+  border-bottom: 1px solid #182a31;
+  color: #a7bac1;
+  text-align: left;
+  background: transparent;
+  cursor: pointer;
+}
+
+.neural-decision-row:last-child {
+  border-bottom: 0;
+}
+
+.neural-decision-row:hover,
+.neural-decision-row:focus-visible {
+  outline: none;
+  background: rgba(78, 205, 160, 0.08);
+}
+
+.neural-decision-rank {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.neural-decision-rank strong {
+  min-width: 0;
+  color: #dce9e7;
+  font-size: 12px;
+  line-height: 1.25;
+  overflow-wrap: anywhere;
+}
+
+.neural-decision-row em {
+  font: 700 11px/1.35 "IBM Plex Mono", "Cascadia Code", monospace;
+  font-style: normal;
+  overflow-wrap: anywhere;
+}
+
+.neural-decision-row small {
+  color: #748c96;
+  font-size: 10px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.neural-decision-empty {
+  margin: 0;
+  padding: 12px;
+  color: #718893;
+  font-size: 11px;
+}
+
+.neural-verdict-pill {
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+  min-height: 20px;
+  padding: 0 7px;
+  border: 1px solid #35505a;
+  border-radius: 999px;
+  color: #cfe2e7;
+  font: 800 9px/1 "IBM Plex Mono", "Cascadia Code", monospace;
+  letter-spacing: 0.04em;
+}
+
+.neural-verdict-pill.verdict-healthy {
+  border-color: #3f9b78;
+  color: #aaf8d4;
+  background: rgba(41, 135, 98, 0.18);
+}
+
+.neural-verdict-pill.verdict-warning {
+  border-color: #d0a646;
+  color: #ffe3a4;
+  background: rgba(148, 108, 32, 0.18);
+}
+
+.neural-verdict-pill.verdict-critical {
+  border-color: #b94a55;
+  color: #ffbac0;
+  background: rgba(122, 38, 47, 0.2);
+}
+
+.neural-verdict-pill.verdict-blocked {
+  border-color: #a78bfa;
+  color: #eee7ff;
+  background: rgba(96, 68, 170, 0.26);
+}
+
+.neural-verdict-pill.verdict-measure {
+  border-color: #3f7a89;
+  color: #a9dfed;
+  background: rgba(35, 105, 122, 0.18);
 }
 
 .neural-milestone-grid {
@@ -361,7 +521,7 @@
 
 .neural-milestone-table-wrap table {
   width: 100%;
-  min-width: 1780px;
+  min-width: 1900px;
   border-collapse: collapse;
   font-size: 10px;
 }
@@ -407,14 +567,20 @@
 .neural-milestone-table-wrap td:nth-child(5),
 .neural-milestone-table-wrap td:nth-child(6),
 .neural-milestone-table-wrap td:nth-child(7),
-.neural-milestone-table-wrap td:nth-child(8) {
+.neural-milestone-table-wrap td:nth-child(8),
+.neural-milestone-table-wrap td:nth-child(9) {
   min-width: 138px;
   max-width: 230px;
   white-space: normal;
 }
 
-.neural-milestone-table-wrap .neural-missing-cell {
+.neural-milestone-table-wrap .neural-missing-cell,
+.neural-milestone-table-wrap .neural-best-use-cell {
   color: #b4c2c8;
+}
+
+.neural-milestone-table-wrap .neural-best-use-cell {
+  color: #d5c27c;
 }
 
 .neural-milestone-table-wrap tbody tr.is-quarantined,
@@ -440,6 +606,11 @@
 .neural-direction-row.direction-short {
   background:
     linear-gradient(90deg, rgba(87, 184, 255, 0.15), rgba(87, 184, 255, 0.03)) !important;
+}
+
+.neural-direction-row.direction-multi {
+  background:
+    linear-gradient(90deg, rgba(111, 183, 201, 0.15), rgba(111, 183, 201, 0.03)) !important;
 }
 
 .neural-direction-row.direction-regime {
@@ -1198,6 +1369,10 @@ i.health-diagnostic {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
+  .neural-decision-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
   .neural-workspace {
     grid-template-columns: minmax(0, 1fr);
   }
@@ -1328,6 +1503,7 @@ i.health-diagnostic {
   }
 
   .neural-milestone-summary,
+  .neural-decision-card-head,
   .neural-milestone-grid > div {
     padding: 12px;
   }

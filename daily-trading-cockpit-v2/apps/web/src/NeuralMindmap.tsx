@@ -4,7 +4,7 @@ import './neural-mindmap.css';
 const TELEMETRY_TIMEOUT_MS = 15_000;
 
 type NeuralHealth = 'HEALTHY' | 'ACTIVE' | 'WARNING' | 'CRITICAL' | 'IDLE' | 'COLLECTING' | 'QUARANTINE' | 'DIAGNOSTIC';
-type LaneMaturitySectionKey = 'LONG' | 'SHORT' | 'REGIME';
+type LaneMaturitySectionKey = 'LONG' | 'SHORT' | 'MULTI' | 'REGIME';
 type NeuralDiagnosisCategory =
   | 'HEALTHY_FLOW'
   | 'COLLECTING_EVIDENCE'
@@ -64,6 +64,12 @@ interface NeuralLane {
     LONG: LaneCohortStats | null;
     SHORT: LaneCohortStats | null;
     MIXED: LaneCohortStats | null;
+    BULLISH?: LaneCohortStats | null;
+    BEARISH?: LaneCohortStats | null;
+    LONG_BULLISH?: LaneCohortStats | null;
+    SHORT_BEARISH?: LaneCohortStats | null;
+    LONG_MIXED?: LaneCohortStats | null;
+    SHORT_MIXED?: LaneCohortStats | null;
   };
   payoffRatio: number | null;
   plus10bpsStillPositive: boolean | null;
@@ -113,7 +119,7 @@ interface LaneMaturitySection {
   lanes: NeuralLane[];
 }
 
-const LANE_MATURITY_SECTION_ORDER: LaneMaturitySectionKey[] = ['LONG', 'SHORT', 'REGIME'];
+const LANE_MATURITY_SECTION_ORDER: LaneMaturitySectionKey[] = ['LONG', 'SHORT', 'MULTI', 'REGIME'];
 const LANE_MATURITY_SECTION_META: Record<LaneMaturitySectionKey, { label: string; detail: string }> = {
   LONG: {
     label: 'LONG direction lanes',
@@ -122,6 +128,10 @@ const LANE_MATURITY_SECTION_META: Record<LaneMaturitySectionKey, { label: string
   SHORT: {
     label: 'SHORT direction lanes',
     detail: 'Direction axis: sell-side / fade-short / short-only diagnostics',
+  },
+  MULTI: {
+    label: 'MULTI-context geometry lanes',
+    detail: 'Same geometry can be measured in LONG, SHORT, and MIXED contexts; pick by the cohort columns, not by prefix',
   },
   REGIME: {
     label: 'REGIME-specific lanes',
@@ -143,6 +153,9 @@ function laneMaturitySection(lane: NeuralLane): LaneMaturitySectionKey {
     label.includes('BULL')
   ) {
     return 'LONG';
+  }
+  if (id.startsWith('CG_VARIANT_MATRIX:') && !label.includes(' SHORT') && !id.includes('EXP_SHORT') && !id.includes('WIDE_FAST_SHORT')) {
+    return 'MULTI';
   }
   return 'SHORT';
 }
@@ -400,6 +413,131 @@ function fmtCohort(cohort: LaneCohortStats | null | undefined): string {
 function cohortTone(cohort: LaneCohortStats | null | undefined): string {
   if (!cohort || cohort.n <= 0 || cohort.netAvgR === null || !Number.isFinite(cohort.netAvgR)) return 'tone-measure';
   return cohort.netAvgR >= 0 ? 'tone-healthy' : 'tone-critical';
+}
+
+interface LaneContextInfo {
+  cohort: LaneCohortStats | null;
+  source: string;
+  secondary: string;
+}
+
+interface LaneDecisionContext {
+  key: 'LONG_BULLISH' | 'SHORT_BEARISH' | 'MIXED';
+  title: string;
+  subtitle: string;
+  tone: 'long' | 'short' | 'mixed';
+}
+
+interface LaneDecisionRow {
+  lane: NeuralLane;
+  cohort: LaneCohortStats | null;
+  source: string;
+  secondary: string;
+  verdict: string;
+  tone: 'healthy' | 'warning' | 'critical' | 'blocked' | 'measure';
+  score: number;
+}
+
+const LANE_DECISION_CONTEXTS: LaneDecisionContext[] = [
+  {
+    key: 'LONG_BULLISH',
+    title: 'LONG / bullish',
+    subtitle: 'Use when controller allows LONG and regime family is bullish/expansion.',
+    tone: 'long',
+  },
+  {
+    key: 'SHORT_BEARISH',
+    title: 'SHORT / bearish',
+    subtitle: 'Use when controller allows SHORT and regime family is bearish/pressure.',
+    tone: 'short',
+  },
+  {
+    key: 'MIXED',
+    title: 'MIXED / choppy',
+    subtitle: 'Use when market is range/rotation; mixed is a regime subset, not a third direction.',
+    tone: 'mixed',
+  },
+];
+
+function miniCohort(cohort: LaneCohortStats | null | undefined): string {
+  if (!cohort || cohort.n <= 0) return 'n/a';
+  return `${cohort.n} · ${fmtR(cohort.netAvgR)} · PF ${fmtNumber(cohort.pf)}`;
+}
+
+function cohortForDecision(lane: NeuralLane, context: LaneDecisionContext['key']): LaneContextInfo {
+  const cohorts = lane.cohorts;
+  if (context === 'LONG_BULLISH') {
+    const exact = cohorts?.LONG_BULLISH ?? null;
+    return {
+      cohort: exact ?? cohorts?.LONG ?? null,
+      source: exact ? 'exact LONG+BULLISH' : 'fallback LONG direction',
+      secondary: `bullish family ${miniCohort(cohorts?.BULLISH)}`,
+    };
+  }
+  if (context === 'SHORT_BEARISH') {
+    const exact = cohorts?.SHORT_BEARISH ?? null;
+    return {
+      cohort: exact ?? cohorts?.SHORT ?? null,
+      source: exact ? 'exact SHORT+BEARISH' : 'fallback SHORT direction',
+      secondary: `bearish family ${miniCohort(cohorts?.BEARISH)}`,
+    };
+  }
+  return {
+    cohort: cohorts?.MIXED ?? null,
+    source: 'regime-family MIXED',
+    secondary: `L-mix ${miniCohort(cohorts?.LONG_MIXED)} · S-mix ${miniCohort(cohorts?.SHORT_MIXED)}`,
+  };
+}
+
+function laneContextVerdict(lane: NeuralLane, cohort: LaneCohortStats | null): Pick<LaneDecisionRow, 'verdict' | 'tone' | 'score'> {
+  const blocked = isQuarantinedLane(lane);
+  if (!cohort || cohort.n <= 0 || cohort.netAvgR === null || !Number.isFinite(cohort.netAvgR)) {
+    return { verdict: blocked ? 'BLOCKED / NO DATA' : 'NO DATA', tone: blocked ? 'blocked' : 'measure', score: blocked ? -20 : -10 };
+  }
+  const pf = cohort.pf ?? 0;
+  const wr = cohort.wr ?? 0;
+  const net = cohort.netAvgR;
+  const sampleScore = Math.min(2, Math.log10(Math.max(1, cohort.n)));
+  const economicsScore = Math.max(-2, Math.min(5, net * 10)) + Math.min(3, Math.max(0, pf)) + wr + sampleScore;
+  const proven = cohort.n >= STABLE_MIN_FRESH && net > 0.05 && (pf > HEADLINE_PF_FLOOR || pf >= 999_999);
+  const watch = cohort.n >= 10 && net > 0 && (pf > 1 || pf >= 999_999);
+  if (blocked && (proven || watch)) {
+    return { verdict: 'BLOCKED EDGE', tone: 'blocked', score: 90 + economicsScore };
+  }
+  if (blocked) return { verdict: 'BLOCKED', tone: 'blocked', score: 10 + economicsScore };
+  if (proven) return { verdict: 'PROVEN', tone: 'healthy', score: 100 + economicsScore };
+  if (watch) return { verdict: 'WATCH', tone: 'warning', score: 60 + economicsScore };
+  return { verdict: net > 0 ? 'EARLY' : 'NO EDGE', tone: net > 0 ? 'measure' : 'critical', score: economicsScore };
+}
+
+function laneDecisionRows(lanes: NeuralLane[], context: LaneDecisionContext['key']): LaneDecisionRow[] {
+  return lanes
+    .map((lane) => {
+      const info = cohortForDecision(lane, context);
+      const verdict = laneContextVerdict(lane, info.cohort);
+      return {
+        lane,
+        cohort: info.cohort,
+        source: info.source,
+        secondary: info.secondary,
+        ...verdict,
+      };
+    })
+    .filter((row) => row.cohort && row.cohort.n > 0)
+    .sort((a, b) => b.score - a.score || (b.cohort?.n ?? 0) - (a.cohort?.n ?? 0))
+    .slice(0, 5);
+}
+
+function bestContextLabel(lane: NeuralLane): string {
+  const candidates = LANE_DECISION_CONTEXTS.map((context) => {
+    const info = cohortForDecision(lane, context.key);
+    const verdict = laneContextVerdict(lane, info.cohort);
+    return { context, info, verdict };
+  }).filter((item) => item.info.cohort && item.info.cohort.n > 0);
+  if (candidates.length === 0) return 'No cohort yet';
+  candidates.sort((a, b) => b.verdict.score - a.verdict.score);
+  const best = candidates[0]!;
+  return `${best.context.title} · ${best.verdict.verdict}`;
 }
 
 function fmtMoney(value: number): string {
@@ -855,6 +993,13 @@ export default function NeuralMindmap() {
   const displayLanes = useMemo(() => {
     return (telemetry?.lanes ?? []).filter((lane) => lane.statsSource !== 'REGIME_DIAGNOSTIC');
   }, [telemetry?.lanes]);
+  const laneDecisionCards = useMemo(
+    () => LANE_DECISION_CONTEXTS.map((context) => ({
+      ...context,
+      rows: laneDecisionRows(displayLanes, context.key),
+    })),
+    [displayLanes],
+  );
   const laneMaturitySections = useMemo(
     () => groupLanesByMaturitySection(displayLanes),
     [displayLanes],
@@ -1086,6 +1231,36 @@ export default function NeuralMindmap() {
             direction cohorts, TP distance, diagnostic MTM, MFE, and mirrored Binance exposure.
           </p>
         </div>
+        <div className="neural-decision-grid" aria-label="Lane selection matrix">
+          {laneDecisionCards.map((card) => (
+            <section key={card.key} className={`neural-decision-card context-${card.tone}`}>
+              <div className="neural-decision-card-head">
+                <span>Best lane by context</span>
+                <strong>{card.title}</strong>
+                <p>{card.subtitle}</p>
+              </div>
+              <div className="neural-decision-rows">
+                {card.rows.length === 0 ? (
+                  <p className="neural-decision-empty">No cohort evidence yet.</p>
+                ) : card.rows.map((row) => (
+                  <button
+                    type="button"
+                    key={`${card.key}-${row.lane.id}`}
+                    className={`neural-decision-row verdict-${row.tone}`}
+                    onClick={() => setSelectedId(row.lane.id)}
+                  >
+                    <span className="neural-decision-rank">
+                      <b className={`neural-verdict-pill verdict-${row.tone}`}>{row.verdict}</b>
+                      <strong>{row.lane.label}</strong>
+                    </span>
+                    <em className={cohortTone(row.cohort)}>{fmtCohort(row.cohort)}</em>
+                    <small>{row.source} · {row.secondary}</small>
+                  </button>
+                ))}
+              </div>
+            </section>
+          ))}
+        </div>
         <div className="neural-milestone-grid">
           <div>
             <span>Collecting</span>
@@ -1117,6 +1292,7 @@ export default function NeuralMindmap() {
                 <th>Telemetry</th>
                 <th>Progress</th>
                 <th>Missing</th>
+                <th>Best use</th>
                 <th>Dir LONG</th>
                 <th>Dir SHORT</th>
                 <th>Regime MIXED</th>
@@ -1135,7 +1311,7 @@ export default function NeuralMindmap() {
               {milestoneSections.map((section) => (
                 <Fragment key={`milestone-section-${section.key}`}>
                   <tr className={`neural-direction-row direction-${section.key.toLowerCase()}`}>
-                    <td colSpan={17}>
+                    <td colSpan={18}>
                       <span>{section.label}</span>
                       <small>{section.lanes.length} lane{section.lanes.length === 1 ? '' : 's'} · {section.detail}</small>
                     </td>
@@ -1157,6 +1333,7 @@ export default function NeuralMindmap() {
                         <td>{lane.status}</td>
                         <td>{progress.progressPct}%</td>
                         <td className="neural-missing-cell">{progress.blockers.slice(0, 2).join(' | ') || 'None'}</td>
+                        <td className="neural-best-use-cell">{bestContextLabel(lane)}</td>
                         <td className={cohortTone(lane.cohorts?.LONG)}>{fmtCohort(lane.cohorts?.LONG)}</td>
                         <td className={cohortTone(lane.cohorts?.SHORT)}>{fmtCohort(lane.cohorts?.SHORT)}</td>
                         <td className={cohortTone(lane.cohorts?.MIXED)}>{fmtCohort(lane.cohorts?.MIXED)}</td>
@@ -1319,8 +1496,11 @@ export default function NeuralMindmap() {
                     <p className="neural-section-note">LONG/SHORT are direction cohorts. MIXED is a regime subset, so it is not added to direction totals.</p>
                     <dl>
                       <div><dt>LONG cohort</dt><dd className={cohortTone(selectedLane.cohorts?.LONG)}>{fmtCohort(selectedLane.cohorts?.LONG)}</dd></div>
+                      <div><dt>LONG + bullish</dt><dd className={cohortTone(selectedLane.cohorts?.LONG_BULLISH)}>{fmtCohort(selectedLane.cohorts?.LONG_BULLISH)}</dd></div>
                       <div><dt>SHORT cohort</dt><dd className={cohortTone(selectedLane.cohorts?.SHORT)}>{fmtCohort(selectedLane.cohorts?.SHORT)}</dd></div>
+                      <div><dt>SHORT + bearish</dt><dd className={cohortTone(selectedLane.cohorts?.SHORT_BEARISH)}>{fmtCohort(selectedLane.cohorts?.SHORT_BEARISH)}</dd></div>
                       <div><dt>MIXED regime</dt><dd className={cohortTone(selectedLane.cohorts?.MIXED)}>{fmtCohort(selectedLane.cohorts?.MIXED)}</dd></div>
+                      <div><dt>Mixed split</dt><dd>{`L ${miniCohort(selectedLane.cohorts?.LONG_MIXED)} · S ${miniCohort(selectedLane.cohorts?.SHORT_MIXED)}`}</dd></div>
                     </dl>
                   </section>
                   {selectedLaneMetricGroups.map((group) => (

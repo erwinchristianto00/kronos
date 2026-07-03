@@ -93,6 +93,14 @@ export interface NeuralMapLane {
     SHORT: NeuralLaneCohortStats | null;
     /** Performance while the market regime family is Mixed/Choppy/Range/Rotation. */
     MIXED: NeuralLaneCohortStats | null;
+    /** Coarse regime-only cohorts, useful as a secondary context check. */
+    BULLISH?: NeuralLaneCohortStats | null;
+    BEARISH?: NeuralLaneCohortStats | null;
+    /** Exact trade direction x regime-family cohorts used for lane-picking. */
+    LONG_BULLISH?: NeuralLaneCohortStats | null;
+    SHORT_BEARISH?: NeuralLaneCohortStats | null;
+    LONG_MIXED?: NeuralLaneCohortStats | null;
+    SHORT_MIXED?: NeuralLaneCohortStats | null;
   };
   payoffRatio: number | null;
   plus10bpsStillPositive: boolean | null;
@@ -438,9 +446,10 @@ function cohortSplitDisplay(
   aggregateStatus: string | null | undefined,
   directionRows: VariantBreakdownRow[],
   regimeFamilyRows: VariantBreakdownRow[],
+  axisRows: VariantBreakdownRow[],
 ): { status: string; reason: string; blockers: string[]; cautions: string[] } | null {
   if (aggregateStatus !== "REJECT") return null;
-  const explorable = [...directionRows, ...regimeFamilyRows]
+  const explorable = [...axisRows, ...directionRows, ...regimeFamilyRows]
     .filter(cohortIsStillExplorable)
     .sort((a, b) => b.n - a.n)
     .slice(0, 3);
@@ -844,20 +853,20 @@ function paperBookStatus(economics: ReturnType<typeof laneEconomics>): {
 
 function laneLabel(id: string): string {
   if (id === H6_TREND_PAPER_LANE_ID) return "H6 TREND LONG";
-  if (id === "CG_VARIANT_MATRIX:CG_WIDE_STOP_TP_WIDE") return "CG_WIDE SHORT";
+  if (id === "CG_VARIANT_MATRIX:CG_WIDE_STOP_TP_WIDE") return "CG_WIDE STOP/TP";
   if (id === "CG_LONG_VARIANT_MATRIX:CG_WIDE_STOP_TP_WIDE") return "CG_WIDE LONG";
   if (id === "CG_LONG_VARIANT_MATRIX:CG_WIDE_LONG_RUNNER") return "CG_WIDE RUNNER 3R";
-  if (id === "CG_VARIANT_MATRIX:CG_WIDE_FAST_SHORT") return "CG_WIDE FAST 0.5R";
+  if (id === "CG_VARIANT_MATRIX:CG_WIDE_FAST_SHORT") return "CG_WIDE FAST SHORT 0.5R";
   if (id === "CG_LONG_VARIANT_MATRIX:CG_WIDE_FAST_SHORT") return "CG_WIDE FAST 0.5R LONG MIRROR";
   if (id === "CG_LONG_VARIANT_MATRIX:CG_WIDE_FAST_LONG") return "CG_WIDE FAST LONG 0.5R";
-  if (id === "CG_VARIANT_MATRIX:CG_TIGHT_FAST_05") return "TIGHT FAST 0.5R SHORT";
+  if (id === "CG_VARIANT_MATRIX:CG_TIGHT_FAST_05") return "TIGHT FAST 0.5R";
   if (id === "CG_LONG_VARIANT_MATRIX:CG_TIGHT_FAST_05") return "TIGHT FAST 0.5R LONG";
   if (id === "CG_LONG_VARIANT_MATRIX:CG_EXP_LONG_WIDE_FAST_10X") return "EXP 10X LONG WIDE FAST";
   if (id === "CG_LONG_VARIANT_MATRIX:CG_EXP_LONG_TIGHT_FAST_10X") return "EXP 10X LONG TIGHT FAST";
   if (id === "CG_LONG_VARIANT_MATRIX:CG_EXP_LONG_MFE_GIVEBACK_10X") return "EXP 10X MFE LONG";
   if (id === "CG_VARIANT_MATRIX:CG_EXP_SHORT_MFE_GIVEBACK_10X") return "EXP 10X MFE SHORT";
   if (id === "CG_VARIANT_MATRIX:CG_EXP_SHORT_WIDE_FAST_10X") return "EXP 10X WIDE SHORT";
-  if (id === "CG_VARIANT_MATRIX:CG_BE_AFTER_05") return "BE@0.5R SHORT";
+  if (id === "CG_VARIANT_MATRIX:CG_BE_AFTER_05") return "BE@0.5R";
   if (id === "CG_LONG_VARIANT_MATRIX:CG_BE_AFTER_05") return "BE@0.5R LONG";
   if (id === `CG_LONG_VARIANT_MATRIX:${BULL_TREND_VARIANT_ID}`) return "BULL TREND 1.5R";
   if (id === `CG_LONG_VARIANT_MATRIX:${BULL_SCALEOUT_VARIANT_ID}`) return "BULL SCALEOUT";
@@ -869,13 +878,13 @@ function laneLabel(id: string): string {
   if (id === "CG_LONG_VARIANT_MATRIX:CG_MAKER_LIMIT_SIM") return "CG_MAKER LONG";
   if (id === "CG_LONG_VARIANT_MATRIX:CG_BASELINE_FAST_05") return "BASELINE FAST 0.5R LONG";
   if (id === "CG_LONG_VARIANT_MATRIX:CG_MAKER_FAST_05") return "MAKER FAST 0.5R LONG";
-  if (id === "CG_VARIANT_MATRIX:CG_TRAIL_AFTER_TP1") return "CG_TRAIL SHORT";
-  if (id === "CG_VARIANT_MATRIX:CG_BASELINE_CURRENT") return "CG_BASELINE SHORT";
+  if (id === "CG_VARIANT_MATRIX:CG_TRAIL_AFTER_TP1") return "CG_TRAIL AFTER TP1";
+  if (id === "CG_VARIANT_MATRIX:CG_BASELINE_CURRENT") return "CG_BASELINE";
   if (id === "CG_LONG_VARIANT_MATRIX:CG_MFE_GIVEBACK") return "MFE-GIVEBACK LONG";
-  if (id === "CG_VARIANT_MATRIX:CG_MFE_GIVEBACK") return "MFE-GIVEBACK SHORT";
-  if (id === "CG_VARIANT_MATRIX:CG_SCALEOUT_TP1_TRAIL") return "CG_SCALEOUT SHORT";
-  if (id === "CG_VARIANT_MATRIX:CG_NO_FIB500_ENTRYSET") return "CG_NO_FIB500 SHORT";
-  if (id === "CG_VARIANT_MATRIX:CG_MAKER_LIMIT_SIM") return "CG_MAKER SHORT";
+  if (id === "CG_VARIANT_MATRIX:CG_MFE_GIVEBACK") return "MFE-GIVEBACK";
+  if (id === "CG_VARIANT_MATRIX:CG_SCALEOUT_TP1_TRAIL") return "CG_SCALEOUT";
+  if (id === "CG_VARIANT_MATRIX:CG_NO_FIB500_ENTRYSET") return "CG_NO_FIB500";
+  if (id === "CG_VARIANT_MATRIX:CG_MAKER_LIMIT_SIM") return "CG_MAKER LIMIT";
   // Fallback: strip BOTH lane prefixes (CG_LONG_VARIANT_MATRIX must be tried
   // first — it contains CG_VARIANT_MATRIX as a substring only after "LONG_").
   return id
@@ -1259,8 +1268,10 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
   const variantLaneIds = new Set(input.variantMatrix.rows.map((row) => variantLaneId(row.variantId)));
   const orderLaneIds = new Set(input.orders.map((order) => order.selectedLaneId).filter(Boolean));
   const quarantinedLaneIds = new Set(input.quarantinedLaneIds ?? []);
-  const laneIds = Array.from(new Set([...variantLaneIds, ...orderLaneIds]))
-    .filter((id) => !quarantinedLaneIds.has(id));
+  // Keep quarantined lanes in telemetry so the dashboard can still compare their context-specific
+  // VM cohorts (blocked edge vs no edge). The SVG map filters them out visually; the scorecard
+  // should not become blind just because a lane is benched.
+  const laneIds = Array.from(new Set([...variantLaneIds, ...orderLaneIds]));
   const rowsById = new Map(input.variantMatrix.rows.map((row) => [variantLaneId(row.variantId), row]));
   const activeLaneIds = new Set([
     ...input.mixed.activeMixedLanes,
@@ -1291,8 +1302,9 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
     const pnlIsDiagnosticOnly = economics.headlineClosed === 0 && economics.diagnosticPnl !== 0;
     const directionRows = evidenceRow?.byDirection ?? [];
     const regimeFamilyRows = evidenceRow?.byRegimeFamily ?? [];
+    const axisRows = evidenceRow?.byAxis ?? [];
     const cohortDisplay = evidenceRow
-      ? cohortSplitDisplay(evidenceRow.status, directionRows, regimeFamilyRows)
+      ? cohortSplitDisplay(evidenceRow.status, directionRows, regimeFamilyRows, axisRows)
       : null;
     const status = cohortDisplay?.status ?? evidenceRow?.status ?? paperStatus.status;
     const evidenceHealth = cohortDisplay
@@ -1345,6 +1357,12 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
         LONG: cohortFromBreakdown(directionRows.find((candidate) => candidate.key === "LONG")) ?? paperOnlyLongCohort,
         SHORT: cohortFromBreakdown(directionRows.find((candidate) => candidate.key === "SHORT")) ?? paperOnlyShortCohort,
         MIXED: cohortFromBreakdown(regimeFamilyRows.find((candidate) => candidate.key === "MIXED")),
+        BULLISH: cohortFromBreakdown(regimeFamilyRows.find((candidate) => candidate.key === "BULLISH")),
+        BEARISH: cohortFromBreakdown(regimeFamilyRows.find((candidate) => candidate.key === "BEARISH")),
+        LONG_BULLISH: cohortFromBreakdown(axisRows.find((candidate) => candidate.key === "LONG_BULLISH")),
+        SHORT_BEARISH: cohortFromBreakdown(axisRows.find((candidate) => candidate.key === "SHORT_BEARISH")),
+        LONG_MIXED: cohortFromBreakdown(axisRows.find((candidate) => candidate.key === "LONG_MIXED")),
+        SHORT_MIXED: cohortFromBreakdown(axisRows.find((candidate) => candidate.key === "SHORT_MIXED")),
       },
       payoffRatio: row?.payoffRatio ?? null,
       plus10bpsStillPositive: row?.plus10bpsStillPositive ?? null,

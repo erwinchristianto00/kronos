@@ -1908,6 +1908,8 @@ export interface CurrentGuardVariantMatrixRow {
   byDirection?: VariantBreakdownRow[];
   /** Coarse regime-family cohort; MIXED answers choppy/range performance directly. */
   byRegimeFamily?: VariantBreakdownRow[];
+  /** Exact direction x regime-family cohort, e.g. LONG_BULLISH or SHORT_BEARISH. */
+  byAxis?: VariantBreakdownRow[];
   byEntryVariant: VariantBreakdownRow[];
   bySymbol: VariantBreakdownRow[];
 
@@ -2280,6 +2282,7 @@ function buildRow(
   const byRegime = breakdownRows(fresh, (o) => o.regime ?? "UNKNOWN");
   const byDirection = breakdownRows(fresh, (o) => o.direction);
   const byRegimeFamily = breakdownRows(fresh, observationRegimeFamilyKey);
+  const byAxis = breakdownRows(fresh, (o) => `${o.direction}_${observationRegimeFamilyKey(o)}`);
   const byEntryVariant = breakdownRows(fresh, (o) => o.entryVariant ?? "unknown");
   const bySymbol = breakdownRows(fresh, (o) => o.symbol);
 
@@ -2338,6 +2341,7 @@ function buildRow(
     byRegime,
     byDirection,
     byRegimeFamily,
+    byAxis,
     byEntryVariant,
     bySymbol,
     oosThirds,
