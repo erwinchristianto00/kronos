@@ -43,7 +43,11 @@ const DEFAULT_EXTERNAL_SIGNAL_FETCH_TIMEOUT_MS = Number(process.env.EXTERNAL_SIG
 // itself cannot parallelize; 3 concurrent /predict calls returned in 6.35s/12.27s/18.89s, i.e. fully
 // serial), yet queueTimeoutMs was capped at 3s — far too short for the 2nd+ symbol in the race to ever
 // get a turn. Raising the total budget gives queueTimeoutMs (below) room to cover a real ~7-8s wait.
-const DEFAULT_TOTAL_SYMBOL_FETCH_TIMEOUT_MS = 24_000;
+// 2026-07-03: CPU-only venv rebuilds can run slower than the old 9.5s per-request cap,
+// so keep the scan bounded but give Kronos enough room to avoid false degraded health.
+const DEFAULT_TOTAL_SYMBOL_FETCH_TIMEOUT_MS = 45_000;
+const DEFAULT_KRONOS_REQUEST_TIMEOUT_MS = 22_000;
+const DEFAULT_KRONOS_QUEUE_TIMEOUT_MS = 20_000;
 const DEFAULT_SYMBOL_FAILURE_RATE_THRESHOLD = 0.8;
 const DEFAULT_PROVIDER_TIMEOUT_STREAK_THRESHOLD = 2;
 const DEFAULT_PROVIDER_CIRCUIT_SKIP_SCANS = 3;
@@ -249,12 +253,14 @@ async function safeKronosPrediction(
   }
 
   try {
-    // requestTimeoutMs: real inference measured ~7.4s; 9.5s ceiling covers it with margin.
-    const requestTimeoutMs = Math.max(1_000, Math.min(9_500, Math.floor(symbolBudgetMs * 0.55)));
+    const requestTimeoutCapMs = positiveEnvInt(process.env.SCAN_KRONOS_REQUEST_TIMEOUT_MS, DEFAULT_KRONOS_REQUEST_TIMEOUT_MS);
+    const queueTimeoutCapMs = positiveEnvInt(process.env.SCAN_KRONOS_QUEUE_TIMEOUT_MS, DEFAULT_KRONOS_QUEUE_TIMEOUT_MS);
+    // requestTimeoutMs: real inference measured ~7.4s before, but CPU-only rebuilds can run slower.
+    const requestTimeoutMs = Math.max(1_000, Math.min(requestTimeoutCapMs, Math.floor(symbolBudgetMs * 0.65)));
     // queueTimeoutMs: with KRONOS_CONCURRENCY=1, a symbol 2nd-in-line must wait out the ~7.4s
     // inference ahead of it before its own turn even starts. The old 3s ceiling killed it before
-    // that wait ever completed, regardless of budget. 10s covers one ahead-of-you inference + margin.
-    const queueTimeoutMs = Math.max(250, Math.min(10_000, Math.floor(symbolBudgetMs * 0.4)));
+    // that wait ever completed, regardless of budget. Keep this bounded and env-tunable.
+    const queueTimeoutMs = Math.max(250, Math.min(queueTimeoutCapMs, Math.floor(symbolBudgetMs * 0.45)));
     return await kronosClient.predict(symbol, "1h", candles1h, {
       requestTimeoutMs,
       queueTimeoutMs,
