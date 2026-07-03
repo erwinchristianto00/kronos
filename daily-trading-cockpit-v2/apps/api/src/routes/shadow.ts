@@ -1506,6 +1506,21 @@ export async function registerShadowRoutes(
               /* mirror must never break the brief */
             }
           }
+          const variantResolverMaxObservations = (() => {
+            const n = Number(process.env.VARIANT_MATRIX_RESOLVER_MAX_OBSERVATIONS_PER_RUN);
+            return Number.isFinite(n) && n > 0 ? Math.max(40, Math.floor(n)) : 100;
+          })();
+          const variantResolverMaxRuntimeMs = (() => {
+            const n = Number(process.env.VARIANT_MATRIX_RESOLVER_MAX_RUNTIME_MS);
+            return Number.isFinite(n) && n > 0 ? Math.max(8_000, Math.floor(n)) : 20_000;
+          })();
+          const variantResolverWaitMs =
+            request.query?.headless === "1"
+              ? Math.min(
+                  variantResolverMaxRuntimeMs + 2_000,
+                  Math.max(8_000, Number(process.env.PAPER_AUTO_CYCLE_TIMEOUT_MS ?? 120_000) - 5_000),
+                )
+              : 8_000;
           const resolverPromise = resolveVariantMatrixObservations(cgvmStoreForResolve, {
             getKlines: async (symbol: string, interval: string, klineOpts: { startTime: number; endTime: number; limit: number }) => {
               const candles = await _rbc.getCandles(symbol, interval, klineOpts.limit, {
@@ -1530,17 +1545,11 @@ export async function registerShadowRoutes(
             // SANITY FLOOR (2026-06-22): a too-small env override (it was set to 25/6 on the VPS,
             // which silently froze resolution for days) is clamped UP so resolution can never stall.
             // Env can still tune HIGHER; it just can't cripple the resolver below a workable minimum.
-            maxObservations: (() => {
-              const n = Number(process.env.VARIANT_MATRIX_RESOLVER_MAX_OBSERVATIONS_PER_RUN);
-              return Number.isFinite(n) && n > 0 ? Math.max(40, Math.floor(n)) : 100;
-            })(),
-            maxRuntimeMs: (() => {
-              const n = Number(process.env.VARIANT_MATRIX_RESOLVER_MAX_RUNTIME_MS);
-              return Number.isFinite(n) && n > 0 ? Math.max(8_000, Math.floor(n)) : 20_000;
-            })(),
+            maxObservations: variantResolverMaxObservations,
+            maxRuntimeMs: variantResolverMaxRuntimeMs,
             yieldEvery: 1,
           });
-          await Promise.race([resolverPromise, new Promise<void>((res) => { setTimeout(res, 8_000); })]);
+          await Promise.race([resolverPromise, new Promise<void>((res) => { setTimeout(res, variantResolverWaitMs); })]);
         } catch { /* resolve=1 failure must never break the brief */ }
 
         // ── Fade-long edge: independent oversold (RSI<30) dip-buy measurement lane ──
