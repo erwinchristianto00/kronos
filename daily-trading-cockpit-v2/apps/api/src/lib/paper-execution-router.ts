@@ -374,6 +374,22 @@ interface PaperExecutionRouterState {
 
 const PAPER_STATE_VERSION = 1;
 
+function paperAxisRegimeFamily(regime: string | null | undefined): NonNullable<PaperOrder["axisRegimeFamily"]> {
+  const label = (regime ?? "").toLowerCase();
+  if (/mixed|rotation|chop|range|sideways|neutral/.test(label)) return "MIXED";
+  if (/bull|long/.test(label)) return "BULLISH";
+  if (/bear|short/.test(label)) return "BEARISH";
+  return "UNKNOWN";
+}
+
+function stampPaperOrderAxis(order: PaperOrder): void {
+  const family = paperAxisRegimeFamily(order.regime);
+  order.axisVersion = 1;
+  order.axisDirection = order.direction;
+  order.axisRegimeFamily = family;
+  order.axisKey = `${order.direction}::${family}`;
+}
+
 export class PaperExecutionRouterStore {
   private readonly file: string;
   private state: PaperExecutionRouterState;
@@ -453,6 +469,7 @@ export class PaperExecutionRouterStore {
 
   save(): void {
     try {
+      for (const order of this.state.orders) stampPaperOrderAxis(order);
       // Atomic write: serialize to a temp file, snapshot the previous good file as .bak, then
       // rename into place (atomic on the same volume). A reload can therefore never observe a
       // partially-written main file, and the .bak is the recovery source if anything goes wrong.

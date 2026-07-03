@@ -784,6 +784,7 @@ export class CurrentGuardVariantMatrixStore {
 
   save(): void {
     try {
+      for (const observation of this.observations) stampObservationAxis(observation);
       const state: VariantMatrixStoreState = { observations: this.observations };
       if (this.resolverMetaInternal) state.resolverMeta = this.resolverMetaInternal;
       writeJsonAtomic(this.file, state);
@@ -2084,6 +2085,14 @@ function regimeFamilyKey(regime: string | null | undefined): AxisRegimeFamily {
 
 function observationRegimeFamilyKey(obs: CurrentGuardVariantMatrixObservation): AxisRegimeFamily {
   return validAxisRegimeFamily(obs.axisRegimeFamily) ?? regimeFamilyKey(obs.regime);
+}
+
+function stampObservationAxis(obs: CurrentGuardVariantMatrixObservation): void {
+  const family = observationRegimeFamilyKey(obs);
+  obs.axisVersion = 1;
+  obs.axisDirection = obs.direction;
+  obs.axisRegimeFamily = family;
+  obs.axisKey = `${obs.direction}::${family}`;
 }
 
 function topSymbolPnlShare(slice: CurrentGuardVariantMatrixObservation[]): number | null {
