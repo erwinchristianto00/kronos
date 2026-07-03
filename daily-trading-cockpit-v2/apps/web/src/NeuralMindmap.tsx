@@ -415,6 +415,20 @@ function cohortTone(cohort: LaneCohortStats | null | undefined): string {
   return cohort.netAvgR >= 0 ? 'tone-healthy' : 'tone-critical';
 }
 
+// The lane's REALIZED (paper-book) economics — the number that actually drives the
+// bench/quarantine, as opposed to the idealized VM-sim cohort above. Surfacing both
+// side by side is why a "BENCHED" lane can show a green sim number and a red book number.
+function fmtBook(lane: NeuralLane): string {
+  if (lane.netAvgR === null || !Number.isFinite(lane.netAvgR)) return 'book n/a';
+  const pf = lane.pf !== null && Number.isFinite(lane.pf) ? ` · PF ${fmtNumber(lane.pf)}` : '';
+  const cl = lane.closed !== null && lane.closed !== undefined ? ` · ${lane.closed}cl` : '';
+  return `book ${fmtR(lane.netAvgR)}${cl}${pf}`;
+}
+function bookTone(lane: NeuralLane): string {
+  if (lane.netAvgR === null || !Number.isFinite(lane.netAvgR)) return 'tone-measure';
+  return lane.netAvgR >= 0 ? 'tone-healthy' : 'tone-critical';
+}
+
 interface LaneContextInfo {
   cohort: LaneCohortStats | null;
   source: string;
@@ -502,7 +516,10 @@ function laneContextVerdict(lane: NeuralLane, cohort: LaneCohortStats | null): P
   const proven = cohort.n >= STABLE_MIN_FRESH && net > 0.05 && (pf > HEADLINE_PF_FLOOR || pf >= 999_999);
   const watch = cohort.n >= 10 && net > 0 && (pf > 1 || pf >= 999_999);
   if (blocked && (proven || watch)) {
-    return { verdict: 'BLOCKED EDGE', tone: 'blocked', score: 90 + economicsScore };
+    // The VM-sim cohort looks positive, but the lane is benched by its REALIZED (paper-book)
+    // economics. "BENCHED" (not "BLOCKED EDGE") + the book number rendered alongside makes it
+    // obvious this is a sim-only edge that lost money realistically — not a good edge unfairly blocked.
+    return { verdict: 'BENCHED', tone: 'blocked', score: 90 + economicsScore };
   }
   if (blocked) return { verdict: 'BLOCKED', tone: 'blocked', score: 10 + economicsScore };
   if (proven) return { verdict: 'PROVEN', tone: 'healthy', score: 100 + economicsScore };
@@ -1231,6 +1248,12 @@ export default function NeuralMindmap() {
             direction cohorts, TP distance, diagnostic MTM, MFE, and mirrored Binance exposure.
           </p>
         </div>
+        <p className="neural-decision-legend">
+          Each lane shows two numbers: <b>sim</b> = idealized VM-simulation cohort (optimistic — entry at
+          signal price, simple costs), <b>book</b> = REALIZED paper-book economics (realistic fills + cost).
+          A <b>BENCHED</b> verdict means the sim looks positive but the book proved it negative, so it is
+          correctly held out of live. Trust the book number for live decisions.
+        </p>
         <div className="neural-decision-grid" aria-label="Lane selection matrix">
           {laneDecisionCards.map((card) => (
             <section key={card.key} className={`neural-decision-card context-${card.tone}`}>
@@ -1253,7 +1276,8 @@ export default function NeuralMindmap() {
                       <b className={`neural-verdict-pill verdict-${row.tone}`}>{row.verdict}</b>
                       <strong>{row.lane.label}</strong>
                     </span>
-                    <em className={cohortTone(row.cohort)}>{fmtCohort(row.cohort)}</em>
+                    <em className={cohortTone(row.cohort)}>sim · {fmtCohort(row.cohort)}</em>
+                    <em className={bookTone(row.lane)}>{fmtBook(row.lane)}</em>
                     <small>{row.source} · {row.secondary}</small>
                   </button>
                 ))}

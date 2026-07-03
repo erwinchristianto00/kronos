@@ -53,28 +53,36 @@ const REGIME_TREE: Array<{
     engineRegime: 'BEAR_TREND',
     lane: 'Trend Short (Breakdown Retest Short)',
     laneNote: 'break + failed retest continuation',
-    preset: { lane1: 'CG_WIDE_FAST_SHORT', w1: '100', lane2: '', w2: '0' },
+    // FAST_SHORT is only marginal (book ~break-even), so pair it with the proven all-weather
+    // market-neutral basket as ballast instead of going 100% into a thin edge.
+    preset: { lane1: 'CG_WIDE_FAST_SHORT', w1: '60', lane2: 'CROSS_SECTIONAL_MARKET_NEUTRAL', w2: '40' },
   },
   {
     label: 'Bear Choppy',
     engineRegime: 'BEARISH_CHOPPY_DEFENSIVE',
     lane: 'Short Rally Fade',
-    laneNote: 'fade weak bounces; micro mean-reversion small',
-    preset: { lane1: 'CG_WIDE_FAST_SHORT', w1: '70', lane2: 'CG_WIDE_FAST_LONG', w2: '30' },
+    laneNote: 'fade weak bounces + market-neutral ballast',
+    // Dropped the 30% counter-trend FAST_LONG (too much long in a bear-choppy regime); pair the
+    // short fade with the market-neutral basket instead.
+    preset: { lane1: 'CG_WIDE_FAST_SHORT', w1: '60', lane2: 'CROSS_SECTIONAL_MARKET_NEUTRAL', w2: '40' },
   },
   {
     label: 'Neutral',
     engineRegime: 'NO_TRADE',
     lane: 'Mean Reversion (cross-sectional market-neutral)',
-    laneNote: 'basket executor trades this; mirror stays balanced',
-    preset: { lane1: 'CG_WIDE_FAST_LONG', w1: '50', lane2: 'CG_WIDE_FAST_SHORT', w2: '50' },
+    laneNote: 'no directional conviction → pure market-neutral',
+    // No directional conviction → 100% market-neutral (the proven all-weather edge, +0.347%),
+    // NOT a 50/50 directional pair (two weak-edge bets that don't cancel beta).
+    preset: { lane1: 'CROSS_SECTIONAL_MARKET_NEUTRAL', w1: '100', lane2: '', w2: '0' },
   },
   {
     label: 'Recovery',
     engineRegime: 'NEUTRAL_RECOVERY',
     lane: 'Pullback Long (scalp)',
-    laneNote: 'buy held pullbacks after the 62k reclaim',
-    preset: { lane1: 'CG_WIDE_FAST_LONG', w1: '70', lane2: 'CG_WIDE_FAST_SHORT', w2: '30' },
+    laneNote: 'proven long + market-neutral ballast',
+    // Longs favored (CG_WIDE_FAST_LONG is proven +0.28R/88%) + market-neutral ballast, instead of
+    // a 30% counter-trend short in an early-recovery regime.
+    preset: { lane1: 'CG_WIDE_FAST_LONG', w1: '60', lane2: 'CROSS_SECTIONAL_MARKET_NEUTRAL', w2: '40' },
   },
   {
     label: 'Bull',
@@ -623,15 +631,20 @@ export default function TestnetExchangeDashboard() {
       setLaneSeries(nextLaneSeries);
       setError(null);
       setLastLoadedAt(new Date().toISOString());
-      // Regime engine report — lives on the TESTNET instance (report-only), shown on both pages.
-      try {
-        const regimeResponse = await fetch(`${TESTNET_API_PREFIX}/shadow/regime-engine-report`, { cache: 'no-store' });
-        setRegimeReport(await regimeResponse.json());
-      } catch {
-        setRegimeReport(null); // fail-soft: the panel just says unavailable
-      }
     } catch (nextError) {
       setError(nextError instanceof Error ? nextError.message : `Unable to load Binance ${isLivePage ? 'mainnet' : 'testnet'} mirror`);
+    }
+  }
+
+  // Regime engine report — report-only, market-wide (lives on the TESTNET instance). Loaded
+  // INDEPENDENTLY of the exchange fetches so a live-endpoint hiccup can never skip it — that
+  // was why the panel could stay blank on /live. Shown identically on both /testnet and /live.
+  async function loadRegimeReport() {
+    try {
+      const res = await fetch(`${TESTNET_API_PREFIX}/shadow/regime-engine-report`, { cache: 'no-store' });
+      setRegimeReport(await res.json());
+    } catch {
+      setRegimeReport(null); // fail-soft: the panel just says unavailable
     }
   }
 
@@ -654,6 +667,17 @@ export default function TestnetExchangeDashboard() {
     }, REFRESH_MS);
     return () => window.clearInterval(timer);
   }, [autoRefresh, performanceView, performanceDay, performanceMonth, performanceYear, performanceRegime]);
+
+  // Regime panel loads on its own cadence, independent of the exchange fetches (so it shows
+  // on /live even if a live endpoint hiccups). Refreshes every 15s.
+  useEffect(() => {
+    void loadRegimeReport();
+    if (!autoRefresh) return undefined;
+    const timer = window.setInterval(() => {
+      void loadRegimeReport();
+    }, 15_000);
+    return () => window.clearInterval(timer);
+  }, [autoRefresh]);
 
   const stale = lastLoadedAt ? Date.now() - new Date(lastLoadedAt).getTime() > REFRESH_MS * 2.5 : true;
   const healthTone = status?.armed ? 'tone-healthy' : status?.health?.lastTickError ? 'tone-warning' : 'tone-measure';

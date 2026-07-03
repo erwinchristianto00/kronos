@@ -12,6 +12,7 @@ import {
   CROSS_SECTIONAL_MARKET_NEUTRAL_LANE_ID,
   type CrossSectionalExecutor,
 } from "../lib/cross-sectional-executor.js";
+import type { RegimeAutopilot } from "../lib/regime-autopilot.js";
 
 type LiveAccountSnapshot = Awaited<ReturnType<LiveExecutionEngine["getAccountSnapshot"]>>;
 
@@ -72,7 +73,11 @@ function annotateCrossSectionalAccount(
 export async function registerLiveRoutes(
   app: FastifyInstance,
   engine: LiveExecutionEngine | null,
-  opts: { configErrors?: string[]; crossSectionalExecutor?: () => CrossSectionalExecutor | null } = {},
+  opts: {
+    configErrors?: string[];
+    crossSectionalExecutor?: () => CrossSectionalExecutor | null;
+    regimeAutopilot?: () => RegimeAutopilot | null;
+  } = {},
 ): Promise<void> {
   app.get("/api/live/status", async () => {
     if (!engine) {
@@ -236,6 +241,15 @@ export async function registerLiveRoutes(
       return { enabled: false, reason: "executor disabled (set CROSS_SECTIONAL_EXEC_ENABLED=1 + live execution env)" };
     }
     return executor.getStatus();
+  });
+
+  // Regime auto-pilot status (Tier 1: auto-syncs allocation to detected regime, anti-whipsaw).
+  app.get("/api/live/autopilot", async () => {
+    const pilot = opts.regimeAutopilot?.() ?? null;
+    if (!pilot) {
+      return { enabled: false, reason: "auto-pilot disabled (set REGIME_AUTOPILOT_ENABLED=1 + REGIME_ENGINE_ENABLED=1)" };
+    }
+    return pilot.getStatus();
   });
 
   // WEIGHTED lane allocation (manual intervention: e.g. lane1 70% / lane2 30%).

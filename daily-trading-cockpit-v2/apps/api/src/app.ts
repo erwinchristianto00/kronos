@@ -24,6 +24,8 @@ import {
   isCrossSectionalExecEnabled,
 } from "./lib/cross-sectional-executor.js";
 import { getCrossSectionalStore } from "./lib/cross-sectional-edge.js";
+import { RegimeAutopilot, isRegimeAutopilotEnabled } from "./lib/regime-autopilot.js";
+import { getRegimeEngineStore } from "./lib/regime-engine-service.js";
 import {
   LiveExecutionEngine,
   LiveExecutionStore,
@@ -125,6 +127,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
   // status (sync getStatus, no I/O) for the order-reconciliation readiness gate, via a lazy getter.
   let liveEngine: LiveExecutionEngine | null = null;
   let crossSectionalExecutor: CrossSectionalExecutor | null = null;
+  let regimeAutopilot: RegimeAutopilot | null = null;
   await registerShadowRoutes(app, shadowEngine, {
     binanceClient,
     metadataFetchImpl: options.fetchImpl,
@@ -253,10 +256,31 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         setInterval(execTick, 5 * 60_000);
       }
     }
+
+    // Regime auto-pilot (Tier 1) — auto-syncs the lane allocation to the report-only regime engine's
+    // detected regime, with anti-whipsaw guards. Env-gated (REGIME_AUTOPILOT_ENABLED), testnet-first.
+    // Requires the regime engine to be producing snapshots (REGIME_ENGINE_ENABLED=1). Never arms.
+    if (isRegimeAutopilotEnabled() && liveEngine) {
+      const engineForPilot = liveEngine;
+      regimeAutopilot = new RegimeAutopilot({
+        setAllocations: (a) => { engineForPilot.setLaneAllocations(a); },
+        getLatestRegime: () => {
+          const snaps = getRegimeEngineStore().snapshots;
+          return snaps.length > 0 ? snaps[snaps.length - 1]!.regime : null;
+        },
+        nowMs: () => Date.now(),
+      });
+      if (!isTest) {
+        const pilotTick = () => { try { regimeAutopilot?.tick(); } catch { /* report-driven; never break the loop */ } };
+        setTimeout(pilotTick, 120_000);
+        setInterval(pilotTick, 5 * 60_000);
+      }
+    }
   }
   await registerLiveRoutes(app, liveEngine, {
     configErrors: liveConfig.enabled ? liveConfig.configErrors : [],
     crossSectionalExecutor: () => crossSectionalExecutor,
+    regimeAutopilot: () => regimeAutopilot,
   });
 
   return app;
