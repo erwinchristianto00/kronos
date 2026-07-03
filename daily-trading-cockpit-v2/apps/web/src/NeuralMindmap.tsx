@@ -4,8 +4,7 @@ import './neural-mindmap.css';
 const TELEMETRY_TIMEOUT_MS = 15_000;
 
 type NeuralHealth = 'HEALTHY' | 'ACTIVE' | 'WARNING' | 'CRITICAL' | 'IDLE' | 'COLLECTING' | 'QUARANTINE' | 'DIAGNOSTIC';
-const MIXED_DIAGNOSTIC_REGIME_LANE_ID = 'MIXED_DIAGNOSTIC_REGIME';
-type LaneDirectionGroupKey = 'LONG' | 'SHORT' | 'MIXED';
+type LaneMaturitySectionKey = 'LONG' | 'SHORT' | 'REGIME';
 type NeuralDiagnosisCategory =
   | 'HEALTHY_FLOW'
   | 'COLLECTING_EVIDENCE'
@@ -107,39 +106,34 @@ interface NeuralLane {
   reason: string;
 }
 
-interface LaneDirectionSection {
-  key: LaneDirectionGroupKey;
+interface LaneMaturitySection {
+  key: LaneMaturitySectionKey;
   label: string;
   detail: string;
   lanes: NeuralLane[];
 }
 
-const LANE_DIRECTION_ORDER: LaneDirectionGroupKey[] = ['LONG', 'SHORT', 'MIXED'];
-const LANE_DIRECTION_META: Record<LaneDirectionGroupKey, { label: string; detail: string }> = {
+const LANE_MATURITY_SECTION_ORDER: LaneMaturitySectionKey[] = ['LONG', 'SHORT', 'REGIME'];
+const LANE_MATURITY_SECTION_META: Record<LaneMaturitySectionKey, { label: string; detail: string }> = {
   LONG: {
-    label: 'LONG lanes',
-    detail: 'Buy-side / bullish continuation / long-only diagnostics',
+    label: 'LONG direction lanes',
+    detail: 'Direction axis: buy-side / bullish continuation / long-only diagnostics',
   },
   SHORT: {
-    label: 'SHORT lanes',
-    detail: 'Sell-side / fade-short / short-only diagnostics',
+    label: 'SHORT direction lanes',
+    detail: 'Direction axis: sell-side / fade-short / short-only diagnostics',
   },
-  MIXED: {
-    label: 'MIXED / regime',
-    detail: 'Choppy-range lanes and regime aggregates; not directly comparable with directional lanes',
+  REGIME: {
+    label: 'REGIME-specific lanes',
+    detail: 'Regime axis: choppy/mixed lanes only; this is not a third trade direction',
   },
 };
 
-function laneDirectionGroup(lane: NeuralLane): LaneDirectionGroupKey {
+function laneMaturitySection(lane: NeuralLane): LaneMaturitySectionKey {
   const id = lane.id.toUpperCase();
   const label = lane.label.toUpperCase();
-  if (
-    lane.id === MIXED_DIAGNOSTIC_REGIME_LANE_ID ||
-    lane.statsSource === 'REGIME_DIAGNOSTIC' ||
-    id.includes('MIXED') ||
-    label.includes('MIXED')
-  ) {
-    return 'MIXED';
+  if (id.includes('MIXED') || label.includes('MIXED')) {
+    return 'REGIME';
   }
   if (
     id.startsWith('CG_LONG_VARIANT_MATRIX:') ||
@@ -153,14 +147,14 @@ function laneDirectionGroup(lane: NeuralLane): LaneDirectionGroupKey {
   return 'SHORT';
 }
 
-function groupLanesByDirection(lanes: NeuralLane[]): LaneDirectionSection[] {
-  return LANE_DIRECTION_ORDER.map((key) => {
-    const meta = LANE_DIRECTION_META[key];
+function groupLanesByMaturitySection(lanes: NeuralLane[]): LaneMaturitySection[] {
+  return LANE_MATURITY_SECTION_ORDER.map((key) => {
+    const meta = LANE_MATURITY_SECTION_META[key];
     return {
       key,
       label: meta.label,
       detail: meta.detail,
-      lanes: lanes.filter((lane) => laneDirectionGroup(lane) === key),
+      lanes: lanes.filter((lane) => laneMaturitySection(lane) === key),
     };
   }).filter((section) => section.lanes.length > 0);
 }
@@ -179,68 +173,6 @@ interface DiagnosticDirectionStats {
   unrealizedPnl: number | null;
   netAvgR: number | null;
   wr: number | null;
-}
-
-function buildMixedDiagnosticRegimeLane(stats: DiagnosticDirectionStats): NeuralLane {
-  return {
-    id: MIXED_DIAGNOSTIC_REGIME_LANE_ID,
-    label: 'MIXED DIAG REGIME',
-    health: stats.closed > 0 || stats.open > 0 ? 'DIAGNOSTIC' : 'IDLE',
-    evidenceHealth: stats.closed > 0 || stats.open > 0 ? 'DIAGNOSTIC' : 'IDLE',
-    active: stats.open > 0,
-    open: stats.open,
-    closed: stats.closed,
-    oosFreshValid: stats.closed,
-    oosThreshold: 10,
-    netAvgR: stats.netAvgR,
-    pf: null,
-    wr: stats.wr,
-    statsSource: 'REGIME_DIAGNOSTIC',
-    cohorts: {
-      LONG: null,
-      SHORT: null,
-      MIXED: { n: stats.closed, netAvgR: stats.netAvgR, pf: null, wr: stats.wr, payoffRatio: null },
-    },
-    payoffRatio: null,
-    plus10bpsStillPositive: null,
-    allThreeOosPositive: null,
-    oosThirds: null,
-    approxMaxDrawdownR: null,
-    topSymbolPnlShare: null,
-    calendarDays: null,
-    distinctRegimes: null,
-    infraReady: null,
-    blockers: ['regime aggregate, not an executable lane', 'do not promote directly'],
-    cautions: ['MIXED is a subset of diagnostic SHORT+LONG, not an added third direction'],
-    headlinePnl: 0,
-    diagnosticPnl: stats.realizedPnl,
-    totalPnl: stats.realizedPnl,
-    openUnrealizedPnl: stats.unrealizedPnl,
-    openUnrealizedR: null,
-    diagnosticUnrealizedPnl: stats.unrealizedPnl,
-    diagnosticUnrealizedR: null,
-    headlineUnrealizedPnl: null,
-    headlineUnrealizedR: null,
-    openMaxFavorablePnl: null,
-    openMaxFavorableR: null,
-    openAvgDistanceToTpPct: null,
-    openNearestDistanceToTpPct: null,
-    openAvgEntryPrice: null,
-    openAvgMarkPrice: null,
-    openAvgTakeProfitPrice: null,
-    openAvgMfePct: null,
-    openP75MfePct: null,
-    openP90MfePct: null,
-    openAvgConfiguredTpPct: null,
-    openTpAssessment: null,
-    openMarkedSymbolCount: stats.open,
-    startingEquity: 0,
-    totalPnlPct: null,
-    headlinePnlPct: null,
-    pnlIsDiagnosticOnly: true,
-    status: 'REGIME_DIAGNOSTIC',
-    reason: 'Diagnostic-only paper orders grouped by Mixed/Choppy/Range regime. Measurement row only, not directly promotable.',
-  };
 }
 
 interface NeuralTelemetry {
@@ -479,6 +411,15 @@ function fmtUsdt(value: number | null): string {
   return `${value >= 0 ? '+' : ''}${value.toFixed(2)} USDT`;
 }
 
+function fmtDiagnosticStats(stats: DiagnosticDirectionStats | null | undefined): string {
+  if (!stats) return 'n/a';
+  const wr = stats.wr === null || !Number.isFinite(stats.wr) ? 'n/a' : `${Math.round(stats.wr * 100)}% WR`;
+  const mtm = stats.unrealizedPnl === null || !Number.isFinite(stats.unrealizedPnl)
+    ? ''
+    : ` · ${fmtUsdt(stats.unrealizedPnl)} MTM`;
+  return `${fmtUsdt(stats.realizedPnl)} · ${stats.closed}cl/${stats.open}op · ${fmtR(stats.netAvgR)} · ${wr}${mtm}`;
+}
+
 function fmtPrice(value: number | null): string {
   if (value === null || !Number.isFinite(value)) return 'n/a';
   if (Math.abs(value) >= 100) return value.toFixed(2);
@@ -597,12 +538,6 @@ function laneMilestone(lane: NeuralLane): { stage: MilestoneStage; reason: strin
   const watchableMin = lane.oosThreshold > 0 ? lane.oosThreshold : 10;
   const freshValid = lane.oosFreshValid ?? lane.closed;
   const status = lane.status.toUpperCase();
-  if (lane.id === MIXED_DIAGNOSTIC_REGIME_LANE_ID || lane.statsSource === 'REGIME_DIAGNOSTIC') {
-    return {
-      stage: freshValid > 0 || lane.open > 0 ? 'PAPER_EVIDENCE' : 'COLLECTING',
-      reason: `MIXED is a diagnostic regime aggregate (${freshValid} closed / ${lane.open} open), not an executable lane. It is displayed here for measurement only.`,
-    };
-  }
   if (isPaperBookOnlyLane(lane) && paperBookClearsHeadline(lane)) {
     if (lane.active) {
       return {
@@ -710,20 +645,6 @@ function stageProgress(lane: NeuralLane): StageProgress {
   const freshValid = lane.oosFreshValid ?? lane.closed;
   const telemetryStatus = lane.status.toUpperCase();
   const blockers = lane.blockers ?? [];
-
-  if (lane.id === MIXED_DIAGNOSTIC_REGIME_LANE_ID || lane.statsSource === 'REGIME_DIAGNOSTIC') {
-    return {
-      nextStage: 'Not promotable',
-      progressPct: 100,
-      blockers: blockers.length > 0 ? blockers : ['regime aggregate, not an executable lane'],
-      checklist: [
-        `mixed diagnostic closed ${freshValid}`,
-        `open ${lane.open}`,
-        `netAvgR ${fmtR(lane.netAvgR)}`,
-        'read as regime evidence only',
-      ],
-    };
-  }
 
   if (isPaperBookOnlyLane(lane)) {
     const headlineReady = paperBookClearsHeadline(lane);
@@ -932,13 +853,10 @@ export default function NeuralMindmap() {
   const diagDir = telemetry?.paper.diagnosticByDirection ?? null;
   const diagMixed = telemetry?.paper.diagnosticByRegime?.MIXED ?? null;
   const displayLanes = useMemo(() => {
-    const lanes = telemetry?.lanes ?? [];
-    if (!diagMixed) return lanes;
-    if (lanes.some((lane) => lane.id === MIXED_DIAGNOSTIC_REGIME_LANE_ID)) return lanes;
-    return [buildMixedDiagnosticRegimeLane(diagMixed), ...lanes];
-  }, [diagMixed, telemetry?.lanes]);
-  const laneDirectionSections = useMemo(
-    () => groupLanesByDirection(displayLanes),
+    return (telemetry?.lanes ?? []).filter((lane) => lane.statsSource !== 'REGIME_DIAGNOSTIC');
+  }, [telemetry?.lanes]);
+  const laneMaturitySections = useMemo(
+    () => groupLanesByMaturitySection(displayLanes),
     [displayLanes],
   );
   const selectedLane = displayLanes.find((lane) => lane.id === selectedId) ?? null;
@@ -1055,11 +973,11 @@ export default function NeuralMindmap() {
   const diagClosedTotal = diagDir ? diagDir.SHORT.closed + diagDir.LONG.closed : 0;
   const diagOpenTotal = diagDir ? diagDir.SHORT.open + diagDir.LONG.open : 0;
   const milestoneSections = useMemo(
-    () => laneDirectionSections.map((section) => ({
+    () => laneMaturitySections.map((section) => ({
       ...section,
       rows: section.lanes.map((lane) => ({ lane, milestone: laneMilestone(lane), progress: stageProgress(lane) })),
     })),
-    [laneDirectionSections],
+    [laneMaturitySections],
   );
   const watchableThreshold = telemetry?.lanes.find((lane) => lane.oosThreshold > 0)?.oosThreshold ?? 10;
 
@@ -1135,6 +1053,18 @@ export default function NeuralMindmap() {
               {telemetry ? `${fmtUsdt(diagRealizedTotal)} · ${diagClosedTotal} closed / ${diagOpenTotal} open` : 'Loading'}
             </strong>
           </div>
+          <div className="neural-axis-split" aria-label="Diagnostic P&L axis split">
+            <div className="neural-axis-block">
+              <span>Direction axis</span>
+              <p><b>SHORT</b><em className={diagDir && diagDir.SHORT.realizedPnl < 0 ? 'tone-critical' : 'tone-healthy'}>{fmtDiagnosticStats(diagDir?.SHORT)}</em></p>
+              <p><b>LONG</b><em className={diagDir && diagDir.LONG.realizedPnl < 0 ? 'tone-critical' : 'tone-healthy'}>{fmtDiagnosticStats(diagDir?.LONG)}</em></p>
+            </div>
+            <div className="neural-axis-block is-regime">
+              <span>Regime subset</span>
+              <p><b>MIXED</b><em className={diagMixed && diagMixed.realizedPnl < 0 ? 'tone-critical' : 'tone-healthy'}>{fmtDiagnosticStats(diagMixed)}</em></p>
+              <small>MIXED is a regime filter over LONG/SHORT orders, not a third direction.</small>
+            </div>
+          </div>
         </div>
       </section>
 
@@ -1187,9 +1117,9 @@ export default function NeuralMindmap() {
                 <th>Telemetry</th>
                 <th>Progress</th>
                 <th>Missing</th>
-                <th>Long</th>
-                <th>Short</th>
-                <th>Mixed</th>
+                <th>Dir LONG</th>
+                <th>Dir SHORT</th>
+                <th>Regime MIXED</th>
                 <th>TP gap</th>
                 <th>Diag MTM</th>
                 <th>MFE</th>
@@ -1385,8 +1315,8 @@ export default function NeuralMindmap() {
                 </div>
                 <div className="neural-lane-card-grid">
                   <section className="neural-lane-metric-card neural-lane-cohort-card">
-                    <h3>Performance scorecard</h3>
-                    <p className="neural-section-note">LONG/SHORT are direction cohorts; MIXED is the choppy/range regime subset.</p>
+                    <h3>Direction / regime scorecard</h3>
+                    <p className="neural-section-note">LONG/SHORT are direction cohorts. MIXED is a regime subset, so it is not added to direction totals.</p>
                     <dl>
                       <div><dt>LONG cohort</dt><dd className={cohortTone(selectedLane.cohorts?.LONG)}>{fmtCohort(selectedLane.cohorts?.LONG)}</dd></div>
                       <div><dt>SHORT cohort</dt><dd className={cohortTone(selectedLane.cohorts?.SHORT)}>{fmtCohort(selectedLane.cohorts?.SHORT)}</dd></div>

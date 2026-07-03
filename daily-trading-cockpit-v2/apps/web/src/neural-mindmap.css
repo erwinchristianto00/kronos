@@ -209,6 +209,50 @@
   gap: 4px;
 }
 
+.neural-axis-split {
+  display: grid;
+  grid-template-columns: minmax(0, 1.15fr) minmax(260px, 0.85fr);
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.neural-axis-block {
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid rgba(73, 103, 113, 0.38);
+  border-radius: 8px;
+  background: rgba(5, 14, 19, 0.72);
+}
+
+.neural-axis-block.is-regime {
+  border-color: rgba(243, 191, 90, 0.38);
+  box-shadow: inset 3px 0 0 rgba(243, 191, 90, 0.55);
+}
+
+.neural-axis-block p {
+  display: grid;
+  grid-template-columns: 56px minmax(0, 1fr);
+  gap: 9px;
+  margin: 6px 0 0;
+  align-items: start;
+}
+
+.neural-axis-block b,
+.neural-axis-block em {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.neural-axis-block b {
+  color: #8aa1aa;
+  font: 700 10px/1.35 "IBM Plex Mono", "Cascadia Code", monospace;
+}
+
+.neural-axis-block em {
+  font: 700 11px/1.38 "IBM Plex Mono", "Cascadia Code", monospace;
+  font-style: normal;
+}
+
 .tone-healthy {
   color: #5ce4a6 !important;
 }
@@ -398,7 +442,7 @@
     linear-gradient(90deg, rgba(87, 184, 255, 0.15), rgba(87, 184, 255, 0.03)) !important;
 }
 
-.neural-direction-row.direction-mixed {
+.neural-direction-row.direction-regime {
   background:
     linear-gradient(90deg, rgba(234, 185, 93, 0.16), rgba(234, 185, 93, 0.03)) !important;
 }
@@ -1242,6 +1286,10 @@ i.health-diagnostic {
   }
 
   .neural-statusbar.is-compact-overview {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .neural-axis-split {
     grid-template-columns: minmax(0, 1fr);
   }
 
