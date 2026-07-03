@@ -400,6 +400,10 @@ function isMixedLikeRegime(regime: string | null | undefined): boolean {
   return label.includes("mixed") || label.includes("chop") || label.includes("range") || label.includes("rotation") || label.includes("sideways");
 }
 
+function isMixedRegimePaperOrder(order: PaperOrder): boolean {
+  return order.axisRegimeFamily === "MIXED" || isMixedLikeRegime(order.regime);
+}
+
 function cohortFromBreakdown(row: VariantBreakdownRow | undefined): NeuralLaneCohortStats | null {
   if (!row || row.n <= 0) return null;
   return {
@@ -690,7 +694,7 @@ export async function buildPaperUnrealizedSnapshot(
       diagByDir[dir].pnl += pnl;
       diagByDir[dir].r += r;
       diagByDir[dir].open += 1;
-      if (isMixedLikeRegime(order.regime)) {
+      if (isMixedRegimePaperOrder(order)) {
         diagByRegime.MIXED.pnl += pnl;
         diagByRegime.MIXED.r += r;
         diagByRegime.MIXED.open += 1;
@@ -1215,7 +1219,7 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
     };
   };
   const diagnosticMixedRegimeStats = (): DiagnosticDirectionStats => {
-    const diag = input.orders.filter((o) => isDiagnosticPaperOrder(o) && isMixedLikeRegime(o.regime));
+    const diag = input.orders.filter((o) => isDiagnosticPaperOrder(o) && isMixedRegimePaperOrder(o));
     const closed = diag.filter((o) => CLOSED.has(o.paperStatus));
     const open = diag.filter((o) => OPEN.has(o.paperStatus));
     const nets = closed.map((o) => o.netR).filter(finite);

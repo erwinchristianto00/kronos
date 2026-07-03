@@ -285,6 +285,11 @@ export interface PaperOrder {
   symbol: string;
   direction: "LONG" | "SHORT";
   regime: string | null;
+  /** Repair-only explicit axes. Direction and regime are separate dimensions. */
+  axisVersion?: 1;
+  axisDirection?: "LONG" | "SHORT";
+  axisRegimeFamily?: "BULLISH" | "BEARISH" | "MIXED" | "UNKNOWN";
+  axisKey?: string;
   controllerMode: string;
   controllerConfidence?: string | null;
   selectedLaneId: string;

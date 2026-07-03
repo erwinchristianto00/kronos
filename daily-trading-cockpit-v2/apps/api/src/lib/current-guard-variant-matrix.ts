@@ -603,6 +603,7 @@ export const BASELINE_VARIANT_ID: VariantMatrixVariantId = "CG_BASELINE_CURRENT"
 export type VariantPosture = "TACTICAL" | "EXTENDED";
 /** Direction the regime favors at signal time (independent of the trade's own direction). */
 export type VariantRegimeDirection = "LONG" | "SHORT" | "MIXED";
+export type AxisRegimeFamily = "BULLISH" | "BEARISH" | "MIXED" | "UNKNOWN";
 
 export interface VariantMatrixSignal {
   sourceSignalId: string;
@@ -634,6 +635,11 @@ export interface CurrentGuardVariantMatrixObservation {
   symbol: string;
   direction: Direction;
   regime: string | null;
+  /** Repair-only explicit axes. Direction and regime are separate dimensions. */
+  axisVersion?: 1;
+  axisDirection?: Direction;
+  axisRegimeFamily?: AxisRegimeFamily;
+  axisKey?: string;
   entryVariant: string | null;
   createdAt: string;
   openedAt: string;
@@ -2062,7 +2068,11 @@ function breakdownRows(
     .sort((a, b) => (a.netAvgR ?? 0) - (b.netAvgR ?? 0));
 }
 
-function regimeFamilyKey(regime: string | null | undefined): "BULLISH" | "BEARISH" | "MIXED" | "UNKNOWN" {
+function validAxisRegimeFamily(value: unknown): AxisRegimeFamily | null {
+  return value === "BULLISH" || value === "BEARISH" || value === "MIXED" || value === "UNKNOWN" ? value : null;
+}
+
+function regimeFamilyKey(regime: string | null | undefined): AxisRegimeFamily {
   const label = (regime ?? "").toLowerCase();
   if (label.includes("mixed") || label.includes("chop") || label.includes("range") || label.includes("rotation") || label.includes("sideways")) {
     return "MIXED";
@@ -2070,6 +2080,10 @@ function regimeFamilyKey(regime: string | null | undefined): "BULLISH" | "BEARIS
   if (label.includes("bull")) return "BULLISH";
   if (label.includes("bear")) return "BEARISH";
   return "UNKNOWN";
+}
+
+function observationRegimeFamilyKey(obs: CurrentGuardVariantMatrixObservation): AxisRegimeFamily {
+  return validAxisRegimeFamily(obs.axisRegimeFamily) ?? regimeFamilyKey(obs.regime);
 }
 
 function topSymbolPnlShare(slice: CurrentGuardVariantMatrixObservation[]): number | null {
@@ -2256,7 +2270,7 @@ function buildRow(
   const distinctRegimes = regimes.size;
   const byRegime = breakdownRows(fresh, (o) => o.regime ?? "UNKNOWN");
   const byDirection = breakdownRows(fresh, (o) => o.direction);
-  const byRegimeFamily = breakdownRows(fresh, (o) => regimeFamilyKey(o.regime));
+  const byRegimeFamily = breakdownRows(fresh, observationRegimeFamilyKey);
   const byEntryVariant = breakdownRows(fresh, (o) => o.entryVariant ?? "unknown");
   const bySymbol = breakdownRows(fresh, (o) => o.symbol);
 
