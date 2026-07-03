@@ -167,6 +167,7 @@ const EXPIRY_MS = 7 * 24 * 60 * 60 * 1000;
 const VM_MAX_EXPIRED_OBS = Number(process.env.VM_MAX_EXPIRED_OBS) || 500;
 /** Open observations older than this threshold are surfaced as "stale" in diagnostics. */
 const STALE_OPEN_WARN_MS = 72 * 60 * 60 * 1000; // 72 h
+const DEFAULT_MAX_HOLD_MS = STALE_OPEN_WARN_MS;
 const MFE_MAE_CAP_R = 20;
 
 // --- Anti-overfit gate thresholds (Part 5) ---
@@ -1253,6 +1254,7 @@ export interface VariantWalkInput {
   makerFillWindowCandles?: number;
   mfeGivebackArmR?: number;
   mfeGivebackFrac?: number;
+  forceCloseAtEnd?: boolean;
 }
 
 export interface VariantWalkResult {
@@ -1501,6 +1503,14 @@ export async function walkVariantPath(
     return finalize(status, grossR, candleCloseTime(lastCandle), "TRAIL_PATH_END", "VALID_5M_ORDERED", true);
   }
 
+  if (input.forceCloseAtEnd) {
+    const lastCandle = candles[candles.length - 1]!;
+    const lastClose = candleClose(lastCandle);
+    const grossR = dir === "LONG" ? (lastClose - E) / risk : (E - lastClose) / risk;
+    const status = grossR > 0 ? "CLOSED_WIN" : "CLOSED_LOSS";
+    return finalize(status, grossR, candleCloseTime(lastCandle), "MAX_HOLD_MTM", "VALID_5M_ORDERED", true);
+  }
+
   return empty;
 }
 
@@ -1607,8 +1617,16 @@ export async function resolveVariantMatrixObservations(
 
       // ── Candle fetch + path walk ─────
       try {
+        const variantDef = VARIANT_MATRIX_DEFINITIONS.find((def) => def.id === obs.variantId);
+        const maxHoldMs = Math.min(
+          (variantDef?.maxHoldHours ?? DEFAULT_MAX_HOLD_MS / (60 * 60 * 1000)) * 60 * 60 * 1000,
+          EXPIRY_MS - CANDLE_MS,
+        );
+        const maxHoldReached = nowMs - openedAtMs >= maxHoldMs;
         const closedAtMs = toMs(obs.resolvedAt) ?? null;
-        const endBound = Math.min((closedAtMs ?? nowMs) + twoHoursMs, nowMs + twoHoursMs);
+        const endBound = maxHoldReached
+          ? Math.min(openedAtMs + maxHoldMs, nowMs + twoHoursMs)
+          : Math.min((closedAtMs ?? nowMs) + twoHoursMs, nowMs + twoHoursMs);
         const startTime = openedAtMs - CANDLE_MS;
         const endTime = endBound;
         const cacheKey = `${obs.symbol}|${startTime}|${endTime}`;
@@ -1646,7 +1664,6 @@ export async function resolveVariantMatrixObservations(
           }
         };
 
-        const variantDef = VARIANT_MATRIX_DEFINITIONS.find((def) => def.id === obs.variantId);
         const walk = await walkVariantPath(
           {
             direction: obs.direction,
@@ -1660,6 +1677,7 @@ export async function resolveVariantMatrixObservations(
             ...(variantDef
               ? { mfeGivebackArmR: effectiveMfeGivebackArmR(variantDef, obs.stopDistanceBps || WIDE_STOP_MIN_BPS) }
               : {}),
+            forceCloseAtEnd: maxHoldReached,
           },
           resolve1m,
         );

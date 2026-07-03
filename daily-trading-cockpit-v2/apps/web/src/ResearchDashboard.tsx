@@ -24,9 +24,11 @@ type XSec = {
 };
 type LanePerf = { n: number; netAvgR: number; winRate: number; profitFactor: number | null };
 type RGL = {
-  totalObs: number; totalGatedOut: number;
+  totalObs: number; totalGateEligible?: number; totalGatedOut: number;
+  gateReasonCounts?: Array<{ reason: string; count: number }>;
   lanes: Array<{
-    variantId: string; raw: LanePerf; gated: LanePerf; filteredOut: number; deltaNetAvgR: number;
+    variantId: string; raw: LanePerf; gated: LanePerf; dropped?: LanePerf; gateEligible?: number; filteredOut: number; deltaNetAvgR: number;
+    gateReasonCounts?: Array<{ reason: string; count: number }>;
     verdict: 'IMPROVED' | 'WORSENED' | 'FLAT' | 'INSUFFICIENT';
   }>;
 };
@@ -209,8 +211,8 @@ export default function ResearchDashboard() {
         return (
           <Card
             title="Regime-gated lane comparison"
-            subtitle="every measured VM lane re-scored raw vs the live engine's regime gate (drop counter-regime trades) — does gating each lane improve it?"
-            right={rgl ? <>{rgl.totalObs} resolved obs · {rgl.totalGatedOut} gated-out</> : null}
+            subtitle="VM lanes re-scored with captured EXTENDED regime direction only; tactical/mixed/legacy rows are kept — does the stricter gate improve each lane?"
+            right={rgl ? <>{rgl.totalObs} resolved obs · {rgl.totalGateEligible ?? 0} gate-eligible · {rgl.totalGatedOut} gated-out</> : null}
           >
             {rgl ? (
               lanes.length ? (
@@ -236,7 +238,7 @@ export default function ResearchDashboard() {
                       </div>
                     ))}
                     <div style={{ fontSize: 11, color: C.dim, marginTop: 10 }}>
-                      Gate keeps a trade only if the regime estimated from its entry regime allows its direction; mixed/unknown regimes are kept.
+                      Gate drops only captured EXTENDED counter-regime rows. Tactical, mixed, unknown, and legacy rows are kept.
                       Δ = gated − raw net avg R. <span style={{ color: C.good }}>Positive Δ = gating would help.</span>
                     </div>
                   </div>

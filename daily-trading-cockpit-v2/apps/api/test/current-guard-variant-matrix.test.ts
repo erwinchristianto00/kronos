@@ -446,6 +446,26 @@ describe("current-guard-variant-matrix", () => {
     expect(result.resolutionSource).toBe("MFE_GIVEBACK_EXIT");
   });
 
+  it("[MAXHOLD-VM] marks unresolved paths to market when lane max-hold is reached", async () => {
+    const result = await walkVariantPath({
+      direction: "LONG",
+      entryPrice: 100,
+      stopLoss: 98,
+      target: 104,
+      exitRule: "tp1_full",
+      fillMode: "taker",
+      openedAtMs: SIGNAL_OPEN_MS,
+      candles: [
+        candle(SIGNAL_OPEN_MS, 101, 99, 100.5),
+        candle(SIGNAL_OPEN_MS + 300000, 101.5, 99.5, 101),
+      ],
+      forceCloseAtEnd: true,
+    });
+    expect(result.status).toBe("CLOSED_WIN");
+    expect(result.grossR).toBeCloseTo(0.5, 6);
+    expect(result.resolutionSource).toBe("MAX_HOLD_MTM");
+  });
+
   it("[MFEG5] CG_MFE_GIVEBACK uses FAR-TP geometry so the giveback can actually fire (not baseline)", () => {
     const def = defOf("CG_MFE_GIVEBACK");
     expect(def.exitRule).toBe("mfe_giveback");
@@ -687,6 +707,34 @@ describe("current-guard-variant-matrix", () => {
     const closed = store.all.filter((o) => o.status === "CLOSED_WIN" || o.status === "CLOSED_LOSS");
     expect(closed.length).toBeGreaterThanOrEqual(1);
     expect(closed.every((o) => o.openedAt === youngIso)).toBe(true);
+  });
+
+  it("[RESLV-MAXHOLD] closes >72h unresolved VM observations via MAX_HOLD_MTM instead of waiting for expiry", async () => {
+    const store = new CurrentGuardVariantMatrixStore(tmpDir());
+    const oldIso = new Date(Date.now() - 73 * 60 * 60 * 1000).toISOString();
+    mirrorVariantMatrixSignals([makeSignal({ sourceSignalId: "old-open", openedAt: oldIso })], store, oldIso);
+
+    const mock = {
+      getKlines: async (
+        _s: string,
+        interval: string,
+        o: { startTime: number; endTime: number; limit: number },
+      ): Promise<KlineTuple[]> => {
+        if (interval === "1m") return [];
+        const open = o.startTime + 300000;
+        return [
+          candle(o.startTime, 100.2, 99.8, 100),
+          candle(open, 101, 99, 100.5),
+          candle(open + 300000, 101.5, 99.5, 101),
+        ];
+      },
+    };
+
+    await resolveVariantMatrixObservations(store, mock, { maxObservations: 1 });
+    const baseline = store.all.find((o) => o.variantId === BASELINE_VARIANT_ID);
+    expect(baseline?.status).toBe("CLOSED_WIN");
+    expect(baseline?.resolutionSource).toBe("MAX_HOLD_MTM");
+    expect(baseline?.grossR).toBeCloseTo(0.5, 6);
   });
 
   // Bonus: selection filter (uses the documented ShadowPosition shape).

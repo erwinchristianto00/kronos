@@ -41,7 +41,7 @@ try {
 if (process.env.PAPER_AUTO_CYCLE !== "0") {
   const intervalMin = Math.max(1, Number(process.env.PAPER_AUTO_CYCLE_MINUTES ?? 7));
   const timeoutMs = Math.max(5_000, Number(process.env.PAPER_AUTO_CYCLE_TIMEOUT_MS ?? 45_000));
-  const url = `http://127.0.0.1:${port}/api/shadow/operator-brief?paper=1&resolve=1`;
+  const url = `http://127.0.0.1:${port}/api/shadow/operator-brief?paper=1&resolve=1&headless=1`;
   let paperCycleInFlight = false;
   const tick = (): void => {
     if (paperCycleInFlight) {

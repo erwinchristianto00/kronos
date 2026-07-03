@@ -740,6 +740,10 @@ export async function registerShadowRoutes(
         variantId: String(o.variantId),
         direction: o.direction,
         regime: o.regime,
+        posture: o.posture,
+        regimeDirection: o.regimeDirection,
+        entryVariant: o.entryVariant,
+        crowdingState: o.crowdingState,
         netR: o.netR,
       });
     }
@@ -1437,7 +1441,7 @@ export async function registerShadowRoutes(
   });
 
   // ── Compact operator brief (report-only read, no writes, no behavior changes) ──
-  app.get<{ Querystring: { era?: string; resolve?: string; paper?: string } }>("/api/shadow/operator-brief", async (request, reply) => {
+  app.get<{ Querystring: { era?: string; resolve?: string; paper?: string; headless?: string } }>("/api/shadow/operator-brief", async (request, reply) => {
     if (!shadowEngine) {
       void reply.code(503).type("text/plain");
       return "OPERATOR BRIEF UNAVAILABLE — shadow engine not enabled\n";
@@ -2219,6 +2223,37 @@ export async function registerShadowRoutes(
           } catch { /* reconciliation failure must never break the brief */ }
         } catch { /* paper=1 failure must never break the brief */ }
       }
+      if (request.query?.headless === "1") {
+        void reply.type("application/json");
+        return {
+          ok: true,
+          generatedAt,
+          mode: "headless-paper-cycle",
+          variantMatrixResolver: variantMatrixReport?.resolverDiagnostics ?? null,
+          paper: paperReport
+            ? {
+                total: paperReport.total,
+                open: paperReport.open,
+                closed: paperReport.closed,
+                win: paperReport.win,
+                loss: paperReport.loss,
+                totalRealizedPaperPnl: paperReport.totalRealizedPaperPnl,
+                diagnosticRealizedPaperPnl: paperReport.diagnosticRealizedPaperPnl,
+                activeLane: paperReport.activeLane,
+              }
+            : null,
+          allocator: allocatorReport
+            ? {
+                selected: allocatorReport.selectedOpportunities.length,
+                createdHeadline: allocatorReport.createdHeadline,
+                createdDiagnostic: allocatorReport.createdDiagnostic,
+                blocker: allocatorReport.blocker,
+              }
+            : null,
+          admissionTrace,
+        };
+      }
+
       const brief = buildOperatorBrief({
         generatedAt,
         era,

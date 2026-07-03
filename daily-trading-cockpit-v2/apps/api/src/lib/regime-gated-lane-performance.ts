@@ -15,7 +15,25 @@ export interface RgObservation {
   variantId: string;
   direction: "LONG" | "SHORT";
   regime: string | null;
+  posture?: "TACTICAL" | "EXTENDED" | null;
+  regimeDirection?: "LONG" | "SHORT" | "MIXED" | null;
+  entryVariant?: string | null;
+  crowdingState?: string | null;
   netR: number | null;
+}
+
+export type RegimeGateReason =
+  | "CAPTURED_EXTENDED_SAME_DIRECTION"
+  | "CAPTURED_EXTENDED_COUNTER_REGIME"
+  | "CAPTURED_TACTICAL_OR_MIXED_KEPT"
+  | "LEGACY_OR_UNKNOWN_CONTEXT_KEPT";
+
+export interface RegimeGateDecision {
+  allowed: boolean;
+  gateEligible: boolean;
+  reason: RegimeGateReason;
+  regimeDirection: "LONG" | "SHORT" | "MIXED" | null;
+  posture: "TACTICAL" | "EXTENDED" | null;
 }
 
 /**
@@ -34,9 +52,57 @@ export function estimateRegimeDirection(regime: string | null): "LONG" | "SHORT"
 }
 
 export function regimeAllowsObservation(obs: { regime: string | null; direction: "LONG" | "SHORT" }): boolean {
-  const dir = estimateRegimeDirection(obs.regime);
-  if (dir === null || dir === "MIXED") return true; // can't gate a mixed/unknown regime → keep
-  return dir === obs.direction; // keep only same-direction; drop counter-regime
+  return regimeGateDecision(obs).allowed;
+}
+
+function capturedRegimeDirection(value: unknown): "LONG" | "SHORT" | "MIXED" | null {
+  return value === "LONG" || value === "SHORT" || value === "MIXED" ? value : null;
+}
+
+function capturedPosture(value: unknown): "TACTICAL" | "EXTENDED" | null {
+  return value === "TACTICAL" || value === "EXTENDED" ? value : null;
+}
+
+export function regimeGateDecision(obs: {
+  regime?: string | null;
+  direction: "LONG" | "SHORT";
+  posture?: "TACTICAL" | "EXTENDED" | null;
+  regimeDirection?: "LONG" | "SHORT" | "MIXED" | null;
+}): RegimeGateDecision {
+  const capturedDir = capturedRegimeDirection(obs.regimeDirection);
+  const posture = capturedPosture(obs.posture);
+
+  // V2 gate is intentionally conservative: only captured EXTENDED directional regimes are gate-eligible.
+  // Legacy rows without captured controller context are kept, so a regex over a display label cannot
+  // silently remove trades from the measurement.
+  if (capturedDir === null || posture === null) {
+    return {
+      allowed: true,
+      gateEligible: false,
+      reason: "LEGACY_OR_UNKNOWN_CONTEXT_KEPT",
+      regimeDirection: capturedDir,
+      posture,
+    };
+  }
+
+  if (posture !== "EXTENDED" || capturedDir === "MIXED") {
+    return {
+      allowed: true,
+      gateEligible: false,
+      reason: "CAPTURED_TACTICAL_OR_MIXED_KEPT",
+      regimeDirection: capturedDir,
+      posture,
+    };
+  }
+
+  const allowed = capturedDir === obs.direction;
+  return {
+    allowed,
+    gateEligible: true,
+    reason: allowed ? "CAPTURED_EXTENDED_SAME_DIRECTION" : "CAPTURED_EXTENDED_COUNTER_REGIME",
+    regimeDirection: capturedDir,
+    posture,
+  };
 }
 
 export interface LanePerf {
@@ -69,14 +135,19 @@ export interface RegimeGatedLaneRow {
   variantId: string;
   raw: LanePerf;
   gated: LanePerf;
+  dropped: LanePerf;
+  gateEligible: number;
   filteredOut: number; // counter-regime obs the gate removed
   deltaNetAvgR: number; // gated − raw
+  gateReasonCounts: Array<{ reason: RegimeGateReason; count: number }>;
   verdict: "IMPROVED" | "WORSENED" | "FLAT" | "INSUFFICIENT";
 }
 
 export interface RegimeGatedLaneReport {
   totalObs: number;
+  totalGateEligible: number;
   totalGatedOut: number;
+  gateReasonCounts: Array<{ reason: RegimeGateReason; count: number }>;
   lanes: RegimeGatedLaneRow[];
 }
 
@@ -92,19 +163,46 @@ export function buildRegimeGatedLaneReport(observations: RgObservation[]): Regim
     if (list) list.push(o);
     else byLane.set(o.variantId, [o]);
   }
+  let totalGateEligible = 0;
   let totalGatedOut = 0;
+  const totalReasons = new Map<RegimeGateReason, number>();
   const lanes: RegimeGatedLaneRow[] = [];
   for (const [variantId, list] of byLane) {
     const raw = perf(list.map((o) => o.netR!));
-    const gatedList = list.filter((o) => regimeAllowsObservation(o));
+    const reasons = new Map<RegimeGateReason, number>();
+    const decisions = list.map((o) => ({ obs: o, decision: regimeGateDecision(o) }));
+    for (const { decision } of decisions) {
+      reasons.set(decision.reason, (reasons.get(decision.reason) ?? 0) + 1);
+      totalReasons.set(decision.reason, (totalReasons.get(decision.reason) ?? 0) + 1);
+      if (decision.gateEligible) totalGateEligible += 1;
+    }
+    const gatedList = decisions.filter(({ decision }) => decision.allowed).map(({ obs }) => obs);
+    const droppedList = decisions.filter(({ decision }) => !decision.allowed).map(({ obs }) => obs);
     const gated = perf(gatedList.map((o) => o.netR!));
+    const dropped = perf(droppedList.map((o) => o.netR!));
     const filteredOut = raw.n - gated.n;
     totalGatedOut += filteredOut;
     const delta = gated.netAvgR - raw.netAvgR;
     const verdict: RegimeGatedLaneRow["verdict"] =
       gated.n < MIN_GATED_N ? "INSUFFICIENT" : delta > 0.01 ? "IMPROVED" : delta < -0.01 ? "WORSENED" : "FLAT";
-    lanes.push({ variantId, raw, gated, filteredOut, deltaNetAvgR: delta, verdict });
+    lanes.push({
+      variantId,
+      raw,
+      gated,
+      dropped,
+      gateEligible: decisions.filter(({ decision }) => decision.gateEligible).length,
+      filteredOut,
+      deltaNetAvgR: delta,
+      gateReasonCounts: [...reasons.entries()].map(([reason, count]) => ({ reason, count })),
+      verdict,
+    });
   }
   lanes.sort((a, b) => b.raw.n - a.raw.n);
-  return { totalObs: resolved.length, totalGatedOut, lanes };
+  return {
+    totalObs: resolved.length,
+    totalGateEligible,
+    totalGatedOut,
+    gateReasonCounts: [...totalReasons.entries()].map(([reason, count]) => ({ reason, count })),
+    lanes,
+  };
 }

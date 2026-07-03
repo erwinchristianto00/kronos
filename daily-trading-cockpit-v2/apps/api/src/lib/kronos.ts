@@ -11,6 +11,9 @@ const MAX_RECENT_ATTEMPTS = 20;
 // Serialising requests (concurrency=1) eliminates the race until the sidecar is patched.
 const KRONOS_CONCURRENCY = 1;
 const FORECAST_CACHE_TTL_MS = 10 * 60 * 1000;
+const LAST_FORECAST_HEALTH_TTL_MS = Number.isFinite(Number(process.env.KRONOS_LAST_FORECAST_HEALTH_TTL_MS))
+  ? Math.max(60_000, Number(process.env.KRONOS_LAST_FORECAST_HEALTH_TTL_MS))
+  : 30 * 60 * 1000;
 
 // Transient failure codes where a stale cached forecast is acceptable as fallback.
 const TRANSIENT_FAILURE_CODES = new Set<KronosAvailabilityReasonCode>(["TIMEOUT", "MODEL_BUSY", "PREDICTION_FAILED"]);
@@ -539,6 +542,8 @@ export class HttpKronosClient implements KronosClient {
   private readonly semaphore = new Semaphore(KRONOS_CONCURRENCY);
   private readonly forecastCache = new Map<string, CachedForecast>();
   private readonly inFlightPredictions = new Map<string, Promise<KronosDebugPrediction>>();
+  private lastSuccessfulForecastAt: number | null = null;
+  private lastForecastCacheHitAt: number | null = null;
 
   constructor(
     private readonly baseUrl: string | undefined,
@@ -556,6 +561,9 @@ export class HttpKronosClient implements KronosClient {
 
   private recordAttempt(prediction: KronosDebugPrediction): void {
     const now = Date.now();
+    if (prediction.available && !(prediction.degradedSampling ?? false)) {
+      this.lastSuccessfulForecastAt = now;
+    }
     this.recentAttempts.push({
       succeeded: prediction.available,
       code: prediction.available ? null : prediction.availabilityReasonCode ?? "PREDICTION_FAILED",
@@ -594,8 +602,25 @@ export class HttpKronosClient implements KronosClient {
       state = "OFFLINE";
       message = base.message;
     } else if (stats.attempted === 0) {
-      state = "REACHABLE";
-      message = "Kronos reachable; no recent forecast sample yet.";
+      const now = Date.now();
+      const lastSuccessAgeMs =
+        this.lastSuccessfulForecastAt !== null ? now - this.lastSuccessfulForecastAt : null;
+      const lastCacheHitAgeMs =
+        this.lastForecastCacheHitAt !== null ? now - this.lastForecastCacheHitAt : null;
+      const recentRealForecast = lastSuccessAgeMs !== null && lastSuccessAgeMs <= LAST_FORECAST_HEALTH_TTL_MS;
+      const recentCachedForecast = lastCacheHitAgeMs !== null && lastCacheHitAgeMs <= LAST_FORECAST_HEALTH_TTL_MS;
+      if (recentRealForecast || recentCachedForecast) {
+        state = "FORECAST_HEALTHY";
+        available = true;
+        forecastHealthy = true;
+        const ageSec = Math.round(((recentRealForecast ? lastSuccessAgeMs : lastCacheHitAgeMs) ?? 0) / 1000);
+        message = recentRealForecast
+          ? `Kronos active; last successful forecast ${ageSec}s ago.`
+          : `Kronos active from forecast cache; last cache hit ${ageSec}s ago.`;
+      } else {
+        state = "REACHABLE";
+        message = "Kronos reachable; no recent forecast sample yet.";
+      }
     } else {
       // Health = model behavior on calls where the input was valid. Scanner-side
       // input issues (INVALID_INPUT, NOT_ENOUGH_CANDLES — e.g. new listings,
@@ -920,6 +945,7 @@ export class HttpKronosClient implements KronosClient {
     }
 
     if (cached && cached.expiresAt > now) {
+      this.lastForecastCacheHitAt = now;
       return cached.prediction;
     }
 

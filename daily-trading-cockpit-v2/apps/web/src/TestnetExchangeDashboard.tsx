@@ -5,7 +5,9 @@ const REFRESH_MS = 5_000;
 const TESTNET_API_PREFIX = '/testnet/api';
 // The REAL-MONEY mainnet engine, proxied by Caddy (/live/api/* → 127.0.0.1:3103).
 const LIVE_API_PREFIX = '/live/api';
-// Lanes that actually flow through the live mirror — options for the allocation control.
+// Static fallback for lanes that actually flow through the live mirror. The control also
+// appends current headline/watchable lane ids from main `/` so newly promoted lanes appear
+// in testnet/live without another frontend deploy.
 const LIVE_LANE_OPTIONS = [
   'CG_WIDE_FAST_SHORT',
   'CG_WIDE_FAST_LONG',
@@ -238,6 +240,18 @@ interface LanePerformanceSeries {
   }>;
 }
 
+interface MainNeuralLane {
+  id?: string;
+  laneId?: string;
+  label?: string;
+  status?: string;
+  health?: string;
+}
+
+interface MainNeuralMap {
+  lanes?: MainNeuralLane[];
+}
+
 function signed(value: number | null | undefined, suffix = 'USDT'): string {
   if (value == null || !Number.isFinite(value)) return 'n/a';
   return `${value >= 0 ? '+' : ''}${value.toFixed(2)} ${suffix}`;
@@ -276,6 +290,38 @@ function timeAgo(iso: string | null | undefined): string {
 
 function compactLane(laneId: string): string {
   return laneId.replace(/^CG_VARIANT_MATRIX:/, '').replace(/^CG_LONG_VARIANT_MATRIX:/, '');
+}
+
+function allocationLaneValue(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  const compact = compactLane(raw.trim());
+  if (!compact) return null;
+  if (compact === 'MIXED_DIAG_REGIME') return null;
+  return compact;
+}
+
+function isHeadlineAllocationLane(lane: MainNeuralLane): boolean {
+  const id = allocationLaneValue(lane.id ?? lane.laneId ?? lane.label);
+  if (!id) return false;
+  if (id === 'H6_TREND_LONG') return false;
+  const status = (lane.status ?? '').toUpperCase();
+  const health = (lane.health ?? '').toUpperCase();
+  if (status.includes('QUARANTIN') || health.includes('QUARANTIN')) return false;
+  if (status.includes('REJECT')) return false;
+  return (
+    status.includes('HEADLINE') ||
+    status.includes('WATCHABLE') ||
+    status.includes('STABLE_CANDIDATE') ||
+    status.includes('PROMOTION_CANDIDATE')
+  );
+}
+
+function extractHeadlineAllocationLanes(payload: MainNeuralMap): string[] {
+  const dynamic = (payload.lanes ?? [])
+    .filter(isHeadlineAllocationLane)
+    .map((lane) => allocationLaneValue(lane.id ?? lane.laneId ?? lane.label))
+    .filter((lane): lane is string => Boolean(lane));
+  return Array.from(new Set(dynamic)).sort();
 }
 
 function formatWinRate(value: number | null | undefined): string {
@@ -464,6 +510,10 @@ export default function TestnetExchangeDashboard() {
   const [allocWeight1, setAllocWeight1] = useState('70');
   const [allocWeight2, setAllocWeight2] = useState('30');
   const [regimeReport, setRegimeReport] = useState<RegimeEngineReport | null>(null);
+  const [headlineLaneOptions, setHeadlineLaneOptions] = useState<string[]>([]);
+  const laneAllocationOptions = Array.from(new Set(
+    [...LIVE_LANE_OPTIONS, ...headlineLaneOptions, allocLane1, allocLane2].filter(Boolean),
+  ));
 
   function applyRegimePreset(preset: { lane1: string; w1: string; lane2: string; w2: string }) {
     setAllocLane1(preset.lane1);
@@ -515,6 +565,15 @@ export default function TestnetExchangeDashboard() {
   };
   const clearAllocation = () =>
     control(`${pageApiPrefix}/live/lane-allocations`, { allocations: null }, `Clear ${allocationLabel}`, loadExchangeOnly);
+
+  async function loadHeadlineLaneOptions() {
+    try {
+      const payload = await fetchJson<MainNeuralMap>('/api/shadow/neural-map');
+      setHeadlineLaneOptions(extractHeadlineAllocationLanes(payload));
+    } catch {
+      // Main `/` can be auth/proxy-unavailable during local dev; keep static fallback options.
+    }
+  }
 
   async function copyToLive(paperOrderId: string) {
     if (copyBusy) return;
@@ -579,6 +638,14 @@ export default function TestnetExchangeDashboard() {
   useEffect(() => {
     void loadExchangeOnly();
   }, [performanceView, performanceDay, performanceMonth, performanceYear, performanceRegime]);
+
+  useEffect(() => {
+    void loadHeadlineLaneOptions();
+    const timer = window.setInterval(() => {
+      void loadHeadlineLaneOptions();
+    }, 30_000);
+    return () => window.clearInterval(timer);
+  }, []);
 
   useEffect(() => {
     if (!autoRefresh) return undefined;
@@ -683,13 +750,13 @@ export default function TestnetExchangeDashboard() {
                 : status?.laneSelection?.mode ?? 'n/a'}
             </small>
             <select value={allocLane1} onChange={(e) => setAllocLane1(e.target.value)}>
-              {LIVE_LANE_OPTIONS.map((lane) => <option key={lane} value={lane}>{lane}</option>)}
+              {laneAllocationOptions.map((lane) => <option key={lane} value={lane}>{lane}</option>)}
             </select>{' '}
             <input type="number" min={1} max={100} value={allocWeight1} onChange={(e) => setAllocWeight1(e.target.value)} style={{ width: 56 }} />%
             {' + '}
             <select value={allocLane2} onChange={(e) => setAllocLane2(e.target.value)}>
               <option value="">(none)</option>
-              {LIVE_LANE_OPTIONS.map((lane) => <option key={lane} value={lane}>{lane}</option>)}
+              {laneAllocationOptions.map((lane) => <option key={lane} value={lane}>{lane}</option>)}
             </select>{' '}
             <input type="number" min={0} max={100} value={allocWeight2} onChange={(e) => setAllocWeight2(e.target.value)} style={{ width: 56 }} />%
             {' '}
