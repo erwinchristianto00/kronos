@@ -45,7 +45,13 @@ export const REALTIME_SHORT_SELECTED_LANE_ID = `CG_VARIANT_MATRIX:${REALTIME_SHO
 const LONG_WIDE_VARIANT_ID = "CG_WIDE_FAST_LONG"; // LONG lane (operator 2026-06-29): fast 0.5R bank, fires only in WIDE_TREND bull
 const MIXED_SYMBOL_BLOCKLIST = new Set(["NEARUSDT"]);
 const DEFAULT_MAX_PER_CYCLE = 3;
-const MANUAL_ONLY_LIVE_MIRROR_VARIANT_IDS = new Set<string>(["CG_EXP_SHORT_MFE_GIVEBACK_10X"]);
+const MANUAL_ONLY_LIVE_MIRROR_VARIANT_IDS = new Set<string>([
+  "CG_EXP_LONG_WIDE_FAST_10X",
+  "CG_EXP_LONG_TIGHT_FAST_10X",
+  "CG_EXP_LONG_MFE_GIVEBACK_10X",
+  "CG_EXP_SHORT_MFE_GIVEBACK_10X",
+  "CG_EXP_SHORT_WIDE_FAST_10X",
+]);
 // Short lanes the operator force-enables BEFORE they naturally reach STABLE_CANDIDATE — lifted to
 // STABLE here + allowed through the app.ts eligibility gate. 2026-06-29: CG_WIDE_FAST_SHORT only
 // (WATCHABLE, +0.110R — clearly the most deserving); CG_WIDE_STOP_TP_WIDE stays gated until STABLE.

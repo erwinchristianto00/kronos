@@ -313,6 +313,7 @@ describe("realtime-short-mirror — fresh short live-mirror source (mode 2)", ()
     expect(REALTIME_SHORT_ALLOWED_VARIANT_IDS).toContain("CG_WIDE_STOP_TP_WIDE");
     expect(REALTIME_SHORT_ALLOWED_VARIANT_IDS).toContain("CG_MFE_GIVEBACK");
     expect(REALTIME_SHORT_ALLOWED_VARIANT_IDS).toContain("CG_TIGHT_FAST_05");
+    expect(REALTIME_SHORT_ALLOWED_VARIANT_IDS).not.toContain("CG_EXP_LONG_MFE_GIVEBACK_10X");
     expect(REALTIME_SHORT_ALLOWED_VARIANT_IDS).not.toContain("CG_EXP_SHORT_MFE_GIVEBACK_10X");
     expect(REALTIME_SHORT_ALLOWED_VARIANT_IDS).not.toContain("CG_MAKER_LIMIT_SIM");
   });
