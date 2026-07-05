@@ -122,7 +122,8 @@ describe("neural map telemetry", () => {
       headlinePnlPct: 0,
       startingEquity: 2000,
     });
-    expect(result.lanes[0]?.label).toBe("CG_WIDE SHORT");
+    const wideLane = result.lanes.find((lane) => lane.id === "CG_VARIANT_MATRIX:CG_WIDE_STOP_TP_WIDE");
+    expect(wideLane?.label).toBe("CG_WIDE STOP/TP");
     expect(result.nodes.find((node) => node.id === "live-lock")?.metric).toBe("LIVE BLOCKED");
     expect(result.nodes.find((node) => node.id === "live-lock")).toMatchObject({
       diagnosisCategory: "BLOCKING_CONDITION",
@@ -644,8 +645,9 @@ describe("neural map telemetry", () => {
     const result = buildNeuralMapTelemetry(input);
     // A diagnostic-only loss is NEUTRAL: the lane is classified DIAGNOSTIC (own color in the
     // map) and raises NO alert — it is reject-sampler measurement, not a real failure/warning.
-    expect(result.alerts.some((alert) => alert.source === "CG_TRAIL SHORT")).toBe(false);
-    const trailLane = result.lanes.find((lane) => lane.label === "CG_TRAIL SHORT");
+    expect(result.alerts.some((alert) => alert.source === "CG_TRAIL AFTER TP1")).toBe(false);
+    const trailLane = result.lanes.find((lane) => lane.id === "CG_VARIANT_MATRIX:CG_TRAIL_AFTER_TP1");
+    expect(trailLane?.label).toBe("CG_TRAIL AFTER TP1");
     expect(trailLane?.health).toBe("DIAGNOSTIC");
     expect(trailLane?.pnlIsDiagnosticOnly).toBe(true);
   });
