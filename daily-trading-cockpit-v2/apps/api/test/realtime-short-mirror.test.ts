@@ -99,6 +99,55 @@ describe("realtime-short-mirror — fresh short live-mirror source (mode 2)", ()
     expect(store.all[0]!.selectedLaneId).toBe(realtimeShortSelectedLaneId("CG_WIDE_FAST_SHORT"));
   });
 
+  it("[ROTATION-SHORTLIST] can emit a non-stable lane only for an allowed bearish symbol", () => {
+    const store = freshStore();
+    const res = runRealtimeShortMirror(
+      inputs([shortCand("INJUSDT")], {
+        stableShortLaneActive: false,
+        stableShortLanes: [
+          {
+            variantId: "CG_WIDE_STOP_TP_WIDE",
+            status: "REJECT",
+            freshValid: 50,
+            netAvgR: -0.2,
+            pf: 0.7,
+            byAxisSymbol: [{ key: "SHORT_BEARISH|INJUSDT", n: 18, netAvgR: 0.22 }],
+          },
+        ],
+        rotationShortlist: {
+          generatedAt: "2026-07-05T04:00:00.000Z",
+          minAllowSample: 10,
+          minWatchSample: 5,
+          bearishGlobal: [],
+          bullishGlobal: [],
+          lanes: [
+            {
+              laneId: realtimeShortSelectedLaneId("CG_WIDE_STOP_TP_WIDE"),
+              variantId: "CG_WIDE_STOP_TP_WIDE",
+              label: "Wide",
+              bullish: [],
+              bearish: [
+                {
+                  symbol: "INJUSDT",
+                  n: 18,
+                  netAvgR: 0.22,
+                  pf: 2.1,
+                  wr: 0.78,
+                  score: 30,
+                  verdict: "ALLOW",
+                  reason: "test allow",
+                },
+              ],
+            },
+          ],
+        },
+      }),
+      store,
+    );
+    expect(res.emitted).toBe(1);
+    expect(store.all[0]!.selectedLaneId).toBe(realtimeShortSelectedLaneId("CG_WIDE_STOP_TP_WIDE"));
+  });
+
   it("[DIRECTION-GATE] emits candidates only when controller allows their direction", () => {
     const store = freshStore();
     const res = runRealtimeShortMirror(

@@ -40,6 +40,7 @@ import {
 } from "../lib/realtime-short-mirror.js";
 import { fetchCrowdingSnapshot } from "../lib/derivatives-crowding.js";
 import { estimateLaneSelectorV2Regime } from "../lib/lane-selector-v2.js";
+import { buildRegimeRotationShortlistReport } from "../lib/regime-rotation-shortlist.js";
 import {
   RegimeControllerAlignedShadowStore,
   admitToControllerAlignedShadow,
@@ -381,6 +382,9 @@ export async function registerScanRoute(
       timing.startStage("realtimeShortMirror");
       try {
         const vmReport = buildCurrentGuardVariantMatrixReport(getCurrentGuardVariantMatrixStore());
+        const rotationShortlist = buildRegimeRotationShortlistReport(vmReport, {
+          generatedAt: new Date().toISOString(),
+        });
         const stableShortLanes = vmReport.rows
           .filter((r) => isRealtimeShortAllowedVariantId(r.variantId))
           .map((r) => ({
@@ -399,6 +403,7 @@ export async function registerScanRoute(
             byRegime: r.byRegime,
             byDirection: r.byDirection,
             byRegimeFamily: r.byRegimeFamily,
+            byAxisSymbol: r.byAxisSymbol,
             bySymbol: r.bySymbol,
           }));
         // Smart direction gate (2026-07-01): hard-veto a direction whose realized, honestly-accounted
@@ -454,6 +459,7 @@ export async function registerScanRoute(
           forceFastShort: process.env.REALTIME_SHORT_FORCE_FAST_SHORT === "1",
           crowdingVetoEnabled,
           crowdingBySymbol,
+          rotationShortlist,
           now: new Date().toISOString(),
         });
       } catch {

@@ -6,6 +6,12 @@ import {
   type VariantMatrixVariantDefinition,
   type VariantMatrixVariantId,
 } from "./current-guard-variant-matrix.js";
+import {
+  rotationLaneIdForVariant,
+  rotationRegimeFamilyForLabel,
+  rotationShortlistDecision,
+  type RegimeRotationShortlistReport,
+} from "./regime-rotation-shortlist.js";
 
 type Direction = "LONG" | "SHORT";
 
@@ -31,6 +37,7 @@ export interface LaneSelectorV2LaneState {
   byRegime?: LaneSelectorV2BreakdownRow[] | null;
   byDirection?: LaneSelectorV2BreakdownRow[] | null;
   byRegimeFamily?: LaneSelectorV2BreakdownRow[] | null;
+  byAxisSymbol?: LaneSelectorV2BreakdownRow[] | null;
   bySymbol?: LaneSelectorV2BreakdownRow[] | null;
 }
 
@@ -90,6 +97,7 @@ export interface LaneSelectorV2Inputs {
   controllerMode: string | null;
   controllerConfidence?: string | null;
   estimatedRegime?: LaneSelectorV2EstimatedRegime | null;
+  rotationShortlist?: RegimeRotationShortlistReport | null;
   now: string;
   maxStopDistanceBps?: number;
 }
@@ -148,7 +156,7 @@ const LANE_CONFIGS = new Map<VariantMatrixVariantId, LaneSelectorV2LaneConfig>(
     def.id,
     {
       variantId: def.id,
-      selectedLaneId: `CG_VARIANT_MATRIX:${def.id}`,
+      selectedLaneId: rotationLaneIdForVariant(def.id),
       exitRule: def.exitRule,
       definition: def,
     },
@@ -205,10 +213,15 @@ function scoreLane(
   const globalNet = numeric(state.netAvgR);
   const regimeNet = matchedCohortNet(state.byRegime, regime ?? "", MIN_REGIME_SAMPLE);
   const symbolNet = matchedCohortNet(state.bySymbol, candidate.symbol, MIN_SYMBOL_SAMPLE);
+  const axisSymbolNet = matchedCohortNet(
+    state.byAxisSymbol,
+    `${candidate.direction}_${rotationRegimeFamilyForLabel(regime)}|${candidate.symbol}`,
+    MIN_SYMBOL_SAMPLE,
+  );
 
   const globalEdge = globalNet * (0.65 + confidence * 0.35);
   const regimeEdge = (regimeNet ?? 0) * 0.45;
-  const symbolEdge = (symbolNet ?? 0) * 0.65;
+  const symbolEdge = (axisSymbolNet ?? symbolNet ?? 0) * 0.65;
   const pfQuality = clamp((numeric(state.pf, 1) - 1) * 0.08, -0.08, 0.22);
   const wrQuality = clamp((numeric(state.wr, 0.5) - 0.5) * 0.10, -0.05, 0.08);
   const payoffQuality = clamp((numeric(state.payoffRatio, 0.5) - 0.5) * 0.05, -0.04, 0.12);
@@ -309,7 +322,9 @@ export function estimateLaneSelectorV2Regime(input: {
 function policyPreferredVariants(
   inputs: LaneSelectorV2Inputs,
   estimated: LaneSelectorV2EstimatedRegime,
+  shortlistEligibleVariantIds: Set<VariantMatrixVariantId>,
 ): VariantMatrixVariantId[] {
+  if (shortlistEligibleVariantIds.size > 0) return [];
   if (
     estimated.policy === "WIDE_TREND" &&
     estimated.direction === "LONG" &&
@@ -339,6 +354,39 @@ function policyBlockReason(inputs: LaneSelectorV2Inputs, estimated: LaneSelector
   return null;
 }
 
+function rotationShortlistAllowsState(
+  inputs: LaneSelectorV2Inputs,
+  state: LaneSelectorV2LaneState,
+  estimated: LaneSelectorV2EstimatedRegime,
+): boolean {
+  const regimeFamily =
+    estimated.direction === "LONG"
+      ? "BULLISH"
+      : estimated.direction === "SHORT"
+        ? "BEARISH"
+        : rotationRegimeFamilyForLabel(inputs.regime);
+  return rotationShortlistDecision(inputs.rotationShortlist, {
+    variantId: state.variantId,
+    laneId: laneSelectorV2LaneId(state.variantId as VariantMatrixVariantId),
+    symbol: inputs.candidate.symbol,
+    direction: inputs.candidate.direction,
+    regimeFamily,
+  }).allowed;
+}
+
+function rotationShortlistGateActive(
+  inputs: LaneSelectorV2Inputs,
+  estimated: LaneSelectorV2EstimatedRegime,
+): boolean {
+  if (!inputs.rotationShortlist) return false;
+  return (
+    (inputs.candidate.direction === "LONG" && estimated.direction === "LONG") ||
+    (inputs.candidate.direction === "SHORT" && estimated.direction === "SHORT") ||
+    (inputs.candidate.direction === "LONG" && rotationRegimeFamilyForLabel(inputs.regime) === "BULLISH") ||
+    (inputs.candidate.direction === "SHORT" && rotationRegimeFamilyForLabel(inputs.regime) === "BEARISH")
+  );
+}
+
 export function selectLaneV2(inputs: LaneSelectorV2Inputs): LaneSelectorV2Result {
   const rejected: string[] = [];
   const evaluated: LaneSelectorV2Result["evaluated"] = [];
@@ -351,6 +399,7 @@ export function selectLaneV2(inputs: LaneSelectorV2Inputs): LaneSelectorV2Result
   const signal = buildSignal(candidate, inputs.regime, inputs.now);
   let best: LaneSelectorV2Geometry | null = null;
   const byVariant = new Map<VariantMatrixVariantId, LaneSelectorV2Geometry>();
+  const shortlistEligibleVariantIds = new Set<VariantMatrixVariantId>();
   const estimated = inputs.estimatedRegime ?? estimateLaneSelectorV2Regime({
     regime: inputs.regime,
     controllerMode: inputs.controllerMode,
@@ -360,17 +409,24 @@ export function selectLaneV2(inputs: LaneSelectorV2Inputs): LaneSelectorV2Result
   if (blockReason) {
     return { selected: null, rejected: [blockReason], evaluated };
   }
+  const shortlistGateActive = rotationShortlistGateActive(inputs, estimated);
 
   for (const state of inputs.laneStates) {
+    const shortlistAllowed = isLaneSelectorV2SupportedVariantId(state.variantId) &&
+      rotationShortlistAllowsState(inputs, state, estimated);
     const statusAllowed =
-      state.status === "STABLE_CANDIDATE" ||
-      isLaneSelectorV2LongWideStopOverride({
-        variantId: state.variantId,
-        direction: candidate.direction,
-        estimatedRegime: estimated,
-      });
+      shortlistGateActive
+        ? shortlistAllowed
+        : state.status === "STABLE_CANDIDATE" ||
+          isLaneSelectorV2LongWideStopOverride({
+            variantId: state.variantId,
+            direction: candidate.direction,
+            estimatedRegime: estimated,
+          });
     if (!statusAllowed) {
-      rejected.push(`${state.variantId}:status_${state.status ?? "unknown"}`);
+      rejected.push(shortlistGateActive
+        ? `${state.variantId}:rotation_shortlist_blocked`
+        : `${state.variantId}:status_${state.status ?? "unknown"}`);
       continue;
     }
     if (!isLaneSelectorV2SupportedVariantId(state.variantId)) {
@@ -382,6 +438,7 @@ export function selectLaneV2(inputs: LaneSelectorV2Inputs): LaneSelectorV2Result
       rejected.push(`${state.variantId}:direction_${candidate.direction}_unsupported`);
       continue;
     }
+    if (shortlistAllowed) shortlistEligibleVariantIds.add(config.variantId);
     const geometry = deriveVariantGeometry(signal, config.definition);
     if (geometry.kind !== "ok") {
       rejected.push(`${state.variantId}:geometry_${geometry.kind}`);
@@ -418,7 +475,7 @@ export function selectLaneV2(inputs: LaneSelectorV2Inputs): LaneSelectorV2Result
   }
 
   evaluated.sort((left, right) => right.score - left.score);
-  const preferredVariants = policyPreferredVariants(inputs, estimated);
+  const preferredVariants = policyPreferredVariants(inputs, estimated, shortlistEligibleVariantIds);
   for (const variantId of preferredVariants) {
     const policyPick = byVariant.get(variantId);
     if (policyPick) return { selected: policyPick, rejected, evaluated };

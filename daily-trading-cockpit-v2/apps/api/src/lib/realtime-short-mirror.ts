@@ -38,6 +38,7 @@ import {
   type LaneSelectorV2LaneState,
 } from "./lane-selector-v2.js";
 import type { VariantMatrixVariantId } from "./current-guard-variant-matrix.js";
+import type { RegimeRotationShortlistReport } from "./regime-rotation-shortlist.js";
 
 export const REALTIME_SHORT_LANE_VARIANT_ID = "CG_WIDE_FAST_SHORT";
 export const REALTIME_SHORT_SELECTED_LANE_ID = `CG_VARIANT_MATRIX:${REALTIME_SHORT_LANE_VARIANT_ID}`;
@@ -113,6 +114,8 @@ export interface RealtimeShortMirrorInputs {
   crowdingVetoEnabled?: boolean;
   /** Per-symbol crowd state at signal time (caller fetches); used by the crowding veto. */
   crowdingBySymbol?: Record<string, { crowdSide: string; crowdingLevel: string }>;
+  /** Symbol-specific bullish/bearish rotation allowlist derived from the main VM report. */
+  rotationShortlist?: RegimeRotationShortlistReport | null;
   /** ISO timestamp — injected for determinism/testability. */
   now: string;
   maxPerCycle?: number;
@@ -210,10 +213,8 @@ export function runRealtimeShortMirror(
   });
   const laneStates = effectiveLaneStates(inputs, estimatedRegime);
 
-  // Only exact STABLE_CANDIDATE rows can emit into /testnet. WATCHABLE/COLLECTING/REJECT
-  // (or any future "headline active" downgrade label) stops being live-eligible immediately.
   const hasAnyStableLane = laneStates.some((state) => state.status === "STABLE_CANDIDATE" && isRealtimeShortAllowedVariantId(state.variantId));
-  if (!hasAnyStableLane) {
+  if (!hasAnyStableLane && !inputs.rotationShortlist) {
     result.reasons.push("stable_lane_inactive");
     return result;
   }
@@ -266,6 +267,7 @@ export function runRealtimeShortMirror(
       controllerMode: inputs.controllerMode,
       controllerConfidence: inputs.controllerConfidence,
       estimatedRegime,
+      rotationShortlist: inputs.rotationShortlist,
       now: inputs.now,
     });
     if (!selected.selected) {

@@ -7,6 +7,121 @@ import {
 } from "../src/lib/lane-selector-v2.js";
 
 describe("LaneSelectorV2", () => {
+  it("allows a non-stable lane only when the bearish rotation shortlist proves that exact symbol", () => {
+    const result = selectLaneV2({
+      candidate: {
+        symbol: "INJUSDT",
+        direction: "SHORT",
+        currentPrice: 100,
+        stopLoss: 104,
+        takeProfitLevels: [94],
+        stopDistanceBps: 400,
+      },
+      regime: "Bearish pressure",
+      controllerMode: "SHORT_ONLY",
+      controllerConfidence: "MEDIUM",
+      now: "2026-07-05T04:00:00.000Z",
+      rotationShortlist: {
+        generatedAt: "2026-07-05T04:00:00.000Z",
+        minAllowSample: 10,
+        minWatchSample: 5,
+        bearishGlobal: [],
+        bullishGlobal: [],
+        lanes: [
+          {
+            laneId: laneSelectorV2LaneId("CG_WIDE_STOP_TP_WIDE"),
+            variantId: "CG_WIDE_STOP_TP_WIDE",
+            label: "Wide",
+            bullish: [],
+            bearish: [
+              {
+                symbol: "INJUSDT",
+                n: 18,
+                netAvgR: 0.22,
+                pf: 2.1,
+                wr: 0.78,
+                score: 30,
+                verdict: "ALLOW",
+                reason: "test allow",
+              },
+            ],
+          },
+        ],
+      },
+      laneStates: [
+        {
+          variantId: "CG_WIDE_STOP_TP_WIDE",
+          status: "REJECT",
+          freshValid: 200,
+          netAvgR: -0.3,
+          pf: 0.6,
+          wr: 0.45,
+          byAxisSymbol: [{ key: "SHORT_BEARISH|INJUSDT", n: 18, netAvgR: 0.22 }],
+        },
+        {
+          variantId: "CG_WIDE_FAST_SHORT",
+          status: "REJECT",
+          freshValid: 200,
+          netAvgR: 9,
+          pf: 9,
+        },
+      ],
+    });
+
+    expect(result.selected?.lane.selectedLaneId).toBe(laneSelectorV2LaneId("CG_WIDE_STOP_TP_WIDE"));
+    expect(result.evaluated.map((item) => item.variantId)).toContain("CG_WIDE_STOP_TP_WIDE");
+  });
+
+  it("does not let a rejected lane trade a bearish symbol outside its rotation shortlist", () => {
+    const result = selectLaneV2({
+      candidate: {
+        symbol: "WLDUSDT",
+        direction: "SHORT",
+        currentPrice: 100,
+        stopLoss: 104,
+        takeProfitLevels: [94],
+        stopDistanceBps: 400,
+      },
+      regime: "Bearish pressure",
+      controllerMode: "SHORT_ONLY",
+      controllerConfidence: "MEDIUM",
+      now: "2026-07-05T04:00:00.000Z",
+      rotationShortlist: {
+        generatedAt: "2026-07-05T04:00:00.000Z",
+        minAllowSample: 10,
+        minWatchSample: 5,
+        bearishGlobal: [],
+        bullishGlobal: [],
+        lanes: [
+          {
+            laneId: laneSelectorV2LaneId("CG_WIDE_STOP_TP_WIDE"),
+            variantId: "CG_WIDE_STOP_TP_WIDE",
+            label: "Wide",
+            bullish: [],
+            bearish: [
+              {
+                symbol: "INJUSDT",
+                n: 18,
+                netAvgR: 0.22,
+                pf: 2.1,
+                wr: 0.78,
+                score: 30,
+                verdict: "ALLOW",
+                reason: "test allow",
+              },
+            ],
+          },
+        ],
+      },
+      laneStates: [
+        { variantId: "CG_WIDE_STOP_TP_WIDE", status: "STABLE_CANDIDATE", freshValid: 200, netAvgR: 9, pf: 9 },
+      ],
+    });
+
+    expect(result.selected).toBeNull();
+    expect(result.rejected).toContain("CG_WIDE_STOP_TP_WIDE:rotation_shortlist_blocked");
+  });
+
   it("refuses score-only short lanes when recommended policy lanes are unavailable", () => {
     const result = selectLaneV2({
       candidate: {

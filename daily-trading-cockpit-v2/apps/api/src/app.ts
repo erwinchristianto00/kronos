@@ -50,6 +50,11 @@ import {
   estimateLaneSelectorV2Regime,
   isLaneSelectorV2LongWideStopOverride,
 } from "./lib/lane-selector-v2.js";
+import {
+  buildRegimeRotationShortlistReport,
+  rotationRegimeFamilyForLabel,
+  rotationShortlistDecision,
+} from "./lib/regime-rotation-shortlist.js";
 
 export interface AppOptions {
   fetchImpl?: typeof fetch;
@@ -179,8 +184,26 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           return false;
         }
         const report = buildCurrentGuardVariantMatrixReport(getCurrentGuardVariantMatrixStore());
+        const rotationShortlist = buildRegimeRotationShortlistReport(report);
         const laneVariantId = order.selectedLaneId.split(":").pop() ?? order.selectedLaneId;
         const row = report.rows.find((candidate) => candidate.variantId === laneVariantId);
+        const regimeFamily =
+          orderEstimatedRegime.direction === "LONG"
+            ? "BULLISH"
+            : orderEstimatedRegime.direction === "SHORT"
+              ? "BEARISH"
+              : rotationRegimeFamilyForLabel(order.regime);
+        const rotationEligible = rotationShortlistDecision(rotationShortlist, {
+          laneId: order.selectedLaneId,
+          variantId: laneVariantId,
+          symbol: order.symbol,
+          direction: order.direction,
+          regimeFamily,
+        }).allowed;
+        const rotationGateActive =
+          (order.direction === "LONG" && regimeFamily === "BULLISH") ||
+          (order.direction === "SHORT" && regimeFamily === "BEARISH");
+        if (rotationGateActive) return rotationEligible;
         return (
           row?.status === "STABLE_CANDIDATE" ||
           // Operator force-enabled short lanes (e.g. CG_WIDE_FAST_SHORT) trade before STABLE — only

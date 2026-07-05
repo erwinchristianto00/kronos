@@ -15,6 +15,10 @@ import type { MixedBudgetForwardValidationReport, MixedRegimeReport, OpenOrderSt
 import type { PaperOrder, PaperPerformanceReport } from "./paper-execution-router.js";
 import { assessPaperTp, cgWideTpPctFromOrder } from "./paper-trading-controls.js";
 import type { RegimeDirectionControllerReport } from "./regime-direction-controller.js";
+import {
+  buildRegimeRotationShortlistReport,
+  type RotationShortlistSymbol,
+} from "./regime-rotation-shortlist.js";
 import type { ScanTimingDiagnostics } from "./scan-timing-diagnostics.js";
 
 // Distinguish the three "red-looking" states the operator kept conflating:
@@ -101,6 +105,10 @@ export interface NeuralMapLane {
     SHORT_BEARISH?: NeuralLaneCohortStats | null;
     LONG_MIXED?: NeuralLaneCohortStats | null;
     SHORT_MIXED?: NeuralLaneCohortStats | null;
+  };
+  rotationShortlist?: {
+    bearish: RotationShortlistSymbol[];
+    bullish: RotationShortlistSymbol[];
   };
   payoffRatio: number | null;
   plus10bpsStillPositive: boolean | null;
@@ -1273,6 +1281,8 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
   // should not become blind just because a lane is benched.
   const laneIds = Array.from(new Set([...variantLaneIds, ...orderLaneIds]));
   const rowsById = new Map(input.variantMatrix.rows.map((row) => [variantLaneId(row.variantId), row]));
+  const rotationShortlistReport = buildRegimeRotationShortlistReport(input.variantMatrix, { generatedAt });
+  const rotationShortlistsByLane = new Map(rotationShortlistReport.lanes.map((lane) => [lane.laneId, lane]));
   const activeLaneIds = new Set([
     ...input.mixed.activeMixedLanes,
     ...(input.paper.currentBatchActiveLane ? [input.paper.currentBatchActiveLane] : []),
@@ -1332,6 +1342,7 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
     const paperBookCohort = statsSource === "PAPER_BOOK" ? cohortFromPaperBook(economics) : null;
     const paperOnlyLongCohort = id.startsWith("CG_LONG_VARIANT_MATRIX:") ? paperBookCohort : null;
     const paperOnlyShortCohort = !id.startsWith("CG_LONG_VARIANT_MATRIX:") ? paperBookCohort : null;
+    const rotationShortlist = rotationShortlistsByLane.get(id);
     return {
       id,
       label: laneLabel(id),
@@ -1364,6 +1375,12 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
         LONG_MIXED: cohortFromBreakdown(axisRows.find((candidate) => candidate.key === "LONG_MIXED")),
         SHORT_MIXED: cohortFromBreakdown(axisRows.find((candidate) => candidate.key === "SHORT_MIXED")),
       },
+      rotationShortlist: rotationShortlist
+        ? {
+            bearish: rotationShortlist.bearish,
+            bullish: rotationShortlist.bullish,
+          }
+        : undefined,
       payoffRatio: row?.payoffRatio ?? null,
       plus10bpsStillPositive: row?.plus10bpsStillPositive ?? null,
       allThreeOosPositive: row?.allThreeOosPositive ?? null,

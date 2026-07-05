@@ -46,6 +46,17 @@ interface LaneCohortStats {
   payoffRatio: number | null;
 }
 
+interface RotationShortlistSymbol {
+  symbol: string;
+  n: number;
+  netAvgR: number | null;
+  pf: number | null;
+  wr: number | null;
+  score: number;
+  verdict: 'ALLOW' | 'WATCH' | 'BLOCK';
+  reason: string;
+}
+
 interface NeuralLane {
   id: string;
   label: string;
@@ -70,6 +81,10 @@ interface NeuralLane {
     SHORT_BEARISH?: LaneCohortStats | null;
     LONG_MIXED?: LaneCohortStats | null;
     SHORT_MIXED?: LaneCohortStats | null;
+  };
+  rotationShortlist?: {
+    bearish: RotationShortlistSymbol[];
+    bullish: RotationShortlistSymbol[];
   };
   payoffRatio: number | null;
   plus10bpsStillPositive: boolean | null;
@@ -555,6 +570,34 @@ function bestContextLabel(lane: NeuralLane): string {
   candidates.sort((a, b) => b.verdict.score - a.verdict.score);
   const best = candidates[0]!;
   return `${best.context.title} · ${best.verdict.verdict}`;
+}
+
+function rotationShortlistItems(items: RotationShortlistSymbol[] | null | undefined): RotationShortlistSymbol[] {
+  if (!items || items.length === 0) return [];
+  const actionable = items.filter((item) => item.verdict !== 'BLOCK');
+  return (actionable.length > 0 ? actionable : items).slice(0, 4);
+}
+
+function rotationShortlistText(items: RotationShortlistSymbol[] | null | undefined): string {
+  const visible = rotationShortlistItems(items);
+  if (visible.length === 0) return 'n/a';
+  return visible.map((item) => `${item.symbol} ${fmtR(item.netAvgR)}`).join(' · ');
+}
+
+function renderRotationShortlist(items: RotationShortlistSymbol[] | null | undefined) {
+  const visible = rotationShortlistItems(items);
+  if (visible.length === 0) return <span className="rotation-empty">n/a</span>;
+  return (
+    <div className="rotation-shortlist">
+      {visible.map((item) => (
+        <span className={`rotation-chip verdict-${item.verdict.toLowerCase()}`} title={item.reason} key={`${item.symbol}-${item.verdict}`}>
+          <b>{item.symbol}</b>
+          <em>{fmtR(item.netAvgR)}</em>
+          <small>{item.n}</small>
+        </span>
+      ))}
+    </div>
+  );
 }
 
 function fmtMoney(value: number): string {
@@ -1317,6 +1360,8 @@ export default function NeuralMindmap() {
                 <th>Progress</th>
                 <th>Missing</th>
                 <th>Best use</th>
+                <th>Bear shortlist</th>
+                <th>Bull shortlist</th>
                 <th>Dir LONG</th>
                 <th>Dir SHORT</th>
                 <th>Regime MIXED</th>
@@ -1335,7 +1380,7 @@ export default function NeuralMindmap() {
               {milestoneSections.map((section) => (
                 <Fragment key={`milestone-section-${section.key}`}>
                   <tr className={`neural-direction-row direction-${section.key.toLowerCase()}`}>
-                    <td colSpan={18}>
+                    <td colSpan={20}>
                       <span>{section.label}</span>
                       <small>{section.lanes.length} lane{section.lanes.length === 1 ? '' : 's'} · {section.detail}</small>
                     </td>
@@ -1358,6 +1403,8 @@ export default function NeuralMindmap() {
                         <td>{progress.progressPct}%</td>
                         <td className="neural-missing-cell">{progress.blockers.slice(0, 2).join(' | ') || 'None'}</td>
                         <td className="neural-best-use-cell">{bestContextLabel(lane)}</td>
+                        <td className="neural-shortlist-cell">{renderRotationShortlist(lane.rotationShortlist?.bearish)}</td>
+                        <td className="neural-shortlist-cell">{renderRotationShortlist(lane.rotationShortlist?.bullish)}</td>
                         <td className={cohortTone(lane.cohorts?.LONG)}>{fmtCohort(lane.cohorts?.LONG)}</td>
                         <td className={cohortTone(lane.cohorts?.SHORT)}>{fmtCohort(lane.cohorts?.SHORT)}</td>
                         <td className={cohortTone(lane.cohorts?.MIXED)}>{fmtCohort(lane.cohorts?.MIXED)}</td>
@@ -1526,6 +1573,24 @@ export default function NeuralMindmap() {
                       <div><dt>MIXED regime</dt><dd className={cohortTone(selectedLane.cohorts?.MIXED)}>{fmtCohort(selectedLane.cohorts?.MIXED)}</dd></div>
                       <div><dt>Mixed split</dt><dd>{`L ${miniCohort(selectedLane.cohorts?.LONG_MIXED)} · S ${miniCohort(selectedLane.cohorts?.SHORT_MIXED)}`}</dd></div>
                     </dl>
+                  </section>
+                  <section className="neural-lane-metric-card neural-lane-rotation-card">
+                    <h3>Rotation shortlist</h3>
+                    <p className="neural-section-note">ALLOW is the only verdict that can feed testnet/live admission; WATCH is visible but not executable.</p>
+                    <dl>
+                      <div><dt>Bearish rotation</dt><dd>{rotationShortlistText(selectedLane.rotationShortlist?.bearish)}</dd></div>
+                      <div><dt>Bullish rotation</dt><dd>{rotationShortlistText(selectedLane.rotationShortlist?.bullish)}</dd></div>
+                    </dl>
+                    <div className="rotation-detail-grid">
+                      <div>
+                        <span>Bear shortlist</span>
+                        {renderRotationShortlist(selectedLane.rotationShortlist?.bearish)}
+                      </div>
+                      <div>
+                        <span>Bull shortlist</span>
+                        {renderRotationShortlist(selectedLane.rotationShortlist?.bullish)}
+                      </div>
+                    </div>
                   </section>
                   {selectedLaneMetricGroups.map((group) => (
                     <section className="neural-lane-metric-card" key={group.title}>

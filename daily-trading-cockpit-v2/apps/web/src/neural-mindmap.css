@@ -568,7 +568,9 @@
 .neural-milestone-table-wrap td:nth-child(6),
 .neural-milestone-table-wrap td:nth-child(7),
 .neural-milestone-table-wrap td:nth-child(8),
-.neural-milestone-table-wrap td:nth-child(9) {
+.neural-milestone-table-wrap td:nth-child(9),
+.neural-milestone-table-wrap td:nth-child(10),
+.neural-milestone-table-wrap td:nth-child(11) {
   min-width: 138px;
   max-width: 230px;
   white-space: normal;
@@ -581,6 +583,99 @@
 
 .neural-milestone-table-wrap .neural-best-use-cell {
   color: #d5c27c;
+}
+
+.neural-milestone-table-wrap .neural-shortlist-cell {
+  min-width: 210px;
+  max-width: 270px;
+}
+
+.rotation-empty {
+  color: #607782;
+}
+
+.rotation-shortlist {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  align-items: center;
+}
+
+.rotation-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 100%;
+  padding: 3px 6px;
+  border: 1px solid #25414b;
+  border-radius: 999px;
+  color: #b8cbd4;
+  background: rgba(10, 25, 32, 0.72);
+  font: 700 10px/1.2 "IBM Plex Mono", "Cascadia Code", monospace;
+  white-space: nowrap;
+}
+
+.rotation-chip b,
+.rotation-chip em,
+.rotation-chip small {
+  font: inherit;
+}
+
+.rotation-chip em {
+  color: #7fcce0;
+}
+
+.rotation-chip small {
+  color: #78919d;
+}
+
+.rotation-chip.verdict-allow {
+  border-color: rgba(73, 218, 154, 0.55);
+  color: #d7fff0;
+  background: rgba(32, 101, 78, 0.24);
+}
+
+.rotation-chip.verdict-allow em {
+  color: #48e2a3;
+}
+
+.rotation-chip.verdict-watch {
+  border-color: rgba(238, 178, 77, 0.55);
+  color: #fff1d1;
+  background: rgba(111, 76, 22, 0.22);
+}
+
+.rotation-chip.verdict-watch em {
+  color: #f3bd61;
+}
+
+.rotation-chip.verdict-block {
+  border-color: rgba(241, 91, 104, 0.4);
+  color: #ffc6ca;
+  background: rgba(95, 30, 38, 0.18);
+}
+
+.rotation-detail-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.rotation-detail-grid > div {
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid #20343d;
+  border-radius: 8px;
+  background: rgba(8, 20, 26, 0.68);
+}
+
+.rotation-detail-grid span {
+  display: block;
+  margin-bottom: 7px;
+  color: #78909a;
+  font: 700 10px/1.2 "IBM Plex Mono", "Cascadia Code", monospace;
+  text-transform: uppercase;
 }
 
 .neural-milestone-table-wrap tbody tr.is-quarantined,

@@ -1910,6 +1910,8 @@ export interface CurrentGuardVariantMatrixRow {
   byRegimeFamily?: VariantBreakdownRow[];
   /** Exact direction x regime-family cohort, e.g. LONG_BULLISH or SHORT_BEARISH. */
   byAxis?: VariantBreakdownRow[];
+  /** Exact direction x regime-family x symbol cohort, e.g. SHORT_BEARISH|INJUSDT. */
+  byAxisSymbol?: VariantBreakdownRow[];
   byEntryVariant: VariantBreakdownRow[];
   bySymbol: VariantBreakdownRow[];
 
@@ -2283,6 +2285,7 @@ function buildRow(
   const byDirection = breakdownRows(fresh, (o) => o.direction);
   const byRegimeFamily = breakdownRows(fresh, observationRegimeFamilyKey);
   const byAxis = breakdownRows(fresh, (o) => `${o.direction}_${observationRegimeFamilyKey(o)}`);
+  const byAxisSymbol = breakdownRows(fresh, (o) => `${o.direction}_${observationRegimeFamilyKey(o)}|${o.symbol}`);
   const byEntryVariant = breakdownRows(fresh, (o) => o.entryVariant ?? "unknown");
   const bySymbol = breakdownRows(fresh, (o) => o.symbol);
 
@@ -2342,6 +2345,7 @@ function buildRow(
     byDirection,
     byRegimeFamily,
     byAxis,
+    byAxisSymbol,
     byEntryVariant,
     bySymbol,
     oosThirds,
