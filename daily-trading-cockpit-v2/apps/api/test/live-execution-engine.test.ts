@@ -2335,3 +2335,28 @@ describe("consecutive-loss ledger — scratch (fee-only) closes must not false-t
     expect(store.getState().consecutiveLosses).toBeLessThan(6);
   });
 });
+
+describe("resetKill — a deliberate reset must give a genuine fresh start (not instantly re-trip)", () => {
+  it("clears the latch AND resets the consecutive-loss streak + re-bases the drawdown peak", () => {
+    const { engine, store } = makeEngine({ config: { maxConsecutiveLosses: 2, scratchEpsilonUsd: 0.1 } });
+    const st = store.getState();
+    st.consecutiveLosses = 6;
+    st.killedAt = "2026-07-04T08:29:43.431Z";
+    st.killReason = "max consecutive losses hit (6)";
+    st.realizedPeakUsd = 20;
+    st.totalRealizedPnlUsd = -5;
+    store.save();
+
+    engine.resetKill();
+
+    const after = store.getState();
+    expect(after.killedAt).toBeNull();
+    expect(after.killReason).toBeNull();
+    expect(after.consecutiveLosses).toBe(0);
+    expect(after.realizedPeakUsd).toBe(-5); // drawdown-from-peak re-based to 0
+
+    // The core guarantee: killSwitchTrip() must NOT immediately re-fire after a reset.
+    const trip = (engine as unknown as { killSwitchTrip: () => string | null }).killSwitchTrip();
+    expect(trip).toBeNull();
+  });
+});

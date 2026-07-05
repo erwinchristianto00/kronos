@@ -1127,11 +1127,24 @@ export class LiveExecutionEngine {
     };
   }
 
-  /** Clears a latched kill (deliberate operator action via route). */
+  /**
+   * Clears a latched kill (deliberate operator action via route; guarded by confirm:"RESET").
+   *
+   * Clearing ONLY the latch is a footgun: killSwitchTrip() runs first on every tick, so if the
+   * condition that tripped it still holds, the very next tick re-latches instantly (a "reset" that
+   * does nothing). So a deliberate reset also gives a genuine fresh start:
+   *  - consecutiveLosses → 0 (the streak that most commonly trips this).
+   *  - realizedPeakUsd → current total (drawdown-from-peak re-based to 0 so a stale high-water mark
+   *    can't re-kill immediately).
+   * The DAILY ledger is intentionally left untouched: a daily-max-loss kill is meant to enforce a
+   * cool-off for the rest of the UTC day, so it correctly re-latches until the day rolls over.
+   */
   resetKill(): void {
     const st = this.store.getState();
     st.killedAt = null;
     st.killReason = null;
+    st.consecutiveLosses = 0;
+    st.realizedPeakUsd = st.totalRealizedPnlUsd;
     this.store.save();
   }
 
