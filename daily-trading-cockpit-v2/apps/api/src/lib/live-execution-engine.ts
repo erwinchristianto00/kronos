@@ -2577,6 +2577,18 @@ export class LiveExecutionEngine {
     return allowed.includes(laneId) || allowed.includes(variantId);
   }
 
+  /** True only when the operator explicitly picked this lane in weighted allocation
+   *  or the legacy allow-list. Unlike laneSelectionAllowsLane(), ALL_LANES is not
+   *  treated as explicit. Used for manual-only experimental lanes. */
+  laneSelectionExplicitlyIncludesLane(laneId: string): boolean {
+    const st = this.store.getState();
+    const variantId = laneId.split(":").pop() ?? laneId;
+    const allocations = st.laneAllocations ?? [];
+    if (allocations.some((a) => a.laneId === laneId || a.laneId === variantId)) return true;
+    const allowed = st.allowedLaneIds;
+    return Array.isArray(allowed) && allowed.some((id) => id === laneId || id === variantId);
+  }
+
   private laneAllocationWeightPct(paper: PaperOrder): number {
     return this.laneSelectionWeightPctForLane(paper.selectedLaneId ?? "");
   }

@@ -36,11 +36,15 @@ import {
 import {
   isRealtimeShortMirrorEnabled,
   isRealtimeShortAllowedVariantId,
+  isRealtimeShortSelectableVariantId,
   runRealtimeShortMirror,
 } from "../lib/realtime-short-mirror.js";
 import { fetchCrowdingSnapshot } from "../lib/derivatives-crowding.js";
 import { estimateLaneSelectorV2Regime } from "../lib/lane-selector-v2.js";
-import { buildRegimeRotationShortlistReport } from "../lib/regime-rotation-shortlist.js";
+import {
+  buildRegimeRotationShortlistReport,
+  rotationLaneIdForVariant,
+} from "../lib/regime-rotation-shortlist.js";
 import {
   RegimeControllerAlignedShadowStore,
   admitToControllerAlignedShadow,
@@ -176,6 +180,10 @@ export async function registerScanRoute(
     kronosCounterfactualStore?: KronosCounterfactualStore | null;
     binanceClient?: BinanceClient;
     performanceProvider?: PerformanceStatsProvider | null;
+    liveEngineGetter?: (() => {
+      laneSelectionAllowsLane(laneId: string): boolean;
+      laneSelectionExplicitlyIncludesLane(laneId: string): boolean;
+    } | null);
   } = {},
 ): Promise<CoreScanAutoRefreshController> {
   // Lazy default — env-var-disabled and isolated from the live scan loop.
@@ -385,8 +393,22 @@ export async function registerScanRoute(
         const rotationShortlist = buildRegimeRotationShortlistReport(vmReport, {
           generatedAt: new Date().toISOString(),
         });
+        const liveLaneSelection = opts.liveEngineGetter?.() ?? null;
+        const manualEnabledVariantIds = new Set<string>();
+        const liveLaneAllowsVariant = (variantId: string): boolean => {
+          const laneId = rotationLaneIdForVariant(variantId);
+          if (!liveLaneSelection) return true;
+          if (liveLaneSelection.laneSelectionExplicitlyIncludesLane(laneId)) {
+            manualEnabledVariantIds.add(variantId);
+          }
+          return liveLaneSelection.laneSelectionAllowsLane(laneId);
+        };
         const stableShortLanes = vmReport.rows
-          .filter((r) => isRealtimeShortAllowedVariantId(r.variantId))
+          .filter((r) => {
+            if (!liveLaneAllowsVariant(r.variantId)) return false;
+            return isRealtimeShortAllowedVariantId(r.variantId) ||
+              isRealtimeShortSelectableVariantId(r.variantId, manualEnabledVariantIds.has(r.variantId));
+          })
           .map((r) => ({
             variantId: r.variantId,
             status: r.status,
@@ -460,6 +482,7 @@ export async function registerScanRoute(
           crowdingVetoEnabled,
           crowdingBySymbol,
           rotationShortlist,
+          manualEnabledVariantIds,
           now: new Date().toISOString(),
         });
       } catch {

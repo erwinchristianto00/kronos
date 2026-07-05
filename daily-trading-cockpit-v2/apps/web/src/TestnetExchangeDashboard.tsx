@@ -254,6 +254,10 @@ interface MainNeuralLane {
   label?: string;
   status?: string;
   health?: string;
+  rotationShortlist?: {
+    bearish?: Array<{ verdict?: string | null }>;
+    bullish?: Array<{ verdict?: string | null }>;
+  };
 }
 
 interface MainNeuralMap {
@@ -313,6 +317,10 @@ function isHeadlineAllocationLane(lane: MainNeuralLane): boolean {
   if (!id) return false;
   if (id === 'H6_TREND_LONG') return false;
   if (id.includes('CG_MAKER')) return false;
+  const shortlistAllows =
+    lane.rotationShortlist?.bearish?.some((item) => String(item.verdict ?? '').toUpperCase() === 'ALLOW') ||
+    lane.rotationShortlist?.bullish?.some((item) => String(item.verdict ?? '').toUpperCase() === 'ALLOW');
+  if (shortlistAllows) return true;
   const status = (lane.status ?? '').toUpperCase();
   const health = (lane.health ?? '').toUpperCase();
   if (status.includes('QUARANTIN') || health.includes('QUARANTIN')) return false;

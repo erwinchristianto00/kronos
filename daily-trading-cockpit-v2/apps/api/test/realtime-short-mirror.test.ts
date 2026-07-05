@@ -249,6 +249,51 @@ describe("realtime-short-mirror — fresh short live-mirror source (mode 2)", ()
     expect(o.selectedLaneId).toBe(realtimeShortSelectedLaneId("CG_WIDE_FAST_SHORT"));
   });
 
+  it("[MANUAL-SHORTLIST] allows manual-only EXP 10x MFE SHORT when explicitly selected and symbol-shortlisted", () => {
+    const store = freshStore();
+    const res = runRealtimeShortMirror(
+      inputs([shortCand("SEIUSDT", { currentPrice: 0.5, stopLoss: 0.515 })], {
+        stableShortLaneActive: false,
+        stableShortLanes: [
+          { variantId: "CG_EXP_SHORT_MFE_GIVEBACK_10X", status: "QUARANTINED", freshValid: 64, netAvgR: -0.3, pf: 0.9 },
+        ],
+        manualEnabledVariantIds: new Set(["CG_EXP_SHORT_MFE_GIVEBACK_10X"]),
+        rotationShortlist: {
+          generatedAt: "2026-07-05T04:00:00.000Z",
+          minAllowSample: 10,
+          minWatchSample: 5,
+          bearishGlobal: [],
+          bullishGlobal: [],
+          lanes: [
+            {
+              laneId: realtimeShortSelectedLaneId("CG_EXP_SHORT_MFE_GIVEBACK_10X"),
+              variantId: "CG_EXP_SHORT_MFE_GIVEBACK_10X",
+              label: "EXP MFE",
+              bullish: [],
+              bearish: [
+                {
+                  symbol: "SEIUSDT",
+                  n: 18,
+                  netAvgR: 0.18,
+                  pf: 2.4,
+                  wr: 0.72,
+                  score: 25,
+                  verdict: "ALLOW",
+                  reason: "test allow",
+                },
+              ],
+            },
+          ],
+        },
+      }),
+      store,
+    );
+    expect(res.emitted).toBe(1);
+    const o = store.all[0]!;
+    expect(o.selectedLaneId).toBe(realtimeShortSelectedLaneId("CG_EXP_SHORT_MFE_GIVEBACK_10X"));
+    expect(o.variantExitRule).toBe("mfe_giveback");
+  });
+
   it("[ALLOWLIST] refuses downgraded lanes and maker-only lanes even when telemetry says stable", () => {
     const store = freshStore();
     const res = runRealtimeShortMirror(

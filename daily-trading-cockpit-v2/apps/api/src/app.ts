@@ -37,6 +37,7 @@ import {
   getRealtimeShortMirrorStore,
   isRealtimeShortAllowedLaneId,
   isRealtimeShortMirrorEnabled,
+  isRealtimeShortSelectableLaneId,
 } from "./lib/realtime-short-mirror.js";
 import {
   buildCurrentGuardVariantMatrixReport,
@@ -125,14 +126,19 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
 
   performanceProvider?.warm();
 
-  const coreScanAutoRefreshController = await registerScanRoute(app, scanService, tracker, outcomeChecker, shadowEngine, { binanceClient, performanceProvider });
-  await registerKronosRoutes(app, kronosClient, binanceClient);
-  await registerOutcomesRoutes(app, tracker, performanceProvider);
   // Declared here (assigned below) so the shadow routes can READ the live engine's in-memory
   // status (sync getStatus, no I/O) for the order-reconciliation readiness gate, via a lazy getter.
   let liveEngine: LiveExecutionEngine | null = null;
   let crossSectionalExecutor: CrossSectionalExecutor | null = null;
   let regimeAutopilot: RegimeAutopilot | null = null;
+
+  const coreScanAutoRefreshController = await registerScanRoute(app, scanService, tracker, outcomeChecker, shadowEngine, {
+    binanceClient,
+    performanceProvider,
+    liveEngineGetter: () => liveEngine,
+  });
+  await registerKronosRoutes(app, kronosClient, binanceClient);
+  await registerOutcomesRoutes(app, tracker, performanceProvider);
   await registerShadowRoutes(app, shadowEngine, {
     binanceClient,
     metadataFetchImpl: options.fetchImpl,
@@ -170,7 +176,14 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         const useTestnetPolicy =
           liveConfig.env === "testnet" ||
           (liveConfig.env === "mainnet" && liveConfig.mainnetKeepTestnetPolicy);
-        if (useTestnetPolicy && !isRealtimeShortAllowedLaneId(order.selectedLaneId)) return false;
+        const manuallySelected = liveEngine?.laneSelectionExplicitlyIncludesLane(order.selectedLaneId) ?? false;
+        if (
+          useTestnetPolicy &&
+          !(
+            isRealtimeShortAllowedLaneId(order.selectedLaneId) ||
+            isRealtimeShortSelectableLaneId(order.selectedLaneId, manuallySelected)
+          )
+        ) return false;
         const orderEstimatedRegime = estimateLaneSelectorV2Regime({
           regime: order.regime,
           controllerMode: order.controllerMode,

@@ -45,23 +45,39 @@ export const REALTIME_SHORT_SELECTED_LANE_ID = `CG_VARIANT_MATRIX:${REALTIME_SHO
 const LONG_WIDE_VARIANT_ID = "CG_WIDE_FAST_LONG"; // LONG lane (operator 2026-06-29): fast 0.5R bank, fires only in WIDE_TREND bull
 const MIXED_SYMBOL_BLOCKLIST = new Set(["NEARUSDT"]);
 const DEFAULT_MAX_PER_CYCLE = 3;
-const DISABLED_LIVE_MIRROR_VARIANT_IDS = new Set<string>(["CG_EXP_SHORT_MFE_GIVEBACK_10X"]);
+const MANUAL_ONLY_LIVE_MIRROR_VARIANT_IDS = new Set<string>(["CG_EXP_SHORT_MFE_GIVEBACK_10X"]);
 // Short lanes the operator force-enables BEFORE they naturally reach STABLE_CANDIDATE — lifted to
 // STABLE here + allowed through the app.ts eligibility gate. 2026-06-29: CG_WIDE_FAST_SHORT only
 // (WATCHABLE, +0.110R — clearly the most deserving); CG_WIDE_STOP_TP_WIDE stays gated until STABLE.
 export const FORCE_ELIGIBLE_SHORT_VARIANT_IDS = new Set<string>(["CG_WIDE_FAST_SHORT"]);
 
 export const REALTIME_SHORT_ALLOWED_VARIANT_IDS = LANE_SELECTOR_V2_LIVE_SUPPORTED_VARIANT_IDS.filter(
-  (id) => !DISABLED_LIVE_MIRROR_VARIANT_IDS.has(id),
+  (id) => !MANUAL_ONLY_LIVE_MIRROR_VARIANT_IDS.has(id),
 );
 
 export function isRealtimeShortAllowedVariantId(id: string | null | undefined): id is VariantMatrixVariantId {
-  return isLaneSelectorV2SupportedVariantId(id) && !DISABLED_LIVE_MIRROR_VARIANT_IDS.has(id);
+  return isLaneSelectorV2SupportedVariantId(id) && !MANUAL_ONLY_LIVE_MIRROR_VARIANT_IDS.has(id);
 }
 
 export function isRealtimeShortAllowedLaneId(laneId: string | null | undefined): boolean {
   const variantId = laneId?.split(":").pop();
   return isRealtimeShortAllowedVariantId(variantId);
+}
+
+export function isRealtimeShortSelectableVariantId(
+  id: string | null | undefined,
+  manualSelected = false,
+): id is VariantMatrixVariantId {
+  return isLaneSelectorV2SupportedVariantId(id) &&
+    (!MANUAL_ONLY_LIVE_MIRROR_VARIANT_IDS.has(id) || manualSelected);
+}
+
+export function isRealtimeShortSelectableLaneId(
+  laneId: string | null | undefined,
+  manualSelected = false,
+): boolean {
+  const variantId = laneId?.split(":").pop();
+  return isRealtimeShortSelectableVariantId(variantId, manualSelected);
 }
 
 export function realtimeShortSelectedLaneId(variantId: VariantMatrixVariantId): string {
@@ -116,6 +132,9 @@ export interface RealtimeShortMirrorInputs {
   crowdingBySymbol?: Record<string, { crowdSide: string; crowdingLevel: string }>;
   /** Symbol-specific bullish/bearish rotation allowlist derived from the main VM report. */
   rotationShortlist?: RegimeRotationShortlistReport | null;
+  /** Variant ids explicitly picked by the operator allocation selector. Manual-only
+   *  high-risk lanes are ignored unless present here. */
+  manualEnabledVariantIds?: Set<string>;
   /** ISO timestamp — injected for determinism/testability. */
   now: string;
   maxPerCycle?: number;
@@ -144,7 +163,9 @@ function effectiveLaneStates(
     : inputs.stableShortLaneActive
     ? [{ variantId: REALTIME_SHORT_LANE_VARIANT_ID, status: "STABLE_CANDIDATE" }]
     : [];
-  const base = baseRaw.filter((state) => !DISABLED_LIVE_MIRROR_VARIANT_IDS.has(state.variantId));
+  const base = baseRaw.filter((state) =>
+    isRealtimeShortSelectableVariantId(state.variantId, inputs.manualEnabledVariantIds?.has(state.variantId) === true),
+  );
   const withLongWideOverride = isLaneSelectorV2LongWideStopOverride({
     variantId: LONG_WIDE_VARIANT_ID,
     direction: "LONG",
@@ -169,7 +190,7 @@ function effectiveLaneStates(
   if (!inputs.forceFastShort) return withLongWideOverride;
   let withForcedShorts = withLongWideOverride;
   for (const variantId of FORCE_ELIGIBLE_SHORT_VARIANT_IDS) {
-    if (DISABLED_LIVE_MIRROR_VARIANT_IDS.has(variantId)) continue;
+    if (!isRealtimeShortSelectableVariantId(variantId, inputs.manualEnabledVariantIds?.has(variantId) === true)) continue;
     withForcedShorts = withForcedShorts.some((state) => state.variantId === variantId)
       ? withForcedShorts.map((state) =>
           state.variantId === variantId ? { ...state, status: "STABLE_CANDIDATE" } : state,
@@ -213,7 +234,10 @@ export function runRealtimeShortMirror(
   });
   const laneStates = effectiveLaneStates(inputs, estimatedRegime);
 
-  const hasAnyStableLane = laneStates.some((state) => state.status === "STABLE_CANDIDATE" && isRealtimeShortAllowedVariantId(state.variantId));
+  const hasAnyStableLane = laneStates.some((state) =>
+    state.status === "STABLE_CANDIDATE" &&
+    isRealtimeShortSelectableVariantId(state.variantId, inputs.manualEnabledVariantIds?.has(state.variantId) === true),
+  );
   if (!hasAnyStableLane && !inputs.rotationShortlist) {
     result.reasons.push("stable_lane_inactive");
     return result;
