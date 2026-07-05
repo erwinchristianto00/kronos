@@ -21,9 +21,6 @@ import { dirname, resolve } from "node:path";
 
 import type { BinanceFuturesPrivateClient } from "./binance-futures-private.js";
 import {
-  CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST,
-  CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST,
-  CROSS_SECTIONAL_FILTERED_SHORT_BLOCKLIST,
   type CrossSectionalObservation,
   type CrossSectionalStore,
 } from "./cross-sectional-edge.js";
@@ -85,19 +82,6 @@ interface ExecutorState {
   baskets: ExecutorBasket[];
   /** openedAtMs watermark — signals at/below this are never re-executed. */
   lastSeenSignalMs: number;
-}
-
-function isFilteredSymbolAllowed(signal: CrossSectionalObservation): boolean {
-  if ((signal.variant ?? "RAW") !== "FILTERED") return true;
-  for (const leg of signal.longLeg) {
-    if (!CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST.has(leg.symbol.toUpperCase())) return false;
-  }
-  for (const leg of signal.shortLeg) {
-    const symbol = leg.symbol.toUpperCase();
-    if (!CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST.has(symbol)) return false;
-    if (CROSS_SECTIONAL_FILTERED_SHORT_BLOCKLIST.has(symbol)) return false;
-  }
-  return true;
 }
 
 export class CrossSectionalExecutorStore {
@@ -312,8 +296,6 @@ export class CrossSectionalExecutor {
     // Watermark BEFORE placing orders: a failed basket must not retry forever.
     st.lastSeenSignalMs = signal.openedAtMs;
     this.store.save();
-
-    if (!isFilteredSymbolAllowed(signal)) return;
 
     const filters = await this.client.getExchangeFilters();
     const legUsd = this.effectiveLegUsd();

@@ -154,14 +154,17 @@ describe("cross-sectional executor (basket execution, testnet-first)", () => {
     expect(basket.legs.find((l) => l.symbol === "DOGEUSDT")?.qty).toBeCloseTo(100, 9);
   });
 
-  it("rejects FILTERED signals whose symbols are outside the hard operator allow/block lists", async () => {
+  it("trusts FILTERED signals already emitted by the research feed instead of re-blocking with stale env lists", async () => {
     const { executor, signalStore, store, client } = makeExecutor();
-    const bad = signalObs(NOW_MS - 5 * 60_000);
-    bad.longLeg = [{ symbol: "RNDRUSDT", entryPrice: 10, exitPrice: null }]; // not in filtered long allow
-    signalStore.add(bad);
+    const signal = signalObs(NOW_MS - 5 * 60_000);
+    // The research feed already applied its adaptive filter when it wrote the signal.
+    // The executor must not re-check against today's static env allowlist, which can
+    // be stale and block every currently-valid short leg.
+    signal.shortLeg = [{ symbol: "RNDRUSDT", entryPrice: 10, exitPrice: null }];
+    signalStore.add(signal);
     await executor.tick();
-    expect(store.getState().baskets.length).toBe(0);
-    expect(client.placed.length).toBe(0);
+    expect(store.getState().baskets.length).toBe(1);
+    expect(client.placed.some((order) => order.symbol === "RNDRUSDT" && order.side === "SELL")).toBe(true);
   });
 
   it("HEDGE INTEGRITY: a failed leg aborts the basket and flattens already-opened legs", async () => {

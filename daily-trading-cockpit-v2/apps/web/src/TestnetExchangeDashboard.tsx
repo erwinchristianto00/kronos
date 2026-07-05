@@ -312,6 +312,7 @@ function isHeadlineAllocationLane(lane: MainNeuralLane): boolean {
   const id = allocationLaneValue(lane.id ?? lane.laneId ?? lane.label);
   if (!id) return false;
   if (id === 'H6_TREND_LONG') return false;
+  if (id.includes('CG_MAKER')) return false;
   const status = (lane.status ?? '').toUpperCase();
   const health = (lane.health ?? '').toUpperCase();
   if (status.includes('QUARANTIN') || health.includes('QUARANTIN')) return false;
@@ -515,12 +516,16 @@ export default function TestnetExchangeDashboard() {
   const [controlMsg, setControlMsg] = useState<{ ok: boolean; message: string } | null>(null);
   const [allocLane1, setAllocLane1] = useState('CG_WIDE_FAST_SHORT');
   const [allocLane2, setAllocLane2] = useState('CG_WIDE_FAST_LONG');
+  const [allocLane3, setAllocLane3] = useState('');
+  const [allocLane4, setAllocLane4] = useState('');
   const [allocWeight1, setAllocWeight1] = useState('70');
   const [allocWeight2, setAllocWeight2] = useState('30');
+  const [allocWeight3, setAllocWeight3] = useState('0');
+  const [allocWeight4, setAllocWeight4] = useState('0');
   const [regimeReport, setRegimeReport] = useState<RegimeEngineReport | null>(null);
   const [headlineLaneOptions, setHeadlineLaneOptions] = useState<string[]>([]);
   const laneAllocationOptions = Array.from(new Set(
-    [...LIVE_LANE_OPTIONS, ...headlineLaneOptions, allocLane1, allocLane2].filter(Boolean),
+    [...LIVE_LANE_OPTIONS, ...headlineLaneOptions, allocLane1, allocLane2, allocLane3, allocLane4].filter(Boolean),
   ));
 
   function applyRegimePreset(preset: { lane1: string; w1: string; lane2: string; w2: string }) {
@@ -528,6 +533,10 @@ export default function TestnetExchangeDashboard() {
     setAllocWeight1(preset.w1);
     setAllocLane2(preset.lane2);
     setAllocWeight2(preset.w2);
+    setAllocLane3('');
+    setAllocWeight3('0');
+    setAllocLane4('');
+    setAllocWeight4('0');
     setControlMsg({ ok: true, message: `Preset dimuat ke form ${allocationLabel} — tekan Apply untuk mengaktifkan` });
   }
 
@@ -563,8 +572,14 @@ export default function TestnetExchangeDashboard() {
 
   const applyAllocation = () => {
     const allocations: Array<{ laneId: string; weightPct: number }> = [];
-    if (allocLane1.trim()) allocations.push({ laneId: allocLane1.trim(), weightPct: Number(allocWeight1) });
-    if (allocLane2.trim()) allocations.push({ laneId: allocLane2.trim(), weightPct: Number(allocWeight2) });
+    [
+      [allocLane1, allocWeight1],
+      [allocLane2, allocWeight2],
+      [allocLane3, allocWeight3],
+      [allocLane4, allocWeight4],
+    ].forEach(([lane, weight]) => {
+      if (lane.trim()) allocations.push({ laneId: lane.trim(), weightPct: Number(weight) });
+    });
     if (allocations.length === 0) {
       setControlMsg({ ok: false, message: 'Allocation: pick at least lane 1' });
       return;
@@ -783,6 +798,18 @@ export default function TestnetExchangeDashboard() {
               {laneAllocationOptions.map((lane) => <option key={lane} value={lane}>{lane}</option>)}
             </select>{' '}
             <input type="number" min={0} max={100} value={allocWeight2} onChange={(e) => setAllocWeight2(e.target.value)} style={{ width: 56 }} />%
+            {' + '}
+            <select value={allocLane3} onChange={(e) => setAllocLane3(e.target.value)}>
+              <option value="">(none)</option>
+              {laneAllocationOptions.map((lane) => <option key={lane} value={lane}>{lane}</option>)}
+            </select>{' '}
+            <input type="number" min={0} max={100} value={allocWeight3} onChange={(e) => setAllocWeight3(e.target.value)} style={{ width: 56 }} />%
+            {' + '}
+            <select value={allocLane4} onChange={(e) => setAllocLane4(e.target.value)}>
+              <option value="">(none)</option>
+              {laneAllocationOptions.map((lane) => <option key={lane} value={lane}>{lane}</option>)}
+            </select>{' '}
+            <input type="number" min={0} max={100} value={allocWeight4} onChange={(e) => setAllocWeight4(e.target.value)} style={{ width: 56 }} />%
             {' '}
             <button type="button" disabled={controlBusy} onClick={applyAllocation}>Apply</button>{' '}
             <button type="button" disabled={controlBusy} onClick={() => void clearAllocation()}>Clear</button>
