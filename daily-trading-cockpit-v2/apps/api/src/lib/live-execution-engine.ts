@@ -70,6 +70,13 @@ export interface LiveExecutionConfig {
   maxCorrelatedAltShortPositions: number;
   dailyMaxLossUsd: number;
   maxConsecutiveLosses: number;
+  /**
+   * A realized close whose |net| is below this is a "scratch" (fee-only / breakeven exit) — it does
+   * NOT count toward the consecutive-loss streak (nor reset it). Stops profit-bank / breakeven-after-cost
+   * exits from false-tripping the consecutive-loss kill-switch. An "adverse" emergency flatten always
+   * counts regardless of magnitude, so churn stays visible to the breaker.
+   */
+  scratchEpsilonUsd: number;
   maxDrawdownUsd: number;
   /** Default leverage used by all non-experimental lanes. */
   defaultLeverage: number;
@@ -189,6 +196,7 @@ export function parseLiveExecutionConfig(env: NodeJS.ProcessEnv = process.env): 
     maxCorrelatedAltShortPositions: envNonNegativeInt(env.LIVE_MAX_CORRELATED_ALT_SHORTS, 3),
     dailyMaxLossUsd: envNum(env.LIVE_DAILY_MAX_LOSS_USD, 15),
     maxConsecutiveLosses: Math.floor(envNum(env.LIVE_MAX_CONSECUTIVE_LOSSES, 5)),
+    scratchEpsilonUsd: envNum(env.LIVE_SCRATCH_EPSILON_USD, Math.max(0.05, 0.02 * envNum(env.LIVE_RISK_USD_PER_TRADE, 5))),
     maxDrawdownUsd: envNum(env.LIVE_MAX_DRAWDOWN_USD, 40),
     defaultLeverage,
     maxLeverage,
@@ -454,6 +462,8 @@ interface LiveDailyLedger {
   realizedPnlUsd: number;
   wins: number;
   losses: number;
+  /** Near-breakeven fee-only closes — neither win nor loss (kept for honest accounting). */
+  scratches?: number;
 }
 
 interface LiveExecutionState {
@@ -1183,6 +1193,7 @@ export class LiveExecutionEngine {
         maxCorrelatedAltShortPositions: this.config.maxCorrelatedAltShortPositions,
         dailyMaxLossUsd: this.config.dailyMaxLossUsd,
         maxConsecutiveLosses: this.config.maxConsecutiveLosses,
+        scratchEpsilonUsd: this.config.scratchEpsilonUsd,
         maxDrawdownUsd: this.config.maxDrawdownUsd,
         defaultLeverage: this.config.defaultLeverage,
         maxLeverage: this.config.maxLeverage,
@@ -2481,13 +2492,24 @@ export class LiveExecutionEngine {
     // An emergency flatten is NEVER a win, even if its realized PnL rounds to ~0 (e.g. the trade
     // fetch failed and net came back 0). Classifying it "adverse" stops a flatten from RESETTING
     // the consecutive-loss streak and masking churn from the kill-switch.
-    const isLoss = classification === "adverse" || net < 0;
-    if (isLoss) {
-      st.dailyLedger.losses += 1;
-      st.consecutiveLosses += 1;
+    //
+    // A near-breakeven "scratch" (an auto profit-bank / breakeven-after-cost exit that gave back
+    // only fees) is NEITHER a win NOR a loss: it must not inflate the consecutive-loss streak, and
+    // it must not reset it either — it is neutral. This false-tripped the kill-switch on 2026-07-04
+    // (3 of the 6 "losses" that killed live were -$0.017 fee-only scratches). An "adverse" flatten
+    // is exempt — it always counts as a loss regardless of magnitude, so churn stays visible.
+    const isScratch = classification !== "adverse" && Math.abs(net) < this.config.scratchEpsilonUsd;
+    if (isScratch) {
+      st.dailyLedger.scratches = (st.dailyLedger.scratches ?? 0) + 1;
     } else {
-      st.dailyLedger.wins += 1;
-      st.consecutiveLosses = 0;
+      const isLoss = classification === "adverse" || net < 0;
+      if (isLoss) {
+        st.dailyLedger.losses += 1;
+        st.consecutiveLosses += 1;
+      } else {
+        st.dailyLedger.wins += 1;
+        st.consecutiveLosses = 0;
+      }
     }
     st.totalRealizedPnlUsd += net;
     if (st.totalRealizedPnlUsd > st.realizedPeakUsd) st.realizedPeakUsd = st.totalRealizedPnlUsd;

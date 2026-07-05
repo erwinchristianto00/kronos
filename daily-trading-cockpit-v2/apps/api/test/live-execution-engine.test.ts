@@ -252,6 +252,7 @@ function makeConfig(overrides: Partial<LiveExecutionConfig> = {}): LiveExecution
     maxCorrelatedAltShortPositions: 3,
     dailyMaxLossUsd: 15,
     maxConsecutiveLosses: 5,
+    scratchEpsilonUsd: 0.1,
     maxDrawdownUsd: 40,
     defaultLeverage: 3,
     maxLeverage: 2,
@@ -829,7 +830,10 @@ describe("LiveExecutionEngine", () => {
     expect(flat.reduceOnly).toBe(true);
     expect(flat.side).toBe("SELL");
     expect(client.cancelAllSymbols).toContain("ETHUSDT");
-    expect(store.getState().dailyLedger.wins).toBe(1);
+    // A +$0.03 breakeven-after-cost close is a SCRATCH, not a win — it must not touch the
+    // win/loss tally (which feeds the consecutive-loss kill-switch). See the scratch-ledger tests.
+    expect(store.getState().dailyLedger.wins).toBe(0);
+    expect(store.getState().dailyLedger.scratches).toBe(1);
     expect(intent.tp1OrderId).not.toBeNull();
   });
 
@@ -2274,5 +2278,60 @@ describe("lane selection auto-reset on losing operator close", () => {
     engine.setLaneAllocations([{ laneId: "CG_WIDE_FAST_SHORT", weightPct: 100 }]); // operator re-selects
     await engine.tick(); // the old CLOSED loss is behind the watermark now
     expect(store.getState().laneAllocations).toEqual([{ laneId: "CG_WIDE_FAST_SHORT", weightPct: 100 }]);
+  });
+});
+
+describe("consecutive-loss ledger — scratch (fee-only) closes must not false-trip the kill-switch", () => {
+  // Regression for 2026-07-04: live latched on "max consecutive losses hit (6)" where 3 of the 6
+  // "losses" were -$0.017 breakeven-after-cost fee scratches. A near-breakeven auto close is neutral.
+  function ledger(engine: LiveExecutionEngine) {
+    return (engine as unknown as {
+      applyRealizedToLedger: (net: number, c?: "auto" | "adverse") => void;
+    }).applyRealizedToLedger.bind(engine);
+  }
+
+  it("a sub-epsilon auto close is a scratch: it neither increments nor resets the streak", () => {
+    const { engine, store } = makeEngine({ config: { scratchEpsilonUsd: 0.1 } });
+    const apply = ledger(engine);
+    apply(-2); // real loss → streak 1
+    apply(-2); // real loss → streak 2
+    expect(store.getState().consecutiveLosses).toBe(2);
+    apply(-0.017); // fee scratch → NEUTRAL, streak unchanged (must not reach 3)
+    apply(-0.017);
+    apply(-0.05);
+    expect(store.getState().consecutiveLosses).toBe(2);
+    expect(store.getState().dailyLedger.scratches).toBe(3);
+    // a real loss after the scratches keeps counting from where the streak was
+    apply(-2);
+    expect(store.getState().consecutiveLosses).toBe(3);
+  });
+
+  it("a tiny positive scratch does NOT reset a real losing streak", () => {
+    const { engine, store } = makeEngine({ config: { scratchEpsilonUsd: 0.1 } });
+    const apply = ledger(engine);
+    apply(-2);
+    apply(-2);
+    apply(0.02); // fee-only positive scratch → neutral, streak preserved
+    expect(store.getState().consecutiveLosses).toBe(2);
+    apply(0.5); // a real win DOES reset
+    expect(store.getState().consecutiveLosses).toBe(0);
+  });
+
+  it("an ADVERSE flatten always counts as a loss regardless of magnitude (churn stays visible)", () => {
+    const { engine, store } = makeEngine({ config: { scratchEpsilonUsd: 0.1 } });
+    const apply = ledger(engine);
+    apply(-0.01, "adverse"); // tiny but adverse → still a loss
+    apply(0, "adverse"); // zero but adverse → still a loss
+    expect(store.getState().consecutiveLosses).toBe(2);
+    expect(store.getState().dailyLedger.scratches ?? 0).toBe(0);
+  });
+
+  it("replaying the 2026-07-04 trip streak no longer reaches 6", () => {
+    const { engine, store } = makeEngine({ config: { scratchEpsilonUsd: 0.1, maxConsecutiveLosses: 6 } });
+    const apply = ledger(engine);
+    for (const net of [-0.017, -0.017, -0.017, -0.509, -1.42, -0.067]) apply(net);
+    // only -0.509 and -1.42 are real losses; the rest are scratches
+    expect(store.getState().consecutiveLosses).toBe(2);
+    expect(store.getState().consecutiveLosses).toBeLessThan(6);
   });
 });
