@@ -237,11 +237,17 @@ export async function registerScanRoute(
     };
   };
 
+  // Returns a settlement promise (resolves once every dispatched task has finished/failed) — tasks
+  // still start immediately via setImmediate, so no caller of scheduleAsyncQueueTasks itself waits
+  // any longer than before. The settlement promise exists purely so a LATER cycle's dispatch can be
+  // chained after it (see lastAsyncQueueSettled below), closing the lost-update race where two
+  // cycles' background tasks (tracker/shadowEngine/outcomeChecker) concurrently read-mutate-write
+  // the same JSON stores and whichever finishes last silently overwrites the other's work.
   const scheduleAsyncQueueTasks = (
     timing: ScanTimingCollector,
     queueBuildMs: number,
     tasks: Array<{ name: string; run: () => Promise<void> }>,
-  ): void => {
+  ): Promise<void> => {
     const queuedAtMs = Date.now();
     const taskTimings: QueueTaskTimingDiagnostics[] = tasks.map((task) => ({
       name: task.name,
@@ -254,7 +260,7 @@ export async function registerScanRoute(
     }));
     const update = () => timing.setAsyncQueueDispatchDiagnostics(buildAsyncQueueDiagnostics(queueBuildMs, taskTimings));
     update();
-    for (const [index, task] of tasks.entries()) {
+    const settlements = tasks.map((task, index) => new Promise<void>((resolve) => {
       setImmediate(() => {
         const item = taskTimings[index]!;
         const startedMs = Date.now();
@@ -275,10 +281,16 @@ export async function registerScanRoute(
             item.finishedAt = new Date(finishedMs).toISOString();
             item.runMs = Math.max(0, finishedMs - startedMs);
             update();
+            resolve();
           });
       });
-    }
+    }));
+    return Promise.all(settlements).then(() => undefined);
   };
+
+  // Chains each cycle's background-task dispatch after the PREVIOUS cycle's settlement (see the
+  // dispatch call site below). This must live outside runCoreScanCycle so it persists across calls.
+  let lastAsyncQueueSettled: Promise<void> = Promise.resolve();
 
   async function runCoreScanCycle() {
     const timing = new ScanTimingCollector();
@@ -1165,7 +1177,15 @@ export async function registerScanRoute(
       });
     }
     const queueBuildMs = Math.max(0, Date.now() - asyncQueueBuildStartedMs);
-    scheduleAsyncQueueTasks(timing, queueBuildMs, asyncTasks);
+    // Chain (not await) this cycle's dispatch onto the previous cycle's settlement — two
+    // overlapping cycles' background tasks must never run concurrently against the same JSON
+    // stores. Chaining rather than awaiting keeps THIS request's own response time unaffected;
+    // it only defers the actual start of this cycle's writes if the previous cycle's are still
+    // in flight (rare in practice — background tasks normally finish well within the 7-min
+    // auto-refresh interval — and closes the race window entirely when it does happen).
+    lastAsyncQueueSettled = lastAsyncQueueSettled.catch(() => undefined).then(
+      () => scheduleAsyncQueueTasks(timing, queueBuildMs, asyncTasks),
+    );
     timing.finishStage("asyncQueueDispatch");
     // Report-only/paper-only: cache the FRESH scan candidates so the operator-brief
     // paper-opportunity allocator can evaluate them without re-scanning. The scan's

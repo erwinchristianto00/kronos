@@ -1966,7 +1966,16 @@ export async function registerShadowRoutes(
             // rendered in Section 10) are recomputed AFTER the resolver from the
             // single final post-resolve store snapshot so the brief never mixes a
             // pre-resolve (closed=N) audit with a post-resolve (closed=N+1) report.
-          } catch { /* allocator failure must never break the brief */ }
+          } catch (error) {
+            // Containment is correct (an allocator bug must never break the whole brief), but this
+            // is the ADMISSION path — not a report endpoint — so a silent catch here means the bot
+            // can stop admitting new positions for an arbitrary number of cycles with zero signal
+            // anywhere (no log line, no field on the response). Surface it without changing the
+            // containment behavior itself.
+            console.error(
+              `[shadow] paper allocator/admission failed this cycle (admission skipped, prior report retained): ${error instanceof Error ? error.message : String(error)}`,
+            );
+          }
           finally {
             if (admissionTrace) {
               if (!admissionTrace.allocatorFinishedAt) admissionTrace.allocatorFinishedAt = new Date().toISOString();
@@ -2005,6 +2014,10 @@ export async function registerShadowRoutes(
                 };
 
           const allocatorSelectedLaneId = allocatorReport?.selectedOpportunities[0]?.laneId ?? null;
+          const resolverMaxRuntimeMs = (() => {
+            const n = Number(process.env.PAPER_RESOLVER_MAX_RUNTIME_MS);
+            return Number.isFinite(n) && n > 0 ? Math.max(8_000, Math.floor(n)) : 12_000;
+          })();
           const paperRunPromise = runPaperAdmissionAndResolution({
             store: paperStore,
             vmStore: getCurrentGuardVariantMatrixStore(),
@@ -2046,14 +2059,19 @@ export async function registerShadowRoutes(
               const n = Number(process.env.PAPER_RESOLVER_MAX_ORDERS_PER_RUN);
               return Number.isFinite(n) && n > 0 ? Math.max(40, Math.floor(n)) : 80;
             })(),
-            resolverMaxRuntimeMs: (() => {
-              const n = Number(process.env.PAPER_RESOLVER_MAX_RUNTIME_MS);
-              return Number.isFinite(n) && n > 0 ? Math.max(8_000, Math.floor(n)) : 12_000;
-            })(),
+            resolverMaxRuntimeMs,
           });
+          // The outer race is a backstop for the resolver failing to respect its own
+          // resolverMaxRuntimeMs budget (e.g. hanging inside a single candle fetch that doesn't
+          // hit the loop's time-check) — it must never be TIGHTER than that budget itself. It
+          // previously hardcoded 8_000ms while the budget defaulted to 12_000ms, so under default
+          // config this race ALWAYS discarded the resolver's work before it could finish normally,
+          // silently re-narrowing the very floor the 2026-06-22 SANITY FLOOR comment above raised.
+          // .catch() prevents an unhandled rejection if the abandoned promise fails after we've
+          // already moved on with the stale paperReport.
           const result = await Promise.race([
-            paperRunPromise,
-            new Promise<null>((res) => { setTimeout(() => res(null), 8_000); }),
+            paperRunPromise.catch(() => null),
+            new Promise<null>((res) => { setTimeout(() => res(null), resolverMaxRuntimeMs + 4_000); }),
           ]);
           if (result !== null) paperReport = result;
 

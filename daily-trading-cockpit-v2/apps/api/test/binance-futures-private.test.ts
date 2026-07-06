@@ -158,4 +158,49 @@ describe("binance-futures-private signing", () => {
     expect(algoUrl).toContain("triggerPrice=0.12346");
     expect(urls.filter((u) => u.includes("/fapi/v1/exchangeInfo"))).toHaveLength(1);
   });
+
+  it("re-fetches exchange filters after the TTL instead of caching them for the process lifetime", async () => {
+    let exchangeInfoCalls = 0;
+    let simulatedNowMs = 1_000_000_000_000;
+    const fetchImpl = (async (url: RequestInfo | URL) => {
+      const u = String(url);
+      if (u.includes("/fapi/v1/time")) {
+        return new Response(JSON.stringify({ serverTime: simulatedNowMs }), { status: 200 });
+      }
+      if (u.includes("/fapi/v1/exchangeInfo")) {
+        exchangeInfoCalls += 1;
+        return new Response(JSON.stringify({
+          symbols: [{
+            symbol: "DOGEUSDT",
+            pricePrecision: 5,
+            quantityPrecision: 0,
+            filters: [
+              { filterType: "PRICE_FILTER", tickSize: "0.0000100" },
+              { filterType: "LOT_SIZE", stepSize: "1", minQty: "1" },
+              { filterType: "MIN_NOTIONAL", notional: "5" },
+            ],
+          }],
+        }), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    }) as typeof fetch;
+
+    const client = new BinanceFuturesPrivateClient({
+      apiKey: "k", apiSecret: "s", env: "testnet", fetchImpl,
+      nowMs: () => simulatedNowMs,
+    });
+
+    await client.getExchangeFilters();
+    expect(exchangeInfoCalls).toBe(1);
+
+    // Well within the 6h TTL — must reuse the cached filters, not re-fetch.
+    simulatedNowMs += 60 * 60 * 1000; // +1h
+    await client.getExchangeFilters();
+    expect(exchangeInfoCalls).toBe(1);
+
+    // Past the 6h TTL — must re-fetch rather than keep serving stale specs.
+    simulatedNowMs += 6 * 60 * 60 * 1000; // +6h more (total +7h)
+    await client.getExchangeFilters();
+    expect(exchangeInfoCalls).toBe(2);
+  });
 });

@@ -45,6 +45,13 @@ const MAX_CLOCK_SKEW_MS = 4_000;
 const GET_MAX_RETRIES = 2;
 // Sync every 60 s so the offset stays fresh even on hosts with fast clock drift.
 const TIME_SYNC_TTL_MS = 60_000;
+// Re-fetch exchange filters (tickSize/stepSize/minQty/minNotional) periodically instead of caching
+// them for the process lifetime. Binance occasionally updates a symbol's LOT_SIZE/PRICE_FILTER/
+// MIN_NOTIONAL specs; without a TTL, a long-running process (days between restarts) would keep
+// rounding orders to stale specs for that symbol until Binance rejects them. Fails safe either way
+// (a stale filter causes an order rejection, not a silent wrong-size fill) — this just shrinks the
+// window instead of leaving it open for the whole process lifetime.
+const EXCHANGE_FILTERS_TTL_MS = 6 * 60 * 60 * 1000; // 6h
 
 // ─── errors ──────────────────────────────────────────────────────────────────
 
@@ -314,6 +321,7 @@ export class BinanceFuturesPrivateClient {
   private lastTimeSyncAtMs = 0;
   private lastMeasuredSkewMs = 0;
   private exchangeFiltersCache: Map<string, FuturesSymbolFilters> | null = null;
+  private exchangeFiltersCacheAtMs = 0;
 
   constructor(options: BinanceFuturesPrivateClientOptions) {
     this.apiKey = options.apiKey;
@@ -478,7 +486,9 @@ export class BinanceFuturesPrivateClient {
   // ── public endpoints ───────────────────────────────────────────────────────
 
   async getExchangeFilters(): Promise<Map<string, FuturesSymbolFilters>> {
-    if (this.exchangeFiltersCache) return new Map(this.exchangeFiltersCache);
+    if (this.exchangeFiltersCache && this.nowMs() - this.exchangeFiltersCacheAtMs < EXCHANGE_FILTERS_TTL_MS) {
+      return new Map(this.exchangeFiltersCache);
+    }
     const parsed = await this.requestPublic("/fapi/v1/exchangeInfo");
     const symbols = (parsed as { symbols?: unknown })?.symbols;
     const out = new Map<string, FuturesSymbolFilters>();
@@ -505,6 +515,7 @@ export class BinanceFuturesPrivateClient {
       });
     }
     this.exchangeFiltersCache = out;
+    this.exchangeFiltersCacheAtMs = this.nowMs();
     return new Map(out);
   }
 
