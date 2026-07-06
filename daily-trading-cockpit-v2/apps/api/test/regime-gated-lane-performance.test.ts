@@ -74,3 +74,41 @@ describe("regime-gated-lane-performance", () => {
     expect(buildRegimeGatedLaneReport(obs).lanes[0]!.raw.n).toBe(1);
   });
 });
+
+describe("regime-gated verdict is BOOK-R based (not the per-trade-average survivorship trap)", () => {
+  it("WORSENED when the gate would drop net-WINNING counter-regime trades (the CG_WIDE_LONG_RUNNER case)", () => {
+    const obs: RgObservation[] = [
+      // kept (regime-aligned) longs — modest winners
+      ...Array.from({ length: 30 }, () => ({
+        variantId: "RUNNER", direction: "LONG" as const, regime: "Bullish expansion",
+        posture: "EXTENDED" as const, regimeDirection: "LONG" as const, netR: 0.2,
+      })),
+      // counter-regime longs the gate DROPS — but they are BIG WINNERS (+1.0R)
+      ...Array.from({ length: 20 }, () => ({
+        variantId: "RUNNER", direction: "LONG" as const, regime: "Bearish pressure",
+        posture: "EXTENDED" as const, regimeDirection: "SHORT" as const, netR: 1.0,
+      })),
+    ];
+    const row = buildRegimeGatedLaneReport(obs).lanes.find((l) => l.variantId === "RUNNER")!;
+    // per-trade average RISES (0.52 → 0.20?) ... actually gated avg (0.2) < raw avg (0.52), but the
+    // point is the BOOK: dropping 20 trades @ +1.0R = -20R of realized edge.
+    expect(row.deltaBookR).toBeCloseTo(-20, 5);
+    expect(row.verdict).toBe("WORSENED");
+    expect(row.gatedTradeable).toBe(true); // lane is still a net winner, so the loss is real
+  });
+
+  it("report aggregates the book-R impact over tradeable lanes (the decision number)", () => {
+    const obs: RgObservation[] = [
+      ...Array.from({ length: 30 }, () => ({
+        variantId: "RUNNER", direction: "LONG" as const, regime: "Bullish expansion",
+        posture: "EXTENDED" as const, regimeDirection: "LONG" as const, netR: 0.2,
+      })),
+      ...Array.from({ length: 20 }, () => ({
+        variantId: "RUNNER", direction: "LONG" as const, regime: "Bearish pressure",
+        posture: "EXTENDED" as const, regimeDirection: "SHORT" as const, netR: 1.0,
+      })),
+    ];
+    const report = buildRegimeGatedLaneReport(obs);
+    expect(report.deltaBookRTradeableLanes).toBeCloseTo(-20, 5);
+  });
+});

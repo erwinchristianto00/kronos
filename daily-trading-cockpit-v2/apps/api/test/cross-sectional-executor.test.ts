@@ -221,4 +221,44 @@ describe("executor variant targeting", () => {
     expect(store.getState().baskets.length).toBe(0);
     expect(executor.getStatus().variant).toBe("FILTERED");
   });
+
+  it("opens a signal up to the wider 50-min freshness window (was rejected at 15 min)", async () => {
+    const { executor, store } = makeExecutor({ signalMs: NOW_MS - 30 * 60_000 }); // 30 min old
+    await executor.tick();
+    expect(store.getState().baskets.length).toBe(1); // fresh under the 50-min default
+    expect(store.getState().baskets[0]!.status).toBe("OPEN");
+  });
+
+  it("respects CROSS_SECTIONAL_EXEC_MAX_SIGNAL_AGE_MS override", async () => {
+    process.env.CROSS_SECTIONAL_EXEC_MAX_SIGNAL_AGE_MS = String(10 * 60_000);
+    try {
+      const { executor, store } = makeExecutor({ signalMs: NOW_MS - 30 * 60_000 }); // 30 min > 10 min
+      await executor.tick();
+      expect(store.getState().baskets.length).toBe(0); // stale under the tighter override
+    } finally {
+      delete process.env.CROSS_SECTIONAL_EXEC_MAX_SIGNAL_AGE_MS;
+    }
+  });
+
+  it("opens multiple concurrent baskets when CROSS_SECTIONAL_EXEC_MAX_OPEN_BASKETS>1 (was locked to 1)", async () => {
+    process.env.CROSS_SECTIONAL_EXEC_MAX_OPEN_BASKETS = "3";
+    try {
+      const { executor, signalStore, store } = makeExecutor({ signalMs: NOW_MS - 20 * 60_000 });
+      await executor.tick();
+      expect(store.getState().baskets.filter((b) => b.status === "OPEN").length).toBe(1);
+      signalStore.add(signalObs(NOW_MS - 3 * 60_000)); // newer than the watermark
+      await executor.tick();
+      expect(store.getState().baskets.filter((b) => b.status === "OPEN").length).toBe(2);
+    } finally {
+      delete process.env.CROSS_SECTIONAL_EXEC_MAX_OPEN_BASKETS;
+    }
+  });
+
+  it("still caps concurrent baskets at MAX_OPEN_BASKETS (default 1)", async () => {
+    const { executor, signalStore, store } = makeExecutor({ signalMs: NOW_MS - 20 * 60_000 });
+    await executor.tick();
+    signalStore.add(signalObs(NOW_MS - 3 * 60_000));
+    await executor.tick();
+    expect(store.getState().baskets.filter((b) => b.status === "OPEN").length).toBe(1);
+  });
 });

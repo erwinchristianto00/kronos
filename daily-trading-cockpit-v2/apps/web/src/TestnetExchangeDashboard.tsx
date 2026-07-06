@@ -118,6 +118,7 @@ interface LiveStatus {
     allowedLaneIds: string[] | null;
     laneAllocations: Array<{ laneId: string; weightPct: number }> | null;
     mode: string;
+    manualSelectorMode?: boolean;
   };
   killedAt?: string | null;
   killReason?: string | null;
@@ -499,6 +500,17 @@ async function fetchJson<T>(url: string): Promise<T> {
   return body as T;
 }
 
+type PsleCellRow = {
+  laneId: string; symbol: string; direction: 'LONG' | 'SHORT' | 'MIXED' | null;
+  closed: number; headlineClosed: number; netAvgR: number | null; pf: number | null; wr: number | null;
+  promotable: boolean; testnetCandidate: boolean;
+};
+type PsleReport = {
+  minClosed: number; cells: PsleCellRow[];
+  summary: { testnetCandidateCells: number; promotableCells: number;
+    byDirection: Record<'LONG' | 'SHORT' | 'MIXED', { measured: number; testnetCandidate: number; promotable: number }> };
+};
+
 export default function TestnetExchangeDashboard() {
   const isLivePage = window.location.pathname.startsWith('/live');
   const pageApiPrefix = isLivePage ? LIVE_API_PREFIX : TESTNET_API_PREFIX;
@@ -531,6 +543,7 @@ export default function TestnetExchangeDashboard() {
   const [allocWeight3, setAllocWeight3] = useState('0');
   const [allocWeight4, setAllocWeight4] = useState('0');
   const [regimeReport, setRegimeReport] = useState<RegimeEngineReport | null>(null);
+  const [psle, setPsle] = useState<PsleReport | null>(null);
   const [headlineLaneOptions, setHeadlineLaneOptions] = useState<string[]>([]);
   const laneAllocationOptions = Array.from(new Set(
     [...LIVE_LANE_OPTIONS, ...headlineLaneOptions, allocLane1, allocLane2, allocLane3, allocLane4].filter(Boolean),
@@ -577,6 +590,13 @@ export default function TestnetExchangeDashboard() {
     void control(`${pageApiPrefix}/live/arm`, { confirm: 'ARM' }, `Arm ${pageName}`, loadExchangeOnly);
   };
   const disarmCurrent = () => control(`${pageApiPrefix}/live/disarm`, {}, `Disarm ${pageName}`, loadExchangeOnly);
+  const toggleManualMode = () =>
+    control(
+      `${pageApiPrefix}/live/manual-mode`,
+      { enabled: !(status?.laneSelection?.manualSelectorMode === true) },
+      'Manual selector mode',
+      loadExchangeOnly,
+    );
 
   const applyAllocation = () => {
     const allocations: Array<{ laneId: string; weightPct: number }> = [];
@@ -671,6 +691,17 @@ export default function TestnetExchangeDashboard() {
     }
   }
 
+  // Per-symbol book edge for THIS instance's book (live shows the mainnet book, testnet the testnet
+  // book) — the book-proven symbols the live auto-rotation admits. Own cadence, fail-soft.
+  async function loadPerSymbol() {
+    try {
+      const res = await fetch(`${pageApiPrefix}/shadow/per-symbol-lane-edge`, { cache: 'no-store' });
+      setPsle(await res.json());
+    } catch {
+      setPsle(null);
+    }
+  }
+
   useEffect(() => {
     void loadExchangeOnly();
   }, [performanceView, performanceDay, performanceMonth, performanceYear, performanceRegime]);
@@ -695,9 +726,11 @@ export default function TestnetExchangeDashboard() {
   // on /live even if a live endpoint hiccups). Refreshes every 15s.
   useEffect(() => {
     void loadRegimeReport();
+    void loadPerSymbol();
     if (!autoRefresh) return undefined;
     const timer = window.setInterval(() => {
       void loadRegimeReport();
+      void loadPerSymbol();
     }, 15_000);
     return () => window.clearInterval(timer);
   }, [autoRefresh]);
@@ -789,6 +822,26 @@ export default function TestnetExchangeDashboard() {
             <small style={{ display: 'block', marginBottom: 4 }}>{pageName} engine{isLivePage ? ' (real money)' : ''}</small>
             <button type="button" disabled={controlBusy || status?.armed === true} onClick={armCurrent}>Arm</button>{' '}
             <button type="button" disabled={controlBusy || status?.armed !== true} onClick={() => void disarmCurrent()}>Disarm</button>
+          </div>
+          <div>
+            <small style={{ display: 'block', marginBottom: 4 }}>
+              Execution mode{' '}
+              <strong style={{ color: status?.laneSelection?.manualSelectorMode ? '#e0a83a' : '#4a9d6a' }}>
+                {status?.laneSelection?.manualSelectorMode ? 'MANUAL (raw selector)' : 'SMART (book+regime)'}
+              </strong>
+            </small>
+            <button
+              type="button"
+              disabled={controlBusy}
+              onClick={() => void toggleManualMode()}
+              title={
+                status?.laneSelection?.manualSelectorMode
+                  ? 'Manual ON: trades exactly the lane allocation selector, bypassing the book overlay + regime direction-gate. Click to return to SMART.'
+                  : 'SMART ON: book overlay + regime direction-gate active. Click to switch to MANUAL (raw selector, bypass smart logic).'
+              }
+            >
+              {status?.laneSelection?.manualSelectorMode ? 'Switch to SMART' : 'Switch to MANUAL (bypass)'}
+            </button>
           </div>
           <div>
             <small style={{ display: 'block', marginBottom: 4 }}>
@@ -950,6 +1003,47 @@ export default function TestnetExchangeDashboard() {
                     <td>{position.laneIds.length > 0 ? position.laneIds.map(compactLane).join(', ') : 'unattributed'}</td>
                   </tr>
                 ))}
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section className="testnet-panel">
+          <header>
+            <span>Book-proven symbols ({pageName} book) — auto-rotation</span>
+            <strong>{psle?.summary?.testnetCandidateCells ?? 0}</strong>
+          </header>
+          <p className="tone-measure" style={{ margin: '4px 0', fontSize: 12 }}>
+            Each (symbol × lane × direction) scored on THIS instance&apos;s realized book. testnet-cand = book-credible (drives the live auto-rotation); PROMOTABLE = also headline-confirmed. MAKER / too-good PF/WR auto-excluded.
+            {psle?.summary && (
+              <> LONG {psle.summary.byDirection.LONG.testnetCandidate} · SHORT {psle.summary.byDirection.SHORT.testnetCandidate} · MIXED {psle.summary.byDirection.MIXED.testnetCandidate} · {psle.summary.promotableCells} promotable{psle.summary.promotableCells === 0 ? ' (all diagnostic-only — headline confirmation accrues over time)' : ''}</>
+            )}
+          </p>
+          <div className="testnet-table-wrap">
+            <table>
+              <thead>
+                <tr><th>Symbol</th><th>Dir</th><th>Lane</th><th>Book avgR</th><th>PF</th><th>WR</th><th>n</th><th>hl</th><th>Stage</th></tr>
+              </thead>
+              <tbody>
+                {(() => {
+                  const rows = (psle?.cells ?? [])
+                    .filter((c) => c.testnetCandidate || c.promotable)
+                    .sort((a, b) => (b.netAvgR ?? -9) - (a.netAvgR ?? -9));
+                  if (rows.length === 0) return <tr><td colSpan={9}>No book-proven symbols yet — accruing.</td></tr>;
+                  return rows.map((c) => (
+                    <tr key={`${c.laneId}:${c.symbol}:${c.direction}`}>
+                      <td>{c.symbol.replace(/USDT$/, '')}</td>
+                      <td className={c.direction === 'LONG' ? 'tone-healthy' : 'tone-critical'}>{c.direction}</td>
+                      <td>{compactLane(c.laneId)}</td>
+                      <td className={tone(c.netAvgR ?? 0)}>{c.netAvgR == null ? '—' : `${c.netAvgR >= 0 ? '+' : ''}${c.netAvgR.toFixed(3)}R`}</td>
+                      <td>{c.pf == null ? '—' : c.pf.toFixed(2)}</td>
+                      <td>{c.wr == null ? '—' : `${Math.round(c.wr * 100)}%`}</td>
+                      <td>{c.closed}</td>
+                      <td className={c.headlineClosed > 0 ? 'tone-healthy' : ''}>{c.headlineClosed}</td>
+                      <td>{c.promotable ? <strong className="tone-healthy">PROMOTABLE</strong> : <span className="tone-measure">testnet-cand</span>}</td>
+                    </tr>
+                  ));
+                })()}
               </tbody>
             </table>
           </div>

@@ -180,6 +180,13 @@ import {
   buildSnapshotFromReport,
 } from "../lib/regime-direction-controller-snapshot.js";
 import { buildNeuralMapTelemetry, buildPaperUnrealizedSnapshot } from "../lib/neural-map-telemetry.js";
+import { buildPerSymbolLaneBookEdge } from "../lib/per-symbol-lane-book-edge.js";
+import {
+  runIntradayMomentumCycleGuarded,
+  buildIntradayMomentumReport,
+  getIntradayMomentumStore,
+  IM_INTERVAL,
+} from "../lib/intraday-momentum-edge.js";
 import {
   assessPaperTp,
   readPaperTradingControls,
@@ -1258,6 +1265,37 @@ export async function registerShadowRoutes(
     return dashboardSummary;
   });
 
+  // Per-symbol × lane BOOK edge (report-only). Which symbols carry real, realized-book-proven edge —
+  // even inside a benched lane — and via which lane. The disciplined basis for opening MORE symbols
+  // than the 3-per-batch cap WITHOUT trading the panel's optimistic sim mirages. Measures only.
+  app.get("/api/shadow/per-symbol-lane-edge", async () => {
+    const generatedAt = new Date().toISOString();
+    const orders = getPaperExecutionRouterStore().getState().orders;
+    const envInt = (v: string | undefined, d: number) => {
+      const n = Number(v);
+      return Number.isFinite(n) && n > 0 ? Math.floor(n) : d;
+    };
+    const envNum = (v: string | undefined, d: number) => {
+      const n = Number(v);
+      return Number.isFinite(n) ? n : d;
+    };
+    const report = buildPerSymbolLaneBookEdge(orders, {
+      minClosed: envInt(process.env.PSLE_MIN_CLOSED, 40),
+      minHeadlineClosed: envInt(process.env.PSLE_MIN_HEADLINE_CLOSED, 20),
+      posMinAvgR: envNum(process.env.PSLE_POS_MIN_AVG_R, 0.03),
+      negMaxAvgR: envNum(process.env.PSLE_NEG_MAX_AVG_R, -0.03),
+      displayFloor: envInt(process.env.PSLE_DISPLAY_FLOOR, 10),
+      suspiciousPf: envNum(process.env.PSLE_SUSPICIOUS_PF, 10),
+      suspiciousWr: envNum(process.env.PSLE_SUSPICIOUS_WR, 0.98),
+    });
+    return { generatedAt, ...report };
+  });
+
+  // Intraday momentum hunter (Sleeve 2) report — report-only measurement, nothing trades on it.
+  app.get("/api/shadow/intraday-momentum-report", async () => {
+    return { generatedAt: new Date().toISOString(), ...buildIntradayMomentumReport(getIntradayMomentumStore().all) };
+  });
+
   app.get("/api/shadow/neural-map", async () => {
     const generatedAt = new Date().toISOString();
     const cached = getLatestScanCandidates();
@@ -1603,6 +1641,18 @@ export async function registerShadowRoutes(
                 takerBuySellRatio: flowValue?.takerBuySellRatio ?? null,
               };
             },
+          }).catch(() => undefined);
+        }
+        // Intraday momentum hunter (Sleeve 2): 1h breakout + volume surge + momentum → MFE-giveback
+        // exit. Hunts the coin that pumps TODAY regardless of the chop macro tape. Report-only,
+        // fire-and-forget, env-gated. NOT regime-gated — it finds per-symbol momentum, not macro trend.
+        if (process.env.INTRADAY_MOMENTUM_DISABLED !== "1") {
+          const _imc = opts.binanceClient;
+          void runIntradayMomentumCycleGuarded({
+            store: getIntradayMomentumStore(),
+            universe: [...CURRENT_SCANNER_UNIVERSE],
+            now: Date.now(),
+            fetchCandles: async (symbol: string) => _imc.getCandles(symbol, IM_INTERVAL, 120),
           }).catch(() => undefined);
         }
         // Cross-sectional market-neutral measurement lane: rank the universe by N-bar momentum, go

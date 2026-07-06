@@ -45,6 +45,10 @@ import {
   buildRegimeRotationShortlistReport,
   rotationLaneIdForVariant,
 } from "../lib/regime-rotation-shortlist.js";
+import { buildPerSymbolLaneBookEdge } from "../lib/per-symbol-lane-book-edge.js";
+import { applyBookEdgeToRotationShortlist } from "../lib/rotation-shortlist-book-overlay.js";
+import type { SymbolRotationMode } from "../lib/per-symbol-rotation.js";
+import { getPaperExecutionRouterStore } from "../lib/paper-execution-router.js";
 import {
   RegimeControllerAlignedShadowStore,
   admitToControllerAlignedShadow,
@@ -183,6 +187,7 @@ export async function registerScanRoute(
     liveEngineGetter?: (() => {
       laneSelectionAllowsLane(laneId: string): boolean;
       laneSelectionExplicitlyIncludesLane(laneId: string): boolean;
+      isManualSelectorMode?: () => boolean;
     } | null);
   } = {},
 ): Promise<CoreScanAutoRefreshController> {
@@ -390,9 +395,26 @@ export async function registerScanRoute(
       timing.startStage("realtimeShortMirror");
       try {
         const vmReport = buildCurrentGuardVariantMatrixReport(getCurrentGuardVariantMatrixStore());
-        const rotationShortlist = buildRegimeRotationShortlistReport(vmReport, {
+        let rotationShortlist = buildRegimeRotationShortlistReport(vmReport, {
           generatedAt: new Date().toISOString(),
         });
+        // Operator MANUAL SELECTOR MODE (live toggle): trade RAW per the lane allocation selector —
+        // bypass the 2b book overlay AND the regime direction-gate below. Hard safety rails are kept.
+        const manualSelectorMode = opts.liveEngineGetter?.()?.isManualSelectorMode?.() === true;
+        // 2b: overlay the REALIZED per-symbol BOOK edge on the (sim-derived) rotation shortlist so
+        // admission auto-rotates on real economics — book-negative symbols are vetoed (don't get stuck
+        // on a bad symbol) and book-proven ones are admitted. Env-gated + OFF by default (opt-in per
+        // instance: PER_SYMBOL_BOOK_ROTATION_MODE = TESTNET | LIVE_CONFIRMED | LIVE_CREDIBLE). Never
+        // throws — a bad overlay must not break the scan. Skipped entirely in manual selector mode.
+        if (!manualSelectorMode && process.env.PER_SYMBOL_BOOK_ROTATION_ENABLED === "1") {
+          try {
+            const mode = (process.env.PER_SYMBOL_BOOK_ROTATION_MODE as SymbolRotationMode) || "TESTNET";
+            const bookReport = buildPerSymbolLaneBookEdge(getPaperExecutionRouterStore().getState().orders);
+            rotationShortlist = applyBookEdgeToRotationShortlist(rotationShortlist, bookReport, { mode });
+          } catch (err) {
+            console.warn(`[scan] per-symbol book rotation overlay skipped: ${err instanceof Error ? err.message : String(err)}`);
+          }
+        }
         const liveLaneSelection = opts.liveEngineGetter?.() ?? null;
         const manualEnabledVariantIds = new Set<string>();
         const liveLaneAllowsVariant = (variantId: string): boolean => {
@@ -435,10 +457,15 @@ export async function registerScanRoute(
         // edgeGate here) — the mirror's live/testnet order admission was never actually protected by
         // it. Pure risk-reducer: can only narrow controllerMode (e.g. to NO_TRADE_NEGATIVE_EDGE), never
         // widen it, so this cannot ADD a trade that wasn't already regime-permitted.
-        const controllerReport = buildRegimeDirectionControllerReport({
+        const baseControllerReport = buildRegimeDirectionControllerReport({
           currentRegime: result.marketRegime,
           edgeGate: getRegimeEdgeMemory(),
         });
+        // Manual selector mode: force the direction gate open (BOTH_ALLOWED) so the operator's picked
+        // lanes trade in their own direction regardless of the detected regime.
+        const controllerReport = manualSelectorMode
+          ? { ...baseControllerReport, controllerMode: "BOTH_ALLOWED" as const }
+          : baseControllerReport;
         const estimatedRegime = estimateLaneSelectorV2Regime({
           regime: controllerReport.currentRegime,
           controllerMode: controllerReport.controllerMode,

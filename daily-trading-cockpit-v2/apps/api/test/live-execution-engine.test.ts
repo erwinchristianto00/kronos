@@ -250,6 +250,7 @@ function makeConfig(overrides: Partial<LiveExecutionConfig> = {}): LiveExecution
     maxConcurrentPositions: 3,
     maxCorrelatedAltLongPositions: 3,
     maxCorrelatedAltShortPositions: 3,
+    maxClusterPositions: 3,
     dailyMaxLossUsd: 15,
     maxConsecutiveLosses: 5,
     scratchEpsilonUsd: 0.1,
@@ -271,6 +272,8 @@ function makeConfig(overrides: Partial<LiveExecutionConfig> = {}): LiveExecution
     mainnetRegimeHardCutMs: 30 * 60 * 1000,
     profitBankNetTargetUsd: 0,
     regimeLossHardCutStopFraction: 0.5,
+    forceMfeGiveback: false,
+    losingMaxHoldMs: 0,
     laneSelectionLossResetUsd: 0.25,
     rescue: {
       enabled: false,
@@ -1167,8 +1170,11 @@ describe("LiveExecutionEngine", () => {
     expect(client.placed.filter((p) => p.type === "MARKET" && !p.reduceOnly).length).toBe(1);
   });
 
-  it("caps correlated alt exposure per direction even when total position cap is high", async () => {
-    const symbols = ["SUIUSDT", "ADAUSDT", "AVAXUSDT", "SOLUSDT", "LINKUSDT", "ETHUSDT"];
+  it("caps exposure PER correlation cluster (a different basket gets its own slots; majors exempt)", async () => {
+    // SUI/ADA/AVAX are all L1 → share one L1:SHORT cluster cap. DOGE is MEME (own cluster). ETH is a
+    // major (exempt). With maxClusterPositions=2: the 3rd L1 short (AVAX) is blocked, but DOGE (a
+    // different cluster) and ETH (major) still get in — the whole point of cluster-scoping the cap.
+    const symbols = ["SUIUSDT", "ADAUSDT", "AVAXUSDT", "DOGEUSDT", "ETHUSDT"];
     const client = new FakeLiveClient();
     client.getExchangeFilters = async () =>
       new Map(symbols.map((symbol) => [symbol, { ...FILTERS, symbol }]));
@@ -1176,32 +1182,16 @@ describe("LiveExecutionEngine", () => {
       paperOrder({ paperOrderId: "short-sui", symbol: "SUIUSDT", createdAt: "2099-01-02T00:00:01.000Z" } as Partial<PaperOrder>),
       paperOrder({ paperOrderId: "short-ada", symbol: "ADAUSDT", createdAt: "2099-01-02T00:00:02.000Z" } as Partial<PaperOrder>),
       paperOrder({ paperOrderId: "short-avax", symbol: "AVAXUSDT", createdAt: "2099-01-02T00:00:03.000Z" } as Partial<PaperOrder>),
-      paperOrder({
-        paperOrderId: "long-sol",
-        symbol: "SOLUSDT",
-        direction: "LONG",
-        stopLoss: 1900,
-        takeProfitLevels: [2100],
-        createdAt: "2099-01-02T00:00:04.000Z",
-      } as Partial<PaperOrder>),
-      paperOrder({
-        paperOrderId: "long-link",
-        symbol: "LINKUSDT",
-        direction: "LONG",
-        stopLoss: 1900,
-        takeProfitLevels: [2100],
-        createdAt: "2099-01-02T00:00:05.000Z",
-      } as Partial<PaperOrder>),
-      // Majors are not counted in the correlated-alt basket.
-      paperOrder({ paperOrderId: "short-eth", symbol: "ETHUSDT", createdAt: "2099-01-02T00:00:06.000Z" } as Partial<PaperOrder>),
+      paperOrder({ paperOrderId: "short-doge", symbol: "DOGEUSDT", createdAt: "2099-01-02T00:00:04.000Z" } as Partial<PaperOrder>),
+      // Majors are exempt from the per-cluster cap.
+      paperOrder({ paperOrderId: "short-eth", symbol: "ETHUSDT", createdAt: "2099-01-02T00:00:05.000Z" } as Partial<PaperOrder>),
     ];
     const { engine } = makeEngine({
       client,
       paper: makePaperStore(orders),
       config: {
         maxConcurrentPositions: 10,
-        maxCorrelatedAltShortPositions: 2,
-        maxCorrelatedAltLongPositions: 1,
+        maxClusterPositions: 2,
       },
     });
 
@@ -1212,11 +1202,10 @@ describe("LiveExecutionEngine", () => {
     expect(entries.map((order) => `${order.symbol}:${order.side}`)).toEqual([
       "SUIUSDT:SELL",
       "ADAUSDT:SELL",
-      "SOLUSDT:BUY",
+      "DOGEUSDT:SELL",
       "ETHUSDT:SELL",
     ]);
-    expect(entries.some((order) => order.symbol === "AVAXUSDT")).toBe(false);
-    expect(entries.some((order) => order.symbol === "LINKUSDT")).toBe(false);
+    expect(entries.some((order) => order.symbol === "AVAXUSDT")).toBe(false); // 3rd L1 short blocked
   });
 
   it("testnet mirror-all keeps one symbol on one lane geometry instead of netting different lanes", async () => {
@@ -1519,6 +1508,9 @@ describe("LiveExecutionEngine", () => {
         mirrorAllPaperOrders: true,
         maxConcurrentPositions: 10,
         maxCorrelatedAltLongPositions: 10,
+        // Isolate the consecutive-loss breaker: don't let the per-cluster cap (SYM* are unknown →
+        // one shared OTHER cluster) throttle how many churn positions open this test.
+        maxClusterPositions: 10,
         maxConsecutiveLosses: 5,
         dailyMaxLossUsd: 999,
         maxDrawdownUsd: 999,
@@ -2358,5 +2350,135 @@ describe("resetKill — a deliberate reset must give a genuine fresh start (not 
     // The core guarantee: killSwitchTrip() must NOT immediately re-fire after a reset.
     const trip = (engine as unknown as { killSwitchTrip: () => string | null }).killSwitchTrip();
     expect(trip).toBeNull();
+  });
+});
+
+describe("per-correlation-cluster concentration cap", () => {
+  it("counts open non-major positions per cluster × direction, excluding BTC/ETH (majors)", () => {
+    const { engine, store } = makeEngine({ config: { maxClusterPositions: 3 } });
+    const st = store.getState();
+    st.intents = [
+      { symbol: "SOLUSDT", direction: "SHORT", state: "OPEN" },
+      { symbol: "SUIUSDT", direction: "SHORT", state: "OPEN" },
+      { symbol: "SEIUSDT", direction: "SHORT", state: "OPEN" }, // 3 L1 shorts
+      { symbol: "DOGEUSDT", direction: "SHORT", state: "OPEN" }, // MEME short — different cluster
+      { symbol: "SOLUSDT", direction: "LONG", state: "OPEN" }, // L1 long — different direction
+      { symbol: "BTCUSDT", direction: "SHORT", state: "OPEN" }, // major — excluded from cluster cap
+      { symbol: "SUIUSDT", direction: "SHORT", state: "PAPER_SUBMITTED" }, // not an OPEN intent state — ignored
+    ] as never;
+    const counts = (engine as unknown as {
+      clusterOpenCounts: (i: unknown[]) => Map<string, Set<string>>;
+    }).clusterOpenCounts(st.intents);
+    expect(counts.get("L1:SHORT")?.size).toBe(3); // the 3 L1 shorts share one cluster cap
+    expect(counts.get("MEME:SHORT")?.size).toBe(1); // meme has its own slots
+    expect(counts.get("L1:LONG")?.size).toBe(1); // opposite direction is separate
+    expect([...counts.keys()].some((k) => k.startsWith("MAJORS"))).toBe(false); // BTC not counted
+  });
+});
+
+describe("Phase-2 exit rebuild: forced MFE-giveback + losing-max-hold cut", () => {
+  it("forceMfeGiveback banks a faded runner on ANY lane (not just mfe_giveback lanes)", async () => {
+    const order = paperOrder(); // scaleout_tp1_trail lane — would NOT giveback without the force flag
+    const { engine, client, store } = makeEngine({
+      paper: makePaperStore([order]),
+      config: { forceMfeGiveback: true },
+    });
+    await engine.arm();
+    await engine.tick(); // opens the short at 2000, stop 2100 (risk 100)
+
+    client.markPriceBySymbol.set("ETHUSDT", 1900); // +1R favorable → peak arms (≥0.75R)
+    await engine.tick();
+    expect(store.getState().intents[0]!.maxFavorableR).toBeCloseTo(1, 6);
+    expect(store.getState().intents[0]!.state).toBe("OPEN"); // still above the giveback line
+
+    client.markPriceBySymbol.set("ETHUSDT", 1960); // favorable 0.4 ≤ peak×(1−0.5)=0.5 → bank it
+    await engine.tick();
+    const closed = store.getState().intents[0]!;
+    expect(closed.state).toBe("CLOSED");
+    expect(closed.closeReason).toBe("MFE_GIVEBACK_EXIT");
+    const flat = client.placed.at(-1)!;
+    expect(flat.type).toBe("MARKET");
+    expect(flat.reduceOnly).toBe(true);
+  });
+
+  it("without the force flag a scaleout-lane runner is NOT givebacked (old behavior preserved)", async () => {
+    const order = paperOrder();
+    const { engine, client, store } = makeEngine({ paper: makePaperStore([order]) });
+    await engine.arm();
+    await engine.tick();
+    client.markPriceBySymbol.set("ETHUSDT", 1900);
+    await engine.tick();
+    client.markPriceBySymbol.set("ETHUSDT", 1960);
+    await engine.tick();
+    expect(store.getState().intents[0]!.state).toBe("OPEN");
+  });
+
+  it("cuts a position that has been LOSING longer than losingMaxHoldMs", async () => {
+    let now = "2099-01-02T12:00:00.000Z";
+    const order = paperOrder();
+    const { engine, client, store } = makeEngine({
+      paper: makePaperStore([order]),
+      config: { losingMaxHoldMs: 4 * 3_600_000 },
+      nowIso: () => now,
+    });
+    await engine.arm();
+    await engine.tick(); // opens the short
+
+    client.markPriceBySymbol.set("ETHUSDT", 2050); // favorable −0.5R (losing)
+    now = "2099-01-02T17:00:00.000Z"; // 5h later > 4h
+    await engine.tick();
+    const closed = store.getState().intents[0]!;
+    expect(closed.state).toBe("CLOSED");
+    expect(closed.closeReason).toBe("LOSING_MAX_HOLD_CUT_4H");
+  });
+
+  it("never cuts a WINNER on hold time, and never cuts a young loser", async () => {
+    let now = "2099-01-02T12:00:00.000Z";
+    const winner = paperOrder({ paperOrderId: "paper-winner", symbol: "ETHUSDT" } as Partial<PaperOrder>);
+    const { engine, client, store } = makeEngine({
+      paper: makePaperStore([winner]),
+      config: { losingMaxHoldMs: 4 * 3_600_000 },
+      nowIso: () => now,
+    });
+    await engine.arm();
+    await engine.tick();
+
+    // old but WINNING → untouched
+    client.markPriceBySymbol.set("ETHUSDT", 1950); // +0.5R favorable
+    now = "2099-01-02T20:00:00.000Z"; // 8h later
+    await engine.tick();
+    expect(store.getState().intents[0]!.state).toBe("OPEN");
+
+    // turns loser but check the YOUNG-loser guard on a fresh engine
+    let now2 = "2099-01-02T12:00:00.000Z";
+    const young = paperOrder({ paperOrderId: "paper-young", symbol: "ETHUSDT" } as Partial<PaperOrder>);
+    const second = makeEngine({
+      paper: makePaperStore([young]),
+      config: { losingMaxHoldMs: 4 * 3_600_000 },
+      nowIso: () => now2,
+    });
+    await second.engine.arm();
+    await second.engine.tick();
+    second.client.markPriceBySymbol.set("ETHUSDT", 2050); // losing
+    now2 = "2099-01-02T13:00:00.000Z"; // only 1h < 4h
+    await second.engine.tick();
+    expect(second.store.getState().intents[0]!.state).toBe("OPEN");
+  });
+});
+
+describe("manual selector mode toggle", () => {
+  it("defaults OFF, toggles on/off, persists in state, and surfaces in status", () => {
+    const { engine, store } = makeEngine();
+    expect(engine.isManualSelectorMode()).toBe(false);
+    expect(engine.getStatus().laneSelection.manualSelectorMode).toBe(false);
+
+    const on = engine.setManualSelectorMode(true);
+    expect(on).toEqual({ ok: true, manualSelectorMode: true });
+    expect(engine.isManualSelectorMode()).toBe(true);
+    expect(store.getState().manualSelectorMode).toBe(true);
+    expect(engine.getStatus().laneSelection.manualSelectorMode).toBe(true);
+
+    engine.setManualSelectorMode(false);
+    expect(engine.isManualSelectorMode()).toBe(false);
   });
 });

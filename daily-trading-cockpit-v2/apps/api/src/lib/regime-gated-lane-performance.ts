@@ -138,8 +138,18 @@ export interface RegimeGatedLaneRow {
   dropped: LanePerf;
   gateEligible: number;
   filteredOut: number; // counter-regime obs the gate removed
-  deltaNetAvgR: number; // gated − raw
+  deltaNetAvgR: number; // gated − raw (per-trade AVERAGE — misleading in isolation; see deltaBookR)
+  /**
+   * The honest impact of gating this lane on the BOOK: gated.totalR − raw.totalR = −dropped.totalR.
+   * Positive = the dropped counter-regime trades were net-losers (gating helps the book). NEGATIVE =
+   * the gate would throw away net-WINNING trades (e.g. CG_WIDE_LONG_RUNNER). deltaNetAvgR can rise
+   * while deltaBookR craters — that is the survivorship trap the old "IMPROVED" verdict fell into.
+   */
+  deltaBookR: number;
+  /** Is the lane a net winner AFTER gating? A gate "helping" a still-negative lane is not actionable. */
+  gatedTradeable: boolean;
   gateReasonCounts: Array<{ reason: RegimeGateReason; count: number }>;
+  /** Verdict is now BOOK-R based (does gating make/lose money), NOT the per-trade-average artifact. */
   verdict: "IMPROVED" | "WORSENED" | "FLAT" | "INSUFFICIENT";
 }
 
@@ -147,6 +157,11 @@ export interface RegimeGatedLaneReport {
   totalObs: number;
   totalGateEligible: number;
   totalGatedOut: number;
+  /** Book-R gained(+)/lost(−) if the gate were applied to EVERY lane. */
+  deltaBookRAllLanes: number;
+  /** The decision number: book-R impact over only the lanes still net-positive after gating (the
+   *  ones you'd actually run). Negative → blanket-gating discards realized edge. */
+  deltaBookRTradeableLanes: number;
   gateReasonCounts: Array<{ reason: RegimeGateReason; count: number }>;
   lanes: RegimeGatedLaneRow[];
 }
@@ -183,8 +198,11 @@ export function buildRegimeGatedLaneReport(observations: RgObservation[]): Regim
     const filteredOut = raw.n - gated.n;
     totalGatedOut += filteredOut;
     const delta = gated.netAvgR - raw.netAvgR;
+    // HONEST verdict: the book-R impact of gating (= −dropped.totalR), NOT the per-trade average.
+    // deltaBookR < 0 means the gate would DISCARD net-winning trades on this lane (the trap).
+    const deltaBookR = gated.totalR - raw.totalR;
     const verdict: RegimeGatedLaneRow["verdict"] =
-      gated.n < MIN_GATED_N ? "INSUFFICIENT" : delta > 0.01 ? "IMPROVED" : delta < -0.01 ? "WORSENED" : "FLAT";
+      gated.n < MIN_GATED_N ? "INSUFFICIENT" : deltaBookR > 1 ? "IMPROVED" : deltaBookR < -1 ? "WORSENED" : "FLAT";
     lanes.push({
       variantId,
       raw,
@@ -193,15 +211,23 @@ export function buildRegimeGatedLaneReport(observations: RgObservation[]): Regim
       gateEligible: decisions.filter(({ decision }) => decision.gateEligible).length,
       filteredOut,
       deltaNetAvgR: delta,
+      deltaBookR,
+      gatedTradeable: gated.totalR > 0,
       gateReasonCounts: [...reasons.entries()].map(([reason, count]) => ({ reason, count })),
       verdict,
     });
   }
   lanes.sort((a, b) => b.raw.n - a.raw.n);
+  // Book-R impact of BLANKET-gating: total, and (the money number) only over lanes still net-positive
+  // after gating — i.e. the lanes you'd actually run. Negative = gating loses realized edge.
+  const deltaBookRAllLanes = lanes.reduce((s, l) => s + l.deltaBookR, 0);
+  const deltaBookRTradeableLanes = lanes.filter((l) => l.gatedTradeable).reduce((s, l) => s + l.deltaBookR, 0);
   return {
     totalObs: resolved.length,
     totalGateEligible,
     totalGatedOut,
+    deltaBookRAllLanes,
+    deltaBookRTradeableLanes,
     gateReasonCounts: [...totalReasons.entries()].map(([reason, count]) => ({ reason, count })),
     lanes,
   };

@@ -51,6 +51,7 @@ import {
   type RescueSkip,
 } from "./regime-flip-rescue.js";
 import { fetchCrowdingSnapshot, type CrowdSide, type CrowdingState } from "./derivatives-crowding.js";
+import { clusterOf, isMajorSymbol } from "./correlation-clusters.js";
 import type { BinanceClient } from "./binance.js";
 import type { PaperOrder } from "./paper-execution-router.js";
 
@@ -68,6 +69,13 @@ export interface LiveExecutionConfig {
   /** Correlated-alt concentration cap per direction. BTC/ETH are majors; everything else is treated as the correlated alt basket. */
   maxCorrelatedAltLongPositions: number;
   maxCorrelatedAltShortPositions: number;
+  /**
+   * Max open positions per correlation CLUSTER per direction (replaces the flat all-alts cap above).
+   * BTC/ETH (MAJORS cluster) are exempt — bounded only by maxConcurrentPositions. This lets genuinely
+   * different baskets (L1 vs meme vs AI) hold their own slots instead of sharing one 3-slot alt cap,
+   * while still blocking a single-cluster pile-up. See correlation-clusters.ts.
+   */
+  maxClusterPositions: number;
   dailyMaxLossUsd: number;
   maxConsecutiveLosses: number;
   /**
@@ -119,6 +127,19 @@ export interface LiveExecutionConfig {
   profitBankNetTargetUsd: number;
   /** Opposing-regime loss cut: close once adverse move reaches this fraction of the entry-to-stop distance. */
   regimeLossHardCutStopFraction: number;
+  /**
+   * Phase-2 exit rebuild (2026-07-05 autopsy: avg win +$0.47 vs avg loss −$2.67, losers held 9.5h).
+   * forceMfeGiveback applies the MFE-giveback exit (arm ≥0.75R, bank on 50% retrace from peak) to
+   * EVERY directional intent regardless of its lane's own exit rule — winners get room to run
+   * instead of being capped, but a faded runner is banked before a regime flip round-trips it.
+   */
+  forceMfeGiveback: boolean;
+  /**
+   * Cut a position that has been LOSING (favorableR < 0) for longer than this. 0 = disabled.
+   * The direct fix for the 567-minute median losing hold: losers no longer sit for hours waiting
+   * for a regime cut to crystallize a -2.7R-sized dollar loss.
+   */
+  losingMaxHoldMs: number;
   /** Auto-reset of the operator lane selection: when a position opened FROM the selection
    *  closes with net realized ≤ -this many USD, the whole selection (allocations + allow-list)
    *  is cleared and control returns to the bot. Small scratch closes (fees-only, e.g. the
@@ -194,6 +215,7 @@ export function parseLiveExecutionConfig(env: NodeJS.ProcessEnv = process.env): 
     maxConcurrentPositions: Math.floor(envNum(env.LIVE_MAX_CONCURRENT_POSITIONS, 3)),
     maxCorrelatedAltLongPositions: envNonNegativeInt(env.LIVE_MAX_CORRELATED_ALT_LONGS, 3),
     maxCorrelatedAltShortPositions: envNonNegativeInt(env.LIVE_MAX_CORRELATED_ALT_SHORTS, 3),
+    maxClusterPositions: envNonNegativeInt(env.LIVE_MAX_CLUSTER_POSITIONS, 3),
     dailyMaxLossUsd: envNum(env.LIVE_DAILY_MAX_LOSS_USD, 15),
     maxConsecutiveLosses: Math.floor(envNum(env.LIVE_MAX_CONSECUTIVE_LOSSES, 5)),
     scratchEpsilonUsd: envNum(env.LIVE_SCRATCH_EPSILON_USD, Math.max(0.05, 0.02 * envNum(env.LIVE_RISK_USD_PER_TRADE, 5))),
@@ -215,6 +237,8 @@ export function parseLiveExecutionConfig(env: NodeJS.ProcessEnv = process.env): 
     mainnetRegimeHardCutMs: liveEnv === "mainnet" ? envNum(env.LIVE_MAINNET_REGIME_HARD_CUT_MS, 30 * 60 * 1000) : 0,
     profitBankNetTargetUsd: Math.max(0, Number.parseFloat(env.LIVE_PROFIT_BANK_NET_TARGET_USD ?? "") || 0),
     regimeLossHardCutStopFraction: envFraction(env.LIVE_REGIME_LOSS_HARD_CUT_STOP_FRACTION, 0.5),
+    forceMfeGiveback: env.LIVE_FORCE_MFE_GIVEBACK === "1",
+    losingMaxHoldMs: Math.max(0, Math.floor(envNum(env.LIVE_LOSING_MAX_HOLD_MS, 0))),
     laneSelectionLossResetUsd: envNum(env.LIVE_LANE_SELECTION_LOSS_RESET_USD, 0.25),
     rescue: parseRegimeFlipRescueConfig(env, liveEnv),
     rescueExecute:
@@ -503,6 +527,13 @@ interface LiveExecutionState {
    *  may open new positions, and each mirrored entry's size is scaled by weightPct/100.
    *  null = off. Persisted so a restart keeps the allocation. */
   laneAllocations: Array<{ laneId: string; weightPct: number }> | null;
+  /**
+   * Manual selector mode (operator toggle). When true, the scan trades RAW per the lane allocation
+   * selector — bypassing the "smart" overlays (the 2b per-symbol book rotation) and the regime
+   * direction-gate — so the operator's picked lanes execute regardless of regime. The HARD safety
+   * rails (kill-switch, cluster cap, risk size, stop/TP geometry) are NEVER bypassed. Persisted.
+   */
+  manualSelectorMode: boolean;
   /** Watermark (closedAt ISO) of operator-selection closes already evaluated by the
    *  auto-reset rule, so a historical loss can never re-trigger a reset later. */
   laneSelectionLossWatermark: string | null;
@@ -579,6 +610,7 @@ export class LiveExecutionStore {
       crowdingExitShadow: {},
       allowedLaneIds: null,
       laneAllocations: null,
+      manualSelectorMode: false,
       laneSelectionLossWatermark: null,
       laneSelectionLastAutoReset: null,
     };
@@ -1204,6 +1236,7 @@ export class LiveExecutionEngine {
         maxConcurrentPositions: this.config.maxConcurrentPositions,
         maxCorrelatedAltLongPositions: this.config.maxCorrelatedAltLongPositions,
         maxCorrelatedAltShortPositions: this.config.maxCorrelatedAltShortPositions,
+        maxClusterPositions: this.config.maxClusterPositions,
         dailyMaxLossUsd: this.config.dailyMaxLossUsd,
         maxConsecutiveLosses: this.config.maxConsecutiveLosses,
         scratchEpsilonUsd: this.config.scratchEpsilonUsd,
@@ -1223,6 +1256,8 @@ export class LiveExecutionEngine {
         regimeExitActive: this.regimeProtectionActive(),
         regimeHardCutMs: this.regimeHardCutMsEffective(),
         regimeLossHardCutStopFraction: this.config.regimeLossHardCutStopFraction,
+        forceMfeGiveback: this.config.forceMfeGiveback,
+        losingMaxHoldMs: this.config.losingMaxHoldMs,
         profitBankNetTargetUsd: this.config.profitBankNetTargetUsd,
         profitBankThresholdUsd: this.profitBankThresholdUsd(),
       },
@@ -1240,6 +1275,7 @@ export class LiveExecutionEngine {
       laneSelection: {
         allowedLaneIds: st.allowedLaneIds ?? null,
         laneAllocations: st.laneAllocations ?? null,
+        manualSelectorMode: st.manualSelectorMode === true,
         mode: st.laneAllocations && st.laneAllocations.length > 0
           ? ("WEIGHTED_ALLOCATION" as const)
           : st.allowedLaneIds === null || st.allowedLaneIds === undefined
@@ -1783,10 +1819,20 @@ export class LiveExecutionEngine {
           if (liveBreakeven.closed) continue;
         }
 
-        if (pos && intent.state === "OPEN" && this.intentExitRule(intent) === "mfe_giveback") {
+        if (
+          pos &&
+          intent.state === "OPEN" &&
+          (this.config.forceMfeGiveback || this.intentExitRule(intent) === "mfe_giveback")
+        ) {
           const mfe = await this.manageMfeGiveback(intent, pos, amt);
           if (mfe.changed) dirty = true;
           if (mfe.closed) continue;
+        }
+
+        if (pos && intent.state === "OPEN") {
+          const losingCut = await this.maybeCutLosingMaxHold(intent, pos, amt);
+          if (losingCut.changed) dirty = true;
+          if (losingCut.closed) continue;
         }
 
         // TP1 filled ⇒ move stop to breakeven for the runner (cancel + replace).
@@ -1945,6 +1991,23 @@ export class LiveExecutionEngine {
       LONG: symbols.LONG.size,
       SHORT: symbols.SHORT.size,
     };
+  }
+
+  /**
+   * Open-position count per correlation cluster × direction (distinct symbols). MAJORS (BTC/ETH) are
+   * excluded — they are exempt from the per-cluster cap. Keyed `${cluster}:${direction}`.
+   */
+  private clusterOpenCounts(intents: LiveIntent[]): Map<string, Set<string>> {
+    const byKey = new Map<string, Set<string>>();
+    for (const intent of intents) {
+      if (!OPEN_INTENT_STATES.has(intent.state)) continue;
+      if (isMajorSymbol(intent.symbol)) continue;
+      const key = `${clusterOf(intent.symbol)}:${intent.direction}`;
+      const set = byKey.get(key);
+      if (set) set.add(intent.symbol);
+      else byKey.set(key, new Set([intent.symbol]));
+    }
+    return byKey;
   }
 
   private stopLossProgressTowardStop(intent: LiveIntent, pos: FuturesPosition): number | null {
@@ -2441,6 +2504,62 @@ export class LiveExecutionEngine {
     return { changed: true, closed: true };
   }
 
+  /**
+   * Phase-2 loss-cut: a position that has been open longer than losingMaxHoldMs AND is currently
+   * LOSING gets flattened at market. Winners (favorableR >= 0) are never touched — this kills the
+   * "losers sit 9.5 hours until a regime cut crystallizes -$2.7" pattern without capping upside.
+   */
+  private async maybeCutLosingMaxHold(intent: LiveIntent, pos: FuturesPosition, amt: number): Promise<{ changed: boolean; closed: boolean }> {
+    if (this.config.losingMaxHoldMs <= 0) return { changed: false, closed: false };
+    const openedMs = Date.parse(intent.createdAt);
+    const nowMs = Date.parse(this.nowIso());
+    if (!Number.isFinite(openedMs) || !Number.isFinite(nowMs)) return { changed: false, closed: false };
+    if (nowMs - openedMs < this.config.losingMaxHoldMs) return { changed: false, closed: false };
+
+    const entry = intent.filledEntryPrice ?? intent.plannedEntryPrice;
+    const risk = Math.abs(entry - intent.stopLossPrice);
+    if (!(entry > 0) || !(risk > 0)) return { changed: false, closed: false };
+    const mark = pos.markPrice > 0 ? pos.markPrice : pos.entryPrice > 0 ? pos.entryPrice : entry;
+    const favorableR = intent.direction === "SHORT" ? (entry - mark) / risk : (mark - entry) / risk;
+    if (favorableR >= 0) return { changed: false, closed: false }; // never cut a winner
+
+    try {
+      if (intent.stopOrderId !== null) await this.client.cancelAlgoOrder(intent.stopOrderId);
+      if (intent.tp1OrderId !== null) await this.client.cancelOrder(intent.symbol, intent.tp1OrderId);
+      if (intent.beStopOrderId !== null) await this.client.cancelAlgoOrder(intent.beStopOrderId);
+    } catch {
+      // The reduce-only market close below is the critical safety action; cleanup is best-effort.
+    }
+
+    const flat = await this.client.placeOrder({
+      symbol: intent.symbol,
+      side: amt > 0 ? "SELL" : "BUY",
+      type: "MARKET",
+      quantity: Math.abs(amt),
+      reduceOnly: true,
+      newClientOrderId: `dtc-${intent.paperOrderId.slice(-18)}-lmh`,
+    });
+    try {
+      await this.client.cancelAllOrders(intent.symbol);
+      await this.client.cancelAllAlgoOrders(intent.symbol);
+    } catch {
+      // best-effort residue cleanup after the position has already been closed.
+    }
+    const net = await this.realizedFromTrades(intent.symbol, intent.createdAt, [
+      intent.entryOrderId,
+      intent.tp1OrderId,
+      flat.orderId,
+    ]);
+    intent.realizedPnlUsd = net;
+    intent.feesUsd = null;
+    intent.state = "CLOSED";
+    intent.closedAt = this.nowIso();
+    intent.updatedAt = this.nowIso();
+    intent.closeReason = `LOSING_MAX_HOLD_CUT_${Math.round(this.config.losingMaxHoldMs / 3_600_000)}H`;
+    this.applyRealizedToLedger(net);
+    return { changed: true, closed: true };
+  }
+
   private async settleClosedIntent(intent: LiveIntent): Promise<void> {
     // Clear any leftover exit orders (e.g. TP1 still resting after a stop-out).
     try {
@@ -2659,6 +2778,18 @@ export class LiveExecutionEngine {
 
   /** Set (and persist) the weighted lane allocation. null turns allocations off.
    *  Each entry: laneId (full or variant suffix) + weightPct in (0, 100]. Max 4 lanes. */
+  /** Operator toggle: RAW selector mode (bypass smart overlays + regime direction-gate). Persisted. */
+  setManualSelectorMode(enabled: boolean): { ok: true; manualSelectorMode: boolean } {
+    const st = this.store.getState();
+    st.manualSelectorMode = enabled === true;
+    this.store.save();
+    return { ok: true, manualSelectorMode: st.manualSelectorMode };
+  }
+
+  isManualSelectorMode(): boolean {
+    return this.store.getState().manualSelectorMode === true;
+  }
+
   setLaneAllocations(
     allocations: Array<{ laneId: string; weightPct: number }> | null,
   ): { ok: boolean; reason: string | null; laneAllocations: Array<{ laneId: string; weightPct: number }> | null } {
@@ -2868,7 +2999,7 @@ export class LiveExecutionEngine {
       .sort((a, b) => (a.createdAt < b.createdAt ? -1 : 1));
 
     let slots = Math.max(0, this.config.maxConcurrentPositions - openCount);
-    const correlatedAltOpen = this.correlatedAltOpenCounts(st.intents);
+    const clusterOpen = this.clusterOpenCounts(st.intents);
     let maxSeen = st.lastSeenCreatedAt;
 
     const grouped = new Map<string, PaperOrder[]>();
@@ -2885,9 +3016,11 @@ export class LiveExecutionEngine {
       const oppositeIntent = openIntentsBySymbol.get(first.symbol);
       if (oppositeIntent && oppositeIntent.direction !== first.direction) continue;
       if (!oppositeIntent && slots <= 0) continue;
-      if (!oppositeIntent && this.isCorrelatedAltSymbol(first.symbol)) {
-        const cap = this.correlatedAltCap(first.direction);
-        if (correlatedAltOpen[first.direction] >= cap) continue;
+      // Per-correlation-cluster cap (MAJORS exempt). A genuinely different basket gets its own slots
+      // instead of sharing one flat alt cap; a single cluster still can't pile up beyond the limit.
+      const clusterKey = `${clusterOf(first.symbol)}:${first.direction}`;
+      if (!oppositeIntent && !isMajorSymbol(first.symbol)) {
+        if ((clusterOpen.get(clusterKey)?.size ?? 0) >= this.config.maxClusterPositions) continue;
       }
       const lanePapers = oppositeIntent
         ? papers.filter((paper) => this.paperCompatibleWithIntent(oppositeIntent, paper))
@@ -2929,8 +3062,10 @@ export class LiveExecutionEngine {
         await this.addToIntent(oppositeIntent, planned, filters);
       } else {
         await this.openIntent(planned, filters);
-        if (this.isCorrelatedAltSymbol(first.symbol)) {
-          correlatedAltOpen[first.direction] += 1;
+        if (!isMajorSymbol(first.symbol)) {
+          const set = clusterOpen.get(clusterKey) ?? new Set<string>();
+          set.add(first.symbol);
+          clusterOpen.set(clusterKey, set);
         }
         slots -= 1;
       }

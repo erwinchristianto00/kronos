@@ -258,6 +258,22 @@ export async function registerLiveRoutes(
   //   {"allocations": [{"laneId":"CG_WIDE_FAST_SHORT","weightPct":70},
   //                    {"laneId":"CG_WIDE_FAST_LONG","weightPct":30}]}
   // Only listed lanes may open NEW positions; each entry's size is scaled by weightPct.
+  // Operator toggle: RAW selector mode (bypass the 2b book overlay + regime direction-gate; trade
+  // exactly the lane allocation selector). OFF = the current "smart" behavior. Hard safety rails
+  // (kill-switch, cluster cap, risk size) are never affected.
+  app.post("/api/live/manual-mode", async (request, reply) => {
+    if (!engine) {
+      reply.code(503);
+      return { ok: false, reason: "live execution disabled" };
+    }
+    const body = (request.body ?? {}) as { enabled?: unknown };
+    if (typeof body.enabled !== "boolean") {
+      reply.code(400);
+      return { ok: false, reason: 'body must be {"enabled": true | false}' };
+    }
+    return engine.setManualSelectorMode(body.enabled);
+  });
+
   app.post("/api/live/lane-allocations", async (request, reply) => {
     if (!engine) {
       reply.code(503);

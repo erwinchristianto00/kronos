@@ -47,8 +47,21 @@ const EXEC_LEVERAGE = () => {
 /** Which measured variant to execute. Default FILTERED (operator: follow the /research
  *  filtered symbols, whose allow/blocklists now auto-update from measured leg returns). */
 const EXEC_VARIANT = () => process.env.CROSS_SECTIONAL_EXEC_VARIANT ?? "FILTERED";
-/** Only execute signals younger than this — a stale basket's momentum ranking has drifted. */
-const MAX_SIGNAL_AGE_MS = 15 * 60_000;
+/**
+ * Only execute signals younger than this — a stale basket's momentum ranking has drifted. Signals
+ * emit hourly (1h bars); a 15-min window meant the executor could only catch a signal in the first
+ * 15 min of the hour, so it almost never opened. Default 50 min: a <1h-old ranking is negligible
+ * drift on a 24h hold, and every hourly signal becomes reliably catchable. Env-tunable.
+ */
+const MAX_SIGNAL_AGE_MS = () =>
+  Math.max(60_000, Math.floor(Number(process.env.CROSS_SECTIONAL_EXEC_MAX_SIGNAL_AGE_MS) || 50 * 60_000));
+/**
+ * Max concurrently-OPEN baskets. Was hard-locked to 1 — with a 24h horizon that capped the whole
+ * lane to ONE basket per day (why testnet looked dead). >1 opens a fresh basket each hour it forms,
+ * diversifying entry times and accumulating proof far faster; each basket is a bounded $legUsd hedge.
+ */
+const MAX_OPEN_BASKETS = () =>
+  Math.max(1, Math.floor(Number(process.env.CROSS_SECTIONAL_EXEC_MAX_OPEN_BASKETS) || 1));
 const TAKER_FEE_RATE = 0.0005; // 5 bps per side, conservative
 
 export interface ExecutorLeg {
@@ -274,7 +287,7 @@ export class CrossSectionalExecutor {
 
   private async maybeOpenBasket(): Promise<void> {
     const st = this.store.getState();
-    if (st.baskets.some((b) => b.status === "OPEN")) return; // one basket at a time
+    if (st.baskets.filter((b) => b.status === "OPEN").length >= MAX_OPEN_BASKETS()) return;
 
     const nowMs = new Date(this.nowIso()).getTime();
     // Newest FRESH, still-OPEN signal of the target variant we haven't executed yet.
@@ -287,7 +300,7 @@ export class CrossSectionalExecutor {
           o.status === "OPEN" &&
           (o.variant ?? "RAW") === targetVariant &&
           o.openedAtMs > st.lastSeenSignalMs &&
-          nowMs - o.openedAtMs <= MAX_SIGNAL_AGE_MS,
+          nowMs - o.openedAtMs <= MAX_SIGNAL_AGE_MS(),
       )
       .sort((a: CrossSectionalObservation, b: CrossSectionalObservation) => b.openedAtMs - a.openedAtMs);
     const signal = candidates[0];

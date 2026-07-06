@@ -25,12 +25,28 @@ type XSec = {
 type LanePerf = { n: number; netAvgR: number; winRate: number; profitFactor: number | null };
 type RGL = {
   totalObs: number; totalGateEligible?: number; totalGatedOut: number;
+  deltaBookRAllLanes?: number; deltaBookRTradeableLanes?: number;
   gateReasonCounts?: Array<{ reason: string; count: number }>;
   lanes: Array<{
     variantId: string; raw: LanePerf; gated: LanePerf; dropped?: LanePerf; gateEligible?: number; filteredOut: number; deltaNetAvgR: number;
+    deltaBookR?: number; gatedTradeable?: boolean;
     gateReasonCounts?: Array<{ reason: string; count: number }>;
     verdict: 'IMPROVED' | 'WORSENED' | 'FLAT' | 'INSUFFICIENT';
   }>;
+};
+type PsleCell = {
+  laneId: string; symbol: string; direction: 'LONG' | 'SHORT' | 'MIXED' | null; bucket: 'MAJOR' | 'ALT';
+  closed: number; headlineClosed: number; netAvgR: number | null; pf: number | null; wr: number | null;
+  executable: boolean; suspiciousFill: boolean;
+  verdict: string; confirmation: string; promotable: boolean; testnetCandidate: boolean;
+};
+type PSLE = {
+  minClosed: number;
+  cells: PsleCell[];
+  summary: {
+    testnetCandidateCells: number; promotableCells: number;
+    byDirection: Record<'LONG' | 'SHORT' | 'MIXED', { measured: number; bookPositive: number; testnetCandidate: number; promotable: number }>;
+  };
 };
 type Moon = {
   daily: { dateUtc: string; tradesToday: number; trades100xToday: number; trades50xPlusToday: number; dailyRealizedLossUsdt: number; activePositions: number };
@@ -163,17 +179,19 @@ export default function ResearchDashboard() {
   const [xsec, setXsec] = useState<XSec | null>(null);
   const [moon, setMoon] = useState<Moon | null>(null);
   const [rgl, setRgl] = useState<RGL | null>(null);
+  const [psle, setPsle] = useState<PSLE | null>(null);
   const [updated, setUpdated] = useState<number | null>(null);
   const [err, setErr] = useState<string | null>(null);
 
   async function load() {
     try {
-      const [a, b, c] = await Promise.all([
+      const [a, b, c, d] = await Promise.all([
         fetch('/api/shadow/cross-sectional-report', { cache: 'no-store' }).then((r) => r.json()),
         fetch('/api/shadow/moonshot-report', { cache: 'no-store' }).then((r) => r.json()),
         fetch('/api/shadow/regime-gated-lanes', { cache: 'no-store' }).then((r) => r.json()),
+        fetch('/api/shadow/per-symbol-lane-edge', { cache: 'no-store' }).then((r) => r.json()).catch(() => null),
       ]);
-      setXsec(a); setMoon(b); setRgl(c); setUpdated(Date.now()); setErr(null);
+      setXsec(a); setMoon(b); setRgl(c); setPsle(d); setUpdated(Date.now()); setErr(null);
     } catch (e) { setErr((e as Error).message); }
   }
   useEffect(() => { void load(); const t = window.setInterval(() => void load(), 10_000); return () => window.clearInterval(t); }, []);
@@ -198,13 +216,61 @@ export default function ResearchDashboard() {
       </header>
 
       {(() => {
+        if (!psle) return null;
+        const tradeable = (psle.cells ?? [])
+          .filter((c) => c.testnetCandidate || c.promotable)
+          .sort((a, b) => (b.netAvgR ?? -9) - (a.netAvgR ?? -9));
+        const stageBadge = (c: PsleCell) => c.promotable
+          ? <span style={{ color: C.good, fontSize: 10, fontWeight: 700 }}>PROMOTABLE</span>
+          : <span style={{ color: C.measure, fontSize: 10, fontWeight: 700 }}>testnet-cand</span>;
+        const bd = psle.summary?.byDirection;
+        const pcol = '1.1fr 0.6fr 1.6fr 0.7fr 0.6fr 0.6fr 0.5fr 0.5fr 1fr';
+        const ph = (t: string, a: 'left' | 'right' = 'right') => <span style={{ textAlign: a, color: C.dim, fontSize: 10, textTransform: 'uppercase', letterSpacing: 0.3 }}>{t}</span>;
+        return (
+          <Card
+            title="Per-symbol book edge — which symbols &amp; lanes are good for live"
+            subtitle="Every (symbol × lane × direction) cell scored on the REALIZED paper book (not the optimistic sim). testnet-candidate = book-credible, drives the live auto-rotation; PROMOTABLE = also headline-confirmed. Mirages (MAKER, PF/WR too-good) are auto-excluded."
+            right={psle.summary ? <>{psle.summary.testnetCandidateCells} tradeable · {psle.summary.promotableCells} promotable</> : null}
+          >
+            {bd && (
+              <div style={{ padding: '10px 16px', borderBottom: `1px solid ${C.border}`, fontSize: 12, color: C.dim }}>
+                by direction — LONG: <span style={{ color: C.text }}>{bd.LONG.testnetCandidate}</span> tradeable · SHORT: <span style={{ color: C.text }}>{bd.SHORT.testnetCandidate}</span> · MIXED: <span style={{ color: C.text }}>{bd.MIXED.testnetCandidate}</span>
+                {psle.summary.promotableCells === 0 && <span style={{ color: C.measure }}> · none headline-confirmed yet (all diagnostic-only — testnet earns confirmation over time)</span>}
+              </div>
+            )}
+            <div style={{ padding: '6px 16px 14px', overflowX: 'auto' }}>
+              <div style={{ display: 'grid', gridTemplateColumns: pcol, gap: 8, alignItems: 'center', padding: '6px 0', borderBottom: `1px solid ${C.border}` }}>
+                {ph('symbol', 'left')}{ph('dir')}{ph('lane', 'left')}{ph('book avgR')}{ph('PF')}{ph('WR')}{ph('n')}{ph('hl')}{ph('stage')}
+              </div>
+              {tradeable.length ? tradeable.map((c) => (
+                <div key={`${c.laneId}:${c.symbol}:${c.direction}`} style={{ display: 'grid', gridTemplateColumns: pcol, gap: 8, alignItems: 'center', padding: '5px 0', borderTop: `1px solid ${C.sub}`, fontSize: 13 }}>
+                  <span style={{ color: C.text, fontWeight: 600 }}>{c.symbol.replace(/USDT$/, '')}</span>
+                  <span style={{ textAlign: 'right', color: c.direction === 'LONG' ? C.good : C.bad }}>{c.direction}</span>
+                  <span style={{ color: C.dim, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }} title={c.laneId}>{c.laneId.split(':').pop()?.replace(/^CG_/, '')}</span>
+                  <span style={{ textAlign: 'right', color: tone(c.netAvgR ?? 0), fontWeight: 700 }}>{rfmt(c.netAvgR)}</span>
+                  <span style={{ textAlign: 'right', color: C.dim }}>{c.pf == null ? '—' : c.pf.toFixed(2)}</span>
+                  <span style={{ textAlign: 'right', color: C.dim }}>{c.wr == null ? '—' : `${Math.round(c.wr * 100)}%`}</span>
+                  <span style={{ textAlign: 'right', color: C.dim }}>{c.closed}</span>
+                  <span style={{ textAlign: 'right', color: c.headlineClosed > 0 ? C.good : C.dim }}>{c.headlineClosed}</span>
+                  <span style={{ textAlign: 'right' }}>{stageBadge(c)}</span>
+                </div>
+              )) : <div style={{ padding: 12, color: C.dim }}>no book-proven symbols yet — accruing</div>}
+              <div style={{ fontSize: 11, color: C.dim, marginTop: 10 }}>
+                Bar: n≥{psle.minClosed} closed, book netAvgR≥+0.03, PF&gt;1, executable, non-suspicious. <span style={{ color: C.text }}>hl</span> = headline closes (0 = diagnostic-only, not yet promotable). Each instance reads its OWN book — live (mainnet) shows what mainnet has traded.
+              </div>
+            </div>
+          </Card>
+        );
+      })()}
+
+      {(() => {
         const lanes = (rgl?.lanes ?? []).filter((l) => l.raw.n >= 5);
         const tally = { IMPROVED: 0, WORSENED: 0, FLAT: 0, INSUFFICIENT: 0 };
         lanes.forEach((l) => { tally[l.verdict] += 1; });
         const verdictTag = (v: keyof typeof tally) => (
           <span style={{ color: VERDICT_COLOR[v], marginRight: 12 }}>{tally[v]} {v.toLowerCase()}</span>
         );
-        const col = '1.7fr 0.5fr 0.8fr 0.6fr 0.5fr 0.8fr 0.6fr 0.8fr 1fr';
+        const col = '1.7fr 0.5fr 0.8fr 0.6fr 0.5fr 0.8fr 0.6fr 0.8fr 0.95fr 1fr';
         const head = (t: string, align: 'left' | 'right' = 'right') => (
           <span style={{ textAlign: align, color: C.dim, fontSize: 10, textTransform: 'uppercase', letterSpacing: 0.3 }}>{t}</span>
         );
@@ -218,11 +284,17 @@ export default function ResearchDashboard() {
               lanes.length ? (
                 <>
                   <div style={{ padding: '10px 16px', borderBottom: `1px solid ${C.border}`, fontSize: 13 }}>
-                    Verdict (gated n≥15): {verdictTag('IMPROVED')}{verdictTag('WORSENED')}{verdictTag('FLAT')}{verdictTag('INSUFFICIENT')}
+                    Verdict (book-R, gated n≥15): {verdictTag('IMPROVED')}{verdictTag('WORSENED')}{verdictTag('FLAT')}{verdictTag('INSUFFICIENT')}
+                    {typeof rgl.deltaBookRTradeableLanes === 'number' && (
+                      <div style={{ marginTop: 6, fontSize: 12, color: rgl.deltaBookRTradeableLanes >= 0 ? C.good : C.bad, fontWeight: 600 }}>
+                        Book-R impact of blanket-gating the lanes you'd actually run (still net-positive after gating): {rfmt(rgl.deltaBookRTradeableLanes)}R
+                        {rgl.deltaBookRTradeableLanes < 0 && <span style={{ color: C.dim, fontWeight: 400 }}> — gating would DISCARD realized edge (it drops winners on the profitable lanes). Do not wire it.</span>}
+                      </div>
+                    )}
                   </div>
                   <div style={{ padding: '6px 16px 14px', overflowX: 'auto' }}>
                     <div style={{ display: 'grid', gridTemplateColumns: col, gap: 8, alignItems: 'center', padding: '6px 0', borderBottom: `1px solid ${C.border}` }}>
-                      {head('Lane', 'left')}{head('raw n')}{head('raw avgR')}{head('raw WR')}{head('gt n')}{head('gated avgR')}{head('gt WR')}{head('Δ avgR')}{head('verdict')}
+                      {head('Lane', 'left')}{head('raw n')}{head('raw avgR')}{head('raw WR')}{head('gt n')}{head('gated avgR')}{head('gt WR')}{head('Δ avgR')}{head('Δ book R')}{head('verdict')}
                     </div>
                     {lanes.map((l) => (
                       <div key={l.variantId} style={{ display: 'grid', gridTemplateColumns: col, gap: 8, alignItems: 'center', padding: '5px 0', borderTop: `1px solid ${C.sub}`, fontSize: 13 }}>
@@ -233,13 +305,15 @@ export default function ResearchDashboard() {
                         <span style={{ textAlign: 'right', color: C.dim }}>{l.gated.n}</span>
                         <span style={{ textAlign: 'right', color: tone(l.gated.netAvgR), fontWeight: 600 }}>{rfmt(l.gated.netAvgR)}</span>
                         <span style={{ textAlign: 'right', color: C.dim }}>{Math.round(l.gated.winRate * 100)}%</span>
-                        <span style={{ textAlign: 'right', color: tone(l.deltaNetAvgR), fontWeight: 600 }}>{rfmt(l.deltaNetAvgR)}</span>
-                        <span style={{ textAlign: 'right', color: VERDICT_COLOR[l.verdict], fontSize: 11, fontWeight: 600 }}>{l.verdict}</span>
+                        <span style={{ textAlign: 'right', color: C.dim, fontWeight: 600 }}>{rfmt(l.deltaNetAvgR)}</span>
+                        <span style={{ textAlign: 'right', color: tone(l.deltaBookR ?? 0), fontWeight: 700 }} title="book-R gained/lost by gating this lane (= −dropped totalR)">{typeof l.deltaBookR === 'number' ? `${l.deltaBookR >= 0 ? '+' : ''}${l.deltaBookR.toFixed(1)}R` : '—'}</span>
+                        <span style={{ textAlign: 'right', color: VERDICT_COLOR[l.verdict], fontSize: 11, fontWeight: 600 }} title={l.gatedTradeable === false ? 'lane still net-negative after gating — not tradeable either way' : ''}>{l.verdict}{l.gatedTradeable === false ? '*' : ''}</span>
                       </div>
                     ))}
                     <div style={{ fontSize: 11, color: C.dim, marginTop: 10 }}>
-                      Gate drops only captured EXTENDED counter-regime rows. Tactical, mixed, unknown, and legacy rows are kept.
-                      Δ = gated − raw net avg R. <span style={{ color: C.good }}>Positive Δ = gating would help.</span>
+                      Gate drops only captured EXTENDED counter-regime rows. <strong style={{ color: C.text }}>Verdict is now BOOK-R based</strong> (Δ book R = gated − raw totalR = the realized edge gating adds/removes), NOT the per-trade average.
+                      <span style={{ color: C.dim }}> Δ avgR (greyed) rises whenever a below-average tail is dropped — even if those trades were winners, which is why it read a misleading “19 improved.”</span>
+                      {' '}<span style={{ color: C.bad }}>Negative Δ book R = gating discards realized profit (drops winners).</span> <span title="lane still net-negative after gating">* = lane still net-negative after gating (not tradeable either way).</span>
                     </div>
                   </div>
                 </>
