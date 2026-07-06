@@ -189,7 +189,15 @@ function repairVariantMatrix(file: string, now: string, apply: boolean, fillCapt
       const family = observation.axisRegimeFamily ?? regimeFamily(observation.regime);
       const inferredDirection = regimeDirectionFromFamily(family);
       observation.regimeDirection = inferredDirection ?? "MIXED";
-      observation.posture = family === "MIXED" || family === "UNKNOWN" ? "TACTICAL" : "EXTENDED";
+      // Always TACTICAL, never EXTENDED: the live estimator only tags EXTENDED when
+      // captured confidence was MEDIUM/HIGH (fresh-variant-matrix-feed.ts), but this
+      // historical schema has no confidence field to check at all. regime-gated-lane-
+      // performance.ts treats non-EXTENDED as the safe "always keep" default and only
+      // EXTENDED rows can be dropped as counter-regime — so claiming EXTENDED here
+      // without a way to verify the precondition would silently change which trades
+      // get excluded from a regime-gated report, exactly the axis this flag promises
+      // not to touch.
+      observation.posture = "TACTICAL";
       counters.inferredCapturedContext = (counters.inferredCapturedContext ?? 0) + 1;
     }
 

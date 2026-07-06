@@ -41,7 +41,7 @@ export function resolveLiveBinanceBaseUrl(env: LiveBinanceEnv): string {
 const REQUEST_TIMEOUT_MS = 6_000;
 const RECV_WINDOW_MS = 5_000;
 // Guard stays below RECV_WINDOW_MS so offset-compensated timestamps still land inside Binance's window.
-const MAX_CLOCK_SKEW_MS = 4_000;
+export const MAX_CLOCK_SKEW_MS = 4_000;
 const GET_MAX_RETRIES = 2;
 // Sync every 60 s so the offset stays fresh even on hosts with fast clock drift.
 const TIME_SYNC_TTL_MS = 60_000;

@@ -68,9 +68,12 @@ function buildRecord(p) {
   const closedAt = variant.closedAt ?? null;
   return {
     positionId: p.id,
+    // context.direction is NOT overridden with position.direction — matches
+    // production's buildStrategyExperienceRecords (packages/shared/src/strategy-
+    // intelligence.ts), which spreads strategyContextSnapshot verbatim. outcome.direction
+    // below legitimately stays position.direction (the real executed direction).
     context: {
       ...ctx,
-      direction: p.direction,
       symbol: p.symbol,
       evidenceEra: ctx.evidenceEra ?? p.variantSelection?.evidenceEra ?? classifyEvidenceEra(p),
     },

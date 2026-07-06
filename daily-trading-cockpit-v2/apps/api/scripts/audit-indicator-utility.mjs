@@ -20,15 +20,19 @@ function fmt(x, d = 4) {
 }
 
 function aggregate(rows, rField = 'realizedNetR') {
-  const r = rows.map(p => Number(p[rField] ?? 0)).filter(v => Number.isFinite(v));
+  // Don't coerce a missing/null value to 0 before the finite-filter — that would
+  // silently count "no data" as a real scratch trade rather than excluding it.
+  const r = rows.map(p => p[rField]).filter(v => typeof v === 'number' && Number.isFinite(v));
   const n = r.length;
   if (n === 0) return { n: 0, avgR: null, sumR: 0, pf: null, wr: null };
   const sum = r.reduce((a, b) => a + b, 0);
   const wins = r.filter(v => v > 0);
   const losses = r.filter(v => v < 0);
+  // null (not a fabricated 0) when every trade in the slice closed at exactly 0 —
+  // an all-scratch cohort is "not measurable", not "lost every time".
   const pf = losses.length > 0
     ? wins.reduce((a, b) => a + b, 0) / Math.abs(losses.reduce((a, b) => a + b, 0))
-    : (wins.length > 0 ? Infinity : 0);
+    : (wins.length > 0 ? Infinity : null);
   return {
     n,
     avgR: sum / n,
@@ -58,8 +62,10 @@ function flatten(positions) {
       selectedExitVariant: p.selectedExitVariant,
       marketRegimeRaw: p.marketRegime || ctx.marketRegime || null,
       closeReason: variant.closeReason,
-      realizedNetR: Number(variant.realizedNetR ?? 0),
-      realizedGrossR: Number(variant.realizedGrossR ?? 0),
+      // Preserve a genuinely missing value as null (not a fabricated 0 scratch trade) —
+      // aggregate() already filters non-finite/null values out of its sample.
+      realizedNetR: typeof variant.realizedNetR === 'number' ? variant.realizedNetR : null,
+      realizedGrossR: typeof variant.realizedGrossR === 'number' ? variant.realizedGrossR : null,
       // top-level
       stopDistanceBps: Number(p.stopDistanceBps ?? ctx.stopDistanceBps ?? NaN),
       // context fields
@@ -162,7 +168,7 @@ slices.push(slice(baselineRows, r => r.chaseRisk === 'LOW', 'chaseRisk LOW'));
 // 8. entryDriftPctOfZone
 slices.push(slice(baselineRows, r => r.entryDriftPctOfZone !== null && r.entryDriftPctOfZone <= -0.65, 'entryDriftPctOfZone <= -0.65'));
 slices.push(slice(baselineRows, r => r.entryDriftPctOfZone !== null && r.entryDriftPctOfZone > -0.65 && r.entryDriftPctOfZone <= -0.2, 'entryDriftPctOfZone -0.65..-0.2'));
-slices.push(slice(baselineRows, r => r.entryDriftPctOfZone !== null && r.entryDriftPctOfZone > -0.2, 'entryDriftPctOfZone >= -0.2'));
+slices.push(slice(baselineRows, r => r.entryDriftPctOfZone !== null && r.entryDriftPctOfZone > -0.2, 'entryDriftPctOfZone > -0.2'));
 
 // 9. entryDriftAtr
 slices.push(slice(baselineRows, r => r.entryDriftAtr !== null && r.entryDriftAtr >= 2.0, 'entryDriftAtr >= 2.0'));
@@ -233,8 +239,10 @@ try {
   const obs = cf.observations || [];
   const resolved = obs.filter(o => o.observationStatus === 'RESOLVED' && o.outcome && o.outcome.fillStatus === 'FILLED');
   const cfRows = resolved.map(o => ({
-    realizedNetR: Number(o.outcome.realizedNetR ?? 0),
-    realizedGrossR: Number(o.outcome.realizedGrossR ?? 0),
+    // Preserve a genuinely missing value as null (not a fabricated 0 scratch trade) —
+    // aggregate() already filters non-finite/null values out of its sample.
+    realizedNetR: typeof o.outcome.realizedNetR === 'number' ? o.outcome.realizedNetR : null,
+    realizedGrossR: typeof o.outcome.realizedGrossR === 'number' ? o.outcome.realizedGrossR : null,
     liveSourceConflict: o.snapshot?.liveSourceConflict ?? null,
     kronosAgrees: o.snapshot?.kronosAgrees ?? null,
   }));

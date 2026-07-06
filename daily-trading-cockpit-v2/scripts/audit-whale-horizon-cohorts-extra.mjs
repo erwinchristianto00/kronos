@@ -33,7 +33,10 @@ function build(p) {
   if (!v) return null;
   const ctx = p.strategyContextSnapshot ?? null;
   if (!ctx) return null;
-  return { id: p.id, position: p, variant: v, context: { ...ctx, direction: p.direction, symbol: p.symbol, evidenceEra: ctx.evidenceEra ?? p.variantSelection?.evidenceEra ?? null }, outcome: { closeReason: v.closeReason, realizedNetR: v.realizedNetR, realizedGrossR: v.realizedGrossR, openedAt: p.entryFilledAt ?? v.openedAt ?? p.scannedAt, selectedExitVariant: v.variant, evidenceEra: p.variantSelection?.evidenceEra ?? null } };
+  // context.direction is NOT overridden with position.direction — matches production's
+  // buildStrategyExperienceRecords (packages/shared/src/strategy-intelligence.ts),
+  // which spreads strategyContextSnapshot verbatim.
+  return { id: p.id, position: p, variant: v, context: { ...ctx, symbol: p.symbol, evidenceEra: ctx.evidenceEra ?? p.variantSelection?.evidenceEra ?? null }, outcome: { closeReason: v.closeReason, realizedNetR: v.realizedNetR, realizedGrossR: v.realizedGrossR, openedAt: p.entryFilledAt ?? v.openedAt ?? p.scannedAt, selectedExitVariant: v.variant, evidenceEra: p.variantSelection?.evidenceEra ?? null } };
 }
 const recs = positions.map(build).filter(Boolean).filter(r => (r.context.evidenceEra ?? r.outcome.evidenceEra) === "POST_CALIBRATION");
 

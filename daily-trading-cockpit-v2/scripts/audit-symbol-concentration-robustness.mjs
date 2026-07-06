@@ -107,7 +107,7 @@ function metricsOf(cohort) {
   const netSumR = sum(netRs);
   return {
     n,
-    netAvgR: round4(netSumR / netRs.length),
+    netAvgR: netRs.length ? round4(netSumR / netRs.length) : null,
     PF: lossAbs === 0 ? null : round4(winSum / lossAbs),
     winRate: round4(wins.length / n),
     netSumR: round4(netSumR),
@@ -248,12 +248,17 @@ function losoTable(cohort, name) {
       excluded: s,
       remainingN: m.n,
       remainingNetAvgR: m.netAvgR,
-      deltaVsOriginal: round4((m.netAvgR ?? 0) - (orig.netAvgR ?? 0)),
+      // null (not a fabricated delta) when either side has no measurable average —
+      // e.g. excluding a symbol empties the remaining cohort entirely.
+      deltaVsOriginal:
+        m.netAvgR !== null && orig.netAvgR !== null ? round4(m.netAvgR - orig.netAvgR) : null,
       remainingNetSumR: m.netSumR,
       remainingPF: m.PF,
     };
   });
-  rows.sort((a, b) => a.deltaVsOriginal - b.deltaVsOriginal); // most load-bearing first (largest drop)
+  // most load-bearing first (largest drop); unmeasurable deltas sink to the bottom
+  // rather than colliding unpredictably with numeric deltas in the sort.
+  rows.sort((a, b) => (a.deltaVsOriginal ?? Infinity) - (b.deltaVsOriginal ?? Infinity));
   console.log(`\n=== LOSO — ${name} ===`);
   console.table(rows);
   return rows;
@@ -268,8 +273,11 @@ function diversityQuality(rows) {
   const positiveSum = rows.filter((r) => r.netSumR > 0).length;
   const positiveAvg = rows.filter((r) => Number.isFinite(r.netAvgR) && r.netAvgR > 0).length;
   const totalNet = sum(sums);
-  const denom = totalNet === 0 ? 1 : Math.abs(totalNet);
-  const hhi = sum(sums.map((v) => (v / denom) ** 2));
+  // HHI-style concentration only means something when there's a real net magnitude to
+  // share out; at totalNet===0 (winners and losers exactly offset — plausibly the
+  // healthiest, most diversified case) any denominator is arbitrary and the resulting
+  // number would misrepresent concentration rather than measure it.
+  const hhi = totalNet === 0 ? null : round4(sum(sums.map((v) => (v / Math.abs(totalNet)) ** 2)));
   return {
     symbols: rows.length,
     netSumR_positive: positiveSum,
@@ -277,7 +285,7 @@ function diversityQuality(rows) {
     median_netSumR: round4(median(sums)),
     mean_netSumR: round4(sum(sums) / (sums.length || 1)),
     median_netAvgR: round4(median(avgs)),
-    HHI_share_of_netSumR_signed: round4(hhi),
+    HHI_share_of_netSumR_signed: hhi,
   };
 }
 console.log("\n=== Diversity quality — WHALE ===");
@@ -432,9 +440,11 @@ function survivalSummary(robustRows) {
     afterTop1: t1.netAvgR,
     afterTop2: t2.netAvgR,
     afterTop3: t3.netAvgR,
-    survivesTop1Removal: (t1.netAvgR ?? -Infinity) >= 0,
-    survivesTop2Removal: (t2.netAvgR ?? -Infinity) >= 0,
-    survivesTop3Removal: (t3.netAvgR ?? -Infinity) >= 0,
+    // null (not a fabricated "did not survive") when removal empties the cohort —
+    // "no data left to judge" is not the same claim as "the edge disappeared".
+    survivesTop1Removal: t1.netAvgR === null ? null : t1.netAvgR >= 0,
+    survivesTop2Removal: t2.netAvgR === null ? null : t2.netAvgR >= 0,
+    survivesTop3Removal: t3.netAvgR === null ? null : t3.netAvgR >= 0,
   };
 }
 console.log("\n=== Survival summary ===");

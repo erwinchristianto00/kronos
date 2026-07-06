@@ -13,7 +13,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 dotenv.config({ path: resolve(__dirname, "../../../.env"), override: true, quiet: true });
 
 const { parseLiveExecutionConfig } = await import("../src/lib/live-execution-engine.js");
-const { BinanceFuturesPrivateClient } = await import("../src/lib/binance-futures-private.js");
+const { BinanceFuturesPrivateClient, MAX_CLOCK_SKEW_MS } = await import("../src/lib/binance-futures-private.js");
 
 async function main(): Promise<void> {
   const cfg = parseLiveExecutionConfig();
@@ -34,7 +34,7 @@ async function main(): Promise<void> {
   const client = new BinanceFuturesPrivateClient({ apiKey: cfg.apiKey, apiSecret: cfg.apiSecret, env: cfg.env });
 
   await client.ensureTimeSync();
-  console.log(`clock skew = ${Math.round(client.getClockSkewMs())}ms (guard 1000ms)`);
+  console.log(`clock skew = ${Math.round(client.getClockSkewMs())}ms (guard ${MAX_CLOCK_SKEW_MS}ms)`);
 
   const hedge = await client.isHedgeMode();
   console.log(`position mode = ${hedge ? "HEDGE (must switch to one-way before arming)" : "ONE-WAY (ok)"}`);

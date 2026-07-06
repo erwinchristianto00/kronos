@@ -28,10 +28,22 @@ function observationCount(file: string): number {
   }
 }
 
-function resetStore(file: string, now: string): { file: string; previousObservations: number; backupPath: string | null } {
+function hasFlag(name: string): boolean {
+  return process.argv.includes(name);
+}
+
+function resetStore(
+  file: string,
+  now: string,
+  dryRun: boolean,
+): { file: string; previousObservations: number; backupPath: string | null } {
   mkdirSync(dirname(file), { recursive: true });
   const previousObservations = observationCount(file);
   let backupPath: string | null = null;
+
+  if (dryRun) {
+    return { file, previousObservations, backupPath: null };
+  }
 
   if (existsSync(file)) {
     const backupDir = resolve(dirname(file), "gate-reset-backups");
@@ -66,19 +78,25 @@ const apiRoot = resolve(scriptDir, "..");
 const repoRoot = resolve(scriptDir, "../../..");
 const now = new Date().toISOString();
 
+// Destructive by nature (wipes both variant-matrix stores to empty) — defaults to a
+// dry-run preview, matching repair-axis-history.ts's safer --apply convention, so a
+// mistaken/muscle-memory invocation can't instantly zero live data with no preview.
+const apply = hasFlag("--apply");
+
 const targets = [
   resolve(repoRoot, "data/current-guard-variant-matrix.json"),
   resolve(apiRoot, "data/current-guard-variant-matrix.json"),
 ];
 
-const results = targets.map((target) => resetStore(target, now));
+const results = targets.map((target) => resetStore(target, now, !apply));
 
+console.log(`mode=${apply ? "APPLY" : "DRY_RUN"}${apply ? "" : " (pass --apply to actually reset)"}`);
 for (const result of results) {
   console.log(
     [
-      `reset=${result.file}`,
+      `${apply ? "reset" : "would-reset"}=${result.file}`,
       `previousObservations=${result.previousObservations}`,
-      `backup=${result.backupPath ?? "NONE"}`,
+      `backup=${result.backupPath ?? (apply ? "NONE" : "N/A (dry-run)")}`,
     ].join(" "),
   );
 }

@@ -55,11 +55,13 @@ const postCalRecs = positionsWithClosedAndCtx.filter(p => classifyEra(p) === "PO
 console.log("POST_CALIBRATION records (Section K input):", postCalRecs.length);
 
 // Section K "Keep only bearish expansion and short" filter
-// IMPORTANT: Section K reads context.marketRegime and context.direction.
-// In TS, the record's context is spread from strategyContextSnapshot.
-// buildStrategyExperienceRecords does: ctx = position.strategyContextSnapshot ?? buildStrategyContextSnapshot(...).
-// It does NOT override context.direction with position.direction (unlike audit script).
-// Need to check both interpretations.
+// RESOLVED: Section K reads context.marketRegime and context.direction. In TS, the
+// record's context is spread from strategyContextSnapshot, and
+// buildStrategyExperienceRecords (packages/shared/src/strategy-intelligence.ts) does
+// `context: { ...position.strategyContextSnapshot }` VERBATIM — it does NOT override
+// context.direction with position.direction. So ctx.direction (dashByCtx) is the
+// correct interpretation, not position.direction (dashByPos) — computing both below
+// only to cross-check; ctxMismatch (below) confirms whether they'd ever disagree.
 
 const dashByCtx = postCalRecs.filter(p => {
   const ctx = p.strategyContextSnapshot;
@@ -92,20 +94,20 @@ for (const p of postCalRecs) {
 }
 console.log(`ctx.direction != position.direction count: ${ctxMismatch}`);
 
-// Variant breakdown inside dashboard cohort (using position.direction interpretation)
+// Variant breakdown inside dashboard cohort (ctx.direction — matches production)
 const variantsInDash = new Map();
-for (const p of dashByPos) {
+for (const p of dashByCtx) {
   const variant = primaryClosed(p);
   const exitVar = variant.variant ?? p.selectedExitVariant;
   const entryVar = p.selectedEntryVariant ?? p.variantSelection?.selectedEntryVariant ?? null;
   const k = `${entryVar} + ${exitVar}`;
   variantsInDash.set(k, (variantsInDash.get(k) ?? 0) + 1);
 }
-console.log("\nVariant (entry+exit) breakdown inside DASHBOARD_SET (position.direction):");
+console.log("\nVariant (entry+exit) breakdown inside DASHBOARD_SET (ctx.direction):");
 for (const [k, n] of [...variantsInDash.entries()].sort((a,b)=>b[1]-a[1])) console.log(`  ${k}: ${n}`);
 
 // ID-set diff
-const dashSet = new Set(dashByPos.map(p => p.id));
+const dashSet = new Set(dashByCtx.map(p => p.id));
 const auditSet = new Set(audit.map(p => p.id));
 const intersection = [...dashSet].filter(id => auditSet.has(id));
 const dashOnly = [...dashSet].filter(id => !auditSet.has(id));
@@ -148,7 +150,7 @@ function metrics(cohort){
   };
 }
 console.log("\n=== Economics ===");
-const dashOnlyRecs = dashByPos.filter(p => !auditSet.has(p.id));
-console.log(`DASHBOARD_SET (N=${dashByPos.length}):`, metrics(dashByPos));
+const dashOnlyRecs = dashByCtx.filter(p => !auditSet.has(p.id));
+console.log(`DASHBOARD_SET (N=${dashByCtx.length}):`, metrics(dashByCtx));
 console.log(`AUDIT_SET     (N=${audit.length}):`, metrics(audit));
 console.log(`DASHBOARD_ONLY(N=${dashOnlyRecs.length}):`, metrics(dashOnlyRecs));

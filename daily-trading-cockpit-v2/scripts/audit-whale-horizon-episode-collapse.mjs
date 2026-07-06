@@ -6,7 +6,10 @@ const positions = JSON.parse(fs.readFileSync(path.join(process.cwd(), "data", "s
 function classifyEra(p){const sel=p?.variantSelection??null;if(!sel)return"LEGACY_PRE_ROUTING";if(sel.evidenceEra)return sel.evidenceEra;const hasRouteMode=typeof sel.routeMode==="string"&&sel.routeMode.length>0;const hasCalibration=sel.calibratedExpectedNetR!==undefined||sel.calibrationVerdict!==undefined;if(!hasRouteMode&&!hasCalibration)return"LEGACY_PRE_ROUTING";if(hasRouteMode&&!hasCalibration)return"POST_ROUTING_PRE_CALIBRATION";if(hasCalibration)return"POST_CALIBRATION";return"UNKNOWN";}
 function normalizeRegime(v){if(v==null||v==="")return null;const s=String(v).toUpperCase();if(s.includes("BULL"))return"BULLISH_EXPANSION";if(s.includes("BEAR"))return"BEARISH_EXPANSION";if(s.includes("SIDE")||s.includes("RANGE")||s.includes("CHOP"))return"SIDEWAYS";if(s.includes("MIX"))return"MIXED";return s;}
 function primaryClosed(p){return p.variants.find((v)=>v.variant===p.selectedExitVariant&&v.state==="CLOSED")??p.variants.find((v)=>v.state==="CLOSED")??null;}
-function build(p){const v=primaryClosed(p);if(!v)return null;const ctx=p.strategyContextSnapshot??null;if(!ctx)return null;return{id:p.id,context:{...ctx,direction:p.direction,symbol:p.symbol,evidenceEra:ctx.evidenceEra??p.variantSelection?.evidenceEra??null},outcome:{closeReason:v.closeReason,realizedNetR:v.realizedNetR,realizedGrossR:v.realizedGrossR,openedAt:p.entryFilledAt??v.openedAt??p.scannedAt,selectedExitVariant:v.variant,evidenceEra:p.variantSelection?.evidenceEra??null}};}
+// context.direction is NOT overridden with position.direction — matches production's
+// buildStrategyExperienceRecords (packages/shared/src/strategy-intelligence.ts), which
+// spreads strategyContextSnapshot verbatim.
+function build(p){const v=primaryClosed(p);if(!v)return null;const ctx=p.strategyContextSnapshot??null;if(!ctx)return null;return{id:p.id,context:{...ctx,symbol:p.symbol,evidenceEra:ctx.evidenceEra??p.variantSelection?.evidenceEra??null},outcome:{closeReason:v.closeReason,realizedNetR:v.realizedNetR,realizedGrossR:v.realizedGrossR,openedAt:p.entryFilledAt??v.openedAt??p.scannedAt,selectedExitVariant:v.variant,evidenceEra:p.variantSelection?.evidenceEra??null}};}
 const recs=positions.map(build).filter(Boolean).filter(r=>(r.context.evidenceEra??r.outcome.evidenceEra)==="POST_CALIBRATION");
 const base=recs.filter(r=>normalizeRegime(r.context.marketRegime)==="BEARISH_EXPANSION"&&r.context.direction==="SHORT"&&r.context.selectedEntryVariant==="vwap_retest_entry"&&r.outcome.selectedExitVariant==="tp1_full_exit");
 
@@ -34,7 +37,7 @@ function summarize(reps, label){
   const winSum = wins.reduce((s,v)=>s+v,0);
   const sorted = [...nets].sort((a,b)=>a-b);
   const med = sorted.length ? (sorted.length%2 ? sorted[Math.floor(sorted.length/2)] : (sorted[sorted.length/2-1]+sorted[sorted.length/2])/2) : null;
-  console.log(`${label}: nEpisodes=${reps.length}  netAvgR(epi)=${(sum/reps.length).toFixed(4)}  PF=${lossAbs?(winSum/lossAbs).toFixed(3):"n/a"}  WR=${(wins.length/reps.length).toFixed(3)}  median=${med?.toFixed(4)}  sum=${sum.toFixed(4)}`);
+  console.log(`${label}: nEpisodes=${reps.length}  netAvgR(epi)=${reps.length?(sum/reps.length).toFixed(4):"n/a"}  PF=${lossAbs?(winSum/lossAbs).toFixed(3):"n/a"}  WR=${reps.length?(wins.length/reps.length).toFixed(3):"n/a"}  median=${med?.toFixed(4)}  sum=${sum.toFixed(4)}`);
 }
 const FIVE_MIN = 5*60_000;
 const FIFTEEN_MIN = 15*60_000;

@@ -145,8 +145,10 @@ for (const lane of Object.keys(stats)) {
   // top-1 / top-2 loss contributors
   const losers = [...rows].sort((a, b) => a.netSumR - b.netSumR);
   const lossSum = sum(rows.filter((r) => r.netSumR < 0).map((r) => r.netSumR));
-  const top1 = losers[0]?.netSumR / lossSum;
-  const top2 = (losers[0]?.netSumR + (losers[1]?.netSumR ?? 0)) / lossSum;
+  // null (not Infinity/NaN) when no symbol in this lane has a negative netSumR —
+  // "loss share" is undefined when there's no loss to share.
+  const top1 = lossSum !== 0 && losers[0] ? losers[0].netSumR / lossSum : null;
+  const top2 = lossSum !== 0 && losers[0] ? (losers[0].netSumR + (losers[1]?.netSumR ?? 0)) / lossSum : null;
   console.log(`  top-1 loss share=${fmt(top1)} top-2 loss share=${fmt(top2)}`);
   // ex-top-1, ex-top-2
   const exTop1Rs = list.filter((o) => o.symbol !== losers[0]?.sym).map((o) => o.outcome.realizedNetR);

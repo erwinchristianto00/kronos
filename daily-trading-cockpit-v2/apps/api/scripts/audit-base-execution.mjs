@@ -14,7 +14,8 @@
 import fs from "node:fs";
 import path from "node:path";
 
-const ROOT = path.resolve("C:/Users/Admin/Desktop/kronos/daily-trading-cockpit-v2");
+// Run from the monorepo root: node apps/api/scripts/audit-base-execution.mjs
+const ROOT = path.resolve(process.cwd());
 const SHADOW_PATH = path.join(ROOT, "data/shadow-positions.json");
 const DLOG_PATH_API = path.join(ROOT, "apps/api/data/decision-log.jsonl");
 const DLOG_PATH_ROOT = path.join(ROOT, "data/decision-log.jsonl");

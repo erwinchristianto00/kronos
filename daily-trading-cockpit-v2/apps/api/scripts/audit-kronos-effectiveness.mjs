@@ -232,7 +232,10 @@ console.log(`|---|---:|---:|---:|---:|---:|`);
 function vetoRow(name, predTrue, predFalse, base) {
   const aT = base.filter(predTrue); const aF = base.filter(predFalse);
   const mT = metrics(aT); const mF = metrics(aF);
-  const delta = (mT.netAvgR != null && mF.netAvgR != null) ? round4(Math.abs(mT.netAvgR - mF.netAvgR)) : null;
+  // Same n<10 suppression as showT/showF below — a confident-looking delta computed
+  // from a sub-10 sample would contradict this row's own "n=X" display of that average.
+  const delta = (mT.n >= 10 && mF.n >= 10 && mT.netAvgR != null && mF.netAvgR != null)
+    ? round4(Math.abs(mT.netAvgR - mF.netAvgR)) : null;
   const showT = mT.n < 10 ? `n=${mT.n}` : mT.netAvgR;
   const showF = mF.n < 10 ? `n=${mF.n}` : mF.netAvgR;
   console.log(`| ${name} | ${mT.n} | ${showT} | ${mF.n} | ${showF} | ${delta} |`);
