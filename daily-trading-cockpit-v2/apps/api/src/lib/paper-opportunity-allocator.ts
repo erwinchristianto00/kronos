@@ -1214,6 +1214,14 @@ export function buildPaperOpportunityAllocatorReport(
   const paperStartMs = inputs.paperStartAt ? new Date(inputs.paperStartAt).getTime() : null;
   const paperControls = readPaperTradingControls();
 
+  // MIXED regime intentionally bypasses the simple paperValidationAllowed gate here — Mixed
+  // admission is instead governed by the more granular mixed-regime-router.ts system downstream
+  // (mixedRegimeReport's admissionResult/occupancyMode/budget profiles, and paperOrderMode tagging
+  // that marks Mixed-admitted candidates DIAGNOSTIC_ONLY, not HEADLINE — confirmed via the existing
+  // [10]/[10e] test coverage, which explicitly admits MIXED candidates with paperValidationAllowed
+  // false/absent). Initially "fixed" this by removing the MIXED bypass, which looked like the same
+  // avgPrice-fallback bug class from elsewhere this session — but running the full suite before
+  // deploy caught that it breaks 6 legitimate, intentional tests. Reverted; not a bug.
   const regimeOk = regimeAllowsPaperLane(controllerMode, regimeFamily, paperValidationAllowed) || regimeFamily === "MIXED";
 
   // ── adaptive lane quarantine + accounting-mode decision (Parts 2/3/5) ──────

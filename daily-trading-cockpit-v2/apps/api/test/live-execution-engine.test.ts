@@ -1397,6 +1397,46 @@ describe("LiveExecutionEngine", () => {
     expect((await engine.arm()).ok).toBe(true);
   });
 
+  it("kill-switch flatten books its realized P&L to the intent and the ledger (was silently dropped)", async () => {
+    // A kill-switch flatten is almost always a loss (that's what tripped the breaker). Before this
+    // fix it left intent.realizedPnlUsd null and never touched dailyLedger — invisible to lane
+    // reports, and understating the total resetKill() rebases its drawdown peak from.
+    const order = paperOrder();
+    const client = new FakeLiveClient();
+    client.flattenRealizedPnl = -7.5; // the kill-switch's own reduce-only flatten realizes -$7.50
+    const { engine, store } = makeEngine({ client, paper: makePaperStore([order]) });
+    await engine.arm();
+    await engine.tick(); // open the intent
+
+    store.getState().dailyLedger.dateUtc = "2099-01-02";
+    store.getState().dailyLedger.realizedPnlUsd = -20;
+    const totalBefore = store.getState().totalRealizedPnlUsd;
+    await engine.tick(); // trips the kill-switch
+
+    const killed = store.getState().intents[0]!;
+    expect(killed.state).toBe("KILLED");
+    expect(killed.realizedPnlUsd).toBeCloseTo(-7.5, 6); // no longer null
+    expect(store.getState().totalRealizedPnlUsd).toBeCloseTo(totalBefore - 7.5, 6);
+    expect(store.getState().dailyLedger.losses).toBeGreaterThanOrEqual(1); // counted as adverse, not silently dropped
+  });
+
+  it("operator panic-flatten (flattenAllExchangePositions) also books its realized P&L (same fix as the kill-switch)", async () => {
+    const order = paperOrder();
+    const client = new FakeLiveClient();
+    client.flattenRealizedPnl = -3.25;
+    const { engine, store } = makeEngine({ client, paper: makePaperStore([order]) });
+    await engine.arm();
+    await engine.tick(); // open the intent
+    const totalBefore = store.getState().totalRealizedPnlUsd;
+
+    await engine.flattenAllExchangePositions("operator panic button");
+
+    const killed = store.getState().intents[0]!;
+    expect(killed.state).toBe("KILLED");
+    expect(killed.realizedPnlUsd).toBeCloseTo(-3.25, 6);
+    expect(store.getState().totalRealizedPnlUsd).toBeCloseTo(totalBefore - 3.25, 6);
+  });
+
   it("reconciliation: an orphan exchange position auto-disarms (never auto-flattens)", async () => {
     const { engine, client } = makeEngine({});
     await engine.arm();
@@ -1739,6 +1779,39 @@ describe("LiveExecutionEngine", () => {
     // A restart with auto-arm on must stay disarmed while the kill is latched.
     expect(engine.isArmed()).toBe(false);
   });
+
+  it("arm() re-checks the kill latch AFTER the isHedgeMode() await — a kill that lands during that network round-trip must not be punched through", async () => {
+    // arm()'s FIRST killedAt check passes (nothing latched yet), then it awaits isHedgeMode() — a
+    // real network call. If a kill-switch (from a concurrent tick) latches during that exact
+    // window, arm() must not blindly proceed to armed=true afterward: it must see the fresh latch.
+    class RaceClient extends FakeLiveClient {
+      constructor(private readonly onCheck: () => void) {
+        super();
+      }
+      async isHedgeMode(): Promise<boolean> {
+        this.onCheck(); // simulates a concurrent kill-switch latching mid-await
+        return super.isHedgeMode();
+      }
+    }
+    const store = new LiveExecutionStore(tmp());
+    const client = new RaceClient(() => {
+      store.getState().killedAt = "2099-01-02T12:00:00.500Z";
+      store.getState().killReason = "concurrent kill mid-arm";
+    });
+    const engine = new LiveExecutionEngine({
+      config: makeConfig({}),
+      client: client as unknown as LivePrivateClient,
+      store,
+      paperStore: makePaperStore([]),
+      nowIso: () => "2099-01-02T12:00:00.000Z",
+    });
+
+    const result = await engine.arm();
+
+    expect(result.ok).toBe(false);
+    expect(result.reason).toMatch(/kill-switch engaged/);
+    expect(engine.isArmed()).toBe(false);
+  });
 });
 
 describe("regime-flip rescue (shadow wiring)", () => {
@@ -1896,6 +1969,31 @@ describe("regime-flip rescue (LIVE execution)", () => {
     await engine.tick();
     expect(engine.isArmed()).toBe(true);
     expect(store.getState().lastRescuePlan!.mode).toBe("live");
+  });
+
+  it("prefers the exchange-confirmed entryPrice over an unconfirmed avgPrice=0 flip fill (never silently records a $0 entry)", async () => {
+    // `??` does not catch a real 0 — `flip.avgPrice ?? after?.entryPrice` would have kept a
+    // genuine avgPrice=0 forever, skipping the fresh getPositions() entryPrice fetched right
+    // after the flip. FakeLiveClient.getPositions() always reports entryPrice=2000.
+    const client = new FakeLiveClient();
+    client.positionsBySymbol.set("ETHUSDT", 1.0);
+    client.markPriceBySymbol.set("ETHUSDT", 1900);
+    client.unrealizedPnlBySymbol.set("ETHUSDT", -5);
+    client.marketFillPrice = 0; // the flip's placeOrder response reports avgPrice=0
+    const { engine, store } = makeEngine({
+      client,
+      config: { rescue: RESCUE_LIVE, rescueExecute: true, regimeLossHardCutStopFraction: 0 },
+      getControllerSnapshot: SHORT_REGIME,
+    });
+    expect((await engine.arm()).ok).toBe(true);
+    pushIntent(store, { paperOrderId: "p-eth" });
+
+    await engine.tick(); // flip
+
+    const rescue = store.getState().intents.find((i) => i.rescue === true)!;
+    expect(rescue.filledEntryPrice).toBeCloseTo(2000, 6); // exchange-confirmed, NOT 0
+    expect(rescue.plannedEntryPrice).toBeCloseTo(2000, 6);
+    expect(rescue.entryPriceConfirmed).toBe(true);
   });
 
   it("flattens a rescued symbol once the combined venture clears target, booking the live leg", async () => {

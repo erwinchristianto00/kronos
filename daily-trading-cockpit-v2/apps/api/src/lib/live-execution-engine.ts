@@ -1053,6 +1053,13 @@ export class LiveExecutionEngine {
     } catch (error) {
       return { ok: false, reason: `cannot verify account mode: ${(error as Error).message}` };
     }
+    // Re-check: a kill-switch can latch during the isHedgeMode() await above. Without this,
+    // arm() would set armed=true right after engageKillSwitch() just disarmed and latched —
+    // punching through the exact protection this function's own killedAt check exists to give.
+    const postAwaitKill = this.store.getState().killedAt;
+    if (postAwaitKill) {
+      return { ok: false, reason: `kill-switch engaged at ${postAwaitKill}: ${this.store.getState().killReason}` };
+    }
     this.armed = true;
     return { ok: true, reason: null };
   }
@@ -1112,6 +1119,7 @@ export class LiveExecutionEngine {
     const canceledOrderSymbols: string[] = [];
     const canceledAlgoSymbols: string[] = [];
     const flattened: Array<{ symbol: string; side: "BUY" | "SELL"; quantity: number; orderId: number | null }> = [];
+    const flattenOrderIdBySymbol = new Map<string, number | null>();
 
     const [positions, openOrders, openAlgoOrders] = await Promise.all([
       this.client.getPositions(),
@@ -1153,6 +1161,7 @@ export class LiveExecutionEngine {
           newClientOrderId: `dtc-flatten-${Date.now().toString(36)}-${symbol.slice(0, 8)}`,
         });
         flattened.push({ symbol, side, quantity, orderId: order.orderId ?? null });
+        flattenOrderIdBySymbol.set(symbol, order.orderId ?? null);
       } catch (error) {
         failed.push({ symbol, action: "marketReduceOnly", reason: (error as Error).message });
       }
@@ -1161,6 +1170,15 @@ export class LiveExecutionEngine {
     const affectedSymbols = new Set([...symbols]);
     for (const intent of st.intents) {
       if (!OPEN_INTENT_STATES.has(intent.state) || !affectedSymbols.has(intent.symbol)) continue;
+      // A panic flatten is NEVER a win — book its realized P&L so it isn't silently dropped from
+      // lane reports and the drawdown-peak rebase, same reasoning as the kill-switch path below.
+      const net = await this.realizedFromTrades(intent.symbol, intent.createdAt, [
+        intent.entryOrderId,
+        intent.tp1OrderId,
+        flattenOrderIdBySymbol.get(intent.symbol) ?? null,
+      ]);
+      intent.realizedPnlUsd = net;
+      this.applyRealizedToLedger(net, "adverse");
       intent.state = "KILLED";
       intent.closeReason = `EXCHANGE_FLATTEN: ${reason}`;
       intent.closedAt = this.nowIso();
@@ -1736,8 +1754,9 @@ export class LiveExecutionEngine {
         await this.client.cancelAllAlgoOrders(intent.symbol);
         const positions = await this.client.getPositions(intent.symbol);
         const pos = positions.find((p) => p.symbol === intent.symbol);
+        let flattenOrderId: number | null = null;
         if (pos && Math.abs(pos.positionAmt) > 0) {
-          await this.client.placeOrder({
+          const flatten = await this.client.placeOrder({
             symbol: intent.symbol,
             side: pos.positionAmt > 0 ? "SELL" : "BUY",
             type: "MARKET",
@@ -1745,7 +1764,14 @@ export class LiveExecutionEngine {
             reduceOnly: true,
             newClientOrderId: `dtc-kill-${intent.paperOrderId.slice(-12)}`,
           });
+          flattenOrderId = flatten.orderId;
         }
+        // A kill-switch flatten is NEVER a win — book its realized P&L (almost always a loss, since
+        // this only fires on a breaker tripping) so lane reports don't silently drop it and
+        // resetKill()'s drawdown-peak rebase isn't understated right when it matters most.
+        const net = await this.realizedFromTrades(intent.symbol, intent.createdAt, [intent.entryOrderId, intent.tp1OrderId, flattenOrderId]);
+        intent.realizedPnlUsd = net;
+        this.applyRealizedToLedger(net, "adverse");
         intent.state = "KILLED";
         intent.closeReason = `KILL_SWITCH: ${reason}`;
         intent.closedAt = this.nowIso();
@@ -2406,6 +2432,12 @@ export class LiveExecutionEngine {
     const netAmt = after?.positionAmt ?? 0;
     if (Math.abs(netAmt) < 1e-12) return; // flip fully flattened — venture closed at the flip, no leg to track
 
+    // `?? ` does NOT catch a real 0 (avgPrice is typed number, never null/undefined) — `flip.avgPrice
+    // ?? after?.entryPrice` would keep a genuine avgPrice=0 echo forever, skipping the fresh,
+    // exchange-confirmed after.entryPrice fetched two lines above. Explicit `> 0` checks, and prefer
+    // the post-fetch exchange truth (after.entryPrice) over the order-placement echo (flip.avgPrice).
+    const resolvedFlipEntry =
+      after?.entryPrice && after.entryPrice > 0 ? after.entryPrice : flip.avgPrice > 0 ? flip.avgPrice : null;
     const st = this.store.getState();
     st.intents.push({
       paperOrderId: `rescue-${action.symbol}-${this.nowIso()}`,
@@ -2414,10 +2446,11 @@ export class LiveExecutionEngine {
       state: "OPEN",
       qty: Math.abs(netAmt),
       tp1Qty: 0,
-      plannedEntryPrice: after?.entryPrice ?? flip.avgPrice ?? 0,
+      plannedEntryPrice: resolvedFlipEntry ?? 0,
       stopLossPrice: 0,
       tp1Price: 0,
-      filledEntryPrice: flip.avgPrice ?? after?.entryPrice ?? null,
+      filledEntryPrice: resolvedFlipEntry,
+      entryPriceConfirmed: resolvedFlipEntry !== null,
       entryOrderId: flip.orderId,
       stopOrderId: null,
       tp1OrderId: null,
