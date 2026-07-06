@@ -1,7 +1,7 @@
 import { useEffect, useState, type ReactNode } from 'react';
 
-// Simple but rich monitoring page for the report-only research lanes (cross-sectional market-neutral
-// + moonshot lottery). Self-contained: own fetches + 10s auto-refresh + inline-styled dark cards.
+// Simple but rich monitoring page for the report-only research lanes (cross-sectional market-neutral).
+// Self-contained: own fetches + 10s auto-refresh + inline-styled dark cards.
 // Served at /research. Surfaces LIVENESS (cycle ran when, funnel, countdowns) so "all 0" is obviously
 // "alive but waiting", not "broken". These lanes accrue slowly — empty/thin is normal until mature.
 
@@ -48,16 +48,6 @@ type PSLE = {
     byDirection: Record<'LONG' | 'SHORT' | 'MIXED', { measured: number; bookPositive: number; testnetCandidate: number; promotable: number }>;
   };
 };
-type Moon = {
-  daily: { dateUtc: string; tradesToday: number; trades100xToday: number; trades50xPlusToday: number; dailyRealizedLossUsdt: number; activePositions: number };
-  defaultMaxLeverage: number; totalLogged: number; signals24h: number; rejects24h: number;
-  lastCycle: { ts: string; scanned: number; prefiltered: number; signals: number; rejects: number } | null;
-  marketCalm: boolean;
-  rejectReasons: Array<{ reason: string; count: number }>;
-  scoreHistogram: number[];
-  recent: Array<{ ts: string; symbol: string; decision: string; moonshotScore: number; riskScore: number; finalLeverage: number; isSniper: boolean; reasons: string[] }>;
-};
-
 const C = {
   bg: '#0b1418', card: '#14222a', sub: '#0f1c23', border: '#20313a', text: '#dbe7ec', dim: '#7d97a3',
   good: '#46d39a', bad: '#ff6b6b', measure: '#6fb3d6', accent: '#f0b54b', track: '#1c2c34',
@@ -93,20 +83,6 @@ function Card({ title, subtitle, right, children }: { title: string; subtitle?: 
     </section>
   );
 }
-function Gauge({ label, value, max, color }: { label: string; value: number; max: number; color?: string }) {
-  const frac = Math.max(0, Math.min(1, max > 0 ? value / max : 0));
-  const c = color ?? (frac >= 0.9 ? C.bad : frac >= 0.6 ? C.accent : C.good);
-  return (
-    <div style={{ padding: '8px 14px', flex: '1 1 120px', minWidth: 110 }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, color: C.dim, textTransform: 'uppercase', letterSpacing: 0.3 }}>
-        <span>{label}</span><span style={{ color: c }}>{value}/{max}</span>
-      </div>
-      <div style={{ height: 6, background: C.track, borderRadius: 3, marginTop: 5, overflow: 'hidden' }}>
-        <div style={{ width: `${frac * 100}%`, height: '100%', background: c }} />
-      </div>
-    </div>
-  );
-}
 function HBar({ label, value, max, color, valueText }: { label: string; value: number; max: number; color: string; valueText?: string }) {
   const frac = max > 0 ? Math.abs(value) / max : 0;
   return (
@@ -130,46 +106,6 @@ function Spark({ values }: { values: number[] }) {
     </div>
   );
 }
-function Histogram({ buckets }: { buckets: number[] }) {
-  const total = buckets.reduce((a, b) => a + b, 0);
-  const max = Math.max(1, ...buckets);
-  return (
-    <div>
-      <div style={{ display: 'flex', alignItems: 'flex-end', gap: 3, height: 92 }}>
-        {buckets.map((v, i) => {
-          const lo = i * 10;
-          const c = lo >= 90 ? C.accent : lo >= 80 ? C.good : C.measure;
-          return (
-            <div key={i} title={`${lo}–${lo + 10}: ${v}`} style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'flex-end', height: '100%' }}>
-              <span style={{ fontSize: 10, color: C.dim, height: 12 }}>{v || ''}</span>
-              <div style={{ width: '100%', height: `${(v / max) * 64 + (v ? 3 : 0)}px`, background: c, borderRadius: 2, opacity: v ? 1 : 0.22 }} />
-              <span style={{ fontSize: 9, color: C.dim, marginTop: 3 }}>{lo}</span>
-            </div>
-          );
-        })}
-      </div>
-      <div style={{ fontSize: 11, color: C.dim, marginTop: 6 }}>
-        {total} candidates scored · <span style={{ color: C.good }}>■</span> ≥82 signal-eligible · <span style={{ color: C.accent }}>■</span> ≥90 (97+ sniper)
-      </div>
-    </div>
-  );
-}
-function Funnel({ steps }: { steps: Array<{ label: string; value: number; color?: string }> }) {
-  return (
-    <div style={{ display: 'flex', alignItems: 'stretch', gap: 0, padding: '10px 16px', flexWrap: 'wrap' }}>
-      {steps.map((s, i) => (
-        <div key={i} style={{ display: 'flex', alignItems: 'center' }}>
-          <div style={{ textAlign: 'center', padding: '6px 16px', background: C.sub, borderRadius: 8, border: `1px solid ${C.border}` }}>
-            <div style={{ fontSize: 22, fontWeight: 700, color: s.color ?? C.text }}>{s.value}</div>
-            <div style={{ fontSize: 11, color: C.dim, textTransform: 'uppercase', letterSpacing: 0.3 }}>{s.label}</div>
-          </div>
-          {i < steps.length - 1 && <span style={{ color: C.dim, padding: '0 8px', fontSize: 18 }}>→</span>}
-        </div>
-      ))}
-    </div>
-  );
-}
-
 const rfmt = (x: number | null | undefined) => (x == null ? '—' : `${x >= 0 ? '+' : ''}${x.toFixed(3)}`);
 const VERDICT_COLOR: Record<RGL['lanes'][number]['verdict'], string> = {
   IMPROVED: C.good, WORSENED: C.bad, FLAT: C.dim, INSUFFICIENT: C.measure,
@@ -177,7 +113,6 @@ const VERDICT_COLOR: Record<RGL['lanes'][number]['verdict'], string> = {
 
 export default function ResearchDashboard() {
   const [xsec, setXsec] = useState<XSec | null>(null);
-  const [moon, setMoon] = useState<Moon | null>(null);
   const [rgl, setRgl] = useState<RGL | null>(null);
   const [psle, setPsle] = useState<PSLE | null>(null);
   const [updated, setUpdated] = useState<number | null>(null);
@@ -185,21 +120,18 @@ export default function ResearchDashboard() {
 
   async function load() {
     try {
-      const [a, b, c, d] = await Promise.all([
+      const [a, c, d] = await Promise.all([
         fetch('/api/shadow/cross-sectional-report', { cache: 'no-store' }).then((r) => r.json()),
-        fetch('/api/shadow/moonshot-report', { cache: 'no-store' }).then((r) => r.json()),
         fetch('/api/shadow/regime-gated-lanes', { cache: 'no-store' }).then((r) => r.json()),
         fetch('/api/shadow/per-symbol-lane-edge', { cache: 'no-store' }).then((r) => r.json()).catch(() => null),
       ]);
-      setXsec(a); setMoon(b); setRgl(c); setPsle(d); setUpdated(Date.now()); setErr(null);
+      setXsec(a); setRgl(c); setPsle(d); setUpdated(Date.now()); setErr(null);
     } catch (e) { setErr((e as Error).message); }
   }
   useEffect(() => { void load(); const t = window.setInterval(() => void load(), 10_000); return () => window.clearInterval(t); }, []);
 
   const r = xsec?.report;
   const rf = xsec?.filteredReport;
-  const m = moon;
-  const maxReject = Math.max(1, ...(m?.rejectReasons ?? []).map((x) => x.count));
   const legMax = Math.max(0.0001, Math.abs(r?.longLegAvgReturn ?? 0), Math.abs(r?.shortLegAvgReturn ?? 0));
   const filteredLegMax = Math.max(0.0001, Math.abs(rf?.longLegAvgReturn ?? 0), Math.abs(rf?.shortLegAvgReturn ?? 0));
 
@@ -426,62 +358,6 @@ export default function ResearchDashboard() {
         ) : <div style={{ padding: 16, color: C.dim }}>loading…</div>}
       </Card>
 
-      <Card
-        title="Moonshot lottery"
-        subtitle={m ? `demo / report-only · sniper slot machine with a seatbelt · default max-lev ${m.defaultMaxLeverage}x (execution re-checks bracket)` : 'loading…'}
-        right={m ? <>{m.lastCycle ? `cycle ${ago(m.lastCycle.ts)} ago` : 'no cycle yet'}{m.marketCalm && <> · <span style={{ color: C.measure }}>market calm — no bursts</span></>}</> : null}
-      >
-        {m ? (
-          <>
-            <div style={{ fontSize: 12, color: C.dim, padding: '10px 16px 0' }}>Gate funnel (proves the lane is scanning — it just holds fire until a violent mover appears)</div>
-            <Funnel steps={[
-              { label: 'Scanned', value: m.lastCycle?.scanned ?? 0 },
-              { label: 'Bursts (prefilter)', value: m.lastCycle?.prefiltered ?? 0, color: C.accent },
-              { label: 'Signals', value: m.lastCycle?.signals ?? 0, color: C.good },
-              { label: 'Rejects', value: m.lastCycle?.rejects ?? 0, color: C.dim },
-            ]} />
-            <div style={{ display: 'flex', flexWrap: 'wrap', borderTop: `1px solid ${C.border}`, borderBottom: `1px solid ${C.border}` }}>
-              <Gauge label="Trades today" value={m.daily.tradesToday} max={10} />
-              <Gauge label="50x+ today" value={m.daily.trades50xPlusToday} max={4} />
-              <Gauge label="100x today" value={m.daily.trades100xToday} max={2} color={C.accent} />
-              <Gauge label="Daily loss $" value={Math.round(m.daily.dailyRealizedLossUsdt * 100) / 100} max={10} color={C.bad} />
-            </div>
-            <div style={{ display: 'flex', gap: 24, padding: '12px 16px', flexWrap: 'wrap', borderBottom: `1px solid ${C.border}` }}>
-              <div style={{ flex: '1 1 320px', minWidth: 280 }}>
-                <div style={{ fontSize: 12, color: C.dim, marginBottom: 6 }}>Score distribution (every scanned candidate)</div>
-                <Histogram buckets={m.scoreHistogram ?? []} />
-              </div>
-            </div>
-            <div style={{ display: 'flex', gap: 24, padding: '12px 16px', flexWrap: 'wrap' }}>
-              <div style={{ flex: '1 1 320px', minWidth: 260 }}>
-                <div style={{ fontSize: 12, color: C.dim, marginBottom: 6 }}>Why candidates get rejected (calibration insight)</div>
-                {m.rejectReasons.length ? m.rejectReasons.map((x) => (
-                  <HBar key={x.reason} label={x.reason} value={x.count} max={maxReject} color={C.measure} valueText={`${x.count}`} />
-                )) : <span style={{ color: C.dim, fontSize: 13 }}>no rejects logged yet</span>}
-              </div>
-              <div style={{ flex: '1 1 160px', display: 'flex', gap: 0, alignItems: 'flex-start' }}>
-                <Stat label="Signals 24h" value={`${m.signals24h}`} color={C.good} />
-                <Stat label="Rejects 24h" value={`${m.rejects24h}`} color={C.dim} />
-                <Stat label="Logged" value={`${m.totalLogged}`} />
-              </div>
-            </div>
-            <div style={{ padding: '4px 16px 14px' }}>
-              <div style={{ color: C.dim, fontSize: 12, marginBottom: 6 }}>{m.recent.length === 0 ? 'No candidates logged yet — waiting for a burst (+0.5% & 2× volume in 1m)' : 'Recent signals / rejects'}</div>
-              {[...m.recent].reverse().slice(0, 12).map((e, i) => (
-                <div key={i} style={{ display: 'flex', gap: 12, fontSize: 13, padding: '4px 0', borderTop: i ? `1px solid ${C.border}` : undefined }}>
-                  <span style={{ width: 64, fontWeight: 600, color: e.decision === 'SIGNAL' ? C.good : C.dim }}>{e.decision}</span>
-                  <span style={{ width: 90 }}>{e.symbol}{e.isSniper ? ' 🎯' : ''}</span>
-                  <span style={{ color: C.measure, width: 64 }}>sc {e.moonshotScore}</span>
-                  <span style={{ color: e.riskScore > 45 ? C.bad : C.dim, width: 60 }}>rk {e.riskScore}</span>
-                  <span style={{ color: C.accent, width: 44 }}>{e.finalLeverage}x</span>
-                  <span style={{ color: C.dim, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{e.reasons.join(' · ')}</span>
-                  <span style={{ color: C.dim }}>{ago(e.ts)} ago</span>
-                </div>
-              ))}
-            </div>
-          </>
-        ) : <div style={{ padding: 16, color: C.dim }}>loading…</div>}
-      </Card>
     </div>
   );
 }

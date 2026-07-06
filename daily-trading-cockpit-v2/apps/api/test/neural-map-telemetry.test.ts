@@ -652,53 +652,6 @@ describe("neural map telemetry", () => {
     expect(trailLane?.pnlIsDiagnosticOnly).toBe(true);
   });
 
-  it("surfaces H6 trend-continuation as a report-only lane in the performance field", () => {
-    const input = baseInput();
-    input.h6Trend = {
-      freshValid: 12,
-      open: 0,
-      expired: 0,
-      netAvgR: -0.08,
-      grossAvgR: -0.02,
-      pf: 0.82,
-      wr: 0.42,
-      avgMaxFavorableR: 0.9,
-      tp1HitRate: 0.25,
-      watchableThreshold: 10,
-      status: "WATCHABLE",
-      totalNetR: -0.96,
-      entryPolicy: {
-        name: "REGIME_FILTERED_TREND_CONTINUATION_LONG",
-        required: ["Daily EMA50 > EMA200", "4H EMA20 > EMA50"],
-        sourceOptional: ["BTC dominance change <= threshold when wired"],
-      },
-      exitPolicy: {
-        version: "tp1-50-be-atr-runner-v1",
-        tp1R: 0.8,
-        tp1ExitPct: 0.5,
-        breakevenAfterTp1: true,
-        runner: "ATR_CHANDELIER",
-      },
-      tight: { freshValid: 12, netAvgR: 0.02, pf: 1.04, wr: 0.5, avgMaxFavorableR: 0.75, tp1HitRate: 0.25 },
-      tightLargeCap: { freshValid: 3, netAvgR: 0.2, pf: 2.4, wr: 0.67, avgMaxFavorableR: 1.2, tp1HitRate: 0.33 },
-    } as never;
-    const result = buildNeuralMapTelemetry(input);
-    const h6 = result.lanes.find((lane) => lane.id === "H6_TREND_CONTINUATION_LONG");
-    expect(h6).toMatchObject({
-      label: "H6 TREND LONG",
-      statsSource: "H6_RESEARCH",
-      open: 0,
-      closed: 12,
-      headlinePnl: 0,
-      diagnosticPnl: 0,
-      totalPnl: 0,
-      health: "WARNING",
-    });
-    expect(h6?.reason).toContain("Paper performance appears here after the paper adapter admits");
-    expect(h6?.blockers).toContain("no current H6 full-context gate pass");
-    expect(h6?.cautions.some((item) => item.includes("TP1 50% at +0.8R"))).toBe(true);
-  });
-
   it("does not let a hanging Binance mark fetch block neural-map unrealized telemetry", async () => {
     const previousTimeout = process.env.NEURAL_MAP_MARK_TIMEOUT_MS;
     process.env.NEURAL_MAP_MARK_TIMEOUT_MS = "5";

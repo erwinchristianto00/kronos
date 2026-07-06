@@ -9,14 +9,14 @@
  * retrace from peak) — the same asymmetry fix the live autopsy demanded. Pure measurement: it records
  * and resolves observations and exposes a report; NOTHING trades until the book proves positive.
  *
- * Independent module (mirrors h6-trend-edge / fade-long-edge): its own store, cycle, resolver, report.
+ * Independent module: its own store, cycle, resolver, report.
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 
 import type { Candle } from "@dtc/shared";
-import { computeEMA, computeATR, computeSMA } from "./h6-trend-edge.js";
+import { computeEMA, computeATR, computeSMA } from "./candle-indicators.js";
 
 function envNum(name: string, dflt: number): number {
   const v = Number(process.env[name]);

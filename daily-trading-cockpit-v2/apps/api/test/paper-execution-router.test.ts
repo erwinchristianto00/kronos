@@ -27,7 +27,6 @@ import {
   type PaperResolverClient,
   type PaperEligibleLane,
 } from "../src/lib/paper-execution-router.js";
-import { H6_TREND_PAPER_LANE_ID } from "../src/lib/h6-trend-edge.js";
 import {
   buildAdaptiveLaneRouterReport,
 } from "../src/lib/adaptive-lane-router.js";
@@ -45,6 +44,10 @@ import {
   buildOperatorBrief,
   OPERATOR_BRIEF_MAX_LINES,
 } from "../src/lib/operator-brief.js";
+
+// An arbitrary example lane id for these generic paper-admission mechanics tests (not testing
+// any h6-trend-specific behavior).
+const H6_TREND_PAPER_LANE_ID = "H6_TREND_CONTINUATION_LONG";
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 

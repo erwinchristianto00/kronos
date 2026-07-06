@@ -79,11 +79,6 @@ import {
   getPortfolioTrendShadowStore,
   type PortfolioTrendCandidate,
 } from "../lib/portfolio-trend-shadow.js";
-import {
-  collectMicrostructureSnapshot,
-  getMicrostructureSnapshotStore,
-  type MicrostructureCollectionOptions,
-} from "../lib/microstructure-feature-collector.js";
 import type { BinanceClient } from "../lib/binance.js";
 import { isRegimeEngineEnabled, runRegimeEngineCycleGuarded } from "../lib/regime-engine-service.js";
 import { runFreshVariantMatrixFeed } from "../lib/fresh-variant-matrix-feed.js";
@@ -1120,64 +1115,6 @@ export async function registerScanRoute(
       // portfolio trend admission must never break the scan
     } finally {
       timing.finishStage("portfolioTrendAdmission");
-    }
-
-    // --- Data collector: Microstructure Feature Collector V1 ---
-    // Fire-and-forget per-symbol snapshots. Disabled via
-    // MICROSTRUCTURE_COLLECTOR_DISABLED=1. Never blocks the scan.
-    timing.startStage("microstructureDispatch");
-    try {
-      const microstructureDisabled = parseBooleanEnv(
-        process.env.MICROSTRUCTURE_COLLECTOR_DISABLED,
-        false,
-      );
-      if (!microstructureDisabled && opts.binanceClient) {
-        const msStore = getMicrostructureSnapshotStore();
-        const msClient = opts.binanceClient;
-        const symbolLimit = parsePositiveIntEnv(
-          process.env.MICROSTRUCTURE_COLLECTOR_SYMBOL_LIMIT,
-          10,
-        );
-        const collectionOpts: MicrostructureCollectionOptions = {
-          depthEnabled: parseBooleanEnv(
-            process.env.MICROSTRUCTURE_COLLECTOR_DEPTH_ENABLED,
-            true,
-          ),
-          tradesEnabled: parseBooleanEnv(
-            process.env.MICROSTRUCTURE_COLLECTOR_TRADES_ENABLED,
-            false,
-          ),
-          openInterestEnabled: parseBooleanEnv(
-            process.env.MICROSTRUCTURE_COLLECTOR_OPEN_INTEREST_ENABLED,
-            true,
-          ),
-          fundingEnabled: parseBooleanEnv(
-            process.env.MICROSTRUCTURE_COLLECTOR_FUNDING_ENABLED,
-            true,
-          ),
-          liquidationsEnabled: false,
-          depthLimit: 5,
-          aggTradesLimit: 100,
-        };
-        const sample = top10WithPlan.slice(0, symbolLimit);
-        for (const c of sample) {
-          collectMicrostructureSnapshot(c.symbol, msClient, collectionOpts)
-            .then((snap) => {
-              try {
-                msStore.append(snap);
-              } catch {
-                // append failures must never break the scan
-              }
-            })
-            .catch(() => {
-              // per-symbol collection failures must never break the scan
-            });
-        }
-      }
-    } catch {
-      // microstructure collection must never break the scan
-    } finally {
-      timing.finishStage("microstructureDispatch");
     }
 
     const hiddenSkipsWithPlan = timing.measureSyncStage("hiddenSkipScoring", () =>

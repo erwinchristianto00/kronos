@@ -53,7 +53,6 @@ import type {
   CurrentGuardVariantMatrixRow,
 } from "./current-guard-variant-matrix.js";
 import type { PortfolioTrendShadowReport } from "./portfolio-trend-shadow.js";
-import type { MicrostructureCollectorReport } from "./microstructure-feature-collector.js";
 import {
   buildLiveTradingGateReport,
   type LiveTradingGateReport,
@@ -384,10 +383,6 @@ export function buildDashboardAuditSummaryReport(
      * Report-only Portfolio Trend Shadow V1 report. Optional. Renders section AB.
      */
     portfolioTrendReport?: PortfolioTrendShadowReport;
-    /**
-     * Report-only Microstructure Feature Collector V1 report. Optional. Section AC.
-     */
-    microstructureReport?: MicrostructureCollectorReport;
     /**
      * Report-only frozen prospective tape report (F***). Optional. Renders
      * section F*** and feeds the scoreboard + live gate prospective lane.
@@ -740,7 +735,7 @@ export function buildDashboardAuditSummaryReport(
   const orderReconciliationReadiness: OrderReconciliationReadinessReport =
     buildOrderReconciliationReadinessReport(generatedAt);
   const exchangeHealthReadiness: ExchangeHealthReadinessReport =
-    buildExchangeHealthReadinessReport(opts.microstructureReport, generatedAt);
+    buildExchangeHealthReadinessReport(generatedAt);
 
   // ---- Live Trading Gate (HARD BLOCK, REPORT-ONLY) --------------------
   const liveTradingGateReport: LiveTradingGateReport = buildLiveTradingGateReport(
@@ -3415,50 +3410,6 @@ export function buildDashboardAuditSummaryReport(
       out.push(`    At 10bps round-trip: net=${fmtR(r.costSensitivity.at10bpsRoundtrip)}`);
       out.push(`    At 50bps round-trip: net=${fmtR(r.costSensitivity.at50bpsRoundtrip)}`);
       out.push("  report-only, isolated; data/shadow-positions.json untouched");
-      return out;
-    })(),
-    "",
-    "AC. MICROSTRUCTURE FEATURE COLLECTOR V1 (DATA COLLECTOR ONLY)",
-    ...(() => {
-      const r = opts.microstructureReport;
-      if (!r) return ["  [unavailable]"];
-      const out: string[] = [];
-      out.push("  Lane: MICROSTRUCTURE_FEATURE_COLLECTOR_V1");
-      out.push(`  Snapshots collected: ${r.snapshotsCollected}`);
-      out.push(`  Rich-schema snapshots: ${r.richSchemaSnapshots}`);
-      out.push(
-        `  Symbols covered: ${r.symbolsCovered.length}${r.symbolsCovered.length > 0 ? ` (${r.symbolsCovered.slice(0, 8).join(", ")}${r.symbolsCovered.length > 8 ? ", …" : ""})` : ""}`,
-      );
-      out.push("  All-time completeness:");
-      for (const [field, rate] of Object.entries(r.allTimeCompleteness)) {
-        out.push(`    ${field}: ${(rate * 100).toFixed(1)}%`);
-      }
-      out.push("  Post-upgrade completeness:");
-      for (const [field, rate] of Object.entries(r.postUpgradeCompleteness)) {
-        out.push(`    ${field}: ${(rate * 100).toFixed(1)}%`);
-      }
-      out.push("  Availability:");
-      out.push(
-        `    bookTickerQty=${(r.bookTickerQtyAvailability * 100).toFixed(1)}% | depthImbalance=${(r.depthImbalanceAvailability * 100).toFixed(1)}% | openInterest=${(r.openInterestAvailability * 100).toFixed(1)}% | funding=${(r.fundingRateAvailability * 100).toFixed(1)}% | tradeDelta=${(r.tradeDeltaAvailability * 100).toFixed(1)}%`,
-      );
-      out.push("  Endpoint diagnostics:");
-      const endpoints = Object.entries(r.endpointDiagnostics ?? {});
-      if (endpoints.length === 0) out.push("    (none)");
-      else {
-        for (const [endpoint, d] of endpoints) {
-          out.push(
-            `    ${endpoint}: success=${d.success} failed=${d.failed} disabled=${d.disabled} unavailable=${d.unavailable}`,
-          );
-        }
-      }
-      const fmtSpread = (v: number | null) =>
-        typeof v === "number" && Number.isFinite(v) ? `${v.toFixed(1)} bps` : "n/a";
-      out.push("  Latest spread distribution:");
-      out.push(`    p50: ${fmtSpread(r.latestSpreadDistribution.p50)} | p90: ${fmtSpread(r.latestSpreadDistribution.p90)} | p99: ${fmtSpread(r.latestSpreadDistribution.p99)}`);
-      out.push("  Data quality warnings:");
-      if (r.dataQualityWarnings.length === 0) out.push("    (none)");
-      else for (const w of r.dataQualityWarnings) out.push(`    - ${w}`);
-      out.push("  No trading logic; pure data collection");
       return out;
     })(),
     "",

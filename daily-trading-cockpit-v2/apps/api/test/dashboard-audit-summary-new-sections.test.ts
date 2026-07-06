@@ -2,7 +2,6 @@ import { describe, expect, it } from "vitest";
 
 import { buildDashboardAuditSummaryReport } from "../src/lib/dashboard-audit-summary.js";
 import type { PortfolioTrendShadowReport } from "../src/lib/portfolio-trend-shadow.js";
-import type { MicrostructureCollectorReport } from "../src/lib/microstructure-feature-collector.js";
 import type {
   BaseRouteCurrentGuardLaneSummary,
   BaseRouteRiskHygieneMonitor,
@@ -188,74 +187,7 @@ function makePortfolioTrendReport(): PortfolioTrendShadowReport {
   };
 }
 
-function makeMicrostructureReport(): MicrostructureCollectorReport {
-  return {
-    reportOnly: true,
-    computedAt: "2026-05-27T00:00:00.000Z",
-    snapshotsCollected: 12,
-    richSchemaSnapshots: 2,
-    symbolsCovered: ["SOLUSDT", "INJUSDT"],
-    allTimeCompleteness: {
-      bestBid: 1.0,
-      bestAsk: 1.0,
-      spreadBps: 1.0,
-      bookTickerBidQty: 0.2,
-      bookTickerAskQty: 0.2,
-      bidDepth5Levels: 0.2,
-      askDepth5Levels: 0.2,
-      topBidQty: 0.2,
-      topAskQty: 0.2,
-      bidDepthNotional5: 0.2,
-      askDepthNotional5: 0.2,
-      depthImbalance5: 0.2,
-      takerBuyVolume1m: 0.0,
-      takerSellVolume1m: 0.0,
-      takerDelta1m: 0.0,
-      fundingRate: 0.2,
-      fundingTimeMs: 0.2,
-      openInterest: 0.2,
-      liquidationLongUsd5m: 0.0,
-      liquidationShortUsd5m: 0.0,
-    },
-    postUpgradeCompleteness: {
-      bestBid: 1.0,
-      bestAsk: 1.0,
-      spreadBps: 1.0,
-      bookTickerBidQty: 1.0,
-      bookTickerAskQty: 1.0,
-      bidDepth5Levels: 1.0,
-      askDepth5Levels: 1.0,
-      topBidQty: 1.0,
-      topAskQty: 1.0,
-      bidDepthNotional5: 1.0,
-      askDepthNotional5: 1.0,
-      depthImbalance5: 1.0,
-      takerBuyVolume1m: 0.8,
-      takerSellVolume1m: 0.8,
-      takerDelta1m: 0.8,
-      fundingRate: 1.0,
-      fundingTimeMs: 1.0,
-      openInterest: 1.0,
-      liquidationLongUsd5m: 0.0,
-      liquidationShortUsd5m: 0.0,
-    },
-    latestSpreadDistribution: { p50: 1.5, p90: 3.2, p99: 8.0 },
-    depthAvailability: 1.0,
-    depthImbalanceAvailability: 1.0,
-    bookTickerQtyAvailability: 1.0,
-    openInterestAvailability: 1.0,
-    fundingRateAvailability: 1.0,
-    tradeDeltaAvailability: 0.8,
-    liquidationAvailability: 0.0,
-    endpointDiagnostics: {
-      bookTicker: { success: 12, failed: 0, disabled: 0, unavailable: 0 },
-      depth: { success: 12, failed: 0, disabled: 0, unavailable: 0 },
-    },
-    dataQualityWarnings: ["LIQUIDATION_MISSING"],
-  };
-}
-
-describe("dashboard new sections AA / AB / AC / AD / W*****", () => {
+describe("dashboard new sections AA / AB / AD / W*****", () => {
   it("renders section AA with NOT_LIVE_READY verdict", () => {
     const r = buildDashboardAuditSummaryReport([]);
     expect(r.summaryText).toContain("AA. STRATEGIC PROFIT ROADMAP");
@@ -278,20 +210,6 @@ describe("dashboard new sections AA / AB / AC / AD / W*****", () => {
     const r = buildDashboardAuditSummaryReport([]);
     expect(r.summaryText).toContain("AB. PORTFOLIO TREND SHADOW V1");
     expect(r.summaryText).toContain("[unavailable]");
-  });
-
-  it("renders section AC with all-time and post-upgrade completeness", () => {
-    const r = buildDashboardAuditSummaryReport([], {
-      microstructureReport: makeMicrostructureReport(),
-    });
-    expect(r.summaryText).toContain("AC. MICROSTRUCTURE FEATURE COLLECTOR V1");
-    expect(r.summaryText).toContain("Snapshots collected: 12");
-    expect(r.summaryText).toContain("Rich-schema snapshots: 2");
-    expect(r.summaryText).toContain("Symbols covered: 2");
-    expect(r.summaryText).toContain("All-time completeness:");
-    expect(r.summaryText).toContain("Post-upgrade completeness:");
-    expect(r.summaryText).toContain("Endpoint diagnostics:");
-    expect(r.summaryText).toContain("bookTicker: success=12");
   });
 
   it("renders section AD with liveBlocked=true and 9 blockers", () => {

@@ -1,41 +1,26 @@
 import { describe, it, expect } from "vitest";
 
 import { buildExchangeHealthReadinessReport } from "../src/lib/exchange-health-readiness.js";
-import type { MicrostructureCollectorReport } from "../src/lib/microstructure-feature-collector.js";
 
-function makeMicrostructure(over: Partial<MicrostructureCollectorReport> = {}): MicrostructureCollectorReport {
-  return {
-    bookTickerQtyAvailability: 1.0,
-    depthAvailability: 1.0,
-    fundingRateAvailability: 1.0,
-    openInterestAvailability: 1.0,
-    latestSpreadDistribution: { p50: 1.1, p90: 4.3, p99: 9.4 },
-    ...over,
-  } as unknown as MicrostructureCollectorReport;
-}
-
-describe("AG exchange health readiness", () => {
-  it("ready=false even when microstructure provides data (needs monitoring loop)", () => {
-    const r = buildExchangeHealthReadinessReport(makeMicrostructure());
+describe("exchange health readiness (report-only spec)", () => {
+  it("ready=false with no live inputs (report-only spec mode)", () => {
+    const r = buildExchangeHealthReadinessReport();
     expect(r.ready).toBe(false);
     expect(r.reportOnly).toBe(true);
+    expect(r.readyReasons).toContain("no live inputs (report-only spec mode)");
   });
 
-  it("bookticker_freshness available=true when microstructure completeness > 0", () => {
-    const r = buildExchangeHealthReadinessReport(makeMicrostructure({ bookTickerQtyAvailability: 1.0 }));
-    const check = r.checks.find((c) => c.name === "bookticker_freshness");
-    expect(check?.available).toBe(true);
-    expect(check?.source).toBe("AC_MICROSTRUCTURE");
+  it("bookticker/depth/funding/openinterest/spread checks are NOT_AVAILABLE (not implemented)", () => {
+    const r = buildExchangeHealthReadinessReport();
+    for (const name of ["bookticker_freshness", "depth_freshness", "funding_freshness", "openinterest_freshness", "abnormal_spread_detection"]) {
+      const check = r.checks.find((c) => c.name === name);
+      expect(check?.available).toBe(false);
+      expect(check?.source).toBe("NOT_AVAILABLE");
+    }
   });
 
-  it("availableCount reflects microstructure availability", () => {
-    const full = buildExchangeHealthReadinessReport(makeMicrostructure());
-    const none = buildExchangeHealthReadinessReport(undefined);
-    expect(full.availableCount).toBeGreaterThan(none.availableCount);
-  });
-
-  it("implemented=false when any check missing (FUTURE checks never available)", () => {
-    const r = buildExchangeHealthReadinessReport(makeMicrostructure());
+  it("implemented=false (FUTURE/NOT_AVAILABLE checks never available)", () => {
+    const r = buildExchangeHealthReadinessReport();
     expect(r.implemented).toBe(false);
     expect(r.missingChecks.length).toBeGreaterThan(0);
   });
@@ -43,37 +28,38 @@ describe("AG exchange health readiness", () => {
   // ── v1 live readiness (gate 1 of infraReady) ──
   const fresh = { reachable: true, marketDataAgeMs: 60_000, clockSkewMs: 200 };
 
-  it("[LIVE] ready=true when reachable + fresh data + feeds present + clock ok", () => {
-    const r = buildExchangeHealthReadinessReport(makeMicrostructure(), undefined, fresh);
-    expect(r.ready).toBe(true);
-    expect(r.readyReasons).toEqual([]);
+  it("[LIVE] ready=false even when reachable + fresh + clock ok (book/depth feeds are not implemented)", () => {
+    const r = buildExchangeHealthReadinessReport(undefined, fresh);
+    expect(r.ready).toBe(false);
+    expect(r.readyReasons.some((x) => x.includes("feed"))).toBe(true);
   });
 
   it("[LIVE] ready=false when market data is stale", () => {
-    const r = buildExchangeHealthReadinessReport(makeMicrostructure(), undefined, { ...fresh, marketDataAgeMs: 60 * 60_000 });
+    const r = buildExchangeHealthReadinessReport(undefined, { ...fresh, marketDataAgeMs: 60 * 60_000 });
     expect(r.ready).toBe(false);
     expect(r.readyReasons.some((x) => x.includes("market data"))).toBe(true);
   });
 
   it("[LIVE] ready=false when not reachable", () => {
-    const r = buildExchangeHealthReadinessReport(makeMicrostructure(), undefined, { ...fresh, reachable: false });
+    const r = buildExchangeHealthReadinessReport(undefined, { ...fresh, reachable: false });
     expect(r.ready).toBe(false);
+    expect(r.readyReasons.some((x) => x.includes("reachable"))).toBe(true);
   });
 
-  it("[LIVE] ready=false when microstructure book/depth feeds are absent", () => {
-    const r = buildExchangeHealthReadinessReport(makeMicrostructure({ bookTickerQtyAvailability: 0 }), undefined, fresh);
-    expect(r.ready).toBe(false);
-    expect(r.readyReasons.some((x) => x.includes("feeds"))).toBe(true);
-  });
-
-  it("[LIVE] clock skew blocks only when MEASURED and over tolerance; null is advisory", () => {
-    const bad = buildExchangeHealthReadinessReport(makeMicrostructure(), undefined, { ...fresh, clockSkewMs: 5000 });
+  it("[LIVE] clock skew blocks only when MEASURED and over tolerance; null is advisory (but feeds still block ready)", () => {
+    const bad = buildExchangeHealthReadinessReport(undefined, { ...fresh, clockSkewMs: 5000 });
     expect(bad.ready).toBe(false);
-    const unmeasured = buildExchangeHealthReadinessReport(makeMicrostructure(), undefined, { ...fresh, clockSkewMs: null });
-    expect(unmeasured.ready).toBe(true); // null skew doesn't block
+    expect(bad.readyReasons.some((x) => x.includes("clock skew"))).toBe(true);
+    const unmeasured = buildExchangeHealthReadinessReport(undefined, { ...fresh, clockSkewMs: null });
+    // clock is advisory-clean, but book/depth feeds are still NOT_AVAILABLE, so overall ready stays false.
+    expect(unmeasured.ready).toBe(false);
+    expect(unmeasured.readyReasons.some((x) => x.includes("clock"))).toBe(false);
   });
 
-  it("[LIVE] no live inputs → still ready=false (report-only spec mode)", () => {
-    expect(buildExchangeHealthReadinessReport(makeMicrostructure()).ready).toBe(false);
+  it("[LIVE] exchange_reachable / market_data_freshness / clock_sync checks appear only when live inputs are supplied", () => {
+    const withLive = buildExchangeHealthReadinessReport(undefined, fresh);
+    expect(withLive.checks.some((c) => c.name === "exchange_reachable")).toBe(true);
+    const withoutLive = buildExchangeHealthReadinessReport();
+    expect(withoutLive.checks.some((c) => c.name === "exchange_reachable")).toBe(false);
   });
 });

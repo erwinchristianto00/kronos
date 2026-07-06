@@ -229,15 +229,6 @@ import {
   type CurrentGuardVariantMatrixReport,
   type KlineTuple as VariantMatrixKlineTuple,
 } from "../lib/current-guard-variant-matrix.js";
-import { getFadeLongStore, runFadeLongCycleGuarded, buildFadeLongReport, FADE_LONG_RESEARCH_QUARANTINED } from "../lib/fade-long-edge.js";
-import {
-  getH6TrendStore,
-  runH6TrendCycleGuarded,
-  buildH6TrendReport,
-  buildH6TrendPaperOpportunities,
-  H6_TREND_INTERVAL,
-  H6_TREND_PAPER_ADMISSION_MAX_AGE_MS,
-} from "../lib/h6-trend-edge.js";
 import {
   getCrossSectionalStore,
   runCrossSectionalCycleGuarded,
@@ -254,13 +245,6 @@ import {
 } from "../lib/cross-sectional-edge.js";
 import { readFileSync } from "node:fs";
 import { analyzeHardCutCounterfactuals, extractHardCutIntents } from "../lib/hard-cut-counterfactual.js";
-import { isMoonshotLotteryEnabled } from "../lib/moonshot-lottery-lane.js";
-import {
-  getMoonshotStore,
-  runMoonshotCycleGuarded,
-  buildMoonshotReport,
-  MOONSHOT_DEFAULT_MAX_LEVERAGE,
-} from "../lib/moonshot-lottery-cycle.js";
 import { getCandidateFunnelLog } from "../lib/accelerated-evidence-candidate-funnel-log.js";
 import {
   buildPortfolioTrendShadowReport,
@@ -268,11 +252,6 @@ import {
   resolvePortfolioTrendPositions,
   type PortfolioTrendShadowReport,
 } from "../lib/portfolio-trend-shadow.js";
-import {
-  buildMicrostructureCollectorReport,
-  getMicrostructureSnapshotStore,
-  type MicrostructureCollectorReport,
-} from "../lib/microstructure-feature-collector.js";
 import { buildRegimeEngineReport, isRegimeEngineEnabled } from "../lib/regime-engine-service.js";
 import { buildFreshVariantMatrixReport } from "../lib/fresh-variant-matrix-feed.js";
 import { buildCrowdingReport } from "../lib/derivatives-crowding.js";
@@ -715,9 +694,6 @@ export async function registerShadowRoutes(
     );
   });
 
-  // MOONSHOT_LOTTERY_LANE demo report — daily budget state + recent signals/rejects (report-only).
-  app.get("/api/shadow/moonshot-report", async () => buildMoonshotReport(getMoonshotStore(), Date.now()));
-
   // Fresh VM-feed report — the honest fresh-entry measurement view. Registered on
   // every instance; only the "/" diagnostic instance (FRESH_VM_FEED_ENABLED=1) has
   // meaningful fresh intake, elsewhere it just reports whatever the store holds.
@@ -1032,41 +1008,11 @@ export async function registerShadowRoutes(
       // portfolio trend shadow must never break the dashboard
     }
 
-    // Data collector: Microstructure feature snapshots — report only.
-    let microstructureReport: MicrostructureCollectorReport | undefined;
-    try {
-      const msStore = getMicrostructureSnapshotStore();
-      microstructureReport = await buildMicrostructureCollectorReport(msStore);
-    } catch {
-      // microstructure report must never break the dashboard
-    }
-
-    // Report-only: realistic cost model for the frozen tape (F***), derived from
-    // the AC microstructure spread distribution + funding availability. Pure
-    // analytics; never throws. When populated, flips FUNDING_SLIPPAGE_MODELED
-    // gate to PASS (liveBlocked still true; infra gates still FAIL).
-    let frozenCostModelReport: FrozenCurrentGuardCostModelReport | undefined;
-    try {
-      if (microstructureReport) {
-        const spread = microstructureReport.latestSpreadDistribution;
-        frozenCostModelReport = buildFrozenCurrentGuardCostModelReport(
-          frozenObservationsForCostModel,
-          {
-            spreadP50Bps: spread.p50,
-            spreadP90Bps: spread.p90,
-            spreadP99Bps: spread.p99,
-            // No avg funding rate value is exposed by the collector report; the
-            // model falls back to a placeholder penalty when null.
-            avgFundingRate: null,
-            depthAvailable: (microstructureReport.depthAvailability ?? 0) > 0,
-            fundingAvailable: (microstructureReport.fundingRateAvailability ?? 0) > 0,
-            spreadAvailable: spread.p90 !== null,
-          },
-        );
-      }
-    } catch {
-      // cost model must never break the dashboard
-    }
+    // Report-only: realistic cost model for the frozen tape — needs a spread/funding source, which is
+    // not currently collected, so this stays undefined (same effective behavior as before). Pure
+    // analytics; never throws. When populated, flips FUNDING_SLIPPAGE_MODELED gate to PASS
+    // (liveBlocked still true; infra gates still FAIL).
+    const frozenCostModelReport: FrozenCurrentGuardCostModelReport | undefined = undefined;
 
     // Report-only: F****** post-cutover clean forward-validation tape. The
     // F***** pathology audit classifies OOS Segment 1 as OLD_BATCH; this tape
@@ -1082,24 +1028,13 @@ export async function registerShadowRoutes(
         );
         const pcStore = getPostCutoverStore();
         const boundary = pcStore.ensureBoundary(frozenCurrentGuardReport, pathology);
-        const spread = microstructureReport?.latestSpreadDistribution;
-        const spreadFunding = spread
-          ? {
-              spreadP50Bps: spread.p50,
-              spreadP90Bps: spread.p90,
-              spreadP99Bps: spread.p99,
-              avgFundingRate: null,
-              depthAvailable: (microstructureReport!.depthAvailability ?? 0) > 0,
-              fundingAvailable: (microstructureReport!.fundingRateAvailability ?? 0) > 0,
-              spreadAvailable: spread.p90 !== null,
-            }
-          : null;
-        // Infra-readiness gates default to false (not implemented), so the
+        // No spread/funding source is currently collected, so this stays null (same effective
+        // behavior as before). Infra-readiness gates default to false (not implemented), so the
         // post-cutover tape can never reach PROMOTION_CANDIDATE here.
         postCutoverReport = buildPostCutoverReport(
           frozenCurrentGuardReport,
           boundary,
-          spreadFunding,
+          null,
         );
       }
     } catch {
@@ -1234,7 +1169,6 @@ export async function registerShadowRoutes(
       parallelShadowExperimentReport,
       currentGuardVariantMatrixReport,
       portfolioTrendReport,
-      microstructureReport,
       frozenCurrentGuardReport,
       frozenCostModelReport,
       postCutoverReport,
@@ -1333,14 +1267,6 @@ export async function registerShadowRoutes(
       getCurrentGuardVariantMatrixStore(),
       { capturedAt: generatedAt },
     );
-    const fadeLong =
-      process.env.FADE_LONG_EDGE_DISABLED === "1" || FADE_LONG_RESEARCH_QUARANTINED
-        ? null
-        : buildFadeLongReport(getFadeLongStore().all);
-    const h6Trend =
-      process.env.H6_TREND_EDGE_DISABLED === "1"
-        ? null
-        : buildH6TrendReport(getH6TrendStore().all);
     const mixed = buildMixedRegimeReport({
       regime,
       candidates: (cached?.candidates ?? []).map((candidate) => ({
@@ -1368,8 +1294,6 @@ export async function registerShadowRoutes(
       paperUnrealized,
       orders,
       variantMatrix,
-      fadeLong,
-      h6Trend,
       mixed,
       mixedValidation,
       staleAudit,
@@ -1614,51 +1538,6 @@ export async function registerShadowRoutes(
         // FIRE-AND-FORGET: the lane is surfaced by the SEPARATE neural-map endpoint, not this
         // brief, so we must NOT block the (already heavy) brief on ~20 sequential candle fetches.
         // Overlap-guarded so the 7-min ticker can't stack two cycles on the singleton store.
-        // Long edges (fade-long dip-buy + H6 trend) only OPEN new positions in a bullish regime —
-        // both bleed in choppy/bearish (dips keep dipping; uptrends don't persist). Resolution of
-        // existing obs still runs regardless. `currentRegime` is now cached-first (the regime of the
-        // scan candidates), so it's the right, populated signal.
-        const regimeAllowsLong = typeof currentRegime === "string" && /bull/i.test(currentRegime);
-        if (process.env.FADE_LONG_EDGE_DISABLED !== "1" && !FADE_LONG_RESEARCH_QUARANTINED) {
-          const _flc = opts.binanceClient;
-          const fadeInterval = process.env.FADE_LONG_INTERVAL || "15m";
-          void runFadeLongCycleGuarded({
-            store: getFadeLongStore(),
-            universe: [...CURRENT_SCANNER_UNIVERSE],
-            now: Date.now(),
-            allowNewEntries: regimeAllowsLong,
-            fetchCandles: async (symbol: string) => _flc.getCandles(symbol, fadeInterval, 120),
-          }).catch(() => undefined);
-        }
-        // H6 trend-following LONG lane — the trend-gated long edge (momentum + uptrend structure,
-        // ATR chandelier trail). Same fire-and-forget discipline: report-only, surfaced by the
-        // neural-map endpoint, never blocks the brief. 6h candles ⇒ ~200 bars covers EMA90 history
-        // plus forward bars for the trail walk. Prove OOS before any read.
-        if (process.env.H6_TREND_EDGE_DISABLED !== "1") {
-          const _h6c = opts.binanceClient;
-          void runH6TrendCycleGuarded({
-            store: getH6TrendStore(),
-            universe: [...CURRENT_SCANNER_UNIVERSE],
-            now: Date.now(),
-            allowNewEntries: regimeAllowsLong,
-            fetchCandles: async (symbol: string) => _h6c.getCandles(symbol, H6_TREND_INTERVAL, 200),
-            fetchContext: async (symbol: string) => {
-              const [daily, h4, flow] = await Promise.allSettled([
-                _h6c.getCandles(symbol, "1d", 260),
-                _h6c.getCandles(symbol, "4h", 120),
-                _h6c.getFuturesFlow(symbol),
-              ]);
-              const flowValue = flow.status === "fulfilled" ? flow.value : null;
-              return {
-                dailyCandles: daily.status === "fulfilled" ? daily.value : undefined,
-                h4Candles: h4.status === "fulfilled" ? h4.value : undefined,
-                fundingRate: flowValue?.fundingRate ?? null,
-                openInterestChangePercent: flowValue?.openInterestChangePercent ?? null,
-                takerBuySellRatio: flowValue?.takerBuySellRatio ?? null,
-              };
-            },
-          }).catch(() => undefined);
-        }
         // Intraday momentum hunter (Sleeve 2): 1h breakout + volume surge + momentum → MFE-giveback
         // exit. Hunts the coin that pumps TODAY regardless of the chop macro tape. Report-only,
         // fire-and-forget, env-gated. NOT regime-gated — it finds per-symbol momentum, not macro trend.
@@ -1725,32 +1604,6 @@ export async function registerShadowRoutes(
               _xsc.getCandles(symbol, CROSS_SECTIONAL_INTERVAL, CROSS_SECTIONAL_MOMENTUM_BARS + 5),
           }).catch(() => undefined);
         }
-        // MOONSHOT_LOTTERY_LANE (demo/report-only): cheap prefilter → deep-extract top movers →
-        // score/risk/leverage gate → LOG signals & rejects. Generates SIGNAL objects only; the
-        // existing execution engine would consume them later. Env-gated, fire-and-forget. Demo uses a
-        // default symbol max-leverage/minNotional — real execution MUST re-check the leverage bracket.
-        if (isMoonshotLotteryEnabled() && opts.binanceClient) {
-          const _mbc = opts.binanceClient;
-          void runMoonshotCycleGuarded({
-            universe: [...CURRENT_SCANNER_UNIVERSE],
-            now: Date.now(),
-            store: getMoonshotStore(),
-            ctx: {
-              getCandles1m: async (sym, limit) => (await _mbc.getCandles(sym, "1m", limit)).map((c) => ({ close: c.close, volume: c.volume })),
-              getFlow: async (sym) => _mbc.getFuturesFlow(sym),
-              getDepth: async (sym) => {
-                const d = await _mbc.getDepth(sym, 50);
-                return {
-                  bids: d.bids.map(([p, q]) => [Number(p), Number(q)] as [number, number]),
-                  asks: d.asks.map(([p, q]) => [Number(p), Number(q)] as [number, number]),
-                };
-              },
-              getMarkPrice: async (sym) => (await _mbc.getFuturesPremiumIndex(sym)).markPrice,
-              minNotionalUsd: () => 5, // Binance futures common minNotional; execution re-checks per-symbol
-              maxLeverage: () => MOONSHOT_DEFAULT_MAX_LEVERAGE,
-            },
-          }).catch(() => undefined);
-        }
       }
       let postCutoverReport: PostCutoverReport | undefined;
       try {
@@ -1768,18 +1621,14 @@ export async function registerShadowRoutes(
         }
       } catch { /* variant matrix unavailable */ }
       // ── infraReady gate 1/3: exchange-health readiness (v1, report-only) ──────────────────────
-      // Computed from data already in hand (scan freshness + microstructure feeds). ANDed with
-      // killSwitch + orderReconciliation (both still false), so infraReady STAYS false → admission
-      // behavior is unchanged. Guarded: any failure → undefined → exchangeHealthReady false (= now).
+      // Computed from data already in hand (scan freshness). ANDed with killSwitch +
+      // orderReconciliation (both still false), so infraReady STAYS false → admission behavior is
+      // unchanged. Guarded: any failure → undefined → exchangeHealthReady false (= now).
       let exchangeHealthReadiness: ExchangeHealthReadinessReport | undefined;
       try {
         const _ehScan = getLatestScanCandidates();
         const _ehScanMs = _ehScan?.scanFinishedAt ? new Date(_ehScan.scanFinishedAt).getTime() : null;
-        let _ehMicro: MicrostructureCollectorReport | undefined;
-        try {
-          _ehMicro = await buildMicrostructureCollectorReport(getMicrostructureSnapshotStore());
-        } catch { /* microstructure optional */ }
-        exchangeHealthReadiness = buildExchangeHealthReadinessReport(_ehMicro, generatedAt, {
+        exchangeHealthReadiness = buildExchangeHealthReadinessReport(generatedAt, {
           reachable: _ehScanMs != null && Date.now() - _ehScanMs <= EXCHANGE_HEALTH_MAX_DATA_AGE_MS,
           marketDataAgeMs: _ehScanMs != null ? Date.now() - _ehScanMs : null,
           clockSkewMs: null, // advisory; wired when the signed client surfaces lastMeasuredSkewMs
@@ -2049,36 +1898,6 @@ export async function registerShadowRoutes(
               admissionTrace.createdDiagnostic = admitResult.admittedDiagnostic;
             }
 
-            if (process.env.H6_TREND_PAPER_ENABLED !== "0") {
-              const h6Opportunities = buildH6TrendPaperOpportunities(getH6TrendStore().all, {
-                now: paperNow,
-                regime: regimeReport?.currentRegime ?? cached?.marketRegime ?? null,
-                controllerMode: _paperRouter.controllerMode,
-                maxAgeMs: H6_TREND_PAPER_ADMISSION_MAX_AGE_MS,
-              });
-              if (h6Opportunities.length > 0) {
-                if (!admissionTrace.paperAdmissionStartedAt) {
-                  admissionTrace.paperAdmissionStartedAt = new Date().toISOString();
-                }
-                const h6AdmitResult = admitPaperOpportunities({
-                  store: paperStore,
-                  opportunities: h6Opportunities,
-                  routerReport: _paperRouter,
-                  gateReport,
-                  now: paperNow,
-                  admissionMaxAgeMs: H6_TREND_PAPER_ADMISSION_MAX_AGE_MS,
-                });
-                admissionTrace.paperAdmissionFinishedAt = new Date().toISOString();
-                admissionTrace.createdHeadline += h6AdmitResult.admittedHeadline;
-                admissionTrace.createdDiagnostic += h6AdmitResult.admittedDiagnostic;
-                if (allocatorReport) {
-                  allocatorReport.paperOrdersCreated += h6AdmitResult.admitted;
-                  allocatorReport.createdHeadline += h6AdmitResult.admittedHeadline;
-                  allocatorReport.createdDiagnostic += h6AdmitResult.admittedDiagnostic;
-                  allocatorReport.duplicateSuppressed += h6AdmitResult.duplicateSuppressed;
-                }
-              }
-            }
             // Report-only provenance audit + loser-fingerprint gate simulation are
             // intentionally NOT computed here. They (and the activeLane* metrics
             // rendered in Section 10) are recomputed AFTER the resolver from the

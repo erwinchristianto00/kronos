@@ -9,8 +9,6 @@ import {
   type CurrentGuardVariantMatrixReport,
   type VariantBreakdownRow,
 } from "./current-guard-variant-matrix.js";
-import type { FadeLongReport } from "./fade-long-edge.js";
-import { H6_TREND_PAPER_LANE_ID, type H6TrendReport } from "./h6-trend-edge.js";
 import type { MixedBudgetForwardValidationReport, MixedRegimeReport, OpenOrderStaleAudit } from "./mixed-regime-router.js";
 import type { PaperOrder, PaperPerformanceReport } from "./paper-execution-router.js";
 import { assessPaperTp, cgWideTpPctFromOrder } from "./paper-trading-controls.js";
@@ -267,48 +265,6 @@ export interface NeuralMapTelemetry {
   };
   nodes: NeuralMapNode[];
   lanes: NeuralMapLane[];
-  /**
-   * Fade-long edge: the oversold (RSI<30) dip-buy measurement lane. The scanner only emits CHASE
-   * longs (no dips) which have no edge on alts; this is the symmetric long-fade, measured on the
-   * universe and resolved by candle-walk. Report-only — accrues OOS like a variant lane, independent
-   * of the allocator/paper book. null when the lane is disabled or the store is empty.
-   */
-  fadeLong: {
-    freshValid: number;
-    open: number;
-    expired: number;
-    oosThreshold: number;
-    status: "COLLECTING" | "WATCHABLE";
-    netAvgR: number | null;
-    grossAvgR: number | null;
-    pf: number | null;
-    wr: number | null;
-    totalNetR: number;
-    antiCrash: FadeLongReport["antiCrash"];
-  } | null;
-  /** H6 trend-following LONG lane (momentum + uptrend gate, ATR chandelier trail). Independent
-   *  measurement edge like fadeLong — report-only, outside the allocator/paper book. null when
-   *  disabled or empty. */
-  h6Trend: {
-    freshValid: number;
-    open: number;
-    expired: number;
-    oosThreshold: number;
-    status: "COLLECTING" | "WATCHABLE";
-    netAvgR: number | null;
-    grossAvgR: number | null;
-    pf: number | null;
-    wr: number | null;
-    avgMaxFavorableR: number | null;
-    tp1HitRate: number | null;
-    totalNetR: number;
-    entryPolicy: H6TrendReport["entryPolicy"];
-    exitPolicy: H6TrendReport["exitPolicy"];
-    /** Research A/B sibling: tight-trail (1.5-ATR) variant on the same entries. */
-    tight: { freshValid: number; netAvgR: number | null; pf: number | null; wr: number | null; avgMaxFavorableR: number | null; tp1HitRate: number | null };
-    /** Focused long profit-generator candidate: tight-trail × large-cap × bullish regime. */
-    tightLargeCap: { freshValid: number; netAvgR: number | null; pf: number | null; wr: number | null; avgMaxFavorableR: number | null; tp1HitRate: number | null };
-  } | null;
   alerts: NeuralMapAlert[];
 }
 
@@ -320,11 +276,6 @@ export interface NeuralMapTelemetryInput {
   paper: PaperPerformanceReport;
   orders: PaperOrder[];
   variantMatrix: CurrentGuardVariantMatrixReport;
-  /** Pre-built fade-long report (from buildFadeLongReport over the fade-long store). Optional —
-   *  when omitted the telemetry's fadeLong field is null. */
-  fadeLong?: FadeLongReport | null;
-  /** Pre-built H6 trend report (from buildH6TrendReport). Optional — null when omitted. */
-  h6Trend?: H6TrendReport | null;
   mixed: MixedRegimeReport;
   mixedValidation: MixedBudgetForwardValidationReport;
   staleAudit: OpenOrderStaleAudit;
@@ -860,7 +811,6 @@ function paperBookStatus(economics: ReturnType<typeof laneEconomics>): {
 }
 
 function laneLabel(id: string): string {
-  if (id === H6_TREND_PAPER_LANE_ID) return "H6 TREND LONG";
   if (id === "CG_VARIANT_MATRIX:CG_WIDE_STOP_TP_WIDE") return "CG_WIDE STOP/TP";
   if (id === "CG_LONG_VARIANT_MATRIX:CG_WIDE_STOP_TP_WIDE") return "CG_WIDE LONG";
   if (id === "CG_LONG_VARIANT_MATRIX:CG_WIDE_LONG_RUNNER") return "CG_WIDE RUNNER 3R";
@@ -915,91 +865,6 @@ function performanceHealthFromLane(totalPnl: number, closed: number, open: numbe
   return closed > 0 || open > 0 ? "COLLECTING" : "IDLE";
 }
 
-function buildH6TrendLane(report: H6TrendReport, startingEquity: number): NeuralMapLane {
-  const closed = report.freshValid;
-  const status = report.status;
-  const netAvgR = report.netAvgR;
-  const evidenceHealth = healthFromLane(status, closed, netAvgR);
-  const health: NeuralHealth =
-    report.open > 0 ? "ACTIVE" :
-    closed === 0 ? "IDLE" :
-    evidenceHealth === "CRITICAL" ? "WARNING" :
-    evidenceHealth;
-  const blockers = [
-    closed < report.watchableThreshold ? `fresh-valid ${closed}/${report.watchableThreshold}` : null,
-    finite(netAvgR) && netAvgR <= 0 ? `netAvgR ${fmtR(netAvgR)} <= 0` : null,
-    finite(report.pf) && report.pf <= 1.2 ? `PF ${report.pf.toFixed(2)} <= 1.20` : null,
-    report.open === 0 ? "no current H6 full-context gate pass" : null,
-    "paper adapter waits for a fresh canonical H6 std signal",
-  ].filter((item): item is string => Boolean(item));
-  const cautions = [
-    `exit ${report.exitPolicy.version}: TP1 ${Math.round(report.exitPolicy.tp1ExitPct * 100)}% at +${report.exitPolicy.tp1R.toFixed(1)}R, BE stop, ATR runner`,
-    report.avgMaxFavorableR !== null ? `avg MFE ${fmtR(report.avgMaxFavorableR)}` : null,
-    report.tp1HitRate !== null ? `TP1 hit ${(report.tp1HitRate * 100).toFixed(1)}%` : null,
-    report.tight.freshValid > 0 ? `tight A/B ${fmtR(report.tight.netAvgR)} net, n=${report.tight.freshValid}` : null,
-    report.tightLargeCap.freshValid > 0 ? `large-cap bull cohort ${fmtR(report.tightLargeCap.netAvgR)} net, n=${report.tightLargeCap.freshValid}` : null,
-  ].filter((item): item is string => Boolean(item));
-
-  return {
-    id: H6_TREND_PAPER_LANE_ID,
-    label: laneLabel(H6_TREND_PAPER_LANE_ID),
-    health,
-    evidenceHealth,
-    active: report.open > 0,
-    open: report.open,
-    closed,
-    oosFreshValid: closed,
-    oosThreshold: report.watchableThreshold,
-    netAvgR,
-    pf: report.pf,
-    wr: report.wr,
-    statsSource: "H6_RESEARCH",
-    cohorts: {
-      LONG: { n: closed, netAvgR, pf: report.pf, wr: report.wr, payoffRatio: null },
-      SHORT: null,
-      MIXED: null,
-    },
-    payoffRatio: null,
-    plus10bpsStillPositive: null,
-    allThreeOosPositive: null,
-    oosThirds: null,
-    approxMaxDrawdownR: null,
-    topSymbolPnlShare: null,
-    calendarDays: null,
-    distinctRegimes: null,
-    infraReady: null,
-    blockers,
-    cautions,
-    headlinePnl: 0,
-    diagnosticPnl: 0,
-    totalPnl: 0,
-    openUnrealizedPnl: null,
-    openUnrealizedR: null,
-    diagnosticUnrealizedPnl: null,
-    diagnosticUnrealizedR: null,
-    headlineUnrealizedPnl: null,
-    headlineUnrealizedR: null,
-    openMaxFavorablePnl: null,
-    openMaxFavorableR: null,
-    openAvgDistanceToTpPct: null,
-    openNearestDistanceToTpPct: null,
-    openAvgEntryPrice: null,
-    openAvgMarkPrice: null,
-    openAvgTakeProfitPrice: null,
-    openAvgMfePct: null,
-    openP75MfePct: null,
-    openP90MfePct: null,
-    openAvgConfiguredTpPct: null,
-    openTpAssessment: null,
-    openMarkedSymbolCount: 0,
-    pnlIsDiagnosticOnly: false,
-    startingEquity,
-    totalPnlPct: null,
-    headlinePnlPct: null,
-    status,
-    reason: `H6 trend-continuation LONG research fallback [stats: H6 research]; ${report.open} open / ${closed} closed. Paper performance appears here after the paper adapter admits a fresh H6 signal.`,
-  };
-}
 
 function pnlPct(pnl: number, startingEquity: number): number | null {
   if (!(Number.isFinite(startingEquity) && startingEquity > 0)) return null;
@@ -1424,13 +1289,9 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
       reason: `${baseReason} ${sourceTag}${diagTag}`,
     };
   });
-  const h6Lane = input.h6Trend && !laneIds.includes(H6_TREND_PAPER_LANE_ID)
-    ? buildH6TrendLane(input.h6Trend, input.paper.startingEquity)
-    : null;
-  const lanes = [
-    ...paperAndVmLanes,
-    ...(h6Lane ? [h6Lane] : []),
-  ].sort((a, b) => Number(b.active) - Number(a.active) || b.closed - a.closed);
+  const lanes = [...paperAndVmLanes].sort(
+    (a, b) => Number(b.active) - Number(a.active) || b.closed - a.closed,
+  );
 
   const inputHealth: NeuralHealth = scanFailed || hangMarkers.length > 0 ? "CRITICAL" : timeoutSymbols > 0 ? "WARNING" : "HEALTHY";
   const externalHealth: NeuralHealth = degradedProviders.length > 0 || providerFailures > 0 ? "WARNING" : "HEALTHY";
@@ -1782,41 +1643,6 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
     },
     nodes,
     lanes,
-    fadeLong: input.fadeLong
-      ? {
-          freshValid: input.fadeLong.freshValid,
-          open: input.fadeLong.open,
-          expired: input.fadeLong.expired,
-          oosThreshold: input.fadeLong.watchableThreshold,
-          status: input.fadeLong.status,
-          netAvgR: input.fadeLong.netAvgR,
-          grossAvgR: input.fadeLong.grossAvgR,
-          pf: input.fadeLong.pf,
-          wr: input.fadeLong.wr,
-          totalNetR: input.fadeLong.totalNetR,
-          antiCrash: input.fadeLong.antiCrash,
-        }
-      : null,
-    h6Trend: input.h6Trend
-      ? {
-          freshValid: input.h6Trend.freshValid,
-          open: input.h6Trend.open,
-          expired: input.h6Trend.expired,
-          oosThreshold: input.h6Trend.watchableThreshold,
-          status: input.h6Trend.status,
-          netAvgR: input.h6Trend.netAvgR,
-          grossAvgR: input.h6Trend.grossAvgR,
-          pf: input.h6Trend.pf,
-          wr: input.h6Trend.wr,
-          avgMaxFavorableR: input.h6Trend.avgMaxFavorableR,
-          tp1HitRate: input.h6Trend.tp1HitRate,
-          totalNetR: input.h6Trend.totalNetR,
-          entryPolicy: input.h6Trend.entryPolicy,
-          exitPolicy: input.h6Trend.exitPolicy,
-          tight: input.h6Trend.tight,
-          tightLargeCap: input.h6Trend.tightLargeCap,
-        }
-      : null,
     alerts,
   };
 }

@@ -684,7 +684,7 @@ export default function TestnetExchangeDashboard() {
   // was why the panel could stay blank on /live. Shown identically on both /testnet and /live.
   async function loadRegimeReport() {
     try {
-      const res = await fetch(`${TESTNET_API_PREFIX}/shadow/regime-engine-report`, { cache: 'no-store' });
+      const res = await fetch(`${pageApiPrefix}/shadow/regime-engine-report`, { cache: 'no-store' });
       setRegimeReport(await res.json());
     } catch {
       setRegimeReport(null); // fail-soft: the panel just says unavailable

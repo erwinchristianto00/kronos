@@ -1,26 +1,22 @@
 /**
- * AG. EXCHANGE HEALTH READINESS — REPORT-ONLY SPEC (PARTIAL DATA AVAILABILITY)
+ * EXCHANGE HEALTH READINESS — REPORT-ONLY SPEC
  *
  * Describes the FUTURE exchange-health monitoring that would have to exist
- * BEFORE any micro-pilot could be discussed. Some checks can already report
- * data AVAILABILITY from the AC microstructure collector (book ticker / depth /
- * funding / open interest / spread distribution), but data availability is NOT
- * the same as a live monitoring + alerting loop — so `ready` is ALWAYS false.
+ * BEFORE any micro-pilot could be discussed. `ready` is ALWAYS false unless
+ * `live` inputs are supplied (clock skew, reachability, data freshness) — this
+ * remains a forward-looking spec, not a live monitor.
  *
- * Pure module: zero I/O, no side effects, never throws. Reads only the already
- * built microstructure report.
+ * Pure module: zero I/O, no side effects, never throws.
  */
-
-import type { MicrostructureCollectorReport } from "./microstructure-feature-collector.js";
 
 export const EXCHANGE_HEALTH_READINESS_MODULE = "EXCHANGE_HEALTH_READINESS" as const;
 
-export type ExchangeHealthSource = "AC_MICROSTRUCTURE" | "NOT_AVAILABLE" | "FUTURE";
+export type ExchangeHealthSource = "LIVE_INPUT" | "NOT_AVAILABLE" | "FUTURE";
 
 export interface ExchangeHealthCheck {
   name: string;
   description: string;
-  available: boolean; // some may be true from AC microstructure
+  available: boolean;
   source: ExchangeHealthSource;
   currentValue?: string;
 }
@@ -52,29 +48,11 @@ export interface ExchangeHealthReadinessReport {
   summary: string;
 }
 
-function pct(v: number | null | undefined): string {
-  if (typeof v !== "number" || !Number.isFinite(v)) return "n/a";
-  return `${(v * 100).toFixed(1)}%`;
-}
-
 export function buildExchangeHealthReadinessReport(
-  microstructure: MicrostructureCollectorReport | undefined,
   capturedAt?: string,
   live?: ExchangeHealthLiveInputs,
 ): ExchangeHealthReadinessReport {
   const computedAt = capturedAt ?? new Date().toISOString();
-
-  const ms = microstructure;
-  const bookTickerAvail = ms?.bookTickerQtyAvailability ?? 0;
-  const depthAvail = ms?.depthAvailability ?? 0;
-  const fundingAvail = ms?.fundingRateAvailability ?? 0;
-  const oiAvail = ms?.openInterestAvailability ?? 0;
-  const spread = ms?.latestSpreadDistribution;
-  const spreadPresent =
-    !!spread &&
-    [spread.p50, spread.p90, spread.p99].some(
-      (v) => typeof v === "number" && Number.isFinite(v),
-    );
 
   const checks: ExchangeHealthCheck[] = [
     {
@@ -92,30 +70,26 @@ export function buildExchangeHealthReadinessReport(
     {
       name: "bookticker_freshness",
       description: "Best bid/ask freshness from the book ticker feed.",
-      available: bookTickerAvail > 0,
-      source: bookTickerAvail > 0 ? "AC_MICROSTRUCTURE" : "NOT_AVAILABLE",
-      currentValue: `bookTickerQtyAvailability=${pct(bookTickerAvail)}`,
+      available: false,
+      source: "NOT_AVAILABLE",
     },
     {
       name: "depth_freshness",
       description: "Top-of-book depth freshness from the depth feed.",
-      available: depthAvail > 0,
-      source: depthAvail > 0 ? "AC_MICROSTRUCTURE" : "NOT_AVAILABLE",
-      currentValue: `depthAvailability=${pct(depthAvail)}`,
+      available: false,
+      source: "NOT_AVAILABLE",
     },
     {
       name: "funding_freshness",
       description: "Funding-rate freshness from the premium-index feed.",
-      available: fundingAvail > 0,
-      source: fundingAvail > 0 ? "AC_MICROSTRUCTURE" : "NOT_AVAILABLE",
-      currentValue: `fundingRateAvailability=${pct(fundingAvail)}`,
+      available: false,
+      source: "NOT_AVAILABLE",
     },
     {
       name: "openinterest_freshness",
       description: "Open-interest freshness.",
-      available: oiAvail > 0,
-      source: oiAvail > 0 ? "AC_MICROSTRUCTURE" : "NOT_AVAILABLE",
-      currentValue: `openInterestAvailability=${pct(oiAvail)}`,
+      available: false,
+      source: "NOT_AVAILABLE",
     },
     {
       name: "error_rate",
@@ -139,11 +113,8 @@ export function buildExchangeHealthReadinessReport(
       name: "abnormal_spread_detection",
       description:
         "Reference threshold for abnormal spread (e.g. p99 from the observed distribution).",
-      available: spreadPresent,
-      source: spreadPresent ? "AC_MICROSTRUCTURE" : "NOT_AVAILABLE",
-      currentValue: spreadPresent
-        ? `spread p99 reference=${typeof spread?.p99 === "number" ? spread!.p99.toFixed(1) + "bps" : "n/a"}`
-        : "spread distribution unavailable",
+      available: false,
+      source: "NOT_AVAILABLE",
     },
     {
       name: "symbol_trading_status",
@@ -162,7 +133,7 @@ export function buildExchangeHealthReadinessReport(
   // ── v1 live CRITICAL checks (computed each brief = the ≈7-min monitoring cadence) ──────────────
   const marketDataFresh =
     !!live && live.marketDataAgeMs != null && live.marketDataAgeMs >= 0 && live.marketDataAgeMs <= EXCHANGE_HEALTH_MAX_DATA_AGE_MS;
-  const feedsPresent = bookTickerAvail > 0 && depthAvail > 0;
+  const feedsPresent = false; // book-ticker/depth feed collection is not implemented (spec-only)
   const reachable = !!live && live.reachable;
   // clock skew is advisory: only blocks when it has been MEASURED and is out of tolerance.
   const clockMeasured = !!live && live.clockSkewMs != null;
@@ -173,14 +144,14 @@ export function buildExchangeHealthReadinessReport(
         name: "exchange_reachable",
         description: "Exchange responded with fresh market data this cycle.",
         available: reachable,
-        source: "AC_MICROSTRUCTURE",
+        source: "LIVE_INPUT",
         currentValue: reachable ? "reachable" : "no recent data",
       },
       {
         name: "market_data_freshness",
         description: "Age of the latest scan/candle close vs the staleness ceiling.",
         available: marketDataFresh,
-        source: "AC_MICROSTRUCTURE",
+        source: "LIVE_INPUT",
         currentValue:
           live.marketDataAgeMs != null ? `${Math.round(live.marketDataAgeMs / 1000)}s old` : "unknown",
       },
@@ -188,7 +159,7 @@ export function buildExchangeHealthReadinessReport(
         name: "clock_sync",
         description: "Signed-client clock skew vs server time (advisory until measured).",
         available: clockOk,
-        source: clockMeasured ? "AC_MICROSTRUCTURE" : "NOT_AVAILABLE",
+        source: clockMeasured ? "LIVE_INPUT" : "NOT_AVAILABLE",
         currentValue: clockMeasured ? `${Math.round(live.clockSkewMs as number)}ms skew` : "not measured",
       },
     );
@@ -205,7 +176,7 @@ export function buildExchangeHealthReadinessReport(
   else {
     if (!reachable) readyReasons.push("exchange not reachable / no recent data");
     if (!marketDataFresh) readyReasons.push("market data stale or unknown");
-    if (!feedsPresent) readyReasons.push("microstructure book/depth feeds incomplete");
+    if (!feedsPresent) readyReasons.push("book/depth feeds not implemented");
     if (clockMeasured && !clockOk) readyReasons.push(`clock skew ${Math.round(live.clockSkewMs as number)}ms over tolerance`);
   }
   const ready = readyReasons.length === 0 && !!live;
