@@ -100,5 +100,18 @@ describe("buildHistoricalValidationReport", () => {
     expect(report.strategyRejection.byScenario.pessimistic.reasons).toBeDefined();
     expect(typeof report.strategyRejection.pessimisticProfitFactorAbove1_2).toBe("boolean");
     expect(typeof report.walkForward.singlePeriodDependence).toBe("boolean");
+
+    // A relentless downtrend never enters NEUTRAL_RECOVERY/TREND_RECOVERY, so the
+    // LONG-only lanes should never fire here — their profit factor must read as
+    // "not measurable" (null), not a fabricated 0 indistinguishable from "traded
+    // and lost every time".
+    const neverTradedLongLane = report.laneOpportunityDiagnostics.RELATIVE_STRENGTH_LONG;
+    expect(neverTradedLongLane?.entryCount).toBe(0);
+    expect(neverTradedLongLane?.grossProfitFactor).toBeNull();
+    expect(neverTradedLongLane?.netProfitFactor).toBeNull();
+    const neverEnteredRegime = report.regimeDenominatorDiagnostics.TREND_RECOVERY;
+    if ((neverEnteredRegime?.tradeCount ?? 0) === 0) {
+      expect(neverEnteredRegime?.profitFactor).toBeNull();
+    }
   });
 });

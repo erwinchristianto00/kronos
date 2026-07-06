@@ -115,6 +115,41 @@ describe("contextFromCandles", () => {
     );
   });
 
+  it("is not corrupted by an out-of-order candle appended after the true latest bar", () => {
+    const btc = bearishBtc(asOf);
+    const baseCtx = contextFromCandles({
+      asOf,
+      btc,
+      microstructure: microstructure(),
+      governance: governance(),
+    });
+
+    // A stale/duplicate candle from an earlier point in time (e.g. a delayed API
+    // retry re-insert), appended AFTER the chronologically-latest bar rather than
+    // in its correct position. Its own close time is still <= asOf, so it isn't
+    // dropped by the future-candle filter — only ordering can save us here.
+    const outOfOrderStale = {
+      openTime: btc.h1[5]!.openTime,
+      open: 65_000,
+      high: 65_100,
+      low: 64_900,
+      close: 65_000, // well ABOVE 60k, unlike the true latest (bearish) close
+      volume: 1_000,
+    };
+    const withOutOfOrder = contextFromCandles({
+      asOf,
+      btc: { ...btc, h1: [...btc.h1, outOfOrderStale] },
+      microstructure: microstructure(),
+      governance: governance(),
+    });
+
+    // If `closedCandles` trusted array position instead of chronological order,
+    // `lastClose` would read the misplaced 65k candle and flip these flags.
+    expect(withOutOfOrder.btcBelow60000).toBe(baseCtx.btcBelow60000);
+    expect(withOutOfOrder.btcBelow60000).toBe(true);
+    expect(withOutOfOrder.rsi1h).toBe(baseCtx.rsi1h);
+  });
+
   it("leaves un-derivable flags undefined (fail-safe) when inputs are absent", () => {
     const ctx = contextFromCandles({
       asOf,

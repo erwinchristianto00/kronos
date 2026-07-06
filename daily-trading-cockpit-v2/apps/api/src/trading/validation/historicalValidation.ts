@@ -189,8 +189,8 @@ export interface LaneOpportunityDiagnostics {
   entryCount: number;
   winCount: number;
   lossCount: number;
-  grossProfitFactor: number;
-  netProfitFactor: number;
+  grossProfitFactor: number | null;
+  netProfitFactor: number | null;
   averageNetPnl: number;
   averageHoldingMinutes: number;
 }
@@ -211,7 +211,7 @@ export interface RegimeDenominatorDiagnostics {
   dayCount: number;
   tradeCount: number;
   tradesPerDayInRegime: number;
-  profitFactor: number;
+  profitFactor: number | null;
   winRate: number;
   averagePnl: number;
 }
@@ -394,7 +394,9 @@ function daysBetween(startMs: number, endMs: number): number {
   return Math.max(0, (endMs - startMs) / 86_400_000);
 }
 
-function profitFactor(wins: number, losses: number): number {
+/** `null` (not a fabricated 0) when there were no trades to measure at all. */
+function profitFactor(wins: number, losses: number, tradeCount: number): number | null {
+  if (tradeCount === 0) return null;
   const grossLoss = Math.abs(losses);
   if (grossLoss > 0) return wins / grossLoss;
   return wins > 0 ? Infinity : 0;
@@ -638,8 +640,8 @@ function emptyLaneDiagnostics(): Record<string, LaneOpportunityDiagnostics> {
         entryCount: 0,
         winCount: 0,
         lossCount: 0,
-        grossProfitFactor: 0,
-        netProfitFactor: 0,
+        grossProfitFactor: null,
+        netProfitFactor: null,
         averageNetPnl: 0,
         averageHoldingMinutes: 0,
       },
@@ -664,8 +666,8 @@ function finalizeLaneDiagnostics(
     d.entryCount = trades.length;
     d.winCount = trades.filter((trade) => trade.netPnl > 0).length;
     d.lossCount = trades.filter((trade) => trade.netPnl <= 0).length;
-    d.grossProfitFactor = profitFactor(grossWins, grossLosses);
-    d.netProfitFactor = profitFactor(netWins, netLosses);
+    d.grossProfitFactor = profitFactor(grossWins, grossLosses, trades.length);
+    d.netProfitFactor = profitFactor(netWins, netLosses, trades.length);
     d.averageNetPnl = trades.length ? trades.reduce((sum, trade) => sum + trade.netPnl, 0) / trades.length : 0;
     d.averageHoldingMinutes = trades.length ? trades.reduce((sum, trade) => sum + trade.holdMinutes, 0) / trades.length : 0;
     d.mostCommonBlockingCondition = sortedBlocks[0]?.[0] ?? null;
@@ -735,7 +737,7 @@ function buildRegimeDenominators(
       dayCount,
       tradeCount: trades.length,
       tradesPerDayInRegime: dayCount > 0 ? trades.length / dayCount : 0,
-      profitFactor: profitFactor(grossWin, grossLoss),
+      profitFactor: profitFactor(grossWin, grossLoss, trades.length),
       winRate: trades.length ? wins.length / trades.length : 0,
       averagePnl: trades.length ? trades.reduce((sum, trade) => sum + trade.netPnl, 0) / trades.length : 0,
     };
@@ -1013,10 +1015,16 @@ export function buildHistoricalValidationReport(input: HistoricalValidationInput
     mergeFeatureSources(featureSourcesSummary, decision.trace);
 
     const atrValue = atr(btc.h1, 14);
+    // The immediately-following real candle's open — the earliest a decision made
+    // from THIS bar's own just-closed data could actually fill. Not `i + decisionEveryBars`:
+    // the market still moves bar-by-bar even when decisions are only evaluated every
+    // N bars, so a fresh entry always fills on the very next candle, never further out.
+    const nextOpen = candles.h1[i + 1]?.open ?? null;
     bars.push({
       timestamp: asOf,
       ctx,
       price: bar.close,
+      nextOpen,
       high: bar.high,
       low: bar.low,
       atr: atrValue,

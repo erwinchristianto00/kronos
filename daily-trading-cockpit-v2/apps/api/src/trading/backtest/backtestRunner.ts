@@ -28,7 +28,12 @@ import { getStrategyMode } from "../config/strategyModes.js";
 export interface BacktestBar {
   timestamp: number; // epoch ms
   ctx: MarketContext; // decision context at this bar (governance fields are overwritten by the sim)
-  price: number; // reference/close price for entries and mark-to-market
+  price: number; // this bar's own close — mark-to-market / managing an ALREADY-open position only
+  // Opening price of the immediately-following bar, or null if there is none (the
+  // last bar in the dataset). A decision computed from `ctx` (this bar's own fully-
+  // closed data) is only actionable starting here — the earliest a live system could
+  // have reacted — so NEW entries fill at `nextOpen`, never at this bar's own `price`.
+  nextOpen: number | null;
   high: number;
   low: number;
   atr: number; // ATR at this bar, in price units (drives ATR-multiple exits)
@@ -127,6 +132,7 @@ export interface BacktestRunDiagnostics {
   skippedBecauseCooldown: number;
   skippedBecauseMaxTrades: number;
   skippedBecauseExecutionGuard: number;
+  skippedBecauseNoNextBar: number;
   positionManagementDecisionCount: number;
   noTradeDecisionCount: number;
 }
@@ -261,6 +267,7 @@ export function runBacktest(config: BacktestConfig): BacktestMetrics {
     skippedBecauseCooldown: 0,
     skippedBecauseMaxTrades: 0,
     skippedBecauseExecutionGuard: 0,
+    skippedBecauseNoNextBar: 0,
     positionManagementDecisionCount: 0,
     noTradeDecisionCount: 0,
   };
@@ -441,13 +448,24 @@ export function runBacktest(config: BacktestConfig): BacktestMetrics {
     recordDecisionDiagnostic(decision);
     if (decision.action === "NO_TRADE") continue;
 
+    // A decision computed from this bar's own closed data is only actionable
+    // starting at the NEXT bar — filling on this bar's own close would assume
+    // zero-latency, omniscient execution at the exact instant the signal became
+    // knowable. Without a next bar (end of the dataset), there is nothing to fill
+    // on, exactly like real trading can't act on a signal with no future price.
+    if (bar.nextOpen === null) {
+      diagnostics.enterSignalCount += 1;
+      diagnostics.skippedBecauseNoNextBar += 1;
+      continue;
+    }
+
     // Open the trade: adjust the entry against us by the entry-side slippage.
     const entrySlipBps = slippageBpsModel(bar);
     const entrySpreadBps = spreadBpsModel(bar);
     const isLong = decision.action === "ENTER_LONG";
     const fillRatio = clamp01(fillRatioModel(bar, decision));
     if (fillRatio <= 0) continue; // missed maker fill / no executable size.
-    const entryPrice = bar.price * (1 + (isLong ? 1 : -1) * bpsToFrac(entrySlipBps));
+    const entryPrice = bar.nextOpen * (1 + (isLong ? 1 : -1) * bpsToFrac(entrySlipBps));
     const slDistance = decision.exit.stopLossATR * bar.atr;
     if (!(slDistance > 0)) continue; // degenerate ATR — skip.
 

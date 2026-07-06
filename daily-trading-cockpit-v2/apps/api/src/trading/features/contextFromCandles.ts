@@ -158,7 +158,16 @@ const lastClose = (c: Candle[]): number => (c.length ? c[c.length - 1]!.close : 
 const candleCloseTime = (c: Candle, tf: Timeframe): number => c.openTime + TF_MS[tf];
 
 function closedCandles(c: Candle[] | undefined, tf: Timeframe, asOf: number): Candle[] {
-  return (c ?? []).filter((x) => candleCloseTime(x, tf) <= asOf);
+  // Sort + dedup by openTime before filtering: the "lookahead rule" below only
+  // holds if `tail(n)` returns the chronologically-latest N candles. A caller
+  // that hands us an out-of-order or duplicate-timestamp array (e.g. a delayed
+  // retry re-insert from a live feed) would otherwise silently shift every
+  // derived feature by a bar with no error.
+  const byTime = new Map<number, Candle>();
+  for (const x of c ?? []) byTime.set(x.openTime, x);
+  return [...byTime.values()]
+    .sort((a, b) => a.openTime - b.openTime)
+    .filter((x) => candleCloseTime(x, tf) <= asOf);
 }
 
 function finitePositive(n: number | undefined): n is number {
@@ -306,9 +315,7 @@ export function contextFromCandles(input: FeatureAdapterInput): MarketContext {
   // Break of major support: derived from ONE threshold so it can't co-exist with
   // btcNotBreakingMajorSupport (contradiction-safe).
   const belowMajor = Number.isFinite(priceH1) && priceH1 < cfg.btcMajorSupport;
-  const brokeRecently =
-    h1.length >= 3 && tail(h1, 3).some((c) => c.close >= cfg.btcMajorSupport); // just crossed under
-  const btcBreaksBelow55000 = belowMajor && brokeRecently ? true : belowMajor ? true : undefined;
+  const btcBreaksBelow55000 = belowMajor ? true : undefined;
   const btcNotBreakingMajorSupport = Number.isFinite(priceH1) ? priceH1 >= cfg.btcMajorSupport : undefined;
   const btcClose4hAbove62000 = Number.isFinite(closeH4) ? closeH4 > cfg.btcBelowLevelB : undefined;
   const btcCloseDailyAbove65000 = Number.isFinite(closeD1) ? closeD1 > cfg.btcDailyTrendLevel : undefined;

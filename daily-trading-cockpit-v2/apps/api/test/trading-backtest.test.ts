@@ -87,6 +87,11 @@ function shortPair(t0: number, resolve: "TP" | "SL"): BacktestBar[] {
     timestamp: t0,
     ctx: fadeCtx(),
     price: 100,
+    // A signal computed from this bar's own close fills on the NEXT bar's open —
+    // kept numerically equal to `price` here so the SL/TP-distance math below
+    // (documented relative to "entry") is unaffected; the dedicated look-ahead
+    // test below is what actually exercises nextOpen != price.
+    nextOpen: 100,
     high: 100.5,
     low: 99.5,
     atr: 1,
@@ -96,8 +101,8 @@ function shortPair(t0: number, resolve: "TP" | "SL"): BacktestBar[] {
   // the favorable low — is not itself tripped intrabar by a wick back up.
   const exit: BacktestBar =
     resolve === "TP"
-      ? { timestamp: t0 + MIN, ctx: flatCtx(), price: 99.3, high: 99.9, low: 99.2, atr: 1 }
-      : { timestamp: t0 + MIN, ctx: flatCtx(), price: 101, high: 101.2, low: 100.5, atr: 1 };
+      ? { timestamp: t0 + MIN, ctx: flatCtx(), price: 99.3, nextOpen: null, high: 99.9, low: 99.2, atr: 1 }
+      : { timestamp: t0 + MIN, ctx: flatCtx(), price: 101, nextOpen: null, high: 101.2, low: 100.5, atr: 1 };
   return [entry, exit];
 }
 
@@ -106,14 +111,15 @@ function longPair(t0: number, resolve: "TP" | "SL"): BacktestBar[] {
     timestamp: t0,
     ctx: microLongCtx(),
     price: 100,
+    nextOpen: 100,
     high: 100.1,
     low: 99.8,
     atr: 1,
   };
   const exit: BacktestBar =
     resolve === "TP"
-      ? { timestamp: t0 + MIN, ctx: flatCtx(), price: 100.5, high: 100.8, low: 100.1, atr: 1 }
-      : { timestamp: t0 + MIN, ctx: flatCtx(), price: 99.3, high: 99.8, low: 99.2, atr: 1 };
+      ? { timestamp: t0 + MIN, ctx: flatCtx(), price: 100.5, nextOpen: null, high: 100.8, low: 100.1, atr: 1 }
+      : { timestamp: t0 + MIN, ctx: flatCtx(), price: 99.3, nextOpen: null, high: 99.8, low: 99.2, atr: 1 };
   return [entry, exit];
 }
 
@@ -122,6 +128,7 @@ function breakdownBreakevenStopPair(t0: number): BacktestBar[] {
     timestamp: t0,
     ctx: breakdownCtx(),
     price: 100,
+    nextOpen: 100,
     high: 100.1,
     low: 99.9,
     atr: 1,
@@ -129,7 +136,7 @@ function breakdownBreakevenStopPair(t0: number): BacktestBar[] {
   return [
     entry,
     // Favorable low arms the 0.4 ATR breakeven ratchet; wick back to entry hits SL at breakeven.
-    { timestamp: t0 + MIN, ctx: flatCtx(), price: 100, high: 100.1, low: 99.3, atr: 1 },
+    { timestamp: t0 + MIN, ctx: flatCtx(), price: 100, nextOpen: null, high: 100.1, low: 99.3, atr: 1 },
   ];
 }
 
@@ -162,6 +169,7 @@ function longBreakevenStopPair(t0: number, lowAfterArm: number): BacktestBar[] {
       timestamp: t0,
       ctx: recoveryLongCtx(),
       price: 100,
+      nextOpen: 100,
       high: 100.1,
       low: 99.9,
       atr: 1,
@@ -170,6 +178,7 @@ function longBreakevenStopPair(t0: number, lowAfterArm: number): BacktestBar[] {
       timestamp: t0 + MIN,
       ctx: flatCtx(),
       price: 100.15,
+      nextOpen: null,
       high: 100.5,
       low: lowAfterArm,
       atr: 1,
@@ -227,6 +236,35 @@ describe("runBacktest", () => {
     expect(m.trades[0]!.action).toBe("ENTER_SHORT");
     expect(m.trades[0]!.exitReason).toBe("SL");
     expect(m.trades[0]!.grossPnl).toBeLessThan(0);
+  });
+
+  it("fills a new entry at the NEXT bar's open, never at the signal bar's own close (look-ahead bias)", () => {
+    // The signal bar closes at 100 (this is what fadeCtx's pattern conditions
+    // "know" as of this bar's close) but gaps down hard to 90 by the time the
+    // very next real bar opens — the earliest a live system could actually act
+    // on a decision computed from this bar's own just-closed data.
+    const bars: BacktestBar[] = [
+      { timestamp: 0, ctx: fadeCtx(), price: 100, nextOpen: 90, high: 100.2, low: 99.8, atr: 1 },
+      // Tight range around 90 so the position rides to the forced end-of-data
+      // close regardless of which entry price (buggy ~100 or correct ~90) was
+      // used — this test is only about what `entryPrice` gets recorded.
+      { timestamp: MIN, ctx: flatCtx(), price: 90, nextOpen: null, high: 90.05, low: 89.95, atr: 1 },
+    ];
+    const m = runBacktest({ bars, startingEquity: 10_000 });
+    expect(m.numTrades).toBe(1);
+    const t = m.trades[0]!;
+    expect(t.action).toBe("ENTER_SHORT");
+    // Entry must track nextOpen (~90), not this bar's own close (100).
+    expect(t.entryPrice).toBeCloseTo(90, 0);
+    expect(t.entryPrice).toBeLessThan(95);
+  });
+
+  it("skips a signal on the very last bar of the dataset — no next bar exists to fill on", () => {
+    const bars: BacktestBar[] = [
+      { timestamp: 0, ctx: fadeCtx(), price: 100, nextOpen: null, high: 100.2, low: 99.8, atr: 1 },
+    ];
+    const m = runBacktest({ bars, startingEquity: 10_000 });
+    expect(m.numTrades).toBe(0);
   });
 
   it("long raw breakeven can produce net negative after costs", () => {
@@ -302,8 +340,8 @@ describe("runBacktest", () => {
 
   it("counts no-trade days and opens nothing on flat context", () => {
     const bars: BacktestBar[] = [
-      { timestamp: 0, ctx: flatCtx(), price: 100, high: 100.2, low: 99.8, atr: 1 },
-      { timestamp: MIN, ctx: flatCtx(), price: 100, high: 100.2, low: 99.8, atr: 1 },
+      { timestamp: 0, ctx: flatCtx(), price: 100, nextOpen: 100, high: 100.2, low: 99.8, atr: 1 },
+      { timestamp: MIN, ctx: flatCtx(), price: 100, nextOpen: null, high: 100.2, low: 99.8, atr: 1 },
     ];
     const m = runBacktest({ bars, startingEquity: 10_000 });
     expect(m.numTrades).toBe(0);
@@ -314,7 +352,7 @@ describe("runBacktest", () => {
     // loss pair on day, then an immediate fade setup one minute later — inside the
     // 180-min two-loss / 45-min single-loss cooldown, so no second trade opens.
     const loss = shortPair(0, "SL");
-    const immediate: BacktestBar = { timestamp: 2 * MIN, ctx: fadeCtx(), price: 100, high: 100.5, low: 99.5, atr: 1 };
+    const immediate: BacktestBar = { timestamp: 2 * MIN, ctx: fadeCtx(), price: 100, nextOpen: 100, high: 100.5, low: 99.5, atr: 1 };
     const m = runBacktest({ bars: [...loss, immediate], startingEquity: 10_000, respectCooldowns: true });
     expect(m.numTrades).toBe(1); // only the first (losing) trade
   });
@@ -354,7 +392,7 @@ describe("rejectStrategy", () => {
 
   it("rejects a strategy that never traded (unproven)", () => {
     const m = runBacktest({
-      bars: [{ timestamp: 0, ctx: flatCtx(), price: 100, high: 100.1, low: 99.9, atr: 1 }],
+      bars: [{ timestamp: 0, ctx: flatCtx(), price: 100, nextOpen: null, high: 100.1, low: 99.9, atr: 1 }],
       startingEquity: 10_000,
     });
     const r = rejectStrategy(m);

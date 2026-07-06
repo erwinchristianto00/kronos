@@ -233,6 +233,26 @@ describe("required execution/microstructure data", () => {
     expect(d.trace?.rejectedBy).toBe("MISSING_EXECUTION_DATA");
     expect(d.trace?.noTradeReason).toContain("MISSING_FUNDING_RISK_ABNORMAL");
   });
+
+  it("detects missing regimeConfidence, dailyLossPct, and consecutiveLosses (required governance fields)", () => {
+    const missing = base({
+      regimeConfidence: undefined as unknown as number,
+      dailyLossPct: NaN,
+      consecutiveLosses: undefined as unknown as number,
+    });
+    expect(missingExecutionDataReasons(missing)).toEqual([
+      "MISSING_REGIME_CONFIDENCE",
+      "MISSING_DAILY_LOSS_PCT",
+      "MISSING_CONSECUTIVE_LOSSES",
+    ]);
+  });
+
+  it("buildTradingDecision stands aside instead of entering when regimeConfidence is missing — a `<`/`>=` comparison against undefined silently evaluates false, so without this gate the no-trade/risk guards never fire", () => {
+    const d = buildTradingDecision(fadeSetup({ regimeConfidence: undefined as unknown as number }));
+    expect(d.action).toBe("NO_TRADE");
+    expect(d.trace?.rejectedBy).toBe("MISSING_EXECUTION_DATA");
+    expect(d.trace?.noTradeReason).toContain("MISSING_REGIME_CONFIDENCE");
+  });
 });
 
 // ── 6. Contradiction detection ───────────────────────────────────────────────

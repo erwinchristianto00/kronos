@@ -58,6 +58,14 @@ export function missingExecutionDataReasons(ctx: MarketContext): string[] {
   if (!Number.isFinite(ctx.slippageBps)) reasons.push("MISSING_SLIPPAGE_BPS");
   if (ctx.liquidityGood === undefined) reasons.push("MISSING_LIQUIDITY_GOOD");
   if (ctx.fundingRiskAbnormal === undefined) reasons.push("MISSING_FUNDING_RISK_ABNORMAL");
+  // These three are declared required (non-optional) in MarketContext, but nothing
+  // stops JSON parsing / a test cast from handing us undefined or NaN anyway — and
+  // every downstream guard reads them via `<`/`>=` comparisons, which silently
+  // evaluate to `false` for undefined/NaN (fail OPEN, not closed). Catch that here,
+  // at the earliest gate, instead of relying on each guard to defend itself.
+  if (!Number.isFinite(ctx.regimeConfidence)) reasons.push("MISSING_REGIME_CONFIDENCE");
+  if (!Number.isFinite(ctx.dailyLossPct)) reasons.push("MISSING_DAILY_LOSS_PCT");
+  if (!Number.isFinite(ctx.consecutiveLosses)) reasons.push("MISSING_CONSECUTIVE_LOSSES");
 
   return reasons;
 }
