@@ -19,7 +19,7 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 
-import type { BinanceFuturesPrivateClient } from "./binance-futures-private.js";
+import { resolveConfirmedFillPrice, type BinanceFuturesPrivateClient, type FillPriceResolution } from "./binance-futures-private.js";
 import {
   CROSS_SECTIONAL_ROUNDTRIP_BPS,
   type CrossSectionalObservation,
@@ -199,41 +199,24 @@ export class CrossSectionalExecutor {
     this.fillConfirmRetryDelayMs = opts.fillConfirmRetryDelayMs ?? 400;
   }
 
-  /**
-   * A MARKET order's synchronous placeOrder response can come back with avgPrice=0 / status
-   * not yet FILLED even when the order fills moments later — observed for real on testnet
-   * (basket xb-mr2x7s6e: all 6 legs got avgPrice=0 in the placeOrder response, yet
-   * queryOrder afterward showed status=FILLED with real, non-zero avgPrice for every one).
-   * Silently trusting avgPrice=0 as "closed flat at the reference price" would fabricate a
-   * fake break-even result over whatever the real fill actually was. Confirm via queryOrder
-   * before ever falling back — and when confirmation genuinely can't be obtained, say so
-   * instead of pretending the fallback price is real.
-   */
+  /** Thin wrapper over the shared resolveConfirmedFillPrice, injecting this executor's
+   *  test-overridable retry delay and a lane-tagged log line. See binance-futures-private.ts
+   *  for why this confirmation step exists (basket xb-mr2x7s6e's real-world avgPrice=0 case). */
   private async resolveFillPrice(
     symbol: string,
     orderId: number,
     initialAvgPrice: number,
     fallbackPrice: number,
-  ): Promise<{ price: number; confirmed: boolean }> {
-    if (initialAvgPrice > 0) return { price: initialAvgPrice, confirmed: true };
-    for (let attempt = 0; attempt < 4; attempt++) {
-      if (this.fillConfirmRetryDelayMs > 0) {
-        await new Promise((r) => setTimeout(r, this.fillConfirmRetryDelayMs));
-      }
-      try {
-        const queried = await this.client.queryOrder(symbol, orderId);
-        if (queried.avgPrice > 0) return { price: queried.avgPrice, confirmed: true };
-        if (queried.status !== "NEW" && queried.status !== "PARTIALLY_FILLED") break; // terminal, non-fillable
-      } catch {
-        // best-effort — fall through to the next attempt / final fallback
-      }
-    }
-    console.error(
-      `[cross-sectional-executor] UNCONFIRMED FILL PRICE: ${symbol} order ${orderId} never returned a ` +
-        `real avgPrice after retries — recording ${fallbackPrice} as a fallback, but this is NOT a ` +
-        `confirmed fill price. PnL involving this leg should be treated as uncertain.`,
-    );
-    return { price: fallbackPrice, confirmed: false };
+  ): Promise<FillPriceResolution> {
+    return resolveConfirmedFillPrice(this.client, symbol, orderId, initialAvgPrice, fallbackPrice, {
+      retryDelayMs: this.fillConfirmRetryDelayMs,
+      onUnconfirmed: (sym, id, fallback) =>
+        console.error(
+          `[cross-sectional-executor] UNCONFIRMED FILL PRICE: ${sym} order ${id} never returned a ` +
+            `real avgPrice after retries — recording ${fallback} as a fallback, but this is NOT a ` +
+            `confirmed fill price. PnL involving this leg should be treated as uncertain.`,
+        ),
+    });
   }
 
   private allocationWeightPct(): number {

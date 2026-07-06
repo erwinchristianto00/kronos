@@ -127,6 +127,62 @@ export interface FuturesOrder {
   updateTime: number;
 }
 
+export interface FillPriceResolution {
+  price: number;
+  confirmed: boolean;
+}
+
+/**
+ * A MARKET order's synchronous placeOrder response can come back with avgPrice=0 / status not
+ * yet FILLED even though the order fills moments later — confirmed for real on testnet (a
+ * cross-sectional executor basket where all 6 legs' placeOrder responses returned avgPrice=0, yet
+ * queryOrder afterward showed status=FILLED with real, non-zero avgPrice for every one). Trusting
+ * avgPrice=0 as "the fallback price is what actually happened" fabricates a fake result — for a
+ * position's entry fill specifically, it can also re-derive stop/TP geometry from a stale
+ * pre-trade reference price instead of the real fill, which is the exact failure mode that once
+ * churned a symbol's stop placement 258× (Binance -2021 "would immediately trigger") because the
+ * stop landed on the wrong side of where the position actually filled.
+ *
+ * Confirms via queryOrder before ever falling back, and when confirmation genuinely can't be
+ * obtained, says so via `confirmed: false` instead of silently pretending the fallback is real.
+ */
+export async function resolveConfirmedFillPrice(
+  client: Pick<BinanceFuturesPrivateClient, "queryOrder">,
+  symbol: string,
+  orderId: number,
+  initialAvgPrice: number,
+  fallbackPrice: number,
+  opts: {
+    retries?: number;
+    retryDelayMs?: number;
+    onUnconfirmed?: (symbol: string, orderId: number, fallbackPrice: number) => void;
+  } = {},
+): Promise<FillPriceResolution> {
+  if (initialAvgPrice > 0) return { price: initialAvgPrice, confirmed: true };
+  const retries = opts.retries ?? 4;
+  const delayMs = opts.retryDelayMs ?? 400;
+  for (let attempt = 0; attempt < retries; attempt++) {
+    if (delayMs > 0) await new Promise((r) => setTimeout(r, delayMs));
+    try {
+      const queried = await client.queryOrder(symbol, orderId);
+      if (queried.avgPrice > 0) return { price: queried.avgPrice, confirmed: true };
+      if (queried.status !== "NEW" && queried.status !== "PARTIALLY_FILLED") break; // terminal, non-fillable
+    } catch {
+      // best-effort — fall through to the next attempt / final fallback
+    }
+  }
+  if (opts.onUnconfirmed) {
+    opts.onUnconfirmed(symbol, orderId, fallbackPrice);
+  } else {
+    console.error(
+      `[binance-futures-private] UNCONFIRMED FILL PRICE: ${symbol} order ${orderId} never returned a ` +
+        `real avgPrice after retries — recording ${fallbackPrice} as a fallback, but this is NOT a ` +
+        `confirmed fill price.`,
+    );
+  }
+  return { price: fallbackPrice, confirmed: false };
+}
+
 export interface FuturesAlgoOrder {
   symbol: string;
   algoId: number;

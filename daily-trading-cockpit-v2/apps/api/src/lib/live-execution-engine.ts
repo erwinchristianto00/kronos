@@ -28,6 +28,7 @@ import { dirname, resolve } from "node:path";
 
 import {
   BinanceFuturesPrivateError,
+  resolveConfirmedFillPrice,
   resolveLiveBinanceEnv,
   type BinanceFuturesPrivateClient,
   type FuturesOrder,
@@ -406,6 +407,10 @@ export interface LiveIntent {
   /** Loss already booked to the ledger when the stuck opposing leg was closed at flip (≤ 0). Lets the
    *  flatten trigger know when the WHOLE venture (booked loss + this live leg) is in profit. */
   rescuePriorRealizedUsd?: number;
+  /** False when the exchange never confirmed a real entry avgPrice (see resolveConfirmedFillPrice)
+   *  and filledEntryPrice fell back to the stale pre-trade paper reference price — the stop/TP
+   *  geometry derived from it may be mispriced. Undefined on older persisted intents (assume true). */
+  entryPriceConfirmed?: boolean;
 }
 
 export interface LiveIntentSource {
@@ -697,6 +702,9 @@ export interface LiveExecutionEngineOptions {
    *  Read-only, best-effort: never throws, never changes the harvest's actual cut/hold decision.
    *  Omit to leave the measurement dormant (no market-data calls). */
   marketDataClient?: Pick<BinanceClient, "getFuturesFlow">;
+  /** Delay between queryOrder fill-confirmation retries (see resolveConfirmedFillPrice).
+   *  Default 400ms; tests pass 0. */
+  fillConfirmRetryDelayMs?: number;
 }
 
 const ERROR_STREAK_DISARM = 3;
@@ -1001,6 +1009,7 @@ export class LiveExecutionEngine {
   private readonly getControllerSnapshot: () => LiveControllerSnapshot | null;
   private readonly nowIso: () => string;
   private readonly marketDataClient?: Pick<BinanceClient, "getFuturesFlow">;
+  private readonly fillConfirmRetryDelayMs: number;
 
   /** In-memory ONLY — restart always boots disarmed. */
   private armed = false;
@@ -1023,6 +1032,7 @@ export class LiveExecutionEngine {
     this.getControllerSnapshot = options.getControllerSnapshot ?? (() => null);
     this.nowIso = options.nowIso ?? (() => new Date().toISOString());
     this.marketDataClient = options.marketDataClient;
+    this.fillConfirmRetryDelayMs = options.fillConfirmRetryDelayMs ?? 400;
     // Auto-arm must NOT punch through a latched kill: a restart preserves the kill until an
     // explicit resetKill(). (arm() already enforces this; the constructor path bypassed it.)
     if (this.config.autoArm && this.config.configErrors.length === 0 && !this.store.getState().killedAt) {
@@ -3258,7 +3268,20 @@ export class LiveExecutionEngine {
         newClientOrderId: `dtc-${idTail}-e`,
       });
       intent.entryOrderId = entry.orderId;
-      intent.filledEntryPrice = entry.avgPrice > 0 ? entry.avgPrice : paper.entryPrice;
+      // Confirm the REAL fill before repricing stop/TP off it — silently trusting an
+      // avgPrice=0 placeOrder response would fall back to the stale pre-trade paper price,
+      // exactly the "wrong side of the actual fill" condition that once churned a stop
+      // placement 258× (see the comment on repricedGeometry's caller below).
+      const entryResolved = await resolveConfirmedFillPrice(this.client, paper.symbol, entry.orderId, entry.avgPrice, paper.entryPrice, {
+        retryDelayMs: this.fillConfirmRetryDelayMs,
+        onUnconfirmed: (sym, id, fallback) =>
+          console.error(
+            `[live-execution-engine] UNCONFIRMED ENTRY FILL: ${sym} order ${id} never returned a real avgPrice — ` +
+              `stop/TP geometry is repriced off the fallback ${fallback} (stale paper reference), not a confirmed fill.`,
+          ),
+      });
+      intent.filledEntryPrice = entryResolved.price;
+      intent.entryPriceConfirmed = entryResolved.confirmed;
       const repriced = this.repricedGeometry(planned, intent.filledEntryPrice, filters);
       intent.stopLossPrice = repriced.stopPrice;
       intent.tp1Price = repriced.tp1Price;
@@ -3352,6 +3375,7 @@ export class LiveExecutionEngine {
     // ordering cancelled the stop FIRST, so an add timeout left the position naked and dumped it at
     // market (EMERGENCY_FLATTEN_ADD_FAILED — the bleed).
     let entry: FuturesOrder;
+    let entryFillResolved: { price: number; confirmed: boolean };
     try {
       await this.ensureSymbolLeverage(intent.symbol, this.leverageForPlanned(planned));
       entry = await this.client.placeOrder({
@@ -3360,6 +3384,17 @@ export class LiveExecutionEngine {
         type: "MARKET",
         quantity: addition.qty,
         newClientOrderId: `dtc-${idTail}-a`,
+      });
+      // Confirm the real fill NOW, while the OLD stop/TP still protect the position — not after
+      // STEP 2 cancels them, where a multi-retry confirmation would needlessly widen the naked
+      // window this function's own STEP 1/STEP 2 split exists to minimize.
+      entryFillResolved = await resolveConfirmedFillPrice(this.client, intent.symbol, entry.orderId, entry.avgPrice, planned[0]!.paper.entryPrice, {
+        retryDelayMs: this.fillConfirmRetryDelayMs,
+        onUnconfirmed: (sym, id, fallback) =>
+          console.error(
+            `[live-execution-engine] UNCONFIRMED ADD-ENTRY FILL: ${sym} order ${id} never returned a real avgPrice — ` +
+              `averaged fill price uses the fallback ${fallback} (stale paper reference), not a confirmed fill.`,
+          ),
       });
     } catch (addError) {
       // Existing stop + TP are still working → the position is safe. Skip the add; do NOT flatten.
@@ -3380,8 +3415,10 @@ export class LiveExecutionEngine {
       const oldQty = intent.qty;
       const totalQty = roundDownToStep(oldQty + addition.qty, filters.stepSize);
       const oldFill = intent.filledEntryPrice ?? intent.plannedEntryPrice;
-      const newFill = entry.avgPrice > 0 ? entry.avgPrice : planned[0]!.paper.entryPrice;
+      const newFill = entryFillResolved.price;
       intent.filledEntryPrice = ((oldFill * oldQty) + (newFill * addition.qty)) / totalQty;
+      // Confirmed status is monotonic-worst: one unconfirmed leg taints the whole averaged fill.
+      intent.entryPriceConfirmed = (intent.entryPriceConfirmed ?? true) && entryFillResolved.confirmed;
       const repriced = this.repricedGeometry(planned, intent.filledEntryPrice, filters);
       const oldStopDistancePct = Math.abs(oldFill - intent.stopLossPrice) / oldFill;
       const oldTargetDistancePct = Math.abs(intent.tp1Price - oldFill) / oldFill;

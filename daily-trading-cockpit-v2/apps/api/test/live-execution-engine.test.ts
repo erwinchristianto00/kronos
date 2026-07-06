@@ -61,6 +61,9 @@ class FakeLiveClient {
   markPriceBySymbol = new Map<string, number>();
   unrealizedPnlBySymbol = new Map<string, number>();
   orderStatusById = new Map<number, string>();
+  /** What queryOrder reports for a symbol — simulates the exchange confirming a fill that the
+   *  initial placeOrder response returned as avgPrice=0. Unset ⇒ stays unconfirmed (NEW). */
+  queryOrderAvgPriceBySymbol = new Map<string, number>();
   trades: FuturesUserTrade[] = [];
   hedge = false;
   failNextTicks = 0;
@@ -132,8 +135,14 @@ class FakeLiveClient {
       actualOrderId: _algoId,
     };
   }
-  async queryOrder(_symbol: string, orderId: number): Promise<FuturesOrder> {
-    return this.stubOrder({ orderId, status: this.orderStatusById.get(orderId) ?? "NEW" });
+  async queryOrder(symbol: string, orderId: number): Promise<FuturesOrder> {
+    // status stays decoupled from avgPrice — other call sites (e.g. TP1-fill polling) rely on
+    // orderStatusById/the "NEW" default independent of whether a fill price has been confirmed.
+    return this.stubOrder({
+      orderId,
+      status: this.orderStatusById.get(orderId) ?? "NEW",
+      avgPrice: this.queryOrderAvgPriceBySymbol.get(symbol) ?? 0,
+    });
   }
   async placeOrder(p: PlaceOrderParams): Promise<FuturesOrder> {
     if (this.failAddEntry && p.newClientOrderId?.endsWith("-a")) {
@@ -312,6 +321,7 @@ function makeEngine(opts: {
     getControllerSnapshot: opts.getControllerSnapshot,
     nowIso: opts.nowIso ?? (() => "2099-01-02T12:00:00.000Z"),
     marketDataClient: opts.marketDataClient,
+    fillConfirmRetryDelayMs: 0,
   });
   return { engine, client, store };
 }
@@ -1437,6 +1447,40 @@ describe("LiveExecutionEngine", () => {
     expect(store.getState().intents[0]!.state).toBe("OPEN");
   });
 
+  it("confirms the real entry fill via queryOrder when placeOrder returns avgPrice=0, and reprices off the CONFIRMED price (not the stale paper price)", async () => {
+    // Same shape as Fault A, but this time the exchange's placeOrder response comes back
+    // avgPrice=0 (a real, observed Binance quirk) instead of reporting the fill directly.
+    // Silently trusting that as "flat at the paper price" would reintroduce Fault A's exact
+    // failure — a stop repriced off a stale reference instead of the real (moved) fill.
+    const order = paperOrder({ direction: "LONG", entryPrice: 2000, stopLoss: 1900, takeProfitLevels: [2100] } as Partial<PaperOrder>);
+    const client = new FakeLiveClient();
+    client.marketFillPrice = 0; // placeOrder reports avgPrice=0 for the entry...
+    client.queryOrderAvgPriceBySymbol.set("ETHUSDT", 1850); // ...but queryOrder confirms the real fill: 1850
+    const { engine, store } = makeEngine({ client, paper: makePaperStore([order]) });
+    await engine.arm();
+    await engine.tick();
+
+    const intent = store.getState().intents[0]!;
+    expect(intent.filledEntryPrice).toBeCloseTo(1850, 6); // the CONFIRMED fill, not paper's 2000
+    expect(intent.entryPriceConfirmed).toBe(true);
+    const stop = client.placed.find((p) => p.type === "STOP_MARKET");
+    expect(stop!.stopPrice!).toBeCloseTo(1757.5, 1); // repriced off 1850, exactly like Fault A
+  });
+
+  it("marks entryPriceConfirmed=false (and falls back to the paper price) when queryOrder never confirms a real fill", async () => {
+    const order = paperOrder({ direction: "LONG", entryPrice: 2000, stopLoss: 1900, takeProfitLevels: [2100] } as Partial<PaperOrder>);
+    const client = new FakeLiveClient();
+    client.marketFillPrice = 0; // neither placeOrder nor queryOrder ever return a real avgPrice
+    const { engine, store } = makeEngine({ client, paper: makePaperStore([order]) });
+    await engine.arm();
+    await engine.tick();
+
+    const intent = store.getState().intents[0]!;
+    expect(intent.filledEntryPrice).toBeCloseTo(2000, 6); // honest fallback to the paper reference
+    expect(intent.entryPriceConfirmed).toBe(false); // but HONESTLY flagged as unconfirmed
+    expect(intent.state).toBe("OPEN"); // still opens — this is a data-honesty flag, not a blocker
+  });
+
   it("Fault B: a paper order whose open keeps failing is quarantined — bounded retries, not infinite churn", async () => {
     const order = paperOrder({
       direction: "LONG",
@@ -1606,6 +1650,64 @@ describe("LiveExecutionEngine", () => {
     const after = client.placed.slice(placedBefore);
     expect(after.some((p) => p.type === "MARKET" && p.reduceOnly)).toBe(false); // no flatten
     expect(intent.lastError ?? "").toMatch(/still protected/i);
+  });
+
+  it("confirms the ADD's real fill via queryOrder before averaging into filledEntryPrice, instead of silently trusting a stale reference", async () => {
+    const orders: PaperOrder[] = [
+      paperOrder({
+        paperOrderId: "p1", direction: "LONG", entryPrice: 2000, stopLoss: 1900, takeProfitLevels: [2100],
+        paperStatus: "PAPER_SUBMITTED", createdAt: "2099-01-02T00:00:00.000Z",
+      } as Partial<PaperOrder>),
+    ];
+    const client = new FakeLiveClient();
+    const { engine, store } = makeEngine({ client, paper: makePaperStore(orders), config: { mirrorAllPaperOrders: true } });
+    await engine.arm();
+    await engine.tick(); // opens p1 at a confirmed 2000
+    expect(store.getState().intents[0]!.entryPriceConfirmed).toBe(true);
+
+    orders.push(
+      paperOrder({
+        paperOrderId: "p2", direction: "LONG", entryPrice: 2000, stopLoss: 1900, takeProfitLevels: [2100],
+        paperStatus: "PAPER_SUBMITTED", createdAt: "2099-01-02T01:00:00.000Z",
+      } as Partial<PaperOrder>),
+    );
+    // The add's placeOrder response comes back avgPrice=0, but the real fill (confirmed via
+    // queryOrder) has since moved well below the paper reference of 2000.
+    client.marketFillPrice = 0;
+    client.queryOrderAvgPriceBySymbol.set("ETHUSDT", 1700);
+    await engine.tick();
+
+    const intent = store.getState().intents[0]!;
+    // If the bug were still present, the add would silently use the stale paper price (2000),
+    // leaving filledEntryPrice unchanged at 2000. It must instead be pulled down toward the
+    // confirmed 1700 fill.
+    expect(intent.filledEntryPrice!).toBeLessThan(2000);
+    expect(intent.entryPriceConfirmed).toBe(true); // the add's fill WAS confirmed, just at a moved price
+  });
+
+  it("marks the intent's entryPriceConfirmed false (monotonic-worst) when an ADD's fill can't be confirmed, even though the original entry was", async () => {
+    const orders: PaperOrder[] = [
+      paperOrder({
+        paperOrderId: "p1", direction: "LONG", entryPrice: 2000, stopLoss: 1900, takeProfitLevels: [2100],
+        paperStatus: "PAPER_SUBMITTED", createdAt: "2099-01-02T00:00:00.000Z",
+      } as Partial<PaperOrder>),
+    ];
+    const client = new FakeLiveClient();
+    const { engine, store } = makeEngine({ client, paper: makePaperStore(orders), config: { mirrorAllPaperOrders: true } });
+    await engine.arm();
+    await engine.tick(); // opens p1 at a confirmed 2000
+    expect(store.getState().intents[0]!.entryPriceConfirmed).toBe(true);
+
+    orders.push(
+      paperOrder({
+        paperOrderId: "p2", direction: "LONG", entryPrice: 2000, stopLoss: 1900, takeProfitLevels: [2100],
+        paperStatus: "PAPER_SUBMITTED", createdAt: "2099-01-02T01:00:00.000Z",
+      } as Partial<PaperOrder>),
+    );
+    client.marketFillPrice = 0; // the add's fill is never confirmed by placeOrder OR queryOrder
+    await engine.tick();
+
+    expect(store.getState().intents[0]!.entryPriceConfirmed).toBe(false);
   });
 
   it("auto-arm does NOT punch through a latched kill on restart", () => {
