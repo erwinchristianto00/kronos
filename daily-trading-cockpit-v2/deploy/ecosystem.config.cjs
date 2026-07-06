@@ -3,6 +3,12 @@
 //
 // Set KRONOS_ENABLED=0 in the environment before `pm2 start` to skip Kronos on a
 // small (1–2GB) box — the scan runs fine without it (Kronos just goes weightless).
+//
+// max_memory_restart is a soft ceiling: pm2 sends a graceful restart (not a hard
+// system OOM-kill) once RSS crosses it. NODE_OPTIONS caps the V8 heap itself,
+// below the RSS ceiling, so a leak surfaces as a catchable/loggable V8 condition
+// before the OS ever has to intervene. Sized for a 7.8GB box running all 3
+// api instances + web + kronos side by side (worst case ~4.6GB, leaves ~3GB free).
 const path = require("node:path");
 
 const apps = [
@@ -14,6 +20,8 @@ const apps = [
     max_restarts: 100,
     restart_delay: 5000,
     time: true,
+    max_memory_restart: "768M",
+    env: { NODE_OPTIONS: "--max-old-space-size=512" },
   },
   {
     name: "dtc-web",
@@ -23,6 +31,8 @@ const apps = [
     max_restarts: 100,
     restart_delay: 5000,
     time: true,
+    max_memory_restart: "384M",
+    env: { NODE_OPTIONS: "--max-old-space-size=256" },
   },
 ];
 
@@ -35,6 +45,7 @@ if (process.env.KRONOS_ENABLED !== "0") {
     max_restarts: 50,
     restart_delay: 10000,
     time: true,
+    max_memory_restart: "2048M",
   });
 }
 
