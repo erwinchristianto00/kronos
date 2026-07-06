@@ -1408,6 +1408,20 @@ describe("LiveExecutionEngine", () => {
     expect(client.placed.length).toBe(0);
   });
 
+  it("reconcileIssues never grows unbounded when the SAME orphan is rediscovered tick after tick", async () => {
+    // Real-world case: an orphan position sits unresolved for days. Every tick rediscovers it and
+    // re-pushes the same message — without a cap, this array grows forever (a memory leak) and
+    // getStatus()'s slice(-10) becomes a misleading stale mix of old + new pushes instead of the
+    // current state. It must stay bounded no matter how many ticks find the same issue.
+    const { engine, client } = makeEngine({});
+    client.positionsBySymbol.set("DOGEUSDT", 5); // orphan, present on every tick
+    for (let i = 0; i < 250; i += 1) await engine.tick();
+    // @ts-expect-error -- reaching into the private field to verify it's bounded at the source,
+    // not just at the getStatus() display layer.
+    expect(engine.reconcileIssues.length).toBeLessThanOrEqual(200);
+    expect(engine.getStatus().reconcileIssues.join(" ")).toMatch(/orphan/);
+  });
+
   it("exchange error streak auto-disarms", async () => {
     const { engine, client } = makeEngine({});
     await engine.arm();

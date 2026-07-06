@@ -1059,7 +1059,19 @@ export class LiveExecutionEngine {
 
   disarm(reason: string): void {
     this.armed = false;
-    this.reconcileIssues.push(`disarmed: ${reason}`);
+    this.pushReconcileIssues(`disarmed: ${reason}`);
+  }
+
+  /** Appends to reconcileIssues WITHOUT letting it grow unbounded. A persistent condition (e.g.
+   *  an unresolved orphan exchange position) gets rediscovered and re-pushed every tick forever
+   *  if left uncapped — getStatus() only ever displays the last 10 anyway (slice(-10)), so this
+   *  cap is generous headroom for investigation, not a display limit. */
+  private pushReconcileIssues(...msgs: string[]): void {
+    this.reconcileIssues.push(...msgs);
+    const MAX_RECONCILE_ISSUES = 200;
+    if (this.reconcileIssues.length > MAX_RECONCILE_ISSUES) {
+      this.reconcileIssues = this.reconcileIssues.slice(-MAX_RECONCILE_ISSUES);
+    }
   }
 
   private currentControllerSnapshot(): LiveControllerSnapshot | null {
@@ -1791,7 +1803,7 @@ export class LiveExecutionEngine {
     }
 
     if (issues.length > 0) {
-      this.reconcileIssues.push(...issues);
+      this.pushReconcileIssues(...issues);
       if (this.armed) this.disarm(`reconciliation mismatch: ${issues[0]}`);
     }
     if (dirty) this.store.save();
@@ -2292,7 +2304,7 @@ export class LiveExecutionEngine {
         try {
           await this.executeRescueFlatten(action, rescueIntentBySymbol.get(action.symbol));
         } catch (error) {
-          this.reconcileIssues.push(`rescue flatten ${action.symbol} failed: ${(error as Error).message}`);
+          this.pushReconcileIssues(`rescue flatten ${action.symbol} failed: ${(error as Error).message}`);
         }
       }
       // Flips OPEN new exposure — only when armed.
@@ -2301,7 +2313,7 @@ export class LiveExecutionEngine {
           try {
             await this.executeRescueFlip(action, openIntents.filter((i) => i.symbol === action.symbol && !i.rescue));
           } catch (error) {
-            this.reconcileIssues.push(`rescue flip ${action.symbol} failed: ${(error as Error).message}`);
+            this.pushReconcileIssues(`rescue flip ${action.symbol} failed: ${(error as Error).message}`);
           }
         }
       }
