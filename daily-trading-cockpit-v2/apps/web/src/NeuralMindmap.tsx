@@ -1000,6 +1000,7 @@ interface LiveAccount {
 export default function NeuralMindmap() {
   const [telemetry, setTelemetry] = useState<NeuralTelemetry | null>(null);
   const [liveAccount, setLiveAccount] = useState<LiveAccount | null>(null);
+  const [liveAccountReceivedAt, setLiveAccountReceivedAt] = useState<number | null>(null);
   const [shortFade, setShortFade] = useState<ShortFadeReport | null>(null);
   const [selectedId, setSelectedId] = useState('');
   const [autoRefresh, setAutoRefresh] = useState(true);
@@ -1054,6 +1055,7 @@ export default function NeuralMindmap() {
           openOrderCount: data.openOrderCount ?? 0,
           lanes: data.lanes ?? [],
         });
+        setLiveAccountReceivedAt(Date.now());
       }
     } catch {
       // non-critical — silently skip if engine is down
@@ -1122,6 +1124,8 @@ export default function NeuralMindmap() {
   const selectedLaneMilestone = selectedLane ? laneMilestone(selectedLane) : null;
   const selectedLaneProgress = selectedLane ? stageProgress(selectedLane) : null;
   const selectedLiveLane = liveAccount?.lanes.find((lane) => lane.laneId === selectedLane?.id) ?? null;
+  const liveAccountStale = liveAccount !== null &&
+    (liveAccountReceivedAt === null || (Date.now() - liveAccountReceivedAt) / 1000 > 30);
   const selectedLaneHeadlinePnl = selectedLane
     ? selectedLane.headlinePnl + (selectedLane.headlineUnrealizedPnl ?? 0)
     : 0;
@@ -1211,12 +1215,12 @@ export default function NeuralMindmap() {
       ],
     },
     {
-      title: 'Binance mirror',
+      title: liveAccountStale ? 'Binance mirror (STALE)' : 'Binance mirror',
       rows: [
         { label: 'Mirrored', value: selectedLiveLane ? `${selectedLiveLane.sourceOrderCount} orders / ${selectedLiveLane.symbols.length} symbols` : 'not open' },
         { label: 'Notional', value: selectedLiveLane ? `${selectedLiveLane.notionalUsd.toFixed(2)} USDT` : '0.00 USDT' },
         { label: 'Unrealized', value: selectedLiveLane ? `${selectedLiveLane.unrealizedPnl >= 0 ? '+' : ''}${selectedLiveLane.unrealizedPnl.toFixed(2)} USDT` : '0.00 USDT', tone: (selectedLiveLane?.unrealizedPnl ?? 0) >= 0 ? 'tone-healthy' : 'tone-critical' },
-        { label: 'Account equity', value: liveAccount?.accountEquity != null ? `${liveAccount.accountEquity.toFixed(2)} USDT` : 'n/a' },
+        { label: 'Account equity', value: `${liveAccount?.accountEquity != null ? `${liveAccount.accountEquity.toFixed(2)} USDT` : 'n/a'}${liveAccountStale ? ' · stale' : ''}`, tone: liveAccountStale ? 'tone-critical' : undefined },
       ],
     },
   ] : [];

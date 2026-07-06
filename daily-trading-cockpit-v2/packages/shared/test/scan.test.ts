@@ -1095,4 +1095,59 @@ describe("shared scanner rules", () => {
 
     expect(after).toEqual(before);
   });
+
+  it("rejects an ATR plan whose stop/target geometry only collapses after price-precision rounding", () => {
+    const fib = calculateFibonacciLevels(makeCandles({ step: 1.5, count: 120, timeStepMs: 60 * 60 * 1000 }));
+    // A near-flat market: ATR is tiny relative to price, so the raw SHORT stop
+    // (entryHigh + atrValue*1.15) sits inside the same rounding tick as entryHigh itself.
+    const plan = buildAtrPlan(99.9999, 0.00003, 0.01, "SHORT", {
+      ...fib,
+      retracement382: 99.9998,
+      retracement236: 100.0001,
+    });
+
+    expect(plan.stopLoss).toBeNull();
+    expect(plan.entryZoneHigh).toBeNull();
+    expect(plan.takeProfit1).toBeNull();
+  });
+
+  it("keeps the SHORT fallback take-profit ladder monotonic (tp1 nearest, tp3 furthest)", () => {
+    const base = buildCandidate({
+      symbol: "ETHUSDT",
+      candles5m: makeCandles({ start: 200, step: -0.8 }),
+      candles15m: makeCandles({ start: 200, step: -0.8, timeStepMs: 15 * 60 * 1000 }),
+      candles1h: makeCandles({ start: 200, step: -0.8, timeStepMs: 60 * 60 * 1000 }),
+      spread: { bid: 200, ask: 200.03, absolute: 0.03, percent: 0.015 },
+      volume: { quoteVolume24h: 150_000_000, baseVolume24h: 2_000_000, volumeRatio5m: 1.2 },
+      kronos: unavailableKronos,
+      whale: { available: false, signal: "UNAVAILABLE", score: 0 },
+      sentiment: { available: false, signal: "UNAVAILABLE", score: 0 },
+      now: Date.UTC(2026, 4, 6, 15, 0, 0),
+    });
+    const candidate = {
+      ...base,
+      finalDirection: "SHORT" as const,
+      direction: "SHORT" as const,
+      // Force the trade-plan fallback (both the primary ATR plan and the candidate's own
+      // takeProfits are unavailable).
+      stopLoss: null,
+      takeProfits: { tp1: null, tp2: null, tp3: null },
+      atr: { ...base.atr, stopLoss: null, takeProfit1: null, takeProfit2: null, takeProfit3: null },
+      fibonacci: { ...base.fibonacci, recentHigh: 110, recentLow: 100, retracement618: 106 },
+      indicators: {
+        ...base.indicators,
+        fiveMinute: { ...base.indicators.fiveMinute, support: 90 },
+      },
+    };
+
+    const plan = buildTradePlan(candidate);
+
+    expect(plan.takeProfit1).not.toBeNull();
+    expect(plan.takeProfit2).not.toBeNull();
+    expect(plan.takeProfit3).not.toBeNull();
+    // tp1 is the first/nearest SHORT target, so it must require the *least* profit —
+    // i.e. sit at or above tp2, which itself sits at or above tp3.
+    expect(plan.takeProfit1!).toBeGreaterThanOrEqual(plan.takeProfit2!);
+    expect(plan.takeProfit2!).toBeGreaterThanOrEqual(plan.takeProfit3!);
+  });
 });

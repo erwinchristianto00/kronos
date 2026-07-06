@@ -306,15 +306,49 @@ export function buildAtrPlan(
     };
   }
 
+  const roundedEntryLow = roundPrice(entryLow, price);
+  const roundedEntryHigh = roundPrice(entryHigh, price);
+  const roundedEntryMid = (roundedEntryLow + roundedEntryHigh) / 2;
+  const roundedStopLoss = roundPrice(stopLoss, price);
+  const roundedTp1 = roundPrice(tp1, price);
+  const roundedTp2 = roundPrice(tp2, price);
+  const roundedTp3 = roundPrice(tp3, price);
+
+  // Rounding each field independently (needed so a plan is internally consistent at the
+  // symbol's own price precision) can collapse a razor-thin raw gap that passed the
+  // pre-round check above — e.g. stopLoss and entryHigh landing on the same tick for a
+  // near-zero-ATR symbol. Re-check the identical invariant post-round so a collision falls
+  // back to "no plan" (safe) instead of shipping a zero/inverted-risk geometry.
+  const roundedInvalidLong =
+    direction === "LONG" &&
+    !(roundedEntryLow <= roundedEntryHigh && roundedStopLoss < roundedEntryLow && roundedTp1 > roundedEntryMid && roundedTp2 > roundedEntryMid && roundedTp3 > roundedEntryMid);
+  const roundedInvalidShort =
+    direction === "SHORT" &&
+    !(roundedEntryLow <= roundedEntryHigh && roundedStopLoss > roundedEntryHigh && roundedTp1 < roundedEntryMid && roundedTp2 < roundedEntryMid && roundedTp3 < roundedEntryMid);
+
+  if (roundedInvalidLong || roundedInvalidShort) {
+    return {
+      atr14: roundPrice(atrValue, price),
+      atrPercent: round(atrPercent, 4),
+      entryZoneLow: null,
+      entryZoneHigh: null,
+      stopLoss: null,
+      takeProfit1: null,
+      takeProfit2: null,
+      takeProfit3: null,
+      riskReward: null,
+    };
+  }
+
   return {
     atr14: roundPrice(atrValue, price),
     atrPercent: round(atrPercent, 4),
-    entryZoneLow: roundPrice(entryLow, price),
-    entryZoneHigh: roundPrice(entryHigh, price),
-    stopLoss: roundPrice(stopLoss, price),
-    takeProfit1: roundPrice(tp1, price),
-    takeProfit2: roundPrice(tp2, price),
-    takeProfit3: roundPrice(tp3, price),
+    entryZoneLow: roundedEntryLow,
+    entryZoneHigh: roundedEntryHigh,
+    stopLoss: roundedStopLoss,
+    takeProfit1: roundedTp1,
+    takeProfit2: roundedTp2,
+    takeProfit3: roundedTp3,
     riskReward: risk > 0 ? round(reward / risk, 4) : null,
   };
 }

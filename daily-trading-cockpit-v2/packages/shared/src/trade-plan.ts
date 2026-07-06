@@ -31,26 +31,29 @@ function effectiveStopLoss(candidate: Candidate): number | null {
 
 function effectiveTakeProfits(candidate: Candidate) {
   const shortRange = Math.max(candidate.fibonacci.recentHigh - candidate.fibonacci.recentLow, 0);
-  return {
-    tp1:
-      candidate.takeProfits.tp1 ??
-      candidate.atr.takeProfit1 ??
-      (candidate.finalDirection === "LONG"
-        ? Math.max(candidate.indicators.fiveMinute.resistance, candidate.fibonacci.retracement236)
-        : Math.min(candidate.indicators.fiveMinute.support, candidate.fibonacci.retracement618)),
-    tp2:
-      candidate.takeProfits.tp2 ??
-      candidate.atr.takeProfit2 ??
-      (candidate.finalDirection === "LONG"
-        ? candidate.fibonacci.extension1272
-        : candidate.fibonacci.recentLow - shortRange * 0.272),
-    tp3:
-      candidate.takeProfits.tp3 ??
-      candidate.atr.takeProfit3 ??
-      (candidate.finalDirection === "LONG"
-        ? candidate.fibonacci.extension1618
-        : candidate.fibonacci.recentLow - shortRange * 0.618),
-  };
+  const tp2 =
+    candidate.takeProfits.tp2 ??
+    candidate.atr.takeProfit2 ??
+    (candidate.finalDirection === "LONG"
+      ? candidate.fibonacci.extension1272
+      : candidate.fibonacci.recentLow - shortRange * 0.272);
+  const tp3 =
+    candidate.takeProfits.tp3 ??
+    candidate.atr.takeProfit3 ??
+    (candidate.finalDirection === "LONG"
+      ? candidate.fibonacci.extension1618
+      : candidate.fibonacci.recentLow - shortRange * 0.618);
+  // The fallback tp1 mixes a short-lookback indicator (5m support/resistance) with a
+  // long-lookback Fibonacci level via min/max, unlike tp2/tp3 which share one anchor —
+  // so it has no natural ordering guarantee against tp2. Clamp it so tp1 always stays the
+  // *nearest* target; otherwise a partial-exit ladder can book its "first" target at a
+  // worse price than its "second" one.
+  const fallbackTp1 =
+    candidate.finalDirection === "LONG"
+      ? Math.min(Math.max(candidate.indicators.fiveMinute.resistance, candidate.fibonacci.retracement236), tp2)
+      : Math.max(Math.min(candidate.indicators.fiveMinute.support, candidate.fibonacci.retracement618), tp2);
+  const tp1 = candidate.takeProfits.tp1 ?? candidate.atr.takeProfit1 ?? fallbackTp1;
+  return { tp1, tp2, tp3 };
 }
 
 function effectiveRiskReward(candidate: Candidate): number | null {

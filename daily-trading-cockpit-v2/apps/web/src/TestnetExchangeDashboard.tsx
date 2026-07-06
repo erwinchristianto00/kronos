@@ -640,7 +640,7 @@ export default function TestnetExchangeDashboard() {
       if (!response.ok || body?.ok === false) {
         setCopyResult({ id: paperOrderId, ok: false, message: body?.reason ?? `copy failed (${response.status})` });
       } else {
-        setCopyResult({ id: paperOrderId, ok: true, message: `LIVE copied: ${body?.live?.intent?.symbol ?? ''} ${body?.live?.intent?.state ?? 'OPEN'}` });
+        setCopyResult({ id: paperOrderId, ok: true, message: `LIVE copied: ${body?.live?.intent?.symbol ?? paperOrderId} ${body?.live?.intent?.state ?? '(state unknown — verify on exchange)'}` });
       }
     } catch (copyError) {
       setCopyResult({ id: paperOrderId, ok: false, message: copyError instanceof Error ? copyError.message : 'copy request failed' });
