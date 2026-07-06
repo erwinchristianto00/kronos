@@ -76,6 +76,16 @@ export interface IntradayMomentumObservation extends IntradayMomentumSignal {
   maxFavorableR: number | null;
   exitReason: "MFE_GIVEBACK" | "INITIAL_STOP" | "MAX_HOLD_MTM" | null;
   resolvedAt: string | null;
+  /**
+   * Order-flow + composite decision score read AT SIGNAL TIME (report-only enrichment; never used to
+   * admit or reject the signal itself — that stays purely the breakout/volume/momentum gates above).
+   * Recording this alongside the eventual realized outcome lets a future pass check whether the score
+   * actually correlates with edge BEFORE it is ever wired into admission. null when the enrichment
+   * fetch failed or was unavailable — absence must never be treated as a good or bad reading.
+   */
+  takerBuyRatioAtEntry?: number | null;
+  spreadBpsAtEntry?: number | null;
+  decisionScoreAtEntry?: number | null;
 }
 
 function finite(v: number | null | undefined): v is number {
@@ -260,6 +270,12 @@ export async function runIntradayMomentumCycle(opts: {
   fetchCandles: (symbol: string) => Promise<Candle[]>;
   /** Don't record a second OPEN obs for a symbol whose prior one is younger than this (one per bar). */
   dedupeWindowMs?: number;
+  /**
+   * Optional report-only enrichment, called ONLY for a symbol that just produced a signal (not the
+   * whole universe every cycle — keeps API load bounded). Never affects whether the signal is
+   * recorded; a throw or a null return just leaves the enrichment fields unset.
+   */
+  enrichSignal?: (symbol: string, signal: IntradayMomentumSignal) => Promise<{ takerBuyRatio?: number | null; spreadBps?: number | null; decisionScore?: number | null } | null>;
 }): Promise<IMCycleResult> {
   const result: IMCycleResult = { scanned: 0, recorded: 0, resolved: 0, expired: 0 };
   const dedupeMs = opts.dedupeWindowMs ?? 3_600_000; // 1h (one signal per symbol per bar)
@@ -297,6 +313,14 @@ export async function runIntradayMomentumCycle(opts: {
     if (recentlyOpened) continue;
     const signal = detectIntradayMomentumEntry(candles);
     if (!signal) continue;
+    let enrichment: { takerBuyRatio?: number | null; spreadBps?: number | null; decisionScore?: number | null } | null = null;
+    if (opts.enrichSignal) {
+      try {
+        enrichment = await opts.enrichSignal(symbol, signal);
+      } catch {
+        enrichment = null; // enrichment must never block or fail the recording itself
+      }
+    }
     const observationId = `im:${symbol}:${opts.now}`;
     const added = opts.store.add({
       ...signal,
@@ -312,6 +336,9 @@ export async function runIntradayMomentumCycle(opts: {
       maxFavorableR: null,
       exitReason: null,
       resolvedAt: null,
+      takerBuyRatioAtEntry: enrichment?.takerBuyRatio ?? null,
+      spreadBpsAtEntry: enrichment?.spreadBps ?? null,
+      decisionScoreAtEntry: enrichment?.decisionScore ?? null,
     });
     if (added) result.recorded += 1;
   }

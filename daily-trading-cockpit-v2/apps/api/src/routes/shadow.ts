@@ -187,6 +187,9 @@ import {
   getIntradayMomentumStore,
   IM_INTERVAL,
 } from "../lib/intraday-momentum-edge.js";
+import { buildLaneVariantPboReport } from "../lib/walk-forward-validation.js";
+import { buildMicrostructureSnapshot } from "../lib/order-flow-microstructure.js";
+import { computeDecisionScore } from "../lib/decision-scoring.js";
 import {
   assessPaperTp,
   readPaperTradingControls,
@@ -1296,6 +1299,19 @@ export async function registerShadowRoutes(
     return { generatedAt: new Date().toISOString(), ...buildIntradayMomentumReport(getIntradayMomentumStore().all) };
   });
 
+  // Probability of Backtest Overfitting (CSCV) across the CG variant-matrix lanes — the honest audit
+  // of "is this lane's edge real, or does it just look best in this sample" (e.g. CG_WIDE_LONG_RUNNER).
+  // Report-only; never gates execution. Query: minObsPerVariant (default 30), bucketDays (default 7).
+  app.get<{ Querystring: { minObsPerVariant?: string; bucketDays?: string } }>("/api/shadow/pbo-report", async (request) => {
+    const minObsPerVariant = Number(request.query.minObsPerVariant) || 30;
+    const bucketMs = (Number(request.query.bucketDays) || 7) * 24 * 3_600_000;
+    const observations = getCurrentGuardVariantMatrixStore()
+      .all.filter((o) => o.resolvedAt !== null)
+      .map((o) => ({ variantId: o.variantId, atMs: new Date(o.resolvedAt as string).getTime(), netR: o.netR }))
+      .filter((o) => Number.isFinite(o.atMs));
+    return { generatedAt: new Date().toISOString(), ...buildLaneVariantPboReport(observations, { minObsPerVariant, bucketMs }) };
+  });
+
   app.get("/api/shadow/neural-map", async () => {
     const generatedAt = new Date().toISOString();
     const cached = getLatestScanCandidates();
@@ -1653,6 +1669,35 @@ export async function registerShadowRoutes(
             universe: [...CURRENT_SCANNER_UNIVERSE],
             now: Date.now(),
             fetchCandles: async (symbol: string) => _imc.getCandles(symbol, IM_INTERVAL, 120),
+            // Report-only enrichment (order-flow + composite decision score), read ONLY for a symbol
+            // that just fired a signal. Never affects whether the signal is recorded — pure logging so
+            // a later pass can check whether the score correlates with realized edge before it is ever
+            // wired into admission. Wrapped by the cycle itself; a failure here never blocks recording.
+            enrichSignal: async (symbol, signal) => {
+              const [trades, depthPayload, bookTicker] = await Promise.all([
+                _imc.getFuturesAggTrades(symbol, { limit: 200 }),
+                _imc.getFuturesDepth(symbol, 20),
+                _imc.getFuturesBookTicker(symbol),
+              ]);
+              const micro = buildMicrostructureSnapshot({
+                symbol,
+                capturedAtMs: Date.now(),
+                trades,
+                depthPayload,
+                bestBid: bookTicker.bid,
+                bestAsk: bookTicker.ask,
+                depthBpsWindow: 10,
+                sizeNotionalUsd: 50, // matches the live risk-per-trade notional scale
+              });
+              const decisionScore = computeDecisionScore({
+                regime: { controllerMode: regimeReport.controllerMode, confidence: regimeReport.confidence, direction: "LONG" },
+                setup: { volumeRatio: signal.volumeRatio, rocPercent: signal.rocAtEntry, atrExtension: signal.atrExtension },
+                orderFlow: { takerBuyRatio: micro.takerFlow.takerBuyRatio, direction: "LONG" },
+                liquidity: { spreadBps: micro.spreadBps, expectedSlippageBps: micro.expectedSlippageBpsBuy, maxSpreadBps: 20, maxSlippageBps: 30 },
+                derivatives: { fundingZScore: null, openInterestChangePercent: null, direction: "LONG" },
+              });
+              return { takerBuyRatio: micro.takerFlow.takerBuyRatio, spreadBps: micro.spreadBps, decisionScore: decisionScore.totalScore };
+            },
           }).catch(() => undefined);
         }
         // Cross-sectional market-neutral measurement lane: rank the universe by N-bar momentum, go

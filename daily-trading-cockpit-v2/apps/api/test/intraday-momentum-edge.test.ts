@@ -143,3 +143,60 @@ describe("intraday momentum hunter — report", () => {
     expect(buildIntradayMomentumReport(few).edgeReady).toBe(false);
   });
 });
+
+describe("intraday momentum hunter — report-only enrichment (order-flow + decision score)", () => {
+  it("records enrichment fields when enrichSignal succeeds, without changing whether the signal is recorded", async () => {
+    const { runIntradayMomentumCycle, IntradayMomentumStore } = await import("../src/lib/intraday-momentum-edge.js");
+    const store = new IntradayMomentumStore(`/tmp/im-test-${Math.random()}.json`);
+    const candles = (() => {
+      let tt = 1_000_000_000_000;
+      const bars = [];
+      for (let i = 0; i < 30; i++) {
+        tt += 3_600_000;
+        bars.push({ openTime: tt, open: 100, high: 101, low: 99, close: 100, volume: 100 });
+      }
+      tt += 3_600_000;
+      bars.push({ openTime: tt, open: 108, high: 108.5, low: 100.5, close: 108, volume: 400 });
+      return bars;
+    })();
+    const result = await runIntradayMomentumCycle({
+      store,
+      universe: ["ENRICHUSDT"],
+      now: candles[candles.length - 1]!.openTime + 1,
+      fetchCandles: async () => candles,
+      enrichSignal: async () => ({ takerBuyRatio: 0.72, spreadBps: 3, decisionScore: 81 }),
+    });
+    expect(result.recorded).toBe(1);
+    const obs = store.all[0]!;
+    expect(obs.takerBuyRatioAtEntry).toBeCloseTo(0.72, 6);
+    expect(obs.spreadBpsAtEntry).toBeCloseTo(3, 6);
+    expect(obs.decisionScoreAtEntry).toBe(81);
+  });
+
+  it("still records the signal (with null enrichment) when enrichSignal throws", async () => {
+    const { runIntradayMomentumCycle, IntradayMomentumStore } = await import("../src/lib/intraday-momentum-edge.js");
+    const store = new IntradayMomentumStore(`/tmp/im-test-${Math.random()}.json`);
+    const candles = (() => {
+      let tt = 1_000_000_000_000;
+      const bars = [];
+      for (let i = 0; i < 30; i++) {
+        tt += 3_600_000;
+        bars.push({ openTime: tt, open: 100, high: 101, low: 99, close: 100, volume: 100 });
+      }
+      tt += 3_600_000;
+      bars.push({ openTime: tt, open: 108, high: 108.5, low: 100.5, close: 108, volume: 400 });
+      return bars;
+    })();
+    const result = await runIntradayMomentumCycle({
+      store,
+      universe: ["FAILUSDT"],
+      now: candles[candles.length - 1]!.openTime + 1,
+      fetchCandles: async () => candles,
+      enrichSignal: async () => {
+        throw new Error("network blip");
+      },
+    });
+    expect(result.recorded).toBe(1); // recording still succeeds
+    expect(store.all[0]!.decisionScoreAtEntry).toBeNull();
+  });
+});
