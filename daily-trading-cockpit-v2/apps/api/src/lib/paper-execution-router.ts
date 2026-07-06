@@ -393,6 +393,8 @@ function stampPaperOrderAxis(order: PaperOrder): void {
 export class PaperExecutionRouterStore {
   private readonly file: string;
   private state: PaperExecutionRouterState;
+  private batchDepth = 0;
+  private dirtyDuringBatch = false;
 
   constructor(dataDir = "data") {
     this.file = resolve(dataDir, "paper-execution-router.json");
@@ -467,14 +469,41 @@ export class PaperExecutionRouterStore {
     };
   }
 
+  /**
+   * Defers save() to a single flush on endBatch(). Callers that mutate many orders in a loop
+   * (e.g. resolvePaperOrders, which used to call store.update() — and therefore a full-array
+   * JSON.stringify + writeFileSync — once PER ORDER) should wrap the loop in begin/endBatch so
+   * the O(n) flush happens once per batch instead of once per order (same class of fix already
+   * applied to current-guard-variant-matrix.ts's resolver).
+   */
+  beginBatch(): void {
+    this.batchDepth += 1;
+  }
+
+  endBatch(): void {
+    if (this.batchDepth > 0) this.batchDepth -= 1;
+    if (this.batchDepth === 0 && this.dirtyDuringBatch) {
+      this.dirtyDuringBatch = false;
+      this.flush();
+    }
+  }
+
   save(): void {
+    if (this.batchDepth > 0) {
+      this.dirtyDuringBatch = true;
+      return;
+    }
+    this.flush();
+  }
+
+  private flush(): void {
     try {
       for (const order of this.state.orders) stampPaperOrderAxis(order);
       // Atomic write: serialize to a temp file, snapshot the previous good file as .bak, then
       // rename into place (atomic on the same volume). A reload can therefore never observe a
       // partially-written main file, and the .bak is the recovery source if anything goes wrong.
       const tmp = `${this.file}.tmp`;
-      writeFileSync(tmp, JSON.stringify(this.state, null, 2), "utf-8");
+      writeFileSync(tmp, JSON.stringify(this.state), "utf-8");
       if (existsSync(this.file)) {
         try {
           copyFileSync(this.file, `${this.file}.bak`);
@@ -1646,6 +1675,20 @@ export async function resolvePaperOrders(
   executionModel: PaperExecutionModel = PAPER_EXECUTION_MODEL_IDEAL,
   opts: { maxOrders?: number; maxRuntimeMs?: number; yieldEvery?: number } = {},
 ): Promise<{ resolved: number; expired: number; dataFailures: number; errors: number }> {
+  store.beginBatch();
+  try {
+    return await resolvePaperOrdersInner(store, binanceClient, executionModel, opts);
+  } finally {
+    store.endBatch();
+  }
+}
+
+async function resolvePaperOrdersInner(
+  store: PaperExecutionRouterStore,
+  binanceClient: PaperResolverClient,
+  executionModel: PaperExecutionModel,
+  opts: { maxOrders?: number; maxRuntimeMs?: number; yieldEvery?: number },
+): Promise<{ resolved: number; expired: number; dataFailures: number; errors: number }> {
   const nowMs = Date.now();
   const startedMs = nowMs;
   const maxOrders =
@@ -2530,19 +2573,18 @@ export function buildPaperPerformanceReport(
     )
     .reduce((sum, o) => sum + (o.netPnlAmount ?? 0), 0);
   const monthTotalPaperPnl = monthHeadlinePaperPnl + monthDiagnosticPaperPnl;
-  const taipeiDate = new Intl.DateTimeFormat("en-CA", {
+  // Hoisted out of orderTaipeiDate: constructing a new Intl.DateTimeFormat is expensive
+  // (ICU/locale setup), and this used to happen once PER ORDER (10k+ and growing) inside the
+  // filter below — ~1.8s of /api/shadow/neural-map's ~9s response time (found 2026-07-06
+  // profiling why the dashboard's 5s auto-refresh was consistently outrunning its own request).
+  const taipeiFormatter = new Intl.DateTimeFormat("en-CA", {
     timeZone: "Asia/Taipei",
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
-  }).format(today);
-  const orderTaipeiDate = (order: PaperOrder): string =>
-    new Intl.DateTimeFormat("en-CA", {
-      timeZone: "Asia/Taipei",
-      year: "numeric",
-      month: "2-digit",
-      day: "2-digit",
-    }).format(new Date(order.updatedAt));
+  });
+  const taipeiDate = taipeiFormatter.format(today);
+  const orderTaipeiDate = (order: PaperOrder): string => taipeiFormatter.format(new Date(order.updatedAt));
   const taipeiDailyClosedOrders = orders.filter(
     (order) =>
       closedStatuses.includes(order.paperStatus) &&

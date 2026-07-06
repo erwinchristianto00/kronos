@@ -28,7 +28,7 @@
  *    stays true; microPilotAllowed stays false.
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 
 import {
@@ -292,7 +292,9 @@ export class PostCutoverStore {
   private _save(): void {
     try {
       const payload: PostCutoverStoreFile = { boundary: this.boundary };
-      writeFileSync(this.file, JSON.stringify(payload, null, 2), "utf-8");
+      const tmp = `${this.file}.tmp`;
+      writeFileSync(tmp, JSON.stringify(payload), "utf-8");
+      renameSync(tmp, this.file);
     } catch {
       // storage failures must never throw — this lane is report-only
     }

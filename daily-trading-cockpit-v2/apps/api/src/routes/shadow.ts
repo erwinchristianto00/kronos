@@ -181,12 +181,19 @@ import {
 } from "../lib/regime-direction-controller-snapshot.js";
 import { buildNeuralMapTelemetry, buildPaperUnrealizedSnapshot } from "../lib/neural-map-telemetry.js";
 import { buildPerSymbolLaneBookEdge } from "../lib/per-symbol-lane-book-edge.js";
+import { getLaneSymbolCurationCacheStore } from "../lib/lane-symbol-curation-cache.js";
 import {
   runIntradayMomentumCycleGuarded,
   buildIntradayMomentumReport,
   getIntradayMomentumStore,
   IM_INTERVAL,
 } from "../lib/intraday-momentum-edge.js";
+import {
+  runShortFadeCycleGuarded,
+  buildShortFadeReport,
+  getShortFadeStore,
+  SF_INTERVAL,
+} from "../lib/short-fade-edge.js";
 import { buildLaneVariantPboReport } from "../lib/walk-forward-validation.js";
 import { buildMicrostructureSnapshot } from "../lib/order-flow-microstructure.js";
 import { computeDecisionScore } from "../lib/decision-scoring.js";
@@ -1233,6 +1240,12 @@ export async function registerShadowRoutes(
     return { generatedAt: new Date().toISOString(), ...buildIntradayMomentumReport(getIntradayMomentumStore().all) };
   });
 
+  // SHORT confirmed-exhaustion + crowded-funding fade report — report-only measurement, nothing
+  // trades on it. See short-fade-edge.ts for the entry-signal rationale.
+  app.get("/api/shadow/short-fade-report", async () => {
+    return { generatedAt: new Date().toISOString(), ...buildShortFadeReport(getShortFadeStore().all) };
+  });
+
   // Probability of Backtest Overfitting (CSCV) across the CG variant-matrix lanes — the honest audit
   // of "is this lane's edge real, or does it just look best in this sample" (e.g. CG_WIDE_LONG_RUNNER).
   // Report-only; never gates execution. Query: minObsPerVariant (default 30), bucketDays (default 7).
@@ -1246,7 +1259,20 @@ export async function registerShadowRoutes(
     return { generatedAt: new Date().toISOString(), ...buildLaneVariantPboReport(observations, { minObsPerVariant, bucketMs }) };
   });
 
-  app.get("/api/shadow/neural-map", async () => {
+  // Single-flight + short TTL cache: the dashboard auto-refreshes this endpoint every 5s, but the
+  // underlying data (variant-matrix report over 129k+ obs, paper performance, live Binance mark
+  // prices) only actually changes on the ~7min paper-cycle tick. Profiling (2026-07-06) found this
+  // one call took 5-10s end to end, so uncached 5s polling meant requests were permanently queued
+  // up behind each other. A short TTL collapses that queue to one real computation per window;
+  // concurrent callers inside the window share the same in-flight promise instead of re-triggering
+  // the expensive work (and the live Binance mark-price fetch) redundantly.
+  // Slightly above the dashboard's 5s auto-refresh interval so a single steady-polling tab
+  // reliably hits cache on most polls even with some jitter in how long the computation takes.
+  const NEURAL_MAP_CACHE_TTL_MS = 6_000;
+  let neuralMapCache: { builtAtMs: number; result: ReturnType<typeof buildNeuralMapTelemetry> } | null = null;
+  let neuralMapInFlight: Promise<ReturnType<typeof buildNeuralMapTelemetry>> | null = null;
+
+  async function computeNeuralMapTelemetry(): Promise<ReturnType<typeof buildNeuralMapTelemetry>> {
     const generatedAt = new Date().toISOString();
     const cached = getLatestScanCandidates();
     const scanStatus = opts.coreScanAutoRefreshController?.getStatus() ?? null;
@@ -1308,6 +1334,23 @@ export async function registerShadowRoutes(
           : []),
       ],
     });
+  }
+
+  app.get("/api/shadow/neural-map", async () => {
+    const nowMs = Date.now();
+    if (neuralMapCache && nowMs - neuralMapCache.builtAtMs < NEURAL_MAP_CACHE_TTL_MS) {
+      return neuralMapCache.result;
+    }
+    if (neuralMapInFlight) return neuralMapInFlight;
+    neuralMapInFlight = computeNeuralMapTelemetry()
+      .then((result) => {
+        neuralMapCache = { builtAtMs: Date.now(), result };
+        return result;
+      })
+      .finally(() => {
+        neuralMapInFlight = null;
+      });
+    return neuralMapInFlight;
   });
 
   app.get("/api/shadow/paper-controls", async () => {
@@ -1577,6 +1620,20 @@ export async function registerShadowRoutes(
               });
               return { takerBuyRatio: micro.takerFlow.takerBuyRatio, spreadBps: micro.spreadBps, decisionScore: decisionScore.totalScore };
             },
+          }).catch(() => undefined);
+        }
+        // SHORT confirmed-exhaustion + crowded-funding fade (2026-07-06, internet-research-informed):
+        // varies the ENTRY signal (RSI exhaustion cross-back-down + crowded-long funding/OI gate) on
+        // a majors/liquid-only universe, keeping the ALREADY-proven CG_WIDE_FAST_SHORT exit geometry.
+        // Report-only, fire-and-forget, env-gated, own store/cycle/resolver — does NOT pass through
+        // the allocator, paper book, live engine, or any strategy gate. See short-fade-edge.ts.
+        if (process.env.SHORT_FADE_DISABLED !== "1") {
+          const _sfc = opts.binanceClient;
+          void runShortFadeCycleGuarded({
+            store: getShortFadeStore(),
+            now: Date.now(),
+            fetchCandles: async (symbol: string) => _sfc.getCandles(symbol, SF_INTERVAL, 120),
+            crowdingClient: _sfc,
           }).catch(() => undefined);
         }
         // Cross-sectional market-neutral measurement lane: rank the universe by N-bar momentum, go
@@ -1878,6 +1935,12 @@ export async function registerShadowRoutes(
               symbolHistoricalNetMap: _symbolHistoricalNetMap,
               currentPaperOrders: paperStore.getState().orders,
               mixedRegimeReport,
+              // Per-lane symbol auto-curation: unset (default) on the diagnostic instance itself —
+              // it must keep exploring the full symbol universe on every lane. testnet/live opt in
+              // via .env and consume the cached report fetched from the diagnostic instance.
+              laneSymbolCurationTier: (process.env.LANE_SYMBOL_CURATION_TIER as "testnet" | "live" | undefined) ?? null,
+              laneSymbolCurationReport: getLaneSymbolCurationCacheStore().get().report,
+              laneSymbolCurationReportGeneratedAt: getLaneSymbolCurationCacheStore().get().fetchedAt,
             });
             admissionTrace.allocatorFinishedAt = new Date().toISOString();
             if (allocatorReport.selectedOpportunities.length > 0) {

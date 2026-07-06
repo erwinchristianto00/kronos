@@ -192,7 +192,7 @@ export class RegimeEdgeMemoryStore {
     const dir = dirname(this.file);
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
     const tmp = `${this.file}.tmp`;
-    writeFileSync(tmp, JSON.stringify(this.state, null, 2), "utf-8");
+    writeFileSync(tmp, JSON.stringify(this.state), "utf-8");
     renameSync(tmp, this.file);
   }
 

@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -584,7 +584,9 @@ export class NotificationService {
   private persistState(): void {
     try {
       mkdirSync(dirname(this.stateFile), { recursive: true });
-      writeFileSync(this.stateFile, JSON.stringify(this.state, null, 2), "utf-8");
+      const tmp = `${this.stateFile}.tmp`;
+      writeFileSync(tmp, JSON.stringify(this.state), "utf-8");
+      renameSync(tmp, this.stateFile);
     } catch (error) {
       this.warn(`[notifications] state persistence failed: ${sanitizedError(error)}`);
     }

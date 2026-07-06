@@ -11,6 +11,7 @@ import {
 } from "./current-guard-variant-matrix.js";
 import type { MixedBudgetForwardValidationReport, MixedRegimeReport, OpenOrderStaleAudit } from "./mixed-regime-router.js";
 import type { PaperOrder, PaperPerformanceReport } from "./paper-execution-router.js";
+import { buildPerSymbolLaneBookEdge } from "./per-symbol-lane-book-edge.js";
 import { assessPaperTp, cgWideTpPctFromOrder } from "./paper-trading-controls.js";
 import type { RegimeDirectionControllerReport } from "./regime-direction-controller.js";
 import {
@@ -60,6 +61,12 @@ export interface NeuralMapNode {
 
 export type NeuralLaneStatsSource = "VM_SIM" | "PAPER_BOOK" | "H6_RESEARCH" | "REGIME_DIAGNOSTIC";
 
+export interface NeuralMapProvenSymbol {
+  symbol: string;
+  /** LIVE_READY = promotable (headline-confirmed); TESTNET_ONLY = testnetCandidate but not yet. */
+  tier: "LIVE_READY" | "TESTNET_ONLY";
+}
+
 export interface NeuralLaneCohortStats {
   n: number;
   netAvgR: number | null;
@@ -108,6 +115,13 @@ export interface NeuralMapLane {
     bearish: RotationShortlistSymbol[];
     bullish: RotationShortlistSymbol[];
   };
+  /**
+   * Symbols where this lane's REALIZED book is currently proven positive, tagged by how far each
+   * has cleared: LIVE_READY (promotable — headline-confirmed, the bar lane-symbol-curation-cache.ts
+   * uses to gate LIVE) vs TESTNET_ONLY (testnetCandidate — book-positive but not yet headline-
+   * confirmed, the bar used to gate testnet). Empty ⇒ no symbol has cleared either bar yet.
+   */
+  provenSymbols: NeuralMapProvenSymbol[];
   payoffRatio: number | null;
   plus10bpsStillPositive: boolean | null;
   allThreeOosPositive: boolean | null;
@@ -1081,6 +1095,19 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
   const background = timing?.backgroundQueue;
   const guardrail = input.mixedValidation.guardrail;
 
+  // Per-lane proven symbols, tagged by the SAME two bars lane-symbol-curation-cache.ts gates on:
+  // LIVE_READY (promotable — headline-confirmed) vs TESTNET_ONLY (testnetCandidate but not yet
+  // headline-confirmed). promotable implies testnetCandidate, so a symbol only ever gets ONE tag —
+  // its highest cleared tier — never both.
+  const provenSymbolsByLane = new Map<string, NeuralMapProvenSymbol[]>();
+  for (const cell of buildPerSymbolLaneBookEdge(input.orders).cells) {
+    if (!cell.testnetCandidate) continue;
+    const entry: NeuralMapProvenSymbol = { symbol: cell.symbol, tier: cell.promotable ? "LIVE_READY" : "TESTNET_ONLY" };
+    const list = provenSymbolsByLane.get(cell.laneId);
+    if (list) list.push(entry);
+    else provenSymbolsByLane.set(cell.laneId, [entry]);
+  }
+
   // Diagnostic performance split by trade direction (SHORT vs LONG). Computed from the orders
   // themselves so the counts/realized PnL are diagnostic-scoped (they always reconcile with the
   // diagnostic dollar figure) — the previous tile mixed the diagnostic $ with TOTAL open/closed
@@ -1246,6 +1273,7 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
             bullish: rotationShortlist.bullish,
           }
         : undefined,
+      provenSymbols: provenSymbolsByLane.get(id) ?? [],
       payoffRatio: row?.payoffRatio ?? null,
       plus10bpsStillPositive: row?.plus10bpsStillPositive ?? null,
       allThreeOosPositive: row?.allThreeOosPositive ?? null,

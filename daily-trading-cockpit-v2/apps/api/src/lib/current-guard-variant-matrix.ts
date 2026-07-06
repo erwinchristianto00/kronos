@@ -2479,8 +2479,18 @@ export function buildCurrentGuardVariantMatrixReport(
         : null,
   };
 
+  // Group once (O(n)) instead of re-scanning the full (129k+ and growing) store once per lane
+  // definition (O(n * lane count)) — this single line was the dominant cost of this report,
+  // ~4s of the ~9s /api/shadow/neural-map takes to respond (found 2026-07-06 profiling why the
+  // dashboard's 5s auto-refresh was consistently outrunning its own request).
+  const byVariantId = new Map<VariantMatrixVariantId, CurrentGuardVariantMatrixObservation[]>();
+  for (const o of all) {
+    const list = byVariantId.get(o.variantId);
+    if (list) list.push(o);
+    else byVariantId.set(o.variantId, [o]);
+  }
   const rows = VARIANT_MATRIX_DEFINITIONS.map((def) =>
-    buildRow(def, all.filter((o) => o.variantId === def.id), infra),
+    buildRow(def, byVariantId.get(def.id) ?? [], infra),
   );
 
   const baselineRow = rows.find((r) => r.variantId === BASELINE_VARIANT_ID) ?? null;

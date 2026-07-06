@@ -24,7 +24,7 @@
  * resolver) and is invoked from the shadow refresh path.
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 
@@ -217,7 +217,12 @@ export class JsonKronosCounterfactualStore implements KronosCounterfactualStore 
   }
 
   writeState(state: KronosCounterfactualStoreState): void {
-    writeFileSync(this.file, JSON.stringify(state, null, 2), "utf-8");
+    // Atomic write: was a direct writeFileSync on the main file with no tmp+rename, so a crash
+    // mid-write could truncate/corrupt this ~2.4MB store. Matches the pattern used elsewhere
+    // (paper-execution-router.ts, current-guard-variant-matrix.ts).
+    const tmp = `${this.file}.tmp`;
+    writeFileSync(tmp, JSON.stringify(state), "utf-8");
+    renameSync(tmp, this.file);
   }
 
   readAll(): KronosCounterfactualObservation[] {

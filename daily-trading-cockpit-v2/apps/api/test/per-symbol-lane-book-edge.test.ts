@@ -1,5 +1,9 @@
 import { describe, it, expect } from "vitest";
-import { buildPerSymbolLaneBookEdge, type PsleOrder } from "../src/lib/per-symbol-lane-book-edge.js";
+import {
+  buildPerSymbolLaneBookEdge,
+  getCuratedSymbolsForLane,
+  type PsleOrder,
+} from "../src/lib/per-symbol-lane-book-edge.js";
 
 /** Uniform closed orders (all the same netR → all win or all loss). Used for edge/suspicious cases. */
 function orders(
@@ -124,5 +128,62 @@ describe("per-symbol × lane BOOK edge", () => {
     ]);
     expect(r.cells.find((c) => c.symbol === "BTCUSDT")!.bucket).toBe("MAJOR");
     expect(r.cells.find((c) => c.symbol === "SUIUSDT")!.bucket).toBe("ALT");
+  });
+});
+
+describe("getCuratedSymbolsForLane", () => {
+  const NOW = new Date("2026-07-06T12:00:00.000Z").getTime();
+  const FRESH_AT = new Date(NOW - 30 * 60_000).toISOString(); // 30min old
+  const STALE_AT = new Date(NOW - 3 * 60 * 60_000).toISOString(); // 3h old
+  const MAX_STALENESS_MS = 2 * 60 * 60 * 1000; // 2h
+
+  function reportFor(orders: PsleOrder[]) {
+    return buildPerSymbolLaneBookEdge(orders);
+  }
+
+  it("returns null (STALE_OR_MISSING) when the report is missing", () => {
+    const d = getCuratedSymbolsForLane(null, null, "CG_WIDE_FAST_SHORT", "testnet", MAX_STALENESS_MS, NOW);
+    expect(d.curated).toBeNull();
+    expect(d.reason).toBe("STALE_OR_MISSING");
+  });
+
+  it("returns null (STALE_OR_MISSING) when the cached report is older than maxStalenessMs", () => {
+    const r = reportFor(wl("CG_WIDE_FAST_SHORT", "LINKUSDT", 30, 0.2, 10, 0.15));
+    const d = getCuratedSymbolsForLane(r, STALE_AT, "CG_WIDE_FAST_SHORT", "testnet", MAX_STALENESS_MS, NOW);
+    expect(d.curated).toBeNull();
+    expect(d.reason).toBe("STALE_OR_MISSING");
+  });
+
+  it("returns null (NO_DATA_FOR_LANE) when the lane has zero measured cells", () => {
+    const r = reportFor(wl("CG_WIDE_FAST_SHORT", "LINKUSDT", 30, 0.2, 10, 0.15));
+    const d = getCuratedSymbolsForLane(r, FRESH_AT, "CG_LONG_VARIANT_MATRIX:CG_WIDE_LONG_RUNNER", "testnet", MAX_STALENESS_MS, NOW);
+    expect(d.curated).toBeNull();
+    expect(d.reason).toBe("NO_DATA_FOR_LANE");
+  });
+
+  it("testnet tier admits testnetCandidate (diagnostic-proven) symbols even without headline confirmation", () => {
+    const r = reportFor([
+      ...wl("CG_WIDE_FAST_SHORT", "LINKUSDT", 30, 0.2, 10, 0.15), // diagnostic book-positive
+      ...wl("CG_WIDE_FAST_SHORT", "SUIUSDT", 10, 0.1, 30, 0.2), // book-negative
+    ]);
+    const d = getCuratedSymbolsForLane(r, FRESH_AT, "CG_WIDE_FAST_SHORT", "testnet", MAX_STALENESS_MS, NOW);
+    expect(d.reason).toBe("OK");
+    expect(d.curated).toEqual(["LINKUSDT"]);
+  });
+
+  it("live tier requires headline confirmation — a diagnostic-only positive is NOT enough", () => {
+    const r = reportFor(wl("CG_WIDE_FAST_SHORT", "LINKUSDT", 30, 0.2, 10, 0.15)); // all diagnostic
+    const d = getCuratedSymbolsForLane(r, FRESH_AT, "CG_WIDE_FAST_SHORT", "live", MAX_STALENESS_MS, NOW);
+    expect(d.reason).toBe("OK");
+    expect(d.curated).toEqual([]); // lane HAS data, but nothing qualifies for live yet
+  });
+
+  it("live tier admits a symbol once headline-confirmed", () => {
+    const r = reportFor([
+      ...wl("CG_WIDE_FAST_SHORT", "LINKUSDT", 30, 0.2, 10, 0.15, { headline: true }),
+      ...wl("CG_WIDE_FAST_SHORT", "LINKUSDT", 30, 0.2, 10, 0.15),
+    ]);
+    const d = getCuratedSymbolsForLane(r, FRESH_AT, "CG_WIDE_FAST_SHORT", "live", MAX_STALENESS_MS, NOW);
+    expect(d.curated).toEqual(["LINKUSDT"]);
   });
 });

@@ -696,4 +696,74 @@ describe("neural map telemetry", () => {
       else process.env.NEURAL_MAP_MARK_TIMEOUT_MS = previousTimeout;
     }
   });
+
+  function mkProvenOrders(
+    laneId: string,
+    symbol: string,
+    wins: number,
+    w: number,
+    losses: number,
+    l: number,
+    headline = false,
+  ) {
+    return Array.from({ length: wins + losses }, (_, i) => ({
+      id: `${laneId}-${symbol}-${headline ? "hl" : "diag"}-${i}`,
+      observationId: `obs-${laneId}-${symbol}-${headline ? "hl" : "diag"}-${i}`,
+      sourceObservationKey: `${symbol}|SHORT|2026-06-06T11:00:00.000Z`,
+      sourceType: "ALLOCATOR_LANE",
+      selectedLaneId: laneId,
+      symbol,
+      direction: "SHORT",
+      regime: "Bearish pressure",
+      entryPrice: 100,
+      stopLoss: 103,
+      takeProfitLevels: [97],
+      paperStatus: i < wins ? "PAPER_CLOSED_WIN" : "PAPER_CLOSED_LOSS",
+      plannedStopDistanceBps: 300,
+      openedAt: "2026-06-06T11:00:00.000Z",
+      updatedAt: "2026-06-06T12:00:00.000Z",
+      ...(headline ? {} : { paperOrderMode: "DIAGNOSTIC_ONLY" }),
+      paperRiskLabel: "NORMAL",
+      netPnlAmount: 0,
+      grossR: 1,
+      costR: 0,
+      netR: i < wins ? w : -l,
+      closeReason: i < wins ? "TP_HIT" : "SL_HIT",
+      reportOnly: true,
+      paperOnly: true,
+    }) as never);
+  }
+
+  it("surfaces provenSymbols per lane from the realized book, tagged TESTNET_ONLY without headline confirmation", () => {
+    const input = baseInput();
+    input.orders = [
+      // Book-positive, adequate sample, realistic win/loss mix, diagnostic-only → TESTNET_ONLY.
+      ...mkProvenOrders("CG_VARIANT_MATRIX:CG_WIDE_FAST_SHORT", "LINKUSDT", 30, 0.2, 10, 0.15),
+      // Book-negative → must NOT appear in provenSymbols even though it has plenty of data.
+      ...mkProvenOrders("CG_VARIANT_MATRIX:CG_WIDE_FAST_SHORT", "SUIUSDT", 10, 0.1, 30, 0.2),
+    ];
+    const result = buildNeuralMapTelemetry(input);
+    const lane = result.lanes.find((l) => l.id === "CG_VARIANT_MATRIX:CG_WIDE_FAST_SHORT");
+    expect(lane?.provenSymbols).toContainEqual({ symbol: "LINKUSDT", tier: "TESTNET_ONLY" });
+    expect(lane?.provenSymbols?.some((s) => s.symbol === "SUIUSDT")).toBe(false);
+  });
+
+  it("tags a symbol LIVE_READY once its headline (real-money-grade) trades also confirm it", () => {
+    const input = baseInput();
+    input.orders = [
+      ...mkProvenOrders("CG_VARIANT_MATRIX:CG_WIDE_FAST_SHORT", "LINKUSDT", 30, 0.2, 10, 0.15, true),
+      ...mkProvenOrders("CG_VARIANT_MATRIX:CG_WIDE_FAST_SHORT", "LINKUSDT", 30, 0.2, 10, 0.15),
+    ];
+    const result = buildNeuralMapTelemetry(input);
+    const lane = result.lanes.find((l) => l.id === "CG_VARIANT_MATRIX:CG_WIDE_FAST_SHORT");
+    expect(lane?.provenSymbols).toContainEqual({ symbol: "LINKUSDT", tier: "LIVE_READY" });
+  });
+
+  it("provenSymbols is empty (not missing) for a lane with no book-positive symbol yet", () => {
+    const input = baseInput();
+    const result = buildNeuralMapTelemetry(input);
+    for (const lane of result.lanes) {
+      expect(Array.isArray(lane.provenSymbols)).toBe(true);
+    }
+  });
 });

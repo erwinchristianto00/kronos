@@ -12,7 +12,7 @@
  * Independent module: its own store, cycle, resolver, report.
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 
 import type { Candle } from "@dtc/shared";
@@ -245,7 +245,9 @@ export class IntradayMomentumStore {
   }
   save(): void {
     mkdirSync(dirname(this.file), { recursive: true });
-    writeFileSync(this.file, JSON.stringify(this.state, null, 2), "utf-8");
+    const tmp = `${this.file}.tmp`;
+    writeFileSync(tmp, JSON.stringify(this.state), "utf-8");
+    renameSync(tmp, this.file);
   }
 }
 

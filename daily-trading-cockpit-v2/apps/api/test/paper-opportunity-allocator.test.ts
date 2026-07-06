@@ -48,6 +48,7 @@ import { buildAdaptiveLaneRouterReport } from "../src/lib/adaptive-lane-router.j
 import { buildRegimeDirectionControllerReport } from "../src/lib/regime-direction-controller.js";
 import { buildLiveTradingGateReport } from "../src/lib/live-trading-gate.js";
 import { buildOperatorBrief } from "../src/lib/operator-brief.js";
+import { buildPerSymbolLaneBookEdge, type PsleOrder } from "../src/lib/per-symbol-lane-book-edge.js";
 import {
   buildMixedRegimeReport,
   MIXED_LONG_WIDE_LANE,
@@ -2918,5 +2919,160 @@ describe("paper-opportunity-allocator", () => {
       expect(o.paperOnly).toBe(true);
       expect(o.paperStatus).not.toBe("PAPER_SUBMITTED");
     }
+  });
+});
+
+// ── Lane symbol auto-curation (2026-07-06): testnet/live gate each lane's admission to the ──
+// symbols currently proven positive on the diagnostic instance's realized book. Unset tier ⇒
+// no gating (default, and always the case on the diagnostic instance itself).
+describe("paper-opportunity-allocator — lane symbol curation", () => {
+  function curationOrders(laneId: string, symbol: string, wins: number, w: number, losses: number, l: number, headline = false): PsleOrder[] {
+    const mk = (netR: number, n: number): PsleOrder[] =>
+      Array.from({ length: n }, () => ({
+        symbol,
+        selectedLaneId: laneId,
+        direction: "SHORT" as const,
+        paperStatus: netR > 0 ? "PAPER_CLOSED_WIN" : "PAPER_CLOSED_LOSS",
+        netR,
+        ...(headline ? {} : { paperOrderMode: "DIAGNOSTIC_ONLY" }),
+      }));
+    return [...mk(w, wins), ...mk(-l, losses)];
+  }
+
+  const FRESH_AT = new Date().toISOString();
+
+  it("uncurated when laneSymbolCurationTier is unset (default, matches pre-existing behavior)", async () => {
+    const dir = tmpDir();
+    const vmReport = await buildWinningVmReport(dir);
+    const report = buildPaperOpportunityAllocatorReport(
+      baseInputs({
+        vmReport,
+        candidates: [makeCandidate({ symbol: "ETHUSDT", direction: "SHORT", stopLoss: 103, tp1: 96 })],
+        paperVariantMatrixDiagnosticEnabled: true,
+        laneSymbolCurationReport: buildPerSymbolLaneBookEdge(
+          curationOrders("CG_VARIANT_MATRIX:CG_WIDE_FAST_SHORT", "LINKUSDT", 30, 0.2, 10, 0.15),
+        ),
+        laneSymbolCurationReportGeneratedAt: FRESH_AT,
+      }),
+    );
+    const laneIds = report.selectedOpportunities.map((o) => o.laneId);
+    expect(laneIds).toContain("CG_VARIANT_MATRIX:CG_WIDE_FAST_SHORT");
+  });
+
+  it("testnet tier rejects a non-curated symbol", async () => {
+    const dir = tmpDir();
+    const vmReport = await buildWinningVmReport(dir);
+    const report = buildPaperOpportunityAllocatorReport(
+      baseInputs({
+        vmReport,
+        candidates: [makeCandidate({ symbol: "ETHUSDT", direction: "SHORT", stopLoss: 103, tp1: 96 })],
+        paperVariantMatrixDiagnosticEnabled: true,
+        laneSymbolCurationTier: "testnet",
+        laneSymbolCurationReport: buildPerSymbolLaneBookEdge(
+          curationOrders("CG_VARIANT_MATRIX:CG_WIDE_FAST_SHORT", "LINKUSDT", 30, 0.2, 10, 0.15),
+        ),
+        laneSymbolCurationReportGeneratedAt: FRESH_AT,
+      }),
+    );
+    const laneIds = report.selectedOpportunities.map((o) => o.laneId);
+    expect(laneIds).not.toContain("CG_VARIANT_MATRIX:CG_WIDE_FAST_SHORT");
+  });
+
+  it("testnet tier admits a symbol that IS in the curated (testnetCandidate) set", async () => {
+    const dir = tmpDir();
+    const vmReport = await buildWinningVmReport(dir);
+    const report = buildPaperOpportunityAllocatorReport(
+      baseInputs({
+        vmReport,
+        candidates: [makeCandidate({ symbol: "LINKUSDT", direction: "SHORT", stopLoss: 103, tp1: 96 })],
+        paperVariantMatrixDiagnosticEnabled: true,
+        laneSymbolCurationTier: "testnet",
+        laneSymbolCurationReport: buildPerSymbolLaneBookEdge(
+          curationOrders("CG_VARIANT_MATRIX:CG_WIDE_FAST_SHORT", "LINKUSDT", 30, 0.2, 10, 0.15),
+        ),
+        laneSymbolCurationReportGeneratedAt: FRESH_AT,
+      }),
+    );
+    const laneIds = report.selectedOpportunities.map((o) => o.laneId);
+    expect(laneIds).toContain("CG_VARIANT_MATRIX:CG_WIDE_FAST_SHORT");
+  });
+
+  it("live tier requires headline confirmation — diagnostic-only positive is not enough for real money", async () => {
+    const dir = tmpDir();
+    const vmReport = await buildWinningVmReport(dir);
+    const report = buildPaperOpportunityAllocatorReport(
+      baseInputs({
+        vmReport,
+        candidates: [makeCandidate({ symbol: "LINKUSDT", direction: "SHORT", stopLoss: 103, tp1: 96 })],
+        paperVariantMatrixDiagnosticEnabled: true,
+        laneSymbolCurationTier: "live",
+        laneSymbolCurationReport: buildPerSymbolLaneBookEdge(
+          curationOrders("CG_VARIANT_MATRIX:CG_WIDE_FAST_SHORT", "LINKUSDT", 30, 0.2, 10, 0.15), // diagnostic only
+        ),
+        laneSymbolCurationReportGeneratedAt: FRESH_AT,
+      }),
+    );
+    const laneIds = report.selectedOpportunities.map((o) => o.laneId);
+    expect(laneIds).not.toContain("CG_VARIANT_MATRIX:CG_WIDE_FAST_SHORT");
+  });
+
+  it("live tier admits once the same symbol is headline-confirmed", async () => {
+    const dir = tmpDir();
+    const vmReport = await buildWinningVmReport(dir);
+    const report = buildPaperOpportunityAllocatorReport(
+      baseInputs({
+        vmReport,
+        candidates: [makeCandidate({ symbol: "LINKUSDT", direction: "SHORT", stopLoss: 103, tp1: 96 })],
+        paperVariantMatrixDiagnosticEnabled: true,
+        laneSymbolCurationTier: "live",
+        laneSymbolCurationReport: buildPerSymbolLaneBookEdge([
+          ...curationOrders("CG_VARIANT_MATRIX:CG_WIDE_FAST_SHORT", "LINKUSDT", 30, 0.2, 10, 0.15, true),
+          ...curationOrders("CG_VARIANT_MATRIX:CG_WIDE_FAST_SHORT", "LINKUSDT", 30, 0.2, 10, 0.15),
+        ]),
+        laneSymbolCurationReportGeneratedAt: FRESH_AT,
+      }),
+    );
+    const laneIds = report.selectedOpportunities.map((o) => o.laneId);
+    expect(laneIds).toContain("CG_VARIANT_MATRIX:CG_WIDE_FAST_SHORT");
+  });
+
+  it("falls back to uncurated for a lane with zero measured cells (protects thin-data lanes like the current WATCHABLE LONG lanes)", async () => {
+    const dir = tmpDir();
+    const vmReport = await buildWinningVmReport(dir);
+    const report = buildPaperOpportunityAllocatorReport(
+      baseInputs({
+        vmReport,
+        candidates: [makeCandidate({ symbol: "ZZZUSDT", direction: "SHORT", stopLoss: 103, tp1: 96 })],
+        paperVariantMatrixDiagnosticEnabled: true,
+        laneSymbolCurationTier: "testnet",
+        // curation data exists, but ONLY for a different lane — CG_WIDE_FAST_SHORT itself has zero cells
+        laneSymbolCurationReport: buildPerSymbolLaneBookEdge(
+          curationOrders("CG_VARIANT_MATRIX:CG_TIGHT_FAST_05", "LINKUSDT", 30, 0.2, 10, 0.15),
+        ),
+        laneSymbolCurationReportGeneratedAt: FRESH_AT,
+      }),
+    );
+    const laneIds = report.selectedOpportunities.map((o) => o.laneId);
+    expect(laneIds).toContain("CG_VARIANT_MATRIX:CG_WIDE_FAST_SHORT");
+  });
+
+  it("falls back to uncurated when the cached report is stale", async () => {
+    const dir = tmpDir();
+    const vmReport = await buildWinningVmReport(dir);
+    const staleAt = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString(); // 3h old > 2h max staleness
+    const report = buildPaperOpportunityAllocatorReport(
+      baseInputs({
+        vmReport,
+        candidates: [makeCandidate({ symbol: "ETHUSDT", direction: "SHORT", stopLoss: 103, tp1: 96 })],
+        paperVariantMatrixDiagnosticEnabled: true,
+        laneSymbolCurationTier: "testnet",
+        laneSymbolCurationReport: buildPerSymbolLaneBookEdge(
+          curationOrders("CG_VARIANT_MATRIX:CG_WIDE_FAST_SHORT", "LINKUSDT", 30, 0.2, 10, 0.15),
+        ),
+        laneSymbolCurationReportGeneratedAt: staleAt,
+      }),
+    );
+    const laneIds = report.selectedOpportunities.map((o) => o.laneId);
+    expect(laneIds).toContain("CG_VARIANT_MATRIX:CG_WIDE_FAST_SHORT");
   });
 });

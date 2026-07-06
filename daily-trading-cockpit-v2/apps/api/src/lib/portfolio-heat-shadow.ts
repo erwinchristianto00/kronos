@@ -10,7 +10,7 @@
 // Persisted to data/portfolio-heat-shadow-snapshots.json. The CLI viewer is
 // scripts/portfolio-heat-shadow.mjs. Keep the math here in sync with that viewer's HONEST READ.
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 
 // Minimal shape of the fields we read off a paper order (decoupled from the full PaperOrder type).
@@ -222,7 +222,9 @@ export function recordHeatShadowSnapshot(
 
   try {
     mkdirSync(dirname(file), { recursive: true });
-    writeFileSync(file, JSON.stringify(doc, null, 2), "utf-8");
+    const tmp = `${file}.tmp`;
+    writeFileSync(tmp, JSON.stringify(doc), "utf-8");
+    renameSync(tmp, file);
   } catch {
     return null;
   }

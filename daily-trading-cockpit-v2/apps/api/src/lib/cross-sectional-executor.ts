@@ -16,7 +16,7 @@
  *  - Consumes the SAME store the measurement lane writes (getCrossSectionalStore)
  *    so what executes is exactly what was measured — no separate signal path.
  */
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 
 import type { BinanceFuturesPrivateClient } from "./binance-futures-private.js";
@@ -129,9 +129,14 @@ export class CrossSectionalExecutorStore {
 
   save(): void {
     try {
+      // Atomic write: the previous version wrote the same content to both a .tmp file and
+      // directly to this.file, so the .tmp write was dead weight and the main write was never
+      // atomic (a crash mid-write could truncate/corrupt this.file). Now the tmp file is the
+      // actual write target and gets renamed into place, matching the pattern used elsewhere
+      // (paper-execution-router.ts, current-guard-variant-matrix.ts).
       const tmp = `${this.file}.tmp`;
-      writeFileSync(tmp, JSON.stringify(this.state, null, 2), "utf-8");
-      writeFileSync(this.file, JSON.stringify(this.state, null, 2), "utf-8");
+      writeFileSync(tmp, JSON.stringify(this.state), "utf-8");
+      renameSync(tmp, this.file);
     } catch {
       // never let a persistence failure break the tick
     }

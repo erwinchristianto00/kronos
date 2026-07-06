@@ -281,6 +281,62 @@
   font-size: 12px;
 }
 
+.neural-shortfade-card {
+  display: grid;
+  gap: 8px;
+  margin: 14px 14px 0;
+  padding: 12px 14px;
+  border: 1px solid rgba(87, 184, 255, 0.35);
+  border-radius: 8px;
+  background: rgba(7, 16, 22, 0.76);
+}
+
+.neural-shortfade-head span {
+  display: block;
+  color: #728993;
+  font: 700 9px/1.25 "IBM Plex Mono", "Cascadia Code", monospace;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.neural-shortfade-head strong {
+  display: inline-block;
+  margin-top: 6px;
+  font-size: 13px;
+}
+
+.neural-shortfade-head small {
+  display: block;
+  margin-top: 4px;
+  color: #8ea3ac;
+  font-size: 10px;
+}
+
+.neural-shortfade-stats {
+  display: flex;
+  gap: 18px;
+}
+
+.neural-shortfade-stats span {
+  display: block;
+  color: #70858f;
+  font: 600 9px/1.3 "IBM Plex Mono", "Cascadia Code", monospace;
+  text-transform: uppercase;
+}
+
+.neural-shortfade-stats strong {
+  display: block;
+  margin-top: 2px;
+  color: #e6f4ee;
+  font-size: 13px;
+}
+
+.neural-shortfade-recent {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
 .neural-milestone-panel {
   display: grid;
   gap: 12px;
@@ -434,6 +490,35 @@
   font-size: 10px;
   line-height: 1.35;
   overflow-wrap: anywhere;
+}
+
+.neural-decision-symbols {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+}
+
+.neural-symbol-badge {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 10px;
+  font: 700 9px/1.6 "IBM Plex Mono", "Cascadia Code", monospace;
+  letter-spacing: 0.02em;
+}
+
+/* Headline-confirmed, real-money grade — the same bar that gates LIVE admission. */
+.neural-symbol-badge.tier-live-ready {
+  color: #5ce4a6;
+  background: rgba(92, 228, 166, 0.14);
+  border: 1px solid rgba(92, 228, 166, 0.4);
+}
+
+/* Book-positive on the diagnostic sleeve only — gates TESTNET admission, not LIVE. */
+.neural-symbol-badge.tier-testnet-only {
+  color: #6fb7c9;
+  background: rgba(111, 183, 201, 0.12);
+  border: 1px solid rgba(111, 183, 201, 0.35);
 }
 
 .neural-decision-empty {

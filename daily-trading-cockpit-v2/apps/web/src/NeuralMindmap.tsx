@@ -57,6 +57,11 @@ interface RotationShortlistSymbol {
   reason: string;
 }
 
+interface NeuralProvenSymbol {
+  symbol: string;
+  tier: 'LIVE_READY' | 'TESTNET_ONLY';
+}
+
 interface NeuralLane {
   id: string;
   label: string;
@@ -82,6 +87,11 @@ interface NeuralLane {
     LONG_MIXED?: LaneCohortStats | null;
     SHORT_MIXED?: LaneCohortStats | null;
   };
+  /**
+   * Symbols where this lane's realized book is currently proven positive, tagged by tier:
+   * LIVE_READY = headline-confirmed (real money-grade), TESTNET_ONLY = book-positive but not yet.
+   */
+  provenSymbols?: NeuralProvenSymbol[];
   rotationShortlist?: {
     bearish: RotationShortlistSymbol[];
     bullish: RotationShortlistSymbol[];
@@ -439,6 +449,27 @@ function fmtBook(lane: NeuralLane): string {
   const cl = lane.closed !== null && lane.closed !== undefined ? ` · ${lane.closed}cl` : '';
   return `book ${fmtR(lane.netAvgR)}${cl}${pf}`;
 }
+function renderProvenSymbols(symbols: NeuralProvenSymbol[] | undefined) {
+  if (!symbols || symbols.length === 0) {
+    return <small className="neural-decision-symbols">Symbols: none proven yet (book-negative or insufficient data)</small>;
+  }
+  const sorted = [...symbols].sort((a, b) => (a.tier === b.tier ? 0 : a.tier === 'LIVE_READY' ? -1 : 1));
+  return (
+    <small className="neural-decision-symbols">
+      Symbols:{' '}
+      {sorted.map((s) => (
+        <span
+          key={s.symbol}
+          className={`neural-symbol-badge ${s.tier === 'LIVE_READY' ? 'tier-live-ready' : 'tier-testnet-only'}`}
+          title={s.tier === 'LIVE_READY' ? 'Headline-confirmed — real-money grade, gates LIVE admission' : 'Book-positive on the diagnostic sleeve — gates TESTNET admission only, not yet live-ready'}
+        >
+          {s.symbol.replace(/USDT$/, '')}
+          {s.tier === 'LIVE_READY' ? ' ✓' : ''}
+        </span>
+      ))}
+    </small>
+  );
+}
 function bookTone(lane: NeuralLane): string {
   if (lane.netAvgR === null || !Number.isFinite(lane.netAvgR)) return 'tone-measure';
   return lane.netAvgR >= 0 ? 'tone-healthy' : 'tone-critical';
@@ -547,15 +578,23 @@ function laneDecisionRows(lanes: NeuralLane[], context: LaneDecisionContext['key
     .map((lane) => {
       const info = cohortForDecision(lane, context);
       const verdict = laneContextVerdict(lane, info.cohort);
+      const hasProvenSymbols = (lane.provenSymbols?.length ?? 0) > 0;
+      // The lane's BLANKET (sim) verdict can be negative/blocked while specific symbols are
+      // realized-book proven (exactly why lane-symbol-curation exists — CG_WIDE_FAST_SHORT is
+      // aggregate-negative but LINK/BTC/SEI are individually positive). Don't let a bad blanket
+      // verdict hide a lane that has real per-symbol proof; surface it distinctly instead.
+      const rescued = hasProvenSymbols && verdict.tone !== 'healthy' && verdict.tone !== 'warning';
       return {
         lane,
         cohort: info.cohort,
         source: info.source,
         secondary: info.secondary,
-        ...verdict,
+        ...(rescued ? { verdict: 'SYMBOL PROVEN', tone: 'warning' as const, score: 50 } : verdict),
       };
     })
-    .filter((row) => row.cohort && row.cohort.n > 0)
+    // Only PROVEN / WATCH / SYMBOL PROVEN (positive-edge verdicts) — BLOCKED, BENCHED, NO EDGE,
+    // NO DATA and EARLY are noise here; they're still visible in the full Lane maturity table below.
+    .filter((row) => row.tone === 'healthy' || row.tone === 'warning')
     .sort((a, b) => b.score - a.score || (b.cohort?.n ?? 0) - (a.cohort?.n ?? 0))
     .slice(0, 5);
 }
@@ -607,15 +646,6 @@ function fmtMoney(value: number): string {
 function fmtUsdt(value: number | null): string {
   if (value === null || !Number.isFinite(value)) return 'n/a';
   return `${value >= 0 ? '+' : ''}${value.toFixed(2)} USDT`;
-}
-
-function fmtDiagnosticStats(stats: DiagnosticDirectionStats | null | undefined): string {
-  if (!stats) return 'n/a';
-  const wr = stats.wr === null || !Number.isFinite(stats.wr) ? 'n/a' : `${Math.round(stats.wr * 100)}% WR`;
-  const mtm = stats.unrealizedPnl === null || !Number.isFinite(stats.unrealizedPnl)
-    ? ''
-    : ` · ${fmtUsdt(stats.unrealizedPnl)} MTM`;
-  return `${fmtUsdt(stats.realizedPnl)} · ${stats.closed}cl/${stats.open}op · ${fmtR(stats.netAvgR)} · ${wr}${mtm}`;
 }
 
 function fmtPrice(value: number | null): string {
@@ -936,6 +966,19 @@ function stageProgress(lane: NeuralLane): StageProgress {
   };
 }
 
+interface ShortFadeReport {
+  laneId: string;
+  interval: string;
+  universe: string[];
+  openCount: number;
+  resolvedCount: number;
+  netAvgR: number | null;
+  pf: number | null;
+  wr: number | null;
+  edgeReady: boolean;
+  topRecent: Array<{ symbol: string; netR: number | null; status: string; exitReason: string | null; openedAt: string; rsiAtEntry: number; fundingBps: number | null }>;
+}
+
 interface LiveLaneExposure {
   laneId: string;
   sourceOrderCount: number;
@@ -957,6 +1000,7 @@ interface LiveAccount {
 export default function NeuralMindmap() {
   const [telemetry, setTelemetry] = useState<NeuralTelemetry | null>(null);
   const [liveAccount, setLiveAccount] = useState<LiveAccount | null>(null);
+  const [shortFade, setShortFade] = useState<ShortFadeReport | null>(null);
   const [selectedId, setSelectedId] = useState('');
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [loading, setLoading] = useState(true);
@@ -1016,9 +1060,20 @@ export default function NeuralMindmap() {
     }
   }
 
+  async function loadShortFade() {
+    try {
+      const response = await fetch('/api/shadow/short-fade-report', { cache: 'no-store' });
+      if (!response.ok) return;
+      setShortFade(await response.json() as ShortFadeReport);
+    } catch {
+      // non-critical — new/experimental lane, silently skip on failure
+    }
+  }
+
   useEffect(() => {
     void loadTelemetry();
     void loadLiveAccount();
+    void loadShortFade();
   }, []);
 
   useEffect(() => {
@@ -1026,6 +1081,7 @@ export default function NeuralMindmap() {
     const timer = window.setInterval(() => {
       void loadTelemetry();
       void loadLiveAccount();
+      void loadShortFade();
     }, 5_000);
     return () => window.clearInterval(timer);
   }, [autoRefresh]);
@@ -1048,8 +1104,6 @@ export default function NeuralMindmap() {
     [telemetry?.nodes],
   );
 
-  const diagDir = telemetry?.paper.diagnosticByDirection ?? null;
-  const diagMixed = telemetry?.paper.diagnosticByRegime?.MIXED ?? null;
   const displayLanes = useMemo(() => {
     return (telemetry?.lanes ?? []).filter((lane) => lane.statsSource !== 'REGIME_DIAGNOSTIC');
   }, [telemetry?.lanes]);
@@ -1168,15 +1222,6 @@ export default function NeuralMindmap() {
   ] : [];
   const newestAgeSec = lastReceivedAt === null ? Infinity : Math.round((Date.now() - lastReceivedAt) / 1000);
   const stale = newestAgeSec > (telemetry?.staleAfterSec ?? 30) || Boolean(error);
-  const criticalCount = (telemetry?.nodes.filter((node) => node.health === 'CRITICAL').length ?? 0) +
-    (telemetry?.lanes.filter((lane) => lane.health === 'CRITICAL').length ?? 0);
-  const warningCount = (telemetry?.nodes.filter((node) => node.health === 'WARNING').length ?? 0) +
-    (telemetry?.lanes.filter((lane) => lane.health === 'WARNING').length ?? 0);
-  // Diagnostic totals derived from the per-direction split so the headline number and the
-  // open/closed counts always reconcile with the SHORT+LONG breakdown shown below it.
-  const diagRealizedTotal = diagDir ? diagDir.SHORT.realizedPnl + diagDir.LONG.realizedPnl : 0;
-  const diagClosedTotal = diagDir ? diagDir.SHORT.closed + diagDir.LONG.closed : 0;
-  const diagOpenTotal = diagDir ? diagDir.SHORT.open + diagDir.LONG.open : 0;
   const milestoneSections = useMemo(
     () => laneMaturitySections.map((section) => ({
       ...section,
@@ -1238,46 +1283,45 @@ export default function NeuralMindmap() {
         </div>
       </header>
 
-      <section className="neural-statusbar is-compact-overview">
-        <div className="neural-pulse-card">
-          <span>System pulse</span>
-          <strong className={criticalCount > 0 ? 'tone-critical' : warningCount > 0 ? 'tone-warning' : 'tone-healthy'}>
-            {criticalCount > 0 ? `${criticalCount} critical` : warningCount > 0 ? `${warningCount} degraded` : 'Nominal'}
-          </strong>
-          <small>{stale ? 'telemetry stale' : `updated ${new Date(telemetry?.generatedAt ?? Date.now()).toLocaleTimeString()}`}</small>
-          <div className="neural-card-subblock">
-            <span>Regime</span>
-            <strong>{telemetry?.controller.regime ?? 'Connecting'}</strong>
-            <small>{telemetry?.controller.mode ?? 'UNKNOWN'} / {telemetry?.controller.bias ?? 'UNKNOWN'}</small>
-          </div>
-        </div>
-        <div className="neural-diagnostic-card">
-          <div className="neural-card-heading">
-            <span>Diagnostic P&amp;L (measurement)</span>
-            <strong className="tone-measure">
-              {telemetry ? `${fmtUsdt(diagRealizedTotal)} · ${diagClosedTotal} closed / ${diagOpenTotal} open` : 'Loading'}
-            </strong>
-          </div>
-          <div className="neural-axis-split" aria-label="Diagnostic P&L axis split">
-            <div className="neural-axis-block">
-              <span>Direction axis</span>
-              <p><b>SHORT</b><em className={diagDir && diagDir.SHORT.realizedPnl < 0 ? 'tone-critical' : 'tone-healthy'}>{fmtDiagnosticStats(diagDir?.SHORT)}</em></p>
-              <p><b>LONG</b><em className={diagDir && diagDir.LONG.realizedPnl < 0 ? 'tone-critical' : 'tone-healthy'}>{fmtDiagnosticStats(diagDir?.LONG)}</em></p>
-            </div>
-            <div className="neural-axis-block is-regime">
-              <span>Regime subset</span>
-              <p><b>MIXED</b><em className={diagMixed && diagMixed.realizedPnl < 0 ? 'tone-critical' : 'tone-healthy'}>{fmtDiagnosticStats(diagMixed)}</em></p>
-              <small>MIXED is a regime filter over LONG/SHORT orders, not a third direction.</small>
-            </div>
-          </div>
-        </div>
-      </section>
-
       {error && (
         <div className="neural-error">
           <strong>Telemetry link interrupted</strong>
           <span>{error}. The last known state remains visible.</span>
         </div>
+      )}
+
+      {shortFade && (
+        <section className="neural-shortfade-card" aria-label="SHORT confirmed-exhaustion + crowded-funding fade (experimental)">
+          <div className="neural-shortfade-head">
+            <span>Experimental — SHORT confirmed-exhaustion + crowded-funding fade</span>
+            <strong className={shortFade.edgeReady ? 'tone-healthy' : 'tone-measure'}>
+              {shortFade.edgeReady ? 'EDGE READY' : 'COLLECTING'}
+            </strong>
+            <small>
+              {shortFade.openCount} open / {shortFade.resolvedCount} resolved · {shortFade.interval} · watching {shortFade.universe.map((s) => s.replace(/USDT$/, '')).join(', ')}
+            </small>
+          </div>
+          <p className="neural-section-note">
+            Entry: RSI crosses back below overbought after confirmed exhaustion (not first touch) AND funding is
+            EXTREME on the long side while OI still rises (crowded longs primed to unwind). Exit: same wide-stop
+            (≥300bps) + fast-TP (0.5R) geometry already proven by CG_WIDE_FAST_SHORT. Report-only — nothing trades
+            on this until the book proves positive.
+          </p>
+          <div className="neural-shortfade-stats">
+            <div><span>Net R</span><strong className={shortFade.netAvgR == null ? '' : shortFade.netAvgR >= 0 ? 'tone-healthy' : 'tone-critical'}>{fmtR(shortFade.netAvgR)}</strong></div>
+            <div><span>PF</span><strong>{fmtNumber(shortFade.pf)}</strong></div>
+            <div><span>WR</span><strong>{shortFade.wr === null ? 'n/a' : `${(shortFade.wr * 100).toFixed(1)}%`}</strong></div>
+          </div>
+          {shortFade.topRecent.length > 0 && (
+            <div className="neural-shortfade-recent">
+              {shortFade.topRecent.slice(0, 6).map((r, i) => (
+                <span key={`${r.symbol}-${r.openedAt}-${i}`} className={`neural-symbol-badge ${r.netR == null ? 'tier-testnet-only' : r.netR >= 0 ? 'tier-live-ready' : ''}`}>
+                  {r.symbol.replace(/USDT$/, '')} {r.netR == null ? '(open)' : fmtR(r.netR)}
+                </span>
+              ))}
+            </div>
+          )}
+        </section>
       )}
 
       <section className="neural-milestone-panel" aria-label="Lane maturity thresholds">
@@ -1287,8 +1331,9 @@ export default function NeuralMindmap() {
           <p>
             Runtime thresholds on VPS now: watchable/headline floor <b>{watchableThreshold}</b> fresh-valid,
             stable candidate <b>{STABLE_MIN_FRESH}</b>, promotion candidate <b>{PROMOTION_MIN_FRESH}</b>.
-            Maturity and performance are merged below so each lane has one row: stage, missing gate,
-            direction cohorts, TP distance, diagnostic MTM, MFE, and mirrored Binance exposure.
+            One row per lane: stage, OOS progress, the gate blocking promotion, and realized book
+            economics. Click a lane row for the full per-lane detail (cohorts, TP geometry, rotation
+            shortlists) in the inspector panel.
           </p>
         </div>
         <p className="neural-decision-legend">
@@ -1307,7 +1352,7 @@ export default function NeuralMindmap() {
               </div>
               <div className="neural-decision-rows">
                 {card.rows.length === 0 ? (
-                  <p className="neural-decision-empty">No cohort evidence yet.</p>
+                  <p className="neural-decision-empty">No PROVEN/WATCH lane for this context yet.</p>
                 ) : card.rows.map((row) => (
                   <button
                     type="button"
@@ -1322,6 +1367,7 @@ export default function NeuralMindmap() {
                     <em className={cohortTone(row.cohort)}>sim · {fmtCohort(row.cohort)}</em>
                     <em className={bookTone(row.lane)}>{fmtBook(row.lane)}</em>
                     <small>{row.source} · {row.secondary}</small>
+                    {renderProvenSymbols(row.lane.provenSymbols)}
                   </button>
                 ))}
               </div>
@@ -1356,31 +1402,21 @@ export default function NeuralMindmap() {
               <tr>
                 <th>Lane</th>
                 <th>Stage</th>
-                <th>Telemetry</th>
-                <th>Progress</th>
-                <th>Missing</th>
-                <th>Best use</th>
-                <th>Bear shortlist</th>
-                <th>Bull shortlist</th>
-                <th>Dir LONG</th>
-                <th>Dir SHORT</th>
-                <th>Regime MIXED</th>
-                <th>TP gap</th>
-                <th>Diag MTM</th>
-                <th>MFE</th>
-                <th>Binance</th>
-                <th>Mirrored</th>
-                <th>Fresh</th>
-                <th>Net R</th>
-                <th>PF</th>
-                <th>WR</th>
+                <th title="Fresh-valid out-of-sample observations vs the threshold for the next stage">OOS progress</th>
+                <th title="The first gate blocking this lane from the next stage">Blocking gate</th>
+                <th title="Market context where this lane has the best evidence">Best use</th>
+                <th title="Realized paper-book average net R per trade (fills + costs)">Net R (book)</th>
+                <th title="Realized paper-book profit factor">PF (book)</th>
+                <th title="Realized paper-book win rate">WR (book)</th>
+                <th title="Mark-to-market of this lane's OPEN paper orders (measurement only, not real money)">Open MTM</th>
+                <th title="Mirrored Binance testnet exposure: unrealized PnL and mirrored order count">Binance mirror</th>
               </tr>
             </thead>
             <tbody>
               {milestoneSections.map((section) => (
                 <Fragment key={`milestone-section-${section.key}`}>
                   <tr className={`neural-direction-row direction-${section.key.toLowerCase()}`}>
-                    <td colSpan={20}>
+                    <td colSpan={10}>
                       <span>{section.label}</span>
                       <small>{section.lanes.length} lane{section.lanes.length === 1 ? '' : 's'} · {section.detail}</small>
                     </td>
@@ -1388,9 +1424,6 @@ export default function NeuralMindmap() {
                   {section.rows.map(({ lane, milestone, progress }) => {
                     const liveLane = liveAccount?.lanes.find((item) => item.laneId === lane.id);
                     const livePnl = liveLane?.unrealizedPnl ?? 0;
-                    const liveGrowth = liveAccount?.accountEquity && liveAccount.accountEquity > 0
-                      ? (livePnl / liveAccount.accountEquity) * 100
-                      : null;
                     return (
                       <tr
                         key={`milestone-${lane.id}`}
@@ -1399,24 +1432,16 @@ export default function NeuralMindmap() {
                       >
                         <td><i className={`health-${healthOf(lane.id).toLowerCase()}`} />{compactLaneLabel(lane.label)}</td>
                         <td><span className={`neural-stage-pill ${evidencePillClass(lane, milestone)}`}>{isQuarantinedLane(lane) ? 'Quarantined' : stageLabel(milestone.stage)}</span></td>
-                        <td>{lane.status}</td>
-                        <td>{progress.progressPct}%</td>
-                        <td className="neural-missing-cell">{progress.blockers.slice(0, 2).join(' | ') || 'None'}</td>
+                        <td>{`${lane.oosFreshValid ?? lane.closed} / ${lane.oosThreshold} fresh · ${progress.progressPct}%`}</td>
+                        <td className="neural-missing-cell">{progress.blockers[0] ?? 'None'}</td>
                         <td className="neural-best-use-cell">{bestContextLabel(lane)}</td>
-                        <td className="neural-shortlist-cell">{renderRotationShortlist(lane.rotationShortlist?.bearish)}</td>
-                        <td className="neural-shortlist-cell">{renderRotationShortlist(lane.rotationShortlist?.bullish)}</td>
-                        <td className={cohortTone(lane.cohorts?.LONG)}>{fmtCohort(lane.cohorts?.LONG)}</td>
-                        <td className={cohortTone(lane.cohorts?.SHORT)}>{fmtCohort(lane.cohorts?.SHORT)}</td>
-                        <td className={cohortTone(lane.cohorts?.MIXED)}>{fmtCohort(lane.cohorts?.MIXED)}</td>
-                        <td>{fmtGapPct(lane.openAvgDistanceToTpPct)}</td>
-                        <td className="tone-measure">{fmtUsdt(lane.diagnosticUnrealizedPnl)}</td>
-                        <td className="tone-measure">{fmtUsdt(lane.openMaxFavorablePnl)}</td>
-                        <td className={livePnl >= 0 ? 'tone-healthy' : 'tone-critical'}>{`${livePnl >= 0 ? '+' : ''}${livePnl.toFixed(2)} USDT · ${fmtPct(liveGrowth)}`}</td>
-                        <td>{liveLane?.sourceOrderCount ?? 0}</td>
-                        <td>{lane.oosFreshValid ?? lane.closed} / {lane.oosThreshold}</td>
                         <td className={lane.netAvgR == null ? '' : lane.netAvgR >= 0 ? 'tone-healthy' : 'tone-critical'}>{fmtR(lane.netAvgR)}</td>
                         <td>{fmtNumber(lane.pf)}</td>
                         <td>{lane.wr === null ? 'n/a' : `${(lane.wr * 100).toFixed(1)}%`}</td>
+                        <td className="tone-measure">{fmtUsdt(lane.diagnosticUnrealizedPnl)}</td>
+                        <td className={livePnl === 0 ? '' : livePnl > 0 ? 'tone-healthy' : 'tone-critical'}>
+                          {liveLane ? `${livePnl >= 0 ? '+' : ''}${livePnl.toFixed(2)} USDT · ${liveLane.sourceOrderCount} mirrored` : '—'}
+                        </td>
                       </tr>
                     );
                   })}

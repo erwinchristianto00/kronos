@@ -168,6 +168,45 @@ function confirmationOf(h: Econ, minHeadlineClosed: number, posMinAvgR: number, 
   return "HEADLINE_MARGINAL";
 }
 
+export type LaneSymbolCurationTier = "testnet" | "live";
+
+export interface LaneSymbolCurationDecision {
+  /** null = no verdict available (stale/missing report, or this lane has zero measured cells)
+   *  → callers must treat this as "not curated yet", i.e. fall back to the lane's normal,
+   *  uncurated (full-universe) admission. A non-null array (even empty) is authoritative:
+   *  the lane HAS enough data to judge, and only these symbols (or none) qualify. */
+  curated: string[] | null;
+  reason: "OK" | "STALE_OR_MISSING" | "NO_DATA_FOR_LANE";
+}
+
+/**
+ * Per-lane symbol curation, derived from the SAME book cells this report already computes.
+ * `testnet` tier uses `testnetCandidate` (book-positive, executable, not a fill artifact — the bar
+ * for earning real/headline confirmation). `live` tier uses `promotable` (additionally
+ * headline-confirmed) — real money only trades symbols with REAL admitted-trade proof, not just
+ * diagnostic sleeve evidence. Both auto-rotate: recomputed fresh from the full order history each
+ * time the source report regenerates, so a symbol that decays below the bar drops out next cycle
+ * and a newly-proven one is added — no manual list to maintain.
+ */
+export function getCuratedSymbolsForLane(
+  report: PerSymbolLaneBookEdgeReport | null,
+  reportGeneratedAt: string | null,
+  laneId: string,
+  tier: LaneSymbolCurationTier,
+  maxStalenessMs: number,
+  nowMs: number = Date.now(),
+): LaneSymbolCurationDecision {
+  if (!report || !reportGeneratedAt) return { curated: null, reason: "STALE_OR_MISSING" };
+  const generatedAtMs = new Date(reportGeneratedAt).getTime();
+  if (!Number.isFinite(generatedAtMs) || nowMs - generatedAtMs > maxStalenessMs) {
+    return { curated: null, reason: "STALE_OR_MISSING" };
+  }
+  const cells = report.cells.filter((c) => c.laneId === laneId);
+  if (cells.length === 0) return { curated: null, reason: "NO_DATA_FOR_LANE" };
+  const qualifies = tier === "live" ? (c: PsleCell) => c.promotable : (c: PsleCell) => c.testnetCandidate;
+  return { curated: cells.filter(qualifies).map((c) => c.symbol), reason: "OK" };
+}
+
 export function buildPerSymbolLaneBookEdge(
   orders: PsleOrder[],
   opts: PsleOptions = {},

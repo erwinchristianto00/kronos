@@ -21,6 +21,7 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  renameSync,
   writeFileSync,
 } from "node:fs";
 import { dirname, resolve } from "node:path";
@@ -182,7 +183,9 @@ export class PortfolioTrendShadowStore {
 
   save(): void {
     try {
-      writeFileSync(this.file, JSON.stringify(this.positions, null, 2), "utf-8");
+      const tmp = `${this.file}.tmp`;
+      writeFileSync(tmp, JSON.stringify(this.positions), "utf-8");
+      renameSync(tmp, this.file);
     } catch {
       // storage failures must never throw — this lane is report-only
     }

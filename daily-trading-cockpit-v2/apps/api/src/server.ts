@@ -4,6 +4,7 @@
 import "./load-env.js";
 
 import { buildApp } from "./app.js";
+import { getLaneSymbolCurationCacheStore, refreshLaneSymbolCurationCache } from "./lib/lane-symbol-curation-cache.js";
 
 console.log(`[API] SOCIAL_SENTIMENT_PROVIDER=${process.env.SOCIAL_SENTIMENT_PROVIDER ?? "(not set)"}`);
 
@@ -71,4 +72,31 @@ if (process.env.PAPER_AUTO_CYCLE !== "0") {
   setTimeout(tick, 60_000); // first run after a scan has populated candidates
   setInterval(tick, intervalMin * 60_000);
   console.log(`[API] PAPER_AUTO_CYCLE on — paper admission+resolution every ${intervalMin}min (timeout ${timeoutMs}ms)`);
+}
+
+// ── Lane symbol curation fetch ───────────────────────────────────────────────
+// Only meaningful on testnet/live: fetches the diagnostic instance's (mature-book) per-symbol-lane
+// edge report on a timer and caches it locally, so the allocator's SYMBOL_NOT_CURATED gate has fresh
+// data to judge against. Unset (default) on the diagnostic instance itself — it must keep exploring
+// the full symbol universe on every lane, since curation has nothing to compute from otherwise.
+if (process.env.LANE_SYMBOL_CURATION_ENABLED === "1") {
+  const intervalMin = Math.max(1, Number(process.env.LANE_SYMBOL_CURATION_REFRESH_MINUTES ?? 15));
+  const cacheStore = getLaneSymbolCurationCacheStore();
+  let refreshInFlight = false;
+  const refresh = (): void => {
+    if (refreshInFlight) return;
+    refreshInFlight = true;
+    refreshLaneSymbolCurationCache(cacheStore)
+      .then((result) => {
+        if (!result.ok) {
+          console.warn(`[API] lane-symbol-curation refresh failed: ${result.error}`);
+        }
+      })
+      .finally(() => {
+        refreshInFlight = false;
+      });
+  };
+  setTimeout(refresh, 15_000); // first run shortly after boot
+  setInterval(refresh, intervalMin * 60_000);
+  console.log(`[API] LANE_SYMBOL_CURATION_ENABLED on — refreshing every ${intervalMin}min from ${process.env.LANE_SYMBOL_CURATION_SOURCE_URL ?? "http://localhost:3101/api/shadow/per-symbol-lane-edge"}`);
 }

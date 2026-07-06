@@ -71,6 +71,11 @@ import {
   type MixedRegimeReport,
 } from "./mixed-regime-router.js";
 import { cgWideTargetFromEntry, readPaperTradingControls } from "./paper-trading-controls.js";
+import {
+  getCuratedSymbolsForLane,
+  type LaneSymbolCurationTier,
+  type PerSymbolLaneBookEdgeReport,
+} from "./per-symbol-lane-book-edge.js";
 
 // ─── public report types ──────────────────────────────────────────────────────
 
@@ -385,7 +390,19 @@ export interface PaperOpportunityAllocatorInputs {
    * reconstructing a potentially divergent Mixed decision.
    */
   mixedRegimeReport?: MixedRegimeReport | null;
+  /**
+   * Per-lane symbol auto-curation (2026-07-06). testnet/live only: gates each lane's admission to
+   * the symbols currently proven positive on the diagnostic instance's realized book (fetched via
+   * lane-symbol-curation-cache.ts). Omitted/null tier ⇒ no gating (the default, and always the case
+   * on the diagnostic instance itself, which must keep exploring the full universe).
+   */
+  laneSymbolCurationTier?: LaneSymbolCurationTier | null;
+  laneSymbolCurationReport?: PerSymbolLaneBookEdgeReport | null;
+  laneSymbolCurationReportGeneratedAt?: string | null;
 }
+
+/** A cached curation report older than this is treated as missing (fall back to uncurated). */
+export const LANE_SYMBOL_CURATION_MAX_STALENESS_MS = 2 * 60 * 60 * 1000; // 2h
 
 // ─── lane policy ──────────────────────────────────────────────────────────────
 
@@ -1711,6 +1728,19 @@ export function buildPaperOpportunityAllocatorReport(
       if (manualQuarantinedPaperLanes.has(laneId)) {
         recordReject(symbol, direction, def.id, "LANE_MANUALLY_QUARANTINED", rowFresh, rowNet);
         continue;
+      }
+      if (inputs.laneSymbolCurationTier) {
+        const curation = getCuratedSymbolsForLane(
+          inputs.laneSymbolCurationReport ?? null,
+          inputs.laneSymbolCurationReportGeneratedAt ?? null,
+          laneId,
+          inputs.laneSymbolCurationTier,
+          LANE_SYMBOL_CURATION_MAX_STALENESS_MS,
+        );
+        if (curation.curated !== null && !curation.curated.includes(symbol)) {
+          recordReject(symbol, direction, def.id, "SYMBOL_NOT_CURATED", rowFresh, rowNet);
+          continue;
+        }
       }
       const sourceCandidateId = `${symbol}-${direction}`;
       const dedupeKey = allocatorDedupeKey({

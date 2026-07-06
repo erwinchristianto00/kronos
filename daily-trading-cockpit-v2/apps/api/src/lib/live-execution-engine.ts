@@ -637,7 +637,7 @@ export class LiveExecutionStore {
   save(): void {
     try {
       const tmp = `${this.file}.tmp`;
-      writeFileSync(tmp, JSON.stringify(this.state, null, 2), "utf-8");
+      writeFileSync(tmp, JSON.stringify(this.state), "utf-8");
       if (existsSync(this.file)) {
         try {
           copyFileSync(this.file, `${this.file}.bak`);
