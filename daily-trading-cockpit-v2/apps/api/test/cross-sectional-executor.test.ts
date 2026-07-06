@@ -2,7 +2,7 @@ import { describe, it, expect, afterEach } from "vitest";
 import { rmSync } from "node:fs";
 import { resolve } from "node:path";
 import os from "node:os";
-import type { FuturesPosition, FuturesSymbolFilters } from "../src/lib/binance-futures-private.js";
+import type { FuturesOrder, FuturesPosition, FuturesSymbolFilters } from "../src/lib/binance-futures-private.js";
 import {
   CrossSectionalStore,
   _resetCrossSectionalStoreForTests,
@@ -57,7 +57,29 @@ class FakeExecClient implements CrossSectionalExecClient {
   failOnSymbol: string | null = null;
   fillPriceBySymbol = new Map<string, number>();
   markPriceBySymbol = new Map<string, number>();
+  /** What queryOrder reports for a symbol when polled — simulates the exchange confirming a fill
+   *  that the initial placeOrder response returned as avgPrice=0. Unset ⇒ stays unconfirmed (NEW). */
+  queryOrderAvgPriceBySymbol = new Map<string, number>();
+  queryOrderCallCount = 0;
   private orderSeq = 100;
+
+  private buildOrder(symbol: string, side: string, quantity: number, reduceOnly: boolean | undefined, orderId: number, avgPrice: number): FuturesOrder {
+    return {
+      symbol,
+      orderId,
+      clientOrderId: "",
+      status: avgPrice > 0 ? "FILLED" : "NEW",
+      type: "MARKET",
+      side: side === "SELL" ? "SELL" : "BUY",
+      reduceOnly: Boolean(reduceOnly),
+      price: 0,
+      stopPrice: 0,
+      origQty: quantity,
+      executedQty: avgPrice > 0 ? quantity : 0,
+      avgPrice,
+      updateTime: 0,
+    };
+  }
 
   async getExchangeFilters(): Promise<Map<string, FuturesSymbolFilters>> {
     const f = (stepSize: number, minQty: number): FuturesSymbolFilters =>
@@ -84,10 +106,17 @@ class FakeExecClient implements CrossSectionalExecClient {
       marginType: "ISOLATED",
     }));
   }
-  async placeOrder(params: { symbol: string; side: string; quantity: number; reduceOnly?: boolean }): Promise<{ orderId: number; avgPrice: number }> {
+  async placeOrder(params: { symbol: string; side: string; quantity: number; reduceOnly?: boolean }) {
     if (this.failOnSymbol === params.symbol && !params.reduceOnly) throw new Error(`exchange rejected ${params.symbol}`);
     this.placed.push(params);
-    return { orderId: this.orderSeq++, avgPrice: this.fillPriceBySymbol.get(params.symbol) ?? 0 };
+    const orderId = this.orderSeq++;
+    const avgPrice = this.fillPriceBySymbol.get(params.symbol) ?? 0;
+    return this.buildOrder(params.symbol, params.side, params.quantity, params.reduceOnly, orderId, avgPrice);
+  }
+  async queryOrder(symbol: string, orderId: number) {
+    this.queryOrderCallCount++;
+    const avgPrice = this.queryOrderAvgPriceBySymbol.get(symbol) ?? 0;
+    return this.buildOrder(symbol, "BUY", 0, false, orderId, avgPrice);
   }
 }
 
@@ -105,6 +134,7 @@ function makeExecutor(opts: { client?: FakeExecClient; allowed?: boolean; laneWe
     isAllowed: () => opts.allowed ?? true,
     laneWeightPct: () => opts.laneWeightPct ?? 100,
     nowIso: () => NOW,
+    fillConfirmRetryDelayMs: 0,
   });
   return { executor, client, signalStore, store };
 }
@@ -288,6 +318,75 @@ describe("cross-sectional executor (basket execution, testnet-first)", () => {
     } finally {
       delete process.env.CROSS_SECTIONAL_EXEC_TP_NET_RETURN;
     }
+  });
+});
+
+describe("fill-price confirmation (honest fills, no silent avgPrice=0 masking)", () => {
+  it("uses the placeOrder avgPrice directly when it's already non-zero (fast path, no extra queryOrder calls)", async () => {
+    const client = new FakeExecClient();
+    client.fillPriceBySymbol.set("SOLUSDT", 100);
+    client.fillPriceBySymbol.set("DOGEUSDT", 0.1);
+    const { executor, store } = makeExecutor({ client, signalMs: NOW_MS - 5 * 60_000 });
+    await executor.tick();
+    const basket = store.getState().baskets[0]!;
+    expect(basket.legs.every((l) => l.entryPriceConfirmed)).toBe(true);
+    expect(client.queryOrderCallCount).toBe(0);
+  });
+
+  it("confirms via queryOrder retry when placeOrder returns avgPrice=0, and records the REAL confirmed fill (not the reference price)", async () => {
+    const client = new FakeExecClient();
+    // placeOrder returns avgPrice=0 for both legs (fillPriceBySymbol left unset)...
+    // ...but queryOrder confirms the real fill moments later, at a price that DIFFERS from
+    // the planned reference price (100 / 0.1) — exactly what was observed on real testnet
+    // basket xb-mr2x7s6e, where all 6 legs' placeOrder responses came back avgPrice=0 while
+    // queryOrder confirmed real, moved fill prices for every one.
+    client.queryOrderAvgPriceBySymbol.set("SOLUSDT", 103.5);
+    client.queryOrderAvgPriceBySymbol.set("DOGEUSDT", 0.098);
+    const { executor, store } = makeExecutor({ client, signalMs: NOW_MS - 5 * 60_000 });
+    await executor.tick();
+    const basket = store.getState().baskets[0]!;
+    const sol = basket.legs.find((l) => l.symbol === "SOLUSDT")!;
+    const doge = basket.legs.find((l) => l.symbol === "DOGEUSDT")!;
+    expect(sol.entryPrice).toBeCloseTo(103.5, 9); // NOT the planned reference price of 100
+    expect(sol.entryPriceConfirmed).toBe(true);
+    expect(doge.entryPrice).toBeCloseTo(0.098, 9); // NOT the planned reference price of 0.1
+    expect(doge.entryPriceConfirmed).toBe(true);
+    expect(client.queryOrderCallCount).toBeGreaterThan(0);
+  });
+
+  it("marks the fill UNCONFIRMED (never fabricates a fake price) when queryOrder never resolves a real fill after retries", async () => {
+    const client = new FakeExecClient();
+    // Neither placeOrder nor queryOrder ever return a non-zero avgPrice for SOLUSDT.
+    const { executor, store } = makeExecutor({ client, signalMs: NOW_MS - 5 * 60_000 });
+    await executor.tick();
+    const basket = store.getState().baskets[0]!;
+    const sol = basket.legs.find((l) => l.symbol === "SOLUSDT")!;
+    expect(sol.entryPriceConfirmed).toBe(false); // honestly flagged, not silently trusted
+    expect(client.queryOrderCallCount).toBeGreaterThan(0); // it DID try to confirm before giving up
+  });
+
+  it("applies the same honest confirmation to exit fills at basket close", async () => {
+    const client = new FakeExecClient();
+    client.fillPriceBySymbol.set("SOLUSDT", 100);
+    client.fillPriceBySymbol.set("DOGEUSDT", 0.1);
+    const { executor, store } = makeExecutor({ client, signalMs: NOW_MS - 5 * 60_000 });
+    await executor.tick(); // open with confirmed entry fills
+    const basket = store.getState().baskets[0]!;
+    basket.closesAtMs = NOW_MS - 1; // due now
+
+    // Exit fills come back unconfirmed from placeOrder, but confirm via queryOrder at a real,
+    // moved price — must NOT silently record exitPrice = entryPrice (a fake flat close).
+    client.fillPriceBySymbol.delete("SOLUSDT");
+    client.fillPriceBySymbol.delete("DOGEUSDT");
+    client.queryOrderAvgPriceBySymbol.set("SOLUSDT", 105);
+    client.queryOrderAvgPriceBySymbol.set("DOGEUSDT", 0.1);
+    await executor.tick();
+
+    expect(basket.status).toBe("CLOSED");
+    const sol = basket.legs.find((l) => l.symbol === "SOLUSDT")!;
+    expect(sol.exitPrice).toBeCloseTo(105, 9); // real confirmed fill, not entryPrice(100)
+    expect(sol.exitPriceConfirmed).toBe(true);
+    expect(basket.grossPnlUsd).toBeGreaterThan(0); // reflects the real +5 move, not a fake flat $0
   });
 });
 

@@ -30,7 +30,7 @@ export const CROSS_SECTIONAL_MARKET_NEUTRAL_LANE_ID = "CROSS_SECTIONAL_MARKET_NE
 
 export type CrossSectionalExecClient = Pick<
   BinanceFuturesPrivateClient,
-  "getExchangeFilters" | "placeOrder" | "setLeverage" | "getPositions"
+  "getExchangeFilters" | "placeOrder" | "setLeverage" | "getPositions" | "queryOrder"
 >;
 
 export function isCrossSectionalExecEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
@@ -86,8 +86,14 @@ export interface ExecutorLeg {
   qty: number;
   entryPrice: number;
   entryOrderId: number;
+  /** False when the exchange never confirmed a real fill price (see resolveFillPrice) and
+   *  entryPrice fell back to the pre-trade reference price — a signal the recorded entry
+   *  may not reflect what actually executed. True is the normal case. */
+  entryPriceConfirmed: boolean;
   exitPrice: number | null;
   exitOrderId: number | null;
+  /** Same caveat as entryPriceConfirmed, for the exit fill. Null while still open. */
+  exitPriceConfirmed: boolean | null;
 }
 
 export interface ExecutorBasket {
@@ -168,6 +174,8 @@ export interface CrossSectionalExecutorOptions {
   /** Operator lane allocation weight. 100 = normal leg size; 0 = blocked. */
   laneWeightPct?: () => number;
   nowIso?: () => string;
+  /** Delay between queryOrder confirmation retries in resolveFillPrice. Default 400ms; tests pass 0. */
+  fillConfirmRetryDelayMs?: number;
 }
 
 export class CrossSectionalExecutor {
@@ -175,6 +183,7 @@ export class CrossSectionalExecutor {
   private readonly signalStore: CrossSectionalStore;
   private readonly store: CrossSectionalExecutorStore;
   private readonly isAllowed: () => boolean;
+  private readonly fillConfirmRetryDelayMs: number;
   private readonly laneWeightPct: () => number;
   private readonly nowIso: () => string;
   private ticking = false;
@@ -187,6 +196,44 @@ export class CrossSectionalExecutor {
     this.isAllowed = opts.isAllowed;
     this.laneWeightPct = opts.laneWeightPct ?? (() => 100);
     this.nowIso = opts.nowIso ?? (() => new Date().toISOString());
+    this.fillConfirmRetryDelayMs = opts.fillConfirmRetryDelayMs ?? 400;
+  }
+
+  /**
+   * A MARKET order's synchronous placeOrder response can come back with avgPrice=0 / status
+   * not yet FILLED even when the order fills moments later — observed for real on testnet
+   * (basket xb-mr2x7s6e: all 6 legs got avgPrice=0 in the placeOrder response, yet
+   * queryOrder afterward showed status=FILLED with real, non-zero avgPrice for every one).
+   * Silently trusting avgPrice=0 as "closed flat at the reference price" would fabricate a
+   * fake break-even result over whatever the real fill actually was. Confirm via queryOrder
+   * before ever falling back — and when confirmation genuinely can't be obtained, say so
+   * instead of pretending the fallback price is real.
+   */
+  private async resolveFillPrice(
+    symbol: string,
+    orderId: number,
+    initialAvgPrice: number,
+    fallbackPrice: number,
+  ): Promise<{ price: number; confirmed: boolean }> {
+    if (initialAvgPrice > 0) return { price: initialAvgPrice, confirmed: true };
+    for (let attempt = 0; attempt < 4; attempt++) {
+      if (this.fillConfirmRetryDelayMs > 0) {
+        await new Promise((r) => setTimeout(r, this.fillConfirmRetryDelayMs));
+      }
+      try {
+        const queried = await this.client.queryOrder(symbol, orderId);
+        if (queried.avgPrice > 0) return { price: queried.avgPrice, confirmed: true };
+        if (queried.status !== "NEW" && queried.status !== "PARTIALLY_FILLED") break; // terminal, non-fillable
+      } catch {
+        // best-effort — fall through to the next attempt / final fallback
+      }
+    }
+    console.error(
+      `[cross-sectional-executor] UNCONFIRMED FILL PRICE: ${symbol} order ${orderId} never returned a ` +
+        `real avgPrice after retries — recording ${fallbackPrice} as a fallback, but this is NOT a ` +
+        `confirmed fill price. PnL involving this leg should be treated as uncertain.`,
+    );
+    return { price: fallbackPrice, confirmed: false };
   }
 
   private allocationWeightPct(): number {
@@ -331,7 +378,9 @@ export class CrossSectionalExecutor {
         newClientOrderId: `xsec-${basket.basketId.slice(-12)}-x${basket.legs.indexOf(leg)}`,
       });
       leg.exitOrderId = order.orderId;
-      leg.exitPrice = order.avgPrice > 0 ? order.avgPrice : leg.entryPrice;
+      const resolved = await this.resolveFillPrice(leg.symbol, order.orderId, order.avgPrice, leg.entryPrice);
+      leg.exitPrice = resolved.price;
+      leg.exitPriceConfirmed = resolved.confirmed;
       const dir = leg.side === "LONG" ? 1 : -1;
       gross += dir * (leg.exitPrice - leg.entryPrice) * leg.qty;
       notionalTouched += leg.entryPrice * leg.qty + leg.exitPrice * leg.qty;
@@ -418,14 +467,17 @@ export class CrossSectionalExecutor {
           quantity: planned.qty,
           newClientOrderId: `xsec-${basket.basketId.slice(-12)}-e${basket.legs.length}`,
         });
+        const resolvedEntry = await this.resolveFillPrice(planned.symbol, order.orderId, order.avgPrice, planned.refPrice);
         basket.legs.push({
           symbol: planned.symbol,
           side: planned.side,
           qty: planned.qty,
-          entryPrice: order.avgPrice > 0 ? order.avgPrice : planned.refPrice,
+          entryPrice: resolvedEntry.price,
           entryOrderId: order.orderId,
+          entryPriceConfirmed: resolvedEntry.confirmed,
           exitPrice: null,
           exitOrderId: null,
+          exitPriceConfirmed: null,
         });
       }
       st.baskets.push(basket);
@@ -446,7 +498,9 @@ export class CrossSectionalExecutor {
             newClientOrderId: `xsec-${basket.basketId.slice(-12)}-a${basket.legs.indexOf(leg)}`,
           });
           leg.exitOrderId = flat.orderId;
-          leg.exitPrice = flat.avgPrice > 0 ? flat.avgPrice : leg.entryPrice;
+          const resolvedFlat = await this.resolveFillPrice(leg.symbol, flat.orderId, flat.avgPrice, leg.entryPrice);
+          leg.exitPrice = resolvedFlat.price;
+          leg.exitPriceConfirmed = resolvedFlat.confirmed;
         } catch {
           // leave for the operator/reconcile — recorded as ABORTED with legs visible
         }
