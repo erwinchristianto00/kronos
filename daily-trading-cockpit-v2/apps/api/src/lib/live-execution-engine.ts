@@ -55,6 +55,13 @@ import { fetchCrowdingSnapshot, type CrowdSide, type CrowdingState } from "./der
 import { clusterOf, isMajorSymbol } from "./correlation-clusters.js";
 import type { BinanceClient } from "./binance.js";
 import type { PaperOrder } from "./paper-execution-router.js";
+import {
+  getCuratedSymbolsForLane,
+  type LaneSymbolCurationTier,
+  type PerSymbolLaneBookEdgeReport,
+} from "./per-symbol-lane-book-edge.js";
+import { getLaneSymbolCurationCacheStore } from "./lane-symbol-curation-cache.js";
+import { LANE_SYMBOL_CURATION_MAX_STALENESS_MS } from "./paper-opportunity-allocator.js";
 
 // ─── config ──────────────────────────────────────────────────────────────────
 
@@ -742,7 +749,7 @@ const LIVE_PERFORMANCE_VIEWS: Record<LivePerformanceView, {
   daily: { label: "Daily", bucketLabel: "Days in selected month" },
   weekly: { label: "Weekly", bucketLabel: "Weeks in selected month" },
   monthly: { label: "Monthly", bucketLabel: "12 monthly buckets" },
-  yearly: { label: "Yearly", bucketLabel: "5 yearly buckets" },
+  yearly: { label: "Yearly", bucketLabel: "3 yearly buckets" },
 };
 /**
  * A paper order whose live open fails this many times is quarantined — never re-mirrored.
@@ -813,11 +820,11 @@ function parseAnchorYear(anchor: string | null | undefined, fallbackMs: number):
 function parseAnchorEndYear(anchor: string | null | undefined, fallbackMs: number): number {
   if (anchor && /^\d{4}$/.test(anchor)) {
     const year = Number(anchor);
-    const parsed = Date.UTC(year - 4, 0, 1);
+    const parsed = Date.UTC(year - 2, 0, 1);
     if (Number.isFinite(parsed)) return parsed;
   }
   const fallbackYear = new Date(fallbackMs).getUTCFullYear();
-  return Date.UTC(fallbackYear - 4, 0, 1);
+  return Date.UTC(fallbackYear - 2, 0, 1);
 }
 
 function addUtcMonths(ms: number, months: number): number {
@@ -899,10 +906,10 @@ function performanceWindow(input: {
   }
   if (input.view === "yearly") {
     const sinceMs = parseAnchorEndYear(input.anchor, input.nowMs);
-    const bucketStartsMs = Array.from({ length: 5 }, (_, index) => Date.UTC(new Date(sinceMs).getUTCFullYear() + index, 0, 1));
-    const untilMs = Date.UTC(new Date(sinceMs).getUTCFullYear() + 5, 0, 1);
+    const bucketStartsMs = Array.from({ length: 3 }, (_, index) => Date.UTC(new Date(sinceMs).getUTCFullYear() + index, 0, 1));
+    const untilMs = Date.UTC(new Date(sinceMs).getUTCFullYear() + 3, 0, 1);
     const startYear = isoYear(sinceMs);
-    const endYear = `${Number(startYear) + 4}`;
+    const endYear = `${Number(startYear) + 2}`;
     return {
       sinceMs,
       untilMs,
@@ -998,6 +1005,46 @@ function regimeFilterMatches(
   if (filter === "long_tactical") return classified.bucket === "LONG_TACTICAL";
   if (filter === "short_tactical") return classified.bucket === "SHORT_TACTICAL";
   return false;
+}
+
+/**
+ * Live-mirror candidate admission priority tier — reorders (never rejects) candidates competing
+ * for limited concurrent-position slots so proven symbols get first crack when slots are scarce.
+ * "No obstruction": every candidate is still eligible and will still be admitted if slots allow it
+ * at its tier — this only changes WHICH ONES win when there aren't enough slots for everyone.
+ *
+ *  Tier 0: symbol is in THIS lane's own curated whitelist at the deployment's tier (testnet/live).
+ *  Tier 1: no tier-0 data (or symbol absent from it), but SOME lane has proven edge for this
+ *          symbol+direction (bestLanePerSymbol stage TESTNET_CANDIDATE or PROMOTABLE) — a broader,
+ *          intentionally looser fallback than tier 0, independent of deployment tier.
+ *  Tier 2: no data in either lookup (report missing/stale, or symbol unmatched anywhere) — still
+ *          admitted, just deprioritized relative to 0/1 when slots run out.
+ */
+export function symbolPriorityTier(
+  symbol: string,
+  direction: "LONG" | "SHORT",
+  laneId: string,
+  report: PerSymbolLaneBookEdgeReport | null,
+  reportGeneratedAt: string | null,
+  tier: LaneSymbolCurationTier | null,
+  nowMs: number = Date.now(),
+): 0 | 1 | 2 {
+  if (report && tier) {
+    const curation = getCuratedSymbolsForLane(
+      report,
+      reportGeneratedAt,
+      laneId,
+      tier,
+      LANE_SYMBOL_CURATION_MAX_STALENESS_MS,
+      nowMs,
+    );
+    if (curation.curated !== null && curation.curated.includes(symbol)) return 0;
+  }
+  if (report) {
+    const best = report.bestLanePerSymbol.find((b) => b.symbol === symbol && b.direction === direction);
+    if (best && best.stage !== "NONE") return 1;
+  }
+  return 2;
 }
 
 export class LiveExecutionEngine {
@@ -2876,6 +2923,25 @@ export class LiveExecutionEngine {
   }
 
   /**
+   * RegimeAutopilot's allocation-apply action. Identical to setLaneAllocations, but ALSO clears
+   * manualSelectorMode (atomically, in the same store save) so the dashboard never keeps showing
+   * "Manual" after the regime engine has genuinely changed the allocation out from under the
+   * operator. Only called when RegimeAutopilot itself decides to act (its own stability/cooldown
+   * guards are unchanged) — if the operator was already in smart mode, this is a no-op on the flag.
+   */
+  applyRegimeAutopilotAllocation(
+    allocations: Array<{ laneId: string; weightPct: number }>,
+  ): { ok: boolean; reason: string | null; laneAllocations: Array<{ laneId: string; weightPct: number }> | null } {
+    const result = this.setLaneAllocations(allocations);
+    if (result.ok) {
+      const st = this.store.getState();
+      st.manualSelectorMode = false;
+      this.store.save();
+    }
+    return result;
+  }
+
+  /**
    * Operator-triggered copy of a TESTNET position onto THIS engine (the mainnet
    * instance): same symbol/direction/qty and the same stop/TP geometry relative to
    * entry (openIntent reprices the absolute levels around the actual live fill).
@@ -3037,6 +3103,10 @@ export class LiveExecutionEngine {
         .map((intent) => [intent.symbol, intent]),
     );
 
+    const curationTier = (process.env.LANE_SYMBOL_CURATION_TIER as LaneSymbolCurationTier | undefined) ?? null;
+    const curationCache = getLaneSymbolCurationCacheStore().get();
+    const nowMs = Date.now();
+
     const candidates = this.paperStore.all
       .filter(
         (o) =>
@@ -3051,7 +3121,31 @@ export class LiveExecutionEngine {
           !mirrored.has(o.paperOrderId) &&
           (st.mirrorAttempts[o.paperOrderId] ?? 0) < MAX_MIRROR_ATTEMPTS, // quarantine repeated open failures
       )
-      .sort((a, b) => (a.createdAt < b.createdAt ? -1 : 1));
+      .sort((a, b) => {
+        // Symbol priority tier (0=curated whitelist, 1=proven-elsewhere fallback, 2=no obstruction —
+        // never rejects, only reorders admission when slots are scarce). createdAt is the tiebreaker
+        // within a tier, preserving the existing FIFO order.
+        const tierA = symbolPriorityTier(
+          a.symbol,
+          a.direction,
+          a.selectedLaneId ?? "",
+          curationCache.report,
+          curationCache.fetchedAt,
+          curationTier,
+          nowMs,
+        );
+        const tierB = symbolPriorityTier(
+          b.symbol,
+          b.direction,
+          b.selectedLaneId ?? "",
+          curationCache.report,
+          curationCache.fetchedAt,
+          curationTier,
+          nowMs,
+        );
+        if (tierA !== tierB) return tierA - tierB;
+        return a.createdAt < b.createdAt ? -1 : 1;
+      });
 
     let slots = Math.max(0, this.config.maxConcurrentPositions - openCount);
     const clusterOpen = this.clusterOpenCounts(st.intents);

@@ -299,7 +299,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     if (isRegimeAutopilotEnabled() && liveEngine) {
       const engineForPilot = liveEngine;
       regimeAutopilot = new RegimeAutopilot({
-        setAllocations: (a) => { engineForPilot.setLaneAllocations(a); },
+        setAllocations: (a) => { engineForPilot.applyRegimeAutopilotAllocation(a); },
         getLatestRegime: () => {
           const snaps = getRegimeEngineStore().snapshots;
           return snaps.length > 0 ? snaps[snaps.length - 1]!.regime : null;

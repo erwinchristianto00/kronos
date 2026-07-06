@@ -22,12 +22,14 @@ import {
   roundDownToStep,
   roundStopToSafeSide,
   roundUpToStep,
+  symbolPriorityTier,
   type LiveExecutionConfig,
   type LivePrivateClient,
   type PaperStoreReader,
 } from "../src/lib/live-execution-engine.js";
 import type { BinanceClient, FuturesFlowSnapshot } from "../src/lib/binance.js";
 import type { PaperOrder } from "../src/lib/paper-execution-router.js";
+import type { PerSymbolLaneBookEdgeReport } from "../src/lib/per-symbol-lane-book-edge.js";
 
 // ── fixtures ─────────────────────────────────────────────────────────────────
 
@@ -1366,8 +1368,8 @@ describe("LiveExecutionEngine", () => {
     expect(monthly.bucketStarts).toHaveLength(12);
 
     const yearly = engine.getLanePerformanceSeries({ view: "yearly", anchor: "2099", regime: "all" });
-    expect(yearly.periodLabel).toBe("2095-2099");
-    expect(yearly.bucketStarts).toHaveLength(5);
+    expect(yearly.periodLabel).toBe("2097-2099");
+    expect(yearly.bucketStarts).toHaveLength(3);
   });
 
   it("kill-switch on daily loss: cancels, flattens, disarms, latches", async () => {
@@ -2694,5 +2696,249 @@ describe("manual selector mode toggle", () => {
 
     engine.setManualSelectorMode(false);
     expect(engine.isManualSelectorMode()).toBe(false);
+  });
+});
+
+describe("symbolPriorityTier (live-mirror candidate priority — no obstruction, only reordering)", () => {
+  const LANE_ID = "CG_VARIANT_MATRIX:CG_WIDE_FAST_SHORT";
+  const OTHER_LANE_ID = "CG_VARIANT_MATRIX:CG_WIDE_FAST_LONG";
+  const GENERATED_AT = "2099-01-02T11:00:00.000Z";
+  const NOW_MS = new Date("2099-01-02T12:00:00.000Z").getTime();
+
+  function makeReport(overrides: Partial<PerSymbolLaneBookEdgeReport> = {}): PerSymbolLaneBookEdgeReport {
+    return {
+      minClosed: 40,
+      minHeadlineClosed: 20,
+      posMinAvgR: 0.03,
+      negMaxAvgR: -0.03,
+      cells: [
+        {
+          laneId: LANE_ID,
+          symbol: "LINKUSDT",
+          direction: "SHORT",
+          bucket: "ALT",
+          closed: 100,
+          headlineClosed: 0,
+          netAvgR: 0.2,
+          pf: 2,
+          wr: 0.8,
+          totalR: 20,
+          headlineNetAvgR: null,
+          headlinePf: null,
+          executable: true,
+          suspiciousFill: false,
+          verdict: "BOOK_POSITIVE",
+          confirmation: "DIAGNOSTIC_ONLY",
+          promotable: false,
+          testnetCandidate: true, // qualifies for "testnet" tier curation on LANE_ID
+        },
+      ],
+      bestLanePerSymbol: [
+        // SUIUSDT: no cell on LANE_ID itself, but SOME lane has proven edge (fallback tier 1).
+        {
+          symbol: "SUIUSDT",
+          direction: "SHORT",
+          bucket: "ALT",
+          bestLaneId: OTHER_LANE_ID,
+          bestNetAvgR: 0.1,
+          bestClosed: 50,
+          stage: "TESTNET_CANDIDATE",
+          positiveLaneCount: 1,
+          measuredLaneCount: 1,
+        },
+      ],
+      summary: {
+        measuredCells: 1,
+        bookPositiveCells: 1,
+        promotableCells: 0,
+        testnetCandidateCells: 1,
+        byDirection: {
+          LONG: { measured: 0, bookPositive: 0, testnetCandidate: 0, promotable: 0 },
+          SHORT: { measured: 1, bookPositive: 1, testnetCandidate: 1, promotable: 0 },
+          MIXED: { measured: 0, bookPositive: 0, testnetCandidate: 0, promotable: 0 },
+        },
+        symbolsMeasured: 1,
+        symbolsTestnetCandidate: 1,
+        symbolsPromotable: 0,
+      },
+      ...overrides,
+    };
+  }
+
+  it("tier 0: symbol is in the exact lane's curated whitelist at the deployment tier", () => {
+    const report = makeReport();
+    const tier = symbolPriorityTier("LINKUSDT", "SHORT", LANE_ID, report, GENERATED_AT, "testnet", NOW_MS);
+    expect(tier).toBe(0);
+  });
+
+  it("tier 1: not in this lane's whitelist, but bestLanePerSymbol has a proven stage for this symbol+direction", () => {
+    const report = makeReport();
+    // SUIUSDT has no cell for LANE_ID, so tier-0 curation misses it; falls back to tier 1 via bestLanePerSymbol.
+    const tier = symbolPriorityTier("SUIUSDT", "SHORT", LANE_ID, report, GENERATED_AT, "testnet", NOW_MS);
+    expect(tier).toBe(1);
+  });
+
+  it("tier 1 fallback ignores deployment tier (looser bar than tier 0, applies regardless of testnet/live)", () => {
+    const report = makeReport();
+    const tier = symbolPriorityTier("SUIUSDT", "SHORT", LANE_ID, report, GENERATED_AT, "live", NOW_MS);
+    expect(tier).toBe(1);
+  });
+
+  it("tier 2: symbol absent from both lookups falls back to no-obstruction (still admitted, just last)", () => {
+    const report = makeReport();
+    const tier = symbolPriorityTier("DOGEUSDT", "SHORT", LANE_ID, report, GENERATED_AT, "testnet", NOW_MS);
+    expect(tier).toBe(2);
+  });
+
+  it("tier 2: report missing entirely (no curation data) still resolves, never throws", () => {
+    const tier = symbolPriorityTier("LINKUSDT", "SHORT", LANE_ID, null, null, "testnet", NOW_MS);
+    expect(tier).toBe(2);
+  });
+
+  it("tier 2: report present but stale (past max staleness) falls back for tier-0, tier-1 (bestLanePerSymbol) still applies", () => {
+    const report = makeReport();
+    const staleGeneratedAt = "2099-01-01T00:00:00.000Z"; // >2h before NOW_MS
+    // Tier-0 curation is staleness-gated and fails → LINKUSDT (only has a tier-0 cell) drops to tier 2.
+    expect(symbolPriorityTier("LINKUSDT", "SHORT", LANE_ID, report, staleGeneratedAt, "testnet", NOW_MS)).toBe(2);
+    // Tier-1 fallback (bestLanePerSymbol) is NOT staleness-gated by getCuratedSymbolsForLane, so SUIUSDT
+    // still resolves to tier 1 even with a "stale" reportGeneratedAt for the tier-0 lookup.
+    expect(symbolPriorityTier("SUIUSDT", "SHORT", LANE_ID, report, staleGeneratedAt, "testnet", NOW_MS)).toBe(1);
+  });
+
+  it("tier 2: deployment tier is null (curation not opted in) never grants tier 0", () => {
+    const report = makeReport();
+    const tier = symbolPriorityTier("LINKUSDT", "SHORT", LANE_ID, report, GENERATED_AT, null, NOW_MS);
+    // No tier-0 possible without a configured tier, but tier-1 fallback still works if bestLanePerSymbol matches.
+    expect(tier).toBe(2); // LINKUSDT has no bestLanePerSymbol entry in this fixture
+  });
+
+  it("no-obstruction property: every tier is a valid admission priority (0, 1, or 2) — never a rejection sentinel", () => {
+    const report = makeReport();
+    for (const [symbol, direction] of [
+      ["LINKUSDT", "SHORT"] as const,
+      ["SUIUSDT", "SHORT"] as const,
+      ["RANDOMCOIN", "SHORT"] as const,
+      ["RANDOMCOIN", "LONG"] as const,
+    ]) {
+      const tier = symbolPriorityTier(symbol, direction, LANE_ID, report, GENERATED_AT, "testnet", NOW_MS);
+      expect([0, 1, 2]).toContain(tier);
+    }
+  });
+
+  it("mirrorNewSignals sort: within a tier, createdAt ascending is preserved as the tiebreaker", async () => {
+    // Simulate the same sort comparator used in mirrorNewSignals: tier primary, createdAt secondary.
+    const report = makeReport();
+    const candidates = [
+      { symbol: "DOGEUSDT", direction: "SHORT" as const, createdAt: "2099-01-02T10:00:00.000Z" }, // tier 2
+      { symbol: "LINKUSDT", direction: "SHORT" as const, createdAt: "2099-01-02T09:00:00.000Z" }, // tier 0, earlier
+      { symbol: "SUIUSDT", direction: "SHORT" as const, createdAt: "2099-01-02T08:30:00.000Z" }, // tier 1
+      { symbol: "SHIBUSDT", direction: "SHORT" as const, createdAt: "2099-01-02T08:00:00.000Z" }, // tier 2, earliest of tier-2 group
+    ];
+    const sorted = [...candidates].sort((a, b) => {
+      const tierA = symbolPriorityTier(a.symbol, a.direction, LANE_ID, report, GENERATED_AT, "testnet", NOW_MS);
+      const tierB = symbolPriorityTier(b.symbol, b.direction, LANE_ID, report, GENERATED_AT, "testnet", NOW_MS);
+      if (tierA !== tierB) return tierA - tierB;
+      return a.createdAt < b.createdAt ? -1 : 1;
+    });
+    expect(sorted.map((c) => c.symbol)).toEqual(["LINKUSDT", "SUIUSDT", "SHIBUSDT", "DOGEUSDT"]);
+  });
+
+  it("mirrorNewSignals: never drops a candidate based on tier — a tier-2 (no-obstruction) symbol still opens when slots allow", async () => {
+    // ETHUSDT (the fixture's only symbol with exchange filters) is deliberately NOT in any
+    // curated/proven lookup here, so it resolves to tier 2 — but must still be admitted.
+    const order = paperOrder({
+      symbol: "ETHUSDT",
+      selectedLaneId: LANE_ID,
+      direction: "SHORT",
+      entryPrice: 2000,
+      stopLoss: 2100,
+    } as Partial<PaperOrder>);
+    const { engine, store } = makeEngine({ paper: makePaperStore([order]) });
+    expect((await engine.arm()).ok).toBe(true);
+    await engine.tick();
+    // No curation env/cache configured in this test process ⇒ tier is always 2 for everyone, but the
+    // candidate must still be admitted (no obstruction) since a slot was available.
+    expect(store.getState().intents.length).toBe(1);
+    expect(store.getState().intents[0]!.symbol).toBe("ETHUSDT");
+  });
+});
+
+describe("applyRegimeAutopilotAllocation (autopilot ↔ manual-mode sync)", () => {
+  it("applies the allocation AND flips manualSelectorMode to false when the operator was in manual mode", () => {
+    const { engine, store } = makeEngine();
+    engine.setManualSelectorMode(true);
+    expect(engine.isManualSelectorMode()).toBe(true);
+
+    const result = engine.applyRegimeAutopilotAllocation([
+      { laneId: "CG_WIDE_FAST_SHORT", weightPct: 60 },
+      { laneId: "CROSS_SECTIONAL_MARKET_NEUTRAL", weightPct: 40 },
+    ]);
+
+    expect(result.ok).toBe(true);
+    expect(store.getState().laneAllocations).toEqual([
+      { laneId: "CG_WIDE_FAST_SHORT", weightPct: 60 },
+      { laneId: "CROSS_SECTIONAL_MARKET_NEUTRAL", weightPct: 40 },
+    ]);
+    expect(engine.isManualSelectorMode()).toBe(false);
+    expect(engine.getStatus().laneSelection.manualSelectorMode).toBe(false);
+  });
+
+  it("leaves manualSelectorMode false (already smart) untouched when applied while not in manual mode", () => {
+    const { engine, store } = makeEngine();
+    expect(engine.isManualSelectorMode()).toBe(false);
+
+    const result = engine.applyRegimeAutopilotAllocation([{ laneId: "CG_WIDE_FAST_LONG", weightPct: 100 }]);
+
+    expect(result.ok).toBe(true);
+    expect(store.getState().laneAllocations).toEqual([{ laneId: "CG_WIDE_FAST_LONG", weightPct: 100 }]);
+    expect(engine.isManualSelectorMode()).toBe(false);
+  });
+
+  it("does NOT touch manualSelectorMode when the allocation is rejected (validation failure)", () => {
+    const { engine, store } = makeEngine();
+    engine.setManualSelectorMode(true);
+
+    const result = engine.applyRegimeAutopilotAllocation([{ laneId: "A", weightPct: 0 }]); // invalid weightPct
+
+    expect(result.ok).toBe(false);
+    expect(engine.isManualSelectorMode()).toBe(true); // untouched — the apply never went through
+    expect(store.getState().laneAllocations).toBeNull();
+  });
+
+  it("regime-autopilot end-to-end via RegimeAutopilot.tick(): a stable regime change flips manual mode off", async () => {
+    const { RegimeAutopilot } = await import("../src/lib/regime-autopilot.js");
+    const { engine } = makeEngine();
+    engine.setManualSelectorMode(true);
+    let regime: string | null = null;
+    let now = 1_000_000_000_000;
+    const pilot = new RegimeAutopilot({
+      setAllocations: (a) => { engine.applyRegimeAutopilotAllocation(a); },
+      getLatestRegime: () => regime,
+      nowMs: () => now,
+      stableCycles: 1,
+      minHoldMs: 30 * 60_000,
+    });
+    regime = "NO_TRADE";
+    pilot.tick(); // stable on first observation (stableCycles: 1) → applies immediately
+    expect(engine.isManualSelectorMode()).toBe(false);
+  });
+
+  it("regime-autopilot: manualSelectorMode stays true while autopilot skips (not yet stable — anti-whipsaw guard unchanged)", async () => {
+    const { RegimeAutopilot } = await import("../src/lib/regime-autopilot.js");
+    const { engine } = makeEngine();
+    engine.setManualSelectorMode(true);
+    let regime: string | null = null;
+    let now = 1_000_000_000_000;
+    const pilot = new RegimeAutopilot({
+      setAllocations: (a) => { engine.applyRegimeAutopilotAllocation(a); },
+      getLatestRegime: () => regime,
+      nowMs: () => now,
+      stableCycles: 3,
+      minHoldMs: 30 * 60_000,
+    });
+    regime = "BEAR_TREND";
+    pilot.tick(); // count 1/3 — not yet stable, does NOT call setAllocations
+    pilot.tick(); // count 2/3 — still not stable
+    expect(engine.isManualSelectorMode()).toBe(true); // untouched, since autopilot never acted
   });
 });
