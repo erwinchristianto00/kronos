@@ -23,7 +23,7 @@ cd "$(dirname "$0")"
 echo "==> 1/3  commit + push to GitHub"
 git add -A
 git commit -m "${1:-deploy $(date '+%Y-%m-%d %H:%M')}" || echo "    (nothing new to commit)"
-git push origin main
+git push origin HEAD
 
 echo "==> 2/3  rsync code -> VPS (data/ untouched)"
 rsync -az --delete \

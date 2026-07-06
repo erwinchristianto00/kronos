@@ -2,7 +2,7 @@ import { describe, it, expect, afterEach } from "vitest";
 import { rmSync } from "node:fs";
 import { resolve } from "node:path";
 import os from "node:os";
-import type { FuturesSymbolFilters } from "../src/lib/binance-futures-private.js";
+import type { FuturesPosition, FuturesSymbolFilters } from "../src/lib/binance-futures-private.js";
 import {
   CrossSectionalStore,
   _resetCrossSectionalStoreForTests,
@@ -56,6 +56,7 @@ class FakeExecClient implements CrossSectionalExecClient {
   leverageCalls: Array<{ symbol: string; leverage: number }> = [];
   failOnSymbol: string | null = null;
   fillPriceBySymbol = new Map<string, number>();
+  markPriceBySymbol = new Map<string, number>();
   private orderSeq = 100;
 
   async getExchangeFilters(): Promise<Map<string, FuturesSymbolFilters>> {
@@ -71,8 +72,17 @@ class FakeExecClient implements CrossSectionalExecClient {
   async setLeverage(symbol: string, leverage: number): Promise<void> {
     this.leverageCalls.push({ symbol, leverage });
   }
-  async getPositions(): Promise<never[]> {
-    return [];
+  async getPositions(): Promise<FuturesPosition[]> {
+    return Array.from(this.markPriceBySymbol.entries()).map(([symbol, markPrice]) => ({
+      symbol,
+      positionAmt: 0,
+      entryPrice: 0,
+      markPrice,
+      liquidationPrice: 0,
+      unRealizedProfit: 0,
+      leverage: 3,
+      marginType: "ISOLATED",
+    }));
   }
   async placeOrder(params: { symbol: string; side: string; quantity: number; reduceOnly?: boolean }): Promise<{ orderId: number; avgPrice: number }> {
     if (this.failOnSymbol === params.symbol && !params.reduceOnly) throw new Error(`exchange rejected ${params.symbol}`);
@@ -201,6 +211,83 @@ describe("cross-sectional executor (basket execution, testnet-first)", () => {
     expect(basket.netPnlUsd!).toBeLessThan(basket.grossPnlUsd!);
     const closes = client.placed.filter((p) => p.reduceOnly);
     expect(closes.length).toBe(2);
+  });
+
+  it("PROFIT BANK: closes early, before horizon, once live net return crosses the threshold", async () => {
+    const client = new FakeExecClient();
+    client.fillPriceBySymbol.set("SOLUSDT", 100);
+    client.fillPriceBySymbol.set("DOGEUSDT", 0.1);
+    const { executor, store } = makeExecutor({ client, signalMs: NOW_MS - 5 * 60_000 });
+    await executor.tick();
+    const basket = store.getState().baskets[0]!;
+    expect(basket.status).toBe("OPEN");
+
+    // SOL long +4%, DOGE short flat: gross = 0.04/2 + 0/2 = 0.02; net = 0.02 - 0.0012 = 0.0188 >= 0.006 default.
+    client.markPriceBySymbol.set("SOLUSDT", 104);
+    client.markPriceBySymbol.set("DOGEUSDT", 0.1);
+    client.fillPriceBySymbol.set("SOLUSDT", 104); // exit fill price on the actual reduce-only close
+    client.fillPriceBySymbol.set("DOGEUSDT", 0.1);
+    // Still hours from horizon — only the live-return check should trigger this, not closeDueBaskets.
+    expect(basket.closesAtMs).toBeGreaterThan(NOW_MS);
+    await executor.tick();
+
+    expect(basket.status).toBe("CLOSED");
+    expect(basket.closeReason).toBe("PROFIT_BANK");
+    expect(basket.netPnlUsd!).toBeGreaterThan(0);
+    const closes = client.placed.filter((p) => p.reduceOnly);
+    expect(closes.length).toBe(2);
+  });
+
+  it("PROFIT BANK: stays open when live net return is below the threshold", async () => {
+    const client = new FakeExecClient();
+    client.fillPriceBySymbol.set("SOLUSDT", 100);
+    client.fillPriceBySymbol.set("DOGEUSDT", 0.1);
+    const { executor, store } = makeExecutor({ client, signalMs: NOW_MS - 5 * 60_000 });
+    await executor.tick();
+    const basket = store.getState().baskets[0]!;
+
+    // SOL long +0.5%, DOGE short flat: gross = 0.005/2 = 0.0025; net = 0.0025 - 0.0012 = 0.0013 < 0.006.
+    client.markPriceBySymbol.set("SOLUSDT", 100.5);
+    client.markPriceBySymbol.set("DOGEUSDT", 0.1);
+    await executor.tick();
+
+    expect(basket.status).toBe("OPEN");
+  });
+
+  it("PROFIT BANK: never forces a decision on incomplete mark-price data (one leg missing)", async () => {
+    const client = new FakeExecClient();
+    client.fillPriceBySymbol.set("SOLUSDT", 100);
+    client.fillPriceBySymbol.set("DOGEUSDT", 0.1);
+    const { executor, store } = makeExecutor({ client, signalMs: NOW_MS - 5 * 60_000 });
+    await executor.tick();
+    const basket = store.getState().baskets[0]!;
+
+    // SOL alone would clear the threshold, but DOGE's mark price is missing entirely.
+    client.markPriceBySymbol.set("SOLUSDT", 110);
+    await executor.tick();
+
+    expect(basket.status).toBe("OPEN");
+  });
+
+  it("PROFIT BANK: respects CROSS_SECTIONAL_EXEC_TP_NET_RETURN override", async () => {
+    process.env.CROSS_SECTIONAL_EXEC_TP_NET_RETURN = "0.05"; // much higher bar
+    try {
+      const client = new FakeExecClient();
+      client.fillPriceBySymbol.set("SOLUSDT", 100);
+      client.fillPriceBySymbol.set("DOGEUSDT", 0.1);
+      const { executor, store } = makeExecutor({ client, signalMs: NOW_MS - 5 * 60_000 });
+      await executor.tick();
+      const basket = store.getState().baskets[0]!;
+
+      // Same +4%/0% move that cleared the 0.6% default now falls short of the 5% override.
+      client.markPriceBySymbol.set("SOLUSDT", 104);
+      client.markPriceBySymbol.set("DOGEUSDT", 0.1);
+      await executor.tick();
+
+      expect(basket.status).toBe("OPEN");
+    } finally {
+      delete process.env.CROSS_SECTIONAL_EXEC_TP_NET_RETURN;
+    }
   });
 });
 

@@ -21,6 +21,7 @@ import { dirname, resolve } from "node:path";
 
 import type { BinanceFuturesPrivateClient } from "./binance-futures-private.js";
 import {
+  CROSS_SECTIONAL_ROUNDTRIP_BPS,
   type CrossSectionalObservation,
   type CrossSectionalStore,
 } from "./cross-sectional-edge.js";
@@ -63,6 +64,21 @@ const MAX_SIGNAL_AGE_MS = () =>
 const MAX_OPEN_BASKETS = () =>
   Math.max(1, Math.floor(Number(process.env.CROSS_SECTIONAL_EXEC_MAX_OPEN_BASKETS) || 1));
 const TAKER_FEE_RATE = 0.0005; // 5 bps per side, conservative
+/**
+ * Profit-bank trigger, expressed as net (cost-adjusted) return on deployed capital — same unit as
+ * cross-sectional-edge.ts's netReturn. Default 0.6% is sourced from measured reality, not a guess:
+ * as of 2026-07-06 the executed FILTERED variant's 77 closed baskets averaged netAvgReturn=0.592%
+ * at the full 24h HORIZON exit (100% of closes were HORIZON — nothing ever exited early). Baskets
+ * were sitting the full horizon even when they'd already reached-or-beaten that average well before
+ * hour 24 (see recentNetReturns spread in /api/shadow/cross-sectional-report). Banking the average
+ * outcome as soon as it's reached — instead of waiting out the clock for a coin-flip on the rest —
+ * frees the basket slot for a fresh cycle sooner. Only ever fires on the profit side; a basket that
+ * never reaches this still rides HORIZON (or an existing SL/regime-flip cut) exactly as before.
+ */
+const TP_NET_RETURN = () => {
+  const n = Number.parseFloat(process.env.CROSS_SECTIONAL_EXEC_TP_NET_RETURN ?? "");
+  return Number.isFinite(n) && n > 0 ? n : 0.006;
+};
 
 export interface ExecutorLeg {
   symbol: string;
@@ -217,11 +233,12 @@ export class CrossSectionalExecutor {
     };
   }
 
-  /** Single-flight tick: close due baskets, then consider opening a new one. */
+  /** Single-flight tick: bank early winners, close due baskets, then consider opening a new one. */
   async tick(): Promise<void> {
     if (this.ticking) return;
     this.ticking = true;
     try {
+      await this.closeBasketsHittingProfitTarget();
       await this.closeDueBaskets();
       await this.ensureOpenBasketLeverage();
       if (this.isAllowed()) await this.maybeOpenBasket();
@@ -230,6 +247,46 @@ export class CrossSectionalExecutor {
       this.lastError = (error as Error).message ?? "tick failed";
     } finally {
       this.ticking = false;
+    }
+  }
+
+  /**
+   * Proactively close any OPEN basket whose live net (cost-adjusted) return on deployed capital
+   * has already reached TP_NET_RETURN, instead of always waiting for the fixed HORIZON. Uses
+   * markPrice from getPositions() (a market-level field, safe to reuse even if another concurrent
+   * basket shares the same symbol) against THIS basket's own recorded entry prices/qty — never the
+   * exchange's aggregated unRealizedProfit, which would blend PnL across baskets sharing a symbol.
+   */
+  private async closeBasketsHittingProfitTarget(): Promise<void> {
+    const st = this.store.getState();
+    const openBaskets = st.baskets.filter((b) => b.status === "OPEN");
+    if (openBaskets.length === 0) return;
+
+    const positions = await this.client.getPositions();
+    const markBySymbol = new Map<string, number>();
+    for (const p of positions) {
+      if (Number.isFinite(p.markPrice) && p.markPrice > 0) markBySymbol.set(p.symbol, p.markPrice);
+    }
+
+    const threshold = TP_NET_RETURN();
+    for (const basket of openBaskets) {
+      const longLegs = basket.legs.filter((l) => l.side === "LONG");
+      const shortLegs = basket.legs.filter((l) => l.side === "SHORT");
+      const legReturn = (leg: ExecutorLeg, direction: "LONG" | "SHORT"): number | null => {
+        const mark = markBySymbol.get(leg.symbol);
+        if (mark === undefined || !(leg.entryPrice > 0)) return null;
+        return direction === "LONG" ? (mark - leg.entryPrice) / leg.entryPrice : (leg.entryPrice - mark) / leg.entryPrice;
+      };
+      const longReturns = longLegs.map((l) => legReturn(l, "LONG"));
+      const shortReturns = shortLegs.map((l) => legReturn(l, "SHORT"));
+      if (longReturns.some((r) => r === null) || shortReturns.some((r) => r === null)) continue; // incomplete mark data — skip this tick, never force a decision on partial info
+
+      const meanLong = longReturns.length ? longReturns.reduce((a, b) => a! + b!, 0)! / longReturns.length : 0;
+      const meanShort = shortReturns.length ? shortReturns.reduce((a, b) => a! + b!, 0)! / shortReturns.length : 0;
+      const grossReturn = meanLong / 2 + meanShort / 2; // mirrors legReturnContribution's equal-notional formula
+      const costReturn = CROSS_SECTIONAL_ROUNDTRIP_BPS / 10_000;
+      const netReturn = grossReturn - costReturn;
+      if (netReturn >= threshold) await this.closeBasket(basket, "PROFIT_BANK");
     }
   }
 
