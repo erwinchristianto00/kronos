@@ -140,6 +140,29 @@ describe("portfolio-trend-shadow admission", () => {
     expect(store.all[0]!.closeReason).toBe("TIME_STOP_EXPIRED");
   });
 
+  it("time-stop resolution records grossR/netR as null (unmeasured), never a fabricated 0", async () => {
+    // No candle walk exists yet to compute what price actually did, so grossR must stay honestly
+    // unmeasured. Recording a fabricated 0 would silently bias the report's netAvgR downward for
+    // every trend position that survives to its time stop (which, for a wide-stop trend lane, likely
+    // means it moved somewhere real) and could push a genuinely working lane into a false KILL verdict.
+    const store = mkStore();
+    const r = admitToPortfolioTrendShadow(bullishLongCandidate(), store);
+    store.add(r.position!);
+    const futureMs = Date.parse(r.position!.openedAt) + 49 * 60 * 60 * 1000;
+    await resolvePortfolioTrendPositions(store, undefined, { nowMs: futureMs });
+
+    expect(store.all[0]!.grossR).toBeNull();
+    expect(store.all[0]!.netR).toBeNull();
+
+    // The report builder's freshValid filter already excludes grossR===null — a time-stop-only
+    // position must NOT count toward freshValidResolved/netAvgR/PF/WR at all (not count as a fake
+    // flat trade), since there's nothing honest to report about it yet.
+    const report = buildPortfolioTrendShadowReport(store);
+    expect(report.resolvedObs).toBe(1); // it IS resolved (no longer OPEN)...
+    expect(report.freshValidResolved).toBe(0); // ...but contributes zero to the economics sample
+    expect(report.freshValidNetAvgR).toBeNull();
+  });
+
   it("buildPortfolioTrendShadowReport returns expected initial shape", () => {
     const store = mkStore();
     const r = buildPortfolioTrendShadowReport(store);

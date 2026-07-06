@@ -386,12 +386,19 @@ export async function resolvePortfolioTrendPositions(
         const elapsedMs = nowMs - openedMs;
         if (elapsedMs >= pos.timeStopHours * 3600 * 1000) {
           const closedAt = new Date(nowMs).toISOString();
+          // grossR/netR are genuinely UNMEASURED here (no candle walk yet — see the TODO above),
+          // not zero. A wide-stop trend position that survives long enough to hit the time stop has
+          // very likely moved meaningfully; fabricating grossR=0 silently biased freshValid's
+          // netAvgR/PF/WR downward and could push a genuinely working trend lane into a false KILL
+          // verdict. null is excluded from freshValid by the report builder's own existing filter
+          // (`p.grossR !== null`) — the same "honest unmeasured, not a fake number" convention this
+          // position already uses for its initial OPEN state.
           store.update(pos.id, {
             status: "CLOSED_TIME_STOP",
             closedAt,
             closeReason: "TIME_STOP_EXPIRED",
-            grossR: 0,
-            netR: pos.costR !== null ? -pos.costR : 0,
+            grossR: null,
+            netR: null,
             durationHours: elapsedMs / (3600 * 1000),
           });
           resolved += 1;

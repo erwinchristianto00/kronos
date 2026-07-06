@@ -192,12 +192,15 @@ function variantSupportsDirection(def: VariantMatrixVariantDefinition, direction
   return true;
 }
 
+// Exact match only. Substring containment previously used here (`wanted.includes(candidateKey) ||
+// candidateKey.includes(wanted)`) silently matched an unrelated cohort whenever one key happened to
+// be a substring of another — a real risk for ticker symbols (e.g. Binance's own "1000PEPEUSDT" vs
+// a hypothetical "PEPEUSDT") and compound axis-symbol keys, not just a theoretical one. This value
+// feeds directly into lane-selection scoring for the real-time short mirror (real order placement),
+// so a wrong cohort match would silently misattribute another symbol/regime's historical edge.
 function matchedCohortNet(rows: LaneSelectorV2BreakdownRow[] | null | undefined, key: string, minSample: number): number | null {
   const wanted = key.toLowerCase();
-  const row = rows?.find((candidate) => {
-    const candidateKey = candidate.key.toLowerCase();
-    return candidateKey === wanted || wanted.includes(candidateKey) || candidateKey.includes(wanted);
-  });
+  const row = rows?.find((candidate) => candidate.key.toLowerCase() === wanted);
   if (!row || row.n < minSample || !isFiniteNumber(row.netAvgR)) return null;
   return row.netAvgR;
 }

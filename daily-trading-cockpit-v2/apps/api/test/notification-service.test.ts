@@ -328,8 +328,9 @@ describe("notification-service", () => {
     expect(messages[0]).toContain("Closed: 2");
     expect(messages[0]).toContain("Wins / Losses: 2 / 0");
     expect(messages[0]).toContain("Headline PnL: NT$ 0");
-    expect(messages[0]).toContain("Diagnostic PnL: NT$ 40");
-    expect(messages[0]).toContain("Total PnL: NT$ 40");
+    // 39.41 rounds to the NEAREST whole unit (39), not up to 40 — see the fmtNtd rounding fix.
+    expect(messages[0]).toContain("Diagnostic PnL: NT$ 39");
+    expect(messages[0]).toContain("Total PnL: NT$ 39");
     expect(messages[0]).toContain("CUMULATIVE");
     expect(messages[0]).toContain("Open positions now: 7");
     expect(messages[0]).toContain("Wins / Losses: 123 / 30");
@@ -355,11 +356,33 @@ describe("notification-service", () => {
     expect(projection.projectedBalance).toBeCloseTo(11253.6364, 4);
   });
 
-  it("[15] NTD formatter rounds upward to whole units with Indonesian separators", () => {
+  it("[15] NTD formatter rounds to the nearest whole unit with Indonesian separators", () => {
     expect(fmtNtd(0)).toBe("NT$ 0");
     expect(fmtNtd(-0)).toBe("NT$ 0");
     expect(fmtNtd(12_000)).toBe("NT$ 12.000");
-    expect(fmtNtd(1_234.001)).toBe("NT$ 1.235");
+    expect(fmtNtd(1_234.001)).toBe("NT$ 1.234");
     expect(fmtNtd(-12.349)).toBe("NT$ -12");
+  });
+
+  it("[15b] NTD formatter rounds small gains/losses symmetrically (was Math.ceil-biased: hid a -0.3 loss as 0 while inflating +0.3 to 1)", () => {
+    expect(fmtNtd(-0.3)).toBe("NT$ 0");
+    expect(fmtNtd(0.3)).toBe("NT$ 0"); // previously "NT$ 1" — inflated relative to the loss case above
+    expect(fmtNtd(-0.6)).toBe("NT$ -1");
+    expect(fmtNtd(0.6)).toBe("NT$ 1");
+  });
+
+  it("[14b] month-end projection stays internally consistent early in the month (dailyPace and remainingDays share the same clamped time basis)", () => {
+    // 6 hours into the 1st of the month: elapsedDays=0.25, clamped to 1 for BOTH the pace
+    // denominator and the remaining-days subtraction. Before the fix, dailyPace used the clamped
+    // 1 but remainingDays used the raw 0.25 — inconsistent bases that wildly overstated the
+    // projection (a $100 morning projected as +$3075 for the rest of a 31-day month).
+    const projection = calculateLinearMonthEndProjection(
+      1000,
+      100,
+      new Date("2026-07-01T06:00:00.000Z"), // July has 31 days
+    );
+    expect(projection.dailyPace).toBeCloseTo(100, 6); // 100 / max(1, 0.25) = 100
+    // remainingDays = 31 - max(1, 0.25) = 30 ⇒ projected = 1000 + 100*30 = 4000, not 4075.
+    expect(projection.projectedBalance).toBeCloseTo(4000, 6);
   });
 });

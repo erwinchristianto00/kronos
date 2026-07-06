@@ -206,12 +206,32 @@ export function planRegimeFlipRescue(input: {
     }
 
     const origAbs = Math.abs(pos.positionAmt);
-    const targetNetQty = origAbs * config.netFraction;
-    let flipQty = origAbs + targetNetQty; // close the opposing leg AND open the net regime-aligned leg
+    const uncappedTargetNetQty = origAbs * config.netFraction;
+    const uncappedFlipQty = origAbs + uncappedTargetNetQty; // close the opposing leg AND open the net regime-aligned leg
+    const flipNotional = uncappedFlipQty * pos.markPrice;
+    let flipQty = uncappedFlipQty;
+    let targetNetQty = uncappedTargetNetQty;
     let cappedNote = "";
-    const flipNotional = flipQty * pos.markPrice;
     if (flipNotional > config.maxNotionalUsd) {
       flipQty = config.maxNotionalUsd / pos.markPrice;
+      // maxNotionalUsd caps the ORDER size, not just the resulting net — if the cap doesn't even
+      // cover closing the original position, the order would only REDUCE it (never cross zero),
+      // leaving it still opposing the regime while getting labeled "in rescue" and losing the
+      // engine's normal harvest/hard-cut protection (both explicitly skip rescue=true intents).
+      // Skip rather than execute a flip that silently isn't one.
+      if (!(flipQty > origAbs)) {
+        plan.skips.push({
+          symbol: pos.symbol,
+          reason:
+            `capped flip (${config.maxNotionalUsd.toFixed(0)} USDT / ${pos.markPrice} = ${flipQty.toFixed(6)}) ` +
+            `would not cross zero (orig ${origAbs.toFixed(6)}) — raise maxNotionalUsd or reduce position size`,
+        });
+        continue;
+      }
+      // Still crosses zero, but to a smaller net than intended — recompute targetNetQty to match
+      // what will ACTUALLY be left after this capped order, so the execution side's post-flip
+      // direction/qty bookkeeping reflects reality instead of the pre-cap intent.
+      targetNetQty = flipQty - origAbs;
       cappedNote = ` [capped to ${config.maxNotionalUsd.toFixed(0)} USDT notional]`;
     }
     // Regime-aligned side is the opposite of the stuck (opposing) side.

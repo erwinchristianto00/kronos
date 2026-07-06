@@ -300,4 +300,16 @@ describe("buildRoutingMonitorReport", () => {
     expect(r.topImprovingRoutes.length).toBe(0);
     expect(r.legacyLeaks.length).toBe(1); // still shows in legacy
   });
+
+  it("does NOT label a still-net-negative route as 'improving' (was `> -0.05`, admitting near-breakeven losers)", () => {
+    const positions = [
+      // netAvgR = -0.02 — still a net loser, just a mild one. Must NOT appear as "improving".
+      makePosition({ id: "mild-loser", firstSeenAt: TODAY, routeMode: "DATA_COLLECTION", entry: "fib_500_entry", exit: "tp1_full_exit", closedNetR: [-0.01, -0.02, -0.03] }),
+      // A genuinely positive route should still show up.
+      makePosition({ id: "real-winner", firstSeenAt: TODAY, routeMode: "DATA_COLLECTION", entry: "vwap_retest_entry", exit: "tp1_full_exit", closedNetR: [0.1, 0.2, 0.15] }),
+    ];
+    const r = buildRoutingMonitorReport(positions, new Date(TODAY));
+    expect(r.topImprovingRoutes.length).toBe(1);
+    expect(r.topImprovingRoutes[0].entryVariant).toBe("vwap_retest_entry");
+  });
 });

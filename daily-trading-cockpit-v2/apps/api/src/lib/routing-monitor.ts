@@ -277,9 +277,11 @@ export function buildRoutingMonitorReport(
     .sort((a, b) => (a.netAvgR ?? 0) - (b.netAvgR ?? 0))
     .slice(0, 5);
 
-  // Top improving routes: best positive netAvgR with meaningful sample (≥3 closed)
+  // Top improving routes: best positive netAvgR with meaningful sample (≥3 closed). Was `> -0.05`,
+  // which let routes still net-negative (down to -0.05R) populate a list documented as "positive" —
+  // an operator scanning this for a promotion candidate could mistake a mildly-losing combo for one.
   const topImprovingRoutes = evidenceRows
-    .filter((r) => r.closedCount >= 3 && r.netAvgR !== null && r.netAvgR > -0.05)
+    .filter((r) => r.closedCount >= 3 && r.netAvgR !== null && r.netAvgR > 0)
     .sort((a, b) => (b.netAvgR ?? 0) - (a.netAvgR ?? 0))
     .slice(0, 5);
 

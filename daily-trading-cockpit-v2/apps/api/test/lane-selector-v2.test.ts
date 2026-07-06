@@ -169,6 +169,43 @@ describe("LaneSelectorV2", () => {
     expect(result.rejected).toContain("CG_WIDE_FAST_SHORT:policy_target_unavailable");
   });
 
+  it("never attributes an UNRELATED symbol's cohort edge via substring containment (exact match only)", () => {
+    // "1000PEPEUSDT" contains "PEPEUSDT" as a literal substring — a real, not hypothetical, pattern
+    // on Binance Futures (rebased/leveraged contracts). Before the fix, matchedCohortNet's
+    // `candidateKey.includes(wanted)` fallback would have silently attributed this unrelated
+    // symbol's strong +0.9 cohort edge to a PEPEUSDT candidate that has no cohort data of its own.
+    const result = selectLaneV2({
+      candidate: {
+        symbol: "PEPEUSDT",
+        direction: "SHORT",
+        currentPrice: 100,
+        stopLoss: 104,
+        takeProfitLevels: [94],
+        stopDistanceBps: 400,
+      },
+      regime: "Bearish pressure",
+      controllerMode: "SHORT_ONLY",
+      now: "2026-06-25T04:00:00.000Z",
+      laneStates: [
+        {
+          variantId: "CG_MFE_GIVEBACK",
+          status: "STABLE_CANDIDATE",
+          freshValid: 200,
+          netAvgR: 0.1,
+          pf: 1.5,
+          wr: 0.55,
+          payoffRatio: 1.1,
+          plus10bpsStillPositive: true,
+          bySymbol: [{ key: "1000PEPEUSDT", n: 20, netAvgR: 0.9 }],
+        },
+      ],
+    });
+
+    // symbolEdge must be exactly 0 (the neutral no-cohort-data fallback) — never influenced by the
+    // unrelated "1000PEPEUSDT" row's +0.9 netAvgR.
+    expect(result.evaluated[0]!.scoreBreakdown.symbolEdge).toBe(0);
+  });
+
   it("uses WIDE FAST SHORT when SHORT_ONLY is an extended trend (CG_WIDE_STOP_TP_WIDE cut from the split 2026-07-01)", () => {
     const estimatedRegime = estimateLaneSelectorV2Regime({
       regime: "Bearish pressure",

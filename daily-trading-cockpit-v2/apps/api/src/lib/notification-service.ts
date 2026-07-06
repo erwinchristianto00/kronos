@@ -155,7 +155,11 @@ function fmtNumber(value: number | null, digits = 2, signed = false): string {
 
 export function fmtNtd(value: number | null): string {
   if (value === null) return "n/a";
-  const rounded = Math.ceil(value - Number.EPSILON);
+  // Math.ceil (the previous rounding here) is directionally asymmetric: it rounds every value in
+  // (-1, 0) UP to 0 (hiding a small real loss as "NT$ 0") while rounding every value in (0, 1) UP
+  // to 1 (inflating a small real gain) — a systematic bias in money display, not a style choice.
+  // Math.round rounds toward the nearest integer symmetrically (both -0.3 and +0.3 → 0).
+  const rounded = Math.round(value);
   const roundedUp = rounded === 0 ? 0 : rounded;
   return `NT$ ${new Intl.NumberFormat("id-ID", {
     maximumFractionDigits: 0,
@@ -192,7 +196,12 @@ export function calculateLinearMonthEndProjection(
     Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 0),
   ).getUTCDate();
   const dailyPace = monthTotalPaperPnl / safeElapsedDays;
-  const remainingDays = Math.max(0, daysInMonth - elapsedDays);
+  // remainingDays must share dailyPace's time basis (safeElapsedDays), not the raw unclamped
+  // elapsedDays — otherwise, early in the month (elapsedDays<1), dailyPace divides by the clamped
+  // 1-day floor while remainingDays uses the true fractional elapsed time, understating how much
+  // "days elapsed" the pace already represents and wildly overstating the projection (e.g. a $100
+  // move in the first 6 hours of the month projected as if $100/day for the other ~30 days).
+  const remainingDays = Math.max(0, daysInMonth - safeElapsedDays);
   return {
     projectedBalance: totalBalance + dailyPace * remainingDays,
     dailyPace,

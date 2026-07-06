@@ -65,6 +65,30 @@ describe("planRegimeFlipRescue — flip side", () => {
     });
     expect(plan.flips[0]!.flipQty).toBeCloseTo(250 / 1.04, 6);
     expect(plan.flips[0]!.reason).toMatch(/capped/);
+    // The cap still leaves flipQty (240.38) > origAbs (236.2), so it DOES cross zero — but to a
+    // smaller net than the uncapped 236.2 originally intended. targetNetQty must reflect what will
+    // ACTUALLY be left after this capped order (240.38 - 236.2 ≈ 4.18), not the stale pre-cap intent.
+    expect(plan.flips[0]!.targetNetQty).toBeCloseTo(250 / 1.04 - 236.2, 6);
+  });
+
+  it("SKIPS instead of flipping when the notional cap would not even cross zero (would only reduce, not flip, the stuck position)", () => {
+    // origAbs=1000 @ markPrice=1.04 ⇒ orig notional 1040 USDT, already over the 250 cap on its own.
+    // The old code would have capped flipQty to 250/1.04≈240.4 — LESS than origAbs=1000 — producing
+    // an order that only reduces the stuck LONG to ~759.6, never crossing zero, while still being
+    // recorded as a "flip" and (on the execution side) labeled rescue=true, losing the engine's
+    // normal harvest/hard-cut protection for a position that is still fully opposing the regime.
+    const plan = planRegimeFlipRescue({
+      config: CFG,
+      opposingDirection: "LONG",
+      nowMs: NOW,
+      availableBalanceUsd: 100,
+      positions: [STUCK_LONG({ positionAmt: 1000, netAfterCostUsd: -20 })],
+      activeRescueCount: 0,
+    });
+    expect(plan.flips).toHaveLength(0);
+    expect(plan.skips).toHaveLength(1);
+    expect(plan.skips[0]!.symbol).toBe("XRPUSDT");
+    expect(plan.skips[0]!.reason).toMatch(/would not cross zero/);
   });
 
   it("flips a stuck SHORT to net LONG when the regime is LONG_ONLY (opposingDirection SHORT)", () => {
