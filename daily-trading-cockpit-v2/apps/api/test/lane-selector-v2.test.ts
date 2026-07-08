@@ -6,6 +6,124 @@ import {
   selectLaneV2,
 } from "../src/lib/lane-selector-v2.js";
 
+// 2026-07-08 operator per-symbol audit: CG_WIDE_FAST_SHORT's pooled testnet/live stats looked
+// flat-to-negative (WR ~55%, meanR ~-0.2) despite the SAME week showing WLD/SUI/FET at 87-100%
+// WR — NEAR/INJ/XRP/SEI sat at 17-48% WR (well under the 66.7% breakeven bar for a 0.5R target)
+// in that identical window, on BOTH testnet and live independently. Confirmed genuine per-symbol
+// underperformance, not a regime-timing artifact. excludedSymbols blocks REAL admission only —
+// measurement (current-guard-variant-matrix.ts) keeps recording all symbols for OOS tracking.
+describe("LaneSelectorV2 — excludedSymbols (per-symbol real-admission block)", () => {
+  const stableFastShortOnly = [
+    { variantId: "CG_WIDE_FAST_SHORT" as const, status: "STABLE_CANDIDATE" as const, freshValid: 200, netAvgR: 0.3, pf: 1.3 },
+  ];
+  function shortAt(symbol: string) {
+    return selectLaneV2({
+      candidate: { symbol, direction: "SHORT" as const, currentPrice: 100, stopLoss: 103, takeProfitLevels: [98.5], stopDistanceBps: 300 },
+      regime: "Bearish pressure",
+      controllerMode: "SHORT_ONLY",
+      controllerConfidence: "MEDIUM",
+      now: "2026-07-08T04:00:00.000Z",
+      laneStates: stableFastShortOnly,
+    });
+  }
+
+  it("rejects NEAR/INJ/XRP/SEI for CG_WIDE_FAST_SHORT with an explicit symbol_excluded reason", () => {
+    for (const symbol of ["NEARUSDT", "INJUSDT", "XRPUSDT", "SEIUSDT"]) {
+      const result = shortAt(symbol);
+      expect(result.selected).toBeNull();
+      expect(result.rejected).toContain(`CG_WIDE_FAST_SHORT:symbol_excluded_${symbol}`);
+    }
+  });
+
+  it("still allows the verified-good symbols (WLD/DOGE/SUI/FET) through CG_WIDE_FAST_SHORT", () => {
+    for (const symbol of ["WLDUSDT", "DOGEUSDT", "SUIUSDT", "FETUSDT"]) {
+      const result = shortAt(symbol);
+      expect(result.selected?.lane.selectedLaneId).toBe(laneSelectorV2LaneId("CG_WIDE_FAST_SHORT"));
+    }
+  });
+
+  it("is case-insensitive (lowercase candidate symbol still gets blocked)", () => {
+    const result = shortAt("nearusdt");
+    expect(result.selected).toBeNull();
+  });
+
+  // NEARUSDT is excluded from CG_WIDE_FAST_SHORT specifically — but selectLaneV2 hardcodes
+  // CG_WIDE_FAST_SHORT as the preferred policy target for ANY plain SHORT candidate (2026-07-01
+  // real-money decision, see policyPreferredVariants), so proving "a different lane still works
+  // for the same symbol" requires the SAME rotation-shortlist escape hatch the pre-existing tests
+  // below use (shortlistEligibleVariantIds.size > 0 bypasses that hardcoded preference).
+  it("does NOT block the same symbol for an unrelated lane (scope is per-variant, not global)", () => {
+    const result = selectLaneV2({
+      candidate: { symbol: "NEARUSDT", direction: "SHORT" as const, currentPrice: 100, stopLoss: 104, takeProfitLevels: [94], stopDistanceBps: 400 },
+      regime: "Bearish pressure",
+      controllerMode: "SHORT_ONLY",
+      controllerConfidence: "MEDIUM",
+      now: "2026-07-08T04:00:00.000Z",
+      rotationShortlist: {
+        generatedAt: "2026-07-08T04:00:00.000Z",
+        minAllowSample: 10,
+        minWatchSample: 5,
+        bearishGlobal: [],
+        bullishGlobal: [],
+        lanes: [
+          {
+            laneId: laneSelectorV2LaneId("CG_WIDE_STOP_TP_WIDE"),
+            variantId: "CG_WIDE_STOP_TP_WIDE",
+            label: "Wide",
+            bullish: [],
+            bearish: [
+              { symbol: "NEARUSDT", n: 18, netAvgR: 0.22, pf: 2.1, wr: 0.78, score: 30, verdict: "ALLOW", reason: "test allow" },
+            ],
+          },
+        ],
+      },
+      laneStates: [
+        { variantId: "CG_WIDE_STOP_TP_WIDE", status: "REJECT", freshValid: 200, netAvgR: -0.3, pf: 0.6, wr: 0.45, byAxisSymbol: [{ key: "SHORT_BEARISH|NEARUSDT", n: 18, netAvgR: 0.22 }] },
+      ],
+    });
+    expect(result.selected?.lane.selectedLaneId).toBe(laneSelectorV2LaneId("CG_WIDE_STOP_TP_WIDE"));
+  });
+});
+
+describe("LaneSelectorV2 — manualEnabledVariantIds bypass (2026-07-08, wiring new lanes into allocation)", () => {
+  const twoCompetingShortLanes = [
+    { variantId: "CG_WIDE_FAST_SHORT" as const, status: "STABLE_CANDIDATE" as const, freshValid: 200, netAvgR: 0.1, pf: 1.1 },
+    { variantId: "CG_MFE_GIVEBACK" as const, status: "STABLE_CANDIDATE" as const, freshValid: 200, netAvgR: 0.5, pf: 2.0 },
+  ];
+  function shortCandidate(overrides: Partial<Parameters<typeof selectLaneV2>[0]> = {}) {
+    return selectLaneV2({
+      candidate: { symbol: "BTCUSDT", direction: "SHORT" as const, currentPrice: 100, stopLoss: 104, takeProfitLevels: [94], stopDistanceBps: 400 },
+      regime: "Bearish pressure",
+      controllerMode: "SHORT_ONLY",
+      controllerConfidence: "MEDIUM",
+      now: "2026-07-08T04:00:00.000Z",
+      laneStates: twoCompetingShortLanes,
+      ...overrides,
+    });
+  }
+
+  it("without manualEnabledVariantIds, the hardcoded CG_WIDE_FAST_SHORT preference wins regardless of score (unchanged default)", () => {
+    const result = shortCandidate();
+    expect(result.selected?.lane.selectedLaneId).toBe(laneSelectorV2LaneId("CG_WIDE_FAST_SHORT"));
+  });
+
+  it("an empty manualEnabledVariantIds set behaves the same as omitted (still hardcoded default)", () => {
+    const result = shortCandidate({ manualEnabledVariantIds: new Set() });
+    expect(result.selected?.lane.selectedLaneId).toBe(laneSelectorV2LaneId("CG_WIDE_FAST_SHORT"));
+  });
+
+  it("a non-empty manualEnabledVariantIds bypasses the hardcoded preference — the higher-scored allocated lane wins", () => {
+    const result = shortCandidate({ manualEnabledVariantIds: new Set(["CG_MFE_GIVEBACK"]) });
+    expect(result.selected?.lane.selectedLaneId).toBe(laneSelectorV2LaneId("CG_MFE_GIVEBACK"));
+  });
+
+  it("bypass still applies even when manualEnabledVariantIds names a THIRD lane not in this candidate's own evaluated set — any active allocation is a global signal, not per-lane", () => {
+    const result = shortCandidate({ manualEnabledVariantIds: new Set(["CG_WIDE_LONG_RUNNER"]) });
+    // Falls through to score-best among what WAS evaluated (CG_MFE_GIVEBACK, higher netAvgR).
+    expect(result.selected?.lane.selectedLaneId).toBe(laneSelectorV2LaneId("CG_MFE_GIVEBACK"));
+  });
+});
+
 describe("LaneSelectorV2", () => {
   it("allows a non-stable lane only when the bearish rotation shortlist proves that exact symbol", () => {
     const result = selectLaneV2({
@@ -248,7 +366,7 @@ describe("LaneSelectorV2", () => {
     });
     const result = selectLaneV2({
       candidate: {
-        symbol: "XRPUSDT", // deterministic bucket 84 at this minute
+        symbol: "BTCUSDT", // placeholder — bySymbol/byAxisSymbol unset in this fixture, so symbol has zero scoring effect here
         direction: "SHORT",
         currentPrice: 100,
         stopLoss: 104,

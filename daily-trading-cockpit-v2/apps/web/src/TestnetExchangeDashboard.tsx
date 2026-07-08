@@ -16,6 +16,17 @@ const LIVE_LANE_OPTIONS = [
   'CG_MFE_GIVEBACK',
   'CG_BE_AFTER_05',
   'CROSS_SECTIONAL_MARKET_NEUTRAL',
+  // 2026-07-08: extra cross-sectional executor instances wired alongside the FILTERED foundation
+  // lane — each mirrors its own measured variant (trend-following / mean-reversion) and only
+  // trades when BOTH this allocation weight is >0 AND that variant's own internal regime gate
+  // (TREND_LONG/SHORT for TREND, MIXED_CHOP for MIXED) agrees. See cross-sectional-executor.ts.
+  'CROSS_SECTIONAL_TREND',
+  'CROSS_SECTIONAL_MIXED',
+  // 2026-07-08: single-symbol executors with their OWN entry signals (not the shared scanner
+  // candidate every CG_* variant rides on) — SingleSymbolLaneExecutor, own enable flag
+  // (SHORT_FADE_EXEC_ENABLED / INTRADAY_MOMENTUM_EXEC_ENABLED on the VPS env).
+  'SHORT_FADE_EXHAUSTION_CROWDED',
+  'INTRADAY_MOMENTUM_BREAKOUT_LONG',
 ];
 const PERFORMANCE_VIEW_OPTIONS = [
   { value: 'hourly', label: 'Hourly' },
@@ -188,6 +199,12 @@ interface LiveAccount {
     leverage: number;
     sourceOrderCount: number;
     laneIds: string[];
+    intentDirection?: 'LONG' | 'SHORT' | null;
+    intentQty?: number | null;
+    intentEntryPrice?: number | null;
+    intentUnrealizedPnl?: number | null;
+    basketQty?: number | null;
+    basketUnrealizedPnl?: number | null;
   }>;
   lanes: Array<{
     laneId: string;
@@ -362,6 +379,17 @@ function formatBucketLabel(iso: string, view: string): string {
   return date.toLocaleDateString([], { year: 'numeric' });
 }
 
+// Terser than formatBucketLabel: hourly/daily views plot up to 24-31 ticks, so the axis
+// needs bare numbers (hour-of-day, day-of-month) rather than formatBucketLabel's full
+// "Jul 1" / "12:00 AM" strings, which would overlap at that density.
+function formatAxisTick(iso: string, view: string): string {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return '';
+  if (view === 'hourly') return `${date.getHours()}`.padStart(2, '0');
+  if (view === 'daily') return `${date.getDate()}`;
+  return formatBucketLabel(iso, view);
+}
+
 function pointCoord(
   point: LanePerformancePoint,
   index: number,
@@ -396,6 +424,171 @@ function localMonthInput(date = new Date()): string {
   return localDateInput(date).slice(0, 7);
 }
 
+type XsecExecStatus = {
+  enabled: boolean;
+  tpNetReturnPct?: number;
+  dailyRealizedUsd?: number;
+  dailyMaxLossUsd?: number;
+  openHalted?: string | null;
+  lastError?: string | null;
+  openBaskets?: Array<{
+    basketId: string;
+    openedAt: string;
+    closesAtMs: number;
+    lastNetReturn?: number | null;
+    lastNetAt?: string | null;
+    legs: Array<{ symbol: string; side: string; exitOrderId: number | null }>;
+  }>;
+};
+
+type RegimeAxisTimelineData = {
+  enabled: boolean;
+  points: Array<{ at: string; score: number; regime: string }>;
+  current: { at: string; score: number; regime: string } | null;
+  slopePerHour: number | null;
+  etaToNeutralHours: number | null;
+  slopeWindowHours: number;
+  zones?: Array<{ from: number; to: number; label: string; laneHint: string }>;
+  perRegimeMedianScore?: Record<string, number>;
+  projection?: Array<{ at: string; score: number }>;
+  guidance?: {
+    zoneLabel: string;
+    direction: 'MENUJU_NETRAL' | 'MENJAUH_NETRAL' | 'FLAT';
+    holdLane: string;
+    switchToLane: string | null;
+    switchAtScore: number | null;
+    etaToSwitchHours: number | null;
+    note: string;
+  } | null;
+  note: string;
+};
+
+/** Distance-to-neutral timeline: signed breadth composite (+1 bullish … 0 neutral … −1 bearish)
+ *  over the regime engine's snapshot history. The middle dashed line IS the neutral zone the
+ *  operator asked about — the closer the line drifts to it, the closer the regime is to flipping. */
+function RegimeAxisChart({ data }: { data: RegimeAxisTimelineData | null }) {
+  const width = 920;
+  const height = 220;
+  const padding = 34;
+  const plotWidth = width - padding * 2;
+  const plotHeight = height - padding * 2;
+  if (!data || data.points.length < 2 || !data.current) {
+    return (
+      <div className="testnet-chart-empty">
+        <strong>No regime history yet</strong>
+        <p>Grafik muncul setelah regime engine mengumpulkan beberapa snapshot (REGIME_ENGINE_ENABLED=1).</p>
+      </div>
+    );
+  }
+  const pts = data.points;
+  const proj = data.projection ?? [];
+  const t0 = new Date(pts[0]!.at).getTime();
+  const t1 = new Date((proj.length > 0 ? proj[proj.length - 1]! : pts[pts.length - 1]!).at).getTime();
+  const span = Math.max(1, t1 - t0);
+  // Fixed y-domain [-1, +1]: the score is bounded by construction, and a fixed frame keeps the
+  // "distance to the middle line" visually comparable across refreshes.
+  const xy = (p: { at: string; score: number }) => ({
+    x: padding + ((new Date(p.at).getTime() - t0) / span) * plotWidth,
+    y: padding + ((1 - p.score) / 2) * plotHeight,
+  });
+  const path = pts.map((p, i) => {
+    const { x, y } = xy(p);
+    return `${i === 0 ? 'M' : 'L'} ${x.toFixed(2)} ${y.toFixed(2)}`;
+  }).join(' ');
+  const zeroY = padding + plotHeight / 2;
+  const cur = xy(data.current);
+  const curColor = data.current.score > 0.02 ? '#5ce4a6' : data.current.score < -0.02 ? '#ff6b6b' : '#f0b54b';
+  const timeLabel = (iso: string) => new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  const eta = data.etaToNeutralHours;
+  return (
+    <div className="testnet-chart-wrap">
+      <svg className="testnet-lane-chart" viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Regime distance-to-neutral timeline">
+        <rect x="0" y="0" width={width} height={height} rx="12" className="testnet-chart-bg" />
+        {(data.zones ?? []).map((z) => {
+          // Zone band: y for score s = padding + ((1 - s) / 2) * plotHeight (top = +1).
+          const yTop = padding + ((1 - z.to) / 2) * plotHeight;
+          const yBot = padding + ((1 - z.from) / 2) * plotHeight;
+          const bull = (z.from + z.to) / 2 > 0.05;
+          const bear = (z.from + z.to) / 2 < -0.05;
+          const fill = bull ? 'rgba(92,228,166,0.06)' : bear ? 'rgba(255,107,107,0.06)' : 'rgba(240,181,75,0.05)';
+          return (
+            <g key={z.label}>
+              <rect x={padding} y={yTop} width={plotWidth} height={Math.max(1, yBot - yTop)} fill={fill} />
+              <text x={width - padding - 4} y={(yTop + yBot) / 2 + 3} textAnchor="end" style={{ fill: bull ? '#5ce4a6' : bear ? '#ff6b6b' : '#f0b54b', font: '600 9px/1 "IBM Plex Mono", monospace', opacity: 0.85 }}>
+                {z.label} · {z.laneHint}
+              </text>
+            </g>
+          );
+        })}
+        {[0.25, 0.75].map((ratio) => (
+          <line key={ratio} x1={padding} x2={width - padding} y1={padding + ratio * plotHeight} y2={padding + ratio * plotHeight} className="testnet-chart-grid" />
+        ))}
+        <line x1={padding} x2={width - padding} y1={zeroY} y2={zeroY} className="testnet-chart-zero" />
+        <text x={padding} y={padding - 8} className="testnet-chart-axis">BULLISH +1</text>
+        <text x={padding} y={zeroY - 6} className="testnet-chart-axis">NEUTRAL 0</text>
+        <text x={padding} y={height - padding + 16} className="testnet-chart-axis">BEARISH −1</text>
+        <path d={path} fill="none" stroke="#6fb3d6" strokeWidth="2" strokeLinejoin="round" strokeLinecap="round" />
+        {proj.length > 0 && (
+          <path
+            d={[data.current, ...proj].map((p, i) => { const { x, y } = xy(p!); return `${i === 0 ? 'M' : 'L'} ${x.toFixed(2)} ${y.toFixed(2)}`; }).join(' ')}
+            fill="none" stroke={curColor} strokeWidth="1.5" strokeDasharray="5 4" opacity="0.7"
+          />
+        )}
+        {data.guidance?.switchAtScore != null && data.guidance.etaToSwitchHours != null && data.current && (() => {
+          // Titik switch: proyeksi menembus batas netral (±0.12) — di sinilah ganti lane.
+          const swX = padding + (((new Date(data.current.at).getTime() + data.guidance.etaToSwitchHours * 3_600_000) - t0) / span) * plotWidth;
+          const swY = padding + ((1 - data.guidance.switchAtScore) / 2) * plotHeight;
+          if (swX > width - padding) return null;
+          return (
+            <g>
+              <circle cx={swX} cy={swY} r="6" fill="none" stroke="#f0b54b" strokeWidth="2" strokeDasharray="2 2" />
+              <text x={Math.min(swX + 8, width - 150)} y={swY - 8} style={{ fill: '#f0b54b', font: '600 10px/1 "IBM Plex Mono", monospace' }}>
+                titik switch (~{data.guidance.etaToSwitchHours}j)
+              </text>
+            </g>
+          );
+        })()}
+        <circle cx={cur.x} cy={cur.y} r="5" fill={curColor} stroke="#071016" strokeWidth="1.5" />
+        <text x={padding} y={height - 6} className="testnet-chart-time">{timeLabel(pts[0]!.at)}</text>
+        <text x={width - padding} y={height - 6} className="testnet-chart-time end">{timeLabel(pts[pts.length - 1]!.at)}</text>
+      </svg>
+      <div className="testnet-chart-legend">
+        <div>
+          <i style={{ background: curColor }} />
+          <span>sekarang</span>
+          <strong style={{ color: curColor }}>{data.current.score >= 0 ? '+' : ''}{data.current.score.toFixed(2)}</strong>
+        </div>
+        <div><span>{data.current.regime}</span></div>
+        {data.slopePerHour != null && (
+          <div><span>drift {data.slopeWindowHours}h</span><strong>{data.slopePerHour >= 0 ? '+' : ''}{data.slopePerHour.toFixed(3)}/jam</strong></div>
+        )}
+        <div style={{ maxWidth: 260 }}>
+          <span>
+            {eta != null
+              ? `menyentuh netral ~${eta.toFixed(1)} jam lagi KALAU laju saat ini bertahan (ekstrapolasi, bukan ramalan)`
+              : 'tidak sedang bergerak menuju netral pada laju yang berarti'}
+          </span>
+        </div>
+      </div>
+      {data.guidance && (
+        <div style={{ margin: '8px 4px 0', padding: '8px 12px', border: '1px solid rgba(240,181,75,0.35)', borderRadius: 8, fontSize: 12, lineHeight: 1.55 }}>
+          <strong style={{ color: '#f0b54b' }}>
+            PEGANG {data.guidance.holdLane.replace('CG_WIDE_', '').replace('CROSS_SECTIONAL_MARKET_NEUTRAL', 'CROSS-SECTIONAL')}
+          </strong>
+          {data.guidance.switchToLane && data.guidance.switchAtScore != null && (
+            <>
+              {' '}· switch ke <strong>{data.guidance.switchToLane.replace('CG_WIDE_', '')}</strong> HANYA setelah skor menembus{' '}
+              <strong>{data.guidance.switchAtScore > 0 ? '+' : ''}{data.guidance.switchAtScore}</strong>
+              {data.guidance.etaToSwitchHours != null ? ` (~${data.guidance.etaToSwitchHours} jam lagi di laju sekarang — ekstrapolasi)` : ' (belum ada ETA — arah belum menuju batas itu)'}
+            </>
+          )}
+          <div style={{ opacity: 0.8, marginTop: 4 }}>{data.guidance.note}</div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function LanePerformanceChart({ series }: { series: LanePerformanceSeries | null }) {
   const lanes = series?.lanes ?? [];
   const width = 920;
@@ -411,9 +604,14 @@ function LanePerformanceChart({ series }: { series: LanePerformanceSeries | null
   const plotHeight = height - padding * 2;
   const zeroY = padding + plotHeight - ((0 - minY) / Math.max(maxY - minY, 1)) * plotHeight;
   const labelBuckets = series?.bucketStarts ?? [];
-  const firstLabel = labelBuckets[0] ? formatBucketLabel(labelBuckets[0], series?.view ?? 'daily') : 'start';
-  const midLabel = labelBuckets[Math.floor(labelBuckets.length / 2)] ? formatBucketLabel(labelBuckets[Math.floor(labelBuckets.length / 2)], series?.view ?? 'daily') : '';
-  const lastLabel = labelBuckets[labelBuckets.length - 1] ? formatBucketLabel(labelBuckets[labelBuckets.length - 1], series?.view ?? 'daily') : 'now';
+  const tickCount = labelBuckets.length;
+  // Cap tick density so a future higher-resolution view can't render illegibly-overlapping
+  // labels; every view shipped today (max 31 daily buckets) renders one tick per bucket.
+  const MAX_TICKS = 31;
+  const tickStep = tickCount > MAX_TICKS ? Math.ceil(tickCount / MAX_TICKS) : 1;
+  const axisTicks = labelBuckets
+    .map((iso, index) => ({ iso, index }))
+    .filter(({ index }) => index % tickStep === 0 || index === tickCount - 1);
 
   if (!series || lanes.length === 0) {
     return (
@@ -441,9 +639,14 @@ function LanePerformanceChart({ series }: { series: LanePerformanceSeries | null
         <line x1={padding} x2={width - padding} y1={zeroY} y2={zeroY} className="testnet-chart-zero" />
         <text x={padding} y={18} className="testnet-chart-axis">{signed(maxY)}</text>
         <text x={padding} y={height - 22} className="testnet-chart-axis">{signed(minY)}</text>
-        <text x={padding} y={height - 8} className="testnet-chart-time">{firstLabel}</text>
-        <text x={width / 2} y={height - 8} className="testnet-chart-time middle">{midLabel}</text>
-        <text x={width - padding} y={height - 8} className="testnet-chart-time end">{lastLabel}</text>
+        {axisTicks.map(({ iso, index }) => {
+          const x = tickCount === 1 ? width / 2 : padding + (index / (tickCount - 1)) * plotWidth;
+          return (
+            <text key={iso} x={x} y={height - 8} className="testnet-chart-time middle">
+              {formatAxisTick(iso, series?.view ?? 'daily')}
+            </text>
+          );
+        })}
         {lanes.map((lane, index) => {
           const color = LANE_CHART_COLORS[index % LANE_CHART_COLORS.length];
           const path = pointPath(lane.points, minY, maxY, plotWidth, plotHeight);
@@ -543,6 +746,10 @@ export default function TestnetExchangeDashboard() {
   const [allocWeight3, setAllocWeight3] = useState('0');
   const [allocWeight4, setAllocWeight4] = useState('0');
   const [regimeReport, setRegimeReport] = useState<RegimeEngineReport | null>(null);
+  const [regimeAxis, setRegimeAxis] = useState<RegimeAxisTimelineData | null>(null);
+  const [closeBusy, setCloseBusy] = useState<string | null>(null);
+  const [closeResult, setCloseResult] = useState<{ ok: boolean; message: string } | null>(null);
+  const [xsecExec, setXsecExec] = useState<XsecExecStatus | null>(null);
   const [psle, setPsle] = useState<PsleReport | null>(null);
   const [headlineLaneOptions, setHeadlineLaneOptions] = useState<string[]>([]);
   const laneAllocationOptions = Array.from(new Set(
@@ -691,6 +898,55 @@ export default function TestnetExchangeDashboard() {
     }
   }
 
+  // Operator close of one directional intent — real market order, double-gated (window.confirm
+  // here + {"confirm":"CLOSE"} on the API). Only the engine's share closes; basket legs stay.
+  async function closeIntentNow(paperOrderId: string, symbol: string) {
+    if (closeBusy) return;
+    if (!window.confirm(`Close ${symbol} sekarang? Ini order market REAL (hanya porsi engine).`)) return;
+    setCloseBusy(paperOrderId);
+    setCloseResult(null);
+    try {
+      const res = await fetch(`${pageApiPrefix}/live/close-intent`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ paperOrderId, confirm: 'CLOSE' }),
+      });
+      const body = await res.json();
+      if (!res.ok || body?.ok === false) {
+        setCloseResult({ ok: false, message: `close ${symbol} gagal: ${body?.reason ?? res.status}` });
+      } else {
+        setCloseResult({ ok: true, message: `${symbol} closed · realized ${body?.realizedPnlUsd != null ? signed(body.realizedPnlUsd) : 'n/a'}` });
+        void loadExchangeOnly();
+      }
+    } catch (err) {
+      setCloseResult({ ok: false, message: err instanceof Error ? err.message : 'close request failed' });
+    } finally {
+      setCloseBusy(null);
+    }
+  }
+
+  // Cross-sectional executor status: per-basket TP gap + daily breaker state.
+  async function loadXsecExec() {
+    try {
+      const res = await fetch(`${pageApiPrefix}/live/cross-sectional-executor`, { cache: 'no-store' });
+      const body = await res.json();
+      if (body && typeof body.enabled === 'boolean') setXsecExec(body as XsecExecStatus);
+    } catch {
+      /* keep last */
+    }
+  }
+
+  // Regime-axis timeline: continuous distance-to-neutral score over the engine's history.
+  async function loadRegimeAxis() {
+    try {
+      const res = await fetch(`${pageApiPrefix}/shadow/regime-axis-timeline`, { cache: 'no-store' });
+      const body = await res.json();
+      if (Array.isArray(body?.points)) setRegimeAxis(body as RegimeAxisTimelineData);
+    } catch {
+      /* keep last */
+    }
+  }
+
   // Per-symbol book edge for THIS instance's book (live shows the mainnet book, testnet the testnet
   // book) — the book-proven symbols the live auto-rotation admits. Own cadence, fail-soft.
   async function loadPerSymbol() {
@@ -727,10 +983,14 @@ export default function TestnetExchangeDashboard() {
   useEffect(() => {
     void loadRegimeReport();
     void loadPerSymbol();
+    void loadRegimeAxis();
+    void loadXsecExec();
     if (!autoRefresh) return undefined;
     const timer = window.setInterval(() => {
       void loadRegimeReport();
       void loadPerSymbol();
+      void loadRegimeAxis();
+      void loadXsecExec();
     }, 15_000);
     return () => window.clearInterval(timer);
   }, [autoRefresh]);
@@ -790,13 +1050,40 @@ export default function TestnetExchangeDashboard() {
         </div>
         <div>
           <span>Unrealized P&amp;L</span>
-          <strong className={tone(account?.unrealizedPnl)}>{signed(account?.unrealizedPnl)}</strong>
-          <small>{account ? `${account.openPositionCount} positions · ${totalSourceEntries} source entries` : 'loading positions'}</small>
+          {(() => {
+            // Split per BOOK (2026-07-08 operator): directional = Σ P&L intent dari entry-nya
+            // sendiri; baskets = Σ P&L leg basket dari entry leg-nya — bukan blend netted exchange.
+            const ps = account?.positions ?? [];
+            const dirUnreal = ps.reduce((s, p) => s + (p.intentUnrealizedPnl ?? 0), 0);
+            const baskUnreal = ps.reduce((s, p) => s + (p.basketUnrealizedPnl ?? 0), 0);
+            return (
+              <>
+                <strong className={tone(account?.unrealizedPnl)}>{signed(account?.unrealizedPnl)}</strong>
+                <small>directional {signed(dirUnreal)} · baskets {signed(baskUnreal)} · {account ? `${account.openPositionCount} pos` : 'loading'}</small>
+              </>
+            );
+          })()}
         </div>
         <div>
-          <span>Realized P&amp;L</span>
-          <strong className={tone(status?.totalRealizedPnlUsd)}>{signed(status?.totalRealizedPnlUsd)}</strong>
-          <small>today {signed(status?.closedToday?.realizedPnlUsd)}</small>
+          <span>Realized P&amp;L (today)</span>
+          {(() => {
+            // HEADLINE = HARI INI (UTC): mirror today + baskets today. The lifetime numbers stay
+            // visible but clearly labeled all-time — the old headline summed lifetime mirror
+            // (which still carries the pre-fix churn-era losses) with baskets and read like a
+            // current loss ("kayanya kebawa data lama" — it wasn't stale, just mislabeled).
+            const basketsAllTime = account?.closedLanes?.find((l) => l.laneId === 'CROSS_SECTIONAL_MARKET_NEUTRAL')?.realizedPnlUsd ?? 0;
+            const mirrorAllTime = status?.totalRealizedPnlUsd;
+            const allTime = mirrorAllTime != null ? mirrorAllTime + basketsAllTime : undefined;
+            const mirrorToday = status?.closedToday?.realizedPnlUsd;
+            const basketsToday = xsecExec?.dailyRealizedUsd;
+            const today = mirrorToday != null || basketsToday != null ? (mirrorToday ?? 0) + (basketsToday ?? 0) : undefined;
+            return (
+              <>
+                <strong className={tone(today)}>{signed(today)}</strong>
+                <small>mirror {signed(mirrorToday)} · baskets {signed(basketsToday)} · all-time {signed(allTime)}</small>
+              </>
+            );
+          })()}
         </div>
         <div>
           <span>Open TP/SL orders</span>
@@ -936,6 +1223,23 @@ export default function TestnetExchangeDashboard() {
         )}
       </section>
 
+      <section className="testnet-panel">
+        <header>
+          <span>Regime Axis — jarak ke netral</span>
+          <strong>
+            {regimeAxis?.current
+              ? `${regimeAxis.current.regime} · skor ${regimeAxis.current.score >= 0 ? '+' : ''}${regimeAxis.current.score.toFixed(2)}`
+              : 'loading…'}
+          </strong>
+        </header>
+        <p style={{ margin: '4px 0' }} className="tone-measure">
+          Skor = komposit input breadth yang dipakai regime engine sendiri (advancers %, % di atas EMA20, return BTC 24h).
+          Garis tengah putus-putus = zona NETRAL: semakin garis mendekat ke tengah, semakin dekat regime ke perubahan.
+          Estimasi waktu adalah ekstrapolasi laju saat ini — bukan ramalan.
+        </p>
+        <RegimeAxisChart data={regimeAxis} />
+      </section>
+
       {error && (
         <div className="neural-error">
           <strong>Exchange link interrupted</strong>
@@ -974,39 +1278,136 @@ export default function TestnetExchangeDashboard() {
           </section>
         )}
 
-        <section className="testnet-panel">
-          <header><span>Exchange Positions</span><strong>{account ? `${account.positions.length} pos · ${totalSourceEntries} entries` : '0'}</strong></header>
-          <div className="testnet-table-wrap">
-            <table>
-              <thead>
-                <tr><th>Symbol</th><th>Side</th><th>Qty</th><th>Entry</th><th>Mark</th><th>TP target</th><th>TP gap</th><th>Liq / margin call</th><th>Unrealized</th><th>After fee+slip</th><th>Lev</th><th>Source entries</th><th>Mirrored lane</th></tr>
-              </thead>
-              <tbody>
-                {(account?.positions ?? []).length === 0 ? (
-                  <tr><td colSpan={13}>No open Binance testnet positions.</td></tr>
-                ) : account!.positions.map((position) => (
-                  <tr key={position.symbol}>
-                    <td>{position.symbol}</td>
-                    <td className={position.direction === 'SHORT' ? 'tone-warning' : 'tone-healthy'}>{position.direction}</td>
-                    <td>{position.quantity}</td>
-                    <td>{price(position.entryPrice)}</td>
-                    <td>{price(position.markPrice)}</td>
-                    <td>{position.targetTpPrice == null && isCrossSectionalPosition(position.laneIds) ? 'basket horizon' : price(position.targetTpPrice)}</td>
-                    <td className={tone(position.targetTpGapPct)}>{position.targetTpGapPct == null && isCrossSectionalPosition(position.laneIds) ? 'timed' : percent(position.targetTpGapPct)}</td>
-                    <td className="tone-critical">{price(position.liquidationPrice)}</td>
-                    <td className={tone(position.unrealizedPnl)}>{signed(position.unrealizedPnl)}</td>
-                    <td className={tone(position.unrealizedAfterEstimatedCloseCostUsd)}>
-                      {signed(position.unrealizedAfterEstimatedCloseCostUsd)}
-                    </td>
-                    <td>{position.leverage}x</td>
-                    <td>{position.sourceOrderCount}</td>
-                    <td>{position.laneIds.length > 0 ? position.laneIds.map(compactLane).join(', ') : 'unattributed'}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </section>
+        {(() => {
+          // Split (2026-07-07 operator ask): the directional slot (engine intents, operator-
+          // closeable) vs the cross-sectional foundation (basket-managed, exits automatic).
+          // A netted symbol carrying BOTH belongs in the directional table — the Close button
+          // there flattens only the engine's share, basket legs stay open.
+          const intentBySymbol = new Map((status?.openIntents ?? []).map((i) => [i.symbol, i]));
+          const positions = account?.positions ?? [];
+          // 2026-07-08 operator ("pisahkan unrealized antara cross sectional dan directional"):
+          // a netted symbol carrying BOTH books now appears in BOTH tables, each showing ITS OWN
+          // qty/entry/P&L (computed from its own entries) — never the exchange's blended row.
+          const directional = positions.filter((p) => intentBySymbol.has(p.symbol));
+          const foundation = positions.filter((p) => (p.basketQty ?? 0) !== 0 || (isCrossSectionalPosition(p.laneIds) && !intentBySymbol.has(p.symbol)));
+          const row = (position: (typeof positions)[number], closeable: boolean) => {
+            const book = closeable ? 'directional' : 'foundation';
+            const mixed = intentBySymbol.has(position.symbol) && (position.basketQty ?? 0) !== 0;
+            const qty = closeable
+              ? Math.abs(position.intentQty ?? position.quantity)
+              : Math.abs(position.basketQty ?? position.quantity);
+            const side = closeable
+              ? (position.intentDirection ?? position.direction)
+              : (position.basketQty != null ? (position.basketQty >= 0 ? 'LONG' : 'SHORT') : position.direction);
+            const entry = closeable
+              ? (position.intentEntryPrice ?? position.entryPrice)
+              : mixed ? null : position.entryPrice; // basket = multi-leg; blended entry menyesatkan saat nyampur
+            const unreal = closeable
+              ? (position.intentUnrealizedPnl ?? position.unrealizedPnl)
+              : (position.basketUnrealizedPnl ?? position.unrealizedPnl);
+            const shareFrac = position.quantity > 0 ? qty / position.quantity : 1;
+            const afterCost = unreal - (position.estimatedCloseCostUsd ?? 0) * Math.min(1, shareFrac);
+            return (
+            <tr key={`${book}-${position.symbol}`}>
+              <td>{position.symbol}</td>
+              <td className={side === 'SHORT' ? 'tone-warning' : 'tone-healthy'}>{side}</td>
+              <td>{Number(qty.toFixed(8))}</td>
+              <td>{entry == null ? 'multi-leg' : price(entry)}</td>
+              <td>{price(position.markPrice)}</td>
+              <td>{!closeable ? 'basket horizon' : price(position.targetTpPrice)}</td>
+              <td className={tone(position.targetTpGapPct)}>{!closeable ? 'timed' : percent(position.targetTpGapPct)}</td>
+              <td className="tone-critical">{price(position.liquidationPrice)}</td>
+              <td className={tone(unreal)}>{signed(unreal)}</td>
+              <td className={tone(afterCost)}>{signed(afterCost)}</td>
+              <td>{position.leverage}x</td>
+              <td>{position.sourceOrderCount}</td>
+              <td>{position.laneIds.length > 0 ? position.laneIds.map(compactLane).join(', ') : 'unattributed'}</td>
+              {closeable && (
+                <td>
+                  <button
+                    type="button"
+                    disabled={closeBusy !== null}
+                    onClick={() => void closeIntentNow(intentBySymbol.get(position.symbol)!.paperOrderId, position.symbol)}
+                  >
+                    {closeBusy === intentBySymbol.get(position.symbol)!.paperOrderId ? 'closing…' : 'Close now'}
+                  </button>
+                </td>
+              )}
+            </tr>
+            );
+          };
+          const headCells = (withClose: boolean) => (
+            <tr><th>Symbol</th><th>Side</th><th>Qty</th><th>Entry</th><th>Mark</th><th>TP target</th><th>TP gap</th><th>Liq / margin call</th><th>Unrealized</th><th>After fee+slip</th><th>Lev</th><th>Source entries</th><th>Mirrored lane</th>{withClose && <th>Manual</th>}</tr>
+          );
+          return (
+            <>
+              <section className="testnet-panel">
+                <header><span>Directional slot — operator-controlled</span><strong>{directional.length} pos</strong></header>
+                <p className="tone-measure" style={{ margin: '4px 0', fontSize: 12 }}>
+                  Posisi dari lane-allocation selector (engine mirror). &quot;Close now&quot; menutup HANYA porsi engine di simbol itu —
+                  leg basket cross-sectional di simbol yang sama tetap terbuka. Order market real, konfirmasi dulu.
+                </p>
+                {closeResult && <p className={closeResult.ok ? 'tone-healthy' : 'tone-critical'} style={{ margin: '4px 0', fontSize: 12 }}>{closeResult.message}</p>}
+                <div className="testnet-table-wrap">
+                  <table>
+                    <thead>{headCells(true)}</thead>
+                    <tbody>
+                      {directional.length === 0 ? (
+                        <tr><td colSpan={14}>No directional positions — pilih lane di allocation selector untuk membuka slot ini.</td></tr>
+                      ) : directional.map((p) => row(p, true))}
+                    </tbody>
+                  </table>
+                </div>
+              </section>
+              <section className="testnet-panel">
+                <header><span>Cross-sectional foundation — automatic</span><strong>{foundation.length} pos</strong></header>
+                <p className="tone-measure" style={{ margin: '4px 0', fontSize: 12 }}>
+                  Basket hedge (long-top / short-bottom). Exit otomatis: profit-bank {xsecExec?.tpNetReturnPct != null ? `${xsecExec.tpNetReturnPct.toFixed(2)}%` : 'net-target'} atau horizon 24 jam — tidak ada tombol close
+                  per posisi di sini karena menutup satu leg membuat sisa basket jadi taruhan directional telanjang.
+                </p>
+                {xsecExec?.openHalted && (
+                  <p className="tone-warning" style={{ margin: '4px 0', fontSize: 12 }}>⛔ {xsecExec.openHalted}</p>
+                )}
+                {xsecExec?.lastError && (
+                  <p className="tone-critical" style={{ margin: '4px 0', fontSize: 12 }}>executor error: {xsecExec.lastError}</p>
+                )}
+                {(xsecExec?.openBaskets ?? []).length > 0 && (
+                  <div style={{ margin: '6px 0', fontSize: 12 }}>
+                    {xsecExec!.openBaskets!.map((b) => {
+                      const tp = xsecExec?.tpNetReturnPct ?? null;
+                      const net = b.lastNetReturn != null ? b.lastNetReturn * 100 : null;
+                      const gap = tp != null && net != null ? tp - net : null;
+                      const hoursLeft = Math.max(0, (b.closesAtMs - Date.now()) / 3600000);
+                      // Stale = the 5-min TP tick hasn't stamped in >15m. A basket younger than
+                      // 15m legitimately has no stamp yet — warning there is a false alarm.
+                      const oldEnough = Date.now() - new Date(b.openedAt).getTime() > 15 * 60_000;
+                      const stale = b.lastNetAt ? Date.now() - new Date(b.lastNetAt).getTime() > 15 * 60_000 : oldEnough;
+                      return (
+                        <div key={b.basketId} style={{ display: 'flex', gap: 14, padding: '2px 0', flexWrap: 'wrap' }}>
+                          <span className="tone-measure">{b.basketId}</span>
+                          <span>net <strong className={net == null ? '' : net >= 0 ? 'tone-healthy' : 'tone-critical'}>{net == null ? '—' : `${net >= 0 ? '+' : ''}${net.toFixed(3)}%`}</strong></span>
+                          <span>TP gap <strong className={gap != null && gap <= 0 ? 'tone-healthy' : ''}>{gap == null ? '—' : gap <= 0 ? 'REACHED — closing' : `${gap.toFixed(3)}% lagi`}</strong></span>
+                          <span className="tone-measure">horizon {hoursLeft.toFixed(1)}h lagi</span>
+                          {stale && <span className="tone-warning">stamp basi &gt;15m — cek executor</span>}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+                <div className="testnet-table-wrap">
+                  <table>
+                    <thead>{headCells(false)}</thead>
+                    <tbody>
+                      {foundation.length === 0 ? (
+                        <tr><td colSpan={13}>No open basket positions.</td></tr>
+                      ) : foundation.map((p) => row(p, false))}
+                    </tbody>
+                  </table>
+                </div>
+              </section>
+            </>
+          );
+        })()}
 
         <section className="testnet-panel">
           <header>

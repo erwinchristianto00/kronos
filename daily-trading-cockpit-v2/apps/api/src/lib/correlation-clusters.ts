@@ -31,8 +31,14 @@ const DEFAULT_CLUSTER_MAP: Record<string, string[]> = {
     "ARBUSDT", "OPUSDT", "LINKUSDT", "UNIUSDT", "AAVEUSDT", "MKRUSDT", "LDOUSDT", "CRVUSDT",
     "MATICUSDT", "STRKUSDT", "DYDXUSDT", "PENDLEUSDT",
   ],
-  MEME: ["DOGEUSDT", "WIFUSDT", "PEPEUSDT", "SHIBUSDT", "BONKUSDT", "FLOKIUSDT", "1000SATSUSDT"],
-  AI: ["FETUSDT", "RENDERUSDT", "TAOUSDT", "WLDUSDT", "AGIXUSDT", "ARKMUSDT"],
+  // "1000PEPEUSDT"/"1000SHIBUSDT"/"1000BONKUSDT"/"1000FLOKIUSDT" are the real Binance futures
+  // symbols (1000x-multiplier contracts) — the bare names below never match what actually flows
+  // through the pipeline (2026-07-08, same class of bug as cross-sectional-edge.ts's PEPEUSDT fix).
+  MEME: ["DOGEUSDT", "WIFUSDT", "1000PEPEUSDT", "1000SHIBUSDT", "1000BONKUSDT", "1000FLOKIUSDT", "1000SATSUSDT"],
+  // "RNDRUSDT", not "RENDERUSDT" — Binance FUTURES renamed the RNDR contract to RENDER, but this
+  // system scores/executes render tokens under the SPOT ticker "RNDRUSDT" throughout (2026-07-08:
+  // confirmed "RENDERUSDT" never matches anything this pipeline actually passes to clusterOf()).
+  AI: ["FETUSDT", "RNDRUSDT", "TAOUSDT", "WLDUSDT", "ARKMUSDT"],
 };
 
 function loadClusterMap(env: NodeJS.ProcessEnv = process.env): Record<string, string[]> {

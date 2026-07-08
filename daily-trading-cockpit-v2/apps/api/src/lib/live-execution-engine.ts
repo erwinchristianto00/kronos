@@ -62,6 +62,13 @@ import {
 } from "./per-symbol-lane-book-edge.js";
 import { getLaneSymbolCurationCacheStore } from "./lane-symbol-curation-cache.js";
 import { LANE_SYMBOL_CURATION_MAX_STALENESS_MS } from "./paper-opportunity-allocator.js";
+import {
+  directionalSymbolSizeMultiplier,
+  getSymbolVolatilityCacheStore,
+  refreshSymbolVolatilityCache,
+  isDirectionalTechnicalGateEnabled,
+  type SymbolVolatilityCacheStore,
+} from "./directional-symbol-sizing.js";
 
 // ─── config ──────────────────────────────────────────────────────────────────
 
@@ -106,6 +113,10 @@ export interface LiveExecutionConfig {
   maxPaperOrderAgeMs: number;
   /** Testnet-only: mirror every open paper order, including diagnostic lanes and pre-restart orders. */
   mirrorAllPaperOrders: boolean;
+  /** LIVE_MIRROR_PROVEN_SYMBOLS_ONLY=1 — see isMirrorProvenSymbolsOnly. Parsed once here so the
+   *  behavior is injectable in tests without mutating process.env (which leaks across vitest
+   *  worker threads). */
+  mirrorProvenSymbolsOnly: boolean;
   /** Testnet-only: close a mirrored position early once exchange unrealized PnL reaches this USDT threshold. */
   testnetTakeProfitUsd: number;
   /** Testnet-only: close regime-opposing exposure once it can be flattened at estimated breakeven or better. */
@@ -233,11 +244,20 @@ export function parseLiveExecutionConfig(env: NodeJS.ProcessEnv = process.env): 
     maxNotionalPerTrade: envNum(env.LIVE_MAX_NOTIONAL_PER_TRADE, 250),
     maxPaperOrderAgeMs: Math.floor(envNum(env.LIVE_MAX_PAPER_ORDER_AGE_MS, 10 * 60 * 1000)),
     mirrorAllPaperOrders: env.LIVE_MIRROR_ALL_PAPER === "1" && liveEnv === "testnet",
+    mirrorProvenSymbolsOnly: isMirrorProvenSymbolsOnly(env),
     testnetTakeProfitUsd: liveEnv === "testnet" ? envNum(env.LIVE_TESTNET_TP_USD, 0) : 0,
     testnetRegimeExitEnabled: liveEnv === "testnet" && env.LIVE_TESTNET_REGIME_EXIT !== "0",
     testnetRegimeHardCutMs: liveEnv === "testnet" ? envNum(env.LIVE_TESTNET_REGIME_HARD_CUT_MS, 30 * 60 * 1000) : 0,
     estimatedCloseCostPct: envNum(env.LIVE_ESTIMATED_CLOSE_COST_PCT, 0.0022),
-    autoArm: env.LIVE_AUTO_ARM === "1" && liveEnv === "testnet", // mainnet NEVER auto-arms
+    // Mainnet auto-arm needs BOTH the flag and an explicit acknowledgement token (2026-07-07,
+    // operator-requested): every restart boots disarmed by design, but live restarts constantly
+    // (deploys + OOM auto-restarts), so mainnet silently missed every signal window while testnet
+    // kept trading. The token keeps a bare LIVE_AUTO_ARM=1 inert on real money; the constructor's
+    // kill-switch latch check still blocks auto-arm after a kill regardless of both flags.
+    autoArm:
+      env.LIVE_AUTO_ARM === "1" &&
+      (liveEnv === "testnet" ||
+        env.LIVE_AUTO_ARM_MAINNET_CONFIRM === "I_UNDERSTAND_AUTO_ARM_REAL_MONEY"),
     mainnetConfirmed,
     mainnetKeepTestnetPolicy: liveEnv === "mainnet" && env.LIVE_MAINNET_KEEP_TESTNET_POLICY === "1",
     mainnetProfitProtection: liveEnv === "mainnet" && env.LIVE_MAINNET_PROFIT_PROTECTION === "1",
@@ -323,6 +343,26 @@ export function crowdingExitRecommendation(
  * >=300bps stop) sits at >=1.5%, far above this floor, so legitimate orders are never blocked.
  */
 const MIN_TP_DISTANCE_PCT = 0.003; // 30bps
+
+/** How often to refresh per-symbol ATR% for the directional size multiplier. ATR on 1h candles
+ *  moves slowly — refetching every ~25s tick would be wasted exchange calls for no new signal. */
+const SYMBOL_VOLATILITY_REFRESH_INTERVAL_MS = 20 * 60_000;
+
+/**
+ * Pyramid cap (2026-07-08, operator-requested after a real loss): a bearish/bullish signal that
+ * keeps re-firing on the SAME symbol keeps adding to the SAME intent every tick. Real MAX_HOLD_CUT
+ * history (8 live cuts, 2026-07-05..08) showed this compounds a normally-small loss into a large
+ * one purely by size, NOT by holding longer — the 4h cut itself fired on schedule every time:
+ *   SEI/FET/AVAX/INJ/WLD: 1-3 adds, maxFavorableR 0-0.20  -> losses $0.01-$0.46
+ *   XRP: 7 adds, maxFavorableR 0 (never once favorable)   -> loss $1.84
+ *   DOGE: 15 adds, maxFavorableR 0.12                     -> loss $4.15
+ * Past PYRAMID_FREE_ADD_LIMIT adds, require the position to have shown at least
+ * PYRAMID_MIN_FAVORABLE_R of real favorable movement to keep growing — a position that's added
+ * repeatedly without ever proving itself stops growing, it doesn't stop existing (the original
+ * size still rides to its own stop/TP/max-hold outcome untouched).
+ */
+const PYRAMID_FREE_ADD_LIMIT = 3;
+const PYRAMID_MIN_FAVORABLE_R = 0.15;
 
 /**
  * Pure sizing: risk a fixed USD amount over the paper geometry's stop distance, round
@@ -708,10 +748,17 @@ export interface LiveExecutionEngineOptions {
   /** Optional market-data client for the crowding-exit SHADOW measurement (getStatus().crowdingExitShadow).
    *  Read-only, best-effort: never throws, never changes the harvest's actual cut/hold decision.
    *  Omit to leave the measurement dormant (no market-data calls). */
-  marketDataClient?: Pick<BinanceClient, "getFuturesFlow">;
+  marketDataClient?: Pick<BinanceClient, "getFuturesFlow" | "getCandles">;
   /** Delay between queryOrder fill-confirmation retries (see resolveConfirmedFillPrice).
    *  Default 400ms; tests pass 0. */
   fillConfirmRetryDelayMs?: number;
+  /** Net exchange qty per symbol (positive = long) legitimately owned by ANOTHER executor sharing
+   *  this Binance account — today the cross-sectional basket executor. Without this, reconcile()
+   *  flagged every basket leg as an "orphan exchange position" and force-disarmed within one tick
+   *  of a basket opening (2026-07-07: confirmed live — armed → basket opened → next reconcile
+   *  disarmed, defeating auto-arm every boot). Positions fully explained by these claims are not
+   *  orphans; anything beyond the claimed qty still disarms exactly as before. */
+  externalManagedNetQty?: () => Map<string, number>;
 }
 
 const ERROR_STREAK_DISARM = 3;
@@ -1047,6 +1094,42 @@ export function symbolPriorityTier(
   return 2;
 }
 
+/** Realized-book performance for symbol+direction from the /research curation report — used to
+ *  rank candidates WITHIN a priority tier so the mirror opens the BEST proven symbol first, not
+ *  merely the oldest. Null = no measured book for this symbol+direction. */
+export function symbolBookNetAvgR(
+  symbol: string,
+  direction: "LONG" | "SHORT",
+  report: PerSymbolLaneBookEdgeReport | null,
+): number | null {
+  if (!report) return null;
+  const best = report.bestLanePerSymbol.find((b) => b.symbol === symbol && b.direction === direction);
+  return best && Number.isFinite(best.bestNetAvgR) ? best.bestNetAvgR : null;
+}
+
+/**
+ * Pyramid cap (2026-07-08): should a further add to this intent be blocked? True once the intent
+ * has already absorbed `freeAddLimit` adds AND still hasn't shown `minFavorableR` of real favorable
+ * movement. See PYRAMID_FREE_ADD_LIMIT/PYRAMID_MIN_FAVORABLE_R for the real-loss evidence behind
+ * the defaults. Pure so the real-money threshold logic is testable without the full engine.
+ */
+export function shouldCapPyramidAdd(
+  intent: Pick<LiveIntent, "sourcePaperOrders" | "maxFavorableR">,
+  freeAddLimit: number,
+  minFavorableR: number,
+): boolean {
+  const addCount = intent.sourcePaperOrders?.length ?? 0;
+  return addCount >= freeAddLimit && (intent.maxFavorableR ?? 0) < minFavorableR;
+}
+
+/** 2026-07-07 operator decision ("bukan sembarang buka"): when set, the mirror admits ONLY
+ *  symbols with /research book proof (priority tier 0/1) — a DELIBERATE exception to the default
+ *  never-rejects rule, so with zero proven symbols the directional slot stays empty rather than
+ *  opening an unproven one. Off by default. */
+export function isMirrorProvenSymbolsOnly(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.LIVE_MIRROR_PROVEN_SYMBOLS_ONLY === "1";
+}
+
 export class LiveExecutionEngine {
   private readonly config: LiveExecutionConfig;
   private readonly client: LivePrivateClient;
@@ -1055,8 +1138,9 @@ export class LiveExecutionEngine {
   private readonly isPaperOrderLiveEligible: (order: PaperOrder, nowIso: string) => boolean;
   private readonly getControllerSnapshot: () => LiveControllerSnapshot | null;
   private readonly nowIso: () => string;
-  private readonly marketDataClient?: Pick<BinanceClient, "getFuturesFlow">;
+  private readonly marketDataClient?: Pick<BinanceClient, "getFuturesFlow" | "getCandles">;
   private readonly fillConfirmRetryDelayMs: number;
+  private readonly externalManagedNetQty: () => Map<string, number>;
 
   /** In-memory ONLY — restart always boots disarmed. */
   private armed = false;
@@ -1066,9 +1150,17 @@ export class LiveExecutionEngine {
   private reconcileIssues: string[] = [];
   private timer: ReturnType<typeof setInterval> | null = null;
   private ticking = false;
+  /** Newest candidates' first-failing mirror gate — pure observation for "kenapa ga ada trade?". */
+  private lastMirrorFunnel: Array<{ id: string; symbol: string; direction: string; createdAt: string; reason: string; firstReason?: string }> = [];
+  /** First-seen decision per candidate: after one tick, live candidates fall behind the watermark
+   *  and every later funnel read shows only "behind_watermark" — the reason that MATTERED (the one
+   *  from the tick that actually evaluated it) must be latched or it is lost forever. */
+  private mirrorFirstReason = new Map<string, string>();
   private filtersCache: Map<string, FuturesSymbolFilters> | null = null;
   private leverageBySymbol = new Map<string, number>();
   private isolatedMarginSet = new Set<string>();
+  /** Throttle for refreshSymbolVolatilityCache — ATR% moves slowly, no need to refetch every tick. */
+  private lastVolatilityRefreshAtMs = 0;
 
   constructor(options: LiveExecutionEngineOptions) {
     this.config = options.config;
@@ -1080,6 +1172,7 @@ export class LiveExecutionEngine {
     this.nowIso = options.nowIso ?? (() => new Date().toISOString());
     this.marketDataClient = options.marketDataClient;
     this.fillConfirmRetryDelayMs = options.fillConfirmRetryDelayMs ?? 400;
+    this.externalManagedNetQty = options.externalManagedNetQty ?? (() => new Map());
     // Auto-arm must NOT punch through a latched kill: a restart preserves the kill until an
     // explicit resetKill(). (arm() already enforces this; the constructor path bypassed it.)
     if (this.config.autoArm && this.config.configErrors.length === 0 && !this.store.getState().killedAt) {
@@ -1306,6 +1399,7 @@ export class LiveExecutionEngine {
       },
       controller,
       reconcileIssues: this.reconcileIssues.slice(-10),
+      mirrorFunnel: this.lastMirrorFunnel,
       watermark: st.lastSeenCreatedAt,
       quarantinedPaperOrders: Object.values(st.mirrorAttempts).filter((n) => n >= MAX_MIRROR_ATTEMPTS).length,
       openIntents: openIntents.map((i) => ({
@@ -1406,6 +1500,16 @@ export class LiveExecutionEngine {
       leverage: number;
       sourceOrderCount: number;
       laneIds: string[];
+      /** DIRECTIONAL-slot share of this netted row (2026-07-08 operator: "pisahkan unrealized
+       *  antara cross sectional dan directional"): the open intent's OWN qty/entry and its P&L
+       *  computed from ITS entry — never the exchange's blended average. Null = no open intent. */
+      intentDirection: "LONG" | "SHORT" | null;
+      intentQty: number | null;
+      intentEntryPrice: number | null;
+      intentUnrealizedPnl: number | null;
+      /** Cross-sectional share — filled by annotateCrossSectionalAccount (the executor's books). */
+      basketQty: number | null;
+      basketUnrealizedPnl: number | null;
     }>;
     lanes: Array<{
       laneId: string;
@@ -1491,6 +1595,17 @@ export class LiveExecutionEngine {
         leverage: position.leverage,
         sourceOrderCount: sources.length,
         laneIds: Array.from(new Set(sources.map((source) => source.laneId))),
+        intentDirection: intent ? intent.direction : null,
+        intentQty: intent ? intent.qty : null,
+        intentEntryPrice: intent ? (intent.filledEntryPrice ?? intent.plannedEntryPrice) : null,
+        intentUnrealizedPnl:
+          intent && markPrice !== null && (intent.filledEntryPrice ?? intent.plannedEntryPrice) > 0
+            ? (intent.direction === "LONG"
+                ? markPrice - (intent.filledEntryPrice ?? intent.plannedEntryPrice)
+                : (intent.filledEntryPrice ?? intent.plannedEntryPrice) - markPrice) * intent.qty
+            : null,
+        basketQty: null,
+        basketUnrealizedPnl: null,
       };
     });
     const unrealizedPnl = positions.reduce((sum, position) => sum + position.unRealizedProfit, 0);
@@ -1768,6 +1883,63 @@ export class LiveExecutionEngine {
     }
   }
 
+  /** Operator-initiated close of ONE open intent (dashboard "Close" button, 2026-07-07: full
+   *  manual control over the directional slot — bank early when the regime turns). Cancels the
+   *  symbol's protective orders, flattens ONLY the engine's own share of the netted position
+   *  (cross-sectional basket legs on the same symbol are external claims and must stay open),
+   *  books realized P&L into the ledger, state → CLOSED with OPERATOR_CLOSE. Never disarms,
+   *  never latches the kill-switch. */
+  async manualCloseIntent(paperOrderId: string): Promise<{ ok: boolean; reason: string | null; realizedPnlUsd: number | null }> {
+    const st = this.store.getState();
+    const intent = st.intents.find((i) => i.paperOrderId === paperOrderId && OPEN_INTENT_STATES.has(i.state));
+    if (!intent) return { ok: false, reason: `no open intent for ${paperOrderId}`, realizedPnlUsd: null };
+    try {
+      await this.client.cancelAllOrders(intent.symbol);
+      await this.client.cancelAllAlgoOrders(intent.symbol);
+      const positions = await this.client.getPositions(intent.symbol);
+      const pos = positions.find((p) => p.symbol === intent.symbol);
+      const netAmt = pos?.positionAmt ?? 0;
+      const externalClaim = this.externalManagedNetQty().get(intent.symbol) ?? 0;
+      // The engine's actual share of the netted exchange position — Binance nets per symbol, so
+      // |positionAmt| can include basket legs (either direction). Closing more than this share
+      // would rip open a hedge the executor legitimately owns.
+      const engineShare = netAmt - externalClaim;
+      const dirSign = intent.direction === "LONG" ? 1 : -1;
+      const remainingQty = intent.state === "TP1_FILLED_BE_SET" ? Math.max(0, intent.qty - intent.tp1Qty) : intent.qty;
+      const closeQty = Math.min(remainingQty, Math.max(0, dirSign * engineShare));
+      let flattenOrderId: number | null = null;
+      if (closeQty > 1e-12) {
+        // reduceOnly is only valid when the NET position still has the intent's sign; when basket
+        // legs flip the net the plain close is justified by the external claim (same reasoning as
+        // the cross-sectional executor's sibling-covered close).
+        const reduceOnly = Math.sign(netAmt) === dirSign;
+        const flatten = await this.client.placeOrder({
+          symbol: intent.symbol,
+          side: intent.direction === "LONG" ? "SELL" : "BUY",
+          type: "MARKET",
+          quantity: Number(closeQty.toFixed(8)),
+          ...(reduceOnly ? { reduceOnly: true } : {}),
+          newClientOrderId: `dtc-opcl-${intent.paperOrderId.slice(-12)}`,
+        });
+        flattenOrderId = flatten.orderId;
+      }
+      const net = await this.realizedFromTrades(intent.symbol, intent.createdAt, [intent.entryOrderId, intent.tp1OrderId, flattenOrderId]);
+      intent.realizedPnlUsd = net;
+      this.applyRealizedToLedger(net);
+      intent.state = "CLOSED";
+      intent.closeReason = "OPERATOR_CLOSE";
+      intent.closedAt = this.nowIso();
+      intent.updatedAt = this.nowIso();
+      this.store.save();
+      return { ok: true, reason: null, realizedPnlUsd: net };
+    } catch (error) {
+      intent.lastError = `operator close failed: ${(error as Error).message}`;
+      intent.updatedAt = this.nowIso();
+      this.store.save();
+      return { ok: false, reason: (error as Error).message, realizedPnlUsd: null };
+    }
+  }
+
   // ── kill-switch ────────────────────────────────────────────────────────────
 
   private killSwitchTrip(): string | null {
@@ -1802,12 +1974,20 @@ export class LiveExecutionEngine {
         const positions = await this.client.getPositions(intent.symbol);
         const pos = positions.find((p) => p.symbol === intent.symbol);
         let flattenOrderId: number | null = null;
-        if (pos && Math.abs(pos.positionAmt) > 0) {
+        // Kill-switch flatten is per-INTENT panic, not per-symbol: flatten the engine share only.
+        // The cross-sectional baskets are horizon-bounded hedges with their own breaker — the
+        // operator's standing rule is that NOTHING force-flattens an open basket, so a kill on a
+        // shared symbol must never take the basket's leg with it (same class as the 2026-07-07
+        // WLD/DOGE hedge-eaten incidents).
+        const killRaw = pos?.positionAmt ?? 0;
+        const killShare = killRaw - (this.externalManagedNetQty().get(intent.symbol) ?? 0);
+        const killAmt = Math.sign(killShare) === Math.sign(killRaw) ? Math.sign(killRaw) * Math.min(Math.abs(killShare), Math.abs(killRaw)) : 0;
+        if (Math.abs(killAmt) > 1e-12) {
           const flatten = await this.client.placeOrder({
             symbol: intent.symbol,
-            side: pos.positionAmt > 0 ? "SELL" : "BUY",
+            side: killAmt > 0 ? "SELL" : "BUY",
             type: "MARKET",
-            quantity: Math.abs(pos.positionAmt),
+            quantity: Math.abs(killAmt),
             reduceOnly: true,
             newClientOrderId: `dtc-kill-${intent.paperOrderId.slice(-12)}`,
           });
@@ -1855,24 +2035,52 @@ export class LiveExecutionEngine {
       dirty = true;
     }
 
+    // Positions the cross-sectional executor legitimately owns on this same account. Binance nets
+    // per symbol, so an engine intent and a basket leg on the same symbol show as ONE combined
+    // position — subtract the external claim before judging what the ENGINE's share looks like.
+    const external = this.externalManagedNetQty();
+    // Float-sum slack only: leg quantities are exact exchange step multiples, so any real foreign
+    // exposure exceeds this by orders of magnitude.
+    const EXTERNAL_QTY_EPS = 1e-6;
+
     // Our intents must be backed by a real position in the right direction.
+    const reportOnlyIssues: string[] = [];
     for (const intent of openIntents) {
       const pos = bySymbol.get(intent.symbol);
-      const amt = pos?.positionAmt ?? 0;
+      const amt = (pos?.positionAmt ?? 0) - (external.get(intent.symbol) ?? 0);
       const expectedSign = intent.direction === "LONG" ? 1 : -1;
       if (Math.abs(amt) < 1e-12) continue; // position may have just closed — lifecycle will settle it
       if (Math.sign(amt) !== expectedSign) {
         issues.push(`position direction mismatch on ${intent.symbol}: exchange ${amt}, intent ${intent.direction}`);
+        continue;
+      }
+      // MISSING-QTY alert (report-only, never disarms): books BIGGER than the exchange means some
+      // close consumed managed exposure — 337 DOGE + 64 WLD vanished exactly this way on
+      // 2026-07-07 with ZERO alerts (the orphan check only catches the opposite direction).
+      // Restricted to full-TP intents (partial-TP lanes legitimately halve mid-life) and a 10%
+      // slack so transient fill states don't spam; disarming here could loop, so it only reports.
+      if (this.isFullTpExitRule(this.intentExitRule(intent)) && Math.abs(amt) < intent.qty * 0.9) {
+        reportOnlyIssues.push(
+          `MISSING QTY on ${intent.symbol}: engine share ${amt} < intent qty ${intent.qty} — managed exposure was consumed by something else (netting-blind close?)`,
+        );
       }
     }
+    if (reportOnlyIssues.length > 0) this.pushReconcileIssues(...reportOnlyIssues);
 
     // Exchange positions on symbols the engine never opened = orphans. NEVER auto-flatten
-    // (could be the operator's own manual position) — disarm + surface instead.
+    // (could be the operator's own manual position) — disarm + surface instead. A position fully
+    // explained by an external executor's claim is NOT an orphan; a position exceeding the claim
+    // still is (the unexplained remainder could be a manual/foreign position).
     const engineSymbols = new Set(st.intents.filter((i) => OPEN_INTENT_STATES.has(i.state)).map((i) => i.symbol));
     for (const pos of positions) {
-      if (Math.abs(pos.positionAmt) > 1e-12 && !engineSymbols.has(pos.symbol)) {
-        issues.push(`orphan exchange position ${pos.symbol} amt=${pos.positionAmt} (not opened by engine)`);
-      }
+      if (Math.abs(pos.positionAmt) <= 1e-12 || engineSymbols.has(pos.symbol)) continue;
+      const claimed = external.get(pos.symbol) ?? 0;
+      if (claimed !== 0 && Math.abs(pos.positionAmt - claimed) <= EXTERNAL_QTY_EPS) continue;
+      issues.push(
+        claimed !== 0
+          ? `orphan exchange position ${pos.symbol} amt=${pos.positionAmt} (external executor claims only ${claimed})`
+          : `orphan exchange position ${pos.symbol} amt=${pos.positionAmt} (not opened by engine)`,
+      );
     }
 
     if (issues.length > 0) {
@@ -1895,21 +2103,36 @@ export class LiveExecutionEngine {
       try {
         const positions = await this.client.getPositions(intent.symbol);
         const pos = positions.find((p) => p.symbol === intent.symbol);
-        const amt = pos?.positionAmt ?? 0;
+        const rawAmt = pos?.positionAmt ?? 0;
+        // 2026-07-07 REAL-MONEY incidents (PROFIT_BANK ate the basket's 337 DOGE hedge at 14:36;
+        // the add-failed emergency flatten ate its 64 WLD hedge at 14:25): Binance nets every
+        // manager's exposure per symbol into ONE position, so rawAmt is NOT this intent's position
+        // whenever the cross-sectional executor holds legs on the same symbol. Every lifecycle
+        // decision below — flat detection, $-TP trigger, close quantities — acts on the ENGINE
+        // SHARE only, exactly like the regime-harvest path's earlier fix.
+        const externalClaim = this.externalManagedNetQty().get(intent.symbol) ?? 0;
+        const amt = rawAmt - externalClaim;
 
-        // Position flat ⇒ closed (stop, breakeven stop, or full TP fill chain).
+        // Engine share flat ⇒ closed (stop, breakeven stop, or full TP fill chain) — even while
+        // the NETTED position stays non-zero because a basket still holds the symbol.
         if (Math.abs(amt) < 1e-12) {
           await this.settleClosedIntent(intent);
           dirty = true;
           continue;
         }
 
-        const usdTp = await this.maybeCloseOnTestnetUsdTakeProfit(intent, pos, amt);
+        // Contaminated share (external claims exceed or flip the whole netted position): any close
+        // computed from it would trade someone else's exposure — leave this intent to its resting
+        // stop/TP for this tick and let reconcile surface the inconsistency.
+        if (Math.sign(rawAmt) !== Math.sign(amt)) continue;
+        const shareFrac = Math.max(0, Math.min(1, amt / rawAmt));
+
+        const usdTp = await this.maybeCloseOnTestnetUsdTakeProfit(intent, pos, amt, shareFrac);
         if (usdTp.changed) dirty = true;
         if (usdTp.closed) continue;
 
         if (pos) {
-          const liveBreakeven = await this.maybeCloseLiveBreakevenLaneAfterCost(intent, pos, amt);
+          const liveBreakeven = await this.maybeCloseLiveBreakevenLaneAfterCost(intent, pos, amt, shareFrac);
           if (liveBreakeven.changed) dirty = true;
           if (liveBreakeven.closed) continue;
         }
@@ -2014,6 +2237,7 @@ export class LiveExecutionEngine {
     intent: LiveIntent,
     pos: FuturesPosition,
     amt: number,
+    shareFrac = 1,
   ): Promise<{ changed: boolean; closed: boolean }> {
     // Runs on both real envs (mainnet + testnet) — operator wants the long-lane positions to bail
     // the instant they're net-positive everywhere they exist.
@@ -2022,8 +2246,13 @@ export class LiveExecutionEngine {
     const expectedSign = intent.direction === "LONG" ? 1 : -1;
     if (Math.sign(amt) !== expectedSign) return { changed: false, closed: false };
 
-    const estimatedCloseCostUsd = this.estimatedCloseCostUsd(pos);
-    const netAfterCost = pos.unRealizedProfit - estimatedCloseCostUsd;
+    // Own-entry basis — see maybeCloseOnTestnetUsdTakeProfit (shareFrac scaling of the netted
+    // P&L is biased whenever the two books' entries differ).
+    const beEntry = intent.filledEntryPrice ?? intent.plannedEntryPrice;
+    const beMark = pos.markPrice > 0 ? pos.markPrice : null;
+    if (beMark === null || !(beEntry > 0)) return { changed: false, closed: false };
+    const beOwnUnrealized = (intent.direction === "LONG" ? beMark - beEntry : beEntry - beMark) * Math.abs(amt);
+    const netAfterCost = beOwnUnrealized - this.estimatedCloseCostUsd(pos) * shareFrac;
     if (!Number.isFinite(netAfterCost) || netAfterCost < 0) return { changed: false, closed: false };
 
     const flat = await this.client.placeOrder({
@@ -2225,15 +2454,29 @@ export class LiveExecutionEngine {
     const bySymbol = new Map(positions.map((position) => [position.symbol, position]));
     let dirty = snapshotChanged;
 
+    const externalClaims = this.externalManagedNetQty();
     for (const intent of harvestIntents) {
       const pos = bySymbol.get(intent.symbol);
       const amt = pos?.positionAmt ?? 0;
       if (!pos || Math.abs(amt) < 1e-12) continue;
+      // 2026-07-07 REAL-MONEY INCIDENT: this loop closed Math.abs(amt) = the WHOLE netted
+      // position — on a symbol shared with cross-sectional basket legs it flattened the basket's
+      // hedge too (DOGEUSDT: intent 1065 + basket 665 short, harvest bought 1730, leaving two
+      // baskets silently un-hedged). Everything below operates on the ENGINE'S SHARE only.
+      const externalClaim = externalClaims.get(intent.symbol) ?? 0;
+      const engineAmt = amt - externalClaim;
+      if (Math.abs(engineAmt) < 1e-12) continue; // engine has no real exposure here
       const expectedSign = intent.direction === "LONG" ? 1 : -1;
-      if (Math.sign(amt) !== expectedSign) continue;
+      if (Math.sign(engineAmt) !== expectedSign) continue;
+      // The exchange's unrealized/cost numbers describe the NETTED position; when the engine owns
+      // only a fraction (same-sign basket legs), scale by its share. If the basket legs flipped
+      // the net sign entirely, the netted P&L says nothing about the engine's leg — skip and
+      // leave the intent to its own stop rather than harvest on contaminated numbers.
+      if (Math.sign(amt) !== Math.sign(engineAmt)) continue;
+      const shareFrac = Math.max(0, Math.min(1, engineAmt / amt));
 
-      const estimatedCloseCostUsd = this.estimatedCloseCostUsd(pos);
-      const netAfterCost = pos.unRealizedProfit - estimatedCloseCostUsd;
+      const estimatedCloseCostUsd = this.estimatedCloseCostUsd(pos) * shareFrac;
+      const netAfterCost = pos.unRealizedProfit * shareFrac - estimatedCloseCostUsd;
       const green = Number.isFinite(netAfterCost) && netAfterCost >= 0;
       const stopLossProgress = this.stopLossProgressTowardStop(intent, pos);
       const lossHardCutThis =
@@ -2253,11 +2496,15 @@ export class LiveExecutionEngine {
       }
       if (!green && !hardCutThis && !lossHardCutThis) continue; // red & not an opposition cut → leave to its stop
 
+      // Close ONLY the engine's share (bounded by the intent's remaining qty) — never the whole
+      // netted position, which can include cross-sectional basket legs on the same symbol.
+      const remainingQty = intent.state === "TP1_FILLED_BE_SET" ? Math.max(0, intent.qty - intent.tp1Qty) : intent.qty;
+      const harvestQty = Math.min(Math.abs(engineAmt), remainingQty > 0 ? remainingQty : Math.abs(engineAmt));
       const flat = await this.client.placeOrder({
         symbol: intent.symbol,
-        side: amt > 0 ? "SELL" : "BUY",
+        side: engineAmt > 0 ? "SELL" : "BUY",
         type: "MARKET",
-        quantity: Math.abs(amt),
+        quantity: Number(harvestQty.toFixed(8)),
         reduceOnly: true,
         newClientOrderId: `dtc-${intent.paperOrderId.slice(-18)}-reg`,
       });
@@ -2518,11 +2765,20 @@ export class LiveExecutionEngine {
     intent: LiveIntent,
     pos: FuturesPosition | undefined,
     amt: number,
+    shareFrac = 1,
   ): Promise<{ changed: boolean; closed: boolean }> {
     const threshold = this.profitBankThresholdUsd();
     if (!(threshold > 0)) return { changed: false, closed: false };
     if (!pos) return { changed: false, closed: false };
-    const netAfterCost = pos.unRealizedProfit - this.estimatedCloseCostUsd(pos);
+    // Trigger from the INTENT'S OWN ENTRY, never the netted exchange P&L. The earlier shareFrac
+    // scaling of pos.unRealizedProfit was still biased whenever the intent's entry differed from
+    // the basket legs' entries on the same symbol — 2026-07-08: two more "PROFIT_BANK_NET_1.00"
+    // closes realized NEGATIVE (−0.035 DOGE, −0.015 WLD) through exactly that bias.
+    const pbEntry = intent.filledEntryPrice ?? intent.plannedEntryPrice;
+    const pbMark = pos.markPrice > 0 ? pos.markPrice : null;
+    if (pbMark === null || !(pbEntry > 0)) return { changed: false, closed: false };
+    const ownUnrealized = (intent.direction === "LONG" ? pbMark - pbEntry : pbEntry - pbMark) * Math.abs(amt);
+    const netAfterCost = ownUnrealized - this.estimatedCloseCostUsd(pos) * shareFrac;
     if (!Number.isFinite(netAfterCost) || netAfterCost < threshold) return { changed: false, closed: false };
 
     const flat = await this.client.placeOrder({
@@ -2842,6 +3098,11 @@ export class LiveExecutionEngine {
    */
   private maybeAutoResetLaneSelection(): void {
     const st = this.store.getState();
+    // 2026-07-08 (manual-mode ownership): in MANUAL execution mode the operator owns the
+    // allocation — silently clearing it on a losing close leaves the slot mysteriously dead
+    // until the operator re-picks ("directional stuck ga bisa open" class). Auto-reset stays
+    // active for smart-mode selections only.
+    if (st.manualSelectorMode === true) return;
     const selectionActive =
       (!!st.laneAllocations && st.laneAllocations.length > 0) ||
       (Array.isArray(st.allowedLaneIds) && st.allowedLaneIds.length > 0);
@@ -2932,6 +3193,16 @@ export class LiveExecutionEngine {
   applyRegimeAutopilotAllocation(
     allocations: Array<{ laneId: string; weightPct: number }>,
   ): { ok: boolean; reason: string | null; laneAllocations: Array<{ laneId: string; weightPct: number }> | null } {
+    // Operator override (2026-07-08): manual execution mode = the operator owns the allocation.
+    // Belt-and-suspenders with the autopilot's own tick guard — NO autopilot-attributed apply may
+    // ever overwrite a manual selection, regardless of which caller path reaches this.
+    if (this.isManualSelectorMode()) {
+      return {
+        ok: false,
+        reason: "manual selector mode aktif — operator memegang lane allocation",
+        laneAllocations: this.store.getState().laneAllocations ?? null,
+      };
+    }
     const result = this.setLaneAllocations(allocations);
     if (result.ok) {
       const st = this.store.getState();
@@ -3107,7 +3378,41 @@ export class LiveExecutionEngine {
     const curationCache = getLaneSymbolCurationCacheStore().get();
     const nowMs = Date.now();
 
-    const candidates = this.paperStore.all
+    const provenOnly = this.config.mirrorProvenSymbolsOnly;
+    // MIRROR FUNNEL (2026-07-08): the operator repeatedly hits "kenapa ga ada trade?" and every
+    // diagnosis so far was archaeology. Record the FIRST failing gate for the newest candidates —
+    // pure observation, identical conditions to the filter below, surfaced via getStatus().
+    const explainDrop = (o: PaperOrder): string => {
+      if (!this.config.mirrorAllPaperOrders) {
+        if (o.paperOrderMode !== "HEADLINE") return "not_headline";
+        if (!this.isFreshPaperOrder(o, now)) return "stale";
+        if (!this.isPaperOrderLiveEligible(o, now)) return "not_live_eligible";
+      }
+      if (o.diagnosticLabel != null) return "diagnostic_label";
+      if (!this.laneAllowedForMirror(o)) return "lane_not_allowed";
+      if (!MIRRORABLE_PAPER_STATUSES.has(o.paperStatus)) return `status_${o.paperStatus}`;
+      if (!this.config.mirrorAllPaperOrders && !(o.createdAt > st.lastSeenCreatedAt)) return "behind_watermark";
+      if (mirrored.has(o.paperOrderId)) return "already_mirrored";
+      if ((st.mirrorAttempts[o.paperOrderId] ?? 0) >= MAX_MIRROR_ATTEMPTS) return "quarantined";
+      return "candidate";
+    };
+    this.lastMirrorFunnel = this.paperStore.all
+      .slice(-8)
+      .map((o) => {
+        const reason = explainDrop(o);
+        if (!this.mirrorFirstReason.has(o.paperOrderId) && reason !== "behind_watermark") {
+          this.mirrorFirstReason.set(o.paperOrderId, reason);
+        }
+        return {
+          id: o.paperOrderId,
+          symbol: o.symbol,
+          direction: o.direction,
+          createdAt: o.createdAt,
+          reason,
+          firstReason: this.mirrorFirstReason.get(o.paperOrderId),
+        };
+      });
+    const ranked = this.paperStore.all
       .filter(
         (o) =>
           (this.config.mirrorAllPaperOrders ||
@@ -3121,35 +3426,68 @@ export class LiveExecutionEngine {
           !mirrored.has(o.paperOrderId) &&
           (st.mirrorAttempts[o.paperOrderId] ?? 0) < MAX_MIRROR_ATTEMPTS, // quarantine repeated open failures
       )
+      .map((paper) => ({
+        paper,
+        tier: symbolPriorityTier(
+          paper.symbol,
+          paper.direction,
+          paper.selectedLaneId ?? "",
+          curationCache.report,
+          curationCache.fetchedAt,
+          curationTier,
+          nowMs,
+        ),
+        bookNetAvgR: symbolBookNetAvgR(paper.symbol, paper.direction, curationCache.report),
+      }));
+    // Volatility + technical-confirmation refresh (throttled — moves slowly, no need to refetch
+    // every ~25s tick). Covers EVERY candidate this tick, not just whitelist ones: the size
+    // multiplier below only reads whitelist entries, but the technical gate (below) applies to
+    // every candidate regardless of whitelist tier — see directional-symbol-sizing.ts.
+    const candidateSymbolsThisTick = [...new Set(ranked.map((r) => r.paper.symbol))];
+    const whitelistSymbolsThisTick = [...new Set(ranked.filter((r) => r.tier === 0).map((r) => r.paper.symbol))];
+    await this.maybeRefreshSymbolVolatility(candidateSymbolsThisTick);
+    const funnelById = new Map(this.lastMirrorFunnel.map((f) => [f.id, f]));
+    const latchReason = (paperOrderId: string, reason: string) => {
+      this.mirrorFirstReason.set(paperOrderId, reason);
+      const f = funnelById.get(paperOrderId);
+      if (f) {
+        f.reason = reason;
+        f.firstReason = reason;
+      }
+    };
+    if (provenOnly) {
+      for (const c of ranked) {
+        if (c.tier > 1) latchReason(c.paper.paperOrderId, "unproven_symbol");
+      }
+    }
+    const candidates = ranked
+      // LIVE_MIRROR_PROVEN_SYMBOLS_ONLY: operator-requested hard gate — only book-proven symbols
+      // (tier 0/1) may open the directional slot; an unproven-symbol candidate is dropped rather
+      // than admitted last. This is the ONE deliberate exception to "never rejects, only reorders"
+      // (flag off = the default reorder-only behavior is unchanged).
+      .filter((c) => !provenOnly || c.tier <= 1)
       .sort((a, b) => {
-        // Symbol priority tier (0=curated whitelist, 1=proven-elsewhere fallback, 2=no obstruction —
-        // never rejects, only reorders admission when slots are scarce). createdAt is the tiebreaker
-        // within a tier, preserving the existing FIFO order.
-        const tierA = symbolPriorityTier(
-          a.symbol,
-          a.direction,
-          a.selectedLaneId ?? "",
-          curationCache.report,
-          curationCache.fetchedAt,
-          curationTier,
-          nowMs,
-        );
-        const tierB = symbolPriorityTier(
-          b.symbol,
-          b.direction,
-          b.selectedLaneId ?? "",
-          curationCache.report,
-          curationCache.fetchedAt,
-          curationTier,
-          nowMs,
-        );
-        if (tierA !== tierB) return tierA - tierB;
-        return a.createdAt < b.createdAt ? -1 : 1;
-      });
+        // Priority tier first (0=curated whitelist, 1=proven-elsewhere, 2=no data), then BEST
+        // measured book performance within the tier ("buka simbol dengan performa terbaik, bukan
+        // sembarang buka"), then createdAt as the final FIFO tiebreaker.
+        if (a.tier !== b.tier) return a.tier - b.tier;
+        const perfA = a.bookNetAvgR ?? Number.NEGATIVE_INFINITY;
+        const perfB = b.bookNetAvgR ?? Number.NEGATIVE_INFINITY;
+        if (perfA !== perfB) return perfB - perfA;
+        return a.paper.createdAt < b.paper.createdAt ? -1 : 1;
+      })
+      .map((c) => c.paper);
 
     let slots = Math.max(0, this.config.maxConcurrentPositions - openCount);
     const clusterOpen = this.clusterOpenCounts(st.intents);
     let maxSeen = st.lastSeenCreatedAt;
+
+    // Snapshot once per tick (not per candidate): this tick's whitelist ATR% values, for the
+    // relative peer comparison in directionalSymbolSizeMultiplier below.
+    const atrPctBySymbol = getSymbolVolatilityCacheStore().get().atrPctBySymbol;
+    const peerAtrPcts = whitelistSymbolsThisTick
+      .map((s) => atrPctBySymbol[s])
+      .filter((v): v is number => typeof v === "number" && Number.isFinite(v) && v > 0);
 
     const grouped = new Map<string, PaperOrder[]>();
     for (const paper of candidates) {
@@ -3163,13 +3501,51 @@ export class LiveExecutionEngine {
         if (paper.createdAt > maxSeen) maxSeen = paper.createdAt;
       }
       const oppositeIntent = openIntentsBySymbol.get(first.symbol);
-      if (oppositeIntent && oppositeIntent.direction !== first.direction) continue;
-      if (!oppositeIntent && slots <= 0) continue;
+      if (oppositeIntent && oppositeIntent.direction !== first.direction) {
+        for (const paper of papers) latchReason(paper.paperOrderId, "opposite_intent_open");
+        continue;
+      }
+      if (!oppositeIntent && slots <= 0) {
+        for (const paper of papers) latchReason(paper.paperOrderId, "no_slots");
+        continue;
+      }
+      // Entry-side netting guard preview (the authoritative guard lives in openIntent): surfaced
+      // here so the funnel explains WHY a candidate on a basket-opposite symbol never opens.
+      const groupClaim = this.externalManagedNetQty().get(first.symbol) ?? 0;
+      if (groupClaim !== 0 && Math.sign(groupClaim) !== (first.direction === "LONG" ? 1 : -1)) {
+        for (const paper of papers) latchReason(paper.paperOrderId, "basket_opposite_side");
+        continue;
+      }
       // Per-correlation-cluster cap (MAJORS exempt). A genuinely different basket gets its own slots
       // instead of sharing one flat alt cap; a single cluster still can't pile up beyond the limit.
       const clusterKey = `${clusterOf(first.symbol)}:${first.direction}`;
       if (!oppositeIntent && !isMajorSymbol(first.symbol)) {
-        if ((clusterOpen.get(clusterKey)?.size ?? 0) >= this.config.maxClusterPositions) continue;
+        if ((clusterOpen.get(clusterKey)?.size ?? 0) >= this.config.maxClusterPositions) {
+          for (const paper of papers) latchReason(paper.paperOrderId, "cluster_cap");
+          continue;
+        }
+      }
+      // Technical-confirmation gate (2026-07-08, operator-requested ADD-ON — whitelist above still
+      // decides which symbols/priority are eligible; this additionally requires the symbol's OWN
+      // fresh candles to confirm the direction right now). Fails CLOSED: missing/stale cache data
+      // blocks rather than passes, since the whole point is "don't fire without confirmation."
+      if (isDirectionalTechnicalGateEnabled()) {
+        const signal = getSymbolVolatilityCacheStore().get().technicalBySymbol[first.symbol]?.[first.direction];
+        if (!signal?.confirmed) {
+          for (const paper of papers) latchReason(paper.paperOrderId, "technical_not_confirmed");
+          continue;
+        }
+      }
+      // Pyramid cap: once an intent has absorbed PYRAMID_FREE_ADD_LIMIT adds, further adds require
+      // real favorable progress (maxFavorableR) — see the constant's doc comment for the real-loss
+      // evidence. The ORIGINAL position is untouched; it still rides to its own stop/TP/max-hold.
+      if (
+        oppositeIntent &&
+        oppositeIntent.direction === first.direction &&
+        shouldCapPyramidAdd(oppositeIntent, PYRAMID_FREE_ADD_LIMIT, PYRAMID_MIN_FAVORABLE_R)
+      ) {
+        for (const paper of papers) latchReason(paper.paperOrderId, "pyramid_capped_no_progress");
+        continue;
       }
       const lanePapers = oppositeIntent
         ? papers.filter((paper) => this.paperCompatibleWithIntent(oppositeIntent, paper))
@@ -3191,13 +3567,26 @@ export class LiveExecutionEngine {
         // (e.g. lane1 70% / lane2 30%). combinedPlan re-rounds to stepSize and a
         // too-small scaled qty fails its minQty check (skipped, not mis-sized).
         const weightPct = this.laneAllocationWeightPct(paper);
+        // Per-symbol performance+volatility tilt (2026-07-08, whitelist-scoped — see
+        // directional-symbol-sizing.ts). 1x outside the curated whitelist or on missing data.
+        const sizeMult = directionalSymbolSizeMultiplier({
+          isWhitelisted:
+            symbolPriorityTier(paper.symbol, paper.direction, paper.selectedLaneId ?? "", curationCache.report, curationCache.fetchedAt, curationTier, nowMs) === 0,
+          netAvgR: symbolBookNetAvgR(paper.symbol, paper.direction, curationCache.report),
+          atrPct: atrPctBySymbol[paper.symbol] ?? null,
+          peerAtrPcts,
+        });
+        const totalScale = (weightPct / 100) * sizeMult;
         const scaled =
-          weightPct === 100
+          totalScale === 1
             ? plan
-            : { ...plan, qty: plan.qty * (weightPct / 100), notionalUsd: plan.notionalUsd * (weightPct / 100) };
+            : { ...plan, qty: plan.qty * totalScale, notionalUsd: plan.notionalUsd * totalScale };
         return [{ paper, plan: scaled }];
       });
-      if (planned.length === 0) continue;
+      if (planned.length === 0) {
+        for (const paper of lanePapers) latchReason(paper.paperOrderId, "plan_not_sizeable"); // e.g. BTC: $50 cap < one 0.001-step
+        continue;
+      }
 
       // Record the attempt BEFORE placing orders and persist it, so a deterministic failure (or a
       // crash mid-open) can never be retried forever — at MAX_MIRROR_ATTEMPTS the paper order is
@@ -3209,8 +3598,10 @@ export class LiveExecutionEngine {
       this.store.save();
       if (oppositeIntent) {
         await this.addToIntent(oppositeIntent, planned, filters);
+        for (const { paper } of planned) latchReason(paper.paperOrderId, "added_to_intent");
       } else {
         await this.openIntent(planned, filters);
+        for (const { paper } of planned) latchReason(paper.paperOrderId, "opened");
         if (!isMajorSymbol(first.symbol)) {
           const set = clusterOpen.get(clusterKey) ?? new Set<string>();
           set.add(first.symbol);
@@ -3229,12 +3620,37 @@ export class LiveExecutionEngine {
         pruned = true;
       }
     }
+    for (const id of this.mirrorFirstReason.keys()) {
+      if (!liveIds.has(id)) this.mirrorFirstReason.delete(id);
+    }
 
     if (maxSeen !== st.lastSeenCreatedAt) {
       st.lastSeenCreatedAt = maxSeen;
       this.store.save();
     } else if (pruned) {
       this.store.save();
+    }
+  }
+
+  /** Best-effort, throttled ATR% refresh for the given (whitelist) symbols. No-ops without a
+   *  candle-capable marketDataClient, within the throttle window, or on an empty symbol list —
+   *  none of these can ever block or fail a tick (directionalSymbolSizeMultiplier falls back to
+   *  1x on missing data regardless). */
+  private async maybeRefreshSymbolVolatility(symbols: string[]): Promise<void> {
+    if (symbols.length === 0 || !this.marketDataClient?.getCandles) return;
+    const nowMs = Date.now();
+    if (nowMs - this.lastVolatilityRefreshAtMs < SYMBOL_VOLATILITY_REFRESH_INTERVAL_MS) return;
+    this.lastVolatilityRefreshAtMs = nowMs;
+    const client = this.marketDataClient;
+    try {
+      await refreshSymbolVolatilityCache(
+        getSymbolVolatilityCacheStore(),
+        symbols,
+        (symbol, interval, limit) => client.getCandles(symbol, interval, limit),
+        { nowIso: this.nowIso },
+      );
+    } catch {
+      // best-effort — a failed refresh just leaves the previous cache in place
     }
   }
 
@@ -3341,6 +3757,21 @@ export class LiveExecutionEngine {
     const paper = planned[0]!.paper;
     const plan = this.combinedPlan(planned, filters);
     if (!plan.ok) return;
+    // ENTRY-side netting guard (2026-07-08 REAL-MONEY incident: a SHORT SUI intent opened while
+    // two baskets held LONG SUI — in one-way mode the "entry" order just SOLD 47.5 of the baskets'
+    // longs, its reduce-only exits then -2022-rejected against the still-net-long position, and
+    // reconcile disarm-looped on the books/exchange mismatch). An intent whose direction OPPOSES
+    // a non-zero external claim on the same symbol can never open cleanly on a netted account —
+    // skip it entirely; the mirror retries once the basket leg is gone.
+    const entryExternalClaim = this.externalManagedNetQty().get(paper.symbol) ?? 0;
+    const intendedSign = paper.direction === "LONG" ? 1 : -1;
+    if (entryExternalClaim !== 0 && Math.sign(entryExternalClaim) !== intendedSign) {
+      console.warn(
+        `[live-execution-engine] skip ${paper.direction} ${paper.symbol}: cross-sectional baskets hold ` +
+          `${entryExternalClaim} on the opposite side — opening would net against (consume) the basket hedge`,
+      );
+      return;
+    }
     const st = this.store.getState();
     const now = this.nowIso();
     const intent: LiveIntent = {
@@ -3470,7 +3901,13 @@ export class LiveExecutionEngine {
         await this.client.cancelAllOrders(paper.symbol);
         await this.client.cancelAllAlgoOrders(paper.symbol);
         const positions = await this.client.getPositions(paper.symbol);
-        const amt = positions.find((p) => p.symbol === paper.symbol)?.positionAmt ?? 0;
+        const rawAmt = positions.find((p) => p.symbol === paper.symbol)?.positionAmt ?? 0;
+        // Flatten the ENGINE SHARE only — positionAmt is netted per symbol and can include
+        // cross-sectional basket legs (2026-07-07: the sibling add-failed path bought back the
+        // basket's 64 WLD hedge along with the failed intent). Cap at |rawAmt| and skip entirely
+        // on a sign flip (external claims own the whole net position — nothing of ours remains).
+        const share = rawAmt - (this.externalManagedNetQty().get(paper.symbol) ?? 0);
+        const amt = Math.sign(share) === Math.sign(rawAmt) ? Math.sign(rawAmt) * Math.min(Math.abs(share), Math.abs(rawAmt)) : 0;
         if (Math.abs(amt) > 1e-12) {
           const flat = await this.client.placeOrder({
             symbol: paper.symbol,
@@ -3506,6 +3943,11 @@ export class LiveExecutionEngine {
     if (intent.state !== "OPEN") return;
     const addition = this.combinedPlan(planned, filters);
     if (!addition.ok) return;
+    // Same ENTRY-side netting guard as openIntent: never add exposure whose direction opposes a
+    // live basket claim on the symbol — the add would net-consume the basket's hedge.
+    const addExternalClaim = this.externalManagedNetQty().get(intent.symbol) ?? 0;
+    const addSign = intent.direction === "LONG" ? 1 : -1;
+    if (addExternalClaim !== 0 && Math.sign(addExternalClaim) !== addSign) return;
     const idTail = planned[0]!.paper.paperOrderId.slice(-18);
 
     // STEP 1 — place the add entry while the EXISTING stop/TP still protect the position. If the
@@ -3626,7 +4068,12 @@ export class LiveExecutionEngine {
         await this.client.cancelAllOrders(intent.symbol);
         await this.client.cancelAllAlgoOrders(intent.symbol);
         const positions = await this.client.getPositions(intent.symbol);
-        const amt = positions.find((p) => p.symbol === intent.symbol)?.positionAmt ?? 0;
+        const rawAmt = positions.find((p) => p.symbol === intent.symbol)?.positionAmt ?? 0;
+        // ENGINE SHARE only (2026-07-07 REAL-MONEY incident: this exact flatten bought back the
+        // whole netted −193 WLD — the failed intent's 129 PLUS the basket's 64 hedge — leaving
+        // basket xb-mrapun17 unhedged). See the sibling comment in openIntent's catch.
+        const share = rawAmt - (this.externalManagedNetQty().get(intent.symbol) ?? 0);
+        const amt = Math.sign(share) === Math.sign(rawAmt) ? Math.sign(rawAmt) * Math.min(Math.abs(share), Math.abs(rawAmt)) : 0;
         if (Math.abs(amt) > 1e-12) {
           const flat = await this.client.placeOrder({
             symbol: intent.symbol,

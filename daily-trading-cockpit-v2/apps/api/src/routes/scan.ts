@@ -513,6 +513,7 @@ export async function registerScanRoute(
           estimatedRegime,
           stableShortLanes,
           forceFastShort: process.env.REALTIME_SHORT_FORCE_FAST_SHORT === "1",
+          forceFastLong: process.env.REALTIME_SHORT_FORCE_FAST_LONG === "1",
           crowdingVetoEnabled,
           crowdingBySymbol,
           rotationShortlist,

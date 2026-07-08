@@ -229,6 +229,20 @@ export function buildRegimeRotationShortlistReport(
   };
 }
 
+/** Whether the shortlist has ANY symbol for the family at all. An EMPTY family means the local
+ *  VM book has no data to rank from (live never accrues VM observations) — that is "no data",
+ *  not "no good symbols", and callers should fall back to the /research curation whitelist
+ *  instead of vetoing everything (2026-07-08: live opened ZERO trades in an extended-bear regime
+ *  because its local shortlist was structurally empty). */
+export function rotationShortlistFamilyHasSymbols(
+  report: RegimeRotationShortlistReport,
+  family: "BULLISH" | "BEARISH",
+): boolean {
+  const key = family === "BULLISH" ? "bullish" : "bearish";
+  if ((family === "BULLISH" ? report.bullishGlobal : report.bearishGlobal).length > 0) return true;
+  return report.lanes.some((lane) => lane[key].length > 0);
+}
+
 export function rotationShortlistDecision(
   report: RegimeRotationShortlistReport | null | undefined,
   input: {

@@ -12,6 +12,7 @@ import {
   CrossSectionalExecutor,
   CrossSectionalExecutorStore,
   type CrossSectionalExecClient,
+  type ExecutorBasket,
 } from "../src/lib/cross-sectional-executor.js";
 
 const NOW = "2026-07-02T03:00:00.000Z";
@@ -106,8 +107,14 @@ class FakeExecClient implements CrossSectionalExecClient {
       marginType: "ISOLATED",
     }));
   }
+  /** Symbols where a reduceOnly order gets Binance's -2022 (netted account position has the
+   *  opposite sign, e.g. a sibling basket holds a bigger opposite leg on the same symbol). */
+  rejectReduceOnlyOn = new Set<string>();
   async placeOrder(params: { symbol: string; side: string; quantity: number; reduceOnly?: boolean }) {
     if (this.failOnSymbol === params.symbol && !params.reduceOnly) throw new Error(`exchange rejected ${params.symbol}`);
+    if (params.reduceOnly && this.rejectReduceOnlyOn.has(params.symbol)) {
+      throw new Error("Binance error HTTP 400 code -2022: ReduceOnly Order is rejected.");
+    }
     this.placed.push(params);
     const orderId = this.orderSeq++;
     const avgPrice = this.fillPriceBySymbol.get(params.symbol) ?? 0;
@@ -120,10 +127,11 @@ class FakeExecClient implements CrossSectionalExecClient {
   }
 }
 
-function makeExecutor(opts: { client?: FakeExecClient; allowed?: boolean; laneWeightPct?: number; signalMs?: number } = {}) {
+function makeExecutor(opts: { client?: FakeExecClient; allowed?: boolean; laneWeightPct?: number; signalMs?: number; dailyMaxLossUsd?: number } = {}) {
   const client = opts.client ?? new FakeExecClient();
   const signalStore = new CrossSectionalStore(tmpDir());
-  const store = new CrossSectionalExecutorStore(tmpDir());
+  const storeDir = tmpDir();
+  const store = new CrossSectionalExecutorStore(storeDir);
   // Executor watermark starts at construction time; backdate it so our test signal is "new".
   store.getState().lastSeenSignalMs = NOW_MS - 3_600_000;
   if (opts.signalMs !== undefined) signalStore.add(signalObs(opts.signalMs));
@@ -135,8 +143,10 @@ function makeExecutor(opts: { client?: FakeExecClient; allowed?: boolean; laneWe
     laneWeightPct: () => opts.laneWeightPct ?? 100,
     nowIso: () => NOW,
     fillConfirmRetryDelayMs: 0,
+    // Injected (not process.env) — env mutation in tests leaks across vitest worker threads.
+    ...(opts.dailyMaxLossUsd !== undefined ? { dailyMaxLossUsd: () => opts.dailyMaxLossUsd! } : {}),
   });
-  return { executor, client, signalStore, store };
+  return { executor, client, signalStore, store, storeDir };
 }
 
 describe("cross-sectional executor (basket execution, testnet-first)", () => {
@@ -446,5 +456,345 @@ describe("executor variant targeting", () => {
     signalStore.add(signalObs(NOW_MS - 3 * 60_000));
     await executor.tick();
     expect(store.getState().baskets.filter((b) => b.status === "OPEN").length).toBe(1);
+  });
+});
+
+// 2026-07-08 (operator: "wire lane baru ke allocation selection"): CrossSectionalExecutor now
+// accepts explicit targetVariant/laneId overrides so app.ts can run SEPARATE executor instances
+// for TREND_BETA_VOL/MIXED_MEAN_REVERSION alongside the original FILTERED foundation instance,
+// each mirroring its own measured variant instead of all three fighting over the same signal feed.
+describe("executor targetVariant/laneId overrides (multi-instance wiring, 2026-07-08)", () => {
+  it("with an explicit targetVariant, executes THAT variant's signals and ignores FILTERED", async () => {
+    const client = new FakeExecClient();
+    const signalStore = new CrossSectionalStore(tmpDir());
+    const store = new CrossSectionalExecutorStore(tmpDir());
+    store.getState().lastSeenSignalMs = NOW_MS - 3_600_000;
+    const filtered = signalObs(NOW_MS - 5 * 60_000);
+    filtered.variant = "FILTERED";
+    signalStore.add(filtered);
+    const trend = signalObs(NOW_MS - 4 * 60_000);
+    trend.observationId = "xsec:MOM24:trend";
+    trend.variant = "TREND_BETA_VOL";
+    signalStore.add(trend);
+    const executor = new CrossSectionalExecutor({
+      client,
+      signalStore,
+      store,
+      isAllowed: () => true,
+      nowIso: () => NOW,
+      targetVariant: "TREND_BETA_VOL",
+    });
+    await executor.tick();
+    expect(executor.getStatus().variant).toBe("TREND_BETA_VOL");
+    expect(store.getState().baskets.length).toBe(1);
+    // The one basket opened must be built from the TREND leg (DOGEUSDT/SOLUSDT are shared fixture
+    // legs in both signals here, so the discriminator is that a FILTERED-only executor would have
+    // opened on the 5-min-old signal's watermark advance instead — this asserts variant selection,
+    // not leg contents).
+  });
+
+  it("with an explicit laneId, reports it via getStatus() instead of the shared CROSS_SECTIONAL_MARKET_NEUTRAL default", async () => {
+    const { executor: defaultExecutor } = makeExecutor({});
+    expect(defaultExecutor.getStatus().laneId).toBe("CROSS_SECTIONAL_MARKET_NEUTRAL");
+
+    const client = new FakeExecClient();
+    const signalStore = new CrossSectionalStore(tmpDir());
+    const store = new CrossSectionalExecutorStore(tmpDir());
+    const executor = new CrossSectionalExecutor({
+      client,
+      signalStore,
+      store,
+      isAllowed: () => true,
+      nowIso: () => NOW,
+      targetVariant: "MIXED_MEAN_REVERSION",
+      laneId: "CROSS_SECTIONAL_MIXED",
+    });
+    expect(executor.getStatus().laneId).toBe("CROSS_SECTIONAL_MIXED");
+    expect(executor.getStatus().variant).toBe("MIXED_MEAN_REVERSION");
+  });
+
+  it("CrossSectionalExecutorStore with a distinct fileName does not collide with the default store file", () => {
+    const makeBasket = (basketId: string): ExecutorBasket => ({
+      basketId,
+      sourceObservationId: `xsec:MOM24:${basketId}`,
+      signal: "MOM24_FILTERED",
+      variant: "FILTERED",
+      openedAt: NOW,
+      closesAtMs: NOW_MS + 24 * 3_600_000,
+      legs: [],
+      status: "OPEN",
+      closedAt: null,
+      closeReason: null,
+      grossPnlUsd: null,
+      feeEstimateUsd: null,
+      netPnlUsd: null,
+    });
+    const dir = tmpDir();
+    const defaultStore = new CrossSectionalExecutorStore(dir);
+    defaultStore.getState().baskets.push(makeBasket("default-basket"));
+    defaultStore.save();
+
+    const mixedStore = new CrossSectionalExecutorStore(dir, "cross-sectional-executor-mixed.json");
+    expect(mixedStore.getState().baskets.length).toBe(0); // fresh state, not the default file's basket
+    mixedStore.getState().baskets.push(makeBasket("mixed-basket"));
+    mixedStore.save();
+
+    // Re-reading the ORIGINAL default file must still show only its own basket (no cross-write).
+    const reread = new CrossSectionalExecutorStore(dir);
+    expect(reread.getState().baskets.map((b) => b.basketId)).toEqual(["default-basket"]);
+  });
+});
+
+// [STATUS-VISIBILITY] 2026-07-07 audit: an executor with zero eligible signals for ~18h was
+// completely silent about it — getStatus() reported nothing that would surface a stuck signal
+// pipeline or a starved adaptive filter. These fields close that gap.
+describe("getStatus signal freshness + adaptive filter visibility", () => {
+  it("reports signalAgeMs/signalStale for a fresh matching-variant signal", () => {
+    const { executor } = makeExecutor({ signalMs: NOW_MS - 5 * 60_000 }); // 5 min old, FILTERED
+    const status = executor.getStatus();
+    expect(status.signalAgeMs).toBe(5 * 60_000);
+    expect(status.signalMaxAgeMs).toBe(50 * 60_000);
+    expect(status.signalStale).toBe(false);
+  });
+
+  it("reports signalStale=true when the newest matching signal is older than the freshness window", () => {
+    const { executor } = makeExecutor({ signalMs: NOW_MS - 60 * 60_000 }); // 60 min > 50 min default
+    const status = executor.getStatus();
+    expect(status.signalAgeMs).toBe(60 * 60_000);
+    expect(status.signalStale).toBe(true);
+  });
+
+  it("reports signalAgeMs=null and signalStale=true when no matching-variant signal exists at all", () => {
+    const { executor } = makeExecutor(); // no signal added
+    const status = executor.getStatus();
+    expect(status.signalAgeMs).toBeNull();
+    expect(status.signalStale).toBe(true);
+  });
+
+  it("surfaces adaptiveFilters.shortFloorApplied when the signal store's own demotion history would starve the short side", async () => {
+    const { executor, signalStore } = makeExecutor({ signalMs: NOW_MS - 5 * 60_000 });
+    const shortSymbols = ["DOGEUSDT", "OPUSDT", "1000PEPEUSDT", "SEIUSDT", "WLDUSDT"];
+    for (let i = 0; i < 3; i++) {
+      signalStore.add({
+        observationId: `closed-${i}`,
+        openedAt: NOW,
+        openedAtMs: NOW_MS - 3_600_000,
+        horizonMs: 3_600_000,
+        signal: "MOM24",
+        variant: "RAW",
+        k: shortSymbols.length,
+        longLeg: [],
+        shortLeg: shortSymbols.map((sym) => ({ symbol: sym, entryPrice: 1, exitPrice: 1.02 })), // rose ⇒ short loses
+        status: "CLOSED",
+        grossReturn: -0.02, costReturn: 0, netReturn: -0.02, longLegReturn: null, shortLegReturn: -0.02,
+        resolvedAt: NOW,
+      });
+    }
+    const status = executor.getStatus();
+    expect(status.adaptiveFilters.shortFloorApplied).toBe(true);
+    expect(status.adaptiveFilters.demotedShort.sort()).toEqual(shortSymbols.sort());
+  });
+
+  it("adaptiveFilters.shortFloorApplied is false when the signal store has no starving demotion history", () => {
+    const { executor } = makeExecutor({ signalMs: NOW_MS - 5 * 60_000 });
+    expect(executor.getStatus().adaptiveFilters.shortFloorApplied).toBe(false);
+    expect(executor.getStatus().adaptiveFilters.longFloorApplied).toBe(false);
+  });
+});
+
+// [NETTED-CLOSE] 2026-07-07: with overlapping baskets, Binance nets per symbol — a basket long
+// SOL while two siblings are short SOL leaves the ACCOUNT net short, so the reduce-only close of
+// the long leg gets -2022 and the basket wedges half-closed forever (testnet xb-mr7zdpiz sat
+// stuck for hours at +0.63% with the TP unable to complete). closeBasket must drop reduceOnly
+// exactly when sibling baskets' un-exited opposite exposure fully covers the leg — and only then.
+describe("closeBasket under cross-basket netting", () => {
+  function basket(id: string, legs: Array<{ symbol: string; side: "LONG" | "SHORT"; qty: number; entryPrice: number; exitOrderId?: number | null; exitPrice?: number | null }>, closesAtMs: number) {
+    return {
+      basketId: id,
+      sourceObservationId: `src-${id}`,
+      signal: "MOM24_FILTERED",
+      variant: "FILTERED",
+      openedAt: new Date(NOW_MS - 24 * 3_600_000).toISOString(),
+      closesAtMs,
+      legs: legs.map((l) => ({
+        symbol: l.symbol, side: l.side, qty: l.qty, entryPrice: l.entryPrice,
+        entryOrderId: 1, entryPriceConfirmed: true,
+        exitPrice: l.exitPrice ?? null, exitOrderId: l.exitOrderId ?? null, exitPriceConfirmed: l.exitOrderId != null ? true : null,
+      })),
+      status: "OPEN" as const,
+      closedAt: null, closeReason: null, grossPnlUsd: null, feeEstimateUsd: null, netPnlUsd: null,
+    };
+  }
+
+  it("[NETTED-CLOSE] drops reduceOnly when sibling baskets fully cover the opposite side", async () => {
+    const { executor, client, store } = makeExecutor();
+    client.rejectReduceOnlyOn.add("SOLUSDT"); // account is net short — reduce-only SELL would be -2022
+    client.fillPriceBySymbol.set("SOLUSDT", 110);
+    store.getState().baskets.push(
+      basket("a", [{ symbol: "SOLUSDT", side: "LONG", qty: 1, entryPrice: 100 }], NOW_MS - 60_000), // due
+      basket("b", [{ symbol: "SOLUSDT", side: "SHORT", qty: 2, entryPrice: 100 }], NOW_MS + 3_600_000), // sibling short, stays open
+    );
+    await executor.tick();
+    const a = store.getState().baskets.find((x) => x.basketId === "a")!;
+    expect(a.status).toBe("CLOSED");
+    const exit = client.placed.find((p) => p.symbol === "SOLUSDT" && p.side === "SELL")!;
+    expect(exit.reduceOnly).toBeFalsy(); // the plain-market bookkeeping close
+    // (110-100)*1 gross − (100+110)*0.0005 fees
+    expect(a.netPnlUsd).toBeCloseTo(10 - 210 * 0.0005, 6);
+    expect(store.getState().baskets.find((x) => x.basketId === "b")!.status).toBe("OPEN");
+  });
+
+  it("[NETTED-CLOSE-GUARD] keeps reduceOnly (and stays OPEN on rejection) when no sibling covers the leg", async () => {
+    const { executor, client, store } = makeExecutor();
+    client.rejectReduceOnlyOn.add("SOLUSDT");
+    store.getState().baskets.push(
+      basket("a", [{ symbol: "SOLUSDT", side: "LONG", qty: 1, entryPrice: 100 }], NOW_MS - 60_000),
+    );
+    await executor.tick();
+    const a = store.getState().baskets.find((x) => x.basketId === "a")!;
+    expect(a.status).toBe("OPEN"); // wedged, surfaced — NOT silently force-closed without the guard
+    expect(executor.getStatus().lastError ?? "").toMatch(/ReduceOnly/);
+  });
+
+  it("[RETRY-PNL] finalizing after a partial close counts the ALREADY-exited legs' P&L", async () => {
+    const { executor, client, store } = makeExecutor();
+    client.fillPriceBySymbol.set("ADAUSDT", 0.9);
+    store.getState().baskets.push(
+      basket("a", [
+        // Exited in a previous attempt (stored exit price 108) — must still count in final P&L.
+        { symbol: "SOLUSDT", side: "LONG", qty: 1, entryPrice: 100, exitOrderId: 999, exitPrice: 108 },
+        { symbol: "ADAUSDT", side: "SHORT", qty: 10, entryPrice: 1 },
+      ], NOW_MS - 60_000),
+    );
+    await executor.tick();
+    const a = store.getState().baskets.find((x) => x.basketId === "a")!;
+    expect(a.status).toBe("CLOSED");
+    // gross = (108−100)*1 + (1−0.9)*10 = 9; fees = ((100+108)*1 + (1+0.9)*10) * 0.0005 = 0.1135
+    expect(a.grossPnlUsd).toBeCloseTo(9, 6);
+    expect(a.netPnlUsd).toBeCloseTo(9 - 227 * 0.0005, 6);
+  });
+});
+
+describe("TP-gap stamping + daily basket loss breaker (safety net, never a profit killer)", () => {
+  function openBasket(id: string, legs: Array<{ symbol: string; side: "LONG" | "SHORT"; qty: number; entryPrice: number }>, closesAtMs: number) {
+    return {
+      basketId: id,
+      sourceObservationId: `src-${id}`,
+      signal: "MOM24_FILTERED",
+      variant: "FILTERED",
+      openedAt: new Date(NOW_MS - 24 * 3_600_000).toISOString(),
+      closesAtMs,
+      legs: legs.map((l) => ({
+        symbol: l.symbol, side: l.side, qty: l.qty, entryPrice: l.entryPrice,
+        entryOrderId: 1, entryPriceConfirmed: true,
+        exitPrice: null, exitOrderId: null, exitPriceConfirmed: null,
+      })),
+      status: "OPEN" as const,
+      closedAt: null, closeReason: null, grossPnlUsd: null, feeEstimateUsd: null, netPnlUsd: null,
+    };
+  }
+  function closedBasket(id: string, closedAt: string, netPnlUsd: number) {
+    return {
+      basketId: id,
+      sourceObservationId: `src-${id}`,
+      signal: "MOM24_FILTERED",
+      variant: "FILTERED",
+      openedAt: new Date(NOW_MS - 24 * 3_600_000).toISOString(),
+      closesAtMs: NOW_MS - 3_600_000,
+      legs: [],
+      status: "CLOSED" as const,
+      closedAt, closeReason: "HORIZON", grossPnlUsd: netPnlUsd, feeEstimateUsd: 0, netPnlUsd,
+    };
+  }
+
+  it("[TP-GAP] stamps lastNetReturn/lastNetAt on every open basket each tick and PERSISTS it (below threshold ⇒ stays OPEN)", async () => {
+    const client = new FakeExecClient();
+    client.fillPriceBySymbol.set("SOLUSDT", 100);
+    client.fillPriceBySymbol.set("DOGEUSDT", 0.1);
+    const { executor, store, storeDir } = makeExecutor({ client, signalMs: NOW_MS - 5 * 60_000 });
+    await executor.tick(); // opens the basket
+    const basket = store.getState().baskets[0]!;
+    expect(basket.lastNetReturn).toBeUndefined(); // nothing stamped yet
+
+    // SOL long +0.5%, DOGE short flat: gross = 0.005/2 = 0.0025; net = 0.0025 − 0.0012 < 0.006 TP.
+    client.markPriceBySymbol.set("SOLUSDT", 100.5);
+    client.markPriceBySymbol.set("DOGEUSDT", 0.1);
+    await executor.tick();
+
+    expect(basket.status).toBe("OPEN");
+    expect(basket.lastNetReturn).toBeCloseTo(0.0025 - 0.0012, 9);
+    expect(basket.lastNetAt).toBe(NOW);
+    // The stamp must survive a restart — the dashboard reads it from the persisted store.
+    const reloaded = new CrossSectionalExecutorStore(storeDir);
+    expect(reloaded.getState().baskets[0]!.lastNetReturn).toBeCloseTo(0.0025 - 0.0012, 9);
+  });
+
+  it("[TP-GAP] skips the stamp (never fabricates) when a leg's mark price is missing", async () => {
+    const client = new FakeExecClient();
+    client.fillPriceBySymbol.set("SOLUSDT", 100);
+    client.fillPriceBySymbol.set("DOGEUSDT", 0.1);
+    const { executor, store } = makeExecutor({ client, signalMs: NOW_MS - 5 * 60_000 });
+    await executor.tick();
+    client.markPriceBySymbol.set("SOLUSDT", 110); // DOGE mark missing entirely
+    await executor.tick();
+    expect(store.getState().baskets[0]!.lastNetReturn).toBeUndefined();
+  });
+
+  it("[BREAKER] halts NEW opens once today's realized basket loss breaches the injected limit", async () => {
+    const { executor, client, store } = makeExecutor({ signalMs: NOW_MS - 5 * 60_000, dailyMaxLossUsd: 5 });
+    store.getState().baskets.push(closedBasket("loss", NOW, -6));
+    await executor.tick();
+    expect(store.getState().baskets.filter((b) => b.status === "OPEN").length).toBe(0);
+    expect(client.placed.length).toBe(0); // not a single entry order reached the exchange
+    const status = executor.getStatus();
+    expect(status.openHalted).toMatch(/breaker/);
+    expect(status.dailyRealizedUsd).toBeCloseTo(-6, 6);
+    expect(status.dailyMaxLossUsd).toBe(5);
+  });
+
+  it("[BREAKER] open baskets still run their own exits while halted — it only blocks NEW opens", async () => {
+    const client = new FakeExecClient();
+    client.fillPriceBySymbol.set("SOLUSDT", 90); // due basket exits at a LOSS, so the day stays below the limit
+    const { executor, store } = makeExecutor({ client, signalMs: NOW_MS - 5 * 60_000, dailyMaxLossUsd: 5 });
+    store.getState().baskets.push(
+      closedBasket("loss", NOW, -6),
+      openBasket("due", [{ symbol: "SOLUSDT", side: "LONG", qty: 1, entryPrice: 100 }], NOW_MS - 60_000),
+    );
+    await executor.tick();
+    const due = store.getState().baskets.find((b) => b.basketId === "due")!;
+    expect(due.status).toBe("CLOSED"); // horizon exit ran untouched
+    expect(due.closeReason).toBe("HORIZON");
+    expect(client.placed.filter((p) => !p.reduceOnly).length).toBe(0); // only the exit, no new entries
+    expect(executor.getStatus().openHalted).toMatch(/breaker/);
+  });
+
+  it("[BREAKER] un-halts BY ITSELF when a later exit recovers the day's realized above the limit", async () => {
+    const client = new FakeExecClient();
+    client.fillPriceBySymbol.set("SOLUSDT", 110); // due basket banks +9.9, wiping the −6 → breaker clears
+    client.fillPriceBySymbol.set("DOGEUSDT", 0.1);
+    const { executor, store } = makeExecutor({ client, signalMs: NOW_MS - 5 * 60_000, dailyMaxLossUsd: 5 });
+    store.getState().baskets.push(
+      closedBasket("loss", NOW, -6),
+      openBasket("due", [{ symbol: "SOLUSDT", side: "LONG", qty: 1, entryPrice: 100 }], NOW_MS - 60_000),
+    );
+    await executor.tick();
+    expect(store.getState().baskets.filter((b) => b.status === "OPEN").length).toBe(1); // fresh basket opened
+    expect(executor.getStatus().openHalted).toBeNull();
+  });
+
+  it("[BREAKER] yesterday's losses never halt today (UTC-day scoped) and the halt clears itself", async () => {
+    const { executor, store } = makeExecutor({ signalMs: NOW_MS - 5 * 60_000, dailyMaxLossUsd: 5 });
+    store.getState().baskets.push(closedBasket("old-loss", "2026-07-01T23:00:00.000Z", -50));
+    await executor.tick();
+    expect(store.getState().baskets.filter((b) => b.status === "OPEN").length).toBe(1); // opened normally
+    expect(executor.getStatus().openHalted).toBeNull();
+  });
+
+  it("[BREAKER] disabled by default (limit 0): deep losses alone never block opens", async () => {
+    const { executor, store } = makeExecutor({ signalMs: NOW_MS - 5 * 60_000, dailyMaxLossUsd: 0 });
+    store.getState().baskets.push(closedBasket("loss", NOW, -500));
+    await executor.tick();
+    expect(store.getState().baskets.filter((b) => b.status === "OPEN").length).toBe(1);
+    expect(executor.getStatus().openHalted).toBeNull();
   });
 });

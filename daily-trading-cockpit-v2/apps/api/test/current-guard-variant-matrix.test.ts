@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { existsSync, rmSync } from "node:fs";
+import { existsSync, readFileSync, rmSync } from "node:fs";
 import { join, resolve } from "node:path";
 import os from "node:os";
 
@@ -999,6 +999,87 @@ describe("current-guard-variant-matrix", () => {
     // (sourceObservationKey, variantId) would be silently blocked as a false "duplicate" forever.
     expect(store.hasObservation("exp-old1", base.variantId)).toBe(false);
     expect(store.hasObservation("exp-new", base.variantId)).toBe(true); // still present, still tracked
+  });
+
+  // [PRUNE-TERM] pruneTerminal bounds CLOSED_WIN/CLOSED_LOSS/REJECTED/NO_FILL independently per
+  // status (2026-07-07 OOM audit: these fed no cap at all, unlike EXPIRED — main's store reached
+  // 197MB/153k obs and crashed on heap limit ~19x more often than testnet/live's 27MB stores).
+  // Unlike pruneExpired, dropped records must be ARCHIVED (these statuses feed real edge
+  // measurement), never silently discarded.
+  it("[PRUNE-TERM] pruneTerminal keeps newest N per status independently, preserves OPEN/EXPIRED", () => {
+    const dir = tmpDir();
+    const store = new CurrentGuardVariantMatrixStore(dir);
+    const base = buildVariantMatrixObservationsForSignal(makeSignal())[0]!;
+    const mk = (id: string, status: string, ts: string) =>
+      ({ ...base, observationId: id, sourceObservationKey: id, status, resolvedAt: ts, openedAt: ts } as typeof base);
+    store.addMany([
+      mk("win-old1", "CLOSED_WIN", "2026-06-01T00:00:00.000Z"),
+      mk("win-old2", "CLOSED_WIN", "2026-06-02T00:00:00.000Z"),
+      mk("win-new", "CLOSED_WIN", "2026-06-20T00:00:00.000Z"),
+      mk("loss-only", "CLOSED_LOSS", "2026-06-10T00:00:00.000Z"), // under cap, must survive untouched
+      mk("exp", "EXPIRED", "2026-06-15T00:00:00.000Z"),
+      mk("open", "OPEN", "2026-06-22T00:00:00.000Z"),
+    ]);
+    const pruned = store.pruneTerminal(1); // keep only the newest 1 PER STATUS
+    expect(pruned).toBe(2); // only the 2 excess CLOSED_WIN dropped; CLOSED_LOSS had just 1, untouched
+    const ids = store.all.map((o) => o.observationId);
+    expect(ids).toContain("win-new");
+    expect(ids).not.toContain("win-old1");
+    expect(ids).not.toContain("win-old2");
+    expect(ids).toContain("loss-only"); // a status under its own cap is never touched
+    expect(ids).toContain("exp"); // EXPIRED is pruneExpired's job, not pruneTerminal's
+    expect(ids).toContain("open"); // OPEN must never be dropped
+    // Dedup index must drop pruned keys, same reasoning as pruneExpired.
+    expect(store.hasObservation("win-old1", base.variantId)).toBe(false);
+    expect(store.hasObservation("win-new", base.variantId)).toBe(true);
+  });
+
+  // [PRUNE-TERM-ARCHIVE] dropped records must be archived (append-only JSONL next to the store),
+  // never discarded outright — 22 files read these statuses for edge/PBO/backtest measurement.
+  it("[PRUNE-TERM-ARCHIVE] pruneTerminal archives dropped records to an append-only JSONL file", () => {
+    const dir = tmpDir();
+    const store = new CurrentGuardVariantMatrixStore(dir);
+    const base = buildVariantMatrixObservationsForSignal(makeSignal())[0]!;
+    const mk = (id: string, ts: string) =>
+      ({ ...base, observationId: id, sourceObservationKey: id, status: "REJECTED", resolvedAt: ts, openedAt: ts } as typeof base);
+    store.addMany([mk("rej-old", "2026-06-01T00:00:00.000Z"), mk("rej-new", "2026-06-20T00:00:00.000Z")]);
+    store.pruneTerminal(1);
+    const archivePath = join(dir, "current-guard-variant-matrix-archive.jsonl");
+    expect(existsSync(archivePath)).toBe(true);
+    const lines = readFileSync(archivePath, "utf-8").trim().split("\n").filter(Boolean);
+    expect(lines.length).toBe(1);
+    const archived = JSON.parse(lines[0]!);
+    expect(archived.observationId).toBe("rej-old"); // the dropped one, not the kept one
+  });
+
+  // [PRUNE-TERM-DATA-FAILURE] 2026-07-08 second-pass OOM fix: DATA_FAILURE was the ONE terminal
+  // status missing from VM_PRUNABLE_TERMINAL_STATUSES entirely — genuinely unbounded (not even a
+  // generous cap like the others had). Empty in production so far, but the class of bug is
+  // identical to every other unbounded-store incident this session — must be capped defensively.
+  it("[PRUNE-TERM-DATA-FAILURE] DATA_FAILURE is bounded exactly like the other terminal statuses", () => {
+    const dir = tmpDir();
+    const store = new CurrentGuardVariantMatrixStore(dir);
+    const base = buildVariantMatrixObservationsForSignal(makeSignal())[0]!;
+    const mk = (id: string, ts: string) =>
+      ({ ...base, observationId: id, sourceObservationKey: id, status: "DATA_FAILURE", resolvedAt: ts, openedAt: ts } as typeof base);
+    store.addMany([mk("df-old", "2026-06-01T00:00:00.000Z"), mk("df-new", "2026-06-20T00:00:00.000Z")]);
+    const pruned = store.pruneTerminal(1);
+    expect(pruned).toBe(1);
+    const ids = store.all.map((o) => o.observationId);
+    expect(ids).toContain("df-new");
+    expect(ids).not.toContain("df-old");
+  });
+
+  // [PRUNE-TERM-NOOP] when nothing exceeds the cap, pruneTerminal must not write an archive file at
+  // all (proves the archive write is gated on actual drops, not called unconditionally every cycle).
+  it("[PRUNE-TERM-NOOP] pruneTerminal is a no-op (no archive file, no drops) when under cap", () => {
+    const dir = tmpDir();
+    const store = new CurrentGuardVariantMatrixStore(dir);
+    const base = buildVariantMatrixObservationsForSignal(makeSignal())[0]!;
+    store.add({ ...base, observationId: "only-one", sourceObservationKey: "only-one", status: "NO_FILL" });
+    const pruned = store.pruneTerminal(15000);
+    expect(pruned).toBe(0);
+    expect(existsSync(join(dir, "current-guard-variant-matrix-archive.jsonl"))).toBe(false);
   });
 
   // [HASOBS-O1] hasObservation must be an O(1) index lookup, not a linear scan — a `.some()` scan

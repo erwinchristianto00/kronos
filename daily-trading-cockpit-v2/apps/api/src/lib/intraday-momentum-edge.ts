@@ -17,6 +17,11 @@ import { dirname, resolve } from "node:path";
 
 import type { Candle } from "@dtc/shared";
 import { computeEMA, computeATR, computeSMA } from "./candle-indicators.js";
+import {
+  makeMfeGivebackExitPolicy,
+  type SingleSymbolExitPolicy,
+  type SingleSymbolFreshSignal,
+} from "./single-symbol-lane-executor.js";
 
 function envNum(name: string, dflt: number): number {
   const v = Number(process.env[name]);
@@ -413,3 +418,53 @@ export function buildIntradayMomentumReport(observations: readonly IntradayMomen
     topRecent,
   };
 }
+
+// ── live execution wiring (2026-07-08) ──────────────────────────────────────
+// Adapters for single-symbol-lane-executor.ts's generic executor. This lane stays a pure
+// measurement module above this line — these two functions are the ONLY seam connecting it to
+// real execution, and neither one changes what gets recorded/resolved for OOS measurement.
+
+/** This lane's OPEN observations → the generic single-symbol executor's common signal shape. */
+export function intradayMomentumOpenSignals(store: IntradayMomentumStore): SingleSymbolFreshSignal[] {
+  return store.all
+    .filter((o) => o.status === "OPEN")
+    .map((o) => ({
+      observationId: o.observationId,
+      symbol: o.symbol,
+      entryPrice: o.entryPrice,
+      stopPrice: o.initialStop,
+      openedAtMs: o.openedAtMs,
+    }));
+}
+
+/** Same exit geometry as the paper measurement (resolveIntradayMomentum): arm once peak favorable-R
+ *  ≥ IM_MFE_ARM_R, bank on a retrace of IM_MFE_GIVEBACK_FRAC of the peak, stop at initialStop,
+ *  IM_MAX_HOLD_BARS (@ 1h bars) mark-to-market fallback. */
+export function intradayMomentumExitPolicy(): SingleSymbolExitPolicy {
+  return makeMfeGivebackExitPolicy({
+    armR: IM_MFE_ARM_R,
+    givebackFrac: IM_MFE_GIVEBACK_FRAC,
+    maxHoldMs: IM_MAX_HOLD_BARS * 3_600_000,
+  });
+}
+
+/** Own enable flag (2026-07-08), independent of LIVE_EXECUTION_ENABLED/CROSS_SECTIONAL_EXEC_ENABLED
+ *  — this lane never executed a real order before this date, so turning it on must be an explicit,
+ *  separate act, same convention as every other executor in this codebase. */
+export function isIntradayMomentumExecEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.INTRADAY_MOMENTUM_EXEC_ENABLED === "1";
+}
+export const IM_EXEC_LEG_USD = (): number => {
+  const n = Number.parseFloat(process.env.INTRADAY_MOMENTUM_EXEC_LEG_USD ?? "");
+  return Number.isFinite(n) && n > 0 ? n : 25;
+};
+export const IM_EXEC_LEVERAGE = (): number => {
+  const n = Number.parseInt(process.env.INTRADAY_MOMENTUM_EXEC_LEVERAGE ?? "", 10);
+  return Number.isFinite(n) && n >= 1 ? Math.floor(n) : 3;
+};
+export const IM_EXEC_MAX_SIGNAL_AGE_MS = (): number =>
+  Math.max(60_000, Math.floor(Number(process.env.INTRADAY_MOMENTUM_EXEC_MAX_SIGNAL_AGE_MS) || 50 * 60_000));
+export const IM_EXEC_DAILY_MAX_LOSS_USD = (): number => {
+  const n = Number.parseFloat(process.env.INTRADAY_MOMENTUM_EXEC_DAILY_MAX_LOSS_USD ?? "");
+  return Number.isFinite(n) && n > 0 ? n : 0;
+};

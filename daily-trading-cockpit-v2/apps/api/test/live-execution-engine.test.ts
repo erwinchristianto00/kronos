@@ -22,6 +22,8 @@ import {
   roundDownToStep,
   roundStopToSafeSide,
   roundUpToStep,
+  shouldCapPyramidAdd,
+  symbolBookNetAvgR,
   symbolPriorityTier,
   type LiveExecutionConfig,
   type LivePrivateClient,
@@ -271,6 +273,7 @@ function makeConfig(overrides: Partial<LiveExecutionConfig> = {}): LiveExecution
     maxNotionalPerTrade: 250,
     maxPaperOrderAgeMs: 24 * 60 * 60 * 1000,
     mirrorAllPaperOrders: false,
+    mirrorProvenSymbolsOnly: false,
     testnetTakeProfitUsd: 0,
     testnetRegimeExitEnabled: true,
     testnetRegimeHardCutMs: 0, // hard-cut disabled by default; opted in per-test
@@ -311,6 +314,7 @@ function makeEngine(opts: {
   getControllerSnapshot?: () => { regime: string | null; mode: string | null; capturedAt?: string | null } | null;
   nowIso?: () => string;
   marketDataClient?: Pick<BinanceClient, "getFuturesFlow">;
+  externalManagedNetQty?: () => Map<string, number>;
 } = {}) {
   const client = opts.client ?? new FakeLiveClient();
   const store = new LiveExecutionStore(tmp());
@@ -324,6 +328,7 @@ function makeEngine(opts: {
     nowIso: opts.nowIso ?? (() => "2099-01-02T12:00:00.000Z"),
     marketDataClient: opts.marketDataClient,
     fillConfirmRetryDelayMs: 0,
+    externalManagedNetQty: opts.externalManagedNetQty,
   });
   return { engine, client, store };
 }
@@ -351,13 +356,32 @@ describe("parseLiveExecutionConfig", () => {
     ).toEqual([]);
   });
 
-  it("auto-arm is testnet-only — mainnet never auto-arms", () => {
+  it("auto-arm: testnet needs only the flag; mainnet additionally needs the explicit token", () => {
+    const mainnetBase = {
+      LIVE_EXECUTION_ENABLED: "1",
+      LIVE_BINANCE_ENV: "mainnet",
+      LIVE_BINANCE_API_KEY: "k",
+      LIVE_BINANCE_API_SECRET: "s",
+      LIVE_MAINNET_CONFIRM: "I_UNDERSTAND_REAL_MONEY",
+    };
     expect(
       parseLiveExecutionConfig({ LIVE_EXECUTION_ENABLED: "1", LIVE_BINANCE_ENV: "testnet", LIVE_BINANCE_API_KEY: "k", LIVE_BINANCE_API_SECRET: "s", LIVE_AUTO_ARM: "1" }).autoArm,
     ).toBe(true);
+    // Bare flag on mainnet stays inert — real money never auto-arms from LIVE_AUTO_ARM alone.
+    expect(parseLiveExecutionConfig({ ...mainnetBase, LIVE_AUTO_ARM: "1" }).autoArm).toBe(false);
+    // Token alone (no flag) is also inert.
     expect(
-      parseLiveExecutionConfig({ LIVE_EXECUTION_ENABLED: "1", LIVE_BINANCE_ENV: "mainnet", LIVE_BINANCE_API_KEY: "k", LIVE_BINANCE_API_SECRET: "s", LIVE_AUTO_ARM: "1", LIVE_MAINNET_CONFIRM: "I_UNDERSTAND_REAL_MONEY" }).autoArm,
+      parseLiveExecutionConfig({ ...mainnetBase, LIVE_AUTO_ARM_MAINNET_CONFIRM: "I_UNDERSTAND_AUTO_ARM_REAL_MONEY" }).autoArm,
     ).toBe(false);
+    // A wrong token value must not count.
+    expect(
+      parseLiveExecutionConfig({ ...mainnetBase, LIVE_AUTO_ARM: "1", LIVE_AUTO_ARM_MAINNET_CONFIRM: "yes" }).autoArm,
+    ).toBe(false);
+    // Flag + exact token = deliberate mainnet auto-arm opt-in (2026-07-07 operator request:
+    // restarts always boot disarmed, and live's frequent deploy/OOM restarts silently benched it).
+    expect(
+      parseLiveExecutionConfig({ ...mainnetBase, LIVE_AUTO_ARM: "1", LIVE_AUTO_ARM_MAINNET_CONFIRM: "I_UNDERSTAND_AUTO_ARM_REAL_MONEY" }).autoArm,
+    ).toBe(true);
   });
 
   it("mainnet can explicitly reuse the testnet live-mirror lane policy", () => {
@@ -735,7 +759,7 @@ describe("LiveExecutionEngine", () => {
     await engine.tick();
 
     const intent = store.getState().intents[0]!;
-    client.unrealizedPnlBySymbol.set("ETHUSDT", 20.5);
+    client.markPriceBySymbol.set("ETHUSDT", 1500); // short from 2000 → own-entry unrealized clears $20
     client.flattenRealizedPnl = 20.12;
     await engine.tick();
 
@@ -762,7 +786,7 @@ describe("LiveExecutionEngine", () => {
     expect((await engine.arm()).ok).toBe(true);
     await engine.tick();
 
-    client.unrealizedPnlBySymbol.set("ETHUSDT", 1.25); // clears the ~0.22 estimated close-cost buffer
+    client.markPriceBySymbol.set("ETHUSDT", 1900); // short from 2000: own-entry unrealized ~5 clears the $1 target
     client.flattenRealizedPnl = 1.02;
     await engine.tick();
 
@@ -782,7 +806,7 @@ describe("LiveExecutionEngine", () => {
     await engine.tick();
     const placedBefore = client.placed.length;
 
-    client.unrealizedPnlBySymbol.set("ETHUSDT", 1.1); // gross > 1, but net after the ~0.22 cost buffer is < 1
+    client.markPriceBySymbol.set("ETHUSDT", 1990); // own-entry unrealized ~0.5 — below the $1 net target
     await engine.tick();
 
     expect(store.getState().intents[0]!.state).toBe("OPEN");
@@ -808,7 +832,7 @@ describe("LiveExecutionEngine", () => {
     expect((await engine.arm()).ok).toBe(true);
     await engine.tick();
 
-    client.unrealizedPnlBySymbol.set("ETHUSDT", 1.25);
+    client.markPriceBySymbol.set("ETHUSDT", 2100); // long from 2000: own-entry unrealized clears the $1 target
     client.flattenRealizedPnl = 1.02;
     await engine.tick();
 
@@ -832,7 +856,7 @@ describe("LiveExecutionEngine", () => {
     await engine.tick();
 
     const intent = store.getState().intents[0]!;
-    client.unrealizedPnlBySymbol.set("ETHUSDT", 0.25); // estimated close cost is about 0.22 USDT.
+    client.markPriceBySymbol.set("ETHUSDT", 2010); // long from 2000: own-entry unrealized ~0.5 > ~0.2 close cost
     client.flattenRealizedPnl = 0.03;
     await engine.tick();
 
@@ -867,7 +891,7 @@ describe("LiveExecutionEngine", () => {
     await engine.tick();
     const placedBefore = client.placed.length;
 
-    client.unrealizedPnlBySymbol.set("ETHUSDT", 0.20); // below the estimated close-cost buffer.
+    client.markPriceBySymbol.set("ETHUSDT", 2002); // own-entry unrealized ~0.1 — below the close-cost buffer
     await engine.tick();
 
     expect(store.getState().intents[0]!.state).toBe("OPEN");
@@ -889,7 +913,7 @@ describe("LiveExecutionEngine", () => {
     expect((await engine.arm()).ok).toBe(true);
     await engine.tick();
 
-    client.unrealizedPnlBySymbol.set("ETHUSDT", 0.25); // clears the ~0.22 estimated close-cost buffer
+    client.markPriceBySymbol.set("ETHUSDT", 2010); // long from 2000: own-entry unrealized ~0.5 > ~0.2 close cost
     client.flattenRealizedPnl = 0.03;
     await engine.tick();
 
@@ -1448,6 +1472,45 @@ describe("LiveExecutionEngine", () => {
     expect(engine.getStatus().reconcileIssues.join(" ")).toMatch(/orphan/);
     // Orphans are surfaced, never flattened — could be the operator's own position.
     expect(client.placed.length).toBe(0);
+  });
+
+  // [EXTERNAL-CLAIM] 2026-07-07: the cross-sectional executor opens real positions on the SAME
+  // Binance account that are not engine intents. Reconcile flagged every basket leg as an orphan
+  // and force-disarmed one tick after a basket opened (confirmed live: armed → basket opened →
+  // "orphan exchange position ... not opened by engine" → disarmed), which also defeated auto-arm
+  // on every boot. Positions fully explained by the external executor's claims must not disarm.
+  it("[EXTERNAL-CLAIM] a position fully explained by an external executor's claim does not disarm", async () => {
+    const { engine, client } = makeEngine({
+      externalManagedNetQty: () => new Map([["SOLUSDT", 0.3], ["DOGEUSDT", -332]]),
+    });
+    await engine.arm();
+    client.positionsBySymbol.set("SOLUSDT", 0.3); // basket long leg
+    client.positionsBySymbol.set("DOGEUSDT", -332); // basket short leg
+    await engine.tick();
+    expect(engine.isArmed()).toBe(true);
+    expect(engine.getStatus().reconcileIssues.join(" ")).not.toMatch(/orphan/);
+  });
+
+  it("[EXTERNAL-CLAIM] a position EXCEEDING the external claim still disarms (unexplained remainder)", async () => {
+    const { engine, client } = makeEngine({
+      externalManagedNetQty: () => new Map([["SOLUSDT", 0.3]]),
+    });
+    await engine.arm();
+    client.positionsBySymbol.set("SOLUSDT", 5.3); // 0.3 claimed + 5.0 foreign
+    await engine.tick();
+    expect(engine.isArmed()).toBe(false);
+    expect(engine.getStatus().reconcileIssues.join(" ")).toMatch(/external executor claims only 0.3/);
+  });
+
+  it("[EXTERNAL-CLAIM] with no claim the orphan behavior is unchanged", async () => {
+    const { engine, client } = makeEngine({
+      externalManagedNetQty: () => new Map(),
+    });
+    await engine.arm();
+    client.positionsBySymbol.set("DOGEUSDT", 5);
+    await engine.tick();
+    expect(engine.isArmed()).toBe(false);
+    expect(engine.getStatus().reconcileIssues.join(" ")).toMatch(/orphan/);
   });
 
   it("reconcileIssues never grows unbounded when the SAME orphan is rediscovered tick after tick", async () => {
@@ -2108,6 +2171,52 @@ describe("mainnet profit protection (opt-in regime harvest on real money)", () =
     expect(flat.side).toBe("BUY"); // reduce a short
     expect(engine.getStatus().limits.regimeExitActive).toBe(true);
   });
+
+  // [HARVEST-SHARE] 2026-07-07 REAL-MONEY INCIDENT: the harvest flattened Math.abs(positionAmt) =
+  // the WHOLE netted position. On DOGEUSDT the intent (1065 short) shared the symbol with two
+  // cross-sectional basket legs (665 short) — the harvest bought 1730, silently stripping the
+  // baskets' hedge. It must close only the ENGINE's share.
+  it("[HARVEST-SHARE] closes only the engine share when basket legs net the same symbol", async () => {
+    const client = new FakeLiveClient();
+    // Intent SHORT 0.05 + basket legs SHORT 0.10 on the same symbol ⇒ netted position -0.15.
+    client.positionsBySymbol.set("ETHUSDT", -0.15);
+    client.markPriceBySymbol.set("ETHUSDT", 1900);
+    client.unrealizedPnlBySymbol.set("ETHUSDT", 3.0); // netted unrealized (whole position)
+    client.flattenRealizedPnl = 0.78;
+    const { engine, store } = makeEngine({
+      client,
+      config: { env: "mainnet", mainnetConfirmed: true, mainnetProfitProtection: true },
+      getControllerSnapshot: () => ({ regime: "Bullish expansion", mode: "LONG_ONLY", capturedAt: new Date().toISOString() }),
+      externalManagedNetQty: () => new Map([["ETHUSDT", -0.1]]), // the baskets' short claim
+    });
+    seedOpposingGreenShort(store);
+    await engine.tick();
+    const closed = store.getState().intents[0]!;
+    expect(closed.state).toBe("CLOSED");
+    const flat = client.placed.at(-1)!;
+    expect(flat.side).toBe("BUY");
+    expect(flat.quantity).toBeCloseTo(0.05, 9); // engine share ONLY — never the baskets' 0.10
+  });
+
+  it("[HARVEST-SHARE] skips harvest entirely when basket legs flipped the net sign (contaminated P&L)", async () => {
+    const client = new FakeLiveClient();
+    // Intent SHORT 0.05 but baskets LONG 0.2 ⇒ net +0.15 (sign flipped vs the intent).
+    client.positionsBySymbol.set("ETHUSDT", 0.15);
+    client.markPriceBySymbol.set("ETHUSDT", 1900);
+    client.unrealizedPnlBySymbol.set("ETHUSDT", 3.0);
+    const { engine, store } = makeEngine({
+      client,
+      config: { env: "mainnet", mainnetConfirmed: true, mainnetProfitProtection: true },
+      getControllerSnapshot: () => ({ regime: "Bullish expansion", mode: "LONG_ONLY", capturedAt: new Date().toISOString() }),
+      externalManagedNetQty: () => new Map([["ETHUSDT", 0.2]]),
+    });
+    seedOpposingGreenShort(store);
+    await engine.tick();
+    // engineAmt = 0.15 - 0.2 = -0.05 (short ✓) but net sign flipped ⇒ netted P&L says nothing
+    // about the engine's leg ⇒ leave it to its own stop, place nothing.
+    expect(store.getState().intents[0]!.state).toBe("MIRRORED");
+    expect(client.placed.length).toBe(0);
+  });
 });
 
 describe("crowdingExitRecommendation (pure classifier)", () => {
@@ -2682,6 +2791,133 @@ describe("Phase-2 exit rebuild: forced MFE-giveback + losing-max-hold cut", () =
   });
 });
 
+// 2026-07-07 REAL-MONEY incidents on live: (a) PROFIT_BANK_NET_1.00 fired off the NETTED position's
+// unrealized (basket leg's profit counted for the intent) and its close bought back the basket's
+// 337 DOGE hedge; (b) the add-failed emergency flatten bought back the whole netted WLD position,
+// eating the basket's 64 hedge. Every lifecycle/panic close must act on the ENGINE SHARE only.
+describe("netted-position closes act on the ENGINE SHARE only (never the basket's hedge)", () => {
+  const EXT = 0.05; // basket's short leg on the same symbol (external managed claim)
+
+  async function openNettedShort(cfg: Partial<LiveExecutionConfig> = {}) {
+    const client = new FakeLiveClient();
+    const made = makeEngine({
+      client,
+      paper: makePaperStore([paperOrder()]),
+      config: cfg,
+      externalManagedNetQty: () => new Map([["ETHUSDT", -EXT]]),
+    });
+    await made.engine.arm();
+    await made.engine.tick(); // opens the engine's own short
+    const intent = made.store.getState().intents[0]!;
+    // Basket leg lands on the same symbol → ONE netted exchange position.
+    client.positionsBySymbol.set("ETHUSDT", -(intent.qty + EXT));
+    return { ...made, client, intent };
+  }
+
+  it("[NETTED-PROFIT-BANK] does NOT fire when only the share-scaled unrealized is below target", async () => {
+    const { engine, client, store } = await openNettedShort({ profitBankNetTargetUsd: 1 });
+    // Own-entry basis: short from 2000, mark 1990 → intent's own unrealized ≈ 0.5 < $1 — must stay
+    // OPEN no matter what the NETTED exchange P&L (which includes the basket's leg) says.
+    client.markPriceBySymbol.set("ETHUSDT", 1990);
+    client.unrealizedPnlBySymbol.set("ETHUSDT", 5); // netted number is big — must be IGNORED
+    await engine.tick();
+    expect(store.getState().intents[0]!.state).toBe("OPEN");
+    expect(client.placed.filter((p) => p.reduceOnly && p.type === "MARKET").length).toBe(0);
+  });
+
+  it("[NETTED-PROFIT-BANK] a genuine trigger closes ONLY the engine share, not the basket's qty", async () => {
+    const { engine, client, store } = await openNettedShort({ profitBankNetTargetUsd: 1 });
+    const q = store.getState().intents[0]!.qty;
+    client.markPriceBySymbol.set("ETHUSDT", 1900); // own-entry unrealized = 100×q ≈ $5 ≥ $1
+    await engine.tick();
+    const closed = store.getState().intents[0]!;
+    expect(closed.state).toBe("CLOSED");
+    expect(closed.closeReason).toBe("PROFIT_BANK_NET_1.00");
+    const flat = client.placed.find((p) => p.reduceOnly && p.type === "MARKET")!;
+    expect(flat.quantity).toBeCloseTo(q, 9); // NOT q + EXT
+  });
+
+  it("[NETTED-EMERGENCY-FLATTEN] a failed open flattens the engine share only", async () => {
+    const client = new FakeLiveClient();
+    client.positionsBySymbol.set("ETHUSDT", -EXT); // basket leg already open on the symbol
+    client.algoErrorCode = -9999; // stop placement fails → EMERGENCY_FLATTEN_NO_STOP path
+    const { engine, store } = makeEngine({
+      client,
+      paper: makePaperStore([paperOrder()]),
+      externalManagedNetQty: () => new Map([["ETHUSDT", -EXT]]),
+    });
+    await engine.arm();
+    await engine.tick().catch(() => undefined); // RETRY_FATAL rethrow after the flatten is fine
+    const intent = store.getState().intents[0]!;
+    expect(intent.state).toBe("ERROR");
+    const flat = client.placed.find((p) => p.reduceOnly && p.type === "MARKET")!;
+    expect(flat).toBeTruthy();
+    expect(flat.quantity).toBeCloseTo(intent.qty, 9); // the basket's EXT stays on the exchange
+  });
+
+  it("[NETTED-KILL] kill-switch flatten never takes the basket's leg with it", async () => {
+    const { engine, client, store } = await openNettedShort();
+    const q = store.getState().intents[0]!.qty;
+    await engine.kill("test breaker");
+    const killed = store.getState().intents[0]!;
+    expect(killed.state).toBe("KILLED");
+    const flat = client.placed.find((p) => p.reduceOnly && p.type === "MARKET" && p.newClientOrderId?.startsWith("dtc-kill"))!;
+    expect(flat.quantity).toBeCloseTo(q, 9);
+  });
+
+  it("[NETTED-FLAT-SETTLE] settles an intent whose engine share is gone even though the basket still holds the symbol", async () => {
+    const { engine, client, store } = await openNettedShort();
+    // Intent's own exposure was stopped out; only the basket's leg remains in the netted position.
+    client.positionsBySymbol.set("ETHUSDT", -EXT);
+    await engine.tick();
+    expect(store.getState().intents[0]!.state).toBe("CLOSED");
+  });
+
+  it("[NETTED-ENTRY-GUARD] never opens an intent whose direction OPPOSES a basket claim on the symbol", async () => {
+    // 2026-07-08 real-money incident: a SHORT SUI "entry" on a basket-long symbol just SOLD the
+    // baskets' longs; its reduce-only exits -2022-rejected and reconcile disarm-looped.
+    const client = new FakeLiveClient();
+    const { engine, store } = makeEngine({
+      client,
+      paper: makePaperStore([paperOrder()]), // SHORT ETHUSDT
+      externalManagedNetQty: () => new Map([["ETHUSDT", 0.05]]), // baskets are LONG the symbol
+    });
+    await engine.arm();
+    await engine.tick();
+    expect(store.getState().intents).toHaveLength(0);
+    expect(client.placed.filter((p) => p.type === "MARKET").length).toBe(0);
+  });
+
+  it("[NETTED-ENTRY-GUARD] a SAME-direction basket claim does not block the open (netting adds)", async () => {
+    const client = new FakeLiveClient();
+    client.positionsBySymbol.set("ETHUSDT", -EXT); // basket short already on the exchange
+    const { engine, store } = makeEngine({
+      client,
+      paper: makePaperStore([paperOrder()]), // SHORT ETHUSDT
+      externalManagedNetQty: () => new Map([["ETHUSDT", -EXT]]),
+    });
+    await engine.arm();
+    await engine.tick();
+    expect(store.getState().intents).toHaveLength(1);
+    expect(store.getState().intents[0]!.state).toBe("OPEN");
+  });
+
+  it("[MISSING-QTY-ALERT] reconcile reports (without disarming) when managed exposure was consumed", async () => {
+    const client = new FakeLiveClient();
+    const { engine, store } = makeEngine({
+      client,
+      paper: makePaperStore([paperOrder({ variantExitRule: "tp1_full" } as Partial<PaperOrder>)]),
+    });
+    await engine.arm();
+    await engine.tick();
+    const q = store.getState().intents[0]!.qty;
+    client.positionsBySymbol.set("ETHUSDT", -q * 0.3); // most of the engine's qty vanished
+    await engine.tick();
+    expect(engine.getStatus().reconcileIssues.join(" ")).toMatch(/MISSING QTY/);
+    expect(engine.isArmed()).toBe(true); // report-only — a disarm here could loop on transients
+  });
+});
+
 describe("manual selector mode toggle", () => {
   it("defaults OFF, toggles on/off, persists in state, and surfaces in status", () => {
     const { engine, store } = makeEngine();
@@ -2861,26 +3097,155 @@ describe("symbolPriorityTier (live-mirror candidate priority — no obstruction,
     expect(store.getState().intents.length).toBe(1);
     expect(store.getState().intents[0]!.symbol).toBe("ETHUSDT");
   });
+
+  // [PROVEN-ONLY] 2026-07-07 operator: "buka simbol dari whitelist dengan performa terbaik, bukan
+  // sembarang buka" — the flag turns the reorder into a hard gate (the ONE deliberate exception
+  // to never-rejects). Default off = previous behavior (covered by the test above).
+  it("[PROVEN-ONLY] mirrorProvenSymbolsOnly gates OUT an unproven (tier-2) candidate even with free slots", async () => {
+    const order = paperOrder({
+      symbol: "ETHUSDT",
+      selectedLaneId: LANE_ID,
+      direction: "SHORT",
+      entryPrice: 2000,
+      stopLoss: 2100,
+    } as Partial<PaperOrder>);
+    // Config-injected (not process.env) — env mutation leaks across vitest worker threads.
+    const { engine, store } = makeEngine({ paper: makePaperStore([order]), config: { mirrorProvenSymbolsOnly: true } });
+    expect((await engine.arm()).ok).toBe(true);
+    await engine.tick();
+    expect(store.getState().intents.length).toBe(0); // unproven symbol stays out — slot stays empty
+  });
+
+  it("[BEST-FIRST] within a tier, the higher measured bookNetAvgR symbol ranks first", () => {
+    const report = makeReport();
+    expect(symbolBookNetAvgR("SUIUSDT", "SHORT", report)).not.toBeNull();
+    expect(symbolBookNetAvgR("NOSUCHUSDT", "SHORT", report)).toBeNull();
+    // Same-tier comparator behavior: higher netAvgR wins over an older createdAt.
+    const candidates = [
+      { symbol: "A", perf: 0.05, createdAt: "2099-01-02T08:00:00.000Z" },
+      { symbol: "B", perf: 0.2, createdAt: "2099-01-02T10:00:00.000Z" },
+    ];
+    const sorted = [...candidates].sort((a, b) => {
+      if (a.perf !== b.perf) return b.perf - a.perf;
+      return a.createdAt < b.createdAt ? -1 : 1;
+    });
+    expect(sorted[0]!.symbol).toBe("B");
+  });
+});
+
+describe("shouldCapPyramidAdd (2026-07-08, real MAX_HOLD_CUT loss evidence)", () => {
+  const adds = (n: number): { paperOrderId: string; laneId: string; qty: number }[] =>
+    Array.from({ length: n }, (_, i) => ({ paperOrderId: `add-${i}`, laneId: "L", qty: 1 }));
+
+  it("never caps under the free-add limit, regardless of favorableR", () => {
+    expect(shouldCapPyramidAdd({ sourcePaperOrders: adds(2), maxFavorableR: 0 }, 3, 0.15)).toBe(false);
+  });
+
+  it("does not cap once past the limit if real favorable progress has been shown", () => {
+    // Real cases that were fine: AVAX (2 adds, 0.184R), WLD (3 adds, 0.201R), INJ (3 adds, 0.169R)
+    expect(shouldCapPyramidAdd({ sourcePaperOrders: adds(3), maxFavorableR: 0.169 }, 3, 0.15)).toBe(false);
+    expect(shouldCapPyramidAdd({ sourcePaperOrders: adds(3), maxFavorableR: 0.201 }, 3, 0.15)).toBe(false);
+  });
+
+  it("caps past the limit when there's been no real progress — the XRP incident (7 adds, 0 favorable, $1.84 loss)", () => {
+    expect(shouldCapPyramidAdd({ sourcePaperOrders: adds(4), maxFavorableR: 0 }, 3, 0.15)).toBe(true);
+    expect(shouldCapPyramidAdd({ sourcePaperOrders: adds(7), maxFavorableR: 0 }, 3, 0.15)).toBe(true);
+  });
+
+  it("caps past the limit when progress is real but below the bar — the DOGE incident (15 adds, 0.12R, $4.15 loss)", () => {
+    expect(shouldCapPyramidAdd({ sourcePaperOrders: adds(4), maxFavorableR: 0.118 }, 3, 0.15)).toBe(true);
+    expect(shouldCapPyramidAdd({ sourcePaperOrders: adds(15), maxFavorableR: 0.118 }, 3, 0.15)).toBe(true);
+  });
+
+  it("treats a missing sourcePaperOrders/maxFavorableR as zero (never caps a fresh intent)", () => {
+    expect(shouldCapPyramidAdd({ sourcePaperOrders: undefined, maxFavorableR: undefined }, 3, 0.15)).toBe(false);
+  });
+});
+
+describe("manualCloseIntent (operator Close button — real-money manual control)", () => {
+  const openOne = async () => {
+    const order = paperOrder({
+      symbol: "ETHUSDT",
+      selectedLaneId: "CG_VARIANT_MATRIX:CG_WIDE_FAST_SHORT",
+      direction: "SHORT",
+      entryPrice: 2000,
+      stopLoss: 2100,
+    } as Partial<PaperOrder>);
+    const made = makeEngine({ paper: makePaperStore([order]) });
+    expect((await made.engine.arm()).ok).toBe(true);
+    await made.engine.tick();
+    expect(made.store.getState().intents.length).toBe(1);
+    return made;
+  };
+
+  it("closes the intent reduce-only, books OPERATOR_CLOSE, and never disarms", async () => {
+    const { engine, store, client } = await openOne();
+    const intent = store.getState().intents[0]!;
+    const res = await engine.manualCloseIntent(intent.paperOrderId);
+    expect(res.ok).toBe(true);
+    expect(intent.state).toBe("CLOSED");
+    expect(intent.closeReason).toBe("OPERATOR_CLOSE");
+    expect(engine.isArmed()).toBe(true); // manual close is not a breaker
+    expect(store.getState().killedAt).toBeNull();
+    const closeOrder = client.placed.find((p) => p.newClientOrderId?.startsWith("dtc-opcl-"));
+    expect(closeOrder).toBeTruthy();
+    expect(closeOrder!.side).toBe("BUY"); // SHORT intent closes with a BUY
+    expect(closeOrder!.reduceOnly).toBe(true);
+    expect(closeOrder!.quantity).toBeCloseTo(intent.qty, 9);
+  });
+
+  it("closes ONLY the engine share when basket legs net the same symbol (external claim respected)", async () => {
+    const { engine, store, client } = await openOne();
+    const intent = store.getState().intents[0]!;
+    // Simulate cross-sectional baskets long 3× the intent qty on the same symbol: exchange net
+    // flips positive even though the engine is SHORT. externalManagedNetQty comes from options —
+    // rebuild an engine sharing the same store/client with the claim wired.
+    const claim = intent.qty * 3;
+    client.positionsBySymbol.set("ETHUSDT", -intent.qty + claim); // netted account position
+    const engine2 = new LiveExecutionEngine({
+      config: makeConfig({}),
+      client: client as unknown as LivePrivateClient,
+      store,
+      paperStore: makePaperStore([]),
+      nowIso: () => "2099-01-02T12:30:00.000Z",
+      fillConfirmRetryDelayMs: 0,
+      externalManagedNetQty: () => new Map([["ETHUSDT", claim]]),
+    });
+    const res = await engine2.manualCloseIntent(intent.paperOrderId);
+    expect(res.ok).toBe(true);
+    const closeOrder = client.placed.filter((p) => p.newClientOrderId?.startsWith("dtc-opcl-")).pop()!;
+    expect(closeOrder.quantity).toBeCloseTo(intent.qty, 9); // engine share only, never the basket legs
+    // Net position sign flipped by the baskets ⇒ reduceOnly would be rejected ⇒ plain market close.
+    expect(closeOrder.reduceOnly).toBeFalsy();
+  });
+
+  it("unknown/closed paperOrderId returns ok:false without placing anything", async () => {
+    const { engine, client } = makeEngine();
+    const before = client.placed.length;
+    const res = await engine.manualCloseIntent("paper-nope");
+    expect(res.ok).toBe(false);
+    expect(client.placed.length).toBe(before);
+  });
 });
 
 describe("applyRegimeAutopilotAllocation (autopilot ↔ manual-mode sync)", () => {
-  it("applies the allocation AND flips manualSelectorMode to false when the operator was in manual mode", () => {
+  // SPEC CHANGE 2026-07-08 (supersedes the 07-07 sync): "autopilot tetep memerintah, tapi kalau
+  // execution mode nya manual, gw ambil alih lane allocation" — an autopilot apply while MANUAL
+  // is on must be REFUSED, never overwrite the operator's allocation.
+  it("[MANUAL-OVERRIDE] refuses the autopilot apply while manual mode is ON (operator owns the allocation)", () => {
     const { engine, store } = makeEngine();
     engine.setManualSelectorMode(true);
-    expect(engine.isManualSelectorMode()).toBe(true);
+    engine.setLaneAllocations([{ laneId: "CG_WIDE_FAST_LONG", weightPct: 100 }]); // operator's pick
 
     const result = engine.applyRegimeAutopilotAllocation([
       { laneId: "CG_WIDE_FAST_SHORT", weightPct: 60 },
       { laneId: "CROSS_SECTIONAL_MARKET_NEUTRAL", weightPct: 40 },
     ]);
 
-    expect(result.ok).toBe(true);
-    expect(store.getState().laneAllocations).toEqual([
-      { laneId: "CG_WIDE_FAST_SHORT", weightPct: 60 },
-      { laneId: "CROSS_SECTIONAL_MARKET_NEUTRAL", weightPct: 40 },
-    ]);
-    expect(engine.isManualSelectorMode()).toBe(false);
-    expect(engine.getStatus().laneSelection.manualSelectorMode).toBe(false);
+    expect(result.ok).toBe(false);
+    expect(result.reason).toMatch(/manual/);
+    expect(store.getState().laneAllocations).toEqual([{ laneId: "CG_WIDE_FAST_LONG", weightPct: 100 }]); // untouched
+    expect(engine.isManualSelectorMode()).toBe(true); // still the operator's
   });
 
   it("leaves manualSelectorMode false (already smart) untouched when applied while not in manual mode", () => {
@@ -2905,22 +3270,29 @@ describe("applyRegimeAutopilotAllocation (autopilot ↔ manual-mode sync)", () =
     expect(store.getState().laneAllocations).toBeNull();
   });
 
-  it("regime-autopilot end-to-end via RegimeAutopilot.tick(): a stable regime change flips manual mode off", async () => {
-    const { RegimeAutopilot } = await import("../src/lib/regime-autopilot.js");
-    const { engine } = makeEngine();
+  it("regime-autopilot end-to-end via RegimeAutopilot.tick(): MANUAL holds the allocation, auto reclaims after it ends", async () => {
+    const { RegimeAutopilot, REGIME_AUTOPILOT_PRESETS } = await import("../src/lib/regime-autopilot.js");
+    const { engine, store } = makeEngine();
     engine.setManualSelectorMode(true);
+    engine.setLaneAllocations([{ laneId: "CG_WIDE_FAST_LONG", weightPct: 100 }]); // operator's pick
     let regime: string | null = null;
     let now = 1_000_000_000_000;
     const pilot = new RegimeAutopilot({
       setAllocations: (a) => { engine.applyRegimeAutopilotAllocation(a); },
       getLatestRegime: () => regime,
+      isManualMode: () => engine.isManualSelectorMode(),
       nowMs: () => now,
       stableCycles: 1,
       minHoldMs: 30 * 60_000,
     });
     regime = "NO_TRADE";
-    pilot.tick(); // stable on first observation (stableCycles: 1) → applies immediately
-    expect(engine.isManualSelectorMode()).toBe(false);
+    pilot.tick(); // MANUAL is on — the autopilot observes but must not touch anything
+    expect(engine.isManualSelectorMode()).toBe(true);
+    expect(store.getState().laneAllocations).toEqual([{ laneId: "CG_WIDE_FAST_LONG", weightPct: 100 }]);
+
+    engine.setManualSelectorMode(false); // operator hands control back
+    pilot.tick(); // bot reclaims on the next tick
+    expect(store.getState().laneAllocations).toEqual(REGIME_AUTOPILOT_PRESETS.NO_TRADE);
   });
 
   it("regime-autopilot: manualSelectorMode stays true while autopilot skips (not yet stable — anti-whipsaw guard unchanged)", async () => {

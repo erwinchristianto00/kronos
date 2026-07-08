@@ -180,7 +180,7 @@ import {
   buildSnapshotFromReport,
 } from "../lib/regime-direction-controller-snapshot.js";
 import { buildNeuralMapTelemetry, buildPaperUnrealizedSnapshot } from "../lib/neural-map-telemetry.js";
-import { buildPerSymbolLaneBookEdge } from "../lib/per-symbol-lane-book-edge.js";
+import { buildPerSymbolLaneBookEdge, type PsleOrder } from "../lib/per-symbol-lane-book-edge.js";
 import { getLaneSymbolCurationCacheStore } from "../lib/lane-symbol-curation-cache.js";
 import {
   runIntradayMomentumCycleGuarded,
@@ -245,11 +245,31 @@ import {
   isCrossSectionalEdgeDisabled,
   CROSS_SECTIONAL_INTERVAL,
   CROSS_SECTIONAL_MOMENTUM_BARS,
+  CROSS_SECTIONAL_UNIVERSE,
   buildCrossSectionalRegimeContext,
   deriveAdaptiveSymbolFilters,
   CROSS_SECTIONAL_TREND_SIGNAL,
   CROSS_SECTIONAL_MIXED_SIGNAL,
 } from "../lib/cross-sectional-edge.js";
+import { spotSymbolForCandles, buildWinnersCounterfactualReport } from "../lib/cross-sectional-winners-counterfactual.js";
+import { buildRegimeAxisTimeline } from "../lib/regime-axis-timeline.js";
+import { buildTpSweepReport } from "../lib/cross-sectional-tp-sweep.js";
+import { CrossSectionalExecutorStore } from "../lib/cross-sectional-executor.js";
+import { buildNarrativeTiltReport } from "../lib/narrative-tags.js";
+import {
+  isNewCoinRadarEnabled,
+  getNewCoinRadarStore,
+  runNewCoinRadarCycleGuarded,
+  buildNewCoinRadarReport,
+} from "../lib/new-coin-radar.js";
+import { isMoonshotLotteryEnabled } from "../lib/moonshot-lottery-lane.js";
+import {
+  getMoonshotStore,
+  runMoonshotCycleGuarded,
+  buildMoonshotReport,
+  resolveMoonshotMemeUniverse,
+  MOONSHOT_DEFAULT_MAX_LEVERAGE,
+} from "../lib/moonshot-lottery-cycle.js";
 import { readFileSync } from "node:fs";
 import { analyzeHardCutCounterfactuals, extractHardCutIntents } from "../lib/hard-cut-counterfactual.js";
 import { getCandidateFunnelLog } from "../lib/accelerated-evidence-candidate-funnel-log.js";
@@ -259,7 +279,7 @@ import {
   resolvePortfolioTrendPositions,
   type PortfolioTrendShadowReport,
 } from "../lib/portfolio-trend-shadow.js";
-import { buildRegimeEngineReport, isRegimeEngineEnabled } from "../lib/regime-engine-service.js";
+import { buildRegimeEngineReport, getRegimeEngineStore, isRegimeEngineEnabled } from "../lib/regime-engine-service.js";
 import { buildFreshVariantMatrixReport } from "../lib/fresh-variant-matrix-feed.js";
 import { buildCrowdingReport } from "../lib/derivatives-crowding.js";
 import { buildRegimeGatedLaneReport, type RgObservation } from "../lib/regime-gated-lane-performance.js";
@@ -599,6 +619,95 @@ export async function registerShadowRoutes(
     };
   });
 
+  // Winners-only counterfactual (report-only): tests the operator's "open only the good legs"
+  // hypothesis against closed-basket history — oracle ceiling + realistic late-entry checkpoints
+  // + leg persistence stats. Fetches real 1h candles (a few calls per distinct symbol), so the
+  // result is cached for 10 min; ?force=1 recomputes, ?variant=X selects the lane variant.
+  let winnersCfCache: { key: string; builtAtMs: number; report: unknown } | null = null;
+  app.get("/api/shadow/cross-sectional-winners-counterfactual", async (request, reply) => {
+    if (!opts.binanceClient) {
+      reply.code(503);
+      return { ok: false, reason: "market-data client unavailable on this instance" };
+    }
+    const q = (request.query ?? {}) as { variant?: string; force?: string };
+    const variant = q.variant ?? "FILTERED";
+    const nowMs = Date.now();
+    if (q.force !== "1" && winnersCfCache && winnersCfCache.key === variant && nowMs - winnersCfCache.builtAtMs < 10 * 60_000) {
+      return { ok: true, cached: true, ...(winnersCfCache.report as object) };
+    }
+    const client = opts.binanceClient;
+    const fetchCandles = async (symbol: string, startMs: number, endMs: number) => {
+      // 1h candles, 1000/call ≈ 41 days — loop only if the basket history spans longer than that.
+      const out = [] as Awaited<ReturnType<typeof client.getCandles>>;
+      let cursor = startMs;
+      while (cursor < endMs) {
+        const batch = await client.getCandles(symbol, "1h", 1000, { startTime: cursor, endTime: endMs });
+        if (batch.length === 0) break;
+        out.push(...batch);
+        const last = batch[batch.length - 1]!.openTime;
+        if (last <= cursor) break; // no forward progress — bail rather than loop forever
+        cursor = last + 3_600_000;
+      }
+      return out;
+    };
+    const report = await buildWinnersCounterfactualReport(getCrossSectionalStore(), fetchCandles, { variant });
+    winnersCfCache = { key: variant, builtAtMs: nowMs, report };
+    return { ok: true, cached: false, ...report };
+  });
+
+  // TP-threshold sweep (report-only): per-basket path replay comparing profit-bank thresholds —
+  // answers "keep 0.6% or bank smaller/more often?" via EV per slot-day. Same candle-fetch cost
+  // profile as the winners counterfactual, so same 10-min cache.
+  let tpSweepCache: { key: string; builtAtMs: number; report: unknown } | null = null;
+  app.get("/api/shadow/cross-sectional-tp-sweep", async (request, reply) => {
+    if (!opts.binanceClient) {
+      reply.code(503);
+      return { ok: false, reason: "market-data client unavailable on this instance" };
+    }
+    const q = (request.query ?? {}) as { variant?: string; force?: string };
+    const variant = q.variant ?? "FILTERED";
+    const nowMs = Date.now();
+    if (q.force !== "1" && tpSweepCache && tpSweepCache.key === variant && nowMs - tpSweepCache.builtAtMs < 10 * 60_000) {
+      return { ok: true, cached: true, ...(tpSweepCache.report as object) };
+    }
+    const client = opts.binanceClient;
+    const fetchCandles = async (symbol: string, startMs: number, endMs: number) => {
+      const out = [] as Awaited<ReturnType<typeof client.getCandles>>;
+      let cursor = startMs;
+      while (cursor < endMs) {
+        const batch = await client.getCandles(symbol, "1h", 1000, { startTime: cursor, endTime: endMs });
+        if (batch.length === 0) break;
+        out.push(...batch);
+        const last = batch[batch.length - 1]!.openTime;
+        if (last <= cursor) break;
+        cursor = last + 3_600_000;
+      }
+      return out;
+    };
+    const report = await buildTpSweepReport(getCrossSectionalStore(), fetchCandles, { variant });
+    tpSweepCache = { key: variant, builtAtMs: nowMs, report };
+    return { ok: true, cached: false, ...report };
+  });
+
+  // Narrative tilt/edge (report-only): tags every basket leg with its sector narrative
+  // (AI/MEME/L1/DeFi/…) and measures (a) whether the "market-neutral" book is secretly a
+  // sector spread and (b) whether any narrative's legs carry edge. Measure-first — nothing
+  // gates on this. Executed baskets come from the executor's persisted store snapshot
+  // (read-only re-read per request; the file is tiny), measured obs from the signal store.
+  app.get("/api/shadow/narrative-tilt-report", async (request) => {
+    const q = (request.query ?? {}) as { variant?: string };
+    const executorStore = new CrossSectionalExecutorStore(opts.externalOverlayDataDir ?? "data");
+    return {
+      ok: true,
+      ...buildNarrativeTiltReport({
+        measuredObservations: getCrossSectionalStore().all,
+        executedBaskets: executorStore.getState().baskets,
+        variant: q.variant ?? "FILTERED",
+        nowIso: new Date().toISOString(),
+      }),
+    };
+  });
+
   // Cross-sectional market-neutral measurement lane — report + open/closed baskets (report-only).
   app.get("/api/shadow/cross-sectional-report", async () => {
     const store = getCrossSectionalStore();
@@ -723,6 +832,25 @@ export async function registerShadowRoutes(
   app.get("/api/shadow/regime-engine-report", async () => ({
     enabled: isRegimeEngineEnabled(),
     ...buildRegimeEngineReport(),
+  }));
+
+  // MOONSHOT_LOTTERY_LANE measurement report — daily budget state + recent signals/rejections
+  // (report-only; nothing trades on this, live execution would be a separate operator-gated build).
+  app.get("/api/shadow/moonshot-report", async () => buildMoonshotReport(getMoonshotStore(), Date.now()));
+
+  // New-coin radar (report-only): recently-listed Binance perps + fundamental profile per coin
+  // (deskripsi/teknologi/manfaat, mcap vs FDV, circulating ratio, dev activity). Nothing trades
+  // from this — universe promotion stays a manual operator decision.
+  app.get("/api/shadow/new-coin-radar", async () => buildNewCoinRadarReport(getNewCoinRadarStore(), Date.now()));
+
+  // Regime-axis timeline: a continuous signed score (breadth composite, 0 = neutral zone) over
+  // the regime engine's snapshot history, so the dashboard can show WHERE the regime sits and
+  // how fast it is drifting toward/away from neutral (see regime-axis-timeline.ts's honesty
+  // contract — the ETA is an extrapolation, not a forecast).
+  app.get("/api/shadow/regime-axis-timeline", async () => ({
+    enabled: isRegimeEngineEnabled(),
+    generatedAt: new Date().toISOString(),
+    ...buildRegimeAxisTimeline(getRegimeEngineStore().snapshots),
   }));
 
   app.get("/api/shadow/regime-gated-lanes", async () => {
@@ -1209,12 +1337,70 @@ export async function registerShadowRoutes(
     return dashboardSummary;
   });
 
+  // Own closed HEADLINE orders, in the minimal PsleOrder shape — exists so the per-symbol-lane-edge
+  // report (below) can pool REAL headline-close proof from testnet/live's own books, not just the
+  // diagnostic instance's. Headline-only (excludes this instance's own diagnostic sleeve) and
+  // closed-only, so the payload is small and callers never receive more than they need.
+  app.get("/api/shadow/headline-closed-orders", async () => {
+    const orders = getPaperExecutionRouterStore().getState().orders;
+    const headlineClosed: PsleOrder[] = orders
+      .filter(
+        (o) =>
+          (o.paperStatus === "PAPER_CLOSED_WIN" || o.paperStatus === "PAPER_CLOSED_LOSS") &&
+          o.paperOrderMode !== "DIAGNOSTIC_ONLY" &&
+          o.diagnosticLabel !== "BACKFILL_DIAGNOSTIC" &&
+          typeof o.selectedLaneId === "string" &&
+          typeof o.symbol === "string",
+      )
+      .map((o) => ({
+        symbol: o.symbol,
+        selectedLaneId: o.selectedLaneId as string,
+        direction: o.direction ?? null,
+        paperStatus: o.paperStatus,
+        netR: o.netR,
+        paperOrderMode: o.paperOrderMode ?? null,
+        diagnosticLabel: o.diagnosticLabel ?? null,
+      }));
+    return { generatedAt: new Date().toISOString(), orders: headlineClosed };
+  });
+
   // Per-symbol × lane BOOK edge (report-only). Which symbols carry real, realized-book-proven edge —
   // even inside a benched lane — and via which lane. The disciplined basis for opening MORE symbols
   // than the 3-per-batch cap WITHOUT trading the panel's optimistic sim mirages. Measures only.
+  //
+  // 2026-07-08: pools in testnet+live's OWN headline-closed orders (via headline-closed-orders above)
+  // alongside this instance's full book. Without this, headlineClosed for real-money lanes was stuck
+  // at 0 forever on the diagnostic instance (it never runs HEADLINE mode for those lanes), which meant
+  // "promotable" (the live curation tier) could never be reached no matter how much time passed — see
+  // PSLE_PEER_SOURCE_URLS. Best-effort: a peer fetch failure just means that peer's real trades are
+  // missing from this cycle's count, never a thrown error or a stale/frozen report.
   app.get("/api/shadow/per-symbol-lane-edge", async () => {
     const generatedAt = new Date().toISOString();
-    const orders = getPaperExecutionRouterStore().getState().orders;
+    const localOrders = getPaperExecutionRouterStore().getState().orders;
+    const peerUrls = (process.env.PSLE_PEER_SOURCE_URLS ?? "http://localhost:3102,http://localhost:3103")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const peerTimeoutMs = 5_000;
+    const peerOrders = (
+      await Promise.all(
+        peerUrls.map(async (base) => {
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), peerTimeoutMs);
+          try {
+            const res = await fetch(`${base}/api/shadow/headline-closed-orders`, { signal: controller.signal });
+            if (!res.ok) return [];
+            const body = (await res.json()) as { orders?: PsleOrder[] };
+            return Array.isArray(body.orders) ? body.orders : [];
+          } catch {
+            return []; // peer unreachable this cycle — its real trades are just absent, not fatal
+          } finally {
+            clearTimeout(timer);
+          }
+        }),
+      )
+    ).flat();
+    const orders = [...localOrders, ...peerOrders];
     const envInt = (v: string | undefined, d: number) => {
       const n = Number(v);
       return Number.isFinite(n) && n > 0 ? Math.floor(n) : d;
@@ -1232,7 +1418,7 @@ export async function registerShadowRoutes(
       suspiciousPf: envNum(process.env.PSLE_SUSPICIOUS_PF, 10),
       suspiciousWr: envNum(process.env.PSLE_SUSPICIOUS_WR, 0.98),
     });
-    return { generatedAt, ...report };
+    return { generatedAt, peerOrdersMerged: peerOrders.length, ...report };
   });
 
   // Intraday momentum hunter (Sleeve 2) report — report-only measurement, nothing trades on it.
@@ -1243,7 +1429,8 @@ export async function registerShadowRoutes(
   // SHORT confirmed-exhaustion + crowded-funding fade report — report-only measurement, nothing
   // trades on it. See short-fade-edge.ts for the entry-signal rationale.
   app.get("/api/shadow/short-fade-report", async () => {
-    return { generatedAt: new Date().toISOString(), ...buildShortFadeReport(getShortFadeStore().all) };
+    const sfStore = getShortFadeStore();
+    return { generatedAt: new Date().toISOString(), ...buildShortFadeReport(sfStore.all, sfStore.cycleMeta) };
   });
 
   // Probability of Backtest Overfitting (CSCV) across the CG variant-matrix lanes — the honest audit
@@ -1636,6 +1823,48 @@ export async function registerShadowRoutes(
             crowdingClient: _sfc,
           }).catch(() => undefined);
         }
+        // NEW-COIN RADAR (report-only): discovery cycle is self-throttled to 12h via the store's
+        // fetchedAt, so riding the 7-min scan hook costs nothing between refreshes. Public
+        // endpoints only (Binance fapi + CoinGecko) — no keys, no orders.
+        if (isNewCoinRadarEnabled()) {
+          void runNewCoinRadarCycleGuarded({
+            store: getNewCoinRadarStore(),
+            nowMs: Date.now(),
+            excludeSymbols: new Set(CURRENT_SCANNER_UNIVERSE),
+          }).catch(() => undefined);
+        }
+        // MOONSHOT_LOTTERY_LANE (measurement/report-only, ported from testnet-live branch): cheap
+        // prefilter → deep-extract top movers → score + LOG signals/rejections. Places NO orders
+        // anywhere; live execution (if ever) will be a separate, operator-triggered build. Demo
+        // uses a default symbol max-leverage/minNotional — real execution MUST re-check brackets.
+        if (isMoonshotLotteryEnabled() && opts.binanceClient) {
+          const _mbc = opts.binanceClient;
+          // Meme-focused universe (2026-07-08): resolved against live exchangeInfo, cached 12h.
+          void resolveMoonshotMemeUniverse({ nowMs: Date.now() }).then((memeUniverse) =>
+            runMoonshotCycleGuarded({
+            universe: memeUniverse,
+            now: Date.now(),
+            store: getMoonshotStore(),
+            ctx: {
+              getCandles1m: async (sym, limit) => (await _mbc.getCandles(sym, "1m", limit)).map((c) => ({ close: c.close, volume: c.volume })),
+              getFlow: async (sym) => _mbc.getFuturesFlow(sym),
+              getDepth: async (sym) => {
+                const d = await _mbc.getDepth(sym, 50);
+                return {
+                  bids: d.bids.map(([p, q]) => [Number(p), Number(q)] as [number, number]),
+                  asks: d.asks.map(([p, q]) => [Number(p), Number(q)] as [number, number]),
+                };
+              },
+              getMarkPrice: async (sym) => (await _mbc.getFuturesPremiumIndex(sym)).markPrice,
+              minNotionalUsd: () => 5, // Binance futures common minNotional; execution re-checks per-symbol
+              maxLeverage: () => MOONSHOT_DEFAULT_MAX_LEVERAGE,
+            },
+          })).catch((err) => {
+            // Universe unresolvable with no cache: warn only — do NOT record a fake zero-cycle
+            // (that would read as "market calm"); a growing "last cycle Xh ago" is the honest signal.
+            console.warn(`[moonshot] meme universe resolve failed: ${(err as Error).message}`);
+          });
+        }
         // Cross-sectional market-neutral measurement lane: rank the universe by N-bar momentum, go
         // (hypothetically) long-top-k / short-bottom-k at equal notional, measure the forward basket
         // return. Beta cancels → the P&L is dispersion, which can be positive in BOTH bull and bear.
@@ -1652,13 +1881,22 @@ export async function registerShadowRoutes(
                 capturedAt: latestRegimeSnapshot.capturedAt,
               })
             : null;
+          // Regime-axis score for the FILTERED basket's leg-count skew (regimeSkewedK) — same
+          // score/boundary already proven out by the directional lane-switch guidance. A missing/
+          // unparseable score just falls back to unskewed 3/3 (regimeSkewedK's own null handling).
+          const axisScore = buildRegimeAxisTimeline(getRegimeEngineStore().snapshots).current?.score ?? null;
           void runCrossSectionalCycleGuarded({
             store: getCrossSectionalStore(),
-            universe: [...CURRENT_SCANNER_UNIVERSE],
+            universe: [...CROSS_SECTIONAL_UNIVERSE],
             now: Date.now(),
             regimeContext: crossSectionalRegimeContext,
+            axisScore,
+            // spotSymbolForCandles: 1000x-multiplier futures contracts (1000PEPEUSDT, …) have no
+            // spot pair under that name — fetch the bare spot symbol instead. Returns are price
+            // RATIOS, so the 1000x scaling cancels; the rest of the pipeline (scoring, allowlist
+            // matching, executor order symbol) keeps using the real futures name throughout.
             fetchCandles: async (symbol: string) =>
-              _xsc.getCandles(symbol, CROSS_SECTIONAL_INTERVAL, CROSS_SECTIONAL_MOMENTUM_BARS + 5),
+              _xsc.getCandles(spotSymbolForCandles(symbol), CROSS_SECTIONAL_INTERVAL, CROSS_SECTIONAL_MOMENTUM_BARS + 5),
           }).catch(() => undefined);
         }
       }

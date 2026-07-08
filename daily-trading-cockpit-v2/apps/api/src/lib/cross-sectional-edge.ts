@@ -13,6 +13,8 @@ import type { Candle } from "@dtc/shared";
 import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, copyFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 
+import { clusterOf, isMajorCluster } from "./correlation-clusters.js";
+
 function envNumPos(key: string, fallback: number): number {
   const v = Number(process.env[key]);
   return Number.isFinite(v) && v > 0 ? v : fallback;
@@ -35,12 +37,48 @@ const INTERVAL_MS: Record<string, number> = {
 export const CROSS_SECTIONAL_INTERVAL = process.env.CROSS_SECTIONAL_INTERVAL || "1h";
 export const CROSS_SECTIONAL_MOMENTUM_BARS = envNumPos("CROSS_SECTIONAL_MOMENTUM_BARS", 24); // ROC lookback
 export const CROSS_SECTIONAL_K = envNumPos("CROSS_SECTIONAL_K", 3); // legs per side (long-k / short-k)
+
+// --- Regime-skewed composition (2026-07-08, operator-requested) ---
+// Real data (99 closed FILTERED baskets): TREND_LONG-at-open baskets averaged +2.79% on the long leg
+// vs -1.83% on the short leg; TREND_SHORT-at-open averaged +1.92% short vs +0.02% long — whichever
+// side matches the regime carries the basket, the other is close to dead weight or a real drag. This
+// tilts leg COUNT toward the regime-favored side when the regime-axis score (see
+// regime-axis-timeline.ts) is outside its ±0.12 neutral boundary — the SAME boundary already proven
+// out by the directional lane-switch guidance. Applied ONLY to the FILTERED (executed) variant; RAW
+// stays unskewed as the enduring, unmodified OOS control. Env-gated + off by default.
+export function isCrossSectionalRegimeSkewEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.CROSS_SECTIONAL_REGIME_SKEW_ENABLED === "1";
+}
+export const CROSS_SECTIONAL_REGIME_SKEW_ZONE_BOUNDARY = envNumPos("CROSS_SECTIONAL_REGIME_SKEW_ZONE_BOUNDARY", 0.12);
+export const CROSS_SECTIONAL_REGIME_SKEW_DELTA = envNumPos("CROSS_SECTIONAL_REGIME_SKEW_DELTA", 1); // 3/3 -> 4/2
+
+/** Pure: given the base per-side k and the current regime-axis score, returns the (possibly skewed)
+ *  long/short leg counts. Null/non-finite/inside-neutral-zone score -> unchanged 3/3-style symmetry.
+ *  The delta is capped so the disfavored side can never drop to 0 (a hedge, however small, survives). */
+export function regimeSkewedK(
+  baseK: number,
+  axisScore: number | null,
+  opts: { zoneBoundary?: number; delta?: number } = {},
+): { longK: number; shortK: number } {
+  const zoneBoundary = opts.zoneBoundary ?? CROSS_SECTIONAL_REGIME_SKEW_ZONE_BOUNDARY;
+  if (axisScore === null || !Number.isFinite(axisScore) || Math.abs(axisScore) <= zoneBoundary) {
+    return { longK: baseK, shortK: baseK };
+  }
+  const delta = Math.max(0, Math.min(baseK - 1, opts.delta ?? CROSS_SECTIONAL_REGIME_SKEW_DELTA));
+  return axisScore > 0 ? { longK: baseK + delta, shortK: baseK - delta } : { longK: baseK - delta, shortK: baseK + delta };
+}
 export const CROSS_SECTIONAL_HORIZON_BARS = envNumPos("CROSS_SECTIONAL_HORIZON_BARS", 24); // forward hold (bars)
 export const CROSS_SECTIONAL_ROUNDTRIP_BPS = Number(process.env.CROSS_SECTIONAL_ROUNDTRIP_BPS ?? 12); // per-position round-trip cost
 export const CROSS_SECTIONAL_FILTERED_SIGNAL = `MOM${CROSS_SECTIONAL_MOMENTUM_BARS}_FILTERED`;
 export const CROSS_SECTIONAL_TREND_SIGNAL = `MOM${CROSS_SECTIONAL_MOMENTUM_BARS}_TREND_BETA_VOL`;
 export const CROSS_SECTIONAL_MIXED_SIGNAL = `MOM${CROSS_SECTIONAL_MOMENTUM_BARS}_MIXED_MR`;
 export const CROSS_SECTIONAL_FILTERED_MIN_SCORE_GAP = envNumNonNeg("CROSS_SECTIONAL_FILTERED_MIN_SCORE_GAP", 0.02); // 24h momentum spread floor
+// 2026-07-08 (operator-requested): the universe was 40% L1 (SOL/AVAX/SUI/INJ/APT/SEI/NEAR/ADA),
+// so a pure top-k/bottom-k score sort could fill an ENTIRE side with one correlated cluster —
+// nominally "3 different symbols" but effectively one correlated bet, not the diversified hedge
+// the basket is supposed to be. Caps how many of a side's selected legs may share a cluster
+// (BTC/ETH majors exempt, same convention as the directional concentration cap). 0 disables.
+export const CROSS_SECTIONAL_FILTERED_MAX_PER_CLUSTER = envNumNonNeg("CROSS_SECTIONAL_FILTERED_MAX_PER_CLUSTER", 2);
 export const CROSS_SECTIONAL_FILTERED_MIN_GROSS_BPS = envNumNonNeg("CROSS_SECTIONAL_FILTERED_MIN_GROSS_BPS", 25); // proof target
 export const CROSS_SECTIONAL_ADAPTIVE_MIN_GROSS_BPS = envNumNonNeg("CROSS_SECTIONAL_ADAPTIVE_MIN_GROSS_BPS", 35); // safer proof target
 export const CROSS_SECTIONAL_TREND_MIN_SCORE_GAP = envNumNonNeg("CROSS_SECTIONAL_TREND_MIN_SCORE_GAP", 0.035);
@@ -48,13 +86,21 @@ export const CROSS_SECTIONAL_MIXED_MIN_SCORE_GAP = envNumNonNeg("CROSS_SECTIONAL
 export const CROSS_SECTIONAL_BASKET_TAKE_PROFIT_BPS = envNumNonNeg("CROSS_SECTIONAL_BASKET_TAKE_PROFIT_BPS", 40);
 export const CROSS_SECTIONAL_BASKET_STOP_LOSS_BPS = envNumNonNeg("CROSS_SECTIONAL_BASKET_STOP_LOSS_BPS", 30);
 export const CROSS_SECTIONAL_TREND_LONG_CAPITAL_WEIGHT = Math.min(0.9, Math.max(0.1, Number(process.env.CROSS_SECTIONAL_TREND_LONG_CAPITAL_WEIGHT ?? 0.35)));
+// 2026-07-07: "PEPEUSDT" is not a real Binance futures symbol — the exchange lists it as
+// "1000PEPEUSDT" (a 1000x-multiplier contract), confirmed against the real exchangeInfo/klines
+// endpoints on both mainnet and testnet (both reject plain "PEPEUSDT" with "Invalid symbol").
+// Any basket containing the wrong name as a leg silently failed at getExchangeFilters() inside
+// cross-sectional-executor.ts's maybeOpenBasket() — no filter entry, no error, the whole basket
+// just never opened. Fixed here at the source (env default + deployed .env values) rather than
+// papering over it with a translation layer in the executor, per this module's own design
+// constraint: "what executes is exactly what was measured — no separate signal path."
 export const CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST = envSymbolSet(
   "CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST",
-  "ADAUSDT,BNBUSDT,ETHUSDT,OPUSDT,PEPEUSDT,SOLUSDT,SUIUSDT",
+  "ADAUSDT,BNBUSDT,ETHUSDT,OPUSDT,1000PEPEUSDT,SOLUSDT,SUIUSDT",
 );
 export const CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST = envSymbolSet(
   "CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST",
-  "DOGEUSDT,OPUSDT,PEPEUSDT,SEIUSDT,WLDUSDT",
+  "DOGEUSDT,OPUSDT,1000PEPEUSDT,SEIUSDT,WLDUSDT",
 );
 export const CROSS_SECTIONAL_FILTERED_SHORT_BLOCKLIST = envSymbolSet(
   "CROSS_SECTIONAL_FILTERED_SHORT_BLOCKLIST",
@@ -62,7 +108,7 @@ export const CROSS_SECTIONAL_FILTERED_SHORT_BLOCKLIST = envSymbolSet(
 );
 export const CROSS_SECTIONAL_TREND_LONG_ALLOWLIST = envSymbolSet(
   "CROSS_SECTIONAL_TREND_LONG_ALLOWLIST",
-  "SOLUSDT,ETHUSDT,OPUSDT,PEPEUSDT",
+  "SOLUSDT,ETHUSDT,OPUSDT,1000PEPEUSDT",
 );
 export const CROSS_SECTIONAL_TREND_LONG_BLOCKLIST = envSymbolSet(
   "CROSS_SECTIONAL_TREND_LONG_BLOCKLIST",
@@ -70,12 +116,28 @@ export const CROSS_SECTIONAL_TREND_LONG_BLOCKLIST = envSymbolSet(
 );
 export const CROSS_SECTIONAL_TREND_SHORT_ALLOWLIST = envSymbolSet(
   "CROSS_SECTIONAL_TREND_SHORT_ALLOWLIST",
-  "WLDUSDT,SEIUSDT,DOGEUSDT,PEPEUSDT,APTUSDT,OPUSDT",
+  "WLDUSDT,SEIUSDT,DOGEUSDT,1000PEPEUSDT,APTUSDT,OPUSDT",
 );
 export const CROSS_SECTIONAL_TREND_SHORT_BLOCKLIST = envSymbolSet(
   "CROSS_SECTIONAL_TREND_SHORT_BLOCKLIST",
   "AVAXUSDT,INJUSDT,FETUSDT,NEARUSDT,RNDRUSDT",
 );
+// 2026-07-08 (operator-requested widening): a dedicated universe for cross-sectional, separate
+// from the main scanner's UNIVERSE (scan-service.ts) — widening THAT shared constant would also
+// add these symbols to Kronos forecasting, directional lane candidates, etc., none of which were
+// asked for or vetted here. The prior 20 were 40% L1 (SOL/AVAX/SUI/INJ/APT/SEI/NEAR/ADA), leaving
+// MEME/AI/L2_DEFI too thin to ever fill a basket leg without repeating the same few names — these
+// additions deepen those thin clusters specifically (see correlation-clusters.ts), not L1 further.
+// "1000PEPEUSDT" (not the scanner's bare "PEPEUSDT") is the real Binance futures symbol — see
+// spotSymbolForCandles usage at this universe's fetchCandles call site for the spot/futures split.
+export const CROSS_SECTIONAL_UNIVERSE: readonly string[] = [
+  ...envSymbolSet(
+    "CROSS_SECTIONAL_UNIVERSE",
+    "BTCUSDT,ETHUSDT,SOLUSDT,DOGEUSDT,AVAXUSDT,LINKUSDT,SUIUSDT,1000PEPEUSDT,ARBUSDT,OPUSDT," +
+      "INJUSDT,WLDUSDT,APTUSDT,SEIUSDT,NEARUSDT,BNBUSDT,XRPUSDT,ADAUSDT,FETUSDT,RNDRUSDT," +
+      "WIFUSDT,TAOUSDT,ARKMUSDT,UNIUSDT,AAVEUSDT,LDOUSDT",
+  ),
+];
 const BAR_MS = INTERVAL_MS[CROSS_SECTIONAL_INTERVAL] ?? INTERVAL_MS["1h"]!;
 export const CROSS_SECTIONAL_HORIZON_MS = CROSS_SECTIONAL_HORIZON_BARS * BAR_MS;
 const EXPIRY_MS = CROSS_SECTIONAL_HORIZON_MS * 3; // give up on a basket missing prices well past its horizon
@@ -112,6 +174,11 @@ export interface CrossSectionalObservation {
   variant?: CrossSectionalVariant;
   strategyFamily?: CrossSectionalStrategyFamily;
   k: number;
+  /** Actual per-side leg counts used (2026-07-08, regime-skewed composition) — equal to `k` on both
+   *  sides unless the regime-axis score was outside the neutral zone at open. Recorded per basket
+   *  so skewed vs. unskewed baskets stay auditable/comparable after the fact. */
+  longK?: number;
+  shortK?: number;
   longLeg: CrossSectionalLeg[];
   shortLeg: CrossSectionalLeg[];
   status: CrossSectionalStatus;
@@ -142,6 +209,10 @@ export interface ScoredSymbol {
 
 interface CrossSectionalBasketOpts {
   k: number;
+  /** Per-side leg count overrides (2026-07-08, regime-skewed composition). Default to `k` when
+   *  unset, so every existing caller is unaffected. */
+  longK?: number;
+  shortK?: number;
   signal: string;
   now: string;
   openedAtMs: number;
@@ -155,6 +226,9 @@ interface CrossSectionalBasketOpts {
   shortAllowlist?: ReadonlySet<string> | null;
   shortBlocklist?: ReadonlySet<string> | null;
   minScoreGap?: number;
+  /** Max legs per side allowed to share a correlation cluster (BTC/ETH majors exempt). Undefined/0
+   *  disables — every existing caller (that never sets it) keeps today's pure top-k/bottom-k sort. */
+  maxPerCluster?: number;
   longCapitalWeight?: number;
   shortCapitalWeight?: number;
   weightingModel?: "EQUAL_NOTIONAL" | "BETA_VOL_PROXY";
@@ -166,6 +240,26 @@ interface CrossSectionalBasketOpts {
 
 function mean(xs: number[]): number {
   return xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : 0;
+}
+
+/** Walks the score-sorted pool taking the best k, but skips a candidate that would push its
+ *  cluster's count on this side past maxPerCluster — so a heavily-populated cluster (e.g. L1)
+ *  can't fill an entire side even when it dominates the universe. Majors (BTC/ETH) are exempt,
+ *  matching the directional concentration cap's convention. Order-preserving: still best-score-
+ *  first among whatever remains eligible, never reshuffles for "fairness" beyond the cap itself. */
+function selectWithClusterCap(sorted: ScoredSymbol[], k: number, maxPerCluster?: number): ScoredSymbol[] {
+  if (!maxPerCluster || maxPerCluster <= 0) return sorted.slice(0, k);
+  const selected: ScoredSymbol[] = [];
+  const clusterCounts = new Map<string, number>();
+  for (const s of sorted) {
+    if (selected.length >= k) break;
+    const cluster = clusterOf(s.symbol);
+    const count = clusterCounts.get(cluster) ?? 0;
+    if (!isMajorCluster(cluster) && count >= maxPerCluster) continue;
+    selected.push(s);
+    clusterCounts.set(cluster, count + 1);
+  }
+  return selected;
 }
 
 function allowed(symbol: string, allowlist?: ReadonlySet<string> | null, blocklist?: ReadonlySet<string> | null): boolean {
@@ -244,14 +338,16 @@ export function buildCrossSectionalBasket(
 ): CrossSectionalObservation | null {
   const valid = scored.filter((s) => Number.isFinite(s.score) && Number.isFinite(s.price) && s.price > 0);
   const mode = opts.selectionMode ?? "MOMENTUM";
+  const longK = opts.longK ?? opts.k;
+  const shortK = opts.shortK ?? opts.k;
   const longPool = valid.filter((s) => allowed(s.symbol, opts.longAllowlist, opts.longBlocklist));
   const longSorted = [...longPool].sort((a, b) => mode === "MEAN_REVERSION" ? a.score - b.score : b.score - a.score);
-  const selectedLongs = longSorted.slice(0, opts.k);
+  const selectedLongs = selectWithClusterCap(longSorted, longK, opts.maxPerCluster);
   const longSymbols = new Set(selectedLongs.map((s) => s.symbol));
   const shortPool = valid.filter((s) => !longSymbols.has(s.symbol) && allowed(s.symbol, opts.shortAllowlist, opts.shortBlocklist));
   const shortSorted = [...shortPool].sort((a, b) => mode === "MEAN_REVERSION" ? b.score - a.score : a.score - b.score);
-  const selectedShorts = shortSorted.slice(0, opts.k);
-  if (selectedLongs.length < opts.k || selectedShorts.length < opts.k) return null;
+  const selectedShorts = selectWithClusterCap(shortSorted, shortK, opts.maxPerCluster);
+  if (selectedLongs.length < longK || selectedShorts.length < shortK) return null;
   const scoreGap = scoreGapFor(selectedLongs, selectedShorts);
   if (opts.minScoreGap !== undefined && scoreGap < opts.minScoreGap) return null;
   const longCapitalWeight = clampWeight(opts.longCapitalWeight ?? 0.5, 0.5);
@@ -269,6 +365,8 @@ export function buildCrossSectionalBasket(
     variant: opts.variant ?? "RAW",
     strategyFamily: opts.strategyFamily ?? (mode === "MEAN_REVERSION" ? "MEAN_REVERSION" : "MOMENTUM_DISPERSION"),
     k: opts.k,
+    longK: selectedLongs.length,
+    shortK: selectedShorts.length,
     longLeg: weightedLegs(selectedLongs, normalizedLongCapital, { weightingModel, volBySymbol: opts.volBySymbol }),
     shortLeg: weightedLegs(selectedShorts, normalizedShortCapital, { weightingModel, volBySymbol: opts.volBySymbol }),
     status: "OPEN",
@@ -316,14 +414,20 @@ export interface AdaptiveSymbolFilters {
     promotedShort: string[];
     demotedLong: string[];
     demotedShort: string[];
+    minEligiblePerSide: number;
+    /** True when demotions alone would have left this side below minEligiblePerSide, so the
+     *  fallback below kicked in instead. See the floor comment at its computation site. */
+    longFloorApplied: boolean;
+    shortFloorApplied: boolean;
   };
 }
 
 export function deriveAdaptiveSymbolFilters(
   store: CrossSectionalStore,
-  opts: { minLegSamples?: number } = {},
+  opts: { minLegSamples?: number; minEligiblePerSide?: number } = {},
 ): AdaptiveSymbolFilters {
   const minLegSamples = opts.minLegSamples ?? 3;
+  const minEligiblePerSide = opts.minEligiblePerSide ?? CROSS_SECTIONAL_K;
   const perf = new Map<string, { longN: number; longSum: number; shortN: number; shortSum: number }>();
   const bump = (symbol: string, side: "long" | "short", ret: number) => {
     const row = perf.get(symbol) ?? { longN: 0, longSum: 0, shortN: 0, shortSum: 0 };
@@ -364,12 +468,29 @@ export function deriveAdaptiveSymbolFilters(
     }
   }
 
-  const longAllow = new Set<string>([...CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST]);
-  for (const s of demotedLong) longAllow.delete(s);
-  const shortAllow = new Set<string>([...CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST]);
-  for (const s of demotedShort) shortAllow.delete(s);
-  const shortBlock = new Set<string>([...CROSS_SECTIONAL_FILTERED_SHORT_BLOCKLIST, ...demotedShort]);
-  const longBlock = new Set<string>(demotedLong);
+  const longAllowRaw = new Set<string>([...CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST]);
+  for (const s of demotedLong) longAllowRaw.delete(s);
+  const shortAllowRaw = new Set<string>([...CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST]);
+  for (const s of demotedShort) shortAllowRaw.delete(s);
+
+  // Floor (2026-07-07 audit): demotion has no natural recovery path — a demoted symbol only
+  // regains eligibility once NEW closed baskets remeasure it positive, but no new baskets can
+  // form once a side drops below the k legs a basket needs. That is a PERMANENT lockout, not a
+  // temporary one: live's entire cross-sectional allocation silently stopped opening SHORT-side
+  // baskets for ~18h this way (all 5 configured short symbols demoted, effective allowlist 0).
+  // If demotions would leave a side under minEligiblePerSide, fall back to the full configured
+  // allowlist for that side THIS CYCLE ONLY — next cycle recomputes fresh from the same
+  // closed-basket history, so a symbol gets a genuine chance to prove out again instead of
+  // staying locked out forever with nothing left to remeasure it.
+  const longFloorApplied = longAllowRaw.size < minEligiblePerSide;
+  const shortFloorApplied = shortAllowRaw.size < minEligiblePerSide;
+  const longAllow = longFloorApplied ? new Set(CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST) : longAllowRaw;
+  const shortAllow = shortFloorApplied ? new Set(CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST) : shortAllowRaw;
+  const shortBlock = new Set<string>([
+    ...CROSS_SECTIONAL_FILTERED_SHORT_BLOCKLIST,
+    ...(shortFloorApplied ? [] : demotedShort),
+  ]);
+  const longBlock = new Set<string>(longFloorApplied ? [] : demotedLong);
 
   return {
     longAllowlist: [...longAllow].sort(),
@@ -383,6 +504,9 @@ export function deriveAdaptiveSymbolFilters(
       promotedShort: promotedShort.sort(),
       demotedLong: demotedLong.sort(),
       demotedShort: demotedShort.sort(),
+      minEligiblePerSide,
+      longFloorApplied,
+      shortFloorApplied,
     },
   };
 }
@@ -400,6 +524,7 @@ export function buildFilteredCrossSectionalBasket(
     shortAllowlist: opts.shortAllowlist ?? CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST,
     shortBlocklist: opts.shortBlocklist ?? CROSS_SECTIONAL_FILTERED_SHORT_BLOCKLIST,
     minScoreGap: opts.minScoreGap ?? CROSS_SECTIONAL_FILTERED_MIN_SCORE_GAP,
+    maxPerCluster: opts.maxPerCluster ?? CROSS_SECTIONAL_FILTERED_MAX_PER_CLUSTER,
   });
 }
 
@@ -670,6 +795,10 @@ export async function runCrossSectionalCycle(opts: {
   now: number;
   fetchCandles: (symbol: string) => Promise<Candle[]>;
   regimeContext?: CrossSectionalRegimeContext | null;
+  /** Current regime-axis score (regime-axis-timeline.ts's current.score), used ONLY when
+   *  CROSS_SECTIONAL_REGIME_SKEW_ENABLED=1 to tilt the FILTERED (executed) basket's leg counts
+   *  toward the regime-favored side. Omit/null -> unskewed 3/3-style symmetry, same as before. */
+  axisScore?: number | null;
 }): Promise<CrossSectionalCycleResult> {
   const result: CrossSectionalCycleResult = { opened: 0, resolved: 0, expired: 0 };
   const nowIso = new Date(opts.now).toISOString();
@@ -735,8 +864,11 @@ export async function runCrossSectionalCycle(opts: {
     // Auto-updating lists: derived from the store's own measured per-leg performance
     // (env lists as the prior) — recomputed every cycle, never a frozen env var.
     const adaptive = deriveAdaptiveSymbolFilters(opts.store);
+    const skew = isCrossSectionalRegimeSkewEnabled() ? regimeSkewedK(CROSS_SECTIONAL_K, opts.axisScore ?? null) : null;
     const basket = buildFilteredCrossSectionalBasket(scored, {
       k: CROSS_SECTIONAL_K,
+      longK: skew?.longK,
+      shortK: skew?.shortK,
       now: nowIso,
       openedAtMs: opts.now,
       horizonMs: CROSS_SECTIONAL_HORIZON_MS,
@@ -800,6 +932,7 @@ export async function runCrossSectionalCycleGuarded(opts: {
   now: number;
   fetchCandles: (symbol: string) => Promise<Candle[]>;
   regimeContext?: CrossSectionalRegimeContext | null;
+  axisScore?: number | null;
 }): Promise<CrossSectionalCycleResult | null> {
   if (cycleRunning) return null;
   cycleRunning = true;

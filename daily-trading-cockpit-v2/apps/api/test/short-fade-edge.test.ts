@@ -7,6 +7,7 @@ import {
   resolveShortFadeObservation,
   buildShortFadeReport,
   runShortFadeCycle,
+  runShortFadeCycleGuarded,
   ShortFadeStore,
   SF_RSI_OVERBOUGHT,
   type ShortFadeObservation,
@@ -272,5 +273,56 @@ describe("short-fade — cycle (bounds the crowding fetch to RSI candidates only
     expect(result.rsiCandidates).toBe(1);
     expect(result.crowdingRejected).toBe(1);
     expect(result.recorded).toBe(0);
+  });
+});
+
+// [LIVENESS] 2026-07-07: the cycle computed a gate funnel (rsiCandidates/crowdingRejected/recorded)
+// and threw it away — an empty book was indistinguishable from a dead cycle without SSHing to the
+// box to stat the store file. The meta must persist, accumulate, and survive a reload.
+describe("short-fade — cycle liveness meta", () => {
+  const neutralCrowding = {
+    getFuturesFlow: async () => ({ fundingRate: 0, openInterestChangePercent: 0, takerBuySellRatio: null, longShortRatio: null }),
+  };
+
+  it("[LIVENESS] persists lastCycleAt + accumulates the gate funnel across cycles and reloads", async () => {
+    const file = `/tmp/short-fade-meta-${Date.now()}-${Math.random()}.json`;
+    const store = new ShortFadeStore(file);
+    const candles = risingThenDrop(24, 1, 8);
+    const base = { store, universe: ["TESTUSDT"] as const, fetchCandles: async () => candles, crowdingClient: neutralCrowding };
+    await runShortFadeCycle({ ...base, now: Date.now() });
+    await runShortFadeCycle({ ...base, now: Date.now() + 3_600_000 });
+    const meta = store.cycleMeta;
+    expect(meta.cycles).toBe(2);
+    expect(meta.lastCycleAt).not.toBeNull();
+    expect(meta.rsiCandidatesTotal).toBe(2); // one RSI candidate per cycle
+    expect(meta.crowdingRejectedTotal).toBe(2); // neutral gate rejected both
+    expect(meta.recordedTotal).toBe(0);
+    expect(meta.lastCycleError).toBeNull();
+    // A restart must not zero the funnel.
+    const reloaded = new ShortFadeStore(file);
+    expect(reloaded.cycleMeta.cycles).toBe(2);
+    expect(reloaded.cycleMeta.rsiCandidatesTotal).toBe(2);
+    // And the report surfaces it.
+    const report = buildShortFadeReport(reloaded.all, reloaded.cycleMeta);
+    expect(report.cycleMeta?.cycles).toBe(2);
+  });
+
+  it("[LIVENESS] a crashing cycle records lastCycleError instead of looking identical to 'no signal'", async () => {
+    const store = new ShortFadeStore(`/tmp/short-fade-meta-err-${Date.now()}-${Math.random()}.json`);
+    const orig = store.save.bind(store);
+    let threw = false;
+    store.save = () => {
+      if (!threw) { threw = true; throw new Error("disk full"); }
+      orig();
+    };
+    const crashed = await runShortFadeCycleGuarded({
+      store,
+      universe: ["TESTUSDT"],
+      now: Date.now(),
+      fetchCandles: async () => risingThenDrop(24, 1, 8),
+      crowdingClient: neutralCrowding,
+    });
+    expect(crashed).toBeNull();
+    expect(store.cycleMeta.lastCycleError).toBe("disk full");
   });
 });

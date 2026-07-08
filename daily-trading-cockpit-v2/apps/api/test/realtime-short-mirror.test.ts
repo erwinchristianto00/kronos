@@ -9,6 +9,8 @@ import {
   makeRealtimeShortPaperOrderId,
   realtimeShortSelectedLaneId,
   REALTIME_SHORT_ALLOWED_VARIANT_IDS,
+  FORCE_ELIGIBLE_SHORT_VARIANT_IDS,
+  FORCE_ELIGIBLE_LONG_VARIANT_IDS,
   type RealtimeShortCandidate,
   type RealtimeShortMirrorInputs,
 } from "../src/lib/realtime-short-mirror.js";
@@ -375,11 +377,53 @@ describe("realtime-short-mirror — fresh short live-mirror source (mode 2)", ()
     expect(o.takeProfitLevels[0]).toBeCloseTo(101.5, 6); // 0.5R target
   });
 
+  it("[FORCE-LONG] without the force flag, FAST_LONG stays gated outside the strict WIDE_TREND+LONG estimate", () => {
+    // 2026-07-07 operator ("buka akses CG_WIDE_FAST_LONG, gw mau trade di saat regime bullish"):
+    // a plain bullish regime whose estimate still reads tactical produced ZERO long candidates.
+    const tacticalBull = {
+      regime: "Bullish expansion",
+      controllerMode: "LONG_ONLY",
+      controllerConfidence: "MEDIUM",
+      estimatedRegime: { posture: "TACTICAL_OR_MIXED", direction: "MIXED", policy: "TACTICAL_70_30", reason: "test" } as const,
+      stableShortLaneActive: false,
+      stableShortLanes: [],
+    };
+    const longCand = { symbol: "ETHUSDT", direction: "LONG" as const, currentPrice: 100, stopLoss: 97, takeProfitLevels: [110] };
+
+    const gated = runRealtimeShortMirror(inputs([longCand], tacticalBull), freshStore());
+    expect(gated.emitted).toBe(0);
+
+    const store = freshStore();
+    const forced = runRealtimeShortMirror(inputs([longCand], { ...tacticalBull, forceFastLong: true }), store);
+    expect(forced.emitted).toBe(1);
+    expect(store.all[0]!.direction).toBe("LONG");
+    expect(store.all[0]!.selectedLaneId).toBe(realtimeShortSelectedLaneId("CG_WIDE_FAST_LONG"));
+  });
+
+  it("[FORCE-LONG] the forced lane still respects the controller direction gate (no longs in SHORT_ONLY)", () => {
+    const res = runRealtimeShortMirror(
+      inputs(
+        [{ symbol: "ETHUSDT", direction: "LONG", currentPrice: 100, stopLoss: 97, takeProfitLevels: [110] }],
+        {
+          regime: "Bearish pressure",
+          controllerMode: "SHORT_ONLY",
+          controllerConfidence: "MEDIUM",
+          estimatedRegime: { posture: "TACTICAL_OR_MIXED", direction: "SHORT", policy: "TACTICAL_70_30", reason: "test" },
+          forceFastLong: true,
+          stableShortLaneActive: false,
+          stableShortLanes: [],
+        },
+      ),
+      freshStore(),
+    );
+    expect(res.emitted).toBe(0);
+  });
+
   it("[GEOMETRY-COHERENT] derives stop + 0.5R TP from the live entry, ignoring the scanner's tp1", () => {
     const store = freshStore();
     // entry 100, stop 105 (5% > 300bps floor). scanner tp1 of 99.9 must be IGNORED.
     runRealtimeShortMirror(
-      inputs([shortCand("XRPUSDT", { currentPrice: 100, stopLoss: 105, takeProfitLevels: [99.9] })], {
+      inputs([shortCand("BTCUSDT", { currentPrice: 100, stopLoss: 105, takeProfitLevels: [99.9] })], {
         controllerConfidence: "MEDIUM",
       }),
       store,
@@ -397,7 +441,7 @@ describe("realtime-short-mirror — fresh short live-mirror source (mode 2)", ()
     const store = freshStore();
     // raw stop only 0.5% away — must floor to 3% (300bps)
     runRealtimeShortMirror(
-      inputs([shortCand("XRPUSDT", { currentPrice: 100, stopLoss: 100.5 })], {
+      inputs([shortCand("BTCUSDT", { currentPrice: 100, stopLoss: 100.5 })], {
         controllerConfidence: "MEDIUM",
       }),
       store,
@@ -502,5 +546,69 @@ describe("realtime-short-mirror — fresh short live-mirror source (mode 2)", ()
     expect(isRealtimeShortMirrorEnabled({} as NodeJS.ProcessEnv)).toBe(false);
     expect(isRealtimeShortMirrorEnabled({ REALTIME_SHORT_MIRROR_ENABLED: "0" } as unknown as NodeJS.ProcessEnv)).toBe(false);
     expect(isRealtimeShortMirrorEnabled({ REALTIME_SHORT_MIRROR_ENABLED: "1" } as unknown as NodeJS.ProcessEnv)).toBe(true);
+  });
+
+  // 2026-07-08 (operator: "wire lane baru ke allocation selection") — CG_WIDE_LONG_RUNNER and
+  // CG_MFE_GIVEBACK need to be force-liftable to STABLE_CANDIDATE the same way FAST_SHORT/FAST_LONG
+  // already are, or the regime-autopilot's new preset entries would allocate a lane that can never
+  // actually emit a real-time signal.
+  it("[FORCE-ELIGIBLE] the default sets are UNCHANGED — only FAST_SHORT/FAST_LONG, exactly as before", () => {
+    // 2026-07-08: deliberately did NOT add new lanes here directly — see [ALLOCATION-FORCE] below
+    // for why (it regressed the FORCE-LONG guarantee when tried). manualEnabledVariantIds is the
+    // mechanism instead, gated on an ACTUAL operator/preset allocation being active.
+    expect([...FORCE_ELIGIBLE_SHORT_VARIANT_IDS]).toEqual(["CG_WIDE_FAST_SHORT"]);
+    expect([...FORCE_ELIGIBLE_LONG_VARIANT_IDS]).toEqual(["CG_WIDE_FAST_LONG"]);
+  });
+
+  it("[ALLOCATION-FORCE] a lane with no allocation active stays gated even outside WIDE_TREND+LONG (unchanged default)", () => {
+    const tacticalBull = {
+      regime: "Bullish expansion",
+      controllerMode: "LONG_ONLY",
+      controllerConfidence: "MEDIUM",
+      estimatedRegime: { posture: "TACTICAL_OR_MIXED", direction: "MIXED", policy: "TACTICAL_70_30", reason: "test" } as const,
+      stableShortLaneActive: false,
+      stableShortLanes: [],
+    };
+    const longCand = { symbol: "ETHUSDT", direction: "LONG" as const, currentPrice: 100, stopLoss: 97, takeProfitLevels: [110] };
+    const result = runRealtimeShortMirror(inputs([longCand], tacticalBull), freshStore());
+    expect(result.emitted).toBe(0); // CG_WIDE_LONG_RUNNER never force-lifted without an explicit allocation
+  });
+
+  it("[ALLOCATION-FORCE] an explicit manualEnabledVariantIds allocation force-lifts + wins the slot for that variant", () => {
+    const tacticalBull = {
+      regime: "Bullish expansion",
+      controllerMode: "LONG_ONLY",
+      controllerConfidence: "MEDIUM",
+      estimatedRegime: { posture: "TACTICAL_OR_MIXED", direction: "MIXED", policy: "TACTICAL_70_30", reason: "test" } as const,
+      stableShortLaneActive: false,
+      stableShortLanes: [],
+    };
+    const longCand = { symbol: "ETHUSDT", direction: "LONG" as const, currentPrice: 100, stopLoss: 97, takeProfitLevels: [110] };
+    const store = freshStore();
+    const result = runRealtimeShortMirror(
+      inputs([longCand], { ...tacticalBull, manualEnabledVariantIds: new Set(["CG_WIDE_LONG_RUNNER"]) }),
+      store,
+    );
+    expect(result.emitted).toBe(1);
+    expect(store.all[0]!.selectedLaneId).toBe(realtimeShortSelectedLaneId("CG_WIDE_LONG_RUNNER"));
+  });
+
+  it("[ALLOCATION-FORCE] does NOT disturb the existing FAST_LONG force-flag guarantee when both are active", () => {
+    // Regression guard: adding manualEnabledVariantIds force-lifting must not make an unrelated
+    // allocated lane steal FAST_LONG's forced slot when FAST_LONG's OWN force flag is what's set.
+    const tacticalBull = {
+      regime: "Bullish expansion",
+      controllerMode: "LONG_ONLY",
+      controllerConfidence: "MEDIUM",
+      estimatedRegime: { posture: "TACTICAL_OR_MIXED", direction: "MIXED", policy: "TACTICAL_70_30", reason: "test" } as const,
+      stableShortLaneActive: false,
+      stableShortLanes: [],
+      forceFastLong: true,
+    };
+    const longCand = { symbol: "ETHUSDT", direction: "LONG" as const, currentPrice: 100, stopLoss: 97, takeProfitLevels: [110] };
+    const store = freshStore();
+    const result = runRealtimeShortMirror(inputs([longCand], tacticalBull), store);
+    expect(result.emitted).toBe(1);
+    expect(store.all[0]!.selectedLaneId).toBe(realtimeShortSelectedLaneId("CG_WIDE_FAST_LONG"));
   });
 });

@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from 'react';
+import { Component, useEffect, useState, type ReactNode } from 'react';
 
 // Simple but rich monitoring page for the report-only research lanes (cross-sectional market-neutral).
 // Self-contained: own fetches + 10s auto-refresh + inline-styled dark cards.
@@ -60,9 +60,31 @@ const ago = (ts: string) => {
   return s < 60 ? `${s}s` : s < 3600 ? `${Math.round(s / 60)}m` : `${Math.round(s / 3600)}h`;
 };
 const dur = (ms: number) => {
+  // A basket overdue for resolution (resolver runs on a 7-min cycle) yields a negative
+  // countdown — clamp to "due" instead of rendering "0h -12m".
+  if (ms <= 0) return 'due';
   const h = Math.floor(ms / 3600000); const m = Math.round((ms % 3600000) / 60000);
   return h > 0 ? `${h}h ${m}m` : `${m}m`;
 };
+
+/** The research page is the operator's decision surface — a single render exception must never
+ *  white-screen the whole thing. Shows the error inline instead so the failure itself is visible. */
+class ErrorBoundary extends Component<{ children: ReactNode }, { error: Error | null }> {
+  state = { error: null as Error | null };
+  static getDerivedStateFromError(error: Error) { return { error }; }
+  render() {
+    if (this.state.error) {
+      return (
+        <div style={{ background: C.bg, minHeight: '100vh', color: C.bad, padding: 24, fontFamily: 'ui-monospace, monospace' }}>
+          <h2 style={{ color: C.text }}>Research dashboard render error</h2>
+          <pre style={{ whiteSpace: 'pre-wrap' }}>{String(this.state.error?.stack ?? this.state.error)}</pre>
+          <div style={{ color: C.dim, marginTop: 12 }}>The API data is unaffected — this is a display failure. Reload to retry.</div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
 
 function Stat({ label, value, color }: { label: string; value: string; color?: string }) {
   return (
@@ -111,24 +133,117 @@ const VERDICT_COLOR: Record<RGL['lanes'][number]['verdict'], string> = {
   IMPROVED: C.good, WORSENED: C.bad, FLAT: C.dim, INSUFFICIENT: C.measure,
 };
 
+type WinnersCf = {
+  variant: string; closedCompleteBaskets: number; costReturnPct: number;
+  fullBasket: { baskets: number; meanNetReturnPct: number | null; winRatePct: number | null };
+  oracle: { baskets: number; meanNetReturnPct: number | null; winRatePct: number | null; note: string };
+  checkpoints: Array<{
+    checkpointLabel: string; evaluatedBaskets: number; noTradeBaskets: number;
+    meanNetReturnPct: number | null; medianNetReturnPct: number | null; winRatePct: number | null;
+    fullBasketMeanNetReturnPctSameSubset: number | null;
+    persistencePct: number | null; baselineLegPositivePct: number | null;
+  }>;
+  verdict: string;
+};
+
+type RadarCoin = {
+  symbol: string;
+  baseAsset: string;
+  onboardDate: string;
+  ageDays: number;
+  volume24hUsd: number | null;
+  lastPrice: number | null;
+  score: number | null;
+  flags: string[];
+  fundamentals: {
+    name: string;
+    description: string | null;
+    categories: string[];
+    marketCapRank: number | null;
+    marketCapUsd: number | null;
+    fdvUsd: number | null;
+    circulatingRatio: number | null;
+    homepage: string | null;
+    github: string | null;
+    commits4w: number | null;
+  } | null;
+};
+type NewCoinRadar = {
+  enabled: boolean;
+  fetchedAt: string | null;
+  lastError: string | null;
+  staleHours: number | null;
+  maxAgeDays: number;
+  coins: RadarCoin[];
+};
+
+type Moonshot = {
+  daily: { dateUtc: string; tradesToday: number; trades100xToday: number; trades50xPlusToday: number; dailyRealizedLossUsdt: number; activePositions: number };
+  defaultMaxLeverage: number;
+  totalLogged: number;
+  signals24h: number;
+  rejects24h: number;
+  lastCycle: { ts: string; scanned: number; prefiltered: number; signals: number; rejects: number; universe?: string[] } | null;
+  marketCalm: boolean;
+  rejectReasons: Array<{ reason: string; count: number }>;
+  scoreHistogram: number[];
+  recent: Array<{ ts: string; symbol: string; decision: 'SIGNAL' | 'REJECT'; moonshotScore: number; riskScore: number; finalLeverage: number; isSniper: boolean; reasons: string[] }>;
+};
+
 export default function ResearchDashboard() {
+  return (
+    <ErrorBoundary>
+      <ResearchDashboardInner />
+    </ErrorBoundary>
+  );
+}
+
+function ResearchDashboardInner() {
   const [xsec, setXsec] = useState<XSec | null>(null);
   const [rgl, setRgl] = useState<RGL | null>(null);
   const [psle, setPsle] = useState<PSLE | null>(null);
+  const [wcf, setWcf] = useState<WinnersCf | null>(null);
+  const [moon, setMoon] = useState<Moonshot | null>(null);
+  const [radar, setRadar] = useState<NewCoinRadar | null>(null);
   const [updated, setUpdated] = useState<number | null>(null);
   const [err, setErr] = useState<string | null>(null);
 
   async function load() {
+    // Each endpoint fails independently — one broken report must not freeze the others
+    // (the old Promise.all rejected as a unit, so a single 502 stopped ALL cards updating).
+    const grab = async <T,>(url: string): Promise<T | null> => {
+      try {
+        const res = await fetch(url, { cache: 'no-store' });
+        return (await res.json()) as T;
+      } catch { return null; }
+    };
+    const [a, c, d, m, r] = await Promise.all([
+      grab<XSec>('/api/shadow/cross-sectional-report'),
+      grab<RGL>('/api/shadow/regime-gated-lanes'),
+      grab<PSLE>('/api/shadow/per-symbol-lane-edge'),
+      grab<Moonshot>('/api/shadow/moonshot-report'),
+      grab<NewCoinRadar>('/api/shadow/new-coin-radar'),
+    ]);
+    if (a) setXsec(a);
+    if (c) setRgl(c);
+    if (d) setPsle(d);
+    if (m) setMoon(m);
+    if (r) setRadar(r);
+    const failed = [a === null && 'cross-sectional', c === null && 'regime-gated', d === null && 'per-symbol-edge', m === null && 'moonshot'].filter(Boolean);
+    setErr(failed.length ? `unreachable: ${failed.join(', ')}` : null);
+    if (failed.length < 4) setUpdated(Date.now());
+  }
+  // Winners counterfactual: own slower cadence — server caches it 10 min, and a cache-miss
+  // recompute fetches real candles (seconds), so it must never sit inside the 10s loop.
+  async function loadWcf() {
     try {
-      const [a, c, d] = await Promise.all([
-        fetch('/api/shadow/cross-sectional-report', { cache: 'no-store' }).then((r) => r.json()),
-        fetch('/api/shadow/regime-gated-lanes', { cache: 'no-store' }).then((r) => r.json()),
-        fetch('/api/shadow/per-symbol-lane-edge', { cache: 'no-store' }).then((r) => r.json()).catch(() => null),
-      ]);
-      setXsec(a); setRgl(c); setPsle(d); setUpdated(Date.now()); setErr(null);
-    } catch (e) { setErr((e as Error).message); }
+      const res = await fetch('/api/shadow/cross-sectional-winners-counterfactual', { cache: 'no-store' });
+      const body = await res.json();
+      if (body?.ok) setWcf(body as WinnersCf);
+    } catch { /* keep last */ }
   }
   useEffect(() => { void load(); const t = window.setInterval(() => void load(), 10_000); return () => window.clearInterval(t); }, []);
+  useEffect(() => { void loadWcf(); const t = window.setInterval(() => void loadWcf(), 60_000); return () => window.clearInterval(t); }, []);
 
   const r = xsec?.report;
   const rf = xsec?.filteredReport;
@@ -356,6 +471,148 @@ export default function ResearchDashboard() {
             </div>
           </>
         ) : <div style={{ padding: 16, color: C.dim }}>loading…</div>}
+      </Card>
+
+      <Card
+        title="Winners-only counterfactual"
+        subtitle='Tests "open only the good legs" against closed-basket history: hindsight oracle vs realistic late-entry checkpoints (enter at the checkpoint price after a leg proves positive). Persistence = P(still positive at exit | positive at checkpoint).'
+        right={wcf ? <>{wcf.closedCompleteBaskets} baskets · {wcf.variant} · refreshes 10m</> : null}
+      >
+        {wcf ? (
+          <>
+            <div style={{ display: 'flex', flexWrap: 'wrap', borderBottom: `1px solid ${C.border}` }}>
+              <Stat label="Full basket" value={pctRaw(wcf.fullBasket.meanNetReturnPct)} color={tone(wcf.fullBasket.meanNetReturnPct)} />
+              <Stat label="Oracle (hindsight)" value={pctRaw(wcf.oracle.meanNetReturnPct)} color={C.measure} />
+              {wcf.checkpoints.map((c) => (
+                <Stat key={c.checkpointLabel} label={`pick @ ${c.checkpointLabel.split(' ')[0]}`} value={pctRaw(c.meanNetReturnPct)} color={tone(c.meanNetReturnPct)} />
+              ))}
+            </div>
+            <div style={{ padding: '10px 16px' }}>
+              {wcf.checkpoints.map((c) => (
+                <div key={c.checkpointLabel} style={{ display: 'flex', gap: 14, fontSize: 12, color: C.dim, padding: '3px 0', flexWrap: 'wrap' }}>
+                  <span style={{ color: C.text, width: 90 }}>{c.checkpointLabel}</span>
+                  <span>strategy <span style={{ color: tone(c.meanNetReturnPct), fontWeight: 600 }}>{pctRaw(c.meanNetReturnPct)}</span></span>
+                  <span>vs full <span style={{ color: tone(c.fullBasketMeanNetReturnPctSameSubset), fontWeight: 600 }}>{pctRaw(c.fullBasketMeanNetReturnPctSameSubset)}</span></span>
+                  <span>WR {c.winRatePct == null ? '—' : `${Math.round(c.winRatePct)}%`}</span>
+                  <span>persistence <span style={{ color: C.text }}>{c.persistencePct == null ? '—' : `${Math.round(c.persistencePct)}%`}</span> vs base {c.baselineLegPositivePct == null ? '—' : `${Math.round(c.baselineLegPositivePct)}%`}</span>
+                  <span>n={c.evaluatedBaskets}{c.noTradeBaskets > 0 ? ` (${c.noTradeBaskets} no-trade)` : ''}</span>
+                </div>
+              ))}
+              <div style={{ fontSize: 11, color: C.dim, marginTop: 8 }}>{wcf.verdict}</div>
+            </div>
+          </>
+        ) : <div style={{ padding: 16, color: C.dim }}>computing (fetches real candles on first load)…</div>}
+      </Card>
+
+      <Card
+        title="Moonshot lottery — burst hunter (fokus MEME)"
+        subtitle="Measurement-only: scan universe MEME COIN tiap cycle untuk mover yang lagi meledak (1m volume/price surge), skor 0–100, LOG signal-atau-reject. Universe = seed meme divalidasi runtime ke exchangeInfo Binance (simbol delisted/typo dibuang otomatis). Tetap NOL order — eksekusi live (kalau nanti) build terpisah yang lu trigger sendiri."
+        right={moon ? <>{moon.signals24h} signals 24h · lev cap {moon.defaultMaxLeverage}x · report-only</> : null}
+      >
+        {moon ? (
+          <>
+            <div style={{ display: 'flex', flexWrap: 'wrap', borderBottom: `1px solid ${C.border}` }}>
+              <Stat label="Last cycle" value={moon.lastCycle ? `${ago(moon.lastCycle.ts)} ago` : 'never'} color={moon.lastCycle ? C.text : C.bad} />
+              <Stat label="Funnel (last cycle)" value={moon.lastCycle ? `${moon.lastCycle.scanned} → ${moon.lastCycle.prefiltered} → ${moon.lastCycle.signals}✓ / ${moon.lastCycle.rejects}✗` : '—'} color={C.dim} />
+              <Stat label="Signals 24h" value={String(moon.signals24h)} color={moon.signals24h > 0 ? C.good : C.dim} />
+              <Stat label="Rejects 24h" value={String(moon.rejects24h)} color={C.dim} />
+              <Stat label="Logged total" value={String(moon.totalLogged)} color={C.dim} />
+              <Stat label="Trades today" value={`${moon.daily.tradesToday} (100x: ${moon.daily.trades100xToday})`} color={C.dim} />
+            </div>
+            <div style={{ padding: '10px 16px' }}>
+              {moon.lastCycle?.universe && moon.lastCycle.universe.length > 0 && (
+                <div style={{ fontSize: 11, color: C.dim, marginBottom: 8 }}>
+                  universe meme ({moon.lastCycle.universe.length}): {moon.lastCycle.universe.map((s) => s.replace(/USDT$/, '').replace(/^1000|^1M/, '')).join(' · ')}
+                </div>
+              )}
+              {moon.marketCalm && (
+                <div style={{ fontSize: 12, color: C.measure, marginBottom: 8 }}>
+                  market calm — cycle jalan normal tapi tidak ada mover yang lolos prefilter (bukan lane mati, memang belum ada yang meledak)
+                </div>
+              )}
+              <div style={{ display: 'flex', alignItems: 'flex-end', gap: 3, height: 46, marginBottom: 4 }}>
+                {moon.scoreHistogram.map((count, i) => {
+                  const max = Math.max(1, ...moon.scoreHistogram);
+                  return <div key={i} title={`score ${i * 10}–${i * 10 + 9}: ${count}`} style={{ width: 22, height: `${(count / max) * 40 + 2}px`, background: i >= 8 ? C.good : i >= 6 ? C.measure : C.sub, borderRadius: 2 }} />;
+                })}
+              </div>
+              <div style={{ fontSize: 10, color: C.dim, marginBottom: 10 }}>score histogram 0–100 (semua kandidat yang pernah discore — hijau = zona signal)</div>
+              {moon.rejectReasons.length > 0 && (
+                <div style={{ fontSize: 12, color: C.dim, marginBottom: 10 }}>
+                  top reject: {moon.rejectReasons.slice(0, 5).map((r) => `${r.reason} (${r.count})`).join(' · ')}
+                </div>
+              )}
+              {moon.recent.length > 0 ? (
+                <div>
+                  {moon.recent.slice(-8).reverse().map((e, idx) => (
+                    <div key={`${e.ts}-${e.symbol}-${idx}`} style={{ display: 'flex', gap: 12, fontSize: 12, padding: '3px 0', borderTop: `1px solid ${C.sub}`, flexWrap: 'wrap' }}>
+                      <span style={{ color: C.dim, width: 70 }}>{ago(e.ts)} ago</span>
+                      <span style={{ color: C.text, fontWeight: 600, width: 80 }}>{e.symbol.replace(/USDT$/, '')}</span>
+                      <span style={{ color: e.decision === 'SIGNAL' ? C.good : C.bad, fontWeight: 700, width: 60 }}>{e.decision}</span>
+                      <span style={{ color: C.dim }}>score {e.moonshotScore}</span>
+                      <span style={{ color: C.dim }}>lev {e.finalLeverage}x{e.isSniper ? ' · sniper' : ''}</span>
+                      <span style={{ color: C.dim, flex: 1, minWidth: 180, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }} title={e.reasons.join('; ')}>{e.reasons[0] ?? ''}</span>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div style={{ fontSize: 12, color: C.dim }}>belum ada kandidat yang discore — log terisi begitu ada mover yang lolos prefilter</div>
+              )}
+            </div>
+          </>
+        ) : <div style={{ padding: 16, color: C.dim }}>loading moonshot report…</div>}
+      </Card>
+
+      <Card
+        title="New-coin radar — listing baru + profil fundamental"
+        subtitle={`Perpetual USDT yang baru listing di Binance (≤${radar?.maxAgeDays ?? 120} hari, dari onboardDate resmi exchange), di luar universe lama. Tiap coin diprofil dari CoinGecko: apa proyeknya, teknologi/kategori, mcap vs FDV (risiko dilusi), aktivitas developer. Report-only — promosi ke universe tetap keputusan operator.`}
+        right={radar ? <>{radar.coins.length} coin · refresh 12 jam{radar.staleHours != null ? ` · ${radar.staleHours}h lalu` : ''}</> : null}
+      >
+        {radar ? (
+          radar.coins.length > 0 ? (
+            <div style={{ padding: '6px 16px 14px' }}>
+              {radar.lastError && <div style={{ color: C.bad, fontSize: 12, padding: '6px 0' }}>radar error: {radar.lastError}</div>}
+              {radar.coins.map((c) => (
+                <div key={c.symbol} style={{ borderTop: `1px solid ${C.sub}`, padding: '10px 0' }}>
+                  <div style={{ display: 'flex', gap: 12, alignItems: 'baseline', flexWrap: 'wrap' }}>
+                    <span style={{ color: C.text, fontWeight: 700, fontSize: 14 }}>{c.symbol.replace(/USDT$/, '')}</span>
+                    <span style={{ color: C.dim, fontSize: 12 }}>umur {Math.round(c.ageDays)} hari</span>
+                    <span style={{ color: c.score == null ? C.dim : c.score >= 60 ? C.good : c.score >= 35 ? C.measure : C.bad, fontWeight: 700, fontSize: 13 }}>
+                      skor {c.score ?? '—'}
+                    </span>
+                    {c.fundamentals?.categories?.slice(0, 3).map((cat) => (
+                      <span key={cat} style={{ color: C.measure, fontSize: 11, border: `1px solid ${C.border}`, borderRadius: 4, padding: '1px 6px' }}>{cat}</span>
+                    ))}
+                    {c.flags.map((f) => (
+                      <span key={f} style={{ color: C.bad, fontSize: 10, fontWeight: 700 }}>{f}</span>
+                    ))}
+                  </div>
+                  <div style={{ display: 'flex', gap: 16, fontSize: 12, color: C.dim, marginTop: 4, flexWrap: 'wrap' }}>
+                    <span>vol 24h {c.volume24hUsd == null ? '—' : `$${(c.volume24hUsd / 1e6).toFixed(1)}M`}</span>
+                    <span>mcap {c.fundamentals?.marketCapUsd == null ? '—' : `$${(c.fundamentals.marketCapUsd / 1e6).toFixed(0)}M`}{c.fundamentals?.marketCapRank != null ? ` (#${c.fundamentals.marketCapRank})` : ''}</span>
+                    <span>FDV {c.fundamentals?.fdvUsd == null ? '—' : `$${(c.fundamentals.fdvUsd / 1e6).toFixed(0)}M`}</span>
+                    <span>circulating {c.fundamentals?.circulatingRatio == null ? '—' : `${Math.round(c.fundamentals.circulatingRatio * 100)}%`}</span>
+                    <span>commits 4w {c.fundamentals?.commits4w ?? '—'}</span>
+                    {c.fundamentals?.homepage && <a href={c.fundamentals.homepage} target="_blank" rel="noreferrer" style={{ color: C.measure }}>web</a>}
+                    {c.fundamentals?.github && <a href={c.fundamentals.github} target="_blank" rel="noreferrer" style={{ color: C.measure }}>github</a>}
+                  </div>
+                  {c.fundamentals?.description && (
+                    <div style={{ fontSize: 12, color: C.text, opacity: 0.85, marginTop: 6, lineHeight: 1.5, maxWidth: 900 }}>
+                      {c.fundamentals.description.length > 300 ? `${c.fundamentals.description.slice(0, 300)}…` : c.fundamentals.description}
+                    </div>
+                  )}
+                </div>
+              ))}
+              <div style={{ fontSize: 11, color: C.dim, marginTop: 10 }}>
+                Skor = likuiditas (log vol 24h) + circulating ratio + rank mcap + aktivitas dev + kelengkapan identitas. Skor — / flag NO_FUNDAMENTAL_DATA = datanya belum ada, bukan nol.
+              </div>
+            </div>
+          ) : (
+            <div style={{ padding: 16, color: C.dim }}>
+              {radar.lastError ? `radar error: ${radar.lastError}` : radar.fetchedAt ? `tidak ada listing baru ≤${radar.maxAgeDays} hari di luar universe` : 'cycle pertama belum jalan (nunggu scan berikutnya)…'}
+            </div>
+          )
+        ) : <div style={{ padding: 16, color: C.dim }}>loading new-coin radar…</div>}
       </Card>
 
     </div>

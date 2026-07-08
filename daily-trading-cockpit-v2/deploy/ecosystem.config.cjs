@@ -8,7 +8,10 @@
 // system OOM-kill) once RSS crosses it. NODE_OPTIONS caps the V8 heap itself,
 // below the RSS ceiling, so a leak surfaces as a catchable/loggable V8 condition
 // before the OS ever has to intervene. Sized for a 7.8GB box running all 3
-// api instances + web + kronos side by side (worst case ~4.6GB, leaves ~3GB free).
+// api instances + web + kronos side by side (worst case ~6.2GB, leaves ~1.6GB free).
+// 2026-07-07: api heap 512→1024 (RSS ceiling 768M→1280M) — at 512MB the api hit the
+// V8 heap limit every 1.5-3h in production; each pm2 auto-restart also silently
+// disarmed the live engine, which is what made live miss its trading windows.
 const path = require("node:path");
 
 const apps = [
@@ -20,8 +23,8 @@ const apps = [
     max_restarts: 100,
     restart_delay: 5000,
     time: true,
-    max_memory_restart: "768M",
-    env: { NODE_OPTIONS: "--max-old-space-size=512" },
+    max_memory_restart: "1280M",
+    env: { NODE_OPTIONS: "--max-old-space-size=1024" },
   },
   {
     name: "dtc-web",

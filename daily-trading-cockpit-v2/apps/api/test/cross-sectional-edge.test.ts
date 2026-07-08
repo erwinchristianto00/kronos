@@ -16,6 +16,11 @@ import {
   CROSS_SECTIONAL_TREND_SIGNAL,
   CROSS_SECTIONAL_MIXED_SIGNAL,
   buildCrossSectionalRegimeContext,
+  CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST,
+  CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST,
+  CROSS_SECTIONAL_TREND_LONG_ALLOWLIST,
+  CROSS_SECTIONAL_TREND_SHORT_ALLOWLIST,
+  regimeSkewedK,
   type ScoredSymbol,
   type CrossSectionalObservation,
 } from "../src/lib/cross-sectional-edge.js";
@@ -295,6 +300,102 @@ describe("cross-sectional-edge — market-neutral measurement lane", () => {
   });
 });
 
+describe("regimeSkewedK — regime-conditioned basket composition (2026-07-08)", () => {
+  it("stays symmetric when the score is null/missing", () => {
+    expect(regimeSkewedK(3, null)).toEqual({ longK: 3, shortK: 3 });
+  });
+
+  it("stays symmetric inside the neutral zone (|score| <= boundary)", () => {
+    expect(regimeSkewedK(3, 0.05)).toEqual({ longK: 3, shortK: 3 });
+    expect(regimeSkewedK(3, -0.05)).toEqual({ longK: 3, shortK: 3 });
+    expect(regimeSkewedK(3, 0.12)).toEqual({ longK: 3, shortK: 3 }); // boundary itself must be CROSSED
+    expect(regimeSkewedK(3, -0.12)).toEqual({ longK: 3, shortK: 3 });
+  });
+
+  it("favors longs once the score crosses the bull boundary", () => {
+    expect(regimeSkewedK(3, 0.13)).toEqual({ longK: 4, shortK: 2 });
+  });
+
+  it("favors shorts once the score crosses the bear boundary", () => {
+    expect(regimeSkewedK(3, -0.13)).toEqual({ longK: 2, shortK: 4 });
+  });
+
+  it("never drops the disfavored side to 0, even with a large delta", () => {
+    expect(regimeSkewedK(1, 0.5, { delta: 5 })).toEqual({ longK: 1, shortK: 1 }); // baseK=1 has no room to skew
+    expect(regimeSkewedK(2, -0.5, { delta: 5 })).toEqual({ longK: 1, shortK: 3 }); // capped at baseK-1=1
+  });
+
+  it("respects custom zoneBoundary and delta overrides", () => {
+    expect(regimeSkewedK(3, 0.2, { zoneBoundary: 0.3 })).toEqual({ longK: 3, shortK: 3 }); // wider neutral zone
+    expect(regimeSkewedK(3, 0.13, { delta: 2 })).toEqual({ longK: 5, shortK: 1 });
+  });
+});
+
+describe("[SKEW] buildCrossSectionalBasket with asymmetric longK/shortK", () => {
+  it("selects the actual per-side counts, not just a single shared k", () => {
+    const b = buildCrossSectionalBasket(
+      scored([["A", 0.9, 10], ["B", 0.7, 20], ["C", 0.5, 30], ["D", -0.1, 40], ["E", -0.3, 50]]),
+      { k: 3, longK: 4, shortK: 1, signal: "MOM", now: T0, openedAtMs: T0ms, horizonMs: CROSS_SECTIONAL_HORIZON_MS },
+    )!;
+    expect(b).not.toBeNull();
+    expect(b.longLeg.map((l) => l.symbol)).toEqual(["A", "B", "C", "D"]);
+    expect(b.shortLeg.map((l) => l.symbol)).toEqual(["E"]);
+    expect(b.longK).toBe(4);
+    expect(b.shortK).toBe(1);
+  });
+
+  it("falls back to k on both sides when longK/shortK are omitted (unchanged existing behavior)", () => {
+    const b = buildCrossSectionalBasket(
+      scored([["A", 0.5, 10], ["B", 0.3, 20], ["C", -0.1, 30], ["D", -0.4, 40]]),
+      { k: 2, signal: "MOM", now: T0, openedAtMs: T0ms, horizonMs: CROSS_SECTIONAL_HORIZON_MS },
+    )!;
+    expect(b.longK).toBe(2);
+    expect(b.shortK).toBe(2);
+  });
+
+  it("still requires enough names for the SKEWED count on each side", () => {
+    const b = buildCrossSectionalBasket(
+      scored([["A", 0.5, 10], ["B", 0.3, 20], ["C", -0.1, 30]]),
+      { k: 3, longK: 4, shortK: 1, signal: "MOM", now: T0, openedAtMs: T0ms, horizonMs: CROSS_SECTIONAL_HORIZON_MS },
+    );
+    expect(b).toBeNull(); // only 2 non-long names left, needs 4 longs total from a 3-symbol universe
+  });
+});
+
+describe("[CLUSTER-CAP] buildCrossSectionalBasket with maxPerCluster (2026-07-08)", () => {
+  // Real default-map clusters: SOLUSDT/AVAXUSDT/SUIUSDT/NEARUSDT = L1, ARBUSDT/OPUSDT = L2_DEFI,
+  // BTCUSDT/ETHUSDT = MAJORS (exempt from the cap).
+  it("skips a same-cluster candidate past the cap, picking the next-best DIFFERENT cluster instead", () => {
+    const b = buildCrossSectionalBasket(
+      scored([
+        ["SOLUSDT", 0.9, 10], ["AVAXUSDT", 0.8, 20], ["SUIUSDT", 0.7, 30], // 3x L1, best-scored
+        ["ARBUSDT", 0.6, 40], // L2_DEFI, next-best after the L1 cap trips
+        ["DOGEUSDT", -0.5, 50], ["WLDUSDT", -0.6, 60], ["FETUSDT", -0.7, 70], // short-side supply
+      ]),
+      { k: 3, maxPerCluster: 2, signal: "MOM", now: T0, openedAtMs: T0ms, horizonMs: CROSS_SECTIONAL_HORIZON_MS },
+    )!;
+    expect(b).not.toBeNull();
+    // SOL + AVAX fill the L1 cap (2); SUI (3rd L1) is skipped; ARB (L2_DEFI) fills the 3rd slot.
+    expect(b.longLeg.map((l) => l.symbol)).toEqual(["SOLUSDT", "AVAXUSDT", "ARBUSDT"]);
+  });
+
+  it("exempts MAJORS (BTC/ETH) from the cluster cap", () => {
+    const b = buildCrossSectionalBasket(
+      scored([["BTCUSDT", 0.9, 10], ["ETHUSDT", 0.8, 20], ["SOLUSDT", 0.1, 30], ["ARBUSDT", -0.1, 40]]),
+      { k: 2, maxPerCluster: 1, signal: "MOM", now: T0, openedAtMs: T0ms, horizonMs: CROSS_SECTIONAL_HORIZON_MS },
+    )!;
+    expect(b.longLeg.map((l) => l.symbol)).toEqual(["BTCUSDT", "ETHUSDT"]); // both MAJORS, cap=1 would otherwise block the 2nd
+  });
+
+  it("disabled (maxPerCluster unset/0) behaves exactly like the pre-existing top-k sort", () => {
+    const b = buildCrossSectionalBasket(
+      scored([["SOLUSDT", 0.9, 10], ["AVAXUSDT", 0.8, 20], ["SUIUSDT", 0.7, 30]]),
+      { k: 3, signal: "MOM", now: T0, openedAtMs: T0ms, horizonMs: CROSS_SECTIONAL_HORIZON_MS },
+    );
+    expect(b).toBeNull(); // needs 2*k=6 names total; unaffected by the cluster cap either way
+  });
+});
+
 const BAR_FUDGE = 60 * 60_000 + 1000; // one 1h bar + a little, to push past the horizon
 
 describe("deriveAdaptiveSymbolFilters — demotes toxic symbols inside hard operator lists", () => {
@@ -346,5 +447,69 @@ describe("deriveAdaptiveSymbolFilters — demotes toxic symbols inside hard oper
     expect(f.longAllowlist).toContain("SOLUSDT");
     expect(f.shortAllowlist).toContain("DOGEUSDT");
     expect(f.longBlocklist).toEqual([]);
+  });
+
+  // [FLOOR] 2026-07-07 audit: demotion has no recovery path (a demoted symbol only regains
+  // eligibility via a NEW closed basket remeasuring it, but no new baskets form once a side
+  // drops below k legs) — a PERMANENT lockout, not a temporary one. This silently stopped ALL
+  // SHORT-side baskets on live for ~18h once every configured short symbol got demoted.
+  it("[FLOOR] falls back to the full allowlist when demotions would starve a side below minEligiblePerSide", () => {
+    const store = freshStore();
+    // Demote every default SHORT-allowlist symbol (DOGEUSDT, OPUSDT, 1000PEPEUSDT, SEIUSDT, WLDUSDT)
+    // with 3 losing legs each — effective short allowlist would be 0, well under k=3.
+    const shortSymbols = ["DOGEUSDT", "OPUSDT", "1000PEPEUSDT", "SEIUSDT", "WLDUSDT"];
+    for (let i = 0; i < 3; i++) {
+      store.add(
+        closedObs(
+          `s${i}`,
+          [["SOLUSDT", 100, 102]], // long side stays healthy (1 winner, not enough to demote/matter)
+          shortSymbols.map((sym): [string, number, number] => [sym, 1, 1.02]), // price rose ⇒ short loses
+        ) as never,
+      );
+    }
+    const f = deriveAdaptiveSymbolFilters(store, { minEligiblePerSide: 3 });
+    expect(f.provenance.demotedShort.sort()).toEqual(shortSymbols.sort());
+    // Floor kicked in: falls back to the FULL configured short allowlist, not the (empty) demoted one.
+    expect(f.provenance.shortFloorApplied).toBe(true);
+    expect(f.shortAllowlist.sort()).toEqual(shortSymbols.sort());
+    // The floor also resets this side's blocklist — a floored symbol must not still be blocked,
+    // or the floor would be a no-op (allowlist says yes, blocklist says no).
+    for (const sym of shortSymbols) expect(f.shortBlocklist).not.toContain(sym);
+    // Long side wasn't starved — no floor, ordinary demotion behavior unaffected.
+    expect(f.provenance.longFloorApplied).toBe(false);
+    expect(f.provenance.minEligiblePerSide).toBe(3);
+  });
+
+  it("[FLOOR] does not trigger when enough symbols survive demotion", () => {
+    const store = freshStore();
+    // Demote only ONE of five short symbols — 4 remain, still >= k=3, no floor needed.
+    for (let i = 0; i < 3; i++) {
+      store.add(closedObs(`o${i}`, [], [["DOGEUSDT", 1, 1.02]]) as never);
+    }
+    const f = deriveAdaptiveSymbolFilters(store, { minEligiblePerSide: 3 });
+    expect(f.provenance.shortFloorApplied).toBe(false);
+    expect(f.shortAllowlist).not.toContain("DOGEUSDT");
+    expect(f.shortAllowlist).toContain("OPUSDT"); // untouched, still eligible
+  });
+
+  // [SYMBOL-NAME] 2026-07-07: "PEPEUSDT" is not a real Binance futures symbol (the exchange lists
+  // it as "1000PEPEUSDT", a 1000x-multiplier contract — confirmed against the real exchangeInfo
+  // and klines endpoints on both mainnet and testnet, both reject plain "PEPEUSDT" as invalid).
+  // A basket containing the wrong name as a leg silently failed to size at getExchangeFilters()
+  // in the executor, with no error surfaced. Guard against this exact typo recurring in any of
+  // the default allow/blocklists.
+  it("[SYMBOL-NAME] no default allowlist references the invalid bare 'PEPEUSDT' symbol", () => {
+    const lists = [
+      CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST,
+      CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST,
+      CROSS_SECTIONAL_TREND_LONG_ALLOWLIST,
+      CROSS_SECTIONAL_TREND_SHORT_ALLOWLIST,
+    ];
+    for (const list of lists) {
+      expect(list.has("PEPEUSDT")).toBe(false);
+    }
+    // The correctly-named contract should still be reachable where the old lists referenced it.
+    expect(CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST.has("1000PEPEUSDT")).toBe(true);
+    expect(CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST.has("1000PEPEUSDT")).toBe(true);
   });
 });

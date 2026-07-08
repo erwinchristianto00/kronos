@@ -977,6 +977,14 @@ interface ShortFadeReport {
   wr: number | null;
   edgeReady: boolean;
   topRecent: Array<{ symbol: string; netR: number | null; status: string; exitReason: string | null; openedAt: string; rsiAtEntry: number; fundingBps: number | null }>;
+  cycleMeta?: {
+    lastCycleAt: string | null;
+    cycles: number;
+    rsiCandidatesTotal: number;
+    crowdingRejectedTotal: number;
+    recordedTotal: number;
+    lastCycleError: string | null;
+  } | null;
 }
 
 interface LiveLaneExposure {
@@ -1316,6 +1324,24 @@ export default function NeuralMindmap() {
             <div><span>PF</span><strong>{fmtNumber(shortFade.pf)}</strong></div>
             <div><span>WR</span><strong>{shortFade.wr === null ? 'n/a' : `${(shortFade.wr * 100).toFixed(1)}%`}</strong></div>
           </div>
+          {(() => {
+            // Liveness + gate funnel: an empty book is only trustworthy if the cycle is visibly
+            // alive — "0 obs, cycle 3m ago, RSI gate never passed" is a waiting lane; a stale
+            // lastCycleAt or lastCycleError is a broken one.
+            const m = shortFade.cycleMeta;
+            if (!m) return null;
+            const ageMin = m.lastCycleAt ? Math.round((Date.now() - new Date(m.lastCycleAt).getTime()) / 60000) : null;
+            const stale = ageMin === null || ageMin > 30;
+            return (
+              <p className="neural-section-note" style={{ marginTop: 6 }}>
+                <span className={m.lastCycleError ? 'tone-critical' : stale ? 'tone-critical' : 'tone-healthy'}>
+                  {m.lastCycleError ? `cycle ERROR: ${m.lastCycleError}` : stale ? `cycle STALE (${ageMin === null ? 'never ran' : `${ageMin}m ago`})` : `alive · cycle ${ageMin}m ago`}
+                </span>
+                {' '}· {m.cycles} cycles since deploy · gate funnel: RSI-confirmed <b>{m.rsiCandidatesTotal}</b> → crowding rejected <b>{m.crowdingRejectedTotal}</b> → entered <b>{m.recordedTotal}</b>
+                {m.rsiCandidatesTotal === 0 && ' — the market has not produced a single RSI-overbought exhaustion on this universe yet (empty book = waiting, not broken)'}
+              </p>
+            );
+          })()}
           {shortFade.topRecent.length > 0 && (
             <div className="neural-shortfade-recent">
               {shortFade.topRecent.slice(0, 6).map((r, i) => (

@@ -24,7 +24,7 @@
  *    manual approval.
  */
 
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 
 import { type ShadowPosition } from "@dtc/shared";
@@ -165,6 +165,30 @@ const EXPIRY_MS = 7 * 24 * 60 * 60 * 1000;
 /** Max EXPIRED observations retained for the diagnostic count display; older ones are pruned from
  *  the store each resolve pass (they feed no stat). Bounds memory after the born-stale gate. */
 const VM_MAX_EXPIRED_OBS = Number(process.env.VM_MAX_EXPIRED_OBS) || 500;
+/** Cap PER TERMINAL STATUS (CLOSED_WIN/CLOSED_LOSS/REJECTED/NO_FILL/DATA_FAILURE, each
+ *  independently) — bounds unbounded long-run growth while staying well above any promotion-gate
+ *  sample-size need (PROMOTION_MIN_FRESH=200 below, shared across ~20-25 variants ⇒ ~200-250/variant
+ *  average at this cap — right at the real floor with headroom). Unlike EXPIRED, these statuses feed
+ *  real edge/PBO/backtest measurement (2026-07-07 audit: 22 files read them), so dropped records are
+ *  archived to an append-only JSONL file next to the store — never discarded — for any offline
+ *  analysis that wants deeper history than the live in-memory cap retains. First found via a
+ *  cross-instance OOM audit: main's UNCAPPED store had reached 197MB/153k observations (81k
+ *  CLOSED_WIN + 42k CLOSED_LOSS alone) and was crashing ~19x more often than testnet/live's 27MB
+ *  stores — that pass added a 15000/status cap. 2026-07-08: OOM was STILL recurring roughly daily
+ *  on every instance after that fix — the store simply refills to the cap (confirmed: 3101 sitting
+ *  at exactly 15030/15000/15000 CLOSED_WIN/CLOSED_LOSS/REJECTED, 52,947 total, 70MB on disk) and a
+ *  60k-observation array held permanently in memory + re-iterated by every measurement-report
+ *  builder on every dashboard poll is enough on its own to tip a 1024MB heap. Second-pass cut to
+ *  5000 (60k→20k terminal ceiling) — DATA_FAILURE was ALSO missing from this list entirely (the one
+ *  status with literally no bound, though empty in practice so far; added defensively). */
+const VM_MAX_TERMINAL_OBS_PER_STATUS = Number(process.env.VM_MAX_TERMINAL_OBS_PER_STATUS) || 5000;
+const VM_PRUNABLE_TERMINAL_STATUSES: VariantObservationStatus[] = [
+  "CLOSED_WIN",
+  "CLOSED_LOSS",
+  "REJECTED",
+  "NO_FILL",
+  "DATA_FAILURE",
+];
 /** Open observations older than this threshold are surfaced as "stale" in diagnostics. */
 const STALE_OPEN_WARN_MS = 72 * 60 * 60 * 1000; // 72 h
 const DEFAULT_MAX_HOLD_MS = STALE_OPEN_WARN_MS;
@@ -242,6 +266,16 @@ export interface VariantMatrixVariantDefinition {
   paperRiskMultiplier?: number;
   /** Explicit marker for high-risk diagnostic lanes. */
   experimentalOnly?: boolean;
+  /** Symbols this variant must NEVER open in the REAL mirror (checked in lane-selector-v2.ts),
+   *  regardless of direction/regime. Measurement (this store) still records observations for
+   *  every symbol — only live/testnet admission is restricted — so OOS proof continues collecting
+   *  in case a blocked symbol's edge recovers. 2026-07-08 operator audit: CG_WIDE_FAST_SHORT's
+   *  pooled stats looked flat-to-negative on testnet/live (WR ~55%, meanR ~-0.2) despite the SAME
+   *  week (07-w0) showing WLD/SUI/FET at 87-100% WR — the pooled average was being dragged down by
+   *  NEAR/INJ/XRP/SEI, which sat at 17-48% WR (well under the 66.7% breakeven bar for a 0.5R
+   *  target) in that SAME week, on BOTH instances independently. Not a regime-timing artifact
+   *  (SUI/WLD/FET improved in the identical window) — genuine per-symbol underperformance. */
+  excludedSymbols?: readonly string[];
 }
 
 export const VARIANT_MATRIX_DEFINITIONS: readonly VariantMatrixVariantDefinition[] = [
@@ -384,6 +418,9 @@ export const VARIANT_MATRIX_DEFINITIONS: readonly VariantMatrixVariantDefinition
     stopFloorBps: 300,
     tpRewardMultiple: 0.5,
     shortOnly: true,
+    // 2026-07-08: NEAR/INJ/XRP/SEI excluded from REAL admission after a per-symbol audit (see
+    // excludedSymbols doc above) — WLD/DOGE/SUI/FET verified good in the same window, kept.
+    excludedSymbols: ["NEARUSDT", "INJUSDT", "XRPUSDT", "SEIUSDT"],
     description:
       "Fast-take-profit SHORT: wide >=300bps stop with a near 0.5R target. Shorts in this universe " +
       "mean-revert up, so a far TP (runner) loses badly (−0.47R) while banking quickly at 0.5R is " +
@@ -868,6 +905,56 @@ export class CurrentGuardVariantMatrixStore {
     const pruned = before - this.observations.length;
     if (pruned > 0) this.save();
     return pruned;
+  }
+
+  /** Same bound-memory purpose as pruneExpired, but for the terminal statuses that DO feed real
+   *  measurement — so dropped records are archived (see archiveDropped), never discarded. Keeps
+   *  the newest `maxPerStatus` of each status in VM_PRUNABLE_TERMINAL_STATUSES independently.
+   *  OPEN and EXPIRED are untouched (EXPIRED has its own cap via pruneExpired; OPEN must never
+   *  be dropped while still live). Returns count pruned. */
+  pruneTerminal(maxPerStatus: number): number {
+    const tsOf = (o: CurrentGuardVariantMatrixObservation) =>
+      toMs(o.resolvedAt) ?? toMs(o.updatedAt) ?? toMs(o.createdAt) ?? 0;
+    const keepIds = new Set<string>();
+    for (const status of VM_PRUNABLE_TERMINAL_STATUSES) {
+      const ofStatus = this.observations.filter((obs) => obs.status === status);
+      const kept = ofStatus.length <= maxPerStatus
+        ? ofStatus
+        : ofStatus.sort((a, b) => tsOf(b) - tsOf(a)).slice(0, maxPerStatus);
+      for (const obs of kept) keepIds.add(obs.observationId);
+    }
+    const before = this.observations.length;
+    const dropped: CurrentGuardVariantMatrixObservation[] = [];
+    this.observations = this.observations.filter((obs) => {
+      const prunable = VM_PRUNABLE_TERMINAL_STATUSES.includes(obs.status);
+      const keepIt = !prunable || keepIds.has(obs.observationId);
+      if (!keepIt) dropped.push(obs);
+      return keepIt;
+    });
+    for (const obs of dropped) {
+      this.observationKeySet.delete(observationKey(obs.sourceObservationKey, obs.variantId));
+    }
+    const pruned = before - this.observations.length;
+    if (pruned > 0) {
+      this.archiveDropped(dropped);
+      this.save();
+    }
+    return pruned;
+  }
+
+  /** Best-effort append-only archive for pruneTerminal's dropped records — never loaded back
+   *  into memory during normal operation, so its own size never contributes to the OOM risk
+   *  this whole mechanism exists to bound. Archiving failure must never block the prune it
+   *  guards (losing the archive write is far better than an unbounded live store). */
+  private archiveDropped(dropped: CurrentGuardVariantMatrixObservation[]): void {
+    if (dropped.length === 0) return;
+    try {
+      const archiveFile = this.file.replace(/\.json$/, "-archive.jsonl");
+      const lines = dropped.map((obs) => JSON.stringify(obs)).join("\n") + "\n";
+      appendFileSync(archiveFile, lines, "utf-8");
+    } catch {
+      // best-effort: archiving must never block the live-store prune
+    }
   }
 }
 
@@ -1601,6 +1688,9 @@ export async function resolveVariantMatrixObservations(
     // ── Phase 1b: bound memory — prune EXPIRED beyond the retain cap (feeds no stat). The born-stale
     //    mirror gate stops new EXPIRED at the source; this clears the accumulated churn backlog. ──
     store.pruneExpired(VM_MAX_EXPIRED_OBS);
+    // ── Phase 1c: bound memory for terminal statuses that DO feed measurement — archives the
+    //    dropped records first (see pruneTerminal/archiveDropped) instead of discarding them. ──
+    store.pruneTerminal(VM_MAX_TERMINAL_OBS_PER_STATUS);
 
     // ── Phase 2: fetch-walk the remaining young OPEN obs, oldest-first BUT starting from a
     //    ROTATING cursor. Pure oldest-first re-walked the same (genuinely unresolvable) oldest

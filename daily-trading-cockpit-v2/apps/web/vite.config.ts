@@ -3,12 +3,18 @@ import react from '@vitejs/plugin-react';
 
 const apiTarget = process.env.VITE_API_PROXY_TARGET ?? 'http://localhost:3101';
 const testnetApiTarget = process.env.VITE_TESTNET_API_PROXY_TARGET ?? 'http://localhost:3102';
+const liveApiTarget = process.env.VITE_LIVE_API_PROXY_TARGET ?? 'http://localhost:3103';
 
 const proxy = {
   '/testnet/api': {
     target: testnetApiTarget,
     changeOrigin: true,
     rewrite: (path: string) => path.replace(/^\/testnet/, ''),
+  },
+  '/live/api': {
+    target: liveApiTarget,
+    changeOrigin: true,
+    rewrite: (path: string) => path.replace(/^\/live/, ''),
   },
   '/api': {
     target: apiTarget,

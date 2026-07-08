@@ -22,11 +22,20 @@ import { dirname, resolve } from "node:path";
 import { resolveConfirmedFillPrice, type BinanceFuturesPrivateClient, type FillPriceResolution } from "./binance-futures-private.js";
 import {
   CROSS_SECTIONAL_ROUNDTRIP_BPS,
+  deriveAdaptiveSymbolFilters,
   type CrossSectionalObservation,
   type CrossSectionalStore,
 } from "./cross-sectional-edge.js";
 
 export const CROSS_SECTIONAL_MARKET_NEUTRAL_LANE_ID = "CROSS_SECTIONAL_MARKET_NEUTRAL";
+/** 2026-07-08: lane ids for the two additional executor instances (see CrossSectionalExecutorOptions
+ *  targetVariant/laneId) that mirror the TREND_BETA_VOL / MIXED_MEAN_REVERSION measured variants.
+ *  Each variant's own signal production already regime-gates itself (TREND_LONG/SHORT and
+ *  MIXED_CHOP respectively, see cross-sectional-edge.ts's runCrossSectionalCycle) — these lane ids
+ *  just let the operator/autopilot separately control the executor's allocation weight, same as
+ *  every other lane. */
+export const CROSS_SECTIONAL_TREND_LANE_ID = "CROSS_SECTIONAL_TREND";
+export const CROSS_SECTIONAL_MIXED_LANE_ID = "CROSS_SECTIONAL_MIXED";
 
 export type CrossSectionalExecClient = Pick<
   BinanceFuturesPrivateClient,
@@ -35,6 +44,15 @@ export type CrossSectionalExecClient = Pick<
 
 export function isCrossSectionalExecEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return env.CROSS_SECTIONAL_EXEC_ENABLED === "1";
+}
+
+/** 2026-07-07 operator decision: cross-sectional is the FOUNDATION strategy and must run at full
+ *  size regardless of the lane-allocation selector — the selector becomes purely the control for
+ *  the DIRECTIONAL mirror slot. Without this flag the executor's leg sizing was scaled by the
+ *  selector's CROSS_SECTIONAL weight, so picking any directional allocation silently shrank (or
+ *  zeroed) the foundation strategy. Armed/kill-switch gating is NOT affected by this flag. */
+export function isCrossSectionalAllocationIndependent(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.CROSS_SECTIONAL_ALLOCATION_INDEPENDENT === "1";
 }
 
 const LEG_USD = () => {
@@ -79,6 +97,15 @@ const TP_NET_RETURN = () => {
   const n = Number.parseFloat(process.env.CROSS_SECTIONAL_EXEC_TP_NET_RETURN ?? "");
   return Number.isFinite(n) && n > 0 ? n : 0.006;
 };
+/** Basket-level safety breaker (2026-07-07 operator: "safety net, bukan profit killer"): when the
+ *  day's REALIZED basket losses breach this, STOP OPENING new baskets until UTC midnight. Open
+ *  baskets keep running their own exits untouched — they are hedged and horizon-bounded, and
+ *  force-flattening a hedge that can still recover would be exactly the profit-killer this is
+ *  deliberately not. 0 = disabled. */
+const XSEC_DAILY_MAX_LOSS_USD = () => {
+  const n = Number.parseFloat(process.env.CROSS_SECTIONAL_DAILY_MAX_LOSS_USD ?? "");
+  return Number.isFinite(n) && n > 0 ? n : 0;
+};
 
 export interface ExecutorLeg {
   symbol: string;
@@ -110,6 +137,11 @@ export interface ExecutorBasket {
   grossPnlUsd: number | null;
   feeEstimateUsd: number | null;
   netPnlUsd: number | null;
+  /** Stamped by every profit-target check (5-min tick): the basket's CURRENT net return vs the
+   *  TP threshold, so the dashboard can show the live TP gap per basket — "tinggal berapa lagi,
+   *  bakal nyampe atau engga, ada yang macet atau engga" (2026-07-07 operator ask). */
+  lastNetReturn?: number | null;
+  lastNetAt?: string | null;
 }
 
 interface ExecutorState {
@@ -123,8 +155,8 @@ export class CrossSectionalExecutorStore {
   private readonly file: string;
   private state: ExecutorState;
 
-  constructor(dataDir = "data") {
-    this.file = resolve(dataDir, "cross-sectional-executor.json");
+  constructor(dataDir = "data", fileName = "cross-sectional-executor.json") {
+    this.file = resolve(dataDir, fileName);
     try {
       mkdirSync(dirname(this.file), { recursive: true });
     } catch {
@@ -176,6 +208,19 @@ export interface CrossSectionalExecutorOptions {
   nowIso?: () => string;
   /** Delay between queryOrder confirmation retries in resolveFillPrice. Default 400ms; tests pass 0. */
   fillConfirmRetryDelayMs?: number;
+  /** Daily basket loss breaker limit override (tests inject; default reads
+   *  CROSS_SECTIONAL_DAILY_MAX_LOSS_USD — env mutation in tests leaks across vitest workers). */
+  dailyMaxLossUsd?: () => number;
+  /** 2026-07-08 (operator: "wire lane baru ke allocation selection"): which measured cross-sectional
+   *  variant THIS executor instance mirrors. Defaults to the original global env read
+   *  (CROSS_SECTIONAL_EXEC_VARIANT, "FILTERED") so the existing single-instance construction is
+   *  byte-for-byte unchanged. Explicit override lets app.ts run MULTIPLE executor instances
+   *  concurrently — one per variant (FILTERED/TREND_BETA_VOL/MIXED_MEAN_REVERSION) — each with its
+   *  own lane id + allocation weight, instead of one global instance stuck on a single variant. */
+  targetVariant?: string;
+  /** Lane id this instance reports in getStatus()/laneWeightPct lookups. Defaults to the original
+   *  CROSS_SECTIONAL_MARKET_NEUTRAL_LANE_ID (unchanged for the existing FILTERED instance). */
+  laneId?: string;
 }
 
 export class CrossSectionalExecutor {
@@ -186,8 +231,12 @@ export class CrossSectionalExecutor {
   private readonly fillConfirmRetryDelayMs: number;
   private readonly laneWeightPct: () => number;
   private readonly nowIso: () => string;
+  private readonly targetVariant: string;
+  private readonly laneId: string;
   private ticking = false;
   private lastError: string | null = null;
+  private openHalted: string | null = null;
+  private readonly dailyMaxLossUsdFn: () => number;
 
   constructor(opts: CrossSectionalExecutorOptions) {
     this.client = opts.client;
@@ -195,8 +244,11 @@ export class CrossSectionalExecutor {
     this.store = opts.store;
     this.isAllowed = opts.isAllowed;
     this.laneWeightPct = opts.laneWeightPct ?? (() => 100);
+    this.targetVariant = opts.targetVariant ?? EXEC_VARIANT();
+    this.laneId = opts.laneId ?? CROSS_SECTIONAL_MARKET_NEUTRAL_LANE_ID;
     this.nowIso = opts.nowIso ?? (() => new Date().toISOString());
     this.fillConfirmRetryDelayMs = opts.fillConfirmRetryDelayMs ?? 400;
+    this.dailyMaxLossUsdFn = opts.dailyMaxLossUsd ?? XSEC_DAILY_MAX_LOSS_USD;
   }
 
   /** Thin wrapper over the shared resolveConfirmedFillPrice, injecting this executor's
@@ -238,29 +290,108 @@ export class CrossSectionalExecutor {
     allocationWeightPct: number;
     leverage: number;
     variant: string;
+    /** Profit-bank threshold as % of deployed capital — shown next to each basket's TP gap. */
+    tpNetReturnPct: number;
+    /** Realized basket P&L for the current UTC day + the safety-breaker limit (0 = disabled). */
+    dailyRealizedUsd: number;
+    dailyMaxLossUsd: number;
+    /** Non-null while the daily-loss breaker is holding NEW opens (open baskets unaffected). */
+    openHalted: string | null;
     openBasket: ExecutorBasket | null;
+    /** ALL currently-open baskets, not just the first (openBasket, kept for compatibility, is
+     *  just openBaskets[0]). MAX_OPEN_BASKETS can exceed 1 (e.g. testnet runs 4) — any consumer
+     *  attributing exchange positions to this lane must attribute EVERY open basket's legs, not
+     *  only the first, or the 2nd+ basket's real positions silently show as unattributed. */
+    openBaskets: ExecutorBasket[];
     closedCount: number;
     totalNetPnlUsd: number;
     lastError: string | null;
     recent: ExecutorBasket[];
+    /** Age of the newest matching-variant OPEN signal, in ms; null if none exist at all.
+     *  A basket can only open from a signal within MAX_SIGNAL_AGE_MS of now — surfaced here
+     *  so a stuck signal pipeline (upstream of this executor) is visible, not silent. */
+    signalAgeMs: number | null;
+    signalMaxAgeMs: number;
+    signalStale: boolean;
+    /** Whether the currently-configured allowlist would have starved a side below the legs a
+     *  basket needs (2026-07-07: this silently blocked SHORT-side baskets for ~18h on live —
+     *  see deriveAdaptiveSymbolFilters's floor). Recomputed live from the signal store, so this
+     *  reflects the CURRENT cycle, not a stale snapshot. */
+    adaptiveFilters: ReturnType<typeof deriveAdaptiveSymbolFilters>["provenance"];
   } {
     const st = this.store.getState();
     const closed = st.baskets.filter((b) => b.status === "CLOSED");
+    const openBaskets = st.baskets.filter((b) => b.status === "OPEN");
+    const targetVariant = this.targetVariant;
+    const nowMs = new Date(this.nowIso()).getTime();
+    const matching = this.signalStore.all
+      .filter((o) => (o.variant ?? "RAW") === targetVariant)
+      .sort((a, b) => b.openedAtMs - a.openedAtMs);
+    const signalAgeMs = matching[0] ? nowMs - matching[0].openedAtMs : null;
+    const signalMaxAgeMs = MAX_SIGNAL_AGE_MS();
     return {
       enabled: isCrossSectionalExecEnabled(),
       allowed: this.isAllowed(),
-      laneId: CROSS_SECTIONAL_MARKET_NEUTRAL_LANE_ID,
+      laneId: this.laneId,
       legUsd: this.effectiveLegUsd(),
       baseLegUsd: LEG_USD(),
       allocationWeightPct: this.allocationWeightPct(),
       leverage: EXEC_LEVERAGE(),
-      variant: EXEC_VARIANT(),
-      openBasket: st.baskets.find((b) => b.status === "OPEN") ?? null,
+      variant: targetVariant,
+      tpNetReturnPct: TP_NET_RETURN() * 100,
+      dailyRealizedUsd: this.dailyRealizedUsd(this.nowIso()),
+      dailyMaxLossUsd: this.dailyMaxLossUsdFn(),
+      openHalted: this.openHalted,
+      openBasket: openBaskets[0] ?? null,
+      openBaskets,
       closedCount: closed.length,
       totalNetPnlUsd: closed.reduce((s, b) => s + (b.netPnlUsd ?? 0), 0),
       lastError: this.lastError,
       recent: st.baskets.slice(-10),
+      signalAgeMs,
+      signalMaxAgeMs,
+      signalStale: signalAgeMs === null || signalAgeMs > signalMaxAgeMs,
+      adaptiveFilters: deriveAdaptiveSymbolFilters(this.signalStore).provenance,
     };
+  }
+
+  /** Realized results of every CLOSED basket, for account-level display: the engine's own
+   *  realized ledger deliberately excludes these positions (they are external-managed claims,
+   *  not engine intents), so without this summary a banked basket increases the REAL wallet
+   *  balance while every "realized P&L" surface stays flat — exactly the operator confusion
+   *  this exists to prevent (2026-07-07: "+1.45 banked, kok realized ga nambah??"). */
+  getClosedSummary(): {
+    closedCount: number;
+    wins: number;
+    losses: number;
+    realizedPnlUsd: number;
+    feesUsd: number;
+    symbols: string[];
+    lastClosedAt: string | null;
+  } {
+    const closed = this.store.getState().baskets.filter((b) => b.status === "CLOSED");
+    const symbols = new Set<string>();
+    let realized = 0;
+    let fees = 0;
+    let wins = 0;
+    let losses = 0;
+    let lastClosedAt: string | null = null;
+    for (const b of closed) {
+      const net = b.netPnlUsd ?? 0;
+      realized += net;
+      fees += b.feeEstimateUsd ?? 0;
+      if (net > 0) wins += 1;
+      else losses += 1;
+      for (const leg of b.legs) symbols.add(leg.symbol);
+      if (b.closedAt && (lastClosedAt === null || b.closedAt > lastClosedAt)) lastClosedAt = b.closedAt;
+    }
+    return { closedCount: closed.length, wins, losses, realizedPnlUsd: realized, feesUsd: fees, symbols: [...symbols].sort(), lastClosedAt };
+  }
+
+  /** Every CLOSED basket, store order — feeds account-level merges that need per-basket
+   *  closedAt/netPnl (e.g. the lane-performance timeline) rather than the aggregate summary. */
+  getClosedBaskets(): ExecutorBasket[] {
+    return this.store.getState().baskets.filter((b) => b.status === "CLOSED");
   }
 
   /** Single-flight tick: bank early winners, close due baskets, then consider opening a new one. */
@@ -299,6 +430,7 @@ export class CrossSectionalExecutor {
     }
 
     const threshold = TP_NET_RETURN();
+    let stamped = false;
     for (const basket of openBaskets) {
       const longLegs = basket.legs.filter((l) => l.side === "LONG");
       const shortLegs = basket.legs.filter((l) => l.side === "SHORT");
@@ -316,8 +448,24 @@ export class CrossSectionalExecutor {
       const grossReturn = meanLong / 2 + meanShort / 2; // mirrors legReturnContribution's equal-notional formula
       const costReturn = CROSS_SECTIONAL_ROUNDTRIP_BPS / 10_000;
       const netReturn = grossReturn - costReturn;
+      basket.lastNetReturn = netReturn;
+      basket.lastNetAt = this.nowIso();
+      stamped = true;
       if (netReturn >= threshold) await this.closeBasket(basket, "PROFIT_BANK");
     }
+    if (stamped) this.store.save(); // persist the TP-gap stamps for the dashboard
+  }
+
+  /** Realized basket P&L for the current UTC day — feeds the basket-level safety breaker. */
+  private dailyRealizedUsd(nowIso: string): number {
+    const day = nowIso.slice(0, 10);
+    let sum = 0;
+    for (const b of this.store.getState().baskets) {
+      if (b.status === "CLOSED" && b.closedAt && b.closedAt.slice(0, 10) === day && b.netPnlUsd !== null) {
+        sum += b.netPnlUsd;
+      }
+    }
+    return sum;
   }
 
   private async ensureOpenBasketLeverage(): Promise<void> {
@@ -346,28 +494,68 @@ export class CrossSectionalExecutor {
     }
   }
 
+  /** Un-exited qty that OTHER open baskets hold on this symbol on the OPPOSITE side. When this
+   *  covers a leg's qty, closing the leg without reduceOnly is pure cross-basket bookkeeping:
+   *  Binance nets per symbol, so the "close" order just transfers the exposure to the sibling
+   *  baskets that legitimately own the other side — it can never create exposure the executor's
+   *  own books don't account for. */
+  private siblingOppositeUnexitedQty(basket: ExecutorBasket, symbol: string, side: "LONG" | "SHORT"): number {
+    let qty = 0;
+    for (const other of this.store.getState().baskets) {
+      if (other === basket || other.status !== "OPEN") continue;
+      for (const leg of other.legs) {
+        if (leg.symbol === symbol && leg.side !== side && leg.exitOrderId === null) qty += leg.qty;
+      }
+    }
+    return qty;
+  }
+
   private async closeBasket(basket: ExecutorBasket, reason: string): Promise<void> {
-    let gross = 0;
-    let notionalTouched = 0;
+    const failures: string[] = [];
     for (const leg of basket.legs) {
       if (leg.exitOrderId !== null) continue; // already closed (retry path)
       const exitSide = leg.side === "LONG" ? "SELL" : "BUY";
-      const order = await this.client.placeOrder({
-        symbol: leg.symbol,
-        side: exitSide,
-        type: "MARKET",
-        quantity: leg.qty,
-        reduceOnly: true,
-        newClientOrderId: `xsec-${basket.basketId.slice(-12)}-x${basket.legs.indexOf(leg)}`,
-      });
-      leg.exitOrderId = order.orderId;
-      const resolved = await this.resolveFillPrice(leg.symbol, order.orderId, order.avgPrice, leg.entryPrice);
-      leg.exitPrice = resolved.price;
-      leg.exitPriceConfirmed = resolved.confirmed;
+      // reduceOnly is the default guard against over-closing stale basket state — but with
+      // overlapping baskets the NETTED account position can carry the opposite sign (e.g. this
+      // basket long SOL while two siblings are short SOL ⇒ account net short), and Binance then
+      // rejects the reduce-only close with -2022, wedging the basket half-closed forever
+      // (2026-07-07: testnet basket xb-mr7zdpiz stuck exactly this way for hours). Drop the flag
+      // ONLY when sibling baskets' un-exited opposite exposure fully covers this leg — the one
+      // case where a plain market close is provably just bookkeeping between our own baskets.
+      const reduceOnly = this.siblingOppositeUnexitedQty(basket, leg.symbol, leg.side) < leg.qty - 1e-9;
+      try {
+        const order = await this.client.placeOrder({
+          symbol: leg.symbol,
+          side: exitSide,
+          type: "MARKET",
+          quantity: leg.qty,
+          ...(reduceOnly ? { reduceOnly: true } : {}),
+          newClientOrderId: `xsec-${basket.basketId.slice(-12)}-x${basket.legs.indexOf(leg)}`,
+        });
+        leg.exitOrderId = order.orderId;
+        const resolved = await this.resolveFillPrice(leg.symbol, order.orderId, order.avgPrice, leg.entryPrice);
+        leg.exitPrice = resolved.price;
+        leg.exitPriceConfirmed = resolved.confirmed;
+      } catch (error) {
+        // Keep attempting the REMAINING legs — aborting mid-loop leaves more naked exposure
+        // stuck open than closing what we can. The basket stays OPEN and retries next tick.
+        failures.push(`${leg.symbol}: ${(error as Error).message}`);
+      }
+      this.store.save(); // persist per leg so a crash/retry mid-close can resume
+    }
+    if (failures.length > 0) {
+      throw new Error(`basket ${basket.basketId} close incomplete, ${failures.length} leg(s) failed: ${failures[0]}`);
+    }
+    // Finalize P&L from the STORED per-leg prices, not a loop-local accumulator: on a retry after
+    // a partial close, the already-exited legs are skipped above, and the old accumulator silently
+    // EXCLUDED them from the basket's final P&L.
+    let gross = 0;
+    let notionalTouched = 0;
+    for (const leg of basket.legs) {
+      const exit = leg.exitPrice ?? leg.entryPrice;
       const dir = leg.side === "LONG" ? 1 : -1;
-      gross += dir * (leg.exitPrice - leg.entryPrice) * leg.qty;
-      notionalTouched += leg.entryPrice * leg.qty + leg.exitPrice * leg.qty;
-      this.store.save(); // persist per leg so a crash mid-close can resume
+      gross += dir * (exit - leg.entryPrice) * leg.qty;
+      notionalTouched += leg.entryPrice * leg.qty + exit * leg.qty;
     }
     const fees = notionalTouched * TAKER_FEE_RATE;
     basket.status = "CLOSED";
@@ -381,13 +569,23 @@ export class CrossSectionalExecutor {
 
   private async maybeOpenBasket(): Promise<void> {
     const st = this.store.getState();
+    // Basket safety breaker: halt NEW opens after a bad realized day; never touches open baskets.
+    const lossLimit = this.dailyMaxLossUsdFn();
+    if (lossLimit > 0) {
+      const dayRealized = this.dailyRealizedUsd(this.nowIso());
+      if (dayRealized <= -lossLimit) {
+        this.openHalted = `daily basket loss breaker: realized ${dayRealized.toFixed(2)} USDT ≤ -${lossLimit} — new opens halted until UTC midnight (open baskets keep their own exits)`;
+        return;
+      }
+    }
+    this.openHalted = null;
     if (st.baskets.filter((b) => b.status === "OPEN").length >= MAX_OPEN_BASKETS()) return;
 
     const nowMs = new Date(this.nowIso()).getTime();
     // Newest FRESH, still-OPEN signal of the target variant we haven't executed yet.
     // Default FILTERED: symbol-filtered baskets whose allow/blocklists auto-update from
     // measured per-leg returns (see deriveAdaptiveSymbolFilters).
-    const targetVariant = EXEC_VARIANT();
+    const targetVariant = this.targetVariant;
     const candidates = this.signalStore.all
       .filter(
         (o: CrossSectionalObservation) =>

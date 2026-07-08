@@ -32,6 +32,11 @@ import type { Candle } from "@dtc/shared";
 import { computeRSI } from "./candle-indicators.js";
 import { fetchCrowdingSnapshot, type CrowdingSnapshot } from "./derivatives-crowding.js";
 import type { BinanceClient } from "./binance.js";
+import {
+  makeFixedRewardExitPolicy,
+  type SingleSymbolExitPolicy,
+  type SingleSymbolFreshSignal,
+} from "./single-symbol-lane-executor.js";
 
 function envNum(name: string, dflt: number): number {
   const v = Number(process.env[name]);
@@ -197,18 +202,38 @@ export function resolveShortFadeObservation(
 }
 
 // ── store ─────────────────────────────────────────────────────────────────
+/** Liveness + funnel counters, persisted so the report can PROVE the cycle is alive and show WHY
+ *  the book is empty (2026-07-07 operator: "masih kosong sampe sekarang" — with no lastCycleAt or
+ *  gate counters, an empty lane was indistinguishable from a dead one without SSHing to the box). */
+export interface SFCycleMeta {
+  lastCycleAt: string | null;
+  cycles: number;
+  rsiCandidatesTotal: number;
+  crowdingRejectedTotal: number;
+  recordedTotal: number;
+  lastCycleError: string | null;
+}
+
+const EMPTY_CYCLE_META: SFCycleMeta = {
+  lastCycleAt: null, cycles: 0, rsiCandidatesTotal: 0, crowdingRejectedTotal: 0, recordedTotal: 0, lastCycleError: null,
+};
+
 interface SFState {
   version: number;
   observations: ShortFadeObservation[];
+  cycleMeta?: SFCycleMeta;
 }
 
 export class ShortFadeStore {
-  private state: SFState = { version: 1, observations: [] };
+  private state: SFState = { version: 1, observations: [], cycleMeta: { ...EMPTY_CYCLE_META } };
   constructor(private readonly file: string) {
     if (existsSync(file)) {
       try {
         const parsed = JSON.parse(readFileSync(file, "utf-8")) as Partial<SFState>;
         if (Array.isArray(parsed.observations)) this.state.observations = parsed.observations as ShortFadeObservation[];
+        if (parsed.cycleMeta && typeof parsed.cycleMeta === "object") {
+          this.state.cycleMeta = { ...EMPTY_CYCLE_META, ...parsed.cycleMeta };
+        }
       } catch {
         /* corrupt → start empty */
       }
@@ -216,6 +241,23 @@ export class ShortFadeStore {
   }
   get all(): ShortFadeObservation[] {
     return this.state.observations;
+  }
+  get cycleMeta(): SFCycleMeta {
+    return this.state.cycleMeta ?? { ...EMPTY_CYCLE_META };
+  }
+  recordCycle(atIso: string, result: SFCycleResult | null, error?: string): void {
+    const meta = this.state.cycleMeta ?? { ...EMPTY_CYCLE_META };
+    meta.lastCycleAt = atIso;
+    meta.cycles += 1;
+    if (result) {
+      meta.rsiCandidatesTotal += result.rsiCandidates;
+      meta.crowdingRejectedTotal += result.crowdingRejected;
+      meta.recordedTotal += result.recorded;
+      meta.lastCycleError = null;
+    } else {
+      meta.lastCycleError = error ?? "unknown cycle error";
+    }
+    this.state.cycleMeta = meta;
   }
   has(observationId: string): boolean {
     return this.state.observations.some((o) => o.observationId === observationId);
@@ -344,6 +386,7 @@ export async function runShortFadeCycle(opts: {
     if (added) result.recorded += 1;
   }
 
+  opts.store.recordCycle(nowIso, result);
   opts.store.save();
   return result;
 }
@@ -351,7 +394,15 @@ export async function runShortFadeCycle(opts: {
 export async function runShortFadeCycleGuarded(opts: Parameters<typeof runShortFadeCycle>[0]): Promise<SFCycleResult | null> {
   try {
     return await runShortFadeCycle(opts);
-  } catch {
+  } catch (error) {
+    // Record the failure so the report shows "cycle ran and ERRORED" instead of silently
+    // looking identical to "no signal yet" — best-effort, never rethrows.
+    try {
+      opts.store.recordCycle(new Date(opts.now).toISOString(), null, (error as Error).message);
+      opts.store.save();
+    } catch {
+      /* never let liveness bookkeeping break the caller */
+    }
     return null;
   }
 }
@@ -372,13 +423,20 @@ export interface ShortFadeReport {
   stopShare: number | null;
   edgeReady: boolean;
   topRecent: Array<{ symbol: string; netR: number | null; status: string; exitReason: string | null; openedAt: string; rsiAtEntry: number; fundingBps: number | null }>;
+  /** Liveness + gate funnel: distinguishes "alive but the market never qualified" (cycles ticking,
+   *  rsiCandidatesTotal 0) from "silently dead" (stale lastCycleAt) and from "erroring"
+   *  (lastCycleError set). Null only for callers that don't pass store meta. */
+  cycleMeta: SFCycleMeta | null;
 }
 
 function mean(xs: number[]): number | null {
   return xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : null;
 }
 
-export function buildShortFadeReport(observations: readonly ShortFadeObservation[]): ShortFadeReport {
+export function buildShortFadeReport(
+  observations: readonly ShortFadeObservation[],
+  cycleMeta?: SFCycleMeta,
+): ShortFadeReport {
   const open = observations.filter((o) => o.status === "OPEN");
   const resolved = observations.filter((o) => (o.status === "CLOSED_WIN" || o.status === "CLOSED_LOSS") && finite(o.netR));
   const nets = resolved.map((o) => o.netR as number);
@@ -410,5 +468,52 @@ export function buildShortFadeReport(observations: readonly ShortFadeObservation
     stopShare: resolved.length ? stops / resolved.length : null,
     edgeReady,
     topRecent,
+    cycleMeta: cycleMeta ?? null,
   };
 }
+
+// ── live execution wiring (2026-07-08) ──────────────────────────────────────
+// Adapters for single-symbol-lane-executor.ts's generic executor. This lane stays a pure
+// measurement module above this line — these two functions are the ONLY seam connecting it to
+// real execution, and neither one changes what gets recorded/resolved for OOS measurement.
+
+/** This lane's OPEN observations → the generic single-symbol executor's common signal shape. */
+export function shortFadeOpenSignals(store: ShortFadeStore): SingleSymbolFreshSignal[] {
+  return store.all
+    .filter((o) => o.status === "OPEN")
+    .map((o) => ({
+      observationId: o.observationId,
+      symbol: o.symbol,
+      entryPrice: o.entryPrice,
+      stopPrice: o.initialStop,
+      openedAtMs: o.openedAtMs,
+    }));
+}
+
+/** Same exit geometry as the paper measurement (buildShortFadeGeometry / resolveShortFadeObservation):
+ *  fast SF_TP_REWARD_MULTIPLE-R bank, stop at the geometry's initialStop, SF_MAX_HOLD_BARS (@ 1h
+ *  bars) mark-to-market fallback. */
+export function shortFadeExitPolicy(): SingleSymbolExitPolicy {
+  return makeFixedRewardExitPolicy({ rewardMultiple: SF_TP_REWARD_MULTIPLE, maxHoldMs: SF_MAX_HOLD_BARS * 3_600_000 });
+}
+
+/** Own enable flag (2026-07-08), independent of LIVE_EXECUTION_ENABLED/CROSS_SECTIONAL_EXEC_ENABLED
+ *  — this lane never executed a real order before this date, so turning it on must be an explicit,
+ *  separate act, same convention as every other executor in this codebase. */
+export function isShortFadeExecEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.SHORT_FADE_EXEC_ENABLED === "1";
+}
+export const SF_EXEC_LEG_USD = (): number => {
+  const n = Number.parseFloat(process.env.SHORT_FADE_EXEC_LEG_USD ?? "");
+  return Number.isFinite(n) && n > 0 ? n : 25;
+};
+export const SF_EXEC_LEVERAGE = (): number => {
+  const n = Number.parseInt(process.env.SHORT_FADE_EXEC_LEVERAGE ?? "", 10);
+  return Number.isFinite(n) && n >= 1 ? Math.floor(n) : 3;
+};
+export const SF_EXEC_MAX_SIGNAL_AGE_MS = (): number =>
+  Math.max(60_000, Math.floor(Number(process.env.SHORT_FADE_EXEC_MAX_SIGNAL_AGE_MS) || 50 * 60_000));
+export const SF_EXEC_DAILY_MAX_LOSS_USD = (): number => {
+  const n = Number.parseFloat(process.env.SHORT_FADE_EXEC_DAILY_MAX_LOSS_USD ?? "");
+  return Number.isFinite(n) && n > 0 ? n : 0;
+};

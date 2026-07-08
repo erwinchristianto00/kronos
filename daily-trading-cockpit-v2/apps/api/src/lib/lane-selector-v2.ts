@@ -98,6 +98,16 @@ export interface LaneSelectorV2Inputs {
   controllerConfidence?: string | null;
   estimatedRegime?: LaneSelectorV2EstimatedRegime | null;
   rotationShortlist?: RegimeRotationShortlistReport | null;
+  /** Operator override (REALTIME_SHORT_FORCE_FAST_LONG, 2026-07-07 "gw mau trade di saat regime
+   *  bullish"): lets LONG candidates through the tactical-longs policy block. The controller
+   *  direction gate still runs FIRST — a forced long never fires in SHORT_ONLY/NO_TRADE. */
+  allowTacticalLongs?: boolean;
+  /** Variant ids the operator/regime-autopilot has EXPLICITLY allocated right now (2026-07-08:
+   *  "wire lane baru ke allocation selection, jangan sampe ada blocker"). Non-empty ⇒ bypasses
+   *  policyPreferredVariants' hardcoded single-variant-per-direction default, the SAME escape
+   *  hatch the rotation-shortlist ALLOW verdict already uses — an explicit operator/preset
+   *  allocation is a stronger signal than the bot's own historical-safety fallback. */
+  manualEnabledVariantIds?: Set<string>;
   now: string;
   maxStopDistanceBps?: number;
 }
@@ -190,6 +200,14 @@ function variantSupportsDirection(def: VariantMatrixVariantDefinition, direction
   if (def.longOnly && direction !== "LONG") return false;
   if (def.shortOnly && direction !== "SHORT") return false;
   return true;
+}
+
+/** Per-symbol REAL-admission block (see excludedSymbols doc on VariantMatrixVariantDefinition).
+ *  Measurement (current-guard-variant-matrix.ts) is untouched — only this live/testnet selection
+ *  path is gated, so OOS proof keeps collecting on blocked symbols in case they recover. */
+function variantSupportsSymbol(def: VariantMatrixVariantDefinition, symbol: string): boolean {
+  if (!def.excludedSymbols || def.excludedSymbols.length === 0) return true;
+  return !def.excludedSymbols.includes(symbol.toUpperCase());
 }
 
 // Exact match only. Substring containment previously used here (`wanted.includes(candidateKey) ||
@@ -328,6 +346,12 @@ function policyPreferredVariants(
   shortlistEligibleVariantIds: Set<VariantMatrixVariantId>,
 ): VariantMatrixVariantId[] {
   if (shortlistEligibleVariantIds.size > 0) return [];
+  // 2026-07-08 (operator: "wire lane baru ke allocation selection, jangan sampe ada blocker"): an
+  // explicit operator/regime-autopilot allocation is a stronger, more current signal than the
+  // hardcoded historical-safety default below — bypass it the SAME way the rotation-shortlist
+  // ALLOW verdict already does, so a newly-allocated lane (e.g. CG_WIDE_LONG_RUNNER,
+  // CG_MFE_GIVEBACK) can actually win selection on score instead of being silently overridden.
+  if (inputs.manualEnabledVariantIds && inputs.manualEnabledVariantIds.size > 0) return [];
   if (
     estimated.policy === "WIDE_TREND" &&
     estimated.direction === "LONG" &&
@@ -349,9 +373,12 @@ function policyBlockReason(inputs: LaneSelectorV2Inputs, estimated: LaneSelector
   if (estimated.direction === "MIXED" && MIXED_SYMBOL_BLOCKLIST.has(inputs.candidate.symbol.toUpperCase())) {
     return `mixed_symbol_blocked:${inputs.candidate.symbol}`;
   }
-  if (inputs.candidate.direction === "LONG" && estimated.policy !== "WIDE_TREND") {
+  if (inputs.candidate.direction === "LONG" && estimated.policy !== "WIDE_TREND" && !inputs.allowTacticalLongs) {
     // Longs fire ONLY in a confident WIDE_TREND bull (CG_WIDE_STOP_TP_WIDE lane); tactical/mixed
     // longs stay disabled. Re-enabled by operator 2026-06-29 to re-test against the fresh / feed.
+    // 2026-07-07 operator override: allowTacticalLongs (REALTIME_SHORT_FORCE_FAST_LONG) opens this
+    // for bullish-but-not-yet-extended regimes; the controller direction gate upstream still
+    // blocks longs whenever the regime doesn't allow them.
     return "long_tactical_disabled";
   }
   return null;
@@ -439,6 +466,10 @@ export function selectLaneV2(inputs: LaneSelectorV2Inputs): LaneSelectorV2Result
     const config = LANE_CONFIGS.get(state.variantId)!;
     if (!variantSupportsDirection(config.definition, candidate.direction)) {
       rejected.push(`${state.variantId}:direction_${candidate.direction}_unsupported`);
+      continue;
+    }
+    if (!variantSupportsSymbol(config.definition, candidate.symbol)) {
+      rejected.push(`${state.variantId}:symbol_excluded_${candidate.symbol}`);
       continue;
     }
     if (shortlistAllowed) shortlistEligibleVariantIds.add(config.variantId);

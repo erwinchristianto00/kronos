@@ -56,6 +56,13 @@ const MANUAL_ONLY_LIVE_MIRROR_VARIANT_IDS = new Set<string>([
 // STABLE here + allowed through the app.ts eligibility gate. 2026-06-29: CG_WIDE_FAST_SHORT only
 // (WATCHABLE, +0.110R — clearly the most deserving); CG_WIDE_STOP_TP_WIDE stays gated until STABLE.
 export const FORCE_ELIGIBLE_SHORT_VARIANT_IDS = new Set<string>(["CG_WIDE_FAST_SHORT"]);
+// LONG counterpart (operator 2026-07-07: "buka akses CG_WIDE_FAST_LONG, gw mau trade di saat regime
+// bullish"): without this, FAST_LONG only ever emitted under the FULL WIDE_TREND+LONG estimate —
+// a plain bullish regime (controller LONG-permissive, autopilot allocating FAST_LONG 60-70%) never
+// produced a single long candidate. Forcing lifts the lane to STABLE at the emitter; the
+// controller-direction gate, bullish rotation shortlist (best-symbols whitelist), proven-symbols
+// tier, and all engine caps still apply — so it still trades ONLY when the regime allows longs.
+export const FORCE_ELIGIBLE_LONG_VARIANT_IDS = new Set<string>(["CG_WIDE_FAST_LONG"]);
 
 export const REALTIME_SHORT_ALLOWED_VARIANT_IDS = LANE_SELECTOR_V2_LIVE_SUPPORTED_VARIANT_IDS.filter(
   (id) => !MANUAL_ONLY_LIVE_MIRROR_VARIANT_IDS.has(id),
@@ -132,6 +139,9 @@ export interface RealtimeShortMirrorInputs {
   stableShortLanes?: RealtimeShortLaneState[];
   /** Operator force: lift FORCE_ELIGIBLE_SHORT_VARIANT_IDS to STABLE even before they mature. */
   forceFastShort?: boolean;
+  /** Operator force: lift FORCE_ELIGIBLE_LONG_VARIANT_IDS to STABLE so FAST_LONG can emit in any
+   *  long-permissive regime, not only the strict WIDE_TREND+LONG estimate. */
+  forceFastLong?: boolean;
   /** Auto-wire crowding veto: skip entries into a crowd already EXTREME on the SAME side. */
   crowdingVetoEnabled?: boolean;
   /** Per-symbol crowd state at signal time (caller fetches); used by the crowding veto. */
@@ -189,21 +199,35 @@ function effectiveLaneStates(
           : [{ variantId: LONG_WIDE_VARIANT_ID, status: "STABLE_CANDIDATE" }, ...lifted];
       })()
     : base;
-  // Force-enabled short lanes → lift to STABLE_CANDIDATE so the mirror emits them before they
-  // naturally mature. OFF by default (preserves the stable-only safety gate); the operator turns it
-  // on per-instance via REALTIME_SHORT_FORCE_FAST_SHORT. selectLaneV2's direction gate still blocks
-  // them when shorts aren't allowed.
-  if (!inputs.forceFastShort) return withLongWideOverride;
-  let withForcedShorts = withLongWideOverride;
-  for (const variantId of FORCE_ELIGIBLE_SHORT_VARIANT_IDS) {
+  // Force-enabled lanes → lift to STABLE_CANDIDATE so the mirror emits them before they naturally
+  // mature. OFF by default (preserves the stable-only safety gate); the operator turns each side on
+  // per-instance via REALTIME_SHORT_FORCE_FAST_SHORT / REALTIME_SHORT_FORCE_FAST_LONG. selectLaneV2's
+  // direction gate still blocks a forced lane whenever the regime doesn't allow that side.
+  //
+  // 2026-07-08 (operator: "wire lane baru ke allocation selection, jangan sampe ada blocker"):
+  // ALSO force-lift whatever the operator/regime-autopilot has EXPLICITLY allocated right now
+  // (manualEnabledVariantIds — e.g. CG_WIDE_LONG_RUNNER, CG_MFE_GIVEBACK), regardless of the fixed
+  // FORCE_ELIGIBLE_* sets above. Deliberately NOT added to those sets directly: doing so made the
+  // new lane compete on raw score against FAST_SHORT/FAST_LONG in EVERY cycle (even with no
+  // allocation active), which regressed the 2026-07-07 "FAST_LONG always wins its forced slot"
+  // guarantee. Gating the lift on an ACTIVE allocation keeps today's default behavior byte-for-byte
+  // identical when nothing new is allocated, and only a variant the operator actually picked ever
+  // gets to compete for (and, via policyPreferredVariants' matching bypass, WIN) the slot.
+  const forcedVariantIds = [
+    ...(inputs.forceFastShort ? FORCE_ELIGIBLE_SHORT_VARIANT_IDS : []),
+    ...(inputs.forceFastLong ? FORCE_ELIGIBLE_LONG_VARIANT_IDS : []),
+    ...(inputs.manualEnabledVariantIds ?? []),
+  ];
+  let withForced = withLongWideOverride;
+  for (const variantId of forcedVariantIds) {
     if (!isRealtimeShortSelectableVariantId(variantId, inputs.manualEnabledVariantIds?.has(variantId) === true)) continue;
-    withForcedShorts = withForcedShorts.some((state) => state.variantId === variantId)
-      ? withForcedShorts.map((state) =>
+    withForced = withForced.some((state) => state.variantId === variantId)
+      ? withForced.map((state) =>
           state.variantId === variantId ? { ...state, status: "STABLE_CANDIDATE" } : state,
         )
-      : [{ variantId, status: "STABLE_CANDIDATE" }, ...withForcedShorts];
+      : [{ variantId, status: "STABLE_CANDIDATE" }, ...withForced];
   }
-  return withForcedShorts;
+  return withForced;
 }
 
 /**
@@ -298,6 +322,13 @@ export function runRealtimeShortMirror(
       controllerConfidence: inputs.controllerConfidence,
       estimatedRegime,
       rotationShortlist: inputs.rotationShortlist,
+      // 2026-07-08: an active operator/preset allocation ALSO opens the tactical-longs block —
+      // without this, a newly-allocated LONG lane (e.g. CG_WIDE_LONG_RUNNER) would force-lift to
+      // STABLE via manualEnabledVariantIds above, then still get rejected by policyBlockReason's
+      // "long_tactical_disabled" outside a confident WIDE_TREND bull. The controller direction gate
+      // still runs first — this only lifts the tactical-longs block, not the regime gate itself.
+      allowTacticalLongs: inputs.forceFastLong === true || (inputs.manualEnabledVariantIds?.size ?? 0) > 0,
+      manualEnabledVariantIds: inputs.manualEnabledVariantIds,
       now: inputs.now,
     });
     if (!selected.selected) {

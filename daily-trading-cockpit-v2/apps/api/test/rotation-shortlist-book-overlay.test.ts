@@ -96,3 +96,23 @@ describe("rotation shortlist BOOK overlay (2b)", () => {
     expect(out.lanes[0]!.bearish.find((s) => s.symbol === "WLDUSDT")).toBeUndefined();
   });
 });
+
+// 2026-07-08: live opened ZERO trades under FAST_SHORT 100% because its LOCAL VM book is empty →
+// shortlist structurally empty → every candidate vetoed. app.ts now falls back to the /research
+// curation whitelist when the family has NO symbols at all — this helper is that emptiness test.
+describe("rotationShortlistFamilyHasSymbols (empty-by-no-data detection)", () => {
+  const empty = {
+    generatedAt: "2026-07-08T00:00:00.000Z", minAllowSample: 5, minWatchSample: 3,
+    lanes: [{ laneId: "L", variantId: "CG_WIDE_FAST_SHORT", label: "l", bearish: [], bullish: [] }],
+    bearishGlobal: [], bullishGlobal: [],
+  };
+  it("empty family ⇒ false; any lane or global entry ⇒ true", async () => {
+    const { rotationShortlistFamilyHasSymbols } = await import("../src/lib/regime-rotation-shortlist.js");
+    expect(rotationShortlistFamilyHasSymbols(empty as never, "BEARISH")).toBe(false);
+    expect(rotationShortlistFamilyHasSymbols(empty as never, "BULLISH")).toBe(false);
+    const withLane = { ...empty, lanes: [{ ...empty.lanes[0]!, bearish: [{ symbol: "BTCUSDT" }] }] };
+    expect(rotationShortlistFamilyHasSymbols(withLane as never, "BEARISH")).toBe(true);
+    const withGlobal = { ...empty, bullishGlobal: [{ symbol: "ETHUSDT" }] };
+    expect(rotationShortlistFamilyHasSymbols(withGlobal as never, "BULLISH")).toBe(true);
+  });
+});
