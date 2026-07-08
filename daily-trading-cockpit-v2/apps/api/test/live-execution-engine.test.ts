@@ -3278,7 +3278,7 @@ describe("applyRegimeAutopilotAllocation (autopilot ↔ manual-mode sync)", () =
     let regime: string | null = null;
     let now = 1_000_000_000_000;
     const pilot = new RegimeAutopilot({
-      setAllocations: (a) => { engine.applyRegimeAutopilotAllocation(a); },
+      setAllocations: (a) => engine.applyRegimeAutopilotAllocation(a),
       getLatestRegime: () => regime,
       isManualMode: () => engine.isManualSelectorMode(),
       nowMs: () => now,
@@ -3302,7 +3302,7 @@ describe("applyRegimeAutopilotAllocation (autopilot ↔ manual-mode sync)", () =
     let regime: string | null = null;
     let now = 1_000_000_000_000;
     const pilot = new RegimeAutopilot({
-      setAllocations: (a) => { engine.applyRegimeAutopilotAllocation(a); },
+      setAllocations: (a) => engine.applyRegimeAutopilotAllocation(a),
       getLatestRegime: () => regime,
       nowMs: () => now,
       stableCycles: 3,

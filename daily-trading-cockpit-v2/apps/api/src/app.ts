@@ -50,6 +50,7 @@ import {
   IM_EXEC_DAILY_MAX_LOSS_USD,
   IM_PAPER_LANE_ID,
 } from "./lib/intraday-momentum-edge.js";
+import { computeExternalManagedNetQty, isNewExecutorLaneAllowed } from "./lib/live-executor-wiring.js";
 import { RegimeAutopilot, isRegimeAutopilotEnabled } from "./lib/regime-autopilot.js";
 import { getRegimeEngineStore } from "./lib/regime-engine-service.js";
 import {
@@ -216,26 +217,11 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       // MIXED, plus the new SHORT_FADE_EXHAUSTION + INTRADAY_MOMENTUM_BREAKOUT single-symbol
       // executors) — the same starvation/false-orphan class of bug the original single-instance
       // fix addressed would otherwise recur for every one of the new instances' own open legs.
-      externalManagedNetQty: () => {
-        const net = new Map<string, number>();
-        for (const exec of [crossSectionalExecutor, crossSectionalTrendExecutor, crossSectionalMixedExecutor]) {
-          if (!exec) continue;
-          for (const basket of exec.getStatus().openBaskets) {
-            for (const leg of basket.legs) {
-              if (leg.exitOrderId !== null) continue; // exit already placed — no longer a claim
-              net.set(leg.symbol, (net.get(leg.symbol) ?? 0) + (leg.side === "LONG" ? leg.qty : -leg.qty));
-            }
-          }
-        }
-        for (const exec of [shortFadeExecutor, intradayMomentumExecutor]) {
-          if (!exec) continue;
-          for (const pos of exec.getStatus().openPositions) {
-            if (pos.exitOrderId !== null) continue; // exit already placed — no longer a claim
-            net.set(pos.symbol, (net.get(pos.symbol) ?? 0) + (pos.direction === "LONG" ? pos.qty : -pos.qty));
-          }
-        }
-        return net;
-      },
+      externalManagedNetQty: () =>
+        computeExternalManagedNetQty(
+          [crossSectionalExecutor, crossSectionalTrendExecutor, crossSectionalMixedExecutor],
+          [shortFadeExecutor, intradayMomentumExecutor],
+        ),
       // "Mode 2" (REALTIME_SHORT_MIRROR_ENABLED=1): the engine mirrors ONLY the dedicated
       // real-time short store — fresh, short-only, stable-lane orders — and never the
       // measurement paper book. Flag off → unchanged (reads the normal paper book).
@@ -414,9 +400,14 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         store: new CrossSectionalExecutorStore(undefined, "cross-sectional-executor-trend.json"),
         targetVariant: "TREND_BETA_VOL",
         laneId: CROSS_SECTIONAL_TREND_LANE_ID,
-        isAllowed: () =>
-          (liveConfig.env === "testnet" ? true : engineForGate !== null && engineForGate.isArmed()) &&
-          (engineForGate?.laneSelectionAllowsLane(CROSS_SECTIONAL_TREND_LANE_ID) ?? true),
+        // 2026-07-08 audit fix: isNewExecutorLaneAllowed requires EXPLICIT allocation inclusion,
+        // not just laneSelectionAllowsLane (which defaults to true when NO allocation is set at
+        // all — the "reorder, never reject" ALL_LANES convention every established lane relies
+        // on). Without this, a brand-new lane the operator has never actually picked would
+        // silently trade at FULL SIZE the instant the engine is armed and no allocation happens
+        // to be active yet (e.g. right after a restart, before RegimeAutopilot's first apply, or
+        // during an auto-reset-on-loss window).
+        isAllowed: () => isNewExecutorLaneAllowed(CROSS_SECTIONAL_TREND_LANE_ID, liveConfig.env === "testnet" ? "testnet" : "mainnet", engineForGate),
         laneWeightPct: () => engineForGate?.laneSelectionWeightPctForLane(CROSS_SECTIONAL_TREND_LANE_ID) ?? 100,
       });
       crossSectionalMixedExecutor = new CrossSectionalExecutor({
@@ -425,9 +416,8 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         store: new CrossSectionalExecutorStore(undefined, "cross-sectional-executor-mixed.json"),
         targetVariant: "MIXED_MEAN_REVERSION",
         laneId: CROSS_SECTIONAL_MIXED_LANE_ID,
-        isAllowed: () =>
-          (liveConfig.env === "testnet" ? true : engineForGate !== null && engineForGate.isArmed()) &&
-          (engineForGate?.laneSelectionAllowsLane(CROSS_SECTIONAL_MIXED_LANE_ID) ?? true),
+        // Same 2026-07-08 fix as CROSS_SECTIONAL_TREND above.
+        isAllowed: () => isNewExecutorLaneAllowed(CROSS_SECTIONAL_MIXED_LANE_ID, liveConfig.env === "testnet" ? "testnet" : "mainnet", engineForGate),
         laneWeightPct: () => engineForGate?.laneSelectionWeightPctForLane(CROSS_SECTIONAL_MIXED_LANE_ID) ?? 100,
       });
       if (!isTest) {
@@ -456,9 +446,10 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         direction: "SHORT",
         getOpenSignals: () => shortFadeOpenSignals(getShortFadeStore()),
         exitPolicy: shortFadeExitPolicy(),
-        isAllowed: () =>
-          (liveConfig.env === "testnet" ? true : engineForGate !== null && engineForGate.isArmed()) &&
-          (engineForGate?.laneSelectionAllowsLane(SF_PAPER_LANE_ID) ?? true),
+        // 2026-07-08 audit fix: see the cross-sectional TREND/MIXED comment above — require
+        // EXPLICIT allocation inclusion so this never-before-executed lane can't silently fire at
+        // full size before it has ever actually been named in an allocation.
+        isAllowed: () => isNewExecutorLaneAllowed(SF_PAPER_LANE_ID, liveConfig.env === "testnet" ? "testnet" : "mainnet", engineForGate),
         laneWeightPct: () => engineForGate?.laneSelectionWeightPctForLane(SF_PAPER_LANE_ID) ?? 100,
         legUsd: SF_EXEC_LEG_USD,
         leverage: SF_EXEC_LEVERAGE,
@@ -483,9 +474,8 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         direction: "LONG",
         getOpenSignals: () => intradayMomentumOpenSignals(getIntradayMomentumStore()),
         exitPolicy: intradayMomentumExitPolicy(),
-        isAllowed: () =>
-          (liveConfig.env === "testnet" ? true : engineForGate !== null && engineForGate.isArmed()) &&
-          (engineForGate?.laneSelectionAllowsLane(IM_PAPER_LANE_ID) ?? true),
+        // 2026-07-08 audit fix: same as SHORT_FADE_EXHAUSTION above.
+        isAllowed: () => isNewExecutorLaneAllowed(IM_PAPER_LANE_ID, liveConfig.env === "testnet" ? "testnet" : "mainnet", engineForGate),
         laneWeightPct: () => engineForGate?.laneSelectionWeightPctForLane(IM_PAPER_LANE_ID) ?? 100,
         legUsd: IM_EXEC_LEG_USD,
         leverage: IM_EXEC_LEVERAGE,
@@ -505,7 +495,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     if (isRegimeAutopilotEnabled() && liveEngine) {
       const engineForPilot = liveEngine;
       regimeAutopilot = new RegimeAutopilot({
-        setAllocations: (a) => { engineForPilot.applyRegimeAutopilotAllocation(a); },
+        setAllocations: (a) => engineForPilot.applyRegimeAutopilotAllocation(a),
         getLatestRegime: () => {
           const snaps = getRegimeEngineStore().snapshots;
           return snaps.length > 0 ? snaps[snaps.length - 1]!.regime : null;

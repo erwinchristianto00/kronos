@@ -278,6 +278,10 @@ export function annotateSingleSymbolAccount(
     const legUnrealized = row.markPrice !== null && pos.entryPrice > 0 ? (row.markPrice - pos.entryPrice) * pos.qty * dir : null;
     row.basketQty = (row.basketQty ?? 0) + pos.qty * dir;
     if (legUnrealized !== null) row.basketUnrealizedPnl = (row.basketUnrealizedPnl ?? 0) + legUnrealized;
+    // Real exchange-side protective stop — NOT an engine TP1, never conflate with targetTpPrice
+    // (2026-07-09 audit finding: the dashboard was rendering this book type's TP columns as if it
+    // were a basket, with no way to show the stop it's ACTUALLY protected by).
+    row.singleSymbolStopPrice = pos.stopPrice;
     laneRow.sourceOrderCount += 1;
     laneRow.symbols.add(row.symbol);
     laneRow.notionalUsd += Math.abs(pos.qty * pos.entryPrice);

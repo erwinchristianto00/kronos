@@ -103,8 +103,12 @@ export function isRegimeAutopilotEnabled(env: NodeJS.ProcessEnv = process.env): 
 }
 
 export interface RegimeAutopilotOptions {
-  /** Apply an allocation to the live engine (engine.setLaneAllocations). */
-  setAllocations: (allocations: LaneAllocationEntry[]) => void;
+  /** Apply an allocation to the live engine (engine.applyRegimeAutopilotAllocation). Returns
+   *  {ok:false} on rejection (e.g. a future preset edit violating setLaneAllocations' own
+   *  constraints — >4 lanes, duplicate laneId, weightPct outside (0,100]) — tick() must NOT mark
+   *  the switch as applied when this happens, or the live engine silently keeps running the OLD
+   *  allocation while RegimeAutopilot's own state believes the new one succeeded. */
+  setAllocations: (allocations: LaneAllocationEntry[]) => { ok: boolean; reason?: string | null };
   /** Latest detected regime string from the report-only regime engine (null when none). */
   getLatestRegime: () => string | null;
   /** Operator override (2026-07-08): while the execution mode is MANUAL the operator owns the
@@ -185,8 +189,13 @@ export class RegimeAutopilot {
       return;
     }
 
-    // Stable + past min-hold + a genuine change → apply.
-    this.opts.setAllocations(REGIME_AUTOPILOT_PRESETS[regime]!.map((e) => ({ ...e })));
+    // Stable + past min-hold + a genuine change → apply. Only mark it applied if the engine
+    // actually accepted it — a rejected allocation must not be silently believed to have switched.
+    const result = this.opts.setAllocations(REGIME_AUTOPILOT_PRESETS[regime]!.map((e) => ({ ...e })));
+    if (!result.ok) {
+      this.lastSkipReason = `apply-rejected:${result.reason ?? "unknown"}`;
+      return;
+    }
     this.appliedRegime = regime;
     this.lastSwitchMs = now;
     this.lastSkipReason = null;

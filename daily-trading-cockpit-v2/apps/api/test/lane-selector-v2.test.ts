@@ -122,6 +122,89 @@ describe("LaneSelectorV2 — manualEnabledVariantIds bypass (2026-07-08, wiring 
     // Falls through to score-best among what WAS evaluated (CG_MFE_GIVEBACK, higher netAvgR).
     expect(result.selected?.lane.selectedLaneId).toBe(laneSelectorV2LaneId("CG_MFE_GIVEBACK"));
   });
+
+  // 2026-07-08 audit fix: in manual-selector-mode (controllerMode forced to BOTH_ALLOWED),
+  // estimateLaneSelectorV2Regime ALWAYS returns direction "MIXED" regardless of the real detected
+  // regime. Combined with a regime label that doesn't map to a recognized bull/bear/chop family,
+  // rotationShortlistGateActive() used to silently return false (gate INACTIVE) even with a real
+  // rotationShortlist present — letting a manually-force-lifted lane trade ANY symbol with zero
+  // per-symbol shortlist proof. This must stay active (require proof) in that ambiguous case.
+  it("still requires rotation-shortlist proof for a manually-allocated lane in manual mode with an unrecognized regime label", () => {
+    const result = selectLaneV2({
+      candidate: { symbol: "WLDUSDT", direction: "SHORT" as const, currentPrice: 100, stopLoss: 104, takeProfitLevels: [94], stopDistanceBps: 400 },
+      regime: "REGIME_7", // deliberately unrecognized by rotationRegimeFamilyForLabel's keyword match
+      controllerMode: "BOTH_ALLOWED", // manual-selector-mode's forced controller mode
+      now: "2026-07-08T04:00:00.000Z",
+      manualEnabledVariantIds: new Set(["CG_WIDE_STOP_TP_WIDE"]),
+      rotationShortlist: {
+        generatedAt: "2026-07-08T04:00:00.000Z",
+        minAllowSample: 10,
+        minWatchSample: 5,
+        bearishGlobal: [],
+        bullishGlobal: [],
+        lanes: [
+          {
+            laneId: laneSelectorV2LaneId("CG_WIDE_STOP_TP_WIDE"),
+            variantId: "CG_WIDE_STOP_TP_WIDE",
+            label: "Wide",
+            bullish: [],
+            // No ALLOW verdict for WLDUSDT specifically — this symbol has NOT been proven for this
+            // lane, so the shortlist gate (if active, as it must be) should refuse it.
+            bearish: [{ symbol: "INJUSDT", n: 18, netAvgR: 0.22, pf: 2.1, wr: 0.78, score: 30, verdict: "ALLOW", reason: "test allow" }],
+          },
+        ],
+      },
+      laneStates: [
+        { variantId: "CG_WIDE_STOP_TP_WIDE", status: "STABLE_CANDIDATE", freshValid: 200, netAvgR: 9, pf: 9 },
+      ],
+    });
+    expect(result.selected).toBeNull();
+    expect(result.rejected).toContain("CG_WIDE_STOP_TP_WIDE:rotation_shortlist_blocked");
+  });
+});
+
+// 2026-07-09 audit: the manualEnabledVariantIds bypass block above only exercises the SHORT branch
+// of policyPreferredVariants (line ~376: `if (inputs.candidate.direction === "SHORT") return
+// [SHORT_FAST_VARIANT_ID]`). The bypass's `if (... .size > 0) return []` sits BEFORE that AND before
+// the separate LONG+WIDE_TREND branch (`estimated.policy === "WIDE_TREND" && estimated.direction ===
+// "LONG" && candidate.direction === "LONG"` → force CG_WIDE_FAST_LONG) — untested until now.
+describe("LaneSelectorV2 — manualEnabledVariantIds bypass on the LONG+WIDE_TREND branch", () => {
+  function longWideTrendCandidate(overrides: Partial<Parameters<typeof selectLaneV2>[0]> = {}) {
+    const estimatedRegime = estimateLaneSelectorV2Regime({
+      regime: "Bullish expansion",
+      controllerMode: "LONG_ONLY",
+      confidence: "MEDIUM",
+    });
+    return selectLaneV2({
+      candidate: { symbol: "ETHUSDT", direction: "LONG" as const, currentPrice: 100, stopLoss: 97, takeProfitLevels: [110], stopDistanceBps: 300 },
+      regime: "Bullish expansion",
+      controllerMode: "LONG_ONLY",
+      controllerConfidence: "MEDIUM",
+      estimatedRegime,
+      now: "2026-06-25T04:00:00.000Z",
+      laneStates: [
+        { variantId: "CG_WIDE_FAST_LONG" as const, status: "STABLE_CANDIDATE" as const, freshValid: 200, netAvgR: 0.1, pf: 1.1 },
+        { variantId: "CG_WIDE_LONG_RUNNER" as const, status: "STABLE_CANDIDATE" as const, freshValid: 200, netAvgR: 0.5, pf: 2.0 },
+      ],
+      ...overrides,
+    });
+  }
+
+  it("without manualEnabledVariantIds, the hardcoded CG_WIDE_FAST_LONG preference wins in a WIDE_TREND bull even against a higher-scored competing lane", () => {
+    expect(estimateLaneSelectorV2Regime({ regime: "Bullish expansion", controllerMode: "LONG_ONLY", confidence: "MEDIUM" }).policy).toBe("WIDE_TREND");
+    const result = longWideTrendCandidate();
+    expect(result.selected?.lane.selectedLaneId).toBe(laneSelectorV2LaneId("CG_WIDE_FAST_LONG"));
+  });
+
+  it("a non-empty manualEnabledVariantIds bypasses the WIDE_TREND+LONG hardcoded preference too — the higher-scored allocated lane wins", () => {
+    const result = longWideTrendCandidate({ manualEnabledVariantIds: new Set(["CG_WIDE_LONG_RUNNER"]) });
+    expect(result.selected?.lane.selectedLaneId).toBe(laneSelectorV2LaneId("CG_WIDE_LONG_RUNNER"));
+  });
+
+  it("an empty manualEnabledVariantIds set behaves the same as omitted on this branch too (still hardcoded default)", () => {
+    const result = longWideTrendCandidate({ manualEnabledVariantIds: new Set() });
+    expect(result.selected?.lane.selectedLaneId).toBe(laneSelectorV2LaneId("CG_WIDE_FAST_LONG"));
+  });
 });
 
 describe("LaneSelectorV2", () => {

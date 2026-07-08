@@ -611,4 +611,27 @@ describe("realtime-short-mirror — fresh short live-mirror source (mode 2)", ()
     expect(result.emitted).toBe(1);
     expect(store.all[0]!.selectedLaneId).toBe(realtimeShortSelectedLaneId("CG_WIDE_FAST_LONG"));
   });
+
+  // 2026-07-08 audit fix: allowTacticalLongs used to be a blanket "manualEnabledVariantIds is
+  // non-empty" check — allocating an unrelated SHORT-only lane (e.g. CG_WIDE_FAST_SHORT) would
+  // incidentally ALSO unlock tactical longs the operator never asked for. Must stay scoped to an
+  // allocation that actually contains a LONG-capable variant.
+  it("[ALLOCATION-FORCE] a SHORT-only allocation does NOT unlock tactical longs outside WIDE_TREND", () => {
+    // CG_WIDE_FAST_LONG is ALREADY naturally STABLE_CANDIDATE here (not force-lifted) — isolates
+    // the test to policyBlockReason's tactical-longs check specifically: with the buggy blanket
+    // "manualEnabledVariantIds.size > 0" version this lane would still get selected (the block
+    // lifts even though nothing LONG-capable was allocated); with the fix it must stay blocked.
+    const tacticalBull = {
+      regime: "Bullish expansion",
+      controllerMode: "LONG_ONLY",
+      controllerConfidence: "MEDIUM",
+      estimatedRegime: { posture: "TACTICAL_OR_MIXED", direction: "MIXED", policy: "TACTICAL_70_30", reason: "test" } as const,
+      stableShortLaneActive: false,
+      stableShortLanes: [{ variantId: "CG_WIDE_FAST_LONG", status: "STABLE_CANDIDATE", freshValid: 200, netAvgR: 0.28, pf: 1.5 }],
+      manualEnabledVariantIds: new Set(["CG_WIDE_FAST_SHORT"]), // SHORT-only — no LONG-capable variant allocated
+    };
+    const longCand = { symbol: "ETHUSDT", direction: "LONG" as const, currentPrice: 100, stopLoss: 97, takeProfitLevels: [110] };
+    const result = runRealtimeShortMirror(inputs([longCand], tacticalBull), freshStore());
+    expect(result.emitted).toBe(0); // tactical-longs block stays in place — nothing LONG-capable was allocated
+  });
 });

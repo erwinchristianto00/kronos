@@ -39,12 +39,39 @@ export interface RegimeAxisZone {
  *  only earns in genuine trends; the neutral band is cross-sectional's home). Boundaries are
  *  GUIDANCE, not decision logic — the engine's own regime label stays authoritative, and
  *  perRegimeMedianScore in the timeline shows where each label empirically sits on this axis. */
+// 2026-07-09: laneHint text kept in sync with regime-autopilot.ts's REGIME_AUTOPILOT_PRESETS —
+// each zone maps to its closest analogous autopilot preset (TREND zones → the two "confirmed
+// trend" presets BEAR_TREND/TREND_RECOVERY; LEAN zones → the tactical/not-yet-confirmed presets
+// BEARISH_CHOPPY_DEFENSIVE/NEUTRAL_RECOVERY). This is a rough analogy, not an identity — this
+// axis's 5 zones come from a continuous score, the regime engine's 5 labels are discrete, and the
+// two classifiers can disagree at the margins. Composition, not just the anchor lane, so the
+// operator sees where the OTHER 3 slots in a 4-lane preset actually go.
 export const REGIME_AXIS_ZONES: readonly RegimeAxisZone[] = [
-  { from: 0.45, to: 1, label: "BULL TREND", laneHint: "LONG wide/runner (FAST_LONG 70 + LONG_RUNNER 30)" },
-  { from: 0.12, to: 0.45, label: "BULL LEAN", laneHint: "LONG fast TP (CG_WIDE_FAST_LONG)" },
-  { from: -0.12, to: 0.12, label: "NEUTRAL", laneHint: "cross-sectional only — directional edge unproven here" },
-  { from: -0.45, to: -0.12, label: "BEAR LEAN", laneHint: "SHORT fast TP (CG_WIDE_FAST_SHORT)" },
-  { from: -1, to: -0.45, label: "BEAR TREND", laneHint: "SHORT wide/trend (FAST_SHORT 60 + XSEC 40)" },
+  {
+    from: 0.45,
+    to: 1,
+    label: "BULL TREND",
+    laneHint: "LONG wide/runner + trend-follow (≈TREND_RECOVERY: FAST_LONG 30 + LONG_RUNNER 25 + MFE_GIVEBACK 20 + XSEC_TREND 25)",
+  },
+  {
+    from: 0.12,
+    to: 0.45,
+    label: "BULL LEAN",
+    laneHint: "LONG fast TP + tactical add-ons (≈NEUTRAL_RECOVERY: FAST_LONG 35 + INTRADAY_MOMENTUM 15 + XSEC_MIXED 20 + XSEC_NEUTRAL 30)",
+  },
+  { from: -0.12, to: 0.12, label: "NEUTRAL", laneHint: "cross-sectional only — directional edge unproven here (≈NO_TRADE: XSEC_NEUTRAL 100)" },
+  {
+    from: -0.45,
+    to: -0.12,
+    label: "BEAR LEAN",
+    laneHint: "SHORT fast TP + tactical add-ons (≈BEARISH_CHOPPY_DEFENSIVE: FAST_SHORT 35 + SHORT_FADE_EXHAUSTION 15 + XSEC_MIXED 20 + XSEC_NEUTRAL 30)",
+  },
+  {
+    from: -1,
+    to: -0.45,
+    label: "BEAR TREND",
+    laneHint: "SHORT wide/trend-follow (≈BEAR_TREND: FAST_SHORT 35 + MFE_GIVEBACK 15 + XSEC_TREND 20 + XSEC_NEUTRAL 30)",
+  },
 ];
 
 export interface RegimeAxisTimeline {
@@ -198,8 +225,8 @@ export function buildRegimeAxisTimeline(
         etaToSwitchHours: eta !== null ? Math.round(eta * 10) / 10 : null,
         note:
           dirLabel === "MENUJU_NETRAL"
-            ? "Masih zona bear: PEGANG FAST_SHORT selama skor < -0.12 — recovery di dalam zona bear BUKAN sinyal long (buku sendiri: long counter-regime rugi). Ganti ke FAST_LONG hanya SETELAH skor menembus -0.12 dan bertahan; sebelum itu profit short dibank oleh exit otomatis."
-            : "Zona bear dan masih menjauh/flat dari netral: FAST_SHORT tetap lane-nya. Tidak ada titik switch selama arah belum berbalik.",
+            ? "Masih zona bear: PEGANG FAST_SHORT selama skor < -0.12 — recovery di dalam zona bear BUKAN sinyal long (buku sendiri: long counter-regime rugi). Ganti ke FAST_LONG hanya SETELAH skor menembus -0.12 dan bertahan; sebelum itu profit short dibank oleh exit otomatis. (Preset autopilot regime ini juga jalankan MFE_GIVEBACK/SHORT_FADE_EXHAUSTION sebagai runner + cross-sectional trend/mixed + market-neutral ballast — lihat REGIME_AXIS_ZONES.laneHint untuk komposisi penuh.)"
+            : "Zona bear dan masih menjauh/flat dari netral: FAST_SHORT tetap lane-nya. Tidak ada titik switch selama arah belum berbalik. (Preset autopilot regime ini juga jalankan MFE_GIVEBACK/SHORT_FADE_EXHAUSTION sebagai runner + cross-sectional trend/mixed + market-neutral ballast — lihat REGIME_AXIS_ZONES.laneHint untuk komposisi penuh.)",
       };
     } else if (sc >= 0.12) {
       const switchAt = 0.12;
@@ -213,8 +240,8 @@ export function buildRegimeAxisTimeline(
         etaToSwitchHours: eta !== null ? Math.round(eta * 10) / 10 : null,
         note:
           dirLabel === "MENUJU_NETRAL"
-            ? "Masih zona bull: PEGANG FAST_LONG selama skor > +0.12 — pelemahan di dalam zona bull bukan sinyal short. Ganti ke FAST_SHORT hanya SETELAH skor menembus +0.12 ke bawah dan bertahan."
-            : "Zona bull dan masih menjauh/flat dari netral: FAST_LONG tetap lane-nya.",
+            ? "Masih zona bull: PEGANG FAST_LONG selama skor > +0.12 — pelemahan di dalam zona bull bukan sinyal short. Ganti ke FAST_SHORT hanya SETELAH skor menembus +0.12 ke bawah dan bertahan. (Preset autopilot regime ini juga jalankan LONG_RUNNER/INTRADAY_MOMENTUM sebagai runner + cross-sectional trend/mixed + market-neutral ballast — lihat REGIME_AXIS_ZONES.laneHint untuk komposisi penuh.)"
+            : "Zona bull dan masih menjauh/flat dari netral: FAST_LONG tetap lane-nya. (Preset autopilot regime ini juga jalankan LONG_RUNNER/INTRADAY_MOMENTUM sebagai runner + cross-sectional trend/mixed + market-neutral ballast — lihat REGIME_AXIS_ZONES.laneHint untuk komposisi penuh.)",
       };
     } else {
       guidance = {

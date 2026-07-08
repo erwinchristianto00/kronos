@@ -29,6 +29,10 @@ function positionOf(over: Partial<SingleSymbolPosition> = {}): SingleSymbolPosit
     entryPriceConfirmed: true,
     stopPrice: 61800,
     stopAlgoOrderId: 900,
+    stopFailureCount: 0,
+    stopUnprotectedSinceIso: null,
+    closeFailureCount: 0,
+    closeFailureSinceIso: null,
     peakFavorableR: 0,
     openedAt: NOW,
     status: "OPEN",
@@ -81,11 +85,14 @@ describe("annotateSingleSymbolAccount", () => {
     const executor = makeExecutorWithPositions([positionOf()]);
     const p = { ...position("BTCUSDT", "SHORT", 0.01, 2), markPrice: 59000 };
     const annotated = annotateSingleSymbolAccount(snapshot([p]), executor);
-    const row = annotated.positions[0]! as { laneIds: string[]; basketQty?: number; basketUnrealizedPnl?: number };
+    const row = annotated.positions[0]! as { laneIds: string[]; basketQty?: number; basketUnrealizedPnl?: number; singleSymbolStopPrice?: number | null };
     expect(row.laneIds).toEqual(["SHORT_FADE_EXHAUSTION_CROWDED"]);
     // SHORT: (entry 60000 - mark 59000) * qty 0.01 = 10
     expect(row.basketUnrealizedPnl).toBeCloseTo(10, 6);
     expect(row.basketQty).toBeCloseTo(-0.01, 6); // SHORT dir = -1
+    // 2026-07-09: real exchange-side stop, distinct from a basket horizon or engine TP1 — the
+    // dashboard fix for the single-symbol/basket-leg conflation reads this field directly.
+    expect(row.singleSymbolStopPrice).toBe(61800);
   });
 
   it("leaves a foreign position (different symbol) unattributed", () => {

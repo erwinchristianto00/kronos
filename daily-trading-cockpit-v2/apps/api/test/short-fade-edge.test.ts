@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import type { Candle } from "@dtc/shared";
 import {
   detectShortFadeRsiSignal,
@@ -10,6 +10,15 @@ import {
   runShortFadeCycleGuarded,
   ShortFadeStore,
   SF_RSI_OVERBOUGHT,
+  SF_TP_REWARD_MULTIPLE,
+  SF_MAX_HOLD_BARS,
+  shortFadeOpenSignals,
+  shortFadeExitPolicy,
+  isShortFadeExecEnabled,
+  SF_EXEC_LEG_USD,
+  SF_EXEC_LEVERAGE,
+  SF_EXEC_MAX_SIGNAL_AGE_MS,
+  SF_EXEC_DAILY_MAX_LOSS_USD,
   type ShortFadeObservation,
 } from "../src/lib/short-fade-edge.js";
 import type { CrowdingSnapshot } from "../src/lib/derivatives-crowding.js";
@@ -324,5 +333,146 @@ describe("short-fade — cycle liveness meta", () => {
     });
     expect(crashed).toBeNull();
     expect(store.cycleMeta.lastCycleError).toBe("disk full");
+  });
+});
+
+function shortFadeObs(over: Partial<ShortFadeObservation> = {}): ShortFadeObservation {
+  return {
+    observationId: "sf:TESTUSDT:1",
+    symbol: "TESTUSDT",
+    direction: "SHORT",
+    entryPrice: 100,
+    initialStop: 103,
+    takeProfitPrice: 98.5,
+    stopDistanceBps: 300,
+    openedAt: new Date(1_000_000_000_000).toISOString(),
+    openedAtMs: 1_000_000_000_000,
+    rsiAtEntry: 70,
+    rsiPriorBar: 76,
+    fundingBps: null,
+    oiChangePercent: null,
+    status: "OPEN",
+    grossR: null,
+    costR: null,
+    netR: null,
+    exitReason: null,
+    resolvedAt: null,
+    ...over,
+  };
+}
+
+describe("short-fade — live execution wiring adapters", () => {
+  it("[shortFadeOpenSignals] maps only OPEN observations into the generic executor's fresh-signal shape", () => {
+    const store = new ShortFadeStore(`/tmp/sf-adapter-${Date.now()}-${Math.random()}.json`);
+    store.add(shortFadeObs({ observationId: "sf:A:1", symbol: "AUSDT", status: "OPEN" }));
+    store.add(shortFadeObs({ observationId: "sf:B:1", symbol: "BUSDT", status: "CLOSED_WIN" }));
+    const signals = shortFadeOpenSignals(store);
+    expect(signals).toHaveLength(1);
+    expect(signals[0]).toEqual({
+      observationId: "sf:A:1",
+      symbol: "AUSDT",
+      entryPrice: 100,
+      stopPrice: 103,
+      openedAtMs: 1_000_000_000_000,
+    });
+  });
+
+  it("[shortFadeOpenSignals] returns an empty array when the store has no OPEN observations", () => {
+    const store = new ShortFadeStore(`/tmp/sf-adapter-${Date.now()}-${Math.random()}.json`);
+    store.add(shortFadeObs({ status: "CLOSED_LOSS" }));
+    expect(shortFadeOpenSignals(store)).toEqual([]);
+  });
+
+  it("[shortFadeExitPolicy] exits at SF_TP_REWARD_MULTIPLE R on a SHORT (price fell)", () => {
+    const policy = shortFadeExitPolicy();
+    const risk = 3; // entry 100, stop 103
+    const favorablePrice = 100 - SF_TP_REWARD_MULTIPLE * risk;
+    const decision = policy({ direction: "SHORT", entryPrice: 100, stopPrice: 103, currentPrice: favorablePrice, peakFavorableR: 0, msHeld: 1000 });
+    expect(decision.shouldExit).toBe(true);
+    expect(decision.reason).toBe("TP_HIT");
+  });
+
+  it("[shortFadeExitPolicy] exits at INITIAL_STOP once price reaches -1R (the stop) on a SHORT", () => {
+    const policy = shortFadeExitPolicy();
+    const decision = policy({ direction: "SHORT", entryPrice: 100, stopPrice: 103, currentPrice: 103, peakFavorableR: 0, msHeld: 1000 });
+    expect(decision.shouldExit).toBe(true);
+    expect(decision.reason).toBe("INITIAL_STOP");
+  });
+
+  it("[shortFadeExitPolicy] falls back to MAX_HOLD_MTM once SF_MAX_HOLD_BARS worth of ms has elapsed", () => {
+    const policy = shortFadeExitPolicy();
+    const decision = policy({
+      direction: "SHORT", entryPrice: 100, stopPrice: 103, currentPrice: 100.5, peakFavorableR: 0,
+      msHeld: SF_MAX_HOLD_BARS * 3_600_000,
+    });
+    expect(decision.shouldExit).toBe(true);
+    expect(decision.reason).toBe("MAX_HOLD_MTM");
+  });
+
+  it("[shortFadeExitPolicy] stays open when neither TP, stop, nor max-hold has been reached", () => {
+    const policy = shortFadeExitPolicy();
+    const decision = policy({ direction: "SHORT", entryPrice: 100, stopPrice: 103, currentPrice: 100.5, peakFavorableR: 0, msHeld: 1000 });
+    expect(decision.shouldExit).toBe(false);
+    expect(decision.reason).toBeNull();
+  });
+
+  it("[isShortFadeExecEnabled] is off by default and only on with the exact '1' flag", () => {
+    expect(isShortFadeExecEnabled({})).toBe(false);
+    expect(isShortFadeExecEnabled({ SHORT_FADE_EXEC_ENABLED: "true" })).toBe(false);
+    expect(isShortFadeExecEnabled({ SHORT_FADE_EXEC_ENABLED: "1" })).toBe(true);
+  });
+
+  describe("SF_EXEC_* config readers", () => {
+    const keys = [
+      "SHORT_FADE_EXEC_LEG_USD",
+      "SHORT_FADE_EXEC_LEVERAGE",
+      "SHORT_FADE_EXEC_MAX_SIGNAL_AGE_MS",
+      "SHORT_FADE_EXEC_DAILY_MAX_LOSS_USD",
+    ] as const;
+    const saved: Record<string, string | undefined> = {};
+
+    beforeEach(() => {
+      for (const k of keys) { saved[k] = process.env[k]; delete process.env[k]; }
+    });
+    afterEach(() => {
+      for (const k of keys) {
+        if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k];
+      }
+    });
+
+    it("SF_EXEC_LEG_USD defaults to 25 and honors a valid positive override", () => {
+      expect(SF_EXEC_LEG_USD()).toBe(25);
+      process.env.SHORT_FADE_EXEC_LEG_USD = "40";
+      expect(SF_EXEC_LEG_USD()).toBe(40);
+    });
+
+    it("SF_EXEC_LEG_USD ignores a non-positive or garbage override and falls back to the default", () => {
+      process.env.SHORT_FADE_EXEC_LEG_USD = "-5";
+      expect(SF_EXEC_LEG_USD()).toBe(25);
+      process.env.SHORT_FADE_EXEC_LEG_USD = "not-a-number";
+      expect(SF_EXEC_LEG_USD()).toBe(25);
+    });
+
+    it("SF_EXEC_LEVERAGE defaults to 3, floors a fractional override, rejects <1", () => {
+      expect(SF_EXEC_LEVERAGE()).toBe(3);
+      process.env.SHORT_FADE_EXEC_LEVERAGE = "5";
+      expect(SF_EXEC_LEVERAGE()).toBe(5);
+      process.env.SHORT_FADE_EXEC_LEVERAGE = "0";
+      expect(SF_EXEC_LEVERAGE()).toBe(3);
+    });
+
+    it("SF_EXEC_MAX_SIGNAL_AGE_MS defaults to 50 minutes and floors at 60s", () => {
+      expect(SF_EXEC_MAX_SIGNAL_AGE_MS()).toBe(50 * 60_000);
+      process.env.SHORT_FADE_EXEC_MAX_SIGNAL_AGE_MS = "1000";
+      expect(SF_EXEC_MAX_SIGNAL_AGE_MS()).toBe(60_000); // floored
+      process.env.SHORT_FADE_EXEC_MAX_SIGNAL_AGE_MS = "120000";
+      expect(SF_EXEC_MAX_SIGNAL_AGE_MS()).toBe(120_000);
+    });
+
+    it("SF_EXEC_DAILY_MAX_LOSS_USD defaults to 0 (no cap) and honors a positive override", () => {
+      expect(SF_EXEC_DAILY_MAX_LOSS_USD()).toBe(0);
+      process.env.SHORT_FADE_EXEC_DAILY_MAX_LOSS_USD = "15";
+      expect(SF_EXEC_DAILY_MAX_LOSS_USD()).toBe(15);
+    });
   });
 });

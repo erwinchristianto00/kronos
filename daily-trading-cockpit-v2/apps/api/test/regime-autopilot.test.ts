@@ -5,13 +5,16 @@ import {
   type LaneAllocationEntry,
 } from "../src/lib/regime-autopilot.js";
 
-function makePilot(opts: { stableCycles?: number; minHoldMs?: number } = {}) {
+function makePilot(opts: { stableCycles?: number; minHoldMs?: number; setAllocationsResult?: { ok: boolean; reason?: string } } = {}) {
   const applied: Array<LaneAllocationEntry[]> = [];
   let regime: string | null = null;
   let now = 1_000_000_000_000;
   let manualMode = false;
   const pilot = new RegimeAutopilot({
-    setAllocations: (a) => applied.push(a),
+    setAllocations: (a) => {
+      applied.push(a);
+      return opts.setAllocationsResult ?? { ok: true };
+    },
     getLatestRegime: () => regime,
     isManualMode: () => manualMode,
     nowMs: () => now,
@@ -115,11 +118,31 @@ describe("regime auto-pilot (Tier 1)", () => {
     expect(pilot.getStatus().lastSkipReason).toMatch(/no-preset/);
   });
 
+  // 2026-07-08 audit fix: setAllocations used to be void-returning — a rejected apply (e.g. a
+  // future preset edit violating setLaneAllocations' own >4-lane/duplicate/weight constraints)
+  // was silently treated as a success, leaving RegimeAutopilot's own state believing it switched
+  // while the live engine's real allocation stayed on the OLD preset.
+  it("does NOT mark the regime as applied when setAllocations reports a rejection", () => {
+    const { pilot, applied, setRegime } = makePilot({ stableCycles: 1, setAllocationsResult: { ok: false, reason: "test rejection" } });
+    setRegime("TREND_RECOVERY");
+    pilot.tick();
+    expect(applied.length).toBe(1); // the attempt was made...
+    expect(pilot.getStatus().appliedRegime).toBeNull(); // ...but never accepted
+    expect(pilot.getStatus().lastSkipReason).toMatch(/apply-rejected:test rejection/);
+    // A later tick must RETRY (not permanently give up) since appliedRegime never advanced.
+    pilot.tick();
+    expect(applied.length).toBe(2);
+  });
+
   it("every preset uses valid weights (0,100] summing sensibly and includes the cross-sectional backbone where non-directional", () => {
     for (const [regime, preset] of Object.entries(REGIME_AUTOPILOT_PRESETS)) {
       const total = preset.reduce((s, e) => s + e.weightPct, 0);
-      expect(total).toBeGreaterThan(0);
-      expect(total).toBeLessThanOrEqual(100);
+      // 2026-07-08 audit fix: was `<= 100` only, which would silently pass an accidentally
+      // under-allocated preset (e.g. summing to 70) identically to a correctly-balanced one.
+      // setLaneAllocations rounds each weightPct with Math.round, so require the sum to land
+      // EXACTLY on 100 post-rounding — a preset design intentionally holding cash in reserve
+      // would need its own explicit test, not a silent pass-through here.
+      expect(total, `${regime} preset weights sum to ${total}, expected exactly 100`).toBe(100);
       for (const e of preset) {
         expect(e.weightPct).toBeGreaterThan(0);
         expect(e.weightPct).toBeLessThanOrEqual(100);

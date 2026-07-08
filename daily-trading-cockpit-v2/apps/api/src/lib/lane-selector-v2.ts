@@ -183,6 +183,16 @@ export function laneSelectorV2LaneId(variantId: VariantMatrixVariantId): string 
   return LANE_CONFIGS.get(variantId)?.selectedLaneId ?? `CG_VARIANT_MATRIX:${variantId}`;
 }
 
+/** True when the given variant id is a LIVE-supported VM variant that can trade LONG (i.e. not
+ *  shortOnly). Unknown/unsupported ids (including non-VM lane ids like CROSS_SECTIONAL_TREND or
+ *  SHORT_FADE_EXHAUSTION_CROWDED) are NOT long-capable by this check — used to scope
+ *  allowTacticalLongs to an allocation that actually contains a LONG-capable variant, instead of
+ *  any non-empty allocation regardless of direction (see realtime-short-mirror.ts). */
+export function isLaneSelectorV2LongCapableVariantId(id: string | null | undefined): boolean {
+  const config = LANE_CONFIGS.get(id as VariantMatrixVariantId);
+  return config !== undefined && !config.definition.shortOnly;
+}
+
 export function isLaneSelectorV2LongWideStopOverride(input: {
   variantId: string | null | undefined;
   direction: Direction;
@@ -409,11 +419,24 @@ function rotationShortlistGateActive(
   estimated: LaneSelectorV2EstimatedRegime,
 ): boolean {
   if (!inputs.rotationShortlist) return false;
+  const regimeFamily = rotationRegimeFamilyForLabel(inputs.regime);
   return (
     (inputs.candidate.direction === "LONG" && estimated.direction === "LONG") ||
     (inputs.candidate.direction === "SHORT" && estimated.direction === "SHORT") ||
-    (inputs.candidate.direction === "LONG" && rotationRegimeFamilyForLabel(inputs.regime) === "BULLISH") ||
-    (inputs.candidate.direction === "SHORT" && rotationRegimeFamilyForLabel(inputs.regime) === "BEARISH")
+    (inputs.candidate.direction === "LONG" && regimeFamily === "BULLISH") ||
+    (inputs.candidate.direction === "SHORT" && regimeFamily === "BEARISH") ||
+    // 2026-07-08: when NEITHER the estimated regime direction nor the regime-label family can be
+    // determined (estimated.direction === "MIXED" and the label matches none of the bull/bear/
+    // chop keywords — always true in manual-selector-mode, since controllerMode BOTH_ALLOWED
+    // forces estimated.direction to MIXED regardless of the real detected regime), do NOT
+    // silently skip the shortlist-proof requirement. A genuinely undetermined regime is exactly
+    // the case where proof-of-edge matters MOST, not least — without this, a manually-allocated
+    // lane (manualEnabledVariantIds force-lift to STABLE_CANDIDATE) could trade any symbol with
+    // zero per-symbol shortlist proof simply because the ambient regime label happened not to
+    // contain a recognized keyword. Deliberately distinct from a genuinely CHOP-labeled regime
+    // (regimeFamily === "MIXED"), where the gate staying inactive is the existing, intentional
+    // behavior — this only closes the "unclassifiable" gap, not the "confirmed chop" case.
+    (estimated.direction === "MIXED" && regimeFamily === "UNKNOWN")
   );
 }
 

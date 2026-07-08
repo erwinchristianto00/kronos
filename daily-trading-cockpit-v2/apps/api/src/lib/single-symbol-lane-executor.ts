@@ -37,7 +37,7 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 
-import { resolveConfirmedFillPrice, type BinanceFuturesPrivateClient } from "./binance-futures-private.js";
+import { BinanceFuturesPrivateError, resolveConfirmedFillPrice, type BinanceFuturesPrivateClient } from "./binance-futures-private.js";
 
 export type SingleSymbolExecClient = Pick<
   BinanceFuturesPrivateClient,
@@ -128,6 +128,20 @@ export interface SingleSymbolPosition {
   /** Exchange-side protective stop algo order id. Null only in the brief window between a
    *  confirmed entry and the stop placement succeeding — see ensureStopOrder(). */
   stopAlgoOrderId: number | null;
+  /** Consecutive ensureStopOrder() failures (resets to 0 on success). A position with this > 0
+   *  AND stopAlgoOrderId still null is genuinely unprotected right now, not just "about to be
+   *  protected next tick" — surfaced via getStatus().unprotectedPositions so a stuck-for-hours
+   *  case is distinguishable from a one-tick blip. */
+  stopFailureCount: number;
+  /** ISO timestamp of the FIRST failure in the current stopFailureCount streak; null once a stop
+   *  placement succeeds. Lets a monitor compute how LONG a position has been unprotected. */
+  stopUnprotectedSinceIso: string | null;
+  /** Consecutive closePosition() order-placement failures (resets to 0 on success). A position
+   *  the exit policy already decided to escape stuck OPEN with this > 0 means the close itself is
+   *  failing repeatedly (e.g. a persistent non-(-2022) rejection) — surfaced via
+   *  getStatus().stuckClosePositions. */
+  closeFailureCount: number;
+  closeFailureSinceIso: string | null;
   peakFavorableR: number;
   openedAt: string;
   status: "OPEN" | "CLOSED" | "ABORTED";
@@ -302,9 +316,19 @@ export class SingleSymbolLaneExecutor {
     totalNetPnlUsd: number;
     lastError: string | null;
     recent: SingleSymbolPosition[];
+    /** OPEN positions with a stop-placement failure streak in progress right now (stopAlgoOrderId
+     *  still null AND stopFailureCount > 0) — genuinely unprotected, not a one-tick blip. Empty in
+     *  the normal case. A non-empty array here for more than a few minutes is an alert-worthy
+     *  condition: real money exposed with zero exchange-side stop protection. */
+    unprotectedPositions: Array<{ positionId: string; symbol: string; stopFailureCount: number; stopUnprotectedSinceIso: string | null }>;
+    /** OPEN positions whose exit policy already decided to close them, but the close order itself
+     *  is repeatedly failing (closeFailureCount > 0) — stuck, retried every tick, never escalated
+     *  beyond the single lastError field otherwise. */
+    stuckClosePositions: Array<{ positionId: string; symbol: string; closeFailureCount: number; closeFailureSinceIso: string | null }>;
   } {
     const st = this.store.getState();
     const closed = st.positions.filter((p) => p.status === "CLOSED");
+    const open = st.positions.filter((p) => p.status === "OPEN");
     return {
       laneId: this.laneId,
       direction: this.direction,
@@ -316,10 +340,16 @@ export class SingleSymbolLaneExecutor {
       dailyRealizedUsd: this.dailyRealizedUsd(this.nowIso()),
       dailyMaxLossUsd: this.dailyMaxLossUsdFn(),
       openHalted: this.openHalted,
-      openPositions: st.positions.filter((p) => p.status === "OPEN"),
+      openPositions: open,
       closedCount: closed.length,
       totalNetPnlUsd: closed.reduce((s, p) => s + (p.netPnlUsd ?? 0), 0),
       lastError: this.lastError,
+      unprotectedPositions: open
+        .filter((p) => p.stopAlgoOrderId === null && p.stopFailureCount > 0)
+        .map((p) => ({ positionId: p.positionId, symbol: p.symbol, stopFailureCount: p.stopFailureCount, stopUnprotectedSinceIso: p.stopUnprotectedSinceIso })),
+      stuckClosePositions: open
+        .filter((p) => p.closeFailureCount > 0)
+        .map((p) => ({ positionId: p.positionId, symbol: p.symbol, closeFailureCount: p.closeFailureCount, closeFailureSinceIso: p.closeFailureSinceIso })),
       recent: st.positions.slice(-10),
     };
   }
@@ -385,23 +415,50 @@ export class SingleSymbolLaneExecutor {
     } catch {
       return false; // best-effort — try again next tick
     }
-    if (actualOrderId === null) return false; // stop still resting, not triggered
+    // Rely on our OWN already-recorded state (not just this tick's possibly-flaky re-query) once
+    // we've previously confirmed the trigger — see the exitOrderId-set-immediately step below.
+    if (actualOrderId === null && pos.exitOrderId === null) return false; // stop still resting
+
+    // Mark the exit as IN FLIGHT the moment the trigger is known, regardless of whether the P&L
+    // fetch below succeeds this tick. This is what stops monitorOpenPositions' exit-policy branch
+    // (and closePosition's own re-entry guard) from ever placing a SECOND close against a position
+    // the exchange has already flattened via this stop.
+    if (pos.exitOrderId === null) {
+      pos.exitOrderId = actualOrderId;
+      this.store.save();
+    }
 
     let realized = 0;
     let fees = 0;
+    let exitNotional = 0;
+    let exitQty = 0;
     try {
-      const trades = await this.client.getUserTrades(pos.symbol, { startTime: new Date(pos.openedAt).getTime(), limit: 200 });
+      // Binance's per-request cap (2^10=1024, Binance documents 1000 as the max for this
+      // endpoint); still not a guarantee against a very active shared symbol exceeding this many
+      // trades since openedAt, but meaningfully wider than the prior 200.
+      const trades = await this.client.getUserTrades(pos.symbol, { startTime: new Date(pos.openedAt).getTime(), limit: 1000 });
       for (const t of trades) {
-        if (t.orderId === actualOrderId || t.orderId === pos.entryOrderId) {
+        if (t.orderId === pos.exitOrderId) {
+          exitNotional += t.price * t.qty;
+          exitQty += t.qty;
+        }
+        if (t.orderId === pos.exitOrderId || t.orderId === pos.entryOrderId) {
           realized += t.realizedPnl;
           fees += t.commission;
         }
       }
     } catch (error) {
-      this.lastError = `settle: trades fetch failed (${(error as Error).message}) — PnL recorded as 0, check manually`;
+      this.lastError = `settle: trades fetch failed (${(error as Error).message}) — retrying next tick, P&L NOT recorded (never fabricated) for ${pos.positionId}`;
+      return true; // exit already in-flight (exitOrderId set) — skip policy-exit eval this tick too
     }
-    pos.exitOrderId = actualOrderId;
-    pos.exitPrice = pos.stopPrice;
+    if (exitQty === 0) {
+      // The exit order's own trade record hasn't shown up in this window yet (timing race right
+      // after the stop fires, or — see the limit comment above — a very active shared symbol
+      // pushed it out of the page). Retry next tick rather than closing with a fabricated P&L.
+      this.lastError = `settle: exit order ${pos.exitOrderId} trade not found yet for ${pos.positionId} — retrying next tick, P&L NOT recorded (never fabricated)`;
+      return true;
+    }
+    pos.exitPrice = exitNotional / exitQty; // qty-weighted average of the ACTUAL fill(s), not the trigger price
     pos.exitPriceConfirmed = true; // sourced from getUserTrades, the most authoritative record
     pos.status = "CLOSED";
     pos.closedAt = this.nowIso();
@@ -432,9 +489,17 @@ export class SingleSymbolLaneExecutor {
         clientAlgoId: `ssle-${pos.positionId.slice(-18)}-s`,
       });
       pos.stopAlgoOrderId = stop.algoId;
+      pos.stopFailureCount = 0;
+      pos.stopUnprotectedSinceIso = null;
       this.store.save();
     } catch (error) {
-      this.lastError = `stop placement failed for ${pos.symbol} (${pos.positionId}): ${(error as Error).message} — retrying next tick, position is UNPROTECTED until then`;
+      pos.stopFailureCount += 1;
+      if (pos.stopUnprotectedSinceIso === null) pos.stopUnprotectedSinceIso = this.nowIso();
+      this.store.save();
+      this.lastError =
+        `stop placement failed for ${pos.symbol} (${pos.positionId}), attempt ${pos.stopFailureCount} ` +
+        `since ${pos.stopUnprotectedSinceIso}: ${(error as Error).message} — retrying next tick, ` +
+        `position is UNPROTECTED until then (see getStatus().unprotectedPositions)`;
     }
   }
 
@@ -490,21 +555,47 @@ export class SingleSymbolLaneExecutor {
     }
     const exitSide = pos.direction === "LONG" ? "SELL" : "BUY";
     try {
-      const order = await this.client.placeOrder({
-        symbol: pos.symbol,
-        side: exitSide,
-        type: "MARKET",
-        quantity: pos.qty,
-        reduceOnly: true,
-        newClientOrderId: `ssle-${pos.positionId.slice(-18)}-x`,
-      });
+      let order;
+      try {
+        order = await this.client.placeOrder({
+          symbol: pos.symbol,
+          side: exitSide,
+          type: "MARKET",
+          quantity: pos.qty,
+          reduceOnly: true,
+          newClientOrderId: `ssle-${pos.positionId.slice(-18)}-x`,
+        });
+      } catch (err) {
+        // -2022 "ReduceOnly Order is rejected": the account's NETTED position on this symbol (one
+        // -way mode; other executors — cross-sectional legs, another single-symbol lane's opposite
+        // side — share this same account) can carry a different sign than this one position alone.
+        // Retry WITHOUT reduceOnly — bounded risk: we only ever send OUR OWN recorded qty in the
+        // closing direction, so this can never create MORE exposure than this position itself
+        // already represents, only reduce or (worst case) flip the account's net by that qty.
+        if (!(err instanceof BinanceFuturesPrivateError) || err.binanceCode !== -2022) throw err;
+        order = await this.client.placeOrder({
+          symbol: pos.symbol,
+          side: exitSide,
+          type: "MARKET",
+          quantity: pos.qty,
+          newClientOrderId: `ssle-${pos.positionId.slice(-18)}-x2`,
+        });
+      }
       pos.exitOrderId = order.orderId;
       const resolved = await this.resolveFillPrice(pos.symbol, order.orderId, order.avgPrice, pos.entryPrice);
       pos.exitPrice = resolved.price;
       pos.exitPriceConfirmed = resolved.confirmed;
+      pos.closeFailureCount = 0;
+      pos.closeFailureSinceIso = null;
     } catch (error) {
+      pos.closeFailureCount += 1;
+      if (pos.closeFailureSinceIso === null) pos.closeFailureSinceIso = this.nowIso();
       this.store.save();
-      throw new Error(`position ${pos.positionId} close failed: ${(error as Error).message}`);
+      throw new Error(
+        `position ${pos.positionId} close failed, attempt ${pos.closeFailureCount} since ` +
+          `${pos.closeFailureSinceIso}: ${(error as Error).message} — position stays OPEN, will ` +
+          `retry next tick (see getStatus().stuckClosePositions)`,
+      );
     }
     const dir = pos.direction === "LONG" ? 1 : -1;
     const exit = pos.exitPrice ?? pos.entryPrice;
@@ -553,6 +644,7 @@ export class SingleSymbolLaneExecutor {
     const rawQty = legUsd / signal.entryPrice;
     const qty = Number((Math.floor(rawQty / f.stepSize) * f.stepSize).toFixed(8));
     if (!(qty >= f.minQty)) return;
+    if (!(qty * signal.entryPrice >= f.minNotional)) return; // Binance rejects an order that clears minQty but misses MIN_NOTIONAL
 
     const positionId = `ssl-${this.laneId.slice(0, 4).toLowerCase()}-${signal.openedAtMs.toString(36)}`;
     try {
@@ -579,6 +671,10 @@ export class SingleSymbolLaneExecutor {
       entryPriceConfirmed: resolvedEntry.confirmed,
       stopPrice: signal.stopPrice,
       stopAlgoOrderId: null,
+      stopFailureCount: 0,
+      stopUnprotectedSinceIso: null,
+      closeFailureCount: 0,
+      closeFailureSinceIso: null,
       peakFavorableR: 0,
       openedAt: this.nowIso(),
       status: "OPEN",

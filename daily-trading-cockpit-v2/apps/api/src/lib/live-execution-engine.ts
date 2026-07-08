@@ -1510,6 +1510,11 @@ export class LiveExecutionEngine {
       /** Cross-sectional share — filled by annotateCrossSectionalAccount (the executor's books). */
       basketQty: number | null;
       basketUnrealizedPnl: number | null;
+      /** Single-symbol-executor share — filled by annotateSingleSymbolAccount. This is a REAL
+       *  exchange-side protective stop (not a basket horizon, not an engine TP1) — kept in its own
+       *  field rather than reusing targetTpPrice so the dashboard can render it honestly instead of
+       *  as a fabricated "TP target" (2026-07-09 audit finding). */
+      singleSymbolStopPrice: number | null;
     }>;
     lanes: Array<{
       laneId: string;
@@ -1606,6 +1611,7 @@ export class LiveExecutionEngine {
             : null,
         basketQty: null,
         basketUnrealizedPnl: null,
+        singleSymbolStopPrice: null,
       };
     });
     const unrealizedPnl = positions.reduce((sum, position) => sum + position.unRealizedProfit, 0);

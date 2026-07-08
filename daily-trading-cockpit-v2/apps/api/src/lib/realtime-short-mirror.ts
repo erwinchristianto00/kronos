@@ -29,6 +29,7 @@ import {
 import {
   LANE_SELECTOR_V2_LIVE_SUPPORTED_VARIANT_IDS,
   estimateLaneSelectorV2Regime,
+  isLaneSelectorV2LongCapableVariantId,
   isLaneSelectorV2LongWideStopOverride,
   isLaneSelectorV2SupportedVariantId,
   laneSelectorV2LaneId,
@@ -322,12 +323,18 @@ export function runRealtimeShortMirror(
       controllerConfidence: inputs.controllerConfidence,
       estimatedRegime,
       rotationShortlist: inputs.rotationShortlist,
-      // 2026-07-08: an active operator/preset allocation ALSO opens the tactical-longs block —
-      // without this, a newly-allocated LONG lane (e.g. CG_WIDE_LONG_RUNNER) would force-lift to
-      // STABLE via manualEnabledVariantIds above, then still get rejected by policyBlockReason's
-      // "long_tactical_disabled" outside a confident WIDE_TREND bull. The controller direction gate
-      // still runs first — this only lifts the tactical-longs block, not the regime gate itself.
-      allowTacticalLongs: inputs.forceFastLong === true || (inputs.manualEnabledVariantIds?.size ?? 0) > 0,
+      // 2026-07-08: an active operator/preset allocation that names a LONG-capable variant ALSO
+      // opens the tactical-longs block — without this, a newly-allocated LONG lane (e.g.
+      // CG_WIDE_LONG_RUNNER) would force-lift to STABLE via manualEnabledVariantIds above, then
+      // still get rejected by policyBlockReason's "long_tactical_disabled" outside a confident
+      // WIDE_TREND bull. The controller direction gate still runs first — this only lifts the
+      // tactical-longs block, not the regime gate itself. Scoped to LONG-capable variants
+      // specifically (not a blanket "any allocation" check) so allocating an unrelated SHORT-only
+      // lane (e.g. SHORT_FADE_EXHAUSTION_CROWDED, which isn't even a VM variant id) never
+      // incidentally unlocks tactical longs the operator didn't intend to enable.
+      allowTacticalLongs:
+        inputs.forceFastLong === true ||
+        Array.from(inputs.manualEnabledVariantIds ?? []).some((id) => isLaneSelectorV2LongCapableVariantId(id)),
       manualEnabledVariantIds: inputs.manualEnabledVariantIds,
       now: inputs.now,
     });

@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import type { Candle } from "@dtc/shared";
 import {
   detectIntradayMomentumEntry,
@@ -6,6 +6,15 @@ import {
   buildIntradayMomentumReport,
   type IntradayMomentumObservation,
   IM_ATR_STOP_MULT,
+  IM_MAX_HOLD_BARS,
+  IntradayMomentumStore,
+  intradayMomentumOpenSignals,
+  intradayMomentumExitPolicy,
+  isIntradayMomentumExecEnabled,
+  IM_EXEC_LEG_USD,
+  IM_EXEC_LEVERAGE,
+  IM_EXEC_MAX_SIGNAL_AGE_MS,
+  IM_EXEC_DAILY_MAX_LOSS_USD,
 } from "../src/lib/intraday-momentum-edge.js";
 
 let t = 1_000_000_000_000;
@@ -198,5 +207,130 @@ describe("intraday momentum hunter — report-only enrichment (order-flow + deci
     });
     expect(result.recorded).toBe(1); // recording still succeeds
     expect(store.all[0]!.decisionScoreAtEntry).toBeNull();
+  });
+});
+
+describe("intraday momentum hunter — live execution wiring adapters", () => {
+  it("[intradayMomentumOpenSignals] maps only OPEN observations into the generic executor's fresh-signal shape", () => {
+    const store = new IntradayMomentumStore(`/tmp/im-adapter-${Date.now()}-${Math.random()}.json`);
+    store.add(obs({ observationId: "im:A:1", symbol: "AUSDT", status: "OPEN" }));
+    store.add(obs({ observationId: "im:B:1", symbol: "BUSDT", status: "CLOSED_WIN" }));
+    const signals = intradayMomentumOpenSignals(store);
+    expect(signals).toHaveLength(1);
+    expect(signals[0]).toEqual({
+      observationId: "im:A:1",
+      symbol: "AUSDT",
+      entryPrice: 100,
+      stopPrice: 100 - IM_ATR_STOP_MULT * 4,
+      openedAtMs: 1_000_000_000_000,
+    });
+  });
+
+  it("[intradayMomentumOpenSignals] returns an empty array when the store has no OPEN observations", () => {
+    const store = new IntradayMomentumStore(`/tmp/im-adapter-${Date.now()}-${Math.random()}.json`);
+    store.add(obs({ status: "CLOSED_LOSS" }));
+    expect(intradayMomentumOpenSignals(store)).toEqual([]);
+  });
+
+  it("[intradayMomentumExitPolicy] exits at INITIAL_STOP once price reaches -1R on a LONG", () => {
+    const policy = intradayMomentumExitPolicy();
+    const decision = policy({ direction: "LONG", entryPrice: 100, stopPrice: 95, currentPrice: 95, peakFavorableR: 0, msHeld: 1000 });
+    expect(decision.shouldExit).toBe(true);
+    expect(decision.reason).toBe("INITIAL_STOP");
+  });
+
+  it("[intradayMomentumExitPolicy] banks MFE_GIVEBACK once armed and price retraces past the giveback line", () => {
+    const policy = intradayMomentumExitPolicy();
+    // Simulate an already-armed peak of 1.0R (>= IM_MFE_ARM_R) fed back in, then a retrace to 0.4R —
+    // below the giveback line (peak * (1 - IM_MFE_GIVEBACK_FRAC) = 0.5).
+    const decision = policy({ direction: "LONG", entryPrice: 100, stopPrice: 95, currentPrice: 102, peakFavorableR: 1.0, msHeld: 1000 });
+    expect(decision.shouldExit).toBe(true);
+    expect(decision.reason).toBe("MFE_GIVEBACK");
+    expect(decision.nextPeakFavorableR).toBe(1.0);
+  });
+
+  it("[intradayMomentumExitPolicy] does NOT giveback-exit before the arm threshold is reached", () => {
+    const policy = intradayMomentumExitPolicy();
+    // r = 0.6R — favorable but below IM_MFE_ARM_R (0.75), so no giveback line applies yet.
+    const decision = policy({ direction: "LONG", entryPrice: 100, stopPrice: 95, currentPrice: 103, peakFavorableR: 0, msHeld: 1000 });
+    expect(decision.shouldExit).toBe(false);
+    expect(decision.nextPeakFavorableR).toBeCloseTo(0.6, 6);
+  });
+
+  it("[intradayMomentumExitPolicy] falls back to MAX_HOLD_MTM once IM_MAX_HOLD_BARS worth of ms has elapsed", () => {
+    const policy = intradayMomentumExitPolicy();
+    const decision = policy({
+      direction: "LONG", entryPrice: 100, stopPrice: 95, currentPrice: 100.5, peakFavorableR: 0,
+      msHeld: IM_MAX_HOLD_BARS * 3_600_000,
+    });
+    expect(decision.shouldExit).toBe(true);
+    expect(decision.reason).toBe("MAX_HOLD_MTM");
+  });
+
+  it("[intradayMomentumExitPolicy] stays open when neither stop, giveback, nor max-hold has been reached", () => {
+    const policy = intradayMomentumExitPolicy();
+    const decision = policy({ direction: "LONG", entryPrice: 100, stopPrice: 95, currentPrice: 100.5, peakFavorableR: 0, msHeld: 1000 });
+    expect(decision.shouldExit).toBe(false);
+    expect(decision.reason).toBeNull();
+  });
+
+  it("[isIntradayMomentumExecEnabled] is off by default and only on with the exact '1' flag", () => {
+    expect(isIntradayMomentumExecEnabled({})).toBe(false);
+    expect(isIntradayMomentumExecEnabled({ INTRADAY_MOMENTUM_EXEC_ENABLED: "true" })).toBe(false);
+    expect(isIntradayMomentumExecEnabled({ INTRADAY_MOMENTUM_EXEC_ENABLED: "1" })).toBe(true);
+  });
+
+  describe("IM_EXEC_* config readers", () => {
+    const keys = [
+      "INTRADAY_MOMENTUM_EXEC_LEG_USD",
+      "INTRADAY_MOMENTUM_EXEC_LEVERAGE",
+      "INTRADAY_MOMENTUM_EXEC_MAX_SIGNAL_AGE_MS",
+      "INTRADAY_MOMENTUM_EXEC_DAILY_MAX_LOSS_USD",
+    ] as const;
+    const saved: Record<string, string | undefined> = {};
+
+    beforeEach(() => {
+      for (const k of keys) { saved[k] = process.env[k]; delete process.env[k]; }
+    });
+    afterEach(() => {
+      for (const k of keys) {
+        if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k];
+      }
+    });
+
+    it("IM_EXEC_LEG_USD defaults to 25 and honors a valid positive override", () => {
+      expect(IM_EXEC_LEG_USD()).toBe(25);
+      process.env.INTRADAY_MOMENTUM_EXEC_LEG_USD = "40";
+      expect(IM_EXEC_LEG_USD()).toBe(40);
+    });
+
+    it("IM_EXEC_LEG_USD ignores a non-positive or garbage override and falls back to the default", () => {
+      process.env.INTRADAY_MOMENTUM_EXEC_LEG_USD = "-5";
+      expect(IM_EXEC_LEG_USD()).toBe(25);
+      process.env.INTRADAY_MOMENTUM_EXEC_LEG_USD = "not-a-number";
+      expect(IM_EXEC_LEG_USD()).toBe(25);
+    });
+
+    it("IM_EXEC_LEVERAGE defaults to 3, floors a fractional override, rejects <1", () => {
+      expect(IM_EXEC_LEVERAGE()).toBe(3);
+      process.env.INTRADAY_MOMENTUM_EXEC_LEVERAGE = "5";
+      expect(IM_EXEC_LEVERAGE()).toBe(5);
+      process.env.INTRADAY_MOMENTUM_EXEC_LEVERAGE = "0";
+      expect(IM_EXEC_LEVERAGE()).toBe(3);
+    });
+
+    it("IM_EXEC_MAX_SIGNAL_AGE_MS defaults to 50 minutes and floors at 60s", () => {
+      expect(IM_EXEC_MAX_SIGNAL_AGE_MS()).toBe(50 * 60_000);
+      process.env.INTRADAY_MOMENTUM_EXEC_MAX_SIGNAL_AGE_MS = "1000";
+      expect(IM_EXEC_MAX_SIGNAL_AGE_MS()).toBe(60_000); // floored
+      process.env.INTRADAY_MOMENTUM_EXEC_MAX_SIGNAL_AGE_MS = "120000";
+      expect(IM_EXEC_MAX_SIGNAL_AGE_MS()).toBe(120_000);
+    });
+
+    it("IM_EXEC_DAILY_MAX_LOSS_USD defaults to 0 (no cap) and honors a positive override", () => {
+      expect(IM_EXEC_DAILY_MAX_LOSS_USD()).toBe(0);
+      process.env.INTRADAY_MOMENTUM_EXEC_DAILY_MAX_LOSS_USD = "15";
+      expect(IM_EXEC_DAILY_MAX_LOSS_USD()).toBe(15);
+    });
   });
 });

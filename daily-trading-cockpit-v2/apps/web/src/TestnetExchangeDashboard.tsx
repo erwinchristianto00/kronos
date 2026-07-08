@@ -52,30 +52,44 @@ const LANE_CHART_COLORS = ['#5ce4a6', '#6fb7c9', '#f3bf5a', '#ff707a', '#a78bfa'
 // lane each regime runs and a SUGGESTED live lane-allocation preset. Presets only
 // PREFILL the allocation form — nothing changes until the operator presses Apply.
 // The regime engine itself is REPORT-ONLY (it records decisions, it does not trade).
+//
+// 2026-07-08: kept in sync with apps/api/src/lib/regime-autopilot.ts's REGIME_AUTOPILOT_PRESETS
+// (the ACTUAL backend allocation regime-autopilot applies automatically) — that redesign added
+// CG_MFE_GIVEBACK/CROSS_SECTIONAL_TREND to the two confirmed-trend regimes and
+// CROSS_SECTIONAL_MIXED + one brand-new single-symbol lane to each of the two tactical/choppy
+// regimes, growing every preset except NO_TRADE from 2 lanes to 4. This form-prefill was NOT
+// updated at the time and silently dropped 2 of the 4 real lanes whenever an operator clicked a
+// preset button — the preset object now carries all 4 slots to match.
 const REGIME_TREE: Array<{
   label: string;
   engineRegime: string;
   lane: string;
   laneNote: string;
-  preset: { lane1: string; w1: string; lane2: string; w2: string };
+  preset: { lane1: string; w1: string; lane2: string; w2: string; lane3: string; w3: string; lane4: string; w4: string };
 }> = [
   {
     label: 'Bear Trend',
     engineRegime: 'BEAR_TREND',
     lane: 'Trend Short (Breakdown Retest Short)',
-    laneNote: 'break + failed retest continuation',
-    // FAST_SHORT is only marginal (book ~break-even), so pair it with the proven all-weather
-    // market-neutral basket as ballast instead of going 100% into a thin edge.
-    preset: { lane1: 'CG_WIDE_FAST_SHORT', w1: '60', lane2: 'CROSS_SECTIONAL_MARKET_NEUTRAL', w2: '40' },
+    laneNote: 'fast-bank short + protected 3R runner (MFE_GIVEBACK) + systematic cross-sectional trend-following + market-neutral ballast',
+    preset: {
+      lane1: 'CG_WIDE_FAST_SHORT', w1: '35',
+      lane2: 'CG_MFE_GIVEBACK', w2: '15',
+      lane3: 'CROSS_SECTIONAL_TREND', w3: '20',
+      lane4: 'CROSS_SECTIONAL_MARKET_NEUTRAL', w4: '30',
+    },
   },
   {
     label: 'Bear Choppy',
     engineRegime: 'BEARISH_CHOPPY_DEFENSIVE',
     lane: 'Short Rally Fade',
-    laneNote: 'fade weak bounces + market-neutral ballast',
-    // Dropped the 30% counter-trend FAST_LONG (too much long in a bear-choppy regime); pair the
-    // short fade with the market-neutral basket instead.
-    preset: { lane1: 'CG_WIDE_FAST_SHORT', w1: '60', lane2: 'CROSS_SECTIONAL_MARKET_NEUTRAL', w2: '40' },
+    laneNote: 'fade weak bounces + RSI-exhaustion crowded-short fade (new, unproven — modest slot) + cross-sectional mean-reversion + market-neutral ballast',
+    preset: {
+      lane1: 'CG_WIDE_FAST_SHORT', w1: '35',
+      lane2: 'SHORT_FADE_EXHAUSTION_CROWDED', w2: '15',
+      lane3: 'CROSS_SECTIONAL_MIXED', w3: '20',
+      lane4: 'CROSS_SECTIONAL_MARKET_NEUTRAL', w4: '30',
+    },
   },
   {
     label: 'Neutral',
@@ -83,24 +97,33 @@ const REGIME_TREE: Array<{
     lane: 'Mean Reversion (cross-sectional market-neutral)',
     laneNote: 'no directional conviction → pure market-neutral',
     // No directional conviction → 100% market-neutral (the proven all-weather edge, +0.347%),
-    // NOT a 50/50 directional pair (two weak-edge bets that don't cancel beta).
-    preset: { lane1: 'CROSS_SECTIONAL_MARKET_NEUTRAL', w1: '100', lane2: '', w2: '0' },
+    // NOT a 50/50 directional pair (two weak-edge bets that don't cancel beta). Unchanged — this
+    // is the one regime with an existing hard invariant (must stay pure 100% single-lane).
+    preset: { lane1: 'CROSS_SECTIONAL_MARKET_NEUTRAL', w1: '100', lane2: '', w2: '0', lane3: '', w3: '0', lane4: '', w4: '0' },
   },
   {
     label: 'Recovery',
     engineRegime: 'NEUTRAL_RECOVERY',
     lane: 'Pullback Long (scalp)',
-    laneNote: 'proven long + market-neutral ballast',
-    // Longs favored (CG_WIDE_FAST_LONG is proven +0.28R/88%) + market-neutral ballast, instead of
-    // a 30% counter-trend short in an early-recovery regime.
-    preset: { lane1: 'CG_WIDE_FAST_LONG', w1: '60', lane2: 'CROSS_SECTIONAL_MARKET_NEUTRAL', w2: '40' },
+    laneNote: 'proven long + breakout-momentum hunter (new, unproven — modest slot) + cross-sectional mean-reversion + market-neutral ballast',
+    preset: {
+      lane1: 'CG_WIDE_FAST_LONG', w1: '35',
+      lane2: 'INTRADAY_MOMENTUM_BREAKOUT_LONG', w2: '15',
+      lane3: 'CROSS_SECTIONAL_MIXED', w3: '20',
+      lane4: 'CROSS_SECTIONAL_MARKET_NEUTRAL', w4: '30',
+    },
   },
   {
     label: 'Bull',
     engineRegime: 'TREND_RECOVERY',
     lane: 'Trend Following (breakout retest long)',
-    laneNote: 'runner earns its place only in a real trend',
-    preset: { lane1: 'CG_WIDE_FAST_LONG', w1: '70', lane2: 'CG_WIDE_LONG_RUNNER', w2: '30' },
+    laneNote: 'fast-bank + full-commit 3R runner + protected 3R runner (MFE_GIVEBACK) + systematic cross-sectional trend-following — no market-neutral dilution, confirmed trend concentrates fully on direction',
+    preset: {
+      lane1: 'CG_WIDE_FAST_LONG', w1: '30',
+      lane2: 'CG_WIDE_LONG_RUNNER', w2: '25',
+      lane3: 'CG_MFE_GIVEBACK', w3: '20',
+      lane4: 'CROSS_SECTIONAL_TREND', w4: '25',
+    },
   },
 ];
 
@@ -205,6 +228,7 @@ interface LiveAccount {
     intentUnrealizedPnl?: number | null;
     basketQty?: number | null;
     basketUnrealizedPnl?: number | null;
+    singleSymbolStopPrice?: number | null;
   }>;
   lanes: Array<{
     laneId: string;
@@ -756,15 +780,15 @@ export default function TestnetExchangeDashboard() {
     [...LIVE_LANE_OPTIONS, ...headlineLaneOptions, allocLane1, allocLane2, allocLane3, allocLane4].filter(Boolean),
   ));
 
-  function applyRegimePreset(preset: { lane1: string; w1: string; lane2: string; w2: string }) {
+  function applyRegimePreset(preset: { lane1: string; w1: string; lane2: string; w2: string; lane3: string; w3: string; lane4: string; w4: string }) {
     setAllocLane1(preset.lane1);
     setAllocWeight1(preset.w1);
     setAllocLane2(preset.lane2);
     setAllocWeight2(preset.w2);
-    setAllocLane3('');
-    setAllocWeight3('0');
-    setAllocLane4('');
-    setAllocWeight4('0');
+    setAllocLane3(preset.lane3);
+    setAllocWeight3(preset.w3);
+    setAllocLane4(preset.lane4);
+    setAllocWeight4(preset.w4);
     setControlMsg({ ok: true, message: `Preset dimuat ke form ${allocationLabel} — tekan Apply untuk mengaktifkan` });
   }
 
@@ -1000,7 +1024,18 @@ export default function TestnetExchangeDashboard() {
   const totalSourceEntries = account?.positions.reduce((sum, position) => sum + position.sourceOrderCount, 0) ?? 0;
   const regimeOptions = laneSeries?.regimeOptions ?? FALLBACK_REGIME_OPTIONS;
   const chartTotal = laneSeries?.lanes.reduce((sum, lane) => sum + lane.realizedPnlUsd, 0) ?? 0;
-  const isCrossSectionalPosition = (laneIds: string[]) => laneIds.includes('CROSS_SECTIONAL_MARKET_NEUTRAL');
+  // 2026-07-09: was CROSS_SECTIONAL_MARKET_NEUTRAL-only — missed the TREND/MIXED instances wired
+  // 2026-07-08, so their basket legs fell through to the directional/foundation split as if they
+  // were plain directional intents instead of hedge-managed cross-sectional legs.
+  const isCrossSectionalPosition = (laneIds: string[]) =>
+    laneIds.includes('CROSS_SECTIONAL_MARKET_NEUTRAL') || laneIds.includes('CROSS_SECTIONAL_TREND') || laneIds.includes('CROSS_SECTIONAL_MIXED');
+  // 2026-07-09: SHORT_FADE_EXHAUSTION_CROWDED/INTRADAY_MOMENTUM_BREAKOUT_LONG (SingleSymbolLaneExecutor)
+  // also write into basketQty/basketUnrealizedPnl (annotateSingleSymbolAccount reuses the same fields
+  // as basket legs), so without this check they fell into the "Cross-sectional foundation" table and
+  // rendered as an untouchable, timed basket leg — when they're actually a single real position with
+  // its own exchange-side stop, no sibling leg, and no "naked directional bet" risk from closing it.
+  const isSingleSymbolExecutorPosition = (laneIds: string[]) =>
+    laneIds.includes('SHORT_FADE_EXHAUSTION_CROWDED') || laneIds.includes('INTRADAY_MOMENTUM_BREAKOUT_LONG');
 
   return (
     <div className="neural-shell testnet-shell">
@@ -1071,7 +1106,11 @@ export default function TestnetExchangeDashboard() {
             // visible but clearly labeled all-time — the old headline summed lifetime mirror
             // (which still carries the pre-fix churn-era losses) with baskets and read like a
             // current loss ("kayanya kebawa data lama" — it wasn't stale, just mislabeled).
-            const basketsAllTime = account?.closedLanes?.find((l) => l.laneId === 'CROSS_SECTIONAL_MARKET_NEUTRAL')?.realizedPnlUsd ?? 0;
+            // 2026-07-09: was CROSS_SECTIONAL_MARKET_NEUTRAL-only — the 2026-07-08 TREND/MIXED
+            // instances merge into their OWN closedLanes entries (see annotateCrossSectionalAccount),
+            // so a banked TREND/MIXED basket previously vanished from this all-time headline.
+            const basketsAllTime = ['CROSS_SECTIONAL_MARKET_NEUTRAL', 'CROSS_SECTIONAL_TREND', 'CROSS_SECTIONAL_MIXED']
+              .reduce((sum, laneId) => sum + (account?.closedLanes?.find((l) => l.laneId === laneId)?.realizedPnlUsd ?? 0), 0);
             const mirrorAllTime = status?.totalRealizedPnlUsd;
             const allTime = mirrorAllTime != null ? mirrorAllTime + basketsAllTime : undefined;
             const mirrorToday = status?.closedToday?.realizedPnlUsd;
@@ -1289,9 +1328,16 @@ export default function TestnetExchangeDashboard() {
           // a netted symbol carrying BOTH books now appears in BOTH tables, each showing ITS OWN
           // qty/entry/P&L (computed from its own entries) — never the exchange's blended row.
           const directional = positions.filter((p) => intentBySymbol.has(p.symbol));
-          const foundation = positions.filter((p) => (p.basketQty ?? 0) !== 0 || (isCrossSectionalPosition(p.laneIds) && !intentBySymbol.has(p.symbol)));
+          // 2026-07-09: single-symbol-executor positions excluded from foundation — they share the
+          // basketQty/basketUnrealizedPnl fields with basket legs, but each is its own real
+          // single-symbol position (own exchange-side stop, no sibling leg), not a basket hedge.
+          const foundation = positions.filter(
+            (p) => !isSingleSymbolExecutorPosition(p.laneIds) && ((p.basketQty ?? 0) !== 0 || (isCrossSectionalPosition(p.laneIds) && !intentBySymbol.has(p.symbol))),
+          );
+          const singleSymbolPositions = positions.filter((p) => isSingleSymbolExecutorPosition(p.laneIds));
           const row = (position: (typeof positions)[number], closeable: boolean) => {
-            const book = closeable ? 'directional' : 'foundation';
+            const isSingleSymbol = !closeable && isSingleSymbolExecutorPosition(position.laneIds);
+            const book = closeable ? 'directional' : isSingleSymbol ? 'single-symbol' : 'foundation';
             const mixed = intentBySymbol.has(position.symbol) && (position.basketQty ?? 0) !== 0;
             const qty = closeable
               ? Math.abs(position.intentQty ?? position.quantity)
@@ -1314,8 +1360,16 @@ export default function TestnetExchangeDashboard() {
               <td>{Number(qty.toFixed(8))}</td>
               <td>{entry == null ? 'multi-leg' : price(entry)}</td>
               <td>{price(position.markPrice)}</td>
-              <td>{!closeable ? 'basket horizon' : price(position.targetTpPrice)}</td>
-              <td className={tone(position.targetTpGapPct)}>{!closeable ? 'timed' : percent(position.targetTpGapPct)}</td>
+              <td>
+                {closeable
+                  ? price(position.targetTpPrice)
+                  : isSingleSymbol
+                    ? (position.singleSymbolStopPrice != null ? `stop ${price(position.singleSymbolStopPrice)}` : 'stop-managed')
+                    : 'basket horizon'}
+              </td>
+              <td className={tone(position.targetTpGapPct)}>
+                {closeable ? percent(position.targetTpGapPct) : isSingleSymbol ? 'real exch. stop' : 'timed'}
+              </td>
               <td className="tone-critical">{price(position.liquidationPrice)}</td>
               <td className={tone(unreal)}>{signed(unreal)}</td>
               <td className={tone(afterCost)}>{signed(afterCost)}</td>
@@ -1401,6 +1455,24 @@ export default function TestnetExchangeDashboard() {
                       {foundation.length === 0 ? (
                         <tr><td colSpan={13}>No open basket positions.</td></tr>
                       ) : foundation.map((p) => row(p, false))}
+                    </tbody>
+                  </table>
+                </div>
+              </section>
+              <section className="testnet-panel">
+                <header><span>Single-symbol executor — stop-protected</span><strong>{singleSymbolPositions.length} pos</strong></header>
+                <p className="tone-measure" style={{ margin: '4px 0', fontSize: 12 }}>
+                  SHORT_FADE_EXHAUSTION_CROWDED / INTRADAY_MOMENTUM_BREAKOUT_LONG. Setiap posisi berdiri sendiri (bukan basket leg,
+                  tidak ada sisi lain yang jadi taruhan telanjang kalau dilepas) dan dilindungi STOP_MARKET real di exchange —
+                  belum ada tombol close manual di sini (exit otomatis lewat stop atau target/MFE-giveback).
+                </p>
+                <div className="testnet-table-wrap">
+                  <table>
+                    <thead>{headCells(false)}</thead>
+                    <tbody>
+                      {singleSymbolPositions.length === 0 ? (
+                        <tr><td colSpan={13}>No open single-symbol executor positions.</td></tr>
+                      ) : singleSymbolPositions.map((p) => row(p, false))}
                     </tbody>
                   </table>
                 </div>
