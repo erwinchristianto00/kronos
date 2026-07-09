@@ -684,7 +684,11 @@ export async function registerLiveRoutes(
       reply.code(400);
       return { ok: false, reason: 'body must be {"allocations": null | [{laneId, weightPct}]}' };
     }
-    const result = engine.setLaneAllocations(
+    // 2026-07-09: operator-explicit path — sets manualSelectorMode when applying a real allocation
+    // so RegimeAutopilot's next tick can't silently revert it (see setLaneAllocationsAsOperator's
+    // doc comment for the incident this closes). Distinct from applyRegimeAutopilotAllocation,
+    // which is autopilot's OWN apply path and clears the flag instead.
+    const result = engine.setLaneAllocationsAsOperator(
       body.allocations === null
         ? null
         : (body.allocations as Array<{ laneId?: unknown; weightPct?: unknown }>).map((a) => ({

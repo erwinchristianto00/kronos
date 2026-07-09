@@ -3219,6 +3219,39 @@ export class LiveExecutionEngine {
   }
 
   /**
+   * Operator-explicit allocation apply (POST /api/live/lane-allocations — the dashboard's "Apply"
+   * button, including applying a regime-tree preset). Mirror image of
+   * applyRegimeAutopilotAllocation above: THAT clears manualSelectorMode because autopilot's own
+   * apply is the "smart" path; THIS sets it, because the operator's own explicit choice must not
+   * be silently overwritten by the next autopilot tick.
+   *
+   * 2026-07-09 (real incident): the operator applied a Bear Trend preset, but ~70 minutes later
+   * regime-autopilot's OWN tick silently reverted the live allocation back to a bare
+   * CROSS_SECTIONAL_MARKET_NEUTRAL 100% (its observed regime — a raw, price-level-driven detector
+   * that flickers near round BTC levels, unrelated to the continuous mood the operator was
+   * reading) — with zero confirmation, discovered only because the operator noticed the
+   * dashboard's regime-tree/allocation mismatch. Setting manualSelectorMode here closes that gap
+   * the same way applyRegimeAutopilotAllocation's own isManualSelectorMode() check already
+   * enforces from the autopilot side — clicking Apply now durably means "operator owns this until
+   * they switch back to SMART", not just "for however long the next background tick allows".
+   *
+   * Only sets the flag when actually applying an allocation (allocations !== null) — clearing
+   * (null) leaves manualSelectorMode as-is, since "remove my custom lanes" isn't necessarily
+   * "hand control back to autopilot" and shouldn't be overloaded to mean that silently.
+   */
+  setLaneAllocationsAsOperator(
+    allocations: Array<{ laneId: string; weightPct: number }> | null,
+  ): { ok: boolean; reason: string | null; laneAllocations: Array<{ laneId: string; weightPct: number }> | null } {
+    const result = this.setLaneAllocations(allocations);
+    if (result.ok && allocations !== null) {
+      const st = this.store.getState();
+      st.manualSelectorMode = true;
+      this.store.save();
+    }
+    return result;
+  }
+
+  /**
    * Operator-triggered copy of a TESTNET position onto THIS engine (the mainnet
    * instance): same symbol/direction/qty and the same stop/TP geometry relative to
    * entry (openIntent reprices the absolute levels around the actual live fill).

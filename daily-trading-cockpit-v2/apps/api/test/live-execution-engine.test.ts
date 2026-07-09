@@ -2527,6 +2527,60 @@ describe("weighted lane allocation (POST /api/live/lane-allocations)", () => {
   });
 });
 
+// 2026-07-09 real incident: the operator applied a Bear Trend preset via the dashboard's "Apply"
+// button, but ~70 minutes later RegimeAutopilot's own tick silently reverted the live allocation
+// back to its own observed-regime preset — because setLaneAllocations() (which the route called
+// directly) never set manualSelectorMode, so applyRegimeAutopilotAllocation's own "operator owns
+// it" guard never actually engaged for a plain dashboard Apply. setLaneAllocationsAsOperator is
+// the fix: the operator-explicit entry point (POST /api/live/lane-allocations) now sets the same
+// flag, closing the loop with applyRegimeAutopilotAllocation's existing isManualSelectorMode() check.
+describe("setLaneAllocationsAsOperator (2026-07-09 fix: operator Apply must not be silently overwritten by autopilot)", () => {
+  it("sets manualSelectorMode when applying a real allocation", () => {
+    const { engine, store } = makeEngine();
+    expect(store.getState().manualSelectorMode).toBe(false);
+    const result = engine.setLaneAllocationsAsOperator([{ laneId: "CG_WIDE_FAST_SHORT", weightPct: 100 }]);
+    expect(result.ok).toBe(true);
+    expect(store.getState().manualSelectorMode).toBe(true);
+  });
+
+  it("does NOT set manualSelectorMode when the allocation is invalid (nothing to protect)", () => {
+    const { engine, store } = makeEngine();
+    const result = engine.setLaneAllocationsAsOperator([{ laneId: "A", weightPct: 101 }]);
+    expect(result.ok).toBe(false);
+    expect(store.getState().manualSelectorMode).toBe(false);
+  });
+
+  it("does NOT touch manualSelectorMode when clearing (allocations: null)", () => {
+    const { engine, store } = makeEngine();
+    engine.setManualSelectorMode(false);
+    engine.setLaneAllocationsAsOperator(null);
+    expect(store.getState().manualSelectorMode).toBe(false);
+    engine.setManualSelectorMode(true);
+    engine.setLaneAllocationsAsOperator(null);
+    expect(store.getState().manualSelectorMode).toBe(true); // unchanged, whichever it was
+  });
+
+  it("[THE ACTUAL INCIDENT] once applied via the operator path, RegimeAutopilot's own apply refuses to overwrite it", () => {
+    const { engine } = makeEngine();
+    engine.setLaneAllocationsAsOperator([
+      { laneId: "CG_WIDE_FAST_SHORT", weightPct: 35 },
+      { laneId: "CG_MFE_GIVEBACK", weightPct: 15 },
+      { laneId: "CROSS_SECTIONAL_TREND", weightPct: 20 },
+      { laneId: "CROSS_SECTIONAL_MARKET_NEUTRAL", weightPct: 30 },
+    ]);
+    // Simulates RegimeAutopilot's tick observing NO_TRADE and trying to apply its own preset —
+    // this must now be REFUSED, preserving the operator's Bear Trend choice.
+    const autopilotAttempt = engine.applyRegimeAutopilotAllocation([{ laneId: "CROSS_SECTIONAL_MARKET_NEUTRAL", weightPct: 100 }]);
+    expect(autopilotAttempt.ok).toBe(false);
+    expect(engine.getStatus().laneSelection.laneAllocations).toEqual([
+      { laneId: "CG_WIDE_FAST_SHORT", weightPct: 35 },
+      { laneId: "CG_MFE_GIVEBACK", weightPct: 15 },
+      { laneId: "CROSS_SECTIONAL_TREND", weightPct: 20 },
+      { laneId: "CROSS_SECTIONAL_MARKET_NEUTRAL", weightPct: 30 },
+    ]);
+  });
+});
+
 describe("lane selection auto-reset on losing operator close", () => {
   // Open an intent under a 100% allocation on its lane, then close it at a given net PnL.
   async function openSelectedIntent(pnl: number) {
