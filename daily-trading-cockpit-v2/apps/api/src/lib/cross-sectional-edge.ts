@@ -98,9 +98,18 @@ export const CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST = envSymbolSet(
   "CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST",
   "ADAUSDT,BNBUSDT,ETHUSDT,OPUSDT,1000PEPEUSDT,SOLUSDT,SUIUSDT",
 );
+// 2026-07-09 (audit finding — live starvation): with CROSS_SECTIONAL_REGIME_SKEW_ENABLED=1, a
+// deeply bearish axisScore pushes shortK to baseK+delta (e.g. 3->4). The prior 5-symbol allowlist
+// had NO margin above that (2 of the 5 sit in CROSS_SECTIONAL_FILTERED_SHORT_BLOCKLIST-adjacent
+// demotion churn — SEIUSDT/WLDUSDT — leaving exactly 3 raw-eligible, below the skewed shortK of 4).
+// buildCrossSectionalBasket() returns null whenever selectedShorts.length < shortK — this basket
+// silently stopped opening for ~16-21h on live/testnet, in EXACTLY the bearish regime the skew
+// exists to lean into. Widened with 5 more liquid symbols (none overlapping
+// CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST, to avoid the same starvation via long/short exclusivity)
+// so a handful of demotions can no longer drop the raw-eligible count below the skewed floor.
 export const CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST = envSymbolSet(
   "CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST",
-  "DOGEUSDT,OPUSDT,1000PEPEUSDT,SEIUSDT,WLDUSDT",
+  "DOGEUSDT,OPUSDT,1000PEPEUSDT,SEIUSDT,WLDUSDT,ARBUSDT,XRPUSDT,LINKUSDT,WIFUSDT,AAVEUSDT",
 );
 export const CROSS_SECTIONAL_FILTERED_SHORT_BLOCKLIST = envSymbolSet(
   "CROSS_SECTIONAL_FILTERED_SHORT_BLOCKLIST",

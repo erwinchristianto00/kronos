@@ -6,6 +6,7 @@ import type { FuturesOrder, FuturesPosition, FuturesSymbolFilters } from "../src
 import {
   CrossSectionalStore,
   _resetCrossSectionalStoreForTests,
+  CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST,
   type CrossSectionalObservation,
 } from "../src/lib/cross-sectional-edge.js";
 import {
@@ -573,7 +574,8 @@ describe("getStatus signal freshness + adaptive filter visibility", () => {
 
   it("surfaces adaptiveFilters.shortFloorApplied when the signal store's own demotion history would starve the short side", async () => {
     const { executor, signalStore } = makeExecutor({ signalMs: NOW_MS - 5 * 60_000 });
-    const shortSymbols = ["DOGEUSDT", "OPUSDT", "1000PEPEUSDT", "SEIUSDT", "WLDUSDT"];
+    // Read from the real constant, not a hardcoded snapshot — 2026-07-09 audit widened this list.
+    const shortSymbols = [...CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST];
     for (let i = 0; i < 3; i++) {
       signalStore.add({
         observationId: `closed-${i}`,

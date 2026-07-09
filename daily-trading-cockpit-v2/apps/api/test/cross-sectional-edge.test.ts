@@ -455,9 +455,10 @@ describe("deriveAdaptiveSymbolFilters — demotes toxic symbols inside hard oper
   // SHORT-side baskets on live for ~18h once every configured short symbol got demoted.
   it("[FLOOR] falls back to the full allowlist when demotions would starve a side below minEligiblePerSide", () => {
     const store = freshStore();
-    // Demote every default SHORT-allowlist symbol (DOGEUSDT, OPUSDT, 1000PEPEUSDT, SEIUSDT, WLDUSDT)
-    // with 3 losing legs each — effective short allowlist would be 0, well under k=3.
-    const shortSymbols = ["DOGEUSDT", "OPUSDT", "1000PEPEUSDT", "SEIUSDT", "WLDUSDT"];
+    // Demote EVERY default SHORT-allowlist symbol (read from the real constant, not a hardcoded
+    // snapshot — 2026-07-09 audit widened this list, and a stale hardcoded subset here would leave
+    // un-demoted symbols surviving, silently un-triggering the floor this test exists to prove).
+    const shortSymbols = [...CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST];
     for (let i = 0; i < 3; i++) {
       store.add(
         closedObs(
@@ -482,7 +483,7 @@ describe("deriveAdaptiveSymbolFilters — demotes toxic symbols inside hard oper
 
   it("[FLOOR] does not trigger when enough symbols survive demotion", () => {
     const store = freshStore();
-    // Demote only ONE of five short symbols — 4 remain, still >= k=3, no floor needed.
+    // Demote only ONE of the default short symbols — plenty remain, still >= k=3, no floor needed.
     for (let i = 0; i < 3; i++) {
       store.add(closedObs(`o${i}`, [], [["DOGEUSDT", 1, 1.02]]) as never);
     }
