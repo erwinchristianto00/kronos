@@ -349,13 +349,31 @@ export function buildCrossSectionalBasket(
   const mode = opts.selectionMode ?? "MOMENTUM";
   const longK = opts.longK ?? opts.k;
   const shortK = opts.shortK ?? opts.k;
-  const longPool = valid.filter((s) => allowed(s.symbol, opts.longAllowlist, opts.longBlocklist));
-  const longSorted = [...longPool].sort((a, b) => mode === "MEAN_REVERSION" ? a.score - b.score : b.score - a.score);
-  const selectedLongs = selectWithClusterCap(longSorted, longK, opts.maxPerCluster);
-  const longSymbols = new Set(selectedLongs.map((s) => s.symbol));
-  const shortPool = valid.filter((s) => !longSymbols.has(s.symbol) && allowed(s.symbol, opts.shortAllowlist, opts.shortBlocklist));
-  const shortSorted = [...shortPool].sort((a, b) => mode === "MEAN_REVERSION" ? b.score - a.score : a.score - b.score);
-  const selectedShorts = selectWithClusterCap(shortSorted, shortK, opts.maxPerCluster);
+  const longPoolAll = valid.filter((s) => allowed(s.symbol, opts.longAllowlist, opts.longBlocklist));
+  const longSortedAll = [...longPoolAll].sort((a, b) => mode === "MEAN_REVERSION" ? a.score - b.score : b.score - a.score);
+  const shortPoolAll = valid.filter((s) => allowed(s.symbol, opts.shortAllowlist, opts.shortBlocklist));
+  const shortSortedAll = [...shortPoolAll].sort((a, b) => mode === "MEAN_REVERSION" ? b.score - a.score : a.score - b.score);
+  // A symbol eligible for BOTH sides (e.g. via CROSS_SECTIONAL_REGIME_SKEW's own allowlists) can
+  // only ever fill one leg. Whichever side selects first claims it. Previously long always went
+  // first, which starves short whenever a regime skew (see regimeSkewedK) raises shortK above
+  // longK — the bearish-favored side needing MORE legs lost the shared symbols to the side needing
+  // FEWER (2026-07-09 audit: BEAR skew needed 4 shorts / 2 longs, but long's greedy first pick took
+  // both overlap-eligible symbols, leaving short one leg short). Select the side with the LARGER
+  // requirement first so a regime-favored side is never starved by the other side's leftovers.
+  // Ties (the common unskewed 3/3 case) keep the original long-first order unchanged.
+  let selectedLongs: ScoredSymbol[];
+  let selectedShorts: ScoredSymbol[];
+  if (shortK > longK) {
+    selectedShorts = selectWithClusterCap(shortSortedAll, shortK, opts.maxPerCluster);
+    const shortSymbols = new Set(selectedShorts.map((s) => s.symbol));
+    const longRemaining = longSortedAll.filter((s) => !shortSymbols.has(s.symbol));
+    selectedLongs = selectWithClusterCap(longRemaining, longK, opts.maxPerCluster);
+  } else {
+    selectedLongs = selectWithClusterCap(longSortedAll, longK, opts.maxPerCluster);
+    const longSymbols = new Set(selectedLongs.map((s) => s.symbol));
+    const shortRemaining = shortSortedAll.filter((s) => !longSymbols.has(s.symbol));
+    selectedShorts = selectWithClusterCap(shortRemaining, shortK, opts.maxPerCluster);
+  }
   if (selectedLongs.length < longK || selectedShorts.length < shortK) return null;
   const scoreGap = scoreGapFor(selectedLongs, selectedShorts);
   if (opts.minScoreGap !== undefined && scoreGap < opts.minScoreGap) return null;

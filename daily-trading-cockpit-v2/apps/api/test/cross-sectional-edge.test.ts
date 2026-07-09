@@ -360,6 +360,44 @@ describe("[SKEW] buildCrossSectionalBasket with asymmetric longK/shortK", () => 
     );
     expect(b).toBeNull(); // only 2 non-long names left, needs 4 longs total from a 3-symbol universe
   });
+
+  // 2026-07-09 audit: live's FILTERED basket stopped opening for 16h+ under a bearish regime skew
+  // (longK=2, shortK=4). Root cause: OP/PEPE were eligible for BOTH sides (shared allow/deny lists),
+  // and long — going first — greedily claimed both (they scored highest overall), leaving short
+  // only 3 of its required 4 legs. Fixed by letting whichever side needs MORE legs select first.
+  it("[OVERLAP-PRIORITY] short (needing more legs under a bearish skew) claims a dual-eligible symbol before long, so it isn't starved", () => {
+    const longAllowlist = new Set(["OP", "PEPE", "ETH", "ADA"]);
+    const shortAllowlist = new Set(["OP", "PEPE", "X", "Y", "Z"]);
+    const b = buildCrossSectionalBasket(
+      scored([
+        ["OP", 0.09, 1], ["PEPE", 0.05, 2], ["ETH", 0.02, 3], ["ADA", -0.02, 4],
+        ["X", -0.05, 5], ["Y", -0.03, 6], ["Z", -0.01, 7],
+      ]),
+      {
+        k: 3, longK: 2, shortK: 4, signal: "MOM", now: T0, openedAtMs: T0ms, horizonMs: CROSS_SECTIONAL_HORIZON_MS,
+        longAllowlist, shortAllowlist,
+      },
+    );
+    expect(b).not.toBeNull();
+    expect(b!.shortLeg.map((l) => l.symbol).sort()).toEqual(["PEPE", "X", "Y", "Z"]);
+    expect(b!.longLeg.map((l) => l.symbol).sort()).toEqual(["ETH", "OP"]);
+  });
+
+  it("[OVERLAP-PRIORITY] ties (longK === shortK, the common unskewed case) keep the original long-first order", () => {
+    const longAllowlist = new Set(["OP", "PEPE"]);
+    const shortAllowlist = new Set(["OP", "PEPE", "X"]);
+    const b = buildCrossSectionalBasket(
+      scored([["OP", 0.09, 1], ["PEPE", 0.05, 2], ["X", -0.05, 3]]),
+      {
+        k: 1, longK: 1, shortK: 1, signal: "MOM", now: T0, openedAtMs: T0ms, horizonMs: CROSS_SECTIONAL_HORIZON_MS,
+        longAllowlist, shortAllowlist,
+      },
+    );
+    expect(b).not.toBeNull();
+    // Long still picks first (OP, the top scorer) — short falls back to its next-best eligible (X).
+    expect(b!.longLeg.map((l) => l.symbol)).toEqual(["OP"]);
+    expect(b!.shortLeg.map((l) => l.symbol)).toEqual(["X"]);
+  });
 });
 
 describe("[CLUSTER-CAP] buildCrossSectionalBasket with maxPerCluster (2026-07-08)", () => {
