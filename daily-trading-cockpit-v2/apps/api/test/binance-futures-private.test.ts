@@ -59,6 +59,39 @@ describe("binance-futures-private signing", () => {
     expect(client.getClockSkewMs()).toBeGreaterThan(1_000);
   });
 
+  it("preserves full precision on Binance order/algo IDs that exceed Number.MAX_SAFE_INTEGER", async () => {
+    // Real observed live order id (19 digits) — native JSON.parse silently rounds this, which is
+    // exactly the bug that made queryOrder(symbol, orderId) fail with -2013 "order does not exist"
+    // for 2 real ETHUSDT positions (the rounded id no longer matched Binance's true internal id).
+    const bigOrderId = "8389766229891298477";
+    const bigAlgoId = "8389766229916336219";
+    const rawOrderBody = `{"symbol":"ETHUSDT","orderId":${bigOrderId},"clientOrderId":"c","status":"FILLED","type":"MARKET","side":"BUY","reduceOnly":false,"price":"0","stopPrice":"0","origQty":"1","executedQty":"1","avgPrice":"1750.5","updateTime":1}`;
+    const rawAlgoBody = `{"symbol":"ETHUSDT","algoId":${bigAlgoId},"clientAlgoId":"a","algoStatus":"NEW","orderType":"STOP_MARKET","side":"SELL","quantity":"1","triggerPrice":"1700","actualOrderId":${bigOrderId}}`;
+
+    // Sanity check: confirm native JSON.parse actually DOES lose precision on this input — proves
+    // the regex guard is solving a real problem, not a hypothetical one.
+    expect(String(JSON.parse(rawOrderBody).orderId)).not.toBe(bigOrderId);
+
+    const fetchImpl = (async (url: RequestInfo | URL) => {
+      const u = String(url);
+      if (u.includes("/fapi/v1/time")) {
+        return new Response(JSON.stringify({ serverTime: Date.now() }), { status: 200 });
+      }
+      if (u.includes("/fapi/v1/algoOrder")) {
+        return new Response(rawAlgoBody, { status: 200 });
+      }
+      return new Response(rawOrderBody, { status: 200 });
+    }) as typeof fetch;
+
+    const client = new BinanceFuturesPrivateClient({ apiKey: "k", apiSecret: "s", env: "testnet", fetchImpl });
+    const order = await client.queryOrder("ETHUSDT", bigOrderId);
+    expect(order.orderId).toBe(bigOrderId);
+
+    const algo = await client.queryAlgoOrder(bigAlgoId);
+    expect(algo.algoId).toBe(bigAlgoId);
+    expect(algo.actualOrderId).toBe(bigOrderId);
+  });
+
   it("maps Binance error payloads to typed errors with the binance code", async () => {
     const fetchImpl = (async (url: RequestInfo | URL) => {
       const u = String(url);

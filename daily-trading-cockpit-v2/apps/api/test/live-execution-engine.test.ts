@@ -59,12 +59,12 @@ class FakeLiveClient {
   env = "testnet" as const;
   placed: PlaceOrderParams[] = [];
   leverageCalls: Array<{ symbol: string; leverage: number }> = [];
-  canceled: Array<{ symbol: string; orderId: number }> = [];
+  canceled: Array<{ symbol: string; orderId: string }> = [];
   cancelAllSymbols: string[] = [];
   positionsBySymbol = new Map<string, number>();
   markPriceBySymbol = new Map<string, number>();
   unrealizedPnlBySymbol = new Map<string, number>();
-  orderStatusById = new Map<number, string>();
+  orderStatusById = new Map<string, string>();
   /** What queryOrder reports for a symbol — simulates the exchange confirming a fill that the
    *  initial placeOrder response returned as avgPrice=0. Unset ⇒ stays unconfirmed (NEW). */
   queryOrderAvgPriceBySymbol = new Map<string, number>();
@@ -126,7 +126,7 @@ class FakeLiveClient {
   async getOpenAlgoOrders() {
     return [];
   }
-  async queryAlgoOrder(_algoId: number): Promise<FuturesAlgoOrder> {
+  async queryAlgoOrder(_algoId: string): Promise<FuturesAlgoOrder> {
     return {
       symbol: "ETHUSDT",
       algoId: _algoId,
@@ -139,7 +139,7 @@ class FakeLiveClient {
       actualOrderId: _algoId,
     };
   }
-  async queryOrder(symbol: string, orderId: number): Promise<FuturesOrder> {
+  async queryOrder(symbol: string, orderId: string): Promise<FuturesOrder> {
     // status stays decoupled from avgPrice — other call sites (e.g. TP1-fill polling) rely on
     // orderStatusById/the "NEW" default independent of whether a fill price has been confirmed.
     return this.stubOrder({
@@ -153,7 +153,7 @@ class FakeLiveClient {
       throw new Error("request timed out after 6000ms");
     }
     this.placed.push(p);
-    const orderId = this.nextOrderId++;
+    const orderId = String(this.nextOrderId++);
     if (p.type === "MARKET" && !p.reduceOnly) {
       this.positionsBySymbol.set(
         p.symbol,
@@ -183,7 +183,7 @@ class FakeLiveClient {
       workingType: p.workingType,
       newClientOrderId: p.clientAlgoId,
     });
-    const algoId = this.nextOrderId++;
+    const algoId = String(this.nextOrderId++);
     return {
       symbol: p.symbol,
       algoId,
@@ -196,10 +196,10 @@ class FakeLiveClient {
       actualOrderId: null,
     };
   }
-  async cancelOrder(symbol: string, orderId: number): Promise<void> {
+  async cancelOrder(symbol: string, orderId: string): Promise<void> {
     this.canceled.push({ symbol, orderId });
   }
-  async cancelAlgoOrder(orderId: number): Promise<void> {
+  async cancelAlgoOrder(orderId: string): Promise<void> {
     this.canceled.push({ symbol: "ETHUSDT", orderId });
   }
   async cancelAllOrders(symbol: string): Promise<void> {
@@ -214,7 +214,7 @@ class FakeLiveClient {
   private stubOrder(overrides: Partial<FuturesOrder>): FuturesOrder {
     return {
       symbol: "ETHUSDT",
-      orderId: 0,
+      orderId: "0",
       clientOrderId: "",
       status: "NEW",
       type: "MARKET",
@@ -617,6 +617,36 @@ describe("LiveExecutionEngine", () => {
     await engine.tick();
     expect(client.placed.length).toBe(0);
     expect(engine.isArmed()).toBe(false);
+  });
+
+  it("new-entry drain blocks fresh opens while the engine remains armed", async () => {
+    const { engine, client, store } = makeEngine({ paper: makePaperStore([paperOrder()]) });
+    expect((await engine.arm()).ok).toBe(true);
+    engine.setNewEntriesPaused(true, "test drain");
+    await engine.tick();
+    expect(client.placed.length).toBe(0);
+    expect(store.getState().intents.length).toBe(0);
+    expect(engine.getStatus()).toMatchObject({
+      armed: true,
+      newEntries: { allowed: false, drainActive: true, pauseReason: "test drain" },
+    });
+  });
+
+  it("new-entry drain does not stop lifecycle settlement for an already-open position", async () => {
+    const order = paperOrder({ variantExitRule: "tp1_full" });
+    const { engine, client, store } = makeEngine({ paper: makePaperStore([order]) });
+    expect((await engine.arm()).ok).toBe(true);
+    await engine.tick();
+    const intent = store.getState().intents[0]!;
+    engine.setNewEntriesPaused(true, "drain existing exposure");
+    client.orderStatusById.set(intent.tp1OrderId!, "FILLED");
+    client.positionsBySymbol.set(intent.symbol, 0);
+    client.trades = [
+      { symbol: intent.symbol, orderId: intent.tp1OrderId!, price: 1900, qty: intent.qty, realizedPnl: 1, commission: 0.01, commissionAsset: "USDT", time: 1 },
+    ];
+    await engine.tick();
+    expect(store.getState().intents[0]!.state).toBe("CLOSED");
+    expect(engine.isArmed()).toBe(true);
   });
 
   it("tp1_full lane banks 100% at TP1 — full-qty LIMIT, settles flat with no runner/breakeven replace", async () => {
@@ -1320,9 +1350,9 @@ describe("LiveExecutionEngine", () => {
         stopLossPrice: 2100,
         tp1Price: 1900,
         filledEntryPrice: 2000,
-        entryOrderId: 1,
+        entryOrderId: "1",
         stopOrderId: null,
-        tp1OrderId: 2,
+        tp1OrderId: "2",
         beStopOrderId: null,
         realizedPnlUsd: 20,
         feesUsd: 1,
@@ -1346,9 +1376,9 @@ describe("LiveExecutionEngine", () => {
         stopLossPrice: 95,
         tp1Price: 105,
         filledEntryPrice: 100,
-        entryOrderId: 3,
+        entryOrderId: "3",
         stopOrderId: null,
-        tp1OrderId: 4,
+        tp1OrderId: "4",
         beStopOrderId: null,
         realizedPnlUsd: -5,
         feesUsd: 0.5,
@@ -1394,6 +1424,140 @@ describe("LiveExecutionEngine", () => {
     const yearly = engine.getLanePerformanceSeries({ view: "yearly", anchor: "2099", regime: "all" });
     expect(yearly.periodLabel).toBe("2097-2099");
     expect(yearly.bucketStarts).toHaveLength(3);
+  });
+
+  // 2026-07-09 fix: a pyramided intent (many sourcePaperOrders sharing the SAME laneId, i.e.
+  // repeated adds into one open position) must count as ONE closed trade for that lane in both
+  // closedLanes and getLanePerformanceSeries, not one per add. Root cause of the CG_WIDE_FAST_LONG
+  // testnet/live divergence investigation: a position pyramided 26x counted as "26 trades",
+  // inflating both reported sample size and win/loss tallies whenever pyramiding correlated with
+  // outcome (heavily-pyramided losers massively over-weighted the loss count).
+  it("getAccountSnapshot().closedLanes counts a pyramided intent as ONE trade per lane, not one per add", async () => {
+    const { engine, store } = makeEngine({ nowIso: () => "2099-01-02T12:00:00.000Z" });
+    store.getState().intents.push({
+      paperOrderId: "paper-pyramided",
+      symbol: "DOGEUSDT",
+      direction: "LONG",
+      state: "CLOSED",
+      qty: 3,
+      tp1Qty: 3,
+      plannedEntryPrice: 1,
+      stopLossPrice: 0.9,
+      tp1Price: 1.1,
+      filledEntryPrice: 1,
+      entryOrderId: "10",
+      stopOrderId: null,
+      tp1OrderId: "11",
+      beStopOrderId: null,
+      realizedPnlUsd: -6, // one real loss, split across 3 pyramided adds
+      feesUsd: 0.3,
+      exitRule: "tp1_full",
+      maxFavorableR: null,
+      createdAt: "2099-01-02T10:00:00.000Z",
+      updatedAt: "2099-01-02T11:30:00.000Z",
+      closedAt: "2099-01-02T11:30:00.000Z",
+      closeReason: "TEST",
+      lastError: null,
+      // 3 adds, all into the SAME lane — this is ONE real trade, not 3.
+      sourcePaperOrders: [
+        { paperOrderId: "paper-pyramided-1", laneId: "CG_WIDE_FAST_LONG", qty: 1 },
+        { paperOrderId: "paper-pyramided-2", laneId: "CG_WIDE_FAST_LONG", qty: 1 },
+        { paperOrderId: "paper-pyramided-3", laneId: "CG_WIDE_FAST_LONG", qty: 1 },
+      ],
+    });
+
+    const account = await engine.getAccountSnapshot();
+    const lane = account.closedLanes.find((l) => l.laneId === "CG_WIDE_FAST_LONG");
+    expect(lane).toBeDefined();
+    expect(lane!.closedCount).toBe(1); // NOT 3
+    expect(lane!.wins).toBe(0);
+    expect(lane!.losses).toBe(1); // NOT 3
+    expect(lane!.realizedPnlUsd).toBeCloseTo(-6, 9); // dollar total still correct
+    expect(lane!.feesUsd).toBeCloseTo(0.3, 9);
+  });
+
+  it("getAccountSnapshot().closedLanes still attributes one count to EACH distinct lane when an intent's sources span multiple lanes", async () => {
+    const { engine, store } = makeEngine({ nowIso: () => "2099-01-02T12:00:00.000Z" });
+    store.getState().intents.push({
+      paperOrderId: "paper-mixed",
+      symbol: "ETHUSDT",
+      direction: "LONG",
+      state: "CLOSED",
+      qty: 2,
+      tp1Qty: 2,
+      plannedEntryPrice: 2000,
+      stopLossPrice: 1900,
+      tp1Price: 2100,
+      filledEntryPrice: 2000,
+      entryOrderId: "20",
+      stopOrderId: null,
+      tp1OrderId: "21",
+      beStopOrderId: null,
+      realizedPnlUsd: 10,
+      feesUsd: 0.4,
+      exitRule: "tp1_full",
+      maxFavorableR: null,
+      createdAt: "2099-01-02T10:00:00.000Z",
+      updatedAt: "2099-01-02T11:30:00.000Z",
+      closedAt: "2099-01-02T11:30:00.000Z",
+      closeReason: "TEST",
+      lastError: null,
+      sourcePaperOrders: [
+        { paperOrderId: "paper-mixed-a", laneId: "LANE_A", qty: 1 },
+        { paperOrderId: "paper-mixed-b", laneId: "LANE_B", qty: 1 },
+      ],
+    });
+
+    const account = await engine.getAccountSnapshot();
+    const laneA = account.closedLanes.find((l) => l.laneId === "LANE_A");
+    const laneB = account.closedLanes.find((l) => l.laneId === "LANE_B");
+    expect(laneA!.closedCount).toBe(1);
+    expect(laneB!.closedCount).toBe(1);
+    expect(laneA!.realizedPnlUsd).toBeCloseTo(5, 9); // 50% qty share of the $10 win
+    expect(laneB!.realizedPnlUsd).toBeCloseTo(5, 9);
+  });
+
+  it("getLanePerformanceSeries counts a pyramided intent as ONE trade, using the first add's regime as representative", () => {
+    const { engine, store } = makeEngine({ nowIso: () => "2099-01-02T12:00:00.000Z" });
+    store.getState().intents.push({
+      paperOrderId: "paper-pyramided-series",
+      symbol: "WLDUSDT",
+      direction: "LONG",
+      state: "CLOSED",
+      qty: 2,
+      tp1Qty: 2,
+      plannedEntryPrice: 1,
+      stopLossPrice: 0.9,
+      tp1Price: 1.1,
+      filledEntryPrice: 1,
+      entryOrderId: "30",
+      stopOrderId: null,
+      tp1OrderId: "31",
+      beStopOrderId: null,
+      realizedPnlUsd: -4,
+      feesUsd: 0.2,
+      exitRule: "tp1_full",
+      maxFavorableR: null,
+      createdAt: "2099-01-02T10:00:00.000Z",
+      updatedAt: "2099-01-02T11:30:00.000Z",
+      closedAt: "2099-01-02T11:30:00.000Z",
+      closeReason: "TEST",
+      lastError: null,
+      // First add's regime (LONG_ONLY) is the entry condition; the second add happened later under
+      // a different (stale) regime snapshot — the WHOLE trade should be classified by the first.
+      sourcePaperOrders: [
+        { paperOrderId: "paper-pyr-series-1", laneId: "LANE_LONG_PYR", qty: 1, regime: "Bullish pullback", controllerMode: "LONG_ONLY", controllerConfidence: "LOW" },
+        { paperOrderId: "paper-pyr-series-2", laneId: "LANE_LONG_PYR", qty: 1, regime: "Mixed rotation", controllerMode: "VALIDATION_ONLY", controllerConfidence: "LOW" },
+      ],
+    });
+
+    const series = engine.getLanePerformanceSeries({ view: "daily", anchor: "2099-01", regime: "long" });
+    expect(series.lanes).toHaveLength(1);
+    expect(series.lanes[0]!.laneId).toBe("LANE_LONG_PYR");
+    expect(series.lanes[0]!.closedCount).toBe(1); // NOT 2
+    expect(series.lanes[0]!.wins).toBe(0);
+    expect(series.lanes[0]!.losses).toBe(1); // NOT 2
+    expect(series.lanes[0]!.realizedPnlUsd).toBeCloseTo(-4, 9);
   });
 
   it("kill-switch on daily loss: cancels, flattens, disarms, latches", async () => {
@@ -1904,7 +2068,7 @@ describe("regime-flip rescue (shadow wiring)", () => {
       stopLossPrice: 1.0,
       tp1Price: 1.1,
       filledEntryPrice: 1.0572,
-      entryOrderId: 1,
+      entryOrderId: "1",
       stopOrderId: null,
       tp1OrderId: null,
       beStopOrderId: null,
@@ -1989,7 +2153,7 @@ describe("regime-flip rescue (LIVE execution)", () => {
       stopLossPrice: 1900,
       tp1Price: 2100,
       filledEntryPrice: 2000,
-      entryOrderId: 1,
+      entryOrderId: "1",
       stopOrderId: null,
       tp1OrderId: null,
       beStopOrderId: null,
@@ -2073,7 +2237,7 @@ describe("regime-flip rescue (LIVE execution)", () => {
       getControllerSnapshot: SHORT_REGIME,
     });
     expect((await engine.arm()).ok).toBe(true);
-    pushIntent(store, { paperOrderId: "p-resc", direction: "SHORT", rescue: true, rescuePriorRealizedUsd: -4.72, entryOrderId: 50 });
+    pushIntent(store, { paperOrderId: "p-resc", direction: "SHORT", rescue: true, rescuePriorRealizedUsd: -4.72, entryOrderId: "50" });
 
     await engine.tick();
 
@@ -2119,7 +2283,7 @@ describe("mainnet profit protection (opt-in regime harvest on real money)", () =
       stopLossPrice: 2060,
       tp1Price: 1900,
       filledEntryPrice: 2000,
-      entryOrderId: 1,
+      entryOrderId: "1",
       stopOrderId: null,
       tp1OrderId: null,
       beStopOrderId: null,
@@ -2487,6 +2651,29 @@ describe("weighted lane allocation (POST /api/live/lane-allocations)", () => {
     expect(engine.getStatus().laneSelection.mode).toBe("ALL_LANES");
   });
 
+  it("[2026-07-09] accepts up to MAX_LANE_ALLOCATIONS (10, raised from the old hardcoded 4) and rejects one more", async () => {
+    const { engine } = makeEngine();
+    const tenLanes = Array.from({ length: 10 }, (_, i) => ({ laneId: `LANE_${i}`, weightPct: 10 }));
+    expect(engine.setLaneAllocations(tenLanes).ok).toBe(true);
+    const elevenLanes = Array.from({ length: 11 }, (_, i) => ({ laneId: `LANE_${i}`, weightPct: 10 }));
+    const rejected = engine.setLaneAllocations(elevenLanes);
+    expect(rejected.ok).toBe(false);
+    expect(rejected.reason).toContain("1-10 lanes");
+  });
+
+  it("[2026-07-09] a real 5-lane allocation (existing REGIME_COMPOSITE_CONFIRMATION_LONG + 4 COMPOSITE_ESTIMATOR_BIDI buckets) is accepted", async () => {
+    const { engine, store } = makeEngine();
+    const result = engine.setLaneAllocations([
+      { laneId: "REGIME_COMPOSITE_CONFIRMATION_LONG", weightPct: 100 },
+      { laneId: "COMPOSITE_ESTIMATOR_BIDI_WIDE_LONG", weightPct: 100 },
+      { laneId: "COMPOSITE_ESTIMATOR_BIDI_WIDE_SHORT", weightPct: 100 },
+      { laneId: "COMPOSITE_ESTIMATOR_BIDI_FAST_LONG", weightPct: 100 },
+      { laneId: "COMPOSITE_ESTIMATOR_BIDI_FAST_SHORT", weightPct: 100 },
+    ]);
+    expect(result.ok).toBe(true);
+    expect(store.getState().laneAllocations).toHaveLength(5);
+  });
+
   it("scales the mirrored entry size by the lane's weight (70% ⇒ 0.7× qty)", async () => {
     const order = paperOrder({ selectedLaneId: "CG_VARIANT_MATRIX:CG_WIDE_FAST_SHORT" } as Partial<PaperOrder>);
     const { engine, store } = makeEngine({ paper: makePaperStore([order]) });
@@ -2527,37 +2714,51 @@ describe("weighted lane allocation (POST /api/live/lane-allocations)", () => {
   });
 });
 
-// 2026-07-09 real incident: the operator applied a Bear Trend preset via the dashboard's "Apply"
-// button, but ~70 minutes later RegimeAutopilot's own tick silently reverted the live allocation
-// back to its own observed-regime preset — because setLaneAllocations() (which the route called
-// directly) never set manualSelectorMode, so applyRegimeAutopilotAllocation's own "operator owns
-// it" guard never actually engaged for a plain dashboard Apply. setLaneAllocationsAsOperator is
-// the fix: the operator-explicit entry point (POST /api/live/lane-allocations) now sets the same
-// flag, closing the loop with applyRegimeAutopilotAllocation's existing isManualSelectorMode() check.
-describe("setLaneAllocationsAsOperator (2026-07-09 fix: operator Apply must not be silently overwritten by autopilot)", () => {
-  it("sets manualSelectorMode when applying a real allocation", () => {
+// 2026-07-09 real incident (two takes): the operator applied a Bear Trend preset via the
+// dashboard's "Apply" button, but later RegimeAutopilot's own tick silently reverted the live
+// allocation back to its own observed-regime preset. Take 1 fixed this by having
+// setLaneAllocationsAsOperator set manualSelectorMode — but that field's real, still-current job is
+// the UNRELATED "raw bypass" toggle (see its own doc comment), and toggling THAT for its own
+// legitimate purpose silently released the guard again, reverting a live 80/8/8/4 allocation within
+// minutes. Take 2 (this block): a dedicated laneAllocationOperatorLock field that only this path
+// and applyRegimeAutopilotAllocation/maybeAutoResetLaneSelection ever touch.
+describe("setLaneAllocationsAsOperator (2026-07-09 fix, take 2: dedicated lock, independent of the raw-bypass toggle)", () => {
+  it("sets laneAllocationOperatorLock when applying a real allocation", () => {
     const { engine, store } = makeEngine();
-    expect(store.getState().manualSelectorMode).toBe(false);
+    expect(store.getState().laneAllocationOperatorLock).toBe(false);
     const result = engine.setLaneAllocationsAsOperator([{ laneId: "CG_WIDE_FAST_SHORT", weightPct: 100 }]);
     expect(result.ok).toBe(true);
-    expect(store.getState().manualSelectorMode).toBe(true);
+    expect(store.getState().laneAllocationOperatorLock).toBe(true);
+    expect(engine.isLaneAllocationOperatorLocked()).toBe(true);
   });
 
-  it("does NOT set manualSelectorMode when the allocation is invalid (nothing to protect)", () => {
+  it("does NOT set laneAllocationOperatorLock when the allocation is invalid (nothing to protect)", () => {
     const { engine, store } = makeEngine();
     const result = engine.setLaneAllocationsAsOperator([{ laneId: "A", weightPct: 101 }]);
     expect(result.ok).toBe(false);
-    expect(store.getState().manualSelectorMode).toBe(false);
+    expect(store.getState().laneAllocationOperatorLock).toBe(false);
   });
 
-  it("does NOT touch manualSelectorMode when clearing (allocations: null)", () => {
+  it("does NOT touch laneAllocationOperatorLock when clearing (allocations: null)", () => {
     const { engine, store } = makeEngine();
-    engine.setManualSelectorMode(false);
+    store.getState().laneAllocationOperatorLock = false;
     engine.setLaneAllocationsAsOperator(null);
-    expect(store.getState().manualSelectorMode).toBe(false);
+    expect(store.getState().laneAllocationOperatorLock).toBe(false);
+    store.getState().laneAllocationOperatorLock = true;
+    engine.setLaneAllocationsAsOperator(null);
+    expect(store.getState().laneAllocationOperatorLock).toBe(true); // unchanged, whichever it was
+  });
+
+  it("toggling the UNRELATED raw-bypass mode never touches the lane-allocation lock (the actual regression)", () => {
+    const { engine, store } = makeEngine();
+    engine.setLaneAllocationsAsOperator([{ laneId: "CG_WIDE_FAST_SHORT", weightPct: 100 }]);
+    expect(engine.isLaneAllocationOperatorLocked()).toBe(true);
+    // Operator flips the "Switch to MANUAL (bypass)" / "Switch to SMART" dashboard button, for its
+    // own unrelated reason (book-overlay/direction-gate bypass) — must NOT release the lock.
     engine.setManualSelectorMode(true);
-    engine.setLaneAllocationsAsOperator(null);
-    expect(store.getState().manualSelectorMode).toBe(true); // unchanged, whichever it was
+    expect(engine.isLaneAllocationOperatorLocked()).toBe(true);
+    engine.setManualSelectorMode(false);
+    expect(engine.isLaneAllocationOperatorLocked()).toBe(true);
   });
 
   it("[THE ACTUAL INCIDENT] once applied via the operator path, RegimeAutopilot's own apply refuses to overwrite it", () => {
@@ -2790,6 +2991,22 @@ describe("Phase-2 exit rebuild: forced MFE-giveback + losing-max-hold cut", () =
     client.markPriceBySymbol.set("ETHUSDT", 1960);
     await engine.tick();
     expect(store.getState().intents[0]!.state).toBe("OPEN");
+  });
+
+  it("profit-core keeps its explicit TP1 scaleout+trail geometry even when global forceMfeGiveback is on", async () => {
+    const order = paperOrder({ selectedLaneId: "PROFIT_CORE_SHORT_TRAIL" } as Partial<PaperOrder>);
+    const { engine, client, store } = makeEngine({
+      paper: makePaperStore([order]),
+      config: { forceMfeGiveback: true },
+    });
+    await engine.arm();
+    await engine.tick();
+    client.markPriceBySymbol.set("ETHUSDT", 1900);
+    await engine.tick();
+    client.markPriceBySymbol.set("ETHUSDT", 1960);
+    await engine.tick();
+    expect(store.getState().intents[0]!.state).toBe("OPEN");
+    expect(store.getState().intents[0]!.closeReason).toBeNull();
   });
 
   it("cuts a position that has been LOSING longer than losingMaxHoldMs", async () => {
@@ -3286,9 +3503,9 @@ describe("applyRegimeAutopilotAllocation (autopilot ↔ manual-mode sync)", () =
   // SPEC CHANGE 2026-07-08 (supersedes the 07-07 sync): "autopilot tetep memerintah, tapi kalau
   // execution mode nya manual, gw ambil alih lane allocation" — an autopilot apply while MANUAL
   // is on must be REFUSED, never overwrite the operator's allocation.
-  it("[MANUAL-OVERRIDE] refuses the autopilot apply while manual mode is ON (operator owns the allocation)", () => {
+  it("[LOCK] refuses the autopilot apply while the lane-allocation lock is ON (operator owns the allocation)", () => {
     const { engine, store } = makeEngine();
-    engine.setManualSelectorMode(true);
+    store.getState().laneAllocationOperatorLock = true;
     engine.setLaneAllocations([{ laneId: "CG_WIDE_FAST_LONG", weightPct: 100 }]); // operator's pick
 
     const result = engine.applyRegimeAutopilotAllocation([
@@ -3297,62 +3514,62 @@ describe("applyRegimeAutopilotAllocation (autopilot ↔ manual-mode sync)", () =
     ]);
 
     expect(result.ok).toBe(false);
-    expect(result.reason).toMatch(/manual/);
+    expect(result.reason).toMatch(/lock/);
     expect(store.getState().laneAllocations).toEqual([{ laneId: "CG_WIDE_FAST_LONG", weightPct: 100 }]); // untouched
-    expect(engine.isManualSelectorMode()).toBe(true); // still the operator's
+    expect(engine.isLaneAllocationOperatorLocked()).toBe(true); // still the operator's
   });
 
-  it("leaves manualSelectorMode false (already smart) untouched when applied while not in manual mode", () => {
+  it("leaves laneAllocationOperatorLock false (already smart) untouched when applied while not locked", () => {
     const { engine, store } = makeEngine();
-    expect(engine.isManualSelectorMode()).toBe(false);
+    expect(engine.isLaneAllocationOperatorLocked()).toBe(false);
 
     const result = engine.applyRegimeAutopilotAllocation([{ laneId: "CG_WIDE_FAST_LONG", weightPct: 100 }]);
 
     expect(result.ok).toBe(true);
     expect(store.getState().laneAllocations).toEqual([{ laneId: "CG_WIDE_FAST_LONG", weightPct: 100 }]);
-    expect(engine.isManualSelectorMode()).toBe(false);
+    expect(engine.isLaneAllocationOperatorLocked()).toBe(false);
   });
 
-  it("does NOT touch manualSelectorMode when the allocation is rejected (validation failure)", () => {
+  it("does NOT touch laneAllocationOperatorLock when the allocation is rejected (validation failure)", () => {
     const { engine, store } = makeEngine();
-    engine.setManualSelectorMode(true);
+    store.getState().laneAllocationOperatorLock = true;
 
     const result = engine.applyRegimeAutopilotAllocation([{ laneId: "A", weightPct: 0 }]); // invalid weightPct
 
     expect(result.ok).toBe(false);
-    expect(engine.isManualSelectorMode()).toBe(true); // untouched — the apply never went through
+    expect(engine.isLaneAllocationOperatorLocked()).toBe(true); // untouched — the apply never went through
     expect(store.getState().laneAllocations).toBeNull();
   });
 
-  it("regime-autopilot end-to-end via RegimeAutopilot.tick(): MANUAL holds the allocation, auto reclaims after it ends", async () => {
+  it("regime-autopilot end-to-end via RegimeAutopilot.tick(): LOCK holds the allocation, auto reclaims after it's released", async () => {
     const { RegimeAutopilot, REGIME_AUTOPILOT_PRESETS } = await import("../src/lib/regime-autopilot.js");
     const { engine, store } = makeEngine();
-    engine.setManualSelectorMode(true);
+    store.getState().laneAllocationOperatorLock = true;
     engine.setLaneAllocations([{ laneId: "CG_WIDE_FAST_LONG", weightPct: 100 }]); // operator's pick
     let regime: string | null = null;
     let now = 1_000_000_000_000;
     const pilot = new RegimeAutopilot({
       setAllocations: (a) => engine.applyRegimeAutopilotAllocation(a),
       getLatestRegime: () => regime,
-      isManualMode: () => engine.isManualSelectorMode(),
+      isManualMode: () => engine.isLaneAllocationOperatorLocked(),
       nowMs: () => now,
       stableCycles: 1,
       minHoldMs: 30 * 60_000,
     });
     regime = "NO_TRADE";
-    pilot.tick(); // MANUAL is on — the autopilot observes but must not touch anything
-    expect(engine.isManualSelectorMode()).toBe(true);
+    pilot.tick(); // LOCK is on — the autopilot observes but must not touch anything
+    expect(engine.isLaneAllocationOperatorLocked()).toBe(true);
     expect(store.getState().laneAllocations).toEqual([{ laneId: "CG_WIDE_FAST_LONG", weightPct: 100 }]);
 
-    engine.setManualSelectorMode(false); // operator hands control back
+    store.getState().laneAllocationOperatorLock = false; // operator hands control back
     pilot.tick(); // bot reclaims on the next tick
     expect(store.getState().laneAllocations).toEqual(REGIME_AUTOPILOT_PRESETS.NO_TRADE);
   });
 
-  it("regime-autopilot: manualSelectorMode stays true while autopilot skips (not yet stable — anti-whipsaw guard unchanged)", async () => {
+  it("regime-autopilot: laneAllocationOperatorLock stays true while autopilot skips (not yet stable — anti-whipsaw guard unchanged)", async () => {
     const { RegimeAutopilot } = await import("../src/lib/regime-autopilot.js");
-    const { engine } = makeEngine();
-    engine.setManualSelectorMode(true);
+    const { engine, store } = makeEngine();
+    store.getState().laneAllocationOperatorLock = true;
     let regime: string | null = null;
     let now = 1_000_000_000_000;
     const pilot = new RegimeAutopilot({
@@ -3365,6 +3582,21 @@ describe("applyRegimeAutopilotAllocation (autopilot ↔ manual-mode sync)", () =
     regime = "BEAR_TREND";
     pilot.tick(); // count 1/3 — not yet stable, does NOT call setAllocations
     pilot.tick(); // count 2/3 — still not stable
-    expect(engine.isManualSelectorMode()).toBe(true); // untouched, since autopilot never acted
+    expect(engine.isLaneAllocationOperatorLocked()).toBe(true); // untouched, since autopilot never acted
+  });
+
+  it("toggling raw-bypass mode (manualSelectorMode) never affects the lane-allocation lock or autopilot's guard", () => {
+    const { engine, store } = makeEngine();
+    store.getState().laneAllocationOperatorLock = true;
+    engine.setLaneAllocations([{ laneId: "CG_WIDE_FAST_LONG", weightPct: 100 }]); // operator's pick
+
+    engine.setManualSelectorMode(true); // operator flips the UNRELATED raw-bypass dashboard toggle
+    let result = engine.applyRegimeAutopilotAllocation([{ laneId: "CROSS_SECTIONAL_MARKET_NEUTRAL", weightPct: 100 }]);
+    expect(result.ok).toBe(false); // still locked — must not have been released by the toggle
+
+    engine.setManualSelectorMode(false);
+    result = engine.applyRegimeAutopilotAllocation([{ laneId: "CROSS_SECTIONAL_MARKET_NEUTRAL", weightPct: 100 }]);
+    expect(result.ok).toBe(false); // STILL locked — toggling raw-bypass off must not release it either
+    expect(store.getState().laneAllocations).toEqual([{ laneId: "CG_WIDE_FAST_LONG", weightPct: 100 }]);
   });
 });

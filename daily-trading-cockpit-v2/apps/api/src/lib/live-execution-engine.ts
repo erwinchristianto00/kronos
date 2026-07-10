@@ -55,6 +55,7 @@ import { fetchCrowdingSnapshot, type CrowdSide, type CrowdingState } from "./der
 import { clusterOf, isMajorSymbol } from "./correlation-clusters.js";
 import type { BinanceClient } from "./binance.js";
 import type { PaperOrder } from "./paper-execution-router.js";
+import { isProfitCoreShortLaneId } from "./realtime-short-mirror.js";
 import {
   getCuratedSymbolsForLane,
   type LaneSymbolCurationTier,
@@ -429,10 +430,10 @@ export interface LiveIntent {
   stopLossPrice: number;
   tp1Price: number;
   filledEntryPrice: number | null;
-  entryOrderId: number | null;
-  stopOrderId: number | null;
-  tp1OrderId: number | null;
-  beStopOrderId: number | null;
+  entryOrderId: string | null;
+  stopOrderId: string | null;
+  tp1OrderId: string | null;
+  beStopOrderId: string | null;
   realizedPnlUsd: number | null;
   feesUsd: number | null;
   exitRule?: VariantExitRule;
@@ -586,12 +587,38 @@ interface LiveExecutionState {
    * rails (kill-switch, cluster cap, risk size, stop/TP geometry) are NEVER bypassed. Persisted.
    */
   manualSelectorMode: boolean;
+  /**
+   * Lane-allocation operator lock (2026-07-09 fix, take 2). Distinct from manualSelectorMode above
+   * — that field is the RAW BYPASS toggle (scan.ts admission overlays) and is exposed via the
+   * dashboard's "Switch to MANUAL (bypass)" button. This field is set ONLY by
+   * setLaneAllocationsAsOperator() when the operator explicitly applies a lane allocation via
+   * POST /api/live/lane-allocations, and checked by RegimeAutopilot.tick() /
+   * applyRegimeAutopilotAllocation() / maybeAutoResetLaneSelection() before any of them may touch
+   * laneAllocations.
+   *
+   * Real incident: the first fix attempt (same day) reused manualSelectorMode for this lock. The
+   * operator toggled the RAW BYPASS button for its own unrelated purpose, which — because both
+   * concepts shared one flag — silently released the lock too, letting the next autopilot tick
+   * revert a manually-set 80/8/8/4 allocation back to the NO_TRADE preset (100%
+   * CROSS_SECTIONAL_MARKET_NEUTRAL) within minutes. Two independent concerns must never share one
+   * boolean again.
+   */
+  laneAllocationOperatorLock: boolean;
   /** Watermark (closedAt ISO) of operator-selection closes already evaluated by the
    *  auto-reset rule, so a historical loss can never re-trigger a reset later. */
   laneSelectionLossWatermark: string | null;
   /** Last automatic selection reset (a losing operator-selected close returned control
    *  to the bot). Display-only provenance. */
   laneSelectionLastAutoReset: { at: string; symbol: string; pnlUsd: number } | null;
+  /** Operator drain mode: blocks every NEW entry while lifecycle/reconcile/exit work keeps running. */
+  newEntriesPaused: boolean;
+  newEntriesPausedAt: string | null;
+  newEntriesPauseReason: string | null;
+}
+
+export interface LiveNewEntryGateDecision {
+  allowed: boolean;
+  reason: string | null;
 }
 
 export interface CrowdingExitShadowEntry {
@@ -663,8 +690,12 @@ export class LiveExecutionStore {
       allowedLaneIds: null,
       laneAllocations: null,
       manualSelectorMode: false,
+      laneAllocationOperatorLock: false,
       laneSelectionLossWatermark: null,
       laneSelectionLastAutoReset: null,
+      newEntriesPaused: false,
+      newEntriesPausedAt: null,
+      newEntriesPauseReason: null,
     };
   }
 
@@ -673,6 +704,15 @@ export class LiveExecutionStore {
       if (!existsSync(path)) return null;
       const parsed = JSON.parse(readFileSync(path, "utf-8"));
       if (parsed && typeof parsed === "object" && Array.isArray((parsed as { intents?: unknown }).intents)) {
+        // Legacy records persisted before entryOrderId/stopOrderId/tp1OrderId/beStopOrderId became
+        // strings (see binance-futures-private.ts's order-ID precision fix) still have these as
+        // bare JS numbers on disk — normalize on load so trade-matching `===` against a freshly
+        // fetched (genuinely string) order id doesn't silently mismatch on type alone.
+        for (const intent of (parsed as { intents: Array<Record<string, unknown>> }).intents) {
+          for (const key of ["entryOrderId", "stopOrderId", "tp1OrderId", "beStopOrderId"]) {
+            if (typeof intent[key] === "number") intent[key] = String(intent[key]);
+          }
+        }
         return { ...this._empty(), ...(parsed as Partial<LiveExecutionState>) } as LiveExecutionState;
       }
     } catch {
@@ -748,7 +788,7 @@ export interface LiveExecutionEngineOptions {
   /** Optional market-data client for the crowding-exit SHADOW measurement (getStatus().crowdingExitShadow).
    *  Read-only, best-effort: never throws, never changes the harvest's actual cut/hold decision.
    *  Omit to leave the measurement dormant (no market-data calls). */
-  marketDataClient?: Pick<BinanceClient, "getFuturesFlow" | "getCandles">;
+  marketDataClient?: Pick<BinanceClient, "getFuturesFlow" | "getCandles" | "getBookTicker">;
   /** Delay between queryOrder fill-confirmation retries (see resolveConfirmedFillPrice).
    *  Default 400ms; tests pass 0. */
   fillConfirmRetryDelayMs?: number;
@@ -759,6 +799,8 @@ export interface LiveExecutionEngineOptions {
    *  disarmed, defeating auto-arm every boot). Positions fully explained by these claims are not
    *  orphans; anything beyond the claimed qty still disarms exactly as before. */
   externalManagedNetQty?: () => Map<string, number>;
+  /** Shared strategy/regime admission gate. It affects NEW exposure only; exits always continue. */
+  newEntryGate?: () => LiveNewEntryGateDecision;
 }
 
 const ERROR_STREAK_DISARM = 3;
@@ -806,6 +848,11 @@ const LIVE_PERFORMANCE_VIEWS: Record<LivePerformanceView, {
  * single transient blip while bounding a churn storm to 2 cycles instead of hundreds.
  */
 const MAX_MIRROR_ATTEMPTS = 2;
+/** 2026-07-09: raised from a hardcoded 4 — operator explicitly asked to raise this so
+ *  REGIME_COMPOSITE_CONFIRMATION_LONG (1 slot, already holding 3 real positions) could coexist with
+ *  COMPOSITE_ESTIMATOR_BIDI's 4 new buckets (5 total) without evicting either, "for now, re-evaluate
+ *  later". Env-overridable so it can be tuned without a redeploy if it needs to change again. */
+const MAX_LANE_ALLOCATIONS = envNonNegativeInt(process.env.LIVE_MAX_LANE_ALLOCATIONS, 10);
 
 function normalizePerformanceView(raw: string | null | undefined): LivePerformanceView {
   return raw && Object.prototype.hasOwnProperty.call(LIVE_PERFORMANCE_VIEWS, raw)
@@ -1138,9 +1185,10 @@ export class LiveExecutionEngine {
   private readonly isPaperOrderLiveEligible: (order: PaperOrder, nowIso: string) => boolean;
   private readonly getControllerSnapshot: () => LiveControllerSnapshot | null;
   private readonly nowIso: () => string;
-  private readonly marketDataClient?: Pick<BinanceClient, "getFuturesFlow" | "getCandles">;
+  private readonly marketDataClient?: Pick<BinanceClient, "getFuturesFlow" | "getCandles" | "getBookTicker">;
   private readonly fillConfirmRetryDelayMs: number;
   private readonly externalManagedNetQty: () => Map<string, number>;
+  private readonly newEntryGate: () => LiveNewEntryGateDecision;
 
   /** In-memory ONLY — restart always boots disarmed. */
   private armed = false;
@@ -1173,6 +1221,7 @@ export class LiveExecutionEngine {
     this.marketDataClient = options.marketDataClient;
     this.fillConfirmRetryDelayMs = options.fillConfirmRetryDelayMs ?? 400;
     this.externalManagedNetQty = options.externalManagedNetQty ?? (() => new Map());
+    this.newEntryGate = options.newEntryGate ?? (() => ({ allowed: true, reason: null }));
     // Auto-arm must NOT punch through a latched kill: a restart preserves the kill until an
     // explicit resetKill(). (arm() already enforces this; the constructor path bypassed it.)
     if (this.config.autoArm && this.config.configErrors.length === 0 && !this.store.getState().killedAt) {
@@ -1247,7 +1296,7 @@ export class LiveExecutionEngine {
     env: string;
     canceledOrderSymbols: string[];
     canceledAlgoSymbols: string[];
-    flattened: Array<{ symbol: string; side: "BUY" | "SELL"; quantity: number; orderId: number | null }>;
+    flattened: Array<{ symbol: string; side: "BUY" | "SELL"; quantity: number; orderId: string | null }>;
     failed: Array<{ symbol: string; action: string; reason: string }>;
   }> {
     const st = this.store.getState();
@@ -1258,8 +1307,8 @@ export class LiveExecutionEngine {
     const failed: Array<{ symbol: string; action: string; reason: string }> = [];
     const canceledOrderSymbols: string[] = [];
     const canceledAlgoSymbols: string[] = [];
-    const flattened: Array<{ symbol: string; side: "BUY" | "SELL"; quantity: number; orderId: number | null }> = [];
-    const flattenOrderIdBySymbol = new Map<string, number | null>();
+    const flattened: Array<{ symbol: string; side: "BUY" | "SELL"; quantity: number; orderId: string | null }> = [];
+    const flattenOrderIdBySymbol = new Map<string, string | null>();
 
     const [positions, openOrders, openAlgoOrders] = await Promise.all([
       this.client.getPositions(),
@@ -1364,6 +1413,47 @@ export class LiveExecutionEngine {
     return this.armed;
   }
 
+  private strategyEntryGate(): LiveNewEntryGateDecision {
+    try {
+      const result = this.newEntryGate();
+      return result && typeof result.allowed === "boolean"
+        ? { allowed: result.allowed, reason: result.reason ?? null }
+        : { allowed: false, reason: "invalid strategy entry-gate response" };
+    } catch (error) {
+      return { allowed: false, reason: `strategy entry gate failed: ${(error as Error).message}` };
+    }
+  }
+
+  /** Armed means exits/reconcile are active. This stricter method controls NEW exposure only. */
+  canOpenNewEntries(): boolean {
+    if (!this.armed || this.store.getState().killedAt) return false;
+    if (this.isNewEntryDrainActive()) return false;
+    return this.strategyEntryGate().allowed;
+  }
+
+  isNewEntryDrainActive(): boolean {
+    return this.store.getState().newEntriesPaused === true || process.env.LIVE_NEW_ENTRY_DRAIN === "1";
+  }
+
+  setNewEntriesPaused(enabled: boolean, reason = "operator request"): {
+    enabled: boolean;
+    effective: boolean;
+    pausedAt: string | null;
+    reason: string | null;
+  } {
+    const st = this.store.getState();
+    st.newEntriesPaused = enabled;
+    st.newEntriesPausedAt = enabled ? this.nowIso() : null;
+    st.newEntriesPauseReason = enabled ? reason : null;
+    this.store.save();
+    return {
+      enabled: st.newEntriesPaused,
+      effective: this.isNewEntryDrainActive(),
+      pausedAt: st.newEntriesPausedAt,
+      reason: st.newEntriesPauseReason,
+    };
+  }
+
   // ── controller ─────────────────────────────────────────────────────────────
 
   start(intervalMs = 25_000): void {
@@ -1384,10 +1474,19 @@ export class LiveExecutionEngine {
     const st = this.store.getState();
     const openIntents = st.intents.filter((i) => OPEN_INTENT_STATES.has(i.state));
     const controller = this.currentControllerSnapshot();
+    const strategyEntryGate = this.strategyEntryGate();
     return {
       enabled: this.config.enabled,
       env: this.config.env,
       armed: this.armed,
+      newEntries: {
+        allowed: this.canOpenNewEntries(),
+        drainActive: this.isNewEntryDrainActive(),
+        persistedDrain: st.newEntriesPaused === true,
+        pausedAt: st.newEntriesPausedAt ?? null,
+        pauseReason: st.newEntriesPauseReason ?? null,
+        strategyGate: strategyEntryGate,
+      },
       configErrors: this.config.configErrors,
       killedAt: st.killedAt,
       killReason: st.killReason,
@@ -1441,6 +1540,8 @@ export class LiveExecutionEngine {
         losingMaxHoldMs: this.config.losingMaxHoldMs,
         profitBankNetTargetUsd: this.config.profitBankNetTargetUsd,
         profitBankThresholdUsd: this.profitBankThresholdUsd(),
+        maxEntryChaseStopFraction: this.maxEntryChaseStopFraction(),
+        minEntryGrossTargetPct: this.minEntryGrossTargetPct(),
       },
       rescue: {
         enabled: this.config.rescue?.enabled ?? false,
@@ -1457,6 +1558,7 @@ export class LiveExecutionEngine {
         allowedLaneIds: st.allowedLaneIds ?? null,
         laneAllocations: st.laneAllocations ?? null,
         manualSelectorMode: st.manualSelectorMode === true,
+        laneAllocationOperatorLock: st.laneAllocationOperatorLock === true,
         mode: st.laneAllocations && st.laneAllocations.length > 0
           ? ("WEIGHTED_ALLOCATION" as const)
           : st.allowedLaneIds === null || st.allowedLaneIds === undefined
@@ -1631,10 +1733,24 @@ export class LiveExecutionEngine {
       const realized = intent.realizedPnlUsd;
       const fees = intent.feesUsd ?? 0;
       const closedAt = intent.closedAt ?? intent.updatedAt;
+      // 2026-07-09 fix: aggregate sources by laneId FIRST. A pyramided intent can carry many
+      // sources sharing the SAME laneId (repeated adds into one open position) — that is ONE
+      // closed trade for that lane, not one per add. Counting per-source previously inflated
+      // closedCount/wins/losses by the add count (a position pyramided 26x counted as "26 trades"),
+      // which both overstated real sample size and distorted the reported win rate whenever
+      // pyramiding correlated with outcome (confirmed root cause of the CG_WIDE_FAST_LONG
+      // testnet/live divergence investigation — testnet's losing DOGE/WLD positions had pyramided
+      // up to 26x before their stop, so those 2 real losses alone inflated the loss tally by
+      // dozens). realizedPnlUsd/feesUsd stay dollar-correct either way (shares still sum to 1
+      // across an intent); only the trade/win/loss COUNTS change.
+      const qtyByLane = new Map<string, number>();
       for (const source of sources) {
-        const share = totalQty > 0 ? source.qty / totalQty : 1 / Math.max(sources.length, 1);
+        qtyByLane.set(source.laneId, (qtyByLane.get(source.laneId) ?? 0) + source.qty);
+      }
+      for (const [laneId, laneQty] of qtyByLane) {
+        const share = totalQty > 0 ? laneQty / totalQty : 1 / Math.max(qtyByLane.size, 1);
         const allocatedRealized = realized * share;
-        const row = closedLaneMap.get(source.laneId) ?? {
+        const row = closedLaneMap.get(laneId) ?? {
           closedCount: 0,
           wins: 0,
           losses: 0,
@@ -1652,7 +1768,7 @@ export class LiveExecutionEngine {
         if (closedAt && (!row.lastClosedAt || closedAt > row.lastClosedAt)) {
           row.lastClosedAt = closedAt;
         }
-        closedLaneMap.set(source.laneId, row);
+        closedLaneMap.set(laneId, row);
       }
     }
 
@@ -1729,17 +1845,32 @@ export class LiveExecutionEngine {
       const realized = intent.realizedPnlUsd;
       const fees = intent.feesUsd ?? 0;
 
+      // 2026-07-09 fix: same as getAccountSnapshot's closedLanes — aggregate sources by laneId
+      // FIRST so a pyramided intent (many adds, same lane) counts as ONE closed trade, not one per
+      // add (see that fix's comment for the full incident). Regime classification uses the FIRST
+      // source's regime/controllerMode/confidence per lane group — that source is the original
+      // entry, and later adds' regime snapshots describe re-entries into an ALREADY open position,
+      // not a fresh trade worth its own classification.
+      const sourcesByLane = new Map<string, LiveIntentSource[]>();
       for (const source of sources) {
-        const share = totalQty > 0 ? source.qty / totalQty : 1 / Math.max(sources.length, 1);
+        const laneId = source.laneId || "UNKNOWN";
+        const list = sourcesByLane.get(laneId) ?? [];
+        list.push(source);
+        sourcesByLane.set(laneId, list);
+      }
+
+      for (const [laneId, laneSources] of sourcesByLane) {
+        const laneQty = laneSources.reduce((sum, source) => sum + source.qty, 0);
+        const share = totalQty > 0 ? laneQty / totalQty : 1 / Math.max(sourcesByLane.size, 1);
+        const representative = laneSources[0]!;
         const classified = classifyLivePerformanceRegime({
-          regime: source.regime ?? null,
-          controllerMode: source.controllerMode ?? null,
-          controllerConfidence: source.controllerConfidence ?? null,
+          regime: representative.regime ?? null,
+          controllerMode: representative.controllerMode ?? null,
+          controllerConfidence: representative.controllerConfidence ?? null,
         });
         if (!regimeFilterMatches(regimeFilter, classified)) continue;
 
         const allocatedRealized = realized * share;
-        const laneId = source.laneId || "UNKNOWN";
         const row = laneRows.get(laneId) ?? {
           realizedPnlUsd: 0,
           feesUsd: 0,
@@ -1838,6 +1969,16 @@ export class LiveExecutionEngine {
     return notional * this.config.estimatedCloseCostPct;
   }
 
+  private maxEntryChaseStopFraction(): number {
+    const n = Number.parseFloat(process.env.LIVE_MAX_ENTRY_CHASE_STOP_FRACTION ?? "");
+    return Number.isFinite(n) && n >= 0 ? n : 0.2;
+  }
+
+  private minEntryGrossTargetPct(): number {
+    const n = Number.parseFloat(process.env.LIVE_MIN_ENTRY_GROSS_TARGET_PCT ?? "");
+    return Number.isFinite(n) && n >= 0 ? n : 0.0035;
+  }
+
   // ── tick orchestration ─────────────────────────────────────────────────────
 
   async tick(): Promise<void> {
@@ -1913,7 +2054,7 @@ export class LiveExecutionEngine {
       const dirSign = intent.direction === "LONG" ? 1 : -1;
       const remainingQty = intent.state === "TP1_FILLED_BE_SET" ? Math.max(0, intent.qty - intent.tp1Qty) : intent.qty;
       const closeQty = Math.min(remainingQty, Math.max(0, dirSign * engineShare));
-      let flattenOrderId: number | null = null;
+      let flattenOrderId: string | null = null;
       if (closeQty > 1e-12) {
         // reduceOnly is only valid when the NET position still has the intent's sign; when basket
         // legs flip the net the plain close is justified by the external claim (same reasoning as
@@ -1979,7 +2120,7 @@ export class LiveExecutionEngine {
         await this.client.cancelAllAlgoOrders(intent.symbol);
         const positions = await this.client.getPositions(intent.symbol);
         const pos = positions.find((p) => p.symbol === intent.symbol);
-        let flattenOrderId: number | null = null;
+        let flattenOrderId: string | null = null;
         // Kill-switch flatten is per-INTENT panic, not per-symbol: flatten the engine share only.
         // The cross-sectional baskets are horizon-bounded hedges with their own breaker — the
         // operator's standing rule is that NOTHING force-flattens an open basket, so a kill on a
@@ -2146,7 +2287,8 @@ export class LiveExecutionEngine {
         if (
           pos &&
           intent.state === "OPEN" &&
-          (this.config.forceMfeGiveback || this.intentExitRule(intent) === "mfe_giveback")
+          ((this.config.forceMfeGiveback && !this.intentSources(intent).some((source) => isProfitCoreShortLaneId(source.laneId))) ||
+            this.intentExitRule(intent) === "mfe_giveback")
         ) {
           const mfe = await this.manageMfeGiveback(intent, pos, amt);
           if (mfe.changed) dirty = true;
@@ -2633,8 +2775,9 @@ export class LiveExecutionEngine {
           this.pushReconcileIssues(`rescue flatten ${action.symbol} failed: ${(error as Error).message}`);
         }
       }
-      // Flips OPEN new exposure — only when armed.
-      if (this.armed) {
+      // Flips OPEN new exposure only when every new-entry gate passes. Risk-reducing flattens above
+      // remain active during drain/NO_TRADE/disarm.
+      if (this.canOpenNewEntries()) {
         for (const action of plan.flips) {
           try {
             await this.executeRescueFlip(action, openIntents.filter((i) => i.symbol === action.symbol && !i.rescue));
@@ -2687,6 +2830,7 @@ export class LiveExecutionEngine {
   /** Place the cross-zero flip order, settle+close the stuck opposing intents (booking their realized
    *  loss), and register the resulting net leg as a dedicated rescue intent so reconcile stays sane. */
   private async executeRescueFlip(action: RescueFlipAction, opposingIntents: LiveIntent[]): Promise<void> {
+    if (!this.canOpenNewEntries()) return;
     const filters = await this.getFilters(action.symbol);
     if (!filters) return;
     const qty = roundDownToStep(action.flipQty, filters.stepSize);
@@ -2935,7 +3079,7 @@ export class LiveExecutionEngine {
     let realized = 0;
     let fees = 0;
     try {
-      const triggeredAlgoOrderIds: number[] = [];
+      const triggeredAlgoOrderIds: string[] = [];
       for (const algoId of [intent.stopOrderId, intent.beStopOrderId]) {
         if (algoId === null) continue;
         try {
@@ -2951,7 +3095,7 @@ export class LiveExecutionEngine {
       });
       const ourOrderIds = new Set(
         [intent.entryOrderId, intent.tp1OrderId, ...triggeredAlgoOrderIds].filter(
-          (id): id is number => typeof id === "number",
+          (id): id is string => typeof id === "string",
         ),
       );
       for (const t of trades) {
@@ -3012,8 +3156,8 @@ export class LiveExecutionEngine {
   }
 
   /** Sum realized PnL net of fees for the given order ids on a symbol since an ISO time (best-effort; 0 on failure). */
-  private async realizedFromTrades(symbol: string, sinceIso: string, orderIds: Array<number | null>): Promise<number> {
-    const ids = new Set(orderIds.filter((id): id is number => typeof id === "number"));
+  private async realizedFromTrades(symbol: string, sinceIso: string, orderIds: Array<string | null>): Promise<number> {
+    const ids = new Set(orderIds.filter((id): id is string => typeof id === "string"));
     if (ids.size === 0) return 0;
     try {
       const trades = await this.client.getUserTrades(symbol, { startTime: new Date(sinceIso).getTime(), limit: 200 });
@@ -3104,11 +3248,11 @@ export class LiveExecutionEngine {
    */
   private maybeAutoResetLaneSelection(): void {
     const st = this.store.getState();
-    // 2026-07-08 (manual-mode ownership): in MANUAL execution mode the operator owns the
+    // 2026-07-08 (manual-mode ownership): when the operator has explicitly locked the lane
     // allocation — silently clearing it on a losing close leaves the slot mysteriously dead
     // until the operator re-picks ("directional stuck ga bisa open" class). Auto-reset stays
-    // active for smart-mode selections only.
-    if (st.manualSelectorMode === true) return;
+    // active for autopilot-managed selections only.
+    if (st.laneAllocationOperatorLock === true) return;
     const selectionActive =
       (!!st.laneAllocations && st.laneAllocations.length > 0) ||
       (Array.isArray(st.allowedLaneIds) && st.allowedLaneIds.length > 0);
@@ -3159,6 +3303,13 @@ export class LiveExecutionEngine {
     return this.store.getState().manualSelectorMode === true;
   }
 
+  /** True once the operator has explicitly applied a lane allocation (POST
+   *  /api/live/lane-allocations) — see laneAllocationOperatorLock's doc comment on
+   *  LiveExecutionState for why this is a SEPARATE flag from manualSelectorMode. */
+  isLaneAllocationOperatorLocked(): boolean {
+    return this.store.getState().laneAllocationOperatorLock === true;
+  }
+
   setLaneAllocations(
     allocations: Array<{ laneId: string; weightPct: number }> | null,
   ): { ok: boolean; reason: string | null; laneAllocations: Array<{ laneId: string; weightPct: number }> | null } {
@@ -3168,8 +3319,8 @@ export class LiveExecutionEngine {
       this.store.save();
       return { ok: true, reason: null, laneAllocations: null };
     }
-    if (allocations.length === 0 || allocations.length > 4) {
-      return { ok: false, reason: "allocations must list 1-4 lanes (or null to turn off)", laneAllocations: st.laneAllocations };
+    if (allocations.length === 0 || allocations.length > MAX_LANE_ALLOCATIONS) {
+      return { ok: false, reason: `allocations must list 1-${MAX_LANE_ALLOCATIONS} lanes (or null to turn off)`, laneAllocations: st.laneAllocations };
     }
     const cleaned: Array<{ laneId: string; weightPct: number }> = [];
     const seen = new Set<string>();
@@ -3191,28 +3342,30 @@ export class LiveExecutionEngine {
 
   /**
    * RegimeAutopilot's allocation-apply action. Identical to setLaneAllocations, but ALSO clears
-   * manualSelectorMode (atomically, in the same store save) so the dashboard never keeps showing
-   * "Manual" after the regime engine has genuinely changed the allocation out from under the
-   * operator. Only called when RegimeAutopilot itself decides to act (its own stability/cooldown
-   * guards are unchanged) — if the operator was already in smart mode, this is a no-op on the flag.
+   * laneAllocationOperatorLock (atomically, in the same store save) so the dashboard never keeps
+   * showing "operator-locked" after the regime engine has genuinely changed the allocation out
+   * from under the operator. Only called when RegimeAutopilot itself decides to act (its own
+   * stability/cooldown guards are unchanged) — if the lock was already off, this is a no-op on
+   * the flag.
    */
   applyRegimeAutopilotAllocation(
     allocations: Array<{ laneId: string; weightPct: number }>,
   ): { ok: boolean; reason: string | null; laneAllocations: Array<{ laneId: string; weightPct: number }> | null } {
-    // Operator override (2026-07-08): manual execution mode = the operator owns the allocation.
+    // Operator override (2026-07-08, corrected 2026-07-09 — see laneAllocationOperatorLock's doc
+    // comment): the operator's explicit lane-allocation choice must never be silently overwritten.
     // Belt-and-suspenders with the autopilot's own tick guard — NO autopilot-attributed apply may
-    // ever overwrite a manual selection, regardless of which caller path reaches this.
-    if (this.isManualSelectorMode()) {
+    // ever overwrite a locked selection, regardless of which caller path reaches this.
+    if (this.isLaneAllocationOperatorLocked()) {
       return {
         ok: false,
-        reason: "manual selector mode aktif — operator memegang lane allocation",
+        reason: "lane allocation operator lock aktif — operator memegang lane allocation",
         laneAllocations: this.store.getState().laneAllocations ?? null,
       };
     }
     const result = this.setLaneAllocations(allocations);
     if (result.ok) {
       const st = this.store.getState();
-      st.manualSelectorMode = false;
+      st.laneAllocationOperatorLock = false;
       this.store.save();
     }
     return result;
@@ -3221,23 +3374,28 @@ export class LiveExecutionEngine {
   /**
    * Operator-explicit allocation apply (POST /api/live/lane-allocations — the dashboard's "Apply"
    * button, including applying a regime-tree preset). Mirror image of
-   * applyRegimeAutopilotAllocation above: THAT clears manualSelectorMode because autopilot's own
-   * apply is the "smart" path; THIS sets it, because the operator's own explicit choice must not
-   * be silently overwritten by the next autopilot tick.
+   * applyRegimeAutopilotAllocation above: THAT clears laneAllocationOperatorLock because
+   * autopilot's own apply is the "smart" path; THIS sets it, because the operator's own explicit
+   * choice must not be silently overwritten by the next autopilot tick.
    *
-   * 2026-07-09 (real incident): the operator applied a Bear Trend preset, but ~70 minutes later
-   * regime-autopilot's OWN tick silently reverted the live allocation back to a bare
-   * CROSS_SECTIONAL_MARKET_NEUTRAL 100% (its observed regime — a raw, price-level-driven detector
-   * that flickers near round BTC levels, unrelated to the continuous mood the operator was
-   * reading) — with zero confirmation, discovered only because the operator noticed the
-   * dashboard's regime-tree/allocation mismatch. Setting manualSelectorMode here closes that gap
-   * the same way applyRegimeAutopilotAllocation's own isManualSelectorMode() check already
-   * enforces from the autopilot side — clicking Apply now durably means "operator owns this until
-   * they switch back to SMART", not just "for however long the next background tick allows".
+   * 2026-07-09 (real incident, two takes): first attempt reused the existing manualSelectorMode
+   * field for this lock. That field's ORIGINAL and still-current meaning (see its own doc comment)
+   * is the RAW BYPASS toggle exposed by POST /api/live/manual-mode and consumed by scan.ts's
+   * realtime-short-mirror admission overlay — an entirely unrelated concern. Because both concerns
+   * shared one flag, toggling the RAW BYPASS button for its own legitimate purpose silently
+   * released the "operator owns the allocation" guard too, and the very next RegimeAutopilot tick
+   * reverted a manually-applied 80/8/8/4 allocation back to the NO_TRADE preset (100%
+   * CROSS_SECTIONAL_MARKET_NEUTRAL) within minutes — discovered only because the operator noticed
+   * the dashboard's regime-tree/allocation mismatch. laneAllocationOperatorLock is a dedicated
+   * field for this concern alone, checked by RegimeAutopilot.tick(),
+   * applyRegimeAutopilotAllocation(), and maybeAutoResetLaneSelection() — never touched by the RAW
+   * BYPASS toggle. Clicking Apply now durably means "operator owns this until they switch back to
+   * SMART", not just "for however long the next background tick allows, and only if the operator
+   * never touches the unrelated bypass toggle".
    *
    * Only sets the flag when actually applying an allocation (allocations !== null) — clearing
-   * (null) leaves manualSelectorMode as-is, since "remove my custom lanes" isn't necessarily
-   * "hand control back to autopilot" and shouldn't be overloaded to mean that silently.
+   * (null) leaves the lock as-is, since "remove my custom lanes" isn't necessarily "hand control
+   * back to autopilot" and shouldn't be overloaded to mean that silently.
    */
   setLaneAllocationsAsOperator(
     allocations: Array<{ laneId: string; weightPct: number }> | null,
@@ -3245,7 +3403,7 @@ export class LiveExecutionEngine {
     const result = this.setLaneAllocations(allocations);
     if (result.ok && allocations !== null) {
       const st = this.store.getState();
-      st.manualSelectorMode = true;
+      st.laneAllocationOperatorLock = true;
       this.store.save();
     }
     return result;
@@ -3274,6 +3432,13 @@ export class LiveExecutionEngine {
   }): Promise<{ ok: boolean; reason: string | null; intent?: LiveIntent }> {
     if (this.store.getState().killedAt) return { ok: false, reason: "kill switch latched" };
     if (!this.armed) return { ok: false, reason: "live engine is DISARMED — arm it first, then copy" };
+    if (!this.canOpenNewEntries()) {
+      const gate = this.strategyEntryGate();
+      const reason = this.isNewEntryDrainActive()
+        ? "new-entry drain is active — exits remain managed, but copy/open is blocked"
+        : gate.reason ?? "new-entry gate is closed";
+      return { ok: false, reason };
+    }
     if (!(req.qty > 0) || !(req.entryPrice > 0) || !(req.stopLossPrice > 0) || !(req.tp1Price > 0)) {
       return { ok: false, reason: "invalid copy spec (qty/entry/stop/tp must be positive)" };
     }
@@ -3393,7 +3558,7 @@ export class LiveExecutionEngine {
   }
 
   private async mirrorNewSignals(): Promise<void> {
-    if (!this.armed) return;
+    if (!this.canOpenNewEntries()) return;
     const now = this.nowIso();
     const st = this.store.getState();
 
@@ -3561,6 +3726,43 @@ export class LiveExecutionEngine {
       if (!oppositeIntent && !isMajorSymbol(first.symbol)) {
         if ((clusterOpen.get(clusterKey)?.size ?? 0) >= this.config.maxClusterPositions) {
           for (const paper of papers) latchReason(paper.paperOrderId, "cluster_cap");
+          continue;
+        }
+      }
+      // Entry-quality gate: do not pay for a signal whose favorable move already happened, whose
+      // stop is already invalidated, or whose remaining target is too small to clear realistic
+      // round-trip friction. Existing positions and all exits are unaffected.
+      if (!oppositeIntent && typeof this.marketDataClient?.getBookTicker === "function") {
+        let livePrice: number | null = null;
+        try {
+          const book = await this.marketDataClient.getBookTicker(first.symbol);
+          if (book.bid !== null && book.ask !== null && book.bid > 0 && book.ask > 0) livePrice = (book.bid + book.ask) / 2;
+          else if (book.bid !== null && book.bid > 0) livePrice = book.bid;
+          else if (book.ask !== null && book.ask > 0) livePrice = book.ask;
+        } catch {
+          // Fail closed below: opening without a current reference defeats the no-chase gate.
+        }
+        const tp = first.takeProfitLevels?.[0];
+        const risk = Math.abs(first.entryPrice - first.stopLoss);
+        if (!(livePrice !== null && livePrice > 0) || !(risk > 0) || !(typeof tp === "number" && tp > 0)) {
+          for (const paper of papers) latchReason(paper.paperOrderId, "entry_quality_unavailable");
+          continue;
+        }
+        const favorableDriftR = first.direction === "LONG"
+          ? (livePrice - first.entryPrice) / risk
+          : (first.entryPrice - livePrice) / risk;
+        const stopCrossed = first.direction === "LONG" ? livePrice <= first.stopLoss : livePrice >= first.stopLoss;
+        if (stopCrossed) {
+          for (const paper of papers) latchReason(paper.paperOrderId, "signal_stop_already_crossed");
+          continue;
+        }
+        if (favorableDriftR > this.maxEntryChaseStopFraction()) {
+          for (const paper of papers) latchReason(paper.paperOrderId, "entry_chase_too_far");
+          continue;
+        }
+        const remainingGrossPct = first.direction === "LONG" ? (tp - livePrice) / livePrice : (livePrice - tp) / livePrice;
+        if (remainingGrossPct < this.minEntryGrossTargetPct()) {
+          for (const paper of papers) latchReason(paper.paperOrderId, "target_below_cost_buffer");
           continue;
         }
       }
@@ -3793,6 +3995,7 @@ export class LiveExecutionEngine {
     planned: Array<{ paper: PaperOrder; plan: LiveOrderPlan }>,
     filters: FuturesSymbolFilters,
   ): Promise<void> {
+    if (!this.canOpenNewEntries()) return;
     const paper = planned[0]!.paper;
     const plan = this.combinedPlan(planned, filters);
     if (!plan.ok) return;
@@ -3979,6 +4182,7 @@ export class LiveExecutionEngine {
     planned: Array<{ paper: PaperOrder; plan: LiveOrderPlan }>,
     filters: FuturesSymbolFilters,
   ): Promise<void> {
+    if (!this.canOpenNewEntries()) return;
     if (intent.state !== "OPEN") return;
     const addition = this.combinedPlan(planned, filters);
     if (!addition.ok) return;

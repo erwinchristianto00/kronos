@@ -69,6 +69,14 @@ export interface ProfitRouteInput {
     | "INSUFFICIENT_SAMPLE";
   calibrationSampleSize?: number;
   calibrationDiagnosisCodes?: string[];
+  /**
+   * Optional current-policy admission fingerprint. Older callers may omit this and keep the
+   * historical routing behavior; buildVariantSelection always supplies it for new observations.
+   */
+  profitAdmission?: {
+    chaseRisk: "LOW" | "MEDIUM" | "HIGH";
+    riskReward: number | null;
+  };
 }
 
 export interface ProfitRouteDecision {
@@ -94,6 +102,12 @@ const STOP_TOO_TIGHT_BPS = 18;
 // POST_CALIBRATION evidence: stopDistanceBps < 100 → 0% win rate, -1.66R avg,
 // inflated projected RR is a false-edge artefact of the tiny stop denominator.
 const ULTRA_TIGHT_STOP_BPS = 100;
+// 2026-07-10 post-calibration audit (2,636 honest closes): the only robust geometry cohort was
+// LOW chase + stop >=500bps + RR 5-8. Narrower stops and RR outside this band remain observable,
+// but may not be labelled primary profit candidates until fresh evidence disproves this guard.
+const PROFIT_STOP_FLOOR_BPS = 500;
+const PROFIT_RR_MIN = 5;
+const PROFIT_RR_MAX = 8;
 const SYMBOL_POSITIVE_NET_R = 0.05;
 const SYMBOL_NEGATIVE_NET_R = -0.05;
 const SIDE_DEEPLY_NEGATIVE_NET_R = -0.15;
@@ -350,6 +364,30 @@ export function computeProfitRoute(input: ProfitRouteInput): ProfitRouteDecision
         "Ultra-tight stop geometry (<100 bps) is not eligible for primary profit routing; collect evidence only.";
     }
     // RESEARCH_ONLY and DATA_COLLECTION are preserved — this guard never loosens a stricter mode.
+  }
+
+  // PROFIT-FOCUSED ADMISSION GUARD
+  // This only demotes PROFIT_CANDIDATE -> DATA_COLLECTION. Every rejected fingerprint keeps
+  // collecting, so the guard can be revised from new OOS evidence instead of freezing research.
+  if (routeMode === "PROFIT_CANDIDATE" && input.profitAdmission) {
+    const stopDistanceBps = input.cost.stopDistanceBps;
+    const riskReward = input.profitAdmission.riskReward;
+    if (input.profitAdmission.chaseRisk !== "LOW") {
+      codes.push("PROFIT_ENTRY_CHASED");
+      routeMode = "DATA_COLLECTION";
+      dataCollectionReason =
+        `Entry chase is ${input.profitAdmission.chaseRisk}; current profit evidence requires LOW chase.`;
+    } else if (!(stopDistanceBps !== null && Number.isFinite(stopDistanceBps) && stopDistanceBps >= PROFIT_STOP_FLOOR_BPS)) {
+      codes.push("PROFIT_STOP_BELOW_EVIDENCE_FLOOR");
+      routeMode = "DATA_COLLECTION";
+      dataCollectionReason =
+        `Stop geometry ${stopDistanceBps?.toFixed(1) ?? "n/a"}bps is below the current 500bps profit-evidence floor.`;
+    } else if (!(riskReward !== null && Number.isFinite(riskReward) && riskReward >= PROFIT_RR_MIN && riskReward <= PROFIT_RR_MAX)) {
+      codes.push("PROFIT_RR_OUTSIDE_EVIDENCE_BAND");
+      routeMode = "DATA_COLLECTION";
+      dataCollectionReason =
+        `Risk/reward ${riskReward?.toFixed(2) ?? "n/a"} is outside the current 5-8 profit-evidence band.`;
+    }
   }
 
   const primaryProfitEligible = routeMode === "PROFIT_CANDIDATE";

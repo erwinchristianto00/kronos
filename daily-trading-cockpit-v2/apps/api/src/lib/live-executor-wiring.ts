@@ -9,6 +9,7 @@ import type { SingleSymbolLaneExecutor } from "./single-symbol-lane-executor.js"
 /** Minimal slice of LiveExecutionEngine this module needs — kept narrow so tests can fake it. */
 export interface LiveExecutorGateEngine {
   isArmed(): boolean;
+  canOpenNewEntries(): boolean;
   laneSelectionExplicitlyIncludesLane(laneId: string): boolean;
   laneSelectionAllowsLane(laneId: string): boolean;
 }
@@ -26,12 +27,48 @@ export function isNewExecutorLaneAllowed(
   laneId: string,
   env: "testnet" | "mainnet",
   engine: LiveExecutorGateEngine | null,
+  opts: { mainnetEntryEligible?: boolean } = {},
 ): boolean {
-  const armedOk = env === "testnet" || (engine !== null && engine.isArmed());
-  if (!armedOk) return false;
+  if (!engine?.isArmed() || !engine.canOpenNewEntries()) return false;
+  if (
+    env === "mainnet" &&
+    opts.mainnetEntryEligible === false &&
+    process.env.LIVE_UNPROVEN_EXECUTION_OVERRIDE !== "1"
+  ) return false;
   const explicit = engine?.laneSelectionExplicitlyIncludesLane(laneId) ?? false;
   if (!explicit) return false;
   return engine?.laneSelectionAllowsLane(laneId) ?? true;
+}
+
+export function rollingNetEntryHealth(
+  recentNetReturns: readonly number[],
+  opts: { shortWindow?: number; longWindow?: number } = {},
+): { allowed: boolean; reason: string | null; shortAvg: number | null; longAvg: number | null } {
+  const shortWindow = Math.max(1, opts.shortWindow ?? 8);
+  const longWindow = Math.max(shortWindow, opts.longWindow ?? 30);
+  const finite = recentNetReturns.filter((value) => Number.isFinite(value));
+  const avg = (values: readonly number[]) => values.reduce((sum, value) => sum + value, 0) / values.length;
+  if (finite.length < shortWindow) {
+    return {
+      allowed: false,
+      reason: `rolling evidence incomplete: ${finite.length}/${shortWindow} recent closes`,
+      shortAvg: null,
+      longAvg: null,
+    };
+  }
+  const shortRows = finite.slice(-shortWindow);
+  const longRows = finite.slice(-Math.min(longWindow, finite.length));
+  const shortAvg = avg(shortRows);
+  const longAvg = avg(longRows);
+  const allowed = shortAvg > 0 && longAvg > 0;
+  return {
+    allowed,
+    reason: allowed
+      ? null
+      : `rolling edge negative: last${shortRows.length}=${(shortAvg * 100).toFixed(3)}%, last${longRows.length}=${(longAvg * 100).toFixed(3)}%`,
+    shortAvg,
+    longAvg,
+  };
 }
 
 /**
@@ -64,4 +101,45 @@ export function computeExternalManagedNetQty(
     }
   }
   return net;
+}
+
+/**
+ * Sums CURRENT notional (USD, qty*entryPrice, UNSIGNED — same-direction stacking is exactly what
+ * this exists to catch, so long+long must ADD not cancel) per symbol across the given
+ * single-symbol executors' OPEN positions (a leg with exitOrderId already set is excluded — its
+ * exit is already in flight, no longer a live claim on the symbol).
+ *
+ * 2026-07-09 audit finding: independently-admitted SingleSymbolLaneExecutor instances (now 7 live:
+ * SHORT_FADE_EXHAUSTION, INTRADAY_MOMENTUM_BREAKOUT, REGIME_COMPOSITE_CONFIRMATION_LONG, and
+ * COMPOSITE_ESTIMATOR_BIDI's 4 buckets) each size a fresh entry purely from their OWN legUsd, with
+ * zero awareness of what OTHER lanes already committed to the same symbol — confirmed live,
+ * REGIME_COMPOSITE_CONFIRMATION_LONG and COMPOSITE_ESTIMATOR_BIDI_WIDE_LONG/FAST_LONG all went
+ * LONG on the same BTC/ETH/SOL universe simultaneously. live-execution-engine.ts's own
+ * correlated-alt/cluster caps don't help here — those only see the "intents" mirror pipeline, never
+ * imported by this executor class. Caller passes the RESULT of this (excluding the querying
+ * instance's own positions — see SingleSymbolLaneExecutorOptions.existingNotionalForSymbol's doc
+ * comment) into each executor's admission gate.
+ */
+export function computeNotionalPerSymbol(
+  singleSymbolExecutors: ReadonlyArray<SingleSymbolLaneExecutor | null>,
+): Map<string, number> {
+  const notional = new Map<string, number>();
+  for (const exec of singleSymbolExecutors) {
+    if (!exec) continue;
+    for (const pos of exec.getStatus().openPositions) {
+      if (pos.exitOrderId !== null) continue;
+      notional.set(pos.symbol, (notional.get(pos.symbol) ?? 0) + Math.abs(pos.qty * pos.entryPrice));
+    }
+  }
+  return notional;
+}
+
+/** 2026-07-09 fix: shared default ceiling for computeNotionalPerSymbol-based admission gates.
+ *  250 permits the two legitimate lanes already stacking on one symbol today (up to ~$150 WIDE +
+ *  ~$91 REGIME_COMPOSITE per symbol, observed live) while stopping a 3rd/4th lane from piling on
+ *  further once that's already committed. Env-overridable, matching every other risk constant in
+ *  this codebase. */
+export function maxNotionalPerSymbolAcrossLanes(): number {
+  const n = Number.parseFloat(process.env.LIVE_MAX_NOTIONAL_PER_SYMBOL_ACROSS_LANES ?? "");
+  return Number.isFinite(n) && n > 0 ? n : 250;
 }

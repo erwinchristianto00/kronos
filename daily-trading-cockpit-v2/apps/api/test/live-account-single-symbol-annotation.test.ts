@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { resolve } from "node:path";
 import os from "node:os";
 
-import { annotateSingleSymbolAccount, mergeSingleSymbolIntoLaneSeries } from "../src/routes/live.js";
+import { annotateSingleSymbolAccount, mergeSingleSymbolIntoLaneSeries, flattenSingleSymbolPositions } from "../src/routes/live.js";
 import {
   SingleSymbolLaneExecutor,
   SingleSymbolLaneExecutorStore,
@@ -188,5 +188,62 @@ describe("mergeSingleSymbolIntoLaneSeries", () => {
     const executor = makeExecutorWithPositions([old]);
     const merged = mergeSingleSymbolIntoLaneSeries(seriesReport(["2026-07-08T10:00:00.000Z"]), executor) as { lanes: unknown[] };
     expect(merged.lanes).toEqual([]);
+  });
+});
+
+describe("flattenSingleSymbolPositions (2026-07-10: per-lane close-now button)", () => {
+  it("returns one row per open position, tagged with the owning executor's laneId", () => {
+    const a = makeExecutorWithPositions([positionOf({ positionId: "a1", symbol: "BTCUSDT" })], "SHORT_FADE_EXHAUSTION_CROWDED");
+    const b = makeExecutorWithPositions(
+      [positionOf({ positionId: "b1", symbol: "BTCUSDT", direction: "LONG", entryPrice: 63000, stopPrice: 62000 })],
+      "REGIME_COMPOSITE_CONFIRMATION_LONG",
+    );
+    const rows = flattenSingleSymbolPositions([a, b], new Map([["BTCUSDT", 63500]]));
+    expect(rows).toHaveLength(2);
+    expect(rows.map((r) => r.laneId).sort()).toEqual(["REGIME_COMPOSITE_CONFIRMATION_LONG", "SHORT_FADE_EXHAUSTION_CROWDED"]);
+    expect(rows.find((r) => r.positionId === "a1")!.laneId).toBe("SHORT_FADE_EXHAUSTION_CROWDED");
+    expect(rows.find((r) => r.positionId === "b1")!.laneId).toBe("REGIME_COMPOSITE_CONFIRMATION_LONG");
+  });
+
+  it("does NOT sum two lanes on the same symbol into one row — each keeps its own qty/entry/unrealized", () => {
+    // Same symbol, two different lanes, two different entries/qty — must stay as two independent
+    // rows so each can be inspected/closed on its own (this is the whole point of the feature: the
+    // operator noticed one lane's leg on a symbol can be proven+protected while another lane's leg
+    // on the SAME symbol is unproven+unprotected, and wanted to tell them apart).
+    const wide = makeExecutorWithPositions(
+      [positionOf({ positionId: "wide1", symbol: "SOLUSDT", direction: "LONG", qty: 1.91, entryPrice: 78.13, stopPrice: 75.95 })],
+      "COMPOSITE_ESTIMATOR_BIDI_WIDE_LONG",
+    );
+    const regime = makeExecutorWithPositions(
+      [positionOf({ positionId: "regime1", symbol: "SOLUSDT", direction: "LONG", qty: 0.76, entryPrice: 78.3, stopPrice: 77.08 })],
+      "REGIME_COMPOSITE_CONFIRMATION_LONG",
+    );
+    const rows = flattenSingleSymbolPositions([wide, regime], new Map([["SOLUSDT", 79]]));
+    expect(rows).toHaveLength(2);
+    const wideRow = rows.find((r) => r.positionId === "wide1")!;
+    const regimeRow = rows.find((r) => r.positionId === "regime1")!;
+    expect(wideRow.qty).toBe(1.91);
+    expect(wideRow.unrealizedPnl).toBeCloseTo((79 - 78.13) * 1.91, 6);
+    expect(regimeRow.qty).toBe(0.76);
+    expect(regimeRow.unrealizedPnl).toBeCloseTo((79 - 78.3) * 0.76, 6);
+  });
+
+  it("computes SHORT unrealizedPnl direction-aware", () => {
+    const executor = makeExecutorWithPositions([positionOf({ direction: "SHORT", qty: 0.01, entryPrice: 60000, stopPrice: 61800 })]);
+    const rows = flattenSingleSymbolPositions([executor], new Map([["BTCUSDT", 59000]]));
+    expect(rows[0]!.unrealizedPnl).toBeCloseTo((60000 - 59000) * 0.01, 6);
+  });
+
+  it("returns markPrice/unrealizedPnl null when no mark is available for the symbol", () => {
+    const executor = makeExecutorWithPositions([positionOf()]);
+    const rows = flattenSingleSymbolPositions([executor], new Map());
+    expect(rows[0]!.markPrice).toBeNull();
+    expect(rows[0]!.unrealizedPnl).toBeNull();
+  });
+
+  it("returns an empty list with no executors and with executors that have no open positions", () => {
+    expect(flattenSingleSymbolPositions([], new Map())).toEqual([]);
+    const empty = makeExecutorWithPositions([]);
+    expect(flattenSingleSymbolPositions([empty], new Map())).toEqual([]);
   });
 });

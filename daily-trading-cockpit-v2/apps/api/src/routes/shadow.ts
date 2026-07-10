@@ -194,6 +194,27 @@ import {
   getShortFadeStore,
   SF_INTERVAL,
 } from "../lib/short-fade-edge.js";
+import {
+  runPanicWashoutCycleGuarded,
+  buildPanicWashoutReport,
+  getPanicWashoutStore,
+  PWR_INTERVAL,
+} from "../lib/panic-washout-reclaim-edge.js";
+import {
+  runRegimeCompositeCycleGuarded,
+  buildRegimeCompositeReport,
+  getRegimeCompositeStore,
+  RC_INTERVAL,
+  RC_UNIVERSE,
+} from "../lib/regime-composite-edge.js";
+import {
+  runCompositeEstimatorCycleGuarded,
+  buildCompositeEstimatorReport,
+  getCompositeEstimatorStore,
+  CE_INTERVAL,
+  CE_UNIVERSE,
+} from "../lib/composite-estimator-edge.js";
+import type { KronosClient } from "../lib/kronos.js";
 import { buildLaneVariantPboReport } from "../lib/walk-forward-validation.js";
 import { buildMicrostructureSnapshot } from "../lib/order-flow-microstructure.js";
 import { computeDecisionScore } from "../lib/decision-scoring.js";
@@ -309,6 +330,10 @@ export async function registerShadowRoutes(
     coreScanAutoRefreshController?: CoreScanAutoRefreshController;
     kronosCounterfactualStore?: KronosCounterfactualStore;
     notificationService?: NotificationService;
+    /** 2026-07-09: COMPOSITE_ESTIMATOR_BIDI's per-symbol Kronos forecast input. Optional — absent
+     *  just means that cycle's Kronos signal is always unavailable (composite falls back to
+     *  axis level+velocity only, same as if every symbol's forecast individually failed). */
+    kronosClient?: KronosClient;
     /** Lazy getter for the live-execution engine (created after this registration). Used READ-ONLY
      *  (sync getStatus, no I/O) to compute the order-reconciliation readiness gate. */
     liveEngineGetter?: () => { getStatus: () => unknown } | null;
@@ -1433,6 +1458,34 @@ export async function registerShadowRoutes(
     return { generatedAt: new Date().toISOString(), ...buildShortFadeReport(sfStore.all, sfStore.cycleMeta) };
   });
 
+  // LONG-side capitulation/washout/reclaim fade report — report-only measurement. See
+  // panic-washout-reclaim-edge.ts for the entry-signal rationale. Live-wired
+  // (PANIC_WASHOUT_EXEC_ENABLED) on operator's explicit request BEFORE any measurement accrued —
+  // this report is where that evidence starts showing up from trade #1 onward.
+  app.get("/api/shadow/panic-washout-report", async () => {
+    const pwrStore = getPanicWashoutStore();
+    return { generatedAt: new Date().toISOString(), ...buildPanicWashoutReport(pwrStore.all, pwrStore.cycleMeta) };
+  });
+
+  // Regime-composite confirmation report (2026-07-09) — gates on axis score + per-symbol crowding
+  // state instead of cross-sectional dispersion or per-symbol rotation history. See
+  // regime-composite-edge.ts for the gap this closes. Live-wired (REGIME_COMPOSITE_EXEC_ENABLED)
+  // on operator's explicit request BEFORE any measurement accrued — this report is where that
+  // evidence starts showing up from trade #1 onward.
+  app.get("/api/shadow/regime-composite-report", async () => {
+    const rcStore = getRegimeCompositeStore();
+    return { generatedAt: new Date().toISOString(), ...buildRegimeCompositeReport(rcStore.all, rcStore.cycleMeta) };
+  });
+
+  // Bidirectional composite estimator report (2026-07-09) — combines axis level + velocity +
+  // per-symbol Kronos forecast into one signed composite; direction follows its sign, steepness
+  // picks WIDE vs FAST geometry. See composite-estimator-edge.ts for the full design rationale.
+  // Live-wired on operator's explicit request BEFORE any measurement accrued.
+  app.get("/api/shadow/composite-estimator-report", async () => {
+    const ceStore = getCompositeEstimatorStore();
+    return { generatedAt: new Date().toISOString(), ...buildCompositeEstimatorReport(ceStore.all, ceStore.cycleMeta) };
+  });
+
   // Probability of Backtest Overfitting (CSCV) across the CG variant-matrix lanes — the honest audit
   // of "is this lane's edge real, or does it just look best in this sample" (e.g. CG_WIDE_LONG_RUNNER).
   // Report-only; never gates execution. Query: minObsPerVariant (default 30), bucketDays (default 7).
@@ -1821,6 +1874,67 @@ export async function registerShadowRoutes(
             now: Date.now(),
             fetchCandles: async (symbol: string) => _sfc.getCandles(symbol, SF_INTERVAL, 120),
             crowdingClient: _sfc,
+          }).catch(() => undefined);
+        }
+        // LONG-side capitulation/washout/reclaim fade (2026-07-09, operator idea): the symmetric
+        // counterpart to SHORT_FADE_EXHAUSTION above — see panic-washout-reclaim-edge.ts. Report-only
+        // measurement cycle here; live-wiring is a separate exec-enable flag in app.ts.
+        if (process.env.PANIC_WASHOUT_DISABLED !== "1") {
+          const _pwc = opts.binanceClient;
+          void runPanicWashoutCycleGuarded({
+            store: getPanicWashoutStore(),
+            now: Date.now(),
+            fetchCandles: async (symbol: string) => _pwc.getCandles(symbol, PWR_INTERVAL, 120),
+            crowdingClient: _pwc,
+          }).catch(() => undefined);
+        }
+        // Regime-composite confirmation (2026-07-09): gates LONG entries on axis score (breadth
+        // composite) + per-symbol crowdingState instead of cross-sectional dispersion or per-symbol
+        // rotation history — see regime-composite-edge.ts for the gap this closes. Report-only
+        // measurement here too (same discipline as every other lane); live-wiring is a SEPARATE
+        // exec-enable flag in app.ts.
+        if (process.env.REGIME_COMPOSITE_DISABLED !== "1") {
+          const _rcc = opts.binanceClient;
+          const rcAxisScore = buildRegimeAxisTimeline(getRegimeEngineStore().snapshots).current?.score ?? null;
+          void runRegimeCompositeCycleGuarded({
+            store: getRegimeCompositeStore(),
+            universe: RC_UNIVERSE,
+            now: Date.now(),
+            axisScore: rcAxisScore,
+            fetchCandles: async (symbol: string) => _rcc.getCandles(symbol, RC_INTERVAL, 120),
+            crowdingClient: _rcc,
+          }).catch(() => undefined);
+        }
+        // Bidirectional composite estimator (2026-07-09): axis level + velocity + per-symbol Kronos
+        // forecast combine into one signed composite; direction follows its sign, steepness picks
+        // WIDE vs FAST geometry. See composite-estimator-edge.ts for the full design. Report-only
+        // measurement here (same discipline as every other lane); live-wiring is a SEPARATE
+        // exec-enable flag per bucket in app.ts.
+        if (process.env.COMPOSITE_ESTIMATOR_DISABLED !== "1") {
+          const _cec = opts.binanceClient;
+          const ceTimeline = buildRegimeAxisTimeline(getRegimeEngineStore().snapshots);
+          const ceAxisLevel = ceTimeline.current?.score ?? null;
+          const ceAxisVelocity = ceTimeline.slopePerHour;
+          const ceKronosClient = opts.kronosClient;
+          void runCompositeEstimatorCycleGuarded({
+            store: getCompositeEstimatorStore(),
+            universe: CE_UNIVERSE,
+            now: Date.now(),
+            axisLevel: ceAxisLevel,
+            axisVelocitySlopePerHour: ceAxisVelocity,
+            fetchCandles: async (symbol: string) => _cec.getCandles(symbol, CE_INTERVAL, 120),
+            fetchKronos: async (symbol: string, candles) => {
+              if (!ceKronosClient) return null;
+              try {
+                return await ceKronosClient.predict(symbol, "1h", candles, {
+                  requestTimeoutMs: 20_000,
+                  queueTimeoutMs: 15_000,
+                  preferStaleOnTimeout: true,
+                });
+              } catch {
+                return null;
+              }
+            },
           }).catch(() => undefined);
         }
         // NEW-COIN RADAR (report-only): discovery cycle is self-throttled to 12h via the store's

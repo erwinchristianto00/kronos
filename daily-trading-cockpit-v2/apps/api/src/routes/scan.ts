@@ -37,6 +37,7 @@ import {
   isRealtimeShortMirrorEnabled,
   isRealtimeShortAllowedVariantId,
   isRealtimeShortSelectableVariantId,
+  isProfitCoreShortEnabled,
   runRealtimeShortMirror,
 } from "../lib/realtime-short-mirror.js";
 import { fetchCrowdingSnapshot } from "../lib/derivatives-crowding.js";
@@ -473,6 +474,11 @@ export async function registerScanRoute(
         const controllerReport = manualSelectorMode
           ? { ...baseControllerReport, controllerMode: "BOTH_ALLOWED" as const }
           : baseControllerReport;
+        const profitCoreEstimatedRegime = estimateLaneSelectorV2Regime({
+          regime: baseControllerReport.currentRegime,
+          controllerMode: baseControllerReport.controllerMode,
+          confidence: baseControllerReport.confidence,
+        });
         const estimatedRegime = estimateLaneSelectorV2Regime({
           regime: controllerReport.currentRegime,
           controllerMode: controllerReport.controllerMode,
@@ -506,6 +512,16 @@ export async function registerScanRoute(
               (v): v is number => typeof v === "number" && Number.isFinite(v) && v > 0,
             ),
             stopDistanceBps: c.selectedExecutionPlan?.stopDistanceBps ?? null,
+            selectedEntryVariant: c.selectedExecutionPlan?.selectedEntryVariant ?? null,
+            selectedExitVariant: c.selectedExecutionPlan?.selectedExitVariant ?? null,
+            routeMode: c.selectedExecutionPlan?.routeMode ?? null,
+            chaseRisk: c.selectedExecutionPlan?.chaseRisk ?? null,
+            riskReward: c.riskReward ?? null,
+            calibratedExpectedNetR: c.selectedExecutionPlan?.calibratedExpectedNetR ?? null,
+            calibrationVerdict: c.selectedExecutionPlan?.calibrationVerdict ?? null,
+            whaleSignal: c.whale.signal ?? null,
+            sourceConflict: c.sourceConflict ?? null,
+            horizonConflict: c.horizonConflict ?? null,
           })),
           regime: result.marketRegime,
           controllerMode: controllerReport.controllerMode,
@@ -518,6 +534,9 @@ export async function registerScanRoute(
           crowdingBySymbol,
           rotationShortlist,
           manualEnabledVariantIds,
+          profitCoreShortEnabled: isProfitCoreShortEnabled(),
+          profitCoreControllerMode: baseControllerReport.controllerMode,
+          profitCoreEstimatedRegime,
           now: new Date().toISOString(),
         });
       } catch {

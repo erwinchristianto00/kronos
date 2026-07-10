@@ -22,11 +22,23 @@ const LIVE_LANE_OPTIONS = [
   // (TREND_LONG/SHORT for TREND, MIXED_CHOP for MIXED) agrees. See cross-sectional-executor.ts.
   'CROSS_SECTIONAL_TREND',
   'CROSS_SECTIONAL_MIXED',
+  // Evidence-gated bearish SHORT: base-current/no-chase entry, >=500bps stop, RR 5-8,
+  // half banked at TP1 and the remainder protected at breakeven/trail. Testnet-only for now.
+  'PROFIT_CORE_SHORT_TRAIL',
   // 2026-07-08: single-symbol executors with their OWN entry signals (not the shared scanner
   // candidate every CG_* variant rides on) — SingleSymbolLaneExecutor, own enable flag
   // (SHORT_FADE_EXEC_ENABLED / INTRADAY_MOMENTUM_EXEC_ENABLED on the VPS env).
   'SHORT_FADE_EXHAUSTION_CROWDED',
   'INTRADAY_MOMENTUM_BREAKOUT_LONG',
+  // 2026-07-09: axis-score + crowding-state gated LONG (regime-composite-edge.ts), same
+  // SingleSymbolLaneExecutor pattern (REGIME_COMPOSITE_EXEC_ENABLED on the VPS env).
+  'REGIME_COMPOSITE_CONFIRMATION_LONG',
+  // 2026-07-09: bidirectional composite estimator (axis level+velocity+Kronos, composite-estimator-edge.ts)
+  // — 4 buckets, each its own SingleSymbolLaneExecutor (COMPOSITE_ESTIMATOR_EXEC_ENABLED on the VPS env).
+  'COMPOSITE_ESTIMATOR_BIDI_WIDE_LONG',
+  'COMPOSITE_ESTIMATOR_BIDI_WIDE_SHORT',
+  'COMPOSITE_ESTIMATOR_BIDI_FAST_LONG',
+  'COMPOSITE_ESTIMATOR_BIDI_FAST_SHORT',
 ];
 const PERFORMANCE_VIEW_OPTIONS = [
   { value: 'hourly', label: 'Hourly' },
@@ -48,82 +60,51 @@ const FALLBACK_REGIME_OPTIONS = [
 ];
 const LANE_CHART_COLORS = ['#5ce4a6', '#6fb7c9', '#f3bf5a', '#ff707a', '#a78bfa', '#f59bd3', '#92d36e', '#ff9b6f'];
 
-// Regime tree (operator's naming) ↔ the regime engine's states, with the strategy
-// lane each regime runs and a SUGGESTED live lane-allocation preset. Presets only
-// PREFILL the allocation form — nothing changes until the operator presses Apply.
-// The regime engine itself is REPORT-ONLY (it records decisions, it does not trade).
+// Regime tree (operator's naming) ↔ the regime engine's states, with the strategy lane each
+// regime runs. Purely DESCRIPTIVE metadata now (label/lane name/note) — the actual allocation
+// weights are fetched live from GET /live/regime-presets (see RegimePresetsMap / loadRegimePresets)
+// so this can never drift from the backend's REGIME_AUTOPILOT_PRESETS again.
 //
-// 2026-07-08: kept in sync with apps/api/src/lib/regime-autopilot.ts's REGIME_AUTOPILOT_PRESETS
-// (the ACTUAL backend allocation regime-autopilot applies automatically) — that redesign added
-// CG_MFE_GIVEBACK/CROSS_SECTIONAL_TREND to the two confirmed-trend regimes and
-// CROSS_SECTIONAL_MIXED + one brand-new single-symbol lane to each of the two tactical/choppy
-// regimes, growing every preset except NO_TRADE from 2 lanes to 4. This form-prefill was NOT
-// updated at the time and silently dropped 2 of the 4 real lanes whenever an operator clicked a
-// preset button — the preset object now carries all 4 slots to match.
+// 2026-07-09: this array used to ALSO carry a hardcoded copy of each preset's lane/weightPct data
+// (for the "Apply preset" button) — that copy drifted from the backend the same day
+// CG_WIDE_FAST_SHORT was removed from BEAR_TREND/BEARISH_CHOPPY_DEFENSIVE (a real-money loss
+// driver, see regime-autopilot.ts), and the operator caught the stale button text before anyone
+// clicked Apply on it. Fetching the real preset eliminates the possibility of this recurring.
 const REGIME_TREE: Array<{
   label: string;
   engineRegime: string;
   lane: string;
   laneNote: string;
-  preset: { lane1: string; w1: string; lane2: string; w2: string; lane3: string; w3: string; lane4: string; w4: string };
 }> = [
   {
     label: 'Bear Trend',
     engineRegime: 'BEAR_TREND',
     lane: 'Trend Short (Breakdown Retest Short)',
-    laneNote: 'fast-bank short + protected 3R runner (MFE_GIVEBACK) + systematic cross-sectional trend-following + market-neutral ballast',
-    preset: {
-      lane1: 'CG_WIDE_FAST_SHORT', w1: '35',
-      lane2: 'CG_MFE_GIVEBACK', w2: '15',
-      lane3: 'CROSS_SECTIONAL_TREND', w3: '20',
-      lane4: 'CROSS_SECTIONAL_MARKET_NEUTRAL', w4: '30',
-    },
+    laneNote: 'protected 3R runner (MFE_GIVEBACK) + systematic cross-sectional trend-following + market-neutral ballast',
   },
   {
     label: 'Bear Choppy',
     engineRegime: 'BEARISH_CHOPPY_DEFENSIVE',
     lane: 'Short Rally Fade',
-    laneNote: 'fade weak bounces + RSI-exhaustion crowded-short fade (new, unproven — modest slot) + cross-sectional mean-reversion + market-neutral ballast',
-    preset: {
-      lane1: 'CG_WIDE_FAST_SHORT', w1: '35',
-      lane2: 'SHORT_FADE_EXHAUSTION_CROWDED', w2: '15',
-      lane3: 'CROSS_SECTIONAL_MIXED', w3: '20',
-      lane4: 'CROSS_SECTIONAL_MARKET_NEUTRAL', w4: '30',
-    },
+    laneNote: 'RSI-exhaustion crowded-short fade + capitulation dip-buy (new, unproven — modest slots) + cross-sectional mean-reversion + market-neutral ballast',
   },
   {
     label: 'Neutral',
     engineRegime: 'NO_TRADE',
     lane: 'Mean Reversion (cross-sectional market-neutral)',
     laneNote: 'no directional conviction → pure market-neutral',
-    // No directional conviction → 100% market-neutral (the proven all-weather edge, +0.347%),
-    // NOT a 50/50 directional pair (two weak-edge bets that don't cancel beta). Unchanged — this
-    // is the one regime with an existing hard invariant (must stay pure 100% single-lane).
-    preset: { lane1: 'CROSS_SECTIONAL_MARKET_NEUTRAL', w1: '100', lane2: '', w2: '0', lane3: '', w3: '0', lane4: '', w4: '0' },
   },
   {
     label: 'Recovery',
     engineRegime: 'NEUTRAL_RECOVERY',
     lane: 'Pullback Long (scalp)',
-    laneNote: 'proven long + breakout-momentum hunter (new, unproven — modest slot) + cross-sectional mean-reversion + market-neutral ballast',
-    preset: {
-      lane1: 'CG_WIDE_FAST_LONG', w1: '35',
-      lane2: 'INTRADAY_MOMENTUM_BREAKOUT_LONG', w2: '15',
-      lane3: 'CROSS_SECTIONAL_MIXED', w3: '20',
-      lane4: 'CROSS_SECTIONAL_MARKET_NEUTRAL', w4: '30',
-    },
+    laneNote: 'proven long + breakout-momentum hunter + capitulation dip-buy (new, unproven — modest slots) + cross-sectional mean-reversion + market-neutral ballast',
   },
   {
     label: 'Bull',
     engineRegime: 'TREND_RECOVERY',
     lane: 'Trend Following (breakout retest long)',
     laneNote: 'fast-bank + full-commit 3R runner + protected 3R runner (MFE_GIVEBACK) + systematic cross-sectional trend-following — no market-neutral dilution, confirmed trend concentrates fully on direction',
-    preset: {
-      lane1: 'CG_WIDE_FAST_LONG', w1: '30',
-      lane2: 'CG_WIDE_LONG_RUNNER', w2: '25',
-      lane3: 'CG_MFE_GIVEBACK', w3: '20',
-      lane4: 'CROSS_SECTIONAL_TREND', w4: '25',
-    },
   },
 ];
 
@@ -144,15 +125,29 @@ interface RegimeEngineReport {
   transitions: Array<{ at: string; from: string; to: string }>;
 }
 
+// 2026-07-09 fix: fetched from GET /live/regime-presets (the ACTUAL backend
+// REGIME_AUTOPILOT_PRESETS), not hardcoded — see that route's doc comment for the incident this
+// closes (a hardcoded frontend copy drifted from the backend after a same-day preset edit).
+type RegimePresetsMap = Record<string, Array<{ laneId: string; weightPct: number }>>;
+
 interface LiveStatus {
   enabled: boolean;
   env?: string | null;
   armed?: boolean;
+  newEntries?: {
+    allowed: boolean;
+    drainActive: boolean;
+    persistedDrain: boolean;
+    pausedAt: string | null;
+    pauseReason: string | null;
+    strategyGate: { allowed: boolean; reason: string | null };
+  };
   laneSelection?: {
     allowedLaneIds: string[] | null;
     laneAllocations: Array<{ laneId: string; weightPct: number }> | null;
     mode: string;
     manualSelectorMode?: boolean;
+    laneAllocationOperatorLock?: boolean;
   };
   killedAt?: string | null;
   killReason?: string | null;
@@ -461,8 +456,22 @@ type XsecExecStatus = {
     closesAtMs: number;
     lastNetReturn?: number | null;
     lastNetAt?: string | null;
-    legs: Array<{ symbol: string; side: string; exitOrderId: number | null }>;
+    legs: Array<{ symbol: string; side: string; exitOrderId: string | null }>;
   }>;
+};
+
+type SingleSymbolLanePosition = {
+  laneId: string;
+  positionId: string;
+  symbol: string;
+  direction: 'LONG' | 'SHORT';
+  qty: number;
+  entryPrice: number;
+  stopPrice: number;
+  markPrice: number | null;
+  unrealizedPnl: number | null;
+  peakFavorableR: number;
+  openedAt: string;
 };
 
 type RegimeAxisTimelineData = {
@@ -761,35 +770,59 @@ export default function TestnetExchangeDashboard() {
   const [copyResult, setCopyResult] = useState<{ id: string; ok: boolean; message: string } | null>(null);
   const [controlBusy, setControlBusy] = useState(false);
   const [controlMsg, setControlMsg] = useState<{ ok: boolean; message: string } | null>(null);
-  const [allocLane1, setAllocLane1] = useState('CG_WIDE_FAST_SHORT');
-  const [allocLane2, setAllocLane2] = useState('CG_WIDE_FAST_LONG');
-  const [allocLane3, setAllocLane3] = useState('');
-  const [allocLane4, setAllocLane4] = useState('');
-  const [allocWeight1, setAllocWeight1] = useState('70');
-  const [allocWeight2, setAllocWeight2] = useState('30');
-  const [allocWeight3, setAllocWeight3] = useState('0');
-  const [allocWeight4, setAllocWeight4] = useState('0');
+  // 2026-07-09 fix: was 4 fixed lane1..4/weight1..4 state pairs — the account now legitimately
+  // runs 5 simultaneous lane allocations (MAX_LANE_ALLOCATIONS raised server-side to 10), and there
+  // was no way to even SEE the current 5th lane in this form before overwriting it — editing any
+  // one weight and hitting Apply silently dropped whichever lane didn't fit in slot 1-4 to
+  // zero-weight/blocked, with no error. Now a dynamic array of rows, and loadCurrentAllocation()
+  // below lets the operator pull the REAL server-side state into the form before editing it.
+  const [allocRows, setAllocRows] = useState<Array<{ lane: string; weight: string }>>([
+    { lane: 'CG_WIDE_FAST_SHORT', weight: '70' },
+    { lane: 'CG_WIDE_FAST_LONG', weight: '30' },
+  ]);
   const [regimeReport, setRegimeReport] = useState<RegimeEngineReport | null>(null);
+  const [regimePresets, setRegimePresets] = useState<RegimePresetsMap>({});
   const [regimeAxis, setRegimeAxis] = useState<RegimeAxisTimelineData | null>(null);
   const [closeBusy, setCloseBusy] = useState<string | null>(null);
   const [closeResult, setCloseResult] = useState<{ ok: boolean; message: string } | null>(null);
   const [xsecExec, setXsecExec] = useState<XsecExecStatus | null>(null);
+  const [singleSymbolLanePositions, setSingleSymbolLanePositions] = useState<SingleSymbolLanePosition[]>([]);
   const [psle, setPsle] = useState<PsleReport | null>(null);
   const [headlineLaneOptions, setHeadlineLaneOptions] = useState<string[]>([]);
   const laneAllocationOptions = Array.from(new Set(
-    [...LIVE_LANE_OPTIONS, ...headlineLaneOptions, allocLane1, allocLane2, allocLane3, allocLane4].filter(Boolean),
+    [...LIVE_LANE_OPTIONS, ...headlineLaneOptions, ...allocRows.map((r) => r.lane)].filter(Boolean),
   ));
 
-  function applyRegimePreset(preset: { lane1: string; w1: string; lane2: string; w2: string; lane3: string; w3: string; lane4: string; w4: string }) {
-    setAllocLane1(preset.lane1);
-    setAllocWeight1(preset.w1);
-    setAllocLane2(preset.lane2);
-    setAllocWeight2(preset.w2);
-    setAllocLane3(preset.lane3);
-    setAllocWeight3(preset.w3);
-    setAllocLane4(preset.lane4);
-    setAllocWeight4(preset.w4);
+  function applyRegimePreset(preset: Array<{ laneId: string; weightPct: number }>) {
+    const rows = preset
+      .filter((entry) => entry.laneId.trim())
+      .map((entry) => ({ lane: entry.laneId, weight: String(entry.weightPct) }));
+    setAllocRows(rows.length ? rows : [{ lane: '', weight: '0' }]);
     setControlMsg({ ok: true, message: `Preset dimuat ke form ${allocationLabel} — tekan Apply untuk mengaktifkan` });
+  }
+
+  // 2026-07-09 fix: pulls the REAL current server-side allocation into the form before editing —
+  // without this, the operator has no way to see what's actually active beyond the read-only
+  // "active: ..." label, so any edit-and-Apply cycle risked silently dropping a lane the form
+  // never knew about.
+  function loadCurrentAllocation() {
+    const current = status?.laneSelection?.laneAllocations;
+    if (!current || current.length === 0) {
+      setControlMsg({ ok: false, message: 'Load current: tidak ada allocation aktif di server (mode ALL_LANES / allow-list)' });
+      return;
+    }
+    setAllocRows(current.map((a) => ({ lane: a.laneId, weight: String(a.weightPct) })));
+    setControlMsg({ ok: true, message: `Dimuat ${current.length} lane aktif dari server ke form — edit lalu tekan Apply` });
+  }
+
+  function addAllocRow() {
+    setAllocRows((rows) => [...rows, { lane: '', weight: '0' }]);
+  }
+  function removeAllocRow(index: number) {
+    setAllocRows((rows) => rows.filter((_, i) => i !== index));
+  }
+  function updateAllocRow(index: number, patch: Partial<{ lane: string; weight: string }>) {
+    setAllocRows((rows) => rows.map((r, i) => (i === index ? { ...r, ...patch } : r)));
   }
 
   async function control(url: string, body: unknown, label: string, refresh: () => Promise<void> | void) {
@@ -821,6 +854,16 @@ export default function TestnetExchangeDashboard() {
     void control(`${pageApiPrefix}/live/arm`, { confirm: 'ARM' }, `Arm ${pageName}`, loadExchangeOnly);
   };
   const disarmCurrent = () => control(`${pageApiPrefix}/live/disarm`, {}, `Disarm ${pageName}`, loadExchangeOnly);
+  const toggleEntryDrain = () => {
+    const enable = !(status?.newEntries?.drainActive === true);
+    if (!enable && isLivePage && !window.confirm('Resume NEW real-money entries? Existing exit management is already active.')) return;
+    void control(
+      `${pageApiPrefix}/live/new-entry-drain`,
+      { enabled: enable, confirm: 'DRAIN', reason: enable ? 'dashboard operator drain' : 'dashboard operator resume' },
+      enable ? 'Pause new entries' : 'Resume new entries',
+      loadExchangeOnly,
+    );
+  };
   const toggleManualMode = () =>
     control(
       `${pageApiPrefix}/live/manual-mode`,
@@ -831,16 +874,11 @@ export default function TestnetExchangeDashboard() {
 
   const applyAllocation = () => {
     const allocations: Array<{ laneId: string; weightPct: number }> = [];
-    [
-      [allocLane1, allocWeight1],
-      [allocLane2, allocWeight2],
-      [allocLane3, allocWeight3],
-      [allocLane4, allocWeight4],
-    ].forEach(([lane, weight]) => {
+    allocRows.forEach(({ lane, weight }) => {
       if (lane.trim()) allocations.push({ laneId: lane.trim(), weightPct: Number(weight) });
     });
     if (allocations.length === 0) {
-      setControlMsg({ ok: false, message: 'Allocation: pick at least lane 1' });
+      setControlMsg({ ok: false, message: 'Allocation: pick at least 1 lane' });
       return;
     }
     void control(`${pageApiPrefix}/live/lane-allocations`, { allocations }, allocationLabel, loadExchangeOnly);
@@ -922,6 +960,18 @@ export default function TestnetExchangeDashboard() {
     }
   }
 
+  // 2026-07-09 fix: loads the REAL backend REGIME_AUTOPILOT_PRESETS so the "Lane Tree" panel's
+  // preset buttons can never drift from what the server actually applies (see /live/regime-presets'
+  // doc comment for the incident this closes).
+  async function loadRegimePresets() {
+    try {
+      const res = await fetch(`${pageApiPrefix}/live/regime-presets`, { cache: 'no-store' });
+      setRegimePresets(await res.json());
+    } catch {
+      setRegimePresets({}); // fail-soft: preset buttons just show nothing to apply
+    }
+  }
+
   // Operator close of one directional intent — real market order, double-gated (window.confirm
   // here + {"confirm":"CLOSE"} on the API). Only the engine's share closes; basket legs stay.
   async function closeIntentNow(paperOrderId: string, symbol: string) {
@@ -946,6 +996,50 @@ export default function TestnetExchangeDashboard() {
       setCloseResult({ ok: false, message: err instanceof Error ? err.message : 'close request failed' });
     } finally {
       setCloseBusy(null);
+    }
+  }
+
+  // Operator close of ONE single-symbol-lane-executor position (2026-07-10: operator asked for
+  // separated per-lane control after noticing two lanes on the same symbol can have very different
+  // track records — one proven-ish and trailing-protected, another with zero closed trades and no
+  // interim protection until its hard stop). Real market order, double-gated same as closeIntentNow.
+  async function closeSingleSymbolLaneNow(positionId: string, symbol: string, laneId: string) {
+    if (closeBusy) return;
+    const busyKey = `ssle:${positionId}`;
+    if (!window.confirm(`Close ${symbol} (${compactLane(laneId)}) sekarang? Ini order market REAL, hanya lane ini.`)) return;
+    setCloseBusy(busyKey);
+    setCloseResult(null);
+    try {
+      const res = await fetch(`${pageApiPrefix}/live/single-symbol/close`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ positionId, confirm: 'CLOSE' }),
+      });
+      const body = await res.json();
+      if (!res.ok || body?.ok === false) {
+        setCloseResult({ ok: false, message: `close ${symbol} (${compactLane(laneId)}) gagal: ${body?.reason ?? res.status}` });
+      } else {
+        setCloseResult({ ok: true, message: `${symbol} (${compactLane(laneId)}) closed · realized ${body?.netPnlUsd != null ? signed(body.netPnlUsd) : 'n/a'}` });
+        void loadExchangeOnly();
+        void loadSingleSymbolPositions();
+      }
+    } catch (err) {
+      setCloseResult({ ok: false, message: err instanceof Error ? err.message : 'close request failed' });
+    } finally {
+      setCloseBusy(null);
+    }
+  }
+
+  // Flat per-lane-position list backing the "Single-symbol executor" panel (2026-07-10) — one row
+  // per lane's OWN position on a symbol, not summed across lanes, so each can be inspected/closed
+  // independently.
+  async function loadSingleSymbolPositions() {
+    try {
+      const res = await fetch(`${pageApiPrefix}/live/single-symbol/positions`, { cache: 'no-store' });
+      const body = await res.json();
+      if (body?.ok && Array.isArray(body.positions)) setSingleSymbolLanePositions(body.positions as SingleSymbolLanePosition[]);
+    } catch {
+      /* keep last */
     }
   }
 
@@ -1006,15 +1100,19 @@ export default function TestnetExchangeDashboard() {
   // on /live even if a live endpoint hiccups). Refreshes every 15s.
   useEffect(() => {
     void loadRegimeReport();
+    void loadRegimePresets();
     void loadPerSymbol();
     void loadRegimeAxis();
     void loadXsecExec();
+    void loadSingleSymbolPositions();
     if (!autoRefresh) return undefined;
     const timer = window.setInterval(() => {
       void loadRegimeReport();
+      void loadRegimePresets();
       void loadPerSymbol();
       void loadRegimeAxis();
       void loadXsecExec();
+      void loadSingleSymbolPositions();
     }, 15_000);
     return () => window.clearInterval(timer);
   }, [autoRefresh]);
@@ -1035,7 +1133,11 @@ export default function TestnetExchangeDashboard() {
   // rendered as an untouchable, timed basket leg — when they're actually a single real position with
   // its own exchange-side stop, no sibling leg, and no "naked directional bet" risk from closing it.
   const isSingleSymbolExecutorPosition = (laneIds: string[]) =>
-    laneIds.includes('SHORT_FADE_EXHAUSTION_CROWDED') || laneIds.includes('INTRADAY_MOMENTUM_BREAKOUT_LONG');
+    laneIds.includes('SHORT_FADE_EXHAUSTION_CROWDED') ||
+    laneIds.includes('INTRADAY_MOMENTUM_BREAKOUT_LONG') ||
+    laneIds.includes('REGIME_COMPOSITE_CONFIRMATION_LONG') ||
+    laneIds.includes('PANIC_WASHOUT_RECLAIM_LONG') ||
+    laneIds.some((id) => id.startsWith('COMPOSITE_ESTIMATOR_BIDI_'));
 
   return (
     <div className="neural-shell testnet-shell">
@@ -1135,7 +1237,7 @@ export default function TestnetExchangeDashboard() {
         <header>
           <span>Engine Controls</span>
           <strong>
-            {pageName.toLowerCase()} {status?.armed ? 'ARMED' : 'disarmed'}
+            {pageName.toLowerCase()} {status?.armed ? 'ARMED' : 'disarmed'} · {status?.newEntries?.allowed ? 'entries OPEN' : 'entries BLOCKED'}
           </strong>
         </header>
         {controlMsg && (
@@ -1148,6 +1250,19 @@ export default function TestnetExchangeDashboard() {
             <small style={{ display: 'block', marginBottom: 4 }}>{pageName} engine{isLivePage ? ' (real money)' : ''}</small>
             <button type="button" disabled={controlBusy || status?.armed === true} onClick={armCurrent}>Arm</button>{' '}
             <button type="button" disabled={controlBusy || status?.armed !== true} onClick={() => void disarmCurrent()}>Disarm</button>
+          </div>
+          <div>
+            <small style={{ display: 'block', marginBottom: 4 }}>
+              New entries <strong className={status?.newEntries?.allowed ? 'tone-healthy' : 'tone-critical'}>
+                {status?.newEntries?.drainActive ? 'DRAINED' : status?.newEntries?.strategyGate?.allowed ? 'OPEN' : 'REGIME BLOCKED'}
+              </strong>
+            </small>
+            <button type="button" disabled={controlBusy} onClick={toggleEntryDrain}>
+              {status?.newEntries?.drainActive ? 'Resume new entries' : 'Pause new entries'}
+            </button>
+            <small style={{ display: 'block', maxWidth: 340, marginTop: 4 }}>
+              {status?.newEntries?.pauseReason ?? status?.newEntries?.strategyGate?.reason ?? 'No entry blocker'}; exits remain managed.
+            </small>
           </div>
           <div>
             <small style={{ display: 'block', marginBottom: 4 }}>
@@ -1174,29 +1289,27 @@ export default function TestnetExchangeDashboard() {
               {allocationLabel} — active: {status?.laneSelection?.laneAllocations
                 ? status.laneSelection.laneAllocations.map((a) => `${compactLane(a.laneId)} ${a.weightPct}%`).join(' + ')
                 : status?.laneSelection?.mode ?? 'n/a'}
+              {' '}
+              <button type="button" disabled={controlBusy} onClick={loadCurrentAllocation}>Load current</button>
+              {' '}
+              <span style={{ color: status?.laneSelection?.laneAllocationOperatorLock ? '#e0a83a' : '#7a8a9a' }}>
+                {status?.laneSelection?.laneAllocationOperatorLock
+                  ? '🔒 operator-locked (autopilot will not touch this)'
+                  : 'autopilot-managed (next regime tick may change this)'}
+              </span>
             </small>
-            <select value={allocLane1} onChange={(e) => setAllocLane1(e.target.value)}>
-              {laneAllocationOptions.map((lane) => <option key={lane} value={lane}>{lane}</option>)}
-            </select>{' '}
-            <input type="number" min={1} max={100} value={allocWeight1} onChange={(e) => setAllocWeight1(e.target.value)} style={{ width: 56 }} />%
-            {' + '}
-            <select value={allocLane2} onChange={(e) => setAllocLane2(e.target.value)}>
-              <option value="">(none)</option>
-              {laneAllocationOptions.map((lane) => <option key={lane} value={lane}>{lane}</option>)}
-            </select>{' '}
-            <input type="number" min={0} max={100} value={allocWeight2} onChange={(e) => setAllocWeight2(e.target.value)} style={{ width: 56 }} />%
-            {' + '}
-            <select value={allocLane3} onChange={(e) => setAllocLane3(e.target.value)}>
-              <option value="">(none)</option>
-              {laneAllocationOptions.map((lane) => <option key={lane} value={lane}>{lane}</option>)}
-            </select>{' '}
-            <input type="number" min={0} max={100} value={allocWeight3} onChange={(e) => setAllocWeight3(e.target.value)} style={{ width: 56 }} />%
-            {' + '}
-            <select value={allocLane4} onChange={(e) => setAllocLane4(e.target.value)}>
-              <option value="">(none)</option>
-              {laneAllocationOptions.map((lane) => <option key={lane} value={lane}>{lane}</option>)}
-            </select>{' '}
-            <input type="number" min={0} max={100} value={allocWeight4} onChange={(e) => setAllocWeight4(e.target.value)} style={{ width: 56 }} />%
+            {allocRows.map((row, i) => (
+              <div key={i} style={{ marginBottom: 2 }}>
+                <select value={row.lane} onChange={(e) => updateAllocRow(i, { lane: e.target.value })}>
+                  <option value="">(none)</option>
+                  {laneAllocationOptions.map((lane) => <option key={lane} value={lane}>{lane}</option>)}
+                </select>{' '}
+                <input type="number" min={0} max={100} value={row.weight} onChange={(e) => updateAllocRow(i, { weight: e.target.value })} style={{ width: 56 }} />%
+                {' '}
+                <button type="button" disabled={controlBusy || allocRows.length <= 1} onClick={() => removeAllocRow(i)}>Remove</button>
+              </div>
+            ))}
+            <button type="button" disabled={controlBusy} onClick={addAllocRow}>+ Add lane</button>
             {' '}
             <button type="button" disabled={controlBusy} onClick={applyAllocation}>Apply</button>{' '}
             <button type="button" disabled={controlBusy} onClick={() => void clearAllocation()}>Clear</button>
@@ -1230,6 +1343,7 @@ export default function TestnetExchangeDashboard() {
               {REGIME_TREE.map((row) => {
                 const isCurrent = regimeReport?.latest?.regime === row.engineRegime;
                 const count = regimeReport?.regimeCounts?.[row.engineRegime] ?? 0;
+                const preset = regimePresets[row.engineRegime] ?? [];
                 return (
                   <tr key={row.engineRegime} style={isCurrent ? { outline: '1px solid #5ce4a6' } : undefined}>
                     <td className={isCurrent ? 'tone-healthy' : undefined}>
@@ -1239,10 +1353,10 @@ export default function TestnetExchangeDashboard() {
                     <td title={row.laneNote}>{row.lane}</td>
                     <td>{count}</td>
                     <td>
-                      <button type="button" disabled={controlBusy} onClick={() => applyRegimePreset(row.preset)}>
-                        {row.preset.lane2
-                          ? `${compactLane(row.preset.lane1)} ${row.preset.w1}% + ${compactLane(row.preset.lane2)} ${row.preset.w2}%`
-                          : `${compactLane(row.preset.lane1)} ${row.preset.w1}%`}
+                      <button type="button" disabled={controlBusy || preset.length === 0} onClick={() => applyRegimePreset(preset)}>
+                        {preset.length > 0
+                          ? preset.map((entry) => `${compactLane(entry.laneId)} ${entry.weightPct}%`).join(' + ')
+                          : 'loading…'}
                       </button>
                     </td>
                   </tr>
@@ -1334,10 +1448,8 @@ export default function TestnetExchangeDashboard() {
           const foundation = positions.filter(
             (p) => !isSingleSymbolExecutorPosition(p.laneIds) && ((p.basketQty ?? 0) !== 0 || (isCrossSectionalPosition(p.laneIds) && !intentBySymbol.has(p.symbol))),
           );
-          const singleSymbolPositions = positions.filter((p) => isSingleSymbolExecutorPosition(p.laneIds));
           const row = (position: (typeof positions)[number], closeable: boolean) => {
-            const isSingleSymbol = !closeable && isSingleSymbolExecutorPosition(position.laneIds);
-            const book = closeable ? 'directional' : isSingleSymbol ? 'single-symbol' : 'foundation';
+            const book = closeable ? 'directional' : 'foundation';
             const mixed = intentBySymbol.has(position.symbol) && (position.basketQty ?? 0) !== 0;
             const qty = closeable
               ? Math.abs(position.intentQty ?? position.quantity)
@@ -1360,16 +1472,8 @@ export default function TestnetExchangeDashboard() {
               <td>{Number(qty.toFixed(8))}</td>
               <td>{entry == null ? 'multi-leg' : price(entry)}</td>
               <td>{price(position.markPrice)}</td>
-              <td>
-                {closeable
-                  ? price(position.targetTpPrice)
-                  : isSingleSymbol
-                    ? (position.singleSymbolStopPrice != null ? `stop ${price(position.singleSymbolStopPrice)}` : 'stop-managed')
-                    : 'basket horizon'}
-              </td>
-              <td className={tone(position.targetTpGapPct)}>
-                {closeable ? percent(position.targetTpGapPct) : isSingleSymbol ? 'real exch. stop' : 'timed'}
-              </td>
+              <td>{closeable ? price(position.targetTpPrice) : 'basket horizon'}</td>
+              <td className={tone(position.targetTpGapPct)}>{closeable ? percent(position.targetTpGapPct) : 'timed'}</td>
               <td className="tone-critical">{price(position.liquidationPrice)}</td>
               <td className={tone(unreal)}>{signed(unreal)}</td>
               <td className={tone(afterCost)}>{signed(afterCost)}</td>
@@ -1460,19 +1564,52 @@ export default function TestnetExchangeDashboard() {
                 </div>
               </section>
               <section className="testnet-panel">
-                <header><span>Single-symbol executor — stop-protected</span><strong>{singleSymbolPositions.length} pos</strong></header>
+                <header><span>Single-symbol executor — stop-protected</span><strong>{singleSymbolLanePositions.length} pos</strong></header>
                 <p className="tone-measure" style={{ margin: '4px 0', fontSize: 12 }}>
-                  SHORT_FADE_EXHAUSTION_CROWDED / INTRADAY_MOMENTUM_BREAKOUT_LONG. Setiap posisi berdiri sendiri (bukan basket leg,
-                  tidak ada sisi lain yang jadi taruhan telanjang kalau dilepas) dan dilindungi STOP_MARKET real di exchange —
-                  belum ada tombol close manual di sini (exit otomatis lewat stop atau target/MFE-giveback).
+                  SHORT_FADE_EXHAUSTION_CROWDED / INTRADAY_MOMENTUM_BREAKOUT_LONG / REGIME_COMPOSITE_CONFIRMATION_LONG /
+                  COMPOSITE_ESTIMATOR_BIDI_* / PANIC_WASHOUT_RECLAIM_LONG. Satu baris per lane per simbol (2 lane yang sama-sama
+                  megang 1 simbol tampil sebagai 2 baris terpisah, bukan digabung) — dilindungi STOP_MARKET real di exchange,
+                  &quot;Close now&quot; hanya menutup lane di baris itu. R = (mark−entry)/(entry−stop); exit otomatis tetap
+                  lewat stop atau target/MFE-giveback kalau tidak diclose manual.
                 </p>
+                {closeResult && <p className={closeResult.ok ? 'tone-healthy' : 'tone-critical'} style={{ margin: '4px 0', fontSize: 12 }}>{closeResult.message}</p>}
                 <div className="testnet-table-wrap">
                   <table>
-                    <thead>{headCells(false)}</thead>
+                    <thead>
+                      <tr><th>Symbol</th><th>Lane</th><th>Side</th><th>Qty</th><th>Entry</th><th>Mark</th><th>Stop</th><th>R now / peak</th><th>Unrealized</th><th>Opened</th><th>Manual</th></tr>
+                    </thead>
                     <tbody>
-                      {singleSymbolPositions.length === 0 ? (
-                        <tr><td colSpan={13}>No open single-symbol executor positions.</td></tr>
-                      ) : singleSymbolPositions.map((p) => row(p, false))}
+                      {singleSymbolLanePositions.length === 0 ? (
+                        <tr><td colSpan={11}>No open single-symbol executor positions.</td></tr>
+                      ) : singleSymbolLanePositions.map((p) => {
+                        const risk = Math.abs(p.entryPrice - p.stopPrice);
+                        const dirSign = p.direction === 'LONG' ? 1 : -1;
+                        const currentR = p.markPrice != null && risk > 0 ? ((p.markPrice - p.entryPrice) / risk) * dirSign : null;
+                        const busyKey = `ssle:${p.positionId}`;
+                        return (
+                          <tr key={p.positionId}>
+                            <td>{p.symbol}</td>
+                            <td>{compactLane(p.laneId)}</td>
+                            <td className={p.direction === 'SHORT' ? 'tone-warning' : 'tone-healthy'}>{p.direction}</td>
+                            <td>{p.qty}</td>
+                            <td>{price(p.entryPrice)}</td>
+                            <td>{price(p.markPrice)}</td>
+                            <td>{price(p.stopPrice)}</td>
+                            <td className={tone(currentR ?? 0)}>{currentR == null ? '—' : `${currentR.toFixed(2)}R`} / {p.peakFavorableR.toFixed(2)}R</td>
+                            <td className={tone(p.unrealizedPnl ?? 0)}>{p.unrealizedPnl == null ? '—' : signed(p.unrealizedPnl)}</td>
+                            <td>{new Date(p.openedAt).toLocaleString()}</td>
+                            <td>
+                              <button
+                                type="button"
+                                disabled={closeBusy !== null}
+                                onClick={() => void closeSingleSymbolLaneNow(p.positionId, p.symbol, p.laneId)}
+                              >
+                                {closeBusy === busyKey ? 'closing…' : 'Close now'}
+                              </button>
+                            </td>
+                          </tr>
+                        );
+                      })}
                     </tbody>
                   </table>
                 </div>

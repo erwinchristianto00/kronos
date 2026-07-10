@@ -524,6 +524,10 @@ export function buildVariantSelection(
     calibrationVerdict: calibrationResult.calibrationVerdict,
     calibrationSampleSize: calibrationResult.calibrationSampleSize,
     calibrationDiagnosisCodes: calibrationResult.calibrationDiagnosisCodes,
+    profitAdmission: {
+      chaseRisk: precision.chaseRisk,
+      riskReward: candidate.riskReward,
+    },
   });
   const routeMode: ProfitRouteMode = routeDecision.routeMode;
   const diagnostics = computeScannerDiagnostics(

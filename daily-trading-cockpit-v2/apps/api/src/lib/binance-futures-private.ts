@@ -120,7 +120,12 @@ export interface FuturesPosition {
 
 export interface FuturesOrder {
   symbol: string;
-  orderId: number;
+  /** String, not number: Binance order IDs can exceed Number.MAX_SAFE_INTEGER (2^53-1) — a plain
+   *  JS number silently loses precision for these, making the id permanently unrecoverable (a real
+   *  incident: 2 live ETHUSDT positions' entryOrderId got rounded, so queryOrder(symbol, orderId)
+   *  on that rounded value returned -2013 "order does not exist" hours later during reconciliation).
+   *  See preserveOrderIdPrecision below for where this is protected at the JSON-parse boundary. */
+  orderId: string;
   clientOrderId: string;
   status: string; // NEW | PARTIALLY_FILLED | FILLED | CANCELED | EXPIRED | REJECTED
   type: string;
@@ -156,13 +161,13 @@ export interface FillPriceResolution {
 export async function resolveConfirmedFillPrice(
   client: Pick<BinanceFuturesPrivateClient, "queryOrder">,
   symbol: string,
-  orderId: number,
+  orderId: string,
   initialAvgPrice: number,
   fallbackPrice: number,
   opts: {
     retries?: number;
     retryDelayMs?: number;
-    onUnconfirmed?: (symbol: string, orderId: number, fallbackPrice: number) => void;
+    onUnconfirmed?: (symbol: string, orderId: string, fallbackPrice: number) => void;
   } = {},
 ): Promise<FillPriceResolution> {
   if (initialAvgPrice > 0) return { price: initialAvgPrice, confirmed: true };
@@ -192,19 +197,21 @@ export async function resolveConfirmedFillPrice(
 
 export interface FuturesAlgoOrder {
   symbol: string;
-  algoId: number;
+  /** String, not number — see FuturesOrder.orderId's doc comment. */
+  algoId: string;
   clientAlgoId: string;
   algoStatus: string;
   orderType: string;
   side: "BUY" | "SELL";
   quantity: number;
   triggerPrice: number;
-  actualOrderId: number | null;
+  actualOrderId: string | null;
 }
 
 export interface FuturesUserTrade {
   symbol: string;
-  orderId: number;
+  /** String, not number — see FuturesOrder.orderId's doc comment. */
+  orderId: string;
   price: number;
   qty: number;
   realizedPnl: number;
@@ -243,6 +250,35 @@ export interface PlaceAlgoOrderParams {
 function toNum(value: unknown): number {
   const n = typeof value === "string" ? Number.parseFloat(value) : typeof value === "number" ? value : NaN;
   return Number.isFinite(n) ? n : 0;
+}
+
+/** For order/algo IDs specifically — NEVER route these through toNum, which would re-introduce the
+ *  exact precision loss preserveOrderIdPrecision protects against. Accepts a string (the normal
+ *  post-fix path) or, defensively, a number (e.g. a hand-built test fixture) — stringifies without
+ *  re-parsing as a float. */
+function toStrId(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  return "";
+}
+
+/**
+ * Guards against JavaScript's silent integer-precision loss for Binance's order/algo IDs, which
+ * can exceed Number.MAX_SAFE_INTEGER (2^53-1 ≈ 9.007e15) — real incident: two live ETHUSDT
+ * entryOrderId values got rounded during response parsing, and the rounded value no longer
+ * matched any real order on Binance's side (queryOrder returned -2013 "order does not exist" when
+ * reconciling hours later). Standard JSON.parse always converts numeric literals to JS `number`,
+ * silently losing precision for anything beyond ~16 digits — there is no way to recover the true
+ * value AFTER that conversion, so this must intercept the RAW response text before JSON.parse
+ * ever sees it.
+ *
+ * Rewrites `"orderId":123456789012345678` → `"orderId":"123456789012345678"` (and the same for
+ * algoId/actualOrderId) so these specific fields parse as exact strings instead of lossy numbers.
+ * Scoped to these 3 known field names (not every large integer in the response) so it can never
+ * accidentally stringify an unrelated numeric field like price/qty/time.
+ */
+function preserveOrderIdPrecision(bodyText: string): string {
+  return bodyText.replace(/"(orderId|algoId|actualOrderId)":(-?\d+)/g, '"$1":"$2"');
 }
 
 function decimalsForStep(step: number, fallback: number): number {
@@ -360,7 +396,7 @@ export class BinanceFuturesPrivateClient {
     }
     let parsed: unknown = null;
     try {
-      parsed = bodyText.length > 0 ? JSON.parse(bodyText) : null;
+      parsed = bodyText.length > 0 ? JSON.parse(preserveOrderIdPrecision(bodyText)) : null;
     } catch {
       throw new BinanceFuturesPrivateError("invalid_response", `non-JSON response (HTTP ${response.status})`, {
         httpStatus: response.status,
@@ -581,12 +617,12 @@ export class BinanceFuturesPrivateClient {
     return Array.isArray(parsed) ? parsed.map((order) => this.mapAlgoOrder(order)) : [];
   }
 
-  async queryAlgoOrder(algoId: number): Promise<FuturesAlgoOrder> {
+  async queryAlgoOrder(algoId: string): Promise<FuturesAlgoOrder> {
     const parsed = await this.requestSigned("GET", "/fapi/v1/algoOrder", { algoId });
     return this.mapAlgoOrder(parsed);
   }
 
-  async queryOrder(symbol: string, orderId: number): Promise<FuturesOrder> {
+  async queryOrder(symbol: string, orderId: string): Promise<FuturesOrder> {
     const parsed = await this.requestSigned("GET", "/fapi/v1/order", { symbol, orderId });
     return this.mapOrder(parsed);
   }
@@ -640,11 +676,11 @@ export class BinanceFuturesPrivateClient {
     return this.mapAlgoOrder(parsed);
   }
 
-  async cancelOrder(symbol: string, orderId: number): Promise<void> {
+  async cancelOrder(symbol: string, orderId: string): Promise<void> {
     await this.requestSigned("DELETE", "/fapi/v1/order", { symbol, orderId });
   }
 
-  async cancelAlgoOrder(algoId: number): Promise<void> {
+  async cancelAlgoOrder(algoId: string): Promise<void> {
     await this.requestSigned("DELETE", "/fapi/v1/algoOrder", { algoId });
   }
 
@@ -665,7 +701,7 @@ export class BinanceFuturesPrivateClient {
     if (!Array.isArray(parsed)) return [];
     return parsed.map((t) => ({
       symbol: String((t as { symbol?: unknown }).symbol ?? ""),
-      orderId: toNum((t as { orderId?: unknown }).orderId),
+      orderId: toStrId((t as { orderId?: unknown }).orderId),
       price: toNum((t as { price?: unknown }).price),
       qty: toNum((t as { qty?: unknown }).qty),
       realizedPnl: toNum((t as { realizedPnl?: unknown }).realizedPnl),
@@ -679,7 +715,7 @@ export class BinanceFuturesPrivateClient {
     const o = raw as Record<string, unknown>;
     return {
       symbol: String(o.symbol ?? ""),
-      orderId: toNum(o.orderId),
+      orderId: toStrId(o.orderId),
       clientOrderId: String(o.clientOrderId ?? o.newClientOrderId ?? ""),
       status: String(o.status ?? ""),
       type: String(o.type ?? o.origType ?? ""),
@@ -696,17 +732,17 @@ export class BinanceFuturesPrivateClient {
 
   private mapAlgoOrder(raw: unknown): FuturesAlgoOrder {
     const order = raw as Record<string, unknown>;
-    const actualOrderId = toNum(order.actualOrderId);
+    const actualOrderId = toStrId(order.actualOrderId);
     return {
       symbol: String(order.symbol ?? ""),
-      algoId: toNum(order.algoId),
+      algoId: toStrId(order.algoId),
       clientAlgoId: String(order.clientAlgoId ?? ""),
       algoStatus: String(order.algoStatus ?? order.status ?? ""),
       orderType: String(order.orderType ?? order.type ?? ""),
       side: order.side === "SELL" ? "SELL" : "BUY",
       quantity: toNum(order.quantity),
       triggerPrice: toNum(order.triggerPrice),
-      actualOrderId: actualOrderId > 0 ? actualOrderId : null,
+      actualOrderId: actualOrderId && actualOrderId !== "0" ? actualOrderId : null,
     };
   }
 }

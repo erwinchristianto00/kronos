@@ -59,13 +59,14 @@ class FakeExecClient implements CrossSectionalExecClient {
   failOnSymbol: string | null = null;
   fillPriceBySymbol = new Map<string, number>();
   markPriceBySymbol = new Map<string, number>();
+  positionAmtBySymbol = new Map<string, number>();
   /** What queryOrder reports for a symbol when polled — simulates the exchange confirming a fill
    *  that the initial placeOrder response returned as avgPrice=0. Unset ⇒ stays unconfirmed (NEW). */
   queryOrderAvgPriceBySymbol = new Map<string, number>();
   queryOrderCallCount = 0;
   private orderSeq = 100;
 
-  private buildOrder(symbol: string, side: string, quantity: number, reduceOnly: boolean | undefined, orderId: number, avgPrice: number): FuturesOrder {
+  private buildOrder(symbol: string, side: string, quantity: number, reduceOnly: boolean | undefined, orderId: string, avgPrice: number): FuturesOrder {
     return {
       symbol,
       orderId,
@@ -97,11 +98,12 @@ class FakeExecClient implements CrossSectionalExecClient {
     this.leverageCalls.push({ symbol, leverage });
   }
   async getPositions(): Promise<FuturesPosition[]> {
-    return Array.from(this.markPriceBySymbol.entries()).map(([symbol, markPrice]) => ({
+    const symbols = new Set([...this.markPriceBySymbol.keys(), ...this.positionAmtBySymbol.keys()]);
+    return Array.from(symbols).map((symbol) => ({
       symbol,
-      positionAmt: 0,
+      positionAmt: this.positionAmtBySymbol.get(symbol) ?? 0,
       entryPrice: 0,
-      markPrice,
+      markPrice: this.markPriceBySymbol.get(symbol) ?? 0,
       liquidationPrice: 0,
       unRealizedProfit: 0,
       leverage: 3,
@@ -117,18 +119,18 @@ class FakeExecClient implements CrossSectionalExecClient {
       throw new Error("Binance error HTTP 400 code -2022: ReduceOnly Order is rejected.");
     }
     this.placed.push(params);
-    const orderId = this.orderSeq++;
+    const orderId = String(this.orderSeq++);
     const avgPrice = this.fillPriceBySymbol.get(params.symbol) ?? 0;
     return this.buildOrder(params.symbol, params.side, params.quantity, params.reduceOnly, orderId, avgPrice);
   }
-  async queryOrder(symbol: string, orderId: number) {
+  async queryOrder(symbol: string, orderId: string) {
     this.queryOrderCallCount++;
     const avgPrice = this.queryOrderAvgPriceBySymbol.get(symbol) ?? 0;
     return this.buildOrder(symbol, "BUY", 0, false, orderId, avgPrice);
   }
 }
 
-function makeExecutor(opts: { client?: FakeExecClient; allowed?: boolean; laneWeightPct?: number; signalMs?: number; dailyMaxLossUsd?: number } = {}) {
+function makeExecutor(opts: { client?: FakeExecClient; allowed?: boolean; laneWeightPct?: number; signalMs?: number; dailyMaxLossUsd?: number; entryHealthAllowed?: boolean } = {}) {
   const client = opts.client ?? new FakeExecClient();
   const signalStore = new CrossSectionalStore(tmpDir());
   const storeDir = tmpDir();
@@ -146,6 +148,9 @@ function makeExecutor(opts: { client?: FakeExecClient; allowed?: boolean; laneWe
     fillConfirmRetryDelayMs: 0,
     // Injected (not process.env) — env mutation in tests leaks across vitest worker threads.
     ...(opts.dailyMaxLossUsd !== undefined ? { dailyMaxLossUsd: () => opts.dailyMaxLossUsd! } : {}),
+    ...(opts.entryHealthAllowed !== undefined
+      ? { entryHealthGate: () => ({ allowed: opts.entryHealthAllowed!, reason: opts.entryHealthAllowed ? null : "rolling edge negative" }) }
+      : {}),
   });
   return { executor, client, signalStore, store, storeDir };
 }
@@ -190,6 +195,13 @@ describe("cross-sectional executor (basket execution, testnet-first)", () => {
     const { executor, store } = makeExecutor({ allowed: false, signalMs: NOW_MS - 5 * 60_000 });
     await executor.tick();
     expect(store.getState().baskets.length).toBe(0);
+  });
+
+  it("rolling entry-health gate blocks a new basket and exposes the reason", async () => {
+    const { executor, store } = makeExecutor({ entryHealthAllowed: false, signalMs: NOW_MS - 5 * 60_000 });
+    await executor.tick();
+    expect(store.getState().baskets.length).toBe(0);
+    expect(executor.getStatus()).toMatchObject({ allowed: false, openHalted: "rolling edge negative" });
   });
 
   it("scales leg size by the operator lane allocation weight", async () => {
@@ -610,7 +622,7 @@ describe("getStatus signal freshness + adaptive filter visibility", () => {
 // stuck for hours at +0.63% with the TP unable to complete). closeBasket must drop reduceOnly
 // exactly when sibling baskets' un-exited opposite exposure fully covers the leg — and only then.
 describe("closeBasket under cross-basket netting", () => {
-  function basket(id: string, legs: Array<{ symbol: string; side: "LONG" | "SHORT"; qty: number; entryPrice: number; exitOrderId?: number | null; exitPrice?: number | null }>, closesAtMs: number) {
+  function basket(id: string, legs: Array<{ symbol: string; side: "LONG" | "SHORT"; qty: number; entryPrice: number; exitOrderId?: string | null; exitPrice?: number | null }>, closesAtMs: number) {
     return {
       basketId: id,
       sourceObservationId: `src-${id}`,
@@ -620,7 +632,7 @@ describe("closeBasket under cross-basket netting", () => {
       closesAtMs,
       legs: legs.map((l) => ({
         symbol: l.symbol, side: l.side, qty: l.qty, entryPrice: l.entryPrice,
-        entryOrderId: 1, entryPriceConfirmed: true,
+        entryOrderId: "1", entryPriceConfirmed: true,
         exitPrice: l.exitPrice ?? null, exitOrderId: l.exitOrderId ?? null, exitPriceConfirmed: l.exitOrderId != null ? true : null,
       })),
       status: "OPEN" as const,
@@ -649,6 +661,7 @@ describe("closeBasket under cross-basket netting", () => {
   it("[NETTED-CLOSE-GUARD] keeps reduceOnly (and stays OPEN on rejection) when no sibling covers the leg", async () => {
     const { executor, client, store } = makeExecutor();
     client.rejectReduceOnlyOn.add("SOLUSDT");
+    client.positionAmtBySymbol.set("SOLUSDT", 1); // exchange still confirms the full same-side leg
     store.getState().baskets.push(
       basket("a", [{ symbol: "SOLUSDT", side: "LONG", qty: 1, entryPrice: 100 }], NOW_MS - 60_000),
     );
@@ -658,13 +671,31 @@ describe("closeBasket under cross-basket netting", () => {
     expect(executor.getStatus().lastError ?? "").toMatch(/ReduceOnly/);
   });
 
+  it("[STALE-BOOK-RECONCILE] aborts without creating opposite exposure when exchange position is already flat", async () => {
+    const { executor, client, store } = makeExecutor();
+    client.rejectReduceOnlyOn.add("SOLUSDT");
+    client.positionAmtBySymbol.set("SOLUSDT", 0);
+    store.getState().baskets.push(
+      basket("flat", [{ symbol: "SOLUSDT", side: "LONG", qty: 1, entryPrice: 100 }], NOW_MS - 60_000),
+    );
+
+    await executor.tick();
+
+    const reconciled = store.getState().baskets.find((x) => x.basketId === "flat")!;
+    expect(reconciled.status).toBe("ABORTED");
+    expect(reconciled.closeReason).toBe("RECONCILED_POSITION_ALREADY_FLAT:HORIZON");
+    expect(reconciled.netPnlUsd).toBeNull(); // no fabricated fill/P&L
+    expect(reconciled.legs[0]!.exitOrderId).toBe("POSITION_ALREADY_FLAT");
+    expect(client.placed).toHaveLength(0); // critically: no plain SELL that creates a new short
+  });
+
   it("[RETRY-PNL] finalizing after a partial close counts the ALREADY-exited legs' P&L", async () => {
     const { executor, client, store } = makeExecutor();
     client.fillPriceBySymbol.set("ADAUSDT", 0.9);
     store.getState().baskets.push(
       basket("a", [
         // Exited in a previous attempt (stored exit price 108) — must still count in final P&L.
-        { symbol: "SOLUSDT", side: "LONG", qty: 1, entryPrice: 100, exitOrderId: 999, exitPrice: 108 },
+        { symbol: "SOLUSDT", side: "LONG", qty: 1, entryPrice: 100, exitOrderId: "999", exitPrice: 108 },
         { symbol: "ADAUSDT", side: "SHORT", qty: 10, entryPrice: 1 },
       ], NOW_MS - 60_000),
     );
@@ -688,7 +719,7 @@ describe("TP-gap stamping + daily basket loss breaker (safety net, never a profi
       closesAtMs,
       legs: legs.map((l) => ({
         symbol: l.symbol, side: l.side, qty: l.qty, entryPrice: l.entryPrice,
-        entryOrderId: 1, entryPriceConfirmed: true,
+        entryOrderId: "1", entryPriceConfirmed: true,
         exitPrice: null, exitOrderId: null, exitPriceConfirmed: null,
       })),
       status: "OPEN" as const,

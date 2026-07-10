@@ -151,8 +151,11 @@ describe("regime auto-pilot (Tier 1)", () => {
       if (regime === "NO_TRADE") {
         expect(preset).toEqual([{ laneId: "CROSS_SECTIONAL_MARKET_NEUTRAL", weightPct: 100 }]);
       }
-      // setLaneAllocations (live-execution-engine.ts) rejects >4 lanes in one allocation.
-      expect(preset.length).toBeLessThanOrEqual(4);
+      // setLaneAllocations (live-execution-engine.ts) rejects >MAX_LANE_ALLOCATIONS lanes in one
+      // allocation — raised from a hardcoded 4 to a configurable 10 (LIVE_MAX_LANE_ALLOCATIONS,
+      // see live-execution-engine.ts) on 2026-07-09; this assertion tracks that current real cap,
+      // not the old hardcoded one.
+      expect(preset.length).toBeLessThanOrEqual(10);
     }
   });
 

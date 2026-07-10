@@ -11,6 +11,8 @@ import {
   REALTIME_SHORT_ALLOWED_VARIANT_IDS,
   FORCE_ELIGIBLE_SHORT_VARIANT_IDS,
   FORCE_ELIGIBLE_LONG_VARIANT_IDS,
+  PROFIT_CORE_SHORT_TRAIL_LANE_ID,
+  profitCoreShortRejectionReason,
   type RealtimeShortCandidate,
   type RealtimeShortMirrorInputs,
 } from "../src/lib/realtime-short-mirror.js";
@@ -30,6 +32,25 @@ function shortCand(symbol: string, over: Partial<RealtimeShortCandidate> = {}): 
     stopDistanceBps: 300,
     ...over,
   };
+}
+
+function profitCoreCand(symbol = "BTCUSDT", over: Partial<RealtimeShortCandidate> = {}): RealtimeShortCandidate {
+  return shortCand(symbol, {
+    stopLoss: 110,
+    takeProfitLevels: [95],
+    stopDistanceBps: 1000,
+    selectedEntryVariant: "base_current_entry",
+    selectedExitVariant: "trail_after_tp1",
+    routeMode: "PROFIT_CANDIDATE",
+    chaseRisk: "LOW",
+    riskReward: 6,
+    calibratedExpectedNetR: 0.4,
+    calibrationVerdict: "CALIBRATED_POSITIVE",
+    whaleSignal: "BEARISH",
+    sourceConflict: false,
+    horizonConflict: false,
+    ...over,
+  });
 }
 
 function inputs(
@@ -52,6 +73,77 @@ function inputs(
 }
 
 describe("realtime-short-mirror — fresh short live-mirror source (mode 2)", () => {
+  it("[PROFIT-CORE] emits only the strict bearish no-chase fingerprint and uses executable scaleout+trail", () => {
+    const store = freshStore();
+    const result = runRealtimeShortMirror(
+      inputs([profitCoreCand()], {
+        controllerConfidence: "MEDIUM",
+        stableShortLanes: [],
+        rotationShortlist: null,
+        profitCoreShortEnabled: true,
+      }),
+      store,
+    );
+    expect(result.emitted).toBe(1);
+    expect(store.all[0]!.selectedLaneId).toBe(PROFIT_CORE_SHORT_TRAIL_LANE_ID);
+    expect(store.all[0]!.variantExitRule).toBe("scaleout_tp1_trail");
+    expect(store.all[0]!.stopLoss).toBe(110);
+    expect(store.all[0]!.takeProfitLevels).toEqual([95]);
+  });
+
+  it("[PROFIT-CORE] cannot be forced outside the evidence fingerprint", () => {
+    const estimated = {
+      posture: "EXTENDED_TREND" as const,
+      direction: "SHORT" as const,
+      policy: "WIDE_TREND" as const,
+      reason: "test",
+    };
+    expect(profitCoreShortRejectionReason(
+      profitCoreCand("SOLUSDT"),
+      { regime: "Bearish pressure", controllerMode: "SHORT_ONLY" },
+      estimated,
+    )).toBe("symbol_not_profit_core");
+    expect(profitCoreShortRejectionReason(
+      profitCoreCand("BTCUSDT", { chaseRisk: "HIGH" }),
+      { regime: "Bearish pressure", controllerMode: "SHORT_ONLY" },
+      estimated,
+    )).toBe("entry_chase_not_low");
+    expect(profitCoreShortRejectionReason(
+      profitCoreCand("BTCUSDT"),
+      { regime: "Bullish expansion", controllerMode: "LONG_ONLY" },
+      { ...estimated, direction: "LONG" },
+    )).toBe("controller_not_short_only");
+  });
+
+  it("[PROFIT-CORE] uses the unmodified controller even when manual selector widens generic lanes", () => {
+    const store = freshStore();
+    const result = runRealtimeShortMirror(
+      inputs([profitCoreCand()], {
+        controllerMode: "BOTH_ALLOWED",
+        controllerConfidence: "MEDIUM",
+        estimatedRegime: {
+          posture: "TACTICAL_OR_MIXED",
+          direction: "MIXED",
+          policy: "TACTICAL_70_30",
+          reason: "manual selector",
+        },
+        profitCoreControllerMode: "SHORT_ONLY",
+        profitCoreEstimatedRegime: {
+          posture: "EXTENDED_TREND",
+          direction: "SHORT",
+          policy: "WIDE_TREND",
+          reason: "real controller",
+        },
+        stableShortLanes: [],
+        rotationShortlist: null,
+        profitCoreShortEnabled: true,
+      }),
+      store,
+    );
+    expect(result.emitted).toBe(1);
+    expect(store.all[0]!.controllerMode).toBe("SHORT_ONLY");
+  });
+
   it("[CROWDING-VETO] skips a short into a SHORT-extreme crowd, still fires into a LONG-extreme crowd", () => {
     // SHORT into a SHORT-crowded-EXTREME book ⇒ vetoed (don't add to the over-short crowd).
     const vetoed = runRealtimeShortMirror(

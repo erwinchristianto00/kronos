@@ -279,4 +279,49 @@ describe("computeProfitRoute", () => {
     expect(decision.routeReasonCodes).not.toContain("STOP_DISTANCE_ULTRA_TIGHT");
     expect(decision.routeMode).toBe("PROFIT_CANDIDATE");
   });
+
+  it("profit-focused admission only promotes LOW-chase, >=500bps stop, RR 5-8", () => {
+    const accepted = computeProfitRoute(
+      baseInput({
+        variantConfidenceTier: "usable",
+        expectedNetR: 0.25,
+        cost: { costR: 0.05, spreadR: 0.01, feeSlippageR: 0.04, stopDistanceBps: 600 },
+        profitAdmission: { chaseRisk: "LOW", riskReward: 6 },
+      }),
+    );
+    expect(accepted.routeMode).toBe("PROFIT_CANDIDATE");
+
+    const chased = computeProfitRoute(
+      baseInput({
+        variantConfidenceTier: "usable",
+        expectedNetR: 0.25,
+        cost: { costR: 0.05, spreadR: 0.01, feeSlippageR: 0.04, stopDistanceBps: 600 },
+        profitAdmission: { chaseRisk: "HIGH", riskReward: 6 },
+      }),
+    );
+    expect(chased.routeMode).toBe("DATA_COLLECTION");
+    expect(chased.routeReasonCodes).toContain("PROFIT_ENTRY_CHASED");
+
+    const narrowStop = computeProfitRoute(
+      baseInput({
+        variantConfidenceTier: "usable",
+        expectedNetR: 0.25,
+        cost: { costR: 0.05, spreadR: 0.01, feeSlippageR: 0.04, stopDistanceBps: 499 },
+        profitAdmission: { chaseRisk: "LOW", riskReward: 6 },
+      }),
+    );
+    expect(narrowStop.routeMode).toBe("DATA_COLLECTION");
+    expect(narrowStop.routeReasonCodes).toContain("PROFIT_STOP_BELOW_EVIDENCE_FLOOR");
+
+    const extremeRr = computeProfitRoute(
+      baseInput({
+        variantConfidenceTier: "usable",
+        expectedNetR: 0.25,
+        cost: { costR: 0.05, spreadR: 0.01, feeSlippageR: 0.04, stopDistanceBps: 600 },
+        profitAdmission: { chaseRisk: "LOW", riskReward: 8.01 },
+      }),
+    );
+    expect(extremeRr.routeMode).toBe("DATA_COLLECTION");
+    expect(extremeRr.routeReasonCodes).toContain("PROFIT_RR_OUTSIDE_EVIDENCE_BAND");
+  });
 });

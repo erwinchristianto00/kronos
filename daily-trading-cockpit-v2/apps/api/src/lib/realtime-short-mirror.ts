@@ -43,6 +43,13 @@ import type { RegimeRotationShortlistReport } from "./regime-rotation-shortlist.
 
 export const REALTIME_SHORT_LANE_VARIANT_ID = "CG_WIDE_FAST_SHORT";
 export const REALTIME_SHORT_SELECTED_LANE_ID = `CG_VARIANT_MATRIX:${REALTIME_SHORT_LANE_VARIANT_ID}`;
+export const PROFIT_CORE_SHORT_TRAIL_LANE_ID = "PROFIT_CORE_SHORT_TRAIL";
+const PROFIT_CORE_SHORT_SYMBOLS = new Set(["BTCUSDT", "INJUSDT", "DOGEUSDT"]);
+const PROFIT_CORE_MIN_STOP_BPS = 500;
+const PROFIT_CORE_MAX_STOP_BPS = 1500;
+const PROFIT_CORE_MIN_RR = 5;
+const PROFIT_CORE_MAX_RR = 8;
+const PROFIT_CORE_MIN_TP_GROSS_PCT = 0.0035;
 const LONG_WIDE_VARIANT_ID = "CG_WIDE_FAST_LONG"; // LONG lane (operator 2026-06-29): fast 0.5R bank, fires only in WIDE_TREND bull
 const MIXED_SYMBOL_BLOCKLIST = new Set(["NEARUSDT"]);
 const DEFAULT_MAX_PER_CYCLE = 3;
@@ -117,6 +124,14 @@ export function isRealtimeShortMirrorEnabled(env: NodeJS.ProcessEnv = process.en
   return env.REALTIME_SHORT_MIRROR_ENABLED === "1";
 }
 
+export function isProfitCoreShortEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.PROFIT_CORE_SHORT_ENABLED === "1";
+}
+
+export function isProfitCoreShortLaneId(laneId: string | null | undefined): boolean {
+  return laneId === PROFIT_CORE_SHORT_TRAIL_LANE_ID;
+}
+
 export interface RealtimeShortCandidate {
   symbol: string;
   direction: "LONG" | "SHORT";
@@ -124,6 +139,16 @@ export interface RealtimeShortCandidate {
   stopLoss: number | null;
   takeProfitLevels: number[];
   stopDistanceBps?: number | null;
+  selectedEntryVariant?: string | null;
+  selectedExitVariant?: string | null;
+  routeMode?: string | null;
+  chaseRisk?: "LOW" | "MEDIUM" | "HIGH" | null;
+  riskReward?: number | null;
+  calibratedExpectedNetR?: number | null;
+  calibrationVerdict?: string | null;
+  whaleSignal?: string | null;
+  sourceConflict?: boolean | null;
+  horizonConflict?: boolean | null;
 }
 
 export type RealtimeShortLaneState = LaneSelectorV2LaneState;
@@ -152,6 +177,12 @@ export interface RealtimeShortMirrorInputs {
   /** Variant ids explicitly picked by the operator allocation selector. Manual-only
    *  high-risk lanes are ignored unless present here. */
   manualEnabledVariantIds?: Set<string>;
+  /** Strict, evidence-derived SHORT lane. Testnet-only eligibility is enforced again in app.ts. */
+  profitCoreShortEnabled?: boolean;
+  /** Unmodified controller values. Manual selector mode may widen the generic selector to BOTH,
+   * but must never bypass the profit-core lane's bearish-only evidence boundary. */
+  profitCoreControllerMode?: string | null;
+  profitCoreEstimatedRegime?: LaneSelectorV2EstimatedRegime | null;
   /** ISO timestamp — injected for determinism/testability. */
   now: string;
   maxPerCycle?: number;
@@ -169,6 +200,42 @@ function isPos(n: number | null | undefined): n is number {
 
 function isMixedSymbolBlocked(symbol: string, estimatedRegime: LaneSelectorV2EstimatedRegime): boolean {
   return estimatedRegime.direction === "MIXED" && MIXED_SYMBOL_BLOCKLIST.has(symbol.toUpperCase());
+}
+
+export function profitCoreShortRejectionReason(
+  candidate: RealtimeShortCandidate,
+  inputs: Pick<RealtimeShortMirrorInputs, "regime" | "controllerMode">,
+  estimatedRegime: LaneSelectorV2EstimatedRegime,
+): string | null {
+  if (candidate.direction !== "SHORT") return "direction_not_short";
+  if (inputs.controllerMode?.toUpperCase() !== "SHORT_ONLY") return "controller_not_short_only";
+  if (estimatedRegime.direction !== "SHORT" || estimatedRegime.policy !== "WIDE_TREND") return "not_extended_short";
+  if (!/bearish pressure/i.test(inputs.regime ?? "")) return "regime_not_bearish_pressure";
+  if (!PROFIT_CORE_SHORT_SYMBOLS.has(candidate.symbol.toUpperCase())) return "symbol_not_profit_core";
+  if (candidate.selectedEntryVariant !== "base_current_entry") return "entry_not_base_current";
+  if (candidate.selectedExitVariant !== "trail_after_tp1") return "exit_not_trail_after_tp1";
+  if (candidate.routeMode !== "PROFIT_CANDIDATE") return "route_not_profit_candidate";
+  if (candidate.chaseRisk !== "LOW") return "entry_chase_not_low";
+  if (candidate.calibrationVerdict !== "CALIBRATED_POSITIVE" || !(Number(candidate.calibratedExpectedNetR) > 0)) {
+    return "calibration_not_positive";
+  }
+  if (candidate.whaleSignal !== "BEARISH") return "whale_not_bearish";
+  if (candidate.sourceConflict === true) return "source_conflict";
+  if (candidate.horizonConflict === true) return "horizon_conflict";
+  const stopBps = candidate.stopDistanceBps;
+  if (!(typeof stopBps === "number" && Number.isFinite(stopBps) && stopBps >= PROFIT_CORE_MIN_STOP_BPS && stopBps <= PROFIT_CORE_MAX_STOP_BPS)) {
+    return "stop_outside_profit_band";
+  }
+  const rr = candidate.riskReward;
+  if (!(typeof rr === "number" && Number.isFinite(rr) && rr >= PROFIT_CORE_MIN_RR && rr <= PROFIT_CORE_MAX_RR)) {
+    return "rr_outside_profit_band";
+  }
+  const entry = candidate.currentPrice;
+  const stop = candidate.stopLoss;
+  const tp1 = candidate.takeProfitLevels[0];
+  if (!(isPos(entry) && isPos(stop) && isPos(tp1) && stop > entry && tp1 < entry)) return "bad_short_geometry";
+  if ((entry - tp1) / entry < PROFIT_CORE_MIN_TP_GROSS_PCT) return "tp_below_cost_buffer";
+  return null;
 }
 
 function effectiveLaneStates(
@@ -264,12 +331,13 @@ export function runRealtimeShortMirror(
     confidence: inputs.controllerConfidence,
   });
   const laneStates = effectiveLaneStates(inputs, estimatedRegime);
+  const profitCoreEnabled = inputs.profitCoreShortEnabled === true;
 
   const hasAnyStableLane = laneStates.some((state) =>
     state.status === "STABLE_CANDIDATE" &&
     isRealtimeShortSelectableVariantId(state.variantId, inputs.manualEnabledVariantIds?.has(state.variantId) === true),
   );
-  if (!hasAnyStableLane && !inputs.rotationShortlist) {
+  if (!hasAnyStableLane && !inputs.rotationShortlist && !profitCoreEnabled) {
     result.reasons.push("stable_lane_inactive");
     return result;
   }
@@ -307,6 +375,32 @@ export function runRealtimeShortMirror(
       result.skipped += 1;
       result.reasons.push(`no_stop:${c.symbol}`);
       continue;
+    }
+    if (profitCoreEnabled) {
+      const profitCoreInputs = {
+        regime: inputs.regime,
+        controllerMode: inputs.profitCoreControllerMode ?? inputs.controllerMode,
+      };
+      const profitCoreEstimatedRegime = inputs.profitCoreEstimatedRegime ?? estimatedRegime;
+      const rejection = profitCoreShortRejectionReason(c, profitCoreInputs, profitCoreEstimatedRegime);
+      if (rejection === null) {
+        const dedupeKey = `PROFITCORE:${c.symbol}:${bucket}`;
+        if (store.hasOrder(dedupeKey)) {
+          result.skipped += 1;
+          result.reasons.push(`duplicate_profit_core:${c.symbol}`);
+          continue;
+        }
+        const paperOrderId = makeRealtimeShortPaperOrderId(c.symbol, inputs.now);
+        store.add(buildProfitCoreShortOrder(
+          c,
+          { ...inputs, controllerMode: profitCoreInputs.controllerMode },
+          dedupeKey,
+          paperOrderId,
+        ));
+        result.emitted += 1;
+        continue;
+      }
+      result.reasons.push(`profit_core_${rejection}:${c.symbol}`);
     }
     const selected = selectLaneV2({
       candidate: {
@@ -356,6 +450,64 @@ export function runRealtimeShortMirror(
     result.emitted += 1;
   }
   return result;
+}
+
+function buildProfitCoreShortOrder(
+  c: RealtimeShortCandidate,
+  inputs: RealtimeShortMirrorInputs,
+  dedupeKey: string,
+  paperOrderId: string,
+): PaperOrder {
+  const now = inputs.now;
+  const entry = c.currentPrice!;
+  const stop = c.stopLoss!;
+  const tp1 = c.takeProfitLevels[0]!;
+  const stopDistanceBps = c.stopDistanceBps!;
+  const plannedRiskAmount = PAPER_EQUITY * 0.01;
+  return {
+    paperOrderId,
+    sourceType: "REALTIME_SHORT_MIRROR",
+    sourceObservationId: dedupeKey,
+    sourceSignalId: null,
+    dedupeKey,
+    createdAt: now,
+    updatedAt: now,
+    openedAt: now,
+    symbol: c.symbol,
+    direction: "SHORT",
+    regime: inputs.regime,
+    controllerMode: inputs.controllerMode ?? "SHORT_ONLY",
+    controllerConfidence: inputs.controllerConfidence ?? null,
+    selectedLaneId: PROFIT_CORE_SHORT_TRAIL_LANE_ID,
+    routerPermission: "HEADLINE",
+    entryPrice: entry,
+    stopLoss: stop,
+    takeProfitLevels: [tp1],
+    // Executable proxy for the research trail: bank half at TP1, then move the remaining half to
+    // breakeven/trail. This is explicit rather than pretending the exchange path is a pure trail.
+    variantExitRule: "scaleout_tp1_trail",
+    fillMode: "taker",
+    plannedStopDistanceBps: stopDistanceBps,
+    riskPctOfEquity: 1,
+    paperEquity: PAPER_EQUITY,
+    plannedRiskAmount,
+    plannedPositionNotional: plannedRiskAmount / (stopDistanceBps / 10_000),
+    plannedRiskR: 1,
+    oosUnconfirmed: false,
+    infraNotReady: false,
+    paperRiskLabel: "EXPERIMENTAL",
+    paperOrderMode: "HEADLINE",
+    operationalSafetyStatus: "OK",
+    diagnosticLabel: null,
+    paperStatus: "CREATED",
+    grossR: null,
+    costR: null,
+    netR: null,
+    netPnlAmount: null,
+    closeReason: null,
+    reportOnly: true,
+    paperOnly: true,
+  };
 }
 
 function buildRealtimeShortOrder(

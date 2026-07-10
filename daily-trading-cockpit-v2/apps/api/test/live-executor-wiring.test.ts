@@ -1,11 +1,19 @@
-import { describe, it, expect } from "vitest";
-import { computeExternalManagedNetQty, isNewExecutorLaneAllowed, type LiveExecutorGateEngine } from "../src/lib/live-executor-wiring.js";
+import { describe, it, expect, afterEach } from "vitest";
+import {
+  computeExternalManagedNetQty,
+  computeNotionalPerSymbol,
+  maxNotionalPerSymbolAcrossLanes,
+  isNewExecutorLaneAllowed,
+  rollingNetEntryHealth,
+  type LiveExecutorGateEngine,
+} from "../src/lib/live-executor-wiring.js";
 import type { CrossSectionalExecutor, ExecutorBasket } from "../src/lib/cross-sectional-executor.js";
 import type { SingleSymbolLaneExecutor, SingleSymbolPosition } from "../src/lib/single-symbol-lane-executor.js";
 
 function fakeEngine(over: Partial<LiveExecutorGateEngine> = {}): LiveExecutorGateEngine {
   return {
     isArmed: () => true,
+    canOpenNewEntries: () => true,
     laneSelectionExplicitlyIncludesLane: () => true,
     laneSelectionAllowsLane: () => true,
     ...over,
@@ -13,16 +21,22 @@ function fakeEngine(over: Partial<LiveExecutorGateEngine> = {}): LiveExecutorGat
 }
 
 describe("isNewExecutorLaneAllowed", () => {
-  it("testnet: allowed once explicitly included, even with no engine.isArmed() requirement", () => {
+  it("testnet: allowed once armed, entry gate open, and explicitly included", () => {
     expect(isNewExecutorLaneAllowed("MY_LANE", "testnet", fakeEngine())).toBe(true);
   });
 
-  it("testnet: still blocked if NOT explicitly included, even though armed is bypassed on testnet", () => {
+  it("testnet: blocked if NOT explicitly included", () => {
     expect(isNewExecutorLaneAllowed("MY_LANE", "testnet", fakeEngine({ laneSelectionExplicitlyIncludesLane: () => false }))).toBe(false);
   });
 
   it("mainnet: blocked when not armed, even if explicitly included", () => {
     expect(isNewExecutorLaneAllowed("MY_LANE", "mainnet", fakeEngine({ isArmed: () => false }))).toBe(false);
+  });
+
+  it("testnet and mainnet: blocked while the shared new-entry gate is closed", () => {
+    const drained = fakeEngine({ canOpenNewEntries: () => false });
+    expect(isNewExecutorLaneAllowed("MY_LANE", "testnet", drained)).toBe(false);
+    expect(isNewExecutorLaneAllowed("MY_LANE", "mainnet", drained)).toBe(false);
   });
 
   it("mainnet: blocked when armed but NOT explicitly included — the core 2026-07-08 audit fix", () => {
@@ -36,6 +50,17 @@ describe("isNewExecutorLaneAllowed", () => {
     expect(isNewExecutorLaneAllowed("MY_LANE", "mainnet", fakeEngine())).toBe(true);
   });
 
+  it("mainnet: unproven executor is testnet-only unless the explicit override is present", () => {
+    const saved = process.env.LIVE_UNPROVEN_EXECUTION_OVERRIDE;
+    delete process.env.LIVE_UNPROVEN_EXECUTION_OVERRIDE;
+    expect(isNewExecutorLaneAllowed("NEW_LANE", "mainnet", fakeEngine(), { mainnetEntryEligible: false })).toBe(false);
+    expect(isNewExecutorLaneAllowed("NEW_LANE", "testnet", fakeEngine(), { mainnetEntryEligible: false })).toBe(true);
+    process.env.LIVE_UNPROVEN_EXECUTION_OVERRIDE = "1";
+    expect(isNewExecutorLaneAllowed("NEW_LANE", "mainnet", fakeEngine(), { mainnetEntryEligible: false })).toBe(true);
+    if (saved === undefined) delete process.env.LIVE_UNPROVEN_EXECUTION_OVERRIDE;
+    else process.env.LIVE_UNPROVEN_EXECUTION_OVERRIDE = saved;
+  });
+
   it("mainnet: blocked when explicitly included but laneSelectionAllowsLane independently refuses (defensive second check)", () => {
     expect(isNewExecutorLaneAllowed("MY_LANE", "mainnet", fakeEngine({ laneSelectionAllowsLane: () => false }))).toBe(false);
   });
@@ -46,6 +71,15 @@ describe("isNewExecutorLaneAllowed", () => {
 
   it("null engine: blocked on testnet too (explicit inclusion defaults to false with no engine)", () => {
     expect(isNewExecutorLaneAllowed("MY_LANE", "testnet", null)).toBe(false);
+  });
+});
+
+describe("rollingNetEntryHealth", () => {
+  it("requires enough recent closes and both short/long rolling averages above zero", () => {
+    expect(rollingNetEntryHealth([0.01, 0.02])).toMatchObject({ allowed: false, shortAvg: null });
+    expect(rollingNetEntryHealth(Array.from({ length: 30 }, () => 0.01))).toMatchObject({ allowed: true });
+    const recentlyToxic = [...Array.from({ length: 22 }, () => 0.01), ...Array.from({ length: 8 }, () => -0.05)];
+    expect(rollingNetEntryHealth(recentlyToxic)).toMatchObject({ allowed: false });
   });
 });
 
@@ -62,9 +96,9 @@ function fakeLeg(symbol: string, side: "LONG" | "SHORT", qty: number, exitOrderI
 function fakeXsecExecutor(baskets: ExecutorBasket[]): CrossSectionalExecutor {
   return { getStatus: () => ({ openBaskets: baskets }) } as unknown as CrossSectionalExecutor;
 }
-function fakePosition(symbol: string, direction: "LONG" | "SHORT", qty: number, exitOrderId: number | null = null): SingleSymbolPosition {
+function fakePosition(symbol: string, direction: "LONG" | "SHORT", qty: number, exitOrderId: number | null = null, entryPrice = 1): SingleSymbolPosition {
   return {
-    positionId: "p1", sourceObservationId: "o1", symbol, direction, qty, entryPrice: 1, entryOrderId: 1,
+    positionId: "p1", sourceObservationId: "o1", symbol, direction, qty, entryPrice, entryOrderId: 1,
     entryPriceConfirmed: true, stopPrice: 1, stopAlgoOrderId: null, stopFailureCount: 0, stopUnprotectedSinceIso: null,
     closeFailureCount: 0, closeFailureSinceIso: null, peakFavorableR: 0, openedAt: "2026-07-08T00:00:00.000Z",
     status: "OPEN", closedAt: null, closeReason: null, exitPrice: null, exitOrderId, exitPriceConfirmed: null,
@@ -107,5 +141,55 @@ describe("computeExternalManagedNetQty", () => {
   it("returns an empty map when everything is null or has no open legs/positions", () => {
     expect(computeExternalManagedNetQty([null, null], [null]).size).toBe(0);
     expect(computeExternalManagedNetQty([fakeXsecExecutor([])], [fakeSingleSymbolExecutor([])]).size).toBe(0);
+  });
+});
+
+describe("computeNotionalPerSymbol (2026-07-09 cross-lane per-symbol notional cap fix)", () => {
+  it("sums notional (qty*entryPrice) UNSIGNED across executors on the SAME symbol — same-direction stacking ADDS, doesn't cancel", () => {
+    // The exact incident: REGIME_COMPOSITE_CONFIRMATION_LONG and COMPOSITE_ESTIMATOR_BIDI_WIDE_LONG
+    // both went LONG on ETHUSDT simultaneously — this must ADD their notional, not net them like
+    // computeExternalManagedNetQty (signed) does for reconcile purposes.
+    const regimeComposite = fakeSingleSymbolExecutor([fakePosition("ETHUSDT", "LONG", 0.085, null, 1755.84)]);
+    const wideLongBucket = fakeSingleSymbolExecutor([fakePosition("ETHUSDT", "LONG", 0.05, null, 1755.84)]);
+    const notional = computeNotionalPerSymbol([regimeComposite, wideLongBucket]);
+    expect(notional.get("ETHUSDT")).toBeCloseTo(0.085 * 1755.84 + 0.05 * 1755.84, 6);
+  });
+
+  it("sums opposite-direction positions on the same symbol as ADDITIONAL exposure, not netted", () => {
+    const longExec = fakeSingleSymbolExecutor([fakePosition("BTCUSDT", "LONG", 1, null, 100)]);
+    const shortExec = fakeSingleSymbolExecutor([fakePosition("BTCUSDT", "SHORT", 1, null, 100)]);
+    const notional = computeNotionalPerSymbol([longExec, shortExec]);
+    expect(notional.get("BTCUSDT")).toBeCloseTo(200, 6); // 100 + 100, NOT 0
+  });
+
+  it("excludes a position whose exit is already in flight (exitOrderId set)", () => {
+    const exec = fakeSingleSymbolExecutor([fakePosition("SOLUSDT", "LONG", 1, 999, 78)]);
+    expect(computeNotionalPerSymbol([exec]).has("SOLUSDT")).toBe(false);
+  });
+
+  it("skips null executor slots and returns an empty map when nothing is open", () => {
+    expect(computeNotionalPerSymbol([null, fakeSingleSymbolExecutor([])]).size).toBe(0);
+  });
+});
+
+describe("maxNotionalPerSymbolAcrossLanes", () => {
+  const key = "LIVE_MAX_NOTIONAL_PER_SYMBOL_ACROSS_LANES";
+  const saved = process.env[key];
+  afterEach(() => {
+    if (saved === undefined) delete process.env[key]; else process.env[key] = saved;
+  });
+
+  it("defaults to 250 and honors a valid positive override", () => {
+    delete process.env[key];
+    expect(maxNotionalPerSymbolAcrossLanes()).toBe(250);
+    process.env[key] = "400";
+    expect(maxNotionalPerSymbolAcrossLanes()).toBe(400);
+  });
+
+  it("ignores a non-positive or garbage override and falls back to the default", () => {
+    process.env[key] = "-10";
+    expect(maxNotionalPerSymbolAcrossLanes()).toBe(250);
+    process.env[key] = "not-a-number";
+    expect(maxNotionalPerSymbolAcrossLanes()).toBe(250);
   });
 });

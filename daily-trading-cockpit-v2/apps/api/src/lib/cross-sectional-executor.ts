@@ -112,13 +112,13 @@ export interface ExecutorLeg {
   side: "LONG" | "SHORT";
   qty: number;
   entryPrice: number;
-  entryOrderId: number;
+  entryOrderId: string;
   /** False when the exchange never confirmed a real fill price (see resolveFillPrice) and
    *  entryPrice fell back to the pre-trade reference price — a signal the recorded entry
    *  may not reflect what actually executed. True is the normal case. */
   entryPriceConfirmed: boolean;
   exitPrice: number | null;
-  exitOrderId: number | null;
+  exitOrderId: string | null;
   /** Same caveat as entryPriceConfirmed, for the exit fill. Null while still open. */
   exitPriceConfirmed: boolean | null;
 }
@@ -169,7 +169,19 @@ export class CrossSectionalExecutorStore {
     try {
       if (existsSync(this.file)) {
         const parsed = JSON.parse(readFileSync(this.file, "utf-8"));
-        if (parsed && Array.isArray(parsed.baskets)) return parsed as ExecutorState;
+        if (parsed && Array.isArray(parsed.baskets)) {
+          // Legacy records persisted before entryOrderId/exitOrderId became strings (see
+          // binance-futures-private.ts's order-ID precision fix) still have these as bare JS
+          // numbers on disk — normalize on load so trade-matching `===` against a freshly
+          // fetched (genuinely string) order id doesn't silently mismatch on type alone.
+          for (const b of parsed.baskets as Array<{ legs?: Array<Record<string, unknown>> }>) {
+            for (const leg of b.legs ?? []) {
+              if (typeof leg.entryOrderId === "number") leg.entryOrderId = String(leg.entryOrderId);
+              if (typeof leg.exitOrderId === "number") leg.exitOrderId = String(leg.exitOrderId);
+            }
+          }
+          return parsed as ExecutorState;
+        }
       }
     } catch {
       // corrupt → fresh (positions reconcile against the exchange on next tick)
@@ -221,6 +233,8 @@ export interface CrossSectionalExecutorOptions {
   /** Lane id this instance reports in getStatus()/laneWeightPct lookups. Defaults to the original
    *  CROSS_SECTIONAL_MARKET_NEUTRAL_LANE_ID (unchanged for the existing FILTERED instance). */
   laneId?: string;
+  /** Rolling evidence gate for NEW baskets. Existing baskets keep closing while this is false. */
+  entryHealthGate?: () => { allowed: boolean; reason: string | null };
 }
 
 export class CrossSectionalExecutor {
@@ -237,6 +251,7 @@ export class CrossSectionalExecutor {
   private lastError: string | null = null;
   private openHalted: string | null = null;
   private readonly dailyMaxLossUsdFn: () => number;
+  private readonly entryHealthGate: () => { allowed: boolean; reason: string | null };
 
   constructor(opts: CrossSectionalExecutorOptions) {
     this.client = opts.client;
@@ -249,6 +264,18 @@ export class CrossSectionalExecutor {
     this.nowIso = opts.nowIso ?? (() => new Date().toISOString());
     this.fillConfirmRetryDelayMs = opts.fillConfirmRetryDelayMs ?? 400;
     this.dailyMaxLossUsdFn = opts.dailyMaxLossUsd ?? XSEC_DAILY_MAX_LOSS_USD;
+    this.entryHealthGate = opts.entryHealthGate ?? (() => ({ allowed: true, reason: null }));
+  }
+
+  private entryHealth(): { allowed: boolean; reason: string | null } {
+    try {
+      const decision = this.entryHealthGate();
+      return decision && typeof decision.allowed === "boolean"
+        ? { allowed: decision.allowed, reason: decision.reason ?? null }
+        : { allowed: false, reason: "invalid cross-sectional entry-health response" };
+    } catch (error) {
+      return { allowed: false, reason: `cross-sectional entry-health failed: ${(error as Error).message}` };
+    }
   }
 
   /** Thin wrapper over the shared resolveConfirmedFillPrice, injecting this executor's
@@ -256,7 +283,7 @@ export class CrossSectionalExecutor {
    *  for why this confirmation step exists (basket xb-mr2x7s6e's real-world avgPrice=0 case). */
   private async resolveFillPrice(
     symbol: string,
-    orderId: number,
+    orderId: string,
     initialAvgPrice: number,
     fallbackPrice: number,
   ): Promise<FillPriceResolution> {
@@ -331,7 +358,7 @@ export class CrossSectionalExecutor {
     const signalMaxAgeMs = MAX_SIGNAL_AGE_MS();
     return {
       enabled: isCrossSectionalExecEnabled(),
-      allowed: this.isAllowed(),
+      allowed: this.isAllowed() && this.entryHealth().allowed,
       laneId: this.laneId,
       legUsd: this.effectiveLegUsd(),
       baseLegUsd: LEG_USD(),
@@ -402,7 +429,12 @@ export class CrossSectionalExecutor {
       await this.closeBasketsHittingProfitTarget();
       await this.closeDueBaskets();
       await this.ensureOpenBasketLeverage();
-      if (this.isAllowed()) await this.maybeOpenBasket();
+      const health = this.entryHealth();
+      if (!health.allowed) {
+        this.openHalted = health.reason ?? "rolling evidence gate blocked new baskets";
+      } else if (this.isAllowed()) {
+        await this.maybeOpenBasket();
+      }
       this.lastError = null;
     } catch (error) {
       this.lastError = (error as Error).message ?? "tick failed";
@@ -512,6 +544,7 @@ export class CrossSectionalExecutor {
 
   private async closeBasket(basket: ExecutorBasket, reason: string): Promise<void> {
     const failures: string[] = [];
+    let staleBookReconciled = false;
     for (const leg of basket.legs) {
       if (leg.exitOrderId !== null) continue; // already closed (retry path)
       const exitSide = leg.side === "LONG" ? "SELL" : "BUY";
@@ -537,14 +570,45 @@ export class CrossSectionalExecutor {
         leg.exitPrice = resolved.price;
         leg.exitPriceConfirmed = resolved.confirmed;
       } catch (error) {
+        const message = (error as Error).message;
+        if (reduceOnly && /(?:code\s*)?-2022|ReduceOnly Order is rejected/i.test(message)) {
+          try {
+            const positions = await this.client.getPositions(leg.symbol);
+            const positionAmt = positions.find((position) => position.symbol === leg.symbol)?.positionAmt ?? 0;
+            const expectedSign = leg.side === "LONG" ? 1 : -1;
+            // The exchange no longer carries enough same-side quantity for this book leg. Retrying
+            // without reduceOnly would CREATE opposite exposure. Reconcile as ABORTED (no invented
+            // P&L), continue flattening every other real leg, and remove the stale claim safely.
+            if (Math.abs(positionAmt) <= 1e-9 || Math.sign(positionAmt) !== expectedSign) {
+              leg.exitOrderId = "POSITION_ALREADY_FLAT";
+              leg.exitPrice = null;
+              leg.exitPriceConfirmed = false;
+              staleBookReconciled = true;
+              this.store.save();
+              continue;
+            }
+          } catch {
+            // Position lookup failed: preserve the original error/retry behavior below.
+          }
+        }
         // Keep attempting the REMAINING legs — aborting mid-loop leaves more naked exposure
         // stuck open than closing what we can. The basket stays OPEN and retries next tick.
-        failures.push(`${leg.symbol}: ${(error as Error).message}`);
+        failures.push(`${leg.symbol}: ${message}`);
       }
       this.store.save(); // persist per leg so a crash/retry mid-close can resume
     }
     if (failures.length > 0) {
       throw new Error(`basket ${basket.basketId} close incomplete, ${failures.length} leg(s) failed: ${failures[0]}`);
+    }
+    if (staleBookReconciled) {
+      basket.status = "ABORTED";
+      basket.closedAt = this.nowIso();
+      basket.closeReason = `RECONCILED_POSITION_ALREADY_FLAT:${reason}`;
+      basket.grossPnlUsd = null;
+      basket.feeEstimateUsd = null;
+      basket.netPnlUsd = null;
+      this.store.save();
+      return;
     }
     // Finalize P&L from the STORED per-leg prices, not a loop-local accumulator: on a retry after
     // a partial close, the already-exited legs are skipped above, and the old accumulator silently

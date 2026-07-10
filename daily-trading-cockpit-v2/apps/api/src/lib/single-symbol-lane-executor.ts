@@ -122,12 +122,12 @@ export interface SingleSymbolPosition {
   direction: "LONG" | "SHORT";
   qty: number;
   entryPrice: number;
-  entryOrderId: number;
+  entryOrderId: string;
   entryPriceConfirmed: boolean;
   stopPrice: number;
   /** Exchange-side protective stop algo order id. Null only in the brief window between a
    *  confirmed entry and the stop placement succeeding — see ensureStopOrder(). */
-  stopAlgoOrderId: number | null;
+  stopAlgoOrderId: string | null;
   /** Consecutive ensureStopOrder() failures (resets to 0 on success). A position with this > 0
    *  AND stopAlgoOrderId still null is genuinely unprotected right now, not just "about to be
    *  protected next tick" — surfaced via getStatus().unprotectedPositions so a stuck-for-hours
@@ -148,7 +148,7 @@ export interface SingleSymbolPosition {
   closedAt: string | null;
   closeReason: string | null;
   exitPrice: number | null;
-  exitOrderId: number | null;
+  exitOrderId: string | null;
   exitPriceConfirmed: boolean | null;
   grossPnlUsd: number | null;
   feeEstimateUsd: number | null;
@@ -159,6 +159,16 @@ interface SingleSymbolExecutorState {
   version: number;
   positions: SingleSymbolPosition[];
   lastSeenSignalMs: number;
+  /** 2026-07-09 fix: per-signal dedup by observationId, bounded to the most recent 500. Replaces
+   *  lastSeenSignalMs-only filtering for candidate selection, which had a real incident: when
+   *  several signals share the EXACT SAME openedAtMs (e.g. a regime-level gate that can fire on
+   *  multiple symbols in one cycle), attempting the FIRST one advanced the scalar watermark past
+   *  that shared timestamp regardless of whether the attempt actually opened a position (a
+   *  MIN_NOTIONAL-rejected entry still advanced it) — silently and PERMANENTLY excluding every
+   *  OTHER signal sharing that timestamp, since "equal to the watermark" no longer counts as
+   *  "newer". Optional for backward compatibility with state files persisted before this field
+   *  existed (`?? []` at every read site). */
+  attemptedObservationIds?: string[];
 }
 
 export class SingleSymbolLaneExecutorStore {
@@ -179,7 +189,20 @@ export class SingleSymbolLaneExecutorStore {
     try {
       if (existsSync(this.file)) {
         const parsed = JSON.parse(readFileSync(this.file, "utf-8"));
-        if (parsed && Array.isArray(parsed.positions)) return parsed as SingleSymbolExecutorState;
+        if (parsed && Array.isArray(parsed.positions)) {
+          // Legacy records persisted before entryOrderId/stopAlgoOrderId/exitOrderId became
+          // strings (see binance-futures-private.ts's order-ID precision fix) still have these
+          // as bare JS numbers on disk — JSON.parse doesn't know about the TS type, so it would
+          // silently load them as `number`, and every trade-matching `===` against a freshly
+          // fetched (genuinely string) order id would then always be false. Normalize on load so
+          // the runtime value matches the type everywhere downstream.
+          for (const p of parsed.positions as Array<Record<string, unknown>>) {
+            if (typeof p.entryOrderId === "number") p.entryOrderId = String(p.entryOrderId);
+            if (typeof p.stopAlgoOrderId === "number") p.stopAlgoOrderId = String(p.stopAlgoOrderId);
+            if (typeof p.exitOrderId === "number") p.exitOrderId = String(p.exitOrderId);
+          }
+          return parsed as SingleSymbolExecutorState;
+        }
       }
     } catch {
       // corrupt → fresh (positions reconcile against the exchange on next tick)
@@ -225,6 +248,28 @@ export interface SingleSymbolLaneExecutorOptions {
   dailyMaxLossUsd?: () => number;
   nowIso?: () => string;
   fillConfirmRetryDelayMs?: number;
+  /** 2026-07-09 fix: current notional (USD) already committed to a symbol by OTHER lane
+   *  instances (this instance's OWN open positions must NOT be included — the caller computes
+   *  this across the OTHER executors, since this one's own admission is already naturally
+   *  bounded by maxOpenPositions). Paired with maxNotionalPerSymbolAcrossLanes below. Without
+   *  this, independently-admitted lanes on the same symbol each size purely from their own
+   *  legUsd with zero awareness of what other lanes already committed — confirmed live
+   *  (REGIME_COMPOSITE_CONFIRMATION_LONG + COMPOSITE_ESTIMATOR_BIDI's WIDE_LONG/FAST_LONG all
+   *  independently going LONG on the same BTC/ETH/SOL universe). Defaults to () => 0 (no other
+   *  lane's exposure known / not wired). */
+  existingNotionalForSymbol?: (symbol: string) => number;
+  /** 0 (default) = no cap. A fresh entry whose notional, ADDED to existingNotionalForSymbol's
+   *  reading for that symbol, would exceed this is skipped (not resized) — same
+   *  skip-not-silently-resize convention as every other admission gate here. Checked BEFORE
+   *  marking the signal's observationId as attempted, unlike the structural minQty/minNotional
+   *  checks above it: this constraint is TRANSIENT (another lane's position on the symbol may
+   *  close by the next tick, freeing capacity), so the same signal deserves another chance next
+   *  tick rather than being permanently blacklisted. */
+  maxNotionalPerSymbolAcrossLanes?: () => number;
+  /** Public-market reference used to reject a signal after price already chased its edge. */
+  currentPrice?: (symbol: string) => Promise<number | null>;
+  /** Maximum favorable drift since the signal, measured in entry-to-stop R. */
+  maxEntryChaseStopFraction?: () => number;
 }
 
 const TAKER_FEE_RATE = 0.0005; // 5 bps per side, conservative
@@ -245,9 +290,14 @@ export class SingleSymbolLaneExecutor {
   private readonly dailyMaxLossUsdFn: () => number;
   private readonly nowIso: () => string;
   private readonly fillConfirmRetryDelayMs: number;
+  private readonly existingNotionalForSymbolFn: (symbol: string) => number;
+  private readonly maxNotionalPerSymbolAcrossLanesFn: () => number;
+  private readonly currentPriceFn: ((symbol: string) => Promise<number | null>) | null;
+  private readonly maxEntryChaseStopFractionFn: () => number;
   private ticking = false;
   private lastError: string | null = null;
   private openHalted: string | null = null;
+  private lastEntrySkipReason: string | null = null;
 
   constructor(opts: SingleSymbolLaneExecutorOptions) {
     this.client = opts.client;
@@ -265,9 +315,16 @@ export class SingleSymbolLaneExecutor {
     this.dailyMaxLossUsdFn = opts.dailyMaxLossUsd ?? (() => 0);
     this.nowIso = opts.nowIso ?? (() => new Date().toISOString());
     this.fillConfirmRetryDelayMs = opts.fillConfirmRetryDelayMs ?? 400;
+    this.existingNotionalForSymbolFn = opts.existingNotionalForSymbol ?? (() => 0);
+    this.maxNotionalPerSymbolAcrossLanesFn = opts.maxNotionalPerSymbolAcrossLanes ?? (() => 0);
+    this.currentPriceFn = opts.currentPrice ?? null;
+    this.maxEntryChaseStopFractionFn = opts.maxEntryChaseStopFraction ?? (() => {
+      const n = Number.parseFloat(process.env.LIVE_MAX_ENTRY_CHASE_STOP_FRACTION ?? "");
+      return Number.isFinite(n) && n >= 0 ? n : 0.2;
+    });
   }
 
-  private async resolveFillPrice(symbol: string, orderId: number, initialAvgPrice: number, fallbackPrice: number) {
+  private async resolveFillPrice(symbol: string, orderId: string, initialAvgPrice: number, fallbackPrice: number) {
     return resolveConfirmedFillPrice(this.client, symbol, orderId, initialAvgPrice, fallbackPrice, {
       retryDelayMs: this.fillConfirmRetryDelayMs,
       onUnconfirmed: (sym, id, fallback) =>
@@ -311,6 +368,7 @@ export class SingleSymbolLaneExecutor {
     dailyRealizedUsd: number;
     dailyMaxLossUsd: number;
     openHalted: string | null;
+    lastEntrySkipReason: string | null;
     openPositions: SingleSymbolPosition[];
     closedCount: number;
     totalNetPnlUsd: number;
@@ -340,6 +398,7 @@ export class SingleSymbolLaneExecutor {
       dailyRealizedUsd: this.dailyRealizedUsd(this.nowIso()),
       dailyMaxLossUsd: this.dailyMaxLossUsdFn(),
       openHalted: this.openHalted,
+      lastEntrySkipReason: this.lastEntrySkipReason,
       openPositions: open,
       closedCount: closed.length,
       totalNetPnlUsd: closed.reduce((s, p) => s + (p.netPnlUsd ?? 0), 0),
@@ -389,6 +448,26 @@ export class SingleSymbolLaneExecutor {
     return this.store.getState().positions.filter((p) => p.status === "CLOSED");
   }
 
+  /** Operator-triggered manual close (dashboard "Close now" button on the single-symbol-executor
+   *  panel) — always allowed regardless of isAllowed()/armed state, same posture as
+   *  live-execution-engine.ts's manualCloseIntent(): a risk-reducing action must never be blocked
+   *  by the entry gate. Reuses closePosition() itself, so it gets the exact same battle-tested
+   *  path the exit policy uses (cancel resting stop, market reduceOnly with -2022 fallback,
+   *  confirmed fill via getUserTrades, honest fee-adjusted P&L). */
+  async manualClosePosition(positionId: string): Promise<{ ok: boolean; reason: string | null; netPnlUsd: number | null }> {
+    const pos = this.store.getState().positions.find((p) => p.positionId === positionId && p.status === "OPEN");
+    if (!pos) return { ok: false, reason: `no open position ${positionId} (already closed or unknown)`, netPnlUsd: null };
+    if (pos.exitOrderId !== null) {
+      return { ok: false, reason: "close already in flight for this position — wait for it to settle", netPnlUsd: null };
+    }
+    try {
+      await this.closePosition(pos, "MANUAL_CLOSE");
+      return { ok: true, reason: null, netPnlUsd: pos.netPnlUsd };
+    } catch (error) {
+      return { ok: false, reason: (error as Error).message, netPnlUsd: null };
+    }
+  }
+
   /** Single-flight tick: settle stop-triggered/policy-decided exits, then consider a new entry. */
   async tick(): Promise<void> {
     if (this.ticking) return;
@@ -408,7 +487,7 @@ export class SingleSymbolLaneExecutor {
    *  Authoritative: uses Binance's own trade records, never a guessed fill price. */
   private async settleIfStopTriggered(pos: SingleSymbolPosition): Promise<boolean> {
     if (pos.stopAlgoOrderId === null) return false;
-    let actualOrderId: number | null = null;
+    let actualOrderId: string | null = null;
     try {
       const algo = await this.client.queryAlgoOrder(pos.stopAlgoOrderId);
       actualOrderId = algo.actualOrderId;
@@ -538,7 +617,19 @@ export class SingleSymbolLaneExecutor {
       });
       pos.peakFavorableR = decision.nextPeakFavorableR;
       stamped = true;
-      if (decision.shouldExit) await this.closePosition(pos, decision.reason ?? "POLICY_EXIT");
+      if (decision.shouldExit) {
+        try {
+          await this.closePosition(pos, decision.reason ?? "POLICY_EXIT");
+        } catch (error) {
+          // 2026-07-10 fix: closePosition() already recorded closeFailureCount/closeFailureSinceIso
+          // and re-throws to signal "not closed, retry next tick" — but letting that throw escape
+          // THIS loop would abort monitorOpenPositions for every position LATER in openPositions
+          // this same tick, silently starving their TP/giveback checks for as long as this one
+          // keeps failing. Every REGIME_COMPOSITE_CONFIRMATION_LONG / COMPOSITE_ESTIMATOR_BIDI_*
+          // instance runs with maxOpenPositions > 1, so this is a real, not hypothetical, hazard.
+          this.lastError = (error as Error).message;
+        }
+      }
     }
     if (stamped) this.store.save();
   }
@@ -590,6 +681,13 @@ export class SingleSymbolLaneExecutor {
     } catch (error) {
       pos.closeFailureCount += 1;
       if (pos.closeFailureSinceIso === null) pos.closeFailureSinceIso = this.nowIso();
+      // 2026-07-10 fix: the protective stop was already (attempted-)cancelled above, unconditionally,
+      // before this close attempt — if the close itself then fails, leaving stopAlgoOrderId pointing
+      // at that now-cancelled order silently hides the position from getStatus().unprotectedPositions
+      // (which requires stopAlgoOrderId === null) and stops ensureStopOrder() from ever replacing it
+      // (it only acts when null). Reset it so both self-heal on the next tick — worst case a harmless
+      // redundant stop placement attempt, never a silently-unprotected position.
+      pos.stopAlgoOrderId = null;
       this.store.save();
       throw new Error(
         `position ${pos.positionId} close failed, attempt ${pos.closeFailureCount} since ` +
@@ -622,75 +720,121 @@ export class SingleSymbolLaneExecutor {
       }
     }
     this.openHalted = null;
-    if (st.positions.filter((p) => p.status === "OPEN").length >= this.maxOpenPositionsFn()) return;
 
     const nowMs = new Date(this.nowIso()).getTime();
+    const attempted = new Set(st.attemptedObservationIds ?? []);
     const candidates = this.getOpenSignals()
-      .filter((s) => s.openedAtMs > st.lastSeenSignalMs && nowMs - s.openedAtMs <= this.maxSignalAgeMsFn())
+      .filter((s) => !attempted.has(s.observationId) && nowMs - s.openedAtMs <= this.maxSignalAgeMsFn())
       .sort((a, b) => b.openedAtMs - a.openedAtMs);
-    const signal = candidates[0];
-    if (!signal) return;
+    this.lastEntrySkipReason = null;
 
-    // Watermark BEFORE placing orders: a failed entry must not retry forever on the same signal.
-    st.lastSeenSignalMs = signal.openedAtMs;
-    this.store.save();
+    // Loop (not just candidates[0]): a regime-level gate can legitimately fire on several symbols
+    // in the SAME cycle (unlike a per-symbol technical trigger, which rarely does) — attempt every
+    // fresh candidate up to remaining capacity in ONE tick rather than trickling one in per 5-min
+    // tick. See the state interface's doc comment for the incident this (plus per-observationId
+    // dedup) fixes.
+    for (const signal of candidates) {
+      if (st.positions.filter((p) => p.status === "OPEN").length >= this.maxOpenPositionsFn()) break;
 
-    const legUsd = this.effectiveLegUsd();
-    if (!(legUsd > 0)) return;
-    if (!(signal.entryPrice > 0)) return;
-    const filters = await this.client.getExchangeFilters();
-    const f = filters.get(signal.symbol);
-    if (!f) return;
-    const rawQty = legUsd / signal.entryPrice;
-    const qty = Number((Math.floor(rawQty / f.stepSize) * f.stepSize).toFixed(8));
-    if (!(qty >= f.minQty)) return;
-    if (!(qty * signal.entryPrice >= f.minNotional)) return; // Binance rejects an order that clears minQty but misses MIN_NOTIONAL
+      if (this.currentPriceFn) {
+        const currentPrice = await this.currentPriceFn(signal.symbol).catch(() => null);
+        const risk = Math.abs(signal.entryPrice - signal.stopPrice);
+        if (!(currentPrice !== null && currentPrice > 0) || !(risk > 0)) {
+          this.lastEntrySkipReason = `${signal.symbol}: live price/risk unavailable for entry-quality gate`;
+          continue;
+        }
+        const favorableDriftR = this.direction === "LONG"
+          ? (currentPrice - signal.entryPrice) / risk
+          : (signal.entryPrice - currentPrice) / risk;
+        const stopCrossed = this.direction === "LONG"
+          ? currentPrice <= signal.stopPrice
+          : currentPrice >= signal.stopPrice;
+        const chaseLimit = this.maxEntryChaseStopFractionFn();
+        if (stopCrossed || favorableDriftR > chaseLimit) {
+          this.lastEntrySkipReason = stopCrossed
+            ? `${signal.symbol}: signal invalidated because live price crossed its stop`
+            : `${signal.symbol}: entry chase ${favorableDriftR.toFixed(2)}R exceeds ${chaseLimit.toFixed(2)}R`;
+          continue;
+        }
+      }
 
-    const positionId = `ssl-${this.laneId.slice(0, 4).toLowerCase()}-${signal.openedAtMs.toString(36)}`;
-    try {
-      await this.client.setLeverage(signal.symbol, this.leverageFn());
-    } catch {
-      // best-effort (already set / position exists)
+      // 2026-07-09 fix: cap combined notional across ALL lanes for this symbol — checked FIRST,
+      // before marking attempted. Unlike the structural checks below (bad price, fails
+      // minQty/minNotional — permanent for this exact signal), this constraint is TRANSIENT:
+      // another lane's position on the symbol may close by the next tick, freeing capacity, so
+      // this same signal deserves another chance rather than being permanently blacklisted.
+      // Uses legUsd as the notional estimate (the exact post-stepSize qty*price isn't known
+      // yet) — close enough for a safety-net cap, not a precision requirement.
+      const notionalCap = this.maxNotionalPerSymbolAcrossLanesFn();
+      if (notionalCap > 0 && this.existingNotionalForSymbolFn(signal.symbol) + this.effectiveLegUsd() > notionalCap) {
+        continue;
+      }
+
+      // Mark attempted BEFORE placing orders: a failed/rejected entry must not retry forever on
+      // the same signal. Bounded — this is a dedup set, not a growing audit log.
+      attempted.add(signal.observationId);
+      st.attemptedObservationIds = Array.from(attempted).slice(-500);
+      this.store.save();
+
+      const legUsd = this.effectiveLegUsd();
+      if (!(legUsd > 0)) continue;
+      if (!(signal.entryPrice > 0)) continue;
+      const filters = await this.client.getExchangeFilters();
+      const f = filters.get(signal.symbol);
+      if (!f) continue;
+      const rawQty = legUsd / signal.entryPrice;
+      const qty = Number((Math.floor(rawQty / f.stepSize) * f.stepSize).toFixed(8));
+      if (!(qty >= f.minQty)) continue;
+      if (!(qty * signal.entryPrice >= f.minNotional)) continue; // Binance rejects an order that clears minQty but misses MIN_NOTIONAL
+
+      // Symbol fragment keeps this unique even when 2+ candidates share the identical openedAtMs
+      // (the exact scenario that exposed the dedup bug above).
+      const positionId = `ssl-${this.laneId.slice(0, 4).toLowerCase()}-${signal.symbol.slice(0, 3).toLowerCase()}-${signal.openedAtMs.toString(36)}`;
+      try {
+        await this.client.setLeverage(signal.symbol, this.leverageFn());
+      } catch {
+        // best-effort (already set / position exists)
+      }
+      const order = await this.client.placeOrder({
+        symbol: signal.symbol,
+        side: this.direction === "LONG" ? "BUY" : "SELL",
+        type: "MARKET",
+        quantity: qty,
+        newClientOrderId: `ssle-${positionId.slice(-18)}-e`,
+      });
+      const resolvedEntry = await this.resolveFillPrice(signal.symbol, order.orderId, order.avgPrice, signal.entryPrice);
+      const position: SingleSymbolPosition = {
+        positionId,
+        sourceObservationId: signal.observationId,
+        symbol: signal.symbol,
+        direction: this.direction,
+        qty,
+        entryPrice: resolvedEntry.price,
+        entryOrderId: order.orderId,
+        entryPriceConfirmed: resolvedEntry.confirmed,
+        stopPrice: signal.stopPrice,
+        stopAlgoOrderId: null,
+        stopFailureCount: 0,
+        stopUnprotectedSinceIso: null,
+        closeFailureCount: 0,
+        closeFailureSinceIso: null,
+        peakFavorableR: 0,
+        openedAt: this.nowIso(),
+        status: "OPEN",
+        closedAt: null,
+        closeReason: null,
+        exitPrice: null,
+        exitOrderId: null,
+        exitPriceConfirmed: null,
+        grossPnlUsd: null,
+        feeEstimateUsd: null,
+        netPnlUsd: null,
+      };
+      st.positions.push(position);
+      this.store.save();
+      // Protective stop placed on the VERY NEXT tick (ensureStopOrder, called at the top of
+      // monitorOpenPositions) rather than inline here — keeps entry and stop-placement failure
+      // handling in ONE place (ensureStopOrder's retry-until-success loop) instead of two.
     }
-    const order = await this.client.placeOrder({
-      symbol: signal.symbol,
-      side: this.direction === "LONG" ? "BUY" : "SELL",
-      type: "MARKET",
-      quantity: qty,
-      newClientOrderId: `ssle-${positionId.slice(-18)}-e`,
-    });
-    const resolvedEntry = await this.resolveFillPrice(signal.symbol, order.orderId, order.avgPrice, signal.entryPrice);
-    const position: SingleSymbolPosition = {
-      positionId,
-      sourceObservationId: signal.observationId,
-      symbol: signal.symbol,
-      direction: this.direction,
-      qty,
-      entryPrice: resolvedEntry.price,
-      entryOrderId: order.orderId,
-      entryPriceConfirmed: resolvedEntry.confirmed,
-      stopPrice: signal.stopPrice,
-      stopAlgoOrderId: null,
-      stopFailureCount: 0,
-      stopUnprotectedSinceIso: null,
-      closeFailureCount: 0,
-      closeFailureSinceIso: null,
-      peakFavorableR: 0,
-      openedAt: this.nowIso(),
-      status: "OPEN",
-      closedAt: null,
-      closeReason: null,
-      exitPrice: null,
-      exitOrderId: null,
-      exitPriceConfirmed: null,
-      grossPnlUsd: null,
-      feeEstimateUsd: null,
-      netPnlUsd: null,
-    };
-    st.positions.push(position);
-    this.store.save();
-    // Protective stop placed on the VERY NEXT tick (ensureStopOrder, called at the top of
-    // monitorOpenPositions) rather than inline here — keeps entry and stop-placement failure
-    // handling in ONE place (ensureStopOrder's retry-until-success loop) instead of two.
   }
 }

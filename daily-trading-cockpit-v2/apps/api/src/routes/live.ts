@@ -10,7 +10,7 @@ import type { FastifyInstance } from "fastify";
 import type { LiveExecutionEngine } from "../lib/live-execution-engine.js";
 import { type CrossSectionalExecutor } from "../lib/cross-sectional-executor.js";
 import type { SingleSymbolLaneExecutor } from "../lib/single-symbol-lane-executor.js";
-import type { RegimeAutopilot } from "../lib/regime-autopilot.js";
+import { REGIME_AUTOPILOT_PRESETS, type RegimeAutopilot } from "../lib/regime-autopilot.js";
 
 type LiveAccountSnapshot = Awaited<ReturnType<LiveExecutionEngine["getAccountSnapshot"]>>;
 
@@ -223,6 +223,53 @@ export function mergeCrossSectionalIntoLaneSeries(
   return report;
 }
 
+export type SingleSymbolLanePositionRow = {
+  laneId: string;
+  positionId: string;
+  symbol: string;
+  direction: "LONG" | "SHORT";
+  qty: number;
+  entryPrice: number;
+  stopPrice: number;
+  markPrice: number | null;
+  unrealizedPnl: number | null;
+  peakFavorableR: number;
+  openedAt: string;
+};
+
+/** One row per lane's OWN open position (2026-07-10: operator wants to inspect/close each lane's
+ *  position on a symbol independently — two lanes holding the same symbol net into one exchange
+ *  position but can have very different track records/protection, e.g. a proven-ish
+ *  trailing-protected lane vs an unproven fixed-target lane with none). Unlike
+ *  annotateSingleSymbolAccount (which sums across lanes into the netted-position view), this never
+ *  aggregates — every open SingleSymbolPosition across every executor gets its own row. */
+export function flattenSingleSymbolPositions(
+  executors: SingleSymbolLaneExecutor[],
+  markBySymbol: Map<string, number>,
+): SingleSymbolLanePositionRow[] {
+  return executors.flatMap((exec) => {
+    const laneId = exec.getStatus().laneId;
+    return exec.getStatus().openPositions.map((p) => {
+      const markPrice = markBySymbol.get(p.symbol) ?? null;
+      const dir = p.direction === "LONG" ? 1 : -1;
+      const unrealizedPnl = markPrice !== null ? (markPrice - p.entryPrice) * p.qty * dir : null;
+      return {
+        laneId,
+        positionId: p.positionId,
+        symbol: p.symbol,
+        direction: p.direction,
+        qty: p.qty,
+        entryPrice: p.entryPrice,
+        stopPrice: p.stopPrice,
+        markPrice,
+        unrealizedPnl,
+        peakFavorableR: p.peakFavorableR,
+        openedAt: p.openedAt,
+      };
+    });
+  });
+}
+
 /** Single-symbol-executor analog of annotateCrossSectionalAccount above — same rationale (a
  *  position opened by SHORT_FADE_EXHAUSTION/INTRADAY_MOMENTUM_BREAKOUT is NOT an engine intent, so
  *  without this its real fill would show up as an "unattributed" exchange position and its banked
@@ -413,6 +460,14 @@ export async function registerLiveRoutes(
     // Same optional/independent contract as the cross-sectional getters above.
     shortFadeExecutor?: () => SingleSymbolLaneExecutor | null;
     intradayMomentumExecutor?: () => SingleSymbolLaneExecutor | null;
+    // 2026-07-09: REGIME_COMPOSITE_CONFIRMATION_LONG. Same optional/independent contract.
+    regimeCompositeExecutor?: () => SingleSymbolLaneExecutor | null;
+    // 2026-07-09: COMPOSITE_ESTIMATOR_BIDI's 4 buckets. Same optional/independent contract.
+    compositeEstimatorWideLongExecutor?: () => SingleSymbolLaneExecutor | null;
+    compositeEstimatorWideShortExecutor?: () => SingleSymbolLaneExecutor | null;
+    compositeEstimatorFastLongExecutor?: () => SingleSymbolLaneExecutor | null;
+    compositeEstimatorFastShortExecutor?: () => SingleSymbolLaneExecutor | null;
+    panicWashoutExecutor?: () => SingleSymbolLaneExecutor | null;
     regimeAutopilot?: () => RegimeAutopilot | null;
   } = {},
 ): Promise<void> {
@@ -421,9 +476,16 @@ export async function registerLiveRoutes(
       (exec): exec is CrossSectionalExecutor => exec !== null,
     );
   const allSingleSymbolExecutors = () =>
-    [opts.shortFadeExecutor?.() ?? null, opts.intradayMomentumExecutor?.() ?? null].filter(
-      (exec): exec is SingleSymbolLaneExecutor => exec !== null,
-    );
+    [
+      opts.shortFadeExecutor?.() ?? null,
+      opts.intradayMomentumExecutor?.() ?? null,
+      opts.regimeCompositeExecutor?.() ?? null,
+      opts.compositeEstimatorWideLongExecutor?.() ?? null,
+      opts.compositeEstimatorWideShortExecutor?.() ?? null,
+      opts.compositeEstimatorFastLongExecutor?.() ?? null,
+      opts.compositeEstimatorFastShortExecutor?.() ?? null,
+      opts.panicWashoutExecutor?.() ?? null,
+    ].filter((exec): exec is SingleSymbolLaneExecutor => exec !== null);
   app.get("/api/live/status", async () => {
     if (!engine) {
       return {
@@ -460,6 +522,28 @@ export async function registerLiveRoutes(
     }
     engine.disarm("manual disarm via /api/live/disarm");
     return { ok: true, armed: engine.isArmed() };
+  });
+
+  // Drain NEW entries without disabling reconciliation, protective exits, TP/SL, or policy closes.
+  // This is deliberately separate from disarm: the engine can remain armed as an exit manager.
+  app.post("/api/live/new-entry-drain", async (request, reply) => {
+    if (!engine) {
+      reply.code(503);
+      return { ok: false, reason: "live execution disabled" };
+    }
+    const body = (request.body ?? {}) as { enabled?: unknown; confirm?: unknown; reason?: unknown };
+    if (typeof body.enabled !== "boolean" || body.confirm !== "DRAIN") {
+      reply.code(400);
+      return { ok: false, reason: 'body must be {"enabled":true|false,"confirm":"DRAIN","reason":"optional"}' };
+    }
+    return {
+      ok: true,
+      ...engine.setNewEntriesPaused(
+        body.enabled,
+        typeof body.reason === "string" && body.reason.trim() ? body.reason.trim() : "operator request",
+      ),
+      armed: engine.isArmed(),
+    };
   });
 
   // RECEIVER (runs on the MAINNET instance): open an exact copy of a testnet
@@ -601,6 +685,89 @@ export async function registerLiveRoutes(
     return result;
   });
 
+  // Flat per-lane-position list for the "Single-symbol executor — stop-protected" panel
+  // (2026-07-10: operator wants to see and close each lane's OWN position on a symbol separately —
+  // two lanes independently holding the same symbol net into one exchange position, but they can
+  // have very different track records/risk profiles, e.g. a proven-ish trailing-protected lane vs
+  // an unproven fixed-target lane with zero interim protection). One entry per open
+  // SingleSymbolPosition, tagged with its owning laneId, merged with the current markPrice from the
+  // account snapshot (never a second, possibly-stale price source).
+  app.get("/api/live/single-symbol/positions", async (_request, reply) => {
+    if (!engine) {
+      reply.code(503);
+      return { ok: false, reason: "live execution disabled" };
+    }
+    try {
+      const snapshot = await engine.getAccountSnapshot();
+      const markBySymbol = new Map(
+        snapshot.positions.filter((p) => p.markPrice !== null).map((p) => [p.symbol, p.markPrice as number]),
+      );
+      const rows = flattenSingleSymbolPositions(allSingleSymbolExecutors(), markBySymbol);
+      return { ok: true, positions: rows };
+    } catch (err) {
+      reply.code(502);
+      return { ok: false, reason: err instanceof Error ? err.message : "single-symbol positions fetch failed" };
+    }
+  });
+
+  // Operator close of single-symbol-lane-executor position(s) — the "Single-symbol executor —
+  // stop-protected" panel's per-row "Close now" button (2026-07-10, urgent operator ask). Body
+  // {"positionId":"…","confirm":"CLOSE"} closes ONE specific lane's position — the operator asked
+  // for this after noticing two lanes on the same symbol can have very different track
+  // records/protection. Body {"symbol":"…","confirm":"CLOSE"} (legacy, still supported) closes ALL
+  // open positions for that symbol across every single-symbol-lane-executor instance (SHORT_FADE_
+  // EXHAUSTION_CROWDED, INTRADAY_MOMENTUM_BREAKOUT_LONG, REGIME_COMPOSITE_CONFIRMATION_LONG,
+  // COMPOSITE_ESTIMATOR_BIDI_* x4, PANIC_WASHOUT_RECLAIM_LONG) — a symbol row is the SUM across
+  // however many of these lanes independently hold that symbol (Binance nets same-symbol positions
+  // per account). Either path reuses manualClosePosition()'s exact same reduceOnly-with-fallback
+  // path the exit policy uses, sized to ONLY that lane's own tracked qty — never touches basket legs
+  // or directional-intent qty on the same symbol from other books.
+  app.post("/api/live/single-symbol/close", async (request, reply) => {
+    const body = (request.body ?? {}) as { symbol?: string; positionId?: string; confirm?: string };
+    if (body.confirm !== "CLOSE") {
+      reply.code(400);
+      return { ok: false, reason: 'closing requires body {"confirm":"CLOSE","positionId":"…"} or {"confirm":"CLOSE","symbol":"…"} — this places a REAL market order' };
+    }
+    if (typeof body.positionId === "string" && body.positionId.length > 0) {
+      const owner = allSingleSymbolExecutors().find((exec) =>
+        exec.getStatus().openPositions.some((p) => p.positionId === body.positionId),
+      );
+      if (!owner) {
+        reply.code(404);
+        return { ok: false, reason: `no open single-symbol-executor position ${body.positionId}` };
+      }
+      const result = await owner.manualClosePosition(body.positionId);
+      if (!result.ok) reply.code(409);
+      return result;
+    }
+    if (typeof body.symbol !== "string" || body.symbol.length === 0) {
+      reply.code(400);
+      return { ok: false, reason: "positionId or symbol required" };
+    }
+    const matches = allSingleSymbolExecutors().flatMap((exec) =>
+      exec.getStatus().openPositions
+        .filter((p) => p.symbol === body.symbol)
+        .map((p) => ({ exec, positionId: p.positionId })),
+    );
+    if (matches.length === 0) {
+      reply.code(404);
+      return { ok: false, reason: `no open single-symbol-executor position for ${body.symbol}` };
+    }
+    const results: Array<{ ok: boolean; reason: string | null; netPnlUsd: number | null }> = [];
+    for (const { exec, positionId } of matches) {
+      results.push(await exec.manualClosePosition(positionId));
+    }
+    const anyFailed = results.some((r) => !r.ok);
+    if (anyFailed) reply.code(409);
+    return {
+      ok: !anyFailed,
+      reason: anyFailed ? (results.find((r) => !r.ok)?.reason ?? "one or more closes failed") : null,
+      closedCount: results.filter((r) => r.ok).length,
+      netPnlUsd: results.reduce((sum, r) => sum + (r.netPnlUsd ?? 0), 0),
+      results,
+    };
+  });
+
   // Cross-sectional executor status (testnet-first basket execution of the measured lane).
   app.get("/api/live/cross-sectional-executor", async () => {
     const executor = opts.crossSectionalExecutor?.() ?? null;
@@ -642,6 +809,37 @@ export async function registerLiveRoutes(
     }
     return executor.getStatus();
   });
+  // 2026-07-09: REGIME_COMPOSITE_CONFIRMATION_LONG executor status.
+  app.get("/api/live/regime-composite-executor", async () => {
+    const executor = opts.regimeCompositeExecutor?.() ?? null;
+    if (!executor) {
+      return { enabled: false, reason: "REGIME_COMPOSITE_CONFIRMATION_LONG executor disabled (set REGIME_COMPOSITE_EXEC_ENABLED=1 + live execution env)" };
+    }
+    return executor.getStatus();
+  });
+  app.get("/api/live/panic-washout-executor", async () => {
+    const executor = opts.panicWashoutExecutor?.() ?? null;
+    if (!executor) {
+      return { enabled: false, reason: "PANIC_WASHOUT_RECLAIM_LONG executor disabled (set PANIC_WASHOUT_EXEC_ENABLED=1 + live execution env)" };
+    }
+    return executor.getStatus();
+  });
+  // 2026-07-09: COMPOSITE_ESTIMATOR_BIDI executor status, one per bucket.
+  const compositeEstimatorBucketRoutes: Array<[string, () => SingleSymbolLaneExecutor | null]> = [
+    ["wide-long", () => opts.compositeEstimatorWideLongExecutor?.() ?? null],
+    ["wide-short", () => opts.compositeEstimatorWideShortExecutor?.() ?? null],
+    ["fast-long", () => opts.compositeEstimatorFastLongExecutor?.() ?? null],
+    ["fast-short", () => opts.compositeEstimatorFastShortExecutor?.() ?? null],
+  ];
+  for (const [slug, getExecutor] of compositeEstimatorBucketRoutes) {
+    app.get(`/api/live/composite-estimator-${slug}-executor`, async () => {
+      const executor = getExecutor();
+      if (!executor) {
+        return { enabled: false, reason: `COMPOSITE_ESTIMATOR_BIDI ${slug} executor disabled (set COMPOSITE_ESTIMATOR_EXEC_ENABLED=1 + live execution env)` };
+      }
+      return executor.getStatus();
+    });
+  }
 
   // Regime auto-pilot status (Tier 1: auto-syncs allocation to detected regime, anti-whipsaw).
   app.get("/api/live/autopilot", async () => {
@@ -651,6 +849,15 @@ export async function registerLiveRoutes(
     }
     return pilot.getStatus();
   });
+
+  // 2026-07-09 fix: the "Regime Engine → Lane Tree" dashboard panel used to hardcode its own COPY
+  // of REGIME_AUTOPILOT_PRESETS (apps/web's REGIME_TREE constant) so the "Apply preset" buttons
+  // could prefill the allocation form — a real incident: editing the backend preset (removing
+  // CG_WIDE_FAST_SHORT after it was proven a real-money loss driver) left the dashboard's copy
+  // stale, so the button still showed/would-have-applied the OLD (cut) lane. Serving the actual
+  // constant here (pure static data, no pilot instance needed) lets the frontend render the TRUE
+  // current preset and eliminates the possibility of the two ever drifting apart again.
+  app.get("/api/live/regime-presets", async () => REGIME_AUTOPILOT_PRESETS);
 
   // WEIGHTED lane allocation (manual intervention: e.g. lane1 70% / lane2 30%).
   // Takes precedence over /api/live/lanes while set. Body:

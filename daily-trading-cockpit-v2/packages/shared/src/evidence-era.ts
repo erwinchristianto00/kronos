@@ -24,7 +24,7 @@ export type EvidenceEra =
   | "UNKNOWN";
 
 /** Bumped whenever decision-policy changes meaningfully. Stamped on every new plan. */
-export const CURRENT_DECISION_POLICY_VERSION = "calibrated-expectancy-v1";
+export const CURRENT_DECISION_POLICY_VERSION = "profit-focused-admission-v2";
 
 /** The era that all new records are emitted under. */
 export const CURRENT_EVIDENCE_ERA: EvidenceEra = "POST_CALIBRATION";

@@ -58,33 +58,49 @@ export interface LaneAllocationEntry {
  * brand-new execution pathway than the fully-concentrated confirmed-trend presets.
  */
 export const REGIME_AUTOPILOT_PRESETS: Record<string, LaneAllocationEntry[]> = {
-  // Confirmed bear trend: fast-bank SHORT + a protected runner for the moves that go further +
-  // systematic cross-sectional trend-following + market-neutral ballast (no single lane at 100%).
+  // Confirmed bear trend: protected runner + systematic cross-sectional trend-following +
+  // market-neutral ballast.
+  // 2026-07-09 (operator: "masih rugi" — real-data review): CG_WIDE_FAST_SHORT REMOVED. 135 closed
+  // live trades, 30% win rate, -$7.93 net — the single biggest realized-loss lane on the account,
+  // despite being the lane earlier assumed "proven" (see the 2026-07-08 comment this replaces, and
+  // task history: it had already displaced CG_WIDE_STOP_TP_WIDE as "the" short lane once). The data
+  // now says neither short lane earns its keep; freed weight goes to market-neutral (the one lane
+  // that's actually been net positive at 75-80%+ win rates). See regime-autopilot.test.ts and
+  // realtime-short-mirror.ts's REALTIME_SHORT_FORCE_FAST_SHORT env flag (disabled the same day) for
+  // the other half of this cut — this preset change alone doesn't stop it; that flag does.
   BEAR_TREND: [
-    { laneId: "CG_WIDE_FAST_SHORT", weightPct: 35 },
     { laneId: "CG_MFE_GIVEBACK", weightPct: 15 },
-    { laneId: "CROSS_SECTIONAL_TREND", weightPct: 20 },
-    { laneId: "CROSS_SECTIONAL_MARKET_NEUTRAL", weightPct: 30 },
+    { laneId: "CROSS_SECTIONAL_TREND", weightPct: 25 },
+    { laneId: "CROSS_SECTIONAL_MARKET_NEUTRAL", weightPct: 60 },
   ],
   // Choppy/defensive bear — NOT a confirmed trend: fast-bank short + the RSI-exhaustion fade (new,
   // unproven — modest slot) + cross-sectional mean-reversion (fits chop) + market-neutral ballast.
   // No let-it-run lanes (they rarely reach their far target in chop; see the 2026-07-08 review).
+  // 2026-07-09: PANIC_WASHOUT_RECLAIM_LONG added (10% slot) — a capitulation dip-buy bounce is a
+  // natural countertrend play in a choppy/defensive bear regime specifically (not a confirmed
+  // trend), same "modest slot, never-before-executed lane" placement convention as
+  // SHORT_FADE_EXHAUSTION_CROWDED above.
+  // Same-day: CG_WIDE_FAST_SHORT REMOVED (see BEAR_TREND's comment above for the real-data reason —
+  // 135 trades, 30% WR, -$7.93 net) — freed weight goes to market-neutral ballast.
   BEARISH_CHOPPY_DEFENSIVE: [
-    { laneId: "CG_WIDE_FAST_SHORT", weightPct: 35 },
     { laneId: "SHORT_FADE_EXHAUSTION_CROWDED", weightPct: 15 },
+    { laneId: "PANIC_WASHOUT_RECLAIM_LONG", weightPct: 10 },
     { laneId: "CROSS_SECTIONAL_MIXED", weightPct: 20 },
-    { laneId: "CROSS_SECTIONAL_MARKET_NEUTRAL", weightPct: 30 },
+    { laneId: "CROSS_SECTIONAL_MARKET_NEUTRAL", weightPct: 55 },
   ],
   // No directional conviction → pure market-neutral (the proven all-weather edge).
   NO_TRADE: [{ laneId: "CROSS_SECTIONAL_MARKET_NEUTRAL", weightPct: 100 }],
   // Early recovery, not yet trend-confirmed: fast-bank long + the breakout-momentum hunter (new,
   // unproven — modest slot) + cross-sectional mean-reversion (still tactical/choppy) + market-neutral
   // ballast.
+  // 2026-07-09: PANIC_WASHOUT_RECLAIM_LONG added here too (same 10%-from-ballast trim) — an early
+  // recovery is exactly where a capitulation-then-reclaim bounce is most plausible.
   NEUTRAL_RECOVERY: [
     { laneId: "CG_WIDE_FAST_LONG", weightPct: 35 },
     { laneId: "INTRADAY_MOMENTUM_BREAKOUT_LONG", weightPct: 15 },
+    { laneId: "PANIC_WASHOUT_RECLAIM_LONG", weightPct: 10 },
     { laneId: "CROSS_SECTIONAL_MIXED", weightPct: 20 },
-    { laneId: "CROSS_SECTIONAL_MARKET_NEUTRAL", weightPct: 30 },
+    { laneId: "CROSS_SECTIONAL_MARKET_NEUTRAL", weightPct: 20 },
   ],
   // Confirmed strong trend: fast-bank + full-commit runner (no protection until the 3R target/stop)
   // + protected runner (same 3R target, banks a faded winner past 0.75R) + systematic cross-sectional

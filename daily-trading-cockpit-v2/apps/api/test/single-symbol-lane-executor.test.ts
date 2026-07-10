@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { rmSync } from "node:fs";
+import { rmSync, mkdirSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import os from "node:os";
 
@@ -51,7 +51,7 @@ function signal(over: Partial<SingleSymbolFreshSignal> = {}): SingleSymbolFreshS
 class FakeClient implements SingleSymbolExecClient {
   placed: PlaceOrderParams[] = [];
   algosPlaced: PlaceAlgoOrderParams[] = [];
-  algosCancelled: number[] = [];
+  algosCancelled: string[] = [];
   failOnSymbol: string | null = null;
   failAlgoOnce = false;
   /** Reject the NEXT reduceOnly placeOrder call with the given Binance error code (e.g. -2022),
@@ -64,12 +64,12 @@ class FakeClient implements SingleSymbolExecClient {
   markPriceBySymbol = new Map<string, number>();
   queryOrderAvgPriceBySymbol = new Map<string, number>();
   /** algoId -> actualOrderId (null = still resting/not triggered). */
-  algoTriggeredOrderId = new Map<number, number | null>();
-  userTradesByOrderId = new Map<number, FuturesUserTrade>();
+  algoTriggeredOrderId = new Map<string, string | null>();
+  userTradesByOrderId = new Map<string, FuturesUserTrade>();
   private orderSeq = 100;
   private algoSeq = 900;
 
-  private buildOrder(symbol: string, side: "BUY" | "SELL", quantity: number, reduceOnly: boolean | undefined, orderId: number, avgPrice: number): FuturesOrder {
+  private buildOrder(symbol: string, side: "BUY" | "SELL", quantity: number, reduceOnly: boolean | undefined, orderId: string, avgPrice: number): FuturesOrder {
     return {
       symbol, orderId, clientOrderId: "", status: avgPrice > 0 ? "FILLED" : "NEW", type: "MARKET", side,
       reduceOnly: Boolean(reduceOnly), price: 0, stopPrice: 0, origQty: quantity,
@@ -104,11 +104,11 @@ class FakeClient implements SingleSymbolExecClient {
       throw new BinanceFuturesPrivateError("binance_error", `Binance error HTTP 400 code ${code}: ReduceOnly Order is rejected.`, { httpStatus: 400, binanceCode: code });
     }
     this.placed.push(params);
-    const orderId = this.orderSeq++;
+    const orderId = String(this.orderSeq++);
     const avgPrice = this.fillPriceBySymbol.get(params.symbol) ?? 0;
     return this.buildOrder(params.symbol, params.side, params.quantity, params.reduceOnly, orderId, avgPrice);
   }
-  async queryOrder(symbol: string, orderId: number): Promise<FuturesOrder> {
+  async queryOrder(symbol: string, orderId: string): Promise<FuturesOrder> {
     const avgPrice = this.queryOrderAvgPriceBySymbol.get(symbol) ?? 0;
     return this.buildOrder(symbol, "BUY", 0, false, orderId, avgPrice);
   }
@@ -118,21 +118,21 @@ class FakeClient implements SingleSymbolExecClient {
       throw new Error("algo order rejected (transient)");
     }
     this.algosPlaced.push(params);
-    const algoId = this.algoSeq++;
+    const algoId = String(this.algoSeq++);
     this.algoTriggeredOrderId.set(algoId, null); // resting by default
     return {
       symbol: params.symbol, algoId, clientAlgoId: params.clientAlgoId ?? "", algoStatus: "WORKING",
       orderType: params.type, side: params.side, quantity: params.quantity, triggerPrice: params.triggerPrice, actualOrderId: null,
     };
   }
-  async queryAlgoOrder(algoId: number): Promise<FuturesAlgoOrder> {
+  async queryAlgoOrder(algoId: string): Promise<FuturesAlgoOrder> {
     const actualOrderId = this.algoTriggeredOrderId.get(algoId) ?? null;
     return {
       symbol: "BTCUSDT", algoId, clientAlgoId: "", algoStatus: actualOrderId !== null ? "EXECUTED" : "WORKING",
       orderType: "STOP_MARKET", side: "BUY", quantity: 0, triggerPrice: 0, actualOrderId,
     };
   }
-  async cancelAlgoOrder(algoId: number): Promise<void> {
+  async cancelAlgoOrder(algoId: string): Promise<void> {
     this.algosCancelled.push(algoId);
   }
   async getUserTrades(_symbol: string): Promise<FuturesUserTrade[]> {
@@ -140,7 +140,7 @@ class FakeClient implements SingleSymbolExecClient {
   }
 
   /** Test helper: mark a previously-placed algo stop as having triggered a real fill. */
-  triggerAlgo(algoId: number, actualOrderId: number, realizedPnl: number, commission: number, price: number, qty = 1): void {
+  triggerAlgo(algoId: string, actualOrderId: string, realizedPnl: number, commission: number, price: number, qty = 1): void {
     this.algoTriggeredOrderId.set(algoId, actualOrderId);
     this.userTradesByOrderId.set(actualOrderId, {
       symbol: "BTCUSDT", orderId: actualOrderId, price, qty, realizedPnl, commission, commissionAsset: "USDT", time: NOW_MS,
@@ -158,11 +158,13 @@ function makeExecutor(opts: {
   maxOpenPositions?: number;
   dailyMaxLossUsd?: number;
   exitPolicy?: ReturnType<typeof makeFixedRewardExitPolicy>;
+  existingNotionalForSymbol?: (symbol: string) => number;
+  maxNotionalPerSymbolAcrossLanes?: number;
+  currentPrice?: number | null;
 } = {}) {
   const client = opts.client ?? new FakeClient();
   const storeDir = tmpDir();
   const store = new SingleSymbolLaneExecutorStore(storeDir, "test.json");
-  store.getState().lastSeenSignalMs = NOW_MS - 3_600_000;
   const signals = opts.signals ?? [];
   const executor = new SingleSymbolLaneExecutor({
     client,
@@ -179,6 +181,9 @@ function makeExecutor(opts: {
     dailyMaxLossUsd: () => opts.dailyMaxLossUsd ?? 0,
     nowIso: () => NOW,
     fillConfirmRetryDelayMs: 0,
+    existingNotionalForSymbol: opts.existingNotionalForSymbol ?? (() => 0),
+    maxNotionalPerSymbolAcrossLanes: () => opts.maxNotionalPerSymbolAcrossLanes ?? 0,
+    ...(opts.currentPrice !== undefined ? { currentPrice: async () => opts.currentPrice! } : {}),
   });
   return { executor, client, store, storeDir };
 }
@@ -279,10 +284,47 @@ describe("SingleSymbolLaneExecutor — entry", () => {
     expect(store.getState().positions.length).toBe(0);
   });
 
-  it("ignores a signal at/below the watermark (already claimed)", async () => {
-    const { executor, store } = makeExecutor({ signals: [signal({ openedAtMs: NOW_MS - 3_600_000 - 1 })] });
+  it("[DEDUP] does not re-attempt the same observationId across ticks even when capacity is available", async () => {
+    // Regression for the 2026-07-09 incident: getOpenSignals() keeps returning the SAME still-OPEN
+    // signal every tick until the measurement lane resolves it upstream — the executor's own
+    // per-observationId dedup (not a coarse timestamp watermark) must be what stops it from
+    // opening a 2nd position on the identical signal.
+    const { executor, store } = makeExecutor({ signals: [signal()], legUsd: 10_000, maxOpenPositions: 5 });
     await executor.tick();
-    expect(store.getState().positions.length).toBe(0);
+    expect(store.getState().positions.length).toBe(1);
+    await executor.tick();
+    await executor.tick();
+    expect(store.getState().positions.length).toBe(1);
+  });
+
+  it("[INCIDENT 2026-07-09] one signal that can't be filled (no exchange filters) must not silently block OTHER signals sharing the identical openedAtMs", async () => {
+    // The real bug: 3 signals recorded in the same regime-composite cycle share one openedAtMs.
+    // The old code advanced a single scalar watermark to that shared timestamp the moment ANY one
+    // of them was attempted — including one this executor can't actually fill (no exchange filter
+    // for its symbol) — which then excluded every OTHER signal at that same timestamp forever
+    // (equal-to-watermark isn't "newer"). Per-observationId dedup fixes this: only the ATTEMPTED
+    // signal is excluded, not everything sharing its timestamp.
+    const sharedMs = NOW_MS - 2 * 60_000;
+    const failing = signal({ observationId: "rc:UNKNOWNUSDT:1", symbol: "UNKNOWNUSDT", openedAtMs: sharedMs });
+    const ok1 = signal({ observationId: "rc:BTCUSDT:1", symbol: "BTCUSDT", openedAtMs: sharedMs });
+    const ok2 = signal({ observationId: "rc:ETHUSDT:1", symbol: "ETHUSDT", entryPrice: 3000, stopPrice: 3090, openedAtMs: sharedMs });
+    const { executor, store } = makeExecutor({ signals: [failing, ok1, ok2], legUsd: 10_000, maxOpenPositions: 5 });
+    await executor.tick();
+    const opened = store.getState().positions.map((p) => p.symbol);
+    expect(opened).toContain("BTCUSDT");
+    expect(opened).toContain("ETHUSDT");
+    expect(opened).not.toContain("UNKNOWNUSDT");
+    expect(store.getState().positions.length).toBe(2);
+  });
+
+  it("distinct positionIds when 2 candidates share the identical openedAtMs (the exact collision the dedup fix also closes)", async () => {
+    const sharedMs = NOW_MS - 2 * 60_000;
+    const ok1 = signal({ observationId: "rc:BTCUSDT:1", symbol: "BTCUSDT", openedAtMs: sharedMs });
+    const ok2 = signal({ observationId: "rc:ETHUSDT:1", symbol: "ETHUSDT", entryPrice: 3000, stopPrice: 3090, openedAtMs: sharedMs });
+    const { executor, store } = makeExecutor({ signals: [ok1, ok2], legUsd: 10_000, maxOpenPositions: 5 });
+    await executor.tick();
+    const ids = store.getState().positions.map((p) => p.positionId);
+    expect(new Set(ids).size).toBe(ids.length);
   });
 
   it("does not open when isAllowed() is false", async () => {
@@ -291,10 +333,80 @@ describe("SingleSymbolLaneExecutor — entry", () => {
     expect(store.getState().positions.length).toBe(0);
   });
 
+  describe("[2026-07-09 fix] cross-lane per-symbol notional cap", () => {
+    it("with no cap set (default 0), behaves exactly as before — opens regardless of existingNotionalForSymbol", async () => {
+      const { executor, store } = makeExecutor({
+        signals: [signal()],
+        legUsd: 100,
+        existingNotionalForSymbol: () => 999_999, // huge — must NOT matter, cap is 0/off
+      });
+      await executor.tick();
+      expect(store.getState().positions.length).toBe(1);
+    });
+
+    it("skips a fresh entry that would push combined notional (existing + this entry's legUsd) over the cap", async () => {
+      const { executor, store } = makeExecutor({
+        signals: [signal()], // BTCUSDT, entryPrice 60000 by default
+        legUsd: 100,
+        existingNotionalForSymbol: (symbol) => (symbol === "BTCUSDT" ? 200 : 0),
+        maxNotionalPerSymbolAcrossLanes: 250, // 200 + 100 = 300 > 250 -> reject
+      });
+      await executor.tick();
+      expect(store.getState().positions.length).toBe(0);
+    });
+
+    it("opens when combined notional stays within the cap", async () => {
+      const { executor, store } = makeExecutor({
+        signals: [signal()],
+        legUsd: 100,
+        existingNotionalForSymbol: (symbol) => (symbol === "BTCUSDT" ? 100 : 0),
+        maxNotionalPerSymbolAcrossLanes: 250, // 100 + 100 = 200 <= 250 -> allowed
+      });
+      await executor.tick();
+      expect(store.getState().positions.length).toBe(1);
+    });
+
+    it("[TRANSIENT] a cap-rejected signal is NOT permanently blacklisted — it retries and succeeds once another lane's exposure (simulated) frees up", async () => {
+      let otherLaneNotional = 300; // starts over cap
+      const signals = [signal()];
+      const { executor, store } = makeExecutor({
+        signals,
+        legUsd: 100,
+        existingNotionalForSymbol: () => otherLaneNotional,
+        maxNotionalPerSymbolAcrossLanes: 250,
+      });
+      await executor.tick(); // rejected: 300 + 100 > 250
+      expect(store.getState().positions.length).toBe(0);
+      otherLaneNotional = 50; // the other lane's position closed, freeing capacity
+      await executor.tick(); // SAME signal (same observationId), now 50 + 100 <= 250 -> must succeed
+      expect(store.getState().positions.length).toBe(1);
+    });
+
+    it("only applies the cap to the fresh entry's OWN symbol, not universe-wide", async () => {
+      const signals = [signal({ observationId: "sf:ETHUSDT:1", symbol: "ETHUSDT", entryPrice: 3000, stopPrice: 3090 })];
+      const { executor, store } = makeExecutor({
+        signals,
+        legUsd: 100,
+        existingNotionalForSymbol: (symbol) => (symbol === "BTCUSDT" ? 999_999 : 0), // BTC is maxed out, ETH is not
+        maxNotionalPerSymbolAcrossLanes: 250,
+      });
+      await executor.tick();
+      expect(store.getState().positions.length).toBe(1);
+      expect(store.getState().positions[0]!.symbol).toBe("ETHUSDT");
+    });
+  });
+
   it("does not open when 0% allocation weight zeroes legUsd", async () => {
     const { executor, store } = makeExecutor({ signals: [signal()], laneWeightPct: 0 });
     await executor.tick();
     expect(store.getState().positions.length).toBe(0);
+  });
+
+  it("rejects a short signal after price has already moved more than 0.2R favorably", async () => {
+    const { executor, store } = makeExecutor({ signals: [signal()], currentPrice: 59_000 });
+    await executor.tick();
+    expect(store.getState().positions.length).toBe(0);
+    expect(executor.getStatus().lastEntrySkipReason).toMatch(/entry chase/);
   });
 
   it("respects maxOpenPositions (default 1): a 2nd fresh signal doesn't open a 2nd position while one is already open", async () => {
@@ -345,7 +457,7 @@ describe("SingleSymbolLaneExecutor — exits", () => {
     await executor.tick(); // place stop
     const pos = store.getState().positions[0]!;
     const algoId = pos.stopAlgoOrderId!;
-    client.triggerAlgo(algoId, 5555, -1.8, 0.05, 61800, pos.qty); // a real stop-out fill: -1.8 gross, 0.05 fee
+    client.triggerAlgo(algoId, "5555", -1.8, 0.05, 61800, pos.qty); // a real stop-out fill: -1.8 gross, 0.05 fee
     client.markPriceBySymbol.set("BTCUSDT", 61800); // irrelevant once settled via trades
     await executor.tick();
     const closed = store.getState().positions[0]!;
@@ -367,17 +479,17 @@ describe("SingleSymbolLaneExecutor — exits", () => {
     const algoId = pos.stopAlgoOrderId!;
     // Mark the algo as triggered, but do NOT register any matching trade yet (simulates the
     // timing race right after a stop fires, before Binance's trade record is queryable).
-    client.algoTriggeredOrderId.set(algoId, 5555);
+    client.algoTriggeredOrderId.set(algoId, "5555");
     await executor.tick();
     const stillOpen = store.getState().positions[0]!;
     expect(stillOpen.status).toBe("OPEN"); // NOT closed — no fabricated 0/0/0 P&L
     expect(stillOpen.grossPnlUsd).toBeNull();
     expect(stillOpen.netPnlUsd).toBeNull();
-    expect(stillOpen.exitOrderId).toBe(5555); // exit marked in-flight so the policy path can't double-close
+    expect(stillOpen.exitOrderId).toBe("5555"); // exit marked in-flight so the policy path can't double-close
 
     // Next tick, the trade record becomes available — settlement completes honestly.
-    client.userTradesByOrderId.set(5555, {
-      symbol: "BTCUSDT", orderId: 5555, price: 61800, qty: pos.qty, realizedPnl: -1.8, commission: 0.05, commissionAsset: "USDT", time: NOW_MS,
+    client.userTradesByOrderId.set("5555", {
+      symbol: "BTCUSDT", orderId: "5555", price: 61800, qty: pos.qty, realizedPnl: -1.8, commission: 0.05, commissionAsset: "USDT", time: NOW_MS,
     });
     await executor.tick();
     const closed = store.getState().positions[0]!;
@@ -408,10 +520,10 @@ describe("SingleSymbolLaneExecutor — exits", () => {
     // Seed a closed loss for today exceeding the limit.
     store.getState().positions.push({
       positionId: "seed", sourceObservationId: "seed", symbol: "BTCUSDT", direction: "SHORT", qty: 0.001,
-      entryPrice: 100, entryOrderId: 1, entryPriceConfirmed: true, stopPrice: 103, stopAlgoOrderId: null,
+      entryPrice: 100, entryOrderId: "1", entryPriceConfirmed: true, stopPrice: 103, stopAlgoOrderId: null,
       stopFailureCount: 0, stopUnprotectedSinceIso: null, closeFailureCount: 0, closeFailureSinceIso: null,
       peakFavorableR: 0, openedAt: NOW, status: "CLOSED", closedAt: NOW, closeReason: "INITIAL_STOP",
-      exitPrice: 103, exitOrderId: 2, exitPriceConfirmed: true, grossPnlUsd: -2, feeEstimateUsd: 0.1, netPnlUsd: -2.1,
+      exitPrice: 103, exitOrderId: "2", exitPriceConfirmed: true, grossPnlUsd: -2, feeEstimateUsd: 0.1, netPnlUsd: -2.1,
     });
     await executor.tick();
     expect(store.getState().positions.filter((p) => p.status === "OPEN").length).toBe(0);
@@ -501,6 +613,148 @@ describe("SingleSymbolLaneExecutor — exits", () => {
     expect(pos.stopUnprotectedSinceIso).toBeNull();
     expect(executor.getStatus().unprotectedPositions.length).toBe(0);
   });
+
+  it("[HAZARD-1 FIX] a stuck close on one position does not block a sibling position's exit-policy check in the same tick", async () => {
+    const client = new FakeClient();
+    const btcSignal = signal({ observationId: "sf:BTCUSDT:1", symbol: "BTCUSDT", entryPrice: 60000, stopPrice: 61800 });
+    const ethSignal = signal({ observationId: "sf:ETHUSDT:1", symbol: "ETHUSDT", entryPrice: 3000, stopPrice: 3090 });
+    const { executor, store } = makeExecutor({ client, signals: [btcSignal, ethSignal], legUsd: 10_000, maxOpenPositions: 2 });
+    await executor.tick(); // opens both
+    await executor.tick(); // places both stops
+    expect(store.getState().positions.filter((p) => p.status === "OPEN").length).toBe(2);
+
+    // Both at 0.5R favorable for their SHORT direction -> TP_HIT for both.
+    client.markPriceBySymbol.set("BTCUSDT", 59000);
+    client.markPriceBySymbol.set("ETHUSDT", 2950);
+    client.failOnSymbol = "BTCUSDT"; // ONLY BTCUSDT's close fails; ETHUSDT's must still go through
+    await executor.tick();
+
+    const btc = store.getState().positions.find((p) => p.symbol === "BTCUSDT")!;
+    const eth = store.getState().positions.find((p) => p.symbol === "ETHUSDT")!;
+    expect(btc.status).toBe("OPEN"); // stuck, retrying next tick
+    expect(btc.closeFailureCount).toBe(1);
+    // Before the fix, BTCUSDT's uncaught throw (it's earlier in the array) would have aborted
+    // monitorOpenPositions' loop before ETHUSDT was ever evaluated this tick.
+    expect(eth.status).toBe("CLOSED");
+    expect(eth.closeReason).toBe("TP_HIT");
+  });
+
+  it("[HAZARD-2 FIX] a failed close resets stopAlgoOrderId so ensureStopOrder replaces it next tick (self-heals)", async () => {
+    const client = new FakeClient();
+    const { executor, store } = makeExecutor({ client, signals: [signal()], legUsd: 10_000 });
+    await executor.tick(); // open
+    await executor.tick(); // place stop
+    expect(store.getState().positions[0]!.stopAlgoOrderId).not.toBeNull();
+
+    client.markPriceBySymbol.set("BTCUSDT", 59000); // TP_HIT
+    client.failAllPlaceOrders = true; // close fails
+    await executor.tick();
+    let pos = store.getState().positions[0]!;
+    expect(pos.status).toBe("OPEN");
+    // Reset by the fix — NOT left pointing at the stop that was already cancelled moments earlier
+    // in the same closePosition() call.
+    expect(pos.stopAlgoOrderId).toBeNull();
+    // stopFailureCount is still 0 here (ensureStopOrder hasn't been retried yet this tick) — this is
+    // "about to self-heal," not yet a confirmed-stuck alert.
+    expect(executor.getStatus().unprotectedPositions.length).toBe(0);
+
+    client.failAllPlaceOrders = false; // let the close succeed once ensureStopOrder has run
+    const algosPlacedBefore = client.algosPlaced.length;
+    await executor.tick();
+    expect(client.algosPlaced.length).toBe(algosPlacedBefore + 1); // replacement stop was placed
+    pos = store.getState().positions[0]!;
+    expect(pos.status).toBe("CLOSED"); // TP_HIT still holds, close now succeeds
+  });
+
+  it("[HAZARD-2 FIX] when the replacement stop ALSO fails, the position is correctly flagged unprotected (previously stopAlgoOrderId never went null, so this alert could never fire)", async () => {
+    const client = new FakeClient();
+    const { executor, store } = makeExecutor({ client, signals: [signal()], legUsd: 10_000 });
+    await executor.tick();
+    await executor.tick();
+    client.markPriceBySymbol.set("BTCUSDT", 59000);
+    client.failAllPlaceOrders = true;
+    await executor.tick(); // close fails -> stopAlgoOrderId reset to null
+    expect(store.getState().positions[0]!.stopAlgoOrderId).toBeNull();
+
+    client.placeAlgoOrder = async () => { throw new Error("algo rejected (persistent)"); };
+    await executor.tick(); // ensureStopOrder's replacement attempt ALSO fails
+    const pos = store.getState().positions[0]!;
+    expect(pos.stopAlgoOrderId).toBeNull();
+    expect(pos.stopFailureCount).toBe(1);
+    expect(executor.getStatus().unprotectedPositions.length).toBe(1);
+    expect(executor.getStatus().unprotectedPositions[0]!.symbol).toBe("BTCUSDT");
+  });
+});
+
+describe("SingleSymbolLaneExecutor — manualClosePosition (2026-07-10 urgent close-now button)", () => {
+  it("closes an OPEN position via reduceOnly market order, cancelling the resting stop first", async () => {
+    const client = new FakeClient();
+    const { executor, store } = makeExecutor({ client, signals: [signal()], legUsd: 10_000 });
+    await executor.tick(); // open
+    await executor.tick(); // place stop
+    const pos = store.getState().positions[0]!;
+    const algoId = pos.stopAlgoOrderId!;
+    client.fillPriceBySymbol.set("BTCUSDT", 60500); // small favorable move for the SHORT, well below TP_HIT
+    const result = await executor.manualClosePosition(pos.positionId);
+    expect(result.ok).toBe(true);
+    expect(result.reason).toBeNull();
+    expect(client.algosCancelled).toContain(algoId);
+    expect(client.placed.some((p) => p.reduceOnly === true)).toBe(true);
+    const closed = store.getState().positions[0]!;
+    expect(closed.status).toBe("CLOSED");
+    expect(closed.closeReason).toBe("MANUAL_CLOSE");
+    expect(result.netPnlUsd).toBe(closed.netPnlUsd);
+  });
+
+  it("rejects an unknown positionId", async () => {
+    const { executor } = makeExecutor({ signals: [] });
+    const result = await executor.manualClosePosition("does-not-exist");
+    expect(result.ok).toBe(false);
+    expect(result.reason).toMatch(/no open position/);
+    expect(result.netPnlUsd).toBeNull();
+  });
+
+  it("rejects a position that is already CLOSED", async () => {
+    const client = new FakeClient();
+    const { executor, store } = makeExecutor({ client, signals: [signal()], legUsd: 10_000 });
+    await executor.tick();
+    await executor.tick();
+    const pos = store.getState().positions[0]!;
+    await executor.manualClosePosition(pos.positionId); // closes it
+    expect(store.getState().positions[0]!.status).toBe("CLOSED");
+    const second = await executor.manualClosePosition(pos.positionId);
+    expect(second.ok).toBe(false);
+    expect(second.reason).toMatch(/no open position/);
+  });
+
+  it("refuses to double-close a position whose exit is already in flight (exitOrderId set)", async () => {
+    const client = new FakeClient();
+    const { executor, store } = makeExecutor({ client, signals: [signal()], legUsd: 10_000 });
+    await executor.tick();
+    await executor.tick();
+    const pos = store.getState().positions[0]!;
+    // Simulate the stop having just triggered (exitOrderId set, not yet settled/CLOSED) — see
+    // settleIfStopTriggered's "mark in flight immediately" step.
+    pos.exitOrderId = "already-triggering";
+    const result = await executor.manualClosePosition(pos.positionId);
+    expect(result.ok).toBe(false);
+    expect(result.reason).toMatch(/already in flight/);
+    expect(client.placed.length).toBe(1); // only the original entry order — no extra close attempt
+  });
+
+  it("surfaces a persistent close failure as ok:false without fabricating a close", async () => {
+    const client = new FakeClient();
+    const { executor, store } = makeExecutor({ client, signals: [signal()], legUsd: 10_000 });
+    await executor.tick();
+    await executor.tick();
+    const pos = store.getState().positions[0]!;
+    client.failAllPlaceOrders = true;
+    const result = await executor.manualClosePosition(pos.positionId);
+    expect(result.ok).toBe(false);
+    expect(result.reason).toMatch(/close failed/);
+    expect(result.netPnlUsd).toBeNull();
+    expect(store.getState().positions[0]!.status).toBe("OPEN"); // never fabricated CLOSED
+  });
 });
 
 describe("SingleSymbolLaneExecutorStore — fileName isolation", () => {
@@ -509,7 +763,7 @@ describe("SingleSymbolLaneExecutorStore — fileName isolation", () => {
     const a = new SingleSymbolLaneExecutorStore(dir, "lane-a.json");
     a.getState().positions.push({
       positionId: "a1", sourceObservationId: "o1", symbol: "BTCUSDT", direction: "SHORT", qty: 1, entryPrice: 1,
-      entryOrderId: 1, entryPriceConfirmed: true, stopPrice: 1.03, stopAlgoOrderId: null,
+      entryOrderId: "1", entryPriceConfirmed: true, stopPrice: 1.03, stopAlgoOrderId: null,
       stopFailureCount: 0, stopUnprotectedSinceIso: null, closeFailureCount: 0, closeFailureSinceIso: null,
       peakFavorableR: 0, openedAt: NOW, status: "OPEN", closedAt: null, closeReason: null, exitPrice: null, exitOrderId: null,
       exitPriceConfirmed: null, grossPnlUsd: null, feeEstimateUsd: null, netPnlUsd: null,
@@ -517,5 +771,32 @@ describe("SingleSymbolLaneExecutorStore — fileName isolation", () => {
     a.save();
     const b = new SingleSymbolLaneExecutorStore(dir, "lane-b.json");
     expect(b.getState().positions.length).toBe(0);
+  });
+
+  it("[LEGACY-NORMALIZE] coerces pre-fix bare-number orderId fields to strings on load", () => {
+    const dir = tmpDir();
+    mkdirSync(dir, { recursive: true });
+    // Simulates a real position persisted before the order-ID precision fix — entryOrderId etc.
+    // written as a bare (already-rounded) JS number, not a quoted string.
+    const legacyJson = JSON.stringify({
+      version: 1,
+      positions: [{
+        positionId: "legacy1", sourceObservationId: "o1", symbol: "ETHUSDT", direction: "LONG", qty: 1,
+        entryPrice: 1750, entryOrderId: 8389766229891298000, entryPriceConfirmed: true, stopPrice: 1700,
+        stopAlgoOrderId: 2000001266429768, stopFailureCount: 0, stopUnprotectedSinceIso: null,
+        closeFailureCount: 0, closeFailureSinceIso: null, peakFavorableR: 0, openedAt: NOW, status: "OPEN",
+        closedAt: null, closeReason: null, exitPrice: null, exitOrderId: null, exitPriceConfirmed: null,
+        grossPnlUsd: null, feeEstimateUsd: null, netPnlUsd: null,
+      }],
+      lastSeenSignalMs: 0,
+    });
+    writeFileSync(resolve(dir, "legacy.json"), legacyJson, "utf-8");
+    const store = new SingleSymbolLaneExecutorStore(dir, "legacy.json");
+    const pos = store.getState().positions[0]!;
+    expect(typeof pos.entryOrderId).toBe("string");
+    expect(pos.entryOrderId).toBe("8389766229891298000");
+    expect(typeof pos.stopAlgoOrderId).toBe("string");
+    expect(pos.stopAlgoOrderId).toBe("2000001266429768");
+    expect(pos.exitOrderId).toBeNull(); // legitimately-null fields must stay null, not become ""
   });
 });
