@@ -14,6 +14,10 @@ node_modules/
 .claude/
 **/.claude/
 
+# Codex agent backup artifacts (working-file snapshots, not source)
+.codex-backups/
+**/.codex-backups/
+
 # logs
 logs/
 **/logs/
