@@ -1017,6 +1017,11 @@ export default function NeuralMindmap() {
   const [lastReceivedAt, setLastReceivedAt] = useState<number | null>(null);
   const telemetryInFlightRef = useRef(false);
   const hasTelemetryRef = useRef(false);
+  // 2026-07-12 fix: loadLiveAccount had no in-flight/sequence guard (unlike loadTelemetry, which
+  // uses telemetryInFlightRef) and stamped its freshness timestamp on ARRIVAL rather than on the
+  // request that produced the data — an out-of-order stale response (this runs on a 5s interval)
+  // could resolve after a newer one and get displayed as fresh.
+  const liveAccountLoadSeqRef = useRef(0);
 
   async function loadTelemetry() {
     if (telemetryInFlightRef.current) return;
@@ -1049,10 +1054,12 @@ export default function NeuralMindmap() {
   }
 
   async function loadLiveAccount() {
+    const seq = ++liveAccountLoadSeqRef.current;
     try {
       const response = await fetch('/api/live/account', { cache: 'no-store' });
       if (!response.ok) return;
       const data = await response.json() as { ok: boolean } & Partial<LiveAccount>;
+      if (seq !== liveAccountLoadSeqRef.current) return; // a newer call already superseded this one
       if (data.ok) {
         setLiveAccount({
           walletBalance: data.walletBalance ?? null,
@@ -1302,6 +1309,13 @@ export default function NeuralMindmap() {
         </div>
       )}
 
+      {(telemetry?.alerts ?? []).map((alert, index) => (
+        <div key={`${alert.source}-${index}`} className={`neural-alert ${alert.severity === 'CRITICAL' ? 'is-critical' : 'is-warning'}`}>
+          <strong>{alert.severity === 'CRITICAL' ? 'CRITICAL' : 'WARNING'} · {alert.source}</strong>
+          <span>{alert.message}</span>
+        </div>
+      ))}
+
       {shortFade && (
         <section className="neural-shortfade-card" aria-label="SHORT confirmed-exhaustion + crowded-funding fade (experimental)">
           <div className="neural-shortfade-head">
@@ -1351,6 +1365,56 @@ export default function NeuralMindmap() {
               ))}
             </div>
           )}
+        </section>
+      )}
+
+      {telemetry?.fadeLong && (
+        <section className="neural-shortfade-card" aria-label="LONG oversold fade (experimental)">
+          <div className="neural-shortfade-head">
+            <span>Experimental — RSI oversold dip-buy fade (symmetric of the SHORT fade above)</span>
+            <strong className={telemetry.fadeLong.status === 'WATCHABLE' ? 'tone-healthy' : 'tone-measure'}>
+              {telemetry.fadeLong.status}
+            </strong>
+            <small>
+              {telemetry.fadeLong.freshValid}/{telemetry.fadeLong.oosThreshold} fresh-valid · {telemetry.fadeLong.open} open · {telemetry.fadeLong.expired} expired
+            </small>
+          </div>
+          <div className="neural-shortfade-stats">
+            <div><span>Net R</span><strong className={telemetry.fadeLong.netAvgR == null ? '' : telemetry.fadeLong.netAvgR >= 0 ? 'tone-healthy' : 'tone-critical'}>{fmtR(telemetry.fadeLong.netAvgR)}</strong></div>
+            <div><span>PF</span><strong>{fmtNumber(telemetry.fadeLong.pf)}</strong></div>
+            <div><span>WR</span><strong>{telemetry.fadeLong.wr === null ? 'n/a' : `${(telemetry.fadeLong.wr * 100).toFixed(1)}%`}</strong></div>
+          </div>
+          {telemetry.fadeLong.antiCrash.tagged > 0 && (
+            <p className="neural-section-note">
+              Anti-crash gate: <b>{telemetry.fadeLong.antiCrash.pass}</b> passed / <b>{telemetry.fadeLong.antiCrash.wouldBlock}</b> would-block of {telemetry.fadeLong.antiCrash.tagged} tagged
+              {' '}· pass-side net R <b>{fmtR(telemetry.fadeLong.antiCrash.passNetAvgR)}</b> vs blocked-side <b>{fmtR(telemetry.fadeLong.antiCrash.blockedNetAvgR)}</b>
+            </p>
+          )}
+        </section>
+      )}
+
+      {telemetry?.h6Trend && (
+        <section className="neural-shortfade-card" aria-label="H6 trend-continuation research">
+          <div className="neural-shortfade-head">
+            <span>Research — H6 trend-continuation (chandelier-trail LONG)</span>
+            <strong className={telemetry.h6Trend.status === 'WATCHABLE' ? 'tone-healthy' : 'tone-measure'}>
+              {telemetry.h6Trend.status}
+            </strong>
+            <small>
+              {telemetry.h6Trend.freshValid}/{telemetry.h6Trend.oosThreshold} fresh-valid · {telemetry.h6Trend.open} open · {telemetry.h6Trend.expired} expired
+            </small>
+          </div>
+          <div className="neural-shortfade-stats">
+            <div><span>Net R</span><strong className={telemetry.h6Trend.netAvgR == null ? '' : telemetry.h6Trend.netAvgR >= 0 ? 'tone-healthy' : 'tone-critical'}>{fmtR(telemetry.h6Trend.netAvgR)}</strong></div>
+            <div><span>PF</span><strong>{fmtNumber(telemetry.h6Trend.pf)}</strong></div>
+            <div><span>WR</span><strong>{telemetry.h6Trend.wr === null ? 'n/a' : `${(telemetry.h6Trend.wr * 100).toFixed(1)}%`}</strong></div>
+            <div><span>TP1 hit rate</span><strong>{telemetry.h6Trend.tp1HitRate === null ? 'n/a' : `${(telemetry.h6Trend.tp1HitRate * 100).toFixed(1)}%`}</strong></div>
+            <div><span>Avg MFE</span><strong>{fmtR(telemetry.h6Trend.avgMaxFavorableR)}</strong></div>
+          </div>
+          <p className="neural-section-note">
+            Tight variant: {telemetry.h6Trend.tight.freshValid} fresh-valid, net R {fmtR(telemetry.h6Trend.tight.netAvgR)}
+            {' '}· Tight large-cap: {telemetry.h6Trend.tightLargeCap.freshValid} fresh-valid, net R {fmtR(telemetry.h6Trend.tightLargeCap.netAvgR)}
+          </p>
         </section>
       )}
 

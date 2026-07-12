@@ -31,6 +31,7 @@ import {
   resolveConfirmedFillPrice,
   resolveLiveBinanceEnv,
   type BinanceFuturesPrivateClient,
+  type FuturesIncomeEntry,
   type FuturesOrder,
   type FuturesPosition,
   type FuturesSymbolFilters,
@@ -68,6 +69,7 @@ import {
   getSymbolVolatilityCacheStore,
   refreshSymbolVolatilityCache,
   isDirectionalTechnicalGateEnabled,
+  isDirectionalTechnicalSignalFresh,
   type SymbolVolatilityCacheStore,
 } from "./directional-symbol-sizing.js";
 
@@ -145,6 +147,17 @@ export interface LiveExecutionConfig {
    *  either env) once unrealized PnL minus estimatedCloseCostUsd reaches this USD amount. Takes priority
    *  over the legacy gross testnetTakeProfitUsd/mainnetTpR thresholds when set. 0 = off. */
   profitBankNetTargetUsd: number;
+  /** 2026-07-12 (profitability Stage 4): profit-bank MODE, opt-in via LIVE_PROFIT_BANK_MODE.
+   *  "FLAT" (default) = the historical flat profitBankNetTargetUsd $ threshold for every position —
+   *  unchanged live behavior. "R_BASED" = scale the bank target to profitBankTargetR × the
+   *  position's OWN effective risk-at-stop (the REAL per-trade R, not the nominal config that the
+   *  $50 notional cap silently clips — see effectiveRiskUsd), so a wider-stop/bigger-risk position
+   *  is allowed to run proportionally further before banking, addressing the flat-$1 bank
+   *  truncating the right tail the loss-asymmetry needs. Never changes anything unless explicitly
+   *  set to R_BASED. */
+  profitBankMode: "FLAT" | "R_BASED";
+  /** R-multiple used when profitBankMode === "R_BASED" (LIVE_PROFIT_BANK_TARGET_R). Default 1.0. */
+  profitBankTargetR: number;
   /** Opposing-regime loss cut: close once adverse move reaches this fraction of the entry-to-stop distance. */
   regimeLossHardCutStopFraction: number;
   /**
@@ -188,6 +201,8 @@ function envNum(raw: string | undefined, fallback: number): number {
   const n = raw === undefined ? NaN : Number.parseFloat(raw);
   return Number.isFinite(n) && n > 0 ? n : fallback;
 }
+
+const MAX_STORED_INTENTS = envNum(process.env.LIVE_MAX_STORED_INTENTS, 2000);
 
 function envNonNegativeInt(raw: string | undefined, fallback: number): number {
   const n = raw === undefined ? NaN : Number.parseFloat(raw);
@@ -265,6 +280,8 @@ export function parseLiveExecutionConfig(env: NodeJS.ProcessEnv = process.env): 
     mainnetTpR: liveEnv === "mainnet" ? Math.max(0, Number.parseFloat(env.LIVE_MAINNET_TP_R ?? "") || 0) : 0,
     mainnetRegimeHardCutMs: liveEnv === "mainnet" ? envNum(env.LIVE_MAINNET_REGIME_HARD_CUT_MS, 30 * 60 * 1000) : 0,
     profitBankNetTargetUsd: Math.max(0, Number.parseFloat(env.LIVE_PROFIT_BANK_NET_TARGET_USD ?? "") || 0),
+    profitBankMode: env.LIVE_PROFIT_BANK_MODE === "R_BASED" ? "R_BASED" : "FLAT",
+    profitBankTargetR: Math.max(0, Number.parseFloat(env.LIVE_PROFIT_BANK_TARGET_R ?? "") || 1),
     regimeLossHardCutStopFraction: envFraction(env.LIVE_REGIME_LOSS_HARD_CUT_STOP_FRACTION, 0.5),
     forceMfeGiveback: env.LIVE_FORCE_MFE_GIVEBACK === "1",
     losingMaxHoldMs: Math.max(0, Math.floor(envNum(env.LIVE_LOSING_MAX_HOLD_MS, 0))),
@@ -288,6 +305,15 @@ export interface LiveOrderPlan {
   notionalUsd: number;
   stopPrice: number;
   tp1Price: number;
+  /** 2026-07-12 R-clipping telemetry: the dollars ACTUALLY at risk between entry and stop for this
+   *  plan (notional × stop distance). The nominal riskUsdPerTrade config is a target, not a
+   *  guarantee — whenever riskUsd/stopDistance exceeds maxNotionalPerTrade, the notional cap binds
+   *  and the true R shrinks silently (measured live 2026-07-12: nominal $5 R clipped to ~$1.50 at
+   *  the dominant ~300bps stop under the $50 cap). Report-only: nothing reads this for decisions;
+   *  it exists so the operator's scaling arithmetic uses the REAL per-trade R, not the config's. */
+  effectiveRiskUsd: number;
+  /** True when maxNotionalPerTrade (not riskUsdPerTrade) determined this plan's size. */
+  riskClippedByNotionalCap: boolean;
 }
 
 export function roundDownToStep(value: number, step: number): number {
@@ -375,7 +401,7 @@ export function computeLiveOrderPlan(
   config: Pick<LiveExecutionConfig, "riskUsdPerTrade" | "maxNotionalPerTrade">,
   filters: FuturesSymbolFilters,
 ): LiveOrderPlan {
-  const fail = (reason: string): LiveOrderPlan => ({ ok: false, reason, qty: 0, tp1Qty: 0, notionalUsd: 0, stopPrice: 0, tp1Price: 0 });
+  const fail = (reason: string): LiveOrderPlan => ({ ok: false, reason, qty: 0, tp1Qty: 0, notionalUsd: 0, stopPrice: 0, tp1Price: 0, effectiveRiskUsd: 0, riskClippedByNotionalCap: false });
 
   const { entryPrice, stopLoss, tp1 } = signal;
   if (!(entryPrice > 0) || !(stopLoss > 0) || !(tp1 > 0)) return fail("invalid geometry");
@@ -397,14 +423,17 @@ export function computeLiveOrderPlan(
   if (qty * entryPrice < filters.minNotional) return fail(`notional below exchange minimum (${filters.minNotional})`);
 
   const tp1Qty = roundDownToStep(qty / 2, filters.stepSize);
+  const finalNotionalUsd = qty * entryPrice;
   return {
     ok: true,
     reason: null,
     qty,
     tp1Qty, // 0 ⇒ position too small to split; runner-only (stop still protects full qty)
-    notionalUsd: qty * entryPrice,
+    notionalUsd: finalNotionalUsd,
     stopPrice: roundDownToStep(stopLoss, filters.tickSize),
     tp1Price: roundDownToStep(tp1, filters.tickSize),
+    effectiveRiskUsd: finalNotionalUsd * stopDistancePct,
+    riskClippedByNotionalCap: rawNotional > config.maxNotionalPerTrade,
   };
 }
 
@@ -438,11 +467,25 @@ export interface LiveIntent {
   feesUsd: number | null;
   exitRule?: VariantExitRule;
   maxFavorableR?: number | null;
+  /** MAE persistence (Tier 2 audit, purely additive): running MOST NEGATIVE (worst) favorableR the
+   *  position has reached, mirroring maxFavorableR's own update (same tick hook inside
+   *  manageMfeGiveback(), same intents tracked). 0 while the position has never gone underwater;
+   *  null on intents that never pass through that hook (rescue legs — same as maxFavorableR).
+   *  Report-only: never read by any exit/close decision. */
+  maxAdverseR?: number | null;
   createdAt: string;
   updatedAt: string;
   closedAt: string | null;
   closeReason: string | null;
   lastError: string | null;
+  /** Exit-side regime snapshot (Tier 2 audit, purely additive): the SAME three controller fields
+   *  captured at entry (see LiveIntentSource.regime/controllerMode/controllerConfidence) but read
+   *  LIVE at the moment of close via currentControllerSnapshot() — the same mechanism the regime
+   *  harvest already uses. Lets a closed trade be compared entry-regime vs exit-regime. null when
+   *  no controller snapshot was available at close time; undefined on intents that never closed. */
+  exitRegime?: string | null;
+  exitControllerMode?: string | null;
+  exitControllerConfidence?: string | null;
   /** Paper orders netted into this one-way Binance symbol position. */
   sourcePaperOrders?: LiveIntentSource[];
   /** True when this intent was opened WHILE an operator lane selection/allocation was active
@@ -459,6 +502,11 @@ export interface LiveIntent {
    *  and filledEntryPrice fell back to the stale pre-trade paper reference price — the stop/TP
    *  geometry derived from it may be mispriced. Undefined on older persisted intents (assume true). */
   entryPriceConfirmed?: boolean;
+  /** 2026-07-12 R-clipping telemetry (report-only, see LiveOrderPlan.effectiveRiskUsd): the dollars
+   *  actually at risk to the stop at entry, and whether the notional cap (not riskUsdPerTrade)
+   *  determined the size. Undefined on older persisted intents. */
+  effectiveRiskUsd?: number | null;
+  riskClippedByNotionalCap?: boolean;
 }
 
 export interface LiveIntentSource {
@@ -553,6 +601,12 @@ interface LiveExecutionState {
   totalRealizedPnlUsd: number;
   /** Peak of totalRealizedPnlUsd — drawdown kill-switch baseline. */
   realizedPeakUsd: number;
+  /** Peak of (totalRealizedPnlUsd + external executors' all-time real P&L) — the drawdown
+   *  kill-switch baseline once getExternalRealizedPnlUsd is wired (2026-07-11 fix; see
+   *  killSwitchTrip's doc comment). Optional/undefined on state loaded before this field existed —
+   *  first read after the fix seeds it from max(realizedPeakUsd, current combined total), an
+   *  honest approximation since no historical combined-total peak was ever tracked before now. */
+  combinedRealizedPeakUsd?: number;
   /** paperOrderId → failed live-open attempts. At MAX_MIRROR_ATTEMPTS the order is quarantined. */
   mirrorAttempts: Record<string, number>;
   /** Last fresh controller snapshot seen by the testnet regime-change harvest. */
@@ -726,7 +780,26 @@ export class LiveExecutionStore {
     return this._parse(this.file) ?? this._parse(`${this.file}.bak`) ?? this._empty();
   }
 
+  /** Bounded retention: every non-terminal intent is kept (it must stay resolvable), plus at most
+   *  MAX_STORED_INTENTS terminal (CLOSED/ERROR/KILLED) ones — oldest terminal intents are dropped
+   *  first once that cap is exceeded, same convention as residual-momentum-edge.ts/liquidation-
+   *  recoil-cross-sectional.ts's own prune(). 2026-07-11 real-money audit fix: this is the ACTUAL
+   *  mainnet trade-intent ledger (data/live-execution.json) — unlike its measurement-lane
+   *  siblings, it had never been given the same fix, so it grows forever across months of live
+   *  trading, one heavy record (variant snapshot, order IDs, state history) per real order. */
+  private prune(): void {
+    const OPEN_STATES = new Set<LiveIntentState>(["MIRRORED", "ENTRY_PLACED", "OPEN", "TP1_FILLED_BE_SET"]);
+    const open = this.state.intents.filter((i) => OPEN_STATES.has(i.state));
+    const terminal = this.state.intents
+      .filter((i) => !OPEN_STATES.has(i.state))
+      .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
+    const keepTerminal =
+      terminal.length > MAX_STORED_INTENTS ? terminal.slice(terminal.length - MAX_STORED_INTENTS) : terminal;
+    this.state.intents = [...open, ...keepTerminal];
+  }
+
   save(): void {
+    this.prune();
     try {
       const tmp = `${this.file}.tmp`;
       writeFileSync(tmp, JSON.stringify(this.state), "utf-8");
@@ -775,6 +848,7 @@ export type LivePrivateClient = Pick<
   | "cancelAllOrders"
   | "cancelAllAlgoOrders"
   | "getUserTrades"
+  | "getIncomeHistory"
 >;
 
 export interface LiveExecutionEngineOptions {
@@ -783,6 +857,10 @@ export interface LiveExecutionEngineOptions {
   store: LiveExecutionStore;
   paperStore: PaperStoreReader;
   isPaperOrderLiveEligible?: (order: PaperOrder, nowIso: string) => boolean;
+  /** Optional central-orchestrator override for lane admission/weight. Returning null preserves
+   *  the existing operator allocation semantics; a concrete value becomes authoritative. */
+  paperLaneGate?: (order: PaperOrder) => boolean | null;
+  paperLaneWeightPct?: (order: PaperOrder) => number | null;
   getControllerSnapshot?: () => LiveControllerSnapshot | null;
   nowIso?: () => string;
   /** Optional market-data client for the crowding-exit SHADOW measurement (getStatus().crowdingExitShadow).
@@ -801,6 +879,32 @@ export interface LiveExecutionEngineOptions {
   externalManagedNetQty?: () => Map<string, number>;
   /** Shared strategy/regime admission gate. It affects NEW exposure only; exits always continue. */
   newEntryGate?: () => LiveNewEntryGateDecision;
+  /**
+   * Real realized P&L (today's UTC-day total + all-time) from every CrossSectionalExecutor and
+   * SingleSymbolLaneExecutor instance — lanes that are separate classes with their own stores and
+   * never flow through this engine's own applyRealizedToLedger/dailyLedger. Without this,
+   * killSwitchTrip() only ever sees this engine's own mirror/directional-slot losses: a 2026-07-11
+   * real-money audit found the account-wide LIVE_DAILY_MAX_LOSS_USD/LIVE_MAX_DRAWDOWN_USD safety net
+   * could never trip from losses concentrated in those 11 other lanes, each of which only enforces
+   * its own much smaller per-lane cap that halts new opens in that ONE lane and never reports
+   * anywhere else. Omit to leave killSwitchTrip's engine-native-only behavior unchanged (e.g. in
+   * tests that don't construct the other executors). See live-executor-wiring.ts's
+   * sumExternalRealizedPnlUsd — the same function backs the dashboard headline and
+   * wallet-reconciliation fixes from the same audit, so all three consumers agree on one number.
+   */
+  getExternalRealizedPnlUsd?: () => { today: number; allTime: number };
+  /** 2026-07-12 kill-switch RESPONSE fix: when the (since 2026-07-11 genuinely portfolio-wide)
+   *  kill-switch TRIGGER trips, the engine previously flattened only its OWN intents — the other
+   *  11 executors (3 baskets + 8 single-symbol lanes) kept their positions and continued running
+   *  under their own small per-lane breakers, so the account-wide "stop everything at -$X"
+   *  promise only ever covered a quarter of the book. app.ts wires this to each executor's OWN
+   *  orderly close method (closeAllBasketsOrderly / closeAllPositionsOrderly) — reduce-only,
+   *  netting-aware closes, NEVER a blanket symbol flatten (the operator's standing rule after the
+   *  2026-07-07 netting-blind-closes incident: nothing force-flattens an open basket's legs via
+   *  raw symbol positions). New ENTRIES across all 11 are already halted automatically: their
+   *  isAllowed gates all require engine.canOpenNewEntries(), false once killedAt latches.
+   *  Best-effort: a throwing callback must never break the engine's own kill path. */
+  onKillSwitchEngaged?: (reason: string) => Promise<void>;
 }
 
 const ERROR_STREAK_DISARM = 3;
@@ -808,13 +912,21 @@ const REGIME_EXIT_SNAPSHOT_MAX_AGE_MS = 15 * 60 * 1000;
 const OPEN_INTENT_STATES: ReadonlySet<LiveIntentState> = new Set(["MIRRORED", "ENTRY_PLACED", "OPEN", "TP1_FILLED_BE_SET"]);
 const MIRRORABLE_PAPER_STATUSES: ReadonlySet<string> = new Set(["CREATED", "PAPER_SUBMITTED"]);
 // Lanes whose open positions are dumped at market the instant they go net-positive after the
-// estimated close cost (operator emergency-exit). Both removed LONG lanes are covered so any
-// position they already opened escapes at the first profitable tick instead of round-tripping.
+// estimated close cost (operator emergency-exit) — for a lane that's genuinely REMOVED from live
+// allocation, so any position it already opened escapes at the first profitable tick instead of
+// round-tripping to its own (now-abandoned) TP1/SL geometry.
+//
+// 2026-07-10: CG_WIDE_FAST_LONG removed from this set. A research audit found it still listed
+// here even though it was reinstated into live's active lane allocation (currently 8% weight) —
+// meaning every real CG_WIDE_FAST_LONG winner was being swept the instant it cleared ~22bps,
+// never reaching its own designed tp1_full target (0.5R). That is almost certainly the mechanical
+// cause of the lane's real-trade pattern (73%+ win rate, ~0.78 payoff ratio): winners capped near
+// breakeven while losers ran to their real stop. Operator-confirmed fix. CG_WIDE_LONG_RUNNER stays
+// — it is genuinely not part of live's current allocation, so the emergency-exit sweep is correct
+// for it.
 const LIVE_BREAKEVEN_EXIT_LANE_IDS = new Set([
   "CG_WIDE_LONG_RUNNER",
   "CG_VARIANT_MATRIX:CG_WIDE_LONG_RUNNER",
-  "CG_WIDE_FAST_LONG",
-  "CG_VARIANT_MATRIX:CG_WIDE_FAST_LONG",
 ]);
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
@@ -1183,12 +1295,16 @@ export class LiveExecutionEngine {
   private readonly store: LiveExecutionStore;
   private readonly paperStore: PaperStoreReader;
   private readonly isPaperOrderLiveEligible: (order: PaperOrder, nowIso: string) => boolean;
+  private readonly paperLaneGate: (order: PaperOrder) => boolean | null;
+  private readonly paperLaneWeightPct: (order: PaperOrder) => number | null;
   private readonly getControllerSnapshot: () => LiveControllerSnapshot | null;
   private readonly nowIso: () => string;
   private readonly marketDataClient?: Pick<BinanceClient, "getFuturesFlow" | "getCandles" | "getBookTicker">;
   private readonly fillConfirmRetryDelayMs: number;
   private readonly externalManagedNetQty: () => Map<string, number>;
   private readonly newEntryGate: () => LiveNewEntryGateDecision;
+  private readonly getExternalRealizedPnlUsd: () => { today: number; allTime: number };
+  private readonly onKillSwitchEngaged: ((reason: string) => Promise<void>) | null;
 
   /** In-memory ONLY — restart always boots disarmed. */
   private armed = false;
@@ -1198,6 +1314,21 @@ export class LiveExecutionEngine {
   private reconcileIssues: string[] = [];
   private timer: ReturnType<typeof setInterval> | null = null;
   private ticking = false;
+  /** 2026-07-11 real-money audit fix: `this.ticking` only blocks a second concurrent tick() — it
+   *  does NOT block manualCloseIntent()/kill()/flattenAllExchangePositions(), which the dashboard
+   *  can call directly at any moment. Any code path about to flatten+settle a specific intent
+   *  must claim it here first and check no one else already has it, or two overlapping paths can
+   *  both flatten the same real position and double-book its realized P&L into the ledger. */
+  private busyIntentIds = new Set<string>();
+  /** Guards engageKillSwitch() itself against two overlapping invocations (tick()'s automatic
+   *  trip and a manual kill() arriving at the same moment) double-flattening the same book. */
+  private killSwitchEngaging = false;
+  /** 2026-07-12 fix: copyExternalIntent()'s "no existing intent on this symbol" check ran before
+   *  an await gap (getFilters), with openIntent() never re-verifying uniqueness before pushing a
+   *  new intent — two overlapping calls (double-click, retry) on the same symbol could both pass
+   *  the check and open two real, independently-managed positions on it. Claimed synchronously
+   *  before any await, released in a finally. */
+  private copyingSymbols = new Set<string>();
   /** Newest candidates' first-failing mirror gate — pure observation for "kenapa ga ada trade?". */
   private lastMirrorFunnel: Array<{ id: string; symbol: string; direction: string; createdAt: string; reason: string; firstReason?: string }> = [];
   /** First-seen decision per candidate: after one tick, live candidates fall behind the watermark
@@ -1216,12 +1347,16 @@ export class LiveExecutionEngine {
     this.store = options.store;
     this.paperStore = options.paperStore;
     this.isPaperOrderLiveEligible = options.isPaperOrderLiveEligible ?? (() => true);
+    this.paperLaneGate = options.paperLaneGate ?? (() => null);
+    this.paperLaneWeightPct = options.paperLaneWeightPct ?? (() => null);
     this.getControllerSnapshot = options.getControllerSnapshot ?? (() => null);
     this.nowIso = options.nowIso ?? (() => new Date().toISOString());
     this.marketDataClient = options.marketDataClient;
     this.fillConfirmRetryDelayMs = options.fillConfirmRetryDelayMs ?? 400;
     this.externalManagedNetQty = options.externalManagedNetQty ?? (() => new Map());
     this.newEntryGate = options.newEntryGate ?? (() => ({ allowed: true, reason: null }));
+    this.getExternalRealizedPnlUsd = options.getExternalRealizedPnlUsd ?? (() => ({ today: 0, allTime: 0 }));
+    this.onKillSwitchEngaged = options.onKillSwitchEngaged ?? null;
     // Auto-arm must NOT punch through a latched kill: a restart preserves the kill until an
     // explicit resetKill(). (arm() already enforces this; the constructor path bypassed it.)
     if (this.config.autoArm && this.config.configErrors.length === 0 && !this.store.getState().killedAt) {
@@ -1283,6 +1418,22 @@ export class LiveExecutionEngine {
     const capturedMs = new Date(snapshot.capturedAt).getTime();
     if (!Number.isFinite(capturedMs)) return false;
     return Math.abs(Date.now() - capturedMs) <= REGIME_EXIT_SNAPSHOT_MAX_AGE_MS;
+  }
+
+  /**
+   * Regime-exit persistence (Tier 2 audit, purely additive): stamps the SAME three controller
+   * fields captured at entry (LiveIntentSource.regime/controllerMode/controllerConfidence) onto
+   * the intent at the moment it closes, read LIVE via currentControllerSnapshot() — the identical
+   * mechanism the regime harvest already reads for its cut/hold decision. No freshness gating here
+   * (unlike controllerSnapshotIsFresh, which gates a live DECISION): this is a report-only
+   * best-effort snapshot for post-hoc entry-vs-exit comparison, never read by any exit/close
+   * decision. null when no controller is wired/available at close time.
+   */
+  private stampExitControllerSnapshot(intent: LiveIntent): void {
+    const controller = this.currentControllerSnapshot();
+    intent.exitRegime = controller?.regime ?? null;
+    intent.exitControllerMode = controller?.mode ?? null;
+    intent.exitControllerConfidence = controller?.confidence ?? null;
   }
 
   /** Manual emergency kill: cancel everything, flatten everything, disarm, latch. */
@@ -1359,21 +1510,39 @@ export class LiveExecutionEngine {
     const affectedSymbols = new Set([...symbols]);
     for (const intent of st.intents) {
       if (!OPEN_INTENT_STATES.has(intent.state) || !affectedSymbols.has(intent.symbol)) continue;
-      // A panic flatten is NEVER a win — book its realized P&L so it isn't silently dropped from
-      // lane reports and the drawdown-peak rebase, same reasoning as the kill-switch path below.
-      const net = await this.realizedFromTrades(intent.symbol, intent.createdAt, [
-        intent.entryOrderId,
-        intent.tp1OrderId,
-        flattenOrderIdBySymbol.get(intent.symbol) ?? null,
-      ]);
-      intent.realizedPnlUsd = net;
-      this.applyRealizedToLedger(net, "adverse");
-      intent.state = "KILLED";
-      intent.closeReason = `EXCHANGE_FLATTEN: ${reason}`;
-      intent.closedAt = this.nowIso();
-      intent.updatedAt = this.nowIso();
-      if (failed.some((item) => item.symbol === intent.symbol)) {
-        intent.lastError = `exchange flatten had symbol-level failures; check /api/live/status`;
+      // 2026-07-11 real-money audit fix: this operator panic-flatten route can race a concurrent
+      // tick() (manageLifecycle/engageKillSwitch) on the same intent — claim it first so neither
+      // path double-flattens/double-books the same real close.
+      if (this.busyIntentIds.has(intent.paperOrderId)) continue;
+      this.busyIntentIds.add(intent.paperOrderId);
+      try {
+        // A panic flatten is NEVER a win — book its realized P&L so it isn't silently dropped from
+        // lane reports and the drawdown-peak rebase, same reasoning as the kill-switch path below.
+        const settled = await this.realizedFromTrades(intent.symbol, intent.createdAt, [
+          intent.entryOrderId,
+          intent.tp1OrderId,
+          flattenOrderIdBySymbol.get(intent.symbol) ?? null,
+        ]);
+        const net = settled?.netUsd ?? null;
+        intent.realizedPnlUsd = net;
+        intent.feesUsd = settled?.feesUsd ?? null;
+        this.applyRealizedToLedger(net, "adverse");
+        intent.state = "KILLED";
+        intent.closeReason = `EXCHANGE_FLATTEN: ${reason}`;
+        intent.closedAt = this.nowIso();
+        this.stampExitControllerSnapshot(intent);
+        intent.updatedAt = this.nowIso();
+        const symbolFailed = failed.some((item) => item.symbol === intent.symbol);
+        if (net === null || symbolFailed) {
+          intent.lastError = [
+            net === null ? "P&L UNKNOWN — trades fetch failed; wallet-reconciliation will catch the true amount" : null,
+            symbolFailed ? "exchange flatten had symbol-level failures; check /api/live/status" : null,
+          ]
+            .filter((part): part is string => part !== null)
+            .join("; ");
+        }
+      } finally {
+        this.busyIntentIds.delete(intent.paperOrderId);
       }
     }
     this.store.save();
@@ -1397,16 +1566,31 @@ export class LiveExecutionEngine {
    *  - consecutiveLosses → 0 (the streak that most commonly trips this).
    *  - realizedPeakUsd → current total (drawdown-from-peak re-based to 0 so a stale high-water mark
    *    can't re-kill immediately).
+   *  - combinedRealizedPeakUsd → current combined (engine + external lanes) total, same rebase
+   *    reason (2026-07-11 fix: without this, a stale pre-reset combined peak would make
+   *    killSwitchTrip's drawdown check re-trip on the very next tick even though realizedPeakUsd
+   *    itself was correctly rebased — the exact footgun this method exists to avoid).
    * The DAILY ledger is intentionally left untouched: a daily-max-loss kill is meant to enforce a
    * cool-off for the rest of the UTC day, so it correctly re-latches until the day rolls over.
+   *
+   * 2026-07-12 fix: this mutated the same shared store with no guard against an in-flight
+   * engageKillSwitch() — calling reset while the kill-triggered flatten loop is still awaiting an
+   * exchange call would erase killedAt/killReason BEFORE the flatten finishes, letting arm() (and
+   * then copyExternalIntent/mirrorNewSignals) re-open exposure on a symbol whose position isn't
+   * actually flat yet. Guarded by the SAME killSwitchEngaging flag engageKillSwitch() itself uses.
    */
-  resetKill(): void {
+  resetKill(): { ok: boolean; reason: string | null } {
+    if (this.killSwitchEngaging) {
+      return { ok: false, reason: "kill-switch flatten is still in progress — wait for it to finish, then reset" };
+    }
     const st = this.store.getState();
     st.killedAt = null;
     st.killReason = null;
     st.consecutiveLosses = 0;
     st.realizedPeakUsd = st.totalRealizedPnlUsd;
+    st.combinedRealizedPeakUsd = st.totalRealizedPnlUsd + this.safeExternalRealizedPnlUsd().allTime;
     this.store.save();
+    return { ok: true, reason: null };
   }
 
   isArmed(): boolean {
@@ -1507,7 +1691,34 @@ export class LiveExecutionEngine {
         direction: i.direction,
         state: i.state,
         qty: i.qty,
+        effectiveRiskUsd: i.effectiveRiskUsd ?? null,
+        riskClippedByNotionalCap: i.riskClippedByNotionalCap ?? null,
       })),
+      // 2026-07-12 R-clipping telemetry (report-only): the scaling arithmetic ("each $1 of R ≈
+      // $X/month at measured netAvgR") is only trustworthy against the REAL per-trade R. Measured
+      // live: nominal $5 risk clipped to ~$1.50 by the $50 notional cap at ~300bps stops — this
+      // block makes that visible instead of leaving the config value to masquerade as reality.
+      riskSizing: (() => {
+        const recentClosed = st.intents
+          .filter((i) => i.state === "CLOSED" && typeof i.effectiveRiskUsd === "number")
+          .slice(-50);
+        const withRisk = [...recentClosed, ...openIntents.filter((i) => typeof i.effectiveRiskUsd === "number")];
+        const clippedCount = withRisk.filter((i) => i.riskClippedByNotionalCap === true).length;
+        const avgEffective =
+          withRisk.length > 0
+            ? withRisk.reduce((sum, i) => sum + (i.effectiveRiskUsd ?? 0), 0) / withRisk.length
+            : null;
+        return {
+          nominalRiskUsdPerTrade: this.config.riskUsdPerTrade,
+          avgEffectiveRiskUsd: avgEffective,
+          sampleCount: withRisk.length,
+          clippedShare: withRisk.length > 0 ? clippedCount / withRisk.length : null,
+          warning:
+            avgEffective !== null && avgEffective < this.config.riskUsdPerTrade * 0.75
+              ? `effective R ($${avgEffective.toFixed(2)}) is well below nominal ($${this.config.riskUsdPerTrade}) — maxNotionalPerTrade ($${this.config.maxNotionalPerTrade}) is clipping size on ${(100 * (clippedCount / withRisk.length)).toFixed(0)}% of recent trades`
+              : null,
+        };
+      })(),
       closedToday: st.dailyLedger,
       consecutiveLosses: st.consecutiveLosses,
       totalRealizedPnlUsd: st.totalRealizedPnlUsd,
@@ -1540,6 +1751,8 @@ export class LiveExecutionEngine {
         losingMaxHoldMs: this.config.losingMaxHoldMs,
         profitBankNetTargetUsd: this.config.profitBankNetTargetUsd,
         profitBankThresholdUsd: this.profitBankThresholdUsd(),
+        profitBankMode: this.config.profitBankMode,
+        profitBankTargetR: this.config.profitBankTargetR,
         maxEntryChaseStopFraction: this.maxEntryChaseStopFraction(),
         minEntryGrossTargetPct: this.minEntryGrossTargetPct(),
       },
@@ -1578,6 +1791,17 @@ export class LiveExecutionEngine {
     const usdt = balances.find((b) => b.asset === "USDT");
     if (!usdt) return null;
     return { walletBalance: usdt.balance, availableBalance: usdt.availableBalance };
+  }
+
+  /**
+   * Read-only passthrough to the client's /fapi/v1/income fetch, account-wide (no symbol filter).
+   * Exists so the (separate, report-only) wallet-reconciliation module can compare Binance's own
+   * income ledger against the internal dailyLedger without reaching into the private `client`
+   * field directly. This method itself does no comparison, no logging, and no side effects — it
+   * only forwards to the client and returns whatever Binance reports.
+   */
+  async getIncomeHistory(startTimeMs: number, endTimeMs: number): Promise<FuturesIncomeEntry[]> {
+    return this.client.getIncomeHistory({ startTime: startTimeMs, endTime: endTimeMs });
   }
 
   async getAccountSnapshot(): Promise<{
@@ -2040,6 +2264,13 @@ export class LiveExecutionEngine {
     const st = this.store.getState();
     const intent = st.intents.find((i) => i.paperOrderId === paperOrderId && OPEN_INTENT_STATES.has(i.state));
     if (!intent) return { ok: false, reason: `no open intent for ${paperOrderId}`, realizedPnlUsd: null };
+    // 2026-07-11 real-money audit fix: this used to have no reentrancy guard at all, so an
+    // in-flight tick() (manageLifecycle/engageKillSwitch, neither gated by `this.ticking` from
+    // here) could flatten+settle this SAME intent concurrently — double-booking realized P&L.
+    if (this.busyIntentIds.has(paperOrderId)) {
+      return { ok: false, reason: "intent is already being processed by the engine — try again in a moment", realizedPnlUsd: null };
+    }
+    this.busyIntentIds.add(paperOrderId);
     try {
       await this.client.cancelAllOrders(intent.symbol);
       await this.client.cancelAllAlgoOrders(intent.symbol);
@@ -2070,12 +2301,20 @@ export class LiveExecutionEngine {
         });
         flattenOrderId = flatten.orderId;
       }
-      const net = await this.realizedFromTrades(intent.symbol, intent.createdAt, [intent.entryOrderId, intent.tp1OrderId, flattenOrderId]);
+      const settled = await this.realizedFromTrades(intent.symbol, intent.createdAt, [intent.entryOrderId, intent.tp1OrderId, flattenOrderId]);
+      const net = settled?.netUsd ?? null;
       intent.realizedPnlUsd = net;
-      this.applyRealizedToLedger(net);
+      intent.feesUsd = settled?.feesUsd ?? null;
+      if (net === null) {
+        intent.lastError = "operator close: P&L UNKNOWN — trades fetch failed after a real close; wallet-reconciliation will catch the true amount";
+        this.applyRealizedToLedger(null);
+      } else {
+        this.applyRealizedToLedger(net);
+      }
       intent.state = "CLOSED";
       intent.closeReason = "OPERATOR_CLOSE";
       intent.closedAt = this.nowIso();
+      this.stampExitControllerSnapshot(intent);
       intent.updatedAt = this.nowIso();
       this.store.save();
       return { ok: true, reason: null, realizedPnlUsd: net };
@@ -2084,78 +2323,164 @@ export class LiveExecutionEngine {
       intent.updatedAt = this.nowIso();
       this.store.save();
       return { ok: false, reason: (error as Error).message, realizedPnlUsd: null };
+    } finally {
+      this.busyIntentIds.delete(paperOrderId);
     }
   }
 
   // ── kill-switch ────────────────────────────────────────────────────────────
 
+  /**
+   * 2026-07-11 real-money audit fix: this used to compare ONLY this engine's own mirror/directional-
+   * slot ledger (dailyLedger/totalRealizedPnlUsd, fed exclusively by applyRealizedToLedger) against
+   * dailyMaxLossUsd/maxDrawdownUsd. The 3 CrossSectionalExecutor + 8 SingleSymbolLaneExecutor
+   * instances are separate classes with their own stores and never touch this ledger — each only
+   * enforces its own much smaller per-lane daily-loss cap (~$8) that halts new opens in that ONE
+   * lane and reports nowhere else. Confirmed live: the account-wide "stop trading if losing more
+   * than $40/day" promise could never be kept purely from losses concentrated in those 11 lanes.
+   * getExternalRealizedPnlUsd() (same source as the dashboard headline and wallet-reconciliation
+   * fixes from the same audit) is folded into both checks below WITHOUT touching dailyLedger/
+   * consecutiveLosses/realizedPeakUsd themselves — those stay engine-native (consecutiveLosses in
+   * particular has no cross-lane equivalent worth inventing; a losing streak is inherently a
+   * per-mechanism concept). combinedRealizedPeakUsd is a NEW, separate peak tracked here (this
+   * function already runs first on every tick, so updating it here needs no new hook) — its first
+   * value after this fix deploys is seeded from max(realizedPeakUsd, current combined total), an
+   * honest approximation since no true historical combined-total peak was ever recorded before.
+   */
+  /** 2026-07-12 fix: getExternalRealizedPnlUsd() fans out to 11 separate executors' getStatus()
+   *  calls with no guard of its own, unlike currentControllerSnapshot()/strategyEntryGate() which
+   *  both fail closed. An exception thrown by any single external executor used to abort the
+   *  ENTIRE tick() before reconcile()/manageLifecycle() even ran (not just the kill-switch check),
+   *  turning one flaky lane's read into a skipped safety cycle for real open positions. Degrades
+   *  to {today:0, allTime:0} on failure — excludes the unreachable external component for this one
+   *  read rather than crashing; the engine-native ledger/drawdown checks still run correctly. */
+  private safeExternalRealizedPnlUsd(): { today: number; allTime: number } {
+    try {
+      return this.getExternalRealizedPnlUsd();
+    } catch {
+      return { today: 0, allTime: 0 };
+    }
+  }
+
   private killSwitchTrip(): string | null {
     const st = this.store.getState();
     if (st.killedAt) return null; // already engaged/latched
     this.rollDailyLedger();
-    if (st.dailyLedger.realizedPnlUsd <= -this.config.dailyMaxLossUsd) {
-      return `daily max loss hit (${st.dailyLedger.realizedPnlUsd.toFixed(2)} USD <= -${this.config.dailyMaxLossUsd})`;
+    const external = this.safeExternalRealizedPnlUsd();
+    const combinedTodayPnl = st.dailyLedger.realizedPnlUsd + external.today;
+    if (combinedTodayPnl <= -this.config.dailyMaxLossUsd) {
+      return (
+        `daily max loss hit (${combinedTodayPnl.toFixed(2)} USD <= -${this.config.dailyMaxLossUsd}` +
+        ` — engine=${st.dailyLedger.realizedPnlUsd.toFixed(2)} other-lanes=${external.today.toFixed(2)})`
+      );
     }
     if (st.consecutiveLosses >= this.config.maxConsecutiveLosses) {
       return `max consecutive losses hit (${st.consecutiveLosses})`;
     }
-    const drawdown = st.realizedPeakUsd - st.totalRealizedPnlUsd;
+    const combinedTotalPnl = st.totalRealizedPnlUsd + external.allTime;
+    const combinedPeak = Math.max(st.combinedRealizedPeakUsd ?? st.realizedPeakUsd, combinedTotalPnl);
+    if (combinedPeak > (st.combinedRealizedPeakUsd ?? -Infinity)) {
+      st.combinedRealizedPeakUsd = combinedPeak;
+      // 2026-07-12 fix: this mutation was never explicitly persisted — a "quiet" tick (nothing
+      // else this tick calls store.save()) followed by a process restart would silently roll the
+      // recorded historical peak back down, understating real drawdown on the very next tick.
+      this.store.save();
+    }
+    const drawdown = combinedPeak - combinedTotalPnl;
     if (drawdown >= this.config.maxDrawdownUsd) {
-      return `max drawdown hit (${drawdown.toFixed(2)} USD from peak)`;
+      return (
+        `max drawdown hit (${drawdown.toFixed(2)} USD from peak` +
+        ` — engine=${st.totalRealizedPnlUsd.toFixed(2)} other-lanes=${external.allTime.toFixed(2)})`
+      );
     }
     return null;
   }
 
   private async engageKillSwitch(reason: string): Promise<void> {
-    const st = this.store.getState();
-    this.armed = false;
-    st.killedAt = this.nowIso();
-    st.killReason = reason;
+    // 2026-07-11 real-money audit fix: tick()'s automatic trip and a manual kill() can arrive at
+    // the same moment (neither is gated by `this.ticking`) — without this guard, two overlapping
+    // invocations would each snapshot+flatten the same open intents and double-book realized P&L.
+    if (this.killSwitchEngaging) return;
+    this.killSwitchEngaging = true;
+    try {
+      const st = this.store.getState();
+      this.armed = false;
+      st.killedAt = this.nowIso();
+      st.killReason = reason;
 
-    // Cancel all engine orders + flatten engine positions, symbol by symbol.
-    const openIntents = st.intents.filter((i) => OPEN_INTENT_STATES.has(i.state));
-    for (const intent of openIntents) {
-      try {
-        await this.client.cancelAllOrders(intent.symbol);
-        await this.client.cancelAllAlgoOrders(intent.symbol);
-        const positions = await this.client.getPositions(intent.symbol);
-        const pos = positions.find((p) => p.symbol === intent.symbol);
-        let flattenOrderId: string | null = null;
-        // Kill-switch flatten is per-INTENT panic, not per-symbol: flatten the engine share only.
-        // The cross-sectional baskets are horizon-bounded hedges with their own breaker — the
-        // operator's standing rule is that NOTHING force-flattens an open basket, so a kill on a
-        // shared symbol must never take the basket's leg with it (same class as the 2026-07-07
-        // WLD/DOGE hedge-eaten incidents).
-        const killRaw = pos?.positionAmt ?? 0;
-        const killShare = killRaw - (this.externalManagedNetQty().get(intent.symbol) ?? 0);
-        const killAmt = Math.sign(killShare) === Math.sign(killRaw) ? Math.sign(killRaw) * Math.min(Math.abs(killShare), Math.abs(killRaw)) : 0;
-        if (Math.abs(killAmt) > 1e-12) {
-          const flatten = await this.client.placeOrder({
-            symbol: intent.symbol,
-            side: killAmt > 0 ? "SELL" : "BUY",
-            type: "MARKET",
-            quantity: Math.abs(killAmt),
-            reduceOnly: true,
-            newClientOrderId: `dtc-kill-${intent.paperOrderId.slice(-12)}`,
-          });
-          flattenOrderId = flatten.orderId;
+      // Cancel all engine orders + flatten engine positions, symbol by symbol.
+      const openIntents = st.intents.filter((i) => OPEN_INTENT_STATES.has(i.state));
+      for (const intent of openIntents) {
+        // A concurrent manualCloseIntent() may already be flattening/settling this exact intent —
+        // skip it here rather than racing; either it finishes and this intent is no longer OPEN
+        // next reconcile, or it fails and reconcile/lifecycle picks it back up next tick.
+        if (this.busyIntentIds.has(intent.paperOrderId)) continue;
+        this.busyIntentIds.add(intent.paperOrderId);
+        try {
+          await this.client.cancelAllOrders(intent.symbol);
+          await this.client.cancelAllAlgoOrders(intent.symbol);
+          const positions = await this.client.getPositions(intent.symbol);
+          const pos = positions.find((p) => p.symbol === intent.symbol);
+          let flattenOrderId: string | null = null;
+          // Kill-switch flatten is per-INTENT panic, not per-symbol: flatten the engine share only.
+          // The cross-sectional baskets are horizon-bounded hedges with their own breaker — the
+          // operator's standing rule is that NOTHING force-flattens an open basket, so a kill on a
+          // shared symbol must never take the basket's leg with it (same class as the 2026-07-07
+          // WLD/DOGE hedge-eaten incidents).
+          const killRaw = pos?.positionAmt ?? 0;
+          const killShare = killRaw - (this.externalManagedNetQty().get(intent.symbol) ?? 0);
+          const killAmt = Math.sign(killShare) === Math.sign(killRaw) ? Math.sign(killRaw) * Math.min(Math.abs(killShare), Math.abs(killRaw)) : 0;
+          if (Math.abs(killAmt) > 1e-12) {
+            const flatten = await this.client.placeOrder({
+              symbol: intent.symbol,
+              side: killAmt > 0 ? "SELL" : "BUY",
+              type: "MARKET",
+              quantity: Math.abs(killAmt),
+              reduceOnly: true,
+              newClientOrderId: `dtc-kill-${intent.paperOrderId.slice(-12)}`,
+            });
+            flattenOrderId = flatten.orderId;
+          }
+          // A kill-switch flatten is NEVER a win — book its realized P&L (almost always a loss,
+          // since this only fires on a breaker tripping) so lane reports don't silently drop it
+          // and resetKill()'s drawdown-peak rebase isn't understated right when it matters most.
+          const settled = await this.realizedFromTrades(intent.symbol, intent.createdAt, [intent.entryOrderId, intent.tp1OrderId, flattenOrderId]);
+          const net = settled?.netUsd ?? null;
+          intent.realizedPnlUsd = net;
+          intent.feesUsd = settled?.feesUsd ?? null;
+          if (net === null) {
+            intent.lastError = "kill flatten: P&L UNKNOWN — trades fetch failed; wallet-reconciliation will catch the true amount";
+          }
+          this.applyRealizedToLedger(net, "adverse");
+          intent.state = "KILLED";
+          intent.closeReason = `KILL_SWITCH: ${reason}`;
+          intent.closedAt = this.nowIso();
+          this.stampExitControllerSnapshot(intent);
+          intent.updatedAt = this.nowIso();
+        } catch (error) {
+          intent.lastError = `kill flatten failed: ${(error as Error).message}`;
+          // keep state — reconciliation will surface any residue loudly
+        } finally {
+          this.busyIntentIds.delete(intent.paperOrderId);
         }
-        // A kill-switch flatten is NEVER a win — book its realized P&L (almost always a loss, since
-        // this only fires on a breaker tripping) so lane reports don't silently drop it and
-        // resetKill()'s drawdown-peak rebase isn't understated right when it matters most.
-        const net = await this.realizedFromTrades(intent.symbol, intent.createdAt, [intent.entryOrderId, intent.tp1OrderId, flattenOrderId]);
-        intent.realizedPnlUsd = net;
-        this.applyRealizedToLedger(net, "adverse");
-        intent.state = "KILLED";
-        intent.closeReason = `KILL_SWITCH: ${reason}`;
-        intent.closedAt = this.nowIso();
-        intent.updatedAt = this.nowIso();
-      } catch (error) {
-        intent.lastError = `kill flatten failed: ${(error as Error).message}`;
-        // keep state — reconciliation will surface any residue loudly
       }
+      this.store.save();
+      // 2026-07-12 kill-switch RESPONSE fix (see LiveExecutionEngineOptions.onKillSwitchEngaged):
+      // after the engine's own intents are flattened, ask every other executor to close its OWN
+      // positions via its OWN orderly mechanics. Best-effort — a callback failure must never break
+      // this engine's already-completed kill path (killedAt is latched above regardless).
+      if (this.onKillSwitchEngaged) {
+        try {
+          await this.onKillSwitchEngaged(reason);
+        } catch (error) {
+          this.reconcileIssues.push(
+            `kill-switch executor-close callback failed: ${(error as Error).message} — the other executors' positions may still be open; their own per-lane exits keep managing them`,
+          );
+        }
+      }
+    } finally {
+      this.killSwitchEngaging = false;
     }
-    this.store.save();
   }
 
   // ── reconciliation ─────────────────────────────────────────────────────────
@@ -2247,6 +2572,12 @@ export class LiveExecutionEngine {
       if (intent.state !== "OPEN" && intent.state !== "TP1_FILLED_BE_SET") continue;
       // Rescue legs have no normal stop/TP — they are governed solely by the rescue flatten trigger.
       if (intent.rescue) continue;
+      // 2026-07-11 real-money audit fix: a concurrent manualCloseIntent()/engageKillSwitch() call
+      // (dashboard action, not gated by `this.ticking`) can flatten this SAME intent mid-await
+      // below; without this guard the stale getPositions snapshot would then see it flat and
+      // settle it a SECOND time here — double-booking realized P&L into the kill-switch ledger.
+      if (this.busyIntentIds.has(intent.paperOrderId)) continue;
+      this.busyIntentIds.add(intent.paperOrderId);
       try {
         const positions = await this.client.getPositions(intent.symbol);
         const pos = positions.find((p) => p.symbol === intent.symbol);
@@ -2349,15 +2680,17 @@ export class LiveExecutionEngine {
               } catch {
                 // best-effort cleanup after the runner is already closed.
               }
-              const net = await this.realizedFromTrades(intent.symbol, intent.createdAt, [
+              const settled = await this.realizedFromTrades(intent.symbol, intent.createdAt, [
                 intent.entryOrderId,
                 intent.tp1OrderId,
                 flat.orderId,
               ]);
+              const net = settled?.netUsd ?? null;
               intent.realizedPnlUsd = net;
-              intent.feesUsd = null;
+              intent.feesUsd = settled?.feesUsd ?? null;
               intent.state = "CLOSED";
               intent.closedAt = this.nowIso();
+              this.stampExitControllerSnapshot(intent);
               intent.closeReason = "BREAKEVEN_ALREADY_TOUCHED_MARKET_CLOSE";
               this.applyRealizedToLedger(net);
             }
@@ -2368,6 +2701,8 @@ export class LiveExecutionEngine {
       } catch (error) {
         intent.lastError = (error as Error).message ?? "lifecycle error";
         throw error; // counted by the tick error-streak guard
+      } finally {
+        this.busyIntentIds.delete(intent.paperOrderId);
       }
     }
     if (dirty) this.store.save();
@@ -2417,15 +2752,17 @@ export class LiveExecutionEngine {
     } catch {
       // Position is already flattened; residue cleanup is best-effort.
     }
-    const net = await this.realizedFromTrades(intent.symbol, intent.createdAt, [
+    const settled = await this.realizedFromTrades(intent.symbol, intent.createdAt, [
       intent.entryOrderId,
       intent.tp1OrderId,
       flat.orderId,
     ]);
+    const net = settled?.netUsd ?? null;
     intent.realizedPnlUsd = net;
-    intent.feesUsd = null;
+    intent.feesUsd = settled?.feesUsd ?? null;
     intent.state = "CLOSED";
     intent.closedAt = this.nowIso();
+    this.stampExitControllerSnapshot(intent);
     intent.updatedAt = this.nowIso();
     intent.closeReason = "LIVE_LONG_RUNNER_BREAKEVEN_AFTER_COST";
     this.applyRealizedToLedger(net);
@@ -2539,10 +2876,20 @@ export class LiveExecutionEngine {
     return 0;
   }
   /** Effective NET (after estimated close cost) profit-bank threshold (0 = no fixed take-profit).
-   *  profitBankNetTargetUsd (either env, flat $ amount) takes priority when set — this is the general
-   *  "bank small wins fast" target. Falls back to the legacy gross thresholds: testnet absolute USD,
-   *  or mainnet R-based (mainnetTpR × riskUsdPerTrade) so it scales with risk rather than a blunt $ cap. */
-  private profitBankThresholdUsd(): number {
+   *
+   *  2026-07-12 (Stage 4): when LIVE_PROFIT_BANK_MODE === "R_BASED" (opt-in, default FLAT), the
+   *  target scales to profitBankTargetR × the position's OWN effective risk-at-stop (`intentRiskUsd`,
+   *  the real per-trade R that the notional cap may have clipped below nominal), so a bigger-risk
+   *  position banks proportionally later instead of at a flat $ that truncates its right tail.
+   *  Absent the effective risk (older intent / not supplied), falls back to nominal riskUsdPerTrade.
+   *
+   *  FLAT mode (default) is the historical behavior unchanged: profitBankNetTargetUsd (flat $) takes
+   *  priority; else testnet absolute USD; else mainnet mainnetTpR × riskUsdPerTrade. */
+  private profitBankThresholdUsd(intentRiskUsd?: number | null): number {
+    if (this.config.profitBankMode === "R_BASED" && this.config.profitBankTargetR > 0) {
+      const riskUsd = typeof intentRiskUsd === "number" && intentRiskUsd > 0 ? intentRiskUsd : this.config.riskUsdPerTrade;
+      if (riskUsd > 0) return this.config.profitBankTargetR * riskUsd;
+    }
     if (this.config.profitBankNetTargetUsd > 0) return this.config.profitBankNetTargetUsd;
     if (this.config.env === "testnet") return this.config.testnetTakeProfitUsd;
     if (this.config.env === "mainnet" && this.config.mainnetProfitProtection && this.config.mainnetTpR > 0) {
@@ -2662,15 +3009,17 @@ export class LiveExecutionEngine {
       } catch {
         // Position is already flattened; exit-order cleanup remains best-effort.
       }
-      const net = await this.realizedFromTrades(intent.symbol, intent.createdAt, [
+      const settled = await this.realizedFromTrades(intent.symbol, intent.createdAt, [
         intent.entryOrderId,
         intent.tp1OrderId,
         flat.orderId,
       ]);
+      const net = settled?.netUsd ?? null;
       intent.realizedPnlUsd = net;
-      intent.feesUsd = null;
+      intent.feesUsd = settled?.feesUsd ?? null;
       intent.state = "CLOSED";
       intent.closedAt = this.nowIso();
+      this.stampExitControllerSnapshot(intent);
       intent.updatedAt = this.nowIso();
       intent.closeReason = !green
         ? (lossHardCutThis
@@ -2817,11 +3166,13 @@ export class LiveExecutionEngine {
     } catch {
       // residue cleanup is best-effort after the position is flat
     }
-    const liveLegRealized = await this.realizedFromTrades(action.symbol, rescueIntent.createdAt, [flat.orderId]);
+    const liveLegSettled = await this.realizedFromTrades(action.symbol, rescueIntent.createdAt, [flat.orderId]);
+    const liveLegRealized = liveLegSettled?.netUsd ?? null;
     rescueIntent.realizedPnlUsd = liveLegRealized;
-    rescueIntent.feesUsd = null;
+    rescueIntent.feesUsd = liveLegSettled?.feesUsd ?? null;
     rescueIntent.state = "CLOSED";
     rescueIntent.closedAt = this.nowIso();
+    this.stampExitControllerSnapshot(rescueIntent);
     rescueIntent.updatedAt = this.nowIso();
     rescueIntent.closeReason = action.reason.startsWith("max-hold") ? "RESCUE_MAXHOLD_CUT" : "RESCUE_FLATTEN_TARGET";
     this.applyRealizedToLedger(liveLegRealized);
@@ -2855,12 +3206,21 @@ export class LiveExecutionEngine {
     // The flip order closed the opposing leg(s): book their realized loss and close them.
     let priorRealized = 0;
     for (const oi of opposingIntents) {
-      const r = await this.realizedFromTrades(action.symbol, oi.createdAt, [oi.entryOrderId, oi.tp1OrderId, flip.orderId]);
-      priorRealized += r;
+      const rSettled = await this.realizedFromTrades(action.symbol, oi.createdAt, [oi.entryOrderId, oi.tp1OrderId, flip.orderId]);
+      const r = rSettled?.netUsd ?? null;
+      if (r === null) {
+        oi.lastError = "rescue flip: P&L UNKNOWN — trades fetch failed; wallet-reconciliation will catch the true amount";
+      } else {
+        priorRealized += r;
+      }
       oi.realizedPnlUsd = r;
-      oi.feesUsd = null;
+      // Pre-existing attribution note: with >1 opposing intents the SAME flip order's trades are
+      // summed into each intent (double-counted across intents) — unchanged here for fees, which
+      // inherit exactly the realizedPnlUsd attribution semantics above.
+      oi.feesUsd = rSettled?.feesUsd ?? null;
       oi.state = "CLOSED";
       oi.closedAt = this.nowIso();
+      this.stampExitControllerSnapshot(oi);
       oi.updatedAt = this.nowIso();
       oi.closeReason = "RESCUE_FLIP";
       this.applyRealizedToLedger(r);
@@ -2917,7 +3277,8 @@ export class LiveExecutionEngine {
     amt: number,
     shareFrac = 1,
   ): Promise<{ changed: boolean; closed: boolean }> {
-    const threshold = this.profitBankThresholdUsd();
+    // R_BASED mode scales the bank to THIS position's own effective risk-at-stop; FLAT ignores it.
+    const threshold = this.profitBankThresholdUsd(intent.effectiveRiskUsd ?? null);
     if (!(threshold > 0)) return { changed: false, closed: false };
     if (!pos) return { changed: false, closed: false };
     // Trigger from the INTENT'S OWN ENTRY, never the netted exchange P&L. The earlier shareFrac
@@ -2945,15 +3306,17 @@ export class LiveExecutionEngine {
     } catch {
       // best-effort residue cleanup after the position has already been closed.
     }
-    const net = await this.realizedFromTrades(intent.symbol, intent.createdAt, [
+    const settled = await this.realizedFromTrades(intent.symbol, intent.createdAt, [
       intent.entryOrderId,
       intent.tp1OrderId,
       flat.orderId,
     ]);
+    const net = settled?.netUsd ?? null;
     intent.realizedPnlUsd = net;
-    intent.feesUsd = null;
+    intent.feesUsd = settled?.feesUsd ?? null;
     intent.state = "CLOSED";
     intent.closedAt = this.nowIso();
+    this.stampExitControllerSnapshot(intent);
     intent.updatedAt = this.nowIso();
     intent.closeReason = `PROFIT_BANK_NET_${threshold.toFixed(2)}`;
     this.applyRealizedToLedger(net);
@@ -2968,8 +3331,14 @@ export class LiveExecutionEngine {
     const favorableR = intent.direction === "SHORT" ? (entry - mark) / risk : (mark - entry) / risk;
     const previousPeak = intent.maxFavorableR ?? 0;
     const peak = Math.max(previousPeak, favorableR);
-    const changed = peak !== previousPeak;
+    // MAE persistence (Tier 2 audit): running worst (most negative) favorableR, mirroring the peak
+    // update above exactly — same tick hook, same intents, same "only update if this tick is worse
+    // than the stored value" style. Purely additive: never read by the exit/close decision below.
+    const previousTrough = intent.maxAdverseR ?? 0;
+    const trough = Math.min(previousTrough, favorableR);
+    const changed = peak !== previousPeak || trough !== previousTrough;
     intent.maxFavorableR = peak;
+    intent.maxAdverseR = trough;
     if (peak < MFE_GIVEBACK_ARM_R) return { changed, closed: false };
 
     const exitR = peak * (1 - MFE_GIVEBACK_FRAC);
@@ -2997,15 +3366,17 @@ export class LiveExecutionEngine {
     } catch {
       // best-effort residue cleanup after the position has already been closed.
     }
-    const net = await this.realizedFromTrades(intent.symbol, intent.createdAt, [
+    const settled = await this.realizedFromTrades(intent.symbol, intent.createdAt, [
       intent.entryOrderId,
       intent.tp1OrderId,
       flat.orderId,
     ]);
+    const net = settled?.netUsd ?? null;
     intent.realizedPnlUsd = net;
-    intent.feesUsd = null;
+    intent.feesUsd = settled?.feesUsd ?? null;
     intent.state = "CLOSED";
     intent.closedAt = this.nowIso();
+    this.stampExitControllerSnapshot(intent);
     intent.updatedAt = this.nowIso();
     intent.closeReason = "MFE_GIVEBACK_EXIT";
     this.applyRealizedToLedger(net);
@@ -3053,15 +3424,17 @@ export class LiveExecutionEngine {
     } catch {
       // best-effort residue cleanup after the position has already been closed.
     }
-    const net = await this.realizedFromTrades(intent.symbol, intent.createdAt, [
+    const settled = await this.realizedFromTrades(intent.symbol, intent.createdAt, [
       intent.entryOrderId,
       intent.tp1OrderId,
       flat.orderId,
     ]);
+    const net = settled?.netUsd ?? null;
     intent.realizedPnlUsd = net;
-    intent.feesUsd = null;
+    intent.feesUsd = settled?.feesUsd ?? null;
     intent.state = "CLOSED";
     intent.closedAt = this.nowIso();
+    this.stampExitControllerSnapshot(intent);
     intent.updatedAt = this.nowIso();
     intent.closeReason = `LOSING_MAX_HOLD_CUT_${Math.round(this.config.losingMaxHoldMs / 3_600_000)}H`;
     this.applyRealizedToLedger(net);
@@ -3076,42 +3449,56 @@ export class LiveExecutionEngine {
     } catch {
       // best-effort cleanup; reconcile surfaces residue
     }
-    let realized = 0;
-    let fees = 0;
+    let net: number | null = null;
+    let fees: number | null = null;
     try {
       const triggeredAlgoOrderIds: string[] = [];
+      let algoQueryFailed = false;
       for (const algoId of [intent.stopOrderId, intent.beStopOrderId]) {
         if (algoId === null) continue;
         try {
           const algo = await this.client.queryAlgoOrder(algoId);
           if (algo.actualOrderId !== null) triggeredAlgoOrderIds.push(algo.actualOrderId);
         } catch {
-          // The trade list below still captures normal TP fills.
+          // 2026-07-11 real-money audit fix: this used to be silently swallowed, leaving
+          // triggeredAlgoOrderIds empty as if the stop/breakeven never fired. The trade sum below
+          // would then find ZERO matching trades for a real stop-out and book net=0 — read as a
+          // harmless scratch, hiding the actual loss. Escalate to an UNKNOWN settlement instead of
+          // guessing: a stale/incomplete ourOrderIds set can only UNDER-count real closing trades.
+          algoQueryFailed = true;
         }
       }
-      const trades = await this.client.getUserTrades(intent.symbol, {
-        startTime: new Date(intent.createdAt).getTime(),
-        limit: 200,
-      });
-      const ourOrderIds = new Set(
-        [intent.entryOrderId, intent.tp1OrderId, ...triggeredAlgoOrderIds].filter(
-          (id): id is string => typeof id === "string",
-        ),
-      );
-      for (const t of trades) {
-        if (!ourOrderIds.has(t.orderId)) continue;
-        realized += t.realizedPnl;
-        fees += t.commission; // commissionAsset assumed USDT on USD-M pairs
+      if (algoQueryFailed) {
+        intent.lastError = "settle: stop/breakeven order query failed — its real closing trade may be missing from this settlement; PnL left UNKNOWN, check manually";
+      } else {
+        const trades = await this.client.getUserTrades(intent.symbol, {
+          startTime: new Date(intent.createdAt).getTime(),
+          limit: 200,
+        });
+        const ourOrderIds = new Set(
+          [intent.entryOrderId, intent.tp1OrderId, ...triggeredAlgoOrderIds].filter(
+            (id): id is string => typeof id === "string",
+          ),
+        );
+        let realized = 0;
+        let feesSum = 0;
+        for (const t of trades) {
+          if (!ourOrderIds.has(t.orderId)) continue;
+          realized += t.realizedPnl;
+          feesSum += t.commission; // commissionAsset assumed USDT on USD-M pairs
+        }
+        net = realized - feesSum;
+        fees = feesSum;
       }
     } catch (error) {
-      intent.lastError = `settle: trades fetch failed (${(error as Error).message}) — PnL recorded as 0, check manually`;
+      intent.lastError = `settle: trades fetch failed (${(error as Error).message}) — PnL UNKNOWN, check manually`;
     }
 
-    const net = realized - fees;
     intent.realizedPnlUsd = net;
     intent.feesUsd = fees;
     intent.state = "CLOSED";
     intent.closedAt = this.nowIso();
+    this.stampExitControllerSnapshot(intent);
     intent.updatedAt = this.nowIso();
     intent.closeReason = intent.closeReason ?? "POSITION_FLAT";
 
@@ -3125,9 +3512,20 @@ export class LiveExecutionEngine {
    * flattened without recording its losses is exactly how the engine burned hundreds of
    * dollars while the consecutive-loss breaker sat at zero.
    */
-  private applyRealizedToLedger(net: number, classification: "auto" | "adverse" = "auto"): void {
+  private applyRealizedToLedger(net: number | null, classification: "auto" | "adverse" = "auto"): void {
     const st = this.store.getState();
     this.rollDailyLedger();
+    if (net === null) {
+      // 2026-07-11 real-money audit fix: a real close whose trades fetch failed has a GENUINELY
+      // UNKNOWN dollar P&L. The old code fabricated 0 here, which then read as a harmless scratch
+      // (|0| < scratchEpsilonUsd) — silently hiding a possibly real loss from the daily-loss,
+      // consecutive-loss, and drawdown kill-switches. Don't touch the dollar totals (wallet-
+      // reconciliation's ledger-vs-Binance-income check is the safety net for the true number),
+      // but DO count the loss-streak conservatively — an unknown outcome must never look neutral.
+      st.dailyLedger.losses += 1;
+      st.consecutiveLosses += 1;
+      return;
+    }
     st.dailyLedger.realizedPnlUsd += net;
     // An emergency flatten is NEVER a win, even if its realized PnL rounds to ~0 (e.g. the trade
     // fetch failed and net came back 0). Classifying it "adverse" stops a flatten from RESETTING
@@ -3155,19 +3553,37 @@ export class LiveExecutionEngine {
     if (st.totalRealizedPnlUsd > st.realizedPeakUsd) st.realizedPeakUsd = st.totalRealizedPnlUsd;
   }
 
-  /** Sum realized PnL net of fees for the given order ids on a symbol since an ISO time (best-effort; 0 on failure). */
-  private async realizedFromTrades(symbol: string, sinceIso: string, orderIds: Array<string | null>): Promise<number> {
+  /** Sum realized PnL net of fees for the given order ids on a symbol since an ISO time. Returns
+   *  `null` (not a fabricated 0) when the trades fetch itself fails — 2026-07-11 real-money audit
+   *  fix: a silent 0 here used to read as a harmless scratch and hide a real loss from the
+   *  kill-switch; every call site must treat null as "P&L unknown", never as "$0".
+   *
+   *  2026-07-12 fee-recording fix: this always fetched the real commissions (net = realizedPnl −
+   *  commission) but THREW THE FEE SUM AWAY, so 132 of the first 154 closed intents carried
+   *  feesUsd=null and every fee report coerced them to $0 — while the exchange-true commission bill
+   *  (-$15.59, 68.7% of the all-time loss) stayed invisible per-trade. Now returns both numbers so
+   *  every close path records the commissions it already paid for the fetch of. Also bumped the
+   *  page limit 200→1000 to match settleIfStopTriggered's earlier fix (#112 rationale). */
+  private async realizedFromTrades(
+    symbol: string,
+    sinceIso: string,
+    orderIds: Array<string | null>,
+  ): Promise<{ netUsd: number; feesUsd: number } | null> {
     const ids = new Set(orderIds.filter((id): id is string => typeof id === "string"));
-    if (ids.size === 0) return 0;
+    if (ids.size === 0) return { netUsd: 0, feesUsd: 0 };
     try {
-      const trades = await this.client.getUserTrades(symbol, { startTime: new Date(sinceIso).getTime(), limit: 200 });
+      const trades = await this.client.getUserTrades(symbol, { startTime: new Date(sinceIso).getTime(), limit: 1000 });
       let net = 0;
+      let fees = 0;
       for (const t of trades) {
-        if (ids.has(t.orderId)) net += t.realizedPnl - t.commission;
+        if (ids.has(t.orderId)) {
+          net += t.realizedPnl - t.commission;
+          fees += t.commission;
+        }
       }
-      return net;
+      return { netUsd: net, feesUsd: fees };
     } catch {
-      return 0;
+      return null;
     }
   }
 
@@ -3217,6 +3633,8 @@ export class LiveExecutionEngine {
   }
 
   private laneAllocationWeightPct(paper: PaperOrder): number {
+    const override = this.paperLaneWeightPct(paper);
+    if (override !== null) return Math.max(0, Math.min(100, override));
     return this.laneSelectionWeightPctForLane(paper.selectedLaneId ?? "");
   }
 
@@ -3224,7 +3642,23 @@ export class LiveExecutionEngine {
    *  plain allow-list (null = all lanes, [] = pause all new mirrors). Matches
    *  selectedLaneId as full id or variant suffix. */
   private laneAllowedForMirror(paper: PaperOrder): boolean {
+    const override = this.paperLaneGate(paper);
+    if (override !== null) return override;
     return this.laneSelectionAllowsLane(paper.selectedLaneId ?? "");
+  }
+
+  /** Unified orchestration deliberately consumes a chosen diagnostic recipe directly instead of
+   *  waiting for the old promotion ladder to relabel it HEADLINE. This bypass is narrow: the
+   *  central lane gate must explicitly accept the recipe and the source must still be fresh.
+   *  Status, dedup, stop/TP geometry, entry quality, cluster caps and every risk check below remain
+   *  unchanged. Returning null from paperLaneGate preserves the legacy source rules exactly. */
+  private paperSourceEligibleForMirror(paper: PaperOrder, nowIso: string): boolean {
+    const override = this.paperLaneGate(paper);
+    if (override !== null) return override && this.isFreshPaperOrder(paper, nowIso);
+    return this.config.mirrorAllPaperOrders ||
+      (paper.paperOrderMode === "HEADLINE" &&
+        this.isFreshPaperOrder(paper, nowIso) &&
+        this.isPaperOrderLiveEligible(paper, nowIso));
   }
 
   /** True when an operator selection (weighted allocation OR allow-list) is active AND
@@ -3456,53 +3890,73 @@ export class LiveExecutionEngine {
       return { ok: false, reason: `max concurrent positions reached (${this.config.maxConcurrentPositions})` };
     }
 
-    const filters = await this.getFilters(req.symbol);
-    if (!filters) return { ok: false, reason: `no exchange filters for ${req.symbol}` };
-
-    // Copy the testnet qty exactly, capped by the live notional ceiling.
-    const maxQtyByNotional = this.config.maxNotionalPerTrade / req.entryPrice;
-    const qty = roundDownToStep(Math.min(req.qty, maxQtyByNotional), filters.stepSize);
-    if (!(qty >= filters.minQty)) {
-      return { ok: false, reason: `copied quantity ${qty} below exchange minimum ${filters.minQty}` };
+    if (this.copyingSymbols.has(req.symbol)) {
+      return { ok: false, reason: `a copy is already in flight for ${req.symbol}` };
     }
+    this.copyingSymbols.add(req.symbol);
+    try {
+      const filters = await this.getFilters(req.symbol);
+      if (!filters) return { ok: false, reason: `no exchange filters for ${req.symbol}` };
 
-    const copyId = `tncopy-${Date.now().toString(36)}-${req.symbol.slice(0, 6)}`;
-    const exitRule: VariantExitRule = req.exitRule ?? "scaleout_tp1_trail";
-    const syntheticPaper = {
-      paperOrderId: copyId,
-      symbol: req.symbol,
-      direction: req.direction,
-      entryPrice: req.entryPrice,
-      stopLoss: req.stopLossPrice,
-      takeProfitLevels: [req.tp1Price],
-      createdAt: this.nowIso(),
-      paperStatus: "CREATED",
-      paperOrderMode: "HEADLINE",
-      diagnosticLabel: null,
-      variantExitRule: exitRule,
-      fillMode: "taker",
-      selectedLaneId: `TESTNET_COPY:${req.sourceLaneId ?? "MANUAL"}`,
-      regime: null,
-      controllerMode: null,
-      controllerConfidence: null,
-    } as unknown as PaperOrder;
-    const plan: LiveOrderPlan = {
-      ok: true,
-      reason: null,
-      qty,
-      tp1Qty: this.isFullTpExitRule(exitRule) ? qty : roundDownToStep(qty / 2, filters.stepSize),
-      notionalUsd: qty * req.entryPrice,
-      stopPrice: req.stopLossPrice,
-      tp1Price: req.tp1Price,
-    };
+      // Re-verify after the await gap above: a concurrent copy (or the tick's own mirrorNewSignals)
+      // could have opened this symbol while we were awaiting filters.
+      const stillOpen = this.store.getState().intents.filter((i) => OPEN_INTENT_STATES.has(i.state));
+      if (stillOpen.some((i) => i.symbol === req.symbol)) {
+        return { ok: false, reason: `an intent is already open on ${req.symbol}` };
+      }
 
-    await this.openIntent([{ paper: syntheticPaper, plan }], filters);
-    const intent = this.store.getState().intents.find((i) => i.paperOrderId === copyId);
-    if (!intent) return { ok: false, reason: "copy did not produce an intent (plan rejected)" };
-    if (intent.state === "ERROR") {
-      return { ok: false, reason: intent.lastError ?? "copy open failed (flattened safely)", intent };
+      // Copy the testnet qty exactly, capped by the live notional ceiling.
+      const maxQtyByNotional = this.config.maxNotionalPerTrade / req.entryPrice;
+      const qty = roundDownToStep(Math.min(req.qty, maxQtyByNotional), filters.stepSize);
+      if (!(qty >= filters.minQty)) {
+        return { ok: false, reason: `copied quantity ${qty} below exchange minimum ${filters.minQty}` };
+      }
+
+      const copyId = `tncopy-${Date.now().toString(36)}-${req.symbol.slice(0, 6)}`;
+      const exitRule: VariantExitRule = req.exitRule ?? "scaleout_tp1_trail";
+      const syntheticPaper = {
+        paperOrderId: copyId,
+        symbol: req.symbol,
+        direction: req.direction,
+        entryPrice: req.entryPrice,
+        stopLoss: req.stopLossPrice,
+        takeProfitLevels: [req.tp1Price],
+        createdAt: this.nowIso(),
+        paperStatus: "CREATED",
+        paperOrderMode: "HEADLINE",
+        diagnosticLabel: null,
+        variantExitRule: exitRule,
+        fillMode: "taker",
+        selectedLaneId: `TESTNET_COPY:${req.sourceLaneId ?? "MANUAL"}`,
+        regime: null,
+        controllerMode: null,
+        controllerConfidence: null,
+      } as unknown as PaperOrder;
+      const copyStopDistancePct = Math.abs(req.entryPrice - req.stopLossPrice) / req.entryPrice;
+      const plan: LiveOrderPlan = {
+        ok: true,
+        reason: null,
+        qty,
+        tp1Qty: this.isFullTpExitRule(exitRule) ? qty : roundDownToStep(qty / 2, filters.stepSize),
+        notionalUsd: qty * req.entryPrice,
+        stopPrice: req.stopLossPrice,
+        tp1Price: req.tp1Price,
+        effectiveRiskUsd: qty * req.entryPrice * copyStopDistancePct,
+        // Copies size from the testnet qty, not riskUsdPerTrade — "clipped" here means the live
+        // notional ceiling shrank the copied qty below what testnet held.
+        riskClippedByNotionalCap: req.qty > maxQtyByNotional,
+      };
+
+      await this.openIntent([{ paper: syntheticPaper, plan }], filters);
+      const intent = this.store.getState().intents.find((i) => i.paperOrderId === copyId);
+      if (!intent) return { ok: false, reason: "copy did not produce an intent (plan rejected)" };
+      if (intent.state === "ERROR") {
+        return { ok: false, reason: intent.lastError ?? "copy open failed (flattened safely)", intent };
+      }
+      return { ok: true, reason: null, intent };
+    } finally {
+      this.copyingSymbols.delete(req.symbol);
     }
-    return { ok: true, reason: null, intent };
   }
 
   /** Full copy spec for an OPEN intent (the testnet side of the copy-to-live relay). */
@@ -3543,7 +3997,16 @@ export class LiveExecutionEngine {
     };
   }
 
-  /** Set (and persist) the operator's lane allow-list. null restores "all lanes". */
+  /** Set (and persist) the operator's lane allow-list. null restores "all lanes".
+   *  2026-07-12 audit note: a round-2 bug-sweep finding claimed this should also set
+   *  laneAllocationOperatorLock, mirroring setLaneAllocationsAsOperator. Re-investigated and
+   *  rejected — RegimeAutopilot never writes allowedLaneIds (grepped confirmed: the only writer
+   *  is this method, called solely from routes/live.ts's POST /api/live/lanes), so there is no
+   *  actual autopilot-overwrite risk to protect against. Setting the lock here would instead
+   *  BREAK the already-tested, intentional maybeAutoResetLaneSelection() behavior — it explicitly
+   *  skips auto-reset when the lock is set, and the existing "lane selection auto-reset" test
+   *  suite (see live-execution-engine.test.ts) requires a losing close to reset an allow-list-only
+   *  selection same as an allocation-only one. Left as-is; not a real bug. */
   setAllowedLanes(laneIds: string[] | null): { allowedLaneIds: string[] | null } {
     const st = this.store.getState();
     if (laneIds === null) {
@@ -3587,7 +4050,11 @@ export class LiveExecutionEngine {
     // diagnosis so far was archaeology. Record the FIRST failing gate for the newest candidates —
     // pure observation, identical conditions to the filter below, surfaced via getStatus().
     const explainDrop = (o: PaperOrder): string => {
-      if (!this.config.mirrorAllPaperOrders) {
+      const orchestrated = this.paperLaneGate(o);
+      if (orchestrated !== null) {
+        if (!orchestrated) return "unified_recipe_not_allowed";
+        if (!this.isFreshPaperOrder(o, now)) return "stale";
+      } else if (!this.config.mirrorAllPaperOrders) {
         if (o.paperOrderMode !== "HEADLINE") return "not_headline";
         if (!this.isFreshPaperOrder(o, now)) return "stale";
         if (!this.isPaperOrderLiveEligible(o, now)) return "not_live_eligible";
@@ -3619,10 +4086,7 @@ export class LiveExecutionEngine {
     const ranked = this.paperStore.all
       .filter(
         (o) =>
-          (this.config.mirrorAllPaperOrders ||
-            (o.paperOrderMode === "HEADLINE" &&
-              this.isFreshPaperOrder(o, now) &&
-              this.isPaperOrderLiveEligible(o, now))) &&
+          this.paperSourceEligibleForMirror(o, now) &&
           o.diagnosticLabel == null &&
           this.laneAllowedForMirror(o) && // operator lane selection (applies in ALL mirror modes)
           MIRRORABLE_PAPER_STATUSES.has(o.paperStatus) &&
@@ -3770,9 +4234,14 @@ export class LiveExecutionEngine {
       // decides which symbols/priority are eligible; this additionally requires the symbol's OWN
       // fresh candles to confirm the direction right now). Fails CLOSED: missing/stale cache data
       // blocks rather than passes, since the whole point is "don't fire without confirmation."
+      // 2026-07-11 fix: was only checking `!signal?.confirmed`, never this entry's OWN computedAt —
+      // a persistently-failing refresh (network/API issue) kept re-serving a stale confirmed=true
+      // verdict from the last successful fetch, potentially days old, under the cache's shared
+      // top-level computedAt which gets re-stamped every cycle regardless of per-symbol success.
       if (isDirectionalTechnicalGateEnabled()) {
-        const signal = getSymbolVolatilityCacheStore().get().technicalBySymbol[first.symbol]?.[first.direction];
-        if (!signal?.confirmed) {
+        const entry = getSymbolVolatilityCacheStore().get().technicalBySymbol[first.symbol];
+        const signal = entry?.[first.direction];
+        if (!signal?.confirmed || !isDirectionalTechnicalSignalFresh(entry, nowMs)) {
           for (const paper of papers) latchReason(paper.paperOrderId, "technical_not_confirmed");
           continue;
         }
@@ -3821,7 +4290,7 @@ export class LiveExecutionEngine {
         const scaled =
           totalScale === 1
             ? plan
-            : { ...plan, qty: plan.qty * totalScale, notionalUsd: plan.notionalUsd * totalScale };
+            : { ...plan, qty: plan.qty * totalScale, notionalUsd: plan.notionalUsd * totalScale, effectiveRiskUsd: plan.effectiveRiskUsd * totalScale };
         return [{ paper, plan: scaled }];
       });
       if (planned.length === 0) {
@@ -3924,6 +4393,8 @@ export class LiveExecutionEngine {
       notionalUsd: planned.reduce((sum, item) => sum + item.plan.notionalUsd, 0),
       stopPrice: direction === "LONG" ? Math.max(...stops) : Math.min(...stops),
       tp1Price: direction === "LONG" ? Math.min(...targets) : Math.max(...targets),
+      effectiveRiskUsd: planned.reduce((sum, item) => sum + item.plan.effectiveRiskUsd, 0),
+      riskClippedByNotionalCap: planned.some((item) => item.plan.riskClippedByNotionalCap),
     };
   }
 
@@ -4035,8 +4506,11 @@ export class LiveExecutionEngine {
       feesUsd: null,
       exitRule: this.paperExitRule(paper),
       maxFavorableR: null,
+      maxAdverseR: null,
       // Tagged so a losing close of an operator-selected position can auto-reset the selection.
       operatorLaneSelection: this.operatorSelectionActiveFor(paper) || undefined,
+      effectiveRiskUsd: plan.effectiveRiskUsd,
+      riskClippedByNotionalCap: plan.riskClippedByNotionalCap,
       createdAt: now,
       updatedAt: now,
       closedAt: null,
@@ -4162,8 +4636,10 @@ export class LiveExecutionEngine {
           intent.closeReason = "EMERGENCY_FLATTEN_NO_STOP";
           // A real position was opened and immediately dumped — book the realized loss so the
           // daily-loss and consecutive-loss breakers SEE the churn instead of being blind to it.
-          const net = await this.realizedFromTrades(paper.symbol, intent.createdAt, [intent.entryOrderId, flat.orderId]);
+          const settled = await this.realizedFromTrades(paper.symbol, intent.createdAt, [intent.entryOrderId, flat.orderId]);
+          const net = settled?.netUsd ?? null;
           intent.realizedPnlUsd = net;
+          intent.feesUsd = settled?.feesUsd ?? null;
           this.applyRealizedToLedger(net, "adverse");
         }
       } catch (flattenError) {
@@ -4251,6 +4727,10 @@ export class LiveExecutionEngine {
       const stopDistancePct = Math.min(oldStopDistancePct, newStopDistancePct);
       const targetDistancePct = Math.min(oldTargetDistancePct, newTargetDistancePct);
       intent.qty = totalQty;
+      // R-clipping telemetry: the add carries its own at-risk dollars; accumulate so the intent's
+      // effectiveRiskUsd stays the whole position's true R (report-only, same as at open).
+      intent.effectiveRiskUsd = (intent.effectiveRiskUsd ?? 0) + addition.effectiveRiskUsd;
+      intent.riskClippedByNotionalCap = (intent.riskClippedByNotionalCap ?? false) || addition.riskClippedByNotionalCap;
       intent.tp1Qty = this.isFullTpExitRule(this.intentExitRule(intent))
         ? totalQty
         : roundDownToStep(totalQty / 2, filters.stepSize);
@@ -4327,8 +4807,10 @@ export class LiveExecutionEngine {
             newClientOrderId: `dtc-${idTail}-ax`,
           });
           intent.closeReason = "EMERGENCY_FLATTEN_ADD_FAILED";
-          const net = await this.realizedFromTrades(intent.symbol, intent.createdAt, [intent.entryOrderId, flat.orderId]);
+          const settled = await this.realizedFromTrades(intent.symbol, intent.createdAt, [intent.entryOrderId, flat.orderId]);
+          const net = settled?.netUsd ?? null;
           intent.realizedPnlUsd = net;
+          intent.feesUsd = settled?.feesUsd ?? null;
           this.applyRealizedToLedger(net, "adverse");
         }
       } catch (flattenError) {

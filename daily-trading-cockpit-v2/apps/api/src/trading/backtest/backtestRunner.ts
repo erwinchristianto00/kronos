@@ -213,6 +213,7 @@ interface OpenState {
   atr: number;
   takeProfitATR: number;
   stopLossATR: number;
+  maxHoldMinutes: number;
   tpPrice: number;
   slPrice: number;
   beArmATR?: number;
@@ -410,8 +411,7 @@ export function runBacktest(config: BacktestConfig): BacktestMetrics {
       const hitTP = isLong ? bar.high >= open.tpPrice : bar.low <= open.tpPrice;
       const holdMin = (bar.timestamp - open.entryTs) / 60_000;
       const mode = getStrategyMode(open.regime);
-      const laneMaxHold = laneMaxHoldMinutes(open.lane);
-      const overHold = holdMin >= laneMaxHold;
+      const overHold = holdMin >= open.maxHoldMinutes;
 
       // Conservative tie-break: if both SL and TP are inside the same bar, take SL.
       if (hitSL) {
@@ -509,6 +509,11 @@ export function runBacktest(config: BacktestConfig): BacktestMetrics {
       atr: bar.atr,
       takeProfitATR: decision.exit.takeProfitATR,
       stopLossATR: decision.exit.stopLossATR,
+      // 2026-07-12 fix: previously re-derived via a hand-maintained laneMaxHoldMinutes(open.lane)
+      // switch at management time, duplicating each lane's own exit.maxHoldMinutes (already sitting
+      // right here at entry, same as every other exit field above) — a lane's config could change
+      // without this switch ever being updated, silently corrupting backtest fidelity with no error.
+      maxHoldMinutes: decision.exit.maxHoldMinutes,
       tpPrice: isLong
         ? entryPrice + decision.exit.takeProfitATR * bar.atr
         : entryPrice - decision.exit.takeProfitATR * bar.atr,
@@ -540,25 +545,6 @@ export function runBacktest(config: BacktestConfig): BacktestMetrics {
 
   diagnostics.closedTradeCount = trades.length;
   return summarize(trades, startingEquity, equity, maxDrawdown, allDays.size, tradedDays.size, diagnostics);
-}
-
-function laneMaxHoldMinutes(lane: LaneId): number {
-  switch (lane) {
-    case "SHORT_RALLY_FADE":
-      return 60;
-    case "BREAKDOWN_RETEST_SHORT":
-      return 90;
-    case "MICRO_MEAN_REVERSION":
-      return 20;
-    case "PULLBACK_LONG_SCALP":
-      return 120;
-    case "BREAKOUT_RETEST_LONG":
-      return 180;
-    case "RELATIVE_STRENGTH_LONG":
-      return 180;
-    default:
-      return 120;
-  }
 }
 
 function summarize(

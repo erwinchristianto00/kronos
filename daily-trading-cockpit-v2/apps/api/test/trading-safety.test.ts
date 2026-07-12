@@ -343,6 +343,20 @@ describe("decision trace fields", () => {
     expect(d.trace?.riskGuardReason).toBeTruthy();
   });
 
+  it("[NaN-FAIL-CLOSED, 2026-07-12 fix] a NaN openPositions/tradesToday blocks entry instead of silently disabling the cap", () => {
+    // `value ?? 0` only replaces null/undefined — NaN used to make `NaN >= cap` always false,
+    // silently DISABLING the position/trade cap rather than failing closed on unknown state.
+    const dOpen = buildTradingDecision(fadeSetup({ openPositions: Number.NaN }));
+    expect(dOpen.action).toBe("NO_TRADE");
+    expect(dOpen.trace?.rejectedBy).toBe("RISK_GUARD");
+    expect(dOpen.trace?.riskGuardReason).toContain("MAX_OPEN_POSITIONS");
+
+    const dTrades = buildTradingDecision(fadeSetup({ tradesToday: Number.NaN }));
+    expect(dTrades.action).toBe("NO_TRADE");
+    expect(dTrades.trace?.rejectedBy).toBe("RISK_GUARD");
+    expect(dTrades.trace?.riskGuardReason).toContain("MAX_TRADES_PER_DAY");
+  });
+
   it("records noTradeReason from the environment guard", () => {
     const d = buildTradingDecision(fadeSetup({ signalConflict: true }));
     expect(d.trace?.rejectedBy).toBe("NO_TRADE_GUARD");

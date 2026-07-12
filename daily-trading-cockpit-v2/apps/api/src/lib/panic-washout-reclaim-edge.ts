@@ -61,6 +61,7 @@ function finite(v: number | null | undefined): v is number {
 }
 
 export const PWR_INTERVAL = process.env.PANIC_WASHOUT_INTERVAL || "1h";
+export const PWR_MAX_STORED_OBSERVATIONS = envNum("PANIC_WASHOUT_MAX_STORED_OBSERVATIONS", 500);
 export const PWR_ATR_PERIOD = envNum("PANIC_WASHOUT_ATR_PERIOD", 14);
 /** Panic bar's |close-open| must be at least this many ATRs — a genuine blowoff, not routine noise. */
 export const PWR_PANIC_ATR_MULT = Number(process.env.PANIC_WASHOUT_ATR_MULT) || 1.5;
@@ -351,7 +352,20 @@ export class PanicWashoutStore {
     const o = this.state.observations.find((x) => x.observationId === observationId);
     if (o) Object.assign(o, patch);
   }
+  /** Bounded retention: every OPEN observation is kept, plus at most PWR_MAX_STORED_OBSERVATIONS
+   *  settled ones — oldest settled observations are dropped first once that cap is exceeded.
+   *  2026-07-11 OOM audit fix: this file had no cap at all despite being live-wired. */
+  private prune(): void {
+    const open = this.state.observations.filter((o) => o.status === "OPEN");
+    const settled = this.state.observations
+      .filter((o) => o.status !== "OPEN")
+      .sort((a, b) => a.openedAtMs - b.openedAtMs);
+    const keepSettled =
+      settled.length > PWR_MAX_STORED_OBSERVATIONS ? settled.slice(settled.length - PWR_MAX_STORED_OBSERVATIONS) : settled;
+    this.state.observations = [...open, ...keepSettled];
+  }
   save(): void {
+    this.prune();
     mkdirSync(dirname(this.file), { recursive: true });
     const tmp = `${this.file}.tmp`;
     writeFileSync(tmp, JSON.stringify(this.state), "utf-8");

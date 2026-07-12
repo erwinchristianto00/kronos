@@ -112,8 +112,20 @@ export const PAPER_MAX_HOLD_MS = 72 * 60 * 60 * 1000; // 72 h
 export const DEFAULT_PAPER_EQUITY = 2000;
 /** Max DIAGNOSTIC closed orders retained in the paper store (rolling measurement window). The
  *  store loads fully each resolve cycle, so unbounded closed-order growth is a memory/latency risk
- *  (the OOM class). HEADLINE (real-ledger) + OPEN orders are NEVER pruned by this. Env-tunable. */
-export const PAPER_MAX_CLOSED_DIAGNOSTIC = Number(process.env.PAPER_MAX_CLOSED_DIAGNOSTIC) || 9_999_999;
+ *  (the OOM class). HEADLINE (real-ledger) + OPEN orders are NEVER pruned by this. Env-tunable.
+ *  2026-07-11: the previous default (9,999,999) was effectively infinite — confirmed live, the
+ *  research instance had grown to 11,213 total orders / 34MB and was never once pruned, directly
+ *  correlated with that instance's 2x-higher OOM crash-restart rate vs live/testnet (whose smaller
+ *  paper-order volume kept them under the same inert ceiling by chance, not by this cap doing
+ *  anything). 5,000 keeps ~9-10 days of rolling diagnostic history at the observed ~540/day
+ *  closed-diagnostic rate — ample for every lane's edgeReady sample-size checks (n>=30) while
+ *  bounding the store to a small fraction of its previous size. */
+export const PAPER_MAX_CLOSED_DIAGNOSTIC = Number(process.env.PAPER_MAX_CLOSED_DIAGNOSTIC) || 5_000;
+/** Never reduce a single lane's retained closed-diagnostic count below this purely because sibling
+ *  lanes are busier — see pruneClosedDiagnostic()'s doc comment. Comfortably above every n>=30/
+ *  n>=40 sample-size gate in the codebase. Env-tunable, mirrors PAPER_DIAGNOSTIC_MAX_OPEN_PER_LANE's
+ *  naming in paper-opportunity-allocator.ts. */
+export const PER_LANE_DIAGNOSTIC_FLOOR = Number(process.env.PAPER_MAX_CLOSED_DIAGNOSTIC_PER_LANE_FLOOR) || 200;
 const RISK_PCT = 1; // 1% of equity per trade — never changed
 const DEFAULT_PAPER_MAX_NOTIONAL_CAP = 50_000;
 const PAPER_TAKER_COST_BPS = 22; // mirrors TAKER_ROUNDTRIP_BPS from CG variant matrix
@@ -601,11 +613,24 @@ export class PaperExecutionRouterStore {
 
   /** Bound memory: DIAGNOSTIC closed orders only feed the ROLLING diagnostic measurement view
    *  (per-lane net/PF/WR + diagnostic P&L tile) — the VM matrix is the authoritative OOS spine, and
-   *  the HEADLINE ledger (real money) is NEVER pruned here. Keeps the newest `maxClosed` diagnostic
-   *  closed orders (by updatedAt) and drops older ones. OPEN orders (resolver inputs) and ALL
+   *  the HEADLINE ledger (real money) is NEVER pruned here. OPEN orders (resolver inputs) and ALL
    *  non-diagnostic orders are untouched. Pruned orders' signals are from old scan batches, so their
-   *  dedupeKeys can't collide with fresh candidates → no re-admission. No-op below the cap (so it
-   *  changes nothing today; current diagnostic-closed count is well under it). Returns count pruned. */
+   *  dedupeKeys can't collide with fresh candidates → no re-admission. No-op below the cap. Returns
+   *  count pruned.
+   *
+   *  2026-07-11: a flat global "keep newest maxClosed across every lane combined" was found by
+   *  adversarial review to cliff-cut quiet lanes' ENTIRE history the first time this ever engages
+   *  (this store had never been pruned before, so the first real prune jumps straight from whatever
+   *  the current total is down to maxClosed in one shot) — whichever lanes are busiest would crowd
+   *  out quiet ones (rare-regime variants, benchmark-only lanes closing 1-3/day) entirely, corrupting
+   *  the n>=30/n>=40 sample-size gates computeAutoQuarantinedVariantLanes()/laneEconomics()/
+   *  per-symbol-lane-book-edge.ts all compute from this same pool. Fixed by giving every
+   *  selectedLaneId a floor (PER_LANE_DIAGNOSTIC_FLOOR) that's kept regardless of how busy sibling
+   *  lanes are — mirrors the per-lane/per-symbol/global-backstop shape paper-opportunity-allocator.ts
+   *  already uses for the OPEN book (PAPER_DIAGNOSTIC_MAX_OPEN_PER_LANE et al). The global maxClosed
+   *  ceiling still applies to whatever's left over each lane's floor, so total size can modestly
+   *  exceed maxClosed when there are many quiet lanes each sitting at their floor — an intentional
+   *  tradeoff: never zero out a lane's history purely because a sibling is busier. */
   pruneClosedDiagnostic(maxClosed: number): number {
     const isClosedDiag = (o: PaperOrder): boolean =>
       (o.paperStatus === "PAPER_CLOSED_WIN" || o.paperStatus === "PAPER_CLOSED_LOSS") &&
@@ -616,9 +641,27 @@ export class PaperExecutionRouterStore {
       const ms = new Date(o.updatedAt ?? o.createdAt ?? 0).getTime();
       return Number.isFinite(ms) ? ms : 0;
     };
+
+    const byLane = new Map<string, PaperOrder[]>();
+    for (const o of closedDiag) {
+      const laneId = o.selectedLaneId ?? "unknown";
+      const bucket = byLane.get(laneId);
+      if (bucket) bucket.push(o);
+      else byLane.set(laneId, [o]);
+    }
+    const floorKept: PaperOrder[] = [];
+    const remainder: PaperOrder[] = [];
+    for (const bucket of byLane.values()) {
+      bucket.sort((a, b) => tsOf(b) - tsOf(a));
+      floorKept.push(...bucket.slice(0, PER_LANE_DIAGNOSTIC_FLOOR));
+      remainder.push(...bucket.slice(PER_LANE_DIAGNOSTIC_FLOOR));
+    }
+    remainder.sort((a, b) => tsOf(b) - tsOf(a));
+    const remainderBudget = Math.max(0, maxClosed - floorKept.length);
     const keep = new Set(
-      closedDiag.sort((a, b) => tsOf(b) - tsOf(a)).slice(0, maxClosed).map((o) => o.paperOrderId),
+      [...floorKept, ...remainder.slice(0, remainderBudget)].map((o) => o.paperOrderId),
     );
+
     const before = this.state.orders.length;
     this.state.orders = this.state.orders.filter((o) => !isClosedDiag(o) || keep.has(o.paperOrderId));
     const pruned = before - this.state.orders.length;
@@ -1045,7 +1088,25 @@ function _buildBaseOrder(
   }, now);
 }
 
+/**
+ * 2026-07-11: every rejected/admitted observation in the loop below calls store.add(), which
+ * (outside a batch) does a full-array JSON.stringify + writeFileSync on its own — on the research
+ * instance's ~34MB pre-fix store, that's a full-store reserialize per candidate, once per scan
+ * cycle, for however many candidates that cycle produced. Same class of write-amplification
+ * resolvePaperOrders() was already fixed for (see its own beginBatch/endBatch wrapper above) —
+ * applying the identical pattern here so a single flush happens once per admission pass instead of
+ * once per candidate.
+ */
 export function admitPaperOrders(inputs: PaperAdmissionInputs): PaperAdmissionResult {
+  inputs.store.beginBatch();
+  try {
+    return admitPaperOrdersInner(inputs);
+  } finally {
+    inputs.store.endBatch();
+  }
+}
+
+function admitPaperOrdersInner(inputs: PaperAdmissionInputs): PaperAdmissionResult {
   const {
     store, vmStore, eligibleLane, routerReport, gateReport, now,
   } = inputs;

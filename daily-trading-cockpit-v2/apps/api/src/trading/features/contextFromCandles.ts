@@ -53,6 +53,7 @@ export interface FeatureAdapterConfig {
   window: number; // general lookback (bars) for volume/range/structure
   vwapWindow: number; // rolling-VWAP window (bars)
   levelTolerancePct: number; // "near a level" band
+  sustainedAboveLevelConfirmBars: number; // consecutive closed 4H bars above a level ⇒ "sustained", not just a retest touch
   breadthWeakPct: number; // breadth fraction below this ⇒ weak
   breadthPositivePct: number; // breadth fraction at/above this ⇒ positive
   volumeExpansionRatio: number; // lastVol / avgVol ⇒ expansion
@@ -72,6 +73,7 @@ export const DEFAULT_FEATURE_CONFIG: FeatureAdapterConfig = {
   window: 20,
   vwapWindow: 24,
   levelTolerancePct: 0.004, // 0.4%
+  sustainedAboveLevelConfirmBars: 2,
   breadthWeakPct: 0.4,
   breadthPositivePct: 0.55,
   volumeExpansionRatio: 1.3,
@@ -388,11 +390,30 @@ export function contextFromCandles(input: FeatureAdapterInput): MarketContext {
     supportBroken === true && nearLevel(priceH1, priorSupport, cfg.levelTolerancePct * 3) ? true : undefined;
   // retest failed (short thesis): retested old support from below and closed back under.
   const retestFailed = retestOldSupport === true && priceH1 < priorSupport ? true : undefined;
-  // 62k retest hold (long thesis): only when NOT failed and price holding above 62k after reclaim.
-  const retest62000Hold =
-    btcClose4hAbove62000 === true && nearLevel(priceH1, cfg.btcBelowLevelB, cfg.levelTolerancePct * 3) && priceH1 >= cfg.btcBelowLevelB
-      ? true
-      : undefined;
+  // 62k retest hold (long thesis): true if EITHER (a) price is in the narrow instant of
+  // retesting the level itself, OR (b) BTC has SUSTAINED above 62k across the last N
+  // confirmed 4H closes and is still at/above it now.
+  //
+  // (a) alone made this flag structurally unreachable during a real, decisive rally:
+  // btcClose4hAbove62000 only turns true once an entire 4H candle CLOSES above the
+  // level (up to 4h lag behind the actual cross), by which point price has typically
+  // already run well outside the +/-1.2% "near level" band — confirmed live 2026-07-10:
+  // BTC held above 62000 for 31+ hours with 100% breadth, yet retest62000Hold (and thus
+  // NEUTRAL_RECOVERY) never fired even once in 746 snapshots, because price sat 3.97%
+  // above 62000 the whole time — 3x outside the band. (b) restores the flag's own
+  // documented intent ("holding above 62k after reclaim") for a genuine sustained move,
+  // confirmed by sustainedAboveLevelConfirmBars consecutive 4H closes (not a single-bar
+  // fluke), without loosening or touching (a)'s original narrow-band case.
+  const retestAtLevel =
+    btcClose4hAbove62000 === true &&
+    nearLevel(priceH1, cfg.btcBelowLevelB, cfg.levelTolerancePct * 3) &&
+    priceH1 >= cfg.btcBelowLevelB;
+  const sustainedAbove62000 =
+    btcClose4hAbove62000 === true &&
+    h4.length >= cfg.sustainedAboveLevelConfirmBars &&
+    tail(h4, cfg.sustainedAboveLevelConfirmBars).every((c) => c.close > cfg.btcBelowLevelB) &&
+    priceH1 >= cfg.btcBelowLevelB;
+  const retest62000Hold = retestAtLevel || sustainedAbove62000 ? true : undefined;
 
   const btcStillWeak =
     btcBelow62000 === true && (marketStructureBullish !== true) ? true : undefined;

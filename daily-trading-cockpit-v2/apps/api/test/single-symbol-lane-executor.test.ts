@@ -19,6 +19,7 @@ import {
   makeFixedRewardExitPolicy,
   makeMfeGivebackExitPolicy,
   type SingleSymbolExecClient,
+  type SingleSymbolExitPolicy,
   type SingleSymbolFreshSignal,
 } from "../src/lib/single-symbol-lane-executor.js";
 
@@ -89,11 +90,20 @@ class FakeClient implements SingleSymbolExecClient {
       ["DOGEUSDT", f(1, 1)],
     ]);
   }
-  async setLeverage(): Promise<void> {}
-  async getPositions(): Promise<FuturesPosition[]> {
-    return Array.from(this.markPriceBySymbol.entries()).map(([symbol, markPrice]) => ({
-      symbol, positionAmt: 0, entryPrice: 0, markPrice, liquidationPrice: 0, unRealizedProfit: 0, leverage: 3, marginType: "ISOLATED",
+  setLeverageCalls: string[] = [];
+  async setLeverage(symbol: string): Promise<void> {
+    this.setLeverageCalls.push(symbol);
+  }
+  /** Simulates a position ALREADY open on the exchange for this symbol (e.g. owned by a sibling
+   *  executor) — used by the [LEVERAGE-SKIP] test to verify setLeverage isn't called against it. */
+  positionAmtBySymbol = new Map<string, number>();
+  async getPositions(symbol?: string): Promise<FuturesPosition[]> {
+    const symbols = new Set([...this.markPriceBySymbol.keys(), ...this.positionAmtBySymbol.keys()]);
+    const entries = Array.from(symbols).map((sym) => ({
+      symbol: sym, positionAmt: this.positionAmtBySymbol.get(sym) ?? 0, entryPrice: 0,
+      markPrice: this.markPriceBySymbol.get(sym) ?? 0, liquidationPrice: 0, unRealizedProfit: 0, leverage: 3, marginType: "ISOLATED" as const,
     }));
+    return symbol ? entries.filter((p) => p.symbol === symbol) : entries;
   }
   async placeOrder(params: PlaceOrderParams): Promise<FuturesOrder> {
     if (this.failOnSymbol === params.symbol) throw new Error(`exchange rejected ${params.symbol}`);
@@ -158,6 +168,7 @@ function makeExecutor(opts: {
   maxOpenPositions?: number;
   dailyMaxLossUsd?: number;
   exitPolicy?: ReturnType<typeof makeFixedRewardExitPolicy>;
+  portfolioExitPolicy?: SingleSymbolExitPolicy;
   existingNotionalForSymbol?: (symbol: string) => number;
   maxNotionalPerSymbolAcrossLanes?: number;
   currentPrice?: number | null;
@@ -173,6 +184,7 @@ function makeExecutor(opts: {
     direction: opts.direction ?? "SHORT",
     getOpenSignals: () => signals,
     exitPolicy: opts.exitPolicy ?? makeFixedRewardExitPolicy({ rewardMultiple: 0.5, maxHoldMs: 48 * 3_600_000 }),
+    portfolioExitPolicy: opts.portfolioExitPolicy,
     isAllowed: () => opts.allowed ?? true,
     laneWeightPct: () => opts.laneWeightPct ?? 100,
     legUsd: () => opts.legUsd ?? 25,
@@ -244,7 +256,7 @@ describe("makeMfeGivebackExitPolicy (INTRADAY_MOMENTUM_BREAKOUT geometry)", () =
 });
 
 describe("SingleSymbolLaneExecutor — entry", () => {
-  it("opens a position from a fresh signal, sized from legUsd/allocation weight, and places a protective stop next tick", async () => {
+  it("opens a position from a fresh signal, sized from legUsd/allocation weight, and places a protective stop immediately (same tick, 2026-07-12 fix)", async () => {
     // legUsd effective = 120,000 * 50% = 60,000; entry 60,000 -> qty = 1.0 exactly (stepSize 0.001).
     const { executor, client, store } = makeExecutor({ signals: [signal()], legUsd: 120_000, laneWeightPct: 50 });
     await executor.tick();
@@ -256,11 +268,37 @@ describe("SingleSymbolLaneExecutor — entry", () => {
     expect(pos.direction).toBe("SHORT");
     expect(pos.qty).toBeCloseTo(1, 6);
     expect(client.placed.length).toBe(1);
-    expect(pos.stopAlgoOrderId).toBeNull(); // not yet placed on THIS tick
-
-    await executor.tick(); // next tick: ensureStopOrder runs
+    // 2026-07-12 fix: the stop used to be deferred to the NEXT tick, contradicting this module's
+    // own header comment and leaving a freshly-opened real position unprotected for a full tick
+    // interval. ensureStopOrder now runs eagerly right after the entry fills, same tick.
     expect(client.algosPlaced.length).toBe(1);
-    expect(store.getState().positions[0]!.stopAlgoOrderId).not.toBeNull();
+    expect(pos.stopAlgoOrderId).not.toBeNull();
+  });
+
+  it("[ENTRY-RETRY, 2026-07-12 fix] a transient entry-order failure does NOT permanently blacklist the signal via attemptedObservationIds", async () => {
+    const client = new FakeClient();
+    client.failOnSymbol = "BTCUSDT";
+    const sig = signal();
+    const { executor, store } = makeExecutor({ client, signals: [sig], legUsd: 10_000 });
+    await executor.tick(); // entry order throws (transient failure)
+    expect(store.getState().positions.length).toBe(0);
+    expect(store.getState().attemptedObservationIds ?? []).not.toContain(sig.observationId);
+
+    client.failOnSymbol = null; // the transient issue clears
+    await executor.tick(); // the SAME signal must still be eligible for retry
+    expect(store.getState().positions.length).toBe(1);
+    expect(store.getState().positions[0]!.status).toBe("OPEN");
+  });
+
+  it("[LEVERAGE-SKIP, 2026-07-12 fix] never calls setLeverage on a symbol that already has ANY open position (e.g. owned by a sibling executor)", async () => {
+    const client = new FakeClient();
+    client.positionAmtBySymbol.set("BTCUSDT", 0.02); // a real exchange position already exists
+    const { executor, store } = makeExecutor({ client, signals: [signal()], legUsd: 10_000 });
+    await executor.tick();
+    expect(store.getState().positions.length).toBe(1); // this executor's own entry still opens
+    // setLeverage must never have been called — a sibling's real position is on this symbol, and
+    // changing leverage would silently move ITS liquidation price.
+    expect(client.setLeverageCalls).toEqual([]);
   });
 
   it("skips a too-small notional that rounds to zero qty (below minQty)", async () => {
@@ -425,8 +463,9 @@ describe("SingleSymbolLaneExecutor — entry", () => {
     const client = new FakeClient();
     client.failAlgoOnce = true;
     const { executor, store } = makeExecutor({ client, signals: [signal()], legUsd: 10_000 });
-    await executor.tick(); // opens position
-    await executor.tick(); // ensureStopOrder fails once
+    // 2026-07-12 fix: ensureStopOrder now runs eagerly the SAME tick the position opens, so the
+    // first (failing) attempt happens on tick 1, not tick 2.
+    await executor.tick(); // opens position + 1st stop attempt fails
     expect(store.getState().positions[0]!.stopAlgoOrderId).toBeNull();
     await executor.tick(); // retries and succeeds
     expect(store.getState().positions[0]!.stopAlgoOrderId).not.toBeNull();
@@ -434,6 +473,29 @@ describe("SingleSymbolLaneExecutor — entry", () => {
 });
 
 describe("SingleSymbolLaneExecutor — exits", () => {
+  it("[PORTFOLIO-EXIT] lets the central overlay close while preserving this executor's orderly close path", async () => {
+    const client = new FakeClient();
+    const { executor, store } = makeExecutor({
+      client,
+      signals: [signal()],
+      legUsd: 10_000,
+      portfolioExitPolicy: (ctx) => ({
+        shouldExit: true,
+        reason: "UNIFIED_REGIME_FLIP_BANK",
+        nextPeakFavorableR: ctx.peakFavorableR,
+      }),
+    });
+    await executor.tick();
+    const algoId = store.getState().positions[0]!.stopAlgoOrderId!;
+    client.markPriceBySymbol.set("BTCUSDT", 59900);
+    await executor.tick();
+    const position = store.getState().positions[0]!;
+    expect(position.status).toBe("CLOSED");
+    expect(position.closeReason).toBe("UNIFIED_REGIME_FLIP_BANK");
+    expect(client.algosCancelled).toContain(algoId);
+    expect(client.placed.some((order) => order.reduceOnly === true)).toBe(true);
+  });
+
   it("[POLICY-EXIT] closes via reduceOnly market order and cancels the stop first when the exit policy fires", async () => {
     const client = new FakeClient();
     const { executor, store } = makeExecutor({ client, signals: [signal()], legUsd: 10_000 });
@@ -495,6 +557,55 @@ describe("SingleSymbolLaneExecutor — exits", () => {
     const closed = store.getState().positions[0]!;
     expect(closed.status).toBe("CLOSED");
     expect(closed.netPnlUsd).toBeCloseTo(-1.85, 6);
+  });
+
+  it("[PARTIAL-FILL, 2026-07-12 fix] a stop that only partially fills does NOT mark the position CLOSED, re-arms protection for the remainder, and banks the running total across both legs", async () => {
+    const client = new FakeClient();
+    const { executor, store } = makeExecutor({ client, signals: [signal()], legUsd: 10_000 });
+    await executor.tick(); // open
+    await executor.tick(); // place stop
+    const opened = store.getState().positions[0]!;
+    const fullQty = opened.qty;
+    const entryOrderId = opened.entryOrderId;
+    const algoId = opened.stopAlgoOrderId!;
+
+    // Entry trade record: zero P&L (opening trades never realize P&L), a small real commission.
+    client.userTradesByOrderId.set(entryOrderId, {
+      symbol: "BTCUSDT", orderId: entryOrderId, price: 60000, qty: fullQty, realizedPnl: 0, commission: 0.02, commissionAsset: "USDT", time: NOW_MS,
+    });
+    // The stop triggers but only HALF the requested qty actually fills (a sibling executor's
+    // netting clipped the reduce-only qty available on the shared netted account) — the other
+    // half never executes as a separate order under Binance's STOP_MARKET semantics.
+    const halfQty = fullQty / 2;
+    client.triggerAlgo(algoId, "9001", -0.9, 0.03, 61800, halfQty);
+    await executor.tick();
+
+    const partial = store.getState().positions[0]!;
+    expect(partial.status).toBe("OPEN"); // NOT falsely closed on a partial fill
+    expect(partial.qty).toBeCloseTo(fullQty - halfQty, 9); // reduced to the genuinely-remaining qty
+    expect(partial.exitOrderId).toBeNull(); // re-armed so the next tick can protect the remainder
+    expect(partial.stopAlgoOrderId).toBeNull();
+    expect(partial.realizedPartialGrossUsd).toBeCloseTo(-0.9, 6);
+    expect(partial.realizedPartialFeeUsd).toBeCloseTo(0.05, 6); // 0.03 (partial exit) + 0.02 (entry, banked once)
+
+    await executor.tick(); // ensureStopOrder re-arms a FRESH algo order for the remaining qty
+    const reArmed = store.getState().positions[0]!;
+    expect(reArmed.status).toBe("OPEN");
+    expect(reArmed.stopAlgoOrderId).not.toBeNull();
+    expect(reArmed.stopAlgoOrderId).not.toBe(algoId); // a genuinely NEW algo order, not the spent one
+
+    // The remaining qty's stop now fully fills — final leg closes the position.
+    client.triggerAlgo(reArmed.stopAlgoOrderId!, "9002", -0.9, 0.03, 61800, reArmed.qty);
+    await executor.tick();
+
+    const closed = store.getState().positions[0]!;
+    expect(closed.status).toBe("CLOSED");
+    // Total across BOTH legs — proves the partial leg's real P&L was never dropped, and the
+    // entry commission was banked exactly ONCE despite getUserTrades being re-queried from
+    // openedAt on every settle call (it would otherwise double-count on this second leg).
+    expect(closed.grossPnlUsd).toBeCloseTo(-1.8, 6);
+    expect(closed.feeEstimateUsd).toBeCloseTo(0.08, 6);
+    expect(closed.netPnlUsd).toBeCloseTo(-1.88, 6);
   });
 
   it("[MFE-GIVEBACK] a momentum-style (LONG) position banks a faded winner via the giveback policy", async () => {
@@ -585,9 +696,9 @@ describe("SingleSymbolLaneExecutor — exits", () => {
   it("[STOP-STUCK] a persistent ensureStopOrder failure increments stopFailureCount across ticks and is surfaced via getStatus().unprotectedPositions", async () => {
     const client = new FakeClient();
     const { executor, store } = makeExecutor({ client, signals: [signal()], legUsd: 10_000 });
-    await executor.tick(); // open
-    client.failAlgoOnce = false;
-    // Simulate a PERSISTENT algo-placement failure by overriding placeAlgoOrder for this test.
+    // Simulate a PERSISTENT algo-placement failure by overriding placeAlgoOrder for this test —
+    // installed BEFORE the open tick since ensureStopOrder now runs eagerly the same tick a
+    // position opens (2026-07-12 fix), so the very first attempt happens during that tick.
     const originalPlaceAlgoOrder = client.placeAlgoOrder.bind(client);
     let algoCallCount = 0;
     client.placeAlgoOrder = async (params) => {
@@ -595,7 +706,7 @@ describe("SingleSymbolLaneExecutor — exits", () => {
       if (algoCallCount <= 2) throw new Error("persistent algo rejection");
       return originalPlaceAlgoOrder(params);
     };
-    await executor.tick(); // 1st stop attempt fails
+    await executor.tick(); // open + 1st stop attempt fails
     let pos = store.getState().positions[0]!;
     expect(pos.stopAlgoOrderId).toBeNull();
     expect(pos.stopFailureCount).toBe(1);
@@ -754,6 +865,45 @@ describe("SingleSymbolLaneExecutor — manualClosePosition (2026-07-10 urgent cl
     expect(result.reason).toMatch(/close failed/);
     expect(result.netPnlUsd).toBeNull();
     expect(store.getState().positions[0]!.status).toBe("OPEN"); // never fabricated CLOSED
+  });
+
+  it("[RACE] 2026-07-11 fix: refuses a concurrent close on the SAME position instead of sending a second real closing order", async () => {
+    // closePosition()'s `pos.exitOrderId !== null` reentry guard is TOCTOU-vulnerable — exitOrderId
+    // isn't set until AFTER the awaited cancelAlgoOrder/placeOrder calls, so two concurrent
+    // manualClosePosition() calls (or a manual click racing monitorOpenPositions' own policy-exit)
+    // can both pass that check and both place a real closing order.
+    class SlowPlaceOrderClient extends FakeClient {
+      onFirstReduceOnlyPlace: (() => Promise<unknown>) | null = null;
+      async placeOrder(params: PlaceOrderParams): Promise<FuturesOrder> {
+        if (params.reduceOnly && this.onFirstReduceOnlyPlace) {
+          const fn = this.onFirstReduceOnlyPlace;
+          this.onFirstReduceOnlyPlace = null;
+          await fn(); // simulates a second manualClosePosition() racing in during this exact await
+        }
+        return super.placeOrder(params);
+      }
+    }
+    const client = new SlowPlaceOrderClient();
+    const { executor, store } = makeExecutor({ client, signals: [signal()], legUsd: 10_000 });
+    await executor.tick();
+    await executor.tick();
+    const pos = store.getState().positions[0]!;
+    client.fillPriceBySymbol.set("BTCUSDT", 60500);
+
+    let secondResult: { ok: boolean; reason: string | null } | null = null;
+    client.onFirstReduceOnlyPlace = async () => {
+      secondResult = await executor.manualClosePosition(pos.positionId);
+    };
+    const firstResult = await executor.manualClosePosition(pos.positionId);
+
+    expect(firstResult.ok).toBe(true);
+    expect(secondResult).not.toBeNull();
+    expect(secondResult!.ok).toBe(false);
+    expect(secondResult!.reason).toMatch(/already in flight/);
+    // Only ONE real closing order reached the exchange, not two — the bug this closes would have
+    // let the second call's own -2022 fallback open a brand-new naked position.
+    expect(client.placed.filter((p) => p.reduceOnly === true)).toHaveLength(1);
+    expect(store.getState().positions[0]!.status).toBe("CLOSED");
   });
 });
 

@@ -40,6 +40,13 @@ export const R_SANITY_CAP_R = 20;
 
 const AVERAGE_STOP_BPS = 200;
 
+function envNum(name: string, dflt: number): number {
+  const v = Number(process.env[name]);
+  return Number.isFinite(v) ? v : dflt;
+}
+
+const FROZEN_MAX_STORED_OBSERVATIONS = envNum("FROZEN_CURRENT_GUARD_MAX_STORED_OBSERVATIONS", 5000);
+
 export interface FrozenCriteriaSnapshot {
   version: typeof FROZEN_LANE;
   frozenAt: string;
@@ -206,8 +213,19 @@ export class FrozenCurrentGuardStore {
     }
   }
 
+  private prune(): void {
+    if (this.observations.length <= FROZEN_MAX_STORED_OBSERVATIONS) return;
+    const open = this.observations.filter((o) => o.status === "OPEN");
+    const settled = this.observations
+      .filter((o) => o.status !== "OPEN")
+      .sort((a, b) => new Date(b.openedAt).getTime() - new Date(a.openedAt).getTime())
+      .slice(0, Math.max(0, FROZEN_MAX_STORED_OBSERVATIONS - open.length));
+    this.observations = [...open, ...settled];
+  }
+
   save(): void {
     try {
+      this.prune();
       const payload: FrozenStoreFile = {
         criteria: this.criteria,
         observations: this.observations,

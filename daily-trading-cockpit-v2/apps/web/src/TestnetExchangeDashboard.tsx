@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import './neural-mindmap.css';
 
 const REFRESH_MS = 5_000;
@@ -39,6 +39,14 @@ const LIVE_LANE_OPTIONS = [
   'COMPOSITE_ESTIMATOR_BIDI_WIDE_SHORT',
   'COMPOSITE_ESTIMATOR_BIDI_FAST_LONG',
   'COMPOSITE_ESTIMATOR_BIDI_FAST_SHORT',
+  // 2026-07-11: 2 variant-matrix lanes confirmed live-flowing on all 3 instances but missing from
+  // this dropdown. Given with the FULL 'CG_VARIANT_MATRIX:' prefix, not the bare suffix like the
+  // other entries above — CG_NO_FIB500_ENTRYSET specifically has a same-suffix LONG sibling
+  // ('CG_LONG_VARIANT_MATRIX:CG_NO_FIB500_ENTRYSET', already active on the research hub's neural-map
+  // though not yet on testnet/live) that live-execution-engine.ts's suffix-matching fallback would
+  // silently ALSO admit if this were given bare, once that LONG variant starts flowing here too.
+  'CG_VARIANT_MATRIX:CG_NO_FIB500_ENTRYSET',
+  'CG_VARIANT_MATRIX:CG_EXP_SHORT_MFE_GIVEBACK_10X',
 ];
 const PERFORMANCE_VIEW_OPTIONS = [
   { value: 'hourly', label: 'Hourly' },
@@ -122,6 +130,7 @@ interface RegimeEngineReport {
     breadth: { advancersPct: number | null; percentAboveEma20: number | null; btcReturn24h: number | null };
   } | null;
   regimeCounts: Record<string, number>;
+  regimeContradictionFlaggedCounts: Record<string, number>;
   transitions: Array<{ at: string; from: string; to: string }>;
 }
 
@@ -190,6 +199,36 @@ interface LiveStatus {
   };
   consecutiveLosses?: number;
   totalRealizedPnlUsd?: number;
+  unifiedOrchestrator?: {
+    enabled: boolean;
+    mode: 'UNIFIED_TESTNET' | 'DISABLED';
+    brainState: 'LONG' | 'LONG_WARNING' | 'FLAT' | 'SHORT_WARNING' | 'SHORT' | 'CHOPPY_LOCK';
+    activeDirection: 'LONG' | 'SHORT' | null;
+    candidateDirection: 'LONG' | 'SHORT' | 'NEUTRAL';
+    candidateStreak: number;
+    updatedAt: string | null;
+    neutralProposalAllowed: boolean;
+    neutralProposalReason: string | null;
+    legacyExecutorEntryMode: 'MANAGE_ONLY' | 'UNCHANGED';
+    allowedDirectionalLaneIds: string[];
+    lastTrace: {
+      reason: string;
+      previousState: string;
+      nextState: string;
+      votes: Array<{ source: string; direction: string; confidence: number; reason: string; veto?: boolean }>;
+    } | null;
+    featureRegistry: Array<{ id: string; role: string; consumers: string[]; purpose: string }>;
+  } | null;
+  unifiedProposalSource?: {
+    active: boolean;
+    scanBatchId: string | null;
+    direction: 'LONG' | 'SHORT' | null;
+    posture: 'EXTENDED_TREND' | 'TACTICAL_OR_MIXED';
+    selectedRecipe: string | null;
+    proposalCount: number;
+    symbols: string[];
+    reason: string;
+  } | null;
   reason?: string;
 }
 
@@ -242,6 +281,7 @@ interface LiveAccount {
     symbols: string[];
     lastClosedAt: string | null;
   }>;
+  singleSymbolExecutorRealizedPnlUsd?: { today: number; allTime: number };
 }
 
 interface LanePerformancePoint {
@@ -473,6 +513,37 @@ type SingleSymbolLanePosition = {
   peakFavorableR: number;
   openedAt: string;
 };
+
+type LaneEvaluationRow = {
+  laneId: string;
+  allocationWeightPct: number;
+  allowed: boolean | null;
+  realOpenCount: number;
+  realClosedCount: number;
+  realNetPnlUsd: number;
+  measuredResolvedCount: number | null;
+  measuredOpenCount: number | null;
+  measuredNetAvgR: number | null;
+  measuredWr: number | null;
+  measuredPf: number | null;
+  measuredEdgeReady: boolean | null;
+};
+
+// The 3 brand-new report-only shadow engines from the 2026-07-10 GPT-5.6 strategy audit (Tier 3):
+// residual cross-sectional momentum + leader-laggard, liquidation-recoil cross-sectional ranking,
+// compression-to-expansion ignition. None are wired to any executor or lane allocation — this panel
+// exists purely so the operator can watch sample size accrue toward edgeReady without hunting down
+// 3 separate API routes.
+type RndLaneReport = {
+  label: string;
+  laneId: string;
+  openCount: number;
+  resolvedCount: number;
+  netAvgR: number | null;
+  wr: number | null;
+  pf: number | null;
+  edgeReady: boolean;
+} | null;
 
 type RegimeAxisTimelineData = {
   enabled: boolean;
@@ -758,6 +829,26 @@ export default function TestnetExchangeDashboard() {
   const [account, setAccount] = useState<LiveAccount | null>(null);
   const [status, setStatus] = useState<LiveStatus | null>(null);
   const [laneSeries, setLaneSeries] = useState<LanePerformanceSeries | null>(null);
+  // Guards against the view-filter effect and the 5s auto-refresh timer racing: only the result
+  // of the MOST RECENTLY STARTED loadExchangeOnly() call is ever applied, so a slower older
+  // request can't resolve after a newer one and overwrite fresher wallet/position/P&L state.
+  const exchangeLoadSeqRef = useRef(0);
+  // 2026-07-12 fix: same race class as exchangeLoadSeqRef above — the 15s auto-refresh poll and a
+  // manual close's own post-close refresh call loadSingleSymbolPositions() independently, with no
+  // guard against an in-flight poll (started BEFORE the close) resolving AFTER the post-close
+  // refresh and making the just-closed position reappear as still open.
+  const singleSymbolLoadSeqRef = useRef(0);
+  // 2026-07-12 fix: same race class — these all run on the SAME 15s auto-refresh timer with no
+  // guard against a slow, older response resolving after a newer one and displaying stale data.
+  const regimeReportLoadSeqRef = useRef(0);
+  const regimePresetsLoadSeqRef = useRef(0);
+  const perSymbolLoadSeqRef = useRef(0);
+  const regimeAxisLoadSeqRef = useRef(0);
+  const xsecExecLoadSeqRef = useRef(0);
+  const xsecExecTrendLoadSeqRef = useRef(0);
+  const xsecExecMixedLoadSeqRef = useRef(0);
+  const laneEvaluationLoadSeqRef = useRef(0);
+  const rndLanesLoadSeqRef = useRef(0);
   const [performanceView, setPerformanceView] = useState('hourly');
   const [performanceDay, setPerformanceDay] = useState(localDateInput());
   const [performanceMonth, setPerformanceMonth] = useState(localMonthInput());
@@ -786,7 +877,26 @@ export default function TestnetExchangeDashboard() {
   const [closeBusy, setCloseBusy] = useState<string | null>(null);
   const [closeResult, setCloseResult] = useState<{ ok: boolean; message: string } | null>(null);
   const [xsecExec, setXsecExec] = useState<XsecExecStatus | null>(null);
+  // 2026-07-11: TREND/MIXED are separate CrossSectionalExecutor instances with their own halted/
+  // error/openBaskets state (see cross-sectional-executor-{trend,mixed} routes) — before this fix
+  // only the base FILTERED instance's status was ever fetched, so an operator had no way to see a
+  // halted or erroring TREND/MIXED instance from this dashboard.
+  const [xsecExecTrend, setXsecExecTrend] = useState<XsecExecStatus | null>(null);
+  const [xsecExecMixed, setXsecExecMixed] = useState<XsecExecStatus | null>(null);
   const [singleSymbolLanePositions, setSingleSymbolLanePositions] = useState<SingleSymbolLanePosition[]>([]);
+  // 2026-07-11: these panels used to silently keep the last-known data forever on a fetch failure,
+  // with no way to tell "confirmed empty" apart from "we just haven't heard back in a while" — the
+  // freshness dot elsewhere on the page kept reporting fresh regardless. Track each source's last
+  // failure so the panel can show a stale warning instead of quietly trusting old data.
+  const [singleSymbolPositionsStaleSince, setSingleSymbolPositionsStaleSince] = useState<string | null>(null);
+  const [xsecExecStaleSince, setXsecExecStaleSince] = useState<string | null>(null);
+  const [xsecExecTrendStaleSince, setXsecExecTrendStaleSince] = useState<string | null>(null);
+  const [xsecExecMixedStaleSince, setXsecExecMixedStaleSince] = useState<string | null>(null);
+  // 2026-07-12 fix: loadRegimeAxis's catch block explicitly "keeps last" on fetch failure with no
+  // staleness flag — same failure mode the panels above already got a staleSince indicator for.
+  const [regimeAxisStaleSince, setRegimeAxisStaleSince] = useState<string | null>(null);
+  const [laneEvaluation, setLaneEvaluation] = useState<LaneEvaluationRow[]>([]);
+  const [rndLanes, setRndLanes] = useState<RndLaneReport[]>([]);
   const [psle, setPsle] = useState<PsleReport | null>(null);
   const [headlineLaneOptions, setHeadlineLaneOptions] = useState<string[]>([]);
   const laneAllocationOptions = Array.from(new Set(
@@ -867,7 +977,7 @@ export default function TestnetExchangeDashboard() {
   const toggleManualMode = () =>
     control(
       `${pageApiPrefix}/live/manual-mode`,
-      { enabled: !(status?.laneSelection?.manualSelectorMode === true) },
+      { enabled: !(status?.laneSelection?.manualSelectorMode === true), confirm: 'SET_MANUAL_MODE' },
       'Manual selector mode',
       loadExchangeOnly,
     );
@@ -881,17 +991,23 @@ export default function TestnetExchangeDashboard() {
       setControlMsg({ ok: false, message: 'Allocation: pick at least 1 lane' });
       return;
     }
-    void control(`${pageApiPrefix}/live/lane-allocations`, { allocations }, allocationLabel, loadExchangeOnly);
+    void control(`${pageApiPrefix}/live/lane-allocations`, { allocations, confirm: 'SET_ALLOCATIONS' }, allocationLabel, loadExchangeOnly);
   };
   const clearAllocation = () =>
-    control(`${pageApiPrefix}/live/lane-allocations`, { allocations: null }, `Clear ${allocationLabel}`, loadExchangeOnly);
+    control(`${pageApiPrefix}/live/lane-allocations`, { allocations: null, confirm: 'SET_ALLOCATIONS' }, `Clear ${allocationLabel}`, loadExchangeOnly);
 
   async function loadHeadlineLaneOptions() {
     try {
-      const payload = await fetchJson<MainNeuralMap>('/api/shadow/neural-map');
+      // 2026-07-11: was a bare '/api/shadow/neural-map' — in production Caddy's Referer-based
+      // routing already sends that to THIS same instance (never to research-hub 3101, contrary to
+      // what this comment used to assume) since every /api/* path matches the @liveApi/@testnetApi
+      // rule first. The only place the bare path actually behaved differently was local vite dev,
+      // whose proxy sends all bare /api/* to localhost:3101 regardless of which page is open (see
+      // apps/web/vite.config.ts) — pageApiPrefix makes local-dev preview match real prod routing.
+      const payload = await fetchJson<MainNeuralMap>(`${pageApiPrefix}/shadow/neural-map`);
       setHeadlineLaneOptions(extractHeadlineAllocationLanes(payload));
     } catch {
-      // Main `/` can be auth/proxy-unavailable during local dev; keep static fallback options.
+      // keep static fallback options
     }
   }
 
@@ -919,6 +1035,7 @@ export default function TestnetExchangeDashboard() {
   }
 
   async function loadExchangeOnly() {
+    const seq = ++exchangeLoadSeqRef.current;
     try {
       const anchor =
         performanceView === 'hourly'
@@ -938,12 +1055,14 @@ export default function TestnetExchangeDashboard() {
         fetchJson<LiveAccount>(`${pageApiPrefix}/live/account`),
         fetchJson<LanePerformanceSeries>(`${pageApiPrefix}/live/lane-performance-series?${seriesParams.toString()}`),
       ]);
+      if (seq !== exchangeLoadSeqRef.current) return; // a newer call already superseded this one
       setStatus(nextStatus);
       setAccount(nextAccount);
       setLaneSeries(nextLaneSeries);
       setError(null);
       setLastLoadedAt(new Date().toISOString());
     } catch (nextError) {
+      if (seq !== exchangeLoadSeqRef.current) return;
       setError(nextError instanceof Error ? nextError.message : `Unable to load Binance ${isLivePage ? 'mainnet' : 'testnet'} mirror`);
     }
   }
@@ -952,10 +1071,14 @@ export default function TestnetExchangeDashboard() {
   // INDEPENDENTLY of the exchange fetches so a live-endpoint hiccup can never skip it — that
   // was why the panel could stay blank on /live. Shown identically on both /testnet and /live.
   async function loadRegimeReport() {
+    const seq = ++regimeReportLoadSeqRef.current;
     try {
       const res = await fetch(`${pageApiPrefix}/shadow/regime-engine-report`, { cache: 'no-store' });
-      setRegimeReport(await res.json());
+      const body = await res.json();
+      if (seq !== regimeReportLoadSeqRef.current) return;
+      setRegimeReport(body);
     } catch {
+      if (seq !== regimeReportLoadSeqRef.current) return;
       setRegimeReport(null); // fail-soft: the panel just says unavailable
     }
   }
@@ -964,10 +1087,14 @@ export default function TestnetExchangeDashboard() {
   // preset buttons can never drift from what the server actually applies (see /live/regime-presets'
   // doc comment for the incident this closes).
   async function loadRegimePresets() {
+    const seq = ++regimePresetsLoadSeqRef.current;
     try {
       const res = await fetch(`${pageApiPrefix}/live/regime-presets`, { cache: 'no-store' });
-      setRegimePresets(await res.json());
+      const body = await res.json();
+      if (seq !== regimePresetsLoadSeqRef.current) return;
+      setRegimePresets(body);
     } catch {
+      if (seq !== regimePresetsLoadSeqRef.current) return;
       setRegimePresets({}); // fail-soft: preset buttons just show nothing to apply
     }
   }
@@ -1034,44 +1161,156 @@ export default function TestnetExchangeDashboard() {
   // per lane's OWN position on a symbol, not summed across lanes, so each can be inspected/closed
   // independently.
   async function loadSingleSymbolPositions() {
+    const seq = ++singleSymbolLoadSeqRef.current;
     try {
       const res = await fetch(`${pageApiPrefix}/live/single-symbol/positions`, { cache: 'no-store' });
       const body = await res.json();
-      if (body?.ok && Array.isArray(body.positions)) setSingleSymbolLanePositions(body.positions as SingleSymbolLanePosition[]);
+      if (seq !== singleSymbolLoadSeqRef.current) return; // a newer call already superseded this one
+      if (body?.ok && Array.isArray(body.positions)) {
+        setSingleSymbolLanePositions(body.positions as SingleSymbolLanePosition[]);
+        setSingleSymbolPositionsStaleSince(null);
+      } else {
+        setSingleSymbolPositionsStaleSince((prev) => prev ?? new Date().toISOString());
+      }
+    } catch {
+      if (seq !== singleSymbolLoadSeqRef.current) return;
+      setSingleSymbolPositionsStaleSince((prev) => prev ?? new Date().toISOString());
+    }
+  }
+
+  // Evaluation section for the lanes being validated on testnet (2026-07-10) — merges each lane's
+  // paper/shadow measurement stats with its real testnet-money execution stats in one table.
+  async function loadLaneEvaluation() {
+    const seq = ++laneEvaluationLoadSeqRef.current;
+    try {
+      const res = await fetch(`${pageApiPrefix}/live/lane-evaluation`, { cache: 'no-store' });
+      const body = await res.json();
+      if (seq !== laneEvaluationLoadSeqRef.current) return;
+      if (body?.ok && Array.isArray(body.lanes)) setLaneEvaluation(body.lanes as LaneEvaluationRow[]);
     } catch {
       /* keep last */
     }
   }
 
+  // Tier-3 R&D lanes (2026-07-10 GPT-5.6 audit): 3 brand-new report-only shadow engines, none
+  // wired to any executor. Fetches all 3 report routes in parallel; a failed/missing one just
+  // shows as null in the table rather than dropping the whole panel.
+  async function loadRndLanes() {
+    const seq = ++rndLanesLoadSeqRef.current;
+    const specs: Array<{ label: string; path: string }> = [
+      { label: 'Residual momentum + catch-up', path: 'residual-momentum-report' },
+      { label: 'Liquidation-recoil cross-sectional', path: 'liquidation-recoil-xs-report' },
+      { label: 'Compression → expansion ignition', path: 'compression-expansion-report' },
+    ];
+    const rows = await Promise.all(
+      specs.map(async ({ label, path }) => {
+        try {
+          const res = await fetch(`${pageApiPrefix}/shadow/${path}`, { cache: 'no-store' });
+          const body = await res.json();
+          if (!body || typeof body.laneId !== 'string') return null;
+          return {
+            label,
+            laneId: body.laneId as string,
+            openCount: Number(body.openCount) || 0,
+            resolvedCount: Number(body.resolvedCount) || 0,
+            netAvgR: body.netAvgR == null ? null : Number(body.netAvgR),
+            wr: body.wr == null ? null : Number(body.wr),
+            pf: body.pf == null ? null : Number(body.pf),
+            edgeReady: Boolean(body.edgeReady),
+          } as RndLaneReport;
+        } catch {
+          return null;
+        }
+      }),
+    );
+    if (seq !== rndLanesLoadSeqRef.current) return;
+    setRndLanes(rows);
+  }
+
   // Cross-sectional executor status: per-basket TP gap + daily breaker state.
   async function loadXsecExec() {
+    const seq = ++xsecExecLoadSeqRef.current;
     try {
       const res = await fetch(`${pageApiPrefix}/live/cross-sectional-executor`, { cache: 'no-store' });
       const body = await res.json();
-      if (body && typeof body.enabled === 'boolean') setXsecExec(body as XsecExecStatus);
+      if (seq !== xsecExecLoadSeqRef.current) return;
+      if (body && typeof body.enabled === 'boolean') {
+        setXsecExec(body as XsecExecStatus);
+        setXsecExecStaleSince(null);
+      } else {
+        setXsecExecStaleSince((prev) => prev ?? new Date().toISOString());
+      }
     } catch {
-      /* keep last */
+      if (seq !== xsecExecLoadSeqRef.current) return;
+      setXsecExecStaleSince((prev) => prev ?? new Date().toISOString());
+    }
+  }
+  // Same shape, the TREND/MIXED sibling instances (2026-07-11: previously never fetched).
+  async function loadXsecExecTrend() {
+    const seq = ++xsecExecTrendLoadSeqRef.current;
+    try {
+      const res = await fetch(`${pageApiPrefix}/live/cross-sectional-executor-trend`, { cache: 'no-store' });
+      const body = await res.json();
+      if (seq !== xsecExecTrendLoadSeqRef.current) return;
+      if (body && typeof body.enabled === 'boolean') {
+        setXsecExecTrend(body as XsecExecStatus);
+        setXsecExecTrendStaleSince(null);
+      } else {
+        setXsecExecTrendStaleSince((prev) => prev ?? new Date().toISOString());
+      }
+    } catch {
+      if (seq !== xsecExecTrendLoadSeqRef.current) return;
+      setXsecExecTrendStaleSince((prev) => prev ?? new Date().toISOString());
+    }
+  }
+  async function loadXsecExecMixed() {
+    const seq = ++xsecExecMixedLoadSeqRef.current;
+    try {
+      const res = await fetch(`${pageApiPrefix}/live/cross-sectional-executor-mixed`, { cache: 'no-store' });
+      const body = await res.json();
+      if (seq !== xsecExecMixedLoadSeqRef.current) return;
+      if (body && typeof body.enabled === 'boolean') {
+        setXsecExecMixed(body as XsecExecStatus);
+        setXsecExecMixedStaleSince(null);
+      } else {
+        setXsecExecMixedStaleSince((prev) => prev ?? new Date().toISOString());
+      }
+    } catch {
+      if (seq !== xsecExecMixedLoadSeqRef.current) return;
+      setXsecExecMixedStaleSince((prev) => prev ?? new Date().toISOString());
     }
   }
 
   // Regime-axis timeline: continuous distance-to-neutral score over the engine's history.
   async function loadRegimeAxis() {
+    const seq = ++regimeAxisLoadSeqRef.current;
     try {
       const res = await fetch(`${pageApiPrefix}/shadow/regime-axis-timeline`, { cache: 'no-store' });
       const body = await res.json();
-      if (Array.isArray(body?.points)) setRegimeAxis(body as RegimeAxisTimelineData);
+      if (seq !== regimeAxisLoadSeqRef.current) return;
+      if (Array.isArray(body?.points)) {
+        setRegimeAxis(body as RegimeAxisTimelineData);
+        setRegimeAxisStaleSince(null);
+      } else {
+        setRegimeAxisStaleSince((prev) => prev ?? new Date().toISOString());
+      }
     } catch {
-      /* keep last */
+      if (seq !== regimeAxisLoadSeqRef.current) return;
+      setRegimeAxisStaleSince((prev) => prev ?? new Date().toISOString());
     }
   }
 
   // Per-symbol book edge for THIS instance's book (live shows the mainnet book, testnet the testnet
   // book) — the book-proven symbols the live auto-rotation admits. Own cadence, fail-soft.
   async function loadPerSymbol() {
+    const seq = ++perSymbolLoadSeqRef.current;
     try {
       const res = await fetch(`${pageApiPrefix}/shadow/per-symbol-lane-edge`, { cache: 'no-store' });
-      setPsle(await res.json());
+      const body = await res.json();
+      if (seq !== perSymbolLoadSeqRef.current) return;
+      setPsle(body);
     } catch {
+      if (seq !== perSymbolLoadSeqRef.current) return;
       setPsle(null);
     }
   }
@@ -1104,7 +1343,11 @@ export default function TestnetExchangeDashboard() {
     void loadPerSymbol();
     void loadRegimeAxis();
     void loadXsecExec();
+    void loadXsecExecTrend();
+    void loadXsecExecMixed();
     void loadSingleSymbolPositions();
+    void loadLaneEvaluation();
+    void loadRndLanes();
     if (!autoRefresh) return undefined;
     const timer = window.setInterval(() => {
       void loadRegimeReport();
@@ -1112,7 +1355,11 @@ export default function TestnetExchangeDashboard() {
       void loadPerSymbol();
       void loadRegimeAxis();
       void loadXsecExec();
+      void loadXsecExecTrend();
+      void loadXsecExecMixed();
       void loadSingleSymbolPositions();
+      void loadLaneEvaluation();
+    void loadRndLanes();
     }, 15_000);
     return () => window.clearInterval(timer);
   }, [autoRefresh]);
@@ -1190,13 +1437,24 @@ export default function TestnetExchangeDashboard() {
           {(() => {
             // Split per BOOK (2026-07-08 operator): directional = Σ P&L intent dari entry-nya
             // sendiri; baskets = Σ P&L leg basket dari entry leg-nya — bukan blend netted exchange.
+            // 2026-07-12 fix: SingleSymbolLaneExecutor positions (SHORT_FADE_EXHAUSTION_CROWDED etc.)
+            // reuse the SAME basketUnrealizedPnl/basketQty fields (see isSingleSymbolExecutorPosition's
+            // own comment above) but the rest of this page treats them as a separate, operator
+            // -closeable book, not a basket hedge leg — this "baskets" subtotal silently folded them
+            // in. Split into 3 explicit subtotals using the same isSingleSymbolExecutorPosition check
+            // already used elsewhere on this page.
             const ps = account?.positions ?? [];
             const dirUnreal = ps.reduce((s, p) => s + (p.intentUnrealizedPnl ?? 0), 0);
-            const baskUnreal = ps.reduce((s, p) => s + (p.basketUnrealizedPnl ?? 0), 0);
+            const baskUnreal = ps
+              .filter((p) => !isSingleSymbolExecutorPosition(p.laneIds))
+              .reduce((s, p) => s + (p.basketUnrealizedPnl ?? 0), 0);
+            const singleSymbolUnreal = ps
+              .filter((p) => isSingleSymbolExecutorPosition(p.laneIds))
+              .reduce((s, p) => s + (p.basketUnrealizedPnl ?? 0), 0);
             return (
               <>
                 <strong className={tone(account?.unrealizedPnl)}>{signed(account?.unrealizedPnl)}</strong>
-                <small>directional {signed(dirUnreal)} · baskets {signed(baskUnreal)} · {account ? `${account.openPositionCount} pos` : 'loading'}</small>
+                <small>directional {signed(dirUnreal)} · baskets {signed(baskUnreal)} · single-symbol {signed(singleSymbolUnreal)} · {account ? `${account.openPositionCount} pos` : 'loading'}</small>
               </>
             );
           })()}
@@ -1204,24 +1462,38 @@ export default function TestnetExchangeDashboard() {
         <div>
           <span>Realized P&amp;L (today)</span>
           {(() => {
-            // HEADLINE = HARI INI (UTC): mirror today + baskets today. The lifetime numbers stay
-            // visible but clearly labeled all-time — the old headline summed lifetime mirror
-            // (which still carries the pre-fix churn-era losses) with baskets and read like a
-            // current loss ("kayanya kebawa data lama" — it wasn't stale, just mislabeled).
+            // HEADLINE = HARI INI (UTC): mirror today + baskets today + single-symbol today. The
+            // lifetime numbers stay visible but clearly labeled all-time — the old headline summed
+            // lifetime mirror (which still carries the pre-fix churn-era losses) with baskets and
+            // read like a current loss ("kayanya kebawa data lama" — it wasn't stale, just mislabeled).
             // 2026-07-09: was CROSS_SECTIONAL_MARKET_NEUTRAL-only — the 2026-07-08 TREND/MIXED
             // instances merge into their OWN closedLanes entries (see annotateCrossSectionalAccount),
             // so a banked TREND/MIXED basket previously vanished from this all-time headline.
+            // 2026-07-11: was single-symbol-executor-blind too — a real +$1.39 BTC close via
+            // REGIME_COMPOSITE_CONFIRMATION_LONG (already correctly folded into account.closedLanes
+            // by annotateSingleSymbolAccount) never moved this headline because nothing here summed
+            // it. Operator caught it live ("kalo memang udah TP, kok all-time nya masih sama").
+            // singleSymbolExecutorRealizedPnlUsd is backend-computed (routes/live.ts's /api/live/account)
+            // over the live list of executors, so this never has to hardcode lane ids that drift.
             const basketsAllTime = ['CROSS_SECTIONAL_MARKET_NEUTRAL', 'CROSS_SECTIONAL_TREND', 'CROSS_SECTIONAL_MIXED']
               .reduce((sum, laneId) => sum + (account?.closedLanes?.find((l) => l.laneId === laneId)?.realizedPnlUsd ?? 0), 0);
+            const singleSymbolAllTime = account?.singleSymbolExecutorRealizedPnlUsd?.allTime;
             const mirrorAllTime = status?.totalRealizedPnlUsd;
-            const allTime = mirrorAllTime != null ? mirrorAllTime + basketsAllTime : undefined;
+            const allTime = mirrorAllTime != null ? mirrorAllTime + basketsAllTime + (singleSymbolAllTime ?? 0) : undefined;
             const mirrorToday = status?.closedToday?.realizedPnlUsd;
-            const basketsToday = xsecExec?.dailyRealizedUsd;
-            const today = mirrorToday != null || basketsToday != null ? (mirrorToday ?? 0) + (basketsToday ?? 0) : undefined;
+            // 2026-07-11: was FILTERED-only (xsecExec?.dailyRealizedUsd) — TREND/MIXED's own daily
+            // realized P&L never moved this "today" figure even though basketsAllTime above already
+            // correctly folds all 3 in via account.closedLanes.
+            const basketsToday = [xsecExec?.dailyRealizedUsd, xsecExecTrend?.dailyRealizedUsd, xsecExecMixed?.dailyRealizedUsd]
+              .reduce<number | undefined>((sum, v) => (v != null ? (sum ?? 0) + v : sum), undefined);
+            const singleSymbolToday = account?.singleSymbolExecutorRealizedPnlUsd?.today;
+            const today = mirrorToday != null || basketsToday != null || singleSymbolToday != null
+              ? (mirrorToday ?? 0) + (basketsToday ?? 0) + (singleSymbolToday ?? 0)
+              : undefined;
             return (
               <>
                 <strong className={tone(today)}>{signed(today)}</strong>
-                <small>mirror {signed(mirrorToday)} · baskets {signed(basketsToday)} · all-time {signed(allTime)}</small>
+                <small>mirror {signed(mirrorToday)} · baskets {signed(basketsToday)} · single-symbol {signed(singleSymbolToday)} · all-time {signed(allTime)}</small>
               </>
             );
           })()}
@@ -1232,6 +1504,85 @@ export default function TestnetExchangeDashboard() {
           <small>{status?.openIntents?.length ?? 0} live intents · exits can be 2x positions</small>
         </div>
       </section>
+
+      {!isLivePage && status?.unifiedOrchestrator && (
+        <section className="testnet-panel">
+          <header>
+            <span>Unified Directional Core</span>
+            <strong className={
+              status.unifiedOrchestrator.brainState === 'LONG' || status.unifiedOrchestrator.brainState === 'SHORT'
+                ? 'tone-healthy'
+                : status.unifiedOrchestrator.brainState.includes('WARNING')
+                  ? 'tone-warning'
+                  : 'tone-measure'
+            }>
+              {status.unifiedOrchestrator.enabled ? status.unifiedOrchestrator.brainState : 'DISABLED'}
+            </strong>
+          </header>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 12 }}>
+            <div>
+              <small>Directional state</small>
+              <strong style={{ display: 'block' }}>
+                active {status.unifiedOrchestrator.activeDirection ?? 'FLAT'} · candidate {status.unifiedOrchestrator.candidateDirection}
+              </strong>
+              <small>confirmation streak {status.unifiedOrchestrator.candidateStreak} · legacy {status.unifiedOrchestrator.legacyExecutorEntryMode}</small>
+            </div>
+            <div>
+              <small>Execution recipes</small>
+              <strong style={{ display: 'block' }}>
+                {status.unifiedOrchestrator.allowedDirectionalLaneIds.length
+                  ? status.unifiedOrchestrator.allowedDirectionalLaneIds.map(compactLane).join(' + ')
+                  : 'directional entries paused'}
+              </strong>
+              <small>
+                neutral basket {status.unifiedOrchestrator.neutralProposalAllowed ? 'eligible' : 'blocked'}
+                {status.unifiedOrchestrator.neutralProposalReason ? ` · ${status.unifiedOrchestrator.neutralProposalReason}` : ''}
+              </small>
+            </div>
+            <div>
+              <small>Last decision</small>
+              <strong style={{ display: 'block' }}>
+                {status.unifiedOrchestrator.lastTrace
+                  ? `${status.unifiedOrchestrator.lastTrace.previousState} → ${status.unifiedOrchestrator.lastTrace.nextState}`
+                  : 'waiting for controller snapshot'}
+              </strong>
+              <small>{status.unifiedOrchestrator.lastTrace?.reason ?? 'No decision yet'}</small>
+            </div>
+            <div>
+              <small>Fresh proposal source</small>
+              <strong style={{ display: 'block' }}>
+                {status.unifiedProposalSource?.selectedRecipe
+                  ? `${compactLane(status.unifiedProposalSource.selectedRecipe)} · ${status.unifiedProposalSource.proposalCount} proposal(s)`
+                  : 'no active recipe'}
+              </strong>
+              <small>
+                {status.unifiedProposalSource?.symbols.length
+                  ? `${status.unifiedProposalSource.posture} · ${status.unifiedProposalSource.symbols.join(', ')}`
+                  : status.unifiedProposalSource?.reason ?? 'waiting for fresh scanner snapshot'}
+              </small>
+            </div>
+          </div>
+          {status.unifiedOrchestrator.lastTrace?.votes.length ? (
+            <div className="testnet-table-wrap" style={{ marginTop: 10 }}>
+              <table>
+                <thead><tr><th>Feature</th><th>Vote</th><th>Confidence</th><th>Reason</th></tr></thead>
+                <tbody>
+                  {status.unifiedOrchestrator.lastTrace.votes.map((vote) => (
+                    <tr key={vote.source}>
+                      <td>{vote.source}</td>
+                      <td className={vote.veto ? 'tone-critical' : vote.direction === 'NEUTRAL' ? 'tone-measure' : 'tone-healthy'}>
+                        {vote.veto ? 'VETO' : vote.direction}
+                      </td>
+                      <td>{Math.round(vote.confidence * 100)}%</td>
+                      <td>{vote.reason}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : null}
+        </section>
+      )}
 
       <section className="testnet-panel">
         <header>
@@ -1322,7 +1673,11 @@ export default function TestnetExchangeDashboard() {
           <span>Regime Engine → Lane Tree</span>
           <strong>
             {regimeReport?.latest
-              ? `${regimeReport.latest.regime} · BTC ${price(regimeReport.latest.btcPrice)} · ${regimeReport.snapshotCount} snapshots`
+              ? `${regimeReport.latest.regime} · BTC ${price(regimeReport.latest.btcPrice)}` +
+                (regimeAxis?.current
+                  ? ` · skor ${regimeAxis.current.score >= 0 ? '+' : ''}${regimeAxis.current.score.toFixed(2)} (${regimeAxis.guidance?.zoneLabel ?? '—'})`
+                  : '') +
+                ` · ${regimeReport.snapshotCount} snapshots`
               : regimeReport?.enabled === false
                 ? 'engine disabled'
                 : 'loading…'}
@@ -1334,6 +1689,15 @@ export default function TestnetExchangeDashboard() {
           {regimeReport?.latest?.breadth?.advancersPct != null &&
             ` Breadth: ${(regimeReport.latest.breadth.advancersPct * 100).toFixed(0)}% advancers · ${((regimeReport.latest.breadth.percentAboveEma20 ?? 0) * 100).toFixed(0)}% above EMA20 · BTC 24h ${((regimeReport.latest.breadth.btcReturn24h ?? 0) * 100).toFixed(1)}%.`}
         </p>
+        <p style={{ margin: '4px 0' }} className="tone-measure">
+          &quot;{regimeReport?.latest?.regime ?? 'Regime'}&quot; = pola struktural diskrit (BUKAN penilaian arah) — cocok/tidaknya candle BTC/ETH/breadth dengan salah satu dari 5 pola tetap.
+          NO_TRADE artinya tidak ada dari 4 pola directional yang cocok, dan BISA tetap muncul bareng skor Axis yang condong kuat ke satu arah (lihat panel di bawah) — itu bukan bug, keduanya mengukur hal berbeda dari data snapshot yang sama.
+        </p>
+        {regimeReport?.latest?.regime === 'NO_TRADE' && regimeAxis?.guidance && regimeAxis.guidance.zoneLabel !== 'NEUTRAL' && (
+          <p style={{ margin: '4px 0' }} className="tone-warning">
+            ⚠ Engine state NO_TRADE, tapi skor Axis saat ini {regimeAxis.current!.score >= 0 ? '+' : ''}{regimeAxis.current!.score.toFixed(2)} → zona {regimeAxis.guidance.zoneLabel} (breadth condong ke {regimeAxis.guidance.holdLane}). {regimeAxis.guidance.note}
+          </p>
+        )}
         <div className="testnet-table-wrap">
           <table>
             <thead>
@@ -1343,6 +1707,7 @@ export default function TestnetExchangeDashboard() {
               {REGIME_TREE.map((row) => {
                 const isCurrent = regimeReport?.latest?.regime === row.engineRegime;
                 const count = regimeReport?.regimeCounts?.[row.engineRegime] ?? 0;
+                const flagged = regimeReport?.regimeContradictionFlaggedCounts?.[row.engineRegime] ?? 0;
                 const preset = regimePresets[row.engineRegime] ?? [];
                 return (
                   <tr key={row.engineRegime} style={isCurrent ? { outline: '1px solid #5ce4a6' } : undefined}>
@@ -1351,7 +1716,9 @@ export default function TestnetExchangeDashboard() {
                     </td>
                     <td>{row.engineRegime}</td>
                     <td title={row.laneNote}>{row.lane}</td>
-                    <td>{count}</td>
+                    <td title={flagged > 0 ? `${flagged} of these were contradiction-flagged (detectContradictions forced NO_TRADE before this label could route to a lane) — not a clean occurrence of this regime` : undefined}>
+                      {count}{flagged > 0 ? ` (${flagged} flagged)` : ''}
+                    </td>
                     <td>
                       <button type="button" disabled={controlBusy || preset.length === 0} onClick={() => applyRegimePreset(preset)}>
                         {preset.length > 0
@@ -1390,6 +1757,11 @@ export default function TestnetExchangeDashboard() {
           Garis tengah putus-putus = zona NETRAL: semakin garis mendekat ke tengah, semakin dekat regime ke perubahan.
           Estimasi waktu adalah ekstrapolasi laju saat ini — bukan ramalan.
         </p>
+        {regimeAxisStaleSince && (
+          <p className="tone-warning" style={{ margin: '4px 0', fontSize: 12 }}>
+            ⚠ fetch gagal sejak {timeAgo(regimeAxisStaleSince)} — data di atas bisa basi.
+          </p>
+        )}
         <RegimeAxisChart data={regimeAxis} />
       </section>
 
@@ -1448,6 +1820,14 @@ export default function TestnetExchangeDashboard() {
           const foundation = positions.filter(
             (p) => !isSingleSymbolExecutorPosition(p.laneIds) && ((p.basketQty ?? 0) !== 0 || (isCrossSectionalPosition(p.laneIds) && !intentBySymbol.has(p.symbol))),
           );
+          // 2026-07-11: the 3 CrossSectionalExecutor instances each have independent halted/error/
+          // openBaskets state — surface all 3, not just FILTERED, so a stuck TREND or MIXED instance
+          // is visible here instead of silently invisible.
+          const xsecInstances: Array<{ label: string; status: XsecExecStatus | null }> = [
+            { label: 'FILTERED', status: xsecExec },
+            { label: 'TREND', status: xsecExecTrend },
+            { label: 'MIXED', status: xsecExecMixed },
+          ];
           const row = (position: (typeof positions)[number], closeable: boolean) => {
             const book = closeable ? 'directional' : 'foundation';
             const mixed = intentBySymbol.has(position.symbol) && (position.basketQty ?? 0) !== 0;
@@ -1523,16 +1903,25 @@ export default function TestnetExchangeDashboard() {
                   Basket hedge (long-top / short-bottom). Exit otomatis: profit-bank {xsecExec?.tpNetReturnPct != null ? `${xsecExec.tpNetReturnPct.toFixed(2)}%` : 'net-target'} atau horizon 24 jam — tidak ada tombol close
                   per posisi di sini karena menutup satu leg membuat sisa basket jadi taruhan directional telanjang.
                 </p>
-                {xsecExec?.openHalted && (
-                  <p className="tone-warning" style={{ margin: '4px 0', fontSize: 12 }}>⛔ {xsecExec.openHalted}</p>
-                )}
-                {xsecExec?.lastError && (
-                  <p className="tone-critical" style={{ margin: '4px 0', fontSize: 12 }}>executor error: {xsecExec.lastError}</p>
-                )}
-                {(xsecExec?.openBaskets ?? []).length > 0 && (
+                {xsecInstances.map(({ label, status: xs }) => xs?.openHalted && (
+                  <p key={`halt-${label}`} className="tone-warning" style={{ margin: '4px 0', fontSize: 12 }}>⛔ [{label}] {xs.openHalted}</p>
+                ))}
+                {xsecInstances.map(({ label, status: xs }) => xs?.lastError && (
+                  <p key={`err-${label}`} className="tone-critical" style={{ margin: '4px 0', fontSize: 12 }}>executor error [{label}]: {xs.lastError}</p>
+                ))}
+                {[
+                  { label: 'FILTERED', staleSince: xsecExecStaleSince },
+                  { label: 'TREND', staleSince: xsecExecTrendStaleSince },
+                  { label: 'MIXED', staleSince: xsecExecMixedStaleSince },
+                ].map(({ label, staleSince }) => staleSince && (
+                  <p key={`stale-${label}`} className="tone-warning" style={{ margin: '4px 0', fontSize: 12 }}>
+                    ⚠ [{label}] fetch gagal sejak {timeAgo(staleSince)} — data di bawah bisa basi.
+                  </p>
+                ))}
+                {xsecInstances.some(({ status: xs }) => (xs?.openBaskets ?? []).length > 0) && (
                   <div style={{ margin: '6px 0', fontSize: 12 }}>
-                    {xsecExec!.openBaskets!.map((b) => {
-                      const tp = xsecExec?.tpNetReturnPct ?? null;
+                    {xsecInstances.flatMap(({ label, status: xs }) => (xs?.openBaskets ?? []).map((b) => {
+                      const tp = xs?.tpNetReturnPct ?? null;
                       const net = b.lastNetReturn != null ? b.lastNetReturn * 100 : null;
                       const gap = tp != null && net != null ? tp - net : null;
                       const hoursLeft = Math.max(0, (b.closesAtMs - Date.now()) / 3600000);
@@ -1542,14 +1931,14 @@ export default function TestnetExchangeDashboard() {
                       const stale = b.lastNetAt ? Date.now() - new Date(b.lastNetAt).getTime() > 15 * 60_000 : oldEnough;
                       return (
                         <div key={b.basketId} style={{ display: 'flex', gap: 14, padding: '2px 0', flexWrap: 'wrap' }}>
-                          <span className="tone-measure">{b.basketId}</span>
+                          <span className="tone-measure">[{label}] {b.basketId}</span>
                           <span>net <strong className={net == null ? '' : net >= 0 ? 'tone-healthy' : 'tone-critical'}>{net == null ? '—' : `${net >= 0 ? '+' : ''}${net.toFixed(3)}%`}</strong></span>
                           <span>TP gap <strong className={gap != null && gap <= 0 ? 'tone-healthy' : ''}>{gap == null ? '—' : gap <= 0 ? 'REACHED — closing' : `${gap.toFixed(3)}% lagi`}</strong></span>
                           <span className="tone-measure">horizon {hoursLeft.toFixed(1)}h lagi</span>
                           {stale && <span className="tone-warning">stamp basi &gt;15m — cek executor</span>}
                         </div>
                       );
-                    })}
+                    }))}
                   </div>
                 )}
                 <div className="testnet-table-wrap">
@@ -1572,6 +1961,11 @@ export default function TestnetExchangeDashboard() {
                   &quot;Close now&quot; hanya menutup lane di baris itu. R = (mark−entry)/(entry−stop); exit otomatis tetap
                   lewat stop atau target/MFE-giveback kalau tidak diclose manual.
                 </p>
+                {singleSymbolPositionsStaleSince && (
+                  <p className="tone-warning" style={{ margin: '4px 0', fontSize: 12 }}>
+                    ⚠ fetch gagal sejak {timeAgo(singleSymbolPositionsStaleSince)} — daftar di bawah bisa basi.
+                  </p>
+                )}
                 {closeResult && <p className={closeResult.ok ? 'tone-healthy' : 'tone-critical'} style={{ margin: '4px 0', fontSize: 12 }}>{closeResult.message}</p>}
                 <div className="testnet-table-wrap">
                   <table>
@@ -1610,6 +2004,77 @@ export default function TestnetExchangeDashboard() {
                           </tr>
                         );
                       })}
+                    </tbody>
+                  </table>
+                </div>
+              </section>
+              <section className="testnet-panel">
+                <header><span>Lane evaluation — 9 lane sedang divalidasi</span><strong>{laneEvaluation.length} lane</strong></header>
+                <p className="tone-measure" style={{ margin: '4px 0', fontSize: 12 }}>
+                  Per lane: sisi "Measured" = sinyal paper/shadow (sample lebih cepat besar, sama persis dengan
+                  /api/shadow/*-report), sisi "Real" = eksekusi uang beneran di instance ini. edgeReady butuh n≥30 DAN
+                  netAvgR≥0.05 DAN payoff ratio&gt;1.1 — jangan simpulkan apapun sebelum itu tercapai.
+                </p>
+                <div className="testnet-table-wrap">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>Lane</th><th>Weight%</th><th>Allowed</th>
+                        <th>Real open</th><th>Real closed</th><th>Real net P&amp;L</th>
+                        <th>Measured resolved</th><th>Measured open</th><th>Net avg R</th><th>WR</th><th>PF</th><th>Edge ready</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {laneEvaluation.length === 0 ? (
+                        <tr><td colSpan={12}>No lane evaluation data.</td></tr>
+                      ) : laneEvaluation.map((r) => (
+                        <tr key={r.laneId}>
+                          <td>{compactLane(r.laneId)}</td>
+                          <td>{r.allocationWeightPct}%</td>
+                          <td className={r.allowed ? 'tone-healthy' : 'tone-measure'}>{r.allowed == null ? 'n/a' : r.allowed ? 'yes' : 'no'}</td>
+                          <td>{r.realOpenCount}</td>
+                          <td>{r.realClosedCount}</td>
+                          <td className={tone(r.realNetPnlUsd)}>{signed(r.realNetPnlUsd)}</td>
+                          <td>{r.measuredResolvedCount ?? '—'}</td>
+                          <td>{r.measuredOpenCount ?? '—'}</td>
+                          <td className={r.measuredNetAvgR == null ? '' : tone(r.measuredNetAvgR)}>{r.measuredNetAvgR == null ? '—' : `${r.measuredNetAvgR >= 0 ? '+' : ''}${r.measuredNetAvgR.toFixed(3)}R`}</td>
+                          <td>{r.measuredWr == null ? '—' : `${Math.round(r.measuredWr * 100)}%`}</td>
+                          <td>{r.measuredPf == null ? '—' : r.measuredPf.toFixed(2)}</td>
+                          <td className={r.measuredEdgeReady ? 'tone-healthy' : 'tone-measure'}>{r.measuredEdgeReady == null ? 'n/a' : r.measuredEdgeReady ? 'YES' : 'not yet'}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </section>
+              <section className="testnet-panel">
+                <header><span>R&amp;D lanes baru (Tier 1-3, 2026-07-10) — semua report-only</span><strong>{rndLanes.filter(Boolean).length}/3</strong></header>
+                <p className="tone-measure" style={{ margin: '4px 0', fontSize: 12 }}>
+                  3 engine baru dari audit strategi GPT-5.6: belum ada satupun yang di-wire ke eksekusi
+                  real atau lane allocation — cuma ngumpulin sample lewat polling dashboard ini. edgeReady
+                  butuh n≥30 DAN netAvgR≥0.05 DAN payoff ratio&gt;1.1, sama seperti semua lane lain.
+                </p>
+                <div className="testnet-table-wrap">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>Lane</th><th>Open</th><th>Resolved</th><th>Net avg R</th><th>WR</th><th>PF</th><th>Edge ready</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {rndLanes.filter(Boolean).length === 0 ? (
+                        <tr><td colSpan={7}>No R&amp;D lane data yet.</td></tr>
+                      ) : rndLanes.map((r) => r && (
+                        <tr key={r.laneId}>
+                          <td>{r.label}</td>
+                          <td>{r.openCount}</td>
+                          <td>{r.resolvedCount}</td>
+                          <td className={r.netAvgR == null ? '' : tone(r.netAvgR)}>{r.netAvgR == null ? '—' : `${r.netAvgR >= 0 ? '+' : ''}${r.netAvgR.toFixed(3)}R`}</td>
+                          <td>{r.wr == null ? '—' : `${Math.round(r.wr * 100)}%`}</td>
+                          <td>{r.pf == null ? '—' : r.pf.toFixed(2)}</td>
+                          <td className={r.edgeReady ? 'tone-healthy' : 'tone-measure'}>{r.edgeReady ? 'YES' : 'not yet'}</td>
+                        </tr>
+                      ))}
                     </tbody>
                   </table>
                 </div>

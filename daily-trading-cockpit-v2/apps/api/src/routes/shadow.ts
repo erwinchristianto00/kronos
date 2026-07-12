@@ -214,6 +214,25 @@ import {
   CE_INTERVAL,
   CE_UNIVERSE,
 } from "../lib/composite-estimator-edge.js";
+import {
+  runResidualMomentumCycleGuarded,
+  buildResidualMomentumReport,
+  getResidualMomentumStore,
+  RM_INTERVAL,
+} from "../lib/residual-momentum-edge.js";
+import {
+  runLiquidationRecoilXsCycleGuarded,
+  buildLiquidationRecoilXsReport,
+  getLiquidationRecoilXsStore,
+  LRX_INTERVAL,
+} from "../lib/liquidation-recoil-cross-sectional.js";
+import {
+  runCompressionExpansionCycleGuarded,
+  buildCompressionExpansionReport,
+  getCompressionExpansionStore,
+  CE_INTERVAL as CEE_INTERVAL,
+  CE_UNIVERSE as CEE_UNIVERSE,
+} from "../lib/compression-expansion-edge.js";
 import type { KronosClient } from "../lib/kronos.js";
 import { buildLaneVariantPboReport } from "../lib/walk-forward-validation.js";
 import { buildMicrostructureSnapshot } from "../lib/order-flow-microstructure.js";
@@ -304,6 +323,11 @@ import { buildRegimeEngineReport, getRegimeEngineStore, isRegimeEngineEnabled } 
 import { buildFreshVariantMatrixReport } from "../lib/fresh-variant-matrix-feed.js";
 import { buildCrowdingReport } from "../lib/derivatives-crowding.js";
 import { buildRegimeGatedLaneReport, type RgObservation } from "../lib/regime-gated-lane-performance.js";
+import {
+  getPriceImpactEfficiencyStore,
+  runPriceImpactEfficiencyCycleGuarded,
+  buildPriceImpactEfficiencyReport,
+} from "../lib/price-impact-efficiency.js";
 
 const mixedLaneIdForDirection = (direction: string | null | undefined): string =>
   direction === "LONG"
@@ -842,13 +866,38 @@ export async function registerShadowRoutes(
     return buildFreshVariantMatrixReport(getCurrentGuardVariantMatrixStore());
   });
 
-  // Derivatives crowding — live funding/OI/taker snapshot per universe symbol.
+  // Derivatives crowding — live funding/OI/taker snapshot per universe symbol. Each snapshot now
+  // also carries flowConfirmed (2026-07-10, Tier-1 audit item 1): whether the already-fetched
+  // takerBuySellRatio agrees with the crowdingState direction — see classifyCrowdingStateWithFlow's
+  // doc comment in derivatives-crowding.ts for the exact rule. Report-only; not read by any gate.
   app.get("/api/shadow/crowding-report", async (_request, reply) => {
     if (!opts.binanceClient) {
       reply.code(503);
       return { error: "NO_MARKET_CLIENT", message: "binance market-data client unavailable" };
     }
     return buildCrowdingReport(opts.binanceClient, [...CURRENT_SCANNER_UNIVERSE].slice(0, 15), new Date().toISOString());
+  });
+
+  // Price-impact efficiency (Tier 2 audit item #6, report-only): absolutePriceMove / aggressiveNotional
+  // per 5m bucket, buy/sell split, with own-history + cluster-relative z-scores (see
+  // price-impact-efficiency.ts's header for the exact windowing). Live-fetches + persists a fresh
+  // reading per universe symbol on each call (same universe-slicing convention as crowding-report),
+  // then returns the accumulated store's per-symbol snapshots. This is the underlying z-score
+  // machinery for the documented gap where decision-scoring.ts's fundingZScore is hardcoded null —
+  // wiring it in there is separate follow-up work, not done by this route.
+  app.get("/api/shadow/price-impact-efficiency-report", async (_request, reply) => {
+    if (!opts.binanceClient) {
+      reply.code(503);
+      return { error: "NO_MARKET_CLIENT", message: "binance market-data client unavailable" };
+    }
+    const pieStore = getPriceImpactEfficiencyStore();
+    await runPriceImpactEfficiencyCycleGuarded({
+      store: pieStore,
+      client: opts.binanceClient,
+      symbols: [...CURRENT_SCANNER_UNIVERSE].slice(0, 15),
+      nowMs: Date.now(),
+    });
+    return buildPriceImpactEfficiencyReport(pieStore);
   });
 
   // Regime switching engine — REPORT-ONLY history of what the hypothesis framework
@@ -1486,6 +1535,27 @@ export async function registerShadowRoutes(
     return { generatedAt: new Date().toISOString(), ...buildCompositeEstimatorReport(ceStore.all, ceStore.cycleMeta) };
   });
 
+  // Residual cross-sectional momentum + leader-laggard catch-up report (2026-07-10, Tier-3 audit
+  // item A). Report-only; not wired to any executor. See residual-momentum-edge.ts.
+  app.get("/api/shadow/residual-momentum-report", async () => {
+    const rmStore = getResidualMomentumStore();
+    return { generatedAt: new Date().toISOString(), ...buildResidualMomentumReport(rmStore.all, rmStore.cycleMeta) };
+  });
+
+  // Liquidation-recoil cross-sectional ranking report (2026-07-10, Tier-3 audit item C). Report-only;
+  // not wired to any executor. See liquidation-recoil-cross-sectional.ts.
+  app.get("/api/shadow/liquidation-recoil-xs-report", async () => {
+    const lrxStore = getLiquidationRecoilXsStore();
+    return { generatedAt: new Date().toISOString(), ...buildLiquidationRecoilXsReport(lrxStore.all, lrxStore.cycleMeta) };
+  });
+
+  // Compression-to-expansion ignition entry detector report (2026-07-10, Tier-3 audit item B).
+  // Report-only; not wired to any executor. See compression-expansion-edge.ts.
+  app.get("/api/shadow/compression-expansion-report", async () => {
+    const ceeStore = getCompressionExpansionStore();
+    return { generatedAt: new Date().toISOString(), ...buildCompressionExpansionReport(ceeStore.all, ceeStore.cycleMeta) };
+  });
+
   // Probability of Backtest Overfitting (CSCV) across the CG variant-matrix lanes — the honest audit
   // of "is this lane's edge real, or does it just look best in this sample" (e.g. CG_WIDE_LONG_RUNNER).
   // Report-only; never gates execution. Query: minObsPerVariant (default 30), bucketDays (default 7).
@@ -1935,6 +2005,46 @@ export async function registerShadowRoutes(
                 return null;
               }
             },
+          }).catch(() => undefined);
+        }
+        // Residual cross-sectional momentum + leader-laggard catch-up (2026-07-10, Tier-3 audit
+        // item A): beta-neutralized residual return ranking + cluster catch-up detection — see
+        // residual-momentum-edge.ts. Report-only measurement, same discipline as every other lane;
+        // never wired to any executor or lane allocation.
+        if (process.env.RESIDUAL_MOMENTUM_DISABLED !== "1") {
+          const _rmc = opts.binanceClient;
+          void runResidualMomentumCycleGuarded({
+            store: getResidualMomentumStore(),
+            now: Date.now(),
+            fetchCandles: async (symbol: string) => _rmc.getCandles(symbol, RM_INTERVAL, 200),
+          }).catch(() => undefined);
+        }
+        // Liquidation-recoil cross-sectional ranking (2026-07-10, Tier-3 audit item C): the
+        // cross-symbol extension of panic-washout-reclaim-edge.ts — detects a broad liquidation
+        // event across the wider universe and ranks members by reclaim strength. See
+        // liquidation-recoil-cross-sectional.ts. Report-only measurement; never wired to any
+        // executor or lane allocation.
+        if (process.env.LIQUIDATION_RECOIL_XS_DISABLED !== "1") {
+          const _lrc = opts.binanceClient;
+          void runLiquidationRecoilXsCycleGuarded({
+            store: getLiquidationRecoilXsStore(),
+            now: Date.now(),
+            fetchCandles: async (symbol: string) => _lrc.getCandles(symbol, LRX_INTERVAL, 200),
+            crowdingClient: _lrc,
+          }).catch(() => undefined);
+        }
+        // Compression-to-expansion ignition entry detector (2026-07-10, Tier-3 audit item B): the
+        // missing entry side of the CG long-volatility-expansion thesis — ATR/Bollinger-width
+        // compression followed by an order-flow-confirmed breakout. See compression-expansion-edge.ts.
+        // Report-only measurement; never wired to any executor or lane allocation.
+        if (process.env.COMPRESSION_EXPANSION_DISABLED !== "1") {
+          const _cee = opts.binanceClient;
+          void runCompressionExpansionCycleGuarded({
+            store: getCompressionExpansionStore(),
+            universe: CEE_UNIVERSE,
+            now: Date.now(),
+            fetchCandles: async (symbol: string) => _cee.getCandles(symbol, CEE_INTERVAL, 200),
+            client: _cee,
           }).catch(() => undefined);
         }
         // NEW-COIN RADAR (report-only): discovery cycle is self-throttled to 12h via the store's

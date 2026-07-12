@@ -191,6 +191,17 @@ const DUPLICATE_SUPPRESSION_MS = 12 * 60 * 60 * 1000;
 const OBSERVATION_MAX_MS = 24 * 60 * 60 * 1000;
 const MIN_OBSERVATION_STOP_BPS = 10;
 const MAX_OBSERVATION_COST_R = 2.0;
+/** 2026-07-11: terminal-status observations (RESOLVED/NO_FILL/EXPIRED/FAILED) were never pruned —
+ *  confirmed live at 991 total observations, 97.4% terminal, growing ~58/day with every refresh
+ *  doing a full read-modify-write of the whole array (the same unbounded-growth class already
+ *  root-caused and fixed today in paper-execution-router.ts). OPEN observations are never subject to
+ *  this cutoff (their count is already inherently bounded — resolveOpenObservations force-expires
+ *  them at OBSERVATION_MAX_MS=24h); this only ages out observations that have already reached a
+ *  terminal state and will never be read/write-referenced again except for historical reporting.
+ *  14 days retains ~800 terminal observations at the observed rate — ample for the performance/
+ *  economics report consumers while bounding the store instead of growing forever. Env-tunable. */
+const PRUNE_TERMINAL_OBSERVATIONS_MAX_AGE_MS =
+  Number(process.env.EXTERNAL_ROTATION_OVERLAY_PRUNE_TERMINAL_MAX_AGE_MS) || 14 * 24 * 60 * 60 * 1000;
 
 export type ExternalRotationOverlayDataValidityStatus =
   | "VALID"
@@ -867,14 +878,19 @@ export async function refreshExternalRotationOverlayObservations(opts: {
         : []),
     ],
   };
+  const pruneCutoffMs = now.getTime() - PRUNE_TERMINAL_OBSERVATIONS_MAX_AGE_MS;
+  const prunedObservations = observations.filter(
+    (o) => o.observationStatus === "OPEN" || new Date(o.createdAt).getTime() >= pruneCutoffMs,
+  );
+
   opts.store.writeState({
-    observations,
+    observations: prunedObservations,
     latestRefreshDiagnostics: diagnostics,
   });
   return {
     generatedAt: nowIso,
     evidenceEra: opts.enrichmentReport.evidenceEra,
     diagnostics,
-    observations,
+    observations: prunedObservations,
   };
 }

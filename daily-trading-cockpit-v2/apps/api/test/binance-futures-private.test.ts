@@ -236,4 +236,118 @@ describe("binance-futures-private signing", () => {
     await client.getExchangeFilters();
     expect(exchangeInfoCalls).toBe(2);
   });
+
+  it("getIncomeHistory signs a GET to /fapi/v1/income and maps a realistic multi-type response", async () => {
+    const urls: string[] = [];
+    const rawIncomeBody = JSON.stringify([
+      { symbol: "ETHUSDT", incomeType: "REALIZED_PNL", income: "3.50000000", asset: "USDT", time: 1720000000000, tranId: "9689322392", info: "" },
+      { symbol: "ETHUSDT", incomeType: "COMMISSION", income: "-0.18000000", asset: "USDT", time: 1720000000500, tranId: "9689322393", info: "" },
+      { symbol: "ETHUSDT", incomeType: "FUNDING_FEE", income: "-0.04120000", asset: "USDT", time: 1720000001000, tranId: "9689322394", info: "" },
+      { symbol: "", incomeType: "TRANSFER", income: "10.00000000", asset: "USDT", time: 1720000001500, tranId: "9689322395", info: "" },
+    ]);
+    const fetchImpl = (async (url: RequestInfo | URL) => {
+      const u = String(url);
+      urls.push(u);
+      if (u.includes("/fapi/v1/time")) {
+        return new Response(JSON.stringify({ serverTime: Date.now() }), { status: 200 });
+      }
+      return new Response(rawIncomeBody, { status: 200 });
+    }) as typeof fetch;
+
+    const client = new BinanceFuturesPrivateClient({ apiKey: "k", apiSecret: "s", env: "testnet", fetchImpl });
+    const entries = await client.getIncomeHistory({ startTime: 1720000000000, endTime: 1720000086399999 });
+
+    const incomeUrl = urls.find((u) => u.includes("/fapi/v1/income"));
+    expect(incomeUrl).toBeDefined();
+    expect(incomeUrl).toContain("startTime=1720000000000");
+    expect(incomeUrl).toContain("endTime=1720000086399999");
+    expect(incomeUrl).toContain("signature=");
+    // Signed GET: must carry the API key header path (same convention as every other signed call) —
+    // verified indirectly via a successful round trip rather than inspecting private fetch options.
+
+    expect(entries).toHaveLength(4);
+    expect(entries[0]).toEqual({
+      symbol: "ETHUSDT",
+      incomeType: "REALIZED_PNL",
+      income: 3.5,
+      asset: "USDT",
+      time: 1720000000000,
+      tranId: "9689322392",
+      info: "",
+    });
+    expect(entries[1].incomeType).toBe("COMMISSION");
+    expect(entries[1].income).toBeCloseTo(-0.18, 10);
+    expect(entries[2].incomeType).toBe("FUNDING_FEE");
+    expect(entries[3].incomeType).toBe("TRANSFER");
+    expect(entries[3].symbol).toBe("");
+  });
+
+  it("getIncomeHistory defaults to limit=1000 and returns [] for a non-array response", async () => {
+    const urls: string[] = [];
+    const fetchImpl = (async (url: RequestInfo | URL) => {
+      const u = String(url);
+      urls.push(u);
+      if (u.includes("/fapi/v1/time")) {
+        return new Response(JSON.stringify({ serverTime: Date.now() }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ code: 0, msg: "unexpected shape" }), { status: 200 });
+    }) as typeof fetch;
+
+    const client = new BinanceFuturesPrivateClient({ apiKey: "k", apiSecret: "s", env: "testnet", fetchImpl });
+    const entries = await client.getIncomeHistory();
+    expect(entries).toEqual([]);
+    const incomeUrl = urls.find((u) => u.includes("/fapi/v1/income"));
+    expect(incomeUrl).toContain("limit=1000");
+  });
+
+  // [TIME-SYNC-RESILIENCE, 2026-07-12 fix]: ensureTimeSync() ran forceTimeSync() uncaught before
+  // every signed request — a single transient hiccup hitting /fapi/v1/time aborted the request
+  // outright with zero retry, even though a prior successful sync (now merely past its TTL) is a
+  // perfectly safe fallback (Binance's own recvWindow/signature check plus assertClockSkewOk still
+  // guard against a truly-drifted clock).
+  it("survives a periodic time-resync failure by riding out the stale-but-recent offset", async () => {
+    let nowMs = 1_700_000_000_000;
+    let timeCalls = 0;
+    const fetchImpl = (async (url: RequestInfo | URL) => {
+      const u = String(url);
+      if (u.includes("/fapi/v1/time")) {
+        timeCalls += 1;
+        if (timeCalls === 1) {
+          return new Response(JSON.stringify({ serverTime: nowMs }), { status: 200 });
+        }
+        throw new Error("simulated network failure hitting /fapi/v1/time");
+      }
+      return new Response(JSON.stringify([]), { status: 200 });
+    }) as typeof fetch;
+
+    const client = new BinanceFuturesPrivateClient({
+      apiKey: "k",
+      apiSecret: "s",
+      env: "testnet",
+      fetchImpl,
+      nowMs: () => nowMs,
+    });
+
+    // First call: real sync succeeds, request goes through.
+    await expect(client.getBalances()).resolves.toEqual([]);
+    expect(timeCalls).toBe(1);
+
+    // Advance well past the periodic TTL so the next call attempts (and exhausts retries on) a
+    // resync that now fails outright — the signed request itself must still succeed, riding out
+    // on the stale-but-recent offset from the first sync instead of aborting.
+    nowMs += 120_000;
+    await expect(client.getBalances()).resolves.toEqual([]);
+    expect(timeCalls).toBeGreaterThan(1);
+  });
+
+  it("still fails closed when the very first time-sync attempt never succeeds", async () => {
+    const fetchImpl = (async (url: RequestInfo | URL) => {
+      const u = String(url);
+      if (u.includes("/fapi/v1/time")) throw new Error("simulated network failure hitting /fapi/v1/time");
+      return new Response(JSON.stringify([]), { status: 200 });
+    }) as typeof fetch;
+
+    const client = new BinanceFuturesPrivateClient({ apiKey: "k", apiSecret: "s", env: "testnet", fetchImpl });
+    await expect(client.getBalances()).rejects.toThrow(/simulated network failure/);
+  });
 });

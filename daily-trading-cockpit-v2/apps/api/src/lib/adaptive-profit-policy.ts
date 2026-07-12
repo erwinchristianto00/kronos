@@ -412,7 +412,14 @@ function microPilotReadinessFor(candidate: Omit<AdaptiveProfitPolicyCandidate, "
   if ((candidate.netAvgR ?? Number.NEGATIVE_INFINITY) < MICRO_PILOT_THRESHOLDS.minimumNetAvgR) {
     blockers.push(`Need netAvgR >= ${MICRO_PILOT_THRESHOLDS.minimumNetAvgR.toFixed(2)}R.`);
   }
-  if ((candidate.profitFactor ?? Number.NEGATIVE_INFINITY) < MICRO_PILOT_THRESHOLDS.minimumProfitFactor) {
+  // 2026-07-12 fix: a null profitFactor means zero LOSING trades (division by zero, not a bad
+  // sign) — treating it as -Infinity always failed this check, contradicting verdictFor's own
+  // explicit null-PF exception in this same file. Same logic here: null PF is sufficient when
+  // netAvgR is positive (the only real signal available in that case).
+  const profitFactorSufficient =
+    (candidate.profitFactor ?? Number.NEGATIVE_INFINITY) >= MICRO_PILOT_THRESHOLDS.minimumProfitFactor ||
+    (candidate.profitFactor === null && (candidate.netAvgR ?? Number.NEGATIVE_INFINITY) > 0);
+  if (!profitFactorSufficient) {
     blockers.push(`Need PF >= ${MICRO_PILOT_THRESHOLDS.minimumProfitFactor.toFixed(2)}.`);
   }
   if (candidate.credibility !== "CLEAN_EVALUABLE") {
@@ -424,12 +431,16 @@ function microPilotReadinessFor(candidate: Omit<AdaptiveProfitPolicyCandidate, "
   if (candidate.evidenceConsensus.evidenceConsensusVerdict === "CONFLICTED") {
     blockers.push("Evidence consensus is conflicted.");
   }
+  // Same null-PF exception as profitFactorSufficient above.
+  const profitFactorNearingSufficient =
+    (candidate.profitFactor ?? Number.NEGATIVE_INFINITY) >= 1 ||
+    (candidate.profitFactor === null && (candidate.netAvgR ?? Number.NEGATIVE_INFINITY) > 0);
   const verdict: MicroPilotReadinessVerdict =
     blockers.length === 0
       ? "MICRO_PILOT_CANDIDATE"
       : candidate.sampleSize >= 20 &&
           (candidate.netAvgR ?? Number.NEGATIVE_INFINITY) >= 0 &&
-          (candidate.profitFactor ?? Number.NEGATIVE_INFINITY) >= 1
+          profitFactorNearingSufficient
         ? "NEARING_MICRO_PILOT"
         : candidate.sampleSize >= 10
           ? "WATCH_CLOSELY"

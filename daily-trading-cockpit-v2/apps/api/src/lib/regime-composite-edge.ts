@@ -51,6 +51,7 @@ export const RC_INTERVAL = process.env.REGIME_COMPOSITE_INTERVAL || "1h";
 export const RC_AXIS_SCORE_MIN = Number(process.env.REGIME_COMPOSITE_AXIS_SCORE_MIN) || 0.35;
 /** crowdingState values that pass the confirmation gate (NOT the fragile/flushing states). */
 export const RC_ALLOWED_CROWDING_STATES: ReadonlySet<CrowdingState> = new Set(["NEUTRAL", "BUILDING"]);
+export const RC_MAX_STORED_OBSERVATIONS = envNum("REGIME_COMPOSITE_MAX_STORED_OBSERVATIONS", 500);
 export const RC_ATR_PERIOD = envNum("REGIME_COMPOSITE_ATR_PERIOD", 14);
 /** Initial stop = entry − ATR × this. Wider than the breakout lane's 1.5 — this rides a broader
  *  regime read, not a tight structural level, matching this repo's own wide-stop-for-LONGs finding. */
@@ -273,7 +274,20 @@ export class RegimeCompositeStore {
     const o = this.state.observations.find((x) => x.observationId === observationId);
     if (o) Object.assign(o, patch);
   }
+  /** Bounded retention: every OPEN observation is kept, plus at most RC_MAX_STORED_OBSERVATIONS
+   *  settled ones — oldest settled observations are dropped first once that cap is exceeded.
+   *  2026-07-11 OOM audit fix. */
+  private prune(): void {
+    const open = this.state.observations.filter((o) => o.status === "OPEN");
+    const settled = this.state.observations
+      .filter((o) => o.status !== "OPEN")
+      .sort((a, b) => a.openedAtMs - b.openedAtMs);
+    const keepSettled =
+      settled.length > RC_MAX_STORED_OBSERVATIONS ? settled.slice(settled.length - RC_MAX_STORED_OBSERVATIONS) : settled;
+    this.state.observations = [...open, ...keepSettled];
+  }
   save(): void {
+    this.prune();
     mkdirSync(dirname(this.file), { recursive: true });
     const tmp = `${this.file}.tmp`;
     writeFileSync(tmp, JSON.stringify(this.state), "utf-8");

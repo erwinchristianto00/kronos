@@ -17,6 +17,7 @@ import { dirname, resolve } from "node:path";
 
 import type { CurrentGuardVariantMatrixReport, CurrentGuardVariantMatrixRow } from "./current-guard-variant-matrix.js";
 import type { PostCutoverReport } from "./frozen-current-guard-post-cutover.js";
+import { rotateJsonlIfNeeded } from "./jsonl-rotation.js";
 
 export type OosValidationSnapshotTriggerSource =
   | "SCHEDULED"
@@ -311,9 +312,37 @@ export class JsonlOosValidationSnapshotStore implements OosValidationSnapshotSto
     try {
       mkdirSync(dirname(this.file), { recursive: true });
       appendFileSync(this.file, JSON.stringify(snapshot) + "\n", "utf-8");
+      this.maybeRotate();
       return true;
     } catch {
       return false;
+    }
+  }
+
+  /**
+   * 2026-07-11: this file had no cap at all — confirmed live at 39.5MB/1,723 lines and growing
+   * ~2.3MB/day, fed by both the 15-min SCHEDULED controller AND an unconditional append on every
+   * dashboard render (routes/shadow.ts's DASHBOARD_AUDIT trigger) — the same unbounded-growth class
+   * already root-caused and fixed today in paper-execution-router.ts. Reuses the same
+   * rotateJsonlIfNeeded helper tracker.ts already applies to scan-history*.jsonl, with a much
+   * smaller threshold than that file's 100MB default since readTail() below loads this file in FULL
+   * on every read (unlike scan-history, which is read via a bounded backward-chunk reader) — keeping
+   * the file itself small keeps that full read cheap. Never throws; rotation failure must never
+   * block persistence.
+   */
+  private maybeRotate(): void {
+    if (process.env.OOS_VALIDATION_SNAPSHOT_ROTATION_DISABLED === "1") return;
+    try {
+      const thresholdBytes = Number(process.env.OOS_VALIDATION_SNAPSHOT_ROTATION_THRESHOLD_BYTES) || 5 * 1024 * 1024;
+      const tailLines = Number(process.env.OOS_VALIDATION_SNAPSHOT_ROTATION_TAIL_LINES) || 2_000;
+      const result = rotateJsonlIfNeeded(this.file, { thresholdBytes, tailLines });
+      if (result.rotated) {
+        console.warn(
+          `[oos-validation-snapshot-logger] rotated ${this.file}: archived ${result.fromSize ?? "?"} bytes → ${result.archivePath ?? "?"}; kept ${result.linesKept ?? 0} lines`,
+        );
+      }
+    } catch {
+      // rotation failure must never block persistence
     }
   }
 

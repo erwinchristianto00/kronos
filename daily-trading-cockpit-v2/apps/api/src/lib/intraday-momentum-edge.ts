@@ -48,6 +48,9 @@ export const IM_MFE_GIVEBACK_FRAC = Number(process.env.INTRADAY_MOMENTUM_MFE_GIV
 /** Max hold in bars (1h) → mark-to-market if neither stop nor giveback fired. */
 export const IM_MAX_HOLD_BARS = envNum("INTRADAY_MOMENTUM_MAX_HOLD_BARS", 24);
 export const IM_PAPER_LANE_ID = "INTRADAY_MOMENTUM_BREAKOUT_LONG" as const;
+/** 2026-07-11 OOM audit fix: bounded retention matching residual-momentum-edge.ts/liquidation-
+ *  recoil-cross-sectional.ts's established convention — keep all OPEN, cap settled to the newest N. */
+export const IM_MAX_STORED_OBSERVATIONS = envNum("INTRADAY_MOMENTUM_MAX_STORED_OBSERVATIONS", 500);
 
 const TAKER_ROUNDTRIP_BPS = 8; // ~0.04% per side, taker in + taker out
 const STOP_OUT_SLIPPAGE_BPS = 5; // extra adverse fill on a stop-out
@@ -248,7 +251,19 @@ export class IntradayMomentumStore {
     const o = this.state.observations.find((x) => x.observationId === observationId);
     if (o) Object.assign(o, patch);
   }
+  /** Bounded retention: every OPEN observation is kept, plus at most IM_MAX_STORED_OBSERVATIONS
+   *  settled ones — oldest settled observations are dropped first once that cap is exceeded. */
+  private prune(): void {
+    const open = this.state.observations.filter((o) => o.status === "OPEN");
+    const settled = this.state.observations
+      .filter((o) => o.status !== "OPEN")
+      .sort((a, b) => a.openedAtMs - b.openedAtMs);
+    const keepSettled =
+      settled.length > IM_MAX_STORED_OBSERVATIONS ? settled.slice(settled.length - IM_MAX_STORED_OBSERVATIONS) : settled;
+    this.state.observations = [...open, ...keepSettled];
+  }
   save(): void {
+    this.prune();
     mkdirSync(dirname(this.file), { recursive: true });
     const tmp = `${this.file}.tmp`;
     writeFileSync(tmp, JSON.stringify(this.state), "utf-8");
@@ -467,4 +482,12 @@ export const IM_EXEC_MAX_SIGNAL_AGE_MS = (): number =>
 export const IM_EXEC_DAILY_MAX_LOSS_USD = (): number => {
   const n = Number.parseFloat(process.env.INTRADAY_MOMENTUM_EXEC_DAILY_MAX_LOSS_USD ?? "");
   return Number.isFinite(n) && n > 0 ? n : 0;
+};
+/** 2026-07-10: was hardcoded to the SingleSymbolLaneExecutor default (1) — see short-fade-edge.ts's
+ *  SF_EXEC_MAX_CONCURRENT for the same fix and rationale (this lane never had its own concurrency
+ *  knob, throttling testnet sample accumulation to one trade at a time). Default preserves existing
+ *  behavior exactly. */
+export const IM_EXEC_MAX_CONCURRENT = (): number => {
+  const n = Number.parseInt(process.env.INTRADAY_MOMENTUM_EXEC_MAX_CONCURRENT ?? "", 10);
+  return Number.isFinite(n) && n >= 1 ? Math.floor(n) : 1;
 };

@@ -52,6 +52,7 @@ export const SF_STOP_FLOOR_BPS = envNum("SHORT_FADE_STOP_FLOOR_BPS", 300);
 export const SF_TP_REWARD_MULTIPLE = Number(process.env.SHORT_FADE_TP_REWARD_MULTIPLE) || 0.5;
 export const SF_MAX_HOLD_BARS = envNum("SHORT_FADE_MAX_HOLD_BARS", 48);
 export const SF_PAPER_LANE_ID = "SHORT_FADE_EXHAUSTION_CROWDED" as const;
+export const SF_MAX_STORED_OBSERVATIONS = envNum("SHORT_FADE_MAX_STORED_OBSERVATIONS", 500);
 /** Majors/liquid tier — matches this repo's own per-symbol-lane-edge book-positive set for the same
  *  wide-stop/fast-TP short geometry, plus the research finding that thin alts trend through mean
  *  reversion. Env-overridable (comma-separated) so it can be widened once more symbols prove out. */
@@ -271,7 +272,20 @@ export class ShortFadeStore {
     const o = this.state.observations.find((x) => x.observationId === observationId);
     if (o) Object.assign(o, patch);
   }
+  /** Bounded retention: every OPEN observation is kept, plus at most SF_MAX_STORED_OBSERVATIONS
+   *  settled ones — oldest settled observations are dropped first once that cap is exceeded.
+   *  2026-07-11 OOM audit fix. */
+  private prune(): void {
+    const open = this.state.observations.filter((o) => o.status === "OPEN");
+    const settled = this.state.observations
+      .filter((o) => o.status !== "OPEN")
+      .sort((a, b) => a.openedAtMs - b.openedAtMs);
+    const keepSettled =
+      settled.length > SF_MAX_STORED_OBSERVATIONS ? settled.slice(settled.length - SF_MAX_STORED_OBSERVATIONS) : settled;
+    this.state.observations = [...open, ...keepSettled];
+  }
   save(): void {
+    this.prune();
     mkdirSync(dirname(this.file), { recursive: true });
     const tmp = `${this.file}.tmp`;
     writeFileSync(tmp, JSON.stringify(this.state), "utf-8");
@@ -516,4 +530,12 @@ export const SF_EXEC_MAX_SIGNAL_AGE_MS = (): number =>
 export const SF_EXEC_DAILY_MAX_LOSS_USD = (): number => {
   const n = Number.parseFloat(process.env.SHORT_FADE_EXEC_DAILY_MAX_LOSS_USD ?? "");
   return Number.isFinite(n) && n > 0 ? n : 0;
+};
+/** 2026-07-10: was hardcoded to the SingleSymbolLaneExecutor default (1) — this executor never
+ *  had its own concurrency knob, unlike every sibling lane (RC/CE/PWR _EXEC_MAX_CONCURRENT). A
+ *  single open-position cap throttles testnet sample accumulation to one trade at a time
+ *  regardless of how many fresh signals fire. Default preserves existing behavior exactly. */
+export const SF_EXEC_MAX_CONCURRENT = (): number => {
+  const n = Number.parseInt(process.env.SHORT_FADE_EXEC_MAX_CONCURRENT ?? "", 10);
+  return Number.isFinite(n) && n >= 1 ? Math.floor(n) : 1;
 };

@@ -261,8 +261,14 @@ describe("buildAdaptiveProfitPolicySynthesisReport", () => {
     const report = buildAdaptiveProfitPolicySynthesisReport(
       many(20, { regime: "Bearish expansion", direction: "SHORT", netR: 0.12 }),
     );
+    // 2026-07-12 fix: this fixture is ALL winners (netR=0.12, zero losers) — profitFactor() returns
+    // null for zero losses, which used to be treated as -Infinity and always failed the PF gate,
+    // contradicting verdictFor's own explicit null-PF exception in this same file. A 20-sample,
+    // all-winning, positive-edge candidate is genuinely promising and should read NEARING, not
+    // merely watchable — microPilotReady itself correctly stays false regardless (sampleSize=20 is
+    // still below minimumResolvedSample=30).
     expect(report.bestOverallPolicy?.microPilotReadiness.microPilotReady).toBe(false);
-    expect(report.bestOverallPolicy?.microPilotReadiness.verdict).toBe("WATCH_CLOSELY");
+    expect(report.bestOverallPolicy?.microPilotReadiness.verdict).toBe("NEARING_MICRO_PILOT");
   });
 });
 

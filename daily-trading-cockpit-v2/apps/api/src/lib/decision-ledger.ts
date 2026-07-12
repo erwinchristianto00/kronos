@@ -8,6 +8,8 @@ import type {
   VariantSelectionSnapshot,
 } from "@dtc/shared";
 
+import { rotateJsonlIfNeeded } from "./jsonl-rotation.js";
+
 export type DecisionLedgerEventType =
   | "PLAN_SELECTED"
   | "ROUTE_ASSIGNED"
@@ -61,6 +63,24 @@ export class DecisionLedger {
 
   append(entry: DecisionLedgerEntry): void {
     appendFileSync(this.file, JSON.stringify(entry) + "\n", "utf-8");
+    this.maybeRotate();
+  }
+
+  /** Append-only JSONL with no prior cap; reuses the rotation helper already applied to other unbounded logs this session. */
+  private maybeRotate(): void {
+    if (process.env.DECISION_LEDGER_ROTATION_DISABLED === "1") return;
+    try {
+      const thresholdBytes = Number(process.env.DECISION_LEDGER_ROTATION_THRESHOLD_BYTES) || 25 * 1024 * 1024;
+      const tailLines = Number(process.env.DECISION_LEDGER_ROTATION_TAIL_LINES) || 10_000;
+      const result = rotateJsonlIfNeeded(this.file, { thresholdBytes, tailLines });
+      if (result.rotated) {
+        console.warn(
+          `[decision-ledger] rotated ${this.file}: archived ${result.fromSize ?? "?"} bytes → ${result.archivePath ?? "?"}; kept ${result.linesKept ?? 0} lines`,
+        );
+      }
+    } catch {
+      // rotation failure must never block persistence
+    }
   }
 
   recordRouteAssigned(base: DecisionLedgerBase): { logged: boolean; duplicate: boolean } {

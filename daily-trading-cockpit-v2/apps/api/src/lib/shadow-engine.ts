@@ -78,6 +78,28 @@ function writeJsonAtomic(file: string, value: unknown): void {
   renameSync(tmp, file);
 }
 
+function envNum(name: string, dflt: number): number {
+  const v = Number(process.env[name]);
+  return Number.isFinite(v) ? v : dflt;
+}
+
+const SHADOW_MAX_STORED_POSITIONS = envNum("SHADOW_MAX_STORED_POSITIONS", 2000);
+
+/** A position is settled once every variant has finished its own lifecycle (CLOSED, including NO_FILL). */
+function isPositionSettled(position: ShadowPosition): boolean {
+  return position.variants.every((variant) => variant.state === "CLOSED");
+}
+
+function prunePositions(positions: ShadowPosition[]): ShadowPosition[] {
+  if (positions.length <= SHADOW_MAX_STORED_POSITIONS) return positions;
+  const active = positions.filter((p) => !isPositionSettled(p));
+  const settled = positions
+    .filter((p) => isPositionSettled(p))
+    .sort((a, b) => new Date(b.lastEvaluatedAt).getTime() - new Date(a.lastEvaluatedAt).getTime())
+    .slice(0, Math.max(0, SHADOW_MAX_STORED_POSITIONS - active.length));
+  return [...active, ...settled];
+}
+
 function entryZoneTolerance(price: number): number {
   return Math.max(Math.abs(price) * ENTRY_ZONE_TOLERANCE_RATIO, MIN_ENTRY_ZONE_TOLERANCE);
 }
@@ -974,7 +996,7 @@ export class ShadowExecutionEngine {
   }
 
   private writePositions(positions: ShadowPosition[]) {
-    writeJsonAtomic(this.positionsFile, positions);
+    writeJsonAtomic(this.positionsFile, prunePositions(positions));
   }
 
   private readLog(): ShadowExecutionEvent[] {

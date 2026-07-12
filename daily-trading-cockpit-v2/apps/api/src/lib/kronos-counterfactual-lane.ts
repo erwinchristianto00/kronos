@@ -39,6 +39,16 @@ import type {
 
 import type { BinanceClient } from "./binance.js";
 
+function envNum(name: string, dflt: number): number {
+  const v = Number(process.env[name]);
+  return Number.isFinite(v) ? v : dflt;
+}
+
+const KRONOS_COUNTERFACTUAL_MAX_STORED_OBSERVATIONS = envNum(
+  "KRONOS_COUNTERFACTUAL_MAX_STORED_OBSERVATIONS",
+  500,
+);
+
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 export type KronosCounterfactualLane =
@@ -192,6 +202,18 @@ const MILESTONE_MIN_RESOLVED_FOR_PROMISING = 20;
 
 // ─── Store ────────────────────────────────────────────────────────────────────
 
+function pruneCounterfactualObservations(
+  observations: KronosCounterfactualObservation[],
+): KronosCounterfactualObservation[] {
+  if (observations.length <= KRONOS_COUNTERFACTUAL_MAX_STORED_OBSERVATIONS) return observations;
+  const open = observations.filter((o) => o.observationStatus === "OPEN");
+  const settled = observations
+    .filter((o) => o.observationStatus !== "OPEN")
+    .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime())
+    .slice(0, Math.max(0, KRONOS_COUNTERFACTUAL_MAX_STORED_OBSERVATIONS - open.length));
+  return [...open, ...settled];
+}
+
 export class JsonKronosCounterfactualStore implements KronosCounterfactualStore {
   private readonly file: string;
 
@@ -221,7 +243,11 @@ export class JsonKronosCounterfactualStore implements KronosCounterfactualStore 
     // mid-write could truncate/corrupt this ~2.4MB store. Matches the pattern used elsewhere
     // (paper-execution-router.ts, current-guard-variant-matrix.ts).
     const tmp = `${this.file}.tmp`;
-    writeFileSync(tmp, JSON.stringify(state), "utf-8");
+    writeFileSync(
+      tmp,
+      JSON.stringify({ ...state, observations: pruneCounterfactualObservations(state.observations) }),
+      "utf-8",
+    );
     renameSync(tmp, this.file);
   }
 

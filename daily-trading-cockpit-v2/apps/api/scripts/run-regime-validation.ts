@@ -87,6 +87,11 @@ async function main(): Promise<void> {
     fetchHistoricalCandles(client, symbol, "4h", startMs, endMs),
     fetchHistoricalCandles(client, symbol, "1d", startMs, endMs),
   ]);
+  // 2026-07-12 fix: buildHistoricalValidationReport never received ETH candles, so ethConfirms was
+  // permanently undefined — TREND_RECOVERY/NEUTRAL_RECOVERY (and their 3 gated long lanes) were
+  // structurally unreachable in every report this script ever produced, regardless of real price
+  // action. Skip the redundant self-fetch when validating ETHUSDT itself (h1 already IS the ETH series).
+  const ethH1 = symbol === "ETHUSDT" ? h1 : await fetchHistoricalCandles(client, "ETHUSDT", "1h", startMs, endMs);
 
   const breadthSymbols = [...new Set(CURRENT_SCANNER_UNIVERSE)].filter((item) => item !== symbol);
   console.log(`fetching breadth h1 candles universeKind=CURRENT_LIQUID_UNIVERSE symbols=${breadthSymbols.length}`);
@@ -127,6 +132,7 @@ async function main(): Promise<void> {
   const report = buildHistoricalValidationReport({
     symbol,
     candles: { m15, h1, h4, d1 },
+    ethCandles: { h1: ethH1 },
     startingEquity,
     breadthByTimestamp,
     breadthUnavailableCount,

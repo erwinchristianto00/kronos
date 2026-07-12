@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { resolve } from "node:path";
 import os from "node:os";
 
-import { annotateSingleSymbolAccount, mergeSingleSymbolIntoLaneSeries, flattenSingleSymbolPositions } from "../src/routes/live.js";
+import { annotateSingleSymbolAccount, mergeSingleSymbolIntoLaneSeries, flattenSingleSymbolPositions, buildLaneEvaluationRows } from "../src/routes/live.js";
 import {
   SingleSymbolLaneExecutor,
   SingleSymbolLaneExecutorStore,
@@ -245,5 +245,75 @@ describe("flattenSingleSymbolPositions (2026-07-10: per-lane close-now button)",
     expect(flattenSingleSymbolPositions([], new Map())).toEqual([]);
     const empty = makeExecutorWithPositions([]);
     expect(flattenSingleSymbolPositions([empty], new Map())).toEqual([]);
+  });
+});
+
+describe("buildLaneEvaluationRows (2026-07-10: testnet 9-lane evaluation section)", () => {
+  it("merges a SingleSymbolLaneExecutor lane's real status with its measured stats", () => {
+    const exec = makeExecutorWithPositions(
+      [positionOf({ status: "CLOSED", netPnlUsd: 3, closedAt: NOW })],
+      "SHORT_FADE_EXHAUSTION_CROWDED",
+    );
+    const status = exec.getStatus();
+    const measured = new Map([
+      ["SHORT_FADE_EXHAUSTION_CROWDED", { resolvedCount: 12, openCount: 2, netAvgR: 0.15, wr: 0.5, pf: 1.4, edgeReady: false }],
+    ]);
+    const rows = buildLaneEvaluationRows([status], measured, null, () => 100);
+    const row = rows.find((r) => r.laneId === "SHORT_FADE_EXHAUSTION_CROWDED")!;
+    expect(row.realClosedCount).toBe(status.closedCount);
+    expect(row.realNetPnlUsd).toBe(status.totalNetPnlUsd);
+    expect(row.allocationWeightPct).toBe(status.allocationWeightPct);
+    expect(row.allowed).toBe(status.allowed);
+    expect(row.measuredResolvedCount).toBe(12);
+    expect(row.measuredNetAvgR).toBe(0.15);
+    expect(row.measuredEdgeReady).toBe(false);
+  });
+
+  it("PROFIT_CORE_SHORT_TRAIL (no executor, no measured report) falls back to closedLanes + the weight callback, with null measured fields — not fabricated 0s", () => {
+    const rows = buildLaneEvaluationRows(
+      [],
+      new Map(),
+      { closedCount: 7, realizedPnlUsd: 12.5 },
+      (laneId) => (laneId === "PROFIT_CORE_SHORT_TRAIL" ? 11 : 0),
+    );
+    expect(rows).toHaveLength(1);
+    const row = rows[0]!;
+    expect(row.laneId).toBe("PROFIT_CORE_SHORT_TRAIL");
+    expect(row.realClosedCount).toBe(7);
+    expect(row.realNetPnlUsd).toBe(12.5);
+    expect(row.allocationWeightPct).toBe(11);
+    expect(row.allowed).toBeNull();
+    expect(row.measuredResolvedCount).toBeNull();
+    expect(row.measuredNetAvgR).toBeNull();
+    expect(row.measuredEdgeReady).toBeNull();
+  });
+
+  it("a lane with an executor but no measured report yet shows real stats with null measured fields", () => {
+    const exec = makeExecutorWithPositions([], "REGIME_COMPOSITE_CONFIRMATION_LONG");
+    const rows = buildLaneEvaluationRows([exec.getStatus()], new Map(), null, () => 0);
+    const row = rows.find((r) => r.laneId === "REGIME_COMPOSITE_CONFIRMATION_LONG")!;
+    expect(row.realClosedCount).toBe(0);
+    expect(row.realOpenCount).toBe(0);
+    expect(row.measuredResolvedCount).toBeNull();
+    expect(row.measuredWr).toBeNull();
+  });
+
+  it("PROFIT_CORE_SHORT_TRAIL with no closedLanes entry defaults real stats to 0, not null", () => {
+    const rows = buildLaneEvaluationRows([], new Map(), null, () => 5);
+    const row = rows[0]!;
+    expect(row.realClosedCount).toBe(0);
+    expect(row.realNetPnlUsd).toBe(0);
+    expect(row.allocationWeightPct).toBe(5);
+  });
+
+  it("always includes PROFIT_CORE_SHORT_TRAIL first, followed by every executor's laneId in order", () => {
+    const a = makeExecutorWithPositions([], "SHORT_FADE_EXHAUSTION_CROWDED");
+    const b = makeExecutorWithPositions([], "PANIC_WASHOUT_RECLAIM_LONG");
+    const rows = buildLaneEvaluationRows([a.getStatus(), b.getStatus()], new Map(), null, () => 0);
+    expect(rows.map((r) => r.laneId)).toEqual([
+      "PROFIT_CORE_SHORT_TRAIL",
+      "SHORT_FADE_EXHAUSTION_CROWDED",
+      "PANIC_WASHOUT_RECLAIM_LONG",
+    ]);
   });
 });

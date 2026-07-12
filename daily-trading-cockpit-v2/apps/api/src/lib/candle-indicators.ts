@@ -83,3 +83,67 @@ export function computeATR(candles: Candle[], period: number): (number | null)[]
   }
   return out;
 }
+
+/**
+ * Standard Bollinger Band width, as a full rolling series (index-aligned with `closes`, same
+ * convention as computeSMA/computeEMA/computeATR): width = (upperBand − lowerBand) / middleBand,
+ * where middleBand = SMA(period) and upper/lower = middleBand ± stdDevMultiple × POPULATION
+ * standard deviation (divide by `period`, not `period − 1`) — the identical formula and defaults
+ * (period 20, multiple 2) as packages/shared/src/indicators.ts's own single-snapshot
+ * `bollingerBands()`, just returned as a rolling array instead of one latest-value snapshot, to
+ * match this file's own convention of index-aligned series.
+ *
+ * A dimensionless, price-normalized ratio: LOW = a tight/coiled range (a "squeeze" — the classic
+ * volatility-compression signal), HIGH = a wide, already-expanded range. Returns null until index
+ * >= period − 1, same "not enough history yet" convention as the rest of this file. Additive only —
+ * does not alter any existing exported function.
+ */
+export function computeBollingerBandWidth(closes: number[], period = 20, stdDevMultiple = 2): (number | null)[] {
+  const out: (number | null)[] = new Array(closes.length).fill(null);
+  if (!(period > 0) || closes.length < period) return out;
+  for (let i = period - 1; i < closes.length; i++) {
+    const slice = closes.slice(i - period + 1, i + 1);
+    const middle = slice.reduce((a, b) => a + b, 0) / period;
+    if (!(middle > 0)) continue; // non-positive price -> width undefined, leave null
+    const variance = slice.reduce((a, b) => a + (b - middle) ** 2, 0) / period;
+    const stdDev = Math.sqrt(variance);
+    const upper = middle + stdDevMultiple * stdDev;
+    const lower = middle - stdDevMultiple * stdDev;
+    out[i] = (upper - lower) / middle;
+  }
+  return out;
+}
+
+/**
+ * Rolling percentile rank (0-100) of the value at each index against its OWN trailing `window` of
+ * history (inclusive of the current value itself — a value equal to the trailing max scores 100; a
+ * value equal to the trailing min scores ~(1/window)×100, never 0). Generic over any indicator
+ * series: this codebase's primary use is ranking the CURRENT ATR reading against its own recent
+ * history to detect a volatility-compression regime (see compression-expansion-edge.ts's
+ * ATR-percentile compression gate), but the algorithm itself has no ATR-specific knowledge, so the
+ * exact same function is reused there to rank Bollinger-band-width too, rather than duplicating the
+ * percentile math for a second series.
+ *
+ * Requires a FULL window of non-null, finite values ending at `i` (no gaps) before it produces a
+ * result — returns null for every earlier index, and for any index whose trailing window contains
+ * a null/non-finite reading, same "not enough/incomplete history yet" convention as
+ * computeSMA/computeATR.
+ *
+ * Window choice: this file makes no assumption about window size — callers pick one long enough to
+ * characterize "this symbol's own current volatility regime" without stretching back into a
+ * completely different one. compression-expansion-edge.ts defaults to 100 bars (~4.2 days on 1h
+ * candles): enough samples for a stable percentile estimate while staying regime-local.
+ */
+export function computeATRPercentile(values: (number | null)[], window: number): (number | null)[] {
+  const out: (number | null)[] = new Array(values.length).fill(null);
+  if (!(window > 0)) return out;
+  for (let i = window - 1; i < values.length; i++) {
+    const slice = values.slice(i - window + 1, i + 1);
+    if (slice.some((v) => typeof v !== "number" || !Number.isFinite(v))) continue;
+    const nums = slice as number[];
+    const current = nums[nums.length - 1]!;
+    const countLE = nums.filter((v) => v <= current).length;
+    out[i] = (countLE / window) * 100;
+  }
+  return out;
+}

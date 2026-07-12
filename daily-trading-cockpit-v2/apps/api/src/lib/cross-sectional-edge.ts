@@ -20,6 +20,11 @@ function envNumPos(key: string, fallback: number): number {
   return Number.isFinite(v) && v > 0 ? v : fallback;
 }
 
+const CROSS_SECTIONAL_MAX_STORED_OBSERVATIONS = envNumPos(
+  "CROSS_SECTIONAL_EDGE_MAX_STORED_OBSERVATIONS",
+  5000,
+);
+
 function envNumNonNeg(key: string, fallback: number): number {
   const v = Number(process.env[key]);
   return Number.isFinite(v) && v >= 0 ? v : fallback;
@@ -66,6 +71,73 @@ export function regimeSkewedK(
   }
   const delta = Math.max(0, Math.min(baseK - 1, opts.delta ?? CROSS_SECTIONAL_REGIME_SKEW_DELTA));
   return axisScore > 0 ? { longK: baseK + delta, shortK: baseK - delta } : { longK: baseK - delta, shortK: baseK + delta };
+}
+/** 2026-07-12 (profitability Stage 3): report-only counterfactual measuring what the regime skew
+ *  (CROSS_SECTIONAL_REGIME_SKEW_ENABLED, 3/3 → 4/2 in a bullish axis) actually costs or earns on
+ *  REAL closed baskets. The adversarial diagnosis flagged that the skew turns the book's only
+ *  genuine hedge into more same-direction beta precisely when a regime flip would hurt — this
+ *  answers "is the tilt paying?" from real fills, not simulation. A basket is "skewed" when its
+ *  long-leg count ≠ short-leg count. Reports each cohort's mean net return, and within skewed
+ *  baskets the mean per-leg return on each side — if the LONG side (the one the skew over-weights
+ *  in a bull axis) isn't out-returning the short side, the skew is adding directional risk for no
+ *  edge and should be reconsidered. Pure function; caller supplies the closed baskets. */
+export interface RegimeSkewCounterfactual {
+  skewedCount: number;
+  symmetricCount: number;
+  skewedMeanNetUsd: number | null;
+  symmetricMeanNetUsd: number | null;
+  skewedLongLegMeanReturnPct: number | null;
+  skewedShortLegMeanReturnPct: number | null;
+  /** Positive ⇒ the over-weighted long side out-returned the short side on skewed baskets (skew
+   *  paying); negative ⇒ the skew added long beta the dispersion didn't reward. Null until data. */
+  skewLongMinusShortEdgePct: number | null;
+  verdict: "SKEW_PAYING" | "SKEW_COSTING" | "INSUFFICIENT_DATA";
+}
+export function regimeSkewCounterfactual(
+  closedBaskets: ReadonlyArray<{
+    netPnlUsd: number | null;
+    legs: ReadonlyArray<{ side: "LONG" | "SHORT"; entryPrice: number; exitPrice: number | null }>;
+  }>,
+): RegimeSkewCounterfactual {
+  const mean = (xs: number[]): number | null => (xs.length > 0 ? xs.reduce((s, x) => s + x, 0) / xs.length : null);
+  const legReturnPct = (leg: { side: "LONG" | "SHORT"; entryPrice: number; exitPrice: number | null }): number | null => {
+    const exit = leg.exitPrice;
+    if (exit === null || !(leg.entryPrice > 0) || !(exit > 0)) return null;
+    return leg.side === "LONG" ? (exit - leg.entryPrice) / leg.entryPrice : (leg.entryPrice - exit) / leg.entryPrice;
+  };
+  const skewedNet: number[] = [];
+  const symmetricNet: number[] = [];
+  const skewedLongLegReturns: number[] = [];
+  const skewedShortLegReturns: number[] = [];
+  for (const b of closedBaskets) {
+    const longs = b.legs.filter((l) => l.side === "LONG").length;
+    const shorts = b.legs.filter((l) => l.side === "SHORT").length;
+    const isSkewed = longs !== shorts;
+    if (typeof b.netPnlUsd === "number") (isSkewed ? skewedNet : symmetricNet).push(b.netPnlUsd);
+    if (isSkewed) {
+      for (const leg of b.legs) {
+        const r = legReturnPct(leg);
+        if (r === null) continue;
+        (leg.side === "LONG" ? skewedLongLegReturns : skewedShortLegReturns).push(r);
+      }
+    }
+  }
+  const skewedLongMean = mean(skewedLongLegReturns);
+  const skewedShortMean = mean(skewedShortLegReturns);
+  const edge =
+    skewedLongMean !== null && skewedShortMean !== null ? skewedLongMean - skewedShortMean : null;
+  const verdict: RegimeSkewCounterfactual["verdict"] =
+    edge === null || skewedNet.length < 5 ? "INSUFFICIENT_DATA" : edge >= 0 ? "SKEW_PAYING" : "SKEW_COSTING";
+  return {
+    skewedCount: skewedNet.length,
+    symmetricCount: symmetricNet.length,
+    skewedMeanNetUsd: mean(skewedNet),
+    symmetricMeanNetUsd: mean(symmetricNet),
+    skewedLongLegMeanReturnPct: skewedLongMean,
+    skewedShortLegMeanReturnPct: skewedShortMean,
+    skewLongMinusShortEdgePct: edge,
+    verdict,
+  };
 }
 export const CROSS_SECTIONAL_HORIZON_BARS = envNumPos("CROSS_SECTIONAL_HORIZON_BARS", 24); // forward hold (bars)
 export const CROSS_SECTIONAL_ROUNDTRIP_BPS = Number(process.env.CROSS_SECTIONAL_ROUNDTRIP_BPS ?? 12); // per-position round-trip cost
@@ -442,6 +514,10 @@ export interface AdaptiveSymbolFilters {
     demotedLong: string[];
     demotedShort: string[];
     minEligiblePerSide: number;
+    /** Per-side floors actually applied — can diverge from minEligiblePerSide when regime skew
+     *  raises one side's required leg count above the base K (see regimeSkewedK). */
+    minEligiblePerSideLong: number;
+    minEligiblePerSideShort: number;
     /** True when demotions alone would have left this side below minEligiblePerSide, so the
      *  fallback below kicked in instead. See the floor comment at its computation site. */
     longFloorApplied: boolean;
@@ -451,10 +527,26 @@ export interface AdaptiveSymbolFilters {
 
 export function deriveAdaptiveSymbolFilters(
   store: CrossSectionalStore,
-  opts: { minLegSamples?: number; minEligiblePerSide?: number } = {},
+  opts: {
+    minLegSamples?: number;
+    minEligiblePerSide?: number;
+    /** Per-side overrides — thread the REGIME-SKEWED longK/shortK through here (not just the base
+     *  CROSS_SECTIONAL_K) when regime skew is enabled. 2026-07-11: the floor below used to always
+     *  check against the unskewed base K on both sides, so when skew raised e.g. shortK from 3 to
+     *  4, a side sitting at exactly 3 eligible symbols looked "fine" (3 is not < 3) even though
+     *  buildFilteredCrossSectionalBasket actually needs 4 and would silently return null — the
+     *  floor's whole purpose (never let a side lock out from forming baskets at all) failed
+     *  silently in exactly the skewed-bearish-regime case the skew exists to lean into. Falls back
+     *  to minEligiblePerSide (then CROSS_SECTIONAL_K) when not provided, so unskewed callers are
+     *  unaffected. */
+    minEligiblePerSideLong?: number;
+    minEligiblePerSideShort?: number;
+  } = {},
 ): AdaptiveSymbolFilters {
   const minLegSamples = opts.minLegSamples ?? 3;
   const minEligiblePerSide = opts.minEligiblePerSide ?? CROSS_SECTIONAL_K;
+  const minEligiblePerSideLong = opts.minEligiblePerSideLong ?? minEligiblePerSide;
+  const minEligiblePerSideShort = opts.minEligiblePerSideShort ?? minEligiblePerSide;
   const perf = new Map<string, { longN: number; longSum: number; shortN: number; shortSum: number }>();
   const bump = (symbol: string, side: "long" | "short", ret: number) => {
     const row = perf.get(symbol) ?? { longN: 0, longSum: 0, shortN: 0, shortSum: 0 };
@@ -509,8 +601,8 @@ export function deriveAdaptiveSymbolFilters(
   // allowlist for that side THIS CYCLE ONLY — next cycle recomputes fresh from the same
   // closed-basket history, so a symbol gets a genuine chance to prove out again instead of
   // staying locked out forever with nothing left to remeasure it.
-  const longFloorApplied = longAllowRaw.size < minEligiblePerSide;
-  const shortFloorApplied = shortAllowRaw.size < minEligiblePerSide;
+  const longFloorApplied = longAllowRaw.size < minEligiblePerSideLong;
+  const shortFloorApplied = shortAllowRaw.size < minEligiblePerSideShort;
   const longAllow = longFloorApplied ? new Set(CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST) : longAllowRaw;
   const shortAllow = shortFloorApplied ? new Set(CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST) : shortAllowRaw;
   const shortBlock = new Set<string>([
@@ -532,6 +624,8 @@ export function deriveAdaptiveSymbolFilters(
       demotedLong: demotedLong.sort(),
       demotedShort: demotedShort.sort(),
       minEligiblePerSide,
+      minEligiblePerSideLong,
+      minEligiblePerSideShort,
       longFloorApplied,
       shortFloorApplied,
     },
@@ -773,8 +867,19 @@ export class CrossSectionalStore {
     if (idx >= 0) this.state.observations[idx] = next;
   }
 
+  private prune(): void {
+    if (this.state.observations.length <= CROSS_SECTIONAL_MAX_STORED_OBSERVATIONS) return;
+    const open = this.state.observations.filter((o) => o.status === "OPEN");
+    const settled = this.state.observations
+      .filter((o) => o.status !== "OPEN")
+      .sort((a, b) => new Date(b.openedAt).getTime() - new Date(a.openedAt).getTime())
+      .slice(0, Math.max(0, CROSS_SECTIONAL_MAX_STORED_OBSERVATIONS - open.length));
+    this.state.observations = [...open, ...settled];
+  }
+
   save(): void {
     try {
+      this.prune();
       const tmp = `${this.file}.tmp`;
       writeFileSync(tmp, JSON.stringify(this.state), "utf-8");
       if (existsSync(this.file)) {
@@ -890,8 +995,16 @@ export async function runCrossSectionalCycle(opts: {
   if (!isCrossSectionalFilteredDisabled() && !alreadyThisBucket(CROSS_SECTIONAL_FILTERED_SIGNAL)) {
     // Auto-updating lists: derived from the store's own measured per-leg performance
     // (env lists as the prior) — recomputed every cycle, never a frozen env var.
-    const adaptive = deriveAdaptiveSymbolFilters(opts.store);
+    // 2026-07-11: skew must be computed BEFORE deriveAdaptiveSymbolFilters, and threaded into its
+    // per-side floor — the floor previously always checked the unskewed base K on both sides, so a
+    // regime-skewed shortK (e.g. 3->4) could silently starve the short side one leg short of what
+    // buildFilteredCrossSectionalBasket actually requires, with the floor never noticing (3
+    // eligible symbols isn't "under 3", but it IS under a skewed requirement of 4).
     const skew = isCrossSectionalRegimeSkewEnabled() ? regimeSkewedK(CROSS_SECTIONAL_K, opts.axisScore ?? null) : null;
+    const adaptive = deriveAdaptiveSymbolFilters(opts.store, {
+      minEligiblePerSideLong: skew?.longK,
+      minEligiblePerSideShort: skew?.shortK,
+    });
     const basket = buildFilteredCrossSectionalBasket(scored, {
       k: CROSS_SECTIONAL_K,
       longK: skew?.longK,

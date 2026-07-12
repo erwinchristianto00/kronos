@@ -27,7 +27,18 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 
-import { type ShadowPosition } from "@dtc/shared";
+import { rotateJsonlIfNeeded } from "./jsonl-rotation.js";
+
+import { type ShadowPosition, type Candle } from "@dtc/shared";
+import { computeATR } from "./candle-indicators.js";
+// Reused unmodified for the "production_breakeven_control" exitRule's quantity-rounding
+// diagnostic (see that branch in walkVariantPath) — the SAME floor-to-stepSize helper
+// binance-futures-private.ts's placeOrder()/placeAlgoOrder() apply to every real order, per
+// investigation into live-execution-engine.ts's maybeCloseLiveBreakevenLaneAfterCost(). This file
+// otherwise has zero dependency on the live Binance client transport; importing one small pure
+// rounding function does not pull in any exchange/network/order-placement code (roundToStep has
+// no side effects and no other imports).
+import { roundToStep } from "./binance-futures-private.js";
 
 function writeJsonAtomic(file: string, value: unknown): void {
   const tmp = `${file}.tmp`;
@@ -93,7 +104,13 @@ export type VariantMatrixVariantId =
 export const BULL_TREND_VARIANT_ID = "BL_TREND_R15_STOP200_FULL" as const;
 export const BULL_SCALEOUT_VARIANT_ID = "BL_TREND_SCALEOUT_STOP200" as const;
 
-export type VariantExitRule = "tp1_full" | "trail_after_tp1" | "scaleout_tp1_trail" | "mfe_giveback";
+export type VariantExitRule =
+  | "tp1_full"
+  | "trail_after_tp1"
+  | "scaleout_tp1_trail"
+  | "mfe_giveback"
+  | "atr_trail"
+  | "production_breakeven_control";
 export type VariantFillMode = "taker" | "maker_limit";
 
 export type VariantObservationStatus =
@@ -156,6 +173,137 @@ export const STOP_OUT_SLIPPAGE_BPS = Number(process.env.STOP_OUT_SLIPPAGE_BPS) |
 export const MFE_GIVEBACK_ARM_R = Number(process.env.MFE_GIVEBACK_ARM_R) || 0.75;
 export const MFE_GIVEBACK_FRAC = Number(process.env.MFE_GIVEBACK_FRAC) || 0.5;
 export const EXPERIMENTAL_TP_NET_BUFFER_R = Number(process.env.EXPERIMENTAL_TP_NET_BUFFER_R) || 0.02;
+
+// --- ATR/structure trailing-stop exit (Tier 2 item 5, OFFLINE ANALYSIS ONLY) ---
+// Ports the proven ATR-ratchet mechanic already live in outcome-checker.ts's "trail_after_tp1"
+// RUNNER state (`currentStop = Math.max(currentStop, candle.close - atr)` for LONG, symmetric
+// `Math.min` for SHORT) into walkVariantPath as its own standalone exit rule. Unlike
+// trail_after_tp1 (a ONE-TIME jump of the stop to breakeven on a TP1 touch), atr_trail
+// continuously ratchets the stop toward price using a fresh N-period Wilder ATR recomputed from
+// the SAME candle window being walked (computeATR, from candle-indicators.ts — reused, not
+// duplicated). It only starts ratcheting once the running favorable excursion (peak BEFORE the
+// current candle, same no-lookahead convention as mfe_giveback's arm) has passed ATR_TRAIL_ARM_R;
+// once armed it stays armed (maxMfeR is monotonic). The ratchet itself is Math.max/Math.min so the
+// stop NEVER loosens. Report-only/offline: no VARIANT_MATRIX_DEFINITIONS entry references this
+// exitRule, so it is never mirrored against live signals, never selected by
+// effectiveExitRuleForOrder/variantDefinitionForOrder in paper-execution-router.ts, and never
+// touched by live-execution-engine.ts. It exists purely so scripts/backfill-cg-wide-fast-long-mfe.ts
+// (and any future offline A/B) can compare it against the existing 4 exit rules on identical entries.
+export const ATR_TRAIL_PERIOD = Number(process.env.ATR_TRAIL_PERIOD) || 14;
+export const ATR_TRAIL_MULTIPLE = Number(process.env.ATR_TRAIL_MULTIPLE) || 2;
+export const ATR_TRAIL_ARM_R = Number(process.env.ATR_TRAIL_ARM_R) || 0.5;
+
+// --- Production breakeven-after-cost CONTROL exit (Task 1, 2026-07-10, OFFLINE ANALYSIS ONLY) ---
+// Models live-execution-engine.ts's maybeCloseLiveBreakevenLaneAfterCost() (the REAL production
+// mechanism, gated on LIVE_BREAKEVEN_EXIT_LANE_IDS = CG_WIDE_LONG_RUNNER / CG_WIDE_FAST_LONG) as
+// its own standalone exitRule, added purely to serve as a VALIDATED CONTROL for the other 6
+// exit-ablation variants (operator-approved research brief). Same additive pattern as atr_trail
+// above: new union member + new branch only, VARIANT_MATRIX_DEFINITIONS untouched, so this is
+// never mirrored against live signals and never touched by live-execution-engine.ts.
+//
+// WHAT THIS FAITHFULLY MODELS (see the exitRule==="production_breakeven_control" branch in
+// walkVariantPath for the exact derivation):
+//  - Activation trigger: fires the instant the position's OWN unrealized P&L (mark vs its own
+//    entry) would exceed the flat round-trip cost estimate applied to current notional — i.e.
+//    netAfterCost = ownUnrealizedUsd − notionalUsd*costPct >= 0 (live-execution-engine.ts:2449-
+//    2451). Solved in closed form for the exact MARK PRICE at which this first becomes true
+//    (see PRODUCTION_BREAKEVEN_CONTROL_COST_PCT doc below) rather than approximated.
+//  - Entry+exit fee AND slippage: production does not itemize these — one blended constant,
+//    estimatedCloseCostPct, sourced from env var LIVE_ESTIMATED_CLOSE_COST_PCT (default 0.0022 =
+//    22bps), applied once against current notional. This control reads that SAME env var name by
+//    default (see PRODUCTION_BREAKEVEN_CONTROL_COST_PCT below) rather than an independent default,
+//    specifically so tuning the real production constant on any deployed instance keeps this
+//    control in sync automatically instead of silently diverging (2026-07-10 fidelity-review fix —
+//    an earlier version declared an unlinked constant that matched only by coincidence of
+//    defaults). PRODUCTION_BREAKEVEN_CONTROL_COST_PCT itself remains available as an explicit
+//    override for deliberately testing a different cost assumption in the ablation only.
+//  - No arm/latch state: re-evaluated fresh; modeled as "first candle whose high/low range
+//    crosses the trigger price" (see approximation note below for why this is the closest
+//    discrete analog available).
+//  - Close mechanics: full-size reduce-only MARKET close (no partial-TP runner state — matches
+//    both real gated lanes, which use tp1_full/full-size TP1, per investigation).
+//  - Quantity step-size rounding: reuses roundToStep() UNMODIFIED from binance-futures-private.ts
+//    (imported above) — the exact function placeOrder() applies to every real close order.
+//
+// WHERE THE CANDLE-WALK PARADIGM NECESSARILY APPROXIMATES (cannot be replicated offline):
+//  1. Tick cadence vs. candle granularity: production evaluates every engine tick (sub-second to
+//     low-single-digit-second cadence against live mark price); this walk only knows OHLC per 5m
+//     candle. A trigger price touched and reverted WITHIN one candle is indistinguishable here
+//     from one touched and held — same intrabar-timing limitation the rest of this file already
+//     documents (VariantWalkResult.peakAtMs, intrabarResolutionStatus).
+//  2. Realized-fee reconciliation: production uses the ESTIMATE (estimatedCloseCostPct) only to
+//     decide WHETHER to fire, then separately books the REAL commission from getUserTrades() into
+//     realizedPnlUsd afterward. This offline walk has no real trade ledger to reconcile against —
+//     grossR at the modeled trigger price IS the model's only "reality"; there is no analog of a
+//     second, more-accurate correction pass. (The backfill script's reconciliation report, Task 2,
+//     compares this model's grossR against the REAL realizedPnlUsd/fees for exactly this reason.)
+//  3. Order-placement retry/failure/timeout: production's close is a single unretried POST; on
+//     failure the exception propagates and the position remains open for re-evaluation next tick
+//     (live-execution-engine.ts:2415-2418, ERROR_STREAK_DISARM=3). This walk has no notion of a
+//     failed order at all — it assumes the close always succeeds instantly the trigger is touched.
+//     There is no offline analog of "the close attempt failed, try again next tick" against
+//     historical candles; we simply do not model order-placement failure.
+//  4. Tick-ordering vs. sibling exit mechanisms (2026-07-10 fidelity-review correction — the
+//     original version of this note was wrong on both points below):
+//     - maybeCloseOnTestnetUsdTakeProfit() runs in the SAME tick, immediately BEFORE this
+//       mechanism (live-execution-engine.ts manageLifecycle: testnet-USD-TP, then breakeven-after-
+//       cost). Despite its name it is NOT testnet-only — profitBankThresholdUsd() returns
+//       config.profitBankNetTargetUsd (a flat net-of-cost $ target, live default $1) on ANY
+//       environment when that config is set >0, and is not restricted to the two gated lanes. It
+//       uses the identical netAfterCost formula as this mechanism, just compared against a
+//       positive $ threshold instead of >=0. Because 0 < that threshold, a position's netAfterCost
+//       crosses this mechanism's trigger (>=0) before it can ever reach the profit-bank's higher
+//       bar, so in practice the breakeven-after-cost sweep should win the race first for these two
+//       lanes today — but that is a NUMERIC-ORDERING fact dependent on the current threshold
+//       values, not a code-level guarantee, and is not modeled as a competing mechanism here.
+//     - manageMfeGiveback() is NOT excluded from these two lanes by their tp1_full exitRule, as an
+//       earlier version of this note incorrectly claimed. Its real gate (manageLifecycle, ~line
+//       2333-2337) is `config.forceMfeGiveback && lane isn't a profit-core-short lane`, OR'd with
+//       an exitRule==="mfe_giveback" check — forceMfeGiveback is documented (line ~152) as applying
+//       "to EVERY directional intent regardless of its lane's own exit rule," and is enabled in
+//       production. The real reason it doesn't preempt this mechanism today is again numeric
+//       ordering, not structural exclusion: MFE-giveback only arms after +0.75R
+//       (MFE_GIVEBACK_ARM_R), a far larger favorable move than this mechanism's ~0.05-0.1R-scale
+//       trigger for these wide-stop lanes, and this mechanism runs first in the same tick anyway.
+//     Net effect: this walk is evaluated in ISOLATION, exactly like all 6 other ablation exit
+//     rules — it does not simulate either sibling mechanism competing for the same tick. This is
+//     an approximately-safe simplification under TODAY's constants (both siblings' thresholds sit
+//     well above this mechanism's near-zero trigger), not a guarantee that survives future tuning
+//     of PRODUCTION_BREAKEVEN_CONTROL_COST_PCT, profitBankNetTargetUsd, or MFE_GIVEBACK_ARM_R.
+//  5. cancelAllOrders/cancelAllAlgoOrders symbol-scoped side effects on OTHER executors sharing
+//     the same symbol (investigation item 7) — has no analog in a single-position candle walk;
+//     not modeled, out of scope for a per-trade exit-ablation.
+//  6. Quantity-rounding's effect on the OUTCOME: per investigation item 8, production's own
+//     quantity floor-rounding never changes the fired decision or the close price (a MARKET order
+//     has no price to round) — it only ever shaves an economically negligible dust remainder off
+//     the closed quantity. This control therefore surfaces the rounded quantity as a DIAGNOSTIC
+//     field only (VariantWalkResult.productionBreakevenModeledCloseQty); it deliberately does NOT
+//     feed grossR, matching production's own economics exactly (rounding is real but immaterial
+//     to R).
+//  7. Pyramiding: production blends ALL adds into one quantity-weighted-average entry/qty
+//     (addToIntent, live-execution-engine.ts:4242-4337) BEFORE this mechanism ever evaluates —
+//     i.e. by the time this check runs, pyramiding has already been fully absorbed into a single
+//     blended (entryPrice, qty) pair. walkVariantPath itself only ever replays ONE entry price; the
+//     existing walkPyramidOnConfirmedWinner sibling function (below) already models "a second
+//     entry added mid-trade" for exactly this reason — Task 3's pyramiding test exercises THAT
+//     function with exitRule: "production_breakeven_control" rather than duplicating pyramid logic
+//     inside walkVariantPath a second time.
+export const PRODUCTION_BREAKEVEN_CONTROL_COST_PCT =
+  Number(process.env.PRODUCTION_BREAKEVEN_CONTROL_COST_PCT) ||
+  Number(process.env.LIVE_ESTIMATED_CLOSE_COST_PCT) ||
+  0.0022;
+
+// --- Pyramid-only-on-confirmed-winner (Tier 2 item 5, OFFLINE ANALYSIS ONLY) ---
+// Mirrors the SPIRIT of live-execution-engine.ts's real pyramid cap (shouldCapPyramidAdd /
+// PYRAMID_FREE_ADD_LIMIT / PYRAMID_MIN_FAVORABLE_R = 0.15 — "no further adds without real
+// favorable progress", backed by real 2026-07-08 loss evidence) for walkPyramidOnConfirmedWinner's
+// FIRST add decision. It is a deliberately separate, independently-tunable constant (not an
+// import of the live constant): that gate governs whether a Nth live add is BLOCKED after
+// PYRAMID_FREE_ADD_LIMIT adds have already happened; this one governs whether this offline
+// simulator's single hypothetical second entry is added AT ALL. Same order of magnitude, same
+// "prove real progress first" intent, zero coupling to the tuned live constant.
+export const PYRAMID_CONFIRMED_ADD_FAVORABLE_R = Number(process.env.PYRAMID_CONFIRMED_ADD_FAVORABLE_R) || 0.15;
+export const PYRAMID_CONFIRMED_ADD_SIZE_MULTIPLE = Number(process.env.PYRAMID_CONFIRMED_ADD_SIZE_MULTIPLE) || 1;
 
 // --- Geometry constants ---
 export const WIDE_STOP_MIN_BPS = 300; // Paper-admissible wide/trail variants require >= 300bps stops
@@ -952,6 +1100,18 @@ export class CurrentGuardVariantMatrixStore {
       const archiveFile = this.file.replace(/\.json$/, "-archive.jsonl");
       const lines = dropped.map((obs) => JSON.stringify(obs)).join("\n") + "\n";
       appendFileSync(archiveFile, lines, "utf-8");
+      // 2026-07-12 fix: this file grows forever (every prune cycle appends, nothing ever trims it) —
+      // "never loaded back into memory" keeps it out of the OOM this mechanism guards against, but
+      // it will still exhaust VPS disk indefinitely. Reuses the same rotation helper already applied
+      // to every other unbounded JSONL log this session (decision-ledger.ts etc.).
+      const thresholdBytes = Number(process.env.VM_ARCHIVE_ROTATION_THRESHOLD_BYTES) || 25 * 1024 * 1024;
+      const tailLines = Number(process.env.VM_ARCHIVE_ROTATION_TAIL_LINES) || 10_000;
+      const result = rotateJsonlIfNeeded(archiveFile, { thresholdBytes, tailLines });
+      if (result.rotated) {
+        console.warn(
+          `[current-guard-variant-matrix] rotated ${archiveFile}: archived ${result.fromSize ?? "?"} bytes → ${result.archivePath ?? "?"}; kept ${result.linesKept ?? 0} lines`,
+        );
+      }
     } catch {
       // best-effort: archiving must never block the live-store prune
     }
@@ -1348,6 +1508,29 @@ export interface VariantWalkInput {
   makerFillWindowCandles?: number;
   mfeGivebackArmR?: number;
   mfeGivebackFrac?: number;
+  /** atr_trail only: Wilder ATR period used to build the trailing series (default ATR_TRAIL_PERIOD). */
+  atrPeriod?: number;
+  /** atr_trail only: stop = close ∓ atrMultiple×ATR once armed (default ATR_TRAIL_MULTIPLE). */
+  atrMultiple?: number;
+  /** atr_trail only: favorable-R the trade must have peaked at (prior candle) before the stop starts
+   *  ratcheting; stays armed forever after (default ATR_TRAIL_ARM_R). */
+  atrTrailArmR?: number;
+  /** production_breakeven_control only: single blended round-trip cost estimate (fee+slippage,
+   *  both legs) as a fraction of notional — mirrors live-execution-engine.ts's
+   *  estimatedCloseCostPct (default PRODUCTION_BREAKEVEN_CONTROL_COST_PCT = 0.0022 = 22bps).
+   *  Overridable per-call for tests/sweeps. */
+  productionBreakevenCostPct?: number;
+  /** production_breakeven_control only, OPTIONAL diagnostic: the position's own close quantity
+   *  (pre-rounding), paired with productionBreakevenQtyStepSize below to demonstrate the exact
+   *  exchange floor-to-stepSize rounding real close orders go through. Per investigation, this
+   *  rounding never changes the fired decision or the close price in production (a MARKET close
+   *  has no price to round) — supplying these two fields only populates the diagnostic
+   *  productionBreakevenModeledCloseQty result field; it never feeds grossR. */
+  productionBreakevenCloseQty?: number;
+  /** production_breakeven_control only: exchange LOT_SIZE stepSize paired with
+   *  productionBreakevenCloseQty above. Both must be supplied (and > 0) for the diagnostic to
+   *  compute; otherwise productionBreakevenModeledCloseQty stays null. */
+  productionBreakevenQtyStepSize?: number;
   forceCloseAtEnd?: boolean;
 }
 
@@ -1358,14 +1541,48 @@ export interface VariantWalkResult {
   closedAtMs: number | null;
   maxMfeR: number | null;
   minMaeR: number | null;
+  /** Open-time (ms) of the candle on which maxMfeR last increased — i.e. when the trade's
+   *  best favorable excursion was reached. Null whenever maxMfeR itself is null (no valid
+   *  path walked, e.g. NO_FILL/UNRESOLVED) or no favorable excursion above 0 ever occurred.
+   *  Approximate to candle granularity (5m) — same intrabar-timing limitation as the rest of
+   *  this walk, which only knows OHLC, not exact tick order within a candle. */
+  peakAtMs: number | null;
   intrabarResolutionStatus: VariantIntrabarStatus;
   isFreshValid: boolean | null;
   resolutionSource: string | null;
+  /** production_breakeven_control only: the modeled arm/trigger PRICE — the closed-form price at
+   *  which ownUnrealized(mark vs entry) first equals the assumed round-trip cost estimate (i.e.
+   *  netAfterCost==0), mirroring live-execution-engine.ts's maybeCloseLiveBreakevenLaneAfterCost().
+   *  Null for every other exitRule. Populated on EVERY result for this exitRule (even a plain
+   *  CLOSED_LOSS/MAX_HOLD_MTM outcome where the trigger was never reached) so a reconciliation
+   *  report can always see what the model's threshold price was. */
+  productionBreakevenTriggerPrice: number | null;
+  /** production_breakeven_control only, present iff BOTH productionBreakevenCloseQty and
+   *  productionBreakevenQtyStepSize were supplied on input: the close quantity after applying the
+   *  exact same floor-to-stepSize rounding real close orders go through (roundToStep, reused
+   *  unmodified from binance-futures-private.ts). Diagnostic only — never feeds grossR (see the
+   *  constant block's approximation note #6 above walkVariantPath for why). */
+  productionBreakevenModeledCloseQty: number | null;
 }
 
 function rewardR(dir: Direction, entry: number, target: number, risk: number): number {
   if (!(risk > 0)) return 0;
   return dir === "LONG" ? (target - entry) / risk : (entry - target) / risk;
+}
+
+/** Minimal KlineTuple->Candle adapter so the atr_trail exit rule can reuse the existing
+ *  computeATR (candle-indicators.ts) instead of duplicating Wilder's ATR math. computeATR only
+ *  reads high/low/close (and the prior candle's close for true range) — `open` is carried through
+ *  for shape-correctness but is never read by computeATR. */
+function klineTupleToCandle(c: KlineTuple): Candle {
+  return {
+    openTime: Number(c[0]),
+    open: Number(c[1]),
+    high: Number(c[2]),
+    low: Number(c[3]),
+    close: Number(c[4]),
+    volume: Number(c[5]),
+  };
 }
 
 /**
@@ -1381,6 +1598,10 @@ export async function walkVariantPath(
   const { direction: dir, entryPrice: E, stopLoss: S, target: T, exitRule, fillMode } = input;
   const mfeGivebackArmR = input.mfeGivebackArmR ?? MFE_GIVEBACK_ARM_R;
   const mfeGivebackFrac = input.mfeGivebackFrac ?? MFE_GIVEBACK_FRAC;
+  const atrPeriod = input.atrPeriod ?? ATR_TRAIL_PERIOD;
+  const atrMultiple = input.atrMultiple ?? ATR_TRAIL_MULTIPLE;
+  const atrTrailArmR = input.atrTrailArmR ?? ATR_TRAIL_ARM_R;
+  const productionBreakevenCostPct = input.productionBreakevenCostPct ?? PRODUCTION_BREAKEVEN_CONTROL_COST_PCT;
   const risk = dir === "LONG" ? E - S : S - E;
   const empty: VariantWalkResult = {
     status: "UNRESOLVED",
@@ -1389,9 +1610,12 @@ export async function walkVariantPath(
     closedAtMs: null,
     maxMfeR: null,
     minMaeR: null,
+    peakAtMs: null,
     intrabarResolutionStatus: null,
     isFreshValid: null,
     resolutionSource: null,
+    productionBreakevenTriggerPrice: null,
+    productionBreakevenModeledCloseQty: null,
   };
   if (!(risk > 0) || input.candles.length === 0) return empty;
 
@@ -1404,6 +1628,59 @@ export async function walkVariantPath(
     const raw = Number(c[6]);
     return Number.isFinite(raw) ? raw : candleOpen(c) + CANDLE_MS;
   };
+
+  // atr_trail only: one ATR series over the FULL candle window, index-aligned with `candles` so
+  // atrSeries[i] lines up directly with candles[i] inside the walk loop below. Computed once,
+  // up-front, regardless of where the walk actually starts (fillIdx) — cheap (single pass) and
+  // keeps the per-candle loop free of re-derivation.
+  const atrSeries = exitRule === "atr_trail" ? computeATR(candles.map(klineTupleToCandle), atrPeriod) : null;
+
+  // production_breakeven_control only: the modeled arm/trigger PRICE, solved in closed form.
+  // Production's real gate (live-execution-engine.ts:2449-2451) is, in dollar terms:
+  //   netAfterCost = (mark-entry)*|qty| - |qty|*mark*costPct >= 0      (LONG; SHORT mirrored)
+  // Assuming the engine's own qty equals the exchange position's qty (shareFrac=1, the common
+  // single-lane case — see investigation item 6), |qty| cancels and this reduces to a pure
+  // function of price:
+  //   LONG:  mark - entry >= mark*costPct  =>  mark >= entry / (1 - costPct)
+  //   SHORT: entry - mark >= mark*costPct  =>  mark <= entry / (1 + costPct)
+  // This is a FIXED price for the whole walk (not path-dependent) — production itself re-checks
+  // the identical algebraic condition fresh every tick with no arm/latch state, so "does this
+  // candle's high/low range cross this fixed price" is the closest discrete analog to "did any
+  // tick's mark price cross it" (approximation #1 in the block comment above).
+  const productionBreakevenTriggerPrice =
+    exitRule === "production_breakeven_control" && productionBreakevenCostPct > 0 && productionBreakevenCostPct < 1
+      ? dir === "LONG"
+        ? E / (1 - productionBreakevenCostPct)
+        : E / (1 + productionBreakevenCostPct)
+      : null;
+  // Whichever of {trigger price, real target T} requires the SMALLER favorable move is reached
+  // FIRST in continuous time. Given costPct (~22bps) is normally far smaller than any of these
+  // lanes' real TP distances (150-900bps), the trigger price is almost always the closer one —
+  // this control preempts the "let it run to TP" thesis whenever the trade ever ticks favorable
+  // by more than the cost estimate. Only in a contrived/misconfigured geometry (TP tighter than
+  // the cost estimate) would T be the closer, "real" outcome instead.
+  const productionBreakevenIsCloserThanTp =
+    productionBreakevenTriggerPrice !== null && Number.isFinite(productionBreakevenTriggerPrice)
+      ? dir === "LONG"
+        ? productionBreakevenTriggerPrice <= T
+        : productionBreakevenTriggerPrice >= T
+      : false;
+  const productionBreakevenExitR =
+    productionBreakevenTriggerPrice !== null && Number.isFinite(productionBreakevenTriggerPrice)
+      ? rewardR(dir, E, productionBreakevenTriggerPrice, risk)
+      : 0;
+  // Diagnostic only (approximation #6 above): floor the position's own close quantity to the
+  // exchange stepSize using the EXACT same helper placeOrder() uses for every real close order.
+  // Never feeds grossR — production's own MARKET close has no price to round, and the qty floor
+  // only ever shaves an economically negligible dust remainder off the closed size.
+  const productionBreakevenModeledCloseQty =
+    exitRule === "production_breakeven_control" &&
+    typeof input.productionBreakevenCloseQty === "number" &&
+    input.productionBreakevenCloseQty > 0 &&
+    typeof input.productionBreakevenQtyStepSize === "number" &&
+    input.productionBreakevenQtyStepSize > 0
+      ? roundToStep(input.productionBreakevenCloseQty, input.productionBreakevenQtyStepSize, "down")
+      : null;
 
   // Locate the signal candle (the one containing openedAtMs).
   let signalIdx = 0;
@@ -1446,9 +1723,10 @@ export async function walkVariantPath(
   const openedAtMs = Math.max(input.openedAtMs, candleOpen(candles[fillIdx]!));
   let maxMfeR = 0;
   let minMaeR = 0;
+  let peakAtMs: number | null = null;
   let pathValid = true;
 
-  const updatePath = (high: number, low: number) => {
+  const updatePath = (high: number, low: number, atMs: number) => {
     if (!pathValid) return;
     const favorable = dir === "LONG" ? Math.max(high - E, 0) : Math.max(E - low, 0);
     const adverse = dir === "LONG" ? Math.min(low - E, 0) : Math.min(E - high, 0);
@@ -1458,7 +1736,10 @@ export async function walkVariantPath(
       pathValid = false;
       return;
     }
-    if (mfeR > maxMfeR) maxMfeR = mfeR;
+    if (mfeR > maxMfeR) {
+      maxMfeR = mfeR;
+      peakAtMs = atMs;
+    }
     if (maeR < minMaeR) minMaeR = maeR;
   };
 
@@ -1476,15 +1757,24 @@ export async function walkVariantPath(
     closedAtMs,
     maxMfeR: pathValid ? maxMfeR : null,
     minMaeR: pathValid ? minMaeR : null,
+    peakAtMs: pathValid ? peakAtMs : null,
     intrabarResolutionStatus: intrabar,
     isFreshValid,
     resolutionSource,
+    // Populated for EVERY outcome of this exitRule (not just the ones caused by the trigger
+    // itself) so a reconciliation report can always see what the model's threshold was, per the
+    // VariantWalkResult field doc.
+    productionBreakevenTriggerPrice,
+    productionBreakevenModeledCloseQty,
   });
 
   const fullRewardR = rewardR(dir, E, T, risk);
 
   // Shared trail state (trail_after_tp1 / scaleout_tp1_trail).
   let tp1Touched = false;
+  // atr_trail state: starts at the original stop and only ever ratchets toward price (never
+  // loosens) once armed. Independent of tp1Touched — atr_trail has no TP1-touch concept.
+  let atrCurrentStop = S;
 
   for (let i = fillIdx; i < candles.length; i += 1) {
     const candle = candles[i]!;
@@ -1496,7 +1786,7 @@ export async function walkVariantPath(
     // Peak favorable BEFORE folding in this candle — used by mfe_giveback so the giveback
     // level cannot be triggered by the same candle's own new high (no intrabar lookahead).
     const peakBefore = maxMfeR;
-    updatePath(high, low);
+    updatePath(high, low, cOpen);
 
     const slHitAtStop = (stop: number) => (dir === "LONG" ? low <= stop : high >= stop);
     const tpHit = dir === "LONG" ? high >= T : low <= T;
@@ -1541,6 +1831,108 @@ export async function walkVariantPath(
           return finalize(status, exitR, cCloseTime, "MFE_GIVEBACK_EXIT", "VALID_5M_ORDERED", true);
         }
       }
+      continue;
+    }
+
+    if (exitRule === "atr_trail") {
+      // Hard far TP still bounds the trade on the upside (same convention as mfe_giveback); the
+      // STOP side is the ratcheted `atrCurrentStop` rather than the fixed `S`. Same-candle
+      // ambiguity resolved the same conservative way as every other exit rule (1m refine, else
+      // SL-first).
+      const slHit = slHitAtStop(atrCurrentStop);
+      if (slHit && tpHit) {
+        const decided = resolve1m ? await resolve1m(cOpen) : null;
+        if (decided === "TP") return finalize("CLOSED_WIN", fullRewardR, cCloseTime, "INTRABAR_1M_TP", "RESOLVED_BY_1M", true);
+        const exitR = rewardR(dir, E, atrCurrentStop, risk);
+        const status = exitR > 0 ? "CLOSED_WIN" : "CLOSED_LOSS";
+        return finalize(status, exitR, cCloseTime, "AMBIGUOUS_SL_FIRST", decided === "SL" ? "RESOLVED_BY_1M" : "AMBIGUOUS_SAME_CANDLE_SL_FIRST", true);
+      }
+      if (slHit) {
+        const exitR = rewardR(dir, E, atrCurrentStop, risk);
+        const status = exitR > 0 ? "CLOSED_WIN" : "CLOSED_LOSS";
+        return finalize(status, exitR, cCloseTime, "ATR_TRAIL_STOP", "VALID_5M_ORDERED", true);
+      }
+      if (tpHit) return finalize("CLOSED_WIN", fullRewardR, cCloseTime, "CANDLE_WALK_TP", "VALID_5M_ORDERED", true);
+      // Ratchet using THIS candle's close, but only for the NEXT candle's touch check (the SL
+      // check above already used the stop as of the END of the PREVIOUS candle — no lookahead).
+      // Only once armed (peak BEFORE this candle >= atrTrailArmR; stays armed, maxMfeR is
+      // monotonic) and only when ATR is available for this index. Math.max/Math.min => never loosens.
+      const atrValue = atrSeries ? atrSeries[i] : null;
+      if (peakBefore >= atrTrailArmR && typeof atrValue === "number" && Number.isFinite(atrValue) && atrValue > 0) {
+        const trailLevel = dir === "LONG" ? cClose - atrMultiple * atrValue : cClose + atrMultiple * atrValue;
+        atrCurrentStop = dir === "LONG" ? Math.max(atrCurrentStop, trailLevel) : Math.min(atrCurrentStop, trailLevel);
+      }
+      continue;
+    }
+
+    if (exitRule === "production_breakeven_control") {
+      // Models live-execution-engine.ts's maybeCloseLiveBreakevenLaneAfterCost(). The hard SL
+      // still bounds the downside exactly like every other rule (production's real stop is a
+      // separate resting order, orthogonal to this mechanism, but still fires if price never
+      // reaches the tiny breakeven-after-cost threshold). productionBreakevenTriggerPrice/
+      // productionBreakevenIsCloserThanTp/productionBreakevenExitR are precomputed ONCE above the
+      // loop (fixed price levels, not path-dependent — see that comment block for the derivation).
+      const slHit = slHitAtStop(S);
+      const beHit =
+        productionBreakevenTriggerPrice !== null && Number.isFinite(productionBreakevenTriggerPrice)
+          ? dir === "LONG"
+            ? high >= productionBreakevenTriggerPrice
+            : low <= productionBreakevenTriggerPrice
+          : false;
+      if (slHit && (beHit || tpHit)) {
+        const decided = resolve1m ? await resolve1m(cOpen) : null;
+        if (decided === "TP") {
+          if (beHit && (productionBreakevenIsCloserThanTp || !tpHit)) {
+            return finalize(
+              productionBreakevenExitR > 0 ? "CLOSED_WIN" : "CLOSED_LOSS",
+              productionBreakevenExitR,
+              cCloseTime,
+              "LIVE_LONG_RUNNER_BREAKEVEN_AFTER_COST",
+              "RESOLVED_BY_1M",
+              true,
+            );
+          }
+          return finalize("CLOSED_WIN", fullRewardR, cCloseTime, "CANDLE_WALK_TP", "RESOLVED_BY_1M", true);
+        }
+        // Conservative SL-first — same convention as every other exit rule in this file.
+        return finalize(
+          "CLOSED_LOSS",
+          -1,
+          cCloseTime,
+          "AMBIGUOUS_SL_FIRST",
+          decided === "SL" ? "RESOLVED_BY_1M" : "AMBIGUOUS_SAME_CANDLE_SL_FIRST",
+          true,
+        );
+      }
+      if (slHit) return finalize("CLOSED_LOSS", -1, cCloseTime, "CANDLE_WALK_SL", "VALID_5M_ORDERED", true);
+      if (beHit && tpHit) {
+        // Both thresholds fall inside this candle's range. The conservative convention this file
+        // already uses (never assume the FARTHER level was reached) plus the real economics
+        // (production's mechanism, when its threshold is closer, would have fired first in
+        // continuous time) both point the same way: take whichever requires the SMALLER move.
+        if (productionBreakevenIsCloserThanTp) {
+          return finalize(
+            productionBreakevenExitR > 0 ? "CLOSED_WIN" : "CLOSED_LOSS",
+            productionBreakevenExitR,
+            cCloseTime,
+            "LIVE_LONG_RUNNER_BREAKEVEN_AFTER_COST",
+            "VALID_5M_ORDERED",
+            true,
+          );
+        }
+        return finalize("CLOSED_WIN", fullRewardR, cCloseTime, "CANDLE_WALK_TP", "VALID_5M_ORDERED", true);
+      }
+      if (beHit) {
+        return finalize(
+          productionBreakevenExitR > 0 ? "CLOSED_WIN" : "CLOSED_LOSS",
+          productionBreakevenExitR,
+          cCloseTime,
+          "LIVE_LONG_RUNNER_BREAKEVEN_AFTER_COST",
+          "VALID_5M_ORDERED",
+          true,
+        );
+      }
+      if (tpHit) return finalize("CLOSED_WIN", fullRewardR, cCloseTime, "CANDLE_WALK_TP", "VALID_5M_ORDERED", true);
       continue;
     }
 
@@ -1605,7 +1997,219 @@ export async function walkVariantPath(
     return finalize(status, grossR, candleCloseTime(lastCandle), "MAX_HOLD_MTM", "VALID_5M_ORDERED", true);
   }
 
-  return empty;
+  // Left UNRESOLVED (no forceCloseAtEnd, arm threshold never crossed, hard stop never touched):
+  // still surface the modeled trigger price/qty diagnostics for production_breakeven_control so a
+  // caller can see what the threshold WAS even though the walk never reached a verdict.
+  return { ...empty, productionBreakevenTriggerPrice, productionBreakevenModeledCloseQty };
+}
+
+// ---------------------------------------------------------------------------
+// Pyramid-only-on-confirmed-winner (Tier 2 item 5, OFFLINE ANALYSIS ONLY).
+// walkVariantPath itself is untouched above and still only ever replays ONE entry — this is an
+// ADDITIVE sibling function, not a modification of it. It simulates adding a SECOND same-direction
+// entry once the FIRST leg has shown real favorable progress (mirrors the "no further adds without
+// progress" spirit of live-execution-engine.ts's shouldCapPyramidAdd/PYRAMID_MIN_FAVORABLE_R gate —
+// see PYRAMID_CONFIRMED_ADD_FAVORABLE_R's doc comment for why this is an independent constant, not
+// a shared one). Both legs' EXITS are resolved entirely by walkVariantPath (reused, not
+// reimplemented) — the only new logic here is "when does leg 2 get added" (a tiny favorable-R
+// crossing scan, not an exit-resolution rule) and "how do the two legs combine into one R number".
+// ---------------------------------------------------------------------------
+
+/**
+ * Finds the first candle (scanning from `fromIdx` onward, inclusive) where the running favorable
+ * excursion from `entryPrice` — using the exact same favorable-excursion formula walkVariantPath's
+ * own MFE tracker uses — reaches `thresholdR`. This is an ENTRY-timing detector, not exit logic:
+ * it never decides whether/how a leg closes (walkVariantPath alone does that). Uses candle
+ * high/low directly (same convention SL/TP touches use elsewhere in this file) rather than the
+ * peakBefore/no-lookahead convention mfe_giveback and atr_trail use for EXITS — there is no
+ * self-referential exit-off-its-own-spike concern for a pure "did we ever reach this level" scan.
+ */
+function findFavorableRCrossing(
+  dir: Direction,
+  entryPrice: number,
+  risk: number,
+  candles: KlineTuple[],
+  fromIdx: number,
+  thresholdR: number,
+): { index: number; atMs: number } | null {
+  if (!(risk > 0) || !(thresholdR > 0)) return null;
+  for (let i = Math.max(fromIdx, 0); i < candles.length; i += 1) {
+    const c = candles[i]!;
+    const high = Number(c[2]);
+    const low = Number(c[3]);
+    const favorable = dir === "LONG" ? Math.max(high - entryPrice, 0) : Math.max(entryPrice - low, 0);
+    if (favorable / risk >= thresholdR) {
+      return { index: i, atMs: Number(c[0]) };
+    }
+  }
+  return null;
+}
+
+/** Locates the index of the candle containing `atMs` (same convention walkVariantPath's own
+ *  signal-candle search uses) — used only to find where to START the favorable-R crossing scan
+ *  (leg 1's actual fill candle, taker OR maker — walkVariantPath already resolved which candle
+ *  that was via its returned `openedAtMs`, so this never re-derives the maker fill-window logic). */
+function locateCandleIndex(candles: KlineTuple[], atMs: number): number {
+  for (let i = 0; i < candles.length; i += 1) {
+    const open = Number(candles[i]![0]);
+    if (open <= atMs && atMs < open + CANDLE_MS) return i;
+    if (open > atMs) return i;
+  }
+  return Math.max(candles.length - 1, 0);
+}
+
+export interface PyramidWalkInput {
+  direction: Direction;
+  entryPrice: number;
+  stopLoss: number;
+  target: number;
+  /** Exit rule applied to BOTH legs (each leg is its own independent walkVariantPath replay). */
+  exitRule: VariantExitRule;
+  fillMode: VariantFillMode;
+  openedAtMs: number;
+  candles: KlineTuple[];
+  /** Favorable-R the FIRST leg must reach (real, not fabricated, progress) before a second
+   *  same-direction entry is added. Default PYRAMID_CONFIRMED_ADD_FAVORABLE_R. */
+  addFavorableR?: number;
+  /** Size of the second entry relative to the first leg's size (1 = equal size). Default
+   *  PYRAMID_CONFIRMED_ADD_SIZE_MULTIPLE. */
+  addSizeMultiple?: number;
+  makerFillWindowCandles?: number;
+  mfeGivebackArmR?: number;
+  mfeGivebackFrac?: number;
+  atrPeriod?: number;
+  atrMultiple?: number;
+  atrTrailArmR?: number;
+  forceCloseAtEnd?: boolean;
+}
+
+export interface PyramidWalkResult {
+  status: "CLOSED_WIN" | "CLOSED_LOSS" | "NO_FILL" | "UNRESOLVED";
+  /** True only when the favorable-R threshold was actually crossed WHILE leg 1 was still open
+   *  and a second leg was walked (regardless of leg 2's own eventual outcome). */
+  addedSecondEntry: boolean;
+  addOpenedAtMs: number | null;
+  addEntryPrice: number | null;
+  /** Full result of the first (original-size) entry — exactly what a plain walkVariantPath call
+   *  on the same geometry/candles would return. */
+  leg1: VariantWalkResult;
+  /** Full result of the second (pyramided) entry, or null when no add was made or leg 1 itself
+   *  never resolved (NO_FILL/UNRESOLVED — nothing to confirm a winner from). */
+  leg2: VariantWalkResult | null;
+  /** Size-weighted blended R across both legs: (leg1R×1 + leg2R×addSizeMultiple) / totalSize.
+   *  Falls back to leg1.grossR alone when leg2 was never added or never resolved — no fabricated
+   *  leg2 P&L is ever assumed. Null only when leg1 itself has no grossR (NO_FILL/UNRESOLVED). */
+  combinedR: number | null;
+  totalSize: number;
+}
+
+export async function walkPyramidOnConfirmedWinner(
+  input: PyramidWalkInput,
+  resolve1m?: (fillCandleOpenMs: number) => Promise<"SL" | "TP" | null>,
+): Promise<PyramidWalkResult> {
+  const addFavorableR = input.addFavorableR ?? PYRAMID_CONFIRMED_ADD_FAVORABLE_R;
+  const addSizeMultiple = input.addSizeMultiple ?? PYRAMID_CONFIRMED_ADD_SIZE_MULTIPLE;
+
+  // Leg 1: the ORIGINAL, full-size entry. Exit resolution entirely delegated to walkVariantPath —
+  // this function never reimplements SL/TP/trail/giveback/atr-trail logic.
+  const leg1 = await walkVariantPath(
+    {
+      direction: input.direction,
+      entryPrice: input.entryPrice,
+      stopLoss: input.stopLoss,
+      target: input.target,
+      exitRule: input.exitRule,
+      fillMode: input.fillMode,
+      openedAtMs: input.openedAtMs,
+      candles: input.candles,
+      makerFillWindowCandles: input.makerFillWindowCandles,
+      mfeGivebackArmR: input.mfeGivebackArmR,
+      mfeGivebackFrac: input.mfeGivebackFrac,
+      atrPeriod: input.atrPeriod,
+      atrMultiple: input.atrMultiple,
+      atrTrailArmR: input.atrTrailArmR,
+      forceCloseAtEnd: input.forceCloseAtEnd,
+    },
+    resolve1m,
+  );
+
+  const noAdd = (): PyramidWalkResult => ({
+    status: leg1.status,
+    addedSecondEntry: false,
+    addOpenedAtMs: null,
+    addEntryPrice: null,
+    leg1,
+    leg2: null,
+    combinedR: leg1.grossR,
+    totalSize: 1,
+  });
+
+  // Nothing to confirm a winner from — leg 1 never filled or never resolved.
+  if (leg1.status === "NO_FILL" || leg1.status === "UNRESOLVED") return noAdd();
+
+  const risk = input.direction === "LONG" ? input.entryPrice - input.stopLoss : input.stopLoss - input.entryPrice;
+  if (!(risk > 0)) return noAdd();
+
+  // Scan for the favorable-R crossing starting from leg 1's ACTUAL fill candle (walkVariantPath
+  // already resolved taker-vs-maker fill timing for us via leg1.openedAtMs — no re-derivation of
+  // the maker fill-window scan here).
+  const scanFrom = locateCandleIndex(input.candles, leg1.openedAtMs ?? input.openedAtMs);
+  const crossing = findFavorableRCrossing(input.direction, input.entryPrice, risk, input.candles, scanFrom, addFavorableR);
+
+  // No confirmed-winner crossing, or it only happened at/after leg 1 already closed (too late to
+  // add to a position that no longer exists) => single-entry outcome only.
+  if (!crossing || (leg1.closedAtMs !== null && crossing.atMs >= leg1.closedAtMs)) return noAdd();
+
+  // Confirmed winner: add a second same-direction entry at the crossing candle's CLOSE (a
+  // conservative, tradeable reference price — not the candle's own intrabar high/low that
+  // triggered the crossing). Leg 2 gets its OWN stop/target, mirroring leg 1's exact geometry
+  // (same absolute risk distance, same absolute reward distance) re-based to its own entry — like
+  // a real pyramid add is a brand-new order, not a fractional share of leg 1's.
+  const addCandle = input.candles[crossing.index]!;
+  const addEntryPrice = Number(addCandle[4]);
+  const leg2StopLoss = input.direction === "LONG" ? addEntryPrice - risk : addEntryPrice + risk;
+  const rewardDistance = input.direction === "LONG" ? input.target - input.entryPrice : input.entryPrice - input.target;
+  const leg2Target = input.direction === "LONG" ? addEntryPrice + rewardDistance : addEntryPrice - rewardDistance;
+  const remainingCandles = input.candles.slice(crossing.index);
+
+  const leg2 = await walkVariantPath(
+    {
+      direction: input.direction,
+      entryPrice: addEntryPrice,
+      stopLoss: leg2StopLoss,
+      target: leg2Target,
+      exitRule: input.exitRule,
+      fillMode: "taker", // the add fires on confirmed real-time progress, not a resting limit
+      openedAtMs: crossing.atMs,
+      candles: remainingCandles,
+      mfeGivebackArmR: input.mfeGivebackArmR,
+      mfeGivebackFrac: input.mfeGivebackFrac,
+      atrPeriod: input.atrPeriod,
+      atrMultiple: input.atrMultiple,
+      atrTrailArmR: input.atrTrailArmR,
+      forceCloseAtEnd: input.forceCloseAtEnd,
+    },
+    resolve1m,
+  );
+
+  const totalSize = 1 + addSizeMultiple;
+  const combinedR =
+    leg1.grossR !== null && leg2.grossR !== null
+      ? (leg1.grossR * 1 + leg2.grossR * addSizeMultiple) / totalSize
+      : leg1.grossR;
+  const status: PyramidWalkResult["status"] =
+    combinedR !== null ? (combinedR > 0 ? "CLOSED_WIN" : "CLOSED_LOSS") : leg1.status;
+
+  return {
+    status,
+    addedSecondEntry: true,
+    addOpenedAtMs: crossing.atMs,
+    addEntryPrice,
+    leg1,
+    leg2,
+    combinedR,
+    totalSize,
+  };
 }
 
 function variantMaxHoldMs(variantId: VariantMatrixVariantId): number {

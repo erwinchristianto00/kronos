@@ -44,6 +44,15 @@ describe("setup/momentum quality dimension (0-25)", () => {
     const chased = scoreSetupQuality({ volumeRatio: 3, rocPercent: 5, atrExtension: 3, maxHealthyAtrExtension: 3 });
     expect(chased).toBeCloseTo(0, 1); // extension at the max -> full penalty
   });
+
+  // [NAN-GUARD, 2026-07-12 fix]: a NaN input (e.g. a 0/0 upstream) used to propagate silently
+  // through clamp()'s Math.max/min into the returned score, corrupting totalScore instead of
+  // scoring this dimension 0 like every other missing/bad-data case in this file.
+  it("scores 0 (never NaN) when any input is non-finite", () => {
+    expect(scoreSetupQuality({ volumeRatio: NaN, rocPercent: 5, atrExtension: 0 })).toBe(0);
+    expect(scoreSetupQuality({ volumeRatio: 3, rocPercent: NaN, atrExtension: 0 })).toBe(0);
+    expect(scoreSetupQuality({ volumeRatio: 3, rocPercent: 5, atrExtension: NaN })).toBe(0);
+  });
 });
 
 describe("order-flow quality dimension (0-20)", () => {
@@ -75,6 +84,14 @@ describe("liquidity quality dimension (0-15)", () => {
 
   it("scores 0 when data is missing (thin book / no quote)", () => {
     expect(scoreLiquidityQuality({ spreadBps: null, expectedSlippageBps: 5, maxSpreadBps: 20, maxSlippageBps: 20 })).toBe(0);
+  });
+
+  // [NAN-GUARD, 2026-07-12 fix]: `=== null` doesn't catch NaN — a spread/slippage computed as 0/0
+  // upstream used to slip through and propagate NaN into the returned score instead of scoring 0
+  // the way an explicit null (missing data) already did.
+  it("scores 0 (never NaN) when spread/slippage is non-finite rather than null", () => {
+    expect(scoreLiquidityQuality({ spreadBps: NaN, expectedSlippageBps: 5, maxSpreadBps: 20, maxSlippageBps: 20 })).toBe(0);
+    expect(scoreLiquidityQuality({ spreadBps: 5, expectedSlippageBps: NaN, maxSpreadBps: 20, maxSlippageBps: 20 })).toBe(0);
   });
 });
 

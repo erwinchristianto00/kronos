@@ -15,6 +15,7 @@ import {
   IM_EXEC_LEVERAGE,
   IM_EXEC_MAX_SIGNAL_AGE_MS,
   IM_EXEC_DAILY_MAX_LOSS_USD,
+  IM_EXEC_MAX_CONCURRENT,
 } from "../src/lib/intraday-momentum-edge.js";
 
 let t = 1_000_000_000_000;
@@ -286,6 +287,7 @@ describe("intraday momentum hunter — live execution wiring adapters", () => {
       "INTRADAY_MOMENTUM_EXEC_LEVERAGE",
       "INTRADAY_MOMENTUM_EXEC_MAX_SIGNAL_AGE_MS",
       "INTRADAY_MOMENTUM_EXEC_DAILY_MAX_LOSS_USD",
+      "INTRADAY_MOMENTUM_EXEC_MAX_CONCURRENT",
     ] as const;
     const saved: Record<string, string | undefined> = {};
 
@@ -331,6 +333,19 @@ describe("intraday momentum hunter — live execution wiring adapters", () => {
       expect(IM_EXEC_DAILY_MAX_LOSS_USD()).toBe(0);
       process.env.INTRADAY_MOMENTUM_EXEC_DAILY_MAX_LOSS_USD = "15";
       expect(IM_EXEC_DAILY_MAX_LOSS_USD()).toBe(15);
+    });
+
+    it("IM_EXEC_MAX_CONCURRENT defaults to 1 (matching the executor's own prior hardcoded default) and honors a positive override", () => {
+      expect(IM_EXEC_MAX_CONCURRENT()).toBe(1);
+      process.env.INTRADAY_MOMENTUM_EXEC_MAX_CONCURRENT = "5";
+      expect(IM_EXEC_MAX_CONCURRENT()).toBe(5);
+    });
+
+    it("IM_EXEC_MAX_CONCURRENT ignores <1 or garbage and falls back to the default", () => {
+      process.env.INTRADAY_MOMENTUM_EXEC_MAX_CONCURRENT = "0";
+      expect(IM_EXEC_MAX_CONCURRENT()).toBe(1);
+      process.env.INTRADAY_MOMENTUM_EXEC_MAX_CONCURRENT = "not-a-number";
+      expect(IM_EXEC_MAX_CONCURRENT()).toBe(1);
     });
   });
 });

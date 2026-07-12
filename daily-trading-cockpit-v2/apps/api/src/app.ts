@@ -26,7 +26,11 @@ import {
   isCrossSectionalExecEnabled,
 } from "./lib/cross-sectional-executor.js";
 import { buildCrossSectionalReport, getCrossSectionalStore } from "./lib/cross-sectional-edge.js";
-import { SingleSymbolLaneExecutor, SingleSymbolLaneExecutorStore } from "./lib/single-symbol-lane-executor.js";
+import {
+  SingleSymbolLaneExecutor,
+  SingleSymbolLaneExecutorStore,
+  type SingleSymbolExitPolicy,
+} from "./lib/single-symbol-lane-executor.js";
 import {
   getShortFadeStore,
   isShortFadeExecEnabled,
@@ -36,6 +40,7 @@ import {
   SF_EXEC_LEVERAGE,
   SF_EXEC_MAX_SIGNAL_AGE_MS,
   SF_EXEC_DAILY_MAX_LOSS_USD,
+  SF_EXEC_MAX_CONCURRENT,
   SF_PAPER_LANE_ID,
 } from "./lib/short-fade-edge.js";
 import {
@@ -47,6 +52,7 @@ import {
   IM_EXEC_LEVERAGE,
   IM_EXEC_MAX_SIGNAL_AGE_MS,
   IM_EXEC_DAILY_MAX_LOSS_USD,
+  IM_EXEC_MAX_CONCURRENT,
   IM_PAPER_LANE_ID,
 } from "./lib/intraday-momentum-edge.js";
 import {
@@ -86,7 +92,7 @@ import {
   ceLaneIdForBucket,
   type CEBucket,
 } from "./lib/composite-estimator-edge.js";
-import { computeExternalManagedNetQty, computeNotionalPerSymbol, maxNotionalPerSymbolAcrossLanes, isNewExecutorLaneAllowed, rollingNetEntryHealth } from "./lib/live-executor-wiring.js";
+import { computeExternalManagedNetQty, computeNotionalPerSymbol, maxNotionalPerSymbolAcrossLanes, isNewExecutorLaneAllowed, rollingNetEntryHealth, sumExternalRealizedPnlUsd } from "./lib/live-executor-wiring.js";
 import { RegimeAutopilot, isRegimeAutopilotEnabled } from "./lib/regime-autopilot.js";
 import { getRegimeEngineStore } from "./lib/regime-engine-service.js";
 import {
@@ -99,8 +105,7 @@ import { getLaneSymbolCurationCacheStore } from "./lib/lane-symbol-curation-cach
 import type { LaneSymbolCurationTier } from "./lib/per-symbol-lane-book-edge.js";
 import { getPaperExecutionRouterStore } from "./lib/paper-execution-router.js";
 import {
-  FORCE_ELIGIBLE_SHORT_VARIANT_IDS,
-  FORCE_ELIGIBLE_LONG_VARIANT_IDS,
+  isForceEligibleForDirection,
   getRealtimeShortMirrorStore,
   isRealtimeShortAllowedLaneId,
   isRealtimeShortMirrorEnabled,
@@ -125,6 +130,14 @@ import {
   rotationShortlistDecision,
   rotationShortlistFamilyHasSymbols,
 } from "./lib/regime-rotation-shortlist.js";
+import {
+  UnifiedTestnetOrchestrator,
+  UnifiedTestnetOrchestratorStore,
+  isUnifiedTestnetOrchestratorEnabled,
+  type UnifiedDirection,
+  type UnifiedFeatureVote,
+} from "./lib/unified-testnet-orchestrator.js";
+import { UnifiedTestnetProposalStore } from "./lib/unified-testnet-proposal-source.js";
 
 export interface AppOptions {
   fetchImpl?: typeof fetch;
@@ -224,11 +237,26 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
   // prior measurement of this exact 3-stage signal.
   let panicWashoutExecutor: SingleSymbolLaneExecutor | null = null;
   let regimeAutopilot: RegimeAutopilot | null = null;
+  let unifiedOrchestrator: UnifiedTestnetOrchestrator | null = null;
+  let unifiedProposalStore: UnifiedTestnetProposalStore | null = null;
 
-  // 2026-07-09 fix: all 8 single-symbol executors, for the cross-lane per-symbol notional cap
-  // (computeNotionalPerSymbol) — see that function's doc comment for the incident this closes.
-  // Referencing the mutable `let` bindings above is safe: this is only ever CALLED during a tick,
+  // 2026-07-09 fix, widened 2026-07-11: the SHARED single source of truth for "every single-symbol
+  // / cross-sectional executor instance that exists" — consumed by the per-symbol notional cap
+  // (computeNotionalPerSymbol), the reconcile-safety net-qty tracker (computeExternalManagedNetQty),
+  // and the external realized-P&L sum (sumExternalRealizedPnlUsd, feeding the kill-switch/wallet-
+  // reconciliation/dashboard headline). Before 2026-07-11 these 3 consumers each had their OWN
+  // hand-duplicated literal array here in app.ts — the exact "hardcoded lane list drift" bug class
+  // found repeatedly in this session's audits (a 12th executor added to only 2 of the 3 lists would
+  // silently reopen the 2026-07-09 concentration-cap incident computeNotionalPerSymbol's own doc
+  // comment describes). A new executor now only has to be added to these 2 closures — every
+  // consumer below reuses them, so there is nothing else to remember.
+  // Referencing the mutable `let` bindings above is safe: these are only ever CALLED during a tick,
   // well after every executor below has been constructed and assigned.
+  const allCrossSectionalLaneExecutors = (): Array<CrossSectionalExecutor | null> => [
+    crossSectionalExecutor,
+    crossSectionalTrendExecutor,
+    crossSectionalMixedExecutor,
+  ];
   const allSingleSymbolLaneExecutors = (): Array<SingleSymbolLaneExecutor | null> => [
     shortFadeExecutor,
     intradayMomentumExecutor,
@@ -280,7 +308,29 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       if (book.ask !== null && book.ask > 0) return book.ask;
       return null;
     };
+    // 2026-07-12 fix: every executor sharing this ONE netted account (3 CrossSectionalExecutor +
+    // up to 8 SingleSymbolLaneExecutor instances) independently called client.getPositions() every
+    // tick purely to read market-wide markPrice data — up to 11 redundant signed, account-wide
+    // calls within the same staggered 5-minute window. Short-TTL (30s, well under any single
+    // instance's own tick cadence) cache shared by ALL of them via each executor's own
+    // sharedGetPositions option, so at most one signed call goes out per cache window regardless
+    // of how many instances' ticks land inside it.
+    let cachedPositions: { at: number; promise: ReturnType<typeof liveClient.getPositions> } | null = null;
+    const sharedGetPositions = () => {
+      const now = Date.now();
+      if (!cachedPositions || now - cachedPositions.at > 30_000) {
+        cachedPositions = { at: now, promise: liveClient.getPositions() };
+      }
+      return cachedPositions.promise;
+    };
     const unifiedRegimeEntryGate = () => {
+      if (unifiedOrchestrator?.isEnabled() && !unifiedOrchestrator.canOpenNewEntries()) {
+        const status = unifiedOrchestrator.getStatus();
+        return {
+          allowed: false,
+          reason: `unified orchestrator ${status.brainState}: ${status.lastTrace?.reason ?? "direction not confirmed"}`,
+        };
+      }
       if (process.env.LIVE_REGIME_NO_TRADE_OVERRIDE === "1" || process.env.REGIME_ENGINE_EXECUTION_GATE_ENABLED === "0") {
         return { allowed: true, reason: null };
       }
@@ -297,6 +347,30 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       }
       return { allowed: true, reason: null };
     };
+    const unifiedEnabled = isUnifiedTestnetOrchestratorEnabled(
+      process.env,
+      liveConfig.env === "testnet" ? "testnet" : "mainnet",
+    );
+    unifiedOrchestrator = new UnifiedTestnetOrchestrator({
+      enabled: unifiedEnabled,
+      store: new UnifiedTestnetOrchestratorStore("data"),
+      confirmSamples: Number(process.env.UNIFIED_DIRECTION_CONFIRM_SAMPLES) || 2,
+      choppySamples: Number(process.env.UNIFIED_CHOPPY_LOCK_SAMPLES) || 2,
+      estimatedCloseCostPct: liveConfig.estimatedCloseCostPct,
+    });
+    const basePaperStore = isRealtimeShortMirrorEnabled()
+      ? getRealtimeShortMirrorStore()
+      : getPaperExecutionRouterStore();
+    unifiedProposalStore = unifiedEnabled
+      ? new UnifiedTestnetProposalStore({
+          baseStore: basePaperStore,
+          getOrchestratorStatus: () => unifiedOrchestrator?.getStatus() ?? null,
+          getScan: getLatestScanCandidates,
+          getPosture: () => liveEngine?.getStatus().controller?.estimatedRegime?.posture ?? "TACTICAL_OR_MIXED",
+          maxCandidates: Number(process.env.UNIFIED_PROPOSAL_MAX_CANDIDATES) || 3,
+          minConfidence: Number(process.env.UNIFIED_PROPOSAL_MIN_CONFIDENCE) || 60,
+        })
+      : null;
     liveEngine = new LiveExecutionEngine({
       config: liveConfig,
       client: liveClient,
@@ -310,31 +384,59 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       // every leg/position as an orphan and disarms one tick after it opens. Lazy closure: the
       // executors are constructed later in this function (they need the engine for their own
       // isAllowed gate), so resolve at call time.
-      // 2026-07-08: sums across ALL FIVE executor instances (cross-sectional FILTERED + TREND +
-      // MIXED, plus the new SHORT_FADE_EXHAUSTION + INTRADAY_MOMENTUM_BREAKOUT single-symbol
-      // executors) — the same starvation/false-orphan class of bug the original single-instance
-      // fix addressed would otherwise recur for every one of the new instances' own open legs.
+      // 2026-07-08: sums across ALL 11 executor instances (cross-sectional FILTERED/TREND/MIXED +
+      // the 8 single-symbol executors) — the same starvation/false-orphan class of bug the original
+      // single-instance fix addressed would otherwise recur for every one of the new instances' own
+      // open legs. 2026-07-11: reuses the shared allCrossSectionalLaneExecutors()/
+      // allSingleSymbolLaneExecutors() closures above instead of its own duplicated literal array.
       externalManagedNetQty: () =>
-        computeExternalManagedNetQty(
-          [crossSectionalExecutor, crossSectionalTrendExecutor, crossSectionalMixedExecutor],
-          [
-            shortFadeExecutor,
-            intradayMomentumExecutor,
-            regimeCompositeExecutor,
-            compositeEstimatorWideLongExecutor,
-            compositeEstimatorWideShortExecutor,
-            compositeEstimatorFastLongExecutor,
-            compositeEstimatorFastShortExecutor,
-            panicWashoutExecutor,
-          ],
-        ),
+        computeExternalManagedNetQty(allCrossSectionalLaneExecutors(), allSingleSymbolLaneExecutors()),
+      // 2026-07-11 real-money audit fix: same shared closures as externalManagedNetQty above, so the
+      // account-wide kill-switch (killSwitchTrip) can finally see real losses/gains from these lanes
+      // instead of only its own mirror/directional-slot ledger — see live-executor-wiring.ts's
+      // sumExternalRealizedPnlUsd doc comment.
+      getExternalRealizedPnlUsd: () =>
+        sumExternalRealizedPnlUsd(allCrossSectionalLaneExecutors(), allSingleSymbolLaneExecutors()),
+      // 2026-07-12 kill-switch RESPONSE fix: when the account-wide breaker trips, close the OTHER
+      // 11 executors' positions too — via each executor's OWN orderly close (reduce-only,
+      // netting-aware), never a blanket symbol flatten (2026-07-07 netting-blind-closes rule).
+      // New entries across all 11 are already halted by their isAllowed gates once killedAt latches.
+      onKillSwitchEngaged: async (reason: string) => {
+        const killReason = `KILL_SWITCH_PORTFOLIO: ${reason}`;
+        for (const exec of allCrossSectionalLaneExecutors()) {
+          if (!exec) continue;
+          try {
+            await exec.closeAllBasketsOrderly(killReason);
+          } catch (error) {
+            console.error(`[app] kill-switch basket close failed: ${(error as Error).message}`);
+          }
+        }
+        for (const exec of allSingleSymbolLaneExecutors()) {
+          if (!exec) continue;
+          try {
+            await exec.closeAllPositionsOrderly(killReason);
+          } catch (error) {
+            console.error(`[app] kill-switch single-symbol close failed: ${(error as Error).message}`);
+          }
+        }
+      },
       // "Mode 2" (REALTIME_SHORT_MIRROR_ENABLED=1): the engine mirrors ONLY the dedicated
       // real-time short store — fresh, short-only, stable-lane orders — and never the
       // measurement paper book. Flag off → unchanged (reads the normal paper book).
-      paperStore: isRealtimeShortMirrorEnabled()
-        ? getRealtimeShortMirrorStore()
-        : getPaperExecutionRouterStore(),
+      paperStore: unifiedProposalStore ?? basePaperStore,
+      paperLaneGate: (order) => unifiedOrchestrator?.isEnabled()
+        ? unifiedOrchestrator.allowsPaperOrder({ selectedLaneId: order.selectedLaneId, direction: order.direction })
+        : null,
+      paperLaneWeightPct: (order) => unifiedOrchestrator?.isEnabled()
+        ? (unifiedOrchestrator.allowsPaperOrder({ selectedLaneId: order.selectedLaneId, direction: order.direction }) ? 100 : 0)
+        : null,
       isPaperOrderLiveEligible: (order) => {
+        if (unifiedOrchestrator?.isEnabled()) {
+          return unifiedOrchestrator.allowsPaperOrder({
+            selectedLaneId: order.selectedLaneId,
+            direction: order.direction,
+          });
+        }
         const useTestnetPolicy =
           liveConfig.env === "testnet" ||
           (liveConfig.env === "mainnet" && liveConfig.mainnetKeepTestnetPolicy);
@@ -366,10 +468,20 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         const rotationShortlist = buildRegimeRotationShortlistReport(report);
         const laneVariantId = order.selectedLaneId.split(":").pop() ?? order.selectedLaneId;
         const row = report.rows.find((candidate) => candidate.variantId === laneVariantId);
+        // Force-eligible lanes (operator opt-in REALTIME_SHORT_FORCE_FAST_LONG/SHORT=1 +
+        // FORCE_ELIGIBLE_LONG_VARIANT_IDS/FORCE_ELIGIBLE_SHORT_VARIANT_IDS below) are meant to trade
+        // regardless of THIS instance's own thin/decaying STABLE_CANDIDATE label — live's local VM
+        // book accrues observations slowly, so freshValid can dip back under the STABLE threshold
+        // long after a lane was proven. Without this check, the hard gate below returned false
+        // BEFORE the force-eligible bypass further down was ever consulted, silently defeating the
+        // operator's own opt-in the moment freshValid decayed (2026-07-11 incident: CG_WIDE_FAST_LONG
+        // went dark for 32h+ this way despite REALTIME_SHORT_FORCE_FAST_LONG=1 being set).
+        const forceEligibleForDirection = isForceEligibleForDirection(order.direction, laneVariantId);
         if (
           liveConfig.env === "mainnet" &&
           row?.status !== "STABLE_CANDIDATE" &&
-          process.env.LIVE_UNPROVEN_EXECUTION_OVERRIDE !== "1"
+          process.env.LIVE_UNPROVEN_EXECUTION_OVERRIDE !== "1" &&
+          !forceEligibleForDirection
         ) return false;
         const regimeFamily =
           orderEstimatedRegime.direction === "LONG"
@@ -411,18 +523,14 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         }
         return (
           row?.status === "STABLE_CANDIDATE" ||
-          // Operator force-enabled short lanes (e.g. CG_WIDE_FAST_SHORT) trade before STABLE — only
-          // when REALTIME_SHORT_FORCE_FAST_SHORT=1 (off by default ⇒ stable-only gate preserved).
-          (process.env.REALTIME_SHORT_FORCE_FAST_SHORT === "1" &&
-            order.direction === "SHORT" &&
-            FORCE_ELIGIBLE_SHORT_VARIANT_IDS.has(laneVariantId)) ||
-          // LONG counterpart (2026-07-07): lets CG_WIDE_FAST_LONG trade in a long-permissive regime
-          // whose estimate direction is not (yet) LONG — e.g. controller LONG_ONLY while the
-          // estimate still reads MIXED. Bullish-estimate longs take the rotation-shortlist path
-          // above instead; this only covers the fallback branch.
-          (process.env.REALTIME_SHORT_FORCE_FAST_LONG === "1" &&
-            order.direction === "LONG" &&
-            FORCE_ELIGIBLE_LONG_VARIANT_IDS.has(laneVariantId)) ||
+          // Operator force-enabled lanes (e.g. CG_WIDE_FAST_SHORT/CG_WIDE_FAST_LONG) trade before
+          // STABLE — only when the matching REALTIME_SHORT_FORCE_FAST_LONG/SHORT flag is set (off
+          // by default ⇒ stable-only gate preserved). LONG counterpart (2026-07-07): lets
+          // CG_WIDE_FAST_LONG trade in a long-permissive regime whose estimate direction is not
+          // (yet) LONG — e.g. controller LONG_ONLY while the estimate still reads MIXED.
+          // Bullish-estimate longs take the rotation-shortlist path above instead; this only
+          // covers the fallback branch.
+          isForceEligibleForDirection(order.direction, laneVariantId) ||
           isLaneSelectorV2LongWideStopOverride({
             variantId: laneVariantId,
             direction: order.direction,
@@ -469,6 +577,116 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         };
       },
     });
+    const tickUnifiedOrchestrator = () => {
+      if (!unifiedOrchestrator?.isEnabled() || !liveEngine) return;
+      const controller = liveEngine.getStatus().controller;
+      const primaryDirection: UnifiedDirection =
+        controller?.mode === "LONG_ONLY" || controller?.bias === "LONG"
+          ? "LONG"
+          : controller?.mode === "SHORT_ONLY" || controller?.bias === "SHORT"
+            ? "SHORT"
+            : "NEUTRAL";
+      const nowMs = Date.now();
+      const freshWindowMs = Math.max(15 * 60_000, Number(process.env.UNIFIED_FEATURE_SIGNAL_MAX_AGE_MS) || 2 * 60 * 60_000);
+      const rcSignals = regimeCompositeOpenSignals(getRegimeCompositeStore())
+        .filter((signal) => nowMs - signal.openedAtMs <= freshWindowMs);
+      const ceLongSignals = ["WIDE_LONG", "FAST_LONG"]
+        .flatMap((bucket) => compositeEstimatorOpenSignals(getCompositeEstimatorStore(), bucket as CEBucket))
+        .filter((signal) => nowMs - signal.openedAtMs <= freshWindowMs);
+      const ceShortSignals = ["WIDE_SHORT", "FAST_SHORT"]
+        .flatMap((bucket) => compositeEstimatorOpenSignals(getCompositeEstimatorStore(), bucket as CEBucket))
+        .filter((signal) => nowMs - signal.openedAtMs <= freshWindowMs);
+      const votes: UnifiedFeatureVote[] = [];
+      if (rcSignals.length > 0) {
+        votes.push({
+          source: "REGIME_COMPOSITE_CONFIRMATION",
+          direction: "LONG",
+          confidence: Math.min(1, rcSignals.length / 3),
+          reason: `${rcSignals.length} fresh axis+crowding confirmation signal(s)`,
+        });
+      }
+      if (ceLongSignals.length > 0 || ceShortSignals.length > 0) {
+        const total = ceLongSignals.length + ceShortSignals.length;
+        const direction: UnifiedDirection = ceLongSignals.length === ceShortSignals.length
+          ? "NEUTRAL"
+          : ceLongSignals.length > ceShortSignals.length
+            ? "LONG"
+            : "SHORT";
+        votes.push({
+          source: "COMPOSITE_ESTIMATOR_BIDI",
+          direction,
+          confidence: total > 0 ? Math.abs(ceLongSignals.length - ceShortSignals.length) / total : 0,
+          reason: `${ceLongSignals.length} long vs ${ceShortSignals.length} short fresh bucket signal(s)`,
+        });
+      }
+      const xsecReport = buildCrossSectionalReport(getCrossSectionalStore(), nowMs, { variant: "FILTERED" });
+      const xsecHealth = rollingNetEntryHealth(xsecReport.recentNetReturns);
+      const capturedAt = controller?.capturedAt ?? new Date(nowMs).toISOString();
+      const sampleId = controller?.capturedAt ?? `fallback:${Math.floor(nowMs / (15 * 60_000))}:${primaryDirection}`;
+      unifiedOrchestrator.update({
+        sampleId,
+        capturedAt,
+        primaryDirection,
+        primaryConfidence:
+          controller?.confidence === "LOW" || controller?.confidence === "MEDIUM" || controller?.confidence === "HIGH"
+            ? controller.confidence
+            : null,
+        primaryReason: controller?.reasons?.join(", ") || controller?.regime || "controller unavailable",
+        votes,
+        neutralProposalAllowed: xsecHealth.allowed,
+        neutralProposalReason: xsecHealth.reason,
+      });
+    };
+    tickUnifiedOrchestrator();
+    if (!isTest && unifiedEnabled) setInterval(tickUnifiedOrchestrator, 30_000);
+
+    const legacyEntryAllowed = (
+      laneId: string,
+      direction: "LONG" | "SHORT",
+      fallback: () => boolean,
+    ): boolean => unifiedOrchestrator?.isEnabled()
+      ? unifiedOrchestrator.allowsLegacySingleSymbolEntry(laneId, direction)
+      : fallback();
+
+    // 2026-07-12 (profitability Stage 3): the learned regime×direction edge-memory veto — measured
+    // to work where blanket regime-gating cost the book ~201R — was wired into the mode-2 mirror
+    // admission and the live engine's controller snapshot, but NOT the single-symbol executors that
+    // actually hold the live-allocated weight (RC/CE/CG). Compose it into their isAllowed as an
+    // additive protection: a direction proven net-negative in the current regime family (n≥30,
+    // avgNetR≤0) is vetoed UNLESS a specific proven-positive lane rescues it (hasPositiveLane,
+    // same semantics as regime-direction-controller.ts). NEVER applied to the market-neutral basket
+    // executors (a per-direction veto would break their long/short hedge invariant). Fails OPEN on
+    // a missing/blank regime — it protects, it does not become a new blanket gate. Uses the SAME
+    // regime string the live engine's own controller snapshot reads, so the two never disagree.
+    const currentRegimeStringForVeto = (): string | null => {
+      const cached = getLatestScanCandidates();
+      const scanStatus = coreScanAutoRefreshController.getStatus();
+      const fallbackSnapshot =
+        cached || scanStatus.lastAutoRefreshResultSummary
+          ? null
+          : getRegimeDirectionControllerSnapshotStore().readLatest();
+      return (
+        cached?.marketRegime ??
+        scanStatus.lastAutoRefreshResultSummary?.marketRegime ??
+        fallbackSnapshot?.currentRegime ??
+        null
+      );
+    };
+    const edgeVeto = (direction: "LONG" | "SHORT"): { allowed: boolean; reason: string | null } => {
+      const regime = currentRegimeStringForVeto();
+      if (!regime || regime.trim().length === 0) return { allowed: true, reason: null }; // fail-open
+      const mem = getRegimeEdgeMemory();
+      const v = mem.verdict(regime, direction);
+      if (v.allowed) return { allowed: true, reason: null }; // ALLOW_PROVEN / ALLOW_INSUFFICIENT
+      if (mem.hasPositiveLane(regime, direction)) return { allowed: true, reason: null }; // lane rescue
+      return {
+        allowed: false,
+        reason: `edge-memory veto: ${direction} proven non-positive in "${regime}" (${v.reasonCode ?? "VETO_NEGATIVE"})`,
+      };
+    };
+    const unifiedPortfolioExitPolicy: SingleSymbolExitPolicy | undefined = unifiedOrchestrator?.isEnabled()
+      ? (ctx) => unifiedOrchestrator!.legacyExitDecision(ctx)
+      : undefined;
     if (!isTest) liveEngine.start();
 
     // Cross-sectional market-neutral EXECUTOR (testnet-first). Env-gated; on mainnet
@@ -480,14 +698,29 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         client: liveClient,
         signalStore: getCrossSectionalStore(),
         store: new CrossSectionalExecutorStore(),
-        isAllowed: () =>
-          (engineForGate?.canOpenNewEntries() ?? false) &&
-          (engineForGate?.laneSelectionAllowsLane(CROSS_SECTIONAL_MARKET_NEUTRAL_LANE_ID) ?? false),
+        isAllowed: () => unifiedOrchestrator?.isEnabled()
+          ? (engineForGate?.canOpenNewEntries() ?? false) &&
+            unifiedOrchestrator.allowsCrossSectionalLane(CROSS_SECTIONAL_MARKET_NEUTRAL_LANE_ID)
+          : (engineForGate?.canOpenNewEntries() ?? false) &&
+            (engineForGate?.laneSelectionAllowsLane(CROSS_SECTIONAL_MARKET_NEUTRAL_LANE_ID) ?? false),
         laneWeightPct: () => engineForGate?.laneSelectionWeightPctForLane(CROSS_SECTIONAL_MARKET_NEUTRAL_LANE_ID) ?? 0,
         entryHealthGate: () => {
           const report = buildCrossSectionalReport(getCrossSectionalStore(), Date.now(), { variant: "FILTERED" });
           return rollingNetEntryHealth(report.recentNetReturns);
         },
+        // 2026-07-11 real-money audit fix: FILTERED/TREND/MIXED share ONE netted exchange account —
+        // closures over these `let`s so each sees the OTHER TWO's CURRENT legs at tick time, not
+        // their (still-null) construction-time value. See CrossSectionalExecutorOptions.siblingOpenLegs.
+        siblingOpenLegs: () => [
+          ...(crossSectionalTrendExecutor?.getOpenUnexitedLegs() ?? []),
+          ...(crossSectionalMixedExecutor?.getOpenUnexitedLegs() ?? []),
+        ],
+        // 2026-07-12 real-money audit fix: XSEC_DAILY_MAX_LOSS_USD is ONE shared ceiling across all
+        // 3 sibling instances — see CrossSectionalExecutorOptions.siblingDailyRealizedUsd.
+        siblingDailyRealizedUsd: (nowIso) =>
+          (crossSectionalTrendExecutor?.getDailyRealizedUsd(nowIso) ?? 0) +
+          (crossSectionalMixedExecutor?.getDailyRealizedUsd(nowIso) ?? 0),
+        sharedGetPositions,
       });
       if (!isTest) {
         const execTick = () => void crossSectionalExecutor?.tick();
@@ -517,8 +750,18 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         // silently trade at FULL SIZE the instant the engine is armed and no allocation happens
         // to be active yet (e.g. right after a restart, before RegimeAutopilot's first apply, or
         // during an auto-reset-on-loss window).
-        isAllowed: () => isNewExecutorLaneAllowed(CROSS_SECTIONAL_TREND_LANE_ID, liveConfig.env === "testnet" ? "testnet" : "mainnet", engineForGate, { mainnetEntryEligible: false }),
+        isAllowed: () => unifiedOrchestrator?.isEnabled()
+          ? unifiedOrchestrator.allowsCrossSectionalLane(CROSS_SECTIONAL_TREND_LANE_ID)
+          : isNewExecutorLaneAllowed(CROSS_SECTIONAL_TREND_LANE_ID, liveConfig.env === "testnet" ? "testnet" : "mainnet", engineForGate, { mainnetEntryEligible: false }),
         laneWeightPct: () => engineForGate?.laneSelectionWeightPctForLane(CROSS_SECTIONAL_TREND_LANE_ID) ?? 100,
+        siblingOpenLegs: () => [
+          ...(crossSectionalExecutor?.getOpenUnexitedLegs() ?? []),
+          ...(crossSectionalMixedExecutor?.getOpenUnexitedLegs() ?? []),
+        ],
+        siblingDailyRealizedUsd: (nowIso) =>
+          (crossSectionalExecutor?.getDailyRealizedUsd(nowIso) ?? 0) +
+          (crossSectionalMixedExecutor?.getDailyRealizedUsd(nowIso) ?? 0),
+        sharedGetPositions,
       });
       crossSectionalMixedExecutor = new CrossSectionalExecutor({
         client: liveClient,
@@ -527,8 +770,18 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         targetVariant: "MIXED_MEAN_REVERSION",
         laneId: CROSS_SECTIONAL_MIXED_LANE_ID,
         // Same 2026-07-08 fix as CROSS_SECTIONAL_TREND above.
-        isAllowed: () => isNewExecutorLaneAllowed(CROSS_SECTIONAL_MIXED_LANE_ID, liveConfig.env === "testnet" ? "testnet" : "mainnet", engineForGate, { mainnetEntryEligible: false }),
+        isAllowed: () => unifiedOrchestrator?.isEnabled()
+          ? unifiedOrchestrator.allowsCrossSectionalLane(CROSS_SECTIONAL_MIXED_LANE_ID)
+          : isNewExecutorLaneAllowed(CROSS_SECTIONAL_MIXED_LANE_ID, liveConfig.env === "testnet" ? "testnet" : "mainnet", engineForGate, { mainnetEntryEligible: false }),
         laneWeightPct: () => engineForGate?.laneSelectionWeightPctForLane(CROSS_SECTIONAL_MIXED_LANE_ID) ?? 100,
+        siblingOpenLegs: () => [
+          ...(crossSectionalExecutor?.getOpenUnexitedLegs() ?? []),
+          ...(crossSectionalTrendExecutor?.getOpenUnexitedLegs() ?? []),
+        ],
+        siblingDailyRealizedUsd: (nowIso) =>
+          (crossSectionalExecutor?.getDailyRealizedUsd(nowIso) ?? 0) +
+          (crossSectionalTrendExecutor?.getDailyRealizedUsd(nowIso) ?? 0),
+        sharedGetPositions,
       });
       if (!isTest) {
         // Staggered start/interval offsets vs. the FILTERED tick above — purely to avoid dispatching
@@ -556,13 +809,20 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         direction: "SHORT",
         getOpenSignals: () => shortFadeOpenSignals(getShortFadeStore()),
         exitPolicy: shortFadeExitPolicy(),
+        portfolioExitPolicy: unifiedPortfolioExitPolicy,
         // 2026-07-08 audit fix: see the cross-sectional TREND/MIXED comment above — require
         // EXPLICIT allocation inclusion so this never-before-executed lane can't silently fire at
         // full size before it has ever actually been named in an allocation.
-        isAllowed: () => isNewExecutorLaneAllowed(SF_PAPER_LANE_ID, liveConfig.env === "testnet" ? "testnet" : "mainnet", engineForGate, { mainnetEntryEligible: false }),
+        isAllowed: () => legacyEntryAllowed(
+          SF_PAPER_LANE_ID,
+          "SHORT",
+          () => isNewExecutorLaneAllowed(SF_PAPER_LANE_ID, liveConfig.env === "testnet" ? "testnet" : "mainnet", engineForGate, { mainnetEntryEligible: false }) && edgeVeto("SHORT").allowed,
+        ),
+        isAllowedReason: () => edgeVeto("SHORT").reason,
         laneWeightPct: () => engineForGate?.laneSelectionWeightPctForLane(SF_PAPER_LANE_ID) ?? 100,
         legUsd: SF_EXEC_LEG_USD,
         leverage: SF_EXEC_LEVERAGE,
+        maxOpenPositions: SF_EXEC_MAX_CONCURRENT,
         maxSignalAgeMs: SF_EXEC_MAX_SIGNAL_AGE_MS,
         dailyMaxLossUsd: SF_EXEC_DAILY_MAX_LOSS_USD,
         // 2026-07-09 fix: cross-lane per-symbol notional cap — see live-executor-wiring.ts's
@@ -570,6 +830,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         existingNotionalForSymbol: (symbol) => notionalForSymbolExcluding(shortFadeExecutor, symbol),
         maxNotionalPerSymbolAcrossLanes,
         currentPrice: currentPublicPrice,
+        sharedGetPositions,
       });
       if (!isTest) {
         const sfTick = () => void shortFadeExecutor?.tick();
@@ -589,16 +850,24 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         direction: "LONG",
         getOpenSignals: () => intradayMomentumOpenSignals(getIntradayMomentumStore()),
         exitPolicy: intradayMomentumExitPolicy(),
+        portfolioExitPolicy: unifiedPortfolioExitPolicy,
         // 2026-07-08 audit fix: same as SHORT_FADE_EXHAUSTION above.
-        isAllowed: () => isNewExecutorLaneAllowed(IM_PAPER_LANE_ID, liveConfig.env === "testnet" ? "testnet" : "mainnet", engineForGate, { mainnetEntryEligible: false }),
+        isAllowed: () => legacyEntryAllowed(
+          IM_PAPER_LANE_ID,
+          "LONG",
+          () => isNewExecutorLaneAllowed(IM_PAPER_LANE_ID, liveConfig.env === "testnet" ? "testnet" : "mainnet", engineForGate, { mainnetEntryEligible: false }) && edgeVeto("LONG").allowed,
+        ),
+        isAllowedReason: () => edgeVeto("LONG").reason,
         laneWeightPct: () => engineForGate?.laneSelectionWeightPctForLane(IM_PAPER_LANE_ID) ?? 100,
         legUsd: IM_EXEC_LEG_USD,
         leverage: IM_EXEC_LEVERAGE,
+        maxOpenPositions: IM_EXEC_MAX_CONCURRENT,
         maxSignalAgeMs: IM_EXEC_MAX_SIGNAL_AGE_MS,
         dailyMaxLossUsd: IM_EXEC_DAILY_MAX_LOSS_USD,
         existingNotionalForSymbol: (symbol) => notionalForSymbolExcluding(intradayMomentumExecutor, symbol),
         maxNotionalPerSymbolAcrossLanes,
         currentPrice: currentPublicPrice,
+        sharedGetPositions,
       });
       if (!isTest) {
         const imTick = () => void intradayMomentumExecutor?.tick();
@@ -622,10 +891,23 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         direction: "LONG",
         getOpenSignals: () => regimeCompositeOpenSignals(getRegimeCompositeStore()),
         exitPolicy: regimeCompositeExitPolicy(),
+        portfolioExitPolicy: unifiedPortfolioExitPolicy,
         // 2026-07-08 audit fix pattern (same as its siblings above): require EXPLICIT allocation
         // inclusion so this never-before-executed lane can't silently fire at full size before
         // the operator has ever actually named its lane id in an allocation.
-        isAllowed: () => isNewExecutorLaneAllowed(RC_PAPER_LANE_ID, liveConfig.env === "testnet" ? "testnet" : "mainnet", engineForGate, { mainnetEntryEligible: false }),
+        // 2026-07-10: operator explicitly granted mainnet eligibility to THIS lane specifically
+        // (real track record: 2 open live positions plus a real MFE_GIVEBACK profit close) after
+        // formalizing it into the live allocation table at a small (3%) weight — see
+        // regime-classifier-neutral-recovery-stuck-fix-2026-07-10 / the live-profitability-pathway
+        // audit that surfaced this lane was silently running outside the allocation table. Its
+        // siblings (PANIC_WASHOUT_RECLAIM_LONG, SHORT_FADE_EXHAUSTION_CROWDED) stay ineligible —
+        // this is a per-lane decision, not a blanket override.
+        isAllowed: () => legacyEntryAllowed(
+          RC_PAPER_LANE_ID,
+          "LONG",
+          () => isNewExecutorLaneAllowed(RC_PAPER_LANE_ID, liveConfig.env === "testnet" ? "testnet" : "mainnet", engineForGate, { mainnetEntryEligible: true }) && edgeVeto("LONG").allowed,
+        ),
+        isAllowedReason: () => edgeVeto("LONG").reason,
         laneWeightPct: () => engineForGate?.laneSelectionWeightPctForLane(RC_PAPER_LANE_ID) ?? 100,
         legUsd: RC_EXEC_LEG_USD,
         leverage: RC_EXEC_LEVERAGE,
@@ -635,6 +917,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         existingNotionalForSymbol: (symbol) => notionalForSymbolExcluding(regimeCompositeExecutor, symbol),
         maxNotionalPerSymbolAcrossLanes,
         currentPrice: currentPublicPrice,
+        sharedGetPositions,
       });
       if (!isTest) {
         const rcTick = () => void regimeCompositeExecutor?.tick();
@@ -657,10 +940,16 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         direction: "LONG",
         getOpenSignals: () => panicWashoutOpenSignals(getPanicWashoutStore()),
         exitPolicy: panicWashoutExitPolicy(),
+        portfolioExitPolicy: unifiedPortfolioExitPolicy,
         // 2026-07-08 audit fix pattern (same as its siblings above): require EXPLICIT allocation
         // inclusion so this never-before-executed lane can't silently fire at full size before
         // the operator has ever actually named its lane id in an allocation.
-        isAllowed: () => isNewExecutorLaneAllowed(PWR_PAPER_LANE_ID, liveConfig.env === "testnet" ? "testnet" : "mainnet", engineForGate, { mainnetEntryEligible: false }),
+        isAllowed: () => legacyEntryAllowed(
+          PWR_PAPER_LANE_ID,
+          "LONG",
+          () => isNewExecutorLaneAllowed(PWR_PAPER_LANE_ID, liveConfig.env === "testnet" ? "testnet" : "mainnet", engineForGate, { mainnetEntryEligible: false }) && edgeVeto("LONG").allowed,
+        ),
+        isAllowedReason: () => edgeVeto("LONG").reason,
         laneWeightPct: () => engineForGate?.laneSelectionWeightPctForLane(PWR_PAPER_LANE_ID) ?? 100,
         legUsd: PWR_EXEC_LEG_USD,
         leverage: PWR_EXEC_LEVERAGE,
@@ -670,6 +959,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         existingNotionalForSymbol: (symbol) => notionalForSymbolExcluding(panicWashoutExecutor, symbol),
         maxNotionalPerSymbolAcrossLanes,
         currentPrice: currentPublicPrice,
+        sharedGetPositions,
       });
       if (!isTest) {
         const pwrTick = () => void panicWashoutExecutor?.tick();
@@ -700,10 +990,21 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           direction,
           getOpenSignals: () => compositeEstimatorOpenSignals(getCompositeEstimatorStore(), bucket),
           exitPolicy: compositeEstimatorExitPolicy(bucket),
+          portfolioExitPolicy: unifiedPortfolioExitPolicy,
           // 2026-07-08 audit fix pattern (same as every sibling above): require EXPLICIT allocation
           // inclusion so a never-before-executed lane can't silently fire at full size before the
           // operator has ever actually named its lane id in an allocation.
-          isAllowed: () => isNewExecutorLaneAllowed(laneId, liveConfig.env === "testnet" ? "testnet" : "mainnet", engineForGate, { mainnetEntryEligible: false }),
+          // 2026-07-10: operator granted mainnet eligibility to WIDE_LONG specifically (real track
+          // record: an open live position plus a real profit close today) after formalizing it into
+          // the live allocation table at a small (3%) weight. The other 3 buckets (WIDE_SHORT,
+          // FAST_LONG, FAST_SHORT — the unproven quadrants per this module's own header comment)
+          // stay ineligible — a per-bucket decision, not a blanket override.
+          isAllowed: () => legacyEntryAllowed(
+            laneId,
+            direction,
+            () => isNewExecutorLaneAllowed(laneId, liveConfig.env === "testnet" ? "testnet" : "mainnet", engineForGate, { mainnetEntryEligible: bucket === "WIDE_LONG" }) && edgeVeto(direction).allowed,
+          ),
+          isAllowedReason: () => edgeVeto(direction).reason,
           laneWeightPct: () => engineForGate?.laneSelectionWeightPctForLane(laneId) ?? 100,
           legUsd: () => ceExecLegUsdForBucket(bucket),
           leverage: CE_EXEC_LEVERAGE,
@@ -716,6 +1017,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           existingNotionalForSymbol: (symbol) => notionalForSymbolExcluding(selfGetter(), symbol),
           maxNotionalPerSymbolAcrossLanes,
           currentPrice: currentPublicPrice,
+          sharedGetPositions,
         });
       };
       compositeEstimatorWideLongExecutor = buildCompositeEstimatorExecutor("WIDE_LONG", "LONG", "composite-estimator-wide-long-executor.json", () => compositeEstimatorWideLongExecutor);
@@ -777,6 +1079,8 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     compositeEstimatorFastShortExecutor: () => compositeEstimatorFastShortExecutor,
     panicWashoutExecutor: () => panicWashoutExecutor,
     regimeAutopilot: () => regimeAutopilot,
+    unifiedOrchestrator: () => unifiedOrchestrator,
+    unifiedProposalStore: () => unifiedProposalStore,
   });
 
   return app;

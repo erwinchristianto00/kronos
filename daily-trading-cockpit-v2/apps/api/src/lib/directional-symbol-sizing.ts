@@ -25,6 +25,15 @@
  * (riskUsdPerTrade / stopDistancePct), which already equalizes DOLLAR RISK per trade regardless
  * of a symbol's stop width. What that formula can't see is how a symbol's volatility compares to
  * its WHITELIST PEERS right now — a relative, cross-sectional signal computed here instead.
+ *
+ * 3. Decision-score quality tilt (2026-07-10, Tier-1 audit item, opt-in): a THIRD multiplicative
+ *    factor derived from decision-scoring.ts's 0-100 composite score, stacked on top of the two
+ *    above. Gated behind DECISION_SCORE_SIZE_MULT_ENABLED (default OFF) — see
+ *    isDecisionScoreSizeMultEnabled below. That composite score is still a REPORT-ONLY measurement
+ *    lane elsewhere in this codebase (never proven to correlate with realized edge yet), so this
+ *    factor fails OPEN to neutral (1.0) whenever the flag is off OR the score is unavailable for a
+ *    given candidate — with the flag off, directionalSymbolSizeMultiplier's output is byte-for-byte
+ *    identical to its pre-2026-07-10 behavior.
  */
 
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
@@ -143,6 +152,36 @@ export function evaluateDirectionalTechnicalConfirmation(
 export interface SymbolTechnicalCacheEntry {
   LONG: DirectionalTechnicalSignal;
   SHORT: DirectionalTechnicalSignal;
+  /** 2026-07-11: per-symbol timestamp of the last SUCCESSFUL fetch for this symbol specifically —
+   *  the cache's single top-level computedAt gets re-stamped every refresh cycle regardless of
+   *  whether any individual symbol's fetch actually succeeded (a persistently-failing symbol keeps
+   *  its old LONG/SHORT verdict forever while looking fresh under the shared timestamp). Callers
+   *  must check THIS field, not the top-level computedAt, before trusting `confirmed` — see
+   *  isDirectionalTechnicalSignalFresh below. */
+  computedAt: string;
+}
+
+/** 2026-07-11: a persistently-failing refresh (network/API issue lasting hours) must not let a
+ *  stale confirmed/unconfirmed verdict from days ago keep silently gating real-money entries
+ *  forever — the whole documented point of this gate is "fails CLOSED on no fresh data." 3x the
+ *  20-min refresh cadence (SYMBOL_VOLATILITY_REFRESH_INTERVAL_MS in live-execution-engine.ts)
+ *  tolerates a couple of missed/failed cycles (transient blips) without going stale, while still
+ *  catching a genuinely broken refresh loop within about an hour. Env-tunable. */
+export const TECHNICAL_SIGNAL_MAX_STALE_MS =
+  Number(process.env.DIRECTIONAL_TECHNICAL_SIGNAL_MAX_STALE_MS) || 60 * 60_000;
+
+/** Fails CLOSED (returns false) on a missing signal OR one whose OWN per-symbol computedAt has
+ *  aged past TECHNICAL_SIGNAL_MAX_STALE_MS — a persistently-failing refresh must not let an old
+ *  confirmed=true verdict keep passing the gate indefinitely under a fresh-looking cache-wide
+ *  timestamp. */
+export function isDirectionalTechnicalSignalFresh(
+  entry: SymbolTechnicalCacheEntry | undefined,
+  nowMs: number,
+): boolean {
+  if (!entry) return false;
+  const computedAtMs = new Date(entry.computedAt).getTime();
+  if (!Number.isFinite(computedAtMs)) return false;
+  return nowMs - computedAtMs <= TECHNICAL_SIGNAL_MAX_STALE_MS;
 }
 
 export interface SymbolVolatilityCacheState {
@@ -259,7 +298,7 @@ export async function refreshSymbolVolatilityCache(
       const atrPct = computeAtrPctFromCandles(candles);
       const long = evaluateDirectionalTechnicalConfirmation(candles, "LONG");
       const short = evaluateDirectionalTechnicalConfirmation(candles, "SHORT");
-      nextTechnical[symbol] = { LONG: long, SHORT: short };
+      nextTechnical[symbol] = { LONG: long, SHORT: short, computedAt: nowIso() };
       if (atrPct !== null) {
         next[symbol] = atrPct;
         refreshed += 1;
@@ -284,8 +323,30 @@ const VOL_MULT_MAX = 1.4;
 const TOTAL_MULT_MIN = 0.5;
 const TOTAL_MULT_MAX = 1.75;
 
+// Decision-score quality tilt (opt-in — see isDecisionScoreSizeMultEnabled + the class-level doc
+// comment's item 3). Linear, centered on decision-scoring.ts's own "neutral-ish" watchThreshold
+// default of 50: a score of 50 resolves to exactly 1.0 (no tilt either way), 0 floors at 0.5x, 100
+// ceilings at 1.5x. Chosen over e.g. a step function or a curve centered elsewhere because (a) it's
+// the simplest monotonic mapping that a still-unproven report-only score deserves, (b) centering at
+// 50 lines up with computeDecisionScore's own WATCH/NO_TRADE boundary rather than an arbitrary
+// number, and (c) its +/-0.5 excursion roughly matches PERF_MULT/VOL_MULT's own scale above, so one
+// quality factor can't dominate the other two once all three are stacked.
+const QUALITY_MULT_MIN = 0.5;
+const QUALITY_MULT_MAX = 1.5;
+const QUALITY_MULT_BASE = 0.5; // score=0   -> 0.5x
+const QUALITY_MULT_SCORE_DIVISOR = 100; // score=100 -> 1.5x, score=50 -> 1.0x (neutral)
+
 function clamp(x: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, x));
+}
+
+/** 2026-07-10, Tier-1 audit item ("sizing quality input"): gates the decision-score quality tilt
+ *  in directionalSymbolSizeMultiplier. Off by default — the composite score it reads
+ *  (decision-scoring.ts's computeDecisionScore) is still a REPORT-ONLY measurement lane elsewhere
+ *  in this codebase, not yet proven to correlate with realized edge. Each deployment opts in
+ *  explicitly via env, matching isDirectionalTechnicalGateEnabled's convention above. */
+export function isDecisionScoreSizeMultEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.DECISION_SCORE_SIZE_MULT_ENABLED === "1";
 }
 
 function median(xs: number[]): number | null {
@@ -304,6 +365,13 @@ export interface DirectionalSizeMultiplierInputs {
   atrPct: number | null;
   /** ATR% of the OTHER whitelisted symbols right now, for relative comparison. */
   peerAtrPcts: number[];
+  /** Optional 0-100 composite decision-quality score (decision-scoring.ts's computeDecisionScore
+   *  totalScore) for this candidate, if one was cheaply available at the call site. This is a
+   *  REPORT-ONLY measurement lane's output elsewhere in the codebase — NOT yet proven to correlate
+   *  with realized edge. Only ever consulted when isDecisionScoreSizeMultEnabled() is true; even
+   *  then, null/undefined/non-finite resolves to a neutral 1.0 (fail OPEN), same philosophy as
+   *  netAvgR/atrPct above. Optional so every existing caller compiles unchanged. */
+  decisionScore?: number | null;
 }
 
 /**
@@ -311,8 +379,17 @@ export interface DirectionalSizeMultiplierInputs {
  * are currently more volatile than their whitelist peers, scoped to the curated whitelist only.
  * Bounded on every factor AND the combined result so no data combination can runaway-size a
  * single-symbol bet — computeLiveOrderPlan's own maxNotionalPerTrade cap still applies on top.
+ *
+ * Optional third factor (2026-07-10): a decision-score quality tilt, stacked multiplicatively with
+ * the perf/vol factors above. Strictly additive and opt-in — see isDecisionScoreSizeMultEnabled and
+ * DirectionalSizeMultiplierInputs.decisionScore's doc comments. With DECISION_SCORE_SIZE_MULT_ENABLED
+ * unset (today's default everywhere), this function's output is IDENTICAL to its pre-2026-07-10
+ * behavior for every input combination.
  */
-export function directionalSymbolSizeMultiplier(inputs: DirectionalSizeMultiplierInputs): number {
+export function directionalSymbolSizeMultiplier(
+  inputs: DirectionalSizeMultiplierInputs,
+  env: NodeJS.ProcessEnv = process.env,
+): number {
   if (!inputs.isWhitelisted) return 1;
 
   const perfMult = clamp(1 + (inputs.netAvgR ?? 0) * PERFORMANCE_SCALE, PERF_MULT_MIN, PERF_MULT_MAX);
@@ -323,5 +400,10 @@ export function directionalSymbolSizeMultiplier(inputs: DirectionalSizeMultiplie
       ? clamp(peerMedian / inputs.atrPct, VOL_MULT_MIN, VOL_MULT_MAX)
       : 1;
 
-  return clamp(perfMult * volMult, TOTAL_MULT_MIN, TOTAL_MULT_MAX);
+  const qualityScoreMult =
+    isDecisionScoreSizeMultEnabled(env) && typeof inputs.decisionScore === "number" && Number.isFinite(inputs.decisionScore)
+      ? clamp(QUALITY_MULT_BASE + inputs.decisionScore / QUALITY_MULT_SCORE_DIVISOR, QUALITY_MULT_MIN, QUALITY_MULT_MAX)
+      : 1;
+
+  return clamp(perfMult * volMult * qualityScoreMult, TOTAL_MULT_MIN, TOTAL_MULT_MAX);
 }

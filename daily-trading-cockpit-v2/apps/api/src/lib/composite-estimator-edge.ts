@@ -89,6 +89,7 @@ export const CE_MAX_CONCURRENT_PER_BUCKET = envNum("COMPOSITE_ESTIMATOR_MAX_CONC
 
 export type CEBucket = "WIDE_LONG" | "WIDE_SHORT" | "FAST_LONG" | "FAST_SHORT";
 export const CE_PAPER_LANE_ID = "COMPOSITE_ESTIMATOR_BIDI" as const;
+export const CE_MAX_STORED_OBSERVATIONS = envNum("COMPOSITE_ESTIMATOR_MAX_STORED_OBSERVATIONS", 500);
 export function ceLaneIdForBucket(bucket: CEBucket): string {
   return `${CE_PAPER_LANE_ID}_${bucket}`;
 }
@@ -371,7 +372,20 @@ export class CompositeEstimatorStore {
     const o = this.state.observations.find((x) => x.observationId === observationId);
     if (o) Object.assign(o, patch);
   }
+  /** Bounded retention: every OPEN observation is kept, plus at most CE_MAX_STORED_OBSERVATIONS
+   *  settled ones — oldest settled observations are dropped first once that cap is exceeded.
+   *  2026-07-11 OOM audit fix. */
+  private prune(): void {
+    const open = this.state.observations.filter((o) => o.status === "OPEN");
+    const settled = this.state.observations
+      .filter((o) => o.status !== "OPEN")
+      .sort((a, b) => a.openedAtMs - b.openedAtMs);
+    const keepSettled =
+      settled.length > CE_MAX_STORED_OBSERVATIONS ? settled.slice(settled.length - CE_MAX_STORED_OBSERVATIONS) : settled;
+    this.state.observations = [...open, ...keepSettled];
+  }
   save(): void {
+    this.prune();
     mkdirSync(dirname(this.file), { recursive: true });
     const tmp = `${this.file}.tmp`;
     writeFileSync(tmp, JSON.stringify(this.state), "utf-8");

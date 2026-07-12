@@ -95,22 +95,40 @@ export const REGIME_AUTOPILOT_PRESETS: Record<string, LaneAllocationEntry[]> = {
   // ballast.
   // 2026-07-09: PANIC_WASHOUT_RECLAIM_LONG added here too (same 10%-from-ballast trim) — an early
   // recovery is exactly where a capitulation-then-reclaim bounce is most plausible.
+  // 2026-07-11 (audit finding — REGIME_AUTOPILOT_PRESETS never mentioned the 2026-07-10 "formalize
+  // RC/CE" lanes; safe today only because laneAllocationOperatorLock is held, but a real landmine
+  // the moment that lock is lifted): REGIME_COMPOSITE_CONFIRMATION_LONG and
+  // COMPOSITE_ESTIMATOR_BIDI_WIDE_LONG added at the same modest 5%-from-ballast slot convention as
+  // every other newly-proven single-symbol lane above — both are LONG-only and internally self-gate
+  // on the breadth axis score (>=0.35), the same "early bullish confirmation" fit as
+  // INTRADAY_MOMENTUM_BREAKOUT_LONG. Funded by trimming CROSS_SECTIONAL_MARKET_NEUTRAL's ballast
+  // (20->10), not by displacing any already-larger directional slot.
   NEUTRAL_RECOVERY: [
     { laneId: "CG_WIDE_FAST_LONG", weightPct: 35 },
     { laneId: "INTRADAY_MOMENTUM_BREAKOUT_LONG", weightPct: 15 },
     { laneId: "PANIC_WASHOUT_RECLAIM_LONG", weightPct: 10 },
+    { laneId: "REGIME_COMPOSITE_CONFIRMATION_LONG", weightPct: 5 },
+    { laneId: "COMPOSITE_ESTIMATOR_BIDI_WIDE_LONG", weightPct: 5 },
     { laneId: "CROSS_SECTIONAL_MIXED", weightPct: 20 },
-    { laneId: "CROSS_SECTIONAL_MARKET_NEUTRAL", weightPct: 20 },
+    { laneId: "CROSS_SECTIONAL_MARKET_NEUTRAL", weightPct: 10 },
   ],
   // Confirmed strong trend: fast-bank + full-commit runner (no protection until the 3R target/stop)
   // + protected runner (same 3R target, banks a faded winner past 0.75R) + systematic cross-sectional
   // trend-following. No market-neutral dilution here — this regime is specifically where
   // concentrating on the confirmed direction earns its keep.
+  // 2026-07-11 (same audit finding as NEUTRAL_RECOVERY above): REGIME_COMPOSITE_CONFIRMATION_LONG and
+  // COMPOSITE_ESTIMATOR_BIDI_WIDE_LONG added here too — a confirmed strong uptrend is exactly where
+  // their internal bullish-axis-score self-gate is most likely to be satisfied. No ballast lane exists
+  // here to trim, so funded by a modest 5-point trim each off the two largest existing slots
+  // (CG_WIDE_FAST_LONG 30->25, CG_WIDE_LONG_RUNNER 25->20) rather than the smaller CG_MFE_GIVEBACK/
+  // CROSS_SECTIONAL_TREND slots.
   TREND_RECOVERY: [
-    { laneId: "CG_WIDE_FAST_LONG", weightPct: 30 },
-    { laneId: "CG_WIDE_LONG_RUNNER", weightPct: 25 },
+    { laneId: "CG_WIDE_FAST_LONG", weightPct: 25 },
+    { laneId: "CG_WIDE_LONG_RUNNER", weightPct: 20 },
     { laneId: "CG_MFE_GIVEBACK", weightPct: 20 },
     { laneId: "CROSS_SECTIONAL_TREND", weightPct: 25 },
+    { laneId: "REGIME_COMPOSITE_CONFIRMATION_LONG", weightPct: 5 },
+    { laneId: "COMPOSITE_ESTIMATOR_BIDI_WIDE_LONG", weightPct: 5 },
   ],
 };
 

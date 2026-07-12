@@ -46,6 +46,16 @@ export const PORTFOLIO_TREND_TOXIC_SYMBOLS: readonly string[] = [
 
 export const PORTFOLIO_TREND_MAX_CONCURRENT = 5;
 
+function envNum(name: string, dflt: number): number {
+  const v = Number(process.env[name]);
+  return Number.isFinite(v) ? v : dflt;
+}
+
+const PORTFOLIO_TREND_MAX_STORED_POSITIONS = envNum(
+  "PORTFOLIO_TREND_MAX_STORED_POSITIONS",
+  500,
+);
+
 const DEFAULT_STOP_MULTIPLIER = 3.0;
 const DEFAULT_TRAILING_MULTIPLIER = 2.0;
 const DEFAULT_TIME_STOP_HOURS = 48;
@@ -181,8 +191,19 @@ export class PortfolioTrendShadowStore {
     }
   }
 
+  private prune(): void {
+    if (this.positions.length <= PORTFOLIO_TREND_MAX_STORED_POSITIONS) return;
+    const open = this.positions.filter((p) => p.status === "OPEN");
+    const settled = this.positions
+      .filter((p) => p.status !== "OPEN")
+      .sort((a, b) => new Date(b.openedAt).getTime() - new Date(a.openedAt).getTime())
+      .slice(0, Math.max(0, PORTFOLIO_TREND_MAX_STORED_POSITIONS - open.length));
+    this.positions = [...open, ...settled];
+  }
+
   save(): void {
     try {
+      this.prune();
       const tmp = `${this.file}.tmp`;
       writeFileSync(tmp, JSON.stringify(this.positions), "utf-8");
       renameSync(tmp, this.file);

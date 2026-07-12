@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { BinanceClient, BinanceRequestError } from "../src/lib/binance.js";
+import { BinanceClient, BinanceRequestError, computeBasis } from "../src/lib/binance.js";
 
 function makeKlinePayload() {
   return Array.from({ length: 3 }, (_, index) => [
@@ -155,6 +155,92 @@ describe("BinanceClient", () => {
     await expect(client.getAggTrades("SOLUSDT", { startTime: 1, endTime: 2, limit: 2 })).resolves.toEqual([
       { price: 100, quantity: 2, isBuyerMaker: false, timestamp: 1_700_000_000_000 },
       { price: 99, quantity: 1, isBuyerMaker: true, timestamp: 1_700_000_001_000 },
+    ]);
+  });
+
+  describe("computeBasis", () => {
+    it("returns a negative basis when mark price trades below index price", () => {
+      expect(computeBasis(99.5, 100)).toEqual({ basis: -0.5, basisPct: -0.5 });
+    });
+
+    it("returns a positive basis when mark price trades above index price", () => {
+      expect(computeBasis(100.5, 100)).toEqual({ basis: 0.5, basisPct: 0.5 });
+    });
+
+    it("returns a zero basis when mark price equals index price", () => {
+      expect(computeBasis(100, 100)).toEqual({ basis: 0, basisPct: 0 });
+    });
+
+    it("returns nulls when either input is missing", () => {
+      expect(computeBasis(null, 100)).toEqual({ basis: null, basisPct: null });
+      expect(computeBasis(100, null)).toEqual({ basis: null, basisPct: null });
+    });
+  });
+
+  it("attaches basis/basisPct to the futures premium index snapshot", async () => {
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input));
+      expect(url.pathname).toBe("/fapi/v1/premiumIndex");
+      return new Response(
+        JSON.stringify({
+          markPrice: "100.5",
+          indexPrice: "100.0",
+          lastFundingRate: "0.0001",
+          nextFundingTime: 1_700_000_000_000,
+        }),
+        { status: 200 },
+      );
+    });
+    const client = new BinanceClient(fetchImpl as typeof fetch);
+
+    await expect(client.getFuturesPremiumIndex("SOLUSDT")).resolves.toEqual({
+      markPrice: 100.5,
+      indexPrice: 100,
+      fundingRate: 0.0001,
+      nextFundingTime: 1_700_000_000_000,
+      basis: 0.5,
+      basisPct: 0.5,
+    });
+  });
+
+  it("parses top-trader long/short ratios from the dedicated top-trader endpoints", async () => {
+    const requestedPaths: string[] = [];
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input));
+      requestedPaths.push(url.pathname);
+      expect(url.host).toBe("fapi.binance.com");
+      expect(url.searchParams.get("symbol")).toBe("SOLUSDT");
+      expect(url.searchParams.get("period")).toBe("5m");
+      expect(url.searchParams.get("limit")).toBe("2");
+      if (url.pathname === "/futures/data/topLongShortPositionRatio") {
+        return new Response(
+          JSON.stringify([
+            { symbol: "SOLUSDT", longShortRatio: "1.7500", longAccount: "0.6364", shortAccount: "0.3636", timestamp: 1_700_000_000_000 },
+            { symbol: "SOLUSDT", longShortRatio: "1.9047", longAccount: "0.6559", shortAccount: "0.3441", timestamp: 1_700_000_300_000 },
+          ]),
+          { status: 200 },
+        );
+      }
+      if (url.pathname === "/futures/data/topLongShortAccountRatio") {
+        return new Response(
+          JSON.stringify([
+            { symbol: "SOLUSDT", longShortRatio: "1.2000", longAccount: "0.5455", shortAccount: "0.4545", timestamp: 1_700_000_000_000 },
+            { symbol: "SOLUSDT", longShortRatio: "1.4342", longAccount: "0.5891", shortAccount: "0.4109", timestamp: 1_700_000_300_000 },
+          ]),
+          { status: 200 },
+        );
+      }
+      return new Response("missing", { status: 404 });
+    });
+    const client = new BinanceClient(fetchImpl as typeof fetch);
+
+    await expect(client.getFuturesTopTraderRatio("SOLUSDT")).resolves.toEqual({
+      topTraderPositionRatio: 1.9047,
+      topTraderAccountRatio: 1.4342,
+    });
+    expect(requestedPaths.sort()).toEqual([
+      "/futures/data/topLongShortAccountRatio",
+      "/futures/data/topLongShortPositionRatio",
     ]);
   });
 });

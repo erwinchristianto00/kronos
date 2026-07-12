@@ -232,6 +232,16 @@ export interface RegimeEngineReport {
   snapshotCount: number;
   latest: RegimeEngineSnapshot | null;
   regimeCounts: Record<string, number>;
+  /** Subset of regimeCounts where contradictions were non-empty, i.e. `s.regime` was
+   *  detected but the decision was actually forced to NO_TRADE by detectContradictions
+   *  before that label could route to a lane. `s.regime` records the PRE-contradiction
+   *  detected label (buildTradingDecision.ts sets trace.detectedRegime before running
+   *  the contradiction check), so regimeCounts alone can overstate how often a regime
+   *  was genuinely clean — this lets a reader subtract out the contradiction-flagged
+   *  share before trusting a count as "real" (e.g. after the 2026-07-10 retest62000Hold
+   *  fix widened the price range where retestFailed/retest62000Hold can theoretically
+   *  co-occur). */
+  regimeContradictionFlaggedCounts: Record<string, number>;
   actionCounts: Record<string, number>;
   rejectedByCounts: Record<string, number>;
   /** at + regime for each regime CHANGE (transitions), most recent last. */
@@ -243,12 +253,16 @@ export interface RegimeEngineReport {
 export function buildRegimeEngineReport(recentCount = 50): Omit<RegimeEngineReport, "enabled" | "breadthMetricsLatest"> {
   const snapshots = getRegimeEngineStore().snapshots;
   const regimeCounts: Record<string, number> = {};
+  const regimeContradictionFlaggedCounts: Record<string, number> = {};
   const actionCounts: Record<string, number> = {};
   const rejectedByCounts: Record<string, number> = {};
   const transitions: Array<{ at: string; from: string; to: string }> = [];
   let prevRegime: string | null = null;
   for (const s of snapshots) {
     regimeCounts[s.regime] = (regimeCounts[s.regime] ?? 0) + 1;
+    if (s.contradictions.length > 0) {
+      regimeContradictionFlaggedCounts[s.regime] = (regimeContradictionFlaggedCounts[s.regime] ?? 0) + 1;
+    }
     actionCounts[s.action] = (actionCounts[s.action] ?? 0) + 1;
     if (s.rejectedBy) rejectedByCounts[s.rejectedBy] = (rejectedByCounts[s.rejectedBy] ?? 0) + 1;
     if (prevRegime !== null && prevRegime !== s.regime) transitions.push({ at: s.at, from: prevRegime, to: s.regime });
@@ -258,6 +272,7 @@ export function buildRegimeEngineReport(recentCount = 50): Omit<RegimeEngineRepo
     snapshotCount: snapshots.length,
     latest: snapshots.length > 0 ? snapshots[snapshots.length - 1]! : null,
     regimeCounts,
+    regimeContradictionFlaggedCounts,
     actionCounts,
     rejectedByCounts,
     transitions: transitions.slice(-40),

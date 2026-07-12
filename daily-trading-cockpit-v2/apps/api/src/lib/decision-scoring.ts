@@ -64,6 +64,14 @@ export interface SetupQualityInputs {
 const SETUP_QUALITY_MAX = 25;
 
 export function scoreSetupQuality(inputs: SetupQualityInputs): number {
+  // 2026-07-12 fix: these 3 fields aren't typed nullable, but nothing upstream actually guarantees
+  // a finite number (e.g. a 0/0 division producing NaN) — clamp()'s Math.max/min silently propagate
+  // NaN through every downstream computation instead of surfacing it, corrupting totalScore (and
+  // whatever report persists it) rather than just scoring this dimension 0 like every other
+  // "missing/bad data" case in this file already does (see scoreOrderFlowQuality below).
+  if (!Number.isFinite(inputs.volumeRatio) || !Number.isFinite(inputs.rocPercent) || !Number.isFinite(inputs.atrExtension)) {
+    return 0;
+  }
   const maxExt = inputs.maxHealthyAtrExtension ?? 3;
   // Volume: 1x=0 credit, 1.5x=half credit, 3x+=full credit for this half of the dimension.
   const volumeScore = clamp(((inputs.volumeRatio - 1) / (3 - 1)) * (SETUP_QUALITY_MAX / 2), 0, SETUP_QUALITY_MAX / 2);
@@ -107,7 +115,15 @@ const LIQUIDITY_QUALITY_MAX = 15;
 
 /** Full score near 0 cost, degrading linearly to 0 at the operator's own max-acceptable thresholds. */
 export function scoreLiquidityQuality(inputs: LiquidityQualityInputs): number {
-  if (inputs.spreadBps === null || inputs.expectedSlippageBps === null) return 0;
+  // 2026-07-12 fix: `=== null` doesn't catch NaN (e.g. a spread/slippage computed as 0/0 upstream)
+  // — matches the same NaN-slips-through-the-null-check pattern already guarded against in
+  // scoreOrderFlowQuality above via Number.isFinite.
+  if (
+    inputs.spreadBps === null || !Number.isFinite(inputs.spreadBps) ||
+    inputs.expectedSlippageBps === null || !Number.isFinite(inputs.expectedSlippageBps)
+  ) {
+    return 0;
+  }
   if (!(inputs.maxSpreadBps > 0) || !(inputs.maxSlippageBps > 0)) return 0;
   const spreadHealth = clamp(1 - inputs.spreadBps / inputs.maxSpreadBps, 0, 1);
   const slippageHealth = clamp(1 - inputs.expectedSlippageBps / inputs.maxSlippageBps, 0, 1);

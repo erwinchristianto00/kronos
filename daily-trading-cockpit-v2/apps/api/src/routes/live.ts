@@ -11,6 +11,20 @@ import type { LiveExecutionEngine } from "../lib/live-execution-engine.js";
 import { type CrossSectionalExecutor } from "../lib/cross-sectional-executor.js";
 import type { SingleSymbolLaneExecutor } from "../lib/single-symbol-lane-executor.js";
 import { REGIME_AUTOPILOT_PRESETS, type RegimeAutopilot } from "../lib/regime-autopilot.js";
+import { getShortFadeStore, buildShortFadeReport, SF_PAPER_LANE_ID } from "../lib/short-fade-edge.js";
+import { getIntradayMomentumStore, buildIntradayMomentumReport, IM_PAPER_LANE_ID } from "../lib/intraday-momentum-edge.js";
+import { getRegimeCompositeStore, buildRegimeCompositeReport, RC_PAPER_LANE_ID } from "../lib/regime-composite-edge.js";
+import { getPanicWashoutStore, buildPanicWashoutReport, PWR_PAPER_LANE_ID } from "../lib/panic-washout-reclaim-edge.js";
+import { getCompositeEstimatorStore, buildCompositeEstimatorReport, ceLaneIdForBucket, type CEBucket } from "../lib/composite-estimator-edge.js";
+import { buildLiveWalletReconciliationReport } from "../lib/wallet-reconciliation.js";
+import { sumExternalRealizedPnlUsd } from "../lib/live-executor-wiring.js";
+import type { UnifiedTestnetOrchestrator } from "../lib/unified-testnet-orchestrator.js";
+import type { UnifiedTestnetProposalStore } from "../lib/unified-testnet-proposal-source.js";
+
+/** 2026-07-10: was named PROFIT_CORE_SHORT_ENABLED (the flag), but the lane id itself only ever
+ *  appears inline in realtime-short-mirror.ts (PROFIT_CORE_SHORT_TRAIL_LANE_ID) — not re-exported
+ *  from anywhere routes/live.ts already imports, so it's spelled out here to avoid a wider import. */
+const PROFIT_CORE_SHORT_TRAIL_LANE_ID = "PROFIT_CORE_SHORT_TRAIL";
 
 type LiveAccountSnapshot = Awaited<ReturnType<LiveExecutionEngine["getAccountSnapshot"]>>;
 
@@ -270,6 +284,85 @@ export function flattenSingleSymbolPositions(
   });
 }
 
+type MeasuredLaneStats = { resolvedCount: number; openCount: number; netAvgR: number | null; wr: number | null; pf: number | null; edgeReady: boolean };
+type SingleSymbolExecutorStatus = ReturnType<SingleSymbolLaneExecutor["getStatus"]>;
+export type LaneEvaluationRow = {
+  laneId: string;
+  allocationWeightPct: number;
+  allowed: boolean | null;
+  realOpenCount: number;
+  realClosedCount: number;
+  realNetPnlUsd: number;
+  measuredResolvedCount: number | null;
+  measuredOpenCount: number | null;
+  measuredNetAvgR: number | null;
+  measuredWr: number | null;
+  measuredPf: number | null;
+  measuredEdgeReady: boolean | null;
+};
+
+/** Pulls each lane's OWN paper/shadow report over its OWN store — the exact same numbers
+ *  /api/shadow/*-report already show, just gathered in one place for the evaluation panel below. */
+export function buildMeasuredLaneStats(): Map<string, MeasuredLaneStats> {
+  const byLane = new Map<string, MeasuredLaneStats>();
+  const sf = buildShortFadeReport(getShortFadeStore().all);
+  byLane.set(SF_PAPER_LANE_ID, { resolvedCount: sf.resolvedCount, openCount: sf.openCount, netAvgR: sf.netAvgR, wr: sf.wr, pf: sf.pf, edgeReady: sf.edgeReady });
+  const im = buildIntradayMomentumReport(getIntradayMomentumStore().all);
+  byLane.set(IM_PAPER_LANE_ID, { resolvedCount: im.resolvedCount, openCount: im.openCount, netAvgR: im.netAvgR, wr: im.wr, pf: im.pf, edgeReady: im.edgeReady });
+  const rc = buildRegimeCompositeReport(getRegimeCompositeStore().all);
+  byLane.set(RC_PAPER_LANE_ID, { resolvedCount: rc.resolvedCount, openCount: rc.openCount, netAvgR: rc.netAvgR, wr: rc.wr, pf: rc.pf, edgeReady: rc.edgeReady });
+  const pwr = buildPanicWashoutReport(getPanicWashoutStore().all);
+  byLane.set(PWR_PAPER_LANE_ID, { resolvedCount: pwr.resolvedCount, openCount: pwr.openCount, netAvgR: pwr.netAvgR, wr: pwr.wr, pf: pwr.pf, edgeReady: pwr.edgeReady });
+  const ce = buildCompositeEstimatorReport(getCompositeEstimatorStore().all);
+  for (const bucket of ce.buckets) {
+    byLane.set(ceLaneIdForBucket(bucket.bucket as CEBucket), {
+      resolvedCount: bucket.resolvedCount,
+      openCount: bucket.openCount,
+      netAvgR: bucket.netAvgR,
+      wr: bucket.wr,
+      pf: bucket.pf,
+      edgeReady: bucket.edgeReady,
+    });
+  }
+  return byLane;
+}
+
+/** Evaluation section for the lanes being validated on testnet (2026-07-10 operator ask): one row
+ *  per lane merging (a) the paper/shadow measurement side (buildMeasuredLaneStats above) and (b)
+ *  the real testnet-money execution side — openCount/closedCount/netPnlUsd from the
+ *  SingleSymbolLaneExecutor's own getStatus(), plus the lane's current allocation weight/allowed
+ *  state. PROFIT_CORE_SHORT_TRAIL has no paper/shadow report (it rides the plain paper->live
+ *  mirror, not a SingleSymbolLaneExecutor) — its real side comes from the account snapshot's
+ *  closedLanes instead, and its measurement fields are null (honestly, not fabricated 0s — there
+ *  is no such report to read for it). */
+export function buildLaneEvaluationRows(
+  execStatuses: SingleSymbolExecutorStatus[],
+  measuredByLane: Map<string, MeasuredLaneStats>,
+  profitCoreClosedLane: { closedCount: number; realizedPnlUsd: number } | null,
+  fallbackWeightPct: (laneId: string) => number,
+): LaneEvaluationRow[] {
+  const execByLane = new Map(execStatuses.map((s) => [s.laneId, s]));
+  const laneIds = [PROFIT_CORE_SHORT_TRAIL_LANE_ID, ...execStatuses.map((s) => s.laneId)];
+  return laneIds.map((laneId) => {
+    const exec = execByLane.get(laneId) ?? null;
+    const measured = measuredByLane.get(laneId) ?? null;
+    return {
+      laneId,
+      allocationWeightPct: exec?.allocationWeightPct ?? fallbackWeightPct(laneId),
+      allowed: exec?.allowed ?? null,
+      realOpenCount: exec?.openPositions.length ?? 0,
+      realClosedCount: exec?.closedCount ?? profitCoreClosedLane?.closedCount ?? 0,
+      realNetPnlUsd: exec?.totalNetPnlUsd ?? profitCoreClosedLane?.realizedPnlUsd ?? 0,
+      measuredResolvedCount: measured?.resolvedCount ?? null,
+      measuredOpenCount: measured?.openCount ?? null,
+      measuredNetAvgR: measured?.netAvgR ?? null,
+      measuredWr: measured?.wr ?? null,
+      measuredPf: measured?.pf ?? null,
+      measuredEdgeReady: measured?.edgeReady ?? null,
+    };
+  });
+}
+
 /** Single-symbol-executor analog of annotateCrossSectionalAccount above — same rationale (a
  *  position opened by SHORT_FADE_EXHAUSTION/INTRADAY_MOMENTUM_BREAKOUT is NOT an engine intent, so
  *  without this its real fill would show up as an "unattributed" exchange position and its banked
@@ -469,6 +562,8 @@ export async function registerLiveRoutes(
     compositeEstimatorFastShortExecutor?: () => SingleSymbolLaneExecutor | null;
     panicWashoutExecutor?: () => SingleSymbolLaneExecutor | null;
     regimeAutopilot?: () => RegimeAutopilot | null;
+    unifiedOrchestrator?: () => UnifiedTestnetOrchestrator | null;
+    unifiedProposalStore?: () => UnifiedTestnetProposalStore | null;
   } = {},
 ): Promise<void> {
   const allCrossSectionalExecutors = () =>
@@ -497,7 +592,11 @@ export async function registerLiveRoutes(
             : "live execution disabled (set LIVE_EXECUTION_ENABLED=1 + LIVE_BINANCE_* env to enable)",
       };
     }
-    return engine.getStatus();
+    return {
+      ...engine.getStatus(),
+      unifiedOrchestrator: opts.unifiedOrchestrator?.()?.getStatus() ?? null,
+      unifiedProposalSource: opts.unifiedProposalStore?.()?.getStatus() ?? null,
+    };
   });
 
   app.post("/api/live/arm", async (request, reply) => {
@@ -652,10 +751,17 @@ export async function registerLiveRoutes(
       reply.code(503);
       return { ok: false, reason: "live execution disabled" };
     }
-    const body = (request.body ?? {}) as { lanes?: unknown };
+    const body = (request.body ?? {}) as { lanes?: unknown; confirm?: string };
+    // 2026-07-12 fix: this mutates which lanes may open new real positions, with no confirmation
+    // phrase — unlike every other state-changing action in this file. No known frontend caller
+    // currently exists (superseded by /api/live/lane-allocations), so this closes the gap safely.
+    if (body.confirm !== "SET_LANES") {
+      reply.code(400);
+      return { ok: false, reason: 'setting the lane allow-list requires body {"confirm":"SET_LANES"}' };
+    }
     if (body.lanes !== null && !Array.isArray(body.lanes)) {
       reply.code(400);
-      return { ok: false, reason: 'body must be {"lanes": null | string[]}' };
+      return { ok: false, reason: 'body must be {"lanes": null | string[], "confirm":"SET_LANES"}' };
     }
     const result = engine.setAllowedLanes(
       body.lanes === null ? null : (body.lanes as unknown[]).map((v) => String(v)),
@@ -710,6 +816,28 @@ export async function registerLiveRoutes(
     }
   });
 
+  app.get("/api/live/lane-evaluation", async (_request, reply) => {
+    if (!engine) {
+      reply.code(503);
+      return { ok: false, reason: "live execution disabled" };
+    }
+    try {
+      const snapshot = await engine.getAccountSnapshot();
+      const execStatuses = allSingleSymbolExecutors().map((exec) => exec.getStatus());
+      const measuredByLane = buildMeasuredLaneStats();
+      const rows = buildLaneEvaluationRows(
+        execStatuses,
+        measuredByLane,
+        snapshot.closedLanes.find((l) => l.laneId === PROFIT_CORE_SHORT_TRAIL_LANE_ID) ?? null,
+        (laneId) => engine.laneSelectionWeightPctForLane(laneId),
+      );
+      return { ok: true, lanes: rows };
+    } catch (err) {
+      reply.code(502);
+      return { ok: false, reason: err instanceof Error ? err.message : "lane evaluation fetch failed" };
+    }
+  });
+
   // Operator close of single-symbol-lane-executor position(s) — the "Single-symbol executor —
   // stop-protected" panel's per-row "Close now" button (2026-07-10, urgent operator ask). Body
   // {"positionId":"…","confirm":"CLOSE"} closes ONE specific lane's position — the operator asked
@@ -723,6 +851,15 @@ export async function registerLiveRoutes(
   // path the exit policy uses, sized to ONLY that lane's own tracked qty — never touches basket legs
   // or directional-intent qty on the same symbol from other books.
   app.post("/api/live/single-symbol/close", async (request, reply) => {
+    // 2026-07-12 fix: the only mutating route in this file that never checked this — every
+    // SingleSymbolLaneExecutor instance is constructed inside the SAME liveConfig.enabled guard as
+    // `engine` itself (they share the same liveClient), so engine === null means these are ALL null
+    // too. Without this check the route fell through to a less clear 404/"no open positions"
+    // response instead of the consistent {enabled:false} contract every other route follows.
+    if (!engine) {
+      reply.code(503);
+      return { ok: false, reason: "live execution disabled" };
+    }
     const body = (request.body ?? {}) as { symbol?: string; positionId?: string; confirm?: string };
     if (body.confirm !== "CLOSE") {
       reply.code(400);
@@ -774,7 +911,9 @@ export async function registerLiveRoutes(
     if (!executor) {
       return { enabled: false, reason: "executor disabled (set CROSS_SECTIONAL_EXEC_ENABLED=1 + live execution env)" };
     }
-    return executor.getStatus();
+    // 2026-07-12 (profitability Stage 3): attach the report-only regime-skew counterfactual so the
+    // operator can see whether CROSS_SECTIONAL_REGIME_SKEW's same-direction tilt is being rewarded.
+    return { ...executor.getStatus(), regimeSkewCounterfactual: executor.getRegimeSkewCounterfactual() };
   });
 
   // 2026-07-08: sibling status endpoints for the two additional variant-targeted instances (same
@@ -873,10 +1012,16 @@ export async function registerLiveRoutes(
       reply.code(503);
       return { ok: false, reason: "live execution disabled" };
     }
-    const body = (request.body ?? {}) as { enabled?: unknown };
+    const body = (request.body ?? {}) as { enabled?: unknown; confirm?: string };
+    // 2026-07-12 fix: this toggles the RAW selector bypass affecting real-money entries, with no
+    // confirmation phrase — unlike every other state-changing action in this file.
+    if (body.confirm !== "SET_MANUAL_MODE") {
+      reply.code(400);
+      return { ok: false, reason: 'toggling manual mode requires body {"enabled": true|false, "confirm":"SET_MANUAL_MODE"}' };
+    }
     if (typeof body.enabled !== "boolean") {
       reply.code(400);
-      return { ok: false, reason: 'body must be {"enabled": true | false}' };
+      return { ok: false, reason: 'body must be {"enabled": true | false, "confirm":"SET_MANUAL_MODE"}' };
     }
     return engine.setManualSelectorMode(body.enabled);
   });
@@ -886,15 +1031,24 @@ export async function registerLiveRoutes(
       reply.code(503);
       return { ok: false, reason: "live execution disabled" };
     }
-    const body = (request.body ?? {}) as { allocations?: unknown };
+    const body = (request.body ?? {}) as { allocations?: unknown; confirm?: string };
+    // 2026-07-12 fix: this mutates which lanes may open new real positions and at what size, with
+    // no confirmation phrase — unlike every other state-changing action in this file.
+    if (body.confirm !== "SET_ALLOCATIONS") {
+      reply.code(400);
+      return { ok: false, reason: 'setting lane allocations requires body {"allocations": …, "confirm":"SET_ALLOCATIONS"}' };
+    }
     if (body.allocations !== null && !Array.isArray(body.allocations)) {
       reply.code(400);
-      return { ok: false, reason: 'body must be {"allocations": null | [{laneId, weightPct}]}' };
+      return { ok: false, reason: 'body must be {"allocations": null | [{laneId, weightPct}], "confirm":"SET_ALLOCATIONS"}' };
     }
-    // 2026-07-09: operator-explicit path — sets manualSelectorMode when applying a real allocation
-    // so RegimeAutopilot's next tick can't silently revert it (see setLaneAllocationsAsOperator's
-    // doc comment for the incident this closes). Distinct from applyRegimeAutopilotAllocation,
-    // which is autopilot's OWN apply path and clears the flag instead.
+    // 2026-07-09: operator-explicit path — sets laneAllocationOperatorLock when applying a real
+    // allocation so RegimeAutopilot's next tick can't silently revert it (see
+    // setLaneAllocationsAsOperator's doc comment for the incident this closes; 2026-07-12 fix:
+    // this comment previously named the wrong flag, manualSelectorMode — that was the ORIGINAL
+    // mechanism before the 2026-07-09 lane-allocation-lock/raw-bypass conflation fix split it into
+    // this dedicated field). Distinct from applyRegimeAutopilotAllocation, which is autopilot's OWN
+    // apply path and clears the flag instead.
     const result = engine.setLaneAllocationsAsOperator(
       body.allocations === null
         ? null
@@ -968,10 +1122,41 @@ export async function registerLiveRoutes(
       for (const executor of allSingleSymbolExecutors()) {
         snapshot = annotateSingleSymbolAccount(snapshot, executor);
       }
-      return { ok: true, ...snapshot };
+      // 2026-07-11: the dashboard's headline "Realized P&L (today/all-time)" summed only the
+      // mirror ledger (status.totalRealizedPnlUsd) and the 3 cross-sectional lane ids — every
+      // SingleSymbolLaneExecutor's real realized P&L (already correctly folded into closedLanes
+      // above via annotateSingleSymbolAccount, just never summed for the headline) was invisible
+      // there. Operator caught this live: a real +$1.39 BTC close via REGIME_COMPOSITE_CONFIRMATION_LONG
+      // didn't move "all-time" at all. Expose the aggregate directly so the frontend doesn't have to
+      // guess/hardcode lane ids that drift every time a new single-symbol lane is wired.
+      // (Single-symbol only, deliberately — cross-sectional's own "baskets" total is a SEPARATE
+      // frontend calc over the 3 CrossSectionalExecutor lane ids, so passing [] here avoids double-
+      // counting; sumExternalRealizedPnlUsd is also reused as-is by the kill-switch and wallet-
+      // reconciliation, which DO want the combined cross-sectional+single-symbol total.)
+      const singleSymbolExecutorRealizedPnlUsd = sumExternalRealizedPnlUsd([], allSingleSymbolExecutors());
+      return { ok: true, ...snapshot, singleSymbolExecutorRealizedPnlUsd };
     } catch (err) {
       reply.code(502);
       return { ok: false, reason: err instanceof Error ? err.message : "account snapshot failed" };
+    }
+  });
+
+  // Report-only: compares the engine's internal daily realized-P&L ledger against Binance's own
+  // /fapi/v1/income for the same UTC day. See wallet-reconciliation.ts's module doc for the full
+  // safety rationale — this endpoint only reads and reports; it never corrects anything.
+  app.get("/api/live/wallet-reconciliation", async (request, reply) => {
+    if (!engine) {
+      reply.code(503);
+      return { ok: false, reason: "live execution disabled" };
+    }
+    const query = (request.query ?? {}) as { day?: string };
+    try {
+      const external = sumExternalRealizedPnlUsd(allCrossSectionalExecutors(), allSingleSymbolExecutors());
+      const report = await buildLiveWalletReconciliationReport(engine, query.day, undefined, external.today);
+      return { ok: true, report };
+    } catch (err) {
+      reply.code(502);
+      return { ok: false, reason: err instanceof Error ? err.message : "wallet reconciliation failed" };
     }
   });
 
@@ -1030,7 +1215,11 @@ export async function registerLiveRoutes(
       reply.code(400);
       return { ok: false, reason: 'resetting a latched kill requires body {"confirm":"RESET"}' };
     }
-    engine.resetKill();
+    const result = engine.resetKill();
+    if (!result.ok) {
+      reply.code(409);
+      return { ok: false, reason: result.reason };
+    }
     return { ok: true, armed: engine.isArmed() };
   });
 }

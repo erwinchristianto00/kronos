@@ -72,6 +72,24 @@ export const FORCE_ELIGIBLE_SHORT_VARIANT_IDS = new Set<string>(["CG_WIDE_FAST_S
 // tier, and all engine caps still apply — so it still trades ONLY when the regime allows longs.
 export const FORCE_ELIGIBLE_LONG_VARIANT_IDS = new Set<string>(["CG_WIDE_FAST_LONG"]);
 
+/** Whether a candidate's own direction makes it force-eligible (operator opt-in via
+ *  REALTIME_SHORT_FORCE_FAST_LONG/SHORT=1 + membership in the matching FORCE_ELIGIBLE_*
+ *  set above) — i.e. allowed to trade regardless of THIS instance's own STABLE_CANDIDATE
+ *  label. 2026-07-11 incident: app.ts's mainnet proven-only gate used to run BEFORE this
+ *  check was ever consulted, silently defeating the operator's own force-eligible opt-in
+ *  the moment this instance's thin/decaying VM book dropped a lane's freshValid count back
+ *  under the STABLE threshold — every call site that gates on STABLE_CANDIDATE status must
+ *  also check this first. */
+export function isForceEligibleForDirection(
+  direction: "LONG" | "SHORT",
+  laneVariantId: string,
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  return direction === "LONG"
+    ? env.REALTIME_SHORT_FORCE_FAST_LONG === "1" && FORCE_ELIGIBLE_LONG_VARIANT_IDS.has(laneVariantId)
+    : env.REALTIME_SHORT_FORCE_FAST_SHORT === "1" && FORCE_ELIGIBLE_SHORT_VARIANT_IDS.has(laneVariantId);
+}
+
 export const REALTIME_SHORT_ALLOWED_VARIANT_IDS = LANE_SELECTOR_V2_LIVE_SUPPORTED_VARIANT_IDS.filter(
   (id) => !MANUAL_ONLY_LIVE_MIRROR_VARIANT_IDS.has(id),
 );

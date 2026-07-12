@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import os from "node:os";
 import { mkdtempSync, existsSync } from "node:fs";
 import { join } from "node:path";
@@ -16,6 +16,8 @@ import {
   buildPaperPerformanceReport,
   buildPaperExecutionRouterBriefLines,
   PAPER_ADMISSION_MAX_AGE_MS,
+  PAPER_MAX_CLOSED_DIAGNOSTIC,
+  PER_LANE_DIAGNOSTIC_FLOOR,
   DEFAULT_PAPER_EQUITY,
   HEADLINE_MAX_OPEN,
   HEADLINE_MAX_PER_SYMBOL,
@@ -2108,29 +2110,117 @@ describe("headline concentration caps (anti-correlation safety)", () => {
     expect(headlineConcentrationRejectReason(openHeadline, "BTCUSDT", "LONG")).toBeNull();
   });
 
-  // [PRUNE] bound the paper store: keep newest N DIAGNOSTIC closed; never touch HEADLINE/OPEN.
-  it("[PRUNE] pruneClosedDiagnostic keeps newest N diagnostic closed, preserves headline + open", () => {
+  // [PRUNE] bound the paper store: keep newest N DIAGNOSTIC closed (per-lane floor + global
+  // backstop, see 2026-07-11 update), never touch HEADLINE/OPEN. This lane alone exceeds
+  // PER_LANE_DIAGNOSTIC_FLOOR so the floor doesn't just protect the whole thing outright — pruning
+  // must still engage past the floor.
+  it("[PRUNE] pruneClosedDiagnostic keeps newest N diagnostic closed within a lane once it exceeds the per-lane floor, preserves headline + open", () => {
     const store = new PaperExecutionRouterStore(tmpDir());
-    for (let i = 0; i < 5; i++) {
+    const laneTotal = PER_LANE_DIAGNOSTIC_FLOOR + 5;
+    const baseMs = Date.parse("2026-06-01T00:00:00.000Z");
+    for (let i = 0; i < laneTotal; i++) {
       store.add(makePaperOrder({
         paperOrderId: `diag-${i}`,
         dedupeKey: `diag-${i}`,
         paperOrderMode: "DIAGNOSTIC_ONLY",
         paperStatus: "PAPER_CLOSED_WIN",
-        updatedAt: `2026-06-1${i}T00:00:00.000Z`, // diag-4 newest
+        updatedAt: new Date(baseMs + i * 60_000).toISOString(), // strictly increasing: diag-(laneTotal-1) newest
       }));
     }
     store.add(makePaperOrder({ paperOrderId: "open-1", dedupeKey: "open-1", paperOrderMode: "DIAGNOSTIC_ONLY", paperStatus: "CREATED" }));
-    store.add(makePaperOrder({ paperOrderId: "hl-1", dedupeKey: "hl-1", paperOrderMode: "HEADLINE", paperStatus: "PAPER_CLOSED_LOSS", updatedAt: "2026-06-01T00:00:00.000Z" }));
+    store.add(makePaperOrder({ paperOrderId: "hl-1", dedupeKey: "hl-1", paperOrderMode: "HEADLINE", paperStatus: "PAPER_CLOSED_LOSS", updatedAt: "2026-05-01T00:00:00.000Z" }));
 
-    expect(store.pruneClosedDiagnostic(2)).toBe(3); // 5 diag closed → keep 2 → prune 3
+    expect(store.pruneClosedDiagnostic(PER_LANE_DIAGNOSTIC_FLOOR)).toBe(5); // laneTotal → floor → prune the 5 oldest
     const ids = store.all.map((o) => o.paperOrderId);
-    expect(ids).toContain("diag-4"); // newest kept
-    expect(ids).toContain("diag-3");
+    expect(ids).toContain(`diag-${laneTotal - 1}`); // newest kept
     expect(ids).not.toContain("diag-0"); // oldest dropped
     expect(ids).toContain("open-1"); // OPEN untouched
     expect(ids).toContain("hl-1"); // HEADLINE (real ledger) NEVER pruned
-    expect(store.pruneClosedDiagnostic(100)).toBe(0); // below cap → no-op
+    expect(store.pruneClosedDiagnostic(100_000)).toBe(0); // below cap → no-op
+  });
+
+  // [OOM-FIX] the flat global sort (pre-2026-07-11) would let a busy lane's newer timestamps
+  // crowd a quiet lane's ENTIRE history out of the "newest maxClosed" window — an adversarial
+  // review before deploy caught this: on the very first prune after shipping the lower default,
+  // a rarely-closing lane could be wiped out instantly just because siblings trade more often.
+  it("[OOM-FIX] pruneClosedDiagnostic never reduces a quiet lane below PER_LANE_DIAGNOSTIC_FLOOR, even when a busy sibling lane's timestamps are all newer", () => {
+    const store = new PaperExecutionRouterStore(tmpDir());
+    const baseMs = Date.parse("2026-06-01T00:00:00.000Z");
+
+    const quietCount = 10; // well under the floor
+    for (let i = 0; i < quietCount; i++) {
+      store.add(makePaperOrder({
+        paperOrderId: `quiet-${i}`,
+        dedupeKey: `quiet-${i}`,
+        selectedLaneId: "QUIET_LANE",
+        paperOrderMode: "DIAGNOSTIC_ONLY",
+        paperStatus: "PAPER_CLOSED_WIN",
+        updatedAt: new Date(baseMs + i * 60_000).toISOString(), // all older than every busy-lane order below
+      }));
+    }
+
+    const busyCount = PER_LANE_DIAGNOSTIC_FLOOR + 100; // exceeds its own floor
+    for (let i = 0; i < busyCount; i++) {
+      store.add(makePaperOrder({
+        paperOrderId: `busy-${i}`,
+        dedupeKey: `busy-${i}`,
+        selectedLaneId: "BUSY_LANE",
+        paperOrderMode: "DIAGNOSTIC_ONLY",
+        paperStatus: "PAPER_CLOSED_WIN",
+        updatedAt: new Date(baseMs + 10_000_000_000 + i * 1_000).toISOString(), // all newer than every quiet-lane order
+      }));
+    }
+
+    const maxClosed = PER_LANE_DIAGNOSTIC_FLOOR + 50; // less than quiet+busy combined, more than one lane's floor alone
+    store.pruneClosedDiagnostic(maxClosed);
+
+    const ids = new Set(store.all.map((o) => o.paperOrderId));
+    const quietSurviving = [...ids].filter((id) => id.startsWith("quiet-")).length;
+    const busySurviving = [...ids].filter((id) => id.startsWith("busy-")).length;
+
+    // The old flat-global-sort behavior would have kept the newest `maxClosed` records overall —
+    // every one of them from BUSY_LANE (its timestamps are all newer) — wiping QUIET_LANE to 0.
+    expect(quietSurviving).toBe(quietCount); // every quiet-lane order survives despite being globally oldest
+    expect(busySurviving).toBeGreaterThanOrEqual(PER_LANE_DIAGNOSTIC_FLOOR); // busy lane keeps at least its own floor
+    expect(busySurviving).toBeLessThan(busyCount); // but busy lane itself still gets trimmed
+    expect(quietSurviving + busySurviving).toBe(maxClosed); // combined total respects the global cap
+  });
+
+  // [OOM-FIX] the default was 9,999,999 (effectively infinite) — confirmed live, the research
+  // instance had grown to 11,213 orders/34MB with the prune never once engaging, directly
+  // correlated with that instance's disproportionate OOM crash-restart rate.
+  it("[OOM-FIX] PAPER_MAX_CLOSED_DIAGNOSTIC default is a real, finite cap (not the old inert ~10M value)", () => {
+    expect(PAPER_MAX_CLOSED_DIAGNOSTIC).toBeLessThanOrEqual(10_000);
+    expect(PAPER_MAX_CLOSED_DIAGNOSTIC).toBeGreaterThan(0);
+  });
+
+  // [OOM-FIX] admitPaperOrders() used to call store.add() (→ save() → a full-array
+  // JSON.stringify + writeFileSync) once per candidate observation — on a large store this is a
+  // real write-amplification spike every scan cycle. Wrapped in beginBatch/endBatch (the same
+  // pattern resolvePaperOrders already used) so only ONE flush happens per call.
+  it("[OOM-FIX] admitPaperOrders flushes to disk once per call, not once per candidate", () => {
+    const dir = tmpDir();
+    const store = new PaperExecutionRouterStore(dir);
+    const vmStore = new CurrentGuardVariantMatrixStore(dir);
+    const freshOpenedAt = new Date(Date.now() - 2 * 60 * 1000).toISOString();
+    store.ensurePaperStartAt(new Date(Date.now() - 5 * 60 * 1000).toISOString()); // predates freshOpenedAt
+    for (let i = 0; i < 5; i++) {
+      vmStore.add(makeVmObs({ observationId: `multi-obs-${i}`, openedAt: freshOpenedAt, symbol: `SYM${i}USDT` }));
+    }
+
+    const flushSpy = vi.spyOn(store as unknown as { flush: () => void }, "flush");
+
+    const result = admitPaperOrders({
+      store,
+      vmStore,
+      eligibleLane: ELIGIBLE_LANE,
+      routerReport: routerOf("Bearish pressure"),
+      gateReport: emptyGate(),
+      now: new Date().toISOString(),
+    });
+
+    expect(result.admitted).toBe(5); // 5 distinct store.add() calls happened...
+    expect(flushSpy.mock.calls.length).toBe(1); // ...but only 1 actual disk flush
   });
 });
 

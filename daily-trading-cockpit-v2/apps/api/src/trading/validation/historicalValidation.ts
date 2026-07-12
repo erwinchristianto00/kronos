@@ -61,6 +61,13 @@ export interface ValidationMicrostructureOptions {
 export interface HistoricalValidationInput {
   symbol: string;
   candles: HistoricalCandleSet;
+  /** ETH 1h candles for ethConfirms (contextFromCandles' cross-asset trend confirmation). Optional
+   *  — omitting it leaves ethConfirms undefined, same as before this field existed. 2026-07-12
+   *  fix: buildHistoricalValidationReport never supplied this, so ethConfirms was permanently
+   *  undefined, making TREND_RECOVERY/NEUTRAL_RECOVERY (and their 3 gated long lanes)
+   *  structurally unreachable in this validation/backtest/walk-forward harness regardless of
+   *  real price action. */
+  ethCandles?: { h1: Candle[] };
   breadth?: FeatureAdapterInput["breadth"];
   breadthByTimestamp?: Map<number, FeatureAdapterInput["breadth"]>;
   breadthUnavailableCount?: number;
@@ -898,6 +905,7 @@ export function buildHistoricalValidationReport(input: HistoricalValidationInput
     h4: sortCandles(input.candles.h4),
     d1: sortCandles(input.candles.d1),
   };
+  const ethH1 = sortCandles(input.ethCandles?.h1 ?? []);
   const startMs = input.startMs ?? candles.h1.at(0)?.openTime ?? 0;
   const endMs = input.endMs ?? (candles.h1.at(-1) ? closeTime(candles.h1.at(-1)!, "1h") : 0);
   const decisionEveryBars = Math.max(1, input.decisionEveryBars ?? 1);
@@ -958,6 +966,7 @@ export function buildHistoricalValidationReport(input: HistoricalValidationInput
     const ctx = contextFromCandles({
       asOf,
       btc,
+      eth: { h1: candlesClosedBy(ethH1, "1h", asOf) },
       breadth: breadthForTimestamp(input, asOf),
       microstructure: defaultMicrostructure(input.symbol, bar, input.microstructure),
       governance: {
@@ -1020,13 +1029,27 @@ export function buildHistoricalValidationReport(input: HistoricalValidationInput
     // the market still moves bar-by-bar even when decisions are only evaluated every
     // N bars, so a fresh entry always fills on the very next candle, never further out.
     const nextOpen = candles.h1[i + 1]?.open ?? null;
+    // 2026-07-12 fix: backtestRunner checks SL/TP against ONLY this bar's high/low each step —
+    // with decisionEveryBars>1 this loop only visits every Nth h1 candle, so any stop/TP-triggering
+    // excursion on a SKIPPED candle was invisible to the sim (an open position could ride straight
+    // through a real stop-out, or silently miss a TP that reversed before the next sampled bar).
+    // Widen high/low to the full range since the previous sampled bar (inclusive of this one) so
+    // the single "management bar" the runner sees still reflects every real candle's extremes.
+    const windowStart = Math.max(0, i - decisionEveryBars + 1);
+    let windowHigh = bar.high;
+    let windowLow = bar.low;
+    for (let j = windowStart; j < i; j += 1) {
+      const wBar = candles.h1[j]!;
+      windowHigh = Math.max(windowHigh, wBar.high);
+      windowLow = Math.min(windowLow, wBar.low);
+    }
     bars.push({
       timestamp: asOf,
       ctx,
       price: bar.close,
       nextOpen,
-      high: bar.high,
-      low: bar.low,
+      high: windowHigh,
+      low: windowLow,
       atr: atrValue,
     });
   }

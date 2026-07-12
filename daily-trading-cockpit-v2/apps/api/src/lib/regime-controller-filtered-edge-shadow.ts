@@ -29,6 +29,16 @@ function writeJsonAtomic(file: string, value: unknown): void {
   renameSync(tmp, file);
 }
 
+function envNum(name: string, dflt: number): number {
+  const v = Number(process.env[name]);
+  return Number.isFinite(v) ? v : dflt;
+}
+
+const FILTERED_EDGE_MAX_STORED_POSITIONS = envNum(
+  "FILTERED_EDGE_MAX_STORED_POSITIONS",
+  500,
+);
+
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 export const FILTERED_EDGE_SHADOW_LANE =
@@ -181,8 +191,19 @@ export class FilteredEdgeShadowStore {
     }
   }
 
+  private prune(): void {
+    if (this.positions.length <= FILTERED_EDGE_MAX_STORED_POSITIONS) return;
+    const open = this.positions.filter((p) => p.status === "OPEN");
+    const settled = this.positions
+      .filter((p) => p.status !== "OPEN")
+      .sort((a, b) => new Date(b.openedAt).getTime() - new Date(a.openedAt).getTime())
+      .slice(0, Math.max(0, FILTERED_EDGE_MAX_STORED_POSITIONS - open.length));
+    this.positions = [...open, ...settled];
+  }
+
   save(): void {
     try {
+      this.prune();
       writeJsonAtomic(this.file, this.positions);
     } catch {
       // storage failures must never throw — this lane is report-only

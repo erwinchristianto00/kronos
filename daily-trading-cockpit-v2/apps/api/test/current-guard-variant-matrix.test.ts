@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { join, resolve } from "node:path";
 import os from "node:os";
@@ -14,6 +14,7 @@ import {
   deriveVariantGeometry,
   deriveVariantStatus,
   walkVariantPath,
+  walkPyramidOnConfirmedWinner,
   buildVariantMatrixObservationsForSignal,
   mirrorVariantMatrixSignals,
   selectVariantMatrixSignals,
@@ -23,6 +24,7 @@ import {
   MAKER_ROUNDTRIP_BPS,
   WIDE_STOP_MIN_BPS,
   WATCHABLE_MIN_FRESH,
+  PRODUCTION_BREAKEVEN_CONTROL_COST_PCT,
   type VariantMatrixSignal,
   type VariantMatrixVariantDefinition,
   type KlineTuple,
@@ -464,6 +466,73 @@ describe("current-guard-variant-matrix", () => {
     expect(result.status).toBe("CLOSED_WIN");
     expect(result.grossR).toBeCloseTo(0.5, 6);
     expect(result.resolutionSource).toBe("MAX_HOLD_MTM");
+  });
+
+  // [PEAK] peakAtMs: additive field recording the open-time of the candle on which the
+  // running MFE high-watermark last increased. Must point at the DELIBERATE peak candle,
+  // not the last candle walked and not the candle where the trade eventually closed.
+  it("[PEAK1] peakAtMs marks the candle where the MFE high-watermark was set, not the last candle", async () => {
+    const peakCandleOpenMs = SIGNAL_OPEN_MS + 300000; // the 2nd candle — the deliberate peak
+    const result = await walkVariantPath({
+      direction: "LONG",
+      entryPrice: 100,
+      stopLoss: 98,
+      target: 110, // far away — never reached, so the walk runs to forceCloseAtEnd
+      exitRule: "tp1_full",
+      fillMode: "taker",
+      openedAtMs: SIGNAL_OPEN_MS,
+      candles: [
+        candle(SIGNAL_OPEN_MS, 101, 99.5, 100.5), // favorable +1 -> mfeR 0.5 (first peak)
+        candle(peakCandleOpenMs, 103, 100, 102), // favorable +3 -> mfeR 1.5 (NEW peak, deliberately placed here)
+        candle(SIGNAL_OPEN_MS + 600000, 102, 99.6, 100), // favorable +2 -> mfeR 1.0, LOWER than the peak — must not move peakAtMs
+      ],
+      forceCloseAtEnd: true,
+    });
+    expect(result.maxMfeR).toBeCloseTo(1.5, 6);
+    expect(result.peakAtMs).toBe(peakCandleOpenMs);
+    // Sanity: the peak candle is neither the first nor the last walked, and not closedAtMs.
+    expect(result.peakAtMs).not.toBe(SIGNAL_OPEN_MS);
+    expect(result.peakAtMs).not.toBe(result.closedAtMs);
+  });
+
+  it("[PEAK2] peakAtMs stays null when price never moves favorably (no MFE above 0)", async () => {
+    const result = await walkVariantPath({
+      direction: "LONG",
+      entryPrice: 100,
+      stopLoss: 95,
+      target: 110,
+      exitRule: "tp1_full",
+      fillMode: "taker",
+      openedAtMs: SIGNAL_OPEN_MS,
+      candles: [
+        candle(SIGNAL_OPEN_MS, 100, 98, 99), // high==entry -> favorable 0
+        candle(SIGNAL_OPEN_MS + 300000, 99.8, 97.5, 98.5), // stays below entry -> favorable 0
+      ],
+      forceCloseAtEnd: true,
+    });
+    expect(result.maxMfeR).toBe(0);
+    expect(result.peakAtMs).toBeNull();
+  });
+
+  it("[PEAK3] SHORT symmetry: peakAtMs marks the candle with the deepest favorable low, not the last candle", async () => {
+    const peakCandleOpenMs = SIGNAL_OPEN_MS + 300000;
+    const result = await walkVariantPath({
+      direction: "SHORT",
+      entryPrice: 100,
+      stopLoss: 102,
+      target: 90, // far away — never reached
+      exitRule: "tp1_full",
+      fillMode: "taker",
+      openedAtMs: SIGNAL_OPEN_MS,
+      candles: [
+        candle(SIGNAL_OPEN_MS, 100.5, 99, 99.5), // favorable +1 -> mfeR 0.5
+        candle(peakCandleOpenMs, 99, 97, 98), // favorable +3 -> mfeR 1.5 (NEW peak)
+        candle(SIGNAL_OPEN_MS + 600000, 100.4, 98, 99), // favorable +2 -> mfeR 1.0, must not move peakAtMs
+      ],
+      forceCloseAtEnd: true,
+    });
+    expect(result.maxMfeR).toBeCloseTo(1.5, 6);
+    expect(result.peakAtMs).toBe(peakCandleOpenMs);
   });
 
   it("[MFEG5] CG_MFE_GIVEBACK uses FAR-TP geometry so the giveback can actually fire (not baseline)", () => {
@@ -1182,5 +1251,563 @@ describe("current-guard-variant-matrix", () => {
     expect(r.netAvgR!).toBeCloseTo(0.7333, 3);
     expect(r.scaleoutNetAvgR!).toBeCloseTo(0.1333, 3);
     expect(r.beatsScaleout).toBe(true);
+  });
+
+  // ===========================================================================================
+  // [ATR-TRAIL] New exitRule: continuous ATR-ratchet trailing stop (Tier 2 item 5, offline-only).
+  // Ports the proven outcome-checker.ts mechanic (currentStop = Math.max(currentStop, close-ATR)
+  // for LONG, Math.min symmetric for SHORT) into walkVariantPath. Small atrPeriod (2) used
+  // throughout so the expected ATR values can be hand-computed exactly.
+  // ===========================================================================================
+  it("[ATR1] LONG: arms after a big favorable move, ratchets the stop up, banks a locked-in profit on the pullback", async () => {
+    const candles: KlineTuple[] = [
+      candle(SIGNAL_OPEN_MS, 104, 99.5, 103), // big pop: mfeR so far after this candle = 2.0
+      candle(SIGNAL_OPEN_MS + 300000, 105, 102.5, 104), // further favorable: mfeR = 2.5 (peak)
+      // ATR now available (period=2 -> first ATR at index 2): tr1=max(105-102.5,|105-103|,|102.5-103|)=2.5;
+      // tr2=max(104.5-102,|104.5-104|,|102-104|)=2.5; atr=(2.5+2.5)/2=2.5. trailLevel=close(103.5)-1*2.5=101.0.
+      candle(SIGNAL_OPEN_MS + 600000, 104.5, 102, 103.5),
+      // Pulls back through the ratcheted stop (101.0) — NOT the original stop (98).
+      candle(SIGNAL_OPEN_MS + 900000, 101.5, 100, 100.5),
+    ];
+    const result = await walkVariantPath({
+      direction: "LONG",
+      entryPrice: 100,
+      stopLoss: 98,
+      target: 110,
+      exitRule: "atr_trail",
+      fillMode: "taker",
+      openedAtMs: SIGNAL_OPEN_MS,
+      candles,
+      atrPeriod: 2,
+      atrMultiple: 1,
+      atrTrailArmR: 0.2,
+    });
+    expect(result.status).toBe("CLOSED_WIN");
+    expect(result.grossR).toBeCloseTo(0.5, 6); // exits at ratcheted stop 101.0 -> (101-100)/2
+    expect(result.resolutionSource).toBe("ATR_TRAIL_STOP");
+    expect(result.maxMfeR).toBeCloseTo(2.5, 6); // ran up to +2.5R before being trailed out
+  });
+
+  it("[ATR2] LONG: never arms (favorable move stays below the arm threshold) -> degrades to a plain static stop (-1)", async () => {
+    const candles: KlineTuple[] = [
+      candle(SIGNAL_OPEN_MS, 100.2, 99, 99.5), // mfeR only 0.1 -> never reaches default arm 0.5
+      candle(SIGNAL_OPEN_MS + 300000, 99.8, 97.5, 98), // hits the ORIGINAL stop (98), never ratcheted
+    ];
+    const result = await walkVariantPath({
+      direction: "LONG",
+      entryPrice: 100,
+      stopLoss: 98,
+      target: 110,
+      exitRule: "atr_trail",
+      fillMode: "taker",
+      openedAtMs: SIGNAL_OPEN_MS,
+      candles,
+      atrPeriod: 2,
+    });
+    expect(result.status).toBe("CLOSED_LOSS");
+    expect(result.grossR).toBe(-1);
+    expect(result.resolutionSource).toBe("ATR_TRAIL_STOP");
+  });
+
+  it("[ATR3] SHORT symmetry: arms, ratchets the stop down, banks a locked-in profit on the bounce", async () => {
+    const candles: KlineTuple[] = [
+      candle(SIGNAL_OPEN_MS, 100.5, 96, 97), // big favorable drop: mfeR after this candle = 2.0
+      candle(SIGNAL_OPEN_MS + 300000, 99, 94.5, 95.5), // further favorable: mfeR = 2.75 (peak)
+      // ATR now available: tr1=max(99-94.5,|99-97|,|94.5-97|)=4.5; tr2=max(98-95,|98-95.5|,|95-95.5|)=3;
+      // atr=(4.5+3)/2=3.75. trailLevel=close(95)+1*3.75=98.75.
+      candle(SIGNAL_OPEN_MS + 600000, 98, 95, 95),
+      // Bounces back up through the ratcheted stop (98.75) — well short of the original stop (102).
+      candle(SIGNAL_OPEN_MS + 900000, 99.5, 97, 98),
+    ];
+    const result = await walkVariantPath({
+      direction: "SHORT",
+      entryPrice: 100,
+      stopLoss: 102,
+      target: 80,
+      exitRule: "atr_trail",
+      fillMode: "taker",
+      openedAtMs: SIGNAL_OPEN_MS,
+      candles,
+      atrPeriod: 2,
+      atrMultiple: 1,
+      atrTrailArmR: 0.2,
+    });
+    expect(result.status).toBe("CLOSED_WIN");
+    expect(result.grossR).toBeCloseTo(0.625, 6); // exits at ratcheted stop 98.75 -> (100-98.75)/2
+    expect(result.resolutionSource).toBe("ATR_TRAIL_STOP");
+  });
+
+  it("[ATR4] LONG: price keeps running without ever touching the ratcheted stop -> forceCloseAtEnd still MTMs cleanly", async () => {
+    const candles: KlineTuple[] = [
+      candle(SIGNAL_OPEN_MS, 104, 99.5, 103),
+      candle(SIGNAL_OPEN_MS + 300000, 105, 102.5, 104),
+      candle(SIGNAL_OPEN_MS + 600000, 104.5, 102, 103.5), // ratchets to 101.0 (same math as ATR1)
+      candle(SIGNAL_OPEN_MS + 900000, 104, 102, 103), // stays comfortably above 101.0 — no touch
+    ];
+    const result = await walkVariantPath({
+      direction: "LONG",
+      entryPrice: 100,
+      stopLoss: 98,
+      target: 1000, // unreachable — forces path-end handling
+      exitRule: "atr_trail",
+      fillMode: "taker",
+      openedAtMs: SIGNAL_OPEN_MS,
+      candles,
+      atrPeriod: 2,
+      atrMultiple: 1,
+      atrTrailArmR: 0.2,
+      forceCloseAtEnd: true,
+    });
+    expect(result.status).toBe("CLOSED_WIN");
+    expect(result.grossR).toBeCloseTo(1.5, 6); // MTM at last close 103 -> (103-100)/2
+    expect(result.resolutionSource).toBe("MAX_HOLD_MTM");
+  });
+
+  // ===========================================================================================
+  // [PYRAMID] New function: walkPyramidOnConfirmedWinner (Tier 2 item 5, offline-only). Reuses
+  // walkVariantPath for BOTH legs' exit resolution; only the "when does leg 2 get added" crossing
+  // scan and the size-weighted R blend are new. walkVariantPath's own single-entry behavior and
+  // signature are completely untouched (proven by the unmodified tests above, all still passing).
+  // ===========================================================================================
+  it("[PYR1] adds a second entry on confirmed progress and blends both legs' R by size", async () => {
+    const candles: KlineTuple[] = [
+      candle(SIGNAL_OPEN_MS, 100.4, 99.6, 100.1), // mfeR=0.2 -> below 0.3 threshold, no cross yet
+      candle(SIGNAL_OPEN_MS + 300000, 100.8, 100.0, 100.6), // mfeR=0.4 -> CROSSES here; add @ close 100.6
+      candle(SIGNAL_OPEN_MS + 600000, 104.5, 100.2, 104.2), // leg1 TP (104) touched here; leg2 TP (110.6? no)
+      candle(SIGNAL_OPEN_MS + 900000, 101, 98.0, 98.5), // leg2's OWN stop (98.6) touched here
+    ];
+    const result = await walkPyramidOnConfirmedWinner({
+      direction: "LONG",
+      entryPrice: 100,
+      stopLoss: 98,
+      target: 104,
+      exitRule: "tp1_full",
+      fillMode: "taker",
+      openedAtMs: SIGNAL_OPEN_MS,
+      candles,
+      addFavorableR: 0.3,
+      addSizeMultiple: 0.5,
+    });
+    expect(result.leg1.status).toBe("CLOSED_WIN");
+    expect(result.leg1.grossR).toBeCloseTo(2.0, 6); // (104-100)/2
+    expect(result.addedSecondEntry).toBe(true);
+    expect(result.addOpenedAtMs).toBe(SIGNAL_OPEN_MS + 300000);
+    expect(result.addEntryPrice).toBeCloseTo(100.6, 6);
+    expect(result.leg2).not.toBeNull();
+    expect(result.leg2!.status).toBe("CLOSED_LOSS");
+    expect(result.leg2!.grossR).toBeCloseTo(-1.0, 6); // leg2 stop 98.6 -> (98.6-100.6)/2
+    expect(result.totalSize).toBeCloseTo(1.5, 6);
+    // combinedR = (2.0*1 + (-1.0)*0.5) / 1.5 = 1.5/1.5 = 1.0
+    expect(result.combinedR).toBeCloseTo(1.0, 6);
+    expect(result.status).toBe("CLOSED_WIN");
+  });
+
+  it("[PYR2] never confirms (favorable move stays below threshold) -> no add, combinedR is leg1 alone", async () => {
+    const candles: KlineTuple[] = [
+      candle(SIGNAL_OPEN_MS, 100.2, 99.5, 99.8), // mfeR=0.1, below the 0.5 threshold
+      candle(SIGNAL_OPEN_MS + 300000, 100.1, 97.5, 98), // hits the stop before ever confirming
+    ];
+    const result = await walkPyramidOnConfirmedWinner({
+      direction: "LONG",
+      entryPrice: 100,
+      stopLoss: 98,
+      target: 110,
+      exitRule: "tp1_full",
+      fillMode: "taker",
+      openedAtMs: SIGNAL_OPEN_MS,
+      candles,
+      addFavorableR: 0.5,
+    });
+    expect(result.leg1.status).toBe("CLOSED_LOSS");
+    expect(result.leg1.grossR).toBe(-1);
+    expect(result.addedSecondEntry).toBe(false);
+    expect(result.addOpenedAtMs).toBeNull();
+    expect(result.addEntryPrice).toBeNull();
+    expect(result.leg2).toBeNull();
+    expect(result.combinedR).toBe(-1);
+    expect(result.status).toBe("CLOSED_LOSS");
+  });
+
+  it("[PYR3] leg 1 NO_FILL (maker never revisited) -> passthrough, no crossing scan, no add", async () => {
+    const candles: KlineTuple[] = [
+      candle(SIGNAL_OPEN_MS, 102, 100.5, 101.5), // signal candle, no fill (maker_limit)
+      candle(SIGNAL_OPEN_MS + 300000, 106, 103, 105), // price only ever runs away — never dips to 100
+      candle(SIGNAL_OPEN_MS + 600000, 108, 105, 107),
+    ];
+    const result = await walkPyramidOnConfirmedWinner({
+      direction: "LONG",
+      entryPrice: 100,
+      stopLoss: 98,
+      target: 110,
+      exitRule: "tp1_full",
+      fillMode: "maker_limit",
+      openedAtMs: SIGNAL_OPEN_MS,
+      candles,
+    });
+    expect(result.leg1.status).toBe("NO_FILL");
+    expect(result.status).toBe("NO_FILL");
+    expect(result.addedSecondEntry).toBe(false);
+    expect(result.leg2).toBeNull();
+    expect(result.combinedR).toBeNull();
+  });
+
+  // ===========================================================================================
+  // [PBC] New exitRule: production_breakeven_control (Task 1, 2026-07-10, offline-only). Models
+  // live-execution-engine.ts's REAL maybeCloseLiveBreakevenLaneAfterCost() — the operator
+  // emergency-exit gated on LIVE_BREAKEVEN_EXIT_LANE_IDS — as a validated control. Trigger price
+  // (LONG) = entry / (1 - costPct); the position closes the first candle whose high/low range
+  // crosses that fixed price, exactly like a TP-touch check elsewhere in this file.
+  // ===========================================================================================
+  it("[PBC1] LONG: arm threshold crossed -> closes at the modeled breakeven-after-cost price", async () => {
+    // costPct=0.2 (round, hand-computable) => trigger = 100 / (1 - 0.2) = 125 exactly.
+    const candles: KlineTuple[] = [
+      candle(SIGNAL_OPEN_MS, 110, 95, 105), // favorable but below the 125 trigger; no SL either
+      candle(SIGNAL_OPEN_MS + 300000, 130, 120, 128), // crosses 125 -> closes here
+    ];
+    const result = await walkVariantPath({
+      direction: "LONG",
+      entryPrice: 100,
+      stopLoss: 75,
+      target: 200, // far away — never touched, isolates the trigger
+      exitRule: "production_breakeven_control",
+      fillMode: "taker",
+      openedAtMs: SIGNAL_OPEN_MS,
+      candles,
+      productionBreakevenCostPct: 0.2,
+    });
+    expect(result.status).toBe("CLOSED_WIN");
+    expect(result.productionBreakevenTriggerPrice).toBeCloseTo(125, 9);
+    expect(result.grossR).toBeCloseTo(1.0, 9); // (125-100)/25
+    expect(result.resolutionSource).toBe("LIVE_LONG_RUNNER_BREAKEVEN_AFTER_COST");
+    expect(result.intrabarResolutionStatus).toBe("VALID_5M_ORDERED");
+    expect(result.productionBreakevenModeledCloseQty).toBeNull(); // no qty/stepSize supplied
+  });
+
+  it("[PBC2] LONG: arm threshold never crossed -> falls through to the plain hard stop (-1), same as every other rule", async () => {
+    // Same 125 trigger (costPct=0.2, entry=100) but price only ever moves adversely and hits the
+    // hard stop at 75 — the trigger is never touched, so this degrades to a plain SL close,
+    // exactly like tp1_full/atr_trail/mfe_giveback would in an identical never-favorable path.
+    const candles: KlineTuple[] = [
+      candle(SIGNAL_OPEN_MS, 105, 90, 95), // favorable move stays well below 125; stop (75) untouched
+      candle(SIGNAL_OPEN_MS + 300000, 90, 70, 72), // hits the hard stop (75), trigger (125) untouched
+    ];
+    const result = await walkVariantPath({
+      direction: "LONG",
+      entryPrice: 100,
+      stopLoss: 75,
+      target: 200,
+      exitRule: "production_breakeven_control",
+      fillMode: "taker",
+      openedAtMs: SIGNAL_OPEN_MS,
+      candles,
+      productionBreakevenCostPct: 0.2,
+    });
+    expect(result.status).toBe("CLOSED_LOSS");
+    expect(result.grossR).toBe(-1);
+    expect(result.resolutionSource).toBe("CANDLE_WALK_SL");
+    // The modeled trigger price is still surfaced as a diagnostic even though the trade never
+    // reached it — see the VariantWalkResult field doc ("populated for EVERY outcome").
+    expect(result.productionBreakevenTriggerPrice).toBeCloseTo(125, 9);
+  });
+
+  it("[PBC3] tick/step-size rounding: floors the diagnostic close quantity to stepSize WITHOUT changing grossR", async () => {
+    // Identical geometry/candles to [PBC1] (same 1.0R win via the 125 trigger) — only the
+    // quantity-rounding diagnostic inputs differ. 1.239 floored to a 0.01 step -> 1.23, NOT 1.24
+    // (which naive Math.round — or a "round to nearest" implementation — would have produced) and
+    // NOT the raw 1.239 (which is what you'd see if rounding were skipped entirely).
+    const candles: KlineTuple[] = [
+      candle(SIGNAL_OPEN_MS, 110, 95, 105),
+      candle(SIGNAL_OPEN_MS + 300000, 130, 120, 128),
+    ];
+    const result = await walkVariantPath({
+      direction: "LONG",
+      entryPrice: 100,
+      stopLoss: 75,
+      target: 200,
+      exitRule: "production_breakeven_control",
+      fillMode: "taker",
+      openedAtMs: SIGNAL_OPEN_MS,
+      candles,
+      productionBreakevenCostPct: 0.2,
+      productionBreakevenCloseQty: 1.239,
+      productionBreakevenQtyStepSize: 0.01,
+    });
+    expect(result.status).toBe("CLOSED_WIN");
+    expect(result.grossR).toBeCloseTo(1.0, 9); // unchanged vs [PBC1] — rounding never feeds grossR
+    expect(result.productionBreakevenModeledCloseQty).toBeCloseTo(1.23, 9);
+    expect(result.productionBreakevenModeledCloseQty).not.toBeCloseTo(1.239, 9);
+    expect(result.productionBreakevenModeledCloseQty).not.toBeCloseTo(1.24, 9);
+  });
+
+  it("[PBC4] pyramiding: a second entry at a DIFFERENT price gets its own independently-derived trigger price", async () => {
+    // Reuses walkPyramidOnConfirmedWinner (existing sibling function, unmodified) with
+    // exitRule: "production_breakeven_control" for BOTH legs — walkVariantPath itself only ever
+    // replays one entry, so pyramiding is exercised at this level, exactly as the pyramid tests
+    // above already do for tp1_full.
+    //
+    // addFavorableR=0.05 (small) is crossed on candle 0 itself (mfeR there = (110-100)/10 = 1.0
+    // >> 0.05), well before leg 1's own production_breakeven_control trigger (which needs a MUCH
+    // smaller relative move, ~0.2205R at the default cost pct) fires on candle 1 — so the add
+    // happens first, at candle 0's CLOSE (100.05), a price DIFFERENT from leg 1's own entry (100).
+    const risk = 10; // entry100/stop90
+    const trigger1 = 100 / (1 - PRODUCTION_BREAKEVEN_CONTROL_COST_PCT);
+    const addEntryPrice = 100.05; // candle 0's close — where walkPyramidOnConfirmedWinner adds leg 2
+    const trigger2 = addEntryPrice / (1 - PRODUCTION_BREAKEVEN_CONTROL_COST_PCT);
+    // Sanity: both triggers must land inside candle 1's [99.9, 100.3] high/low range for this
+    // fixture to unambiguously close both legs on candle 1 (not before/after).
+    expect(trigger1).toBeGreaterThan(100);
+    expect(trigger1).toBeLessThan(100.3);
+    expect(trigger2).toBeGreaterThan(100.05);
+    expect(trigger2).toBeLessThan(100.3);
+
+    const candles: KlineTuple[] = [
+      // Signal/fill candle for BOTH legs (leg 2's add candle IS this same candle — the crossing
+      // is found here). high=110 gives mfeR=1.0 (>> addFavorableR=0.05) but stays below either
+      // trigger (~100.22/~100.27), so neither leg closes here yet.
+      candle(SIGNAL_OPEN_MS, 110, 99.8, 100.05),
+      // Both triggers (~100.2205 and ~100.2706) fall inside [99.9, 100.3] — both legs close here.
+      candle(SIGNAL_OPEN_MS + 300000, 100.3, 99.9, 100.2),
+    ];
+    const result = await walkPyramidOnConfirmedWinner({
+      direction: "LONG",
+      entryPrice: 100,
+      stopLoss: 90,
+      target: 200,
+      exitRule: "production_breakeven_control",
+      fillMode: "taker",
+      openedAtMs: SIGNAL_OPEN_MS,
+      candles,
+      addFavorableR: 0.05,
+    });
+
+    expect(result.addedSecondEntry).toBe(true);
+    expect(result.addEntryPrice).toBeCloseTo(addEntryPrice, 6);
+    expect(result.leg1.status).toBe("CLOSED_WIN");
+    expect(result.leg1.resolutionSource).toBe("LIVE_LONG_RUNNER_BREAKEVEN_AFTER_COST");
+    expect(result.leg1.productionBreakevenTriggerPrice).toBeCloseTo(trigger1, 9);
+    expect(result.leg1.grossR).toBeCloseTo((trigger1 - 100) / risk, 9);
+
+    expect(result.leg2).not.toBeNull();
+    expect(result.leg2!.status).toBe("CLOSED_WIN");
+    expect(result.leg2!.resolutionSource).toBe("LIVE_LONG_RUNNER_BREAKEVEN_AFTER_COST");
+    // Leg 2's trigger is DERIVED FROM ITS OWN entry price (100.05), not leg 1's (100) — the two
+    // are close but genuinely different numbers, proving each leg's trigger is computed
+    // independently rather than shared/inherited from leg 1.
+    expect(result.leg2!.productionBreakevenTriggerPrice).toBeCloseTo(trigger2, 9);
+    expect(result.leg2!.productionBreakevenTriggerPrice).not.toBeCloseTo(trigger1, 6);
+    expect(result.leg2!.grossR).toBeCloseTo((trigger2 - addEntryPrice) / risk, 9);
+
+    const expectedCombinedR = (result.leg1.grossR! * 1 + result.leg2!.grossR! * 1) / 2; // addSizeMultiple default = 1
+    expect(result.combinedR).toBeCloseTo(expectedCombinedR, 9);
+    expect(result.status).toBe("CLOSED_WIN");
+  });
+
+  it("[PBC5] SHORT symmetry: trigger = entry / (1 + costPct), below entry, crossed on a favorable drop", async () => {
+    // costPct=0.2, entry=100 => trigger = 100 / 1.2 = 83.3333... (SHORT: favorable = price DOWN,
+    // so the trigger sits BELOW entry, mirroring the LONG case's trigger sitting above entry).
+    const candles: KlineTuple[] = [
+      candle(SIGNAL_OPEN_MS, 105, 90, 95), // favorable but stays above the 83.333 trigger; stop (125) untouched
+      candle(SIGNAL_OPEN_MS + 300000, 95, 80, 82), // crosses below 83.333 -> closes here
+    ];
+    const result = await walkVariantPath({
+      direction: "SHORT",
+      entryPrice: 100,
+      stopLoss: 125,
+      target: 20, // far away — never touched, isolates the trigger
+      exitRule: "production_breakeven_control",
+      fillMode: "taker",
+      openedAtMs: SIGNAL_OPEN_MS,
+      candles,
+      productionBreakevenCostPct: 0.2,
+    });
+    expect(result.status).toBe("CLOSED_WIN");
+    expect(result.productionBreakevenTriggerPrice).toBeCloseTo(100 / 1.2, 9);
+    expect(result.grossR).toBeCloseTo((100 - 100 / 1.2) / 25, 9); // (100-83.333)/25
+    expect(result.resolutionSource).toBe("LIVE_LONG_RUNNER_BREAKEVEN_AFTER_COST");
+    expect(result.intrabarResolutionStatus).toBe("VALID_5M_ORDERED");
+  });
+
+  describe("[PBC-COST-FALLBACK] PRODUCTION_BREAKEVEN_CONTROL_COST_PCT env resolution (fidelity-review fix, 2026-07-10)", () => {
+    // Guards against the exact drift risk an adversarial fidelity review flagged: the control's
+    // cost constant must default to the SAME env var the real live engine reads
+    // (LIVE_ESTIMATED_CLOSE_COST_PCT), not an independently-declared default that only matches by
+    // coincidence. Uses vi.resetModules() + a fresh dynamic import since this is a module-level
+    // constant resolved once from process.env at import time.
+    const ENV_KEYS = ["PRODUCTION_BREAKEVEN_CONTROL_COST_PCT", "LIVE_ESTIMATED_CLOSE_COST_PCT"] as const;
+    const savedEnv: Record<string, string | undefined> = {};
+
+    beforeEach(() => {
+      for (const key of ENV_KEYS) savedEnv[key] = process.env[key];
+    });
+
+    afterEach(() => {
+      for (const key of ENV_KEYS) {
+        if (savedEnv[key] === undefined) delete process.env[key];
+        else process.env[key] = savedEnv[key];
+      }
+      vi.resetModules();
+    });
+
+    it("falls back to LIVE_ESTIMATED_CLOSE_COST_PCT when the control-specific override is unset", async () => {
+      delete process.env.PRODUCTION_BREAKEVEN_CONTROL_COST_PCT;
+      process.env.LIVE_ESTIMATED_CLOSE_COST_PCT = "0.005";
+      vi.resetModules();
+      const fresh = await import("../src/lib/current-guard-variant-matrix.js");
+      expect(fresh.PRODUCTION_BREAKEVEN_CONTROL_COST_PCT).toBeCloseTo(0.005, 9);
+    });
+
+    it("the control-specific override still wins when explicitly set", async () => {
+      process.env.PRODUCTION_BREAKEVEN_CONTROL_COST_PCT = "0.01";
+      process.env.LIVE_ESTIMATED_CLOSE_COST_PCT = "0.005";
+      vi.resetModules();
+      const fresh = await import("../src/lib/current-guard-variant-matrix.js");
+      expect(fresh.PRODUCTION_BREAKEVEN_CONTROL_COST_PCT).toBeCloseTo(0.01, 9);
+    });
+
+    it("defaults to 0.0022 when neither env var is set", async () => {
+      delete process.env.PRODUCTION_BREAKEVEN_CONTROL_COST_PCT;
+      delete process.env.LIVE_ESTIMATED_CLOSE_COST_PCT;
+      vi.resetModules();
+      const fresh = await import("../src/lib/current-guard-variant-matrix.js");
+      expect(fresh.PRODUCTION_BREAKEVEN_CONTROL_COST_PCT).toBeCloseTo(0.0022, 9);
+    });
+  });
+
+  // ===========================================================================================
+  // [PBC-REGRESSION] Sentinel regression tests (Task 1, 2026-07-10): each of the 6 PRE-EXISTING
+  // ablation variants (5 walkVariantPath exitRule branches + the pyramid_confirmed_winner sibling
+  // function) still produces its exact expected outcome after adding the new
+  // production_breakeven_control branch/fields — and every one of them now carries the two new
+  // VariantWalkResult fields as null (they are exitRule-gated, computed only for
+  // production_breakeven_control). This is IN ADDITION to (not a replacement for) the full
+  // pre-existing test suite above, which already exercises all 6 extensively and must also stay
+  // green.
+  // ===========================================================================================
+  it("[PBC-REG1] tp1_full unchanged: TP hit -> CLOSED_WIN, new fields null", async () => {
+    const candles: KlineTuple[] = [candle(SIGNAL_OPEN_MS, 105, 99, 104.5)];
+    const result = await walkVariantPath({
+      direction: "LONG",
+      entryPrice: 100,
+      stopLoss: 98,
+      target: 104,
+      exitRule: "tp1_full",
+      fillMode: "taker",
+      openedAtMs: SIGNAL_OPEN_MS,
+      candles,
+    });
+    expect(result.status).toBe("CLOSED_WIN");
+    expect(result.grossR).toBeCloseTo(2, 9); // (104-100)/2
+    expect(result.resolutionSource).toBe("CANDLE_WALK_TP");
+    expect(result.productionBreakevenTriggerPrice).toBeNull();
+    expect(result.productionBreakevenModeledCloseQty).toBeNull();
+  });
+
+  it("[PBC-REG2] trail_after_tp1 unchanged: TP1 touched then price returns to breakeven on a LATER candle", async () => {
+    const candles: KlineTuple[] = [
+      candle(SIGNAL_OPEN_MS, 103, 100.5, 102.8), // TP1 (102) touched; stays above entry (100)
+      candle(SIGNAL_OPEN_MS + 300000, 101, 99, 99.5), // returns to/through entry -> breakeven exit
+    ];
+    const result = await walkVariantPath({
+      direction: "LONG",
+      entryPrice: 100,
+      stopLoss: 98,
+      target: 102,
+      exitRule: "trail_after_tp1",
+      fillMode: "taker",
+      openedAtMs: SIGNAL_OPEN_MS,
+      candles,
+    });
+    expect(result.status).toBe("CLOSED_LOSS"); // runnerR=0, 0>0 is false
+    expect(result.grossR).toBe(0);
+    expect(result.resolutionSource).toBe("TRAIL_BREAKEVEN_EXIT");
+    expect(result.productionBreakevenTriggerPrice).toBeNull();
+    expect(result.productionBreakevenModeledCloseQty).toBeNull();
+  });
+
+  it("[PBC-REG3] scaleout_tp1_trail unchanged: same path as REG2 but blends 50% full-exit + 50% runner", async () => {
+    const candles: KlineTuple[] = [
+      candle(SIGNAL_OPEN_MS, 103, 100.5, 102.8),
+      candle(SIGNAL_OPEN_MS + 300000, 101, 99, 99.5),
+    ];
+    const result = await walkVariantPath({
+      direction: "LONG",
+      entryPrice: 100,
+      stopLoss: 98,
+      target: 102,
+      exitRule: "scaleout_tp1_trail",
+      fillMode: "taker",
+      openedAtMs: SIGNAL_OPEN_MS,
+      candles,
+    });
+    expect(result.status).toBe("CLOSED_WIN"); // 0.5*1 + 0.5*0 = 0.5 > 0
+    expect(result.grossR).toBeCloseTo(0.5, 9);
+    expect(result.resolutionSource).toBe("TRAIL_BREAKEVEN_EXIT");
+    expect(result.productionBreakevenTriggerPrice).toBeNull();
+    expect(result.productionBreakevenModeledCloseQty).toBeNull();
+  });
+
+  it("[PBC-REG4] mfe_giveback unchanged: hard stop hit directly (never arms) -> CLOSED_LOSS", async () => {
+    const candles: KlineTuple[] = [candle(SIGNAL_OPEN_MS, 101, 97, 98)];
+    const result = await walkVariantPath({
+      direction: "LONG",
+      entryPrice: 100,
+      stopLoss: 98,
+      target: 110,
+      exitRule: "mfe_giveback",
+      fillMode: "taker",
+      openedAtMs: SIGNAL_OPEN_MS,
+      candles,
+    });
+    expect(result.status).toBe("CLOSED_LOSS");
+    expect(result.grossR).toBe(-1);
+    expect(result.resolutionSource).toBe("CANDLE_WALK_SL");
+    expect(result.productionBreakevenTriggerPrice).toBeNull();
+    expect(result.productionBreakevenModeledCloseQty).toBeNull();
+  });
+
+  it("[PBC-REG5] atr_trail unchanged: hard stop hit directly (never arms) -> CLOSED_LOSS", async () => {
+    const candles: KlineTuple[] = [candle(SIGNAL_OPEN_MS, 101, 97, 98)];
+    const result = await walkVariantPath({
+      direction: "LONG",
+      entryPrice: 100,
+      stopLoss: 98,
+      target: 110,
+      exitRule: "atr_trail",
+      fillMode: "taker",
+      openedAtMs: SIGNAL_OPEN_MS,
+      candles,
+      atrPeriod: 2,
+    });
+    expect(result.status).toBe("CLOSED_LOSS");
+    expect(result.grossR).toBe(-1);
+    expect(result.resolutionSource).toBe("ATR_TRAIL_STOP");
+    expect(result.productionBreakevenTriggerPrice).toBeNull();
+    expect(result.productionBreakevenModeledCloseQty).toBeNull();
+  });
+
+  it("[PBC-REG6] pyramid_confirmed_winner(tp1_full) unchanged: never confirms -> single-leg outcome only", async () => {
+    const candles: KlineTuple[] = [
+      candle(SIGNAL_OPEN_MS, 100.2, 99.5, 99.8), // mfeR=0.1, below the 0.5 threshold
+      candle(SIGNAL_OPEN_MS + 300000, 100.1, 97.5, 98), // hits the stop before ever confirming
+    ];
+    const result = await walkPyramidOnConfirmedWinner({
+      direction: "LONG",
+      entryPrice: 100,
+      stopLoss: 98,
+      target: 110,
+      exitRule: "tp1_full",
+      fillMode: "taker",
+      openedAtMs: SIGNAL_OPEN_MS,
+      candles,
+      addFavorableR: 0.5,
+    });
+    expect(result.leg1.status).toBe("CLOSED_LOSS");
+    expect(result.leg1.grossR).toBe(-1);
+    expect(result.addedSecondEntry).toBe(false);
+    expect(result.leg2).toBeNull();
+    expect(result.combinedR).toBe(-1);
+    expect(result.status).toBe("CLOSED_LOSS");
+    expect(result.leg1.productionBreakevenTriggerPrice).toBeNull();
+    expect(result.leg1.productionBreakevenModeledCloseQty).toBeNull();
   });
 });

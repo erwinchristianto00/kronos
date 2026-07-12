@@ -16,6 +16,7 @@
 
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
+import { rotateJsonlIfNeeded } from "./jsonl-rotation.js";
 
 // ─── Interface ────────────────────────────────────────────────────────────────
 
@@ -123,8 +124,33 @@ export class CandidateFunnelLog {
         mkdirSync(dir, { recursive: true });
       }
       appendFileSync(this.file, JSON.stringify(entry) + "\n", "utf-8");
+      this.maybeRotate();
     } catch {
       // append failures must never throw — this log is report-only
+    }
+  }
+
+  /**
+   * 2026-07-11: this file had no cap at all — confirmed live at 33.6MB/33,926 lines and growing
+   * ~2MB/day (up to 10 candidates appended per ~7-min scan cycle), the same unbounded-growth class
+   * already root-caused and fixed today in paper-execution-router.ts. Reuses the same
+   * rotateJsonlIfNeeded helper tracker.ts already applies to scan-history*.jsonl. Kept small (5MB)
+   * because readRecentEntries() below loads this file in FULL on every call regardless of the
+   * requested window — keeping the underlying file small keeps that full read cheap. Never throws.
+   */
+  private maybeRotate(): void {
+    if (process.env.CANDIDATE_FUNNEL_LOG_ROTATION_DISABLED === "1") return;
+    try {
+      const thresholdBytes = Number(process.env.CANDIDATE_FUNNEL_LOG_ROTATION_THRESHOLD_BYTES) || 5 * 1024 * 1024;
+      const tailLines = Number(process.env.CANDIDATE_FUNNEL_LOG_ROTATION_TAIL_LINES) || 5_000;
+      const result = rotateJsonlIfNeeded(this.file, { thresholdBytes, tailLines });
+      if (result.rotated) {
+        console.warn(
+          `[accelerated-evidence-candidate-funnel-log] rotated ${this.file}: archived ${result.fromSize ?? "?"} bytes → ${result.archivePath ?? "?"}; kept ${result.linesKept ?? 0} lines`,
+        );
+      }
+    } catch {
+      // rotation failure must never block persistence
     }
   }
 

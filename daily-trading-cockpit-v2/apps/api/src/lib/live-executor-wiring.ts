@@ -134,6 +134,41 @@ export function computeNotionalPerSymbol(
   return notional;
 }
 
+/**
+ * Sums realized P&L (today + all-time) across every cross-sectional + single-symbol executor
+ * instance — the ONE place this aggregation should live, consumed by everything that needs "real
+ * P&L from lanes outside the engine's own mirror/directional ledger": the dashboard headline
+ * (routes/live.ts's /api/live/account), the global kill-switch (killSwitchTrip), and the wallet-
+ * reconciliation report. Before 2026-07-11 each of those had either no such figure at all or its
+ * own separate, incomplete summing — the kill-switch and wallet-reconciliation genuinely could
+ * never see these 11 executors' real losses/gains, only the dashboard headline had a (correct but
+ * now-duplicated) version of this exact loop.
+ *
+ * IMPORTANT — this function's own 2 parameters are NOT the only place a new executor must be
+ * registered. app.ts previously had THREE separate hand-duplicated literal arrays of the same 11
+ * executors (one each for this function, computeExternalManagedNetQty, and the per-symbol
+ * notional-cap closure `allSingleSymbolLaneExecutors`) — a 12th executor added to only 2 of the 3
+ * would silently reopen the 2026-07-09 concentration-cap incident computeNotionalPerSymbol's doc
+ * comment describes. Fixed 2026-07-11: app.ts now defines ONE shared pair of closures
+ * (allCrossSectionalLaneExecutors/allSingleSymbolLaneExecutors, right above `allSingleSymbolLaneExecutors`
+ * in that file) and passes them to every one of these consumers, so a new executor really only needs
+ * adding in that one place in app.ts — not "the two arrays passed in here."
+ */
+export function sumExternalRealizedPnlUsd(
+  crossSectionalExecutors: ReadonlyArray<CrossSectionalExecutor | null>,
+  singleSymbolExecutors: ReadonlyArray<SingleSymbolLaneExecutor | null>,
+): { today: number; allTime: number } {
+  let today = 0;
+  let allTime = 0;
+  for (const exec of [...crossSectionalExecutors, ...singleSymbolExecutors]) {
+    if (!exec) continue;
+    const status = exec.getStatus();
+    today += status.dailyRealizedUsd;
+    allTime += status.totalNetPnlUsd;
+  }
+  return { today, allTime };
+}
+
 /** 2026-07-09 fix: shared default ceiling for computeNotionalPerSymbol-based admission gates.
  *  250 permits the two legitimate lanes already stacking on one symbol today (up to ~$150 WIDE +
  *  ~$91 REGIME_COMPOSITE per symbol, observed live) while stopping a 3rd/4th lane from piling on

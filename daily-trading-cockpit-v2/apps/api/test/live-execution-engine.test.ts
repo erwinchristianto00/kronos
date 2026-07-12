@@ -26,6 +26,7 @@ import {
   symbolBookNetAvgR,
   symbolPriorityTier,
   type LiveExecutionConfig,
+  type LiveIntent,
   type LivePrivateClient,
   type PaperStoreReader,
 } from "../src/lib/live-execution-engine.js";
@@ -285,6 +286,8 @@ function makeConfig(overrides: Partial<LiveExecutionConfig> = {}): LiveExecution
     mainnetTpR: 0,
     mainnetRegimeHardCutMs: 30 * 60 * 1000,
     profitBankNetTargetUsd: 0,
+    profitBankMode: "FLAT",
+    profitBankTargetR: 1,
     regimeLossHardCutStopFraction: 0.5,
     forceMfeGiveback: false,
     losingMaxHoldMs: 0,
@@ -311,10 +314,14 @@ function makeEngine(opts: {
   paper?: PaperStoreReader;
   config?: Partial<LiveExecutionConfig>;
   isPaperOrderLiveEligible?: (order: PaperOrder, nowIso: string) => boolean;
-  getControllerSnapshot?: () => { regime: string | null; mode: string | null; capturedAt?: string | null } | null;
+  paperLaneGate?: (order: PaperOrder) => boolean | null;
+  paperLaneWeightPct?: (order: PaperOrder) => number | null;
+  getControllerSnapshot?: () => { regime: string | null; mode: string | null; confidence?: string | null; capturedAt?: string | null } | null;
   nowIso?: () => string;
   marketDataClient?: Pick<BinanceClient, "getFuturesFlow">;
   externalManagedNetQty?: () => Map<string, number>;
+  getExternalRealizedPnlUsd?: () => { today: number; allTime: number };
+  onKillSwitchEngaged?: (reason: string) => Promise<void>;
 } = {}) {
   const client = opts.client ?? new FakeLiveClient();
   const store = new LiveExecutionStore(tmp());
@@ -324,11 +331,15 @@ function makeEngine(opts: {
     store,
     paperStore: opts.paper ?? makePaperStore([]),
     isPaperOrderLiveEligible: opts.isPaperOrderLiveEligible,
+    paperLaneGate: opts.paperLaneGate,
+    paperLaneWeightPct: opts.paperLaneWeightPct,
     getControllerSnapshot: opts.getControllerSnapshot,
     nowIso: opts.nowIso ?? (() => "2099-01-02T12:00:00.000Z"),
     marketDataClient: opts.marketDataClient,
     fillConfirmRetryDelayMs: 0,
     externalManagedNetQty: opts.externalManagedNetQty,
+    getExternalRealizedPnlUsd: opts.getExternalRealizedPnlUsd,
+    onKillSwitchEngaged: opts.onKillSwitchEngaged,
   });
   return { engine, client, store };
 }
@@ -492,6 +503,16 @@ describe("parseLiveExecutionConfig", () => {
     expect(
       parseLiveExecutionConfig({ ...mainnetBase, LIVE_PROFIT_BANK_NET_TARGET_USD: "1" }).profitBankNetTargetUsd,
     ).toBe(1);
+
+    // 2026-07-12 Stage 4: profit-bank MODE is opt-in, defaults FLAT, R target defaults 1.
+    const dflt = parseLiveExecutionConfig(testnetBase);
+    expect(dflt.profitBankMode).toBe("FLAT");
+    expect(dflt.profitBankTargetR).toBe(1);
+    const rBased = parseLiveExecutionConfig({ ...testnetBase, LIVE_PROFIT_BANK_MODE: "R_BASED", LIVE_PROFIT_BANK_TARGET_R: "2.5" });
+    expect(rBased.profitBankMode).toBe("R_BASED");
+    expect(rBased.profitBankTargetR).toBe(2.5);
+    // Any non-"R_BASED" value stays FLAT (safe default).
+    expect(parseLiveExecutionConfig({ ...testnetBase, LIVE_PROFIT_BANK_MODE: "garbage" }).profitBankMode).toBe("FLAT");
   });
 
   it("mainnet profit-protection is opt-in and mainnet-only; R-based TP parses", () => {
@@ -871,6 +892,51 @@ describe("LiveExecutionEngine", () => {
     expect(closed.closeReason).toBe("PROFIT_BANK_NET_1.00");
   });
 
+  // [PROFIT-BANK-R-BASED, 2026-07-12 Stage 4 fix]: the opt-in R_BASED mode scales the bank to the
+  // position's OWN effective risk-at-stop (profitBankTargetR × effectiveRiskUsd), so a wider-stop
+  // position runs proportionally further before banking instead of truncating at a flat $1.
+  it("R_BASED profit-bank does NOT close at $1 when the position's own R target is higher (default FLAT would have)", async () => {
+    // stop 1900 on entry 2000 = 5% stop; $50 cap notional ⇒ effectiveRiskUsd ≈ $2.50. targetR=2 ⇒
+    // bank target ≈ $5.00. An own-entry unrealized of ~$2 (mark 2080) clears the FLAT $1 but NOT the
+    // $5 R-based target, so R_BASED keeps it open where FLAT would have banked.
+    const order = paperOrder({ direction: "LONG", stopLoss: 1900, takeProfitLevels: [2300] } as Partial<PaperOrder>);
+    const { engine, client, store } = makeEngine({
+      paper: makePaperStore([order]),
+      config: { profitBankNetTargetUsd: 1, profitBankMode: "R_BASED", profitBankTargetR: 2, maxNotionalPerTrade: 50 },
+    });
+    expect((await engine.arm()).ok).toBe(true);
+    await engine.tick();
+    const placedBefore = client.placed.length;
+    const eff = store.getState().intents[0]!.effectiveRiskUsd ?? 0;
+    expect(eff).toBeGreaterThan(0);
+    expect(eff).toBeLessThan(5); // clipped by the $50 cap, well below the nominal $5 risk
+
+    client.markPriceBySymbol.set("ETHUSDT", 2080); // own-entry unrealized clears $1 flat but not 2×R
+    await engine.tick();
+    expect(store.getState().intents[0]!.state).toBe("OPEN"); // R_BASED let it run
+    expect(client.placed.length).toBe(placedBefore);
+  });
+
+  it("R_BASED profit-bank DOES close once the position clears its own R target", async () => {
+    const order = paperOrder({ direction: "LONG", stopLoss: 1900, takeProfitLevels: [2300] } as Partial<PaperOrder>);
+    const { engine, client, store } = makeEngine({
+      paper: makePaperStore([order]),
+      config: { profitBankNetTargetUsd: 1, profitBankMode: "R_BASED", profitBankTargetR: 2, maxNotionalPerTrade: 50 },
+    });
+    expect((await engine.arm()).ok).toBe(true);
+    await engine.tick();
+    const eff = store.getState().intents[0]!.effectiveRiskUsd ?? 0;
+    const qty = store.getState().intents[0]!.qty;
+    // Move mark far enough that own-entry unrealized (mark-2000)*qty comfortably clears 2×eff + cost.
+    const targetUnrealized = 2 * eff + 5;
+    const mark = 2000 + targetUnrealized / qty;
+    client.markPriceBySymbol.set("ETHUSDT", mark);
+    client.flattenRealizedPnl = 2 * eff;
+    await engine.tick();
+    expect(store.getState().intents[0]!.state).toBe("CLOSED");
+    expect(store.getState().intents[0]!.closeReason).toMatch(/^PROFIT_BANK_NET_/);
+  });
+
   it("mainnet CG_WIDE_LONG_RUNNER closes immediately once unrealized clears estimated close cost", async () => {
     const order = paperOrder({
       direction: "LONG",
@@ -928,8 +994,14 @@ describe("LiveExecutionEngine", () => {
     expect(client.placed.length).toBe(placedBefore);
   });
 
-  it("CG_WIDE_FAST_LONG closes once net-positive after cost — covers the 2nd long lane, and on testnet", async () => {
-    // Emergency exit must cover BOTH removed long lanes (not just the runner) and run on testnet too.
+  it("2026-07-10 fix: CG_WIDE_FAST_LONG stays OPEN once net-positive after cost — no longer swept by the emergency-exit lane list", async () => {
+    // Regression pin for the fix itself: this test used to assert the OPPOSITE (an immediate
+    // sweep close, identical to CG_WIDE_LONG_RUNNER's). A research audit found CG_WIDE_FAST_LONG
+    // was still on LIVE_BREAKEVEN_EXIT_LANE_IDS ("removed lane" emergency-exit) despite being back
+    // in live's active lane allocation (8% weight) — every real winner was being capped near
+    // breakeven instead of ever reaching its own tp1_full target. Operator-confirmed fix: removed
+    // from the sweep list. CG_WIDE_LONG_RUNNER (genuinely not in live allocation) keeps the old
+    // behavior — see the "mainnet CG_WIDE_LONG_RUNNER closes immediately..." test above, unchanged.
     const order = paperOrder({
       direction: "LONG",
       stopLoss: 1900,
@@ -942,15 +1014,45 @@ describe("LiveExecutionEngine", () => {
     });
     expect((await engine.arm()).ok).toBe(true);
     await engine.tick();
+    const placedBefore = client.placed.length;
 
     client.markPriceBySymbol.set("ETHUSDT", 2010); // long from 2000: own-entry unrealized ~0.5 > ~0.2 close cost
-    client.flattenRealizedPnl = 0.03;
+    await engine.tick();
+
+    const intent = store.getState().intents[0]!;
+    expect(intent.state).toBe("OPEN");
+    expect(client.placed.length).toBe(placedBefore); // no new close order placed
+    expect(client.cancelAllSymbols).not.toContain("ETHUSDT");
+  });
+
+  it("2026-07-10 fix: CG_WIDE_FAST_LONG still closes normally at its own real tp1_full target (untouched by the fix)", async () => {
+    const order = paperOrder({
+      direction: "LONG",
+      stopLoss: 1900,
+      takeProfitLevels: [2300],
+      selectedLaneId: "CG_VARIANT_MATRIX:CG_WIDE_FAST_LONG",
+      variantExitRule: "tp1_full",
+    } as Partial<PaperOrder>);
+    const { engine, client, store } = makeEngine({
+      paper: makePaperStore([order]),
+      config: { env: "testnet", testnetTakeProfitUsd: 0 },
+    });
+    expect((await engine.arm()).ok).toBe(true);
+    await engine.tick();
+    const intent = store.getState().intents[0]!;
+
+    // TP1 (the real, full-size target) fills.
+    client.orderStatusById.set(intent.tp1OrderId!, "FILLED");
+    client.positionsBySymbol.set("ETHUSDT", 0);
+    client.trades = [
+      { symbol: "ETHUSDT", orderId: intent.tp1OrderId!, price: 2300, qty: 0.05, realizedPnl: 15, commission: 0.05, commissionAsset: "USDT", time: 1 },
+    ];
     await engine.tick();
 
     const closed = store.getState().intents[0]!;
     expect(closed.state).toBe("CLOSED");
-    expect(closed.closeReason).toBe("LIVE_LONG_RUNNER_BREAKEVEN_AFTER_COST");
-    expect(closed.realizedPnlUsd).toBeCloseTo(0.03, 6);
+    expect(closed.closeReason).not.toBe("LIVE_LONG_RUNNER_BREAKEVEN_AFTER_COST");
+    expect(closed.realizedPnlUsd).toBeGreaterThan(0);
   });
 
   it("testnet regime-opposition exit closes only opposing exposure that clears estimated close cost", async () => {
@@ -1148,6 +1250,46 @@ describe("LiveExecutionEngine", () => {
     await halted.engine.arm();
     await halted.engine.tick();
     expect(halted.client.placed.length).toBe(0);
+  });
+
+  it("unified lane admission consumes a fresh DIAGNOSTIC_ONLY recipe without bypassing freshness", async () => {
+    const fresh = paperOrder({
+      paperOrderId: "unified-fresh",
+      paperOrderMode: "DIAGNOSTIC_ONLY",
+      selectedLaneId: "CG_VARIANT_MATRIX:CG_WIDE_FAST_LONG",
+      direction: "LONG",
+      stopLoss: 1900,
+      takeProfitLevels: [2100],
+      createdAt: "2099-01-02T11:55:00.000Z",
+    } as Partial<PaperOrder>);
+    const stale = paperOrder({
+      paperOrderId: "unified-stale",
+      paperOrderMode: "DIAGNOSTIC_ONLY",
+      selectedLaneId: "CG_VARIANT_MATRIX:CG_WIDE_FAST_LONG",
+      direction: "LONG",
+      symbol: "BTCUSDT",
+      entryPrice: 60_000,
+      stopLoss: 58_000,
+      takeProfitLevels: [61_000],
+      createdAt: "2099-01-02T10:00:00.000Z",
+    } as Partial<PaperOrder>);
+    const client = new FakeLiveClient();
+    client.getExchangeFilters = async () => new Map([
+      ["ETHUSDT", FILTERS],
+      ["BTCUSDT", { ...FILTERS, symbol: "BTCUSDT" }],
+    ]);
+    const { engine } = makeEngine({
+      client,
+      paper: makePaperStore([fresh, stale]),
+      config: { maxPaperOrderAgeMs: 10 * 60 * 1000 },
+      paperLaneGate: (order) => order.selectedLaneId.endsWith("CG_WIDE_FAST_LONG"),
+      paperLaneWeightPct: () => 100,
+    });
+    await engine.arm();
+    await engine.tick();
+    const entries = client.placed.filter((order) => order.type === "MARKET" && !order.reduceOnly);
+    expect(entries, JSON.stringify(engine.getStatus().mirrorFunnel)).toHaveLength(1);
+    expect(entries[0]!.symbol).toBe("ETHUSDT");
   });
 
   it("skips stale HEADLINE paper orders on live mirror re-arm", async () => {
@@ -1585,6 +1727,75 @@ describe("LiveExecutionEngine", () => {
     expect((await engine.arm()).ok).toBe(false);
     engine.resetKill();
     expect((await engine.arm()).ok).toBe(true);
+  });
+
+  it("[COMBINED-PNL] kill-switch trips on combined daily loss even when the engine-native ledger alone is healthy", async () => {
+    const { engine, store } = makeEngine({
+      getExternalRealizedPnlUsd: () => ({ today: -20, allTime: -20 }),
+    });
+    await engine.arm();
+    await engine.tick(); // rolls the ledger fresh: engine-native realizedPnlUsd = 0 (healthy alone)
+    expect(store.getState().dailyLedger.realizedPnlUsd).toBe(0);
+
+    await engine.tick(); // killSwitchTrip: combined = 0 + (-20) <= -15 (dailyMaxLossUsd)
+    expect(engine.isArmed()).toBe(false);
+    expect(store.getState().killedAt).not.toBeNull();
+    expect(store.getState().killReason).toMatch(/daily max loss/);
+    expect(store.getState().killReason).toMatch(/other-lanes=-20\.00/);
+  });
+
+  it("[COMBINED-PNL] kill-switch does NOT trip when the combined daily loss stays within budget", async () => {
+    const { engine, store } = makeEngine({
+      getExternalRealizedPnlUsd: () => ({ today: -5, allTime: -5 }),
+    });
+    await engine.arm();
+    await engine.tick();
+    store.getState().dailyLedger.realizedPnlUsd = -5; // engine-native alone also within budget
+    await engine.tick(); // combined = -5 + -5 = -10, still above the -15 floor
+
+    expect(engine.isArmed()).toBe(true);
+    expect(store.getState().killedAt).toBeNull();
+  });
+
+  it("[COMBINED-PNL] kill-switch's drawdown check uses the combined (engine + external) peak and total", async () => {
+    let externalAllTime = 50;
+    const { engine, store } = makeEngine({
+      config: { dailyMaxLossUsd: 999 }, // isolate: only the drawdown branch should be able to trip
+      getExternalRealizedPnlUsd: () => ({ today: 0, allTime: externalAllTime }),
+    });
+    await engine.arm();
+    await engine.tick(); // establishes combinedRealizedPeakUsd = 0 (engine) + 50 (external)
+    expect(store.getState().combinedRealizedPeakUsd).toBe(50);
+    expect(engine.isArmed()).toBe(true);
+
+    externalAllTime = 5; // external lanes gave back $45 — drawdown from peak = 50 - 5 = 45 >= 40
+    await engine.tick();
+
+    expect(engine.isArmed()).toBe(false);
+    expect(store.getState().killReason).toMatch(/max drawdown hit/);
+    expect(store.getState().killReason).toMatch(/other-lanes=5\.00/);
+  });
+
+  it("[COMBINED-PNL] resetKill rebases combinedRealizedPeakUsd too (else a stale peak instantly re-trips drawdown)", async () => {
+    let externalAllTime = 50;
+    const { engine, store } = makeEngine({
+      config: { dailyMaxLossUsd: 999 },
+      getExternalRealizedPnlUsd: () => ({ today: 0, allTime: externalAllTime }),
+    });
+    await engine.arm();
+    await engine.tick(); // peak = 50
+
+    externalAllTime = 5; // drawdown of 45 >= 40 trips
+    await engine.tick();
+    expect(store.getState().killedAt).not.toBeNull();
+
+    engine.resetKill();
+    expect(store.getState().combinedRealizedPeakUsd).toBe(5); // rebased to the current combined total, not left at 50
+
+    expect((await engine.arm()).ok).toBe(true);
+    await engine.tick(); // if combinedRealizedPeakUsd had stayed 50, this would immediately re-trip
+    expect(engine.isArmed()).toBe(true);
+    expect(store.getState().killedAt).toBeNull();
   });
 
   it("kill-switch flatten books its realized P&L to the intent and the ledger (was silently dropped)", async () => {
@@ -3136,6 +3347,41 @@ describe("netted-position closes act on the ENGINE SHARE only (never the basket'
     expect(flat.quantity).toBeCloseTo(q, 9);
   });
 
+  // [KILL-RESPONSE, 2026-07-12 fix]: the kill-switch TRIGGER became portfolio-wide on 2026-07-11
+  // (sums all 11 executors' P&L) but the RESPONSE only flattened the engine's own intents — the
+  // other 11 executors kept trading. The onKillSwitchEngaged callback closes them via their OWN
+  // orderly close mechanics (never blanket symbol flattens).
+  it("[KILL-RESPONSE] engageKillSwitch invokes onKillSwitchEngaged after flattening its own intents", async () => {
+    const calls: string[] = [];
+    const client = new FakeLiveClient();
+    const { engine } = makeEngine({
+      client,
+      onKillSwitchEngaged: async (reason) => {
+        calls.push(reason);
+      },
+    });
+    await engine.arm();
+    await engine.kill("portfolio breaker test");
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toContain("portfolio breaker test");
+    expect(engine.getStatus().killedAt).not.toBeNull();
+  });
+
+  it("[KILL-RESPONSE] a throwing onKillSwitchEngaged never breaks the engine's own kill path", async () => {
+    const client = new FakeLiveClient();
+    const { engine } = makeEngine({
+      client,
+      onKillSwitchEngaged: async () => {
+        throw new Error("executor close blew up");
+      },
+    });
+    await engine.arm();
+    await engine.kill("breaker with failing callback");
+    const status = engine.getStatus();
+    expect(status.killedAt).not.toBeNull(); // kill still latched
+    expect(status.reconcileIssues.some((issue: string) => issue.includes("kill-switch executor-close callback failed"))).toBe(true);
+  });
+
   it("[NETTED-FLAT-SETTLE] settles an intent whose engine share is gone even though the basket still holds the symbol", async () => {
     const { engine, client, store } = await openNettedShort();
     // Intent's own exposure was stopped out; only the basket's leg remains in the netted position.
@@ -3496,6 +3742,360 @@ describe("manualCloseIntent (operator Close button — real-money manual control
     const res = await engine.manualCloseIntent("paper-nope");
     expect(res.ok).toBe(false);
     expect(client.placed.length).toBe(before);
+  });
+});
+
+describe("real-money reentrancy + silent-P&L-loss audit fixes (2026-07-11)", () => {
+  function openOneVia(client: FakeLiveClient) {
+    const order = paperOrder({
+      symbol: "ETHUSDT",
+      selectedLaneId: "CG_VARIANT_MATRIX:CG_WIDE_FAST_SHORT",
+      direction: "SHORT",
+      entryPrice: 2000,
+      stopLoss: 2100,
+    } as Partial<PaperOrder>);
+    return makeEngine({ client, paper: makePaperStore([order]) });
+  }
+
+  it("[RACE-1] manualCloseIntent refuses a concurrent call on the SAME intent instead of double-flattening it", async () => {
+    class SlowGetPositionsClient extends FakeLiveClient {
+      onFirstGetPositions: (() => Promise<unknown>) | null = null;
+      async getPositions(symbol?: string) {
+        if (this.onFirstGetPositions) {
+          const fn = this.onFirstGetPositions;
+          this.onFirstGetPositions = null;
+          await fn(); // simulates a second manualCloseIntent() racing in during this exact await
+        }
+        return super.getPositions(symbol);
+      }
+    }
+    const client = new SlowGetPositionsClient();
+    const { engine, store } = openOneVia(client);
+    expect((await engine.arm()).ok).toBe(true);
+    await engine.tick();
+    const intent = store.getState().intents[0]!;
+
+    let secondResult: { ok: boolean; reason: string | null } | null = null;
+    client.onFirstGetPositions = async () => {
+      secondResult = await engine.manualCloseIntent(intent.paperOrderId);
+    };
+    const firstResult = await engine.manualCloseIntent(intent.paperOrderId);
+
+    expect(firstResult.ok).toBe(true);
+    expect(secondResult).not.toBeNull();
+    expect(secondResult!.ok).toBe(false);
+    expect(secondResult!.reason).toMatch(/already being processed/);
+    // Only ONE real flatten order reached the exchange, not two — the bug this closes would have
+    // let both calls independently flatten + book realized P&L for the same real position.
+    expect(client.placed.filter((p) => p.newClientOrderId?.startsWith("dtc-opcl-"))).toHaveLength(1);
+  });
+
+  it("[RACE-2] engageKillSwitch (kill()) refuses to double-process while already engaging", async () => {
+    const client = new FakeLiveClient();
+    const { engine, store } = openOneVia(client);
+    expect((await engine.arm()).ok).toBe(true);
+    await engine.tick();
+    expect(store.getState().intents).toHaveLength(1);
+
+    // JS is single-threaded: calling kill() twice back-to-back WITHOUT awaiting either runs the
+    // first call synchronously up to its first internal await (killSwitchEngaging is set to true
+    // BEFORE that await) — the second call then starts synchronously too, sees the flag already
+    // set, and returns immediately. This is exactly the "tick()'s auto-trip + a manual kill()
+    // arrive at the same moment" race the fix closes.
+    const p1 = engine.kill("first kill");
+    const p2 = engine.kill("second concurrent kill");
+    await Promise.all([p1, p2]);
+
+    // Only ONE kill-flatten order reached the exchange, not two.
+    expect(client.placed.filter((p) => p.newClientOrderId?.startsWith("dtc-kill-"))).toHaveLength(1);
+    expect(store.getState().intents[0]!.state).toBe("KILLED");
+  });
+
+  it("[SILENT-LOSS-1] a getUserTrades failure during manualCloseIntent leaves P&L UNKNOWN (never a fabricated 0/scratch), but still counts as a loss for the kill-switch streak", async () => {
+    class FailingTradesClient extends FakeLiveClient {
+      async getUserTrades(): Promise<FuturesUserTrade[]> {
+        throw new Error("simulated getUserTrades outage");
+      }
+    }
+    const client = new FailingTradesClient();
+    const { engine, store } = openOneVia(client);
+    expect((await engine.arm()).ok).toBe(true);
+    await engine.tick();
+    const intent = store.getState().intents[0]!;
+    const dailyBefore = { ...store.getState().dailyLedger };
+    const totalBefore = store.getState().totalRealizedPnlUsd;
+    const consecutiveBefore = store.getState().consecutiveLosses;
+
+    const res = await engine.manualCloseIntent(intent.paperOrderId);
+
+    expect(res.ok).toBe(true);
+    expect(res.realizedPnlUsd).toBeNull();
+    expect(intent.realizedPnlUsd).toBeNull();
+    expect(intent.lastError).toMatch(/UNKNOWN/);
+    // Dollar totals untouched — the real number is genuinely unknown, wallet-reconciliation is
+    // the safety net for it, not a fabricated $0 here.
+    expect(store.getState().dailyLedger.realizedPnlUsd).toBe(dailyBefore.realizedPnlUsd);
+    expect(store.getState().totalRealizedPnlUsd).toBe(totalBefore);
+    // But the loss-streak IS bumped — an unknown outcome must never read as a neutral scratch.
+    expect(store.getState().consecutiveLosses).toBe(consecutiveBefore + 1);
+    expect(store.getState().dailyLedger.losses).toBe((dailyBefore.losses ?? 0) + 1);
+  });
+
+  it("[SILENT-LOSS-2] a failed stop/breakeven order query during settlement leaves P&L UNKNOWN instead of silently booking the real stop-out as a $0 scratch", async () => {
+    class FailingAlgoQueryClient extends FakeLiveClient {
+      async queryAlgoOrder(): Promise<FuturesAlgoOrder> {
+        throw new Error("simulated queryAlgoOrder outage");
+      }
+    }
+    const client = new FailingAlgoQueryClient();
+    const { engine, store } = openOneVia(client);
+    expect((await engine.arm()).ok).toBe(true);
+    await engine.tick();
+    const intent = store.getState().intents[0]!;
+    expect(intent.stopOrderId).toBeTruthy(); // sanity: a real protective stop was placed on entry
+    const dailyBefore = { ...store.getState().dailyLedger };
+    const consecutiveBefore = store.getState().consecutiveLosses;
+
+    // Simulate the stop having triggered and flattened the position on the exchange, with the
+    // real closing trade booked under the STOP's own fill order id (not the entry order id) —
+    // settleClosedIntent can only discover that id via queryAlgoOrder(stopOrderId), which is now
+    // failing, so the old code's ourOrderIds set would miss this trade entirely and compute net=0.
+    client.positionsBySymbol.set("ETHUSDT", 0);
+    client.trades = [{ orderId: "stop-fill-order-id", realizedPnl: -12, commission: 0.5 } as never];
+    await engine.tick();
+
+    const closed = store.getState().intents[0]!;
+    expect(closed.state).toBe("CLOSED");
+    expect(closed.realizedPnlUsd).toBeNull(); // NOT a fabricated 0 — the real -12 loss is unrecoverable here
+    expect(closed.lastError).toMatch(/UNKNOWN/);
+    expect(store.getState().dailyLedger.realizedPnlUsd).toBe(dailyBefore.realizedPnlUsd);
+    expect(store.getState().consecutiveLosses).toBe(consecutiveBefore + 1);
+  });
+});
+
+describe("LiveExecutionStore prune on save (2026-07-11 OOM fix — mainnet's real trade-intent ledger)", () => {
+  function minimalClosedIntent(id: string, createdAtMs: number): LiveIntent {
+    const iso = new Date(createdAtMs).toISOString();
+    return {
+      paperOrderId: id,
+      symbol: "ETHUSDT",
+      direction: "SHORT",
+      state: "CLOSED",
+      qty: 1,
+      tp1Qty: 0,
+      plannedEntryPrice: 2000,
+      stopLossPrice: 2100,
+      tp1Price: 1900,
+      filledEntryPrice: 2000,
+      entryOrderId: "1",
+      stopOrderId: null,
+      tp1OrderId: null,
+      beStopOrderId: null,
+      realizedPnlUsd: 1,
+      feesUsd: 0,
+      createdAt: iso,
+      updatedAt: iso,
+      closedAt: iso,
+      closeReason: "OPERATOR_CLOSE",
+      lastError: null,
+    };
+  }
+
+  it("keeps every non-terminal (OPEN/etc.) intent and drops only the OLDEST terminal ones beyond the cap", () => {
+    const dir = mkdtempSync(join(tmpdir(), "dtc-live-prune-"));
+    dirs.push(dir);
+    const store = new LiveExecutionStore(dir);
+    const MAX = 2000; // default LIVE_MAX_STORED_INTENTS
+    const extra = 5;
+    for (let i = 0; i < MAX + extra; i++) {
+      store.getState().intents.push(minimalClosedIntent(`closed-${i}`, 1_000_000_000_000 + i * 60_000));
+    }
+    // Deliberately OLDER than every closed intent above, to prove OPEN status alone (not recency)
+    // is what protects an intent from the terminal-only prune.
+    store.getState().intents.push({
+      ...minimalClosedIntent("open-1", 1),
+      state: "OPEN",
+      realizedPnlUsd: null,
+      closedAt: null,
+      closeReason: null,
+    });
+
+    store.save();
+
+    const state = store.getState();
+    expect(state.intents.filter((i) => i.state === "OPEN")).toHaveLength(1);
+    expect(state.intents.some((i) => i.paperOrderId === "open-1")).toBe(true);
+    const terminal = state.intents.filter((i) => i.state !== "OPEN");
+    expect(terminal).toHaveLength(MAX);
+    for (let i = 0; i < extra; i++) {
+      expect(state.intents.some((i) => i.paperOrderId === `closed-${i}`)).toBe(false);
+    }
+    expect(state.intents.some((i) => i.paperOrderId === `closed-${extra}`)).toBe(true);
+    expect(state.intents.some((i) => i.paperOrderId === `closed-${MAX + extra - 1}`)).toBe(true);
+
+    const reloaded = new LiveExecutionStore(dir);
+    expect(reloaded.getState().intents).toHaveLength(1 + MAX);
+  });
+});
+
+describe("MAE/regime-exit persistence (Tier 2 audit, purely additive — new recorded fields only)", () => {
+  it("REGRESSION: maxFavorableR still behaves exactly as before (unchanged peak, same arm/giveback close) — and maxAdverseR stays 0 on a path that never goes adverse", async () => {
+    // Identical scenario to the pre-existing "mfe_giveback lane tracks favorable R…" test: entry
+    // 2000/short, +1R favorable, then a retrace to +0.5R that triggers the giveback close. Price
+    // never crosses to adverse (favorableR is 0.5-1.0 throughout), so maxAdverseR must stay at its
+    // floor (0) the whole time — this is the documented "never goes adverse ⇒ stays at 0" case.
+    const order = paperOrder({
+      selectedLaneId: "CG_VARIANT_MATRIX:CG_MFE_GIVEBACK",
+      variantExitRule: "mfe_giveback",
+      takeProfitLevels: [1700],
+    } as Partial<PaperOrder>);
+    const { engine, client, store } = makeEngine({ paper: makePaperStore([order]) });
+    expect((await engine.arm()).ok).toBe(true);
+
+    await engine.tick();
+    expect(client.placed.map((p) => p.type)).toEqual(["MARKET", "STOP_MARKET", "LIMIT"]);
+    // Freshly-opened this tick: manageMfeGiveback (the shared tick hook) hasn't run against it yet,
+    // same as maxFavorableR — both stay at their construction-time null until the next tick.
+    expect(store.getState().intents[0]!.maxFavorableR).toBeNull();
+    expect(store.getState().intents[0]!.maxAdverseR).toBeNull();
+
+    client.markPriceBySymbol.set("ETHUSDT", 1900); // +1R favorable on a short
+    await engine.tick();
+    expect(store.getState().intents[0]!.state).toBe("OPEN");
+    expect(store.getState().intents[0]!.maxFavorableR).toBeCloseTo(1, 6); // exact pre-existing assertion
+    expect(store.getState().intents[0]!.maxAdverseR).toBe(0); // still never adverse
+
+    client.markPriceBySymbol.set("ETHUSDT", 1950); // retraces to +0.5R; default giveback threshold
+    client.flattenRealizedPnl = 2.2;
+    await engine.tick();
+
+    const closed = store.getState().intents[0]!;
+    expect(closed.state).toBe("CLOSED");
+    expect(closed.closeReason).toBe("MFE_GIVEBACK_EXIT"); // exact pre-existing assertion
+    expect(closed.realizedPnlUsd).toBeCloseTo(2.2, 6); // exact pre-existing assertion
+    expect(closed.maxFavorableR).toBeCloseTo(1, 6); // peak untouched by the new trough tracking
+    expect(closed.maxAdverseR).toBe(0); // favorableR was 0.5 at close — never negative
+    expect(store.getState().dailyLedger.wins).toBe(1); // exact pre-existing assertion
+  });
+
+  it("maxAdverseR tracks the running WORST (most negative) favorableR on a synthetic price path, independent of maxFavorableR's own peak", async () => {
+    // Keep favorableR below the 0.75R arm threshold throughout so the giveback close never fires —
+    // this isolates the tracking math (peak/trough) from the exit DECISION entirely.
+    const order = paperOrder({
+      selectedLaneId: "CG_VARIANT_MATRIX:CG_MFE_GIVEBACK",
+      variantExitRule: "mfe_giveback",
+      takeProfitLevels: [1700],
+    } as Partial<PaperOrder>);
+    const { engine, client, store } = makeEngine({ paper: makePaperStore([order]) });
+    expect((await engine.arm()).ok).toBe(true);
+    await engine.tick(); // mirror/open at entry 2000, stop 2100 (short; risk = 100)
+
+    // Tick: price moves ADVERSE first (mark 2050 ⇒ favorableR = (2000-2050)/100 = -0.5).
+    client.markPriceBySymbol.set("ETHUSDT", 2050);
+    await engine.tick();
+    let intent = store.getState().intents[0]!;
+    expect(intent.state).toBe("OPEN");
+    expect(intent.maxFavorableR).toBe(0); // never favorable yet — peak stays at its floor
+    expect(intent.maxAdverseR).toBeCloseTo(-0.5, 6); // worst point recorded
+
+    // Tick: price recovers to favorable but well under the arm threshold (mark 1980 ⇒ +0.2R).
+    client.markPriceBySymbol.set("ETHUSDT", 1980);
+    await engine.tick();
+    intent = store.getState().intents[0]!;
+    expect(intent.state).toBe("OPEN");
+    expect(intent.maxFavorableR).toBeCloseTo(0.2, 6);
+    expect(intent.maxAdverseR).toBeCloseTo(-0.5, 6); // recovery does NOT improve the stored trough
+
+    // Tick: price makes a NEW, deeper adverse excursion (mark 2080 ⇒ -0.8R).
+    client.markPriceBySymbol.set("ETHUSDT", 2080);
+    await engine.tick();
+    intent = store.getState().intents[0]!;
+    expect(intent.state).toBe("OPEN");
+    expect(intent.maxFavorableR).toBeCloseTo(0.2, 6); // peak unaffected by the new worse trough
+    expect(intent.maxAdverseR).toBeCloseTo(-0.8, 6); // trough only updates when this tick is worse
+  });
+
+  it("stamps the exit-side regime snapshot with the LIVE controller state at close time (not the frozen entry-time regime), and leaves it absent while an intent has never closed", async () => {
+    // Intent A: stays OPEN across multiple ticks — the exit-side fields must never appear.
+    const openOrder = paperOrder({
+      paperOrderId: "paper-open-forever",
+      regime: "Bearish",
+      controllerMode: "SHORT_ONLY",
+      controllerConfidence: "MEDIUM",
+    } as Partial<PaperOrder>);
+    const { engine: openEngine, store: openStore } = makeEngine({
+      paper: makePaperStore([openOrder]),
+      getControllerSnapshot: () => ({
+        regime: "Mixed",
+        mode: "VALIDATION_ONLY",
+        confidence: "LOW",
+        capturedAt: "2099-01-02T12:00:00.000Z",
+      }),
+    });
+    expect((await openEngine.arm()).ok).toBe(true);
+    await openEngine.tick();
+    await openEngine.tick(); // a second tick — still never closed
+    const stillOpen = openStore.getState().intents[0]!;
+    expect(stillOpen.state).toBe("OPEN");
+    expect(stillOpen.exitRegime).toBeUndefined();
+    expect(stillOpen.exitControllerMode).toBeUndefined();
+    expect(stillOpen.exitControllerConfidence).toBeUndefined();
+    // Entry-side snapshot is the frozen ENTRY value — unaffected by the live "Mixed" controller.
+    expect(stillOpen.sourcePaperOrders?.[0]?.regime).toBe("Bearish");
+
+    // Intent B: closes via the operator manual-close path. The live controller reads "Mixed" at
+    // this moment, deliberately different from the "Bullish" entry-time regime, to prove the exit
+    // stamp reads CURRENT state via currentControllerSnapshot(), not the stale entry snapshot.
+    const closingOrder = paperOrder({
+      paperOrderId: "paper-will-close",
+      regime: "Bullish",
+      controllerMode: "LONG_ONLY",
+      controllerConfidence: "HIGH",
+    } as Partial<PaperOrder>);
+    const { engine: closeEngine, store: closeStore } = makeEngine({
+      paper: makePaperStore([closingOrder]),
+      getControllerSnapshot: () => ({
+        regime: "Mixed",
+        mode: "VALIDATION_ONLY",
+        confidence: "LOW",
+        capturedAt: "2099-01-02T12:00:00.000Z",
+      }),
+    });
+    expect((await closeEngine.arm()).ok).toBe(true);
+    await closeEngine.tick();
+    const beforeClose = closeStore.getState().intents[0]!;
+    expect(beforeClose.exitRegime).toBeUndefined();
+
+    const res = await closeEngine.manualCloseIntent(beforeClose.paperOrderId);
+    expect(res.ok).toBe(true);
+    const closed = closeStore.getState().intents[0]!;
+    expect(closed.state).toBe("CLOSED");
+    expect(closed.exitRegime).toBe("Mixed");
+    expect(closed.exitControllerMode).toBe("VALIDATION_ONLY");
+    expect(closed.exitControllerConfidence).toBe("LOW");
+    // Entry-side snapshot remains the frozen ENTRY regime ("Bullish"), untouched by the exit stamp.
+    expect(closed.sourcePaperOrders?.[0]?.regime).toBe("Bullish");
+  });
+
+  it("exit-side regime snapshot fields are null (never the stale entry snapshot) when no live controller is wired at close", async () => {
+    const order = paperOrder({
+      regime: "Bullish",
+      controllerMode: "LONG_ONLY",
+      controllerConfidence: "HIGH",
+    } as Partial<PaperOrder>);
+    // No getControllerSnapshot passed ⇒ engine defaults to () => null (see constructor).
+    const { engine, store } = makeEngine({ paper: makePaperStore([order]) });
+    expect((await engine.arm()).ok).toBe(true);
+    await engine.tick();
+    const intent = store.getState().intents[0]!;
+
+    const res = await engine.manualCloseIntent(intent.paperOrderId);
+    expect(res.ok).toBe(true);
+    const closed = store.getState().intents[0]!;
+    expect(closed.state).toBe("CLOSED");
+    expect(closed.exitRegime).toBeNull();
+    expect(closed.exitControllerMode).toBeNull();
+    expect(closed.exitControllerConfidence).toBeNull();
   });
 });
 

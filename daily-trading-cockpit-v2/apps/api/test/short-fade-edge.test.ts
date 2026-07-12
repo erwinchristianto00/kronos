@@ -19,6 +19,7 @@ import {
   SF_EXEC_LEVERAGE,
   SF_EXEC_MAX_SIGNAL_AGE_MS,
   SF_EXEC_DAILY_MAX_LOSS_USD,
+  SF_EXEC_MAX_CONCURRENT,
   type ShortFadeObservation,
 } from "../src/lib/short-fade-edge.js";
 import type { CrowdingSnapshot } from "../src/lib/derivatives-crowding.js";
@@ -428,6 +429,7 @@ describe("short-fade — live execution wiring adapters", () => {
       "SHORT_FADE_EXEC_LEVERAGE",
       "SHORT_FADE_EXEC_MAX_SIGNAL_AGE_MS",
       "SHORT_FADE_EXEC_DAILY_MAX_LOSS_USD",
+      "SHORT_FADE_EXEC_MAX_CONCURRENT",
     ] as const;
     const saved: Record<string, string | undefined> = {};
 
@@ -473,6 +475,19 @@ describe("short-fade — live execution wiring adapters", () => {
       expect(SF_EXEC_DAILY_MAX_LOSS_USD()).toBe(0);
       process.env.SHORT_FADE_EXEC_DAILY_MAX_LOSS_USD = "15";
       expect(SF_EXEC_DAILY_MAX_LOSS_USD()).toBe(15);
+    });
+
+    it("SF_EXEC_MAX_CONCURRENT defaults to 1 (matching the executor's own prior hardcoded default) and honors a positive override", () => {
+      expect(SF_EXEC_MAX_CONCURRENT()).toBe(1);
+      process.env.SHORT_FADE_EXEC_MAX_CONCURRENT = "5";
+      expect(SF_EXEC_MAX_CONCURRENT()).toBe(5);
+    });
+
+    it("SF_EXEC_MAX_CONCURRENT ignores <1 or garbage and falls back to the default", () => {
+      process.env.SHORT_FADE_EXEC_MAX_CONCURRENT = "0";
+      expect(SF_EXEC_MAX_CONCURRENT()).toBe(1);
+      process.env.SHORT_FADE_EXEC_MAX_CONCURRENT = "not-a-number";
+      expect(SF_EXEC_MAX_CONCURRENT()).toBe(1);
     });
   });
 });

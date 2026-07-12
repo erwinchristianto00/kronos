@@ -220,6 +220,30 @@ export interface FuturesUserTrade {
   time: number;
 }
 
+/**
+ * One row of Binance's /fapi/v1/income ledger (used by wallet-reconciliation.ts's report-only
+ * income-vs-internal-ledger check — see that module's doc comment for the safety rationale).
+ * incomeType is a known Binance vocabulary (REALIZED_PNL, FUNDING_FEE, COMMISSION, TRANSFER,
+ * INSURANCE_CLEAR, …) but kept as `string` here rather than a closed union so an exchange-added
+ * type we haven't seen yet still comes through instead of being dropped or throwing.
+ *
+ * tranId is NOT run through preserveOrderIdPrecision (that guard is intentionally scoped to the 3
+ * fields actually used to act on an order/algo — orderId/algoId/actualOrderId). tranId is a
+ * diagnostic transaction id only: this client never uses it to query, cancel, or match an order,
+ * and the reconciliation math below never keys on it either, so a hypothetical precision loss here
+ * has no safety consequence (unlike the real orderId incident that guard exists for).
+ */
+export interface FuturesIncomeEntry {
+  symbol: string;
+  incomeType: string;
+  /** Signed USD-equivalent amount as Binance reports it (e.g. COMMISSION is typically negative). */
+  income: number;
+  asset: string;
+  time: number;
+  tranId: string;
+  info: string;
+}
+
 export interface PlaceOrderParams {
   symbol: string;
   side: "BUY" | "SELL";
@@ -229,8 +253,14 @@ export interface PlaceOrderParams {
   stopPrice?: number; // STOP_MARKET / TAKE_PROFIT_MARKET
   reduceOnly?: boolean;
   timeInForce?: "GTC" | "IOC" | "FOK";
-  /** Engine-supplied idempotency key (derived from the paper order id). */
-  newClientOrderId?: string;
+  /** Engine-supplied idempotency key (derived from the paper order id). REQUIRED (2026-07-12 fix):
+   *  this file's own top-of-file safety design ("POST/DELETE NEVER auto-retry... the engine passes
+   *  newClientOrderId so a retry-by-engine is exchange-side idempotent") depended entirely on every
+   *  caller supplying one, but nothing enforced it while this field was optional — every real call
+   *  site already supplies it (grepped: zero omissions across src/ and test/), so this closes the
+   *  gap with zero behavior change and makes a future omission a compile error instead of a silent
+   *  non-idempotent retry risk. */
+  newClientOrderId: string;
   workingType?: "CONTRACT_PRICE" | "MARK_PRICE";
 }
 
@@ -290,7 +320,15 @@ function decimalsForStep(step: number, fallback: number): number {
   return dot === -1 ? 0 : Math.min(12, text.length - dot - 1);
 }
 
-function roundToStep(value: number, step: number, mode: "down" | "up"): number {
+/**
+ * Exported (2026-07-10, Task 1) purely so the offline exit-ablation harness
+ * (current-guard-variant-matrix.ts's "production_breakeven_control" exitRule) can reuse the
+ * EXACT SAME floor-to-stepSize quantity rounding that placeOrder() (below) applies to every real
+ * reduce-only close order, instead of re-implementing the epsilon/floor logic a second time. Pure
+ * visibility change only — the function body and every existing call site in this file are
+ * unchanged, so this does not alter any live order-placement/close behavior.
+ */
+export function roundToStep(value: number, step: number, mode: "down" | "up"): number {
   if (!(step > 0) || !Number.isFinite(value)) return value;
   const rawSteps = value / step;
   const steps = mode === "up" ? Math.ceil(rawSteps - 1e-9) : Math.floor(rawSteps + 1e-9);
@@ -463,7 +501,16 @@ export class BinanceFuturesPrivateClient {
           lastError = error;
           const type = error instanceof BinanceFuturesPrivateError ? error.failureType : "network";
           if (error instanceof BinanceFuturesPrivateError && error.binanceCode === -1021 && attempt < GET_MAX_RETRIES) {
-            await this.forceTimeSync();
+            // 2026-07-12 fix: forceTimeSync() itself hits the network (/fapi/v1/time) and can throw —
+            // previously that throw escaped this catch block uncaught, aborting the ENTIRE retry loop
+            // (never reaching `throw lastError`) and replacing the meaningful original -1021 with an
+            // unrelated network error. Best-effort only: worst case the stale offset still triggers
+            // another -1021 next attempt, caught the same way, same as if this resync had never run.
+            try {
+              await this.forceTimeSync();
+            } catch {
+              /* best-effort re-sync — original -1021 still drives the retry below */
+            }
             this.assertClockSkewOk();
             await new Promise((r) => setTimeout(r, 150 * (attempt + 1)));
             continue;
@@ -479,7 +526,13 @@ export class BinanceFuturesPrivateClient {
       return await this.rawRequest(method, buildSignedUrl(), true);
     } catch (error) {
       if (error instanceof BinanceFuturesPrivateError && error.binanceCode === -1021) {
-        await this.forceTimeSync();
+        // Best-effort resync for the NEXT signed call — this call is failing with -1021 regardless,
+        // so a resync failure here must not replace the original error being rethrown below.
+        try {
+          await this.forceTimeSync();
+        } catch {
+          /* best-effort — see GET branch above */
+        }
       }
       throw error;
     }
@@ -489,7 +542,19 @@ export class BinanceFuturesPrivateClient {
 
   async ensureTimeSync(): Promise<void> {
     if (this.nowMs() - this.lastTimeSyncAtMs < TIME_SYNC_TTL_MS) return;
-    await this.forceTimeSync();
+    try {
+      await this.forceTimeSync();
+    } catch (error) {
+      // 2026-07-12 fix: this ran unconditionally before EVERY signed request, uncaught — a single
+      // transient hiccup hitting the public /fapi/v1/time endpoint aborted the request outright with
+      // ZERO retry, even for the GET path which otherwise retries several times. Binance's own
+      // recvWindow/signature check (and assertClockSkewOk below, using the LAST successfully measured
+      // skew) are the actual safety net against a truly-drifted clock, so a periodic-refresh miss is
+      // safe to ride out on the stale-but-recent offset. Only fail closed when there has NEVER been a
+      // successful sync (lastTimeSyncAtMs still 0): lastMeasuredSkewMs's 0 default would otherwise
+      // silently pass assertClockSkewOk() as if skew were known-good when it is actually unknown.
+      if (this.lastTimeSyncAtMs === 0) throw error;
+    }
   }
 
   private async forceTimeSync(): Promise<void> {
@@ -708,6 +773,37 @@ export class BinanceFuturesPrivateClient {
       commission: toNum((t as { commission?: unknown }).commission),
       commissionAsset: String((t as { commissionAsset?: unknown }).commissionAsset ?? ""),
       time: toNum((t as { time?: unknown }).time),
+    }));
+  }
+
+  /**
+   * Account income ledger (/fapi/v1/income) — realized PnL, funding fees, commission, and any
+   * other exchange-side income/expense entries, account-wide (no symbol filter, matching how the
+   * engine's own internal ledger accumulates across all symbols/lanes). READ-ONLY signed GET,
+   * same requestSigned/retry path as every other GET here. Used exclusively by
+   * wallet-reconciliation.ts to compare against the internal LiveDailyLedger — never by any
+   * order-placement or risk-control path.
+   */
+  async getIncomeHistory(
+    opts: { startTime?: number; endTime?: number; incomeType?: string; limit?: number } = {},
+  ): Promise<FuturesIncomeEntry[]> {
+    const parsed = await this.requestSigned("GET", "/fapi/v1/income", {
+      startTime: opts.startTime,
+      endTime: opts.endTime,
+      incomeType: opts.incomeType,
+      limit: opts.limit ?? 1000,
+    });
+    if (!Array.isArray(parsed)) return [];
+    return parsed.map((entry) => ({
+      symbol: String((entry as { symbol?: unknown }).symbol ?? ""),
+      incomeType: String((entry as { incomeType?: unknown }).incomeType ?? ""),
+      income: toNum((entry as { income?: unknown }).income),
+      asset: String((entry as { asset?: unknown }).asset ?? ""),
+      time: toNum((entry as { time?: unknown }).time),
+      // Diagnostic id only — see FuturesIncomeEntry.tranId's doc comment for why this
+      // deliberately does NOT go through preserveOrderIdPrecision.
+      tranId: toStrId((entry as { tranId?: unknown }).tranId),
+      info: String((entry as { info?: unknown }).info ?? ""),
     }));
   }
 

@@ -11,6 +11,7 @@ import {
   REALTIME_SHORT_ALLOWED_VARIANT_IDS,
   FORCE_ELIGIBLE_SHORT_VARIANT_IDS,
   FORCE_ELIGIBLE_LONG_VARIANT_IDS,
+  isForceEligibleForDirection,
   PROFIT_CORE_SHORT_TRAIL_LANE_ID,
   profitCoreShortRejectionReason,
   type RealtimeShortCandidate,
@@ -650,6 +651,40 @@ describe("realtime-short-mirror — fresh short live-mirror source (mode 2)", ()
     // mechanism instead, gated on an ACTUAL operator/preset allocation being active.
     expect([...FORCE_ELIGIBLE_SHORT_VARIANT_IDS]).toEqual(["CG_WIDE_FAST_SHORT"]);
     expect([...FORCE_ELIGIBLE_LONG_VARIANT_IDS]).toEqual(["CG_WIDE_FAST_LONG"]);
+  });
+
+  // 2026-07-11 incident: app.ts's mainnet proven-only gate used to check row.status BEFORE ever
+  // consulting this bypass, so a force-eligible lane (REALTIME_SHORT_FORCE_FAST_LONG=1 +
+  // CG_WIDE_FAST_LONG in the set) silently stopped trading the moment this instance's own
+  // freshValid count decayed under STABLE_CANDIDATE — for 32h+, with zero alerting. Every call
+  // site gating on STABLE_CANDIDATE status must consult isForceEligibleForDirection FIRST.
+  describe("[FORCE-ELIGIBLE-FN] isForceEligibleForDirection", () => {
+    it("is true for a LONG force-eligible variant when the flag is on", () => {
+      expect(
+        isForceEligibleForDirection("LONG", "CG_WIDE_FAST_LONG", { REALTIME_SHORT_FORCE_FAST_LONG: "1" } as unknown as NodeJS.ProcessEnv),
+      ).toBe(true);
+    });
+    it("is false for the same variant/direction when the flag is off (default)", () => {
+      expect(isForceEligibleForDirection("LONG", "CG_WIDE_FAST_LONG", {} as unknown as NodeJS.ProcessEnv)).toBe(false);
+    });
+    it("is false for a variant not in FORCE_ELIGIBLE_LONG_VARIANT_IDS even with the flag on", () => {
+      expect(
+        isForceEligibleForDirection("LONG", "CG_WIDE_STOP_TP_WIDE", { REALTIME_SHORT_FORCE_FAST_LONG: "1" } as unknown as NodeJS.ProcessEnv),
+      ).toBe(false);
+    });
+    it("is true for a SHORT force-eligible variant when its own flag is on", () => {
+      expect(
+        isForceEligibleForDirection("SHORT", "CG_WIDE_FAST_SHORT", { REALTIME_SHORT_FORCE_FAST_SHORT: "1" } as unknown as NodeJS.ProcessEnv),
+      ).toBe(true);
+    });
+    it("does NOT cross-apply the LONG flag to a SHORT candidate, or vice versa", () => {
+      expect(
+        isForceEligibleForDirection("SHORT", "CG_WIDE_FAST_SHORT", { REALTIME_SHORT_FORCE_FAST_LONG: "1" } as unknown as NodeJS.ProcessEnv),
+      ).toBe(false);
+      expect(
+        isForceEligibleForDirection("LONG", "CG_WIDE_FAST_LONG", { REALTIME_SHORT_FORCE_FAST_SHORT: "1" } as unknown as NodeJS.ProcessEnv),
+      ).toBe(false);
+    });
   });
 
   it("[ALLOCATION-FORCE] a lane with no allocation active stays gated even outside WIDE_TREND+LONG (unchanged default)", () => {

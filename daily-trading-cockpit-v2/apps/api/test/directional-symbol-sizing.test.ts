@@ -8,7 +8,10 @@ import {
   computeAtrPctFromCandles,
   directionalSymbolSizeMultiplier,
   evaluateDirectionalTechnicalConfirmation,
+  isDecisionScoreSizeMultEnabled,
   isDirectionalTechnicalGateEnabled,
+  isDirectionalTechnicalSignalFresh,
+  TECHNICAL_SIGNAL_MAX_STALE_MS,
   SymbolVolatilityCacheStore,
   refreshSymbolVolatilityCache,
   _resetSymbolVolatilityCacheStoreForTests,
@@ -220,6 +223,80 @@ describe("directionalSymbolSizeMultiplier", () => {
   });
 });
 
+describe("directionalSymbolSizeMultiplier — decisionScore quality tilt (DECISION_SCORE_SIZE_MULT_ENABLED)", () => {
+  // Exactly the fixtures from the describe block above, reused verbatim as the baseline-preservation
+  // proof: every one of these must produce the SAME output with the flag off as it did before this
+  // factor existed (fail-without/pass-with baseline).
+  const existingFixtures = [
+    { isWhitelisted: false, netAvgR: 0.5, atrPct: 0.01, peerAtrPcts: [0.05, 0.05, 0.05] },
+    { isWhitelisted: true, netAvgR: null, atrPct: null, peerAtrPcts: [] },
+    { isWhitelisted: true, netAvgR: 0.3, atrPct: null, peerAtrPcts: [] },
+    { isWhitelisted: true, netAvgR: -0.2, atrPct: null, peerAtrPcts: [] },
+    { isWhitelisted: true, netAvgR: null, atrPct: 0.02, peerAtrPcts: [0.04, 0.04, 0.04] },
+    { isWhitelisted: true, netAvgR: null, atrPct: 0.08, peerAtrPcts: [0.04, 0.04, 0.04] },
+    { isWhitelisted: true, netAvgR: 5, atrPct: 0.001, peerAtrPcts: [0.1, 0.1, 0.1] },
+    { isWhitelisted: true, netAvgR: -5, atrPct: 1, peerAtrPcts: [0.001, 0.001, 0.001] },
+  ];
+
+  it("is off unless explicitly enabled via env", () => {
+    expect(isDecisionScoreSizeMultEnabled({})).toBe(false);
+    expect(isDecisionScoreSizeMultEnabled({ DECISION_SCORE_SIZE_MULT_ENABLED: "1" })).toBe(true);
+    expect(isDecisionScoreSizeMultEnabled({ DECISION_SCORE_SIZE_MULT_ENABLED: "true" })).toBe(false);
+  });
+
+  it("(1) FLAG OFF/UNSET: output is IDENTICAL to pre-existing behavior across every existing fixture, " +
+    "even when a decisionScore is supplied — this is the baseline-preservation proof", () => {
+    for (const fixture of existingFixtures) {
+      const todaysBehavior = directionalSymbolSizeMultiplier(fixture); // no env arg — every real call site today
+      const explicitlyOff = directionalSymbolSizeMultiplier(fixture, {});
+      const offWithScoreAttached = directionalSymbolSizeMultiplier({ ...fixture, decisionScore: 95 }, {});
+      const offWithScoreAttachedNoEnvArg = directionalSymbolSizeMultiplier({ ...fixture, decisionScore: 95 });
+      expect(explicitlyOff).toBe(todaysBehavior);
+      expect(offWithScoreAttached).toBe(todaysBehavior);
+      expect(offWithScoreAttachedNoEnvArg).toBe(todaysBehavior);
+    }
+  });
+
+  it("(2) FLAG ON: higher decision score -> strictly larger multiplier, within the documented [0.5, 1.5] quality clamp", () => {
+    const enabledEnv = { DECISION_SCORE_SIZE_MULT_ENABLED: "1" };
+    const neutral = { isWhitelisted: true, netAvgR: null, atrPct: null, peerAtrPcts: [] };
+    const low = directionalSymbolSizeMultiplier({ ...neutral, decisionScore: 0 }, enabledEnv);
+    const mid = directionalSymbolSizeMultiplier({ ...neutral, decisionScore: 50 }, enabledEnv);
+    const high = directionalSymbolSizeMultiplier({ ...neutral, decisionScore: 100 }, enabledEnv);
+    expect(low).toBeCloseTo(0.5, 10); // score=0 floors at the documented 0.5x
+    expect(mid).toBe(1); // score=50 is neutral by design (no tilt either way)
+    expect(high).toBeCloseTo(1.5, 10); // score=100 ceilings at the documented 1.5x
+    expect(low).toBeLessThan(mid);
+    expect(mid).toBeLessThan(high);
+    expect(low).toBeGreaterThanOrEqual(0.5);
+    expect(high).toBeLessThanOrEqual(1.5);
+  });
+
+  it("(3) FLAG ON but decisionScore missing/null/non-finite: quality factor still resolves to neutral 1.0", () => {
+    const enabledEnv = { DECISION_SCORE_SIZE_MULT_ENABLED: "1" };
+    const inputsNoScore = { isWhitelisted: true, netAvgR: 0.3, atrPct: null, peerAtrPcts: [] };
+    const flagOffBaseline = directionalSymbolSizeMultiplier(inputsNoScore, {});
+    expect(directionalSymbolSizeMultiplier(inputsNoScore, enabledEnv)).toBe(flagOffBaseline); // decisionScore undefined
+    expect(directionalSymbolSizeMultiplier({ ...inputsNoScore, decisionScore: null }, enabledEnv)).toBe(flagOffBaseline);
+    expect(directionalSymbolSizeMultiplier({ ...inputsNoScore, decisionScore: Number.NaN }, enabledEnv)).toBe(flagOffBaseline);
+  });
+
+  it("FLAG ON: stacks multiplicatively with perf/vol factors, still bounded by the existing combined clamp", () => {
+    const enabledEnv = { DECISION_SCORE_SIZE_MULT_ENABLED: "1" };
+    const mult = directionalSymbolSizeMultiplier(
+      {
+        isWhitelisted: true,
+        netAvgR: 5, // would blow past PERF_MULT_MAX alone
+        atrPct: 0.001, // absurdly calm vs peers
+        peerAtrPcts: [0.1, 0.1, 0.1],
+        decisionScore: 100, // pushes quality mult to its 1.5x ceiling too
+      },
+      enabledEnv,
+    );
+    expect(mult).toBeLessThanOrEqual(1.75); // same TOTAL_MULT_MAX ceiling as before this change
+  });
+});
+
 describe("SymbolVolatilityCacheStore + refreshSymbolVolatilityCache", () => {
   let dir: string;
 
@@ -266,5 +343,64 @@ describe("SymbolVolatilityCacheStore + refreshSymbolVolatilityCache", () => {
     await refreshSymbolVolatilityCache(store1, ["ETHUSDT"], async () => steadyCandles(40, 3000, 15));
     const store2 = new SymbolVolatilityCacheStore(dir);
     expect(store2.get().atrPctBySymbol.ETHUSDT).toBe(store1.get().atrPctBySymbol.ETHUSDT);
+  });
+
+  // [STALE-FIX] 2026-07-11: a persistently-failing refresh must not let a stale confirmed/
+  // unconfirmed verdict from days ago keep silently gating real-money entries forever — this is
+  // the per-symbol computedAt stamped on every successful fetch, checked independently of the
+  // cache-wide computedAt (which used to re-stamp every cycle regardless of per-symbol success).
+  it("[STALE-FIX] a symbol whose fetch keeps failing goes stale even while OTHER symbols keep refreshing successfully", async () => {
+    const store = new SymbolVolatilityCacheStore(dir);
+    let clockMs = 1_800_000_000_000;
+    const nowIso = () => new Date(clockMs).toISOString();
+
+    // Cycle 1: both symbols fetch successfully.
+    await refreshSymbolVolatilityCache(
+      store,
+      ["BTCUSDT", "DOGEUSDT"],
+      async () => steadyCandles(40, 100, 2),
+      { nowIso },
+    );
+    const btcEntryAfterCycle1 = store.get().technicalBySymbol.BTCUSDT!;
+    const dogeEntryAfterCycle1 = store.get().technicalBySymbol.DOGEUSDT!;
+    expect(isDirectionalTechnicalSignalFresh(btcEntryAfterCycle1, clockMs)).toBe(true);
+    expect(isDirectionalTechnicalSignalFresh(dogeEntryAfterCycle1, clockMs)).toBe(true);
+
+    // Advance the clock well past TECHNICAL_SIGNAL_MAX_STALE_MS, simulating several refresh cycles
+    // where DOGEUSDT's fetch keeps throwing (e.g. a persistent exchange/network issue) while
+    // BTCUSDT keeps succeeding normally.
+    clockMs += TECHNICAL_SIGNAL_MAX_STALE_MS * 2;
+    await refreshSymbolVolatilityCache(
+      store,
+      ["BTCUSDT", "DOGEUSDT"],
+      async (symbol) => {
+        if (symbol === "DOGEUSDT") throw new Error("simulated persistent exchange timeout");
+        return steadyCandles(40, 100, 2);
+      },
+      { nowIso },
+    );
+
+    const btcEntryAfterCycle2 = store.get().technicalBySymbol.BTCUSDT!;
+    const dogeEntryAfterCycle2 = store.get().technicalBySymbol.DOGEUSDT!;
+    // BTCUSDT kept refreshing successfully — still fresh.
+    expect(isDirectionalTechnicalSignalFresh(btcEntryAfterCycle2, clockMs)).toBe(true);
+    // DOGEUSDT's entry is untouched (same object as cycle 1) and is now stale relative to the
+    // advanced clock — the exact scenario the old code would have silently kept trusting.
+    expect(dogeEntryAfterCycle2.computedAt).toBe(dogeEntryAfterCycle1.computedAt);
+    expect(isDirectionalTechnicalSignalFresh(dogeEntryAfterCycle2, clockMs)).toBe(false);
+  });
+
+  it("[STALE-FIX] isDirectionalTechnicalSignalFresh fails closed on a missing entry or an invalid computedAt", () => {
+    expect(isDirectionalTechnicalSignalFresh(undefined, Date.now())).toBe(false);
+    expect(
+      isDirectionalTechnicalSignalFresh(
+        {
+          LONG: { direction: "LONG", emaAligned: true, momentumAligned: true, notOverextended: true, confirmed: true, emaFast: 1, emaSlow: 1, roc: 1, rsi: 50 },
+          SHORT: { direction: "SHORT", emaAligned: false, momentumAligned: false, notOverextended: false, confirmed: false, emaFast: null, emaSlow: null, roc: null, rsi: null },
+          computedAt: "not-a-real-timestamp",
+        },
+        Date.now(),
+      ),
+    ).toBe(false);
   });
 });

@@ -20,6 +20,7 @@ import {
   type RegimeDirectionControllerReport,
   type RegimeDirectionAlignment,
 } from "./regime-direction-controller.js";
+import { rotateJsonlIfNeeded } from "./jsonl-rotation.js";
 
 // ---------------------------------------------------------------------------
 // Snapshot shape
@@ -77,8 +78,33 @@ export class RegimeDirectionControllerSnapshotStore {
   append(snapshot: RegimeDirectionControllerSnapshot): void {
     try {
       appendFileSync(this.file, JSON.stringify(snapshot) + "\n", "utf-8");
+      this.maybeRotate();
     } catch {
       // report-only store; write failures must not surface to callers
+    }
+  }
+
+  /**
+   * 2026-07-11: this file had no cap at all — confirmed live at 1.4MB/3,541 lines and growing
+   * ~83KB/day (appended every scan cycle AND every dashboard render), the same unbounded-growth
+   * class already root-caused and fixed today in paper-execution-router.ts. Slower-growing than its
+   * siblings but readLatest() still loads the whole file on every call, and this store sits on the
+   * hot startup-fallback path (app.ts, routes/shadow.ts). Reuses the same rotateJsonlIfNeeded helper
+   * tracker.ts already applies to scan-history*.jsonl. Never throws.
+   */
+  private maybeRotate(): void {
+    if (process.env.REGIME_DIRECTION_SNAPSHOT_ROTATION_DISABLED === "1") return;
+    try {
+      const thresholdBytes = Number(process.env.REGIME_DIRECTION_SNAPSHOT_ROTATION_THRESHOLD_BYTES) || 5 * 1024 * 1024;
+      const tailLines = Number(process.env.REGIME_DIRECTION_SNAPSHOT_ROTATION_TAIL_LINES) || 5_000;
+      const result = rotateJsonlIfNeeded(this.file, { thresholdBytes, tailLines });
+      if (result.rotated) {
+        console.warn(
+          `[regime-direction-controller-snapshot] rotated ${this.file}: archived ${result.fromSize ?? "?"} bytes → ${result.archivePath ?? "?"}; kept ${result.linesKept ?? 0} lines`,
+        );
+      }
+    } catch {
+      // rotation failure must never block persistence
     }
   }
 

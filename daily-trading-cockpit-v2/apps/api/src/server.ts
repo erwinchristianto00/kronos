@@ -100,3 +100,52 @@ if (process.env.LANE_SYMBOL_CURATION_ENABLED === "1") {
   setInterval(refresh, intervalMin * 60_000);
   console.log(`[API] LANE_SYMBOL_CURATION_ENABLED on — refreshing every ${intervalMin}min from ${process.env.LANE_SYMBOL_CURATION_SOURCE_URL ?? "http://localhost:3101/api/shadow/per-symbol-lane-edge"}`);
 }
+
+// ── Wallet reconciliation ticker (report-only) ───────────────────────────────
+// Periodically compares the live-execution engine's internal realized-P&L ledger against
+// Binance's own /fapi/v1/income for the current UTC day (see lib/wallet-reconciliation.ts for the
+// full comparison logic and safety rationale). HARD RULE: on a mismatch beyond tolerance this
+// ONLY logs a warning — it must never pause trading, disarm, or take any corrective action. No
+// smaller than the live engine's own status; purely an early-warning log line for the operator.
+if (process.env.WALLET_RECONCILIATION_ENABLED === "1") {
+  const intervalMin = Math.max(1, Number(process.env.WALLET_RECONCILIATION_INTERVAL_MINUTES ?? 30));
+  const timeoutMs = Math.max(5_000, Number(process.env.WALLET_RECONCILIATION_TIMEOUT_MS ?? 15_000));
+  const url = `http://127.0.0.1:${port}/api/live/wallet-reconciliation`;
+  let reconciliationInFlight = false;
+  const runReconciliation = (): void => {
+    if (reconciliationInFlight) {
+      console.warn("[API] wallet-reconciliation tick skipped: previous tick still running");
+      return;
+    }
+    reconciliationInFlight = true;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    fetch(url, { signal: controller.signal })
+      .then(async (res) => {
+        if (!res.ok) {
+          console.warn(`[API] wallet-reconciliation tick returned HTTP ${res.status}`);
+          return;
+        }
+        const body = (await res.json().catch(() => null)) as {
+          ok?: boolean;
+          report?: { dayUtc?: string; deltaUsd?: number; toleranceUsd?: number; withinTolerance?: boolean };
+        } | null;
+        if (body?.ok && body.report && body.report.withinTolerance === false) {
+          const delta = body.report.deltaUsd ?? 0;
+          console.warn(
+            `[API] WALLET RECONCILIATION MISMATCH day=${body.report.dayUtc} delta=$${delta.toFixed(2)} ` +
+              `exceeds tolerance $${body.report.toleranceUsd} — internal ledger vs Binance income history ` +
+              `disagree. Report-only: no trading action taken; investigate manually.`,
+          );
+        }
+      })
+      .catch((e) => console.warn(`[API] wallet-reconciliation tick failed: ${(e as Error).message}`))
+      .finally(() => {
+        clearTimeout(timer);
+        reconciliationInFlight = false;
+      });
+  };
+  setTimeout(runReconciliation, 90_000); // first run well after boot, once the engine + ledger are warm
+  setInterval(runReconciliation, intervalMin * 60_000);
+  console.log(`[API] WALLET_RECONCILIATION_ENABLED on — checking every ${intervalMin}min (timeout ${timeoutMs}ms)`);
+}

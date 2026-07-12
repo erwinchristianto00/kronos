@@ -88,6 +88,10 @@ interface BinanceLongShortRatio {
   timestamp: number;
 }
 
+// Same payload shape as BinanceLongShortRatio; Binance's top-trader endpoints
+// (topLongShortPositionRatio, topLongShortAccountRatio) return identical fields.
+type BinanceTopTraderRatio = BinanceLongShortRatio;
+
 export interface Ticker24hSnapshot {
   baseVolume24h: number | null;
   quoteVolume24h: number | null;
@@ -107,6 +111,15 @@ export interface FuturesFlowSnapshot {
   longShortRatio: number | null;
 }
 
+// Separate from FuturesFlowSnapshot on purpose: FuturesFlowSnapshot already flows into
+// whale.ts's generic Object.values(...).some(...) "hasRealData" availability check, which
+// feeds live candidate scoring. Keeping the new top-trader fields on their own snapshot type
+// means this addition can never change that (or any other) existing decision path's behavior.
+export interface FuturesTopTraderRatioSnapshot {
+  topTraderPositionRatio: number | null;
+  topTraderAccountRatio: number | null;
+}
+
 export interface FuturesBookTickerSnapshot {
   bid: number | null;
   ask: number | null;
@@ -120,6 +133,8 @@ export interface FuturesPremiumIndexSnapshot {
   indexPrice: number | null;
   fundingRate: number | null;
   nextFundingTime: number | null;
+  basis: number | null;
+  basisPct: number | null;
 }
 
 export interface FuturesAggTradeSnapshot {
@@ -163,6 +178,18 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function finiteNumber(value: unknown): number | null {
   const n = Number(value);
   return Number.isFinite(n) ? n : null;
+}
+
+// Report-only derived metric (Tier 1 item 3): futures mark price vs spot-weighted
+// index price. Positive basis ⇒ futures trading at a premium to index (bullish
+// crowding); negative ⇒ discount. Not wired into any decision path — data collection only.
+export function computeBasis(markPrice: number | null, indexPrice: number | null): { basis: number | null; basisPct: number | null } {
+  if (markPrice === null || indexPrice === null) {
+    return { basis: null, basisPct: null };
+  }
+  const basis = markPrice - indexPrice;
+  const basisPct = indexPrice !== 0 ? (basis / indexPrice) * 100 : null;
+  return { basis, basisPct };
 }
 
 function isRetryable(error: BinanceRequestError): boolean {
@@ -572,11 +599,16 @@ export class BinanceClient {
     if (!isRecord(payload)) {
       throw new BinanceRequestError("invalid_response", "futures_premium_index", `invalid_response: Binance futures premium index was malformed for ${symbol}`);
     }
+    const markPrice = finiteNumber(payload.markPrice);
+    const indexPrice = finiteNumber(payload.indexPrice);
+    const { basis, basisPct } = computeBasis(markPrice, indexPrice);
     return {
-      markPrice: finiteNumber(payload.markPrice),
-      indexPrice: finiteNumber(payload.indexPrice),
+      markPrice,
+      indexPrice,
       fundingRate: finiteNumber(payload.lastFundingRate),
       nextFundingTime: finiteNumber(payload.nextFundingTime),
+      basis,
+      basisPct,
     };
   }
 
@@ -654,6 +686,24 @@ export class BinanceClient {
           : null,
       takerBuySellRatio: latestTaker ? Number(latestTaker.buySellRatio) : null,
       longShortRatio: latestLongShort ? Number(latestLongShort.longShortRatio) : null,
+    };
+  }
+
+  // Tier 1 item 3 (top-trader ratio): report-only data collection, deliberately kept
+  // separate from getFuturesFlow()/FuturesFlowSnapshot — see FuturesTopTraderRatioSnapshot
+  // comment above for why. Same getJson/plumbing/period/limit convention as getFuturesFlow.
+  async getFuturesTopTraderRatio(symbol: string): Promise<FuturesTopTraderRatioSnapshot> {
+    const [topTraderPositionPayload, topTraderAccountPayload] = await Promise.all([
+      this.getJson<BinanceTopTraderRatio[]>(symbol, "futures_top_trader_position_ratio", "/futures/data/topLongShortPositionRatio", { symbol, period: "5m", limit: "2" }, BINANCE_FUTURES_BASE_URL),
+      this.getJson<BinanceTopTraderRatio[]>(symbol, "futures_top_trader_account_ratio", "/futures/data/topLongShortAccountRatio", { symbol, period: "5m", limit: "2" }, BINANCE_FUTURES_BASE_URL),
+    ]);
+
+    const latestPosition = topTraderPositionPayload.at(-1);
+    const latestAccount = topTraderAccountPayload.at(-1);
+
+    return {
+      topTraderPositionRatio: latestPosition ? Number(latestPosition.longShortRatio) : null,
+      topTraderAccountRatio: latestAccount ? Number(latestAccount.longShortRatio) : null,
     };
   }
 }

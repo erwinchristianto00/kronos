@@ -21,6 +21,7 @@ import {
   CROSS_SECTIONAL_TREND_LONG_ALLOWLIST,
   CROSS_SECTIONAL_TREND_SHORT_ALLOWLIST,
   regimeSkewedK,
+  regimeSkewCounterfactual,
   type ScoredSymbol,
   type CrossSectionalObservation,
 } from "../src/lib/cross-sectional-edge.js";
@@ -331,6 +332,51 @@ describe("regimeSkewedK — regime-conditioned basket composition (2026-07-08)",
   });
 });
 
+describe("regimeSkewCounterfactual — is the skew tilt paying? (2026-07-12 profitability Stage 3)", () => {
+  const leg = (side: "LONG" | "SHORT", entryPrice: number, exitPrice: number | null) => ({ side, entryPrice, exitPrice });
+  it("returns INSUFFICIENT_DATA below the sample floor", () => {
+    const r = regimeSkewCounterfactual([
+      { netPnlUsd: 1, legs: [leg("LONG", 100, 102), leg("LONG", 50, 51), leg("SHORT", 10, 9.9)] },
+    ]);
+    expect(r.verdict).toBe("INSUFFICIENT_DATA");
+    expect(r.skewedCount).toBe(1);
+  });
+
+  it("partitions skewed (long≠short) vs symmetric baskets and reports each cohort's mean net", () => {
+    const skewed = { netPnlUsd: 2, legs: [leg("LONG", 100, 102), leg("LONG", 100, 101), leg("SHORT", 100, 99)] };
+    const symmetric = { netPnlUsd: -1, legs: [leg("LONG", 100, 100), leg("SHORT", 100, 100)] };
+    const r = regimeSkewCounterfactual([skewed, symmetric]);
+    expect(r.skewedCount).toBe(1);
+    expect(r.symmetricCount).toBe(1);
+    expect(r.skewedMeanNetUsd).toBeCloseTo(2, 9);
+    expect(r.symmetricMeanNetUsd).toBeCloseTo(-1, 9);
+  });
+
+  it("verdicts SKEW_COSTING when the over-weighted long side under-returns the short side", () => {
+    // 5 skewed baskets, longs flat (0%), shorts +2% each — the dispersion is on the short side, so
+    // over-weighting longs (the bull skew) is adding directional risk the book isn't rewarded for.
+    const baskets = Array.from({ length: 5 }, () => ({
+      netPnlUsd: 0.5,
+      legs: [leg("LONG", 100, 100), leg("LONG", 100, 100), leg("SHORT", 100, 98)],
+    }));
+    const r = regimeSkewCounterfactual(baskets);
+    expect(r.skewedLongLegMeanReturnPct).toBeCloseTo(0, 9);
+    expect(r.skewedShortLegMeanReturnPct).toBeCloseTo(0.02, 9);
+    expect(r.skewLongMinusShortEdgePct).toBeCloseTo(-0.02, 9);
+    expect(r.verdict).toBe("SKEW_COSTING");
+  });
+
+  it("verdicts SKEW_PAYING when the over-weighted long side out-returns the short side", () => {
+    const baskets = Array.from({ length: 5 }, () => ({
+      netPnlUsd: 1,
+      legs: [leg("LONG", 100, 103), leg("LONG", 100, 103), leg("SHORT", 100, 100)],
+    }));
+    const r = regimeSkewCounterfactual(baskets);
+    expect(r.skewLongMinusShortEdgePct!).toBeGreaterThan(0);
+    expect(r.verdict).toBe("SKEW_PAYING");
+  });
+});
+
 describe("[SKEW] buildCrossSectionalBasket with asymmetric longK/shortK", () => {
   it("selects the actual per-side counts, not just a single shared k", () => {
     const b = buildCrossSectionalBasket(
@@ -529,6 +575,39 @@ describe("deriveAdaptiveSymbolFilters — demotes toxic symbols inside hard oper
     expect(f.provenance.shortFloorApplied).toBe(false);
     expect(f.shortAllowlist).not.toContain("DOGEUSDT");
     expect(f.shortAllowlist).toContain("OPUSDT"); // untouched, still eligible
+  });
+
+  // [SKEW-FLOOR] 2026-07-11: regime skew can raise shortK above the base K (e.g. 3->4 via
+  // regimeSkewedK), but the floor previously only ever checked the unskewed shared
+  // minEligiblePerSide on both sides — a short side sitting at exactly the base K eligible symbols
+  // looked "fine" (not under the base K) even though buildFilteredCrossSectionalBasket actually
+  // needs the SKEWED count and would silently return null. Fixed by threading separate per-side
+  // floors through; this proves the shared value alone misses it while the per-side override catches it.
+  it("[SKEW-FLOOR] per-side floor override catches a regime-skewed shortK requirement the shared minEligiblePerSide would miss", () => {
+    const store = freshStore();
+    // Demote only ONE short symbol — plenty remain relative to the unskewed base K, same setup as
+    // the "does not trigger" test above.
+    for (let i = 0; i < 3; i++) {
+      store.add(closedObs(`p${i}`, [], [["DOGEUSDT", 1, 1.02]]) as never);
+    }
+    const remaining = CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST.size - 1; // one demoted out of the full list
+
+    // Old behavior (shared value only, matching the unskewed base K): floor correctly stays off —
+    // this is the "no regime skew" case and must remain unaffected.
+    const unskewed = deriveAdaptiveSymbolFilters(store, { minEligiblePerSide: 3 });
+    expect(unskewed.provenance.shortFloorApplied).toBe(false);
+
+    // Regime skew raises the ACTUAL short requirement one past what remains eligible — the
+    // per-side override must catch this even though the shared/base value alone would not.
+    const skewed = deriveAdaptiveSymbolFilters(store, {
+      minEligiblePerSide: 3,
+      minEligiblePerSideShort: remaining + 1,
+    });
+    expect(skewed.provenance.shortFloorApplied).toBe(true);
+    expect(skewed.provenance.minEligiblePerSideShort).toBe(remaining + 1);
+    // Long side is unaffected by the short-side override.
+    expect(skewed.provenance.longFloorApplied).toBe(false);
+    expect(skewed.provenance.minEligiblePerSideLong).toBe(3);
   });
 
   // [SYMBOL-NAME] 2026-07-07: "PEPEUSDT" is not a real Binance futures symbol (the exchange lists

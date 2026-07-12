@@ -12,6 +12,7 @@ import {
 import {
   CrossSectionalExecutor,
   CrossSectionalExecutorStore,
+  CROSS_SECTIONAL_TREND_LANE_ID,
   type CrossSectionalExecClient,
   type ExecutorBasket,
 } from "../src/lib/cross-sectional-executor.js";
@@ -128,9 +129,29 @@ class FakeExecClient implements CrossSectionalExecClient {
     const avgPrice = this.queryOrderAvgPriceBySymbol.get(symbol) ?? 0;
     return this.buildOrder(symbol, "BUY", 0, false, orderId, avgPrice);
   }
+  /** [FEE-RECORDING, 2026-07-12 fix] real per-order commissions closeBasket now prefers over the
+   *  flat TAKER_FEE_RATE estimate. Map value = commission per trade; every placed order for the
+   *  symbol gets one trade entry. Empty (default) ⇒ closeBasket falls back to the estimate. */
+  commissionPerTradeBySymbol = new Map<string, number>();
+  async getUserTrades(symbol: string): Promise<Array<{ orderId: string; price: number; qty: number; realizedPnl: number; commission: number; commissionAsset: string; time: number }>> {
+    const commission = this.commissionPerTradeBySymbol.get(symbol);
+    if (commission === undefined) return [];
+    return this.placed
+      .map((p, i) => ({ p, orderId: String(100 + i) }))
+      .filter(({ p }) => p.symbol === symbol)
+      .map(({ p, orderId }) => ({
+        orderId,
+        price: this.fillPriceBySymbol.get(symbol) ?? 0,
+        qty: p.quantity,
+        realizedPnl: 0,
+        commission,
+        commissionAsset: "USDT",
+        time: 0,
+      }));
+  }
 }
 
-function makeExecutor(opts: { client?: FakeExecClient; allowed?: boolean; laneWeightPct?: number; signalMs?: number; dailyMaxLossUsd?: number; entryHealthAllowed?: boolean } = {}) {
+function makeExecutor(opts: { client?: FakeExecClient; allowed?: boolean; laneWeightPct?: number; laneId?: string; signalMs?: number; dailyMaxLossUsd?: number; entryHealthAllowed?: boolean; siblingOpenLegs?: () => Array<{ symbol: string; side: "LONG" | "SHORT"; qty: number }> } = {}) {
   const client = opts.client ?? new FakeExecClient();
   const signalStore = new CrossSectionalStore(tmpDir());
   const storeDir = tmpDir();
@@ -144,6 +165,7 @@ function makeExecutor(opts: { client?: FakeExecClient; allowed?: boolean; laneWe
     store,
     isAllowed: () => opts.allowed ?? true,
     laneWeightPct: () => opts.laneWeightPct ?? 100,
+    ...(opts.laneId !== undefined ? { laneId: opts.laneId } : {}),
     nowIso: () => NOW,
     fillConfirmRetryDelayMs: 0,
     // Injected (not process.env) — env mutation in tests leaks across vitest worker threads.
@@ -151,6 +173,7 @@ function makeExecutor(opts: { client?: FakeExecClient; allowed?: boolean; laneWe
     ...(opts.entryHealthAllowed !== undefined
       ? { entryHealthGate: () => ({ allowed: opts.entryHealthAllowed!, reason: opts.entryHealthAllowed ? null : "rolling edge negative" }) }
       : {}),
+    ...(opts.siblingOpenLegs !== undefined ? { siblingOpenLegs: opts.siblingOpenLegs } : {}),
   });
   return { executor, client, signalStore, store, storeDir };
 }
@@ -217,6 +240,39 @@ describe("cross-sectional executor (basket execution, testnet-first)", () => {
     expect(basket.legs.find((l) => l.symbol === "DOGEUSDT")?.qty).toBeCloseTo(100, 9);
   });
 
+  // 2026-07-10 fix: isCrossSectionalAllocationIndependent() was defined 2026-07-07 (doc comment:
+  // "cross-sectional is the FOUNDATION strategy and must run at full size regardless of the
+  // lane-allocation selector") but never actually consulted — the foundation lane's leg size was
+  // silently scaled by the directional-slot allocation weight anyway (live-confirmed: 80% weight
+  // -> $20 legUsd instead of the documented $25 full size).
+  it("CROSS_SECTIONAL_ALLOCATION_INDEPENDENT=1: the foundation lane ignores its allocation weight and stays full size", async () => {
+    process.env.CROSS_SECTIONAL_ALLOCATION_INDEPENDENT = "1";
+    try {
+      const { executor, store } = makeExecutor({ laneWeightPct: 40, signalMs: NOW_MS - 5 * 60_000 });
+      expect(executor.getStatus()).toMatchObject({ legUsd: 25, baseLegUsd: 25, allocationWeightPct: 100 });
+      await executor.tick();
+      const basket = store.getState().baskets[0]!;
+      expect(basket.legs.find((l) => l.symbol === "SOLUSDT")?.qty).toBeCloseTo(0.25, 9);
+      expect(basket.legs.find((l) => l.symbol === "DOGEUSDT")?.qty).toBeCloseTo(250, 9);
+    } finally {
+      delete process.env.CROSS_SECTIONAL_ALLOCATION_INDEPENDENT;
+    }
+  });
+
+  it("CROSS_SECTIONAL_ALLOCATION_INDEPENDENT=1: a non-foundation instance (CROSS_SECTIONAL_TREND) still scales normally", async () => {
+    process.env.CROSS_SECTIONAL_ALLOCATION_INDEPENDENT = "1";
+    try {
+      const { executor, store } = makeExecutor({ laneWeightPct: 40, laneId: CROSS_SECTIONAL_TREND_LANE_ID, signalMs: NOW_MS - 5 * 60_000 });
+      expect(executor.getStatus()).toMatchObject({ legUsd: 10, baseLegUsd: 25, allocationWeightPct: 40 });
+      await executor.tick();
+      const basket = store.getState().baskets[0]!;
+      expect(basket.legs.find((l) => l.symbol === "SOLUSDT")?.qty).toBeCloseTo(0.1, 9);
+      expect(basket.legs.find((l) => l.symbol === "DOGEUSDT")?.qty).toBeCloseTo(100, 9);
+    } finally {
+      delete process.env.CROSS_SECTIONAL_ALLOCATION_INDEPENDENT;
+    }
+  });
+
   it("trusts FILTERED signals already emitted by the research feed instead of re-blocking with stale env lists", async () => {
     const { executor, signalStore, store, client } = makeExecutor();
     const signal = signalObs(NOW_MS - 5 * 60_000);
@@ -264,6 +320,63 @@ describe("cross-sectional executor (basket execution, testnet-first)", () => {
     expect(basket.netPnlUsd!).toBeLessThan(basket.grossPnlUsd!);
     const closes = client.placed.filter((p) => p.reduceOnly);
     expect(closes.length).toBe(2);
+  });
+
+  // [FEE-RECORDING, 2026-07-12 fix]: closeBasket previously ALWAYS recorded the flat
+  // notionalTouched × TAKER_FEE_RATE estimate even though the real per-order commissions were
+  // one getUserTrades call away — the exchange-truth audit found commissions were 68.7% of the
+  // account's all-time loss while every internal fee report undercounted them.
+  it("[FEE-RECORDING] closeBasket records REAL commissions from getUserTrades when available, estimate only as fallback", async () => {
+    const client = new FakeExecClient();
+    client.fillPriceBySymbol.set("SOLUSDT", 100);
+    client.fillPriceBySymbol.set("DOGEUSDT", 0.1);
+    // Real commission of $0.05 per trade on both symbols: 2 entry + 2 exit trades = $0.20 total.
+    client.commissionPerTradeBySymbol.set("SOLUSDT", 0.05);
+    client.commissionPerTradeBySymbol.set("DOGEUSDT", 0.05);
+    const { executor, store } = makeExecutor({ client, signalMs: NOW_MS - 5 * 60_000 });
+    await executor.tick();
+    const basket = store.getState().baskets[0]!;
+    basket.closesAtMs = NOW_MS - 1;
+    await executor.tick();
+    expect(basket.status).toBe("CLOSED");
+    // Real sum (4 × $0.05 = $0.20), NOT the notional-based estimate.
+    expect(basket.feeEstimateUsd).toBeCloseTo(0.2, 9);
+    expect(basket.netPnlUsd).toBeCloseTo(basket.grossPnlUsd! - 0.2, 9);
+  });
+
+  // [OOM-FIX-2] lastNetReturn used to only ever be stamped by the periodic mark-price check
+  // (closeBasketsHittingProfitTarget) — once a basket closes at HORIZON with real exit fills, that
+  // stamp could be left stuck at a stale sign from before the close. Confirmed live: a basket
+  // settled a real +$0.73 (positive) win but its stored lastNetReturn still showed -0.13% from an
+  // earlier mark-price check.
+  it("[OOM-FIX-2] lastNetReturn is recomputed from FINAL exit fills at close, correcting a stale pre-close mark-price sign", async () => {
+    const client = new FakeExecClient();
+    client.fillPriceBySymbol.set("SOLUSDT", 100);
+    client.fillPriceBySymbol.set("DOGEUSDT", 0.1);
+    const { executor, store } = makeExecutor({ client, signalMs: NOW_MS - 5 * 60_000 });
+    await executor.tick();
+    const basket = store.getState().baskets[0]!;
+
+    // Pre-close mark-price check shows a LOSS (stays OPEN, below threshold either way) — stamps
+    // lastNetReturn negative, same as the existing TP-GAP stamping behavior.
+    client.markPriceBySymbol.set("SOLUSDT", 99); // SOL long down 1%
+    client.markPriceBySymbol.set("DOGEUSDT", 0.1); // DOGE short flat
+    await executor.tick();
+    expect(basket.status).toBe("OPEN");
+    expect(basket.lastNetReturn!).toBeLessThan(0); // stale negative stamp, pre-close
+
+    // Now the basket actually closes at horizon with REAL fills showing a WIN (SOL +2%, DOGE -1%,
+    // same move as "closes the basket at horizon... honest net PnL" above).
+    client.fillPriceBySymbol.set("SOLUSDT", 102);
+    client.fillPriceBySymbol.set("DOGEUSDT", 0.099);
+    basket.closesAtMs = NOW_MS - 1;
+    await executor.tick();
+
+    expect(basket.status).toBe("CLOSED");
+    expect(basket.closeReason).toBe("HORIZON");
+    expect(basket.netPnlUsd!).toBeGreaterThan(0); // real settled win
+    expect(basket.lastNetReturn!).toBeGreaterThan(0); // corrected to match — no longer stuck negative
+    expect(basket.lastNetAt).toBe(basket.closedAt); // re-stamped at the moment of settlement
   });
 
   it("PROFIT BANK: closes early, before horizon, once live net return crosses the threshold", async () => {
@@ -669,6 +782,29 @@ describe("closeBasket under cross-basket netting", () => {
     const a = store.getState().baskets.find((x) => x.basketId === "a")!;
     expect(a.status).toBe("OPEN"); // wedged, surfaced — NOT silently force-closed without the guard
     expect(executor.getStatus().lastError ?? "").toMatch(/ReduceOnly/);
+  });
+
+  it("[SIBLING-INSTANCE-CLOSE] 2026-07-11 fix: drops reduceOnly when a SEPARATE executor instance's leg (not one in THIS store) covers the opposite side", async () => {
+    // FILTERED/TREND/MIXED are 3 SEPARATE CrossSectionalExecutor instances, each with their OWN
+    // store file, on the SAME netted Binance account. Before this fix, siblingOppositeUnexitedQty
+    // only ever scanned THIS instance's own store.getState().baskets — a same-symbol opposite-side
+    // leg owned by a sibling INSTANCE (not a sibling basket in the same store) was invisible.
+    const { executor, client, store } = makeExecutor({
+      siblingOpenLegs: () => [{ symbol: "SOLUSDT", side: "SHORT", qty: 2 }], // a TREND/MIXED instance's own leg
+    });
+    client.rejectReduceOnlyOn.add("SOLUSDT"); // account is net short — reduce-only SELL would be -2022
+    client.fillPriceBySymbol.set("SOLUSDT", 110);
+    store.getState().baskets.push(
+      basket("a", [{ symbol: "SOLUSDT", side: "LONG", qty: 1, entryPrice: 100 }], NOW_MS - 60_000), // due
+      // Deliberately NO sibling basket in THIS store — the only cover comes from siblingOpenLegs().
+    );
+
+    await executor.tick();
+
+    const a = store.getState().baskets.find((x) => x.basketId === "a")!;
+    expect(a.status).toBe("CLOSED");
+    const exit = client.placed.find((p) => p.symbol === "SOLUSDT" && p.side === "SELL")!;
+    expect(exit.reduceOnly).toBeFalsy(); // the plain-market bookkeeping close, justified by the sibling INSTANCE's leg
   });
 
   it("[STALE-BOOK-RECONCILE] aborts without creating opposite exposure when exchange position is already flat", async () => {

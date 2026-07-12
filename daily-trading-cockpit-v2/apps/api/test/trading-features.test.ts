@@ -41,6 +41,7 @@ function microstructure(overrides: Partial<FeatureAdapterInput["microstructure"]
 function governance(overrides: Partial<FeatureAdapterInput["governance"]> = {}) {
   return { dailyLossPct: 0, consecutiveLosses: 0, openPositions: 0, tradesToday: 0, ...overrides };
 }
+const nearLevelDistancePct = (price: number, level: number) => Math.abs(price - level) / level;
 
 describe("contextFromCandles", () => {
   const asOf = 2_000_000_000_000;
@@ -282,6 +283,74 @@ describe("contextFromCandles", () => {
     if (d.action !== "NO_TRADE") {
       expect(["SHORT_RALLY_FADE", "BREAKDOWN_RETEST_SHORT", "MICRO_MEAN_REVERSION"]).toContain(d.lane);
     }
+  });
+
+  // 2026-07-10: retest62000Hold was fixed to add a "sustained above the level" path
+  // alongside the original narrow-band "retest at the level" path, because the
+  // narrow-band-only version made NEUTRAL_RECOVERY structurally unreachable during a
+  // real, decisive rally (0/746 real production snapshots) — see contextFromCandles.ts.
+  function recoveryBtc(
+    asOf: number,
+    opts: { h4Tail: [number, number]; h1LastClose: number },
+  ) {
+    const closesH1 = Array.from({ length: 40 }, (_, i) => 58_000 + i * ((opts.h1LastClose - 58_000) / 39));
+    closesH1[closesH1.length - 1] = opts.h1LastClose;
+    const closesH4 = [
+      ...Array.from({ length: 18 }, (_, i) => 58_000 + i * 100),
+      opts.h4Tail[0],
+      opts.h4Tail[1],
+    ];
+    const closesD1 = Array.from({ length: 10 }, (_, i) => 60_000 + i * 200);
+    return {
+      h1: series(closesH1, asOf - 40 * HOUR, HOUR),
+      h4: series(closesH4, asOf - 20 * 4 * HOUR, 4 * HOUR),
+      d1: series(closesD1, asOf - 10 * 24 * HOUR, 24 * HOUR),
+    };
+  }
+
+  it("retest62000Hold: fires on a sustained rally (2 consecutive 4H closes above 62000) even far from the level", () => {
+    const ctx = contextFromCandles({
+      asOf,
+      // 2 consecutive confirmed 4H closes above 62000, current price 64240 — 3.6% away,
+      // well outside the 1.2% narrow-band tolerance. Only the new sustained-above path
+      // can make this true.
+      btc: recoveryBtc(asOf, { h4Tail: [62_800, 63_900], h1LastClose: 64_240 }),
+      microstructure: microstructure(),
+      governance: governance(),
+    });
+    expect(ctx.btcClose4hAbove62000).toBe(true);
+    expect(nearLevelDistancePct(64_240, 62_000)).toBeGreaterThan(0.012);
+    expect(ctx.retest62000Hold).toBe(true);
+  });
+
+  it("retest62000Hold: stays undefined on a single-bar poke above 62000 that hasn't confirmed twice yet", () => {
+    const ctx = contextFromCandles({
+      asOf,
+      // Same far-from-level price as above, but only the LAST 4H bar closed above
+      // 62000 — the one before it (h4[length-2]) did not. Isolates the "2 consecutive
+      // bars" requirement: far from the level AND not yet sustained ⇒ must stay undefined.
+      btc: recoveryBtc(asOf, { h4Tail: [61_500, 63_900], h1LastClose: 64_240 }),
+      microstructure: microstructure(),
+      governance: governance(),
+    });
+    expect(ctx.btcClose4hAbove62000).toBe(true);
+    expect(ctx.retest62000Hold).toBeUndefined();
+  });
+
+  it("retest62000Hold: original narrow-band retest-at-level case is unchanged (regression)", () => {
+    const ctx = contextFromCandles({
+      asOf,
+      // Price sitting within 1.2% of 62000 (62035, 0.056% away) — the ORIGINAL passing
+      // case. The last 4H bar closed above 62000 but the one before did NOT (61200), so
+      // sustainedAbove62000 is false here — proving retestAtLevel alone still fires this
+      // true, untouched by the new branch.
+      btc: recoveryBtc(asOf, { h4Tail: [61_200, 62_300], h1LastClose: 62_035 }),
+      microstructure: microstructure(),
+      governance: governance(),
+    });
+    expect(ctx.btcClose4hAbove62000).toBe(true);
+    expect(nearLevelDistancePct(62_035, 62_000)).toBeLessThan(0.012);
+    expect(ctx.retest62000Hold).toBe(true);
   });
 
   it("respects explicit overrides applied last", () => {

@@ -35,6 +35,16 @@ function writeJsonAtomic(file: string, value: unknown): void {
   renameSync(tmp, file);
 }
 
+function envNum(name: string, dflt: number): number {
+  const v = Number(process.env[name]);
+  return Number.isFinite(v) ? v : dflt;
+}
+
+const PARALLEL_SHADOW_MAX_STORED_OBSERVATIONS = envNum(
+  "PARALLEL_SHADOW_MAX_STORED_OBSERVATIONS",
+  500,
+);
+
 export type ParallelExperimentId =
   | "BASE_BROAD_COST20_STOP150"
   | "BASE_COST10_ONLY"
@@ -289,8 +299,19 @@ export class ParallelShadowExperimentStore {
     }
   }
 
+  private prune(): void {
+    if (this.observations.length <= PARALLEL_SHADOW_MAX_STORED_OBSERVATIONS) return;
+    const open = this.observations.filter((o) => o.status === "OPEN");
+    const settled = this.observations
+      .filter((o) => o.status !== "OPEN")
+      .sort((a, b) => new Date(b.openedAt).getTime() - new Date(a.openedAt).getTime())
+      .slice(0, Math.max(0, PARALLEL_SHADOW_MAX_STORED_OBSERVATIONS - open.length));
+    this.observations = [...open, ...settled];
+  }
+
   save(): void {
     try {
+      this.prune();
       writeJsonAtomic(this.file, {
         observations: this.observations,
         latestAdmissionDiagnostics: this.latestDiagnostics,

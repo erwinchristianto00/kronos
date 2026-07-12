@@ -29,6 +29,28 @@ function writeJsonAtomic(file: string, value: unknown): void {
   renameSync(tmp, file);
 }
 
+function envNum(name: string, dflt: number): number {
+  const v = Number(process.env[name]);
+  return Number.isFinite(v) ? v : dflt;
+}
+
+const CONTROLLER_ALIGNED_MAX_STORED_OBSERVATIONS = envNum(
+  "CONTROLLER_ALIGNED_MAX_STORED_OBSERVATIONS",
+  500,
+);
+
+function pruneControllerAlignedObservations(
+  observations: ControllerAlignedShadowPosition[],
+): ControllerAlignedShadowPosition[] {
+  if (observations.length <= CONTROLLER_ALIGNED_MAX_STORED_OBSERVATIONS) return observations;
+  const open = observations.filter((o) => o.status === "OPEN");
+  const settled = observations
+    .filter((o) => o.status !== "OPEN")
+    .sort((a, b) => new Date(b.openedAt).getTime() - new Date(a.openedAt).getTime())
+    .slice(0, Math.max(0, CONTROLLER_ALIGNED_MAX_STORED_OBSERVATIONS - open.length));
+  return [...open, ...settled];
+}
+
 import type { RegimeDirectionControllerReport } from "./regime-direction-controller.js";
 import { BASE_ROUTE_POLICY_VERSION_V2 } from "./shadow-engine.js";
 import {
@@ -181,7 +203,10 @@ export class RegimeControllerAlignedShadowStore {
       if (!existsSync(dir)) {
         mkdirSync(dir, { recursive: true });
       }
-      writeJsonAtomic(this.filePath, state);
+      writeJsonAtomic(this.filePath, {
+        ...state,
+        observations: pruneControllerAlignedObservations(state.observations),
+      });
     } catch {
       // storage failures must never throw — this lane is report-only
     }
