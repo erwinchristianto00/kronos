@@ -1,0 +1,35 @@
+[
+  {
+    "model": "A_REAL_OBSERVED_ONLY",
+    "eligibleRows": 0,
+    "distinctDecisionDays": 0,
+    "distinctLanes": 0,
+    "distinctSymbols": 0,
+    "chronologicalWalkForward": "NOT_RUN",
+    "groupedConfidenceIntervals": "NOT_RUN",
+    "status": "NOT_RUN_INSUFFICIENT_ELIGIBLE_CAUSAL_EXPERIENCE",
+    "exclusion": "No synthetic/stress/adversarial/execution-calibration record is included."
+  },
+  {
+    "model": "B_REAL_OBSERVED_PLUS_HISTORICAL_REPLAY",
+    "eligibleRows": 0,
+    "distinctDecisionDays": 0,
+    "distinctLanes": 0,
+    "distinctSymbols": 0,
+    "chronologicalWalkForward": "NOT_RUN",
+    "groupedConfidenceIntervals": "NOT_RUN",
+    "status": "NOT_RUN_INSUFFICIENT_ELIGIBLE_CAUSAL_EXPERIENCE",
+    "exclusion": "No synthetic/stress/adversarial/execution-calibration record is included."
+  },
+  {
+    "model": "C_REAL_PLUS_REPLAY_PLUS_OBSERVED_PATH_COUNTERFACTUAL",
+    "eligibleRows": 0,
+    "distinctDecisionDays": 0,
+    "distinctLanes": 0,
+    "distinctSymbols": 0,
+    "chronologicalWalkForward": "NOT_RUN",
+    "groupedConfidenceIntervals": "NOT_RUN",
+    "status": "NOT_RUN_INSUFFICIENT_ELIGIBLE_CAUSAL_EXPERIENCE",
+    "exclusion": "No synthetic/stress/adversarial/execution-calibration record is included."
+  }
+]

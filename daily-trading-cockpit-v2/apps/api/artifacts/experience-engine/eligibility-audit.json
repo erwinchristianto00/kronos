@@ -1,0 +1,59 @@
+{
+  "inventory": {
+    "generatedAt": "offline deterministic inventory; no wall-clock acceptance decision",
+    "sources": {
+      "OBSERVED_SHADOW_OUTCOME": {
+        "records": 2320,
+        "file": "data/regime-controller-aligned-shadow.json",
+        "status": "OUTCOMES_PRESENT_DECISION_SNAPSHOTS_ABSENT"
+      },
+      "OBSERVED_LIVE_CONTEXT_WITH_PAPER_OUTCOME": {
+        "records": 64,
+        "file": "data/paper-execution-router.json",
+        "status": "CONTEXT_PRESENT_RESOLVED_OUTCOMES_ABSENT"
+      },
+      "HISTORICAL_CAUSAL_REPLAY": {
+        "records": 0,
+        "file": "artifacts/backfill/*",
+        "status": "ONLY_AGGREGATES_PRESENT_NO_ROW_LEVEL_CAUSAL_EXPORT"
+      },
+      "OBSERVED_PATH_COUNTERFACTUAL": {
+        "records": 500,
+        "file": "data/kronos-counterfactual-observations.json",
+        "status": "PATH_OBSERVATIONS_PRESENT_CURRENTLY_UNRESOLVED"
+      },
+      "SIMULATED_STRESS": {
+        "status": "PHASE2D_AND_PHASE3A_STRESS_TEST_ONLY"
+      },
+      "ADVERSARIAL_SYNTHETIC": {
+        "status": "INVARIANT_TESTING_ONLY"
+      },
+      "EXECUTION_CALIBRATION": {
+        "status": "EVALUATION_ONLY_NOT_DIRECTIONAL_ALPHA"
+      }
+    },
+    "eligibility": {
+      "CANDIDATE_LEARNING_ELIGIBLE": 0,
+      "EVALUATION_ONLY": 0,
+      "INELIGIBLE_FOR_DIRECT_TRAINING": 2884
+    }
+  },
+  "eligibility": {
+    "CANDIDATE_LEARNING_ELIGIBLE": 0,
+    "EVALUATION_ONLY": 0,
+    "INELIGIBLE_FOR_DIRECT_TRAINING": 2884
+  },
+  "rejectionReasons": {
+    "missing_decision_time": 2320,
+    "missing_feature_snapshot": 2884,
+    "attribution_missing_decision_snapshot": 2384,
+    "outcome_invalid_geometry": 4,
+    "missing_valid_outcome_net_r": 766,
+    "source_error": 4,
+    "outcome_no_fill": 124,
+    "outcome_missing_outcome": 547,
+    "missing_market_close_or_resolution_time": 579,
+    "outcome_open": 91,
+    "post_open_decision_leakage": 64
+  }
+}

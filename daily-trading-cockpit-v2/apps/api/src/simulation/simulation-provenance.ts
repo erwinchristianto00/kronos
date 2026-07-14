@@ -36,6 +36,11 @@ export type ExperienceLearningEligibility =
   | "TRANSFER_TEST_REQUIRED"
   | "REAL_DATA_ELIGIBLE";
 
+/** Final direct-learning firewall. This is intentionally stricter than the older Phase-1 research metadata:
+ * observed historical paths may be eligible after the Experience Engine's causal audit; every generated path is
+ * permanently ineligible to change CORTEX coefficients, even when historically calibrated. */
+export type DirectTrainingEligibility = "ELIGIBLE_AFTER_CAUSAL_AUDIT" | "INELIGIBLE_FOR_DIRECT_TRAINING";
+
 export interface ProvenanceEligibility {
   stressTesting: boolean;
   /** Whether the provenance may be used for model RESEARCH (distributional study), not training. */
@@ -44,6 +49,7 @@ export interface ProvenanceEligibility {
   futureCandidateLearning: "POTENTIALLY_ELIGIBLE" | "ELIGIBLE_WITH_DISCOUNT_AND_TRANSFER_PROOF" | "EXPERIMENTAL_ONLY" | "NO";
   /** The eligibility label every experience of this provenance MUST carry during THIS phase. */
   phase1Eligibility: ExperienceLearningEligibility;
+  directTrainingEligibility: DirectTrainingEligibility;
 }
 
 /**
@@ -51,12 +57,12 @@ export interface ProvenanceEligibility {
  * are stored as METADATA only. Any experience is at most `TRANSFER_TEST_REQUIRED`; most are `STRESS_TEST_ONLY`.
  */
 const ELIGIBILITY: Record<SimulationProvenance, ProvenanceEligibility> = {
-  OBSERVED_HISTORICAL: { stressTesting: true, modelResearch: "YES", futureCandidateLearning: "POTENTIALLY_ELIGIBLE", phase1Eligibility: "TRANSFER_TEST_REQUIRED" },
-  HISTORICAL_BOOTSTRAP: { stressTesting: true, modelResearch: "YES", futureCandidateLearning: "ELIGIBLE_WITH_DISCOUNT_AND_TRANSFER_PROOF", phase1Eligibility: "TRANSFER_TEST_REQUIRED" },
-  EMPIRICALLY_CALIBRATED: { stressTesting: true, modelResearch: "YES", futureCandidateLearning: "EXPERIMENTAL_ONLY", phase1Eligibility: "TRANSFER_TEST_REQUIRED" },
-  STRESS_PERTURBATION: { stressTesting: true, modelResearch: "LIMITED", futureCandidateLearning: "NO", phase1Eligibility: "STRESS_TEST_ONLY" },
-  ADVERSARIAL_SYNTHETIC: { stressTesting: true, modelResearch: "FAILURE_ANALYSIS_ONLY", futureCandidateLearning: "NO", phase1Eligibility: "STRESS_TEST_ONLY" },
-  UNCONSTRAINED_SYNTHETIC: { stressTesting: true, modelResearch: "NO", futureCandidateLearning: "NO", phase1Eligibility: "STRESS_TEST_ONLY" },
+  OBSERVED_HISTORICAL: { stressTesting: true, modelResearch: "YES", futureCandidateLearning: "POTENTIALLY_ELIGIBLE", phase1Eligibility: "TRANSFER_TEST_REQUIRED", directTrainingEligibility: "ELIGIBLE_AFTER_CAUSAL_AUDIT" },
+  HISTORICAL_BOOTSTRAP: { stressTesting: true, modelResearch: "YES", futureCandidateLearning: "ELIGIBLE_WITH_DISCOUNT_AND_TRANSFER_PROOF", phase1Eligibility: "TRANSFER_TEST_REQUIRED", directTrainingEligibility: "INELIGIBLE_FOR_DIRECT_TRAINING" },
+  EMPIRICALLY_CALIBRATED: { stressTesting: true, modelResearch: "YES", futureCandidateLearning: "EXPERIMENTAL_ONLY", phase1Eligibility: "TRANSFER_TEST_REQUIRED", directTrainingEligibility: "INELIGIBLE_FOR_DIRECT_TRAINING" },
+  STRESS_PERTURBATION: { stressTesting: true, modelResearch: "LIMITED", futureCandidateLearning: "NO", phase1Eligibility: "STRESS_TEST_ONLY", directTrainingEligibility: "INELIGIBLE_FOR_DIRECT_TRAINING" },
+  ADVERSARIAL_SYNTHETIC: { stressTesting: true, modelResearch: "FAILURE_ANALYSIS_ONLY", futureCandidateLearning: "NO", phase1Eligibility: "STRESS_TEST_ONLY", directTrainingEligibility: "INELIGIBLE_FOR_DIRECT_TRAINING" },
+  UNCONSTRAINED_SYNTHETIC: { stressTesting: true, modelResearch: "NO", futureCandidateLearning: "NO", phase1Eligibility: "STRESS_TEST_ONLY", directTrainingEligibility: "INELIGIBLE_FOR_DIRECT_TRAINING" },
 };
 
 export function eligibilityFor(p: SimulationProvenance): ProvenanceEligibility {
@@ -69,6 +75,10 @@ export function eligibilityFor(p: SimulationProvenance): ProvenanceEligibility {
  */
 export function isPhase1LearningForbidden(eligibility: ExperienceLearningEligibility): boolean {
   return eligibility !== "REAL_DATA_ELIGIBLE";
+}
+
+export function isDirectTrainingForbidden(eligibility: ProvenanceEligibility): boolean {
+  return eligibility.directTrainingEligibility === "INELIGIBLE_FOR_DIRECT_TRAINING";
 }
 
 /** When two records of differing provenance are combined, the RESULT takes the LEAST-grounded (highest-rank) one —
