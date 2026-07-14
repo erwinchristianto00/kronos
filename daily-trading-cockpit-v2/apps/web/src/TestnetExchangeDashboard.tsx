@@ -800,11 +800,21 @@ function LanePerformanceChart({ series }: { series: LanePerformanceSeries | null
 
 async function fetchJson<T>(url: string): Promise<T> {
   const response = await fetch(url, { cache: 'no-store' });
-  const body = await response.json();
+  const body = await readJsonResponse<T & { ok?: boolean; reason?: string }>(response);
   if (!response.ok || body?.ok === false) {
     throw new Error(body?.reason ?? `Request failed (${response.status})`);
   }
   return body as T;
+}
+
+async function readJsonResponse<T = Record<string, unknown>>(response: Response): Promise<T> {
+  const text = await response.text();
+  if (text.trim().length === 0) return {} as T;
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    throw new Error(`Invalid JSON response (${response.status})`);
+  }
 }
 
 type PsleCellRow = {
@@ -1142,7 +1152,7 @@ export default function TestnetExchangeDashboard() {
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ positionId, confirm: 'CLOSE' }),
       });
-      const body = await res.json();
+      const body = await readJsonResponse<{ ok?: boolean; reason?: string; netPnlUsd?: number | null }>(res);
       if (!res.ok || body?.ok === false) {
         setCloseResult({ ok: false, message: `close ${symbol} (${compactLane(laneId)}) gagal: ${body?.reason ?? res.status}` });
       } else {
@@ -1164,9 +1174,9 @@ export default function TestnetExchangeDashboard() {
     const seq = ++singleSymbolLoadSeqRef.current;
     try {
       const res = await fetch(`${pageApiPrefix}/live/single-symbol/positions`, { cache: 'no-store' });
-      const body = await res.json();
+      const body = await readJsonResponse<{ ok?: boolean; positions?: SingleSymbolLanePosition[] }>(res);
       if (seq !== singleSymbolLoadSeqRef.current) return; // a newer call already superseded this one
-      if (body?.ok && Array.isArray(body.positions)) {
+      if (res.ok && body?.ok && Array.isArray(body.positions)) {
         setSingleSymbolLanePositions(body.positions as SingleSymbolLanePosition[]);
         setSingleSymbolPositionsStaleSince(null);
       } else {
