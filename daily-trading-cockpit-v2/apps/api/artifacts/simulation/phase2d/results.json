@@ -1,0 +1,3123 @@
+{
+ "phase": "2D",
+ "generatedAtProcessingMs": 1784041675458,
+ "runtimeMs": 543956,
+ "monthHours": {
+  "01": 744,
+  "02": 672,
+  "03": 744,
+  "04": 720,
+  "05": 744,
+  "06": 720
+ },
+ "gates": {
+  "seamExcessMax": 0.1,
+  "seamRatioMax": 2,
+  "seamExcessCiLowerMax": 0.1,
+  "seamClassifierMax": 0.65,
+  "minStylizedPassRate": 0.5,
+  "depDistMax": 0.08,
+  "maxUnchangedRunHours": 144,
+  "minUniqueContinuation": 0.3,
+  "maxDupSeqRate": 0.05
+ },
+ "constraints": {
+  "maxUnchangedRunHours": 144,
+  "maxSuccessorReuse": 4,
+  "maxMonthFraction": 0.5,
+  "minMatches": 5
+ },
+ "stageA": {
+  "corpus": [
+   "2026-01",
+   "2026-02"
+  ],
+  "tuneTarget": 1248,
+  "tuneProof": {
+   "excludedMonthHours": 672,
+   "feasibleHoursUnderMonthCap": 1248,
+   "feasibleHoursUnderReuseCap": 249024,
+   "targetHours": 672,
+   "fillable": true,
+   "bindingConstraint": "EXCLUDED_MONTH_HOURS",
+   "reason": "FILLABLE (target 672h, pack slack 0h)",
+   "trainingMonthCount": 2,
+   "perMonthAvailableHours": [
+    744,
+    624
+   ]
+  },
+  "bestParams": {
+   "topK": 12,
+   "reusePenalty": 0.5,
+   "entropyFloor": 0,
+   "candidateSupportFloor": 8,
+   "regularization": 0.1,
+   "balanceStrength": 1
+  },
+  "grid": [
+   {
+    "params": {
+     "topK": 12,
+     "reusePenalty": 0.5,
+     "entropyFloor": 0,
+     "candidateSupportFloor": 8,
+     "regularization": 0.1,
+     "balanceStrength": 1
+    },
+    "passRate": 0.5,
+    "insufficientRate": 0,
+    "meanEff": 8.046882462659445,
+    "dupWorst": 0,
+    "uniqMin": 0.9615384615384616
+   },
+   {
+    "params": {
+     "topK": 12,
+     "reusePenalty": 0.5,
+     "entropyFloor": 0.6,
+     "candidateSupportFloor": 8,
+     "regularization": 0.1,
+     "balanceStrength": 1
+    },
+    "passRate": 0.5,
+    "insufficientRate": 0,
+    "meanEff": 8.046882462659445,
+    "dupWorst": 0,
+    "uniqMin": 0.9615384615384616
+   },
+   {
+    "params": {
+     "topK": 20,
+     "reusePenalty": 0.5,
+     "entropyFloor": 0,
+     "candidateSupportFloor": 5,
+     "regularization": 0.1,
+     "balanceStrength": 1
+    },
+    "passRate": 0.4166666666666667,
+    "insufficientRate": 0,
+    "meanEff": 12.325092982270137,
+    "dupWorst": 0,
+    "uniqMin": 0.9615384615384616
+   },
+   {
+    "params": {
+     "topK": 20,
+     "reusePenalty": 0.5,
+     "entropyFloor": 0,
+     "candidateSupportFloor": 8,
+     "regularization": 0.1,
+     "balanceStrength": 1
+    },
+    "passRate": 0.4166666666666667,
+    "insufficientRate": 0,
+    "meanEff": 12.325092982270137,
+    "dupWorst": 0,
+    "uniqMin": 0.9615384615384616
+   },
+   {
+    "params": {
+     "topK": 20,
+     "reusePenalty": 0.5,
+     "entropyFloor": 0.6,
+     "candidateSupportFloor": 5,
+     "regularization": 0.1,
+     "balanceStrength": 1
+    },
+    "passRate": 0.4166666666666667,
+    "insufficientRate": 0,
+    "meanEff": 12.325092982270137,
+    "dupWorst": 0,
+    "uniqMin": 0.9615384615384616
+   },
+   {
+    "params": {
+     "topK": 20,
+     "reusePenalty": 0.5,
+     "entropyFloor": 0.6,
+     "candidateSupportFloor": 8,
+     "regularization": 0.1,
+     "balanceStrength": 1
+    },
+    "passRate": 0.4166666666666667,
+    "insufficientRate": 0,
+    "meanEff": 12.325092982270137,
+    "dupWorst": 0,
+    "uniqMin": 0.9615384615384616
+   },
+   {
+    "params": {
+     "topK": 12,
+     "reusePenalty": 1,
+     "entropyFloor": 0,
+     "candidateSupportFloor": 8,
+     "regularization": 0.1,
+     "balanceStrength": 1
+    },
+    "passRate": 0.4166666666666667,
+    "insufficientRate": 0,
+    "meanEff": 8.108840345219308,
+    "dupWorst": 0,
+    "uniqMin": 0.9615384615384616
+   },
+   {
+    "params": {
+     "topK": 12,
+     "reusePenalty": 1,
+     "entropyFloor": 0.6,
+     "candidateSupportFloor": 8,
+     "regularization": 0.1,
+     "balanceStrength": 1
+    },
+    "passRate": 0.4166666666666667,
+    "insufficientRate": 0,
+    "meanEff": 8.108840345219308,
+    "dupWorst": 0,
+    "uniqMin": 0.9615384615384616
+   },
+   {
+    "params": {
+     "topK": 12,
+     "reusePenalty": 0.5,
+     "entropyFloor": 0,
+     "candidateSupportFloor": 5,
+     "regularization": 0.1,
+     "balanceStrength": 1
+    },
+    "passRate": 0.4166666666666667,
+    "insufficientRate": 0,
+    "meanEff": 8.046882462659445,
+    "dupWorst": 0,
+    "uniqMin": 0.9615384615384616
+   },
+   {
+    "params": {
+     "topK": 12,
+     "reusePenalty": 0.5,
+     "entropyFloor": 0.6,
+     "candidateSupportFloor": 5,
+     "regularization": 0.1,
+     "balanceStrength": 1
+    },
+    "passRate": 0.4166666666666667,
+    "insufficientRate": 0,
+    "meanEff": 8.046882462659445,
+    "dupWorst": 0,
+    "uniqMin": 0.9615384615384616
+   },
+   {
+    "params": {
+     "topK": 20,
+     "reusePenalty": 1,
+     "entropyFloor": 0,
+     "candidateSupportFloor": 5,
+     "regularization": 0.1,
+     "balanceStrength": 1
+    },
+    "passRate": 0.3333333333333333,
+    "insufficientRate": 0,
+    "meanEff": 12.275681474160928,
+    "dupWorst": 0,
+    "uniqMin": 0.9230769230769231
+   },
+   {
+    "params": {
+     "topK": 20,
+     "reusePenalty": 1,
+     "entropyFloor": 0,
+     "candidateSupportFloor": 8,
+     "regularization": 0.1,
+     "balanceStrength": 1
+    },
+    "passRate": 0.3333333333333333,
+    "insufficientRate": 0,
+    "meanEff": 12.275681474160928,
+    "dupWorst": 0,
+    "uniqMin": 0.9230769230769231
+   },
+   {
+    "params": {
+     "topK": 20,
+     "reusePenalty": 1,
+     "entropyFloor": 0.6,
+     "candidateSupportFloor": 5,
+     "regularization": 0.1,
+     "balanceStrength": 1
+    },
+    "passRate": 0.3333333333333333,
+    "insufficientRate": 0,
+    "meanEff": 12.275681474160928,
+    "dupWorst": 0,
+    "uniqMin": 0.9230769230769231
+   },
+   {
+    "params": {
+     "topK": 20,
+     "reusePenalty": 1,
+     "entropyFloor": 0.6,
+     "candidateSupportFloor": 8,
+     "regularization": 0.1,
+     "balanceStrength": 1
+    },
+    "passRate": 0.3333333333333333,
+    "insufficientRate": 0,
+    "meanEff": 12.275681474160928,
+    "dupWorst": 0,
+    "uniqMin": 0.9230769230769231
+   },
+   {
+    "params": {
+     "topK": 12,
+     "reusePenalty": 1,
+     "entropyFloor": 0,
+     "candidateSupportFloor": 5,
+     "regularization": 0.1,
+     "balanceStrength": 1
+    },
+    "passRate": 0.3333333333333333,
+    "insufficientRate": 0,
+    "meanEff": 8.108840345219308,
+    "dupWorst": 0,
+    "uniqMin": 0.9615384615384616
+   },
+   {
+    "params": {
+     "topK": 12,
+     "reusePenalty": 1,
+     "entropyFloor": 0.6,
+     "candidateSupportFloor": 5,
+     "regularization": 0.1,
+     "balanceStrength": 1
+    },
+    "passRate": 0.3333333333333333,
+    "insufficientRate": 0,
+    "meanEff": 8.108840345219308,
+    "dupWorst": 0,
+    "uniqMin": 0.9615384615384616
+   },
+   {
+    "params": {
+     "topK": 8,
+     "reusePenalty": 1,
+     "entropyFloor": 0,
+     "candidateSupportFloor": 5,
+     "regularization": 0.1,
+     "balanceStrength": 1
+    },
+    "passRate": 0.3333333333333333,
+    "insufficientRate": 0,
+    "meanEff": 5.815116054976921,
+    "dupWorst": 0,
+    "uniqMin": 0.9230769230769231
+   },
+   {
+    "params": {
+     "topK": 8,
+     "reusePenalty": 1,
+     "entropyFloor": 0.6,
+     "candidateSupportFloor": 5,
+     "regularization": 0.1,
+     "balanceStrength": 1
+    },
+    "passRate": 0.3333333333333333,
+    "insufficientRate": 0,
+    "meanEff": 5.815116054976921,
+    "dupWorst": 0,
+    "uniqMin": 0.9230769230769231
+   },
+   {
+    "params": {
+     "topK": 8,
+     "reusePenalty": 1,
+     "entropyFloor": 0,
+     "candidateSupportFloor": 8,
+     "regularization": 0.1,
+     "balanceStrength": 1
+    },
+    "passRate": 0.3333333333333333,
+    "insufficientRate": 0,
+    "meanEff": 5.780301154042354,
+    "dupWorst": 0,
+    "uniqMin": 0.9230769230769231
+   },
+   {
+    "params": {
+     "topK": 8,
+     "reusePenalty": 1,
+     "entropyFloor": 0.6,
+     "candidateSupportFloor": 8,
+     "regularization": 0.1,
+     "balanceStrength": 1
+    },
+    "passRate": 0.3333333333333333,
+    "insufficientRate": 0,
+    "meanEff": 5.780301154042354,
+    "dupWorst": 0,
+    "uniqMin": 0.9230769230769231
+   },
+   {
+    "params": {
+     "topK": 8,
+     "reusePenalty": 0.5,
+     "entropyFloor": 0,
+     "candidateSupportFloor": 5,
+     "regularization": 0.1,
+     "balanceStrength": 1
+    },
+    "passRate": 0.25,
+    "insufficientRate": 0,
+    "meanEff": 5.7039846240687915,
+    "dupWorst": 0,
+    "uniqMin": 0.9230769230769231
+   },
+   {
+    "params": {
+     "topK": 8,
+     "reusePenalty": 0.5,
+     "entropyFloor": 0,
+     "candidateSupportFloor": 8,
+     "regularization": 0.1,
+     "balanceStrength": 1
+    },
+    "passRate": 0.25,
+    "insufficientRate": 0,
+    "meanEff": 5.7039846240687915,
+    "dupWorst": 0,
+    "uniqMin": 0.9230769230769231
+   },
+   {
+    "params": {
+     "topK": 8,
+     "reusePenalty": 0.5,
+     "entropyFloor": 0.6,
+     "candidateSupportFloor": 5,
+     "regularization": 0.1,
+     "balanceStrength": 1
+    },
+    "passRate": 0.25,
+    "insufficientRate": 0,
+    "meanEff": 5.7039846240687915,
+    "dupWorst": 0,
+    "uniqMin": 0.9230769230769231
+   },
+   {
+    "params": {
+     "topK": 8,
+     "reusePenalty": 0.5,
+     "entropyFloor": 0.6,
+     "candidateSupportFloor": 8,
+     "regularization": 0.1,
+     "balanceStrength": 1
+    },
+    "passRate": 0.25,
+    "insufficientRate": 0,
+    "meanEff": 5.7039846240687915,
+    "dupWorst": 0,
+    "uniqMin": 0.9230769230769231
+   }
+  ]
+ },
+ "folds": [
+  {
+   "evalMonth": "2026-02",
+   "trainMonths": [
+    "2026-01"
+   ],
+   "status": "INSUFFICIENT_CROSS_FIT_SUPPORT",
+   "proof": {
+    "excludedMonthHours": 576,
+    "feasibleHoursUnderMonthCap": 0,
+    "feasibleHoursUnderReuseCap": 120000,
+    "targetHours": 0,
+    "fillable": false,
+    "bindingConstraint": "NONE",
+    "reason": "INSUFFICIENT_CROSS_FIT_SUPPORT: 1 training month(s) cannot satisfy the 0.5 month-concentration cap (need ≥2)",
+    "trainingMonthCount": 1,
+    "perMonthAvailableHours": [
+     696
+    ]
+   },
+   "librarySize": 625
+  },
+  {
+   "evalMonth": "2026-03",
+   "trainMonths": [
+    "2026-01",
+    "2026-02"
+   ],
+   "status": "EVALUATED",
+   "proof": {
+    "excludedMonthHours": 648,
+    "feasibleHoursUnderMonthCap": 1248,
+    "feasibleHoursUnderReuseCap": 249024,
+    "targetHours": 576,
+    "fillable": true,
+    "bindingConstraint": "MONTH_CONCENTRATION_CAP",
+    "reason": "FILLABLE (target 576h, pack slack 0h)",
+    "trainingMonthCount": 2,
+    "perMonthAvailableHours": [
+     744,
+     624
+    ]
+   },
+   "librarySize": 1297,
+   "target": 576,
+   "seed": {
+    "n": 100,
+    "passRate": 0.27,
+    "insufficientRate": 0.01,
+    "invariantFailures": 0,
+    "excess": {
+     "p5": -0.07727975270479134,
+     "p50": 0.10453842911339048,
+     "p95": 0.2863566109315723,
+     "worst": 0.46817479274975404
+    },
+    "ratio": {
+     "p50": 2.352727272727273,
+     "p95": 4.705454545454546,
+     "worst": 7.058181818181818
+    },
+    "seamClassifier": {
+     "p50": 0.6388888888888888,
+     "p95": 0.8611111111111112,
+     "worst": 1
+    },
+    "longestRun": {
+     "p50": 96,
+     "p95": 144,
+     "worst": 144
+    },
+    "dupSeq": {
+     "p50": 0,
+     "p95": 0,
+     "worst": 0
+    },
+    "uniqueContinuation": {
+     "p50": 1,
+     "min": 0.9166666666666666
+    },
+    "monthConcentration": {
+     "p50": 0.5,
+     "p95": 0.5,
+     "worst": 0.5
+    },
+    "meanEffectiveCandidates": {
+     "p50": 8.083290823868415,
+     "min": 7.062757536710169
+    },
+    "failureCounts": {
+     "seam-excess": 58,
+     "seam-ratio": 58,
+     "seam-classifier": 40,
+     "seam-ci-lower": 2,
+     "stylized-facts": 3,
+     "insufficient": 1
+    }
+   },
+   "caps": [
+    {
+     "cap": 48,
+     "n": 30,
+     "passRate": 0.1,
+     "insufficientRate": 0.03333333333333333,
+     "invariantFailures": 0,
+     "excess": {
+      "p5": -0.07727975270479134,
+      "p50": 0.10453842911339048,
+      "p95": 0.2863566109315723,
+      "worst": 0.3772657018406632
+     },
+     "ratio": {
+      "p50": 2.352727272727273,
+      "p95": 4.705454545454546,
+      "worst": 5.881818181818182
+     },
+     "seamClassifier": {
+      "p50": 0.6111111111111112,
+      "p95": 0.7777777777777778,
+      "worst": 0.8888888888888888
+     },
+     "longestRun": {
+      "p50": 48,
+      "p95": 48,
+      "worst": 48
+     },
+     "dupSeq": {
+      "p50": 0,
+      "p95": 0,
+      "worst": 0
+     },
+     "uniqueContinuation": {
+      "p50": 1,
+      "min": 0.9166666666666666
+     },
+     "monthConcentration": {
+      "p50": 0.5,
+      "p95": 0.5,
+      "worst": 0.5
+     },
+     "meanEffectiveCandidates": {
+      "p50": 10.191011027619806,
+      "min": 9.336830594915707
+     },
+     "failureCounts": {
+      "seam-classifier": 10,
+      "seam-excess": 21,
+      "seam-ratio": 21,
+      "insufficient": 1,
+      "seam-ci-lower": 1
+     }
+    },
+    {
+     "cap": 72,
+     "n": 30,
+     "passRate": 0.1,
+     "insufficientRate": 0.03333333333333333,
+     "invariantFailures": 0,
+     "excess": {
+      "p5": -0.07727975270479134,
+      "p50": 0.10453842911339048,
+      "p95": 0.2863566109315723,
+      "worst": 0.3772657018406632
+     },
+     "ratio": {
+      "p50": 2.352727272727273,
+      "p95": 4.705454545454546,
+      "worst": 5.881818181818182
+     },
+     "seamClassifier": {
+      "p50": 0.6111111111111112,
+      "p95": 0.7777777777777778,
+      "worst": 0.8888888888888888
+     },
+     "longestRun": {
+      "p50": 48,
+      "p95": 48,
+      "worst": 48
+     },
+     "dupSeq": {
+      "p50": 0,
+      "p95": 0,
+      "worst": 0
+     },
+     "uniqueContinuation": {
+      "p50": 1,
+      "min": 0.9166666666666666
+     },
+     "monthConcentration": {
+      "p50": 0.5,
+      "p95": 0.5,
+      "worst": 0.5
+     },
+     "meanEffectiveCandidates": {
+      "p50": 10.191011027619806,
+      "min": 9.336830594915707
+     },
+     "failureCounts": {
+      "seam-classifier": 10,
+      "seam-excess": 21,
+      "seam-ratio": 21,
+      "insufficient": 1,
+      "seam-ci-lower": 1
+     }
+    },
+    {
+     "cap": 96,
+     "n": 30,
+     "passRate": 0.26666666666666666,
+     "insufficientRate": 0,
+     "invariantFailures": 0,
+     "excess": {
+      "p5": -0.07727975270479134,
+      "p50": 0.013629338204299568,
+      "p95": 0.2863566109315723,
+      "worst": 0.46817479274975404
+     },
+     "ratio": {
+      "p50": 1.1763636363636365,
+      "p95": 4.705454545454546,
+      "worst": 7.058181818181818
+     },
+     "seamClassifier": {
+      "p50": 0.6388888888888888,
+      "p95": 0.8055555555555556,
+      "worst": 1
+     },
+     "longestRun": {
+      "p50": 96,
+      "p95": 96,
+      "worst": 96
+     },
+     "dupSeq": {
+      "p50": 0,
+      "p95": 0,
+      "worst": 0
+     },
+     "uniqueContinuation": {
+      "p50": 1,
+      "min": 0.9166666666666666
+     },
+     "monthConcentration": {
+      "p50": 0.5,
+      "p95": 0.5,
+      "worst": 0.5
+     },
+     "meanEffectiveCandidates": {
+      "p50": 8.322191222512162,
+      "min": 7.525149840392647
+     },
+     "failureCounts": {
+      "seam-excess": 12,
+      "seam-ratio": 12,
+      "stylized-facts": 1,
+      "seam-ci-lower": 2,
+      "seam-classifier": 13
+     }
+    },
+    {
+     "cap": 120,
+     "n": 30,
+     "passRate": 0.26666666666666666,
+     "insufficientRate": 0,
+     "invariantFailures": 0,
+     "excess": {
+      "p5": -0.07727975270479134,
+      "p50": 0.013629338204299568,
+      "p95": 0.2863566109315723,
+      "worst": 0.46817479274975404
+     },
+     "ratio": {
+      "p50": 1.1763636363636365,
+      "p95": 4.705454545454546,
+      "worst": 7.058181818181818
+     },
+     "seamClassifier": {
+      "p50": 0.6388888888888888,
+      "p95": 0.8055555555555556,
+      "worst": 1
+     },
+     "longestRun": {
+      "p50": 96,
+      "p95": 96,
+      "worst": 96
+     },
+     "dupSeq": {
+      "p50": 0,
+      "p95": 0,
+      "worst": 0
+     },
+     "uniqueContinuation": {
+      "p50": 1,
+      "min": 0.9166666666666666
+     },
+     "monthConcentration": {
+      "p50": 0.5,
+      "p95": 0.5,
+      "worst": 0.5
+     },
+     "meanEffectiveCandidates": {
+      "p50": 8.322191222512162,
+      "min": 7.525149840392647
+     },
+     "failureCounts": {
+      "seam-excess": 12,
+      "seam-ratio": 12,
+      "stylized-facts": 1,
+      "seam-ci-lower": 2,
+      "seam-classifier": 13
+     }
+    },
+    {
+     "cap": 144,
+     "n": 30,
+     "passRate": 0.26666666666666666,
+     "insufficientRate": 0,
+     "invariantFailures": 0,
+     "excess": {
+      "p5": -0.07727975270479134,
+      "p50": 0.10453842911339048,
+      "p95": 0.19544752002248136,
+      "worst": 0.46817479274975404
+     },
+     "ratio": {
+      "p50": 2.352727272727273,
+      "p95": 3.529090909090909,
+      "worst": 7.058181818181818
+     },
+     "seamClassifier": {
+      "p50": 0.6111111111111112,
+      "p95": 0.8055555555555556,
+      "worst": 0.9444444444444444
+     },
+     "longestRun": {
+      "p50": 96,
+      "p95": 144,
+      "worst": 144
+     },
+     "dupSeq": {
+      "p50": 0,
+      "p95": 0,
+      "worst": 0
+     },
+     "uniqueContinuation": {
+      "p50": 1,
+      "min": 1
+     },
+     "monthConcentration": {
+      "p50": 0.5,
+      "p95": 0.5,
+      "worst": 0.5
+     },
+     "meanEffectiveCandidates": {
+      "p50": 7.972112909810551,
+      "min": 7.181913112814123
+     },
+     "failureCounts": {
+      "seam-excess": 18,
+      "seam-ratio": 18,
+      "seam-classifier": 10,
+      "seam-ci-lower": 1
+     }
+    }
+   ],
+   "perturbations": [
+    {
+     "name": "remove_top_1pct_successors",
+     "n": 30,
+     "passRate": 0.36666666666666664,
+     "insufficientRate": 0,
+     "invariantFailures": 0,
+     "excess": {
+      "p5": -0.07727975270479134,
+      "p50": 0.013629338204299568,
+      "p95": 0.19544752002248136,
+      "worst": 0.3772657018406632
+     },
+     "ratio": {
+      "p50": 1.1763636363636365,
+      "p95": 3.529090909090909,
+      "worst": 5.881818181818182
+     },
+     "seamClassifier": {
+      "p50": 0.6111111111111112,
+      "p95": 0.8611111111111112,
+      "worst": 0.9722222222222222
+     },
+     "longestRun": {
+      "p50": 96,
+      "p95": 144,
+      "worst": 144
+     },
+     "dupSeq": {
+      "p50": 0,
+      "p95": 0,
+      "worst": 0
+     },
+     "uniqueContinuation": {
+      "p50": 1,
+      "min": 1
+     },
+     "monthConcentration": {
+      "p50": 0.5,
+      "p95": 0.5,
+      "worst": 0.5
+     },
+     "meanEffectiveCandidates": {
+      "p50": 8.030899560036566,
+      "min": 7.183693664787137
+     },
+     "failureCounts": {
+      "seam-excess": 15,
+      "seam-ratio": 15,
+      "seam-classifier": 13,
+      "seam-ci-lower": 1
+     }
+    },
+    {
+     "name": "remove_top_source_month",
+     "n": 30,
+     "passRate": 0,
+     "insufficientRate": 1,
+     "invariantFailures": 0,
+     "excess": {
+      "p5": null,
+      "p50": null,
+      "p95": null,
+      "worst": null
+     },
+     "ratio": {
+      "p50": null,
+      "p95": null,
+      "worst": null
+     },
+     "seamClassifier": {
+      "p50": null,
+      "p95": null,
+      "worst": null
+     },
+     "longestRun": {
+      "p50": null,
+      "p95": null,
+      "worst": null
+     },
+     "dupSeq": {
+      "p50": null,
+      "p95": null,
+      "worst": null
+     },
+     "uniqueContinuation": {
+      "p50": null,
+      "min": null
+     },
+     "monthConcentration": {
+      "p50": null,
+      "p95": null,
+      "worst": null
+     },
+     "meanEffectiveCandidates": {
+      "p50": null,
+      "min": null
+     },
+     "failureCounts": {
+      "seam-excess": 16,
+      "seam-ratio": 16,
+      "seam-classifier": 9,
+      "insufficient": 30,
+      "stylized-facts": 5,
+      "seam-ci-lower": 1
+     }
+    },
+    {
+     "name": "exclude_rank_one_matches",
+     "n": 30,
+     "passRate": 0.3333333333333333,
+     "insufficientRate": 0,
+     "invariantFailures": 0,
+     "excess": {
+      "p5": -0.07727975270479134,
+      "p50": 0.10453842911339048,
+      "p95": 0.2863566109315723,
+      "worst": 0.2863566109315723
+     },
+     "ratio": {
+      "p50": 2.352727272727273,
+      "p95": 4.705454545454546,
+      "worst": 4.705454545454546
+     },
+     "seamClassifier": {
+      "p50": 0.5833333333333333,
+      "p95": 0.75,
+      "worst": 0.8611111111111112
+     },
+     "longestRun": {
+      "p50": 96,
+      "p95": 96,
+      "worst": 144
+     },
+     "dupSeq": {
+      "p50": 0,
+      "p95": 0,
+      "worst": 0
+     },
+     "uniqueContinuation": {
+      "p50": 1,
+      "min": 0.9166666666666666
+     },
+     "monthConcentration": {
+      "p50": 0.5,
+      "p95": 0.5,
+      "worst": 0.5
+     },
+     "meanEffectiveCandidates": {
+      "p50": 12,
+      "min": 11.818181818181818
+     },
+     "failureCounts": {
+      "seam-excess": 16,
+      "seam-ratio": 16,
+      "seam-classifier": 9
+     }
+    },
+    {
+     "name": "cap_reuse_at_2",
+     "n": 30,
+     "passRate": 0.26666666666666666,
+     "insufficientRate": 0,
+     "invariantFailures": 0,
+     "excess": {
+      "p5": -0.07727975270479134,
+      "p50": 0.10453842911339048,
+      "p95": 0.19544752002248136,
+      "worst": 0.46817479274975404
+     },
+     "ratio": {
+      "p50": 2.352727272727273,
+      "p95": 3.529090909090909,
+      "worst": 7.058181818181818
+     },
+     "seamClassifier": {
+      "p50": 0.6111111111111112,
+      "p95": 0.8055555555555556,
+      "worst": 0.9444444444444444
+     },
+     "longestRun": {
+      "p50": 96,
+      "p95": 144,
+      "worst": 144
+     },
+     "dupSeq": {
+      "p50": 0,
+      "p95": 0,
+      "worst": 0
+     },
+     "uniqueContinuation": {
+      "p50": 1,
+      "min": 1
+     },
+     "monthConcentration": {
+      "p50": 0.5,
+      "p95": 0.5,
+      "worst": 0.5
+     },
+     "meanEffectiveCandidates": {
+      "p50": 7.972112909810551,
+      "min": 7.181913112814123
+     },
+     "failureCounts": {
+      "seam-excess": 18,
+      "seam-ratio": 18,
+      "seam-classifier": 10,
+      "seam-ci-lower": 1
+     }
+    },
+    {
+     "name": "min_entropy_floor",
+     "n": 30,
+     "passRate": 0.2,
+     "insufficientRate": 0,
+     "invariantFailures": 0,
+     "excess": {
+      "p5": -0.07727975270479134,
+      "p50": 0.10453842911339048,
+      "p95": 0.19544752002248136,
+      "worst": 0.559083883658845
+     },
+     "ratio": {
+      "p50": 2.352727272727273,
+      "p95": 3.529090909090909,
+      "worst": 8.234545454545454
+     },
+     "seamClassifier": {
+      "p50": 0.5833333333333334,
+      "p95": 0.8333333333333334,
+      "worst": 0.9444444444444444
+     },
+     "longestRun": {
+      "p50": 96,
+      "p95": 144,
+      "worst": 144
+     },
+     "dupSeq": {
+      "p50": 0,
+      "p95": 0,
+      "worst": 0
+     },
+     "uniqueContinuation": {
+      "p50": 1,
+      "min": 1
+     },
+     "monthConcentration": {
+      "p50": 0.5,
+      "p95": 0.5,
+      "worst": 0.5
+     },
+     "meanEffectiveCandidates": {
+      "p50": 8.277455698928787,
+      "min": 7.500460553455435
+     },
+     "failureCounts": {
+      "seam-excess": 19,
+      "seam-ratio": 19,
+      "seam-classifier": 11,
+      "stylized-facts": 1,
+      "seam-ci-lower": 1
+     }
+    },
+    {
+     "name": "remove_regime_UPTREND",
+     "n": 30,
+     "passRate": 0.03333333333333333,
+     "insufficientRate": 0.9333333333333333,
+     "invariantFailures": 0,
+     "excess": {
+      "p5": -0.07727975270479134,
+      "p50": -0.07727975270479134,
+      "p95": -0.07727975270479134,
+      "worst": 0.013629338204299568
+     },
+     "ratio": {
+      "p50": 0,
+      "p95": 0,
+      "worst": 1.1763636363636365
+     },
+     "seamClassifier": {
+      "p50": 0.6111111111111112,
+      "p95": 0.6111111111111112,
+      "worst": 0.6666666666666666
+     },
+     "longestRun": {
+      "p50": 96,
+      "p95": 96,
+      "worst": 144
+     },
+     "dupSeq": {
+      "p50": 0,
+      "p95": 0,
+      "worst": 0
+     },
+     "uniqueContinuation": {
+      "p50": 1,
+      "min": 1
+     },
+     "monthConcentration": {
+      "p50": 0.5,
+      "p95": 0.5,
+      "worst": 0.5
+     },
+     "meanEffectiveCandidates": {
+      "p50": 8.496568045327946,
+      "min": 8.496568045327946
+     },
+     "failureCounts": {
+      "seam-excess": 8,
+      "seam-ratio": 9,
+      "seam-classifier": 13,
+      "insufficient": 28,
+      "stylized-facts": 17
+     }
+    }
+   ]
+  },
+  {
+   "evalMonth": "2026-04",
+   "trainMonths": [
+    "2026-01",
+    "2026-02",
+    "2026-03"
+   ],
+   "status": "EVALUATED",
+   "proof": {
+    "excludedMonthHours": 624,
+    "feasibleHoursUnderMonthCap": 2064,
+    "feasibleHoursUnderReuseCap": 391872,
+    "targetHours": 624,
+    "fillable": true,
+    "bindingConstraint": "EXCLUDED_MONTH_HOURS",
+    "reason": "FILLABLE (target 624h, pack slack 240h)",
+    "trainingMonthCount": 3,
+    "perMonthAvailableHours": [
+     744,
+     672,
+     696
+    ]
+   },
+   "librarySize": 2041,
+   "target": 624,
+   "seed": {
+    "n": 100,
+    "passRate": 0.22,
+    "insufficientRate": 0,
+    "invariantFailures": 0,
+    "excess": {
+     "p5": -0.0898876404494382,
+     "p50": -0.006554307116104871,
+     "p95": 0.24344569288389512,
+     "worst": 0.3267790262172285
+    },
+    "ratio": {
+     "p50": 0.9270833333333333,
+     "p95": 3.708333333333333,
+     "worst": 4.635416666666667
+    },
+    "seamClassifier": {
+     "p50": 0.75,
+     "p95": 0.9444444444444444,
+     "worst": 0.9722222222222222
+    },
+    "longestRun": {
+     "p50": 96,
+     "p95": 144,
+     "worst": 144
+    },
+    "dupSeq": {
+     "p50": 0,
+     "p95": 0,
+     "worst": 0
+    },
+    "uniqueContinuation": {
+     "p50": 1,
+     "min": 0.9230769230769231
+    },
+    "monthConcentration": {
+     "p50": 0.46153846153846156,
+     "p95": 0.46153846153846156,
+     "worst": 0.46153846153846156
+    },
+    "meanEffectiveCandidates": {
+     "p50": 8.263691280525668,
+     "min": 7.236017260319823
+    },
+    "failureCounts": {
+     "seam-classifier": 71,
+     "seam-excess": 27,
+     "seam-ratio": 27,
+     "stylized-facts": 12
+    }
+   },
+   "caps": [
+    {
+     "cap": 48,
+     "n": 30,
+     "passRate": 0.13333333333333333,
+     "insufficientRate": 0,
+     "invariantFailures": 0,
+     "excess": {
+      "p5": -0.0898876404494382,
+      "p50": -0.006554307116104871,
+      "p95": 0.1601123595505618,
+      "worst": 0.24344569288389512
+     },
+     "ratio": {
+      "p50": 0.9270833333333333,
+      "p95": 2.78125,
+      "worst": 3.708333333333333
+     },
+     "seamClassifier": {
+      "p50": 0.6944444444444444,
+      "p95": 0.8611111111111112,
+      "worst": 1
+     },
+     "longestRun": {
+      "p50": 48,
+      "p95": 48,
+      "worst": 48
+     },
+     "dupSeq": {
+      "p50": 0,
+      "p95": 0,
+      "worst": 0
+     },
+     "uniqueContinuation": {
+      "p50": 1,
+      "min": 0.9230769230769231
+     },
+     "monthConcentration": {
+      "p50": 0.46153846153846156,
+      "p95": 0.46153846153846156,
+      "worst": 0.46153846153846156
+     },
+     "meanEffectiveCandidates": {
+      "p50": 10.252599270946886,
+      "min": 9.519359205590211
+     },
+     "failureCounts": {
+      "seam-excess": 8,
+      "seam-ratio": 8,
+      "seam-classifier": 22,
+      "stylized-facts": 3
+     }
+    },
+    {
+     "cap": 72,
+     "n": 30,
+     "passRate": 0.13333333333333333,
+     "insufficientRate": 0,
+     "invariantFailures": 0,
+     "excess": {
+      "p5": -0.0898876404494382,
+      "p50": -0.006554307116104871,
+      "p95": 0.1601123595505618,
+      "worst": 0.24344569288389512
+     },
+     "ratio": {
+      "p50": 0.9270833333333333,
+      "p95": 2.78125,
+      "worst": 3.708333333333333
+     },
+     "seamClassifier": {
+      "p50": 0.6944444444444444,
+      "p95": 0.8611111111111112,
+      "worst": 1
+     },
+     "longestRun": {
+      "p50": 48,
+      "p95": 48,
+      "worst": 48
+     },
+     "dupSeq": {
+      "p50": 0,
+      "p95": 0,
+      "worst": 0
+     },
+     "uniqueContinuation": {
+      "p50": 1,
+      "min": 0.9230769230769231
+     },
+     "monthConcentration": {
+      "p50": 0.46153846153846156,
+      "p95": 0.46153846153846156,
+      "worst": 0.46153846153846156
+     },
+     "meanEffectiveCandidates": {
+      "p50": 10.252599270946886,
+      "min": 9.519359205590211
+     },
+     "failureCounts": {
+      "seam-excess": 8,
+      "seam-ratio": 8,
+      "seam-classifier": 22,
+      "stylized-facts": 3
+     }
+    },
+    {
+     "cap": 96,
+     "n": 30,
+     "passRate": 0.26666666666666666,
+     "insufficientRate": 0,
+     "invariantFailures": 0,
+     "excess": {
+      "p5": -0.006554307116104871,
+      "p50": -0.006554307116104871,
+      "p95": 0.1601123595505618,
+      "worst": 0.3267790262172285
+     },
+     "ratio": {
+      "p50": 0.9270833333333333,
+      "p95": 2.78125,
+      "worst": 4.635416666666667
+     },
+     "seamClassifier": {
+      "p50": 0.7222222222222222,
+      "p95": 0.8888888888888888,
+      "worst": 0.9444444444444444
+     },
+     "longestRun": {
+      "p50": 96,
+      "p95": 96,
+      "worst": 96
+     },
+     "dupSeq": {
+      "p50": 0,
+      "p95": 0,
+      "worst": 0
+     },
+     "uniqueContinuation": {
+      "p50": 1,
+      "min": 0.9230769230769231
+     },
+     "monthConcentration": {
+      "p50": 0.46153846153846156,
+      "p95": 0.46153846153846156,
+      "worst": 0.46153846153846156
+     },
+     "meanEffectiveCandidates": {
+      "p50": 8.525654559453752,
+      "min": 7.695574296511367
+     },
+     "failureCounts": {
+      "seam-classifier": 21,
+      "seam-excess": 6,
+      "seam-ratio": 6,
+      "stylized-facts": 1
+     }
+    },
+    {
+     "cap": 120,
+     "n": 30,
+     "passRate": 0.26666666666666666,
+     "insufficientRate": 0,
+     "invariantFailures": 0,
+     "excess": {
+      "p5": -0.006554307116104871,
+      "p50": -0.006554307116104871,
+      "p95": 0.1601123595505618,
+      "worst": 0.3267790262172285
+     },
+     "ratio": {
+      "p50": 0.9270833333333333,
+      "p95": 2.78125,
+      "worst": 4.635416666666667
+     },
+     "seamClassifier": {
+      "p50": 0.7222222222222222,
+      "p95": 0.8888888888888888,
+      "worst": 0.9444444444444444
+     },
+     "longestRun": {
+      "p50": 96,
+      "p95": 96,
+      "worst": 96
+     },
+     "dupSeq": {
+      "p50": 0,
+      "p95": 0,
+      "worst": 0
+     },
+     "uniqueContinuation": {
+      "p50": 1,
+      "min": 0.9230769230769231
+     },
+     "monthConcentration": {
+      "p50": 0.46153846153846156,
+      "p95": 0.46153846153846156,
+      "worst": 0.46153846153846156
+     },
+     "meanEffectiveCandidates": {
+      "p50": 8.525654559453752,
+      "min": 7.695574296511367
+     },
+     "failureCounts": {
+      "seam-classifier": 21,
+      "seam-excess": 6,
+      "seam-ratio": 6,
+      "stylized-facts": 1,
+      "seam-ci-lower": 1
+     }
+    },
+    {
+     "cap": 144,
+     "n": 30,
+     "passRate": 0.16666666666666666,
+     "insufficientRate": 0,
+     "invariantFailures": 0,
+     "excess": {
+      "p5": -0.0898876404494382,
+      "p50": -0.006554307116104871,
+      "p95": 0.24344569288389512,
+      "worst": 0.24344569288389512
+     },
+     "ratio": {
+      "p50": 0.9270833333333333,
+      "p95": 3.708333333333333,
+      "worst": 3.708333333333333
+     },
+     "seamClassifier": {
+      "p50": 0.7777777777777778,
+      "p95": 0.9166666666666666,
+      "worst": 0.9722222222222222
+     },
+     "longestRun": {
+      "p50": 96,
+      "p95": 144,
+      "worst": 144
+     },
+     "dupSeq": {
+      "p50": 0,
+      "p95": 0,
+      "worst": 0
+     },
+     "uniqueContinuation": {
+      "p50": 1,
+      "min": 0.9230769230769231
+     },
+     "monthConcentration": {
+      "p50": 0.46153846153846156,
+      "p95": 0.46153846153846156,
+      "worst": 0.46153846153846156
+     },
+     "meanEffectiveCandidates": {
+      "p50": 8.175644016137069,
+      "min": 7.440373152191064
+     },
+     "failureCounts": {
+      "seam-classifier": 24,
+      "seam-excess": 5,
+      "seam-ratio": 5,
+      "stylized-facts": 3
+     }
+    }
+   ],
+   "perturbations": [
+    {
+     "name": "remove_top_1pct_successors",
+     "n": 30,
+     "passRate": 0.16666666666666666,
+     "insufficientRate": 0,
+     "invariantFailures": 0,
+     "excess": {
+      "p5": -0.0898876404494382,
+      "p50": -0.006554307116104871,
+      "p95": 0.1601123595505618,
+      "worst": 0.24344569288389512
+     },
+     "ratio": {
+      "p50": 0.9270833333333333,
+      "p95": 2.78125,
+      "worst": 3.708333333333333
+     },
+     "seamClassifier": {
+      "p50": 0.7777777777777778,
+      "p95": 0.9166666666666666,
+      "worst": 0.9444444444444444
+     },
+     "longestRun": {
+      "p50": 96,
+      "p95": 144,
+      "worst": 144
+     },
+     "dupSeq": {
+      "p50": 0,
+      "p95": 0,
+      "worst": 0
+     },
+     "uniqueContinuation": {
+      "p50": 1,
+      "min": 0.9230769230769231
+     },
+     "monthConcentration": {
+      "p50": 0.46153846153846156,
+      "p95": 0.46153846153846156,
+      "worst": 0.46153846153846156
+     },
+     "meanEffectiveCandidates": {
+      "p50": 8.286490546954388,
+      "min": 7.392914452119368
+     },
+     "failureCounts": {
+      "seam-classifier": 22,
+      "stylized-facts": 5,
+      "seam-excess": 6,
+      "seam-ratio": 6
+     }
+    },
+    {
+     "name": "remove_top_source_month",
+     "n": 30,
+     "passRate": 0,
+     "insufficientRate": 1,
+     "invariantFailures": 0,
+     "excess": {
+      "p5": null,
+      "p50": null,
+      "p95": null,
+      "worst": null
+     },
+     "ratio": {
+      "p50": null,
+      "p95": null,
+      "worst": null
+     },
+     "seamClassifier": {
+      "p50": null,
+      "p95": null,
+      "worst": null
+     },
+     "longestRun": {
+      "p50": null,
+      "p95": null,
+      "worst": null
+     },
+     "dupSeq": {
+      "p50": null,
+      "p95": null,
+      "worst": null
+     },
+     "uniqueContinuation": {
+      "p50": null,
+      "min": null
+     },
+     "monthConcentration": {
+      "p50": null,
+      "p95": null,
+      "worst": null
+     },
+     "meanEffectiveCandidates": {
+      "p50": null,
+      "min": null
+     },
+     "failureCounts": {
+      "insufficient": 30,
+      "seam-excess": 5,
+      "seam-ratio": 16,
+      "seam-classifier": 17,
+      "seam-ci-lower": 3,
+      "stylized-facts": 2
+     }
+    },
+    {
+     "name": "exclude_rank_one_matches",
+     "n": 30,
+     "passRate": 0.3333333333333333,
+     "insufficientRate": 0,
+     "invariantFailures": 0,
+     "excess": {
+      "p5": -0.0898876404494382,
+      "p50": 0.07677902621722846,
+      "p95": 0.1601123595505618,
+      "worst": 0.4101123595505618
+     },
+     "ratio": {
+      "p50": 1.8541666666666665,
+      "p95": 2.78125,
+      "worst": 5.5625
+     },
+     "seamClassifier": {
+      "p50": 0.75,
+      "p95": 0.9166666666666666,
+      "worst": 0.9444444444444444
+     },
+     "longestRun": {
+      "p50": 96,
+      "p95": 96,
+      "worst": 144
+     },
+     "dupSeq": {
+      "p50": 0,
+      "p95": 0,
+      "worst": 0
+     },
+     "uniqueContinuation": {
+      "p50": 1,
+      "min": 0.9230769230769231
+     },
+     "monthConcentration": {
+      "p50": 0.46153846153846156,
+      "p95": 0.46153846153846156,
+      "worst": 0.46153846153846156
+     },
+     "meanEffectiveCandidates": {
+      "p50": 12,
+      "min": 12
+     },
+     "failureCounts": {
+      "seam-classifier": 20,
+      "seam-excess": 7,
+      "seam-ratio": 7,
+      "stylized-facts": 3,
+      "seam-ci-lower": 1
+     }
+    },
+    {
+     "name": "cap_reuse_at_2",
+     "n": 30,
+     "passRate": 0.16666666666666666,
+     "insufficientRate": 0,
+     "invariantFailures": 0,
+     "excess": {
+      "p5": -0.0898876404494382,
+      "p50": -0.006554307116104871,
+      "p95": 0.24344569288389512,
+      "worst": 0.24344569288389512
+     },
+     "ratio": {
+      "p50": 0.9270833333333333,
+      "p95": 3.708333333333333,
+      "worst": 3.708333333333333
+     },
+     "seamClassifier": {
+      "p50": 0.7777777777777778,
+      "p95": 0.9166666666666666,
+      "worst": 0.9722222222222222
+     },
+     "longestRun": {
+      "p50": 96,
+      "p95": 144,
+      "worst": 144
+     },
+     "dupSeq": {
+      "p50": 0,
+      "p95": 0,
+      "worst": 0
+     },
+     "uniqueContinuation": {
+      "p50": 1,
+      "min": 0.9230769230769231
+     },
+     "monthConcentration": {
+      "p50": 0.46153846153846156,
+      "p95": 0.46153846153846156,
+      "worst": 0.46153846153846156
+     },
+     "meanEffectiveCandidates": {
+      "p50": 8.175644016137069,
+      "min": 7.440373152191064
+     },
+     "failureCounts": {
+      "seam-classifier": 24,
+      "seam-excess": 5,
+      "seam-ratio": 5,
+      "stylized-facts": 3
+     }
+    },
+    {
+     "name": "min_entropy_floor",
+     "n": 30,
+     "passRate": 0.2,
+     "insufficientRate": 0,
+     "invariantFailures": 0,
+     "excess": {
+      "p5": -0.0898876404494382,
+      "p50": -0.006554307116104871,
+      "p95": 0.1601123595505618,
+      "worst": 0.3267790262172285
+     },
+     "ratio": {
+      "p50": 0.9270833333333333,
+      "p95": 2.78125,
+      "worst": 4.635416666666667
+     },
+     "seamClassifier": {
+      "p50": 0.7777777777777778,
+      "p95": 0.9444444444444444,
+      "worst": 1
+     },
+     "longestRun": {
+      "p50": 96,
+      "p95": 144,
+      "worst": 144
+     },
+     "dupSeq": {
+      "p50": 0,
+      "p95": 0,
+      "worst": 0
+     },
+     "uniqueContinuation": {
+      "p50": 1,
+      "min": 1
+     },
+     "monthConcentration": {
+      "p50": 0.46153846153846156,
+      "p95": 0.46153846153846156,
+      "worst": 0.46153846153846156
+     },
+     "meanEffectiveCandidates": {
+      "p50": 8.49581968354654,
+      "min": 7.69163737954348
+     },
+     "failureCounts": {
+      "seam-classifier": 24,
+      "seam-excess": 5,
+      "seam-ratio": 5,
+      "stylized-facts": 3
+     }
+    },
+    {
+     "name": "remove_regime_UPTREND",
+     "n": 30,
+     "passRate": 0,
+     "insufficientRate": 0.9666666666666667,
+     "invariantFailures": 0,
+     "excess": {
+      "p5": -0.0898876404494382,
+      "p50": -0.0898876404494382,
+      "p95": -0.0898876404494382,
+      "worst": -0.0898876404494382
+     },
+     "ratio": {
+      "p50": 0,
+      "p95": 0,
+      "worst": 0
+     },
+     "seamClassifier": {
+      "p50": 0.8333333333333334,
+      "p95": 0.8333333333333334,
+      "worst": 0.8333333333333334
+     },
+     "longestRun": {
+      "p50": 48,
+      "p95": 48,
+      "worst": 48
+     },
+     "dupSeq": {
+      "p50": 0,
+      "p95": 0,
+      "worst": 0
+     },
+     "uniqueContinuation": {
+      "p50": 1,
+      "min": 1
+     },
+     "monthConcentration": {
+      "p50": 0.46153846153846156,
+      "p95": 0.46153846153846156,
+      "worst": 0.46153846153846156
+     },
+     "meanEffectiveCandidates": {
+      "p50": 8.189055183816823,
+      "min": 8.189055183816823
+     },
+     "failureCounts": {
+      "seam-classifier": 15,
+      "insufficient": 29,
+      "seam-excess": 7,
+      "seam-ratio": 7,
+      "seam-ci-lower": 2,
+      "stylized-facts": 18
+     }
+    }
+   ]
+  },
+  {
+   "evalMonth": "2026-05",
+   "trainMonths": [
+    "2026-01",
+    "2026-02",
+    "2026-03",
+    "2026-04"
+   ],
+   "status": "EVALUATED",
+   "proof": {
+    "excludedMonthHours": 648,
+    "feasibleHoursUnderMonthCap": 2784,
+    "feasibleHoursUnderReuseCap": 530112,
+    "targetHours": 624,
+    "fillable": true,
+    "bindingConstraint": "EXCLUDED_MONTH_HOURS",
+    "reason": "FILLABLE (target 624h, pack slack 528h)",
+    "trainingMonthCount": 4,
+    "perMonthAvailableHours": [
+     744,
+     672,
+     744,
+     672
+    ]
+   },
+   "librarySize": 2761,
+   "target": 624,
+   "seed": {
+    "n": 100,
+    "passRate": 0.13,
+    "insufficientRate": 0,
+    "invariantFailures": 0,
+    "excess": {
+     "p5": -0.080370942812983,
+     "p50": 0.0029623905203503276,
+     "p95": 0.2529623905203503,
+     "worst": 0.33629572385368367
+    },
+    "ratio": {
+     "p50": 1.0368589743589742,
+     "p95": 4.147435897435897,
+     "worst": 5.184294871794872
+    },
+    "seamClassifier": {
+     "p50": 0.75,
+     "p95": 0.9722222222222222,
+     "worst": 1
+    },
+    "longestRun": {
+     "p50": 96,
+     "p95": 144,
+     "worst": 144
+    },
+    "dupSeq": {
+     "p50": 0,
+     "p95": 0,
+     "worst": 0
+    },
+    "uniqueContinuation": {
+     "p50": 1,
+     "min": 0.9230769230769231
+    },
+    "monthConcentration": {
+     "p50": 0.46153846153846156,
+     "p95": 0.46153846153846156,
+     "worst": 0.46153846153846156
+    },
+    "meanEffectiveCandidates": {
+     "p50": 8.46621169633943,
+     "min": 7.128163308892368
+    },
+    "failureCounts": {
+     "seam-excess": 29,
+     "seam-ratio": 48,
+     "seam-classifier": 71,
+     "stylized-facts": 4
+    }
+   },
+   "caps": [
+    {
+     "cap": 48,
+     "n": 30,
+     "passRate": 0.06666666666666667,
+     "insufficientRate": 0,
+     "invariantFailures": 0,
+     "excess": {
+      "p5": -0.080370942812983,
+      "p50": 0.0029623905203503276,
+      "p95": 0.16962905718701698,
+      "worst": 0.419629057187017
+     },
+     "ratio": {
+      "p50": 1.0368589743589742,
+      "p95": 3.110576923076923,
+      "worst": 6.221153846153846
+     },
+     "seamClassifier": {
+      "p50": 0.8055555555555556,
+      "p95": 0.9444444444444444,
+      "worst": 1
+     },
+     "longestRun": {
+      "p50": 48,
+      "p95": 48,
+      "worst": 48
+     },
+     "dupSeq": {
+      "p50": 0,
+      "p95": 0,
+      "worst": 0
+     },
+     "uniqueContinuation": {
+      "p50": 1,
+      "min": 1
+     },
+     "monthConcentration": {
+      "p50": 0.46153846153846156,
+      "p95": 0.46153846153846156,
+      "worst": 0.46153846153846156
+     },
+     "meanEffectiveCandidates": {
+      "p50": 10.323036856539883,
+      "min": 9.866129772191416
+     },
+     "failureCounts": {
+      "seam-classifier": 25,
+      "seam-ratio": 13,
+      "seam-excess": 3,
+      "seam-ci-lower": 1
+     }
+    },
+    {
+     "cap": 72,
+     "n": 30,
+     "passRate": 0.06666666666666667,
+     "insufficientRate": 0,
+     "invariantFailures": 0,
+     "excess": {
+      "p5": -0.080370942812983,
+      "p50": 0.0029623905203503276,
+      "p95": 0.16962905718701698,
+      "worst": 0.419629057187017
+     },
+     "ratio": {
+      "p50": 1.0368589743589742,
+      "p95": 3.110576923076923,
+      "worst": 6.221153846153846
+     },
+     "seamClassifier": {
+      "p50": 0.8055555555555556,
+      "p95": 0.9444444444444444,
+      "worst": 1
+     },
+     "longestRun": {
+      "p50": 48,
+      "p95": 48,
+      "worst": 48
+     },
+     "dupSeq": {
+      "p50": 0,
+      "p95": 0,
+      "worst": 0
+     },
+     "uniqueContinuation": {
+      "p50": 1,
+      "min": 1
+     },
+     "monthConcentration": {
+      "p50": 0.46153846153846156,
+      "p95": 0.46153846153846156,
+      "worst": 0.46153846153846156
+     },
+     "meanEffectiveCandidates": {
+      "p50": 10.323036856539883,
+      "min": 9.866129772191416
+     },
+     "failureCounts": {
+      "seam-classifier": 25,
+      "seam-ratio": 13,
+      "seam-excess": 3,
+      "seam-ci-lower": 1
+     }
+    },
+    {
+     "cap": 96,
+     "n": 30,
+     "passRate": 0.06666666666666667,
+     "insufficientRate": 0,
+     "invariantFailures": 0,
+     "excess": {
+      "p5": -0.080370942812983,
+      "p50": 0.0029623905203503276,
+      "p95": 0.2529623905203503,
+      "worst": 0.33629572385368367
+     },
+     "ratio": {
+      "p50": 1.0368589743589742,
+      "p95": 4.147435897435897,
+      "worst": 5.184294871794872
+     },
+     "seamClassifier": {
+      "p50": 0.7777777777777778,
+      "p95": 0.9722222222222222,
+      "worst": 1
+     },
+     "longestRun": {
+      "p50": 96,
+      "p95": 96,
+      "worst": 96
+     },
+     "dupSeq": {
+      "p50": 0,
+      "p95": 0,
+      "worst": 0
+     },
+     "uniqueContinuation": {
+      "p50": 1,
+      "min": 1
+     },
+     "monthConcentration": {
+      "p50": 0.46153846153846156,
+      "p95": 0.46153846153846156,
+      "worst": 0.46153846153846156
+     },
+     "meanEffectiveCandidates": {
+      "p50": 8.75384915974229,
+      "min": 7.584450088155407
+     },
+     "failureCounts": {
+      "seam-ratio": 13,
+      "seam-classifier": 27,
+      "seam-excess": 8,
+      "stylized-facts": 1
+     }
+    },
+    {
+     "cap": 120,
+     "n": 30,
+     "passRate": 0.06666666666666667,
+     "insufficientRate": 0,
+     "invariantFailures": 0,
+     "excess": {
+      "p5": -0.080370942812983,
+      "p50": 0.0029623905203503276,
+      "p95": 0.2529623905203503,
+      "worst": 0.33629572385368367
+     },
+     "ratio": {
+      "p50": 1.0368589743589742,
+      "p95": 4.147435897435897,
+      "worst": 5.184294871794872
+     },
+     "seamClassifier": {
+      "p50": 0.7777777777777778,
+      "p95": 0.9722222222222222,
+      "worst": 1
+     },
+     "longestRun": {
+      "p50": 96,
+      "p95": 96,
+      "worst": 96
+     },
+     "dupSeq": {
+      "p50": 0,
+      "p95": 0,
+      "worst": 0
+     },
+     "uniqueContinuation": {
+      "p50": 1,
+      "min": 1
+     },
+     "monthConcentration": {
+      "p50": 0.46153846153846156,
+      "p95": 0.46153846153846156,
+      "worst": 0.46153846153846156
+     },
+     "meanEffectiveCandidates": {
+      "p50": 8.75384915974229,
+      "min": 7.584450088155407
+     },
+     "failureCounts": {
+      "seam-ratio": 13,
+      "seam-classifier": 27,
+      "seam-excess": 8,
+      "stylized-facts": 1
+     }
+    },
+    {
+     "cap": 144,
+     "n": 30,
+     "passRate": 0.13333333333333333,
+     "insufficientRate": 0,
+     "invariantFailures": 0,
+     "excess": {
+      "p5": -0.080370942812983,
+      "p50": 0.0029623905203503276,
+      "p95": 0.2529623905203503,
+      "worst": 0.33629572385368367
+     },
+     "ratio": {
+      "p50": 1.0368589743589742,
+      "p95": 4.147435897435897,
+      "worst": 5.184294871794872
+     },
+     "seamClassifier": {
+      "p50": 0.75,
+      "p95": 0.9444444444444444,
+      "worst": 0.9722222222222222
+     },
+     "longestRun": {
+      "p50": 96,
+      "p95": 144,
+      "worst": 144
+     },
+     "dupSeq": {
+      "p50": 0,
+      "p95": 0,
+      "worst": 0
+     },
+     "uniqueContinuation": {
+      "p50": 1,
+      "min": 0.9230769230769231
+     },
+     "monthConcentration": {
+      "p50": 0.46153846153846156,
+      "p95": 0.46153846153846156,
+      "worst": 0.46153846153846156
+     },
+     "meanEffectiveCandidates": {
+      "p50": 8.493147045183123,
+      "min": 7.128163308892368
+     },
+     "failureCounts": {
+      "seam-excess": 9,
+      "seam-ratio": 14,
+      "seam-classifier": 21,
+      "stylized-facts": 2
+     }
+    }
+   ],
+   "perturbations": [
+    {
+     "name": "remove_top_1pct_successors",
+     "n": 30,
+     "passRate": 0.1,
+     "insufficientRate": 0,
+     "invariantFailures": 0,
+     "excess": {
+      "p5": -0.080370942812983,
+      "p50": 0.0029623905203503276,
+      "p95": 0.2529623905203503,
+      "worst": 0.2529623905203503
+     },
+     "ratio": {
+      "p50": 1.0368589743589742,
+      "p95": 4.147435897435897,
+      "worst": 4.147435897435897
+     },
+     "seamClassifier": {
+      "p50": 0.75,
+      "p95": 0.9444444444444444,
+      "worst": 1
+     },
+     "longestRun": {
+      "p50": 96,
+      "p95": 144,
+      "worst": 144
+     },
+     "dupSeq": {
+      "p50": 0,
+      "p95": 0,
+      "worst": 0
+     },
+     "uniqueContinuation": {
+      "p50": 1,
+      "min": 1
+     },
+     "monthConcentration": {
+      "p50": 0.46153846153846156,
+      "p95": 0.46153846153846156,
+      "worst": 0.46153846153846156
+     },
+     "meanEffectiveCandidates": {
+      "p50": 8.477761242688954,
+      "min": 7.5541999017508354
+     },
+     "failureCounts": {
+      "seam-excess": 7,
+      "seam-ratio": 15,
+      "seam-classifier": 20
+     }
+    },
+    {
+     "name": "remove_top_source_month",
+     "n": 30,
+     "passRate": 0.06666666666666667,
+     "insufficientRate": 0.03333333333333333,
+     "invariantFailures": 0,
+     "excess": {
+      "p5": -0.080370942812983,
+      "p50": 0.08629572385368366,
+      "p95": 0.2529623905203503,
+      "worst": 0.2529623905203503
+     },
+     "ratio": {
+      "p50": 2.0737179487179485,
+      "p95": 4.147435897435897,
+      "worst": 4.147435897435897
+     },
+     "seamClassifier": {
+      "p50": 0.8055555555555556,
+      "p95": 0.9166666666666666,
+      "worst": 1
+     },
+     "longestRun": {
+      "p50": 96,
+      "p95": 144,
+      "worst": 144
+     },
+     "dupSeq": {
+      "p50": 0,
+      "p95": 0,
+      "worst": 0
+     },
+     "uniqueContinuation": {
+      "p50": 1,
+      "min": 0.9230769230769231
+     },
+     "monthConcentration": {
+      "p50": 0.46153846153846156,
+      "p95": 0.46153846153846156,
+      "worst": 0.46153846153846156
+     },
+     "meanEffectiveCandidates": {
+      "p50": 8.527734325995612,
+      "min": 7.3859707056154384
+     },
+     "failureCounts": {
+      "seam-classifier": 24,
+      "seam-excess": 12,
+      "seam-ratio": 17,
+      "stylized-facts": 3,
+      "insufficient": 1
+     }
+    },
+    {
+     "name": "exclude_rank_one_matches",
+     "n": 30,
+     "passRate": 0.03333333333333333,
+     "insufficientRate": 0,
+     "invariantFailures": 0,
+     "excess": {
+      "p5": -0.080370942812983,
+      "p50": 0.08629572385368366,
+      "p95": 0.16962905718701698,
+      "worst": 0.33629572385368367
+     },
+     "ratio": {
+      "p50": 2.0737179487179485,
+      "p95": 3.110576923076923,
+      "worst": 5.184294871794872
+     },
+     "seamClassifier": {
+      "p50": 0.7777777777777778,
+      "p95": 0.9166666666666666,
+      "worst": 1
+     },
+     "longestRun": {
+      "p50": 96,
+      "p95": 96,
+      "worst": 144
+     },
+     "dupSeq": {
+      "p50": 0,
+      "p95": 0,
+      "worst": 0
+     },
+     "uniqueContinuation": {
+      "p50": 1,
+      "min": 1
+     },
+     "monthConcentration": {
+      "p50": 0.46153846153846156,
+      "p95": 0.46153846153846156,
+      "worst": 0.46153846153846156
+     },
+     "meanEffectiveCandidates": {
+      "p50": 12,
+      "min": 12
+     },
+     "failureCounts": {
+      "seam-classifier": 28,
+      "seam-ratio": 16,
+      "seam-excess": 6
+     }
+    },
+    {
+     "name": "cap_reuse_at_2",
+     "n": 30,
+     "passRate": 0.13333333333333333,
+     "insufficientRate": 0,
+     "invariantFailures": 0,
+     "excess": {
+      "p5": -0.080370942812983,
+      "p50": 0.0029623905203503276,
+      "p95": 0.2529623905203503,
+      "worst": 0.33629572385368367
+     },
+     "ratio": {
+      "p50": 1.0368589743589742,
+      "p95": 4.147435897435897,
+      "worst": 5.184294871794872
+     },
+     "seamClassifier": {
+      "p50": 0.75,
+      "p95": 0.9444444444444444,
+      "worst": 0.9722222222222222
+     },
+     "longestRun": {
+      "p50": 96,
+      "p95": 144,
+      "worst": 144
+     },
+     "dupSeq": {
+      "p50": 0,
+      "p95": 0,
+      "worst": 0
+     },
+     "uniqueContinuation": {
+      "p50": 1,
+      "min": 0.9230769230769231
+     },
+     "monthConcentration": {
+      "p50": 0.46153846153846156,
+      "p95": 0.46153846153846156,
+      "worst": 0.46153846153846156
+     },
+     "meanEffectiveCandidates": {
+      "p50": 8.493147045183123,
+      "min": 7.128163308892368
+     },
+     "failureCounts": {
+      "seam-excess": 9,
+      "seam-ratio": 14,
+      "seam-classifier": 21,
+      "stylized-facts": 2
+     }
+    },
+    {
+     "name": "min_entropy_floor",
+     "n": 30,
+     "passRate": 0.1,
+     "insufficientRate": 0,
+     "invariantFailures": 0,
+     "excess": {
+      "p5": -0.080370942812983,
+      "p50": 0.0029623905203503276,
+      "p95": 0.2529623905203503,
+      "worst": 0.33629572385368367
+     },
+     "ratio": {
+      "p50": 1.0368589743589742,
+      "p95": 4.147435897435897,
+      "worst": 5.184294871794872
+     },
+     "seamClassifier": {
+      "p50": 0.8055555555555556,
+      "p95": 0.9444444444444444,
+      "worst": 0.9722222222222222
+     },
+     "longestRun": {
+      "p50": 96,
+      "p95": 144,
+      "worst": 144
+     },
+     "dupSeq": {
+      "p50": 0,
+      "p95": 0,
+      "worst": 0
+     },
+     "uniqueContinuation": {
+      "p50": 1,
+      "min": 0.9230769230769231
+     },
+     "monthConcentration": {
+      "p50": 0.46153846153846156,
+      "p95": 0.46153846153846156,
+      "worst": 0.46153846153846156
+     },
+     "meanEffectiveCandidates": {
+      "p50": 8.647149847438653,
+      "min": 7.780597517590461
+     },
+     "failureCounts": {
+      "seam-excess": 8,
+      "seam-ratio": 14,
+      "seam-classifier": 22,
+      "stylized-facts": 2
+     }
+    },
+    {
+     "name": "remove_regime_UPTREND",
+     "n": 30,
+     "passRate": 0.03333333333333333,
+     "insufficientRate": 0.9,
+     "invariantFailures": 0,
+     "excess": {
+      "p5": 0.0029623905203503276,
+      "p50": 0.0029623905203503276,
+      "p95": 0.0029623905203503276,
+      "worst": 0.08629572385368366
+     },
+     "ratio": {
+      "p50": 1.0368589743589742,
+      "p95": 1.0368589743589742,
+      "worst": 2.0737179487179485
+     },
+     "seamClassifier": {
+      "p50": 0.6666666666666666,
+      "p95": 0.6666666666666666,
+      "worst": 0.7777777777777778
+     },
+     "longestRun": {
+      "p50": 96,
+      "p95": 96,
+      "worst": 144
+     },
+     "dupSeq": {
+      "p50": 0,
+      "p95": 0,
+      "worst": 0
+     },
+     "uniqueContinuation": {
+      "p50": 1,
+      "min": 1
+     },
+     "monthConcentration": {
+      "p50": 0.46153846153846156,
+      "p95": 0.46153846153846156,
+      "worst": 0.46153846153846156
+     },
+     "meanEffectiveCandidates": {
+      "p50": 8.489250854443096,
+      "min": 7.8789912638583735
+     },
+     "failureCounts": {
+      "stylized-facts": 14,
+      "insufficient": 27,
+      "seam-classifier": 14,
+      "seam-ratio": 7,
+      "seam-excess": 4,
+      "seam-ci-lower": 1
+     }
+    }
+   ]
+  },
+  {
+   "evalMonth": "2026-06",
+   "trainMonths": [
+    "2026-01",
+    "2026-02",
+    "2026-03",
+    "2026-04",
+    "2026-05"
+   ],
+   "status": "EVALUATED",
+   "proof": {
+    "excludedMonthHours": 624,
+    "feasibleHoursUnderMonthCap": 3504,
+    "feasibleHoursUnderReuseCap": 672960,
+    "targetHours": 624,
+    "fillable": true,
+    "bindingConstraint": "EXCLUDED_MONTH_HOURS",
+    "reason": "FILLABLE (target 624h, pack slack 816h)",
+    "trainingMonthCount": 5,
+    "perMonthAvailableHours": [
+     744,
+     672,
+     744,
+     720,
+     696
+    ]
+   },
+   "librarySize": 3505,
+   "target": 624,
+   "seed": {
+    "n": 100,
+    "passRate": 0.34,
+    "insufficientRate": 0,
+    "invariantFailures": 0,
+    "excess": {
+     "p5": -0.08667736757624397,
+     "p50": -0.0033440342429106457,
+     "p95": 0.24665596575708934,
+     "worst": 0.32998929909042274
+    },
+    "ratio": {
+     "p50": 0.9614197530864198,
+     "p95": 3.845679012345679,
+     "worst": 4.807098765432099
+    },
+    "seamClassifier": {
+     "p50": 0.6666666666666667,
+     "p95": 0.8611111111111112,
+     "worst": 0.9444444444444444
+    },
+    "longestRun": {
+     "p50": 96,
+     "p95": 144,
+     "worst": 144
+    },
+    "dupSeq": {
+     "p50": 0,
+     "p95": 0,
+     "worst": 0
+    },
+    "uniqueContinuation": {
+     "p50": 1,
+     "min": 1
+    },
+    "monthConcentration": {
+     "p50": 0.46153846153846156,
+     "p95": 0.46153846153846156,
+     "worst": 0.46153846153846156
+    },
+    "meanEffectiveCandidates": {
+     "p50": 8.650120927450738,
+     "min": 7.748205625226273
+    },
+    "failureCounts": {
+     "stylized-facts": 9,
+     "seam-classifier": 53,
+     "seam-excess": 21,
+     "seam-ratio": 21
+    }
+   },
+   "caps": [
+    {
+     "cap": 48,
+     "n": 30,
+     "passRate": 0.36666666666666664,
+     "insufficientRate": 0,
+     "invariantFailures": 0,
+     "excess": {
+      "p5": -0.08667736757624397,
+      "p50": -0.0033440342429106457,
+      "p95": 0.16332263242375603,
+      "worst": 0.16332263242375603
+     },
+     "ratio": {
+      "p50": 0.9614197530864198,
+      "p95": 2.8842592592592595,
+      "worst": 2.8842592592592595
+     },
+     "seamClassifier": {
+      "p50": 0.6666666666666666,
+      "p95": 0.8055555555555556,
+      "worst": 0.8611111111111112
+     },
+     "longestRun": {
+      "p50": 48,
+      "p95": 48,
+      "worst": 48
+     },
+     "dupSeq": {
+      "p50": 0,
+      "p95": 0,
+      "worst": 0
+     },
+     "uniqueContinuation": {
+      "p50": 1,
+      "min": 1
+     },
+     "monthConcentration": {
+      "p50": 0.38461538461538464,
+      "p95": 0.46153846153846156,
+      "worst": 0.46153846153846156
+     },
+     "meanEffectiveCandidates": {
+      "p50": 10.52652106706174,
+      "min": 9.892795807075943
+     },
+     "failureCounts": {
+      "seam-classifier": 16,
+      "seam-excess": 3,
+      "seam-ratio": 3,
+      "stylized-facts": 2
+     }
+    },
+    {
+     "cap": 72,
+     "n": 30,
+     "passRate": 0.36666666666666664,
+     "insufficientRate": 0,
+     "invariantFailures": 0,
+     "excess": {
+      "p5": -0.08667736757624397,
+      "p50": -0.0033440342429106457,
+      "p95": 0.16332263242375603,
+      "worst": 0.16332263242375603
+     },
+     "ratio": {
+      "p50": 0.9614197530864198,
+      "p95": 2.8842592592592595,
+      "worst": 2.8842592592592595
+     },
+     "seamClassifier": {
+      "p50": 0.6666666666666666,
+      "p95": 0.8055555555555556,
+      "worst": 0.8611111111111112
+     },
+     "longestRun": {
+      "p50": 48,
+      "p95": 48,
+      "worst": 48
+     },
+     "dupSeq": {
+      "p50": 0,
+      "p95": 0,
+      "worst": 0
+     },
+     "uniqueContinuation": {
+      "p50": 1,
+      "min": 1
+     },
+     "monthConcentration": {
+      "p50": 0.38461538461538464,
+      "p95": 0.46153846153846156,
+      "worst": 0.46153846153846156
+     },
+     "meanEffectiveCandidates": {
+      "p50": 10.52652106706174,
+      "min": 9.892795807075943
+     },
+     "failureCounts": {
+      "seam-classifier": 16,
+      "seam-excess": 3,
+      "seam-ratio": 3,
+      "stylized-facts": 2
+     }
+    },
+    {
+     "cap": 96,
+     "n": 30,
+     "passRate": 0.3,
+     "insufficientRate": 0,
+     "invariantFailures": 0,
+     "excess": {
+      "p5": -0.08667736757624397,
+      "p50": 0.07998929909042268,
+      "p95": 0.16332263242375603,
+      "worst": 0.32998929909042274
+     },
+     "ratio": {
+      "p50": 1.9228395061728396,
+      "p95": 2.8842592592592595,
+      "worst": 4.807098765432099
+     },
+     "seamClassifier": {
+      "p50": 0.6666666666666666,
+      "p95": 0.8055555555555556,
+      "worst": 0.9166666666666666
+     },
+     "longestRun": {
+      "p50": 96,
+      "p95": 96,
+      "worst": 96
+     },
+     "dupSeq": {
+      "p50": 0,
+      "p95": 0,
+      "worst": 0
+     },
+     "uniqueContinuation": {
+      "p50": 1,
+      "min": 0.9230769230769231
+     },
+     "monthConcentration": {
+      "p50": 0.46153846153846156,
+      "p95": 0.46153846153846156,
+      "worst": 0.46153846153846156
+     },
+     "meanEffectiveCandidates": {
+      "p50": 8.800542446890473,
+      "min": 8.16215985402456
+     },
+     "failureCounts": {
+      "stylized-facts": 3,
+      "seam-classifier": 16,
+      "seam-excess": 10,
+      "seam-ratio": 10
+     }
+    },
+    {
+     "cap": 120,
+     "n": 30,
+     "passRate": 0.3,
+     "insufficientRate": 0,
+     "invariantFailures": 0,
+     "excess": {
+      "p5": -0.08667736757624397,
+      "p50": 0.07998929909042268,
+      "p95": 0.16332263242375603,
+      "worst": 0.32998929909042274
+     },
+     "ratio": {
+      "p50": 1.9228395061728396,
+      "p95": 2.8842592592592595,
+      "worst": 4.807098765432099
+     },
+     "seamClassifier": {
+      "p50": 0.6666666666666666,
+      "p95": 0.8055555555555556,
+      "worst": 0.9166666666666666
+     },
+     "longestRun": {
+      "p50": 96,
+      "p95": 96,
+      "worst": 96
+     },
+     "dupSeq": {
+      "p50": 0,
+      "p95": 0,
+      "worst": 0
+     },
+     "uniqueContinuation": {
+      "p50": 1,
+      "min": 0.9230769230769231
+     },
+     "monthConcentration": {
+      "p50": 0.46153846153846156,
+      "p95": 0.46153846153846156,
+      "worst": 0.46153846153846156
+     },
+     "meanEffectiveCandidates": {
+      "p50": 8.800542446890473,
+      "min": 8.16215985402456
+     },
+     "failureCounts": {
+      "stylized-facts": 3,
+      "seam-classifier": 16,
+      "seam-excess": 10,
+      "seam-ratio": 10,
+      "seam-ci-lower": 1
+     }
+    },
+    {
+     "cap": 144,
+     "n": 30,
+     "passRate": 0.36666666666666664,
+     "insufficientRate": 0,
+     "invariantFailures": 0,
+     "excess": {
+      "p5": -0.08667736757624397,
+      "p50": -0.0033440342429106457,
+      "p95": 0.16332263242375603,
+      "worst": 0.32998929909042274
+     },
+     "ratio": {
+      "p50": 0.9614197530864198,
+      "p95": 2.8842592592592595,
+      "worst": 4.807098765432099
+     },
+     "seamClassifier": {
+      "p50": 0.6666666666666667,
+      "p95": 0.8611111111111112,
+      "worst": 0.8611111111111112
+     },
+     "longestRun": {
+      "p50": 96,
+      "p95": 144,
+      "worst": 144
+     },
+     "dupSeq": {
+      "p50": 0,
+      "p95": 0,
+      "worst": 0
+     },
+     "uniqueContinuation": {
+      "p50": 1,
+      "min": 1
+     },
+     "monthConcentration": {
+      "p50": 0.46153846153846156,
+      "p95": 0.46153846153846156,
+      "worst": 0.46153846153846156
+     },
+     "meanEffectiveCandidates": {
+      "p50": 8.650120927450738,
+      "min": 7.838048033602739
+     },
+     "failureCounts": {
+      "stylized-facts": 3,
+      "seam-classifier": 16,
+      "seam-excess": 5,
+      "seam-ratio": 5
+     }
+    }
+   ],
+   "perturbations": [
+    {
+     "name": "remove_top_1pct_successors",
+     "n": 30,
+     "passRate": 0.5,
+     "insufficientRate": 0,
+     "invariantFailures": 0,
+     "excess": {
+      "p5": -0.08667736757624397,
+      "p50": -0.0033440342429106457,
+      "p95": 0.16332263242375603,
+      "worst": 0.49665596575708937
+     },
+     "ratio": {
+      "p50": 0.9614197530864198,
+      "p95": 2.8842592592592595,
+      "worst": 6.729938271604939
+     },
+     "seamClassifier": {
+      "p50": 0.6111111111111112,
+      "p95": 0.8333333333333334,
+      "worst": 0.9444444444444444
+     },
+     "longestRun": {
+      "p50": 96,
+      "p95": 144,
+      "worst": 144
+     },
+     "dupSeq": {
+      "p50": 0,
+      "p95": 0,
+      "worst": 0
+     },
+     "uniqueContinuation": {
+      "p50": 1,
+      "min": 1
+     },
+     "monthConcentration": {
+      "p50": 0.46153846153846156,
+      "p95": 0.46153846153846156,
+      "worst": 0.46153846153846156
+     },
+     "meanEffectiveCandidates": {
+      "p50": 8.545616114917001,
+      "min": 7.94092467804512
+     },
+     "failureCounts": {
+      "seam-classifier": 12,
+      "seam-excess": 5,
+      "seam-ratio": 5,
+      "stylized-facts": 1,
+      "seam-ci-lower": 1
+     }
+    },
+    {
+     "name": "remove_top_source_month",
+     "n": 30,
+     "passRate": 0.4,
+     "insufficientRate": 0,
+     "invariantFailures": 0,
+     "excess": {
+      "p5": -0.08667736757624397,
+      "p50": 0.07998929909042268,
+      "p95": 0.24665596575708934,
+      "worst": 0.24665596575708934
+     },
+     "ratio": {
+      "p50": 1.9228395061728396,
+      "p95": 3.845679012345679,
+      "worst": 3.845679012345679
+     },
+     "seamClassifier": {
+      "p50": 0.6388888888888888,
+      "p95": 0.7777777777777778,
+      "worst": 0.8611111111111112
+     },
+     "longestRun": {
+      "p50": 96,
+      "p95": 144,
+      "worst": 144
+     },
+     "dupSeq": {
+      "p50": 0,
+      "p95": 0,
+      "worst": 0
+     },
+     "uniqueContinuation": {
+      "p50": 1,
+      "min": 0.9230769230769231
+     },
+     "monthConcentration": {
+      "p50": 0.46153846153846156,
+      "p95": 0.46153846153846156,
+      "worst": 0.46153846153846156
+     },
+     "meanEffectiveCandidates": {
+      "p50": 8.741805556300372,
+      "min": 7.807690386948721
+     },
+     "failureCounts": {
+      "stylized-facts": 2,
+      "seam-classifier": 14,
+      "seam-excess": 8,
+      "seam-ratio": 8
+     }
+    },
+    {
+     "name": "exclude_rank_one_matches",
+     "n": 30,
+     "passRate": 0.16666666666666666,
+     "insufficientRate": 0,
+     "invariantFailures": 0,
+     "excess": {
+      "p5": -0.08667736757624397,
+      "p50": 0.07998929909042268,
+      "p95": 0.24665596575708934,
+      "worst": 0.32998929909042274
+     },
+     "ratio": {
+      "p50": 1.9228395061728396,
+      "p95": 3.845679012345679,
+      "worst": 4.807098765432099
+     },
+     "seamClassifier": {
+      "p50": 0.6944444444444444,
+      "p95": 0.7777777777777778,
+      "worst": 0.8611111111111112
+     },
+     "longestRun": {
+      "p50": 96,
+      "p95": 96,
+      "worst": 144
+     },
+     "dupSeq": {
+      "p50": 0,
+      "p95": 0,
+      "worst": 0
+     },
+     "uniqueContinuation": {
+      "p50": 1,
+      "min": 1
+     },
+     "monthConcentration": {
+      "p50": 0.46153846153846156,
+      "p95": 0.46153846153846156,
+      "worst": 0.46153846153846156
+     },
+     "meanEffectiveCandidates": {
+      "p50": 12,
+      "min": 11.916666666666666
+     },
+     "failureCounts": {
+      "seam-excess": 9,
+      "seam-ratio": 9,
+      "seam-classifier": 17,
+      "stylized-facts": 4
+     }
+    },
+    {
+     "name": "cap_reuse_at_2",
+     "n": 30,
+     "passRate": 0.36666666666666664,
+     "insufficientRate": 0,
+     "invariantFailures": 0,
+     "excess": {
+      "p5": -0.08667736757624397,
+      "p50": -0.0033440342429106457,
+      "p95": 0.16332263242375603,
+      "worst": 0.32998929909042274
+     },
+     "ratio": {
+      "p50": 0.9614197530864198,
+      "p95": 2.8842592592592595,
+      "worst": 4.807098765432099
+     },
+     "seamClassifier": {
+      "p50": 0.6666666666666667,
+      "p95": 0.8611111111111112,
+      "worst": 0.8611111111111112
+     },
+     "longestRun": {
+      "p50": 96,
+      "p95": 144,
+      "worst": 144
+     },
+     "dupSeq": {
+      "p50": 0,
+      "p95": 0,
+      "worst": 0
+     },
+     "uniqueContinuation": {
+      "p50": 1,
+      "min": 1
+     },
+     "monthConcentration": {
+      "p50": 0.46153846153846156,
+      "p95": 0.46153846153846156,
+      "worst": 0.46153846153846156
+     },
+     "meanEffectiveCandidates": {
+      "p50": 8.650120927450738,
+      "min": 7.838048033602739
+     },
+     "failureCounts": {
+      "stylized-facts": 3,
+      "seam-classifier": 16,
+      "seam-excess": 5,
+      "seam-ratio": 5
+     }
+    },
+    {
+     "name": "min_entropy_floor",
+     "n": 30,
+     "passRate": 0.3333333333333333,
+     "insufficientRate": 0,
+     "invariantFailures": 0,
+     "excess": {
+      "p5": -0.08667736757624397,
+      "p50": -0.0033440342429106457,
+      "p95": 0.16332263242375603,
+      "worst": 0.32998929909042274
+     },
+     "ratio": {
+      "p50": 0.9614197530864198,
+      "p95": 2.8842592592592595,
+      "worst": 4.807098765432099
+     },
+     "seamClassifier": {
+      "p50": 0.6944444444444444,
+      "p95": 0.8333333333333334,
+      "worst": 0.8611111111111112
+     },
+     "longestRun": {
+      "p50": 96,
+      "p95": 144,
+      "worst": 144
+     },
+     "dupSeq": {
+      "p50": 0,
+      "p95": 0,
+      "worst": 0
+     },
+     "uniqueContinuation": {
+      "p50": 1,
+      "min": 1
+     },
+     "monthConcentration": {
+      "p50": 0.46153846153846156,
+      "p95": 0.46153846153846156,
+      "worst": 0.46153846153846156
+     },
+     "meanEffectiveCandidates": {
+      "p50": 8.73228411186901,
+      "min": 7.838048033602739
+     },
+     "failureCounts": {
+      "stylized-facts": 3,
+      "seam-classifier": 18,
+      "seam-excess": 5,
+      "seam-ratio": 5
+     }
+    },
+    {
+     "name": "remove_regime_UPTREND",
+     "n": 30,
+     "passRate": 0,
+     "insufficientRate": 1,
+     "invariantFailures": 0,
+     "excess": {
+      "p5": null,
+      "p50": null,
+      "p95": null,
+      "worst": null
+     },
+     "ratio": {
+      "p50": null,
+      "p95": null,
+      "worst": null
+     },
+     "seamClassifier": {
+      "p50": null,
+      "p95": null,
+      "worst": null
+     },
+     "longestRun": {
+      "p50": null,
+      "p95": null,
+      "worst": null
+     },
+     "dupSeq": {
+      "p50": null,
+      "p95": null,
+      "worst": null
+     },
+     "uniqueContinuation": {
+      "p50": null,
+      "min": null
+     },
+     "monthConcentration": {
+      "p50": null,
+      "p95": null,
+      "worst": null
+     },
+     "meanEffectiveCandidates": {
+      "p50": null,
+      "min": null
+     },
+     "failureCounts": {
+      "stylized-facts": 21,
+      "insufficient": 30,
+      "seam-classifier": 12,
+      "seam-excess": 10,
+      "seam-ratio": 10,
+      "seam-ci-lower": 3
+     }
+    }
+   ]
+  }
+ ],
+ "readiness": {
+  "c1_overallSeedPassRate": {
+   "value": 0.24,
+   "pass": false
+  },
+  "c2_everySupportedFoldPasses": {
+   "value": [
+    0.27,
+    0.22,
+    0.13,
+    0.34
+   ],
+   "pass": false
+  },
+  "c3_notOneMonthDependent": {
+   "pass": false
+  },
+  "c4_capLE96PassesOrSupportLimited": {
+   "pass": false
+  },
+  "c5_dupSeqCiBelow": {
+   "pass": true
+  },
+  "c6_seamClassifierCiBelow": {
+   "pass": false
+  },
+  "c7_noConcentrationOrMemorizationFailure": {
+   "pass": true
+  },
+  "c8_perturbationAcceptable": {
+   "pass": false
+  },
+  "c9_noUnresolvedAdversarialFinding": {
+   "pass": null,
+   "note": "set after mandatory adversarial review (Step 9)"
+  },
+  "c10_codeAndParamsFrozenCommitted": {
+   "pass": null,
+   "note": "set after commit"
+  }
+ },
+ "verdict": "ROBUSTNESS_NOT_ESTABLISHED_FINAL",
+ "determinismCheck": "13858406fd362a83"
+}
