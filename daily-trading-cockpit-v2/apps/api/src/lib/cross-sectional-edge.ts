@@ -271,6 +271,12 @@ export interface CrossSectionalObservation {
   weightingModel?: "EQUAL_NOTIONAL" | "BETA_VOL_PROXY" | null;
   takeProfitReturn?: number | null;
   stopLossReturn?: number | null;
+  /** The R-denominator FROZEN at open (fraction). CORTEX #218 divides realized netReturn by THIS to get
+   *  netR — never the live CROSS_SECTIONAL_BASKET_STOP_LOSS_BPS at resolve (a deploy between open and
+   *  resolve would else silently rewrite the denominator of every open basket). Set on every basket:
+   *  = the real stop for TREND_BETA_VOL/MIXED, or the frozen config stop-unit for the stopless FILTERED
+   *  basket (the SAME divisor the x-side CORTEX_XSEC_STOP_RETURN uses, kept consistent + config-proof). */
+  riskDistanceAtOpen?: number | null;
   regimeFlipExit?: boolean | null;
   exitReason?: CrossSectionalExitReason | null;
   /** Return on deployed capital after market-beta cancels = the cross-sectional dispersion. */
@@ -316,6 +322,8 @@ interface CrossSectionalBasketOpts {
   volBySymbol?: Record<string, number>;
   takeProfitReturn?: number | null;
   stopLossReturn?: number | null;
+  /** Override the frozen-at-open R-denominator. Defaults to stopLossReturn, else the config stop-unit. */
+  riskDistanceAtOpen?: number | null;
   regimeFlipExit?: boolean;
 }
 
@@ -477,6 +485,9 @@ export function buildCrossSectionalBasket(
     weightingModel,
     takeProfitReturn: opts.takeProfitReturn ?? null,
     stopLossReturn: opts.stopLossReturn ?? null,
+    // Freeze the R-denominator at open (config-change-proof). Real stop if this basket has one, else the
+    // process-frozen config stop-unit — the SAME quantity CORTEX's x-side uses, so netR is symmetric.
+    riskDistanceAtOpen: opts.riskDistanceAtOpen ?? opts.stopLossReturn ?? CROSS_SECTIONAL_BASKET_STOP_LOSS_BPS / 10_000,
     regimeFlipExit: opts.regimeFlipExit ?? false,
     exitReason: null,
     grossReturn: null,

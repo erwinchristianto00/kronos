@@ -336,6 +336,17 @@ export interface PaperOrder {
   netR: number | null;
   netPnlAmount: number | null;
   closeReason: string | null;
+  /** MARKET timestamp (ms) of the exit candle that first satisfied the exit rule — from candle data, NOT process
+   *  time. Candle-granularity; conservative adverse-first when a bar spans both stop and target. Null on legacy
+   *  records + non-close statuses. Use THIS (never updatedAt/Date.now) for outcome attribution + chronological
+   *  learning. Added 2026-07-13 (Track 1a); see lane-context-journal.ts. */
+  closedAtMs?: number | null;
+  /** PROCESS timestamp (ms) when the resolver persisted the close. Audit only — never an attribution key. Always
+   *  ≥ closedAtMs (a close is persisted at/after the market bar that triggered it). */
+  resolvedAtMs?: number | null;
+  /** True when the exit candle spanned BOTH stop and target and intrabar order was unprovable (resolved
+   *  adverse-first) — the row is intrabar-ambiguous for close-timing purposes. */
+  closeIntrabarAmbiguous?: boolean;
   /**
    * Candidate-level provenance (PAPER ORDER PROVENANCE V1). Present on
    * allocator-created orders; null/omitted on legacy variant-matrix orders.
@@ -672,11 +683,21 @@ export class PaperExecutionRouterStore {
   update(orderId: string, patch: Partial<PaperOrder>): void {
     const idx = this.state.orders.findIndex((o) => o.paperOrderId === orderId);
     if (idx < 0) return;
-    this.state.orders[idx] = {
-      ...this.state.orders[idx]!,
+    const previous = this.state.orders[idx]!;
+    const next: PaperOrder = {
+      ...previous,
       ...patch,
       updatedAt: patch.updatedAt ?? new Date().toISOString(),
     };
+    // Central resolvedAtMs stamp (Track 1a): the PROCESS time this close was persisted, stamped ONLY on a genuine
+    // NON-terminal → terminal transition. NOT "current status is closed && field empty" — that would fabricate a
+    // resolution time on a legacy already-closed order the moment an unrelated update touches it (legacy orders
+    // have no resolvedAtMs). Audit only — never an attribution key; a re-transition keeps the first value.
+    const isClosedOutcome = (s: PaperOrderStatus): boolean => s === "PAPER_CLOSED_WIN" || s === "PAPER_CLOSED_LOSS";
+    if (!isClosedOutcome(previous.paperStatus) && isClosedOutcome(next.paperStatus)) {
+      next.resolvedAtMs = next.resolvedAtMs ?? Date.now();
+    }
+    this.state.orders[idx] = next;
     this.save();
   }
 
@@ -1913,6 +1934,8 @@ async function resolvePaperOrdersInner(
             netR,
             netPnlAmount: netR * order.plannedRiskAmount,
             closeReason: walk.resolutionSource ?? (exitRule === "scaleout_tp1_trail" ? "SCALEOUT_EXIT" : "MAKER_EXIT"),
+            closedAtMs: walk.closedAtMs ?? null, // MARKET ts of the exit candle (from walkVariantPath), not process time
+            closeIntrabarAmbiguous: walk.intrabarResolutionStatus === "AMBIGUOUS_SAME_CANDLE_SL_FIRST",
             updatedAt: new Date().toISOString(),
           });
           resolved += 1;
@@ -1935,6 +1958,8 @@ async function resolvePaperOrdersInner(
             netR,
             netPnlAmount: netR * order.plannedRiskAmount,
             closeReason: "MAX_HOLD_MTM",
+            // MARKET ts: the mark-to-market horizon exit happens at the LAST candle's close (open + interval).
+            closedAtMs: lastCandle ? Number(lastCandle[0]) + CANDLE_MS : null,
             updatedAt: new Date().toISOString(),
           });
           resolved += 1;
@@ -1951,6 +1976,7 @@ async function resolvePaperOrdersInner(
       for (const c of candles) {
         const openMs = c[0];
         if (openMs < openedAtMs - CANDLE_MS) continue;
+        const candleCloseMs = Number(openMs) + CANDLE_MS; // MARKET close time of THIS candle — the exit bar's ts (Track 1a)
         const high = Number(c[2]);
         const low = Number(c[3]);
         const close = Number(c[4]);
@@ -1974,6 +2000,8 @@ async function resolvePaperOrdersInner(
                   netR,
                   netPnlAmount: netR * order.plannedRiskAmount,
                   closeReason: "TRAIL_SL_HIT_AMBIGUOUS",
+                  closedAtMs: candleCloseMs,
+                  closeIntrabarAmbiguous: true,
                   updatedAt: new Date().toISOString(),
                 });
                 resolved += 1;
@@ -1992,6 +2020,8 @@ async function resolvePaperOrdersInner(
                   netR,
                   netPnlAmount: netR * order.plannedRiskAmount,
                   closeReason: "TRAIL_BREAKEVEN_SAME_CANDLE",
+                  closedAtMs: candleCloseMs,
+                  closeIntrabarAmbiguous: true,
                   updatedAt: new Date().toISOString(),
                 });
                 resolved += 1;
@@ -2010,6 +2040,7 @@ async function resolvePaperOrdersInner(
                 netR,
                 netPnlAmount: netR * order.plannedRiskAmount,
                 closeReason: "TRAIL_SL_HIT",
+                closedAtMs: candleCloseMs,
                 updatedAt: new Date().toISOString(),
               });
               resolved += 1;
@@ -2029,6 +2060,8 @@ async function resolvePaperOrdersInner(
                   netR,
                   netPnlAmount: netR * order.plannedRiskAmount,
                   closeReason: "TRAIL_BREAKEVEN_SAME_CANDLE",
+                  closedAtMs: candleCloseMs,
+                  closeIntrabarAmbiguous: true,
                   updatedAt: new Date().toISOString(),
                 });
                 resolved += 1;
@@ -2050,6 +2083,7 @@ async function resolvePaperOrdersInner(
               netR,
               netPnlAmount: netR * order.plannedRiskAmount,
               closeReason: "TRAIL_BREAKEVEN_EXIT",
+              closedAtMs: candleCloseMs,
               updatedAt: new Date().toISOString(),
             });
             resolved += 1;
@@ -2072,6 +2106,7 @@ async function resolvePaperOrdersInner(
               netR,
               netPnlAmount: netR * order.plannedRiskAmount,
               closeReason: "TP1_HIT_REFINED_1M",
+              closedAtMs: candleCloseMs, // 1m-refined resolution, so intrabar order WAS proven — not ambiguous
               updatedAt: new Date().toISOString(),
             });
           } else {
@@ -2084,6 +2119,8 @@ async function resolvePaperOrdersInner(
               netR,
               netPnlAmount: netR * order.plannedRiskAmount,
               closeReason: "SL_HIT_AMBIGUOUS",
+              closedAtMs: candleCloseMs,
+              closeIntrabarAmbiguous: true,
               updatedAt: new Date().toISOString(),
             });
           }
@@ -2102,6 +2139,7 @@ async function resolvePaperOrdersInner(
             netR,
             netPnlAmount: netR * order.plannedRiskAmount,
             closeReason: "SL_HIT",
+            closedAtMs: candleCloseMs,
             updatedAt: new Date().toISOString(),
           });
           resolved += 1;
@@ -2119,6 +2157,7 @@ async function resolvePaperOrdersInner(
             netR,
             netPnlAmount: netR * order.plannedRiskAmount,
             closeReason: "TP1_HIT",
+            closedAtMs: candleCloseMs,
             updatedAt: new Date().toISOString(),
           });
           resolved += 1;
@@ -2139,6 +2178,8 @@ async function resolvePaperOrdersInner(
           netR,
           netPnlAmount: netR * order.plannedRiskAmount,
           closeReason: "TRAIL_PATH_END",
+          // path-end MTM exit ⇒ market ts is the LAST candle's close (open + interval).
+          closedAtMs: candles.length ? Number(candles[candles.length - 1]![0]) + CANDLE_MS : null,
           updatedAt: new Date().toISOString(),
         });
         resolved += 1;
@@ -2163,6 +2204,8 @@ async function resolvePaperOrdersInner(
           netR,
           netPnlAmount: netR * order.plannedRiskAmount,
           closeReason: "MAX_HOLD_MTM",
+          // MTM force-exit at the last observed candle's close (open + interval) — market ts, not process time.
+          closedAtMs: candles.length ? Number(candles[candles.length - 1]![0]) + CANDLE_MS : null,
           updatedAt: new Date().toISOString(),
         });
         resolved += 1;

@@ -1,4 +1,12 @@
 import { describe, expect, it } from "vitest";
+import { fileURLToPath } from "node:url";
+import { dirname, resolve as resolvePath } from "node:path";
+
+/** Anchor source-file reads to THIS test file's location (apps/api), not process.cwd() — so the
+ *  isolation guards pass whether vitest is invoked from apps/api OR from the repo root (CI/container/
+ *  another operator). A cwd-dependent test is real debt: it goes false-red the moment cwd changes. */
+const API_ROOT = resolvePath(dirname(fileURLToPath(import.meta.url)), "..");
+const apiSrc = (rel: string): string => resolvePath(API_ROOT, rel);
 
 import { buildDashboardAuditSummaryReport } from "../src/lib/dashboard-audit-summary.js";
 import type { PortfolioTrendShadowReport } from "../src/lib/portfolio-trend-shadow.js";
@@ -360,9 +368,8 @@ describe("dashboard new sections AA / AB / AD / W*****", () => {
 
     it("test 19 (isolation): cost model source does not write any files", async () => {
       const fs = await import("node:fs");
-      const path = await import("node:path");
       const text = fs.readFileSync(
-        path.resolve(process.cwd(), "src/lib/frozen-current-guard-cost-model.ts"),
+        apiSrc("src/lib/frozen-current-guard-cost-model.ts"),
         "utf8",
       );
       expect(text.includes("shadow-positions.json")).toBe(false);
@@ -374,17 +381,16 @@ describe("dashboard new sections AA / AB / AD / W*****", () => {
 
     it("test 24 (isolation): new stability + frozen source modules do not write shadow-positions.json", async () => {
       const fs = await import("node:fs");
-      const path = await import("node:path");
       // Stability audit is a pure module — no fs imports at all.
       const stabilityText = fs.readFileSync(
-        path.resolve(process.cwd(), "src/lib/base-route-current-guard-stability-audit.ts"),
+        apiSrc("src/lib/base-route-current-guard-stability-audit.ts"),
         "utf8",
       );
       expect(stabilityText.includes("shadow-positions.json")).toBe(false);
       expect(/writeFile(Sync)?\s*\(/.test(stabilityText)).toBe(false);
       // Frozen store DOES write — but only to its own isolated file, never shadow-positions.json.
       const frozenText = fs.readFileSync(
-        path.resolve(process.cwd(), "src/lib/base-route-current-guard-frozen.ts"),
+        apiSrc("src/lib/base-route-current-guard-frozen.ts"),
         "utf8",
       );
       expect(frozenText.includes("shadow-positions.json")).toBe(false);
@@ -433,8 +439,7 @@ describe("dashboard new sections AA / AB / AD / W*****", () => {
       // unreliable here because Node's built-in fs descriptors are non-
       // configurable under vitest's module evaluation.
       const fs = await import("node:fs");
-      const path = await import("node:path");
-      // Resolve from project root: test cwd is apps/api.
+      // Resolved relative to this test file (apps/api), so it is cwd-independent.
       const filesToCheck = [
         "src/lib/base-route-risk-hygiene-monitor.ts",
         "src/lib/shadow-lane-scoreboard.ts",
@@ -442,7 +447,7 @@ describe("dashboard new sections AA / AB / AD / W*****", () => {
         "src/lib/strategy-research-roadmap.ts",
       ];
       for (const rel of filesToCheck) {
-        const text = fs.readFileSync(path.resolve(process.cwd(), rel), "utf8");
+        const text = fs.readFileSync(apiSrc(rel), "utf8");
         expect(text.includes("shadow-positions.json")).toBe(false);
         expect(/writeFile(Sync)?\s*\(/.test(text)).toBe(false);
         expect(/appendFile(Sync)?\s*\(/.test(text)).toBe(false);

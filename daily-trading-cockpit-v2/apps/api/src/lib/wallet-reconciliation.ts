@@ -169,6 +169,10 @@ export interface WalletReconciliationReport {
    *  figure at all for any other day. When false, withinTolerance is forced true (no verdict can
    *  honestly be rendered) and `note` explains why. */
   internalLedgerFresh: boolean;
+  comparisonBasis: "NET_REALIZED_WITH_ALL_COMMISSION" | "GROSS_REALIZED_CLOSED_ONLY";
+  internalClosedFeesUsd: number | null;
+  comparisonInternalUsd: number;
+  comparisonExchangeUsd: number;
   exchangeIncome: DailyIncomeSummary;
   /** exchangeIncome.comparableToLedgerUsd − internalRealizedPnlUsd. */
   deltaUsd: number;
@@ -190,6 +194,9 @@ export function buildWalletReconciliationReport(opts: {
   fetchedCount?: number;
   fetchLimit?: number;
   nowIso?: () => string;
+  /** When supplied, compare exchange gross REALIZED_PNL against internal net closed PnL plus only
+   * closed-position fees. This excludes commissions paid to enter positions that remain OPEN. */
+  internalClosedFeesUsd?: number;
 }): WalletReconciliationReport {
   const nowIso = opts.nowIso ?? (() => new Date().toISOString());
   const summaries = summarizeIncomeByUtcDay(opts.incomeEntries, {
@@ -199,6 +206,17 @@ export function buildWalletReconciliationReport(opts: {
   const exchangeIncome = summaries.get(opts.dayUtc) ?? emptyDailyIncomeSummary(opts.dayUtc);
   const internalLedgerFresh = opts.internalLedger.dateUtc === opts.dayUtc;
   const internalRealizedPnlUsd = internalLedgerFresh ? opts.internalLedger.realizedPnlUsd : 0;
+  const grossClosedMode = typeof opts.internalClosedFeesUsd === "number" && Number.isFinite(opts.internalClosedFeesUsd);
+  const internalClosedFeesUsd = grossClosedMode ? Math.max(0, opts.internalClosedFeesUsd!) : null;
+  const comparisonBasis = grossClosedMode
+    ? "GROSS_REALIZED_CLOSED_ONLY" as const
+    : "NET_REALIZED_WITH_ALL_COMMISSION" as const;
+  const comparisonInternalUsd = grossClosedMode
+    ? internalRealizedPnlUsd + (internalClosedFeesUsd ?? 0)
+    : internalRealizedPnlUsd;
+  const comparisonExchangeUsd = grossClosedMode
+    ? exchangeIncome.realizedPnlUsd
+    : exchangeIncome.comparableToLedgerUsd;
 
   if (!internalLedgerFresh) {
     return {
@@ -206,6 +224,10 @@ export function buildWalletReconciliationReport(opts: {
       generatedAt: nowIso(),
       internalRealizedPnlUsd,
       internalLedgerFresh,
+      comparisonBasis,
+      internalClosedFeesUsd,
+      comparisonInternalUsd,
+      comparisonExchangeUsd,
       exchangeIncome,
       deltaUsd: 0,
       toleranceUsd: opts.toleranceUsd,
@@ -217,13 +239,17 @@ export function buildWalletReconciliationReport(opts: {
     };
   }
 
-  const deltaUsd = exchangeIncome.comparableToLedgerUsd - internalRealizedPnlUsd;
+  const deltaUsd = comparisonExchangeUsd - comparisonInternalUsd;
   const withinTolerance = Math.abs(deltaUsd) <= opts.toleranceUsd;
   return {
     dayUtc: opts.dayUtc,
     generatedAt: nowIso(),
     internalRealizedPnlUsd,
     internalLedgerFresh,
+    comparisonBasis,
+    internalClosedFeesUsd,
+    comparisonInternalUsd,
+    comparisonExchangeUsd,
     exchangeIncome,
     deltaUsd,
     toleranceUsd: opts.toleranceUsd,
@@ -294,6 +320,7 @@ export async function buildLiveWalletReconciliationReport(
   dayUtc?: string,
   config: WalletReconciliationConfig = parseWalletReconciliationConfig(),
   externalTodayRealizedPnlUsd = 0,
+  internalTodayClosedFeesUsd?: number,
 ): Promise<WalletReconciliationReport> {
   const day = resolveDayUtc(dayUtc);
   const { startMs, endMs } = utcDayBoundsMs(day);
@@ -309,5 +336,6 @@ export async function buildLiveWalletReconciliationReport(
     toleranceUsd: config.toleranceUsd,
     fetchedCount: incomeEntries.length,
     fetchLimit: INCOME_FETCH_LIMIT,
+    internalClosedFeesUsd: internalTodayClosedFeesUsd,
   });
 }

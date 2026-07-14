@@ -105,7 +105,13 @@ export const UNIFIED_FEATURE_REGISTRY: readonly UnifiedFeatureRegistration[] = [
     id: "REGIME_COMPOSITE_CONFIRMATION",
     role: "VOTER",
     consumers: ["UNIFIED_DIRECTIONAL_BRAIN", "DECISION_TRACE"],
-    purpose: "Axis breadth plus derivatives-crowding confirmation.",
+    purpose: "LONG-side axis breadth plus derivatives-crowding confirmation.",
+  },
+  {
+    id: "REGIME_COMPOSITE_SHORT_CONFIRMATION",
+    role: "VOTER",
+    consumers: ["UNIFIED_DIRECTIONAL_BRAIN", "DECISION_TRACE"],
+    purpose: "SHORT-side bearish-breadth plus crowding-stability confirmation (mirror of the LONG lane).",
   },
   {
     id: "COMPOSITE_ESTIMATOR_BIDI",
@@ -136,6 +142,12 @@ export const UNIFIED_FEATURE_REGISTRY: readonly UnifiedFeatureRegistration[] = [
     role: "PROPOSAL",
     consumers: ["UNIFIED_DIRECTIONAL_BRAIN", "PORTFOLIO_RISK_COORDINATOR"],
     purpose: "Neutral basket proposal used only when its rolling after-cost health is positive.",
+  },
+  {
+    id: "REGIME_EDGE_MEMORY",
+    role: "VOTER",
+    consumers: ["UNIFIED_DIRECTIONAL_BRAIN"],
+    purpose: "Hard-vetoes a primary direction proven net-negative (n≥30, avgNetR≤0) in the current regime.",
   },
   {
     id: "LIVE_RISK_GUARDS",

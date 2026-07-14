@@ -56,6 +56,8 @@ import { fetchCrowdingSnapshot, type CrowdSide, type CrowdingState } from "./der
 import { clusterOf, isMajorSymbol } from "./correlation-clusters.js";
 import type { BinanceClient } from "./binance.js";
 import type { PaperOrder } from "./paper-execution-router.js";
+import { recordExecLifecycle } from "./lane-context-journal-runtime.js";
+import type { LifecycleEvent } from "./execution-lifecycle-log.js";
 import { isProfitCoreShortLaneId } from "./realtime-short-mirror.js";
 import {
   getCuratedSymbolsForLane,
@@ -87,6 +89,8 @@ export interface LiveExecutionConfig {
   /** Correlated-alt concentration cap per direction. BTC/ETH are majors; everything else is treated as the correlated alt basket. */
   maxCorrelatedAltLongPositions: number;
   maxCorrelatedAltShortPositions: number;
+  /** Hard aggregate stop-risk ceiling for one intent after all pyramid adds. */
+  maxAggregateIntentRiskUsd: number;
   /**
    * Max open positions per correlation CLUSTER per direction (replaces the flat all-alts cap above).
    * BTC/ETH (MAJORS cluster) are exempt — bounded only by maxConcurrentPositions. This lets genuinely
@@ -192,6 +196,10 @@ export interface LiveControllerSnapshot {
   mode: string | null;
   bias?: string | null;
   confidence?: string | null;
+  /** Graduated-confidence telemetry (2026-07-12). convictionScore 0..1; gradedConfidence is the
+   *  un-floored tier (may be LOW where `confidence` is floored to MEDIUM). Shadow/telemetry only. */
+  convictionScore?: number | null;
+  gradedConfidence?: string | null;
   estimatedRegime?: LaneSelectorV2EstimatedRegime | null;
   reasons?: string[];
   capturedAt?: string | null;
@@ -236,6 +244,7 @@ export function parseLiveExecutionConfig(env: NodeJS.ProcessEnv = process.env): 
   }
 
   const maxLeverage = Math.floor(envNum(env.LIVE_MAX_LEVERAGE, 2));
+  const riskUsdPerTrade = envNum(env.LIVE_RISK_USD_PER_TRADE, 5);
   const defaultLeverage = boundedLeverage(
     envNum(env.LIVE_DEFAULT_LEVERAGE, Math.min(3, maxLeverage)),
     maxLeverage,
@@ -246,10 +255,11 @@ export function parseLiveExecutionConfig(env: NodeJS.ProcessEnv = process.env): 
     env: liveEnv,
     apiKey,
     apiSecret,
-    riskUsdPerTrade: envNum(env.LIVE_RISK_USD_PER_TRADE, 5),
+    riskUsdPerTrade,
     maxConcurrentPositions: Math.floor(envNum(env.LIVE_MAX_CONCURRENT_POSITIONS, 3)),
     maxCorrelatedAltLongPositions: envNonNegativeInt(env.LIVE_MAX_CORRELATED_ALT_LONGS, 3),
     maxCorrelatedAltShortPositions: envNonNegativeInt(env.LIVE_MAX_CORRELATED_ALT_SHORTS, 3),
+    maxAggregateIntentRiskUsd: envNum(env.LIVE_MAX_AGGREGATE_INTENT_RISK_USD, riskUsdPerTrade),
     maxClusterPositions: envNonNegativeInt(env.LIVE_MAX_CLUSTER_POSITIONS, 3),
     dailyMaxLossUsd: envNum(env.LIVE_DAILY_MAX_LOSS_USD, 15),
     maxConsecutiveLosses: Math.floor(envNum(env.LIVE_MAX_CONSECUTIVE_LOSSES, 5)),
@@ -460,6 +470,8 @@ export interface LiveIntent {
   tp1Price: number;
   filledEntryPrice: number | null;
   entryOrderId: string | null;
+  /** Every exchange entry order absorbed into this intent, including pyramid adds. */
+  entryOrderIds?: string[];
   stopOrderId: string | null;
   tp1OrderId: string | null;
   beStopOrderId: string | null;
@@ -1518,11 +1530,7 @@ export class LiveExecutionEngine {
       try {
         // A panic flatten is NEVER a win — book its realized P&L so it isn't silently dropped from
         // lane reports and the drawdown-peak rebase, same reasoning as the kill-switch path below.
-        const settled = await this.realizedFromTrades(intent.symbol, intent.createdAt, [
-          intent.entryOrderId,
-          intent.tp1OrderId,
-          flattenOrderIdBySymbol.get(intent.symbol) ?? null,
-        ]);
+        const settled = await this.settleIntentAfterClose(intent, [flattenOrderIdBySymbol.get(intent.symbol) ?? null]);
         const net = settled?.netUsd ?? null;
         intent.realizedPnlUsd = net;
         intent.feesUsd = settled?.feesUsd ?? null;
@@ -1727,6 +1735,7 @@ export class LiveExecutionEngine {
         maxConcurrentPositions: this.config.maxConcurrentPositions,
         maxCorrelatedAltLongPositions: this.config.maxCorrelatedAltLongPositions,
         maxCorrelatedAltShortPositions: this.config.maxCorrelatedAltShortPositions,
+        maxAggregateIntentRiskUsd: this.maxAggregateIntentRiskUsd(),
         maxClusterPositions: this.config.maxClusterPositions,
         dailyMaxLossUsd: this.config.dailyMaxLossUsd,
         maxConsecutiveLosses: this.config.maxConsecutiveLosses,
@@ -1802,6 +1811,20 @@ export class LiveExecutionEngine {
    */
   async getIncomeHistory(startTimeMs: number, endTimeMs: number): Promise<FuturesIncomeEntry[]> {
     return this.client.getIncomeHistory({ startTime: startTimeMs, endTime: endTimeMs });
+  }
+
+  /** Actual commissions attributed to engine intents CLOSED today. Open-entry commissions are
+   * deliberately excluded so wallet reconciliation compares closed economics to closed economics. */
+  getClosedTodayFeesUsd(): number {
+    const dayUtc = this.nowIso().slice(0, 10);
+    return this.store.getState().intents
+      .filter((intent) =>
+        intent.state === "CLOSED" &&
+        intent.closedAt?.startsWith(dayUtc) &&
+        typeof intent.feesUsd === "number" &&
+        Number.isFinite(intent.feesUsd),
+      )
+      .reduce((sum, intent) => sum + (intent.feesUsd ?? 0), 0);
   }
 
   async getAccountSnapshot(): Promise<{
@@ -2301,7 +2324,7 @@ export class LiveExecutionEngine {
         });
         flattenOrderId = flatten.orderId;
       }
-      const settled = await this.realizedFromTrades(intent.symbol, intent.createdAt, [intent.entryOrderId, intent.tp1OrderId, flattenOrderId]);
+      const settled = await this.settleIntentAfterClose(intent, [flattenOrderId]);
       const net = settled?.netUsd ?? null;
       intent.realizedPnlUsd = net;
       intent.feesUsd = settled?.feesUsd ?? null;
@@ -2444,7 +2467,7 @@ export class LiveExecutionEngine {
           // A kill-switch flatten is NEVER a win — book its realized P&L (almost always a loss,
           // since this only fires on a breaker tripping) so lane reports don't silently drop it
           // and resetKill()'s drawdown-peak rebase isn't understated right when it matters most.
-          const settled = await this.realizedFromTrades(intent.symbol, intent.createdAt, [intent.entryOrderId, intent.tp1OrderId, flattenOrderId]);
+          const settled = await this.settleIntentAfterClose(intent, [flattenOrderId]);
           const net = settled?.netUsd ?? null;
           intent.realizedPnlUsd = net;
           intent.feesUsd = settled?.feesUsd ?? null;
@@ -2680,11 +2703,7 @@ export class LiveExecutionEngine {
               } catch {
                 // best-effort cleanup after the runner is already closed.
               }
-              const settled = await this.realizedFromTrades(intent.symbol, intent.createdAt, [
-                intent.entryOrderId,
-                intent.tp1OrderId,
-                flat.orderId,
-              ]);
+              const settled = await this.settleIntentAfterClose(intent, [flat.orderId]);
               const net = settled?.netUsd ?? null;
               intent.realizedPnlUsd = net;
               intent.feesUsd = settled?.feesUsd ?? null;
@@ -2752,11 +2771,7 @@ export class LiveExecutionEngine {
     } catch {
       // Position is already flattened; residue cleanup is best-effort.
     }
-    const settled = await this.realizedFromTrades(intent.symbol, intent.createdAt, [
-      intent.entryOrderId,
-      intent.tp1OrderId,
-      flat.orderId,
-    ]);
+    const settled = await this.settleIntentAfterClose(intent, [flat.orderId]);
     const net = settled?.netUsd ?? null;
     intent.realizedPnlUsd = net;
     intent.feesUsd = settled?.feesUsd ?? null;
@@ -2786,7 +2801,10 @@ export class LiveExecutionEngine {
       : this.config.maxCorrelatedAltShortPositions;
   }
 
-  private correlatedAltOpenCounts(intents: LiveIntent[]): Record<"LONG" | "SHORT", number> {
+  private correlatedAltOpenSymbols(
+    intents: LiveIntent[],
+    externalManagedNetQty: ReadonlyMap<string, number> = new Map(),
+  ): Record<"LONG" | "SHORT", Set<string>> {
     const symbols: Record<"LONG" | "SHORT", Set<string>> = {
       LONG: new Set(),
       SHORT: new Set(),
@@ -2796,10 +2814,15 @@ export class LiveExecutionEngine {
       if (!this.isCorrelatedAltSymbol(intent.symbol)) continue;
       symbols[intent.direction].add(intent.symbol);
     }
-    return {
-      LONG: symbols.LONG.size,
-      SHORT: symbols.SHORT.size,
-    };
+    for (const [symbol, netQty] of externalManagedNetQty) {
+      if (!this.isCorrelatedAltSymbol(symbol) || !Number.isFinite(netQty) || Math.abs(netQty) <= 1e-12) continue;
+      symbols[netQty > 0 ? "LONG" : "SHORT"].add(symbol.toUpperCase());
+    }
+    return symbols;
+  }
+
+  private maxAggregateIntentRiskUsd(): number {
+    return Math.max(0, this.config.maxAggregateIntentRiskUsd);
   }
 
   /**
@@ -3009,11 +3032,7 @@ export class LiveExecutionEngine {
       } catch {
         // Position is already flattened; exit-order cleanup remains best-effort.
       }
-      const settled = await this.realizedFromTrades(intent.symbol, intent.createdAt, [
-        intent.entryOrderId,
-        intent.tp1OrderId,
-        flat.orderId,
-      ]);
+      const settled = await this.settleIntentAfterClose(intent, [flat.orderId]);
       const net = settled?.netUsd ?? null;
       intent.realizedPnlUsd = net;
       intent.feesUsd = settled?.feesUsd ?? null;
@@ -3166,7 +3185,7 @@ export class LiveExecutionEngine {
     } catch {
       // residue cleanup is best-effort after the position is flat
     }
-    const liveLegSettled = await this.realizedFromTrades(action.symbol, rescueIntent.createdAt, [flat.orderId]);
+    const liveLegSettled = await this.settleIntentAfterClose(rescueIntent, [flat.orderId]);
     const liveLegRealized = liveLegSettled?.netUsd ?? null;
     rescueIntent.realizedPnlUsd = liveLegRealized;
     rescueIntent.feesUsd = liveLegSettled?.feesUsd ?? null;
@@ -3206,7 +3225,7 @@ export class LiveExecutionEngine {
     // The flip order closed the opposing leg(s): book their realized loss and close them.
     let priorRealized = 0;
     for (const oi of opposingIntents) {
-      const rSettled = await this.realizedFromTrades(action.symbol, oi.createdAt, [oi.entryOrderId, oi.tp1OrderId, flip.orderId]);
+      const rSettled = await this.settleIntentAfterClose(oi, [flip.orderId]);
       const r = rSettled?.netUsd ?? null;
       if (r === null) {
         oi.lastError = "rescue flip: P&L UNKNOWN — trades fetch failed; wallet-reconciliation will catch the true amount";
@@ -3306,11 +3325,7 @@ export class LiveExecutionEngine {
     } catch {
       // best-effort residue cleanup after the position has already been closed.
     }
-    const settled = await this.realizedFromTrades(intent.symbol, intent.createdAt, [
-      intent.entryOrderId,
-      intent.tp1OrderId,
-      flat.orderId,
-    ]);
+    const settled = await this.settleIntentAfterClose(intent, [flat.orderId]);
     const net = settled?.netUsd ?? null;
     intent.realizedPnlUsd = net;
     intent.feesUsd = settled?.feesUsd ?? null;
@@ -3366,11 +3381,7 @@ export class LiveExecutionEngine {
     } catch {
       // best-effort residue cleanup after the position has already been closed.
     }
-    const settled = await this.realizedFromTrades(intent.symbol, intent.createdAt, [
-      intent.entryOrderId,
-      intent.tp1OrderId,
-      flat.orderId,
-    ]);
+    const settled = await this.settleIntentAfterClose(intent, [flat.orderId]);
     const net = settled?.netUsd ?? null;
     intent.realizedPnlUsd = net;
     intent.feesUsd = settled?.feesUsd ?? null;
@@ -3424,11 +3435,7 @@ export class LiveExecutionEngine {
     } catch {
       // best-effort residue cleanup after the position has already been closed.
     }
-    const settled = await this.realizedFromTrades(intent.symbol, intent.createdAt, [
-      intent.entryOrderId,
-      intent.tp1OrderId,
-      flat.orderId,
-    ]);
+    const settled = await this.settleIntentAfterClose(intent, [flat.orderId]);
     const net = settled?.netUsd ?? null;
     intent.realizedPnlUsd = net;
     intent.feesUsd = settled?.feesUsd ?? null;
@@ -3471,24 +3478,21 @@ export class LiveExecutionEngine {
       if (algoQueryFailed) {
         intent.lastError = "settle: stop/breakeven order query failed — its real closing trade may be missing from this settlement; PnL left UNKNOWN, check manually";
       } else {
-        const trades = await this.client.getUserTrades(intent.symbol, {
-          startTime: new Date(intent.createdAt).getTime(),
-          limit: 200,
-        });
-        const ourOrderIds = new Set(
-          [intent.entryOrderId, intent.tp1OrderId, ...triggeredAlgoOrderIds].filter(
-            (id): id is string => typeof id === "string",
-          ),
+        const requiredCloseOrderIds = triggeredAlgoOrderIds.length > 0
+          ? triggeredAlgoOrderIds
+          : [intent.tp1OrderId];
+        const settled = await this.realizedFromTrades(
+          intent.symbol,
+          intent.createdAt,
+          this.intentSettlementOrderIds(intent, triggeredAlgoOrderIds),
+          { requiredOrderIds: requiredCloseOrderIds },
         );
-        let realized = 0;
-        let feesSum = 0;
-        for (const t of trades) {
-          if (!ourOrderIds.has(t.orderId)) continue;
-          realized += t.realizedPnl;
-          feesSum += t.commission; // commissionAsset assumed USDT on USD-M pairs
+        if (settled === null) {
+          intent.lastError = "settle: closing trade not visible after retries — P&L left UNKNOWN; wallet reconciliation will catch the true amount";
+        } else {
+          net = settled.netUsd;
+          fees = settled.feesUsd;
         }
-        net = realized - feesSum;
-        fees = feesSum;
       }
     } catch (error) {
       intent.lastError = `settle: trades fetch failed (${(error as Error).message}) — PnL UNKNOWN, check manually`;
@@ -3568,23 +3572,72 @@ export class LiveExecutionEngine {
     symbol: string,
     sinceIso: string,
     orderIds: Array<string | null>,
+    opts: {
+      /** A just-placed close can be eventually consistent in /userTrades. Never settle until
+       *  these order ids are visible, otherwise entry commission alone looks like a realized loss. */
+      requiredOrderIds?: Array<string | null>;
+      retries?: number;
+      retryDelayMs?: number;
+    } = {},
   ): Promise<{ netUsd: number; feesUsd: number } | null> {
     const ids = new Set(orderIds.filter((id): id is string => typeof id === "string"));
     if (ids.size === 0) return { netUsd: 0, feesUsd: 0 };
-    try {
-      const trades = await this.client.getUserTrades(symbol, { startTime: new Date(sinceIso).getTime(), limit: 1000 });
-      let net = 0;
-      let fees = 0;
-      for (const t of trades) {
-        if (ids.has(t.orderId)) {
-          net += t.realizedPnl - t.commission;
-          fees += t.commission;
+    const required = new Set(
+      (opts.requiredOrderIds ?? []).filter((id): id is string => typeof id === "string"),
+    );
+    const retries = Math.max(0, Math.floor(opts.retries ?? (required.size > 0 ? 6 : 0)));
+    const retryDelayMs = Math.max(0, opts.retryDelayMs ?? this.fillConfirmRetryDelayMs);
+    for (let attempt = 0; attempt <= retries; attempt += 1) {
+      try {
+        const trades = await this.client.getUserTrades(symbol, { startTime: new Date(sinceIso).getTime(), limit: 1000 });
+        const visibleIds = new Set(trades.map((trade) => trade.orderId));
+        const matchedTrades = trades.filter((trade) => ids.has(trade.orderId));
+        // One of several candidate exit orders may be the actual fill (TP vs stop vs BE stop).
+        // A matched non-zero realized row is also definitive close evidence for legacy records
+        // whose exact close order id was not persisted; entry rows have realizedPnl=0.
+        const closeVisible = required.size === 0 ||
+          [...required].some((id) => visibleIds.has(id)) ||
+          matchedTrades.some((trade) => Math.abs(trade.realizedPnl) > 1e-12);
+        if (!closeVisible) {
+          if (attempt === retries) return null;
+        } else {
+          let net = 0;
+          let fees = 0;
+          for (const t of matchedTrades) {
+            if (ids.has(t.orderId)) {
+              net += t.realizedPnl - t.commission;
+              fees += t.commission;
+            }
+          }
+          return { netUsd: net, feesUsd: fees };
         }
+      } catch {
+        if (attempt === retries) return null;
       }
-      return { netUsd: net, feesUsd: fees };
-    } catch {
-      return null;
+      if (retryDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
     }
+    return null;
+  }
+
+  private intentSettlementOrderIds(intent: LiveIntent, extra: Array<string | null> = []): Array<string | null> {
+    return [
+      intent.entryOrderId,
+      ...(intent.entryOrderIds ?? []),
+      intent.tp1OrderId,
+      ...extra,
+    ];
+  }
+
+  private settleIntentAfterClose(
+    intent: LiveIntent,
+    closeOrderIds: Array<string | null>,
+  ): Promise<{ netUsd: number; feesUsd: number } | null> {
+    return this.realizedFromTrades(
+      intent.symbol,
+      intent.createdAt,
+      this.intentSettlementOrderIds(intent, closeOrderIds),
+      { requiredOrderIds: closeOrderIds },
+    );
   }
 
   private rollDailyLedger(): void {
@@ -4147,7 +4200,9 @@ export class LiveExecutionEngine {
       .map((c) => c.paper);
 
     let slots = Math.max(0, this.config.maxConcurrentPositions - openCount);
+    const externalManaged = this.externalManagedNetQty();
     const clusterOpen = this.clusterOpenCounts(st.intents);
+    const correlatedAltOpen = this.correlatedAltOpenSymbols(st.intents, externalManaged);
     let maxSeen = st.lastSeenCreatedAt;
 
     // Snapshot once per tick (not per candidate): this tick's whitelist ATR% values, for the
@@ -4179,10 +4234,17 @@ export class LiveExecutionEngine {
       }
       // Entry-side netting guard preview (the authoritative guard lives in openIntent): surfaced
       // here so the funnel explains WHY a candidate on a basket-opposite symbol never opens.
-      const groupClaim = this.externalManagedNetQty().get(first.symbol) ?? 0;
+      const groupClaim = externalManaged.get(first.symbol) ?? 0;
       if (groupClaim !== 0 && Math.sign(groupClaim) !== (first.direction === "LONG" ? 1 : -1)) {
         for (const paper of papers) latchReason(paper.paperOrderId, "basket_opposite_side");
         continue;
+      }
+      if (!oppositeIntent && this.isCorrelatedAltSymbol(first.symbol)) {
+        const openSymbols = correlatedAltOpen[first.direction];
+        if (!openSymbols.has(first.symbol) && openSymbols.size >= this.correlatedAltCap(first.direction)) {
+          for (const paper of papers) latchReason(paper.paperOrderId, "correlated_alt_cap");
+          continue;
+        }
       }
       // Per-correlation-cluster cap (MAJORS exempt). A genuinely different basket gets its own slots
       // instead of sharing one flat alt cap; a single cluster still can't pile up beyond the limit.
@@ -4297,6 +4359,15 @@ export class LiveExecutionEngine {
         for (const paper of lanePapers) latchReason(paper.paperOrderId, "plan_not_sizeable"); // e.g. BTC: $50 cap < one 0.001-step
         continue;
       }
+      if (oppositeIntent) {
+        const currentRisk = Math.max(0, oppositeIntent.effectiveRiskUsd ?? 0);
+        const additionRisk = planned.reduce((sum, item) => sum + item.plan.effectiveRiskUsd, 0);
+        const aggregateCap = this.maxAggregateIntentRiskUsd();
+        if (currentRisk + additionRisk > aggregateCap + 1e-9) {
+          for (const paper of lanePapers) latchReason(paper.paperOrderId, "aggregate_intent_risk_cap");
+          continue;
+        }
+      }
 
       // Record the attempt BEFORE placing orders and persist it, so a deterministic failure (or a
       // crash mid-open) can never be retried forever — at MAX_MIRROR_ATTEMPTS the paper order is
@@ -4317,6 +4388,7 @@ export class LiveExecutionEngine {
           set.add(first.symbol);
           clusterOpen.set(clusterKey, set);
         }
+        if (this.isCorrelatedAltSymbol(first.symbol)) correlatedAltOpen[first.direction].add(first.symbol);
         slots -= 1;
       }
     }
@@ -4529,6 +4601,28 @@ export class LiveExecutionEngine {
     this.store.save();
 
     const idTail = paper.paperOrderId.slice(-18);
+    // ── Stage-2 execution-lifecycle tap (report-only, default-OFF, fail-open) ──
+    // Records the ENTRY order's lifecycle timestamps (decision→submit→ack→fill / reject) for free L1 execution
+    // calibration. `recordExecLifecycle` is synchronous, never throws (fail-open inside the runtime), makes no
+    // exchange call and mutates nothing — so it cannot alter the awaits/retries/ordering below or the returned
+    // result. Gated: ZERO I/O unless EXEC_LIFECYCLE_TIMESTAMPS=1 on 3101/3102 (hard-blocked on live 3103). The
+    // stable correlation key is the ENTRY clientOrderId. Stop/TP/exit/flatten/flip order lifecycles are
+    // intentionally omitted from this first wiring (surfaced here, not silently) — the entry fill is the signal.
+    const entryClientId = `dtc-${idTail}-e`;
+    const entryLcSide: "BUY" | "SELL" = paper.direction === "LONG" ? "BUY" : "SELL";
+    const logEntryLc = (event: LifecycleEvent, cumulativeFilledQty: number | null = null): void => {
+      recordExecLifecycle({
+        orderId: entryClientId, decisionId: paper.paperOrderId, event, eventAtMs: Date.now(), exchangeEventAtMs: null,
+        symbol: paper.symbol, side: entryLcSide, orderType: "MARKET", requestedQty: plan.qty, cumulativeFilledQty,
+        source: "live-execution-engine.openIntent",
+      });
+    };
+    logEntryLc("DECISION"); // the decision to open THIS entry is committed (intent persisted above)
+    // Tracks whether the ENTRY order itself reached its fill terminal. The catch below wraps the WHOLE open path
+    // (entry + protective stop + TP), so without this a stop/TP placement failure AFTER a filled entry would emit a
+    // spurious REJECTED for an order that actually FINAL_FILLed — a double-terminal that corrupts the L1 calibration
+    // stream. REJECTED is emitted ONLY when the entry never filled (a genuine entry-submission rejection).
+    let entryFilled = false;
     try {
       const leverage = this.leverageForPlanned(planned);
       await this.ensureSymbolLeverage(paper.symbol, leverage);
@@ -4546,14 +4640,17 @@ export class LiveExecutionEngine {
       const entrySide = paper.direction === "LONG" ? "BUY" : "SELL";
       const exitSide = paper.direction === "LONG" ? "SELL" : "BUY";
 
+      logEntryLc("SUBMITTED"); // about to hand the entry order to the exchange
       const entry = await this.client.placeOrder({
         symbol: paper.symbol,
         side: entrySide,
         type: "MARKET",
         quantity: plan.qty,
-        newClientOrderId: `dtc-${idTail}-e`,
+        newClientOrderId: entryClientId,
       });
+      logEntryLc("EXCHANGE_ACK"); // genuine: placeOrder returned the exchange's orderId (never synthesized)
       intent.entryOrderId = entry.orderId;
+      intent.entryOrderIds = [entry.orderId];
       // Confirm the REAL fill before repricing stop/TP off it — silently trusting an
       // avgPrice=0 placeOrder response would fall back to the stale pre-trade paper price,
       // exactly the "wrong side of the actual fill" condition that once churned a stop
@@ -4568,6 +4665,10 @@ export class LiveExecutionEngine {
       });
       intent.filledEntryPrice = entryResolved.price;
       intent.entryPriceConfirmed = entryResolved.confirmed;
+      // FINAL_FILL: the entry MARKET fill is resolved. This path observes only the resolved fill, not incremental
+      // partials, so FIRST_FILL is intentionally not emitted separately (documented fill contract).
+      logEntryLc("FINAL_FILL", plan.qty);
+      entryFilled = true; // the entry order is now a filled terminal — a later throw is NOT an entry rejection
       const repriced = this.repricedGeometry(planned, intent.filledEntryPrice, filters);
       intent.stopLossPrice = repriced.stopPrice;
       intent.tp1Price = repriced.tp1Price;
@@ -4609,6 +4710,12 @@ export class LiveExecutionEngine {
       intent.updatedAt = this.nowIso();
       this.store.save();
     } catch (error) {
+      // REJECTED covers ONLY a genuine entry-submission failure (the entry never filled). If the entry already
+      // FINAL_FILLed and a DOWNSTREAM protective placement (stop/TP) threw, that is NOT an entry rejection — emitting
+      // it would double-terminal the entry order (finalFillAt AND rejectedAt) and pollute the L1 calibration stream.
+      // The downstream failure's own lifecycle is intentionally not journaled in this first wiring. Report-only; the
+      // emergency flatten + error handling below is UNCHANGED.
+      if (!entryFilled) logEntryLc("REJECTED");
       // A position without a protective stop is NOT allowed to exist: flatten immediately.
       intent.lastError = (error as Error).message ?? "open failed";
       intent.state = "ERROR";
@@ -4636,7 +4743,7 @@ export class LiveExecutionEngine {
           intent.closeReason = "EMERGENCY_FLATTEN_NO_STOP";
           // A real position was opened and immediately dumped — book the realized loss so the
           // daily-loss and consecutive-loss breakers SEE the churn instead of being blind to it.
-          const settled = await this.realizedFromTrades(paper.symbol, intent.createdAt, [intent.entryOrderId, flat.orderId]);
+          const settled = await this.settleIntentAfterClose(intent, [flat.orderId]);
           const net = settled?.netUsd ?? null;
           intent.realizedPnlUsd = net;
           intent.feesUsd = settled?.feesUsd ?? null;
@@ -4696,6 +4803,12 @@ export class LiveExecutionEngine {
               `averaged fill price uses the fallback ${fallback} (stale paper reference), not a confirmed fill.`,
           ),
       });
+      intent.entryOrderIds = Array.from(new Set([
+        ...(intent.entryOrderIds ?? (intent.entryOrderId ? [intent.entryOrderId] : [])),
+        entry.orderId,
+      ]));
+      intent.updatedAt = this.nowIso();
+      this.store.save();
     } catch (addError) {
       // Existing stop + TP are still working → the position is safe. Skip the add; do NOT flatten.
       intent.lastError = `add entry skipped — position still protected: ${(addError as Error).message}`;
@@ -4807,7 +4920,7 @@ export class LiveExecutionEngine {
             newClientOrderId: `dtc-${idTail}-ax`,
           });
           intent.closeReason = "EMERGENCY_FLATTEN_ADD_FAILED";
-          const settled = await this.realizedFromTrades(intent.symbol, intent.createdAt, [intent.entryOrderId, flat.orderId]);
+          const settled = await this.settleIntentAfterClose(intent, [flat.orderId]);
           const net = settled?.netUsd ?? null;
           intent.realizedPnlUsd = net;
           intent.feesUsd = settled?.feesUsd ?? null;

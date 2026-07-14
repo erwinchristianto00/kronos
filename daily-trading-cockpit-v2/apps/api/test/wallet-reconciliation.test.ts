@@ -168,6 +168,28 @@ describe("buildWalletReconciliationReport", () => {
     expect(report.exchangeIncome.fundingFeeUsd).toBeCloseTo(-3, 10);
   });
 
+  it("gross-closed mode excludes commissions belonging to positions that are still open", () => {
+    const entries = [
+      income({ time: day1Ms, incomeType: "REALIZED_PNL", income: 10 }),
+      income({ time: day1Ms + 1, incomeType: "COMMISSION", income: -0.2 }), // closed trade fees
+      income({ time: day1Ms + 2, incomeType: "COMMISSION", income: -0.7 }), // open entries
+    ];
+    const report = buildWalletReconciliationReport({
+      dayUtc: DAY1,
+      internalLedger: { dateUtc: DAY1, realizedPnlUsd: 9.8 },
+      internalClosedFeesUsd: 0.2,
+      incomeEntries: entries,
+      toleranceUsd: 0.5,
+    });
+
+    expect(report.comparisonBasis).toBe("GROSS_REALIZED_CLOSED_ONLY");
+    expect(report.comparisonInternalUsd).toBeCloseTo(10, 10);
+    expect(report.comparisonExchangeUsd).toBeCloseTo(10, 10);
+    expect(report.deltaUsd).toBeCloseTo(0, 10);
+    expect(report.withinTolerance).toBe(true);
+    expect(report.exchangeIncome.commissionUsd).toBeCloseTo(-0.9, 10); // still visible, just not misclassified
+  });
+
   it("skips the tolerance verdict (withinTolerance=true, note explains why) when the ledger's own date is stale", () => {
     const entries = [income({ time: day1Ms, incomeType: "REALIZED_PNL", income: 999 })];
     const report = buildWalletReconciliationReport({
@@ -269,6 +291,21 @@ describe("buildLiveWalletReconciliationReport", () => {
     const withExternal = await buildLiveWalletReconciliationReport(engine, DAY1, { toleranceUsd: 0.5 }, 4.8);
     expect(withExternal.deltaUsd).toBeCloseTo(0, 10);
     expect(withExternal.withinTolerance).toBe(true);
+  });
+
+  it("passes closed-only fees into the live gross-realized comparison", async () => {
+    const engine: LiveEngineReconciliationSource = {
+      getStatus: () => ({ closedToday: { dateUtc: DAY1, realizedPnlUsd: 9.8 } }),
+      getIncomeHistory: async (startTimeMs) => [
+        income({ time: startTimeMs + 1000, incomeType: "REALIZED_PNL", income: 10 }),
+        income({ time: startTimeMs + 2000, incomeType: "COMMISSION", income: -1 }),
+      ],
+    };
+
+    const report = await buildLiveWalletReconciliationReport(engine, DAY1, { toleranceUsd: 0.5 }, 0, 0.2);
+    expect(report.comparisonBasis).toBe("GROSS_REALIZED_CLOSED_ONLY");
+    expect(report.deltaUsd).toBeCloseTo(0, 10);
+    expect(report.withinTolerance).toBe(true);
   });
 
   it("propagates a fetch failure instead of swallowing it into a false 'reconciled' result", async () => {

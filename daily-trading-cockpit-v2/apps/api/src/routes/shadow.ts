@@ -39,6 +39,7 @@ import {
 import { buildDashboardAuditSummaryReport, type DashboardAuditSummaryEra } from "../lib/dashboard-audit-summary.js";
 import { buildRegimeDirectionControllerReport } from "../lib/regime-direction-controller.js";
 import { getRegimeEdgeMemory } from "../lib/regime-edge-memory.js";
+import { runLaneResolutionScan } from "../lib/lane-context-journal-runtime.js";
 import { buildLiveTradingGateReport } from "../lib/live-trading-gate.js";
 import {
   buildExchangeHealthReadinessReport,
@@ -207,6 +208,13 @@ import {
   RC_INTERVAL,
   RC_UNIVERSE,
 } from "../lib/regime-composite-edge.js";
+import {
+  runRegimeCompositeShortCycleGuarded,
+  buildRegimeCompositeShortReport,
+  getRegimeCompositeShortStore,
+  RCS_INTERVAL,
+  RCS_UNIVERSE,
+} from "../lib/regime-composite-short-edge.js";
 import {
   runCompositeEstimatorCycleGuarded,
   buildCompositeEstimatorReport,
@@ -1448,7 +1456,16 @@ export async function registerShadowRoutes(
   // "promotable" (the live curation tier) could never be reached no matter how much time passed — see
   // PSLE_PEER_SOURCE_URLS. Best-effort: a peer fetch failure just means that peer's real trades are
   // missing from this cycle's count, never a thrown error or a stale/frozen report.
-  app.get("/api/shadow/per-symbol-lane-edge", async () => {
+  // ── per-symbol-lane-edge: TTL-cached (2026-07-12 OOM fix) ────────────────────────────────────────
+  // This endpoint copies the ENTIRE held order array (thousands on the diagnostic instance) + fetches
+  // peers + builds full grouping maps — a heavy transient-allocation scan. It is hit every 15min by BOTH
+  // testnet+live curation PLUS every dashboard render, which under the V8 heap cap produced the periodic
+  // OOM on 3101. Cache the result for a short TTL (curation acts on slow-moving realized-book stats, so a
+  // ≤60s-stale report is harmless) and COALESCE concurrent rebuilds so N simultaneous requests do ONE scan.
+  const PSLE_CACHE_TTL_MS = Number(process.env.PSLE_CACHE_TTL_MS) > 0 ? Math.floor(Number(process.env.PSLE_CACHE_TTL_MS)) : 60_000;
+  let psleCache: { atMs: number; value: unknown } | null = null;
+  let psleInflight: Promise<unknown> | null = null;
+  const buildPerSymbolLaneEdgeReport = async () => {
     const generatedAt = new Date().toISOString();
     const localOrders = getPaperExecutionRouterStore().getState().orders;
     const peerUrls = (process.env.PSLE_PEER_SOURCE_URLS ?? "http://localhost:3102,http://localhost:3103")
@@ -1493,6 +1510,21 @@ export async function registerShadowRoutes(
       suspiciousWr: envNum(process.env.PSLE_SUSPICIOUS_WR, 0.98),
     });
     return { generatedAt, peerOrdersMerged: peerOrders.length, ...report };
+  };
+  app.get("/api/shadow/per-symbol-lane-edge", async () => {
+    const now = Date.now();
+    if (psleCache && now - psleCache.atMs < PSLE_CACHE_TTL_MS) return psleCache.value; // fresh → no rescan
+    if (psleInflight) return psleInflight; // a rebuild is already running → coalesce onto it (one scan)
+    psleInflight = (async () => {
+      try {
+        const v = await buildPerSymbolLaneEdgeReport();
+        psleCache = { atMs: Date.now(), value: v };
+        return v;
+      } finally {
+        psleInflight = null;
+      }
+    })();
+    return psleInflight;
   });
 
   // Intraday momentum hunter (Sleeve 2) report — report-only measurement, nothing trades on it.
@@ -1524,6 +1556,13 @@ export async function registerShadowRoutes(
   app.get("/api/shadow/regime-composite-report", async () => {
     const rcStore = getRegimeCompositeStore();
     return { generatedAt: new Date().toISOString(), ...buildRegimeCompositeReport(rcStore.all, rcStore.cycleMeta) };
+  });
+
+  // Bearish-breadth mirror of the RC report above — the SHORT confirmation lane feeding the unified
+  // brain's SHORT vote (regime-composite-short-edge.ts). Report-only, accrues OOS evidence.
+  app.get("/api/shadow/regime-composite-short-report", async () => {
+    const rcsStore = getRegimeCompositeShortStore();
+    return { generatedAt: new Date().toISOString(), ...buildRegimeCompositeShortReport(rcsStore.all, rcsStore.cycleMeta) };
   });
 
   // Bidirectional composite estimator report (2026-07-09) — combines axis level + velocity +
@@ -1973,6 +2012,23 @@ export async function registerShadowRoutes(
             axisScore: rcAxisScore,
             fetchCandles: async (symbol: string) => _rcc.getCandles(symbol, RC_INTERVAL, 120),
             crowdingClient: _rcc,
+          }).catch(() => undefined);
+        }
+        // Regime-composite SHORT confirmation (2026-07-12): the bearish-breadth mirror of the RC
+        // lane above — same axis score (symmetric -1..+1 breadth composite), gated on axis <=
+        // -threshold instead of >= +threshold, same direction-agnostic crowding stability filter.
+        // Report-only measurement; consumed only as a SHORT confirmation vote by the unified brain
+        // (regime-composite-short-edge.ts). No executor — it never places a real order.
+        if (process.env.REGIME_COMPOSITE_SHORT_DISABLED !== "1") {
+          const _rcsc = opts.binanceClient;
+          const rcsAxisScore = buildRegimeAxisTimeline(getRegimeEngineStore().snapshots).current?.score ?? null;
+          void runRegimeCompositeShortCycleGuarded({
+            store: getRegimeCompositeShortStore(),
+            universe: RCS_UNIVERSE,
+            now: Date.now(),
+            axisScore: rcsAxisScore,
+            fetchCandles: async (symbol: string) => _rcsc.getCandles(symbol, RCS_INTERVAL, 120),
+            crowdingClient: _rcsc,
           }).catch(() => undefined);
         }
         // Bidirectional composite estimator (2026-07-09): axis level + velocity + per-symbol Kronos
@@ -2544,6 +2600,12 @@ export async function registerShadowRoutes(
             edgeMemory.updateFromClosedOrders(paperStore.getState().orders);
             edgeMemory.save();
           } catch { /* edge-memory update is report-only; never break the brief */ }
+
+          // ── Stage-2 lane-context resolution tap (report-only, default-OFF, fail-open) ──
+          // Observes the PERSISTED terminal paper outcomes (closedAtMs/resolvedAtMs already committed above); never
+          // mutates an order and cannot roll back the resolver. Zero I/O unless LANE_CONTEXT_JOURNAL_MODE=shadow on
+          // 3101/3102 (never 3103). Cheap + idempotent per cycle — a throw is swallowed inside the runtime.
+          runLaneResolutionScan(paperStore.getState().orders, Date.now());
 
           // ── Single post-resolve snapshot reconciliation (Section 10 consistency) ──
           // The resolver mutates the paper store (orders close), so the allocator

@@ -72,7 +72,8 @@ export class DecisionLedger {
     try {
       const thresholdBytes = Number(process.env.DECISION_LEDGER_ROTATION_THRESHOLD_BYTES) || 25 * 1024 * 1024;
       const tailLines = Number(process.env.DECISION_LEDGER_ROTATION_TAIL_LINES) || 10_000;
-      const result = rotateJsonlIfNeeded(this.file, { thresholdBytes, tailLines });
+      const tailBytes = Number(process.env.DECISION_LEDGER_ROTATION_TAIL_BYTES) || 8 * 1024 * 1024;
+      const result = rotateJsonlIfNeeded(this.file, { thresholdBytes, tailLines, tailBytes });
       if (result.rotated) {
         console.warn(
           `[decision-ledger] rotated ${this.file}: archived ${result.fromSize ?? "?"} bytes → ${result.archivePath ?? "?"}; kept ${result.linesKept ?? 0} lines`,

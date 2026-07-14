@@ -173,7 +173,10 @@ export function rotateJsonlIfNeeded(
 ): RotationResult {
   const thresholdBytes = opts.thresholdBytes ?? DEFAULT_THRESHOLD_BYTES;
   const tailLines = opts.tailLines ?? DEFAULT_TAIL_LINES;
-  const tailBytes = opts.tailBytes ?? DEFAULT_TAIL_BYTES;
+  // Keep the retained tail materially below the trigger. If both are equal, the first append
+  // after a rotation crosses the threshold again and creates a rotation storm.
+  const requestedTailBytes = opts.tailBytes ?? DEFAULT_TAIL_BYTES;
+  const tailBytes = Math.max(1, Math.min(requestedTailBytes, Math.floor(thresholdBytes / 2)));
   const readChunkSize = opts.readChunkSize ?? DEFAULT_READ_CHUNK_SIZE;
   try {
     if (!existsSync(filePath)) {

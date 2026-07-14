@@ -1,0 +1,265 @@
+/**
+ * CORTEX #218 — impure bindings for the nightly refit: read the decision journal (line-resilient, both
+ * the live .jsonl and the rotated .jsonl.1) + each lane's OWN resolved closes out of the six edge stores,
+ * the cross-sectional store, and the CG variant matrix, then normalize them into the pure runner's inputs.
+ * Every record that can't be normalized is TALLIED by reason (skipsByLane) so nothing is silently dropped.
+ */
+import { existsSync, readFileSync } from "node:fs";
+import { CORTEX_FEATURE_SCHEMA_VERSION } from "./cortex-brain.js";
+import type { CortexDecisionRow, CortexLaneDir, CortexLaneOutcome } from "./cortex-attribution.js";
+import {
+  directionalObsToOutcome,
+  xsecObsToOutcome,
+  buildCortexAttrRoster,
+  cortexLaneTtlMs,
+  parseIsoMs,
+  type CortexOutcomeSkipReason,
+  type RawDirectionalObs,
+  type RawXsecObs,
+} from "./cortex-outcome-source.js";
+import { runCortexRefit, type CortexRefitInput, type CortexRefitReport } from "./cortex-refit-runner.js";
+import type { CortexBrainStore } from "./cortex-brain-store.js";
+import { CORTEX_LANE_ROSTER } from "./cortex-live-gather.js";
+
+import { getRegimeCompositeStore, RC_PAPER_LANE_ID } from "./regime-composite-edge.js";
+import { getRegimeCompositeShortStore, RCS_PAPER_LANE_ID } from "./regime-composite-short-edge.js";
+import { getShortFadeStore, SF_PAPER_LANE_ID } from "./short-fade-edge.js";
+import { getIntradayMomentumStore, IM_PAPER_LANE_ID } from "./intraday-momentum-edge.js";
+import { getPanicWashoutStore, PWR_PAPER_LANE_ID } from "./panic-washout-reclaim-edge.js";
+import { getCompositeEstimatorStore, ceLaneIdForBucket } from "./composite-estimator-edge.js";
+import { CrossSectionalStore, type CrossSectionalObservation } from "./cross-sectional-edge.js";
+import {
+  CROSS_SECTIONAL_MARKET_NEUTRAL_LANE_ID,
+  CROSS_SECTIONAL_TREND_LANE_ID,
+  CROSS_SECTIONAL_MIXED_LANE_ID,
+} from "./cross-sectional-executor.js";
+import { getCurrentGuardVariantMatrixStore } from "./current-guard-variant-matrix.js";
+
+/** Only pull outcomes resolved within this window — older ones can't attribute (their decisions rotated
+ *  out of the ~26-day journal) and the refit's recency decay makes them ~zero weight anyway. Bounds the
+ *  CG matrix read (which can hold 100k+ obs). */
+export const CORTEX_REFIT_LOOKBACK_MS = 45 * 86_400_000;
+
+/** The three roster CG lanes (variantId == laneId). */
+const CG_ROSTER = new Set(["CG_WIDE_FAST_LONG", "CG_WIDE_LONG_RUNNER", "CG_MFE_GIVEBACK"]);
+const XSEC_STORE_VARIANTS: Record<string, string> = {
+  [CROSS_SECTIONAL_MARKET_NEUTRAL_LANE_ID]: "FILTERED",
+  [CROSS_SECTIONAL_TREND_LANE_ID]: "TREND_BETA_VOL",
+  [CROSS_SECTIONAL_MIXED_LANE_ID]: "MIXED_MEAN_REVERSION",
+};
+
+/** Parse the append-only journal into decision rows. Per-line try/catch (a truncated line is skipped +
+ *  counted, never aborts the read), reads .jsonl.1 (older) before .jsonl (newer), dedupes rows by `at`. */
+export function readCortexDecisionRows(files: string[]): { rows: CortexDecisionRow[]; badLines: number; totalLines: number } {
+  const byAt = new Map<string, CortexDecisionRow>();
+  let badLines = 0;
+  let totalLines = 0;
+  for (const file of files) {
+    if (!existsSync(file)) continue;
+    let text: string;
+    try {
+      text = readFileSync(file, "utf-8");
+    } catch {
+      continue;
+    }
+    for (const line of text.split("\n")) {
+      if (!line.trim()) continue;
+      totalLines += 1;
+      let rec: Record<string, unknown>;
+      try {
+        rec = JSON.parse(line) as Record<string, unknown>;
+      } catch {
+        badLines += 1;
+        continue;
+      }
+      if (rec.kind !== "BRAIN_DECISION" || typeof rec.at !== "string") continue;
+      if (byAt.has(rec.at)) continue; // dedupe: identical decision across rotation
+      const atMs = parseIsoMs(rec.at);
+      if (atMs === null) continue;
+      const lanes = new Map<string, { x: number[]; eligible: boolean; direction: CortexLaneDir | null }>();
+      const rawLanes = Array.isArray(rec.lanes) ? (rec.lanes as Record<string, unknown>[]) : [];
+      for (const l of rawLanes) {
+        const laneId = typeof l.laneId === "string" ? l.laneId : null;
+        const x = Array.isArray(l.x) ? (l.x as unknown[]).map(Number) : null;
+        if (!laneId || !x || x.length === 0 || !x.every((v) => Number.isFinite(v))) continue;
+        const dir = l.direction === "LONG" || l.direction === "SHORT" || l.direction === "NEUTRAL" ? (l.direction as CortexLaneDir) : null;
+        lanes.set(laneId, { x, eligible: l.eligible === true, direction: dir });
+      }
+      byAt.set(rec.at, {
+        atMs,
+        featureSchemaVersion: typeof rec.featureSchemaVersion === "number" ? rec.featureSchemaVersion : 0,
+        regimeFamily: typeof rec.regimeFamily === "string" ? rec.regimeFamily : "UNKNOWN",
+        lanes,
+      });
+    }
+  }
+  return { rows: [...byAt.values()].sort((a, b) => a.atMs - b.atMs), badLines, totalLines };
+}
+
+type Skips = Record<string, Partial<Record<CortexOutcomeSkipReason, number>>>;
+function bump(skips: Skips, laneId: string, reason: CortexOutcomeSkipReason): void {
+  const s = (skips[laneId] ??= {});
+  s[reason] = (s[reason] ?? 0) + 1;
+}
+
+/** Fold a normalize result into the outcome list / skip tally. */
+function absorb(
+  laneId: string,
+  res: ReturnType<typeof directionalObsToOutcome>,
+  out: CortexLaneOutcome[],
+  skips: Skips,
+): void {
+  if (res.ok) out.push(res.outcome);
+  else bump(skips, laneId, res.skip);
+}
+
+/**
+ * Read every roster lane's resolved closes into normalized outcomes. Pure over the injected `.all` arrays
+ * (the caller supplies the real store snapshots), so this is unit-testable with fakes.
+ */
+export function collectCortexOutcomes(sources: {
+  directional: { laneId: string; obs: RawDirectionalObs[] }[];
+  xsec: { laneId: string; obs: RawXsecObs[] }[];
+  sinceMs?: number;
+}): { outcomes: CortexLaneOutcome[]; skipsByLane: Skips } {
+  const outcomes: CortexLaneOutcome[] = [];
+  const skips: Skips = {};
+  const since = sources.sinceMs ?? 0;
+  for (const { laneId, obs } of sources.directional) {
+    for (const o of obs) {
+      const rms = parseIsoMs(o.resolvedAt);
+      if (o.status !== "OPEN" && rms !== null && rms < since) continue; // outside lookback
+      absorb(laneId, directionalObsToOutcome(laneId, o), outcomes, skips);
+    }
+  }
+  for (const { laneId, obs } of sources.xsec) {
+    for (const o of obs) {
+      const rms = parseIsoMs(o.resolvedAt);
+      if (o.status !== "OPEN" && rms !== null && rms < since) continue;
+      absorb(laneId, xsecObsToOutcome(laneId, o), outcomes, skips);
+    }
+  }
+  return { outcomes, skipsByLane: skips };
+}
+
+/**
+ * The top-level impure gather: reads the journal + all lane stores from disk, builds the full CortexRefitInput.
+ * hasOutcomeSource is true for every roster lane here (all 15 have a wired reader below); if a lane ever
+ * loses its source, drop it from the readers and it will report NO_OUTCOME_SOURCE instead of silently vanishing.
+ */
+export function gatherCortexRefitInputs(deps: {
+  dataDir: string;
+  journalFile: string;
+  nowMs: number;
+  nowIso: string;
+  staticWeightPctForLane: (laneId: string) => number;
+}): CortexRefitInput & { journalBadLines: number } {
+  const sinceMs = deps.nowMs - CORTEX_REFIT_LOOKBACK_MS;
+
+  const journal = readCortexDecisionRows([`${deps.journalFile}.1`, deps.journalFile]);
+
+  // Directional edge stores → RawDirectionalObs (netR already in R).
+  const dirObs = (all: { observationId: string; openedAtMs: number; resolvedAt: string | null; status: string; netR: number | null }[]): RawDirectionalObs[] =>
+    all.map((o) => ({ observationId: o.observationId, openedAtMs: o.openedAtMs, resolvedAt: o.resolvedAt, status: o.status, netR: o.netR }));
+
+  const directional: { laneId: string; obs: RawDirectionalObs[] }[] = [
+    { laneId: RC_PAPER_LANE_ID, obs: dirObs(getRegimeCompositeStore(deps.dataDir).all) },
+    { laneId: RCS_PAPER_LANE_ID, obs: dirObs(getRegimeCompositeShortStore(deps.dataDir).all) },
+    { laneId: SF_PAPER_LANE_ID, obs: dirObs(getShortFadeStore(deps.dataDir).all) },
+    { laneId: IM_PAPER_LANE_ID, obs: dirObs(getIntradayMomentumStore(deps.dataDir).all) },
+    { laneId: PWR_PAPER_LANE_ID, obs: dirObs(getPanicWashoutStore(deps.dataDir).all) },
+  ];
+
+  // Composite estimator — one store, four buckets → four laneIds.
+  const ceAll = getCompositeEstimatorStore(deps.dataDir).all;
+  for (const bucket of ["WIDE_LONG", "WIDE_SHORT", "FAST_LONG", "FAST_SHORT"] as const) {
+    directional.push({
+      laneId: ceLaneIdForBucket(bucket),
+      obs: ceAll.filter((o) => o.bucket === bucket).map((o) => ({ observationId: o.observationId, openedAtMs: o.openedAtMs, resolvedAt: o.resolvedAt, status: o.status, netR: o.netR })),
+    });
+  }
+
+  // CG variant matrix — one store, filter to the 3 roster CG lanes (variantId == laneId). openedAt is ISO.
+  const cgAll = getCurrentGuardVariantMatrixStore(deps.dataDir).all;
+  const cgByLane = new Map<string, RawDirectionalObs[]>();
+  for (const lane of CG_ROSTER) cgByLane.set(lane, []);
+  for (const o of cgAll) {
+    if (!CG_ROSTER.has(o.variantId)) continue;
+    // A corrupt openedAt becomes NaN (NOT a silent skip) so directionalObsToOutcome tallies it as
+    // BAD_TIMESTAMP — the module's "every record is tallied by reason" guarantee holds.
+    const openedAtMs = parseIsoMs(o.openedAt) ?? Number.NaN;
+    cgByLane.get(o.variantId)!.push({ observationId: o.observationId, openedAtMs, resolvedAt: o.resolvedAt, status: o.status, netR: o.netR });
+  }
+  for (const [laneId, obs] of cgByLane) directional.push({ laneId, obs });
+
+  // Cross-sectional store — one store, three variants → three laneIds. netReturn is a fraction.
+  const xsecAll = new CrossSectionalStore(`${deps.dataDir}/cross-sectional-edge.json`).all;
+  const xsec: { laneId: string; obs: RawXsecObs[] }[] = Object.entries(XSEC_STORE_VARIANTS).map(([laneId, variant]) => ({
+    laneId,
+    obs: xsecAll
+      .filter((o: CrossSectionalObservation) => (o.variant ?? "RAW") === variant)
+      .map((o: CrossSectionalObservation) => ({
+        observationId: o.observationId,
+        openedAtMs: o.openedAtMs,
+        resolvedAt: o.resolvedAt,
+        status: o.status,
+        netReturn: o.netReturn,
+        riskDistanceAtOpen: o.riskDistanceAtOpen ?? null,
+        stopLossReturn: o.stopLossReturn ?? null,
+      })),
+  }));
+
+  const { outcomes, skipsByLane } = collectCortexOutcomes({ directional, xsec, sinceMs });
+
+  const roster = buildCortexAttrRoster(deps.staticWeightPctForLane, () => true);
+
+  return {
+    decisions: journal.rows,
+    outcomes,
+    roster,
+    nowMs: deps.nowMs,
+    nowIso: deps.nowIso,
+    currentSchemaVersion: CORTEX_FEATURE_SCHEMA_VERSION,
+    ttlMsForLane: cortexLaneTtlMs,
+    skipsByLane,
+    // Prune the counted-observation ledger STRICTLY OLDER than the bindings' lookback (5-day buffer) so an
+    // outcome the bindings still return (resolvedAtMs ≥ sinceMs) can never be pruned and then re-counted.
+    pruneBeforeMs: sinceMs - 5 * 86_400_000,
+    journalBadLines: journal.badLines,
+  };
+}
+
+/** The last nightly-refit report, exposed for #219's dashboard / an ops route (no recompute). */
+let latestRefitReport: (CortexRefitReport & { journalBadLines: number }) | null = null;
+export function getLatestCortexRefitReport(): (CortexRefitReport & { journalBadLines: number }) | null {
+  return latestRefitReport;
+}
+
+/**
+ * One nightly refit pass, wired to the real stores + journal. Report-only + idempotent: applies ACCEPTED
+ * archetype refits + advances cumulativeResolved/resolvedByFamily via the watermark, and NEVER touches
+ * CORTEX_LIVE_BETA. Never throws through (a refit failure must not break the tick that schedules it).
+ */
+export function runCortexNightlyRefit(deps: {
+  store: CortexBrainStore;
+  dataDir: string;
+  journalFile: string;
+  staticWeightPctForLane: (laneId: string) => number;
+  nowMs: number;
+  nowIso: string;
+  apply?: boolean;
+}): CortexRefitReport & { journalBadLines: number } {
+  const input = gatherCortexRefitInputs({
+    dataDir: deps.dataDir,
+    journalFile: deps.journalFile,
+    nowMs: deps.nowMs,
+    nowIso: deps.nowIso,
+    staticWeightPctForLane: deps.staticWeightPctForLane,
+  });
+  const report = runCortexRefit(deps.store, { ...input, apply: deps.apply });
+  const withMeta = { ...report, journalBadLines: input.journalBadLines };
+  latestRefitReport = withMeta;
+  return withMeta;
+}
+
+export { CORTEX_LANE_ROSTER };

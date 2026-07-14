@@ -14,10 +14,11 @@ import { REGIME_AUTOPILOT_PRESETS, type RegimeAutopilot } from "../lib/regime-au
 import { getShortFadeStore, buildShortFadeReport, SF_PAPER_LANE_ID } from "../lib/short-fade-edge.js";
 import { getIntradayMomentumStore, buildIntradayMomentumReport, IM_PAPER_LANE_ID } from "../lib/intraday-momentum-edge.js";
 import { getRegimeCompositeStore, buildRegimeCompositeReport, RC_PAPER_LANE_ID } from "../lib/regime-composite-edge.js";
+import { getRegimeCompositeShortStore, buildRegimeCompositeShortReport, RCS_PAPER_LANE_ID } from "../lib/regime-composite-short-edge.js";
 import { getPanicWashoutStore, buildPanicWashoutReport, PWR_PAPER_LANE_ID } from "../lib/panic-washout-reclaim-edge.js";
 import { getCompositeEstimatorStore, buildCompositeEstimatorReport, ceLaneIdForBucket, type CEBucket } from "../lib/composite-estimator-edge.js";
 import { buildLiveWalletReconciliationReport } from "../lib/wallet-reconciliation.js";
-import { sumExternalRealizedPnlUsd } from "../lib/live-executor-wiring.js";
+import { sumExternalClosedFeesUsd, sumExternalRealizedPnlUsd } from "../lib/live-executor-wiring.js";
 import type { UnifiedTestnetOrchestrator } from "../lib/unified-testnet-orchestrator.js";
 import type { UnifiedTestnetProposalStore } from "../lib/unified-testnet-proposal-source.js";
 
@@ -311,6 +312,8 @@ export function buildMeasuredLaneStats(): Map<string, MeasuredLaneStats> {
   byLane.set(IM_PAPER_LANE_ID, { resolvedCount: im.resolvedCount, openCount: im.openCount, netAvgR: im.netAvgR, wr: im.wr, pf: im.pf, edgeReady: im.edgeReady });
   const rc = buildRegimeCompositeReport(getRegimeCompositeStore().all);
   byLane.set(RC_PAPER_LANE_ID, { resolvedCount: rc.resolvedCount, openCount: rc.openCount, netAvgR: rc.netAvgR, wr: rc.wr, pf: rc.pf, edgeReady: rc.edgeReady });
+  const rcs = buildRegimeCompositeShortReport(getRegimeCompositeShortStore().all);
+  byLane.set(RCS_PAPER_LANE_ID, { resolvedCount: rcs.resolvedCount, openCount: rcs.openCount, netAvgR: rcs.netAvgR, wr: rcs.wr, pf: rcs.pf, edgeReady: rcs.edgeReady });
   const pwr = buildPanicWashoutReport(getPanicWashoutStore().all);
   byLane.set(PWR_PAPER_LANE_ID, { resolvedCount: pwr.resolvedCount, openCount: pwr.openCount, netAvgR: pwr.netAvgR, wr: pwr.wr, pf: pwr.pf, edgeReady: pwr.edgeReady });
   const ce = buildCompositeEstimatorReport(getCompositeEstimatorStore().all);
@@ -1152,7 +1155,10 @@ export async function registerLiveRoutes(
     const query = (request.query ?? {}) as { day?: string };
     try {
       const external = sumExternalRealizedPnlUsd(allCrossSectionalExecutors(), allSingleSymbolExecutors());
-      const report = await buildLiveWalletReconciliationReport(engine, query.day, undefined, external.today);
+      const dayUtc = query.day ?? new Date().toISOString().slice(0, 10);
+      const closedFees = engine.getClosedTodayFeesUsd() +
+        sumExternalClosedFeesUsd(allCrossSectionalExecutors(), allSingleSymbolExecutors(), dayUtc);
+      const report = await buildLiveWalletReconciliationReport(engine, query.day, undefined, external.today, closedFees);
       return { ok: true, report };
     } catch (err) {
       reply.code(502);

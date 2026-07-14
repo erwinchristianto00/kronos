@@ -80,6 +80,11 @@ import {
   RC_PAPER_LANE_ID,
 } from "./lib/regime-composite-edge.js";
 import {
+  getRegimeCompositeShortStore,
+  regimeCompositeShortOpenSignals,
+  RCS_PAPER_LANE_ID,
+} from "./lib/regime-composite-short-edge.js";
+import {
   getCompositeEstimatorStore,
   isCompositeEstimatorExecEnabled,
   compositeEstimatorExitPolicy,
@@ -95,6 +100,7 @@ import {
 import { computeExternalManagedNetQty, computeNotionalPerSymbol, maxNotionalPerSymbolAcrossLanes, isNewExecutorLaneAllowed, rollingNetEntryHealth, sumExternalRealizedPnlUsd } from "./lib/live-executor-wiring.js";
 import { RegimeAutopilot, isRegimeAutopilotEnabled } from "./lib/regime-autopilot.js";
 import { getRegimeEngineStore } from "./lib/regime-engine-service.js";
+import { buildRegimeAxisTimeline } from "./lib/regime-axis-timeline.js";
 import {
   LiveExecutionEngine,
   LiveExecutionStore,
@@ -120,6 +126,19 @@ import { getLatestScanCandidates } from "./lib/latest-scan-candidates-cache.js";
 import { buildRegimeDirectionControllerReport } from "./lib/regime-direction-controller.js";
 import { getRegimeDirectionControllerSnapshotStore } from "./lib/regime-direction-controller-snapshot.js";
 import { getRegimeEdgeMemory } from "./lib/regime-edge-memory.js";
+import { cortexBrainMode } from "./lib/cortex-brain.js";
+import { CortexBrainStore, CortexDecisionJournal, runCortexShadowTick } from "./lib/cortex-brain-store.js";
+import { runFourBrainShadowCycle } from "./lib/four-brain-live-wiring.js";
+import { classifyIncumbentLanes } from "./lib/four-brain-lane-support.js";
+import { buildLaneContextSnapshotInputs } from "./lib/lane-context-snapshot-source.js";
+import { journalLaneSnapshots, laneJournalActive } from "./lib/lane-context-journal-runtime.js";
+import { FourBrainMetricsAggregator } from "./lib/four-brain-metrics.js";
+import { resolveFourBrainInstanceId, fourBrainInstanceAllowed, type FourBrainBindingDeps } from "./lib/four-brain-live-gather-bindings.js";
+import { fourBrainMode } from "./lib/four-brain-types.js";
+import { CORTEX_LANE_ROSTER } from "./lib/cortex-live-gather.js";
+import { gatherCortexContext } from "./lib/cortex-live-gather.js";
+import { buildLiveCortexGatherDeps } from "./lib/cortex-live-gather-bindings.js";
+import { runCortexNightlyRefit } from "./lib/cortex-refit-runner-bindings.js";
 import {
   estimateLaneSelectorV2Regime,
   isLaneSelectorV2LongWideStopOverride,
@@ -211,6 +230,11 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
   // Declared here (assigned below) so the shadow routes can READ the live engine's in-memory
   // status (sync getStatus, no I/O) for the order-reconciliation readiness gate, via a lazy getter.
   let liveEngine: LiveExecutionEngine | null = null;
+  // Read-only capture of the engine's execution store so the report-only four-brain shadow tick can
+  // enumerate FULL open intents (getStatus().openIntents is a reduced shape). Assigned during engine
+  // construction below; stays null on instances that build no engine (e.g. 3101 research). READ-ONLY —
+  // the four-brain path never mutates it.
+  let liveExecutionStore: LiveExecutionStore | null = null;
   let crossSectionalExecutor: CrossSectionalExecutor | null = null;
   // 2026-07-08: two more instances mirroring TREND_BETA_VOL / MIXED_MEAN_REVERSION, alongside the
   // FILTERED foundation instance above (see cross-sectional-executor.ts's targetVariant/laneId).
@@ -374,7 +398,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     liveEngine = new LiveExecutionEngine({
       config: liveConfig,
       client: liveClient,
-      store: new LiveExecutionStore(),
+      store: (liveExecutionStore = new LiveExecutionStore()),
       // Crowding-exit SHADOW measurement only (getStatus().crowdingExitShadow) — read-only market
       // data, never touches order placement. Reuses the same market-data client scan.ts uses.
       marketDataClient: binanceClient,
@@ -555,11 +579,18 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         // stays consistent with the mode-2 mirror's admission gate (scan.ts) — both read the same
         // process-wide edge-memory singleton, so a direction proven non-positive collapses to
         // NO_TRADE_NEGATIVE_EDGE everywhere the engine looks, not just at entry.
+        // Graduated-confidence inputs (2026-07-12): the current regime-axis breadth composite + its
+        // velocity, so a directional trend's confidence reflects the real evidence strength instead of
+        // a hardcoded MEDIUM. Live-safe (confidence is floored ≥ MEDIUM for trends in Phase 1 — the
+        // upgrade to HIGH is invisible to live admission, which only distinguishes MEDIUM||HIGH).
+        const controllerAxis = buildRegimeAxisTimeline(getRegimeEngineStore().snapshots);
         const controller = buildRegimeDirectionControllerReport({
           currentRegime: regime,
           adaptiveDirectionBias: null,
           primaryValidationLane: null,
           edgeGate: getRegimeEdgeMemory(),
+          axisScore: controllerAxis.current?.score ?? null,
+          axisSlopePerHour: controllerAxis.slopePerHour ?? null,
         });
         const estimatedRegime = estimateLaneSelectorV2Regime({
           regime: controller.currentRegime,
@@ -571,6 +602,8 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           mode: controller.controllerMode,
           bias: controller.directionalBias,
           confidence: controller.confidence,
+          convictionScore: controller.convictionScore,
+          gradedConfidence: controller.gradedConfidence,
           estimatedRegime,
           reasons: controller.reasonCodes,
           capturedAt: cached?.scanFinishedAt ?? scanStatus.lastAutoRefreshFinishedAt ?? fallbackSnapshot?.capturedAt ?? null,
@@ -590,6 +623,8 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       const freshWindowMs = Math.max(15 * 60_000, Number(process.env.UNIFIED_FEATURE_SIGNAL_MAX_AGE_MS) || 2 * 60 * 60_000);
       const rcSignals = regimeCompositeOpenSignals(getRegimeCompositeStore())
         .filter((signal) => nowMs - signal.openedAtMs <= freshWindowMs);
+      const rcsSignals = regimeCompositeShortOpenSignals(getRegimeCompositeShortStore())
+        .filter((signal) => nowMs - signal.openedAtMs <= freshWindowMs);
       const ceLongSignals = ["WIDE_LONG", "FAST_LONG"]
         .flatMap((bucket) => compositeEstimatorOpenSignals(getCompositeEstimatorStore(), bucket as CEBucket))
         .filter((signal) => nowMs - signal.openedAtMs <= freshWindowMs);
@@ -597,12 +632,33 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         .flatMap((bucket) => compositeEstimatorOpenSignals(getCompositeEstimatorStore(), bucket as CEBucket))
         .filter((signal) => nowMs - signal.openedAtMs <= freshWindowMs);
       const votes: UnifiedFeatureVote[] = [];
-      if (rcSignals.length > 0) {
+      // REGIME_COMPOSITE_CONFIRMATION is a LONG-ONLY measurement lane (regime-composite-edge.ts:
+      // RC_PAPER_LANE_ID = "REGIME_COMPOSITE_CONFIRMATION_LONG"; regimeCompositeOpenSignals can only
+      // ever emit LONG). Pushing a hardcoded direction:"LONG" vote unconditionally made it
+      // structurally asymmetric — it could confirm a LONG cheaply but, whenever the primary was
+      // SHORT, it landed as OPPOSING support that one-sidedly penalized the short while being
+      // physically incapable of ever confirming one (there is no bearish-breadth counterpart). Gate
+      // it to a LONG primary so it acts as honest long-confirmation only and never blocks shorts.
+      // (The symmetric long-term fix is a real bearish-breadth signal; CE_BIDI already votes both sides.)
+      if (rcSignals.length > 0 && primaryDirection === "LONG") {
         votes.push({
           source: "REGIME_COMPOSITE_CONFIRMATION",
           direction: "LONG",
           confidence: Math.min(1, rcSignals.length / 3),
           reason: `${rcSignals.length} fresh axis+crowding confirmation signal(s)`,
+        });
+      }
+      // 2026-07-12: the bearish-breadth counterpart (regime-composite-short-edge.ts). RC could only
+      // ever confirm LONG; this SHORT confirmation lane gives the brain a symmetric bearish read
+      // (axis <= -threshold + same crowding-stability filter), so a SHORT primary is now confirmable
+      // by real breadth evidence instead of riding on the single CE_BIDI voter. Gated to a SHORT
+      // primary — mirror of the RC LONG gate above.
+      if (rcsSignals.length > 0 && primaryDirection === "SHORT") {
+        votes.push({
+          source: "REGIME_COMPOSITE_SHORT_CONFIRMATION",
+          direction: "SHORT",
+          confidence: Math.min(1, rcsSignals.length / 3),
+          reason: `${rcsSignals.length} fresh bearish axis+crowding confirmation signal(s)`,
         });
       }
       if (ceLongSignals.length > 0 || ceShortSignals.length > 0) {
@@ -618,6 +674,30 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           confidence: total > 0 ? Math.abs(ceLongSignals.length - ceShortSignals.length) / total : 0,
           reason: `${ceLongSignals.length} long vs ${ceShortSignals.length} short fresh bucket signal(s)`,
         });
+      }
+      // 2026-07-12: wire the measured regime×direction edge-memory as a REAL veto. The orchestrator's
+      // veto branch (candidateFrom, unified-testnet-orchestrator.ts:189-193) was dead — no vote source
+      // ever set veto:true, so the "strongest override path" never fired. If the primary direction is
+      // PROVEN net-negative in the current regime (VETO_NEGATIVE: n≥30, avgNetR≤0) and no proven-positive
+      // lane rescues it, veto → the brain drops to NEUTRAL instead of arming a direction it has already
+      // measured to lose here. Fails OPEN on insufficient samples (ALLOW_INSUFFICIENT) or a blank regime,
+      // so it can only ever block a demonstrated loser, never become a new blanket gate. Uses the same
+      // regime string the brain's primaryDirection is derived from (controller.regime), so they agree.
+      if (primaryDirection === "LONG" || primaryDirection === "SHORT") {
+        const regimeForEdge = controller?.regime ?? null;
+        if (regimeForEdge && regimeForEdge.trim().length > 0) {
+          const edgeMem = getRegimeEdgeMemory();
+          const edgeV = edgeMem.verdict(regimeForEdge, primaryDirection);
+          if (!edgeV.allowed && !edgeMem.hasPositiveLane(regimeForEdge, primaryDirection)) {
+            votes.push({
+              source: "REGIME_EDGE_MEMORY",
+              direction: primaryDirection,
+              confidence: 1,
+              veto: true,
+              reason: `${primaryDirection} proven net-negative in "${regimeForEdge}" (${edgeV.reasonCode})`,
+            });
+          }
+        }
       }
       const xsecReport = buildCrossSectionalReport(getCrossSectionalStore(), nowMs, { variant: "FILTERED" });
       const xsecHealth = rollingNetEntryHealth(xsecReport.recentNetReturns);
@@ -639,6 +719,96 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     };
     tickUnifiedOrchestrator();
     if (!isTest && unifiedEnabled) setInterval(tickUnifiedOrchestrator, 30_000);
+
+    // ── CORTEX central-brain SHADOW tick (2026-07-12) ────────────────────────────────────────────
+    // Gated hard on CENTRAL_BRAIN_MODE==='shadow' (default OFF ⇒ this is a pure no-op and NOTHING in the
+    // live path changes). In shadow it gathers the current federated context per lane, runs decideCortex,
+    // and APPENDS a BRAIN_DECISION to the journal — it DRIVES NOTHING (never calls setAllocations). The
+    // brain's only authority remains a weight vector that would flow through the engine's guards; here it
+    // is purely observed + scored vs the incumbent. resolvedThisCycle=0 keeps β=0 (== post-federated-veto
+    // incumbent) until the outcome-attribution + nightly-refit increment (#218) advances the ramp.
+    const cortexStore = new CortexBrainStore("data/cortex-brain.json");
+    const cortexJournal = new CortexDecisionJournal("data/cortex-decision-journal.jsonl");
+    const cortexShadowTick = () => {
+      try {
+        if (cortexBrainMode(process.env) !== "shadow" || !liveEngine) return;
+        const engine = liveEngine;
+        const cached = getLatestScanCandidates();
+        const scanStatus = coreScanAutoRefreshController.getStatus();
+        const fallbackSnapshot =
+          cached || scanStatus.lastAutoRefreshResultSummary ? null : getRegimeDirectionControllerSnapshotStore().readLatest();
+        const regime =
+          cached?.marketRegime ?? scanStatus.lastAutoRefreshResultSummary?.marketRegime ?? fallbackSnapshot?.currentRegime ?? null;
+        const axis = buildRegimeAxisTimeline(getRegimeEngineStore().snapshots);
+        const report = buildRegimeDirectionControllerReport({
+          currentRegime: regime,
+          adaptiveDirectionBias: null,
+          primaryValidationLane: null,
+          edgeGate: getRegimeEdgeMemory(),
+          axisScore: axis.current?.score ?? null,
+          axisSlopePerHour: axis.slopePerHour ?? null,
+        });
+        const status = engine.getStatus();
+        const deps = buildLiveCortexGatherDeps({
+          staticWeightPctForLane: (laneId) => engine.laneSelectionWeightPctForLane(laneId),
+          edgeMemory: getRegimeEdgeMemory(),
+          controller: {
+            directionalBias: report.directionalBias,
+            convictionScore: report.convictionScore,
+            allowsLong: report.allowsLong,
+            allowsShort: report.allowsShort,
+            controllerMode: report.controllerMode,
+            edgeGated: report.edgeGated,
+          },
+          regimeRaw: regime,
+          axisScore: axis.current?.score ?? null,
+          axisSlopePerHour: axis.slopePerHour ?? null,
+          killLatched: status.killedAt != null,
+          killBudgetUsd: status.limits?.maxDrawdownUsd ?? null,
+        });
+        const context = gatherCortexContext(deps);
+        runCortexShadowTick({ store: cortexStore, journal: cortexJournal, context, nowIso: new Date().toISOString(), mode: "shadow", resolvedThisCycle: 0 });
+      } catch (err) {
+        console.error("[cortex-shadow] tick failed", err);
+      }
+    };
+    if (!isTest) {
+      cortexShadowTick();
+      setInterval(cortexShadowTick, 5 * 60_000);
+    }
+
+    // ── CORTEX #218 nightly refit (outcome-attribution + per-archetype logistic refit) ───────────────
+    // Gated on shadow mode (opt-out CORTEX_REFIT_ENABLED=0). Report-only + idempotent: attributes each
+    // lane's OWN resolved closes to their owning decisions, refits the archetype coefficients (ACCEPTED
+    // only), and advances cumulativeResolved/resolvedByFamily via the monotonic watermark. It NEVER touches
+    // CORTEX_LIVE_BETA (0) — learning ≠ going live; the operational allocation stays the β=0 incumbent.
+    // Runs at boot + every 6h (a same-run re-read adds 0, so cadence is harmless); the report feeds #219.
+    const cortexRefitTick = () => {
+      try {
+        if (cortexBrainMode(process.env) !== "shadow" || !liveEngine || process.env.CORTEX_REFIT_ENABLED === "0") return;
+        const engine = liveEngine;
+        const now = new Date();
+        const report = runCortexNightlyRefit({
+          store: cortexStore,
+          dataDir: "data",
+          journalFile: "data/cortex-decision-journal.jsonl",
+          staticWeightPctForLane: (laneId) => engine.laneSelectionWeightPctForLane(laneId),
+          nowMs: now.getTime(),
+          nowIso: now.toISOString(),
+        });
+        console.log(
+          `[cortex-refit] examples=${report.examplesTotal} (+${report.examplesNew} new) resolved=${report.coverage.cumulativeResolved} ` +
+            `families=${report.coverage.regimeFamiliesWithOutcomes} blindCapital=${report.coverage.blindCapitalPct.toFixed(0)}% ` +
+            `refits=[${report.archetypes.map((a) => `${a.archetype}:${a.status}`).join(", ")}]`,
+        );
+      } catch (err) {
+        console.error("[cortex-refit] pass failed", err);
+      }
+    };
+    if (!isTest) {
+      cortexRefitTick();
+      setInterval(cortexRefitTick, 6 * 60 * 60_000);
+    }
 
     const legacyEntryAllowed = (
       laneId: string,
@@ -1065,6 +1235,213 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       }
     }
   }
+  // ── Four-Brain intelligence layer — SHADOW tick (2026-07-13, testnet wiring) ─────────────────────
+  // Report-only decision architecture (Market State / Direction / Entry / Exit + Executive) layered
+  // ABOVE the incumbent + CORTEX. Placed OUTSIDE `if (liveConfig.enabled)` so it runs on 3101 (research,
+  // no live engine) too. Runs ONLY when FOUR_BRAIN_MODE==="shadow" AND the instance is allowlisted
+  // (3101 + 3102; the live 3103 is HARD-BLOCKED inside fourBrainInstanceAllowed regardless of env).
+  // Default (mode off) ⇒ a pure no-op: zero I/O, zero gather, zero journal. It DRIVES NOTHING — never
+  // sets allocations, places/cancels orders, mutates stops/positions/sizing, changes CORTEX_LIVE_BETA
+  // (0), or lane eligibility. Every engine-dependent read degrades gracefully when liveEngine is null
+  // (3101), so the tick still observes market state + direction + entry candidates from the lane stores.
+  // Journal is instance-isolated (data/four-brain-decision-journal.jsonl per repo) + rotation-bounded
+  // (CortexDecisionJournal 8MB→.1). Known-MISSING inputs (market-wide ATR%ile/sentiment/crowd/kronos,
+  // sync mark price) are emitted MISSING — never fabricated — exactly as the source mapping documented.
+  if (!isTest) {
+    const fourBrainJournal = new CortexDecisionJournal("data/four-brain-decision-journal.jsonl");
+    const fourBrainMetrics = new FourBrainMetricsAggregator();
+    const CE_ALL_BUCKETS: CEBucket[] = ["WIDE_LONG", "FAST_LONG", "WIDE_SHORT", "FAST_SHORT"];
+    // Retained handle for the report-only lane-context snapshot ticker (registered once, below) — see Stage-2 timer
+    // ownership: single registration at boot, cleared on shutdown so a flush attempt never blocks termination.
+    let laneContextSnapshotTimer: ReturnType<typeof setInterval> | null = null;
+
+    const collectFourBrainOpenSignals = (): FourBrainBindingDeps["openSignals"] => {
+      const out: FourBrainBindingDeps["openSignals"] = [];
+      const add = (
+        laneId: string,
+        direction: "LONG" | "SHORT",
+        sigs: { observationId: string; symbol: string; entryPrice: number; stopPrice: number; openedAtMs: number }[],
+      ): void => {
+        for (const s of sigs) out.push({ laneId, symbol: s.symbol, direction, observationId: s.observationId, openedAtMs: s.openedAtMs, entryPrice: s.entryPrice, stopPrice: s.stopPrice });
+      };
+      try { add(SF_PAPER_LANE_ID, "SHORT", shortFadeOpenSignals(getShortFadeStore())); } catch { /* lane store unavailable ⇒ skip (no fabrication) */ }
+      try { add(IM_PAPER_LANE_ID, "LONG", intradayMomentumOpenSignals(getIntradayMomentumStore())); } catch { /* */ }
+      try { add(RC_PAPER_LANE_ID, "LONG", regimeCompositeOpenSignals(getRegimeCompositeStore())); } catch { /* */ }
+      try { add(RCS_PAPER_LANE_ID, "SHORT", regimeCompositeShortOpenSignals(getRegimeCompositeShortStore())); } catch { /* */ }
+      try { add(PWR_PAPER_LANE_ID, "LONG", panicWashoutOpenSignals(getPanicWashoutStore())); } catch { /* */ }
+      for (const bucket of CE_ALL_BUCKETS) {
+        try { add(ceLaneIdForBucket(bucket), bucket.includes("SHORT") ? "SHORT" : "LONG", compositeEstimatorOpenSignals(getCompositeEstimatorStore(), bucket)); } catch { /* */ }
+      }
+      return out;
+    };
+
+    const activeFourBrainAllocation = (): { laneId: string; weightPct: number }[] => {
+      const allocs = liveEngine?.getStatus().laneSelection?.laneAllocations;
+      if (allocs && allocs.length > 0) return allocs.map((a) => ({ laneId: a.laneId, weightPct: a.weightPct }));
+      // allocations OFF or no engine ⇒ treat every roster lane as active at 100 (degenerate all-lanes case)
+      return CORTEX_LANE_ROSTER.map((e) => ({ laneId: e.laneId, weightPct: 100 }));
+    };
+
+    const buildFourBrainDeps = (nowMs: number): Omit<FourBrainBindingDeps, "entryMicrostructure"> => {
+      const engine = liveEngine; // null on 3101 ⇒ engine-dependent fields degrade
+      const status = engine ? engine.getStatus() : null;
+      const snaps = getRegimeEngineStore().snapshots;
+      const latestSnap = snaps.length ? snaps[snaps.length - 1]! : null;
+      const axis = buildRegimeAxisTimeline(snaps);
+      const regime = getLatestScanCandidates()?.marketRegime ?? latestSnap?.regime ?? null;
+      const edgeMem = getRegimeEdgeMemory();
+      const controller = buildRegimeDirectionControllerReport({
+        currentRegime: regime,
+        adaptiveDirectionBias: null,
+        primaryValidationLane: null,
+        edgeGate: edgeMem,
+        axisScore: axis.current?.score ?? null,
+        axisSlopePerHour: axis.slopePerHour ?? null,
+      });
+      const intents = liveExecutionStore ? liveExecutionStore.getState().intents : [];
+      const openStates = new Set(["MIRRORED", "ENTRY_PLACED", "OPEN", "TP1_FILLED_BE_SET"]);
+      const openPositions = intents
+        .filter((i) => openStates.has(i.state))
+        .map((i) => ({
+          paperOrderId: i.paperOrderId,
+          laneId: i.sourcePaperOrders?.[0]?.laneId ?? "UNKNOWN",
+          symbol: i.symbol,
+          direction: i.direction,
+          entryPrice: i.filledEntryPrice ?? i.plannedEntryPrice,
+          stopPrice: i.stopLossPrice,
+          mfeR: i.maxFavorableR ?? null,
+          maeR: i.maxAdverseR ?? null,
+          createdAtMs: Date.parse(i.createdAt),
+        }));
+      const crowdingShadow = status?.crowdingExitShadow ?? {};
+      return {
+        instanceId: resolveFourBrainInstanceId(process.env),
+        nowMs,
+        axisScore: axis.current?.score ?? null,
+        axisAtMs: axis.current?.at ? Date.parse(axis.current.at) : null,
+        axisSlopePerHour: axis.slopePerHour ?? null,
+        // No valid market-wide 0..100 ATR-percentile producer (the cached BTC value is an ATR/price
+        // fraction, wrong scale) ⇒ MISSING, never fabricated.
+        btcAtrPercentile: null,
+        atrAtMs: null,
+        advancersPct: latestSnap?.breadth.advancersPct ?? null,
+        breadthAtMs: latestSnap?.at ? Date.parse(latestSnap.at) : null,
+        // No market-wide sentiment / crowd-align / kronos-agree −1..1 producer ⇒ MISSING (CORTEX
+        // neutral-fills the same inputs). Per-symbol async producers exist but are not sync-safe here.
+        sentiment: null,
+        sentimentAtMs: null,
+        safetyEvents: [],
+        regimeRaw: regime,
+        edgeMemory: edgeMem,
+        controllerBias: controller.directionalBias,
+        convictionScore: Number.isFinite(controller.convictionScore) ? controller.convictionScore : null,
+        allowsLong: controller.allowsLong,
+        allowsShort: controller.allowsShort,
+        bestLaneReportForDirection: () => null,
+        crowdAlignLong: null,
+        crowdAtMs: null,
+        kronosAgree: null,
+        kronosAtMs: null,
+        openSignals: collectFourBrainOpenSignals(),
+        maxSignalAgeMs: 50 * 60_000,
+        crowdingStateForSymbol: (symbol) => crowdingShadow[symbol]?.crowdingState ?? null,
+        openPositions,
+        // No sync {price,atMs} mark source ⇒ MISSING (atMs null ⇒ the gather never treats it as fresh).
+        // Testnet holds 0 open positions today, so live exit coverage is zero; the replay harness supplies
+        // the exit-decision example. Honest — not a stub that pretends the mark is fresh.
+        markPriceForSymbol: () => ({ price: null, atMs: null }),
+        // CORTEX exposes no decision id; at β=0 its finalPct equals the incumbent static weight, which is
+        // the correct allocation CONTEXT for the report-only executive linkage.
+        cortexDecisionId: `four-brain:${nowMs}`,
+        cortexFinalPctForLane: (laneId) => (engine ? engine.laneSelectionWeightPctForLane(laneId) : null),
+        laneEligibleIncumbent: (laneId) => (engine ? engine.laneSelectionWeightPctForLane(laneId) > 0 : true),
+        killLatched: status?.killedAt != null,
+        killReason: status?.killReason ?? null,
+      };
+    };
+
+    // ── Stage-2 lane-context SNAPSHOT tap (report-only, default-OFF, fail-open) ──
+    // Captures the Direction-Brain decision context (regime, per-lane edge-memory, controller conviction/mode, axis,
+    // eligibility, static+cortex weights, per-lane veto) for EVERY active incumbent lane exactly once, at the
+    // four-brain decision cadence. Values are frozen as-captured (the journal deep-copies), so a later edge-memory
+    // mutation cannot alter a recorded snapshot. Fully independent of the four-brain executive: its own try/catch on
+    // its own ticker ⇒ a snapshot failure cannot suppress the four-brain tick or the resolution scan, and vice versa.
+    // Internally re-gated (journalLaneSnapshots) ⇒ ZERO I/O unless LANE_CONTEXT_JOURNAL_MODE=shadow on 3101/3102.
+    const captureLaneContextSnapshots = (nowMs: number): void => {
+      try {
+        const snaps = getRegimeEngineStore().snapshots;
+        const latestSnap = snaps.length ? snaps[snaps.length - 1]! : null;
+        const regime = getLatestScanCandidates()?.marketRegime ?? latestSnap?.regime ?? null;
+        const edgeMem = getRegimeEdgeMemory();
+        const axis = buildRegimeAxisTimeline(snaps);
+        const controller = buildRegimeDirectionControllerReport({
+          currentRegime: regime,
+          adaptiveDirectionBias: null,
+          primaryValidationLane: null,
+          edgeGate: edgeMem,
+          axisScore: axis.current?.score ?? null,
+          axisSlopePerHour: axis.slopePerHour ?? null,
+        });
+        const coverage = classifyIncumbentLanes(activeFourBrainAllocation());
+        const inputs = buildLaneContextSnapshotInputs({
+          regimeRaw: regime,
+          axisScore: axis.current?.score ?? null,
+          controllerMode: controller.directionalBias,
+          conviction: Number.isFinite(controller.convictionScore) ? controller.convictionScore : null,
+          lanes: coverage.lanes,
+          laneEdgeStat: (dir, lane) => { const s = edgeMem.laneLookup(regime, dir, lane); return { n: s.n, avgNetR: s.avgNetR }; },
+          laneVeto: (dir, lane) => { const v = edgeMem.laneVerdict(regime, dir, lane); return { vetoed: v.decision === "VETO_NEGATIVE", reason: v.reasonCode }; },
+          cortexFinalPctForLane: (lane) => (liveEngine ? liveEngine.laneSelectionWeightPctForLane(lane) : null),
+          laneEligibleIncumbent: (lane) => (liveEngine ? liveEngine.laneSelectionWeightPctForLane(lane) > 0 : true),
+        });
+        journalLaneSnapshots(nowMs, inputs);
+      } catch { /* report-only: a snapshot failure must never disturb any live cycle */ }
+    };
+    // Armed by the lane-context journal's OWN activation (independent of four-brain mode) so the resolution chain
+    // (snapshot → outcome) stays coherent under a single LANE_CONTEXT_JOURNAL_MODE flag. Registered once at boot
+    // (the null-guard blocks a duplicate interval on any bootstrap retry); cleared on shutdown so nothing blocks
+    // termination. `journalLaneSnapshots` re-checks activation ⇒ even if armed, it is a no-op when mode is off.
+    if (laneJournalActive(process.env) && laneContextSnapshotTimer === null) {
+      setTimeout(() => captureLaneContextSnapshots(Date.now()), 60_000);
+      laneContextSnapshotTimer = setInterval(() => captureLaneContextSnapshots(Date.now()), 5 * 60_000);
+      const clearLaneContextSnapshotTimer = (): void => {
+        try { if (laneContextSnapshotTimer) { clearInterval(laneContextSnapshotTimer); laneContextSnapshotTimer = null; } }
+        catch { /* clearing is best-effort; a failure must never block process termination */ }
+      };
+      process.once("SIGTERM", clearLaneContextSnapshotTimer);
+      process.once("SIGINT", clearLaneContextSnapshotTimer);
+    }
+
+    const fourBrainCycle = (): void => {
+      void runFourBrainShadowCycle({
+        buildDeps: buildFourBrainDeps,
+        fetchCandles: (symbol) => binanceClient.getCandles(symbol, "15m", 150).catch(() => null),
+        candleTimeframe: "15m",
+        activeAllocation: activeFourBrainAllocation,
+        journalAppend: (r) => fourBrainJournal.append(r),
+        metrics: fourBrainMetrics,
+        now: () => Date.now(),
+        perfNow: () => performance.now(), // monotonic clock for gather/inference/journal LATENCY only
+      })
+        .then((res) => {
+          if (!res.ran) return;
+          const s = fourBrainMetrics.summary();
+          console.log(
+            `[four-brain-shadow] instance=${resolveFourBrainInstanceId(process.env)} reason=${res.tick?.reason} ` +
+              `lanes=${res.tick?.metrics.laneCoverage ?? 0} positions=${res.tick?.metrics.positionCoverage ?? 0} ` +
+              `decisions=${res.tick?.metrics.decisions ?? 0} coverage=${res.coverage?.capitalCoveragePct.toFixed(0) ?? "?"}% ` +
+              `completed=${s.ticks.completed} skipped=${s.ticks.skippedSingleFlight} gatherErr=${s.ticks.gatherErrors}`,
+          );
+        })
+        .catch((err) => console.error("[four-brain-shadow] cycle failed", err));
+    };
+    // Arm the interval ONLY where the tick could actually run — 3103 (live) never even schedules it.
+    if (fourBrainMode(process.env) === "shadow" && fourBrainInstanceAllowed(process.env)) {
+      setTimeout(fourBrainCycle, 90_000);
+      setInterval(fourBrainCycle, 5 * 60_000);
+    }
+  }
+
   await registerLiveRoutes(app, liveEngine, {
     configErrors: liveConfig.enabled ? liveConfig.configErrors : [],
     crossSectionalExecutor: () => crossSectionalExecutor,

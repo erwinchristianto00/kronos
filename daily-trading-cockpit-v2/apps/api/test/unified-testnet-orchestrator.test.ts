@@ -105,4 +105,24 @@ describe("UnifiedTestnetOrchestrator", () => {
       msHeld: 1_000,
     }).reason).toBe("UNIFIED_REGIME_FLIP_HARD_CUT");
   });
+
+  it("hard-vetoes an otherwise-confirming primary when a veto vote is present", () => {
+    const orchestrator = build();
+    // Two consecutive confirming LONG primaries normally arm LONG (see the confirmation test above).
+    // A veto vote (e.g. REGIME_EDGE_MEMORY proving LONG net-negative in this regime) forces the
+    // candidate to NEUTRAL on every sample, so the brain must never arm the direction. This locks in
+    // the candidateFrom veto branch that was previously dead (no runtime source ever set veto:true).
+    const vetoVote = {
+      source: "REGIME_EDGE_MEMORY",
+      direction: "LONG" as const,
+      confidence: 1,
+      veto: true,
+      reason: 'LONG proven net-negative in "Bullish pressure" (EDGE_PROVEN_NEGATIVE)',
+    };
+    expect(orchestrator.update({ ...input("1", "LONG"), votes: [vetoVote] }).brainState).toBe("FLAT");
+    const second = orchestrator.update({ ...input("2", "LONG"), votes: [vetoVote] });
+    expect(second.brainState).not.toBe("LONG");
+    expect(second.candidateDirection).toBe("NEUTRAL");
+    expect(orchestrator.allowsPaperOrder({ selectedLaneId: "CG_WIDE_FAST_LONG", direction: "LONG" })).toBe(false);
+  });
 });

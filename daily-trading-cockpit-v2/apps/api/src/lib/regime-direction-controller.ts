@@ -77,6 +77,15 @@ export interface RegimeDirectionControllerInput {
    * trend vote. Omitted → pure naive mapping (back-compat for report-only callers).
    */
   edgeGate?: DirectionEdgeGate | null;
+  /**
+   * Optional numeric strength signals for GRADUATED confidence (2026-07-12). The current
+   * regime-axis breadth composite (buildRegimeAxisTimeline(...).current.score, symmetric −1..+1)
+   * and its velocity (.slopePerHour). When present on a directional-trend mode, confidence is
+   * graded from the actual evidence strength instead of a hardcoded MEDIUM. Absent → the many
+   * report-only string-only callers keep today's behavior verbatim (see graduateConfidence Step 0).
+   */
+  axisScore?: number | null;
+  axisSlopePerHour?: number | null;
 }
 
 export interface RegimeDirectionControllerReportPrimaryLane {
@@ -91,7 +100,21 @@ export interface RegimeDirectionControllerReport {
   currentRegime: string | null;
   controllerMode: RegimeDirectionMode;
   directionalBias: RegimeDirectionalBias;
+  /**
+   * LIVE-SAFE confidence tier. For a directional trend it is graded from numeric evidence but
+   * FLOORED to ≥ MEDIUM (Phase 1): on live, admission gates only distinguish MEDIUM||HIGH
+   * (estimateLaneSelectorV2Regime confidenceOk), so a MEDIUM→HIGH upgrade is invisible to real-money
+   * behavior. This is the field every existing consumer reads.
+   */
   confidence: RegimeDirectionConfidence;
+  /** 0..1 continuous conviction underneath the tier (2026-07-12). Telemetry/shadow. */
+  convictionScore: number;
+  /**
+   * Un-floored graded tier (may be LOW where `confidence` is floored to MEDIUM). Telemetry/shadow
+   * ONLY — read by NO gate today. A future measure-first, env-gated Phase 2 would promote this to
+   * drive live once the shadow proves the LOW bucket is a genuine loser.
+   */
+  gradedConfidence: RegimeDirectionConfidence;
 
   allowsLong: boolean;
   allowsShort: boolean;
@@ -261,6 +284,115 @@ function mapRegimeToMode(regimeRaw: string | null | undefined): ModeMapping {
   };
 }
 
+// ── Graduated confidence (2026-07-12) ────────────────────────────────────────
+// Replaces the hardcoded MEDIUM on directional trends with a confidence graded from the actual
+// numeric evidence strength: aligned axis-breadth magnitude, aligned axis velocity, and the proven
+// regime×direction edge. Two output channels — a LIVE-SAFE `confidence` (floored ≥ MEDIUM so a
+// directional trend never emits LOW to a live admission gate in Phase 1) and an un-floored
+// `gradedConfidence` + continuous `convictionScore` for shadow/telemetry. Multiplicative "compounded
+// evidence" spine (absent signal ⇒ factor 1.0 ⇒ conviction 0.50 = today's MEDIUM), with a structural
+// HIGH gate (strong breadth AND agreeing velocity, OR a strong proven edge) so three lukewarm signals
+// can't mint HIGH, and a proven-negative (lane-rescued) direction can never read HIGH.
+const GRAD_BREADTH_FULL = 0.45; // BULL/BEAR trend-zone edge (REGIME_AXIS_ZONES)
+const GRAD_VEL_FLAT = 0.005; // axis module's flat threshold (score-units/hr)
+const GRAD_VEL_FULL = 0.03; // a strong slope: ~0.18 score over the 6h OLS window
+const GRAD_EDGE_R_FULL = 0.2; // a strong honest avgNetR/trade
+const GRAD_EDGE_N_MIN = 30; // = EDGE_MIN_SAMPLES
+const GRAD_EDGE_N_FULL = 120; // full sample trust
+const GRAD_HIGH_CONV = 0.75;
+const GRAD_LOW_CONV = 0.45;
+
+function clampNum(v: number, lo: number, hi: number): number {
+  return Math.max(lo, Math.min(hi, v));
+}
+function clamp01(v: number): number {
+  return clampNum(v, 0, 1);
+}
+const CONFIDENCE_RANK: Record<RegimeDirectionConfidence, number> = { LOW: 0, MEDIUM: 1, HIGH: 2 };
+function maxConfidence(a: RegimeDirectionConfidence, b: RegimeDirectionConfidence): RegimeDirectionConfidence {
+  return CONFIDENCE_RANK[a] >= CONFIDENCE_RANK[b] ? a : b;
+}
+function minConfidence(a: RegimeDirectionConfidence, b: RegimeDirectionConfidence): RegimeDirectionConfidence {
+  return CONFIDENCE_RANK[a] <= CONFIDENCE_RANK[b] ? a : b;
+}
+/** Fixed conviction for the modes that keep their hardcoded confidence (non-directional-trend). */
+const FIXED_CONVICTION: Record<RegimeDirectionConfidence, number> = { HIGH: 0.85, MEDIUM: 0.5, LOW: 0.2 };
+
+export interface GraduatedConfidence {
+  /** Live-safe tier: floored ≥ MEDIUM for a directional trend (Phase 1). */
+  confidence: RegimeDirectionConfidence;
+  /** Un-floored tier (may be LOW). Shadow/telemetry only. */
+  gradedConfidence: RegimeDirectionConfidence;
+  convictionScore: number;
+}
+
+/**
+ * Pure graduated-confidence helper. Deterministic; no I/O. Only ever CALLED for a directional trend
+ * (LONG_ONLY/SHORT_ONLY); for any other mode the caller keeps the hardcoded confidence.
+ */
+export function graduateConfidence(args: {
+  dir: "LONG" | "SHORT";
+  axisScore: number | null | undefined;
+  axisSlopePerHour: number | null | undefined;
+  edgeStat: { n: number; avgNetR: number } | null | undefined;
+  mappingConfidence: RegimeDirectionConfidence;
+}): GraduatedConfidence {
+  const d = args.dir === "LONG" ? 1 : -1;
+  const axisScore =
+    typeof args.axisScore === "number" && Number.isFinite(args.axisScore) ? args.axisScore : null;
+  const slope =
+    typeof args.axisSlopePerHour === "number" && Number.isFinite(args.axisSlopePerHour)
+      ? args.axisSlopePerHour
+      : null;
+  const stat =
+    args.edgeStat && Number.isFinite(args.edgeStat.n) && Number.isFinite(args.edgeStat.avgNetR)
+      ? args.edgeStat
+      : null;
+
+  // Step 0 — back-compat: no numeric evidence at all → today's behavior verbatim.
+  if (axisScore === null && (stat === null || stat.n === 0)) {
+    return { confidence: args.mappingConfidence, gradedConfidence: args.mappingConfidence, convictionScore: 0.5 };
+  }
+
+  // Step 1 — aligned breadth factor (1.0 when absent/neutral).
+  const aB = axisScore === null ? 0 : clampNum((d * axisScore) / GRAD_BREADTH_FULL, -1, 1);
+  const gBreadth = 1 + 0.4 * aB;
+
+  // Step 2 — aligned velocity factor (1.0 when flat/absent).
+  const V = slope === null || Math.abs(slope) < GRAD_VEL_FLAT ? 0 : clampNum((d * slope) / GRAD_VEL_FULL, -1, 1);
+  const gVel = 1 + 0.4 * V;
+
+  // Step 3 — edge class + sample-weighted magnitude.
+  const provenPos = stat !== null && stat.n >= GRAD_EDGE_N_MIN && stat.avgNetR > 0;
+  const provenNeg = stat !== null && stat.n >= GRAD_EDGE_N_MIN && stat.avgNetR <= 0;
+  let E = 0;
+  let gEdge = 1;
+  if (provenPos && stat) {
+    const rMag = clamp01(stat.avgNetR / GRAD_EDGE_R_FULL);
+    const sConf = clamp01((stat.n - GRAD_EDGE_N_MIN) / (GRAD_EDGE_N_FULL - GRAD_EDGE_N_MIN));
+    E = rMag * (0.6 + 0.4 * sConf); // a barely-30-sample slice is discounted ×0.60
+    gEdge = 1 + 0.5 * E;
+  }
+
+  // Step 4 — conviction (baseline × compounded agreement factors).
+  const convictionScore = clamp01(0.5 * gBreadth * gVel * gEdge);
+
+  // Step 5 — tier. Structural HIGH gate: strong breadth IN the trend zone AND agreeing velocity,
+  // OR a strong well-sampled proven edge. Proven-negative (lane-rescued) can never read HIGH.
+  const momentumHigh = axisScore !== null && d * axisScore >= GRAD_BREADTH_FULL && V >= 0.34;
+  const edgeHigh = provenPos && E >= 0.75;
+  let candidate: RegimeDirectionConfidence =
+    convictionScore >= GRAD_HIGH_CONV ? "HIGH" : convictionScore < GRAD_LOW_CONV ? "LOW" : "MEDIUM";
+  if (candidate === "HIGH" && !(momentumHigh || edgeHigh)) candidate = "MEDIUM";
+  if (provenNeg) candidate = minConfidence(candidate, "MEDIUM");
+
+  return {
+    confidence: maxConfidence(candidate, "MEDIUM"), // Phase-1 live-safe floor
+    gradedConfidence: candidate,
+    convictionScore,
+  };
+}
+
 /**
  * True when a regime string maps to a confirmed strong directional trend — LONG_ONLY / SHORT_ONLY,
  * the only modes carrying directional conviction with allowsNewEntries=true. Chop, mixed/rotation,
@@ -400,6 +532,32 @@ export function buildRegimeDirectionControllerReport(
     }
   }
 
+  // ── Graduated confidence ────────────────────────────────────────────────
+  // Only for a resolved directional trend (post-veto LONG_ONLY/SHORT_ONLY). Every other mode
+  // (panic-retest, chop, mixed, unknown, collapsed NO_TRADE_NEGATIVE_EDGE) keeps its hardcoded
+  // confidence + a fixed conviction — so all report-only string-only callers are unchanged.
+  let confidence = mapping.confidence;
+  let gradedConfidence = mapping.confidence;
+  let convictionScore = FIXED_CONVICTION[mapping.confidence];
+  const isDirectionalTrend =
+    (controllerMode === "LONG_ONLY" || controllerMode === "SHORT_ONLY") &&
+    (directionalBias === "LONG" || directionalBias === "SHORT");
+  if (isDirectionalTrend) {
+    const dir = directionalBias as "LONG" | "SHORT";
+    const edgeStat =
+      input.edgeGate && currentRegimeTrimmed ? input.edgeGate.verdict(currentRegimeTrimmed, dir).stat : null;
+    const graded = graduateConfidence({
+      dir,
+      axisScore: input.axisScore,
+      axisSlopePerHour: input.axisSlopePerHour,
+      edgeStat,
+      mappingConfidence: mapping.confidence,
+    });
+    confidence = graded.confidence;
+    gradedConfidence = graded.gradedConfidence;
+    convictionScore = graded.convictionScore;
+  }
+
   const { report: primaryLaneReport, alignment } = buildPrimaryLaneReport(
     currentRegimeTrimmed,
     input.primaryValidationLane ?? null,
@@ -416,7 +574,9 @@ export function buildRegimeDirectionControllerReport(
     currentRegime: currentRegimeTrimmed,
     controllerMode,
     directionalBias,
-    confidence: mapping.confidence,
+    confidence,
+    convictionScore,
+    gradedConfidence,
     allowsLong,
     allowsShort,
     allowsNewEntries,

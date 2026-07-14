@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -80,6 +80,9 @@ class FakeLiveClient {
   failAddEntry = false;
   /** When set, each reduce-only MARKET flatten books a userTrade with this realizedPnl on its own order id. */
   flattenRealizedPnl: number | null = null;
+  /** Simulates Binance /userTrades eventual consistency after a just-placed close. */
+  hideTradesForCalls = 0;
+  getUserTradesCalls = 0;
   private nextOrderId = 1000;
 
   async ensureTimeSync(): Promise<void> {
@@ -210,6 +213,8 @@ class FakeLiveClient {
     this.cancelAllSymbols.push(symbol);
   }
   async getUserTrades(): Promise<FuturesUserTrade[]> {
+    this.getUserTradesCalls += 1;
+    if (this.getUserTradesCalls <= this.hideTradesForCalls) return [];
     return this.trades;
   }
   private stubOrder(overrides: Partial<FuturesOrder>): FuturesOrder {
@@ -264,6 +269,7 @@ function makeConfig(overrides: Partial<LiveExecutionConfig> = {}): LiveExecution
     maxConcurrentPositions: 3,
     maxCorrelatedAltLongPositions: 3,
     maxCorrelatedAltShortPositions: 3,
+    maxAggregateIntentRiskUsd: 5,
     maxClusterPositions: 3,
     dailyMaxLossUsd: 15,
     maxConsecutiveLosses: 5,
@@ -847,6 +853,29 @@ describe("LiveExecutionEngine", () => {
     expect(closed.realizedPnlUsd).toBeCloseTo(1.02, 6);
   });
 
+  it("waits for the just-placed close trade instead of booking entry commission as a fake loss", async () => {
+    const order = paperOrder();
+    const client = new FakeLiveClient();
+    const { engine, store } = makeEngine({
+      client,
+      paper: makePaperStore([order]),
+      config: { profitBankNetTargetUsd: 1 },
+    });
+    await engine.arm();
+    await engine.tick();
+
+    client.markPriceBySymbol.set("ETHUSDT", 1900);
+    client.flattenRealizedPnl = 1.25;
+    client.hideTradesForCalls = 1;
+    await engine.tick();
+
+    const closed = store.getState().intents[0]!;
+    expect(client.getUserTradesCalls).toBeGreaterThanOrEqual(2);
+    expect(closed.state).toBe("CLOSED");
+    expect(closed.realizedPnlUsd).toBeCloseTo(1.25, 6);
+    expect(store.getState().dailyLedger.wins).toBe(1);
+  });
+
   it("profit-bank net target stays open when gross unrealized crosses $1 but net-of-cost does not", async () => {
     const order = paperOrder();
     const { engine, client, store } = makeEngine({
@@ -1399,6 +1428,7 @@ describe("LiveExecutionEngine", () => {
       paper: makePaperStore(orders),
       config: {
         maxConcurrentPositions: 10,
+        maxCorrelatedAltShortPositions: 10,
         maxClusterPositions: 2,
       },
     });
@@ -1414,6 +1444,58 @@ describe("LiveExecutionEngine", () => {
       "ETHUSDT:SELL",
     ]);
     expect(entries.some((order) => order.symbol === "AVAXUSDT")).toBe(false); // 3rd L1 short blocked
+  });
+
+  it("enforces the global correlated-alt cap across different clusters while majors remain exempt", async () => {
+    const symbols = ["SUIUSDT", "DOGEUSDT", "FETUSDT", "ETHUSDT"];
+    const client = new FakeLiveClient();
+    client.getExchangeFilters = async () =>
+      new Map(symbols.map((symbol) => [symbol, { ...FILTERS, symbol }]));
+    const orders = symbols.map((symbol, index) =>
+      paperOrder({
+        paperOrderId: `global-cap-${symbol}`,
+        symbol,
+        createdAt: `2099-01-02T00:00:0${index + 1}.000Z`,
+      } as Partial<PaperOrder>),
+    );
+    const { engine } = makeEngine({
+      client,
+      paper: makePaperStore(orders),
+      config: {
+        maxConcurrentPositions: 10,
+        maxCorrelatedAltShortPositions: 2,
+        maxClusterPositions: 10,
+      },
+    });
+
+    await engine.arm();
+    await engine.tick();
+
+    const entries = client.placed.filter((order) => order.type === "MARKET" && !order.reduceOnly);
+    expect(entries.map((order) => order.symbol)).toEqual(["SUIUSDT", "DOGEUSDT", "ETHUSDT"]);
+    expect(engine.getStatus().mirrorFunnel.find((row) => row.symbol === "FETUSDT")?.reason).toBe("correlated_alt_cap");
+  });
+
+  it("blocks pyramid adds that would exceed aggregate intent stop-risk even after favorable progress", async () => {
+    const orders = [paperOrder({ paperOrderId: "risk-cap-first" } as Partial<PaperOrder>)];
+    const paper = makePaperStore(orders);
+    const { engine, client, store } = makeEngine({
+      paper,
+      config: { maxAggregateIntentRiskUsd: 5 },
+    });
+    await engine.arm();
+    await engine.tick();
+    store.getState().intents[0]!.maxFavorableR = 1; // old gate would allow unlimited adds now
+    orders.push(paperOrder({
+      paperOrderId: "risk-cap-add",
+      createdAt: "2099-01-02T00:01:00.000Z",
+    } as Partial<PaperOrder>));
+
+    await engine.tick();
+
+    expect(client.placed.filter((order) => order.type === "MARKET" && !order.reduceOnly)).toHaveLength(1);
+    expect(store.getState().intents[0]!.sourcePaperOrders).toHaveLength(1);
+    expect(engine.getStatus().mirrorFunnel.find((row) => row.id === "risk-cap-add")?.reason).toBe("aggregate_intent_risk_cap");
   });
 
   it("testnet mirror-all keeps one symbol on one lane geometry instead of netting different lanes", async () => {
@@ -2079,7 +2161,11 @@ describe("LiveExecutionEngine", () => {
       } as Partial<PaperOrder>),
     ];
     const client = new FakeLiveClient();
-    const { engine, store } = makeEngine({ client, paper: makePaperStore(orders), config: { mirrorAllPaperOrders: true } });
+    const { engine, store } = makeEngine({
+      client,
+      paper: makePaperStore(orders),
+      config: { mirrorAllPaperOrders: true, maxAggregateIntentRiskUsd: 10 },
+    });
     await engine.arm();
     await engine.tick();
     expect(store.getState().intents[0]!.state).toBe("OPEN");
@@ -2119,7 +2205,11 @@ describe("LiveExecutionEngine", () => {
       } as Partial<PaperOrder>),
     ];
     const client = new FakeLiveClient();
-    const { engine, store } = makeEngine({ client, paper: makePaperStore(orders), config: { mirrorAllPaperOrders: true } });
+    const { engine, store } = makeEngine({
+      client,
+      paper: makePaperStore(orders),
+      config: { mirrorAllPaperOrders: true, maxAggregateIntentRiskUsd: 10 },
+    });
     await engine.arm();
     await engine.tick();
     const opened = store.getState().intents[0]!;
@@ -2154,7 +2244,11 @@ describe("LiveExecutionEngine", () => {
       } as Partial<PaperOrder>),
     ];
     const client = new FakeLiveClient();
-    const { engine, store } = makeEngine({ client, paper: makePaperStore(orders), config: { mirrorAllPaperOrders: true } });
+    const { engine, store } = makeEngine({
+      client,
+      paper: makePaperStore(orders),
+      config: { mirrorAllPaperOrders: true, maxAggregateIntentRiskUsd: 10 },
+    });
     await engine.arm();
     await engine.tick(); // opens p1 at a confirmed 2000
     expect(store.getState().intents[0]!.entryPriceConfirmed).toBe(true);
@@ -2177,6 +2271,7 @@ describe("LiveExecutionEngine", () => {
     // confirmed 1700 fill.
     expect(intent.filledEntryPrice!).toBeLessThan(2000);
     expect(intent.entryPriceConfirmed).toBe(true); // the add's fill WAS confirmed, just at a moved price
+    expect(intent.entryOrderIds).toHaveLength(2); // initial entry + pyramid add retained for fee settlement
   });
 
   it("marks the intent's entryPriceConfirmed false (monotonic-worst) when an ADD's fill can't be confirmed, even though the original entry was", async () => {
@@ -2187,7 +2282,11 @@ describe("LiveExecutionEngine", () => {
       } as Partial<PaperOrder>),
     ];
     const client = new FakeLiveClient();
-    const { engine, store } = makeEngine({ client, paper: makePaperStore(orders), config: { mirrorAllPaperOrders: true } });
+    const { engine, store } = makeEngine({
+      client,
+      paper: makePaperStore(orders),
+      config: { mirrorAllPaperOrders: true, maxAggregateIntentRiskUsd: 10 },
+    });
     await engine.arm();
     await engine.tick(); // opens p1 at a confirmed 2000
     expect(store.getState().intents[0]!.entryPriceConfirmed).toBe(true);
@@ -4198,5 +4297,98 @@ describe("applyRegimeAutopilotAllocation (autopilot ↔ manual-mode sync)", () =
     result = engine.applyRegimeAutopilotAllocation([{ laneId: "CROSS_SECTIONAL_MARKET_NEUTRAL", weightPct: 100 }]);
     expect(result.ok).toBe(false); // STILL locked — toggling raw-bypass off must not release it either
     expect(store.getState().laneAllocations).toEqual([{ laneId: "CG_WIDE_FAST_LONG", weightPct: 100 }]);
+  });
+});
+
+// ── Stage-2 execution-lifecycle tap: proves the report-only entry taps NEVER disturb execution ──────────────────
+describe("openIntent execution-lifecycle tap — report-only, cannot alter the exchange interaction", () => {
+  // Run one armed entry tick under a given env and return the exact exchange-order sequence + intent state.
+  async function runEntry(env: NodeJS.ProcessEnv): Promise<{ placed: Array<{ type: string; side: string; quantity: number; reduceOnly: boolean | undefined }>; count: number; state: string }> {
+    const saved = { EXEC_LIFECYCLE_TIMESTAMPS: process.env.EXEC_LIFECYCLE_TIMESTAMPS, FOUR_BRAIN_INSTANCE_ID: process.env.FOUR_BRAIN_INSTANCE_ID, LANE_CONTEXT_JOURNAL_DIR: process.env.LANE_CONTEXT_JOURNAL_DIR, PORT: process.env.PORT };
+    delete process.env.PORT; // ensure the 3103 raw-PORT block can't accidentally fire from the test runner env
+    for (const [k, v] of Object.entries(env)) process.env[k] = v as string;
+    try {
+      // SAME paperOrderId across runs so the derived clientOrderIds match ⇒ a fair sequence comparison.
+      const order = paperOrder({ paperOrderId: "paper-fixedlifecycle01", variantExitRule: "tp1_full" });
+      const { engine, client, store } = makeEngine({ paper: makePaperStore([order]) });
+      expect((await engine.arm()).ok).toBe(true);
+      await engine.tick();
+      return {
+        placed: client.placed.map((p) => ({ type: p.type, side: p.side, quantity: p.quantity, reduceOnly: p.reduceOnly })),
+        count: client.placed.length,
+        canceled: client.canceled.length,
+        leverage: client.leverageCalls.length,
+        state: store.getState().intents[0]?.state ?? "NONE",
+      };
+    } finally {
+      for (const k of ["EXEC_LIFECYCLE_TIMESTAMPS", "FOUR_BRAIN_INSTANCE_ID", "LANE_CONTEXT_JOURNAL_DIR", "PORT"] as const) {
+        if (saved[k] === undefined) delete process.env[k];
+        else process.env[k] = saved[k]!;
+      }
+    }
+  }
+
+  it("logger OFF vs logger THROWING at every point ⇒ identical exchange sequence + intent result, no throw", async () => {
+    // Baseline: lifecycle logging fully OFF (the production default).
+    const off = await runEntry({});
+    expect(off.count).toBeGreaterThan(0);
+    expect(off.placed.map((p) => p.type)).toEqual(["MARKET", "STOP_MARKET", "LIMIT"]);
+    expect(off.state).toBe("OPEN");
+
+    // Logger ENABLED but pointed at a broken journal dir (a FILE) so EVERY lifecycle write throws internally.
+    const brokenBase = join(tmp(), "not-a-dir-file");
+    writeFileSync(brokenBase, "x");
+    let threw = false;
+    let on: Awaited<ReturnType<typeof runEntry>> | null = null;
+    try {
+      on = await runEntry({ EXEC_LIFECYCLE_TIMESTAMPS: "1", FOUR_BRAIN_INSTANCE_ID: "3102", LANE_CONTEXT_JOURNAL_DIR: brokenBase });
+    } catch {
+      threw = true;
+    }
+    expect(threw).toBe(false); // a throwing logger never escapes into the execution path
+    expect(on).not.toBeNull();
+    expect(on!.count).toBe(off.count); // exchange CALL COUNT unchanged (runtime spy: placeOrder/placeAlgoOrder)
+    expect(on!.placed).toEqual(off.placed); // exchange sequence (type/side/qty/reduceOnly) byte-for-byte unchanged
+    expect(on!.canceled).toBe(off.canceled); // no extra cancel calls
+    expect(on!.leverage).toBe(off.leverage); // no extra setLeverage calls
+    expect(on!.state).toBe(off.state); // intent result unchanged
+  });
+
+  it("logger enabled + a WORKING dir writes the entry lifecycle without changing the exchange sequence", async () => {
+    const dir = tmp();
+    const on = await runEntry({ EXEC_LIFECYCLE_TIMESTAMPS: "1", FOUR_BRAIN_INSTANCE_ID: "3102", LANE_CONTEXT_JOURNAL_DIR: dir });
+    expect(on.placed.map((p) => p.type)).toEqual(["MARKET", "STOP_MARKET", "LIMIT"]); // unchanged
+    expect(on.state).toBe("OPEN");
+    // the entry lifecycle was journaled: DECISION → SUBMITTED → EXCHANGE_ACK → FINAL_FILL
+    const events = readFileSync(join(dir, "lane-context", "3102", "lifecycle.jsonl"), "utf8").trim().split("\n").map((l) => (JSON.parse(l) as { event: string }).event);
+    expect(events).toEqual(["DECISION", "SUBMITTED", "EXCHANGE_ACK", "FINAL_FILL"]);
+  });
+
+  it("REGRESSION (review finding): a filled entry whose downstream STOP placement throws is NOT mislabeled REJECTED", async () => {
+    const saved = { EXEC_LIFECYCLE_TIMESTAMPS: process.env.EXEC_LIFECYCLE_TIMESTAMPS, FOUR_BRAIN_INSTANCE_ID: process.env.FOUR_BRAIN_INSTANCE_ID, LANE_CONTEXT_JOURNAL_DIR: process.env.LANE_CONTEXT_JOURNAL_DIR, PORT: process.env.PORT };
+    delete process.env.PORT;
+    const dir = tmp();
+    process.env.EXEC_LIFECYCLE_TIMESTAMPS = "1";
+    process.env.FOUR_BRAIN_INSTANCE_ID = "3102";
+    process.env.LANE_CONTEXT_JOURNAL_DIR = dir;
+    try {
+      const client = new FakeLiveClient();
+      client.algoErrorCode = -2021; // the protective STOP throws "would immediately trigger" AFTER the entry fills
+      const order = paperOrder({ paperOrderId: "paper-stopfail0001", variantExitRule: "tp1_full" });
+      const { engine, store } = makeEngine({ client: client as unknown as FakeLiveClient, paper: makePaperStore([order]) });
+      expect((await engine.arm()).ok).toBe(true);
+      await engine.tick();
+      // Incumbent behavior UNCHANGED: entry filled but stop failed ⇒ emergency flatten ⇒ intent ERROR.
+      expect(store.getState().intents[0]!.state).toBe("ERROR");
+      const events = readFileSync(join(dir, "lane-context", "3102", "lifecycle.jsonl"), "utf8").trim().split("\n").map((l) => (JSON.parse(l) as { event: string }).event);
+      expect(events).toContain("FINAL_FILL"); // the entry order genuinely filled...
+      expect(events).not.toContain("REJECTED"); // ...so it must NOT be labeled a rejection (no double-terminal)
+      expect(events).toEqual(["DECISION", "SUBMITTED", "EXCHANGE_ACK", "FINAL_FILL"]);
+    } finally {
+      for (const k of ["EXEC_LIFECYCLE_TIMESTAMPS", "FOUR_BRAIN_INSTANCE_ID", "LANE_CONTEXT_JOURNAL_DIR", "PORT"] as const) {
+        if (saved[k] === undefined) delete process.env[k];
+        else process.env[k] = saved[k]!;
+      }
+    }
   });
 });

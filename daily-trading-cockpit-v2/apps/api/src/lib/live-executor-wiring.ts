@@ -169,6 +169,29 @@ export function sumExternalRealizedPnlUsd(
   return { today, allTime };
 }
 
+/** Fee estimates/actual fees attached only to external positions CLOSED on the requested UTC day.
+ * Open-entry commissions must not be mixed into a closed-realized reconciliation comparison. */
+export function sumExternalClosedFeesUsd(
+  crossSectionalExecutors: ReadonlyArray<CrossSectionalExecutor | null>,
+  singleSymbolExecutors: ReadonlyArray<SingleSymbolLaneExecutor | null>,
+  dayUtc = new Date().toISOString().slice(0, 10),
+): number {
+  let fees = 0;
+  for (const exec of crossSectionalExecutors) {
+    if (!exec) continue;
+    for (const basket of exec.getClosedBaskets()) {
+      if (basket.closedAt?.startsWith(dayUtc)) fees += basket.feeEstimateUsd ?? 0;
+    }
+  }
+  for (const exec of singleSymbolExecutors) {
+    if (!exec) continue;
+    for (const position of exec.getClosedPositions()) {
+      if (position.closedAt?.startsWith(dayUtc)) fees += position.feeEstimateUsd ?? 0;
+    }
+  }
+  return fees;
+}
+
 /** 2026-07-09 fix: shared default ceiling for computeNotionalPerSymbol-based admission gates.
  *  250 permits the two legitimate lanes already stacking on one symbol today (up to ~$150 WIDE +
  *  ~$91 REGIME_COMPOSITE per symbol, observed live) while stopping a 3rd/4th lane from piling on

@@ -1,4 +1,5 @@
 import {
+  appendFileSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -48,7 +49,8 @@ describe("rotateJsonlIfNeeded", () => {
     expect(sizeBefore).toBeGreaterThan(0);
 
     const result = rotateJsonlIfNeeded(file, {
-      thresholdBytes: 100,
+      // Large enough that the requested 10-line tail fits below the new half-threshold safety cap.
+      thresholdBytes: 2500,
       tailLines: 10,
     });
     expect(result.rotated).toBe(true);
@@ -211,5 +213,22 @@ describe("rotateJsonlIfNeeded", () => {
     // archive directory should now contain the rotated file
     const entries = readdirSync(archiveDir);
     expect(entries.some((e) => e.startsWith("history.jsonl"))).toBe(true);
+  });
+
+  it("caps the retained tail below half the threshold so the next append cannot rotate again", () => {
+    const dir = mkTmp();
+    const file = join(dir, "decision-log.jsonl");
+    writeFileSync(file, Array.from({ length: 40 }, (_, index) => `${index}:${"x".repeat(20)}`).join("\n") + "\n", "utf-8");
+
+    const result = rotateJsonlIfNeeded(file, {
+      thresholdBytes: 200,
+      tailLines: 10_000,
+      tailBytes: 200,
+    });
+
+    expect(result.rotated).toBe(true);
+    expect(statSync(file).size).toBeLessThanOrEqual(100);
+    appendFileSync(file, "next\n", "utf-8");
+    expect(rotateJsonlIfNeeded(file, { thresholdBytes: 200, tailLines: 10_000, tailBytes: 200 }).rotated).toBe(false);
   });
 });
