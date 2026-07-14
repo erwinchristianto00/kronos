@@ -128,7 +128,10 @@ export function describeWindow(frames: readonly CommonMarketFrame[], from: numbe
 /** TERMINAL state at the END of a source block [start, start+len): summarize the last TERMINAL_LOOKBACK candles. */
 export function computeTerminalState(frames: readonly CommonMarketFrame[], blockStart: number, blockLen: number, baseline: CalibrationVolumeBaseline, btc: string, eth: string, lookback = TERMINAL_LOOKBACK): BlockTransitionState {
   const end = blockStart + blockLen; // exclusive
-  const from = Math.max(0, end - lookback);
+  // Clamp the lookback to the block's OWN start: for a short block (len < lookback, e.g. COMPAT_STATIONARY geometric
+  // lengths) the window must NOT reach into source candles BEFORE this block — those precede the block in the SOURCE
+  // but a DIFFERENT block precedes it in the generated path, so summarizing them would be a causality mismatch.
+  const from = Math.max(0, blockStart, end - lookback);
   return describeWindow(frames, from, end, end - 1, baseline, btc, eth);
 }
 

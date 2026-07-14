@@ -135,7 +135,8 @@ async function main() {
   const seamRng = createRng(999, "seam-bootstrap");
   const methodResults: Record<string, unknown> = {};
   const classifierWindows: LabeledWindow[] = [];
-  const perMethodSimForClf: Record<string, number[]> = {}; // seed-1 sim returns per method for the classifier
+  const perMethodSimForClf: Record<string, number[]> = {}; // seed-1 sim returns per method for the main classifier + domain-shift
+  const simForClfMulti: { method: string; seed: number; returns: number[] }[] = []; // seeds 1-3 per method → more independent sim GROUPS for the grouped CI
 
   const measurePath = (res: BootstrapResult) => {
     const inv = checkFrameStreamInvariants(res.frames, { expectSingleProvenance: true });
@@ -168,6 +169,7 @@ async function main() {
       const meas = measurePath(res);
       const recs = seamRecords(res); allSeamRecords.push(...recs);
       if (seed === 1) perMethodSimForClf[m.key] = meas.simBtc;
+      if (seed <= 3) simForClfMulti.push({ method: m.key, seed, returns: meas.simBtc }); // more sim groups for the grouped CI
       perSeed.push({
         seed, invariantsOk: meas.inv, hash: stableHash(res.frames.map((f) => f.frameId)).slice(0, 12),
         seamRejectRate: res.stitches.length ? res.rejectedBoundaries / res.stitches.length : 0,
@@ -178,9 +180,10 @@ async function main() {
         nBlocks: res.blocks.length,
       });
     }
-    // seam realism with grouped CI (pooled across seeds; grouped by source day)
-    const seamRealism = computeSeamRealism(allSeamRecords, { rate: natural.rate }, seamRng);
-    const seamRealismBtc = computeSeamRealism(allSeamRecords, { rate: naturalBtcOnly.rate }, seamRng);
+    // seam realism with grouped CI (pooled across seeds; grouped by source day). Natural baseline items are passed so
+    // the excess CI bootstraps the natural rate's own uncertainty (not a fixed constant). Both use the both-symbol
+    // decision, so it is apples-to-apples (the misleading both-vs-BTC-only comparison was removed).
+    const seamRealism = computeSeamRealism(allSeamRecords, natural, seamRng);
     const med = (f: (s: Record<string, unknown>) => number | null | undefined) => median(perSeed.map(f));
     // aggregate concentration (median across seeds)
     const concKeys = ["top1", "top5", "top10", "effectiveNumberOfBlocks", "uniqueBlockCoverage", "monthConcentrationMax", "monthEntropy", "transitionCellConcentrationMax", "duplicateSequenceCount"] as const;
@@ -193,6 +196,7 @@ async function main() {
       top1: Math.max(0, ...concVals("top1")),
       monthConcentrationMax: Math.max(0, ...concVals("monthConcentrationMax")),
       uniqueBlockCoverage: concVals("uniqueBlockCoverage").length ? Math.min(...concVals("uniqueBlockCoverage")) : null,
+      overlapAwareCoverage: concVals("overlapAwareCoverage").length ? Math.min(...concVals("overlapAwareCoverage")) : null,
       duplicateSequenceCount: Math.max(0, ...concVals("duplicateSequenceCount")),
     };
     // pooled fallback counts
@@ -205,7 +209,7 @@ async function main() {
       allDeterministic: perSeed.every((s) => s.invariantsOk),
       medianDepDist: med((s) => s.depDist as number | null),
       medianRealism: { wasserstein: med((s) => (s.realism as Record<string, number>).wasserstein), absAutocorr: med((s) => (s.realism as Record<string, number>).absAutocorr), tail: med((s) => (s.realism as Record<string, number>).tail) },
-      seamRealism, seamRealismBtcOnly: seamRealismBtc,
+      seamRealism,
       concentrationMedian, concentrationWorst, fallbackTotals,
       insufficientSeamsTotal: perSeed.reduce((a, s) => a + (s.insufficientSeams as number), 0),
       anyInsufficient: perSeed.some((s) => s.selectionStatus === "STRESS_TEST_ONLY_INSUFFICIENT_TRANSITION_SUPPORT"),
@@ -224,7 +228,9 @@ async function main() {
   }
   pushWindowsByDayInto(classifierWindows, dev, BTC, 1, "development");
   pushWindowsByDayInto(classifierWindows, diag, BTC, 1, "development"); // diagnostic real (burned) as extra dev real
-  for (const m of METHODS) pushWindows(classifierWindows, perMethodSimForClf[m.key] ?? [], 0, `sim-dev-${m.key}`, "development");
+  // sim negatives from seeds 1-3 per method, each its OWN origin — gives the grouped CI more comparably-sized sim
+  // groups (15) instead of 5 giant per-method groups that would dominate the cluster bootstrap.
+  for (const s of simForClfMulti) pushWindows(classifierWindows, s.returns, 0, `sim-dev-${s.method}-s${s.seed}`, "development");
   const classifier = evaluateClassifier(classifierWindows);
 
   // grouped CI + per-regime + per-origin AUC on development split (trained on calibration)
@@ -271,11 +277,14 @@ async function main() {
     const top1 = conc.top1; if (top1 != null && top1 > GATES.srcTop1Max) failures.push(`worst-seed src top1 ${top1.toFixed(3)}>${GATES.srcTop1Max}`);
     const mm = conc.monthConcentrationMax; if (mm != null && mm > GATES.srcMonthMax) failures.push(`worst-seed month conc ${mm.toFixed(2)}>${GATES.srcMonthMax}`);
     const uc = conc.uniqueBlockCoverage; if (uc != null && uc < GATES.minUniqueCoverage) failures.push(`worst-seed unique cov ${uc.toFixed(2)}<${GATES.minUniqueCoverage}`);
+    const oc = conc.overlapAwareCoverage; if (oc != null && oc < GATES.minUniqueCoverage) failures.push(`worst-seed overlap-aware cov ${oc.toFixed(2)}<${GATES.minUniqueCoverage}`);
     const dup = conc.duplicateSequenceCount; if (dup != null && dup > 0) failures.push(`worst-seed duplicate sequences ${dup}>0`);
     if (r.anyInsufficient as boolean) failures.push("insufficient-transition-support on ≥1 seed");
     acceptance[m.key] = { pass: failures.length === 0, failures, notes };
   }
-  const anyPass = Object.values(acceptance).some((a) => a.pass);
+  // The holdout greenlight additionally requires the development classifier to be TRUSTWORTHY: a domain-confounded
+  // near-chance AUC cannot certify realism (sim-basis month ≠ real-eval month), so it must NOT open a scarce holdout.
+  const anyPass = Object.values(acceptance).some((a) => a.pass) && !classifierDomainConfounded;
 
   const results = {
     phase: "2B", generatedAtProcessingMs: t0, runtimeMs: Date.now() - t0,

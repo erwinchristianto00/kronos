@@ -10,7 +10,7 @@ import { buildCommonMarketFrame, type SymbolFrameInput } from "../src/simulation
 import type { CommonMarketFrame } from "../src/simulation/simulation-types.js";
 import { computeCalibrationVolumeBaseline, computeInitialState, computeTerminalState, CANDIDATE_PREFIX_LEN, TERMINAL_LOOKBACK } from "../src/simulation/block-transition-state.js";
 import { buildCompatibilityNormalizer, assessCompatibility, RELAX_LEVELS } from "../src/simulation/block-compatibility.js";
-import { selectCompatibilityBlocks, precomputeInitialStates, buildTransitionKernel, detectDuplicateSequences, DEFAULT_CONSTRAINTS } from "../src/simulation/compatibility-block-selection.js";
+import { selectCompatibilityBlocks, precomputeInitialStates, buildTransitionKernel, detectDuplicateSequences, computeConcentration, DEFAULT_CONSTRAINTS } from "../src/simulation/compatibility-block-selection.js";
 import { computeSeamRealism, groupedBootstrapMeanCI } from "../src/simulation/seam-realism.js";
 import { assembleReturnSpaceBootstrapPath } from "../src/simulation/historical-block-bootstrap.js";
 
@@ -172,8 +172,43 @@ describe("phase-2b — seam realism + duplicate detection", () => {
     const [lo, hi] = groupedBootstrapMeanCI(items, createRng(2, "b"));
     expect(lo).toBeLessThanOrEqual(hi);
   });
-  it("detectDuplicateSequences flags a repeated 3-block run", () => {
-    expect(detectDuplicateSequences([1, 2, 3, 9, 1, 2, 3], 3)).toBe(1);
+  it("detectDuplicateSequences counts MULTIPLICITY (a 3× pattern → 2, not 1)", () => {
+    expect(detectDuplicateSequences([1, 2, 3, 9, 1, 2, 3], 3)).toBe(1); // appears 2× ⇒ 1 extra
+    expect(detectDuplicateSequences([1, 2, 3, 1, 2, 3, 1, 2, 3], 3)).toBeGreaterThanOrEqual(2); // 3× ⇒ ≥2 extra
     expect(detectDuplicateSequences([1, 2, 3, 4, 5, 6], 3)).toBe(0);
+  });
+
+  it("computeConcentration reports overlap-aware coverage ≤ exact-index coverage", () => {
+    // near-adjacent starts (overlapping blocks) collapse into fewer overlap regions than distinct exact starts.
+    const frames = synthCorpus(200);
+    const initialStates = new Map();
+    const blocks = [{ startIndex: 0, length: 48 }, { startIndex: 1, length: 48 }, { startIndex: 2, length: 48 }, { startIndex: 100, length: 48 }];
+    const conc = computeConcentration(blocks, frames, initialStates, 48);
+    expect(conc.overlapAwareCoverage).toBeLessThanOrEqual(conc.uniqueBlockCoverage); // adjacents share a region
+    expect(conc.uniqueBlockCoverage).toBe(1); // 4 distinct exact starts / 4 placed
+    expect(conc.overlapAwareCoverage).toBeLessThan(1); // 0,1,2 fall in one region ⇒ &lt;4 regions
+  });
+
+  it("computeTerminalState never reaches before a SHORT block's own start (causality clamp)", () => {
+    const frames = synthCorpus(80);
+    const baseline = computeCalibrationVolumeBaseline(frames, "BTCUSDT");
+    // block [40, 43) length 3, lookback 24 would reach to index 19 without the clamp; clamped it starts at 40.
+    const shortSt = computeTerminalState(frames, 40, 3, baseline, "BTCUSDT", "ETHUSDT", 24);
+    // mutate a candle BEFORE the block (index 30) — must NOT change the clamped terminal state
+    const c = frames[30]!.symbols.BTCUSDT!.candle.value!;
+    const mut = frames.slice();
+    mut[30] = buildCommonMarketFrame({ runId: "c", asOfMs: frames[30]!.asOfMs, symbols: { BTCUSDT: { candle: { ...c, close: c.close * 2, high: c.high * 2 }, source: "t" }, ETHUSDT: { candle: frames[30]!.symbols.ETHUSDT!.candle.value!, source: "t" } }, provenance: "OBSERVED_HISTORICAL" });
+    const shortSt2 = computeTerminalState(mut, 40, 3, baseline, "BTCUSDT", "ETHUSDT", 24);
+    expect(shortSt2.volatilityMedium).toBeCloseTo(shortSt.volatilityMedium, 12);
+    expect(shortSt2.recentReturn).toBeCloseTo(shortSt.recentReturn, 12);
+  });
+
+  it("seam-realism excess CI widens when the natural baseline's uncertainty is bootstrapped (not a constant)", () => {
+    const seams = Array.from({ length: 120 }, (_, i) => ({ rejected: i % 4 === 0, reasons: [] as string[], group: `d${i % 12}` }));
+    const natItems = Array.from({ length: 120 }, (_, i) => ({ value: i % 10 === 0 ? 1 : 0, group: `n${i % 12}` }));
+    const withConst = computeSeamRealism(seams, { rate: 0.1 }, createRng(1, "a"));
+    const withBoot = computeSeamRealism(seams, { rate: 0.1, items: natItems }, createRng(1, "a"));
+    const width = (r: { excessConfidenceInterval: [number, number] }) => r.excessConfidenceInterval[1] - r.excessConfidenceInterval[0];
+    expect(width(withBoot)).toBeGreaterThanOrEqual(width(withConst)); // bootstrapping natural adds uncertainty
   });
 });

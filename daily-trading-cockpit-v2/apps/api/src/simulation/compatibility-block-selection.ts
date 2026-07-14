@@ -39,6 +39,7 @@ export interface ConcentrationReport {
   top1: number; top5: number; top10: number;
   effectiveNumberOfBlocks: number; // (Σn)² / Σn²
   uniqueBlockCoverage: number; // distinct source blocks used / blocks placed
+  overlapAwareCoverage: number; // distinct NON-overlapping regions (bucket=blockLen/2) used / blocks placed
   monthConcentrationMax: number; // largest single-month share
   monthEntropy: number; // Shannon entropy (nats) over source months
   transitionCellConcentrationMax: number; // largest single selected-initial-cell share
@@ -114,10 +115,16 @@ export function selectCompatibilityBlocks(args: SelectArgs): CompatibilitySelect
   let insufficientSeams = 0;
   let placed = 0; let total = 0;
   const geoP = 1 / Math.max(1, args.blockLen);
+  // OVERLAP-aware guard: two starts within `minSep` reconstruct a heavily-overlapping real segment, so the exact-index
+  // guards (maxUse/cooldown/uniqueCoverage/duplicate) would miss near-duplicates. Treat starts within minSep of a
+  // recently-placed start as the same "region" for cooldown purposes.
+  const minSep = Math.max(1, Math.floor(args.blockLen / 2));
 
   const passesConcentration = (start: number, len: number): boolean => {
     if ((useCount.get(start) ?? 0) >= constraints.maxUsePerBlock) return false;
     const la = lastUsedAt.get(start); if (la != null && placed - la < constraints.cooldown) return false;
+    // near-duplicate (overlapping) cooldown: reject if an OVERLAPPING start was placed within the cooldown window.
+    for (const [u, at] of lastUsedAt) { if (Math.abs(start - u) < minSep && placed - at < constraints.cooldown) return false; }
     const mo = monthOf(frames, start);
     const maxForMonth = Math.max(1, Math.ceil((targetLen / Math.max(1, args.blockLen)) * constraints.maxMonthFraction));
     if ((monthCount.get(mo) ?? 0) >= maxForMonth) return false;
@@ -210,19 +217,21 @@ export function selectCompatibilityBlocks(args: SelectArgs): CompatibilitySelect
   }
 
   const status = insufficientSeams > 0 ? "STRESS_TEST_ONLY_INSUFFICIENT_TRANSITION_SUPPORT" : "OK";
-  return { strategy, blocks, seams, insufficientSeams, status, concentration: computeConcentration(blocks, frames, initialStates), fallbackLevelCounts };
+  return { strategy, blocks, seams, insufficientSeams, status, concentration: computeConcentration(blocks, frames, initialStates, args.blockLen), fallbackLevelCounts };
 }
 
 function geometricLen(rng: DeterministicRng, p: number, sourceLen: number): number {
   let len = 1; while (rng.nextFloat() > p && len < sourceLen && len < 240) len += 1; return len;
 }
 
-/** Concentration diagnostics over the placed block sequence. */
-export function computeConcentration(blocks: readonly BlockRef[], frames: readonly CommonMarketFrame[], initialStates: Map<number, BlockTransitionState>): ConcentrationReport {
+/** Concentration diagnostics over the placed block sequence. `blockLen` sizes the overlap-aware region bucket. */
+export function computeConcentration(blocks: readonly BlockRef[], frames: readonly CommonMarketFrame[], initialStates: Map<number, BlockTransitionState>, blockLen: number): ConcentrationReport {
   const use = new Map<number, number>();
   for (const b of blocks) use.set(b.startIndex, (use.get(b.startIndex) ?? 0) + 1);
   const counts = [...use.values()].sort((a, b) => b - a);
   const totalPlaced = blocks.length || 1;
+  const regionSize = Math.max(1, Math.floor(blockLen / 2));
+  const regions = new Set(blocks.map((b) => Math.floor(b.startIndex / regionSize)));
   const share = (k: number) => counts.slice(0, k).reduce((a, v) => a + v, 0) / totalPlaced;
   const sum = counts.reduce((a, v) => a + v, 0); const sumSq = counts.reduce((a, v) => a + v * v, 0);
   const monthUse = new Map<string, number>();
@@ -236,6 +245,7 @@ export function computeConcentration(blocks: readonly BlockRef[], frames: readon
     top1: share(1), top5: share(5), top10: share(10),
     effectiveNumberOfBlocks: sumSq > 0 ? (sum * sum) / sumSq : 0,
     uniqueBlockCoverage: use.size / totalPlaced,
+    overlapAwareCoverage: regions.size / totalPlaced,
     monthConcentrationMax: Math.max(0, ...monthShares),
     monthEntropy,
     transitionCellConcentrationMax: cellMax,
@@ -243,13 +253,14 @@ export function computeConcentration(blocks: readonly BlockRef[], frames: readon
   };
 }
 
-/** Count repeated consecutive start-index subsequences of length ≥ `minLen` (memorization signal). */
+/** Count repeated consecutive start-index subsequences of length ≥ `minLen` (memorization signal). Counts total EXTRA
+ *  occurrences (multiplicity): a pattern seen 3× contributes 2, not 1 — so heavy repetition is not undercounted. */
 export function detectDuplicateSequences(starts: readonly number[], minLen: number): number {
   const seen = new Map<string, number>(); let dup = 0;
   for (let i = 0; i + minLen <= starts.length; i += 1) {
     const key = starts.slice(i, i + minLen).join(",");
     const c = (seen.get(key) ?? 0) + 1; seen.set(key, c);
-    if (c === 2) dup += 1; // count each repeated pattern once
+    if (c >= 2) dup += 1; // every occurrence beyond the first counts (multiplicity)
   }
   return dup;
 }
