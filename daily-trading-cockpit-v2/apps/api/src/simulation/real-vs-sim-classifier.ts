@@ -110,31 +110,55 @@ export function rocAuc(scores: readonly number[], labels: readonly number[]): nu
   return (sumRanksPos - (pos.length * (pos.length + 1)) / 2) / (pos.length * neg.length);
 }
 
+/** AUC with orientation handled: rawAuc keeps the model's score direction; separabilityAuc = max(raw, 1-raw) is the
+ *  ORIENTATION-INVARIANT detectability (a raw AUC near 0 OR near 1 both mean strong separability — the Phase-1B
+ *  0.076 was actually 0.924 separable). The realism GATE must use separabilityAuc. positiveClass = REAL (label 1). */
+export interface OrientedAuc { rawAuc: number | null; orientedAuc: number | null; separabilityAuc: number | null; }
+export function orientAuc(raw: number | null): OrientedAuc {
+  if (raw == null) return { rawAuc: null, orientedAuc: null, separabilityAuc: null };
+  const sep = Math.max(raw, 1 - raw);
+  return { rawAuc: raw, orientedAuc: raw >= 0.5 ? raw : 1 - raw, separabilityAuc: sep };
+}
+
 export interface ClassifierEvaluation {
-  trainAuc: number | null;
-  developmentAuc: number | null;
-  untouchedValidationAuc: number | null;
+  positiveClassDefinition: string;
+  train: OrientedAuc;
+  development: OrientedAuc;
+  untouchedValidation: OrientedAuc;
+  /** feature-ablation separabilityAuc on the development split (which feature groups drive detectability). */
+  ablations: Record<string, number | null>;
   leakage: LeakageReport;
   interpretation: string;
 }
 
-/** Train on calibration, report AUC on each split. The untouched holdout is scored ONCE, never used to tune. */
+const FEATURE_GROUPS: Record<string, number[]> = {
+  returnVol: [0, 1, 2, 3], // mean/std/q05/q95
+  dependenceAcf: [4, 5], // acf1(raw), acf1(abs)
+  tailGeometry: [6, 7, 8], // hillTail, maxDD, tailSpread
+};
+
+/** Train on calibration, report ORIENTED AUCs per split + feature-group ablations. Holdout scored ONCE. */
 export function evaluateClassifier(windows: readonly LabeledWindow[]): ClassifierEvaluation {
   const leakage = checkLeakage(windows);
   const by = (s: ClassifierSplit): LabeledWindow[] => windows.filter((w) => w.split === s);
-  const feats = (ws: LabeledWindow[]): number[][] => ws.map((w) => windowFeatures(w.returns));
   const cal = by("calibration");
-  const aucFor = (model: TrainedClassifier | null, ws: LabeledWindow[]): number | null => {
-    if (!model || ws.length === 0) return null;
-    const scores = ws.map((w) => predictProba(model, windowFeatures(w.returns)));
-    return rocAuc(scores, ws.map((w) => w.label));
+  const trainable = cal.length >= 4 && new Set(cal.map((w) => w.label)).size === 2;
+  const featOf = (w: LabeledWindow, idx?: number[]): number[] => { const f = windowFeatures(w.returns); return idx ? idx.map((i) => f[i]!) : f; };
+  const auc = (idx: number[] | undefined, split: ClassifierSplit): number | null => {
+    if (!trainable) return null;
+    const model = trainLogistic(cal.map((w) => featOf(w, idx)), cal.map((w) => w.label));
+    const ws = by(split); if (ws.length === 0) return null;
+    return rocAuc(ws.map((w) => predictProba(model, featOf(w, idx))), ws.map((w) => w.label));
   };
-  const model = cal.length >= 4 && new Set(cal.map((w) => w.label)).size === 2 ? trainLogistic(feats(cal), cal.map((w) => w.label)) : null;
+  const ablations: Record<string, number | null> = {};
+  for (const [name, idx] of Object.entries(FEATURE_GROUPS)) ablations[name] = orientAuc(auc(idx, "development")).separabilityAuc;
+  ablations.fullFeatureSet = orientAuc(auc(undefined, "development")).separabilityAuc;
   return {
-    trainAuc: aucFor(model, cal),
-    developmentAuc: aucFor(model, by("development")),
-    untouchedValidationAuc: aucFor(model, by("untouched-realism-holdout")),
-    leakage,
-    interpretation: "HIGH validation AUC ⇒ strong evidence the simulator is UNREALISTIC (the classifier can tell them apart). LOW AUC is necessary but NOT sufficient for realism — combine with distributional + stylized-fact metrics.",
+    positiveClassDefinition: "label 1 = REAL market window; label 0 = SIMULATED/bootstrap window",
+    train: orientAuc(auc(undefined, "calibration")),
+    development: orientAuc(auc(undefined, "development")),
+    untouchedValidation: orientAuc(auc(undefined, "untouched-realism-holdout")),
+    ablations, leakage,
+    interpretation: "GATE on separabilityAuc = max(raw,1-raw). HIGH separability ⇒ detectably UNrealistic. LOW separability (~0.5) is necessary but NOT sufficient — combine with distributional + stylized-fact metrics.",
   };
 }

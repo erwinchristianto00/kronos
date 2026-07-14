@@ -126,6 +126,67 @@ export function assembleBootstrapPath(source: readonly CommonMarketFrame[], bloc
   return { method: args.method, frames, blocks: blocks.slice(), stitches, rejectedBoundaries: rejected };
 }
 
+/**
+ * RETURN-SPACE stitching (Phase 2A repair). Rebuilds a CONTINUOUS synchronized price path from the source blocks'
+ * WITHIN-block relative geometry so seams inject NO artificial price-level jump (the Phase-1B defect). For each
+ * candle: the block's first candle opens exactly at the previous GENERATED close (continuity — the seam gap is
+ * removed); subsequent candles preserve the source's within-block open-gap return; every candle's body + wicks are
+ * reconstructed by the source's OWN ratios (open/prevClose, close/open, high/open, low/open) around the new anchored
+ * level. BTC and ETH are reconstructed from the SAME block sequence + candle index, so their contemporaneous return
+ * vectors (and seam behavior) are preserved — dependence is NOT independently normalized away. OHLC invariants hold
+ * by construction (ratios of a valid source candle scaled by a positive anchor). Deterministic. Provenance ⇒
+ * HISTORICAL_BOOTSTRAP.
+ */
+export function assembleReturnSpaceBootstrapPath(source: readonly CommonMarketFrame[], blocks: readonly BlockRef[], args: { runId: string; symbols: string[]; startMs: number; stepMs: number; method: BlockSelectionMethod; tolerances?: StitchTolerances }): BootstrapResult {
+  const frames: CommonMarketFrame[] = [];
+  const stitches: StitchAssessment[] = [];
+  let rejected = 0;
+  const anchor: Record<string, number> = {}; // running GENERATED close per symbol
+  let tOpen = args.startMs;
+  let prevLast: CommonMarketFrame | null = null;
+
+  for (const [bi, block] of blocks.entries()) {
+    const slice = source.slice(block.startIndex, block.startIndex + block.length);
+    if (slice.length === 0) continue;
+    const stitchStartIndex = frames.length;
+    for (let j = 0; j < slice.length; j += 1) {
+      const openTimeMs = tOpen; const closeTimeMs = tOpen + args.stepMs;
+      const symbols: Record<string, SymbolFrameInput> = {};
+      for (const sym of args.symbols) {
+        const sc = slice[j]!.symbols[sym]?.candle.value;
+        if (!sc || !(sc.open > 0) || !(sc.close > 0) || !(sc.high > 0) || !(sc.low > 0)) { symbols[sym] = { candle: null, source: `rspace:${sym}:blk${bi}` }; continue; }
+        const prevGen = anchor[sym];
+        let newOpen: number;
+        if (prevGen === undefined) {
+          newOpen = sc.open; // very first candle of the whole path: start at the real source level
+        } else if (j === 0) {
+          newOpen = prevGen; // SEAM: open at the previous generated close — NO artificial cross-block gap
+        } else {
+          const srcPrev = slice[j - 1]!.symbols[sym]?.candle.value;
+          const openGap = srcPrev && srcPrev.close > 0 ? sc.open / srcPrev.close : 1; // within-block open-gap return
+          newOpen = prevGen * openGap;
+        }
+        const newClose = newOpen * (sc.close / sc.open);
+        const newHigh = newOpen * (sc.high / sc.open);
+        const newLow = newOpen * (sc.low / sc.open);
+        anchor[sym] = newClose;
+        symbols[sym] = { candle: { openTimeMs, closeTimeMs, open: newOpen, high: newHigh, low: newLow, close: newClose, volume: sc.volume }, source: `rspace:${sym}:blk${bi}` };
+      }
+      frames.push(buildCommonMarketFrame({ runId: args.runId, asOfMs: closeTimeMs, symbols, provenance: "HISTORICAL_BOOTSTRAP" }));
+      tOpen = closeTimeMs;
+    }
+    // Seam assessment on the RECONSTRUCTED frames (price gap ≈ 0 by construction — that is the point; a seam is
+    // rejected only if the reconstructed transition is still genuinely implausible, e.g. an extreme first-candle move).
+    if (prevLast && frames.length > stitchStartIndex) {
+      const st = assessStitch(prevLast, frames[stitchStartIndex]!, args.symbols, args.tolerances);
+      stitches.push(st);
+      if (!st.accepted) rejected += 1;
+    }
+    prevLast = frames.at(-1)!;
+  }
+  return { method: args.method, frames, blocks: blocks.slice(), stitches, rejectedBoundaries: rejected };
+}
+
 /** Deterministic FIXED-LENGTH block selection: pick `count` contiguous blocks of exactly `blockLen` frames. */
 export function selectFixedLengthBlocks(sourceLen: number, blockLen: number, count: number, rng: DeterministicRng): BlockRef[] {
   if (blockLen <= 0 || blockLen > sourceLen) throw new Error(`fixed-block: blockLen ${blockLen} invalid for source ${sourceLen}`);

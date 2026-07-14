@@ -153,7 +153,7 @@ async function main() {
 
   // ── Step 12: acceptance gates per method ──
   const acceptance: Record<string, { verdict: "STRESS_TEST_ONLY" | "TRANSFER_TEST_REQUIRED"; reasons: string[] }> = {};
-  const holdoutAuc = classifier.untouchedValidationAuc;
+  const holdoutAuc = classifier.untouchedValidation.rawAuc; // Phase-1B reported raw AUC (separability = max(raw,1-raw))
   for (const spec of BLOCK_METHODS) {
     const mr = methodResults[spec.key] as Record<string, unknown>;
     const reasons: string[] = [];
@@ -170,7 +170,7 @@ async function main() {
     runtimeMs: Date.now() - t0,
     partitions: PARTITIONS, embargoHours: EMBARGO_HOURS, classifierAucMax: CLASSIFIER_AUC_MAX,
     historicalControl, methodResults,
-    classifier: { trainAuc: classifier.trainAuc, developmentAuc: classifier.developmentAuc, untouchedValidationAuc: classifier.untouchedValidationAuc, leakageOverlaps: classifier.leakage.overlappingPairs, classBalance: classifier.leakage.classBalance, volOnlyBaselineAuc: volOnlyAuc, interpretation: classifier.interpretation },
+    classifier: { trainAuc: classifier.train.rawAuc, developmentAuc: classifier.development.rawAuc, untouchedValidationAuc: classifier.untouchedValidation.rawAuc, untouchedSeparabilityAuc: classifier.untouchedValidation.separabilityAuc, leakageOverlaps: classifier.leakage.overlappingPairs, classBalance: classifier.leakage.classBalance, volOnlyBaselineAuc: volOnlyAuc, interpretation: classifier.interpretation },
     acceptance,
     determinismCheck: stableHash(Object.values(methodResults).map((m) => (m as Record<string, unknown>).perSeed)).slice(0, 16),
   };

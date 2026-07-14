@@ -221,7 +221,9 @@ describe("realism", () => {
     for (let i = 0; i < 20; i += 1) windows.push(mk(i % 2 === 0 ? 1 : 0, i % 2 === 0 ? "real" : "sim", i < 14 ? "calibration" : "development", i * 100));
     const ev = evaluateClassifier(windows);
     expect(ev.leakage.overlappingPairs).toBe(0);
-    if (ev.developmentAuc != null) expect(ev.developmentAuc).toBeGreaterThan(0.1);
+    // identical distributions ⇒ separabilityAuc (max(raw,1-raw)) should NOT be high (not detectably separable)
+    if (ev.development.separabilityAuc != null) expect(ev.development.separabilityAuc).toBeLessThan(0.9);
+    expect(ev.development.separabilityAuc == null || ev.development.separabilityAuc >= 0.5).toBe(true);
     // overlap: two windows same origin, different split, overlapping ranges
     const leak = [mk(1, "real", "calibration", 0), mk(1, "real", "untouched-realism-holdout", 30)];
     expect(evaluateClassifier(leak).leakage.overlappingPairs).toBe(1);
