@@ -47,6 +47,14 @@ import {
 import type { AdaptiveLaneRouterReport } from "./adaptive-lane-router.js";
 import type { LiveTradingGateReport } from "./live-trading-gate.js";
 import { recordHeatShadowSnapshot } from "./portfolio-heat-shadow.js";
+import {
+  prepareForwardCausalIdentity,
+  recordForwardOpportunity,
+  recordForwardOutcome,
+  resolveCausalCollectionActivation,
+  withResolvedCausalIdentity,
+  type CausalIdentity,
+} from "../experience-engine/forward-causal-collection.js";
 
 // ─── public enums / type tokens ──────────────────────────────────────────────
 
@@ -355,6 +363,8 @@ export interface PaperOrder {
   provenance?: PaperOrderProvenance | null;
   /** Provenance source fields that were unavailable at admission (persisted as null). */
   provenanceFieldMissing?: string[];
+  /** Forward-only causal identity. Absent on legacy orders and whenever collection mode is off. */
+  causalIdentity?: CausalIdentity | null;
   // ── forward-gate shadow label (report-only OOS validation; NEVER blocks admission) ──
   forwardGateId?: string;
   forwardGateVersion?: number;
@@ -1062,7 +1072,7 @@ function _buildBaseOrder(
     !gateReport.killSwitchReady ||
     !gateReport.orderReconciliationReady ||
     !gateReport.exchangeHealthReady;
-  return _stampForwardGate({
+  const order = _stampForwardGate({
     paperOrderId: `paper-${randomUUID()}`,
     sourceType: "VARIANT_MATRIX_OBSERVATION",
     sourceCandidateId: null,
@@ -1107,6 +1117,9 @@ function _buildBaseOrder(
     reportOnly: true,
     paperOnly: true,
   }, now);
+  const identity = prepareForwardCausalIdentity(order);
+  if (identity) order.causalIdentity = identity;
+  return order;
 }
 
 /**
@@ -1215,6 +1228,8 @@ function admitPaperOrdersInner(inputs: PaperAdmissionInputs): PaperAdmissionResu
     // stamp infraNotReady so the brief is transparent. Live remains blocked.
     order.operationalSafetyStatus = "OK";
     store.add(order);
+    // Exact-ID collection is best-effort only; a journal failure cannot affect admission.
+    recordForwardOpportunity(order);
     result.admitted += 1;
   }
 
@@ -1334,7 +1349,7 @@ function _buildAllocatorOrder(
   const dedupeKey = allocatorDedupeKey(o);
   const riskMultiplier = opportunityRiskMultiplier(o);
   const effectiveRiskPct = RISK_PCT * riskMultiplier;
-  return _stampForwardGate({
+  const order = _stampForwardGate({
     paperOrderId: `paper-${randomUUID()}`,
     sourceType: "SCAN_CANDIDATE_LANE_ALLOCATOR",
     sourceCandidateId: o.sourceCandidateId,
@@ -1390,6 +1405,9 @@ function _buildAllocatorOrder(
     reportOnly: true,
     paperOnly: true,
   }, now);
+  const identity = prepareForwardCausalIdentity(order);
+  if (identity) order.causalIdentity = identity;
+  return order;
 }
 
 // ─── Global HEADLINE concentration caps (anti-correlation safety) ─────────────
@@ -1552,6 +1570,8 @@ export function admitPaperOpportunities(
     }
 
     store.add(order);
+    // Persist the immutable pre-open snapshot only after the incumbent paper store accepted the order.
+    recordForwardOpportunity(order);
     result.admitted += 1;
     if ((order.paperOrderMode ?? "HEADLINE") === "DIAGNOSTIC_ONLY") {
       result.admittedDiagnostic += 1;
@@ -1759,10 +1779,27 @@ export async function resolvePaperOrders(
 ): Promise<{ resolved: number; expired: number; dataFailures: number; errors: number }> {
   store.beginBatch();
   try {
-    return await resolvePaperOrdersInner(store, binanceClient, executionModel, opts);
+    const result = await resolvePaperOrdersInner(store, binanceClient, executionModel, opts);
+    recordForwardCausalResolutions(store);
+    return result;
   } finally {
     store.endBatch();
   }
+}
+
+/**
+ * Forward collection observes already-persisted terminal paper outcomes. It only
+ * stamps the additive lineage outcomeId and appends a report-only event; no
+ * resolver result, risk control, allocation, or exchange action is changed.
+ */
+function recordForwardCausalResolutions(store: PaperExecutionRouterStore): void {
+  if (!resolveCausalCollectionActivation(process.env).active) return;
+  for (const order of store.all) {
+    if (order.paperStatus !== "PAPER_CLOSED_WIN" && order.paperStatus !== "PAPER_CLOSED_LOSS") continue;
+    const identity = withResolvedCausalIdentity(order);
+    if (identity && identity !== order.causalIdentity) store.update(order.paperOrderId, { causalIdentity: identity });
+  }
+  for (const order of store.all) recordForwardOutcome(order);
 }
 
 async function resolvePaperOrdersInner(
