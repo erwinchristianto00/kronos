@@ -534,6 +534,34 @@ describe("SingleSymbolLaneExecutor — entry", () => {
     expect(store.getState().positions.length).toBe(1); // no 2nd position record created at all
   });
 
+  it("[MAX-OPEN-DIAGNOSTIC, 2026-07-19 fix] sets lastEntrySkipReason (instead of silently leaving it null) when the maxOpenPositions cap blocks a fresh candidate", async () => {
+    const { executor, store } = makeExecutor({
+      // maxOpenPositions defaults to 1 in makeExecutor; seed the store directly so the cap is
+      // already at its limit BEFORE tick() runs (no need to spend a tick opening it first).
+      signals: [signal({ observationId: "sf:ETHUSDT:2", symbol: "ETHUSDT" })],
+      legUsd: 10_000,
+    });
+    store.getState().positions.push({
+      positionId: "seed-open", sourceObservationId: "seed-open", symbol: "BTCUSDT", direction: "SHORT", qty: 0.001,
+      entryPrice: 60000, entryOrderId: "1", entryPriceConfirmed: true, stopPrice: 61800, stopAlgoOrderId: "900",
+      stopFailureCount: 0, stopUnprotectedSinceIso: null, closeFailureCount: 0, closeFailureSinceIso: null,
+      peakFavorableR: 0, openedAt: NOW, status: "OPEN", closedAt: null, closeReason: null,
+      exitPrice: null, exitOrderId: null, exitPriceConfirmed: false, grossPnlUsd: null, feeEstimateUsd: 0, netPnlUsd: null,
+    });
+
+    await executor.tick();
+
+    // Property 2: cap behavior itself is unchanged — the fresh ETHUSDT candidate must NOT open.
+    expect(store.getState().positions.filter((p) => p.status === "OPEN").length).toBe(1);
+    expect(store.getState().positions.find((p) => p.symbol === "ETHUSDT")).toBeUndefined();
+
+    // Property 1 (the actual fix): before 2026-07-19, this check "break"-ed with NO reason set,
+    // leaving lastEntrySkipReason null and giving the operator zero diagnostic for why nothing
+    // opened. It must now be a non-null string that names the cap.
+    expect(executor.getStatus().lastEntrySkipReason).not.toBeNull();
+    expect(executor.getStatus().lastEntrySkipReason).toMatch(/max open positions/i);
+  });
+
   it("retries stop placement on a later tick if the first attempt failed (never leaves a position unprotected forever)", async () => {
     const client = new FakeClient();
     client.failAlgoOnce = true;

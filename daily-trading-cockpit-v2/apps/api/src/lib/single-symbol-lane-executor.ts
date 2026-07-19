@@ -952,7 +952,10 @@ export class SingleSymbolLaneExecutor {
     // tick. See the state interface's doc comment for the incident this (plus per-observationId
     // dedup) fixes.
     for (const signal of candidates) {
-      if (st.positions.filter((p) => p.status === "OPEN").length >= this.maxOpenPositionsFn()) break;
+      if (st.positions.filter((p) => p.status === "OPEN").length >= this.maxOpenPositionsFn()) {
+        this.lastEntrySkipReason = `max open positions (${this.maxOpenPositionsFn()}) reached for this lane instance`;
+        break;
+      }
 
       if (exchangePositions.some((p) => p.symbol === signal.symbol && Math.abs(p.positionAmt) > 1e-9)) {
         this.lastEntrySkipReason = `${signal.symbol}: exchange position already exists; refusing one-way-mode netting`;
