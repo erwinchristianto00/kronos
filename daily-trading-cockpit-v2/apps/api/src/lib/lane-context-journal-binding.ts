@@ -194,6 +194,18 @@ export function runResolutionScan(deps: ResolutionScanDeps): ScanResult {
           try { const v = (JSON.parse(line) as { resolvedAtMs?: number }).resolvedAtMs; return typeof v === "number" ? v : null; } catch { return null; }
         });
       } catch { /* fail open — pruning is an optimization, never a correctness dependency */ }
+      // Sibling snapshots journal: rotated the same way (rotateIfNeeded in journalLaneSnapshots) but was NEVER
+      // pruned, so old segments accumulated on disk without bound for the lifetime of shadow mode. Mirror the
+      // resolutions convention exactly, keyed off the snapshot's own `asOfMs` instead of `resolvedAtMs`: a
+      // snapshot can only ever be ATTRIBUTED to an outcome whose openedAtMs is within `ttlMs` AFTER its asOfMs (see
+      // attributeOutcome's TTL_EXPIRED check) — so once the checkpoint watermark shows every outcome up to
+      // (watermark − overlap) has already been processed, any snapshot older than (watermark − overlap − ttlMs)
+      // can no longer be attributed to a future resolution and is safe to drop.
+      try {
+        deps.fs.pruneCoveredSegments(paths.snapshots, plan.nextCheckpoint.highWatermarkResolvedAtMs - deps.overlapWindowMs - deps.ttlMs, (line) => {
+          try { const v = (JSON.parse(line) as { asOfMs?: number }).asOfMs; return typeof v === "number" ? v : null; } catch { return null; }
+        });
+      } catch { /* fail open — pruning is an optimization, never a correctness dependency */ }
     }
     deps.metrics.scansCompleted += 1;
     return { ran: true, reason: "ok", appended: toAppend.length, corrupt: parsed.corrupt };

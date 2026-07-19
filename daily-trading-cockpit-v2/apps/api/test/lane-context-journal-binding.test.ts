@@ -1,10 +1,13 @@
 import { describe, it, expect } from "vitest";
-import { readFileSync } from "node:fs";
+import { readFileSync, mkdtempSync, writeFileSync, existsSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   resolveLaneJournalActivation, laneJournalPaths, runResolutionScan, planSnapshotBatch, snapshotIdFor,
   validateResolutionRecord, emptyScanMetrics, type JournalFs, type ResolutionScanDeps, type LaneContextSnapshotInput,
 } from "../src/lib/lane-context-journal-binding.js";
+import { createProductionJournalFs } from "../src/lib/lane-context-journal-fs.js";
 import type { ClosedOutcomeInput, ResolutionRecord } from "../src/lib/lane-outcome-processor.js";
 import type { LaneContextSnapshot } from "../src/lib/lane-context-journal.js";
 
@@ -171,5 +174,65 @@ describe("binding — validation + snapshot tap", () => {
     expect(src).not.toMatch(/\.(placeOrder|cancelOrder|closePosition|setAllocation|updateFromClosedOrders|resetKill|setKill|rampBeta)\s*\(/);
     const imports = src.split("\n").filter((l) => /^\s*import\b/.test(l)).join("\n");
     expect(imports).not.toMatch(/live-execution-engine|regime-edge-memory|cortex-brain\b|binance/i);
+  });
+});
+
+describe("binding — snapshot journal pruning (REGRESSION: mirrors the resolutions sibling convention)", () => {
+  /**
+   * Before the fix, `runResolutionScan` called `fs.pruneCoveredSegments` ONLY for `paths.resolutions`, never for
+   * `paths.snapshots` — the snapshot journal rotates (rotateIfNeeded in journalLaneSnapshots) but old rotated
+   * segments were NEVER deleted, so they accumulated on disk without bound for the lifetime of shadow mode. This
+   * proves a rotated snapshot segment that is long-covered (its newest asOfMs is well before the checkpoint's
+   * durably-committed watermark, minus the overlap window AND the attribution TTL — i.e. it could no longer be
+   * attributed to ANY future outcome) is now actually deleted from a REAL filesystem, using the exact same
+   * production `pruneCoveredSegments` primitive already proven safe for the resolutions journal.
+   */
+  it("a long-covered rotated snapshot segment is pruned once the checkpoint durably covers it; a fresh active file is retained", () => {
+    const dir = mkdtempSync(join(tmpdir(), "lane-snapshot-prune-"));
+    const { fs: prodFs } = createProductionJournalFs();
+    const paths = laneJournalPaths("3102", dir);
+    prodFs.ensureDir(paths.dir);
+
+    // An OLD rotated snapshot segment (captured long ago) + a FRESH active snapshot file.
+    writeFileSync(`${paths.snapshots}.1`, `${JSON.stringify({ asOfMs: 1_000 })}\n`);
+    writeFileSync(paths.snapshots, `${JSON.stringify({ asOfMs: 9_500_000 })}\n`);
+    expect(existsSync(`${paths.snapshots}.1`)).toBe(true);
+
+    const o = outcome({ resolvedAtMs: 10_000_000, closedAtMs: 9_900_000, openedAtMs: 9_800_000 });
+    const deps: ResolutionScanDeps = {
+      env: SHADOW_3102 as unknown as NodeJS.ProcessEnv, baseDir: dir, fs: prodFs, nowMs: 10_000_000,
+      singleFlightGuard: { inFlight: false }, readOutcomes: () => [o], decisionsFor: () => [], metrics: emptyScanMetrics(),
+      ttlMs: 1_800_000, overlapWindowMs: 300_000, detectionMarginMs: 300_000, maxConsumed: 1000, recoverTailLines: 500, journalMaxBytes: 1_000_000,
+    };
+
+    const r = runResolutionScan(deps);
+    expect(r.ran).toBe(true);
+
+    // safe-before bound = highWatermarkResolvedAtMs(10_000_000) − overlapWindowMs(300_000) − ttlMs(1_800_000) = 7_900_000
+    // the old segment's only asOfMs (1_000) is well below that ⇒ it can never be attributed to a future outcome.
+    expect(existsSync(`${paths.snapshots}.1`)).toBe(false); // pruned
+    expect(existsSync(paths.snapshots)).toBe(true); // fresh active file untouched
+    expect(readFileSync(paths.snapshots, "utf8")).toContain("9500000");
+  });
+
+  it("a RECENT rotated snapshot segment (still within the attribution window) is RETAINED, not deleted", () => {
+    const dir = mkdtempSync(join(tmpdir(), "lane-snapshot-prune-"));
+    const { fs: prodFs } = createProductionJournalFs();
+    const paths = laneJournalPaths("3102", dir);
+    prodFs.ensureDir(paths.dir);
+
+    // Segment's newest asOfMs is only just outside the overlap window but INSIDE the TTL margin ⇒ must be retained.
+    writeFileSync(`${paths.snapshots}.1`, `${JSON.stringify({ asOfMs: 9_600_000 })}\n`);
+
+    const o = outcome({ resolvedAtMs: 10_000_000, closedAtMs: 9_900_000, openedAtMs: 9_800_000 });
+    const deps: ResolutionScanDeps = {
+      env: SHADOW_3102 as unknown as NodeJS.ProcessEnv, baseDir: dir, fs: prodFs, nowMs: 10_000_000,
+      singleFlightGuard: { inFlight: false }, readOutcomes: () => [o], decisionsFor: () => [], metrics: emptyScanMetrics(),
+      ttlMs: 1_800_000, overlapWindowMs: 300_000, detectionMarginMs: 300_000, maxConsumed: 1000, recoverTailLines: 500, journalMaxBytes: 1_000_000,
+    };
+
+    runResolutionScan(deps);
+    // safe-before bound = 7_900_000; segment's asOfMs (9_600_000) ≥ bound ⇒ retained (still possibly needed).
+    expect(existsSync(`${paths.snapshots}.1`)).toBe(true);
   });
 });
