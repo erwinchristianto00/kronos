@@ -2907,6 +2907,14 @@ export class LiveExecutionEngine {
         if (Math.sign(rawAmt) !== Math.sign(amt)) continue;
         const shareFrac = Math.max(0, Math.min(1, amt / rawAmt));
 
+        // 2026-07-19 real-money audit fix (BUG 3): the resting protective stop can be GONE
+        // (triggered-and-partially-filled under thin liquidity, or cancelled/expired without ever
+        // triggering) while the engine share is still nonzero — see
+        // reestablishStopForResidualIfNaked's doc comment for why nothing else in this loop would
+        // otherwise notice a naked residual position.
+        const restop = await this.reestablishStopForResidualIfNaked(intent, amt);
+        if (restop.changed) dirty = true;
+
         const usdTp = await this.maybeCloseOnTestnetUsdTakeProfit(intent, pos, amt, shareFrac);
         if (usdTp.changed) dirty = true;
         if (usdTp.closed) continue;
@@ -3004,6 +3012,83 @@ export class LiveExecutionEngine {
       }
     }
     if (dirty) this.store.save();
+  }
+
+  /**
+   * 2026-07-19 real-money audit fix (BUG 3, MEDIUM): a protective STOP_MARKET can fill PARTIALLY
+   * under thin liquidity — Binance futures STOP_MARKET/market orders are effectively IOC once
+   * triggered, so an unfilled remainder does not keep resting, it simply expires. Before this
+   * existed, the intent's active stop reference (stopOrderId pre-TP1, beStopOrderId once the
+   * runner is on breakeven) then pointed at a dead, no-longer-protecting order while `amt` (the
+   * engine's own remaining share, computed by the caller) was still nonzero — the residual
+   * quantity stayed completely naked until the position eventually hit some OTHER exit path (if
+   * any). Detects exactly that — the active stop is gone from the book (whether it triggered and
+   * only partially filled, or was cancelled/expired without ever triggering — both leave the same
+   * naked residual) — and immediately re-establishes protection for whatever quantity is left,
+   * reusing the same STOP_MARKET placement shape every other stop in this class uses.
+   *
+   * Fail-safe like settleIfStopTriggered's sibling logic in single-symbol-lane-executor.ts: any
+   * query failure or ambiguous/unrecognized status is treated as "still resting" and retried next
+   * tick, never acted on speculatively.
+   */
+  private async reestablishStopForResidualIfNaked(intent: LiveIntent, amt: number): Promise<{ changed: boolean }> {
+    if (Math.abs(amt) < 1e-12) return { changed: false };
+    const activeStopId = intent.state === "TP1_FILLED_BE_SET" ? intent.beStopOrderId : intent.stopOrderId;
+    if (activeStopId === null) return { changed: false };
+
+    let algoStatus = "";
+    let actualOrderId: string | null = null;
+    try {
+      const algo = await this.client.queryAlgoOrder(activeStopId);
+      algoStatus = algo.algoStatus;
+      actualOrderId = algo.actualOrderId;
+    } catch {
+      return { changed: false }; // best-effort — retry next tick rather than act on an unconfirmed read
+    }
+
+    let stopIsGone: boolean;
+    if (actualOrderId === null) {
+      // Never triggered. Only a recognized terminal-without-trigger status means it is genuinely
+      // gone from the book; NEW/WORKING/unrecognized/empty is treated as still resting.
+      const s = algoStatus.trim().toUpperCase();
+      stopIsGone = s === "CANCELED" || s === "CANCELLED" || s === "EXPIRED" || s === "REJECTED";
+    } else {
+      // Triggered — done executing (no more fills coming) is what "no longer protecting" means
+      // here, regardless of whether it closed the full quantity or only part of it.
+      try {
+        const actual = await this.client.queryOrder(intent.symbol, actualOrderId);
+        stopIsGone = actual.status !== "NEW" && actual.status !== "PARTIALLY_FILLED";
+      } catch {
+        return { changed: false }; // retry next tick
+      }
+    }
+    if (!stopIsGone) return { changed: false };
+
+    try {
+      const fresh = await this.client.placeAlgoOrder({
+        symbol: intent.symbol,
+        side: intent.direction === "LONG" ? "SELL" : "BUY",
+        type: "STOP_MARKET",
+        quantity: Math.abs(amt),
+        triggerPrice:
+          intent.state === "TP1_FILLED_BE_SET" ? intent.filledEntryPrice ?? intent.plannedEntryPrice : intent.stopLossPrice,
+        reduceOnly: true,
+        workingType: "CONTRACT_PRICE",
+        clientAlgoId: `dtc-${intent.paperOrderId.slice(-14)}-rs${this.nowIso().replace(/[^0-9]/g, "").slice(-8)}`,
+      });
+      if (intent.state === "TP1_FILLED_BE_SET") intent.beStopOrderId = fresh.algoId;
+      else intent.stopOrderId = fresh.algoId;
+      intent.lastError = null;
+      intent.updatedAt = this.nowIso();
+      return { changed: true };
+    } catch (error) {
+      intent.lastError =
+        `residual stop re-establish failed for ${intent.symbol} (${intent.paperOrderId}) after the ` +
+        `original stop partially filled/expired: ${(error as Error).message} — position is PARTIALLY ` +
+        `UNPROTECTED, retrying next tick`;
+      intent.updatedAt = this.nowIso();
+      return { changed: true };
+    }
   }
 
   private intentHasLiveBreakevenExitLane(intent: LiveIntent): boolean {

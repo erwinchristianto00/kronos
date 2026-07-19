@@ -99,6 +99,10 @@ class FakeLiveClient {
    *  transient error instead of filling — simulates a Binance/network blip during a kill-switch
    *  flatten. Decremented on each throw. */
   failNextReduceOnlyMarketOrders = 0;
+  /** [BUG 3 test support] Per-algoId override for queryAlgoOrder — when set, replaces the default
+   *  "still resting, actualOrderId = itself" stub so a test can simulate a stop that triggered (or
+   *  was cancelled/expired) WITHOUT fully closing the position. */
+  algoOrderOverrides = new Map<string, { algoStatus: string; actualOrderId: string | null }>();
   private nextOrderId = 1000;
 
   async ensureTimeSync(): Promise<void> {
@@ -147,16 +151,17 @@ class FakeLiveClient {
     return [];
   }
   async queryAlgoOrder(_algoId: string): Promise<FuturesAlgoOrder> {
+    const override = this.algoOrderOverrides.get(_algoId);
     return {
       symbol: "ETHUSDT",
       algoId: _algoId,
       clientAlgoId: "",
-      algoStatus: "NEW",
+      algoStatus: override?.algoStatus ?? "NEW",
       orderType: "STOP_MARKET",
       side: "BUY",
       quantity: 0,
       triggerPrice: 0,
-      actualOrderId: _algoId,
+      actualOrderId: override ? override.actualOrderId : _algoId,
     };
   }
   async queryOrder(symbol: string, orderId: string): Promise<FuturesOrder> {
@@ -4822,5 +4827,61 @@ describe("[BUG 2] rescue flip: single real P&L across multiple opposing intents"
     // FIX: the ledger sees the single real P&L exactly once.
     expect(store.getState().totalRealizedPnlUsd).toBeCloseTo(totalBefore - 10, 6);
     expect(store.getState().consecutiveLosses).toBe(1);
+  });
+});
+
+// ── 2026-07-19 real-money audit fix (BUG 3) ─────────────────────────────────
+
+describe("[BUG 3] partial protective-stop fill re-establishes protection for the residual", () => {
+  it("places a fresh STOP_MARKET for the residual quantity when the resting stop is gone but the position isn't fully flat", async () => {
+    const order = paperOrder(); // SHORT ETHUSDT, entry 2000, stop 2100
+    const client = new FakeLiveClient();
+    const { engine, store } = makeEngine({ client, paper: makePaperStore([order]) });
+    await engine.arm();
+    await engine.tick(); // opens the intent + places the initial protective stop
+
+    const intent = store.getState().intents[0]!;
+    const originalStopId = intent.stopOrderId!;
+    expect(originalStopId).toBeTruthy();
+    const fullQty = intent.qty;
+    expect(client.positionsBySymbol.get("ETHUSDT")).toBeCloseTo(-fullQty, 6);
+
+    // Simulate: the stop TRIGGERED but only PARTIALLY filled under thin liquidity (a real,
+    // documented Binance behavior — STOP_MARKET becomes a taker MARKET order once triggered, and an
+    // unfilled remainder does not keep resting). 40% of the qty closed, 60% remains, and the stop's
+    // own order is now terminal (EXPIRED) — no longer resting/protecting anything.
+    const residualQty = Number((fullQty * 0.6).toFixed(6));
+    client.positionsBySymbol.set("ETHUSDT", -residualQty);
+    client.algoOrderOverrides.set(originalStopId, { algoStatus: "EXPIRED", actualOrderId: "9001" });
+    client.orderStatusById.set("9001", "EXPIRED"); // the triggered market order is done executing — no more fills coming
+
+    await engine.tick(); // manageLifecycle must notice the residual is naked and re-protect it
+
+    // FAIL-WITHOUT-FIX: nothing re-queries the stop's own status once placed, so the intent would
+    // stay OPEN pointing at the now-dead stopOrderId with the residual quantity completely naked.
+    const freshStop = client.placed.find(
+      (p) => p.type === "STOP_MARKET" && p.reduceOnly && Math.abs(p.quantity - residualQty) < 1e-6,
+    );
+    expect(freshStop).toBeTruthy(); // FIX: a new protective stop was placed for the residual qty
+    const updated = store.getState().intents[0]!;
+    expect(updated.stopOrderId).not.toBe(originalStopId); // FIX: the intent now points at the fresh stop
+    expect(updated.state).toBe("OPEN"); // still open (correctly not settled — it isn't fully flat)
+  });
+
+  it("does nothing when the stop is still genuinely resting (no false positives)", async () => {
+    const order = paperOrder();
+    const client = new FakeLiveClient();
+    const { engine, store } = makeEngine({ client, paper: makePaperStore([order]) });
+    await engine.arm();
+    await engine.tick(); // opens the intent
+
+    const intent = store.getState().intents[0]!;
+    const originalStopId = intent.stopOrderId!;
+    const placedBefore = client.placed.length;
+
+    await engine.tick(); // stop is untouched (default fake: algoStatus "NEW", actualOrderId = itself → treated as still resting since its actual order defaults to status "NEW")
+
+    expect(client.placed.length).toBe(placedBefore); // no new stop placed
+    expect(store.getState().intents[0]!.stopOrderId).toBe(originalStopId);
   });
 });
