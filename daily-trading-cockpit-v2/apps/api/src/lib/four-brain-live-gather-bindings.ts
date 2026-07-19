@@ -390,9 +390,19 @@ export function buildFourBrainGatherInput(dep: FourBrainBindingDeps): FourBrainG
   };
 }
 
-/** Resolve a stable instance id from the runtime (PORT distinguishes 3101/3102/3103; journal paths keyed by it). */
+/** The default serving port this codebase's OWN server.ts falls back to when PORT is unset
+ *  (`const port = Number(process.env.PORT ?? 3101)` in apps/api/src/server.ts). Kept in lockstep here so a
+ *  missing PORT env var can NEVER again silently resolve to an unrecognized id (e.g. "unknown") that isn't
+ *  in FOUR_BRAIN_DEFAULT_INSTANCE_ALLOWLIST — that exact fragility once fail-closed EVERY instance-scoped
+ *  four-brain feature (collection, shadow tick, lane-context journal) on the main/research instance for its
+ *  entire lifetime, discovered only because the operator noticed collection was silently disabled. */
+export const FOUR_BRAIN_DEFAULT_PORT = "3101";
+
+/** Resolve a stable instance id from the runtime (PORT distinguishes 3101/3102/3103; journal paths keyed by
+ *  it). Falls back to FOUR_BRAIN_DEFAULT_PORT — NEVER "unknown" — when PORT is unset, so this always agrees
+ *  with the port server.ts will actually bind to. */
 export function resolveFourBrainInstanceId(env: NodeJS.ProcessEnv = process.env): string {
-  return (env.FOUR_BRAIN_INSTANCE_ID ?? env.PORT ?? "unknown").toString();
+  return (env.FOUR_BRAIN_INSTANCE_ID ?? env.PORT ?? FOUR_BRAIN_DEFAULT_PORT).toString();
 }
 
 /** Instances the shadow tick may EVER run on. Default 3101 (research) + 3102 (testnet) ONLY — the live

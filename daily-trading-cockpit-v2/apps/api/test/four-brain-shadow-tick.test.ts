@@ -251,6 +251,19 @@ describe("Four-Brain incumbent parity", () => {
     expect(resolveFourBrainInstanceId({ FOUR_BRAIN_INSTANCE_ID: "live" } as NodeJS.ProcessEnv)).toBe("live");
   });
 
+  // Regression (2026-07-19): a missing PORT env var used to resolve to "unknown" — NOT in
+  // FOUR_BRAIN_DEFAULT_INSTANCE_ALLOWLIST — which silently fail-closed every instance-scoped four-brain
+  // feature (collection, shadow tick, lane-context journal) on any instance that never explicitly set PORT,
+  // exactly like the main/research instance whose PORT was unset for its entire lifetime. It must instead
+  // agree with server.ts's own default (`Number(process.env.PORT ?? 3101)`).
+  it("resolveFourBrainInstanceId falls back to server.ts's OWN default port (3101), never 'unknown', when PORT is unset", () => {
+    expect(resolveFourBrainInstanceId({} as NodeJS.ProcessEnv)).toBe("3101");
+    expect(resolveFourBrainInstanceId({} as NodeJS.ProcessEnv)).not.toBe("unknown");
+    // and that default is consequential: it lands inside the default instance allowlist, so an instance
+    // that never set PORT is no longer silently excluded from every gated four-brain feature.
+    expect(fourBrainInstanceAllowed({} as NodeJS.ProcessEnv)).toBe(true);
+  });
+
   it("instance allowlist permits 3101/3102 and HARD-BLOCKS live 3103 (even if allowlisted)", () => {
     expect(fourBrainInstanceAllowed({ PORT: "3101" } as NodeJS.ProcessEnv)).toBe(true);
     expect(fourBrainInstanceAllowed({ PORT: "3102" } as NodeJS.ProcessEnv)).toBe(true);
