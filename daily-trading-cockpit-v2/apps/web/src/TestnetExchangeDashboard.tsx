@@ -793,7 +793,7 @@ function SingleSymbolPriceTimelineChart({ data }: { data: SingleSymbolPriceTimel
   const toneFor = (directive: string) => directive === 'ENTER_LONG' ? '#5ce4a6' : directive === 'ENTER_SHORT' ? '#ff6b6b' : '#f0b54b';
   const signedPct = (value: number) => `${value >= 0 ? '+' : ''}${(value * 100).toFixed(2)}%`;
   return (
-    <div className="testnet-chart-wrap">
+    <div className="testnet-price-timeline-list">
       {rows.map((row) => {
         if (!row.available || row.points.length < 2 || row.price == null) {
           return <div className="testnet-chart-empty" key={row.symbol}><strong>{row.symbol}: timeline unavailable</strong><p>{row.reason ?? 'Waiting for candle data.'}</p></div>;
