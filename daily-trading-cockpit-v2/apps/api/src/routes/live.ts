@@ -10,6 +10,7 @@ import type { FastifyInstance } from "fastify";
 import type { LiveExecutionEngine } from "../lib/live-execution-engine.js";
 import { type CrossSectionalExecutor } from "../lib/cross-sectional-executor.js";
 import type { SingleSymbolLaneExecutor } from "../lib/single-symbol-lane-executor.js";
+import type { SingleSymbolPriceTimelineService } from "../lib/single-symbol-price-timeline.js";
 import { REGIME_AUTOPILOT_PRESETS, type RegimeAutopilot } from "../lib/regime-autopilot.js";
 import { getShortFadeStore, buildShortFadeReport, SF_PAPER_LANE_ID } from "../lib/short-fade-edge.js";
 import { getIntradayMomentumStore, buildIntradayMomentumReport, IM_PAPER_LANE_ID } from "../lib/intraday-momentum-edge.js";
@@ -567,6 +568,7 @@ export async function registerLiveRoutes(
     regimeAutopilot?: () => RegimeAutopilot | null;
     unifiedOrchestrator?: () => UnifiedTestnetOrchestrator | null;
     unifiedProposalStore?: () => UnifiedTestnetProposalStore | null;
+    singleSymbolPriceTimeline?: () => SingleSymbolPriceTimelineService | null;
   } = {},
 ): Promise<void> {
   const allCrossSectionalExecutors = () =>
@@ -600,6 +602,17 @@ export async function registerLiveRoutes(
       unifiedOrchestrator: opts.unifiedOrchestrator?.()?.getStatus() ?? null,
       unifiedProposalSource: opts.unifiedProposalStore?.()?.getStatus() ?? null,
     };
+  });
+
+  // Shared BTC/ETH/SOL price timeline for the operator and the optional single-symbol execution
+  // overlay. The service uses public candles only; no account or order action happens on GET.
+  app.get("/api/live/single-symbol-timeline", async (_request, reply) => {
+    const timeline = opts.singleSymbolPriceTimeline?.() ?? null;
+    if (!timeline) {
+      reply.code(503);
+      return { enabled: false, reason: "single-symbol timeline unavailable because live market runtime is disabled" };
+    }
+    return { enabled: true, ...(await timeline.getSnapshot()) };
   });
 
   app.post("/api/live/arm", async (request, reply) => {

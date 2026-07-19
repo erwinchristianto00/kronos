@@ -172,6 +172,10 @@ function makeExecutor(opts: {
   existingNotionalForSymbol?: (symbol: string) => number;
   maxNotionalPerSymbolAcrossLanes?: number;
   currentPrice?: number | null;
+  sharedGetPositions?: () => ReturnType<FakeClient["getPositions"]>;
+  tryClaimEntrySymbol?: (symbol: string) => boolean;
+  releaseEntrySymbol?: (symbol: string) => void;
+  timelineEntryGate?: (signal: SingleSymbolFreshSignal, direction: "LONG" | "SHORT") => Promise<{ allowed: boolean; reason: string | null }>;
 } = {}) {
   const client = opts.client ?? new FakeClient();
   const storeDir = tmpDir();
@@ -196,6 +200,10 @@ function makeExecutor(opts: {
     existingNotionalForSymbol: opts.existingNotionalForSymbol ?? (() => 0),
     maxNotionalPerSymbolAcrossLanes: () => opts.maxNotionalPerSymbolAcrossLanes ?? 0,
     ...(opts.currentPrice !== undefined ? { currentPrice: async () => opts.currentPrice! } : {}),
+    ...(opts.sharedGetPositions ? { sharedGetPositions: opts.sharedGetPositions } : {}),
+    ...(opts.tryClaimEntrySymbol ? { tryClaimEntrySymbol: opts.tryClaimEntrySymbol } : {}),
+    ...(opts.releaseEntrySymbol ? { releaseEntrySymbol: opts.releaseEntrySymbol } : {}),
+    ...(opts.timelineEntryGate ? { timelineEntryGate: opts.timelineEntryGate } : {}),
   });
   return { executor, client, store, storeDir };
 }
@@ -256,6 +264,18 @@ describe("makeMfeGivebackExitPolicy (INTRADAY_MOMENTUM_BREAKOUT geometry)", () =
 });
 
 describe("SingleSymbolLaneExecutor — entry", () => {
+  it("[TIMELINE-GATE] keeps a fresh signal retryable while the BTC/ETH/SOL timeline says WAIT", async () => {
+    const sig = signal();
+    const { executor, client, store } = makeExecutor({
+      signals: [sig],
+      timelineEntryGate: async () => ({ allowed: false, reason: "BTCUSDT: timeline WAIT" }),
+    });
+    await executor.tick();
+    expect(client.placed).toHaveLength(0);
+    expect(store.getState().attemptedObservationIds ?? []).not.toContain(sig.observationId);
+    expect(executor.getStatus().lastEntrySkipReason).toContain("timeline WAIT");
+  });
+
   it("opens a position from a fresh signal, sized from legUsd/allocation weight, and places a protective stop immediately (same tick, 2026-07-12 fix)", async () => {
     // legUsd effective = 120,000 * 50% = 60,000; entry 60,000 -> qty = 1.0 exactly (stepSize 0.001).
     const { executor, client, store } = makeExecutor({ signals: [signal()], legUsd: 120_000, laneWeightPct: 50 });
@@ -290,15 +310,70 @@ describe("SingleSymbolLaneExecutor — entry", () => {
     expect(store.getState().positions[0]!.status).toBe("OPEN");
   });
 
-  it("[LEVERAGE-SKIP, 2026-07-12 fix] never calls setLeverage on a symbol that already has ANY open position (e.g. owned by a sibling executor)", async () => {
+  it("[ONE-WAY-NETTING, 2026-07-16 fix] refuses to open against an existing exchange position owned by another lane", async () => {
     const client = new FakeClient();
     client.positionAmtBySymbol.set("BTCUSDT", 0.02); // a real exchange position already exists
     const { executor, store } = makeExecutor({ client, signals: [signal()], legUsd: 10_000 });
     await executor.tick();
-    expect(store.getState().positions.length).toBe(1); // this executor's own entry still opens
-    // setLeverage must never have been called — a sibling's real position is on this symbol, and
-    // changing leverage would silently move ITS liquidation price.
+    expect(store.getState().positions.length).toBe(0);
+    // In Binance one-way mode, an opposite entry would reduce or reverse the sibling's position.
+    // Skipping it is safer than merely preserving the sibling's leverage.
     expect(client.setLeverageCalls).toEqual([]);
+  });
+
+  it("[ONE-WAY-NETTING RACE] serializes sibling entries when their shared position cache is stale-flat", async () => {
+    const client = new FakeClient();
+    const claims = new Set<string>();
+    const tryClaimEntrySymbol = (symbol: string) => {
+      if (claims.has(symbol)) return false;
+      claims.add(symbol);
+      return true;
+    };
+    const releaseEntrySymbol = (symbol: string) => { claims.delete(symbol); };
+    // Simulates the 30-second shared monitor cache immediately before either executor opens.
+    const sharedGetPositions = async () => [];
+    const long = makeExecutor({
+      client,
+      direction: "LONG",
+      signals: [signal({ observationId: "race:BTC:long", stopPrice: 58200 })],
+      legUsd: 10_000,
+      sharedGetPositions,
+      tryClaimEntrySymbol,
+      releaseEntrySymbol,
+    });
+    const short = makeExecutor({
+      client,
+      direction: "SHORT",
+      signals: [signal({ observationId: "race:BTC:short" })],
+      legUsd: 10_000,
+      sharedGetPositions,
+      tryClaimEntrySymbol,
+      releaseEntrySymbol,
+    });
+
+    await Promise.all([long.executor.tick(), short.executor.tick()]);
+
+    expect(client.placed).toHaveLength(1);
+    expect(long.store.getState().positions.length + short.store.getState().positions.length).toBe(1);
+    expect(claims.size).toBe(0);
+  });
+
+  it("[ONE-WAY-NETTING FRESH CHECK] refuses an entry when a position appears after the shared cache was read", async () => {
+    const client = new FakeClient();
+    client.positionAmtBySymbol.set("BTCUSDT", 0.02);
+    const { executor, store } = makeExecutor({
+      client,
+      signals: [signal()],
+      legUsd: 10_000,
+      // The monitor cache is stale, but entry admission must use client.getPositions(symbol).
+      sharedGetPositions: async () => [],
+    });
+
+    await executor.tick();
+
+    expect(store.getState().positions).toHaveLength(0);
+    expect(client.placed).toHaveLength(0);
+    expect(executor.getStatus().lastEntrySkipReason).toMatch(/fresh exchange position/);
   });
 
   it("skips a too-small notional that rounds to zero qty (below minQty)", async () => {

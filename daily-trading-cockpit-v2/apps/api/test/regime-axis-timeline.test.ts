@@ -120,8 +120,16 @@ describe("regime-axis projection + lane-switch guidance", () => {
     expect(t.guidance!.direction).toBe("MENUJU_NETRAL");
     expect(t.guidance!.switchAtScore).toBe(-0.12);
     expect(t.guidance!.etaToSwitchHours).toBeGreaterThan(0); // (−0.12 − −0.3)/0.05 ≈ 3.6h
-    expect(t.projection.length).toBe(12);
-    expect(t.projection[0]!.score).toBeGreaterThan(-0.3); // extrapolates upward
+    expect(t.projection.length).toBe(3); // explicit 1h / 3h / 6h forecast horizons
+    expect(t.forecast.horizons.map((h) => h.hours)).toEqual([1, 3, 6]);
+    expect(t.projection[0]!.score).toBeGreaterThan(-0.3); // forecast still recognizes recovery
+    expect(t.forecast.confidence).toBe("LOW"); // only seven rows: do not manufacture certainty
+    for (const h of t.forecast.horizons) {
+      expect(h.lowerScore).toBeLessThanOrEqual(h.expectedScore);
+      expect(h.upperScore).toBeGreaterThanOrEqual(h.expectedScore);
+      expect(h.bullProbability + h.neutralProbability + h.bearProbability).toBeCloseTo(1, 8);
+      expect(Math.max(h.bullProbability, h.neutralProbability, h.bearProbability)).toBeLessThan(1);
+    }
   });
 
   it("bear + moving AWAY from neutral: FAST_SHORT with NO switch eta", () => {
@@ -136,5 +144,20 @@ describe("regime-axis projection + lane-switch guidance", () => {
     expect(t.guidance!.holdLane).toBe("CROSS_SECTIONAL_MARKET_NEUTRAL");
     expect(t.guidance!.switchToLane).toBe("CG_WIDE_FAST_LONG");
     expect(t.guidance!.switchAtScore).toBe(0.12);
+  });
+
+  it("uses completed historical successors as analogs without hiding the sample count", () => {
+    const scores = Array.from({ length: 120 }, (_, i) => {
+      const cycle = i % 24;
+      return Math.sin((cycle / 24) * Math.PI * 2) * 0.65;
+    });
+    const t = buildRegimeAxisTimeline(mk(scores));
+    expect(t.forecast.available).toBe(true);
+    expect(t.forecast.horizons).toHaveLength(3);
+    expect(Math.max(...t.forecast.horizons.map((h) => h.analogCount))).toBeGreaterThanOrEqual(8);
+    expect(t.forecast.horizons.find((h) => h.hours === 6)!.analogCount).toBeLessThan(t.forecast.horizons.find((h) => h.hours === 1)!.analogCount);
+    expect(t.forecast.slopeAgreement).toBeGreaterThanOrEqual(0);
+    expect(t.forecast.slopeAgreement).toBeLessThanOrEqual(1);
+    expect(t.smoothedPoints).toHaveLength(t.points.length);
   });
 });

@@ -102,6 +102,7 @@ import { computeExternalManagedNetQty, computeNotionalPerSymbol, maxNotionalPerS
 import { RegimeAutopilot, isRegimeAutopilotEnabled } from "./lib/regime-autopilot.js";
 import { getRegimeEngineStore } from "./lib/regime-engine-service.js";
 import { buildRegimeAxisTimeline } from "./lib/regime-axis-timeline.js";
+import { SingleSymbolPriceTimelineService } from "./lib/single-symbol-price-timeline.js";
 import {
   LiveExecutionEngine,
   LiveExecutionStore,
@@ -263,6 +264,10 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
   let regimeAutopilot: RegimeAutopilot | null = null;
   let unifiedOrchestrator: UnifiedTestnetOrchestrator | null = null;
   let unifiedProposalStore: UnifiedTestnetProposalStore | null = null;
+  // One shared BTC/ETH/SOL timeline for the dashboard and every single-symbol executor. The
+  // optional execution overlay is opt-in per environment; the data endpoint remains available in
+  // either mode so an operator can inspect exactly what would have been allowed.
+  let singleSymbolPriceTimeline: SingleSymbolPriceTimelineService | null = null;
 
   // 2026-07-09 fix, widened 2026-07-11: the SHARED single source of truth for "every single-symbol
   // / cross-sectional executor instance that exists" — consumed by the per-symbol notional cap
@@ -333,6 +338,10 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       if (book.ask !== null && book.ask > 0) return book.ask;
       return null;
     };
+    singleSymbolPriceTimeline = new SingleSymbolPriceTimelineService(
+      (symbol, interval, limit) => binanceClient.getCandles(symbol, interval, limit),
+      { enabledForExecution: process.env.SINGLE_SYMBOL_TIMELINE_EXEC_ENABLED === "1" },
+    );
     // 2026-07-12 fix: every executor sharing this ONE netted account (3 CrossSectionalExecutor +
     // up to 8 SingleSymbolLaneExecutor instances) independently called client.getPositions() every
     // tick purely to read market-wide markPrice data — up to 11 redundant signed, account-wide
@@ -347,6 +356,27 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         cachedPositions = { at: now, promise: liveClient.getPositions() };
       }
       return cachedPositions.promise;
+    };
+    // Binance USD-M runs in one-way mode: a BUY from one lane can reduce or reverse a SELL from
+    // another lane on the same symbol. Monitoring may share the cache above, but entry admission
+    // needs a synchronous per-symbol claim plus the executor's direct final exchange recheck.
+    const entrySymbolsInFlight = new Set<string>();
+    const singleSymbolEntryClaims = {
+      tryClaimEntrySymbol: (symbol: string) => {
+        if (entrySymbolsInFlight.has(symbol)) return false;
+        entrySymbolsInFlight.add(symbol);
+        return true;
+      },
+      releaseEntrySymbol: (symbol: string) => {
+        entrySymbolsInFlight.delete(symbol);
+        // The direct entry check may have discovered a new position. Do not let the shared
+        // monitoring snapshot keep reporting the pre-entry flat account for another 30 seconds.
+        cachedPositions = null;
+      },
+      timelineEntryGate: (signal: { symbol: string }, direction: "LONG" | "SHORT") =>
+        singleSymbolPriceTimeline?.entryGate(signal.symbol, direction) ?? Promise.resolve({ allowed: true, reason: null }),
+      timelineExitGate: (symbol: string, direction: "LONG" | "SHORT") =>
+        singleSymbolPriceTimeline?.exitGate(symbol, direction) ?? Promise.resolve({ shouldExit: false, reason: null }),
     };
     const unifiedRegimeEntryGate = () => {
       if (unifiedOrchestrator?.isEnabled() && !unifiedOrchestrator.canOpenNewEntries()) {
@@ -1015,6 +1045,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         maxNotionalPerSymbolAcrossLanes,
         currentPrice: currentPublicPrice,
         sharedGetPositions,
+        ...singleSymbolEntryClaims,
       });
       if (!isTest) {
         const sfTick = () => void shortFadeExecutor?.tick();
@@ -1052,6 +1083,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         maxNotionalPerSymbolAcrossLanes,
         currentPrice: currentPublicPrice,
         sharedGetPositions,
+        ...singleSymbolEntryClaims,
       });
       if (!isTest) {
         const imTick = () => void intradayMomentumExecutor?.tick();
@@ -1102,6 +1134,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         maxNotionalPerSymbolAcrossLanes,
         currentPrice: currentPublicPrice,
         sharedGetPositions,
+        ...singleSymbolEntryClaims,
       });
       if (!isTest) {
         const rcTick = () => void regimeCompositeExecutor?.tick();
@@ -1144,6 +1177,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         maxNotionalPerSymbolAcrossLanes,
         currentPrice: currentPublicPrice,
         sharedGetPositions,
+        ...singleSymbolEntryClaims,
       });
       if (!isTest) {
         const pwrTick = () => void panicWashoutExecutor?.tick();
@@ -1202,6 +1236,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           maxNotionalPerSymbolAcrossLanes,
           currentPrice: currentPublicPrice,
           sharedGetPositions,
+          ...singleSymbolEntryClaims,
         });
       };
       compositeEstimatorWideLongExecutor = buildCompositeEstimatorExecutor("WIDE_LONG", "LONG", "composite-estimator-wide-long-executor.json", () => compositeEstimatorWideLongExecutor);
@@ -1472,6 +1507,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     regimeAutopilot: () => regimeAutopilot,
     unifiedOrchestrator: () => unifiedOrchestrator,
     unifiedProposalStore: () => unifiedProposalStore,
+    singleSymbolPriceTimeline: () => singleSymbolPriceTimeline,
   });
 
   return app;

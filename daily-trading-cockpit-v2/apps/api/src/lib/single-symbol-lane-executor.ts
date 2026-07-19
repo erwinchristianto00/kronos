@@ -79,6 +79,11 @@ export interface SingleSymbolExitDecision {
 
 export type SingleSymbolExitPolicy = (ctx: SingleSymbolExitContext) => SingleSymbolExitDecision;
 
+/** Optional asynchronous execution overlay. It may only veto a fresh entry or request an orderly
+ * exit; it never places an order itself and the lane's exchange-side STOP_MARKET stays in force. */
+export type SingleSymbolTimelineEntryGate = (signal: SingleSymbolFreshSignal, direction: "LONG" | "SHORT") => Promise<{ allowed: boolean; reason: string | null }>;
+export type SingleSymbolTimelineExitGate = (symbol: string, direction: "LONG" | "SHORT") => Promise<{ shouldExit: boolean; reason: string | null }>;
+
 function favorableR(direction: "LONG" | "SHORT", entryPrice: number, stopPrice: number, currentPrice: number): number {
   const risk = Math.abs(entryPrice - stopPrice);
   if (!(risk > 0)) return 0;
@@ -263,6 +268,10 @@ export interface SingleSymbolLaneExecutorOptions {
    *  exposure; it lets a central directional/risk controller bank or hard-cut legacy positions
    *  while this executor remains responsible for its own netting-aware close and stop lifecycle. */
   portfolioExitPolicy?: SingleSymbolExitPolicy;
+  /** BTC/ETH/SOL multi-indicator timeline overlay. Optional and additive: its absence preserves
+   * the historical executor behavior exactly. */
+  timelineEntryGate?: SingleSymbolTimelineEntryGate;
+  timelineExitGate?: SingleSymbolTimelineExitGate;
   /** Master permission gate. Testnet: () => true. Mainnet: () => engine.isArmed(). */
   isAllowed: () => boolean;
   /** 2026-07-12: optional human-readable reason surfaced in getStatus() when a NON-obvious gate
@@ -315,6 +324,11 @@ export interface SingleSymbolLaneExecutorOptions {
    *  (unchanged behavior) — callers that wire a shared short-TTL cache across sibling instances
    *  (see app.ts's sharedGetPositions) cut this down to one signed call per cache window. */
   sharedGetPositions?: () => ReturnType<SingleSymbolExecClient["getPositions"]>;
+  /** Atomic account-wide claim for an in-flight entry. Prevents sibling executors from sending
+   * opposing orders against the same netted Binance symbol after observing stale cached state. */
+  tryClaimEntrySymbol?: (symbol: string) => boolean;
+  /** Releases an entry-symbol claim after every success, rejection, or failure path. */
+  releaseEntrySymbol?: (symbol: string) => void;
 }
 
 /** Store never capped closed/aborted positions, growing forever. Keeps every OPEN position
@@ -331,6 +345,8 @@ export class SingleSymbolLaneExecutor {
   private readonly getOpenSignals: () => SingleSymbolFreshSignal[];
   private readonly exitPolicy: SingleSymbolExitPolicy;
   private readonly portfolioExitPolicy: SingleSymbolExitPolicy | null;
+  private readonly timelineEntryGate: SingleSymbolTimelineEntryGate | null;
+  private readonly timelineExitGate: SingleSymbolTimelineExitGate | null;
   private readonly isAllowed: () => boolean;
   private readonly isAllowedReasonFn: () => string | null;
   private readonly laneWeightPctFn: () => number;
@@ -346,6 +362,8 @@ export class SingleSymbolLaneExecutor {
   private readonly currentPriceFn: ((symbol: string) => Promise<number | null>) | null;
   private readonly maxEntryChaseStopFractionFn: () => number;
   private readonly sharedGetPositions: () => ReturnType<SingleSymbolExecClient["getPositions"]>;
+  private readonly tryClaimEntrySymbol: (symbol: string) => boolean;
+  private readonly releaseEntrySymbol: (symbol: string) => void;
   private ticking = false;
   /** 2026-07-11 real-money audit fix: closePosition()'s `pos.exitOrderId !== null` reentry guard
    *  is TOCTOU-vulnerable — exitOrderId isn't set until AFTER the awaited cancelAlgoOrder/placeOrder
@@ -367,6 +385,8 @@ export class SingleSymbolLaneExecutor {
     this.getOpenSignals = opts.getOpenSignals;
     this.exitPolicy = opts.exitPolicy;
     this.portfolioExitPolicy = opts.portfolioExitPolicy ?? null;
+    this.timelineEntryGate = opts.timelineEntryGate ?? null;
+    this.timelineExitGate = opts.timelineExitGate ?? null;
     this.isAllowed = opts.isAllowed;
     this.isAllowedReasonFn = opts.isAllowedReason ?? (() => null);
     this.laneWeightPctFn = opts.laneWeightPct ?? (() => 100);
@@ -385,6 +405,8 @@ export class SingleSymbolLaneExecutor {
       return Number.isFinite(n) && n >= 0 ? n : 0.2;
     });
     this.sharedGetPositions = opts.sharedGetPositions ?? (() => this.client.getPositions());
+    this.tryClaimEntrySymbol = opts.tryClaimEntrySymbol ?? (() => true);
+    this.releaseEntrySymbol = opts.releaseEntrySymbol ?? (() => {});
   }
 
   private async resolveFillPrice(symbol: string, orderId: string, initialAvgPrice: number, fallbackPrice: number) {
@@ -762,7 +784,20 @@ export class SingleSymbolLaneExecutor {
         ...exitContext,
         peakFavorableR: portfolioDecision?.nextPeakFavorableR ?? exitContext.peakFavorableR,
       });
-      const decision = portfolioDecision?.shouldExit ? portfolioDecision : laneDecision;
+      let decision = portfolioDecision?.shouldExit ? portfolioDecision : laneDecision;
+      // A timeline reversal may bank/cut a position only after the lane's own risk/TP rule has
+      // declined to exit. A timeline fetch failure is fail-open for exits: the protective stop and
+      // established lane policy keep managing the real position rather than a stale chart closing it.
+      if (!decision.shouldExit && this.timelineExitGate) {
+        try {
+          const timeline = await this.timelineExitGate(pos.symbol, pos.direction);
+          if (timeline.shouldExit) {
+            decision = { shouldExit: true, reason: timeline.reason ?? "TIMELINE_REVERSAL", nextPeakFavorableR: laneDecision.nextPeakFavorableR };
+          }
+        } catch {
+          // Timeline is an overlay, never a reason to interrupt established exit management.
+        }
+      }
       pos.peakFavorableR = decision.nextPeakFavorableR;
       stamped = true;
       if (decision.shouldExit) {
@@ -900,6 +935,17 @@ export class SingleSymbolLaneExecutor {
       .sort((a, b) => b.openedAtMs - a.openedAtMs);
     this.lastEntrySkipReason = null;
 
+    // Binance USD-M one-way mode nets positions by symbol. Never let an independently-managed
+    // lane reverse or reduce an existing exchange position simply because it sees an opposite
+    // signal; that position must be closed by its own owner first.
+    let exchangePositions: Awaited<ReturnType<SingleSymbolExecClient["getPositions"]>>;
+    try {
+      exchangePositions = await this.sharedGetPositions();
+    } catch (error) {
+      this.lastEntrySkipReason = `exchange position check failed (${(error as Error).message})`;
+      return;
+    }
+
     // Loop (not just candidates[0]): a regime-level gate can legitimately fire on several symbols
     // in the SAME cycle (unlike a per-symbol technical trigger, which rarely does) — attempt every
     // fresh candidate up to remaining capacity in ONE tick rather than trickling one in per 5-min
@@ -907,6 +953,28 @@ export class SingleSymbolLaneExecutor {
     // dedup) fixes.
     for (const signal of candidates) {
       if (st.positions.filter((p) => p.status === "OPEN").length >= this.maxOpenPositionsFn()) break;
+
+      if (exchangePositions.some((p) => p.symbol === signal.symbol && Math.abs(p.positionAmt) > 1e-9)) {
+        this.lastEntrySkipReason = `${signal.symbol}: exchange position already exists; refusing one-way-mode netting`;
+        continue;
+      }
+
+      // The BTC/ETH/SOL timeline is deliberately evaluated before consuming the observation id.
+      // A WAIT is transient; the same still-fresh lane signal can become executable if the next
+      // timeline refresh confirms its direction. Market-data failure therefore fails closed for a
+      // NEW entry, never marks a valid signal permanently attempted.
+      if (this.timelineEntryGate) {
+        try {
+          const timeline = await this.timelineEntryGate(signal, this.direction);
+          if (!timeline.allowed) {
+            this.lastEntrySkipReason = timeline.reason ?? `${signal.symbol}: timeline entry gate rejected`;
+            continue;
+          }
+        } catch (error) {
+          this.lastEntrySkipReason = `${signal.symbol}: timeline entry gate unavailable (${(error as Error).message})`;
+          continue;
+        }
+      }
 
       if (this.currentPriceFn) {
         const currentPrice = await this.currentPriceFn(signal.symbol).catch(() => null);
@@ -950,6 +1018,21 @@ export class SingleSymbolLaneExecutor {
           continue;
         }
       }
+
+      // The shared position snapshot above is intentionally cached for monitoring efficiency.
+      // It is not safe as the final authority for an entry: two sibling lane ticks can both see
+      // the same cached-flat symbol and otherwise submit opposing orders into Binance one-way
+      // mode. Claim synchronously, then re-read this symbol directly before consuming a signal.
+      if (!this.tryClaimEntrySymbol(signal.symbol)) {
+        this.lastEntrySkipReason = `${signal.symbol}: another executor is admitting this netted symbol`;
+        continue;
+      }
+      try {
+        const freshPositions = await this.client.getPositions(signal.symbol);
+        if (freshPositions.some((p) => p.symbol === signal.symbol && Math.abs(p.positionAmt) > 1e-9)) {
+          this.lastEntrySkipReason = `${signal.symbol}: fresh exchange position already exists; refusing one-way-mode netting`;
+          continue;
+        }
 
       // Mark attempted BEFORE placing orders: a failed/rejected entry must not retry forever on
       // the same signal. Bounded — this is a dedup set, not a growing audit log.
@@ -1049,6 +1132,9 @@ export class SingleSymbolLaneExecutor {
         st.attemptedObservationIds = Array.from(attempted);
         this.lastEntrySkipReason = `${signal.symbol}: entry failed (${(error as Error).message}) — will retry next tick`;
         this.store.save();
+      }
+      } finally {
+        this.releaseEntrySymbol(signal.symbol);
       }
     }
   }

@@ -548,6 +548,7 @@ type RndLaneReport = {
 type RegimeAxisTimelineData = {
   enabled: boolean;
   points: Array<{ at: string; score: number; regime: string }>;
+  smoothedPoints?: Array<{ at: string; score: number }>;
   current: { at: string; score: number; regime: string } | null;
   slopePerHour: number | null;
   etaToNeutralHours: number | null;
@@ -555,6 +556,28 @@ type RegimeAxisTimelineData = {
   zones?: Array<{ from: number; to: number; label: string; laneHint: string }>;
   perRegimeMedianScore?: Record<string, number>;
   projection?: Array<{ at: string; score: number }>;
+  forecast?: {
+    available: boolean;
+    bias: 'BULLISH' | 'BEARISH' | 'NEUTRAL' | 'UNCERTAIN';
+    confidence: 'LOW' | 'MEDIUM' | 'HIGH';
+    smoothedScore: number | null;
+    consensusSlopePerHour: number | null;
+    slopeAgreement: number | null;
+    persistenceProbability: number | null;
+    horizons: Array<{
+      hours: 1 | 3 | 6;
+      at: string;
+      expectedScore: number;
+      lowerScore: number;
+      upperScore: number;
+      bullProbability: number;
+      neutralProbability: number;
+      bearProbability: number;
+      analogCount: number;
+    }>;
+    invalidation: string;
+    reason: string;
+  };
   guidance?: {
     zoneLabel: string;
     direction: 'MENUJU_NETRAL' | 'MENJAUH_NETRAL' | 'FLAT';
@@ -564,18 +587,35 @@ type RegimeAxisTimelineData = {
     etaToSwitchHours: number | null;
     note: string;
   } | null;
+  entryDecision?: {
+    action: 'NO_TRADE' | 'WAIT_PULLBACK' | 'WAIT_REJECTION';
+    directionalBias: 'LONG' | 'SHORT' | null;
+    reason: string;
+    requiredSetup: string;
+    invalidation: string;
+  };
   note: string;
 };
 
-/** Distance-to-neutral timeline: signed breadth composite (+1 bullish … 0 neutral … −1 bearish)
- *  over the regime engine's snapshot history. The middle dashed line IS the neutral zone the
- *  operator asked about — the closer the line drifts to it, the closer the regime is to flipping. */
+type SingleSymbolPriceTimelineData = {
+  enabled: boolean;
+  generatedAt?: string;
+  enabledForExecution?: boolean;
+  note?: string;
+  symbols?: Array<{
+    symbol: 'BTCUSDT' | 'ETHUSDT' | 'SOLUSDT'; available: boolean; reason: string | null; updatedAt: string | null;
+    price: number | null; points: Array<{ at: string; price: number }>; score: number | null; confidence: number | null;
+    directive: 'ENTER_LONG' | 'ENTER_SHORT' | 'WAIT'; turningPoint: string; entryReason: string;
+    exitLongReason: string | null; exitShortReason: string | null;
+    forecasts: Array<{ hours: 1 | 3 | 6; targetPrice: number; lowerPrice: number; upperPrice: number; expectedMovePct: number }>;
+    indicators: { m5: { rsi14: number; atrPercent: number; ema20: number; ema50: number; vwap: number; volumeRatio: number | null; support: number; resistance: number; trend: string } | null;
+      h1: { rsi14: number; atrPercent: number; ema20: number; ema50: number; ema200: number; vwap: number; volumeRatio: number | null; support: number; resistance: number; trend: string } | null };
+  }>;
+};
+
+/** Regime-state forecast, not a price target. Raw breadth stays visible, while a causal EWMA and
+ * historical-successor intervals make the useful signal legible without pretending certainty. */
 function RegimeAxisChart({ data }: { data: RegimeAxisTimelineData | null }) {
-  const width = 920;
-  const height = 220;
-  const padding = 34;
-  const plotWidth = width - padding * 2;
-  const plotHeight = height - padding * 2;
   if (!data || data.points.length < 2 || !data.current) {
     return (
       <div className="testnet-chart-empty">
@@ -584,111 +624,217 @@ function RegimeAxisChart({ data }: { data: RegimeAxisTimelineData | null }) {
       </div>
     );
   }
-  const pts = data.points;
-  const proj = data.projection ?? [];
+
+  const width = 960;
+  const height = 260;
+  const paddingX = 46;
+  const paddingY = 30;
+  const plotWidth = width - paddingX * 2;
+  const plotHeight = height - paddingY * 2;
+  const currentMs = new Date(data.current.at).getTime();
+  const recentStartMs = currentMs - 24 * 3_600_000;
+  const recent = data.points.filter((point) => new Date(point.at).getTime() >= recentStartMs);
+  const pts = recent.length >= 2 ? recent : data.points.slice(-60);
+  const smoothedByAt = new Map((data.smoothedPoints ?? []).map((point) => [point.at, point.score]));
+  const smoothPts = pts.map((point) => ({ at: point.at, score: smoothedByAt.get(point.at) ?? point.score }));
+  const forecast = data.forecast;
+  const horizons = forecast?.available ? forecast.horizons : [];
+  const forecastCenter = horizons.length > 0
+    ? horizons.map((h) => ({ at: h.at, score: h.expectedScore }))
+    : data.projection ?? [];
+  const currentSmooth = forecast?.smoothedScore ?? smoothPts[smoothPts.length - 1]!.score;
   const t0 = new Date(pts[0]!.at).getTime();
-  const t1 = new Date((proj.length > 0 ? proj[proj.length - 1]! : pts[pts.length - 1]!).at).getTime();
+  const t1 = horizons.length > 0 ? new Date(horizons[horizons.length - 1]!.at).getTime() : currentMs;
   const span = Math.max(1, t1 - t0);
-  // Fixed y-domain [-1, +1]: the score is bounded by construction, and a fixed frame keeps the
-  // "distance to the middle line" visually comparable across refreshes.
   const xy = (p: { at: string; score: number }) => ({
-    x: padding + ((new Date(p.at).getTime() - t0) / span) * plotWidth,
-    y: padding + ((1 - p.score) / 2) * plotHeight,
+    x: paddingX + ((new Date(p.at).getTime() - t0) / span) * plotWidth,
+    y: paddingY + ((1 - p.score) / 2) * plotHeight,
   });
-  const path = pts.map((p, i) => {
+  const linePath = (rows: Array<{ at: string; score: number }>) => rows.map((p, i) => {
     const { x, y } = xy(p);
     return `${i === 0 ? 'M' : 'L'} ${x.toFixed(2)} ${y.toFixed(2)}`;
   }).join(' ');
-  const zeroY = padding + plotHeight / 2;
-  const cur = xy(data.current);
-  const curColor = data.current.score > 0.02 ? '#5ce4a6' : data.current.score < -0.02 ? '#ff6b6b' : '#f0b54b';
+  const rawPath = linePath(pts);
+  const smoothPath = linePath(smoothPts);
+  const forecastPath = forecastCenter.length > 0
+    ? linePath([{ at: data.current.at, score: currentSmooth }, ...forecastCenter])
+    : '';
+  const bandPath = horizons.length > 0
+    ? linePath([
+        { at: data.current.at, score: currentSmooth },
+        ...horizons.map((h) => ({ at: h.at, score: h.lowerScore })),
+        ...[...horizons].reverse().map((h) => ({ at: h.at, score: h.upperScore })),
+      ]) + ' Z'
+    : '';
+  const zeroY = paddingY + plotHeight / 2;
+  const cur = xy({ at: data.current.at, score: currentSmooth });
+  const curColor = currentSmooth > 0.12 ? '#5ce4a6' : currentSmooth < -0.12 ? '#ff6b6b' : '#f0b54b';
+  const forecastColor = forecast?.bias === 'BEARISH' ? '#ff6b6b' : forecast?.bias === 'NEUTRAL' ? '#f0b54b' : forecast?.bias === 'UNCERTAIN' ? '#9db1ba' : '#5ce4a6';
+  const entryDecision = data.entryDecision;
+  const entryColor = entryDecision?.directionalBias === 'SHORT' ? '#ff6b6b' : entryDecision?.directionalBias === 'LONG' ? '#5ce4a6' : '#f0b54b';
   const timeLabel = (iso: string) => new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-  const eta = data.etaToNeutralHours;
+  const signed = (value: number) => `${value >= 0 ? '+' : ''}${value.toFixed(2)}`;
+  const pct = (value: number | null | undefined) => value == null ? 'n/a' : `${Math.round(value * 100)}%`;
+
   return (
     <div className="testnet-chart-wrap">
-      <svg className="testnet-lane-chart" viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Regime distance-to-neutral timeline">
+      <svg className="testnet-lane-chart" viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Probabilistic regime-axis forecast">
         <rect x="0" y="0" width={width} height={height} rx="12" className="testnet-chart-bg" />
         {(data.zones ?? []).map((z) => {
-          // Zone band: y for score s = padding + ((1 - s) / 2) * plotHeight (top = +1).
-          const yTop = padding + ((1 - z.to) / 2) * plotHeight;
-          const yBot = padding + ((1 - z.from) / 2) * plotHeight;
+          const yTop = paddingY + ((1 - z.to) / 2) * plotHeight;
+          const yBot = paddingY + ((1 - z.from) / 2) * plotHeight;
           const bull = (z.from + z.to) / 2 > 0.05;
           const bear = (z.from + z.to) / 2 < -0.05;
           const fill = bull ? 'rgba(92,228,166,0.06)' : bear ? 'rgba(255,107,107,0.06)' : 'rgba(240,181,75,0.05)';
+          return <rect key={z.label} x={paddingX} y={yTop} width={plotWidth} height={Math.max(1, yBot - yTop)} fill={fill} />;
+        })}
+        {[0.25, 0.75].map((ratio) => (
+          <line key={ratio} x1={paddingX} x2={width - paddingX} y1={paddingY + ratio * plotHeight} y2={paddingY + ratio * plotHeight} className="testnet-chart-grid" />
+        ))}
+        <line x1={paddingX} x2={width - paddingX} y1={zeroY} y2={zeroY} className="testnet-chart-zero" />
+        <line x1={cur.x} x2={cur.x} y1={paddingY} y2={height - paddingY} className="testnet-chart-now" />
+        <text x={paddingX} y={paddingY - 8} className="testnet-chart-axis">BULL +1</text>
+        <text x={paddingX} y={zeroY - 6} className="testnet-chart-axis">NEUTRAL 0</text>
+        <text x={paddingX} y={height - paddingY + 16} className="testnet-chart-axis">BEAR −1</text>
+        <path d={rawPath} fill="none" stroke="#6fb3d6" strokeWidth="1.2" opacity="0.35" strokeLinejoin="round" strokeLinecap="round" />
+        <path d={smoothPath} fill="none" stroke="#8bd3f0" strokeWidth="2.4" strokeLinejoin="round" strokeLinecap="round" />
+        {bandPath && <path d={bandPath} fill={forecastColor} opacity="0.1" stroke="none" />}
+        {forecastPath && <path d={forecastPath} fill="none" stroke={forecastColor} strokeWidth="2" strokeDasharray="6 5" opacity="0.9" />}
+        {horizons.map((h) => {
+          const point = xy({ at: h.at, score: h.expectedScore });
           return (
-            <g key={z.label}>
-              <rect x={padding} y={yTop} width={plotWidth} height={Math.max(1, yBot - yTop)} fill={fill} />
-              <text x={width - padding - 4} y={(yTop + yBot) / 2 + 3} textAnchor="end" style={{ fill: bull ? '#5ce4a6' : bear ? '#ff6b6b' : '#f0b54b', font: '600 9px/1 "IBM Plex Mono", monospace', opacity: 0.85 }}>
-                {z.label} · {z.laneHint}
+            <g key={h.hours}>
+              <line x1={point.x} x2={point.x} y1={xy({ at: h.at, score: h.lowerScore }).y} y2={xy({ at: h.at, score: h.upperScore }).y} stroke={forecastColor} strokeWidth="2" opacity="0.55" />
+              <circle cx={point.x} cy={point.y} r="4" fill={forecastColor} />
+              <text x={point.x} y={Math.max(paddingY + 12, point.y - 10)} textAnchor="middle" className="testnet-chart-forecast-label">
+                +{h.hours}h {signed(h.expectedScore)}
               </text>
             </g>
           );
         })}
-        {[0.25, 0.75].map((ratio) => (
-          <line key={ratio} x1={padding} x2={width - padding} y1={padding + ratio * plotHeight} y2={padding + ratio * plotHeight} className="testnet-chart-grid" />
-        ))}
-        <line x1={padding} x2={width - padding} y1={zeroY} y2={zeroY} className="testnet-chart-zero" />
-        <text x={padding} y={padding - 8} className="testnet-chart-axis">BULLISH +1</text>
-        <text x={padding} y={zeroY - 6} className="testnet-chart-axis">NEUTRAL 0</text>
-        <text x={padding} y={height - padding + 16} className="testnet-chart-axis">BEARISH −1</text>
-        <path d={path} fill="none" stroke="#6fb3d6" strokeWidth="2" strokeLinejoin="round" strokeLinecap="round" />
-        {proj.length > 0 && (
-          <path
-            d={[data.current, ...proj].map((p, i) => { const { x, y } = xy(p!); return `${i === 0 ? 'M' : 'L'} ${x.toFixed(2)} ${y.toFixed(2)}`; }).join(' ')}
-            fill="none" stroke={curColor} strokeWidth="1.5" strokeDasharray="5 4" opacity="0.7"
-          />
-        )}
         {data.guidance?.switchAtScore != null && data.guidance.etaToSwitchHours != null && data.current && (() => {
-          // Titik switch: proyeksi menembus batas netral (±0.12) — di sinilah ganti lane.
-          const swX = padding + (((new Date(data.current.at).getTime() + data.guidance.etaToSwitchHours * 3_600_000) - t0) / span) * plotWidth;
-          const swY = padding + ((1 - data.guidance.switchAtScore) / 2) * plotHeight;
-          if (swX > width - padding) return null;
+          const swX = paddingX + (((currentMs + data.guidance.etaToSwitchHours * 3_600_000) - t0) / span) * plotWidth;
+          const swY = paddingY + ((1 - data.guidance.switchAtScore) / 2) * plotHeight;
+          if (swX > width - paddingX) return null;
           return (
             <g>
               <circle cx={swX} cy={swY} r="6" fill="none" stroke="#f0b54b" strokeWidth="2" strokeDasharray="2 2" />
-              <text x={Math.min(swX + 8, width - 150)} y={swY - 8} style={{ fill: '#f0b54b', font: '600 10px/1 "IBM Plex Mono", monospace' }}>
-                titik switch (~{data.guidance.etaToSwitchHours}j)
+              <text x={Math.min(swX + 8, width - 145)} y={swY - 8} className="testnet-chart-switch-label">
+                switch conditional
               </text>
             </g>
           );
         })()}
         <circle cx={cur.x} cy={cur.y} r="5" fill={curColor} stroke="#071016" strokeWidth="1.5" />
-        <text x={padding} y={height - 6} className="testnet-chart-time">{timeLabel(pts[0]!.at)}</text>
-        <text x={width - padding} y={height - 6} className="testnet-chart-time end">{timeLabel(pts[pts.length - 1]!.at)}</text>
+        <text x={paddingX} y={height - 5} className="testnet-chart-time">{timeLabel(pts[0]!.at)} · −24h</text>
+        <text x={cur.x} y={height - 5} className="testnet-chart-time middle">NOW</text>
+        {horizons.length > 0 && <text x={width - paddingX} y={height - 5} className="testnet-chart-time end">+6h</text>}
       </svg>
-      <div className="testnet-chart-legend">
-        <div>
-          <i style={{ background: curColor }} />
-          <span>sekarang</span>
-          <strong style={{ color: curColor }}>{data.current.score >= 0 ? '+' : ''}{data.current.score.toFixed(2)}</strong>
+      <div className="testnet-regime-forecast">
+        <div className="testnet-regime-forecast-head">
+          <span>REGIME FORECAST</span>
+          <strong style={{ color: forecastColor }}>{forecast?.bias ?? 'UNAVAILABLE'}</strong>
+          <em>{forecast?.confidence ?? 'LOW'} confidence</em>
         </div>
-        <div><span>{data.current.regime}</span></div>
-        {data.slopePerHour != null && (
-          <div><span>drift {data.slopeWindowHours}h</span><strong>{data.slopePerHour >= 0 ? '+' : ''}{data.slopePerHour.toFixed(3)}/jam</strong></div>
-        )}
-        <div style={{ maxWidth: 260 }}>
-          <span>
-            {eta != null
-              ? `menyentuh netral ~${eta.toFixed(1)} jam lagi KALAU laju saat ini bertahan (ekstrapolasi, bukan ramalan)`
-              : 'tidak sedang bergerak menuju netral pada laju yang berarti'}
-          </span>
+        <div className="testnet-regime-now">
+          <span>EWMA sekarang</span>
+          <strong style={{ color: curColor }}>{signed(currentSmooth)}</strong>
+          <small>{data.current.regime}</small>
         </div>
+        {horizons.map((h) => (
+          <div className="testnet-regime-horizon" key={h.hours}>
+            <b>+{h.hours}H</b>
+            <strong>{signed(h.expectedScore)}</strong>
+            <span>range {signed(h.lowerScore)} … {signed(h.upperScore)}</span>
+            <small>B {pct(h.bullProbability)} · N {pct(h.neutralProbability)} · S {pct(h.bearProbability)} · {h.analogCount} analog</small>
+          </div>
+        ))}
+        <div className="testnet-regime-reliability">
+          <span>Persist 3h</span>
+          <strong>{pct(forecast?.persistenceProbability)}</strong>
+          <small>{forecast?.reason ?? 'Belum cukup history untuk forecast.'}</small>
+        </div>
+        <div className="testnet-regime-invalidation">{forecast?.invalidation ?? 'Tunggu snapshot tambahan.'}</div>
+      </div>
+      <div className="testnet-regime-entry-decision">
+        <span>ENTRY DECISION SEKARANG</span>
+        <strong style={{ color: entryColor }}>{entryDecision?.action?.replaceAll('_', ' ') ?? 'NO TRADE'}</strong>
+        <em>{entryDecision?.directionalBias ? `${entryDecision.directionalBias} BIAS` : 'NO DIRECTIONAL BIAS'}</em>
+        <p>{entryDecision?.reason ?? 'Belum ada keputusan entry yang dapat dipakai.'}</p>
+        <small><b>Wajib:</b> {entryDecision?.requiredSetup ?? 'Tunggu setup simbol.'}</small>
+        <small><b>Invalid:</b> {entryDecision?.invalidation ?? forecast?.invalidation ?? 'n/a'}</small>
       </div>
       {data.guidance && (
-        <div style={{ margin: '8px 4px 0', padding: '8px 12px', border: '1px solid rgba(240,181,75,0.35)', borderRadius: 8, fontSize: 12, lineHeight: 1.55 }}>
+        <div className="testnet-regime-guidance">
           <strong style={{ color: '#f0b54b' }}>
-            PEGANG {data.guidance.holdLane.replace('CG_WIDE_', '').replace('CROSS_SECTIONAL_MARKET_NEUTRAL', 'CROSS-SECTIONAL')}
+            BIAS LANE {data.guidance.holdLane.replace('CG_WIDE_', '').replace('CROSS_SECTIONAL_MARKET_NEUTRAL', 'CROSS-SECTIONAL')}
           </strong>
           {data.guidance.switchToLane && data.guidance.switchAtScore != null && (
             <>
               {' '}· switch ke <strong>{data.guidance.switchToLane.replace('CG_WIDE_', '')}</strong> HANYA setelah skor menembus{' '}
               <strong>{data.guidance.switchAtScore > 0 ? '+' : ''}{data.guidance.switchAtScore}</strong>
-              {data.guidance.etaToSwitchHours != null ? ` (~${data.guidance.etaToSwitchHours} jam lagi di laju sekarang — ekstrapolasi)` : ' (belum ada ETA — arah belum menuju batas itu)'}
+              {data.guidance.etaToSwitchHours != null ? ` (~${data.guidance.etaToSwitchHours} jam jika momentum konsisten)` : ' (belum ada ETA yang stabil)'}
             </>
           )}
-          <div style={{ opacity: 0.8, marginTop: 4 }}>{data.guidance.note}</div>
+          <div>{data.guidance.note}</div>
         </div>
       )}
+    </div>
+  );
+}
+
+/** Price-scale-safe counterpart of RegimeAxisChart: one compact pane per symbol rather than
+ * overlaying BTC/ETH/SOL nominal prices on a misleading shared y-axis. */
+function SingleSymbolPriceTimelineChart({ data }: { data: SingleSymbolPriceTimelineData | null }) {
+  const rows = data?.symbols ?? [];
+  if (!data || rows.length === 0) {
+    return <div className="testnet-chart-empty"><strong>Loading BTC / ETH / SOL timeline…</strong><p>Need fresh 5m and 1h Binance candles.</p></div>;
+  }
+  const toneFor = (directive: string) => directive === 'ENTER_LONG' ? '#5ce4a6' : directive === 'ENTER_SHORT' ? '#ff6b6b' : '#f0b54b';
+  const signedPct = (value: number) => `${value >= 0 ? '+' : ''}${(value * 100).toFixed(2)}%`;
+  return (
+    <div className="testnet-chart-wrap">
+      {rows.map((row) => {
+        if (!row.available || row.points.length < 2 || row.price == null) {
+          return <div className="testnet-chart-empty" key={row.symbol}><strong>{row.symbol}: timeline unavailable</strong><p>{row.reason ?? 'Waiting for candle data.'}</p></div>;
+        }
+        const width = 960; const height = 160; const px = 46; const py = 22;
+        const forecast = row.forecasts ?? [];
+        const values = [...row.points.map((p) => p.price), ...forecast.flatMap((p) => [p.lowerPrice, p.upperPrice])];
+        const rawMin = Math.min(...values); const rawMax = Math.max(...values); const pad = Math.max((rawMax - rawMin) * 0.12, row.price * 0.002);
+        const min = rawMin - pad; const max = rawMax + pad; const currentAt = new Date(row.points.at(-1)!.at).getTime();
+        const t0 = new Date(row.points[0]!.at).getTime(); const t1 = currentAt + 6 * 3_600_000; const span = Math.max(1, t1 - t0);
+        const xy = (at: string, priceValue: number) => ({ x: px + ((new Date(at).getTime() - t0) / span) * (width - px * 2), y: py + (1 - (priceValue - min) / Math.max(max - min, 1e-9)) * (height - py * 2) });
+        const line = (points: Array<{ at: string; price: number }>) => points.map((p, i) => { const v = xy(p.at, p.price); return `${i ? 'L' : 'M'} ${v.x.toFixed(1)} ${v.y.toFixed(1)}`; }).join(' ');
+        const current = xy(row.points.at(-1)!.at, row.price); const targetPoints = forecast.map((p) => ({ at: new Date(currentAt + p.hours * 3_600_000).toISOString(), price: p.targetPrice }));
+        const forecastLine = line([{ at: row.points.at(-1)!.at, price: row.price }, ...targetPoints]);
+        const rangePath = forecast.length ? line([{ at: row.points.at(-1)!.at, price: row.price }, ...forecast.map((p) => ({ at: new Date(currentAt + p.hours * 3_600_000).toISOString(), price: p.lowerPrice })), ...[...forecast].reverse().map((p) => ({ at: new Date(currentAt + p.hours * 3_600_000).toISOString(), price: p.upperPrice }))]) + ' Z' : '';
+        const color = toneFor(row.directive); const m5 = row.indicators.m5; const h1 = row.indicators.h1;
+        return <div key={row.symbol} className="testnet-price-timeline">
+          <div className="testnet-regime-forecast-head"><span>{row.symbol} PRICE TIMELINE</span><strong style={{ color }}>{row.directive.replace('_', ' ')}</strong><em>{row.confidence == null ? 'n/a' : `${Math.round(row.confidence * 100)}% confidence`}</em></div>
+          <svg className="testnet-lane-chart" viewBox={`0 0 ${width} ${height}`} role="img" aria-label={`${row.symbol} price timeline and forecast`}>
+            <rect x="0" y="0" width={width} height={height} rx="12" className="testnet-chart-bg" />
+            {[0.2, 0.5, 0.8].map((ratio) => <line key={ratio} x1={px} x2={width - px} y1={py + ratio * (height - py * 2)} y2={py + ratio * (height - py * 2)} className="testnet-chart-grid" />)}
+            <line x1={current.x} x2={current.x} y1={py} y2={height - py} className="testnet-chart-now" />
+            <path d={line(row.points)} fill="none" stroke="#8bd3f0" strokeWidth="2.2" strokeLinejoin="round" strokeLinecap="round" />
+            {rangePath && <path d={rangePath} fill={color} opacity="0.12" />}
+            {forecastLine && <path d={forecastLine} fill="none" stroke={color} strokeWidth="2" strokeDasharray="6 5" />}
+            <circle cx={current.x} cy={current.y} r="4.5" fill={color} stroke="#071016" strokeWidth="1.5" />
+            <text x={px} y={15} className="testnet-chart-axis">{price(max)}</text><text x={px} y={height - 7} className="testnet-chart-axis">{price(min)}</text>
+            <text x={px} y={height - 7} className="testnet-chart-time">{new Date(row.points[0]!.at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} · -12h</text><text x={current.x} y={height - 7} className="testnet-chart-time middle">NOW</text><text x={width - px} y={height - 7} className="testnet-chart-time end">+6h</text>
+            {forecast.map((f) => { const pt = xy(new Date(currentAt + f.hours * 3_600_000).toISOString(), f.targetPrice); return <g key={f.hours}><circle cx={pt.x} cy={pt.y} r="3.5" fill={color} /><text x={pt.x} y={Math.max(18, pt.y - 8)} textAnchor="middle" className="testnet-chart-forecast-label">+{f.hours}h {price(f.targetPrice)}</text></g>; })}
+          </svg>
+          <div className="testnet-price-timeline-meta">
+            <span><b>Now</b> {price(row.price)} · score {row.score == null ? 'n/a' : `${row.score >= 0 ? '+' : ''}${row.score.toFixed(2)}`}</span>
+            <span><b>Turn</b> {row.turningPoint.replaceAll('_', ' ')}</span>
+            <span><b>5m</b> RSI {m5?.rsi14.toFixed(0) ?? 'n/a'} · {m5?.trend ?? 'n/a'} · vol {m5?.volumeRatio?.toFixed(2) ?? 'n/a'}x</span>
+            <span><b>1h</b> RSI {h1?.rsi14.toFixed(0) ?? 'n/a'} · {h1?.trend ?? 'n/a'} · ATR {h1?.atrPercent.toFixed(2) ?? 'n/a'}%</span>
+            {forecast.map((f) => <span key={f.hours}><b>+{f.hours}h</b> {price(f.targetPrice)} ({signedPct(f.expectedMovePct)}) · {price(f.lowerPrice)}–{price(f.upperPrice)}</span>)}
+          </div>
+          <p className="tone-measure" style={{ margin: '5px 0 12px', fontSize: 12 }}>{row.entryReason}. Long exit: {row.exitLongReason ?? 'hold lane/stop'} · Short exit: {row.exitShortReason ?? 'hold lane/stop'}.</p>
+        </div>;
+      })}
+      <p className="tone-measure" style={{ margin: '8px 0 0', fontSize: 12 }}>{data.note ?? 'Timeline is informational.'} Execution overlay: {data.enabledForExecution ? 'ON for fresh BTC/ETH/SOL single-symbol signals' : 'OFF (display only)'}.</p>
     </div>
   );
 }
@@ -854,6 +1000,7 @@ export default function TestnetExchangeDashboard() {
   const regimePresetsLoadSeqRef = useRef(0);
   const perSymbolLoadSeqRef = useRef(0);
   const regimeAxisLoadSeqRef = useRef(0);
+  const singleSymbolTimelineLoadSeqRef = useRef(0);
   const xsecExecLoadSeqRef = useRef(0);
   const xsecExecTrendLoadSeqRef = useRef(0);
   const xsecExecMixedLoadSeqRef = useRef(0);
@@ -884,6 +1031,7 @@ export default function TestnetExchangeDashboard() {
   const [regimeReport, setRegimeReport] = useState<RegimeEngineReport | null>(null);
   const [regimePresets, setRegimePresets] = useState<RegimePresetsMap>({});
   const [regimeAxis, setRegimeAxis] = useState<RegimeAxisTimelineData | null>(null);
+  const [singleSymbolTimeline, setSingleSymbolTimeline] = useState<SingleSymbolPriceTimelineData | null>(null);
   const [closeBusy, setCloseBusy] = useState<string | null>(null);
   const [closeResult, setCloseResult] = useState<{ ok: boolean; message: string } | null>(null);
   const [xsecExec, setXsecExec] = useState<XsecExecStatus | null>(null);
@@ -905,6 +1053,7 @@ export default function TestnetExchangeDashboard() {
   // 2026-07-12 fix: loadRegimeAxis's catch block explicitly "keeps last" on fetch failure with no
   // staleness flag — same failure mode the panels above already got a staleSince indicator for.
   const [regimeAxisStaleSince, setRegimeAxisStaleSince] = useState<string | null>(null);
+  const [singleSymbolTimelineStaleSince, setSingleSymbolTimelineStaleSince] = useState<string | null>(null);
   const [laneEvaluation, setLaneEvaluation] = useState<LaneEvaluationRow[]>([]);
   const [rndLanes, setRndLanes] = useState<RndLaneReport[]>([]);
   const [psle, setPsle] = useState<PsleReport | null>(null);
@@ -1310,6 +1459,24 @@ export default function TestnetExchangeDashboard() {
     }
   }
 
+  async function loadSingleSymbolTimeline() {
+    const seq = ++singleSymbolTimelineLoadSeqRef.current;
+    try {
+      const res = await fetch(`${pageApiPrefix}/live/single-symbol-timeline`, { cache: 'no-store' });
+      const body = await res.json();
+      if (seq !== singleSymbolTimelineLoadSeqRef.current) return;
+      if (body?.enabled === true && Array.isArray(body?.symbols)) {
+        setSingleSymbolTimeline(body as SingleSymbolPriceTimelineData);
+        setSingleSymbolTimelineStaleSince(null);
+      } else {
+        setSingleSymbolTimelineStaleSince((prev) => prev ?? new Date().toISOString());
+      }
+    } catch {
+      if (seq !== singleSymbolTimelineLoadSeqRef.current) return;
+      setSingleSymbolTimelineStaleSince((prev) => prev ?? new Date().toISOString());
+    }
+  }
+
   // Per-symbol book edge for THIS instance's book (live shows the mainnet book, testnet the testnet
   // book) — the book-proven symbols the live auto-rotation admits. Own cadence, fail-soft.
   async function loadPerSymbol() {
@@ -1352,6 +1519,7 @@ export default function TestnetExchangeDashboard() {
     void loadRegimePresets();
     void loadPerSymbol();
     void loadRegimeAxis();
+    void loadSingleSymbolTimeline();
     void loadXsecExec();
     void loadXsecExecTrend();
     void loadXsecExecMixed();
@@ -1364,6 +1532,7 @@ export default function TestnetExchangeDashboard() {
       void loadRegimePresets();
       void loadPerSymbol();
       void loadRegimeAxis();
+      void loadSingleSymbolTimeline();
       void loadXsecExec();
       void loadXsecExecTrend();
       void loadXsecExecMixed();
@@ -1763,9 +1932,9 @@ export default function TestnetExchangeDashboard() {
           </strong>
         </header>
         <p style={{ margin: '4px 0' }} className="tone-measure">
-          Skor = komposit input breadth yang dipakai regime engine sendiri (advancers %, % di atas EMA20, return BTC 24h).
-          Garis tengah putus-putus = zona NETRAL: semakin garis mendekat ke tengah, semakin dekat regime ke perubahan.
-          Estimasi waktu adalah ekstrapolasi laju saat ini — bukan ramalan.
+          Garis tipis = breadth mentah; garis tebal = EWMA kausal. Area forecast menunjukkan rentang p25–p75 dari momentum
+          1/3/6 jam dan successor historis yang paling mirip. Ini membaca state regime, bukan target harga: gunakan `ENTRY DECISION`
+          untuk tahu kapan harus menunggu pullback/rejection, lalu tunggu gate simbol RC/RCS benar-benar lolos.
         </p>
         {regimeAxisStaleSince && (
           <p className="tone-warning" style={{ margin: '4px 0', fontSize: 12 }}>
@@ -1773,6 +1942,25 @@ export default function TestnetExchangeDashboard() {
           </p>
         )}
         <RegimeAxisChart data={regimeAxis} />
+      </section>
+
+      <section className="testnet-panel">
+        <header>
+          <span>BTC / ETH / SOL Execution Timeline</span>
+          <strong>{singleSymbolTimeline?.enabledForExecution ? 'execution overlay ON' : 'display / waiting'}</strong>
+        </header>
+        <p style={{ margin: '4px 0' }} className="tone-measure">
+          Price path 12 jam dan proyeksi 1/3/6 jam memakai consensus kausal 5m+1h: EMA, RSI, MACD,
+          Bollinger, ATR, VWAP, volume, momentum, support/resistance. Ini adalah rentang probabilistik,
+          bukan janji harga. Executor tetap perlu sinyal lane fresh, lalu hanya entry searah `ENTER LONG`/`ENTER SHORT`;
+          posisi yang sudah terbuka hanya di-close oleh reversal kuat terkonfirmasi atau rule/stop lama.
+        </p>
+        {singleSymbolTimelineStaleSince && (
+          <p className="tone-warning" style={{ margin: '4px 0', fontSize: 12 }}>
+            ⚠ timeline fetch gagal sejak {timeAgo(singleSymbolTimelineStaleSince)} — entry BTC/ETH/SOL fail-closed bila execution overlay aktif; stop posisi yang ada tetap jalan.
+          </p>
+        )}
+        <SingleSymbolPriceTimelineChart data={singleSymbolTimeline} />
       </section>
 
       {error && (

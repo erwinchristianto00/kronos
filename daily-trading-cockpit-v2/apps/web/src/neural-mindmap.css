@@ -2136,7 +2136,7 @@ i.health-diagnostic {
 
 .testnet-chart-wrap {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(220px, 0.28fr);
+  grid-template-columns: minmax(0, 1fr) minmax(300px, 340px);
   gap: 12px;
   padding: 14px;
   border-bottom: 1px solid #20313a;
@@ -2162,6 +2162,22 @@ i.health-diagnostic {
   stroke: rgba(231, 238, 248, 0.34);
   stroke-width: 1.2;
   stroke-dasharray: 5 7;
+}
+
+.testnet-chart-now {
+  stroke: rgba(240, 181, 75, 0.42);
+  stroke-width: 1;
+  stroke-dasharray: 2 5;
+}
+
+.testnet-chart-forecast-label,
+.testnet-chart-switch-label {
+  fill: #d8e7e4;
+  font: 700 9px/1.2 "IBM Plex Mono", "Cascadia Code", monospace;
+}
+
+.testnet-chart-switch-label {
+  fill: #f0b54b;
 }
 
 .testnet-chart-axis,
@@ -2212,6 +2228,151 @@ i.health-diagnostic {
   min-width: 0;
   margin: 0;
   overflow-wrap: anywhere;
+}
+
+.testnet-regime-forecast {
+  align-content: start;
+  display: grid;
+  gap: 8px;
+}
+
+.testnet-regime-entry-decision {
+  align-content: start;
+  display: grid;
+  gap: 6px;
+  padding: 12px;
+  border: 1px solid rgba(240, 181, 75, 0.38);
+  border-radius: 8px;
+  background: rgba(46, 36, 12, 0.22);
+}
+
+.testnet-regime-entry-decision > span,
+.testnet-regime-entry-decision > em {
+  color: #9db1ba;
+  font: 700 9px/1.2 "IBM Plex Mono", "Cascadia Code", monospace;
+  font-style: normal;
+  letter-spacing: 0.05em;
+}
+
+.testnet-regime-entry-decision > strong {
+  font: 800 15px/1.1 "IBM Plex Mono", "Cascadia Code", monospace;
+}
+
+.testnet-regime-entry-decision p,
+.testnet-regime-entry-decision small {
+  margin: 0;
+  color: #b5c5ca;
+  font: 600 11px/1.45 "IBM Plex Sans", sans-serif;
+}
+
+.testnet-regime-entry-decision small b {
+  color: #e0e9e7;
+}
+
+.testnet-regime-forecast-head,
+.testnet-regime-now,
+.testnet-regime-horizon,
+.testnet-regime-reliability,
+.testnet-regime-invalidation {
+  min-width: 0;
+  padding: 9px 10px;
+  border: 1px solid #20313a;
+  border-radius: 8px;
+  background: rgba(5, 13, 18, 0.66);
+}
+
+.testnet-regime-forecast-head {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: baseline;
+  gap: 3px 10px;
+}
+
+.testnet-regime-forecast-head span,
+.testnet-regime-now span,
+.testnet-regime-reliability span {
+  color: #70858f;
+  font: 700 9px/1.2 "IBM Plex Mono", "Cascadia Code", monospace;
+  letter-spacing: 0.05em;
+}
+
+.testnet-regime-forecast-head strong {
+  font: 800 15px/1.1 "IBM Plex Mono", "Cascadia Code", monospace;
+}
+
+.testnet-regime-forecast-head em {
+  grid-column: 2;
+  color: #9db1ba;
+  font: 600 10px/1.2 "IBM Plex Mono", "Cascadia Code", monospace;
+  font-style: normal;
+}
+
+.testnet-regime-now,
+.testnet-regime-reliability {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 3px 10px;
+}
+
+.testnet-regime-now strong,
+.testnet-regime-reliability strong {
+  font: 800 14px/1.15 "IBM Plex Mono", "Cascadia Code", monospace;
+}
+
+.testnet-regime-now small,
+.testnet-regime-reliability small {
+  grid-column: 1 / -1;
+  color: #93a8b0;
+  font-size: 10px;
+  line-height: 1.35;
+}
+
+.testnet-regime-horizon {
+  display: grid;
+  grid-template-columns: 34px 58px minmax(0, 1fr);
+  align-items: baseline;
+  gap: 3px 7px;
+  font-family: "IBM Plex Mono", "Cascadia Code", monospace;
+}
+
+.testnet-regime-horizon b {
+  color: #f0b54b;
+  font-size: 10px;
+}
+
+.testnet-regime-horizon strong {
+  color: #e3efec;
+  font-size: 12px;
+}
+
+.testnet-regime-horizon span,
+.testnet-regime-horizon small {
+  color: #8fa4ad;
+  font-size: 9px;
+  line-height: 1.35;
+}
+
+.testnet-regime-horizon small {
+  grid-column: 2 / -1;
+}
+
+.testnet-regime-invalidation {
+  color: #d2b06a;
+  font: 600 10px/1.45 "IBM Plex Mono", "Cascadia Code", monospace;
+}
+
+.testnet-regime-guidance {
+  grid-column: 1 / -1;
+  padding: 9px 12px;
+  border: 1px solid rgba(240, 181, 75, 0.35);
+  border-radius: 8px;
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.testnet-regime-guidance > div {
+  margin-top: 4px;
+  opacity: 0.8;
 }
 
 .testnet-chart-legend span {
