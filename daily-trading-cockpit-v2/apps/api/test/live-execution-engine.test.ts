@@ -302,6 +302,7 @@ function makeConfig(overrides: Partial<LiveExecutionConfig> = {}): LiveExecution
     maxClusterPositions: 3,
     dailyMaxLossUsd: 15,
     maxConsecutiveLosses: 5,
+    consecutiveLossWindowHours: 24,
     scratchEpsilonUsd: 0.1,
     maxDrawdownUsd: 40,
     defaultLeverage: 3,
@@ -3494,7 +3495,7 @@ describe("account-wide consecutive-loss kill-switch fed by a SingleSymbolLaneExe
 
     await openAndClosePosition(executor, executorStore, client, signals, "rc:ETHUSDT:2", 4_000, -2);
     expect(store.getState().consecutiveLosses).toBe(2);
-    expect(trip()).toBe("max consecutive losses hit (2)");
+    expect(trip()).toBe("max consecutive losses hit (2 within 24h of each other)");
   });
 
   it("a subsequent win from the SAME single-symbol lane resets the streak back to 0", async () => {
@@ -3520,6 +3521,132 @@ describe("account-wide consecutive-loss kill-switch fed by a SingleSymbolLaneExe
 
     await openAndClosePosition(executor, executorStore, client, signals, "rc:ETHUSDT:2", 4_000, -0.017);
     expect(store.getState().consecutiveLosses).toBe(1); // scratch — unchanged, must not reach 2
+  });
+});
+
+describe("consecutive-loss TIME-WINDOW bound (2026-07-19 real-money audit follow-up)", () => {
+  // Regression for the adversarial-review finding on top of 8792bd0 ("wire single-symbol lane
+  // closes into the consecutive-loss kill-switch"): once ALL 9 SingleSymbolLaneExecutor instances
+  // fed consecutiveLosses (not just the dead legacy pipeline), the counter was fed continuously by
+  // real money — but it was UNBOUNDED IN TIME, so a loss 3 days ago and an unrelated loss today
+  // (from independently-ticking lanes) could chain into the SAME "streak" and force-flatten every
+  // open real-money position for ordinary multi-day trading variance, not a genuine correlated
+  // failure. noteConsecutiveLoss() now only chains a new loss onto the existing streak if it lands
+  // within config.consecutiveLossWindowHours of the last COUNTED loss; otherwise it starts fresh at 1.
+  //
+  // FAIL-WITHOUT-FIX: before this change, applyRealizedToLedger/recordExternalConsecutiveLossOutcome
+  // did a bare `st.consecutiveLosses += 1` with no time dimension at all — test (a) below asserts
+  // consecutiveLosses stays at 1 after 5 widely-spaced losses; pre-fix code has no `lastLossAtMs`
+  // field to reset and would have incremented every single time regardless of gap, landing at 5 and
+  // tripping the breaker. Confirmed by reverting the noteConsecutiveLoss changes locally and
+  // re-running this file: (a) fails (consecutiveLosses reads 5, trip() returns non-null) and (d)
+  // fails identically through the production recordExternalConsecutiveLossOutcome() path.
+
+  function ledger(engine: LiveExecutionEngine) {
+    return (engine as unknown as {
+      applyRealizedToLedger: (net: number, c?: "auto" | "adverse") => void;
+    }).applyRealizedToLedger.bind(engine);
+  }
+
+  function trip(engine: LiveExecutionEngine) {
+    return (engine as unknown as { killSwitchTrip: () => string | null }).killSwitchTrip.bind(engine);
+  }
+
+  const START = "2099-01-02T00:00:00.000Z";
+
+  it("(a) CORE FIX: losses spread out with gaps LARGER than the window do NOT chain and do NOT trip", () => {
+    let now = START;
+    const { engine, store } = makeEngine({
+      nowIso: () => now,
+      config: { scratchEpsilonUsd: 0.1, maxConsecutiveLosses: 5, consecutiveLossWindowHours: 24 },
+    });
+    const apply = ledger(engine);
+    const tripFn = trip(engine);
+
+    // 5 real losses, each 30h apart — wider than the 24h window every time (mirrors the reported
+    // "one 3 days ago, one today, across independently-ticking lanes" false-trip scenario).
+    for (let i = 0; i < 5; i++) {
+      apply(-2);
+      now = new Date(Date.parse(now) + 30 * 3_600_000).toISOString();
+    }
+
+    // Every loss landed outside the window of the previous one, so the streak restarts each time —
+    // it must NEVER have accumulated past 1, and the account-wide kill-switch must never trip.
+    expect(store.getState().consecutiveLosses).toBe(1);
+    expect(tripFn()).toBeNull();
+  });
+
+  it("(b) NO REGRESSION: losses within the window still chain into a trip exactly as before", () => {
+    let now = START;
+    const { engine, store } = makeEngine({
+      nowIso: () => now,
+      config: { scratchEpsilonUsd: 0.1, maxConsecutiveLosses: 5, consecutiveLossWindowHours: 24 },
+    });
+    const apply = ledger(engine);
+    const tripFn = trip(engine);
+
+    // 5 real losses, each only 2h apart — a genuine tight cluster (the correlated-failure
+    // signature this breaker exists to catch), well inside the 24h window every time.
+    for (let i = 0; i < 5; i++) {
+      apply(-2);
+      now = new Date(Date.parse(now) + 2 * 3_600_000).toISOString();
+    }
+
+    expect(store.getState().consecutiveLosses).toBe(5);
+    expect(tripFn()).toBe("max consecutive losses hit (5 within 24h of each other)");
+  });
+
+  it("(c) a win still resets BOTH the counter and the last-loss timestamp", () => {
+    let now = START;
+    const { engine, store } = makeEngine({
+      nowIso: () => now,
+      config: { scratchEpsilonUsd: 0.1, consecutiveLossWindowHours: 24 },
+    });
+    const apply = ledger(engine);
+
+    apply(-2);
+    apply(-2);
+    expect(store.getState().consecutiveLosses).toBe(2);
+    expect(store.getState().lastLossAtMs).not.toBeNull();
+
+    apply(1.5); // a real win
+    expect(store.getState().consecutiveLosses).toBe(0);
+    expect(store.getState().lastLossAtMs).toBeNull();
+  });
+
+  it("(d) the production SingleSymbolLaneExecutor path (recordExternalConsecutiveLossOutcome) also respects the window", () => {
+    let now = START;
+    const { engine, store } = makeEngine({
+      nowIso: () => now,
+      config: { scratchEpsilonUsd: 0.1, maxConsecutiveLosses: 2, consecutiveLossWindowHours: 24 },
+    });
+    const tripFn = trip(engine);
+
+    engine.recordExternalConsecutiveLossOutcome(-2); // e.g. RC lane loses, 3 days ago
+    now = new Date(Date.parse(now) + 72 * 3_600_000).toISOString(); // 3 days later
+    engine.recordExternalConsecutiveLossOutcome(-2); // e.g. CE-FAST_LONG lane loses today
+
+    // Must NOT chain into a 2-loss streak just because both came from real-money lanes — they're
+    // 3 days apart, far outside the 24h window.
+    expect(store.getState().consecutiveLosses).toBe(1);
+    expect(tripFn()).toBeNull();
+  });
+
+  it("windowed losses that stay inside each successive gap can still chain past the window's own width", () => {
+    // Deliberately verifies this is a ROLLING gap-since-last-loss window, not a fixed calendar
+    // bucket: 4 losses each 20h apart span 60h total (> the 24h window width) but every individual
+    // gap is inside the window, so the streak must still chain all the way to 4.
+    let now = START;
+    const { engine, store } = makeEngine({
+      nowIso: () => now,
+      config: { scratchEpsilonUsd: 0.1, maxConsecutiveLosses: 10, consecutiveLossWindowHours: 24 },
+    });
+    const apply = ledger(engine);
+    for (let i = 0; i < 4; i++) {
+      apply(-2);
+      now = new Date(Date.parse(now) + 20 * 3_600_000).toISOString();
+    }
+    expect(store.getState().consecutiveLosses).toBe(4);
   });
 });
 

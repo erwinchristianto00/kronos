@@ -100,6 +100,32 @@ export interface LiveExecutionConfig {
   maxClusterPositions: number;
   dailyMaxLossUsd: number;
   maxConsecutiveLosses: number;
+  /**
+   * 2026-07-19 real-money audit follow-up (time-window bound on the consecutive-loss streak):
+   * once recordExternalConsecutiveLossOutcome() wired ALL 9 SingleSymbolLaneExecutor instances
+   * (RC/RCS/CE-x4/SF/IM/PWR) into this counter — not just the previously-sole, permanently
+   * 0%-weight legacy CG_*-variant-matrix feeder — maxConsecutiveLosses stopped being dormant and
+   * started being fed continuously by the lanes that actually hold real money. But the counter was
+   * (and, before this field, always had been) UNBOUNDED IN TIME: a loss 3 days ago and a loss today,
+   * on two independently-ticking lanes with no real correlation, chained into the same "streak" and
+   * could trip the account-wide force-flatten kill-switch for ordinary multi-day trading variance,
+   * not a genuine correlated failure (broken strategy/data feed/bug).
+   *
+   * This bounds how long a loss stays "chainable": if the gap since the last COUNTED loss exceeds
+   * this many hours, the next loss starts a FRESH streak (count=1) instead of incrementing the old
+   * one — see noteConsecutiveLoss()'s doc comment. Default 24h chosen from this account's real
+   * cadence: RC/CE-Wide/CE-Fast combined have historically closed roughly 1-2 trades/day across all
+   * 3 lanes, so consecutive closes on an ordinary trading day are commonly 6-24h apart even when
+   * they land in different lanes — a 24h window still lets a same-day cluster of losses (the actual
+   * correlated-failure signature: several losses close together in time) chain and trip the breaker
+   * exactly as before, while a loss 3 days apart from the last one (this account's reported false-trip
+   * scenario) now starts fresh instead of chaining. A shorter window (1-2h) would defeat the entire
+   * point of counting a streak across a normal multi-lane trading day (real closes routinely land
+   * hours apart); a much longer one (1 week) barely changes today's broken unbounded behavior.
+   * Configurable via LIVE_CONSECUTIVE_LOSS_WINDOW_HOURS for an operator to retune as real cadence
+   * data accumulates.
+   */
+  consecutiveLossWindowHours: number;
   /** Testnet-only opt-out for account-wide automatic breaker trips. Manual kill, stops,
    * reconciliation, and exchange-error safety remain active. */
   autoKillSwitchEnabled: boolean;
@@ -285,6 +311,7 @@ export function parseLiveExecutionConfig(env: NodeJS.ProcessEnv = process.env): 
     maxClusterPositions: envNonNegativeInt(env.LIVE_MAX_CLUSTER_POSITIONS, 3),
     dailyMaxLossUsd: envNum(env.LIVE_DAILY_MAX_LOSS_USD, 15),
     maxConsecutiveLosses: Math.floor(envNum(env.LIVE_MAX_CONSECUTIVE_LOSSES, 5)),
+    consecutiveLossWindowHours: envNum(env.LIVE_CONSECUTIVE_LOSS_WINDOW_HOURS, 24),
     autoKillSwitchEnabled: liveEnv !== "testnet" || env.LIVE_TESTNET_AUTO_KILL_SWITCH !== "0",
     scratchEpsilonUsd: envNum(env.LIVE_SCRATCH_EPSILON_USD, Math.max(0.05, 0.02 * envNum(env.LIVE_RISK_USD_PER_TRADE, 5))),
     maxDrawdownUsd: envNum(env.LIVE_MAX_DRAWDOWN_USD, 40),
@@ -638,6 +665,14 @@ interface LiveExecutionState {
   lastSeenCreatedAt: string;
   dailyLedger: LiveDailyLedger;
   consecutiveLosses: number;
+  /** Wall-clock (ms since epoch) of the most recently COUNTED loss in the consecutiveLosses streak
+   *  above — null if the streak is currently 0 (never started, or last reset by a win/resetKill()).
+   *  Read by noteConsecutiveLoss() to decide whether the NEXT loss chains onto this streak (gap <=
+   *  config.consecutiveLossWindowHours) or starts a fresh one (gap exceeds it). See
+   *  consecutiveLossWindowHours's doc comment on LiveExecutionConfig for the incident this bounds.
+   *  Optional/undefined on state persisted before this field existed — _parse()'s `{...this._empty(),
+   *  ...parsed}` merge seeds it to null (the safe "no prior counted loss" default) on first load. */
+  lastLossAtMs: number | null;
   totalRealizedPnlUsd: number;
   /** Peak of totalRealizedPnlUsd — drawdown kill-switch baseline. */
   realizedPeakUsd: number;
@@ -793,6 +828,7 @@ export class LiveExecutionStore {
       lastSeenCreatedAt: new Date().toISOString(),
       dailyLedger: { dateUtc: new Date().toISOString().slice(0, 10), realizedPnlUsd: 0, wins: 0, losses: 0 },
       consecutiveLosses: 0,
+      lastLossAtMs: null,
       totalRealizedPnlUsd: 0,
       realizedPeakUsd: 0,
       mirrorAttempts: {},
@@ -1730,6 +1766,7 @@ export class LiveExecutionEngine {
     st.killedAt = null;
     st.killReason = null;
     st.consecutiveLosses = 0;
+    st.lastLossAtMs = null;
     st.realizedPeakUsd = st.totalRealizedPnlUsd;
     st.combinedRealizedPeakUsd = st.totalRealizedPnlUsd + this.safeExternalRealizedPnlUsd().allTime;
     this.store.save();
@@ -1900,6 +1937,7 @@ export class LiveExecutionEngine {
         maxClusterPositions: this.config.maxClusterPositions,
         dailyMaxLossUsd: this.config.dailyMaxLossUsd,
         maxConsecutiveLosses: this.config.maxConsecutiveLosses,
+        consecutiveLossWindowHours: this.config.consecutiveLossWindowHours,
         autoKillSwitchEnabled: this.config.autoKillSwitchEnabled,
         scratchEpsilonUsd: this.config.scratchEpsilonUsd,
         maxDrawdownUsd: this.config.maxDrawdownUsd,
@@ -2592,6 +2630,30 @@ export class LiveExecutionEngine {
     }
   }
 
+  /**
+   * 2026-07-19 real-money audit follow-up (time-window bound): the single choke point every loss
+   * increment must go through — recordExternalConsecutiveLossOutcome() and BOTH branches of
+   * applyRealizedToLedger() (the known-net path and the net===null/UNKNOWN-outcome path) all call
+   * this instead of doing `st.consecutiveLosses += 1` directly, so the window logic can never be
+   * applied on some paths and forgotten on others (see consecutiveLossWindowHours's doc comment on
+   * LiveExecutionConfig for the incident this fixes).
+   *
+   * Chains onto the existing streak only if a loss was already counted (lastLossAtMs set) AND the
+   * gap since it is within config.consecutiveLossWindowHours; otherwise starts a fresh streak at 1.
+   * Always stamps lastLossAtMs to now so the NEXT loss's gap is measured from THIS one, not the
+   * streak's original start — i.e. this is a rolling "gap since last loss" window, not a fixed
+   * calendar bucket, so a genuine tight cluster of losses spanning slightly more than one window's
+   * width can still chain (each individual gap stays inside the window) while an isolated loss
+   * days after the last one always starts over.
+   */
+  private noteConsecutiveLoss(st: LiveExecutionState): void {
+    const nowMs = Date.parse(this.nowIso());
+    const windowMs = Math.max(0, this.config.consecutiveLossWindowHours) * 60 * 60 * 1000;
+    const withinWindow = st.lastLossAtMs != null && nowMs - st.lastLossAtMs <= windowMs;
+    st.consecutiveLosses = withinWindow ? st.consecutiveLosses + 1 : 1;
+    st.lastLossAtMs = nowMs;
+  }
+
   private killSwitchTrip(): string | null {
     // Existing config fixtures and persisted callers predate this testnet-only option.
     // Only an explicit false disables automatic trips; missing remains safely enabled.
@@ -2608,7 +2670,10 @@ export class LiveExecutionEngine {
       );
     }
     if (st.consecutiveLosses >= this.config.maxConsecutiveLosses) {
-      return `max consecutive losses hit (${st.consecutiveLosses})`;
+      return (
+        `max consecutive losses hit (${st.consecutiveLosses} within ` +
+        `${this.config.consecutiveLossWindowHours}h of each other)`
+      );
     }
     const combinedTotalPnl = st.totalRealizedPnlUsd + external.allTime;
     const combinedPeak = Math.max(st.combinedRealizedPeakUsd ?? st.realizedPeakUsd, combinedTotalPnl);
@@ -2662,9 +2727,10 @@ export class LiveExecutionEngine {
     const isScratch = Math.abs(netUsd) < this.config.scratchEpsilonUsd;
     if (isScratch) return;
     if (netUsd < 0) {
-      st.consecutiveLosses += 1;
+      this.noteConsecutiveLoss(st);
     } else {
       st.consecutiveLosses = 0;
+      st.lastLossAtMs = null;
     }
     this.store.save();
   }
@@ -3954,7 +4020,7 @@ export class LiveExecutionEngine {
       // reconciliation's ledger-vs-Binance-income check is the safety net for the true number),
       // but DO count the loss-streak conservatively — an unknown outcome must never look neutral.
       st.dailyLedger.losses += 1;
-      st.consecutiveLosses += 1;
+      this.noteConsecutiveLoss(st);
       return;
     }
     st.dailyLedger.realizedPnlUsd += net;
@@ -3974,10 +4040,11 @@ export class LiveExecutionEngine {
       const isLoss = classification === "adverse" || net < 0;
       if (isLoss) {
         st.dailyLedger.losses += 1;
-        st.consecutiveLosses += 1;
+        this.noteConsecutiveLoss(st);
       } else {
         st.dailyLedger.wins += 1;
         st.consecutiveLosses = 0;
+        st.lastLossAtMs = null;
       }
     }
     st.totalRealizedPnlUsd += net;
