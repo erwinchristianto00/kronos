@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { BinanceClient, BinanceRequestError, computeBasis } from "../src/lib/binance.js";
 
@@ -20,6 +20,12 @@ function makeKlinePayload() {
 }
 
 describe("BinanceClient", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    delete process.env.BINANCE_CACHE_MAX_ENTRIES;
+    delete process.env.SCAN_CANDLE_CACHE_TTL_MS;
+  });
+
   it("serves rapid repeated klines from the short read-through cache", async () => {
     const successPayload = makeKlinePayload();
     let calls = 0;
@@ -83,6 +89,104 @@ describe("BinanceClient", () => {
     await expect(client.getCandles("BTCUSDT", "5m", 3)).rejects.toMatchObject<Partial<BinanceRequestError>>({
       failureType: "timeout",
       stage: "candles_5m",
+    });
+  });
+
+  describe("kline cache eviction (OOM regression)", () => {
+    // Root cause: getCacheIdentityParams() folds a time-bucketed cacheLatestOpenTime into
+    // the klines cache key so each candle-close bucket rollover mints a brand-new cache
+    // entry. Nothing ever evicted the *previous* bucket's entry — getFreshCache() only
+    // checked TTL on read, and setCache() only ever added keys — so the map grew without
+    // bound for hours until the process OOM'd. This suite proves the added prune-on-save
+    // sweep actually removes stale time-bucketed entries as buckets roll forward, without
+    // ever evicting an entry that is still within its TTL.
+
+    it("does not let the cache grow unboundedly as the 1m kline bucket rolls forward for hours (fails without the fix)", async () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+
+      const successPayload = makeKlinePayload();
+      let calls = 0;
+      const fetchImpl = vi.fn(async () => {
+        calls += 1;
+        return new Response(JSON.stringify(successPayload), { status: 200 });
+      });
+      const client = new BinanceClient(fetchImpl as typeof fetch);
+
+      const BUCKET_ROLLOVERS = 200; // ~3.3 hours of 1m candles ticking every minute
+      for (let i = 0; i < BUCKET_ROLLOVERS; i += 1) {
+        await client.getCandles("BTCUSDT", "1m", 3);
+        // Advance past the 1m bucket boundary (mints a new cacheLatestOpenTime key) and
+        // past the default 30s kline TTL / prune-throttle interval, so every iteration
+        // both busts the previous cache entry and gives the prune sweep a chance to run.
+        await vi.advanceTimersByTimeAsync(60_000);
+      }
+
+      // Every iteration was a genuine cache miss (new bucket each time) and hit Binance live.
+      expect(calls).toBe(BUCKET_ROLLOVERS);
+
+      // Without eviction this map would hold one permanent dead entry per rollover
+      // (200 entries here; unboundedly many over a real multi-hour run). With the
+      // TTL-based prune sweep, only the most recent bucket's entry should remain live.
+      const finalCacheSize = client._getCacheSizeForTests();
+      expect(finalCacheSize).toBeLessThan(BUCKET_ROLLOVERS);
+      expect(finalCacheSize).toBeLessThanOrEqual(2);
+    });
+
+    it("still serves a fresh-within-TTL kline cache entry unchanged, and only refetches once the TTL truly elapses", async () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+
+      const successPayload = makeKlinePayload();
+      let calls = 0;
+      const fetchImpl = vi.fn(async () => {
+        calls += 1;
+        return new Response(JSON.stringify(successPayload), { status: 200 });
+      });
+      const client = new BinanceClient(fetchImpl as typeof fetch);
+
+      await client.getCandles("BTCUSDT", "1m", 3);
+      expect(calls).toBe(1);
+
+      // Still within the 30s default TTL and within the same 1m bucket: must remain a hit.
+      await vi.advanceTimersByTimeAsync(25_000);
+      const cached = await client.getCandles("BTCUSDT", "1m", 3);
+      expect(cached).toHaveLength(3);
+      expect(calls).toBe(1);
+      expect(client.getSymbolFetchSummary("BTCUSDT").mode).toBe("CACHE_FRESH");
+
+      // 35s after the original write (still the same 1m bucket, so same cache key) is past
+      // the 30s TTL: the read path must naturally refetch, exactly as before this change.
+      await vi.advanceTimersByTimeAsync(10_000);
+      await client.getCandles("BTCUSDT", "1m", 3);
+      expect(calls).toBe(2);
+    });
+
+    it("enforces BINANCE_CACHE_MAX_ENTRIES as a hard cap, evicting oldest entries first", async () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+      // Long TTL so this test isolates hard-cap eviction from TTL-based eviction.
+      process.env.SCAN_CANDLE_CACHE_TTL_MS = "300000";
+      process.env.BINANCE_CACHE_MAX_ENTRIES = "3";
+
+      const successPayload = makeKlinePayload();
+      const fetchImpl = vi.fn(async () => new Response(JSON.stringify(successPayload), { status: 200 }));
+      const client = new BinanceClient(fetchImpl as typeof fetch);
+
+      // Write 5 distinct symbols in quick succession (well inside the 30s prune-throttle
+      // window, so the sweep only actually runs once, on the very first write).
+      for (const symbol of ["BTCUSDT", "ETHUSDT", "SOLUSDT", "ADAUSDT", "XRPUSDT"]) {
+        await client.getCandles(symbol, "1m", 3);
+        await vi.advanceTimersByTimeAsync(1_000);
+      }
+      expect(client._getCacheSizeForTests()).toBe(5);
+
+      // Clear the prune throttle, then write one more entry. TTL alone would not evict
+      // anything here (everything is well under the 300s TTL) — only the hard cap should.
+      await vi.advanceTimersByTimeAsync(31_000);
+      await client.getCandles("DOGEUSDT", "1m", 3);
+
+      expect(client._getCacheSizeForTests()).toBeLessThanOrEqual(3);
     });
   });
 

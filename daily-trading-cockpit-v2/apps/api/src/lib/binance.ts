@@ -7,6 +7,14 @@ const BINANCE_FUTURES_BASE_URL = "https://fapi.binance.com";
 const REQUEST_TIMEOUT_MS = 6_000;
 const MAX_RETRIES = 2;
 const DEFAULT_KLINE_CACHE_TTL_MS = 30_000;
+// Throttle for the stale-entry sweep in BinanceClient.pruneStaleCache() — the sweep
+// piggybacks on every setCache() write (no dedicated timer), so this bounds how often
+// it actually walks the map.
+const CACHE_PRUNE_INTERVAL_MS = 30_000;
+// Defense-in-depth hard cap: even if TTL-based pruning somehow falls behind (e.g. a burst
+// of never-again-requested symbol/interval combinations), the map is truncated back down
+// to this many entries, oldest (by cachedAt) evicted first.
+const DEFAULT_BINANCE_CACHE_MAX_ENTRIES = 5_000;
 
 type BinanceKline = [
   number,
@@ -149,6 +157,10 @@ type FetchSourceMode = "LIVE" | "CACHE_FRESH";
 
 interface CacheEntry<T> {
   cachedAt: number;
+  // TTL in effect when this entry was written, captured once at write time so
+  // pruneStaleCache() can evict stale entries without re-deriving TTL from a bare
+  // cache key (path/params are no longer available once the entry only lives in the map).
+  ttlMs: number;
   value: T;
 }
 
@@ -221,6 +233,7 @@ function intervalMs(interval: string | undefined): number | null {
 export class BinanceClient {
   private readonly cache = new Map<string, CacheEntry<unknown>>();
   private readonly symbolFetchSummary = new Map<string, SymbolFetchSummary>();
+  private lastCachePruneAt = 0;
 
   constructor(
     private readonly fetchImpl: typeof fetch = fetch,
@@ -229,6 +242,11 @@ export class BinanceClient {
 
   resetFetchSummary(): void {
     this.symbolFetchSummary.clear();
+  }
+
+  /** @internal test-only accessor — do not call from production code. */
+  _getCacheSizeForTests(): number {
+    return this.cache.size;
   }
 
   getSymbolFetchSummary(symbol: string): SymbolFetchSummary {
@@ -321,11 +339,42 @@ export class BinanceClient {
     return cached.value as T;
   }
 
-  private setCache<T>(cacheKey: string, value: T): void {
+  private setCache<T>(cacheKey: string, value: T, ttlMs: number): void {
     this.cache.set(cacheKey, {
       cachedAt: Date.now(),
+      ttlMs,
       value,
     });
+    // Prune-on-save (same convention as ParallelShadowExperimentStore.save()/prune()):
+    // piggyback stale-entry eviction on the existing write path instead of a new timer.
+    // Without this, time-bucketed kline cache keys (see getCacheIdentityParams) mint a
+    // brand-new permanent entry every time a candle's bucket rolls over, and the old
+    // bucket's entry is never otherwise removed — this is the root cause of the
+    // multi-hour unbounded heap growth / OOM crash pattern.
+    this.pruneStaleCache();
+  }
+
+  private pruneStaleCache(): void {
+    const now = Date.now();
+    if (now - this.lastCachePruneAt < CACHE_PRUNE_INTERVAL_MS) {
+      return;
+    }
+    this.lastCachePruneAt = now;
+
+    for (const [key, entry] of this.cache) {
+      if (now - entry.cachedAt > entry.ttlMs) {
+        this.cache.delete(key);
+      }
+    }
+
+    const maxEntries = positiveEnvInt(process.env.BINANCE_CACHE_MAX_ENTRIES, DEFAULT_BINANCE_CACHE_MAX_ENTRIES);
+    if (this.cache.size > maxEntries) {
+      const oldestFirst = [...this.cache.entries()].sort((a, b) => a[1].cachedAt - b[1].cachedAt);
+      const excess = this.cache.size - maxEntries;
+      for (let i = 0; i < excess; i += 1) {
+        this.cache.delete(oldestFirst[i]![0]);
+      }
+    }
   }
 
   private async fetchWithTimeout(url: URL, stage: string): Promise<Response> {
@@ -396,7 +445,7 @@ export class BinanceClient {
           const payload = (await response.json()) as T;
           this.updateSymbolFetchSummary(symbol, stage, "LIVE");
           if (useCache) {
-            this.setCache(cacheKey, payload);
+            this.setCache(cacheKey, payload, ttlMs);
           }
           return payload;
         } catch (error) {
