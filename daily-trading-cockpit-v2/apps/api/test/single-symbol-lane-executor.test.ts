@@ -386,6 +386,9 @@ describe("SingleSymbolLaneExecutor — entry", () => {
     const { executor, store } = makeExecutor({ signals: [signal()], legUsd: 1 }); // 1/60000 << minQty 0.001
     await executor.tick();
     expect(store.getState().positions.length).toBe(0);
+    // 2026-07-19 real-money audit fix: this structural rejection used to leave lastEntrySkipReason
+    // null, unlike every other skip branch in this function.
+    expect(executor.getStatus().lastEntrySkipReason).toMatch(/below exchange minQty/i);
   });
 
   it("skips an entry that clears minQty but fails MIN_NOTIONAL", async () => {
@@ -395,6 +398,30 @@ describe("SingleSymbolLaneExecutor — entry", () => {
     const { executor, store } = makeExecutor({ signals: [dogeSignal], legUsd: 0.5 });
     await executor.tick();
     expect(store.getState().positions.length).toBe(0);
+    // 2026-07-19 real-money audit fix: see minQty's identical comment above.
+    expect(executor.getStatus().lastEntrySkipReason).toMatch(/below exchange minNotional/i);
+  });
+
+  it("[ENTRY-SKIP-REASON, 2026-07-19 fix] sets lastEntrySkipReason (instead of silently leaving it null) for every other structural sizing rejection", async () => {
+    // Covers the remaining silent branches from the same audit: missing exchange filters, invalid
+    // legUsd, and invalid entryPrice. Each ran its OWN tick/executor so one rejection's message
+    // can't be masked by a later signal's success within the same tick.
+    const noFilterSignal = signal({ observationId: "sf:UNKNOWNUSDT:1", symbol: "UNKNOWNUSDT" });
+    const { executor: filtersExecutor, store: filtersStore } = makeExecutor({ signals: [noFilterSignal], legUsd: 10_000 });
+    await filtersExecutor.tick();
+    expect(filtersStore.getState().positions.length).toBe(0);
+    expect(filtersExecutor.getStatus().lastEntrySkipReason).toMatch(/UNKNOWNUSDT.*exchange filters unavailable/i);
+
+    const { executor: legUsdExecutor, store: legUsdStore } = makeExecutor({ signals: [signal()], legUsd: 0 });
+    await legUsdExecutor.tick();
+    expect(legUsdStore.getState().positions.length).toBe(0);
+    expect(legUsdExecutor.getStatus().lastEntrySkipReason).toMatch(/invalid leg size/i);
+
+    const zeroPriceSignal = signal({ entryPrice: 0 });
+    const { executor: priceExecutor, store: priceStore } = makeExecutor({ signals: [zeroPriceSignal], legUsd: 10_000 });
+    await priceExecutor.tick();
+    expect(priceStore.getState().positions.length).toBe(0);
+    expect(priceExecutor.getStatus().lastEntrySkipReason).toMatch(/entry price unavailable/i);
   });
 
   it("[STEPSIZE-EPSILON, 2026-07-19 fix] a stepSize floor that would floating-point-undershoot by exactly one step opens at the mathematically correct quantity instead of silently dropping the signal", async () => {
@@ -489,6 +516,9 @@ describe("SingleSymbolLaneExecutor — entry", () => {
       });
       await executor.tick();
       expect(store.getState().positions.length).toBe(0);
+      // 2026-07-19 real-money audit fix: this structural rejection used to leave lastEntrySkipReason
+      // null, unlike every other skip branch in this function.
+      expect(executor.getStatus().lastEntrySkipReason).toMatch(/BTCUSDT.*cross-lane per-symbol notional cap exceeded/i);
     });
 
     it("opens when combined notional stays within the cap", async () => {

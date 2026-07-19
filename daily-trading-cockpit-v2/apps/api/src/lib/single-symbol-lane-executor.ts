@@ -1054,6 +1054,10 @@ export class SingleSymbolLaneExecutor {
           .filter((p) => p.status === "OPEN" && p.symbol === signal.symbol)
           .reduce((sum, p) => sum + p.qty * p.entryPrice, 0);
         if (this.existingNotionalForSymbolFn(signal.symbol) + ownSameSymbolNotional + this.effectiveLegUsd() > notionalCap) {
+          // 2026-07-19 real-money audit fix: every OTHER skip branch in this function sets
+          // lastEntrySkipReason; this one (and the structural rejections below) silently left it
+          // null, giving the operator zero diagnostic for why a candidate was rejected.
+          this.lastEntrySkipReason = `${signal.symbol}: cross-lane per-symbol notional cap exceeded (cap ${notionalCap})`;
           continue;
         }
       }
@@ -1080,8 +1084,16 @@ export class SingleSymbolLaneExecutor {
       this.store.save();
 
       const legUsd = this.effectiveLegUsd();
-      if (!(legUsd > 0)) continue;
-      if (!(signal.entryPrice > 0)) continue;
+      if (!(legUsd > 0)) {
+        // 2026-07-19 real-money audit fix: see the notional-cap skip's identical comment above —
+        // this was another silent structural rejection.
+        this.lastEntrySkipReason = `${signal.symbol}: invalid leg size (legUsd=${legUsd})`;
+        continue;
+      }
+      if (!(signal.entryPrice > 0)) {
+        this.lastEntrySkipReason = `${signal.symbol}: entry price unavailable`;
+        continue;
+      }
 
       // 2026-07-12 fix: everything from here down makes real network calls (exchange filters,
       // leverage, the entry order itself) — a transient failure (network blip, margin, rate
@@ -1092,7 +1104,11 @@ export class SingleSymbolLaneExecutor {
       try {
         const filters = await this.client.getExchangeFilters();
         const f = filters.get(signal.symbol);
-        if (!f) continue;
+        if (!f) {
+          // 2026-07-19 real-money audit fix: see the notional-cap skip's comment above.
+          this.lastEntrySkipReason = `${signal.symbol}: exchange filters unavailable`;
+          continue;
+        }
         const rawQty = legUsd / signal.entryPrice;
         // 2026-07-19 real-money audit fix: the previous manual `Math.floor(rawQty / f.stepSize) *
         // f.stepSize` had no epsilon guard, so plain floating-point representation error (e.g.
@@ -1105,8 +1121,17 @@ export class SingleSymbolLaneExecutor {
         // against minQty/minNotional below is the SAME size actually sent, and never rounds a
         // genuinely-below-threshold value up into passing.
         const qty = roundToStep(rawQty, f.stepSize, "down");
-        if (!(qty >= f.minQty)) continue;
-        if (!(qty * signal.entryPrice >= f.minNotional)) continue; // Binance rejects an order that clears minQty but misses MIN_NOTIONAL
+        if (!(qty >= f.minQty)) {
+          // 2026-07-19 real-money audit fix: see the notional-cap skip's comment above.
+          this.lastEntrySkipReason = `${signal.symbol}: quantity ${qty} below exchange minQty ${f.minQty}`;
+          continue;
+        }
+        const notional = qty * signal.entryPrice;
+        if (!(notional >= f.minNotional)) {
+          // Binance rejects an order that clears minQty but misses MIN_NOTIONAL.
+          this.lastEntrySkipReason = `${signal.symbol}: notional ${notional.toFixed(2)} below exchange minNotional ${f.minNotional}`;
+          continue;
+        }
 
         // Symbol fragment keeps this unique even when 2+ candidates share the identical openedAtMs
         // (the exact scenario that exposed the dedup bug above).
