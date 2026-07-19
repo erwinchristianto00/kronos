@@ -3502,27 +3502,45 @@ export class LiveExecutionEngine {
     });
 
     // The flip order closed the opposing leg(s): book their realized loss and close them.
+    //
+    // 2026-07-19 real-money audit fix (BUG 2, MEDIUM): settleIntentAfterClose sums ALL trades
+    // matching the SAME flip.orderId since an intent's createdAt — with 2+ opposing intents on the
+    // same symbol, calling it once PER intent returned the IDENTICAL total flip P&L every time
+    // (there is only ever ONE real close), and the old code then called applyRealizedToLedger(r)
+    // once per intent too — double-(or N-times-)booking a SINGLE real fill's P&L into
+    // totalRealizedPnlUsd/dailyLedger/consecutive-loss. Settle the flip's real P&L EXACTLY ONCE
+    // (anchored on the earliest-opened opposing intent, so the trade-search window safely covers
+    // every opposing intent's history), then attribute it to each intent proportionally by its own
+    // qty share for display/rescuePriorRealizedUsd — the shares sum back to the one real amount,
+    // and the ledger only ever sees it once.
+    const anchorIntent = opposingIntents.reduce(
+      (earliest, i) => (i.createdAt < earliest.createdAt ? i : earliest),
+      opposingIntents[0]!,
+    );
+    const flipSettled = await this.settleIntentAfterClose(anchorIntent, [flip.orderId]);
+    const flipNet = flipSettled?.netUsd ?? null;
+    const flipFees = flipSettled?.feesUsd ?? null;
+    const totalOpposingQty = opposingIntents.reduce((sum, i) => sum + Math.abs(i.qty), 0);
     let priorRealized = 0;
     for (const oi of opposingIntents) {
-      const rSettled = await this.settleIntentAfterClose(oi, [flip.orderId]);
-      const r = rSettled?.netUsd ?? null;
-      if (r === null) {
+      const share = totalOpposingQty > 1e-12 ? Math.abs(oi.qty) / totalOpposingQty : 1 / opposingIntents.length;
+      const oiNet = flipNet === null ? null : flipNet * share;
+      if (oiNet === null) {
         oi.lastError = "rescue flip: P&L UNKNOWN — trades fetch failed; wallet-reconciliation will catch the true amount";
       } else {
-        priorRealized += r;
+        priorRealized += oiNet;
       }
-      oi.realizedPnlUsd = r;
-      // Pre-existing attribution note: with >1 opposing intents the SAME flip order's trades are
-      // summed into each intent (double-counted across intents) — unchanged here for fees, which
-      // inherit exactly the realizedPnlUsd attribution semantics above.
-      oi.feesUsd = rSettled?.feesUsd ?? null;
+      oi.realizedPnlUsd = oiNet;
+      oi.feesUsd = flipFees === null ? null : flipFees * share;
       oi.state = "CLOSED";
       oi.closedAt = this.nowIso();
       this.stampExitControllerSnapshot(oi);
       oi.updatedAt = this.nowIso();
       oi.closeReason = "RESCUE_FLIP";
-      this.applyRealizedToLedger(r);
     }
+    // Book the ONE real P&L outcome exactly once, regardless of how many opposing intents it
+    // resolved (see doc comment above) — this is the fix: previously this ran once per intent.
+    this.applyRealizedToLedger(flipNet);
     try {
       await this.client.cancelAllOrders(action.symbol);
       await this.client.cancelAllAlgoOrders(action.symbol);

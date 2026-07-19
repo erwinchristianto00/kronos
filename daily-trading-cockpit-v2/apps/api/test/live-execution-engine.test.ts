@@ -88,6 +88,10 @@ class FakeLiveClient {
   failAddEntry = false;
   /** When set, each reduce-only MARKET flatten books a userTrade with this realizedPnl on its own order id. */
   flattenRealizedPnl: number | null = null;
+  /** [BUG 2 test support] When set, the rescue-flip's own non-reduceOnly MARKET order (clientOrderId
+   *  prefix "dtc-rescue-") books a userTrade with this realizedPnl on its own order id — lets a test
+   *  observe the flip's single REAL P&L without having to predict generated order ids. */
+  rescueFlipRealizedPnl: number | null = null;
   /** Simulates Binance /userTrades eventual consistency after a just-placed close. */
   hideTradesForCalls = 0;
   getUserTradesCalls = 0;
@@ -179,6 +183,9 @@ class FakeLiveClient {
         p.symbol,
         (this.positionsBySymbol.get(p.symbol) ?? 0) + (p.side === "BUY" ? 1 : -1) * p.quantity,
       );
+      if (p.newClientOrderId?.startsWith("dtc-rescue-") && this.rescueFlipRealizedPnl != null) {
+        this.trades.push({ symbol: p.symbol, orderId, price: 0, qty: p.quantity, realizedPnl: this.rescueFlipRealizedPnl, commission: 0, commissionAsset: "USDT", time: 1 });
+      }
     }
     if (p.type === "MARKET" && p.reduceOnly) {
       this.positionsBySymbol.set(p.symbol, 0);
@@ -4729,5 +4736,91 @@ describe("[BUG 1] kill-switch flatten failure tracking + retry", () => {
     expect(st.intents[0]!.state).toBe("KILLED");
     expect(st.killSwitchFlattenFailedIntentIds).toEqual([]);
     expect((engine.getStatus() as unknown as { killSwitchFlattenFailures: unknown[] }).killSwitchFlattenFailures).toEqual([]);
+  });
+});
+
+// ── 2026-07-19 real-money audit fix (BUG 2) ─────────────────────────────────
+
+describe("[BUG 2] rescue flip: single real P&L across multiple opposing intents", () => {
+  const RESCUE_LIVE = {
+    enabled: true,
+    minAgeMs: 60 * 60 * 1000,
+    minLossUsd: 1,
+    netFraction: 1,
+    maxNotionalUsd: 5000,
+    targetUsd: 0,
+    maxSymbols: 2,
+    minAvailableBalanceUsd: 10,
+    maxHoldMs: 24 * 60 * 60 * 1000,
+  };
+  const SHORT_REGIME = () => ({ regime: "Bearish", mode: "SHORT_ONLY", capturedAt: new Date().toISOString() });
+
+  function pushIntent(store: ReturnType<typeof makeEngine>["store"], over: Record<string, unknown>) {
+    store.getState().intents.push({
+      paperOrderId: "p-x",
+      symbol: "ETHUSDT",
+      direction: "LONG",
+      state: "OPEN",
+      qty: 1.0,
+      tp1Qty: 0,
+      plannedEntryPrice: 2000,
+      stopLossPrice: 1900,
+      tp1Price: 2100,
+      filledEntryPrice: 2000,
+      entryOrderId: "1",
+      stopOrderId: null,
+      tp1OrderId: null,
+      beStopOrderId: null,
+      realizedPnlUsd: null,
+      feesUsd: null,
+      createdAt: "2099-01-02T10:00:00.000Z",
+      updatedAt: "2099-01-02T10:00:00.000Z",
+      closedAt: null,
+      closeReason: null,
+      lastError: null,
+      ...over,
+    } as never);
+    store.save();
+  }
+
+  it("books the ONE real P&L exactly once across 2 opposing intents resolved by the SAME flip order (previously double-counted)", async () => {
+    const client = new FakeLiveClient();
+    client.positionsBySymbol.set("ETHUSDT", 1.0); // netted engine-share LONG exposure
+    client.markPriceBySymbol.set("ETHUSDT", 1900);
+    client.unrealizedPnlBySymbol.set("ETHUSDT", -5);
+    client.rescueFlipRealizedPnl = -10; // the ONE real flip close realizes exactly -$10
+    const { engine, store } = makeEngine({
+      client,
+      config: { rescue: RESCUE_LIVE, rescueExecute: true, regimeLossHardCutStopFraction: 0 },
+      getControllerSnapshot: SHORT_REGIME,
+    });
+    expect((await engine.arm()).ok).toBe(true);
+    // TWO opposing LONG intents on the SAME symbol summing to the netted position above — the flip
+    // resolves BOTH of them from a SINGLE real close.
+    pushIntent(store, { paperOrderId: "p-eth-a", qty: 0.6 });
+    pushIntent(store, { paperOrderId: "p-eth-b", qty: 0.4 });
+
+    const totalBefore = store.getState().totalRealizedPnlUsd;
+    await engine.tick(); // flip resolves both opposing intents at once
+
+    const intents = store.getState().intents;
+    const a = intents.find((i) => i.paperOrderId === "p-eth-a")!;
+    const b = intents.find((i) => i.paperOrderId === "p-eth-b")!;
+    expect(a.state).toBe("CLOSED");
+    expect(b.state).toBe("CLOSED");
+    expect(a.closeReason).toBe("RESCUE_FLIP");
+    expect(b.closeReason).toBe("RESCUE_FLIP");
+
+    // FIX: the ONE real -$10 outcome is attributed proportionally by qty share (0.6 / 0.4), summing
+    // back to the single real amount — NOT -$10 booked to EACH intent (which would sum to -$20).
+    expect((a.realizedPnlUsd ?? 0) + (b.realizedPnlUsd ?? 0)).toBeCloseTo(-10, 6);
+    expect(a.realizedPnlUsd).toBeCloseTo(-6, 6);
+    expect(b.realizedPnlUsd).toBeCloseTo(-4, 6);
+
+    // FAIL-WITHOUT-FIX: the old code called applyRealizedToLedger(-10) once PER opposing intent,
+    // so totalRealizedPnlUsd would have dropped by -20 (double-counted) and consecutiveLosses by 2.
+    // FIX: the ledger sees the single real P&L exactly once.
+    expect(store.getState().totalRealizedPnlUsd).toBeCloseTo(totalBefore - 10, 6);
+    expect(store.getState().consecutiveLosses).toBe(1);
   });
 });
