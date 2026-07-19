@@ -10,6 +10,7 @@ import { CORTEX_LIVE_BETA, CORTEX_WIN_HURDLE_R } from "./cortex-brain.js";
 import { CORTEX_ATTR_MIN_EXAMPLES_ACTIVE } from "./cortex-attribution.js";
 import { readCortexJournalTail } from "./cortex-journal-reader.js";
 import { getLatestCortexRefitReport } from "./cortex-refit-runner-bindings.js";
+import { resolveFourBrainInstanceId } from "./four-brain-live-gather-bindings.js";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -106,7 +107,12 @@ function causalExclusionReason(row: JsonRecord): string | null {
 }
 
 function resolveCollectionStatus(env: NodeJS.ProcessEnv, dataDir: string) {
-  const instanceId = (env.PORT ?? "unknown").toString().trim() || "unknown";
+  // Must resolve the instance the SAME way the actual journal writer does
+  // (forward-causal-collection.ts's resolveCausalCollectionActivation), so the two can never disagree
+  // about which instance/journal is active. resolveFourBrainInstanceId checks FOUR_BRAIN_INSTANCE_ID
+  // first, falling back to PORT — reading env.PORT directly here would silently diverge from the
+  // writer if FOUR_BRAIN_INSTANCE_ID were ever set to something other than PORT.
+  const instanceId = resolveFourBrainInstanceId(env);
   if (instanceId === "3103") return { active: false, instanceId, reason: "live-3103-blocked" as const, journalPath: null };
   if ((env.CAUSAL_EXPERIENCE_COLLECTION_MODE ?? "").toString().trim().toLowerCase() !== "shadow")
     return { active: false, instanceId, reason: "mode-off" as const, journalPath: null };

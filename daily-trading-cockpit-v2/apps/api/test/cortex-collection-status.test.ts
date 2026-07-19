@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { buildCortexCollectionStatus } from "../src/lib/cortex-collection-status.js";
+import { resolveCausalCollectionActivation } from "../src/experience-engine/forward-causal-collection.js";
 
 const dirs: string[] = [];
 afterEach(() => dirs.splice(0).forEach((dir) => rmSync(dir, { recursive: true, force: true })));
@@ -32,6 +33,32 @@ describe("cortex collection status", () => {
   it("keeps mainnet collection hard-blocked even when its environment says shadow", () => {
     const report = buildCortexCollectionStatus({ env: { PORT: "3103", CAUSAL_EXPERIENCE_COLLECTION_MODE: "shadow" } });
     expect(report.collection).toMatchObject({ mode: "off", instanceId: "3103", status: "live-3103-blocked" });
+  });
+
+  it("resolves the same instance id as the actual journal writer, never off env.PORT alone (2026-07-19 fix)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "cortex-status-instance-")); dirs.push(dir);
+    // FOUR_BRAIN_INSTANCE_ID disagrees with PORT: the real writer (forward-causal-collection.ts) picks
+    // the id via resolveFourBrainInstanceId, which prefers FOUR_BRAIN_INSTANCE_ID over PORT, and journals
+    // to causal-experience/<that id>/events.jsonl. The status endpoint must resolve — and read from —
+    // that same instance, not silently key off env.PORT on its own.
+    const env = {
+      PORT: "3101",
+      FOUR_BRAIN_INSTANCE_ID: "3102",
+      CAUSAL_EXPERIENCE_COLLECTION_MODE: "shadow",
+      CAUSAL_EXPERIENCE_COLLECTION_DIR: dir,
+    };
+    const writerActivation = resolveCausalCollectionActivation(env as unknown as NodeJS.ProcessEnv);
+    expect(writerActivation.instanceId).toBe("3102");
+
+    const causalDir = join(dir, "causal-experience", writerActivation.instanceId); mkdirSync(causalDir, { recursive: true });
+    writeFileSync(join(causalDir, "events.jsonl"), JSON.stringify({ eventType: "OPPORTUNITY_OPEN", openedAtMs: 1_000 }) + "\n");
+
+    const report = buildCortexCollectionStatus({ dataDir: dir, env, nowMs: 2_000 });
+    expect(report.collection.instanceId).toBe(writerActivation.instanceId);
+    expect(report.collection.status).toBe("shadow-active");
+    // Proves it actually located and read the writer's real journal (under 3102/), not a
+    // nonexistent/blocked path derived from raw PORT ("3101").
+    expect(report.lineage.totalEvents).toBe(1);
   });
 
   it("caches the journal read for a short TTL instead of re-parsing on every call (2026-07-19 OOM-shaped fix)", () => {
