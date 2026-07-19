@@ -128,6 +128,26 @@ describe("cortex-attribution — the anti-leakage property (operator's core conc
     expect(l1.unattributedNoDecision).toBe(1);
   });
 
+  it("a stale-flag leak from a NEWER schema-mismatch must not paint an OLDER, differently-caused rejection as SCHEMA_MISMATCH", () => {
+    // Two in-window slices for the same lane. Walk order is newest→oldest:
+    //  - newer slice (t=20min): stale schema (direction OK) — a genuine schema-mismatch candidate.
+    //  - older slice (t=10min): current schema BUT wrong direction — a genuine, UNRELATED rejection.
+    // Neither slice can own the trade, but the true reason is a MIX of causes, not "schema alone" — so the
+    // outcome must be an honest no-owner drop (unattributedNoDecision), never SCHEMA_MISMATCH leaking over
+    // from the newer candidate's rejection reason.
+    const decisions = [
+      decision(10 * MIN, { schema: 1, lanes: { L1: { direction: "SHORT" } } }), // current schema, wrong direction
+      decision(20 * MIN, { schema: 0, lanes: { L1: { direction: "LONG" } } }), // stale schema, right direction
+    ];
+    const o = outcome("L1", 25 * MIN, 100 * MIN, 0.2, "obs-mixed-cause", "LONG");
+    const r = attributeOutcomes(decisions, [o], OPTS);
+    expect(r.examples).toHaveLength(0);
+    const l1 = r.perLane.find((l) => l.laneId === "L1")!;
+    expect(l1.schemaMismatch).toBe(0); // NOT schema-only — a direction-mismatched candidate was also in play
+    expect(l1.unattributedNoDecision).toBe(1);
+    expect(l1.status).toBe("INSUFFICIENT_DATA"); // never SCHEMA_MISMATCH for a mixed-cause drop
+  });
+
   it("requireEligible=true excludes a vetoed decision; default (false) keeps the training set unbiased", () => {
     const decisions = [decision(0, { lanes: { L1: { eligible: false } } })];
     const o = outcome("L1", 3 * MIN, 60 * MIN, 0.2, "obs-v");

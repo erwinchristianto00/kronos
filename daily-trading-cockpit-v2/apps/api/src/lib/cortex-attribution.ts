@@ -199,16 +199,25 @@ export function attributeOutcomes(
     // (eligible if required). Walk from the end since slices are ascending — the first hit IS the latest.
     // The schema test is INSIDE the walk (not a post-filter on a single pre-chosen owner): a stale-schema
     // slice must NOT shadow an older current-schema owner (that would drop a valid attribution), and
-    // schemaMismatch is counted ONLY when schema was the sole reason no owner was found.
+    // schemaMismatch is counted ONLY when EVERY in-window candidate's sole blocking reason was schema —
+    // an older (or newer) candidate that separately fails on eligibility/direction makes it a genuine mix
+    // of causes, which must fall back to an honest no-owner drop, not a schema-only diagnosis.
     let owner: LaneSlice | null = null;
     let sawSchemaMismatch = false;
+    let sawOtherReasonRejection = false;
     if (slices) {
       for (let i = slices.length - 1; i >= 0; i -= 1) {
         const s = slices[i]!;
         if (s.atMs > o.openedAtMs) continue; // decision after the open — cannot own it
         if (s.atMs < lo) break; // past the TTL window; everything earlier is older still
-        if (opts.requireEligible && !s.eligible) continue;
-        if (s.direction && o.direction && s.direction !== o.direction) continue; // corrupt-row guard
+        if (opts.requireEligible && !s.eligible) {
+          sawOtherReasonRejection = true;
+          continue;
+        }
+        if (s.direction && o.direction && s.direction !== o.direction) {
+          sawOtherReasonRejection = true; // corrupt-row guard
+          continue;
+        }
         if (s.schemaVersion !== opts.currentSchemaVersion) {
           sawSchemaMismatch = true; // eligible+direction-consistent but stale schema — keep searching older
           continue;
@@ -220,8 +229,9 @@ export function attributeOutcomes(
 
     if (!owner) {
       // No current-schema owner. If the only in-window candidate(s) failed on schema alone, that's a genuine
-      // schema mismatch; otherwise it's an honest no-owner drop (nothing eligible/direction-consistent).
-      if (sawSchemaMismatch) c.schemaMismatch += 1;
+      // schema mismatch; otherwise (nothing eligible/direction-consistent, or a mix of schema + other
+      // rejections across candidates) it's an honest no-owner drop.
+      if (sawSchemaMismatch && !sawOtherReasonRejection) c.schemaMismatch += 1;
       else c.noDecision += 1;
       continue;
     }
