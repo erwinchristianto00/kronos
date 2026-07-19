@@ -176,6 +176,102 @@ export interface AppOptions {
 
 const DEFAULT_KRONOS_BASE_URL = "http://localhost:8001";
 
+/**
+ * Pure builder for the four-brain shadow-tick EXECUTIVE_DECISION journal context. Bug fix: the
+ * `runFourBrainShadowCycle` call site below used to supply NO `journalContext` at all, so every
+ * EXECUTIVE_DECISION record ever appended to data/four-brain-decision-journal.jsonl carried
+ * instanceId/rawFeatures/normalizedFeatures/sourceStatuses/missingReasons/incumbent as hard `null` — the
+ * audit trail this layer exists to build was silently incomplete. This turns the EXACT gather-deps
+ * snapshot the tick's brains just consumed (captured by the call site, never re-derived/re-fetched) into
+ * the journal's provenance fields. Exported + pure (zero I/O) so it is directly unit-testable with plain
+ * fixture objects. Every MISSING/FRESH classification + missingReason mirrors the SAME known-unavailable
+ * sources already documented at their source in buildFourBrainDeps (btcAtrPercentile/sentiment/
+ * crowdAlignLong/kronosAgree have no live sync producer today) — never fabricated.
+ */
+export function buildFourBrainJournalContext(
+  base: Pick<
+    FourBrainBindingDeps,
+    | "instanceId"
+    | "axisScore"
+    | "axisSlopePerHour"
+    | "btcAtrPercentile"
+    | "advancersPct"
+    | "sentiment"
+    | "regimeRaw"
+    | "controllerBias"
+    | "convictionScore"
+    | "allowsLong"
+    | "allowsShort"
+    | "crowdAlignLong"
+    | "kronosAgree"
+    | "killLatched"
+    | "killReason"
+    | "openPositions"
+    | "openSignals"
+  >,
+  activeAllocation: { laneId: string; weightPct: number }[],
+): Record<string, unknown> {
+  const missingReasons: Record<string, string> = {};
+  if (base.axisScore == null) missingReasons.axisScore = "no regime-axis snapshot available yet";
+  if (base.advancersPct == null) missingReasons.breadth = "no regime-engine snapshot available yet";
+  if (base.regimeRaw == null) missingReasons.regimeRaw = "no regime classification available yet";
+  if (base.btcAtrPercentile == null) {
+    missingReasons.btcAtrPercentile = "no market-wide ATR-percentile producer (cached BTC value is an ATR/price fraction, wrong scale)";
+  }
+  if (base.sentiment == null) missingReasons.sentiment = "no market-wide sentiment producer (sync-safe)";
+  if (base.crowdAlignLong == null) missingReasons.crowdAlignLong = "no sync crowd-align producer";
+  if (base.kronosAgree == null) missingReasons.kronosAgree = "no sync kronos-agree producer";
+
+  const sourceStatuses: Record<string, string> = {
+    axisScore: base.axisScore != null ? "FRESH" : "MISSING",
+    axisSlopePerHour: base.axisSlopePerHour != null ? "FRESH" : "MISSING",
+    breadth: base.advancersPct != null ? "FRESH" : "MISSING",
+    regimeRaw: base.regimeRaw != null ? "FRESH" : "MISSING",
+    btcAtrPercentile: base.btcAtrPercentile != null ? "FRESH" : "MISSING",
+    sentiment: base.sentiment != null ? "FRESH" : "MISSING",
+    crowdAlignLong: base.crowdAlignLong != null ? "FRESH" : "MISSING",
+    kronosAgree: base.kronosAgree != null ? "FRESH" : "MISSING",
+  };
+
+  return {
+    instanceId: base.instanceId,
+    rawFeatures: {
+      regimeRaw: base.regimeRaw,
+      axisScore: base.axisScore,
+      axisSlopePerHour: base.axisSlopePerHour,
+      advancersPct: base.advancersPct,
+      btcAtrPercentile: base.btcAtrPercentile,
+      sentiment: base.sentiment,
+      crowdAlignLong: base.crowdAlignLong,
+      kronosAgree: base.kronosAgree,
+      convictionScore: base.convictionScore,
+      controllerBias: base.controllerBias,
+      killLatched: base.killLatched,
+      killReason: base.killReason,
+      openPositionCount: base.openPositions.length,
+      openSignalCount: base.openSignals.length,
+    },
+    normalizedFeatures: {
+      axisScore: base.axisScore,
+      axisSlopePerHour: base.axisSlopePerHour,
+      advancersPct: base.advancersPct,
+      convictionScore: base.convictionScore,
+      allowsLong: base.allowsLong,
+      allowsShort: base.allowsShort,
+    },
+    sourceStatuses,
+    missingReasons,
+    incumbent: {
+      laneAllocations: activeAllocation,
+      controllerBias: base.controllerBias,
+      allowsLong: base.allowsLong,
+      allowsShort: base.allowsShort,
+      killLatched: base.killLatched,
+      killReason: base.killReason,
+    },
+  };
+}
+
 export async function buildApp(options: AppOptions = {}): Promise<FastifyInstance> {
   const app = Fastify({
     logger: false,
@@ -1624,13 +1720,30 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       process.once("SIGINT", clearLaneContextSnapshotTimer);
     }
 
+    // Retained handle: the EXACT gather-deps snapshot buildFourBrainDeps produced for the in-flight cycle,
+    // captured here so journalContext (below) reports the SAME per-tick feature snapshot the brains just
+    // decided from — never a separately re-derived (and potentially drifted) recomputation.
+    let lastFourBrainGatherBase: Omit<FourBrainBindingDeps, "entryMicrostructure"> | null = null;
+    const buildFourBrainDepsForCycle = (nowMs: number): Omit<FourBrainBindingDeps, "entryMicrostructure"> => {
+      const built = buildFourBrainDeps(nowMs);
+      lastFourBrainGatherBase = built;
+      return built;
+    };
+
     const fourBrainCycle = (): void => {
       void runFourBrainShadowCycle({
-        buildDeps: buildFourBrainDeps,
+        buildDeps: buildFourBrainDepsForCycle,
         fetchCandles: (symbol) => binanceClient.getCandles(symbol, "15m", 150).catch(() => null),
         candleTimeframe: "15m",
         activeAllocation: activeFourBrainAllocation,
         journalAppend: (r) => fourBrainJournal.append(r),
+        // Bug fix: previously unsupplied ⇒ every journaled EXECUTIVE_DECISION had instanceId/rawFeatures/
+        // normalizedFeatures/sourceStatuses/missingReasons/incumbent hard-null. Built from this cycle's own
+        // captured gather deps (never fabricated) + the live incumbent lane allocation.
+        journalContext: () =>
+          lastFourBrainGatherBase
+            ? buildFourBrainJournalContext(lastFourBrainGatherBase, activeFourBrainAllocation())
+            : { instanceId: resolveFourBrainInstanceId(process.env) },
         metrics: fourBrainMetrics,
         now: () => Date.now(),
         perfNow: () => performance.now(), // monotonic clock for gather/inference/journal LATENCY only
