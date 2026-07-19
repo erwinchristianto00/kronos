@@ -18,6 +18,7 @@ import {
   LiveExecutionStore,
   computeLiveOrderPlan,
   crowdingExitRecommendation,
+  interleaveTestnetCollectionCandidates,
   parseLiveExecutionConfig,
   roundDownToStep,
   roundStopToSafeSide,
@@ -280,6 +281,7 @@ function makeConfig(overrides: Partial<LiveExecutionConfig> = {}): LiveExecution
     maxNotionalPerTrade: 250,
     maxPaperOrderAgeMs: 24 * 60 * 60 * 1000,
     mirrorAllPaperOrders: false,
+    testnetStratifiedCollection: false,
     mirrorProvenSymbolsOnly: false,
     testnetTakeProfitUsd: 0,
     testnetRegimeExitEnabled: true,
@@ -323,6 +325,7 @@ function makeEngine(opts: {
   paperLaneGate?: (order: PaperOrder) => boolean | null;
   paperLaneWeightPct?: (order: PaperOrder) => number | null;
   getControllerSnapshot?: () => { regime: string | null; mode: string | null; confidence?: string | null; capturedAt?: string | null } | null;
+  newEntryGate?: () => { allowed: boolean; reason: string | null };
   nowIso?: () => string;
   marketDataClient?: Pick<BinanceClient, "getFuturesFlow">;
   externalManagedNetQty?: () => Map<string, number>;
@@ -340,6 +343,7 @@ function makeEngine(opts: {
     paperLaneGate: opts.paperLaneGate,
     paperLaneWeightPct: opts.paperLaneWeightPct,
     getControllerSnapshot: opts.getControllerSnapshot,
+    newEntryGate: opts.newEntryGate,
     nowIso: opts.nowIso ?? (() => "2099-01-02T12:00:00.000Z"),
     marketDataClient: opts.marketDataClient,
     fillConfirmRetryDelayMs: 0,
@@ -433,6 +437,36 @@ describe("parseLiveExecutionConfig", () => {
     }).mirrorAllPaperOrders).toBe(false);
   });
 
+  it("testnet stratified collection is explicitly testnet-only", () => {
+    const base = {
+      LIVE_EXECUTION_ENABLED: "1",
+      LIVE_BINANCE_API_KEY: "k",
+      LIVE_BINANCE_API_SECRET: "s",
+      LIVE_TESTNET_STRATIFIED_COLLECTION: "1",
+    };
+    expect(parseLiveExecutionConfig({ ...base, LIVE_BINANCE_ENV: "testnet" }).testnetStratifiedCollection).toBe(true);
+    expect(parseLiveExecutionConfig({
+      ...base,
+      LIVE_BINANCE_ENV: "mainnet",
+      LIVE_MAINNET_CONFIRM: "I_UNDERSTAND_REAL_MONEY",
+    }).testnetStratifiedCollection).toBe(false);
+  });
+
+  it("interleaves testnet collection by least-observed lane, direction, and entry regime", () => {
+    const candidates = [
+      { paper: paperOrder({ paperOrderId: "bear-1", selectedLaneId: "LANE_BEAR", direction: "SHORT", regime: "Bearish pressure" }) },
+      { paper: paperOrder({ paperOrderId: "bear-2", selectedLaneId: "LANE_BEAR", direction: "SHORT", regime: "Bearish pressure" }) },
+      { paper: paperOrder({ paperOrderId: "bull-1", selectedLaneId: "LANE_BULL", direction: "LONG", regime: "Bullish expansion" }) },
+      { paper: paperOrder({ paperOrderId: "mixed-1", selectedLaneId: "LANE_MIX", direction: "SHORT", regime: "Mixed rotation" }) },
+    ];
+    const ordered = interleaveTestnetCollectionCandidates(candidates, new Map([
+      ["LANE_BEAR|SHORT|BEARISH", 9],
+      ["LANE_BULL|LONG|BULLISH", 1],
+      ["LANE_MIX|SHORT|MIXED", 1],
+    ]));
+    expect(ordered.map((candidate) => candidate.paper.paperOrderId)).toEqual(["bull-1", "mixed-1", "bear-1", "bear-2"]);
+  });
+
   it("testnet USD take-profit is testnet-only and disabled unless configured", () => {
     const base = {
       LIVE_EXECUTION_ENABLED: "1",
@@ -459,6 +493,25 @@ describe("parseLiveExecutionConfig", () => {
     expect(parseLiveExecutionConfig(base).testnetRegimeExitEnabled).toBe(true);
     expect(parseLiveExecutionConfig({ ...base, LIVE_TESTNET_REGIME_EXIT: "0" }).testnetRegimeExitEnabled).toBe(false);
     expect(parseLiveExecutionConfig(base).estimatedCloseCostPct).toBeCloseTo(0.0022, 8);
+  });
+
+  it("can disable only testnet's automatic account-level kill switch", () => {
+    const testnet = {
+      LIVE_EXECUTION_ENABLED: "1",
+      LIVE_BINANCE_ENV: "testnet",
+      LIVE_BINANCE_API_KEY: "k",
+      LIVE_BINANCE_API_SECRET: "s",
+    };
+    expect(parseLiveExecutionConfig(testnet).autoKillSwitchEnabled).toBe(true);
+    expect(parseLiveExecutionConfig({ ...testnet, LIVE_TESTNET_AUTO_KILL_SWITCH: "0" }).autoKillSwitchEnabled).toBe(false);
+
+    const mainnet = {
+      ...testnet,
+      LIVE_BINANCE_ENV: "mainnet",
+      LIVE_MAINNET_CONFIRM: "I_UNDERSTAND_REAL_MONEY",
+      LIVE_TESTNET_AUTO_KILL_SWITCH: "0",
+    };
+    expect(parseLiveExecutionConfig(mainnet).autoKillSwitchEnabled).toBe(true);
   });
 
   it("defaults correlated-alt caps and stop-distance loss hard-cut, with env overrides", () => {
@@ -1504,13 +1557,13 @@ describe("LiveExecutionEngine", () => {
         paperOrderId: "paper-lane-a",
         selectedLaneId: "LANE_A",
         paperOrderMode: "DIAGNOSTIC_ONLY",
-        createdAt: "2000-01-01T00:00:00.000Z",
+        createdAt: "2099-01-02T00:00:00.000Z",
       } as Partial<PaperOrder>),
       paperOrder({
         paperOrderId: "paper-lane-b",
         selectedLaneId: "LANE_B",
         paperOrderMode: "DIAGNOSTIC_ONLY",
-        createdAt: "2000-01-01T00:01:00.000Z",
+        createdAt: "2099-01-02T00:01:00.000Z",
       } as Partial<PaperOrder>),
     ];
     const { engine, client, store } = makeEngine({
@@ -1541,6 +1594,54 @@ describe("LiveExecutionEngine", () => {
     expect(account.positions[0]!.targetTpGapPct).toBeCloseTo(5, 9);
     expect(account.positions[0]!.liquidationPrice).toBe(1500);
     expect(account.lanes.map((lane) => lane.laneId)).toEqual(["LANE_A"]);
+  });
+
+  it("testnet mirror-all accepts a diagnostic source outside the operator lane selection", async () => {
+    const order = paperOrder({
+      paperOrderId: "testnet-collect-all",
+      selectedLaneId: "QUARANTINED_DIAGNOSTIC_LANE",
+      paperOrderMode: "DIAGNOSTIC_ONLY",
+      diagnosticLabel: "TESTNET_COLLECT_ALL_LANES",
+    });
+    const { engine, client } = makeEngine({
+      paper: makePaperStore([order]),
+      config: { mirrorAllPaperOrders: true },
+      paperLaneGate: () => false,
+    });
+    await engine.arm();
+    await engine.tick();
+
+    expect(client.placed.filter((placed) => placed.type === "MARKET" && !placed.reduceOnly)).toHaveLength(1);
+  });
+
+  it("testnet mirror-all bypasses only strategy admission, not the exchange safety path", async () => {
+    const order = paperOrder({
+      paperOrderId: "testnet-collector-admission",
+      selectedLaneId: "ANY_FRESH_DIAGNOSTIC_LANE",
+      paperOrderMode: "DIAGNOSTIC_ONLY",
+      diagnosticLabel: "TESTNET_COLLECT_ALL_LANES",
+    });
+    const { engine, client } = makeEngine({
+      paper: makePaperStore([order]),
+      config: { mirrorAllPaperOrders: true },
+      newEntryGate: () => ({ allowed: false, reason: "strategy says wait" }),
+    });
+    await engine.arm();
+    await engine.tick();
+
+    expect(client.placed.filter((placed) => placed.type === "MARKET" && !placed.reduceOnly)).toHaveLength(1);
+  });
+
+  it("normal mirror keeps a strategy admission block", async () => {
+    const order = paperOrder({ paperOrderId: "normal-admission-block" });
+    const { engine, client } = makeEngine({
+      paper: makePaperStore([order]),
+      newEntryGate: () => ({ allowed: false, reason: "strategy says wait" }),
+    });
+    await engine.arm();
+    await engine.tick();
+
+    expect(client.placed.filter((placed) => placed.type === "MARKET" && !placed.reduceOnly)).toHaveLength(0);
   });
 
   it("builds lane performance series by period and regime filter from closed intents", () => {
@@ -2234,6 +2335,43 @@ describe("LiveExecutionEngine", () => {
     const after = client.placed.slice(placedBefore);
     expect(after.some((p) => p.type === "MARKET" && p.reduceOnly)).toBe(false); // no flatten
     expect(intent.lastError ?? "").toMatch(/still protected/i);
+  });
+
+  it("testnet stratified collection never pyramids a new entry-regime into an existing intent", async () => {
+    const orders: PaperOrder[] = [
+      paperOrder({
+        paperOrderId: "bull-source",
+        selectedLaneId: "CG_VARIANT_MATRIX:CG_MFE_GIVEBACK",
+        direction: "LONG",
+        regime: "Bullish expansion",
+        entryPrice: 2000,
+        stopLoss: 1900,
+        takeProfitLevels: [2100],
+        paperStatus: "PAPER_SUBMITTED",
+      } as Partial<PaperOrder>),
+    ];
+    const { engine, client, store } = makeEngine({
+      paper: makePaperStore(orders),
+      config: { mirrorAllPaperOrders: true, testnetStratifiedCollection: true, maxAggregateIntentRiskUsd: 10 },
+    });
+    await engine.arm();
+    await engine.tick();
+    expect(store.getState().intents[0]!.sourcePaperOrders).toHaveLength(1);
+
+    orders.push(paperOrder({
+      paperOrderId: "bear-source",
+      selectedLaneId: "CG_VARIANT_MATRIX:CG_MFE_GIVEBACK",
+      direction: "LONG",
+      regime: "Bearish pressure",
+      entryPrice: 2000,
+      stopLoss: 1900,
+      takeProfitLevels: [2100],
+      paperStatus: "PAPER_SUBMITTED",
+    } as Partial<PaperOrder>));
+    await engine.tick();
+
+    expect(store.getState().intents[0]!.sourcePaperOrders).toHaveLength(1);
+    expect(client.placed.filter((order) => order.type === "MARKET" && !order.reduceOnly)).toHaveLength(1);
   });
 
   it("confirms the ADD's real fill via queryOrder before averaging into filledEntryPrice, instead of silently trusting a stale reference", async () => {
@@ -3548,6 +3686,40 @@ describe("manual selector mode toggle", () => {
 
     engine.setManualSelectorMode(false);
     expect(engine.isManualSelectorMode()).toBe(false);
+  });
+
+  it("uses only the Entry Decision side's directional allocation and holds safely with no decision", () => {
+    const { engine } = makeEngine();
+    expect(engine.setManualDirectionalLaneAllocations({
+      long: [{ laneId: "CG_WIDE_FAST_LONG", weightPct: 70 }],
+      short: [{ laneId: "CG_WIDE_FAST_SHORT", weightPct: 80 }],
+    }).ok).toBe(true);
+    engine.setManualSelectorMode(true);
+
+    // Manual mode must fail closed until the scanner produces a fresh directional decision.
+    expect(engine.laneSelectionAllowsLane("CG_WIDE_FAST_LONG")).toBe(false);
+    expect(engine.laneSelectionWeightPctForLane("CG_WIDE_FAST_SHORT")).toBe(0);
+
+    engine.setManualEntryDecision({
+      action: "WAIT_PULLBACK",
+      directionalBias: "LONG",
+      reason: "test",
+      observedAt: "2099-01-02T12:00:00.000Z",
+    });
+    expect(engine.getStatus().laneSelection.mode).toBe("MANUAL_DIRECTIONAL");
+    expect(engine.laneSelectionWeightPctForLane("CG_WIDE_FAST_LONG")).toBe(70);
+    expect(engine.laneSelectionAllowsLane("CG_WIDE_FAST_SHORT")).toBe(false);
+    expect(engine.isManualEntryAllowedForPaper({ selectedLaneId: "CG_WIDE_FAST_LONG", direction: "LONG" } as PaperOrder)).toBe(true);
+    expect(engine.isManualEntryAllowedForPaper({ selectedLaneId: "CG_WIDE_FAST_SHORT", direction: "SHORT" } as PaperOrder)).toBe(false);
+
+    engine.setManualEntryDecision({
+      action: "WAIT_REJECTION",
+      directionalBias: "SHORT",
+      reason: "test",
+      observedAt: "2099-01-02T12:05:00.000Z",
+    });
+    expect(engine.laneSelectionWeightPctForLane("CG_WIDE_FAST_SHORT")).toBe(80);
+    expect(engine.laneSelectionAllowsLane("CG_WIDE_FAST_LONG")).toBe(false);
   });
 });
 

@@ -15,7 +15,7 @@ import { join, resolve } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import { rotateJsonlIfNeeded } from "../src/lib/jsonl-rotation.js";
+import { readJsonlTailLinesSync, rotateJsonlIfNeeded } from "../src/lib/jsonl-rotation.js";
 
 const tempDirs: string[] = [];
 
@@ -36,6 +36,14 @@ afterEach(() => {
 });
 
 describe("rotateJsonlIfNeeded", () => {
+  it("reads only the requested JSONL tail in source order", () => {
+    const dir = mkTmp();
+    const file = join(dir, "tail.jsonl");
+    writeFileSync(file, Array.from({ length: 100 }, (_, i) => `row-${i}`).join("\n") + "\n", "utf-8");
+
+    expect(readJsonlTailLinesSync(file, 3, 1024)).toEqual(["row-97", "row-98", "row-99"]);
+  });
+
   it("archives file when above threshold and keeps tail N lines", () => {
     const dir = mkTmp();
     const file = join(dir, "scan-history.jsonl");

@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import type { Candle } from "@dtc/shared";
 import {
   detectRegimeCompositeEntry,
+  evaluateRegimeCompositeEntry,
   resolveRegimeCompositeObservation,
   buildRegimeCompositeReport,
   runRegimeCompositeCycle,
@@ -22,9 +23,9 @@ import {
 import type { CrowdingSnapshot } from "../src/lib/derivatives-crowding.js";
 
 let t = 1_000_000_000_000;
-function bar(close: number, opts: { high?: number; low?: number } = {}): Candle {
+function bar(close: number, opts: { open?: number; high?: number; low?: number } = {}): Candle {
   t += 3_600_000;
-  return { openTime: t, open: close, high: opts.high ?? close, low: opts.low ?? close, close, volume: 100 };
+  return { openTime: t, open: opts.open ?? close, high: opts.high ?? close, low: opts.low ?? close, close, volume: 100 };
 }
 
 /** N bars with a real (non-zero) daily range each, so ATR is computable and positive. */
@@ -35,6 +36,15 @@ function candlesWithRange(n: number, basePrice = 100, rangeEach = 1): Candle[] {
     const c = basePrice + i * 0.1;
     candles.push(bar(c, { high: c + rangeEach, low: c - rangeEach }));
   }
+  return candles;
+}
+
+function longRetestCandles(): Candle[] {
+  t = 1_000_000_000_000;
+  const candles = Array.from({ length: 20 }, () => bar(100, { high: 101, low: 99 }));
+  candles.push(bar(98.8, { open: 100, high: 100.2, low: 98.5 }));
+  // Tests EMA20 from above, leaves a lower-side rejection, and closes back over the mean.
+  candles.push(bar(100.4, { open: 99.5, high: 100.8, low: 99.1 }));
   return candles;
 }
 
@@ -57,7 +67,7 @@ function crowdSnap(over: Partial<CrowdingSnapshot> = {}): CrowdingSnapshot {
 
 describe("regime-composite — entry gate (axis score + crowding, both must pass)", () => {
   it("fires when axis score clears the floor AND crowding is NEUTRAL", () => {
-    const candles = candlesWithRange(20);
+    const candles = longRetestCandles();
     const sig = detectRegimeCompositeEntry(candles, RC_AXIS_SCORE_MIN + 0.1, crowdSnap());
     expect(sig).not.toBeNull();
     expect(sig!.entryPrice).toBe(candles[candles.length - 1]!.close);
@@ -66,7 +76,7 @@ describe("regime-composite — entry gate (axis score + crowding, both must pass
   });
 
   it("fires when crowding is BUILDING (the other allowed state)", () => {
-    const candles = candlesWithRange(20);
+    const candles = longRetestCandles();
     const sig = detectRegimeCompositeEntry(candles, RC_AXIS_SCORE_MIN + 0.1, crowdSnap({ crowdingState: "BUILDING" }));
     expect(sig).not.toBeNull();
   });
@@ -102,6 +112,24 @@ describe("regime-composite — entry gate (axis score + crowding, both must pass
   it("returns null with too few candles even when both gates pass", () => {
     expect(detectRegimeCompositeEntry([bar(100), bar(101)], 0.9, crowdSnap())).toBeNull();
   });
+
+  it("rejects a vertical long as overbought and tells the caller to wait for a pullback", () => {
+    const candles = longRetestCandles();
+    const last = candles[candles.length - 1]!;
+    candles[candles.length - 1] = { ...last, open: 99.7, high: 105, low: 99.4, close: 104 };
+    const result = evaluateRegimeCompositeEntry(candles, 0.9, crowdSnap());
+    expect(result.signal).toBeNull();
+    expect(["RSI_OVERBOUGHT_WAIT_PULLBACK", "LATE_EXTENSION_WAIT_PULLBACK"]).toContain(result.rejection);
+  });
+
+  it("rejects bullish regime alone when no EMA20 retest/rejection exists", () => {
+    const candles = longRetestCandles();
+    const last = candles[candles.length - 1]!;
+    candles[candles.length - 1] = { ...last, open: 99.1, high: 99.2, low: 98.7, close: 98.9 };
+    const result = evaluateRegimeCompositeEntry(candles, 0.9, crowdSnap());
+    expect(result.signal).toBeNull();
+    expect(["NO_EMA20_RETEST", "NO_BULLISH_REJECTION"]).toContain(result.rejection);
+  });
 });
 
 function obs(over: Partial<RegimeCompositeObservation> = {}): RegimeCompositeObservation {
@@ -111,6 +139,7 @@ function obs(over: Partial<RegimeCompositeObservation> = {}): RegimeCompositeObs
     observationId: "rc:TEST:1", symbol: "TESTUSDT", direction: "LONG",
     entryPrice, initialStop, stopDistanceBps: ((entryPrice - initialStop) / entryPrice) * 10000,
     atrAtEntry: 4, axisScoreAtEntry: 0.5, crowdingStateAtEntry: "NEUTRAL", fundingBpsAtEntry: 0,
+    entrySetup: "EMA20_RETEST_REJECTION", ema20AtEntry: 100, extensionAboveEmaAtr: 0.075,
     openedAt: new Date(1_000_000_000_000).toISOString(), openedAtMs: 1_000_000_000_000,
     status: "OPEN", grossR: null, costR: null, netR: null, maxFavorableR: null, exitReason: null, resolvedAt: null,
     ...over,
@@ -193,7 +222,7 @@ describe("regime-composite — cycle (axis gate first, bounds the crowding fetch
       universe: ["BTCUSDT"],
       now: Date.now(),
       axisScore: RC_AXIS_SCORE_MIN - 0.1,
-      fetchCandles: async () => candlesWithRange(20),
+      fetchCandles: async () => longRetestCandles(),
       crowdingClient: {
         getFuturesFlow: async () => {
           crowdingCalls += 1;
@@ -213,7 +242,7 @@ describe("regime-composite — cycle (axis gate first, bounds the crowding fetch
       universe: ["BTCUSDT"],
       now: Date.now(),
       axisScore: RC_AXIS_SCORE_MIN + 0.1,
-      fetchCandles: async () => candlesWithRange(20),
+      fetchCandles: async () => longRetestCandles(),
       crowdingClient: {
         getFuturesFlow: async () => ({ fundingRate: 0, openInterestChangePercent: 0, takerBuySellRatio: null, longShortRatio: null }),
       },
@@ -231,7 +260,7 @@ describe("regime-composite — cycle (axis gate first, bounds the crowding fetch
       universe: ["BTCUSDT"],
       now: Date.now(),
       axisScore: RC_AXIS_SCORE_MIN + 0.1,
-      fetchCandles: async () => candlesWithRange(20),
+      fetchCandles: async () => longRetestCandles(),
       crowdingClient: {
         // EXTREME funding + rising OI ⇒ EXHAUSTING ⇒ gate fails.
         getFuturesFlow: async () => ({ fundingRate: 0.001, openInterestChangePercent: 2, takerBuySellRatio: null, longShortRatio: null }),
@@ -250,7 +279,7 @@ describe("regime-composite — cycle (axis gate first, bounds the crowding fetch
       now: Date.now(),
       axisScore: RC_AXIS_SCORE_MIN + 0.1,
       maxConcurrent: 2,
-      fetchCandles: async () => candlesWithRange(20),
+      fetchCandles: async () => longRetestCandles(),
       crowdingClient: neutralCrowding,
     });
     expect(result.recorded).toBe(2);
@@ -266,7 +295,7 @@ describe("regime-composite — cycle liveness meta", () => {
   it("[LIVENESS] persists lastCycleAt + accumulates the gate funnel across cycles and reloads", async () => {
     const file = `/tmp/regime-composite-meta-${Date.now()}-${Math.random()}.json`;
     const store = new RegimeCompositeStore(file);
-    const base = { store, universe: ["BTCUSDT"] as const, fetchCandles: async () => candlesWithRange(20), crowdingClient: neutralCrowding };
+    const base = { store, universe: ["BTCUSDT"] as const, fetchCandles: async () => longRetestCandles(), crowdingClient: neutralCrowding };
     await runRegimeCompositeCycle({ ...base, now: Date.now(), axisScore: RC_AXIS_SCORE_MIN - 0.1 });
     await runRegimeCompositeCycle({ ...base, now: Date.now() + 3_600_000, axisScore: RC_AXIS_SCORE_MIN - 0.1 });
     const meta = store.cycleMeta;
@@ -423,8 +452,8 @@ describe("regime-composite — live execution wiring adapters", () => {
       expect(RC_EXEC_LEVERAGE()).toBe(3);
     });
 
-    it("RC_EXEC_MAX_SIGNAL_AGE_MS defaults to 50 minutes and floors at 60s", () => {
-      expect(RC_EXEC_MAX_SIGNAL_AGE_MS()).toBe(50 * 60_000);
+    it("RC_EXEC_MAX_SIGNAL_AGE_MS defaults to 10 minutes and floors at 60s", () => {
+      expect(RC_EXEC_MAX_SIGNAL_AGE_MS()).toBe(10 * 60_000);
       process.env.REGIME_COMPOSITE_EXEC_MAX_SIGNAL_AGE_MS = "1000";
       expect(RC_EXEC_MAX_SIGNAL_AGE_MS()).toBe(60_000);
       process.env.REGIME_COMPOSITE_EXEC_MAX_SIGNAL_AGE_MS = "120000";

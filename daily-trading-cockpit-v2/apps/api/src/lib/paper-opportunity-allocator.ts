@@ -283,6 +283,14 @@ export interface PaperOpportunityAllocatorInputs {
   /** Immutable paper-start anchor; candidates before it are excluded from admission. */
   paperStartAt: string | null;
   paperValidationAllowed?: boolean;
+  /**
+   * Testnet-only high-throughput collection mode. Every fresh candidate × lane
+   * with valid executable geometry is admitted as DIAGNOSTIC_ONLY, including
+   * lanes normally vetoed by regime, economics, curation, or quarantine. This
+   * is intentionally an input rather than a global so production callers
+   * cannot accidentally enable it.
+   */
+  testnetCollectAllLanes?: boolean;
   admissionMaxAgeMs?: number;
   /** Already-available external/universe rotation shortlist symbols (advisory). */
   externalShortlistSymbols?: string[];
@@ -1207,6 +1215,7 @@ export function buildPaperOpportunityAllocatorReport(
 ): PaperOpportunityAllocatorReport {
   const controllerMode = inputs.routerReport.controllerMode;
   const regimeFamily = inputs.routerReport.regimeFamily;
+  const testnetCollectAllLanes = inputs.testnetCollectAllLanes === true;
   const paperValidationAllowed = inputs.paperValidationAllowed === true;
   const maxAge = inputs.admissionMaxAgeMs ?? PAPER_ADMISSION_MAX_AGE_MS;
   const nowMs = new Date(inputs.now).getTime();
@@ -1222,7 +1231,10 @@ export function buildPaperOpportunityAllocatorReport(
   // false/absent). Initially "fixed" this by removing the MIXED bypass, which looked like the same
   // avgPrice-fallback bug class from elsewhere this session — but running the full suite before
   // deploy caught that it breaks 6 legitimate, intentional tests. Reverted; not a bug.
-  const regimeOk = regimeAllowsPaperLane(controllerMode, regimeFamily, paperValidationAllowed) || regimeFamily === "MIXED";
+  const regimeOk =
+    testnetCollectAllLanes ||
+    regimeAllowsPaperLane(controllerMode, regimeFamily, paperValidationAllowed) ||
+    regimeFamily === "MIXED";
 
   // ── adaptive lane quarantine + accounting-mode decision (Parts 2/3/5) ──────
   const diagnosticContinue = inputs.paperDiagnosticContinue === true;
@@ -1548,6 +1560,7 @@ export function buildPaperOpportunityAllocatorReport(
           (laneDecision.batchOrderMode !== "HEADLINE" && !longHeadlineCollection)
         );
       if (
+        !testnetCollectAllLanes &&
         BENCHMARK_ONLY_LANE_IDS.includes(def.id) &&
         !variantDiagnosticCollection &&
         !(headlineVariant && headlineStableOk && laneDecision.batchOrderMode === "HEADLINE")
@@ -1555,11 +1568,12 @@ export function buildPaperOpportunityAllocatorReport(
         recordReject(symbol, direction, def.id, "LANE_DIAGNOSTIC_ONLY", rowFresh, rowNet);
         continue;
       }
-      if (def.id === PAPER_CHALLENGER_LANE_ID && !challengerDiagnosticEnabled) {
+      if (!testnetCollectAllLanes && def.id === PAPER_CHALLENGER_LANE_ID && !challengerDiagnosticEnabled) {
         recordReject(symbol, direction, def.id, "LANE_NOT_PAPER_MODELED", rowFresh, rowNet);
         continue;
       }
       if (
+        !testnetCollectAllLanes &&
         !PAPER_ADMISSIBLE_LANE_IDS.includes(def.id) &&
         !challengerDiagnosticCollection &&
         !variantDiagnosticCollection &&
@@ -1577,6 +1591,7 @@ export function buildPaperOpportunityAllocatorReport(
         continue;
       }
       if (
+        !testnetCollectAllLanes &&
         def.bullishOnly &&
         !(direction === "LONG" && controllerMode === "LONG_ONLY" && regimeFamily === "BULLISH")
       ) {
@@ -1589,7 +1604,7 @@ export function buildPaperOpportunityAllocatorReport(
       // admits as HEADLINE when the candidate is headline-quality, else falls back to
       // DIAGNOSTIC_ONLY (rather than being rejected). Applies to BOTH directions.
       const cgWidePriorityCollection = cgWidePriority && def.id === "CG_WIDE_STOP_TP_WIDE";
-      if (def.id === "CG_WIDE_STOP_TP_WIDE") {
+      if (!testnetCollectAllLanes && def.id === "CG_WIDE_STOP_TP_WIDE") {
         const cgWideCapacityReason = cgWideCapacityRejectReason({
           orders: currentPaperOrders,
           nowMs,
@@ -1608,6 +1623,7 @@ export function buildPaperOpportunityAllocatorReport(
       // Diagnostic collection paths admit regardless of the lane's own economics row (they exist
       // to COLLECT that economics honestly). Regime/direction-compat gates below still apply.
       const skipEconomics =
+        testnetCollectAllLanes ||
         challengerDiagnosticCollection ||
         longPaperCollection ||
         longHeadlineCollection ||
@@ -1620,7 +1636,7 @@ export function buildPaperOpportunityAllocatorReport(
         recordReject(symbol, direction, def.id, "NO_COMPATIBLE_REGIME", rowFresh, rowNet);
         continue;
       }
-      if (!directionCompatibleWithMode(direction, controllerMode)) {
+      if (!testnetCollectAllLanes && !directionCompatibleWithMode(direction, controllerMode)) {
         recordReject(symbol, direction, def.id, "DIRECTION_INCOMPATIBLE_WITH_MODE", rowFresh, rowNet);
         continue;
       }
@@ -1633,7 +1649,7 @@ export function buildPaperOpportunityAllocatorReport(
       // measurement lane (fade-long-edge.ts), NOT this allocator path; relaxing the gate
       // would only re-admit the losing chase-longs. The gate stays until the fade lane
       // matures and earns its own admission path.
-      if (LONG_LARGE_CAP_ONLY && direction === "LONG" && paperIsHighBetaAlt(symbol)) {
+      if (!testnetCollectAllLanes && LONG_LARGE_CAP_ONLY && direction === "LONG" && paperIsHighBetaAlt(symbol)) {
         recordReject(symbol, direction, def.id, "LONG_HIGH_BETA_ALT_NO_EDGE", rowFresh, rowNet);
         continue;
       }
@@ -1641,7 +1657,7 @@ export function buildPaperOpportunityAllocatorReport(
       // edge is proven-negative, even when the direction is allowed. This is what
       // lets a positive SHORT lane (tight/fast-TP) trade while the losing wide-stop
       // SHORT lane stays blocked — capturing edge the coarse direction gate missed.
-      if (inputs.laneEdgeGate) {
+      if (!testnetCollectAllLanes && inputs.laneEdgeGate) {
         const lv = inputs.laneEdgeGate.laneVerdict(inputs.marketRegime, direction, def.id);
         if (!lv.allowed) {
           recordReject(symbol, direction, def.id, "EDGE_LANE_PROVEN_NEGATIVE", rowFresh, rowNet);
@@ -1701,6 +1717,7 @@ export function buildPaperOpportunityAllocatorReport(
         continue;
       }
       if (
+        !testnetCollectAllLanes &&
         def.id === "CG_WIDE_STOP_TP_WIDE" &&
         !cgWidePriorityCollection &&
         !longPaperCollection &&
@@ -1733,11 +1750,11 @@ export function buildPaperOpportunityAllocatorReport(
         recordReject(symbol, direction, def.id, "BULL_TREND_LANE_ID_MISMATCH", rowFresh, rowNet);
         continue;
       }
-      if (manualQuarantinedPaperLanes.has(laneId)) {
+      if (!testnetCollectAllLanes && manualQuarantinedPaperLanes.has(laneId)) {
         recordReject(symbol, direction, def.id, "LANE_MANUALLY_QUARANTINED", rowFresh, rowNet);
         continue;
       }
-      if (inputs.laneSymbolCurationTier) {
+      if (!testnetCollectAllLanes && inputs.laneSymbolCurationTier) {
         const curation = getCuratedSymbolsForLane(
           inputs.laneSymbolCurationReport ?? null,
           inputs.laneSymbolCurationReportGeneratedAt ?? null,
@@ -1768,6 +1785,7 @@ export function buildPaperOpportunityAllocatorReport(
       // ── adaptive lane quarantine: a degraded lane must NOT admit new orders
       //    unless diagnostic-only collection was explicitly opted into ─────────
       if (
+        !testnetCollectAllLanes &&
         laneDecision.batchOrderMode === "NONE" &&
         !longPaperCollection &&
         !challengerDiagnosticCollection &&
@@ -1780,6 +1798,7 @@ export function buildPaperOpportunityAllocatorReport(
         continue;
       }
       if (
+        !testnetCollectAllLanes &&
         challengerDiagnosticCollection &&
         challengerDiagnosticSelected >= challengerDiagnosticMaxPerScan
       ) {
@@ -1788,6 +1807,7 @@ export function buildPaperOpportunityAllocatorReport(
       }
       // Per-variant per-scan cap for the full variant-matrix diagnostic collection.
       if (
+        !testnetCollectAllLanes &&
         (variantDiagnosticCollection || expLongMfePriorityCollection || cohortNeedsDiagnosticCollection) &&
         (variantDiagnosticSelected.get(def.id) ?? 0) >= (
           expLongMfePriorityCollection ? expLongMfeMaxPerScan : variantMatrixDiagnosticMaxPerScan
@@ -1804,7 +1824,7 @@ export function buildPaperOpportunityAllocatorReport(
         continue;
       }
       // Standing open-book caps: global total ceiling (~800) + per-symbol/per-lane concentration.
-      if (variantDiagnosticCollection || expLongMfePriorityCollection || cohortNeedsDiagnosticCollection) {
+      if (!testnetCollectAllLanes && (variantDiagnosticCollection || expLongMfePriorityCollection || cohortNeedsDiagnosticCollection)) {
         if (diagnosticOpenRunning >= PAPER_DIAGNOSTIC_MAX_OPEN_TOTAL) {
           recordReject(symbol, direction, def.id, "DIAGNOSTIC_TOTAL_OPEN_CAP_REACHED", rowFresh, rowNet);
           continue;
@@ -1820,7 +1840,7 @@ export function buildPaperOpportunityAllocatorReport(
       }
       // Auto-quarantine: a variant lane that is confidently net-negative in realized paper stops
       // admitting new orders (and renders violet). "Let it run, then bench confirmed losers."
-      if ((variantDiagnosticCollection || expLongMfePriorityCollection || cohortNeedsDiagnosticCollection) && autoQuarantinedVariantLanes.has(laneId)) {
+      if (!testnetCollectAllLanes && (variantDiagnosticCollection || expLongMfePriorityCollection || cohortNeedsDiagnosticCollection) && autoQuarantinedVariantLanes.has(laneId)) {
         recordReject(symbol, direction, def.id, "VARIANT_LANE_AUTO_QUARANTINED", rowFresh, rowNet);
         continue;
       }
@@ -1828,7 +1848,7 @@ export function buildPaperOpportunityAllocatorReport(
       // Pure-bullish lane gates. Missing optional external evidence is allowed,
       // but explicit contradiction is not. This keeps collection moving while
       // isolating it from weak-trend and contra-flow LONG candidates.
-      if (bullTrendCollection) {
+      if (!testnetCollectAllLanes && bullTrendCollection) {
         if (!Number.isFinite(c.trendScore) || c.trendScore < BULL_TREND_MIN_SCORE) {
           recordReject(symbol, direction, def.id, "BULL_TREND_SCORE_BELOW_60", rowFresh, rowNet);
           continue;
@@ -1860,7 +1880,7 @@ export function buildPaperOpportunityAllocatorReport(
       // Applied after the cap check so they don't consume the per-scan cap slot.
       // These raise the structural quality floor for trail data collection beyond
       // the permissive diagnosticEligible threshold.
-      if (challengerDiagnosticCollection) {
+      if (!testnetCollectAllLanes && challengerDiagnosticCollection) {
         // Gate E: Lane quarantine. The trail_after_tp1 exit rule has been falsified
         // as net-negative on this universe (see paperChallengerQuarantined). Reject
         // every new trail admission so the bleeding diagnostic stops adding orders;
@@ -1984,6 +2004,7 @@ export function buildPaperOpportunityAllocatorReport(
           ) ?? null
         : null;
       if (
+        !testnetCollectAllLanes &&
         regimeFamily === "MIXED" &&
         (
           !mixedBudgetState ||
@@ -2066,6 +2087,9 @@ export function buildPaperOpportunityAllocatorReport(
             `PAPER_RISK_MULTIPLIER_${def.paperRiskMultiplier ?? 1}X`,
           );
         }
+        if (testnetCollectAllLanes) {
+          provenance.candidateQualityFlags.push("TESTNET_COLLECT_ALL_LANES");
+        }
         return {
           sourceCandidateId,
           scanBatchId: inputs.scanBatchId,
@@ -2108,7 +2132,11 @@ export function buildPaperOpportunityAllocatorReport(
       }
 
       let orderMode: PaperOrderMode;
-      if (challengerDiagnosticCollection) {
+      if (testnetCollectAllLanes) {
+        // Collection intentionally records even poor candidate fingerprints, but
+        // keeps the order diagnostic so it cannot contaminate headline metrics.
+        orderMode = "DIAGNOSTIC_ONLY";
+      } else if (challengerDiagnosticCollection) {
         if (!verdict.diagnosticEligible) {
           recordReject(symbol, direction, def.id, verdict.reason ?? "CANDIDATE_REJECTED_HARD", rowFresh, rowNet);
           continue;

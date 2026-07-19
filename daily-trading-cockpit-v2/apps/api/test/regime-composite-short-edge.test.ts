@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import type { Candle } from "@dtc/shared";
 import {
   detectRegimeCompositeShortEntry,
+  evaluateRegimeCompositeShortEntry,
   resolveRegimeCompositeShortObservation,
   buildRegimeCompositeShortReport,
   runRegimeCompositeShortCycle,
@@ -15,9 +16,9 @@ import {
 import type { CrowdingSnapshot } from "../src/lib/derivatives-crowding.js";
 
 let t = 1_000_000_000_000;
-function bar(close: number, opts: { high?: number; low?: number } = {}): Candle {
+function bar(close: number, opts: { open?: number; high?: number; low?: number } = {}): Candle {
   t += 3_600_000;
-  return { openTime: t, open: close, high: opts.high ?? close, low: opts.low ?? close, close, volume: 100 };
+  return { openTime: t, open: opts.open ?? close, high: opts.high ?? close, low: opts.low ?? close, close, volume: 100 };
 }
 
 /** N bars with a real (non-zero) range each, so ATR is computable and positive. */
@@ -28,6 +29,15 @@ function candlesWithRange(n: number, basePrice = 100, rangeEach = 1): Candle[] {
     const c = basePrice + i * 0.1;
     candles.push(bar(c, { high: c + rangeEach, low: c - rangeEach }));
   }
+  return candles;
+}
+
+function shortRetestCandles(): Candle[] {
+  t = 1_000_000_000_000;
+  const candles = Array.from({ length: 20 }, () => bar(100, { high: 101, low: 99 }));
+  candles.push(bar(100.4, { open: 100, high: 100.6, low: 99.8 }));
+  // Tests EMA20 from below, leaves an upper-wick rejection, and closes back below the mean.
+  candles.push(bar(99.7, { open: 100.3, high: 101, low: 99.6 }));
   return candles;
 }
 
@@ -51,7 +61,7 @@ function crowdSnap(over: Partial<CrowdingSnapshot> = {}): CrowdingSnapshot {
 
 describe("regime-composite-short — entry gate (bearish axis ceiling + crowding, both must pass)", () => {
   it("fires when axis score is below the bearish ceiling AND crowding is NEUTRAL", () => {
-    const candles = candlesWithRange(20);
+    const candles = shortRetestCandles();
     const sig = detectRegimeCompositeShortEntry(candles, RCS_AXIS_SCORE_MAX - 0.1, crowdSnap());
     expect(sig).not.toBeNull();
     expect(sig!.entryPrice).toBe(candles[candles.length - 1]!.close);
@@ -61,7 +71,7 @@ describe("regime-composite-short — entry gate (bearish axis ceiling + crowding
   });
 
   it("fires when crowding is BUILDING (the other allowed state)", () => {
-    const candles = candlesWithRange(20);
+    const candles = shortRetestCandles();
     const sig = detectRegimeCompositeShortEntry(candles, RCS_AXIS_SCORE_MAX - 0.1, crowdSnap({ crowdingState: "BUILDING" }));
     expect(sig).not.toBeNull();
   });
@@ -102,6 +112,24 @@ describe("regime-composite-short — entry gate (bearish axis ceiling + crowding
   it("returns null with too few candles even when both gates pass", () => {
     expect(detectRegimeCompositeShortEntry([bar(100), bar(101)], -0.9, crowdSnap())).toBeNull();
   });
+
+  it("rejects a waterfall short as oversold and tells the caller to wait for a pullback", () => {
+    const candles = shortRetestCandles();
+    const last = candles[candles.length - 1]!;
+    candles[candles.length - 1] = { ...last, open: 100.3, high: 101, low: 95.5, close: 96 };
+    const result = evaluateRegimeCompositeShortEntry(candles, -0.9, crowdSnap());
+    expect(result.signal).toBeNull();
+    expect(["RSI_OVERSOLD_WAIT_PULLBACK", "LATE_EXTENSION_WAIT_PULLBACK"]).toContain(result.rejection);
+  });
+
+  it("rejects bearish regime alone when no EMA20 retest/rejection exists", () => {
+    const candles = shortRetestCandles();
+    const last = candles[candles.length - 1]!;
+    candles[candles.length - 1] = { ...last, open: 100.3, high: 100.4, low: 100.1, close: 100.2 };
+    const result = evaluateRegimeCompositeShortEntry(candles, -0.9, crowdSnap());
+    expect(result.signal).toBeNull();
+    expect(["NO_EMA20_RETEST", "NO_BEARISH_REJECTION"]).toContain(result.rejection);
+  });
 });
 
 function obs(over: Partial<RegimeCompositeShortObservation> = {}): RegimeCompositeShortObservation {
@@ -111,6 +139,7 @@ function obs(over: Partial<RegimeCompositeShortObservation> = {}): RegimeComposi
     observationId: "rcs:TEST:1", symbol: "TESTUSDT", direction: "SHORT",
     entryPrice, initialStop, stopDistanceBps: ((initialStop - entryPrice) / entryPrice) * 10000,
     atrAtEntry: 4, axisScoreAtEntry: -0.5, crowdingStateAtEntry: "NEUTRAL", fundingBpsAtEntry: 0,
+    entrySetup: "EMA20_RETEST_REJECTION", ema20AtEntry: 100, extensionBelowEmaAtr: 0.075,
     openedAt: new Date(1_000_000_000_000).toISOString(), openedAtMs: 1_000_000_000_000,
     status: "OPEN", grossR: null, costR: null, netR: null, maxFavorableR: null, exitReason: null, resolvedAt: null,
     ...over,
@@ -186,7 +215,7 @@ describe("regime-composite-short — cycle (bearish axis gate first, bounds the 
       universe: ["BTCUSDT"],
       now: Date.now(),
       axisScore: RCS_AXIS_SCORE_MAX + 0.1, // not bearish enough
-      fetchCandles: async () => candlesWithRange(20),
+      fetchCandles: async () => shortRetestCandles(),
       crowdingClient: {
         getFuturesFlow: async () => {
           crowdingCalls += 1;
@@ -206,7 +235,7 @@ describe("regime-composite-short — cycle (bearish axis gate first, bounds the 
       universe: ["BTCUSDT"],
       now: Date.now(),
       axisScore: RCS_AXIS_SCORE_MAX - 0.1, // bearish enough
-      fetchCandles: async () => candlesWithRange(20),
+      fetchCandles: async () => shortRetestCandles(),
       crowdingClient: {
         getFuturesFlow: async () => ({ fundingRate: 0, openInterestChangePercent: 0, takerBuySellRatio: null, longShortRatio: null }),
       },
@@ -225,7 +254,7 @@ describe("regime-composite-short — cycle (bearish axis gate first, bounds the 
       universe: ["BTCUSDT"],
       now: Date.now(),
       axisScore: RCS_AXIS_SCORE_MAX - 0.1,
-      fetchCandles: async () => candlesWithRange(20),
+      fetchCandles: async () => shortRetestCandles(),
       crowdingClient: {
         getFuturesFlow: async () => ({ fundingRate: 0.001, openInterestChangePercent: 2, takerBuySellRatio: null, longShortRatio: null }),
       },
@@ -243,7 +272,7 @@ describe("regime-composite-short — cycle (bearish axis gate first, bounds the 
       now: Date.now(),
       axisScore: RCS_AXIS_SCORE_MAX - 0.1,
       maxConcurrent: 2,
-      fetchCandles: async () => candlesWithRange(20),
+      fetchCandles: async () => shortRetestCandles(),
       crowdingClient: neutralCrowding,
     });
     expect(result.recorded).toBe(2);

@@ -50,7 +50,7 @@ import { recordHeatShadowSnapshot } from "./portfolio-heat-shadow.js";
 import {
   prepareForwardCausalIdentity,
   recordForwardOpportunity,
-  recordForwardOutcome,
+  recordForwardOutcomes,
   resolveCausalCollectionActivation,
   withResolvedCausalIdentity,
   type CausalIdentity,
@@ -1794,12 +1794,14 @@ export async function resolvePaperOrders(
  */
 function recordForwardCausalResolutions(store: PaperExecutionRouterStore): void {
   if (!resolveCausalCollectionActivation(process.env).active) return;
+  const resolved: PaperOrder[] = [];
   for (const order of store.all) {
     if (order.paperStatus !== "PAPER_CLOSED_WIN" && order.paperStatus !== "PAPER_CLOSED_LOSS") continue;
     const identity = withResolvedCausalIdentity(order);
     if (identity && identity !== order.causalIdentity) store.update(order.paperOrderId, { causalIdentity: identity });
+    resolved.push(order);
   }
-  for (const order of store.all) recordForwardOutcome(order);
+  recordForwardOutcomes(resolved);
 }
 
 async function resolvePaperOrdersInner(

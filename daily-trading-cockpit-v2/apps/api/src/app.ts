@@ -82,7 +82,14 @@ import {
 } from "./lib/regime-composite-edge.js";
 import {
   getRegimeCompositeShortStore,
+  isRegimeCompositeShortExecEnabled,
+  regimeCompositeShortExitPolicy,
   regimeCompositeShortOpenSignals,
+  RCS_EXEC_DAILY_MAX_LOSS_USD,
+  RCS_EXEC_LEG_USD,
+  RCS_EXEC_LEVERAGE,
+  RCS_EXEC_MAX_CONCURRENT,
+  RCS_EXEC_MAX_SIGNAL_AGE_MS,
   RCS_PAPER_LANE_ID,
 } from "./lib/regime-composite-short-edge.js";
 import {
@@ -250,6 +257,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
   // 2026-07-09: REGIME_COMPOSITE_CONFIRMATION_LONG — same single-symbol executor pattern, own
   // axis-score + crowding-state entry gate (see regime-composite-edge.ts).
   let regimeCompositeExecutor: SingleSymbolLaneExecutor | null = null;
+  let regimeCompositeShortExecutor: SingleSymbolLaneExecutor | null = null;
   // 2026-07-09: COMPOSITE_ESTIMATOR_BIDI — bidirectional (axis level + velocity + Kronos), 4
   // buckets (WIDE_LONG/WIDE_SHORT/FAST_LONG/FAST_SHORT), each its own fixed-direction executor
   // instance fed by ONE shared measurement store filtered per bucket (see composite-estimator-edge.ts).
@@ -290,6 +298,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     shortFadeExecutor,
     intradayMomentumExecutor,
     regimeCompositeExecutor,
+    regimeCompositeShortExecutor,
     compositeEstimatorWideLongExecutor,
     compositeEstimatorWideShortExecutor,
     compositeEstimatorFastLongExecutor,
@@ -492,6 +501,11 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
             direction: order.direction,
           });
         }
+        // Operator manual directional mode is a narrow admission override: it may bypass maturity,
+        // book, and regime-policy blockers only for the currently selected Entry Decision side and
+        // explicitly selected lane. The engine still enforces freshness, geometry, caps, and all
+        // exchange/account safety before it can open anything.
+        if (liveEngine?.isManualEntryAllowedForPaper(order)) return true;
         const useTestnetPolicy =
           liveConfig.env === "testnet" ||
           (liveConfig.env === "mainnet" && liveConfig.mainnetKeepTestnetPolicy);
@@ -1143,6 +1157,43 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       }
     }
 
+    // Bearish counterpart of REGIME_COMPOSITE_CONFIRMATION_LONG. It only opens its own fresh
+    // BTC/ETH/SOL signals after the operator explicitly allocates this lane.
+    if (isRegimeCompositeShortExecEnabled()) {
+      const engineForGate = liveEngine;
+      regimeCompositeShortExecutor = new SingleSymbolLaneExecutor({
+        client: liveClient,
+        store: new SingleSymbolLaneExecutorStore("data", "regime-composite-short-executor.json"),
+        laneId: RCS_PAPER_LANE_ID,
+        direction: "SHORT",
+        getOpenSignals: () => regimeCompositeShortOpenSignals(getRegimeCompositeShortStore()),
+        exitPolicy: regimeCompositeShortExitPolicy(),
+        portfolioExitPolicy: unifiedPortfolioExitPolicy,
+        isAllowed: () => legacyEntryAllowed(
+          RCS_PAPER_LANE_ID,
+          "SHORT",
+          () => isNewExecutorLaneAllowed(RCS_PAPER_LANE_ID, liveConfig.env === "testnet" ? "testnet" : "mainnet", engineForGate, { mainnetEntryEligible: true }) && edgeVeto("SHORT").allowed,
+        ),
+        isAllowedReason: () => edgeVeto("SHORT").reason,
+        laneWeightPct: () => engineForGate?.laneSelectionWeightPctForLane(RCS_PAPER_LANE_ID) ?? 100,
+        legUsd: RCS_EXEC_LEG_USD,
+        leverage: RCS_EXEC_LEVERAGE,
+        maxOpenPositions: RCS_EXEC_MAX_CONCURRENT,
+        maxSignalAgeMs: RCS_EXEC_MAX_SIGNAL_AGE_MS,
+        dailyMaxLossUsd: RCS_EXEC_DAILY_MAX_LOSS_USD,
+        existingNotionalForSymbol: (symbol) => notionalForSymbolExcluding(regimeCompositeShortExecutor, symbol),
+        maxNotionalPerSymbolAcrossLanes,
+        currentPrice: currentPublicPrice,
+        sharedGetPositions,
+        ...singleSymbolEntryClaims,
+      });
+      if (!isTest) {
+        const rcsTick = () => void regimeCompositeShortExecutor?.tick();
+        setTimeout(rcsTick, 255_000);
+        setInterval(rcsTick, 5 * 60_000);
+      }
+    }
+
     // PANIC_WASHOUT_RECLAIM_LONG single-symbol EXECUTOR (2026-07-09). Same posture as
     // REGIME_COMPOSITE_CONFIRMATION_LONG above, own enable flag (PANIC_WASHOUT_EXEC_ENABLED). See
     // panic-washout-reclaim-edge.ts — wired straight to live on operator's explicit request with
@@ -1499,6 +1550,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     shortFadeExecutor: () => shortFadeExecutor,
     intradayMomentumExecutor: () => intradayMomentumExecutor,
     regimeCompositeExecutor: () => regimeCompositeExecutor,
+    regimeCompositeShortExecutor: () => regimeCompositeShortExecutor,
     compositeEstimatorWideLongExecutor: () => compositeEstimatorWideLongExecutor,
     compositeEstimatorWideShortExecutor: () => compositeEstimatorWideShortExecutor,
     compositeEstimatorFastLongExecutor: () => compositeEstimatorFastLongExecutor,

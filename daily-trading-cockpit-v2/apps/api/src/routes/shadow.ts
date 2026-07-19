@@ -2407,6 +2407,11 @@ export async function registerShadowRoutes(
               // as pre-paper backfill. Existing paperStartAt is never reset.
               paperStartAt: paperStore.ensurePaperStartAt(cached?.scanFinishedAt ?? paperNow),
               paperValidationAllowed,
+              // Explicitly scoped to the testnet process. This mode expands forward
+              // diagnostic collection only; it cannot be enabled on a mainnet API.
+              testnetCollectAllLanes:
+                process.env.PAPER_TESTNET_COLLECT_ALL_LANES === "1" &&
+                process.env.LIVE_BINANCE_ENV === "testnet",
               laneState: _laneState,
               paperDiagnosticContinue: process.env.PAPER_DIAGNOSTIC_CONTINUE === "1",
               paperRejectDiagnosticContinue: process.env.PAPER_REJECT_DIAGNOSTIC_CONTINUE === "1",

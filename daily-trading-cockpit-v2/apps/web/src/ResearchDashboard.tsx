@@ -1,4 +1,5 @@
 import { Component, useEffect, useState, type ReactNode } from 'react';
+import { CortexCollectionStatusCard } from './CortexCollectionStatusCard';
 
 // Simple but rich monitoring page for the report-only research lanes (cross-sectional market-neutral).
 // Self-contained: own fetches + 10s auto-refresh + inline-styled dark cards.
@@ -189,7 +190,6 @@ type Moonshot = {
   scoreHistogram: number[];
   recent: Array<{ ts: string; symbol: string; decision: 'SIGNAL' | 'REJECT'; moonshotScore: number; riskScore: number; finalLeverage: number; isSniper: boolean; reasons: string[] }>;
 };
-
 export default function ResearchDashboard() {
   return (
     <ErrorBoundary>
@@ -261,6 +261,8 @@ function ResearchDashboardInner() {
           <span style={{ color: err ? C.bad : C.good }}>●</span> {err ? 'link error' : updated ? `updated ${ago(new Date(updated).toISOString())} ago` : 'loading…'} · auto-refresh 10s
         </div>
       </header>
+
+      <CortexCollectionStatusCard />
 
       {(() => {
         if (!psle) return null;

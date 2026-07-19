@@ -18,6 +18,7 @@ import { getRegimeCompositeStore, buildRegimeCompositeReport, RC_PAPER_LANE_ID }
 import { getRegimeCompositeShortStore, buildRegimeCompositeShortReport, RCS_PAPER_LANE_ID } from "../lib/regime-composite-short-edge.js";
 import { getPanicWashoutStore, buildPanicWashoutReport, PWR_PAPER_LANE_ID } from "../lib/panic-washout-reclaim-edge.js";
 import { getCompositeEstimatorStore, buildCompositeEstimatorReport, ceLaneIdForBucket, type CEBucket } from "../lib/composite-estimator-edge.js";
+import { LANE_SELECTOR_V2_LIVE_SUPPORTED_VARIANT_IDS, laneSelectorV2LaneId } from "../lib/lane-selector-v2.js";
 import { buildLiveWalletReconciliationReport } from "../lib/wallet-reconciliation.js";
 import { sumExternalClosedFeesUsd, sumExternalRealizedPnlUsd } from "../lib/live-executor-wiring.js";
 import type { UnifiedTestnetOrchestrator } from "../lib/unified-testnet-orchestrator.js";
@@ -27,6 +28,22 @@ import type { UnifiedTestnetProposalStore } from "../lib/unified-testnet-proposa
  *  appears inline in realtime-short-mirror.ts (PROFIT_CORE_SHORT_TRAIL_LANE_ID) — not re-exported
  *  from anywhere routes/live.ts already imports, so it's spelled out here to avoid a wider import. */
 const PROFIT_CORE_SHORT_TRAIL_LANE_ID = "PROFIT_CORE_SHORT_TRAIL";
+
+/** Canonical choices for the operator allocation selector. Keep this server-owned so newly
+ * wired executors do not disappear just because a frontend fallback list was not updated. */
+const OPERATOR_ALLOCATION_LANE_IDS = [
+  ...LANE_SELECTOR_V2_LIVE_SUPPORTED_VARIANT_IDS.map((variantId) => laneSelectorV2LaneId(variantId)),
+  "CROSS_SECTIONAL_MARKET_NEUTRAL",
+  "CROSS_SECTIONAL_TREND",
+  "CROSS_SECTIONAL_MIXED",
+  PROFIT_CORE_SHORT_TRAIL_LANE_ID,
+  SF_PAPER_LANE_ID,
+  IM_PAPER_LANE_ID,
+  RC_PAPER_LANE_ID,
+  RCS_PAPER_LANE_ID,
+  PWR_PAPER_LANE_ID,
+  ...(["WIDE_LONG", "WIDE_SHORT", "FAST_LONG", "FAST_SHORT"] as CEBucket[]).map(ceLaneIdForBucket),
+];
 
 type LiveAccountSnapshot = Awaited<ReturnType<LiveExecutionEngine["getAccountSnapshot"]>>;
 
@@ -559,6 +576,7 @@ export async function registerLiveRoutes(
     intradayMomentumExecutor?: () => SingleSymbolLaneExecutor | null;
     // 2026-07-09: REGIME_COMPOSITE_CONFIRMATION_LONG. Same optional/independent contract.
     regimeCompositeExecutor?: () => SingleSymbolLaneExecutor | null;
+    regimeCompositeShortExecutor?: () => SingleSymbolLaneExecutor | null;
     // 2026-07-09: COMPOSITE_ESTIMATOR_BIDI's 4 buckets. Same optional/independent contract.
     compositeEstimatorWideLongExecutor?: () => SingleSymbolLaneExecutor | null;
     compositeEstimatorWideShortExecutor?: () => SingleSymbolLaneExecutor | null;
@@ -580,6 +598,7 @@ export async function registerLiveRoutes(
       opts.shortFadeExecutor?.() ?? null,
       opts.intradayMomentumExecutor?.() ?? null,
       opts.regimeCompositeExecutor?.() ?? null,
+      opts.regimeCompositeShortExecutor?.() ?? null,
       opts.compositeEstimatorWideLongExecutor?.() ?? null,
       opts.compositeEstimatorWideShortExecutor?.() ?? null,
       opts.compositeEstimatorFastLongExecutor?.() ?? null,
@@ -603,6 +622,10 @@ export async function registerLiveRoutes(
       unifiedProposalSource: opts.unifiedProposalStore?.()?.getStatus() ?? null,
     };
   });
+
+  app.get("/api/live/allocation-lanes", async () => ({
+    lanes: Array.from(new Set(OPERATOR_ALLOCATION_LANE_IDS)).sort(),
+  }));
 
   // Shared BTC/ETH/SOL price timeline for the operator and the optional single-symbol execution
   // overlay. The service uses public candles only; no account or order action happens on GET.
@@ -972,6 +995,13 @@ export async function registerLiveRoutes(
     }
     return executor.getStatus();
   });
+  app.get("/api/live/regime-composite-short-executor", async () => {
+    const executor = opts.regimeCompositeShortExecutor?.() ?? null;
+    if (!executor) {
+      return { enabled: false, reason: "REGIME_COMPOSITE_CONFIRMATION_SHORT executor disabled (set REGIME_COMPOSITE_SHORT_EXEC_ENABLED=1 + live execution env)" };
+    }
+    return executor.getStatus();
+  });
   app.get("/api/live/panic-washout-executor", async () => {
     const executor = opts.panicWashoutExecutor?.() ?? null;
     if (!executor) {
@@ -1040,6 +1070,43 @@ export async function registerLiveRoutes(
       return { ok: false, reason: 'body must be {"enabled": true | false, "confirm":"SET_MANUAL_MODE"}' };
     }
     return engine.setManualSelectorMode(body.enabled);
+  });
+
+  // Directional manual allocation: the long list is active only when the current scanner Entry
+  // Decision says LONG, and the short list only when it says SHORT. This does not place an order by
+  // itself; a fresh lane signal with valid stop/TP geometry is still required by the mirror.
+  app.post("/api/live/manual-directional-allocations", async (request, reply) => {
+    if (!engine) {
+      reply.code(503);
+      return { ok: false, reason: "live execution disabled" };
+    }
+    const body = (request.body ?? {}) as {
+      allocations?: unknown;
+      confirm?: string;
+    };
+    if (body.confirm !== "SET_MANUAL_DIRECTIONAL_ALLOCATIONS") {
+      reply.code(400);
+      return { ok: false, reason: 'setting manual directional allocations requires confirm="SET_MANUAL_DIRECTIONAL_ALLOCATIONS"' };
+    }
+    if (body.allocations !== null && (typeof body.allocations !== "object" || Array.isArray(body.allocations))) {
+      reply.code(400);
+      return { ok: false, reason: 'allocations must be null or {long:[{laneId,weightPct}],short:[{laneId,weightPct}]}' };
+    }
+    const raw = body.allocations as { long?: unknown; short?: unknown } | null;
+    if (raw !== null && (!Array.isArray(raw?.long) || !Array.isArray(raw?.short))) {
+      reply.code(400);
+      return { ok: false, reason: 'allocations.long and allocations.short must both be arrays' };
+    }
+    const toRows = (rows: unknown[]) => rows.map((row) => {
+      const value = row && typeof row === "object" ? row as { laneId?: unknown; weightPct?: unknown } : {};
+      return { laneId: String(value.laneId ?? ""), weightPct: Number(value.weightPct) };
+    });
+    const result = engine.setManualDirectionalLaneAllocations(raw === null ? null : {
+      long: toRows(Array.isArray(raw.long) ? raw.long : []),
+      short: toRows(Array.isArray(raw.short) ? raw.short : []),
+    });
+    if (!result.ok) reply.code(400);
+    return result;
   });
 
   app.post("/api/live/lane-allocations", async (request, reply) => {

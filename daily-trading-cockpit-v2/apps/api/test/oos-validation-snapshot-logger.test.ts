@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { appendFileSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -210,6 +210,24 @@ describe("OOS validation snapshot logger", () => {
     expect(store.append(second)).toBe(true);
     expect(store.readTail(1).map((s) => s.capturedAt)).toEqual(["2026-06-05T00:15:00.000Z"]);
     expect(store.readTail(10)).toHaveLength(2);
+  });
+
+  it("reads a bounded tail when the snapshot journal has many large records", () => {
+    tempDir = mkdtempSync(join(tmpdir(), "oos-validation-snapshots-"));
+    const store = new JsonlOosValidationSnapshotStore(tempDir);
+    for (let i = 0; i < 50; i += 1) {
+      const snapshot = buildOosValidationSnapshot({
+        capturedAt: `2026-06-05T00:${String(i).padStart(2, "0")}:00.000Z`,
+        triggerSource: "SCHEDULED",
+        variantMatrixReport: makeVariantMatrixReport(),
+      });
+      appendFileSync(store.path, JSON.stringify({ ...snapshot, padding: "x".repeat(32_000) }) + "\n", "utf-8");
+    }
+
+    expect(store.readTail(2).map((snapshot) => snapshot.capturedAt)).toEqual([
+      "2026-06-05T00:48:00.000Z",
+      "2026-06-05T00:49:00.000Z",
+    ]);
   });
 
   it("schedules read-only snapshots at startup and interval", async () => {

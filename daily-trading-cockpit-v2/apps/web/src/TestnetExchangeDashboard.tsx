@@ -33,6 +33,7 @@ const LIVE_LANE_OPTIONS = [
   // 2026-07-09: axis-score + crowding-state gated LONG (regime-composite-edge.ts), same
   // SingleSymbolLaneExecutor pattern (REGIME_COMPOSITE_EXEC_ENABLED on the VPS env).
   'REGIME_COMPOSITE_CONFIRMATION_LONG',
+  'REGIME_COMPOSITE_CONFIRMATION_SHORT',
   // 2026-07-09: bidirectional composite estimator (axis level+velocity+Kronos, composite-estimator-edge.ts)
   // — 4 buckets, each its own SingleSymbolLaneExecutor (COMPOSITE_ESTIMATOR_EXEC_ENABLED on the VPS env).
   'COMPOSITE_ESTIMATOR_BIDI_WIDE_LONG',
@@ -156,6 +157,12 @@ interface LiveStatus {
     laneAllocations: Array<{ laneId: string; weightPct: number }> | null;
     mode: string;
     manualSelectorMode?: boolean;
+    manualDirectionalAllocations?: {
+      long: Array<{ laneId: string; weightPct: number }>;
+      short: Array<{ laneId: string; weightPct: number }>;
+      activeDirection: 'LONG' | 'SHORT' | null;
+      entryDecision: { action: 'NO_TRADE' | 'WAIT_PULLBACK' | 'WAIT_REJECTION'; directionalBias: 'LONG' | 'SHORT' | null; reason: string; observedAt: string } | null;
+    } | null;
     laneAllocationOperatorLock?: boolean;
   };
   killedAt?: string | null;
@@ -1028,6 +1035,8 @@ export default function TestnetExchangeDashboard() {
     { lane: 'CG_WIDE_FAST_SHORT', weight: '70' },
     { lane: 'CG_WIDE_FAST_LONG', weight: '30' },
   ]);
+  const [manualLongAllocRows, setManualLongAllocRows] = useState<Array<{ lane: string; weight: string }>>([{ lane: 'CG_WIDE_FAST_LONG', weight: '100' }]);
+  const [manualShortAllocRows, setManualShortAllocRows] = useState<Array<{ lane: string; weight: string }>>([{ lane: 'CG_WIDE_FAST_SHORT', weight: '100' }]);
   const [regimeReport, setRegimeReport] = useState<RegimeEngineReport | null>(null);
   const [regimePresets, setRegimePresets] = useState<RegimePresetsMap>({});
   const [regimeAxis, setRegimeAxis] = useState<RegimeAxisTimelineData | null>(null);
@@ -1058,8 +1067,9 @@ export default function TestnetExchangeDashboard() {
   const [rndLanes, setRndLanes] = useState<RndLaneReport[]>([]);
   const [psle, setPsle] = useState<PsleReport | null>(null);
   const [headlineLaneOptions, setHeadlineLaneOptions] = useState<string[]>([]);
+  const [serverAllocationLaneOptions, setServerAllocationLaneOptions] = useState<string[]>([]);
   const laneAllocationOptions = Array.from(new Set(
-    [...LIVE_LANE_OPTIONS, ...headlineLaneOptions, ...allocRows.map((r) => r.lane)].filter(Boolean),
+    [...LIVE_LANE_OPTIONS, ...serverAllocationLaneOptions, ...headlineLaneOptions, ...allocRows.map((r) => r.lane)].filter(Boolean),
   ));
 
   function applyRegimePreset(preset: Array<{ laneId: string; weightPct: number }>) {
@@ -1093,6 +1103,20 @@ export default function TestnetExchangeDashboard() {
   function updateAllocRow(index: number, patch: Partial<{ lane: string; weight: string }>) {
     setAllocRows((rows) => rows.map((r, i) => (i === index ? { ...r, ...patch } : r)));
   }
+  const updateManualAllocRow = (
+    side: 'long' | 'short', index: number, patch: Partial<{ lane: string; weight: string }>,
+  ) => {
+    const setRows = side === 'long' ? setManualLongAllocRows : setManualShortAllocRows;
+    setRows((rows) => rows.map((row, i) => i === index ? { ...row, ...patch } : row));
+  };
+  const addManualAllocRow = (side: 'long' | 'short') => {
+    const setRows = side === 'long' ? setManualLongAllocRows : setManualShortAllocRows;
+    setRows((rows) => [...rows, { lane: '', weight: '0' }]);
+  };
+  const removeManualAllocRow = (side: 'long' | 'short', index: number) => {
+    const setRows = side === 'long' ? setManualLongAllocRows : setManualShortAllocRows;
+    setRows((rows) => rows.length <= 1 ? rows : rows.filter((_, i) => i !== index));
+  };
 
   async function control(url: string, body: unknown, label: string, refresh: () => Promise<void> | void) {
     if (controlBusy) return;
@@ -1133,13 +1157,16 @@ export default function TestnetExchangeDashboard() {
       loadExchangeOnly,
     );
   };
-  const toggleManualMode = () =>
-    control(
+  const toggleManualMode = () => {
+    const enabling = !(status?.laneSelection?.manualSelectorMode === true);
+    if (enabling && isLivePage && !window.confirm('Enable LIVE manual directional mode? It bypasses strategy admission blockers, but still requires Entry Decision bias, fresh signal, valid stop/TP, and account safety checks.')) return;
+    void control(
       `${pageApiPrefix}/live/manual-mode`,
-      { enabled: !(status?.laneSelection?.manualSelectorMode === true), confirm: 'SET_MANUAL_MODE' },
+      { enabled: enabling, confirm: 'SET_MANUAL_MODE' },
       'Manual selector mode',
       loadExchangeOnly,
     );
+  };
 
   const applyAllocation = () => {
     const allocations: Array<{ laneId: string; weightPct: number }> = [];
@@ -1155,6 +1182,40 @@ export default function TestnetExchangeDashboard() {
   const clearAllocation = () =>
     control(`${pageApiPrefix}/live/lane-allocations`, { allocations: null, confirm: 'SET_ALLOCATIONS' }, `Clear ${allocationLabel}`, loadExchangeOnly);
 
+  const loadManualDirectionalAllocation = () => {
+    const current = status?.laneSelection?.manualDirectionalAllocations;
+    if (!current) {
+      setControlMsg({ ok: false, message: 'Manual directional allocation belum diset di server.' });
+      return;
+    }
+    setManualLongAllocRows(current.long.length ? current.long.map((row) => ({ lane: row.laneId, weight: String(row.weightPct) })) : [{ lane: '', weight: '0' }]);
+    setManualShortAllocRows(current.short.length ? current.short.map((row) => ({ lane: row.laneId, weight: String(row.weightPct) })) : [{ lane: '', weight: '0' }]);
+    setControlMsg({ ok: true, message: 'Manual LONG dan SHORT allocation dimuat dari server.' });
+  };
+  const applyManualDirectionalAllocation = () => {
+    const toRows = (rows: Array<{ lane: string; weight: string }>) => rows
+      .filter((row) => row.lane.trim())
+      .map((row) => ({ laneId: row.lane.trim(), weightPct: Number(row.weight) }));
+    const allocations = { long: toRows(manualLongAllocRows), short: toRows(manualShortAllocRows) };
+    if (allocations.long.length + allocations.short.length === 0) {
+      setControlMsg({ ok: false, message: 'Manual directional allocation: pilih minimal satu lane.' });
+      return;
+    }
+    void control(
+      `${pageApiPrefix}/live/manual-directional-allocations`,
+      { allocations, confirm: 'SET_MANUAL_DIRECTIONAL_ALLOCATIONS' },
+      'Manual LONG/SHORT allocation',
+      loadExchangeOnly,
+    );
+  };
+  const clearManualDirectionalAllocation = () =>
+    control(
+      `${pageApiPrefix}/live/manual-directional-allocations`,
+      { allocations: null, confirm: 'SET_MANUAL_DIRECTIONAL_ALLOCATIONS' },
+      'Clear manual LONG/SHORT allocation',
+      loadExchangeOnly,
+    );
+
   async function loadHeadlineLaneOptions() {
     try {
       // 2026-07-11: was a bare '/api/shadow/neural-map' — in production Caddy's Referer-based
@@ -1167,6 +1228,17 @@ export default function TestnetExchangeDashboard() {
       setHeadlineLaneOptions(extractHeadlineAllocationLanes(payload));
     } catch {
       // keep static fallback options
+    }
+  }
+
+  async function loadServerAllocationLaneOptions() {
+    try {
+      const payload = await fetchJson<{ lanes?: unknown }>(`${pageApiPrefix}/live/allocation-lanes`);
+      if (Array.isArray(payload.lanes)) {
+        setServerAllocationLaneOptions(payload.lanes.filter((lane): lane is string => typeof lane === 'string' && lane.trim().length > 0));
+      }
+    } catch {
+      // Static and active-allocation fallbacks keep the selector usable during a transient API error.
     }
   }
 
@@ -1498,8 +1570,10 @@ export default function TestnetExchangeDashboard() {
 
   useEffect(() => {
     void loadHeadlineLaneOptions();
+    void loadServerAllocationLaneOptions();
     const timer = window.setInterval(() => {
       void loadHeadlineLaneOptions();
+      void loadServerAllocationLaneOptions();
     }, 30_000);
     return () => window.clearInterval(timer);
   }, []);
@@ -1784,14 +1858,20 @@ export default function TestnetExchangeDashboard() {
           <div>
             <small style={{ display: 'block', marginBottom: 4 }}>
               New entries <strong className={status?.newEntries?.allowed ? 'tone-healthy' : 'tone-critical'}>
-                {status?.newEntries?.drainActive ? 'DRAINED' : status?.newEntries?.strategyGate?.allowed ? 'OPEN' : 'REGIME BLOCKED'}
+                {status?.newEntries?.drainActive
+                  ? 'DRAINED'
+                  : status?.laneSelection?.manualSelectorMode
+                    ? status?.laneSelection?.manualDirectionalAllocations?.activeDirection ? 'MANUAL READY' : 'WAITING ENTRY DECISION'
+                    : status?.newEntries?.strategyGate?.allowed ? 'OPEN' : 'REGIME BLOCKED'}
               </strong>
             </small>
             <button type="button" disabled={controlBusy} onClick={toggleEntryDrain}>
               {status?.newEntries?.drainActive ? 'Resume new entries' : 'Pause new entries'}
             </button>
             <small style={{ display: 'block', maxWidth: 340, marginTop: 4 }}>
-              {status?.newEntries?.pauseReason ?? status?.newEntries?.strategyGate?.reason ?? 'No entry blocker'}; exits remain managed.
+              {status?.newEntries?.pauseReason ?? (status?.laneSelection?.manualSelectorMode
+                ? 'Manual directional policy active; scanner decides the allowed side.'
+                : status?.newEntries?.strategyGate?.reason) ?? 'No entry blocker'}; exits remain managed.
             </small>
           </div>
           <div>
@@ -1804,17 +1884,53 @@ export default function TestnetExchangeDashboard() {
             <button
               type="button"
               disabled={controlBusy}
-              onClick={() => void toggleManualMode()}
+              onClick={toggleManualMode}
               title={
                 status?.laneSelection?.manualSelectorMode
-                  ? 'Manual ON: trades exactly the lane allocation selector, bypassing the book overlay + regime direction-gate. Click to return to SMART.'
-                  : 'SMART ON: book overlay + regime direction-gate active. Click to switch to MANUAL (raw selector, bypass smart logic).'
+                  ? 'Manual ON: scanner Entry Decision selects LONG or SHORT allocation; admission blockers are bypassed, but all exchange/account protections remain. Click to return to SMART.'
+                  : 'SMART ON: book overlay + regime direction-gate active. Click to switch to manual directional mode.'
               }
             >
-              {status?.laneSelection?.manualSelectorMode ? 'Switch to SMART' : 'Switch to MANUAL (bypass)'}
+              {status?.laneSelection?.manualSelectorMode ? 'Switch to SMART' : 'Switch to MANUAL directional'}
             </button>
           </div>
-          <div>
+          {isLivePage ? <div style={{ minWidth: 430, maxWidth: 640 }}>
+            <small style={{ display: 'block', marginBottom: 4 }}>
+              LIVE manual long / short allocation{' '}
+              <button type="button" disabled={controlBusy} onClick={loadManualDirectionalAllocation}>Load current</button>{' '}
+              <span style={{ color: '#e0a83a' }}>
+                active: {status?.laneSelection?.manualDirectionalAllocations?.activeDirection ?? 'NO TRADE'}
+                {status?.laneSelection?.manualDirectionalAllocations?.entryDecision
+                  ? ` · ${status.laneSelection.manualDirectionalAllocations.entryDecision.action.replaceAll('_', ' ')}`
+                  : ' · waiting for scanner'}
+              </span>
+            </small>
+            {(['long', 'short'] as const).map((side) => {
+              const rows = side === 'long' ? manualLongAllocRows : manualShortAllocRows;
+              const tone = side === 'long' ? '#5ce4a6' : '#ffbf55';
+              return <div key={side} style={{ borderTop: '1px solid #22343c', paddingTop: 4, marginTop: 4 }}>
+                <strong style={{ color: tone, fontSize: 12 }}>{side.toUpperCase()} selector</strong>
+                {rows.map((row, i) => (
+                  <div key={i} style={{ marginTop: 2 }}>
+                    <select value={row.lane} onChange={(event) => updateManualAllocRow(side, i, { lane: event.target.value })}>
+                      <option value="">(none)</option>
+                      {laneAllocationOptions.map((lane) => <option key={lane} value={lane}>{lane}</option>)}
+                    </select>{' '}
+                    <input type="number" min={0} max={100} value={row.weight} onChange={(event) => updateManualAllocRow(side, i, { weight: event.target.value })} style={{ width: 56 }} />%
+                    {' '}<button type="button" disabled={controlBusy || rows.length <= 1} onClick={() => removeManualAllocRow(side, i)}>Remove</button>
+                  </div>
+                ))}
+                <button type="button" disabled={controlBusy} onClick={() => addManualAllocRow(side)}>+ Add {side}</button>
+              </div>;
+            })}
+            <div style={{ marginTop: 6 }}>
+              <button type="button" disabled={controlBusy} onClick={applyManualDirectionalAllocation}>Apply LONG / SHORT</button>{' '}
+              <button type="button" disabled={controlBusy} onClick={() => void clearManualDirectionalAllocation()}>Clear</button>
+            </div>
+            <small style={{ display: 'block', maxWidth: 610, marginTop: 4 }}>
+              Manual follows `ENTRY DECISION SEKARANG`: only the matching directional selector is admitted. `NO TRADE` opens nothing. Fresh signal, stop/TP geometry, correlation caps, kill switch, and exchange checks remain mandatory.
+            </small>
+          </div> : <div>
             <small style={{ display: 'block', marginBottom: 4 }}>
               {allocationLabel} — active: {status?.laneSelection?.laneAllocations
                 ? status.laneSelection.laneAllocations.map((a) => `${compactLane(a.laneId)} ${a.weightPct}%`).join(' + ')
@@ -1843,7 +1959,7 @@ export default function TestnetExchangeDashboard() {
             {' '}
             <button type="button" disabled={controlBusy} onClick={applyAllocation}>Apply</button>{' '}
             <button type="button" disabled={controlBusy} onClick={() => void clearAllocation()}>Clear</button>
-          </div>
+          </div>}
         </div>
       </section>
 

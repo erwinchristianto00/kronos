@@ -32,7 +32,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "
 import { dirname, resolve } from "node:path";
 
 import type { Candle } from "@dtc/shared";
-import { computeATR } from "./candle-indicators.js";
+import { computeATR, computeEMA, computeRSI } from "./candle-indicators.js";
 import { fetchCrowdingSnapshot, type CrowdingSnapshot, type CrowdingState } from "./derivatives-crowding.js";
 import type { BinanceClient } from "./binance.js";
 import {
@@ -53,6 +53,11 @@ export const RC_AXIS_SCORE_MIN = Number(process.env.REGIME_COMPOSITE_AXIS_SCORE_
 export const RC_ALLOWED_CROWDING_STATES: ReadonlySet<CrowdingState> = new Set(["NEUTRAL", "BUILDING"]);
 export const RC_MAX_STORED_OBSERVATIONS = envNum("REGIME_COMPOSITE_MAX_STORED_OBSERVATIONS", 500);
 export const RC_ATR_PERIOD = envNum("REGIME_COMPOSITE_ATR_PERIOD", 14);
+/** A bullish regime is directional context, not a license to chase an already-extended green bar. */
+export const RC_RETEST_EMA_PERIOD = Math.max(2, Math.floor(envNum("REGIME_COMPOSITE_RETEST_EMA_PERIOD", 20)));
+export const RC_RETEST_EMA_TOUCH_ATR = Math.max(0, envNum("REGIME_COMPOSITE_RETEST_EMA_TOUCH_ATR", 0.25));
+export const RC_MAX_EXTENSION_ABOVE_EMA_ATR = Math.max(0.1, envNum("REGIME_COMPOSITE_MAX_EXTENSION_ABOVE_EMA_ATR", 0.75));
+export const RC_MAX_ENTRY_RSI = Math.max(0, Math.min(100, envNum("REGIME_COMPOSITE_MAX_ENTRY_RSI", 68)));
 /** Initial stop = entry − ATR × this. Wider than the breakout lane's 1.5 — this rides a broader
  *  regime read, not a tight structural level, matching this repo's own wide-stop-for-LONGs finding. */
 export const RC_ATR_STOP_MULT = Number(process.env.REGIME_COMPOSITE_ATR_STOP_MULT) || 2;
@@ -87,6 +92,36 @@ export interface RegimeCompositeSignal {
   axisScoreAtEntry: number;
   crowdingStateAtEntry: CrowdingState;
   fundingBpsAtEntry: number | null;
+  entrySetup: "EMA20_RETEST_REJECTION";
+  ema20AtEntry: number;
+  extensionAboveEmaAtr: number;
+}
+
+export type RcLongEntryRejection =
+  | "AXIS_NOT_BULLISH"
+  | "CROWDING_NOT_STABLE"
+  | "INSUFFICIENT_CANDLES"
+  | "ATR_UNAVAILABLE"
+  | "EMA_UNAVAILABLE"
+  | "RSI_OVERBOUGHT_WAIT_PULLBACK"
+  | "NO_EMA20_RETEST"
+  | "NO_BULLISH_REJECTION"
+  | "LATE_EXTENSION_WAIT_PULLBACK"
+  | "INVALID_STOP_GEOMETRY";
+
+export interface RcLongEntryEvaluation {
+  signal: RegimeCompositeSignal | null;
+  rejection: RcLongEntryRejection | null;
+}
+
+function bullishRejectionOrBreakout(last: Candle, previous: Candle, atr: number): boolean {
+  const body = Math.abs(last.close - last.open);
+  const lowerWick = Math.min(last.open, last.close) - last.low;
+  const meaningfulBody = Math.max(body, atr * 0.05);
+  const bullishClose = last.close > last.open;
+  const wickRejects = lowerWick >= meaningfulBody;
+  const breakoutRejects = last.close > previous.high;
+  return bullishClose && (wickRejects || breakoutRejects);
 }
 
 /**
@@ -94,38 +129,69 @@ export interface RegimeCompositeSignal {
  * (last element = the just-closed bar). Both confirmations must pass; ATR must be computable. No
  * lookahead — uses only closed bars.
  */
+export function evaluateRegimeCompositeEntry(
+  candles: Candle[],
+  axisScore: number | null,
+  crowding: CrowdingSnapshot | null,
+): RcLongEntryEvaluation {
+  if (!finite(axisScore) || axisScore < RC_AXIS_SCORE_MIN) return { signal: null, rejection: "AXIS_NOT_BULLISH" };
+  if (!crowding || !RC_ALLOWED_CROWDING_STATES.has(crowding.crowdingState)) return { signal: null, rejection: "CROWDING_NOT_STABLE" };
+
+  const need = Math.max(RC_ATR_PERIOD, RC_RETEST_EMA_PERIOD) + 2;
+  if (candles.length < need) return { signal: null, rejection: "INSUFFICIENT_CANDLES" };
+  const last = candles[candles.length - 1]!;
+  const previous = candles[candles.length - 2]!;
+  const entryPrice = last.close;
+  if (!(entryPrice > 0)) return { signal: null, rejection: "INVALID_STOP_GEOMETRY" };
+
+  const atrSeries = computeATR(candles, RC_ATR_PERIOD);
+  const atr = atrSeries[atrSeries.length - 1];
+  if (!finite(atr) || !(atr > 0)) return { signal: null, rejection: "ATR_UNAVAILABLE" };
+
+  const ema20 = computeEMA(candles.map((c) => c.close), RC_RETEST_EMA_PERIOD).at(-1);
+  if (!finite(ema20) || !(ema20 > 0)) return { signal: null, rejection: "EMA_UNAVAILABLE" };
+  const rsi = computeRSI(candles.map((c) => c.close), 14).at(-1);
+  if (finite(rsi) && rsi >= RC_MAX_ENTRY_RSI) return { signal: null, rejection: "RSI_OVERBOUGHT_WAIT_PULLBACK" };
+
+  const touchedEmaFromAbove = last.low <= ema20 + RC_RETEST_EMA_TOUCH_ATR * atr;
+  const closedAboveEma = last.close > ema20;
+  if (!touchedEmaFromAbove || !closedAboveEma) return { signal: null, rejection: "NO_EMA20_RETEST" };
+  if (!bullishRejectionOrBreakout(last, previous, atr)) return { signal: null, rejection: "NO_BULLISH_REJECTION" };
+
+  const extensionAboveEmaAtr = (last.close - ema20) / atr;
+  if (extensionAboveEmaAtr > RC_MAX_EXTENSION_ABOVE_EMA_ATR) {
+    return { signal: null, rejection: "LATE_EXTENSION_WAIT_PULLBACK" };
+  }
+
+  const initialStop = entryPrice - RC_ATR_STOP_MULT * atr;
+  if (!(initialStop > 0) || !(initialStop < entryPrice)) return { signal: null, rejection: "INVALID_STOP_GEOMETRY" };
+  const stopDistanceBps = ((entryPrice - initialStop) / entryPrice) * 10000;
+  if (!(stopDistanceBps > 0)) return { signal: null, rejection: "INVALID_STOP_GEOMETRY" };
+
+  return {
+    signal: {
+      entryPrice,
+      initialStop,
+      stopDistanceBps,
+      atrAtEntry: atr,
+      axisScoreAtEntry: axisScore,
+      crowdingStateAtEntry: crowding.crowdingState,
+      fundingBpsAtEntry: crowding.fundingBps,
+      entrySetup: "EMA20_RETEST_REJECTION",
+      ema20AtEntry: ema20,
+      extensionAboveEmaAtr,
+    },
+    rejection: null,
+  };
+}
+
+/** Backward-compatible nullable entry seam for callers that only need executable geometry. */
 export function detectRegimeCompositeEntry(
   candles: Candle[],
   axisScore: number | null,
   crowding: CrowdingSnapshot | null,
 ): RegimeCompositeSignal | null {
-  if (!finite(axisScore) || axisScore < RC_AXIS_SCORE_MIN) return null;
-  if (!crowding || !RC_ALLOWED_CROWDING_STATES.has(crowding.crowdingState)) return null;
-
-  const need = RC_ATR_PERIOD + 2;
-  if (candles.length < need) return null;
-  const last = candles[candles.length - 1]!;
-  const entryPrice = last.close;
-  if (!(entryPrice > 0)) return null;
-
-  const atrSeries = computeATR(candles, RC_ATR_PERIOD);
-  const atr = atrSeries[atrSeries.length - 1];
-  if (!finite(atr) || !(atr > 0)) return null;
-
-  const initialStop = entryPrice - RC_ATR_STOP_MULT * atr;
-  if (!(initialStop > 0) || !(initialStop < entryPrice)) return null;
-  const stopDistanceBps = ((entryPrice - initialStop) / entryPrice) * 10000;
-  if (!(stopDistanceBps > 0)) return null;
-
-  return {
-    entryPrice,
-    initialStop,
-    stopDistanceBps,
-    atrAtEntry: atr,
-    axisScoreAtEntry: axisScore,
-    crowdingStateAtEntry: crowding.crowdingState,
-    fundingBpsAtEntry: crowding.fundingBps,
-  };
+  return evaluateRegimeCompositeEntry(candles, axisScore, crowding).signal;
 }
 
 export interface RegimeCompositeObservation extends RegimeCompositeSignal {
@@ -213,12 +279,13 @@ export interface RCCycleMeta {
   cycles: number;
   axisGateFailTotal: number;
   crowdingGateFailTotal: number;
+  entrySetupGateFailTotal: number;
   recordedTotal: number;
   lastCycleError: string | null;
 }
 
 const EMPTY_CYCLE_META: RCCycleMeta = {
-  lastCycleAt: null, cycles: 0, axisGateFailTotal: 0, crowdingGateFailTotal: 0, recordedTotal: 0, lastCycleError: null,
+  lastCycleAt: null, cycles: 0, axisGateFailTotal: 0, crowdingGateFailTotal: 0, entrySetupGateFailTotal: 0, recordedTotal: 0, lastCycleError: null,
 };
 
 interface RCState {
@@ -255,6 +322,7 @@ export class RegimeCompositeStore {
     if (result) {
       meta.axisGateFailTotal += result.axisGateFail;
       meta.crowdingGateFailTotal += result.crowdingGateFail;
+      meta.entrySetupGateFailTotal += result.entrySetupGateFail;
       meta.recordedTotal += result.recorded;
       meta.lastCycleError = null;
     } else {
@@ -313,6 +381,7 @@ export interface RCCycleResult {
   expired: number;
   axisGateFail: number;
   crowdingGateFail: number;
+  entrySetupGateFail: number;
 }
 
 export async function runRegimeCompositeCycle(opts: {
@@ -326,7 +395,7 @@ export async function runRegimeCompositeCycle(opts: {
   /** Don't record a second OPEN obs for a symbol whose prior one is younger than this. */
   dedupeWindowMs?: number;
 }): Promise<RCCycleResult> {
-  const result: RCCycleResult = { scanned: 0, recorded: 0, resolved: 0, expired: 0, axisGateFail: 0, crowdingGateFail: 0 };
+  const result: RCCycleResult = { scanned: 0, recorded: 0, resolved: 0, expired: 0, axisGateFail: 0, crowdingGateFail: 0, entrySetupGateFail: 0 };
   const universe = opts.universe ?? RC_UNIVERSE;
   const maxConcurrent = opts.maxConcurrent ?? RC_MAX_CONCURRENT;
   const dedupeMs = opts.dedupeWindowMs ?? 3_600_000; // 1h (one signal per symbol per bar)
@@ -387,8 +456,12 @@ export async function runRegimeCompositeCycle(opts: {
       continue;
     }
 
-    const signal = detectRegimeCompositeEntry(candles, opts.axisScore, crowding);
-    if (!signal) continue;
+    const evaluated = evaluateRegimeCompositeEntry(candles, opts.axisScore, crowding);
+    if (!evaluated.signal) {
+      result.entrySetupGateFail += 1;
+      continue;
+    }
+    const signal = evaluated.signal;
 
     const observationId = `rc:${symbol}:${opts.now}`;
     const added = opts.store.add({
@@ -444,7 +517,7 @@ export interface RegimeCompositeReport {
   mfeGivebackShare: number | null;
   stopShare: number | null;
   edgeReady: boolean;
-  topRecent: Array<{ symbol: string; netR: number | null; status: string; exitReason: string | null; openedAt: string; axisScoreAtEntry: number; crowdingStateAtEntry: CrowdingState }>;
+  topRecent: Array<{ symbol: string; netR: number | null; status: string; exitReason: string | null; openedAt: string; axisScoreAtEntry: number; crowdingStateAtEntry: CrowdingState; entrySetup: string | null }>;
   cycleMeta: RCCycleMeta | null;
 }
 
@@ -469,7 +542,7 @@ export function buildRegimeCompositeReport(
   const topRecent = [...observations]
     .sort((a, b) => b.openedAtMs - a.openedAtMs)
     .slice(0, 12)
-    .map((o) => ({ symbol: o.symbol, netR: o.netR, status: o.status, exitReason: o.exitReason, openedAt: o.openedAt, axisScoreAtEntry: o.axisScoreAtEntry, crowdingStateAtEntry: o.crowdingStateAtEntry }));
+    .map((o) => ({ symbol: o.symbol, netR: o.netR, status: o.status, exitReason: o.exitReason, openedAt: o.openedAt, axisScoreAtEntry: o.axisScoreAtEntry, crowdingStateAtEntry: o.crowdingStateAtEntry, entrySetup: o.entrySetup ?? null }));
 
   return {
     laneId: RC_PAPER_LANE_ID,
@@ -543,7 +616,7 @@ export const RC_EXEC_LEVERAGE = (): number => {
   return Number.isFinite(n) && n >= 1 ? Math.floor(n) : 3;
 };
 export const RC_EXEC_MAX_SIGNAL_AGE_MS = (): number =>
-  Math.max(60_000, Math.floor(Number(process.env.REGIME_COMPOSITE_EXEC_MAX_SIGNAL_AGE_MS) || 50 * 60_000));
+  Math.max(60_000, Math.floor(Number(process.env.REGIME_COMPOSITE_EXEC_MAX_SIGNAL_AGE_MS) || 10 * 60_000));
 export const RC_EXEC_DAILY_MAX_LOSS_USD = (): number => {
   const n = Number.parseFloat(process.env.REGIME_COMPOSITE_EXEC_DAILY_MAX_LOSS_USD ?? "");
   return Number.isFinite(n) && n > 0 ? n : 8;

@@ -5,6 +5,7 @@ import "./load-env.js";
 
 import { buildApp } from "./app.js";
 import { getLaneSymbolCurationCacheStore, refreshLaneSymbolCurationCache } from "./lib/lane-symbol-curation-cache.js";
+import { createSingleFlightRunner } from "./lib/single-flight-runner.js";
 
 console.log(`[API] SOCIAL_SENTIMENT_PROVIDER=${process.env.SOCIAL_SENTIMENT_PROVIDER ?? "(not set)"}`);
 
@@ -43,34 +44,30 @@ if (process.env.PAPER_AUTO_CYCLE !== "0") {
   const intervalMin = Math.max(1, Number(process.env.PAPER_AUTO_CYCLE_MINUTES ?? 7));
   const timeoutMs = Math.max(5_000, Number(process.env.PAPER_AUTO_CYCLE_TIMEOUT_MS ?? 45_000));
   const url = `http://127.0.0.1:${port}/api/shadow/operator-brief?paper=1&resolve=1&headless=1`;
-  let paperCycleInFlight = false;
-  const tick = (): void => {
-    if (paperCycleInFlight) {
-      console.warn("[API] paper-cycle tick skipped: previous tick still running");
-      return;
-    }
-    paperCycleInFlight = true;
+  const paperCycle = createSingleFlightRunner(async () => {
     const startedAt = Date.now();
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
-    fetch(url, { signal: controller.signal })
-      .then((res) => {
-        if (!res.ok) {
-          console.warn(`[API] paper-cycle tick returned HTTP ${res.status}`);
-        }
-      })
-      .catch((e) => console.warn(`[API] paper-cycle tick failed: ${(e as Error).message}`))
-      .finally(() => {
-        clearTimeout(timer);
-        paperCycleInFlight = false;
-        const elapsedMs = Date.now() - startedAt;
-        if (elapsedMs > timeoutMs * 0.8) {
-          console.warn(`[API] paper-cycle tick slow: ${elapsedMs}ms`);
-        }
-      });
-  };
-  setTimeout(tick, 60_000); // first run after a scan has populated candidates
-  setInterval(tick, intervalMin * 60_000);
+    try {
+      const res = await fetch(url, { signal: controller.signal });
+      if (!res.ok) console.warn(`[API] paper-cycle tick returned HTTP ${res.status}`);
+    } catch (error) {
+      console.warn(`[API] paper-cycle tick failed: ${(error as Error).message}`);
+    } finally {
+      clearTimeout(timer);
+      const elapsedMs = Date.now() - startedAt;
+      if (elapsedMs > timeoutMs * 0.8) console.warn(`[API] paper-cycle tick slow: ${elapsedMs}ms`);
+    }
+  }, {
+    onQueued: () => console.warn("[API] paper-cycle tick queued: previous tick still running"),
+  });
+  // Start the repeating timer only AFTER the warm-up tick. Starting setTimeout(60s) and
+  // setInterval(1min) together makes both fire simultaneously on the testnet's 1-minute cadence,
+  // immediately queuing a duplicate full resolver run after every restart.
+  setTimeout(() => {
+    paperCycle.tick(); // first run after a scan has populated candidates
+    setInterval(paperCycle.tick, intervalMin * 60_000);
+  }, 60_000);
   console.log(`[API] PAPER_AUTO_CYCLE on — paper admission+resolution every ${intervalMin}min (timeout ${timeoutMs}ms)`);
 }
 
@@ -111,41 +108,36 @@ if (process.env.WALLET_RECONCILIATION_ENABLED === "1") {
   const intervalMin = Math.max(1, Number(process.env.WALLET_RECONCILIATION_INTERVAL_MINUTES ?? 30));
   const timeoutMs = Math.max(5_000, Number(process.env.WALLET_RECONCILIATION_TIMEOUT_MS ?? 15_000));
   const url = `http://127.0.0.1:${port}/api/live/wallet-reconciliation`;
-  let reconciliationInFlight = false;
-  const runReconciliation = (): void => {
-    if (reconciliationInFlight) {
-      console.warn("[API] wallet-reconciliation tick skipped: previous tick still running");
-      return;
-    }
-    reconciliationInFlight = true;
+  const reconciliation = createSingleFlightRunner(async () => {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
-    fetch(url, { signal: controller.signal })
-      .then(async (res) => {
-        if (!res.ok) {
-          console.warn(`[API] wallet-reconciliation tick returned HTTP ${res.status}`);
-          return;
-        }
-        const body = (await res.json().catch(() => null)) as {
+    try {
+      const res = await fetch(url, { signal: controller.signal });
+      if (!res.ok) {
+        console.warn(`[API] wallet-reconciliation tick returned HTTP ${res.status}`);
+        return;
+      }
+      const body = (await res.json().catch(() => null)) as {
           ok?: boolean;
           report?: { dayUtc?: string; deltaUsd?: number; toleranceUsd?: number; withinTolerance?: boolean };
-        } | null;
-        if (body?.ok && body.report && body.report.withinTolerance === false) {
-          const delta = body.report.deltaUsd ?? 0;
-          console.warn(
-            `[API] WALLET RECONCILIATION MISMATCH day=${body.report.dayUtc} delta=$${delta.toFixed(2)} ` +
-              `exceeds tolerance $${body.report.toleranceUsd} — internal ledger vs Binance income history ` +
-              `disagree. Report-only: no trading action taken; investigate manually.`,
-          );
-        }
-      })
-      .catch((e) => console.warn(`[API] wallet-reconciliation tick failed: ${(e as Error).message}`))
-      .finally(() => {
-        clearTimeout(timer);
-        reconciliationInFlight = false;
-      });
-  };
-  setTimeout(runReconciliation, 90_000); // first run well after boot, once the engine + ledger are warm
-  setInterval(runReconciliation, intervalMin * 60_000);
+      } | null;
+      if (body?.ok && body.report && body.report.withinTolerance === false) {
+        const delta = body.report.deltaUsd ?? 0;
+        console.warn(
+          `[API] WALLET RECONCILIATION MISMATCH day=${body.report.dayUtc} delta=$${delta.toFixed(2)} ` +
+            `exceeds tolerance $${body.report.toleranceUsd} — internal ledger vs Binance income history ` +
+            `disagree. Report-only: no trading action taken; investigate manually.`,
+        );
+      }
+    } catch (error) {
+      console.warn(`[API] wallet-reconciliation tick failed: ${(error as Error).message}`);
+    } finally {
+      clearTimeout(timer);
+    }
+  }, {
+    onQueued: () => console.warn("[API] wallet-reconciliation tick queued: previous tick still running"),
+  });
+  setTimeout(reconciliation.tick, 90_000); // first run well after boot, once the engine + ledger are warm
+  setInterval(reconciliation.tick, intervalMin * 60_000);
   console.log(`[API] WALLET_RECONCILIATION_ENABLED on — checking every ${intervalMin}min (timeout ${timeoutMs}ms)`);
 }

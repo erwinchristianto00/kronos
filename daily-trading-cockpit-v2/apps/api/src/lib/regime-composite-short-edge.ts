@@ -23,11 +23,10 @@
  * Fixed small universe (BTC/ETH/SOL — high-liquidity majors), SHORT-only, standalone module (own
  * store/cycle/resolver/report), same "measure before it trades" discipline as every other lane.
  *
- * Consumed ONLY as a confirmation signal by the unified testnet brain (regimeCompositeShortOpenSignals
- * → a SHORT confirmation vote in app.ts). Unlike RC it has NO executor adapters — the brain owns
- * execution through its CG recipes; this lane never places a real order, so there is nothing to
- * live-wire and no exec-enable flag. It only needs to accrue an honest OOS record so its confirmation
- * can eventually be trusted.
+ * Its observation stream is also the sole source for the optional single-symbol executor. Entry is
+ * intentionally stricter than the regime read: bearish breadth says which side has the wind, while
+ * the local retest/rejection setup decides whether entering NOW is acceptable. A broad selloff is
+ * therefore not itself a short trigger.
  *
  * FUTURE ENHANCEMENT (deliberately not baked in, to keep this a faithful/comparable mirror of RC):
  * a crowd-side-aware refinement could ADMIT an EXHAUSTING state when the exhausted crowd is LONG
@@ -39,10 +38,14 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "
 import { dirname, resolve } from "node:path";
 
 import type { Candle } from "@dtc/shared";
-import { computeATR } from "./candle-indicators.js";
+import { computeATR, computeEMA, computeRSI } from "./candle-indicators.js";
 import { fetchCrowdingSnapshot, type CrowdingSnapshot, type CrowdingState } from "./derivatives-crowding.js";
 import type { BinanceClient } from "./binance.js";
-import type { SingleSymbolFreshSignal } from "./single-symbol-lane-executor.js";
+import {
+  makeMfeGivebackExitPolicy,
+  type SingleSymbolExitPolicy,
+  type SingleSymbolFreshSignal,
+} from "./single-symbol-lane-executor.js";
 
 function envNum(name: string, dflt: number): number {
   const v = Number(process.env[name]);
@@ -60,6 +63,14 @@ export const RCS_AXIS_SCORE_MAX = Number.isFinite(Number(process.env.REGIME_COMP
 export const RCS_ALLOWED_CROWDING_STATES: ReadonlySet<CrowdingState> = new Set(["NEUTRAL", "BUILDING"]);
 export const RCS_MAX_STORED_OBSERVATIONS = envNum("REGIME_COMPOSITE_SHORT_MAX_STORED_OBSERVATIONS", 500);
 export const RCS_ATR_PERIOD = envNum("REGIME_COMPOSITE_SHORT_ATR_PERIOD", 14);
+/** A bearish regime is not an entry license. Require a closed-candle retest of this EMA from below. */
+export const RCS_RETEST_EMA_PERIOD = Math.max(2, Math.floor(envNum("REGIME_COMPOSITE_SHORT_RETEST_EMA_PERIOD", 20)));
+/** The retest high may finish slightly below the EMA, but cannot be a distant waterfall candle. */
+export const RCS_RETEST_EMA_TOUCH_ATR = Math.max(0, envNum("REGIME_COMPOSITE_SHORT_RETEST_EMA_TOUCH_ATR", 0.25));
+/** Reject a late short when its close has already stretched too far below the retest mean. */
+export const RCS_MAX_EXTENSION_BELOW_EMA_ATR = Math.max(0.1, envNum("REGIME_COMPOSITE_SHORT_MAX_EXTENSION_BELOW_EMA_ATR", 0.75));
+/** A deeply oversold hourly RSI is a rebound-risk state, not a permission to chase the selloff. */
+export const RCS_MIN_ENTRY_RSI = Math.max(0, Math.min(100, envNum("REGIME_COMPOSITE_SHORT_MIN_ENTRY_RSI", 32)));
 /** Initial stop = entry + ATR × this (stop ABOVE for a short). Wide, matching RC's regime-read stop. */
 export const RCS_ATR_STOP_MULT = Number(process.env.REGIME_COMPOSITE_SHORT_ATR_STOP_MULT) || 2;
 export const RCS_MFE_ARM_R = Number(process.env.REGIME_COMPOSITE_SHORT_MFE_ARM_R) || 0.75;
@@ -95,6 +106,36 @@ export interface RegimeCompositeShortSignal {
   axisScoreAtEntry: number;
   crowdingStateAtEntry: CrowdingState;
   fundingBpsAtEntry: number | null;
+  entrySetup: "EMA20_RETEST_REJECTION";
+  ema20AtEntry: number;
+  extensionBelowEmaAtr: number;
+}
+
+export type RcsShortEntryRejection =
+  | "AXIS_NOT_BEARISH"
+  | "CROWDING_NOT_STABLE"
+  | "INSUFFICIENT_CANDLES"
+  | "ATR_UNAVAILABLE"
+  | "EMA_UNAVAILABLE"
+  | "RSI_OVERSOLD_WAIT_PULLBACK"
+  | "NO_EMA20_RETEST"
+  | "NO_BEARISH_REJECTION"
+  | "LATE_EXTENSION_WAIT_PULLBACK"
+  | "INVALID_STOP_GEOMETRY";
+
+export interface RcsShortEntryEvaluation {
+  signal: RegimeCompositeShortSignal | null;
+  rejection: RcsShortEntryRejection | null;
+}
+
+function bearishRejectionOrBreakdown(last: Candle, previous: Candle, atr: number): boolean {
+  const body = Math.abs(last.close - last.open);
+  const upperWick = last.high - Math.max(last.open, last.close);
+  const meaningfulBody = Math.max(body, atr * 0.05);
+  const bearishClose = last.close < last.open;
+  const wickRejects = upperWick >= meaningfulBody;
+  const breakdownRejects = last.close < previous.low;
+  return bearishClose && (wickRejects || breakdownRejects);
 }
 
 /**
@@ -103,38 +144,69 @@ export interface RegimeCompositeShortSignal {
  * <= RCS_AXIS_SCORE_MAX, crowding must be a stable state, ATR must be computable, stop sits ABOVE
  * entry. No lookahead — uses only closed bars.
  */
+export function evaluateRegimeCompositeShortEntry(
+  candles: Candle[],
+  axisScore: number | null,
+  crowding: CrowdingSnapshot | null,
+): RcsShortEntryEvaluation {
+  if (!finite(axisScore) || axisScore > RCS_AXIS_SCORE_MAX) return { signal: null, rejection: "AXIS_NOT_BEARISH" };
+  if (!crowding || !RCS_ALLOWED_CROWDING_STATES.has(crowding.crowdingState)) return { signal: null, rejection: "CROWDING_NOT_STABLE" };
+
+  const need = Math.max(RCS_ATR_PERIOD, RCS_RETEST_EMA_PERIOD) + 2;
+  if (candles.length < need) return { signal: null, rejection: "INSUFFICIENT_CANDLES" };
+  const last = candles[candles.length - 1]!;
+  const previous = candles[candles.length - 2]!;
+  const entryPrice = last.close;
+  if (!(entryPrice > 0)) return { signal: null, rejection: "INVALID_STOP_GEOMETRY" };
+
+  const atrSeries = computeATR(candles, RCS_ATR_PERIOD);
+  const atr = atrSeries[atrSeries.length - 1];
+  if (!finite(atr) || !(atr > 0)) return { signal: null, rejection: "ATR_UNAVAILABLE" };
+
+  const ema20 = computeEMA(candles.map((c) => c.close), RCS_RETEST_EMA_PERIOD).at(-1);
+  if (!finite(ema20) || !(ema20 > 0)) return { signal: null, rejection: "EMA_UNAVAILABLE" };
+  const rsi = computeRSI(candles.map((c) => c.close), 14).at(-1);
+  if (finite(rsi) && rsi <= RCS_MIN_ENTRY_RSI) return { signal: null, rejection: "RSI_OVERSOLD_WAIT_PULLBACK" };
+
+  const touchedEmaFromBelow = last.high >= ema20 - RCS_RETEST_EMA_TOUCH_ATR * atr;
+  const closedBelowEma = last.close < ema20;
+  if (!touchedEmaFromBelow || !closedBelowEma) return { signal: null, rejection: "NO_EMA20_RETEST" };
+  if (!bearishRejectionOrBreakdown(last, previous, atr)) return { signal: null, rejection: "NO_BEARISH_REJECTION" };
+
+  const extensionBelowEmaAtr = (ema20 - last.close) / atr;
+  if (extensionBelowEmaAtr > RCS_MAX_EXTENSION_BELOW_EMA_ATR) {
+    return { signal: null, rejection: "LATE_EXTENSION_WAIT_PULLBACK" };
+  }
+
+  const initialStop = entryPrice + RCS_ATR_STOP_MULT * atr;
+  if (!(initialStop > entryPrice)) return { signal: null, rejection: "INVALID_STOP_GEOMETRY" };
+  const stopDistanceBps = ((initialStop - entryPrice) / entryPrice) * 10000;
+  if (!(stopDistanceBps > 0)) return { signal: null, rejection: "INVALID_STOP_GEOMETRY" };
+
+  return {
+    signal: {
+      entryPrice,
+      initialStop,
+      stopDistanceBps,
+      atrAtEntry: atr,
+      axisScoreAtEntry: axisScore,
+      crowdingStateAtEntry: crowding.crowdingState,
+      fundingBpsAtEntry: crowding.fundingBps,
+      entrySetup: "EMA20_RETEST_REJECTION",
+      ema20AtEntry: ema20,
+      extensionBelowEmaAtr,
+    },
+    rejection: null,
+  };
+}
+
+/** Backward-compatible nullable entry seam for callers that only need executable geometry. */
 export function detectRegimeCompositeShortEntry(
   candles: Candle[],
   axisScore: number | null,
   crowding: CrowdingSnapshot | null,
 ): RegimeCompositeShortSignal | null {
-  if (!finite(axisScore) || axisScore > RCS_AXIS_SCORE_MAX) return null;
-  if (!crowding || !RCS_ALLOWED_CROWDING_STATES.has(crowding.crowdingState)) return null;
-
-  const need = RCS_ATR_PERIOD + 2;
-  if (candles.length < need) return null;
-  const last = candles[candles.length - 1]!;
-  const entryPrice = last.close;
-  if (!(entryPrice > 0)) return null;
-
-  const atrSeries = computeATR(candles, RCS_ATR_PERIOD);
-  const atr = atrSeries[atrSeries.length - 1];
-  if (!finite(atr) || !(atr > 0)) return null;
-
-  const initialStop = entryPrice + RCS_ATR_STOP_MULT * atr;
-  if (!(initialStop > entryPrice)) return null;
-  const stopDistanceBps = ((initialStop - entryPrice) / entryPrice) * 10000;
-  if (!(stopDistanceBps > 0)) return null;
-
-  return {
-    entryPrice,
-    initialStop,
-    stopDistanceBps,
-    atrAtEntry: atr,
-    axisScoreAtEntry: axisScore,
-    crowdingStateAtEntry: crowding.crowdingState,
-    fundingBpsAtEntry: crowding.fundingBps,
-  };
+  return evaluateRegimeCompositeShortEntry(candles, axisScore, crowding).signal;
 }
 
 export interface RegimeCompositeShortObservation extends RegimeCompositeShortSignal {
@@ -221,12 +293,13 @@ export interface RCSCycleMeta {
   cycles: number;
   axisGateFailTotal: number;
   crowdingGateFailTotal: number;
+  entrySetupGateFailTotal: number;
   recordedTotal: number;
   lastCycleError: string | null;
 }
 
 const EMPTY_CYCLE_META: RCSCycleMeta = {
-  lastCycleAt: null, cycles: 0, axisGateFailTotal: 0, crowdingGateFailTotal: 0, recordedTotal: 0, lastCycleError: null,
+  lastCycleAt: null, cycles: 0, axisGateFailTotal: 0, crowdingGateFailTotal: 0, entrySetupGateFailTotal: 0, recordedTotal: 0, lastCycleError: null,
 };
 
 interface RCSState {
@@ -263,6 +336,7 @@ export class RegimeCompositeShortStore {
     if (result) {
       meta.axisGateFailTotal += result.axisGateFail;
       meta.crowdingGateFailTotal += result.crowdingGateFail;
+      meta.entrySetupGateFailTotal += result.entrySetupGateFail;
       meta.recordedTotal += result.recorded;
       meta.lastCycleError = null;
     } else {
@@ -320,6 +394,7 @@ export interface RCSCycleResult {
   expired: number;
   axisGateFail: number;
   crowdingGateFail: number;
+  entrySetupGateFail: number;
 }
 
 export async function runRegimeCompositeShortCycle(opts: {
@@ -332,7 +407,7 @@ export async function runRegimeCompositeShortCycle(opts: {
   maxConcurrent?: number;
   dedupeWindowMs?: number;
 }): Promise<RCSCycleResult> {
-  const result: RCSCycleResult = { scanned: 0, recorded: 0, resolved: 0, expired: 0, axisGateFail: 0, crowdingGateFail: 0 };
+  const result: RCSCycleResult = { scanned: 0, recorded: 0, resolved: 0, expired: 0, axisGateFail: 0, crowdingGateFail: 0, entrySetupGateFail: 0 };
   const universe = opts.universe ?? RCS_UNIVERSE;
   const maxConcurrent = opts.maxConcurrent ?? RCS_MAX_CONCURRENT;
   const dedupeMs = opts.dedupeWindowMs ?? 3_600_000; // 1h (one signal per symbol per bar)
@@ -391,8 +466,12 @@ export async function runRegimeCompositeShortCycle(opts: {
       continue;
     }
 
-    const signal = detectRegimeCompositeShortEntry(candles, opts.axisScore, crowding);
-    if (!signal) continue;
+    const evaluated = evaluateRegimeCompositeShortEntry(candles, opts.axisScore, crowding);
+    if (!evaluated.signal) {
+      result.entrySetupGateFail += 1;
+      continue;
+    }
+    const signal = evaluated.signal;
 
     const observationId = `rcs:${symbol}:${opts.now}`;
     const added = opts.store.add({
@@ -450,7 +529,7 @@ export interface RegimeCompositeShortReport {
   mfeGivebackShare: number | null;
   stopShare: number | null;
   edgeReady: boolean;
-  topRecent: Array<{ symbol: string; netR: number | null; status: string; exitReason: string | null; openedAt: string; axisScoreAtEntry: number; crowdingStateAtEntry: CrowdingState }>;
+  topRecent: Array<{ symbol: string; netR: number | null; status: string; exitReason: string | null; openedAt: string; axisScoreAtEntry: number; crowdingStateAtEntry: CrowdingState; entrySetup: string | null }>;
   cycleMeta: RCSCycleMeta | null;
 }
 
@@ -475,7 +554,7 @@ export function buildRegimeCompositeShortReport(
   const topRecent = [...observations]
     .sort((a, b) => b.openedAtMs - a.openedAtMs)
     .slice(0, 12)
-    .map((o) => ({ symbol: o.symbol, netR: o.netR, status: o.status, exitReason: o.exitReason, openedAt: o.openedAt, axisScoreAtEntry: o.axisScoreAtEntry, crowdingStateAtEntry: o.crowdingStateAtEntry }));
+    .map((o) => ({ symbol: o.symbol, netR: o.netR, status: o.status, exitReason: o.exitReason, openedAt: o.openedAt, axisScoreAtEntry: o.axisScoreAtEntry, crowdingStateAtEntry: o.crowdingStateAtEntry, entrySetup: o.entrySetup ?? null }));
 
   return {
     laneId: RCS_PAPER_LANE_ID,
@@ -512,3 +591,36 @@ export function regimeCompositeShortOpenSignals(store: RegimeCompositeShortStore
       openedAtMs: o.openedAtMs,
     }));
 }
+
+/** Exchange execution uses the exact MFE-giveback geometry measured by this lane. */
+export function regimeCompositeShortExitPolicy(): SingleSymbolExitPolicy {
+  return makeMfeGivebackExitPolicy({
+    armR: RCS_MFE_ARM_R,
+    givebackFrac: RCS_MFE_GIVEBACK_FRAC,
+    maxHoldMs: RCS_MAX_HOLD_BARS * 3_600_000,
+  });
+}
+
+/** Measurement is inert by default; real execution needs this explicit independent flag. */
+export function isRegimeCompositeShortExecEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.REGIME_COMPOSITE_SHORT_EXEC_ENABLED === "1";
+}
+
+export const RCS_EXEC_LEG_USD = (): number => {
+  const n = Number.parseFloat(process.env.REGIME_COMPOSITE_SHORT_EXEC_LEG_USD ?? "");
+  return Number.isFinite(n) && n > 0 ? n : 130;
+};
+export const RCS_EXEC_LEVERAGE = (): number => {
+  const n = Number.parseInt(process.env.REGIME_COMPOSITE_SHORT_EXEC_LEVERAGE ?? "", 10);
+  return Number.isFinite(n) && n >= 1 ? Math.floor(n) : 3;
+};
+export const RCS_EXEC_MAX_SIGNAL_AGE_MS = (): number =>
+  Math.max(60_000, Math.floor(Number(process.env.REGIME_COMPOSITE_SHORT_EXEC_MAX_SIGNAL_AGE_MS) || 10 * 60_000));
+export const RCS_EXEC_DAILY_MAX_LOSS_USD = (): number => {
+  const n = Number.parseFloat(process.env.REGIME_COMPOSITE_SHORT_EXEC_DAILY_MAX_LOSS_USD ?? "");
+  return Number.isFinite(n) && n > 0 ? n : 8;
+};
+export const RCS_EXEC_MAX_CONCURRENT = (): number => {
+  const n = Number.parseInt(process.env.REGIME_COMPOSITE_SHORT_EXEC_MAX_CONCURRENT ?? "", 10);
+  return Number.isFinite(n) && n >= 1 ? Math.floor(n) : RCS_MAX_CONCURRENT;
+};

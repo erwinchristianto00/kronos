@@ -1317,6 +1317,32 @@ describe("paper-opportunity-allocator", () => {
     expect(on.selectedOpportunities.every((o) => o.paperOrderMode === "DIAGNOSTIC_ONLY")).toBe(true);
   });
 
+  it("testnet collect-all admits a fresh cross-direction lane as diagnostic despite normal gates", () => {
+    const dir = tmpDir();
+    const report = buildPaperOpportunityAllocatorReport(
+      baseInputs({
+        vmReport: buildEmptyVmReport(dir),
+        candidates: [makeCandidate({
+          direction: "LONG",
+          symbol: "AVAXUSDT",
+          stopLoss: 97,
+          tp1: 104,
+          noExecutionPlan: true,
+        })],
+        // Bearish router + no evidence + unmodelled EXP lane would all reject this in normal mode.
+        laneState: degradedLaneState(),
+        testnetCollectAllLanes: true,
+      }),
+    );
+
+    const expLong = report.selectedOpportunities.find(
+      (opportunity) => opportunity.variantId === "CG_WIDE_STOP_TP_WIDE",
+    );
+    expect(expLong?.paperOrderMode).toBe("DIAGNOSTIC_ONLY");
+    expect(expLong?.provenance?.candidateQualityFlags).toContain("TESTNET_COLLECT_ALL_LANES");
+    expect(report.headlineEligibleCount).toBe(0);
+  });
+
   it("[P7-3b] quarantined wide lane can still collect one qualified trail challenger diagnostic", async () => {
     const dir = tmpDir();
     const vmReport = await buildWinningVmReport(dir);

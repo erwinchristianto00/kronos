@@ -91,7 +91,12 @@ function safeIsoForFilename(): string {
  * Read the last `tailLines` non-empty lines of a file using a backward
  * chunked reader. Never loads the full file as a single string.
  */
-function readTailLinesSync(filePath: string, tailLines: number, tailBytes: number, chunkSize: number): string[] {
+/**
+ * Return a bounded JSONL tail without materializing the whole source file.
+ * Readers that only need recent telemetry must use this rather than readFileSync(...).split(...),
+ * otherwise an archive-sized report log can take down an API process just by rendering a dashboard.
+ */
+export function readJsonlTailLinesSync(filePath: string, tailLines: number, tailBytes = DEFAULT_TAIL_BYTES, chunkSize = DEFAULT_READ_CHUNK_SIZE): string[] {
   if (tailLines <= 0 || tailBytes <= 0) return [];
   const fd = openSync(filePath, "r");
   try {
@@ -219,7 +224,7 @@ export function rotateJsonlIfNeeded(
 
     let tail: string[];
     try {
-      tail = readTailLinesSync(filePath, tailLines, tailBytes, readChunkSize);
+      tail = readJsonlTailLinesSync(filePath, tailLines, tailBytes, readChunkSize);
     } catch (err) {
       return {
         rotated: false,

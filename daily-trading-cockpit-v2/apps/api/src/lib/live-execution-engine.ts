@@ -100,6 +100,9 @@ export interface LiveExecutionConfig {
   maxClusterPositions: number;
   dailyMaxLossUsd: number;
   maxConsecutiveLosses: number;
+  /** Testnet-only opt-out for account-wide automatic breaker trips. Manual kill, stops,
+   * reconciliation, and exchange-error safety remain active. */
+  autoKillSwitchEnabled: boolean;
   /**
    * A realized close whose |net| is below this is a "scratch" (fee-only / breakeven exit) — it does
    * NOT count toward the consecutive-loss streak (nor reset it). Stops profit-bank / breakeven-after-cost
@@ -120,6 +123,13 @@ export interface LiveExecutionConfig {
   maxPaperOrderAgeMs: number;
   /** Testnet-only: mirror every open paper order, including diagnostic lanes and pre-restart orders. */
   mirrorAllPaperOrders: boolean;
+  /**
+   * Testnet-only collector policy. Interleaves fresh sources by their
+   * lane × direction × entry-regime exposure and never pyramids a source from
+   * a different entry regime into an existing intent. It is observational
+   * collection hygiene, not a mainnet lane-selection policy.
+   */
+  testnetStratifiedCollection: boolean;
   /** LIVE_MIRROR_PROVEN_SYMBOLS_ONLY=1 — see isMirrorProvenSymbolsOnly. Parsed once here so the
    *  behavior is injectable in tests without mutating process.env (which leaks across vitest
    *  worker threads). */
@@ -263,6 +273,7 @@ export function parseLiveExecutionConfig(env: NodeJS.ProcessEnv = process.env): 
     maxClusterPositions: envNonNegativeInt(env.LIVE_MAX_CLUSTER_POSITIONS, 3),
     dailyMaxLossUsd: envNum(env.LIVE_DAILY_MAX_LOSS_USD, 15),
     maxConsecutiveLosses: Math.floor(envNum(env.LIVE_MAX_CONSECUTIVE_LOSSES, 5)),
+    autoKillSwitchEnabled: liveEnv !== "testnet" || env.LIVE_TESTNET_AUTO_KILL_SWITCH !== "0",
     scratchEpsilonUsd: envNum(env.LIVE_SCRATCH_EPSILON_USD, Math.max(0.05, 0.02 * envNum(env.LIVE_RISK_USD_PER_TRADE, 5))),
     maxDrawdownUsd: envNum(env.LIVE_MAX_DRAWDOWN_USD, 40),
     defaultLeverage,
@@ -270,6 +281,8 @@ export function parseLiveExecutionConfig(env: NodeJS.ProcessEnv = process.env): 
     maxNotionalPerTrade: envNum(env.LIVE_MAX_NOTIONAL_PER_TRADE, 250),
     maxPaperOrderAgeMs: Math.floor(envNum(env.LIVE_MAX_PAPER_ORDER_AGE_MS, 10 * 60 * 1000)),
     mirrorAllPaperOrders: env.LIVE_MIRROR_ALL_PAPER === "1" && liveEnv === "testnet",
+    testnetStratifiedCollection:
+      env.LIVE_TESTNET_STRATIFIED_COLLECTION === "1" && liveEnv === "testnet",
     mirrorProvenSymbolsOnly: isMirrorProvenSymbolsOnly(env),
     testnetTakeProfitUsd: liveEnv === "testnet" ? envNum(env.LIVE_TESTNET_TP_USD, 0) : 0,
     testnetRegimeExitEnabled: liveEnv === "testnet" && env.LIVE_TESTNET_REGIME_EXIT !== "0",
@@ -651,8 +664,13 @@ interface LiveExecutionState {
    * selector — bypassing the "smart" overlays (the 2b per-symbol book rotation) and the regime
    * direction-gate — so the operator's picked lanes execute regardless of regime. The HARD safety
    * rails (kill-switch, cluster cap, risk size, stop/TP geometry) are NEVER bypassed. Persisted.
-   */
+  */
   manualSelectorMode: boolean;
+  /** Operator allocations used only by manual mode, selected from the latest Entry Decision bias. */
+  manualDirectionalAllocations: {
+    long: Array<{ laneId: string; weightPct: number }>;
+    short: Array<{ laneId: string; weightPct: number }>;
+  } | null;
   /**
    * Lane-allocation operator lock (2026-07-09 fix, take 2). Distinct from manualSelectorMode above
    * — that field is the RAW BYPASS toggle (scan.ts admission overlays) and is exposed via the
@@ -685,6 +703,13 @@ interface LiveExecutionState {
 export interface LiveNewEntryGateDecision {
   allowed: boolean;
   reason: string | null;
+}
+
+export interface ManualEntryDecisionSnapshot {
+  action: "NO_TRADE" | "WAIT_PULLBACK" | "WAIT_REJECTION";
+  directionalBias: "LONG" | "SHORT" | null;
+  reason: string;
+  observedAt: string;
 }
 
 export interface CrowdingExitShadowEntry {
@@ -756,6 +781,7 @@ export class LiveExecutionStore {
       allowedLaneIds: null,
       laneAllocations: null,
       manualSelectorMode: false,
+      manualDirectionalAllocations: null,
       laneAllocationOperatorLock: false,
       laneSelectionLossWatermark: null,
       laneSelectionLastAutoReset: null,
@@ -1278,6 +1304,68 @@ export function symbolBookNetAvgR(
   return best && Number.isFinite(best.bestNetAvgR) ? best.bestNetAvgR : null;
 }
 
+export type TestnetCollectionRegimeFamily = "BULLISH" | "BEARISH" | "MIXED" | "UNKNOWN";
+
+/** The regime is fixed at the source decision, never inferred from the current controller. */
+export function testnetCollectionRegimeFamily(
+  source: Pick<PaperOrder, "regime" | "controllerMode">,
+): TestnetCollectionRegimeFamily {
+  const regime = (source.regime ?? "").toUpperCase();
+  if (regime.includes("BULL")) return "BULLISH";
+  if (regime.includes("BEAR")) return "BEARISH";
+  if (regime.includes("MIX")) return "MIXED";
+
+  const mode = (source.controllerMode ?? "").toUpperCase();
+  if (mode === "LONG_ONLY") return "BULLISH";
+  if (mode === "SHORT_ONLY") return "BEARISH";
+  if (mode.includes("MIX") || mode === "VALIDATION_ONLY") return "MIXED";
+  return "UNKNOWN";
+}
+
+/** A CORTEX collection stratum is intentionally lane- and entry-direction-specific. */
+export function testnetCollectionStratumKey(
+  source: Pick<PaperOrder, "selectedLaneId" | "direction" | "regime" | "controllerMode">,
+): string {
+  return [
+    source.selectedLaneId ?? "UNKNOWN",
+    source.direction,
+    testnetCollectionRegimeFamily(source),
+  ].join("|");
+}
+
+/**
+ * Deterministic weighted round-robin for testnet evidence collection. Existing samples are the
+ * weight: the least-observed lane × direction × entry-regime gets a turn first, then the next
+ * least-observed stratum. Candidates within a stratum retain their caller-provided priority.
+ */
+export function interleaveTestnetCollectionCandidates<T extends {
+  paper: Pick<PaperOrder, "selectedLaneId" | "direction" | "regime" | "controllerMode">;
+}>(
+  candidates: readonly T[],
+  observedByStratum: ReadonlyMap<string, number>,
+): T[] {
+  const queues = new Map<string, T[]>();
+  for (const candidate of candidates) {
+    const key = testnetCollectionStratumKey(candidate.paper);
+    queues.set(key, [...(queues.get(key) ?? []), candidate]);
+  }
+
+  const emittedByStratum = new Map<string, number>();
+  const output: T[] = [];
+  while (queues.size > 0) {
+    const nextKey = [...queues.keys()].sort((left, right) => {
+      const leftWeight = (observedByStratum.get(left) ?? 0) + (emittedByStratum.get(left) ?? 0);
+      const rightWeight = (observedByStratum.get(right) ?? 0) + (emittedByStratum.get(right) ?? 0);
+      return leftWeight - rightWeight || left.localeCompare(right);
+    })[0]!;
+    const queue = queues.get(nextKey)!;
+    output.push(queue.shift()!);
+    emittedByStratum.set(nextKey, (emittedByStratum.get(nextKey) ?? 0) + 1);
+    if (queue.length === 0) queues.delete(nextKey);
+  }
+  return output;
+}
+
 /**
  * Pyramid cap (2026-07-08): should a further add to this intent be blocked? True once the intent
  * has already absorbed `freeAddLimit` adds AND still hasn't shown `minFavorableR` of real favorable
@@ -1350,6 +1438,8 @@ export class LiveExecutionEngine {
   private filtersCache: Map<string, FuturesSymbolFilters> | null = null;
   private leverageBySymbol = new Map<string, number>();
   private isolatedMarginSet = new Set<string>();
+  /** Scanner-owned; intentionally not persisted, so a restart can never revive a stale direction. */
+  private manualEntryDecision: ManualEntryDecisionSnapshot | null = null;
   /** Throttle for refreshSymbolVolatilityCache — ATR% moves slowly, no need to refetch every tick. */
   private lastVolatilityRefreshAtMs = 0;
 
@@ -1618,8 +1708,15 @@ export class LiveExecutionEngine {
 
   /** Armed means exits/reconcile are active. This stricter method controls NEW exposure only. */
   canOpenNewEntries(): boolean {
-    if (!this.armed || this.store.getState().killedAt) return false;
+    const st = this.store.getState();
+    if (!this.armed || st.killedAt) return false;
     if (this.isNewEntryDrainActive()) return false;
+    // Testnet collect-all still honours arm/disarm, the kill switch, and an
+    // operator drain. It deliberately does not inherit strategy admission.
+    if (this.config.mirrorAllPaperOrders) return true;
+    // Manual mode bypasses strategy/admission blockers only when the scanner has produced a current
+    // directional Entry Decision. Exchange health, stop/TP placement, caps, and the kill switch remain.
+    if (st.manualSelectorMode && st.manualDirectionalAllocations) return this.isManualDirectionalEntryEnabled();
     return this.strategyEntryGate().allowed;
   }
 
@@ -1739,6 +1836,7 @@ export class LiveExecutionEngine {
         maxClusterPositions: this.config.maxClusterPositions,
         dailyMaxLossUsd: this.config.dailyMaxLossUsd,
         maxConsecutiveLosses: this.config.maxConsecutiveLosses,
+        autoKillSwitchEnabled: this.config.autoKillSwitchEnabled,
         scratchEpsilonUsd: this.config.scratchEpsilonUsd,
         maxDrawdownUsd: this.config.maxDrawdownUsd,
         defaultLeverage: this.config.defaultLeverage,
@@ -1746,6 +1844,9 @@ export class LiveExecutionEngine {
         maxNotionalPerTrade: this.config.maxNotionalPerTrade,
         maxPaperOrderAgeMs: this.config.maxPaperOrderAgeMs,
         mirrorAllPaperOrders: this.config.mirrorAllPaperOrders,
+        // Deliberately testnet-only; reports whether collection is being interleaved by
+        // lane, side, and entry-regime rather than a single mirror priority queue.
+        testnetStratifiedCollection: this.config.testnetStratifiedCollection,
         testnetTakeProfitUsd: this.config.testnetTakeProfitUsd,
         testnetRegimeExitEnabled: this.config.testnetRegimeExitEnabled,
         estimatedCloseCostPct: this.config.estimatedCloseCostPct,
@@ -1780,8 +1881,18 @@ export class LiveExecutionEngine {
         allowedLaneIds: st.allowedLaneIds ?? null,
         laneAllocations: st.laneAllocations ?? null,
         manualSelectorMode: st.manualSelectorMode === true,
+        manualDirectionalAllocations: st.manualDirectionalAllocations
+          ? {
+              long: st.manualDirectionalAllocations.long,
+              short: st.manualDirectionalAllocations.short,
+              activeDirection: this.manualEntryDecision?.directionalBias ?? null,
+              entryDecision: this.manualEntryDecision,
+            }
+          : null,
         laneAllocationOperatorLock: st.laneAllocationOperatorLock === true,
-        mode: st.laneAllocations && st.laneAllocations.length > 0
+        mode: st.manualSelectorMode && st.manualDirectionalAllocations
+          ? ("MANUAL_DIRECTIONAL" as const)
+          : st.laneAllocations && st.laneAllocations.length > 0
           ? ("WEIGHTED_ALLOCATION" as const)
           : st.allowedLaneIds === null || st.allowedLaneIds === undefined
             ? ("ALL_LANES" as const)
@@ -2386,6 +2497,9 @@ export class LiveExecutionEngine {
   }
 
   private killSwitchTrip(): string | null {
+    // Existing config fixtures and persisted callers predate this testnet-only option.
+    // Only an explicit false disables automatic trips; missing remains safely enabled.
+    if (this.config.autoKillSwitchEnabled === false) return null;
     const st = this.store.getState();
     if (st.killedAt) return null; // already engaged/latched
     this.rollDailyLedger();
@@ -3650,11 +3764,31 @@ export class LiveExecutionEngine {
 
   // ── mirroring ──────────────────────────────────────────────────────────────
 
+  private activeManualDirectionalAllocations(): Array<{ laneId: string; weightPct: number }> | null {
+    const configured = this.store.getState().manualDirectionalAllocations;
+    const decision = this.manualEntryDecision;
+    if (!this.store.getState().manualSelectorMode || !configured || !decision?.directionalBias || decision.action === "NO_TRADE") return null;
+    return decision.directionalBias === "LONG" ? configured.long : configured.short;
+  }
+
+  private effectiveLaneAllocations(): Array<{ laneId: string; weightPct: number }> | null {
+    const st = this.store.getState();
+    // Empty means an intentional directional hold while manual mode awaits a fresh Entry Decision.
+    if (st.manualSelectorMode && st.manualDirectionalAllocations) return this.activeManualDirectionalAllocations() ?? [];
+    return st.laneAllocations;
+  }
+
+  private isManualDirectionalEntryEnabled(): boolean {
+    const active = this.activeManualDirectionalAllocations();
+    return active !== null && active.length > 0;
+  }
+
   /** Weighted allocation lookup: 100 when allocations are off; the lane's weightPct when
    *  listed; 0 (blocked) when allocations are ON but the lane is not listed. */
   laneSelectionWeightPctForLane(laneId: string): number {
-    const allocations = this.store.getState().laneAllocations;
-    if (!allocations || allocations.length === 0) return 100;
+    const allocations = this.effectiveLaneAllocations();
+    if (allocations === null) return 100;
+    if (allocations.length === 0) return 0;
     const variantId = laneId.split(":").pop() ?? laneId;
     const hit = allocations.find((a) => a.laneId === laneId || a.laneId === variantId);
     return hit ? hit.weightPct : 0;
@@ -3664,7 +3798,8 @@ export class LiveExecutionEngine {
    *  Weighted allocations take precedence; otherwise the plain allow-list applies. */
   laneSelectionAllowsLane(laneId: string): boolean {
     const st = this.store.getState();
-    if (st.laneAllocations && st.laneAllocations.length > 0) {
+    const allocations = this.effectiveLaneAllocations();
+    if (allocations !== null) {
       return this.laneSelectionWeightPctForLane(laneId) > 0;
     }
     const allowed = st.allowedLaneIds;
@@ -3679,7 +3814,7 @@ export class LiveExecutionEngine {
   laneSelectionExplicitlyIncludesLane(laneId: string): boolean {
     const st = this.store.getState();
     const variantId = laneId.split(":").pop() ?? laneId;
-    const allocations = st.laneAllocations ?? [];
+    const allocations = this.effectiveLaneAllocations() ?? [];
     if (allocations.some((a) => a.laneId === laneId || a.laneId === variantId)) return true;
     const allowed = st.allowedLaneIds;
     return Array.isArray(allowed) && allowed.some((id) => id === laneId || id === variantId);
@@ -3695,6 +3830,9 @@ export class LiveExecutionEngine {
    *  plain allow-list (null = all lanes, [] = pause all new mirrors). Matches
    *  selectedLaneId as full id or variant suffix. */
   private laneAllowedForMirror(paper: PaperOrder): boolean {
+    // LIVE_MIRROR_ALL_PAPER is parsed as testnet-only. Collection mode mirrors
+    // every fresh diagnostic source so lane selection cannot starve CORTEX data.
+    if (this.config.mirrorAllPaperOrders) return true;
     const override = this.paperLaneGate(paper);
     if (override !== null) return override;
     return this.laneSelectionAllowsLane(paper.selectedLaneId ?? "");
@@ -3706,12 +3844,14 @@ export class LiveExecutionEngine {
    *  Status, dedup, stop/TP geometry, entry quality, cluster caps and every risk check below remain
    *  unchanged. Returning null from paperLaneGate preserves the legacy source rules exactly. */
   private paperSourceEligibleForMirror(paper: PaperOrder, nowIso: string): boolean {
+    // Testnet collection is broader than orchestration. Still require a fresh
+    // source, but do not let an old unified-recipe verdict suppress it.
+    if (this.config.mirrorAllPaperOrders) return this.isFreshPaperOrder(paper, nowIso);
     const override = this.paperLaneGate(paper);
     if (override !== null) return override && this.isFreshPaperOrder(paper, nowIso);
-    return this.config.mirrorAllPaperOrders ||
-      (paper.paperOrderMode === "HEADLINE" &&
+    return paper.paperOrderMode === "HEADLINE" &&
         this.isFreshPaperOrder(paper, nowIso) &&
-        this.isPaperOrderLiveEligible(paper, nowIso));
+        this.isPaperOrderLiveEligible(paper, nowIso);
   }
 
   /** True when an operator selection (weighted allocation OR allow-list) is active AND
@@ -3719,7 +3859,8 @@ export class LiveExecutionEngine {
    *  exists because of the manual selection, not the bot's normal routing. */
   private operatorSelectionActiveFor(paper: PaperOrder): boolean {
     const st = this.store.getState();
-    const hasAllocations = !!st.laneAllocations && st.laneAllocations.length > 0;
+    const effectiveAllocations = this.effectiveLaneAllocations();
+    const hasAllocations = !!effectiveAllocations && effectiveAllocations.length > 0;
     const hasAllowList = Array.isArray(st.allowedLaneIds) && st.allowedLaneIds.length > 0;
     if (!hasAllocations && !hasAllowList) return false;
     return this.laneAllowedForMirror(paper);
@@ -3782,12 +3923,82 @@ export class LiveExecutionEngine {
   setManualSelectorMode(enabled: boolean): { ok: true; manualSelectorMode: boolean } {
     const st = this.store.getState();
     st.manualSelectorMode = enabled === true;
+    if (!st.manualSelectorMode) this.manualEntryDecision = null;
     this.store.save();
     return { ok: true, manualSelectorMode: st.manualSelectorMode };
   }
 
   isManualSelectorMode(): boolean {
     return this.store.getState().manualSelectorMode === true;
+  }
+
+  /** Scanner-owned direction context for manual mode. It is intentionally ephemeral: after a
+   * restart the engine waits for a new scanner decision instead of trading a remembered bias. */
+  setManualEntryDecision(decision: ManualEntryDecisionSnapshot | null): void {
+    this.manualEntryDecision = decision
+      ? {
+          action: decision.action,
+          directionalBias: decision.directionalBias,
+          reason: decision.reason,
+          observedAt: decision.observedAt,
+        }
+      : null;
+  }
+
+  /** Admission-only manual override. A paper signal must still be fresh and carry valid geometry;
+   * this merely bypasses maturity/book/regime policy after the operator selected that directional lane. */
+  isManualEntryAllowedForPaper(paper: Pick<PaperOrder, "selectedLaneId" | "direction">): boolean {
+    const decision = this.manualEntryDecision;
+    return this.isManualDirectionalEntryEnabled() &&
+      decision?.directionalBias === paper.direction &&
+      this.laneSelectionAllowsLane(paper.selectedLaneId ?? "");
+  }
+
+  setManualDirectionalLaneAllocations(
+    allocations: { long: Array<{ laneId: string; weightPct: number }>; short: Array<{ laneId: string; weightPct: number }> } | null,
+  ): {
+    ok: boolean;
+    reason: string | null;
+    manualDirectionalAllocations: LiveExecutionState["manualDirectionalAllocations"];
+  } {
+    const st = this.store.getState();
+    if (allocations === null) {
+      st.manualDirectionalAllocations = null;
+      this.manualEntryDecision = null;
+      this.store.save();
+      return { ok: true, reason: null, manualDirectionalAllocations: null };
+    }
+    const clean = (side: "long" | "short") => {
+      const rows = allocations[side];
+      if (!Array.isArray(rows) || rows.length > MAX_LANE_ALLOCATIONS) {
+        return { ok: false as const, reason: `${side} allocations must list 0-${MAX_LANE_ALLOCATIONS} lanes` };
+      }
+      const seen = new Set<string>();
+      const result: Array<{ laneId: string; weightPct: number }> = [];
+      for (const raw of rows) {
+        const laneId = String(raw.laneId ?? "").trim();
+        const weightPct = Number(raw.weightPct);
+        if (!laneId) return { ok: false as const, reason: `${side} allocation has empty laneId` };
+        if (!Number.isFinite(weightPct) || weightPct <= 0 || weightPct > 100) {
+          return { ok: false as const, reason: `${side} weightPct for ${laneId} must be in (0, 100]` };
+        }
+        if (seen.has(laneId)) return { ok: false as const, reason: `duplicate ${side} laneId ${laneId}` };
+        seen.add(laneId);
+        result.push({ laneId, weightPct: Math.round(weightPct) });
+      }
+      return { ok: true as const, rows: result };
+    };
+    const long = clean("long");
+    if (!long.ok) return { ok: false, reason: long.reason, manualDirectionalAllocations: st.manualDirectionalAllocations };
+    const short = clean("short");
+    if (!short.ok) return { ok: false, reason: short.reason, manualDirectionalAllocations: st.manualDirectionalAllocations };
+    if (long.rows.length + short.rows.length === 0) {
+      return { ok: false, reason: "pick at least one long or short lane, or clear the manual directional allocation", manualDirectionalAllocations: st.manualDirectionalAllocations };
+    }
+    st.manualDirectionalAllocations = { long: long.rows, short: short.rows };
+    st.laneAllocationOperatorLock = true;
+    this.store.save();
+    return { ok: true, reason: null, manualDirectionalAllocations: st.manualDirectionalAllocations };
   }
 
   /** True once the operator has explicitly applied a lane allocation (POST
@@ -4080,7 +4291,7 @@ export class LiveExecutionEngine {
 
     // Respect the PAPER drawdown breaker too: if the strategy layer halted itself,
     // the live mirror must not keep firing its signals.
-    if (this.paperStore.isAdmissionHalted(now)) return;
+    if (!this.config.mirrorAllPaperOrders && this.paperStore.isAdmissionHalted(now)) return;
 
     const mirrored = new Set(
       st.intents
@@ -4103,8 +4314,10 @@ export class LiveExecutionEngine {
     // diagnosis so far was archaeology. Record the FIRST failing gate for the newest candidates —
     // pure observation, identical conditions to the filter below, surfaced via getStatus().
     const explainDrop = (o: PaperOrder): string => {
-      const orchestrated = this.paperLaneGate(o);
-      if (orchestrated !== null) {
+      const orchestrated = this.config.mirrorAllPaperOrders ? null : this.paperLaneGate(o);
+      if (this.config.mirrorAllPaperOrders) {
+        if (!this.isFreshPaperOrder(o, now)) return "stale";
+      } else if (orchestrated !== null) {
         if (!orchestrated) return "unified_recipe_not_allowed";
         if (!this.isFreshPaperOrder(o, now)) return "stale";
       } else if (!this.config.mirrorAllPaperOrders) {
@@ -4112,7 +4325,7 @@ export class LiveExecutionEngine {
         if (!this.isFreshPaperOrder(o, now)) return "stale";
         if (!this.isPaperOrderLiveEligible(o, now)) return "not_live_eligible";
       }
-      if (o.diagnosticLabel != null) return "diagnostic_label";
+      if (!this.config.mirrorAllPaperOrders && o.diagnosticLabel != null) return "diagnostic_label";
       if (!this.laneAllowedForMirror(o)) return "lane_not_allowed";
       if (!MIRRORABLE_PAPER_STATUSES.has(o.paperStatus)) return `status_${o.paperStatus}`;
       if (!this.config.mirrorAllPaperOrders && !(o.createdAt > st.lastSeenCreatedAt)) return "behind_watermark";
@@ -4140,7 +4353,7 @@ export class LiveExecutionEngine {
       .filter(
         (o) =>
           this.paperSourceEligibleForMirror(o, now) &&
-          o.diagnosticLabel == null &&
+          (this.config.mirrorAllPaperOrders || o.diagnosticLabel == null) &&
           this.laneAllowedForMirror(o) && // operator lane selection (applies in ALL mirror modes)
           MIRRORABLE_PAPER_STATUSES.has(o.paperStatus) &&
           (this.config.mirrorAllPaperOrders || o.createdAt > st.lastSeenCreatedAt) &&
@@ -4181,7 +4394,7 @@ export class LiveExecutionEngine {
         if (c.tier > 1) latchReason(c.paper.paperOrderId, "unproven_symbol");
       }
     }
-    const candidates = ranked
+    const priorityOrderedCandidates = ranked
       // LIVE_MIRROR_PROVEN_SYMBOLS_ONLY: operator-requested hard gate — only book-proven symbols
       // (tier 0/1) may open the directional slot; an unproven-symbol candidate is dropped rather
       // than admitted last. This is the ONE deliberate exception to "never rejects, only reorders"
@@ -4198,6 +4411,12 @@ export class LiveExecutionEngine {
         return a.paper.createdAt < b.paper.createdAt ? -1 : 1;
       })
       .map((c) => c.paper);
+    const candidates = this.config.testnetStratifiedCollection
+      ? interleaveTestnetCollectionCandidates(
+          priorityOrderedCandidates.map((paper) => ({ paper })),
+          this.testnetObservedStratumCounts(st.intents),
+        ).map((candidate) => candidate.paper)
+      : priorityOrderedCandidates;
 
     let slots = Math.max(0, this.config.maxConcurrentPositions - openCount);
     const externalManaged = this.externalManagedNetQty();
@@ -4258,7 +4477,7 @@ export class LiveExecutionEngine {
       // Entry-quality gate: do not pay for a signal whose favorable move already happened, whose
       // stop is already invalidated, or whose remaining target is too small to clear realistic
       // round-trip friction. Existing positions and all exits are unaffected.
-      if (!oppositeIntent && typeof this.marketDataClient?.getBookTicker === "function") {
+      if (!this.config.mirrorAllPaperOrders && !oppositeIntent && typeof this.marketDataClient?.getBookTicker === "function") {
         let livePrice: number | null = null;
         try {
           const book = await this.marketDataClient.getBookTicker(first.symbol);
@@ -4300,7 +4519,7 @@ export class LiveExecutionEngine {
       // a persistently-failing refresh (network/API issue) kept re-serving a stale confirmed=true
       // verdict from the last successful fetch, potentially days old, under the cache's shared
       // top-level computedAt which gets re-stamped every cycle regardless of per-symbol success.
-      if (isDirectionalTechnicalGateEnabled()) {
+      if (!this.config.mirrorAllPaperOrders && isDirectionalTechnicalGateEnabled()) {
         const entry = getSymbolVolatilityCacheStore().get().technicalBySymbol[first.symbol];
         const signal = entry?.[first.direction];
         if (!signal?.confirmed || !isDirectionalTechnicalSignalFresh(entry, nowMs)) {
@@ -4322,7 +4541,12 @@ export class LiveExecutionEngine {
       const lanePapers = oppositeIntent
         ? papers.filter((paper) => this.paperCompatibleWithIntent(oppositeIntent, paper))
         : papers.filter((paper) => this.paperGeometryKey(paper) === this.paperGeometryKey(first));
-      if (lanePapers.length === 0) continue;
+      if (lanePapers.length === 0) {
+        if (oppositeIntent && this.config.testnetStratifiedCollection) {
+          for (const paper of papers) latchReason(paper.paperOrderId, "entry_regime_isolated_open_intent");
+        }
+        continue;
+      }
 
       const filters = await this.getFilters(first.symbol);
       if (!filters) continue;
@@ -4505,11 +4729,40 @@ export class LiveExecutionEngine {
     return `${paper.selectedLaneId ?? "UNKNOWN"}|${this.paperExitRule(paper)}`;
   }
 
+  /** Recent execution provenance is the fairness denominator, not paper issuance volume. */
+  private testnetObservedStratumCounts(intents: readonly LiveIntent[]): Map<string, number> {
+    const counts = new Map<string, number>();
+    for (const intent of intents) {
+      const sources = this.intentSources(intent);
+      for (const source of sources) {
+        const key = testnetCollectionStratumKey({
+          selectedLaneId: source.laneId,
+          direction: intent.direction,
+          regime: source.regime ?? null,
+          controllerMode: source.controllerMode ?? "",
+        });
+        counts.set(key, (counts.get(key) ?? 0) + 1);
+      }
+    }
+    return counts;
+  }
+
   private paperCompatibleWithIntent(intent: LiveIntent, paper: PaperOrder): boolean {
     if (this.paperExitRule(paper) !== this.intentExitRule(intent)) return false;
     const laneId = paper.selectedLaneId ?? "UNKNOWN";
     const existingLaneIds = new Set(this.intentSources(intent).map((source) => source.laneId));
-    return existingLaneIds.size === 0 || existingLaneIds.has(laneId);
+    if (existingLaneIds.size > 0 && !existingLaneIds.has(laneId)) return false;
+    if (!this.config.testnetStratifiedCollection) return true;
+
+    const paperStratum = testnetCollectionStratumKey(paper);
+    return this.intentSources(intent).some((source) =>
+      testnetCollectionStratumKey({
+        selectedLaneId: source.laneId,
+        direction: intent.direction,
+        regime: source.regime ?? null,
+        controllerMode: source.controllerMode ?? "",
+      }) === paperStratum,
+    );
   }
 
   private repricedGeometry(

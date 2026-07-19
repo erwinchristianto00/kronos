@@ -12,12 +12,12 @@
  *  - Storage failures never throw into callers.
  */
 
-import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 
 import type { CurrentGuardVariantMatrixReport, CurrentGuardVariantMatrixRow } from "./current-guard-variant-matrix.js";
 import type { PostCutoverReport } from "./frozen-current-guard-post-cutover.js";
-import { rotateJsonlIfNeeded } from "./jsonl-rotation.js";
+import { readJsonlTailLinesSync, rotateJsonlIfNeeded } from "./jsonl-rotation.js";
 
 export type OosValidationSnapshotTriggerSource =
   | "SCHEDULED"
@@ -349,11 +349,9 @@ export class JsonlOosValidationSnapshotStore implements OosValidationSnapshotSto
   readTail(limit = 20): OosValidationSnapshot[] {
     try {
       if (!existsSync(this.file)) return [];
-      const lines = readFileSync(this.file, "utf-8")
-        .split("\n")
-        .map((line) => line.trim())
-        .filter(Boolean)
-        .slice(-Math.max(0, limit));
+      // Snapshot records contain complete variant-matrix reports and can be tens of KB each.
+      // This endpoint asks for at most a few recent rows, so never build a full-file string here.
+      const lines = readJsonlTailLinesSync(this.file, Math.max(0, limit), 2 * 1024 * 1024);
       const out: OosValidationSnapshot[] = [];
       for (const line of lines) {
         try {
