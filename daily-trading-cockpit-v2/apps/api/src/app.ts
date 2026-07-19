@@ -1265,13 +1265,23 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           // operator has ever actually named its lane id in an allocation.
           // 2026-07-10: operator granted mainnet eligibility to WIDE_LONG specifically (real track
           // record: an open live position plus a real profit close today) after formalizing it into
-          // the live allocation table at a small (3%) weight. The other 3 buckets (WIDE_SHORT,
-          // FAST_LONG, FAST_SHORT — the unproven quadrants per this module's own header comment)
-          // stay ineligible — a per-bucket decision, not a blanket override.
+          // the live allocation table at a small (3%) weight. WIDE_SHORT and FAST_SHORT (the
+          // remaining unproven/negative quadrants) stay ineligible — a per-bucket decision, not a
+          // blanket override.
+          // 2026-07-19: operator explicitly reviewed FAST_LONG's measured track record (n=30
+          // resolved observations, win rate 70%, profit factor 1.115, mean +0.033R/trade — thin but
+          // genuinely positive) and granted mainnet eligibility to this bucket specifically. This
+          // does not contradict CE_UNPROVEN_BUCKETS in composite-estimator-edge.ts, which still
+          // correctly keeps applying its conservative size-cut to FAST_LONG given the thin sample —
+          // that label refers to zero PRIOR backtest evidence at this module's 2026-07-09 design
+          // time, not the live measurement accrued since, and the size-cut behavior is intentionally
+          // left untouched (same conservative-sizing posture as WIDE_LONG's own 3% promotion above).
+          // WIDE_SHORT and FAST_SHORT remain ineligible — both are measured net-negative in live data
+          // (PF 0.575 and 0.558 respectively) — this is a per-bucket decision, not a blanket change.
           isAllowed: () => legacyEntryAllowed(
             laneId,
             direction,
-            () => isNewExecutorLaneAllowed(laneId, liveConfig.env === "testnet" ? "testnet" : "mainnet", engineForGate, { mainnetEntryEligible: bucket === "WIDE_LONG" }) && edgeVeto(direction).allowed,
+            () => isNewExecutorLaneAllowed(laneId, liveConfig.env === "testnet" ? "testnet" : "mainnet", engineForGate, { mainnetEntryEligible: bucket === "WIDE_LONG" || bucket === "FAST_LONG" }) && edgeVeto(direction).allowed,
           ),
           isAllowedReason: () => edgeVeto(direction).reason,
           laneWeightPct: () => engineForGate?.laneSelectionWeightPctForLane(laneId) ?? 100,
