@@ -1,12 +1,31 @@
-# Caddy: one front door for the dashboard — auto-HTTPS + password, reachable from
-# anywhere (phone included) without an SSH tunnel. Caddy serves the built dashboard
-# and proxies /api to the trading API, so you do NOT also need the `dtc-web` pm2
-# process or an open 5173 port. Open only 80 + 443 in the firewall.
+# Caddy: one front door for THREE separate checkouts of this repo running on the
+# same box — main (/, port 3101), testnet (/testnet, port 3102), live/mainnet
+# (/live, port 3103) — each with its OWN `apps/web/dist` build. See the
+# "Current production topology" section in deploy/README.md before touching this
+# file: this exact routing shape has caused repeated confusion (wrong process
+# restarted, assuming a git push deploys /testnet or /live, etc).
+#
+# KEY GOTCHA: none of the three frontends are served by a running Node process —
+# every `handle_path` block below is a plain `file_server` reading a dist folder
+# straight off disk. A frontend-only fix to /testnet or /live needs ONLY a
+# rebuild (`npm run build -w @dtc/web`) INSIDE THAT SPECIFIC CHECKOUT — no pm2
+# restart, and definitely not `pm2 restart dtc-web` (that process's cwd is the
+# MAIN checkout only and has nothing to do with /testnet or /live).
+#
+# SECOND GOTCHA: `/api/*` and `/assets/*` requests from testnet/live pages don't
+# carry a path prefix (the browser just requests `/api/...` or `/assets/...`
+# exactly as embedded in that page's HTML/JS) — Caddy tells them apart from the
+# main instance's identical-looking requests by matching the `Referer` HEADER
+# instead of the URL path (`@liveApi`/`@liveAssets`/`@testnetApi`/`@testnetAssets`
+# below). If a request arrives with no Referer or a stripped one (some
+# extensions/proxies do this), it silently falls through to the main instance's
+# handlers instead of erroring — keep this in mind if testnet/live ever seem to
+# read/write the wrong instance's data.
 #
 # Fill these before use:
-#   - replace dash.example.duckdns.org with YOUR free domain (see deploy/README.md)
-#   - replace the basicauth user + hash (generate with:  caddy hash-password )
-#   - replace /home/ubuntu/... if your repo lives elsewhere
+#   - replace dash.example.duckdns.org (or the bare IP in the fallback block) with your own
+#   - replace the basicauth user + hash (generate with:  caddy hash-password ) — never commit a real hash
+#   - replace the /home/ubuntu/... (or /root/...) checkout paths if yours differ
 
 dash.example.duckdns.org {
 	# Password gate for the whole dashboard. Generate the hash with:
@@ -15,19 +34,62 @@ dash.example.duckdns.org {
 		admin REPLACE_WITH_BCRYPT_HASH
 	}
 
-	# /testnet/api/* → the Binance testnet mirror API. The strip keeps the API
-	# path shape as /api/live/... after proxying to the testnet API process.
+	# ── /live (port 3103, real-money mainnet) ──────────────────────────────
+	@liveApi {
+		path /api/*
+		header_regexp Referer ^https://dash\.example\.duckdns\.org/live
+	}
+	handle @liveApi {
+		reverse_proxy 127.0.0.1:3103
+	}
+	@liveAssets {
+		path /assets/*
+		header_regexp Referer ^https://dash\.example\.duckdns\.org/live
+	}
+	handle @liveAssets {
+		root * /home/ubuntu/kronos-live/daily-trading-cockpit-v2/apps/web/dist
+		file_server
+	}
+	handle /live/api/* {
+		uri strip_prefix /live
+		reverse_proxy 127.0.0.1:3103
+	}
+	handle_path /live* {
+		root * /home/ubuntu/kronos-live/daily-trading-cockpit-v2/apps/web/dist
+		try_files {path} /index.html
+		file_server
+	}
+
+	# ── /testnet (port 3102) ────────────────────────────────────────────────
+	@testnetApi {
+		path /api/*
+		header_regexp Referer ^https://dash\.example\.duckdns\.org/testnet
+	}
+	handle @testnetApi {
+		reverse_proxy 127.0.0.1:3102
+	}
+	@testnetAssets {
+		path /assets/*
+		header_regexp Referer ^https://dash\.example\.duckdns\.org/testnet
+	}
+	handle @testnetAssets {
+		root * /home/ubuntu/kronos-testnet/daily-trading-cockpit-v2/apps/web/dist
+		file_server
+	}
 	handle /testnet/api/* {
 		uri strip_prefix /testnet
 		reverse_proxy 127.0.0.1:3102
 	}
+	handle_path /testnet* {
+		root * /home/ubuntu/kronos-testnet/daily-trading-cockpit-v2/apps/web/dist
+		try_files {path} /index.html
+		file_server
+	}
 
-	# /api/* → the trading API (localhost only)
+	# ── / (main, port 3101) — must stay LAST, it's the catch-all ───────────
 	handle /api/* {
 		reverse_proxy 127.0.0.1:3101
 	}
-
-	# everything else → the built single-page dashboard
 	handle {
 		root * /home/ubuntu/daily-trading-cockpit-v2/apps/web/dist
 		try_files {path} /index.html
@@ -40,17 +102,61 @@ dash.example.duckdns.org {
 # ── IP-only fallback (no domain) ────────────────────────────────────────────
 # No free domain? Comment the block above and use this instead — Caddy serves a
 # self-signed cert on the VM's public IP (browser shows a one-time warning).
-# Replace the IP. Auto-HTTPS via Let's Encrypt needs a real domain, so this uses
-# Caddy's internal CA.
+# Replace the IP and the Referer regexes' host to match. Auto-HTTPS via Let's
+# Encrypt needs a real domain, so this uses Caddy's internal CA.
 #
 # https://<VM_PUBLIC_IP> {
 # 	tls internal
 # 	basicauth {
 # 		admin REPLACE_WITH_BCRYPT_HASH
 # 	}
+# 	@liveApi {
+# 		path /api/*
+# 		header_regexp Referer ^https://<VM_PUBLIC_IP>/live
+# 	}
+# 	handle @liveApi {
+# 		reverse_proxy 127.0.0.1:3103
+# 	}
+# 	@liveAssets {
+# 		path /assets/*
+# 		header_regexp Referer ^https://<VM_PUBLIC_IP>/live
+# 	}
+# 	handle @liveAssets {
+# 		root * /home/ubuntu/kronos-live/daily-trading-cockpit-v2/apps/web/dist
+# 		file_server
+# 	}
+# 	handle /live/api/* {
+# 		uri strip_prefix /live
+# 		reverse_proxy 127.0.0.1:3103
+# 	}
+# 	handle_path /live* {
+# 		root * /home/ubuntu/kronos-live/daily-trading-cockpit-v2/apps/web/dist
+# 		try_files {path} /index.html
+# 		file_server
+# 	}
+# 	@testnetApi {
+# 		path /api/*
+# 		header_regexp Referer ^https://<VM_PUBLIC_IP>/testnet
+# 	}
+# 	handle @testnetApi {
+# 		reverse_proxy 127.0.0.1:3102
+# 	}
+# 	@testnetAssets {
+# 		path /assets/*
+# 		header_regexp Referer ^https://<VM_PUBLIC_IP>/testnet
+# 	}
+# 	handle @testnetAssets {
+# 		root * /home/ubuntu/kronos-testnet/daily-trading-cockpit-v2/apps/web/dist
+# 		file_server
+# 	}
 # 	handle /testnet/api/* {
 # 		uri strip_prefix /testnet
 # 		reverse_proxy 127.0.0.1:3102
+# 	}
+# 	handle_path /testnet* {
+# 		root * /home/ubuntu/kronos-testnet/daily-trading-cockpit-v2/apps/web/dist
+# 		try_files {path} /index.html
+# 		file_server
 # 	}
 # 	handle /api/* {
 # 		reverse_proxy 127.0.0.1:3101

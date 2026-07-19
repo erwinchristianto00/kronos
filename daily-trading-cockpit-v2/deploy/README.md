@@ -11,6 +11,45 @@ option: **Contabo** (below).
 
 ---
 
+## ⚠️ Current production topology (read this before touching Caddy)
+
+The steps below describe setting up **one fresh VM with one checkout**. What's actually running
+in production today is **three separate checkouts of this repo on one Contabo VPS**, behind
+**one shared Caddy instance**:
+
+| Path       | API port | Checkout (on the VPS)                          | Deploy method |
+|------------|----------|--------------------------------------------------|---------------|
+| `/`        | 3101     | `~/daily-trading-cockpit-v2` (main)             | `deploy.sh` — a real git repo (commit → push → pull → build → pm2 restart) |
+| `/testnet` | 3102     | `~/kronos-testnet/daily-trading-cockpit-v2`     | **rsync only — NOT a git repo.** `git push` does nothing here. |
+| `/live`    | 3103     | `~/kronos-live/daily-trading-cockpit-v2`        | **rsync only — NOT a git repo. Real money.** |
+
+`deploy/Caddyfile` reflects this exact 3-instance shape — keep it in sync with whatever's
+actually installed at `/etc/caddy/Caddyfile` on the box (they've drifted apart before, which is
+part of why Caddy confusion keeps recurring).
+
+**The two gotchas that cause almost every "why isn't my fix showing up" moment:**
+
+1. **`/testnet` and `/live` are rsync-only.** Committing and pushing to git changes NOTHING on
+   those two instances until someone explicitly rsyncs the changed files into that specific
+   checkout on the VPS. A frontend or backend change only reaches `/` automatically (via
+   `deploy.sh`); `/testnet` and `/live` need their own manual copy + rebuild + (for backend
+   changes) `pm2 restart`.
+2. **No frontend is served by a running Node process.** Every path (`/`, `/testnet`, `/live`) is
+   served by Caddy's `file_server` reading that checkout's `apps/web/dist` directly off disk —
+   there is nothing to restart for a frontend-only change, just `npm run build -w @dtc/web` inside
+   the right checkout. In particular, **`pm2 restart dtc-web` only affects the `/` (main) instance**
+   — its working directory is the main checkout, it has no relationship to `/testnet` or `/live`
+   at all, and restarting it does nothing for a `/testnet` or `/live` frontend deploy (a mistake
+   made in this exact repo before — see `pm2 describe dtc-web`'s `exec cwd` to confirm which
+   checkout it's actually bound to before assuming it's relevant).
+
+Because `/api/*` and `/assets/*` requests from a `/testnet` or `/live` page are requested by the
+browser without any path prefix, Caddy tells them apart from the main instance's identical-looking
+requests using the `Referer` **header**, not the URL — see the comments in `deploy/Caddyfile` for
+the exact matcher blocks (`@liveApi`, `@liveAssets`, etc.) before editing routing rules.
+
+---
+
 ## 0. Contabo (recommended — cheap, no capacity lottery)  ⭐
 The same deploy package runs as-is on a Contabo VPS, and Contabo is the easiest path:
 no ARM capacity lottery, ~€5–7/mo for **4 vCPU / 8 GB**, x86 Ubuntu, generous traffic,
