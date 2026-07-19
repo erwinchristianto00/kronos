@@ -1010,6 +1010,16 @@ export default function NeuralMindmap() {
   const [liveAccount, setLiveAccount] = useState<LiveAccount | null>(null);
   const [liveAccountReceivedAt, setLiveAccountReceivedAt] = useState<number | null>(null);
   const [shortFade, setShortFade] = useState<ShortFadeReport | null>(null);
+  const [chatEnabled, setChatEnabled] = useState(false);
+  const [chatStatusLoaded, setChatStatusLoaded] = useState(false);
+  const [chatStatusReason, setChatStatusReason] = useState<string | null>(null);
+  const [chatModel, setChatModel] = useState<string | null>(null);
+  const [chatFallbackModel, setChatFallbackModel] = useState<string | null>(null);
+  const [chatDiagnosticEnabled, setChatDiagnosticEnabled] = useState(false);
+  const [chatMessages, setChatMessages] = useState<{ role: 'user' | 'assistant'; content: string; toolsUsed?: string[]; modelsUsed?: string[] }[]>([]);
+  const [chatInput, setChatInput] = useState('');
+  const [chatLoading, setChatLoading] = useState(false);
+  const [chatError, setChatError] = useState<string | null>(null);
   const [selectedId, setSelectedId] = useState('');
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [loading, setLoading] = useState(true);
@@ -1087,10 +1097,57 @@ export default function NeuralMindmap() {
     }
   }
 
+  async function loadChatStatus() {
+    try {
+      const response = await fetch('/api/trading-assistant/status', { cache: 'no-store' });
+      if (!response.ok) return;
+      const raw = await response.text();
+      const data = JSON.parse(raw) as { enabled: boolean; model?: string | null; fallbackModel?: string | null; diagnosticEnabled?: boolean; reason?: string | null };
+      setChatEnabled(data.enabled);
+      setChatModel(data.model ?? null);
+      setChatFallbackModel(data.fallbackModel ?? null);
+      setChatStatusReason(data.reason ?? null);
+      setChatDiagnosticEnabled(data.diagnosticEnabled === true);
+      setChatStatusLoaded(true);
+    } catch {
+      // non-critical — assistant simply stays hidden if unreachable
+    }
+  }
+
+  async function sendChatMessage() {
+    const question = chatInput.trim();
+    if (!question || chatLoading) return;
+    const nextMessages = [...chatMessages, { role: 'user' as const, content: question }];
+    setChatMessages(nextMessages);
+    setChatInput('');
+    setChatLoading(true);
+    setChatError(null);
+    try {
+      const response = await fetch('/api/trading-assistant/ask', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ question, history: chatMessages.slice(-6) }),
+      });
+      const raw = await response.text();
+      if (!raw) throw new Error(`Assistant returned an empty response (${response.status})`);
+      const data = JSON.parse(raw) as { ok: boolean; answer?: string; reason?: string; toolsUsed?: string[]; modelsUsed?: string[] };
+      if (data.ok && data.answer) {
+        setChatMessages([...nextMessages, { role: 'assistant', content: data.answer, toolsUsed: data.toolsUsed ?? [], modelsUsed: data.modelsUsed ?? [] }]);
+      } else {
+        setChatError(data.reason || 'Assistant request failed');
+      }
+    } catch (nextError) {
+      setChatError(nextError instanceof Error ? nextError.message : 'Assistant request failed');
+    } finally {
+      setChatLoading(false);
+    }
+  }
+
   useEffect(() => {
     void loadTelemetry();
     void loadLiveAccount();
     void loadShortFade();
+    void loadChatStatus();
   }, []);
 
   useEffect(() => {
@@ -1365,6 +1422,55 @@ export default function NeuralMindmap() {
               ))}
             </div>
           )}
+        </section>
+      )}
+
+      {chatStatusLoaded && (
+        <section className="neural-chat-card" aria-label="Trading assistant (read-only chat, cannot place or modify anything)">
+          <div className="neural-shortfade-head">
+            <span>Trading assistant — read-only chat over CORTEX + live account state</span>
+            <small>Can only explain/report. It cannot place, close, arm, or change anything — use the dashboard controls for that.</small>
+            <small>Privacy: when you press Send, a minimized live/CORTEX summary and only the source/log excerpts selected by read-only tools are sent to NVIDIA NIM.</small>
+            {chatEnabled && chatModel && <small>Primary model: {chatModel}{chatFallbackModel ? ` · availability fallback: ${chatFallbackModel}` : ''}</small>}
+            {chatEnabled && <small>Diagnostics: {chatDiagnosticEnabled ? 'read-only file, git, log, and health tools enabled' : 'context-only'}</small>}
+          </div>
+          <div className="neural-chat-log">
+            {!chatEnabled && (
+              <p className="neural-section-note tone-measure">
+                CORTEX chat belum aktif ({chatStatusReason === 'provider_not_configured' ? 'NVIDIA provider belum valid' : 'fitur masih disabled'}). Pasang NVIDIA_API_KEY lalu set CORTEX_CHAT_ENABLED=1 di instance ini.
+              </p>
+            )}
+            {chatEnabled && chatMessages.length === 0 && (
+              <p className="neural-section-note">Ask about CORTEX's current lane weights, why a lane was vetoed, or the live account's equity/positions.</p>
+            )}
+            {chatMessages.map((m, i) => (
+              <div key={i} className={`neural-chat-msg neural-chat-msg-${m.role}`}>
+                <span className="neural-chat-role">{m.role === 'user' ? 'You' : 'Assistant'}</span>
+                <p>{m.content}</p>
+                {m.role === 'assistant' && m.toolsUsed && m.toolsUsed.length > 0 && (
+                  <small className="neural-chat-tools">Checked: {[...new Set(m.toolsUsed)].join(', ')}</small>
+                )}
+                {m.role === 'assistant' && m.modelsUsed && m.modelsUsed.length > 0 && (
+                  <small className="neural-chat-tools">Answered by: {[...new Set(m.modelsUsed)].join(', ')}</small>
+                )}
+              </div>
+            ))}
+            {chatLoading && <div className="neural-chat-msg neural-chat-msg-assistant"><span className="neural-chat-role">Assistant</span><p>Thinking…</p></div>}
+          </div>
+          {chatError && <p className="neural-section-note tone-critical">{chatError}</p>}
+          <form
+            className="neural-chat-input-row"
+            onSubmit={(e) => { e.preventDefault(); void sendChatMessage(); }}
+          >
+            <input
+              type="text"
+              value={chatInput}
+              onChange={(e) => setChatInput(e.target.value)}
+              placeholder="Ask about CORTEX, live state, source code, logs, or a bug…"
+              disabled={!chatEnabled || chatLoading}
+            />
+            <button type="submit" disabled={!chatEnabled || chatLoading || !chatInput.trim()}>Send</button>
+          </form>
         </section>
       )}
 

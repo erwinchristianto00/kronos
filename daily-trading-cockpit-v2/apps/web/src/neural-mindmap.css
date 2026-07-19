@@ -356,6 +356,93 @@
   gap: 4px;
 }
 
+.neural-chat-card {
+  display: grid;
+  gap: 10px;
+  margin: 14px 14px 0;
+  padding: 12px 14px;
+  border: 1px solid rgba(87, 184, 255, 0.35);
+  border-radius: 8px;
+  background: rgba(7, 16, 22, 0.76);
+}
+
+.neural-chat-log {
+  display: grid;
+  gap: 8px;
+  max-height: 260px;
+  overflow-y: auto;
+}
+
+.neural-chat-msg {
+  display: grid;
+  gap: 2px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.neural-chat-msg-user {
+  justify-self: end;
+  background: rgba(87, 184, 255, 0.1);
+  max-width: 85%;
+}
+
+.neural-chat-msg-assistant {
+  justify-self: start;
+  max-width: 85%;
+}
+
+.neural-chat-msg p {
+  margin: 0;
+  color: #d7e6ee;
+  font-size: 12px;
+  line-height: 1.4;
+  white-space: pre-wrap;
+}
+
+.neural-chat-role {
+  color: #728993;
+  font: 700 9px/1.25 "IBM Plex Mono", "Cascadia Code", monospace;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.neural-chat-tools {
+  color: #62c9a5;
+  font: 700 9px/1.35 "IBM Plex Mono", "Cascadia Code", monospace;
+  overflow-wrap: anywhere;
+}
+
+.neural-chat-input-row {
+  display: flex;
+  gap: 8px;
+}
+
+.neural-chat-input-row input {
+  flex: 1;
+  padding: 8px 10px;
+  border: 1px solid #24363f;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.25);
+  color: #e7eef8;
+  font-size: 12px;
+}
+
+.neural-chat-input-row button {
+  padding: 8px 14px;
+  border: 1px solid rgba(87, 184, 255, 0.35);
+  border-radius: 6px;
+  background: rgba(87, 184, 255, 0.12);
+  color: #e7eef8;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.neural-chat-input-row button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
 .neural-milestone-panel {
   display: grid;
   gap: 12px;

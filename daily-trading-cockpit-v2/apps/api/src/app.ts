@@ -16,6 +16,7 @@ import { registerNotificationRoutes } from "./routes/notifications.js";
 import { registerOutcomesRoutes } from "./routes/outcomes.js";
 import { registerScanRoute } from "./routes/scan.js";
 import { registerShadowRoutes } from "./routes/shadow.js";
+import { registerTradingAssistantRoutes } from "./routes/trading-assistant.js";
 import { BinanceFuturesPrivateClient } from "./lib/binance-futures-private.js";
 import {
   CROSS_SECTIONAL_MARKET_NEUTRAL_LANE_ID,
@@ -312,6 +313,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     kronosClient,
   });
   await registerNotificationRoutes(app, notificationService);
+  await registerTradingAssistantRoutes(app);
 
   // Live-execution mirror (Binance USD-M). Fully dormant unless LIVE_EXECUTION_ENABLED=1:
   // no private client is constructed, no loop runs, nothing else in the app changes.
