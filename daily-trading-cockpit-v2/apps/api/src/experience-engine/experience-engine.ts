@@ -62,6 +62,11 @@ export function assessExperienceEligibility(record: Omit<ExperienceRecord, "elig
   if (record.attributionStatus !== "ATTRIBUTED" && record.attributionStatus !== "NATIVE_DIRECT") reasons.push(`attribution_${record.attributionStatus.toLowerCase()}`);
   if (record.outcomeQuality !== "RESOLVED_VALID") reasons.push(`outcome_${record.outcomeQuality.toLowerCase()}`);
   if (record.outcomeNetR == null || !Number.isFinite(record.outcomeNetR)) reasons.push("missing_valid_outcome_net_r");
+  // A historical FLAT incumbent creates no exposure. Its zero outcome is useful evidence that the
+  // historical reconstruction lacked the live-only edge inputs, but it is not a losing trade label.
+  if (record.source === "HISTORICAL_CAUSAL_REPLAY" && record.direction === "FLAT" && record.labels.entry === "SKIP") {
+    reasons.push("historical_flat_abstention_has_no_trade_label");
+  }
   if (Object.values(record.sourceStatuses).some((status) => status === "ERROR")) reasons.push("source_error");
   return reasons.length ? { eligibility: "INELIGIBLE_FOR_DIRECT_TRAINING", eligibilityReasons: reasons } : { eligibility: "CANDIDATE_LEARNING_ELIGIBLE", eligibilityReasons: [] };
 }

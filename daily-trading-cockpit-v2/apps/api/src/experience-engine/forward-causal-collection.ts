@@ -7,7 +7,7 @@
  * accidentally copied from a shadow instance.
  */
 import { createHash } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 
 import { resolveFourBrainInstanceId } from "../lib/four-brain-live-gather-bindings.js";
@@ -237,12 +237,28 @@ function outcomeEvent(order: ForwardPaperOrderLike): OutcomeResolutionEvent | nu
 const journalPath = (env: NodeJS.ProcessEnv, instanceId: string): string =>
   resolve((env.CAUSAL_EXPERIENCE_COLLECTION_DIR ?? "data").toString(), "causal-experience", instanceId, "events.jsonl");
 
+interface EventIdCacheEntry {
+  ids: Set<string>;
+  size: number;
+  mtimeMs: number;
+}
+
+// A resolution pass can emit hundreds of outcomes. Re-reading the complete append-only journal
+// for each event made collection O(events x journal-size) and eventually dominated testnet's
+// paper cycle. The cache remains safe across recovery tooling because an external file change
+// invalidates it before admission checks use the IDs again.
+const eventIdCache = new Map<string, EventIdCacheEntry>();
+
 function existingEventIds(file: string): Set<string> {
   if (!existsSync(file)) return new Set();
+  const stat = statSync(file);
+  const cached = eventIdCache.get(file);
+  if (cached && cached.size === stat.size && cached.mtimeMs === stat.mtimeMs) return cached.ids;
   const result = new Set<string>();
   for (const line of readFileSync(file, "utf8").split("\n")) {
     try { const value = JSON.parse(line) as { eventId?: unknown }; if (typeof value.eventId === "string") result.add(value.eventId); } catch { /* Partial tail is never eligible. */ }
   }
+  eventIdCache.set(file, { ids: result, size: stat.size, mtimeMs: stat.mtimeMs });
   return result;
 }
 
@@ -252,10 +268,18 @@ function appendEvents(events: readonly ForwardEvent[], env: NodeJS.ProcessEnv): 
   try {
     const file = journalPath(env, activation.instanceId);
     const seen = existingEventIds(file);
-    const unique = events.filter((event) => !seen.has(event.eventId));
+    const requested = new Set<string>();
+    const unique = events.filter((event) => {
+      if (seen.has(event.eventId) || requested.has(event.eventId)) return false;
+      requested.add(event.eventId);
+      return true;
+    });
     if (!unique.length) return false;
     mkdirSync(dirname(file), { recursive: true });
     appendFileSync(file, unique.map((event) => JSON.stringify(event)).join("\n") + "\n", "utf8");
+    for (const event of unique) seen.add(event.eventId);
+    const stat = statSync(file);
+    eventIdCache.set(file, { ids: seen, size: stat.size, mtimeMs: stat.mtimeMs });
     return true;
   } catch { return false; } // Collection is observational; it must fail open.
 }
@@ -269,6 +293,18 @@ export function recordForwardOpportunity(order: ForwardPaperOrderLike, env: Node
 export function recordForwardOutcome(order: ForwardPaperOrderLike, env: NodeJS.ProcessEnv = process.env): boolean {
   const event = outcomeEvent(order);
   return event ? appendEvents([event], env) : false;
+}
+
+/**
+ * Resolver batches are persisted in one append rather than one full admission check per order.
+ * This is observational only: every event keeps its deterministic ID and appendEvents still
+ * deduplicates both against the journal and within this batch.
+ */
+export function recordForwardOutcomes(orders: readonly ForwardPaperOrderLike[], env: NodeJS.ProcessEnv = process.env): boolean {
+  return appendEvents(orders.flatMap((order) => {
+    const event = outcomeEvent(order);
+    return event ? [event] : [];
+  }), env);
 }
 
 export function forwardCausalJournalPath(env: NodeJS.ProcessEnv = process.env): string | null {

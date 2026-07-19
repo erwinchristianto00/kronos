@@ -13,9 +13,9 @@
         "status": "CONTEXT_PRESENT_RESOLVED_OUTCOMES_ABSENT"
       },
       "HISTORICAL_CAUSAL_REPLAY": {
-        "records": 0,
-        "file": "artifacts/backfill/*",
-        "status": "ONLY_AGGREGATES_PRESENT_NO_ROW_LEVEL_CAUSAL_EXPORT"
+        "records": 24920,
+        "file": "artifacts/experience-engine/historical-causal-replay.json",
+        "status": "ROW_LEVEL_CAUSAL_EXPORT_PRESENT_TIER_A_EXECUTION_MODEL_ESTIMATE"
       },
       "OBSERVED_PATH_COUNTERFACTUAL": {
         "records": 500,
@@ -35,13 +35,13 @@
     "eligibility": {
       "CANDIDATE_LEARNING_ELIGIBLE": 0,
       "EVALUATION_ONLY": 0,
-      "INELIGIBLE_FOR_DIRECT_TRAINING": 2884
+      "INELIGIBLE_FOR_DIRECT_TRAINING": 27804
     }
   },
   "eligibility": {
     "CANDIDATE_LEARNING_ELIGIBLE": 0,
     "EVALUATION_ONLY": 0,
-    "INELIGIBLE_FOR_DIRECT_TRAINING": 2884
+    "INELIGIBLE_FOR_DIRECT_TRAINING": 27804
   },
   "rejectionReasons": {
     "missing_decision_time": 2320,
@@ -54,6 +54,7 @@
     "outcome_missing_outcome": 547,
     "missing_market_close_or_resolution_time": 579,
     "outcome_open": 91,
-    "post_open_decision_leakage": 64
+    "post_open_decision_leakage": 64,
+    "historical_flat_abstention_has_no_trade_label": 24920
   }
 }

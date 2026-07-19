@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -9,6 +9,7 @@ import {
   prepareForwardCausalIdentity,
   recordForwardOpportunity,
   recordForwardOutcome,
+  recordForwardOutcomes,
   resolveCausalCollectionActivation,
   withResolvedCausalIdentity,
   type ForwardPaperOrderLike,
@@ -66,6 +67,32 @@ describe("forward causal collection", () => {
     expect(audit.completeChains).toBe(1);
     expect(audit.directChains).toBe(1);
     expect(auditForwardCausalEvents(events).auditHash).toBe(audit.auditHash);
+  });
+
+  it("invalidates its event-id cache after an external append", () => {
+    const dir = mkdtempSync(join(tmpdir(), "causal-cache-")); dirs.push(dir);
+    const env = shadowEnv(dir); const o = order();
+    o.causalIdentity = prepareForwardCausalIdentity(o, env);
+    expect(recordForwardOpportunity(o, env)).toBe(true);
+    const path = forwardCausalJournalPath(env)!;
+    appendFileSync(path, `${JSON.stringify({ eventId: "external-event" })}\n`);
+    expect(recordForwardOpportunity(o, env)).toBe(false);
+    const ids = readFileSync(path, "utf8").trim().split("\n").map((line) => JSON.parse(line).eventId);
+    expect(ids.filter((id) => id === o.causalIdentity!.decisionId)).toHaveLength(1);
+    expect(ids).toContain("external-event");
+  });
+
+  it("appends a resolver batch once and deduplicates repeated outcomes", () => {
+    const dir = mkdtempSync(join(tmpdir(), "causal-batch-")); dirs.push(dir);
+    const env = shadowEnv(dir); const o = order();
+    o.causalIdentity = prepareForwardCausalIdentity(o, env);
+    expect(recordForwardOpportunity(o, env)).toBe(true);
+    o.paperStatus = "PAPER_CLOSED_WIN"; o.closedAtMs = 2_000; o.resolvedAtMs = 3_000; o.grossR = 0.2; o.costR = -0.02; o.netR = 0.18;
+    o.causalIdentity = withResolvedCausalIdentity(o);
+    expect(recordForwardOutcomes([o, { ...o }], env)).toBe(true);
+    expect(recordForwardOutcomes([o], env)).toBe(false);
+    const events = readFileSync(forwardCausalJournalPath(env)!, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    expect(events.filter((event) => event.eventType === "OUTCOME_RESOLUTION")).toHaveLength(1);
   });
 
   it("never substitutes process time for market open or close timestamps", () => {
