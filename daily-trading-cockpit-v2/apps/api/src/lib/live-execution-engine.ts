@@ -642,6 +642,17 @@ interface LiveExecutionState {
   opposingSince: string | null;
   killedAt: string | null;
   killReason: string | null;
+  /**
+   * 2026-07-19 real-money audit fix (BUG 1, HIGH): paperOrderIds of intents whose kill-switch
+   * flatten attempt THREW (a transient Binance/network error) and are therefore still open on the
+   * exchange right now — indistinguishable, before this field existed, from either "successfully
+   * flattened" or "kill-switch never engaged" anywhere in getStatus()/reconcile()/the kill route.
+   * Populated by engageKillSwitch()'s per-intent loop on failure, cleared on a successful retry.
+   * killSwitchTrip() never re-fires once st.killedAt is latched (see its own doc comment), so
+   * retryFailedKillFlattens() — called every tick once killedAt is set — is the ONLY path that
+   * revisits these until the flatten actually succeeds. Persisted so a restart doesn't lose track
+   * of a still-exposed position. */
+  killSwitchFlattenFailedIntentIds: string[];
   /** Last regime-flip-rescue evaluation (shadow). What the rescue WOULD flip/flatten this tick. */
   lastRescuePlan: LiveRescuePlanSnapshot | null;
   /** Crowding-gated exit SHADOW measurement, keyed by symbol. Records what the derivatives-crowding
@@ -776,6 +787,7 @@ export class LiveExecutionStore {
       opposingSince: null,
       killedAt: null,
       killReason: null,
+      killSwitchFlattenFailedIntentIds: [],
       lastRescuePlan: null,
       crowdingExitShadow: {},
       allowedLaneIds: null,
@@ -1779,6 +1791,25 @@ export class LiveExecutionEngine {
       configErrors: this.config.configErrors,
       killedAt: st.killedAt,
       killReason: st.killReason,
+      // 2026-07-19 real-money audit fix (BUG 1): a kill-switch flatten that threw on a transient
+      // error left a real position open with NOTHING distinguishing it from "cleanly flattened" or
+      // "never killed" — see LiveExecutionState.killSwitchFlattenFailedIntentIds's doc comment.
+      // Non-empty here means real, still-open exposure the kill-switch tried and failed to close;
+      // retryFailedKillFlattens() keeps retrying every tick until this list empties out on its own.
+      killSwitchFlattenFailures: (st.killSwitchFlattenFailedIntentIds ?? [])
+        .map((paperOrderId) => {
+          const intent = st.intents.find((i) => i.paperOrderId === paperOrderId);
+          return intent
+            ? {
+                paperOrderId,
+                symbol: intent.symbol,
+                direction: intent.direction,
+                qty: intent.qty,
+                lastError: intent.lastError,
+              }
+            : null;
+        })
+        .filter((entry): entry is NonNullable<typeof entry> => entry !== null),
       health: {
         errorStreak: this.errorStreak,
         clockSkewMs: this.client.getClockSkewMs?.() ?? null,
@@ -2353,6 +2384,13 @@ export class LiveExecutionEngine {
         return;
       }
 
+      // 1.5. Retry any per-intent kill-switch flatten that previously failed with a transient
+      // error (see LiveExecutionState.killSwitchFlattenFailedIntentIds's doc comment). killSwitchTrip()
+      // itself never re-fires once already latched, so this is the only path that revisits a
+      // failed kill flatten on a later tick — a transient failure must self-heal, not leave real
+      // exposure silently open forever.
+      await this.retryFailedKillFlattens();
+
       // 2. Reconcile local intents vs exchange truth.
       await this.reconcile();
 
@@ -2586,6 +2624,120 @@ export class LiveExecutionEngine {
     this.store.save();
   }
 
+  /**
+   * 2026-07-19 real-money audit fix (BUG 1): does the actual cancel/flatten/settle work for ONE
+   * intent's kill-switch panic-close. Extracted out of engageKillSwitch's loop (unchanged logic)
+   * so retryFailedKillFlattens() can reuse the EXACT same flatten path on a later tick instead of
+   * a parallel, potentially-drifting reimplementation. Returns true only once the intent has been
+   * fully settled and marked KILLED; false (with intent.lastError set) on ANY throw along the way
+   * — the caller is responsible for tracking/clearing killSwitchFlattenFailedIntentIds.
+   */
+  private async attemptKillFlatten(intent: LiveIntent, killReason: string): Promise<boolean> {
+    try {
+      await this.client.cancelAllOrders(intent.symbol);
+      await this.client.cancelAllAlgoOrders(intent.symbol);
+      const positions = await this.client.getPositions(intent.symbol);
+      const pos = positions.find((p) => p.symbol === intent.symbol);
+      let flattenOrderId: string | null = null;
+      // Kill-switch flatten is per-INTENT panic, not per-symbol: flatten the engine share only.
+      // The cross-sectional baskets are horizon-bounded hedges with their own breaker — the
+      // operator's standing rule is that NOTHING force-flattens an open basket, so a kill on a
+      // shared symbol must never take the basket's leg with it (same class as the 2026-07-07
+      // WLD/DOGE hedge-eaten incidents).
+      const killRaw = pos?.positionAmt ?? 0;
+      const killShare = killRaw - (this.externalManagedNetQty().get(intent.symbol) ?? 0);
+      const killAmt = Math.sign(killShare) === Math.sign(killRaw) ? Math.sign(killRaw) * Math.min(Math.abs(killShare), Math.abs(killRaw)) : 0;
+      if (Math.abs(killAmt) > 1e-12) {
+        const flatten = await this.client.placeOrder({
+          symbol: intent.symbol,
+          side: killAmt > 0 ? "SELL" : "BUY",
+          type: "MARKET",
+          quantity: Math.abs(killAmt),
+          reduceOnly: true,
+          newClientOrderId: `dtc-kill-${intent.paperOrderId.slice(-12)}`,
+        });
+        flattenOrderId = flatten.orderId;
+      }
+      // A kill-switch flatten is NEVER a win — book its realized P&L (almost always a loss,
+      // since this only fires on a breaker tripping) so lane reports don't silently drop it
+      // and resetKill()'s drawdown-peak rebase isn't understated right when it matters most.
+      const settled = await this.settleIntentAfterClose(intent, [flattenOrderId]);
+      const net = settled?.netUsd ?? null;
+      intent.realizedPnlUsd = net;
+      intent.feesUsd = settled?.feesUsd ?? null;
+      if (net === null) {
+        intent.lastError = "kill flatten: P&L UNKNOWN — trades fetch failed; wallet-reconciliation will catch the true amount";
+      }
+      this.applyRealizedToLedger(net, "adverse");
+      intent.state = "KILLED";
+      intent.closeReason = `KILL_SWITCH: ${killReason}`;
+      intent.closedAt = this.nowIso();
+      this.stampExitControllerSnapshot(intent);
+      intent.updatedAt = this.nowIso();
+      return true;
+    } catch (error) {
+      intent.lastError = `kill flatten failed: ${(error as Error).message}`;
+      // keep state — reconciliation surfaces any residue loudly, and (2026-07-19 fix)
+      // killSwitchFlattenFailedIntentIds/getStatus()/the kill route now surface it too, plus
+      // retryFailedKillFlattens() keeps retrying this exact intent on every subsequent tick.
+      return false;
+    }
+  }
+
+  /** Adds/removes a paperOrderId from the persisted kill-switch-flatten-failure set. Callers own
+   *  calling store.save() (both engageKillSwitch's loop and retryFailedKillFlattens already save
+   *  once after their own loop). */
+  private recordKillFlattenFailure(paperOrderId: string): void {
+    const st = this.store.getState();
+    const set = new Set(st.killSwitchFlattenFailedIntentIds ?? []);
+    set.add(paperOrderId);
+    st.killSwitchFlattenFailedIntentIds = [...set];
+  }
+
+  private clearKillFlattenFailure(paperOrderId: string): void {
+    const st = this.store.getState();
+    if (!st.killSwitchFlattenFailedIntentIds || st.killSwitchFlattenFailedIntentIds.length === 0) return;
+    st.killSwitchFlattenFailedIntentIds = st.killSwitchFlattenFailedIntentIds.filter((id) => id !== paperOrderId);
+  }
+
+  /**
+   * 2026-07-19 real-money audit fix (BUG 1, HIGH — real-money risk): retries any kill-switch
+   * flatten that previously threw on a transient Binance/network error, every tick, for as long as
+   * it stays unresolved. Before this existed, killSwitchTrip()'s own "already engaged/latched"
+   * short-circuit meant a flatten failure during the initial engageKillSwitch() call was NEVER
+   * revisited automatically — that specific position stayed open on the exchange indefinitely,
+   * with nothing in getStatus()/reconcile()/the kill route distinguishing it from a clean flatten.
+   * A no-op (single state read) whenever the kill-switch isn't engaged or nothing is pending.
+   */
+  private async retryFailedKillFlattens(): Promise<void> {
+    const st = this.store.getState();
+    if (!st.killedAt) return;
+    const pendingIds = st.killSwitchFlattenFailedIntentIds ?? [];
+    if (pendingIds.length === 0) return;
+    let dirty = false;
+    for (const paperOrderId of pendingIds) {
+      const intent = st.intents.find((i) => i.paperOrderId === paperOrderId);
+      // Already resolved by a different path since the failure was recorded (e.g. an operator
+      // manualCloseIntent(), or a prior retry that this loop hadn't yet persisted) — nothing left
+      // to retry; drop the stale marker rather than retrying forever against a closed intent.
+      if (!intent || !OPEN_INTENT_STATES.has(intent.state)) {
+        this.clearKillFlattenFailure(paperOrderId);
+        dirty = true;
+        continue;
+      }
+      if (this.busyIntentIds.has(paperOrderId)) continue; // a concurrent close/kill owns it this tick
+      this.busyIntentIds.add(paperOrderId);
+      try {
+        const ok = await this.attemptKillFlatten(intent, st.killReason ?? "kill-switch (retry)");
+        if (ok) this.clearKillFlattenFailure(paperOrderId);
+        dirty = true; // lastError/state mutated either way — persist it
+      } finally {
+        this.busyIntentIds.delete(paperOrderId);
+      }
+    }
+    if (dirty) this.store.save();
+  }
+
   private async engageKillSwitch(reason: string): Promise<void> {
     // 2026-07-11 real-money audit fix: tick()'s automatic trip and a manual kill() can arrive at
     // the same moment (neither is gated by `this.ticking`) — without this guard, two overlapping
@@ -2607,49 +2759,9 @@ export class LiveExecutionEngine {
         if (this.busyIntentIds.has(intent.paperOrderId)) continue;
         this.busyIntentIds.add(intent.paperOrderId);
         try {
-          await this.client.cancelAllOrders(intent.symbol);
-          await this.client.cancelAllAlgoOrders(intent.symbol);
-          const positions = await this.client.getPositions(intent.symbol);
-          const pos = positions.find((p) => p.symbol === intent.symbol);
-          let flattenOrderId: string | null = null;
-          // Kill-switch flatten is per-INTENT panic, not per-symbol: flatten the engine share only.
-          // The cross-sectional baskets are horizon-bounded hedges with their own breaker — the
-          // operator's standing rule is that NOTHING force-flattens an open basket, so a kill on a
-          // shared symbol must never take the basket's leg with it (same class as the 2026-07-07
-          // WLD/DOGE hedge-eaten incidents).
-          const killRaw = pos?.positionAmt ?? 0;
-          const killShare = killRaw - (this.externalManagedNetQty().get(intent.symbol) ?? 0);
-          const killAmt = Math.sign(killShare) === Math.sign(killRaw) ? Math.sign(killRaw) * Math.min(Math.abs(killShare), Math.abs(killRaw)) : 0;
-          if (Math.abs(killAmt) > 1e-12) {
-            const flatten = await this.client.placeOrder({
-              symbol: intent.symbol,
-              side: killAmt > 0 ? "SELL" : "BUY",
-              type: "MARKET",
-              quantity: Math.abs(killAmt),
-              reduceOnly: true,
-              newClientOrderId: `dtc-kill-${intent.paperOrderId.slice(-12)}`,
-            });
-            flattenOrderId = flatten.orderId;
-          }
-          // A kill-switch flatten is NEVER a win — book its realized P&L (almost always a loss,
-          // since this only fires on a breaker tripping) so lane reports don't silently drop it
-          // and resetKill()'s drawdown-peak rebase isn't understated right when it matters most.
-          const settled = await this.settleIntentAfterClose(intent, [flattenOrderId]);
-          const net = settled?.netUsd ?? null;
-          intent.realizedPnlUsd = net;
-          intent.feesUsd = settled?.feesUsd ?? null;
-          if (net === null) {
-            intent.lastError = "kill flatten: P&L UNKNOWN — trades fetch failed; wallet-reconciliation will catch the true amount";
-          }
-          this.applyRealizedToLedger(net, "adverse");
-          intent.state = "KILLED";
-          intent.closeReason = `KILL_SWITCH: ${reason}`;
-          intent.closedAt = this.nowIso();
-          this.stampExitControllerSnapshot(intent);
-          intent.updatedAt = this.nowIso();
-        } catch (error) {
-          intent.lastError = `kill flatten failed: ${(error as Error).message}`;
-          // keep state — reconciliation will surface any residue loudly
+          const ok = await this.attemptKillFlatten(intent, reason);
+          if (ok) this.clearKillFlattenFailure(intent.paperOrderId);
+          else this.recordKillFlattenFailure(intent.paperOrderId);
         } finally {
           this.busyIntentIds.delete(intent.paperOrderId);
         }

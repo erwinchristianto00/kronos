@@ -91,6 +91,10 @@ class FakeLiveClient {
   /** Simulates Binance /userTrades eventual consistency after a just-placed close. */
   hideTradesForCalls = 0;
   getUserTradesCalls = 0;
+  /** [BUG 1 test support] When >0, the NEXT that many reduce-only MARKET orders (flattens) throw a
+   *  transient error instead of filling — simulates a Binance/network blip during a kill-switch
+   *  flatten. Decremented on each throw. */
+  failNextReduceOnlyMarketOrders = 0;
   private nextOrderId = 1000;
 
   async ensureTimeSync(): Promise<void> {
@@ -163,6 +167,10 @@ class FakeLiveClient {
   async placeOrder(p: PlaceOrderParams): Promise<FuturesOrder> {
     if (this.failAddEntry && p.newClientOrderId?.endsWith("-a")) {
       throw new Error("request timed out after 6000ms");
+    }
+    if (p.type === "MARKET" && p.reduceOnly && this.failNextReduceOnlyMarketOrders > 0) {
+      this.failNextReduceOnlyMarketOrders -= 1;
+      throw new Error("fake transient network error during flatten");
     }
     this.placed.push(p);
     const orderId = String(this.nextOrderId++);
@@ -4682,5 +4690,44 @@ describe("openIntent execution-lifecycle tap — report-only, cannot alter the e
         else process.env[k] = saved[k]!;
       }
     }
+  });
+});
+
+// ── 2026-07-19 real-money audit fix (BUG 1) ─────────────────────────────────
+
+describe("[BUG 1] kill-switch flatten failure tracking + retry", () => {
+  it("tracks a per-intent flatten failure distinctly, surfaces it in getStatus, and self-heals via retry on the next tick", async () => {
+    const order = paperOrder();
+    const client = new FakeLiveClient();
+    const { engine, store } = makeEngine({ client, paper: makePaperStore([order]) });
+    await engine.arm();
+    await engine.tick(); // opens the intent
+
+    // Trip the kill-switch (daily max loss) while the flatten's reduce-only close throws ONCE —
+    // simulates a transient Binance/network error mid-flatten.
+    client.failNextReduceOnlyMarketOrders = 1;
+    store.getState().dailyLedger.dateUtc = "2099-01-02";
+    store.getState().dailyLedger.realizedPnlUsd = -20;
+    await engine.tick();
+
+    let st = store.getState();
+    expect(st.killedAt).not.toBeNull(); // kill-switch IS engaged
+    const intent = st.intents[0]!;
+    // FAIL-WITHOUT-FIX: before the fix, this position was silently left OPEN forever — nothing
+    // distinguished it from "cleanly flattened" or "never killed" anywhere in getStatus()/the kill
+    // route, and nothing ever retried it.
+    expect(intent.state).toBe("OPEN"); // never flattened — still exposed on the exchange
+    expect(st.killSwitchFlattenFailedIntentIds).toContain(intent.paperOrderId);
+
+    const status = engine.getStatus() as unknown as { killSwitchFlattenFailures: Array<{ paperOrderId: string; symbol: string }> };
+    expect(status.killSwitchFlattenFailures.some((f) => f.paperOrderId === intent.paperOrderId && f.symbol === "ETHUSDT")).toBe(true);
+
+    // FIX: killSwitchTrip() never re-fires once latched, but retryFailedKillFlattens() must pick
+    // this back up automatically on the very next tick — no operator action required.
+    await engine.tick();
+    st = store.getState();
+    expect(st.intents[0]!.state).toBe("KILLED");
+    expect(st.killSwitchFlattenFailedIntentIds).toEqual([]);
+    expect((engine.getStatus() as unknown as { killSwitchFlattenFailures: unknown[] }).killSwitchFlattenFailures).toEqual([]);
   });
 });
