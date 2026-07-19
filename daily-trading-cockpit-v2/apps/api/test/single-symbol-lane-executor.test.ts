@@ -98,6 +98,10 @@ class FakeClient implements SingleSymbolExecClient {
       // fails minQty and is dropped, while the correct 0.007 passes. Dedicated fixture for the
       // stepSize-epsilon regression test below.
       ["XYZUSDT", f(0.001, 0.007)],
+      // Non-MAJOR, cluster-mapped symbol (L1 in correlation-clusters.ts's DEFAULT_CLUSTER_MAP,
+      // alongside ADAUSDT/SUIUSDT/AVAXUSDT) — fixture for the correlated-cluster cap regression
+      // tests below, which need a real (non-BTC/ETH) symbol that can fully open.
+      ["SOLUSDT", f(0.01, 0.01)],
     ]);
   }
   setLeverageCalls: string[] = [];
@@ -191,6 +195,8 @@ function makeExecutor(opts: {
   portfolioExitPolicy?: SingleSymbolExitPolicy;
   existingNotionalForSymbol?: (symbol: string) => number;
   maxNotionalPerSymbolAcrossLanes?: number;
+  existingClusterOpenSymbols?: (symbol: string, direction: "LONG" | "SHORT") => ReadonlySet<string>;
+  maxClusterPositionsAcrossLanes?: number;
   currentPrice?: number | null;
   sharedGetPositions?: () => ReturnType<FakeClient["getPositions"]>;
   tryClaimEntrySymbol?: (symbol: string) => boolean;
@@ -219,6 +225,8 @@ function makeExecutor(opts: {
     fillConfirmRetryDelayMs: 0,
     existingNotionalForSymbol: opts.existingNotionalForSymbol ?? (() => 0),
     maxNotionalPerSymbolAcrossLanes: () => opts.maxNotionalPerSymbolAcrossLanes ?? 0,
+    existingClusterOpenSymbols: opts.existingClusterOpenSymbols ?? (() => new Set<string>()),
+    maxClusterPositionsAcrossLanes: () => opts.maxClusterPositionsAcrossLanes ?? 0,
     ...(opts.currentPrice !== undefined ? { currentPrice: async () => opts.currentPrice! } : {}),
     ...(opts.sharedGetPositions ? { sharedGetPositions: opts.sharedGetPositions } : {}),
     ...(opts.tryClaimEntrySymbol ? { tryClaimEntrySymbol: opts.tryClaimEntrySymbol } : {}),
@@ -573,6 +581,102 @@ describe("SingleSymbolLaneExecutor — entry", () => {
       await executor.tick();
       expect(store.getState().positions.length).toBe(1);
       expect(store.getState().positions[0]!.symbol).toBe("ETHUSDT");
+    });
+  });
+
+  describe("[2026-07-19 real-money audit fix] correlated-cluster cap extended to single-symbol lanes", () => {
+    // SOLUSDT/ADAUSDT are both in the L1 cluster (correlation-clusters.ts's DEFAULT_CLUSTER_MAP) —
+    // the same class of correlated-alt basket (a SUI/ADA/AVAX-style dump-together cluster) the
+    // mirror's own cap was built to stop. existingClusterOpenSymbols simulates what app.ts's real
+    // wiring combines: the legacy mirror's own open intents + every OTHER executor instance's open
+    // positions — here standing in for "the legacy mirror already has ADAUSDT open in this cluster".
+    const solSignal = signal({ observationId: "sol:1", symbol: "SOLUSDT", entryPrice: 150, stopPrice: 154.5 });
+
+    it("with no cap set (default 0), behaves exactly as before — opens regardless of existingClusterOpenSymbols (FAIL-WITHOUT baseline)", async () => {
+      const { executor, store } = makeExecutor({
+        signals: [solSignal],
+        legUsd: 100,
+        existingClusterOpenSymbols: () => new Set(["ADAUSDT", "AVAXUSDT", "SUIUSDT"]), // huge — must NOT matter, cap is 0/off
+      });
+      await executor.tick();
+      expect(store.getState().positions.length).toBe(1);
+    });
+
+    it("FAIL-WITHOUT/PASS-WITH: blocks a fresh entry into a correlated-cluster symbol once the cluster cap would be exceeded by combining this lane's OWN position with a (simulated) legacy-mirror position", async () => {
+      const client = new FakeClient();
+      // Step 1: this lane instance already holds SUIUSDT (L1) open, from an earlier tick — its OWN
+      // position, tracked in this executor's OWN store (not via existingClusterOpenSymbols).
+      const suiSignal = signal({ observationId: "sui:1", symbol: "SUIUSDT", entryPrice: 4, stopPrice: 4.12 });
+      // A non-MAJOR L1 filter is needed for SUIUSDT too, so the seeding entry can fully open.
+      const clientWithSui = client as FakeClient & { getExchangeFilters: FakeClient["getExchangeFilters"] };
+      const originalFilters = clientWithSui.getExchangeFilters.bind(clientWithSui);
+      clientWithSui.getExchangeFilters = async () => {
+        const m = await originalFilters();
+        m.set("SUIUSDT", { symbol: "X", stepSize: 0.1, minQty: 0.1, tickSize: 0.001, minNotional: 5, pricePrecision: 3, quantityPrecision: 1 });
+        return m;
+      };
+      const signals: SingleSymbolFreshSignal[] = [suiSignal];
+      const { executor, store } = makeExecutor({
+        client,
+        signals,
+        legUsd: 100,
+        maxOpenPositions: 2, // this instance is allowed 2 concurrent positions, so both can attempt
+        // Simulated legacy-mirror open intent: ADAUSDT (also L1) already open on the mirror side.
+        existingClusterOpenSymbols: () => new Set(["ADAUSDT"]),
+        maxClusterPositionsAcrossLanes: 2, // cap of 2 symbols per cluster+direction
+      });
+      await executor.tick(); // opens SUIUSDT — own book now has 1 L1 symbol (SUIUSDT)
+      expect(store.getState().positions.filter((p) => p.status === "OPEN").length).toBe(1);
+
+      // Step 2: a FRESH SOLUSDT (also L1) signal arrives. Cluster count is now ADAUSDT (mirror) +
+      // SUIUSDT (this instance's own open position) = 2, already AT the cap of 2 — SOLUSDT must be
+      // blocked (fail-without: prior to this fix, existingClusterOpenSymbols/maxClusterPositionsAcrossLanes
+      // did not exist and this entry would have opened unconditionally).
+      signals.push(solSignal);
+      await executor.tick();
+      const open = store.getState().positions.filter((p) => p.status === "OPEN");
+      expect(open.length).toBe(1); // still just SUIUSDT — SOLUSDT was blocked
+      expect(open.some((p) => p.symbol === "SOLUSDT")).toBe(false);
+      expect(executor.getStatus().lastEntrySkipReason).toMatch(/SOLUSDT.*correlated-cluster cap \(L1/i);
+    });
+
+    it("PASS-WITH: the SAME cluster composition opens normally once the cap has NOT yet been reached", async () => {
+      const { executor, store } = makeExecutor({
+        signals: [solSignal],
+        legUsd: 100,
+        // Only ADAUSDT open elsewhere (mirror) — 1 symbol in the L1 cluster, cap is 3 -> room remains.
+        existingClusterOpenSymbols: () => new Set(["ADAUSDT"]),
+        maxClusterPositionsAcrossLanes: 3,
+      });
+      await executor.tick();
+      const open = store.getState().positions.filter((p) => p.status === "OPEN");
+      expect(open.length).toBe(1);
+      expect(open[0]!.symbol).toBe("SOLUSDT");
+    });
+
+    it("does not block re-adding to a symbol that is ALREADY counted in the cluster's open set (the cap only blocks NEW symbols, matching the mirror's own !openSymbols.has(...) exemption)", async () => {
+      const { executor, store } = makeExecutor({
+        signals: [solSignal],
+        legUsd: 100,
+        // SOLUSDT itself already counted (e.g. this exact instance's own earlier open, or another
+        // lane's open on the SAME symbol) — cap is fully saturated at 1, but SOLUSDT is already IN
+        // the open set, so it must not be treated as a NEW cluster addition.
+        existingClusterOpenSymbols: () => new Set(["SOLUSDT"]),
+        maxClusterPositionsAcrossLanes: 1,
+      });
+      await executor.tick();
+      expect(store.getState().positions.length).toBe(1);
+    });
+
+    it("MAJORS (BTC/ETH) are exempt from the cluster cap, matching live-execution-engine.ts's own exemption", async () => {
+      const { executor, store } = makeExecutor({
+        signals: [signal()], // BTCUSDT by default
+        legUsd: 100,
+        existingClusterOpenSymbols: () => new Set(["ADAUSDT", "AVAXUSDT", "SUIUSDT"]), // irrelevant — BTC never checks this
+        maxClusterPositionsAcrossLanes: 1,
+      });
+      await executor.tick();
+      expect(store.getState().positions.length).toBe(1);
     });
   });
 

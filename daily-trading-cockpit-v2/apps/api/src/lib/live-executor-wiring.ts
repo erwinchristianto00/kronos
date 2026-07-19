@@ -4,6 +4,7 @@
  * automated test despite gating real-money exposure and reconcile-safety for 5 executor instances.
  */
 import type { CrossSectionalExecutor } from "./cross-sectional-executor.js";
+import { clusterOf, isMajorSymbol } from "./correlation-clusters.js";
 import type { SingleSymbolLaneExecutor } from "./single-symbol-lane-executor.js";
 
 /** Minimal slice of LiveExecutionEngine this module needs — kept narrow so tests can fake it. */
@@ -220,4 +221,76 @@ export function sumExternalClosedFeesUsd(
 export function maxNotionalPerSymbolAcrossLanes(): number {
   const n = Number.parseFloat(process.env.LIVE_MAX_NOTIONAL_PER_SYMBOL_ACROSS_LANES ?? "");
   return Number.isFinite(n) && n > 0 ? n : 250;
+}
+
+/**
+ * Open-position SYMBOLS per correlation cluster × direction, combining the legacy
+ * CG_*-variant-matrix mirror's own open intents with every cross-sectional + single-symbol
+ * executor instance's open legs/positions. Reuses the SAME clusterOf()/isMajorSymbol() grouping
+ * live-execution-engine.ts's own per-cluster cap already uses (see correlation-clusters.ts) — this
+ * does NOT invent a new correlation model, it only extends the existing one's reach.
+ *
+ * 2026-07-19 real-money audit fix (confirmed finding, not re-investigated here): the mirror's
+ * per-cluster cap (LiveExecutionEngine.clusterOpenCounts/maxClusterPositions — the SUI/ADA/AVAX
+ * dump-together incident it exists to prevent, see correlation-clusters.ts's header comment) only
+ * ever counted the mirror's OWN open intents. It had ZERO visibility into any of the 9
+ * independently-admitted SingleSymbolLaneExecutor instances — exactly the same blind spot
+ * computeNotionalPerSymbol's doc comment describes for the flat per-symbol cap. Two of those 9
+ * lanes sit at 0% allocation weight today specifically BECAUSE they trade correlated-alt universes
+ * (SHORT_FADE_EXHAUSTION_CROWDED: a LINK/SEI/BNB/SOL-style universe; INTRADAY_MOMENTUM_BREAKOUT_LONG:
+ * the entire scanner universe, which can include a correlated cluster) with no such protection wired
+ * in. This closes that gap so the cap applies uniformly the moment either lane is ever turned on —
+ * with SF/IM at 0% weight and thus 0 open positions today, this is a no-op in practice right now.
+ *
+ * MAJORS (BTC/ETH) are excluded from every returned set, matching the mirror's own exemption.
+ *
+ * `legacyMirrorOpenIntents` is the mirror's OWN open-intent symbols/directions — pass
+ * `engine.getStatus().openIntents` (LiveExecutionEngine's private per-cluster bookkeeping is not
+ * reusable from outside the class, so this is reconstructed from its public status projection).
+ */
+export function computeClusterOpenSymbols(
+  legacyMirrorOpenIntents: ReadonlyArray<{ symbol: string; direction: "LONG" | "SHORT" }>,
+  crossSectionalExecutors: ReadonlyArray<CrossSectionalExecutor | null>,
+  singleSymbolExecutors: ReadonlyArray<SingleSymbolLaneExecutor | null>,
+): Map<string, Set<string>> {
+  const byKey = new Map<string, Set<string>>();
+  const add = (symbol: string, direction: "LONG" | "SHORT") => {
+    if (isMajorSymbol(symbol)) return;
+    const key = `${clusterOf(symbol)}:${direction}`;
+    const set = byKey.get(key);
+    const upper = symbol.toUpperCase();
+    if (set) set.add(upper);
+    else byKey.set(key, new Set([upper]));
+  };
+  for (const intent of legacyMirrorOpenIntents) add(intent.symbol, intent.direction);
+  for (const exec of crossSectionalExecutors) {
+    if (!exec) continue;
+    for (const basket of exec.getStatus().openBaskets) {
+      for (const leg of basket.legs) {
+        if (leg.exitOrderId !== null) continue;
+        add(leg.symbol, leg.side);
+      }
+    }
+  }
+  for (const exec of singleSymbolExecutors) {
+    if (!exec) continue;
+    for (const pos of exec.getStatus().openPositions) {
+      if (pos.exitOrderId !== null) continue;
+      add(pos.symbol, pos.direction);
+    }
+  }
+  return byKey;
+}
+
+/** Shared default cap for computeClusterOpenSymbols-based admission gates, mirroring
+ *  live-execution-engine.ts's own maxClusterPositions default (env LIVE_MAX_CLUSTER_POSITIONS,
+ *  default 3 — see LiveExecutionConfig.maxClusterPositions). Callers that have a live engine
+ *  reference should prefer reading `engine.getStatus().limits.maxClusterPositions` directly (the
+ *  engine's own live-configured value, guaranteed identical to what its OWN cap enforces) — this
+ *  export exists only as a safe, independently-testable fallback for callers with no engine
+ *  reference (e.g. a disarmed/absent engine, or a unit test). */
+export function maxClusterPositionsAcrossLanes(): number {
+  const raw = process.env.LIVE_MAX_CLUSTER_POSITIONS;
+  const n = raw === undefined ? NaN : Number.parseFloat(raw);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 3;
 }

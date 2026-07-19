@@ -3,6 +3,8 @@ import {
   computeExternalManagedNetQty,
   computeNotionalPerSymbol,
   maxNotionalPerSymbolAcrossLanes,
+  computeClusterOpenSymbols,
+  maxClusterPositionsAcrossLanes,
   isNewExecutorLaneAllowed,
   rollingNetEntryHealth,
   type LiveExecutorGateEngine,
@@ -215,5 +217,81 @@ describe("maxNotionalPerSymbolAcrossLanes", () => {
     expect(maxNotionalPerSymbolAcrossLanes()).toBe(250);
     process.env[key] = "not-a-number";
     expect(maxNotionalPerSymbolAcrossLanes()).toBe(250);
+  });
+});
+
+describe("maxClusterPositionsAcrossLanes", () => {
+  const key = "LIVE_MAX_CLUSTER_POSITIONS";
+  const saved = process.env[key];
+  afterEach(() => {
+    if (saved === undefined) delete process.env[key]; else process.env[key] = saved;
+  });
+
+  it("defaults to 3 (matching live-execution-engine.ts's own maxClusterPositions default) and honors a valid override", () => {
+    delete process.env[key];
+    expect(maxClusterPositionsAcrossLanes()).toBe(3);
+    process.env[key] = "5";
+    expect(maxClusterPositionsAcrossLanes()).toBe(5);
+  });
+
+  it("ignores a negative or garbage override and falls back to the default", () => {
+    process.env[key] = "-1";
+    expect(maxClusterPositionsAcrossLanes()).toBe(3);
+    process.env[key] = "not-a-number";
+    expect(maxClusterPositionsAcrossLanes()).toBe(3);
+  });
+});
+
+describe("computeClusterOpenSymbols (2026-07-19 real-money audit fix: correlated-cluster cap reach)", () => {
+  it("groups the legacy mirror's own open intents by cluster+direction, keyed the same way live-execution-engine.ts's clusterOpenCounts does", () => {
+    // SOLUSDT and AVAXUSDT are both in the L1 cluster (see correlation-clusters.ts's DEFAULT_CLUSTER_MAP).
+    const open = computeClusterOpenSymbols(
+      [{ symbol: "SOLUSDT", direction: "LONG" }, { symbol: "AVAXUSDT", direction: "LONG" }],
+      [],
+      [],
+    );
+    expect(open.get("L1:LONG")).toEqual(new Set(["SOLUSDT", "AVAXUSDT"]));
+  });
+
+  it("folds in cross-sectional basket legs and single-symbol lane positions on the SAME cluster+direction", () => {
+    const xsec = fakeXsecExecutor([fakeBasket([fakeLeg("ADAUSDT", "LONG", 10)])]);
+    const single = fakeSingleSymbolExecutor([fakePosition("SUIUSDT", "LONG", 4)]);
+    // ADAUSDT, SUIUSDT are both L1 — same cluster as the mirror's SOLUSDT intent below.
+    const open = computeClusterOpenSymbols([{ symbol: "SOLUSDT", direction: "LONG" }], [xsec], [single]);
+    expect(open.get("L1:LONG")).toEqual(new Set(["SOLUSDT", "ADAUSDT", "SUIUSDT"]));
+  });
+
+  it("separates clusters and directions into distinct keys — an L1 short does not count against an L1 long, and MEME stays separate from L1", () => {
+    const open = computeClusterOpenSymbols(
+      [
+        { symbol: "SOLUSDT", direction: "LONG" },
+        { symbol: "ADAUSDT", direction: "SHORT" },
+        { symbol: "DOGEUSDT", direction: "LONG" },
+      ],
+      [],
+      [],
+    );
+    expect(open.get("L1:LONG")).toEqual(new Set(["SOLUSDT"]));
+    expect(open.get("L1:SHORT")).toEqual(new Set(["ADAUSDT"]));
+    expect(open.get("MEME:LONG")).toEqual(new Set(["DOGEUSDT"]));
+  });
+
+  it("excludes MAJORS (BTC/ETH) entirely, matching live-execution-engine.ts's own per-cluster exemption", () => {
+    const open = computeClusterOpenSymbols(
+      [{ symbol: "BTCUSDT", direction: "LONG" }, { symbol: "ETHUSDT", direction: "LONG" }],
+      [],
+      [],
+    );
+    expect(open.size).toBe(0);
+  });
+
+  it("excludes a cross-sectional leg or single-symbol position whose exit is already in flight", () => {
+    const xsec = fakeXsecExecutor([fakeBasket([fakeLeg("ADAUSDT", "LONG", 1, 999)])]);
+    const single = fakeSingleSymbolExecutor([fakePosition("SUIUSDT", "LONG", 1, 888)]);
+    expect(computeClusterOpenSymbols([], [xsec], [single]).size).toBe(0);
+  });
+
+  it("skips null executor slots and returns an empty map when nothing is open anywhere", () => {
+    expect(computeClusterOpenSymbols([], [null], [null]).size).toBe(0);
   });
 });

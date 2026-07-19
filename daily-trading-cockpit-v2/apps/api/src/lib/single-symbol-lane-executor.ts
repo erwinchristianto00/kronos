@@ -38,6 +38,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "
 import { dirname, resolve } from "node:path";
 
 import { BinanceFuturesPrivateError, resolveConfirmedFillPrice, roundToStep, type BinanceFuturesPrivateClient } from "./binance-futures-private.js";
+import { clusterOf, isMajorSymbol } from "./correlation-clusters.js";
 
 export type SingleSymbolExecClient = Pick<
   BinanceFuturesPrivateClient,
@@ -324,6 +325,26 @@ export interface SingleSymbolLaneExecutorOptions {
    *  close by the next tick, freeing capacity), so the same signal deserves another chance next
    *  tick rather than being permanently blacklisted. */
   maxNotionalPerSymbolAcrossLanes?: () => number;
+  /** 2026-07-19 real-money audit fix (confirmed finding): symbols ALREADY open in this signal's
+   *  correlation cluster + direction — see correlation-clusters.ts's clusterOf() (the SAME grouping
+   *  live-execution-engine.ts's own per-cluster cap already uses; this does not invent a new
+   *  correlation model) — across the legacy CG_*-variant-matrix mirror AND every OTHER lane
+   *  instance (this instance's OWN open positions in the same cluster are added separately inside
+   *  maybeOpenPosition, same convention as existingNotionalForSymbol above). Before this, the
+   *  mirror's per-cluster cap (built after a real prior loss incident: a SUI/ADA/AVAX cluster
+   *  dumping together simultaneously) had ZERO reach into any of the 9 independently-admitted
+   *  SingleSymbolLaneExecutor instances — SHORT_FADE_EXHAUSTION_CROWDED (a LINK/SEI/BNB/SOL-style
+   *  correlated-alt universe) and INTRADAY_MOMENTUM_BREAKOUT_LONG (the entire scanner universe,
+   *  which can include a correlated cluster) sit at 0% allocation weight today specifically because
+   *  turning either on had no code-level safeguard against this exact risk. Defaults to
+   *  () => new Set() (no visibility / not wired) — same opt-in posture as existingNotionalForSymbol.
+   *  See live-executor-wiring.ts's computeClusterOpenSymbols. */
+  existingClusterOpenSymbols?: (symbol: string, direction: "LONG" | "SHORT") => ReadonlySet<string>;
+  /** 0 (default) = no cap. Same skip-not-blacklist TRANSIENT-retry convention as
+   *  maxNotionalPerSymbolAcrossLanes: another lane's position in this cluster may close by the next
+   *  tick, so a blocked signal gets another chance next tick rather than being permanently
+   *  attempted. MAJORS (BTC/ETH) are exempt, matching live-execution-engine.ts's own cap. */
+  maxClusterPositionsAcrossLanes?: () => number;
   /** Public-market reference used to reject a signal after price already chased its edge. */
   currentPrice?: (symbol: string) => Promise<number | null>;
   /** Maximum favorable drift since the signal, measured in entry-to-stop R. */
@@ -385,6 +406,8 @@ export class SingleSymbolLaneExecutor {
   private readonly fillConfirmRetryDelayMs: number;
   private readonly existingNotionalForSymbolFn: (symbol: string) => number;
   private readonly maxNotionalPerSymbolAcrossLanesFn: () => number;
+  private readonly existingClusterOpenSymbolsFn: (symbol: string, direction: "LONG" | "SHORT") => ReadonlySet<string>;
+  private readonly maxClusterPositionsAcrossLanesFn: () => number;
   private readonly currentPriceFn: ((symbol: string) => Promise<number | null>) | null;
   private readonly maxEntryChaseStopFractionFn: () => number;
   private readonly sharedGetPositions: () => ReturnType<SingleSymbolExecClient["getPositions"]>;
@@ -426,6 +449,8 @@ export class SingleSymbolLaneExecutor {
     this.fillConfirmRetryDelayMs = opts.fillConfirmRetryDelayMs ?? 400;
     this.existingNotionalForSymbolFn = opts.existingNotionalForSymbol ?? (() => 0);
     this.maxNotionalPerSymbolAcrossLanesFn = opts.maxNotionalPerSymbolAcrossLanes ?? (() => 0);
+    this.existingClusterOpenSymbolsFn = opts.existingClusterOpenSymbols ?? (() => new Set<string>());
+    this.maxClusterPositionsAcrossLanesFn = opts.maxClusterPositionsAcrossLanes ?? (() => 0);
     this.currentPriceFn = opts.currentPrice ?? null;
     this.maxEntryChaseStopFractionFn = opts.maxEntryChaseStopFraction ?? (() => {
       const n = Number.parseFloat(process.env.LIVE_MAX_ENTRY_CHASE_STOP_FRACTION ?? "");
@@ -1096,6 +1121,32 @@ export class SingleSymbolLaneExecutor {
           // lastEntrySkipReason; this one (and the structural rejections below) silently left it
           // null, giving the operator zero diagnostic for why a candidate was rejected.
           this.lastEntrySkipReason = `${signal.symbol}: cross-lane per-symbol notional cap exceeded (cap ${notionalCap})`;
+          continue;
+        }
+      }
+
+      // 2026-07-19 real-money audit fix (confirmed finding): correlated-cluster concentration cap,
+      // extended to reach this lane instance — see existingClusterOpenSymbols's doc comment for the
+      // gap this closes (live-execution-engine.ts's own per-cluster cap, built after a real prior
+      // loss incident — a SUI/ADA/AVAX cluster dumping together simultaneously — previously had ZERO
+      // reach into any of the 9 SingleSymbolLaneExecutor instances). Checked in the SAME spot and
+      // with the SAME transient-retry convention as the notional cap immediately above: another
+      // lane's position in this cluster may close by the next tick, so a blocked signal gets
+      // another chance next tick rather than being permanently attempted. MAJORS (BTC/ETH) are
+      // exempt, matching the mirror's own exemption.
+      const clusterCap = this.maxClusterPositionsAcrossLanesFn();
+      if (clusterCap > 0 && !isMajorSymbol(signal.symbol)) {
+        // Mirrors the notional cap's ownSameSymbolNotional handling just above:
+        // existingClusterOpenSymbolsFn only ever reports OTHER lane instances (+ the mirror) — this
+        // instance's OWN already-open positions in the SAME cluster must be added explicitly.
+        const ownOpenSameCluster = st.positions
+          .filter((p) => p.status === "OPEN" && clusterOf(p.symbol) === clusterOf(signal.symbol))
+          .map((p) => p.symbol.toUpperCase());
+        const openSymbols = new Set([...this.existingClusterOpenSymbolsFn(signal.symbol, this.direction), ...ownOpenSameCluster]);
+        if (!openSymbols.has(signal.symbol.toUpperCase()) && openSymbols.size >= clusterCap) {
+          this.lastEntrySkipReason =
+            `${signal.symbol}: correlated-cluster cap (${clusterOf(signal.symbol)}, cap ${clusterCap}) reached ` +
+            `— ${openSymbols.size} symbol(s) already open`;
           continue;
         }
       }

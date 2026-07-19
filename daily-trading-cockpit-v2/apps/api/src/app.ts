@@ -105,7 +105,8 @@ import {
   ceLaneIdForBucket,
   type CEBucket,
 } from "./lib/composite-estimator-edge.js";
-import { computeExternalManagedNetQty, computeNotionalPerSymbol, maxNotionalPerSymbolAcrossLanes, isNewExecutorLaneAllowed, rollingNetEntryHealth, sumExternalRealizedPnlUsd } from "./lib/live-executor-wiring.js";
+import { computeExternalManagedNetQty, computeNotionalPerSymbol, maxNotionalPerSymbolAcrossLanes, computeClusterOpenSymbols, maxClusterPositionsAcrossLanes, isNewExecutorLaneAllowed, rollingNetEntryHealth, sumExternalRealizedPnlUsd } from "./lib/live-executor-wiring.js";
+import { clusterOf } from "./lib/correlation-clusters.js";
 import { RegimeAutopilot, isRegimeAutopilotEnabled } from "./lib/regime-autopilot.js";
 import { getRegimeEngineStore } from "./lib/regime-engine-service.js";
 import { buildRegimeAxisTimeline } from "./lib/regime-axis-timeline.js";
@@ -324,6 +325,27 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
    *  RC/CE-WIDE_LONG/CE-FAST_LONG trade real money on today. */
   const crossSectionalNotionalForSymbolExcluding = (self: CrossSectionalExecutor | null, symbol: string): number =>
     computeNotionalPerSymbol(allSingleSymbolLaneExecutors(), allCrossSectionalLaneExecutors().filter((e) => e !== self)).get(symbol) ?? 0;
+  /** 2026-07-19 real-money audit fix (confirmed finding): extends live-execution-engine.ts's own
+   *  correlated-cluster cap (built after a real prior loss incident — a SUI/ADA/AVAX cluster dumping
+   *  together simultaneously) to reach the single-symbol lanes, the SAME way notionalForSymbolExcluding
+   *  above already does for the flat per-symbol notional cap. Combines the legacy mirror's OWN open
+   *  intents (`engine.getStatus().openIntents` — the engine's private per-cluster bookkeeping isn't
+   *  reusable from outside the class) with every cross-sectional basket leg and every OTHER
+   *  single-symbol lane's open position, grouped via the SAME clusterOf() map the mirror's own cap
+   *  uses (see live-executor-wiring.ts's computeClusterOpenSymbols doc comment). */
+  const clusterOpenSymbolsExcluding = (self: SingleSymbolLaneExecutor | null, symbol: string, direction: "LONG" | "SHORT"): ReadonlySet<string> =>
+    computeClusterOpenSymbols(
+      liveEngine?.getStatus().openIntents ?? [],
+      allCrossSectionalLaneExecutors(),
+      allSingleSymbolLaneExecutors().filter((e) => e !== self),
+    ).get(`${clusterOf(symbol)}:${direction}`) ?? new Set<string>();
+  /** Reuses the LIVE engine's OWN configured cap (guaranteed identical to what its OWN per-cluster
+   *  admission check enforces — see LiveExecutionEngine.config.maxClusterPositions, surfaced via
+   *  getStatus().limits) rather than independently re-parsing the env var, so this can never drift
+   *  from the mirror's real threshold. Falls back to maxClusterPositionsAcrossLanes()'s own default
+   *  only in the (practically unreachable) case of no engine — every single-symbol executor's
+   *  isAllowed() already requires an armed engine before maybeOpenPosition ever runs. */
+  const clusterCapAcrossLanes = (): number => liveEngine?.getStatus().limits.maxClusterPositions ?? maxClusterPositionsAcrossLanes();
 
   const coreScanAutoRefreshController = await registerScanRoute(app, scanService, tracker, outcomeChecker, shadowEngine, {
     binanceClient,
@@ -1083,6 +1105,13 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         // computeNotionalPerSymbol doc comment for the incident this closes.
         existingNotionalForSymbol: (symbol) => notionalForSymbolExcluding(shortFadeExecutor, symbol),
         maxNotionalPerSymbolAcrossLanes,
+        // 2026-07-19 real-money audit fix: correlated-cluster cap, extended from the mirror — see
+        // clusterOpenSymbolsExcluding's doc comment. This is the FIRST of the two lanes the audit
+        // finding specifically flagged (SHORT_FADE_EXHAUSTION_CROWDED trades a
+        // LINK/SEI/BNB/SOL-style correlated-alt universe) — currently at 0% weight, so this wiring
+        // is a no-op until the operator raises it above 0.
+        existingClusterOpenSymbols: (symbol, direction) => clusterOpenSymbolsExcluding(shortFadeExecutor, symbol, direction),
+        maxClusterPositionsAcrossLanes: clusterCapAcrossLanes,
         currentPrice: currentPublicPrice,
         sharedGetPositions,
         // 2026-07-19 real-money audit fix: feed the account-wide consecutive-loss kill-switch
@@ -1127,6 +1156,12 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         dailyMaxLossUsd: IM_EXEC_DAILY_MAX_LOSS_USD,
         existingNotionalForSymbol: (symbol) => notionalForSymbolExcluding(intradayMomentumExecutor, symbol),
         maxNotionalPerSymbolAcrossLanes,
+        // 2026-07-19 real-money audit fix: see shortFadeExecutor above. This is the SECOND lane the
+        // audit finding specifically flagged (INTRADAY_MOMENTUM_BREAKOUT_LONG trades the entire
+        // scanner universe, which can include a correlated-alt cluster) — currently at 0% weight,
+        // so this wiring is a no-op until the operator raises it above 0.
+        existingClusterOpenSymbols: (symbol, direction) => clusterOpenSymbolsExcluding(intradayMomentumExecutor, symbol, direction),
+        maxClusterPositionsAcrossLanes: clusterCapAcrossLanes,
         currentPrice: currentPublicPrice,
         sharedGetPositions,
         // 2026-07-19 real-money audit fix — see shortFadeExecutor above.
@@ -1180,6 +1215,9 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         dailyMaxLossUsd: RC_EXEC_DAILY_MAX_LOSS_USD,
         existingNotionalForSymbol: (symbol) => notionalForSymbolExcluding(regimeCompositeExecutor, symbol),
         maxNotionalPerSymbolAcrossLanes,
+        // 2026-07-19 real-money audit fix: see shortFadeExecutor above.
+        existingClusterOpenSymbols: (symbol, direction) => clusterOpenSymbolsExcluding(regimeCompositeExecutor, symbol, direction),
+        maxClusterPositionsAcrossLanes: clusterCapAcrossLanes,
         currentPrice: currentPublicPrice,
         sharedGetPositions,
         // 2026-07-19 real-money audit fix — see shortFadeExecutor above. This lane is one of the 3
@@ -1220,6 +1258,9 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         dailyMaxLossUsd: RCS_EXEC_DAILY_MAX_LOSS_USD,
         existingNotionalForSymbol: (symbol) => notionalForSymbolExcluding(regimeCompositeShortExecutor, symbol),
         maxNotionalPerSymbolAcrossLanes,
+        // 2026-07-19 real-money audit fix: see shortFadeExecutor above.
+        existingClusterOpenSymbols: (symbol, direction) => clusterOpenSymbolsExcluding(regimeCompositeShortExecutor, symbol, direction),
+        maxClusterPositionsAcrossLanes: clusterCapAcrossLanes,
         currentPrice: currentPublicPrice,
         sharedGetPositions,
         // 2026-07-19 real-money audit fix — see shortFadeExecutor above.
@@ -1265,6 +1306,9 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         dailyMaxLossUsd: PWR_EXEC_DAILY_MAX_LOSS_USD,
         existingNotionalForSymbol: (symbol) => notionalForSymbolExcluding(panicWashoutExecutor, symbol),
         maxNotionalPerSymbolAcrossLanes,
+        // 2026-07-19 real-money audit fix: see shortFadeExecutor above.
+        existingClusterOpenSymbols: (symbol, direction) => clusterOpenSymbolsExcluding(panicWashoutExecutor, symbol, direction),
+        maxClusterPositionsAcrossLanes: clusterCapAcrossLanes,
         currentPrice: currentPublicPrice,
         sharedGetPositions,
         // 2026-07-19 real-money audit fix — see shortFadeExecutor above.
@@ -1344,6 +1388,12 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           // toward each other's exposure on the same symbol, same as every other lane).
           existingNotionalForSymbol: (symbol) => notionalForSymbolExcluding(selfGetter(), symbol),
           maxNotionalPerSymbolAcrossLanes,
+          // 2026-07-19 real-money audit fix: see shortFadeExecutor above. selfGetter (same rationale
+          // as the notional cap immediately above) lets each of the 4 buckets exclude only ITS OWN
+          // positions from the "other lanes" side — the caller adds this instance's own open
+          // positions back in separately (see existingClusterOpenSymbols's doc comment).
+          existingClusterOpenSymbols: (symbol, entryDirection) => clusterOpenSymbolsExcluding(selfGetter(), symbol, entryDirection),
+          maxClusterPositionsAcrossLanes: clusterCapAcrossLanes,
           currentPrice: currentPublicPrice,
           sharedGetPositions,
           // 2026-07-19 real-money audit fix — see shortFadeExecutor above. WIDE_LONG/FAST_LONG are 2
