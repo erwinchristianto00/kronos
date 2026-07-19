@@ -12,7 +12,11 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { refreshManualEntryDecision, type ManualEntryDecisionLiveEngine } from "../src/routes/scan.js";
+import {
+  refreshManualEntryDecision,
+  logManualEntryDecisionRefreshFailure,
+  type ManualEntryDecisionLiveEngine,
+} from "../src/routes/scan.js";
 import { RegimeEngineStore, _resetRegimeEngineStoreForTests } from "../src/lib/regime-engine-service.js";
 
 const dirs: string[] = [];
@@ -77,5 +81,40 @@ describe("refreshManualEntryDecision", () => {
     refreshManualEntryDecision(engine);
     expect(engine.setManualEntryDecision).toHaveBeenCalledTimes(1);
     expect(engine.setManualEntryDecision.mock.calls[0]![0]).not.toBeNull();
+  });
+});
+
+/**
+ * REGRESSION (2026-07-19 BUG 2): the scan cycle's catch block around refreshManualEntryDecision()
+ * used to swallow any exception with ZERO logging, leaving manualEntryDecision frozen with no
+ * operator-visible signal. logManualEntryDecisionRefreshFailure is the exact function the catch
+ * block now calls — this proves it actually logs (matching the file's "[scan] ..." console.error
+ * convention), for both Error instances and non-Error throws (e.g. a thrown string/object).
+ */
+describe("logManualEntryDecisionRefreshFailure (BUG 2 fix: visibility on refresh failure)", () => {
+  it("logs a [scan]-prefixed console.error containing the Error's message", () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      logManualEntryDecisionRefreshFailure(new Error("buildRegimeAxisTimeline blew up"));
+      expect(spy).toHaveBeenCalledTimes(1);
+      const [message] = spy.mock.calls[0]!;
+      expect(message).toContain("[scan]");
+      expect(message).toContain("manualEntryDecision refresh failed");
+      expect(message).toContain("buildRegimeAxisTimeline blew up");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("still logs something useful when a non-Error value is thrown (no crash, no blank message)", () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      logManualEntryDecisionRefreshFailure("some string throw");
+      expect(spy).toHaveBeenCalledTimes(1);
+      const [message] = spy.mock.calls[0]!;
+      expect(message).toContain("some string throw");
+    } finally {
+      spy.mockRestore();
+    }
   });
 });

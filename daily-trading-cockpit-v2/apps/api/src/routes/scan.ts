@@ -208,6 +208,19 @@ export function refreshManualEntryDecision(liveEngine: ManualEntryDecisionLiveEn
   return { manualSelectorMode, manualEntryDecision };
 }
 
+/**
+ * 2026-07-19 fix (BUG 2): the try/catch around refreshManualEntryDecision() in the scan cycle used to
+ * swallow any exception (e.g. from buildRegimeAxisTimeline) with ZERO logging, leaving
+ * manualEntryDecision frozen at its previous value with no operator-visible signal anything failed.
+ * Extracted so the exact log line is directly unit-testable, matching this file's `[scan] ...`
+ * console.error/warn convention for fire-and-forget cycle-stage failures (see the per-symbol
+ * book-rotation overlay catch below). Does NOT change the fail-open-freeze recovery behavior itself —
+ * visibility only.
+ */
+export function logManualEntryDecisionRefreshFailure(error: unknown): void {
+  console.error(`[scan] manualEntryDecision refresh failed: ${error instanceof Error ? error.message : String(error)}`);
+}
+
 export async function registerScanRoute(
   app: FastifyInstance,
   scanService: ScanService,
@@ -448,8 +461,10 @@ export async function registerScanRoute(
     try {
       liveLaneSelection = opts.liveEngineGetter?.() ?? null;
       ({ manualSelectorMode, manualEntryDecision } = refreshManualEntryDecision(liveLaneSelection));
-    } catch {
-      // manual entry decision refresh must never break the scan
+    } catch (error) {
+      // manual entry decision refresh must never break the scan — but see
+      // logManualEntryDecisionRefreshFailure's doc comment for the silent-swallow finding this logs.
+      logManualEntryDecisionRefreshFailure(error);
     } finally {
       timing.finishStage("manualEntryDecision");
     }
