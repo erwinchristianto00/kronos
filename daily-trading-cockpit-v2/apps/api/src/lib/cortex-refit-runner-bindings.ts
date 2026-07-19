@@ -152,10 +152,23 @@ export function collectCortexOutcomes(sources: {
   return { outcomes, skipsByLane: skips };
 }
 
+/** The lane IDs actually covered by a wired reader — the union of the `directional` and `xsec` source
+ *  arrays this same function builds from the real stores. This (never a hardcoded constant) is what
+ *  decides hasOutcomeSource: a CORTEX_LANE_ROSTER lane added without a matching push into either array
+ *  correctly reports NO_OUTCOME_SOURCE (structurally unwired) instead of being silently reported as
+ *  INSUFFICIENT_DATA (which implies it just needs more time to accumulate). Pure + independently testable. */
+export function cortexWiredOutcomeSourceLaneIds(
+  directional: { laneId: string }[],
+  xsec: { laneId: string }[],
+): Set<string> {
+  return new Set<string>([...directional.map((d) => d.laneId), ...xsec.map((x) => x.laneId)]);
+}
+
 /**
  * The top-level impure gather: reads the journal + all lane stores from disk, builds the full CortexRefitInput.
- * hasOutcomeSource is true for every roster lane here (all 15 have a wired reader below); if a lane ever
- * loses its source, drop it from the readers and it will report NO_OUTCOME_SOURCE instead of silently vanishing.
+ * hasOutcomeSource is derived from cortexWiredOutcomeSourceLaneIds(directional, xsec) below — all 15 roster
+ * lanes currently have a wired reader; if a lane ever loses its source (or a new roster lane is added without
+ * a matching push into `directional`/`xsec`), it will report NO_OUTCOME_SOURCE instead of silently vanishing.
  */
 export function gatherCortexRefitInputs(deps: {
   dataDir: string;
@@ -223,7 +236,8 @@ export function gatherCortexRefitInputs(deps: {
 
   const { outcomes, skipsByLane } = collectCortexOutcomes({ directional, xsec, sinceMs });
 
-  const roster = buildCortexAttrRoster(deps.staticWeightPctForLane, () => true);
+  const wiredLaneIds = cortexWiredOutcomeSourceLaneIds(directional, xsec);
+  const roster = buildCortexAttrRoster(deps.staticWeightPctForLane, (laneId) => wiredLaneIds.has(laneId));
 
   return {
     decisions: journal.rows,
