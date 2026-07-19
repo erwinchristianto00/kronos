@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 
-import { buildRegimeAxisTimeline, computeRegimeAxisScore } from "../src/lib/regime-axis-timeline.js";
+import { buildRegimeAxisTimeline, computeRegimeAxisScore, REGIME_AXIS_STALE_THRESHOLD_MS } from "../src/lib/regime-axis-timeline.js";
 import type { RegimeEngineSnapshot } from "../src/lib/regime-engine-service.js";
 import { isCrossSectionalAllocationIndependent } from "../src/lib/cross-sectional-executor.js";
 
@@ -95,6 +95,86 @@ describe("regime-axis timeline (slope + honest ETA-to-neutral)", () => {
     expect(tl.points).toEqual([]);
     expect(tl.current).toBeNull();
     expect(tl.etaToNeutralHours).toBeNull();
+  });
+});
+
+// REGRESSION (2026-07-19 BUG 1): buildRegimeAxisTimeline accepted opts.nowMs but never used it to
+// check the freshness of `current` — a stuck regime-engine cycle (runRegimeEngineCycleGuarded fails
+// silently via `.catch(() => {})`) kept serving its last directional read forever, with no signal
+// anything was wrong. Fix: an explicit staleness check against REGIME_AXIS_STALE_THRESHOLD_MS that
+// fails SAFE to NO_TRADE + null directionalBias with a distinct, clearly-labeled reason.
+describe("regime-axis entry-decision staleness (2026-07-19 fix — fail SAFE on a stuck regime engine)", () => {
+  // Strong, sustained, decelerating bullish climb: without the staleness fix this reliably produces
+  // a real (non-NO_TRADE) directional entry decision — WAIT_REJECTION / LONG with HIGH confidence —
+  // so the contrast between "fresh" and "stale" is unambiguous. Uses the shared module-level `snap()`
+  // helper (and its module-level T0), not a locally-shadowed one, so timestamps stay consistent.
+  function bullishSnap(hoursFromT0: number): RegimeEngineSnapshot {
+    const score = Math.min(0.8, 0.1 + hoursFromT0 * 0.01);
+    return snap(hoursFromT0, { advancersPct: (score + 1) / 2 }, "TREND_RECOVERY");
+  }
+  const snaps = Array.from({ length: 200 }, (_, i) => bullishSnap(i));
+  const lastAtMs = Date.parse(snaps[snaps.length - 1]!.at);
+
+  it("BASELINE: fresh data (nowMs at the latest snapshot) yields a real directional decision, not the stale fallback", () => {
+    const tl = buildRegimeAxisTimeline(snaps, { nowMs: lastAtMs });
+    expect(tl.entryDecision.action).not.toBe("NO_TRADE");
+    expect(tl.entryDecision.directionalBias).toBe("LONG");
+    expect(tl.entryDecision.reason).not.toMatch(/STALE/i);
+  });
+
+  it("REGRESSION: nowMs just past the staleness threshold forces NO_TRADE + null bias with an explicit stale-data reason", () => {
+    const staleNowMs = lastAtMs + REGIME_AXIS_STALE_THRESHOLD_MS + 60_000;
+    const tl = buildRegimeAxisTimeline(snaps, { nowMs: staleNowMs });
+    expect(tl.entryDecision.action).toBe("NO_TRADE");
+    expect(tl.entryDecision.directionalBias).toBeNull();
+    expect(tl.entryDecision.reason).toMatch(/stale/i);
+    expect(tl.entryDecision.reason).toMatch(/regime engine/i);
+  });
+
+  it("does NOT trigger the stale fallback just under the threshold (no off-by-one over-blocking)", () => {
+    const justFreshNowMs = lastAtMs + REGIME_AXIS_STALE_THRESHOLD_MS - 60_000;
+    const tl = buildRegimeAxisTimeline(snaps, { nowMs: justFreshNowMs });
+    expect(tl.entryDecision.reason).not.toMatch(/STALE/i);
+  });
+
+  it("empty history never trips the staleness path (current is null, nothing to compare against)", () => {
+    const tl = buildRegimeAxisTimeline([], { nowMs: Date.now() });
+    expect(tl.current).toBeNull();
+    expect(tl.entryDecision.action).toBe("NO_TRADE");
+    expect(tl.entryDecision.reason).not.toMatch(/STALE/i);
+  });
+
+  it("defaults nowMs to real wall-clock time when omitted (does not silently disable the staleness guard)", () => {
+    // Build a fixture relative to the REAL current time (not the fixed future T0 the other fixtures
+    // in this file use) whose newest snapshot is already well past the staleness threshold. Omitting
+    // opts.nowMs entirely must still catch it — proving the default isn't "always fresh"/disabled.
+    const realNowMs = Date.now();
+    const staleSnaps: RegimeEngineSnapshot[] = Array.from({ length: 10 }, (_, i) => {
+      const hoursAgo = 5 - i * 0.5; // newest point ~2h before realNowMs, well past a 20-min threshold
+      return {
+        at: new Date(realNowMs - hoursAgo * 3_600_000).toISOString(),
+        btcPrice: 60000,
+        regime: "TREND_RECOVERY",
+        action: "NO_TRADE",
+        lane: null,
+        rejectedBy: null,
+        noTradeReason: null,
+        contradictions: [],
+        spreadBps: 1,
+        fundingRate: 0,
+        fundingRiskAbnormal: false,
+        breadth: {
+          advancersPct: 0.9,
+          altAdvancersPct: null,
+          percentAboveEma20: null,
+          btcReturn24h: null,
+          unavailableReason: null,
+        },
+      };
+    });
+    const tl = buildRegimeAxisTimeline(staleSnaps);
+    expect(tl.entryDecision.action).toBe("NO_TRADE");
+    expect(tl.entryDecision.reason).toMatch(/stale/i);
   });
 });
 

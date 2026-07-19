@@ -20,6 +20,26 @@ import type { RegimeEngineSnapshot } from "./regime-engine-service.js";
 /** Full-scale BTC 24h move for the score's third component: ±3% in 24h saturates that input. */
 const BTC_RETURN_FULL_SCALE = 0.03;
 
+/**
+ * 2026-07-19 fix: `runRegimeEngineCycleGuarded` (regime-engine-service.ts) fires the collection
+ * cycle fire-and-forget with `.catch(() => {})` — a silently-failing cycle (documented recurring
+ * failure mode in this system: Binance geo-block, transient API errors) simply stops appending new
+ * snapshots. Without an explicit staleness check, `current` below is just "the last element of the
+ * array" regardless of age, so a stuck engine keeps returning its last directional read forever with
+ * no signal anything is wrong.
+ *
+ * Threshold rationale: the regime engine cycle runs roughly every 7 minutes in steady state
+ * (MAX_SNAPSHOTS's own "~2 weeks at 7-min cycles" comment in regime-engine-service.ts) with a
+ * MIN_CYCLE_GAP_MS floor of 5 minutes. This mirrors the same "tolerate a couple of missed/failed
+ * cycles, but catch a genuinely stuck loop" convention already used elsewhere in this codebase
+ * (RC/RCS's ~10-minute REGIME_COMPOSITE_EXEC_MAX_SIGNAL_AGE_MS default; directional-symbol-sizing's
+ * TECHNICAL_SIGNAL_MAX_STALE_MS = 3x its refresh cadence). At ~3x the regime engine's own cadence,
+ * 20 minutes tolerates a couple of transient blips while still catching a stuck cycle promptly.
+ * Env-tunable, like the other *_STALE_MS/*_MAX_SIGNAL_AGE_MS constants in this codebase.
+ */
+export const REGIME_AXIS_STALE_THRESHOLD_MS =
+  Number(process.env.REGIME_AXIS_STALE_THRESHOLD_MS) || 20 * 60_000;
+
 export interface RegimeAxisPoint {
   at: string;
   score: number;
@@ -416,6 +436,7 @@ export function buildRegimeAxisTimeline(
 ): RegimeAxisTimeline {
   const maxPoints = opts.maxPoints ?? 200;
   const slopeWindowHours = opts.slopeWindowHours ?? 6;
+  const nowMs = opts.nowMs ?? Date.now();
 
   const scored: ScoredPoint[] = [];
   for (const s of snapshots) {
@@ -482,7 +503,24 @@ export function buildRegimeAxisTimeline(
   // smoothing, multi-window momentum, and observed historical successors of similar states.
   const forecast = buildForecast(scored, smoothedScores);
   const projection = forecast.horizons.map((h) => ({ at: h.at, score: h.expectedScore }));
-  const entryDecision = buildEntryDecision(current, forecast, slopePerHour);
+  const freshEntryDecision = buildEntryDecision(current, forecast, slopePerHour);
+  // 2026-07-19 fix: fail SAFE, not open — a stuck regime-engine cycle (runRegimeEngineCycleGuarded
+  // swallows its own failures) must never let an old directional read keep being served as if it
+  // were current. See REGIME_AXIS_STALE_THRESHOLD_MS's doc comment for the threshold rationale.
+  const staleByMs = current ? nowMs - current.atMs : null;
+  const isStale = staleByMs !== null && staleByMs > REGIME_AXIS_STALE_THRESHOLD_MS;
+  const entryDecision: RegimeAxisEntryDecision = isStale
+    ? {
+        action: "NO_TRADE",
+        directionalBias: null,
+        reason:
+          `Regime-axis data STALE: latest snapshot is ${Math.round(staleByMs! / 60_000)}m old ` +
+          `(threshold ${Math.round(REGIME_AXIS_STALE_THRESHOLD_MS / 60_000)}m) — the regime engine cycle ` +
+          "appears stuck (no new snapshot appended). No directional entry authorized on stale data.",
+        requiredSetup: "Tidak ada entry directional. Regime engine perlu jalan lagi sebelum entry directional bisa dievaluasi ulang.",
+        invalidation: "Stale-data block clears automatically once a fresh regime-engine snapshot arrives within the threshold.",
+      }
+    : freshEntryDecision;
 
   // Lane guidance from LEVEL × SLOPE. The honest core: momentum lanes follow the LEVEL — a bear
   // score recovering toward neutral is still a bear regime, and the book's own measurements say
