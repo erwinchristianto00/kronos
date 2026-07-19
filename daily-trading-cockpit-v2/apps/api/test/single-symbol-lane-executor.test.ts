@@ -66,6 +66,10 @@ class FakeClient implements SingleSymbolExecClient {
   queryOrderAvgPriceBySymbol = new Map<string, number>();
   /** algoId -> actualOrderId (null = still resting/not triggered). */
   algoTriggeredOrderId = new Map<string, string | null>();
+  /** algoIds externally CANCELED/EXPIRED on the exchange WITHOUT ever triggering (e.g. a sibling
+   *  cancelAllAlgoOrders call for the same symbol) — distinct from "still resting" (null in
+   *  algoTriggeredOrderId above). Dedicated fixture for the [STOP-HEALTH] regression test below. */
+  algoExternallyTerminalStatus = new Map<string, string>();
   userTradesByOrderId = new Map<string, FuturesUserTrade>();
   private orderSeq = 100;
   private algoSeq = 900;
@@ -143,8 +147,10 @@ class FakeClient implements SingleSymbolExecClient {
   }
   async queryAlgoOrder(algoId: string): Promise<FuturesAlgoOrder> {
     const actualOrderId = this.algoTriggeredOrderId.get(algoId) ?? null;
+    const externalStatus = this.algoExternallyTerminalStatus.get(algoId);
+    const algoStatus = externalStatus ?? (actualOrderId !== null ? "EXECUTED" : "WORKING");
     return {
-      symbol: "BTCUSDT", algoId, clientAlgoId: "", algoStatus: actualOrderId !== null ? "EXECUTED" : "WORKING",
+      symbol: "BTCUSDT", algoId, clientAlgoId: "", algoStatus,
       orderType: "STOP_MARKET", side: "BUY", quantity: 0, triggerPrice: 0, actualOrderId,
     };
   }
@@ -161,6 +167,14 @@ class FakeClient implements SingleSymbolExecClient {
     this.userTradesByOrderId.set(actualOrderId, {
       symbol: "BTCUSDT", orderId: actualOrderId, price, qty, realizedPnl, commission, commissionAsset: "USDT", time: NOW_MS,
     });
+  }
+
+  /** Test helper (2026-07-19 [STOP-HEALTH] fix): simulate the stop being cancelled/expired on the
+   *  exchange WITHOUT ever triggering — e.g. an unrelated cancelAllAlgoOrders call for the same
+   *  symbol from a sibling close/flip operation. actualOrderId stays null (never triggered); only
+   *  algoStatus changes from "WORKING" to a terminal-without-trigger value. */
+  cancelAlgoExternally(algoId: string, status: string = "CANCELED"): void {
+    this.algoExternallyTerminalStatus.set(algoId, status);
   }
 }
 
@@ -713,6 +727,64 @@ describe("SingleSymbolLaneExecutor — exits", () => {
     const closed = store.getState().positions[0]!;
     expect(closed.status).toBe("CLOSED");
     expect(closed.netPnlUsd).toBeCloseTo(-1.85, 6);
+  });
+
+  it("[STOP-HEALTH, 2026-07-19 fix] re-establishes protection when the exchange-side stop is CANCELED/EXPIRED WITHOUT ever triggering, instead of silently trusting the stale stopAlgoOrderId forever", async () => {
+    const client = new FakeClient();
+    const { executor, store } = makeExecutor({ client, signals: [signal()], legUsd: 10_000 });
+    await executor.tick(); // open
+    await executor.tick(); // place stop
+    const opened = store.getState().positions[0]!;
+    const originalAlgoId = opened.stopAlgoOrderId!;
+    expect(originalAlgoId).not.toBeNull();
+
+    // Simulate an unrelated part of the system (e.g. a sibling close/flip operation's
+    // cancelAllAlgoOrders for this same symbol) cancelling the stop on the exchange WITHOUT it
+    // ever triggering — actualOrderId stays null, only algoStatus changes.
+    client.cancelAlgoExternally(originalAlgoId, "CANCELED");
+    client.markPriceBySymbol.set("BTCUSDT", 60100); // irrelevant to this check — position stays OPEN, not stopped out
+
+    await executor.tick();
+
+    const afterDetection = store.getState().positions[0]!;
+    expect(afterDetection.status).toBe("OPEN"); // never falsely closed — the stop never triggered
+    // The core fix: a genuinely NEW stop must be placed, not the stale cancelled id trusted forever.
+    expect(afterDetection.stopAlgoOrderId).not.toBeNull();
+    expect(afterDetection.stopAlgoOrderId).not.toBe(originalAlgoId);
+    expect(client.algosPlaced.length).toBe(2); // original + the re-established replacement
+    expect(afterDetection.stopFailureCount).toBe(0); // re-establish succeeded — not flagged unprotected
+
+    // The freshly re-established stop is a real, independently trackable resting order — a genuine
+    // trigger on IT must still settle the position normally.
+    client.triggerAlgo(afterDetection.stopAlgoOrderId!, "7777", -1.8, 0.05, 60100, afterDetection.qty);
+    await executor.tick();
+    const closed = store.getState().positions[0]!;
+    expect(closed.status).toBe("CLOSED");
+    expect(closed.closeReason).toBe("INITIAL_STOP");
+  });
+
+  it("[STOP-HEALTH, 2026-07-19 fix] surfaces the position as unprotected via getStatus() when re-establishing the stop ALSO fails, rather than staying silent", async () => {
+    const client = new FakeClient();
+    const { executor, store } = makeExecutor({ client, signals: [signal()], legUsd: 10_000 });
+    await executor.tick(); // open
+    await executor.tick(); // place stop
+    const opened = store.getState().positions[0]!;
+    const originalAlgoId = opened.stopAlgoOrderId!;
+
+    client.cancelAlgoExternally(originalAlgoId, "EXPIRED");
+    client.failAlgoOnce = true; // the re-establish attempt itself fails transiently
+
+    await executor.tick();
+
+    const afterDetection = store.getState().positions[0]!;
+    expect(afterDetection.status).toBe("OPEN");
+    expect(afterDetection.stopAlgoOrderId).toBeNull(); // re-establish failed — genuinely naked right now
+    expect(afterDetection.stopFailureCount).toBeGreaterThan(0);
+    // Operator-visible, not silent: the SAME persistent mechanism ensureStopOrder's own failures
+    // already use (unlike lastError, which tick() resets to null once the tick completes without
+    // throwing — unprotectedPositions is the durable signal an operator/monitor actually polls).
+    const unprotected = executor.getStatus().unprotectedPositions;
+    expect(unprotected.some((p) => p.positionId === afterDetection.positionId)).toBe(true);
   });
 
   it("[PARTIAL-FILL, 2026-07-12 fix] a stop that only partially fills does NOT mark the position CLOSED, re-arms protection for the remainder, and banks the running total across both legs", async () => {

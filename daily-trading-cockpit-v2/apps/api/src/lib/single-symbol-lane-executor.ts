@@ -90,6 +90,18 @@ function favorableR(direction: "LONG" | "SHORT", entryPrice: number, stopPrice: 
   return direction === "LONG" ? (currentPrice - entryPrice) / risk : (entryPrice - currentPrice) / risk;
 }
 
+/** 2026-07-19 real-money audit fix (see settleIfStopTriggered): Binance's algo/order status
+ *  vocabulary is inconsistent across endpoints (FuturesAlgoOrder.algoStatus falls back to the
+ *  plain-order vocabulary — NEW | PARTIALLY_FILLED | FILLED | CANCELED | EXPIRED | REJECTED — when
+ *  the algo-specific field is absent). Only the strings that unambiguously mean "gone from the
+ *  order book, and NOT because it triggered/filled" count as terminal-without-trigger. Anything
+ *  else (NEW/WORKING/unrecognized/empty) is treated as still resting — the same fail-safe posture
+ *  as a queryAlgoOrder network failure (retry next tick rather than act on an ambiguous read). */
+function isTerminalStopWithoutTrigger(algoStatus: string): boolean {
+  const s = algoStatus.trim().toUpperCase();
+  return s === "CANCELED" || s === "CANCELLED" || s === "EXPIRED" || s === "REJECTED";
+}
+
 /** Flat target: exit at +rewardMultiple R, or the stop (−1R), or mark-to-market at maxHoldMs.
  *  Used by SHORT_FADE_EXHAUSTION (reuses CG_WIDE_FAST_SHORT's proven 0.5R-fast-bank geometry). */
 export function makeFixedRewardExitPolicy(opts: { rewardMultiple: number; maxHoldMs: number }): SingleSymbolExitPolicy {
@@ -672,15 +684,41 @@ export class SingleSymbolLaneExecutor {
   private async settleIfStopTriggered(pos: SingleSymbolPosition): Promise<boolean> {
     if (pos.stopAlgoOrderId === null) return false;
     let actualOrderId: string | null = null;
+    let algoStatus = "";
     try {
       const algo = await this.client.queryAlgoOrder(pos.stopAlgoOrderId);
       actualOrderId = algo.actualOrderId;
+      algoStatus = algo.algoStatus;
     } catch {
       return false; // best-effort — try again next tick
     }
     // Rely on our OWN already-recorded state (not just this tick's possibly-flaky re-query) once
     // we've previously confirmed the trigger — see the exitOrderId-set-immediately step below.
-    if (actualOrderId === null && pos.exitOrderId === null) return false; // stop still resting
+    if (actualOrderId === null && pos.exitOrderId === null) {
+      // 2026-07-19 real-money audit fix: actualOrderId===null used to be read UNCONDITIONALLY as
+      // "stop still resting" — but stopAlgoOrderId being non-null only proves a stop WAS placed,
+      // never that it is still an ACTIVE resting order right now. The exchange-side stop can be
+      // cancelled or expire WITHOUT ever triggering (e.g. another part of the system calling
+      // cancelAllAlgoOrders for this same symbol as part of an unrelated close/flip operation on
+      // this shared netted account) — this executor previously had no way to detect that and kept
+      // believing the position was protected indefinitely, when it was actually completely naked.
+      // Only treat "still resting" as confirmed when algoStatus itself is ambiguous/unrecognized
+      // (the same fail-safe posture as a queryAlgoOrder network failure above, which also just
+      // retries next tick) — a recognized terminal-without-trigger status re-establishes
+      // protection immediately instead of silently trusting the stale id.
+      if (isTerminalStopWithoutTrigger(algoStatus)) {
+        this.lastError =
+          `stop for ${pos.symbol} (${pos.positionId}) was ${algoStatus} on the exchange WITHOUT ` +
+          `triggering (position still OPEN) — re-establishing protection immediately`;
+        pos.stopAlgoOrderId = null; // ensureStopOrder() only acts when this is null
+        this.store.save();
+        await this.ensureStopOrder(pos);
+        // ensureStopOrder() itself records stopFailureCount/stopUnprotectedSinceIso (surfaced via
+        // getStatus().unprotectedPositions) and this.lastError on failure — nothing further needed
+        // here to make a re-establish failure operator-visible rather than silent.
+      }
+      return false; // stop still resting (or a fresh replacement was just placed) — no close yet
+    }
 
     // Mark the exit as IN FLIGHT the moment the trigger is known, regardless of whether the P&L
     // fetch below succeeds this tick. This is what stops monitorOpenPositions' exit-policy branch
