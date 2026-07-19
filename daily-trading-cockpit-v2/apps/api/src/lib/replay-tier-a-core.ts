@@ -20,6 +20,7 @@ import type { DirectionHorizon } from "./four-brain-types.js";
 export const HOUR = 3_600_000;
 export const HORIZON_BARS: Record<DirectionHorizon, number> = { SCALP: 1, INTRADAY: 4, SWING: 24 };
 export const WARMUP = 60; // bars before the first decision (EMA50/ATR14 + percentile window)
+export const GAP_LOOKBACK_BARS = 168; // 7d — the widest rolling window any Tier-A feature reads (ATR percentile)
 export const HURDLE_R = 0.03;
 export const RISK_ATR_MULT = 1.5;
 export const EXEC_LEVEL_KEYS = ["L0", "L1_low", "L1_base", "L1_high"] as const;
@@ -61,6 +62,23 @@ export function countHourGaps(candles: Candle[]): number {
   return gaps;
 }
 
+/**
+ * True iff a non-contiguous 1h boundary — the same "gap" signature `countHourGaps` tallies globally, e.g. a
+ * missing/empty monthly CSV silently concatenated at a month boundary (see scripts/replay-tier-a-6mo-run.ts and
+ * scripts/replay-entry-exit-6mo-run.ts, which both substitute `[]` for any absent monthly file rather than
+ * failing loudly) — falls inside the causal lookback window feeding THIS row's features. Only looks BACKWARD
+ * from `i` (a gap after `i` cannot corrupt a decision already made at `i`), bounded to `lookbackBars` (the
+ * widest rolling window any Tier-A feature actually reads — see GAP_LOOKBACK_BARS). This is what lets DATA_GAP
+ * actually fire in classifyReplayRow instead of being permanently hardcoded false.
+ */
+export function hasDataGapInLookback(candles: Candle[], i: number, lookbackBars: number): boolean {
+  const start = Math.max(1, i - lookbackBars + 1);
+  for (let k = start; k <= i; k += 1) {
+    if (candles[k]!.openTime - candles[k - 1]!.openTime !== HOUR) return true;
+  }
+  return false;
+}
+
 export interface ReconstructResult {
   marketRows: TAMarketRow[]; dirRows: TADirRow[]; gaps: number;
   candidateTimestamps: number; leakGuardHits: number; causalDecisions: number; labeled: number;
@@ -81,7 +99,7 @@ export function reconstructSymbol(symbol: string, candles: Candle[]): Reconstruc
   const ema50 = computeEMA(closes, 50);
   const atr14 = computeATR(candles, 14);
   const atrPct = atr14.map((a, i) => (finite(a) && closes[i]! > 0 ? a / closes[i]! : null));
-  const atrPctile = computeATRPercentile(atrPct, 168); // 7d rolling percentile (causal)
+  const atrPctile = computeATRPercentile(atrPct, GAP_LOOKBACK_BARS); // 7d rolling percentile (causal)
 
   for (let i = WARMUP; i < candles.length; i += 1) {
     candidateTimestamps += 1;
@@ -94,6 +112,7 @@ export function reconstructSymbol(symbol: string, candles: Candle[]): Reconstruc
     const roc = i >= 20 && closes[i - 20]! > 0 ? closes[i]! / closes[i - 20]! - 1 : null;
     const mom = roc !== null ? tanh(roc / 0.05) : null;
     const asOf = c.closeTime;
+    const dataGap = hasDataGapInLookback(candles, i, GAP_LOOKBACK_BARS);
 
     const audit = buildSnapshotAudit(decisionAtMs, [{ name: "btc1h", ts: c.closeTime }], () => 6 * HOUR);
     const causal = isCausal(audit);
@@ -105,7 +124,7 @@ export function reconstructSymbol(symbol: string, candles: Candle[]): Reconstruc
       momentum: { value: mom, asOfMs: asOf }, eventRisk: { value: null }, sentiment: { value: null }, safetyEvents: [],
     });
     const featuresPresent = finite(trendRaw) && finite(vol) && finite(mom);
-    const msStatus = classifyReplayRow({ purpose: "MarketState", timestampsCausal: causal, schemaMatch: true, configVersioned: true, dataGap: false, labelSafe: true, requiredFeaturesPresent: featuresPresent, dataTier: "A_CANDLE", executionCalibrated: false, modelFitEligible: true }).status;
+    const msStatus = classifyReplayRow({ purpose: "MarketState", timestampsCausal: causal, schemaMatch: true, configVersioned: true, dataGap, labelSafe: true, requiredFeaturesPresent: featuresPresent, dataTier: "A_CANDLE", executionCalibrated: false, modelFitEligible: true }).status;
     marketRows.push({ symbol, tMs: decisionAtMs, family: ms.family, bias: ms.bias, vol: ms.volatility, conf: ms.confidence, unknown: ms.family === "UNKNOWN", causal, status: msStatus });
     if (causal) causalDecisions += 1;
 
@@ -131,7 +150,7 @@ export function reconstructSymbol(symbol: string, candles: Candle[]): Reconstruc
         win = chosenNetR > HURDLE_R ? 1 : 0;
         labeled += 1;
       }
-      const dStatus = classifyReplayRow({ purpose: "Direction", timestampsCausal: causal, schemaMatch: true, configVersioned: true, dataGap: false, labelSafe: chosenNetR !== null, requiredFeaturesPresent: featuresPresent, dataTier: "A_CANDLE", executionCalibrated: false, modelFitEligible: true }).status;
+      const dStatus = classifyReplayRow({ purpose: "Direction", timestampsCausal: causal, schemaMatch: true, configVersioned: true, dataGap, labelSafe: chosenNetR !== null, requiredFeaturesPresent: featuresPresent, dataTier: "A_CANDLE", executionCalibrated: false, modelFitEligible: true }).status;
       dirRows.push({ symbol, horizon, tMs: decisionAtMs, x: [trendRaw ?? 0, vol ?? 0, mom ?? 0], action: dir.action, bestAction, longNetR, shortNetR, chosenNetR, win, status: dStatus });
     }
   }
