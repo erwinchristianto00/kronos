@@ -81,7 +81,8 @@ import {
   type PortfolioTrendCandidate,
 } from "../lib/portfolio-trend-shadow.js";
 import type { BinanceClient } from "../lib/binance.js";
-import { isRegimeEngineEnabled, runRegimeEngineCycleGuarded } from "../lib/regime-engine-service.js";
+import { getRegimeEngineStore, isRegimeEngineEnabled, runRegimeEngineCycleGuarded } from "../lib/regime-engine-service.js";
+import { buildRegimeAxisTimeline } from "../lib/regime-axis-timeline.js";
 import { runFreshVariantMatrixFeed } from "../lib/fresh-variant-matrix-feed.js";
 import {
   getCandidateFunnelLog,
@@ -170,6 +171,43 @@ function sortedReasonCounts(counts: Record<string, number>): Array<{ reason: str
     .sort((a, b) => b.count - a.count || a.reason.localeCompare(b.reason));
 }
 
+export interface ManualEntryDecisionLiveEngine {
+  isManualSelectorMode?: () => boolean;
+  setManualEntryDecision?: (decision: {
+    action: "NO_TRADE" | "WAIT_PULLBACK" | "WAIT_REJECTION";
+    directionalBias: "LONG" | "SHORT" | null;
+    reason: string;
+    observedAt: string;
+  } | null) => void;
+}
+
+/**
+ * Refresh the manual-directional entry decision on the live engine every scan cycle whenever manual
+ * selector mode is on. Extracted (2026-07-19 fix) so it can run INDEPENDENTLY of the mode-2
+ * realtime-short-mirror env flag — LiveExecutionEngine.canOpenNewEntries() branches on
+ * manualSelectorMode + manualDirectionalAllocations to isManualDirectionalEntryEnabled(), which reads
+ * this.manualEntryDecision, an in-memory field with exactly one setter: setManualEntryDecision. That
+ * setter used to be called ONLY inside the isRealtimeShortMirrorEnabled() block (an unrelated,
+ * SHORT-only, testnet-only diagnostic flag, off by default and not even documented in .env.example).
+ * On any instance where that flag was off, manualEntryDecision stayed null forever, so
+ * canOpenNewEntries() stayed permanently false for every single-symbol lane whenever an operator
+ * turned on manual mode + a directional allocation — regardless of what they actually allocated. The
+ * dashboard showed this as a permanent "WAITING ENTRY DECISION" / "waiting for scanner" state.
+ */
+export function refreshManualEntryDecision(liveEngine: ManualEntryDecisionLiveEngine | null): {
+  manualSelectorMode: boolean;
+  manualEntryDecision: ReturnType<typeof buildRegimeAxisTimeline>["entryDecision"] | null;
+} {
+  const manualSelectorMode = liveEngine?.isManualSelectorMode?.() === true;
+  const manualEntryDecision = manualSelectorMode
+    ? buildRegimeAxisTimeline(getRegimeEngineStore().snapshots).entryDecision
+    : null;
+  liveEngine?.setManualEntryDecision?.(manualEntryDecision
+    ? { ...manualEntryDecision, observedAt: new Date().toISOString() }
+    : null);
+  return { manualSelectorMode, manualEntryDecision };
+}
+
 export async function registerScanRoute(
   app: FastifyInstance,
   scanService: ScanService,
@@ -184,6 +222,12 @@ export async function registerScanRoute(
       laneSelectionAllowsLane(laneId: string): boolean;
       laneSelectionExplicitlyIncludesLane(laneId: string): boolean;
       isManualSelectorMode?: () => boolean;
+      setManualEntryDecision?: (decision: {
+        action: "NO_TRADE" | "WAIT_PULLBACK" | "WAIT_REJECTION";
+        directionalBias: "LONG" | "SHORT" | null;
+        reason: string;
+        observedAt: string;
+      } | null) => void;
     } | null);
   } = {},
 ): Promise<CoreScanAutoRefreshController> {
@@ -394,6 +438,21 @@ export async function registerScanRoute(
     } else {
       timing.recordNotInvokedStage("kronosCounterfactual");
     }
+    // --- Manual-directional entry decision (2026-07-19 fix) ---
+    // Must run every cycle whenever manual selector mode is on, independent of the mode-2 mirror
+    // flag below — see refreshManualEntryDecision's doc comment for the incident this fixes.
+    timing.startStage("manualEntryDecision");
+    let liveLaneSelection: ReturnType<NonNullable<typeof opts.liveEngineGetter>> | null = null;
+    let manualSelectorMode = false;
+    let manualEntryDecision: ReturnType<typeof buildRegimeAxisTimeline>["entryDecision"] | null = null;
+    try {
+      liveLaneSelection = opts.liveEngineGetter?.() ?? null;
+      ({ manualSelectorMode, manualEntryDecision } = refreshManualEntryDecision(liveLaneSelection));
+    } catch {
+      // manual entry decision refresh must never break the scan
+    } finally {
+      timing.finishStage("manualEntryDecision");
+    }
     // --- Real-time short live-mirror ("mode 2") ---
     // Emits FRESH (openedAt = now) short HEADLINE orders into the dedicated mirror store so the
     // live engine can mirror the stable short edge to the exchange without the lagged
@@ -406,9 +465,14 @@ export async function registerScanRoute(
         let rotationShortlist = buildRegimeRotationShortlistReport(vmReport, {
           generatedAt: new Date().toISOString(),
         });
-        // Operator MANUAL SELECTOR MODE (live toggle): trade RAW per the lane allocation selector —
-        // bypass the 2b book overlay AND the regime direction-gate below. Hard safety rails are kept.
-        const manualSelectorMode = opts.liveEngineGetter?.()?.isManualSelectorMode?.() === true;
+        // manualSelectorMode/manualEntryDecision are now computed once above (independent of this
+        // mirror flag) — reused here rather than recomputed. Manual selector is directional, not a
+        // blanket BOTH_ALLOWED override: the scanner's current Entry Decision chooses which of the
+        // operator's long/short lists is active. A NO_TRADE read removes all manual admission until
+        // the next scan produces a directional bias.
+        const manualDirection = manualEntryDecision?.action !== "NO_TRADE"
+          ? manualEntryDecision?.directionalBias ?? null
+          : null;
         // 2b: overlay the REALIZED per-symbol BOOK edge on the (sim-derived) rotation shortlist so
         // admission auto-rotates on real economics — book-negative symbols are vetoed (don't get stuck
         // on a bad symbol) and book-proven ones are admitted. Env-gated + OFF by default (opt-in per
@@ -423,7 +487,6 @@ export async function registerScanRoute(
             console.warn(`[scan] per-symbol book rotation overlay skipped: ${err instanceof Error ? err.message : String(err)}`);
           }
         }
-        const liveLaneSelection = opts.liveEngineGetter?.() ?? null;
         const manualEnabledVariantIds = new Set<string>();
         const liveLaneAllowsVariant = (variantId: string): boolean => {
           const laneId = rotationLaneIdForVariant(variantId);
@@ -469,11 +532,43 @@ export async function registerScanRoute(
           currentRegime: result.marketRegime,
           edgeGate: getRegimeEdgeMemory(),
         });
-        // Manual selector mode: force the direction gate open (BOTH_ALLOWED) so the operator's picked
-        // lanes trade in their own direction regardless of the detected regime.
-        const controllerReport = manualSelectorMode
-          ? { ...baseControllerReport, controllerMode: "BOTH_ALLOWED" as const }
-          : baseControllerReport;
+        const controllerReport = !manualSelectorMode
+          ? baseControllerReport
+          : manualDirection === "LONG"
+            ? {
+                ...baseControllerReport,
+                controllerMode: "LONG_ONLY" as const,
+                directionalBias: "LONG" as const,
+                allowsLong: true,
+                allowsShort: false,
+                allowsNewEntries: true,
+                requiresRetest: true,
+                edgeGated: false,
+                reasonCodes: [...baseControllerReport.reasonCodes, "manual_entry_decision_long"],
+              }
+            : manualDirection === "SHORT"
+              ? {
+                  ...baseControllerReport,
+                  controllerMode: "SHORT_ONLY" as const,
+                  directionalBias: "SHORT" as const,
+                  allowsLong: false,
+                  allowsShort: true,
+                  allowsNewEntries: true,
+                  requiresRetest: true,
+                  edgeGated: false,
+                  reasonCodes: [...baseControllerReport.reasonCodes, "manual_entry_decision_short"],
+                }
+              : {
+                  ...baseControllerReport,
+                  controllerMode: "NO_TRADE_CHOP" as const,
+                  directionalBias: "NEUTRAL" as const,
+                  allowsLong: false,
+                  allowsShort: false,
+                  allowsNewEntries: false,
+                  requiresRetest: true,
+                  edgeGated: false,
+                  reasonCodes: [...baseControllerReport.reasonCodes, "manual_entry_decision_no_trade"],
+                };
         const profitCoreEstimatedRegime = estimateLaneSelectorV2Regime({
           regime: baseControllerReport.currentRegime,
           controllerMode: baseControllerReport.controllerMode,
@@ -500,7 +595,9 @@ export async function registerScanRoute(
           }
         }
         runRealtimeShortMirror({
-          candidates: top10WithPlan.map((c) => ({
+          candidates: top10WithPlan
+            .filter((c) => !manualSelectorMode || (manualDirection !== null && c.finalDirection === manualDirection))
+            .map((c) => ({
             symbol: c.symbol,
             direction: (c.finalDirection === "SHORT" ? "SHORT" : "LONG") as "LONG" | "SHORT",
             currentPrice: candidateCurrentPrice(c),
