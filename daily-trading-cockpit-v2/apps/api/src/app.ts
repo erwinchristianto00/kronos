@@ -135,8 +135,7 @@ import { journalLaneSnapshots, laneJournalActive } from "./lib/lane-context-jour
 import { FourBrainMetricsAggregator } from "./lib/four-brain-metrics.js";
 import { resolveFourBrainInstanceId, fourBrainInstanceAllowed, type FourBrainBindingDeps } from "./lib/four-brain-live-gather-bindings.js";
 import { fourBrainMode } from "./lib/four-brain-types.js";
-import { CORTEX_LANE_ROSTER } from "./lib/cortex-live-gather.js";
-import { gatherCortexContext } from "./lib/cortex-live-gather.js";
+import { CORTEX_LANE_ROSTER, gatherCortexContext, normalizeCortexStaticWeightPctForLane } from "./lib/cortex-live-gather.js";
 import { buildLiveCortexGatherDeps } from "./lib/cortex-live-gather-bindings.js";
 import { runCortexNightlyRefit } from "./lib/cortex-refit-runner-bindings.js";
 import {
@@ -749,8 +748,11 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           axisSlopePerHour: axis.slopePerHour ?? null,
         });
         const status = engine.getStatus();
+        const staticWeightPctForLane = normalizeCortexStaticWeightPctForLane(
+          (laneId) => engine.laneSelectionWeightPctForLane(laneId),
+        );
         const deps = buildLiveCortexGatherDeps({
-          staticWeightPctForLane: (laneId) => engine.laneSelectionWeightPctForLane(laneId),
+          staticWeightPctForLane,
           edgeMemory: getRegimeEdgeMemory(),
           controller: {
             directionalBias: report.directionalBias,
@@ -788,11 +790,14 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         if (cortexBrainMode(process.env) !== "shadow" || !liveEngine || process.env.CORTEX_REFIT_ENABLED === "0") return;
         const engine = liveEngine;
         const now = new Date();
+        const staticWeightPctForLane = normalizeCortexStaticWeightPctForLane(
+          (laneId) => engine.laneSelectionWeightPctForLane(laneId),
+        );
         const report = runCortexNightlyRefit({
           store: cortexStore,
           dataDir: "data",
           journalFile: "data/cortex-decision-journal.jsonl",
-          staticWeightPctForLane: (laneId) => engine.laneSelectionWeightPctForLane(laneId),
+          staticWeightPctForLane,
           nowMs: now.getTime(),
           nowIso: now.toISOString(),
         });
@@ -807,7 +812,14 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     };
     if (!isTest) {
       cortexRefitTick();
-      setInterval(cortexRefitTick, 6 * 60 * 60_000);
+      // Testnet can refit more frequently to turn resolved collection into
+      // feedback quickly. Production retains the six-hour default unless an
+      // operator explicitly configures a different cadence.
+      const cortexRefitIntervalMs = Math.max(
+        60_000,
+        Number(process.env.CORTEX_REFIT_INTERVAL_MS ?? 6 * 60 * 60_000),
+      );
+      setInterval(cortexRefitTick, cortexRefitIntervalMs);
     }
 
     const legacyEntryAllowed = (

@@ -167,6 +167,7 @@ import {
 } from "../lib/external-rotation-overlay-economics.js";
 import { buildTpSlGeometryRootCauseAuditReport } from "../lib/tp-sl-geometry-root-cause-audit.js";
 import { buildAdaptiveProfitPolicySynthesisReport, type AdaptiveProfitPolicyEvidenceEra } from "../lib/adaptive-profit-policy.js";
+import { buildCortexCollectionStatus } from "../lib/cortex-collection-status.js";
 import {
   JsonKronosCounterfactualStore,
   buildKronosCounterfactualReport,
@@ -648,6 +649,10 @@ export async function registerShadowRoutes(
     }
     return shadowEngine.getSnapshot();
   });
+
+  // Read-only lineage/learner monitor. It never writes a journal, changes beta,
+  // refits a model, or touches execution; /research uses it for live status.
+  app.get("/api/shadow/cortex-collection-status", async () => buildCortexCollectionStatus());
 
   app.get("/api/shadow/oos-validation-snapshot-status", async () => ({
     reportOnly: true,

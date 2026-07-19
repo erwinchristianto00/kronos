@@ -7,6 +7,10 @@ import { CortexBrainStore } from "../src/lib/cortex-brain-store.js";
 import { runCortexRefit, CORTEX_GATE_MIN_REGIME_FAMILIES } from "../src/lib/cortex-refit-runner.js";
 import { collectCortexOutcomes, readCortexDecisionRows } from "../src/lib/cortex-refit-runner-bindings.js";
 import { CORTEX_LIVE_BETA } from "../src/lib/cortex-brain.js";
+import {
+  CORTEX_CG_MFE_GIVEBACK_LONG_LANE_ID,
+  CORTEX_CG_MFE_GIVEBACK_SHORT_LANE_ID,
+} from "../src/lib/cortex-live-gather.js";
 import type { CortexAttrRosterEntry, CortexDecisionRow, CortexLaneOutcome } from "../src/lib/cortex-attribution.js";
 import { writeFileSync, mkdirSync } from "node:fs";
 
@@ -49,6 +53,7 @@ describe("runCortexRefit — end-to-end + monotonic counters + liveBeta wall", (
 
     expect(report.examplesTotal).toBe(30);
     expect(report.examplesNew).toBe(30);
+    expect(report.reinforcementByLane).toEqual([{ laneId: RC, positive: 15, noReward: 15 }]);
     expect(store.get().cumulativeResolved).toBe(30);
     expect(report.coverage.regimeFamiliesWithOutcomes).toBe(2);
     expect(report.coverage.regimeCoverageGateMet).toBe(true);
@@ -147,5 +152,27 @@ describe("collectCortexOutcomes — normalization + skip tally", () => {
     expect(outcomes.find((o) => o.observationId === "x1")!.netR).toBeCloseTo(2.0, 10);
     expect(skipsByLane[RC]?.NOT_RESOLVED).toBe(1);
     expect(skipsByLane["CROSS_SECTIONAL_MARKET_NEUTRAL"]?.NO_RISK_AT_OPEN).toBe(1);
+  });
+
+  it("keeps direction-agnostic CG MFE outcomes on separate LONG and SHORT causal axes", () => {
+    const now = 1_000_000_000;
+    const { outcomes } = collectCortexOutcomes({
+      directional: [
+        {
+          laneId: CORTEX_CG_MFE_GIVEBACK_LONG_LANE_ID,
+          obs: [{ observationId: "mfe-long", openedAtMs: now, resolvedAt: new Date(now + 1).toISOString(), status: "CLOSED_WIN", netR: 0.5 }],
+        },
+        {
+          laneId: CORTEX_CG_MFE_GIVEBACK_SHORT_LANE_ID,
+          obs: [{ observationId: "mfe-short", openedAtMs: now, resolvedAt: new Date(now + 1).toISOString(), status: "CLOSED_LOSS", netR: -0.5 }],
+        },
+      ],
+      xsec: [],
+      sinceMs: 0,
+    });
+    expect(outcomes).toEqual(expect.arrayContaining([
+      expect.objectContaining({ laneId: CORTEX_CG_MFE_GIVEBACK_LONG_LANE_ID, direction: "LONG" }),
+      expect.objectContaining({ laneId: CORTEX_CG_MFE_GIVEBACK_SHORT_LANE_ID, direction: "SHORT" }),
+    ]));
   });
 });

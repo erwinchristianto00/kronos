@@ -19,7 +19,11 @@ import {
 } from "./cortex-outcome-source.js";
 import { runCortexRefit, type CortexRefitInput, type CortexRefitReport } from "./cortex-refit-runner.js";
 import type { CortexBrainStore } from "./cortex-brain-store.js";
-import { CORTEX_LANE_ROSTER } from "./cortex-live-gather.js";
+import {
+  CORTEX_CG_MFE_GIVEBACK_LONG_LANE_ID,
+  CORTEX_CG_MFE_GIVEBACK_SHORT_LANE_ID,
+  CORTEX_LANE_ROSTER,
+} from "./cortex-live-gather.js";
 
 import { getRegimeCompositeStore, RC_PAPER_LANE_ID } from "./regime-composite-edge.js";
 import { getRegimeCompositeShortStore, RCS_PAPER_LANE_ID } from "./regime-composite-short-edge.js";
@@ -40,8 +44,14 @@ import { getCurrentGuardVariantMatrixStore } from "./current-guard-variant-matri
  *  CG matrix read (which can hold 100k+ obs). */
 export const CORTEX_REFIT_LOOKBACK_MS = 45 * 86_400_000;
 
-/** The three roster CG lanes (variantId == laneId). */
-const CG_ROSTER = new Set(["CG_WIDE_FAST_LONG", "CG_WIDE_LONG_RUNNER", "CG_MFE_GIVEBACK"]);
+/** Direction is part of the causal identity. CG_MFE is executable both ways, so its two books
+ * must not share labels or training examples. */
+const CG_ROSTER: readonly { laneId: string; variantId: string; direction: "LONG" | "SHORT" }[] = [
+  { laneId: "CG_WIDE_FAST_LONG", variantId: "CG_WIDE_FAST_LONG", direction: "LONG" },
+  { laneId: "CG_WIDE_LONG_RUNNER", variantId: "CG_WIDE_LONG_RUNNER", direction: "LONG" },
+  { laneId: CORTEX_CG_MFE_GIVEBACK_LONG_LANE_ID, variantId: "CG_MFE_GIVEBACK", direction: "LONG" },
+  { laneId: CORTEX_CG_MFE_GIVEBACK_SHORT_LANE_ID, variantId: "CG_MFE_GIVEBACK", direction: "SHORT" },
+];
 const XSEC_STORE_VARIANTS: Record<string, string> = {
   [CROSS_SECTIONAL_MARKET_NEUTRAL_LANE_ID]: "FILTERED",
   [CROSS_SECTIONAL_TREND_LANE_ID]: "TREND_BETA_VOL",
@@ -179,16 +189,18 @@ export function gatherCortexRefitInputs(deps: {
     });
   }
 
-  // CG variant matrix — one store, filter to the 3 roster CG lanes (variantId == laneId). openedAt is ISO.
+  // CG variant matrix — filter by BOTH variant and direction. A direction-agnostic geometry such as
+  // CG_MFE_GIVEBACK cannot be trained as a single LONG-labelled lane when most observations are SHORT.
   const cgAll = getCurrentGuardVariantMatrixStore(deps.dataDir).all;
   const cgByLane = new Map<string, RawDirectionalObs[]>();
-  for (const lane of CG_ROSTER) cgByLane.set(lane, []);
+  for (const lane of CG_ROSTER) cgByLane.set(lane.laneId, []);
   for (const o of cgAll) {
-    if (!CG_ROSTER.has(o.variantId)) continue;
+    const owner = CG_ROSTER.find((lane) => lane.variantId === o.variantId && lane.direction === o.direction);
+    if (!owner) continue;
     // A corrupt openedAt becomes NaN (NOT a silent skip) so directionalObsToOutcome tallies it as
     // BAD_TIMESTAMP — the module's "every record is tallied by reason" guarantee holds.
     const openedAtMs = parseIsoMs(o.openedAt) ?? Number.NaN;
-    cgByLane.get(o.variantId)!.push({ observationId: o.observationId, openedAtMs, resolvedAt: o.resolvedAt, status: o.status, netR: o.netR });
+    cgByLane.get(owner.laneId)!.push({ observationId: o.observationId, openedAtMs, resolvedAt: o.resolvedAt, status: o.status, netR: o.netR });
   }
   for (const [laneId, obs] of cgByLane) directional.push({ laneId, obs });
 

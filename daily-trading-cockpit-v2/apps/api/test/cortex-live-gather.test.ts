@@ -4,6 +4,7 @@ import {
   deriveDirectionVeto,
   mapControllerBias,
   gatherCortexContext,
+  normalizeCortexStaticWeightPctForLane,
   CORTEX_LANE_ROSTER,
   type CortexGatherDeps,
   type CortexRosterEntry,
@@ -144,12 +145,14 @@ describe("cortex-live-gather — conviction + bias mapping", () => {
 });
 
 describe("cortex-live-gather — gatherCortexContext end-to-end", () => {
-  it("includes only lanes with staticWeightPct>0 and produces a decidable, invariant-clean context", () => {
-    // Only fund two lanes; everything else weight 0 → excluded.
+  it("journals every roster lane while retaining zero weights for non-funded lanes", () => {
+    // Only fund two lanes. The remaining lanes must stay observable for causal outcome attribution.
     const funded = new Set(["CG_WIDE_FAST_LONG", "CROSS_SECTIONAL_MARKET_NEUTRAL"]);
     const deps = fakeDeps({ staticWeightPctForLane: (id) => (funded.has(id) ? 25 : 0) });
     const ctx = gatherCortexContext(deps);
-    expect(ctx.lanes.map((l) => l.laneId).sort()).toEqual(["CG_WIDE_FAST_LONG", "CROSS_SECTIONAL_MARKET_NEUTRAL"]);
+    expect(ctx.lanes.map((l) => l.laneId).sort()).toEqual(CORTEX_LANE_ROSTER.map((l) => l.laneId).sort());
+    expect(ctx.lanes.find((l) => l.laneId === "CG_WIDE_FAST_LONG")?.staticWeightPct).toBe(25);
+    expect(ctx.lanes.find((l) => l.laneId === "REGIME_COMPOSITE_CONFIRMATION_SHORT")?.staticWeightPct).toBe(0);
     const d = decideCortex(ctx, emptyCortexState(), { beta: 0 });
     expect(checkCortexInvariants(d).ok).toBe(true);
   });
@@ -163,14 +166,25 @@ describe("cortex-live-gather — gatherCortexContext end-to-end", () => {
     expect(ctx0.portfolioDrawdownPct).toBe(0);
     expect(ctx0.killBudgetUtilization).toBe(0);
   });
+  it("normalizes ALL_LANES eligibility sentinels without changing an explicit partial allocation", () => {
+    const allLaneWeight = normalizeCortexStaticWeightPctForLane(() => 100);
+    const allLaneTotal = CORTEX_LANE_ROSTER.reduce((sum, lane) => sum + allLaneWeight(lane.laneId), 0);
+    expect(allLaneTotal).toBeCloseTo(100, 9);
+    expect(allLaneWeight("CG_WIDE_FAST_LONG")).toBeCloseTo(100 / CORTEX_LANE_ROSTER.length, 9);
+
+    const partial = normalizeCortexStaticWeightPctForLane((laneId) => (laneId === "CG_WIDE_FAST_LONG" ? 25 : 0));
+    expect(partial("CG_WIDE_FAST_LONG")).toBe(25);
+  });
 });
 
 describe("cortex-live-gather — roster integrity", () => {
-  it("roster has the 15 known lanes; 3 XSEC are NEUTRAL, the rest directional", () => {
-    expect(CORTEX_LANE_ROSTER.length).toBe(15);
+  it("roster has 16 lanes; CG MFE is represented separately per direction and 3 XSEC are NEUTRAL", () => {
+    expect(CORTEX_LANE_ROSTER.length).toBe(16);
     const xsec = CORTEX_LANE_ROSTER.filter((r) => r.isXsec);
     expect(xsec.length).toBe(3);
     expect(xsec.every((r) => r.direction === "NEUTRAL")).toBe(true);
     expect(CORTEX_LANE_ROSTER.filter((r) => !r.isXsec).every((r) => r.direction === "LONG" || r.direction === "SHORT")).toBe(true);
+    expect(CORTEX_LANE_ROSTER).toContainEqual({ laneId: "CG_MFE_GIVEBACK_LONG", direction: "LONG", isXsec: false });
+    expect(CORTEX_LANE_ROSTER).toContainEqual({ laneId: "CG_MFE_GIVEBACK_SHORT", direction: "SHORT", isXsec: false });
   });
 });

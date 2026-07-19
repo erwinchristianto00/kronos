@@ -63,6 +63,14 @@ export interface CortexArchetypeRefit {
   nEff: number;
 }
 
+/** Label counts for examples that passed strict ownership attribution. This is observability only:
+ * it explains what the learner saw without exposing a coefficient update as a trading decision. */
+export interface CortexLaneReinforcementSummary {
+  laneId: string;
+  positive: number;
+  noReward: number;
+}
+
 export interface CortexPromotionCoverage {
   cumulativeResolved: number;
   resolvedByFamily: Record<string, number>;
@@ -83,6 +91,7 @@ export interface CortexRefitReport {
   examplesNew: number;
   perLane: CortexLaneAttributionStatus[];
   archetypes: CortexArchetypeRefit[];
+  reinforcementByLane: CortexLaneReinforcementSummary[];
   coverage: CortexPromotionCoverage;
   skipsByLane: Record<string, Partial<Record<CortexOutcomeSkipReason, number>>>;
   applied: boolean;
@@ -114,8 +123,15 @@ export function runCortexRefit(store: CortexBrainStore, input: CortexRefitInput)
   // Per-archetype refit on the FULL derivable example set (recency-decayed inside the refit). Write only on
   // ACCEPTED — a rejected fit leaves the last healthy coefficients untouched.
   const byArch = new Map<CortexArchetype, CortexTrainingExample[]>();
+  const reinforcementByLane = new Map<string, CortexLaneReinforcementSummary>();
   for (const a of ARCHETYPES) byArch.set(a, []);
-  for (const e of attr.examples) byArch.get(e.archetype)?.push({ x: e.x, y: e.y, tMs: e.tMs, schemaVersion: e.schemaVersion });
+  for (const e of attr.examples) {
+    byArch.get(e.archetype)?.push({ x: e.x, y: e.y, tMs: e.tMs, schemaVersion: e.schemaVersion });
+    const summary = reinforcementByLane.get(e.laneId) ?? { laneId: e.laneId, positive: 0, noReward: 0 };
+    if (e.y === 1) summary.positive += 1;
+    else summary.noReward += 1;
+    reinforcementByLane.set(e.laneId, summary);
+  }
 
   const archetypes: CortexArchetypeRefit[] = [];
   for (const a of ARCHETYPES) {
@@ -160,6 +176,7 @@ export function runCortexRefit(store: CortexBrainStore, input: CortexRefitInput)
     examplesNew: newlyCounted,
     perLane: attr.perLane,
     archetypes,
+    reinforcementByLane: [...reinforcementByLane.values()].sort((a, b) => a.laneId.localeCompare(b.laneId)),
     coverage,
     skipsByLane: input.skipsByLane ?? {},
     applied: apply,

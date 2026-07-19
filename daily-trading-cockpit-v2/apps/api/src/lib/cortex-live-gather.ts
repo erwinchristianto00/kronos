@@ -37,6 +37,11 @@ import { assembleCortexContext, type CortexContext } from "./cortex-brain.js";
 
 export type CortexLaneDirection = "LONG" | "SHORT" | "NEUTRAL";
 
+/** CG_MFE_GIVEBACK is direction-agnostic at execution time, so CORTEX must never pool its
+ * SHORT outcomes under a LONG feature vector. These are separate causal learners. */
+export const CORTEX_CG_MFE_GIVEBACK_LONG_LANE_ID = "CG_MFE_GIVEBACK_LONG" as const;
+export const CORTEX_CG_MFE_GIVEBACK_SHORT_LANE_ID = "CG_MFE_GIVEBACK_SHORT" as const;
+
 /** Code-anchored roster: laneId + direction + isXsec are construction-time literals in app.ts (NOT
  *  available from any runtime getter), so they are pinned here. Direction/isXsec confirmed against the
  *  executor-wiring constants. Keep in sync if a lane's wiring direction changes. */
@@ -49,7 +54,8 @@ export const CORTEX_LANE_ROSTER: readonly CortexRosterEntry[] = [
   // CG paper-mirror lanes (preset-only; no dedicated executor) — all LONG, BREADTH.
   { laneId: "CG_WIDE_FAST_LONG", direction: "LONG", isXsec: false },
   { laneId: "CG_WIDE_LONG_RUNNER", direction: "LONG", isXsec: false },
-  { laneId: "CG_MFE_GIVEBACK", direction: "LONG", isXsec: false },
+  { laneId: CORTEX_CG_MFE_GIVEBACK_LONG_LANE_ID, direction: "LONG", isXsec: false },
+  { laneId: CORTEX_CG_MFE_GIVEBACK_SHORT_LANE_ID, direction: "SHORT", isXsec: false },
   // Composite confirmation (RC long / RCS short).
   { laneId: RC_PAPER_LANE_ID, direction: "LONG", isXsec: false },
   { laneId: RCS_PAPER_LANE_ID, direction: "SHORT", isXsec: false },
@@ -111,6 +117,27 @@ export interface CortexGatherDeps {
   currentEquity: number | null;
   currentDrawdownUsd: number | null; // for killBudgetUtilization = drawdownUsd/killBudget
   killBudgetUsd: number | null;
+}
+
+/**
+ * `LiveExecutionEngine.laneSelectionWeightPctForLane()` deliberately returns 100 for every
+ * lane while no explicit allocation is configured: there it means "not blocked", not "100% of
+ * portfolio". CORTEX, however, consumes this field as a portfolio weight. Normalize only an
+ * over-100 roster total so explicit partial allocations (for example a deliberate 25% sleeve)
+ * retain their cash reserve, while ALL_LANES cannot become an impossible 1500% portfolio.
+ */
+export function normalizeCortexStaticWeightPctForLane(
+  staticWeightPctForLane: (laneId: string) => number,
+): (laneId: string) => number {
+  const rawByLane = new Map(
+    CORTEX_LANE_ROSTER.map((entry) => {
+      const raw = staticWeightPctForLane(entry.laneId);
+      return [entry.laneId, Number.isFinite(raw) ? Math.max(0, raw) : 0] as const;
+    }),
+  );
+  const total = [...rawByLane.values()].reduce((sum, weight) => sum + weight, 0);
+  const scale = total > 100 ? 100 / total : 1;
+  return (laneId: string) => (rawByLane.get(laneId) ?? 0) * scale;
 }
 
 /** Map the controller's directionalBias enum to the gather's ControllerBias (only LONG/SHORT change the
@@ -178,15 +205,19 @@ export function buildCortexLaneRaw(entry: CortexRosterEntry, deps: CortexGatherD
 }
 
 /**
- * Assemble the full CortexContext for a shadow tick. Includes ONLY roster lanes with staticWeightPct > 0
- * (the lanes the incumbent live allocation table actually funds) — filtering keeps the shadow decision
- * aligned to the incumbent's active set. (Degenerate case: if allocations are OFF the accessor returns
- * 100 for every lane and none are filtered; that is a report-only artifact, harmless in shadow.)
+ * Assemble the full CortexContext for a shadow tick.
+ *
+ * Every roster lane is journaled, including lanes with a zero incumbent allocation. An allocation is an
+ * execution choice, not an observation filter: omitting zero-weight lanes meant a later paper outcome
+ * could not be causally linked to the contemporaneous CORTEX context and silently stayed unlearnable.
+ * The zero weight remains in the feature vector and final allocation, so this expands shadow evidence
+ * only; it cannot fund a lane or alter live execution.
  */
 export function gatherCortexContext(deps: CortexGatherDeps): CortexContext {
+  const normalizedStaticWeightPctForLane = normalizeCortexStaticWeightPctForLane(deps.staticWeightPctForLane);
+  const normalizedDeps = { ...deps, staticWeightPctForLane: normalizedStaticWeightPctForLane };
   const observations = CORTEX_LANE_ROSTER
-    .map((entry) => buildCortexLaneRaw(entry, deps))
-    .filter((raw) => raw.staticWeightPct > 0)
+    .map((entry) => buildCortexLaneRaw(entry, normalizedDeps))
     .map((raw) => buildLaneObservationFromRaw(raw).obs);
   const top: Omit<CortexContext, "lanes"> = {
     regimeFamily: deps.regimeRaw ?? "UNKNOWN",
