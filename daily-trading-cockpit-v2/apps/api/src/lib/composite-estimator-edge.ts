@@ -261,7 +261,20 @@ export function resolveCompositeObservation(
   const fwd = forwardCandles.filter((c) => c.openTime > obs.openedAtMs).sort((a, b) => a.openTime - b.openTime);
   const risk = Math.abs(obs.entryPrice - obs.initialStop);
   if (!(risk > 0)) return null;
-  const maxHoldBars = obs.maxHoldHours; // interval is 1h, so hours == bars
+  // Wall-clock max-hold ceiling, NOT a candle-bar count. 2026-07-19 fix: the sole production
+  // fetchCandles call site (shadow.ts) hands this function a fixed trailing window of candles
+  // (e.g. "last 120 candles ending now") that is independent of maxHoldHours (WIDE's 144h > that
+  // window). Counting bars (`i + 1 >= maxHoldBars`, the pre-fix shape) made the max-hold branch
+  // structurally unreachable for any bucket whose maxHoldHours exceeds however many forward bars
+  // one cycle happens to fetch -- WIDE observations older than the fetch window could never
+  // force-close and stayed OPEN forever. Comparing each candle's real elapsed time since
+  // openedAtMs instead means a genuinely-past-due observation resolves on the very first cycle
+  // that hands back ANY forward candle whose timestamp has already crossed the ceiling,
+  // regardless of how many bars were fetched. For an on-time, contiguous 1h feed this triggers
+  // at the identical candle as the old bar-count check (bar i's openTime is ~(i+1)h after entry),
+  // so in-window observations are unaffected -- this is a strict generalization, not a behavior
+  // change for the common case.
+  const maxHoldMs = obs.maxHoldHours * 3_600_000;
 
   const finalize = (
     grossR: number,
@@ -292,12 +305,12 @@ export function resolveCompositeObservation(
         : (obs.entryPrice - obs.takeProfitPrice) / risk;
       return finalize(grossR, c.openTime, "TP_HIT");
     }
-    if (i + 1 >= maxHoldBars) {
+    if (c.openTime - obs.openedAtMs >= maxHoldMs) {
       const grossR = obs.direction === "LONG" ? (c.close - obs.entryPrice) / risk : (obs.entryPrice - c.close) / risk;
       return finalize(grossR, c.openTime, "MAX_HOLD_MTM");
     }
   }
-  if (fwd.length === 0 && nowMs - obs.openedAtMs > maxHoldBars * 3_600_000 * 3) {
+  if (fwd.length === 0 && nowMs - obs.openedAtMs > maxHoldMs * 3) {
     return { status: "EXPIRED", resolvedAt: new Date(nowMs).toISOString() };
   }
   return null; // still open

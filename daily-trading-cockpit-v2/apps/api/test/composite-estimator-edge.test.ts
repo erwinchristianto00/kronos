@@ -15,6 +15,8 @@ import {
   CE_CONFLICT_MIN_MAGNITUDE,
   CE_VELOCITY_SAT_PER_HR,
   CE_KRONOS_RETURN_SAT_PCT,
+  CE_WIDE_MAX_HOLD_HOURS,
+  CE_FAST_MAX_HOLD_HOURS,
   CE_UNPROVEN_BUCKETS,
   compositeEstimatorOpenSignals,
   compositeEstimatorExitPolicy,
@@ -278,6 +280,129 @@ describe("composite-estimator — resolution (direction-aware, SL-first-conserva
   it("expires a stale OPEN observation with no forward candles ever", () => {
     const staleNowMs = obs().openedAtMs + 48 * 3_600_000 * 4;
     expect(resolveCompositeObservation(obs(), [], staleNowMs)?.status).toBe("EXPIRED");
+  });
+});
+
+// 2026-07-19 stuck-WIDE-observation fix. The sole production fetchCandles call site
+// (apps/api/src/routes/shadow.ts:2056) fetches only a trailing window of `_cec.getCandles(symbol,
+// CE_INTERVAL, 120)` -- the most recent 120 hourly candles ending "now", NOT candles starting
+// right after the observation opened. For any WIDE observation (144h max hold > 120h fetch
+// window) that survives past ~120h without hitting SL/TP, the pre-fix bar-count check
+// (`i + 1 >= maxHoldBars`) could never see 144 bars in a single 120-candle fetch and so could
+// never trigger MAX_HOLD_MTM -- exactly what happened to the live BTCUSDT/SOLUSDT WIDE
+// observations this fix targets.
+function trailingWindowCandles(
+  nowMs: number,
+  windowHours: number,
+  price: { close: number; high?: number; low?: number },
+): Candle[] {
+  // Simulates the REAL production fetch shape: the most recent `windowHours` hourly candles
+  // ending at `nowMs`, regardless of how long ago the observation being resolved actually opened
+  // -- distinct from this file's `fwd()` helper above, which always starts candles immediately
+  // after the observation's own openedAtMs.
+  return Array.from({ length: windowHours }, (_, i) => {
+    const openTime = nowMs - (windowHours - 1 - i) * 3_600_000;
+    return { openTime, open: price.close, high: price.high ?? price.close, low: price.low ?? price.close, close: price.close, volume: 100 };
+  });
+}
+
+describe("composite-estimator — stale WIDE observation past max-hold window (2026-07-19 fix)", () => {
+  const NOW = 2_000_000_000_000;
+  // Matches shadow.ts's hardcoded `_cec.getCandles(symbol, CE_INTERVAL, 120)` -- deliberately NOT
+  // widened for this test, to prove the fix works entirely within resolveCompositeObservation
+  // without requiring any change to the production fetch limit.
+  const PRODUCTION_FETCH_LIMIT_HOURS = 120;
+
+  function wideLongObs(ageHours: number): CompositeEstimatorObservation {
+    return obs({
+      bucket: "WIDE_LONG",
+      direction: "LONG",
+      maxHoldHours: CE_WIDE_MAX_HOLD_HOURS,
+      entryPrice: 100,
+      initialStop: 97,
+      takeProfitPrice: 109,
+      openedAtMs: NOW - ageHours * 3_600_000,
+      openedAt: new Date(NOW - ageHours * 3_600_000).toISOString(),
+    });
+  }
+
+  it("[FAIL-WITHOUT/PASS-WITH] a WIDE_LONG observation 237.2h old (the live BTCUSDT incident's exact age) resolves even though only a trailing 120-candle window is fetched", () => {
+    const observation = wideLongObs(237.2);
+    // Flat price action strictly between stop (97) and TP (109) -- never trips SL/TP, isolating
+    // the max-hold path exactly like the real stuck BTCUSDT position (far from both levels).
+    const forwardCandles = trailingWindowCandles(NOW, PRODUCTION_FETCH_LIMIT_HOURS, { close: 100.2, high: 100.3, low: 100.1 });
+    const patch = resolveCompositeObservation(observation, forwardCandles, NOW);
+    // Pre-fix, `i + 1 >= maxHoldBars` needs fwd.length >= 144, but fwd.length here is only 120 --
+    // structurally unreachable, so the pre-fix code returns null (stuck OPEN) forever.
+    expect(patch).not.toBeNull();
+    expect(patch?.status).not.toBe("OPEN");
+    expect(patch?.exitReason).toBe("MAX_HOLD_MTM");
+  });
+
+  it("mirrors the live stuck-SOLUSDT WIDE_SHORT incident (228.5h old) the same way", () => {
+    const observation = obs({
+      bucket: "WIDE_SHORT",
+      direction: "SHORT",
+      maxHoldHours: CE_WIDE_MAX_HOLD_HOURS,
+      entryPrice: 100,
+      initialStop: 103,
+      takeProfitPrice: 91,
+      openedAtMs: NOW - 228.5 * 3_600_000,
+      openedAt: new Date(NOW - 228.5 * 3_600_000).toISOString(),
+    });
+    const forwardCandles = trailingWindowCandles(NOW, PRODUCTION_FETCH_LIMIT_HOURS, { close: 99.8, high: 99.9, low: 99.7 });
+    const patch = resolveCompositeObservation(observation, forwardCandles, NOW);
+    expect(patch).not.toBeNull();
+    expect(patch?.status).not.toBe("OPEN");
+    expect(patch?.exitReason).toBe("MAX_HOLD_MTM");
+  });
+
+  it("does NOT force-close a FRESH WIDE_LONG observation well within its 144h window (20h old), even against the identical trailing-120-candle fetch shape", () => {
+    const observation = wideLongObs(20);
+    const forwardCandles = trailingWindowCandles(NOW, PRODUCTION_FETCH_LIMIT_HOURS, { close: 100.2, high: 100.3, low: 100.1 });
+    const patch = resolveCompositeObservation(observation, forwardCandles, NOW);
+    expect(patch).toBeNull(); // still legitimately open -- must not resolve early
+  });
+
+  it("does NOT force-close an observation just 1h shy of its 144h max-hold ceiling", () => {
+    const observation = wideLongObs(CE_WIDE_MAX_HOLD_HOURS - 1);
+    const forwardCandles = trailingWindowCandles(NOW, PRODUCTION_FETCH_LIMIT_HOURS, { close: 100.2, high: 100.3, low: 100.1 });
+    const patch = resolveCompositeObservation(observation, forwardCandles, NOW);
+    expect(patch).toBeNull();
+  });
+
+  it("DOES force-close an observation the instant it crosses the 144h ceiling", () => {
+    const observation = wideLongObs(CE_WIDE_MAX_HOLD_HOURS + 1);
+    const forwardCandles = trailingWindowCandles(NOW, PRODUCTION_FETCH_LIMIT_HOURS, { close: 100.2, high: 100.3, low: 100.1 });
+    const patch = resolveCompositeObservation(observation, forwardCandles, NOW);
+    expect(patch?.exitReason).toBe("MAX_HOLD_MTM");
+  });
+
+  it("FAST bucket (48h) still resolves correctly against the same fetch window -- no regression from the WIDE fix", () => {
+    const observation = obs({
+      bucket: "FAST_LONG",
+      direction: "LONG",
+      maxHoldHours: CE_FAST_MAX_HOLD_HOURS,
+      entryPrice: 100,
+      initialStop: 97,
+      takeProfitPrice: 101.5,
+      openedAtMs: NOW - 100 * 3_600_000, // well past 48h, still inside the 120h fetch window
+      openedAt: new Date(NOW - 100 * 3_600_000).toISOString(),
+    });
+    const forwardCandles = trailingWindowCandles(NOW, PRODUCTION_FETCH_LIMIT_HOURS, { close: 100.2, high: 100.3, low: 100.1 });
+    const patch = resolveCompositeObservation(observation, forwardCandles, NOW);
+    expect(patch).not.toBeNull();
+    expect(patch?.exitReason).toBe("MAX_HOLD_MTM");
+  });
+
+  it("still books SL/TP ahead of max-hold for a stale observation (SL-first-conservative priority preserved)", () => {
+    const observation = wideLongObs(237.2);
+    // Same stale age as the primary repro, but this time price actually breaches the stop before
+    // the max-hold ceiling would be reached -- must book INITIAL_STOP, not MAX_HOLD_MTM.
+    const forwardCandles = trailingWindowCandles(NOW, PRODUCTION_FETCH_LIMIT_HOURS, { close: 96, high: 96.5, low: 95.5 });
+    const patch = resolveCompositeObservation(observation, forwardCandles, NOW);
+    expect(patch?.exitReason).toBe("INITIAL_STOP");
+    expect(patch?.status).toBe("CLOSED_LOSS");
   });
 });
 
