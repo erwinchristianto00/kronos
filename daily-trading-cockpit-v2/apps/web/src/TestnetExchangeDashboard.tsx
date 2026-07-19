@@ -1035,8 +1035,15 @@ export default function TestnetExchangeDashboard() {
     { lane: 'CG_WIDE_FAST_SHORT', weight: '70' },
     { lane: 'CG_WIDE_FAST_LONG', weight: '30' },
   ]);
-  const [manualLongAllocRows, setManualLongAllocRows] = useState<Array<{ lane: string; weight: string }>>([{ lane: 'CG_WIDE_FAST_LONG', weight: '100' }]);
-  const [manualShortAllocRows, setManualShortAllocRows] = useState<Array<{ lane: string; weight: string }>>([{ lane: 'CG_WIDE_FAST_SHORT', weight: '100' }]);
+  // 2026-07-19 fix: these used to default to a hardcoded specific lane (CG_WIDE_FAST_LONG /
+  // CG_WIDE_FAST_SHORT — a decommissioned lane on the SHORT side) instead of the real server
+  // state. An operator who opened this panel and hit "Apply LONG / SHORT" before ever clicking
+  // "Load current" would silently overwrite their actual live allocation with these placeholders,
+  // with no warning. Now defaults to empty (same safe fallback loadManualDirectionalAllocation
+  // itself already uses when the server has nothing set) and is auto-populated from the real
+  // server value once below, instead of guessing.
+  const [manualLongAllocRows, setManualLongAllocRows] = useState<Array<{ lane: string; weight: string }>>([{ lane: '', weight: '0' }]);
+  const [manualShortAllocRows, setManualShortAllocRows] = useState<Array<{ lane: string; weight: string }>>([{ lane: '', weight: '0' }]);
   const [regimeReport, setRegimeReport] = useState<RegimeEngineReport | null>(null);
   const [regimePresets, setRegimePresets] = useState<RegimePresetsMap>({});
   const [regimeAxis, setRegimeAxis] = useState<RegimeAxisTimelineData | null>(null);
@@ -1616,6 +1623,20 @@ export default function TestnetExchangeDashboard() {
     }, 15_000);
     return () => window.clearInterval(timer);
   }, [autoRefresh]);
+
+  // 2026-07-19 fix: auto-sync the manual LONG/SHORT selector with the REAL server-side allocation
+  // the very first time it becomes available, instead of leaving the operator to discover (or
+  // never discover) that the form was still showing an empty/placeholder default. Guarded by a
+  // ref, not state, so it fires exactly once — later status polls (every few seconds while
+  // autoRefresh is on) must NOT re-run this and clobber whatever the operator has since typed in,
+  // mid-edit, before pressing Apply.
+  const manualDirectionalAutoLoadedRef = useRef(false);
+  useEffect(() => {
+    if (manualDirectionalAutoLoadedRef.current) return;
+    if (!status?.laneSelection?.manualDirectionalAllocations) return;
+    manualDirectionalAutoLoadedRef.current = true;
+    loadManualDirectionalAllocation();
+  }, [status]);
 
   const stale = lastLoadedAt ? Date.now() - new Date(lastLoadedAt).getTime() > REFRESH_MS * 2.5 : true;
   const healthTone = status?.armed ? 'tone-healthy' : status?.health?.lastTickError ? 'tone-warning' : 'tone-measure';
