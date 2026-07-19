@@ -16,6 +16,7 @@ import {
 import {
   LiveExecutionEngine,
   LiveExecutionStore,
+  combinedWorstCaseNotionalUsd,
   computeLiveOrderPlan,
   crowdingExitRecommendation,
   interleaveTestnetCollectionCandidates,
@@ -339,6 +340,7 @@ function makeConfig(overrides: Partial<LiveExecutionConfig> = {}): LiveExecution
       maxHoldMs: 24 * 60 * 60 * 1000,
     },
     rescueExecute: false,
+    maxAggregateManualDirectionalNotionalUsd: 0,
     configErrors: [],
     ...overrides,
   };
@@ -4883,5 +4885,67 @@ describe("[BUG 3] partial protective-stop fill re-establishes protection for the
 
     expect(client.placed.length).toBe(placedBefore); // no new stop placed
     expect(store.getState().intents[0]!.stopOrderId).toBe(originalStopId);
+  });
+});
+
+// ── 2026-07-19 real-money audit fix (BUG 4) ─────────────────────────────────
+
+describe("[BUG 4] aggregate worst-case notional across manual directional lanes", () => {
+  it("computes and surfaces the combined worst-case notional per side without blocking multi-lane configs when no cap is set (additive)", () => {
+    const { engine } = makeEngine({ config: { maxNotionalPerTrade: 250 } });
+    const result = engine.setManualDirectionalLaneAllocations({
+      long: [
+        { laneId: "LANE_A", weightPct: 100 },
+        { laneId: "LANE_B", weightPct: 100 },
+        { laneId: "LANE_C", weightPct: 100 },
+      ],
+      short: [],
+    });
+    // Historical behavior preserved: 3 lanes at 100% each was always allowed and must STILL be
+    // allowed when no aggregate cap is configured — additive fix, never silently blocks.
+    expect(result.ok).toBe(true);
+    // FIX: the real worst-case aggregate is now computed and surfaced — 3 x $250, not "diversified".
+    expect(result.combinedWorstCaseNotionalUsd?.long).toBeCloseTo(750, 6);
+    expect(result.combinedWorstCaseNotionalUsd?.short).toBeCloseTo(0, 6);
+    expect(
+      engine.getStatus().laneSelection.manualDirectionalAllocations?.combinedWorstCaseNotionalUsd.long,
+    ).toBeCloseTo(750, 6);
+  });
+
+  it("a single lane per direction (the common case) is unaffected — bounded by maxNotionalPerTrade exactly as before", () => {
+    const { engine } = makeEngine({ config: { maxNotionalPerTrade: 250 } });
+    const result = engine.setManualDirectionalLaneAllocations({
+      long: [{ laneId: "LANE_A", weightPct: 100 }],
+      short: [{ laneId: "LANE_B", weightPct: 50 }],
+    });
+    expect(result.ok).toBe(true);
+    expect(result.combinedWorstCaseNotionalUsd?.long).toBeCloseTo(250, 6);
+    expect(result.combinedWorstCaseNotionalUsd?.short).toBeCloseTo(125, 6);
+  });
+
+  it("rejects a configuration whose aggregate exceeds an EXPLICITLY opted-in cap, and does not persist it", () => {
+    const { engine, store } = makeEngine({
+      config: { maxNotionalPerTrade: 250, maxAggregateManualDirectionalNotionalUsd: 500 },
+    });
+    const before = store.getState().manualDirectionalAllocations;
+    const result = engine.setManualDirectionalLaneAllocations({
+      long: [
+        { laneId: "LANE_A", weightPct: 100 },
+        { laneId: "LANE_B", weightPct: 100 },
+        { laneId: "LANE_C", weightPct: 100 },
+      ],
+      short: [],
+    });
+    expect(result.ok).toBe(false);
+    expect(result.reason).toMatch(/exceeds the configured aggregate cap/);
+    expect(result.combinedWorstCaseNotionalUsd?.long).toBeCloseTo(750, 6);
+    // Rejected configuration must NOT be persisted.
+    expect(store.getState().manualDirectionalAllocations).toEqual(before);
+  });
+
+  it("combinedWorstCaseNotionalUsd (pure) sums weightPct-scaled notional across lanes", () => {
+    expect(combinedWorstCaseNotionalUsd([{ weightPct: 100 }, { weightPct: 100 }], 250)).toBeCloseTo(500, 6);
+    expect(combinedWorstCaseNotionalUsd([{ weightPct: 50 }], 250)).toBeCloseTo(125, 6);
+    expect(combinedWorstCaseNotionalUsd([], 250)).toBe(0);
   });
 });

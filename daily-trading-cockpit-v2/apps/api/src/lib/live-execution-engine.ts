@@ -197,6 +197,18 @@ export interface LiveExecutionConfig {
   /** Testnet-only: when true the rescue PLACES orders (flip/flatten); otherwise it only shadow-evaluates.
    *  LIVE_TESTNET_RESCUE_MODE=live. Forced false unless rescue.enabled (so mainnet can never execute). */
   rescueExecute: boolean;
+  /**
+   * 2026-07-19 real-money audit fix (BUG 4, HIGH): opt-in aggregate cap for setManualDirectionalLaneAllocations
+   * (LIVE_MAX_AGGREGATE_MANUAL_DIRECTIONAL_NOTIONAL_USD). Each lane in the long/short allocation list
+   * independently sizes to its OWN full maxNotionalPerTrade at weightPct:100 — nothing previously
+   * normalized or capped the SUM across lanes on the same side, so e.g. 3 LONG lanes each at 100%
+   * could each deploy their own full size simultaneously if signals fire together (observed live:
+   * exactly this 3-lanes-at-100 configuration). 0 (default) = disabled, matching the historical
+   * always-allowed behavior — combinedWorstCaseNotionalUsd() is still computed and surfaced via
+   * setManualDirectionalLaneAllocations()'s return value and getStatus() regardless of whether this
+   * cap is set, so the real aggregate figure is never silently hidden even when not enforced.
+   */
+  maxAggregateManualDirectionalNotionalUsd: number;
   /** Why the config cannot trade (empty = config valid for its env). */
   configErrors: string[];
 }
@@ -314,6 +326,9 @@ export function parseLiveExecutionConfig(env: NodeJS.ProcessEnv = process.env): 
       env.LIVE_TESTNET_RESCUE_ENABLED === "1" &&
       env.LIVE_TESTNET_RESCUE_MODE === "live" &&
       liveEnv === "testnet",
+    // 0 = disabled (default, matches historical always-allowed behavior — see the field's own doc
+    // comment on LiveExecutionConfig for the real-money gap this closes).
+    maxAggregateManualDirectionalNotionalUsd: envNonNegativeInt(env.LIVE_MAX_AGGREGATE_MANUAL_DIRECTIONAL_NOTIONAL_USD, 0),
     configErrors,
   };
 }
@@ -1393,6 +1408,24 @@ export function shouldCapPyramidAdd(
   return addCount >= freeAddLimit && (intent.maxFavorableR ?? 0) < minFavorableR;
 }
 
+/**
+ * 2026-07-19 real-money audit fix (BUG 4, HIGH): worst-case combined notional a directional
+ * allocation list (one side — long or short — of setManualDirectionalLaneAllocations) could deploy
+ * SIMULTANEOUSLY if every listed lane's signal fired at once. Each lane sizes independently to its
+ * own weightPct share of maxNotionalPerTrade — nothing previously summed that across lanes, so
+ * e.g. 3 lanes each at weightPct:100 read as "diversification" but structurally means up to 3x
+ * maxNotionalPerTrade of real simultaneous exposure. Pure so the real-money math is testable
+ * without the full engine; see LiveExecutionConfig.maxAggregateManualDirectionalNotionalUsd's doc
+ * comment for how this is used (opt-in cap) and surfaced (always, via getStatus() and this
+ * function's return value from setManualDirectionalLaneAllocations).
+ */
+export function combinedWorstCaseNotionalUsd(
+  rows: ReadonlyArray<{ weightPct: number }>,
+  maxNotionalPerTrade: number,
+): number {
+  return rows.reduce((sum, r) => sum + maxNotionalPerTrade * (Math.max(0, Math.min(100, r.weightPct)) / 100), 0);
+}
+
 /** 2026-07-07 operator decision ("bukan sembarang buka"): when set, the mirror admits ONLY
  *  symbols with /research book proof (priority tier 0/1) — a DELIBERATE exception to the default
  *  never-rejects rule, so with zero proven symbols the directional slot stays empty rather than
@@ -1916,6 +1949,18 @@ export class LiveExecutionEngine {
           ? {
               long: st.manualDirectionalAllocations.long,
               short: st.manualDirectionalAllocations.short,
+              // 2026-07-19 real-money audit fix (BUG 4): the real worst-case combined notional per
+              // side if every listed lane fired at once — see combinedWorstCaseNotionalUsd's doc
+              // comment. Always computed from the CURRENT persisted allocation + config so it
+              // stays correct across restarts, independent of whether the aggregate cap below is
+              // enforced — a 3-lanes-at-100% configuration must never read as "diversification"
+              // just because nothing rejected it.
+              combinedWorstCaseNotionalUsd: {
+                long: combinedWorstCaseNotionalUsd(st.manualDirectionalAllocations.long, this.config.maxNotionalPerTrade),
+                short: combinedWorstCaseNotionalUsd(st.manualDirectionalAllocations.short, this.config.maxNotionalPerTrade),
+              },
+              maxAggregateNotionalCapUsd:
+                this.config.maxAggregateManualDirectionalNotionalUsd > 0 ? this.config.maxAggregateManualDirectionalNotionalUsd : null,
               activeDirection: this.manualEntryDecision?.directionalBias ?? null,
               entryDecision: this.manualEntryDecision,
             }
@@ -4228,6 +4273,11 @@ export class LiveExecutionEngine {
     ok: boolean;
     reason: string | null;
     manualDirectionalAllocations: LiveExecutionState["manualDirectionalAllocations"];
+    /** 2026-07-19 real-money audit fix (BUG 4): worst-case combined notional per side if every
+     *  listed lane fired simultaneously — see combinedWorstCaseNotionalUsd's doc comment. Always
+     *  computed (even when maxAggregateManualDirectionalNotionalUsd is 0/disabled) so the real
+     *  aggregate figure is never silently hidden from whatever calls this (e.g. the dashboard). */
+    combinedWorstCaseNotionalUsd?: { long: number; short: number };
   } {
     const st = this.store.getState();
     if (allocations === null) {
@@ -4263,10 +4313,35 @@ export class LiveExecutionEngine {
     if (long.rows.length + short.rows.length === 0) {
       return { ok: false, reason: "pick at least one long or short lane, or clear the manual directional allocation", manualDirectionalAllocations: st.manualDirectionalAllocations };
     }
+    // 2026-07-19 real-money audit fix (BUG 4, HIGH): each lane independently sizes to its own full
+    // maxNotionalPerTrade at weightPct:100 — nothing previously normalized or capped the SUM across
+    // lanes on the SAME side, so e.g. 3 LONG lanes each at 100% could each deploy their own full
+    // size simultaneously if signals fire together (this exact configuration was observed live).
+    // Always computed and returned; only ENFORCED (rejects) when the operator has explicitly opted
+    // into a cap via LIVE_MAX_AGGREGATE_MANUAL_DIRECTIONAL_NOTIONAL_USD — additive: a single lane
+    // per direction (the common case) is bounded by maxNotionalPerTrade exactly as before, and a
+    // previously-allowed multi-lane configuration is never silently blocked unless the operator has
+    // opted in to the cap.
+    const worstCase = {
+      long: combinedWorstCaseNotionalUsd(long.rows, this.config.maxNotionalPerTrade),
+      short: combinedWorstCaseNotionalUsd(short.rows, this.config.maxNotionalPerTrade),
+    };
+    const cap = this.config.maxAggregateManualDirectionalNotionalUsd;
+    if (cap > 0 && (worstCase.long > cap || worstCase.short > cap)) {
+      return {
+        ok: false,
+        reason:
+          `combined worst-case notional would be long $${worstCase.long.toFixed(2)} / short $${worstCase.short.toFixed(2)}` +
+          ` — exceeds the configured aggregate cap of $${cap} (LIVE_MAX_AGGREGATE_MANUAL_DIRECTIONAL_NOTIONAL_USD).` +
+          ` Reduce the lane weights on that side or raise the cap explicitly.`,
+        manualDirectionalAllocations: st.manualDirectionalAllocations,
+        combinedWorstCaseNotionalUsd: worstCase,
+      };
+    }
     st.manualDirectionalAllocations = { long: long.rows, short: short.rows };
     st.laneAllocationOperatorLock = true;
     this.store.save();
-    return { ok: true, reason: null, manualDirectionalAllocations: st.manualDirectionalAllocations };
+    return { ok: true, reason: null, manualDirectionalAllocations: st.manualDirectionalAllocations, combinedWorstCaseNotionalUsd: worstCase };
   }
 
   /** True once the operator has explicitly applied a lane allocation (POST
