@@ -88,6 +88,12 @@ class FakeClient implements SingleSymbolExecClient {
       // qty=1 clears minQty=1 but at entryPrice=0.10 the notional is only $0.10, well under
       // minNotional=5. Dedicated fixture for the minNotional regression test below.
       ["DOGEUSDT", f(1, 1)],
+      // 2026-07-19 real-money audit fix fixture: minQty pinned EXACTLY at the mathematically
+      // correct stepSize-floored quantity for legUsd=140.07/entryPrice=20010 (rawQty is exactly 7
+      // steps of 0.001 -> qty=0.007) so a floating-point-undershot qty of 0.006 (one step below)
+      // fails minQty and is dropped, while the correct 0.007 passes. Dedicated fixture for the
+      // stepSize-epsilon regression test below.
+      ["XYZUSDT", f(0.001, 0.007)],
     ]);
   }
   setLeverageCalls: string[] = [];
@@ -389,6 +395,23 @@ describe("SingleSymbolLaneExecutor — entry", () => {
     const { executor, store } = makeExecutor({ signals: [dogeSignal], legUsd: 0.5 });
     await executor.tick();
     expect(store.getState().positions.length).toBe(0);
+  });
+
+  it("[STEPSIZE-EPSILON, 2026-07-19 fix] a stepSize floor that would floating-point-undershoot by exactly one step opens at the mathematically correct quantity instead of silently dropping the signal", async () => {
+    // legUsd=140.07 / entryPrice=20010 -> rawQty is EXACTLY 7 steps of stepSize=0.001
+    // mathematically, but JS float representation gives 0.006999999999999999 (a hair under 7.0).
+    // The pre-fix `Math.floor(rawQty / stepSize) * stepSize` (no epsilon guard) floored this to 6
+    // steps -> qty=0.006, which fails this fixture's minQty=0.007 (pinned exactly there) and drops
+    // the signal permanently (structural rejection, never retried) — a real order 14.3% smaller
+    // than intended, in this case shrunk all the way to a fundable signal that could never fund.
+    // The fix (roundToStep's epsilon-before-floor) must open at the correct qty=0.007.
+    const client = new FakeClient();
+    const stepSignal = signal({ observationId: "sf:XYZUSDT:1", symbol: "XYZUSDT", entryPrice: 20010, stopPrice: 20612 });
+    const { executor, store } = makeExecutor({ client, signals: [stepSignal], legUsd: 140.07 });
+    await executor.tick();
+    const positions = store.getState().positions;
+    expect(positions.length).toBe(1); // would be 0 under the bug (floored qty 0.006 < minQty 0.007)
+    expect(positions[0]!.qty).toBeCloseTo(0.007, 8);
   });
 
   it("ignores a stale signal older than maxSignalAgeMs default (50 min)", async () => {

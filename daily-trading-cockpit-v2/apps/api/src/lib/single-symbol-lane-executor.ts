@@ -37,7 +37,7 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 
-import { BinanceFuturesPrivateError, resolveConfirmedFillPrice, type BinanceFuturesPrivateClient } from "./binance-futures-private.js";
+import { BinanceFuturesPrivateError, resolveConfirmedFillPrice, roundToStep, type BinanceFuturesPrivateClient } from "./binance-futures-private.js";
 
 export type SingleSymbolExecClient = Pick<
   BinanceFuturesPrivateClient,
@@ -1094,7 +1094,17 @@ export class SingleSymbolLaneExecutor {
         const f = filters.get(signal.symbol);
         if (!f) continue;
         const rawQty = legUsd / signal.entryPrice;
-        const qty = Number((Math.floor(rawQty / f.stepSize) * f.stepSize).toFixed(8));
+        // 2026-07-19 real-money audit fix: the previous manual `Math.floor(rawQty / f.stepSize) *
+        // f.stepSize` had no epsilon guard, so plain floating-point representation error (e.g.
+        // legUsd=140.07, entryPrice=20010, stepSize=0.001 -> rawQty=0.006999999999999999) silently
+        // floored to ONE STEP BELOW the correct quantity — shrinking the real order by up to one
+        // stepSize (14.3% in that example) and, worse, could permanently fail a minQty/minNotional
+        // check a signal should have passed. roundToStep() is the SAME epsilon-before-floor
+        // convention binance-futures-private.ts's placeOrder()/placeAlgoOrder() already apply to
+        // this exact quantity before it hits the exchange — reusing it here means the size checked
+        // against minQty/minNotional below is the SAME size actually sent, and never rounds a
+        // genuinely-below-threshold value up into passing.
+        const qty = roundToStep(rawQty, f.stepSize, "down");
         if (!(qty >= f.minQty)) continue;
         if (!(qty * signal.entryPrice >= f.minNotional)) continue; // Binance rejects an order that clears minQty but misses MIN_NOTIONAL
 
