@@ -329,6 +329,20 @@ export interface SingleSymbolLaneExecutorOptions {
   tryClaimEntrySymbol?: (symbol: string) => boolean;
   /** Releases an entry-symbol claim after every success, rejection, or failure path. */
   releaseEntrySymbol?: (symbol: string) => void;
+  /** 2026-07-19 real-money audit fix: best-effort notification fired exactly once per position
+   *  fully closed (stop-triggered, policy exit, manual close, or an orderly kill-switch wind-down —
+   *  every one of those paths funnels through settleIfStopTriggered()/closePosition()'s own single
+   *  finalization block), carrying the position's confirmed netPnlUsd. app.ts wires this to
+   *  LiveExecutionEngine.recordExternalConsecutiveLossOutcome() so a losing streak concentrated
+   *  entirely in THIS instance (as opposed to the legacy CG_*-variant-matrix mirror pipeline) still
+   *  trips the account-wide consecutive-loss kill-switch condition — before this hook existed, that
+   *  condition could only ever be fed by the mirror pipeline's own applyRealizedToLedger, which
+   *  these independently-admitted single-symbol lanes never called into at all. Never invoked with
+   *  a null net: unlike the mirror pipeline, this executor never finalizes a position CLOSED with
+   *  an unresolved P&L — both settlement paths retry next tick rather than settle with a
+   *  fabricated/unknown number. A throwing callback never interrupts this executor's own
+   *  settlement bookkeeping — see notifyPositionClosed(). */
+  onPositionClosed?: (netUsd: number) => void;
 }
 
 /** Store never capped closed/aborted positions, growing forever. Keeps every OPEN position
@@ -364,6 +378,7 @@ export class SingleSymbolLaneExecutor {
   private readonly sharedGetPositions: () => ReturnType<SingleSymbolExecClient["getPositions"]>;
   private readonly tryClaimEntrySymbol: (symbol: string) => boolean;
   private readonly releaseEntrySymbol: (symbol: string) => void;
+  private readonly onPositionClosed: (netUsd: number) => void;
   private ticking = false;
   /** 2026-07-11 real-money audit fix: closePosition()'s `pos.exitOrderId !== null` reentry guard
    *  is TOCTOU-vulnerable — exitOrderId isn't set until AFTER the awaited cancelAlgoOrder/placeOrder
@@ -407,6 +422,18 @@ export class SingleSymbolLaneExecutor {
     this.sharedGetPositions = opts.sharedGetPositions ?? (() => this.client.getPositions());
     this.tryClaimEntrySymbol = opts.tryClaimEntrySymbol ?? (() => true);
     this.releaseEntrySymbol = opts.releaseEntrySymbol ?? (() => {});
+    this.onPositionClosed = opts.onPositionClosed ?? (() => {});
+  }
+
+  /** Best-effort fan-out of a finalized close to onPositionClosed — never let a throwing callback
+   *  interrupt this executor's own settlement bookkeeping (same fail-open posture as
+   *  live-execution-engine.ts's onKillSwitchEngaged callback). */
+  private notifyPositionClosed(netUsd: number): void {
+    try {
+      this.onPositionClosed(netUsd);
+    } catch {
+      // best-effort — the position is already fully settled and persisted regardless
+    }
   }
 
   private async resolveFillPrice(symbol: string, orderId: string, initialAvgPrice: number, fallbackPrice: number) {
@@ -710,8 +737,13 @@ export class SingleSymbolLaneExecutor {
     // FULL lifetime, not just the final leg.
     pos.grossPnlUsd = (pos.realizedPartialGrossUsd ?? 0) + realized;
     pos.feeEstimateUsd = (pos.realizedPartialFeeUsd ?? 0) + fees;
-    pos.netPnlUsd = pos.grossPnlUsd - pos.feeEstimateUsd;
+    const netUsd = pos.grossPnlUsd - pos.feeEstimateUsd;
+    pos.netPnlUsd = netUsd;
     this.store.save();
+    // 2026-07-19 real-money audit fix: feed the account-wide consecutive-loss kill-switch counter
+    // (see onPositionClosed's doc comment) — every full close, stop-triggered or policy-decided,
+    // must reach it, not just the legacy mirror pipeline's own applyRealizedToLedger.
+    this.notifyPositionClosed(netUsd);
     return true;
   }
 
@@ -909,8 +941,12 @@ export class SingleSymbolLaneExecutor {
       pos.closeReason = reason;
       pos.grossPnlUsd = gross;
       pos.feeEstimateUsd = fees;
-      pos.netPnlUsd = gross - fees;
+      const netUsd = gross - fees;
+      pos.netPnlUsd = netUsd;
       this.store.save();
+      // 2026-07-19 real-money audit fix: see settleIfStopTriggered's identical call — this covers
+      // every OTHER close path (policy exit, manual close, orderly kill-switch wind-down).
+      this.notifyPositionClosed(netUsd);
     } finally {
       this.closingPositionIds.delete(pos.positionId);
     }

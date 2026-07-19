@@ -31,6 +31,13 @@ import {
   type LivePrivateClient,
   type PaperStoreReader,
 } from "../src/lib/live-execution-engine.js";
+import {
+  SingleSymbolLaneExecutor,
+  SingleSymbolLaneExecutorStore,
+  makeFixedRewardExitPolicy,
+  type SingleSymbolExecClient,
+  type SingleSymbolFreshSignal,
+} from "../src/lib/single-symbol-lane-executor.js";
 import type { BinanceClient, FuturesFlowSnapshot } from "../src/lib/binance.js";
 import type { PaperOrder } from "../src/lib/paper-execution-router.js";
 import type { PerSymbolLaneBookEdgeReport } from "../src/lib/per-symbol-lane-book-edge.js";
@@ -3378,6 +3385,119 @@ describe("resetKill — a deliberate reset must give a genuine fresh start (not 
     // The core guarantee: killSwitchTrip() must NOT immediately re-fire after a reset.
     const trip = (engine as unknown as { killSwitchTrip: () => string | null }).killSwitchTrip();
     expect(trip).toBeNull();
+  });
+});
+
+describe("account-wide consecutive-loss kill-switch fed by a SingleSymbolLaneExecutor (2026-07-19 real-money audit fix)", () => {
+  // Regression for the audit finding: consecutiveLosses was ONLY ever incremented by this engine's
+  // own applyRealizedToLedger, itself fed exclusively by the legacy CG_*-variant-matrix mirror
+  // pipeline (retired, 0% allocation weight today). The 3 lanes holding 100% of today's real money
+  // (REGIME_COMPOSITE_CONFIRMATION_LONG, COMPOSITE_ESTIMATOR_BIDI_WIDE_LONG/FAST_LONG) are all
+  // SingleSymbolLaneExecutor instances, which never called into that pipeline — so a real losing
+  // streak concentrated entirely in one of them could never trip this specific kill-switch
+  // condition. Proves recordExternalConsecutiveLossOutcome() + SingleSymbolLaneExecutor's
+  // onPositionClosed callback close that gap end to end: real losing closes from an ACTUAL
+  // SingleSymbolLaneExecutor instance (not the legacy mirror) increment the SAME counter
+  // killSwitchTrip() reads and eventually trip it, and a subsequent win resets it — exactly
+  // matching applyRealizedToLedger's own scratch/loss/win semantics.
+  //
+  // FAIL-WITHOUT-FIX: before this fix, SingleSymbolLaneExecutor had no onPositionClosed option at
+  // all and LiveExecutionEngine had no recordExternalConsecutiveLossOutcome method — this test
+  // could not even be written against pre-fix code, let alone pass; it errors at construction time
+  // ("onPositionClosed" is not an assignable option / recordExternalConsecutiveLossOutcome is not a
+  // function). Confirmed by reverting this change locally and re-running the file.
+
+  const SSLE_NOW_ISO = "2026-07-19T12:00:00.000Z";
+  const SSLE_NOW_MS = new Date(SSLE_NOW_ISO).getTime();
+
+  function makeSingleSymbolExecutor(
+    client: FakeLiveClient,
+    engine: LiveExecutionEngine,
+    signals: SingleSymbolFreshSignal[],
+  ) {
+    const executorStore = new SingleSymbolLaneExecutorStore(tmp(), "test.json");
+    const executor = new SingleSymbolLaneExecutor({
+      client: client as unknown as SingleSymbolExecClient,
+      store: executorStore,
+      laneId: "REGIME_COMPOSITE_CONFIRMATION_LONG",
+      direction: "LONG",
+      getOpenSignals: () => signals,
+      exitPolicy: makeFixedRewardExitPolicy({ rewardMultiple: 0.5, maxHoldMs: 48 * 3_600_000 }),
+      isAllowed: () => true,
+      laneWeightPct: () => 100,
+      legUsd: () => 200,
+      leverage: () => 3,
+      maxOpenPositions: () => 1,
+      nowIso: () => SSLE_NOW_ISO,
+      fillConfirmRetryDelayMs: 0,
+      // The exact wiring app.ts uses for all 9 single-symbol lane instances.
+      onPositionClosed: (netUsd) => engine.recordExternalConsecutiveLossOutcome(netUsd),
+    });
+    return { executor, executorStore };
+  }
+
+  /** Opens ONE fresh position on this executor and closes it via the operator manual-close path,
+   *  banking EXACTLY `realizedPnlUsd` (zero fees) as its confirmed net P&L via FakeLiveClient's
+   *  flattenRealizedPnl — same controlled-close convention single-symbol-lane-executor.test.ts uses.
+   *  `ageMs` keeps each signal fresh (well under the executor's default 50-minute max-signal-age)
+   *  while still giving it a distinct openedAtMs, so consecutive calls don't collide. */
+  async function openAndClosePosition(
+    executor: SingleSymbolLaneExecutor,
+    executorStore: SingleSymbolLaneExecutorStore,
+    client: FakeLiveClient,
+    signals: SingleSymbolFreshSignal[],
+    observationId: string,
+    ageMs: number,
+    realizedPnlUsd: number,
+  ): Promise<void> {
+    signals.push({ observationId, symbol: "ETHUSDT", entryPrice: 2000, stopPrice: 1900, openedAtMs: SSLE_NOW_MS - ageMs });
+    await executor.tick(); // opens the position (FakeLiveClient fills entries at marketFillPrice ?? 2000)
+    const pos = executorStore.getState().positions.find((p) => p.status === "OPEN");
+    expect(pos).toBeDefined();
+    client.flattenRealizedPnl = realizedPnlUsd;
+    const result = await executor.manualClosePosition(pos!.positionId);
+    expect(result.ok).toBe(true);
+    expect(result.netPnlUsd).toBeCloseTo(realizedPnlUsd, 6);
+  }
+
+  it("a losing streak from a single-symbol lane increments and TRIPS the SAME counter killSwitchTrip() reads", async () => {
+    const { engine, store, client } = makeEngine({ config: { scratchEpsilonUsd: 0.1, maxConsecutiveLosses: 2 } });
+    const signals: SingleSymbolFreshSignal[] = [];
+    const { executor, executorStore } = makeSingleSymbolExecutor(client, engine, signals);
+    const trip = () => (engine as unknown as { killSwitchTrip: () => string | null }).killSwitchTrip();
+
+    await openAndClosePosition(executor, executorStore, client, signals, "rc:ETHUSDT:1", 5_000, -2);
+    expect(store.getState().consecutiveLosses).toBe(1);
+    expect(trip()).toBeNull(); // only 1 loss so far — must not trip early
+
+    await openAndClosePosition(executor, executorStore, client, signals, "rc:ETHUSDT:2", 4_000, -2);
+    expect(store.getState().consecutiveLosses).toBe(2);
+    expect(trip()).toBe("max consecutive losses hit (2)");
+  });
+
+  it("a subsequent win from the SAME single-symbol lane resets the streak back to 0", async () => {
+    const { engine, store, client } = makeEngine({ config: { scratchEpsilonUsd: 0.1, maxConsecutiveLosses: 5 } });
+    const signals: SingleSymbolFreshSignal[] = [];
+    const { executor, executorStore } = makeSingleSymbolExecutor(client, engine, signals);
+
+    await openAndClosePosition(executor, executorStore, client, signals, "rc:ETHUSDT:1", 5_000, -2);
+    await openAndClosePosition(executor, executorStore, client, signals, "rc:ETHUSDT:2", 4_000, -2);
+    expect(store.getState().consecutiveLosses).toBe(2);
+
+    await openAndClosePosition(executor, executorStore, client, signals, "rc:ETHUSDT:3", 3_000, 1.5);
+    expect(store.getState().consecutiveLosses).toBe(0);
+  });
+
+  it("a sub-epsilon scratch close from a single-symbol lane is neutral — neither increments nor resets", async () => {
+    const { engine, store, client } = makeEngine({ config: { scratchEpsilonUsd: 0.1, maxConsecutiveLosses: 5 } });
+    const signals: SingleSymbolFreshSignal[] = [];
+    const { executor, executorStore } = makeSingleSymbolExecutor(client, engine, signals);
+
+    await openAndClosePosition(executor, executorStore, client, signals, "rc:ETHUSDT:1", 5_000, -2);
+    expect(store.getState().consecutiveLosses).toBe(1);
+
+    await openAndClosePosition(executor, executorStore, client, signals, "rc:ETHUSDT:2", 4_000, -0.017);
+    expect(store.getState().consecutiveLosses).toBe(1); // scratch — unchanged, must not reach 2
   });
 });
 

@@ -2474,12 +2474,25 @@ export class LiveExecutionEngine {
    * than $40/day" promise could never be kept purely from losses concentrated in those 11 lanes.
    * getExternalRealizedPnlUsd() (same source as the dashboard headline and wallet-reconciliation
    * fixes from the same audit) is folded into both checks below WITHOUT touching dailyLedger/
-   * consecutiveLosses/realizedPeakUsd themselves — those stay engine-native (consecutiveLosses in
-   * particular has no cross-lane equivalent worth inventing; a losing streak is inherently a
-   * per-mechanism concept). combinedRealizedPeakUsd is a NEW, separate peak tracked here (this
-   * function already runs first on every tick, so updating it here needs no new hook) — its first
-   * value after this fix deploys is seeded from max(realizedPeakUsd, current combined total), an
-   * honest approximation since no true historical combined-total peak was ever recorded before.
+   * consecutiveLosses/realizedPeakUsd themselves — those stay engine-native. combinedRealizedPeakUsd
+   * is a NEW, separate peak tracked here (this function already runs first on every tick, so
+   * updating it here needs no new hook) — its first value after this fix deploys is seeded from
+   * max(realizedPeakUsd, current combined total), an honest approximation since no true historical
+   * combined-total peak was ever recorded before.
+   *
+   * 2026-07-19 real-money audit follow-up: the paragraph above used to claim "consecutiveLosses has
+   * no cross-lane equivalent worth inventing; a losing streak is inherently a per-mechanism concept"
+   * — that was wrong in practice. consecutiveLosses (below) was ONLY ever incremented by this
+   * engine's own applyRealizedToLedger, itself fed exclusively by the legacy CG_*-variant-matrix
+   * mirror pipeline this class drives — a pipeline that sits at 0% allocation weight today (retired,
+   * superseded by RC/CE in July). The 3 lanes holding 100% of today's real money
+   * (REGIME_COMPOSITE_CONFIRMATION_LONG, COMPOSITE_ESTIMATOR_BIDI_WIDE_LONG,
+   * COMPOSITE_ESTIMATOR_BIDI_FAST_LONG — all SingleSymbolLaneExecutor instances) never fed this
+   * counter at all, so a real losing streak concentrated entirely in those lanes could never trip
+   * this specific condition — only the two dollar-based conditions above would eventually catch it.
+   * recordExternalConsecutiveLossOutcome() below closes that gap: app.ts wires it into EVERY
+   * SingleSymbolLaneExecutor instance's onPositionClosed callback (all 9 lanes, not just the 3
+   * currently allocated weight, so a future allocation change needs no further wiring here).
    */
   /** 2026-07-12 fix: getExternalRealizedPnlUsd() fans out to 11 separate executors' getStatus()
    *  calls with no guard of its own, unlike currentControllerSnapshot()/strategyEntryGate() which
@@ -2531,6 +2544,46 @@ export class LiveExecutionEngine {
       );
     }
     return null;
+  }
+
+  /**
+   * 2026-07-19 real-money audit fix: killSwitchTrip's maxConsecutiveLosses condition (above) was fed
+   * EXCLUSIVELY by this engine's own applyRealizedToLedger — itself only ever called from the legacy
+   * CG_*-variant-matrix mirror pipeline this class drives, which sits at 0% allocation weight today
+   * (retired, superseded by RC/CE in July). The 3 lanes holding 100% of today's real money
+   * (REGIME_COMPOSITE_CONFIRMATION_LONG, COMPOSITE_ESTIMATOR_BIDI_WIDE_LONG,
+   * COMPOSITE_ESTIMATOR_BIDI_FAST_LONG — all SingleSymbolLaneExecutor instances) never fed this
+   * counter at all, so a real losing streak concentrated entirely in those lanes could never trip
+   * this specific condition — only the two dollar-based conditions above would eventually catch it.
+   * app.ts wires this method into EVERY SingleSymbolLaneExecutor instance's onPositionClosed
+   * callback (all 9 lanes — RC/RCS/CE-WIDE_LONG/CE-WIDE_SHORT/CE-FAST_LONG/CE-FAST_SHORT/SF/IM/PWR —
+   * not just the 3 currently allocated weight, so a future allocation change needs no further wiring
+   * here), giving every one of them a way to feed the SAME counter killSwitchTrip() already reads.
+   *
+   * Uses the IDENTICAL scratch/loss/win classification applyRealizedToLedger already uses for the
+   * legacy mirror pipeline: a scratch (|net| < scratchEpsilonUsd) is neutral — neither increments
+   * nor resets — a real loss increments, a win resets to 0. Deliberately does NOT touch
+   * dailyLedger/totalRealizedPnlUsd/realizedPeakUsd/combinedRealizedPeakUsd — those dollar totals
+   * already correctly aggregate every lane's real P&L via getExternalRealizedPnlUsd/
+   * safeExternalRealizedPnlUsd (see killSwitchTrip's own doc comment above); folding them in here
+   * too would double-count the exact same close into both the engine-native ledger and the external
+   * sum.
+   *
+   * Unlike applyRealizedToLedger, this never needs to handle a null net: SingleSymbolLaneExecutor
+   * never finalizes a position CLOSED with an unresolved P&L — its settlement paths retry next tick
+   * rather than ever settling with a fabricated/unknown number — so its onPositionClosed callback
+   * only ever fires with a real, confirmed number.
+   */
+  recordExternalConsecutiveLossOutcome(netUsd: number): void {
+    const st = this.store.getState();
+    const isScratch = Math.abs(netUsd) < this.config.scratchEpsilonUsd;
+    if (isScratch) return;
+    if (netUsd < 0) {
+      st.consecutiveLosses += 1;
+    } else {
+      st.consecutiveLosses = 0;
+    }
+    this.store.save();
   }
 
   private async engageKillSwitch(reason: string): Promise<void> {

@@ -1085,6 +1085,12 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         maxNotionalPerSymbolAcrossLanes,
         currentPrice: currentPublicPrice,
         sharedGetPositions,
+        // 2026-07-19 real-money audit fix: feed the account-wide consecutive-loss kill-switch
+        // condition (LiveExecutionEngine.recordExternalConsecutiveLossOutcome's doc comment) —
+        // this lane's own closes never reached that counter before, so a losing streak concentrated
+        // entirely here could never trip it. Same wiring on every sibling single-symbol executor
+        // below, regardless of current allocation weight.
+        onPositionClosed: (netUsd) => engineForGate?.recordExternalConsecutiveLossOutcome(netUsd),
         ...singleSymbolEntryClaims,
       });
       if (!isTest) {
@@ -1123,6 +1129,8 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         maxNotionalPerSymbolAcrossLanes,
         currentPrice: currentPublicPrice,
         sharedGetPositions,
+        // 2026-07-19 real-money audit fix — see shortFadeExecutor above.
+        onPositionClosed: (netUsd) => engineForGate?.recordExternalConsecutiveLossOutcome(netUsd),
         ...singleSymbolEntryClaims,
       });
       if (!isTest) {
@@ -1174,6 +1182,9 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         maxNotionalPerSymbolAcrossLanes,
         currentPrice: currentPublicPrice,
         sharedGetPositions,
+        // 2026-07-19 real-money audit fix — see shortFadeExecutor above. This lane is one of the 3
+        // holding 100% of today's real money — the original motivating gap for this fix.
+        onPositionClosed: (netUsd) => engineForGate?.recordExternalConsecutiveLossOutcome(netUsd),
         ...singleSymbolEntryClaims,
       });
       if (!isTest) {
@@ -1211,6 +1222,8 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         maxNotionalPerSymbolAcrossLanes,
         currentPrice: currentPublicPrice,
         sharedGetPositions,
+        // 2026-07-19 real-money audit fix — see shortFadeExecutor above.
+        onPositionClosed: (netUsd) => engineForGate?.recordExternalConsecutiveLossOutcome(netUsd),
         ...singleSymbolEntryClaims,
       });
       if (!isTest) {
@@ -1254,6 +1267,8 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         maxNotionalPerSymbolAcrossLanes,
         currentPrice: currentPublicPrice,
         sharedGetPositions,
+        // 2026-07-19 real-money audit fix — see shortFadeExecutor above.
+        onPositionClosed: (netUsd) => engineForGate?.recordExternalConsecutiveLossOutcome(netUsd),
         ...singleSymbolEntryClaims,
       });
       if (!isTest) {
@@ -1331,6 +1346,9 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           maxNotionalPerSymbolAcrossLanes,
           currentPrice: currentPublicPrice,
           sharedGetPositions,
+          // 2026-07-19 real-money audit fix — see shortFadeExecutor above. WIDE_LONG/FAST_LONG are 2
+          // of the 3 lanes holding 100% of today's real money — the original motivating gap.
+          onPositionClosed: (netUsd) => engineForGate?.recordExternalConsecutiveLossOutcome(netUsd),
           ...singleSymbolEntryClaims,
         });
       };
