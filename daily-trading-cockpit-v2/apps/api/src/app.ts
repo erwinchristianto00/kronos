@@ -98,8 +98,8 @@ import {
   compositeEstimatorExitPolicy,
   compositeEstimatorOpenSignals,
   ceExecLegUsdForBucket,
+  ceExecMaxSignalAgeMsForBucket,
   CE_EXEC_LEVERAGE,
-  CE_EXEC_MAX_SIGNAL_AGE_MS,
   CE_EXEC_DAILY_MAX_LOSS_USD,
   CE_EXEC_MAX_CONCURRENT,
   ceLaneIdForBucket,
@@ -1288,7 +1288,15 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           legUsd: () => ceExecLegUsdForBucket(bucket),
           leverage: CE_EXEC_LEVERAGE,
           maxOpenPositions: CE_EXEC_MAX_CONCURRENT,
-          maxSignalAgeMs: CE_EXEC_MAX_SIGNAL_AGE_MS,
+          // 2026-07-19: FAST_LONG now resolves its OWN freshness-window override
+          // (COMPOSITE_ESTIMATOR_FAST_LONG_EXEC_MAX_SIGNAL_AGE_MS, falling back to the shared
+          // default when unset) via ceExecMaxSignalAgeMsForBucket — WIDE_LONG/WIDE_SHORT/FAST_SHORT
+          // still resolve through the unchanged shared CE_EXEC_MAX_SIGNAL_AGE_MS. Added as
+          // infrastructure only — the env var is deliberately left UNSET, see the doc comment on
+          // CE_FAST_LONG_EXEC_MAX_SIGNAL_AGE_MS in composite-estimator-edge.ts for why (the low
+          // historical trade count here was actually caused by a separate mainnetEntryEligible
+          // hardcode, not confirmed to be caused by staleness).
+          maxSignalAgeMs: () => ceExecMaxSignalAgeMsForBucket(bucket),
           dailyMaxLossUsd: CE_EXEC_DAILY_MAX_LOSS_USD,
           // 2026-07-09 fix: cross-lane per-symbol notional cap — selfGetter lets each of the 4
           // buckets exclude only ITS OWN positions (not the other 3 buckets, which DO count

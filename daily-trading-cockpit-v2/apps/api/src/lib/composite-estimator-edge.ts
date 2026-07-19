@@ -662,6 +662,31 @@ export const CE_EXEC_LEVERAGE = (): number => {
 };
 export const CE_EXEC_MAX_SIGNAL_AGE_MS = (): number =>
   Math.max(60_000, Math.floor(Number(process.env.COMPOSITE_ESTIMATOR_EXEC_MAX_SIGNAL_AGE_MS) || 50 * 60_000));
+/** 2026-07-19: FAST_LONG's own freshness-window override, independent of the shared
+ *  CE_EXEC_MAX_SIGNAL_AGE_MS above (WIDE_LONG/WIDE_SHORT/FAST_SHORT keep using it unchanged).
+ *  FAST_LONG's real signal cadence (median ~370min / p90 ~1074min between fresh signals)
+ *  structurally exceeds the shared 50-minute default by an order of magnitude — but note the
+ *  low real-trade count to date (measuredResolvedCount:30 vs 1 closed trade) was actually caused
+ *  by a separate mainnetEntryEligible hardcode that blocked this bucket outright, NOT confirmed to
+ *  be caused by staleness (the executor never got to attempt a signal old enough to test that).
+ *  This override is added as infrastructure for if/when staleness turns out to be a real,
+ *  *observed* constraint now that mainnetEntryEligible is fixed — the env var below is
+ *  deliberately left UNSET until there's live evidence it's needed; do not set it off a cadence
+ *  estimate alone, cadence-between-signals and how-long-a-signal-stays-predictive are different
+ *  questions. Same per-lane-override idiom as RC_EXEC_MAX_SIGNAL_AGE_MS / RCS_EXEC_MAX_SIGNAL_AGE_MS
+ *  in the sibling regime-composite modules — falls back to the pre-existing shared
+ *  CE_EXEC_MAX_SIGNAL_AGE_MS() when unset, so this is purely additive/backward-compatible. */
+export const CE_FAST_LONG_EXEC_MAX_SIGNAL_AGE_MS = (): number => {
+  const n = Number(process.env.COMPOSITE_ESTIMATOR_FAST_LONG_EXEC_MAX_SIGNAL_AGE_MS);
+  return Number.isFinite(n) && n > 0 ? Math.max(60_000, Math.floor(n)) : CE_EXEC_MAX_SIGNAL_AGE_MS();
+};
+/** Per-bucket max signal age: FAST_LONG resolves through its own override-capable env var above;
+ *  WIDE_LONG/WIDE_SHORT/FAST_SHORT continue to resolve through the shared CE_EXEC_MAX_SIGNAL_AGE_MS
+ *  exactly as before — this function changes NOTHING for those 3 buckets. Mirrors the existing
+ *  ceExecLegUsdForBucket per-bucket dispatch pattern just below. */
+export function ceExecMaxSignalAgeMsForBucket(bucket: CEBucket): number {
+  return bucket === "FAST_LONG" ? CE_FAST_LONG_EXEC_MAX_SIGNAL_AGE_MS() : CE_EXEC_MAX_SIGNAL_AGE_MS();
+}
 export const CE_EXEC_DAILY_MAX_LOSS_USD = (): number => {
   const n = Number.parseFloat(process.env.COMPOSITE_ESTIMATOR_EXEC_DAILY_MAX_LOSS_USD ?? "");
   return Number.isFinite(n) && n > 0 ? n : 8;
