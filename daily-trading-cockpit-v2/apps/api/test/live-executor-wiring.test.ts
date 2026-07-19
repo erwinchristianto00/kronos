@@ -170,6 +170,30 @@ describe("computeNotionalPerSymbol (2026-07-09 cross-lane per-symbol notional ca
   it("skips null executor slots and returns an empty map when nothing is open", () => {
     expect(computeNotionalPerSymbol([null, fakeSingleSymbolExecutor([])]).size).toBe(0);
   });
+
+  describe("2026-07-19 real-money audit fix: bidirectional single-symbol <-> cross-sectional visibility", () => {
+    it("omitting the cross-sectional param (existing call sites) is byte-identical to pre-fix behavior", () => {
+      const exec = fakeSingleSymbolExecutor([fakePosition("BTCUSDT", "LONG", 1, null, 100)]);
+      expect(computeNotionalPerSymbol([exec])).toEqual(new Map([["BTCUSDT", 100]]));
+    });
+
+    it("folds in cross-sectional basket legs' notional on the SAME symbol as a single-symbol lane", () => {
+      const single = fakeSingleSymbolExecutor([fakePosition("ETHUSDT", "LONG", 0.05, null, 1755.84)]);
+      const xsec = fakeXsecExecutor([fakeBasket([fakeLeg("ETHUSDT", "LONG", 0.03, null)])]);
+      // ETHUSDT entryPrice defaults to 1 in fakeLeg — combined = 0.05*1755.84 (single) + 0.03*1 (xsec leg)
+      const notional = computeNotionalPerSymbol([single], [xsec]);
+      expect(notional.get("ETHUSDT")).toBeCloseTo(0.05 * 1755.84 + 0.03 * 1, 6);
+    });
+
+    it("excludes a cross-sectional leg whose exit is already in flight (exitOrderId set)", () => {
+      const xsec = fakeXsecExecutor([fakeBasket([fakeLeg("SOLUSDT", "SHORT", 1, 999)])]);
+      expect(computeNotionalPerSymbol([], [xsec]).has("SOLUSDT")).toBe(false);
+    });
+
+    it("skips null cross-sectional slots and returns an empty map when nothing is open on either side", () => {
+      expect(computeNotionalPerSymbol([null], [null, fakeXsecExecutor([])]).size).toBe(0);
+    });
+  });
 });
 
 describe("maxNotionalPerSymbolAcrossLanes", () => {

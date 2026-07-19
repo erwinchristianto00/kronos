@@ -307,9 +307,23 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
   ];
   /** Notional already committed to `symbol` by every OTHER single-symbol executor (excludes
    *  `self` — an instance's own admission is already bounded by its own maxOpenPositions, and
-   *  double-counting itself would make the cap tighter than intended). */
+   *  double-counting itself would make the cap tighter than intended).
+   *  2026-07-19 real-money audit fix: now ALSO includes every open cross-sectional basket leg on
+   *  the symbol (all 3 of MARKET_NEUTRAL/TREND/MIXED — never `self`, they're never a
+   *  SingleSymbolLaneExecutor) — before this, a single-symbol lane's own admission gate had zero
+   *  visibility into what the cross-sectional baskets already held on the same symbol. See
+   *  live-executor-wiring.ts's computeNotionalPerSymbol doc comment. */
   const notionalForSymbolExcluding = (self: SingleSymbolLaneExecutor | null, symbol: string): number =>
-    computeNotionalPerSymbol(allSingleSymbolLaneExecutors().filter((e) => e !== self)).get(symbol) ?? 0;
+    computeNotionalPerSymbol(allSingleSymbolLaneExecutors().filter((e) => e !== self), allCrossSectionalLaneExecutors()).get(symbol) ?? 0;
+  /** Mirror of notionalForSymbolExcluding for the cross-sectional side: notional already committed
+   *  to `symbol` by every OTHER cross-sectional executor instance (excludes `self`) PLUS every
+   *  single-symbol lane executor. 2026-07-19 real-money audit fix: closes the gap where
+   *  CROSS_SECTIONAL_MARKET_NEUTRAL/TREND/MIXED had zero visibility into the 9 single-symbol lanes'
+   *  (or each other's) same-symbol exposure despite sharing ONE netted Binance account —
+   *  MARKET_NEUTRAL's own long/short allowlists include ETHUSDT/SOLUSDT, 2 of the exact 3 symbols
+   *  RC/CE-WIDE_LONG/CE-FAST_LONG trade real money on today. */
+  const crossSectionalNotionalForSymbolExcluding = (self: CrossSectionalExecutor | null, symbol: string): number =>
+    computeNotionalPerSymbol(allSingleSymbolLaneExecutors(), allCrossSectionalLaneExecutors().filter((e) => e !== self)).get(symbol) ?? 0;
 
   const coreScanAutoRefreshController = await registerScanRoute(app, scanService, tracker, outcomeChecker, shadowEngine, {
     binanceClient,
@@ -949,6 +963,12 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           (crossSectionalTrendExecutor?.getDailyRealizedUsd(nowIso) ?? 0) +
           (crossSectionalMixedExecutor?.getDailyRealizedUsd(nowIso) ?? 0),
         sharedGetPositions,
+        // 2026-07-19 real-money audit fix: see CrossSectionalExecutorOptions.existingNotionalForSymbol
+        // and live-executor-wiring.ts's computeNotionalPerSymbol doc comment — closes the gap where
+        // this lane's ETHUSDT/SOLUSDT legs had zero visibility into the 9 single-symbol lanes'
+        // (RC/CE-WIDE_LONG/CE-FAST_LONG included) already-open same-symbol exposure.
+        existingNotionalForSymbol: (symbol) => crossSectionalNotionalForSymbolExcluding(crossSectionalExecutor, symbol),
+        maxNotionalPerSymbolAcrossLanes,
       });
       if (!isTest) {
         const execTick = () => void crossSectionalExecutor?.tick();
@@ -990,6 +1010,9 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           (crossSectionalExecutor?.getDailyRealizedUsd(nowIso) ?? 0) +
           (crossSectionalMixedExecutor?.getDailyRealizedUsd(nowIso) ?? 0),
         sharedGetPositions,
+        // Same 2026-07-19 real-money audit fix as the foundation instance above.
+        existingNotionalForSymbol: (symbol) => crossSectionalNotionalForSymbolExcluding(crossSectionalTrendExecutor, symbol),
+        maxNotionalPerSymbolAcrossLanes,
       });
       crossSectionalMixedExecutor = new CrossSectionalExecutor({
         client: liveClient,
@@ -1010,6 +1033,9 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           (crossSectionalExecutor?.getDailyRealizedUsd(nowIso) ?? 0) +
           (crossSectionalTrendExecutor?.getDailyRealizedUsd(nowIso) ?? 0),
         sharedGetPositions,
+        // Same 2026-07-19 real-money audit fix as the foundation instance above.
+        existingNotionalForSymbol: (symbol) => crossSectionalNotionalForSymbolExcluding(crossSectionalMixedExecutor, symbol),
+        maxNotionalPerSymbolAcrossLanes,
       });
       if (!isTest) {
         // Staggered start/interval offsets vs. the FILTERED tick above — purely to avoid dispatching

@@ -277,6 +277,27 @@ export interface CrossSectionalExecutorOptions {
    *  short-TTL shared cache across all 3 instances; defaults to the direct client call (existing
    *  single-instance behavior/tests unchanged). */
   sharedGetPositions?: () => ReturnType<CrossSectionalExecClient["getPositions"]>;
+  /** 2026-07-19 real-money audit fix: notional (USD) already committed to a symbol by every
+   *  OTHER executor sharing this netted Binance account — the 9 SingleSymbolLaneExecutor
+   *  instances AND the 2 sibling CrossSectionalExecutor instances (never `self`; app.ts wires
+   *  this the same way notionalForSymbolExcluding does for the single-symbol side — see
+   *  live-executor-wiring.ts's computeNotionalPerSymbol doc comment). Before this option existed,
+   *  a cross-sectional basket leg had ZERO visibility into what the single-symbol lanes (or its
+   *  own siblings) already held on the same symbol, so a leg could stack arbitrarily on top of an
+   *  already-capped single-symbol position. Defaults to `() => 0` (no other executor's exposure
+   *  known / not wired) — existing single-instance construction and tests are unaffected. Paired
+   *  with `maxNotionalPerSymbolAcrossLanes` below. */
+  existingNotionalForSymbol?: (symbol: string) => number;
+  /** 0 (default) = no cap, byte-identical to pre-2026-07-19 behavior. A fresh leg whose notional,
+   *  ADDED to existingNotionalForSymbol's reading for that symbol PLUS this instance's own
+   *  already-open basket legs on it, would exceed this is skipped — but per this executor's own
+   *  hedge-integrity design constraint (see the module doc comment at the top of this file: "Either
+   *  the WHOLE basket opens or nothing"), a capped leg skips the ENTIRE basket this tick, exactly
+   *  like the existing missing-filters/un-sizeable-leg checks in maybeOpenBasket. This constraint is
+   *  TRANSIENT (another lane's position on the symbol may close by the next tick, freeing capacity)
+   *  — the watermark is already advanced before this check runs, so the signal is not retried, but
+   *  the NEXT fresh signal on the same symbol gets a clean re-evaluation. */
+  maxNotionalPerSymbolAcrossLanes?: () => number;
 }
 
 export class CrossSectionalExecutor {
@@ -297,6 +318,8 @@ export class CrossSectionalExecutor {
   private readonly siblingOpenLegs: () => Array<{ symbol: string; side: "LONG" | "SHORT"; qty: number }>;
   private readonly siblingDailyRealizedUsd: (nowIso: string) => number;
   private readonly sharedGetPositions: () => ReturnType<CrossSectionalExecClient["getPositions"]>;
+  private readonly existingNotionalForSymbolFn: (symbol: string) => number;
+  private readonly maxNotionalPerSymbolAcrossLanesFn: () => number;
 
   constructor(opts: CrossSectionalExecutorOptions) {
     this.client = opts.client;
@@ -308,6 +331,8 @@ export class CrossSectionalExecutor {
     this.laneId = opts.laneId ?? CROSS_SECTIONAL_MARKET_NEUTRAL_LANE_ID;
     this.nowIso = opts.nowIso ?? (() => new Date().toISOString());
     this.fillConfirmRetryDelayMs = opts.fillConfirmRetryDelayMs ?? 400;
+    this.existingNotionalForSymbolFn = opts.existingNotionalForSymbol ?? (() => 0);
+    this.maxNotionalPerSymbolAcrossLanesFn = opts.maxNotionalPerSymbolAcrossLanes ?? (() => 0);
     this.dailyMaxLossUsdFn = opts.dailyMaxLossUsd ?? XSEC_DAILY_MAX_LOSS_USD;
     this.entryHealthGate = opts.entryHealthGate ?? (() => ({ allowed: true, reason: null }));
     this.siblingOpenLegs = opts.siblingOpenLegs ?? (() => []);
@@ -326,6 +351,22 @@ export class CrossSectionalExecutor {
       }
     }
     return out;
+  }
+
+  /** 2026-07-19 real-money audit fix: this instance's OWN open (un-exited) basket legs' notional
+   *  on `symbol` — existingNotionalForSymbolFn only ever sums OTHER executor instances (see its own
+   *  doc comment), and MAX_OPEN_BASKETS can exceed 1, so THIS instance alone could hold multiple
+   *  concurrent baskets whose legs overlap on the same symbol, invisible to the cap without this
+   *  (same self-inclusion fix single-symbol-lane-executor.ts already applies for its own kind). */
+  private ownOpenNotionalForSymbol(symbol: string): number {
+    let sum = 0;
+    for (const basket of this.store.getState().baskets) {
+      if (basket.status !== "OPEN") continue;
+      for (const leg of basket.legs) {
+        if (leg.exitOrderId === null && leg.symbol === symbol) sum += leg.qty * leg.entryPrice;
+      }
+    }
+    return sum;
   }
 
   private entryHealth(): { allowed: boolean; reason: string | null } {
@@ -845,6 +886,7 @@ export class CrossSectionalExecutor {
     const filters = await this.client.getExchangeFilters();
     const legUsd = this.effectiveLegUsd();
     if (!(legUsd > 0)) return;
+    const notionalCap = this.maxNotionalPerSymbolAcrossLanesFn();
     const plannedLegs: Array<{ symbol: string; side: "LONG" | "SHORT"; qty: number; refPrice: number }> = [];
     for (const [side, legs] of [["LONG", signal.longLeg], ["SHORT", signal.shortLeg]] as const) {
       for (const leg of legs) {
@@ -853,6 +895,20 @@ export class CrossSectionalExecutor {
         const rawQty = legUsd / leg.entryPrice;
         const qty = Math.floor(rawQty / f.stepSize) * f.stepSize;
         if (!(qty >= f.minQty)) return; // any un-sizeable leg ⇒ skip whole basket (hedge integrity)
+        // 2026-07-19 real-money audit fix: this leg's notional, ADDED to whatever every OTHER
+        // executor sharing this netted account (the 9 single-symbol lanes AND this instance's own
+        // 2 cross-sectional siblings, PLUS this instance's own already-open legs on the symbol)
+        // already holds on this exact symbol, must not exceed the shared per-symbol cap — see
+        // live-executor-wiring.ts's computeNotionalPerSymbol doc comment for the original
+        // single-symbol-only incident this closes. Same skip-WHOLE-basket-this-tick convention as
+        // the filters/minQty checks above (this executor's hedge-integrity design constraint: never
+        // open one side without the other — see the module doc comment at the top of this file).
+        // TRANSIENT, not permanent: the watermark above only advances past THIS signal, so the next
+        // fresh signal gets a clean re-evaluation once the colliding exposure frees up.
+        if (
+          notionalCap > 0 &&
+          this.existingNotionalForSymbolFn(leg.symbol) + this.ownOpenNotionalForSymbol(leg.symbol) + qty * leg.entryPrice > notionalCap
+        ) return;
         plannedLegs.push({ symbol: leg.symbol, side, qty: Number(qty.toFixed(8)), refPrice: leg.entryPrice });
       }
     }

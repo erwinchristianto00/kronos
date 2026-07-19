@@ -119,9 +119,20 @@ export function computeExternalManagedNetQty(
  * imported by this executor class. Caller passes the RESULT of this (excluding the querying
  * instance's own positions — see SingleSymbolLaneExecutorOptions.existingNotionalForSymbol's doc
  * comment) into each executor's admission gate.
+ *
+ * 2026-07-19 real-money audit fix: `crossSectionalExecutors` (optional, defaults to `[]` — every
+ * pre-existing caller that only ever passed the single-symbol array is byte-for-byte unaffected)
+ * folds in the 3 CrossSectionalExecutor instances' (MARKET_NEUTRAL/TREND/MIXED) own open
+ * (un-exited) basket legs on the same symbol. Before this, the 9 single-symbol lanes and the 3
+ * cross-sectional baskets shared ONE netted Binance account with ZERO mutual visibility into each
+ * other's same-symbol exposure — only same-class stacking (single-symbol vs single-symbol) was
+ * capped. CROSS_SECTIONAL_MARKET_NEUTRAL's own long/short allowlists include ETHUSDT/SOLUSDT,
+ * exactly 2 of the 3 symbols the real-money-active RC/CE-WIDE_LONG/CE-FAST_LONG lanes trade — a
+ * basket leg opening alongside those lanes' existing exposure was invisible to this cap until now.
  */
 export function computeNotionalPerSymbol(
   singleSymbolExecutors: ReadonlyArray<SingleSymbolLaneExecutor | null>,
+  crossSectionalExecutors: ReadonlyArray<CrossSectionalExecutor | null> = [],
 ): Map<string, number> {
   const notional = new Map<string, number>();
   for (const exec of singleSymbolExecutors) {
@@ -129,6 +140,15 @@ export function computeNotionalPerSymbol(
     for (const pos of exec.getStatus().openPositions) {
       if (pos.exitOrderId !== null) continue;
       notional.set(pos.symbol, (notional.get(pos.symbol) ?? 0) + Math.abs(pos.qty * pos.entryPrice));
+    }
+  }
+  for (const exec of crossSectionalExecutors) {
+    if (!exec) continue;
+    for (const basket of exec.getStatus().openBaskets) {
+      for (const leg of basket.legs) {
+        if (leg.exitOrderId !== null) continue;
+        notional.set(leg.symbol, (notional.get(leg.symbol) ?? 0) + Math.abs(leg.qty * leg.entryPrice));
+      }
     }
   }
   return notional;

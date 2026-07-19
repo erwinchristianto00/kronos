@@ -151,7 +151,7 @@ class FakeExecClient implements CrossSectionalExecClient {
   }
 }
 
-function makeExecutor(opts: { client?: FakeExecClient; allowed?: boolean; laneWeightPct?: number; laneId?: string; signalMs?: number; dailyMaxLossUsd?: number; entryHealthAllowed?: boolean; siblingOpenLegs?: () => Array<{ symbol: string; side: "LONG" | "SHORT"; qty: number }> } = {}) {
+function makeExecutor(opts: { client?: FakeExecClient; allowed?: boolean; laneWeightPct?: number; laneId?: string; signalMs?: number; dailyMaxLossUsd?: number; entryHealthAllowed?: boolean; siblingOpenLegs?: () => Array<{ symbol: string; side: "LONG" | "SHORT"; qty: number }>; existingNotionalForSymbol?: (symbol: string) => number; maxNotionalPerSymbolAcrossLanes?: number } = {}) {
   const client = opts.client ?? new FakeExecClient();
   const signalStore = new CrossSectionalStore(tmpDir());
   const storeDir = tmpDir();
@@ -174,6 +174,10 @@ function makeExecutor(opts: { client?: FakeExecClient; allowed?: boolean; laneWe
       ? { entryHealthGate: () => ({ allowed: opts.entryHealthAllowed!, reason: opts.entryHealthAllowed ? null : "rolling edge negative" }) }
       : {}),
     ...(opts.siblingOpenLegs !== undefined ? { siblingOpenLegs: opts.siblingOpenLegs } : {}),
+    ...(opts.existingNotionalForSymbol !== undefined ? { existingNotionalForSymbol: opts.existingNotionalForSymbol } : {}),
+    ...(opts.maxNotionalPerSymbolAcrossLanes !== undefined
+      ? { maxNotionalPerSymbolAcrossLanes: () => opts.maxNotionalPerSymbolAcrossLanes! }
+      : {}),
   });
   return { executor, client, signalStore, store, storeDir };
 }
@@ -454,6 +458,65 @@ describe("cross-sectional executor (basket execution, testnet-first)", () => {
     } finally {
       delete process.env.CROSS_SECTIONAL_EXEC_TP_NET_RETURN;
     }
+  });
+});
+
+describe("[2026-07-19 real-money audit fix] cross-lane per-symbol notional cap (single-symbol <-> cross-sectional)", () => {
+  it("BLOCKS the whole basket this tick when a single-symbol lane already holds notional near the cap on one of the basket's legs' symbols", async () => {
+    // Default legUsd=25/leg: SOLUSDT leg = 0.25 * 100 = $25. A single-symbol lane already holding
+    // $230 on SOLUSDT would push combined exposure to $255 > $250 cap.
+    const { executor, store } = makeExecutor({
+      signalMs: NOW_MS - 5 * 60_000,
+      existingNotionalForSymbol: (symbol) => (symbol === "SOLUSDT" ? 230 : 0),
+      maxNotionalPerSymbolAcrossLanes: 250,
+    });
+    await executor.tick();
+    // Hedge-integrity design constraint (see module doc comment): the basket does not open AT ALL
+    // this tick — neither the capped SOLUSDT leg nor its DOGEUSDT hedge partner — rather than
+    // silently proceeding with excess same-symbol exposure on SOLUSDT.
+    expect(store.getState().baskets.length).toBe(0);
+  });
+
+  it("opens the FULL basket, byte-identical to pre-fix behavior, when there is zero competing exposure on either leg's symbol", async () => {
+    const { executor, store } = makeExecutor({
+      signalMs: NOW_MS - 5 * 60_000,
+      existingNotionalForSymbol: () => 0, // no other lane/basket holds anything on either symbol
+      maxNotionalPerSymbolAcrossLanes: 250, // cap is live and enforced, just not breached
+    });
+    await executor.tick();
+    const basket = store.getState().baskets[0]!;
+    expect(basket.status).toBe("OPEN");
+    expect(basket.legs.length).toBe(2);
+    const sol = basket.legs.find((l) => l.symbol === "SOLUSDT")!;
+    const doge = basket.legs.find((l) => l.symbol === "DOGEUSDT")!;
+    expect(sol.side).toBe("LONG");
+    expect(sol.qty).toBeCloseTo(0.25, 9);
+    expect(doge.side).toBe("SHORT");
+    expect(doge.qty).toBeCloseTo(250, 9);
+  });
+
+  it("with no cap wired at all (default 0, matching every pre-existing test/call site in this file), behaves exactly as before regardless of existingNotionalForSymbol", async () => {
+    const { executor, store } = makeExecutor({
+      signalMs: NOW_MS - 5 * 60_000,
+      existingNotionalForSymbol: () => 999_999, // huge — must NOT matter, cap is 0/off
+    });
+    await executor.tick();
+    expect(store.getState().baskets.length).toBe(1);
+  });
+
+  it("[TRANSIENT] a cap-blocked signal's watermark still advances (existing convention for un-sizeable legs) — the NEXT fresh signal is evaluated on its own merits once exposure frees up", async () => {
+    let otherLaneNotional = 230; // starts near-capped on SOLUSDT
+    const { executor, store, signalStore } = makeExecutor({
+      signalMs: NOW_MS - 5 * 60_000,
+      existingNotionalForSymbol: (symbol) => (symbol === "SOLUSDT" ? otherLaneNotional : 0),
+      maxNotionalPerSymbolAcrossLanes: 250,
+    });
+    await executor.tick(); // blocked: 230 + 25 > 250
+    expect(store.getState().baskets.length).toBe(0);
+    otherLaneNotional = 0; // the other lane's SOLUSDT position closed
+    signalStore.add(signalObs(NOW_MS - 4 * 60_000)); // a fresh hourly signal, newer than the first
+    await executor.tick();
+    expect(store.getState().baskets.length).toBe(1); // opens now that the symbol is no longer crowded
   });
 });
 
