@@ -101,9 +101,15 @@ export function reconstructSymbol(symbol: string, candles: Candle[]): Reconstruc
   const atrPct = atr14.map((a, i) => (finite(a) && closes[i]! > 0 ? a / closes[i]! : null));
   const atrPctile = computeATRPercentile(atrPct, GAP_LOOKBACK_BARS); // 7d rolling percentile (causal)
 
+  // Running max of every antecedent candle's OWN closeTime (indices [0..i]), tracked incrementally as the loop
+  // advances. Seed it over the pre-WARMUP prefix the main loop never visits.
+  let maxCloseTimeSoFar = -Infinity;
+  for (let k = 0; k < WARMUP && k < candles.length; k += 1) maxCloseTimeSoFar = Math.max(maxCloseTimeSoFar, candles[k]!.closeTime);
+
   for (let i = WARMUP; i < candles.length; i += 1) {
     candidateTimestamps += 1;
     const c = candles[i]!;
+    maxCloseTimeSoFar = Math.max(maxCloseTimeSoFar, c.closeTime);
     const decisionAtMs = c.closeTime + 1; // decision made JUST after the bar closes (no early high/low)
     if (!candleAvailableAt(c.openTime, HOUR, decisionAtMs)) { leakGuardHits += 1; continue; } // CAUSALITY GUARD
 
@@ -114,7 +120,13 @@ export function reconstructSymbol(symbol: string, candles: Candle[]): Reconstruc
     const asOf = c.closeTime;
     const dataGap = hasDataGapInLookback(candles, i, GAP_LOOKBACK_BARS);
 
-    const audit = buildSnapshotAudit(decisionAtMs, [{ name: "btc1h", ts: c.closeTime }], () => 6 * HOUR);
+    // INDEPENDENT re-check (defense-in-depth, not a substitute for the leak-guard above): the leak-guard only
+    // inspects THIS bar's own openTime; it cannot notice a future/out-of-order bar smuggled EARLIER in the array
+    // that the EMA/ATR/percentile computations (which iterate candles[0..i] assuming ascending order) would then
+    // silently ingest. `maxCloseTimeSoFar` is derived from a DIFFERENT signal — the running max closeTime over
+    // every antecedent candle, not this bar's openTime+HOUR arithmetic — so a mis-sorted/duplicated input would
+    // make maxCloseTimeSoFar > decisionAtMs and flip this to false even though the leak-guard above passed.
+    const audit = buildSnapshotAudit(decisionAtMs, [{ name: "closedPrefixMaxCloseTime", ts: maxCloseTimeSoFar }], () => 6 * HOUR);
     const causal = isCausal(audit);
 
     const ms = decideMarketState({
