@@ -33,4 +33,31 @@ describe("cortex collection status", () => {
     const report = buildCortexCollectionStatus({ env: { PORT: "3103", CAUSAL_EXPERIENCE_COLLECTION_MODE: "shadow" } });
     expect(report.collection).toMatchObject({ mode: "off", instanceId: "3103", status: "live-3103-blocked" });
   });
+
+  it("caches the journal read for a short TTL instead of re-parsing on every call (2026-07-19 OOM-shaped fix)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "cortex-status-cache-")); dirs.push(dir);
+    const causalDir = join(dir, "causal-experience", "3101"); mkdirSync(causalDir, { recursive: true });
+    const journalPath = join(causalDir, "events.jsonl");
+    const env = { PORT: "3101", CAUSAL_EXPERIENCE_COLLECTION_MODE: "shadow", CAUSAL_EXPERIENCE_COLLECTION_DIR: dir };
+
+    writeFileSync(journalPath, [JSON.stringify({ eventType: "OPPORTUNITY_OPEN", openedAtMs: 1_000 })].join("\n"));
+    const first = buildCortexCollectionStatus({ dataDir: dir, env, nowMs: 10_000 });
+    expect(first.lineage.totalEvents).toBe(1);
+
+    // Journal grows in place, simulating live collection continuing to append while an operator tab
+    // polls every 10s. A poll well within the TTL window must reuse the cached parse, not re-read the
+    // now-larger file.
+    writeFileSync(journalPath, [
+      JSON.stringify({ eventType: "OPPORTUNITY_OPEN", openedAtMs: 1_000 }),
+      JSON.stringify({ eventType: "OPPORTUNITY_OPEN", openedAtMs: 1_100 }),
+      JSON.stringify({ eventType: "OPPORTUNITY_OPEN", openedAtMs: 1_200 }),
+    ].join("\n"));
+    const withinTtl = buildCortexCollectionStatus({ dataDir: dir, env, nowMs: 11_000 }); // +1s: well under the TTL
+    expect(withinTtl.lineage.totalEvents).toBe(1);
+
+    // Once the TTL has elapsed, a subsequent poll must observe the fresh file content again — the
+    // cache must never survive past its window and leave the dashboard permanently stale.
+    const afterTtl = buildCortexCollectionStatus({ dataDir: dir, env, nowMs: 20_000 }); // +10s from the first read
+    expect(afterTtl.lineage.totalEvents).toBe(3);
+  });
 });

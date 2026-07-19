@@ -43,6 +43,31 @@ function readJsonl(path: string | null): { rows: JsonRecord[]; badLines: number 
   }
 }
 
+// TTL-cached journal read (2026-07-19 OOM-shaped fix, same class as the binance.ts leak fixed the
+// same day). apps/web/src/CortexCollectionStatusCard.tsx polls buildCortexCollectionStatus every 10s
+// via a browser interval for as long as any operator tab is open, on all 3 instances, and the
+// causal-experience journal it reads has been growing unrotated since ~2026-07-13. Without this
+// cache every single poll did a full readFileSync + line-by-line JSON.parse of an ever-larger file,
+// blocking the single-threaded event loop for longer and longer as the journal grows. A short TTL
+// (comfortably under the 10s poll interval) collapses repeated polls within the window to one real
+// read+parse, mirroring the neural-map TTL-cache pattern in routes/shadow.ts. Unlike that endpoint,
+// this function is fully synchronous (no await points), so there is no way for concurrent callers to
+// interleave mid-read the way async work can pile up in-flight — the TTL cache alone is sufficient
+// here; there is no separate in-flight-promise case to dedupe.
+const JOURNAL_READ_CACHE_TTL_MS = 5_000;
+const journalReadCache = new Map<string, { atMs: number; rows: JsonRecord[]; badLines: number }>();
+
+function readJsonlCached(path: string | null, nowMs: number): { rows: JsonRecord[]; badLines: number } {
+  if (!path) return { rows: [], badLines: 0 };
+  const cached = journalReadCache.get(path);
+  if (cached && nowMs - cached.atMs < JOURNAL_READ_CACHE_TTL_MS) {
+    return { rows: cached.rows, badLines: cached.badLines };
+  }
+  const fresh = readJsonl(path);
+  journalReadCache.set(path, { atMs: nowMs, rows: fresh.rows, badLines: fresh.badLines });
+  return fresh;
+}
+
 function readJson(path: string): JsonRecord | null {
   if (!existsSync(path)) return null;
   try {
@@ -104,8 +129,9 @@ export function buildCortexCollectionStatus(options: {
 } = {}) {
   const env = options.env ?? process.env;
   const dataDir = options.dataDir ?? env.CAUSAL_EXPERIENCE_COLLECTION_DIR ?? "data";
+  const nowMs = options.nowMs ?? Date.now();
   const activation = resolveCollectionStatus(env, dataDir);
-  const lineage = readJsonl(activation.journalPath);
+  const lineage = readJsonlCached(activation.journalPath, nowMs);
 
   let decisionSnapshots = 0;
   let opportunitiesOpened = 0;
@@ -188,7 +214,6 @@ export function buildCortexCollectionStatus(options: {
   }));
   const latestRefit = getLatestCortexRefitReport();
   const latestDecision = readCortexJournalTail(dataDir, 1).at(-1) ?? null;
-  const nowMs = options.nowMs ?? Date.now();
 
   return {
     reportOnly: true,
