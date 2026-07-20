@@ -180,7 +180,9 @@ export function buildSingleSymbolPriceTimelineState(
   const trend = clamp(0.42 * emaScore(h1) + 0.25 * h1Macd + 0.18 * rsiScore(h1.rsi14) + 0.15 * h1Momentum, -1, 1);
   const score = clamp(0.62 * trend + 0.38 * tactical, -1, 1);
   const directionalAgreement = Math.sign(trend) === Math.sign(tactical) && Math.abs(trend) >= 0.15 && Math.abs(tactical) >= 0.15;
-  const volumeConfirm = (m5.volumeRatio ?? 1) >= 0.85;
+  // A null baseline (bad/insufficient feed data) must never read as "confirmed" — that would let a
+  // missing signal grant the same gate pass/confidence bonus as a genuinely-average volume reading.
+  const volumeConfirm = m5.volumeRatio !== null && m5.volumeRatio >= 0.85;
   const confidence = clamp(0.42 + Math.abs(score) * 0.36 + (directionalAgreement ? 0.16 : 0) + (volumeConfirm ? 0.06 : 0), 0, 0.95);
   const lowerBandTouch = m5.latestClose <= m5.bollingerBands20.lower * 1.004;
   const upperBandTouch = m5.latestClose >= m5.bollingerBands20.upper * 0.996;
