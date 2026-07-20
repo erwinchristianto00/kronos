@@ -386,3 +386,32 @@ describe("snapshot lookback covers a long-held lane's entry decision (BUG 1 fix)
     expect(rec.attributionStatus).not.toBe("ATTRIBUTED");
   });
 });
+
+// ═══════════════════════════════ 7. WRITER-LOCK FAILURE RETRY (BUG 3) ═══════════════════════════════
+describe("writer-lock failure is retried after a cooldown, not cached forever (BUG 3 fix)", () => {
+  it("a transient failure at first use is retried once WRITER_LOCK_RETRY_COOLDOWN_MS has passed and the condition clears", () => {
+    const dir = tmp();
+    mkdirSync(join(dir, "lane-context"), { recursive: true });
+    const instDir = join(dir, "lane-context", "3102");
+    writeFileSync(instDir, "blocking-file"); // a FILE where the instance dir should be ⇒ cleanupStaleTemp's readdirSync throws ENOTDIR
+    const orders = [closedOrder()];
+
+    const first = runLaneResolutionScan(orders, 1_000, shadowEnv(dir));
+    expect(first.ran).toBe(false);
+    expect(first.reason).toBe("writer-lock-unavailable");
+
+    // the underlying condition clears...
+    rmSync(instDir, { force: true });
+
+    // ...but still within the cooldown ⇒ NOT yet retried (old code would ALSO still be false here, so this alone
+    // doesn't distinguish the fix — the THIRD call below is the one that does).
+    const second = runLaneResolutionScan(orders, 1_000 + 60_000, shadowEnv(dir));
+    expect(second.ran).toBe(false);
+    expect(second.reason).toBe("writer-lock-unavailable");
+
+    // past the cooldown ⇒ RETRIES and succeeds now that the dir can actually be created. Old code cached the
+    // first failure for the rest of the process's life and would return false here forever.
+    const third = runLaneResolutionScan(orders, 1_000 + 6 * 60_000, shadowEnv(dir));
+    expect(third.ran).toBe(true);
+  });
+});

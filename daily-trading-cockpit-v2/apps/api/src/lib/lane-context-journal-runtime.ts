@@ -34,8 +34,13 @@ interface RuntimeScanMetrics extends ScanMetrics {
 export const scanMetrics: RuntimeScanMetrics = { ...emptyScanMetrics(), snapshotTailInsufficient: 0 };
 export const snapshotMetrics = { ticks: 0, lanes: 0, duplicateBatches: 0, journalErrors: 0, writeLatencyMsTotal: 0 };
 export const lifecycleMetrics = { events: 0, byEvent: {} as Record<string, number>, journalErrors: 0 };
-let writerLockChecked = false;
 let writerLockOk = false;
+// null ⇒ never failed (either never checked yet, or the last check succeeded). A genuine acquisition is cached
+// forever (no re-check needed); only a FAILURE is retried, after this cooldown, so a transient boot-time fault
+// (data dir not yet mounted, momentary permission error) doesn't permanently disable journaling for the process's
+// entire uptime once the underlying condition clears.
+let writerLockLastFailedAtMs: number | null = null;
+const WRITER_LOCK_RETRY_COOLDOWN_MS = 5 * 60_000;
 
 /** True when the lane-context journal is armed for this instance (shadow mode + 3101/3102) — used to gate the
  * snapshot ticker's registration. `journalLaneSnapshots` re-checks internally, so this is belt-and-suspenders. */
@@ -45,7 +50,7 @@ export function laneJournalActive(env: NodeJS.ProcessEnv = process.env): boolean
 
 /** Test hook — reset the per-process singletons so integration tests start clean. */
 export function _resetLaneRuntimeForTests(): void {
-  writerLockChecked = false; writerLockOk = false; scanSingleFlight.inFlight = false;
+  writerLockOk = false; writerLockLastFailedAtMs = null; scanSingleFlight.inFlight = false;
   Object.assign(scanMetrics, emptyScanMetrics(), { snapshotTailInsufficient: 0 });
   Object.assign(snapshotMetrics, { ticks: 0, lanes: 0, duplicateBatches: 0, journalErrors: 0, writeLatencyMsTotal: 0 });
   Object.assign(lifecycleMetrics, { events: 0, byEvent: {}, journalErrors: 0 });
@@ -72,10 +77,11 @@ function toClosedOutcome(o: PaperOrderLike): ClosedOutcomeInput {
 }
 
 function ensureWriterLock(dir: string, instanceId: string, nowMs: number): boolean {
-  if (writerLockChecked) return writerLockOk;
-  writerLockChecked = true;
+  if (writerLockOk) return true; // genuinely acquired ⇒ never needs re-checking
+  if (writerLockLastFailedAtMs != null && nowMs - writerLockLastFailedAtMs < WRITER_LOCK_RETRY_COOLDOWN_MS) return false;
   try { prod.fs.ensureDir(dir); prod.cleanupStaleTemp(dir); writerLockOk = prod.acquireWriterLock(dir, instanceId, nowMs).acquired; }
   catch { writerLockOk = false; }
+  writerLockLastFailedAtMs = writerLockOk ? null : nowMs;
   return writerLockOk;
 }
 
