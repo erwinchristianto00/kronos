@@ -25,6 +25,8 @@ import {
   CrossSectionalExecutor,
   CrossSectionalExecutorStore,
   isCrossSectionalExecEnabled,
+  isCrossSectionalAllocationIndependent,
+  crossSectionalMarketNeutralIsAllowed,
 } from "./lib/cross-sectional-executor.js";
 import { buildCrossSectionalReport, getCrossSectionalStore } from "./lib/cross-sectional-edge.js";
 import {
@@ -1065,15 +1067,23 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         client: liveClient,
         signalStore: getCrossSectionalStore(),
         store: new CrossSectionalExecutorStore(),
-        // 2026-07-20 real-money audit fix: this basket is marketed/sized as allocation-independent
-        // (isCrossSectionalAllocationIndependent) and has no single-symbol directional bias of its
-        // own — canOpenNewEntries() must NOT be used here, since it delegates to the operator's
-        // manual-directional LONG/SHORT gate (an unrelated subsystem) once manual mode is on.
-        isAllowed: () => unifiedOrchestrator?.isEnabled()
-          ? (engineForGate?.canOpenNewEntriesIgnoringManualDirectional() ?? false) &&
-            unifiedOrchestrator.allowsCrossSectionalLane(CROSS_SECTIONAL_MARKET_NEUTRAL_LANE_ID)
-          : (engineForGate?.canOpenNewEntriesIgnoringManualDirectional() ?? false) &&
-            (engineForGate?.laneSelectionAllowsLane(CROSS_SECTIONAL_MARKET_NEUTRAL_LANE_ID) ?? false),
+        // 2026-07-20 real-money audit fix (round 2): the first pass only swapped canOpenNewEntries()
+        // for the manual-directional-blind variant, but every isAllowed() branch still ANDed
+        // laneSelectionAllowsLane()/allowsCrossSectionalLane() — both of which ALSO route through
+        // effectiveLaneAllocations()'s manual-directional substitution once manual mode is on, so a
+        // basket that (by design) is never listed in either LONG/SHORT array stayed blocked exactly
+        // as before. When isCrossSectionalAllocationIndependent() is on, admission must mirror the
+        // sizing exemption above and skip the lane-selector check ENTIRELY (armed/killed/drain only,
+        // via canOpenNewEntriesIgnoringManualDirectional()) — otherwise fall back to the original,
+        // fully-coupled behavior so disabling the flag really does disable independence, not just sizing.
+        isAllowed: () => crossSectionalMarketNeutralIsAllowed({
+          allocationIndependent: isCrossSectionalAllocationIndependent(),
+          canOpenIgnoringManualDirectional: () => engineForGate?.canOpenNewEntriesIgnoringManualDirectional() ?? false,
+          canOpenNewEntries: () => engineForGate?.canOpenNewEntries() ?? false,
+          unifiedOrchestratorEnabled: unifiedOrchestrator?.isEnabled() ?? false,
+          allowsCrossSectionalLane: () => unifiedOrchestrator?.allowsCrossSectionalLane(CROSS_SECTIONAL_MARKET_NEUTRAL_LANE_ID) ?? false,
+          laneSelectionAllowsLane: () => engineForGate?.laneSelectionAllowsLane(CROSS_SECTIONAL_MARKET_NEUTRAL_LANE_ID) ?? false,
+        }),
         laneWeightPct: () => engineForGate?.laneSelectionWeightPctForLane(CROSS_SECTIONAL_MARKET_NEUTRAL_LANE_ID) ?? 0,
         entryHealthGate: () => {
           const report = buildCrossSectionalReport(getCrossSectionalStore(), Date.now(), { variant: "FILTERED" });

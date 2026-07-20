@@ -13,6 +13,7 @@ import {
   CrossSectionalExecutor,
   CrossSectionalExecutorStore,
   CROSS_SECTIONAL_TREND_LANE_ID,
+  crossSectionalMarketNeutralIsAllowed,
   type CrossSectionalExecClient,
   type ExecutorBasket,
 } from "../src/lib/cross-sectional-executor.js";
@@ -1278,5 +1279,84 @@ describe("[BUG 3] a genuine partial MARKET fill is recorded as what actually exe
     expect(orphans).toHaveLength(1);
     expect(orphans[0]).toMatchObject({ symbol: "SOLUSDT", side: "LONG" });
     expect(orphans[0]!.qty).toBeCloseTo(solQtyOpened * 0.6, 6); // the un-filled remainder, tracked for retry
+  });
+});
+
+// REGRESSION (2026-07-20 real-money audit fix, round 2): the first pass at exempting the
+// allocation-independent basket from the manual-directional gate only swapped canOpenNewEntries()
+// for a manual-directional-blind variant, but every isAllowed() branch still ANDed
+// laneSelectionAllowsLane()/allowsCrossSectionalLane() — both of which ALSO route through
+// effectiveLaneAllocations()'s manual-directional substitution, so a basket that (by design) is
+// never listed in either LONG/SHORT array stayed blocked exactly as before the "fix". Adversarial
+// review caught this by reading the actual gate composition; this proves it via the pure function.
+describe("[2026-07-20 round 2] crossSectionalMarketNeutralIsAllowed genuinely exempts an allocation-independent basket from the lane selector", () => {
+  it("REGRESSION: allocation-independent + armed/killed/drain all clear must open even though the basket is NEVER listed in the manual-directional allocation (the exact bug being fixed)", () => {
+    const allowed = crossSectionalMarketNeutralIsAllowed({
+      allocationIndependent: true,
+      canOpenIgnoringManualDirectional: () => true, // armed, not killed, no drain
+      canOpenNewEntries: () => true,
+      unifiedOrchestratorEnabled: false,
+      allowsCrossSectionalLane: () => false, // irrelevant on this branch
+      laneSelectionAllowsLane: () => false, // basket never listed on either manual-directional side — the bug
+    });
+    expect(allowed).toBe(true);
+  });
+
+  it("still respects armed/killed/drain when allocation-independent (the exemption is NOT unconditional)", () => {
+    const allowed = crossSectionalMarketNeutralIsAllowed({
+      allocationIndependent: true,
+      canOpenIgnoringManualDirectional: () => false, // e.g. killed, drained, or disarmed
+      canOpenNewEntries: () => true,
+      unifiedOrchestratorEnabled: false,
+      allowsCrossSectionalLane: () => true,
+      laneSelectionAllowsLane: () => true,
+    });
+    expect(allowed).toBe(false);
+  });
+
+  it("falls back to the ORIGINAL fully-coupled behavior when allocation-independent is off (unifiedOrchestrator disabled)", () => {
+    const blockedByLaneSelector = crossSectionalMarketNeutralIsAllowed({
+      allocationIndependent: false,
+      canOpenIgnoringManualDirectional: () => true,
+      canOpenNewEntries: () => true,
+      unifiedOrchestratorEnabled: false,
+      allowsCrossSectionalLane: () => true,
+      laneSelectionAllowsLane: () => false, // not listed ⇒ correctly blocked when independence is OFF
+    });
+    expect(blockedByLaneSelector).toBe(false);
+
+    const allowedWhenListed = crossSectionalMarketNeutralIsAllowed({
+      allocationIndependent: false,
+      canOpenIgnoringManualDirectional: () => true,
+      canOpenNewEntries: () => true,
+      unifiedOrchestratorEnabled: false,
+      allowsCrossSectionalLane: () => true,
+      laneSelectionAllowsLane: () => true,
+    });
+    expect(allowedWhenListed).toBe(true);
+  });
+
+  it("falls back to the ORIGINAL fully-coupled behavior when allocation-independent is off (unifiedOrchestrator enabled)", () => {
+    const blockedByOrchestrator = crossSectionalMarketNeutralIsAllowed({
+      allocationIndependent: false,
+      canOpenIgnoringManualDirectional: () => true,
+      canOpenNewEntries: () => true,
+      unifiedOrchestratorEnabled: true,
+      allowsCrossSectionalLane: () => false,
+      laneSelectionAllowsLane: () => true, // irrelevant on this branch
+    });
+    expect(blockedByOrchestrator).toBe(false);
+  });
+
+  it("armed/killed/drain still gates the fallback (non-independent) path via canOpenNewEntries", () => {
+    const blockedWhileKilled = crossSectionalMarketNeutralIsAllowed({
+      allocationIndependent: false,
+      canOpenIgnoringManualDirectional: () => true,
+      canOpenNewEntries: () => false, // killed/disarmed/drained
+      unifiedOrchestratorEnabled: false,
+      allowsCrossSectionalLane: () => true,
+      laneSelectionAllowsLane: () => true,
+    });
+    expect(blockedWhileKilled).toBe(false);
   });
 });

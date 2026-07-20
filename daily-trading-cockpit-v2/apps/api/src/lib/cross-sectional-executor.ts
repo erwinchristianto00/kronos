@@ -57,6 +57,27 @@ export function isCrossSectionalAllocationIndependent(env: NodeJS.ProcessEnv = p
   return env.CROSS_SECTIONAL_ALLOCATION_INDEPENDENT === "1";
 }
 
+/** 2026-07-20 real-money audit fix (round 2): admission must mirror the sizing exemption above.
+ *  A basket marked allocation-independent must not be gated behind the single-symbol lane
+ *  selector at all (regular OR manual-directional flavor) — only armed/killed/drain, via
+ *  `canOpenIgnoringManualDirectional`. Disabling the flag falls all the way back to the original,
+ *  fully-coupled behavior (`canOpenNewEntries` + the lane-selector check) so the flag genuinely
+ *  controls independence, not just sizing. Pure so app.ts's otherwise-untestable wiring closure
+ *  can be covered directly. */
+export function crossSectionalMarketNeutralIsAllowed(deps: {
+  allocationIndependent: boolean;
+  canOpenIgnoringManualDirectional: () => boolean;
+  canOpenNewEntries: () => boolean;
+  unifiedOrchestratorEnabled: boolean;
+  allowsCrossSectionalLane: () => boolean;
+  laneSelectionAllowsLane: () => boolean;
+}): boolean {
+  if (deps.allocationIndependent) return deps.canOpenIgnoringManualDirectional();
+  return deps.unifiedOrchestratorEnabled
+    ? deps.canOpenNewEntries() && deps.allowsCrossSectionalLane()
+    : deps.canOpenNewEntries() && deps.laneSelectionAllowsLane();
+}
+
 const LEG_USD = () => {
   const n = Number.parseFloat(process.env.CROSS_SECTIONAL_EXEC_LEG_USD ?? "");
   return Number.isFinite(n) && n > 0 ? n : 25;
