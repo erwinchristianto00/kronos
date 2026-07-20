@@ -88,7 +88,10 @@ export class DecisionLedger {
     const key = `${base.symbol}|${base.direction}|${base.routeMode ?? ""}|${base.selectedExecutionPlan?.selectedEntryVariant ?? ""}|${base.selectedExecutionPlan?.selectedExitVariant ?? ""}`;
     const now = Date.parse(base.timestamp);
     const previous = this.recentRouteKeys.get(key);
-    if (previous && Number.isFinite(now) && now - previous < this.duplicateWindowMs) {
+    // now >= previous guards against a backward system-clock correction: without it a single
+    // non-monotonic timestamp poisons the dedup cache and misclassifies every later genuine call
+    // for this key as a duplicate until real time catches up past previous+window.
+    if (previous && Number.isFinite(now) && now >= previous && now - previous < this.duplicateWindowMs) {
       this.append({ ...base, event: "ROUTE_DUPLICATE_SUPPRESSED" });
       return { logged: false, duplicate: true };
     }

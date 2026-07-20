@@ -105,9 +105,11 @@ describe("DecisionLedger", () => {
     expect(afterClockJump.duplicate).toBe(false);
     expect(afterClockJump.logged).toBe(true);
 
-    // A further genuine call shortly after the corrected clock must also not be poisoned by the
-    // pre-jump "previous" timestamp.
-    const followUp = ledger.recordRouteAssigned({ ...base, timestamp: "2026-05-11T11:05:00.000Z" });
+    // A further genuine call 90 minutes after the (corrected) backward-jump call — outside the 1h
+    // window from that call, but only 30 minutes after the ORIGINAL pre-jump timestamp. A buggy
+    // implementation that never updated "previous" on the backward-jump call would still compare
+    // against the stale pre-jump timestamp and wrongly flag this as a duplicate.
+    const followUp = ledger.recordRouteAssigned({ ...base, timestamp: "2026-05-11T12:30:00.000Z" });
     expect(followUp.duplicate).toBe(false);
     expect(followUp.logged).toBe(true);
 
