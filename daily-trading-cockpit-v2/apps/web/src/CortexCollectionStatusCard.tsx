@@ -24,11 +24,24 @@ type CortexCollectionStatus = {
   };
 };
 
+type CortexDecisionAlpha = {
+  reportOnly: true;
+  generatedAt: string;
+  examplesConsidered: number;
+  journalBadLines: number;
+  decisionAlpha: {
+    n: number;
+    cumulativeTiltDeltaR: number;
+    meanTiltDeltaR: number | null;
+    perLane: Array<{ laneId: string; n: number; cumulativeTiltDeltaR: number }>;
+  };
+};
+
 const C = { card: '#14222a', border: '#20313a', text: '#dbe7ec', dim: '#7d97a3', good: '#46d39a', bad: '#ff6b6b', measure: '#6fb3d6', accent: '#f0b54b' };
 const INSTANCES = [
-  ['research', 'Collector / research', '/api/shadow/cortex-collection-status'],
-  ['testnet', 'Testnet', '/testnet/api/shadow/cortex-collection-status'],
-  ['live', 'Live mainnet', '/live/api/shadow/cortex-collection-status'],
+  ['research', 'Collector / research', '/api/shadow/cortex-collection-status', '/api/shadow/cortex-decision-alpha'],
+  ['testnet', 'Testnet', '/testnet/api/shadow/cortex-collection-status', '/testnet/api/shadow/cortex-decision-alpha'],
+  ['live', 'Live mainnet', '/live/api/shadow/cortex-collection-status', '/live/api/shadow/cortex-decision-alpha'],
 ] as const;
 
 const ago = (timestamp: string) => {
@@ -41,6 +54,7 @@ const outcomeColor = (value: 'POSITIVE' | 'NON_POSITIVE' | 'EXCLUDED') => value 
 
 export function CortexCollectionStatusCard() {
   const [status, setStatus] = useState<Record<string, CortexCollectionStatus | null>>({});
+  const [alpha, setAlpha] = useState<Record<string, CortexDecisionAlpha | null>>({});
 
   useEffect(() => {
     let cancelled = false;
@@ -54,7 +68,19 @@ export function CortexCollectionStatusCard() {
           return [key, null] as const;
         }
       }));
-      if (!cancelled) setStatus(Object.fromEntries(entries));
+      const alphaEntries = await Promise.all(INSTANCES.map(async ([key, _label, _statusUrl, alphaUrl]) => {
+        try {
+          const response = await fetch(alphaUrl, { cache: 'no-store' });
+          if (!response.ok) return [key, null] as const;
+          return [key, await response.json() as CortexDecisionAlpha] as const;
+        } catch {
+          return [key, null] as const;
+        }
+      }));
+      if (!cancelled) {
+        setStatus(Object.fromEntries(entries));
+        setAlpha(Object.fromEntries(alphaEntries));
+      }
     };
     void load();
     const timer = window.setInterval(() => void load(), 10_000);
@@ -132,6 +158,37 @@ export function CortexCollectionStatusCard() {
                     ))}
                   </div>
                 </div> : null}
+              </details>
+              <details open style={{ marginTop: 11, borderTop: `1px solid ${C.border}`, paddingTop: 9 }}>
+                <summary style={{ cursor: 'pointer', color: C.measure, fontSize: 12, fontWeight: 700 }}>Shadow decision-alpha (#219)</summary>
+                {(() => {
+                  const report = alpha[key];
+                  if (!report) return <div style={{ color: C.dim, fontSize: 11, marginTop: 8 }}>loading or unreachable…</div>;
+                  const da = report.decisionAlpha;
+                  if (da.n === 0) return <div style={{ color: C.dim, fontSize: 11, marginTop: 8 }}>No attributed outcomes yet — nothing to measure.</div>;
+                  const cumColor = da.cumulativeTiltDeltaR > 0 ? C.good : da.cumulativeTiltDeltaR < 0 ? C.bad : C.dim;
+                  return (
+                    <>
+                      <div style={{ color: C.dim, fontSize: 11, lineHeight: 1.45, marginTop: 8 }}>
+                        Would the brain's shadow tilt have added or cost R, realized, over every outcome attributed so far? Read-only counterfactual — never applied to real orders unless separately promoted.
+                      </div>
+                      <div style={{ display: 'flex', gap: 14, flexWrap: 'wrap', fontSize: 12, marginTop: 8 }}>
+                        <span>outcomes <b style={{ color: C.text }}>{da.n}</b></span>
+                        <span>cumulative <b style={{ color: cumColor }}>{fmtR(da.cumulativeTiltDeltaR)}</b></span>
+                        <span>mean/outcome <b style={{ color: C.dim }}>{fmtR(da.meanTiltDeltaR)}</b></span>
+                      </div>
+                      {da.perLane.length ? <div style={{ marginTop: 9, display: 'grid', gap: 4 }}>
+                        {da.perLane.slice(0, 8).map((lane) => (
+                          <div key={lane.laneId} style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) auto auto', gap: 7, fontSize: 11, borderTop: `1px solid ${C.border}`, paddingTop: 4 }}>
+                            <span style={{ color: C.text, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{lane.laneId}</span>
+                            <span style={{ color: C.dim }}>{lane.n}</span>
+                            <span style={{ color: lane.cumulativeTiltDeltaR > 0 ? C.good : lane.cumulativeTiltDeltaR < 0 ? C.bad : C.dim }}>{fmtR(lane.cumulativeTiltDeltaR)}</span>
+                          </div>
+                        ))}
+                      </div> : null}
+                    </>
+                  );
+                })()}
               </details>
             </div>
           );

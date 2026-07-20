@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import './neural-mindmap.css';
+import { CortexCollectionStatusCard } from './CortexCollectionStatusCard';
 
 const REFRESH_MS = 5_000;
 const TESTNET_API_PREFIX = '/testnet/api';
@@ -1684,6 +1685,8 @@ export default function TestnetExchangeDashboard() {
           </button>
         </div>
       </header>
+
+      <CortexCollectionStatusCard />
 
       <section className="neural-statusbar testnet-statusbar">
         <div>
