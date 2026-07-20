@@ -3992,6 +3992,49 @@ describe("manual selector mode toggle", () => {
   });
 });
 
+describe("canOpenNewEntriesIgnoringManualDirectional (2026-07-20 real-money audit fix: the " +
+  "market-neutral basket has no single-symbol directional bias and must not be coupled to the " +
+  "operator's manual-directional LONG/SHORT gate)", () => {
+  it("fails-without: canOpenNewEntries() blocks admission while manual mode holds no fresh " +
+    "directional decision — the routine idle state that exposed the bug", async () => {
+    const { engine } = makeEngine();
+    expect((await engine.arm()).ok).toBe(true);
+    engine.setManualSelectorMode(true);
+    // Operator never listed the market-neutral lane here — reasonable, since it's marketed as
+    // allocation-independent — leaving only an unrelated single-symbol LONG lane.
+    expect(engine.setManualDirectionalLaneAllocations({
+      long: [{ laneId: "CG_WIDE_FAST_LONG", weightPct: 100 }],
+      short: [],
+    }).ok).toBe(true);
+    // No setManualEntryDecision() call: the scanner's directional read is NO_TRADE, same as it is
+    // whenever single-symbol lanes are routinely idle.
+    expect(engine.canOpenNewEntries()).toBe(false);
+  });
+
+  it("pass-with: canOpenNewEntriesIgnoringManualDirectional() stays open in that exact state", async () => {
+    const { engine } = makeEngine();
+    expect((await engine.arm()).ok).toBe(true);
+    engine.setManualSelectorMode(true);
+    expect(engine.setManualDirectionalLaneAllocations({
+      long: [{ laneId: "CG_WIDE_FAST_LONG", weightPct: 100 }],
+      short: [],
+    }).ok).toBe(true);
+    expect(engine.canOpenNewEntries()).toBe(false); // sanity: the directional gate is indeed blocking
+    expect(engine.canOpenNewEntriesIgnoringManualDirectional()).toBe(true); // basket unaffected by it
+  });
+
+  it("still requires armed and respects the kill-switch/drain breakers (unchanged from canOpenNewEntries)", async () => {
+    const { engine } = makeEngine();
+    expect(engine.canOpenNewEntriesIgnoringManualDirectional()).toBe(false); // not armed yet
+    expect((await engine.arm()).ok).toBe(true);
+    expect(engine.canOpenNewEntriesIgnoringManualDirectional()).toBe(true);
+    engine.setNewEntriesPaused(true);
+    expect(engine.canOpenNewEntriesIgnoringManualDirectional()).toBe(false); // operator drain
+    engine.setNewEntriesPaused(false);
+    expect(engine.canOpenNewEntriesIgnoringManualDirectional()).toBe(true);
+  });
+});
+
 describe("symbolPriorityTier (live-mirror candidate priority — no obstruction, only reordering)", () => {
   const LANE_ID = "CG_VARIANT_MATRIX:CG_WIDE_FAST_SHORT";
   const OTHER_LANE_ID = "CG_VARIANT_MATRIX:CG_WIDE_FAST_LONG";

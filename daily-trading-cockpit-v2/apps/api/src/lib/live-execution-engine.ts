@@ -1802,6 +1802,19 @@ export class LiveExecutionEngine {
     return this.strategyEntryGate().allowed;
   }
 
+  /** Same as canOpenNewEntries() but never delegates to the manual-directional bias gate — for
+   *  baskets (e.g. CROSS_SECTIONAL_MARKET_NEUTRAL) whose own signal has no single-symbol
+   *  directional bias to align with, so the manual selector's LONG/SHORT allocation is simply
+   *  irrelevant to them. Manual mode still resolves via strategyEntryGate() below, exactly as
+   *  when manual mode is off — this only removes the mode-specific short-circuit. */
+  canOpenNewEntriesIgnoringManualDirectional(): boolean {
+    const st = this.store.getState();
+    if (!this.armed || st.killedAt) return false;
+    if (this.isNewEntryDrainActive()) return false;
+    if (this.config.mirrorAllPaperOrders) return true;
+    return this.strategyEntryGate().allowed;
+  }
+
   isNewEntryDrainActive(): boolean {
     return this.store.getState().newEntriesPaused === true || process.env.LIVE_NEW_ENTRY_DRAIN === "1";
   }
