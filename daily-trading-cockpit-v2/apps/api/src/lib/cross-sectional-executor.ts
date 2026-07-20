@@ -812,7 +812,16 @@ export class CrossSectionalExecutor {
         // via the SAME orphaned-leg retry mechanism as BUG 1 (this basket stays consistent —
         // exitOrderId is still set, so the basket's own lifecycle isn't blocked — while the
         // residual keeps getting flattened automatically every tick until it too resolves).
-        const executedQty = Number.isFinite(order.executedQty) ? order.executedQty : leg.qty;
+        // 2026-07-19 real-money audit follow-up: mirror the entry-leg guard's `> 0` check exactly
+        // — Binance's synchronous order ACK can come back with avgPrice=0/executedQty=0 even
+        // though the order fully filled moments later (this file's own resolveFillPrice already
+        // documents and works around this for price; executedQty needs the identical treatment).
+        // Without the `> 0` guard, EVERY unconfirmed-at-ACK exit (a routine, frequent occurrence,
+        // not an edge case) would be misread as a 100% shortfall and spuriously orphaned, even
+        // though the leg is genuinely fully closed — and a retry of that bogus orphan could
+        // succeed against a SIBLING executor's real position on the same symbol (the exact
+        // "netting-blind-closes" bug class this codebase already had to fix once, engine-wide).
+        const executedQty = Number.isFinite(order.executedQty) && order.executedQty > 0 ? order.executedQty : leg.qty;
         const shortfall = leg.qty - executedQty;
         if (shortfall > 1e-9) {
           this.recordOrphanedLeg(
@@ -1088,6 +1097,20 @@ export class CrossSectionalExecutor {
           const resolvedFlat = await this.resolveFillPrice(leg.symbol, flat.orderId, flat.avgPrice, leg.entryPrice);
           leg.exitPrice = resolvedFlat.price;
           leg.exitPriceConfirmed = resolvedFlat.confirmed;
+          // 2026-07-19 real-money audit follow-up: same executedQty honoring as closeBasket's exit
+          // path (see BUG 3) — a genuine partial fill on this abort-flatten must not be recorded
+          // as fully closed. Guarded with `> 0` exactly like the other two sites, since an
+          // unconfirmed-at-ACK (avgPrice=0/executedQty=0) but genuinely full fill must fall back
+          // to the requested qty, not be misread as a 100% shortfall.
+          const flatExecutedQty = Number.isFinite(flat.executedQty) && flat.executedQty > 0 ? flat.executedQty : leg.qty;
+          const flatShortfall = leg.qty - flatExecutedQty;
+          if (flatShortfall > 1e-9) {
+            this.recordOrphanedLeg(
+              basket,
+              { ...leg, qty: flatShortfall },
+              new Error(`abort-flatten partial fill: requested ${leg.qty}, executed ${flatExecutedQty} — residual ${flatShortfall} still open`),
+            );
+          }
         } catch (flattenError) {
           // 2026-07-19 real-money audit fix (BUG 1, HIGH — real-money risk): this leg is now a
           // REAL, still-open exchange position (e.g. a sibling XSEC executor already holds the
@@ -1160,6 +1183,28 @@ export class CrossSectionalExecutor {
           reduceOnly: true,
           newClientOrderId: `xsec-orph-${orphan.basketId.slice(-10)}-${orphan.symbol.slice(0, 6)}`,
         });
+        // 2026-07-19 real-money audit follow-up: same executedQty honoring as BUG 3 elsewhere in
+        // this file — a genuine partial fill on a RETRY must not be treated as fully resolved,
+        // or the still-open remainder silently loses tracking a second time. `> 0` guard exactly
+        // like the other two sites (avgPrice=0/executedQty=0 at ACK does not mean zero fill).
+        const orphanExecutedQty =
+          Number.isFinite(order.executedQty) && order.executedQty > 0 ? order.executedQty : orphan.qty;
+        const orphanShortfall = orphan.qty - orphanExecutedQty;
+        if (orphanShortfall > 1e-9) {
+          // Only PARTIALLY resolved — reduce this SAME orphan record's qty to the remainder and
+          // keep retrying it next tick, rather than either dropping it (losing the residual) or
+          // spawning a duplicate record for it.
+          const st2 = this.store.getState();
+          const current = (st2.orphanedLegs ?? []).find((o) => o === orphan);
+          if (current) {
+            current.qty = orphanShortfall;
+            current.lastAttemptAt = this.nowIso();
+            current.attempts += 1;
+            current.lastError = `partial retry fill: requested ${orphan.qty}, executed ${orphanExecutedQty} — residual ${orphanShortfall} still open`;
+            this.store.save();
+          }
+          continue;
+        }
         const resolved = await this.resolveFillPrice(orphan.symbol, order.orderId, order.avgPrice, orphan.entryPrice);
         this.applyOrphanResolution(orphan, order.orderId, resolved.price, resolved.confirmed);
       } catch (error) {

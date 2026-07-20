@@ -601,6 +601,14 @@ describe("fill-price confirmation (honest fills, no silent avgPrice=0 masking)",
     expect(sol.exitPrice).toBeCloseTo(105, 9); // real confirmed fill, not entryPrice(100)
     expect(sol.exitPriceConfirmed).toBe(true);
     expect(basket.grossPnlUsd).toBeGreaterThan(0); // reflects the real +5 move, not a fake flat $0
+    // 2026-07-19 real-money audit follow-up: avgPrice=0 at the synchronous ACK also means
+    // executedQty=0 in the raw order response (both legs closed FULLY, just unconfirmed at ACK
+    // time — confirmed moments later via queryOrder above). FAIL-WITHOUT-FIX: before the `> 0`
+    // guard on executedQty, this exact scenario spuriously recorded BOTH legs as a 100% shortfall
+    // and created bogus orphanedLegs entries for legs that were, in reality, fully and correctly
+    // closed — and a retry of that bogus orphan could go on to eat into a SIBLING executor's real
+    // position on the same symbol.
+    expect(store.getState().orphanedLegs).toHaveLength(0);
   });
 });
 
