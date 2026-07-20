@@ -732,6 +732,32 @@ function cgWideCapacityRejectReason(args: {
   return null;
 }
 
+/**
+ * Minimal open-order stand-in for a CG_WIDE opportunity just admitted within this scan, so the
+ * next candidate's capacity/occupancy checks see it too (see cgWideRunningOrders). Only carries
+ * the fields those checks (and the Mixed occupancy snapshot's forward-gate fallback) actually read.
+ */
+function cgWideRunningOrderStub(opportunity: PaperOpportunity): PaperOrder {
+  return {
+    paperOrderId: `scan-pending:${opportunity.sourceCandidateId}`,
+    sourceObservationId: opportunity.sourceCandidateId,
+    sourceSignalId: opportunity.sourceCandidateId,
+    dedupeKey: `scan-pending:${opportunity.sourceCandidateId}`,
+    createdAt: opportunity.openedAt,
+    updatedAt: opportunity.openedAt,
+    openedAt: opportunity.openedAt,
+    symbol: opportunity.symbol,
+    direction: opportunity.direction,
+    regime: opportunity.regime,
+    controllerMode: opportunity.controllerMode,
+    selectedLaneId: opportunity.laneId,
+    paperOrderMode: opportunity.paperOrderMode,
+    mixedBudgetProfile: opportunity.mixedBudgetProfile,
+    budgetActivationScope: opportunity.budgetActivationScope,
+    paperStatus: "CREATED",
+  } as unknown as PaperOrder;
+}
+
 // Long large-cap-only gate. The 2026-06-21 forward audit decomposed the -$3.3k
 // diagnostic loss: it is ~entirely high-beta-alt LONGs (avgR -0.66R, n=246) — small
 // alts chop/revert and hit stops even in an up market (BTC +1.58% over the window),
@@ -1244,6 +1270,11 @@ export function buildPaperOpportunityAllocatorReport(
   const symbolHistoricalNetMap = inputs.symbolHistoricalNetMap ?? {};
   const activeMixedBudget = getActiveMixedPaperBudgetProfileConfig();
   const currentPaperOrders = inputs.currentPaperOrders ?? [];
+  // currentPaperOrders is a frozen pre-scan snapshot. CG_WIDE admissions earlier in this SAME
+  // scan's candidate loop must also count against the capacity/occupancy checks below, or every
+  // candidate independently sees stale headroom and the scan can jointly overshoot the caps.
+  // Mirrors diagnosticOpenRunning's per-scan accounting further down.
+  const cgWideRunningOrders: PaperOrder[] = [...currentPaperOrders];
   const cgWideBudget = activeMixedBudget.budget;
   const openCgWideOrders = currentPaperOrders.filter((order) => isOpenPaperOrder(order) && isCgWideLaneId(order.selectedLaneId));
   const headlineOpenCount = currentPaperOrders.filter(
@@ -1606,7 +1637,7 @@ export function buildPaperOpportunityAllocatorReport(
       const cgWidePriorityCollection = cgWidePriority && def.id === "CG_WIDE_STOP_TP_WIDE";
       if (!testnetCollectAllLanes && def.id === "CG_WIDE_STOP_TP_WIDE") {
         const cgWideCapacityReason = cgWideCapacityRejectReason({
-          orders: currentPaperOrders,
+          orders: cgWideRunningOrders,
           nowMs,
           symbol,
           direction,
@@ -1984,7 +2015,7 @@ export function buildPaperOpportunityAllocatorReport(
                 volatilityScore: typeof c.volatilityScore === "number" ? c.volatilityScore : null,
                 liquidityScore: typeof c.liquidityScore === "number" ? c.liquidityScore : null,
               }],
-              orders: currentPaperOrders,
+              orders: cgWideRunningOrders,
               nowMs,
               trailLaneAvailable: true,
               occupancyBudget: activeMixedBudget.budget,
@@ -2210,6 +2241,7 @@ export function buildPaperOpportunityAllocatorReport(
             report.diagnosticEligibleCount += 1;
             laneRollup(def.id).eligible += 1;
             symbolRollup(symbol).eligible += 1;
+            cgWideRunningOrders.push(cgWideRunningOrderStub(opportunity));
             continue;
           }
           const reason = verdict.reason ?? "CANDIDATE_REJECTED";
@@ -2250,6 +2282,10 @@ export function buildPaperOpportunityAllocatorReport(
       report.paperEligibleCount += 1;
       if (orderMode === "HEADLINE") report.headlineEligibleCount += 1;
       else report.diagnosticEligibleCount += 1;
+      if (def.id === "CG_WIDE_STOP_TP_WIDE") {
+        // keep the CG_WIDE capacity/occupancy checks accurate within this scan
+        cgWideRunningOrders.push(cgWideRunningOrderStub(opportunity));
+      }
       if (challengerDiagnosticCollection) {
         challengerDiagnosticSelected += 1;
         report.challengerDiagnosticSelected = challengerDiagnosticSelected;

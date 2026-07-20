@@ -915,6 +915,64 @@ describe("paper-opportunity-allocator", () => {
     expect(rejectKeys.some((k) => k === "MIXED_REJECT" || k === "LONG_HIGH_BETA_ALT_NO_EDGE")).toBe(true);
   });
 
+  // [10g] regression: the self-built Mixed occupancy budget (no externally-supplied
+  // mixedRegimeReport) must also account for CG_WIDE admissions made earlier in the SAME scan,
+  // not just the pre-scan currentPaperOrders snapshot. Uses the soft ELEVATED threshold (not the
+  // hard 26-open cap already covered by [P7-3p]) so this exercises the Mixed-only occupancy read
+  // at ~line 2018 in isolation — the hard cap would reject via the (already-fixed) generic
+  // cgWideCapacityRejectReason check first and mask this separate read.
+  it("[10g] Mixed self-built occupancy budget counts this scan's own CG_WIDE admissions", async () => {
+    const dir = tmpDir();
+    const vmReport = await buildWinningVmReport(dir);
+    const now = new Date().toISOString();
+    // 18 existing = one below the ELEVATED_WIDE_OPEN threshold (floor(26*0.75)=19). Split across
+    // directions so per-direction (elevated at 18) stays clear of the SHORT candidates below.
+    const existingWide = Array.from({ length: 18 }, (_, i) => ({
+      paperOrderId: `mixed-existing-${i}`,
+      sourceObservationId: `mixed-existing-${i}`,
+      sourceSignalId: `mixed-existing-${i}`,
+      dedupeKey: `mixed-existing-${i}`,
+      createdAt: now,
+      updatedAt: now,
+      openedAt: now,
+      symbol: `MEXIST${i}USDT`,
+      direction: i < 9 ? "SHORT" : "LONG",
+      regime: "Mixed rotation",
+      selectedLaneId: "CG_VARIANT_MATRIX:CG_WIDE_STOP_TP_WIDE",
+      paperStatus: "PAPER_SUBMITTED",
+      reportOnly: true,
+      paperOnly: true,
+    } as unknown as PaperOrder));
+
+    // 2 fresh SHORT candidates in ONE scan, distinct symbols, no mixedRegimeReport supplied — this
+    // forces the allocator's self-built buildMixedRegimeReport() path (~line 1987-2018).
+    const candidates = ["MELEVATEDAUSDT", "MELEVATEDBUSDT"].map((symbol) =>
+      makeCandidate({ symbol, direction: "SHORT" }),
+    );
+
+    const report = buildPaperOpportunityAllocatorReport(
+      baseInputs({
+        vmReport,
+        marketRegime: "Mixed rotation",
+        routerReport: routerOf("Mixed rotation"),
+        candidates,
+        currentPaperOrders: existingWide,
+      }),
+    );
+
+    const wideAdmitted = report.selectedOpportunities.filter(
+      (o) => o.variantId === "CG_WIDE_STOP_TP_WIDE" && o.direction === "SHORT",
+    );
+    // Both are admitted (ELEVATED only reduces risk, it never blocks) — but the 2nd candidate's
+    // occupancy must reflect the 1st candidate's admission (18 existing + 1 this-scan = 19, at the
+    // elevated threshold), not the frozen pre-scan snapshot (18, never elevated).
+    expect(wideAdmitted.length).toBe(2);
+    expect(wideAdmitted[0]!.occupancyMode).toBe("NORMAL");
+    expect(wideAdmitted[0]!.admissionResult).toBe("ALLOW");
+    expect(wideAdmitted[1]!.occupancyMode).toBe("REDUCED_RISK");
+    expect(wideAdmitted[1]!.admissionResult).toBe("ALLOW_REDUCED");
+  });
+
   // [11]
   it("[11] Bullish LONG_ONLY does not create a SHORT paper order", async () => {
     const dir = tmpDir();
@@ -1773,6 +1831,53 @@ describe("paper-opportunity-allocator", () => {
     expect(lines.some((line) => line.includes("headlineOpen=0 diagnosticCreated=0 diagnosticOpen=26 note=DIAGNOSTIC_OPEN_ONLY"))).toBe(true);
     expect(lines.some((line) => line.includes("cgWideCapacity: open=26/26"))).toBe(true);
     expect(lines.some((line) => line.includes("warningAt=19 pressure=FULL"))).toBe(true);
+  });
+
+  // [P7-3p] regression: cgWideCapacityRejectReason must be checked against a running count that
+  // includes THIS scan's own admissions, not just the pre-scan currentPaperOrders snapshot.
+  it("[P7-3p] CG_WIDE per-scan admissions count against the same scan's capacity cap", async () => {
+    const dir = tmpDir();
+    const vmReport = await buildWinningVmReport(dir);
+    const now = new Date().toISOString();
+    // One below the 26-open cap, split across directions/symbols so only the wide-open cap —
+    // not per-symbol/per-direction — is what the 2nd/3rd candidate below can trip.
+    const existingWide = Array.from({ length: 25 }, (_, i) => ({
+      paperOrderId: `wide-existing-${i}`,
+      sourceObservationId: `wide-existing-${i}`,
+      sourceSignalId: `wide-existing-${i}`,
+      dedupeKey: `wide-existing-${i}`,
+      createdAt: now,
+      updatedAt: now,
+      openedAt: now,
+      symbol: `EXIST${i}USDT`,
+      direction: i < 13 ? "SHORT" : "LONG",
+      selectedLaneId: "CG_VARIANT_MATRIX:CG_WIDE_STOP_TP_WIDE",
+      paperOrderMode: "DIAGNOSTIC_ONLY",
+      paperStatus: "PAPER_SUBMITTED",
+      reportOnly: true,
+      paperOnly: true,
+    } as unknown as PaperOrder));
+
+    // 3 fresh SHORT candidates in ONE scan, each a distinct symbol not already open.
+    const candidates = ["NEWAUSDT", "NEWBUSDT", "NEWCUSDT"].map((symbol) =>
+      makeCandidate({ symbol, direction: "SHORT" }),
+    );
+
+    const report = buildPaperOpportunityAllocatorReport(
+      baseInputs({
+        vmReport,
+        candidates,
+        paperCgWidePriority: true,
+        currentPaperOrders: existingWide,
+      }),
+    );
+
+    const wideAdmitted = report.selectedOpportunities.filter((o) => o.variantId === "CG_WIDE_STOP_TP_WIDE");
+    // 25 existing + this scan's admissions must never exceed the 26-open cap: exactly 1 of the 3
+    // candidates can be admitted, not all 3 just because the frozen pre-scan snapshot (25) was
+    // under cap for each of them independently.
+    expect(wideAdmitted.length).toBe(1);
+    expect(report.topRejects.map((r) => r.key)).toContain("CG_WIDE_MAX_OPEN_REACHED");
   });
 
   // [P7-4]
