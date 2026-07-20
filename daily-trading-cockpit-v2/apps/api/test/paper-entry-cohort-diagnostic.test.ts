@@ -3,16 +3,21 @@ import { mkdtempSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import os from "node:os";
 
+import Fastify from "fastify";
+
 import {
   buildEntryCohortDiagnostic,
   buildEntryCohortDiagnosticBriefLines,
   ENTRY_COHORT_DIMENSIONS,
   PaperExecutionRouterStore,
   buildPaperPerformanceReport,
+  getPaperExecutionRouterStore,
+  _resetPaperExecutionRouterStoreForTests,
   type PaperOrder,
   type PaperOrderStatus,
 } from "../src/lib/paper-execution-router.js";
 import { buildLiveTradingGateReport } from "../src/lib/live-trading-gate.js";
+import { registerShadowRoutes } from "../src/routes/shadow.js";
 
 const HOUR = 3_600_000;
 const tmpDir = () => mkdtempSync(join(os.tmpdir(), "entry-cohort-test-"));
@@ -199,5 +204,28 @@ describe("entry-quality / cohort diagnostic (DIAGNOSTIC-ONLY)", () => {
     expect(perfAfter.headlineWR).toBe(perfBefore.headlineWR);
     expect(gateAfter.liveBlocked).toBe(true);
     expect(gateAfter.microPilotAllowed).toBe(false);
+  });
+});
+
+// ── GET /api/shadow/entry-cohort-diagnostic endpoint ────────────────────────
+describe("entry-cohort-diagnostic endpoint — repeated ?dims querystring key", () => {
+  // Fastify parses a repeated key (?dims=symbol&dims=regime) as string[], not the
+  // string the route's TS generic declares — .split(",") on that array throws
+  // uncaught. The fix treats a non-string dims value as absent (all default dims).
+  it("does not 500 when ?dims is supplied twice, and falls back to the full dimension set", async () => {
+    _resetPaperExecutionRouterStoreForTests();
+    getPaperExecutionRouterStore(tmpDir());
+    const app = Fastify({ logger: false });
+    await registerShadowRoutes(app, null);
+
+    const res = await app.inject({
+      method: "GET",
+      url: "/api/shadow/entry-cohort-diagnostic?dims=symbol&dims=regime",
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json().report.dimensions.length).toBe(ENTRY_COHORT_DIMENSIONS.length);
+    await app.close();
+    _resetPaperExecutionRouterStoreForTests();
   });
 });
