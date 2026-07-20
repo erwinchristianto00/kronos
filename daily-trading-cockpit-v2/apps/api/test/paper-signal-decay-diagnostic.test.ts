@@ -3,18 +3,23 @@ import { mkdtempSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import os from "node:os";
 
+import Fastify from "fastify";
+
 import {
   buildSignalDecayDiagnostic,
   buildSignalDecayDiagnosticBriefLines,
   PaperExecutionRouterStore,
   buildPaperPerformanceReport,
   PAPER_EXECUTION_MODEL_REALISTIC,
+  getPaperExecutionRouterStore,
+  _resetPaperExecutionRouterStoreForTests,
   type PaperResolverClient,
   type PaperKlineTuple,
   type PaperOrder,
   type PaperOrderStatus,
 } from "../src/lib/paper-execution-router.js";
 import { buildLiveTradingGateReport } from "../src/lib/live-trading-gate.js";
+import { registerShadowRoutes } from "../src/routes/shadow.js";
 
 const CANDLE_MS = 5 * 60 * 1000;
 const tmpDir = () => mkdtempSync(join(os.tmpdir(), "signal-decay-test-"));
@@ -185,5 +190,30 @@ describe("signal-decay diagnostic V1 (DIAGNOSTIC-ONLY)", () => {
       minSample: 20, // 1 order < 20
     });
     expect(off(r, 5).verdict).toBe("INSUFFICIENT_SAMPLE");
+  });
+});
+
+// ── GET /api/shadow/signal-decay-diagnostic endpoint ────────────────────────
+describe("signal-decay-diagnostic endpoint — repeated ?offsets querystring key", () => {
+  // Fastify parses a repeated key (?offsets=-10&offsets=10) as string[], not the
+  // string the route's TS generic declares — .split(",") on that array throws
+  // uncaught.
+  it("does not 500 when ?offsets is supplied twice", async () => {
+    _resetPaperExecutionRouterStoreForTests();
+    getPaperExecutionRouterStore(tmpDir());
+    const app = Fastify({ logger: false });
+    await registerShadowRoutes(app, null, {
+      binanceClient: { getCandles: async () => [] },
+    } as never);
+
+    const res = await app.inject({
+      method: "GET",
+      url: "/api/shadow/signal-decay-diagnostic?offsets=-10&offsets=10",
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json().report).toBeTruthy();
+    await app.close();
+    _resetPaperExecutionRouterStoreForTests();
   });
 });
