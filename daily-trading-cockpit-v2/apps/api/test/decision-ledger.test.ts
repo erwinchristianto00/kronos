@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { mkdtempSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -58,6 +58,83 @@ describe("DecisionLedger", () => {
     expect(second.duplicate).toBe(true);
     const lines = readFileSync(file, "utf-8").trim().split("\n");
     expect(lines.map((l) => JSON.parse(l).event)).toEqual(["ROUTE_ASSIGNED", "ROUTE_DUPLICATE_SUPPRESSED"]);
+  });
+
+  it("does not poison the dedup cache when the durable append throws (fail-without/pass-with)", () => {
+    const file = tempLedgerFile();
+    const ledger = new DecisionLedger(file, { duplicateWindowMs: 60_000 });
+    const base = {
+      timestamp: "2026-05-11T12:00:00.000Z",
+      symbol: "SOLUSDT",
+      direction: "LONG" as const,
+      routeMode: "PROFIT_CANDIDATE" as const,
+    };
+
+    const appendSpy = vi.spyOn(ledger, "append").mockImplementationOnce(() => {
+      throw new Error("disk full");
+    });
+    expect(() => ledger.recordRouteAssigned(base)).toThrow("disk full");
+    appendSpy.mockRestore();
+
+    // The first call's write failed, so the retry 30s later (well within the 60s window) is the
+    // FIRST successful record of this decision, not a duplicate of a decision that was never persisted.
+    const retry = ledger.recordRouteAssigned({ ...base, timestamp: "2026-05-11T12:00:30.000Z" });
+    expect(retry.logged).toBe(true);
+    expect(retry.duplicate).toBe(false);
+
+    const lines = readFileSync(file, "utf-8").trim().split("\n");
+    expect(lines).toHaveLength(1);
+    expect(JSON.parse(lines[0]).event).toBe("ROUTE_ASSIGNED");
+  });
+
+  it("does not permanently misclassify calls as duplicates after a backward system-clock jump (fail-without/pass-with)", () => {
+    const file = tempLedgerFile();
+    const ledger = new DecisionLedger(file, { duplicateWindowMs: 3_600_000 });
+    const base = {
+      timestamp: "2026-05-11T12:00:00.000Z",
+      symbol: "ADAUSDT",
+      direction: "LONG" as const,
+      routeMode: "PROFIT_CANDIDATE" as const,
+    };
+
+    const first = ledger.recordRouteAssigned(base);
+    expect(first.logged).toBe(true);
+
+    // Clock jumps backward by an hour (e.g. NTP correction) before the next genuine call.
+    const afterClockJump = ledger.recordRouteAssigned({ ...base, timestamp: "2026-05-11T11:00:00.000Z" });
+    expect(afterClockJump.duplicate).toBe(false);
+    expect(afterClockJump.logged).toBe(true);
+
+    // A further genuine call shortly after the corrected clock must also not be poisoned by the
+    // pre-jump "previous" timestamp.
+    const followUp = ledger.recordRouteAssigned({ ...base, timestamp: "2026-05-11T11:05:00.000Z" });
+    expect(followUp.duplicate).toBe(false);
+    expect(followUp.logged).toBe(true);
+
+    const events = readFileSync(file, "utf-8").trim().split("\n").map((l) => JSON.parse(l).event);
+    expect(events).toEqual(["ROUTE_ASSIGNED", "ROUTE_ASSIGNED", "ROUTE_ASSIGNED"]);
+  });
+
+  it("prunes route-dedup keys older than the duplicate window instead of growing unboundedly", () => {
+    const file = tempLedgerFile();
+    const duplicateWindowMs = 1_000;
+    const ledger = new DecisionLedger(file, { duplicateWindowMs });
+    const startMs = Date.parse("2026-05-11T12:00:00.000Z");
+
+    // Each call uses a distinct symbol (distinct dedup key) and advances well past the 1s window,
+    // so nothing should ever legitimately be treated as a duplicate, and old keys should be evicted.
+    const SYMBOL_COUNT = 500;
+    for (let i = 0; i < SYMBOL_COUNT; i += 1) {
+      const ts = new Date(startMs + i * (duplicateWindowMs * 5)).toISOString();
+      ledger.recordRouteAssigned({
+        timestamp: ts,
+        symbol: `SYM${i}USDT`,
+        direction: "LONG",
+        routeMode: "PROFIT_CANDIDATE",
+      });
+    }
+
+    expect(ledger._getRouteKeyCacheSizeForTests()).toBeLessThan(SYMBOL_COUNT);
   });
 
   it("records reflection codes", () => {

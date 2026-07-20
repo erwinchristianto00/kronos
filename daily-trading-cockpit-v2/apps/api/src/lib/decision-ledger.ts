@@ -92,8 +92,10 @@ export class DecisionLedger {
       this.append({ ...base, event: "ROUTE_DUPLICATE_SUPPRESSED" });
       return { logged: false, duplicate: true };
     }
-    this.recentRouteKeys.set(key, Number.isFinite(now) ? now : Date.now());
+    // Append before marking the key seen: if append() throws, the decision was never durably
+    // recorded, so the dedup cache must not be poisoned into treating the retry as a duplicate.
     this.append({ ...base, event: "ROUTE_ASSIGNED" });
+    this.recentRouteKeys.set(key, Number.isFinite(now) ? now : Date.now());
     return { logged: true, duplicate: false };
   }
 
