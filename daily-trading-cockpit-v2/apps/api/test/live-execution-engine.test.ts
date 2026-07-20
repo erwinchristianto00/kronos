@@ -5013,6 +5013,45 @@ describe("[BUG 3] partial protective-stop fill re-establishes protection for the
     expect(client.placed.length).toBe(placedBefore); // no new stop placed
     expect(store.getState().intents[0]!.stopOrderId).toBe(originalStopId);
   });
+
+  it("[real-money audit follow-up] falls back to an immediate reduceOnly MARKET close on -2021 instead of retrying forever", async () => {
+    const order = paperOrder(); // SHORT ETHUSDT, entry 2000, stop 2100
+    const client = new FakeLiveClient();
+    const { engine, store } = makeEngine({ client, paper: makePaperStore([order]) });
+    await engine.arm();
+    await engine.tick(); // opens the intent + places the initial protective stop (no error yet)
+
+    const intent = store.getState().intents[0]!;
+    const originalStopId = intent.stopOrderId!;
+    const fullQty = intent.qty;
+    const residualQty = Number((fullQty * 0.6).toFixed(6));
+    client.positionsBySymbol.set("ETHUSDT", -residualQty);
+    client.algoOrderOverrides.set(originalStopId, { algoStatus: "EXPIRED", actualOrderId: "9001" });
+    client.orderStatusById.set("9001", "EXPIRED");
+    // By construction of this scenario, price has already crossed the original trigger level —
+    // a fresh conditional order at that SAME price is exactly what Binance's -2021 ("would
+    // immediately trigger") guards against. Simulate that rejection on the re-establish attempt.
+    client.algoErrorCode = -2021;
+    // A matched non-zero realized row against a KNOWN order id (the entry) is definitive close
+    // evidence per realizedFromTrades' own doc comment — same convention other settlement tests
+    // in this file use — so settlement doesn't need to guess the dynamically-generated close
+    // order id ahead of time.
+    client.trades = [{ orderId: intent.entryOrderId!, realizedPnl: -5, commission: 0.1 } as never];
+
+    await engine.tick(); // must not retry the identical doomed order forever — must market-close instead
+
+    // FAIL-WITHOUT-FIX: before the fallback, the catch block only set intent.lastError and
+    // returned, retrying an order that would hit -2021 again on every subsequent tick, forever,
+    // leaving the residual genuinely naked with no automatic resolution.
+    const marketClose = client.placed.find(
+      (p) => p.type === "MARKET" && p.reduceOnly && Math.abs(p.quantity - residualQty) < 1e-6,
+    );
+    expect(marketClose).toBeTruthy(); // FIX: fell back to an immediate market close of the residual
+    const updated = store.getState().intents[0]!;
+    expect(updated.state).toBe("CLOSED"); // fully resolved, not left open and naked
+    expect(updated.realizedPnlUsd).not.toBeNull();
+    expect(updated.closeReason).toBe("RESIDUAL_STOP_REESTABLISH_2021_FALLBACK_MARKET_CLOSE");
+  });
 });
 
 // ── 2026-07-19 real-money audit fix (BUG 4) ─────────────────────────────────

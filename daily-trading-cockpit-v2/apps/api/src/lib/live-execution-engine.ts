@@ -3193,6 +3193,53 @@ export class LiveExecutionEngine {
       intent.updatedAt = this.nowIso();
       return { changed: true };
     } catch (error) {
+      // 2026-07-19 real-money audit follow-up: a plain retry-next-tick here re-submits a fresh
+      // conditional order at the EXACT SAME trigger price that just fired — by construction of
+      // this function (a stop that just triggered/expired), price has already crossed that
+      // level, so Binance's -2021 ("would immediately trigger") is very likely to reject that
+      // same order again on every subsequent tick, forever, leaving the residual genuinely naked
+      // with no automatic resolution — this codebase has already been burned by exactly this
+      // failure class (a documented incident: a stop landed on the wrong side of the actual fill,
+      // churning 258x and costing ~$865). Mirror the sibling TP1→breakeven stop-placement
+      // fallback a few lines above: on -2021 specifically, fall back to an immediate reduceOnly
+      // MARKET close of the residual instead of retrying an order that cannot succeed.
+      if (error instanceof BinanceFuturesPrivateError && error.binanceCode === -2021) {
+        try {
+          const flat = await this.client.placeOrder({
+            symbol: intent.symbol,
+            side: intent.direction === "LONG" ? "SELL" : "BUY",
+            type: "MARKET",
+            quantity: Math.abs(amt),
+            reduceOnly: true,
+            newClientOrderId: `dtc-${intent.paperOrderId.slice(-14)}-rsx${this.nowIso().replace(/[^0-9]/g, "").slice(-8)}`,
+          });
+          try {
+            await this.client.cancelAllOrders(intent.symbol);
+            await this.client.cancelAllAlgoOrders(intent.symbol);
+          } catch {
+            // best-effort cleanup after the residual is already closed.
+          }
+          const settled = await this.settleIntentAfterClose(intent, [flat.orderId]);
+          const net = settled?.netUsd ?? null;
+          intent.realizedPnlUsd = net;
+          intent.feesUsd = settled?.feesUsd ?? null;
+          intent.state = "CLOSED";
+          intent.closedAt = this.nowIso();
+          this.stampExitControllerSnapshot(intent);
+          intent.updatedAt = this.nowIso();
+          intent.closeReason = "RESIDUAL_STOP_REESTABLISH_2021_FALLBACK_MARKET_CLOSE";
+          intent.lastError = null;
+          this.applyRealizedToLedger(net);
+          return { changed: true };
+        } catch (marketCloseError) {
+          intent.lastError =
+            `residual stop re-establish hit -2021 AND the immediate market-close fallback ALSO failed for ` +
+            `${intent.symbol} (${intent.paperOrderId}): ${(marketCloseError as Error).message} — position is ` +
+            `PARTIALLY UNPROTECTED, retrying next tick`;
+          intent.updatedAt = this.nowIso();
+          return { changed: true };
+        }
+      }
       intent.lastError =
         `residual stop re-establish failed for ${intent.symbol} (${intent.paperOrderId}) after the ` +
         `original stop partially filled/expired: ${(error as Error).message} — position is PARTIALLY ` +
