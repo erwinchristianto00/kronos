@@ -16,10 +16,12 @@ import {
 import {
   LiveExecutionEngine,
   LiveExecutionStore,
+  MANUAL_ENTRY_DECISION_MAX_AGE_MS,
   combinedWorstCaseNotionalUsd,
   computeLiveOrderPlan,
   crowdingExitRecommendation,
   interleaveTestnetCollectionCandidates,
+  isManualEntryDecisionStale,
   manualDirectionalLaneMismatchReason,
   parseLiveExecutionConfig,
   roundDownToStep,
@@ -5240,5 +5242,68 @@ describe("[BUG 1] manual-directional lane allocation direction validation", () =
       manualDirectionalLaneMismatchReason("short", "CG_VARIANT_MATRIX:SHORT_FADE_EXHAUSTION_CROWDED", laneDirectionForId),
     ).toBeNull();
     expect(manualDirectionalLaneMismatchReason("long", "UNKNOWN_LANE", laneDirectionForId)).toBeNull();
+  });
+});
+
+// ── 2026-07-20 real-money audit fix (BUG 2) ─────────────────────────────────
+
+describe("[BUG 2] manual entry decision staleness gate", () => {
+  it("fails-without (sanity — must not false-trip ordinary cycle jitter): a decision refreshed well " +
+    "within the normal ~7-minute scan cadence still enables entry", () => {
+    const nowIso = "2099-01-02T12:00:00.000Z";
+    const { engine } = makeEngine({ nowIso: () => nowIso });
+    engine.setManualSelectorMode(true);
+    expect(engine.setManualDirectionalLaneAllocations({
+      long: [{ laneId: "CG_WIDE_FAST_LONG", weightPct: 100 }],
+      short: [],
+    }).ok).toBe(true);
+    engine.setManualEntryDecision({
+      action: "WAIT_PULLBACK",
+      directionalBias: "LONG",
+      reason: "test",
+      observedAt: "2099-01-02T11:45:00.000Z", // 15 minutes old — inside tolerance
+    });
+    expect(engine.isManualEntryAllowedForPaper({ selectedLaneId: "CG_WIDE_FAST_LONG", direction: "LONG" } as PaperOrder)).toBe(true);
+    expect(engine.getStatus().laneSelection.manualDirectionalAllocations?.entryDecisionStale).toBe(false);
+  });
+
+  it("pass-with: a decision older than the threshold — the documented failure mode, a persistently " +
+    "failing scan cycle leaving the prior directional bias frozen for hours — now fails CLOSED, " +
+    "exactly as if the scanner's action were NO_TRADE", () => {
+    const nowIso = "2099-01-02T12:00:00.000Z";
+    const { engine } = makeEngine({ nowIso: () => nowIso });
+    engine.setManualSelectorMode(true);
+    expect(engine.setManualDirectionalLaneAllocations({
+      long: [{ laneId: "CG_WIDE_FAST_LONG", weightPct: 100 }],
+      short: [],
+    }).ok).toBe(true);
+    engine.setManualEntryDecision({
+      action: "WAIT_PULLBACK",
+      directionalBias: "LONG",
+      reason: "test",
+      observedAt: "2099-01-02T08:00:00.000Z", // 4 hours old — a genuine multi-hour scan outage
+    });
+    expect(engine.isManualEntryAllowedForPaper({ selectedLaneId: "CG_WIDE_FAST_LONG", direction: "LONG" } as PaperOrder)).toBe(false);
+    expect(engine.laneSelectionWeightPctForLane("CG_WIDE_FAST_LONG")).toBe(0);
+    expect(engine.getStatus().laneSelection.manualDirectionalAllocations?.entryDecisionStale).toBe(true);
+  });
+
+  it("entryDecisionStale reads false when there is no cached decision at all — 'never observed yet' " +
+    "and 'observed, now stale' are different states with different existing dashboard copy", () => {
+    const { engine } = makeEngine();
+    engine.setManualSelectorMode(true);
+    expect(engine.setManualDirectionalLaneAllocations({
+      long: [{ laneId: "CG_WIDE_FAST_LONG", weightPct: 100 }],
+      short: [],
+    }).ok).toBe(true);
+    expect(engine.getStatus().laneSelection.manualDirectionalAllocations?.entryDecisionStale).toBe(false);
+  });
+
+  it("isManualEntryDecisionStale (pure): strict > boundary, and an unparsable timestamp fails closed", () => {
+    const observedAt = "2099-01-02T12:00:00.000Z";
+    const observedMs = Date.parse(observedAt);
+    expect(isManualEntryDecisionStale(observedAt, observedMs + MANUAL_ENTRY_DECISION_MAX_AGE_MS)).toBe(false);
+    expect(isManualEntryDecisionStale(observedAt, observedMs + MANUAL_ENTRY_DECISION_MAX_AGE_MS + 1)).toBe(true);
+    expect(isManualEntryDecisionStale("not-a-timestamp", observedMs)).toBe(true);
   });
 });

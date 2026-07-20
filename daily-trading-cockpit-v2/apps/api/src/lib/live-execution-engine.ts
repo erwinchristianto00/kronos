@@ -1504,6 +1504,29 @@ export function manualDirectionalLaneMismatchReason(
   return null;
 }
 
+/**
+ * 2026-07-20 real-money audit fix (BUG 2, HIGH): manualEntryDecision carries an observedAt stamp
+ * that nothing ever compared to "now" before treating it as authoritative for real-money admission.
+ * refreshManualEntryDecision() (scan.ts) only console.errors on a persistent failure and otherwise
+ * leaves the prior decision frozen — so a scan-cycle outage lasting hours left single-symbol lanes
+ * opening real positions on a directional read that may have long since reversed. Threshold: the
+ * scan cycle refreshes this every CORE_SCAN_AUTO_REFRESH_INTERVAL_MINUTES (scan.ts, default 7 min);
+ * 3x that (21 min, rounded to 20) survives ordinary cycle jitter (one slow or skipped tick) without
+ * ever treating a genuinely hours-long outage as still fresh. An unparsable timestamp is treated as
+ * maximally stale (fail closed), never as fresh.
+ */
+export const MANUAL_ENTRY_DECISION_MAX_AGE_MS = 20 * 60 * 1000;
+
+export function isManualEntryDecisionStale(
+  observedAt: string,
+  nowMs: number,
+  maxAgeMs: number = MANUAL_ENTRY_DECISION_MAX_AGE_MS,
+): boolean {
+  const observedMs = Date.parse(observedAt);
+  if (!Number.isFinite(observedMs)) return true;
+  return nowMs - observedMs > maxAgeMs;
+}
+
 /** 2026-07-07 operator decision ("bukan sembarang buka"): when set, the mirror admits ONLY
  *  symbols with /research book proof (priority tier 0/1) — a DELIBERATE exception to the default
  *  never-rejects rule, so with zero proven symbols the directional slot stays empty rather than
@@ -2058,6 +2081,14 @@ export class LiveExecutionEngine {
                 this.config.maxAggregateManualDirectionalNotionalUsd > 0 ? this.config.maxAggregateManualDirectionalNotionalUsd : null,
               activeDirection: this.manualEntryDecision?.directionalBias ?? null,
               entryDecision: this.manualEntryDecision,
+              // 2026-07-20 real-money audit fix (BUG 2): surfaced so the dashboard COULD show a
+              // staleness warning — see isManualEntryDecisionStale's doc comment for the threshold
+              // and the outage class this guards against. false (never stale) when there is no
+              // decision at all — "no decision yet" and "stale decision" are different states and
+              // the dashboard's existing WAITING ENTRY DECISION copy already covers the former.
+              entryDecisionStale: this.manualEntryDecision
+                ? isManualEntryDecisionStale(this.manualEntryDecision.observedAt, Date.parse(this.nowIso()))
+                : false,
             }
           : null,
         laneAllocationOperatorLock: st.laneAllocationOperatorLock === true,
@@ -4252,6 +4283,11 @@ export class LiveExecutionEngine {
     const configured = this.store.getState().manualDirectionalAllocations;
     const decision = this.manualEntryDecision;
     if (!this.store.getState().manualSelectorMode || !configured || !decision?.directionalBias || decision.action === "NO_TRADE") return null;
+    // 2026-07-20 real-money audit fix (BUG 2): a decision this stale is treated exactly like "no
+    // decision yet" (null) — every downstream consumer (effectiveLaneAllocations,
+    // isManualDirectionalEntryEnabled, canOpenNewEntries, isManualEntryAllowedForPaper) already
+    // fails closed on null, so this single check protects all of them at once.
+    if (isManualEntryDecisionStale(decision.observedAt, Date.parse(this.nowIso()))) return null;
     return decision.directionalBias === "LONG" ? configured.long : configured.short;
   }
 
