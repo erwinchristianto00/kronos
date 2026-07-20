@@ -352,14 +352,20 @@ function buildForecast(points: readonly ScoredPoint[], smoothed: readonly number
       : meanConfidence >= 0.48
         ? "MEDIUM"
         : "LOW";
-  const persistenceProbability = currentScore > 0.12
+  // Must key off `bias` (the call already made from the 3h-ahead probability distribution), not off
+  // currentScore's own ±0.12 zone: those are different quantities, and a trend that has just crossed
+  // out of neutral routinely has bias=BULLISH/BEARISH (from the forward-looking horizon probabilities)
+  // while the smoothed currentScore itself still sits inside the neutral band. Keying off currentScore
+  // there silently substituted neutralProbability for the bull/bear probability that actually earned
+  // the bias call, causing buildEntryDecision()'s persistence >= 0.55 check to reject valid signals.
+  const persistenceProbability = bias === "BULLISH"
     ? anchor.bullProbability
-    : currentScore < -0.12
+    : bias === "BEARISH"
       ? anchor.bearProbability
       : anchor.neutralProbability;
-  const invalidation = currentScore > 0.12
+  const invalidation = bias === "BULLISH"
     ? "Bias bull invalid jika EWMA menembus +0.12 ke bawah atau slope 1h dan 3h sama-sama negatif."
-    : currentScore < -0.12
+    : bias === "BEARISH"
       ? "Bias bear invalid jika EWMA menembus -0.12 ke atas atau slope 1h dan 3h sama-sama positif."
       : "Bias netral invalid setelah EWMA menembus ±0.12 dengan slope 1h dan 3h yang searah.";
 

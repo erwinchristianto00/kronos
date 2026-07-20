@@ -178,6 +178,80 @@ describe("regime-axis entry-decision staleness (2026-07-19 fix — fail SAFE on 
   });
 });
 
+// REGRESSION (2026-07-20 BUG): persistenceProbability was keyed off currentScore's own ±0.12 zone
+// instead of the already-chosen `bias` — a different quantity. The moment a trend crosses out of
+// neutral, `bias` legitimately flips to BULLISH/BEARISH off the forward-looking 3h horizon
+// probabilities while the *smoothed* currentScore can still sit inside the neutral band for a bit
+// longer. The old code then plugged neutralProbability into the "is this bias reliable" check
+// instead of the bull/bear probability that actually earned the bias call, so a confidently-called
+// directional bias could self-reject as NO_TRADE. Reproduced live on 3103 2026-07-20 (bias=BULLISH,
+// bullProbability 55.7%, but persistenceProbability read 23% — the neutral bucket — and blocked entry).
+describe("regime-axis persistence-probability (2026-07-20 fix — key off bias, not currentScore's zone)", () => {
+  const T0 = Date.parse("2099-02-01T00:00:00.000Z");
+  function sawtoothSnap(hoursFromT0: number, score: number): RegimeEngineSnapshot {
+    return {
+      at: new Date(T0 + hoursFromT0 * 3_600_000).toISOString(),
+      btcPrice: 60000,
+      regime: "TREND_RECOVERY",
+      action: "NO_TRADE",
+      lane: null,
+      rejectedBy: null,
+      noTradeReason: null,
+      contradictions: [],
+      spreadBps: 1,
+      fundingRate: 0,
+      fundingRiskAbnormal: false,
+      breadth: { advancersPct: (score + 1) / 2, altAdvancersPct: null, percentAboveEma20: null, btcReturn24h: null, unavailableReason: null },
+    };
+  }
+
+  // Many repeated 8h climbs from -0.3 to +0.5 (a market that reliably breaks out of a dip and keeps
+  // running) give buildForecast() plenty of real historical analogs at the "mid-climb, just below the
+  // neutral cutoff" phase, each of which continued upward well past +0.12 within the next 3h — so
+  // bullProbability comes out high and confidence HIGH from real analog evidence, not the sparse-history
+  // fallback. Truncated exactly at the point in the final cycle where the smoothed score is still
+  // inside ±0.12 (mid-climb) while the forward-looking bias has already flipped BULLISH.
+  const CYCLE_HOURS = 8;
+  const NUM_CYCLES = 20;
+  const snaps: RegimeEngineSnapshot[] = [];
+  for (let c = 0; c < NUM_CYCLES; c += 1) {
+    for (let h = 0; h < CYCLE_HOURS; h += 1) {
+      snaps.push(sawtoothSnap(c * CYCLE_HOURS + h, -0.3 + 0.8 * (h / CYCLE_HOURS)));
+    }
+  }
+  const truncateAtHour = (NUM_CYCLES - 1) * CYCLE_HOURS + 3; // mid-climb of the final cycle, score = 0.0
+  const truncated = snaps.filter((s) => Date.parse(s.at) <= T0 + truncateAtHour * 3_600_000);
+  const nowMs = T0 + truncateAtHour * 3_600_000;
+
+  it("sets up the exact failure condition: bias flips directional while the smoothed score is still inside the neutral band", () => {
+    const tl = buildRegimeAxisTimeline(truncated, { nowMs });
+    expect(tl.forecast.bias).toBe("BULLISH");
+    expect(Math.abs(tl.forecast.smoothedScore ?? 1)).toBeLessThan(0.12);
+    expect(tl.forecast.confidence).not.toBe("LOW");
+    const anchor = tl.forecast.horizons.find((h) => h.hours === 3)!;
+    expect(anchor.bullProbability).toBeGreaterThan(0.55);
+    expect(anchor.neutralProbability).toBeLessThan(0.55);
+  });
+
+  it("REGRESSION: persistenceProbability reflects the BULLISH bias's own probability, not the neutral bucket", () => {
+    const tl = buildRegimeAxisTimeline(truncated, { nowMs });
+    const anchor = tl.forecast.horizons.find((h) => h.hours === 3)!;
+    expect(tl.forecast.persistenceProbability).toBeCloseTo(anchor.bullProbability, 9);
+    expect(tl.forecast.persistenceProbability).not.toBeCloseTo(anchor.neutralProbability, 2);
+  });
+
+  it("REGRESSION: a confidently-called bullish bias is no longer self-rejected as NO_TRADE", () => {
+    const tl = buildRegimeAxisTimeline(truncated, { nowMs });
+    expect(tl.entryDecision.action).not.toBe("NO_TRADE");
+    expect(tl.entryDecision.directionalBias).toBe("LONG");
+  });
+
+  it("invalidation text matches the chosen bias, not the currentScore zone", () => {
+    const tl = buildRegimeAxisTimeline(truncated, { nowMs });
+    expect(tl.entryDecision.invalidation).toMatch(/bias bull invalid/i);
+  });
+});
+
 describe("cross-sectional allocation independence flag", () => {
   it("is opt-in via CROSS_SECTIONAL_ALLOCATION_INDEPENDENT=1 only", () => {
     expect(isCrossSectionalAllocationIndependent({})).toBe(false);
