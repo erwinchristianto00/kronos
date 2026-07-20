@@ -305,6 +305,36 @@ describe("cortex — learning (refit logistic via IRLS)", () => {
     expect(r.w).toEqual(wPrior); // model preserved, not corrupted
   });
 
+  it("2026-07-20 fix: undamped Newton oscillation on collinear features + stale prior now converges (ACCEPTED, not REJECTED_NON_CONVERGENCE)", () => {
+    // Regression for the real TACTICAL archetype failure: near-collinear features (mirroring
+    // laneNetAvgR/lanePf moving together) plus a stale prior displaced from the data's optimum
+    // made undamped Newton steps overshoot and oscillate between two coefficient vectors forever,
+    // never satisfying the convergence tolerance. A backtracking line search guarantees each step
+    // improves the penalized likelihood, so it converges instead of oscillating.
+    const mkRow = (i: number): CortexTrainingExample => {
+      const r = (n: number) => Math.sin(42 * 99991 + i * 7919 + n * 104729) * 0.5 + 0.5;
+      const core = r(5) * 2 - 1;
+      const x = new Array(CORTEX_FEATURE_DIM).fill(0);
+      x[0] = 1;
+      x[1] = r(1) * 2 - 1;
+      x[2] = r(2) * 2 - 1;
+      x[3] = r(3) * 2 - 1;
+      x[4] = r(4);
+      x[5] = core + (r(6) - 0.5) * 0.02; // near-duplicate of x[6], like laneNetAvgR/lanePf
+      x[6] = core + (r(7) - 0.5) * 0.02;
+      x[9] = r(8);
+      const y: 0 | 1 = core + (r(9) - 0.5) * 1.4 > 0 ? 1 : 0;
+      return train(x, y, now);
+    };
+    const examples = Array.from({ length: 89 }, (_, i) => mkRow(i));
+    // Stale prior displaced far from the data's true optimum — mirrors a thin-sample archetype
+    // whose last accepted fit no longer matches the current data.
+    const wPrior = [0.6, 4.56, -3.5, 0.8, -1.2, 1.8, -1.8, 0, 0, 1];
+    const r = refitArchetypeCoefficients(examples, wPrior, { nowMs: now, iterations: 12, maxJump: 8 });
+    expect(r.status).toBe("ACCEPTED");
+    expect(r.w.every((v) => Number.isFinite(v))).toBe(true);
+  });
+
   it("win label applies the economic hurdle (a fee-scratch is not a win)", () => {
     expect(cortexWinLabel(0.2)).toBe(1);
     expect(cortexWinLabel(0.01)).toBe(0); // below hurdle → loss

@@ -99,6 +99,30 @@ function dot(a: readonly number[], b: readonly number[]): number {
   for (let i = 0; i < a.length; i += 1) s += a[i]! * b[i]!;
   return s;
 }
+/** Numerically stable log(1+exp(v)) — used to compute the logistic log-likelihood without ever
+ *  taking log(sigmoid(z)) directly (which underflows to log(0) once z saturates the sigmoid). */
+function softplus(v: number): number {
+  return v > 0 ? v + Math.log1p(Math.exp(-v)) : Math.log1p(Math.exp(v));
+}
+/** The exact objective refitArchetypeCoefficients's Newton step descends (ridge-penalized weighted
+ *  negative log-likelihood) — used only to backtrack an oversized step, never to change the fit
+ *  itself. -log(p)=softplus(-z), -log(1-p)=softplus(z), so this needs no separate sigmoid() call. */
+function penalizedNegLogLik(
+  w: readonly number[],
+  rows: readonly CortexTrainingExample[],
+  a: readonly number[],
+  wPrior: readonly number[],
+  lambda: number,
+): number {
+  let nll = 0;
+  for (let r = 0; r < rows.length; r += 1) {
+    const z = dot(w, rows[r]!.x);
+    nll += a[r]! * (rows[r]!.y === 1 ? softplus(-z) : softplus(z));
+  }
+  let penalty = 0;
+  for (let i = 0; i < w.length; i += 1) penalty += (w[i]! - wPrior[i]!) ** 2;
+  return nll + 0.5 * lambda * penalty;
+}
 
 export interface CortexLaneInput {
   laneId: string;
@@ -592,11 +616,34 @@ export function refitArchetypeCoefficients(
       }
     }
     const step = solveLinear(H, g);
+    // 2026-07-20 real-money-adjacent audit fix: the raw Newton step was applied unconditionally.
+    // H = XᵀWX + λI is positive definite (λ>0), so -H⁻¹g is a genuine descent direction for the
+    // convex penalized log-likelihood below — but on a small, feature-degenerate sample the FULL
+    // step can overshoot past where that local quadratic approximation is valid, and an undamped
+    // Newton iteration can then lock into a stable, non-decaying oscillation between two points
+    // instead of converging OR diverging monotonically (reproduced and confirmed on real TACTICAL
+    // archetype data: 12, and even 200, undamped iterations settle into an exact 2-cycle). Standard
+    // backtracking line search fixes this: repeatedly halve the step until it actually decreases the
+    // objective. Since the direction is always a valid descent direction here, some small enough
+    // scale is mathematically guaranteed to improve on it (or the step is already ~0, i.e. converged).
+    const currentObjective = penalizedNegLogLik(w, rows, a, wPrior, lambda);
+    let scale = 1;
     let maxStep = 0;
-    for (let i = 0; i < dim; i += 1) {
-      w[i]! -= step[i]!;
-      maxStep = Math.max(maxStep, Math.abs(step[i]!));
+    let stepAccepted = false;
+    for (let backtrack = 0; backtrack < 30; backtrack += 1) {
+      const candidate = w.map((wi, i) => wi - scale * step[i]!);
+      if (candidate.every((v) => Number.isFinite(v))) {
+        const candidateObjective = penalizedNegLogLik(candidate, rows, a, wPrior, lambda);
+        if (Number.isFinite(candidateObjective) && candidateObjective <= currentObjective) {
+          for (let i = 0; i < dim; i += 1) maxStep = Math.max(maxStep, Math.abs(scale * step[i]!));
+          w = candidate;
+          stepAccepted = true;
+          break;
+        }
+      }
+      scale *= 0.5;
     }
+    if (!stepAccepted) break; // no improving step found even after 30 halvings — non-convergent, not silently applied
     if (maxStep < 1e-8) {
       converged = true;
       break;
