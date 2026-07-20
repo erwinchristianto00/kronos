@@ -2,8 +2,9 @@ import { mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
+import { _resetLaneRuntimeForTests } from "../src/lib/lane-context-journal-runtime.js";
 import {
   BinanceFuturesPrivateError,
   type FuturesAlgoOrder,
@@ -4791,6 +4792,17 @@ describe("applyRegimeAutopilotAllocation (autopilot ↔ manual-mode sync)", () =
 
 // ── Stage-2 execution-lifecycle tap: proves the report-only entry taps NEVER disturb execution ──────────────────
 describe("openIntent execution-lifecycle tap — report-only, cannot alter the exchange interaction", () => {
+  // The writer-lock singleton in lane-context-journal-runtime.ts is process-lifetime/global by design
+  // (production wants a failed lock retried later, not re-checked every call). Within this describe
+  // block one test deliberately points the journal at a broken (file-not-dir) path to prove a throwing
+  // logger never escapes into the execution path — that intentionally trips the lock's failure+cooldown
+  // state, which would otherwise silently starve the *next* test's perfectly valid temp dir of its
+  // lifecycle write (no ensureDir ever runs against it) for the length of the retry cooldown. Reset
+  // between tests so each one's writer-lock outcome reflects only its own directory.
+  beforeEach(() => {
+    _resetLaneRuntimeForTests();
+  });
+
   // Run one armed entry tick under a given env and return the exact exchange-order sequence + intent state.
   async function runEntry(env: NodeJS.ProcessEnv): Promise<{ placed: Array<{ type: string; side: string; quantity: number; reduceOnly: boolean | undefined }>; count: number; state: string }> {
     const saved = { EXEC_LIFECYCLE_TIMESTAMPS: process.env.EXEC_LIFECYCLE_TIMESTAMPS, FOUR_BRAIN_INSTANCE_ID: process.env.FOUR_BRAIN_INSTANCE_ID, LANE_CONTEXT_JOURNAL_DIR: process.env.LANE_CONTEXT_JOURNAL_DIR, PORT: process.env.PORT };
