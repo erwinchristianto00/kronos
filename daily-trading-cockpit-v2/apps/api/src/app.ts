@@ -617,6 +617,12 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           }
         }
       },
+      // 2026-07-20 real-money audit fix (BUG 1): laneId → fixed direction lookup for
+      // setManualDirectionalLaneAllocations's validator. CORTEX_LANE_ROSTER is already this
+      // codebase's single code-anchored source of truth for every lane's construction-time
+      // direction (kept in sync with the SingleSymbolLaneExecutor instantiations below) — reused
+      // here rather than duplicating a second lane-id list inside live-execution-engine.ts.
+      laneDirectionForId: (laneId) => CORTEX_LANE_ROSTER.find((entry) => entry.laneId === laneId)?.direction ?? null,
       // "Mode 2" (REALTIME_SHORT_MIRROR_ENABLED=1): the engine mirrors ONLY the dedicated
       // real-time short store — fresh, short-only, stable-lane orders — and never the
       // measurement paper book. Flag off → unchanged (reads the normal paper book).

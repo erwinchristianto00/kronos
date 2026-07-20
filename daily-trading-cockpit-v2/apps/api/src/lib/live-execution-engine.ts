@@ -1006,6 +1006,16 @@ export interface LiveExecutionEngineOptions {
    *  isAllowed gates all require engine.canOpenNewEntries(), false once killedAt latches.
    *  Best-effort: a throwing callback must never break the engine's own kill path. */
   onKillSwitchEngaged?: (reason: string) => Promise<void>;
+  /**
+   * 2026-07-20 real-money audit fix (BUG 1): laneId → fixed trading direction, for
+   * setManualDirectionalLaneAllocations's validator (see manualDirectionalLaneMismatchReason's doc
+   * comment). app.ts is the single source of truth for which lanes exist and what direction each
+   * one is hardcoded to trade — this engine must never hardcode its own lane-id list, or the two
+   * would drift the moment a new lane is wired. Omit (e.g. in tests) to leave every laneId
+   * unchecked, matching the pre-fix behavior. Return null for a lane with no fixed single direction
+   * (unknown id, or a NEUTRAL cross-sectional basket).
+   */
+  laneDirectionForId?: (laneId: string) => "LONG" | "SHORT" | "NEUTRAL" | null;
 }
 
 const ERROR_STREAK_DISARM = 3;
@@ -1462,6 +1472,38 @@ export function combinedWorstCaseNotionalUsd(
   return rows.reduce((sum, r) => sum + maxNotionalPerTrade * (Math.max(0, Math.min(100, r.weightPct)) / 100), 0);
 }
 
+/**
+ * 2026-07-20 real-money audit fix (BUG 1, HIGH): setManualDirectionalLaneAllocations validated each
+ * laneId as an opaque string — nothing checked it against the lane's own FIXED trading direction.
+ * SingleSymbolLaneExecutor instances (RC/RCS/SF/IM/PWR + the 4 CE buckets) are each constructed in
+ * app.ts with a hardcoded `direction`; their isAllowed() only ever consults
+ * laneSelectionAllowsLane(laneId), which is direction-blind. If an operator (or a copy/paste error
+ * in the dashboard's shared long/short lane dropdown — both rows list the SAME options) put a
+ * LONG-only lane under "short", the moment the scanner's Entry Decision flipped to SHORT the lane's
+ * weight>0 on the active side, opening a real LONG position at exactly the moment the engine's own
+ * directional read favored SHORT. laneDirectionForId returning null (unknown lane — e.g. a CG
+ * variant-matrix id with no dedicated executor, or a NEUTRAL cross-sectional basket) is NOT treated
+ * as a mismatch: those lanes are either direction-agnostic or already validated by
+ * isManualEntryAllowedForPaper's own `decision.directionalBias === paper.direction` check — this
+ * only rejects a PROVEN conflict against a lane's own fixed direction, never an absence of proof.
+ */
+export function manualDirectionalLaneMismatchReason(
+  side: "long" | "short",
+  laneId: string,
+  laneDirectionForId: (laneId: string) => "LONG" | "SHORT" | "NEUTRAL" | null,
+): string | null {
+  const variantId = laneId.split(":").pop() ?? laneId;
+  const direction = laneDirectionForId(laneId) ?? laneDirectionForId(variantId);
+  if (!direction || direction === "NEUTRAL") return null;
+  if (side === "long" && direction === "SHORT") {
+    return `${laneId} is a fixed SHORT-direction lane and cannot be listed under long`;
+  }
+  if (side === "short" && direction === "LONG") {
+    return `${laneId} is a fixed LONG-direction lane and cannot be listed under short`;
+  }
+  return null;
+}
+
 /** 2026-07-07 operator decision ("bukan sembarang buka"): when set, the mirror admits ONLY
  *  symbols with /research book proof (priority tier 0/1) — a DELIBERATE exception to the default
  *  never-rejects rule, so with zero proven symbols the directional slot stays empty rather than
@@ -1486,6 +1528,7 @@ export class LiveExecutionEngine {
   private readonly newEntryGate: () => LiveNewEntryGateDecision;
   private readonly getExternalRealizedPnlUsd: () => { today: number; allTime: number };
   private readonly onKillSwitchEngaged: ((reason: string) => Promise<void>) | null;
+  private readonly laneDirectionForId: (laneId: string) => "LONG" | "SHORT" | "NEUTRAL" | null;
 
   /** In-memory ONLY — restart always boots disarmed. */
   private armed = false;
@@ -1540,6 +1583,7 @@ export class LiveExecutionEngine {
     this.newEntryGate = options.newEntryGate ?? (() => ({ allowed: true, reason: null }));
     this.getExternalRealizedPnlUsd = options.getExternalRealizedPnlUsd ?? (() => ({ today: 0, allTime: 0 }));
     this.onKillSwitchEngaged = options.onKillSwitchEngaged ?? null;
+    this.laneDirectionForId = options.laneDirectionForId ?? (() => null);
     // Auto-arm must NOT punch through a latched kill: a restart preserves the kill until an
     // explicit resetKill(). (arm() already enforces this; the constructor path bypassed it.)
     if (this.config.autoArm && this.config.configErrors.length === 0 && !this.store.getState().killedAt) {
@@ -4427,6 +4471,8 @@ export class LiveExecutionEngine {
         if (!Number.isFinite(weightPct) || weightPct <= 0 || weightPct > 100) {
           return { ok: false as const, reason: `${side} weightPct for ${laneId} must be in (0, 100]` };
         }
+        const directionMismatch = manualDirectionalLaneMismatchReason(side, laneId, this.laneDirectionForId);
+        if (directionMismatch) return { ok: false as const, reason: directionMismatch };
         if (seen.has(laneId)) return { ok: false as const, reason: `duplicate ${side} laneId ${laneId}` };
         seen.add(laneId);
         result.push({ laneId, weightPct: Math.round(weightPct) });

@@ -20,6 +20,7 @@ import {
   computeLiveOrderPlan,
   crowdingExitRecommendation,
   interleaveTestnetCollectionCandidates,
+  manualDirectionalLaneMismatchReason,
   parseLiveExecutionConfig,
   roundDownToStep,
   roundStopToSafeSide,
@@ -361,6 +362,7 @@ function makeEngine(opts: {
   externalManagedNetQty?: () => Map<string, number>;
   getExternalRealizedPnlUsd?: () => { today: number; allTime: number };
   onKillSwitchEngaged?: (reason: string) => Promise<void>;
+  laneDirectionForId?: (laneId: string) => "LONG" | "SHORT" | "NEUTRAL" | null;
 } = {}) {
   const client = opts.client ?? new FakeLiveClient();
   const store = new LiveExecutionStore(tmp());
@@ -380,6 +382,7 @@ function makeEngine(opts: {
     externalManagedNetQty: opts.externalManagedNetQty,
     getExternalRealizedPnlUsd: opts.getExternalRealizedPnlUsd,
     onKillSwitchEngaged: opts.onKillSwitchEngaged,
+    laneDirectionForId: opts.laneDirectionForId,
   });
   return { engine, client, store };
 }
@@ -5156,5 +5159,86 @@ describe("[BUG 4] aggregate worst-case notional across manual directional lanes"
     expect(combinedWorstCaseNotionalUsd([{ weightPct: 100 }, { weightPct: 100 }], 250)).toBeCloseTo(500, 6);
     expect(combinedWorstCaseNotionalUsd([{ weightPct: 50 }], 250)).toBeCloseTo(125, 6);
     expect(combinedWorstCaseNotionalUsd([], 250)).toBe(0);
+  });
+});
+
+// ── 2026-07-20 real-money audit fix (BUG 1) ─────────────────────────────────
+
+describe("[BUG 1] manual-directional lane allocation direction validation", () => {
+  it("fails-without: with no lane-direction lookup wired (the pre-fix default — app.ts had no such " +
+    "parameter to pass), a lane whose executor is hardcoded SHORT is silently accepted under long", () => {
+    const { engine } = makeEngine(); // no laneDirectionForId ⇒ identical to the pre-fix constructor
+    // SHORT_FADE_EXHAUSTION_CROWDED is SF_PAPER_LANE_ID — instantiated with direction:"SHORT" in
+    // app.ts, and its getOpenSignals() can only ever emit SHORT paper orders.
+    const result = engine.setManualDirectionalLaneAllocations({
+      long: [{ laneId: "SHORT_FADE_EXHAUSTION_CROWDED", weightPct: 100 }],
+      short: [],
+    });
+    expect(result.ok).toBe(true); // BUG: nothing here ever checked the lane's real direction
+  });
+
+  it("pass-with: the same fixed-SHORT lane under long is rejected once the lookup is wired, and the " +
+    "rejected configuration is never persisted", () => {
+    const laneDirectionForId = (laneId: string): "LONG" | "SHORT" | "NEUTRAL" | null =>
+      laneId === "SHORT_FADE_EXHAUSTION_CROWDED" ? "SHORT" : null;
+    const { engine, store } = makeEngine({ laneDirectionForId });
+    const before = store.getState().manualDirectionalAllocations;
+    const result = engine.setManualDirectionalLaneAllocations({
+      long: [{ laneId: "SHORT_FADE_EXHAUSTION_CROWDED", weightPct: 100 }],
+      short: [],
+    });
+    expect(result.ok).toBe(false);
+    expect(result.reason).toMatch(/fixed SHORT-direction lane/);
+    expect(store.getState().manualDirectionalAllocations).toEqual(before);
+  });
+
+  it("the mirror-image mismatch (a fixed-LONG lane listed under short) is also rejected", () => {
+    const laneDirectionForId = (laneId: string): "LONG" | "SHORT" | "NEUTRAL" | null =>
+      laneId === "INTRADAY_MOMENTUM_BREAKOUT_LONG" ? "LONG" : null;
+    const { engine } = makeEngine({ laneDirectionForId });
+    const result = engine.setManualDirectionalLaneAllocations({
+      long: [],
+      short: [{ laneId: "INTRADAY_MOMENTUM_BREAKOUT_LONG", weightPct: 100 }],
+    });
+    expect(result.ok).toBe(false);
+    expect(result.reason).toMatch(/fixed LONG-direction lane/);
+  });
+
+  it("a lane the lookup has no fixed direction for (unknown id, or a NEUTRAL cross-sectional basket) " +
+    "is never blocked here — it is either direction-agnostic or validated by " +
+    "isManualEntryAllowedForPaper's own directionalBias check instead", () => {
+    const laneDirectionForId = (laneId: string): "LONG" | "SHORT" | "NEUTRAL" | null =>
+      laneId === "CROSS_SECTIONAL_MARKET_NEUTRAL" ? "NEUTRAL" : null;
+    const { engine } = makeEngine({ laneDirectionForId });
+    expect(engine.setManualDirectionalLaneAllocations({
+      long: [
+        { laneId: "CROSS_SECTIONAL_MARKET_NEUTRAL", weightPct: 100 },
+        { laneId: "SOME_UNKNOWN_LANE_ID", weightPct: 50 },
+      ],
+      short: [],
+    }).ok).toBe(true);
+  });
+
+  it("a lane listed on its own correct side is accepted", () => {
+    const laneDirectionForId = (laneId: string): "LONG" | "SHORT" | "NEUTRAL" | null =>
+      laneId === "REGIME_COMPOSITE_CONFIRMATION_LONG" ? "LONG" : null;
+    const { engine } = makeEngine({ laneDirectionForId });
+    expect(engine.setManualDirectionalLaneAllocations({
+      long: [{ laneId: "REGIME_COMPOSITE_CONFIRMATION_LONG", weightPct: 100 }],
+      short: [],
+    }).ok).toBe(true);
+  });
+
+  it("manualDirectionalLaneMismatchReason (pure): matches variant-suffixed lane ids via the trailing " +
+    "segment, same convention as laneSelectionWeightPctForLane", () => {
+    const laneDirectionForId = (laneId: string): "LONG" | "SHORT" | "NEUTRAL" | null =>
+      laneId === "SHORT_FADE_EXHAUSTION_CROWDED" ? "SHORT" : null;
+    expect(
+      manualDirectionalLaneMismatchReason("long", "CG_VARIANT_MATRIX:SHORT_FADE_EXHAUSTION_CROWDED", laneDirectionForId),
+    ).toMatch(/fixed SHORT-direction lane/);
+    expect(
+      manualDirectionalLaneMismatchReason("short", "CG_VARIANT_MATRIX:SHORT_FADE_EXHAUSTION_CROWDED", laneDirectionForId),
+    ).toBeNull();
+    expect(manualDirectionalLaneMismatchReason("long", "UNKNOWN_LANE", laneDirectionForId)).toBeNull();
   });
 });
