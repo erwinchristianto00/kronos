@@ -1,10 +1,14 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { existsSync, readFileSync, rmSync } from "node:fs";
-import { resolve } from "node:path";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+
+import { buildCandidate, type Candidate, type Candle } from "@dtc/shared";
 
 import { buildApp } from "../src/app.js";
+import { DecisionLedger, _resetDecisionLedgerForTests } from "../src/lib/decision-ledger.js";
 import { _resetParallelShadowExperimentStoreForTests } from "../src/lib/parallel-shadow-experiments.js";
-import { _resetScanProviderCircuitsForTests } from "../src/lib/scan-service.js";
+import { ScanService, _resetScanProviderCircuitsForTests } from "../src/lib/scan-service.js";
 
 function makeKlines(step: number, intervalMs: number) {
   const latestOpenTime = Date.now() - intervalMs;
@@ -28,6 +32,37 @@ function makeKlines(step: number, intervalMs: number) {
   });
 }
 
+// Mirrors shadow-engine.test.ts's makeCandles fixture: builds a well-formed, non-degenerate candle
+// series so buildCandidate() produces a candidate that clears the SKIP thresholds (liquidity,
+// spread, risk-reward), independent of this file's HTTP-level klines mocks.
+function makeCandles({
+  start = 95,
+  step = 0.2,
+  volumeBase = 1000,
+  count = 160,
+  timeStepMs = 5 * 60 * 1000,
+  startTime = Date.UTC(2026, 4, 6, 0, 0, 0),
+}: {
+  start?: number;
+  step?: number;
+  volumeBase?: number;
+  count?: number;
+  timeStepMs?: number;
+  startTime?: number;
+} = {}): Candle[] {
+  return Array.from({ length: count }, (_, index) => {
+    const close = start + index * step;
+    return {
+      openTime: startTime + index * timeStepMs,
+      open: close - step * 0.25,
+      high: close + Math.abs(step) * 0.5 + 1,
+      low: close - Math.abs(step) * 0.5 - 1,
+      close,
+      volume: volumeBase + index * 10,
+    };
+  });
+}
+
 describe("GET /api/scan", () => {
   const originalEnv = { ...process.env };
 
@@ -36,6 +71,7 @@ describe("GET /api/scan", () => {
     vi.restoreAllMocks();
     _resetScanProviderCircuitsForTests();
     _resetParallelShadowExperimentStoreForTests();
+    _resetDecisionLedgerForTests();
     const matrixPath = resolve(process.cwd(), "data", "parallel-shadow-experiments.json");
     if (existsSync(matrixPath)) rmSync(matrixPath, { force: true });
     const timingPath = resolve(process.cwd(), "data", "scan-timing-diagnostics.json");
@@ -449,5 +485,104 @@ describe("GET /api/scan", () => {
     expect(second.json().coverage.cacheFreshSymbols).toBeGreaterThan(0);
 
     await app.close();
+  });
+
+  it("isolates decision-ledger recording per candidate so one failure doesn't suppress the rest (fail-without/pass-with)", async () => {
+    const ledgerDir = mkdtempSync(join(tmpdir(), "dtc-scan-ledger-"));
+    process.env.DECISION_LEDGER_FILE = join(ledgerDir, "decision-log.jsonl");
+
+    const fetchImpl = vi.fn(async (input: string | URL) => {
+      const url = input.toString();
+      if (url.endsWith("/health")) {
+        return new Response(JSON.stringify({ ok: true, modelConnected: false }), { status: 200 });
+      }
+      throw new Error(`Unhandled URL: ${url}`);
+    });
+
+    const app = await buildApp({
+      fetchImpl: fetchImpl as typeof fetch,
+      kronosBaseUrl: "http://localhost:8001",
+    });
+
+    // Bypass the scoring pipeline entirely (unrelated to this bug) by stubbing scan() to return
+    // several already-built, non-SKIP candidates directly, so top10 has more than one entry.
+    const candidateCount = 4;
+    const fakeCandidate = (symbol: string): Candidate =>
+      buildCandidate({
+        symbol,
+        candles5m: makeCandles(),
+        candles15m: makeCandles({ timeStepMs: 15 * 60 * 1000 }),
+        candles1h: makeCandles({ timeStepMs: 60 * 60 * 1000 }),
+        spread: { bid: 100, ask: 100.02, absolute: 0.02, percent: 0.02 },
+        volume: { quoteVolume24h: 150_000_000, baseVolume24h: 2_000_000, volumeRatio5m: 1.4 },
+        kronos: {
+          available: true,
+          kronosLongProbability: 80,
+          kronosShortProbability: 20,
+          kronosBias: "LONG",
+          kronosConfidence: 76,
+          kronosConfidenceBucket: "STRONG",
+          expectedReturn1h: 1.2,
+          expectedReturn4h: 2.1,
+          probabilityUp: 70,
+          probabilityDown: 30,
+          forecastMaxHigh: 105,
+          forecastMinLow: 97,
+          kronosRisk: 30,
+        },
+        whale: { available: true, signal: "BULLISH", score: 75, reason: "aligned" },
+        sentiment: { available: false, signal: "UNAVAILABLE", score: 0, source: "none" },
+      });
+    const fakeCandidates = Array.from({ length: candidateCount }, (_, i) => ({
+      ...fakeCandidate(`FAKE${i}USDT`),
+      rank: i + 1,
+      direction: "LONG" as const,
+      finalDirection: "LONG" as const,
+      status: "READY" as const,
+      finalStatus: "READY" as const,
+      entryZone: [99.5, 100.2] as [number, number],
+      stopLoss: 98.0,
+      takeProfits: { tp1: 103.0, tp2: 105, tp3: 107 },
+      riskReward: 1.8,
+      dangerScore: 30,
+    }));
+    const scanSpy = vi.spyOn(ScanService.prototype, "scan").mockResolvedValue({
+      generatedAt: new Date().toISOString(),
+      coverage: { totalSymbols: candidateCount, scannedSymbols: candidateCount, returnedSymbols: candidateCount, skippedSymbols: 0, percent: 100 },
+      marketRegime: "Mixed rotation",
+      top10: fakeCandidates,
+      diagnostics: {
+        universe: fakeCandidates.map((c) => c.symbol),
+        skippedSymbols: [],
+        symbolFailures: [],
+        hiddenSkips: [],
+        kronos: { available: true, message: "ok" },
+        whale: { available: true, message: "ok" },
+        sentiment: { available: false, message: "off" },
+      },
+    });
+
+    // Fail exactly the FIRST candidate's ledger write (e.g. disk full for that one call) and let
+    // the rest call through to the real method.
+    const recordSpy = vi.spyOn(DecisionLedger.prototype, "recordRouteAssigned").mockImplementationOnce(() => {
+      throw new Error("disk full");
+    });
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const response = await app.inject({ method: "GET", url: "/api/scan" });
+
+    expect(response.statusCode).toBe(200);
+    expect(scanSpy).toHaveBeenCalled();
+    expect(recordSpy).toHaveBeenCalledTimes(candidateCount);
+    expect(errorSpy).toHaveBeenCalled();
+    // Isolation: the (candidateCount - 1) candidates AFTER the failing one must still be recorded,
+    // not skipped as a side effect of the first candidate's write throwing.
+    const ledgerFile = process.env.DECISION_LEDGER_FILE!;
+    const lines = readFileSync(ledgerFile, "utf-8").trim().split("\n");
+    const routeAssignedCount = lines.map((l) => JSON.parse(l)).filter((e) => e.event === "ROUTE_ASSIGNED").length;
+    expect(routeAssignedCount).toBe(candidateCount - 1);
+
+    await app.close();
+    rmSync(ledgerDir, { recursive: true, force: true });
   });
 });

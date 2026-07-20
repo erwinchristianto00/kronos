@@ -391,42 +391,49 @@ export async function registerScanRoute(
         const ledger = getDecisionLedger(process.env.DECISION_LEDGER_FILE ?? "data/decision-log.jsonl");
         const ts = new Date().toISOString();
         for (const candidate of top10WithPlan) {
-          const plan = candidate.selectedExecutionPlan;
-          const whaleAvail = candidate.whale.available;
-          const whaleAgrees =
-            (candidate.finalDirection === "LONG" && candidate.whale.signal === "BULLISH") ||
-            (candidate.finalDirection === "SHORT" && candidate.whale.signal === "BEARISH");
-          const whaleDisagrees =
-            (candidate.finalDirection === "LONG" && candidate.whale.signal === "BEARISH") ||
-            (candidate.finalDirection === "SHORT" && candidate.whale.signal === "BULLISH");
-          const dir: "LONG" | "SHORT" = candidate.finalDirection === "SHORT" ? "SHORT" : "LONG";
-          ledger.recordRouteAssigned({
-            timestamp: ts,
-            symbol: candidate.symbol,
-            direction: dir,
-            candidateId: `${candidate.symbol}-${candidate.finalDirection}-${ts}`,
-            selectedExecutionPlan: plan ?? null,
-            routeMode: plan?.routeMode ?? null,
-            routeReasonCodes: plan?.routeReasonCodes ?? [],
-            expectedNetR: plan?.expectedNetR ?? null,
-            expectedGrossR: plan?.expectedGrossR ?? null,
-            costR: plan?.costR ?? null,
-            stopDistanceBps: plan?.stopDistanceBps ?? null,
-            kronosBias: candidate.selectedKronosBias ?? candidate.kronosBias ?? null,
-            kronosHorizonConflict: candidate.horizonConflict ?? false,
-            liveSourceConflict: candidate.sourceConflict ?? null,
-            whaleAgreement: !whaleAvail
-              ? "UNAVAILABLE"
-              : whaleAgrees
-                ? "AGREES"
-                : whaleDisagrees
-                  ? "DISAGREES"
-                  : "UNAVAILABLE",
-          });
+          // Per-candidate isolation (mirrors shadow-engine.ts's emitLifecycleEvents): one
+          // candidate's write failure must not prevent the rest of top10 from being recorded.
+          try {
+            const plan = candidate.selectedExecutionPlan;
+            const whaleAvail = candidate.whale.available;
+            const whaleAgrees =
+              (candidate.finalDirection === "LONG" && candidate.whale.signal === "BULLISH") ||
+              (candidate.finalDirection === "SHORT" && candidate.whale.signal === "BEARISH");
+            const whaleDisagrees =
+              (candidate.finalDirection === "LONG" && candidate.whale.signal === "BEARISH") ||
+              (candidate.finalDirection === "SHORT" && candidate.whale.signal === "BULLISH");
+            const dir: "LONG" | "SHORT" = candidate.finalDirection === "SHORT" ? "SHORT" : "LONG";
+            ledger.recordRouteAssigned({
+              timestamp: ts,
+              symbol: candidate.symbol,
+              direction: dir,
+              candidateId: `${candidate.symbol}-${candidate.finalDirection}-${ts}`,
+              selectedExecutionPlan: plan ?? null,
+              routeMode: plan?.routeMode ?? null,
+              routeReasonCodes: plan?.routeReasonCodes ?? [],
+              expectedNetR: plan?.expectedNetR ?? null,
+              expectedGrossR: plan?.expectedGrossR ?? null,
+              costR: plan?.costR ?? null,
+              stopDistanceBps: plan?.stopDistanceBps ?? null,
+              kronosBias: candidate.selectedKronosBias ?? candidate.kronosBias ?? null,
+              kronosHorizonConflict: candidate.horizonConflict ?? false,
+              liveSourceConflict: candidate.sourceConflict ?? null,
+              whaleAgreement: !whaleAvail
+                ? "UNAVAILABLE"
+                : whaleAgrees
+                  ? "AGREES"
+                  : whaleDisagrees
+                    ? "DISAGREES"
+                    : "UNAVAILABLE",
+            });
+          } catch (err) {
+            // ledger failures must never break the scan
+            console.error(`[scan] decision-ledger recordRouteAssigned failed for ${candidate.symbol}:`, err);
+          }
         }
       } catch (err) {
         // ledger failures must never break the scan
-        console.error("[scan] decision-ledger recordRouteAssigned failed:", err);
+        console.error("[scan] decision-ledger recording failed:", err);
       } finally {
         timing.finishStage("decisionLedger");
       }
