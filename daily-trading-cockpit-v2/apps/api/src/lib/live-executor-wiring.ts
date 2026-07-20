@@ -93,6 +93,17 @@ export function computeExternalManagedNetQty(
         net.set(leg.symbol, (net.get(leg.symbol) ?? 0) + (leg.side === "LONG" ? leg.qty : -leg.qty));
       }
     }
+    // 2026-07-19 real-money audit follow-up: an orphaned leg (see cross-sectional-executor.ts's
+    // OrphanedLeg doc comment — a real, still-open exchange position a basket's own bookkeeping
+    // can no longer reach through openBaskets, from a basket-abort flatten failure or a partial
+    // close fill) is REAL exchange exposure exactly like an open basket leg — omitting it here
+    // means reconcile() sees this real position with claimed=0, logs it as an unexplained "orphan
+    // exchange position", and force-disarms the account (this exact bug class has hit this
+    // codebase before, per this function's own doc comment above) even though it is a KNOWN,
+    // already-self-healing orphan being retried every tick.
+    for (const orphan of exec.getStatus().orphanedLegs) {
+      net.set(orphan.symbol, (net.get(orphan.symbol) ?? 0) + (orphan.side === "LONG" ? orphan.qty : -orphan.qty));
+    }
   }
   for (const exec of singleSymbolExecutors) {
     if (!exec) continue;
@@ -150,6 +161,14 @@ export function computeNotionalPerSymbol(
         if (leg.exitOrderId !== null) continue;
         notional.set(leg.symbol, (notional.get(leg.symbol) ?? 0) + Math.abs(leg.qty * leg.entryPrice));
       }
+    }
+    // 2026-07-19 real-money audit follow-up: an orphaned leg is real, still-open notional on the
+    // exchange (see computeExternalManagedNetQty's identical addition above for the full
+    // rationale) — without this, a fresh basket or single-symbol lane could stack additional real
+    // exposure on a symbol that already carries unresolved orphaned exposure, exactly what this
+    // cap exists to prevent.
+    for (const orphan of exec.getStatus().orphanedLegs) {
+      notional.set(orphan.symbol, (notional.get(orphan.symbol) ?? 0) + Math.abs(orphan.qty * orphan.entryPrice));
     }
   }
   return notional;
@@ -270,6 +289,13 @@ export function computeClusterOpenSymbols(
         if (leg.exitOrderId !== null) continue;
         add(leg.symbol, leg.side);
       }
+    }
+    // 2026-07-19 real-money audit follow-up: an orphaned leg is a real, still-open position in
+    // its cluster exactly like an open basket leg (see computeExternalManagedNetQty's identical
+    // addition above for the full rationale) — omitting it here would let the correlated-cluster
+    // cap undercount real exposure while an orphan is unresolved.
+    for (const orphan of exec.getStatus().orphanedLegs) {
+      add(orphan.symbol, orphan.side);
     }
   }
   for (const exec of singleSymbolExecutors) {

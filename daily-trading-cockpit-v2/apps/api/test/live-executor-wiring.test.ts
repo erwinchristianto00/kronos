@@ -9,7 +9,7 @@ import {
   rollingNetEntryHealth,
   type LiveExecutorGateEngine,
 } from "../src/lib/live-executor-wiring.js";
-import type { CrossSectionalExecutor, ExecutorBasket } from "../src/lib/cross-sectional-executor.js";
+import type { CrossSectionalExecutor, ExecutorBasket, OrphanedLeg } from "../src/lib/cross-sectional-executor.js";
 import type { SingleSymbolLaneExecutor, SingleSymbolPosition } from "../src/lib/single-symbol-lane-executor.js";
 
 function fakeEngine(over: Partial<LiveExecutorGateEngine> = {}): LiveExecutorGateEngine {
@@ -95,8 +95,14 @@ function fakeBasket(legs: ExecutorBasket["legs"]): ExecutorBasket {
 function fakeLeg(symbol: string, side: "LONG" | "SHORT", qty: number, exitOrderId: number | null = null): ExecutorBasket["legs"][number] {
   return { symbol, side, qty, entryPrice: 1, entryOrderId: 1, entryPriceConfirmed: true, exitPrice: null, exitOrderId, exitPriceConfirmed: null };
 }
-function fakeXsecExecutor(baskets: ExecutorBasket[]): CrossSectionalExecutor {
-  return { getStatus: () => ({ openBaskets: baskets }) } as unknown as CrossSectionalExecutor;
+function fakeOrphanedLeg(symbol: string, side: "LONG" | "SHORT", qty: number, entryPrice = 1): OrphanedLeg {
+  return {
+    basketId: "b1", symbol, side, qty, entryPrice, entryOrderId: "1",
+    since: "2026-07-19T00:00:00.000Z", lastAttemptAt: "2026-07-19T00:00:00.000Z", lastError: "test fixture", attempts: 1,
+  };
+}
+function fakeXsecExecutor(baskets: ExecutorBasket[], orphanedLegs: OrphanedLeg[] = []): CrossSectionalExecutor {
+  return { getStatus: () => ({ openBaskets: baskets, orphanedLegs }) } as unknown as CrossSectionalExecutor;
 }
 function fakePosition(symbol: string, direction: "LONG" | "SHORT", qty: number, exitOrderId: number | null = null, entryPrice = 1): SingleSymbolPosition {
   return {
@@ -143,6 +149,20 @@ describe("computeExternalManagedNetQty", () => {
   it("returns an empty map when everything is null or has no open legs/positions", () => {
     expect(computeExternalManagedNetQty([null, null], [null]).size).toBe(0);
     expect(computeExternalManagedNetQty([fakeXsecExecutor([])], [fakeSingleSymbolExecutor([])]).size).toBe(0);
+  });
+
+  describe("2026-07-19 real-money audit follow-up: orphaned legs count as real exposure", () => {
+    it("folds an orphaned leg's qty into the net exactly like an open basket leg", () => {
+      const exec = fakeXsecExecutor([], [fakeOrphanedLeg("BTCUSDT", "LONG", 0.4)]);
+      const net = computeExternalManagedNetQty([exec], []);
+      expect(net.get("BTCUSDT")).toBeCloseTo(0.4, 9);
+    });
+
+    it("combines an orphaned leg with a live open leg on the SAME symbol", () => {
+      const exec = fakeXsecExecutor([fakeBasket([fakeLeg("ETHUSDT", "SHORT", 1)])], [fakeOrphanedLeg("ETHUSDT", "LONG", 0.3)]);
+      const net = computeExternalManagedNetQty([exec], []);
+      expect(net.get("ETHUSDT")).toBeCloseTo(-0.7, 9); // -1 (short leg) + 0.3 (orphan)
+    });
   });
 });
 
@@ -194,6 +214,25 @@ describe("computeNotionalPerSymbol (2026-07-09 cross-lane per-symbol notional ca
 
     it("skips null cross-sectional slots and returns an empty map when nothing is open on either side", () => {
       expect(computeNotionalPerSymbol([null], [null, fakeXsecExecutor([])]).size).toBe(0);
+    });
+  });
+
+  describe("2026-07-19 real-money audit follow-up: an unresolved orphaned leg counts toward the cap", () => {
+    it("folds an orphaned leg's notional into the total on its symbol", () => {
+      const exec = fakeXsecExecutor([], [fakeOrphanedLeg("SOLUSDT", "LONG", 2, 100)]);
+      const notional = computeNotionalPerSymbol([], [exec]);
+      expect(notional.get("SOLUSDT")).toBeCloseTo(200, 6);
+    });
+
+    it("prevents a fresh single-symbol lane from silently exceeding the cap alongside an unresolved orphan", () => {
+      const xsec = fakeXsecExecutor([], [fakeOrphanedLeg("SOLUSDT", "LONG", 2, 100)]); // $200 already real/unresolved
+      const notionalBefore = computeNotionalPerSymbol([], [xsec]);
+      expect(notionalBefore.get("SOLUSDT")).toBeCloseTo(200, 6);
+      // A single-symbol lane sizing a fresh $100 entry on the same symbol would see $300 total,
+      // not $100 — exactly the visibility this cap exists to provide.
+      const single = fakeSingleSymbolExecutor([fakePosition("SOLUSDT", "LONG", 1, null, 100)]);
+      const notionalAfter = computeNotionalPerSymbol([single], [xsec]);
+      expect(notionalAfter.get("SOLUSDT")).toBeCloseTo(300, 6);
     });
   });
 });
@@ -293,5 +332,12 @@ describe("computeClusterOpenSymbols (2026-07-19 real-money audit fix: correlated
 
   it("skips null executor slots and returns an empty map when nothing is open anywhere", () => {
     expect(computeClusterOpenSymbols([], [null], [null]).size).toBe(0);
+  });
+
+  it("2026-07-19 real-money audit follow-up: an orphaned leg counts toward its cluster exactly like an open leg", () => {
+    // ADAUSDT is L1 — same cluster as the mirror's SOLUSDT intent.
+    const xsec = fakeXsecExecutor([], [fakeOrphanedLeg("ADAUSDT", "LONG", 10)]);
+    const open = computeClusterOpenSymbols([{ symbol: "SOLUSDT", direction: "LONG" }], [xsec], []);
+    expect(open.get("L1:LONG")).toEqual(new Set(["SOLUSDT", "ADAUSDT"]));
   });
 });
