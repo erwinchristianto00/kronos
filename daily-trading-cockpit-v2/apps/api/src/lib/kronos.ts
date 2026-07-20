@@ -11,6 +11,13 @@ const MAX_RECENT_ATTEMPTS = 20;
 // Serialising requests (concurrency=1) eliminates the race until the sidecar is patched.
 const KRONOS_CONCURRENCY = 1;
 const FORECAST_CACHE_TTL_MS = 10 * 60 * 1000;
+// On the real trading path this cache is naturally bounded (fixed ~20-symbol UNIVERSE x a
+// handful of timeframes — well under 100 keys). But /api/kronos/test-symbol accepts an arbitrary,
+// unvalidated symbol string and writes through this same cache (see debugPredict's cacheKey),
+// so repeated calls with distinct real symbols outside the fixed universe could otherwise mint
+// permanent entries with no cap. This bound only bites on that abuse path; the normal universe
+// never gets close to it.
+const MAX_FORECAST_CACHE_ENTRIES = 200;
 const LAST_FORECAST_HEALTH_TTL_MS = Number.isFinite(Number(process.env.KRONOS_LAST_FORECAST_HEALTH_TTL_MS))
   ? Math.max(60_000, Number(process.env.KRONOS_LAST_FORECAST_HEALTH_TTL_MS))
   : 30 * 60 * 1000;
@@ -585,6 +592,31 @@ export class HttpKronosClient implements KronosClient {
     }
   }
 
+  /** Bounds forecastCache — see MAX_FORECAST_CACHE_ENTRIES's comment for why this exists. First
+   *  drops anything already TTL-expired, then (only if still over the cap) evicts the
+   *  least-recently-written entries first. Real universe symbols get re-set on every scan cycle,
+   *  which bumps their expiresAt forward, so they naturally sort to the "keep" side; one-off
+   *  symbols from /api/kronos/test-symbol don't get refreshed and sort to the "evict" side. */
+  private pruneForecastCache(now: number): void {
+    for (const [key, entry] of this.forecastCache) {
+      if (entry.expiresAt <= now) {
+        this.forecastCache.delete(key);
+      }
+    }
+    if (this.forecastCache.size > MAX_FORECAST_CACHE_ENTRIES) {
+      const oldestFirst = [...this.forecastCache.entries()].sort((a, b) => a[1].expiresAt - b[1].expiresAt);
+      const excess = this.forecastCache.size - MAX_FORECAST_CACHE_ENTRIES;
+      for (let i = 0; i < excess; i += 1) {
+        this.forecastCache.delete(oldestFirst[i]![0]);
+      }
+    }
+  }
+
+  /** Test-only introspection hook (mirrors BinanceClient's _getCacheSizeForTests convention). */
+  _getForecastCacheSizeForTests(): number {
+    return this.forecastCache.size;
+  }
+
   private buildAvailability(base: {
     configured: boolean;
     reachable: boolean;
@@ -1034,6 +1066,7 @@ export class HttpKronosClient implements KronosClient {
         this.recordAttempt(prediction);
         if (prediction.available) {
           this.forecastCache.set(cacheKey, { prediction, expiresAt: now + FORECAST_CACHE_TTL_MS });
+          this.pruneForecastCache(now);
         }
         return prediction;
       } catch (error) {
