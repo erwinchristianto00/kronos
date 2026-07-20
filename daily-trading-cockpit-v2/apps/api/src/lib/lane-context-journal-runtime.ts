@@ -157,6 +157,9 @@ export function recordExecLifecycle(rec: Omit<ExecutionLifecycleEvent, "schemaVe
     if (!act.active) return false;
     if (act.instanceId !== "3101" && act.instanceId !== "3102" && act.instanceId !== "3103") return false; // belt: only known instances
     const paths = laneJournalPaths(act.instanceId, baseDir(env));
+    // Same writer-lock gate as the resolution + snapshot call-sites — a concurrent second process for this
+    // instanceId (pm2 restart race, crash zombie) must be SURFACED (refuse to write), not silently interleaved.
+    if (!ensureWriterLock(paths.dir, act.instanceId, nowMsSafe(rec.eventAtMs))) return false;
     const lifecyclePath = `${paths.dir}/lifecycle.jsonl`;
     const wrote = recordLifecycle(
       // Rotation-bounded JSONL append (same discipline as the snapshot journal) so lifecycle.jsonl cannot grow

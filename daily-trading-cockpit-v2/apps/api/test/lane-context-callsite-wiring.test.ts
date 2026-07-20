@@ -231,15 +231,33 @@ describe("lifecycle call-site tap — gated + fail-open", () => {
     expect(written.schemaVersion).toBe("exec-lifecycle-1");
   });
 
-  it("fail-open: a broken dir yields false without throwing, journalErrors incremented", () => {
-    const fileAsDir = join(tmp(), "f");
-    writeFileSync(fileAsDir, "x");
+  it("fail-open: a broken lifecycle append target yields false without throwing, journalErrors incremented", () => {
+    const dir = tmp();
+    const instDir = join(dir, "lane-context", "3102");
+    mkdirSync(instDir, { recursive: true });
+    // a DIRECTORY where lifecycle.jsonl should be ⇒ the writer-lock itself succeeds (real dir), but the append throws
+    mkdirSync(join(instDir, "lifecycle.jsonl"));
     let threw = false;
     let ok = true;
-    try { ok = recordExecLifecycle(rec, { EXEC_LIFECYCLE_TIMESTAMPS: "1", FOUR_BRAIN_INSTANCE_ID: "3102", LANE_CONTEXT_JOURNAL_DIR: fileAsDir }); } catch { threw = true; }
+    try { ok = recordExecLifecycle(rec, { EXEC_LIFECYCLE_TIMESTAMPS: "1", FOUR_BRAIN_INSTANCE_ID: "3102", LANE_CONTEXT_JOURNAL_DIR: dir }); } catch { threw = true; }
     expect(threw).toBe(false);
     expect(ok).toBe(false);
     expect(lifecycleMetrics.journalErrors).toBeGreaterThan(0);
+  });
+
+  it("a concurrent live-writer lock ⇒ recordExecLifecycle returns false without throwing or writing (BUG 2 fix)", () => {
+    const dir = tmp();
+    const instDir = join(dir, "lane-context", "3102");
+    mkdirSync(instDir, { recursive: true });
+    // simulate another LIVE process holding the writer lock for this instance (same shape as the resolution-scan test)
+    writeFileSync(join(instDir, ".writer.lock"), JSON.stringify({ pid: 1, instanceId: "3102", startedAtMs: 4_000 }));
+    let threw = false;
+    let ok = true;
+    try { ok = recordExecLifecycle({ ...rec, eventAtMs: 5_000 }, { EXEC_LIFECYCLE_TIMESTAMPS: "1", FOUR_BRAIN_INSTANCE_ID: "3102", LANE_CONTEXT_JOURNAL_DIR: dir }); }
+    catch { threw = true; }
+    expect(threw).toBe(false);
+    expect(ok).toBe(false);
+    expect(existsSync(join(instDir, "lifecycle.jsonl"))).toBe(false); // never interleaved with the other writer
   });
 });
 
