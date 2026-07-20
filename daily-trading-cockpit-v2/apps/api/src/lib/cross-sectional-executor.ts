@@ -150,11 +150,47 @@ export interface ExecutorBasket {
   lastNetAt?: string | null;
 }
 
+/**
+ * 2026-07-19 real-money audit fix (BUG 1, HIGH — real-money risk): a REAL, still-open exchange
+ * position that this executor's normal bookkeeping can no longer reach through its usual
+ * HORIZON/PROFIT_BANK close paths. Two origins:
+ *  - maybeOpenBasket's abort path: one leg already opened, a LATER leg's placeOrder then threw
+ *    (a naked directional bet), and the abort handler's OWN flatten attempt for the already-opened
+ *    leg ALSO failed (e.g. a sibling XSEC executor already holds the opposite side on this symbol,
+ *    or a transient exchange/network error). Before this existed, that leg fell out of the
+ *    basket's bookkeeping entirely — recorded ABORTED with exitOrderId still null, but nothing
+ *    ever looked at it again.
+ *  - closeBasket's exit path: a genuine partial MARKET fill on the reduce-only close order left a
+ *    real, un-closed remainder on the exchange (see BUG 3's executedQty validation) — the
+ *    remainder is tracked here exactly like a failed-flatten leg, not silently dropped.
+ * retryOrphanedLegFlattens() retries the flatten every tick until it actually resolves (either a
+ * real fill, or the exchange confirming the position is already flat/opposite-signed — never
+ * blindly retried forever against a position that's already gone). getStatus().orphanedLegs
+ * surfaces this list so an operator (or a future account-wide reconciliation) can never mistake a
+ * still-failing retry for "handled".
+ */
+export interface OrphanedLeg {
+  basketId: string;
+  symbol: string;
+  side: "LONG" | "SHORT";
+  qty: number;
+  entryPrice: number;
+  entryOrderId: string;
+  /** ISO timestamp of the ORIGINAL failure that created this record — never updated on retry. */
+  since: string;
+  lastAttemptAt: string;
+  lastError: string;
+  attempts: number;
+}
+
 interface ExecutorState {
   version: number;
   baskets: ExecutorBasket[];
   /** openedAtMs watermark — signals at/below this are never re-executed. */
   lastSeenSignalMs: number;
+  /** See OrphanedLeg's doc comment. Persisted so a restart doesn't lose track of a still-exposed
+   *  position — same convention as live-execution-engine.ts's killSwitchFlattenFailedIntentIds. */
+  orphanedLegs: OrphanedLeg[];
 }
 
 export class CrossSectionalExecutorStore {
@@ -186,13 +222,19 @@ export class CrossSectionalExecutorStore {
               if (typeof leg.exitOrderId === "number") leg.exitOrderId = String(leg.exitOrderId);
             }
           }
+          // 2026-07-19 real-money audit fix (BUG 1): legacy records persisted before
+          // orphanedLegs existed have no such field on disk — default it, never leave it
+          // undefined (every reader below assumes an array).
+          if (!Array.isArray((parsed as { orphanedLegs?: unknown }).orphanedLegs)) {
+            (parsed as { orphanedLegs: OrphanedLeg[] }).orphanedLegs = [];
+          }
           return parsed as ExecutorState;
         }
       }
     } catch {
       // corrupt → fresh (positions reconcile against the exchange on next tick)
     }
-    return { version: 1, baskets: [], lastSeenSignalMs: Date.now() };
+    return { version: 1, baskets: [], lastSeenSignalMs: Date.now(), orphanedLegs: [] };
   }
 
   getState(): ExecutorState {
@@ -458,6 +500,13 @@ export class CrossSectionalExecutor {
      *  see deriveAdaptiveSymbolFilters's floor). Recomputed live from the signal store, so this
      *  reflects the CURRENT cycle, not a stale snapshot. */
     adaptiveFilters: ReturnType<typeof deriveAdaptiveSymbolFilters>["provenance"];
+    /** 2026-07-19 real-money audit fix (BUG 1, HIGH — real-money risk): real, still-open exchange
+     *  exposure this executor's normal HORIZON/PROFIT_BANK close paths can no longer reach — see
+     *  OrphanedLeg's doc comment. retryOrphanedLegFlattens() retries every tick automatically, but
+     *  a NON-EMPTY array here means a position is, right now, still open on the exchange with
+     *  every retry so far having failed — an operator (or a future account-wide reconciliation)
+     *  must never mistake a still-failing retry for "handled". */
+    orphanedLegs: OrphanedLeg[];
   } {
     const st = this.store.getState();
     const closed = st.baskets.filter((b) => b.status === "CLOSED");
@@ -492,6 +541,7 @@ export class CrossSectionalExecutor {
       signalMaxAgeMs,
       signalStale: signalAgeMs === null || signalAgeMs > signalMaxAgeMs,
       adaptiveFilters: deriveAdaptiveSymbolFilters(this.signalStore).provenance,
+      orphanedLegs: st.orphanedLegs ?? [],
     };
   }
 
@@ -548,6 +598,11 @@ export class CrossSectionalExecutor {
     if (this.ticking) return;
     this.ticking = true;
     try {
+      // 2026-07-19 real-money audit fix (BUG 1): retry any leg the basket-open abort path (or a
+      // partial exit fill, see BUG 3) previously failed to flatten — see OrphanedLeg's doc
+      // comment. Runs FIRST, every tick, for as long as it stays unresolved; a transient failure
+      // must self-heal, not leave real exposure silently open forever.
+      await this.retryOrphanedLegFlattens();
       await this.closeBasketsHittingProfitTarget();
       await this.closeDueBaskets();
       await this.ensureOpenBasketLeverage();
@@ -985,13 +1040,128 @@ export class CrossSectionalExecutor {
           const resolvedFlat = await this.resolveFillPrice(leg.symbol, flat.orderId, flat.avgPrice, leg.entryPrice);
           leg.exitPrice = resolvedFlat.price;
           leg.exitPriceConfirmed = resolvedFlat.confirmed;
-        } catch {
-          // leave for the operator/reconcile — recorded as ABORTED with legs visible
+        } catch (flattenError) {
+          // 2026-07-19 real-money audit fix (BUG 1, HIGH — real-money risk): this leg is now a
+          // REAL, still-open exchange position (e.g. a sibling XSEC executor already holds the
+          // opposite side on this symbol, or a transient exchange/network error) that this
+          // basket's own bookkeeping can never reach again — it is recorded ABORTED with
+          // exitOrderId still null, and nothing else in this file ever revisits an ABORTED
+          // basket. Track it explicitly so retryOrphanedLegFlattens() (called every tick) keeps
+          // trying to flatten it, and getStatus().orphanedLegs surfaces it prominently — it must
+          // never again just silently fall out of this basket's bookkeeping.
+          this.recordOrphanedLeg(basket, leg, flattenError);
         }
       }
       st.baskets.push(basket);
       this.store.save();
       throw error;
     }
+  }
+
+  /** See OrphanedLeg's doc comment. Pushes a NEW record — callers only ever invoke this once per
+   *  leg (the abort-flatten catch fires at most once per leg; a partial-exit remainder is a fresh
+   *  leg-like record every time), so no merge-with-existing lookup is needed. */
+  private recordOrphanedLeg(basket: ExecutorBasket, leg: ExecutorLeg, error: unknown): void {
+    const st = this.store.getState();
+    if (!Array.isArray(st.orphanedLegs)) st.orphanedLegs = [];
+    const now = this.nowIso();
+    const message = (error as Error)?.message ?? "flatten failed";
+    st.orphanedLegs.push({
+      basketId: basket.basketId,
+      symbol: leg.symbol,
+      side: leg.side,
+      qty: leg.qty,
+      entryPrice: leg.entryPrice,
+      entryOrderId: leg.entryOrderId,
+      since: now,
+      lastAttemptAt: now,
+      lastError: message,
+      attempts: 1,
+    });
+    this.store.save();
+    console.error(
+      `[cross-sectional-executor] ORPHANED LEG: ${leg.symbol} ${leg.side} qty=${leg.qty} from basket ` +
+        `${basket.basketId} could NOT be flattened (${message}) — real, still-open exchange exposure. ` +
+        `Tracked for automatic retry every tick; surfaced via getStatus().orphanedLegs.`,
+    );
+  }
+
+  /**
+   * 2026-07-19 real-money audit fix (BUG 1, HIGH — real-money risk): retries flattening every
+   * tracked orphaned leg (see OrphanedLeg's doc comment) on every tick, for as long as it stays
+   * unresolved. A plain reduceOnly MARKET close is attempted first (the safe default that can
+   * never over-close); if the exchange rejects it with -2022 (this leg's side is no longer
+   * covered by a same-signed position — e.g. a sibling XSEC executor's opposite exposure, or the
+   * position was already closed by some other path), the real exchange position is queried and,
+   * when it confirms the leg is genuinely already flat/opposite-signed, the record is resolved
+   * WITHOUT creating new exposure — mirroring closeBasket's own -2022 reconciliation exactly.
+   * Any other error (a transient exchange/network blip) just updates the record's lastError/
+   * attempts and is retried again on the next tick.
+   */
+  private async retryOrphanedLegFlattens(): Promise<void> {
+    const st = this.store.getState();
+    const pending = st.orphanedLegs ?? [];
+    if (pending.length === 0) return;
+    for (const orphan of [...pending]) {
+      try {
+        const order = await this.client.placeOrder({
+          symbol: orphan.symbol,
+          side: orphan.side === "LONG" ? "SELL" : "BUY",
+          type: "MARKET",
+          quantity: orphan.qty,
+          reduceOnly: true,
+          newClientOrderId: `xsec-orph-${orphan.basketId.slice(-10)}-${orphan.symbol.slice(0, 6)}`,
+        });
+        const resolved = await this.resolveFillPrice(orphan.symbol, order.orderId, order.avgPrice, orphan.entryPrice);
+        this.applyOrphanResolution(orphan, order.orderId, resolved.price, resolved.confirmed);
+      } catch (error) {
+        const message = (error as Error).message ?? "flatten retry failed";
+        if (/(?:code\s*)?-2022|ReduceOnly Order is rejected/i.test(message)) {
+          try {
+            const positions = await this.client.getPositions(orphan.symbol);
+            const positionAmt = positions.find((p) => p.symbol === orphan.symbol)?.positionAmt ?? 0;
+            const expectedSign = orphan.side === "LONG" ? 1 : -1;
+            if (Math.abs(positionAmt) <= 1e-9 || Math.sign(positionAmt) !== expectedSign) {
+              // The exchange no longer carries this leg — resolve WITHOUT creating opposite
+              // exposure, exactly closeBasket's own RECONCILED_POSITION_ALREADY_FLAT handling.
+              this.applyOrphanResolution(orphan, "POSITION_ALREADY_FLAT", null, false);
+              continue;
+            }
+          } catch {
+            // position lookup failed too — fall through, keep retrying next tick
+          }
+        }
+        const st2 = this.store.getState();
+        const current = (st2.orphanedLegs ?? []).find((o) => o === orphan);
+        if (current) {
+          current.lastError = message;
+          current.lastAttemptAt = this.nowIso();
+          current.attempts += 1;
+          this.store.save();
+        }
+      }
+    }
+  }
+
+  /** Resolves (removes) an orphaned-leg record and, when the ORIGINAL basket/leg record can
+   *  still be found, updates it with the real exit — so a basket's own legs array never
+   *  disagrees with what actually happened on the exchange. `exitPrice`/`exitPriceConfirmed` are
+   *  null/false for the POSITION_ALREADY_FLAT reconciliation path (no real fill occurred). */
+  private applyOrphanResolution(
+    orphan: OrphanedLeg,
+    exitOrderId: string,
+    exitPrice: number | null,
+    exitPriceConfirmed: boolean,
+  ): void {
+    const st = this.store.getState();
+    const basket = st.baskets.find((b) => b.basketId === orphan.basketId);
+    const leg = basket?.legs.find((l) => l.symbol === orphan.symbol && l.side === orphan.side && l.exitOrderId === null);
+    if (leg) {
+      leg.exitOrderId = exitOrderId;
+      leg.exitPrice = exitPrice;
+      leg.exitPriceConfirmed = exitPriceConfirmed;
+    }
+    st.orphanedLegs = (st.orphanedLegs ?? []).filter((o) => o !== orphan);
+    this.store.save();
   }
 }

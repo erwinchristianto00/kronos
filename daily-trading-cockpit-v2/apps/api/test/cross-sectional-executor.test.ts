@@ -114,10 +114,18 @@ class FakeExecClient implements CrossSectionalExecClient {
   /** Symbols where a reduceOnly order gets Binance's -2022 (netted account position has the
    *  opposite sign, e.g. a sibling basket holds a bigger opposite leg on the same symbol). */
   rejectReduceOnlyOn = new Set<string>();
+  /** [BUG 1 test support] When >0, the NEXT that many reduceOnly MARKET orders throw a
+   *  transient (non -2022) error instead of filling — simulates a Binance/network blip during a
+   *  basket-open-abort's flatten attempt (or an orphaned-leg retry). Decremented on each throw. */
+  failNextReduceOnlyOrders = 0;
   async placeOrder(params: { symbol: string; side: string; quantity: number; reduceOnly?: boolean }) {
     if (this.failOnSymbol === params.symbol && !params.reduceOnly) throw new Error(`exchange rejected ${params.symbol}`);
     if (params.reduceOnly && this.rejectReduceOnlyOn.has(params.symbol)) {
       throw new Error("Binance error HTTP 400 code -2022: ReduceOnly Order is rejected.");
+    }
+    if (params.reduceOnly && this.failNextReduceOnlyOrders > 0) {
+      this.failNextReduceOnlyOrders -= 1;
+      throw new Error("fake transient network error during flatten");
     }
     this.placed.push(params);
     const orderId = String(this.orderSeq++);
@@ -1028,5 +1036,92 @@ describe("TP-gap stamping + daily basket loss breaker (safety net, never a profi
     await executor.tick();
     expect(store.getState().baskets.filter((b) => b.status === "OPEN").length).toBe(1);
     expect(executor.getStatus().openHalted).toBeNull();
+  });
+});
+
+// ── 2026-07-19 real-money audit fix (BUG 1) ─────────────────────────────────
+describe("[BUG 1] orphaned-leg tracking + retry when a basket-open abort's flatten ALSO fails", () => {
+  it("tracks the still-open leg, surfaces it in getStatus, and self-heals via automatic retry on the next tick", async () => {
+    const client = new FakeExecClient();
+    client.failOnSymbol = "DOGEUSDT"; // long (SOL) opens, short (DOGE) fails -> basket aborts
+    client.failNextReduceOnlyOrders = 1; // the abort handler's OWN flatten of the SOL long ALSO fails once
+    const { executor, store } = makeExecutor({ client, signalMs: NOW_MS - 5 * 60_000 });
+    await executor.tick();
+
+    const basket = store.getState().baskets[0]!;
+    expect(basket.status).toBe("ABORTED");
+    const sol = basket.legs.find((l) => l.symbol === "SOLUSDT")!;
+    // FAIL-WITHOUT-FIX: before the fix, this leg silently fell out of ALL bookkeeping the moment
+    // the abort-flatten attempt itself threw — nothing tracked it, nothing retried it, and it
+    // stayed a real, open, un-flattened position on the exchange with no recovery path.
+    expect(sol.exitOrderId).toBeNull(); // still open on the exchange, never flattened
+
+    expect(store.getState().orphanedLegs).toHaveLength(1);
+    expect(store.getState().orphanedLegs[0]).toMatchObject({
+      basketId: basket.basketId,
+      symbol: "SOLUSDT",
+      side: "LONG",
+      qty: sol.qty,
+      attempts: 1,
+    });
+
+    const status = executor.getStatus();
+    expect(status.orphanedLegs).toHaveLength(1);
+    expect(status.orphanedLegs[0]).toMatchObject({ symbol: "SOLUSDT", side: "LONG" });
+
+    // FIX: the very next tick automatically retries the flatten — no operator action required,
+    // and nothing about the ABORTED basket's own state stopped this retry from happening.
+    await executor.tick();
+
+    expect(store.getState().orphanedLegs).toHaveLength(0);
+    expect(sol.exitOrderId).not.toBeNull(); // real fill recorded on the ORIGINAL basket leg
+    expect(sol.exitOrderId).not.toBe("POSITION_ALREADY_FLAT"); // a genuine flatten fill, not a reconciliation
+    expect(executor.getStatus().orphanedLegs).toHaveLength(0);
+  });
+
+  it("keeps retrying (never gives up, never disappears) across multiple consecutive failed retries", async () => {
+    const client = new FakeExecClient();
+    client.failOnSymbol = "DOGEUSDT";
+    client.failNextReduceOnlyOrders = 1; // initial abort-flatten fails
+    const { executor, store } = makeExecutor({ client, signalMs: NOW_MS - 5 * 60_000 });
+    await executor.tick();
+    expect(store.getState().orphanedLegs).toHaveLength(1);
+
+    client.failNextReduceOnlyOrders = 1; // the retry ALSO fails once more
+    await executor.tick();
+
+    const orphan = store.getState().orphanedLegs[0]!;
+    expect(orphan.attempts).toBe(2); // tracked, not silently dropped after the first failed retry
+    expect(orphan.lastError).toMatch(/transient network error/);
+
+    // Third time's the charm — no more injected failures.
+    await executor.tick();
+    expect(store.getState().orphanedLegs).toHaveLength(0);
+  });
+
+  it("resolves an orphaned leg without fabricating exposure when a retry's reduceOnly rejects because the exchange position is already flat", async () => {
+    const client = new FakeExecClient();
+    client.failOnSymbol = "DOGEUSDT";
+    client.failNextReduceOnlyOrders = 1; // initial abort-flatten fails (transient)
+    const { executor, store } = makeExecutor({ client, signalMs: NOW_MS - 5 * 60_000 });
+    await executor.tick();
+    expect(store.getState().orphanedLegs).toHaveLength(1);
+    // Exactly one non-reduceOnly SOLUSDT order so far: the original entry BUY.
+    const nonReduceOnlySolBefore = client.placed.filter((p) => p.symbol === "SOLUSDT" && !p.reduceOnly).length;
+    expect(nonReduceOnlySolBefore).toBe(1);
+
+    // Before the retry runs: the exchange no longer carries the SOL long at all (e.g. resolved by
+    // some other path) — a plain reduceOnly SELL retry would now CREATE a brand-new short.
+    client.rejectReduceOnlyOn.add("SOLUSDT");
+    client.positionAmtBySymbol.set("SOLUSDT", 0);
+    await executor.tick();
+
+    expect(store.getState().orphanedLegs).toHaveLength(0); // resolved, not retried forever
+    const basket = store.getState().baskets[0]!;
+    const sol = basket.legs.find((l) => l.symbol === "SOLUSDT")!;
+    expect(sol.exitOrderId).toBe("POSITION_ALREADY_FLAT");
+    // Critically: the retry never created NEW (non-reduceOnly) exposure to "close" an
+    // already-flat position — the count of non-reduceOnly SOLUSDT orders is unchanged.
+    expect(client.placed.filter((p) => p.symbol === "SOLUSDT" && !p.reduceOnly).length).toBe(nonReduceOnlySolBefore);
   });
 });
