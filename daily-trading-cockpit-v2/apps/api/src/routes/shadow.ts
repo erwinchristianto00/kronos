@@ -353,6 +353,13 @@ function parsePositiveIntEnv(value: string | undefined, fallback: number): numbe
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+// Fastify returns an array (not the declared TS string) when a querystring key is
+// repeated, e.g. ?dims=a&dims=b — the route's TS generic has no runtime schema
+// enforcement, so callers must guard before calling .split()/.trim() on it.
+function coerceQueryString(value: unknown): string | undefined {
+  return typeof value === "string" ? value : undefined;
+}
+
 export async function registerShadowRoutes(
   app: FastifyInstance,
   shadowEngine: ShadowExecutionEngine | null,
@@ -3088,7 +3095,7 @@ export async function registerShadowRoutes(
         },
       };
 
-      const boxes = (request.query?.boxes ?? "4,8")
+      const boxes = (coerceQueryString(request.query?.boxes) ?? "4,8")
         .split(",")
         .map((s) => Number(s.trim()))
         .filter((n) => Number.isFinite(n) && n > 0)
@@ -3168,14 +3175,14 @@ export async function registerShadowRoutes(
         },
       };
 
-      const variantsParam = (request.query?.variants ?? "").trim().toLowerCase();
+      const variantsParam = (coerceQueryString(request.query?.variants) ?? "").trim().toLowerCase();
       let variants: FastTpVariant[];
       if (variantsParam === "trail-sweep") {
         variants = buildFastTpTrailSweepVariants(); // 0.75R / 50% partial, trail 0.25..1.25R
       } else if (variantsParam === "trail-grid") {
         variants = buildFastTpTrailGridVariants(); // firstTP × partial × trail (27)
       } else {
-        const levels = (request.query?.variants ?? "0.25,0.5,0.75")
+        const levels = (coerceQueryString(request.query?.variants) ?? "0.25,0.5,0.75")
           .split(",")
           .map((s) => Number(s.trim()))
           .filter((n) => Number.isFinite(n) && n > 0)
@@ -3242,9 +3249,8 @@ export async function registerShadowRoutes(
         .orders.filter((o) => o.selectedLaneId === SOURCE_LANE)
         .slice(-limit);
 
-      const dims = request.query?.dims
-        ? request.query.dims.split(",").map((s) => s.trim()).filter(Boolean)
-        : undefined;
+      const dimsParam = coerceQueryString(request.query?.dims);
+      const dims = dimsParam ? dimsParam.split(",").map((s) => s.trim()).filter(Boolean) : undefined;
       const minRaw = Number(request.query?.minN);
       const toxRaw = Number(request.query?.toxic);
       const report = buildEntryCohortDiagnostic(orders, {
@@ -3332,7 +3338,7 @@ export async function registerShadowRoutes(
         },
       };
 
-      const offsets = (request.query?.offsets ?? "-10,-5,-3,-1,0,1,3,5,10")
+      const offsets = (coerceQueryString(request.query?.offsets) ?? "-10,-5,-3,-1,0,1,3,5,10")
         .split(",")
         .map((s) => Number(s.trim()))
         .filter((n) => Number.isFinite(n))
