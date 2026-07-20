@@ -3198,6 +3198,103 @@ describe("weighted lane allocation (POST /api/live/lane-allocations)", () => {
   });
 });
 
+describe("CORTEX Phase-4 promoted-weight override (2026-07-20, operator-approved testnet-only)", () => {
+  it("2026-07-20 HIGH safety-review fix: never reinstates a lane the operator explicitly excluded from the weighted table", () => {
+    const { engine } = makeEngine();
+    engine.setLaneAllocations([{ laneId: "CG_WIDE_FAST_SHORT", weightPct: 70 }]); // CG_WIDE_FAST_LONG deliberately omitted
+    expect(engine.laneSelectionWeightPctForLane("CG_WIDE_FAST_LONG")).toBe(0); // blocked, as expected
+
+    // CORTEX's roster covers CG_WIDE_FAST_LONG and computes a real nonzero tilt for it — but the
+    // operator never funded this lane in the live weighted-allocation table at all.
+    engine.setCortexPromotedWeights({ CG_WIDE_FAST_SHORT: 5, CG_WIDE_FAST_LONG: 20 });
+    expect(engine.laneSelectionWeightPctForLane("CG_WIDE_FAST_LONG")).toBe(0); // still blocked — CORTEX may only rescale, never reinstate
+    expect(engine.laneSelectionWeightPctForLane("CG_WIDE_FAST_SHORT")).toBe(5); // the already-funded lane still tilts normally
+  });
+
+  it("overrides the plain allocation table's weight for a listed lane once installed", () => {
+    const { engine } = makeEngine();
+    engine.setLaneAllocations([{ laneId: "CG_WIDE_FAST_SHORT", weightPct: 70 }]);
+    expect(engine.laneSelectionWeightPctForLane("CG_WIDE_FAST_SHORT")).toBe(70);
+
+    engine.setCortexPromotedWeights({ CG_WIDE_FAST_SHORT: 12.5 });
+    expect(engine.laneSelectionWeightPctForLane("CG_WIDE_FAST_SHORT")).toBe(12.5);
+    expect(engine.getCortexPromotedWeights()).toEqual({ CG_WIDE_FAST_SHORT: 12.5 });
+  });
+
+  it("resolves the variant-id suffix the same way the plain table lookup does", () => {
+    const { engine } = makeEngine();
+    engine.setLaneAllocations([{ laneId: "CG_WIDE_FAST_SHORT", weightPct: 70 }]);
+    engine.setCortexPromotedWeights({ CG_WIDE_FAST_SHORT: 5 });
+    expect(engine.laneSelectionWeightPctForLane("CG_VARIANT_MATRIX:CG_WIDE_FAST_SHORT")).toBe(5);
+  });
+
+  it("never applies while allocations are OFF (null ⇒ 100 unblocked sentinel) — no semantics mixing", () => {
+    const { engine } = makeEngine();
+    expect(engine.laneSelectionWeightPctForLane("CG_WIDE_FAST_SHORT")).toBe(100); // no table configured
+    engine.setCortexPromotedWeights({ CG_WIDE_FAST_SHORT: 5 });
+    expect(engine.laneSelectionWeightPctForLane("CG_WIDE_FAST_SHORT")).toBe(100); // still untouched
+  });
+
+  it("never applies during a manual-directional HOLD (no fresh Entry Decision yet ⇒ empty/blocked, 0 stays 0)", () => {
+    // effectiveLaneAllocations() returns [] here (an intentional directional hold), which
+    // laneSelectionWeightPctForLane short-circuits to 0 BEFORE the CORTEX override is even consulted.
+    const { engine } = makeEngine();
+    engine.setManualDirectionalLaneAllocations({
+      long: [{ laneId: "CG_WIDE_FAST_LONG", weightPct: 70 }],
+      short: [{ laneId: "CG_WIDE_FAST_SHORT", weightPct: 80 }],
+    });
+    engine.setManualSelectorMode(true); // no setManualEntryDecision ⇒ still holding
+    engine.setCortexPromotedWeights({ CG_WIDE_FAST_LONG: 5 });
+    expect(engine.laneSelectionWeightPctForLane("CG_WIDE_FAST_LONG")).toBe(0);
+  });
+
+  it("goes inert while manual-directional mode is actively selecting lanes — the operator's explicit choice always wins", () => {
+    const { engine } = makeEngine();
+    engine.setManualDirectionalLaneAllocations({
+      long: [{ laneId: "CG_WIDE_FAST_LONG", weightPct: 70 }],
+      short: [{ laneId: "CG_WIDE_FAST_SHORT", weightPct: 80 }],
+    });
+    engine.setManualSelectorMode(true);
+    engine.setManualEntryDecision({
+      action: "WAIT_PULLBACK",
+      directionalBias: "LONG",
+      reason: "test",
+      observedAt: "2099-01-02T12:00:00.000Z",
+    });
+    expect(engine.laneSelectionWeightPctForLane("CG_WIDE_FAST_LONG")).toBe(70); // manual table, unmodified
+
+    engine.setCortexPromotedWeights({ CG_WIDE_FAST_LONG: 5 }); // CORTEX says 5%...
+    expect(engine.laneSelectionWeightPctForLane("CG_WIDE_FAST_LONG")).toBe(70); // ...but manual still wins
+  });
+
+  it("setCortexPromotedWeights(null) clears the override, reverting to the plain table", () => {
+    const { engine } = makeEngine();
+    engine.setLaneAllocations([{ laneId: "CG_WIDE_FAST_SHORT", weightPct: 70 }]);
+    engine.setCortexPromotedWeights({ CG_WIDE_FAST_SHORT: 5 });
+    expect(engine.laneSelectionWeightPctForLane("CG_WIDE_FAST_SHORT")).toBe(5);
+
+    engine.setCortexPromotedWeights(null);
+    expect(engine.laneSelectionWeightPctForLane("CG_WIDE_FAST_SHORT")).toBe(70);
+    expect(engine.getCortexPromotedWeights()).toBeNull();
+  });
+
+  it("a lane the promoted map doesn't mention falls through untouched to the plain table", () => {
+    const { engine } = makeEngine();
+    engine.setLaneAllocations([
+      { laneId: "CG_WIDE_FAST_SHORT", weightPct: 70 },
+      { laneId: "CG_WIDE_FAST_LONG", weightPct: 30 },
+    ]);
+    engine.setCortexPromotedWeights({ CG_WIDE_FAST_SHORT: 5 }); // says nothing about CG_WIDE_FAST_LONG
+    expect(engine.laneSelectionWeightPctForLane("CG_WIDE_FAST_SHORT")).toBe(5);
+    expect(engine.laneSelectionWeightPctForLane("CG_WIDE_FAST_LONG")).toBe(30); // unaffected
+  });
+
+  it("a fresh engine defaults to no override at all (getCortexPromotedWeights null)", () => {
+    const { engine } = makeEngine();
+    expect(engine.getCortexPromotedWeights()).toBeNull();
+  });
+});
+
 // 2026-07-09 real incident (two takes): the operator applied a Bear Trend preset via the
 // dashboard's "Apply" button, but later RegimeAutopilot's own tick silently reverted the live
 // allocation back to its own observed-regime preset. Take 1 fixed this by having

@@ -1587,6 +1587,11 @@ export class LiveExecutionEngine {
   private isolatedMarginSet = new Set<string>();
   /** Scanner-owned; intentionally not persisted, so a restart can never revive a stale direction. */
   private manualEntryDecision: ManualEntryDecisionSnapshot | null = null;
+  /** CORTEX Phase-4 promotion (2026-07-20): the latest gated/damped operational tilt, keyed by REAL
+   *  engine lane id — set every ~5min cycle by the caller (app.ts's cortexShadowTick), null whenever
+   *  this instance isn't promoted or the cycle's checks didn't pass. Intentionally not persisted:
+   *  a restart must never resume a stale tilt before the next cycle re-derives it fresh. */
+  private cortexPromotedWeights: Record<string, number> | null = null;
   /** Throttle for refreshSymbolVolatilityCache — ATR% moves slowly, no need to refetch every tick. */
   private lastVolatilityRefreshAtMs = 0;
 
@@ -4303,6 +4308,15 @@ export class LiveExecutionEngine {
     return active !== null && active.length > 0;
   }
 
+  /** CORTEX Phase-4 promotion (2026-07-20): install/clear the latest gated tilt. `null` clears any
+   *  override (the default — every non-promoted instance never calls this, so it's always null there). */
+  setCortexPromotedWeights(weights: Record<string, number> | null): void {
+    this.cortexPromotedWeights = weights;
+  }
+  getCortexPromotedWeights(): Record<string, number> | null {
+    return this.cortexPromotedWeights;
+  }
+
   /** Weighted allocation lookup: 100 when allocations are off; the lane's weightPct when
    *  listed; 0 (blocked) when allocations are ON but the lane is not listed. */
   laneSelectionWeightPctForLane(laneId: string): number {
@@ -4311,7 +4325,16 @@ export class LiveExecutionEngine {
     if (allocations.length === 0) return 0;
     const variantId = laneId.split(":").pop() ?? laneId;
     const hit = allocations.find((a) => a.laneId === laneId || a.laneId === variantId);
-    return hit ? hit.weightPct : 0;
+    if (!hit) return 0; // the operator explicitly excluded this lane — CORTEX may tilt it, never reinstate it
+    // CORTEX promoted tilt (2026-07-20 safety-review fix): only RESCALES a lane the operator's own
+    // table already funds (the `hit` check above) — never a lane the operator explicitly left out, and
+    // never during the operator's own manual-directional entries (an explicit manual choice always
+    // wins outright, so the brain's tilt simply goes inert for as long as manual mode is active).
+    if (this.cortexPromotedWeights && !this.isManualDirectionalEntryEnabled()) {
+      const w = this.cortexPromotedWeights[laneId] ?? this.cortexPromotedWeights[variantId];
+      if (typeof w === "number" && Number.isFinite(w)) return Math.max(0, w);
+    }
+    return hit.weightPct;
   }
 
   /** Operator lane selection for non-paper lanes too (e.g. cross-sectional executor).

@@ -21,9 +21,11 @@ import { dirname, resolve } from "node:path";
 import {
   buildCortexDecisionRecord,
   checkCortexInvariants,
+  cortexPromotedBeta,
   decideCortex,
   emptyCortexState,
   evaluationBeta,
+  CORTEX_LANE_CAP_PCT,
   CORTEX_LIVE_BETA,
   CORTEX_FEATURE_DIM,
   CORTEX_FEATURE_SCHEMA_VERSION,
@@ -35,6 +37,7 @@ import {
   type CortexRefitResult,
   type CortexStoreState,
 } from "./cortex-brain.js";
+import { engineLaneIdForStaticWeight } from "./cortex-live-gather.js";
 
 export class CortexBrainStore {
   private state: CortexStoreState;
@@ -229,6 +232,15 @@ export function _resetCortexDecisionJournalForTests(): void {
  * auditable trace. Phase 1 = SHADOW → this drives NOTHING (the caller ignores the returned decision
  * for allocation; only journals). The learned-model UPDATE (refit) is a SEPARATE nightly job, not
  * this per-cycle tick. Never throws through the journal. Returns the decision for the report layer.
+ *
+ * `promotion` is the Phase-4 opt-in (2026-07-20): when present AND `deps.mode === "live"`, this ALSO
+ * computes a REAL operational decision at the gated/damped/ramped promoted β (cortexPromotedBeta) and
+ * returns its per-lane weights for the caller to push into the execution engine. Absent/null on every
+ * still-shadow instance (unchanged behavior — `promotedWeights` is always null there). Every one of
+ * these must hold for a non-null result: `envBlocked` false (the LIVE_BINANCE_ENV≠mainnet circuit
+ * breaker), `regimeCoverageGateMet` true, and the promoted decision itself passing `checkCortexInvariants`
+ * — a failure at any of these silently falls back to null (caller then leaves the incumbent table alone),
+ * never to a partially-applied or unchecked tilt.
  */
 export function runCortexShadowTick(deps: {
   store: CortexBrainStore;
@@ -237,7 +249,8 @@ export function runCortexShadowTick(deps: {
   nowIso: string;
   mode: CortexBrainMode;
   resolvedThisCycle?: number;
-}): { decision: CortexDecision; invariants: CortexInvariantResult } {
+  promotion?: { regimeCoverageGateMet: boolean; blindCapitalPct: number; envBlocked: boolean } | null;
+}): { decision: CortexDecision; invariants: CortexInvariantResult; promotedWeights: Record<string, number> | null } {
   if (deps.resolvedThisCycle && deps.resolvedThisCycle > 0) deps.store.addResolved(deps.resolvedThisCycle, deps.nowIso);
   const state = deps.store.get();
   // OPERATIONAL decision = the β=0 post-veto incumbent — what would drive live (drives NOTHING in shadow).
@@ -252,5 +265,48 @@ export function runCortexShadowTick(deps: {
   deps.journal.append(
     buildCortexDecisionRecord({ atIso: deps.nowIso, mode: deps.mode, ctx: deps.context, decision, invariants, evalDecision, evaluationBeta: evalBeta }),
   );
-  return { decision, invariants };
+
+  let promotedWeights: Record<string, number> | null = null;
+  if (deps.mode === "live" && deps.promotion && !deps.promotion.envBlocked) {
+    const promotedBeta = cortexPromotedBeta(state.cumulativeResolved, deps.promotion.regimeCoverageGateMet, deps.promotion.blindCapitalPct);
+    if (promotedBeta > 0) {
+      const promoted = decideCortex(deps.context, state, { beta: promotedBeta });
+      const promotedInvariants = checkCortexInvariants(promoted);
+      if (promotedInvariants.ok) {
+        // Fold the roster's synthetic direction-split ids (e.g. CG_MFE_GIVEBACK_LONG/_SHORT) onto the
+        // one real engine lane they both size — see engineLaneIdForStaticWeight's own doc for why: the
+        // execution engine has no concept of the split, only ONE real weight slot per engine lane id.
+        const summed: Record<string, number> = {};
+        const staticByEngineLaneId: Record<string, number> = {};
+        for (const l of promoted.lanes) {
+          const engineLaneId = engineLaneIdForStaticWeight(l.laneId);
+          summed[engineLaneId] = (summed[engineLaneId] ?? 0) + Math.max(0, l.finalPct);
+          // Duplicate roster entries share the identical real static value (both call the SAME real
+          // accessor) — max() is just a defensive tie-break, not an actual combine rule.
+          staticByEngineLaneId[engineLaneId] = Math.max(staticByEngineLaneId[engineLaneId] ?? 0, l.staticPct);
+        }
+        // 2026-07-20 safety-review fix (CRITICAL): checkCortexInvariants above validated each ROSTER
+        // entry against its OWN per-lane cap individually — a split that shares one real engine lane
+        // can each independently pass that check yet SUM well past the real concentration cap once
+        // folded onto the one lane the engine actually sizes (e.g. LONG at its own 35% cap + SHORT at
+        // 12% both "pass", but the real lane would be installed at 47%). Re-validate the FOLDED total
+        // against the same effCap formula decideCortex/checkCortexInvariants use; any violation
+        // discards the WHOLE promoted map for this cycle — never a silent partial/clamped install.
+        const foldViolations = Object.entries(summed).filter(
+          ([engineLaneId, w]) => w > Math.max(staticByEngineLaneId[engineLaneId] ?? 0, CORTEX_LANE_CAP_PCT) + 1e-6,
+        );
+        if (foldViolations.length === 0) {
+          promotedWeights = summed;
+        } else {
+          console.error(
+            "[cortex-live] promoted decision failed the POST-FOLD per-engine-lane cap — falling back to the incumbent table this cycle",
+            foldViolations,
+          );
+        }
+      } else {
+        console.error("[cortex-live] promoted decision failed invariants — falling back to the incumbent table this cycle", promotedInvariants.violations);
+      }
+    }
+  }
+  return { decision, invariants, promotedWeights };
 }

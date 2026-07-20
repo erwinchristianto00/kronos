@@ -297,6 +297,34 @@ export function evaluationBeta(cumulativeResolved: number, betaMax = CORTEX_BETA
   return cortexBeta(cumulativeResolved, betaMax);
 }
 
+// ── Phase 4: explicit, gated promotion (2026-07-20 operator-approved, testnet-only). ──────────────
+// CENTRAL_BRAIN_MODE=live opts ONE instance's operational decision off the hard 0 — but the MAGNITUDE
+// is still never a bare function of sample count. cortexPromotedBeta reuses the same proven ramp as
+// evaluationBeta, then dampens it by how much of the roster's capital actually has learning feedback
+// (blindCapitalPct): a lane the brain has never gotten resolved outcomes for is tilted less, and that
+// damping relaxes on its own as more lanes go learning-active — "auto-adjustable" by construction, not
+// a fixed unlock. Hard-gated to 0 unless the pre-registered regime-coverage half of the promotion gate
+// has already passed (independently computed by the nightly refit, never by this function).
+export function cortexPromotedBeta(
+  cumulativeResolved: number,
+  regimeCoverageGateMet: boolean,
+  blindCapitalPct: number,
+  betaMax = CORTEX_BETA_MAX,
+): number {
+  if (!regimeCoverageGateMet) return 0;
+  const coverage = 1 - clamp01(finiteOr(blindCapitalPct, 100) / 100);
+  return cortexBeta(cumulativeResolved, betaMax) * coverage;
+}
+
+/** Hard circuit breaker, independent of CENTRAL_BRAIN_MODE: CORTEX may NEVER drive real allocation on
+ *  the mainnet Binance environment, full stop — this is the same LIVE_BINANCE_ENV flag the execution
+ *  engine itself uses to pick testnet vs real-money endpoints, so a testnet .env accidentally copied
+ *  onto the live instance still can't promote real money (the promotion opt-in and this check are two
+ *  independent failure points that would BOTH have to be wrong at once). */
+export function cortexPromotionBlockedByEnv(env: NodeJS.ProcessEnv = process.env): boolean {
+  return (env.LIVE_BINANCE_ENV ?? "").trim().toLowerCase() === "mainnet";
+}
+
 export interface CortexArchetypeState {
   w: number[]; // logistic coefficients (length CORTEX_FEATURE_DIM)
   refitAt: string | null;

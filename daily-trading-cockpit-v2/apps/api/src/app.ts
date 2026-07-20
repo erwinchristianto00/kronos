@@ -138,7 +138,7 @@ import { getLatestScanCandidates } from "./lib/latest-scan-candidates-cache.js";
 import { buildRegimeDirectionControllerReport } from "./lib/regime-direction-controller.js";
 import { getRegimeDirectionControllerSnapshotStore } from "./lib/regime-direction-controller-snapshot.js";
 import { getRegimeEdgeMemory } from "./lib/regime-edge-memory.js";
-import { cortexBrainMode } from "./lib/cortex-brain.js";
+import { cortexBrainMode, cortexPromotionBlockedByEnv } from "./lib/cortex-brain.js";
 import { CortexBrainStore, CortexDecisionJournal, runCortexShadowTick } from "./lib/cortex-brain-store.js";
 import { runFourBrainShadowCycle } from "./lib/four-brain-live-wiring.js";
 import { classifyIncumbentLanes } from "./lib/four-brain-lane-support.js";
@@ -149,7 +149,7 @@ import { resolveFourBrainInstanceId, fourBrainInstanceAllowed, type FourBrainBin
 import { fourBrainMode } from "./lib/four-brain-types.js";
 import { CORTEX_LANE_ROSTER, gatherCortexContext, normalizeCortexStaticWeightPctForLane } from "./lib/cortex-live-gather.js";
 import { buildLiveCortexGatherDeps } from "./lib/cortex-live-gather-bindings.js";
-import { runCortexNightlyRefit } from "./lib/cortex-refit-runner-bindings.js";
+import { runCortexNightlyRefit, getLatestCortexRefitReport } from "./lib/cortex-refit-runner-bindings.js";
 import {
   estimateLaneSelectorV2Regime,
   isLaneSelectorV2LongWideStopOverride,
@@ -906,18 +906,29 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     tickUnifiedOrchestrator();
     if (!isTest && unifiedEnabled) setInterval(tickUnifiedOrchestrator, 30_000);
 
-    // ── CORTEX central-brain SHADOW tick (2026-07-12) ────────────────────────────────────────────
-    // Gated hard on CENTRAL_BRAIN_MODE==='shadow' (default OFF ⇒ this is a pure no-op and NOTHING in the
-    // live path changes). In shadow it gathers the current federated context per lane, runs decideCortex,
-    // and APPENDS a BRAIN_DECISION to the journal — it DRIVES NOTHING (never calls setAllocations). The
-    // brain's only authority remains a weight vector that would flow through the engine's guards; here it
-    // is purely observed + scored vs the incumbent. resolvedThisCycle=0 keeps β=0 (== post-federated-veto
-    // incumbent) until the outcome-attribution + nightly-refit increment (#218) advances the ramp.
+    // ── CORTEX central-brain SHADOW / (2026-07-20) PROMOTED-LIVE tick ────────────────────────────
+    // Gated hard on CENTRAL_BRAIN_MODE in {'shadow','live'} (default OFF ⇒ pure no-op). In 'shadow' it
+    // gathers the current federated context per lane, runs decideCortex, and APPENDS a BRAIN_DECISION
+    // to the journal — it DRIVES NOTHING (never calls setAllocations). In 'live' (opt-in, testnet-only
+    // per the operator's explicit 2026-07-20 approval) it ADDITIONALLY computes a gated/damped/ramped
+    // promoted decision and pushes its per-lane weights into the live engine — see runCortexShadowTick's
+    // doc for the full promotion contract (regime-coverage gate, blindCapital damping, per-cycle
+    // invariant fallback, hard LIVE_BINANCE_ENV≠mainnet circuit breaker independent of this mode flag).
+    // resolvedThisCycle=0 in both modes: β only ever advances via the outcome-attribution + nightly-refit
+    // increment (#218), never by this per-cycle tick.
     const cortexStore = new CortexBrainStore("data/cortex-brain.json");
     const cortexJournal = new CortexDecisionJournal("data/cortex-decision-journal.jsonl");
     const cortexShadowTick = () => {
       try {
-        if (cortexBrainMode(process.env) !== "shadow" || !liveEngine) return;
+        if (!liveEngine) return;
+        const mode = cortexBrainMode(process.env);
+        if (mode === "off") {
+          // Mode flipped off (possibly straight from 'live') ⇒ clear any previously-installed promoted
+          // tilt immediately, every tick, so turning CORTEX off can never leave a stale override stuck
+          // in the engine (setCortexPromotedWeights(null) on an already-null field is a cheap no-op).
+          liveEngine.setCortexPromotedWeights(null);
+          return;
+        }
         const engine = liveEngine;
         const cached = getLatestScanCandidates();
         const scanStatus = coreScanAutoRefreshController.getStatus();
@@ -956,9 +967,33 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           killBudgetUsd: status.limits?.maxDrawdownUsd ?? null,
         });
         const context = gatherCortexContext(deps);
-        runCortexShadowTick({ store: cortexStore, journal: cortexJournal, context, nowIso: new Date().toISOString(), mode: "shadow", resolvedThisCycle: 0 });
+        const promotion = mode === "live"
+          ? {
+              regimeCoverageGateMet: getLatestCortexRefitReport()?.coverage.regimeCoverageGateMet ?? false,
+              blindCapitalPct: getLatestCortexRefitReport()?.coverage.blindCapitalPct ?? 100,
+              envBlocked: cortexPromotionBlockedByEnv(process.env),
+            }
+          : null;
+        const { promotedWeights } = runCortexShadowTick({
+          store: cortexStore,
+          journal: cortexJournal,
+          context,
+          nowIso: new Date().toISOString(),
+          mode,
+          resolvedThisCycle: 0,
+          promotion,
+        });
+        // Every cycle re-derives this from scratch and pushes it (including null) — a lost gate, a
+        // failed invariant check, or the mode dropping back to 'shadow' all self-heal to the incumbent
+        // table within one tick.
+        engine.setCortexPromotedWeights(promotedWeights);
       } catch (err) {
         console.error("[cortex-shadow] tick failed", err);
+        // 2026-07-20 safety-review fix (HIGH): a mid-cycle throw here must NEVER leave a PRIOR cycle's
+        // promoted override installed and unrefreshed — a stuck real-money-adjacent tilt from a broken
+        // cycle is worse than falling back to the incumbent table. Every failure clears the override;
+        // it only comes back once a cycle completes cleanly end to end.
+        liveEngine?.setCortexPromotedWeights(null);
       }
     };
     if (!isTest) {
@@ -967,14 +1002,18 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     }
 
     // ── CORTEX #218 nightly refit (outcome-attribution + per-archetype logistic refit) ───────────────
-    // Gated on shadow mode (opt-out CORTEX_REFIT_ENABLED=0). Report-only + idempotent: attributes each
-    // lane's OWN resolved closes to their owning decisions, refits the archetype coefficients (ACCEPTED
-    // only), and advances cumulativeResolved/resolvedByFamily via the monotonic watermark. It NEVER touches
-    // CORTEX_LIVE_BETA (0) — learning ≠ going live; the operational allocation stays the β=0 incumbent.
-    // Runs at boot + every 6h (a same-run re-read adds 0, so cadence is harmless); the report feeds #219.
+    // Gated on shadow OR live mode (opt-out CORTEX_REFIT_ENABLED=0) — learning must keep running even
+    // once an instance is promoted, so the ramp/gate/damping the promotion reads all stay current.
+    // Idempotent: attributes each lane's OWN resolved closes to their owning decisions, refits the
+    // archetype coefficients (ACCEPTED only), and advances cumulativeResolved/resolvedByFamily via the
+    // monotonic watermark. It NEVER touches CORTEX_LIVE_BETA (0) or the promoted β — this writes only
+    // the coefficients + coverage report that cortexPromotedBeta later reads; the tick above is the
+    // only place a gated/damped β ever gets computed. Runs at boot + every 6h (a same-run re-read adds
+    // 0, so cadence is harmless); the report feeds #219 and gates the promotion above.
     const cortexRefitTick = () => {
       try {
-        if (cortexBrainMode(process.env) !== "shadow" || !liveEngine || process.env.CORTEX_REFIT_ENABLED === "0") return;
+        const refitMode = cortexBrainMode(process.env);
+        if ((refitMode !== "shadow" && refitMode !== "live") || !liveEngine || process.env.CORTEX_REFIT_ENABLED === "0") return;
         const engine = liveEngine;
         const now = new Date();
         const staticWeightPctForLane = normalizeCortexStaticWeightPctForLane(

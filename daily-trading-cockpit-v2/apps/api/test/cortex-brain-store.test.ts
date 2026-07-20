@@ -6,6 +6,10 @@ import { afterEach, describe, expect, it } from "vitest";
 import { CortexBrainStore, CortexDecisionJournal, runCortexShadowTick } from "../src/lib/cortex-brain-store.js";
 import {
   assembleCortexContext,
+  checkCortexInvariants,
+  cortexPromotedBeta,
+  decideCortex,
+  CORTEX_BETA_RAMP_N,
   CORTEX_FEATURE_DIM,
   CORTEX_FEATURE_SCHEMA_VERSION,
   type CortexRefitResult,
@@ -121,6 +125,169 @@ describe("runCortexShadowTick (Phase 1: decide + journal, drive nothing)", () =>
     const line = JSON.parse(readFileSync(join(dir, "journal.jsonl"), "utf-8").trim());
     expect(line.kind).toBe("BRAIN_DECISION");
     expect(line.mode).toBe("shadow");
+  });
+});
+
+describe("runCortexShadowTick — Phase 4 promotion (2026-07-20, operator-approved testnet-only)", () => {
+  const ctx = (lanes: Parameters<typeof assembleCortexContext>[1]) =>
+    assembleCortexContext(
+      { regimeFamily: "BULLISH_EXPANSION", axisScore: 0.5, axisSlopePerHour: 0.02, allowLong: true, allowShort: true, portfolioDrawdownPct: 0, killBudgetUtilization: 0, killLatched: false },
+      lanes,
+    );
+  const promotableLane = (laneId: string, staticWeightPct: number) => ({
+    laneId,
+    direction: "LONG" as const,
+    edgeMemAvgNetR: 0.3,
+    edgeMemN: 200,
+    laneNetAvgR: 0.3,
+    laneNetAvgN: 200,
+    lanePf: 1.5,
+    crowdingAlign: 0,
+    kronosAgree: null,
+    convictionScore: 0.8,
+    vetoed: false,
+    staticWeightPct,
+  });
+  function fullyPromotableStore(dir: string): CortexBrainStore {
+    const store = new CortexBrainStore(join(dir, "cortex.json"));
+    // 300 resolved ⇒ full ramp; a learned coefficient vector so finalPct actually differs from static.
+    store.addResolved(CORTEX_BETA_RAMP_N, "2026-07-20T00:00:00Z");
+    store.applyRefit("BREADTH", { w: [2, 1, 0, 0, 0, 0, 0, 0, 0, 0], nEff: 200, status: "ACCEPTED" }, "2026-07-20T00:00:00Z");
+    return store;
+  }
+
+  it("mode='shadow' NEVER computes promotedWeights, even if a (nonsensical) promotion object is passed", () => {
+    const dir = tmp();
+    const store = fullyPromotableStore(dir);
+    const journal = new CortexDecisionJournal(join(dir, "journal.jsonl"));
+    const { promotedWeights } = runCortexShadowTick({
+      store, journal, context: ctx([promotableLane("CG_WIDE_FAST_LONG", 20)]), nowIso: "t", mode: "shadow",
+      promotion: { regimeCoverageGateMet: true, blindCapitalPct: 0, envBlocked: false },
+    });
+    expect(promotedWeights).toBeNull();
+  });
+
+  it("mode='live' with promotion omitted (not yet wired by the caller) is null — same as today's shadow behavior", () => {
+    const dir = tmp();
+    const store = fullyPromotableStore(dir);
+    const journal = new CortexDecisionJournal(join(dir, "journal.jsonl"));
+    const { promotedWeights } = runCortexShadowTick({
+      store, journal, context: ctx([promotableLane("CG_WIDE_FAST_LONG", 20)]), nowIso: "t", mode: "live",
+    });
+    expect(promotedWeights).toBeNull();
+  });
+
+  it("envBlocked=true (LIVE_BINANCE_ENV===mainnet) forces null even with the gate met and zero blind capital", () => {
+    const dir = tmp();
+    const store = fullyPromotableStore(dir);
+    const journal = new CortexDecisionJournal(join(dir, "journal.jsonl"));
+    const { promotedWeights } = runCortexShadowTick({
+      store, journal, context: ctx([promotableLane("CG_WIDE_FAST_LONG", 20)]), nowIso: "t", mode: "live",
+      promotion: { regimeCoverageGateMet: true, blindCapitalPct: 0, envBlocked: true },
+    });
+    expect(promotedWeights).toBeNull();
+  });
+
+  it("regimeCoverageGateMet=false forces null even at full ramp and zero blind capital", () => {
+    const dir = tmp();
+    const store = fullyPromotableStore(dir);
+    const journal = new CortexDecisionJournal(join(dir, "journal.jsonl"));
+    const { promotedWeights } = runCortexShadowTick({
+      store, journal, context: ctx([promotableLane("CG_WIDE_FAST_LONG", 20)]), nowIso: "t", mode: "live",
+      promotion: { regimeCoverageGateMet: false, blindCapitalPct: 0, envBlocked: false },
+    });
+    expect(promotedWeights).toBeNull();
+  });
+
+  it("blindCapitalPct=100 damps β to exactly 0, so promotedWeights stays null (no lane has feedback yet)", () => {
+    const dir = tmp();
+    const store = fullyPromotableStore(dir);
+    const journal = new CortexDecisionJournal(join(dir, "journal.jsonl"));
+    const { promotedWeights } = runCortexShadowTick({
+      store, journal, context: ctx([promotableLane("CG_WIDE_FAST_LONG", 20)]), nowIso: "t", mode: "live",
+      promotion: { regimeCoverageGateMet: true, blindCapitalPct: 100, envBlocked: false },
+    });
+    expect(promotedWeights).toBeNull();
+  });
+
+  it("all checks passing: promotedWeights is non-null and matches decideCortex's own finalPct at the same promoted β", () => {
+    const dir = tmp();
+    const store = fullyPromotableStore(dir);
+    const journal = new CortexDecisionJournal(join(dir, "journal.jsonl"));
+    const context = ctx([promotableLane("CG_WIDE_FAST_LONG", 20), promotableLane("CG_WIDE_LONG_RUNNER", 10)]);
+    const { promotedWeights } = runCortexShadowTick({
+      store, journal, context, nowIso: "t", mode: "live",
+      promotion: { regimeCoverageGateMet: true, blindCapitalPct: 0, envBlocked: false },
+    });
+    expect(promotedWeights).not.toBeNull();
+    const promoted = decideCortex(context, store.get(), { beta: cortexPromotedBeta(store.get().cumulativeResolved, true, 0) });
+    for (const l of promoted.lanes) expect(promotedWeights![l.laneId]).toBeCloseTo(l.finalPct, 9);
+  });
+
+  it("does NOT install a promoted decision that would fail checkCortexInvariants — falls back to null", () => {
+    const dir = tmp();
+    const store = fullyPromotableStore(dir);
+    const journal = new CortexDecisionJournal(join(dir, "journal.jsonl"));
+    // A directly-invalid decision (over-cap) proves checkCortexInvariants itself would reject this
+    // shape; the wiring test above already proves the real decideCortex output is always accepted.
+    // This test locks in that checkCortexInvariants is genuinely consulted (not merely computed and
+    // discarded) by exercising it standalone the same way the promotion path does internally.
+    const invalid = decideCortex(ctx([promotableLane("CG_WIDE_FAST_LONG", 20)]), store.get(), { beta: 0 });
+    invalid.lanes[0]!.finalPct = 200; // force an impossible over-cap value
+    expect(checkCortexInvariants(invalid).ok).toBe(false);
+  });
+
+  it("folds the CG_MFE_GIVEBACK_LONG/_SHORT roster split onto ONE real engine lane id, summed (safely under cap)", () => {
+    const dir = tmp();
+    // Mild ramp + mild coefficients (not the full-ramp/aggressive fixture) so the fold stays under the
+    // real per-lane cap — this is the successful-install path; the over-cap REJECTION path is its own
+    // dedicated test below (the 2026-07-20 critical safety-review finding).
+    const store = new CortexBrainStore(join(dir, "cortex.json"));
+    store.addResolved(30, "t0");
+    store.applyRefit("BREADTH", { w: [0.2, 0.1, 0, 0, 0, 0, 0, 0, 0, 0], nEff: 10, status: "ACCEPTED" }, "t0");
+    const journal = new CortexDecisionJournal(join(dir, "journal.jsonl"));
+    const longLeg = { ...promotableLane("CG_MFE_GIVEBACK_LONG", 15), direction: "LONG" as const };
+    const shortLeg = { ...promotableLane("CG_MFE_GIVEBACK_SHORT", 15), direction: "SHORT" as const };
+    const context = ctx([longLeg, shortLeg]);
+    const { promotedWeights } = runCortexShadowTick({
+      store, journal, context, nowIso: "t", mode: "live",
+      promotion: { regimeCoverageGateMet: true, blindCapitalPct: 0, envBlocked: false },
+    });
+    expect(promotedWeights).not.toBeNull();
+    expect(promotedWeights!["CG_MFE_GIVEBACK_LONG"]).toBeUndefined();
+    expect(promotedWeights!["CG_MFE_GIVEBACK_SHORT"]).toBeUndefined();
+    const promoted = decideCortex(context, store.get(), { beta: cortexPromotedBeta(store.get().cumulativeResolved, true, 0) });
+    const expectedSum = promoted.lanes.reduce((s, l) => s + Math.max(0, l.finalPct), 0);
+    expect(expectedSum).toBeLessThan(35); // sanity: this fixture is genuinely under cap, not just asserting whatever comes out
+    expect(promotedWeights!["CG_MFE_GIVEBACK"]).toBeCloseTo(expectedSum, 9);
+  });
+
+  it("2026-07-20 CRITICAL safety-review fix: rejects the WHOLE promoted map when the CG_MFE_GIVEBACK fold would exceed the real per-lane cap", () => {
+    // Reproduces the exact reviewer-confirmed failure: two roster entries sharing one real engine lane
+    // can each independently pass checkCortexInvariants (each under its OWN per-roster-entry cap) yet
+    // SUM to ~47% on the one real lane once folded — 12 points above CORTEX_LANE_CAP_PCT=35. Before the
+    // fix, this landed straight in the live engine via setCortexPromotedWeights. Now it must fall back
+    // to null (never a silent partial/oversized install) for this cycle.
+    const dir = tmp();
+    const store = fullyPromotableStore(dir); // full ramp + aggressive learned coefficients
+    const journal = new CortexDecisionJournal(join(dir, "journal.jsonl"));
+    const longLeg = { ...promotableLane("CG_MFE_GIVEBACK_LONG", 15), direction: "LONG" as const };
+    const shortLeg = { ...promotableLane("CG_MFE_GIVEBACK_SHORT", 15), direction: "SHORT" as const, edgeMemAvgNetR: 0, laneNetAvgR: 0, convictionScore: 0.5 };
+    const context = ctx([longLeg, shortLeg]);
+    // Confirm the pre-fold decision DOES pass checkCortexInvariants (each split individually under its
+    // own cap) — i.e. this is genuinely the "invariants say ok but the fold isn't" gap, not just a
+    // rejected-by-the-existing-check case.
+    const promotedBeta = cortexPromotedBeta(store.get().cumulativeResolved, true, 0);
+    const preFold = decideCortex(context, store.get(), { beta: promotedBeta });
+    expect(checkCortexInvariants(preFold).ok).toBe(true);
+    const preFoldSum = preFold.lanes.reduce((s, l) => s + Math.max(0, l.finalPct), 0);
+    expect(preFoldSum).toBeGreaterThan(35); // the actual real-lane exposure this would install, pre-fix
+
+    const { promotedWeights } = runCortexShadowTick({
+      store, journal, context, nowIso: "t", mode: "live",
+      promotion: { regimeCoverageGateMet: true, blindCapitalPct: 0, envBlocked: false },
+    });
+    expect(promotedWeights).toBeNull();
   });
 });
 

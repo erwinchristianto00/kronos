@@ -47,7 +47,7 @@ export const CORTEX_CG_MFE_GIVEBACK_SHORT_LANE_ID = "CG_MFE_GIVEBACK_SHORT" as c
  *  CG_ROSTER's variantId mapping in cortex-refit-runner-bindings.ts, which resolves the same split for
  *  a different accessor). Map the two synthetic roster ids to that real id for the static-weight lookup
  *  ONLY; the synthetic id stays untouched everywhere else (journaling, attribution, edge-memory). */
-function engineLaneIdForStaticWeight(laneId: string): string {
+export function engineLaneIdForStaticWeight(laneId: string): string {
   return laneId === CORTEX_CG_MFE_GIVEBACK_LONG_LANE_ID || laneId === CORTEX_CG_MFE_GIVEBACK_SHORT_LANE_ID
     ? "CG_MFE_GIVEBACK"
     : laneId;

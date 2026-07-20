@@ -7,10 +7,14 @@ import {
   cortexArchetypeForLane,
   cortexWinLabel,
   cortexBrainMode,
+  cortexPromotedBeta,
+  cortexPromotionBlockedByEnv,
   assembleCortexContext,
   buildCortexDecisionRecord,
   emptyCortexState,
   cortexBeta,
+  CORTEX_BETA_MAX,
+  CORTEX_BETA_RAMP_N,
   CORTEX_FEATURE_DIM,
   CORTEX_FEATURE_NAMES,
   CORTEX_FEATURE_SCHEMA_VERSION,
@@ -340,6 +344,55 @@ describe("cortex — learning (refit logistic via IRLS)", () => {
     expect(cortexWinLabel(0.01)).toBe(0); // below hurdle → loss
     expect(cortexWinLabel(-0.5)).toBe(0);
     expect(cortexWinLabel(NaN)).toBe(0);
+  });
+});
+
+describe("cortex — Phase 4 promotion (2026-07-20, operator-approved testnet-only wiring)", () => {
+  describe("cortexPromotedBeta", () => {
+    it("is hard 0 whenever the regime-coverage gate hasn't passed, regardless of everything else", () => {
+      expect(cortexPromotedBeta(CORTEX_BETA_RAMP_N, false, 0)).toBe(0);
+      expect(cortexPromotedBeta(1_000_000, false, 0)).toBe(0);
+    });
+
+    it("fully damps to 0 when blindCapitalPct is 100 (no lane has learning feedback yet)", () => {
+      expect(cortexPromotedBeta(CORTEX_BETA_RAMP_N, true, 100)).toBe(0);
+    });
+
+    it("reaches β_max only at full ramp AND zero blind capital", () => {
+      expect(cortexPromotedBeta(CORTEX_BETA_RAMP_N, true, 0)).toBeCloseTo(CORTEX_BETA_MAX, 9);
+    });
+
+    it("damps proportionally to blind capital — half-blind halves the ramped β", () => {
+      const full = cortexPromotedBeta(CORTEX_BETA_RAMP_N, true, 0);
+      const halfBlind = cortexPromotedBeta(CORTEX_BETA_RAMP_N, true, 50);
+      expect(halfBlind).toBeCloseTo(full / 2, 9);
+    });
+
+    it("matches the plain cortexBeta ramp at a partial sample count once undamped", () => {
+      const n = CORTEX_BETA_RAMP_N / 2;
+      expect(cortexPromotedBeta(n, true, 0)).toBeCloseTo(cortexBeta(n), 9);
+    });
+
+    it("never lets a non-finite blindCapitalPct escape as a non-finite or over-max β", () => {
+      const r = cortexPromotedBeta(CORTEX_BETA_RAMP_N, true, NaN);
+      expect(Number.isFinite(r)).toBe(true);
+      expect(r).toBe(0); // NaN blind-capital defaults to the SAFEST reading (100 == fully blind)
+    });
+  });
+
+  describe("cortexPromotionBlockedByEnv (hard circuit breaker, independent of any opt-in flag)", () => {
+    it("blocks when LIVE_BINANCE_ENV is mainnet — this is the real-money boundary the execution engine itself uses", () => {
+      expect(cortexPromotionBlockedByEnv({ LIVE_BINANCE_ENV: "mainnet" } as NodeJS.ProcessEnv)).toBe(true);
+    });
+    it("does not block on testnet", () => {
+      expect(cortexPromotionBlockedByEnv({ LIVE_BINANCE_ENV: "testnet" } as NodeJS.ProcessEnv)).toBe(false);
+    });
+    it("does not block when unset (safe default is NOT blocked, since the mode opt-in is the primary gate)", () => {
+      expect(cortexPromotionBlockedByEnv({} as NodeJS.ProcessEnv)).toBe(false);
+    });
+    it("is case/whitespace-insensitive so a sloppy .env value still trips the breaker", () => {
+      expect(cortexPromotionBlockedByEnv({ LIVE_BINANCE_ENV: "  MainNet  " } as NodeJS.ProcessEnv)).toBe(true);
+    });
   });
 });
 

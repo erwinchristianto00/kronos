@@ -260,6 +260,9 @@ let latestRefitReport: (CortexRefitReport & { journalBadLines: number }) | null 
 export function getLatestCortexRefitReport(): (CortexRefitReport & { journalBadLines: number }) | null {
   return latestRefitReport;
 }
+export function _resetLatestCortexRefitReportForTests(): void {
+  latestRefitReport = null;
+}
 
 /**
  * One nightly refit pass, wired to the real stores + journal. Report-only + idempotent: applies ACCEPTED
