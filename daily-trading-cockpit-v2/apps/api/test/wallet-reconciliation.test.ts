@@ -272,6 +272,42 @@ describe("buildLiveWalletReconciliationReport", () => {
     expect(seenWindows[0].endTimeMs).toBe(Date.parse(`${DAY1}T00:00:00.000Z`) + 24 * 60 * 60 * 1000 - 1);
   });
 
+  // [TIMING-FIX] 2026-07-20: getStatus() must be read back-to-back with `day`, BEFORE the
+  // potentially-slow getIncomeHistory await — not after it resolves. Reading it after leaves a
+  // window as wide as the network round-trip in which the engine's internal ledger could roll over
+  // to a new UTC day, diverging from `day` (already resolved before the await started).
+  it("[TIMING-FIX] reads engine.getStatus() before awaiting getIncomeHistory, not after", async () => {
+    const callOrder: string[] = [];
+    let resolveIncome!: (entries: FuturesIncomeEntry[]) => void;
+    const incomePromise = new Promise<FuturesIncomeEntry[]>((resolve) => {
+      resolveIncome = resolve;
+    });
+    const engine: LiveEngineReconciliationSource = {
+      getStatus: () => {
+        callOrder.push("getStatus");
+        return { closedToday: { dateUtc: DAY1, realizedPnlUsd: 9.8 } };
+      },
+      getIncomeHistory: async () => {
+        callOrder.push("getIncomeHistory:called");
+        return incomePromise; // stays pending — simulates an in-flight network call
+      },
+    };
+
+    const reportPromise = buildLiveWalletReconciliationReport(engine, DAY1, { toleranceUsd: 0.5 });
+    await Promise.resolve();
+    await Promise.resolve();
+    // getStatus() must already have been read by the time getIncomeHistory is still pending —
+    // i.e. it happens BEFORE the await, not after it resolves.
+    expect(callOrder).toEqual(["getStatus", "getIncomeHistory:called"]);
+
+    resolveIncome([
+      income({ time: day1Ms, incomeType: "REALIZED_PNL", income: 10 }),
+      income({ time: day1Ms + 1, incomeType: "COMMISSION", income: -0.2 }),
+    ]);
+    const report = await reportPromise;
+    expect(report.withinTolerance).toBe(true);
+  });
+
   it("[EXTERNAL-PNL] folds externalTodayRealizedPnlUsd into the internal figure — the engine's own ledger alone would falsely mismatch", async () => {
     // Real exchange income is REALIZED_PNL 10 + COMMISSION -0.2 = 9.8 comparable. The engine's own
     // mirror/directional ledger only booked 5 of that; the other 4.8 came from the 11 external
@@ -391,6 +427,63 @@ describe("safety: report-only guarantee", () => {
       expect(flattenAllExchangePositions).not.toHaveBeenCalled();
     } finally {
       warnSpy.mockRestore();
+    }
+  });
+
+  // [FRESHNESS-FIX] 2026-07-20: buildLiveWalletReconciliationReport computes `day` BEFORE the
+  // awaited getIncomeHistory call, then reads getStatus() AFTER it resolves. If the engine's daily
+  // ledger rolls to a new UTC day during that await, internalLedgerFresh correctly comes back false
+  // — but the OLD server.ts ticker only ever checked `withinTolerance` (forced true in that branch),
+  // so a "not verified, no comparison happened" day was logged identically to (i.e. not at all,
+  // same as) a genuinely reconciled healthy day. This reproduces server.ts's runReconciliation()
+  // body twice against the exact payload that race produces — once with the OLD (buggy) branching
+  // to prove the silence, once with the NEW branching to prove it now warns distinctly.
+  it("[FRESHNESS-FIX] the server-side ticker path must not treat internalLedgerFresh=false identically to a verified-healthy day", async () => {
+    const reportPayload = {
+      ok: true,
+      report: {
+        dayUtc: DAY1,
+        deltaUsd: 0,
+        toleranceUsd: 0.5,
+        withinTolerance: true, // forced true by buildWalletReconciliationReport's !internalLedgerFresh branch
+        internalLedgerFresh: false,
+        note:
+          `internal ledger's dateUtc (${DAY2}) does not match the requested day (${DAY1}) — the live ` +
+          `engine only retains the CURRENT day's ledger, so no internal figure exists for this day; ` +
+          `skipping the tolerance check.`,
+      },
+    };
+
+    // OLD ticker logic (pre-fix): only ever branches on withinTolerance === false.
+    const oldWarnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const body = reportPayload;
+      if (body.ok && body.report && body.report.withinTolerance === false) {
+        console.warn(`[API] WALLET RECONCILIATION MISMATCH day=${body.report.dayUtc} ...`);
+      }
+      // Demonstrates the bug: a day that was NEVER actually verified produces zero log output,
+      // indistinguishable from a genuinely reconciled healthy day.
+      expect(oldWarnSpy).not.toHaveBeenCalled();
+    } finally {
+      oldWarnSpy.mockRestore();
+    }
+
+    // NEW ticker logic (post-fix, mirrors server.ts's runReconciliation() body).
+    const newWarnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const body = reportPayload;
+      if (body.ok && body.report && body.report.withinTolerance === false) {
+        console.warn(`[API] WALLET RECONCILIATION MISMATCH day=${body.report.dayUtc} ...`);
+      } else if (body.ok && body.report && body.report.internalLedgerFresh === false) {
+        console.warn(
+          `[API] wallet reconciliation NOT VERIFIED day=${body.report.dayUtc}: ${body.report.note ?? "internal ledger day mismatch"}`,
+        );
+      }
+      expect(newWarnSpy).toHaveBeenCalledTimes(1);
+      expect(newWarnSpy.mock.calls[0][0]).toMatch(/NOT VERIFIED/);
+      expect(newWarnSpy.mock.calls[0][0]).not.toMatch(/MISMATCH/);
+    } finally {
+      newWarnSpy.mockRestore();
     }
   });
 });

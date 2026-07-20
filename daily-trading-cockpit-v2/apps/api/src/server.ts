@@ -119,7 +119,14 @@ if (process.env.WALLET_RECONCILIATION_ENABLED === "1") {
       }
       const body = (await res.json().catch(() => null)) as {
           ok?: boolean;
-          report?: { dayUtc?: string; deltaUsd?: number; toleranceUsd?: number; withinTolerance?: boolean };
+          report?: {
+            dayUtc?: string;
+            deltaUsd?: number;
+            toleranceUsd?: number;
+            withinTolerance?: boolean;
+            internalLedgerFresh?: boolean;
+            note?: string | null;
+          };
       } | null;
       if (body?.ok && body.report && body.report.withinTolerance === false) {
         const delta = body.report.deltaUsd ?? 0;
@@ -127,6 +134,14 @@ if (process.env.WALLET_RECONCILIATION_ENABLED === "1") {
           `[API] WALLET RECONCILIATION MISMATCH day=${body.report.dayUtc} delta=$${delta.toFixed(2)} ` +
             `exceeds tolerance $${body.report.toleranceUsd} — internal ledger vs Binance income history ` +
             `disagree. Report-only: no trading action taken; investigate manually.`,
+        );
+      } else if (body?.ok && body.report && body.report.internalLedgerFresh === false) {
+        // withinTolerance is forced true here (no comparison was actually made — see
+        // wallet-reconciliation.ts) — must NOT be logged (or silently skipped) identically to a
+        // genuinely verified healthy day, or an operator loses the one signal that today's tick
+        // proved nothing.
+        console.warn(
+          `[API] wallet reconciliation NOT VERIFIED day=${body.report.dayUtc}: ${body.report.note ?? "internal ledger day mismatch"}`,
         );
       }
     } catch (error) {

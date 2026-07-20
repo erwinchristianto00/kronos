@@ -323,9 +323,16 @@ export async function buildLiveWalletReconciliationReport(
   internalTodayClosedFeesUsd?: number,
 ): Promise<WalletReconciliationReport> {
   const day = resolveDayUtc(dayUtc);
+  // 2026-07-20 fix: read closedToday HERE, back-to-back with `day` above, rather than after the
+  // awaited getIncomeHistory call below. getIncomeHistory can take an arbitrary amount of wall-clock
+  // time (network round-trip); if the engine's internal daily ledger rolls over to a new UTC day
+  // while it's in flight, a POST-await getStatus() read would see the NEW day while `day` (and the
+  // fetched income window) still reflect the OLD one — shrinking that window from "however long the
+  // network call takes" to "two synchronous statements" makes the rollover race about as narrow as
+  // it can get without coordinating with the engine's own clock.
+  const { closedToday } = engine.getStatus();
   const { startMs, endMs } = utcDayBoundsMs(day);
   const incomeEntries = await engine.getIncomeHistory(startMs, endMs);
-  const { closedToday } = engine.getStatus();
   return buildWalletReconciliationReport({
     dayUtc: day,
     internalLedger: {

@@ -239,6 +239,38 @@ describe("buildTradingAssistantContext", () => {
     expect(ctx.contextText).toContain("openPositions=n/a");
   });
 
+  // [FRESHNESS-FIX] 2026-07-20: wallet-reconciliation's report forces withinTolerance=true (and
+  // deltaUsd=0) whenever internalLedgerFresh is false — i.e. no comparison actually happened (see
+  // wallet-reconciliation.ts's !internalLedgerFresh branch). Before this fix, the context text only
+  // read r.withinTolerance, so this "not verified" state rendered identically to "within tolerance"
+  // — an operator reading the assistant's answer could not tell a genuinely healthy day from one the
+  // check never actually ran on.
+  it("[FRESHNESS-FIX] renders a distinct NOT VERIFIED status when internalLedgerFresh=false, instead of 'within tolerance'", async () => {
+    const dir = tmp();
+    const fetchImpl = vi.fn(async (input: string | URL) => {
+      if (input.toString().endsWith("/api/live/wallet-reconciliation")) {
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            report: {
+              dayUtc: "2026-07-10",
+              internalRealizedPnlUsd: 0,
+              comparisonExchangeUsd: 999,
+              deltaUsd: 0,
+              withinTolerance: true,
+              internalLedgerFresh: false,
+            },
+          }),
+          { status: 200 },
+        );
+      }
+      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    });
+    const ctx = await buildTradingAssistantContext({ dataDir: dir, fetchImpl: fetchImpl as unknown as typeof fetch, peerTimeoutMs: 100 });
+    expect(ctx.contextText).toContain("NOT VERIFIED");
+    expect(ctx.contextText).not.toContain("(within tolerance)");
+  });
+
   it("SAFETY: never issues a non-GET request, and only ever to the confirmed read-only allowlist paths", async () => {
     const dir = tmp();
     const calls: { url: string; method: string }[] = [];

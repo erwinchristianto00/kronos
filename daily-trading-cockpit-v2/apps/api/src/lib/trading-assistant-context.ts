@@ -27,7 +27,14 @@ interface LiveBalanceSnapshot {
   availableBalance: number | null;
 }
 interface WalletReconciliationSnapshot {
-  report?: { dayUtc: string; internalRealizedPnlUsd: number; comparisonExchangeUsd: number; deltaUsd: number; withinTolerance: boolean };
+  report?: {
+    dayUtc: string;
+    internalRealizedPnlUsd: number;
+    comparisonExchangeUsd: number;
+    deltaUsd: number;
+    withinTolerance: boolean;
+    internalLedgerFresh: boolean;
+  };
 }
 
 function finiteNumber(value: unknown): number | null {
@@ -138,7 +145,14 @@ export async function buildTradingAssistantContext(args: BuildContextArgs = {}):
   }
   if (reconciliation?.report) {
     const r = reconciliation.report;
-    sections.push(`Wallet reconciliation (${safeText(r.dayUtc, 24)}): internal=$${formatNumber(r.internalRealizedPnlUsd)} vs exchange=$${formatNumber(r.comparisonExchangeUsd)}, delta=$${formatNumber(r.deltaUsd)} (${r.withinTolerance ? "within tolerance" : "OUT OF TOLERANCE"})`);
+    // internalLedgerFresh=false means withinTolerance was forced true WITHOUT a real comparison
+    // (see wallet-reconciliation.ts) — must render as its own distinct status, never folded into
+    // "within tolerance", or the LLM (and the operator reading its answer) would report a healthy
+    // day that was never actually checked.
+    const status = r.internalLedgerFresh === false
+      ? "NOT VERIFIED — internal ledger day mismatch, no comparison made"
+      : r.withinTolerance ? "within tolerance" : "OUT OF TOLERANCE";
+    sections.push(`Wallet reconciliation (${safeText(r.dayUtc, 24)}): internal=$${formatNumber(r.internalRealizedPnlUsd)} vs exchange=$${formatNumber(r.comparisonExchangeUsd)}, delta=$${formatNumber(r.deltaUsd)} (${status})`);
   }
   if (!liveAvailable) {
     sections.push("=== LIVE / MAINNET ===\nCould not reach the live/mainnet instance's read-only status right now (it may be down, or this deployment has no live peer configured).");
