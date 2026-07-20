@@ -3,6 +3,8 @@ import { mkdtempSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import os from "node:os";
 
+import Fastify from "fastify";
+
 import {
   buildFastTpTightDiagnostic,
   buildFastTpTightDiagnosticBriefLines,
@@ -13,6 +15,8 @@ import {
   PaperExecutionRouterStore,
   buildPaperPerformanceReport,
   PAPER_EXECUTION_MODEL_IDEAL,
+  getPaperExecutionRouterStore,
+  _resetPaperExecutionRouterStoreForTests,
   type FastTpVariant,
   type PaperResolverClient,
   type PaperKlineTuple,
@@ -20,6 +24,7 @@ import {
   type PaperOrderStatus,
 } from "../src/lib/paper-execution-router.js";
 import { buildLiveTradingGateReport } from "../src/lib/live-trading-gate.js";
+import { registerShadowRoutes } from "../src/routes/shadow.js";
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -331,5 +336,31 @@ describe("fast-TP trailing-stop sweep", () => {
     expect(ranking.bestByHoldReduction).toBe("TP_0_75R_PARTIAL_50_TRAIL_0_25R"); // tighter exits sooner
     expect(ranking.bestBalancedTradeoff).not.toBeNull();
     expect(Object.keys(ranking.balancedScores).length).toBe(2);
+  });
+});
+
+// ── GET /api/shadow/fast-tp-diagnostic endpoint ─────────────────────────────
+describe("fast-tp-diagnostic endpoint — repeated ?variants querystring key", () => {
+  // Fastify parses a repeated key (?variants=0.25&variants=0.5) as string[], not
+  // the string the route's TS generic declares. Two call sites read this same
+  // field (a .trim().toLowerCase() mode check, then a .split(",") level parse) —
+  // both must survive a non-string value without throwing.
+  it("does not 500 when ?variants is supplied twice", async () => {
+    _resetPaperExecutionRouterStoreForTests();
+    getPaperExecutionRouterStore(tmpDir());
+    const app = Fastify({ logger: false });
+    await registerShadowRoutes(app, null, {
+      binanceClient: { getCandles: async () => [] },
+    } as never);
+
+    const res = await app.inject({
+      method: "GET",
+      url: "/api/shadow/fast-tp-diagnostic?variants=0.25&variants=0.5",
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(Array.isArray(res.json().reports)).toBe(true);
+    await app.close();
+    _resetPaperExecutionRouterStoreForTests();
   });
 });
