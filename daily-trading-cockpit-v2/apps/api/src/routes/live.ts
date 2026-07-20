@@ -19,7 +19,7 @@ import { getRegimeCompositeShortStore, buildRegimeCompositeShortReport, RCS_PAPE
 import { getPanicWashoutStore, buildPanicWashoutReport, PWR_PAPER_LANE_ID } from "../lib/panic-washout-reclaim-edge.js";
 import { getCompositeEstimatorStore, buildCompositeEstimatorReport, ceLaneIdForBucket, type CEBucket } from "../lib/composite-estimator-edge.js";
 import { LANE_SELECTOR_V2_LIVE_SUPPORTED_VARIANT_IDS, laneSelectorV2LaneId } from "../lib/lane-selector-v2.js";
-import { buildLiveWalletReconciliationReport } from "../lib/wallet-reconciliation.js";
+import { buildLiveWalletReconciliationReport, resolveDayUtc } from "../lib/wallet-reconciliation.js";
 import { sumExternalClosedFeesUsd, sumExternalRealizedPnlUsd } from "../lib/live-executor-wiring.js";
 import type { UnifiedTestnetOrchestrator } from "../lib/unified-testnet-orchestrator.js";
 import type { UnifiedTestnetProposalStore } from "../lib/unified-testnet-proposal-source.js";
@@ -1235,10 +1235,20 @@ export async function registerLiveRoutes(
     const query = (request.query ?? {}) as { day?: string };
     try {
       const external = sumExternalRealizedPnlUsd(allCrossSectionalExecutors(), allSingleSymbolExecutors());
-      const dayUtc = query.day ?? new Date().toISOString().slice(0, 10);
+      // 2026-07-19 fix: this used to compute its own ad-hoc `query.day ?? new Date()...` fallback
+      // here (for the fee sum) while separately handing the RAW, unvalidated query.day to
+      // buildLiveWalletReconciliationReport (which resolves it internally via resolveDayUtc). A
+      // malformed/non-existent day (e.g. "2026-04-31") is truthy, so it passed the `?? fallback`
+      // unchanged into sumExternalClosedFeesUsd's startsWith() match — which then matched nothing
+      // and silently returned 0 fees — while the report itself fell back to today via
+      // resolveDayUtc's round-trip validation. The two halves of the response ended up describing
+      // different days, and the mismatch always resolved to an artificially clean (zero-fee) report
+      // rather than a rejected request. Resolving once, up front, and reusing that single validated
+      // day for both the fee sum and the report keeps them consistent.
+      const dayUtc = resolveDayUtc(query.day);
       const closedFees = engine.getClosedTodayFeesUsd() +
         sumExternalClosedFeesUsd(allCrossSectionalExecutors(), allSingleSymbolExecutors(), dayUtc);
-      const report = await buildLiveWalletReconciliationReport(engine, query.day, undefined, external.today, closedFees);
+      const report = await buildLiveWalletReconciliationReport(engine, dayUtc, undefined, external.today, closedFees);
       return { ok: true, report };
     } catch (err) {
       reply.code(502);
