@@ -16,11 +16,22 @@ import { recordLifecycle, isLifecycleLoggingEnabled, type ExecutionLifecycleEven
  *  tests and responds to a per-invocation env — behaviour-identical to a constant in production (env=process.env). */
 const baseDir = (env: NodeJS.ProcessEnv = process.env): string => (env.LANE_CONTEXT_JOURNAL_DIR ?? "data").toString();
 const CONFIG = { ttlMs: 30 * 60_000, overlapWindowMs: 10 * 60_000, detectionMarginMs: 10 * 60_000, maxConsumed: 50_000, recoverTailLines: 50_000, journalMaxBytes: 8 * 1024 * 1024 };
-const SNAPSHOT_LOOKBACK_LINES = 5_000;
+// Must cover the longest lane hold in current-guard-variant-matrix.ts (CG_WIDE_LONG_RUNNER, maxHoldHours=144 ⇒
+// 6 days) — the pre-open snapshot for a max-held trade is still ~6 days old by the time resolution runs. At the
+// snapshot tick cadence (5min, app.ts) x ~13-16 lanes/tick, 6 days ≈ 288*6*16 ≈ 27.6k lines; 50k (same bound as
+// CONFIG.recoverTailLines) leaves ~1.8x headroom for lane-count growth without scrolling the entry decision out.
+const SNAPSHOT_LOOKBACK_LINES = 50_000;
 
 const prod = createProductionJournalFs();
 const scanSingleFlight = { inFlight: false };
-export const scanMetrics: ScanMetrics = emptyScanMetrics();
+/** scanMetrics + the snapshot-tail tripwire, both surfaced together as one metrics object. */
+interface RuntimeScanMetrics extends ScanMetrics {
+  /** Snapshot tail hit SNAPSHOT_LOOKBACK_LINES (capped) AND its oldest record is still not older than the
+   *  outcome's openedAtMs ⇒ the true pre-open decision may sit further back than this read reached — mirrors
+   *  the resolutions journal's `recoveryTailInsufficient` tripwire for the snapshot journal. */
+  snapshotTailInsufficient: number;
+}
+export const scanMetrics: RuntimeScanMetrics = { ...emptyScanMetrics(), snapshotTailInsufficient: 0 };
 export const snapshotMetrics = { ticks: 0, lanes: 0, duplicateBatches: 0, journalErrors: 0, writeLatencyMsTotal: 0 };
 export const lifecycleMetrics = { events: 0, byEvent: {} as Record<string, number>, journalErrors: 0 };
 let writerLockChecked = false;
@@ -35,7 +46,7 @@ export function laneJournalActive(env: NodeJS.ProcessEnv = process.env): boolean
 /** Test hook — reset the per-process singletons so integration tests start clean. */
 export function _resetLaneRuntimeForTests(): void {
   writerLockChecked = false; writerLockOk = false; scanSingleFlight.inFlight = false;
-  Object.assign(scanMetrics, emptyScanMetrics());
+  Object.assign(scanMetrics, emptyScanMetrics(), { snapshotTailInsufficient: 0 });
   Object.assign(snapshotMetrics, { ticks: 0, lanes: 0, duplicateBatches: 0, journalErrors: 0, writeLatencyMsTotal: 0 });
   Object.assign(lifecycleMetrics, { events: 0, byEvent: {}, journalErrors: 0 });
 }
@@ -71,8 +82,17 @@ function ensureWriterLock(dir: string, instanceId: string, nowMs: number): boole
 /** Read recent lane-context snapshots from the snapshot journal for attribution (identity-filtered by the caller). */
 function snapshotDecisionsFor(paths: ReturnType<typeof laneJournalPaths>, o: ClosedOutcomeInput): LaneContextSnapshot[] {
   try {
-    const parsed = parseJsonlTail(prod.fs.readTailLines(paths.snapshots, SNAPSHOT_LOOKBACK_LINES));
-    return (parsed.records as unknown as LaneContextSnapshot[]).filter((s) => s && s.laneId === o.laneId && s.symbolOrBasketId === o.symbolOrBasketId && s.direction === o.direction);
+    const rawLines = prod.fs.readTailLines(paths.snapshots, SNAPSHOT_LOOKBACK_LINES);
+    const parsed = parseJsonlTail(rawLines);
+    const records = parsed.records as unknown as LaneContextSnapshot[];
+    // SURFACE a potential un-recovered gap: the tail hit the line cap (more history may exist beyond it) AND its
+    // oldest record is still not older than the outcome's open time ⇒ a matching pre-open decision could sit
+    // further back than this read reached — mirrors runResolutionScan's recoveryTailInsufficient tripwire.
+    if (rawLines.length >= SNAPSHOT_LOOKBACK_LINES) {
+      const oldestAsOf = records.reduce<number | null>((min, r) => (r && Number.isFinite(r.asOfMs) ? (min == null ? r.asOfMs : Math.min(min, r.asOfMs)) : min), null);
+      if (oldestAsOf != null && oldestAsOf >= o.openedAtMs) scanMetrics.snapshotTailInsufficient += 1;
+    }
+    return records.filter((s) => s && s.laneId === o.laneId && s.symbolOrBasketId === o.symbolOrBasketId && s.direction === o.direction);
   } catch { return []; }
 }
 

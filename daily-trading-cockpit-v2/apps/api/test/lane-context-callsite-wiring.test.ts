@@ -319,3 +319,52 @@ describe("COLLECT_ONLY gate — live-3103 report-only collection, default-OFF, a
     expect(existsSync(join(dir, "lane-context", "3103", "lifecycle.jsonl"))).toBe(true);
   });
 });
+
+// ═══════════════════════════════ 6. SNAPSHOT LOOKBACK (BUG 1) ═══════════════════════════════
+describe("snapshot lookback covers a long-held lane's entry decision (BUG 1 fix)", () => {
+  it("(a) attributes an outcome whose pre-open decision is >5,000 (but <50,000) snapshot lines back", () => {
+    const dir = tmp();
+    const snapDir = join(dir, "lane-context", "3102");
+    mkdirSync(snapDir, { recursive: true });
+    // the TARGET pre-open decision is the OLDEST line; 5,009 filler lines from OTHER lanes follow it, pushing it
+    // past the old 5,000-line tail window (real write rate: ~13-16 lines/5min tick across all active lanes).
+    const lines: string[] = [
+      JSON.stringify({ decisionId: "dec-target-a", asOfMs: 1_000, laneId: "CG_WIDE_LONG_RUNNER", symbolOrBasketId: "BTCUSDT", direction: "LONG", featureSchemaVersion: "lane-context-1" }),
+    ];
+    for (let i = 0; i < 5_009; i += 1) {
+      lines.push(JSON.stringify({ decisionId: `dec-filler-${i}`, asOfMs: 1_001 + i, laneId: "FILLER_LANE", symbolOrBasketId: "ETHUSDT", direction: "SHORT", featureSchemaVersion: "lane-context-1" }));
+    }
+    writeFileSync(join(snapDir, "snapshots.jsonl"), `${lines.join("\n")}\n`);
+    const order = closedOrder({
+      paperOrderId: "runner-po", selectedLaneId: "CG_WIDE_LONG_RUNNER", symbol: "BTCUSDT", direction: "LONG",
+      openedAt: new Date(2_000).toISOString(), closedAtMs: 500_000, resolvedAtMs: 600_000, netR: 0.9, grossR: 1.0, costR: -0.1,
+    });
+    const r = runLaneResolutionScan([order], 700_000, shadowEnv(dir));
+    expect(r.ran).toBe(true);
+    const rec = JSON.parse(readFileSync(join(snapDir, "resolutions.jsonl"), "utf8").trim().split("\n")[0]!) as { attributionStatus: string; attributedDecisionId: string | null };
+    expect(rec.attributionStatus).toBe("ATTRIBUTED"); // old 5,000-line lookback would have scrolled dec-target-a out ⇒ IDENTITY_MISMATCH
+    expect(rec.attributedDecisionId).toBe("dec-target-a");
+    expect(scanMetrics.snapshotTailInsufficient).toBe(0); // the whole file was read (no cap hit) ⇒ no false-positive tripwire
+  });
+
+  it("(b) snapshotTailInsufficient fires when the tail is genuinely capped short of the outcome's open time", () => {
+    const dir = tmp();
+    const snapDir = join(dir, "lane-context", "3102");
+    mkdirSync(snapDir, { recursive: true });
+    const total = 60_000; // exceeds SNAPSHOT_LOOKBACK_LINES (50,000) — a genuine, not-yet-covered volume spike
+    const lines: string[] = [];
+    for (let i = 0; i < total; i += 1) {
+      lines.push(JSON.stringify({ decisionId: `dec-${i}`, asOfMs: 100_000 + i, laneId: "OTHER_LANE", symbolOrBasketId: "ETHUSDT", direction: "SHORT", featureSchemaVersion: "lane-context-1" }));
+    }
+    writeFileSync(join(snapDir, "snapshots.jsonl"), `${lines.join("\n")}\n`);
+    const order = closedOrder({
+      paperOrderId: "capped-po", selectedLaneId: "CG_WIDE_LONG_RUNNER", symbol: "BTCUSDT", direction: "LONG",
+      openedAt: new Date(1_000).toISOString(), closedAtMs: 500_000, resolvedAtMs: 600_000,
+    });
+    const r = runLaneResolutionScan([order], 700_000, shadowEnv(dir));
+    expect(r.ran).toBe(true);
+    expect(scanMetrics.snapshotTailInsufficient).toBeGreaterThan(0); // SURFACED, not silent
+    const rec = JSON.parse(readFileSync(join(snapDir, "resolutions.jsonl"), "utf8").trim().split("\n")[0]!) as { attributionStatus: string };
+    expect(rec.attributionStatus).not.toBe("ATTRIBUTED");
+  });
+});
