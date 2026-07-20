@@ -76,4 +76,20 @@ describe("exit actions", () => {
     expect(trail.exitBar).toBe(2); // NOT 1 (the favorable-first bug exited on bar 1)
     expect(trail.finalNetR).toBeCloseTo(0.25); // (0.8−0.5) − 0.05
   });
+  it("TRAIL must honor the hard-stop floor even before any peak has armed (V-shaped crash then recover)", () => {
+    // LONG entry 100, risk 10. Bar1 crashes to −2R (low 80) with NO favorable excursion yet (peak still 0) —
+    // a real stop order at −1R (price 90) would have closed this on bar 1. Bar2 then rips to +3R (peak arms),
+    // bar3 retraces to +2.5R. A buggy peak-gated TRAIL never sees the bar-1 stop (peak>0 guard blocks it) and
+    // reconstructs a +2.45R winner — physically impossible once the hard stop was breached on bar 1.
+    const path = [
+      c(100, 100, 100, 100),
+      c(100, 100, 80, 85, 1), // crash: low 80 ⇒ −2R, high 100 ⇒ 0R favorable (peak stays 0)
+      c(85, 130, 125, 128, 2), // recovery: high 130 ⇒ +3R arms peak; low 125 ⇒ +2.5R (no exit yet, peak was 0 entering this bar)
+      c(128, 128, 125, 126, 3), // retrace: low 125 ⇒ +2.5R trips peak(3) − trailFrac(0.5) = 2.5
+    ];
+    const params: ExitParams = { direction: "LONG", riskDistance: 10, horizonBars: 10, costRoundTripR: 0.05, trailFrac: 0.5, tpR: 2 };
+    const trail = evaluateExitActions(path, params).find((r) => r.action === "TRAIL")!;
+    expect(trail.exitBar).toBe(1); // hard stop on bar 1, NOT the bar-3 trail retrace
+    expect(trail.finalNetR).toBeCloseTo(-1.05); // −1R − cost, same as HOLD's stop-out
+  });
 });

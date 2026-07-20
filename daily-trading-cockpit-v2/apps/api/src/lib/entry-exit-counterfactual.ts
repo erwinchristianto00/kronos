@@ -138,6 +138,9 @@ export function evaluateExitActions(path: PathCandle[], p: ExitParams): ExitResu
   { let peak = 0; const last = Math.min(path.length - 1, p.horizonBars);
     for (let b = 1; b <= last; b += 1) { const c = path[b]!;
       const curR = rOf(dir === 1 ? c.low : c.high); // adverse extreme, tested against the prior-bar peak
+      // Hard stop at −1R applies unconditionally, even before any peak has armed — a real stop order fires
+      // regardless of whether the trailing mechanism has anything to trail yet (matches INCUMBENT_TP_SL below).
+      if (curR <= -1) { trailNet = -1 - p.costRoundTripR; trailBar = b; break; }
       if (peak > 0 && curR <= peak - p.trailFrac) { trailNet = (peak - p.trailFrac) - p.costRoundTripR; trailBar = b; break; }
       const favR = rOf(dir === 1 ? c.high : c.low); if (favR > peak) peak = favR; // arm the peak AFTER the retrace test
     } }
