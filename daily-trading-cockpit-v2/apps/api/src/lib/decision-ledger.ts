@@ -50,6 +50,7 @@ export class DecisionLedger {
   private readonly file: string;
   private readonly recentRouteKeys = new Map<string, number>();
   private readonly duplicateWindowMs: number;
+  private lastRouteKeyPruneAt = 0;
 
   constructor(file: string, options?: { duplicateWindowMs?: number }) {
     this.file = resolve(file);
@@ -98,8 +99,31 @@ export class DecisionLedger {
     // Append before marking the key seen: if append() throws, the decision was never durably
     // recorded, so the dedup cache must not be poisoned into treating the retry as a duplicate.
     this.append({ ...base, event: "ROUTE_ASSIGNED" });
-    this.recentRouteKeys.set(key, Number.isFinite(now) ? now : Date.now());
+    const effectiveNow = Number.isFinite(now) ? now : Date.now();
+    this.recentRouteKeys.set(key, effectiveNow);
+    this.pruneRouteKeys(effectiveNow);
     return { logged: true, duplicate: false };
+  }
+
+  /** Prune-on-write (same convention as BinanceClient.pruneStaleCache()): sweep keys older than the
+   *  duplicate window off the write path instead of a new timer. Without this, recentRouteKeys keeps
+   *  every distinct (symbol,direction,routeMode,entryVariant,exitVariant) key ever observed for the
+   *  process lifetime, growing unboundedly over weeks of uptime. Uses the domain "now" derived from
+   *  base.timestamp (not wall-clock Date.now()) so the throttle and staleness check stay consistent
+   *  with the dedup window itself regardless of how far real wall time has drifted from it.
+   */
+  private pruneRouteKeys(now: number): void {
+    if (now - this.lastRouteKeyPruneAt < this.duplicateWindowMs) return;
+    this.lastRouteKeyPruneAt = now;
+    for (const [k, seenAt] of this.recentRouteKeys) {
+      if (now - seenAt >= this.duplicateWindowMs) {
+        this.recentRouteKeys.delete(k);
+      }
+    }
+  }
+
+  _getRouteKeyCacheSizeForTests(): number {
+    return this.recentRouteKeys.size;
   }
 
   recordPlanSelected(base: DecisionLedgerBase): void {
