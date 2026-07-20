@@ -1,14 +1,22 @@
+import { mkdtempSync } from "node:fs";
+import { join } from "node:path";
+import os from "node:os";
+
+import Fastify from "fastify";
 import { describe, it, expect } from "vitest";
 
 import {
   buildTimeboxedExitDiagnostic,
   buildTimeboxedExitDiagnosticBriefLines,
   PAPER_EXECUTION_MODEL_IDEAL,
+  getPaperExecutionRouterStore,
+  _resetPaperExecutionRouterStoreForTests,
   type PaperResolverClient,
   type PaperKlineTuple,
   type PaperOrder,
   type PaperOrderStatus,
 } from "../src/lib/paper-execution-router.js";
+import { registerShadowRoutes } from "../src/routes/shadow.js";
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -169,5 +177,29 @@ describe("timeboxed-exit counterfactual diagnostic (DIAGNOSTIC-ONLY)", () => {
     expect(r.sampleSize).toBe(0);
     expect(r.boxNetAvgR).toBeNull();
     expect(r.verdict).toBe("INSUFFICIENT_SAMPLE");
+  });
+});
+
+// ── GET /api/shadow/timebox-exit-diagnostic endpoint ────────────────────────
+describe("timebox-exit-diagnostic endpoint — repeated ?boxes querystring key", () => {
+  // Fastify parses a repeated key (?boxes=4&boxes=8) as string[], not the string
+  // the route's TS generic declares — .split(",") on that array throws uncaught.
+  it("does not 500 when ?boxes is supplied twice", async () => {
+    _resetPaperExecutionRouterStoreForTests();
+    getPaperExecutionRouterStore(mkdtempSync(join(os.tmpdir(), "timebox-endpoint-test-")));
+    const app = Fastify({ logger: false });
+    await registerShadowRoutes(app, null, {
+      binanceClient: { getCandles: async () => [] },
+    } as never);
+
+    const res = await app.inject({
+      method: "GET",
+      url: "/api/shadow/timebox-exit-diagnostic?boxes=4&boxes=8",
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json().reports.length).toBe(2);
+    await app.close();
+    _resetPaperExecutionRouterStoreForTests();
   });
 });
