@@ -42,6 +42,17 @@ export type CortexLaneDirection = "LONG" | "SHORT" | "NEUTRAL";
 export const CORTEX_CG_MFE_GIVEBACK_LONG_LANE_ID = "CG_MFE_GIVEBACK_LONG" as const;
 export const CORTEX_CG_MFE_GIVEBACK_SHORT_LANE_ID = "CG_MFE_GIVEBACK_SHORT" as const;
 
+/** `LiveExecutionEngine.laneSelectionWeightPctForLane` (the real allocation table) has no concept of
+ *  the LONG/SHORT split above — it only ever matches the single real id "CG_MFE_GIVEBACK" (mirrors
+ *  CG_ROSTER's variantId mapping in cortex-refit-runner-bindings.ts, which resolves the same split for
+ *  a different accessor). Map the two synthetic roster ids to that real id for the static-weight lookup
+ *  ONLY; the synthetic id stays untouched everywhere else (journaling, attribution, edge-memory). */
+function engineLaneIdForStaticWeight(laneId: string): string {
+  return laneId === CORTEX_CG_MFE_GIVEBACK_LONG_LANE_ID || laneId === CORTEX_CG_MFE_GIVEBACK_SHORT_LANE_ID
+    ? "CG_MFE_GIVEBACK"
+    : laneId;
+}
+
 /** Code-anchored roster: laneId + direction + isXsec are construction-time literals in app.ts (NOT
  *  available from any runtime getter), so they are pinned here. Direction/isXsec confirmed against the
  *  executor-wiring constants. Keep in sync if a lane's wiring direction changes. */
@@ -129,15 +140,20 @@ export interface CortexGatherDeps {
 export function normalizeCortexStaticWeightPctForLane(
   staticWeightPctForLane: (laneId: string) => number,
 ): (laneId: string) => number {
-  const rawByLane = new Map(
-    CORTEX_LANE_ROSTER.map((entry) => {
-      const raw = staticWeightPctForLane(entry.laneId);
-      return [entry.laneId, Number.isFinite(raw) ? Math.max(0, raw) : 0] as const;
-    }),
-  );
-  const total = [...rawByLane.values()].reduce((sum, weight) => sum + weight, 0);
+  // Keyed by the real engine lane id, not the roster id: CG_MFE_GIVEBACK_LONG/_SHORT both resolve to
+  // the one real "CG_MFE_GIVEBACK" sleeve, so it must be looked up (and counted toward the over-100
+  // clip) exactly once — counting it per roster entry would double it and wrongly shrink every other
+  // lane's weight whenever CG_MFE_GIVEBACK has a nonzero real allocation.
+  const rawByEngineLane = new Map<string, number>();
+  for (const entry of CORTEX_LANE_ROSTER) {
+    const engineLaneId = engineLaneIdForStaticWeight(entry.laneId);
+    if (rawByEngineLane.has(engineLaneId)) continue;
+    const raw = staticWeightPctForLane(engineLaneId);
+    rawByEngineLane.set(engineLaneId, Number.isFinite(raw) ? Math.max(0, raw) : 0);
+  }
+  const total = [...rawByEngineLane.values()].reduce((sum, weight) => sum + weight, 0);
   const scale = total > 100 ? 100 / total : 1;
-  return (laneId: string) => (rawByLane.get(laneId) ?? 0) * scale;
+  return (laneId: string) => (rawByEngineLane.get(engineLaneIdForStaticWeight(laneId)) ?? 0) * scale;
 }
 
 /** Map the controller's directionalBias enum to the gather's ControllerBias (only LONG/SHORT change the
@@ -200,7 +216,7 @@ export function buildCortexLaneRaw(entry: CortexRosterEntry, deps: CortexGatherD
     kronosAgree: deps.kronosAgreeForLane(entry.laneId),
     controllerBias: mapControllerBias(deps.controller.directionalBias),
     controllerConviction: deps.controller.convictionScore,
-    staticWeightPct: deps.staticWeightPctForLane(entry.laneId),
+    staticWeightPct: deps.staticWeightPctForLane(engineLaneIdForStaticWeight(entry.laneId)),
   };
 }
 

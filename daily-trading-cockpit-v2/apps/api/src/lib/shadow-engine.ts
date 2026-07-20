@@ -982,8 +982,9 @@ export class ShadowExecutionEngine {
             });
           }
         }
-      } catch {
+      } catch (err) {
         // ledger failures must never break shadow flow
+        console.error(`[shadow-engine] decision-ledger lifecycle event (${event.type}) failed:`, err);
       }
     }
   }

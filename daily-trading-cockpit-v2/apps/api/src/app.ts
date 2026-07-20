@@ -325,8 +325,9 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
   if (shadowEngine && process.env.DECISION_LEDGER_DISABLED !== "1") {
     try {
       shadowEngine.setDecisionLedger(getDecisionLedger(process.env.DECISION_LEDGER_FILE ?? "data/decision-log.jsonl"));
-    } catch {
+    } catch (err) {
       // ledger wiring is best-effort
+      console.error("[app] decision-ledger wiring failed:", err);
     }
   }
 
@@ -1058,10 +1059,14 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         client: liveClient,
         signalStore: getCrossSectionalStore(),
         store: new CrossSectionalExecutorStore(),
+        // 2026-07-20 real-money audit fix: this basket is marketed/sized as allocation-independent
+        // (isCrossSectionalAllocationIndependent) and has no single-symbol directional bias of its
+        // own — canOpenNewEntries() must NOT be used here, since it delegates to the operator's
+        // manual-directional LONG/SHORT gate (an unrelated subsystem) once manual mode is on.
         isAllowed: () => unifiedOrchestrator?.isEnabled()
-          ? (engineForGate?.canOpenNewEntries() ?? false) &&
+          ? (engineForGate?.canOpenNewEntriesIgnoringManualDirectional() ?? false) &&
             unifiedOrchestrator.allowsCrossSectionalLane(CROSS_SECTIONAL_MARKET_NEUTRAL_LANE_ID)
-          : (engineForGate?.canOpenNewEntries() ?? false) &&
+          : (engineForGate?.canOpenNewEntriesIgnoringManualDirectional() ?? false) &&
             (engineForGate?.laneSelectionAllowsLane(CROSS_SECTIONAL_MARKET_NEUTRAL_LANE_ID) ?? false),
         laneWeightPct: () => engineForGate?.laneSelectionWeightPctForLane(CROSS_SECTIONAL_MARKET_NEUTRAL_LANE_ID) ?? 0,
         entryHealthGate: () => {

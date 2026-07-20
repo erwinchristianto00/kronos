@@ -80,8 +80,9 @@ export class DecisionLedger {
           `[decision-ledger] rotated ${this.file}: archived ${result.fromSize ?? "?"} bytes → ${result.archivePath ?? "?"}; kept ${result.linesKept ?? 0} lines`,
         );
       }
-    } catch {
+    } catch (err) {
       // rotation failure must never block persistence
+      console.error(`[decision-ledger] rotation failed for ${this.file}:`, err);
     }
   }
 

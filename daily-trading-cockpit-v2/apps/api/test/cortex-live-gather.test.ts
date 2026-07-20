@@ -168,12 +168,61 @@ describe("cortex-live-gather — gatherCortexContext end-to-end", () => {
   });
   it("normalizes ALL_LANES eligibility sentinels without changing an explicit partial allocation", () => {
     const allLaneWeight = normalizeCortexStaticWeightPctForLane(() => 100);
+    // 16 roster entries but only 15 DISTINCT real allocation ids: CG_MFE_GIVEBACK_LONG/_SHORT share one
+    // real sleeve, so the shared slot is counted once for scaling but read back on 2 roster entries —
+    // the roster-level total lands just over 100 (still nowhere near the old bug's impossible 1500%).
+    const distinctRealLanes = CORTEX_LANE_ROSTER.length - 1;
     const allLaneTotal = CORTEX_LANE_ROSTER.reduce((sum, lane) => sum + allLaneWeight(lane.laneId), 0);
-    expect(allLaneTotal).toBeCloseTo(100, 9);
-    expect(allLaneWeight("CG_WIDE_FAST_LONG")).toBeCloseTo(100 / CORTEX_LANE_ROSTER.length, 9);
+    expect(allLaneTotal).toBeCloseTo((CORTEX_LANE_ROSTER.length / distinctRealLanes) * 100, 9);
+    expect(allLaneWeight("CG_WIDE_FAST_LONG")).toBeCloseTo(100 / distinctRealLanes, 9);
+    expect(allLaneWeight("CG_MFE_GIVEBACK_LONG")).toBeCloseTo(100 / distinctRealLanes, 9);
+    expect(allLaneWeight("CG_MFE_GIVEBACK_SHORT")).toBeCloseTo(100 / distinctRealLanes, 9);
 
     const partial = normalizeCortexStaticWeightPctForLane((laneId) => (laneId === "CG_WIDE_FAST_LONG" ? 25 : 0));
     expect(partial("CG_WIDE_FAST_LONG")).toBe(25);
+  });
+});
+
+describe("cortex-live-gather — CG_MFE_GIVEBACK static-weight lane-id mapping", () => {
+  // The real LiveExecutionEngine allocation table only ever uses the id "CG_MFE_GIVEBACK" (confirmed
+  // against regime-autopilot.ts's presets) — never the roster's synthetic "_LONG"/"_SHORT" split. Before
+  // the fix, staticWeightPctForLane("CG_MFE_GIVEBACK_LONG"/"_SHORT") always read 0 under any explicit
+  // allocation, silently falsifying CORTEX's shadow decision journal for this lane pair.
+  it("buildCortexLaneRaw maps both synthetic roster ids to the real 'CG_MFE_GIVEBACK' id for the static-weight lookup only", () => {
+    const deps = fakeDeps({ staticWeightPctForLane: (id) => (id === "CG_MFE_GIVEBACK" ? 15 : 0) });
+    const longRaw = buildCortexLaneRaw({ laneId: "CG_MFE_GIVEBACK_LONG", direction: "LONG", isXsec: false }, deps);
+    const shortRaw = buildCortexLaneRaw({ laneId: "CG_MFE_GIVEBACK_SHORT", direction: "SHORT", isXsec: false }, deps);
+    expect(longRaw.staticWeightPct).toBe(15);
+    expect(shortRaw.staticWeightPct).toBe(15);
+    // The synthetic id itself stays untouched everywhere else (journaling/attribution/direction split).
+    expect(longRaw.laneId).toBe("CG_MFE_GIVEBACK_LONG");
+    expect(shortRaw.laneId).toBe("CG_MFE_GIVEBACK_SHORT");
+  });
+
+  it("normalizeCortexStaticWeightPctForLane resolves the same real-id mapping for both synthetic ids", () => {
+    const raw = (id: string) => (id === "CG_WIDE_FAST_LONG" ? 30 : id === "CG_MFE_GIVEBACK" ? 15 : 0);
+    const normalized = normalizeCortexStaticWeightPctForLane(raw);
+    expect(normalized("CG_WIDE_FAST_LONG")).toBe(30);
+    expect(normalized("CG_MFE_GIVEBACK_LONG")).toBe(15);
+    expect(normalized("CG_MFE_GIVEBACK_SHORT")).toBe(15);
+  });
+
+  it("does not double-count CG_MFE_GIVEBACK's shared real allocation toward the over-100 clip", () => {
+    // A real table that already sums to exactly 100 across DISTINCT real ids: 50 + 50. If the shared
+    // CG_MFE_GIVEBACK slot were counted once PER synthetic roster entry, the total would read 150 and
+    // every lane (including CG_WIDE_FAST_LONG) would get wrongly scaled down to 33.3.
+    const raw = (id: string) => (id === "CG_WIDE_FAST_LONG" ? 50 : id === "CG_MFE_GIVEBACK" ? 50 : 0);
+    const normalized = normalizeCortexStaticWeightPctForLane(raw);
+    expect(normalized("CG_WIDE_FAST_LONG")).toBe(50);
+    expect(normalized("CG_MFE_GIVEBACK_LONG")).toBe(50);
+    expect(normalized("CG_MFE_GIVEBACK_SHORT")).toBe(50);
+  });
+
+  it("gatherCortexContext end-to-end: CG_MFE_GIVEBACK's real 15% allocation reaches BOTH direction-siloed lane observations", () => {
+    const deps = fakeDeps({ staticWeightPctForLane: (id) => (id === "CG_MFE_GIVEBACK" ? 15 : 0) });
+    const ctx = gatherCortexContext(deps);
+    expect(ctx.lanes.find((l) => l.laneId === "CG_MFE_GIVEBACK_LONG")?.staticWeightPct).toBe(15);
+    expect(ctx.lanes.find((l) => l.laneId === "CG_MFE_GIVEBACK_SHORT")?.staticWeightPct).toBe(15);
   });
 });
 

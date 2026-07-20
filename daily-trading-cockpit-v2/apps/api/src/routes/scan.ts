@@ -424,8 +424,9 @@ export async function registerScanRoute(
                   : "UNAVAILABLE",
           });
         }
-      } catch {
+      } catch (err) {
         // ledger failures must never break the scan
+        console.error("[scan] decision-ledger recordRouteAssigned failed:", err);
       } finally {
         timing.finishStage("decisionLedger");
       }
