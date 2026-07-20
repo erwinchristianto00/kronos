@@ -597,6 +597,13 @@ export class CrossSectionalExecutor {
   async tick(): Promise<void> {
     if (this.ticking) return;
     this.ticking = true;
+    // 2026-07-19 real-money audit fix (BUG 2): reset HERE, at the top, not unconditionally after
+    // every phase runs. closeBasketsHittingProfitTarget()/closeDueBaskets() now catch and record
+    // per-basket close failures internally (see their own per-basket try/catch) so ONE wedged
+    // basket can no longer abort the whole tick — but that means a failure recorded mid-tick must
+    // survive to the end of this function; a trailing unconditional `this.lastError = null` would
+    // silently wipe it out the moment the rest of the tick completes without ALSO throwing.
+    this.lastError = null;
     try {
       // 2026-07-19 real-money audit fix (BUG 1): retry any leg the basket-open abort path (or a
       // partial exit fill, see BUG 3) previously failed to flatten — see OrphanedLeg's doc
@@ -612,7 +619,6 @@ export class CrossSectionalExecutor {
       } else if (this.isAllowed()) {
         await this.maybeOpenBasket();
       }
-      this.lastError = null;
     } catch (error) {
       this.lastError = (error as Error).message ?? "tick failed";
     } finally {
@@ -684,7 +690,17 @@ export class CrossSectionalExecutor {
       basket.lastNetReturn = netReturn;
       basket.lastNetAt = this.nowIso();
       stamped = true;
-      if (netReturn >= threshold) await this.closeBasket(basket, "PROFIT_BANK");
+      if (netReturn >= threshold) {
+        // 2026-07-19 real-money audit fix (BUG 2): isolate this basket's close attempt so one
+        // wedged basket (repeated throw, e.g. a persistent margin/rate-limit condition) cannot
+        // prevent OTHER healthy baskets in this same loop from being processed this tick — mirrors
+        // closeAllBasketsOrderly's own per-basket try/catch isolation above.
+        try {
+          await this.closeBasket(basket, "PROFIT_BANK");
+        } catch (error) {
+          this.lastError = (error as Error).message ?? "profit-bank close failed";
+        }
+      }
     }
     if (stamped) this.store.save(); // persist the TP-gap stamps for the dashboard
   }
@@ -729,7 +745,14 @@ export class CrossSectionalExecutor {
     for (const basket of st.baskets) {
       if (basket.status !== "OPEN") continue;
       if (nowMs < basket.closesAtMs) continue;
-      await this.closeBasket(basket, "HORIZON");
+      // 2026-07-19 real-money audit fix (BUG 2): same per-basket isolation as
+      // closeBasketsHittingProfitTarget above — one basket's HORIZON close failing must not block
+      // every OTHER due basket from being closed this tick.
+      try {
+        await this.closeBasket(basket, "HORIZON");
+      } catch (error) {
+        this.lastError = (error as Error).message ?? "horizon close failed";
+      }
     }
   }
 
@@ -780,8 +803,26 @@ export class CrossSectionalExecutor {
           ...(reduceOnly ? { reduceOnly: true } : {}),
           newClientOrderId: `xsec-${basket.basketId.slice(-12)}-x${basket.legs.indexOf(leg)}`,
         });
-        leg.exitOrderId = order.orderId;
         const resolved = await this.resolveFillPrice(leg.symbol, order.orderId, order.avgPrice, leg.entryPrice);
+        // 2026-07-19 real-money audit fix (BUG 3): a genuine partial MARKET fill on the close
+        // order leaves a real, un-closed remainder on the exchange — recording this leg as fully
+        // exited would silently understate the account's true exposure. If executedQty
+        // meaningfully undershoots the requested qty, only the FILLED portion is booked as
+        // closed on this leg (at the confirmed fill price); the un-filled remainder is tracked
+        // via the SAME orphaned-leg retry mechanism as BUG 1 (this basket stays consistent —
+        // exitOrderId is still set, so the basket's own lifecycle isn't blocked — while the
+        // residual keeps getting flattened automatically every tick until it too resolves).
+        const executedQty = Number.isFinite(order.executedQty) ? order.executedQty : leg.qty;
+        const shortfall = leg.qty - executedQty;
+        if (shortfall > 1e-9) {
+          this.recordOrphanedLeg(
+            basket,
+            { ...leg, qty: shortfall },
+            new Error(`partial close fill: requested ${leg.qty}, executed ${executedQty} — residual ${shortfall} still open`),
+          );
+          leg.qty = executedQty > 0 ? executedQty : leg.qty;
+        }
+        leg.exitOrderId = order.orderId;
         leg.exitPrice = resolved.price;
         leg.exitPriceConfirmed = resolved.confirmed;
       } catch (error) {
@@ -1007,10 +1048,17 @@ export class CrossSectionalExecutor {
           newClientOrderId: `xsec-${basket.basketId.slice(-12)}-e${basket.legs.length}`,
         });
         const resolvedEntry = await this.resolveFillPrice(planned.symbol, order.orderId, order.avgPrice, planned.refPrice);
+        // 2026-07-19 real-money audit fix (BUG 3): a genuine partial MARKET fill (realistic on
+        // thin-liquidity basket-universe symbols during volatility spikes — exactly what this
+        // dispersion strategy targets) must not be silently recorded as if the full requested
+        // quantity filled. Record the REAL executedQty so downstream P&L/exposure tracking
+        // reflects what actually happened on the exchange, not what was requested.
+        const filledQty =
+          Number.isFinite(order.executedQty) && order.executedQty > 0 ? order.executedQty : planned.qty;
         basket.legs.push({
           symbol: planned.symbol,
           side: planned.side,
-          qty: planned.qty,
+          qty: filledQty,
           entryPrice: resolvedEntry.price,
           entryOrderId: order.orderId,
           entryPriceConfirmed: resolvedEntry.confirmed,

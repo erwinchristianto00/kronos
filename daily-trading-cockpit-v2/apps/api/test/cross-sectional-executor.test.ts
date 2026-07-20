@@ -67,7 +67,14 @@ class FakeExecClient implements CrossSectionalExecClient {
   queryOrderCallCount = 0;
   private orderSeq = 100;
 
+  /** [BUG 3 test support] When set for a symbol, a FILLED order (avgPrice>0) reports this
+   *  executedQty instead of the full requested quantity — simulates a genuine partial MARKET fill
+   *  (thin liquidity / volatility spike) on either an entry or an exit leg. */
+  partialFillQtyBySymbol = new Map<string, number>();
+
   private buildOrder(symbol: string, side: string, quantity: number, reduceOnly: boolean | undefined, orderId: string, avgPrice: number): FuturesOrder {
+    const partial = this.partialFillQtyBySymbol.get(symbol);
+    const executedQty = avgPrice > 0 ? (partial !== undefined ? Math.min(partial, quantity) : quantity) : 0;
     return {
       symbol,
       orderId,
@@ -79,7 +86,7 @@ class FakeExecClient implements CrossSectionalExecClient {
       price: 0,
       stopPrice: 0,
       origQty: quantity,
-      executedQty: avgPrice > 0 ? quantity : 0,
+      executedQty,
       avgPrice,
       updateTime: 0,
     };
@@ -1123,5 +1130,145 @@ describe("[BUG 1] orphaned-leg tracking + retry when a basket-open abort's flatt
     // Critically: the retry never created NEW (non-reduceOnly) exposure to "close" an
     // already-flat position — the count of non-reduceOnly SOLUSDT orders is unchanged.
     expect(client.placed.filter((p) => p.symbol === "SOLUSDT" && !p.reduceOnly).length).toBe(nonReduceOnlySolBefore);
+  });
+});
+
+// ── 2026-07-19 real-money audit fix (BUG 2) ─────────────────────────────────
+describe("[BUG 2] one wedged basket's close failure does not block other due baskets in the same tick", () => {
+  function directBasket(basketId: string, symbol: string, closesAtMs: number): ExecutorBasket {
+    return {
+      basketId,
+      sourceObservationId: `manual:${basketId}`,
+      signal: "MOM24_FILTERED",
+      variant: "FILTERED",
+      openedAt: NOW,
+      closesAtMs,
+      legs: [
+        {
+          symbol,
+          side: "LONG",
+          qty: 10,
+          entryPrice: 1,
+          entryOrderId: `entry-${basketId}`,
+          entryPriceConfirmed: true,
+          exitPrice: null,
+          exitOrderId: null,
+          exitPriceConfirmed: null,
+        },
+      ],
+      status: "OPEN",
+      closedAt: null,
+      closeReason: null,
+      grossPnlUsd: null,
+      feeEstimateUsd: null,
+      netPnlUsd: null,
+    };
+  }
+
+  it("closeDueBaskets: a persistently-failing basket stays OPEN, a healthy due basket in the SAME tick still closes", async () => {
+    const client = new FakeExecClient();
+    const { executor, store } = makeExecutor({ client });
+    const st = store.getState();
+    // Wedged: ADAUSDT's reduceOnly close is rejected (-2022) AND the exchange still genuinely
+    // carries the matching LONG position, so it can never reconcile as already-flat — every
+    // attempt falls through to a real failure, exactly a persistent margin/rate-limit condition.
+    client.rejectReduceOnlyOn.add("ADAUSDT");
+    client.positionAmtBySymbol.set("ADAUSDT", 10);
+    st.baskets.push(directBasket("xb-wedged", "ADAUSDT", NOW_MS - 60_000));
+    // Healthy: RNDRUSDT closes normally.
+    client.fillPriceBySymbol.set("RNDRUSDT", 1.05);
+    st.baskets.push(directBasket("xb-healthy", "RNDRUSDT", NOW_MS - 60_000));
+    store.save();
+
+    await executor.tick();
+
+    const wedged = store.getState().baskets.find((b) => b.basketId === "xb-wedged")!;
+    const healthy = store.getState().baskets.find((b) => b.basketId === "xb-healthy")!;
+    // FAIL-WITHOUT-FIX: before the fix, closeDueBaskets had no per-basket try/catch, so the
+    // wedged basket's thrown error would propagate out of the for-loop and the healthy basket
+    // (iterated AFTER it) would never even be attempted this tick.
+    expect(wedged.status).toBe("OPEN"); // still due, will retry next tick
+    expect(healthy.status).toBe("CLOSED"); // NOT blocked by the wedged basket ahead of it
+    expect(executor.lastError).toMatch(/ADAUSDT|close incomplete/);
+  });
+
+  it("closeBasketsHittingProfitTarget: same isolation for the profit-bank path", async () => {
+    const client = new FakeExecClient();
+    const { executor, store } = makeExecutor({ client });
+    const st = store.getState();
+    client.rejectReduceOnlyOn.add("ADAUSDT");
+    client.positionAmtBySymbol.set("ADAUSDT", 10);
+    client.markPriceBySymbol.set("ADAUSDT", 2); // deep in profit vs entryPrice=1 -> hits TP threshold
+    st.baskets.push(directBasket("xb-wedged-tp", "ADAUSDT", NOW_MS + 3_600_000)); // not yet due by horizon
+    client.fillPriceBySymbol.set("RNDRUSDT", 2.05);
+    client.markPriceBySymbol.set("RNDRUSDT", 2);
+    st.baskets.push(directBasket("xb-healthy-tp", "RNDRUSDT", NOW_MS + 3_600_000));
+    store.save();
+
+    await executor.tick();
+
+    const wedged = store.getState().baskets.find((b) => b.basketId === "xb-wedged-tp")!;
+    const healthy = store.getState().baskets.find((b) => b.basketId === "xb-healthy-tp")!;
+    expect(wedged.status).toBe("OPEN");
+    expect(healthy.status).toBe("CLOSED");
+  });
+});
+
+// ── 2026-07-19 real-money audit fix (BUG 3) ─────────────────────────────────
+describe("[BUG 3] a genuine partial MARKET fill is recorded as what actually executed, not the requested qty", () => {
+  it("entry leg: a partial fill records the REAL executedQty, not the requested quantity", async () => {
+    const client = new FakeExecClient();
+    client.fillPriceBySymbol.set("SOLUSDT", 100);
+    client.fillPriceBySymbol.set("DOGEUSDT", 0.1);
+    // Determine the FULL requested qty first (no partial fill), then reproduce a genuine partial
+    // fill at 40% of that — whatever the executor's real default legUsd/stepSize sizing works out
+    // to, rather than guessing a specific notional.
+    const probe = makeExecutor({ signalMs: NOW_MS - 5 * 60_000 });
+    await probe.executor.tick();
+    const requestedQty = probe.store.getState().baskets[0]!.legs.find((l) => l.symbol === "SOLUSDT")!.qty;
+
+    client.partialFillQtyBySymbol.set("SOLUSDT", requestedQty * 0.4); // 40% partial fill
+    const { executor, store } = makeExecutor({ client, signalMs: NOW_MS - 5 * 60_000 });
+    await executor.tick();
+
+    const basket = store.getState().baskets[0]!;
+    const sol = basket.legs.find((l) => l.symbol === "SOLUSDT")!;
+    // FAIL-WITHOUT-FIX: before the fix, `qty: planned.qty` always recorded the full requested
+    // size regardless of what the exchange actually confirmed via executedQty.
+    expect(sol.qty).toBeCloseTo(requestedQty * 0.4, 6);
+    expect(sol.qty).not.toBeCloseTo(requestedQty, 6); // sanity: genuinely different from the un-partial-filled qty
+  });
+
+  it("exit leg: a partial close fill books only the executed qty and tracks the residual as an orphaned leg", async () => {
+    const client = new FakeExecClient();
+    client.fillPriceBySymbol.set("SOLUSDT", 100);
+    client.fillPriceBySymbol.set("DOGEUSDT", 0.1);
+    const { executor, store } = makeExecutor({ client, signalMs: NOW_MS - 5 * 60_000 });
+    await executor.tick(); // opens the basket
+
+    const opened = store.getState().baskets[0]!;
+    // Force the basket into its due-for-HORIZON-close window directly (the signal itself stays
+    // fresh — only the basket's own closesAtMs is backdated — matching how other tests in this
+    // file simulate "already due" without needing to also make the ENTRY signal look stale).
+    opened.closesAtMs = NOW_MS - 60_000;
+    store.save();
+    const solQtyOpened = opened.legs.find((l) => l.symbol === "SOLUSDT")!.qty;
+
+    // Now the CLOSE order on SOLUSDT only partially fills.
+    client.partialFillQtyBySymbol.set("SOLUSDT", solQtyOpened * 0.4);
+    await executor.tick(); // HORIZON close is due
+
+    const basket = store.getState().baskets.find((b) => b.basketId === opened.basketId)!;
+    const sol = basket.legs.find((l) => l.symbol === "SOLUSDT")!;
+    // FAIL-WITHOUT-FIX: before the fix, this leg's exitOrderId/exitPrice were set from the
+    // partial fill while qty stayed at the FULL original size — silently understating the real,
+    // still-open remainder with no tracking or recovery path at all.
+    expect(sol.exitOrderId).not.toBeNull(); // the basket's own lifecycle is not blocked
+    expect(sol.qty).toBeCloseTo(solQtyOpened * 0.4, 6); // only the executed portion is booked on this leg
+
+    const orphans = store.getState().orphanedLegs;
+    expect(orphans).toHaveLength(1);
+    expect(orphans[0]).toMatchObject({ symbol: "SOLUSDT", side: "LONG" });
+    expect(orphans[0]!.qty).toBeCloseTo(solQtyOpened * 0.6, 6); // the un-filled remainder, tracked for retry
   });
 });
