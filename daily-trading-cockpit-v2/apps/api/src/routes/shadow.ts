@@ -168,6 +168,7 @@ import {
 import { buildTpSlGeometryRootCauseAuditReport } from "../lib/tp-sl-geometry-root-cause-audit.js";
 import { buildAdaptiveProfitPolicySynthesisReport, type AdaptiveProfitPolicyEvidenceEra } from "../lib/adaptive-profit-policy.js";
 import { buildCortexCollectionStatus } from "../lib/cortex-collection-status.js";
+import { buildCortexShadowDecisionAlphaReport } from "../lib/cortex-decision-alpha-report.js";
 import {
   JsonKronosCounterfactualStore,
   buildKronosCounterfactualReport,
@@ -660,6 +661,11 @@ export async function registerShadowRoutes(
   // Read-only lineage/learner monitor. It never writes a journal, changes beta,
   // refits a model, or touches execution; /research uses it for live status.
   app.get("/api/shadow/cortex-collection-status", async () => buildCortexCollectionStatus());
+
+  // #219 — how much R the shadow tilt would have added, realized, over every outcome attribution has
+  // already tied to an owning decision. Read-only diagnostic; never writes anything, never influences
+  // allocation (see cortex-decision-alpha-report.ts's own doc for why no live engine dependency is needed).
+  app.get("/api/shadow/cortex-decision-alpha", async () => buildCortexShadowDecisionAlphaReport());
 
   app.get("/api/shadow/oos-validation-snapshot-status", async () => ({
     reportOnly: true,

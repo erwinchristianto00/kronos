@@ -86,14 +86,18 @@ export function readCortexDecisionRows(files: string[]): { rows: CortexDecisionR
       if (byAt.has(rec.at)) continue; // dedupe: identical decision across rotation
       const atMs = parseIsoMs(rec.at);
       if (atMs === null) continue;
-      const lanes = new Map<string, { x: number[]; eligible: boolean; direction: CortexLaneDir | null }>();
+      const lanes = new Map<string, { x: number[]; eligible: boolean; direction: CortexLaneDir | null; finalPct: number; evalFinalPct: number }>();
       const rawLanes = Array.isArray(rec.lanes) ? (rec.lanes as Record<string, unknown>[]) : [];
       for (const l of rawLanes) {
         const laneId = typeof l.laneId === "string" ? l.laneId : null;
         const x = Array.isArray(l.x) ? (l.x as unknown[]).map(Number) : null;
         if (!laneId || !x || x.length === 0 || !x.every((v) => Number.isFinite(v))) continue;
         const dir = l.direction === "LONG" || l.direction === "SHORT" || l.direction === "NEUTRAL" ? (l.direction as CortexLaneDir) : null;
-        lanes.set(laneId, { x, eligible: l.eligible === true, direction: dir });
+        const finalPct = typeof l.finalPct === "number" && Number.isFinite(l.finalPct) ? l.finalPct : 0;
+        // Older rows journaled before #219 have no evalFinalPct — fall back to finalPct (β=0 ⇒ no tilt,
+        // which is the correct reading for a row that never carried an eval-counterfactual weight at all).
+        const evalFinalPct = typeof l.evalFinalPct === "number" && Number.isFinite(l.evalFinalPct) ? l.evalFinalPct : finalPct;
+        lanes.set(laneId, { x, eligible: l.eligible === true, direction: dir, finalPct, evalFinalPct });
       }
       byAt.set(rec.at, {
         atMs,

@@ -3,8 +3,10 @@ import {
   attributeOutcomes,
   cortexBlindCapitalPct,
   cortexRegimeFamilyCoverage,
+  cortexShadowDecisionAlpha,
   CORTEX_ATTR_DEFAULT_TTL_MS,
   type CortexAttrRosterEntry,
+  type CortexAttributedExample,
   type CortexDecisionRow,
   type CortexLaneOutcome,
 } from "../src/lib/cortex-attribution.js";
@@ -30,10 +32,16 @@ import {
 
 const MIN = 60_000;
 
-function decision(atMs: number, opts: { schema?: number; family?: string; lanes: Record<string, { x?: number[]; eligible?: boolean; direction?: "LONG" | "SHORT" | "NEUTRAL" }> }): CortexDecisionRow {
-  const lanes = new Map<string, { x: number[]; eligible: boolean; direction: "LONG" | "SHORT" | "NEUTRAL" | null }>();
+function decision(atMs: number, opts: { schema?: number; family?: string; lanes: Record<string, { x?: number[]; eligible?: boolean; direction?: "LONG" | "SHORT" | "NEUTRAL"; finalPct?: number; evalFinalPct?: number }> }): CortexDecisionRow {
+  const lanes = new Map<string, { x: number[]; eligible: boolean; direction: "LONG" | "SHORT" | "NEUTRAL" | null; finalPct: number; evalFinalPct: number }>();
   for (const [laneId, l] of Object.entries(opts.lanes)) {
-    lanes.set(laneId, { x: l.x ?? [1, atMs / 1e9, 0, 0, 0, 0, 0, 0, 0, 0.5], eligible: l.eligible ?? true, direction: l.direction ?? "LONG" });
+    lanes.set(laneId, {
+      x: l.x ?? [1, atMs / 1e9, 0, 0, 0, 0, 0, 0, 0, 0.5],
+      eligible: l.eligible ?? true,
+      direction: l.direction ?? "LONG",
+      finalPct: l.finalPct ?? 0,
+      evalFinalPct: l.evalFinalPct ?? l.finalPct ?? 0,
+    });
   }
   return { atMs, featureSchemaVersion: opts.schema ?? 1, regimeFamily: opts.family ?? "BULL", lanes };
 }
@@ -292,5 +300,94 @@ describe("cortex beta split — liveBeta wall (operator hard rule)", () => {
     // The evaluation decision at the ramped β DOES tilt (proves the two channels differ).
     const evalDec = decideCortex(ctx, state, { beta: evaluationBeta(state.cumulativeResolved) });
     expect(evalDec.beta).toBeGreaterThan(0);
+  });
+});
+
+describe("cortexShadowDecisionAlpha (#219 — realized tilt-delta-R, 2026-07-20)", () => {
+  const ex = (over: Partial<CortexAttributedExample> = {}): CortexAttributedExample => ({
+    x: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    y: 1,
+    tMs: 0,
+    schemaVersion: 1,
+    laneId: "L1",
+    archetype: "BREADTH",
+    regimeFamily: "BULL",
+    observationId: "o1",
+    netR: 0,
+    resolvedAtMs: 0,
+    eligibleAtDecision: true,
+    finalPctAtDecision: 0,
+    evalFinalPctAtDecision: 0,
+    ...over,
+  });
+
+  it("zero examples ⇒ n=0, cumulativeTiltDeltaR=0, meanTiltDeltaR=null (never a fabricated 0-edge)", () => {
+    const r = cortexShadowDecisionAlpha([]);
+    expect(r).toEqual({ n: 0, cumulativeTiltDeltaR: 0, meanTiltDeltaR: null, perLane: [] });
+  });
+
+  it("an overweighted winner adds POSITIVE tilt-delta-R (the tilt correctly leaned into it)", () => {
+    // eval overweights this lane by 20pp vs the incumbent's 10%, and it resolved +2R.
+    const r = cortexShadowDecisionAlpha([ex({ finalPctAtDecision: 10, evalFinalPctAtDecision: 30, netR: 2 })]);
+    expect(r.n).toBe(1);
+    expect(r.cumulativeTiltDeltaR).toBeCloseTo(0.2 * 2, 9); // (30-10)/100 * 2
+    expect(r.meanTiltDeltaR).toBeCloseTo(0.4, 9);
+  });
+
+  it("an underweighted winner adds NEGATIVE tilt-delta-R (the tilt missed upside by pulling away)", () => {
+    const r = cortexShadowDecisionAlpha([ex({ finalPctAtDecision: 30, evalFinalPctAtDecision: 10, netR: 2 })]);
+    expect(r.cumulativeTiltDeltaR).toBeCloseTo(-0.2 * 2, 9);
+  });
+
+  it("an overweighted LOSER adds negative tilt-delta-R (leaning into a loser is genuinely bad)", () => {
+    const r = cortexShadowDecisionAlpha([ex({ finalPctAtDecision: 10, evalFinalPctAtDecision: 30, netR: -1.5 })]);
+    expect(r.cumulativeTiltDeltaR).toBeCloseTo(0.2 * -1.5, 9);
+  });
+
+  it("no tilt (finalPct===evalFinalPct, e.g. β never ramped) contributes exactly 0 regardless of netR", () => {
+    const r = cortexShadowDecisionAlpha([ex({ finalPctAtDecision: 15, evalFinalPctAtDecision: 15, netR: 5 })]);
+    expect(r.cumulativeTiltDeltaR).toBe(0);
+  });
+
+  it("aggregates across lanes correctly: total = sum of per-lane, both directions net out honestly", () => {
+    const examples = [
+      ex({ laneId: "L1", finalPctAtDecision: 10, evalFinalPctAtDecision: 25, netR: 1, observationId: "a" }),
+      ex({ laneId: "L1", finalPctAtDecision: 10, evalFinalPctAtDecision: 25, netR: -0.5, observationId: "b" }),
+      ex({ laneId: "L2", finalPctAtDecision: 20, evalFinalPctAtDecision: 5, netR: 3, observationId: "c" }),
+    ];
+    const r = cortexShadowDecisionAlpha(examples);
+    expect(r.n).toBe(3);
+    const l1Expected = 0.15 * 1 + 0.15 * -0.5;
+    const l2Expected = -0.15 * 3;
+    expect(r.cumulativeTiltDeltaR).toBeCloseTo(l1Expected + l2Expected, 9);
+    const byLane = Object.fromEntries(r.perLane.map((l) => [l.laneId, l]));
+    expect(byLane.L1!.n).toBe(2);
+    expect(byLane.L1!.cumulativeTiltDeltaR).toBeCloseTo(l1Expected, 9);
+    expect(byLane.L2!.n).toBe(1);
+    expect(byLane.L2!.cumulativeTiltDeltaR).toBeCloseTo(l2Expected, 9);
+  });
+
+  it("skips a non-finite weight or netR defensively rather than poisoning the sum with NaN", () => {
+    const r = cortexShadowDecisionAlpha([
+      ex({ finalPctAtDecision: NaN, evalFinalPctAtDecision: 20, netR: 1 }),
+      ex({ finalPctAtDecision: 10, evalFinalPctAtDecision: 20, netR: 1, observationId: "ok" }),
+    ]);
+    expect(r.n).toBe(1); // the NaN row is dropped, not counted
+    expect(Number.isFinite(r.cumulativeTiltDeltaR)).toBe(true);
+    expect(r.cumulativeTiltDeltaR).toBeCloseTo(0.1, 9);
+  });
+
+  it("end-to-end wiring: finalPct/evalFinalPct survive readCortexDecisionRows-shaped input through attributeOutcomes into the alpha computation", () => {
+    // A single decision at t=0 with a 25pp tilt (10% static -> 35% eval), then a trade opens+resolves
+    // inside its TTL window, winning +2R. The realized tilt-delta-R must reflect that exact 25pp tilt.
+    const decisions = [decision(0, { lanes: { L1: { finalPct: 10, evalFinalPct: 35 } } })];
+    const outcomes = [outcome("L1", 5 * MIN, 10 * MIN, 2, "trade-1")];
+    const attributed = attributeOutcomes(decisions, outcomes, OPTS);
+    expect(attributed.examples).toHaveLength(1);
+    expect(attributed.examples[0]!.finalPctAtDecision).toBe(10);
+    expect(attributed.examples[0]!.evalFinalPctAtDecision).toBe(35);
+    const alpha = cortexShadowDecisionAlpha(attributed.examples);
+    expect(alpha.n).toBe(1);
+    expect(alpha.cumulativeTiltDeltaR).toBeCloseTo(0.25 * 2, 9);
   });
 });

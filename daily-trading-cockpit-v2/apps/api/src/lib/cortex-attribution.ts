@@ -44,12 +44,16 @@ export interface CortexLaneOutcome {
   riskDistanceAtOpen?: number | null;
 }
 
-/** One journaled brain decision, reduced to what attribution needs. `lanes` is keyed by laneId. */
+/** One journaled brain decision, reduced to what attribution needs. `lanes` is keyed by laneId.
+ *  finalPct/evalFinalPct are the OPERATIONAL (β=0) vs SHADOW-counterfactual (evaluationBeta) per-lane
+ *  weights at decision time — carried through so a resolved outcome's realized netR can be compared
+ *  against what the tilt WOULD have weighted it, for #219's decision-alpha (see cortexShadowDecisionAlpha
+ *  below). Not used by the refit itself (which only needs x/y). */
 export interface CortexDecisionRow {
   atMs: number;
   featureSchemaVersion: number;
   regimeFamily: string;
-  lanes: Map<string, { x: number[]; eligible: boolean; direction: CortexLaneDir | null }>;
+  lanes: Map<string, { x: number[]; eligible: boolean; direction: CortexLaneDir | null; finalPct: number; evalFinalPct: number }>;
 }
 
 /** A roster entry: what CORTEX believes it is tracking, and whether an outcome source is actually wired. */
@@ -89,6 +93,10 @@ export interface CortexAttributedExample extends CortexTrainingExample {
   resolvedAtMs: number;
   /** The owning decision's eligible flag (diagnostic). Not a hard filter unless opts.requireEligible. */
   eligibleAtDecision: boolean;
+  /** The owning decision's OPERATIONAL (β=0) and SHADOW-counterfactual (evaluationBeta) weight for this
+   *  lane, at decision time — for cortexShadowDecisionAlpha below. Diagnostic only, never a training input. */
+  finalPctAtDecision: number;
+  evalFinalPctAtDecision: number;
 }
 
 export interface CortexAttributionResult {
@@ -122,6 +130,8 @@ interface LaneSlice {
   direction: CortexLaneDir | null;
   schemaVersion: number;
   regimeFamily: string;
+  finalPct: number;
+  evalFinalPct: number;
 }
 
 /**
@@ -152,6 +162,8 @@ export function attributeOutcomes(
         direction: l.direction,
         schemaVersion: d.featureSchemaVersion,
         regimeFamily: d.regimeFamily,
+        finalPct: Number.isFinite(l.finalPct) ? l.finalPct : 0,
+        evalFinalPct: Number.isFinite(l.evalFinalPct) ? l.evalFinalPct : (Number.isFinite(l.finalPct) ? l.finalPct : 0),
       });
     }
   }
@@ -251,6 +263,8 @@ export function attributeOutcomes(
       netR: o.netR,
       resolvedAtMs: o.resolvedAtMs,
       eligibleAtDecision: owner.eligible,
+      finalPctAtDecision: owner.finalPct,
+      evalFinalPctAtDecision: owner.evalFinalPct,
     });
     regimeCoverageThisRun[owner.regimeFamily] = (regimeCoverageThisRun[owner.regimeFamily] ?? 0) + 1;
     if (o.resolvedAtMs > maxResolvedAtMs) maxResolvedAtMs = o.resolvedAtMs;
@@ -305,4 +319,57 @@ export function cortexBlindCapitalPct(perLane: CortexLaneAttributionStatus[]): n
  *  PERSISTED store.resolvedByFamily, not decision ticks). Exported for the gate + tests. */
 export function cortexRegimeFamilyCoverage(resolvedByFamily: Record<string, number>): number {
   return Object.values(resolvedByFamily).filter((n) => Number.isFinite(n) && n > 0).length;
+}
+
+/** Per-lane rollup of the shadow decision-alpha (below). */
+export interface CortexShadowDecisionAlphaLane {
+  laneId: string;
+  n: number;
+  cumulativeTiltDeltaR: number;
+}
+
+export interface CortexShadowDecisionAlphaResult {
+  /** Number of attributed outcomes this was computed over. */
+  n: number;
+  /** Σ over every attributed outcome of (evalFinalPct − finalPct)/100 × netR — the REALIZED R the
+   *  shadow tilt would have added, in aggregate, had it been operating on real capital all along.
+   *  Mirrors decideCortex's own `expectedTiltDeltaR` formula exactly, but with the lane's REAL
+   *  resolved netR substituted for its pre-decision shrunk-edge estimate — this is the "compared to
+   *  realized at resolution" reconciliation expectedTiltDeltaR's own doc comment calls for (#219). */
+  cumulativeTiltDeltaR: number;
+  /** cumulativeTiltDeltaR / n, or null if n===0 — the average per-outcome edge the tilt adds. */
+  meanTiltDeltaR: number | null;
+  perLane: CortexShadowDecisionAlphaLane[];
+}
+
+/**
+ * #219 — CORTEX's shadow decision-alpha: how much R the brain's tilt (at whatever evaluationBeta was in
+ * effect at each decision) would have added, realized, over every outcome attribution has already tied
+ * back to an owning decision. Pure + deterministic; a diagnostic READ over already-attributed examples,
+ * never a training input and never wired to any allocation. Zero examples ⇒ n=0, cumulativeTiltDeltaR=0,
+ * meanTiltDeltaR=null (not 0 — "no data yet" must never look identical to "measured zero edge").
+ */
+export function cortexShadowDecisionAlpha(examples: CortexAttributedExample[]): CortexShadowDecisionAlphaResult {
+  const perLane = new Map<string, { n: number; sum: number }>();
+  let cumulativeTiltDeltaR = 0;
+  let n = 0;
+  for (const e of examples) {
+    if (!Number.isFinite(e.finalPctAtDecision) || !Number.isFinite(e.evalFinalPctAtDecision) || !Number.isFinite(e.netR)) continue;
+    const tiltDeltaR = ((e.evalFinalPctAtDecision - e.finalPctAtDecision) / 100) * e.netR;
+    if (!Number.isFinite(tiltDeltaR)) continue;
+    cumulativeTiltDeltaR += tiltDeltaR;
+    n += 1;
+    const l = perLane.get(e.laneId) ?? { n: 0, sum: 0 };
+    l.n += 1;
+    l.sum += tiltDeltaR;
+    perLane.set(e.laneId, l);
+  }
+  return {
+    n,
+    cumulativeTiltDeltaR,
+    meanTiltDeltaR: n > 0 ? cumulativeTiltDeltaR / n : null,
+    perLane: [...perLane.entries()]
+      .map(([laneId, v]) => ({ laneId, n: v.n, cumulativeTiltDeltaR: v.sum }))
+      .sort((a, b) => Math.abs(b.cumulativeTiltDeltaR) - Math.abs(a.cumulativeTiltDeltaR)),
+  };
 }
