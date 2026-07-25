@@ -19,7 +19,7 @@ import { decideMarketState } from "./market-state-brain.js";
 import { decideDirection } from "./direction-brain.js";
 import { decideEntry } from "./entry-brain.js";
 import { decideExit } from "./exit-brain.js";
-import { buildExecutiveDecision } from "./executive-decision.js";
+import { buildExecutiveDecision, runBrainSafely } from "./executive-decision.js";
 import {
   checkEntryInvariants,
   checkExecutiveInvariants,
@@ -34,6 +34,12 @@ export interface FourBrainTickMetrics {
   skippedSingleFlight: number;
   gatherErrors: number;
   journalErrors: number;
+  /** 2026-07-22 fix: a single candidate's Direction/Entry/Exit/ExecutiveDecision call throwing used to
+   *  abort the ENTIRE tick (the one top-level try/catch), losing the market snapshot + every OTHER
+   *  candidate's decision too — disproportionate to one bad candidate. Each per-candidate brain call is
+   *  now wrapped in runBrainSafely (executive-decision.ts's own doc always claimed this, but it was never
+   *  actually called anywhere until this fix) so a single failure only skips that one candidate. */
+  brainErrors: number;
   invariantFailures: number;
   decisions: number;
   duplicateDecisionIds: number;
@@ -77,7 +83,7 @@ export interface FourBrainShadowTickDeps {
 
 function emptyMetrics(): FourBrainTickMetrics {
   return {
-    attempted: 0, completed: 0, skippedSingleFlight: 0, gatherErrors: 0, journalErrors: 0, invariantFailures: 0,
+    attempted: 0, completed: 0, skippedSingleFlight: 0, gatherErrors: 0, journalErrors: 0, brainErrors: 0, invariantFailures: 0,
     decisions: 0, duplicateDecisionIds: 0, byCandidateStatus: {}, byBrainAction: {}, unknownLanes: 0,
     duplicateIdentities: 0, laneCoverage: 0, positionCoverage: 0, staleOrMissingByClass: {}, gatherMs: 0, inferenceMs: 0, journalMs: 0,
   };
@@ -145,7 +151,11 @@ export function runFourBrainShadowTick(deps: FourBrainShadowTickDeps): FourBrain
     for (const d of gathered.directionInputs) {
       // The Market State Brain is the SINGLE source of bias/transitionRisk (a soft nudge to Direction) —
       // patch them from the just-computed marketState so there is no second, divergent bias estimate.
-      const dec = decideDirection({ ...d.input, marketBias: marketState.bias, transitionRisk: marketState.transitionRisk });
+      const dec = runBrainSafely(() => decideDirection({ ...d.input, marketBias: marketState.bias, transitionRisk: marketState.transitionRisk }));
+      if (dec === null) {
+        metrics.brainErrors += 1;
+        continue; // this horizon's direction is skipped; other horizons + the tick as a whole still complete
+      }
       directionByHorizon.set(d.horizon, dec);
       directions.push(dec);
       metrics.byBrainAction[`dir:${dec.action}`] = (metrics.byBrainAction[`dir:${dec.action}`] ?? 0) + 1;
@@ -155,51 +165,71 @@ export function runFourBrainShadowTick(deps: FourBrainShadowTickDeps): FourBrain
     const seenDecisionIds = new Set<string>();
 
     for (const c of gathered.entryCandidates) {
-      const entry = decideEntry(c.input);
+      const entry = runBrainSafely(() => decideEntry(c.input));
+      if (entry === null) {
+        metrics.brainErrors += 1;
+        continue; // this candidate is skipped; every other candidate + the market snapshot still journal
+      }
       metrics.byBrainAction[`entry:${entry.action}`] = (metrics.byBrainAction[`entry:${entry.action}`] ?? 0) + 1;
       const signalFresh = c.readings.length === 0 ? undefined : c.input.signalAgeMs != null && c.input.signalAgeMs <= c.input.maxSignalAgeMs;
       const inv = checkEntryInvariants(entry, { signalFresh, side: c.input.side });
       if (!inv.ok) metrics.invariantFailures += inv.violations.length;
-      const exec = buildExecutiveDecision({
-        nowMs,
-        marketState,
-        direction: directionByHorizon.get(c.identity.horizon ?? "") ?? null,
-        entry,
-        exit: null,
-        cortexDecisionId: c.exec.cortexDecisionId,
-        laneId: c.identity.laneId,
-        symbolOrBasketId: c.identity.symbolOrBasketId,
-        laneEligibleIncumbent: c.exec.laneEligibleIncumbent,
-        cortexAllocationPct: c.exec.cortexAllocationPct,
-        directionHurdlePassed: c.exec.directionHurdlePassed,
-        killLatched: c.exec.killLatched,
-        riskBlockedReason: c.exec.riskBlockedReason,
-        identityDiscriminator: `entry:${c.identity.signalId ?? c.identity.symbolOrBasketId}`,
-      });
+      const exec = runBrainSafely(() =>
+        buildExecutiveDecision({
+          nowMs,
+          marketState,
+          direction: directionByHorizon.get(c.identity.horizon ?? "") ?? null,
+          entry,
+          exit: null,
+          cortexDecisionId: c.exec.cortexDecisionId,
+          laneId: c.identity.laneId,
+          symbolOrBasketId: c.identity.symbolOrBasketId,
+          laneEligibleIncumbent: c.exec.laneEligibleIncumbent,
+          cortexAllocationPct: c.exec.cortexAllocationPct,
+          directionHurdlePassed: c.exec.directionHurdlePassed,
+          killLatched: c.exec.killLatched,
+          riskBlockedReason: c.exec.riskBlockedReason,
+          identityDiscriminator: `entry:${c.identity.signalId ?? c.identity.symbolOrBasketId}`,
+        }),
+      );
+      if (exec === null) {
+        metrics.brainErrors += 1;
+        continue;
+      }
       executiveDecisions.push(exec);
     }
 
     for (const c of gathered.exitCandidates) {
-      const exit = decideExit(c.input);
+      const exit = runBrainSafely(() => decideExit(c.input));
+      if (exit === null) {
+        metrics.brainErrors += 1;
+        continue;
+      }
       metrics.byBrainAction[`exit:${exit.action}`] = (metrics.byBrainAction[`exit:${exit.action}`] ?? 0) + 1;
       const inv = checkExitInvariants(exit, { side: c.input.side, hardStopPrice: c.input.hardStopPrice, hardExitTriggered: c.exec.hardExitTriggered });
       if (!inv.ok) metrics.invariantFailures += inv.violations.length;
-      const exec = buildExecutiveDecision({
-        nowMs,
-        marketState,
-        direction: null,
-        entry: null,
-        exit,
-        cortexDecisionId: c.exec.cortexDecisionId,
-        laneId: c.identity.laneId,
-        symbolOrBasketId: c.identity.symbolOrBasketId,
-        laneEligibleIncumbent: c.exec.laneEligibleIncumbent,
-        cortexAllocationPct: c.exec.cortexAllocationPct,
-        killLatched: c.exec.killLatched,
-        riskBlockedReason: c.exec.riskBlockedReason,
-        hardExitTriggered: c.exec.hardExitTriggered,
-        identityDiscriminator: `exit:${c.identity.positionId ?? c.identity.symbolOrBasketId}`,
-      });
+      const exec = runBrainSafely(() =>
+        buildExecutiveDecision({
+          nowMs,
+          marketState,
+          direction: null,
+          entry: null,
+          exit,
+          cortexDecisionId: c.exec.cortexDecisionId,
+          laneId: c.identity.laneId,
+          symbolOrBasketId: c.identity.symbolOrBasketId,
+          laneEligibleIncumbent: c.exec.laneEligibleIncumbent,
+          cortexAllocationPct: c.exec.cortexAllocationPct,
+          killLatched: c.exec.killLatched,
+          riskBlockedReason: c.exec.riskBlockedReason,
+          hardExitTriggered: c.exec.hardExitTriggered,
+          identityDiscriminator: `exit:${c.identity.positionId ?? c.identity.symbolOrBasketId}`,
+        }),
+      );
+      if (exec === null) {
+        metrics.brainErrors += 1;
+        continue;
+      }
       executiveDecisions.push(exec);
     }
     metrics.inferenceMs = perf() - i0;

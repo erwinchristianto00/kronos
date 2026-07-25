@@ -53,6 +53,29 @@ export interface EntryInput {
   validityMs: number;
   side: EntrySide;
 
+  /** Candidate-identifying salt (e.g. `${laneId}::${symbolOrBasketId}::${side}::${signalId}` — mirrors
+   *  four-brain-live-gather.ts's own identityKey()), folded into decisionId below. WHY: fourBrainDecisionId
+   *  is a pure hash of (prefix, asOfMs, key); with key = `${side}:${action}` alone, ANY two of the
+   *  ~14-25 entry candidates evaluated in one shadow tick that land on the same side+action bucket (10
+   *  possible values total) get a byte-identical decisionId, even though they are genuinely DIFFERENT
+   *  decisions (different symbol/lane/targetEntry/stop). Confirmed (2026-07-24) to cause real, silent,
+   *  PERMANENT loss of the losing candidate's outcome: direction-entry-outcome-store.ts's
+   *  recordEntryOutcome() is idempotent per decisionId (a later candidate sharing the id is a silent
+   *  no-op), and direction-entry-reconciler.ts unconditionally adds every processed row's decisionId to
+   *  its removal set regardless of whether recordEntryOutcome actually booked it — so
+   *  four-brain-outcome-ledger.ts's removeEntryByIds() evicts BOTH colliding pending rows in one pass,
+   *  permanently discarding the one that lost the race. The SAME collision also starves
+   *  entry-brain-tier1-realized-resolver.ts's consumedDecisionIds set: once any candidate sharing a
+   *  colliding id claims one real close, every OTHER candidate sharing that id can never claim a
+   *  DIFFERENT real close either, even one that is its own exact lane/symbol match — an entire
+   *  lane/symbol combo can go permanently uncovered. Callers SHOULD always pass a value that is unique
+   *  per genuinely-distinct candidate within one tick (e.g. the gather layer's own identityKey(), which
+   *  entry-candidate dedup already guarantees is unique per kept candidate) — null/absent falls back to
+   *  the pre-fix side:action-only key (no worse than before, but re-exposes the collision risk). The
+   *  SAME candidate re-decided at the same asOfMs (e.g. immediately after a crash-restart) still yields
+   *  the SAME decisionId, preserving the store's crash-restart idempotency contract. */
+  candidateKey?: string | null;
+
   /** Age of the driving lane signal (ms) + its max allowed age. null age ⇒ no fresh signal (stale). */
   signalAgeMs: number | null;
   maxSignalAgeMs: number;
@@ -222,9 +245,14 @@ export function decideEntry(input: EntryInput): EntryDecision {
   if (action === "SKIP") confidence = clamp01(confidence * 0.7 + 0.1);
   confidence = clamp01(confidence);
 
+  // Fold the candidate identity (when the caller supplies one) into the decisionId key so genuinely
+  // different candidates sharing side+action in the same tick never collide — see EntryInput.candidateKey's
+  // doc comment for the full collision mechanism this closes. A missing/empty candidateKey falls back to
+  // the pre-fix side:action-only key, unchanged.
+  const candidateSalt = typeof input.candidateKey === "string" && input.candidateKey.length > 0 ? `:${input.candidateKey}` : "";
   return {
     schemaVersion: ENTRY_SCHEMA_VERSION,
-    decisionId: fourBrainDecisionId("entry", nowMs, `${input.side}:${action}`),
+    decisionId: fourBrainDecisionId("entry", nowMs, `${input.side}:${action}${candidateSalt}`),
     asOfMs: nowMs,
     validUntilMs: nowMs + Math.max(0, input.validityMs || 0),
     action,

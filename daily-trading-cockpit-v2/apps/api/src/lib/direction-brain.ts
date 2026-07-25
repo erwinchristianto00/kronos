@@ -54,6 +54,13 @@ export interface DirectionInput {
   /** True when edge-memory verdict is VETO_NEGATIVE (proven-negative, no positive-lane rescue). Penalty, not a gate. */
   longVeto?: boolean;
   shortVeto?: boolean;
+  /** True when the FOUR-BRAIN layer's OWN self-referential edge memory (four-brain-edge-memory.ts,
+   *  fourBrainEdgeVerdict) reports VETO_NEGATIVE for this side — i.e. the Direction Brain's OWN past
+   *  LONG/SHORT calls for this horizon have themselves proven net-negative (n >= MIN_SAMPLES). A SECOND,
+   *  independent soft penalty stacked next to longVeto/shortVeto (the incumbent engine's edge-memory) —
+   *  never a hard gate; see the score blocks below. */
+  fourBrainLongVeto?: boolean;
+  fourBrainShortVeto?: boolean;
 
   /** The graduated controller's directional conviction (0..1) + which sides its posture leans to (SOFT). */
   conviction: TaggedSource; // 0..1
@@ -125,6 +132,10 @@ export function decideDirection(input: DirectionInput): DirectionDecision {
       longScore *= 0.25; // proven-negative penalty
       conflicting.push("LONG proven-negative edge (edge-memory VETO)");
     }
+    if (input.fourBrainLongVeto) {
+      longScore *= 0.5; // second, independent proven-negative penalty (four-brain's own self-outcome memory)
+      conflicting.push("LONG proven-negative (Four-Brain self-outcome VETO)");
+    }
     longScore = clamp01(longScore);
     if (longEdge !== null && longEdge > hurdle) supporting.push(`LONG proven edge ${longEdge.toFixed(3)}R`);
   }
@@ -144,6 +155,10 @@ export function decideDirection(input: DirectionInput): DirectionDecision {
     if (input.shortVeto) {
       shortScore *= 0.25;
       conflicting.push("SHORT proven-negative edge (edge-memory VETO)");
+    }
+    if (input.fourBrainShortVeto) {
+      shortScore *= 0.5; // second, independent proven-negative penalty (four-brain's own self-outcome memory)
+      conflicting.push("SHORT proven-negative (Four-Brain self-outcome VETO)");
     }
     shortScore = clamp01(shortScore);
     if (shortEdge !== null && shortEdge > hurdle) supporting.push(`SHORT proven edge ${shortEdge.toFixed(3)}R`);

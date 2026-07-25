@@ -83,7 +83,9 @@ export function CortexCollectionStatusCard() {
       }
     };
     void load();
-    const timer = window.setInterval(() => void load(), 10_000);
+    // The refit cycle (and its decision-alpha cache) only advances every CORTEX_REFIT_INTERVAL_MS (default
+    // 6h) — a 10s poll was pure chatter that contributed to the 2026-07-20 event-loop-blocking incident.
+    const timer = window.setInterval(() => void load(), 60_000);
     return () => { cancelled = true; window.clearInterval(timer); };
   }, []);
 

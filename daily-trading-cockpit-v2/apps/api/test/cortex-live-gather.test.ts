@@ -41,6 +41,12 @@ function fakeDeps(over: Partial<CortexGatherDeps> = {}): CortexGatherDeps {
     currentEquity: 88,
     currentDrawdownUsd: 4.8,
     killBudgetUsd: 40,
+    // 2026-07-22 fix: this field was never set here (or by any test in this file), so every existing
+    // test ran with deps.nowMs silently undefined and every lastCycleAt effectively unset/null — the
+    // STALE-detection plumbing this module's 2026-07-22 fix comments document (nowMs/lastCycleAt feed
+    // cortex-brain-gather.ts's STALE guards) had zero coverage at this layer. A real, fixed value here
+    // means every test now exercises real plumbing instead of `undefined`.
+    nowMs: Date.parse("2026-07-22T12:00:00.000Z"),
     ...over,
   };
 }
@@ -67,6 +73,31 @@ describe("cortex-live-gather — directional lane raw mapping", () => {
     expect(raw.hasReport).toBe(false);
     expect(raw.edgeMemAvgNetR).toBe(0.12); // magnitude still comes from edge-memory
     expect(raw.edgeMemN).toBe(80);
+  });
+});
+
+describe("[REGRESSION 2026-07-22] cortex-live-gather — nowMs/lastCycleAt STALE-detection plumbing", () => {
+  it("propagates deps.nowMs and the directional lane report's lastCycleAt onto the raw object", () => {
+    const nowMs = Date.parse("2026-07-22T18:00:00.000Z");
+    const raw = buildCortexLaneRaw(
+      entry(),
+      fakeDeps({ nowMs, laneReport: () => ({ netAvgR: 0.1, pf: 1.3, resolvedCount: 50, lastCycleAt: "2026-07-22T17:30:00.000Z" }) }),
+    );
+    expect(raw.nowMs).toBe(nowMs);
+    expect(raw.lastCycleAt).toBe("2026-07-22T17:30:00.000Z");
+  });
+  it("propagates deps.nowMs and the XSEC report's lastCycleAt onto the raw object", () => {
+    const nowMs = Date.parse("2026-07-22T18:00:00.000Z");
+    const raw = buildCortexLaneRaw(
+      entry({ laneId: "CROSS_SECTIONAL_MARKET_NEUTRAL", direction: "NEUTRAL", isXsec: true }),
+      fakeDeps({ nowMs, xsecReport: () => ({ netAvgReturn: 0.00592, resolvedCount: 77, lastCycleAt: "2026-07-22T17:45:00.000Z" }) }),
+    );
+    expect(raw.nowMs).toBe(nowMs);
+    expect(raw.lastCycleAt).toBe("2026-07-22T17:45:00.000Z");
+  });
+  it("a report with no lastCycleAt (never tracked by the source store) maps to null, not a fabricated freshness", () => {
+    const raw = buildCortexLaneRaw(entry(), fakeDeps({ laneReport: () => ({ netAvgR: 0.1, pf: 1.3, resolvedCount: 50 }) }));
+    expect(raw.lastCycleAt).toBeNull();
   });
 });
 

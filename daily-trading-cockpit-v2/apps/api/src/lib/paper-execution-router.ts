@@ -1466,6 +1466,25 @@ export function headlineConcentrationRejectReason(
 export function admitPaperOpportunities(
   inputs: PaperOpportunityAdmissionInputs,
 ): PaperOpportunityAdmissionResult {
+  // One flush for this whole admission pass instead of one full-array JSON.stringify+writeFileSync
+  // per store.add() call in the loop below (up to 3 add() sites per opportunity: backfill-reject,
+  // sizing-reject, real admit). Same fix, same reasoning, same file as
+  // runPaperAdmissionAndResolution's own beginBatch/endBatch wrap above — this is its sibling
+  // allocator-sourced admission path, called independently and BEFORE it from shadow.ts, and was
+  // flagged during that fix's review as capable of reproducing the identical
+  // operator-brief?resolve=1&paper=1 event-loop freeze (100MB+ store, N opportunities admitted in one
+  // cycle = N synchronous full-store rewrites) via this separate call site.
+  inputs.store.beginBatch();
+  try {
+    return admitPaperOpportunitiesInner(inputs);
+  } finally {
+    inputs.store.endBatch();
+  }
+}
+
+function admitPaperOpportunitiesInner(
+  inputs: PaperOpportunityAdmissionInputs,
+): PaperOpportunityAdmissionResult {
   const { store, opportunities, routerReport, gateReport, now } = inputs;
   const maxAge = inputs.admissionMaxAgeMs ?? PAPER_ADMISSION_MAX_AGE_MS;
   const paperEquity = inputs.paperEquity ?? PAPER_EQUITY;
@@ -4306,6 +4325,29 @@ export interface PaperRunInputs {
 }
 
 export async function runPaperAdmissionAndResolution(
+  inputs: PaperRunInputs,
+): Promise<PaperPerformanceReport> {
+  const {
+    store, vmStore, routerReport, vmReport, gateReport, binanceClient, now,
+  } = inputs;
+  // One flush for this ENTIRE pass (admission across every eligible lane, the 4 backlog-cleanup
+  // calls below, and resolvePaperOrders' own already-batched flush) instead of one full-array
+  // JSON.stringify + writeFileSync per call. store.path on testnet has been observed at 100MB+
+  // (this store has no per-lane cap, only the OOM-fix's cap on total order count, and testnet's
+  // real order history is large) — 5-6 independent full-store rewrites of a file that size in one
+  // operator-brief?resolve=1&paper=1 request is what actually froze the whole event loop for
+  // 90-190+s per cycle (every OTHER concurrent request also hung, since writeFileSync blocks the
+  // single-threaded process). Mirrors the identical fix already applied to
+  // CurrentGuardVariantMatrixStore's resolveVariantMatrixObservations (current-guard-variant-matrix.ts).
+  store.beginBatch();
+  try {
+    return await runPaperAdmissionAndResolutionInner(inputs);
+  } finally {
+    store.endBatch();
+  }
+}
+
+async function runPaperAdmissionAndResolutionInner(
   inputs: PaperRunInputs,
 ): Promise<PaperPerformanceReport> {
   const {

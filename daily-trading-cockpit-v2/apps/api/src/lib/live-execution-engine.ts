@@ -54,6 +54,8 @@ import {
 } from "./regime-flip-rescue.js";
 import { fetchCrowdingSnapshot, type CrowdSide, type CrowdingState } from "./derivatives-crowding.js";
 import { clusterOf, isMajorSymbol } from "./correlation-clusters.js";
+import type { CortexRealAttributionStore } from "./cortex-real-attribution.js";
+import type { PositionPathRecorder } from "./position-path-recorder.js";
 import type { BinanceClient } from "./binance.js";
 import type { PaperOrder } from "./paper-execution-router.js";
 import { recordExecLifecycle } from "./lane-context-journal-runtime.js";
@@ -368,6 +370,16 @@ export interface LiveOrderPlan {
   qty: number;
   tp1Qty: number;
   notionalUsd: number;
+  /** Requested risk budget after any lane/allocation scaling. Report-only. */
+  plannedRiskUsd: number;
+  /** Notional needed to deploy plannedRiskUsd at this stop distance, before the cap/rounding. */
+  requiredNotionalUsd: number;
+  /** Notional that survives the cap and exchange quantity rounding. Mirrors notionalUsd. */
+  appliedNotionalUsd: number;
+  /** Effective per-plan notional ceiling after lane/allocation scaling. */
+  notionalCapUsd: number;
+  /** Absolute entry-to-stop distance as a fraction of entry. null when geometry is invalid. */
+  stopDistancePct: number | null;
   stopPrice: number;
   tp1Price: number;
   /** 2026-07-12 R-clipping telemetry: the dollars ACTUALLY at risk between entry and stop for this
@@ -466,7 +478,22 @@ export function computeLiveOrderPlan(
   config: Pick<LiveExecutionConfig, "riskUsdPerTrade" | "maxNotionalPerTrade">,
   filters: FuturesSymbolFilters,
 ): LiveOrderPlan {
-  const fail = (reason: string): LiveOrderPlan => ({ ok: false, reason, qty: 0, tp1Qty: 0, notionalUsd: 0, stopPrice: 0, tp1Price: 0, effectiveRiskUsd: 0, riskClippedByNotionalCap: false });
+  const fail = (reason: string): LiveOrderPlan => ({
+    ok: false,
+    reason,
+    qty: 0,
+    tp1Qty: 0,
+    notionalUsd: 0,
+    plannedRiskUsd: config.riskUsdPerTrade,
+    requiredNotionalUsd: 0,
+    appliedNotionalUsd: 0,
+    notionalCapUsd: config.maxNotionalPerTrade,
+    stopDistancePct: null,
+    stopPrice: 0,
+    tp1Price: 0,
+    effectiveRiskUsd: 0,
+    riskClippedByNotionalCap: false,
+  });
 
   const { entryPrice, stopLoss, tp1 } = signal;
   if (!(entryPrice > 0) || !(stopLoss > 0) || !(tp1 > 0)) return fail("invalid geometry");
@@ -495,6 +522,11 @@ export function computeLiveOrderPlan(
     qty,
     tp1Qty, // 0 ⇒ position too small to split; runner-only (stop still protects full qty)
     notionalUsd: finalNotionalUsd,
+    plannedRiskUsd: config.riskUsdPerTrade,
+    requiredNotionalUsd: rawNotional,
+    appliedNotionalUsd: finalNotionalUsd,
+    notionalCapUsd: config.maxNotionalPerTrade,
+    stopDistancePct,
     stopPrice: roundDownToStep(stopLoss, filters.tickSize),
     tp1Price: roundDownToStep(tp1, filters.tickSize),
     effectiveRiskUsd: finalNotionalUsd * stopDistancePct,
@@ -574,6 +606,31 @@ export interface LiveIntent {
    *  determined the size. Undefined on older persisted intents. */
   effectiveRiskUsd?: number | null;
   riskClippedByNotionalCap?: boolean;
+  /** Full sizing provenance captured at entry. Optional on pre-telemetry persisted intents. */
+  plannedRiskUsd?: number | null;
+  requiredNotionalUsd?: number | null;
+  appliedNotionalUsd?: number | null;
+  notionalCapUsd?: number | null;
+  stopDistancePct?: number | null;
+  /** Durable idempotency identity for a testnet→live copy. A repeated signed request returns this
+   * intent instead of opening a second real position, including after a process restart. */
+  externalCopyIdempotencyKey?: string;
+  /** CORTEX real-USDT attribution capture (2026-07-21, report-only — see cortex-real-attribution.ts):
+   *  the lane weight the mirror sizing path ACTUALLY applied to this intent's entry (includes any
+   *  active CORTEX promoted tilt) and the operator's untouched static table weight for the same
+   *  lane, both frozen AT OPEN time. Pyramid adds deliberately inherit these open-time values —
+   *  the whole intent's realized P&L is attributed at the open-time tilt share (documented choice;
+   *  the tilt moves slowly relative to an intent's add window). Undefined on intents persisted
+   *  before this feature and on non-mirror opens (operator testnet→live copy), which are therefore
+   *  never attributed. */
+  cortexAppliedWeightPct?: number;
+  cortexRawStaticWeightPct?: number;
+  /** 2026-07-21 review fix: durable per-intent dedup marker set by sweepCortexRealAttribution the
+   *  moment this intent's close is booked. Persisted with the intent and dies with it, so the
+   *  attribution store's bounded id-FIFO can never be the only thing standing between a re-offered
+   *  terminal intent and a double-booking (FIFO eviction, LIVE_MAX_STORED_INTENTS raised above the
+   *  FIFO cap, or a lost/corrupt attribution file are all covered by this flag). */
+  cortexAttributed?: boolean;
 }
 
 export interface LiveIntentSource {
@@ -1016,6 +1073,17 @@ export interface LiveExecutionEngineOptions {
    * (unknown id, or a NEUTRAL cross-sectional basket).
    */
   laneDirectionForId?: (laneId: string) => "LONG" | "SHORT" | "NEUTRAL" | null;
+  /** CORTEX real-USDT attribution sink (2026-07-21, report-only — see cortex-real-attribution.ts).
+   *  Injected the same optional-dep way as laneDirectionForId above: omit (e.g. in tests that
+   *  don't care) and the engine records nothing. Every use is wrapped so a failure can NEVER
+   *  affect trading. */
+  cortexRealAttribution?: CortexRealAttributionStore;
+  /** Dense per-tick R-path recorder (2026-07-22, report-only — see position-path-recorder.ts).
+   *  Same optional-dep posture as cortexRealAttribution above: omit and the engine is byte-for-byte
+   *  unchanged. When present, manageLifecycle appends one (tsMs, currentR) sample per OPEN intent
+   *  per tick and a per-tick sweep marks terminal intents' paths closed — every call is wrapped so
+   *  a failure can NEVER affect trading. */
+  positionPathRecorder?: PositionPathRecorder;
 }
 
 const ERROR_STREAK_DISARM = 3;
@@ -1071,6 +1139,23 @@ const LIVE_PERFORMANCE_VIEWS: Record<LivePerformanceView, {
  * single transient blip while bounding a churn storm to 2 cycles instead of hundreds.
  */
 const MAX_MIRROR_ATTEMPTS = 2;
+/** 2026-07-21 fix: mirrorAllPaperOrders (testnet collection mode) bypasses lane-eligibility entirely
+ *  (laneAllowedForMirror returns true unconditionally) so off-table diagnostic/research paper orders
+ *  (exit-ablation variants, sizing-quality experiments, etc.) still get mirrored for real fill data —
+ *  but sizing fell through to the OPERATOR's real allocation table regardless, which returns exactly
+ *  0% for any lane it doesn't list. A 0% weight zeroes the plan's qty, openIntent's own combinedPlan
+ *  then silently no-ops on the unsizeable plan (no order, no error) while the caller still latches
+ *  "opened" — so every one of these candidates was mirrored in name only, quarantined after
+ *  MAX_MIRROR_ATTEMPTS, and never produced the real fill data the collection mode exists to gather.
+ *  This is the default REAL size an off-table lane gets in mirror-all mode — a lane the operator
+ *  explicitly listed at 0% (a deliberate exclusion) is untouched by this and stays at 0.
+ *  2026-07-21 follow-up: originally 10, which reproduced the SAME silent-fail one step later in
+ *  production — 10% of the $50-capped plan is ~$5 notional, under Binance's per-symbol minQty/
+ *  minNotional after stepSize rounding, so combinedPlan quietly no-oped and every fresh candidate
+ *  quarantined after MAX_MIRROR_ATTEMPTS with zero exchange errors logged. This whole branch is
+ *  reachable ONLY under mirrorAllPaperOrders (config-gated testnet-only), so full size is safe and
+ *  matches the collection mode's original intent: real, fill-quality execution data per lane. */
+const DIAGNOSTIC_LANE_MIRROR_WEIGHT_PCT = 100;
 /** 2026-07-09: raised from a hardcoded 4 — operator explicitly asked to raise this so
  *  REGIME_COMPOSITE_CONFIRMATION_LONG (1 slot, already holding 3 real positions) could coexist with
  *  COMPOSITE_ESTIMATOR_BIDI's 4 new buckets (5 total) without evicting either, "for now, re-evaluate
@@ -1552,6 +1637,8 @@ export class LiveExecutionEngine {
   private readonly getExternalRealizedPnlUsd: () => { today: number; allTime: number };
   private readonly onKillSwitchEngaged: ((reason: string) => Promise<void>) | null;
   private readonly laneDirectionForId: (laneId: string) => "LONG" | "SHORT" | "NEUTRAL" | null;
+  private readonly cortexRealAttribution: CortexRealAttributionStore | null;
+  private readonly positionPathRecorder: PositionPathRecorder | null;
 
   /** In-memory ONLY — restart always boots disarmed. */
   private armed = false;
@@ -1612,6 +1699,8 @@ export class LiveExecutionEngine {
     this.getExternalRealizedPnlUsd = options.getExternalRealizedPnlUsd ?? (() => ({ today: 0, allTime: 0 }));
     this.onKillSwitchEngaged = options.onKillSwitchEngaged ?? null;
     this.laneDirectionForId = options.laneDirectionForId ?? (() => null);
+    this.cortexRealAttribution = options.cortexRealAttribution ?? null;
+    this.positionPathRecorder = options.positionPathRecorder ?? null;
     // Auto-arm must NOT punch through a latched kill: a restart preserves the kill until an
     // explicit resetKill(). (arm() already enforces this; the constructor path bypassed it.)
     if (this.config.autoArm && this.config.configErrors.length === 0 && !this.store.getState().killedAt) {
@@ -1982,7 +2071,12 @@ export class LiveExecutionEngine {
         direction: i.direction,
         state: i.state,
         qty: i.qty,
+        plannedRiskUsd: i.plannedRiskUsd ?? null,
         effectiveRiskUsd: i.effectiveRiskUsd ?? null,
+        requiredNotionalUsd: i.requiredNotionalUsd ?? null,
+        appliedNotionalUsd: i.appliedNotionalUsd ?? null,
+        notionalCapUsd: i.notionalCapUsd ?? null,
+        stopDistancePct: i.stopDistancePct ?? null,
         riskClippedByNotionalCap: i.riskClippedByNotionalCap ?? null,
       })),
       // 2026-07-12 R-clipping telemetry (report-only): the scaling arithmetic ("each $1 of R ≈
@@ -1999,11 +2093,23 @@ export class LiveExecutionEngine {
           withRisk.length > 0
             ? withRisk.reduce((sum, i) => sum + (i.effectiveRiskUsd ?? 0), 0) / withRisk.length
             : null;
+        const average = (field: "plannedRiskUsd" | "requiredNotionalUsd" | "appliedNotionalUsd" | "notionalCapUsd" | "stopDistancePct"): number | null => {
+          const values = withRisk
+            .map((intent) => intent[field])
+            .filter((value): value is number => typeof value === "number" && Number.isFinite(value));
+          return values.length > 0 ? values.reduce((sum, value) => sum + value, 0) / values.length : null;
+        };
         return {
           nominalRiskUsdPerTrade: this.config.riskUsdPerTrade,
+          avgPlannedRiskUsd: average("plannedRiskUsd"),
           avgEffectiveRiskUsd: avgEffective,
+          avgRequiredNotionalUsd: average("requiredNotionalUsd"),
+          avgAppliedNotionalUsd: average("appliedNotionalUsd"),
+          avgNotionalCapUsd: average("notionalCapUsd"),
+          avgStopDistancePct: average("stopDistancePct"),
           sampleCount: withRisk.length,
           clippedShare: withRisk.length > 0 ? clippedCount / withRisk.length : null,
+          clippingRatePct: withRisk.length > 0 ? (clippedCount / withRisk.length) * 100 : null,
           warning:
             avgEffective !== null && avgEffective < this.config.riskUsdPerTrade * 0.75
               ? `effective R ($${avgEffective.toFixed(2)}) is well below nominal ($${this.config.riskUsdPerTrade}) — maxNotionalPerTrade ($${this.config.maxNotionalPerTrade}) is clipping size on ${(100 * (clippedCount / withRisk.length)).toFixed(0)}% of recent trades`
@@ -2573,6 +2679,14 @@ export class LiveExecutionEngine {
       // 3. Manage lifecycle of open intents (TP1 → breakeven, close detection).
       await this.manageLifecycle();
 
+      // 3.5. CORTEX real-USDT attribution sweep (report-only, fail-safe — see its doc comment).
+      this.sweepCortexRealAttribution();
+
+      // 3.6. Dense R-path close sweep + batched persist (report-only, fail-safe — see its doc
+      // comment). Runs right after lifecycle management so a close is handed to the Exit Brain's
+      // reader on the same tick it settles.
+      this.sweepPositionPathRecorder();
+
       // 4. Testnet safety harvest: on every fresh regime/mode change, flatten any exposure
       // that can clear the conservative close-cost estimate. Between changes, preserve the
       // older opposing-direction breakeven harvest so stale contra exposure can still free slots.
@@ -3110,6 +3224,13 @@ export class LiveExecutionEngine {
         // stop/TP for this tick and let reconcile surface the inconsistency.
         if (Math.sign(rawAmt) !== Math.sign(amt)) continue;
         const shareFrac = Math.max(0, Math.min(1, amt / rawAmt));
+
+        // Dense R-path tick (2026-07-22, report-only — see position-path-recorder.ts): sample this
+        // OPEN intent's signed mark-R once per lifecycle tick so the Exit Brain shadow scorer can
+        // walk REAL recorded paths instead of 4-point skeletons. Same currentR formula as
+        // manageMfeGiveback below (which only runs for mfe_giveback-ruled intents — this hook
+        // covers EVERY open intent). Wrapped inside; absent recorder = no-op, zero behavior change.
+        this.recordPositionPathTick(intent, pos);
 
         // 2026-07-19 real-money audit fix (BUG 3): the resting protective stop can be GONE
         // (triggered-and-partially-filled under thin liquidity, or cancelled/expired without ever
@@ -4282,6 +4403,150 @@ export class LiveExecutionEngine {
     }
   }
 
+  /** CORTEX real-USDT attribution sweep (2026-07-21, report-only — see cortex-real-attribution.ts).
+   *
+   *  WHY A SWEEP, NOT PER-CLOSE-PATH HOOKS: the engine has MANY paths that finalize an intent's
+   *  realized P&L (settleClosedIntent's position-flat path, the MFE-giveback/profit-bank/regime
+   *  -harvest/hard-cut flattens, manualCloseIntent, the kill-switch + panic exchange-flatten KILLED
+   *  paths, and both openIntent/addToIntent EMERGENCY_FLATTEN error paths). They all converge on
+   *  applyRealizedToLedger(net) — but that choke point only receives the bare number, not the
+   *  intent. Rather than re-thread the intent through ~14 call sites (or hook each path and
+   *  inevitably miss the next one someone adds), this sweep runs once per tick over the persisted
+   *  intents and books every terminal intent (CLOSED/KILLED, plus ERROR intents whose emergency
+   *  flatten realized actual dollars) exactly once — the store's own persisted dedup ids make it
+   *  idempotent across ticks AND restarts, and closes that happen outside a tick (manual close,
+   *  panic flatten) are simply picked up on the next one.
+   *
+   *  HARD SAFETY RULE: this is bookkeeping about trading, never part of it — the whole sweep is
+   *  wrapped so no failure here can ever affect a trading decision, an order, or the tick. */
+  private sweepCortexRealAttribution(): void {
+    const attributionStore = this.cortexRealAttribution;
+    if (!attributionStore) return;
+    try {
+      let bookedAny = false;
+      for (const intent of this.store.getState().intents) {
+        if (OPEN_INTENT_STATES.has(intent.state)) continue; // nothing realized yet
+        // 2026-07-21 review fix: the durable per-intent flag is the PRIMARY dedup — it survives
+        // attribution-file loss and id-FIFO eviction, and it also makes a lost-dedup re-book storm
+        // structurally impossible (already-booked intents are skipped here regardless of the store).
+        if (intent.cortexAttributed === true) continue;
+        if (typeof intent.realizedPnlUsd !== "number") continue; // P&L UNKNOWN — never fabricate
+        // Pre-feature intents and non-mirror opens (operator copy path) carry no open-time weight
+        // capture — skip them entirely rather than invent a tilt share after the fact.
+        if (typeof intent.cortexAppliedWeightPct !== "number" || typeof intent.cortexRawStaticWeightPct !== "number") continue;
+        // createdAt disambiguates the rare re-mirror of the same paper order after an ERROR intent
+        // (the mirrored-set check excludes ERROR/KILLED states, so one paperOrderId can produce a
+        // second intent) — each intent instance books its own close exactly once.
+        const recordId = `intent:${intent.paperOrderId}:${intent.createdAt}`;
+        if (attributionStore.hasRecorded(recordId)) {
+          // Booked previously but the flag was lost (e.g. pre-flag deploy) — repair the flag.
+          intent.cortexAttributed = true;
+          bookedAny = true;
+          continue;
+        }
+        // deferSave: batch every booking this tick into ONE attribution-store write below — a
+        // multi-booking tick must never turn into a per-record sync-write storm (review finding).
+        const booked = attributionStore.recordClose(
+          {
+            recordId,
+            closedAtIso: intent.closedAt ?? intent.updatedAt,
+            laneId: intent.sourcePaperOrders?.[0]?.laneId ?? "UNKNOWN",
+            symbol: intent.symbol,
+            realizedPnlUsd: intent.realizedPnlUsd,
+            appliedWeightPct: intent.cortexAppliedWeightPct,
+            rawStaticWeightPct: intent.cortexRawStaticWeightPct,
+          },
+          { deferSave: true },
+        );
+        if (booked) {
+          intent.cortexAttributed = true;
+          bookedAny = true;
+        }
+      }
+      if (bookedAny) {
+        attributionStore.flush();
+        this.store.save(); // persist the cortexAttributed flags alongside the booked records
+      }
+    } catch {
+      // report-only bookkeeping — a failure here must NEVER affect trading
+    }
+  }
+
+  /** Stable path key for one intent instance — the SAME identity scheme sweepCortexRealAttribution
+   *  uses (createdAt disambiguates a re-mirror of the same paper order after an ERROR intent). */
+  private positionPathKeyForIntent(intent: LiveIntent): string {
+    return `intent:${intent.paperOrderId}:${intent.createdAt}`;
+  }
+
+  /** Dense R-path sample for one OPEN intent (2026-07-22, report-only — see
+   *  position-path-recorder.ts). currentR uses the exact formula manageMfeGiveback derives its
+   *  favorableR from (entry vs mark over the entry→stop risk distance, sign-normalized so
+   *  favorable is positive). deferSave batches the whole tick's samples into ONE disk write in
+   *  sweepPositionPathRecorder's flush(). HARD SAFETY RULE: wrapped so no failure here can ever
+   *  affect a trading decision, an order, or the tick. */
+  private recordPositionPathTick(intent: LiveIntent, pos: FuturesPosition | undefined): void {
+    const recorder = this.positionPathRecorder;
+    if (!recorder || !pos) return;
+    try {
+      const entry = intent.filledEntryPrice ?? intent.plannedEntryPrice;
+      const risk = Math.abs(entry - intent.stopLossPrice);
+      if (!(entry > 0) || !(risk > 0)) return;
+      const mark = pos.markPrice > 0 ? pos.markPrice : pos.entryPrice > 0 ? pos.entryPrice : entry;
+      const currentR = intent.direction === "SHORT" ? (entry - mark) / risk : (mark - entry) / risk;
+      const tsMs = Date.parse(this.nowIso());
+      if (!Number.isFinite(currentR) || !Number.isFinite(tsMs)) return;
+      recorder.recordTick(this.positionPathKeyForIntent(intent), tsMs, currentR, {
+        meta: {
+          laneId: intent.sourcePaperOrders?.[0]?.laneId ?? "UNKNOWN",
+          symbol: intent.symbol,
+          direction: intent.direction,
+          source: "engine",
+        },
+        deferSave: true,
+      });
+    } catch {
+      // report-only bookkeeping — a failure here must NEVER affect trading
+    }
+  }
+
+  /** Dense R-path close sweep (2026-07-22, report-only — see position-path-recorder.ts).
+   *
+   *  WHY A SWEEP, NOT PER-CLOSE-PATH HOOKS: exactly sweepCortexRealAttribution's rationale above —
+   *  the engine has ~14 paths that finalize an intent (lifecycle closes, manual close, kill-switch,
+   *  emergency flattens), and a sweep over the persisted intents catches every one of them exactly
+   *  once (markClosed no-ops for keys the recorder isn't tracking, so re-sweeping terminal intents
+   *  is idempotent and closes that happen outside a tick are picked up on the next one). Also
+   *  flushes the tick's deferred recordTick samples in one write and prunes expired paths.
+   *
+   *  finalR: NET realized R (realizedPnlUsd / effectiveRiskUsd) when both are known — the honest
+   *  "what the exit actually banked" number; omitted otherwise, in which case the recorder falls
+   *  back to the last recorded mark-R tick.
+   *
+   *  HARD SAFETY RULE: bookkeeping about trading, never part of it — fully wrapped. */
+  private sweepPositionPathRecorder(): void {
+    const recorder = this.positionPathRecorder;
+    if (!recorder) return;
+    try {
+      const nowMs = Date.parse(this.nowIso());
+      for (const intent of this.store.getState().intents) {
+        if (OPEN_INTENT_STATES.has(intent.state)) continue; // still open — keep recording
+        const key = this.positionPathKeyForIntent(intent);
+        if (!recorder.isTrackingOpen(key)) continue; // never tracked, or already handed off
+        const closedMs = Date.parse(intent.closedAt ?? intent.updatedAt);
+        const risk = intent.effectiveRiskUsd;
+        const finalR =
+          typeof intent.realizedPnlUsd === "number" && Number.isFinite(intent.realizedPnlUsd) && typeof risk === "number" && risk > 0
+            ? intent.realizedPnlUsd / risk
+            : undefined;
+        recorder.markClosed(key, Number.isFinite(closedMs) ? closedMs : nowMs, { finalR, deferSave: true });
+      }
+      recorder.pruneExpired(Number.isFinite(nowMs) ? nowMs : Date.now(), { deferSave: true });
+      recorder.flush(); // one write for the whole tick's samples + closes; no-op while clean
+    } catch {
+      // report-only bookkeeping — a failure here must NEVER affect trading
+    }
+  }
+
   // ── mirroring ──────────────────────────────────────────────────────────────
 
   private activeManualDirectionalAllocations(): Array<{ laneId: string; weightPct: number }> | null {
@@ -4337,6 +4602,27 @@ export class LiveExecutionEngine {
     return hit.weightPct;
   }
 
+  /** 2026-07-21 CRITICAL fix: same lookup as laneSelectionWeightPctForLane, but NEVER consults
+   *  cortexPromotedWeights. CORTEX's own "static weight" input (app.ts's staticWeightPctForLane) was
+   *  wired to laneSelectionWeightPctForLane — the SAME accessor its own promoted output feeds back
+   *  into — creating a self-referential feedback loop: a cycle that promotes lane X writes X's tilted
+   *  weight into cortexPromotedWeights, and the NEXT cycle then reads that tilted number back as if it
+   *  were the plain operator table, feeds it into decideCortex as "static", and (for a direction-split
+   *  roster lane like CG_MFE_GIVEBACK_LONG/_SHORT) folds it into a phantom concentration that trips the
+   *  per-lane cap — which clears the override, so the cycle after reads the TRUE table again and
+   *  re-promotes, oscillating forever. Observed live: CG_MFE_GIVEBACK's real static is a flat 12%
+   *  (24% folded, well under the 35% cap) but the contaminated read alternated 12%→21.5%, folding to
+   *  24.0% / ~43.1% every other cycle. CORTEX's static-weight input must be immune to its own prior
+   *  output, so it always reads the TRUE operator-configured table here. */
+  rawLaneAllocationWeightPctForLane(laneId: string): number {
+    const allocations = this.effectiveLaneAllocations();
+    if (allocations === null) return 100;
+    if (allocations.length === 0) return 0;
+    const variantId = laneId.split(":").pop() ?? laneId;
+    const hit = allocations.find((a) => a.laneId === laneId || a.laneId === variantId);
+    return hit ? hit.weightPct : 0;
+  }
+
   /** Operator lane selection for non-paper lanes too (e.g. cross-sectional executor).
    *  Weighted allocations take precedence; otherwise the plain allow-list applies. */
   laneSelectionAllowsLane(laneId: string): boolean {
@@ -4364,9 +4650,38 @@ export class LiveExecutionEngine {
   }
 
   private laneAllocationWeightPct(paper: PaperOrder): number {
+    return this.laneAllocationWeightPctWithRaw(paper).applied;
+  }
+
+  /** Same decision tree as laneAllocationWeightPct always used (the `applied` side is byte-for-byte
+   *  its old behavior), extended to ALSO report the operator's untouched static table weight for
+   *  the same lane through the SAME branch that produced the applied number — so the pair is
+   *  always internally consistent (CORTEX real-USDT attribution, 2026-07-21). The two can only
+   *  differ on the plain table branch, where `applied` may carry an active CORTEX promoted tilt
+   *  (laneSelectionWeightPctForLane) while `raw` never does (rawLaneAllocationWeightPctForLane);
+   *  an orchestrator override or the diagnostic-collection fallback is not a CORTEX tilt, so both
+   *  sides return the identical number there (tiltShare 0 by construction). */
+  private laneAllocationWeightPctWithRaw(paper: PaperOrder): { applied: number; raw: number } {
     const override = this.paperLaneWeightPct(paper);
-    if (override !== null) return Math.max(0, Math.min(100, override));
-    return this.laneSelectionWeightPctForLane(paper.selectedLaneId ?? "");
+    if (override !== null) {
+      const clamped = Math.max(0, Math.min(100, override));
+      return { applied: clamped, raw: clamped };
+    }
+    const laneId = paper.selectedLaneId ?? "";
+    const tableWeight = this.laneSelectionWeightPctForLane(laneId);
+    const rawTableWeight = this.rawLaneAllocationWeightPctForLane(laneId);
+    if (tableWeight > 0 || !this.config.mirrorAllPaperOrders) return { applied: tableWeight, raw: rawTableWeight };
+    // tableWeight is 0 under mirrorAllPaperOrders: distinguish "the operator explicitly listed this
+    // lane at 0%" (a deliberate exclusion — must stay 0, even in collection mode) from "this lane
+    // simply isn't part of the real allocation table at all" (an off-table diagnostic/research
+    // variant, which collection mode should still size for real — see DIAGNOSTIC_LANE_MIRROR_WEIGHT_PCT).
+    const allocations = this.effectiveLaneAllocations();
+    if (allocations === null || allocations.length === 0) return { applied: tableWeight, raw: rawTableWeight };
+    const variantId = laneId.split(":").pop() ?? laneId;
+    const listed = allocations.some((a) => a.laneId === laneId || a.laneId === variantId);
+    return listed
+      ? { applied: tableWeight, raw: rawTableWeight }
+      : { applied: DIAGNOSTIC_LANE_MIRROR_WEIGHT_PCT, raw: DIAGNOSTIC_LANE_MIRROR_WEIGHT_PCT };
   }
 
   /** Operator lane selection: weighted allocations (when set) take precedence; else the
@@ -4702,7 +5017,22 @@ export class LiveExecutionEngine {
     sourceLaneId?: string | null;
     sourcePaperOrderId?: string | null;
     sourceEnv?: string | null;
+    idempotencyKey?: string | null;
   }): Promise<{ ok: boolean; reason: string | null; intent?: LiveIntent }> {
+    const idempotencyKey =
+      typeof req.idempotencyKey === "string" && req.idempotencyKey.trim().length > 0
+        ? req.idempotencyKey.trim()
+        : null;
+    if (idempotencyKey) {
+      const prior = this.store
+        .getState()
+        .intents.find((intent) => intent.externalCopyIdempotencyKey === idempotencyKey);
+      if (prior) {
+        return prior.state === "ERROR"
+          ? { ok: false, reason: prior.lastError ?? "prior idempotent copy failed", intent: prior }
+          : { ok: true, reason: "idempotent replay: existing copy returned", intent: prior };
+      }
+    }
     if (this.store.getState().killedAt) return { ok: false, reason: "kill switch latched" };
     if (!this.armed) return { ok: false, reason: "live engine is DISARMED — arm it first, then copy" };
     if (!this.canOpenNewEntries()) {
@@ -4778,6 +5108,11 @@ export class LiveExecutionEngine {
         qty,
         tp1Qty: this.isFullTpExitRule(exitRule) ? qty : roundDownToStep(qty / 2, filters.stepSize),
         notionalUsd: qty * req.entryPrice,
+        plannedRiskUsd: req.qty * req.entryPrice * copyStopDistancePct,
+        requiredNotionalUsd: req.qty * req.entryPrice,
+        appliedNotionalUsd: qty * req.entryPrice,
+        notionalCapUsd: this.config.maxNotionalPerTrade,
+        stopDistancePct: copyStopDistancePct,
         stopPrice: req.stopLossPrice,
         tp1Price: req.tp1Price,
         effectiveRiskUsd: qty * req.entryPrice * copyStopDistancePct,
@@ -4786,7 +5121,10 @@ export class LiveExecutionEngine {
         riskClippedByNotionalCap: req.qty > maxQtyByNotional,
       };
 
-      await this.openIntent([{ paper: syntheticPaper, plan }], filters);
+      await this.openIntent(
+        [{ paper: syntheticPaper, plan, externalCopyIdempotencyKey: idempotencyKey ?? undefined }],
+        filters,
+      );
       const intent = this.store.getState().intents.find((i) => i.paperOrderId === copyId);
       if (!intent) return { ok: false, reason: "copy did not produce an intent (plan rejected)" };
       if (intent.state === "ERROR") {
@@ -5137,7 +5475,10 @@ export class LiveExecutionEngine {
         // Operator weighted allocation: scale the entry size by the lane's weight
         // (e.g. lane1 70% / lane2 30%). combinedPlan re-rounds to stepSize and a
         // too-small scaled qty fails its minQty check (skipped, not mis-sized).
-        const weightPct = this.laneAllocationWeightPct(paper);
+        // CORTEX real-USDT attribution (2026-07-21): capture the applied weight AND the raw static
+        // table weight at this exact sizing moment — openIntent freezes the pair on the intent so
+        // the close sweep can later attribute realizedPnlUsd × tiltShare (report-only).
+        const { applied: weightPct, raw: rawWeightPct } = this.laneAllocationWeightPctWithRaw(paper);
         // Per-symbol performance+volatility tilt (2026-07-08, whitelist-scoped — see
         // directional-symbol-sizing.ts). 1x outside the curated whitelist or on missing data.
         const sizeMult = directionalSymbolSizeMultiplier({
@@ -5151,8 +5492,17 @@ export class LiveExecutionEngine {
         const scaled =
           totalScale === 1
             ? plan
-            : { ...plan, qty: plan.qty * totalScale, notionalUsd: plan.notionalUsd * totalScale, effectiveRiskUsd: plan.effectiveRiskUsd * totalScale };
-        return [{ paper, plan: scaled }];
+            : {
+                ...plan,
+                qty: plan.qty * totalScale,
+                notionalUsd: plan.notionalUsd * totalScale,
+                plannedRiskUsd: plan.plannedRiskUsd * totalScale,
+                requiredNotionalUsd: plan.requiredNotionalUsd * totalScale,
+                appliedNotionalUsd: plan.appliedNotionalUsd * totalScale,
+                notionalCapUsd: plan.notionalCapUsd * totalScale,
+                effectiveRiskUsd: plan.effectiveRiskUsd * totalScale,
+              };
+        return [{ paper, plan: scaled, cortexAppliedWeightPct: weightPct, cortexRawStaticWeightPct: rawWeightPct }];
       });
       if (planned.length === 0) {
         for (const paper of lanePapers) latchReason(paper.paperOrderId, "plan_not_sizeable"); // e.g. BTC: $50 cap < one 0.001-step
@@ -5256,15 +5606,36 @@ export class LiveExecutionEngine {
     // When tp1Qty == qty, a TP1 fill flattens the position and manageLifecycle settles it via the
     // "position flat ⇒ closed" path (the BE/trail branch is skipped because there is no runner).
     const fullExitAtTp1 = this.isFullTpExitRule(planned[0]!.paper.variantExitRule);
+    // 2026-07-23 fix: mirrorNewSignals scales each item's plan.qty by (weight% × size-multiplier)
+    // AFTER computeLiveOrderPlan already validated the UNSCALED qty against minQty/minNotional —
+    // that scaled qty was never re-checked against minNotional here, only against minQty (qty count
+    // can clear minQty while the scaled-down dollar notional still misses the exchange's separate
+    // minNotional floor). Confirmed live on testnet: CG_LONG_VARIANT_MATRIX:CG_EXP_LONG_MFE_GIVEBACK_10X
+    // hit Binance -4164 "notional must be no smaller than 5/20" on 104/201 real open attempts (52%)
+    // because of exactly this gap — same silent-scale-below-floor bug class as the
+    // DIAGNOSTIC_LANE_MIRROR_WEIGHT_PCT incident above, just via a different weight source.
+    const entryPrice = planned[0]!.paper.entryPrice;
+    const notionalUsd = qty * entryPrice;
+    const effectiveRiskUsd = planned.reduce((sum, item) => sum + item.plan.effectiveRiskUsd, 0);
+    const ok = qty >= filters.minQty && notionalUsd >= filters.minNotional;
     return {
-      ok: qty >= filters.minQty,
-      reason: qty >= filters.minQty ? null : "aggregate quantity below exchange minimum",
+      ok,
+      reason: ok
+        ? null
+        : qty < filters.minQty
+          ? "aggregate quantity below exchange minimum"
+          : `aggregate notional below exchange minimum (${filters.minNotional})`,
       qty,
       tp1Qty: fullExitAtTp1 ? qty : roundDownToStep(qty / 2, filters.stepSize),
-      notionalUsd: planned.reduce((sum, item) => sum + item.plan.notionalUsd, 0),
+      notionalUsd,
+      plannedRiskUsd: planned.reduce((sum, item) => sum + item.plan.plannedRiskUsd, 0),
+      requiredNotionalUsd: planned.reduce((sum, item) => sum + item.plan.requiredNotionalUsd, 0),
+      appliedNotionalUsd: notionalUsd,
+      notionalCapUsd: planned.reduce((sum, item) => sum + item.plan.notionalCapUsd, 0),
+      stopDistancePct: notionalUsd > 0 ? effectiveRiskUsd / notionalUsd : null,
       stopPrice: direction === "LONG" ? Math.max(...stops) : Math.min(...stops),
       tp1Price: direction === "LONG" ? Math.min(...targets) : Math.max(...targets),
-      effectiveRiskUsd: planned.reduce((sum, item) => sum + item.plan.effectiveRiskUsd, 0),
+      effectiveRiskUsd,
       riskClippedByNotionalCap: planned.some((item) => item.plan.riskClippedByNotionalCap),
     };
   }
@@ -5363,7 +5734,13 @@ export class LiveExecutionEngine {
   }
 
   private async openIntent(
-    planned: Array<{ paper: PaperOrder; plan: LiveOrderPlan }>,
+    planned: Array<{
+      paper: PaperOrder;
+      plan: LiveOrderPlan;
+      cortexAppliedWeightPct?: number;
+      cortexRawStaticWeightPct?: number;
+      externalCopyIdempotencyKey?: string;
+    }>,
     filters: FuturesSymbolFilters,
   ): Promise<void> {
     if (!this.canOpenNewEntries()) return;
@@ -5411,6 +5788,18 @@ export class LiveExecutionEngine {
       operatorLaneSelection: this.operatorSelectionActiveFor(paper) || undefined,
       effectiveRiskUsd: plan.effectiveRiskUsd,
       riskClippedByNotionalCap: plan.riskClippedByNotionalCap,
+      plannedRiskUsd: plan.plannedRiskUsd,
+      requiredNotionalUsd: plan.requiredNotionalUsd,
+      appliedNotionalUsd: plan.appliedNotionalUsd,
+      notionalCapUsd: plan.notionalCapUsd,
+      stopDistancePct: plan.stopDistancePct,
+      externalCopyIdempotencyKey: planned[0]!.externalCopyIdempotencyKey,
+      // CORTEX real-USDT attribution capture (2026-07-21, report-only): frozen from the mirror's
+      // OWN sizing computation (see mirrorNewSignals), so the pair reflects exactly what sized
+      // this entry. Undefined on non-mirror opens (operator copy path) — those are never CORTEX
+      // -tilted and are deliberately left out of the attribution sweep.
+      cortexAppliedWeightPct: planned[0]!.cortexAppliedWeightPct,
+      cortexRawStaticWeightPct: planned[0]!.cortexRawStaticWeightPct,
       createdAt: now,
       updatedAt: now,
       closedAt: null,
@@ -5672,6 +6061,14 @@ export class LiveExecutionEngine {
       // effectiveRiskUsd stays the whole position's true R (report-only, same as at open).
       intent.effectiveRiskUsd = (intent.effectiveRiskUsd ?? 0) + addition.effectiveRiskUsd;
       intent.riskClippedByNotionalCap = (intent.riskClippedByNotionalCap ?? false) || addition.riskClippedByNotionalCap;
+      intent.plannedRiskUsd = (intent.plannedRiskUsd ?? 0) + addition.plannedRiskUsd;
+      intent.requiredNotionalUsd = (intent.requiredNotionalUsd ?? 0) + addition.requiredNotionalUsd;
+      intent.appliedNotionalUsd = (intent.appliedNotionalUsd ?? 0) + addition.appliedNotionalUsd;
+      intent.notionalCapUsd = (intent.notionalCapUsd ?? 0) + addition.notionalCapUsd;
+      intent.stopDistancePct =
+        (intent.appliedNotionalUsd ?? 0) > 0
+          ? (intent.effectiveRiskUsd ?? 0) / (intent.appliedNotionalUsd as number)
+          : intent.stopDistancePct ?? null;
       intent.tp1Qty = this.isFullTpExitRule(this.intentExitRule(intent))
         ? totalQty
         : roundDownToStep(totalQty / 2, filters.stepSize);

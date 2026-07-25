@@ -74,7 +74,12 @@ describe("cortex-attribution — the anti-leakage property (operator's core conc
     const o = outcome("L1", 200 * MIN, 260 * MIN, 0.2, "obs-late");
     const r = attributeOutcomes(decisions, [o], OPTS);
     expect(r.examples).toHaveLength(0);
-    expect(r.perLane.find((l) => l.laneId === "L1")!.unattributedNoDecision).toBe(1);
+    const l1 = r.perLane.find((l) => l.laneId === "L1")!;
+    expect(l1.unattributedNoDecision).toBe(1);
+    // [2026-07-22 diagnostic split] the journal DOES reach back to t=0, well before this trade's t=200min
+    // open — so this is a genuine per-lane coverage gap, not a journal-retention scar.
+    expect(l1.unattributedNoDecisionGenuineGap).toBe(1);
+    expect(l1.unattributedNoDecisionJournalGap).toBe(0);
   });
 
   it("never keys on resolvedAt: a trade opened BEFORE every decision is unattributed", () => {
@@ -84,7 +89,33 @@ describe("cortex-attribution — the anti-leakage property (operator's core conc
     const o = outcome("L1", -10 * MIN, 60 * MIN, 0.2, "obs-pre");
     const r = attributeOutcomes(decisions, [o], OPTS);
     expect(r.examples).toHaveLength(0);
-    expect(r.perLane.find((l) => l.laneId === "L1")!.unattributedNoDecision).toBe(1);
+    const l1 = r.perLane.find((l) => l.laneId === "L1")!;
+    expect(l1.unattributedNoDecision).toBe(1);
+    // [2026-07-22 diagnostic split] this trade's t=-10min open predates the journal's own earliest
+    // retained decision (t=0) — structurally unattributable no matter what, a journal-retention scar.
+    expect(l1.unattributedNoDecisionJournalGap).toBe(1);
+    expect(l1.unattributedNoDecisionGenuineGap).toBe(0);
+  });
+
+  it("[REGRESSION 2026-07-22] unattributedNoDecisionJournalGap + unattributedNoDecisionGenuineGap always sum to unattributedNoDecision, across a mix of both kinds", () => {
+    // Journal covers t=0..20min. One outcome opens BEFORE that (t=-5min, journal scar); one opens well
+    // AFTER it but outside the TTL window for this lane (t=200min, genuine gap); one attributes cleanly.
+    const decisions = [
+      decision(0, { lanes: { L1: { x: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0.5] } } }),
+      decision(20 * MIN, { lanes: { L1: { x: [1, 20, 0, 0, 0, 0, 0, 0, 0, 0.5] } } }),
+    ];
+    const outcomes = [
+      outcome("L1", -5 * MIN, 30 * MIN, 0.2, "obs-scar"), // journal gap
+      outcome("L1", 200 * MIN, 260 * MIN, 0.2, "obs-genuine"), // genuine gap (155min+ past TTL)
+      outcome("L1", 22 * MIN, 40 * MIN, 0.2, "obs-clean"), // attributes to the t=20min decision
+    ];
+    const r = attributeOutcomes(decisions, outcomes, OPTS);
+    const l1 = r.perLane.find((l) => l.laneId === "L1")!;
+    expect(l1.attributed).toBe(1);
+    expect(l1.unattributedNoDecision).toBe(2);
+    expect(l1.unattributedNoDecisionJournalGap).toBe(1);
+    expect(l1.unattributedNoDecisionGenuineGap).toBe(1);
+    expect(l1.unattributedNoDecisionJournalGap + l1.unattributedNoDecisionGenuineGap).toBe(l1.unattributedNoDecision);
   });
 
   it("claims one outcome only once (dedupe by laneId+observationId)", () => {
@@ -188,6 +219,30 @@ describe("cortex-attribution — per-lane status + coverage", () => {
     const r = attributeOutcomes(decisions, outs, OPTS);
     expect(cortexRegimeFamilyCoverage(r.regimeCoverageThisRun)).toBe(2);
     expect(r.regimeCoverageThisRun).toEqual({ BULL: 1, BEAR: 1 });
+  });
+
+  it("[REGRESSION 2026-07-22] a non-finite netR/openedAtMs/resolvedAtMs is counted into outcomesSeen + invalidData, never silently vanishing before any counter increments", () => {
+    const decisions = [decision(0, { lanes: { L1: {} } })];
+    const bad = outcome("L1", 3 * MIN, 60 * MIN, Number.NaN, "corrupt-1");
+    const r = attributeOutcomes(decisions, [bad], OPTS);
+    const st = r.perLane.find((l) => l.laneId === "L1")!;
+    expect(st.outcomesSeen).toBe(1); // previously 0 — the drop happened BEFORE c.seen+=1
+    expect(st.invalidData).toBe(1);
+    expect(st.attributed).toBe(0);
+    expect(st.unattributedNoDecision).toBe(0); // this class of drop must not double up into noDecision either
+  });
+
+  it("[REGRESSION 2026-07-22] a duplicate outcome (same laneId+observationId) that fails to attribute on its FIRST occurrence is recognized as a duplicate on its SECOND, instead of independently inflating unattributedNoDecision every time", () => {
+    // No decisions at all ⇒ every occurrence genuinely fails to find an owner (a real, reachable
+    // "genuine gap" case), NOT a TTL-window exclusion — so any repeat is unambiguously a duplicate,
+    // not a second real trade.
+    const dup1 = outcome("L1", 3 * MIN, 60 * MIN, 0.2, "same-obs-id");
+    const dup2 = outcome("L1", 3 * MIN, 60 * MIN, 0.2, "same-obs-id");
+    const r = attributeOutcomes([], [dup1, dup2], OPTS);
+    const st = r.perLane.find((l) => l.laneId === "L1")!;
+    expect(st.outcomesSeen).toBe(2);
+    expect(st.duplicateDropped).toBe(1); // previously 0 — the 2nd copy was never recognized as a dup
+    expect(st.unattributedNoDecision).toBe(1); // previously 2 — inflated by the un-recognized duplicate
   });
 
   it("cortexBlindCapitalPct sums static weight of lanes not LEARNING_ACTIVE", () => {

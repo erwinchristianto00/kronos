@@ -1,5 +1,9 @@
 import { Component, useEffect, useState, type ReactNode } from 'react';
-import { CortexCollectionStatusCard } from './CortexCollectionStatusCard';
+import { CortexReadinessCard } from './CortexReadinessCard';
+import { InnovationLanesCard } from './InnovationLanesCard';
+import { FourBrainDashboardCard } from './FourBrainDashboardCard';
+import { CrisisModeCard } from './CrisisModeCard';
+import { Disclosure } from './LaneMaturityTable';
 
 // Simple but rich monitoring page for the report-only research lanes (cross-sectional market-neutral).
 // Self-contained: own fetches + 10s auto-refresh + inline-styled dark cards.
@@ -130,6 +134,18 @@ function Spark({ values }: { values: number[] }) {
   );
 }
 const rfmt = (x: number | null | undefined) => (x == null ? '—' : `${x >= 0 ? '+' : ''}${x.toFixed(3)}`);
+/** Shared style for the plain button+useState toggles (2026-07-23 declutter): Lane Performance's
+ *  By Symbol/Direction vs By Regime Gate, and Cross-sectional's RAW vs FILTERED. */
+const tabButtonStyle = (active: boolean): React.CSSProperties => ({
+  background: active ? C.track : 'none',
+  border: `1px solid ${C.border}`,
+  borderRadius: 4,
+  color: active ? C.text : C.dim,
+  cursor: 'pointer',
+  fontSize: 12,
+  padding: '4px 10px',
+  fontWeight: active ? 700 : 400,
+});
 const VERDICT_COLOR: Record<RGL['lanes'][number]['verdict'], string> = {
   IMPROVED: C.good, WORSENED: C.bad, FLAT: C.dim, INSUFFICIENT: C.measure,
 };
@@ -207,6 +223,19 @@ function ResearchDashboardInner() {
   const [radar, setRadar] = useState<NewCoinRadar | null>(null);
   const [updated, setUpdated] = useState<number | null>(null);
   const [err, setErr] = useState<string | null>(null);
+  // 2026-07-23 declutter: toggles for the merged composites (Lane Performance & Edge Readiness,
+  // Cross-sectional RAW/FILTERED) and the new-coin-radar truncation controls.
+  const [laneTableTab, setLaneTableTab] = useState<'symbol' | 'regime'>('symbol');
+  const [xsecVariant, setXsecVariant] = useState<'RAW' | 'FILTERED'>('RAW');
+  const [radarShowAll, setRadarShowAll] = useState(false);
+  const [radarExpandedDescs, setRadarExpandedDescs] = useState<Set<string>>(new Set());
+  const toggleRadarDesc = (symbol: string) =>
+    setRadarExpandedDescs((prev) => {
+      const next = new Set(prev);
+      if (next.has(symbol)) next.delete(symbol);
+      else next.add(symbol);
+      return next;
+    });
 
   async function load() {
     // Each endpoint fails independently — one broken report must not freeze the others
@@ -214,6 +243,10 @@ function ResearchDashboardInner() {
     const grab = async <T,>(url: string): Promise<T | null> => {
       try {
         const res = await fetch(url, { cache: 'no-store' });
+        // A non-200 with a JSON body (proxy error page, future {"error":...} handler) would parse
+        // fine, land in state as a truthy object, and the card's field accesses would throw —
+        // tripping the page-level ErrorBoundary and blanking the WHOLE page instead of one card.
+        if (!res.ok) return null;
         return (await res.json()) as T;
       } catch { return null; }
     };
@@ -262,57 +295,32 @@ function ResearchDashboardInner() {
         </div>
       </header>
 
-      <CortexCollectionStatusCard />
+      {/* Kesiapan CORTEX: the headline summary. */}
+      <CortexReadinessCard />
+
+      {/* Four-Brain (2026-07-23 operator ask): health + recent Market State/Direction/Entry/Exit
+          decisions + direction/entry-brain measured performance for the shadow decision layer
+          sitting above CORTEX/incumbent — see FourBrainDashboardCard.tsx. Four-brain shadow mode
+          runs on research (3101) AND testnet (3102), never live (3103) — this card is
+          testnet-preferred, same as InnovationLanesCard below. */}
+      <FourBrainDashboardCard />
 
       {(() => {
-        if (!psle) return null;
-        const tradeable = (psle.cells ?? [])
+        // 3 — Lane Performance & Edge Readiness (2026-07-23 declutter): merges the per-symbol book
+        // edge table (psle) and the regime-gated lane comparison (rgl) into one composite — same
+        // lane universe, one table visible at a time via a toggle instead of two stacked full
+        // tables. This is the operator's main "provably good to run live" reference, so it stays
+        // prominent (not collapsed).
+        const tradeable = (psle?.cells ?? [])
           .filter((c) => c.testnetCandidate || c.promotable)
           .sort((a, b) => (b.netAvgR ?? -9) - (a.netAvgR ?? -9));
         const stageBadge = (c: PsleCell) => c.promotable
           ? <span style={{ color: C.good, fontSize: 10, fontWeight: 700 }}>PROMOTABLE</span>
           : <span style={{ color: C.measure, fontSize: 10, fontWeight: 700 }}>testnet-cand</span>;
-        const bd = psle.summary?.byDirection;
+        const bd = psle?.summary?.byDirection;
         const pcol = '1.1fr 0.6fr 1.6fr 0.7fr 0.6fr 0.6fr 0.5fr 0.5fr 1fr';
         const ph = (t: string, a: 'left' | 'right' = 'right') => <span style={{ textAlign: a, color: C.dim, fontSize: 10, textTransform: 'uppercase', letterSpacing: 0.3 }}>{t}</span>;
-        return (
-          <Card
-            title="Per-symbol book edge — which symbols &amp; lanes are good for live"
-            subtitle="Every (symbol × lane × direction) cell scored on the REALIZED paper book (not the optimistic sim). testnet-candidate = book-credible, drives the live auto-rotation; PROMOTABLE = also headline-confirmed. Mirages (MAKER, PF/WR too-good) are auto-excluded."
-            right={psle.summary ? <>{psle.summary.testnetCandidateCells} tradeable · {psle.summary.promotableCells} promotable</> : null}
-          >
-            {bd && (
-              <div style={{ padding: '10px 16px', borderBottom: `1px solid ${C.border}`, fontSize: 12, color: C.dim }}>
-                by direction — LONG: <span style={{ color: C.text }}>{bd.LONG.testnetCandidate}</span> tradeable · SHORT: <span style={{ color: C.text }}>{bd.SHORT.testnetCandidate}</span> · MIXED: <span style={{ color: C.text }}>{bd.MIXED.testnetCandidate}</span>
-                {psle.summary.promotableCells === 0 && <span style={{ color: C.measure }}> · none headline-confirmed yet (all diagnostic-only — testnet earns confirmation over time)</span>}
-              </div>
-            )}
-            <div style={{ padding: '6px 16px 14px', overflowX: 'auto' }}>
-              <div style={{ display: 'grid', gridTemplateColumns: pcol, gap: 8, alignItems: 'center', padding: '6px 0', borderBottom: `1px solid ${C.border}` }}>
-                {ph('symbol', 'left')}{ph('dir')}{ph('lane', 'left')}{ph('book avgR')}{ph('PF')}{ph('WR')}{ph('n')}{ph('hl')}{ph('stage')}
-              </div>
-              {tradeable.length ? tradeable.map((c) => (
-                <div key={`${c.laneId}:${c.symbol}:${c.direction}`} style={{ display: 'grid', gridTemplateColumns: pcol, gap: 8, alignItems: 'center', padding: '5px 0', borderTop: `1px solid ${C.sub}`, fontSize: 13 }}>
-                  <span style={{ color: C.text, fontWeight: 600 }}>{c.symbol.replace(/USDT$/, '')}</span>
-                  <span style={{ textAlign: 'right', color: c.direction === 'LONG' ? C.good : C.bad }}>{c.direction}</span>
-                  <span style={{ color: C.dim, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }} title={c.laneId}>{c.laneId.split(':').pop()?.replace(/^CG_/, '')}</span>
-                  <span style={{ textAlign: 'right', color: tone(c.netAvgR ?? 0), fontWeight: 700 }}>{rfmt(c.netAvgR)}</span>
-                  <span style={{ textAlign: 'right', color: C.dim }}>{c.pf == null ? '—' : c.pf.toFixed(2)}</span>
-                  <span style={{ textAlign: 'right', color: C.dim }}>{c.wr == null ? '—' : `${Math.round(c.wr * 100)}%`}</span>
-                  <span style={{ textAlign: 'right', color: C.dim }}>{c.closed}</span>
-                  <span style={{ textAlign: 'right', color: c.headlineClosed > 0 ? C.good : C.dim }}>{c.headlineClosed}</span>
-                  <span style={{ textAlign: 'right' }}>{stageBadge(c)}</span>
-                </div>
-              )) : <div style={{ padding: 12, color: C.dim }}>no book-proven symbols yet — accruing</div>}
-              <div style={{ fontSize: 11, color: C.dim, marginTop: 10 }}>
-                Bar: n≥{psle.minClosed} closed, book netAvgR≥+0.03, PF&gt;1, executable, non-suspicious. <span style={{ color: C.text }}>hl</span> = headline closes (0 = diagnostic-only, not yet promotable). Each instance reads its OWN book — live (mainnet) shows what mainnet has traded.
-              </div>
-            </div>
-          </Card>
-        );
-      })()}
 
-      {(() => {
         const lanes = (rgl?.lanes ?? []).filter((l) => l.raw.n >= 5);
         const tally = { IMPROVED: 0, WORSENED: 0, FLAT: 0, INSUFFICIENT: 0 };
         lanes.forEach((l) => { tally[l.verdict] += 1; });
@@ -323,156 +331,215 @@ function ResearchDashboardInner() {
         const head = (t: string, align: 'left' | 'right' = 'right') => (
           <span style={{ textAlign: align, color: C.dim, fontSize: 10, textTransform: 'uppercase', letterSpacing: 0.3 }}>{t}</span>
         );
+
         return (
           <Card
-            title="Regime-gated lane comparison"
-            subtitle="VM lanes re-scored with captured EXTENDED regime direction only; tactical/mixed/legacy rows are kept — does the stricter gate improve each lane?"
-            right={rgl ? <>{rgl.totalObs} resolved obs · {rgl.totalGateEligible ?? 0} gate-eligible · {rgl.totalGatedOut} gated-out</> : null}
+            title="Lane Performance &amp; Edge Readiness"
+            subtitle="Per-(symbol × lane × direction) book edge and regime-gated lane comparison — same lane universe, one table at a time. The operator's main 'provably good to run live' reference."
+            right={psle?.summary ? <>{psle.summary.testnetCandidateCells} tradeable · {psle.summary.promotableCells} promotable</> : null}
           >
-            {rgl ? (
+            {bd && (
+              <div style={{ padding: '10px 16px', borderBottom: `1px solid ${C.border}`, fontSize: 12, color: C.dim }}>
+                by direction — LONG: <span style={{ color: C.text }}>{bd.LONG.testnetCandidate}</span> tradeable · SHORT: <span style={{ color: C.text }}>{bd.SHORT.testnetCandidate}</span> · MIXED: <span style={{ color: C.text }}>{bd.MIXED.testnetCandidate}</span>
+                {psle?.summary?.promotableCells === 0 && <span style={{ color: C.measure }}> · none headline-confirmed yet (all diagnostic-only — testnet earns confirmation over time)</span>}
+              </div>
+            )}
+            {rgl && lanes.length > 0 && (
+              <div style={{ padding: '10px 16px', borderBottom: `1px solid ${C.border}`, fontSize: 13 }}>
+                Verdict (book-R, gated n≥15): {verdictTag('IMPROVED')}{verdictTag('WORSENED')}{verdictTag('FLAT')}{verdictTag('INSUFFICIENT')}
+                {typeof rgl.deltaBookRTradeableLanes === 'number' && (
+                  <div style={{ marginTop: 6, fontSize: 12, color: rgl.deltaBookRTradeableLanes >= 0 ? C.good : C.bad, fontWeight: 600 }}>
+                    Book-R impact of blanket-gating the lanes you'd actually run (still net-positive after gating): {rfmt(rgl.deltaBookRTradeableLanes)}R
+                    {rgl.deltaBookRTradeableLanes < 0 && <span style={{ color: C.dim, fontWeight: 400 }}> — gating would DISCARD realized edge (it drops winners on the profitable lanes). Do not wire it.</span>}
+                  </div>
+                )}
+              </div>
+            )}
+
+            <div style={{ padding: '8px 16px', display: 'flex', gap: 8, borderBottom: `1px solid ${C.border}` }}>
+              <button onClick={() => setLaneTableTab('symbol')} style={tabButtonStyle(laneTableTab === 'symbol')}>By Symbol/Direction</button>
+              <button onClick={() => setLaneTableTab('regime')} style={tabButtonStyle(laneTableTab === 'regime')}>By Regime Gate</button>
+            </div>
+
+            {laneTableTab === 'symbol' ? (
+              psle ? (
+                <div style={{ padding: '6px 16px 14px', overflowX: 'auto' }}>
+                  <div style={{ display: 'grid', gridTemplateColumns: pcol, gap: 8, alignItems: 'center', padding: '6px 0', borderBottom: `1px solid ${C.border}` }}>
+                    {ph('symbol', 'left')}{ph('dir')}{ph('lane', 'left')}{ph('book avgR')}{ph('PF')}{ph('WR')}{ph('n')}{ph('hl')}{ph('stage')}
+                  </div>
+                  {tradeable.length ? tradeable.map((c) => (
+                    <div key={`${c.laneId}:${c.symbol}:${c.direction}`} style={{ display: 'grid', gridTemplateColumns: pcol, gap: 8, alignItems: 'center', padding: '5px 0', borderTop: `1px solid ${C.sub}`, fontSize: 13 }}>
+                      <span style={{ color: C.text, fontWeight: 600 }}>{c.symbol.replace(/USDT$/, '')}</span>
+                      <span style={{ textAlign: 'right', color: c.direction === 'LONG' ? C.good : C.bad }}>{c.direction}</span>
+                      <span style={{ color: C.dim, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }} title={c.laneId}>{c.laneId.split(':').pop()?.replace(/^CG_/, '')}</span>
+                      <span style={{ textAlign: 'right', color: tone(c.netAvgR ?? 0), fontWeight: 700 }}>{rfmt(c.netAvgR)}</span>
+                      <span style={{ textAlign: 'right', color: C.dim }}>{c.pf == null ? '—' : c.pf.toFixed(2)}</span>
+                      <span style={{ textAlign: 'right', color: C.dim }}>{c.wr == null ? '—' : `${Math.round(c.wr * 100)}%`}</span>
+                      <span style={{ textAlign: 'right', color: C.dim }}>{c.closed}</span>
+                      <span style={{ textAlign: 'right', color: c.headlineClosed > 0 ? C.good : C.dim }}>{c.headlineClosed}</span>
+                      <span style={{ textAlign: 'right' }}>{stageBadge(c)}</span>
+                    </div>
+                  )) : <div style={{ padding: 12, color: C.dim }}>no book-proven symbols yet — accruing</div>}
+                  <div style={{ fontSize: 11, color: C.dim, marginTop: 10 }}>
+                    Bar: n≥{psle.minClosed} closed, book netAvgR≥+0.03, PF&gt;1, executable, non-suspicious. <span style={{ color: C.text }}>hl</span> = headline closes (0 = diagnostic-only, not yet promotable). Each instance reads its OWN book — live (mainnet) shows what mainnet has traded.
+                  </div>
+                </div>
+              ) : <div style={{ padding: 16, color: C.dim }}>loading…</div>
+            ) : rgl ? (
               lanes.length ? (
-                <>
-                  <div style={{ padding: '10px 16px', borderBottom: `1px solid ${C.border}`, fontSize: 13 }}>
-                    Verdict (book-R, gated n≥15): {verdictTag('IMPROVED')}{verdictTag('WORSENED')}{verdictTag('FLAT')}{verdictTag('INSUFFICIENT')}
-                    {typeof rgl.deltaBookRTradeableLanes === 'number' && (
-                      <div style={{ marginTop: 6, fontSize: 12, color: rgl.deltaBookRTradeableLanes >= 0 ? C.good : C.bad, fontWeight: 600 }}>
-                        Book-R impact of blanket-gating the lanes you'd actually run (still net-positive after gating): {rfmt(rgl.deltaBookRTradeableLanes)}R
-                        {rgl.deltaBookRTradeableLanes < 0 && <span style={{ color: C.dim, fontWeight: 400 }}> — gating would DISCARD realized edge (it drops winners on the profitable lanes). Do not wire it.</span>}
-                      </div>
-                    )}
+                <div style={{ padding: '6px 16px 14px', overflowX: 'auto' }}>
+                  <div style={{ display: 'grid', gridTemplateColumns: col, gap: 8, alignItems: 'center', padding: '6px 0', borderBottom: `1px solid ${C.border}` }}>
+                    {head('Lane', 'left')}{head('raw n')}{head('raw avgR')}{head('raw WR')}{head('gt n')}{head('gated avgR')}{head('gt WR')}{head('Δ avgR')}{head('Δ book R')}{head('verdict')}
                   </div>
-                  <div style={{ padding: '6px 16px 14px', overflowX: 'auto' }}>
-                    <div style={{ display: 'grid', gridTemplateColumns: col, gap: 8, alignItems: 'center', padding: '6px 0', borderBottom: `1px solid ${C.border}` }}>
-                      {head('Lane', 'left')}{head('raw n')}{head('raw avgR')}{head('raw WR')}{head('gt n')}{head('gated avgR')}{head('gt WR')}{head('Δ avgR')}{head('Δ book R')}{head('verdict')}
+                  {lanes.map((l) => (
+                    <div key={l.variantId} style={{ display: 'grid', gridTemplateColumns: col, gap: 8, alignItems: 'center', padding: '5px 0', borderTop: `1px solid ${C.sub}`, fontSize: 13 }}>
+                      <span style={{ color: C.text, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }} title={l.variantId}>{l.variantId.replace(/^CG_/, '')}</span>
+                      <span style={{ textAlign: 'right', color: C.dim }}>{l.raw.n}</span>
+                      <span style={{ textAlign: 'right', color: tone(l.raw.netAvgR), fontWeight: 600 }}>{rfmt(l.raw.netAvgR)}</span>
+                      <span style={{ textAlign: 'right', color: C.dim }}>{Math.round(l.raw.winRate * 100)}%</span>
+                      <span style={{ textAlign: 'right', color: C.dim }}>{l.gated.n}</span>
+                      <span style={{ textAlign: 'right', color: tone(l.gated.netAvgR), fontWeight: 600 }}>{rfmt(l.gated.netAvgR)}</span>
+                      <span style={{ textAlign: 'right', color: C.dim }}>{Math.round(l.gated.winRate * 100)}%</span>
+                      <span style={{ textAlign: 'right', color: C.dim, fontWeight: 600 }}>{rfmt(l.deltaNetAvgR)}</span>
+                      <span style={{ textAlign: 'right', color: tone(l.deltaBookR ?? 0), fontWeight: 700 }} title="book-R gained/lost by gating this lane (= −dropped totalR)">{typeof l.deltaBookR === 'number' ? `${l.deltaBookR >= 0 ? '+' : ''}${l.deltaBookR.toFixed(1)}R` : '—'}</span>
+                      <span style={{ textAlign: 'right', color: VERDICT_COLOR[l.verdict], fontSize: 11, fontWeight: 600 }} title={l.gatedTradeable === false ? 'lane still net-negative after gating — not tradeable either way' : ''}>{l.verdict}{l.gatedTradeable === false ? '*' : ''}</span>
                     </div>
-                    {lanes.map((l) => (
-                      <div key={l.variantId} style={{ display: 'grid', gridTemplateColumns: col, gap: 8, alignItems: 'center', padding: '5px 0', borderTop: `1px solid ${C.sub}`, fontSize: 13 }}>
-                        <span style={{ color: C.text, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }} title={l.variantId}>{l.variantId.replace(/^CG_/, '')}</span>
-                        <span style={{ textAlign: 'right', color: C.dim }}>{l.raw.n}</span>
-                        <span style={{ textAlign: 'right', color: tone(l.raw.netAvgR), fontWeight: 600 }}>{rfmt(l.raw.netAvgR)}</span>
-                        <span style={{ textAlign: 'right', color: C.dim }}>{Math.round(l.raw.winRate * 100)}%</span>
-                        <span style={{ textAlign: 'right', color: C.dim }}>{l.gated.n}</span>
-                        <span style={{ textAlign: 'right', color: tone(l.gated.netAvgR), fontWeight: 600 }}>{rfmt(l.gated.netAvgR)}</span>
-                        <span style={{ textAlign: 'right', color: C.dim }}>{Math.round(l.gated.winRate * 100)}%</span>
-                        <span style={{ textAlign: 'right', color: C.dim, fontWeight: 600 }}>{rfmt(l.deltaNetAvgR)}</span>
-                        <span style={{ textAlign: 'right', color: tone(l.deltaBookR ?? 0), fontWeight: 700 }} title="book-R gained/lost by gating this lane (= −dropped totalR)">{typeof l.deltaBookR === 'number' ? `${l.deltaBookR >= 0 ? '+' : ''}${l.deltaBookR.toFixed(1)}R` : '—'}</span>
-                        <span style={{ textAlign: 'right', color: VERDICT_COLOR[l.verdict], fontSize: 11, fontWeight: 600 }} title={l.gatedTradeable === false ? 'lane still net-negative after gating — not tradeable either way' : ''}>{l.verdict}{l.gatedTradeable === false ? '*' : ''}</span>
-                      </div>
-                    ))}
-                    <div style={{ fontSize: 11, color: C.dim, marginTop: 10 }}>
-                      Gate drops only captured EXTENDED counter-regime rows. <strong style={{ color: C.text }}>Verdict is now BOOK-R based</strong> (Δ book R = gated − raw totalR = the realized edge gating adds/removes), NOT the per-trade average.
-                      <span style={{ color: C.dim }}> Δ avgR (greyed) rises whenever a below-average tail is dropped — even if those trades were winners, which is why it read a misleading “19 improved.”</span>
-                      {' '}<span style={{ color: C.bad }}>Negative Δ book R = gating discards realized profit (drops winners).</span> <span title="lane still net-negative after gating">* = lane still net-negative after gating (not tradeable either way).</span>
-                    </div>
+                  ))}
+                  <div style={{ fontSize: 11, color: C.dim, marginTop: 10 }}>
+                    Gate drops only captured EXTENDED counter-regime rows. <strong style={{ color: C.text }}>Verdict is now BOOK-R based</strong> (Δ book R = gated − raw totalR = the realized edge gating adds/removes), NOT the per-trade average.
+                    <span style={{ color: C.dim }}> Δ avgR (greyed) rises whenever a below-average tail is dropped — even if those trades were winners, which is why it read a misleading “19 improved.”</span>
+                    {' '}<span style={{ color: C.bad }}>Negative Δ book R = gating discards realized profit (drops winners).</span> <span title="lane still net-negative after gating">* = lane still net-negative after gating (not tradeable either way).</span>
                   </div>
-                </>
+                </div>
               ) : <div style={{ padding: 16, color: C.dim }}>no resolved observations yet</div>
             ) : <div style={{ padding: 16, color: C.dim }}>loading…</div>}
           </Card>
         );
       })()}
 
+      {/* 4 — Cross-Sectional Market-Neutral (2026-07-23 declutter): merges the RAW and FILTERED
+          variants (previously 2 stacked full Cards) behind one RAW/FILTERED toggle. This strategy is
+          LIVE-EXECUTING — its positions show up on the Exchange Dashboard's Open Positions table
+          under Book/Type = Basket — so it's placed ahead of the pure-shadow Innovation Lanes below. */}
       <Card
         title="Cross-sectional market-neutral"
-        subtitle={r ? `${r.signal} · long-top-${r.k} / short-bottom-${r.k} · ${r.horizonBars}-bar horizon · beta-cancelled dispersion` : 'loading…'}
-        right={r ? <>{r.lastCycleAt ? `cycle ${ago(r.lastCycleAt)} ago` : 'no cycle yet'}{r.nextResolveInMs != null && <> · <span style={{ color: C.accent }}>first resolves in {dur(r.nextResolveInMs)}</span></>}</> : null}
+        subtitle="Long-top / short-bottom beta-cancelled dispersion. Live-executing — positions from this strategy show up on the Exchange Dashboard's Open Positions table under Book/Type = Basket."
       >
-        {r ? (
-          <>
-            <div style={{ display: 'flex', flexWrap: 'wrap', borderBottom: `1px solid ${C.border}` }}>
-              <Stat label="Closed" value={`${r.closed}`} />
-              <Stat label="Open" value={`${r.open}`} />
-              <Stat label="Net avg return" value={pct(r.netAvgReturn)} color={tone(r.netAvgReturn)} />
-              <Stat label="Win rate" value={r.closed ? `${Math.round(r.winRate * 100)}%` : '—'} />
-              <Stat label="Sharpe-like" value={r.sharpeLike == null ? '—' : r.sharpeLike.toFixed(2)} color={tone(r.sharpeLike)} />
-              <Stat label="Total net" value={pct(r.totalNetReturn, 2)} color={tone(r.totalNetReturn)} />
-            </div>
-            <div style={{ display: 'flex', gap: 24, padding: '14px 16px', flexWrap: 'wrap', borderBottom: `1px solid ${C.border}` }}>
-              <div style={{ flex: '1 1 280px', minWidth: 240 }}>
-                <div style={{ fontSize: 12, color: C.dim, marginBottom: 6 }}>Leg contribution (the dispersion = both legs winning)</div>
-                <HBar label="Long leg avg" value={r.longLegAvgReturn} max={legMax} color={tone(r.longLegAvgReturn)} valueText={pct(r.longLegAvgReturn)} />
-                <HBar label="Short leg avg" value={r.shortLegAvgReturn} max={legMax} color={tone(r.shortLegAvgReturn)} valueText={pct(r.shortLegAvgReturn)} />
-              </div>
-              <div style={{ flex: '1 1 240px', minWidth: 200 }}>
-                <div style={{ fontSize: 12, color: C.dim, marginBottom: 6 }}>Closed-basket net returns</div>
-                <Spark values={r.recentNetReturns} />
-              </div>
-            </div>
-            <div style={{ padding: '12px 16px' }}>
-              <div style={{ color: C.dim, fontSize: 12, marginBottom: 6 }}>
-                {r.closed === 0 ? `${r.open} open baskets accruing — none matured yet (each resolves after the ${r.horizonBars}h horizon)` : 'Recent closed baskets'}
-              </div>
-              {(xsec.recentClosed ?? []).slice(-6).reverse().map((b, i) => (
-                <div key={i} style={{ display: 'flex', gap: 12, fontSize: 13, padding: '4px 0', borderTop: i ? `1px solid ${C.border}` : undefined }}>
-                  <span style={{ color: tone(b.netReturnPct), fontWeight: 600, width: 64 }}>{pctRaw(b.netReturnPct)}</span>
-                  <span style={{ color: C.good }}>L: {b.long.join(', ')}</span>
-                  <span style={{ color: C.bad }}>S: {b.short.join(', ')}</span>
-                  <span style={{ color: C.dim, marginLeft: 'auto' }}>{b.resolvedAt ? `${ago(b.resolvedAt)} ago` : ''}</span>
-                </div>
-              ))}
-              {(xsec.openBaskets ?? []).slice(-3).reverse().map((b, i) => (
-                <div key={`o${i}`} style={{ display: 'flex', gap: 12, fontSize: 13, padding: '4px 0', borderTop: `1px solid ${C.border}`, opacity: 0.65 }}>
-                  <span style={{ color: C.measure, width: 64 }}>OPEN</span>
-                  <span style={{ color: C.good }}>L: {b.long.join(', ')}</span>
-                  <span style={{ color: C.bad }}>S: {b.short.join(', ')}</span>
-                  <span style={{ color: C.dim, marginLeft: 'auto' }}>{ago(b.openedAt)} ago</span>
-                </div>
-              ))}
-            </div>
-          </>
-        ) : <div style={{ padding: 16, color: C.dim }}>loading…</div>}
-      </Card>
+        <div style={{ padding: '8px 16px', display: 'flex', gap: 8, borderBottom: `1px solid ${C.border}` }}>
+          <button onClick={() => setXsecVariant('RAW')} style={tabButtonStyle(xsecVariant === 'RAW')}>RAW</button>
+          <button onClick={() => setXsecVariant('FILTERED')} style={tabButtonStyle(xsecVariant === 'FILTERED')}>
+            FILTERED{rf?.edgeReady ? ' — edge ready' : ''}
+          </button>
+        </div>
 
-      <Card
-        title="Cross-sectional filtered"
-        subtitle={rf ? `${rf.signal} · symbol-filtered · score gap >= ${pctRaw((xsec?.filteredConfig?.minScoreGap ?? 0) * 100, 2)} · target gross ${pct(xsec?.filteredConfig?.targetGrossReturn ?? rf.targetGrossReturn ?? 0, 2)}` : 'loading…'}
-        right={rf ? <span style={{ color: rf.edgeReady ? C.good : C.accent }}>{rf.edgeReady ? 'edge ready' : 'collecting filtered OOS'}</span> : null}
-      >
-        {rf ? (
+        {xsecVariant === 'RAW' && (
           <>
-            <div style={{ display: 'flex', flexWrap: 'wrap', borderBottom: `1px solid ${C.border}` }}>
-              <Stat label="Closed" value={`${rf.closed}`} />
-              <Stat label="Open" value={`${rf.open}`} />
-              <Stat label="Net avg return" value={pct(rf.netAvgReturn)} color={tone(rf.netAvgReturn)} />
-              <Stat label="Gross avg return" value={pct(rf.grossAvgReturn)} color={tone(rf.grossAvgReturn)} />
-              <Stat label="Win rate" value={rf.closed ? `${Math.round(rf.winRate * 100)}%` : '—'} />
-              <Stat label="Total net" value={pct(rf.totalNetReturn, 2)} color={tone(rf.totalNetReturn)} />
+            <div style={{ padding: '8px 16px', fontSize: 11, color: C.dim, borderBottom: `1px solid ${C.border}` }}>
+              {r ? <>{r.signal} · long-top-{r.k} / short-bottom-{r.k} · {r.horizonBars}-bar horizon · beta-cancelled dispersion · {r.lastCycleAt ? `cycle ${ago(r.lastCycleAt)} ago` : 'no cycle yet'}{r.nextResolveInMs != null && <> · <span style={{ color: C.accent }}>first resolves in {dur(r.nextResolveInMs)}</span></>}</> : 'loading…'}
             </div>
-            <div style={{ display: 'flex', gap: 24, padding: '12px 16px', flexWrap: 'wrap', borderBottom: `1px solid ${C.border}` }}>
-              <div style={{ flex: '1 1 280px', minWidth: 240 }}>
-                <div style={{ fontSize: 12, color: C.dim, marginBottom: 6 }}>Filtered leg contribution</div>
-                <HBar label="Long leg avg" value={rf.longLegAvgReturn} max={filteredLegMax} color={tone(rf.longLegAvgReturn)} valueText={pct(rf.longLegAvgReturn)} />
-                <HBar label="Short leg avg" value={rf.shortLegAvgReturn} max={filteredLegMax} color={tone(rf.shortLegAvgReturn)} valueText={pct(rf.shortLegAvgReturn)} />
-              </div>
-              <div style={{ flex: '1 1 300px', minWidth: 260, fontSize: 12, color: C.dim, lineHeight: 1.55 }}>
-                <div><span style={{ color: C.good }}>Long allow:</span> {(xsec?.filteredConfig?.longAllowlist ?? []).join(', ')}</div>
-                <div><span style={{ color: C.bad }}>Short allow:</span> {(xsec?.filteredConfig?.shortAllowlist ?? []).join(', ')}</div>
-                <div><span style={{ color: C.accent }}>Short blocked:</span> {(xsec?.filteredConfig?.shortBlocklist ?? []).join(', ')}</div>
-              </div>
-            </div>
-            <div style={{ padding: '12px 16px' }}>
-              <div style={{ color: C.dim, fontSize: 12, marginBottom: 6 }}>
-                {rf.closed === 0 ? `${rf.open} filtered baskets accruing — first resolved sample needs the ${rf.horizonBars}h horizon` : 'Recent filtered baskets'}
-              </div>
-              {(xsec.filteredRecentClosed ?? []).slice(-6).reverse().map((b, i) => (
-                <div key={i} style={{ display: 'flex', gap: 12, fontSize: 13, padding: '4px 0', borderTop: i ? `1px solid ${C.border}` : undefined }}>
-                  <span style={{ color: tone(b.netReturnPct), fontWeight: 600, width: 64 }}>{pctRaw(b.netReturnPct)}</span>
-                  <span style={{ color: C.good }}>L: {b.long.join(', ')}</span>
-                  <span style={{ color: C.bad }}>S: {b.short.join(', ')}</span>
-                  <span style={{ color: C.dim, marginLeft: 'auto' }}>{b.resolvedAt ? `${ago(b.resolvedAt)} ago` : ''}</span>
+            {r ? (
+              <>
+                <div style={{ display: 'flex', flexWrap: 'wrap', borderBottom: `1px solid ${C.border}` }}>
+                  <Stat label="Closed" value={`${r.closed}`} />
+                  <Stat label="Open" value={`${r.open}`} />
+                  <Stat label="Net avg return" value={pct(r.netAvgReturn)} color={tone(r.netAvgReturn)} />
+                  <Stat label="Win rate" value={r.closed ? `${Math.round(r.winRate * 100)}%` : '—'} />
+                  <Stat label="Sharpe-like" value={r.sharpeLike == null ? '—' : r.sharpeLike.toFixed(2)} color={tone(r.sharpeLike)} />
+                  <Stat label="Total net" value={pct(r.totalNetReturn, 2)} color={tone(r.totalNetReturn)} />
                 </div>
-              ))}
-              {(xsec.filteredOpenBaskets ?? []).slice(-3).reverse().map((b, i) => (
-                <div key={`fo${i}`} style={{ display: 'flex', gap: 12, fontSize: 13, padding: '4px 0', borderTop: `1px solid ${C.border}`, opacity: 0.7 }}>
-                  <span style={{ color: C.measure, width: 64 }}>OPEN</span>
-                  <span style={{ color: C.good }}>L: {b.long.join(', ')}</span>
-                  <span style={{ color: C.bad }}>S: {b.short.join(', ')}</span>
-                  <span style={{ color: C.dim, marginLeft: 'auto' }}>{ago(b.openedAt)} ago</span>
+                <div style={{ display: 'flex', gap: 24, padding: '14px 16px', flexWrap: 'wrap', borderBottom: `1px solid ${C.border}` }}>
+                  <div style={{ flex: '1 1 280px', minWidth: 240 }}>
+                    <div style={{ fontSize: 12, color: C.dim, marginBottom: 6 }}>Leg contribution (the dispersion = both legs winning)</div>
+                    <HBar label="Long leg avg" value={r.longLegAvgReturn} max={legMax} color={tone(r.longLegAvgReturn)} valueText={pct(r.longLegAvgReturn)} />
+                    <HBar label="Short leg avg" value={r.shortLegAvgReturn} max={legMax} color={tone(r.shortLegAvgReturn)} valueText={pct(r.shortLegAvgReturn)} />
+                  </div>
+                  <div style={{ flex: '1 1 240px', minWidth: 200 }}>
+                    <div style={{ fontSize: 12, color: C.dim, marginBottom: 6 }}>Closed-basket net returns</div>
+                    <Spark values={r.recentNetReturns} />
+                  </div>
                 </div>
-              ))}
-            </div>
+                <div style={{ padding: '12px 16px' }}>
+                  <div style={{ color: C.dim, fontSize: 12, marginBottom: 6 }}>
+                    {r.closed === 0 ? `${r.open} open baskets accruing — none matured yet (each resolves after the ${r.horizonBars}h horizon)` : 'Recent closed baskets'}
+                  </div>
+                  {(xsec?.recentClosed ?? []).slice(-6).reverse().map((b, i) => (
+                    <div key={i} style={{ display: 'flex', gap: 12, fontSize: 13, padding: '4px 0', borderTop: i ? `1px solid ${C.border}` : undefined }}>
+                      <span style={{ color: tone(b.netReturnPct), fontWeight: 600, width: 64 }}>{pctRaw(b.netReturnPct)}</span>
+                      <span style={{ color: C.good }}>L: {b.long.join(', ')}</span>
+                      <span style={{ color: C.bad }}>S: {b.short.join(', ')}</span>
+                      <span style={{ color: C.dim, marginLeft: 'auto' }}>{b.resolvedAt ? `${ago(b.resolvedAt)} ago` : ''}</span>
+                    </div>
+                  ))}
+                  {(xsec?.openBaskets ?? []).slice(-3).reverse().map((b, i) => (
+                    <div key={`o${i}`} style={{ display: 'flex', gap: 12, fontSize: 13, padding: '4px 0', borderTop: `1px solid ${C.border}`, opacity: 0.65 }}>
+                      <span style={{ color: C.measure, width: 64 }}>OPEN</span>
+                      <span style={{ color: C.good }}>L: {b.long.join(', ')}</span>
+                      <span style={{ color: C.bad }}>S: {b.short.join(', ')}</span>
+                      <span style={{ color: C.dim, marginLeft: 'auto' }}>{ago(b.openedAt)} ago</span>
+                    </div>
+                  ))}
+                </div>
+              </>
+            ) : <div style={{ padding: 16, color: C.dim }}>loading…</div>}
           </>
-        ) : <div style={{ padding: 16, color: C.dim }}>loading…</div>}
+        )}
+
+        {xsecVariant === 'FILTERED' && (
+          <>
+            <div style={{ padding: '8px 16px', fontSize: 11, color: C.dim, borderBottom: `1px solid ${C.border}` }}>
+              {rf ? <>{rf.signal} · symbol-filtered · score gap &gt;= {pctRaw((xsec?.filteredConfig?.minScoreGap ?? 0) * 100, 2)} · target gross {pct(xsec?.filteredConfig?.targetGrossReturn ?? rf.targetGrossReturn ?? 0, 2)} · <span style={{ color: rf.edgeReady ? C.good : C.accent }}>{rf.edgeReady ? 'edge ready' : 'collecting filtered OOS'}</span></> : 'loading…'}
+            </div>
+            {rf ? (
+              <>
+                <div style={{ display: 'flex', flexWrap: 'wrap', borderBottom: `1px solid ${C.border}` }}>
+                  <Stat label="Closed" value={`${rf.closed}`} />
+                  <Stat label="Open" value={`${rf.open}`} />
+                  <Stat label="Net avg return" value={pct(rf.netAvgReturn)} color={tone(rf.netAvgReturn)} />
+                  <Stat label="Gross avg return" value={pct(rf.grossAvgReturn)} color={tone(rf.grossAvgReturn)} />
+                  <Stat label="Win rate" value={rf.closed ? `${Math.round(rf.winRate * 100)}%` : '—'} />
+                  <Stat label="Total net" value={pct(rf.totalNetReturn, 2)} color={tone(rf.totalNetReturn)} />
+                </div>
+                <div style={{ padding: '14px 16px', borderBottom: `1px solid ${C.border}` }}>
+                  <div style={{ fontSize: 12, color: C.dim, marginBottom: 6 }}>Filtered leg contribution</div>
+                  <HBar label="Long leg avg" value={rf.longLegAvgReturn} max={filteredLegMax} color={tone(rf.longLegAvgReturn)} valueText={pct(rf.longLegAvgReturn)} />
+                  <HBar label="Short leg avg" value={rf.shortLegAvgReturn} max={filteredLegMax} color={tone(rf.shortLegAvgReturn)} valueText={pct(rf.shortLegAvgReturn)} />
+                </div>
+                <div style={{ padding: '12px 16px' }}>
+                  <div style={{ color: C.dim, fontSize: 12, marginBottom: 6 }}>
+                    {rf.closed === 0 ? `${rf.open} filtered baskets accruing — first resolved sample needs the ${rf.horizonBars}h horizon` : 'Recent filtered baskets'}
+                  </div>
+                  {(xsec?.filteredRecentClosed ?? []).slice(-6).reverse().map((b, i) => (
+                    <div key={i} style={{ display: 'flex', gap: 12, fontSize: 13, padding: '4px 0', borderTop: i ? `1px solid ${C.border}` : undefined }}>
+                      <span style={{ color: tone(b.netReturnPct), fontWeight: 600, width: 64 }}>{pctRaw(b.netReturnPct)}</span>
+                      <span style={{ color: C.good }}>L: {b.long.join(', ')}</span>
+                      <span style={{ color: C.bad }}>S: {b.short.join(', ')}</span>
+                      <span style={{ color: C.dim, marginLeft: 'auto' }}>{b.resolvedAt ? `${ago(b.resolvedAt)} ago` : ''}</span>
+                    </div>
+                  ))}
+                  {(xsec?.filteredOpenBaskets ?? []).slice(-3).reverse().map((b, i) => (
+                    <div key={`fo${i}`} style={{ display: 'flex', gap: 12, fontSize: 13, padding: '4px 0', borderTop: `1px solid ${C.border}`, opacity: 0.7 }}>
+                      <span style={{ color: C.measure, width: 64 }}>OPEN</span>
+                      <span style={{ color: C.good }}>L: {b.long.join(', ')}</span>
+                      <span style={{ color: C.bad }}>S: {b.short.join(', ')}</span>
+                      <span style={{ color: C.dim, marginLeft: 'auto' }}>{ago(b.openedAt)} ago</span>
+                    </div>
+                  ))}
+                </div>
+              </>
+            ) : <div style={{ padding: 16, color: C.dim }}>loading…</div>}
+          </>
+        )}
+
+        {/* Filter rules (active) — ALWAYS VISIBLE regardless of RAW/FILTERED toggle: unique to the
+            filtered variant, must not disappear when RAW is selected. */}
+        {xsec && (
+          <div style={{ padding: '12px 16px', borderTop: `1px solid ${C.border}`, fontSize: 12, color: C.dim, lineHeight: 1.55 }}>
+            <div style={{ fontWeight: 700, color: C.text, marginBottom: 4 }}>Filter rules (active)</div>
+            <div><span style={{ color: C.good }}>Long allow:</span> {(xsec.filteredConfig?.longAllowlist ?? []).join(', ')}</div>
+            <div><span style={{ color: C.bad }}>Short allow:</span> {(xsec.filteredConfig?.shortAllowlist ?? []).join(', ')}</div>
+            <div><span style={{ color: C.accent }}>Short blocked:</span> {(xsec.filteredConfig?.shortBlocklist ?? []).join(', ')}</div>
+          </div>
+        )}
       </Card>
 
       <Card
@@ -480,6 +547,9 @@ function ResearchDashboardInner() {
         subtitle='Tests "open only the good legs" against closed-basket history: hindsight oracle vs realistic late-entry checkpoints (enter at the checkpoint price after a leg proves positive). Persistence = P(still positive at exit | positive at checkpoint).'
         right={wcf ? <>{wcf.closedCompleteBaskets} baskets · {wcf.variant} · refreshes 10m</> : null}
       >
+        <div style={{ padding: '8px 16px 0', fontSize: 11, color: C.dim }}>
+          Re-derives from the same closed-basket history as the cross-sectional card above (a separate analytical question — which legs to skip — not a RAW/FILTERED toggle variant of it).
+        </div>
         {wcf ? (
           <>
             <div style={{ display: 'flex', flexWrap: 'wrap', borderBottom: `1px solid ${C.border}` }}>
@@ -506,6 +576,17 @@ function ResearchDashboardInner() {
         ) : <div style={{ padding: 16, color: C.dim }}>computing (fetches real candles on first load)…</div>}
       </Card>
 
+      {/* 5 — Research & Innovation Lanes: the 5 shadow measurement lanes (exit-brain / funding-carry /
+          btc-leadlag-snap / meta-label / liq-recoil), one data-maturity table — see
+          InnovationLanesCard.tsx. Positioned after the Cross-Sectional composite above since none of
+          these 5 lanes has traded or proven anything yet (all pending edgeReady thresholds), unlike
+          the live-executing cross-sectional strategy. */}
+      <InnovationLanesCard />
+
+      {/* 6 — Moonshot lottery: stat strip + market-calm note always visible; universe symbol list and
+          histogram/reject-reasons/recent-log fold into Disclosures (2026-07-23 declutter) — the
+          histogram/log shape doesn't reduce to one row without losing the "why rejected" diagnostic,
+          so this stays its own card rather than folding into the Innovation Lanes table above. */}
       <Card
         title="Moonshot lottery — burst hunter (fokus MEME)"
         subtitle="Measurement-only: scan universe MEME COIN tiap cycle untuk mover yang lagi meledak (1m volume/price surge), skor 0–100, LOG signal-atau-reject. Universe = seed meme divalidasi runtime ke exchangeInfo Binance (simbol delisted/typo dibuang otomatis). Tetap NOL order — eksekusi live (kalau nanti) build terpisah yang lu trigger sendiri."
@@ -522,49 +603,56 @@ function ResearchDashboardInner() {
               <Stat label="Trades today" value={`${moon.daily.tradesToday} (100x: ${moon.daily.trades100xToday})`} color={C.dim} />
             </div>
             <div style={{ padding: '10px 16px' }}>
-              {moon.lastCycle?.universe && moon.lastCycle.universe.length > 0 && (
-                <div style={{ fontSize: 11, color: C.dim, marginBottom: 8 }}>
-                  universe meme ({moon.lastCycle.universe.length}): {moon.lastCycle.universe.map((s) => s.replace(/USDT$/, '').replace(/^1000|^1M/, '')).join(' · ')}
-                </div>
-              )}
               {moon.marketCalm && (
                 <div style={{ fontSize: 12, color: C.measure, marginBottom: 8 }}>
                   market calm — cycle jalan normal tapi tidak ada mover yang lolos prefilter (bukan lane mati, memang belum ada yang meledak)
                 </div>
               )}
-              <div style={{ display: 'flex', alignItems: 'flex-end', gap: 3, height: 46, marginBottom: 4 }}>
-                {moon.scoreHistogram.map((count, i) => {
-                  const max = Math.max(1, ...moon.scoreHistogram);
-                  return <div key={i} title={`score ${i * 10}–${i * 10 + 9}: ${count}`} style={{ width: 22, height: `${(count / max) * 40 + 2}px`, background: i >= 8 ? C.good : i >= 6 ? C.measure : C.sub, borderRadius: 2 }} />;
-                })}
-              </div>
-              <div style={{ fontSize: 10, color: C.dim, marginBottom: 10 }}>score histogram 0–100 (semua kandidat yang pernah discore — hijau = zona signal)</div>
-              {moon.rejectReasons.length > 0 && (
-                <div style={{ fontSize: 12, color: C.dim, marginBottom: 10 }}>
-                  top reject: {moon.rejectReasons.slice(0, 5).map((r) => `${r.reason} (${r.count})`).join(' · ')}
-                </div>
+              {moon.lastCycle?.universe && moon.lastCycle.universe.length > 0 && (
+                <Disclosure summary={`Universe meme (${moon.lastCycle.universe.length}) ▸`}>
+                  <div style={{ fontSize: 11, color: C.dim }}>
+                    {moon.lastCycle.universe.map((s) => s.replace(/USDT$/, '').replace(/^1000|^1M/, '')).join(' · ')}
+                  </div>
+                </Disclosure>
               )}
-              {moon.recent.length > 0 ? (
-                <div>
-                  {moon.recent.slice(-8).reverse().map((e, idx) => (
-                    <div key={`${e.ts}-${e.symbol}-${idx}`} style={{ display: 'flex', gap: 12, fontSize: 12, padding: '3px 0', borderTop: `1px solid ${C.sub}`, flexWrap: 'wrap' }}>
-                      <span style={{ color: C.dim, width: 70 }}>{ago(e.ts)} ago</span>
-                      <span style={{ color: C.text, fontWeight: 600, width: 80 }}>{e.symbol.replace(/USDT$/, '')}</span>
-                      <span style={{ color: e.decision === 'SIGNAL' ? C.good : C.bad, fontWeight: 700, width: 60 }}>{e.decision}</span>
-                      <span style={{ color: C.dim }}>score {e.moonshotScore}</span>
-                      <span style={{ color: C.dim }}>lev {e.finalLeverage}x{e.isSniper ? ' · sniper' : ''}</span>
-                      <span style={{ color: C.dim, flex: 1, minWidth: 180, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }} title={e.reasons.join('; ')}>{e.reasons[0] ?? ''}</span>
-                    </div>
-                  ))}
+              <Disclosure summary="Detail ▸">
+                <div style={{ display: 'flex', alignItems: 'flex-end', gap: 3, height: 46, marginBottom: 4 }}>
+                  {moon.scoreHistogram.map((count, i) => {
+                    const max = Math.max(1, ...moon.scoreHistogram);
+                    return <div key={i} title={`score ${i * 10}–${i * 10 + 9}: ${count}`} style={{ width: 22, height: `${(count / max) * 40 + 2}px`, background: i >= 8 ? C.good : i >= 6 ? C.measure : C.sub, borderRadius: 2 }} />;
+                  })}
                 </div>
-              ) : (
-                <div style={{ fontSize: 12, color: C.dim }}>belum ada kandidat yang discore — log terisi begitu ada mover yang lolos prefilter</div>
-              )}
+                <div style={{ fontSize: 10, color: C.dim, marginBottom: 10 }}>score histogram 0–100 (semua kandidat yang pernah discore — hijau = zona signal)</div>
+                {moon.rejectReasons.length > 0 && (
+                  <div style={{ fontSize: 12, color: C.dim, marginBottom: 10 }}>
+                    top reject: {moon.rejectReasons.slice(0, 5).map((r) => `${r.reason} (${r.count})`).join(' · ')}
+                  </div>
+                )}
+                {moon.recent.length > 0 ? (
+                  <div>
+                    {moon.recent.slice(-8).reverse().map((e, idx) => (
+                      <div key={`${e.ts}-${e.symbol}-${idx}`} style={{ display: 'flex', gap: 12, fontSize: 12, padding: '3px 0', borderTop: `1px solid ${C.sub}`, flexWrap: 'wrap' }}>
+                        <span style={{ color: C.dim, width: 70 }}>{ago(e.ts)} ago</span>
+                        <span style={{ color: C.text, fontWeight: 600, width: 80 }}>{e.symbol.replace(/USDT$/, '')}</span>
+                        <span style={{ color: e.decision === 'SIGNAL' ? C.good : C.bad, fontWeight: 700, width: 60 }}>{e.decision}</span>
+                        <span style={{ color: C.dim }}>score {e.moonshotScore}</span>
+                        <span style={{ color: C.dim }}>lev {e.finalLeverage}x{e.isSniper ? ' · sniper' : ''}</span>
+                        <span style={{ color: C.dim, flex: 1, minWidth: 180, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }} title={e.reasons.join('; ')}>{e.reasons[0] ?? ''}</span>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div style={{ fontSize: 12, color: C.dim }}>belum ada kandidat yang discore — log terisi begitu ada mover yang lolos prefilter</div>
+                )}
+              </Disclosure>
             </div>
           </>
         ) : <div style={{ padding: 16, color: C.dim }}>loading moonshot report…</div>}
       </Card>
 
+      {/* 7 — new-coin-radar: kept standalone (its shape doesn't merge cleanly with anything above).
+          2026-07-23 declutter: default to first 5 entries with a "show all" control, and each coin's
+          description truncates behind a per-row "more" toggle instead of a static hard cut. */}
       <Card
         title="New-coin radar — listing baru + profil fundamental"
         subtitle={`Perpetual USDT yang baru listing di Binance (≤${radar?.maxAgeDays ?? 120} hari, dari onboardDate resmi exchange), di luar universe lama. Tiap coin diprofil dari CoinGecko: apa proyeknya, teknologi/kategori, mcap vs FDV (risiko dilusi), aktivitas developer. Report-only — promosi ke universe tetap keputusan operator.`}
@@ -574,7 +662,7 @@ function ResearchDashboardInner() {
           radar.coins.length > 0 ? (
             <div style={{ padding: '6px 16px 14px' }}>
               {radar.lastError && <div style={{ color: C.bad, fontSize: 12, padding: '6px 0' }}>radar error: {radar.lastError}</div>}
-              {radar.coins.map((c) => (
+              {(radarShowAll ? radar.coins : radar.coins.slice(0, 5)).map((c) => (
                 <div key={c.symbol} style={{ borderTop: `1px solid ${C.sub}`, padding: '10px 0' }}>
                   <div style={{ display: 'flex', gap: 12, alignItems: 'baseline', flexWrap: 'wrap' }}>
                     <span style={{ color: C.text, fontWeight: 700, fontSize: 14 }}>{c.symbol.replace(/USDT$/, '')}</span>
@@ -600,11 +688,29 @@ function ResearchDashboardInner() {
                   </div>
                   {c.fundamentals?.description && (
                     <div style={{ fontSize: 12, color: C.text, opacity: 0.85, marginTop: 6, lineHeight: 1.5, maxWidth: 900 }}>
-                      {c.fundamentals.description.length > 300 ? `${c.fundamentals.description.slice(0, 300)}…` : c.fundamentals.description}
+                      {radarExpandedDescs.has(c.symbol) || c.fundamentals.description.length <= 300
+                        ? c.fundamentals.description
+                        : `${c.fundamentals.description.slice(0, 300)}…`}
+                      {c.fundamentals.description.length > 300 && (
+                        <button
+                          onClick={() => toggleRadarDesc(c.symbol)}
+                          style={{ marginLeft: 6, background: 'none', border: 'none', color: C.measure, cursor: 'pointer', fontSize: 11, padding: 0 }}
+                        >
+                          {radarExpandedDescs.has(c.symbol) ? 'less' : 'more'}
+                        </button>
+                      )}
                     </div>
                   )}
                 </div>
               ))}
+              {radar.coins.length > 5 && (
+                <button
+                  onClick={() => setRadarShowAll((v) => !v)}
+                  style={{ marginTop: 10, background: 'none', border: `1px solid ${C.border}`, borderRadius: 4, color: C.measure, cursor: 'pointer', fontSize: 11, padding: '3px 8px' }}
+                >
+                  {radarShowAll ? 'show fewer' : `show all ${radar.coins.length}`}
+                </button>
+              )}
               <div style={{ fontSize: 11, color: C.dim, marginTop: 10 }}>
                 Skor = likuiditas (log vol 24h) + circulating ratio + rank mcap + aktivitas dev + kelengkapan identitas. Skor — / flag NO_FUNDAMENTAL_DATA = datanya belum ada, bukan nol.
               </div>
@@ -616,6 +722,11 @@ function ResearchDashboardInner() {
           )
         ) : <div style={{ padding: 16, color: C.dim }}>loading new-coin radar…</div>}
       </Card>
+
+      {/* 8 — Crisis Mode (2026-07-22): geopolitical-escalation + market-shock confirmation,
+          report-only, testnet/research — see CrisisModeCard.tsx. Ships off by default. Placed last —
+          it's the least mature/most speculative signal on this page (detect-only, not yet turned on). */}
+      <CrisisModeCard />
 
     </div>
   );

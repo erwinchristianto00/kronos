@@ -39,6 +39,8 @@ import { dirname, resolve } from "node:path";
 
 import { BinanceFuturesPrivateError, resolveConfirmedFillPrice, roundToStep, type BinanceFuturesPrivateClient } from "./binance-futures-private.js";
 import { clusterOf, isMajorSymbol } from "./correlation-clusters.js";
+import type { CortexRealAttributionStore } from "./cortex-real-attribution.js";
+import type { PositionPathRecorder } from "./position-path-recorder.js";
 
 export type SingleSymbolExecClient = Pick<
   BinanceFuturesPrivateClient,
@@ -183,6 +185,13 @@ export interface SingleSymbolPosition {
    *  realizedPartial*Usd — prevents re-counting the SAME entry trade's fee/pnl on a second (or
    *  third) partial-fill cycle, since getUserTrades is re-queried from openedAt every time. */
   entryFeeRealized?: boolean;
+  /** CORTEX real-USDT attribution capture (2026-07-21, report-only — see cortex-real-attribution.ts):
+   *  the allocation weight this executor's sizing ACTUALLY applied to this entry (laneWeightPct —
+   *  wired to laneSelectionWeightPctForLane in app.ts, so it includes any active CORTEX promoted
+   *  tilt) and the operator's untouched static table weight (rawLaneWeightPct), both frozen AT OPEN
+   *  time. Undefined on positions persisted before this feature — those are never attributed. */
+  cortexAppliedWeightPct?: number;
+  cortexRawStaticWeightPct?: number;
 }
 
 interface SingleSymbolExecutorState {
@@ -294,6 +303,21 @@ export interface SingleSymbolLaneExecutorOptions {
   isAllowedReason?: () => string | null;
   /** Operator lane allocation weight. 100 = normal size; 0 = blocked. */
   laneWeightPct?: () => number;
+  /** CORTEX real-USDT attribution (2026-07-21, report-only): the operator's untouched static
+   *  table weight for this lane (rawLaneAllocationWeightPctForLane — NEVER consults CORTEX's
+   *  promoted override, unlike laneWeightPct above which app.ts wires to
+   *  laneSelectionWeightPctForLane). Omit and the raw side simply mirrors laneWeightPct, making
+   *  every tiltShare 0 — an unwired instance can never fabricate CORTEX influence. */
+  rawLaneWeightPct?: () => number;
+  /** CORTEX real-USDT attribution sink (see cortex-real-attribution.ts). Optional and report-only:
+   *  every use is wrapped so a failure can NEVER affect this executor's trading or settlement. */
+  cortexRealAttribution?: CortexRealAttributionStore;
+  /** Dense per-tick R-path recorder (2026-07-22, report-only — see position-path-recorder.ts).
+   *  Same optional posture as cortexRealAttribution: omit and this executor is byte-for-byte
+   *  unchanged. When present, monitorOpenPositions appends one (tsMs, currentR) sample per OPEN
+   *  position per tick and both close finalizations mark the path closed — every use is wrapped
+   *  so a failure can NEVER affect trading or settlement. */
+  positionPathRecorder?: PositionPathRecorder;
   /** Base position notional in USD, BEFORE allocation-weight scaling. */
   legUsd: () => number;
   leverage: () => number;
@@ -397,6 +421,9 @@ export class SingleSymbolLaneExecutor {
   private readonly isAllowed: () => boolean;
   private readonly isAllowedReasonFn: () => string | null;
   private readonly laneWeightPctFn: () => number;
+  private readonly rawLaneWeightPctFn: (() => number) | null;
+  private readonly cortexRealAttribution: CortexRealAttributionStore | null;
+  private readonly positionPathRecorder: PositionPathRecorder | null;
   private readonly legUsdFn: () => number;
   private readonly leverageFn: () => number;
   private readonly maxOpenPositionsFn: () => number;
@@ -440,6 +467,9 @@ export class SingleSymbolLaneExecutor {
     this.isAllowed = opts.isAllowed;
     this.isAllowedReasonFn = opts.isAllowedReason ?? (() => null);
     this.laneWeightPctFn = opts.laneWeightPct ?? (() => 100);
+    this.rawLaneWeightPctFn = opts.rawLaneWeightPct ?? null;
+    this.cortexRealAttribution = opts.cortexRealAttribution ?? null;
+    this.positionPathRecorder = opts.positionPathRecorder ?? null;
     this.legUsdFn = opts.legUsd;
     this.leverageFn = opts.leverage;
     this.maxOpenPositionsFn = opts.maxOpenPositions ?? (() => 1);
@@ -489,6 +519,94 @@ export class SingleSymbolLaneExecutor {
     const pct = Number(this.laneWeightPctFn());
     if (!Number.isFinite(pct)) return 100;
     return Math.max(0, Math.min(100, pct));
+  }
+
+  /** Raw-static counterpart of allocationWeightPct (CORTEX real-USDT attribution, 2026-07-21):
+   *  same clamping, but reads the operator's untouched table weight. When rawLaneWeightPct isn't
+   *  wired, mirrors the applied weight so tiltShare is 0 by construction — an unwired instance
+   *  must never fabricate CORTEX influence. */
+  private rawAllocationWeightPct(): number {
+    if (!this.rawLaneWeightPctFn) return this.allocationWeightPct();
+    const pct = Number(this.rawLaneWeightPctFn());
+    if (!Number.isFinite(pct)) return 100;
+    return Math.max(0, Math.min(100, pct));
+  }
+
+  /** CORTEX real-USDT attribution write for one FULLY closed position (report-only). Called from
+   *  the two finalization blocks every close path funnels through — settleIfStopTriggered's
+   *  full-close block (exchange-side stop fill) and closePosition's finalization (policy exit,
+   *  manual close, orderly kill-switch wind-down) — right next to their notifyPositionClosed
+   *  calls. A partial stop fill is deliberately NOT recorded: the final leg's netPnlUsd already
+   *  folds the banked partial P&L in, so recording only at full close books the position's whole
+   *  lifetime exactly once. Wrapped so a failure can NEVER affect settlement or trading. */
+  private recordCortexRealAttribution(pos: SingleSymbolPosition): void {
+    try {
+      const store = this.cortexRealAttribution;
+      if (!store) return;
+      // Positions persisted before the capture fields existed carry no open-time weights — skip
+      // rather than invent a tilt share after the fact.
+      if (typeof pos.cortexAppliedWeightPct !== "number" || typeof pos.cortexRawStaticWeightPct !== "number") return;
+      if (typeof pos.netPnlUsd !== "number" || !Number.isFinite(pos.netPnlUsd)) return;
+      store.recordClose({
+        recordId: `ssle:${this.laneId}:${pos.positionId}`,
+        closedAtIso: pos.closedAt ?? this.nowIso(),
+        laneId: this.laneId,
+        symbol: pos.symbol,
+        realizedPnlUsd: pos.netPnlUsd,
+        appliedWeightPct: pos.cortexAppliedWeightPct,
+        rawStaticWeightPct: pos.cortexRawStaticWeightPct,
+      });
+    } catch {
+      // report-only bookkeeping — a failure here must NEVER affect trading
+    }
+  }
+
+  /** Stable dense-path key for one position — the SAME identity scheme
+   *  recordCortexRealAttribution's recordId uses. */
+  private positionPathKey(pos: SingleSymbolPosition): string {
+    return `ssle:${this.laneId}:${pos.positionId}`;
+  }
+
+  /** Dense R-path sample for one OPEN position (2026-07-22, report-only — see
+   *  position-path-recorder.ts): the signed mark-R this tick, same favorableR() formula the exit
+   *  policies consume. deferSave batches the whole tick's samples into monitorOpenPositions'
+   *  single flush(). Wrapped so a failure can NEVER affect trading. */
+  private recordPositionPathTick(pos: SingleSymbolPosition, mark: number, tsMs: number): void {
+    try {
+      const recorder = this.positionPathRecorder;
+      if (!recorder) return;
+      const currentR = favorableR(pos.direction, pos.entryPrice, pos.stopPrice, mark);
+      if (!Number.isFinite(currentR) || !Number.isFinite(tsMs)) return;
+      recorder.recordTick(this.positionPathKey(pos), tsMs, currentR, {
+        meta: { laneId: this.laneId, symbol: pos.symbol, direction: pos.direction, source: "executor" },
+        deferSave: true,
+      });
+    } catch {
+      // report-only bookkeeping — a failure here must NEVER affect trading
+    }
+  }
+
+  /** Dense R-path close handoff (2026-07-22, report-only). Called from the SAME two finalization
+   *  blocks recordCortexRealAttribution is (settleIfStopTriggered's full close + closePosition) —
+   *  every close path funnels through one of them exactly once. finalR is the RAW mark-R at the
+   *  recorded exit price (price-based, so a partial-fill-mutated qty cannot skew it); when the
+   *  exit price is unknown the recorder falls back to the last recorded tick. Wrapped so a
+   *  failure can NEVER affect settlement or trading. */
+  private markPositionPathClosed(pos: SingleSymbolPosition): void {
+    try {
+      const recorder = this.positionPathRecorder;
+      if (!recorder) return;
+      const closedMs = Date.parse(pos.closedAt ?? this.nowIso());
+      const finalR =
+        typeof pos.exitPrice === "number" && Number.isFinite(pos.exitPrice)
+          ? favorableR(pos.direction, pos.entryPrice, pos.stopPrice, pos.exitPrice)
+          : undefined;
+      recorder.markClosed(this.positionPathKey(pos), Number.isFinite(closedMs) ? closedMs : Date.now(), {
+        finalR: Number.isFinite(finalR) ? finalR : undefined,
+      });
+    } catch {
+      // report-only bookkeeping — a failure here must NEVER affect trading
+    }
   }
 
   private effectiveLegUsd(): number {
@@ -807,6 +925,10 @@ export class SingleSymbolLaneExecutor {
     // (see onPositionClosed's doc comment) — every full close, stop-triggered or policy-decided,
     // must reach it, not just the legacy mirror pipeline's own applyRealizedToLedger.
     this.notifyPositionClosed(netUsd);
+    // CORTEX real-USDT attribution (2026-07-21, report-only, fail-safe — see its doc comment).
+    this.recordCortexRealAttribution(pos);
+    // Dense R-path close handoff (2026-07-22, report-only, fail-safe — see its doc comment).
+    this.markPositionPathClosed(pos);
     return true;
   }
 
@@ -865,6 +987,10 @@ export class SingleSymbolLaneExecutor {
       const mark = markBySymbol.get(pos.symbol);
       if (mark === undefined) continue; // no mark data this tick — never force a decision on partial info
 
+      // Dense R-path tick (2026-07-22, report-only — see position-path-recorder.ts). Fail-safe:
+      // wrapped inside; absent recorder = no-op, zero behavior change.
+      this.recordPositionPathTick(pos, mark, new Date(this.nowIso()).getTime());
+
       const msHeld = new Date(this.nowIso()).getTime() - new Date(pos.openedAt).getTime();
       const exitContext = {
         direction: pos.direction,
@@ -910,6 +1036,12 @@ export class SingleSymbolLaneExecutor {
       }
     }
     if (stamped) this.store.save();
+    // Batched persist of this tick's dense R-path samples (report-only; no-op while clean).
+    try {
+      this.positionPathRecorder?.flush();
+    } catch {
+      // report-only bookkeeping — a failure here must NEVER affect trading
+    }
   }
 
   private async closePosition(pos: SingleSymbolPosition, reason: string): Promise<void> {
@@ -1010,6 +1142,10 @@ export class SingleSymbolLaneExecutor {
       // 2026-07-19 real-money audit fix: see settleIfStopTriggered's identical call — this covers
       // every OTHER close path (policy exit, manual close, orderly kill-switch wind-down).
       this.notifyPositionClosed(netUsd);
+      // CORTEX real-USDT attribution (2026-07-21, report-only, fail-safe — see its doc comment).
+      this.recordCortexRealAttribution(pos);
+      // Dense R-path close handoff (2026-07-22, report-only, fail-safe — see its doc comment).
+      this.markPositionPathClosed(pos);
     } finally {
       this.closingPositionIds.delete(pos.positionId);
     }
@@ -1172,7 +1308,13 @@ export class SingleSymbolLaneExecutor {
       st.attemptedObservationIds = Array.from(attempted).slice(-500);
       this.store.save();
 
-      const legUsd = this.effectiveLegUsd();
+      // CORTEX real-USDT attribution capture (2026-07-21): freeze the applied + raw-static weights
+      // at this exact sizing moment, and derive legUsd from the SAME applied number (identical math
+      // to effectiveLegUsd()) so the captured pair is guaranteed to be what actually sized this
+      // entry — never a re-read that could have moved between here and the position record below.
+      const cortexAppliedWeightPct = this.allocationWeightPct();
+      const cortexRawStaticWeightPct = this.rawAllocationWeightPct();
+      const legUsd = this.legUsdFn() * (cortexAppliedWeightPct / 100);
       if (!(legUsd > 0)) {
         // 2026-07-19 real-money audit fix: see the notional-cap skip's identical comment above —
         // this was another silent structural rejection.
@@ -1278,6 +1420,8 @@ export class SingleSymbolLaneExecutor {
           grossPnlUsd: null,
           feeEstimateUsd: null,
           netPnlUsd: null,
+          cortexAppliedWeightPct,
+          cortexRawStaticWeightPct,
         };
         st.positions.push(position);
         this.store.save();

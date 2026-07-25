@@ -60,6 +60,25 @@ export interface ExitInput {
   thesisIntact?: boolean | null;
 
   scaleOutFraction?: number; // default 0.4
+
+  /** Candidate-identifying salt (e.g. `${laneId}::${symbolOrBasketId}::${side}::${signalId|positionId}` —
+   *  mirrors four-brain-live-gather.ts's own identityKey()), folded into decisionId below. WHY: mirrors the
+   *  2026-07-24 Entry Brain fix exactly. fourBrainDecisionId is a pure hash of (prefix, asOfMs, key); with
+   *  key = `${side}:${action}` alone, ANY two exit candidates evaluated in the same tick that land on the
+   *  same side+action bucket (a small, fixed number of buckets) get a byte-identical decisionId even though
+   *  they are genuinely DIFFERENT decisions (different position/symbol/lane). Verified empirically
+   *  (2026-07-24): real testnet journal data shows 85.5% of exit candidates within a tick collide on this
+   *  decisionId (one tick had 9 candidates across 9 symbols, 8 sharing the exact same id). Confirmed
+   *  CURRENTLY HARMLESS — no Exit-outcome ledger/reconciler analogous to direction-entry-outcome-store.ts
+   *  exists yet to silently drop a colliding candidate's outcome, and the real Exit Brain shadow-counterfactual
+   *  store (exit-brain-shadow.ts) dedupes on a separate, already-unique `sp:${positionId}:${variant}` key —
+   *  but any FUTURE Exit-outcome ledger built the same way Entry's was would inherit the identical silent-loss
+   *  bug. Fixed preventively. Callers SHOULD always pass a value that is unique per genuinely-distinct
+   *  candidate within one tick (e.g. the gather layer's own identityKey(), which exit-candidate dedup already
+   *  guarantees is unique per kept candidate) — null/absent falls back to the pre-fix side:action-only key
+   *  (no worse than before, but re-exposes the collision risk). The SAME candidate re-decided at the same
+   *  asOfMs (e.g. immediately after a crash-restart) still yields the SAME decisionId, preserving idempotency. */
+  candidateKey?: string | null;
 }
 
 /** True when the incumbent hard stop is already breached or the kill switch is latched. */
@@ -187,9 +206,14 @@ export function decideExit(input: ExitInput): ExitDecision {
     reasons.push(`premature-exit risk: continuation prob ${continuationProbability.toFixed(2)} still favors staying`);
   }
 
+  // Fold the candidate identity (when the caller supplies one) into the decisionId key so genuinely
+  // different candidates sharing side+action in the same tick never collide — see ExitInput.candidateKey's
+  // doc comment for the full collision mechanism this closes. A missing/empty candidateKey falls back to
+  // the pre-fix side:action-only key, unchanged.
+  const candidateSalt = typeof input.candidateKey === "string" && input.candidateKey.length > 0 ? `:${input.candidateKey}` : "";
   return {
     schemaVersion: EXIT_SCHEMA_VERSION,
-    decisionId: fourBrainDecisionId("exit", nowMs, `${input.side}:${action}`),
+    decisionId: fourBrainDecisionId("exit", nowMs, `${input.side}:${action}${candidateSalt}`),
     asOfMs: nowMs,
     validUntilMs: nowMs + Math.max(0, input.validityMs || 0),
     action,

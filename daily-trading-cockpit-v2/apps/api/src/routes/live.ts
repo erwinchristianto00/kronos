@@ -20,9 +20,20 @@ import { getPanicWashoutStore, buildPanicWashoutReport, PWR_PAPER_LANE_ID } from
 import { getCompositeEstimatorStore, buildCompositeEstimatorReport, ceLaneIdForBucket, type CEBucket } from "../lib/composite-estimator-edge.js";
 import { LANE_SELECTOR_V2_LIVE_SUPPORTED_VARIANT_IDS, laneSelectorV2LaneId } from "../lib/lane-selector-v2.js";
 import { buildLiveWalletReconciliationReport, resolveDayUtc } from "../lib/wallet-reconciliation.js";
+import { getCortexRealAttributionStore } from "../lib/cortex-real-attribution.js";
 import { sumExternalClosedFeesUsd, sumExternalRealizedPnlUsd } from "../lib/live-executor-wiring.js";
 import type { UnifiedTestnetOrchestrator } from "../lib/unified-testnet-orchestrator.js";
 import type { UnifiedTestnetProposalStore } from "../lib/unified-testnet-proposal-source.js";
+import {
+  CopyAuditLogger,
+  CopyReplayGuard,
+  copyPayloadSha256,
+  isLoopbackAddress,
+  signCopyRequest,
+  verifyCopyRequest,
+  type CopyAuditEvent,
+  type CopyAuthHeaders,
+} from "../lib/copy-to-live-security.js";
 
 /** 2026-07-10: was named PROFIT_CORE_SHORT_ENABLED (the flag), but the lane id itself only ever
  *  appears inline in realtime-short-mirror.ts (PROFIT_CORE_SHORT_TRAIL_LANE_ID) — not re-exported
@@ -587,8 +598,26 @@ export async function registerLiveRoutes(
     unifiedOrchestrator?: () => UnifiedTestnetOrchestrator | null;
     unifiedProposalStore?: () => UnifiedTestnetProposalStore | null;
     singleSymbolPriceTimeline?: () => SingleSymbolPriceTimelineService | null;
+    /** Test seam only. Production uses durable data-dir backed defaults. */
+    copySecurity?: {
+      secret?: string;
+      replayGuard?: CopyReplayGuard;
+      auditLogger?: CopyAuditLogger;
+      nowMs?: () => number;
+    };
   } = {},
 ): Promise<void> {
+  const copySecurityDataDir = process.env.LIVE_COPY_SECURITY_DATA_DIR ?? "data";
+  const copySecret = (): string => opts.copySecurity?.secret ?? process.env.LIVE_COPY_SHARED_SECRET ?? "";
+  const copyReplayGuard = opts.copySecurity?.replayGuard ?? new CopyReplayGuard(copySecurityDataDir);
+  const copyAuditLogger = opts.copySecurity?.auditLogger ?? new CopyAuditLogger(copySecurityDataDir);
+  const copyNowMs = (): number => opts.copySecurity?.nowMs?.() ?? Date.now();
+  const copyHeader = (headers: Record<string, unknown>, name: string): string | undefined => {
+    const value = headers[name];
+    return typeof value === "string" ? value : Array.isArray(value) ? String(value[0] ?? "") : undefined;
+  };
+  const appendCopyAudit = (event: Omit<CopyAuditEvent, "at">): { ok: boolean; reason: string | null } =>
+    copyAuditLogger.append({ ...event, at: new Date(copyNowMs()).toISOString() });
   const allCrossSectionalExecutors = () =>
     [opts.crossSectionalExecutor?.() ?? null, opts.crossSectionalTrendExecutor?.() ?? null, opts.crossSectionalMixedExecutor?.() ?? null].filter(
       (exec): exec is CrossSectionalExecutor => exec !== null,
@@ -689,10 +718,6 @@ export async function registerLiveRoutes(
   // geometry is preserved relative to entry; the protective stop is placed before
   // the intent is considered OPEN (same machinery as the normal mirror).
   app.post("/api/live/copy-intent", async (request, reply) => {
-    if (!engine) {
-      reply.code(503);
-      return { ok: false, reason: "live execution disabled" };
-    }
     const body = (request.body ?? {}) as {
       confirm?: string;
       symbol?: string;
@@ -705,8 +730,90 @@ export async function registerLiveRoutes(
       sourceLaneId?: string | null;
       sourcePaperOrderId?: string | null;
       sourceEnv?: string | null;
+      idempotencyKey?: string | null;
     };
+    const remoteAddress = request.ip ?? request.socket.remoteAddress ?? null;
+    if (!isLoopbackAddress(remoteAddress)) {
+      appendCopyAudit({
+        stage: "RECEIVER",
+        outcome: "REJECTED",
+        reason: "non-loopback source",
+        requestId: request.id,
+        idempotencyKey: body.idempotencyKey ?? null,
+        sourcePaperOrderId: body.sourcePaperOrderId ?? null,
+        symbol: body.symbol ?? null,
+        direction: body.direction ?? null,
+        payloadSha256: copyPayloadSha256(body),
+        remoteAddress,
+      });
+      reply.code(403);
+      return { ok: false, reason: "copy receiver is private and accepts loopback relay traffic only" };
+    }
+    if (!engine) {
+      reply.code(503);
+      return { ok: false, reason: "live execution disabled" };
+    }
+    const authHeaders: Partial<CopyAuthHeaders> = {
+      timestamp: copyHeader(request.headers, "x-kronos-copy-timestamp"),
+      nonce: copyHeader(request.headers, "x-kronos-copy-nonce"),
+      idempotencyKey: copyHeader(request.headers, "x-kronos-copy-idempotency-key"),
+      signature: copyHeader(request.headers, "x-kronos-copy-signature"),
+    };
+    const verified = verifyCopyRequest({
+      secret: copySecret(),
+      body,
+      headers: authHeaders,
+      replayGuard: copyReplayGuard,
+      nowMs: copyNowMs(),
+    });
+    if (!verified.ok) {
+      appendCopyAudit({
+        stage: "RECEIVER",
+        outcome: "REJECTED",
+        reason: verified.reason,
+        requestId: request.id,
+        idempotencyKey: authHeaders.idempotencyKey ?? null,
+        sourcePaperOrderId: body.sourcePaperOrderId ?? null,
+        symbol: body.symbol ?? null,
+        direction: body.direction ?? null,
+        payloadSha256: verified.payloadSha256,
+        remoteAddress,
+      });
+      reply.code(verified.reason?.includes("secret") ? 503 : 401);
+      return { ok: false, reason: verified.reason };
+    }
+    if (
+      typeof body.idempotencyKey !== "string" ||
+      body.idempotencyKey !== authHeaders.idempotencyKey
+    ) {
+      appendCopyAudit({
+        stage: "RECEIVER",
+        outcome: "REJECTED",
+        reason: "body/header idempotency key mismatch",
+        requestId: request.id,
+        idempotencyKey: authHeaders.idempotencyKey ?? null,
+        sourcePaperOrderId: body.sourcePaperOrderId ?? null,
+        symbol: body.symbol ?? null,
+        direction: body.direction ?? null,
+        payloadSha256: verified.payloadSha256,
+        remoteAddress,
+      });
+      reply.code(400);
+      return { ok: false, reason: "body/header idempotency key mismatch" };
+    }
     if (body.confirm !== "COPY") {
+      appendCopyAudit({
+        stage: "RECEIVER",
+        outcome: "REJECTED",
+        reason: "explicit COPY confirmation missing",
+        requestId: request.id,
+        idempotencyKey: body.idempotencyKey,
+        sourcePaperOrderId: body.sourcePaperOrderId ?? null,
+        symbol: body.symbol ?? null,
+        direction: body.direction ?? null,
+        payloadSha256: verified.payloadSha256,
+        remoteAddress,
+      });
       reply.code(400);
       return { ok: false, reason: 'copy requires body {"confirm":"COPY", ...spec} — this opens a REAL position' };
     }
@@ -718,8 +825,36 @@ export async function registerLiveRoutes(
       typeof body.stopLossPrice !== "number" ||
       typeof body.tp1Price !== "number"
     ) {
+      appendCopyAudit({
+        stage: "RECEIVER",
+        outcome: "REJECTED",
+        reason: "invalid copy specification",
+        requestId: request.id,
+        idempotencyKey: body.idempotencyKey,
+        sourcePaperOrderId: body.sourcePaperOrderId ?? null,
+        symbol: body.symbol ?? null,
+        direction: body.direction ?? null,
+        payloadSha256: verified.payloadSha256,
+        remoteAddress,
+      });
       reply.code(400);
       return { ok: false, reason: "spec requires symbol, direction, qty, entryPrice, stopLossPrice, tp1Price" };
+    }
+    const acceptedAudit = appendCopyAudit({
+      stage: "RECEIVER",
+      outcome: "ACCEPTED",
+      reason: null,
+      requestId: request.id,
+      idempotencyKey: body.idempotencyKey,
+      sourcePaperOrderId: body.sourcePaperOrderId ?? null,
+      symbol: body.symbol,
+      direction: body.direction,
+      payloadSha256: verified.payloadSha256,
+      remoteAddress,
+    });
+    if (!acceptedAudit.ok) {
+      reply.code(503);
+      return { ok: false, reason: acceptedAudit.reason };
     }
     const result = await engine.copyExternalIntent({
       symbol: body.symbol,
@@ -732,6 +867,23 @@ export async function registerLiveRoutes(
       sourceLaneId: body.sourceLaneId ?? null,
       sourcePaperOrderId: body.sourcePaperOrderId ?? null,
       sourceEnv: body.sourceEnv ?? null,
+      idempotencyKey: body.idempotencyKey,
+    });
+    appendCopyAudit({
+      stage: "RECEIVER",
+      outcome: result.reason?.startsWith("idempotent replay")
+        ? "IDEMPOTENT_REPLAY"
+        : result.ok
+          ? "ACCEPTED"
+          : "FAILED",
+      reason: result.reason,
+      requestId: request.id,
+      idempotencyKey: body.idempotencyKey,
+      sourcePaperOrderId: body.sourcePaperOrderId ?? null,
+      symbol: body.symbol,
+      direction: body.direction,
+      payloadSha256: verified.payloadSha256,
+      remoteAddress,
     });
     if (!result.ok) reply.code(409);
     return result;
@@ -741,11 +893,20 @@ export async function registerLiveRoutes(
   // live" button. Looks up the OPEN testnet intent and forwards its exact spec to
   // the mainnet instance (LIVE_COPY_TARGET_URL, default the local 3103 process).
   app.post("/api/live/copy-to-live", async (request, reply) => {
+    const remoteAddress = request.ip ?? request.socket.remoteAddress ?? null;
+    if (!isLoopbackAddress(remoteAddress)) {
+      reply.code(403);
+      return { ok: false, reason: "copy relay is reachable only through the local authenticated reverse proxy" };
+    }
     if (!engine) {
       reply.code(503);
       return { ok: false, reason: "live execution disabled" };
     }
-    const body = (request.body ?? {}) as { paperOrderId?: string };
+    const body = (request.body ?? {}) as { paperOrderId?: string; confirm?: string };
+    if (body.confirm !== "COPY_TO_LIVE") {
+      reply.code(400);
+      return { ok: false, reason: 'copy relay requires {"confirm":"COPY_TO_LIVE","paperOrderId":"..."}' };
+    }
     if (typeof body.paperOrderId !== "string" || body.paperOrderId.length === 0) {
       reply.code(400);
       return { ok: false, reason: 'body must be {"paperOrderId":"<open intent id>"}' };
@@ -756,26 +917,121 @@ export async function registerLiveRoutes(
       return { ok: false, reason: lookup.reason };
     }
     const target = process.env.LIVE_COPY_TARGET_URL ?? "http://127.0.0.1:3103";
-    const spec = { confirm: "COPY", ...lookup.spec, sourceEnv: "testnet" };
+    let targetUrl: URL;
+    try {
+      targetUrl = new URL(target);
+    } catch {
+      reply.code(503);
+      return { ok: false, reason: "LIVE_COPY_TARGET_URL is invalid" };
+    }
+    if (
+      targetUrl.protocol !== "http:" ||
+      !isLoopbackAddress(targetUrl.hostname) ||
+      targetUrl.username ||
+      targetUrl.password
+    ) {
+      reply.code(503);
+      return { ok: false, reason: "LIVE_COPY_TARGET_URL must be an unauthenticated loopback http URL" };
+    }
+    const secret = copySecret();
+    if (secret.length < 32) {
+      reply.code(503);
+      return { ok: false, reason: "LIVE_COPY_SHARED_SECRET is missing or shorter than 32 characters" };
+    }
+    const idempotencyKey = `testnet:${body.paperOrderId}`;
+    const spec = { confirm: "COPY", ...lookup.spec, sourceEnv: "testnet", idempotencyKey };
+    const auth = signCopyRequest({
+      secret,
+      body: spec,
+      idempotencyKey,
+      nowMs: copyNowMs(),
+    });
+    const payloadSha256 = copyPayloadSha256(spec);
+    const acceptedAudit = appendCopyAudit({
+      stage: "RELAY",
+      outcome: "ACCEPTED",
+      reason: null,
+      requestId: request.id,
+      idempotencyKey,
+      sourcePaperOrderId: body.paperOrderId,
+      symbol: lookup.spec.symbol,
+      direction: lookup.spec.direction,
+      payloadSha256,
+      remoteAddress,
+    });
+    if (!acceptedAudit.ok) {
+      reply.code(503);
+      return { ok: false, reason: acceptedAudit.reason };
+    }
+    let timer: ReturnType<typeof setTimeout> | null = null;
     try {
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 20_000);
+      timer = setTimeout(() => controller.abort(), 20_000);
       const response = await fetch(`${target}/api/live/copy-intent`, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: {
+          "content-type": "application/json",
+          "x-kronos-copy-timestamp": auth.timestamp,
+          "x-kronos-copy-nonce": auth.nonce,
+          "x-kronos-copy-idempotency-key": auth.idempotencyKey,
+          "x-kronos-copy-signature": auth.signature,
+        },
         body: JSON.stringify(spec),
         signal: controller.signal,
       });
-      clearTimeout(timer);
-      const payload = (await response.json()) as { ok?: boolean; reason?: string };
+      const responseText = await response.text();
+      let payload: { ok?: boolean; reason?: string } = {};
+      try {
+        payload = responseText ? (JSON.parse(responseText) as { ok?: boolean; reason?: string }) : {};
+      } catch {
+        payload = { ok: false, reason: `live copy returned non-JSON HTTP ${response.status}` };
+      }
       if (!response.ok || payload.ok === false) {
+        appendCopyAudit({
+          stage: "RELAY",
+          outcome: "FAILED",
+          reason: payload.reason ?? `live copy failed (${response.status})`,
+          requestId: request.id,
+          idempotencyKey,
+          sourcePaperOrderId: body.paperOrderId,
+          symbol: lookup.spec.symbol,
+          direction: lookup.spec.direction,
+          payloadSha256,
+          remoteAddress,
+        });
         reply.code(response.status === 200 ? 409 : response.status);
         return { ok: false, reason: payload.reason ?? `live copy failed (${response.status})`, spec };
       }
+      appendCopyAudit({
+        stage: "RELAY",
+        outcome: payload.reason?.startsWith("idempotent replay") ? "IDEMPOTENT_REPLAY" : "ACCEPTED",
+        reason: payload.reason ?? null,
+        requestId: request.id,
+        idempotencyKey,
+        sourcePaperOrderId: body.paperOrderId,
+        symbol: lookup.spec.symbol,
+        direction: lookup.spec.direction,
+        payloadSha256,
+        remoteAddress,
+      });
       return { ok: true, spec, live: payload };
     } catch (error) {
+      appendCopyAudit({
+        stage: "RELAY",
+        outcome: "FAILED",
+        reason: (error as Error).message,
+        requestId: request.id,
+        idempotencyKey,
+        sourcePaperOrderId: body.paperOrderId,
+        symbol: lookup.spec.symbol,
+        direction: lookup.spec.direction,
+        payloadSha256,
+        remoteAddress,
+      });
       reply.code(502);
       return { ok: false, reason: `live instance unreachable: ${(error as Error).message}`, spec };
+    } finally {
+      if (timer) clearTimeout(timer);
     }
   });
 
@@ -875,6 +1131,21 @@ export async function registerLiveRoutes(
       reply.code(502);
       return { ok: false, reason: err instanceof Error ? err.message : "lane evaluation fetch failed" };
     }
+  });
+
+  // 2026-07-22 (CORTEX promoted-tilt audit): report-only visibility into what CORTEX's promotion
+  // pipeline is CURRENTLY installing on this engine. Before this route existed, verifying "what is
+  // CORTEX applying right now" required cross-referencing /api/live/lane-evaluation (single-symbol
+  // lanes only), /api/live/cortex-real-attribution (historical, captured-at-open, not live), and the
+  // raw decision journal (which only carries the β=0 operational and evaluationBeta counterfactual,
+  // never the promoted value) — no single endpoint answered the question directly.
+  app.get("/api/live/cortex-promoted-weights", async (_request, reply) => {
+    if (!engine) {
+      reply.code(503);
+      return { ok: false, reason: "live execution disabled" };
+    }
+    const weights = engine.getCortexPromotedWeights();
+    return { ok: true, active: weights !== null, weights: weights ?? {} };
   });
 
   // Operator close of single-symbol-lane-executor position(s) — the "Single-symbol executor —
@@ -1025,6 +1296,13 @@ export async function registerLiveRoutes(
       return executor.getStatus();
     });
   }
+
+  // CORTEX real-USDT attribution (2026-07-21): realized-dollar share attributable to CORTEX's
+  // promoted weight tilt, per closed trade opened under an active tilt — see
+  // cortex-real-attribution.ts for the definition (tiltShare captured at open, sign-honest).
+  // Report-only reads of the shared singleton store both the engine's close sweep and every
+  // SingleSymbolLaneExecutor write into; no engine/executor instance needed to serve it.
+  app.get("/api/live/cortex-real-attribution", async () => getCortexRealAttributionStore().buildReport());
 
   // Regime auto-pilot status (Tier 1: auto-syncs allocation to detected regime, anti-whipsaw).
   app.get("/api/live/autopilot", async () => {

@@ -1,0 +1,8 @@
+{
+  "instanceId": "3103",
+  "role": "mainnet",
+  "apiPort": 3103,
+  "pm2Process": "dtc-api-live",
+  "manifestPath": "deploy/manifests/3103.json",
+  "protectedFromRuntimeDeployment": true
+}

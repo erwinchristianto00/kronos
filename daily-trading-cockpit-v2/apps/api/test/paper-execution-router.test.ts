@@ -417,6 +417,63 @@ describe("paper-execution-router", () => {
     });
   });
 
+  // [9c] admitPaperOpportunities flushes at most once per call, even with multiple admittable
+  // opportunities (2026-07-23 fix, sibling of [17d]). This is the allocator-sourced admission path
+  // (shadow.ts calls it independently, BEFORE runPaperAdmissionAndResolution, in the same
+  // operator-brief?resolve=1&paper=1 request) — its loop previously called store.add() once per
+  // opportunity with no batch open, so N admitted opportunities in one cycle meant N independent
+  // full-array JSON.stringify+writeFileSync passes of the SAME 100MB+ store (confirmed on testnet)
+  // that runPaperAdmissionAndResolution's own fix targets — this call site was flagged during that
+  // fix's review as capable of reproducing the identical freeze on its own.
+  it("[9c] admitPaperOpportunities does exactly ONE flush across 2 admitted opportunities", () => {
+    const dir = tmpDir();
+    const store = new PaperExecutionRouterStore(dir);
+    const now = new Date();
+    const openedAt = new Date(now.getTime() - 2 * 60_000).toISOString();
+    store.ensurePaperStartAt(new Date(now.getTime() - 5 * 60_000).toISOString());
+    const baseOpportunity = {
+      scanBatchId: "h6trend",
+      direction: "LONG" as const,
+      regime: "Bullish expansion",
+      laneId: H6_TREND_PAPER_LANE_ID,
+      variantId: H6_TREND_PAPER_LANE_ID,
+      controllerMode: "LONG_ONLY",
+      entryPrice: 100,
+      stopLoss: 95,
+      takeProfitLevels: [104],
+      variantExitRule: "scaleout_tp1_trail" as const,
+      fillMode: "taker" as const,
+      plannedStopDistanceBps: 500,
+      oosUnconfirmed: true,
+      paperRiskLabel: "EXPERIMENTAL" as const,
+      paperOrderMode: "HEADLINE" as const,
+      openedAt,
+      provenance: null,
+      provenanceFieldMissing: [],
+    };
+
+    const flushSpy = vi.spyOn(store as unknown as { flush: () => void }, "flush");
+
+    const result = admitPaperOpportunities({
+      store,
+      opportunities: [
+        { ...baseOpportunity, sourceCandidateId: "h6trend:BTCUSDT:123", symbol: "BTCUSDT" },
+        { ...baseOpportunity, sourceCandidateId: "h6trend:ETHUSDT:124", symbol: "ETHUSDT" },
+      ],
+      routerReport: routerOf("Bullish expansion"),
+      gateReport: emptyGate(),
+      now: now.toISOString(),
+    });
+
+    // Sanity: both opportunities were actually admitted (otherwise this test would pass for the
+    // wrong reason) — 2 independent store.add() calls, each a would-be-separate flush pre-fix.
+    expect(result.admitted).toBe(2);
+    expect(store.all.filter((o) => o.paperStatus === "CREATED").length).toBe(2);
+    // The actual regression check: ONE flush for the whole admission pass.
+    expect(flushSpy).toHaveBeenCalledTimes(1);
+    flushSpy.mockRestore();
+  });
+
   // [10] Bearish SHORT_ONLY + scaleout (headline) eligible
   it("[10] Bearish SHORT_ONLY with eligible scaleout lane admits paper order", async () => {
     const dir = tmpDir();
@@ -621,6 +678,94 @@ describe("paper-execution-router", () => {
     expect(store.all.some((o) => o.closeReason === "SOURCE_STALE")).toBe(false);
     expect(store.all.some((o) => o.diagnosticLabel === "SOURCE_TOO_OLD_FOR_PAPER_ADMISSION")).toBe(false);
     expect(report.activeLane).toBe("CG_VARIANT_MATRIX:CG_SCALEOUT_TP1_TRAIL");
+  });
+
+  // [17d] runPaperAdmissionAndResolution flushes at most once per pass (2026-07-23 fix for the
+  // operator-brief?resolve=1&paper=1 90-190s testnet freeze). This function does admission, 4
+  // backlog-cleanup calls (resetTransientFailures / cancelPreGateTrailBacklog /
+  // cancelQuarantinedTrailShortBacklog / reclassifyDemotedFullExitHeadlineOrders — each independently
+  // saving whenever it mutates something) and resolvePaperOrders (already internally batched) — all in
+  // ONE request. On testnet this store's file (paper-execution-router.json) was independently confirmed
+  // at 100MB+ in production; a handful of full-array JSON.stringify+writeFileSync passes of a file that
+  // size, back to back in one request, is what actually froze the whole event loop (every other
+  // concurrent request also hung) for 90-190+s per cycle. This test seeds TWO independent real mutation
+  // triggers — a PAPER_DATA_FAILURE order (resetTransientFailures has real work) and a genuinely
+  // resolvable OPEN order (resolvePaperOrders has real work, using the exact winning-SHORT candle setup
+  // proven at test [RESLV-... win-order-1] above) — to prove 2 distinct save sites collapse to 1 flush.
+  // Spies on the store's own private `flush` — same justification as the sibling fix in
+  // current-guard-variant-matrix.test.ts: Vitest cannot spy on node:fs's writeFileSync (frozen ESM
+  // export), and flush() is this store's own single choke point for an actual disk write anyway.
+  it("[17d] runPaperAdmissionAndResolution does exactly ONE flush across 2 independent mutation sites", async () => {
+    const dir = tmpDir();
+    const vmStore = new CurrentGuardVariantMatrixStore(dir);
+    const vmReport = buildCurrentGuardVariantMatrixReport(vmStore, { capturedAt: new Date().toISOString() });
+    const store = new PaperExecutionRouterStore(dir);
+    store.ensurePaperStartAt(new Date(Date.now() - 60_000).toISOString());
+
+    // Trigger 1: resetTransientFailures() has real work (PAPER_DATA_FAILURE + DATA_FETCH_ERROR).
+    store.add(
+      makePaperOrder({
+        paperOrderId: "data-failure-1",
+        dedupeKey: "data-failure-1:lane",
+        sourceObservationId: "obs-data-failure-1",
+        paperStatus: "PAPER_DATA_FAILURE",
+        closeReason: "DATA_FETCH_ERROR",
+      }),
+    );
+
+    // Trigger 2: resolvePaperOrders() has real work — a genuinely resolvable OPEN SHORT that a
+    // winning candle path closes CLOSED_WIN (identical setup to the "win-order-1" test above).
+    const openedAt = new Date(Date.now() - 5 * 60_000).toISOString();
+    store.add(
+      makePaperOrder({
+        paperOrderId: "win-order-2",
+        dedupeKey: "win-2:lane",
+        sourceObservationId: "obs-win-2",
+        openedAt,
+        symbol: "ETHUSDT",
+        direction: "SHORT",
+        entryPrice: 100,
+        stopLoss: 103,
+        takeProfitLevels: [96],
+        plannedStopDistanceBps: 300,
+        paperStatus: "CREATED",
+      }),
+    );
+
+    const flushSpy = vi.spyOn(store as unknown as { flush: () => void }, "flush");
+
+    const signalMs = new Date(openedAt).getTime();
+    const report = await runPaperAdmissionAndResolution({
+      store,
+      vmStore,
+      routerReport: routerOf(null), // no regime ⇒ no eligible admission lane; only cleanup + resolution run
+      vmReport,
+      gateReport: emptyGate(),
+      binanceClient: {
+        getKlines: async (_s, interval) => {
+          if (interval === "1m") return [];
+          return [
+            [signalMs - 300_000, "0", "100.2", "99.9", "100", "0", signalMs] as PaperKlineTuple,
+            [signalMs, "0", "100.5", "95.5", "96", "0", signalMs + 300_000] as PaperKlineTuple,
+          ];
+        },
+      },
+      now: new Date().toISOString(),
+    });
+
+    expect(report).toBeTruthy();
+    // Sanity: both mutation triggers actually fired (otherwise this test would pass for the wrong
+    // reason). The mock binance client returns the same winning candle path regardless of symbol, so
+    // resetTransientFailures' PAPER_SUBMITTED reset is immediately followed by resolvePaperOrders
+    // resolving that SAME order too (both orders end up CLOSED_WIN) — the key proof is simply that it
+    // no longer sits in the original PAPER_DATA_FAILURE state, confirming resetTransientFailures ran.
+    const dataFailureOrder = store.all.find((o) => o.paperOrderId === "data-failure-1");
+    expect(dataFailureOrder?.paperStatus).not.toBe("PAPER_DATA_FAILURE"); // reset by resetTransientFailures
+    const winOrder = store.all.find((o) => o.paperOrderId === "win-order-2");
+    expect(winOrder?.paperStatus).toBe("PAPER_CLOSED_WIN"); // resolved by resolvePaperOrders
+    // The actual regression check: ONE flush for the whole pass, not one per mutation site.
+    expect(flushSpy).toHaveBeenCalledTimes(1);
+    flushSpy.mockRestore();
   });
 
   // [18] Loss does not trigger hard daily stop

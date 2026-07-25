@@ -119,6 +119,11 @@ export function classifyFreshness(args: {
 }): ExternalSignalStatus {
   const obs = parseMs(args.observedAt);
   if (obs === null) return "MISSING";
+  // 2026-07-22 fix: a future-dated observedAt (clock-skewed or corrupted fetcher — this codebase has a
+  // documented history of Binance clock-sync skew incidents) previously passed straight through as
+  // FRESH, since nowMs-obs is negative and never exceeds a positive maxAgeMs. That's not a genuinely
+  // observed-in-the-past fact, so it must never be trusted as FRESH.
+  if (args.nowMs < obs) return "STALE";
   const exp = parseMs(args.expiresAt);
   if (exp !== null && args.nowMs > exp) return "STALE";
   if (args.nowMs - obs > args.maxAgeMs) return "STALE";
@@ -133,7 +138,13 @@ export function classifyFreshness(args: {
 export function moodFeatureValue(signal: ExternalSignal<MarketMood> | null | undefined): number {
   if (!signal || signal.status !== "FRESH") return 0;
   const m = signal.value;
-  const w = clamp01(finiteOr(m.confidence, 0)) * clamp01(finiteOr(m.sourceCoverage, 0));
+  // 2026-07-22 fix: the outer signal.confidence (fetch/provenance trust — e.g. only some of the
+  // expected sources actually responded) was never applied here, unlike narrativeAlignFeatureValue
+  // below which DOES multiply by it — a degraded fetch with a high inner MarketMood.confidence would
+  // still read as a near-max-strength feature instead of being discounted per the module's own
+  // "confidence gates, doesn't decorate" rule.
+  const w =
+    clamp01(finiteOr(m.confidence, 0)) * clamp01(finiteOr(m.sourceCoverage, 0)) * clamp01(finiteOr(signal.confidence, 1));
   return clamp(finiteOr(m.score, 0) * w, -1, 1);
 }
 

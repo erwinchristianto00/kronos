@@ -27,6 +27,7 @@ import {
   cortexBlindCapitalPct,
   cortexRegimeFamilyCoverage,
   type CortexAttrRosterEntry,
+  type CortexAttributedExample,
   type CortexDecisionRow,
   type CortexLaneAttributionStatus,
   type CortexLaneOutcome,
@@ -95,6 +96,11 @@ export interface CortexRefitReport {
   coverage: CortexPromotionCoverage;
   skipsByLane: Record<string, Partial<Record<CortexOutcomeSkipReason, number>>>;
   applied: boolean;
+  /** The exact attributeOutcomes() output this run computed (2026-07-22 bug-hunt fix): exposed so
+   *  callers that need the raw attributed examples (e.g. decision-alpha reporting) can reuse this
+   *  run's result instead of re-running the full sort+per-lane-search+dedupe walk a second time on
+   *  identical inputs — attributeOutcomes is real, non-trivial CPU work, not a cheap lookup. */
+  examples: CortexAttributedExample[];
 }
 
 /**
@@ -180,5 +186,6 @@ export function runCortexRefit(store: CortexBrainStore, input: CortexRefitInput)
     coverage,
     skipsByLane: input.skipsByLane ?? {},
     applied: apply,
+    examples: attr.examples,
   };
 }

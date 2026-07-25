@@ -90,11 +90,18 @@ export interface CortexLaneReportLike {
   netAvgR: number | null; // R (net of cost); null at resolvedCount===0 (NOT a fabricated 0)
   pf: number | null;
   resolvedCount: number;
+  /** 2026-07-22 bug-hunt fix: the source store's cycleMeta.lastCycleAt, when the store tracks one
+   *  (RC/RCS/SF/PWR/CE do; IM currently does not) — omit/undefined for stores that don't, never a
+   *  guessed value. Feeds STALE detection in cortex-brain-gather.ts's guard functions. */
+  lastCycleAt?: string | null;
 }
 /** A NEUTRAL basket's report (fractional per-basket net return + resolved basket count). */
 export interface CortexXsecReportLike {
   netAvgReturn: number | null; // FRACTION (not %, not bps, not R)
   resolvedCount: number;
+  /** Same as CortexLaneReportLike.lastCycleAt; omitted here since the cross-sectional store
+   *  currently tracks no cycle timestamp at all. */
+  lastCycleAt?: string | null;
 }
 /** The regime-edge-memory slice + verdict, keyed by regime×direction. */
 export interface CortexEdgeMemoryLike {
@@ -128,6 +135,9 @@ export interface CortexGatherDeps {
   currentEquity: number | null;
   currentDrawdownUsd: number | null; // for killBudgetUtilization = drawdownUsd/killBudget
   killBudgetUsd: number | null;
+  /** 2026-07-22 bug-hunt fix: wall-clock "now" for this gather, needed by the STALE-detection guard
+   *  in buildCortexLaneRaw (pure — never reads Date.now() itself). */
+  nowMs: number;
 }
 
 /**
@@ -209,6 +219,8 @@ export function buildCortexLaneRaw(entry: CortexRosterEntry, deps: CortexGatherD
     reportPf: rep?.pf ?? null,
     reportN: entry.isXsec ? xrep?.resolvedCount ?? 0 : rep?.resolvedCount ?? 0,
     hasReport: entry.isXsec ? xrep != null && xrep.resolvedCount > 0 : rep != null && rep.resolvedCount > 0,
+    lastCycleAt: entry.isXsec ? xrep?.lastCycleAt ?? null : rep?.lastCycleAt ?? null,
+    nowMs: deps.nowMs,
     isXsec: entry.isXsec,
     xsecNetAvgReturn: xrep?.netAvgReturn ?? null,
     xsecStopDistance: CORTEX_XSEC_STOP_RETURN,

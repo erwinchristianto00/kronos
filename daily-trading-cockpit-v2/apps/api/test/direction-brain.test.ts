@@ -41,6 +41,41 @@ describe("Direction Brain", () => {
     expect(conflicted.confidence).toBeLessThan(clean.confidence);
   });
 
+  it("four-brain's OWN self-outcome VETO (fourBrainLongVeto) is a SECOND, independent soft penalty — never a hard zero — stacked next to the incumbent edge-memory longVeto", () => {
+    const clean = decideDirection(directionInput({ longEdge: src(0.12) }));
+    const fourBrainOnly = decideDirection(directionInput({ longEdge: src(0.12), fourBrainLongVeto: true }));
+    const incumbentOnly = decideDirection(directionInput({ longEdge: src(0.12), longVeto: true }));
+    const both = decideDirection(directionInput({ longEdge: src(0.12), longVeto: true, fourBrainLongVeto: true }));
+
+    // Soft, not a gate: penalized but never driven to exactly 0.
+    expect(fourBrainOnly.longScore).toBeLessThan(clean.longScore);
+    expect(fourBrainOnly.longScore).toBeGreaterThan(0);
+    expect(fourBrainOnly.conflictingSignals.some((s) => s.includes("Four-Brain self-outcome VETO"))).toBe(true);
+
+    // The two penalties are independent and compose: stacking both reduces the score further than either alone.
+    expect(both.longScore).toBeLessThan(fourBrainOnly.longScore);
+    expect(both.longScore).toBeLessThan(incumbentOnly.longScore);
+    expect(both.longScore).toBeGreaterThan(0);
+  });
+
+  it("four-brain's OWN self-outcome VETO (fourBrainShortVeto) mirrors the LONG side for SHORT", () => {
+    const clean = decideDirection(
+      directionInput({ marketBias: "BULLISH", longEdge: src(null), shortEdge: src(0.12), shortLaneEdge: src(0.1), controllerBias: "SHORT", longLaneEdge: src(null) }),
+    );
+    const vetoed = decideDirection(
+      directionInput({ marketBias: "BULLISH", longEdge: src(null), shortEdge: src(0.12), shortLaneEdge: src(0.1), controllerBias: "SHORT", longLaneEdge: src(null), fourBrainShortVeto: true }),
+    );
+    expect(vetoed.shortScore).toBeLessThan(clean.shortScore);
+    expect(vetoed.shortScore).toBeGreaterThan(0);
+    expect(vetoed.conflictingSignals.some((s) => s.includes("SHORT proven-negative (Four-Brain self-outcome VETO)"))).toBe(true);
+  });
+
+  it("fourBrainLongVeto/fourBrainShortVeto default to no penalty when omitted (backward-compatible, never fabricated)", () => {
+    const withoutFlags = decideDirection(directionInput({ longEdge: src(0.12) }));
+    const explicitFalse = decideDirection(directionInput({ longEdge: src(0.12), fourBrainLongVeto: false, fourBrainShortVeto: false }));
+    expect(withoutFlags.longScore).toBeCloseTo(explicitFalse.longScore, 9);
+  });
+
   it("an unknown/neutral market state still yields a valid decision", () => {
     const d = decideDirection(directionInput({ marketBias: "MIXED", longEdge: src(0.1) }));
     expect(["LONG", "SHORT", "BOTH", "FLAT"]).toContain(d.action);

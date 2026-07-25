@@ -213,6 +213,43 @@ describe("cortex — decide (starts == incumbent, gates, deleverage)", () => {
     expect(d.lanes.find((l) => l.laneId === "STRONG")!.finalPct).toBeLessThanOrEqual(35 + 1e-6);
     expect(checkCortexInvariants(d).ok).toBe(true);
   });
+
+  it("[REGRESSION 2026-07-22] rawSum<=0 (no eligible lane's pWin exceeds 0.5) falls back learnedPct to static, preserving the incumbent total instead of silently deflating it by β", () => {
+    // emptyCortexState() ⇒ all-zero coefficients ⇒ sigmoid(0)=0.5 exactly for every lane ⇒ raw=0 for
+    // every lane ⇒ rawSum=0. This is the GUARANTEED post-init state, and also the state any archetype
+    // reverts to on any refit rejection — cumulativeResolved (which drives β) advances independently of
+    // whether a fit has ever succeeded, so β>0 alongside this state is a normal early-lifecycle condition,
+    // not a contrived edge case.
+    const c = ctx({ lanes: [lane({ laneId: "A", staticWeightPct: 20 }), lane({ laneId: "B", staticWeightPct: 30 })] });
+    const halfBeta = decideCortex(c, emptyCortexState(), { beta: 0.5 });
+    const totalHalf = halfBeta.lanes.reduce((s, l) => s + l.finalPct, 0);
+    expect(totalHalf).toBeCloseTo(50, 6); // previously 25 — half the book silently vanished
+    const fullBeta = decideCortex(c, emptyCortexState(), { beta: 1 });
+    const totalFull = fullBeta.lanes.reduce((s, l) => s + l.finalPct, 0);
+    expect(totalFull).toBeCloseTo(50, 6); // previously 0 — the entire roster silently went to cash
+    // An ineligible (vetoed) lane must still fall back to 0, not to its static share.
+    const withVeto = decideCortex(
+      ctx({ lanes: [lane({ laneId: "A", staticWeightPct: 20 }), lane({ laneId: "V", staticWeightPct: 30, vetoed: true })] }),
+      emptyCortexState(),
+      { beta: 0.5 },
+    );
+    expect(withVeto.lanes.find((l) => l.laneId === "V")!.finalPct).toBe(0);
+    expect(withVeto.lanes.find((l) => l.laneId === "A")!.finalPct).toBeCloseTo(20, 6);
+  });
+
+  it("[REGRESSION 2026-07-22] expectedTiltDeltaR stays 0 at β=0 even when a vetoed lane is present (the veto itself must not fabricate a nonzero reality-gap reading)", () => {
+    const c = ctx({
+      lanes: [
+        lane({ laneId: "KEEP", staticWeightPct: 30, vetoed: false }),
+        lane({ laneId: "VETOED", staticWeightPct: 20, vetoed: true, edgeMemAvgNetR: 0.1, edgeMemN: 50 }),
+      ],
+    });
+    const d = decideCortex(c, emptyCortexState(), { beta: 0 });
+    // Confirm zero tilt was actually applied (the exact "β=0 == post-veto incumbent" contract).
+    expect(d.lanes.find((l) => l.laneId === "KEEP")!.finalPct).toBeCloseTo(30, 6);
+    expect(d.lanes.find((l) => l.laneId === "VETOED")!.finalPct).toBe(0);
+    expect(Math.abs(d.expectedTiltDeltaR)).toBeLessThan(1e-9); // previously -0.02
+  });
 });
 
 describe("cortex — invariants", () => {

@@ -39,12 +39,21 @@ describe("cortex-enrichment — freshness contract", () => {
   it("MISSING when no observedAt", () => {
     expect(classifyFreshness({ observedAt: null, expiresAt: null, nowMs: NOW, maxAgeMs: 6 * 3_600_000 })).toBe("MISSING");
   });
+  it("[REGRESSION 2026-07-22] STALE (not FRESH) when observedAt is in the FUTURE (clock-skewed or corrupted fetcher) — nowMs-obs is negative and would otherwise never exceed maxAgeMs", () => {
+    expect(classifyFreshness({ observedAt: iso(10 * 60_000), expiresAt: iso(3_600_000), nowMs: NOW, maxAgeMs: 6 * 3_600_000 })).toBe("STALE");
+  });
 });
 
 describe("cortex-enrichment — neutral-on-stale (confidence gates, never carry-forward)", () => {
-  it("FRESH mood → score weighted by confidence × coverage", () => {
+  it("FRESH mood → score weighted by inner confidence × coverage × OUTER signal.confidence (2026-07-22 fix: outer provenance confidence — default 0.8 from moodSig() — was previously ignored)", () => {
     const v = moodFeatureValue(moodSig({}, { score: 0.6, confidence: 0.5, sourceCoverage: 0.5 }));
-    expect(v).toBeCloseTo(0.6 * 0.5 * 0.5, 6);
+    expect(v).toBeCloseTo(0.6 * 0.5 * 0.5 * 0.8, 6);
+  });
+  it("[REGRESSION 2026-07-22] a low outer signal.confidence (degraded fetch) discounts the feature even when the inner MarketMood.confidence is high", () => {
+    const highOuterConfidence = moodFeatureValue(moodSig({ confidence: 0.95 }, { score: 0.9, confidence: 0.95, sourceCoverage: 1 }));
+    const lowOuterConfidence = moodFeatureValue(moodSig({ confidence: 0.1 }, { score: 0.9, confidence: 0.95, sourceCoverage: 1 }));
+    expect(lowOuterConfidence).toBeCloseTo(0.9 * 0.95 * 1 * 0.1, 6);
+    expect(Math.abs(lowOuterConfidence)).toBeLessThan(Math.abs(highOuterConfidence));
   });
   it("STALE / MISSING / ERROR mood → 0 (no carry-forward)", () => {
     expect(moodFeatureValue(moodSig({ status: "STALE" }))).toBe(0);

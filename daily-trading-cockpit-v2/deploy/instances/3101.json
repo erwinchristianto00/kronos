@@ -1,0 +1,8 @@
+{
+  "instanceId": "3101",
+  "role": "research",
+  "apiPort": 3101,
+  "pm2Process": "dtc-api-research",
+  "manifestPath": "deploy/manifests/3101.json",
+  "protectedFromRuntimeDeployment": false
+}

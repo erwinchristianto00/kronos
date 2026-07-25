@@ -26,6 +26,7 @@ import {
   CrossSectionalExecutorStore,
   isCrossSectionalExecEnabled,
   isCrossSectionalAllocationIndependent,
+  isCrossSectionalTrendMixedAdmissionIndependent,
   crossSectionalMarketNeutralIsAllowed,
 } from "./lib/cross-sectional-executor.js";
 import { buildCrossSectionalReport, getCrossSectionalStore } from "./lib/cross-sectional-edge.js";
@@ -105,6 +106,7 @@ import {
   CE_EXEC_DAILY_MAX_LOSS_USD,
   CE_EXEC_MAX_CONCURRENT,
   ceLaneIdForBucket,
+  buildCompositeEstimatorReport,
   type CEBucket,
 } from "./lib/composite-estimator-edge.js";
 import { computeExternalManagedNetQty, computeNotionalPerSymbol, maxNotionalPerSymbolAcrossLanes, computeClusterOpenSymbols, maxClusterPositionsAcrossLanes, isNewExecutorLaneAllowed, rollingNetEntryHealth, sumExternalRealizedPnlUsd } from "./lib/live-executor-wiring.js";
@@ -145,10 +147,31 @@ import { classifyIncumbentLanes } from "./lib/four-brain-lane-support.js";
 import { buildLaneContextSnapshotInputs } from "./lib/lane-context-snapshot-source.js";
 import { journalLaneSnapshots, laneJournalActive } from "./lib/lane-context-journal-runtime.js";
 import { FourBrainMetricsAggregator } from "./lib/four-brain-metrics.js";
-import { resolveFourBrainInstanceId, fourBrainInstanceAllowed, type FourBrainBindingDeps } from "./lib/four-brain-live-gather-bindings.js";
+import {
+  FourBrainRecentDecisionsBuffer,
+  wrapFourBrainJournalAppendForRecentDecisions,
+} from "./lib/four-brain-recent-decisions.js";
+import {
+  FourBrainOutcomeLedger,
+  rehydrateFourBrainOutcomeLedgerFromJournals,
+  wrapFourBrainJournalAppendForOutcomeLedger,
+  type FourBrainOutcomeHorizon,
+} from "./lib/four-brain-outcome-ledger.js";
+import { resolveFourBrainInstanceId, fourBrainInstanceAllowed, fourBrainShadowActive, type FourBrainBindingDeps } from "./lib/four-brain-live-gather-bindings.js";
 import { fourBrainMode } from "./lib/four-brain-types.js";
+import { getBtcAtrPercentileCacheStore, refreshBtcAtrPercentileCache } from "./lib/btc-atr-percentile-cache.js";
+import { buildLiveBestLaneReportForDirection } from "./lib/four-brain-best-lane-report.js";
+import { getLiveMarkPriceCacheStore, refreshLiveMarkPriceCache } from "./lib/live-mark-price-cache.js";
 import { CORTEX_LANE_ROSTER, gatherCortexContext, normalizeCortexStaticWeightPctForLane } from "./lib/cortex-live-gather.js";
 import { buildLiveCortexGatherDeps } from "./lib/cortex-live-gather-bindings.js";
+import { getCortexRealAttributionStore } from "./lib/cortex-real-attribution.js";
+import { getPositionPathRecorder } from "./lib/position-path-recorder.js";
+import { getDirectionEntryOutcomeStore, buildDirectionEntryOutcomeReport, type DirectionEntryOutcomeReport } from "./lib/direction-entry-outcome-store.js";
+import {
+  runDirectionEntryReconciliationCycleGuarded,
+  directionEntryReconcilerActive,
+} from "./lib/direction-entry-reconciler.js";
+import { ENTRY_TIER2_HORIZON_BARS, ENTRY_TIER2_WAIT_WINDOW_BARS } from "./lib/entry-brain-tier2-simulated-resolver.js";
 import { runCortexNightlyRefit, getLatestCortexRefitReport } from "./lib/cortex-refit-runner-bindings.js";
 import {
   estimateLaneSelectorV2Regime,
@@ -187,8 +210,9 @@ const DEFAULT_KRONOS_BASE_URL = "http://localhost:8001";
  * snapshot the tick's brains just consumed (captured by the call site, never re-derived/re-fetched) into
  * the journal's provenance fields. Exported + pure (zero I/O) so it is directly unit-testable with plain
  * fixture objects. Every MISSING/FRESH classification + missingReason mirrors the SAME known-unavailable
- * sources already documented at their source in buildFourBrainDeps (btcAtrPercentile/sentiment/
- * crowdAlignLong/kronosAgree have no live sync producer today) — never fabricated.
+ * sources already documented at their source in buildFourBrainDeps (sentiment/crowdAlignLong/kronosAgree
+ * have no live sync producer today; btcAtrPercentile now DOES — see BtcAtrPercentileCacheStore — so it
+ * classifies FRESH/MISSING on that cache's own populated state instead) — never fabricated.
  */
 export function buildFourBrainJournalContext(
   base: Pick<
@@ -218,7 +242,7 @@ export function buildFourBrainJournalContext(
   if (base.advancersPct == null) missingReasons.breadth = "no regime-engine snapshot available yet";
   if (base.regimeRaw == null) missingReasons.regimeRaw = "no regime classification available yet";
   if (base.btcAtrPercentile == null) {
-    missingReasons.btcAtrPercentile = "no market-wide ATR-percentile producer (cached BTC value is an ATR/price fraction, wrong scale)";
+    missingReasons.btcAtrPercentile = "BTC ATR-percentile cache not yet warm (first refresh pending) or refresh persistently failing";
   }
   if (base.sentiment == null) missingReasons.sentiment = "no market-wide sentiment producer (sync-safe)";
   if (base.crowdAlignLong == null) missingReasons.crowdAlignLong = "no sync crowd-align producer";
@@ -338,6 +362,17 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
   // Declared here (assigned below) so the shadow routes can READ the live engine's in-memory
   // status (sync getStatus, no I/O) for the order-reconciliation readiness gate, via a lazy getter.
   let liveEngine: LiveExecutionEngine | null = null;
+  // Declared here (assigned inside the four-brain `if (!isTest)` block below, from that block's OWN
+  // local `const`s — see the "Ref" suffix) so the shadow routes' /api/shadow/four-brain handler can
+  // READ the live metrics aggregator + recent-decisions ring buffer via a lazy getter — same threading
+  // pattern as `liveEngine` above. Stay null (⇒ the route fails open to an empty/disabled shape) on any
+  // instance/test run that never constructs them.
+  let fourBrainMetricsRef: FourBrainMetricsAggregator | null = null;
+  let fourBrainRecentDecisionsRef: FourBrainRecentDecisionsBuffer | null = null;
+  // Same threading pattern, for the Direction/Entry counterfactual outcome reconciler's own report.
+  // Stays null (⇒ the route fails open to an empty/disabled shape) unless directionEntryReconcilerActive
+  // (its own 3-layer gate — see direction-entry-reconciler.ts) is true on this instance.
+  let directionEntryOutcomeReportGetterRef: (() => DirectionEntryOutcomeReport | null) | null = null;
   // Read-only capture of the engine's execution store so the report-only four-brain shadow tick can
   // enumerate FULL open intents (getStatus().openIntents is a reduced shape). Assigned during engine
   // construction below; stays null on instances that build no engine (e.g. 3101 research). READ-ONLY —
@@ -460,6 +495,9 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     notificationService,
     liveEngineGetter: () => liveEngine,
     kronosClient,
+    fourBrainMetricsGetter: () => fourBrainMetricsRef?.summary() ?? null,
+    fourBrainRecentDecisionsGetter: () => fourBrainRecentDecisionsRef?.getAll() ?? null,
+    directionEntryOutcomeReportGetter: () => directionEntryOutcomeReportGetterRef?.() ?? null,
   });
   await registerNotificationRoutes(app, notificationService);
   await registerTradingAssistantRoutes(app);
@@ -494,13 +532,56 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     // sharedGetPositions option, so at most one signed call goes out per cache window regardless
     // of how many instances' ticks land inside it.
     let cachedPositions: { at: number; promise: ReturnType<typeof liveClient.getPositions> } | null = null;
-    const sharedGetPositions = () => {
+    // Split out so a caller that needs the ACTUAL fetch timestamp (not just the promise) — see
+    // live-mark-price-cache.ts's non-interference contract — can read `{at, promise}` atomically in
+    // one synchronous call, with zero change to sharedGetPositions's own behavior/timing for its
+    // existing 11+ callers (sharedGetPositions below is unchanged in every observable way — same
+    // cache object, same 30s window, same returned promise).
+    const ensureCachedPositions = (): { at: number; promise: ReturnType<typeof liveClient.getPositions> } => {
       const now = Date.now();
       if (!cachedPositions || now - cachedPositions.at > 30_000) {
         cachedPositions = { at: now, promise: liveClient.getPositions() };
       }
-      return cachedPositions.promise;
+      return cachedPositions;
     };
+    const sharedGetPositions = () => ensureCachedPositions().promise;
+    // Four-brain markPriceForSymbol pipeline (item 3 of 3 four-brain data gaps — see
+    // live-mark-price-cache.ts's module doc comment). Registered HERE (inside `if (liveConfig.enabled)`,
+    // not in the four-brain `if (!isTest)` block below) purely because `sharedGetPositions` — a plain
+    // `const` — is block-scoped to THIS `if` and is not visible from that sibling block. The cache STORE
+    // itself is a module-level singleton (getLiveMarkPriceCacheStore), so buildFourBrainDeps below can
+    // still read it synchronously by calling the same getter independently — no shared variable needed
+    // across the two blocks, exactly like btcAtrPercentileCache's own singleton pattern.
+    // Gated IDENTICALLY to the other 2 four-brain-only refresh intervals (ATR-percentile, four-brain
+    // cycle itself): fourBrainMode==="shadow" && fourBrainInstanceAllowed ⇒ never schedules on live/3103,
+    // and is a pure no-op (zero extra I/O) whenever four-brain shadow mode is off.
+    // refreshLiveMarkPriceCache calls ensureCachedPositions() itself each cycle (via the closure below)
+    // rather than attaching a `.then()` onto one captured promise: ensureCachedPositions already
+    // de-dupes/caches upstream (repeated calls inside its own 30s window return the SAME
+    // `{at, promise}` pair, so this costs zero extra Binance calls), and calling it fresh each cycle
+    // means a stale/nulled `cachedPositions` (see releaseEntrySymbol above, which resets it to null on
+    // entry) is naturally picked up next cycle instead of this reader ever holding a stale reference.
+    // 2026-07-23 fix: stamp the cache with the ACTUAL fetch timestamp (`at`, captured atomically with
+    // the promise via ensureCachedPositions), not `Date.now()` at the moment this refresh happens to
+    // run. Since this refresh's own 25s cadence is SHORTER than sharedGetPositions's 30s de-dup window,
+    // roughly every other cycle reuses an already-resolved promise from up to ~30s earlier — stamping
+    // with call-time would silently understate staleness by up to that ~30s, letting data close to
+    // FRESHNESS_TTL_MS.position's 60s bound read as near-real-time. See refreshLiveMarkPriceCache's own
+    // doc comment for the full non-interference contract (it only reads the resolved value; it never
+    // mutates or replaces `cachedPositions`; a rejection is caught inside its own try/catch and can
+    // never become an unhandled rejection or crash this timer).
+    if (!isTest && fourBrainMode(process.env) === "shadow" && fourBrainInstanceAllowed(process.env)) {
+      const liveMarkPriceCache = getLiveMarkPriceCacheStore();
+      const fetchPositionsWithTimestamp = () => {
+        const c = ensureCachedPositions();
+        return { promise: c.promise, fetchedAtMs: c.at };
+      };
+      const runLiveMarkPriceRefresh = (): void => {
+        void refreshLiveMarkPriceCache(liveMarkPriceCache, fetchPositionsWithTimestamp);
+      };
+      setTimeout(runLiveMarkPriceRefresh, 10_000);
+      setInterval(runLiveMarkPriceRefresh, 25_000); // comfortably under FRESHNESS_TTL_MS.position (60s)
+    }
     // Binance USD-M runs in one-way mode: a BUY from one lane can reduce or reverse a SELL from
     // another lane on the same symbol. Monitoring may share the cache above, but entry admission
     // needs a synchronous per-symbol claim plus the executor's direct final exchange recheck.
@@ -574,6 +655,16 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       config: liveConfig,
       client: liveClient,
       store: (liveExecutionStore = new LiveExecutionStore()),
+      // CORTEX real-USDT attribution (2026-07-21, report-only, fail-safe — see
+      // cortex-real-attribution.ts): the engine sweeps its own closed intents into this store;
+      // the SingleSymbolLaneExecutor instances below write to the SAME singleton at their close
+      // finalization, so /api/live/cortex-real-attribution reports one unified number.
+      cortexRealAttribution: getCortexRealAttributionStore(),
+      // Dense per-tick R-path recorder (2026-07-22, report-only, fail-safe — see
+      // position-path-recorder.ts): the engine samples every OPEN intent's mark-R once per tick
+      // and hands CLOSED paths to the Exit Brain shadow scorer's reader (routes/shadow.ts). The
+      // SingleSymbolLaneExecutor instances below record into this SAME singleton.
+      positionPathRecorder: getPositionPathRecorder(),
       // Crowding-exit SHADOW measurement only (getStatus().crowdingExitShadow) — read-only market
       // data, never touches order placement. Reuses the same market-data client scan.ts uses.
       marketDataClient: binanceClient,
@@ -946,8 +1037,12 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           axisSlopePerHour: axis.slopePerHour ?? null,
         });
         const status = engine.getStatus();
+        // 2026-07-21 CRITICAL fix: must read the TRUE operator table (rawLaneAllocationWeightPctForLane),
+        // never laneSelectionWeightPctForLane — that accessor ALSO applies CORTEX's own promoted-weight
+        // override, so using it here fed CORTEX's prior output back in as this cycle's "static" input,
+        // a self-referential loop that manufactured a phantom concentration and blocked promotion forever.
         const staticWeightPctForLane = normalizeCortexStaticWeightPctForLane(
-          (laneId) => engine.laneSelectionWeightPctForLane(laneId),
+          (laneId) => engine.rawLaneAllocationWeightPctForLane(laneId),
         );
         const deps = buildLiveCortexGatherDeps({
           staticWeightPctForLane,
@@ -967,11 +1062,19 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           killBudgetUsd: status.limits?.maxDrawdownUsd ?? null,
         });
         const context = gatherCortexContext(deps);
+        // 2026-07-21 operator ask: only the roster lanes the nightly refit has actually proven
+        // LEARNING_ACTIVE may receive CORTEX's tilt — everything else stays pinned to its exact
+        // static value inside runCortexShadowTick, while shadow collection/attribution continues for
+        // every lane regardless (unaffected by this set).
+        const learningActiveLaneIds = new Set(
+          (getLatestCortexRefitReport()?.perLane ?? []).filter((l) => l.status === "LEARNING_ACTIVE").map((l) => l.laneId),
+        );
         const promotion = mode === "live"
           ? {
               regimeCoverageGateMet: getLatestCortexRefitReport()?.coverage.regimeCoverageGateMet ?? false,
               blindCapitalPct: getLatestCortexRefitReport()?.coverage.blindCapitalPct ?? 100,
               envBlocked: cortexPromotionBlockedByEnv(process.env),
+              learningActiveLaneIds,
             }
           : null;
         const { promotedWeights } = runCortexShadowTick({
@@ -1016,8 +1119,11 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         if ((refitMode !== "shadow" && refitMode !== "live") || !liveEngine || process.env.CORTEX_REFIT_ENABLED === "0") return;
         const engine = liveEngine;
         const now = new Date();
+        // 2026-07-21 CRITICAL fix: same reasoning as the shadow-tick site above — the nightly refit's
+        // own notion of "static weight" (which feeds cortexBlindCapitalPct/roster coverage) must also be
+        // immune to CORTEX's own currently-installed promoted override.
         const staticWeightPctForLane = normalizeCortexStaticWeightPctForLane(
-          (laneId) => engine.laneSelectionWeightPctForLane(laneId),
+          (laneId) => engine.rawLaneAllocationWeightPctForLane(laneId),
         );
         const report = runCortexNightlyRefit({
           store: cortexStore,
@@ -1124,6 +1230,11 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           laneSelectionAllowsLane: () => engineForGate?.laneSelectionAllowsLane(CROSS_SECTIONAL_MARKET_NEUTRAL_LANE_ID) ?? false,
         }),
         laneWeightPct: () => engineForGate?.laneSelectionWeightPctForLane(CROSS_SECTIONAL_MARKET_NEUTRAL_LANE_ID) ?? 0,
+        // 2026-07-22 bug-hunt fix: this executor's real basket closes were never wired into
+        // cortex-real-attribution.ts at all (see CrossSectionalExecutorOptions.rawLaneWeightPct /
+        // .cortexRealAttribution doc comments) — same pattern as every other lane below.
+        rawLaneWeightPct: () => engineForGate?.rawLaneAllocationWeightPctForLane(CROSS_SECTIONAL_MARKET_NEUTRAL_LANE_ID) ?? 100,
+        cortexRealAttribution: getCortexRealAttributionStore(),
         entryHealthGate: () => {
           const report = buildCrossSectionalReport(getCrossSectionalStore(), Date.now(), { variant: "FILTERED" });
           return rollingNetEntryHealth(report.recentNetReturns);
@@ -1176,10 +1287,21 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         // silently trade at FULL SIZE the instant the engine is armed and no allocation happens
         // to be active yet (e.g. right after a restart, before RegimeAutopilot's first apply, or
         // during an auto-reset-on-loss window).
-        isAllowed: () => unifiedOrchestrator?.isEnabled()
-          ? unifiedOrchestrator.allowsCrossSectionalLane(CROSS_SECTIONAL_TREND_LANE_ID)
-          : isNewExecutorLaneAllowed(CROSS_SECTIONAL_TREND_LANE_ID, liveConfig.env === "testnet" ? "testnet" : "mainnet", engineForGate, { mainnetEntryEligible: false }),
+        // 2026-07-22 (CORTEX capital-coverage diagnosis): when explicitly turned on, this lane
+        // becomes admission-independent — same bypass shape as MARKET_NEUTRAL's own
+        // allocationIndependent branch above (armed/kill-switch/drain only, via
+        // canOpenNewEntriesIgnoringManualDirectional) — see
+        // isCrossSectionalTrendMixedAdmissionIndependent's doc comment for why. Off by default;
+        // the rest of this ternary is untouched, so disabling the flag is a byte-for-byte revert.
+        isAllowed: () => isCrossSectionalTrendMixedAdmissionIndependent()
+          ? (engineForGate?.canOpenNewEntriesIgnoringManualDirectional() ?? false)
+          : unifiedOrchestrator?.isEnabled()
+            ? unifiedOrchestrator.allowsCrossSectionalLane(CROSS_SECTIONAL_TREND_LANE_ID)
+            : isNewExecutorLaneAllowed(CROSS_SECTIONAL_TREND_LANE_ID, liveConfig.env === "testnet" ? "testnet" : "mainnet", engineForGate, { mainnetEntryEligible: false }),
         laneWeightPct: () => engineForGate?.laneSelectionWeightPctForLane(CROSS_SECTIONAL_TREND_LANE_ID) ?? 100,
+        // 2026-07-22 bug-hunt fix: see the FILTERED instance above.
+        rawLaneWeightPct: () => engineForGate?.rawLaneAllocationWeightPctForLane(CROSS_SECTIONAL_TREND_LANE_ID) ?? 100,
+        cortexRealAttribution: getCortexRealAttributionStore(),
         siblingOpenLegs: () => [
           ...(crossSectionalExecutor?.getOpenUnexitedLegs() ?? []),
           ...(crossSectionalMixedExecutor?.getOpenUnexitedLegs() ?? []),
@@ -1198,11 +1320,17 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         store: new CrossSectionalExecutorStore(undefined, "cross-sectional-executor-mixed.json"),
         targetVariant: "MIXED_MEAN_REVERSION",
         laneId: CROSS_SECTIONAL_MIXED_LANE_ID,
-        // Same 2026-07-08 fix as CROSS_SECTIONAL_TREND above.
-        isAllowed: () => unifiedOrchestrator?.isEnabled()
-          ? unifiedOrchestrator.allowsCrossSectionalLane(CROSS_SECTIONAL_MIXED_LANE_ID)
-          : isNewExecutorLaneAllowed(CROSS_SECTIONAL_MIXED_LANE_ID, liveConfig.env === "testnet" ? "testnet" : "mainnet", engineForGate, { mainnetEntryEligible: false }),
+        // Same 2026-07-08 fix as CROSS_SECTIONAL_TREND above, plus the same 2026-07-22
+        // admission-independence bypass (see CROSS_SECTIONAL_TREND's isAllowed above).
+        isAllowed: () => isCrossSectionalTrendMixedAdmissionIndependent()
+          ? (engineForGate?.canOpenNewEntriesIgnoringManualDirectional() ?? false)
+          : unifiedOrchestrator?.isEnabled()
+            ? unifiedOrchestrator.allowsCrossSectionalLane(CROSS_SECTIONAL_MIXED_LANE_ID)
+            : isNewExecutorLaneAllowed(CROSS_SECTIONAL_MIXED_LANE_ID, liveConfig.env === "testnet" ? "testnet" : "mainnet", engineForGate, { mainnetEntryEligible: false }),
         laneWeightPct: () => engineForGate?.laneSelectionWeightPctForLane(CROSS_SECTIONAL_MIXED_LANE_ID) ?? 100,
+        // 2026-07-22 bug-hunt fix: see the FILTERED instance above.
+        rawLaneWeightPct: () => engineForGate?.rawLaneAllocationWeightPctForLane(CROSS_SECTIONAL_MIXED_LANE_ID) ?? 100,
+        cortexRealAttribution: getCortexRealAttributionStore(),
         siblingOpenLegs: () => [
           ...(crossSectionalExecutor?.getOpenUnexitedLegs() ?? []),
           ...(crossSectionalTrendExecutor?.getOpenUnexitedLegs() ?? []),
@@ -1252,6 +1380,13 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         ),
         isAllowedReason: () => edgeVeto("SHORT").reason,
         laneWeightPct: () => engineForGate?.laneSelectionWeightPctForLane(SF_PAPER_LANE_ID) ?? 100,
+        // CORTEX real-USDT attribution (2026-07-21, report-only): raw static weight (never tilted)
+        // + shared attribution sink — same pair on every SingleSymbolLaneExecutor below.
+        rawLaneWeightPct: () => engineForGate?.rawLaneAllocationWeightPctForLane(SF_PAPER_LANE_ID) ?? 100,
+        cortexRealAttribution: getCortexRealAttributionStore(),
+        // Dense per-tick R-path recorder (2026-07-22, report-only) — same shared singleton as the
+        // engine's own wiring above; same line on every SingleSymbolLaneExecutor below.
+        positionPathRecorder: getPositionPathRecorder(),
         legUsd: SF_EXEC_LEG_USD,
         leverage: SF_EXEC_LEVERAGE,
         maxOpenPositions: SF_EXEC_MAX_CONCURRENT,
@@ -1305,6 +1440,9 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         ),
         isAllowedReason: () => edgeVeto("LONG").reason,
         laneWeightPct: () => engineForGate?.laneSelectionWeightPctForLane(IM_PAPER_LANE_ID) ?? 100,
+        rawLaneWeightPct: () => engineForGate?.rawLaneAllocationWeightPctForLane(IM_PAPER_LANE_ID) ?? 100,
+        cortexRealAttribution: getCortexRealAttributionStore(),
+        positionPathRecorder: getPositionPathRecorder(),
         legUsd: IM_EXEC_LEG_USD,
         leverage: IM_EXEC_LEVERAGE,
         maxOpenPositions: IM_EXEC_MAX_CONCURRENT,
@@ -1364,6 +1502,9 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         ),
         isAllowedReason: () => edgeVeto("LONG").reason,
         laneWeightPct: () => engineForGate?.laneSelectionWeightPctForLane(RC_PAPER_LANE_ID) ?? 100,
+        rawLaneWeightPct: () => engineForGate?.rawLaneAllocationWeightPctForLane(RC_PAPER_LANE_ID) ?? 100,
+        cortexRealAttribution: getCortexRealAttributionStore(),
+        positionPathRecorder: getPositionPathRecorder(),
         legUsd: RC_EXEC_LEG_USD,
         leverage: RC_EXEC_LEVERAGE,
         maxOpenPositions: RC_EXEC_MAX_CONCURRENT,
@@ -1407,6 +1548,9 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         ),
         isAllowedReason: () => edgeVeto("SHORT").reason,
         laneWeightPct: () => engineForGate?.laneSelectionWeightPctForLane(RCS_PAPER_LANE_ID) ?? 100,
+        rawLaneWeightPct: () => engineForGate?.rawLaneAllocationWeightPctForLane(RCS_PAPER_LANE_ID) ?? 100,
+        cortexRealAttribution: getCortexRealAttributionStore(),
+        positionPathRecorder: getPositionPathRecorder(),
         legUsd: RCS_EXEC_LEG_USD,
         leverage: RCS_EXEC_LEVERAGE,
         maxOpenPositions: RCS_EXEC_MAX_CONCURRENT,
@@ -1455,6 +1599,9 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         ),
         isAllowedReason: () => edgeVeto("LONG").reason,
         laneWeightPct: () => engineForGate?.laneSelectionWeightPctForLane(PWR_PAPER_LANE_ID) ?? 100,
+        rawLaneWeightPct: () => engineForGate?.rawLaneAllocationWeightPctForLane(PWR_PAPER_LANE_ID) ?? 100,
+        cortexRealAttribution: getCortexRealAttributionStore(),
+        positionPathRecorder: getPositionPathRecorder(),
         legUsd: PWR_EXEC_LEG_USD,
         leverage: PWR_EXEC_LEVERAGE,
         maxOpenPositions: PWR_EXEC_MAX_CONCURRENT,
@@ -1526,6 +1673,9 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           ),
           isAllowedReason: () => edgeVeto(direction).reason,
           laneWeightPct: () => engineForGate?.laneSelectionWeightPctForLane(laneId) ?? 100,
+          rawLaneWeightPct: () => engineForGate?.rawLaneAllocationWeightPctForLane(laneId) ?? 100,
+          cortexRealAttribution: getCortexRealAttributionStore(),
+          positionPathRecorder: getPositionPathRecorder(),
           legUsd: () => ceExecLegUsdForBucket(bucket),
           leverage: CE_EXEC_LEVERAGE,
           maxOpenPositions: CE_EXEC_MAX_CONCURRENT,
@@ -1618,6 +1768,69 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
   if (!isTest) {
     const fourBrainJournal = new CortexDecisionJournal("data/four-brain-decision-journal.jsonl");
     const fourBrainMetrics = new FourBrainMetricsAggregator();
+    // Bounded ring buffer (last 100) of recent MARKET_SNAPSHOT / EXECUTIVE_DECISION journal records, fed
+    // at journal-append time below (see wrapFourBrainJournalAppendForRecentDecisions) — the operator
+    // dashboard's /api/shadow/four-brain route reads this, NEVER the journal file, on every request.
+    const fourBrainRecentDecisions = new FourBrainRecentDecisionsBuffer({ capacity: 100 });
+    // Bounded FIFO ledger (Direction cap 500 / Entry cap 2000) of pending DIRECTION + ENTRY decisions,
+    // fed at journal-append time below (see wrapFourBrainJournalAppendForOutcomeLedger) — the FOUNDATION
+    // for a follow-up Direction/Entry Brain counterfactual outcome-resolution phase (not built here).
+    // Deliberately separate from fourBrainRecentDecisions above: that 100-slot dashboard ring is far too
+    // small to survive a 24h SWING decision's own resolution horizon.
+    const fourBrainOutcomeLedger = new FourBrainOutcomeLedger();
+    // Direction/Entry counterfactual outcome store (2026-07-23) — the persisted destination the
+    // reconciler below writes RESOLVED/INSTRUMENT_DATA_MISSING/EXPIRED_UNRESOLVABLE outcomes into. The
+    // store itself is safe to construct unconditionally (pure bookkeeping, mirrors every other
+    // report-only store in this codebase); only the RECONCILER INTERVAL and the report getter below are
+    // gated.
+    const directionEntryOutcomeStore = getDirectionEntryOutcomeStore();
+    if (directionEntryReconcilerActive(process.env)) {
+      const rehydrated = rehydrateFourBrainOutcomeLedgerFromJournals({
+        ledger: fourBrainOutcomeLedger,
+        journalFiles: [
+          "data/four-brain-decision-journal.jsonl.1",
+          "data/four-brain-decision-journal.jsonl",
+        ],
+        hasProcessedDirection: (decisionId) => directionEntryOutcomeStore.hasProcessedDirection(decisionId),
+        hasProcessedEntry: (decisionId) => directionEntryOutcomeStore.hasProcessedEntry(decisionId),
+      });
+      console.log(
+        `[four-brain-outcome-rehydrate] instance=${resolveFourBrainInstanceId(process.env)} ` +
+          `direction=${rehydrated.directionRehydrated} entry=${rehydrated.entryRehydrated} ` +
+          `skippedProcessed=${rehydrated.directionSkippedProcessed + rehydrated.entrySkippedProcessed} ` +
+          `badLines=${rehydrated.badLines}`,
+      );
+    }
+    // 2026-07-23 fix: only expose these to the /api/shadow/four-brain route's getters (⇒ `enabled:true`)
+    // when the shadow cycle is ACTUALLY armed on this instance (fourBrainShadowActive — same composed
+    // gate used below to arm the interval). This `if (!isTest)` block runs on every non-test process
+    // regardless of FOUR_BRAIN_MODE, so unconditionally assigning fourBrainMetricsRef/
+    // fourBrainRecentDecisionsRef here previously made the route report enabled:true (with an honestly
+    // all-zero, but misleadingly-labeled, health object) even on an instance where shadow mode is off —
+    // indistinguishable on the dashboard from "shadow mode is on and just hasn't completed a tick yet".
+    if (fourBrainShadowActive(process.env)) {
+      fourBrainMetricsRef = fourBrainMetrics; // exposed to the shadow routes' lazy getter (see above)
+      fourBrainRecentDecisionsRef = fourBrainRecentDecisions; // exposed to the shadow routes' lazy getter
+    }
+    // Same fail-open discipline for the Direction/Entry outcome report — gated on the RECONCILER's own
+    // (stricter, 3-layer) activation, not merely fourBrainShadowActive, since the report is meaningless
+    // (perpetually empty) on an instance where the reconciler itself never runs.
+    if (directionEntryReconcilerActive(process.env)) {
+      directionEntryOutcomeReportGetterRef = () => {
+        const pendingDirectionRows = fourBrainOutcomeLedger.getPendingDirectionRows();
+        const directionByHorizon: Partial<Record<FourBrainOutcomeHorizon, number>> = {};
+        for (const row of pendingDirectionRows) directionByHorizon[row.horizon] = (directionByHorizon[row.horizon] ?? 0) + 1;
+        return buildDirectionEntryOutcomeReport(directionEntryOutcomeStore.getState(), {
+          directionByHorizon,
+          entry: fourBrainOutcomeLedger.entrySize,
+        });
+      };
+    }
+    // Real BTC ATR-percentile producer for buildFourBrainDeps (see call site below) — gated + intervaled
+    // identically to the four-brain cycle itself (fourBrainMode==="shadow" && fourBrainInstanceAllowed), so
+    // 3103 (live) never schedules this extra fetch either, matching every other four-brain-only interval in
+    // this block.
+    const btcAtrPercentileCache = getBtcAtrPercentileCacheStore();
     const CE_ALL_BUCKETS: CEBucket[] = ["WIDE_LONG", "FAST_LONG", "WIDE_SHORT", "FAST_SHORT"];
     // Retained handle for the report-only lane-context snapshot ticker (registered once, below) — see Stage-2 timer
     // ownership: single registration at boot, cleared on shutdown so a flush attempt never blocks termination.
@@ -1682,16 +1895,32 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           createdAtMs: Date.parse(i.createdAt),
         }));
       const crowdingShadow = status?.crowdingExitShadow ?? {};
+      // Memoized PER-CALL (one buildFourBrainDeps() == one gather/tick, per its own doc comment above) so
+      // the 4 CE bucket lanes share ONE composite-estimator report build, not one per direction × per CE
+      // lane bestLaneReportForDirection ends up scanning — mirrors buildLiveCortexGatherDeps's identical
+      // ceBucketsOnce contract in cortex-live-gather-bindings.ts (same underlying store, independent memo).
+      let ceBucketsCache: ReturnType<typeof buildCompositeEstimatorReport>["buckets"] | undefined;
+      const ceBucketsOnce = (): ReturnType<typeof buildCompositeEstimatorReport>["buckets"] => {
+        if (ceBucketsCache === undefined) {
+          try {
+            ceBucketsCache = buildCompositeEstimatorReport(getCompositeEstimatorStore().all).buckets;
+          } catch {
+            ceBucketsCache = [];
+          }
+        }
+        return ceBucketsCache;
+      };
       return {
         instanceId: resolveFourBrainInstanceId(process.env),
         nowMs,
         axisScore: axis.current?.score ?? null,
         axisAtMs: axis.current?.at ? Date.parse(axis.current.at) : null,
         axisSlopePerHour: axis.slopePerHour ?? null,
-        // No valid market-wide 0..100 ATR-percentile producer (the cached BTC value is an ATR/price
-        // fraction, wrong scale) ⇒ MISSING, never fabricated.
-        btcAtrPercentile: null,
-        atrAtMs: null,
+        // Real 0..100 BTC ATR-percentile, refreshed on its own ~15min interval below (see
+        // runBtcAtrPercentileRefresh) and read synchronously here — never fabricated: null until
+        // the first refresh completes or after a persistent fetch failure (fail-open).
+        btcAtrPercentile: btcAtrPercentileCache.get().percentile,
+        atrAtMs: btcAtrPercentileCache.get().atMs,
         advancersPct: latestSnap?.breadth.advancersPct ?? null,
         breadthAtMs: latestSnap?.at ? Date.parse(latestSnap.at) : null,
         // No market-wide sentiment / crowd-align / kronos-agree −1..1 producer ⇒ MISSING (CORTEX
@@ -1705,7 +1934,12 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         convictionScore: Number.isFinite(controller.convictionScore) ? controller.convictionScore : null,
         allowsLong: controller.allowsLong,
         allowsShort: controller.allowsShort,
-        bestLaneReportForDirection: () => null,
+        // Real per-direction lane-edge accessor (item 2 of the 3 permanent-null four-brain data gaps —
+        // see btc-atr-percentile-cache.ts for item 1). Picks the highest-netAvgR roster lane with
+        // resolvedCount>0 for the requested direction, reusing the SAME RC/RCS/SF/IM/PWR/CE store+report
+        // builders CORTEX's own gather already reads (see four-brain-best-lane-report.ts's doc comment
+        // for the exact selection rule + why n=0 lanes are never selectable).
+        bestLaneReportForDirection: buildLiveBestLaneReportForDirection("data", ceBucketsOnce),
         crowdAlignLong: null,
         crowdAtMs: null,
         kronosAgree: null,
@@ -1714,10 +1948,16 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         maxSignalAgeMs: 50 * 60_000,
         crowdingStateForSymbol: (symbol) => crowdingShadow[symbol]?.crowdingState ?? null,
         openPositions,
-        // No sync {price,atMs} mark source ⇒ MISSING (atMs null ⇒ the gather never treats it as fresh).
-        // Testnet holds 0 open positions today, so live exit coverage is zero; the replay harness supplies
-        // the exit-decision example. Honest — not a stub that pretends the mark is fresh.
-        markPriceForSymbol: () => ({ price: null, atMs: null }),
+        // Real synchronous {price,atMs} mark accessor (item 3 of the 3 permanent-null four-brain data
+        // gaps — see live-mark-price-cache.ts's module doc comment). Backed by a module-level singleton
+        // cache refreshed every 25s (well under FRESHNESS_TTL_MS.position's 60s) from the SAME
+        // sharedGetPositions() promise every executor already reads — see that refresh registration's
+        // own doc comment (near `sharedGetPositions` above) for why it lives in that other block and the
+        // non-interference contract with sharedGetPositions. Never fabricates: an unknown symbol, or one
+        // whose last refresh predates this call by more than the consumer's own TTL, yields
+        // {price:null, atMs:null} exactly like the old stub did — the difference is a symbol WITH a real,
+        // fresh position now gets a genuine mark instead of a permanent null.
+        markPriceForSymbol: (symbol) => getLiveMarkPriceCacheStore().get(symbol),
         // CORTEX exposes no decision id; at β=0 its finalPct equals the incumbent static weight, which is
         // the correct allocation CONTEXT for the report-only executive linkage.
         cortexDecisionId: `four-brain:${nowMs}`,
@@ -1796,7 +2036,19 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         fetchCandles: (symbol) => binanceClient.getCandles(symbol, "15m", 150).catch(() => null),
         candleTimeframe: "15m",
         activeAllocation: activeFourBrainAllocation,
-        journalAppend: (r) => fourBrainJournal.append(r),
+        // Wrapped so the SAME journalAppend call that writes the real file also mirrors records into two
+        // independent, best-effort side-observers — the bounded recent-decisions ring buffer (dashboard)
+        // and the bounded Direction/Entry outcome ledger (counterfactual-resolution foundation) — while
+        // the real file append (fourBrainJournal.append, innermost) stays the single unconditional/
+        // unaltered call; see four-brain-recent-decisions.ts / four-brain-outcome-ledger.ts's own doc
+        // comments.
+        journalAppend: wrapFourBrainJournalAppendForOutcomeLedger(
+          wrapFourBrainJournalAppendForRecentDecisions(
+            (r) => fourBrainJournal.append(r),
+            fourBrainRecentDecisions,
+          ),
+          fourBrainOutcomeLedger,
+        ),
         // Bug fix: previously unsupplied ⇒ every journaled EXECUTIVE_DECISION had instanceId/rawFeatures/
         // normalizedFeatures/sourceStatuses/missingReasons/incumbent hard-null. Built from this cycle's own
         // captured gather deps (never fabricated) + the live incumbent lane allocation.
@@ -1815,15 +2067,63 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
             `[four-brain-shadow] instance=${resolveFourBrainInstanceId(process.env)} reason=${res.tick?.reason} ` +
               `lanes=${res.tick?.metrics.laneCoverage ?? 0} positions=${res.tick?.metrics.positionCoverage ?? 0} ` +
               `decisions=${res.tick?.metrics.decisions ?? 0} coverage=${res.coverage?.capitalCoveragePct.toFixed(0) ?? "?"}% ` +
-              `completed=${s.ticks.completed} skipped=${s.ticks.skippedSingleFlight} gatherErr=${s.ticks.gatherErrors}`,
+              `completed=${s.ticks.completed} skipped=${s.ticks.skippedSingleFlight} gatherErr=${s.ticks.gatherErrors} brainErr=${s.ticks.brainErrors}`,
           );
         })
         .catch((err) => console.error("[four-brain-shadow] cycle failed", err));
     };
     // Arm the interval ONLY where the tick could actually run — 3103 (live) never even schedules it.
-    if (fourBrainMode(process.env) === "shadow" && fourBrainInstanceAllowed(process.env)) {
+    if (fourBrainShadowActive(process.env)) {
       setTimeout(fourBrainCycle, 90_000);
       setInterval(fourBrainCycle, 5 * 60_000);
+
+      // BTC ATR-percentile refresh — ATR-percentile is slow-moving (7d rolling window), so a 15min cadence is
+      // ample (mirrors SYMBOL_VOLATILITY_REFRESH_INTERVAL_MS's 20min choice for the same reason). Near-immediate
+      // warm-up fire so the value isn't null for the first full interval if avoidable; both calls are
+      // fire-and-forget (refreshBtcAtrPercentileCache never throws — fail-open, see its own doc comment).
+      const runBtcAtrPercentileRefresh = (): void => {
+        void refreshBtcAtrPercentileCache(btcAtrPercentileCache, (symbol, interval, limit) =>
+          binanceClient.getCandles(symbol, interval, limit),
+        );
+      };
+      setTimeout(runBtcAtrPercentileRefresh, 10_000);
+      setInterval(runBtcAtrPercentileRefresh, 15 * 60_000);
+    }
+
+    // ── Direction/Entry counterfactual outcome RECONCILER (2026-07-23) — its OWN interval, its OWN
+    // try/catch, fully decoupled from the four-brain shadow tick's interval/exception handling above: a
+    // bug in this reconciler can never affect that tick, or vice versa (see direction-entry-reconciler.ts's
+    // own doc). Gated by directionEntryReconcilerActive — 3 ANDed layers (a brand-new, separate
+    // FOUR_BRAIN_OUTCOME_MODE flag; fourBrainInstanceAllowed; fourBrainShadowActive) so enabling the
+    // four-brain shadow tick alone can NEVER also turn this on, and 3103 (live) is hard-blocked exactly
+    // like every other four-brain-only interval regardless of env.
+    if (directionEntryReconcilerActive(process.env)) {
+      const runDirectionEntryReconciliation = (): void => {
+        void runDirectionEntryReconciliationCycleGuarded({
+          ledger: fourBrainOutcomeLedger,
+          store: directionEntryOutcomeStore,
+          listClosedPositionPaths: () => getPositionPathRecorder().listClosedPaths(),
+          fetchDirectionCandles: () => binanceClient.getCandles("BTCUSDT", "1h", 500).catch(() => null),
+          fetchEntryTier2Candles: (symbol, sinceMs) =>
+            binanceClient
+              .getCandles(symbol, "15m", ENTRY_TIER2_HORIZON_BARS + ENTRY_TIER2_WAIT_WINDOW_BARS + 1, { startTime: sinceMs })
+              .catch(() => null),
+          now: () => Date.now(),
+        })
+          .then((res) => {
+            if (!res) return; // single-flight skip — a prior cycle is still in flight
+            console.log(
+              `[direction-entry-reconciler] instance=${resolveFourBrainInstanceId(process.env)} ` +
+                `directionProcessed=${res.directionProcessed} entryProcessed=${res.entryProcessed} ` +
+                `tier1Matched=${res.tier1Diagnostics?.matchedRows ?? 0} ` +
+                `tier1NoIdentityClose=${res.tier1Diagnostics?.rejectionReasons.NO_EXACT_LANE_SYMBOL_SIDE_CLOSE ?? 0} ` +
+                `error=${res.error ?? "none"}`,
+            );
+          })
+          .catch((err) => console.error("[direction-entry-reconciler] cycle failed", err));
+      };
+      setTimeout(runDirectionEntryReconciliation, 120_000);
+      setInterval(runDirectionEntryReconciliation, 15 * 60_000);
     }
   }
 

@@ -53,38 +53,51 @@ const XSEC_VARIANT_BY_LANE_ID: Record<string, CrossSectionalVariant> = {
   [CROSS_SECTIONAL_MIXED_LANE_ID]: "MIXED_MEAN_REVERSION",
 };
 
-type CEBucketStatsList = ReturnType<typeof buildCompositeEstimatorReport>["buckets"];
+export type CEBucketStatsList = ReturnType<typeof buildCompositeEstimatorReport>["buckets"];
 
 /** Read one directional lane's OWN realized report, mapping laneId → its edge module. null for CG lanes
  *  (no standalone report builder) and anything unrecognized. Never throws (best-effort store read). The
  *  4 CE bucket lanes share ONE composite-estimator report — `ceBucketsOnce` memoizes it so the full
- *  observation scan runs once per tick, not 4× (per-tick load matters: the shadow runs for weeks). */
-function liveLaneReport(laneId: string, dataDir: string, ceBucketsOnce: () => CEBucketStatsList): CortexLaneReportLike | null {
+ *  observation scan runs once per tick, not 4× (per-tick load matters: the shadow runs for weeks).
+ *
+ *  Exported (2026-07-23) so a SECOND, independent consumer — the four-brain layer's
+ *  bestLaneReportForDirection (see four-brain-best-lane-report.ts) — can reuse the exact same
+ *  laneId→store/report-builder mapping instead of re-deriving it. Every store getter/report builder
+ *  this function calls is a synchronous, idempotent read (not a one-shot), so a second caller in the
+ *  same tick is safe. */
+export function liveLaneReport(laneId: string, dataDir: string, ceBucketsOnce: () => CEBucketStatsList): CortexLaneReportLike | null {
   try {
     if (laneId === RC_PAPER_LANE_ID) {
-      const r = buildRegimeCompositeReport(getRegimeCompositeStore(dataDir).all);
-      return { netAvgR: r.netAvgR, pf: r.pf, resolvedCount: r.resolvedCount };
+      const store = getRegimeCompositeStore(dataDir);
+      const r = buildRegimeCompositeReport(store.all);
+      return { netAvgR: r.netAvgR, pf: r.pf, resolvedCount: r.resolvedCount, lastCycleAt: store.cycleMeta.lastCycleAt };
     }
     if (laneId === RCS_PAPER_LANE_ID) {
-      const r = buildRegimeCompositeShortReport(getRegimeCompositeShortStore(dataDir).all);
-      return { netAvgR: r.netAvgR, pf: r.pf, resolvedCount: r.resolvedCount };
+      const store = getRegimeCompositeShortStore(dataDir);
+      const r = buildRegimeCompositeShortReport(store.all);
+      return { netAvgR: r.netAvgR, pf: r.pf, resolvedCount: r.resolvedCount, lastCycleAt: store.cycleMeta.lastCycleAt };
     }
     if (laneId === SF_PAPER_LANE_ID) {
-      const r = buildShortFadeReport(getShortFadeStore(dataDir).all);
-      return { netAvgR: r.netAvgR, pf: r.pf, resolvedCount: r.resolvedCount };
+      const store = getShortFadeStore(dataDir);
+      const r = buildShortFadeReport(store.all);
+      return { netAvgR: r.netAvgR, pf: r.pf, resolvedCount: r.resolvedCount, lastCycleAt: store.cycleMeta.lastCycleAt };
     }
     if (laneId === IM_PAPER_LANE_ID) {
+      // 2026-07-22 note: this store does not track a cycleMeta timestamp — lastCycleAt omitted
+      // (never guessed), so this lane simply cannot be marked STALE yet, same as before this fix.
       const r = buildIntradayMomentumReport(getIntradayMomentumStore(dataDir).all);
       return { netAvgR: r.netAvgR, pf: r.pf, resolvedCount: r.resolvedCount };
     }
     if (laneId === PWR_PAPER_LANE_ID) {
-      const r = buildPanicWashoutReport(getPanicWashoutStore(dataDir).all);
-      return { netAvgR: r.netAvgR, pf: r.pf, resolvedCount: r.resolvedCount };
+      const store = getPanicWashoutStore(dataDir);
+      const r = buildPanicWashoutReport(store.all);
+      return { netAvgR: r.netAvgR, pf: r.pf, resolvedCount: r.resolvedCount, lastCycleAt: store.cycleMeta.lastCycleAt };
     }
     const bucket = CE_BUCKET_BY_LANE_ID[laneId];
     if (bucket) {
       const stats = ceBucketsOnce().find((b) => b.bucket === bucket);
-      return stats ? { netAvgR: stats.netAvgR, pf: stats.pf, resolvedCount: stats.resolvedCount } : null;
+      const lastCycleAt = getCompositeEstimatorStore(dataDir).cycleMeta.lastCycleAt;
+      return stats ? { netAvgR: stats.netAvgR, pf: stats.pf, resolvedCount: stats.resolvedCount, lastCycleAt } : null;
     }
     return null; // CG paper-mirror lanes + unknown ids → own-report not sourced (edge-memory drives magnitude)
   } catch {
@@ -158,5 +171,6 @@ export function buildLiveCortexGatherDeps(input: LiveCortexGatherInputs): Cortex
     currentEquity: input.currentEquity ?? null,
     currentDrawdownUsd: input.currentDrawdownUsd ?? null,
     killBudgetUsd: input.killBudgetUsd,
+    nowMs,
   };
 }

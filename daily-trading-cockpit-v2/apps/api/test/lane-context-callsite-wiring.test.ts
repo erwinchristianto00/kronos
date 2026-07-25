@@ -385,6 +385,77 @@ describe("snapshot lookback covers a long-held lane's entry decision (BUG 1 fix)
     const rec = JSON.parse(readFileSync(join(snapDir, "resolutions.jsonl"), "utf8").trim().split("\n")[0]!) as { attributionStatus: string };
     expect(rec.attributionStatus).not.toBe("ATTRIBUTED");
   });
+
+  it("(c) a batch of many outcomes shares ONE snapshot-tail read (2026-07-20 incident fix) without cross-contaminating attribution", () => {
+    // Regression for the profiler-confirmed hotspot: snapshotDecisionsFor used to re-read + re-parse the whole
+    // (up to 50,000-line) snapshot tail once PER OUTCOME in the batch. The fix caches that read once per scan.
+    // This proves the shared cache still attributes each outcome to ITS OWN matching decision — the cache only
+    // memoizes the RAW parsed records; the identity filter still runs fresh per outcome — and that the
+    // per-outcome snapshotTailInsufficient tripwire still fires only for the outcome whose openedAtMs genuinely
+    // isn't covered, not for every outcome in the batch once the cache is warm.
+    const dir = tmp();
+    const snapDir = join(dir, "lane-context", "3102");
+    mkdirSync(snapDir, { recursive: true });
+    const total = 60_000; // exceeds SNAPSHOT_LOOKBACK_LINES (50,000) so the tail read is genuinely capped
+    const lines: string[] = [];
+    // Filler lines FIRST (oldest, earliest file position — a real append-only journal writes oldest-first)...
+    for (let i = 0; i < total; i += 1) {
+      lines.push(JSON.stringify({ decisionId: `dec-filler-${i}`, asOfMs: 100_000 + i, laneId: "OTHER_LANE", symbolOrBasketId: "SOLUSDT", direction: "SHORT", featureSchemaVersion: "lane-context-1" }));
+    }
+    // ...then the two DISTINCT target decisions LAST (most recent file position), each for a different
+    // lane/symbol — readTailLines reads the last N LINES (file position), not the N most-recent by asOfMs, so
+    // a target this test wants inside the tail window must actually be near the end of the file.
+    lines.push(JSON.stringify({ decisionId: "dec-alpha", asOfMs: 590_000, laneId: "CG_WIDE_LONG_RUNNER", symbolOrBasketId: "BTCUSDT", direction: "LONG", featureSchemaVersion: "lane-context-1" }));
+    lines.push(JSON.stringify({ decisionId: "dec-beta", asOfMs: 590_500, laneId: "CG_WIDE_FAST_LONG", symbolOrBasketId: "ETHUSDT", direction: "LONG", featureSchemaVersion: "lane-context-1" }));
+    writeFileSync(join(snapDir, "snapshots.jsonl"), `${lines.join("\n")}\n`);
+
+    const covered = closedOrder({
+      // openedAt AFTER the tail's oldest retained record ⇒ within coverage, must attribute cleanly.
+      paperOrderId: "covered-po", selectedLaneId: "CG_WIDE_LONG_RUNNER", symbol: "BTCUSDT", direction: "LONG",
+      openedAt: new Date(591_000).toISOString(), closedAtMs: 650_000, resolvedAtMs: 660_000,
+      netR: 0.9, grossR: 1.0, costR: -0.1, // arithmetically consistent (netR = grossR + costR) — the fixture default isn't
+    });
+    const uncovered = closedOrder({
+      // openedAt far BEFORE the tail's oldest retained record ⇒ genuinely not covered, must trip the tripwire.
+      paperOrderId: "uncovered-po", selectedLaneId: "CG_WIDE_FAST_LONG", symbol: "ETHUSDT", direction: "LONG",
+      openedAt: new Date(1_000).toISOString(), closedAtMs: 651_000, resolvedAtMs: 661_000,
+      netR: 0.9, grossR: 1.0, costR: -0.1,
+    });
+
+    const r = runLaneResolutionScan([covered, uncovered], 700_000, shadowEnv(dir));
+    expect(r.ran).toBe(true);
+    const recs = readFileSync(join(snapDir, "resolutions.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l) as { outcomeId: string; attributionStatus: string; attributedDecisionId: string | null });
+    const coveredRec = recs.find((rec) => rec.outcomeId === "covered-po")!;
+    const uncoveredRec = recs.find((rec) => rec.outcomeId === "uncovered-po")!;
+    expect(coveredRec.attributionStatus).toBe("ATTRIBUTED");
+    expect(coveredRec.attributedDecisionId).toBe("dec-alpha"); // never dec-beta — the shared cache didn't cross-contaminate
+    expect(uncoveredRec.attributionStatus).not.toBe("ATTRIBUTED");
+    // Exactly one outcome in this batch is genuinely uncovered — the tripwire counts it once, not once per outcome.
+    expect(scanMetrics.snapshotTailInsufficient).toBe(1);
+  });
+
+  it("[REGRESSION 2026-07-22] an outcome with a missing/unparsable openedAt never false-positives the tripwire, even under a genuinely-capped tail", () => {
+    // Same capped-tail setup as (b), but this outcome's own openedAt is missing entirely — toClosedOutcome()
+    // falls back to openedAtMs: 0 (no real trade ever opens at Unix epoch). Before the fix, `oldestAsOf >= 0` is
+    // true for any real (positive) oldestAsOf, so the tripwire fired for EVERY such outcome once the tail hit its
+    // cap — a false alarm, since "did we read back far enough" is meaningless without a real open time to compare.
+    const dir = tmp();
+    const snapDir = join(dir, "lane-context", "3102");
+    mkdirSync(snapDir, { recursive: true });
+    const total = 60_000; // exceeds SNAPSHOT_LOOKBACK_LINES (50,000) — genuinely capped
+    const lines: string[] = [];
+    for (let i = 0; i < total; i += 1) {
+      lines.push(JSON.stringify({ decisionId: `dec-${i}`, asOfMs: 100_000 + i, laneId: "OTHER_LANE", symbolOrBasketId: "ETHUSDT", direction: "SHORT", featureSchemaVersion: "lane-context-1" }));
+    }
+    writeFileSync(join(snapDir, "snapshots.jsonl"), `${lines.join("\n")}\n`);
+    const order = closedOrder({
+      paperOrderId: "no-openedat-po", selectedLaneId: "CG_WIDE_LONG_RUNNER", symbol: "BTCUSDT", direction: "LONG",
+      openedAt: undefined, closedAtMs: 500_000, resolvedAtMs: 600_000,
+    });
+    const r = runLaneResolutionScan([order], 700_000, shadowEnv(dir));
+    expect(r.ran).toBe(true);
+    expect(scanMetrics.snapshotTailInsufficient).toBe(0); // no real openedAtMs to judge coverage against
+  });
 });
 
 // ═══════════════════════════════ 7. WRITER-LOCK FAILURE RETRY (BUG 3) ═══════════════════════════════

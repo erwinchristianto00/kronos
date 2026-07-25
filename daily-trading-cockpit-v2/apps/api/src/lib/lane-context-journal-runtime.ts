@@ -67,6 +67,10 @@ function toClosedOutcome(o: PaperOrderLike): ClosedOutcomeInput {
   const openedAtMs = o.openedAt ? Date.parse(o.openedAt) : NaN;
   return {
     outcomeId: o.paperOrderId, laneId: o.selectedLaneId ?? "?", symbolOrBasketId: o.symbol ?? "?", direction: o.direction ?? "LONG",
+    // ClosedOutcomeInput.openedAtMs is a required `number` (used elsewhere for attributionLagMs
+    // arithmetic), so a genuinely missing/unparsable openedAt falls back to epoch 0 here — no real
+    // trade ever opens at Unix epoch, so `> 0` downstream (snapshotDecisionsFor's tripwire) is a safe,
+    // unambiguous "was this a real timestamp" gate without widening the shared type to `| null`.
     openedAtMs: Number.isFinite(openedAtMs) ? openedAtMs : 0,
     closedAtMs: typeof o.closedAtMs === "number" ? o.closedAtMs : null, // PERSISTED market close ts (Track 1a) — never a draft
     resolvedAtMs: typeof o.resolvedAtMs === "number" ? o.resolvedAtMs : null,
@@ -85,19 +89,41 @@ function ensureWriterLock(dir: string, instanceId: string, nowMs: number): boole
   return writerLockOk;
 }
 
-/** Read recent lane-context snapshots from the snapshot journal for attribution (identity-filtered by the caller). */
-function snapshotDecisionsFor(paths: ReturnType<typeof laneJournalPaths>, o: ClosedOutcomeInput): LaneContextSnapshot[] {
+interface SnapshotTailCache {
+  hitCap: boolean;
+  oldestAsOf: number | null;
+  records: LaneContextSnapshot[];
+}
+
+/**
+ * Read recent lane-context snapshots from the snapshot journal for attribution (identity-filtered by the caller).
+ * `planResolutions` (lane-outcome-processor.ts) calls this ONCE PER OUTCOME in the batch being resolved — a batch
+ * of N closed orders previously re-read + re-parsed the (up to SNAPSHOT_LOOKBACK_LINES = 50,000-line) snapshot tail
+ * N separate times, since the read/parse lived inside this per-outcome function. 2026-07-20 incident: this was the
+ * same O(outcomes × journal-size) shape already documented and fixed once in forward-causal-collection.ts's
+ * existingEventIds — it just hadn't been fixed here yet, and was a real, profiler-confirmed contributor to
+ * testnet's event-loop starvation. The read+parse now happens at most ONCE per scan, cached in `cache` (passed by
+ * the caller, one instance per `runLaneResolutionScan` invocation) — every subsequent outcome in the same batch
+ * reuses the already-parsed records and only pays for its own (cheap, in-memory) identity filter.
+ */
+function snapshotDecisionsFor(paths: ReturnType<typeof laneJournalPaths>, o: ClosedOutcomeInput, cache: { tail?: SnapshotTailCache }): LaneContextSnapshot[] {
   try {
-    const rawLines = prod.fs.readTailLines(paths.snapshots, SNAPSHOT_LOOKBACK_LINES);
-    const parsed = parseJsonlTail(rawLines);
-    const records = parsed.records as unknown as LaneContextSnapshot[];
-    // SURFACE a potential un-recovered gap: the tail hit the line cap (more history may exist beyond it) AND its
-    // oldest record is still not older than the outcome's open time ⇒ a matching pre-open decision could sit
-    // further back than this read reached — mirrors runResolutionScan's recoveryTailInsufficient tripwire.
-    if (rawLines.length >= SNAPSHOT_LOOKBACK_LINES) {
+    if (!cache.tail) {
+      const rawLines = prod.fs.readTailLines(paths.snapshots, SNAPSHOT_LOOKBACK_LINES);
+      const parsed = parseJsonlTail(rawLines);
+      const records = parsed.records as unknown as LaneContextSnapshot[];
       const oldestAsOf = records.reduce<number | null>((min, r) => (r && Number.isFinite(r.asOfMs) ? (min == null ? r.asOfMs : Math.min(min, r.asOfMs)) : min), null);
-      if (oldestAsOf != null && oldestAsOf >= o.openedAtMs) scanMetrics.snapshotTailInsufficient += 1;
+      cache.tail = { hitCap: rawLines.length >= SNAPSHOT_LOOKBACK_LINES, oldestAsOf, records };
     }
+    const { hitCap, oldestAsOf, records } = cache.tail;
+    // SURFACE a potential un-recovered gap: the tail hit the line cap (more history may exist beyond it) AND its
+    // oldest record is still not older than THIS outcome's open time ⇒ a matching pre-open decision could sit
+    // further back than this read reached — mirrors runResolutionScan's recoveryTailInsufficient tripwire. This
+    // check stays per-outcome (each has its own openedAtMs) even though the underlying read is now shared.
+    // o.openedAtMs === 0 means toClosedOutcome() never had a real timestamp for this outcome (missing
+    // or unparsable openedAt) — the "did we read back far enough" question is meaningless without one,
+    // so it must not be evaluated (would otherwise false-positive on every such outcome once hitCap).
+    if (hitCap && oldestAsOf != null && o.openedAtMs > 0 && oldestAsOf >= o.openedAtMs) scanMetrics.snapshotTailInsufficient += 1;
     return records.filter((s) => s && s.laneId === o.laneId && s.symbolOrBasketId === o.symbolOrBasketId && s.direction === o.direction);
   } catch { return []; }
 }
@@ -115,10 +141,11 @@ export function runLaneResolutionScan(orders: PaperOrderLike[], nowMs: number, e
     const paths = laneJournalPaths(act.instanceId, dir);
     if (!ensureWriterLock(paths.dir, act.instanceId, nowMs)) { scanMetrics.scansSkipped += 1; return { ran: false, reason: "writer-lock-unavailable" }; }
     const closedOutcomes = orders.map(toClosedOutcome);
+    const snapshotCache: { tail?: SnapshotTailCache } = {}; // one per scan — shared across every outcome this batch
     const r = runResolutionScan({
       env, baseDir: dir, fs: prod.fs, nowMs, singleFlightGuard: scanSingleFlight,
       readOutcomes: (since) => closedOutcomes.filter((o) => o.resolvedAtMs == null || o.resolvedAtMs >= since),
-      decisionsFor: (o) => snapshotDecisionsFor(paths, o), metrics: scanMetrics, ...CONFIG,
+      decisionsFor: (o) => snapshotDecisionsFor(paths, o, snapshotCache), metrics: scanMetrics, ...CONFIG,
     });
     return { ran: r.ran, reason: r.reason };
   } catch { return { ran: false, reason: "runtime-failed-open" }; } // NEVER throws into the resolver

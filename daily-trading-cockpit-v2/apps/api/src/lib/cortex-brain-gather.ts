@@ -54,13 +54,36 @@ export function xsecReturnToR(
   return { value: netAvgReturn / stopDistance, status: "FRESH", numerator: netAvgReturn, denominator: stopDistance };
 }
 
-/** A directional lane's own report netAvgR, guarding the CG/VM `0-at-n=0` fabrication → null. */
+/** 2026-07-22 bug-hunt fix: STALE was declared in CortexFeatureStatus but no function ever computed
+ *  it — a frozen upstream lane report (this codebase has a documented real precedent: a resolver
+ *  silently frozen for 18 days) looked FRESH forever. 6h is generous vs the shadow tick's own ~7min
+ *  cadence, and tight enough to catch a genuinely-frozen lane long before it reaches that incident's
+ *  scale. Optional on purpose: several lane stores don't track a cycle timestamp at all (see
+ *  liveLaneReport/liveXsecReport in cortex-live-gather-bindings.ts) — absence must mean "cannot
+ *  judge staleness", never "assume stale" or "assume fresh". */
+export const CORTEX_LANE_STALE_MAX_AGE_MS = 6 * 3_600_000;
+
+export interface CortexLaneCycleStaleness {
+  lastCycleAt: string | null | undefined;
+  nowMs: number;
+}
+
+function isLaneCycleStale(staleness?: CortexLaneCycleStaleness): boolean {
+  if (!staleness || !staleness.lastCycleAt) return false;
+  const lastMs = Date.parse(staleness.lastCycleAt);
+  if (!Number.isFinite(lastMs)) return false;
+  return staleness.nowMs - lastMs > CORTEX_LANE_STALE_MAX_AGE_MS;
+}
+
+/** A directional lane's own report netAvgR, guarding the CG/VM `0-at-n=0` fabrication → null.
+ *  `staleness` is optional (omit when the source store tracks no cycle timestamp at all). */
 export function laneNetAvgRGuarded(
   netAvgR: number | null,
   n: number,
+  staleness?: CortexLaneCycleStaleness,
 ): { value: number | null; status: CortexFeatureStatus } {
   if (n === 0 || !finite(netAvgR)) return { value: null, status: "MISSING" };
-  return { value: netAvgR, status: "FRESH" };
+  return { value: netAvgR, status: isLaneCycleStale(staleness) ? "STALE" : "FRESH" };
 }
 
 /** The report builders' "all wins, zero losses" sentinel (grossLoss==0 && grossWin>0 → 999). It is NOT a
@@ -68,9 +91,13 @@ export function laneNetAvgRGuarded(
  *  than saturating the lanePf feature at its cap (x[6]=clamp(999−1)=2) off a thin lucky all-win lane. */
 export const CORTEX_PF_ALLWINS_SENTINEL = 999;
 /** PF: unavailable / no report / no-losses-null / all-wins-sentinel → null, NOT 1 (feature neutral-fills to 1). */
-export function lanePfGuarded(pf: number | null, hasReport: boolean): { value: number | null; status: CortexFeatureStatus } {
+export function lanePfGuarded(
+  pf: number | null,
+  hasReport: boolean,
+  staleness?: CortexLaneCycleStaleness,
+): { value: number | null; status: CortexFeatureStatus } {
   if (!hasReport || !finite(pf) || pf === CORTEX_PF_ALLWINS_SENTINEL) return { value: null, status: "MISSING" };
-  return { value: pf, status: "FRESH" };
+  return { value: pf, status: isLaneCycleStale(staleness) ? "STALE" : "FRESH" };
 }
 
 /**
@@ -140,6 +167,12 @@ export interface CortexLaneRaw {
   /** the lane's OWN report; for XSEC pass isXsec=true + netAvgReturnFraction (per-basket %). */
   reportNetAvgR: number | null; // R for non-XSEC lanes; ignored for XSEC (use xsecNetAvgReturn)
   reportPf: number | null;
+  /** 2026-07-22 bug-hunt fix: the source store's own cycleMeta.lastCycleAt, when it tracks one —
+   *  undefined/null for stores that don't (see liveLaneReport's doc comment). Feeds STALE detection
+   *  in laneNetAvgRGuarded/lanePfGuarded; absence never implies fresh OR stale. */
+  lastCycleAt?: string | null;
+  /** Wall-clock "now" for this gather (pure function — never reads Date.now() itself). */
+  nowMs: number;
   reportN: number;
   hasReport: boolean;
   isXsec: boolean;
@@ -165,10 +198,11 @@ export interface CortexLaneFeatureDebug {
 
 /** Apply the full contract to one lane's raw inputs → the observation + a per-feature status debug. */
 export function buildLaneObservationFromRaw(raw: CortexLaneRaw): { obs: CortexLaneObservation; debug: CortexLaneFeatureDebug } {
+  const staleness: CortexLaneCycleStaleness = { lastCycleAt: raw.lastCycleAt, nowMs: raw.nowMs };
   const laneR = raw.isXsec
     ? xsecReturnToR(raw.xsecNetAvgReturn, raw.xsecStopDistance, raw.reportN)
-    : laneNetAvgRGuarded(raw.reportNetAvgR, raw.reportN);
-  const pf = lanePfGuarded(raw.reportPf, raw.hasReport);
+    : laneNetAvgRGuarded(raw.reportNetAvgR, raw.reportN, staleness);
+  const pf = lanePfGuarded(raw.reportPf, raw.hasReport, staleness);
   const crowd = crowdingAlignForLane(raw.crowdSides, raw.direction);
   const edgeMemStatus: CortexFeatureStatus = raw.direction === "NEUTRAL" || !finite(raw.edgeMemAvgNetR) || raw.edgeMemN === 0 ? "MISSING" : "FRESH";
   const kronosStatus: CortexFeatureStatus = finite(raw.kronosAgree) ? "FRESH" : "MISSING";

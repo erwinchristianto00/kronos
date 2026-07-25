@@ -1,8 +1,24 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import { runFourBrainShadowTick, _resetFourBrainSingleFlightForTests } from "../src/lib/four-brain-shadow-tick.js";
 import { assembleFourBrainTick } from "../src/lib/four-brain-live-gather.js";
-import { buildFourBrainGatherInput, resolveFourBrainInstanceId, fourBrainInstanceAllowed, unrealizedRFromPosition, type FourBrainBindingDeps, type EntryMicrostructure } from "../src/lib/four-brain-live-gather-bindings.js";
+import { buildFourBrainGatherInput, resolveFourBrainInstanceId, fourBrainInstanceAllowed, fourBrainShadowActive, unrealizedRFromPosition, type FourBrainBindingDeps, type EntryMicrostructure } from "../src/lib/four-brain-live-gather-bindings.js";
 import { decideEntry } from "../src/lib/entry-brain.js";
+
+// 2026-07-22 regression harness: runBrainSafely isolation needs ONE brain call to genuinely throw, which
+// none of the pure brains do on any malformed-but-typed input (by design — they degrade gracefully). A
+// module mock is the clean way to prove isolation without fighting that design. Default OFF (real
+// decideEntry runs for every other test in this file); a single test flips it on, then resets in `finally`.
+let forceEntryBrainThrow = false;
+vi.mock("../src/lib/entry-brain.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/lib/entry-brain.js")>();
+  return {
+    ...actual,
+    decideEntry: (input: Parameters<typeof actual.decideEntry>[0]) => {
+      if (forceEntryBrainThrow) throw new Error("[test] forced decideEntry crash");
+      return actual.decideEntry(input);
+    },
+  };
+});
 
 const NOW = 1_800_000_000_000;
 const MIN = 60_000;
@@ -116,6 +132,22 @@ describe("Four-Brain shadow tick — decisions + journal + determinism", () => {
     }
   });
 
+  it("[REGRESSION 2026-07-22] one candidate's decideEntry throwing does NOT abort the whole tick — the market snapshot + the exit candidate's decision still journal, and it's counted (not silently lost)", () => {
+    forceEntryBrainThrow = true;
+    try {
+      const j = spyJournal();
+      const r = runFourBrainShadowTick({ mode: "shadow", nowMs: NOW, gather: gatherFrom(fakeDeps()), journalAppend: j.append, tickId: "t" });
+      expect(r.ran).toBe(true); // the tick as a WHOLE still completes — previously this would have been reason:"exception", ran:false
+      expect(r.metrics.brainErrors).toBeGreaterThan(0);
+      expect(r.executiveDecisions).toHaveLength(1); // only the exit candidate's exec survives; the entry candidate is skipped
+      const kinds = j.records.map((x) => x.kind);
+      expect(kinds).toContain("MARKET_SNAPSHOT"); // previously would have been lost too (whole-tick abort)
+      expect(kinds).toContain("EXECUTIVE_DECISION");
+    } finally {
+      forceEntryBrainThrow = false;
+    }
+  });
+
   it("review fix (HIGH): an emitMetrics that throws does NOT escape the tick (fail-open)", () => {
     const r = runFourBrainShadowTick({ mode: "shadow", nowMs: NOW, gather: gatherFrom(fakeDeps()), journalAppend: () => {}, emitMetrics: () => { throw new Error("metrics sink down"); }, tickId: "t" });
     expect(r.ran).toBe(true); // metrics throw swallowed
@@ -196,6 +228,26 @@ describe("Four-Brain gather assembly — identity, freshness, unknown lanes", ()
     expect(entryExec?.entry?.action).toBe("SKIP");
   });
 
+  it("[FIX 2026-07-24] two DIFFERENT real candidates sharing side+action get DISTINCT entry.decisionId end-to-end — the collision this task fixes (decisionId used to be a pure function of nowMs+side+action only, silently dropping/misattributing the losing candidate's counterfactual outcome)", () => {
+    const dep = fakeDeps({
+      openSignals: [
+        { laneId: "REGIME_COMPOSITE_CONFIRMATION_LONG", symbol: "BTCUSDT", direction: "LONG", observationId: "old-1", openedAtMs: NOW - 90 * MIN, entryPrice: 100, stopPrice: 97 },
+        { laneId: "COMPOSITE_ESTIMATOR_BIDI_WIDE_LONG", symbol: "ETHUSDT", direction: "LONG", observationId: "old-2", openedAtMs: NOW - 90 * MIN, entryPrice: 200, stopPrice: 194 },
+      ],
+    });
+    const g = assembleFourBrainTick(buildFourBrainGatherInput(dep));
+    expect(g.entryCandidates).toHaveLength(2); // distinct identities — neither rejected as a duplicate
+    const [c1, c2] = g.entryCandidates;
+    expect(c1!.input.candidateKey).toBeTruthy();
+    expect(c2!.input.candidateKey).toBeTruthy();
+    expect(c1!.input.candidateKey).not.toBe(c2!.input.candidateKey); // the gather wired a real, distinct salt
+    const d1 = decideEntry(c1!.input);
+    const d2 = decideEntry(c2!.input);
+    expect(d1.action).toBe("SKIP");
+    expect(d2.action).toBe("SKIP"); // BOTH SKIP: same side+action bucket — would have collided pre-fix
+    expect(d1.decisionId).not.toBe(d2.decisionId);
+  });
+
   it("MISSING microstructure stays MISSING (never fabricated); a future timestamp is ERROR", () => {
     const g = assembleFourBrainTick(buildFourBrainGatherInput(fakeDeps()));
     const entry = g.entryCandidates[0]!;
@@ -272,6 +324,29 @@ describe("Four-Brain incumbent parity", () => {
     expect(fourBrainInstanceAllowed({ PORT: "3103", FOUR_BRAIN_INSTANCE_ALLOWLIST: "3101,3102,3103" } as NodeJS.ProcessEnv)).toBe(false);
     // an unknown instance not in the allowlist is excluded
     expect(fourBrainInstanceAllowed({ PORT: "9999" } as NodeJS.ProcessEnv)).toBe(false);
+  });
+
+  // Regression (2026-07-23): app.ts used to expose fourBrainMetricsRef/fourBrainRecentDecisionsRef to the
+  // /api/shadow/four-brain route unconditionally inside its `if (!isTest)` wiring block — i.e. on EVERY
+  // non-test process regardless of FOUR_BRAIN_MODE — so the route's `enabled: health !== null` was really
+  // testing "did this process reach that code block", not "is the shadow cycle actually armed here". A
+  // mode-off (or non-allowlisted) instance would report enabled:true with an honestly-all-zero but
+  // misleadingly-labeled health object, indistinguishable from "shadow mode is on and hasn't ticked yet".
+  // fourBrainShadowActive is the single composed gate app.ts now uses for BOTH arming the interval AND
+  // exposing the refs, so this proves the exact condition the route's honesty depends on.
+  it("fourBrainShadowActive requires BOTH mode==='shadow' AND instance-allowed — off/unallowlisted/live-port must be false", () => {
+    expect(fourBrainShadowActive({ FOUR_BRAIN_MODE: "shadow", PORT: "3101" } as NodeJS.ProcessEnv)).toBe(true);
+    expect(fourBrainShadowActive({ FOUR_BRAIN_MODE: "shadow", PORT: "3102" } as NodeJS.ProcessEnv)).toBe(true);
+    // mode off (the default) ⇒ inactive even on an otherwise-allowed instance
+    expect(fourBrainShadowActive({ PORT: "3101" } as NodeJS.ProcessEnv)).toBe(false);
+    expect(fourBrainShadowActive({} as NodeJS.ProcessEnv)).toBe(false);
+    // mode on but the instance isn't allowlisted
+    expect(fourBrainShadowActive({ FOUR_BRAIN_MODE: "shadow", PORT: "9999" } as NodeJS.ProcessEnv)).toBe(false);
+    // mode on but this IS the hard-blocked live instance — never active no matter what
+    expect(fourBrainShadowActive({ FOUR_BRAIN_MODE: "shadow", PORT: "3103" } as NodeJS.ProcessEnv)).toBe(false);
+    expect(
+      fourBrainShadowActive({ FOUR_BRAIN_MODE: "shadow", PORT: "3103", FOUR_BRAIN_INSTANCE_ALLOWLIST: "3101,3102,3103" } as NodeJS.ProcessEnv),
+    ).toBe(false);
   });
 });
 

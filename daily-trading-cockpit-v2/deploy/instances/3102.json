@@ -1,0 +1,8 @@
+{
+  "instanceId": "3102",
+  "role": "testnet",
+  "apiPort": 3102,
+  "pm2Process": "dtc-api-testnet",
+  "manifestPath": "deploy/manifests/3102.json",
+  "protectedFromRuntimeDeployment": false
+}

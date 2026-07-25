@@ -1788,8 +1788,12 @@ describe("dashboard audit summary", () => {
       metadataFetchImpl: async () => [],
     } as never);
 
-    const routeTree = app.printRoutes();
-    expect(routeTree).toContain("dashboard-audit-summary (GET, HEAD)");
+    // Uses Fastify's own route-introspection API rather than string-matching printRoutes()'s
+    // prefix-compressed tree output — that tree's exact text shape shifts whenever any OTHER route
+    // sharing a leading path segment is registered/removed elsewhere in shadow.ts, which is unrelated
+    // to whether THIS route is actually registered (see direction-entry-outcomes, added 2026-07-23,
+    // which shares the "/api/shadow/d..." prefix and previously broke this assertion for that reason).
+    expect(app.hasRoute({ method: "GET", url: "/api/shadow/dashboard-audit-summary" })).toBe(true);
     expect(getAllPositionsCalls).toBe(0);
     expect(positions).toEqual([]);
     void app.close();

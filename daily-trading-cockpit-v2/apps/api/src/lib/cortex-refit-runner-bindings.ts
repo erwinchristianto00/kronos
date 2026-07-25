@@ -6,7 +6,13 @@
  */
 import { existsSync, readFileSync } from "node:fs";
 import { CORTEX_FEATURE_SCHEMA_VERSION } from "./cortex-brain.js";
-import type { CortexDecisionRow, CortexLaneDir, CortexLaneOutcome } from "./cortex-attribution.js";
+import {
+  cortexShadowDecisionAlpha,
+  type CortexDecisionRow,
+  type CortexLaneDir,
+  type CortexLaneOutcome,
+  type CortexShadowDecisionAlphaResult,
+} from "./cortex-attribution.js";
 import {
   directionalObsToOutcome,
   xsecObsToOutcome,
@@ -31,7 +37,7 @@ import { getShortFadeStore, SF_PAPER_LANE_ID } from "./short-fade-edge.js";
 import { getIntradayMomentumStore, IM_PAPER_LANE_ID } from "./intraday-momentum-edge.js";
 import { getPanicWashoutStore, PWR_PAPER_LANE_ID } from "./panic-washout-reclaim-edge.js";
 import { getCompositeEstimatorStore, ceLaneIdForBucket } from "./composite-estimator-edge.js";
-import { CrossSectionalStore, type CrossSectionalObservation } from "./cross-sectional-edge.js";
+import { getCrossSectionalStore, type CrossSectionalObservation } from "./cross-sectional-edge.js";
 import {
   CROSS_SECTIONAL_MARKET_NEUTRAL_LANE_ID,
   CROSS_SECTIONAL_TREND_LANE_ID,
@@ -82,10 +88,23 @@ export function readCortexDecisionRows(files: string[]): { rows: CortexDecisionR
         badLines += 1;
         continue;
       }
-      if (rec.kind !== "BRAIN_DECISION" || typeof rec.at !== "string") continue;
+      // 2026-07-22 fix: these 2 checks previously dropped the line with no counter touched, contradicting
+      // this file's own header claim that "every record that can't be normalized is TALLIED by reason ...
+      // so nothing is silently dropped". A syntactically-valid but semantically-invalid line (wrong/missing
+      // `kind`/`at`, or an unparsable `at`) is exactly the class of corruption `badLines` exists to surface —
+      // it must count the same as a JSON.parse failure, not vanish silently. The dedupe check right after
+      // (identical decision re-seen across .jsonl/.jsonl.1 rotation) stays UNCOUNTED — that's expected,
+      // not corruption.
+      if (rec.kind !== "BRAIN_DECISION" || typeof rec.at !== "string") {
+        badLines += 1;
+        continue;
+      }
       if (byAt.has(rec.at)) continue; // dedupe: identical decision across rotation
       const atMs = parseIsoMs(rec.at);
-      if (atMs === null) continue;
+      if (atMs === null) {
+        badLines += 1;
+        continue;
+      }
       const lanes = new Map<string, { x: number[]; eligible: boolean; direction: CortexLaneDir | null; finalPct: number; evalFinalPct: number }>();
       const rawLanes = Array.isArray(rec.lanes) ? (rec.lanes as Record<string, unknown>[]) : [];
       for (const l of rawLanes) {
@@ -222,7 +241,14 @@ export function gatherCortexRefitInputs(deps: {
   for (const [laneId, obs] of cgByLane) directional.push({ laneId, obs });
 
   // Cross-sectional store — one store, three variants → three laneIds. netReturn is a fraction.
-  const xsecAll = new CrossSectionalStore(`${deps.dataDir}/cross-sectional-edge.json`).all;
+  // 2026-07-22 bug fix: CrossSectionalStore's constructor already appends "cross-sectional-edge.json"
+  // to dataDir internally (see cross-sectional-edge.ts) — passing an already-suffixed path here made
+  // it resolve to a nonexistent nested path, so load() silently returned {observations: []} on every
+  // call. CORTEX's attribution saw ZERO cross-sectional observations for all 3 xsec lanes (NEUTRAL/
+  // TREND/MIXED) regardless of how much real measurement/execution data existed. Use the shared
+  // singleton (matches every other store factory in this function) so this also picks up any
+  // not-yet-persisted in-process state, not just what's on disk.
+  const xsecAll = getCrossSectionalStore(deps.dataDir).all;
   const xsec: { laneId: string; obs: RawXsecObs[] }[] = Object.entries(XSEC_STORE_VARIANTS).map(([laneId, variant]) => ({
     laneId,
     obs: xsecAll
@@ -269,6 +295,42 @@ export function _resetLatestCortexRefitReportForTests(): void {
 }
 
 /**
+ * 2026-07-20 real-incident fix: the decision-alpha HTTP route originally called gatherCortexRefitInputs
+ * (full journal + every lane-store JSON re-read from disk, tens of MB) fresh on EVERY request. The
+ * dashboard card polls it every 10s, which repeatedly blocked the single Node event loop long enough to
+ * starve the paper-cycle tick and inflate the Binance clock-sync measurement into a false "clock skew"
+ * refusal — testnet effectively hung. Fix: compute decision-alpha ONCE per refit cycle here (reusing
+ * `report.examples` — runCortexRefit's own attributeOutcomes() output, see its doc comment in
+ * cortex-refit-runner.ts; 2026-07-22 fix removed a SECOND attributeOutcomes call that used to
+ * recompute the identical result here — zero extra disk I/O AND zero duplicate CPU work now), cache
+ * it, and have the HTTP route (cortex-decision-alpha-report.ts) only ever read the cache. */
+let latestDecisionAlpha: { generatedAtMs: number; examplesConsidered: number; journalBadLines: number; decisionAlpha: CortexShadowDecisionAlphaResult } | null = null;
+export function getLatestCortexShadowDecisionAlpha(): typeof latestDecisionAlpha {
+  return latestDecisionAlpha;
+}
+export function _resetLatestCortexShadowDecisionAlphaForTests(): void {
+  latestDecisionAlpha = null;
+}
+
+/** Same shape as above, but scoped to outcomes resolved within the CURRENT UTC calendar day only — this is
+ *  what lets the "Realized P&L (today)" dashboard panel show CORTEX's shadow contribution alongside the
+ *  real (non-CORTEX) P&L for the SAME day, instead of only an all-time/window figure. Computed from the
+ *  SAME already-gathered `report.examples` as latestDecisionAlpha — a cheap in-memory filter, zero extra I/O. */
+let latestDecisionAlphaToday: { generatedAtMs: number; dayStartMs: number; examplesConsidered: number; decisionAlpha: CortexShadowDecisionAlphaResult } | null = null;
+export function getLatestCortexShadowDecisionAlphaToday(): typeof latestDecisionAlphaToday {
+  return latestDecisionAlphaToday;
+}
+export function _resetLatestCortexShadowDecisionAlphaTodayForTests(): void {
+  latestDecisionAlphaToday = null;
+}
+/** Test-only: inject a specific cached "today" value (e.g. a stale prior-day cache) without running
+ *  the full nightly-refit pipeline — see cortex-decision-alpha-report.test.ts's 2026-07-22 stale-cache
+ *  regression test. */
+export function _setLatestCortexShadowDecisionAlphaTodayForTests(value: typeof latestDecisionAlphaToday): void {
+  latestDecisionAlphaToday = value;
+}
+
+/**
  * One nightly refit pass, wired to the real stores + journal. Report-only + idempotent: applies ACCEPTED
  * archetype refits + advances cumulativeResolved/resolvedByFamily via the watermark, and NEVER touches
  * CORTEX_LIVE_BETA. Never throws through (a refit failure must not break the tick that schedules it).
@@ -292,7 +354,35 @@ export function runCortexNightlyRefit(deps: {
   const report = runCortexRefit(deps.store, { ...input, apply: deps.apply });
   const withMeta = { ...report, journalBadLines: input.journalBadLines };
   latestRefitReport = withMeta;
+
+  // 2026-07-22 bug-hunt fix: reuse THIS run's own attributeOutcomes() output (report.examples) —
+  // runCortexRefit already computed it on the exact same inputs a few lines above. Re-running the
+  // full sort + per-lane TTL-window search + dedupe walk here doubled the CPU cost of every nightly
+  // refit tick on identical data (see cortex-refit-runner.ts's CortexRefitReport.examples doc comment).
+  const attrExamples = report.examples;
+  latestDecisionAlpha = {
+    generatedAtMs: deps.nowMs,
+    examplesConsidered: attrExamples.length,
+    journalBadLines: input.journalBadLines,
+    decisionAlpha: cortexShadowDecisionAlpha(attrExamples),
+  };
+
+  const dayStartMs = startOfUtcDayMs(deps.nowMs);
+  const todaysExamples = attrExamples.filter((e) => e.resolvedAtMs >= dayStartMs);
+  latestDecisionAlphaToday = {
+    generatedAtMs: deps.nowMs,
+    dayStartMs,
+    examplesConsidered: todaysExamples.length,
+    decisionAlpha: cortexShadowDecisionAlpha(todaysExamples),
+  };
+
   return withMeta;
+}
+
+/** Start of the UTC calendar day containing `nowMs`, as an epoch-ms boundary. Pure, no Date-locale
+ *  ambiguity (integer floor-division on epoch ms is always UTC by construction). */
+export function startOfUtcDayMs(nowMs: number): number {
+  return Math.floor(nowMs / 86_400_000) * 86_400_000;
 }
 
 export { CORTEX_LANE_ROSTER };

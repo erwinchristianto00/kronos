@@ -3,22 +3,32 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { buildCortexCollectionStatus } from "../src/lib/cortex-collection-status.js";
+import { _resetCortexCollectionStatusAccumulatorsForTests, buildCortexCollectionStatus } from "../src/lib/cortex-collection-status.js";
 import { resolveCausalCollectionActivation } from "../src/experience-engine/forward-causal-collection.js";
 
 const dirs: string[] = [];
-afterEach(() => dirs.splice(0).forEach((dir) => rmSync(dir, { recursive: true, force: true })));
+afterEach(() => {
+  dirs.splice(0).forEach((dir) => rmSync(dir, { recursive: true, force: true }));
+  _resetCortexCollectionStatusAccumulatorsForTests();
+});
 
 describe("cortex collection status", () => {
   it("reports append-only lineage separately from the refit subset", () => {
     const dir = mkdtempSync(join(tmpdir(), "cortex-status-")); dirs.push(dir);
     const causalDir = join(dir, "causal-experience", "3102"); mkdirSync(causalDir, { recursive: true });
-    writeFileSync(join(causalDir, "events.jsonl"), [
-      JSON.stringify({ eventType: "DECISION_SNAPSHOT", eventId: "decision-1", asOfMs: 1_000, identity: { decisionId: "decision-1" }, marketState: { regime: "BULLISH" } }),
-      JSON.stringify({ eventType: "OPPORTUNITY_OPEN", openedAtMs: 1_100 }),
-      JSON.stringify({ eventType: "OUTCOME_RESOLUTION", resolvedAtMs: 1_200, decisionId: "decision-1", identity: { laneId: "CG_TEST", symbolOrBasketId: "BTCUSDT", direction: "LONG" }, netR: 0.04, outcomeQuality: "RESOLVED_VALID", directAttribution: "DIRECT_CAUSAL_LINK", intrabarAmbiguous: false }),
-      JSON.stringify({ eventType: "OPPORTUNITY_OPEN", openedAtMs: 1_300 }),
-    ].join("\n"));
+    writeFileSync(
+      join(causalDir, "events.jsonl"),
+      // A trailing newline after the LAST line matters here: the real writer (forward-causal-collection.ts's
+      // appendEvents) always appends one after every batch, and the incremental reader treats a line with
+      // no trailing newline yet as an in-flight partial write (correctly, since a live append-only journal
+      // could genuinely be mid-write) — so a realistic fixture must end in "\n" too.
+      `${[
+        JSON.stringify({ eventType: "DECISION_SNAPSHOT", eventId: "decision-1", asOfMs: 1_000, identity: { decisionId: "decision-1" }, marketState: { regime: "BULLISH" } }),
+        JSON.stringify({ eventType: "OPPORTUNITY_OPEN", openedAtMs: 1_100 }),
+        JSON.stringify({ eventType: "OUTCOME_RESOLUTION", resolvedAtMs: 1_200, decisionId: "decision-1", identity: { laneId: "CG_TEST", symbolOrBasketId: "BTCUSDT", direction: "LONG" }, netR: 0.04, outcomeQuality: "RESOLVED_VALID", directAttribution: "DIRECT_CAUSAL_LINK", intrabarAmbiguous: false }),
+        JSON.stringify({ eventType: "OPPORTUNITY_OPEN", openedAtMs: 1_300 }),
+      ].join("\n")}\n`,
+    );
     writeFileSync(join(dir, "cortex-brain.json"), JSON.stringify({ cumulativeResolved: 1, updatedAt: "1970-01-01T00:00:01.200Z", archetypes: { BREADTH: { nEff: 2.5, refitAt: "1970-01-01T00:00:01.200Z" } } }));
 
     const report = buildCortexCollectionStatus({ dataDir: dir, env: { PORT: "3102", CAUSAL_EXPERIENCE_COLLECTION_MODE: "shadow", CAUSAL_EXPERIENCE_COLLECTION_DIR: dir }, nowMs: 2_000 });
@@ -61,30 +71,100 @@ describe("cortex collection status", () => {
     expect(report.lineage.totalEvents).toBe(1);
   });
 
-  it("caches the journal read for a short TTL instead of re-parsing on every call (2026-07-19 OOM-shaped fix)", () => {
-    const dir = mkdtempSync(join(tmpdir(), "cortex-status-cache-")); dirs.push(dir);
+  it("only re-reads bytes appended since the last call — never the whole file again (2026-07-20 incident fix)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "cortex-status-incremental-")); dirs.push(dir);
     const causalDir = join(dir, "causal-experience", "3101"); mkdirSync(causalDir, { recursive: true });
     const journalPath = join(causalDir, "events.jsonl");
     const env = { PORT: "3101", CAUSAL_EXPERIENCE_COLLECTION_MODE: "shadow", CAUSAL_EXPERIENCE_COLLECTION_DIR: dir };
 
-    writeFileSync(journalPath, [JSON.stringify({ eventType: "OPPORTUNITY_OPEN", openedAtMs: 1_000 })].join("\n"));
+    writeFileSync(journalPath, `${JSON.stringify({ eventType: "OPPORTUNITY_OPEN", openedAtMs: 1_000 })}\n`);
     const first = buildCortexCollectionStatus({ dataDir: dir, env, nowMs: 10_000 });
     expect(first.lineage.totalEvents).toBe(1);
+    expect(first.lineage.opportunitiesOpened).toBe(1);
 
-    // Journal grows in place, simulating live collection continuing to append while an operator tab
-    // polls every 10s. A poll well within the TTL window must reuse the cached parse, not re-read the
-    // now-larger file.
-    writeFileSync(journalPath, [
-      JSON.stringify({ eventType: "OPPORTUNITY_OPEN", openedAtMs: 1_000 }),
-      JSON.stringify({ eventType: "OPPORTUNITY_OPEN", openedAtMs: 1_100 }),
-      JSON.stringify({ eventType: "OPPORTUNITY_OPEN", openedAtMs: 1_200 }),
-    ].join("\n"));
-    const withinTtl = buildCortexCollectionStatus({ dataDir: dir, env, nowMs: 11_000 }); // +1s: well under the TTL
-    expect(withinTtl.lineage.totalEvents).toBe(1);
+    // Journal grows in place via APPEND (never rewritten from scratch, matching the real writer). A
+    // poll immediately afterward — no TTL window to wait out — must see the new lines right away, and
+    // must NOT double-count the line already folded into the accumulator on the previous call.
+    writeFileSync(
+      journalPath,
+      `${JSON.stringify({ eventType: "OPPORTUNITY_OPEN", openedAtMs: 1_100 })}\n${JSON.stringify({ eventType: "OPPORTUNITY_OPEN", openedAtMs: 1_200 })}\n`,
+      { flag: "a" },
+    );
+    const afterGrowth = buildCortexCollectionStatus({ dataDir: dir, env, nowMs: 10_050 });
+    expect(afterGrowth.lineage.totalEvents).toBe(3);
+    expect(afterGrowth.lineage.opportunitiesOpened).toBe(3);
 
-    // Once the TTL has elapsed, a subsequent poll must observe the fresh file content again — the
-    // cache must never survive past its window and leave the dashboard permanently stale.
-    const afterTtl = buildCortexCollectionStatus({ dataDir: dir, env, nowMs: 20_000 }); // +10s from the first read
-    expect(afterTtl.lineage.totalEvents).toBe(3);
+    // A third, no-op poll (file unchanged) must not change the counts.
+    const unchanged = buildCortexCollectionStatus({ dataDir: dir, env, nowMs: 10_100 });
+    expect(unchanged.lineage.totalEvents).toBe(3);
+  });
+
+  it("leaves a torn/partial trailing line (mid-append) unconsumed until it is completed, never dropped or double-counted", () => {
+    const dir = mkdtempSync(join(tmpdir(), "cortex-status-partial-")); dirs.push(dir);
+    const causalDir = join(dir, "causal-experience", "3101"); mkdirSync(causalDir, { recursive: true });
+    const journalPath = join(causalDir, "events.jsonl");
+    const env = { PORT: "3101", CAUSAL_EXPERIENCE_COLLECTION_MODE: "shadow", CAUSAL_EXPERIENCE_COLLECTION_DIR: dir };
+
+    // One complete line followed by a torn, in-flight write (no trailing newline yet).
+    writeFileSync(journalPath, `${JSON.stringify({ eventType: "OPPORTUNITY_OPEN", openedAtMs: 1_000 })}\n{"eventType":"OPPORTUNITY_OPEN","open`);
+    const midWrite = buildCortexCollectionStatus({ dataDir: dir, env, nowMs: 10_000 });
+    expect(midWrite.lineage.totalEvents).toBe(1); // the torn line must not be parsed yet
+    expect(midWrite.collection.journalBadLines).toBe(0); // and must not be counted as a bad line either — just not-yet-consumed
+
+    // The writer completes the line (appends the rest + a fresh newline).
+    writeFileSync(journalPath, `edAtMs":1100}\n`, { flag: "a" });
+    const completed = buildCortexCollectionStatus({ dataDir: dir, env, nowMs: 10_050 });
+    expect(completed.lineage.totalEvents).toBe(2);
+    expect(completed.lineage.opportunitiesOpened).toBe(2);
+    expect(completed.collection.journalBadLines).toBe(0);
+  });
+
+  it("carries the decision→outcome join across incremental reads (a snapshot read in an earlier call still joins a later outcome)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "cortex-status-join-")); dirs.push(dir);
+    const causalDir = join(dir, "causal-experience", "3101"); mkdirSync(causalDir, { recursive: true });
+    const journalPath = join(causalDir, "events.jsonl");
+    const env = { PORT: "3101", CAUSAL_EXPERIENCE_COLLECTION_MODE: "shadow", CAUSAL_EXPERIENCE_COLLECTION_DIR: dir };
+
+    writeFileSync(journalPath, `${JSON.stringify({ eventType: "DECISION_SNAPSHOT", eventId: "decision-1", asOfMs: 1_000, identity: { decisionId: "decision-1" }, marketState: { regime: "BULLISH" } })}\n`);
+    buildCortexCollectionStatus({ dataDir: dir, env, nowMs: 10_000 }); // first call folds the snapshot into the accumulator's join map
+
+    writeFileSync(
+      journalPath,
+      `${JSON.stringify({ eventType: "OUTCOME_RESOLUTION", resolvedAtMs: 2_000, decisionId: "decision-1", identity: { laneId: "CG_TEST", symbolOrBasketId: "BTCUSDT", direction: "LONG" }, netR: 0.04, outcomeQuality: "RESOLVED_VALID", directAttribution: "DIRECT_CAUSAL_LINK", intrabarAmbiguous: false })}\n`,
+      { flag: "a" },
+    );
+    const report = buildCortexCollectionStatus({ dataDir: dir, env, nowMs: 10_050 }); // second call only reads the new outcome line
+    expect(report.learning.recentCausalOutcomes[0]).toMatchObject({ laneId: "CG_TEST", symbolOrBasketId: "BTCUSDT", regime: "BULLISH", reinforcement: "POSITIVE" });
+  });
+
+  // [2026-07-22 bug-hunt fix] decisionsById had no bound at all — every DECISION_SNAPSHOT ever read
+  // added one full row, forever, for the life of the process (unlike recentOutcomes' bounded ring).
+  // decisionId is 1:1 with one opportunity (hashed from selectedLaneId+symbol+direction+asOfMs in
+  // forward-causal-collection.ts), so it resolves exactly once in real operation — the fix deletes
+  // the entry the instant its one OUTCOME_RESOLUTION consumes it. This test proves the deletion
+  // actually happens (observable via a synthetic SECOND resolution for the same decisionId — never
+  // legitimate in production, but the only way to observe "was this entry actually freed" through
+  // the public report API without a dedicated internal-size getter): its marketState join is gone,
+  // exactly as it should be for an already-consumed decisionId.
+  it("[2026-07-22 bug-hunt fix] decisionsById entry is freed immediately after its one OUTCOME_RESOLUTION consumes it", () => {
+    const dir = mkdtempSync(join(tmpdir(), "cortex-status-decisionsById-")); dirs.push(dir);
+    const causalDir = join(dir, "causal-experience", "3101"); mkdirSync(causalDir, { recursive: true });
+    const journalPath = join(causalDir, "events.jsonl");
+    const env = { PORT: "3101", CAUSAL_EXPERIENCE_COLLECTION_MODE: "shadow", CAUSAL_EXPERIENCE_COLLECTION_DIR: dir };
+
+    writeFileSync(
+      journalPath,
+      `${[
+        JSON.stringify({ eventType: "DECISION_SNAPSHOT", eventId: "decision-1", asOfMs: 1_000, identity: { decisionId: "decision-1" }, marketState: { regime: "BULLISH" } }),
+        JSON.stringify({ eventType: "OUTCOME_RESOLUTION", resolvedAtMs: 2_000, decisionId: "decision-1", identity: { laneId: "CG_TEST", symbolOrBasketId: "BTCUSDT", direction: "LONG" }, netR: 0.04, outcomeQuality: "RESOLVED_VALID", directAttribution: "DIRECT_CAUSAL_LINK", intrabarAmbiguous: false }),
+        // Synthetic second resolution for the SAME decisionId — never legitimate in real data, but the
+        // only observable proof (through this public API) that the first lookup deleted the entry.
+        JSON.stringify({ eventType: "OUTCOME_RESOLUTION", resolvedAtMs: 3_000, decisionId: "decision-1", identity: { laneId: "CG_TEST", symbolOrBasketId: "ETHUSDT", direction: "LONG" }, netR: 0.02, outcomeQuality: "RESOLVED_VALID", directAttribution: "DIRECT_CAUSAL_LINK", intrabarAmbiguous: false }),
+      ].join("\n")}\n`,
+    );
+    const report = buildCortexCollectionStatus({ dataDir: dir, env, nowMs: 10_000 });
+    const bySymbol = new Map(report.learning.recentCausalOutcomes.map((o) => [o.symbolOrBasketId, o]));
+    expect(bySymbol.get("BTCUSDT")).toMatchObject({ regime: "BULLISH" }); // first lookup: entry present
+    expect(bySymbol.get("ETHUSDT")?.regime).toBeNull(); // second lookup on the SAME decisionId: already freed
   });
 });

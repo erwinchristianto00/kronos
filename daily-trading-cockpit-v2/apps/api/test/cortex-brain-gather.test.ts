@@ -10,6 +10,7 @@ import {
   buildLaneObservationFromRaw,
   CORTEX_XSEC_STOP_RETURN,
   CORTEX_CROWD_ALIGNED,
+  CORTEX_LANE_STALE_MAX_AGE_MS,
   type CortexLaneRaw,
   type CrowdSide,
 } from "../src/lib/cortex-brain-gather.js";
@@ -43,6 +44,35 @@ describe("cortex-gather — CG n=0 → null (not 0); PF unavailable → null (no
   it("the all-wins 999 sentinel is treated as PF-unavailable (null), not a real high PF that saturates the feature", () => {
     expect(lanePfGuarded(999, true)).toEqual({ value: null, status: "MISSING" }); // no-losses = no denominator
     expect(lanePfGuarded(998.9, true)).toEqual({ value: 998.9, status: "FRESH" }); // a genuine (absurd) PF still passes
+  });
+});
+
+// [2026-07-22 bug-hunt fix] STALE was declared in CortexFeatureStatus but no function ever computed
+// it — a frozen upstream lane report looked FRESH forever, matching this codebase's real 18-day
+// frozen-resolver incident. These prove the guard now actually returns STALE, and only when a real
+// timestamp says so (never guessed from absence).
+describe("cortex-gather — STALE detection (2026-07-22 bug-hunt fix)", () => {
+  const NOW = 1_800_000_000_000;
+  it("laneNetAvgRGuarded: FRESH when the cycle ran recently", () => {
+    const staleness = { lastCycleAt: new Date(NOW - 60_000).toISOString(), nowMs: NOW };
+    expect(laneNetAvgRGuarded(0.2, 50, staleness)).toEqual({ value: 0.2, status: "FRESH" });
+  });
+  it("laneNetAvgRGuarded: STALE when the last cycle is older than CORTEX_LANE_STALE_MAX_AGE_MS", () => {
+    const staleness = { lastCycleAt: new Date(NOW - CORTEX_LANE_STALE_MAX_AGE_MS - 1).toISOString(), nowMs: NOW };
+    expect(laneNetAvgRGuarded(0.2, 50, staleness)).toEqual({ value: 0.2, status: "STALE" });
+  });
+  it("lanePfGuarded: STALE when the last cycle is older than CORTEX_LANE_STALE_MAX_AGE_MS", () => {
+    const staleness = { lastCycleAt: new Date(NOW - CORTEX_LANE_STALE_MAX_AGE_MS - 1).toISOString(), nowMs: NOW };
+    expect(lanePfGuarded(1.3, true, staleness)).toEqual({ value: 1.3, status: "STALE" });
+  });
+  it("no lastCycleAt at all (store doesn't track one, e.g. IM/XSEC) never fabricates STALE or FRESH-by-default — stays FRESH exactly like before this fix", () => {
+    expect(laneNetAvgRGuarded(0.2, 50, { lastCycleAt: null, nowMs: NOW })).toEqual({ value: 0.2, status: "FRESH" });
+    expect(laneNetAvgRGuarded(0.2, 50, { lastCycleAt: undefined, nowMs: NOW })).toEqual({ value: 0.2, status: "FRESH" });
+    expect(laneNetAvgRGuarded(0.2, 50)).toEqual({ value: 0.2, status: "FRESH" }); // omitted entirely
+  });
+  it("a MISSING lane (n=0) never becomes STALE — MISSING wins regardless of staleness", () => {
+    const staleness = { lastCycleAt: new Date(NOW - CORTEX_LANE_STALE_MAX_AGE_MS - 1).toISOString(), nowMs: NOW };
+    expect(laneNetAvgRGuarded(0, 0, staleness)).toEqual({ value: null, status: "MISSING" });
   });
 });
 
@@ -114,9 +144,20 @@ describe("cortex-gather — buildLaneObservationFromRaw (full contract + status 
       controllerBias: "SHORT",
       controllerConviction: 0.86,
       staticWeightPct: 0,
+      nowMs: 1_800_000_000_000,
       ...over,
     };
   }
+
+  it("[2026-07-22 bug-hunt fix, END-TO-END] surfaces STALE for a lane whose report store's cycleMeta.lastCycleAt is 18 days old (the real documented frozen-resolver incident)", () => {
+    const NOW = 1_800_000_000_000;
+    const eighteenDaysMs = 18 * 86_400_000;
+    const { debug } = buildLaneObservationFromRaw(
+      raw({ lastCycleAt: new Date(NOW - eighteenDaysMs).toISOString(), nowMs: NOW }),
+    );
+    expect(debug.laneNetAvgR).toBe("STALE");
+    expect(debug.lanePf).toBe("STALE");
+  });
 
   it("directional lane: full edge + conviction match + aligned-crowd negative + kronos null", () => {
     const { obs, debug } = buildLaneObservationFromRaw(raw());

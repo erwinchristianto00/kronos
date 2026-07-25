@@ -102,4 +102,60 @@ describe("Entry Brain", () => {
     const thin = decideEntry(entryInput({ expectedSlippageBps: src(null) }));
     expect(thin.action).toBe("SKIP");
   });
+
+  // ── 2026-07-24 fix: decisionId collision across candidates sharing side+action ────────────────────
+  // Root cause: decisionId used to be fourBrainDecisionId("entry", nowMs, `${side}:${action}`) — a pure
+  // function of (nowMs, side, action) ONLY. Any two of the ~14-25 real candidates evaluated in one shadow
+  // tick landing on the same side+action bucket (10 possible values) got a byte-identical decisionId even
+  // though they were genuinely different candidates (different symbol/lane/targetEntry/stop). Confirmed
+  // this caused REAL, PERMANENT, silent outcome loss: direction-entry-outcome-store.ts's
+  // recordEntryOutcome() is idempotent per decisionId (a later candidate sharing the id is a silent
+  // no-op returning false — never pushed, never aggregated), and direction-entry-reconciler.ts
+  // unconditionally adds every processed row's decisionId to its removal set regardless of whether
+  // recordEntryOutcome actually booked it, so four-brain-outcome-ledger.ts's removeEntryByIds() evicts
+  // BOTH colliding pending rows in one pass — the losing candidate's outcome is discarded forever, not
+  // merely delayed. entry-brain-tier1-realized-resolver.ts's consumedDecisionIds set (also keyed purely
+  // by decisionId) compounds this: once ANY candidate sharing a colliding id claims one real close, every
+  // OTHER candidate sharing that id can never claim a DIFFERENT real close either — even its own exact
+  // lane/symbol match — starving that lane/symbol combo of Tier 1 coverage permanently.
+  describe("decisionId collision fix (candidateKey salt)", () => {
+    it("two candidates with the SAME side+action but DIFFERENT candidateKey get DIFFERENT decisionIds", () => {
+      const a = decideEntry(entryInput({ side: "SHORT", signalAgeMs: 90 * MIN, candidateKey: "COMPOSITE_ESTIMATOR_BIDI_WIDE_SHORT::BNBUSDT::SHORT::sig-1" })); // SKIP via stale signal
+      const b = decideEntry(entryInput({ side: "SHORT", signalAgeMs: 90 * MIN, candidateKey: "REGIME_COMPOSITE_CONFIRMATION_SHORT::ETHUSDT::SHORT::sig-2" }));
+      expect(a.action).toBe("SKIP");
+      expect(b.action).toBe("SKIP"); // same side+action bucket as `a` — would have collided pre-fix
+      expect(a.decisionId).not.toBe(b.decisionId);
+    });
+
+    it("without a candidateKey (caller omits it), the pre-fix collision across same side+action still reproduces — proves the fix is opt-in via the new field, not a behavior change for un-migrated callers", () => {
+      const a = decideEntry(entryInput({ side: "SHORT", signalAgeMs: 90 * MIN }));
+      const b = decideEntry(entryInput({ side: "SHORT", signalAgeMs: 90 * MIN, targetEntry: 250, initialStopPrice: 240 })); // genuinely different candidate geometry
+      expect(a.action).toBe("SKIP");
+      expect(b.action).toBe("SKIP");
+      expect(a.decisionId).toBe(b.decisionId); // the exact bug this task fixes, absent the salt
+    });
+
+    it("the SAME candidate re-decided at the same asOfMs (e.g. immediately after a crash-restart) still yields the SAME decisionId — crash-restart idempotency is preserved", () => {
+      const opts = { side: "LONG" as const, candidateKey: "CG_WIDE_FAST_LONG::BTCUSDT::LONG::sig-9" };
+      const first = decideEntry(entryInput(opts));
+      const second = decideEntry(entryInput(opts));
+      expect(first.decisionId).toBe(second.decisionId);
+      expect(first.action).toBe(second.action);
+    });
+
+    it("an empty-string candidateKey falls back to the no-salt key (never fabricates a distinct id from an empty string)", () => {
+      const withEmpty = decideEntry(entryInput({ side: "SHORT", signalAgeMs: 90 * MIN, candidateKey: "" }));
+      const withoutField = decideEntry(entryInput({ side: "SHORT", signalAgeMs: 90 * MIN }));
+      expect(withEmpty.decisionId).toBe(withoutField.decisionId);
+    });
+
+    it("candidateKey never changes the decision's substantive action/fields — only decisionId", () => {
+      const base = entryInput({ candleExtensionAtr: src(3.5), distanceFromVwapAtr: src(3.0), pullbackDepthAtr: src(0) });
+      const withSalt = decideEntry({ ...base, candidateKey: "SOME_LANE::SOLUSDT::LONG::sig-7" });
+      const withoutSalt = decideEntry(base);
+      expect(withSalt.action).toBe(withoutSalt.action);
+      expect(withSalt.chaseRisk).toBe(withoutSalt.chaseRisk);
+      expect(withSalt.decisionId).not.toBe(withoutSalt.decisionId);
+    });
+  });
 });

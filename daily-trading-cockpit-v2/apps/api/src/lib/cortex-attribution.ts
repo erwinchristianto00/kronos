@@ -78,8 +78,22 @@ export interface CortexLaneAttributionStatus {
   outcomesSeen: number;
   attributed: number;
   unattributedNoDecision: number;
+  /** Breakdown of unattributedNoDecision (2026-07-22): how many of those drops are structurally
+   *  unattributable scars — the outcome's openedAtMs predates the journal's OWN earliest retained
+   *  decision, so no owning decision could possibly still exist — vs a genuine coverage gap where the
+   *  journal DOES reach back that far but no matching (eligible/direction/schema) slice was ever
+   *  found for this lane in the TTL window. unattributedNoDecisionJournalGap +
+   *  unattributedNoDecisionGenuineGap === unattributedNoDecision always. Answers "is this lane's low
+   *  attribution rate old scar tissue that will age out, or a live gap worth investigating" directly
+   *  from the data, without the code-archaeology a prior investigation needed. */
+  unattributedNoDecisionJournalGap: number;
+  unattributedNoDecisionGenuineGap: number;
   schemaMismatch: number;
   duplicateDropped: number;
+  /** 2026-07-22: outcomes dropped for a non-finite openedAtMs/resolvedAtMs/netR — corrupt input, never
+   *  a real trade this lane could have learned from. Counted separately from noDecision/schemaMismatch/
+   *  duplicate so "every drop is counted, never quiet" (module contract) actually holds for this class too. */
+  invalidData: number;
   staticWeightPct: number;
 }
 
@@ -169,16 +183,44 @@ export function attributeOutcomes(
   }
   for (const arr of byLane.values()) arr.sort((a, b) => a.atMs - b.atMs);
 
+  // The journal's own retention boundary — the earliest atMs among ALL decisions read this run,
+  // regardless of lane. An outcome whose openedAtMs predates this could never have an owning decision
+  // no matter how the walk below runs; that's a structural scar, not a live coverage gap.
+  let journalEarliestAtMs: number | null = null;
+  for (const d of decisions) {
+    if (!Number.isFinite(d.atMs)) continue;
+    if (journalEarliestAtMs === null || d.atMs < journalEarliestAtMs) journalEarliestAtMs = d.atMs;
+  }
+
   // Per-lane counters (seeded from roster so a lane with 0 outcomes still reports a status).
   const counters = new Map<
     string,
-    { seen: number; attributed: number; noDecision: number; schemaMismatch: number; duplicate: number }
+    {
+      seen: number;
+      attributed: number;
+      noDecision: number;
+      noDecisionJournalGap: number;
+      noDecisionGenuineGap: number;
+      schemaMismatch: number;
+      duplicate: number;
+      invalidData: number;
+    }
   >();
+  const emptyCounter = () => ({
+    seen: 0,
+    attributed: 0,
+    noDecision: 0,
+    noDecisionJournalGap: 0,
+    noDecisionGenuineGap: 0,
+    schemaMismatch: 0,
+    duplicate: 0,
+    invalidData: 0,
+  });
   const rosterById = new Map(opts.roster.map((r) => [r.laneId, r]));
-  for (const r of opts.roster) counters.set(r.laneId, { seen: 0, attributed: 0, noDecision: 0, schemaMismatch: 0, duplicate: 0 });
+  for (const r of opts.roster) counters.set(r.laneId, emptyCounter());
   const ctr = (laneId: string) => {
     let c = counters.get(laneId);
-    if (!c) counters.set(laneId, (c = { seen: 0, attributed: 0, noDecision: 0, schemaMismatch: 0, duplicate: 0 }));
+    if (!c) counters.set(laneId, (c = emptyCounter()));
     return c;
   };
 
@@ -193,15 +235,27 @@ export function attributeOutcomes(
   );
 
   for (const o of sortedOutcomes) {
-    if (!Number.isFinite(o.openedAtMs) || !Number.isFinite(o.resolvedAtMs) || !Number.isFinite(o.netR)) continue;
     const c = ctr(o.laneId);
     c.seen += 1;
+    // 2026-07-22 fix: this check used to run BEFORE c.seen+=1, so a corrupt outcome (non-finite
+    // timestamp/netR) vanished from every per-lane counter — contradicting the module's own "every
+    // drop is COUNTED, never quiet" contract. seen is now bumped first, and invalidData tallies this
+    // specific drop reason so it's visible, not silently folded into any other bucket.
+    if (!Number.isFinite(o.openedAtMs) || !Number.isFinite(o.resolvedAtMs) || !Number.isFinite(o.netR)) {
+      c.invalidData += 1;
+      continue;
+    }
 
     const key = `${o.laneId}::${o.observationId}`;
     if (consumed.has(key)) {
       c.duplicate += 1;
       continue;
     }
+    // 2026-07-22 fix: mark this key consumed on the FIRST encounter regardless of outcome (success or
+    // failure) — previously only the SUCCESS path added to `consumed` (below), so a duplicate outcome
+    // that failed to find an owning decision was never recognized as a duplicate on its 2nd+ occurrence;
+    // it was independently counted into noDecision/schemaMismatch every time, inflating those buckets.
+    consumed.add(key);
 
     const slices = byLane.get(o.laneId);
     const ttl = Math.max(0, ttlFor(o.laneId));
@@ -243,12 +297,18 @@ export function attributeOutcomes(
       // No current-schema owner. If the only in-window candidate(s) failed on schema alone, that's a genuine
       // schema mismatch; otherwise (nothing eligible/direction-consistent, or a mix of schema + other
       // rejections across candidates) it's an honest no-owner drop.
-      if (sawSchemaMismatch && !sawOtherReasonRejection) c.schemaMismatch += 1;
-      else c.noDecision += 1;
+      if (sawSchemaMismatch && !sawOtherReasonRejection) {
+        c.schemaMismatch += 1;
+      } else {
+        c.noDecision += 1;
+        // journalEarliestAtMs === null ⇒ no decisions were read AT ALL this run, so nothing could ever
+        // have been attributed — that's a journal-coverage scar too, not a genuine per-lane gap.
+        if (journalEarliestAtMs === null || o.openedAtMs < journalEarliestAtMs) c.noDecisionJournalGap += 1;
+        else c.noDecisionGenuineGap += 1;
+      }
       continue;
     }
 
-    consumed.add(key);
     c.attributed += 1;
     const y = cortexWinLabel(o.netR);
     examples.push({
@@ -296,8 +356,11 @@ export function attributeOutcomes(
       outcomesSeen: c.seen,
       attributed: c.attributed,
       unattributedNoDecision: c.noDecision,
+      unattributedNoDecisionJournalGap: c.noDecisionJournalGap,
+      unattributedNoDecisionGenuineGap: c.noDecisionGenuineGap,
       schemaMismatch: c.schemaMismatch,
       duplicateDropped: c.duplicate,
+      invalidData: c.invalidData,
       staticWeightPct,
     });
   }

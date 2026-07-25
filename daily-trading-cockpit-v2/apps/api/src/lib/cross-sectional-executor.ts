@@ -20,6 +20,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "
 import { dirname, resolve } from "node:path";
 
 import { resolveConfirmedFillPrice, type BinanceFuturesPrivateClient, type FillPriceResolution } from "./binance-futures-private.js";
+import type { CortexRealAttributionStore } from "./cortex-real-attribution.js";
 import {
   CROSS_SECTIONAL_ROUNDTRIP_BPS,
   deriveAdaptiveSymbolFilters,
@@ -55,6 +56,28 @@ export function isCrossSectionalExecEnabled(env: NodeJS.ProcessEnv = process.env
  *  zeroed) the foundation strategy. Armed/kill-switch gating is NOT affected by this flag. */
 export function isCrossSectionalAllocationIndependent(env: NodeJS.ProcessEnv = process.env): boolean {
   return env.CROSS_SECTIONAL_ALLOCATION_INDEPENDENT === "1";
+}
+
+/** 2026-07-22 (CORTEX capital-coverage diagnosis): CROSS_SECTIONAL_TREND/MIXED are gated on
+ *  ADMISSION by isNewExecutorLaneAllowed(), which requires laneSelectionExplicitlyIncludesLane()
+ *  — false whenever the operator's live allocation table is null/unset, which it currently is on
+ *  testnet. Their signals fire on ordinary/common regime states (TREND_LONG/SHORT, MIXED_CHOP),
+ *  yet neither lane has ever been given a table slot, so they sit at 0 real outcomes forever —
+ *  structurally unable to ever reach CORTEX's LEARNING_ACTIVE threshold no matter what else is
+ *  fixed. Setting the table to include them was investigated and rejected: ~28 other real lanes
+ *  (12 executor-constructed + up to 16 actively-mirrored HEADLINE variants under
+ *  LIVE_MIRROR_ALL_PAPER=1) currently rely on the table staying null (permissive-when-null), and
+ *  the table's own MAX_LANE_ALLOCATIONS cap (default 10) can't even hold that many rows — so a
+ *  non-null table would either reject outright or silently zero unlisted real lanes. A DEDICATED
+ *  flag (deliberately separate from CROSS_SECTIONAL_ALLOCATION_INDEPENDENT, which is MARKET_
+ *  NEUTRAL's own "foundation lane" sizing-independence decision — that must stay independently
+ *  toggleable) reuses the SAME proven crossSectionalMarketNeutralIsAllowed() bypass for admission
+ *  ONLY, on these 2 lanes only. Sizing is untouched: laneWeightPct still reads
+ *  laneSelectionWeightPctForLane() normally (already 100 today under the null table, and will
+ *  correctly respect a real table if the operator ever sets one). Default OFF — a deliberate,
+ *  separate step from shipping this code. */
+export function isCrossSectionalTrendMixedAdmissionIndependent(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.CROSS_SECTIONAL_TREND_MIXED_ADMISSION_INDEPENDENT === "1";
 }
 
 /** 2026-07-20 real-money audit fix (round 2): admission must mirror the sizing exemption above.
@@ -169,6 +192,13 @@ export interface ExecutorBasket {
    *  bakal nyampe atau engga, ada yang macet atau engga" (2026-07-07 operator ask). */
   lastNetReturn?: number | null;
   lastNetAt?: string | null;
+  /** CORTEX real-USDT attribution capture-at-open (2026-07-22 bug-hunt fix): the applied vs
+   *  raw-static allocation weight, frozen the instant the basket opens — same convention as
+   *  SingleSymbolPosition's cortexAppliedWeightPct/cortexRawStaticWeightPct in
+   *  single-symbol-lane-executor.ts. Optional so baskets persisted before this field existed are
+   *  never retroactively assigned an invented tilt share. */
+  cortexAppliedWeightPct?: number;
+  cortexRawStaticWeightPct?: number;
 }
 
 /**
@@ -361,6 +391,19 @@ export interface CrossSectionalExecutorOptions {
    *  — the watermark is already advanced before this check runs, so the signal is not retried, but
    *  the NEXT fresh signal on the same symbol gets a clean re-evaluation. */
   maxNotionalPerSymbolAcrossLanes?: () => number;
+  /** CORTEX real-USDT attribution (2026-07-22 bug-hunt fix): the operator's untouched static-table
+   *  weight, read the same way laneWeightPct reads the (possibly CORTEX-tilted) applied weight.
+   *  Same optional posture as single-symbol-lane-executor.ts's rawLaneWeightPct — omit and this
+   *  executor is byte-for-byte unchanged (rawAllocationWeightPct mirrors allocationWeightPct,
+   *  tiltShare is 0 by construction). */
+  rawLaneWeightPct?: () => number;
+  /** CORTEX real-USDT attribution store (2026-07-22 bug-hunt fix): CROSS_SECTIONAL_MARKET_NEUTRAL/
+   *  TREND/MIXED are full CORTEX_LANE_ROSTER members whose real sizing already responds to
+   *  CORTEX's tilt via laneWeightPct — before this option existed, every basket this executor
+   *  closed was invisible to cortex-real-attribution.ts's ledger entirely (not reported as $0,
+   *  simply never recorded), silently omitting this whole execution architecture. Optional: omit
+   *  and nothing is recorded, same as before this fix (existing single-instance tests unaffected). */
+  cortexRealAttribution?: CortexRealAttributionStore;
 }
 
 export class CrossSectionalExecutor {
@@ -383,6 +426,8 @@ export class CrossSectionalExecutor {
   private readonly sharedGetPositions: () => ReturnType<CrossSectionalExecClient["getPositions"]>;
   private readonly existingNotionalForSymbolFn: (symbol: string) => number;
   private readonly maxNotionalPerSymbolAcrossLanesFn: () => number;
+  private readonly rawLaneWeightPctFn: (() => number) | null;
+  private readonly cortexRealAttribution: CortexRealAttributionStore | null;
 
   constructor(opts: CrossSectionalExecutorOptions) {
     this.client = opts.client;
@@ -401,6 +446,8 @@ export class CrossSectionalExecutor {
     this.siblingOpenLegs = opts.siblingOpenLegs ?? (() => []);
     this.siblingDailyRealizedUsd = opts.siblingDailyRealizedUsd ?? (() => 0);
     this.sharedGetPositions = opts.sharedGetPositions ?? (() => this.client.getPositions());
+    this.rawLaneWeightPctFn = opts.rawLaneWeightPct ?? null;
+    this.cortexRealAttribution = opts.cortexRealAttribution ?? null;
   }
 
   /** This instance's own open (status OPEN), un-exited (exitOrderId===null) basket legs — the
@@ -482,6 +529,47 @@ export class CrossSectionalExecutor {
 
   private effectiveLegUsd(): number {
     return LEG_USD() * (this.allocationWeightPct() / 100);
+  }
+
+  /** Raw-static counterpart of allocationWeightPct (CORTEX real-USDT attribution, 2026-07-22 fix):
+   *  same clamping AND the same independent-allocation special case (the MARKET_NEUTRAL lane's
+   *  applied weight is forced to 100 by that feature, unrelated to CORTEX — mirroring it here
+   *  keeps tiltShare 0 for that case instead of misattributing independent-allocation's own effect
+   *  to CORTEX). When rawLaneWeightPct isn't wired, mirrors the applied weight so tiltShare is 0
+   *  by construction — an unwired instance must never fabricate CORTEX influence. */
+  private rawAllocationWeightPct(): number {
+    if (isCrossSectionalAllocationIndependent() && this.laneId === CROSS_SECTIONAL_MARKET_NEUTRAL_LANE_ID) {
+      return 100;
+    }
+    if (!this.rawLaneWeightPctFn) return this.allocationWeightPct();
+    const pct = Number(this.rawLaneWeightPctFn());
+    if (!Number.isFinite(pct)) return 100;
+    return Math.max(0, Math.min(100, pct));
+  }
+
+  /** CORTEX real-USDT attribution write for one fully closed basket (report-only, 2026-07-22 fix)
+   *  — mirrors single-symbol-lane-executor.ts's recordCortexRealAttribution exactly. Called once
+   *  from closeBasket's normal-close finalization, right next to its own store.save(). Wrapped so
+   *  a failure can NEVER affect settlement. Baskets persisted before the capture fields existed
+   *  carry no open-time weights and are skipped rather than assigned an invented tilt share. */
+  private recordCortexRealAttribution(basket: ExecutorBasket): void {
+    try {
+      const store = this.cortexRealAttribution;
+      if (!store) return;
+      if (typeof basket.cortexAppliedWeightPct !== "number" || typeof basket.cortexRawStaticWeightPct !== "number") return;
+      if (typeof basket.netPnlUsd !== "number" || !Number.isFinite(basket.netPnlUsd)) return;
+      store.recordClose({
+        recordId: `xsec:${this.laneId}:${basket.basketId}`,
+        closedAtIso: basket.closedAt ?? this.nowIso(),
+        laneId: this.laneId,
+        symbol: basket.legs.map((leg) => leg.symbol).join("+"),
+        realizedPnlUsd: basket.netPnlUsd,
+        appliedWeightPct: basket.cortexAppliedWeightPct,
+        rawStaticWeightPct: basket.cortexRawStaticWeightPct,
+      });
+    } catch {
+      // report-only bookkeeping — a failure here must NEVER affect trading
+    }
   }
 
   getStatus(): {
@@ -967,6 +1055,7 @@ export class CrossSectionalExecutor {
     basket.lastNetReturn = finalMeanLong / 2 + finalMeanShort / 2 - CROSS_SECTIONAL_ROUNDTRIP_BPS / 10_000;
     basket.lastNetAt = basket.closedAt;
     this.store.save();
+    this.recordCortexRealAttribution(basket);
   }
 
   private async maybeOpenBasket(): Promise<void> {
@@ -1061,7 +1150,27 @@ export class CrossSectionalExecutor {
       grossPnlUsd: null,
       feeEstimateUsd: null,
       netPnlUsd: null,
+      cortexAppliedWeightPct: this.allocationWeightPct(),
+      cortexRawStaticWeightPct: this.rawAllocationWeightPct(),
     };
+
+    // 2026-07-21 real-money audit fix (CRITICAL): push + save the basket BEFORE placing any order,
+    // then save again after EVERY leg fills — mirroring closeBasket's own "persist per leg so a
+    // crash/retry mid-close can resume" discipline (see its comment above). Before this fix, the
+    // basket only ever reached st.baskets on the try's SUCCESS path or the catch's abort path; a
+    // process crash/restart between a leg's placeOrder confirming filled and either of those two
+    // points left a REAL, exchange-confirmed position with ZERO record anywhere — not in baskets,
+    // not in orphanedLegs — because the watermark above already advanced past this signal, so it's
+    // never retried either. This is the exact, confirmed root cause of the 2026-07-18 testnet
+    // incident (a real WIFUSDT fill that vanished from all bookkeeping after an apparent crash mid
+    // basket-open). Pushing the SAME object reference here means every later mutation (`.legs.push`,
+    // `.status = "ABORTED"`, etc.) is already visible to anything reading st.baskets — including a
+    // concurrent externalManagedNetQty()/reconciliation read from a different ticker, which can only
+    // become MORE accurate this way (it now sees exactly the legs genuinely filled so far), never
+    // less. Re-entrancy is not a concern within this class: `tick()`'s own `this.ticking` guard means
+    // this method can't overlap with itself or with closeBasketsHittingProfitTarget in the same tick.
+    st.baskets.push(basket);
+    this.store.save();
 
     try {
       for (const planned of plannedLegs) {
@@ -1096,9 +1205,8 @@ export class CrossSectionalExecutor {
           exitOrderId: null,
           exitPriceConfirmed: null,
         });
+        this.store.save(); // persist per leg so a crash mid-open still records this filled leg
       }
-      st.baskets.push(basket);
-      this.store.save();
     } catch (error) {
       // A partial basket is a NAKED directional bet — flatten whatever opened, record ABORTED.
       basket.status = "ABORTED";
@@ -1144,7 +1252,8 @@ export class CrossSectionalExecutor {
           this.recordOrphanedLeg(basket, leg, flattenError);
         }
       }
-      st.baskets.push(basket);
+      // basket was already pushed into st.baskets before the loop started (see comment above) —
+      // no second push here, just persist the final ABORTED status/legs.
       this.store.save();
       throw error;
     }

@@ -199,3 +199,42 @@ describe("registerLiveRoutes — /api/live/lane-performance-series wires ALL 5 e
     ]);
   });
 });
+
+describe("[2026-07-22] /api/live/cortex-promoted-weights — direct visibility into the engine's currently-installed tilt", () => {
+  it("503s with engine disabled — same contract as every other route in this file", async () => {
+    app = Fastify();
+    await registerLiveRoutes(app, null);
+    await app.ready();
+    const res = await app.inject({ method: "GET", url: "/api/live/cortex-promoted-weights" });
+    expect(res.statusCode).toBe(503);
+    expect(res.json()).toMatchObject({ ok: false });
+  });
+
+  it("reports active:false and an empty map when CORTEX has no promoted override installed", async () => {
+    const fakeEngine = {
+      getCortexPromotedWeights: () => null,
+    } as unknown as LiveExecutionEngine;
+    app = Fastify();
+    await registerLiveRoutes(app, fakeEngine);
+    await app.ready();
+    const res = await app.inject({ method: "GET", url: "/api/live/cortex-promoted-weights" });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ ok: true, active: false, weights: {} });
+  });
+
+  it("reports active:true and the exact installed map when CORTEX has a live promoted override", async () => {
+    const fakeEngine = {
+      getCortexPromotedWeights: () => ({ CG_MFE_GIVEBACK_SHORT: 23.71776, INTRADAY_MOMENTUM_BREAKOUT_LONG: 7.808 }),
+    } as unknown as LiveExecutionEngine;
+    app = Fastify();
+    await registerLiveRoutes(app, fakeEngine);
+    await app.ready();
+    const res = await app.inject({ method: "GET", url: "/api/live/cortex-promoted-weights" });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({
+      ok: true,
+      active: true,
+      weights: { CG_MFE_GIVEBACK_SHORT: 23.71776, INTRADAY_MOMENTUM_BREAKOUT_LONG: 7.808 },
+    });
+  });
+});

@@ -163,8 +163,13 @@ export function _resetCortexBrainStoreForTests(): void {
  *  logging failure must never break the trading cycle it observes. */
 /** Journal size cap before rotation. The shadow appends one decision every cycle for WEEKS (until the
  *  60-day / 300-resolved promotion gate), so an uncapped jsonl is the repo's classic unbounded-store
- *  disk/OOM bomb. Bound it: at ~3KB/decision, 8MB ≈ 2.6k decisions; one rolling .1 backup ⇒ ≤16MB on disk. */
-export const CORTEX_JOURNAL_MAX_BYTES = 8 * 1024 * 1024;
+ *  disk/OOM bomb. 2026-07-22: raised from 8MB (measured ~4.6 days actual retention on testnet — the
+ *  prior "~3KB/decision, 8MB ≈ 2.6k decisions" estimate was stale against today's larger per-decision
+ *  record shape) to 35MB per file (70MB total across current+.1 backup) ≈ 26 days at the MEASURED
+ *  ~2.66MB/day growth rate (testnet, 2026-07-22) — comfortably covers the longest roster lane hold
+ *  (COMPOSITE_ESTIMATOR_BIDI_WIDE_*, 144h/6d) with ~4x margin, so a WIDE lane's own decision context
+ *  no longer rotates out of the journal before that lane's trade even resolves. */
+export const CORTEX_JOURNAL_MAX_BYTES = 35 * 1024 * 1024;
 
 export class CortexDecisionJournal {
   constructor(
@@ -249,7 +254,19 @@ export function runCortexShadowTick(deps: {
   nowIso: string;
   mode: CortexBrainMode;
   resolvedThisCycle?: number;
-  promotion?: { regimeCoverageGateMet: boolean; blindCapitalPct: number; envBlocked: boolean } | null;
+  promotion?: {
+    regimeCoverageGateMet: boolean;
+    blindCapitalPct: number;
+    envBlocked: boolean;
+    /** 2026-07-21 operator ask: only roster lanes with proven LEARNING_ACTIVE status (from the
+     *  nightly refit's own attribution, ≥ CORTEX_ATTR_MIN_EXAMPLES_ACTIVE attributed examples) may
+     *  ever receive CORTEX's tilt. Every other lane (INSUFFICIENT_DATA/NO_OUTCOME_SOURCE/etc.) is
+     *  forced back to its exact operational (β=0) value below — a data-starved lane's untested guess
+     *  can never move real capital, while shadow collection/attribution/refit continues unaffected
+     *  for every lane regardless, so the two tracks genuinely run in parallel. Absent/empty ⇒ no lane
+     *  is eligible (fails safe to fully static, never the reverse). */
+    learningActiveLaneIds?: Set<string>;
+  } | null;
 }): { decision: CortexDecision; invariants: CortexInvariantResult; promotedWeights: Record<string, number> | null } {
   if (deps.resolvedThisCycle && deps.resolvedThisCycle > 0) deps.store.addResolved(deps.resolvedThisCycle, deps.nowIso);
   const state = deps.store.get();
@@ -271,40 +288,118 @@ export function runCortexShadowTick(deps: {
     const promotedBeta = cortexPromotedBeta(state.cumulativeResolved, deps.promotion.regimeCoverageGateMet, deps.promotion.blindCapitalPct);
     if (promotedBeta > 0) {
       const promoted = decideCortex(deps.context, state, { beta: promotedBeta });
-      const promotedInvariants = checkCortexInvariants(promoted);
-      if (promotedInvariants.ok) {
+      // 2026-07-21 operator ask: gate the tilt itself per-lane. `decision` above is the SAME context/state
+      // at β=0 — already computed, already journaled — so a non-active lane's "effective" entry here is
+      // BYTE-IDENTICAL to its true static-scaled operational value (no new decideCortex call needed, no
+      // approximation: decideCortex's own blend is (1-β)·staticPct + β·learnedPct, and finalPct at β=0 IS
+      // staticPct exactly). Only LEARNING_ACTIVE lanes keep the real tilted (promoted) entry.
+      const learningActiveLaneIds = deps.promotion.learningActiveLaneIds ?? new Set<string>();
+      const staticFinalPctByLaneId = new Map(decision.lanes.map((l) => [l.laneId, l]));
+      const effectiveLanes = promoted.lanes.map((l) =>
+        learningActiveLaneIds.has(l.laneId) ? l : (staticFinalPctByLaneId.get(l.laneId) ?? l),
+      );
+      const effectiveDecision: CortexDecision = { ...promoted, lanes: effectiveLanes };
+      const promotedInvariants = checkCortexInvariants(effectiveDecision);
+      // 2026-07-20 fix: checkCortexInvariants' "total weight ≤ 100%" check sums the RAW roster, which
+      // structurally double-counts a direction-split lane (CG_MFE_GIVEBACK_LONG/_SHORT both carry the
+      // SAME real static weight per engineLaneIdForStaticWeight's own doc — that's by design, so each
+      // half's OWN per-half cap (max(staticPct, CORTEX_LANE_CAP_PCT)) is correct even at β=0). A
+      // legitimate allocation table summing to exactly 100% therefore raw-sums to
+      // 100% + staticPct(split lane) and trips this check FOREVER, at any β, regardless of tilt quality
+      // — decideCortex's blend is (1-β)·staticPct + β·learnedPct, and learnedPct is genuinely normalized
+      // to sum to 100 across the roster (the split competes fairly for capital there), so the ONLY
+      // source of over-100% is the (1-β)-weighted duplicate static contribution. Every OTHER invariant
+      // (NaN/negative/per-lane cap/vetoed-funded/grossG range) is still a real per-entry check and stays
+      // gating as-is; only "total weight" is deferred to the folded-vs-budget check below.
+      const nonTotalViolations = promotedInvariants.violations.filter((v) => !v.startsWith("total weight "));
+      if (nonTotalViolations.length === 0) {
         // Fold the roster's synthetic direction-split ids (e.g. CG_MFE_GIVEBACK_LONG/_SHORT) onto the
         // one real engine lane they both size — see engineLaneIdForStaticWeight's own doc for why: the
         // execution engine has no concept of the split, only ONE real weight slot per engine lane id.
         const summed: Record<string, number> = {};
         const staticByEngineLaneId: Record<string, number> = {};
-        for (const l of promoted.lanes) {
+        const rosterCountByEngineLaneId: Record<string, number> = {};
+        for (const l of effectiveLanes) {
           const engineLaneId = engineLaneIdForStaticWeight(l.laneId);
           summed[engineLaneId] = (summed[engineLaneId] ?? 0) + Math.max(0, l.finalPct);
           // Duplicate roster entries share the identical real static value (both call the SAME real
           // accessor) — max() is just a defensive tie-break, not an actual combine rule.
           staticByEngineLaneId[engineLaneId] = Math.max(staticByEngineLaneId[engineLaneId] ?? 0, l.staticPct);
+          rosterCountByEngineLaneId[engineLaneId] = (rosterCountByEngineLaneId[engineLaneId] ?? 0) + 1;
         }
-        // 2026-07-20 safety-review fix (CRITICAL): checkCortexInvariants above validated each ROSTER
-        // entry against its OWN per-lane cap individually — a split that shares one real engine lane
-        // can each independently pass that check yet SUM well past the real concentration cap once
-        // folded onto the one lane the engine actually sizes (e.g. LONG at its own 35% cap + SHORT at
-        // 12% both "pass", but the real lane would be installed at 47%). Re-validate the FOLDED total
-        // against the same effCap formula decideCortex/checkCortexInvariants use; any violation
-        // discards the WHOLE promoted map for this cycle — never a silent partial/clamped install.
-        const foldViolations = Object.entries(summed).filter(
-          ([engineLaneId, w]) => w > Math.max(staticByEngineLaneId[engineLaneId] ?? 0, CORTEX_LANE_CAP_PCT) + 1e-6,
+        const foldedTotal = Object.values(summed).reduce((s, w) => s + w, 0);
+        // 2026-07-21 precision fix: a non-active roster entry is forced to its EXACT β=0 static value
+        // (byte-identical to `decision.lanes`, per the comment above) — it is NEVER tilted, so budgeting
+        // its extra at `(1-promotedBeta)` (the discount that made sense for the OLD "every copy is tilted"
+        // assumption) systematically UNDER-budgets it by `promotedBeta · staticPct`, which is exactly why
+        // this check was rejecting promotion on every single cycle in production despite the actual
+        // deviation from the incumbent being tiny. The duplicate's extra is FULL and undiscounted:
+        const duplicateStaticExtra = Object.entries(rosterCountByEngineLaneId).reduce(
+          (sum, [engineLaneId, count]) => sum + Math.max(0, count - 1) * (staticByEngineLaneId[engineLaneId] ?? 0),
+          0,
         );
-        if (foldViolations.length === 0) {
-          promotedWeights = summed;
-        } else {
+        // 2026-07-21 CRITICAL fix (adversarial-review finding): the budget below allows a
+        // LEARNING_ACTIVE lane's own tilt headroom, but the aggregate foldedTotal>foldedBudget
+        // comparison can't tell WHERE any extra actually came from — headroom sitting on one active
+        // lane can silently absorb a genuine over-100% CORRUPTION on a completely different, unrelated
+        // lane (e.g. an operator/autopilot table whose individual entries each validate but SUM past
+        // 100% — setLaneAllocations validates each entry's range, never the total). Neither lane need
+        // breach its OWN per-lane cap for this, so the post-fold per-lane check below (a concentration
+        // check) does not catch it — this is an aggregate-total failure. Validate the incumbent (β=0)
+        // baseline itself, independent of any active-lane headroom, BEFORE trusting that headroom to
+        // explain any further growth: the untilted table must already fit the one shape this promotion
+        // path understands and accepts (100% + the known roster-split duplicate), full stop.
+        const staticByEngineLaneForBaseline: Record<string, number> = {};
+        for (const l of decision.lanes) {
+          const engineLaneId = engineLaneIdForStaticWeight(l.laneId);
+          staticByEngineLaneForBaseline[engineLaneId] = (staticByEngineLaneForBaseline[engineLaneId] ?? 0) + Math.max(0, l.finalPct);
+        }
+        const staticFoldedTotal = Object.values(staticByEngineLaneForBaseline).reduce((s, w) => s + w, 0);
+        const expectedStaticCeiling = effectiveDecision.grossG * (100 + duplicateStaticExtra);
+        if (staticFoldedTotal > expectedStaticCeiling + 1e-6) {
           console.error(
-            "[cortex-live] promoted decision failed the POST-FOLD per-engine-lane cap — falling back to the incumbent table this cycle",
-            foldViolations,
+            `[cortex-live] incumbent (β=0) folded total ${staticFoldedTotal.toFixed(2)}% already exceeds its expected ${expectedStaticCeiling.toFixed(2)}% ceiling before any tilt — falling back to the incumbent table this cycle`,
           );
+        } else {
+          // The ONLY legitimate source of growth beyond the now-validated duplicate-adjusted 100%
+          // baseline is a LEARNING_ACTIVE lane's own tilt — bounded, per lane, by the SAME effectiveCap
+          // the fold-cap check below re-verifies. Summing that per-lane worst case (cap − static) over
+          // just the active roster entries gives an exact, still-conservative ceiling for "every active
+          // lane tilts all the way to its own cap simultaneously" — not an approximation, an actual
+          // reachable bound — so ordinary small-β production tilts (which use only a sliver of this
+          // headroom) are no longer spuriously rejected, while the fold-cap check remains the real
+          // per-lane backstop.
+          const activeTiltHeadroom = effectiveLanes
+            .filter((l) => learningActiveLaneIds.has(l.laneId))
+            .reduce((sum, l) => sum + Math.max(0, Math.max(l.staticPct, CORTEX_LANE_CAP_PCT) - l.staticPct), 0);
+          const foldedBudget = expectedStaticCeiling + activeTiltHeadroom;
+          if (foldedTotal > foldedBudget + 1e-6) {
+            console.error(
+              `[cortex-live] promoted decision's folded total ${foldedTotal.toFixed(2)}% exceeds its budget ${foldedBudget.toFixed(2)}% — falling back to the incumbent table this cycle`,
+            );
+          } else {
+            // 2026-07-20 safety-review fix (CRITICAL): checkCortexInvariants above validated each ROSTER
+            // entry against its OWN per-lane cap individually — a split that shares one real engine lane
+            // can each independently pass that check yet SUM well past the real concentration cap once
+            // folded onto the one lane the engine actually sizes (e.g. LONG at its own 35% cap + SHORT at
+            // 12% both "pass", but the real lane would be installed at 47%). Re-validate the FOLDED total
+            // PER LANE against the same effCap formula decideCortex/checkCortexInvariants use; any
+            // violation discards the WHOLE promoted map for this cycle — never a silent partial install.
+            const foldViolations = Object.entries(summed).filter(
+              ([engineLaneId, w]) => w > Math.max(staticByEngineLaneId[engineLaneId] ?? 0, CORTEX_LANE_CAP_PCT) + 1e-6,
+            );
+            if (foldViolations.length === 0) {
+              promotedWeights = summed;
+            } else {
+              console.error(
+                "[cortex-live] promoted decision failed the POST-FOLD per-engine-lane cap — falling back to the incumbent table this cycle",
+                foldViolations,
+              );
+            }
+          }
         }
       } else {
-        console.error("[cortex-live] promoted decision failed invariants — falling back to the incumbent table this cycle", promotedInvariants.violations);
+        console.error("[cortex-live] promoted decision failed invariants — falling back to the incumbent table this cycle", nonTotalViolations);
       }
     }
   }

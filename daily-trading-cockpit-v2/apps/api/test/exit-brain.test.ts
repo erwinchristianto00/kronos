@@ -68,4 +68,58 @@ describe("Exit Brain", () => {
     const t = decideExit(exitInput({ currentPrice: Number.NaN, mfeR: 2, unrealizedR: 0.6, divergence: true })); // → TRAIL branch
     expect(t.suggestedTrailDistance === null || Number.isFinite(t.suggestedTrailDistance)).toBe(true);
   });
+
+  // ── 2026-07-24 defensive-hygiene fix: decisionId collision across candidates sharing side+action ──────
+  // Mirrors the Entry Brain fix exactly (see entry-brain.ts / entry-brain.test.ts). Root cause: decisionId
+  // used to be fourBrainDecisionId("exit", nowMs, `${side}:${action}`) — a pure function of (nowMs, side,
+  // action) ONLY. Verified empirically (2026-07-24) against real testnet journal data: 85.5% of exit
+  // candidates within a tick collide on this decisionId (one tick had 9 candidates across 9 different
+  // symbols, 8 of which shared the exact same id), even though they are genuinely different decisions
+  // (different position/symbol/lane). Confirmed CURRENTLY HARMLESS: no Exit-outcome ledger/reconciler
+  // analogous to direction-entry-outcome-store.ts exists yet, and the real Exit Brain shadow-counterfactual
+  // store (exit-brain-shadow.ts) already dedupes on a separate, already-unique `sp:${positionId}:${variant}`
+  // key. Fixed preventively so a FUTURE Exit-outcome ledger built the same way Entry's was doesn't inherit
+  // the identical silent-loss bug (recordOutcome-style idempotent-per-decisionId store discarding a
+  // colliding candidate's outcome forever, per the Entry Brain incident this mirrors).
+  describe("decisionId collision fix (candidateKey salt)", () => {
+    it("two candidates with the SAME side+action but DIFFERENT candidateKey get DIFFERENT decisionIds", () => {
+      const a = decideExit(exitInput({ candidateKey: "CG_WIDE_FAST_LONG::BTCUSDT::LONG::pos-1" })); // HOLD (clean fixture)
+      const b = decideExit(exitInput({ candidateKey: "CG_WIDE_TREND::ETHUSDT::LONG::pos-2" }));
+      expect(a.action).toBe("HOLD");
+      expect(b.action).toBe("HOLD"); // same side+action bucket as `a` — would have collided pre-fix
+      expect(a.decisionId).not.toBe(b.decisionId);
+    });
+
+    it("without a candidateKey (caller omits it), the pre-fix collision across same side+action still reproduces — proves the fix is opt-in via the new field, not a behavior change for un-migrated callers", () => {
+      const a = decideExit(exitInput()); // HOLD
+      const b = decideExit(exitInput({ entryPrice: 250, currentPrice: 255, hardStopPrice: 240 })); // genuinely different position, same HOLD bucket
+      expect(a.action).toBe("HOLD");
+      expect(b.action).toBe("HOLD");
+      expect(a.decisionId).toBe(b.decisionId); // the exact bug this task fixes, absent the salt
+    });
+
+    it("the SAME candidate re-decided at the same asOfMs (e.g. immediately after a crash-restart) still yields the SAME decisionId — crash-restart idempotency is preserved", () => {
+      const opts = { candidateKey: "CG_WIDE_FAST_LONG::BTCUSDT::LONG::pos-9" };
+      const first = decideExit(exitInput(opts));
+      const second = decideExit(exitInput(opts));
+      expect(first.decisionId).toBe(second.decisionId);
+      expect(first.action).toBe(second.action);
+    });
+
+    it("an empty-string candidateKey falls back to the no-salt key (never fabricates a distinct id from an empty string)", () => {
+      const withEmpty = decideExit(exitInput({ candidateKey: "" }));
+      const withoutField = decideExit(exitInput());
+      expect(withEmpty.decisionId).toBe(withoutField.decisionId);
+    });
+
+    it("candidateKey never changes the decision's substantive action/fields — only decisionId", () => {
+      const base = exitInput({ mfeR: 2.0, unrealizedR: 0.6, structureBreak: true, divergence: true }); // giveback branch
+      const withSalt = decideExit({ ...base, candidateKey: "SOME_LANE::SOLUSDT::LONG::pos-7" });
+      const withoutSalt = decideExit(base);
+      expect(withSalt.action).toBe(withoutSalt.action);
+      expect(withSalt.exitFraction).toBe(withoutSalt.exitFraction);
+      expect(withSalt.reversalRisk).toBe(withoutSalt.reversalRisk);
+      expect(withSalt.decisionId).not.toBe(withoutSalt.decisionId);
+    });
+  });
 });

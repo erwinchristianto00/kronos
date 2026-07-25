@@ -122,6 +122,19 @@ describe("readCortexDecisionRows — line-resilient journal reader", () => {
     expect(rows.map((r) => r.regimeFamily)).toEqual(["BULL", "BEAR"]); // sorted by atMs
     expect(rows[1]!.lanes.get(RC)!.eligible).toBe(false);
   });
+
+  it("[REGRESSION 2026-07-22] a syntactically-valid but semantically-invalid line (wrong kind, missing/unparsable `at`) counts into badLines too, not just a JSON.parse failure", () => {
+    const dir = tmp();
+    mkdirSync(dir, { recursive: true });
+    const file = join(dir, "journal.jsonl");
+    const good = { kind: "BRAIN_DECISION", at: "2026-07-22T00:00:00.000Z", featureSchemaVersion: 1, regimeFamily: "BULL", lanes: [{ laneId: RC, x: [1, 2, 3], eligible: true, direction: "LONG" }] };
+    const wrongKind = { kind: "SOMETHING_ELSE", at: "2026-07-22T00:05:00.000Z", featureSchemaVersion: 1, regimeFamily: "BULL", lanes: [] };
+    const badAt = { kind: "BRAIN_DECISION", at: "not-a-real-timestamp", featureSchemaVersion: 1, regimeFamily: "BULL", lanes: [] };
+    writeFileSync(file, [good, wrongKind, badAt].map((r) => JSON.stringify(r)).join("\n") + "\n");
+    const { rows, badLines } = readCortexDecisionRows([file]);
+    expect(rows).toHaveLength(1); // only the genuinely valid row
+    expect(badLines).toBe(2); // previously 0 — both malformed lines vanished uncounted
+  });
 });
 
 describe("collectCortexOutcomes — normalization + skip tally", () => {

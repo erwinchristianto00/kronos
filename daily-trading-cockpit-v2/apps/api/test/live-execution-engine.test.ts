@@ -44,6 +44,7 @@ import {
   type SingleSymbolFreshSignal,
 } from "../src/lib/single-symbol-lane-executor.js";
 import type { BinanceClient, FuturesFlowSnapshot } from "../src/lib/binance.js";
+import { CortexRealAttributionStore } from "../src/lib/cortex-real-attribution.js";
 import type { PaperOrder } from "../src/lib/paper-execution-router.js";
 import type { PerSymbolLaneBookEdgeReport } from "../src/lib/per-symbol-lane-book-edge.js";
 
@@ -366,9 +367,11 @@ function makeEngine(opts: {
   getExternalRealizedPnlUsd?: () => { today: number; allTime: number };
   onKillSwitchEngaged?: (reason: string) => Promise<void>;
   laneDirectionForId?: (laneId: string) => "LONG" | "SHORT" | "NEUTRAL" | null;
+  cortexRealAttribution?: CortexRealAttributionStore;
+  store?: LiveExecutionStore;
 } = {}) {
   const client = opts.client ?? new FakeLiveClient();
-  const store = new LiveExecutionStore(tmp());
+  const store = opts.store ?? new LiveExecutionStore(tmp());
   const engine = new LiveExecutionEngine({
     config: makeConfig(opts.config),
     client: client as unknown as LivePrivateClient,
@@ -386,6 +389,7 @@ function makeEngine(opts: {
     getExternalRealizedPnlUsd: opts.getExternalRealizedPnlUsd,
     onKillSwitchEngaged: opts.onKillSwitchEngaged,
     laneDirectionForId: opts.laneDirectionForId,
+    cortexRealAttribution: opts.cortexRealAttribution,
   });
   return { engine, client, store };
 }
@@ -661,6 +665,13 @@ describe("computeLiveOrderPlan", () => {
     expect(plan.qty).toBeCloseTo(0.05, 9);
     expect(plan.tp1Qty).toBeCloseTo(0.025, 9);
     expect(plan.notionalUsd).toBeCloseTo(100, 6);
+    expect(plan.plannedRiskUsd).toBe(5);
+    expect(plan.requiredNotionalUsd).toBeCloseTo(100, 6);
+    expect(plan.appliedNotionalUsd).toBeCloseTo(100, 6);
+    expect(plan.notionalCapUsd).toBe(250);
+    expect(plan.stopDistancePct).toBeCloseTo(0.05, 9);
+    expect(plan.effectiveRiskUsd).toBeCloseTo(5, 6);
+    expect(plan.riskClippedByNotionalCap).toBe(false);
     expect(plan.stopPrice).toBeCloseTo(2100, 9);
     expect(plan.tp1Price).toBeCloseTo(1900, 9);
   });
@@ -674,6 +685,12 @@ describe("computeLiveOrderPlan", () => {
     );
     expect(capped.ok).toBe(true);
     expect(capped.notionalUsd).toBeLessThanOrEqual(250);
+    expect(capped.plannedRiskUsd).toBe(5);
+    expect(capped.requiredNotionalUsd).toBeCloseTo(5000, 6);
+    expect(capped.appliedNotionalUsd).toBeLessThanOrEqual(250);
+    expect(capped.notionalCapUsd).toBe(250);
+    expect(capped.stopDistancePct).toBeCloseTo(0.001, 9);
+    expect(capped.riskClippedByNotionalCap).toBe(true);
 
     const tooSmall = computeLiveOrderPlan(
       { direction: "LONG", entryPrice: 2000, stopLoss: 1000, tp1: 3000 },
@@ -1666,6 +1683,86 @@ describe("LiveExecutionEngine", () => {
     await engine.tick();
 
     expect(client.placed.filter((placed) => placed.type === "MARKET" && !placed.reduceOnly)).toHaveLength(1);
+  });
+
+  it("2026-07-21 fix: an off-table diagnostic lane gets a REAL nonzero mirror size under mirrorAllPaperOrders, not a silent qty=0", async () => {
+    // Reproduces the exact production bug: a real, non-null operator allocation table is configured
+    // (as it always is on the actual testnet deployment) that simply doesn't list this diagnostic/
+    // research variant lane. Before the fix, laneSelectionWeightPctForLane returned 0 for it (the
+    // lane-not-listed branch), zeroing the plan's qty; openIntent's combinedPlan then silently no-op'd
+    // on the unsizeable plan while the caller still latched "opened" — no real order was EVER placed.
+    const order = paperOrder({
+      paperOrderId: "off-table-diagnostic",
+      selectedLaneId: "CG_EXP_LONG_MFE_GIVEBACK_10X", // NOT in the table set below
+      paperOrderMode: "DIAGNOSTIC_ONLY",
+      diagnosticLabel: "TESTNET_COLLECT_ALL_LANES",
+    });
+    const { engine, client } = makeEngine({
+      paper: makePaperStore([order]),
+      config: { mirrorAllPaperOrders: true },
+    });
+    engine.setLaneAllocations([{ laneId: "CG_WIDE_FAST_LONG", weightPct: 100 }]); // the real table — off-table lane deliberately absent
+    await engine.arm();
+    await engine.tick();
+
+    const entries = client.placed.filter((placed) => placed.type === "MARKET" && !placed.reduceOnly);
+    expect(entries).toHaveLength(1); // fixed: a real order is actually placed now
+    // Full-size (DIAGNOSTIC_LANE_MIRROR_WEIGHT_PCT=100): the original 10% default silently failed
+    // one step later in production — the scaled qty fell under real Binance minQty/minNotional.
+    expect(entries[0]!.quantity).toBeCloseTo(0.05, 9);
+  });
+
+  it("2026-07-21 fix: a listed lane CORTEX has tilted down to exactly 0% stays at 0% even under mirrorAllPaperOrders", async () => {
+    // The fix must not become a blanket bypass of a deliberate zero — only a lane genuinely ABSENT
+    // from the table gets the diagnostic default. setLaneAllocations itself rejects a literal 0%
+    // entry (operators can't list a lane at exactly 0%), so the one real way a LISTED lane's
+    // effective weight lands on exactly 0 is CORTEX's promoted-weight override — exercise that path.
+    const order = paperOrder({
+      paperOrderId: "cortex-zeroed",
+      selectedLaneId: "CG_WIDE_FAST_SHORT",
+      paperOrderMode: "DIAGNOSTIC_ONLY",
+      diagnosticLabel: "TESTNET_COLLECT_ALL_LANES",
+    });
+    const { engine, client } = makeEngine({
+      paper: makePaperStore([order]),
+      config: { mirrorAllPaperOrders: true },
+    });
+    engine.setLaneAllocations([
+      { laneId: "CG_WIDE_FAST_LONG", weightPct: 50 },
+      { laneId: "CG_WIDE_FAST_SHORT", weightPct: 50 },
+    ]);
+    engine.setCortexPromotedWeights({ CG_WIDE_FAST_SHORT: 0 }); // listed lane, tilted to exactly 0 — not an omission
+    await engine.arm();
+    await engine.tick();
+
+    const entries = client.placed.filter((placed) => placed.type === "MARKET" && !placed.reduceOnly);
+    expect(entries).toHaveLength(0); // still blocked — a listed-but-zeroed lane must never be reinterpreted as "off-table"
+  });
+
+  it("2026-07-23 fix: an operator-weight-scaled qty that clears minQty but misses minNotional is rejected, not silently opened", async () => {
+    // Reproduces a real production bug found investigating CG_LONG_VARIANT_MATRIX:CG_EXP_LONG_MFE_GIVEBACK_10X
+    // on testnet: computeLiveOrderPlan validates the qty/notional BEFORE mirrorNewSignals scales it
+    // by (operator weight% x directional size-multiplier); combinedPlan then re-rounded that SCALED
+    // qty and re-checked it against minQty only, never against minNotional. A low weight% can clear
+    // minQty by unit count while the dollar notional falls under the exchange's separate minNotional
+    // floor — Binance then rejects the real order with -4164 ("notional must be no smaller than 5").
+    // Live evidence: 104/201 (52%) of this lane's real open attempts failed with exactly this error.
+    const order = paperOrder({
+      paperOrderId: "weight-scaled-under-notional",
+      selectedLaneId: "CG_WIDE_FAST_LONG",
+      direction: "LONG",
+      entryPrice: 1,
+      stopLoss: 0.8, // 20% stop distance: unscaled notional = riskUsdPerTrade(5)/0.20 = $25 (clears minNotional=5)
+      takeProfitLevels: [1.2],
+    });
+    const { engine, client } = makeEngine({ paper: makePaperStore([order]) });
+    // 1% of the validated $25 plan = $0.25 notional (below minNotional=5) but 0.25 qty units (still
+    // above minQty=0.001) — exactly the gap between the two checks.
+    engine.setLaneAllocations([{ laneId: "CG_WIDE_FAST_LONG", weightPct: 1 }]);
+    await engine.arm();
+    await engine.tick();
+
+    expect(client.placed.filter((placed) => placed.type === "MARKET" && !placed.reduceOnly)).toHaveLength(0);
   });
 
   it("normal mirror keeps a strategy admission block", async () => {
@@ -3080,6 +3177,21 @@ describe("copyExternalIntent (testnet→live copy button)", () => {
     expect(intent.tp1OrderId).not.toBeNull();
     // full-TP exit rule ⇒ tp1Qty equals qty (banks 100% at TP1)
     expect(intent.tp1Qty).toBeCloseTo(intent.qty, 9);
+    expect(intent.plannedRiskUsd).toBeCloseTo(5, 6);
+    expect(intent.requiredNotionalUsd).toBeCloseTo(100, 6);
+    expect(intent.appliedNotionalUsd).toBeCloseTo(100, 6);
+    expect(intent.notionalCapUsd).toBe(250);
+    expect(intent.stopDistancePct).toBeCloseTo(0.05, 9);
+    expect(engine.getStatus().riskSizing).toEqual(
+      expect.objectContaining({
+        avgPlannedRiskUsd: 5,
+        avgRequiredNotionalUsd: 100,
+        avgAppliedNotionalUsd: 100,
+        avgNotionalCapUsd: 250,
+        avgStopDistancePct: 0.05,
+        clippingRatePct: 0,
+      }),
+    );
   });
 
   it("refuses a second copy on a symbol that already has an open intent", async () => {
@@ -3089,6 +3201,25 @@ describe("copyExternalIntent (testnet→live copy button)", () => {
     const res = await engine.copyExternalIntent(spec);
     expect(res.ok).toBe(false);
     expect(res.reason).toMatch(/already open/);
+  });
+
+  it("returns the durable prior intent for the same idempotency key, including after store reload", async () => {
+    const dataDir = tmp();
+    const client = new FakeLiveClient();
+    const first = makeEngine({ client, store: new LiveExecutionStore(dataDir) });
+    expect((await first.engine.arm()).ok).toBe(true);
+    const request = { ...spec, idempotencyKey: "testnet:paper-src-1" };
+    const opened = await first.engine.copyExternalIntent(request);
+    expect(opened.ok).toBe(true);
+    expect(first.store.getState().intents[0]?.externalCopyIdempotencyKey).toBe(request.idempotencyKey);
+    const placedAfterOpen = client.placed.length;
+
+    const reloaded = makeEngine({ client, store: new LiveExecutionStore(dataDir) });
+    const replay = await reloaded.engine.copyExternalIntent(request);
+    expect(replay.ok).toBe(true);
+    expect(replay.reason).toMatch(/idempotent replay/);
+    expect(replay.intent?.paperOrderId).toBe(opened.intent?.paperOrderId);
+    expect(client.placed).toHaveLength(placedAfterOpen);
   });
 
   it("refuses invalid geometry (stop on the wrong side for the direction)", async () => {
@@ -3292,6 +3423,243 @@ describe("CORTEX Phase-4 promoted-weight override (2026-07-20, operator-approved
   it("a fresh engine defaults to no override at all (getCortexPromotedWeights null)", () => {
     const { engine } = makeEngine();
     expect(engine.getCortexPromotedWeights()).toBeNull();
+  });
+});
+
+describe("rawLaneAllocationWeightPctForLane (2026-07-21 CRITICAL fix: breaks a self-referential feedback loop)", () => {
+  // Bug reproduction: CORTEX's own "static weight" input used to be wired to
+  // laneSelectionWeightPctForLane — the SAME accessor its own promoted output feeds back into. A cycle
+  // that installs a promoted weight poisons the very next cycle's "static" read, which (for a
+  // direction-split roster lane like CG_MFE_GIVEBACK_LONG/_SHORT) folds into a phantom concentration
+  // that trips the per-lane cap, clearing the override — so the cycle after reads the TRUE table again
+  // and re-promotes, oscillating forever. Observed live: a real static 12% (24% folded) alternated with
+  // a contaminated ~21.5% (43.1% folded) every other 5-minute cycle, never stabilizing.
+
+  it("returns the TRUE operator table value even while a CORTEX override is installed — immune to self-contamination", () => {
+    const { engine } = makeEngine();
+    engine.setLaneAllocations([{ laneId: "CG_MFE_GIVEBACK", weightPct: 12 }]);
+    expect(engine.rawLaneAllocationWeightPctForLane("CG_MFE_GIVEBACK")).toBe(12);
+
+    // Simulate a prior cycle's promotion having installed a tilted weight for this same lane.
+    engine.setCortexPromotedWeights({ CG_MFE_GIVEBACK: 21.5 });
+
+    // The REAL order-sizing accessor is correctly rescaled by the override (unchanged behavior)...
+    expect(engine.laneSelectionWeightPctForLane("CG_MFE_GIVEBACK")).toBe(21.5);
+    // ...but CORTEX's own next-cycle "static" input must NOT see that contaminated number.
+    expect(engine.rawLaneAllocationWeightPctForLane("CG_MFE_GIVEBACK")).toBe(12);
+  });
+
+  it("matches laneSelectionWeightPctForLane's plain-table semantics when no override is installed", () => {
+    const { engine } = makeEngine();
+    expect(engine.rawLaneAllocationWeightPctForLane("CG_WIDE_FAST_SHORT")).toBe(100); // no table ⇒ unblocked sentinel
+
+    engine.setLaneAllocations([{ laneId: "CG_WIDE_FAST_SHORT", weightPct: 70 }]);
+    expect(engine.rawLaneAllocationWeightPctForLane("CG_WIDE_FAST_SHORT")).toBe(70);
+    expect(engine.rawLaneAllocationWeightPctForLane("CG_WIDE_FAST_LONG")).toBe(0); // excluded lane
+    expect(engine.rawLaneAllocationWeightPctForLane("CG_VARIANT_MATRIX:CG_WIDE_FAST_SHORT")).toBe(70); // variantId suffix
+  });
+
+  it("empty allocations (intentional manual-directional hold) resolve to 0, same as the real accessor", () => {
+    const { engine } = makeEngine();
+    engine.setManualDirectionalLaneAllocations({
+      long: [{ laneId: "CG_WIDE_FAST_LONG", weightPct: 70 }],
+      short: [{ laneId: "CG_WIDE_FAST_SHORT", weightPct: 80 }],
+    });
+    engine.setManualSelectorMode(true); // no setManualEntryDecision ⇒ still holding ⇒ effectiveLaneAllocations() === []
+    expect(engine.rawLaneAllocationWeightPctForLane("CG_WIDE_FAST_LONG")).toBe(0);
+  });
+
+  it("end-to-end: a clean split-lane fold stays clean across repeated cycles instead of oscillating", () => {
+    // Reproduces the exact live scenario: CG_MFE_GIVEBACK's two roster halves (LONG/SHORT) both read the
+    // SAME real engine lane's static weight. Before the fix, alternating cycles fed 12 then a
+    // contaminated ~21.5 into this lookup. After the fix, every cycle sees the true 12 regardless of
+    // what CORTEX itself installed last cycle.
+    const { engine } = makeEngine();
+    engine.setLaneAllocations([{ laneId: "CG_MFE_GIVEBACK", weightPct: 12 }]);
+
+    for (let cycle = 0; cycle < 5; cycle += 1) {
+      const staticNow = engine.rawLaneAllocationWeightPctForLane("CG_MFE_GIVEBACK");
+      expect(staticNow).toBe(12); // never contaminated by the previous cycle's install
+      const foldedTotal = staticNow * 2; // both LONG and SHORT roster halves share this one real value
+      expect(foldedTotal).toBeLessThan(35); // stays safely under CORTEX_LANE_CAP_PCT every cycle
+      // Simulate this cycle's promotion succeeding and installing a (slightly tilted) weight, as the
+      // real promotion path would once the invariant checks pass.
+      engine.setCortexPromotedWeights({ CG_MFE_GIVEBACK: staticNow + 0.3 });
+    }
+  });
+});
+
+describe("CORTEX real-USDT attribution (2026-07-21: realizedPnlUsd × open-time tiltShare, report-only)", () => {
+  // FAIL-WITHOUT-FIX: before this feature, LiveExecutionEngine had no cortexRealAttribution option,
+  // LiveIntent had no cortexAppliedWeightPct/cortexRawStaticWeightPct capture, and no sweep existed —
+  // these tests cannot even construct against pre-feature code, and with the option removed the
+  // attribution store trivially stays empty after a real open→close cycle.
+
+  function tp1FullOrder() {
+    return paperOrder({ selectedLaneId: "CG_WIDE_FAST_SHORT", variantExitRule: "tp1_full" });
+  }
+
+  /** Drives the standard tp1_full close: TP1 fills the whole position → flat → settleClosedIntent
+   *  books net = realizedPnl − commission from the exchange's own trade records. */
+  async function closeViaTp1(engine: LiveExecutionEngine, client: FakeLiveClient, intent: LiveIntent, realizedPnl: number, commission: number) {
+    client.orderStatusById.set(intent.tp1OrderId!, "FILLED");
+    client.positionsBySymbol.set(intent.symbol, 0);
+    client.trades = [
+      { symbol: intent.symbol, orderId: intent.tp1OrderId!, price: 1900, qty: intent.qty, realizedPnl, commission, commissionAsset: "USDT", time: 1 },
+    ];
+    await engine.tick();
+  }
+
+  it("open under an INSTALLED promoted tilt → close → attribution record with the exact open-time tiltShare", async () => {
+    const attribution = new CortexRealAttributionStore(tmp());
+    const order = tp1FullOrder();
+    const { engine, client, store } = makeEngine({ paper: makePaperStore([order]), cortexRealAttribution: attribution });
+    engine.setLaneAllocations([{ laneId: "CG_WIDE_FAST_SHORT", weightPct: 70 }]);
+    engine.setCortexPromotedWeights({ CG_WIDE_FAST_SHORT: 74.62 }); // CORTEX upsized 70% → 74.62%
+    expect((await engine.arm()).ok).toBe(true);
+
+    await engine.tick(); // mirrors + opens
+    const intent = store.getState().intents[0]!;
+    // Capture-at-open: BOTH weights frozen on the persisted intent, from the sizing path itself.
+    expect(intent.cortexAppliedWeightPct).toBeCloseTo(74.62, 9);
+    expect(intent.cortexRawStaticWeightPct).toBe(70);
+    expect(attribution.getState().records).toHaveLength(0); // nothing attributed while open
+
+    await closeViaTp1(engine, client, intent, 5, 0.04); // net +4.96
+    expect(store.getState().intents[0]!.state).toBe("CLOSED");
+
+    const records = attribution.getState().records;
+    expect(records).toHaveLength(1);
+    const record = records[0]!;
+    const expectedShare = (74.62 - 70) / 74.62;
+    expect(record.laneId).toBe("CG_WIDE_FAST_SHORT");
+    expect(record.symbol).toBe("ETHUSDT");
+    expect(record.realizedPnlUsd).toBeCloseTo(4.96, 6);
+    expect(record.tiltShare).toBeCloseTo(expectedShare, 9);
+    expect(record.cortexUsd).toBeCloseTo(4.96 * expectedShare, 6);
+    // Aggregator: the close lands in "today" (the engine's fixed nowIso day) and all-time.
+    const report = attribution.buildReport("2099-01-02T23:00:00.000Z");
+    expect(report.today.n).toBe(1);
+    expect(report.today.cortexUsd).toBeCloseTo(4.96 * expectedShare, 6);
+    expect(report.allTime.n).toBe(1);
+
+    // Idempotent: further ticks re-sweep the same CLOSED intent without double-booking.
+    await engine.tick();
+    await engine.tick();
+    expect(attribution.getState().records).toHaveLength(1);
+    expect(attribution.getState().allTime.n).toBe(1);
+
+    // 2026-07-21 review fix: the booked intent carries a DURABLE dedup flag, persisted with the
+    // intent — so even total attribution-store loss (corrupt/deleted file, dedup-FIFO eviction)
+    // can never re-book it. Simulate by wiping the attribution store's own state entirely.
+    expect(store.getState().intents[0]!.cortexAttributed).toBe(true);
+    const wiped = attribution.getState();
+    wiped.records.length = 0;
+    wiped.allTime.n = 0;
+    wiped.allTime.cortexUsd = 0;
+    wiped.attributedRecordIds.length = 0;
+    (attribution as unknown as { attributedIdSet: Set<string> }).attributedIdSet.clear();
+    await engine.tick();
+    expect(attribution.getState().records).toHaveLength(0); // NOT re-booked — the intent flag held
+    expect(attribution.getState().allTime.n).toBe(0);
+  });
+
+  it("a DOWNSIZING tilt on a losing close books a POSITIVE cortexUsd (CORTEX saved money) — sign honesty end to end", async () => {
+    const attribution = new CortexRealAttributionStore(tmp());
+    const order = tp1FullOrder();
+    const { engine, client, store } = makeEngine({ paper: makePaperStore([order]), cortexRealAttribution: attribution });
+    engine.setLaneAllocations([{ laneId: "CG_WIDE_FAST_SHORT", weightPct: 70 }]);
+    engine.setCortexPromotedWeights({ CG_WIDE_FAST_SHORT: 56 }); // CORTEX downsized 70% → 56%
+    expect((await engine.arm()).ok).toBe(true);
+    await engine.tick();
+    const intent = store.getState().intents[0]!;
+
+    await closeViaTp1(engine, client, intent, -3, 0.04); // net −3.04: a real loss
+    const record = attribution.getState().records[0]!;
+    expect(record.tiltShare).toBeCloseTo((56 - 70) / 56, 9); // negative share — a downsizing tilt
+    expect(record.cortexUsd).toBeCloseTo(-3.04 * ((56 - 70) / 56), 6);
+    expect(record.cortexUsd).toBeGreaterThan(0); // loser shrunk by CORTEX ⇒ CORTEX saved dollars
+  });
+
+  it("open with NO tilt → close → an explicit tiltShare-0 / $0 record IS written (documented choice: every " +
+    "captured close is booked, so the all-time n is an honest denominator)", async () => {
+    const attribution = new CortexRealAttributionStore(tmp());
+    const order = tp1FullOrder();
+    const { engine, client, store } = makeEngine({ paper: makePaperStore([order]), cortexRealAttribution: attribution });
+    // No allocations table and no promoted weights at all — applied == raw == 100.
+    expect((await engine.arm()).ok).toBe(true);
+    await engine.tick();
+    const intent = store.getState().intents[0]!;
+    expect(intent.cortexAppliedWeightPct).toBe(100);
+    expect(intent.cortexRawStaticWeightPct).toBe(100);
+
+    await closeViaTp1(engine, client, intent, 5, 0.04);
+    const record = attribution.getState().records[0]!;
+    expect(record.tiltShare).toBe(0);
+    expect(record.cortexUsd).toBe(0);
+    expect(record.realizedPnlUsd).toBeCloseTo(4.96, 6);
+    expect(attribution.buildReport("2099-01-02T23:00:00.000Z").allTime).toMatchObject({ n: 1, cortexUsd: 0 });
+  });
+
+  it("no attribution store wired (every pre-existing caller/test) → engine behaves byte-for-byte as before", async () => {
+    const order = tp1FullOrder();
+    const { engine, client, store } = makeEngine({ paper: makePaperStore([order]) });
+    engine.setLaneAllocations([{ laneId: "CG_WIDE_FAST_SHORT", weightPct: 70 }]);
+    engine.setCortexPromotedWeights({ CG_WIDE_FAST_SHORT: 74.62 });
+    expect((await engine.arm()).ok).toBe(true);
+    await engine.tick();
+    const intent = store.getState().intents[0]!;
+    expect(intent.cortexAppliedWeightPct).toBeCloseTo(74.62, 9); // capture still happens (persisted data)
+    await closeViaTp1(engine, client, intent, 5, 0.04);
+    expect(store.getState().intents[0]!.state).toBe("CLOSED"); // close path fully unaffected
+  });
+
+  it("SingleSymbolLaneExecutor path: capture at open (applied vs rawLaneWeightPct) + attribution at close finalization", async () => {
+    const attribution = new CortexRealAttributionStore(tmp());
+    const { engine, client } = makeEngine();
+    const signals: SingleSymbolFreshSignal[] = [];
+    const NOW_ISO = "2026-07-21T12:00:00.000Z";
+    const executorStore = new SingleSymbolLaneExecutorStore(tmp(), "test.json");
+    const executor = new SingleSymbolLaneExecutor({
+      client: client as unknown as SingleSymbolExecClient,
+      store: executorStore,
+      laneId: "COMPOSITE_ESTIMATOR_WIDE_LONG",
+      direction: "LONG",
+      getOpenSignals: () => signals,
+      exitPolicy: makeFixedRewardExitPolicy({ rewardMultiple: 0.5, maxHoldMs: 48 * 3_600_000 }),
+      isAllowed: () => true,
+      // The exact app.ts wiring shape: applied = tilted selection weight, raw = untouched table.
+      laneWeightPct: () => 53.3,
+      rawLaneWeightPct: () => 50,
+      cortexRealAttribution: attribution,
+      legUsd: () => 200,
+      leverage: () => 3,
+      maxOpenPositions: () => 1,
+      nowIso: () => NOW_ISO,
+      fillConfirmRetryDelayMs: 0,
+      onPositionClosed: (netUsd) => engine.recordExternalConsecutiveLossOutcome(netUsd),
+    });
+
+    signals.push({ observationId: "ce:ETHUSDT:1", symbol: "ETHUSDT", entryPrice: 2000, stopPrice: 1900, openedAtMs: new Date(NOW_ISO).getTime() - 5_000 });
+    await executor.tick();
+    const pos = executorStore.getState().positions.find((p) => p.status === "OPEN")!;
+    expect(pos.cortexAppliedWeightPct).toBeCloseTo(53.3, 9);
+    expect(pos.cortexRawStaticWeightPct).toBe(50);
+    // legUsd scaled by the SAME captured applied weight: 200 × 0.533 / 2000 = 0.0533 → step 0.053.
+    expect(pos.qty).toBeCloseTo(0.053, 9);
+    expect(attribution.getState().records).toHaveLength(0);
+
+    client.flattenRealizedPnl = 10;
+    const result = await executor.manualClosePosition(pos.positionId);
+    expect(result.ok).toBe(true);
+    expect(result.netPnlUsd).toBeCloseTo(10, 6);
+
+    const record = attribution.getState().records[0]!;
+    const expectedShare = (53.3 - 50) / 53.3;
+    expect(record.laneId).toBe("COMPOSITE_ESTIMATOR_WIDE_LONG");
+    expect(record.tiltShare).toBeCloseTo(expectedShare, 9);
+    expect(record.cortexUsd).toBeCloseTo(10 * expectedShare, 6);
+    expect(record.closedAtIso).toBe(NOW_ISO);
   });
 });
 

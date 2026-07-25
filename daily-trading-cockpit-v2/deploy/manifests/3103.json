@@ -1,0 +1,1686 @@
+{
+  "schemaVersion": 1,
+  "instanceId": "3103",
+  "generatedAt": "2026-07-25T03:20:21.225Z",
+  "gitSha": "be0e7d431bd0b647f0f22dd2b68c0bb5466dc398",
+  "gitDirty": true,
+  "fileCount": 335,
+  "rootDigestSha256": "ccb6759b804e4606e721572131e98a6052b375491cac85085aa59d3ed49647ac",
+  "checksums": [
+    {
+      "path": "apps/api/src/app.ts",
+      "bytes": 131551,
+      "sha256": "127bb02032d0a57ddf75f015d7ce206bf8cfaded998779c4bead2405b8fd9105"
+    },
+    {
+      "path": "apps/api/src/experience-engine/experience-engine.ts",
+      "bytes": 5385,
+      "sha256": "3159492ae67a5106314835b9108f18ce75b1964ee77c64f06450a96a45b0dbaa"
+    },
+    {
+      "path": "apps/api/src/experience-engine/forward-causal-auditor.ts",
+      "bytes": 5025,
+      "sha256": "887563e5f9b2f4e1bf01bfdde0c81ad810d7a9daeea6782080c707bc2b25b432"
+    },
+    {
+      "path": "apps/api/src/experience-engine/forward-causal-collection.ts",
+      "bytes": 15139,
+      "sha256": "1b5f826670d19ed17b77ce6b73995bcbd62e820d78452a6f714e5036dff35992"
+    },
+    {
+      "path": "apps/api/src/experience-engine/historical-causal-replay-export.ts",
+      "bytes": 2777,
+      "sha256": "b64090e9d79743d12d4fb2e48bf9177149deb5d4280a0173e13b1b7ccd9798fc"
+    },
+    {
+      "path": "apps/api/src/experience-engine/lineage-auditor.ts",
+      "bytes": 7395,
+      "sha256": "9bc5b15cc480c2bce465800899451fd00df4f34a2442ea679f73c0e038b96ec8"
+    },
+    {
+      "path": "apps/api/src/experience-engine/simulator-stress-lab.ts",
+      "bytes": 1274,
+      "sha256": "07b6748f002af1e36ba344af96df6a601e27ddd9659fc96f1daec0db318fdf4a"
+    },
+    {
+      "path": "apps/api/src/index.ts",
+      "bytes": 26,
+      "sha256": "55b3b498220f015044d89c4125c103df55f5bf23eae755637252698e63479fff"
+    },
+    {
+      "path": "apps/api/src/lib/accelerated-evidence-candidate-funnel-log.ts",
+      "bytes": 9220,
+      "sha256": "b724e43ca0dc8bf9f2e6f4525152eb46c8abb4920ef93cb92ea830ddd74b7608"
+    },
+    {
+      "path": "apps/api/src/lib/accelerated-evidence-funnel.ts",
+      "bytes": 16607,
+      "sha256": "72069f946f91f0226ca2b486ff49ac984fb5bd43e2fd938f0efecb909c84e5e6"
+    },
+    {
+      "path": "apps/api/src/lib/adaptive-gate-intelligence.ts",
+      "bytes": 53735,
+      "sha256": "e9729dce648322c650bde1b456d4016d82f75e8e472d4d307befeaedb9e38716"
+    },
+    {
+      "path": "apps/api/src/lib/adaptive-gate-overlay-performance.ts",
+      "bytes": 11126,
+      "sha256": "7893b3e99d973e70cc72c0382e10b45396f1eb9311c652213407fb531818eef2"
+    },
+    {
+      "path": "apps/api/src/lib/adaptive-lane-router.ts",
+      "bytes": 35440,
+      "sha256": "abb6e9356eb4d74ccf23c8da6cba81e36a9c7b8d81877b0b8021c9ad2ba8905c"
+    },
+    {
+      "path": "apps/api/src/lib/adaptive-profit-policy.ts",
+      "bytes": 57526,
+      "sha256": "52e57f3a4312eaf9f3b52422a189cf3b419da84de7f609fb21832697c5d4b45c"
+    },
+    {
+      "path": "apps/api/src/lib/backfill-adapters.ts",
+      "bytes": 11344,
+      "sha256": "f6113a7331abef6cb118f3f9d1fe970300f7af053ca1baf844c2873c4441f64c"
+    },
+    {
+      "path": "apps/api/src/lib/backfill-asof.ts",
+      "bytes": 3096,
+      "sha256": "266a8c7101a4dc5e6544867474133facc66145b4a8e62b1405ad2e66bb97fb7a"
+    },
+    {
+      "path": "apps/api/src/lib/backfill-attribution.ts",
+      "bytes": 8708,
+      "sha256": "136715abf9963355291c02c6ec80720317e501ad1dd6d62d0764ca7769e4c90c"
+    },
+    {
+      "path": "apps/api/src/lib/backfill-classify.ts",
+      "bytes": 3396,
+      "sha256": "23b7a0f5782b49d015e799f91f35b60ac05e3d1fb56b471b7cd5be6aad8fdcbe"
+    },
+    {
+      "path": "apps/api/src/lib/backfill-datasets.ts",
+      "bytes": 4448,
+      "sha256": "3d69417e77c9fe3930394c40f1905acf37cbbd5f2588ca738e7fd65a40a4841b"
+    },
+    {
+      "path": "apps/api/src/lib/backfill-outcome.ts",
+      "bytes": 4471,
+      "sha256": "e4a6ea22db08a8fcb44c09a08ddfc987e7ec5cff4f6b9b7c455067eb160fa2ba"
+    },
+    {
+      "path": "apps/api/src/lib/backfill-reconciliation.ts",
+      "bytes": 3322,
+      "sha256": "e5c2090b44fb7b93383885c6d18835196e4db848741f8587bff2d09eef5ac419"
+    },
+    {
+      "path": "apps/api/src/lib/backfill-schema.ts",
+      "bytes": 5405,
+      "sha256": "396214968ebdc68c50bab88b835b6c7756591ec5f84310dadb2b5826166c00b5"
+    },
+    {
+      "path": "apps/api/src/lib/backfill-walkforward.ts",
+      "bytes": 11379,
+      "sha256": "fbc058941696cffb29a52f7e1baacb50380206e865ae362a776eb3cf340ee625"
+    },
+    {
+      "path": "apps/api/src/lib/backfill-warmstart.ts",
+      "bytes": 5448,
+      "sha256": "09c783d9241f7a38c9df0e0a3824860166caf061e915cb533c77d89482d7f54f"
+    },
+    {
+      "path": "apps/api/src/lib/base-route-current-guard-frozen.ts",
+      "bytes": 30062,
+      "sha256": "02564624d7ac87be9ead46d5e678cc0509f94aadde7249b16e8fbd373fd69f2f"
+    },
+    {
+      "path": "apps/api/src/lib/base-route-current-guard-stability-audit.ts",
+      "bytes": 18040,
+      "sha256": "3b17acf869da8a94965ac506c9a53ad9beb6cac372723cd7773f1865114f5e9b"
+    },
+    {
+      "path": "apps/api/src/lib/base-route-risk-hygiene-monitor.ts",
+      "bytes": 22937,
+      "sha256": "daab87936a36b8d1bb5b8d04ca579dffd7d5f15e3745f24fef123481040a0be5"
+    },
+    {
+      "path": "apps/api/src/lib/binance-futures-private.ts",
+      "bytes": 37183,
+      "sha256": "49390e04559c8a5eb80f21a36c6845f9a4523bc1228c56996e6404ed8aac845a"
+    },
+    {
+      "path": "apps/api/src/lib/binance.ts",
+      "bytes": 27278,
+      "sha256": "695d7834fb9c237cafa1d9ac93b79a65a298ad3bf8ab00fcd325fbfe9777c872"
+    },
+    {
+      "path": "apps/api/src/lib/btc-atr-percentile-cache.ts",
+      "bytes": 8145,
+      "sha256": "88c9248b6c9f494833586fd4706b820b5275a5912ea0c18e420e0f516d7b765f"
+    },
+    {
+      "path": "apps/api/src/lib/btc-leadlag-snap-edge.ts",
+      "bytes": 43786,
+      "sha256": "f3e0b304a023d3264f807baf851cb1a74eadae310207b07c01def581b07575a2"
+    },
+    {
+      "path": "apps/api/src/lib/candle-indicators.ts",
+      "bytes": 6941,
+      "sha256": "0ef9b7a64e15539b62add1a8f54988d8a0cf13724b972799a36f277308340030"
+    },
+    {
+      "path": "apps/api/src/lib/candle-range-fetch.ts",
+      "bytes": 2674,
+      "sha256": "b6130c880cbfc1b8c5d78bd98f2f31470ea0d4031e82c184dea10d8d4bf733e2"
+    },
+    {
+      "path": "apps/api/src/lib/cg-wide-fast-long-hour-interaction.ts",
+      "bytes": 19124,
+      "sha256": "34f5e309392f9140aca5533f0d95acd083b900ffe3a3e49cf8aa8fbc8b30c8b3"
+    },
+    {
+      "path": "apps/api/src/lib/cg-wide-fast-long-path-classification.ts",
+      "bytes": 24082,
+      "sha256": "e2e098744ef2e5cda234c631ea7bb8151edd3ae501239614a1f47e238587c181"
+    },
+    {
+      "path": "apps/api/src/lib/cg-wide-fast-long-predictor-stats.ts",
+      "bytes": 29065,
+      "sha256": "0492d881e6b79b0434ae902568fcfb232dd7ac4b7663b8a02bbf50d3b92caf56"
+    },
+    {
+      "path": "apps/api/src/lib/cohort-performance.ts",
+      "bytes": 9746,
+      "sha256": "9802377ab04fb3c9d096e200b5337498f64323b65cdbf4134ef504e5722fa15a"
+    },
+    {
+      "path": "apps/api/src/lib/composite-estimator-edge.ts",
+      "bytes": 34051,
+      "sha256": "33daceef04cccefaee19d724a2e0b2a5184995dc088eba476542d4210f247287"
+    },
+    {
+      "path": "apps/api/src/lib/compression-expansion-edge.ts",
+      "bytes": 35469,
+      "sha256": "3167306eae131f1abbd332dc0338ef6cac0dc29f9b6cd9b68f6394f53a773b7a"
+    },
+    {
+      "path": "apps/api/src/lib/conditional-alpha-stability.ts",
+      "bytes": 11311,
+      "sha256": "f74d1954a2ec71d512e7c032850b951f845da020374f0524e4aa0fbcf27658d3"
+    },
+    {
+      "path": "apps/api/src/lib/controller-aligned-edge-isolation.ts",
+      "bytes": 15290,
+      "sha256": "afabc99581139a7eb389cd6857c0ab170bd49dce8cbfb473819a0f788a30e639"
+    },
+    {
+      "path": "apps/api/src/lib/controller-aligned-exit-counterfactuals.ts",
+      "bytes": 12716,
+      "sha256": "9690f34ea45445acaa7acbdbdf09c22e54168b3c5fb2ccd26c85ddbd80db9984"
+    },
+    {
+      "path": "apps/api/src/lib/copy-to-live-security.ts",
+      "bytes": 7416,
+      "sha256": "458b0cb645d0a54d29b277883236b84337aeb51499190e5d24e1a181add248fd"
+    },
+    {
+      "path": "apps/api/src/lib/core-scan-auto-refresh.ts",
+      "bytes": 3542,
+      "sha256": "84b3c5f06f048329ca317511a8d7c1e35945e0fb025158ccd13f61908e97246f"
+    },
+    {
+      "path": "apps/api/src/lib/correlation-clusters.ts",
+      "bytes": 4477,
+      "sha256": "f1f6a2832312dfeac1dc714346b3ff4cc325789a79127afe1bb69144b2d39108"
+    },
+    {
+      "path": "apps/api/src/lib/cortex-attribution.ts",
+      "bytes": 20712,
+      "sha256": "88e6e7449314a7bb59ab06d96477b3de625b1c75076dc81bc8e8c22c541a4cbc"
+    },
+    {
+      "path": "apps/api/src/lib/cortex-brain-gather.ts",
+      "bytes": 13148,
+      "sha256": "0251948173012d856508c258be8f2bc63d030cb271be78508162fa4a11e6b6c6"
+    },
+    {
+      "path": "apps/api/src/lib/cortex-brain-store.ts",
+      "bytes": 24177,
+      "sha256": "55653b7008e14bb16b825f47a536b7cf0397f7e1a42ba36d37b5595b99d76169"
+    },
+    {
+      "path": "apps/api/src/lib/cortex-brain.ts",
+      "bytes": 49567,
+      "sha256": "ba0ea0b885c93d62b0c8c84cba08851f7bedc8ccf49829b510ce2e9b25d67820"
+    },
+    {
+      "path": "apps/api/src/lib/cortex-collection-status.ts",
+      "bytes": 17272,
+      "sha256": "2a43a71a07d9836d4edc2b5f896d264c34825a6f3f335a9a58e4c881cb51c02e"
+    },
+    {
+      "path": "apps/api/src/lib/cortex-decision-alpha-report.ts",
+      "bytes": 3977,
+      "sha256": "2308f39b53014e891dfe40dd2a01ccf5886ab2eb5602f9dfd4582b98ec98d382"
+    },
+    {
+      "path": "apps/api/src/lib/cortex-enrichment.ts",
+      "bytes": 8530,
+      "sha256": "a714eff68fb6af5e6648b7f83f984292fbc59ba9b9f6736202d1a83a8f98686b"
+    },
+    {
+      "path": "apps/api/src/lib/cortex-instance-diagnosis.ts",
+      "bytes": 2181,
+      "sha256": "aa9cf9296c774194af5decdfe3cd556609d215eff55a11c01ae7d2e07a6613e1"
+    },
+    {
+      "path": "apps/api/src/lib/cortex-journal-reader.ts",
+      "bytes": 4437,
+      "sha256": "50f62b1a870ea48abfbbe21aa6b6544ea45ad12927a9f9206aaa4cf5a7bfa441"
+    },
+    {
+      "path": "apps/api/src/lib/cortex-live-gather-bindings.ts",
+      "bytes": 9264,
+      "sha256": "a85f5e767788a011da17c044082e80122c84369545b20d8010bfaa7702f2175f"
+    },
+    {
+      "path": "apps/api/src/lib/cortex-live-gather.ts",
+      "bytes": 15065,
+      "sha256": "f10400e6c8165091549d7d3b69581a6405012d5730873d0a45c7a910cc42acaf"
+    },
+    {
+      "path": "apps/api/src/lib/cortex-outcome-source.ts",
+      "bytes": 6719,
+      "sha256": "518f50cc16b6ef0aaf37f9e070f2db3d11512551a79925c0508916f4fc926a4c"
+    },
+    {
+      "path": "apps/api/src/lib/cortex-readiness-bindings.ts",
+      "bytes": 11606,
+      "sha256": "b4b8f32e0c1d214e46de62c40f307f53f3145530c2a4cb7abf5b3695f3b3e663"
+    },
+    {
+      "path": "apps/api/src/lib/cortex-readiness.ts",
+      "bytes": 32562,
+      "sha256": "990de39551b66dc75e61b96c6ef271279fc1c02cfa8bfa8556c70f88f728f0db"
+    },
+    {
+      "path": "apps/api/src/lib/cortex-real-attribution.ts",
+      "bytes": 12814,
+      "sha256": "29784893a36266acb672053903174b5c8be9dfa1ab5d7732329b061e4a7b77e8"
+    },
+    {
+      "path": "apps/api/src/lib/cortex-refit-runner-bindings.ts",
+      "bytes": 20009,
+      "sha256": "c6249dcef99fb86cb32b5cc04bcfe1c62ef2b9fc7261382d8069e7e02e1880ff"
+    },
+    {
+      "path": "apps/api/src/lib/cortex-refit-runner.ts",
+      "bytes": 8517,
+      "sha256": "1960d3d00c1f3ec7dc738aab3bd0feb974c56b6ae964eb3d4a9d7b850fe5a8ad"
+    },
+    {
+      "path": "apps/api/src/lib/cost-attribution.ts",
+      "bytes": 18853,
+      "sha256": "7b216738615a13c3df6062add63ed34c69b49738451ce13a2e1c3833c30b7e6a"
+    },
+    {
+      "path": "apps/api/src/lib/crisis-mode-controller.ts",
+      "bytes": 22942,
+      "sha256": "900145d045d95cdb0915b6018f4f183cc8ce77f850b9a1fb9307b6e82a38f93e"
+    },
+    {
+      "path": "apps/api/src/lib/crisis-mode-cycle.ts",
+      "bytes": 21871,
+      "sha256": "b651af5107930d5843c320c711c6b855b966cd98f1753ea21819b568e17e5a85"
+    },
+    {
+      "path": "apps/api/src/lib/crisis-mode-instance-guard.ts",
+      "bytes": 5922,
+      "sha256": "50d27de354df5e3fb5f68e2304dca66d6252ca2a6904d41fe0fbdaeb2993e023"
+    },
+    {
+      "path": "apps/api/src/lib/cross-sectional-edge.ts",
+      "bytes": 60756,
+      "sha256": "50c87c723f913ab8f20c0c83b49dcc07f2aed456c5746b23a9058c7044475796"
+    },
+    {
+      "path": "apps/api/src/lib/cross-sectional-executor.ts",
+      "bytes": 77349,
+      "sha256": "4e8a17d81fe510c2a715290a9afd403cf485de96637e9a30a052c75899dcd518"
+    },
+    {
+      "path": "apps/api/src/lib/cross-sectional-tp-sweep.ts",
+      "bytes": 7173,
+      "sha256": "2cbcb6ad9ec2e14242839e7f685c043afe7db2b99205282006f94abcaf94d236"
+    },
+    {
+      "path": "apps/api/src/lib/cross-sectional-winners-counterfactual.ts",
+      "bytes": 13011,
+      "sha256": "9c776269a00d56c2408ad753c586482d3058c3256548927e4f0124371fc7697a"
+    },
+    {
+      "path": "apps/api/src/lib/current-guard-variant-matrix.ts",
+      "bytes": 155445,
+      "sha256": "16c77c83cd15d323c46fcd97b1e93aa829eb663ec4dfd84dc33e775b7bd02906"
+    },
+    {
+      "path": "apps/api/src/lib/dashboard-audit-summary.ts",
+      "bytes": 215445,
+      "sha256": "210584d63b6dfa473b5e7eb3d6d6fd8f262a2b3c5858b14c7d23c52f1eb02044"
+    },
+    {
+      "path": "apps/api/src/lib/decision-ledger.ts",
+      "bytes": 6536,
+      "sha256": "ef87d53061c455d8beed8c29cb73423ac9f7180c0d35310b4e59aa55cd1c308d"
+    },
+    {
+      "path": "apps/api/src/lib/decision-scoring.ts",
+      "bytes": 11235,
+      "sha256": "e531bee5d5389a5b35ad8203182e2bfd332666433f27beb758df2e658da19e4b"
+    },
+    {
+      "path": "apps/api/src/lib/derivatives-crowding.ts",
+      "bytes": 9642,
+      "sha256": "ce859e9b3fef28e53b7be4a5d58fd847e946541e7aed3016563c101d514867ea"
+    },
+    {
+      "path": "apps/api/src/lib/direction-brain-resolver.ts",
+      "bytes": 15541,
+      "sha256": "a3c33af0af29298f85fa7983a00f30036573d52baba6a26d3ae2fe26d8d27ed5"
+    },
+    {
+      "path": "apps/api/src/lib/direction-brain.ts",
+      "bytes": 12172,
+      "sha256": "ad9bfa5fe929dc1bc361be140c39f581c9accaccf643f3ec2e81ad016c6d85ca"
+    },
+    {
+      "path": "apps/api/src/lib/direction-entry-outcome-store.ts",
+      "bytes": 50354,
+      "sha256": "eabbfa571d25a14eb63face1102ec7694b5ce6e5d27e04d0c3667a92dbc9e0f5"
+    },
+    {
+      "path": "apps/api/src/lib/direction-entry-reconciler.ts",
+      "bytes": 22441,
+      "sha256": "a2896537e39efbbcdce66250bafff06beff2c6797e55ff0d2c12b4a01f261f29"
+    },
+    {
+      "path": "apps/api/src/lib/directional-symbol-sizing.ts",
+      "bytes": 18885,
+      "sha256": "e04c790a715fb4c3be49f85baa15c2ae772555c1db7253109b2313ad494e54f4"
+    },
+    {
+      "path": "apps/api/src/lib/entry-brain-tier1-realized-resolver.ts",
+      "bytes": 16877,
+      "sha256": "3f9afe83a5fab96aea47544ca32ec6580883117c612f9539768cdb5db5c91848"
+    },
+    {
+      "path": "apps/api/src/lib/entry-brain-tier2-simulated-resolver.ts",
+      "bytes": 15027,
+      "sha256": "a4cc847ad68eea6bed0763cd50f493667d33a2ce2e1ca2ac3cf0dc89c7c06134"
+    },
+    {
+      "path": "apps/api/src/lib/entry-brain.ts",
+      "bytes": 16226,
+      "sha256": "231e23e62f9f5c350eb5258d1710b59d1f7867cf7a2b933ee7a116fc7b6bc56d"
+    },
+    {
+      "path": "apps/api/src/lib/entry-exit-counterfactual.ts",
+      "bytes": 12153,
+      "sha256": "a4559b31f2cd8c335d6910dc9afb461f90115e6a56f09501f38404dbbcc8b450"
+    },
+    {
+      "path": "apps/api/src/lib/entry-precision-audit.ts",
+      "bytes": 43901,
+      "sha256": "55709aeb1227b0171f0e4dea30cfbef9fa5fa1d437fd26652e5645eec9bc579f"
+    },
+    {
+      "path": "apps/api/src/lib/evidence-consensus.ts",
+      "bytes": 11470,
+      "sha256": "206c1e03a74445ceef7e408b2ca2185de9964beac470170981aaa3da725c2753"
+    },
+    {
+      "path": "apps/api/src/lib/exchange-health-readiness.ts",
+      "bytes": 7647,
+      "sha256": "1aa5a43f5bd706ec2d8d7d087565bb7f9aab36672b01df0807aaa5aba9078e58"
+    },
+    {
+      "path": "apps/api/src/lib/execution-lifecycle-log.ts",
+      "bytes": 5137,
+      "sha256": "a5608c6685a85b80bbcb4465b0d4099fb44b5f2e1a820ad822b54c4017c5f963"
+    },
+    {
+      "path": "apps/api/src/lib/executive-decision.ts",
+      "bytes": 7961,
+      "sha256": "0e78616932b304622d3e76515ac433ed31b5e03e99545bcb6f994371385b5cfb"
+    },
+    {
+      "path": "apps/api/src/lib/exit-brain-policy.ts",
+      "bytes": 18963,
+      "sha256": "e81f34f904f57226c8418df4b4af3eedd9a078a943153dc50ddab7b4ceef9e98"
+    },
+    {
+      "path": "apps/api/src/lib/exit-brain-shadow.ts",
+      "bytes": 23009,
+      "sha256": "14159aebfe9b47fc657a7955fdc070dfed60299490e313689e4c9bd0aadc2dfe"
+    },
+    {
+      "path": "apps/api/src/lib/exit-brain.ts",
+      "bytes": 12434,
+      "sha256": "c267116f5c749e296b5ba633544effdbe03507710803af97de990a6b5243a782"
+    },
+    {
+      "path": "apps/api/src/lib/expansion-report.ts",
+      "bytes": 12682,
+      "sha256": "e1896f22c287e37a45b13e33e3aa543097ca60562fefac564dd02e25d0a8ef3c"
+    },
+    {
+      "path": "apps/api/src/lib/expectation-calibration.ts",
+      "bytes": 22479,
+      "sha256": "51a21fd483ed395b794caddd9853b4ae7825c360f34f78d3844e0ce4dc328f88"
+    },
+    {
+      "path": "apps/api/src/lib/external-candidate-discovery-intelligence.ts",
+      "bytes": 33583,
+      "sha256": "f85af7ac9385c0da3d6c8612a0d2561fe2e3c327fc2bd0ee3fa40c4bd61fa180"
+    },
+    {
+      "path": "apps/api/src/lib/external-candidate-metadata-fetcher.ts",
+      "bytes": 17079,
+      "sha256": "2df5d7e5bcb0e3dc7144be6b4dc984589a3341b83d07cc72ad195047f460f8c8"
+    },
+    {
+      "path": "apps/api/src/lib/external-rotation-overlay-auto-refresh.ts",
+      "bytes": 4979,
+      "sha256": "7e227999b6cc896c2dddef1902715243fb92e30949b0c5850d53f1cf95a10a85"
+    },
+    {
+      "path": "apps/api/src/lib/external-rotation-overlay-economics.ts",
+      "bytes": 42019,
+      "sha256": "57d5ee2a24e60f76d43e7882a9f6a34b504497a9f1ec790754ffe5905e020e9f"
+    },
+    {
+      "path": "apps/api/src/lib/external-rotation-overlay-performance.ts",
+      "bytes": 16993,
+      "sha256": "baff4b58290ba207be6645412c61bba152a384b7811419b019c590ec9f0e3cf7"
+    },
+    {
+      "path": "apps/api/src/lib/external-rotation-overlay.ts",
+      "bytes": 39047,
+      "sha256": "d62c69e77e49eb4fae846867e8ae1258f2e5175353f7249ea818d1ec8a3ebce9"
+    },
+    {
+      "path": "apps/api/src/lib/external-strategy-fit-enrichment.ts",
+      "bytes": 27090,
+      "sha256": "60503063784647b9212edbf065cd8aff49c05905b6fd520155ab2b4872aa92ec"
+    },
+    {
+      "path": "apps/api/src/lib/four-brain-best-lane-report.ts",
+      "bytes": 5839,
+      "sha256": "4ed0862adc9f155a1750643d2fec7dbb0da21dd1dd98eb2a954e85604e4f488d"
+    },
+    {
+      "path": "apps/api/src/lib/four-brain-edge-memory.ts",
+      "bytes": 10182,
+      "sha256": "1c140c19daafe5b4d1dcfe5b39401ac1f92dded8070858a48404e18a241bded9"
+    },
+    {
+      "path": "apps/api/src/lib/four-brain-historical-backfill.ts",
+      "bytes": 19176,
+      "sha256": "784ad91ed78f4805286a687db2e65cb86ab23389f083dbc2f57ff8f05182edae"
+    },
+    {
+      "path": "apps/api/src/lib/four-brain-invariants.ts",
+      "bytes": 6670,
+      "sha256": "aa98bf78aeeb9367291f4d35b87c9fd030344c6bbd9b15ef428cdaeebb27ad43"
+    },
+    {
+      "path": "apps/api/src/lib/four-brain-journal.ts",
+      "bytes": 6811,
+      "sha256": "719e82e9c14929496d9398629522ce3fabd21a238b4e9b2914f3e88aeb6b95ce"
+    },
+    {
+      "path": "apps/api/src/lib/four-brain-lane-support.ts",
+      "bytes": 5004,
+      "sha256": "e99e62fbbf206101579160d99ce7641d90d09c2a2a411bec2cf368ec6cbcd0aa"
+    },
+    {
+      "path": "apps/api/src/lib/four-brain-live-gather-bindings.ts",
+      "bytes": 26314,
+      "sha256": "8c3cee2320b570daefd93d4aa5bc342191383f4579565fef9e943ce00ede58db"
+    },
+    {
+      "path": "apps/api/src/lib/four-brain-live-gather.ts",
+      "bytes": 19687,
+      "sha256": "7ae9d179a5e21b7e9e6549ae91d8c00a792ca1c57699327b0502b82cc3af49b2"
+    },
+    {
+      "path": "apps/api/src/lib/four-brain-live-wiring.ts",
+      "bytes": 6957,
+      "sha256": "13ed48fda2220444fa376beb069856b96c1d4b9e41adc723fa5d1c29b38d37b7"
+    },
+    {
+      "path": "apps/api/src/lib/four-brain-metrics.ts",
+      "bytes": 6489,
+      "sha256": "fe6450acd24d5b7e5bbf7742d1bbe3b49265a97ecbe0cada03724a66e555fa95"
+    },
+    {
+      "path": "apps/api/src/lib/four-brain-outcome-ledger.ts",
+      "bytes": 20761,
+      "sha256": "613c6708e807ff140e66db0777b0883e114478bbf1597bdfe2efa3eae71d6783"
+    },
+    {
+      "path": "apps/api/src/lib/four-brain-recent-decisions.ts",
+      "bytes": 3755,
+      "sha256": "5715bba9f6b191ac578d00bc56c3d2f0537ffcd99c0d347129d4b6122ab554d0"
+    },
+    {
+      "path": "apps/api/src/lib/four-brain-replay-harness.ts",
+      "bytes": 5073,
+      "sha256": "6263c2734a62d777f5d9b7baaaa6e7b4d894cf734dee50752bf7938d7aa77ddb"
+    },
+    {
+      "path": "apps/api/src/lib/four-brain-shadow-tick.ts",
+      "bytes": 13299,
+      "sha256": "46d5e655faa7bbe3f9e7b37c17ddb26501a1b37654a279bd635e36691504c5e7"
+    },
+    {
+      "path": "apps/api/src/lib/four-brain-types.ts",
+      "bytes": 9476,
+      "sha256": "9c85dc2901d3fb39035de691ebdc06c48717239bcf6383f86f8e55bef9761a65"
+    },
+    {
+      "path": "apps/api/src/lib/fresh-variant-matrix-feed.ts",
+      "bytes": 14276,
+      "sha256": "f29c94113646efe699c288badcb052ceb71687b558f1d74e195d053f3534fc31"
+    },
+    {
+      "path": "apps/api/src/lib/frozen-current-guard-cost-model.ts",
+      "bytes": 11359,
+      "sha256": "5a388be1705d10a1a9923fe8629ddf3e848c281265253120a8c653fc5948f889"
+    },
+    {
+      "path": "apps/api/src/lib/frozen-current-guard-post-cutover.ts",
+      "bytes": 28650,
+      "sha256": "cab40c5a8be3e60f17d66bf34d752c63ada722b60eb889f07807d1d3cb804415"
+    },
+    {
+      "path": "apps/api/src/lib/frozen-current-guard-promotion-tracker.ts",
+      "bytes": 14226,
+      "sha256": "1f0999b0a445a0a929db34b11c22ecd95b10b6c628d209f493317b0b7bb51239"
+    },
+    {
+      "path": "apps/api/src/lib/frozen-segment-pathology-audit.ts",
+      "bytes": 24819,
+      "sha256": "31377cbf59d9cd19f637a3afe70df03ead0a6902683ae7da1e340c175453e858"
+    },
+    {
+      "path": "apps/api/src/lib/funding-carry-edge.ts",
+      "bytes": 36802,
+      "sha256": "ff0f1bef005c3dfd7b81df13f1a7952033a062c7df390810d329d03948dc4611"
+    },
+    {
+      "path": "apps/api/src/lib/geopolitical-conflict-feed.ts",
+      "bytes": 28980,
+      "sha256": "169904409d675ca92dbcb7fa7052871c1fb6e0c1c2fbc771a2a84d21b001ec3e"
+    },
+    {
+      "path": "apps/api/src/lib/geopolitical-escalation-classifier.ts",
+      "bytes": 21992,
+      "sha256": "5c7c7340ff93f81cf40173b60a70ba0bb8802a3b0c1124f5453c8ecc7c2ffa01"
+    },
+    {
+      "path": "apps/api/src/lib/hard-cut-counterfactual.ts",
+      "bytes": 6581,
+      "sha256": "765b86cc0a9f7a9429af5639ff79af9b3bd9df15d5822d7c885809ec15885616"
+    },
+    {
+      "path": "apps/api/src/lib/intraday-momentum-edge.ts",
+      "bytes": 22520,
+      "sha256": "a0aa329bdbda4b1f8af00548a6a0ecb080dd5f983b858130d904f8514c6424db"
+    },
+    {
+      "path": "apps/api/src/lib/jsonl-rotation.ts",
+      "bytes": 9582,
+      "sha256": "42bbb8f8f16a4346b58d78be3b55f33363552a5b1619999e44634cc58d256f13"
+    },
+    {
+      "path": "apps/api/src/lib/kronos-counterfactual-lane.ts",
+      "bytes": 39954,
+      "sha256": "607e642ca61d90c8065fcffdc3aa15b9e34c4a41ba0386dfad254934a97fcb25"
+    },
+    {
+      "path": "apps/api/src/lib/kronos.ts",
+      "bytes": 43168,
+      "sha256": "fc18af4d4056328594b54e9e810de6cfa2f1ecc00179cece2c88130e0c9ebd50"
+    },
+    {
+      "path": "apps/api/src/lib/lane-context-journal-binding.ts",
+      "bytes": 18255,
+      "sha256": "767c116230c5b59c4f7a22a5e7fa718822e2b70d8f9821a4e5f98bd3b252eabc"
+    },
+    {
+      "path": "apps/api/src/lib/lane-context-journal-fs.ts",
+      "bytes": 6836,
+      "sha256": "144ce0cfede64a8a78b88a56693cb2db725956a9e32cd53b1ffa92d8279ec839"
+    },
+    {
+      "path": "apps/api/src/lib/lane-context-journal-runtime.ts",
+      "bytes": 15712,
+      "sha256": "b75da0876400d762aa949ca663dec0328759cd68f7e96399b023b8a9cff14b7b"
+    },
+    {
+      "path": "apps/api/src/lib/lane-context-journal.ts",
+      "bytes": 8702,
+      "sha256": "de0c0ea5ee0a3048791e54b083089221928855363b9e544d16abfc7ee50b0f8e"
+    },
+    {
+      "path": "apps/api/src/lib/lane-context-snapshot-source.ts",
+      "bytes": 5217,
+      "sha256": "c9bd0faf19b7a751a5561d9f8864d66495b884ba5bbade8a73577e3d1c9a3fa7"
+    },
+    {
+      "path": "apps/api/src/lib/lane-outcome-processor.ts",
+      "bytes": 10665,
+      "sha256": "1112fe8a9a46f8655e4052311d867ca57646281acd46acf871b5337990064647"
+    },
+    {
+      "path": "apps/api/src/lib/lane-selector-v2.ts",
+      "bytes": 22405,
+      "sha256": "2eed17bf05ad45ff1263985317d143f688f3107c1916982c46733b6db5599849"
+    },
+    {
+      "path": "apps/api/src/lib/lane-symbol-curation-cache.ts",
+      "bytes": 5842,
+      "sha256": "7516c9c32f1ad645d38468dd23f2f665445cd254f33a0dfe858728ae45cd6ef0"
+    },
+    {
+      "path": "apps/api/src/lib/lane-toxic-symbol-evaluator.ts",
+      "bytes": 11338,
+      "sha256": "1d8924f0fb389cf334007cb266acd3c5acc7ea45c5c8160f7356341397137135"
+    },
+    {
+      "path": "apps/api/src/lib/latest-scan-candidates-cache.ts",
+      "bytes": 1486,
+      "sha256": "c61c438277a9a75d0e90e08a7c84c90bc36f49e83fef326b24fdfe176441c848"
+    },
+    {
+      "path": "apps/api/src/lib/liq-recoil-edge.ts",
+      "bytes": 47489,
+      "sha256": "62125217e1a73baa59690d861f310cbc35bc30c660226c3b608ac38608335f42"
+    },
+    {
+      "path": "apps/api/src/lib/liquidation-recoil-cross-sectional.ts",
+      "bytes": 37617,
+      "sha256": "4098f683bfea239b2ab8b3689660df306479c2175fcac82968d7d86281f627fb"
+    },
+    {
+      "path": "apps/api/src/lib/live-execution-engine.ts",
+      "bytes": 319113,
+      "sha256": "5cd8c09662255621093138ebe0e25e95266f79f342f8751de0b82f8ab4d3deb3"
+    },
+    {
+      "path": "apps/api/src/lib/live-executor-wiring.ts",
+      "bytes": 17555,
+      "sha256": "7778dd06eeee5f98fffb6db2873f685719fd4dbed06a66b44a3f73378194e368"
+    },
+    {
+      "path": "apps/api/src/lib/live-mark-price-cache.ts",
+      "bytes": 11215,
+      "sha256": "f40c84bf812f69c5a53b4f1c70db7480a6b8cf3540b48fdab304c50fbc9299fb"
+    },
+    {
+      "path": "apps/api/src/lib/live-readiness.ts",
+      "bytes": 16936,
+      "sha256": "1f42cc06c4cf4ea390c831cfe18084f587ab2d7d8c481f94c5f5e24559e16cb9"
+    },
+    {
+      "path": "apps/api/src/lib/live-trading-gate.ts",
+      "bytes": 20210,
+      "sha256": "eccc98f3ff22e1dea428ab23c79918dc1f68c371184fb56b4ce3f54e3b7d369a"
+    },
+    {
+      "path": "apps/api/src/lib/market-state-brain.ts",
+      "bytes": 10965,
+      "sha256": "b067deeabea110422607078ebb7f232062d60c60e3f28800f29d194510466923"
+    },
+    {
+      "path": "apps/api/src/lib/meta-label-gate.ts",
+      "bytes": 45477,
+      "sha256": "863af90690c50cbe56d23bdca1f077f4f1d605dadd19331445ea1956dec0143b"
+    },
+    {
+      "path": "apps/api/src/lib/micro-pilot-kill-switch-readiness.ts",
+      "bytes": 8230,
+      "sha256": "e6710cc657facf0228b14fa78c37cb9e9ffc3fd912bc4d38733fce8e4a77bf66"
+    },
+    {
+      "path": "apps/api/src/lib/mixed-regime-router.ts",
+      "bytes": 105303,
+      "sha256": "7021e1b9b300f85a1e759208f7b546b1f04c3b4c34970fc7d40037db75d2d887"
+    },
+    {
+      "path": "apps/api/src/lib/moonshot-lottery-cycle.ts",
+      "bytes": 19532,
+      "sha256": "0784643e5aaff56388a1f6dc3fae724a09d60e78818aa8a3299e72adb57a5871"
+    },
+    {
+      "path": "apps/api/src/lib/moonshot-lottery-lane.ts",
+      "bytes": 16265,
+      "sha256": "6df81fd90cd9959fe73c39178fa8f871cbde13c49aca3c25c1e010e3f915c7ae"
+    },
+    {
+      "path": "apps/api/src/lib/narrative-tags.ts",
+      "bytes": 9146,
+      "sha256": "905646a77d1c2dad99fc794809b5a6bd39223acf9cf58aa29807db4c48d37e4f"
+    },
+    {
+      "path": "apps/api/src/lib/neural-map-telemetry.ts",
+      "bytes": 74283,
+      "sha256": "e9a7a7849a4162dd5681ec93229b3269edd831efa43c054019bcb2b0213ce8c8"
+    },
+    {
+      "path": "apps/api/src/lib/new-coin-radar.ts",
+      "bytes": 15594,
+      "sha256": "eb23c6cecb1b911b7c48b296df8d92d4bac54ea286e96ae6096e963dcc8f8982"
+    },
+    {
+      "path": "apps/api/src/lib/notification-service.ts",
+      "bytes": 21964,
+      "sha256": "a089f3585c4989ad57c53fc881dd670f0748c501969a24439e8e6161013d6145"
+    },
+    {
+      "path": "apps/api/src/lib/nvidia-chat-client.ts",
+      "bytes": 7614,
+      "sha256": "26948f291b3db861154a406a47c35d407efff4e32339ba66b3db82bd7b81ded9"
+    },
+    {
+      "path": "apps/api/src/lib/oos-validation-snapshot-logger.ts",
+      "bytes": 16980,
+      "sha256": "78ead39c99839ad976b718c985323ccadfad4fb1a0c82fbb5ad7e0effd0afbfe"
+    },
+    {
+      "path": "apps/api/src/lib/operator-brief.ts",
+      "bytes": 21729,
+      "sha256": "686bc5e74f5e228fab8982f274166dcce56237176537dc28b96a2122ecffae1d"
+    },
+    {
+      "path": "apps/api/src/lib/order-flow-microstructure.ts",
+      "bytes": 8031,
+      "sha256": "ce5e00d626263f4e3383ee9eb7389beb67c1cef36d63c343473e2eac90f2a056"
+    },
+    {
+      "path": "apps/api/src/lib/order-reconciliation-readiness.ts",
+      "bytes": 7493,
+      "sha256": "702f7c4dd38b6bec091c5ffa5519a7d78affce99d2630d46f441bd4581f3d4fe"
+    },
+    {
+      "path": "apps/api/src/lib/outcome-checker.ts",
+      "bytes": 73381,
+      "sha256": "dccfb1e9327e10f07a63f69e4414550fdc9b215f7f1559720aefef7a6a643f46"
+    },
+    {
+      "path": "apps/api/src/lib/panic-washout-reclaim-edge.ts",
+      "bytes": 28427,
+      "sha256": "5a18a66dbfd5baff84d2a1086630b152fbed6cb2a51d6d313d56d0ecf6dbec11"
+    },
+    {
+      "path": "apps/api/src/lib/paper-execution-router.ts",
+      "bytes": 271154,
+      "sha256": "103533544e41ef016e476e82c9950cd732d9b0cb529008032eb30506be4d409c"
+    },
+    {
+      "path": "apps/api/src/lib/paper-opportunity-allocator.ts",
+      "bytes": 116388,
+      "sha256": "bf3e2662314d7ba331a1bd3cfebc905378782ce9ac9fed9a1ddd2e8123ebfd6d"
+    },
+    {
+      "path": "apps/api/src/lib/paper-trading-controls.ts",
+      "bytes": 4154,
+      "sha256": "a639d63317d737c238e951790867fb5062bc119943ce258ccbfa83a712c67cd0"
+    },
+    {
+      "path": "apps/api/src/lib/parallel-shadow-experiments.ts",
+      "bytes": 42885,
+      "sha256": "22bb903d52212b13da9825e45d26086de227ecd901746e59f6de6c71f32a707e"
+    },
+    {
+      "path": "apps/api/src/lib/per-symbol-lane-book-edge.ts",
+      "bytes": 14931,
+      "sha256": "e725fce3eef96152cfb2d8089a96177b226c28fa25e7056ab86ed0c37f6d514f"
+    },
+    {
+      "path": "apps/api/src/lib/per-symbol-rotation.ts",
+      "bytes": 4426,
+      "sha256": "9caebc563d8c665920d1a30d7e14643329c491aeb0ea181eb047a84aa3424507"
+    },
+    {
+      "path": "apps/api/src/lib/performance-cache.ts",
+      "bytes": 3873,
+      "sha256": "507931e6fdc8970ad5986918416953b96fdc83c581770339a0391f317ac843a4"
+    },
+    {
+      "path": "apps/api/src/lib/portfolio-heat-shadow.ts",
+      "bytes": 8569,
+      "sha256": "1ac3d4e7fa82e704db4ef956aa3cd1cfc03d6d9a8ce29b325447227578a57b6a"
+    },
+    {
+      "path": "apps/api/src/lib/portfolio-trend-shadow.ts",
+      "bytes": 19980,
+      "sha256": "cdc5083cd3bfc411091663c8e7d3c1b063f1713745a8e758d1ce06f5a10f18a6"
+    },
+    {
+      "path": "apps/api/src/lib/position-path-recorder.ts",
+      "bytes": 17459,
+      "sha256": "345ce5b2eb89c8dcc74ec2284d4454eff07ee3d074025958f5fc315d88868424"
+    },
+    {
+      "path": "apps/api/src/lib/price-impact-efficiency.ts",
+      "bytes": 23021,
+      "sha256": "1a156a1e610913c9016f0541cb71f0dc1986b91ccc15a1b92b3e97f7fcf80e2a"
+    },
+    {
+      "path": "apps/api/src/lib/profit-anatomy.ts",
+      "bytes": 24983,
+      "sha256": "72fc47f8b95e3a634305a76cca529d5fdb773623d204192ca8ddeac183422685"
+    },
+    {
+      "path": "apps/api/src/lib/realtime-short-mirror.ts",
+      "bytes": 26153,
+      "sha256": "d0936acd5c6b501780d4d69cffe4cce6837b028b7856664d0d4cc59207aedecb"
+    },
+    {
+      "path": "apps/api/src/lib/refined-policy-promotion.ts",
+      "bytes": 7312,
+      "sha256": "1f20c9c33bc1b730ed692e8cbdf9bb7f85c9e5a9807eac04a5043f107614eb3a"
+    },
+    {
+      "path": "apps/api/src/lib/reflection-agent.ts",
+      "bytes": 2002,
+      "sha256": "262ab0ae751b24055234b5e15f667fc399496c51a6c38f8cdc643352ede5de90"
+    },
+    {
+      "path": "apps/api/src/lib/regime-autopilot.ts",
+      "bytes": 14394,
+      "sha256": "14bf1d3670b4328c40a75542ea914fd50d4c8453b9b9543735be35da35fd6d69"
+    },
+    {
+      "path": "apps/api/src/lib/regime-axis-timeline.ts",
+      "bytes": 30595,
+      "sha256": "85ba31b13dbe140a23e0703be745528dcdbf31e528654720f0a716a17ea0973c"
+    },
+    {
+      "path": "apps/api/src/lib/regime-composite-edge.ts",
+      "bytes": 27733,
+      "sha256": "6c6e0ce2c62d0b1f45fa564e3bb22b7fabe9ccc049e1698a57cce223ad28dc96"
+    },
+    {
+      "path": "apps/api/src/lib/regime-composite-short-edge.ts",
+      "bytes": 27619,
+      "sha256": "f51dbc2adf89041194d49912f8fe286282d499625e32e3e5861b2e75776aa7e5"
+    },
+    {
+      "path": "apps/api/src/lib/regime-controller-aligned-shadow.ts",
+      "bytes": 61923,
+      "sha256": "6b95a53c7f194b35370f84c4b315a4798bd272828f05d48d6de69c1061ee903c"
+    },
+    {
+      "path": "apps/api/src/lib/regime-controller-filtered-edge-shadow.ts",
+      "bytes": 84771,
+      "sha256": "4cfd0e3680248a5bc3dfd6dd7e836c979c6a03afa658877b450918fc876b611a"
+    },
+    {
+      "path": "apps/api/src/lib/regime-direction-controller-retrospective-audit.ts",
+      "bytes": 10216,
+      "sha256": "aa0b0afab7e2ff720daca02a6e8e8883a678d581299590fd3e2d7bc89e3d78ef"
+    },
+    {
+      "path": "apps/api/src/lib/regime-direction-controller-snapshot.ts",
+      "bytes": 8590,
+      "sha256": "c6c92830f521fc98bf72a8fc5bcbc0c44f8862d96c66814a6382b24d84b38376"
+    },
+    {
+      "path": "apps/api/src/lib/regime-direction-controller.ts",
+      "bytes": 23053,
+      "sha256": "e89a3c336f5cc34c68a056dc5946a25c837b8bf732c725948a12099ecee1f465"
+    },
+    {
+      "path": "apps/api/src/lib/regime-drift.ts",
+      "bytes": 12745,
+      "sha256": "6581ebecb54f68d5e45b1ef76a20ca2dea005394e98242e8b7b2221e30eb747e"
+    },
+    {
+      "path": "apps/api/src/lib/regime-edge-memory.ts",
+      "bytes": 12822,
+      "sha256": "684373f3a1a3a312dbb28cf041bd3804e7ee7803d4c6944827e8a07c96fd90f7"
+    },
+    {
+      "path": "apps/api/src/lib/regime-engine-service.ts",
+      "bytes": 11237,
+      "sha256": "60a0f01737a6194b7e7b506fd809dccdcc688dbd4c57799c7ec7d3202f0cd3a1"
+    },
+    {
+      "path": "apps/api/src/lib/regime-flip-rescue.ts",
+      "bytes": 11720,
+      "sha256": "b193f60344e05a8b475249aca20985623862624e9c01fb548a73421517fb302e"
+    },
+    {
+      "path": "apps/api/src/lib/regime-gated-lane-performance.ts",
+      "bytes": 9559,
+      "sha256": "401e80996991847b187963ed578d1efd3b10d1819cc46a7627584892b99d07d3"
+    },
+    {
+      "path": "apps/api/src/lib/regime-policy-counterfactual.ts",
+      "bytes": 16364,
+      "sha256": "aeac7b9c6758b3989fe3b017ee28b72c79eeaead3ec715696e2f53dc94802c6d"
+    },
+    {
+      "path": "apps/api/src/lib/regime-rotation-shortlist.ts",
+      "bytes": 10885,
+      "sha256": "cb3511c6883d68d0fafece76d5c3dcb3337f6549db0d5218615e937e35f3997b"
+    },
+    {
+      "path": "apps/api/src/lib/replay-clock.ts",
+      "bytes": 4211,
+      "sha256": "b9e2d8d31e2cdb45a01c984c19e144ddc640dc62275dbd52311ae2dfb4ee7b15"
+    },
+    {
+      "path": "apps/api/src/lib/replay-data-tiers.ts",
+      "bytes": 4061,
+      "sha256": "8c6c17f2b9017aeb19ffa07077ce10f34ed793f3d9d10de30ecf6090614c79e1"
+    },
+    {
+      "path": "apps/api/src/lib/replay-execution-calibration.ts",
+      "bytes": 18019,
+      "sha256": "276c6822ad97d40817a52f0f4e3a70066cc8da9e530eed513b4d98fcd56dcb2d"
+    },
+    {
+      "path": "apps/api/src/lib/replay-execution-emulator.ts",
+      "bytes": 5435,
+      "sha256": "6a327618762007023b8bc1967eea825f0fdad6581cf3d8b968ad4a6e5b6fe4f8"
+    },
+    {
+      "path": "apps/api/src/lib/replay-market-data-provider.ts",
+      "bytes": 6194,
+      "sha256": "6ee427b72cd27569da44bb58edc61d02d133e8cc6abf6611c28f0582e4fcb863"
+    },
+    {
+      "path": "apps/api/src/lib/replay-provenance.ts",
+      "bytes": 5977,
+      "sha256": "1395eb355950e907379f89c8a118f46ccccc7fa9a1855e13f182654e626a84e4"
+    },
+    {
+      "path": "apps/api/src/lib/replay-quality-status.ts",
+      "bytes": 4588,
+      "sha256": "55efc16673597b0bf241b5ac0d7e02aadcd904a668d76131c7b57748648e594d"
+    },
+    {
+      "path": "apps/api/src/lib/replay-tier-a-core.ts",
+      "bytes": 12350,
+      "sha256": "ac316d3bbc92098a6dc084aa7b55753a8e90aaf20e3a86ad29d4ad3a815daf23"
+    },
+    {
+      "path": "apps/api/src/lib/replay-tier-a-metrics.ts",
+      "bytes": 5271,
+      "sha256": "f65f4fdaf032881f3e08bd7b45f4503bd3aaf0b60ef2bc1bc94ba49992e04bb9"
+    },
+    {
+      "path": "apps/api/src/lib/residual-momentum-edge.ts",
+      "bytes": 42412,
+      "sha256": "6b3264e5d02350dd4cb56a2a943439fb5ad97e1ca5d8dbdd2fbce94a53749f86"
+    },
+    {
+      "path": "apps/api/src/lib/rotation-shortlist-book-overlay.ts",
+      "bytes": 4728,
+      "sha256": "5e1e90d2cf12751669c893d97c91fe349ece1609d111230c39cb07bc6d661233"
+    },
+    {
+      "path": "apps/api/src/lib/route-maturity.ts",
+      "bytes": 13699,
+      "sha256": "8db583352c76d890374c4f6757726626f810a05906403d8c826998051651bf44"
+    },
+    {
+      "path": "apps/api/src/lib/routing-monitor.ts",
+      "bytes": 11624,
+      "sha256": "ebcb427ccf1d5c0da5b2a8f94b1eccea149cd8ee1bc5f832c9c42c732ed21487"
+    },
+    {
+      "path": "apps/api/src/lib/scan-service.ts",
+      "bytes": 27311,
+      "sha256": "3470eca201074f9c5b5c92c5b97e798e7e2484c2078cfa7ff1887347656d245c"
+    },
+    {
+      "path": "apps/api/src/lib/scan-timing-diagnostics.ts",
+      "bytes": 33736,
+      "sha256": "428026e6e2e02876db537ca6be9eacf865a38fc9bdfc8b28a4369545fe55c20f"
+    },
+    {
+      "path": "apps/api/src/lib/shadow-engine.ts",
+      "bytes": 65508,
+      "sha256": "09503f3cad00ede569060b9d39542d702a669a0888ff43edd9f83647a0d7db70"
+    },
+    {
+      "path": "apps/api/src/lib/shadow-lane-scoreboard.ts",
+      "bytes": 14765,
+      "sha256": "1a7bc3a4e782764f770537de4788292ab104050a17378c35c69a2c2d852dd8ee"
+    },
+    {
+      "path": "apps/api/src/lib/short-fade-edge.ts",
+      "bytes": 23722,
+      "sha256": "ae725ca319933afccdb0a3d695d842f8ada7aa5d04b748adb7f3561459e4a835"
+    },
+    {
+      "path": "apps/api/src/lib/signal-multiplicity-guardrail.ts",
+      "bytes": 6651,
+      "sha256": "de4884d60615cdc2a52e92b33b32f274f7840c459b6a87012d43270f61491889"
+    },
+    {
+      "path": "apps/api/src/lib/single-flight-runner.ts",
+      "bytes": 1214,
+      "sha256": "8611a05ce2856591a9fe85d7080e1cad03f7401a2f05af81e0b31c0e1f30a943"
+    },
+    {
+      "path": "apps/api/src/lib/single-symbol-lane-executor.ts",
+      "bytes": 81940,
+      "sha256": "56d77886db14cfba82e751273c822c514cb85435cc9623cb65d4915f45202e70"
+    },
+    {
+      "path": "apps/api/src/lib/single-symbol-price-timeline.ts",
+      "bytes": 13815,
+      "sha256": "9bb12285bedc71867c5892c2ea1a778f8ef24eb6b705f0c94486fa2f631744aa"
+    },
+    {
+      "path": "apps/api/src/lib/social.ts",
+      "bytes": 16468,
+      "sha256": "391f55d4a00be5c01bdb77eabdae8d8a5e6d491449f650ce7ec2bff4f27c231c"
+    },
+    {
+      "path": "apps/api/src/lib/stop-geometry-audit.ts",
+      "bytes": 51647,
+      "sha256": "568b09b6878174a864c123688bc1f41b7d13533d246d16135f420f1e3b6143db"
+    },
+    {
+      "path": "apps/api/src/lib/strategy-research-roadmap.ts",
+      "bytes": 10213,
+      "sha256": "eb0d448ad248ad609a730f1920749c074f7da80834fe676c7d9bf36f99a7373a"
+    },
+    {
+      "path": "apps/api/src/lib/symbol-route-audit.ts",
+      "bytes": 35620,
+      "sha256": "2fda0850610bfbc136785a58b86fdb956b9a613528e6f2e2cf0c38d253281779"
+    },
+    {
+      "path": "apps/api/src/lib/symbol-route-suitability.ts",
+      "bytes": 28433,
+      "sha256": "c6b2a53503b2999f4049b1ef4b620d2faa7a1801f2f5397848e9168f02c8b292"
+    },
+    {
+      "path": "apps/api/src/lib/technical-stop-tp-credibility.ts",
+      "bytes": 42002,
+      "sha256": "1abdc5cfc07dc89ee3c57b5b39913d398eff8da9368d69cd3814caf14036b69b"
+    },
+    {
+      "path": "apps/api/src/lib/top-contributor-fingerprint-v0.ts",
+      "bytes": 28906,
+      "sha256": "9a3c42c3be4d798c5475d151fcb388f716c90126d8c5a3606145ed5b1c121870"
+    },
+    {
+      "path": "apps/api/src/lib/tp-sl-geometry-root-cause-audit.ts",
+      "bytes": 28391,
+      "sha256": "f7a9978f83621f0bceb8153ac4c4517a8b964fc4df09a6300a6b7b846fa59604"
+    },
+    {
+      "path": "apps/api/src/lib/tracker.ts",
+      "bytes": 23334,
+      "sha256": "ace40dfd354682944f90820b8959ba45f0e5822c7bb84fdd52631d46f82cad3b"
+    },
+    {
+      "path": "apps/api/src/lib/trading-assistant-context.ts",
+      "bytes": 8862,
+      "sha256": "bef7bc3953cd4ce4a235f9ae8ee0734780f27fe22f9ad4e3b4c5e9d58db5c7e1"
+    },
+    {
+      "path": "apps/api/src/lib/trading-assistant-diagnostic-tools.ts",
+      "bytes": 16954,
+      "sha256": "35140148ee17d61028e388c82134f576c68f4f96a0a1b3f559e4fb8ce1ea33ac"
+    },
+    {
+      "path": "apps/api/src/lib/unified-testnet-orchestrator.ts",
+      "bytes": 15843,
+      "sha256": "c36cf54847e364bb1f8af090d5721e7e6e940aa40eed876a8e73a3bab555d398"
+    },
+    {
+      "path": "apps/api/src/lib/unified-testnet-proposal-source.ts",
+      "bytes": 10320,
+      "sha256": "f11bd464c477a8e1de8815a24183c0e439b012898e3e960a3d7090a332eea92e"
+    },
+    {
+      "path": "apps/api/src/lib/universe-rotation-intelligence.ts",
+      "bytes": 37032,
+      "sha256": "d23a5c278d4e167ecd23dba9ef41ff15c23f75a98d9387bc130187209fd51a8a"
+    },
+    {
+      "path": "apps/api/src/lib/walk-forward-validation.ts",
+      "bytes": 14510,
+      "sha256": "f423df2a7a5521da9fca5bfee7ba673736db4c9da7f81d68689d6d20d64197f4"
+    },
+    {
+      "path": "apps/api/src/lib/wallet-reconciliation.ts",
+      "bytes": 17110,
+      "sha256": "54a966e65610b632b441cdddcbd19ac4df5b1d04ba2ed0b80d6a01b69eefa1fa"
+    },
+    {
+      "path": "apps/api/src/lib/whale.ts",
+      "bytes": 3089,
+      "sha256": "265cbca9f055e4e340cc02a34c76e5a2cac06457eb032325f4fb9b4dc789a1c6"
+    },
+    {
+      "path": "apps/api/src/lib/winner-loser-audit.ts",
+      "bytes": 49008,
+      "sha256": "263a66040e8ff094c7ac2b9b0f95e570d51cc0b786242aaba3c40729a3255bfc"
+    },
+    {
+      "path": "apps/api/src/load-env.ts",
+      "bytes": 1164,
+      "sha256": "4761c5c1f53ef78590056f86a632ef0cf4f46b224332b7c6eea4aabdfba6eb88"
+    },
+    {
+      "path": "apps/api/src/routes/kronos.ts",
+      "bytes": 3071,
+      "sha256": "cad0153653d2493f737214ec41162ac136ae04dfd32ff52d7a1d76602e6d4c58"
+    },
+    {
+      "path": "apps/api/src/routes/live.ts",
+      "bytes": 75154,
+      "sha256": "e365a5b56539a43227b1158a4200c2122add70d5a3b969cfcf3d3c852fa1d079"
+    },
+    {
+      "path": "apps/api/src/routes/notifications.ts",
+      "bytes": 995,
+      "sha256": "28efe7fac7f169011ab3492fbfb31c24b3d2240e36f63c92e39771a1bd270952"
+    },
+    {
+      "path": "apps/api/src/routes/outcomes.ts",
+      "bytes": 1752,
+      "sha256": "08f5fd8bf6a767e65d2e453a6111cb2b96210c3bb77f7aaec5da3e9652b80cbe"
+    },
+    {
+      "path": "apps/api/src/routes/scan.ts",
+      "bytes": 69217,
+      "sha256": "7c3ce02c7256d26e0bf7dadde6df14bf9d21e2c6f393bc6f3879b7f405e9b9e7"
+    },
+    {
+      "path": "apps/api/src/routes/shadow.ts",
+      "bytes": 205869,
+      "sha256": "7f0077ef85bbafa1092d67911c1ee3d2ac7b3008f8016ef010934dd80d813a75"
+    },
+    {
+      "path": "apps/api/src/routes/trading-assistant.ts",
+      "bytes": 10907,
+      "sha256": "bc604c21950adbdb68ac482e61b683a40380de181d0115604a8a8dcbba8d22f3"
+    },
+    {
+      "path": "apps/api/src/server.ts",
+      "bytes": 8482,
+      "sha256": "d07088f63b232ef1576b5af3a83886bac526491bcc8c524f2c3b29df4a6c2e62"
+    },
+    {
+      "path": "apps/api/src/simulation/block-compatibility.ts",
+      "bytes": 6332,
+      "sha256": "6dd7ebb3e470e1accc7bd60fdb273f0607c875d6cb35ed2196dff758b625c842"
+    },
+    {
+      "path": "apps/api/src/simulation/block-transition-state.ts",
+      "bytes": 8861,
+      "sha256": "298cfe865d703a1dd679ddc857ef659c7b0fb0b796d74f43bc18ed5a6ac8f3ba"
+    },
+    {
+      "path": "apps/api/src/simulation/calibrated-value.ts",
+      "bytes": 2502,
+      "sha256": "1f1f59e4ef1322f7996213a3f2f1bce5e1440071f3ad9e87be7edad46a32e852"
+    },
+    {
+      "path": "apps/api/src/simulation/calibration-dataset.ts",
+      "bytes": 2533,
+      "sha256": "7ee11b2f11cac59b0ae4ffdb6bab253ed0012b366bcadeb5fde335ffd0e94956"
+    },
+    {
+      "path": "apps/api/src/simulation/calibration-metrics.ts",
+      "bytes": 4505,
+      "sha256": "e2ebe2404fe21d9109ca26c6b4357ff00bfb768d9ef0f548e11b409ca0caaefc"
+    },
+    {
+      "path": "apps/api/src/simulation/common-market-frame.ts",
+      "bytes": 5881,
+      "sha256": "c913a3db69ef9f763a61bf858ce057d2ca5b693a8a9da6ff990d80266fce22c2"
+    },
+    {
+      "path": "apps/api/src/simulation/compatibility-block-selection.ts",
+      "bytes": 16459,
+      "sha256": "96056d15bf66543bd87ad31db60aa4d97c385f198bab9c63ccb3e5e484b75ad0"
+    },
+    {
+      "path": "apps/api/src/simulation/deterministic-rng.ts",
+      "bytes": 6241,
+      "sha256": "71b96d19f2faa6b8e9d36fd85029cd1f83507d80d2fdcb5e227db85ccf411139"
+    },
+    {
+      "path": "apps/api/src/simulation/hidden-market-state.ts",
+      "bytes": 2031,
+      "sha256": "bf6fd8c1cd7b3a04fe4bcccbe28b636040cb84f146bee42d31ce5770c205e217"
+    },
+    {
+      "path": "apps/api/src/simulation/historical-block-bootstrap.ts",
+      "bytes": 11853,
+      "sha256": "8d5ba1a76b0b670a5f5892a9764793c81a324a357fdbdab6077f67be78070e8f"
+    },
+    {
+      "path": "apps/api/src/simulation/historical-continuation-library.ts",
+      "bytes": 6120,
+      "sha256": "869536be96d40eb2b3fe3cd303cc9dac3d13c0d99673a3d95266746f80098bec"
+    },
+    {
+      "path": "apps/api/src/simulation/historical-event-template.ts",
+      "bytes": 4003,
+      "sha256": "0cef2fb0517980758ac1d63ae7e86d795058ea1d008b4d43431f63bbf5b067d1"
+    },
+    {
+      "path": "apps/api/src/simulation/historical-market-source.ts",
+      "bytes": 6417,
+      "sha256": "a6f7021202eea7e3ff45cc38a654bce7768179682619b8605918f92d859962a9"
+    },
+    {
+      "path": "apps/api/src/simulation/natural-boundary-detector.ts",
+      "bytes": 5186,
+      "sha256": "81324027709ab57fbfa6c5f97b27f390184b0ad767b0411c958c41d465386ad3"
+    },
+    {
+      "path": "apps/api/src/simulation/observed-market-view.ts",
+      "bytes": 1864,
+      "sha256": "ade010790f08c7da967bb0b605a88800242291015dfb4c238e221c18241ec267"
+    },
+    {
+      "path": "apps/api/src/simulation/observed-successor-b2.ts",
+      "bytes": 8715,
+      "sha256": "e1b5cf3a96427314dc18bb5efa5fcafb7e4ab2fe079fda84956363ea491ffdfd"
+    },
+    {
+      "path": "apps/api/src/simulation/observed-successor-b3.ts",
+      "bytes": 16906,
+      "sha256": "4b295a351d62fae0b0ba8e0373b8a3b4c07c8d3b86168ac6514d95ab7107b7bb"
+    },
+    {
+      "path": "apps/api/src/simulation/observed-transition-selection.ts",
+      "bytes": 14086,
+      "sha256": "d432a1b4345b62f512ad59449ae8022dd7943410896d495e0eaabd06970949ab"
+    },
+    {
+      "path": "apps/api/src/simulation/real-vs-sim-classifier.ts",
+      "bytes": 8914,
+      "sha256": "8fdff955dccffc8256fd2bd384ec81d85ee3f457c3bf9d63f2fb87f9f4d1d273"
+    },
+    {
+      "path": "apps/api/src/simulation/realism-assessment.ts",
+      "bytes": 4933,
+      "sha256": "f59c4798bdbeac3dbc970a9871e8bbfb1e7a7a8e62ff80211bcdc488bc5f567e"
+    },
+    {
+      "path": "apps/api/src/simulation/realism-gate.ts",
+      "bytes": 3775,
+      "sha256": "6c62e8bb15f4b8a120632e659c2e9499f8a9472e8af4c9c7612e5526ac056cb3"
+    },
+    {
+      "path": "apps/api/src/simulation/regime-conditioned-bootstrap.ts",
+      "bytes": 4862,
+      "sha256": "e1cccc0d4e2247cf98a9a79449ec3e6ddc1992365f4c2eb96afd800d7835013f"
+    },
+    {
+      "path": "apps/api/src/simulation/regime-conditioned-multivariate-residual.ts",
+      "bytes": 23989,
+      "sha256": "14fd1ef76e09889d92d1360bcbe2e69ae869d91b67a060c068a1488e3ec107bc"
+    },
+    {
+      "path": "apps/api/src/simulation/seam-realism-classifier.ts",
+      "bytes": 4511,
+      "sha256": "38e913a5bed73fcdae7393065d87a338d9382cb9efdd9a4abacf2528d98ecb6d"
+    },
+    {
+      "path": "apps/api/src/simulation/seam-realism.ts",
+      "bytes": 6559,
+      "sha256": "91c5a4034c893ec74e1303534fbd1f7248dd56c70447ef39144411709cc1c465"
+    },
+    {
+      "path": "apps/api/src/simulation/simulation-clock.ts",
+      "bytes": 1994,
+      "sha256": "d86f168b9377ae984ac8bd21766d9dac859c8c481ecb5e122edc66e7ee72f553"
+    },
+    {
+      "path": "apps/api/src/simulation/simulation-invariants.ts",
+      "bytes": 2174,
+      "sha256": "f3712e08bf2c6ba6d00cdb2c15794430bcc03d0bd47753ece17a3bbf953f181c"
+    },
+    {
+      "path": "apps/api/src/simulation/simulation-provenance.ts",
+      "bytes": 5277,
+      "sha256": "f9aeb2487e149ade732bb3eed55e2aa840b0bc33e665fc4d98190bc658315179"
+    },
+    {
+      "path": "apps/api/src/simulation/simulation-report.ts",
+      "bytes": 2212,
+      "sha256": "538734fa3312bde7f9e49c18b002702b457bd6abdee6466f2269d1548c10cb1a"
+    },
+    {
+      "path": "apps/api/src/simulation/simulation-run-identity.ts",
+      "bytes": 3196,
+      "sha256": "8f823e53e743e545d3d07e29057ae67c455b12c8463c728f48d4440447a1b4bf"
+    },
+    {
+      "path": "apps/api/src/simulation/simulation-safety-boundary.ts",
+      "bytes": 2763,
+      "sha256": "9b6920425a641e0c7acc2dad671745e214d8e95a5921db944c3c4d86268b0b7f"
+    },
+    {
+      "path": "apps/api/src/simulation/simulation-types.ts",
+      "bytes": 4522,
+      "sha256": "9caad367153021898a98b78d6c51f66f1d5283b3e9c5a4f747f3948f58081aa1"
+    },
+    {
+      "path": "apps/api/src/trading/backtest/backtestRunner.ts",
+      "bytes": 28367,
+      "sha256": "b15906543ac2b358f18a54c5e34213d08c3ba0ebcade70ceb9f9757a8398be5b"
+    },
+    {
+      "path": "apps/api/src/trading/config/strategyModes.ts",
+      "bytes": 4720,
+      "sha256": "12c13c170692bd329a5de87896f7b1da05298ca62381bacbc843ce5eee205b9f"
+    },
+    {
+      "path": "apps/api/src/trading/constants.ts",
+      "bytes": 2105,
+      "sha256": "e48f37c4653b7580123943f64ee16d6bccec3a490e5e18474c66131770788d7d"
+    },
+    {
+      "path": "apps/api/src/trading/contextIntegrity.ts",
+      "bytes": 5259,
+      "sha256": "8639f338c4264ab1426af96a9b28a347cf77e16c57e7141848a0a45abee3f4c3"
+    },
+    {
+      "path": "apps/api/src/trading/decision/buildTradingDecision.ts",
+      "bytes": 7700,
+      "sha256": "7b0848d91e3b8f8d5beb00b6a98013986e6df1e96cd84d0a169b5d55eba74095"
+    },
+    {
+      "path": "apps/api/src/trading/decision/noTradeGuard.ts",
+      "bytes": 2843,
+      "sha256": "a2eebefd473f0d9a6b4b04626f5064081957cba25a7715ef3767b092cb8a9c90"
+    },
+    {
+      "path": "apps/api/src/trading/execution/executionGuard.ts",
+      "bytes": 2531,
+      "sha256": "4490f55c4a08227cd0909b5d54fa31184ea33e2704ae9ff781a0a0189f358742"
+    },
+    {
+      "path": "apps/api/src/trading/features/breadthFromCandles.ts",
+      "bytes": 6274,
+      "sha256": "8242e31c1b87140ee85f74c2d7be9b56718e97016539d6b13f91cc2e4e42aec8"
+    },
+    {
+      "path": "apps/api/src/trading/features/contextFromCandles.ts",
+      "bytes": 27774,
+      "sha256": "e3b1f50bae4e0e3e61d1902d9e59be570ada92ad0e1de5ae9e3bc6f3da4d93fd"
+    },
+    {
+      "path": "apps/api/src/trading/index.ts",
+      "bytes": 2247,
+      "sha256": "3a70bbb9781a3a5221d05e8490eecd9766c395eafff97cacf44e02f8edc9da63"
+    },
+    {
+      "path": "apps/api/src/trading/lanes/breakdownRetestShort.ts",
+      "bytes": 1585,
+      "sha256": "8cf480fe8699ad914e73dead7b146b685689aa0830aa2f5c54b2e4cffc801cfe"
+    },
+    {
+      "path": "apps/api/src/trading/lanes/breakoutRetestLong.ts",
+      "bytes": 1765,
+      "sha256": "b7d9303bdd1cbe9c49d51c61ceb0f01495ab0d2b775dabb1f0a184fc14506d10"
+    },
+    {
+      "path": "apps/api/src/trading/lanes/laneKit.ts",
+      "bytes": 2096,
+      "sha256": "b5806fae704d6f9dec5913714f96aa5e1daec0d1c994a6def805edad4e922b3e"
+    },
+    {
+      "path": "apps/api/src/trading/lanes/microMeanReversion.ts",
+      "bytes": 1692,
+      "sha256": "fb3b44df62bb308cde96d97033beca6fc8f51dd96d391b9a06ba982fd3028306"
+    },
+    {
+      "path": "apps/api/src/trading/lanes/pullbackLongScalp.ts",
+      "bytes": 1582,
+      "sha256": "e18acdea139ce5b87984fcc65aa051d22ebe2ec3a43cfcb79820b72553be0004"
+    },
+    {
+      "path": "apps/api/src/trading/lanes/relativeStrengthLong.ts",
+      "bytes": 1511,
+      "sha256": "e1d44e305a817db02c5cb6f795502a71cbb9214e8e23e3a92f27d4ab5e73d9a3"
+    },
+    {
+      "path": "apps/api/src/trading/lanes/shortRallyFade.ts",
+      "bytes": 1691,
+      "sha256": "0d1fc2030bf6ec897b9ecbda4361d0a453ce896fcf2779c171ca383686966c77"
+    },
+    {
+      "path": "apps/api/src/trading/regime/detectRegime.ts",
+      "bytes": 2555,
+      "sha256": "5742682b1febc6cbd4274961b7ddcc1e909e6cd200de73ebe10fbc212fa94064"
+    },
+    {
+      "path": "apps/api/src/trading/risk/riskGuard.ts",
+      "bytes": 3378,
+      "sha256": "4dab3d2c8c9196bb054cc41bf47ad95fff4912176fa0c6e93d8260a07743ea01"
+    },
+    {
+      "path": "apps/api/src/trading/safety.ts",
+      "bytes": 5045,
+      "sha256": "42dec8ba3ad36dfb7499162f2d1ee200af31836cbbc5ce292ad44a38a5433bb6"
+    },
+    {
+      "path": "apps/api/src/trading/types.ts",
+      "bytes": 11838,
+      "sha256": "d1634e00dc803f69e7184d8d12d3798d638f324827c75f24cbb393fdefbc6d07"
+    },
+    {
+      "path": "apps/api/src/trading/validation/historicalValidation.ts",
+      "bytes": 48350,
+      "sha256": "4b43dfdf16f51a37a1141f68f6fd52036a073e3fb1914809d92a8a5d3862a771"
+    },
+    {
+      "path": "apps/web/src/App.tsx",
+      "bytes": 698,
+      "sha256": "32e6f87d3f22825468a45832d0f16afef1e5c861cf788c02a30ce09a1f1d6df4"
+    },
+    {
+      "path": "apps/web/src/CortexCollectionStatusCard.tsx",
+      "bytes": 15918,
+      "sha256": "f9348c784073b103a61d2f7d878e24ca34c02a724ff2815d88a23a46622739d0"
+    },
+    {
+      "path": "apps/web/src/CortexReadinessCard.tsx",
+      "bytes": 17408,
+      "sha256": "f32248f61be349691a3a6ca8abc80a8aec008399f61d9865834e89731a38fa57"
+    },
+    {
+      "path": "apps/web/src/CrisisModeCard.tsx",
+      "bytes": 17599,
+      "sha256": "3a98ca946dc0b282a8549747f5e7dc14201ac5c10b1ccbab548619e5a3290009"
+    },
+    {
+      "path": "apps/web/src/FourBrainDashboardCard.tsx",
+      "bytes": 30271,
+      "sha256": "10c0d26d2b49687a559e21514dd81d680a8a1458277041716de6a10a35c9e623"
+    },
+    {
+      "path": "apps/web/src/InnovationLanesCard.tsx",
+      "bytes": 20337,
+      "sha256": "c68dc8fc51b5ecb57d34fc3f18b0bd07a30c3223c66a746dd59c34b4f28a84d4"
+    },
+    {
+      "path": "apps/web/src/LaneMaturityTable.tsx",
+      "bytes": 7411,
+      "sha256": "09f059c4262a4229a9063debcdaa6177c1770cc93410abfaf1684ed87707ed63"
+    },
+    {
+      "path": "apps/web/src/main.tsx",
+      "bytes": 238,
+      "sha256": "240903a71d5933c9b6910e054295ec4551c18803cd024ad6ef6d52134d96202a"
+    },
+    {
+      "path": "apps/web/src/neural-mindmap.css",
+      "bytes": 45893,
+      "sha256": "eb9581f88c613e3ef0899cce1779109dc119e467067f3df8a540feba521e6c1a"
+    },
+    {
+      "path": "apps/web/src/NeuralMindmap.tsx",
+      "bytes": 88020,
+      "sha256": "9db2c26823a210aa8da2f49e6c828851148336aa91b16d0571b9aba10b9689fc"
+    },
+    {
+      "path": "apps/web/src/ResearchDashboard.tsx",
+      "bytes": 50336,
+      "sha256": "31701c398ef7b14b0140208fae0fdb1eec1d1ddf2a4261fa9fac53e69b26a859"
+    },
+    {
+      "path": "apps/web/src/styles.css",
+      "bytes": 10833,
+      "sha256": "de45417a2ede35d1730c82e484fef1f18581d52f76a4de0936c066bdd1ff27ed"
+    },
+    {
+      "path": "apps/web/src/TestnetExchangeDashboard.tsx",
+      "bytes": 151434,
+      "sha256": "ed0b6164d84460d4bcc0a79144de9a452c4adc09f3f90f91af6e4d6ca7c02acd"
+    },
+    {
+      "path": "deploy/Caddyfile",
+      "bytes": 5942,
+      "sha256": "96771e42776e4d33fba279671a31b0461e98bd80bb4823707241b11d136367d6"
+    },
+    {
+      "path": "deploy/ecosystem.config.cjs",
+      "bytes": 1914,
+      "sha256": "73cf9c35ac62ea30e5be4b893841f61a4c98e761db6319f69b65af456f74399a"
+    },
+    {
+      "path": "deploy/generate-instance-manifest.mjs",
+      "bytes": 4093,
+      "sha256": "ecffc9e06dcf08c3d80264924e1b7c0d1e0144ea4951ad8153a8a4405dce102b"
+    },
+    {
+      "path": "deploy/instances/3101.json",
+      "bytes": 195,
+      "sha256": "e4b0a986555ddafcb3fed1e19a1ea5188f38ce564005b652bf9aeb2888b7a247"
+    },
+    {
+      "path": "deploy/instances/3102.json",
+      "bytes": 193,
+      "sha256": "2f871f94bd240fa5cba85abb06c0c59d086e660802af4797c70577ce619145ab"
+    },
+    {
+      "path": "deploy/instances/3103.json",
+      "bytes": 189,
+      "sha256": "15b4f3619532bc716c582a0b8a8dd526a4af678c2b3c79df35ef5819080a5adc"
+    },
+    {
+      "path": "deploy/README.md",
+      "bytes": 12789,
+      "sha256": "a6bff5e387ee90591c36771276a5bd89bb5dd7db1d5c4ab886477c2af66e0069"
+    },
+    {
+      "path": "deploy/run-api.sh",
+      "bytes": 177,
+      "sha256": "0c0f982562db943991cf6d6e6877709d156699ffa8964bfd51b12c67b00b0863"
+    },
+    {
+      "path": "deploy/run-kronos.sh",
+      "bytes": 647,
+      "sha256": "e6c43d6b78640881ca1ca839824adb321366ae6f407ce5927ccc1dd265ef42b3"
+    },
+    {
+      "path": "deploy/run-web.sh",
+      "bytes": 297,
+      "sha256": "498dc00c4a326302ddd001e262af828b17daea579b5decfbffb880629d25d3bf"
+    },
+    {
+      "path": "deploy/setup-vps.sh",
+      "bytes": 4456,
+      "sha256": "51a6945a9835b9e36862ad471aa9c6ca526a0555cc003be6be601e64e92ed0be"
+    },
+    {
+      "path": "package-lock.json",
+      "bytes": 113882,
+      "sha256": "4c4949f3d8757e69f3c9d0e7c6c3744c11eab056ba7a6d86052d90997eba1e3e"
+    },
+    {
+      "path": "package.json",
+      "bytes": 740,
+      "sha256": "c648321b93627ead1881d28c573e52c4f9f8385a4735760a4e4bfd79994c0ce8"
+    },
+    {
+      "path": "packages/shared/src/calibrated-expectancy.ts",
+      "bytes": 11852,
+      "sha256": "3e93ab5cef432bd7af3d1e1f9551e44b9e5c905e93e507e76cec697826f05313"
+    },
+    {
+      "path": "packages/shared/src/edge.ts",
+      "bytes": 10232,
+      "sha256": "024ec1a3db91e7882f125fd0cfdc627daff80beb6ba6075fb68a5e1b72745f3f"
+    },
+    {
+      "path": "packages/shared/src/evidence-era.ts",
+      "bytes": 2401,
+      "sha256": "a2b456dd7a0eb4794f0eba3351124931f9a4d7ae09cb2046f9eae1fddd223bb6"
+    },
+    {
+      "path": "packages/shared/src/execution-plan.ts",
+      "bytes": 33196,
+      "sha256": "c6f0bb503adebfe413c20b01c5419d6bb0928de985c679e1813005ab46fb4391"
+    },
+    {
+      "path": "packages/shared/src/index.ts",
+      "bytes": 387,
+      "sha256": "126e0403d6417ce8ab311c6604d558c806acc80f072de92877cfc9829bb961b0"
+    },
+    {
+      "path": "packages/shared/src/indicators.ts",
+      "bytes": 13083,
+      "sha256": "680c35d3bf88858a13fec8c0a3142d98637b24bc1e2b309927d1695e2638878b"
+    },
+    {
+      "path": "packages/shared/src/profit-routing.ts",
+      "bytes": 15279,
+      "sha256": "651e3ab6b0aa2d45c81699be33c4b52ee39680760dbfe50907f5bb2495b4f813"
+    },
+    {
+      "path": "packages/shared/src/scan.ts",
+      "bytes": 21180,
+      "sha256": "3d5da52cc0d055f2b5bbc561003169f40a3ea5b791c11d1a251374539ee7dcd1"
+    },
+    {
+      "path": "packages/shared/src/scanner-diagnostics.ts",
+      "bytes": 5698,
+      "sha256": "140b9fb0b41396e6005b4436a30082e731d946507b71910192a2f3fc57ecb5b5"
+    },
+    {
+      "path": "packages/shared/src/strategy-intelligence.ts",
+      "bytes": 48138,
+      "sha256": "31f9df9c1dfe9327fd6a7280ba732fb1e566246f73ce3cffbf6be95fdd2b8ef7"
+    },
+    {
+      "path": "packages/shared/src/trade-plan.ts",
+      "bytes": 15085,
+      "sha256": "7d494783c90fa070129a9745c0e976caf4a87aa15042a0599fbf0c36267bc94e"
+    },
+    {
+      "path": "packages/shared/src/types.ts",
+      "bytes": 31010,
+      "sha256": "0e146cb240f46d6206cadb36471a0db01dc99bc7304f9e10038e3721a1c4f201"
+    }
+  ]
+}

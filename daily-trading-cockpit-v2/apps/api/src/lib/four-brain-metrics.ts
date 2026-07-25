@@ -33,6 +33,7 @@ export interface FourBrainMetricsSummary {
     gatherErrors: number;
     exceptions: number;
     journalErrors: number;
+    brainErrors: number;
     invariantFailures: number;
   };
   decisions: { total: number; duplicateDecisionIds: number; unknownLanes: number; duplicateIdentities: number };
@@ -55,6 +56,7 @@ export class FourBrainMetricsAggregator {
   private gatherErrors = 0;
   private exceptions = 0;
   private journalErrors = 0;
+  private brainErrors = 0;
   private invariantFailures = 0;
   private decisions = 0;
   private dupDecisionIds = 0;
@@ -80,6 +82,7 @@ export class FourBrainMetricsAggregator {
     this.gatherErrors += m.gatherErrors;
     if (reason === "exception") this.exceptions += 1;
     this.journalErrors += m.journalErrors;
+    this.brainErrors += m.brainErrors;
     this.invariantFailures += m.invariantFailures;
     this.decisions += m.decisions;
     this.dupDecisionIds += m.duplicateDecisionIds;
@@ -122,6 +125,7 @@ export class FourBrainMetricsAggregator {
         gatherErrors: this.gatherErrors,
         exceptions: this.exceptions,
         journalErrors: this.journalErrors,
+        brainErrors: this.brainErrors,
         invariantFailures: this.invariantFailures,
       },
       decisions: { total: this.decisions, duplicateDecisionIds: this.dupDecisionIds, unknownLanes: this.unknownLanes, duplicateIdentities: this.dupIdentities },

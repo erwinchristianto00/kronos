@@ -14,9 +14,11 @@ import {
   CrossSectionalExecutorStore,
   CROSS_SECTIONAL_TREND_LANE_ID,
   crossSectionalMarketNeutralIsAllowed,
+  isCrossSectionalTrendMixedAdmissionIndependent,
   type CrossSectionalExecClient,
   type ExecutorBasket,
 } from "../src/lib/cross-sectional-executor.js";
+import { CortexRealAttributionStore } from "../src/lib/cortex-real-attribution.js";
 
 const NOW = "2026-07-02T03:00:00.000Z";
 const NOW_MS = new Date(NOW).getTime();
@@ -167,7 +169,7 @@ class FakeExecClient implements CrossSectionalExecClient {
   }
 }
 
-function makeExecutor(opts: { client?: FakeExecClient; allowed?: boolean; laneWeightPct?: number; laneId?: string; signalMs?: number; dailyMaxLossUsd?: number; entryHealthAllowed?: boolean; siblingOpenLegs?: () => Array<{ symbol: string; side: "LONG" | "SHORT"; qty: number }>; existingNotionalForSymbol?: (symbol: string) => number; maxNotionalPerSymbolAcrossLanes?: number } = {}) {
+function makeExecutor(opts: { client?: FakeExecClient; allowed?: boolean; laneWeightPct?: number; rawLaneWeightPct?: number; cortexRealAttribution?: CortexRealAttributionStore; laneId?: string; signalMs?: number; dailyMaxLossUsd?: number; entryHealthAllowed?: boolean; siblingOpenLegs?: () => Array<{ symbol: string; side: "LONG" | "SHORT"; qty: number }>; existingNotionalForSymbol?: (symbol: string) => number; maxNotionalPerSymbolAcrossLanes?: number } = {}) {
   const client = opts.client ?? new FakeExecClient();
   const signalStore = new CrossSectionalStore(tmpDir());
   const storeDir = tmpDir();
@@ -181,6 +183,8 @@ function makeExecutor(opts: { client?: FakeExecClient; allowed?: boolean; laneWe
     store,
     isAllowed: () => opts.allowed ?? true,
     laneWeightPct: () => opts.laneWeightPct ?? 100,
+    ...(opts.rawLaneWeightPct !== undefined ? { rawLaneWeightPct: () => opts.rawLaneWeightPct! } : {}),
+    ...(opts.cortexRealAttribution !== undefined ? { cortexRealAttribution: opts.cortexRealAttribution } : {}),
     ...(opts.laneId !== undefined ? { laneId: opts.laneId } : {}),
     nowIso: () => NOW,
     fillConfirmRetryDelayMs: 0,
@@ -320,6 +324,86 @@ describe("cross-sectional executor (basket execution, testnet-first)", () => {
     expect(flatten!.side).toBe("SELL");
   });
 
+  describe("2026-07-21 CRITICAL fix: basket-open persistence survives a crash mid-loop", () => {
+    // Root cause of the confirmed 2026-07-18 testnet incident: a real, exchange-filled leg (WIFUSDT)
+    // vanished from ALL bookkeeping — not in baskets, not in orphanedLegs — because the basket only
+    // ever reached st.baskets on the loop's SUCCESS or ABORT path. A process crash between one leg's
+    // placeOrder confirming filled and either of those two points left a real position with zero
+    // record anywhere, and the watermark (already advanced before any leg was placed) meant the
+    // signal was never retried either. These tests prove each leg is now durably persisted the
+    // MOMENT it fills, independent of whether the loop or its abort handler ever finish.
+
+    it("persists the basket (status OPEN, empty legs) to disk BEFORE the first leg's order is even placed", async () => {
+      const client = new FakeExecClient();
+      client.fillPriceBySymbol.set("SOLUSDT", 100);
+      client.fillPriceBySymbol.set("DOGEUSDT", 0.1);
+      const { executor, store, storeDir } = makeExecutor({ client, signalMs: NOW_MS - 5 * 60_000 });
+      let sawEmptyOpenBasketBeforeAnyFill = false;
+      const originalSetLeverage = client.setLeverage.bind(client);
+      client.setLeverage = async (symbol, leverage) => {
+        // setLeverage is called before EVERY leg's placeOrder — checking on the very first call
+        // (SOLUSDT) proves the basket was written to disk before any order at all went out.
+        if (symbol === "SOLUSDT") {
+          const freshStore = new CrossSectionalExecutorStore(storeDir);
+          const basket = freshStore.getState().baskets[0];
+          sawEmptyOpenBasketBeforeAnyFill =
+            basket !== undefined && basket.status === "OPEN" && basket.legs.length === 0;
+        }
+        return originalSetLeverage(symbol, leverage);
+      };
+      await executor.tick();
+      expect(sawEmptyOpenBasketBeforeAnyFill).toBe(true);
+    });
+
+    it("persists a filled leg to disk immediately — before the NEXT leg's order is placed, surviving a simulated crash mid-loop", async () => {
+      const client = new FakeExecClient();
+      client.fillPriceBySymbol.set("SOLUSDT", 100);
+      client.fillPriceBySymbol.set("DOGEUSDT", 0.1);
+      const { executor, store, storeDir } = makeExecutor({ client, signalMs: NOW_MS - 5 * 60_000 });
+      let sawPersistedAfterFirstLeg = false;
+      const originalPlaceOrder = client.placeOrder.bind(client);
+      client.placeOrder = async (params) => {
+        if (params.symbol === "DOGEUSDT" && !params.reduceOnly) {
+          // Re-read from a FRESH store instance pointed at the same directory — simulating exactly
+          // what a restarted process would see if it crashed right here, between the SOL leg's fill
+          // and the DOGE leg's order going out.
+          const freshStore = new CrossSectionalExecutorStore(storeDir);
+          const basket = freshStore.getState().baskets[0];
+          sawPersistedAfterFirstLeg =
+            basket !== undefined &&
+            basket.status === "OPEN" &&
+            basket.legs.length === 1 &&
+            basket.legs[0]!.symbol === "SOLUSDT" &&
+            basket.legs[0]!.entryOrderId !== null;
+        }
+        return originalPlaceOrder(params);
+      };
+      await executor.tick();
+      expect(sawPersistedAfterFirstLeg).toBe(true);
+      // Sanity: the basket did go on to complete normally — this isn't just testing a fixture quirk.
+      expect(store.getState().baskets[0]!.status).toBe("OPEN");
+      expect(store.getState().baskets[0]!.legs.length).toBe(2);
+    });
+
+    it("a fully successful basket-open is recorded exactly once (no duplicate push from the old success-path push+the new upfront push)", async () => {
+      const client = new FakeExecClient();
+      client.fillPriceBySymbol.set("SOLUSDT", 100);
+      client.fillPriceBySymbol.set("DOGEUSDT", 0.1);
+      const { executor, store } = makeExecutor({ client, signalMs: NOW_MS - 5 * 60_000 });
+      await executor.tick();
+      expect(store.getState().baskets.length).toBe(1);
+    });
+
+    it("an ABORTED basket (failed leg) is recorded exactly once (no duplicate push from the old abort-path push+the new upfront push)", async () => {
+      const client = new FakeExecClient();
+      client.failOnSymbol = "DOGEUSDT";
+      const { executor, store } = makeExecutor({ client, signalMs: NOW_MS - 5 * 60_000 });
+      await executor.tick();
+      expect(store.getState().baskets.length).toBe(1);
+      expect(store.getState().baskets[0]!.status).toBe("ABORTED");
+    });
+  });
+
   it("closes the basket at horizon with reduce-only orders and honest net PnL", async () => {
     const client = new FakeExecClient();
     client.fillPriceBySymbol.set("SOLUSDT", 100); // entry fills
@@ -340,6 +424,58 @@ describe("cross-sectional executor (basket execution, testnet-first)", () => {
     expect(basket.netPnlUsd!).toBeLessThan(basket.grossPnlUsd!);
     const closes = client.placed.filter((p) => p.reduceOnly);
     expect(closes.length).toBe(2);
+  });
+
+  // [2026-07-22 bug-hunt fix]: CROSS_SECTIONAL_MARKET_NEUTRAL/TREND/MIXED are full
+  // CORTEX_LANE_ROSTER members whose real sizing already responds to CORTEX's tilt, but a
+  // closed basket was never recorded into cortex-real-attribution.ts's ledger at all — not
+  // reported as $0, simply never written. This is the first test that actually exercises the
+  // wiring end to end.
+  it("[CORTEX-ATTRIBUTION] closeBasket records the CORTEX real-USDT attribution when wired, capturing the open-time tilt", async () => {
+    const client = new FakeExecClient();
+    client.fillPriceBySymbol.set("SOLUSDT", 100);
+    client.fillPriceBySymbol.set("DOGEUSDT", 0.1);
+    const cortexRealAttribution = new CortexRealAttributionStore(tmpDir());
+    const { executor, store } = makeExecutor({
+      client,
+      signalMs: NOW_MS - 5 * 60_000,
+      laneWeightPct: 50, // applied (CORTEX-tilted): 50%
+      rawLaneWeightPct: 20, // operator's untouched table weight: 20%
+      cortexRealAttribution,
+    });
+    await executor.tick();
+    const basket = store.getState().baskets[0]!;
+    expect(basket.cortexAppliedWeightPct).toBe(50);
+    expect(basket.cortexRawStaticWeightPct).toBe(20);
+    client.fillPriceBySymbol.set("SOLUSDT", 102);
+    client.fillPriceBySymbol.set("DOGEUSDT", 0.099);
+    basket.closesAtMs = NOW_MS - 1;
+    await executor.tick();
+    expect(basket.status).toBe("CLOSED");
+    const records = cortexRealAttribution.getState().records;
+    expect(records.length).toBe(1);
+    const rec = records[0]!;
+    expect(rec.recordId).toBe(`xsec:${rec.laneId}:${basket.basketId}`);
+    expect(rec.appliedWeightPct).toBe(50);
+    expect(rec.rawStaticWeightPct).toBe(20);
+    expect(rec.realizedPnlUsd).toBeCloseTo(basket.netPnlUsd!, 9);
+    // tiltShare = (applied-raw)/applied = (50-20)/50 = 0.6, cortexUsd = realizedPnlUsd * 0.6
+    expect(rec.tiltShare).toBeCloseTo(0.6, 9);
+    expect(rec.cortexUsd).toBeCloseTo(basket.netPnlUsd! * 0.6, 9);
+  });
+
+  it("[CORTEX-ATTRIBUTION] without cortexRealAttribution wired, closeBasket records nothing (byte-identical to pre-fix behavior)", async () => {
+    const client = new FakeExecClient();
+    client.fillPriceBySymbol.set("SOLUSDT", 100);
+    client.fillPriceBySymbol.set("DOGEUSDT", 0.1);
+    const { executor, store } = makeExecutor({ client, signalMs: NOW_MS - 5 * 60_000 });
+    await executor.tick();
+    const basket = store.getState().baskets[0]!;
+    client.fillPriceBySymbol.set("SOLUSDT", 102);
+    client.fillPriceBySymbol.set("DOGEUSDT", 0.099);
+    basket.closesAtMs = NOW_MS - 1;
+    await expect(executor.tick()).resolves.not.toThrow();
+    expect(basket.status).toBe("CLOSED");
   });
 
   // [FEE-RECORDING, 2026-07-12 fix]: closeBasket previously ALWAYS recorded the flat
@@ -1358,5 +1494,22 @@ describe("[2026-07-20 round 2] crossSectionalMarketNeutralIsAllowed genuinely ex
       laneSelectionAllowsLane: () => true,
     });
     expect(blockedWhileKilled).toBe(false);
+  });
+});
+
+describe("[2026-07-22 CORTEX capital-coverage diagnosis] isCrossSectionalTrendMixedAdmissionIndependent", () => {
+  it("is OFF by default (unset env)", () => {
+    const env = {} as NodeJS.ProcessEnv;
+    expect(isCrossSectionalTrendMixedAdmissionIndependent(env)).toBe(false);
+  });
+
+  it("is ON only for the exact string \"1\"", () => {
+    expect(isCrossSectionalTrendMixedAdmissionIndependent({ CROSS_SECTIONAL_TREND_MIXED_ADMISSION_INDEPENDENT: "1" } as NodeJS.ProcessEnv)).toBe(true);
+    expect(isCrossSectionalTrendMixedAdmissionIndependent({ CROSS_SECTIONAL_TREND_MIXED_ADMISSION_INDEPENDENT: "true" } as NodeJS.ProcessEnv)).toBe(false);
+    expect(isCrossSectionalTrendMixedAdmissionIndependent({ CROSS_SECTIONAL_TREND_MIXED_ADMISSION_INDEPENDENT: "0" } as NodeJS.ProcessEnv)).toBe(false);
+  });
+
+  it("is independent of CROSS_SECTIONAL_ALLOCATION_INDEPENDENT — the two flags gate different lanes and must not leak into each other", () => {
+    expect(isCrossSectionalTrendMixedAdmissionIndependent({ CROSS_SECTIONAL_ALLOCATION_INDEPENDENT: "1" } as NodeJS.ProcessEnv)).toBe(false);
   });
 });

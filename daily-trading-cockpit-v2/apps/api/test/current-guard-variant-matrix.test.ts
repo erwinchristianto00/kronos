@@ -1000,6 +1000,83 @@ describe("current-guard-variant-matrix", () => {
     expect(result.resolved).toBe(0);
   });
 
+  // ── beginBatch/endBatch (2026-07-23 fix for the operator-brief?resolve=1 90-190s testnet freeze) ──
+  // Spies on the store's own private `flush` (cast to any — Vitest cannot spy on a built-in ESM
+  // module's named export like node:fs's writeFileSync, since the module namespace is non-configurable;
+  // flush() is this store's own single choke point for an actual disk write, so spying on it directly
+  // is both the only viable hook AND the more precise one — it tests the batching CONTRACT, not an
+  // incidental implementation detail of how persistence happens to be implemented underneath it).
+
+  // [13b] beginBatch/endBatch collapses N independent save-worthy mutations into ONE flush.
+  it("[13b] beginBatch/endBatch collapses multiple mutations into a single flush", () => {
+    const store = new CurrentGuardVariantMatrixStore(tmpDir());
+    const flushSpy = vi.spyOn(store as unknown as { flush: () => void }, "flush");
+
+    // Without batching, add() + setResolverMeta() + update() would each flush independently (3 writes).
+    store.beginBatch();
+    store.add(buildVariantMatrixObservationsForSignal(makeSignal({ sourceSignalId: "b1" }))[0]!);
+    store.setResolverMeta({ lastRunAt: new Date().toISOString(), resolvedCount: 0, expiredCount: 0, dataFailureCount: 0, errorCount: 0, walkCursor: 0 });
+    store.update(store.all[0]!.observationId, { status: "EXPIRED" });
+    store.endBatch();
+
+    expect(flushSpy).toHaveBeenCalledTimes(1);
+    // The batched mutations must still have actually landed (batching only defers the disk flush).
+    expect(store.all[0]!.status).toBe("EXPIRED");
+    expect(store.getResolverMeta()?.resolvedCount).toBe(0);
+    flushSpy.mockRestore();
+  });
+
+  // [13c] Nested beginBatch/endBatch only flushes once the OUTERMOST endBatch() runs.
+  it("[13c] nested batches only flush on the outermost endBatch()", () => {
+    const store = new CurrentGuardVariantMatrixStore(tmpDir());
+    const flushSpy = vi.spyOn(store as unknown as { flush: () => void }, "flush");
+
+    store.beginBatch();
+    store.add(buildVariantMatrixObservationsForSignal(makeSignal({ sourceSignalId: "n1" }))[0]!);
+    store.beginBatch();
+    store.add(buildVariantMatrixObservationsForSignal(makeSignal({ sourceSignalId: "n2" }))[0]!);
+    store.endBatch(); // inner — must NOT flush yet
+    expect(flushSpy).not.toHaveBeenCalled();
+    store.endBatch(); // outer — flushes once
+
+    expect(flushSpy).toHaveBeenCalledTimes(1);
+    flushSpy.mockRestore();
+  });
+
+  // [13d] resolveVariantMatrixObservations flushes at most once per run — the actual bug this fix
+  // targets: Phase 1's stale-expiry bulkUpdate and setResolverMeta (always saves, unconditionally,
+  // every single run — see its own doc comment) used to each write the FULL store independently
+  // (plus pruneExpired/pruneTerminal/Phase-2's own bulkUpdate whenever THEY have something to do), up
+  // to 5 full-array JSON.stringify+writeFileSync passes in one run. On the production store (documented
+  // elsewhere in this file's constructor comment as having reached 129k+ observations / ~200MB), that
+  // is what actually starved operator-brief?resolve=1 for 90-190+s per cycle and froze the whole
+  // process for every other concurrent request (writeFileSync blocks the single-threaded event loop).
+  // This test only needs to prove TWO of those five independent call sites collapse to one flush —
+  // Phase 1's stale-expiry bulkUpdate (which only fires when there is something to expire) plus the
+  // always-fires setResolverMeta — reusing test [11]'s exact stale-OPEN setup (candle fetch is never
+  // reached for an already-expired obs, so a plain empty-returning binance mock is enough here; a
+  // full winning-candle-walk Phase-2 scenario is exercised separately by test [13b]'s unit-level check
+  // on bulkUpdate/setResolverMeta directly and by every other resolver test in this file).
+  it("[13d] resolveVariantMatrixObservations does exactly ONE flush even though 2+ mutation phases fire", async () => {
+    const dir = tmpDir();
+    const store = new CurrentGuardVariantMatrixStore(dir);
+    const oldMs = Date.now() - 8 * 24 * 60 * 60 * 1000;
+    const signal = makeSignal({ openedAt: new Date(oldMs).toISOString() });
+    store.addMany(buildVariantMatrixObservationsForSignal(signal));
+
+    const flushSpy = vi.spyOn(store as unknown as { flush: () => void }, "flush");
+    const trackingBinance = { getKlines: async (): Promise<KlineTuple[]> => [] };
+
+    const result = await resolveVariantMatrixObservations(store, trackingBinance);
+
+    // Sanity: the stale-expiry bulkUpdate path actually fired (otherwise this test would pass for the
+    // wrong reason) — setResolverMeta always fires regardless, so this alone is already 2 save sites.
+    expect(result.expired).toBeGreaterThan(0);
+    // The actual regression check: ONE flush for the whole run, not one per phase.
+    expect(flushSpy).toHaveBeenCalledTimes(1);
+    flushSpy.mockRestore();
+  });
+
   // [14] Resolver diagnostics surface max-hold-overdue observations, not merely >72h runner holds.
   it("[14] resolver diagnostics: staleOpenCount follows each lane max-hold", () => {
     const dir = tmpDir();

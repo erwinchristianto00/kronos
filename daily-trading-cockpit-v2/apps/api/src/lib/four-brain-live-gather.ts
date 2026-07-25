@@ -201,6 +201,11 @@ export interface DirectionRawReadings {
   leansShort?: boolean;
   longVeto?: boolean;
   shortVeto?: boolean;
+  /** Four-brain's OWN self-referential edge-memory veto (four-brain-edge-memory.ts) — a SECOND,
+   *  independent soft penalty from longVeto/shortVeto (the incumbent engine's edge-memory). Passed
+   *  straight through to DirectionInput; see direction-brain.ts. */
+  fourBrainLongVeto?: boolean;
+  fourBrainShortVeto?: boolean;
   validityMs: number;
 }
 
@@ -368,6 +373,8 @@ export function assembleFourBrainTick(input: FourBrainGatherInput): FourBrainGat
       leansShort: d.leansShort,
       longVeto: d.longVeto,
       shortVeto: d.shortVeto,
+      fourBrainLongVeto: d.fourBrainLongVeto,
+      fourBrainShortVeto: d.fourBrainShortVeto,
     };
     return { horizon: d.horizon, input: di, readings: Object.values(readings) };
   });
@@ -386,6 +393,10 @@ export function assembleFourBrainTick(input: FourBrainGatherInput): FourBrainGat
       nowMs,
       validityMs: c.validityMs,
       side: c.side,
+      // Candidate identity salt for decisionId — the SAME key used for entry-candidate dedup above, so
+      // it is guaranteed unique across every kept candidate in this tick (see EntryInput.candidateKey's
+      // doc comment in entry-brain.ts for the collision this closes).
+      candidateKey: identityKey(c.identity),
       signalAgeMs: c.signalAgeMs,
       maxSignalAgeMs: c.maxSignalAgeMs,
       price: c.price,
@@ -415,6 +426,10 @@ export function assembleFourBrainTick(input: FourBrainGatherInput): FourBrainGat
       nowMs,
       validityMs: c.validityMs,
       side: c.side,
+      // Candidate identity salt for decisionId — the SAME key used for exit-candidate dedup above, so
+      // it is guaranteed unique across every kept candidate in this tick (see ExitInput.candidateKey's
+      // doc comment in exit-brain.ts for the collision this closes).
+      candidateKey: identityKey(c.identity),
       entryPrice: c.entryPrice,
       currentPrice: c.currentPrice,
       unrealizedR: c.unrealizedR,

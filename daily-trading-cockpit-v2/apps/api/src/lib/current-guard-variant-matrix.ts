@@ -914,6 +914,19 @@ export class CurrentGuardVariantMatrixStore {
   // 8s setTimeout callback itself couldn't fire until the synchronous scan finished. (Observed: every
   // operator-brief?resolve=1 cycle on / (3101) hanging 190-235s and getting aborted.)
   private observationKeySet: Set<string>;
+  // Defers save() to a single flush on endBatch() — same fix already applied to
+  // PaperExecutionRouterStore (paper-execution-router.ts). resolveVariantMatrixObservations() calls
+  // bulkUpdate() (expiry sweep), pruneExpired(), pruneTerminal(), bulkUpdate() again (resolutions), and
+  // setResolverMeta() — up to 5 independent full-array JSON.stringify + writeFileSync passes in ONE
+  // resolver run, even though each individual call was already collapsed from O(n) per-observation to
+  // O(1) per-phase. On a store that has reached 129k+ observations / ~200MB in production (see
+  // buildCurrentGuardVariantMatrixReport's own doc comment on this exact store), 5 sequential full
+  // rewrites of that size is what actually starved operator-brief?resolve=1 for 90-190+s per cycle
+  // (`ps` showed low CPU% during the freeze, consistent with synchronous disk I/O wait, not a CPU-bound
+  // loop) — every OTHER concurrent request hung too, since writeFileSync blocks the whole single-threaded
+  // event loop. Wrapping the resolver's body in beginBatch()/endBatch() collapses this to ONE flush.
+  private batchDepth = 0;
+  private dirtyDuringBatch = false;
 
   constructor(dataDir = "data") {
     this.file = resolve(dataDir, "current-guard-variant-matrix.json");
@@ -967,7 +980,29 @@ export class CurrentGuardVariantMatrixStore {
     }
   }
 
+  /** Start deferring save() to a single flush on the matching endBatch(). Nestable (paired calls only
+   *  flush once the outermost endBatch() runs) — mirrors PaperExecutionRouterStore's beginBatch(). */
+  beginBatch(): void {
+    this.batchDepth += 1;
+  }
+
+  endBatch(): void {
+    if (this.batchDepth > 0) this.batchDepth -= 1;
+    if (this.batchDepth === 0 && this.dirtyDuringBatch) {
+      this.dirtyDuringBatch = false;
+      this.flush();
+    }
+  }
+
   save(): void {
+    if (this.batchDepth > 0) {
+      this.dirtyDuringBatch = true;
+      return;
+    }
+    this.flush();
+  }
+
+  private flush(): void {
     try {
       for (const observation of this.observations) stampObservationAxis(observation);
       const state: VariantMatrixStoreState = { observations: this.observations };
@@ -2259,6 +2294,10 @@ export async function resolveVariantMatrixObservations(
   // sweep, just extended to cover the resolution loop too.
   const patches: Array<{ observationId: string; patch: Partial<CurrentGuardVariantMatrixObservation> }> = [];
 
+  // One flush for this ENTIRE run (expiry sweep + both prune passes + resolution patches + resolver
+  // meta), not one per phase — see beginBatch()'s own doc comment for why this run alone used to do up
+  // to 5 sequential full-store rewrites and starve operator-brief?resolve=1 for 90-190+s.
+  store.beginBatch();
   try {
     // ── Phase 1: cheap bulk expiry sweep (no I/O, NOT counted against the fetch budget). ──
     // Stale (>EXPIRY_MS) OPEN observations are marked EXPIRED in ONE save. Previously the expiry
@@ -2487,6 +2526,11 @@ export async function resolveVariantMatrixObservations(
     });
   } catch {
     // meta-save failure must never break the resolver
+  } finally {
+    // Single flush for the whole run — pairs with the beginBatch() above. Runs no matter how the
+    // function above exited (including a throw this function's own guards did not anticipate), so a
+    // batch can never leak open and permanently suppress persistence for this store.
+    store.endBatch();
   }
 
   return { resolved, expired, dataFailures, errors };

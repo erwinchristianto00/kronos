@@ -15,7 +15,8 @@ import { calculateTimeframeIndicators, type Candle } from "@dtc/shared";
 import { deriveDirectionVeto, CORTEX_LANE_ROSTER, type CortexLaneDirection } from "./cortex-live-gather.js";
 import { FOUR_BRAIN_LANE_SUPPORT, FOUR_BRAIN_SUPPORTED_LANES as SUPPORTED_LANES } from "./four-brain-lane-support.js";
 import type { MarketSafetyEvent } from "./market-state-brain.js";
-import type { DirectionHorizon } from "./four-brain-types.js";
+import { fourBrainMode, type DirectionHorizon } from "./four-brain-types.js";
+import { getFourBrainEdgeMemory, fourBrainEdgeVerdict } from "./four-brain-edge-memory.js";
 import {
   FRESHNESS_TTL_MS,
   type EntryCandidateRaw,
@@ -257,24 +258,35 @@ export function buildFourBrainGatherInput(dep: FourBrainBindingDeps): FourBrainG
   const shortVeto = deriveDirectionVeto({ direction: "SHORT" as CortexLaneDirection, edgeMemory: dep.edgeMemory, regimeRaw: dep.regimeRaw });
   const longLane = dep.bestLaneReportForDirection("LONG");
   const shortLane = dep.bestLaneReportForDirection("SHORT");
-  const directions = horizons.map((horizon) => ({
-    horizon,
-    marketBias: "NEUTRAL" as const, // placeholder — the tick overrides from the Market State Brain
-    transitionRisk: 0,
-    longEdge: reading("edge-memory-long", longEdge, "R", dep.axisAtMs, "regime", "n=0 (no proven edge)"),
-    shortEdge: reading("edge-memory-short", shortEdge, "R", dep.axisAtMs, "regime", "n=0 (no proven edge)"),
-    conviction: reading("controller-conviction", finite(dep.convictionScore) ? dep.convictionScore : null, "0..1", dep.axisAtMs, "regime"),
-    longLaneEdge: reading("lane-report-long", longLane && longLane.resolvedCount > 0 ? longLane.netAvgR : null, "R", dep.axisAtMs, "regime", "no resolved long-lane closes"),
-    shortLaneEdge: reading("lane-report-short", shortLane && shortLane.resolvedCount > 0 ? shortLane.netAvgR : null, "R", dep.axisAtMs, "regime", "no resolved short-lane closes"),
-    kronosAgree: reading("kronos-agree", finite(dep.kronosAgree) ? dep.kronosAgree : null, "-1..1", dep.kronosAtMs, "derivatives", "kronos ~55% MISSING"),
-    crowdingAlignLong: reading("crowding-align-long", finite(dep.crowdAlignLong) ? dep.crowdAlignLong : null, "-1..1", dep.crowdAtMs, "derivatives"),
-    controllerBias: dep.controllerBias,
-    leansLong: dep.allowsLong,
-    leansShort: dep.allowsShort,
-    longVeto,
-    shortVeto,
-    validityMs,
-  }));
+  // Four-brain's OWN self-referential edge memory (four-brain-edge-memory.ts) — a SECOND, independent
+  // proven-negative signal from the incumbent's longVeto/shortVeto above, derived from the Direction
+  // Brain's OWN resolved LONG/SHORT outcomes (direction-entry-outcome-store.ts). Horizon-scoped (unlike
+  // longVeto/shortVeto, which are regime-level only), so it is computed per-horizon inside the map below.
+  const fbEdge = getFourBrainEdgeMemory();
+  const directions = horizons.map((horizon) => {
+    const fourBrainLongVeto = fourBrainEdgeVerdict(fbEdge, dep.regimeRaw, "LONG", horizon).verdict === "VETO_NEGATIVE";
+    const fourBrainShortVeto = fourBrainEdgeVerdict(fbEdge, dep.regimeRaw, "SHORT", horizon).verdict === "VETO_NEGATIVE";
+    return {
+      horizon,
+      marketBias: "NEUTRAL" as const, // placeholder — the tick overrides from the Market State Brain
+      transitionRisk: 0,
+      longEdge: reading("edge-memory-long", longEdge, "R", dep.axisAtMs, "regime", "n=0 (no proven edge)"),
+      shortEdge: reading("edge-memory-short", shortEdge, "R", dep.axisAtMs, "regime", "n=0 (no proven edge)"),
+      conviction: reading("controller-conviction", finite(dep.convictionScore) ? dep.convictionScore : null, "0..1", dep.axisAtMs, "regime"),
+      longLaneEdge: reading("lane-report-long", longLane && longLane.resolvedCount > 0 ? longLane.netAvgR : null, "R", dep.axisAtMs, "regime", "no resolved long-lane closes"),
+      shortLaneEdge: reading("lane-report-short", shortLane && shortLane.resolvedCount > 0 ? shortLane.netAvgR : null, "R", dep.axisAtMs, "regime", "no resolved short-lane closes"),
+      kronosAgree: reading("kronos-agree", finite(dep.kronosAgree) ? dep.kronosAgree : null, "-1..1", dep.kronosAtMs, "derivatives", "kronos ~55% MISSING"),
+      crowdingAlignLong: reading("crowding-align-long", finite(dep.crowdAlignLong) ? dep.crowdAlignLong : null, "-1..1", dep.crowdAtMs, "derivatives"),
+      controllerBias: dep.controllerBias,
+      leansLong: dep.allowsLong,
+      leansShort: dep.allowsShort,
+      longVeto,
+      shortVeto,
+      fourBrainLongVeto,
+      fourBrainShortVeto,
+      validityMs,
+    };
+  });
 
   const riskBlockedReason = (laneId: string, direction: "LONG" | "SHORT"): string | null => {
     if (dep.killLatched) return dep.killReason ?? "kill switch latched";
@@ -424,4 +436,18 @@ export function fourBrainInstanceAllowed(env: NodeJS.ProcessEnv = process.env): 
   const raw = (env.FOUR_BRAIN_INSTANCE_ALLOWLIST ?? FOUR_BRAIN_DEFAULT_INSTANCE_ALLOWLIST.join(",")).trim();
   const allow = new Set(raw.split(",").map((s) => s.trim()).filter(Boolean));
   return allow.has(id);
+}
+
+/** True only when the four-brain shadow cycle is actually configured to run on THIS instance — BOTH
+ *  FOUR_BRAIN_MODE==="shadow" AND fourBrainInstanceAllowed(env). This is the exact composed gate app.ts
+ *  uses to arm the shadow-tick interval ("Arm the interval ONLY where the tick could actually run").
+ *  Anything that wants to answer "is four-brain live on this box" — in particular the operator dashboard's
+ *  /api/shadow/four-brain `enabled` field — must key off THIS, not merely "did this process construct the
+ *  metrics aggregator": app.ts's four-brain wiring block runs on every non-test process regardless of mode,
+ *  so a metrics/ring-buffer object always gets constructed there even when shadow mode is off. Without this
+ *  helper gating what gets exposed to the route, a mode-off instance would report enabled:true with an
+ *  honestly-all-zero (never fabricated) but semantically-misleading health object — indistinguishable from
+ *  "shadow mode is on and simply hasn't completed a tick yet". */
+export function fourBrainShadowActive(env: NodeJS.ProcessEnv = process.env): boolean {
+  return fourBrainMode(env) === "shadow" && fourBrainInstanceAllowed(env);
 }

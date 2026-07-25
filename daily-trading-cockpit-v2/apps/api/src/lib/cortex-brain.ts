@@ -453,7 +453,16 @@ export function decideCortex(
 
   const lanes: CortexLaneDecision[] = laneCalc.map((c) => {
     const staticPct = Math.max(0, finiteOr(c.lane.staticWeightPct, 0)); // NaN-guard the one un-wrapped input
-    const learnedPct = rawSum > 0 && c.eligible ? (c.raw / rawSum) * 100 : 0;
+    // 2026-07-22 fix: when NO eligible lane's pWin exceeds 0.5 (rawSum<=0 — the guaranteed state right
+    // after emptyCortexState() or any refit rejection, since cumulativeResolved/β advances independently
+    // of whether a fit has ever succeeded), learnedPct used to hard-zero for every lane. blended =
+    // (1-β)*staticPct then had nothing to redistribute the β-fraction into, so the WHOLE book's funded
+    // capital silently shrank by up to β_max — a discontinuous under-allocation cliff invisible to
+    // checkCortexInvariants (which only bounds sum<=100, never floors it). Falling back learnedPct to
+    // staticPct here makes blended = staticPct regardless of β in this case — exactly the incumbent,
+    // matching the "no lane has a modeled edge yet" state to "the model contributes nothing", not
+    // "the model actively defunds everyone".
+    const learnedPct = c.eligible ? (rawSum > 0 ? (c.raw / rawSum) * 100 : staticPct) : 0;
     // Blend toward the static table by β, then deleverage by gross. Eligibility hard-gates on veto/
     // risk only. The de-concentration cap is applied to the TILT, never below the static incumbent:
     // min(blended, max(static, cap)) — so a lane the live table already runs at 80% is NOT silently
@@ -483,8 +492,13 @@ export function decideCortex(
 
   // Reality-gap prediction: the R-delta the brain's tilt is EXPECTED to add vs the gross-scaled static
   // table, per the model's own shrunk edge. 0 at β=0. Compared to realized at resolution.
+  // 2026-07-22 fix: staticShareG must use the POST-VETO incumbent share (0 for an ineligible lane), not
+  // the raw staticPct — the module's own "β=0 == POST-FEDERATED-VETO incumbent" contract already zeroes
+  // a vetoed lane's finalPct, so comparing that zeroed finalPct against its UN-zeroed raw static share
+  // fabricated a nonzero "reality gap" purely from the veto itself, on every cycle with an active veto,
+  // even when β=0 and zero tilt was actually applied.
   const expectedTiltDeltaR = lanes.reduce((s, l) => {
-    const staticShareG = (Math.max(0, l.staticPct) * grossG) / 100;
+    const staticShareG = l.eligible ? (Math.max(0, l.staticPct) * grossG) / 100 : 0;
     return s + (l.finalPct / 100 - staticShareG) * l.shrunkNetR;
   }, 0);
 

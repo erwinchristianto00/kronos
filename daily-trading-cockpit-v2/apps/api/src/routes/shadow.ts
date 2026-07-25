@@ -169,6 +169,7 @@ import { buildTpSlGeometryRootCauseAuditReport } from "../lib/tp-sl-geometry-roo
 import { buildAdaptiveProfitPolicySynthesisReport, type AdaptiveProfitPolicyEvidenceEra } from "../lib/adaptive-profit-policy.js";
 import { buildCortexCollectionStatus } from "../lib/cortex-collection-status.js";
 import { buildCortexShadowDecisionAlphaReport } from "../lib/cortex-decision-alpha-report.js";
+import { buildCortexReadinessEndpointResponse } from "../lib/cortex-readiness-bindings.js";
 import {
   JsonKronosCounterfactualStore,
   buildKronosCounterfactualReport,
@@ -225,6 +226,13 @@ import {
   CE_UNIVERSE,
 } from "../lib/composite-estimator-edge.js";
 import {
+  getExitBrainShadowStore,
+  resolvedTradesFromShadowPositions,
+  runExitBrainShadowCycleGuarded,
+} from "../lib/exit-brain-shadow.js";
+import { getPositionPathRecorder, resolvedTradesFromRecordedPaths } from "../lib/position-path-recorder.js";
+import { DEFAULT_EXIT_BRAIN_PARAMS } from "../lib/exit-brain-policy.js";
+import {
   runResidualMomentumCycleGuarded,
   buildResidualMomentumReport,
   getResidualMomentumStore,
@@ -243,6 +251,41 @@ import {
   CE_INTERVAL as CEE_INTERVAL,
   CE_UNIVERSE as CEE_UNIVERSE,
 } from "../lib/compression-expansion-edge.js";
+import {
+  runFundingCarryCycleGuarded,
+  buildFundingCarryReport,
+  getFundingCarryStore,
+} from "../lib/funding-carry-edge.js";
+import {
+  runMetaLabelCycleGuarded,
+  buildMetaLabelReport,
+  getMetaLabelStore,
+  crowdingAlignFromSnapshot,
+  type MetaLabelFeatureSources,
+} from "../lib/meta-label-gate.js";
+import { getSymbolVolatilityCacheStore } from "../lib/directional-symbol-sizing.js";
+import {
+  runBtcLeadLagCycleGuarded,
+  buildBtcLeadLagReport,
+  getBtcLeadLagSnapStore,
+  BLS_INTERVAL,
+  BLS_CANDLE_FETCH_LIMIT,
+} from "../lib/btc-leadlag-snap-edge.js";
+import {
+  runLiqRecoilCycleGuarded,
+  buildLiqRecoilReport,
+  getLiqRecoilStore,
+  LQR_INTERVAL,
+  LQR_CANDLE_FETCH_LIMIT,
+} from "../lib/liq-recoil-edge.js";
+import { getGeopoliticalConflictFeedStore } from "../lib/geopolitical-conflict-feed.js";
+import {
+  runCrisisModeCycleGuarded,
+  buildCrisisModeReport,
+  getCrisisModeAuditLogStore,
+  btcShockFromCycleMeta,
+} from "../lib/crisis-mode-cycle.js";
+import { loadNvidiaChatConfig } from "../lib/nvidia-chat-client.js";
 import type { KronosClient } from "../lib/kronos.js";
 import { buildLaneVariantPboReport } from "../lib/walk-forward-validation.js";
 import { buildMicrostructureSnapshot } from "../lib/order-flow-microstructure.js";
@@ -331,13 +374,33 @@ import {
 } from "../lib/portfolio-trend-shadow.js";
 import { buildRegimeEngineReport, getRegimeEngineStore, isRegimeEngineEnabled } from "../lib/regime-engine-service.js";
 import { buildFreshVariantMatrixReport } from "../lib/fresh-variant-matrix-feed.js";
-import { buildCrowdingReport } from "../lib/derivatives-crowding.js";
+import { buildCrowdingReport, fetchCrowdingSnapshot } from "../lib/derivatives-crowding.js";
 import { buildRegimeGatedLaneReport, type RgObservation } from "../lib/regime-gated-lane-performance.js";
 import {
   getPriceImpactEfficiencyStore,
   runPriceImpactEfficiencyCycleGuarded,
   buildPriceImpactEfficiencyReport,
 } from "../lib/price-impact-efficiency.js";
+import type { FourBrainMetricsSummary } from "../lib/four-brain-metrics.js";
+import type { DirectionEntryOutcomeReport } from "../lib/direction-entry-outcome-store.js";
+
+// Fail-open shape for /api/shadow/four-brain's `health` field on any instance where the four-brain
+// metrics aggregator was never constructed (mode off, test harness, etc.) — every count is honestly 0,
+// never fabricated, and the shape always matches FourBrainMetricsSummary so the frontend never has to
+// special-case a missing field.
+const EMPTY_FOUR_BRAIN_HEALTH: FourBrainMetricsSummary = {
+  ticks: { attempted: 0, completed: 0, skippedSingleFlight: 0, gatherErrors: 0, exceptions: 0, journalErrors: 0, brainErrors: 0, invariantFailures: 0 },
+  decisions: { total: 0, duplicateDecisionIds: 0, unknownLanes: 0, duplicateIdentities: 0 },
+  coverage: { lastLaneCoverage: 0, maxLaneCoverage: 0, lastPositionCoverage: 0, maxPositionCoverage: 0 },
+  sourceQuality: {},
+  byCandidateStatus: {},
+  byBrainAction: {},
+  latencyMs: {
+    gather: { p50: null, p90: null, p99: null, samples: 0 },
+    inference: { p50: null, p90: null, p99: null, samples: 0 },
+    journal: { p50: null, p90: null, p99: null, samples: 0 },
+  },
+};
 
 const mixedLaneIdForDirection = (direction: string | null | undefined): string =>
   direction === "LONG"
@@ -378,6 +441,20 @@ export async function registerShadowRoutes(
     /** Lazy getter for the live-execution engine (created after this registration). Used READ-ONLY
      *  (sync getStatus, no I/O) to compute the order-reconciliation readiness gate. */
     liveEngineGetter?: () => { getStatus: () => unknown } | null;
+    /** Lazy getter for the four-brain shadow tick's metrics aggregator (created after this
+     *  registration, inside app.ts's `if (!isTest)` block, on instances that even construct it).
+     *  null on any instance where four-brain shadow mode has never enabled (fail-open — see the
+     *  /api/shadow/four-brain handler). READ-ONLY (aggregator.summary() is pure bookkeeping). */
+    fourBrainMetricsGetter?: () => FourBrainMetricsSummary | null;
+    /** Lazy getter for the bounded in-memory ring buffer of recent MARKET_SNAPSHOT / EXECUTIVE_DECISION
+     *  journal records (see four-brain-recent-decisions.ts). Deliberately NEVER reads the journal file —
+     *  see that module's doc comment for the incident this avoids repeating. */
+    fourBrainRecentDecisionsGetter?: () => Record<string, unknown>[] | null;
+    /** Lazy getter for the Direction/Entry Brain counterfactual outcome report (see
+     *  direction-entry-outcome-store.ts / direction-entry-reconciler.ts). null on any instance where the
+     *  reconciler's own 3-layer gate (directionEntryReconcilerActive) is not active — fail-open, exactly
+     *  like fourBrainMetricsGetter above; never a 500. */
+    directionEntryOutcomeReportGetter?: () => DirectionEntryOutcomeReport | null;
   } = {},
 ): Promise<void> {
   const overlayStore = new JsonExternalRotationOverlayStore(opts.externalOverlayDataDir ?? "data");
@@ -666,6 +743,14 @@ export async function registerShadowRoutes(
   // already tied to an owning decision. Read-only diagnostic; never writes anything, never influences
   // allocation (see cortex-decision-alpha-report.ts's own doc for why no live engine dependency is needed).
   app.get("/api/shadow/cortex-decision-alpha", async () => buildCortexShadowDecisionAlphaReport());
+
+  // CORTEX Readiness (2026-07-21 operator ask) — one transparent %-ready number + components/rate/ETA/
+  // status/quality/reinforcement for the /research card. Read-only over in-memory caches + the tiny
+  // brain-state json; the ONLY write is the bounded daily snapshot history (atomic, never throws).
+  // Cross-instance: when CORTEX_READINESS_PEER_URL is set (research → http://localhost:3102), the
+  // response also carries testnet's readiness best-effort — the card prefers it, since testnet is
+  // where promotion is actually being proven. See cortex-readiness.ts for the documented formula.
+  app.get("/api/shadow/cortex-readiness", async () => buildCortexReadinessEndpointResponse());
 
   app.get("/api/shadow/oos-validation-snapshot-status", async () => ({
     reportOnly: true,
@@ -1545,6 +1630,57 @@ export async function registerShadowRoutes(
     return psleInflight;
   });
 
+  // EXIT BRAIN shadow report — report-only. Aggregated policy-vs-actual counterfactual deltas
+  // PLUS the path-data coverage block (how many resolved trades even carry enough recorded ticks
+  // to score — the honest "do we need a dense path recorder first?" answer) + the exact params
+  // the transparent policy ran with. See exit-brain-policy.ts / exit-brain-shadow.ts.
+  app.get("/api/shadow/exit-brain", async () => {
+    return {
+      generatedAt: new Date().toISOString(),
+      params: DEFAULT_EXIT_BRAIN_PARAMS,
+      ...getExitBrainShadowStore().buildReport(),
+    };
+  });
+
+  // Four-Brain operator dashboard feed (2026-07-23) — report-only, health + recent decisions for the
+  // Market State / Direction / Entry / Exit shadow layer (four-brain-*.ts). Deliberately does NOT
+  // re-read the four-brain journal file: `health` reads the LIVE in-memory metrics aggregator
+  // (fourBrainMetricsGetter, threaded from app.ts exactly like liveEngineGetter above) and
+  // `recentDecisions` reads a bounded in-memory ring buffer fed at journal-append time
+  // (fourBrainRecentDecisionsGetter — see four-brain-recent-decisions.ts's own doc comment for the
+  // exact production incident, on this SAME journal-reading pattern, this avoids repeating). Fails
+  // open to an empty-but-valid shape (enabled:false) on any instance that never constructed these —
+  // e.g. this instance's four-brain shadow mode was never enabled, or this is a test harness — never
+  // a 500. Exit Brain's OWN measured performance lives at /api/shadow/exit-brain (reused, not
+  // duplicated here) since Direction/Entry Brain have no counterfactual measurement yet.
+  app.get("/api/shadow/four-brain", async () => {
+    const health = opts.fourBrainMetricsGetter?.() ?? null;
+    const recentDecisions = (opts.fourBrainRecentDecisionsGetter?.() ?? []).slice(0, 50);
+    return {
+      reportOnly: true,
+      generatedAt: new Date().toISOString(),
+      enabled: health !== null,
+      health: health ?? EMPTY_FOUR_BRAIN_HEALTH,
+      recentDecisions,
+    };
+  });
+
+  // Direction + Entry Brain counterfactual outcome report (2026-07-23) — report-only, two independent
+  // sections (Direction, Entry) never blended into one number; see direction-entry-outcome-store.ts's own
+  // doc for the full contract (tier split, effective-sample-size, INSUFFICIENT_DATA floor). Fails open to
+  // an empty-but-valid `enabled:false` shape on any instance where directionEntryReconcilerActive's own
+  // 3-layer gate is not active (e.g. FOUR_BRAIN_OUTCOME_MODE unset, 3103 live, or shadow mode itself off)
+  // — never a 500, mirrors /api/shadow/four-brain's own fail-open discipline exactly.
+  app.get("/api/shadow/direction-entry-outcomes", async () => {
+    const report = opts.directionEntryOutcomeReportGetter?.() ?? null;
+    return {
+      reportOnly: true,
+      generatedAt: new Date().toISOString(),
+      enabled: report !== null,
+      report,
+    };
+  });
+
   // Intraday momentum hunter (Sleeve 2) report — report-only measurement, nothing trades on it.
   app.get("/api/shadow/intraday-momentum-report", async () => {
     return { generatedAt: new Date().toISOString(), ...buildIntradayMomentumReport(getIntradayMomentumStore().all) };
@@ -1611,6 +1747,60 @@ export async function registerShadowRoutes(
   app.get("/api/shadow/compression-expansion-report", async () => {
     const ceeStore = getCompressionExpansionStore();
     return { generatedAt: new Date().toISOString(), ...buildCompressionExpansionReport(ceeStore.all, ceeStore.cycleMeta) };
+  });
+
+  // Funding-carry market-neutral pair report (2026-07-21) — report-only measurement, nothing
+  // trades on it and it has NO executor. Aggregates n/open/netAvgR/WR/PF plus the honest
+  // decomposition (avg funding captured vs avg divergence cost vs fees, all in R) and the
+  // break-even parameters the entry test ran with. See funding-carry-edge.ts.
+  app.get("/api/shadow/funding-carry", async () => {
+    const fcStore = getFundingCarryStore();
+    return { generatedAt: new Date().toISOString(), ...buildFundingCarryReport(fcStore.all, fcStore.cycleMeta) };
+  });
+
+  // Meta-label per-signal gate report (2026-07-22) — report-only shadow scorer; nothing reads the
+  // score on any admission/resolution/allocation/live path. Model status + transparent per-feature
+  // weights, feature coverage (% non-null), and the counterfactual cohort table: for each τ, what
+  // retention/netAvgR/PF a "score ≥ τ" gate WOULD have produced vs all signals. See meta-label-gate.ts.
+  app.get("/api/shadow/meta-label", async () => {
+    return { generatedAt: new Date().toISOString(), ...buildMetaLabelReport(getMetaLabelStore()) };
+  });
+
+  // BTC lead-lag residual snap report (2026-07-21) — report-only measurement, nothing trades on it
+  // and it has NO executor. n/open/netAvgR/WR/PF/edgeReady + shock stats (per-cycle liveness meta,
+  // deduped shock counts) + avg lag-to-convergence + the detection-latency handicap of riding the
+  // shared ~7min ticker (measured per entry, not hidden). See btc-leadlag-snap-edge.ts.
+  app.get("/api/shadow/btc-leadlag-snap", async () => {
+    const blsStore = getBtcLeadLagSnapStore();
+    return { generatedAt: new Date().toISOString(), ...buildBtcLeadLagReport(blsStore.all, blsStore.cycleMeta) };
+  });
+
+  // Liquidation-recoil EVENT lane report (2026-07-22) — report-only measurement, nothing trades on
+  // it and it has NO executor. Fade a STALLED liquidation cascade, gated on the OI-contraction +
+  // taker-imbalance forced-flow proxy (this repo has NO real liquidation feed — the report's
+  // signalSource field says so explicitly). n/open/netAvgR/WR/PF/edgeReady + by-direction split +
+  // per-cycle liveness meta (events detected, flow-gate rejections, no-flow-data abstentions).
+  // Distinct from /api/shadow/liquidation-recoil-xs-report (Tier-3 candle-shape RANKING module) and
+  // from the PWR candle lane — see liq-recoil-edge.ts's header for the differentiation.
+  app.get("/api/shadow/liq-recoil", async () => {
+    const lqrStore = getLiqRecoilStore();
+    return { generatedAt: new Date().toISOString(), ...buildLiqRecoilReport(lqrStore.all, lqrStore.cycleMeta) };
+  });
+
+  // Crisis-mode report (2026-07-22) — TESTNET/RESEARCH REPORT-ONLY. Current escalation score +
+  // reasoning, market-confirmation state (BTC lead-lag shock + RCS bearish-axis), active/inactive,
+  // recent audit-log entries (every active-state flip), the underlying conflict-event evidence, and
+  // every safety-gate flag's live status (cycleDisabled/controllerDisabled/isLiveInstance/
+  // actionEnabled/liveExecutionAllowed/canApplyActions) — fully transparent, no black-box number.
+  // Ships off by default (see crisis-mode-cycle.ts); this route is registered on every instance the
+  // same way every other shadow report is, but returns cycleDisabled:true with an empty status until
+  // an operator explicitly sets CRISIS_MODE_DISABLED=0 on that instance.
+  app.get("/api/shadow/crisis-mode", async () => {
+    return buildCrisisModeReport({
+      feedStore: getGeopoliticalConflictFeedStore(),
+      auditStore: getCrisisModeAuditLogStore(),
+      now: Date.now(),
+    });
   });
 
   // Probability of Backtest Overfitting (CSCV) across the CG variant-matrix lanes — the honest audit
@@ -2081,6 +2271,37 @@ export async function registerShadowRoutes(
             },
           }).catch(() => undefined);
         }
+        // EXIT BRAIN shadow counterfactual (2026-07-21): scores a transparent parametric HOLD/BANK
+        // exit policy against what each newly-resolved trade's ACTUAL exit achieved, walking the
+        // trade's RECORDED path (no lookahead, dedup exactly-once). Report-only, fire-and-forget,
+        // default-on, fail-open — it never touches admission/resolution/live behavior. Today's
+        // stores persist at most a 4-point path skeleton, so most trades will honestly classify
+        // INSUFFICIENT_PATH_DATA — the /api/shadow/exit-brain coverage block is the deliverable
+        // that tells us whether a dense path recorder must land first. See exit-brain-shadow.ts.
+        if (process.env.EXIT_BRAIN_SHADOW_DISABLED !== "1" && shadowEngine) {
+          const _ebEngine = shadowEngine;
+          void runExitBrainShadowCycleGuarded({
+            store: getExitBrainShadowStore(),
+            // 2026-07-22: DENSE recorded paths (position-path-recorder.ts — real per-tick R
+            // samples written by the live engine + single-symbol executors, a different trade
+            // universe from the shadow-position skeletons) are merged in FIRST and win any
+            // tradeId collision — real ticks always take priority over a 4-point skeleton.
+            // Fail-open: a recorder failure degrades to the skeleton-only reader, never breaks
+            // the cycle.
+            readResolvedTrades: () => {
+              const skeletons = resolvedTradesFromShadowPositions(_ebEngine.getAllPositions());
+              try {
+                const dense = resolvedTradesFromRecordedPaths(getPositionPathRecorder().listClosedPaths());
+                if (dense.length === 0) return skeletons;
+                const denseIds = new Set(dense.map((t) => t.tradeId));
+                return [...dense, ...skeletons.filter((t) => !denseIds.has(t.tradeId))];
+              } catch {
+                return skeletons;
+              }
+            },
+            now: Date.now(),
+          }).catch(() => undefined);
+        }
         // Residual cross-sectional momentum + leader-laggard catch-up (2026-07-10, Tier-3 audit
         // item A): beta-neutralized residual return ranking + cluster catch-up detection — see
         // residual-momentum-edge.ts. Report-only measurement, same discipline as every other lane;
@@ -2119,6 +2340,154 @@ export async function registerShadowRoutes(
             now: Date.now(),
             fetchCandles: async (symbol: string) => _cee.getCandles(symbol, CEE_INTERVAL, 200),
             client: _cee,
+          }).catch(() => undefined);
+        }
+        // FUNDING-CARRY MARKET-NEUTRAL PAIR (2026-07-21): LONG the low-funding leg, SHORT the
+        // high-funding leg of a SAME-cluster pair (correlation-clusters.ts — beta approximately
+        // cancels), entered only when the funding differential clears the 4-leg fee bill × safety
+        // within the target hold. Accrues funding at the ACTUAL observed rate each 8h settlement,
+        // measures the residual pair divergence honestly (it IS the risk / R denominator). Pure
+        // shadow measurement — report-only, fire-and-forget, env-gated, own store/cycle/report;
+        // does NOT pass through the allocator, paper book, live engine, or any strategy gate, and
+        // has NO executor. See funding-carry-edge.ts.
+        if (process.env.FUNDING_CARRY_DISABLED !== "1") {
+          const _fcc = opts.binanceClient;
+          void runFundingCarryCycleGuarded({
+            store: getFundingCarryStore(),
+            now: Date.now(),
+            // One existing-client call per symbol: current-period funding rate + mark price
+            // (same getFuturesPremiumIndex the moonshot lane already uses for mark prices).
+            fetchPremiumIndex: async (symbol: string) => {
+              const p = await _fcc.getFuturesPremiumIndex(symbol);
+              return { fundingRate: p.fundingRate, markPrice: p.markPrice };
+            },
+          }).catch(() => undefined);
+        }
+        // BTC LEAD-LAG RESIDUAL SNAP (2026-07-21): when BTC makes a sharp move (short-window
+        // return ≥ k × its OWN recent vol — self-normalizing), rank correlated alts by how far
+        // they still are from their beta-implied repricing and shadow-enter the top laggards in
+        // the shock direction. Pure shadow measurement — report-only, fire-and-forget, env-gated,
+        // own store/cycle/report; NO executor, never touches admission/allocation/live behavior.
+        // Spot candles via spotSymbolForCandles (1000x-multiplier contracts have no spot pair
+        // under the futures name; returns are ratios so the multiplier cancels — same convention
+        // as the cross-sectional call site below). See btc-leadlag-snap-edge.ts, incl. the honest
+        // ~7min-cadence detection-latency caveat recorded per entry.
+        if (process.env.BTC_LEADLAG_DISABLED !== "1") {
+          const _blc = opts.binanceClient;
+          void runBtcLeadLagCycleGuarded({
+            store: getBtcLeadLagSnapStore(),
+            now: Date.now(),
+            fetchCandles: async (symbol: string) =>
+              _blc.getCandles(spotSymbolForCandles(symbol), BLS_INTERVAL, BLS_CANDLE_FETCH_LIMIT),
+          }).catch(() => undefined);
+        }
+        // LIQUIDATION-RECOIL EVENT lane (2026-07-22): fade a STALLED liquidation cascade — a
+        // ≥ k×ATR forced leg whose extreme has held for M closed bars (exhaustion), confirmed by
+        // the OI-contraction + cascade-side taker-aggression proxy accrued in the lane's own
+        // bounded flow history (this repo has NO real liquidation feed; the 5m OI step from
+        // getFuturesFlow is the closest honest signal, and it must be SAMPLED every cycle because
+        // the spike decays before the stall confirms — see liq-recoil-edge.ts's header). Entry is
+        // AGAINST the cascade with a structural stop beyond the extreme, half-cascade retrace
+        // target, short max-hold MTM. Pure shadow measurement — report-only, fire-and-forget,
+        // env-gated, own store/cycle/report; NO executor, never touches admission/allocation/live
+        // behavior. Distinct from the PWR candle lane and the Tier-3 cross-sectional ranking
+        // module (both candle-shape-driven; this one is flow-driven and bidirectional).
+        if (process.env.LIQ_RECOIL_DISABLED !== "1") {
+          const _lqc = opts.binanceClient;
+          void runLiqRecoilCycleGuarded({
+            store: getLiqRecoilStore(),
+            now: Date.now(),
+            fetchCandles: async (symbol: string) => _lqc.getCandles(symbol, LQR_INTERVAL, LQR_CANDLE_FETCH_LIMIT),
+            crowdingClient: _lqc,
+          }).catch(() => undefined);
+        }
+        // META-LABEL PER-SIGNAL GATE (2026-07-22): López-de-Prado-style secondary classifier that
+        // scores EVERY new paper order (the signal stream) with p(win | features at signal time),
+        // labels it when the paper resolver closes it, and reports the counterfactual "score ≥ τ"
+        // cohort curve vs all signals. Differs from CORTEX by one axis: CORTEX weights LANES; this
+        // scores each SIGNAL. Pure shadow measurement — the sweep only READS the paper store and
+        // writes its own store; NOTHING reads the score on any admission/resolution/allocation/live
+        // path. Sweep (not call-site hooks) because paper orders arrive via 3+ admission paths and
+        // resolve inside resolvePaperOrders' batched loop — a report-only feature must not touch
+        // those. Feature sources are all existing caches/stores + admission-time provenance; the
+        // ONLY fetch is one crowding snapshot per NEW signal (bounded per cycle), same client call
+        // sibling lanes make per cycle. See meta-label-gate.ts.
+        if (process.env.META_LABEL_DISABLED !== "1") {
+          const _mlbc = opts.binanceClient;
+          const _mlPaperOrders = getPaperExecutionRouterStore().all;
+          // Lazy per-cycle memos: computed only when a NEW signal actually needs the feature (the
+          // typical cycle has zero new signals — these then cost nothing).
+          let _mlBookCells: Map<string, number | null> | null = null;
+          let _mlLaneHist: Map<string, number | null> | null = null;
+          const _mlSources: MetaLabelFeatureSources = {
+            atrPct: (symbol) => {
+              const v = getSymbolVolatilityCacheStore().get().atrPctBySymbol[symbol];
+              return typeof v === "number" && Number.isFinite(v) ? v : null;
+            },
+            edgeMem: (regime, direction) => {
+              const stat = getRegimeEdgeMemory().lookup(regime, direction);
+              return stat.n > 0 ? { avgNetR: stat.avgNetR, n: stat.n } : null;
+            },
+            crowdingAlign: async (symbol, direction) => {
+              const snap = await fetchCrowdingSnapshot(_mlbc, symbol, new Date().toISOString());
+              return crowdingAlignFromSnapshot(snap, direction);
+            },
+            bookEdgeNetAvgR: (laneId, symbol) => {
+              if (!_mlBookCells) {
+                _mlBookCells = new Map();
+                const psle = buildPerSymbolLaneBookEdge(_mlPaperOrders as unknown as PsleOrder[]);
+                for (const cell of psle.cells) _mlBookCells.set(`${cell.laneId} ${cell.symbol}`, cell.netAvgR);
+              }
+              return _mlBookCells.get(`${laneId} ${symbol}`) ?? null;
+            },
+            laneHistNetAvgR: (laneId) => {
+              if (!_mlLaneHist) {
+                _mlLaneHist = new Map();
+                const byLane = new Map<string, number[]>();
+                for (const o of _mlPaperOrders) {
+                  if (o.paperStatus !== "PAPER_CLOSED_WIN" && o.paperStatus !== "PAPER_CLOSED_LOSS") continue;
+                  if (typeof o.netR !== "number" || !Number.isFinite(o.netR)) continue;
+                  const list = byLane.get(o.selectedLaneId) ?? [];
+                  list.push(o.netR);
+                  byLane.set(o.selectedLaneId, list);
+                }
+                for (const [lane, nets] of byLane) {
+                  const recent = nets.slice(-200);
+                  _mlLaneHist.set(
+                    lane,
+                    recent.length >= 5 ? recent.reduce((a, b) => a + b, 0) / recent.length : null,
+                  );
+                }
+              }
+              return _mlLaneHist.get(laneId) ?? null;
+            },
+          };
+          void runMetaLabelCycleGuarded({
+            store: getMetaLabelStore(),
+            orders: _mlPaperOrders,
+            sources: _mlSources,
+            now: Date.now(),
+          }).catch(() => undefined);
+        }
+        // CRISIS MODE (2026-07-22, TESTNET/RESEARCH REPORT-ONLY): fetches GDELT conflict events,
+        // classifies escalation (quantitative-primary, LLM-ceilinged), and evaluates crisis mode
+        // against the BTC lead-lag shock (read-only from btc-leadlag-snap-edge.ts's OWN cycleMeta —
+        // see btcShockFromCycleMeta's freshness-windowed derivation, does NOT run BLS's cycle) and
+        // the RCS bearish-breadth axis score (same buildRegimeAxisTimeline read every RC/RCS/CE cycle
+        // above already uses). SHIPS OFF BY DEFAULT — CRISIS_MODE_DISABLED must be explicitly "0" on
+        // an instance before this does anything (see crisis-mode-cycle.ts's module header). Persists
+        // ONLY to its own audit-log store; applies NOTHING to any real allocation or exit binding —
+        // see crisis-mode-instance-guard.ts for the gate that would hard-block such an application on
+        // the live instance (3103) if one is ever built.
+        {
+          const _cmAxisScore = buildRegimeAxisTimeline(getRegimeEngineStore().snapshots).current?.score ?? null;
+          const _cmBtcShock = btcShockFromCycleMeta(getBtcLeadLagSnapStore().cycleMeta, Date.now());
+          void runCrisisModeCycleGuarded({
+            feedStore: getGeopoliticalConflictFeedStore(),
+            auditStore: getCrisisModeAuditLogStore(),
+            now: Date.now(),
+            marketShockSignals: { btcShock: _cmBtcShock, regimeAxisScore: _cmAxisScore },
+            nvidiaConfig: loadNvidiaChatConfig(process.env),
           }).catch(() => undefined);
         }
         // NEW-COIN RADAR (report-only): discovery cycle is self-throttled to 12h via the store's
