@@ -1892,6 +1892,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           `direction=${rehydrated.directionPendingRestored}/${rehydrated.directionEligibleUnprocessed} ` +
           `entry=${rehydrated.entryPendingRestored}/${rehydrated.entryEligibleUnprocessed} ` +
           `evicted=${rehydrated.directionEvictedDuringRehydrate + rehydrated.entryEvictedDuringRehydrate} ` +
+          `entryIdsMigrated=${rehydrated.entryDecisionIdsMigrated} ` +
           `duplicates=${rehydrated.duplicateDirectionRowsSkipped + rehydrated.duplicateEntryRowsSkipped} ` +
           `skippedProcessed=${rehydrated.directionSkippedProcessed + rehydrated.entrySkippedProcessed} ` +
           `badLines=${rehydrated.badLines}`,

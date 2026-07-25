@@ -53,6 +53,7 @@
  * Pure + independently unit-testable: push/evict/dedup/order/extraction have no dependency on the journal
  * file, the shadow tick, or any live state.
  */
+import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 
 export type FourBrainOutcomeHorizon = "SCALP" | "INTRADAY" | "SWING";
@@ -343,6 +344,12 @@ export interface FourBrainOutcomeLedgerRehydrateResult {
   entrySkippedProcessed: number;
   duplicateDirectionRowsSkipped: number;
   duplicateEntryRowsSkipped: number;
+  entryDecisionIdsMigrated: number;
+}
+
+function rehydratedEntryDecisionId(entry: PendingEntryRow, fingerprint: string): string {
+  const digest = createHash("sha256").update(fingerprint).digest("hex");
+  return `${entry.decisionId}:journal:${digest}`;
 }
 
 /**
@@ -374,6 +381,7 @@ export function rehydrateFourBrainOutcomeLedgerFromJournals(args: {
     entrySkippedProcessed: 0,
     duplicateDirectionRowsSkipped: 0,
     duplicateEntryRowsSkipped: 0,
+    entryDecisionIdsMigrated: 0,
   };
   const seenDirectionIds = new Set<string>();
   const seenEntryRows = new Set<string>();
@@ -417,18 +425,18 @@ export function rehydrateFourBrainOutcomeLedgerFromJournals(args: {
 
       const entry = extractPendingEntryRow(record);
       if (entry) {
-        if (args.hasProcessedEntry(entry.decisionId)) {
+        const fingerprint = JSON.stringify(entry);
+        const effectiveDecisionId = rehydratedEntryDecisionId(entry, fingerprint);
+        if (args.hasProcessedEntry(entry.decisionId) || args.hasProcessedEntry(effectiveDecisionId)) {
           result.entrySkippedProcessed += 1;
+        } else if (seenEntryRows.has(fingerprint)) {
+          result.duplicateEntryRowsSkipped += 1;
         } else {
-          const fingerprint = JSON.stringify(entry);
-          if (seenEntryRows.has(fingerprint)) {
-            result.duplicateEntryRowsSkipped += 1;
-          } else {
-            seenEntryRows.add(fingerprint);
-            result.entryEligibleUnprocessed += 1;
-            args.ledger.pushEntry(entry);
-            result.entryRehydrated += 1;
-          }
+          seenEntryRows.add(fingerprint);
+          result.entryEligibleUnprocessed += 1;
+          result.entryDecisionIdsMigrated += 1;
+          args.ledger.pushEntry({ ...entry, decisionId: effectiveDecisionId });
+          result.entryRehydrated += 1;
         }
       }
     }

@@ -175,6 +175,67 @@ describe("FourBrainOutcomeLedger", () => {
     }
   });
 
+  it("migrates legacy colliding Entry ids deterministically and restores each candidate exactly once", () => {
+    const dataDir = mkdtempSync(join(tmpdir(), "four-brain-rehydrate-entry-collision-"));
+    try {
+      const journal = join(dataDir, "four-brain-decision-journal.jsonl");
+      const sharedEntry = {
+        decisionId: "legacy-collision",
+        asOfMs: 1000,
+        side: "LONG",
+        action: "ENTER_NOW",
+        targetEntry: 101,
+        initialStopPrice: 96,
+        expectedNetR: 0.18,
+      };
+      writeFileSync(
+        journal,
+        [
+          executiveRecord({
+            decisionId: "record-a",
+            asOfMs: 1000,
+            laneId: "CG_WIDE_FAST_LONG",
+            symbolOrBasketId: "BTCUSDT",
+            entry: sharedEntry,
+          }),
+          executiveRecord({
+            decisionId: "record-b",
+            asOfMs: 1000,
+            laneId: "CG_WIDE_LONG_RUNNER",
+            symbolOrBasketId: "ETHUSDT",
+            entry: sharedEntry,
+          }),
+        ].map((row) => JSON.stringify(row)).join("\n"),
+        "utf-8",
+      );
+      const processed = new Set<string>();
+      const firstLedger = new FourBrainOutcomeLedger();
+      const first = rehydrateFourBrainOutcomeLedgerFromJournals({
+        ledger: firstLedger,
+        journalFiles: [journal],
+        hasProcessedDirection: () => false,
+        hasProcessedEntry: (id) => processed.has(id),
+      });
+      const restored = firstLedger.getPendingEntryRows();
+      expect(first.entryDecisionIdsMigrated).toBe(2);
+      expect(restored).toHaveLength(2);
+      expect(new Set(restored.map((row) => row.decisionId)).size).toBe(2);
+      expect(restored.every((row) => row.decisionId.startsWith("legacy-collision:journal:"))).toBe(true);
+
+      processed.add(restored[0]!.decisionId);
+      const restartedLedger = new FourBrainOutcomeLedger();
+      rehydrateFourBrainOutcomeLedgerFromJournals({
+        ledger: restartedLedger,
+        journalFiles: [journal],
+        hasProcessedDirection: () => false,
+        hasProcessedEntry: (id) => processed.has(id),
+      });
+      expect(restartedLedger.getPendingEntryRows().map((row) => row.decisionId)).toEqual([restored[1]!.decisionId]);
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
   it("pushes and returns Direction rows oldest-first (basic push/get correctness)", () => {
     const ledger = new FourBrainOutcomeLedger({ directionCapacity: 10, entryCapacity: 10 });
     ledger.pushDirection(directionRow(1));
