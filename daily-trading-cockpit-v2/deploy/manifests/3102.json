@@ -1,11 +1,11 @@
 {
   "schemaVersion": 1,
   "instanceId": "3102",
-  "generatedAt": "2026-07-25T03:57:17.055Z",
-  "gitSha": "e630a18770c8cf7836fa0df22fb8c5ddd31c9628",
+  "generatedAt": "2026-07-25T04:17:41.341Z",
+  "gitSha": "34926decf37eef94de1c02c271a1023236608e59",
   "gitDirty": false,
   "fileCount": 335,
-  "rootDigestSha256": "372f7a96648d34be91aa6a07f04017dad475533445721fde3aa8dff53cae75bb",
+  "rootDigestSha256": "373ab10d292ec943fd130a11b8999670b82b7dfcafb9b5275db12e3bc91e0650",
   "checksums": [
     {
       "path": "apps/api/src/app.ts",
@@ -399,8 +399,8 @@
     },
     {
       "path": "apps/api/src/lib/direction-entry-reconciler.ts",
-      "bytes": 22441,
-      "sha256": "a2896537e39efbbcdce66250bafff06beff2c6797e55ff0d2c12b4a01f261f29"
+      "bytes": 24413,
+      "sha256": "65c34f47b8d2c7985d5fd034686f2e5985f4b4eab30e9b1e509985f59500773f"
     },
     {
       "path": "apps/api/src/lib/directional-symbol-sizing.ts",
