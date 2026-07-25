@@ -1865,7 +1865,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     // at journal-append time below (see wrapFourBrainJournalAppendForRecentDecisions) — the operator
     // dashboard's /api/shadow/four-brain route reads this, NEVER the journal file, on every request.
     const fourBrainRecentDecisions = new FourBrainRecentDecisionsBuffer({ capacity: 100 });
-    // Bounded FIFO ledger (Direction cap 500 / Entry cap 2000) of pending DIRECTION + ENTRY decisions,
+    // Bounded FIFO ledger (Direction cap 2000 / Entry cap 10000) of pending DIRECTION + ENTRY decisions,
     // fed at journal-append time below (see wrapFourBrainJournalAppendForOutcomeLedger) — the FOUNDATION
     // for a follow-up Direction/Entry Brain counterfactual outcome-resolution phase (not built here).
     // Deliberately separate from fourBrainRecentDecisions above: that 100-slot dashboard ring is far too

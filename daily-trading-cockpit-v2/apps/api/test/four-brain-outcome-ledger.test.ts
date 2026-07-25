@@ -211,12 +211,12 @@ describe("FourBrainOutcomeLedger", () => {
     expect(ledger.droppedPendingBeforeResolution.direction).toBe(0);
   });
 
-  it("defaults to Direction capacity 500 / Entry capacity 2000 and tolerates bad capacity options", () => {
+  it("defaults to Direction capacity 2000 / Entry capacity 10000 and tolerates bad capacity options", () => {
     const ledger = new FourBrainOutcomeLedger({ directionCapacity: -1, entryCapacity: Number.NaN });
-    for (let i = 0; i < 501; i++) ledger.pushDirection(directionRow(i));
-    for (let i = 0; i < 2001; i++) ledger.pushEntry(entryRow(i));
-    expect(ledger.directionSize).toBe(500);
-    expect(ledger.entrySize).toBe(2000);
+    for (let i = 0; i < 2001; i++) ledger.pushDirection(directionRow(i));
+    for (let i = 0; i < 10_001; i++) ledger.pushEntry(entryRow(i));
+    expect(ledger.directionSize).toBe(2000);
+    expect(ledger.entrySize).toBe(10_000);
   });
 
   it("getPendingDirectionRows/getPendingEntryRows return fresh arrays — callers cannot mutate internal state", () => {

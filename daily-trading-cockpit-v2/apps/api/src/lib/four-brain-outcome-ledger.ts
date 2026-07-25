@@ -33,8 +33,8 @@
  * ~7x over distinct decisionIds, flooding this FIFO ledger and evicting genuinely-distinct pending rows
  * (via droppedDirection above) long before they could reach their own resolution horizon — permanently
  * freezing Direction's "evaluated" counter. pushDirection() now dedupes by decisionId via a bounded FIFO
- * "seen" set (seenDirectionIds, capacity directionSeenCapacity, default 4000 — sized well above this
- * ledger's own 500-row directionCapacity, mirroring direction-entry-outcome-store.ts's own
+ * "seen" set (seenDirectionIds, capacity directionSeenCapacity, default 8000 — sized well above this
+ * ledger's own 2000-row directionCapacity, mirroring direction-entry-outcome-store.ts's own
  * processedDecisionIds idiom exactly) so that for any given Direction decisionId, at most one row is ever
  * admitted to directionRows, for the lifetime of that id's presence in the seen set — regardless of how
  * many EXECUTIVE_DECISION records reference it in one tick or across ticks, and regardless of whether an
@@ -90,20 +90,20 @@ export interface PendingEntryRow {
 }
 
 export interface FourBrainOutcomeLedgerOptions {
-  /** Max Direction rows retained. Oldest is evicted (FIFO) once exceeded. Defaults to 500. */
+  /** Max Direction rows retained. Oldest is evicted (FIFO) once exceeded. Defaults to 2000. */
   directionCapacity?: number;
-  /** Max Entry rows retained. Oldest is evicted (FIFO) once exceeded. Defaults to 2000. */
+  /** Max Entry rows retained. Oldest is evicted (FIFO) once exceeded. Defaults to 10000. */
   entryCapacity?: number;
   /** Max Direction decisionIds remembered for dedup (FIFO — oldest id forgotten once exceeded). Defaults
-   *  to 4000. Sized well above directionCapacity so a duplicate can never slip through within (or across)
+   *  to 8000. Sized well above directionCapacity so a duplicate can never slip through within (or across)
    *  the handful of ticks it takes for legitimately-new decisionIds to displace it — see the module doc's
    *  DIRECTION DEDUP section. */
   directionSeenCapacity?: number;
 }
 
-const DEFAULT_DIRECTION_CAPACITY = 500;
-const DEFAULT_ENTRY_CAPACITY = 2000;
-const DEFAULT_DIRECTION_SEEN_CAPACITY = 4000;
+const DEFAULT_DIRECTION_CAPACITY = 2000;
+const DEFAULT_ENTRY_CAPACITY = 10_000;
+const DEFAULT_DIRECTION_SEEN_CAPACITY = 8000;
 
 function resolveCapacity(cap: number | undefined, fallback: number): number {
   return Number.isFinite(cap) && (cap as number) > 0 ? Math.floor(cap as number) : fallback;
