@@ -1,16 +1,16 @@
 {
   "schemaVersion": 1,
   "instanceId": "3101",
-  "generatedAt": "2026-07-25T03:22:03.790Z",
-  "gitSha": "537cc8d88b3a108570d79d715db77b2d2e8b0f50",
+  "generatedAt": "2026-07-25T03:42:22.642Z",
+  "gitSha": "5c2526215e31fc5e6d9d88aac8879b95b3bf3ff8",
   "gitDirty": false,
   "fileCount": 335,
-  "rootDigestSha256": "ccb6759b804e4606e721572131e98a6052b375491cac85085aa59d3ed49647ac",
+  "rootDigestSha256": "e342cd23b2c194453a4bf9a3668be5cc0a524c5d33bd49c6a0546db7fc35fe4d",
   "checksums": [
     {
       "path": "apps/api/src/app.ts",
-      "bytes": 131551,
-      "sha256": "127bb02032d0a57ddf75f015d7ce206bf8cfaded998779c4bead2405b8fd9105"
+      "bytes": 136057,
+      "sha256": "b23378e2794d3a3f357446dbefd16d4a2a296b89b0ef9a3480a6531c025905e4"
     },
     {
       "path": "apps/api/src/experience-engine/experience-engine.ts",
@@ -269,8 +269,8 @@
     },
     {
       "path": "apps/api/src/lib/cortex-instance-diagnosis.ts",
-      "bytes": 2181,
-      "sha256": "aa9cf9296c774194af5decdfe3cd556609d215eff55a11c01ae7d2e07a6613e1"
+      "bytes": 2856,
+      "sha256": "e11fa970e500f1475dcbfdb37e5a82b62948b4a4d49c580e0e878e8c8178e4bd"
     },
     {
       "path": "apps/api/src/lib/cortex-journal-reader.ts",
@@ -394,8 +394,8 @@
     },
     {
       "path": "apps/api/src/lib/direction-entry-outcome-store.ts",
-      "bytes": 50354,
-      "sha256": "eabbfa571d25a14eb63face1102ec7694b5ce6e5d27e04d0c3667a92dbc9e0f5"
+      "bytes": 50432,
+      "sha256": "54e771840f6a45de5ae36da84b3a6be6fbc5c516bc79402a2f17ef6b80703643"
     },
     {
       "path": "apps/api/src/lib/direction-entry-reconciler.ts",
@@ -409,8 +409,8 @@
     },
     {
       "path": "apps/api/src/lib/entry-brain-tier1-realized-resolver.ts",
-      "bytes": 16877,
-      "sha256": "3f9afe83a5fab96aea47544ca32ec6580883117c612f9539768cdb5db5c91848"
+      "bytes": 18046,
+      "sha256": "898f71c5b7f1e2d56cb5cd69ef549bf9aea3d9083b23391564c4963ab7e12c00"
     },
     {
       "path": "apps/api/src/lib/entry-brain-tier2-simulated-resolver.ts",
@@ -564,8 +564,8 @@
     },
     {
       "path": "apps/api/src/lib/four-brain-outcome-ledger.ts",
-      "bytes": 20761,
-      "sha256": "613c6708e807ff140e66db0777b0883e114478bbf1597bdfe2efa3eae71d6783"
+      "bytes": 21784,
+      "sha256": "83dc76a9f522d011f92051b0c75b5989d9b267ccaf397650a15471c6e0dc69e0"
     },
     {
       "path": "apps/api/src/lib/four-brain-recent-decisions.ts",
