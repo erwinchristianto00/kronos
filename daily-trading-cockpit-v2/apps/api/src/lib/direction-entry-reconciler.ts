@@ -102,6 +102,7 @@ export const ENTRY_TIER2_ELIGIBLE_AFTER_MS = ENTRY_TIER2_HORIZON_MS + ENTRY_TIER
  *  exit-brain-shadow.ts's DEFAULT_MAX_TRADES_PER_CYCLE idiom. */
 export const DEFAULT_MAX_DIRECTION_PER_CYCLE = 500;
 export const DEFAULT_MAX_ENTRY_TIER2_ATTEMPTS_PER_CYCLE = 200;
+export const DEFAULT_ENTRY_TIER2_FETCH_CONCURRENCY = 4;
 
 export interface OutcomeLedgerLike {
   getPendingDirectionRows(): PendingDirectionRow[];
@@ -125,6 +126,7 @@ export interface DirectionEntryReconcilerDeps {
   now?: () => number;
   maxDirectionPerCycle?: number;
   maxEntryTier2AttemptsPerCycle?: number;
+  entryTier2FetchConcurrency?: number;
 }
 
 export interface DirectionEntryReconcilerResult {
@@ -135,6 +137,35 @@ export interface DirectionEntryReconcilerResult {
   entrySkippedNotDue: number;
   tier1Diagnostics: EntryBrainTier1Diagnostics | null;
   error: string | null;
+}
+
+async function prefetchEntryTier2Candles(args: {
+  requests: Array<{ cacheKey: string; symbolOrBasketId: string; sinceMs: number; decisionId: string }>;
+  cache: Map<string, PathCandle[] | null>;
+  fetch: (symbolOrBasketId: string, sinceMs: number) => Promise<PathCandle[] | null>;
+  errors: string[];
+  concurrency: number;
+}): Promise<void> {
+  let cursor = 0;
+  const worker = async (): Promise<void> => {
+    while (cursor < args.requests.length) {
+      const request = args.requests[cursor++]!;
+      try {
+        const candles = await args.fetch(request.symbolOrBasketId, request.sinceMs);
+        args.cache.set(request.cacheKey, candles ?? null);
+      } catch (err) {
+        args.errors.push(
+          `entry-tier2-candles:${request.decisionId}:${err instanceof Error ? err.message : String(err)}`,
+        );
+        args.cache.set(request.cacheKey, null);
+      }
+    }
+  };
+  const workerCount = Math.min(
+    args.requests.length,
+    Math.max(1, Math.floor(args.concurrency)),
+  );
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
 }
 
 /**
@@ -150,6 +181,8 @@ export async function runDirectionEntryReconciliationCycle(
   const nowMs = deps.now?.() ?? Date.now();
   const maxDirection = deps.maxDirectionPerCycle ?? DEFAULT_MAX_DIRECTION_PER_CYCLE;
   const maxEntryTier2 = deps.maxEntryTier2AttemptsPerCycle ?? DEFAULT_MAX_ENTRY_TIER2_ATTEMPTS_PER_CYCLE;
+  const entryTier2FetchConcurrency =
+    deps.entryTier2FetchConcurrency ?? DEFAULT_ENTRY_TIER2_FETCH_CONCURRENCY;
   const errors: string[] = [];
   let directionProcessed = 0;
   let entryProcessed = 0;
@@ -248,6 +281,33 @@ export async function runDirectionEntryReconciliationCycle(
     let entryMissingCount = 0;
     let tier2Attempts = 0;
     const tier2CandleCache = new Map<string, PathCandle[] | null>();
+    const tier2PrefetchRequests = new Map<
+      string,
+      { cacheKey: string; symbolOrBasketId: string; sinceMs: number; decisionId: string }
+    >();
+    let plannedTier2Attempts = 0;
+    for (const row of pendingEntry) {
+      if (tier1ByDecisionId.get(row.decisionId)?.status === "RESOLVED") continue;
+      if (nowMs < row.asOfMs + ENTRY_TIER2_ELIGIBLE_AFTER_MS || !row.symbolOrBasketId) continue;
+      if (plannedTier2Attempts >= maxEntryTier2) break;
+      plannedTier2Attempts += 1;
+      const cacheKey = `${row.symbolOrBasketId}:${row.asOfMs}`;
+      if (!tier2PrefetchRequests.has(cacheKey)) {
+        tier2PrefetchRequests.set(cacheKey, {
+          cacheKey,
+          symbolOrBasketId: row.symbolOrBasketId,
+          sinceMs: row.asOfMs,
+          decisionId: row.decisionId,
+        });
+      }
+    }
+    await prefetchEntryTier2Candles({
+      requests: [...tier2PrefetchRequests.values()],
+      cache: tier2CandleCache,
+      fetch: deps.fetchEntryTier2Candles,
+      errors,
+      concurrency: entryTier2FetchConcurrency,
+    });
 
     for (const row of pendingEntry) {
       const t1 = tier1ByDecisionId.get(row.decisionId);
@@ -319,16 +379,7 @@ export async function runDirectionEntryReconciliationCycle(
       tier2Attempts += 1;
 
       const cacheKey = `${row.symbolOrBasketId}:${row.asOfMs}`;
-      let candles = tier2CandleCache.get(cacheKey);
-      if (candles === undefined) {
-        try {
-          candles = await deps.fetchEntryTier2Candles(row.symbolOrBasketId, row.asOfMs);
-        } catch (err) {
-          errors.push(`entry-tier2-candles:${row.decisionId}:${err instanceof Error ? err.message : String(err)}`);
-          candles = null;
-        }
-        tier2CandleCache.set(cacheKey, candles ?? null);
-      }
+      const candles = tier2CandleCache.get(cacheKey) ?? null;
 
       let tier2Result: ReturnType<typeof resolveEntryTier2Row> = null;
       if (candles && candles.length > 0) {

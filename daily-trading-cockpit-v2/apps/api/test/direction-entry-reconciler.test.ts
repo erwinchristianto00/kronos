@@ -332,6 +332,45 @@ describe("runDirectionEntryReconciliationCycle — Tier 1 vs Tier 2 routing (nev
     expect(store.getState().entry.resolvedRealMatchCount).toBe(1);
     expect(store.getState().entry.resolvedSimulatedCount).toBe(1);
   });
+
+  it("prefetches unique Tier-2 candle keys with bounded concurrency while preserving the attempt cap", async () => {
+    const rows = Array.from({ length: 12 }, (_, index): PendingEntryRow => ({
+      decisionId: `entry-prefetch-${index}`,
+      asOfMs: index,
+      symbolOrBasketId: `SYM${index}USDT`,
+      laneId: "CG_WIDE_FAST_LONG",
+      side: "LONG",
+      action: "ENTER_NOW",
+      targetEntry: 100,
+      initialStopPrice: 95,
+      expectedNetR: 0.1,
+    }));
+    let active = 0;
+    let peakActive = 0;
+    let calls = 0;
+    const result = await runDirectionEntryReconciliationCycle(
+      baseDeps({
+        ledger: fakeLedger({ entry: rows }),
+        store: new DirectionEntryOutcomeStore(tmp()),
+        now: () => 24 * HOUR_MS,
+        maxEntryTier2AttemptsPerCycle: 10,
+        entryTier2FetchConcurrency: 3,
+        fetchEntryTier2Candles: async (_symbol, sinceMs) => {
+          calls += 1;
+          active += 1;
+          peakActive = Math.max(peakActive, active);
+          await new Promise((resolve) => setTimeout(resolve, 5));
+          active -= 1;
+          return flatCandles(sinceMs, 40, 100) as PathCandle[];
+        },
+      }),
+    );
+    expect(calls).toBe(10);
+    expect(peakActive).toBeGreaterThan(1);
+    expect(peakActive).toBeLessThanOrEqual(3);
+    expect(result.entryProcessed).toBe(10);
+    expect(result.entrySkippedNotDue).toBe(0);
+  });
 });
 
 describe("runDirectionEntryReconciliationCycle — cycleMeta reflects a real error, never silently frozen", () => {
