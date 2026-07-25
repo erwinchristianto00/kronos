@@ -13,7 +13,7 @@ const INCLUDED_ROOTS = [
   "package.json",
   "package-lock.json",
 ];
-const EXCLUDED_PARTS = new Set(["manifests", "node_modules", "dist", "data", ".git"]);
+const EXCLUDED_PARTS = new Set(["manifests", "backups", "node_modules", "dist", "data", ".git"]);
 
 function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
@@ -27,6 +27,7 @@ function walk(root, target, output) {
     return;
   }
   for (const name of readdirSync(target).sort()) {
+    if (name === ".DS_Store" || name.startsWith("._") || name.includes(".bak")) continue;
     if (EXCLUDED_PARTS.has(name)) continue;
     walk(root, resolve(target, name), output);
   }
@@ -46,8 +47,9 @@ export function buildInstanceManifest({ instanceId, rootDir, generatedAt = new D
   let gitSha = null;
   let gitDirty = null;
   try {
-    gitSha = execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf-8" }).trim();
-    gitDirty = execFileSync("git", ["status", "--porcelain"], { cwd: root, encoding: "utf-8" }).trim().length > 0;
+    const gitOpts = { cwd: root, encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] };
+    gitSha = execFileSync("git", ["rev-parse", "HEAD"], gitOpts).trim();
+    gitDirty = execFileSync("git", ["status", "--porcelain"], gitOpts).trim().length > 0;
   } catch {
     // A source archive may not contain .git; checksums remain authoritative.
   }

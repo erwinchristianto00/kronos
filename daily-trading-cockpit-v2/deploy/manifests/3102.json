@@ -1,16 +1,66 @@
 {
   "schemaVersion": 1,
   "instanceId": "3102",
-  "generatedAt": "2026-07-25T04:17:41.341Z",
-  "gitSha": "34926decf37eef94de1c02c271a1023236608e59",
-  "gitDirty": false,
-  "fileCount": 335,
-  "rootDigestSha256": "373ab10d292ec943fd130a11b8999670b82b7dfcafb9b5275db12e3bc91e0650",
+  "generatedAt": "2026-07-25T04:39:19.411Z",
+  "gitSha": null,
+  "gitDirty": null,
+  "fileCount": 349,
+  "rootDigestSha256": "6cf7029a7b150706f9059a53433b509fa965e3cec749ad3456f930be844c8030",
   "checksums": [
     {
       "path": "apps/api/src/app.ts",
       "bytes": 136130,
       "sha256": "21f03876474d239b7a74a442c7e343c5ee4b11944000bad06b12f5bfff2534b7"
+    },
+    {
+      "path": "apps/api/src/audit-base-execution.mjs",
+      "bytes": 13464,
+      "sha256": "1b54d6a408f1548413ee1abcc97693dbc0785731e54becd9b6f9fbf24755d2a1"
+    },
+    {
+      "path": "apps/api/src/audit-fingerprint-v0-overlap.mjs",
+      "bytes": 13942,
+      "sha256": "b80f41664097fb518baf75c8fe57be69ea213ada84014fcb34964db70da3692e"
+    },
+    {
+      "path": "apps/api/src/audit-fingerprint-v0-robustness.mjs",
+      "bytes": 21624,
+      "sha256": "c45144bdc75fd8244b8992b05c0a39b1cf9948f36ea0432f9fe1243e427245b1"
+    },
+    {
+      "path": "apps/api/src/audit-indicator-utility.mjs",
+      "bytes": 13312,
+      "sha256": "8c735a9840c3261f880babdf7dd06a53acabb54b30a217ab6aa286164019b8df"
+    },
+    {
+      "path": "apps/api/src/audit-kronos-counterfactual.mjs",
+      "bytes": 13800,
+      "sha256": "96a266975470c0da29def9201c6905d2618520bd78a6266663355957f0c0d272"
+    },
+    {
+      "path": "apps/api/src/audit-kronos-effectiveness.mjs",
+      "bytes": 16582,
+      "sha256": "c75e9047d5dfbac4fbb90d7a21f6a382ce4e0faf6271cf0c9bc42947c67617e2"
+    },
+    {
+      "path": "apps/api/src/audit-top-contributor-fingerprint.mjs",
+      "bytes": 16263,
+      "sha256": "0f12ba6fadbe3dd5f0aa2e186fe02b64dfa1bcc1bbbc00c2a8876b2912de22c4"
+    },
+    {
+      "path": "apps/api/src/cgwide-exit-search.ts",
+      "bytes": 8124,
+      "sha256": "62e8190a8c72359b295b60223ba50c50210e7f3179b2b4399b2b1c16bed30326"
+    },
+    {
+      "path": "apps/api/src/cgwide-reseed.ts",
+      "bytes": 5947,
+      "sha256": "22b662f4f826473031a101661c3cbd02c6f22334ae57dcac2b5d235d3b7cfb76"
+    },
+    {
+      "path": "apps/api/src/cgwide-short-search.ts",
+      "bytes": 6568,
+      "sha256": "e7574c9d9a7138d37ddd7f1298af016825365e12e2aef00a67c33c564afa8eec"
     },
     {
       "path": "apps/api/src/experience-engine/experience-engine.ts",
@@ -43,9 +93,19 @@
       "sha256": "07b6748f002af1e36ba344af96df6a601e27ddd9659fc96f1daec0db318fdf4a"
     },
     {
+      "path": "apps/api/src/honest-reresolve.ts",
+      "bytes": 7302,
+      "sha256": "72e03cff77939009157461316daaf5db4e39ebf1804d70f895cb9ab0c70b5104"
+    },
+    {
       "path": "apps/api/src/index.ts",
       "bytes": 26,
       "sha256": "55b3b498220f015044d89c4125c103df55f5bf23eae755637252698e63479fff"
+    },
+    {
+      "path": "apps/api/src/lane-seed.ts",
+      "bytes": 6697,
+      "sha256": "1a35e2686ea83a7ca50bfa76f8045f2d21bd384e3a13a0bea6ed345cb8da9dcb"
     },
     {
       "path": "apps/api/src/lib/accelerated-evidence-candidate-funnel-log.ts",
@@ -218,11 +278,6 @@
       "sha256": "9690f34ea45445acaa7acbdbdf09c22e54168b3c5fb2ccd26c85ddbd80db9984"
     },
     {
-      "path": "apps/api/src/lib/copy-to-live-security.ts",
-      "bytes": 7416,
-      "sha256": "458b0cb645d0a54d29b277883236b84337aeb51499190e5d24e1a181add248fd"
-    },
-    {
       "path": "apps/api/src/lib/core-scan-auto-refresh.ts",
       "bytes": 3542,
       "sha256": "84b3c5f06f048329ca317511a8d7c1e35945e0fb025158ccd13f61908e97246f"
@@ -294,8 +349,8 @@
     },
     {
       "path": "apps/api/src/lib/cortex-readiness-bindings.ts",
-      "bytes": 11606,
-      "sha256": "b4b8f32e0c1d214e46de62c40f307f53f3145530c2a4cb7abf5b3695f3b3e663"
+      "bytes": 11203,
+      "sha256": "420cec56954e5ba017f45d7ab9c6bdfc2d4821b4853bd28ac7eb56bc24f75fb2"
     },
     {
       "path": "apps/api/src/lib/cortex-readiness.ts",
@@ -714,8 +769,8 @@
     },
     {
       "path": "apps/api/src/lib/live-execution-engine.ts",
-      "bytes": 319113,
-      "sha256": "5cd8c09662255621093138ebe0e25e95266f79f342f8751de0b82f8ab4d3deb3"
+      "bytes": 313757,
+      "sha256": "1baf2fd0b83e2e72ef9a47a7a807954d3ff53ae9a4916e226b834dbb48b2b431"
     },
     {
       "path": "apps/api/src/lib/live-executor-wiring.ts",
@@ -826,6 +881,11 @@
       "path": "apps/api/src/lib/paper-execution-router.ts",
       "bytes": 271154,
       "sha256": "103533544e41ef016e476e82c9950cd732d9b0cb529008032eb30506be4d409c"
+    },
+    {
+      "path": "apps/api/src/lib/paper-execution-router.ts.forward-causal-predeploy",
+      "bytes": 267168,
+      "sha256": "9f3ecbf966bf23d5439bfd6f141cc141305cceef589fb8f57d4366fc25a5e8bc"
     },
     {
       "path": "apps/api/src/lib/paper-opportunity-allocator.ts",
@@ -1178,9 +1238,24 @@
       "sha256": "263a66040e8ff094c7ac2b9b0f95e570d51cc0b786242aaba3c40729a3255bfc"
     },
     {
+      "path": "apps/api/src/live-preflight.ts",
+      "bytes": 2535,
+      "sha256": "6ed2060189353339c61e187528ee1c431359573312c8b84ef0ac92f358bb54e0"
+    },
+    {
       "path": "apps/api/src/load-env.ts",
       "bytes": 1164,
       "sha256": "4761c5c1f53ef78590056f86a632ef0cf4f46b224332b7c6eea4aabdfba6eb88"
+    },
+    {
+      "path": "apps/api/src/repair-axis-history.ts",
+      "bytes": 8572,
+      "sha256": "5da994f3ec5970460a78a47956e0508fd3782fcd69ac48dc7415a2d3f31470f5"
+    },
+    {
+      "path": "apps/api/src/reset-regime-gate.ts",
+      "bytes": 3112,
+      "sha256": "801d9427e781843f98757fa81e9557ef95802f23b4c292f46642a200e5504eef"
     },
     {
       "path": "apps/api/src/routes/kronos.ts",
@@ -1189,8 +1264,13 @@
     },
     {
       "path": "apps/api/src/routes/live.ts",
-      "bytes": 75154,
-      "sha256": "e365a5b56539a43227b1158a4200c2122add70d5a3b969cfcf3d3c852fa1d079"
+      "bytes": 65819,
+      "sha256": "c11b6efd63a67a2539908c5c0522d33507001ba4a0290065d9876d156e703202"
+    },
+    {
+      "path": "apps/api/src/routes/live.ts.pre-allocation-20260716134540",
+      "bytes": 59269,
+      "sha256": "1a6f2696ab084e05a90f7f64f633f8232d13c4924c7fd0d608f503bf92bc2e43"
     },
     {
       "path": "apps/api/src/routes/notifications.ts",
@@ -1216,6 +1296,11 @@
       "path": "apps/api/src/routes/trading-assistant.ts",
       "bytes": 10907,
       "sha256": "bc604c21950adbdb68ac482e61b683a40380de181d0115604a8a8dcbba8d22f3"
+    },
+    {
+      "path": "apps/api/src/run-regime-validation.ts",
+      "bytes": 6732,
+      "sha256": "e45d05e5d97068b77fd6bfe966f4d9105e02dda2f08b6214f018da4ae521f081"
     },
     {
       "path": "apps/api/src/server.ts",
@@ -1499,8 +1584,8 @@
     },
     {
       "path": "apps/web/src/CortexCollectionStatusCard.tsx",
-      "bytes": 15918,
-      "sha256": "f9348c784073b103a61d2f7d878e24ca34c02a724ff2815d88a23a46622739d0"
+      "bytes": 15702,
+      "sha256": "3c71e758e3a96cf3fbecd7fe3527a55e544db942e2047d3e1b4e203418781891"
     },
     {
       "path": "apps/web/src/CortexReadinessCard.tsx",
@@ -1554,43 +1639,28 @@
     },
     {
       "path": "apps/web/src/TestnetExchangeDashboard.tsx",
-      "bytes": 151434,
-      "sha256": "ed0b6164d84460d4bcc0a79144de9a452c4adc09f3f90f91af6e4d6ca7c02acd"
+      "bytes": 151409,
+      "sha256": "632ca25b49693458f6b5e0b10dfc175926d3101901e4c184230ce97619fe530f"
     },
     {
       "path": "deploy/Caddyfile",
-      "bytes": 5942,
-      "sha256": "96771e42776e4d33fba279671a31b0461e98bd80bb4823707241b11d136367d6"
+      "bytes": 2125,
+      "sha256": "12bb73ce83a516bba2e8474afa2b2ce6e2e0fe13c94c35ac75f61c541d272834"
     },
     {
       "path": "deploy/ecosystem.config.cjs",
-      "bytes": 1914,
-      "sha256": "73cf9c35ac62ea30e5be4b893841f61a4c98e761db6319f69b65af456f74399a"
+      "bytes": 1922,
+      "sha256": "beb855eb88335c9d8adad792f32377c3d7cfa9823e7d83873258302bf6498bad"
     },
     {
       "path": "deploy/generate-instance-manifest.mjs",
-      "bytes": 4093,
-      "sha256": "ecffc9e06dcf08c3d80264924e1b7c0d1e0144ea4951ad8153a8a4405dce102b"
-    },
-    {
-      "path": "deploy/instances/3101.json",
-      "bytes": 195,
-      "sha256": "e4b0a986555ddafcb3fed1e19a1ea5188f38ce564005b652bf9aeb2888b7a247"
-    },
-    {
-      "path": "deploy/instances/3102.json",
-      "bytes": 193,
-      "sha256": "2f871f94bd240fa5cba85abb06c0c59d086e660802af4797c70577ce619145ab"
-    },
-    {
-      "path": "deploy/instances/3103.json",
-      "bytes": 189,
-      "sha256": "15b4f3619532bc716c582a0b8a8dd526a4af678c2b3c79df35ef5819080a5adc"
+      "bytes": 4235,
+      "sha256": "879b496537cd92d0faade326652a4c7114deba801e937973bbcf7e57e0292c38"
     },
     {
       "path": "deploy/README.md",
-      "bytes": 12789,
-      "sha256": "a6bff5e387ee90591c36771276a5bd89bb5dd7db1d5c4ab886477c2af66e0069"
+      "bytes": 10023,
+      "sha256": "ed1f27d4e5888c9aaf10ba47f39e5282ef28d62d411ee870704b019fbf934119"
     },
     {
       "path": "deploy/run-api.sh",
