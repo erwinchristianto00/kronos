@@ -142,6 +142,7 @@ import { getRegimeDirectionControllerSnapshotStore } from "./lib/regime-directio
 import { getRegimeEdgeMemory } from "./lib/regime-edge-memory.js";
 import { cortexBrainMode, cortexPromotionBlockedByEnv } from "./lib/cortex-brain.js";
 import { CortexBrainStore, CortexDecisionJournal, runCortexShadowTick } from "./lib/cortex-brain-store.js";
+import { standaloneCortexShadowAllowed } from "./lib/cortex-instance-diagnosis.js";
 import { runFourBrainShadowCycle } from "./lib/four-brain-live-wiring.js";
 import { classifyIncumbentLanes } from "./lib/four-brain-lane-support.js";
 import { buildLaneContextSnapshotInputs } from "./lib/lane-context-snapshot-source.js";
@@ -1753,6 +1754,98 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       }
     }
   }
+  // Research/testnet-only CORTEX lifecycle for an allowlisted instance with execution disabled.
+  // This is shadow-only and has no engine reference, promotion object, allocation setter, or execution
+  // callback. The hard instance gate excludes 3103 independently of environment configuration.
+  if (!isTest && standaloneCortexShadowAllowed({ env: process.env, liveEnginePresent: liveEngine != null })) {
+    const cortexStore = new CortexBrainStore("data/cortex-brain.json");
+    const cortexJournal = new CortexDecisionJournal("data/cortex-decision-journal.jsonl");
+    const staticWeightPctForLane = normalizeCortexStaticWeightPctForLane(() => 100);
+    const cortexStandaloneContext = () => {
+      const cached = getLatestScanCandidates();
+      const scanStatus = coreScanAutoRefreshController.getStatus();
+      const fallbackSnapshot =
+        cached || scanStatus.lastAutoRefreshResultSummary ? null : getRegimeDirectionControllerSnapshotStore().readLatest();
+      const regime =
+        cached?.marketRegime ?? scanStatus.lastAutoRefreshResultSummary?.marketRegime ?? fallbackSnapshot?.currentRegime ?? null;
+      const axis = buildRegimeAxisTimeline(getRegimeEngineStore().snapshots);
+      const report = buildRegimeDirectionControllerReport({
+        currentRegime: regime,
+        adaptiveDirectionBias: null,
+        primaryValidationLane: null,
+        edgeGate: getRegimeEdgeMemory(),
+        axisScore: axis.current?.score ?? null,
+        axisSlopePerHour: axis.slopePerHour ?? null,
+      });
+      return gatherCortexContext(
+        buildLiveCortexGatherDeps({
+          staticWeightPctForLane,
+          edgeMemory: getRegimeEdgeMemory(),
+          controller: {
+            directionalBias: report.directionalBias,
+            convictionScore: report.convictionScore,
+            allowsLong: report.allowsLong,
+            allowsShort: report.allowsShort,
+            controllerMode: report.controllerMode,
+            edgeGated: report.edgeGated,
+          },
+          regimeRaw: regime,
+          axisScore: axis.current?.score ?? null,
+          axisSlopePerHour: axis.slopePerHour ?? null,
+          killLatched: false,
+          killBudgetUsd: null,
+        }),
+      );
+    };
+    const cortexStandaloneShadowTick = () => {
+      try {
+        if (!standaloneCortexShadowAllowed({ env: process.env, liveEnginePresent: liveEngine != null })) return;
+        runCortexShadowTick({
+          store: cortexStore,
+          journal: cortexJournal,
+          context: cortexStandaloneContext(),
+          nowIso: new Date().toISOString(),
+          mode: "shadow",
+          resolvedThisCycle: 0,
+          promotion: null,
+        });
+      } catch (err) {
+        console.error("[cortex-shadow-standalone] tick failed", err);
+      }
+    };
+    const cortexStandaloneRefitTick = () => {
+      try {
+        if (
+          !standaloneCortexShadowAllowed({ env: process.env, liveEnginePresent: liveEngine != null }) ||
+          process.env.CORTEX_REFIT_ENABLED === "0"
+        ) return;
+        const now = new Date();
+        const report = runCortexNightlyRefit({
+          store: cortexStore,
+          dataDir: "data",
+          journalFile: "data/cortex-decision-journal.jsonl",
+          staticWeightPctForLane,
+          nowMs: now.getTime(),
+          nowIso: now.toISOString(),
+        });
+        console.log(
+          `[cortex-refit-standalone] examples=${report.examplesTotal} (+${report.examplesNew} new) ` +
+            `resolved=${report.coverage.cumulativeResolved} families=${report.coverage.regimeFamiliesWithOutcomes} ` +
+            `blindCapital=${report.coverage.blindCapitalPct.toFixed(0)}%`,
+        );
+      } catch (err) {
+        console.error("[cortex-refit-standalone] pass failed", err);
+      }
+    };
+    cortexStandaloneShadowTick();
+    cortexStandaloneRefitTick();
+    setInterval(cortexStandaloneShadowTick, 5 * 60_000);
+    const cortexRefitIntervalMs = Math.max(
+      60_000,
+      Number(process.env.CORTEX_REFIT_INTERVAL_MS ?? 6 * 60 * 60_000),
+    );
+    setInterval(cortexStandaloneRefitTick, cortexRefitIntervalMs);
+  }
   // ── Four-Brain intelligence layer — SHADOW tick (2026-07-13, testnet wiring) ─────────────────────
   // Report-only decision architecture (Market State / Direction / Entry / Exit + Executive) layered
   // ABOVE the incumbent + CORTEX. Placed OUTSIDE `if (liveConfig.enabled)` so it runs on 3101 (research,
@@ -1796,7 +1889,10 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       });
       console.log(
         `[four-brain-outcome-rehydrate] instance=${resolveFourBrainInstanceId(process.env)} ` +
-          `direction=${rehydrated.directionRehydrated} entry=${rehydrated.entryRehydrated} ` +
+          `direction=${rehydrated.directionPendingRestored}/${rehydrated.directionEligibleUnprocessed} ` +
+          `entry=${rehydrated.entryPendingRestored}/${rehydrated.entryEligibleUnprocessed} ` +
+          `evicted=${rehydrated.directionEvictedDuringRehydrate + rehydrated.entryEvictedDuringRehydrate} ` +
+          `duplicates=${rehydrated.duplicateDirectionRowsSkipped + rehydrated.duplicateEntryRowsSkipped} ` +
           `skippedProcessed=${rehydrated.directionSkippedProcessed + rehydrated.entrySkippedProcessed} ` +
           `badLines=${rehydrated.badLines}`,
       );

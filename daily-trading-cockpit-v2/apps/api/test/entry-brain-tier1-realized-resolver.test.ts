@@ -96,6 +96,54 @@ describe("entry-brain-tier1-realized-resolver — strict windowed match", () => 
     expect(resolved.closedAtMs).toBe(closedAtMs);
   });
 
+  it("joins canonical and variant-matrix lane namespaces without rewriting historical identity", () => {
+    const pending = [
+      pendingRow({
+        decisionId: "canonical",
+        asOfMs: 10 * MIN,
+        laneId: "CG_WIDE_FAST_LONG",
+        symbolOrBasketId: "btcusdt",
+      }),
+    ];
+    const closed = [
+      closedPath({
+        key: "CG_VARIANT_MATRIX:CG_WIDE_FAST_LONG::BTCUSDT::LONG::real-1",
+        laneId: "CG_VARIANT_MATRIX:CG_WIDE_FAST_LONG",
+        firstTickMs: 12 * MIN,
+        closedAtMs: 50 * MIN,
+      }),
+    ];
+
+    const result = resolveEntryBrainTier1RealizedWithDiagnostics(pending, closed);
+    const row = result.rows[0] as EntryBrainTier1ResolvedRow;
+    expect(row.status).toBe("RESOLVED");
+    expect(row.laneId).toBe("CG_WIDE_FAST_LONG");
+    expect(row.matchedCloseKey).toBe("CG_VARIANT_MATRIX:CG_WIDE_FAST_LONG::BTCUSDT::LONG::real-1");
+    expect(result.diagnostics.namespaceNormalizedMatches).toBe(1);
+  });
+
+  it("normalizes both matrix namespaces but still keeps side as a strict independent axis", () => {
+    const pending = [
+      pendingRow({
+        decisionId: "long-matrix",
+        asOfMs: 10 * MIN,
+        laneId: "CG_LONG_VARIANT_MATRIX:CG_EXP_MFE_10X",
+        side: "LONG",
+      }),
+    ];
+    const wrongSide = closedPath({
+      key: "wrong-side",
+      laneId: "CG_VARIANT_MATRIX:CG_EXP_MFE_10X",
+      direction: "SHORT",
+      firstTickMs: 12 * MIN,
+      closedAtMs: 50 * MIN,
+    });
+    expect(resolveEntryBrainTier1Realized(pending, [wrongSide])[0]!.status).toBe("PENDING");
+
+    const rightSide = { ...wrongSide, key: "right-side", meta: { ...wrongSide.meta!, direction: "LONG" as const } };
+    expect(resolveEntryBrainTier1Realized(pending, [rightSide])[0]!.status).toBe("RESOLVED");
+  });
+
   it("never claims an out-of-window close (decision too far before open)", () => {
     const decisionAsOf = 0;
     const openedAtMs = ENTRY_BRAIN_TIER1_DEFAULT_TTL_MS + 5 * MIN; // outside ttl from decisionAsOf

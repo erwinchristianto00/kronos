@@ -318,6 +318,7 @@ function sanitizeTier1Diagnostics(raw: unknown): EntryBrainTier1Diagnostics | nu
     matchableClosedPaths: nonNegInt(source.matchableClosedPaths),
     unusableClosedPaths: nonNegInt(source.unusableClosedPaths),
     matchedRows: nonNegInt(source.matchedRows),
+    namespaceNormalizedMatches: nonNegInt(source.namespaceNormalizedMatches),
     rejectedRows: nonNegInt(source.rejectedRows),
     rejectionReasons: {
       MISSING_IDENTITY: nonNegInt(reasons.MISSING_IDENTITY),

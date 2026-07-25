@@ -98,6 +98,10 @@ describe("FourBrainOutcomeLedger", () => {
       });
       expect(first.directionRehydrated).toBe(1);
       expect(first.entryRehydrated).toBe(1);
+      expect(first.directionPendingRestored).toBe(1);
+      expect(first.entryPendingRestored).toBe(1);
+      expect(first.directionEvictedDuringRehydrate).toBe(0);
+      expect(first.entryEvictedDuringRehydrate).toBe(0);
 
       store.recordDirectionOutcome({
         decisionId: "restart-dir",
@@ -139,6 +143,33 @@ describe("FourBrainOutcomeLedger", () => {
       expect(second.entrySkippedProcessed).toBe(1);
       expect(restartedLedger.directionSize).toBe(0);
       expect(restartedLedger.entrySize).toBe(0);
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it("reports capacity loss explicitly so a deployment audit can refuse an unsafe restart", () => {
+    const dataDir = mkdtempSync(join(tmpdir(), "four-brain-rehydrate-capacity-"));
+    try {
+      const journal = join(dataDir, "four-brain-decision-journal.jsonl");
+      writeFileSync(
+        journal,
+        [1, 2, 3].map((n) => JSON.stringify(executiveRecord({ decisionId: `cap-${n}`, asOfMs: n * 1000 }))).join("\n"),
+        "utf-8",
+      );
+      const ledger = new FourBrainOutcomeLedger({ directionCapacity: 2, entryCapacity: 2 });
+      const result = rehydrateFourBrainOutcomeLedgerFromJournals({
+        ledger,
+        journalFiles: [journal],
+        hasProcessedDirection: () => false,
+        hasProcessedEntry: () => false,
+      });
+      expect(result.directionEligibleUnprocessed).toBe(3);
+      expect(result.entryEligibleUnprocessed).toBe(3);
+      expect(result.directionPendingRestored).toBe(2);
+      expect(result.entryPendingRestored).toBe(2);
+      expect(result.directionEvictedDuringRehydrate).toBe(1);
+      expect(result.entryEvictedDuringRehydrate).toBe(1);
     } finally {
       rmSync(dataDir, { recursive: true, force: true });
     }

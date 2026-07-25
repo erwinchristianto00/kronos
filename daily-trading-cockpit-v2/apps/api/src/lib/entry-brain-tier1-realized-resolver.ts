@@ -123,6 +123,9 @@ export interface EntryBrainTier1Diagnostics {
   matchableClosedPaths: number;
   unusableClosedPaths: number;
   matchedRows: number;
+  /** Resolved joins where the journal and position path used different representations of the same
+   * canonical lane (for example CG_WIDE_FAST_LONG vs CG_VARIANT_MATRIX:CG_WIDE_FAST_LONG). */
+  namespaceNormalizedMatches: number;
   rejectedRows: number;
   rejectionReasons: Record<EntryBrainTier1RejectionReason, number>;
 }
@@ -142,8 +145,25 @@ function emptyRejectionReasons(): Record<EntryBrainTier1RejectionReason, number>
   };
 }
 
+const VARIANT_MATRIX_LANE_PREFIXES = ["CG_VARIANT_MATRIX:", "CG_LONG_VARIANT_MATRIX:"] as const;
+
+/**
+ * Normalize only the storage namespace around a variant id. Historical records keep their original
+ * laneId; this value is used solely for the Tier-1 join key. Both matrix writers describe the same
+ * canonical geometry id after the prefix, while side remains an independent join axis below.
+ */
+export function normalizeEntryTier1LaneNamespace(laneId: string): string {
+  const normalized = laneId.trim().toUpperCase();
+  for (const prefix of VARIANT_MATRIX_LANE_PREFIXES) {
+    if (normalized.startsWith(prefix) && normalized.length > prefix.length) {
+      return normalized.slice(prefix.length);
+    }
+  }
+  return normalized;
+}
+
 function matchKey(laneId: string, symbolOrBasketId: string, side: string): string {
-  return `${laneId}::${symbolOrBasketId}::${side}`;
+  return `${normalizeEntryTier1LaneNamespace(laneId)}::${symbolOrBasketId.trim().toUpperCase()}::${side}`;
 }
 
 /** The real open-time proxy for a closed path: its own earliest recorded tick. Falls back to
@@ -234,6 +254,7 @@ export function resolveEntryBrainTier1RealizedWithDiagnostics(
 
   const consumedDecisionIds = new Set<string>(); // a decision, once it owns a close, can never own another
   const resolvedByDecisionId = new Map<string, EntryBrainTier1ResolvedRow>();
+  let namespaceNormalizedMatches = 0;
 
   for (const close of closes) {
     const meta = close.path.meta!;
@@ -257,6 +278,7 @@ export function resolveEntryBrainTier1RealizedWithDiagnostics(
     if (!owner) continue;
 
     consumedDecisionIds.add(owner.decisionId);
+    if (owner.laneId !== meta.laneId) namespaceNormalizedMatches += 1;
     resolvedByDecisionId.set(owner.decisionId, {
       decisionId: owner.decisionId,
       status: "RESOLVED",
@@ -338,6 +360,7 @@ export function resolveEntryBrainTier1RealizedWithDiagnostics(
       matchableClosedPaths: closes.length,
       unusableClosedPaths: Math.max(0, (Array.isArray(closedPaths) ? closedPaths.length : 0) - closes.length),
       matchedRows: resolvedByDecisionId.size,
+      namespaceNormalizedMatches,
       rejectedRows: outputRows.length - resolvedByDecisionId.size,
       rejectionReasons,
     },

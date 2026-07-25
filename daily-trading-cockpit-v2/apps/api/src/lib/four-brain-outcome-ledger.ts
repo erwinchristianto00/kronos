@@ -331,10 +331,17 @@ export interface FourBrainOutcomeLedgerRehydrateResult {
   linesRead: number;
   badLines: number;
   executiveRecords: number;
+  directionEligibleUnprocessed: number;
+  entryEligibleUnprocessed: number;
   directionRehydrated: number;
   entryRehydrated: number;
+  directionPendingRestored: number;
+  entryPendingRestored: number;
+  directionEvictedDuringRehydrate: number;
+  entryEvictedDuringRehydrate: number;
   directionSkippedProcessed: number;
   entrySkippedProcessed: number;
+  duplicateDirectionRowsSkipped: number;
   duplicateEntryRowsSkipped: number;
 }
 
@@ -355,12 +362,20 @@ export function rehydrateFourBrainOutcomeLedgerFromJournals(args: {
     linesRead: 0,
     badLines: 0,
     executiveRecords: 0,
+    directionEligibleUnprocessed: 0,
+    entryEligibleUnprocessed: 0,
     directionRehydrated: 0,
     entryRehydrated: 0,
+    directionPendingRestored: 0,
+    entryPendingRestored: 0,
+    directionEvictedDuringRehydrate: 0,
+    entryEvictedDuringRehydrate: 0,
     directionSkippedProcessed: 0,
     entrySkippedProcessed: 0,
+    duplicateDirectionRowsSkipped: 0,
     duplicateEntryRowsSkipped: 0,
   };
+  const seenDirectionIds = new Set<string>();
   const seenEntryRows = new Set<string>();
 
   for (const file of args.journalFiles) {
@@ -391,10 +406,12 @@ export function rehydrateFourBrainOutcomeLedgerFromJournals(args: {
       const direction = extractPendingDirectionRow(record);
       if (direction) {
         if (args.hasProcessedDirection(direction.decisionId)) result.directionSkippedProcessed += 1;
+        else if (seenDirectionIds.has(direction.decisionId)) result.duplicateDirectionRowsSkipped += 1;
         else {
-          const before = args.ledger.directionSize;
+          seenDirectionIds.add(direction.decisionId);
+          result.directionEligibleUnprocessed += 1;
           args.ledger.pushDirection(direction);
-          if (args.ledger.directionSize > before) result.directionRehydrated += 1;
+          result.directionRehydrated += 1;
         }
       }
 
@@ -408,6 +425,7 @@ export function rehydrateFourBrainOutcomeLedgerFromJournals(args: {
             result.duplicateEntryRowsSkipped += 1;
           } else {
             seenEntryRows.add(fingerprint);
+            result.entryEligibleUnprocessed += 1;
             args.ledger.pushEntry(entry);
             result.entryRehydrated += 1;
           }
@@ -415,5 +433,10 @@ export function rehydrateFourBrainOutcomeLedgerFromJournals(args: {
       }
     }
   }
+  result.directionPendingRestored = args.ledger.directionSize;
+  result.entryPendingRestored = args.ledger.entrySize;
+  const dropped = args.ledger.droppedPendingBeforeResolution;
+  result.directionEvictedDuringRehydrate = dropped.direction;
+  result.entryEvictedDuringRehydrate = dropped.entry;
   return result;
 }

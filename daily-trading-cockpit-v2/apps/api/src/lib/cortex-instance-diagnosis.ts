@@ -1,7 +1,9 @@
+import { fourBrainInstanceAllowed } from "./four-brain-live-gather-bindings.js";
+
 export type CortexInstanceDiagnosisCode =
   | "STATE_PRESENT"
   | "MODE_OFF"
-  | "BLOCKED_BY_LIVE_ENGINE_WIRING"
+  | "STANDALONE_SHADOW_READY"
   | "STATE_MISSING_FOR_UNKNOWN_REASON";
 
 export interface CortexInstanceDiagnosis {
@@ -11,11 +13,17 @@ export interface CortexInstanceDiagnosis {
   reportOnly: true;
 }
 
-/**
- * Explain missing CORTEX state without changing any mode, beta, or wiring. The current app constructs
- * the CORTEX store/tick/refit inside the live-engine block, so a research instance configured for
- * shadow learning but with LIVE_EXECUTION_ENABLED=0 cannot create cortex-brain.json.
- */
+/** A standalone lifecycle is allowed only in shadow mode, without a live engine, and on the same hard
+ * research/testnet allowlist used by Four-Brain. This excludes 3103 even if its env is changed. */
+export function standaloneCortexShadowAllowed(args: {
+  env: NodeJS.ProcessEnv;
+  liveEnginePresent: boolean;
+}): boolean {
+  const mode = (args.env.CENTRAL_BRAIN_MODE ?? "").trim().toLowerCase();
+  return mode === "shadow" && !args.liveEnginePresent && fourBrainInstanceAllowed(args.env);
+}
+
+/** Explain missing CORTEX state without changing mode, beta, or execution wiring. */
 export function diagnoseCortexInstance(args: {
   env: NodeJS.ProcessEnv;
   brainPresent: boolean;
@@ -49,10 +57,18 @@ export function diagnoseCortexInstance(args: {
     };
   }
   if (!liveExecutionEnabled) {
+    if (standaloneCortexShadowAllowed({ env: args.env, liveEnginePresent: false })) {
+      return {
+        code: "STANDALONE_SHADOW_READY",
+        rootCause:
+          "CORTEX standalone shadow lifecycle is allowed on this research/testnet instance; missing state means boot/tick verification is still pending.",
+        evidence,
+        reportOnly: true,
+      };
+    }
     return {
-      code: "BLOCKED_BY_LIVE_ENGINE_WIRING",
-      rootCause:
-        "CORTEX lifecycle construction is nested under LIVE_EXECUTION_ENABLED, so this shadow instance collects lineage but cannot create or refit brain state.",
+      code: "STATE_MISSING_FOR_UNKNOWN_REASON",
+      rootCause: "CORTEX state is missing and this instance is not allowlisted for standalone shadow lifecycle.",
       evidence,
       reportOnly: true,
     };
