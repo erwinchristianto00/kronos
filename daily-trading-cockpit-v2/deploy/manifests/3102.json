@@ -1,16 +1,16 @@
 {
   "schemaVersion": 1,
   "instanceId": "3102",
-  "generatedAt": "2026-07-25T03:48:42.188Z",
-  "gitSha": "2a41c065e31e713c172ca4abf2fd49d597a59021",
+  "generatedAt": "2026-07-25T03:57:17.055Z",
+  "gitSha": "e630a18770c8cf7836fa0df22fb8c5ddd31c9628",
   "gitDirty": false,
   "fileCount": 335,
-  "rootDigestSha256": "2853d4a12cd7e84885196955a7761b4b8dad9ac52cbcc9a72f2bf7d2d11b5c66",
+  "rootDigestSha256": "372f7a96648d34be91aa6a07f04017dad475533445721fde3aa8dff53cae75bb",
   "checksums": [
     {
       "path": "apps/api/src/app.ts",
-      "bytes": 136059,
-      "sha256": "63a5c7638d16e979fff31fcf896753427473b02875842eea03ca03acfc467355"
+      "bytes": 136130,
+      "sha256": "21f03876474d239b7a74a442c7e343c5ee4b11944000bad06b12f5bfff2534b7"
     },
     {
       "path": "apps/api/src/experience-engine/experience-engine.ts",
@@ -564,8 +564,8 @@
     },
     {
       "path": "apps/api/src/lib/four-brain-outcome-ledger.ts",
-      "bytes": 21790,
-      "sha256": "8d076ed6fdc45544a0ef97250126130aa13d8275d629fafb385463294c41ae0b"
+      "bytes": 22297,
+      "sha256": "721ac27968d8dca74485198d1cb174bd856700d31dedd5d71a998223857d89fe"
     },
     {
       "path": "apps/api/src/lib/four-brain-recent-decisions.ts",
