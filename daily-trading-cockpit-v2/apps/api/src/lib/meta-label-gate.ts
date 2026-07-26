@@ -114,6 +114,12 @@ export const META_LABEL_MIN_EXAMPLES = envNum("META_LABEL_MIN_EXAMPLES", 100);
 export const META_LABEL_REFIT_INTERVAL_MS = envNum("META_LABEL_REFIT_INTERVAL_MS", 24 * 3_600_000);
 /** L2 shrinkage toward zero weights (transparent v1 — no recency decay, no priors beyond 0). */
 export const META_LABEL_L2_LAMBDA = envNum("META_LABEL_L2_LAMBDA", 4);
+/** Reject a refit whose max|w − wPrior| exceeds this. Same guard, same default, and the same reason
+ *  as cortex-brain.ts's CORTEX_REFIT_MAX_JUMP: a blown-up or separated fit must never replace a
+ *  healthy model. Without it (the state before 2026-07-26) each nightly refit was free to swing the
+ *  model from predictive to anti-predictive and back, making any measured lift a function of which
+ *  version happened to be active rather than of the signal. */
+export const META_LABEL_REFIT_MAX_JUMP = envNum("META_LABEL_REFIT_MAX_JUMP", 8);
 /** Bounded store: settled (labeled/voided) records kept, oldest dropped past this cap. */
 export const META_LABEL_MAX_STORED_SETTLED = envNum("META_LABEL_MAX_STORED_SETTLED", 4_000);
 /** An unlabeled record whose order can no longer resolve (paper orders expire at 7d) is pruned
@@ -372,7 +378,14 @@ export type MetaLabelFitStatus =
   | "ACCEPTED"
   | "REJECTED_MIN_EXAMPLES"
   | "REJECTED_NON_CONVERGENCE"
-  | "REJECTED_NON_FINITE";
+  | "REJECTED_NON_FINITE"
+  /** The fit converged but moved further from the previous model than META_LABEL_REFIT_MAX_JUMP
+   *  allows — a blown-up/separated fit. Mirrors CORTEX_REFIT_MAX_JUMP in cortex-brain.ts, which
+   *  exists for exactly this failure. Added 2026-07-26 after measuring that successive nightly
+   *  refits swung the model between predictive and ANTI-predictive (v3 cohort lift +0.085R at
+   *  tau=0.70 vs v4 cohort -0.213R on its own walk-forward cohort) purely because each refit was an
+   *  unanchored from-scratch fit with no continuity to the last healthy one. */
+  | "REJECTED_COEFFICIENT_JUMP";
 
 export interface MetaLabelFitResult {
   weights: number[]; // on rejection: all-zero (caller must NOT install it — check status)
@@ -385,15 +398,26 @@ export interface MetaLabelTrainingExample {
   y: 0 | 1;
 }
 
-function penalizedNegLogLik(w: readonly number[], X: number[][], ys: readonly (0 | 1)[], lambda: number): number {
+function penalizedNegLogLik(
+  w: readonly number[],
+  X: number[][],
+  ys: readonly (0 | 1)[],
+  lambda: number,
+  wPrior: readonly number[],
+): number {
   let nll = 0;
   for (let r = 0; r < X.length; r += 1) {
     let z = 0;
     for (let i = 0; i < w.length; i += 1) z += w[i]! * X[r]![i]!;
     nll += ys[r] === 1 ? softplus(-z) : softplus(z);
   }
+  // Shrink toward wPrior (the last healthy fit), NOT toward zero — this is what gives successive
+  // refits continuity. wPrior is all-zero on the very first fit, so that case is byte-identical to
+  // the previous shrink-to-zero behavior. MUST stay consistent with the gradient/Hessian below:
+  // the backtracking line search compares this objective, so anchoring one and not the other would
+  // make the search optimize a different function than the Newton step descends.
   let penalty = 0;
-  for (let i = 1; i < w.length; i += 1) penalty += w[i]! ** 2; // bias unpenalized (base rate must be free)
+  for (let i = 1; i < w.length; i += 1) penalty += (w[i]! - wPrior[i]!) ** 2; // bias unpenalized
   return nll + 0.5 * lambda * penalty;
 }
 
@@ -405,13 +429,25 @@ function penalizedNegLogLik(w: readonly number[], X: number[][], ys: readonly (0
  */
 export function fitMetaLabelLogistic(
   examples: readonly MetaLabelTrainingExample[],
-  opts: { lambda?: number; iterations?: number; minExamples?: number } = {},
+  opts: {
+    lambda?: number;
+    iterations?: number;
+    minExamples?: number;
+    /** The last healthy model's weights. The ridge shrinks toward THIS instead of toward zero, and
+     *  the fit is warm-started from it, so consecutive refits stay continuous. Omitted/undefined
+     *  (or wrong length) => all-zero => byte-identical to the pre-2026-07-26 behavior. */
+    wPrior?: readonly number[];
+  } = {},
 ): MetaLabelFitResult {
   const lambda = opts.lambda ?? META_LABEL_L2_LAMBDA;
   const iterations = opts.iterations ?? 25;
   const minExamples = opts.minExamples ?? META_LABEL_MIN_EXAMPLES;
   const dim = META_LABEL_DIM;
   const zero = () => new Array<number>(dim).fill(0);
+  const wPrior: number[] =
+    opts.wPrior && opts.wPrior.length === dim && opts.wPrior.every((v) => Number.isFinite(v))
+      ? [...opts.wPrior]
+      : zero();
 
   const usable = examples.filter((e) => e && (e.y === 0 || e.y === 1) && e.features && e.features.bias === 1);
   if (usable.length < minExamples) return { weights: zero(), status: "REJECTED_MIN_EXAMPLES", nTrain: usable.length };
@@ -419,13 +455,13 @@ export function fitMetaLabelLogistic(
   const X = usable.map((e) => effectiveFeatureVector(e.features));
   const ys = usable.map((e) => e.y);
 
-  let w = zero();
+  let w = [...wPrior]; // warm start from the last healthy fit (all-zero on the first ever fit)
   let converged = false;
   for (let iter = 0; iter < iterations; iter += 1) {
     const g = zero();
     const H = Array.from({ length: dim }, () => new Array<number>(dim).fill(0));
     for (let i = 1; i < dim; i += 1) {
-      g[i] = lambda * w[i]!;
+      g[i] = lambda * (w[i]! - wPrior[i]!); // anchored ridge — matches penalizedNegLogLik above
       H[i]![i]! += lambda;
     }
     // Tiny ridge on the bias too — numerical PD-ness only, not shrinkage of the base rate.
@@ -444,14 +480,14 @@ export function fitMetaLabelLogistic(
       }
     }
     const step = solveLinear(H, g);
-    const currentObjective = penalizedNegLogLik(w, X, ys, lambda);
+    const currentObjective = penalizedNegLogLik(w, X, ys, lambda, wPrior);
     let scale = 1;
     let maxStep = 0;
     let stepAccepted = false;
     for (let backtrack = 0; backtrack < 30; backtrack += 1) {
       const candidate = w.map((wi, i) => wi - scale * step[i]!);
       if (candidate.every((v) => Number.isFinite(v))) {
-        const candidateObjective = penalizedNegLogLik(candidate, X, ys, lambda);
+        const candidateObjective = penalizedNegLogLik(candidate, X, ys, lambda, wPrior);
         if (Number.isFinite(candidateObjective) && candidateObjective <= currentObjective) {
           for (let i = 0; i < dim; i += 1) maxStep = Math.max(maxStep, Math.abs(scale * step[i]!));
           w = candidate;
@@ -469,6 +505,11 @@ export function fitMetaLabelLogistic(
   }
   if (!w.every((v) => Number.isFinite(v))) return { weights: zero(), status: "REJECTED_NON_FINITE", nTrain: usable.length };
   if (!converged) return { weights: zero(), status: "REJECTED_NON_CONVERGENCE", nTrain: usable.length };
+  let maxJump = 0;
+  for (let i = 0; i < dim; i += 1) maxJump = Math.max(maxJump, Math.abs(w[i]! - wPrior[i]!));
+  if (maxJump > META_LABEL_REFIT_MAX_JUMP) {
+    return { weights: zero(), status: "REJECTED_COEFFICIENT_JUMP", nTrain: usable.length };
+  }
   return { weights: w, status: "ACCEPTED", nTrain: usable.length };
 }
 
@@ -838,7 +879,10 @@ export async function runMetaLabelCycle(opts: {
   const refitDue = !lastModel || opts.now - lastModel.fittedAtMs >= refitIntervalMs;
   if (refitDue && labeledExamples.length >= minExamples) {
     result.fit.ran = true;
-    const fit = fitMetaLabelLogistic(labeledExamples, { minExamples });
+    // Anchor to the last healthy model so successive refits stay continuous (and so a blown-up fit
+    // is rejected rather than installed). lastModel is null on the very first fit => unanchored,
+    // exactly as before.
+    const fit = fitMetaLabelLogistic(labeledExamples, { minExamples, wPrior: lastModel?.weights });
     result.fit.status = fit.status;
     if (fit.status === "ACCEPTED") {
       store.addModel({
@@ -938,8 +982,23 @@ function wr(nets: readonly number[]): number | null {
 export function buildMetaLabelCohortTable(
   records: readonly MetaLabelRecord[],
   taus: readonly number[] = META_LABEL_TAUS,
+  opts: {
+    /** When set, restrict the population to signals whose score was FROZEN by this model version.
+     *  Scores are walk-forward: each record keeps the modelVersion that scored it and is never
+     *  retro-scored. Pooling versions therefore measures a mixture of different models, not the one
+     *  in use — and the mixture can invert the sign of the answer. Measured 2026-07-26 on testnet:
+     *  pooled lift at tau=0.70 read +0.0118R, while the SAME data split by cohort was +0.0853R for
+     *  v3 and -0.2125R for v4 (the then-current model). The pooled figure described neither. */
+    modelVersion?: number | null;
+  } = {},
 ): MetaLabelCohortRow[] {
-  const population = records.filter((r) => r.label != null && !r.voided && finite(r.score));
+  const population = records.filter(
+    (r) =>
+      r.label != null &&
+      !r.voided &&
+      finite(r.score) &&
+      (opts.modelVersion == null || r.modelVersion === opts.modelVersion),
+  );
   const allNets = population.map((r) => r.label!.netR);
   const ungatedNetAvgR = mean(allNets);
   const ungatedPF = pf(allNets);
@@ -990,7 +1049,13 @@ export interface MetaLabelReport {
   };
   /** Per-feature % non-null across all records — the honest "which features actually exist" read. */
   featureCoverage: Array<{ feature: MetaLabelFeatureName; presentPct: number | null }>;
+  /** POOLED across every model version — a mixture, retained for history. Do NOT read this as an
+   *  evaluation of the current model; see cohortsCurrentModel. */
   cohorts: MetaLabelCohortRow[];
+  /** Same table restricted to signals scored BY the current model — the walk-forward-honest view.
+   *  Empty when no model is ready. */
+  cohortsCurrentModel: MetaLabelCohortRow[];
+  currentModelVersion: number | null;
   cycleMeta: MetaLabelCycleMeta;
 }
 
@@ -1032,6 +1097,14 @@ export function buildMetaLabelReport(store: MetaLabelStore): MetaLabelReport {
     },
     featureCoverage,
     cohorts: buildMetaLabelCohortTable(records),
+    // The honest evaluation of the model actually in use: only signals whose score that model
+    // froze. `cohorts` above pools every model version and therefore describes a mixture, not the
+    // current model — keep both so the pooled history stays inspectable, but this is the one an
+    // operator should read when asking "does the gate I have work?".
+    cohortsCurrentModel: current
+      ? buildMetaLabelCohortTable(records, META_LABEL_TAUS, { modelVersion: current.version })
+      : [],
+    currentModelVersion: current?.version ?? null,
     cycleMeta: store.cycleMeta,
   };
 }

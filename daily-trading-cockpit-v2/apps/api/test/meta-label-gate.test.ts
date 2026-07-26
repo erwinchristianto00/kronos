@@ -5,6 +5,7 @@ import { join } from "node:path";
 
 import {
   META_LABEL_DIM,
+  META_LABEL_REFIT_MAX_JUMP,
   META_LABEL_FEATURE_NAMES,
   META_LABEL_FEATURE_SCHEMA_VERSION,
   META_LABEL_MAX_STORED_SETTLED,
@@ -681,5 +682,129 @@ describe("report", () => {
     expect(kronosCoverage.presentPct).toBeCloseTo(0);
     expect(report.cohorts).toHaveLength(META_LABEL_TAUS.length);
     expect(report.cycleMeta.cycles).toBe(1);
+  });
+});
+
+describe("[REFIT-STABILITY] wPrior anchoring + coefficient-jump rejection (2026-07-26)", () => {
+  // WHY: before this, every nightly refit was an unanchored from-scratch fit with L2 pulling toward
+  // ZERO, and the only rejections were min-examples / non-convergence / non-finite. Nothing stopped
+  // a refit from landing somewhere completely different from the last healthy model. Measured on
+  // real testnet data: successive versions swung between predictive and ANTI-predictive (v3 cohort
+  // lift +0.0853R at tau=0.70; v4 cohort -0.2125R on its own walk-forward cohort), so any reported
+  // lift was a function of which version happened to be live. cortex-brain.ts already solved exactly
+  // this with CORTEX_REFIT_MAX_JUMP + a wPrior-anchored ridge; this mirrors it.
+  const separable = () =>
+    Array.from({ length: 200 }, (_, i) => {
+      const win = i % 2 === 0;
+      return { features: nullFeatures({ regimeAlign: win ? 1 : -1 }), y: (win ? 1 : 0) as 0 | 1 };
+    });
+  const idx = META_LABEL_FEATURE_NAMES.indexOf("regimeAlign");
+
+  it("BACKWARD COMPAT: omitting wPrior reproduces the unanchored fit exactly", () => {
+    const a = fitMetaLabelLogistic(separable(), { minExamples: 100 });
+    const b = fitMetaLabelLogistic(separable(), { minExamples: 100, wPrior: new Array(META_LABEL_DIM).fill(0) });
+    expect(a.status).toBe("ACCEPTED");
+    expect(b.status).toBe("ACCEPTED");
+    // An all-zero prior IS the old behavior, so the two must agree bit-for-bit.
+    expect(b.weights).toEqual(a.weights);
+  });
+
+  it("anchors toward the previous model: same data lands closer to wPrior than the unanchored fit", () => {
+    const unanchored = fitMetaLabelLogistic(separable(), { minExamples: 100 });
+    const prior = new Array(META_LABEL_DIM).fill(0);
+    prior[idx] = -2; // a previous model that disagreed with this data
+    const anchored = fitMetaLabelLogistic(separable(), { minExamples: 100, wPrior: prior });
+    expect(anchored.status).toBe("ACCEPTED");
+    // Continuity: the anchored fit must not jump as far from the prior as the unanchored one does.
+    expect(Math.abs(anchored.weights[idx]! - prior[idx]!)).toBeLessThan(
+      Math.abs(unanchored.weights[idx]! - prior[idx]!),
+    );
+  });
+
+  it("REJECTS a converged fit that lands further from the prior than META_LABEL_REFIT_MAX_JUMP", () => {
+    // Weak shrinkage + a prior on the opposite side: the fit converges (so this is NOT the
+    // non-convergence guard) but lands ~1.68, i.e. ~8.7 away from a prior of -7 — past the budget.
+    const prior = new Array(META_LABEL_DIM).fill(0);
+    prior[idx] = -7;
+    const fit = fitMetaLabelLogistic(separable(), { minExamples: 100, lambda: 0.5, wPrior: prior });
+    expect(fit.status).toBe("REJECTED_COEFFICIENT_JUMP");
+    // On rejection the caller must not install these — mirrors every other rejection path.
+    expect(fit.weights.every((v) => v === 0)).toBe(true);
+  });
+
+  it("ACCEPTS the same fit one notch inside the budget (the guard is a real boundary, not a blanket)", () => {
+    const prior = new Array(META_LABEL_DIM).fill(0);
+    prior[idx] = -6; // fit lands ~1.68 => jump ~7.68 < 8
+    const fit = fitMetaLabelLogistic(separable(), { minExamples: 100, lambda: 0.5, wPrior: prior });
+    expect(fit.status).toBe("ACCEPTED");
+    const jump = Math.max(...fit.weights.map((w, k) => Math.abs(w - prior[k]!)));
+    expect(jump).toBeLessThanOrEqual(META_LABEL_REFIT_MAX_JUMP);
+  });
+
+  it("a diverging (separable, unshrunk) fit is still caught by the pre-existing non-convergence guard", () => {
+    // Ordering matters: non-convergence is checked BEFORE the jump budget, so a blown-up fit keeps
+    // reporting the more specific existing status rather than being relabelled by the new one.
+    const fit = fitMetaLabelLogistic(separable(), { minExamples: 100, lambda: 0 });
+    expect(fit.status).toBe("REJECTED_NON_CONVERGENCE");
+  });
+
+  it("a far-away prior on saturated data holds the fit AT the prior (documented, not a jump)", () => {
+    // Worth pinning: when the prior is extreme, z saturates the sigmoid, the likelihood gradient
+    // vanishes and the anchored fit converges immediately at the prior — so this is ACCEPTED with a
+    // zero jump, not a rejection. Safe in practice because a prior can only ever be a previously
+    // ACCEPTED fit, which this same guard already bounded.
+    const prior = new Array(META_LABEL_DIM).fill(0);
+    prior[idx] = META_LABEL_REFIT_MAX_JUMP * 10;
+    const fit = fitMetaLabelLogistic(separable(), { minExamples: 100, wPrior: prior });
+    expect(fit.status).toBe("ACCEPTED");
+    expect(fit.weights[idx]!).toBeCloseTo(prior[idx]!, 6);
+  });
+
+  it("a malformed wPrior (wrong length / non-finite) degrades to unanchored rather than corrupting the fit", () => {
+    const baseline = fitMetaLabelLogistic(separable(), { minExamples: 100 });
+    for (const bad of [[1, 2], new Array(META_LABEL_DIM).fill(Number.NaN)] as number[][]) {
+      const fit = fitMetaLabelLogistic(separable(), { minExamples: 100, wPrior: bad });
+      expect(fit.status).toBe("ACCEPTED");
+      expect(fit.weights).toEqual(baseline.weights);
+    }
+  });
+});
+
+describe("[COHORT-PER-MODEL] the sweep must not pool signals scored by different models (2026-07-26)", () => {
+  // The pooled table mixes cohorts frozen by different model versions and can therefore report a
+  // sign that describes NEITHER. Real measured example: pooled lift at tau=0.70 read +0.0118R while
+  // the same records split by cohort were +0.0853R (v3) and -0.2125R (v4, then-current).
+  const rows = (): MetaLabelRecord[] => [
+    // v1 cohort: high score => good outcome (predictive)
+    labeledRecord("v1a", 0.9, 2.0, { modelVersion: 1 }),
+    labeledRecord("v1b", 0.8, 1.5, { modelVersion: 1 }),
+    labeledRecord("v1c", 0.2, -1.0, { modelVersion: 1 }),
+    labeledRecord("v1d", 0.1, -1.5, { modelVersion: 1 }),
+    // v2 cohort: high score => bad outcome (anti-predictive)
+    labeledRecord("v2a", 0.9, -2.0, { modelVersion: 2 }),
+    labeledRecord("v2b", 0.8, -1.5, { modelVersion: 2 }),
+    labeledRecord("v2c", 0.2, 1.0, { modelVersion: 2 }),
+    labeledRecord("v2d", 0.1, 1.5, { modelVersion: 2 }),
+  ];
+
+  it("filtering by modelVersion isolates that cohort's population", () => {
+    const pooled = buildMetaLabelCohortTable(rows(), [0.5]);
+    const v1 = buildMetaLabelCohortTable(rows(), [0.5], { modelVersion: 1 });
+    const v2 = buildMetaLabelCohortTable(rows(), [0.5], { modelVersion: 2 });
+    expect(pooled[0]!.n).toBe(8);
+    expect(v1[0]!.n).toBe(4);
+    expect(v2[0]!.n).toBe(4);
+  });
+
+  it("the two cohorts have OPPOSITE lift while the pooled figure hides it", () => {
+    const v1 = buildMetaLabelCohortTable(rows(), [0.5], { modelVersion: 1 })[0]!;
+    const v2 = buildMetaLabelCohortTable(rows(), [0.5], { modelVersion: 2 })[0]!;
+    const pooled = buildMetaLabelCohortTable(rows(), [0.5])[0]!;
+    expect(v1.lift!).toBeGreaterThan(0);
+    expect(v2.lift!).toBeLessThan(0);
+    // The pooled number sits between them and therefore describes neither cohort — the exact
+    // failure mode this split exists to prevent.
+    expect(Math.abs(pooled.lift!)).toBeLessThan(Math.abs(v1.lift!));
+    expect(Math.abs(pooled.lift!)).toBeLessThan(Math.abs(v2.lift!));
   });
 });

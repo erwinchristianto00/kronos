@@ -20,6 +20,10 @@ import {
   CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST,
   CROSS_SECTIONAL_TREND_LONG_ALLOWLIST,
   CROSS_SECTIONAL_TREND_SHORT_ALLOWLIST,
+  CROSS_SECTIONAL_MIXED_MIN_SCORE_GAP,
+  crossSectionalMixedLongAllowlist,
+  isCrossSectionalMixedWideLongPoolEnabled,
+  getCrossSectionalAdaptiveConfig,
   regimeSkewedK,
   regimeSkewCounterfactual,
   type ScoredSymbol,
@@ -298,6 +302,171 @@ describe("cross-sectional-edge — market-neutral measurement lane", () => {
     const filtered = buildCrossSectionalReport(store, T0ms, { variant: "FILTERED" });
     expect(filtered.closed).toBe(1);
     expect(filtered.netAvgReturn).toBeCloseTo(0.5, 9);
+  });
+});
+
+// ── CROSS_SECTIONAL_MIXED_WIDE_LONG_POOL (2026-07-26) ────────────────────────────────────────
+// MIXED borrows TREND's 4-symbol long allowlist. Under MEAN_REVERSION that pool has no room to
+// move (3 weakest of 4 ≈ the pool mean) while the short side picks the 3 strongest of 6, so the
+// score gap collapses and the lane stopped forming baskets. The flag widens ONLY the MIXED long
+// pool, to the instance's own FILTERED long allowlist. Default = today's behavior, bit for bit.
+//
+// Runs the flag through process.env (not an injected env) on purpose: the point of these tests is
+// that buildMixedCrossSectionalBasket's DEFAULT path consults the flag, which is exactly the path
+// a deployed instance takes. Always restored in `finally` so nothing leaks to a later test.
+function withMixedWideLongPool<T>(value: string | undefined, fn: () => T): T {
+  const KEY = "CROSS_SECTIONAL_MIXED_WIDE_LONG_POOL";
+  const prev = process.env[KEY];
+  if (value === undefined) delete process.env[KEY];
+  else process.env[KEY] = value;
+  try {
+    return fn();
+  } finally {
+    if (prev === undefined) delete process.env[KEY];
+    else process.env[KEY] = prev;
+  }
+}
+
+/** Symbols on the FILTERED long allowlist that are NOT on TREND's — i.e. exactly what widening adds. */
+const WIDENING_ADDS = [...CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST].filter(
+  (s) => !CROSS_SECTIONAL_TREND_LONG_ALLOWLIST.has(s),
+);
+
+const BASKET_BASE = { k: 3, now: T0, openedAtMs: T0ms, horizonMs: CROSS_SECTIONAL_HORIZON_MS } as const;
+
+describe("[MIXED-POOL] CROSS_SECTIONAL_MIXED_WIDE_LONG_POOL — widening the dead MIXED long pool", () => {
+  it("the fixture is only meaningful if the source defaults still make FILTERED wider than TREND", () => {
+    // Guards the whole block: if someone renarrows the FILTERED list to a subset of TREND's, the
+    // tests below would pass vacuously instead of failing loudly.
+    expect(CROSS_SECTIONAL_TREND_LONG_ALLOWLIST.size).toBe(4);
+    expect(WIDENING_ADDS.sort()).toEqual(["ADAUSDT", "BNBUSDT", "SUIUSDT"]);
+  });
+
+  it("[RESOLVER] default resolves to TREND's narrow long pool; only an exact \"1\" widens it", () => {
+    const trend = [...CROSS_SECTIONAL_TREND_LONG_ALLOWLIST].sort();
+    const filtered = [...CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST].sort();
+    const at = (env: NodeJS.ProcessEnv) => [...crossSectionalMixedLongAllowlist(env)].sort();
+    expect(at({} as NodeJS.ProcessEnv)).toEqual(trend); // unset — today's behavior
+    expect(at({ CROSS_SECTIONAL_MIXED_WIDE_LONG_POOL: "0" } as NodeJS.ProcessEnv)).toEqual(trend);
+    expect(at({ CROSS_SECTIONAL_MIXED_WIDE_LONG_POOL: "" } as NodeJS.ProcessEnv)).toEqual(trend);
+    expect(at({ CROSS_SECTIONAL_MIXED_WIDE_LONG_POOL: "true" } as NodeJS.ProcessEnv)).toEqual(trend);
+    expect(at({ CROSS_SECTIONAL_MIXED_WIDE_LONG_POOL: "1" } as NodeJS.ProcessEnv)).toEqual(filtered);
+    expect(isCrossSectionalMixedWideLongPoolEnabled({} as NodeJS.ProcessEnv)).toBe(false);
+    expect(isCrossSectionalMixedWideLongPoolEnabled({ CROSS_SECTIONAL_MIXED_WIDE_LONG_POOL: "1" } as NodeJS.ProcessEnv)).toBe(true);
+  });
+
+  // The measured root cause, reproduced at basket level: identical scores, identical 0.035
+  // threshold — the ONLY difference is the size of the long pool. Narrow => scoreGap 0.020 => no
+  // basket (the dead lane). Wide => scoreGap 0.262 => basket. Fails without the flag wiring.
+  const deadLaneScores = scored([
+    // TREND long pool: tightly clustered, so picking 3 of 4 barely moves the long mean.
+    ["SOLUSDT", 0.050, 100], ["ETHUSDT", 0.052, 100], ["OPUSDT", 0.054, 100], ["1000PEPEUSDT", 0.056, 100],
+    // Only reachable once the long pool is widened.
+    ["ADAUSDT", -0.200, 100], ["BNBUSDT", -0.190, 100], ["SUIUSDT", -0.180, 100],
+    // Short pool (TREND short allowlist) — unchanged by this flag.
+    ["WLDUSDT", 0.070, 100], ["SEIUSDT", 0.072, 100], ["DOGEUSDT", 0.074, 100], ["APTUSDT", 0.060, 100],
+  ]);
+
+  it("[DEFAULT] with the flag unset the narrow pool cannot clear 0.035 — today's dead lane, unchanged", () => {
+    const b = withMixedWideLongPool(undefined, () => buildMixedCrossSectionalBasket(deadLaneScores, { ...BASKET_BASE }));
+    expect(b).toBeNull();
+    // And prove WHY it is null: it is the pool, not the threshold. Same scores, same 0.035, but a
+    // long pool handed in explicitly as the wide one => a basket forms.
+    const forced = buildMixedCrossSectionalBasket(deadLaneScores, {
+      ...BASKET_BASE,
+      longAllowlist: CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST,
+    });
+    expect(forced).not.toBeNull();
+    expect(forced!.scoreGap!).toBeGreaterThan(CROSS_SECTIONAL_MIXED_MIN_SCORE_GAP);
+  });
+
+  it("[FLAG] with the flag set the widened pool forms the basket the lane has been missing", () => {
+    const b = withMixedWideLongPool("1", () => buildMixedCrossSectionalBasket(deadLaneScores, { ...BASKET_BASE }));
+    expect(b).not.toBeNull();
+    expect(b!.signal).toBe(CROSS_SECTIONAL_MIXED_SIGNAL);
+    expect(b!.strategyFamily).toBe("MEAN_REVERSION");
+    // Mean reversion longs the weakest — now reachable outside TREND's 4.
+    expect(b!.longLeg.map((l) => l.symbol)).toEqual(["ADAUSDT", "BNBUSDT", "SUIUSDT"]);
+    expect(b!.shortLeg.map((l) => l.symbol)).toEqual(["DOGEUSDT", "SEIUSDT", "WLDUSDT"]);
+    expect(b!.scoreGap!).toBeCloseTo(0.262, 9);
+  });
+
+  // Same universe, but shorts stretched far enough that BOTH pools clear the threshold — isolates
+  // the composition change from the "did a basket form at all" question.
+  const bothFormScores = scored([
+    ["SOLUSDT", 0.050, 100], ["ETHUSDT", 0.052, 100], ["OPUSDT", 0.054, 100], ["1000PEPEUSDT", 0.056, 100],
+    ["ADAUSDT", -0.200, 100], ["BNBUSDT", -0.190, 100], ["SUIUSDT", -0.180, 100],
+    ["WLDUSDT", 0.300, 100], ["SEIUSDT", 0.320, 100], ["DOGEUSDT", 0.340, 100], ["APTUSDT", 0.060, 100],
+  ]);
+
+  it("[DEFAULT] flag unset keeps the EXACT legs MIXED picks today (never reaches the wider names)", () => {
+    const b = withMixedWideLongPool(undefined, () => buildMixedCrossSectionalBasket(bothFormScores, { ...BASKET_BASE }))!;
+    expect(b).not.toBeNull();
+    expect(b.longLeg.map((l) => l.symbol)).toEqual(["SOLUSDT", "ETHUSDT", "OPUSDT"]);
+    for (const s of WIDENING_ADDS) expect(b.longLeg.map((l) => l.symbol)).not.toContain(s);
+  });
+
+  it("[SHORT-LEG] widening the LONG pool leaves the short leg and the capital split untouched", () => {
+    const narrow = withMixedWideLongPool(undefined, () => buildMixedCrossSectionalBasket(bothFormScores, { ...BASKET_BASE }))!;
+    const wide = withMixedWideLongPool("1", () => buildMixedCrossSectionalBasket(bothFormScores, { ...BASKET_BASE }))!;
+    expect(wide.longLeg.map((l) => l.symbol)).toEqual(["ADAUSDT", "BNBUSDT", "SUIUSDT"]); // long side did change
+    expect(wide.shortLeg.map((l) => l.symbol)).toEqual(narrow.shortLeg.map((l) => l.symbol)); // short side did not
+    expect(wide.shortLeg.map((l) => l.weight)).toEqual(narrow.shortLeg.map((l) => l.weight));
+    expect(wide.shortCapitalWeight).toBe(narrow.shortCapitalWeight);
+    expect(wide.longCapitalWeight).toBe(narrow.longCapitalWeight);
+    expect(wide.takeProfitReturn).toBe(narrow.takeProfitReturn);
+    expect(wide.stopLossReturn).toBe(narrow.stopLossReturn);
+  });
+
+  it("[THRESHOLD] the 0.035 gap still binds under the widened pool — widening never lowers the bar", () => {
+    expect(CROSS_SECTIONAL_MIXED_MIN_SCORE_GAP).toBe(0.035);
+    expect(getCrossSectionalAdaptiveConfig().mixedMinScoreGap).toBe(0.035);
+    // Widened pool, but a genuine gap of 0.025 — between the rejected 0.020 proposal and 0.035.
+    const marginal = scored([
+      ["ADAUSDT", 0.000, 100], ["BNBUSDT", 0.001, 100], ["SUIUSDT", 0.002, 100],
+      ["SOLUSDT", 0.050, 100], ["ETHUSDT", 0.050, 100],
+      ["OPUSDT", 0.011, 100], ["1000PEPEUSDT", 0.012, 100],
+      ["WLDUSDT", 0.025, 100], ["SEIUSDT", 0.026, 100], ["DOGEUSDT", 0.027, 100], ["APTUSDT", 0.010, 100],
+    ]);
+    expect(withMixedWideLongPool("1", () => buildMixedCrossSectionalBasket(marginal, { ...BASKET_BASE }))).toBeNull();
+    // Same input, same widened pool, threshold explicitly dropped to the rejected 0.020 => it WOULD
+    // have opened. So the rejection above is the threshold doing its job, not a starved pool.
+    const at020 = withMixedWideLongPool("1", () =>
+      buildMixedCrossSectionalBasket(marginal, { ...BASKET_BASE, minScoreGap: 0.020 }),
+    )!;
+    expect(at020).not.toBeNull();
+    expect(at020.scoreGap!).toBeCloseTo(0.025, 9);
+    expect(at020.scoreGap!).toBeLessThan(CROSS_SECTIONAL_MIXED_MIN_SCORE_GAP);
+  });
+
+  it("[TREND-LANE] the TREND lane's long pool is NOT widened by this flag", () => {
+    // ADA/BNB/SUI carry the top momentum scores here: if the flag leaked into TREND, they would
+    // take the whole long side.
+    const trendScores = scored([
+      ["ADAUSDT", 0.500, 100], ["BNBUSDT", 0.490, 100], ["SUIUSDT", 0.480, 100],
+      ["SOLUSDT", 0.200, 100], ["ETHUSDT", 0.190, 100], ["OPUSDT", 0.180, 100], ["1000PEPEUSDT", 0.170, 100],
+      ["WLDUSDT", -0.300, 100], ["SEIUSDT", -0.310, 100], ["DOGEUSDT", -0.320, 100], ["APTUSDT", -0.100, 100],
+    ]);
+    const build = () => buildTrendCrossSectionalBasket(trendScores, { ...BASKET_BASE })!;
+    const off = withMixedWideLongPool(undefined, build);
+    const on = withMixedWideLongPool("1", build);
+    expect(off.signal).toBe(CROSS_SECTIONAL_TREND_SIGNAL);
+    expect(off.longLeg.map((l) => l.symbol)).toEqual(["SOLUSDT", "ETHUSDT", "OPUSDT"]);
+    expect(on.longLeg.map((l) => l.symbol)).toEqual(off.longLeg.map((l) => l.symbol));
+    expect(on.shortLeg.map((l) => l.symbol)).toEqual(off.shortLeg.map((l) => l.symbol));
+    for (const s of WIDENING_ADDS) expect(on.longLeg.map((l) => l.symbol)).not.toContain(s);
+  });
+
+  it("[CONFIG] the adaptive config reports which long pool MIXED is actually running on", () => {
+    const off = withMixedWideLongPool(undefined, () => getCrossSectionalAdaptiveConfig());
+    expect(off.mixedWideLongPool).toBe(false);
+    expect(off.mixedLongAllowlist).toEqual([...CROSS_SECTIONAL_TREND_LONG_ALLOWLIST].sort());
+    const on = withMixedWideLongPool("1", () => getCrossSectionalAdaptiveConfig());
+    expect(on.mixedWideLongPool).toBe(true);
+    expect(on.mixedLongAllowlist).toEqual([...CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST].sort());
+    // TREND's reported lists are the same object on both paths.
+    expect(on.trendLongAllowlist).toEqual(off.trendLongAllowlist);
+    expect(on.trendShortAllowlist).toEqual(off.trendShortAllowlist);
   });
 });
 

@@ -18,6 +18,27 @@ import { C, fmtR, toneR, ago, laneEdgeBadge, LaneMaturityTable, type LaneMaturit
 // toneR / ago / laneEdgeBadge are the shared helpers (same values this file used to duplicate
 // locally) — see LaneMaturityTable.tsx.
 
+/** One evidence tier's self-contained block (backend: exit-brain-shadow.ts ExitBrainTierBlock).
+ *  MEASURED = path nyata yang benar-benar terekam. SIMULATED = rekonstruksi candle-walk dari paper
+ *  order. Keduanya SELALU dirender terpisah dan TIDAK PERNAH dijumlahkan — sengaja tidak ada satu
+ *  angka gabungan di sini, persis seperti disiplin Tier 1 / Tier 2 milik Entry Brain. */
+export type ExitBrainTierBlock = {
+  tier: 'MEASURED' | 'SIMULATED';
+  note: string;
+  processed: number;
+  evaluated: number;
+  insufficientPathData: number;
+  coverageRatio: number | null;
+  n: number;
+  meanDeltaR: number | null;
+  cumDeltaR: number;
+  policyBetterShare: number | null;
+  policyBetter: number;
+  policyWorse: number;
+  ties: number;
+  banked: number;
+};
+
 export type ExitBrainReport = {
   coverage: {
     processed: number;
@@ -43,6 +64,11 @@ export type ExitBrainReport = {
     banked: number;
   };
   cycleMeta: { lastRunAtIso: string | null; lastProcessed: number; lastError: string | null } | null;
+  /** Optional: absent when the instance being polled (testnet is preferred, see useShadowReport)
+   *  still runs a build from before the tier split. The card then falls back to the legacy single
+   *  unlabeled row — which was ALWAYS measured-only, so nothing is mislabeled either way. */
+  measured?: ExitBrainTierBlock;
+  simulated?: ExitBrainTierBlock;
 };
 type FundingCarryReport = {
   openCount: number;
@@ -162,6 +188,36 @@ function Mini({ label, value, color, title }: { label: string; value: string; co
 
 const statRow: React.CSSProperties = { display: 'flex', gap: 14, flexWrap: 'wrap', marginTop: 6, alignItems: 'baseline' };
 
+/** Satu baris tier bukti Exit Brain. Dirender satu per tier, tidak pernah dijumlahkan.
+ *  Baris SIMULASI diberi label eksplisit + warna peringatan supaya operator tidak mungkin
+ *  membacanya sebagai hasil terukur. */
+function ExitBrainTierRow({ block }: { block: ExitBrainTierBlock }) {
+  const simulated = block.tier === 'SIMULATED';
+  return (
+    <div
+      style={{
+        ...statRow,
+        borderLeft: `3px solid ${simulated ? C.accent : C.measure}`,
+        paddingLeft: 8,
+        marginTop: 8,
+      }}
+    >
+      <span style={{ fontSize: 11, fontWeight: 700, color: simulated ? C.accent : C.measure, whiteSpace: 'nowrap' }} title={block.note}>
+        {simulated ? '⚠ SIMULASI (paper candle-walk — BUKAN terukur)' : 'TERUKUR (path nyata terekam)'}
+      </span>
+      <Mini label="n evaluated" value={`${block.n}/${block.processed}`} title={block.note} />
+      <Mini label="mean ΔR" value={fmtR(block.meanDeltaR)} color={toneR(block.meanDeltaR)} />
+      <Mini label="kumulatif ΔR" value={fmtR(block.cumDeltaR)} color={toneR(block.cumDeltaR)} />
+      <Mini
+        label="policy lebih baik"
+        value={block.policyBetterShare == null ? '—' : `${Math.round(block.policyBetterShare * 100)}% (${block.policyBetter}✓/${block.policyWorse}✗)`}
+      />
+      <Mini label="seri (tie)" value={String(block.ties)} title="ΔR = 0 — policy shadow dan exit aktual menghasilkan R yang identik (bukan berarti belum terukur)" />
+      <Mini label="dibank policy" value={String(block.banked)} title="Dari trade yang evaluated, berapa yang policy shadow akan bank lebih awal (bukan hold sampai exit aktual)" />
+    </div>
+  );
+}
+
 /** Per-row source annotation (testnet/local/unreachable) — used to live always-visible next to each
  *  lane's badge in the old LaneRow; the shared LaneMaturityTable doesn't have a slot for it, so it
  *  moves into the expanded detail instead of being dropped outright. */
@@ -209,27 +265,40 @@ export function InnovationLanesCard() {
       expanded: eb && (
         <>
           {sourceNote(exitBrain) && <div style={{ fontSize: 10, color: C.measure, marginBottom: 4 }}>{sourceNote(exitBrain)}</div>}
-          <div style={statRow}>
-            <Mini label="n evaluated" value={String(eb.performance.n)} />
-            <Mini label="mean ΔR" value={fmtR(eb.performance.meanDeltaR)} color={toneR(eb.performance.meanDeltaR)} />
-            <Mini label="kumulatif ΔR" value={fmtR(eb.performance.cumDeltaR)} color={toneR(eb.performance.cumDeltaR)} />
-            <Mini
-              label="policy lebih baik"
-              value={eb.performance.policyBetterShare == null ? '—' : `${Math.round(eb.performance.policyBetterShare * 100)}% (${eb.performance.policyBetter}✓/${eb.performance.policyWorse}✗)`}
-            />
-            <Mini
-              label="seri (tie)"
-              value={String(eb.performance.ties)}
-              title="ΔR = 0 — policy shadow dan exit aktual menghasilkan R yang identik (bukan berarti belum terukur)"
-            />
-            <Mini
-              label="dibank policy"
-              value={String(eb.performance.banked)}
-              title="Dari trade yang evaluated, berapa yang policy shadow akan bank lebih awal (bukan hold sampai exit aktual)"
-            />
-          </div>
+          {eb.measured && eb.simulated ? (
+            // Dua tier bukti, DUA baris terpisah — tidak ada satu angka gabungan di mana pun.
+            <>
+              <ExitBrainTierRow block={eb.measured} />
+              <ExitBrainTierRow block={eb.simulated} />
+              <div style={{ fontSize: 10, color: C.dim, marginTop: 4 }}>
+                Baris SIMULASI berasal dari candle-walk paper order (walkVariantPath), bukan rekaman tick nyata — angkanya
+                tidak pernah dijumlahkan atau dirata-ratakan dengan baris TERUKUR.
+              </div>
+            </>
+          ) : (
+            // Fallback: instance lama (belum ada pemisahan tier). Angka ini SELALU measured-only.
+            <div style={statRow}>
+              <Mini label="n evaluated" value={String(eb.performance.n)} />
+              <Mini label="mean ΔR" value={fmtR(eb.performance.meanDeltaR)} color={toneR(eb.performance.meanDeltaR)} />
+              <Mini label="kumulatif ΔR" value={fmtR(eb.performance.cumDeltaR)} color={toneR(eb.performance.cumDeltaR)} />
+              <Mini
+                label="policy lebih baik"
+                value={eb.performance.policyBetterShare == null ? '—' : `${Math.round(eb.performance.policyBetterShare * 100)}% (${eb.performance.policyBetter}✓/${eb.performance.policyWorse}✗)`}
+              />
+              <Mini
+                label="seri (tie)"
+                value={String(eb.performance.ties)}
+                title="ΔR = 0 — policy shadow dan exit aktual menghasilkan R yang identik (bukan berarti belum terukur)"
+              />
+              <Mini
+                label="dibank policy"
+                value={String(eb.performance.banked)}
+                title="Dari trade yang evaluated, berapa yang policy shadow akan bank lebih awal (bukan hold sampai exit aktual)"
+              />
+            </div>
+          )}
           <div style={{ ...statRow, background: C.sub, borderRadius: 6, padding: '6px 10px', marginTop: 8 }}>
-            <Mini label="cakupan path" value={`${eb.coverage.evaluated}/${eb.coverage.processed} (${ebCoveragePct ?? '—'})`} color={eb.coverage.evaluated > 0 ? C.text : C.accent} title={eb.coverage.note} />
+            <Mini label="cakupan path (terukur)" value={`${eb.coverage.evaluated}/${eb.coverage.processed} (${ebCoveragePct ?? '—'})`} color={eb.coverage.evaluated > 0 ? C.text : C.accent} title={eb.coverage.note} />
             <Mini label="INSUFFICIENT_PATH_DATA" value={String(eb.coverage.insufficientPathData)} color={C.accent} />
             {(eb.coverage.coverageRatio ?? 0) === 0 && (
               <span style={{ fontSize: 12, color: C.accent }}>

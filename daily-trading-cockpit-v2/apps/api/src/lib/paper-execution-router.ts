@@ -37,6 +37,7 @@ import type {
   VariantMatrixVariantId,
   VariantExitRule,
   VariantFillMode,
+  VariantRPathPoint,
 } from "./current-guard-variant-matrix.js";
 import {
   effectiveMfeGivebackArmR,
@@ -47,6 +48,7 @@ import {
 import type { AdaptiveLaneRouterReport } from "./adaptive-lane-router.js";
 import type { LiveTradingGateReport } from "./live-trading-gate.js";
 import { recordHeatShadowSnapshot } from "./portfolio-heat-shadow.js";
+import { getSimulatedPaperPathStore, simulatedPaperPathDirFor } from "./paper-simulated-path-store.js";
 import {
   prepareForwardCausalIdentity,
   recordForwardOpportunity,
@@ -887,8 +889,30 @@ export function getPaperExecutionRouterStore(dataDir = "data"): PaperExecutionRo
   return _singleton;
 }
 
+/**
+ * NON-INSTANTIATING peek at the module singleton: returns the store ONLY if some earlier caller has
+ * already constructed it (and therefore already paid the one-time file parse), never constructing it
+ * here. Added 2026-07-26 for CORTEX's nightly refit, which wants to read this book as an outcome source
+ * but must never be the caller that FIRST materializes it: `new PaperExecutionRouterStore()` does a
+ * synchronous readFileSync + JSON.parse of paper-execution-router.json, which is ~107 MB in production.
+ * A refit runs on an interval inside the same single Node process as the live execution engine, so a
+ * cold parse there is the exact shape of the 2026-07-20 testnet-unresponsive incident (a large JSON
+ * re-read per poll pinning the event loop). Callers that legitimately need the book to EXIST must keep
+ * using getPaperExecutionRouterStore(); callers that only want it opportunistically use this and treat
+ * null as "no data available this run".
+ */
+export function peekPaperExecutionRouterStore(): PaperExecutionRouterStore | null {
+  return _singleton;
+}
+
 export function _resetPaperExecutionRouterStoreForTests(): void {
   _singleton = null;
+}
+
+/** Test-only: install an already-constructed store as the resident singleton, so a test can exercise
+ *  the peek path above without reaching into module internals. */
+export function _setPaperExecutionRouterStoreForTests(store: PaperExecutionRouterStore | null): void {
+  _singleton = store;
 }
 
 // ─── position sizing ────────────────────────────────────────────────────────
@@ -1715,6 +1739,63 @@ function _computePaperCostR(plannedStopDistanceBps: number): number {
   return -(PAPER_TAKER_COST_BPS / plannedStopDistanceBps);
 }
 
+// ─── SIMULATED R-path capture (2026-07-26, REPORT-ONLY) ─────────────────────
+//
+// Paper orders resolved through walkVariantPath already have their whole candle path reconstructed;
+// collectRPath surfaces the per-candle R series that walk computes, and it is persisted here for the
+// Exit Brain's SIMULATED evidence tier (paper-simulated-path-store.ts). Absolutely nothing in this
+// block can move a paper outcome: it is called AFTER grossR/costR/netR are computed, it writes only
+// to its own isolated bounded JSON store, and every failure mode is swallowed.
+//
+// Default-ON with a single env kill-switch, matching the repo's `*_DISABLED !== "1"` idiom (the same
+// shape EXIT_BRAIN_SHADOW_DISABLED / RESIDUAL_MOMENTUM_DISABLED use). Deliberately NOT
+// instance-gated: it touches no live gate on any instance, so there is no gating code to change.
+
+function _simulatedPathCaptureEnabled(): boolean {
+  return process.env.PAPER_SIMULATED_PATH_CAPTURE_DISABLED !== "1";
+}
+
+/** Best-effort side-record of one resolved paper order's simulated R path. Never throws; a missing
+ *  rPath (capture disabled, or a walk whose path was invalidated) is simply not recorded — never
+ *  fabricated. `closeR` is the walk's RAW grossR, the same unit as the series. The store lives next
+ *  to the paper store itself (simulatedPaperPathDirFor — the same locality idiom
+ *  recordHeatShadowSnapshot uses below), so it follows the instance's real data dir instead of
+ *  assuming the process cwd, and the Exit Brain reader derives its dir the exact same way.
+ *
+ *  ALWAYS deferSave (2026-07-26 review fix): without it every resolved order serialized and
+ *  writeFileSync'd the WHOLE store synchronously. At steady state (300 paths) that store is ~3.5MB,
+ *  and resolverMaxOrders defaults to 80 — measured at ~565ms of BLOCKED EVENT LOOP per resolver pass.
+ *  This resolver shares its process with the live mainnet execution engine on 3103, so that is a
+ *  real-money latency hazard, not just slow bookkeeping. The single write now happens in
+ *  _flushSimulatedPaperPaths, hung off resolvePaperOrders' existing beginBatch/endBatch wrapper. */
+function _recordSimulatedPaperPath(
+  store: PaperExecutionRouterStore,
+  order: PaperOrder,
+  walk: { rPath?: VariantRPathPoint[] | null; closedAtMs: number | null },
+  closeR: number,
+): void {
+  try {
+    if (!_simulatedPathCaptureEnabled()) return;
+    const rPath = walk.rPath;
+    if (!Array.isArray(rPath) || rPath.length === 0) return;
+    if (!Number.isFinite(walk.closedAtMs)) return;
+    getSimulatedPaperPathStore(simulatedPaperPathDirFor(store.path)).recordResolvedPath(
+      {
+        key: order.paperOrderId,
+        laneId: order.selectedLaneId,
+        symbol: order.symbol,
+        direction: order.direction,
+        closedAtMs: walk.closedAtMs as number,
+        closeR,
+        rPath,
+      },
+      { deferSave: true },
+    );
+  } catch {
+    // report-only bookkeeping never breaks paper resolution
+  }
+}
+
 // ─── execution-realism model (live-preview fidelity) ────────────────────────
 //
 // The paper-shadow run SIMULATES live execution, so fills are modeled with the
@@ -1808,9 +1889,40 @@ export async function resolvePaperOrders(
   try {
     const result = await resolvePaperOrdersInner(store, binanceClient, executionModel, opts);
     recordForwardCausalResolutions(store);
+    _pruneSimulatedPaperPaths(store);
     return result;
   } finally {
     store.endBatch();
+    // Exactly ONE write of the simulated-path store per resolver pass, on the SAME wrapper the paper
+    // store's own batching already uses. In the `finally` so an aborted/throwing pass still persists
+    // whatever it managed to record (and so a deferred prune is never left unwritten).
+    _flushSimulatedPaperPaths(store);
+  }
+}
+
+/** Age-prune of the report-only simulated R-path store, once per resolver pass (the FIFO cap is
+ *  enforced on write; this is the second, time-based bound — same two-bound idiom
+ *  position-path-recorder.ts uses, whose pruneExpired the live engine likewise calls once per tick).
+ *  Fully swallowed: a prune failure can never affect paper resolution. */
+function _pruneSimulatedPaperPaths(store: PaperExecutionRouterStore): void {
+  try {
+    if (!_simulatedPathCaptureEnabled()) return;
+    // Deferred like every other write in this pass — _flushSimulatedPaperPaths persists it below.
+    getSimulatedPaperPathStore(simulatedPaperPathDirFor(store.path)).pruneExpired(Date.now(), { deferSave: true });
+  } catch {
+    // report-only bookkeeping never breaks paper resolution
+  }
+}
+
+/** The ONE write of the simulated R-path store per resolver pass (see _recordSimulatedPaperPath's
+ *  event-loop note). flush() is a no-op while the store is clean, so a pass that recorded nothing
+ *  costs nothing. Fully swallowed: a persistence failure can never affect paper resolution. */
+function _flushSimulatedPaperPaths(store: PaperExecutionRouterStore): void {
+  try {
+    if (!_simulatedPathCaptureEnabled()) return;
+    getSimulatedPaperPathStore(simulatedPaperPathDirFor(store.path)).flush();
+  } catch {
+    // report-only bookkeeping never breaks paper resolution
   }
 }
 
@@ -1977,6 +2089,12 @@ async function resolvePaperOrdersInner(
             candles,
             makerFillWindowCandles: MAKER_FILL_WINDOW_CANDLES,
             ...(variantDef ? { mfeGivebackArmR: effectiveMfeGivebackArmR(variantDef, order.plannedStopDistanceBps) } : {}),
+            // OPT-IN R-series capture (2026-07-26, REPORT-ONLY). Purely additive: collectRPath only
+            // ADDS walk.rPath and provably changes no other field of VariantWalkResult, so paper
+            // resolution — and everything downstream of it, including lane maturity and live
+            // eligibility — is byte-for-byte unaffected. The series feeds the Exit Brain's SIMULATED
+            // tier only (paper-simulated-path-store.ts). Kill-switch: default-on, one env var off.
+            ...(_simulatedPathCaptureEnabled() ? { collectRPath: true as const } : {}),
           },
           (fillCandleOpenMs) => _resolve1mForPaper(binanceClient, order.symbol, fillCandleOpenMs, dir, E, S, T),
         );
@@ -1993,6 +2111,11 @@ async function resolvePaperOrdersInner(
           const grossR = walk.grossR ?? 0;
           const costR = _computePaperCostR(order.plannedStopDistanceBps);
           const netR = grossR + costR;
+          // REPORT-ONLY side-record of the SIMULATED R path (Exit Brain SIMULATED tier). Wrapped +
+          // fail-open: it runs AFTER the outcome numbers above are computed and cannot influence any
+          // of them, and a store failure is swallowed inside the store itself. closeR is the walk's
+          // RAW grossR — the same unit as the series (costR is the paper book's separate modeling).
+          _recordSimulatedPaperPath(store, order, walk, grossR);
           store.update(order.paperOrderId, {
             paperStatus: netR > 0 ? "PAPER_CLOSED_WIN" : "PAPER_CLOSED_LOSS",
             grossR,

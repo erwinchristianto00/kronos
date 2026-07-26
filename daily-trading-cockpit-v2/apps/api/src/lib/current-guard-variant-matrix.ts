@@ -1531,6 +1531,111 @@ export interface VariantMatrixBinanceClient {
   ) => Promise<KlineTuple[]>;
 }
 
+// ---------------------------------------------------------------------------
+// OPT-IN per-candle R series (2026-07-26). PURELY ADDITIVE — see VariantWalkInput.collectRPath.
+//
+// WHY: exit-brain-shadow.ts can only score a trade whose recorded path carries >= minEvaluableTicks
+// R observations. The only genuinely dense paths on disk are position-path-recorder.ts's REAL
+// per-tick samples (live engine + single-symbol executors). This walk already reconstructs a full
+// candle path for every paper/VM order but has only ever surfaced SUMMARY stats (maxMfeR/minMaeR/
+// peakAtMs/grossR) from it. Collecting the series it already computes costs one array push per
+// candle and unlocks a SECOND, explicitly-SIMULATED evidence tier.
+//
+// WHAT THE SERIES IS (and is not): ONE point per candle carrying the position's MARK-TO-MARKET R at
+// that candle's close, with the candle's extremes as peakR/troughR refinements. It is NOT a stream
+// of excursion statistics: an earlier draft emitted two points per candle (that candle's favorable
+// and adverse EXCURSIONS, each clamped at 0 against entry), which guaranteed one ≤0 point per candle
+// forever and made any arm-then-bank consumer round-trip-guard itself to ~0 on the very next candle.
+// A clean +5R winner scored 0R under that shape. See VariantWalkResult.rPath for the full contract.
+//
+// HARD RULE (the reason this is opt-in rather than always-on): this module is REAL-MONEY-ADJACENT —
+// VariantWalkResult feeds lane maturity (INSUFFICIENT→COLLECTING→WATCHABLE→STABLE_CANDIDATE) and
+// STABLE_CANDIDATE is a REQUIRED gate for mainnet live eligibility (isPaperOrderLiveEligible). With
+// collectRPath absent/false NOTHING changes: the `rPath` key is not even present on the returned
+// object, so every existing field — and the object's own shape — is byte-identical to before.
+// ---------------------------------------------------------------------------
+
+/** One point of the opt-in per-candle R series — deliberately shaped so it is directly assignable to
+ *  exit-brain-policy.ts's ExitBrainPathTick.
+ *
+ *  `currentR` is the position's MARK-TO-MARKET R at the candle's CLOSE, in the walk's OWN R unit
+ *  ((close−E)/risk for LONG, (E−close)/risk for SHORT — the same `risk` denominator and the same
+ *  direction convention maxMfeR/minMaeR use, never a second R definition). It is SIGNED and
+ *  unclamped: a real unrealized-R path, not an excursion statistic.
+ *
+ *  `peakR`/`troughR` carry that candle's favorable/adverse EXTREMES (the very same mfeR/maeR the
+ *  summary stats are built from). They are the ExitBrainPathTick fields the counterfactual evaluator
+ *  already folds into its running peak/trough, so MFE/MAE information survives at one tick per candle
+ *  WITHOUT fabricating an oscillation the position never experienced.
+ *
+ *  Raw/unrounded here; a persisting store may round (see paper-simulated-path-store.ts). */
+export interface VariantRPathPoint {
+  tsMs: number;
+  currentR: number;
+  /** This candle's favorable excursion in R (≥ 0). Omitted on the terminating tick of an INTRABAR
+   *  exit — see VariantWalkResult.rPath's POST-EXIT rule. */
+  peakR?: number;
+  /** This candle's adverse excursion in R (≤ 0). */
+  troughR?: number;
+}
+
+/** The running peak/trough a consumer folds a point into — mirrors evaluateExitBrainCounterfactual's
+ *  own `Math.max(peak, currentR, peakR)` / `Math.min(trough, currentR, troughR)` exactly, so the
+ *  thinner below preserves precisely what the evaluator would have seen. */
+function rPathPointHigh(p: VariantRPathPoint): number {
+  return typeof p.peakR === "number" && Number.isFinite(p.peakR) ? Math.max(p.currentR, p.peakR) : p.currentR;
+}
+function rPathPointLow(p: VariantRPathPoint): number {
+  return typeof p.troughR === "number" && Number.isFinite(p.troughR) ? Math.min(p.currentR, p.troughR) : p.currentR;
+}
+
+/** Hard cap on the returned series length (mirrors position-path-recorder.ts's
+ *  MAX_TICKS_PER_POSITION=600 bounds idiom). Overridable per call via VariantWalkInput.rPathMaxPoints
+ *  for tests/sweeps; never unbounded. */
+export const VARIANT_R_PATH_MAX_POINTS = 600;
+/** Floor for a caller-supplied rPathMaxPoints — the thinner must always be able to retain
+ *  {first, last, argmax, argmin}, which is what keeps the thinned series folding to the same running
+ *  peak/trough as the full one. */
+export const VARIANT_R_PATH_MIN_CAP = 4;
+
+/**
+ * Downsamples an R series to at most `cap` points while ALWAYS retaining the first point, the last
+ * point, the global maximum and the global minimum, in original chronological order.
+ *
+ * That retention rule is not cosmetic — it is what makes the thinned series preserve the running
+ * peak/trough a consumer would have folded out of the FULL series: argmax/argmin are taken over
+ * max(currentR, peakR) / min(currentR, troughR) (exactly what evaluateExitBrainCounterfactual folds),
+ * so the extreme survives any number of thinning passes even when it lives in a point's peakR/troughR
+ * refinement rather than its currentR. Everything else is an even stride, so a long hold keeps a
+ * uniformly-sampled shape rather than a truncated head or tail.
+ *
+ * Deliberately a LOCAL helper rather than an import of position-path-recorder.ts's thinOlderHalf:
+ * (a) that thinner optimizes for "recent retraces matter most" on a live-growing buffer and does
+ * NOT preserve extremes, which would break the invariant above; (b) this file is real-money-adjacent
+ * and gains no new module dependency. Pure; exported for tests.
+ */
+export function thinRPathPreservingExtremes(points: VariantRPathPoint[], cap: number): VariantRPathPoint[] {
+  if (!Array.isArray(points)) return [];
+  const keepCap = Math.max(VARIANT_R_PATH_MIN_CAP, Math.floor(Number.isFinite(cap) ? cap : VARIANT_R_PATH_MAX_POINTS));
+  const n = points.length;
+  if (n <= keepCap) return points;
+  let maxIdx = 0;
+  let minIdx = 0;
+  for (let i = 1; i < n; i += 1) {
+    if (rPathPointHigh(points[i]!) > rPathPointHigh(points[maxIdx]!)) maxIdx = i;
+    if (rPathPointLow(points[i]!) < rPathPointLow(points[minIdx]!)) minIdx = i;
+  }
+  const keep = new Set<number>([0, n - 1, maxIdx, minIdx]);
+  const budget = keepCap - keep.size;
+  if (budget > 0) {
+    const stride = n / (budget + 1);
+    for (let k = 1; k <= budget; k += 1) keep.add(Math.min(n - 1, Math.round(k * stride)));
+  }
+  const out: VariantRPathPoint[] = [];
+  for (let i = 0; i < n; i += 1) if (keep.has(i)) out.push(points[i]!);
+  return out;
+}
+
 export interface VariantWalkInput {
   direction: Direction;
   entryPrice: number;
@@ -1567,6 +1672,15 @@ export interface VariantWalkInput {
    *  compute; otherwise productionBreakevenModeledCloseQty stays null. */
   productionBreakevenQtyStepSize?: number;
   forceCloseAtEnd?: boolean;
+  /** OPT-IN (2026-07-26): collect the per-candle R series this walk already computes and return it
+   *  as VariantWalkResult.rPath. Absent/false ⇒ the result object does not even carry an `rPath`
+   *  key and every other field is byte-identical to before this option existed. Never changes any
+   *  computation, ordering or early-return — see the VariantRPathPoint block above. */
+  collectRPath?: boolean;
+  /** collectRPath only: hard cap on the returned series length (default VARIANT_R_PATH_MAX_POINTS,
+   *  floored at VARIANT_R_PATH_MIN_CAP). Thinning always retains first/last/argmax/argmin, so the
+   *  max/min-vs-maxMfeR/minMaeR consistency holds at any cap. */
+  rPathMaxPoints?: number;
 }
 
 export interface VariantWalkResult {
@@ -1598,6 +1712,54 @@ export interface VariantWalkResult {
    *  unmodified from binance-futures-private.ts). Diagnostic only — never feeds grossR (see the
    *  constant block's approximation note #6 above walkVariantPath for why). */
   productionBreakevenModeledCloseQty: number | null;
+  /**
+   * OPT-IN, present ONLY when VariantWalkInput.collectRPath === true (the key is absent otherwise,
+   * so a default-path result object is byte-identical to before this field existed).
+   *
+   * The position's UNREALIZED-R path, in the walk's own R unit: ONE point per walked candle, whose
+   * `currentR` is the MARK-TO-MARKET R at that candle's CLOSE, plus that candle's favorable/adverse
+   * extremes carried in the point's `peakR`/`troughR` (see VariantRPathPoint). Points are stamped
+   * with the candle's OPEN time, the same candle-granularity convention `peakAtMs` documents — except
+   * the terminating point, which is stamped at the trade's real `closedAtMs`.
+   *
+   * ── NO POST-EXIT INFORMATION (the hard rule) ────────────────────────────────────────────────────
+   * A recorded path describes an OPEN position, so no point may describe a moment at which the
+   * position was already closed. Two consequences:
+   *   - A candle's close-mark is only emitted once the position is KNOWN to have survived that
+   *     candle (the walk stages it and commits it on the next iteration). On the candle that fires
+   *     the exit, that close-mark is discarded — the exit happened INTRABAR, before the close.
+   *   - The terminating point instead carries the trade's REALIZED exit R (`grossR`) at `closedAtMs`.
+   *
+   * The convention chosen for the terminating candle, and why it CANNOT flatter a downstream policy:
+   *   - INTRABAR exit (stop/TP/trail/breakeven fired inside the candle): only `troughR` — that
+   *     candle's ADVERSE extreme — is carried. OHLC does not say which extreme printed first, and
+   *     this file's existing same-candle convention is SL-first, so the adverse extreme is treated
+   *     as reachable before the exit while the FAVORABLE extreme is not recorded at all (it may be
+   *     a post-fill rebound). Suppressing it can only LOWER a consumer's running peak, and lowering
+   *     the peak can only make an arm-then-bank policy bank later or not at all — it can never
+   *     manufacture a better exit than the one the trade actually got. Carrying `troughR` is
+   *     likewise safe: a deeper running trough never improves any policy's banked R.
+   *   - CLOSE exit (MAX_HOLD_MTM / TRAIL_PATH_END): the position was open for the WHOLE final
+   *     candle and closes at its close, so both of that candle's extremes ARE pre-exit and both are
+   *     carried; `currentR` is the realized R, which for MAX_HOLD_MTM is that same close-mark.
+   *
+   * ── RELATION TO THE SUMMARY STATS ───────────────────────────────────────────────────────────────
+   * Same formula, same `risk` denominator, same direction convention — the series IS the walk's own
+   * computation, recorded rather than only reduced. Therefore it is BOUNDED by the summary stats:
+   * every currentR/peakR ≤ maxMfeR and every currentR/troughR ≥ minMaeR, and folding the series into
+   * a running peak/trough reproduces maxMfeR/minMaeR EXACTLY whenever the walk's extreme is not a
+   * post-exit print on the terminating candle (it is strictly smaller when it is — that gap is the
+   * post-exit information being withheld on purpose, not a disagreement). maxMfeR/minMaeR themselves
+   * are UNCHANGED by this option: they still see every candle in full, because they feed lane
+   * maturity and mainnet live eligibility. Thinning preserves the fold (thinRPathPreservingExtremes).
+   *
+   *   - null (not an empty array) whenever maxMfeR/minMaeR are themselves null — i.e. NO_FILL,
+   *     UNRESOLVED, or a path invalidated by the MFE_MAE_CAP_R sanity bound. The series and the
+   *     summary stats are always valid or null TOGETHER.
+   * This is a SIMULATED reconstruction from candles, NOT a measured per-tick recording; consumers
+   * must keep it in its own evidence tier (see exit-brain-shadow.ts's MEASURED vs SIMULATED blocks).
+   */
+  rPath?: VariantRPathPoint[] | null;
 }
 
 function rewardR(dir: Direction, entry: number, target: number, risk: number): number {
@@ -1638,6 +1800,20 @@ export async function walkVariantPath(
   const atrTrailArmR = input.atrTrailArmR ?? ATR_TRAIL_ARM_R;
   const productionBreakevenCostPct = input.productionBreakevenCostPct ?? PRODUCTION_BREAKEVEN_CONTROL_COST_PCT;
   const risk = dir === "LONG" ? E - S : S - E;
+  // OPT-IN R-series collection (see VariantWalkInput.collectRPath). Everything below that touches
+  // rPath is guarded by this flag; with it off the conditional spreads collapse to `{}` and the
+  // result object keeps its exact pre-existing shape.
+  const collectRPath = input.collectRPath === true;
+  const rPathCap = Math.max(
+    VARIANT_R_PATH_MIN_CAP,
+    Math.floor(Number.isFinite(input.rPathMaxPoints) ? (input.rPathMaxPoints as number) : VARIANT_R_PATH_MAX_POINTS),
+  );
+  /** In-flight ceiling: the buffer is decimated back to rPathCap whenever it grows past 4× the cap,
+   *  so an absurdly long candle window can never grow an unbounded array (repo OOM discipline) while
+   *  the amortized cost stays O(candles). Thinning preserves the extremes, so the max/min-vs-summary
+   *  consistency survives every pass. */
+  const rPathInFlightCap = rPathCap * 4;
+  let rPath: VariantRPathPoint[] | null = collectRPath ? [] : null;
   const empty: VariantWalkResult = {
     status: "UNRESOLVED",
     grossR: null,
@@ -1651,6 +1827,10 @@ export async function walkVariantPath(
     resolutionSource: null,
     productionBreakevenTriggerPrice: null,
     productionBreakevenModeledCloseQty: null,
+    // Key present ONLY when collecting — so every non-collecting return stays byte-identical.
+    // `empty` is the NO_FILL/UNRESOLVED/invalid-input shape, where maxMfeR/minMaeR are null too:
+    // the series and the summary stats are always valid-or-null together.
+    ...(collectRPath ? { rPath: null } : {}),
   };
   if (!(risk > 0) || input.candles.length === 0) return empty;
 
@@ -1761,14 +1941,32 @@ export async function walkVariantPath(
   let peakAtMs: number | null = null;
   let pathValid = true;
 
-  const updatePath = (high: number, low: number, atMs: number) => {
-    if (!pathValid) return;
+  // OPT-IN series staging (see VariantWalkResult.rPath's POST-EXIT rule). A candle's close-mark is
+  // only a valid observation of an OPEN position if the position actually SURVIVED that candle —
+  // which is only known once the next iteration begins, since every exit returns from inside the
+  // iteration that fires it. So updatePath STAGES the candle's point and commitStagedRPathTick()
+  // commits the previous one at the top of the next iteration; finalize() decides what the
+  // terminating candle may contribute and discards whatever is still staged.
+  let stagedRPathTick: VariantRPathPoint | null = null;
+  const commitStagedRPathTick = () => {
+    if (!rPath || !stagedRPathTick) return;
+    rPath.push(stagedRPathTick);
+    stagedRPathTick = null;
+    if (rPath.length > rPathInFlightCap) rPath = thinRPathPreservingExtremes(rPath, rPathCap);
+  };
+
+  const updatePath = (high: number, low: number, close: number, atMs: number) => {
+    if (!pathValid) {
+      stagedRPathTick = null;
+      return;
+    }
     const favorable = dir === "LONG" ? Math.max(high - E, 0) : Math.max(E - low, 0);
     const adverse = dir === "LONG" ? Math.min(low - E, 0) : Math.min(E - high, 0);
     const mfeR = favorable / risk;
     const maeR = adverse / risk;
     if (!Number.isFinite(mfeR) || !Number.isFinite(maeR) || Math.abs(mfeR) > MFE_MAE_CAP_R || Math.abs(maeR) > MFE_MAE_CAP_R) {
       pathValid = false;
+      stagedRPathTick = null;
       return;
     }
     if (mfeR > maxMfeR) {
@@ -1776,6 +1974,47 @@ export async function walkVariantPath(
       peakAtMs = atMs;
     }
     if (maeR < minMaeR) minMaeR = maeR;
+    // OPT-IN series capture: ONE point per candle, the position's mark-to-market R at the candle's
+    // CLOSE — the actual unrealized-R path — with the candle's extremes carried as the peakR/troughR
+    // refinements a consumer folds into its running peak/trough. Same `risk` denominator and same
+    // direction convention as mfeR/maeR above; never a second R definition.
+    if (rPath) {
+      const markR = dir === "LONG" ? (close - E) / risk : (E - close) / risk;
+      stagedRPathTick = Number.isFinite(markR) ? { tsMs: atMs, currentR: markR, peakR: mfeR, troughR: maeR } : null;
+    }
+  };
+
+  /** Set ONLY by the two path-END closes (TRAIL_PATH_END / MAX_HOLD_MTM), where the position was
+   *  open for the WHOLE final candle and closes AT its close — so that candle's extremes are both
+   *  genuinely pre-exit. Every other exit in this walk fires INTRABAR. Read by finalize() for the
+   *  R-series termination rule only; it touches nothing else. */
+  let closedAtFinalCandleClose = false;
+
+  /**
+   * Closes the R series for a RESOLVED walk. Implements VariantWalkResult.rPath's POST-EXIT rule:
+   * the terminating candle's staged close-mark is DISCARDED (for an intrabar exit the close is a
+   * moment the position no longer existed), and the series instead ends on the trade's realized
+   * exit R stamped at its real closedAtMs.
+   *
+   * The terminating candle's FAVORABLE extreme is carried only for a close-exit (MAX_HOLD_MTM /
+   * TRAIL_PATH_END), where the position was open for that entire candle. For an intrabar exit it is
+   * withheld — it may be a post-fill rebound, and withholding it can only lower a consumer's running
+   * peak, which can only make an arm-then-bank policy bank later or not at all. There is no ordering
+   * of that candle's extremes which could let a policy book a better exit than the one the trade
+   * actually got; the adverse extreme is still carried (SL-first, this file's existing convention),
+   * and a deeper trough never improves a banked R either.
+   */
+  const terminateRPath = (grossR: number, closedAtMs: number): VariantRPathPoint[] => {
+    const staged = stagedRPathTick;
+    stagedRPathTick = null;
+    const out = rPath ?? [];
+    out.push({
+      tsMs: closedAtMs,
+      currentR: grossR,
+      ...(closedAtFinalCandleClose && typeof staged?.peakR === "number" ? { peakR: staged.peakR } : {}),
+      ...(typeof staged?.troughR === "number" ? { troughR: staged.troughR } : {}),
+    });
+    return thinRPathPreservingExtremes(out, rPathCap);
   };
 
   const finalize = (
@@ -1801,6 +2040,9 @@ export async function walkVariantPath(
     // VariantWalkResult field doc.
     productionBreakevenTriggerPrice,
     productionBreakevenModeledCloseQty,
+    // Key present ONLY when collecting (the spread is `{}` otherwise). Gated on the SAME pathValid
+    // flag maxMfeR/minMaeR use, so the series can never outlive the stats it must agree with.
+    ...(collectRPath ? { rPath: pathValid ? terminateRPath(grossR, closedAtMs) : null } : {}),
   });
 
   const fullRewardR = rewardR(dir, E, T, risk);
@@ -1821,7 +2063,10 @@ export async function walkVariantPath(
     // Peak favorable BEFORE folding in this candle — used by mfe_giveback so the giveback
     // level cannot be triggered by the same candle's own new high (no intrabar lookahead).
     const peakBefore = maxMfeR;
-    updatePath(high, low, cOpen);
+    // We are iterating again, so nothing terminated on the PREVIOUS candle: its close-mark is now
+    // known to be an observation of a still-open position and may be committed to the series.
+    commitStagedRPathTick();
+    updatePath(high, low, cClose, cOpen);
 
     const slHitAtStop = (stop: number) => (dir === "LONG" ? low <= stop : high >= stop);
     const tpHit = dir === "LONG" ? high >= T : low <= T;
@@ -2021,6 +2266,8 @@ export async function walkVariantPath(
     const runnerR = dir === "LONG" ? (lastClose - E) / risk : (E - lastClose) / risk;
     const grossR = exitRule === "scaleout_tp1_trail" ? 0.5 * fullRewardR + 0.5 * runnerR : runnerR;
     const status = grossR > 0 ? "CLOSED_WIN" : "CLOSED_LOSS";
+    // Position was open for the whole final candle and closes at its close — no post-exit window.
+    closedAtFinalCandleClose = true;
     return finalize(status, grossR, candleCloseTime(lastCandle), "TRAIL_PATH_END", "VALID_5M_ORDERED", true);
   }
 
@@ -2029,6 +2276,8 @@ export async function walkVariantPath(
     const lastClose = candleClose(lastCandle);
     const grossR = dir === "LONG" ? (lastClose - E) / risk : (E - lastClose) / risk;
     const status = grossR > 0 ? "CLOSED_WIN" : "CLOSED_LOSS";
+    // Position was open for the whole final candle and closes at its close — no post-exit window.
+    closedAtFinalCandleClose = true;
     return finalize(status, grossR, candleCloseTime(lastCandle), "MAX_HOLD_MTM", "VALID_5M_ORDERED", true);
   }
 

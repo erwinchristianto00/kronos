@@ -203,6 +203,49 @@ export const CROSS_SECTIONAL_TREND_SHORT_BLOCKLIST = envSymbolSet(
   "CROSS_SECTIONAL_TREND_SHORT_BLOCKLIST",
   "AVAXUSDT,INJUSDT,FETUSDT,NEARUSDT,RNDRUSDT",
 );
+
+// --- MIXED long-pool widening (2026-07-26, measured dead-lane fix) — OFF BY DEFAULT ---
+// buildMixedCrossSectionalBasket borrows CROSS_SECTIONAL_TREND_LONG_ALLOWLIST, which is
+// deliberately narrow (4 symbols by default). Under MEAN_REVERSION selection that pool has almost
+// no room to move: the long side takes the 3 WEAKEST of 4 (mean ≈ the pool mean) while the short
+// side takes the 3 STRONGEST of its 6, so |scoreGap| collapses toward zero and essentially never
+// clears CROSS_SECTIONAL_MIXED_MIN_SCORE_GAP. Independent 500-bar backtest over the observed dead
+// window (26-symbol universe, 24-bar ROC):
+//     MIXED as configured, 4-symbol long pool  → median scoreGap 0.0127,  2.10% of bars clear 0.035
+//     MIXED with the wider FILTERED long pool  → median scoreGap 0.0589, 97.48% of bars clear 0.035
+//     TREND, same 4-symbol pool but MOMENTUM   → median scoreGap 0.0178,  9.24% clear (matches its
+//                                                 real 75 baskets, i.e. the model is calibrated)
+// So the binding constraint is the POOL, not the threshold and not the selection mode. The
+// threshold is therefore left at 0.035 on purpose: the same backtest shows that with the widened
+// pool 100% of bars would clear a 0.020 threshold, i.e. every MIXED_CHOP cycle would open a basket.
+// Widening the pool alone is sufficient (97.48%) and keeps a real, if shallow, dispersion filter.
+//
+// Why a flag and not a new hardcoded default list: /live and /testnet are rsync-only from this
+// shared source and have silently diverged before, so a changed shared default IS a change to live.
+// Each instance also curates its OWN CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST — live's is 7 symbols,
+// NARROWER than testnet's 21 — so baking a testnet-shaped list in here would silently widen live's
+// trading universe. Resolving through that per-instance env var means enabling this can only ever
+// widen MIXED's long pool to symbols the operator has ALREADY approved for LONG execution on that
+// same instance; it can never import another instance's universe. This matters because
+// app.ts's isCrossSectionalTrendMixedAdmissionIndependent() branch can turn MIXED into real
+// mainnet baskets, so the widened pool must be safe under the assumption that someone later sets
+// that flag too. With the flag unset, crossSectionalMixedLongAllowlist() returns the exact same set
+// MIXED uses today, so an un-flagged deploy (including a live rsync) is a bit-for-bit no-op.
+export function isCrossSectionalMixedWideLongPoolEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.CROSS_SECTIONAL_MIXED_WIDE_LONG_POOL === "1";
+}
+
+/** The long-side allowlist the MIXED (mean-reversion) basket actually uses. Resolved per call
+ *  rather than frozen at module load so the flag is testable and so nothing can read a stale value.
+ *  The long BLOCKLIST is intentionally NOT switched — CROSS_SECTIONAL_TREND_LONG_BLOCKLIST stays
+ *  applied on both paths, so widening can only ADD symbols the operator allows for longs and can
+ *  never re-admit one they explicitly blocked. Only the LONG side is touched: the short side keeps
+ *  CROSS_SECTIONAL_TREND_SHORT_ALLOWLIST/BLOCKLIST, and the TREND lane is untouched entirely. */
+export function crossSectionalMixedLongAllowlist(env: NodeJS.ProcessEnv = process.env): ReadonlySet<string> {
+  return isCrossSectionalMixedWideLongPoolEnabled(env)
+    ? CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST
+    : CROSS_SECTIONAL_TREND_LONG_ALLOWLIST;
+}
 // 2026-07-08 (operator-requested widening): a dedicated universe for cross-sectional, separate
 // from the main scanner's UNIVERSE (scan-service.ts) — widening THAT shared constant would also
 // add these symbols to Kronos forecasting, directional lane candidates, etc., none of which were
@@ -698,7 +741,11 @@ export function buildMixedCrossSectionalBasket(
     strategyFamily: "MEAN_REVERSION",
     selectionMode: "MEAN_REVERSION",
     // Mixed/chop reverses extremes, but keeps the same side-specific toxicity guardrails.
-    longAllowlist: opts.longAllowlist ?? CROSS_SECTIONAL_TREND_LONG_ALLOWLIST,
+    // Long pool: TREND's narrow allowlist by default (today's behavior, unchanged), or the
+    // instance's own FILTERED long allowlist when CROSS_SECTIONAL_MIXED_WIDE_LONG_POOL=1 — see the
+    // measured rationale at crossSectionalMixedLongAllowlist. An explicit opts.longAllowlist from a
+    // caller still wins, exactly as before.
+    longAllowlist: opts.longAllowlist ?? crossSectionalMixedLongAllowlist(),
     longBlocklist: opts.longBlocklist ?? CROSS_SECTIONAL_TREND_LONG_BLOCKLIST,
     shortAllowlist: opts.shortAllowlist ?? CROSS_SECTIONAL_TREND_SHORT_ALLOWLIST,
     shortBlocklist: opts.shortBlocklist ?? CROSS_SECTIONAL_TREND_SHORT_BLOCKLIST,
@@ -1264,6 +1311,11 @@ export function getCrossSectionalAdaptiveConfig(): {
   trendLongBlocklist: string[];
   trendShortAllowlist: string[];
   trendShortBlocklist: string[];
+  /** Which long pool the MIXED lane is actually running on, so /research shows the effective
+   *  universe instead of readers having to infer it from the TREND lists (additive/report-only). */
+  mixedWideLongPool: boolean;
+  mixedLongAllowlist: string[];
+  mixedLongBlocklist: string[];
 } {
   return {
     trendSignal: CROSS_SECTIONAL_TREND_SIGNAL,
@@ -1279,5 +1331,8 @@ export function getCrossSectionalAdaptiveConfig(): {
     trendLongBlocklist: [...CROSS_SECTIONAL_TREND_LONG_BLOCKLIST].sort(),
     trendShortAllowlist: [...CROSS_SECTIONAL_TREND_SHORT_ALLOWLIST].sort(),
     trendShortBlocklist: [...CROSS_SECTIONAL_TREND_SHORT_BLOCKLIST].sort(),
+    mixedWideLongPool: isCrossSectionalMixedWideLongPoolEnabled(),
+    mixedLongAllowlist: [...crossSectionalMixedLongAllowlist()].sort(),
+    mixedLongBlocklist: [...CROSS_SECTIONAL_TREND_LONG_BLOCKLIST].sort(),
   };
 }

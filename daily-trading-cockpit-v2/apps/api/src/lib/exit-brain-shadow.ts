@@ -28,6 +28,14 @@
  *
  * Store idiom follows cortex-real-attribution.ts: compact JSON, atomic tmp+rename, bounded detail
  * records + running aggregates that survive pruning + bounded FIFO dedup ledger.
+ *
+ * ── EVIDENCE TIERS (2026-07-26) ─────────────────────────────────────────────────────────────────
+ * Every scored trade is booked under exactly one ExitBrainEvidenceTier — MEASURED (a real recorded
+ * path) or SIMULATED (a candle-walk reconstruction of a paper order, see paper-simulated-path-
+ * store.ts). The two tiers keep completely independent aggregates and are NEVER blended into one
+ * number, mirroring the Entry Brain's Tier 1 (realized) vs Tier 2 (simulated) discipline. Records
+ * written before the tier split carry no tier and are MEASURED — which is what they are, since the
+ * only readers that existed then produced recorded real paths and recorded shadow-position outcomes.
  */
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
@@ -56,6 +64,35 @@ const TICK_HISTOGRAM_MAX_KEY = 12;
 /** Per-cycle work bound — a first run over a large backlog must not stall the shadow tick. */
 const DEFAULT_MAX_TRADES_PER_CYCLE = 500;
 
+// ── evidence tier ────────────────────────────────────────────────────────────
+
+/**
+ * WHICH KIND OF EVIDENCE a scored trade rests on. This is a PERMANENT schema discriminator, not a
+ * migration flag — mirroring the Entry Brain's own Tier 1 (entry-brain-tier1-realized-resolver.ts,
+ * MEASURED) vs Tier 2 (entry-brain-tier2-simulated-resolver.ts, EXPERIMENTAL_COST_OF_CAUTION)
+ * discipline, which likewise keeps two independent aggregates and never sums them.
+ *
+ *  - MEASURED  : the path points came from something that actually happened and was RECORDED —
+ *                position-path-recorder.ts's real per-tick R samples (live engine + single-symbol
+ *                executors), or a closed shadow position's own recorded MFE/MAE skeleton.
+ *  - SIMULATED : the path points were RECONSTRUCTED from candles by walkVariantPath (paper orders).
+ *                Real market data, but a modeled fill/exit path — Task 1 (2026-07-10) measured the
+ *                candle-walk exit methodology diverging from real fills by −193%, so a SIMULATED
+ *                number is never interchangeable with a MEASURED one.
+ *
+ * HARD RULE: the two tiers are accumulated into SEPARATE aggregates and are NEVER blended into one
+ * number — not in this store, not in buildReport(), not on the dashboard. A caller that wants "all
+ * trades" must show two numbers.
+ */
+export type ExitBrainEvidenceTier = "MEASURED" | "SIMULATED";
+
+/** Absent tier ⇒ MEASURED. Every row and every stored record written before the tier discriminator
+ *  existed came from a recorded real path or a recorded shadow-position outcome — i.e. it IS
+ *  measured evidence — so defaulting is a correct classification, not a lossy fallback. */
+export function exitBrainTierOf(tier: ExitBrainEvidenceTier | undefined | null): ExitBrainEvidenceTier {
+  return tier === "SIMULATED" ? "SIMULATED" : "MEASURED";
+}
+
 // ── reader contract (DI) ─────────────────────────────────────────────────────
 
 /** One resolved trade with whatever recorded path points exist for it. */
@@ -72,6 +109,8 @@ export interface ExitBrainResolvedTrade {
   actualExitR: number;
   /** Chronological recorded path observations (however many actually exist). */
   ticks: ExitBrainPathTick[];
+  /** Evidence tier. Omitted ⇒ MEASURED (see exitBrainTierOf). */
+  tier?: ExitBrainEvidenceTier;
 }
 
 export type ExitBrainTradeReader = () => ExitBrainResolvedTrade[] | Promise<ExitBrainResolvedTrade[]>;
@@ -90,6 +129,9 @@ export interface ExitBrainEvaluationRecord {
   deltaR: number | null;
   bankedAt: string | null;
   bankReason: string | null;
+  /** Evidence tier this record was booked under. Omitted on records written before the
+   *  discriminator existed — those are MEASURED (see exitBrainTierOf), which is what they are. */
+  tier?: ExitBrainEvidenceTier;
 }
 
 interface EvaluatedAggregate {
@@ -117,17 +159,63 @@ interface CycleMeta {
   lastError: string | null;
 }
 
+/** The SIMULATED tier's own, completely independent copies of the MEASURED counters. Deliberately a
+ *  nested object rather than extra sibling fields: it is structurally impossible to accidentally
+ *  `+=` a simulated result into a measured counter when the two live in different objects, and a
+ *  reader that forgets the tier split gets the MEASURED numbers (the conservative default), never a
+ *  silently blended one. */
+interface SimulatedTierState {
+  evaluated: EvaluatedAggregate;
+  insufficient: { n: number };
+  tickHistogram: Record<string, number>;
+}
+
 interface ExitBrainShadowState {
   version: number;
   records: ExitBrainEvaluationRecord[];
+  /** MEASURED tier only (see ExitBrainEvidenceTier). Never includes a SIMULATED result. */
   evaluated: EvaluatedAggregate;
+  /** MEASURED tier only. */
   insufficient: { n: number };
-  /** Histogram of recorded tick counts over EVERY processed trade (evaluated + insufficient) —
-   *  the direct "how dense are today's recorded paths" evidence. Keys "0".."12" and "13+". */
+  /** Histogram of recorded tick counts over every processed MEASURED trade (evaluated +
+   *  insufficient) — the direct "how dense are today's RECORDED paths" evidence. Keys "0".."12" and
+   *  "13+". Simulated candle-walk series are counted in `simulated.tickHistogram` instead: folding
+   *  them in here would inflate the very coverage number that exists to prove whether real recorded
+   *  paths are dense enough. */
   tickHistogram: Record<string, number>;
+  /** MEASURED tier only — a per-lane mean that was part measured and part simulated would be
+   *  uninterpretable. The SIMULATED tier's lane detail is available through `records` (each carries
+   *  laneId + tier); it deliberately has no blended per-lane aggregate. */
   perLane: Record<string, LaneAggregate>;
+  /** SIMULATED tier's independent counters. Absent on files written before the tier split ⇒ zeroed
+   *  (there were no simulated results then, by construction). */
+  simulated: SimulatedTierState;
   processedTradeIds: string[];
   cycleMeta: CycleMeta;
+}
+
+/** One evidence tier's complete, self-contained block. MEASURED and SIMULATED are reported as two
+ *  of these and are NEVER added together — see ExitBrainEvidenceTier's hard rule. */
+export interface ExitBrainTierBlock {
+  tier: ExitBrainEvidenceTier;
+  /** Human-readable statement of what this tier's numbers are (and are not). Rendered verbatim so
+   *  an operator cannot read a simulated number as a measured one. */
+  note: string;
+  processed: number;
+  evaluated: number;
+  insufficientPathData: number;
+  coverageRatio: number | null;
+  tickHistogram: Record<string, number>;
+  n: number;
+  meanDeltaR: number | null;
+  cumDeltaR: number;
+  meanActualExitR: number | null;
+  meanPolicyExitR: number | null;
+  policyBetterShare: number | null;
+  policyBetter: number;
+  policyWorse: number;
+  ties: number;
+  banked: number;
 }
 
 export interface ExitBrainShadowReport {
@@ -157,10 +245,21 @@ export interface ExitBrainShadowReport {
   perLane: Array<{ laneId: string } & LaneAggregate & { meanDeltaR: number | null }>;
   recent: ExitBrainEvaluationRecord[];
   cycleMeta: CycleMeta;
+  /** MEASURED evidence — identical content to `coverage`/`performance` above, which have ALWAYS
+   *  been measured-only and stay byte-identical for existing data. Exposed as a tier block too so a
+   *  consumer can render the two tiers symmetrically without special-casing one of them. */
+  measured: ExitBrainTierBlock;
+  /** SIMULATED evidence — candle-walk reconstructions of paper orders. Structurally independent of
+   *  every other number in this report; never added to the measured block. */
+  simulated: ExitBrainTierBlock;
 }
 
 function emptyEvaluated(): EvaluatedAggregate {
   return { n: 0, cumDeltaR: 0, cumActualExitR: 0, cumPolicyExitR: 0, policyBetter: 0, policyWorse: 0, ties: 0, banked: 0 };
+}
+
+function emptySimulatedTier(): SimulatedTierState {
+  return { evaluated: emptyEvaluated(), insufficient: { n: 0 }, tickHistogram: {} };
 }
 
 function emptyState(): ExitBrainShadowState {
@@ -171,6 +270,7 @@ function emptyState(): ExitBrainShadowState {
     insufficient: { n: 0 },
     tickHistogram: {},
     perLane: {},
+    simulated: emptySimulatedTier(),
     processedTradeIds: [],
     cycleMeta: { lastRunAtIso: null, lastProcessed: 0, lastError: null },
   };
@@ -229,10 +329,22 @@ export class ExitBrainShadowStore {
             policyBetter: Math.max(0, Math.floor(finiteOr(c.policyBetter, 0))),
           };
         }
-        const tickHistogram: Record<string, number> = {};
-        for (const [k, v] of Object.entries(raw.tickHistogram ?? {})) {
-          if (typeof k === "string" && Number.isFinite(v)) tickHistogram[k] = Math.max(0, Math.floor(v as number));
-        }
+        const sanitizeHistogram = (rawHist: unknown): Record<string, number> => {
+          const out: Record<string, number> = {};
+          for (const [k, v] of Object.entries((rawHist ?? {}) as Record<string, unknown>)) {
+            if (typeof k === "string" && Number.isFinite(v)) out[k] = Math.max(0, Math.floor(v as number));
+          }
+          return out;
+        };
+        const tickHistogram = sanitizeHistogram(raw.tickHistogram);
+        // Absent on files written before the tier split — zeroed, which is exactly right: no
+        // simulated result had ever been booked then, so nothing is lost and no MEASURED number moves.
+        const rawSimulated = (raw.simulated ?? {}) as Partial<SimulatedTierState>;
+        const simulated: SimulatedTierState = {
+          evaluated: sanitizeEvaluated(rawSimulated.evaluated),
+          insufficient: { n: Math.max(0, Math.floor(finiteOr((rawSimulated.insufficient ?? {}).n, 0))) },
+          tickHistogram: sanitizeHistogram(rawSimulated.tickHistogram),
+        };
         const records = (raw.records as unknown[]).filter((r): r is ExitBrainEvaluationRecord => {
           if (!r || typeof r !== "object") return false;
           const rec = r as Partial<ExitBrainEvaluationRecord>;
@@ -253,6 +365,7 @@ export class ExitBrainShadowStore {
           insufficient: { n: Math.max(0, Math.floor(finiteOr((raw.insufficient ?? {}).n, 0))) },
           tickHistogram,
           perLane,
+          simulated,
           processedTradeIds: Array.isArray(raw.processedTradeIds)
             ? raw.processedTradeIds.filter((id): id is string => typeof id === "string").slice(-MAX_PROCESSED_IDS)
             : [],
@@ -288,11 +401,19 @@ export class ExitBrainShadowStore {
       this.state.records.push(record);
       if (this.state.records.length > MAX_RECORDS) this.state.records = this.state.records.slice(-MAX_RECORDS);
 
+      // TIER ROUTING (the only place a result is attributed to a tier). Every counter touched below
+      // belongs to exactly ONE tier's object; a simulated result can never reach a measured counter,
+      // and vice versa. Absent tier ⇒ MEASURED (see exitBrainTierOf).
+      const isSimulated = exitBrainTierOf(record.tier) === "SIMULATED";
+      const tierEvaluated = isSimulated ? this.state.simulated.evaluated : this.state.evaluated;
+      const tierInsufficient = isSimulated ? this.state.simulated.insufficient : this.state.insufficient;
+      const tierHistogram = isSimulated ? this.state.simulated.tickHistogram : this.state.tickHistogram;
+
       const histKey = record.tickCount > TICK_HISTOGRAM_MAX_KEY ? `${TICK_HISTOGRAM_MAX_KEY + 1}+` : String(Math.max(0, Math.floor(record.tickCount)));
-      this.state.tickHistogram[histKey] = (this.state.tickHistogram[histKey] ?? 0) + 1;
+      tierHistogram[histKey] = (tierHistogram[histKey] ?? 0) + 1;
 
       if (record.status === "EVALUATED" && record.policyExitR !== null && record.deltaR !== null) {
-        const agg = this.state.evaluated;
+        const agg = tierEvaluated;
         agg.n += 1;
         agg.cumDeltaR += record.deltaR;
         agg.cumActualExitR += record.actualExitR;
@@ -302,15 +423,20 @@ export class ExitBrainShadowStore {
         else agg.ties += 1;
         if (record.bankedAt !== null) agg.banked += 1;
 
-        const laneKey =
-          record.laneId in this.state.perLane || Object.keys(this.state.perLane).length < MAX_LANES ? record.laneId : OVERFLOW_LANE_ID;
-        const lane = this.state.perLane[laneKey] ?? { n: 0, cumDeltaR: 0, policyBetter: 0 };
-        lane.n += 1;
-        lane.cumDeltaR += record.deltaR;
-        if (record.deltaR > 0) lane.policyBetter += 1;
-        this.state.perLane[laneKey] = lane;
+        // perLane is MEASURED-ONLY by contract (see the field's doc on ExitBrainShadowState): a lane
+        // mean that silently mixed measured and simulated rows would be uninterpretable, and there
+        // is no honest way to present one blended per-lane number.
+        if (!isSimulated) {
+          const laneKey =
+            record.laneId in this.state.perLane || Object.keys(this.state.perLane).length < MAX_LANES ? record.laneId : OVERFLOW_LANE_ID;
+          const lane = this.state.perLane[laneKey] ?? { n: 0, cumDeltaR: 0, policyBetter: 0 };
+          lane.n += 1;
+          lane.cumDeltaR += record.deltaR;
+          if (record.deltaR > 0) lane.policyBetter += 1;
+          this.state.perLane[laneKey] = lane;
+        }
       } else {
-        this.state.insufficient.n += 1;
+        tierInsufficient.n += 1;
       }
 
       this.processedIdSet.add(record.tradeId);
@@ -335,6 +461,47 @@ export class ExitBrainShadowStore {
   /** Persist now (for batch writers using deferSave). Never throws. */
   flush(): void {
     this._save();
+  }
+
+  /** Folds ONE tier's counters into its self-contained block. Reads only the objects it is handed —
+   *  it cannot reach across tiers, which is what makes cross-contamination impossible here too. */
+  private buildTierBlock(
+    tier: ExitBrainEvidenceTier,
+    ev: EvaluatedAggregate,
+    insufficientN: number,
+    tickHistogram: Record<string, number>,
+  ): ExitBrainTierBlock {
+    const processed = ev.n + insufficientN;
+    const coverageRatio = processed > 0 ? ev.n / processed : null;
+    const scope =
+      tier === "SIMULATED"
+        ? "SIMULATED (candle-walk reconstruction of paper orders — modeled, NOT measured; never add to the MEASURED block)"
+        : "MEASURED (real recorded paths)";
+    const note =
+      processed === 0
+        ? `${scope}: no resolved trades processed yet.`
+        : coverageRatio === 0
+          ? `${scope}: 0% of resolved trades carry enough recorded path ticks to score the exit policy (min ${DEFAULT_EXIT_BRAIN_PARAMS.minEvaluableTicks} ticks).`
+          : `${scope}: ${(coverageRatio! * 100).toFixed(1)}% of resolved trades were dense enough to score (min ${DEFAULT_EXIT_BRAIN_PARAMS.minEvaluableTicks} ticks).`;
+    return {
+      tier,
+      note,
+      processed,
+      evaluated: ev.n,
+      insufficientPathData: insufficientN,
+      coverageRatio,
+      tickHistogram: { ...tickHistogram },
+      n: ev.n,
+      meanDeltaR: ev.n > 0 ? ev.cumDeltaR / ev.n : null,
+      cumDeltaR: ev.cumDeltaR,
+      meanActualExitR: ev.n > 0 ? ev.cumActualExitR / ev.n : null,
+      meanPolicyExitR: ev.n > 0 ? ev.cumPolicyExitR / ev.n : null,
+      policyBetterShare: ev.n > 0 ? ev.policyBetter / ev.n : null,
+      policyBetter: ev.policyBetter,
+      policyWorse: ev.policyWorse,
+      ties: ev.ties,
+      banked: ev.banked,
+    };
   }
 
   buildReport(): ExitBrainShadowReport {
@@ -374,6 +541,16 @@ export class ExitBrainShadowStore {
         .sort((a, b) => Math.abs(b.cumDeltaR) - Math.abs(a.cumDeltaR)),
       recent: this.state.records.slice(-20),
       cycleMeta: { ...this.state.cycleMeta },
+      // Two INDEPENDENT blocks. `measured` restates exactly the coverage/performance numbers above
+      // (both have always been measured-only); `simulated` is built from its own separate counters
+      // and is never summed with them anywhere in this report.
+      measured: this.buildTierBlock("MEASURED", ev, this.state.insufficient.n, this.state.tickHistogram),
+      simulated: this.buildTierBlock(
+        "SIMULATED",
+        this.state.simulated.evaluated,
+        this.state.simulated.insufficient.n,
+        this.state.simulated.tickHistogram,
+      ),
     };
   }
 
@@ -406,6 +583,10 @@ export function _resetExitBrainShadowStoreForTests(): void {
  * Sign note: shadow-engine stores maeR as a POSITIVE magnitude (Math.max(0, adverseAbs)/risk);
  * the path tick needs the signed unrealized R at the trough, so it is negated here. Ticks with
  * missing timestamps are simply omitted (never fabricated). Pure; exported for tests.
+ *
+ * TIER: rows carry no `tier`, i.e. MEASURED — these are a real closed position's own recorded
+ * MFE/MAE observations, not a reconstruction. (Sparse, so most classify INSUFFICIENT_PATH_DATA —
+ * that is a density problem, not an evidence-quality one.)
  */
 export function resolvedTradesFromShadowPositions(positions: ShadowPosition[]): ExitBrainResolvedTrade[] {
   const out: ExitBrainResolvedTrade[] = [];
@@ -501,6 +682,9 @@ export async function runExitBrainShadowCycle(deps: ExitBrainShadowCycleDeps): P
           deltaR: cf.deltaR,
           bankedAt: cf.bankedAt,
           bankReason: cf.bankReason,
+          // Carried verbatim from the reader that produced this trade — the reader is the ONLY
+          // authority on what kind of evidence its rows are. Absent ⇒ MEASURED (exitBrainTierOf).
+          tier: exitBrainTierOf(trade.tier),
         },
         { deferSave: true },
       );

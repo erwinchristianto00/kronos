@@ -231,6 +231,11 @@ import {
   runExitBrainShadowCycleGuarded,
 } from "../lib/exit-brain-shadow.js";
 import { getPositionPathRecorder, resolvedTradesFromRecordedPaths } from "../lib/position-path-recorder.js";
+import {
+  getSimulatedPaperPathStore,
+  resolvedTradesFromSimulatedPaperPaths,
+  simulatedPaperPathDirFor,
+} from "../lib/paper-simulated-path-store.js";
 import { DEFAULT_EXIT_BRAIN_PARAMS } from "../lib/exit-brain-policy.js";
 import {
   runResidualMomentumCycleGuarded,
@@ -2288,15 +2293,34 @@ export async function registerShadowRoutes(
             // tradeId collision — real ticks always take priority over a 4-point skeleton.
             // Fail-open: a recorder failure degrades to the skeleton-only reader, never breaks
             // the cycle.
+            // 2026-07-26: a THIRD source is appended LAST — walkVariantPath's per-candle R series
+            // for RESOLVED PAPER orders (paper-simulated-path-store.ts). These are SIMULATED, not
+            // measured, and every row it emits carries tier:"SIMULATED" so exit-brain-shadow.ts
+            // books them into their own independent aggregate and never blends them with the
+            // measured numbers. Appended last so the existing dense→skeleton precedence above is
+            // untouched, and wrapped in its own try/catch so it keeps the same fail-open behavior.
             readResolvedTrades: () => {
               const skeletons = resolvedTradesFromShadowPositions(_ebEngine.getAllPositions());
+              let measured = skeletons;
               try {
                 const dense = resolvedTradesFromRecordedPaths(getPositionPathRecorder().listClosedPaths());
-                if (dense.length === 0) return skeletons;
-                const denseIds = new Set(dense.map((t) => t.tradeId));
-                return [...dense, ...skeletons.filter((t) => !denseIds.has(t.tradeId))];
+                if (dense.length > 0) {
+                  const denseIds = new Set(dense.map((t) => t.tradeId));
+                  measured = [...dense, ...skeletons.filter((t) => !denseIds.has(t.tradeId))];
+                }
               } catch {
-                return skeletons;
+                measured = skeletons;
+              }
+              try {
+                // Same dir derivation the writer uses (simulatedPaperPathDirFor over the SAME paper
+                // store), so reader and writer can never point at different files.
+                const simStore = getSimulatedPaperPathStore(simulatedPaperPathDirFor(getPaperExecutionRouterStore().path));
+                const simulated = resolvedTradesFromSimulatedPaperPaths(simStore.listPaths());
+                if (simulated.length === 0) return measured;
+                const seen = new Set(measured.map((t) => t.tradeId));
+                return [...measured, ...simulated.filter((t) => !seen.has(t.tradeId))];
+              } catch {
+                return measured;
               }
             },
             now: Date.now(),

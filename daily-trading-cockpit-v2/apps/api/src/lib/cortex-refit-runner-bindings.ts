@@ -44,6 +44,7 @@ import {
   CROSS_SECTIONAL_MIXED_LANE_ID,
 } from "./cross-sectional-executor.js";
 import { getCurrentGuardVariantMatrixStore } from "./current-guard-variant-matrix.js";
+import { peekPaperExecutionRouterStore } from "./paper-execution-router.js";
 
 /** Only pull outcomes resolved within this window — older ones can't attribute (their decisions rotated
  *  out of the ~26-day journal) and the refit's recency decay makes them ~zero weight anyway. Bounds the
@@ -63,6 +64,303 @@ const XSEC_STORE_VARIANTS: Record<string, string> = {
   [CROSS_SECTIONAL_TREND_LANE_ID]: "TREND_BETA_VOL",
   [CROSS_SECTIONAL_MIXED_LANE_ID]: "MIXED_MEAN_REVERSION",
 };
+
+// ─── PAPER-EXECUTION-ROUTER outcome source for the three DEAD LONG CG lanes ──────────────────────────
+//
+// WHY (measured 2026-07-26): the CG block below reads ONLY getCurrentGuardVariantMatrixStore().all, and
+// that store's LONG side is dead — its LONG rows were all written inside one 23-hour window on
+// 2026-06-27 and every one of them resolved BEFORE the CORTEX decision journal's earliest retained
+// decision, so the three CG LONG lanes can never reach the 20 attributed examples LEARNING_ACTIVE needs
+// no matter how long they wait. data/paper-execution-router.json, by contrast, holds fresh CLOSED orders
+// for exactly those lanes with a real netR and a real market close timestamp. A router order's
+// `openedAt` is the scan-batch timestamp, which always has a journaled brain decision inside the 50-min
+// directional TTL, so attribution is causally sound (the owning decision strictly precedes the open) and
+// carries no label leakage (nothing here is keyed on resolvedAt).
+//
+// ENV-GATED, DEFAULT OFF: with CORTEX_CG_ROUTER_OUTCOMES unset/≠"1" this whole block contributes
+// nothing — no store read, no observations, no source entries — so the refit's inputs are byte-for-byte
+// what they are today on every instance, including real-money mainnet 3103.
+
+/** Router `selectedLaneId` namespaces. BOTH appear on real LONG orders (confirmed in the live store), so
+ *  the prefix is NOT a usable direction label — direction is always taken from the order itself. Mirrors
+ *  entry-brain-tier1-realized-resolver.ts's VARIANT_MATRIX_LANE_PREFIXES. */
+const CG_ROUTER_LANE_PREFIXES = ["CG_LONG_VARIANT_MATRIX:", "CG_VARIANT_MATRIX:"] as const;
+
+/**
+ * Strip either router namespace off a `selectedLaneId`, returning the bare variant id — or null when the
+ * id carries neither prefix (a non-variant-matrix router lane, which this source must ignore entirely).
+ */
+export function cortexCgRouterVariantId(selectedLaneId: string | null | undefined): string | null {
+  const id = typeof selectedLaneId === "string" ? selectedLaneId.trim() : "";
+  for (const prefix of CG_ROUTER_LANE_PREFIXES) {
+    if (id.startsWith(prefix) && id.length > prefix.length) return id.slice(prefix.length);
+  }
+  return null;
+}
+
+/**
+ * EXPLICIT ALLOWLIST — variantId → CORTEX laneId — for the THREE dead LONG lanes and nothing else.
+ *
+ * This is deliberately NOT `CG_ROSTER.find(l => l.variantId === v && l.direction === ord.direction)`:
+ * that generic form also matches CG_MFE_GIVEBACK_SHORT, which already has a healthy, working
+ * variant-matrix outcome source. Blending a second data-generating process (paper-router fills, a
+ * different fill/cost/exit model) into a lane that is already learning would corrupt it mid-flight while
+ * looking like nothing more than "more data". Every entry here is LONG by construction, and the reader
+ * additionally requires the ORDER's own direction to be LONG, so a SHORT order can never land in any of
+ * these books even if a future writer reuses one of these variant ids.
+ */
+const CG_ROUTER_LONG_LANE_BY_VARIANT: ReadonlyMap<string, string> = new Map<string, string>([
+  ["CG_WIDE_FAST_LONG", "CG_WIDE_FAST_LONG"],
+  ["CG_WIDE_LONG_RUNNER", "CG_WIDE_LONG_RUNNER"],
+  ["CG_MFE_GIVEBACK", CORTEX_CG_MFE_GIVEBACK_LONG_LANE_ID],
+]);
+
+/** The CORTEX lane ids this source may EVER write to. Exported so a test can assert the negative
+ *  (CG_MFE_GIVEBACK_SHORT is not a member) without reaching into module internals. */
+export const CORTEX_CG_ROUTER_ALLOWED_LANE_IDS: readonly string[] = [...CG_ROUTER_LONG_LANE_BY_VARIANT.values()];
+
+/** The mark-to-market close reason. 141/200 of CG_WIDE_LONG_RUNNER's router closes carry it. */
+const ROUTER_MAX_HOLD_MTM_REASON = "MAX_HOLD_MTM";
+
+/** ECMA-262's maximum representable time value. `new Date(x).toISOString()` THROWS RangeError beyond it,
+ *  and this code runs inside the real-money mainnet process — one corrupt row in a 100k-order book must
+ *  degrade to a counted BAD_TIMESTAMP, never take down the whole nightly refit. */
+const MAX_EPOCH_MS = 8.64e15;
+function safeEpochToIso(ms: number | null | undefined): string | null {
+  return typeof ms === "number" && Number.isFinite(ms) && Math.abs(ms) <= MAX_EPOCH_MS ? new Date(ms).toISOString() : null;
+}
+
+/** The minimal structural shape this source needs from a PaperOrder (real PaperOrder is assignable). */
+export interface CortexCgRouterOrderLike {
+  paperOrderId: string;
+  selectedLaneId: string;
+  direction: "LONG" | "SHORT";
+  openedAt: string;
+  paperStatus: string;
+  netR: number | null;
+  /** MARKET timestamp of the exit candle — the documented attribution key (never updatedAt/Date.now). */
+  closedAtMs?: number | null;
+  closeReason?: string | null;
+}
+
+export interface CortexCgRouterLaneCounts {
+  /** Observations handed to the normalizer for this lane. */
+  admitted: number;
+  /** MAX_HOLD_MTM closes DROPPED because CORTEX_CG_ROUTER_INCLUDE_MTM is off (the default). */
+  maxHoldMtmExcluded: number;
+  /** MAX_HOLD_MTM closes ADMITTED because the operator explicitly opted in. NOT realized edge. */
+  maxHoldMtmIncluded: number;
+  /** Router orders for this lane that never reached a WIN/LOSS close (still open, rejected, no-fill…). */
+  nonClosedSkipped: number;
+}
+
+export interface CortexCgRouterOutcomeSummary {
+  /** CORTEX_CG_ROUTER_OUTCOMES === "1". False ⇒ this source contributed literally nothing. */
+  enabled: boolean;
+  /** False ⇒ the paper-router singleton was NOT already resident, so nothing was read (see the
+   *  cold-parse guard on readResidentCgRouterOrders). Honest "we produced no data and why". */
+  storeResident: boolean;
+  /** Router orders scanned (0 when disabled or not resident). */
+  ordersScanned: number;
+  /** CORTEX_CG_ROUTER_INCLUDE_MTM === "1". TRUE means mark-to-market marks are being fed to the learner
+   *  as if they were realized outcomes — see the honesty note on collectCortexCgRouterObs. */
+  includeMaxHoldMtm: boolean;
+  /** Total MTM marks admitted across all three lanes. Non-zero here is the loud signal that this run's
+   *  CG LONG evidence is NOT purely realized. */
+  maxHoldMtmIncludedTotal: number;
+  byLane: Record<string, CortexCgRouterLaneCounts>;
+}
+
+function emptyRouterLaneCounts(): CortexCgRouterLaneCounts {
+  return { admitted: 0, maxHoldMtmExcluded: 0, maxHoldMtmIncluded: 0, nonClosedSkipped: 0 };
+}
+
+export function emptyCortexCgRouterSummary(
+  over: Partial<CortexCgRouterOutcomeSummary> = {},
+): CortexCgRouterOutcomeSummary {
+  return {
+    enabled: false,
+    storeResident: false,
+    ordersScanned: 0,
+    includeMaxHoldMtm: false,
+    maxHoldMtmIncludedTotal: 0,
+    byLane: {},
+    ...over,
+  };
+}
+
+/** CORTEX_CG_ROUTER_OUTCOMES — default OFF. Opt-in only, exact "1" (no truthy-string ambiguity). */
+export function cortexCgRouterOutcomesEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.CORTEX_CG_ROUTER_OUTCOMES === "1";
+}
+
+/** CORTEX_CG_ROUTER_INCLUDE_MTM — default OFF. Its own flag, deliberately NOT folded into the one
+ *  above: turning the router source on must not silently also turn mark-to-market marks on. */
+export function cortexCgRouterIncludeMaxHoldMtm(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.CORTEX_CG_ROUTER_INCLUDE_MTM === "1";
+}
+
+/**
+ * PURE: fold paper-router orders into per-lane RawDirectionalObs for the three allowlisted LONG CG lanes.
+ *
+ * MAX_HOLD_MTM HONESTY GUARD (default: EXCLUDE). A MAX_HOLD_MTM close is a mark-to-market snapshot at the
+ * max-hold horizon, not a realized exit — the documented phantom-equity hazard. 141 of
+ * CG_WIDE_LONG_RUNNER's 200 router closes are MAX_HOLD_MTM and its router netR sums to roughly +104R,
+ * while the SAME lane in the variant-matrix store shows 337 CLOSED_LOSS against 2 CLOSED_WIN. That
+ * divergence is strong evidence the +104R is a marking artifact rather than edge, so these marks are
+ * DROPPED unless the operator sets CORTEX_CG_ROUTER_INCLUDE_MTM=1. Either way the counts are reported
+ * per lane (and logged by runCortexNightlyRefit), and admitted marks are namespaced `router-mtm:` rather
+ * than `router:` so their provenance stays visible forever in the store's counted-observation ledger —
+ * nobody can later read an MTM-fed lane as realized edge.
+ *
+ * Everything that is not admitted is COUNTED in the returned summary (module contract: no silent drops).
+ * Rows with a corrupt openedAt / missing close timestamp / non-finite netR are deliberately PASSED
+ * THROUGH to directionalObsToOutcome so they are tallied as BAD_TIMESTAMP / NO_OUTCOME_VALUE in the
+ * standard skipsByLane report, exactly like the variant-matrix block does.
+ *
+ * COST: a single O(orders) pass of string compares + one Map lookup each, run once per refit interval
+ * (6h by default). On the largest real book that is single-digit milliseconds — orders of magnitude below
+ * the file parse this deliberately never performs (see readResidentCgRouterOrders).
+ */
+export function collectCortexCgRouterObs(
+  orders: readonly CortexCgRouterOrderLike[],
+  opts: { includeMaxHoldMtm: boolean },
+): { byLane: Map<string, RawDirectionalObs[]>; byLaneCounts: Record<string, CortexCgRouterLaneCounts> } {
+  const byLane = new Map<string, RawDirectionalObs[]>();
+  const byLaneCounts: Record<string, CortexCgRouterLaneCounts> = {};
+  for (const laneId of CG_ROUTER_LONG_LANE_BY_VARIANT.values()) {
+    byLane.set(laneId, []);
+    byLaneCounts[laneId] = emptyRouterLaneCounts();
+  }
+
+  for (const ord of orders) {
+    const variantId = cortexCgRouterVariantId(ord?.selectedLaneId);
+    if (variantId === null) continue; // not a variant-matrix router lane at all
+    const laneId = CG_ROUTER_LONG_LANE_BY_VARIANT.get(variantId);
+    if (laneId === undefined) continue; // (a) NOT on the three-lane allowlist — e.g. CG_WIDE_STOP_TP_WIDE
+    // (b) Direction comes from the ORDER, never from the "CG_LONG_" prefix. Both namespaces carry LONG
+    // orders in the real store, and this is also the second, independent guard that keeps a SHORT
+    // CG_MFE_GIVEBACK order out of the already-healthy CG_MFE_GIVEBACK_SHORT book.
+    if (ord.direction !== "LONG") continue;
+
+    const counts = byLaneCounts[laneId]!;
+    const isClosed = ord.paperStatus === "PAPER_CLOSED_WIN" || ord.paperStatus === "PAPER_CLOSED_LOSS";
+    if (!isClosed) {
+      counts.nonClosedSkipped += 1;
+      continue;
+    }
+
+    const isMtm = (ord.closeReason ?? "") === ROUTER_MAX_HOLD_MTM_REASON;
+    if (isMtm && !opts.includeMaxHoldMtm) {
+      counts.maxHoldMtmExcluded += 1;
+      continue;
+    }
+    if (isMtm) counts.maxHoldMtmIncluded += 1;
+
+    // A corrupt openedAt becomes NaN (NOT a silent skip) so directionalObsToOutcome tallies BAD_TIMESTAMP.
+    const openedAtMs = parseIsoMs(ord.openedAt) ?? Number.NaN;
+    // closedAtMs is the MARKET close timestamp — the only legitimate attribution key here. A row without a
+    // usable one becomes resolvedAt=null ⇒ BAD_TIMESTAMP, never a fabricated resolvedAtMs/updatedAt/
+    // Date.now() fallback (paper-execution-router.ts is explicit that resolvedAtMs is audit-only).
+    const resolvedAt = safeEpochToIso(ord.closedAtMs);
+
+    byLane.get(laneId)!.push({
+      // Namespaced so it can never collide with a variant-matrix observationId for the same lane (the
+      // attribution dedupe key is `${laneId}::${observationId}`), and so MTM provenance is permanent.
+      observationId: `${isMtm ? "router-mtm" : "router"}:${ord.paperOrderId}`,
+      openedAtMs,
+      resolvedAt,
+      status: ord.paperStatus === "PAPER_CLOSED_WIN" ? "CLOSED_WIN" : "CLOSED_LOSS",
+      netR: typeof ord.netR === "number" && Number.isFinite(ord.netR) ? ord.netR : null,
+    });
+    counts.admitted += 1;
+  }
+
+  return { byLane, byLaneCounts };
+}
+
+/**
+ * (c) COLD-PARSE GUARD — how this is guaranteed:
+ *
+ * This reader calls peekPaperExecutionRouterStore(), which returns the module singleton ONLY if some
+ * earlier caller already constructed it, and NEVER constructs it. It is therefore impossible for the
+ * refit to be the first caller that materializes the store, and impossible for this code path to
+ * trigger the ~107 MB synchronous readFileSync + JSON.parse that `new PaperExecutionRouterStore()`
+ * performs. On testnet/live the store is instantiated at boot (app.ts wires it into the execution
+ * engine), so `.all` is a free in-memory array reference. In the standalone-CORTEX path (app.ts's
+ * cortexStandaloneRefitTick, liveEngine absent) it is typically NOT resident — there this returns null
+ * and the source honestly contributes nothing, rather than paying a multi-second event-loop block on
+ * every refit interval. That was the failure shape of the 2026-07-20 testnet-unresponsive incident (a
+ * 234 MB file re-read per poll, CPU 140%), and the refit shares its process with the live mainnet
+ * execution engine on 3103.
+ */
+function readResidentCgRouterOrders(): readonly CortexCgRouterOrderLike[] | null {
+  const store = peekPaperExecutionRouterStore();
+  return store ? store.all : null;
+}
+
+/** Impure wrapper: apply the two env flags + the residency guard, then fold via the pure collector. */
+export function gatherCortexCgRouterOutcomes(deps: {
+  env?: NodeJS.ProcessEnv;
+  readOrders?: () => readonly CortexCgRouterOrderLike[] | null;
+}): { byLane: Map<string, RawDirectionalObs[]>; summary: CortexCgRouterOutcomeSummary } {
+  const env = deps.env ?? process.env;
+  if (!cortexCgRouterOutcomesEnabled(env)) {
+    // Default path: no store touched, no source entries produced — today's behavior exactly.
+    return { byLane: new Map(), summary: emptyCortexCgRouterSummary() };
+  }
+  const includeMaxHoldMtm = cortexCgRouterIncludeMaxHoldMtm(env);
+  const orders = (deps.readOrders ?? readResidentCgRouterOrders)();
+  if (orders === null) {
+    return {
+      byLane: new Map(),
+      summary: emptyCortexCgRouterSummary({ enabled: true, storeResident: false, includeMaxHoldMtm }),
+    };
+  }
+  const { byLane, byLaneCounts } = collectCortexCgRouterObs(orders, { includeMaxHoldMtm });
+  return {
+    byLane,
+    summary: {
+      enabled: true,
+      storeResident: true,
+      ordersScanned: orders.length,
+      includeMaxHoldMtm,
+      maxHoldMtmIncludedTotal: Object.values(byLaneCounts).reduce((s, c) => s + c.maxHoldMtmIncluded, 0),
+      byLane: byLaneCounts,
+    },
+  };
+}
+
+/**
+ * PURE: render the CG-router source's one-line operator log, or null when the source is disabled (the
+ * default — a disabled source must not add a line of noise to every refit tick).
+ *
+ * The MTM wording is deliberately blunt: when marks are included the line says so in capitals and names
+ * them "NOT-REALIZED", so an operator reading the log can never mistake an MTM-fed lane's R for edge.
+ */
+export function formatCortexCgRouterOutcomeSummary(summary: CortexCgRouterOutcomeSummary): string | null {
+  if (!summary.enabled) return null;
+  if (!summary.storeResident) {
+    return "[cortex-refit] CG_ROUTER_OUTCOMES=1 but the paper-execution-router store is NOT resident in this process — no router outcomes read (deliberate: never cold-parse the ~107MB book on the refit interval).";
+  }
+  const lanes = Object.entries(summary.byLane)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(
+      ([laneId, c]) =>
+        `${laneId} admitted=${c.admitted} mtmExcluded=${c.maxHoldMtmExcluded} mtmIncluded=${c.maxHoldMtmIncluded} nonClosed=${c.nonClosedSkipped}`,
+    )
+    .join(" | ");
+  const mtmNote =
+    summary.maxHoldMtmIncludedTotal > 0
+      ? ` *** WARNING: ${summary.maxHoldMtmIncludedTotal} MAX_HOLD_MTM mark-to-market closes were ADMITTED as outcomes (CORTEX_CG_ROUTER_INCLUDE_MTM=1). These are NOT-REALIZED marks; their R is not edge. Their observationIds are namespaced "router-mtm:". ***`
+      : "";
+  return `[cortex-refit] CG_ROUTER_OUTCOMES=1 scanned=${summary.ordersScanned} includeMaxHoldMtm=${summary.includeMaxHoldMtm} — ${lanes}${mtmNote}`;
+}
+
+function logCortexCgRouterOutcomeSummary(summary: CortexCgRouterOutcomeSummary): void {
+  const line = formatCortexCgRouterOutcomeSummary(summary);
+  if (line !== null) console.log(line);
+}
 
 /** Parse the append-only journal into decision rows. Per-line try/catch (a truncated line is skipped +
  *  counted, never aborts the read), reads .jsonl.1 (older) before .jsonl (newer), dedupes rows by `at`. */
@@ -175,23 +473,47 @@ export function collectCortexOutcomes(sources: {
   return { outcomes, skipsByLane: skips };
 }
 
-/** The lane IDs actually covered by a wired reader — the union of the `directional` and `xsec` source
+/** The lane IDs actually covered by a wired reader — derived from the `directional` and `xsec` source
  *  arrays this same function builds from the real stores. This (never a hardcoded constant) is what
  *  decides hasOutcomeSource: a CORTEX_LANE_ROSTER lane added without a matching push into either array
  *  correctly reports NO_OUTCOME_SOURCE (structurally unwired) instead of being silently reported as
- *  INSUFFICIENT_DATA (which implies it just needs more time to accumulate). Pure + independently testable. */
+ *  INSUFFICIENT_DATA (which implies it just needs more time to accumulate). Pure + independently testable.
+ *
+ *  2026-07-26 HONESTY FIX: this used to test laneId MEMBERSHIP only, so a source entry pushed with an
+ *  EMPTY observation array counted as "wired". The CG block below pushes all four CG lanes
+ *  unconditionally (`for (const [laneId, obs] of cgByLane) directional.push({ laneId, obs })`) — one
+ *  entry per roster lane whether or not the variant matrix holds a single row for it — so three CG LONG
+ *  lanes whose outcome source has been structurally dead for weeks were reported INSUFFICIENT_DATA
+ *  ("just needs more time") and the readiness card showed noOutcomeSource: 0, which is why nobody
+ *  noticed. An entry with zero observations is not a source; it is the absence of one. `obs` is a
+ *  REQUIRED parameter (not optional-with-a-permissive-default) precisely so no future caller can
+ *  re-introduce the membership-only reading by simply forgetting to pass it.
+ *
+ *  This is a REPORTING-status change only, and it cannot silence a lane that is actually learning:
+ *  cortex-attribution.ts assigns NO_OUTCOME_SOURCE from exactly this hasOutcomeSource flag (its first
+ *  branch), and a lane with zero observations necessarily has zero attributed examples, so no lane can
+ *  move from LEARNING_ACTIVE to NO_OUTCOME_SOURCE because of this. Statuses stay single-sourced in
+ *  cortex-attribution.ts — this function only feeds it an honest input, it does not define a second
+ *  parallel notion of the status. */
 export function cortexWiredOutcomeSourceLaneIds(
-  directional: { laneId: string }[],
-  xsec: { laneId: string }[],
+  directional: readonly { laneId: string; obs: readonly unknown[] }[],
+  xsec: readonly { laneId: string; obs: readonly unknown[] }[],
 ): Set<string> {
-  return new Set<string>([...directional.map((d) => d.laneId), ...xsec.map((x) => x.laneId)]);
+  const wired = new Set<string>();
+  // A lane may legitimately be fed by MORE THAN ONE source entry (e.g. a CG LONG lane reading both the
+  // variant matrix and the paper-execution router below), so it is wired when ANY of its entries is
+  // non-empty — never "the last entry seen".
+  for (const src of directional) if (src.obs.length > 0) wired.add(src.laneId);
+  for (const src of xsec) if (src.obs.length > 0) wired.add(src.laneId);
+  return wired;
 }
 
 /**
  * The top-level impure gather: reads the journal + all lane stores from disk, builds the full CortexRefitInput.
- * hasOutcomeSource is derived from cortexWiredOutcomeSourceLaneIds(directional, xsec) below — all 15 roster
- * lanes currently have a wired reader; if a lane ever loses its source (or a new roster lane is added without
- * a matching push into `directional`/`xsec`), it will report NO_OUTCOME_SOURCE instead of silently vanishing.
+ * hasOutcomeSource is derived from cortexWiredOutcomeSourceLaneIds(directional, xsec) below: a roster lane
+ * whose reader is missing — OR whose reader is present but produced ZERO observations — reports
+ * NO_OUTCOME_SOURCE rather than the far more forgiving INSUFFICIENT_DATA, so a structurally dead source
+ * can never masquerade as "just needs more time" (2026-07-26; see that function's doc comment).
  */
 export function gatherCortexRefitInputs(deps: {
   dataDir: string;
@@ -199,7 +521,12 @@ export function gatherCortexRefitInputs(deps: {
   nowMs: number;
   nowIso: string;
   staticWeightPctForLane: (laneId: string) => number;
-}): CortexRefitInput & { journalBadLines: number } {
+  /** Env used for the CG-router source's two flags. Defaults to process.env. */
+  env?: NodeJS.ProcessEnv;
+  /** Test seam for the CG-router source. Defaults to the RESIDENT-ONLY reader (never a cold parse —
+   *  see readResidentCgRouterOrders). Returning null means "no router data available this run". */
+  readCgRouterOrders?: () => readonly CortexCgRouterOrderLike[] | null;
+}): CortexRefitInput & { journalBadLines: number; cgRouterOutcomes: CortexCgRouterOutcomeSummary } {
   const sinceMs = deps.nowMs - CORTEX_REFIT_LOOKBACK_MS;
 
   const journal = readCortexDecisionRows([`${deps.journalFile}.1`, deps.journalFile]);
@@ -239,6 +566,14 @@ export function gatherCortexRefitInputs(deps: {
     cgByLane.get(owner.laneId)!.push({ observationId: o.observationId, openedAtMs, resolvedAt: o.resolvedAt, status: o.status, netR: o.netR });
   }
   for (const [laneId, obs] of cgByLane) directional.push({ laneId, obs });
+
+  // CG paper-execution-router source for the three dead LONG CG lanes (env-gated, DEFAULT OFF — with the
+  // flag unset this yields an empty map and pushes nothing, so `directional` is identical to today's).
+  // Pushed as SEPARATE source entries rather than merged into cgByLane so the two data-generating
+  // processes stay distinguishable in the arrays, and so cortexWiredOutcomeSourceLaneIds' "any non-empty
+  // entry wires the lane" rule reports the truth when one source is empty and the other is not.
+  const cgRouter = gatherCortexCgRouterOutcomes({ env: deps.env, readOrders: deps.readCgRouterOrders });
+  for (const [laneId, obs] of cgRouter.byLane) directional.push({ laneId, obs });
 
   // Cross-sectional store — one store, three variants → three laneIds. netReturn is a fraction.
   // 2026-07-22 bug fix: CrossSectionalStore's constructor already appends "cross-sectional-edge.json"
@@ -282,12 +617,19 @@ export function gatherCortexRefitInputs(deps: {
     // outcome the bindings still return (resolvedAtMs ≥ sinceMs) can never be pruned and then re-counted.
     pruneBeforeMs: sinceMs - 5 * 86_400_000,
     journalBadLines: journal.badLines,
+    cgRouterOutcomes: cgRouter.summary,
   };
 }
 
-/** The last nightly-refit report, exposed for #219's dashboard / an ops route (no recompute). */
-let latestRefitReport: (CortexRefitReport & { journalBadLines: number }) | null = null;
-export function getLatestCortexRefitReport(): (CortexRefitReport & { journalBadLines: number }) | null {
+/** The last nightly-refit report, exposed for #219's dashboard / an ops route (no recompute).
+ *  cgRouterOutcomes rides along so the CG-router source's state — on/off, resident/not, and above all
+ *  how many mark-to-market marks (if any) were fed in — is readable from the report, not just the log. */
+export type CortexRefitReportWithMeta = CortexRefitReport & {
+  journalBadLines: number;
+  cgRouterOutcomes: CortexCgRouterOutcomeSummary;
+};
+let latestRefitReport: CortexRefitReportWithMeta | null = null;
+export function getLatestCortexRefitReport(): CortexRefitReportWithMeta | null {
   return latestRefitReport;
 }
 export function _resetLatestCortexRefitReportForTests(): void {
@@ -343,17 +685,24 @@ export function runCortexNightlyRefit(deps: {
   nowMs: number;
   nowIso: string;
   apply?: boolean;
-}): CortexRefitReport & { journalBadLines: number } {
+  /** Both forwarded to gatherCortexRefitInputs; see the CG-router source above. */
+  env?: NodeJS.ProcessEnv;
+  readCgRouterOrders?: () => readonly CortexCgRouterOrderLike[] | null;
+}): CortexRefitReportWithMeta {
   const input = gatherCortexRefitInputs({
     dataDir: deps.dataDir,
     journalFile: deps.journalFile,
     nowMs: deps.nowMs,
     nowIso: deps.nowIso,
     staticWeightPctForLane: deps.staticWeightPctForLane,
+    env: deps.env,
+    readCgRouterOrders: deps.readCgRouterOrders,
   });
   const report = runCortexRefit(deps.store, { ...input, apply: deps.apply });
-  const withMeta = { ...report, journalBadLines: input.journalBadLines };
+  const withMeta = { ...report, journalBadLines: input.journalBadLines, cgRouterOutcomes: input.cgRouterOutcomes };
   latestRefitReport = withMeta;
+
+  logCortexCgRouterOutcomeSummary(input.cgRouterOutcomes);
 
   // 2026-07-22 bug-hunt fix: reuse THIS run's own attributeOutcomes() output (report.examples) —
   // runCortexRefit already computed it on the exact same inputs a few lines above. Re-running the
