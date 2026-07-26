@@ -16,8 +16,15 @@ export const MIN = 60_000;
 export function src(value: number | null, ageMs = 0): TaggedSource {
   return { value, asOfMs: NOW - ageMs };
 }
-/** A source with NO timestamp (static/config — always current). */
-export function staticSrc(value: number | null): TaggedSource {
+/** A source that carries a value but NO timestamp.
+ *
+ *  2026-07-26: this used to be documented as "static/config — always current", which is no longer
+ *  true and never was enforced. classifySource() now returns STALE for an untimed value whenever the
+ *  caller configured a TTL (> 0), because a freshness claim that cannot be checked must not be
+ *  granted. Untimed still means FRESH when the caller passes no TTL (ttlMs <= 0 / non-finite), which
+ *  is the genuinely timeless-source case. The helper was dead code when the semantics changed — kept
+ *  (with corrected docs) precisely so nobody re-derives the old "always current" assumption from it. */
+export function untimedSrc(value: number | null): TaggedSource {
   return { value, asOfMs: null };
 }
 

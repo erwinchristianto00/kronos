@@ -37,8 +37,17 @@ function baseDeps(o: Partial<FourBrainBindingDeps> = {}): FourBrainBindingDeps {
     safetyEvents: [],
     regimeRaw: "Bullish expansion",
     edgeMemory: allowingEdge,
+    // 2026-07-26: these three timestamps used to be implicit — every Direction reading silently
+    // inherited axisAtMs, so this fixture's "clean, PROVABLE-edge" claim rode on the axis clock and
+    // was never actually stated. Once each reading carries its OWN clock, an unstamped fixture is
+    // (correctly) untimed ⇒ STALE ⇒ no proven edge ⇒ no VALID candidate. Stating them explicitly is
+    // what the fixture always meant; the values are recent-but-distinct so a future regression that
+    // re-borrows one source's clock for another shows up as a wrong number, not a silent pass.
+    edgeMemoryUpdatedAtMs: REPLAY_NOW - 5 * MIN,
+    controllerCapturedAtMs: REPLAY_NOW - 2 * MIN,
     controllerBias: "LONG", convictionScore: 0.72, allowsLong: true, allowsShort: true,
-    bestLaneReportForDirection: (d) => (d === "LONG" ? { netAvgR: 0.09, resolvedCount: 80 } : null),
+    bestLaneReportForDirection: (d) =>
+      d === "LONG" ? { netAvgR: 0.09, resolvedCount: 80, lastCycleAt: new Date(REPLAY_NOW - 4 * MIN).toISOString() } : null,
     crowdAlignLong: 0.2, crowdAtMs: REPLAY_NOW - 3 * MIN,
     kronosAgree: null, kronosAtMs: null,
     openSignals: [

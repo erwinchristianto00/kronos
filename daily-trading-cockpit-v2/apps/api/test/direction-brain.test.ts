@@ -128,7 +128,10 @@ describe("edge standing: absence of evidence is not evidence of absence (2026-07
     // FAILS WITHOUT FIX: the old gate required `shortEdge !== null && shortEdge > hurdle`, so an
     // unmeasured side could never clear no matter how strong every other signal was.
     expect(d.action).toBe("SHORT");
-    expect(d.supportingSignals.join(" ")).toContain("SHORT unproven");
+    // 2026-07-26: wording sharpened — with shortEdge null this is the UNMEASURED case (no slice at
+    // all), now stated distinctly from a slice that exists but is too thin to prove anything. Same
+    // semantic as the old "SHORT unproven", just no longer conflating the two.
+    expect(d.supportingSignals.join(" ")).toContain("SHORT edge UNMEASURED");
   });
 
   it("STILL bars a side proven below the hurdle on a sufficient sample", () => {
@@ -164,6 +167,88 @@ describe("edge standing: absence of evidence is not evidence of absence (2026-07
     // 4 samples prove nothing either way; the side stays eligible and wins on the other evidence.
     expect(d.action).toBe("SHORT");
     expect(d.conflictingSignals.join(" ")).not.toContain("SHORT proven at/below hurdle");
+  });
+
+  // ── 2026-07-26 observability fixes ──────────────────────────────────────────────────────────────
+  // Two suppressors were fully active yet completely absent from the decision payload, so an operator
+  // reading the API could not tell why a side lost. Neither fix changes any score or any action.
+
+  it("FAIL-WITHOUT: the leansShort=false 30% haircut is REPORTED, not applied silently", () => {
+    const leaning = decideDirection(directionInput({ shortEdge: src(0.2), leansShort: true }));
+    const discounted = decideDirection(directionInput({ shortEdge: src(0.2), leansShort: false }));
+    // The discount itself is unchanged — exactly ×0.7, still soft, still not a zero.
+    expect(discounted.shortScore).toBeCloseTo(leaning.shortScore * 0.7, 10);
+    // ...and it now says so. Pre-fix this array was empty and the haircut was invisible.
+    expect(discounted.conflictingSignals.some((s) => s.includes("SHORT discounted 30%"))).toBe(true);
+    expect(leaning.conflictingSignals.some((s) => s.includes("SHORT discounted 30%"))).toBe(false);
+  });
+
+  it("FAIL-WITHOUT: the leansLong=false haircut is reported too (the LONG twin was equally silent)", () => {
+    const leaning = decideDirection(directionInput({ longEdge: src(0.2), leansLong: true }));
+    const discounted = decideDirection(directionInput({ longEdge: src(0.2), leansLong: false }));
+    expect(discounted.longScore).toBeCloseTo(leaning.longScore * 0.7, 10);
+    expect(discounted.conflictingSignals.some((s) => s.includes("LONG discounted 30%"))).toBe(true);
+    expect(leaning.conflictingSignals.some((s) => s.includes("LONG discounted 30%"))).toBe(false);
+  });
+
+  it("FAIL-WITHOUT: a thin-sample edge is reported even when its side does NOT clear", () => {
+    // The exact research/3101 shape: BULLISH_EXPANSION::LONG = -1.0553R over n=2. Catastrophically
+    // negative, but n < 30 makes it UNPROVEN — and UNPROVEN used to be announced only when the side
+    // CLEARED, so this decision reported nothing at all about it (conflictingSignals was []).
+    const d = decideDirection(
+      directionInput({
+        longEdge: src(-1.0553),
+        longEdgeN: 2,
+        shortEdge: src(null),
+        shortEdgeN: 0,
+        longLaneEdge: src(null),
+        shortLaneEdge: src(null),
+        kronosAgree: src(null),
+        crowdingAlignLong: src(null),
+      }),
+    );
+    expect(d.action).toBe("FLAT"); // it does not clear — which is exactly when it used to go quiet
+    const notes = d.supportingSignals.join(" ");
+    expect(notes).toContain("LONG edge UNPROVEN");
+    expect(notes).toContain("-1.055R");
+    expect(notes).toContain(`n=2 < ${DIRECTION_EDGE_MIN_SAMPLES}`);
+  });
+
+  it("distinguishes 'no slice at all' from 'slice too thin to prove anything'", () => {
+    const d = decideDirection(
+      directionInput({ longEdge: src(0.08), longEdgeN: 3, shortEdge: src(null), shortEdgeN: 0 }),
+    );
+    const notes = d.supportingSignals.join(" ");
+    expect(notes).toContain("SHORT edge UNMEASURED (no edge-memory slice for this regime)");
+    expect(notes).toContain("LONG edge UNPROVEN"); // has a value, just not enough of it
+    expect(notes).not.toContain("LONG edge UNMEASURED");
+  });
+
+  it("reporting is additive only — action, scores AND confidence match the pre-fix values exactly", () => {
+    // Guards against an observability change quietly becoming a behaviour change. These constants were
+    // taken by running HEAD's pre-fix decideDirection side-by-side with this one over the same inputs
+    // (git show of the file into a temp module), not by copying whatever the new code happened to emit.
+    //
+    // confidence is the subtle one: it is damped by `conflicting.length > 0`, so routing the two new
+    // regime-posture notes through conflictingSignals directly would have moved it. They go through
+    // reportOnlyConflicts instead and are merged only at the return — hence confidence is unchanged.
+    const d = decideDirection(directionInput({ longEdge: src(0.12), shortEdge: src(null) }));
+    expect(d.action).toBe("LONG");
+    expect(d.longScore).toBe(0.6300000000000001);
+    expect(d.shortScore).toBe(0.25);
+    expect(d.flatScore).toBe(0.35);
+    expect(d.confidence).toBe(0.4971428571428572);
+  });
+
+  it("the posture haircut is visible in the payload yet does NOT damp confidence", () => {
+    const leaning = decideDirection(directionInput({ shortEdge: src(0.2), leansShort: true }));
+    const discounted = decideDirection(directionInput({ shortEdge: src(0.2), leansShort: false }));
+    expect(discounted.conflictingSignals.some((s) => s.includes("SHORT discounted 30%"))).toBe(true);
+    // Pre-fix baseline for the leansShort=false case, measured against HEAD: identical confidence.
+    // (It does NOT equal the leansShort=true confidence, and must not — confidence also tracks score
+    // separation, which the haircut genuinely moves. That is the pre-existing behaviour, untouched.)
+    expect(discounted.confidence).toBe(0.5127380952380952);
+    expect(leaning.confidence).toBe(0.4319047619047619);
   });
 
 });

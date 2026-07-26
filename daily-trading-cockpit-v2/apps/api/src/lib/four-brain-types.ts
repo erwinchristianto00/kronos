@@ -213,6 +213,25 @@ export function classifySource(src: TaggedSource | null | undefined, nowMs: numb
     if (!Number.isFinite(asOf)) return "ERROR";
     if (asOf > nowMs + skewMs) return "ERROR"; // future timestamp — causal break, rejected
     if (Number.isFinite(ttlMs) && ttlMs > 0 && nowMs - asOf > ttlMs) return "STALE";
+  } else if (Number.isFinite(ttlMs) && ttlMs > 0) {
+    // 2026-07-26: an UNTIMED value under a configured TTL is STALE, not FRESH.
+    //
+    // RawReadingInput.observedAtMs is deliberately `number | null`, so a producer can legitimately
+    // hand over a value it has no timestamp for. Falling through to FRESH made that case claim a
+    // freshness guarantee nothing had checked — a fail-OPEN on the very contract this function
+    // exists to enforce, and it was silent: the payload said FRESH.
+    //
+    // Observed on 3101: app.ts derives every Direction reading's observedAtMs from `axisAtMs`
+    // (`axis.current?.at ? Date.parse(...) : null`). With axisScore MISSING, axis.current is null,
+    // so longEdge / conviction / longLaneEdge / shortLaneEdge all arrived untimed and were reported
+    // FRESH *forever* — a permanently green freshness panel over values of unknown age.
+    //
+    // A caller that passed a TTL is asserting "this value must be recent". Without a timestamp that
+    // assertion is uncheckable, so the honest answer is STALE (fail-closed). Downstream already
+    // handles it correctly and without special-casing: toTagged() and freshValueOr() both drop any
+    // non-FRESH value. A caller that genuinely does not care about age passes ttlMs <= 0 (or a
+    // non-finite TTL) and still gets FRESH, so untimed-but-timeless sources are unaffected.
+    return "STALE";
   }
   return "FRESH";
 }

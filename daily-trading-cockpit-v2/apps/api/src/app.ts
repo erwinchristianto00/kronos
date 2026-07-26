@@ -1966,8 +1966,27 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       const snaps = getRegimeEngineStore().snapshots;
       const latestSnap = snaps.length ? snaps[snaps.length - 1]! : null;
       const axis = buildRegimeAxisTimeline(snaps);
-      const regime = getLatestScanCandidates()?.marketRegime ?? latestSnap?.regime ?? null;
+      const scanCached = getLatestScanCandidates();
+      const regime = scanCached?.marketRegime ?? latestSnap?.regime ?? null;
       const edgeMem = getRegimeEdgeMemory();
+      // 2026-07-26 PROVENANCE FIX — every Direction reading below used to be stamped `axisAtMs`, the
+      // regime AXIS's clock, no matter which producer the value actually came from. These two carry
+      // the producers' own clocks instead (see FourBrainBindingDeps.edgeMemoryUpdatedAtMs).
+      const parseAtMs = (iso: string | null | undefined): number | null => {
+        if (typeof iso !== "string") return null;
+        const ms = Date.parse(iso);
+        return Number.isFinite(ms) ? ms : null;
+      };
+      // Edge-memory's own last write. seededAt is deliberately NOT a fallback: a seeded-but-never-
+      // updated store has no live observation to be fresh about.
+      const edgeMemoryUpdatedAtMs = parseAtMs(edgeMem.snapshot().liveUpdatedAt);
+      // The controller report is computed synchronously, so its real age is the age of the regime
+      // input it derives from — and the timestamp must follow the SAME fallback chain `regime` above
+      // took, or it would describe a different source than the value. scanFinishedAt is the scan's
+      // own generatedAt (see latest-scan-candidates-cache.ts's anti-lookahead invariant).
+      const controllerCapturedAtMs = scanCached?.marketRegime
+        ? parseAtMs(scanCached.scanFinishedAt)
+        : parseAtMs(latestSnap?.at);
       const controller = buildRegimeDirectionControllerReport({
         currentRegime: regime,
         adaptiveDirectionBias: null,
@@ -2027,6 +2046,8 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         safetyEvents: [],
         regimeRaw: regime,
         edgeMemory: edgeMem,
+        edgeMemoryUpdatedAtMs,
+        controllerCapturedAtMs,
         controllerBias: controller.directionalBias,
         convictionScore: Number.isFinite(controller.convictionScore) ? controller.convictionScore : null,
         allowsLong: controller.allowsLong,

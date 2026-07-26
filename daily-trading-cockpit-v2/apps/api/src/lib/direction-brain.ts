@@ -144,6 +144,16 @@ export function decideDirection(input: DirectionInput): DirectionDecision {
 
   const supporting: string[] = [];
   const conflicting: string[] = [];
+  /** 2026-07-26 — report-only conflicts, deliberately kept OUT of the confidence damping below.
+   *
+   *  `confidence` is damped by `conflicting.length > 0`. Pushing the newly-reported regime-posture
+   *  haircuts straight into `conflicting` would therefore have silently moved a numeric output while
+   *  the stated goal was pure observability, and it would have confounded the SHORT-reachability
+   *  measurement currently running on 3101/3102 (the damping would kick in on nearly every tick,
+   *  since one side is almost always off-posture). They are merged into conflictingSignals at the
+   *  return so operators see them, but confidence keeps its exact prior semantics. Damping them is
+   *  arguably more correct and can be adopted later — as its own change, with its own before/after. */
+  const reportOnlyConflicts: string[] = [];
   const hurdle = Number.isFinite(input.hurdleR as number) ? (input.hurdleR as number) : DIRECTION_EDGE_HURDLE_R;
 
   // ── Independent LONG score ──────────────────────────────────────────────────────────────────────
@@ -163,7 +173,15 @@ export function decideDirection(input: DirectionInput): DirectionDecision {
     if (crowdLong !== null) parts.push(clamp01((crowdLong + 1) / 2));
     longScore = parts.length ? parts.reduce((a, b) => a + b, 0) / parts.length : 0;
     if (input.marketBias === "BULLISH") longScore = clamp01(longScore + 0.05); // SOFT nudge only
-    if (input.leansLong === false) longScore *= 0.7; // soft posture discount — NOT a zero
+    if (input.leansLong === false) {
+      longScore *= 0.7; // soft posture discount — NOT a zero
+      // 2026-07-26: this discount used to be applied SILENTLY. It is frequently the single largest
+      // suppressor of a side (a flat 30% haircut), yet nothing was pushed to conflicting[], so the
+      // payload showed conflictingSignals: [] while the haircut was fully active — the dominant
+      // reason for a FLAT was invisible to the operator and to every downstream consumer. Reported
+      // on BOTH sides; the SHORT twin below was found first, but the LONG one was equally silent.
+      reportOnlyConflicts.push("LONG discounted 30% — regime controller posture does not lean LONG");
+    }
     if (input.longVeto) {
       longScore *= 0.25; // proven-negative penalty
       conflicting.push("LONG proven-negative edge (edge-memory VETO)");
@@ -187,7 +205,10 @@ export function decideDirection(input: DirectionInput): DirectionDecision {
     if (crowdLong !== null) parts.push(clamp01((-crowdLong + 1) / 2));
     shortScore = parts.length ? parts.reduce((a, b) => a + b, 0) / parts.length : 0;
     if (input.marketBias === "BEARISH") shortScore = clamp01(shortScore + 0.05);
-    if (input.leansShort === false) shortScore *= 0.7;
+    if (input.leansShort === false) {
+      shortScore *= 0.7; // see the LONG twin above — same discount, same reporting obligation
+      reportOnlyConflicts.push("SHORT discounted 30% — regime controller posture does not lean SHORT");
+    }
     if (input.shortVeto) {
       shortScore *= 0.25;
       conflicting.push("SHORT proven-negative edge (edge-memory VETO)");
@@ -221,8 +242,30 @@ export function decideDirection(input: DirectionInput): DirectionDecision {
   const shortStanding = edgeStanding(shortEdge, input.shortEdgeN, hurdle);
   const longClears = longScore > flatScore && longStanding !== "PROVEN_BELOW";
   const shortClears = shortScore > flatScore && shortStanding !== "PROVEN_BELOW";
-  if (longStanding === "UNPROVEN" && longClears) supporting.push("LONG unproven (no/thin edge sample) — decided on score, not proof");
-  if (shortStanding === "UNPROVEN" && shortClears) supporting.push("SHORT unproven (no/thin edge sample) — decided on score, not proof");
+  // 2026-07-26: report evidence standing UNCONDITIONALLY. The UNPROVEN notes below used to be gated
+  // on `&& xClears`, i.e. announced only when the thin evidence did NOT bind, and silent in exactly
+  // the case an operator needs to see — a side sitting on real but sub-threshold evidence that never
+  // gets to matter. Observed on 3101: the store held BULLISH_EXPANSION::LONG at −1.055R over n=2, so
+  // a catastrophically negative measured edge produced NO signal of any kind (conflictingSignals was
+  // literally []), because n=2 < DIRECTION_EDGE_MIN_SAMPLES makes it UNPROVEN and UNPROVEN was mute.
+  // "No slice at all" and "a slice too thin to prove anything" are also genuinely different states
+  // and are now distinguished. Purely additive reporting — no threshold and no score changes here.
+  const sampleNote = (n: number | null | undefined): string =>
+    n == null || !Number.isFinite(n) ? "n=?" : `n=${n} < ${DIRECTION_EDGE_MIN_SAMPLES}`;
+  if (longStanding === "UNPROVEN") {
+    supporting.push(
+      longEdge === null
+        ? "LONG edge UNMEASURED (no edge-memory slice for this regime) — competing on score alone"
+        : `LONG edge UNPROVEN: ${longEdge.toFixed(3)}R at ${sampleNote(input.longEdgeN)} — not proof either way, competing on score alone`,
+    );
+  }
+  if (shortStanding === "UNPROVEN") {
+    supporting.push(
+      shortEdge === null
+        ? "SHORT edge UNMEASURED (no edge-memory slice for this regime) — competing on score alone"
+        : `SHORT edge UNPROVEN: ${shortEdge.toFixed(3)}R at ${sampleNote(input.shortEdgeN)} — not proof either way, competing on score alone`,
+    );
+  }
   if (longStanding === "PROVEN_BELOW") conflicting.push(`LONG proven at/below hurdle (${(longEdge as number).toFixed(3)}R ≤ ${hurdle}R)`);
   if (shortStanding === "PROVEN_BELOW") conflicting.push(`SHORT proven at/below hurdle (${(shortEdge as number).toFixed(3)}R ≤ ${hurdle}R)`);
   let action: DirectionAction;
@@ -267,7 +310,7 @@ export function decideDirection(input: DirectionInput): DirectionDecision {
     confidence,
     expectedDirectionalR: expectedDirectionalR === null ? null : Number(expectedDirectionalR),
     supportingSignals: supporting,
-    conflictingSignals: conflicting,
+    conflictingSignals: [...conflicting, ...reportOnlyConflicts],
     sourceStatuses: st,
   };
 }

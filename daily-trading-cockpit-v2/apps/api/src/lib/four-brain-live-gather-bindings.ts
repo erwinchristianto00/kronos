@@ -41,6 +41,15 @@ export const FOUR_BRAIN_SUPPORTED_LANES: ReadonlySet<string> = SUPPORTED_LANES;
 export interface LaneReportLike {
   netAvgR: number | null;
   resolvedCount: number;
+  /** 2026-07-26: when this lane's store last ran a cycle — the report's OWN age.
+   *
+   *  liveLaneReport() has always returned this (`store.cycleMeta.lastCycleAt`); this narrowed
+   *  four-brain view simply dropped it on the floor, so longLaneEdge/shortLaneEdge were tagged with
+   *  the regime axis's timestamp instead of their own. Optional because it is genuinely absent for
+   *  lanes whose store tracks no cycleMeta (IM) — see the "never guessed" note in
+   *  cortex-live-gather-bindings.ts. Absent ⇒ the reading goes out untimed and classifySource marks
+   *  it STALE, which is the honest answer, not a defect. */
+  lastCycleAt?: string | null;
 }
 export interface EdgeMemoryLike {
   lookup(regimeRaw: string | null, direction: "LONG" | "SHORT"): { avgNetR: number; n: number };
@@ -178,6 +187,18 @@ export interface FourBrainBindingDeps {
   // ── Direction (regime-level) ──
   regimeRaw: string | null;
   edgeMemory: EdgeMemoryLike;
+  /** 2026-07-26 — PROVENANCE FIX. Every Direction reading used to be stamped with `axisAtMs`, the
+   *  regime axis's clock, regardless of where the value actually came from. Four unrelated producers
+   *  therefore reported one shared, borrowed age: when the axis was present they inherited a
+   *  timestamp that was not theirs (over- or under-stating their real freshness), and when the axis
+   *  was absent (3101, axisScore MISSING) they all went untimed at once and — before the
+   *  classifySource fail-closed fix — were reported FRESH forever.
+   *
+   *  These two carry the producers' OWN clocks: the edge-memory store's `liveUpdatedAt` and the
+   *  regime controller snapshot's `capturedAt`. Both already existed and were simply never passed in.
+   *  Optional so existing callers/tests keep compiling; absent ⇒ untimed ⇒ STALE (never guessed). */
+  edgeMemoryUpdatedAtMs?: number | null;
+  controllerCapturedAtMs?: number | null;
   controllerBias: "LONG" | "SHORT" | "NEUTRAL" | "MIXED" | "UNKNOWN";
   convictionScore: number | null; // 0..1
   allowsLong: boolean;
@@ -222,6 +243,17 @@ const finite = (n: unknown): n is number => typeof n === "number" && Number.isFi
 function edgeR(dep: FourBrainBindingDeps, direction: "LONG" | "SHORT"): number | null {
   const s = dep.edgeMemory.lookup(dep.regimeRaw, direction);
   return s.n > 0 && finite(s.avgNetR) ? s.avgNetR : null;
+}
+
+/** A lane report's OWN age, from its store's last cycle. null when that lane's store tracks no
+ *  cycleMeta (IM) — the reading then goes out untimed and classifySource marks it STALE rather than
+ *  borrowing someone else's clock. Deliberately does NOT fall back to axisAtMs: that fallback WAS
+ *  the bug (see the LaneReportLike.lastCycleAt and edgeMemoryUpdatedAtMs doc comments). */
+function laneAtMs(report: LaneReportLike | null): number | null {
+  const at = report?.lastCycleAt;
+  if (typeof at !== "string") return null;
+  const ms = Date.parse(at);
+  return Number.isFinite(ms) ? ms : null;
 }
 
 /** riskDistance-normalized unrealized R for an open position (LONG: up = profit). null when data insufficient. */
@@ -275,13 +307,13 @@ export function buildFourBrainGatherInput(dep: FourBrainBindingDeps): FourBrainG
       horizon,
       marketBias: "NEUTRAL" as const, // placeholder — the tick overrides from the Market State Brain
       transitionRisk: 0,
-      longEdge: reading("edge-memory-long", longEdge, "R", dep.axisAtMs, "regime", "n=0 (no proven edge)"),
-      shortEdge: reading("edge-memory-short", shortEdge, "R", dep.axisAtMs, "regime", "n=0 (no proven edge)"),
+      longEdge: reading("edge-memory-long", longEdge, "R", dep.edgeMemoryUpdatedAtMs ?? null, "regime", "n=0 (no proven edge)"),
+      shortEdge: reading("edge-memory-short", shortEdge, "R", dep.edgeMemoryUpdatedAtMs ?? null, "regime", "n=0 (no proven edge)"),
       longEdgeN,
       shortEdgeN,
-      conviction: reading("controller-conviction", finite(dep.convictionScore) ? dep.convictionScore : null, "0..1", dep.axisAtMs, "regime"),
-      longLaneEdge: reading("lane-report-long", longLane && longLane.resolvedCount > 0 ? longLane.netAvgR : null, "R", dep.axisAtMs, "regime", "no resolved long-lane closes"),
-      shortLaneEdge: reading("lane-report-short", shortLane && shortLane.resolvedCount > 0 ? shortLane.netAvgR : null, "R", dep.axisAtMs, "regime", "no resolved short-lane closes"),
+      conviction: reading("controller-conviction", finite(dep.convictionScore) ? dep.convictionScore : null, "0..1", dep.controllerCapturedAtMs ?? null, "regime"),
+      longLaneEdge: reading("lane-report-long", longLane && longLane.resolvedCount > 0 ? longLane.netAvgR : null, "R", laneAtMs(longLane), "regime", "no resolved long-lane closes"),
+      shortLaneEdge: reading("lane-report-short", shortLane && shortLane.resolvedCount > 0 ? shortLane.netAvgR : null, "R", laneAtMs(shortLane), "regime", "no resolved short-lane closes"),
       kronosAgree: reading("kronos-agree", finite(dep.kronosAgree) ? dep.kronosAgree : null, "-1..1", dep.kronosAtMs, "derivatives", "kronos ~55% MISSING"),
       crowdingAlignLong: reading("crowding-align-long", finite(dep.crowdAlignLong) ? dep.crowdAlignLong : null, "-1..1", dep.crowdAtMs, "derivatives"),
       controllerBias: dep.controllerBias,
