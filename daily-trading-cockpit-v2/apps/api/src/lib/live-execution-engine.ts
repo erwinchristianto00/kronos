@@ -585,6 +585,15 @@ export interface LiveIntent {
   exitRegime?: string | null;
   exitControllerMode?: string | null;
   exitControllerConfidence?: string | null;
+  /** 2026-07-26 regime-opposition breakeven deferral (see OPPOSITION_BREAKEVEN_DEFER_MS): the first
+   *  tick at which this intent WOULD have been harvested as REGIME_OPPOSITION_BREAKEVEN_* — green,
+   *  counter-regime, no controller flip. The harvest then leaves it on its own stop/TP until
+   *  OPPOSITION_BREAKEVEN_DEFER_MS has elapsed from this stamp. Deliberately never cleared once
+   *  set: a position that dips red and comes back green keeps its ORIGINAL anchor, so the backstop
+   *  measures total time-since-first-eligible rather than restarting on every wobble (strictly the
+   *  more conservative reading, and it cannot be gamed by oscillation). Undefined on intents that
+   *  were never eligible and on those persisted before this field existed. */
+  oppositionBreakevenDeferredAt?: string | null;
   /** Paper orders netted into this one-way Binance symbol position. */
   sourcePaperOrders?: LiveIntentSource[];
   /** True when this intent was opened WHILE an operator lane selection/allocation was active
@@ -1103,6 +1112,18 @@ const MIRRORABLE_PAPER_STATUSES: ReadonlySet<string> = new Set(["CREATED", "PAPE
 // breakeven while losers ran to their real stop. Operator-confirmed fix. CG_WIDE_LONG_RUNNER stays
 // — it is genuinely not part of live's current allocation, so the emergency-exit sweep is correct
 // for it.
+//
+// 2026-07-26: the SAME mistake had silently recurred on testnet, because membership in this set was
+// the only condition — the sweep never checked whether the lane is actually de-allocated in the
+// instance it is running in. CG_WIDE_LONG_RUNNER is indeed unallocated on live (so the note above
+// stayed true there) but carries a real 10% weight on testnet, so every one of its testnet winners
+// was being swept at ~breakeven. Measured over testnet's own closed ledger: 40 trades closed
+// LIVE_LONG_RUNNER_BREAKEVEN_AFTER_COST for a combined +$1.96, where letting the same 40 run to
+// their own stop/TP was worth +$76.12 (forward 15m testnet candles from each actual close, walked
+// with the intent's original geometry). Rather than delete the lane from the set — which would just
+// leave the same trap armed for the next lane that gets re-funded — intentHasLiveBreakevenExitLane
+// now also requires the lane to be genuinely unfunded HERE. Live behavior is byte-for-byte
+// unchanged today (the lane has no live weight, so the orphan-escape sweep stays armed there).
 const LIVE_BREAKEVEN_EXIT_LANE_IDS = new Set([
   "CG_WIDE_LONG_RUNNER",
   "CG_VARIANT_MATRIX:CG_WIDE_LONG_RUNNER",
@@ -1110,6 +1131,13 @@ const LIVE_BREAKEVEN_EXIT_LANE_IDS = new Set([
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
 const WEEK_MS = 7 * DAY_MS;
+// 2026-07-26 measured exit-policy change (see maybeCloseTestnetRegimeHarvest): how long a GREEN
+// counter-regime position is left to run on its own stop/TP geometry before the regime-opposition
+// harvest finally takes it at market. Derived from the same forward-candle study that motivated it:
+// across testnet's 78 breakeven-class closes the resolve time was 7.5h median / 16.4h p90, and
+// sweeping the backstop 4h→8h→12h→24h→48h yielded +$10 / +$42 / +$54 / +$124 / +$121 versus the
+// harvest-at-breakeven baseline — monotone up to 24h, then flat-to-down, so 24h is the knee.
+const OPPOSITION_BREAKEVEN_DEFER_MS = DAY_MS;
 const LIVE_PERFORMANCE_REGIME_OPTIONS: Array<{ value: LivePerformanceRegimeFilter; label: string }> = [
   { value: "all", label: "All regimes" },
   { value: "short", label: "Short all" },
@@ -3467,7 +3495,15 @@ export class LiveExecutionEngine {
     return this.intentSources(intent).some((source) => {
       const laneId = source.laneId ?? "";
       const variantId = laneId.split(":").pop() ?? laneId;
-      return LIVE_BREAKEVEN_EXIT_LANE_IDS.has(laneId) || LIVE_BREAKEVEN_EXIT_LANE_IDS.has(variantId);
+      if (!LIVE_BREAKEVEN_EXIT_LANE_IDS.has(laneId) && !LIVE_BREAKEVEN_EXIT_LANE_IDS.has(variantId)) return false;
+      // 2026-07-26 (see the block comment on LIVE_BREAKEVEN_EXIT_LANE_IDS): the sweep is an
+      // ORPHAN-ESCAPE hatch, so it may only fire for a lane this instance genuinely does not fund.
+      // The moment the operator funds the lane again, its positions own real geometry and must be
+      // allowed to reach it. rawLaneAllocationWeightPctForLane is deliberate over the CORTEX-aware
+      // accessor: this asks "did the OPERATOR de-allocate it", which a promoted tilt must not
+      // answer. It returns 100 when allocations are off entirely (every lane funded → sweep off)
+      // and 0 when the table is present but omits the lane (→ sweep armed, today's live case).
+      return this.rawLaneAllocationWeightPctForLane(laneId) <= 0;
     });
   }
 
@@ -3750,6 +3786,36 @@ export class LiveExecutionEngine {
       }
       if (!green && !hardCutThis && !lossHardCutThis) continue; // red & not an opposition cut → leave to its stop
 
+      // 2026-07-26 measured exit-policy change (see OPPOSITION_BREAKEVEN_DEFER_MS). A GREEN
+      // counter-regime position with no controller flip is EXACTLY the population that used to
+      // close as REGIME_OPPOSITION_BREAKEVEN_* — and harvesting it there is what cost money.
+      // Testnet's own ledger, 38 such closes: +$4.35 realized, versus +$50.6 for letting the same
+      // 38 run to their original stop/TP (forward 15m candles from each actual close). Live's
+      // independent sample agreed in sign. So: leave it on its own geometry, but bound the wait so
+      // a counter-regime position can never sit open indefinitely.
+      //
+      // Note this branch is reachable with hardCutThis/lossHardCutThis true — a green position
+      // inside the hard-cut window was ALREADY labelled ..._BREAKEVEN_* rather than ..._HARD_CUT_*
+      // by the closeReason ternary below, so it is part of the measured population and defers too.
+      // The hard cuts themselves are untouched: they decide RED positions, which returned above,
+      // and the same study confirmed they stay protective (328 hard-cut closes were $182 BETTER
+      // cut than held). REGIME_CHANGE_HARVEST_* is likewise untouched — controllerChanged short-
+      // circuits this whole block, and all five of its buckets were already net-positive.
+      if (green && !controllerChanged) {
+        if (!intent.oppositionBreakevenDeferredAt) {
+          intent.oppositionBreakevenDeferredAt = this.nowIso();
+          intent.updatedAt = this.nowIso();
+          dirty = true;
+        }
+        const deferredSinceMs = new Date(intent.oppositionBreakevenDeferredAt).getTime();
+        // An unparseable stamp must not strand the position forever — treat it as "backstop
+        // already elapsed" and harvest on this tick, i.e. fail back to the old behavior.
+        if (Number.isFinite(deferredSinceMs)) {
+          const heldForMs = new Date(this.nowIso()).getTime() - deferredSinceMs;
+          if (heldForMs < OPPOSITION_BREAKEVEN_DEFER_MS) continue;
+        }
+      }
+
       // Close ONLY the engine's share (bounded by the intent's remaining qty) — never the whole
       // netted position, which can include cross-sectional basket legs on the same symbol.
       const remainingQty = intent.state === "TP1_FILLED_BE_SET" ? Math.max(0, intent.qty - intent.tp1Qty) : intent.qty;
@@ -3782,7 +3848,10 @@ export class LiveExecutionEngine {
             : `REGIME_OPPOSITION_HARD_CUT_${currentMode ?? "UNKNOWN"}`)
         : controllerChanged
           ? `REGIME_CHANGE_HARVEST_${previousMode ?? previousRegime ?? "UNKNOWN"}_TO_${currentMode ?? currentRegime ?? "UNKNOWN"}`
-          : `REGIME_OPPOSITION_BREAKEVEN_${currentMode ?? "UNKNOWN"}`;
+          // 2026-07-26: distinct from the old REGIME_OPPOSITION_BREAKEVEN_* label on purpose. The
+          // only way to reach here now is with the deferral backstop already elapsed, so the two
+          // are different populations and must never be pooled when this change is evaluated.
+          : `REGIME_OPPOSITION_BREAKEVEN_DEFERRED_${Math.round(OPPOSITION_BREAKEVEN_DEFER_MS / HOUR_MS)}H_${currentMode ?? "UNKNOWN"}`;
       this.applyRealizedToLedger(net);
       dirty = true;
     }

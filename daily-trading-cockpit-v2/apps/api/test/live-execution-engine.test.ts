@@ -1087,6 +1087,12 @@ describe("LiveExecutionEngine", () => {
     await engine.tick();
 
     const intent = store.getState().intents[0]!;
+    // 2026-07-26: the sweep is now conditional on the lane being genuinely DE-ALLOCATED here, so
+    // the scenario must state that — and it states it the way it actually happens: the position
+    // opened while the lane was funded, THEN the operator dropped it from the table, stranding an
+    // orphan whose TP1/SL geometry no longer belongs to any funded lane. That orphan is precisely
+    // what this emergency sweep exists for. The companion test below covers the still-funded case.
+    expect(engine.setLaneAllocations([{ laneId: "CG_WIDE_FAST_LONG", weightPct: 100 }]).ok).toBe(true);
     client.markPriceBySymbol.set("ETHUSDT", 2010); // long from 2000: own-entry unrealized ~0.5 > ~0.2 close cost
     client.flattenRealizedPnl = 0.03;
     await engine.tick();
@@ -1105,6 +1111,40 @@ describe("LiveExecutionEngine", () => {
     expect(store.getState().dailyLedger.wins).toBe(0);
     expect(store.getState().dailyLedger.scratches).toBe(1);
     expect(intent.tp1OrderId).not.toBeNull();
+  });
+
+  // 2026-07-26 fail-without/pass-with for the allocation-aware guard. Before it, membership in
+  // LIVE_BREAKEVEN_EXIT_LANE_IDS was the ONLY condition, so a lane the operator had re-funded was
+  // still swept at ~breakeven — the exact recurrence of the 2026-07-10 CG_WIDE_FAST_LONG bug,
+  // caught on testnet where CG_WIDE_LONG_RUNNER carries a real 10% weight (40 trades, +$1.96
+  // realized vs +$76.12 for letting them reach their own geometry). This test fails without the
+  // guard: the intent closes as LIVE_LONG_RUNNER_BREAKEVEN_AFTER_COST instead of running on.
+  it("2026-07-26 fix: a FUNDED CG_WIDE_LONG_RUNNER is NOT swept at breakeven — it keeps its own TP/SL", async () => {
+    const order = paperOrder({
+      direction: "LONG",
+      stopLoss: 1900,
+      takeProfitLevels: [2300],
+      selectedLaneId: "CG_VARIANT_MATRIX:CG_WIDE_LONG_RUNNER",
+    } as Partial<PaperOrder>);
+    const { engine, client, store } = makeEngine({
+      paper: makePaperStore([order]),
+      config: { env: "mainnet", mainnetConfirmed: true },
+    });
+    expect((await engine.arm()).ok).toBe(true);
+    await engine.tick();
+    // The operator KEEPS the lane funded — testnet's real shape (10% weight). This is the only
+    // difference from the test above, and it is the whole fix.
+    expect(engine.setLaneAllocations([{ laneId: "CG_WIDE_LONG_RUNNER", weightPct: 10 }]).ok).toBe(true);
+
+    client.markPriceBySymbol.set("ETHUSDT", 2010); // same net-positive tick as the test above
+    client.flattenRealizedPnl = 0.03;
+    await engine.tick();
+
+    const held = store.getState().intents[0]!;
+    expect(held.state).not.toBe("CLOSED");
+    expect(held.closeReason).toBeNull();
+    expect(held.tp1OrderId).not.toBeNull(); // its real 2300 target is still working
+    expect(store.getState().dailyLedger.scratches ?? 0).toBe(0);
   });
 
   it("mainnet CG_WIDE_LONG_RUNNER stays open while still negative after estimated close cost", async () => {
@@ -1190,27 +1230,67 @@ describe("LiveExecutionEngine", () => {
     expect(closed.realizedPnlUsd).toBeGreaterThan(0);
   });
 
-  it("testnet regime-opposition exit closes only opposing exposure that clears estimated close cost", async () => {
+  // 2026-07-26 exit-policy change. This scenario (green, counter-regime, no controller flip) used
+  // to close instantly as REGIME_OPPOSITION_BREAKEVEN_LONG_ONLY. Measured on testnet's own ledger,
+  // that harvest was the costly one, so the position now defers to its own stop/TP for
+  // OPPOSITION_BREAKEVEN_DEFER_MS (24h) first. Both halves are asserted: defer, then close.
+  function greenOpposingShortEngine(clock: { iso: string }) {
     const order = paperOrder(); // SHORT.
-    const { engine, client, store } = makeEngine({
+    return makeEngine({
       paper: makePaperStore([order]),
+      nowIso: () => clock.iso,
       getControllerSnapshot: () => ({
         regime: "Bullish expansion",
         mode: "LONG_ONLY",
         capturedAt: new Date().toISOString(),
       }),
     });
+  }
+
+  it("regime-opposition harvest DEFERS a green counter-regime position instead of banking it at breakeven", async () => {
+    const clock = { iso: "2099-01-02T12:00:00.000Z" };
+    const { engine, client, store } = greenOpposingShortEngine(clock);
     expect((await engine.arm()).ok).toBe(true);
     await engine.tick();
 
     client.markPriceBySymbol.set("ETHUSDT", 1900);
     client.unrealizedPnlBySymbol.set("ETHUSDT", 1.0); // cost buffer is about 0.21 USDT.
     client.flattenRealizedPnl = 0.78;
+    const placedBefore = client.placed.length;
+    await engine.tick();
+
+    const held = store.getState().intents[0]!;
+    expect(held.state).not.toBe("CLOSED");
+    expect(held.closeReason).toBeNull();
+    expect(held.oppositionBreakevenDeferredAt).toBe("2099-01-02T12:00:00.000Z");
+    expect(client.placed.length).toBe(placedBefore); // no flatten order placed
+    expect(store.getState().dailyLedger.wins).toBe(0);
+
+    // Still inside the backstop 23h later — and the anchor must NOT drift forward on re-ticks.
+    clock.iso = "2099-01-03T11:00:00.000Z";
+    await engine.tick();
+    expect(store.getState().intents[0]!.state).not.toBe("CLOSED");
+    expect(store.getState().intents[0]!.oppositionBreakevenDeferredAt).toBe("2099-01-02T12:00:00.000Z");
+  });
+
+  it("regime-opposition harvest banks the deferred position once the 24h backstop elapses", async () => {
+    const clock = { iso: "2099-01-02T12:00:00.000Z" };
+    const { engine, client, store } = greenOpposingShortEngine(clock);
+    expect((await engine.arm()).ok).toBe(true);
+    await engine.tick();
+
+    client.markPriceBySymbol.set("ETHUSDT", 1900);
+    client.unrealizedPnlBySymbol.set("ETHUSDT", 1.0);
+    client.flattenRealizedPnl = 0.78;
+    await engine.tick(); // arms the deferral
+    expect(store.getState().intents[0]!.state).not.toBe("CLOSED");
+
+    clock.iso = "2099-01-03T12:00:01.000Z"; // 24h + 1s
     await engine.tick();
 
     const closed = store.getState().intents[0]!;
     expect(closed.state).toBe("CLOSED");
-    expect(closed.closeReason).toBe("REGIME_OPPOSITION_BREAKEVEN_LONG_ONLY");
+    expect(closed.closeReason).toBe("REGIME_OPPOSITION_BREAKEVEN_DEFERRED_24H_LONG_ONLY");
     expect(closed.realizedPnlUsd).toBeCloseTo(0.78, 6);
     const flat = client.placed.at(-1)!;
     expect(flat.type).toBe("MARKET");
@@ -2879,7 +2959,7 @@ describe("mainnet profit protection (opt-in regime harvest on real money)", () =
     store.save();
   }
 
-  function mainnetEngine(profitProtection: boolean) {
+  function mainnetEngine(profitProtection: boolean, clock = { iso: "2099-01-02T12:00:00.000Z" }) {
     const client = new FakeLiveClient();
     client.positionsBySymbol.set("ETHUSDT", -0.05); // net short
     client.markPriceBySymbol.set("ETHUSDT", 1900);
@@ -2887,10 +2967,11 @@ describe("mainnet profit protection (opt-in regime harvest on real money)", () =
     client.flattenRealizedPnl = 0.78;
     const { engine, store } = makeEngine({
       client,
+      nowIso: () => clock.iso,
       config: { env: "mainnet", mainnetConfirmed: true, mainnetProfitProtection: profitProtection },
       getControllerSnapshot: () => ({ regime: "Bullish expansion", mode: "LONG_ONLY", capturedAt: new Date().toISOString() }),
     });
-    return { engine, client, store };
+    return { engine, client, store, clock };
   }
 
   it("WITHOUT the opt-in, mainnet leaves a counter-regime green position open (the old, exposed behavior)", async () => {
@@ -2902,13 +2983,22 @@ describe("mainnet profit protection (opt-in regime harvest on real money)", () =
     expect(engine.getStatus().limits.regimeExitActive).toBe(false);
   });
 
-  it("WITH the opt-in, mainnet banks the counter-regime green position at breakeven (same harvest as testnet)", async () => {
-    const { engine, client, store } = mainnetEngine(true);
+  it("WITH the opt-in, mainnet defers the counter-regime green position, then banks it after 24h", async () => {
+    // 2026-07-26: the opt-in still governs WHETHER mainnet harvests at all (the test above proves
+    // it stays fully hands-off when off). What changed is the TIMING once it is on — the green
+    // counter-regime position now runs on its own geometry for the 24h backstop first.
+    const { engine, client, store, clock } = mainnetEngine(true);
     seedOpposingGreenShort(store);
+    await engine.tick();
+    expect(store.getState().intents[0]!.state).toBe("MIRRORED"); // deferred, not banked
+    expect(client.placed.length).toBe(0);
+    expect(engine.getStatus().limits.regimeExitActive).toBe(true); // the harvest IS active/armed
+
+    clock.iso = "2099-01-03T12:00:01.000Z"; // 24h + 1s
     await engine.tick();
     const closed = store.getState().intents[0]!;
     expect(closed.state).toBe("CLOSED");
-    expect(closed.closeReason).toBe("REGIME_OPPOSITION_BREAKEVEN_LONG_ONLY");
+    expect(closed.closeReason).toBe("REGIME_OPPOSITION_BREAKEVEN_DEFERRED_24H_LONG_ONLY");
     expect(closed.realizedPnlUsd).toBeCloseTo(0.78, 6);
     const flat = client.placed.at(-1)!;
     expect(flat.type).toBe("MARKET");
@@ -2928,13 +3018,20 @@ describe("mainnet profit protection (opt-in regime harvest on real money)", () =
     client.markPriceBySymbol.set("ETHUSDT", 1900);
     client.unrealizedPnlBySymbol.set("ETHUSDT", 3.0); // netted unrealized (whole position)
     client.flattenRealizedPnl = 0.78;
+    const clock = { iso: "2099-01-02T12:00:00.000Z" };
     const { engine, store } = makeEngine({
       client,
+      nowIso: () => clock.iso,
       config: { env: "mainnet", mainnetConfirmed: true, mainnetProfitProtection: true },
       getControllerSnapshot: () => ({ regime: "Bullish expansion", mode: "LONG_ONLY", capturedAt: new Date().toISOString() }),
       externalManagedNetQty: () => new Map([["ETHUSDT", -0.1]]), // the baskets' short claim
     });
     seedOpposingGreenShort(store);
+    await engine.tick();
+    // 2026-07-26: this green counter-regime position now defers 24h before the harvest takes it.
+    // The incident this test guards is the SHARE math at the moment of the close, so drive the
+    // clock past the backstop and assert exactly what it always asserted.
+    clock.iso = "2099-01-03T12:00:01.000Z";
     await engine.tick();
     const closed = store.getState().intents[0]!;
     expect(closed.state).toBe("CLOSED");
