@@ -1087,6 +1087,11 @@ function _buildBaseOrder(
     direction: obs.direction,
     regime: obs.regime ?? null,
     controllerMode: routerReport.controllerMode,
+    // 2026-07-26: persist the confidence that produced controllerMode. Declared on PaperOrder and
+    // consumed by meta-label-gate.ts:286 (controllerConfFeature) since day one, but never assigned —
+    // 0 of 28,889 stored orders carried it, so the controllerConf feature sat at 0% coverage and every
+    // refit pinned its weight to exactly 0.0000. Sourced from the same regime report controllerMode is.
+    controllerConfidence: routerReport.controllerConfidence ?? null,
     selectedLaneId: eligibleLane.laneId,
     routerPermission: routerReport.currentPermission,
     entryPrice: obs.simulatedEntryPrice,
@@ -1364,6 +1369,9 @@ function _buildAllocatorOrder(
     direction: o.direction,
     regime: o.regime ?? null,
     controllerMode: o.controllerMode || routerReport.controllerMode,
+    // PaperOpportunity carries controllerMode but no per-opportunity confidence, so this comes from
+    // the router report — the same regime read that produced the mode above.
+    controllerConfidence: routerReport.controllerConfidence ?? null,
     selectedLaneId: o.laneId,
     routerPermission: routerReport.currentPermission,
     entryPrice: o.entryPrice,

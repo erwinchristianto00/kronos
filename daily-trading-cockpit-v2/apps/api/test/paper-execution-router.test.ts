@@ -2371,3 +2371,37 @@ describe("headline concentration caps (anti-correlation safety)", () => {
 
 // Eliminate "unused import" lint complaints
 void buildPaperExecutionRouterBriefLines;
+
+describe("[CONTROLLER-CONF-PERSIST] PaperOrder.controllerConfidence is actually populated (2026-07-26)", () => {
+  // REGRESSION GUARD for a silent dead-feature bug: PaperOrder.controllerConfidence was DECLARED on
+  // the type and CONSUMED by meta-label-gate.ts:286 (controllerConfFeature) from day one, but was
+  // never ASSIGNED at either admission site. Measured on real testnet data: 0 of 28,889 stored paper
+  // orders carried it, so the meta-label model's `controllerConf` feature had 0% coverage and every
+  // refit pinned its weight to exactly 0.0000 — one of 11 features contributing literally nothing,
+  // with nothing anywhere reporting an error. Type-checking could not catch it because the field is
+  // optional. These assertions fail if the assignment is ever dropped again.
+  it("the router report carries the controller's confidence alongside its mode", () => {
+    const report = routerOf("Bearish pressure");
+    expect(report.controllerMode).toBeTruthy();
+    // Must be a real graduated label, not null/undefined — that was the bug.
+    expect(report.controllerConfidence).toBeTruthy();
+    expect(["HIGH", "MEDIUM", "LOW", "DEGRADED"]).toContain(String(report.controllerConfidence));
+  });
+
+  it("controllerConfidence maps to a NON-NULL meta-label feature (the dead-feature symptom)", async () => {
+    const { controllerConfFeature } = await import("../src/lib/meta-label-gate.js");
+    const report = routerOf("Bearish pressure");
+    // The exact call meta-label-gate.ts:286 makes on a stored order. Before the fix this was
+    // controllerConfFeature(undefined) === null on every single order.
+    expect(controllerConfFeature(report.controllerConfidence)).not.toBeNull();
+  });
+
+  it("degrades to null (not a fabricated label) when there is no regime report", () => {
+    const report = buildAdaptiveLaneRouterReport({
+      generatedAt: new Date().toISOString(),
+      regimeReport: undefined,
+      gateReport: emptyGate(),
+    });
+    expect(report.controllerConfidence).toBeNull();
+  });
+});

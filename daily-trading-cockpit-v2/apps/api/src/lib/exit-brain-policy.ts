@@ -74,10 +74,41 @@ export interface ExitBrainParams {
   minEvaluableTicks: number;
 }
 
+/** Min/max accepted for an EXIT_BRAIN_ARM_PEAK_R override. Below the floor the policy would arm on
+ *  ordinary bar noise (banking scraps and churning fees — the exact failure armPeakR exists to
+ *  prevent); above the ceiling it could never arm at all on any realistic path, silently turning
+ *  the whole counterfactual into a no-op. An out-of-range or non-finite value falls back to the
+ *  documented default rather than being clamped, so a typo can never quietly reshape the policy. */
+const ARM_PEAK_R_MIN = 0.02;
+const ARM_PEAK_R_MAX = 2;
+
+/** Read the operator's armPeakR override, if any. Mirrors meta-label-gate.ts's envNum idiom, with
+ *  an added range check because this single number decides whether the policy can ever arm. */
+function armPeakROverride(env: NodeJS.ProcessEnv = process.env): number | null {
+  const raw = env.EXIT_BRAIN_ARM_PEAK_R;
+  if (typeof raw !== "string" || raw.trim().length === 0) return null;
+  const v = Number(raw);
+  if (!Number.isFinite(v) || v < ARM_PEAK_R_MIN || v > ARM_PEAK_R_MAX) return null;
+  return v;
+}
+
 /** One exported tunable const (task requirement) so a later refit can adjust the policy without
- *  touching any logic. Every value is a documented judgment call, NOT fitted to any sample. */
+ *  touching any logic. Every value is a documented judgment call, NOT fitted to any sample.
+ *
+ *  armPeakR EXCEPTION (2026-07-25): the default below stays at its original judgment-call value,
+ *  but is now overridable via EXIT_BRAIN_ARM_PEAK_R. Reason: measured against the real retained
+ *  path population on testnet (286 closed paths), peak R came in at median 0.052 / p90 0.178 /
+ *  max 0.495 — only 3 paths (1.0%) ever reached 0.35R. The policy therefore never armed, every
+ *  evaluated trade fell into the "held through the entire path" branch (deltaR pinned to 0), and
+ *  the counterfactual reported 233/233 ties with meanDeltaR exactly 0.000 — structurally
+ *  incapable of producing a signal either way. The 0.35 figure came from the CG_WIDE_FAST_LONG
+ *  wide-stop study cited in this file's header, but the population actually being scored is
+ *  dominated by fast small-R lanes. Rather than hardcode a sample-fitted number here (which would
+ *  contradict the "NOT fitted to any sample" contract above), the threshold is made an explicit
+ *  operator/research knob: the default remains the documented judgment call, and any retuning is
+ *  a visible, instantly reversible env decision per instance. */
 export const DEFAULT_EXIT_BRAIN_PARAMS: ExitBrainParams = {
-  armPeakR: 0.35,
+  armPeakR: armPeakROverride() ?? 0.35,
   baseRetraceFrac: 0.55,
   minRetraceFrac: 0.22,
   retraceTightenPerPeakR: 0.18,

@@ -126,6 +126,14 @@ export interface AdaptiveLaneRouterReport {
   currentRegime: string | null;
   regimeFamily: RegimeFamily;
   controllerMode: RegimeDirectionMode | string;
+  /** The controller's graduated confidence for THIS report's regime read (HIGH/MEDIUM/LOW/DEGRADED),
+   *  or null when the regime report is absent. Carried alongside controllerMode purely so downstream
+   *  consumers that already persist controllerMode can persist the confidence that produced it —
+   *  see paper-execution-router.ts's PaperOrder.controllerConfidence, which fed meta-label-gate.ts's
+   *  controllerConf feature. That feature had 0% coverage (weight pinned to exactly 0.0000 across
+   *  every refit) purely because this value was never threaded through, not because the signal is
+   *  uninformative. Advisory/report-only like every other field on this report. */
+  controllerConfidence: string | null;
   currentPermission: RouterPermission;
   selectedCurrentLane: string | null;
   selectedCurrentLaneReason: string;
@@ -710,6 +718,7 @@ export function buildAdaptiveLaneRouterReport(
   const currentRegime = regimeReport?.currentRegime ?? null;
   const regimeFamily = normalizeRegimeFamily(currentRegime);
   const controllerMode: RegimeDirectionMode | string = regimeReport?.controllerMode ?? "UNKNOWN";
+  const controllerConfidence: string | null = regimeReport?.confidence ?? null;
 
   const infraReady =
     gateReport.killSwitchReady === true &&
@@ -841,6 +850,7 @@ export function buildAdaptiveLaneRouterReport(
     currentRegime,
     regimeFamily,
     controllerMode,
+    controllerConfidence,
     currentPermission,
     selectedCurrentLane,
     selectedCurrentLaneReason,

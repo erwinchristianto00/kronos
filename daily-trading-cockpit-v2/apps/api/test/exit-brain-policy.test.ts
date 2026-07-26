@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import type { ShadowPosition } from "@dtc/shared";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   DEFAULT_EXIT_BRAIN_PARAMS,
@@ -484,5 +484,70 @@ describe("resolvedTradesFromShadowPositions", () => {
     expect(report.coverage.coverageRatio).toBe(0);
     expect(report.coverage.note).toContain("dense");
     expect(report.coverage.tickHistogram["4"]).toBe(1);
+  });
+});
+
+describe("[ARM-PEAK-R-ENV] EXIT_BRAIN_ARM_PEAK_R override (2026-07-25)", () => {
+  // armPeakR lives on a module-level const resolved once from process.env at import time, so these
+  // use vi.resetModules() + a fresh dynamic import — the same idiom as
+  // current-guard-variant-matrix.test.ts's [PBC-COST-FALLBACK] block.
+  //
+  // WHY this knob exists: measured against the real retained path population on testnet, only 1.0%
+  // of paths ever reached the 0.35R default, so the policy never armed and the counterfactual
+  // reported 100% ties with meanDeltaR exactly 0 — no signal in either direction. The threshold is
+  // now retunable per instance WITHOUT hardcoding a sample-fitted number as the documented default.
+  const KEY = "EXIT_BRAIN_ARM_PEAK_R";
+  let saved: string | undefined;
+
+  beforeEach(() => {
+    saved = process.env[KEY];
+  });
+
+  afterEach(() => {
+    if (saved === undefined) delete process.env[KEY];
+    else process.env[KEY] = saved;
+    vi.resetModules();
+  });
+
+  async function freshArmPeakR(): Promise<number> {
+    vi.resetModules();
+    const fresh = await import("../src/lib/exit-brain-policy.js");
+    return fresh.DEFAULT_EXIT_BRAIN_PARAMS.armPeakR;
+  }
+
+  it("keeps the documented 0.35 judgment-call default when unset", async () => {
+    delete process.env[KEY];
+    expect(await freshArmPeakR()).toBeCloseTo(0.35, 9);
+  });
+
+  it("applies a valid in-range override", async () => {
+    process.env[KEY] = "0.15";
+    expect(await freshArmPeakR()).toBeCloseTo(0.15, 9);
+  });
+
+  it("FAILS-WITHOUT-FIX control: an override only changes armPeakR, never the other params", async () => {
+    process.env[KEY] = "0.15";
+    vi.resetModules();
+    const fresh = await import("../src/lib/exit-brain-policy.js");
+    const p = fresh.DEFAULT_EXIT_BRAIN_PARAMS;
+    expect(p.armPeakR).toBeCloseTo(0.15, 9);
+    expect(p.baseRetraceFrac).toBeCloseTo(0.55, 9);
+    expect(p.minRetraceFrac).toBeCloseTo(0.22, 9);
+    expect(p.roundTripGuardR).toBeCloseTo(0.05, 9);
+    expect(p.minEvaluableTicks).toBe(6);
+  });
+
+  it("rejects out-of-range and non-numeric values back to the default (a typo must not reshape the policy)", async () => {
+    for (const bad of ["0", "0.001", "5", "-0.2", "abc", "", "   ", "NaN", "Infinity"]) {
+      process.env[KEY] = bad;
+      expect(await freshArmPeakR(), `input ${JSON.stringify(bad)} must fall back`).toBeCloseTo(0.35, 9);
+    }
+  });
+
+  it("accepts the exact range boundaries", async () => {
+    process.env[KEY] = "0.02";
+    expect(await freshArmPeakR()).toBeCloseTo(0.02, 9);
+    process.env[KEY] = "2";
+    expect(await freshArmPeakR()).toBeCloseTo(2, 9);
   });
 });
