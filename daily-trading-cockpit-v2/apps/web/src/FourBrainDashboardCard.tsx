@@ -77,6 +77,12 @@ type FourBrainReport = {
 // (simulated) are ALWAYS two separate rows (see `tier` on every entry aggregate) — never summed into one number.
 type RateView = {
   n: number;
+  // TRUE denominators behind meanNetR / winRate. They can be far smaller than `n`: SKIP and untriggered
+  // WAIT_* rows resolve with netR:null by design, so they count toward n but contribute no R. Rendering
+  // `n` alone next to meanR overstated the evidence badly (testnet: n=10808 vs 62 rows actually carrying
+  // an R). Optional so an older backend that doesn't send them degrades to the previous display.
+  netRTrackedN?: number;
+  winTrackedN?: number;
   insufficientData: boolean;
   winRate: number | null;
   meanNetR: number | null;
@@ -174,7 +180,16 @@ function RateStatsInline({ rv, dim }: { rv: RateView; dim?: boolean }) {
   }
   return (
     <span style={{ fontSize: 11, color: dim ? C.dim : C.text }}>
-      n={rv.n} · WR {fmtPct(rv.winRate != null ? rv.winRate * 100 : null)} · meanR{' '}
+      n={rv.n}
+      {rv.netRTrackedN != null && rv.netRTrackedN < rv.n && (
+        <span
+          style={{ color: C.accent }}
+          title={`meanR/cumR dihitung dari ${rv.netRTrackedN} baris yang benar-benar punya R — ${rv.n - rv.netRTrackedN} baris sisanya (SKIP / WAIT yang tidak pernah ter-trigger) resolve dengan netR:null dan tidak menyumbang apa pun ke rata-rata.`}
+        >
+          {' '}({rv.netRTrackedN} dgn R)
+        </span>
+      )}{' '}
+      · WR {fmtPct(rv.winRate != null ? rv.winRate * 100 : null)} · meanR{' '}
       <b style={{ color: toneR(rv.meanNetR) }}>{fmtR(rv.meanNetR)}</b>
       {rv.meanRegretR != null && <> · regret {fmtR(rv.meanRegretR)}</>}
       {rv.meanCalibrationGapR != null && <> · calib-gap {fmtR(rv.meanCalibrationGapR)}</>}

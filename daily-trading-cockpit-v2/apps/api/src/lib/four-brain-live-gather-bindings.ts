@@ -254,6 +254,11 @@ export function buildFourBrainGatherInput(dep: FourBrainBindingDeps): FourBrainG
   // ── Direction readings per horizon (regime-level, same for each horizon in v1) ──
   const longEdge = edgeR(dep, "LONG");
   const shortEdge = edgeR(dep, "SHORT");
+  // Sample counts behind those edges. The brain needs n (not just the R) to tell "unmeasured / thin" from
+  // "measured and genuinely bad" — see direction-brain.ts's edgeStanding(). Passing the R alone made a
+  // 4-sample −0.27R read as conclusively disqualifying, and an n=0 slice read the same as a bad one.
+  const longEdgeN = dep.edgeMemory.lookup(dep.regimeRaw, "LONG").n;
+  const shortEdgeN = dep.edgeMemory.lookup(dep.regimeRaw, "SHORT").n;
   const longVeto = deriveDirectionVeto({ direction: "LONG" as CortexLaneDirection, edgeMemory: dep.edgeMemory, regimeRaw: dep.regimeRaw });
   const shortVeto = deriveDirectionVeto({ direction: "SHORT" as CortexLaneDirection, edgeMemory: dep.edgeMemory, regimeRaw: dep.regimeRaw });
   const longLane = dep.bestLaneReportForDirection("LONG");
@@ -272,6 +277,8 @@ export function buildFourBrainGatherInput(dep: FourBrainBindingDeps): FourBrainG
       transitionRisk: 0,
       longEdge: reading("edge-memory-long", longEdge, "R", dep.axisAtMs, "regime", "n=0 (no proven edge)"),
       shortEdge: reading("edge-memory-short", shortEdge, "R", dep.axisAtMs, "regime", "n=0 (no proven edge)"),
+      longEdgeN,
+      shortEdgeN,
       conviction: reading("controller-conviction", finite(dep.convictionScore) ? dep.convictionScore : null, "0..1", dep.axisAtMs, "regime"),
       longLaneEdge: reading("lane-report-long", longLane && longLane.resolvedCount > 0 ? longLane.netAvgR : null, "R", dep.axisAtMs, "regime", "no resolved long-lane closes"),
       shortLaneEdge: reading("lane-report-short", shortLane && shortLane.resolvedCount > 0 ? shortLane.netAvgR : null, "R", dep.axisAtMs, "regime", "no resolved short-lane closes"),

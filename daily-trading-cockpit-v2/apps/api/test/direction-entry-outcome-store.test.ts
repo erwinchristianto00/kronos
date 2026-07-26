@@ -381,3 +381,69 @@ describe("buildDirectionEntryOutcomeReport — pure builder, exported for tests"
     expect(report.entry.coverage.pending).toBe(7);
   });
 });
+
+describe("netRTrackedN / winTrackedN expose the TRUE denominator behind meanNetR / winRate", () => {
+  // Reproduces the real testnet 2026-07-25 case: Entry Tier-2 calibration reported n=10808 next to
+  // meanR -0.368R, but only 62 of those rows carried an R at all — the rest were SKIP rows that resolve
+  // with realizedNetR:null by design. The mean was always computed correctly (over the 62); what was
+  // missing was any way for a reader to see that `n` was NOT the evidence count.
+  function skipRow(n: number): EntryOutcomeRecord {
+    return entryRecord(n, {
+      tier: "TIER2_SIMULATED",
+      action: "SKIP",
+      confidence: "EXPERIMENTAL_COST_OF_CAUTION",
+      expectedNetR: null,
+      realizedNetR: null, // NOT_ENTERED — no R exists for a trade never taken
+      realizedRSource: null,
+    });
+  }
+  function enteredRow(n: number, realizedNetR: number): EntryOutcomeRecord {
+    return entryRecord(n, {
+      tier: "TIER2_SIMULATED",
+      action: "ENTER_NOW",
+      confidence: "MEASURED",
+      realizedNetR,
+    });
+  }
+
+  it("reports netRTrackedN as the count of rows that actually supplied an R, not n", () => {
+    const store = new DirectionEntryOutcomeStore(tmp());
+    // 30 R-bearing rows (each -1R) + 300 null-R SKIP rows, all in the same Tier-2 bucket.
+    for (let i = 0; i < 30; i += 1) store.recordEntryOutcome(enteredRow(i, -1));
+    for (let i = 0; i < 300; i += 1) store.recordEntryOutcome(skipRow(1000 + i));
+
+    const report = buildDirectionEntryOutcomeReport(store.getState());
+    const calib = report.entry.calibration.find((c) => c.tier === "TIER2_SIMULATED")!;
+
+    expect(calib.n).toBe(330); // every row counts toward n
+    expect(calib.netRTrackedN).toBe(30); // ...but only 30 carried an R
+    // FAILS WITHOUT FIX: before netRTrackedN was exposed, a consumer had only `n` (330) to pair with a
+    // mean derived from 30 rows — an 11x overstatement of the evidence.
+    expect(calib.netRTrackedN).toBeLessThan(calib.n);
+    // the mean itself was and remains correct: -30R over 30 R-bearing rows, NOT diluted across 330
+    expect(calib.meanNetR).toBe(-1);
+    expect(calib.cumNetR).toBe(-30);
+  });
+
+  it("netRTrackedN === n when every row carries an R (no spurious qualifier to render)", () => {
+    const store = new DirectionEntryOutcomeStore(tmp());
+    for (let i = 0; i < 25; i += 1) store.recordEntryOutcome(enteredRow(i, 0.4));
+    const report = buildDirectionEntryOutcomeReport(store.getState());
+    const calib = report.entry.calibration.find((c) => c.tier === "TIER2_SIMULATED")!;
+    expect(calib.n).toBe(25);
+    expect(calib.netRTrackedN).toBe(25);
+    expect(calib.meanNetR).toBe(0.4);
+  });
+
+  it("an all-SKIP bucket reports netRTrackedN 0 and a null mean — never a fabricated +0.000R", () => {
+    const store = new DirectionEntryOutcomeStore(tmp());
+    for (let i = 0; i < 50; i += 1) store.recordEntryOutcome(skipRow(i));
+    const report = buildDirectionEntryOutcomeReport(store.getState());
+    const calib = report.entry.calibration.find((c) => c.tier === "TIER2_SIMULATED")!;
+    expect(calib.n).toBe(50);
+    expect(calib.netRTrackedN).toBe(0);
+    expect(calib.meanNetR).toBeNull();
+    expect(calib.winTrackedN).toBe(0);
+    expect(calib.winRate).toBeNull();
+  });
+});

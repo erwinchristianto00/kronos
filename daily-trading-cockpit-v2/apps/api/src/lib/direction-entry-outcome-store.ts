@@ -368,6 +368,16 @@ function round4(v: number): number {
  *  doc); defaults to the aggregate's own n. */
 interface RateView {
   n: number;
+  /** How many of `n` actually supplied a non-null netR — i.e. the TRUE denominator behind `meanNetR` and
+   *  `cumNetR`. Exposed because the two can differ by orders of magnitude and a reader seeing only `n`
+   *  next to `meanNetR` would badly overestimate how much evidence backs that mean. Real case (testnet
+   *  2026-07-25): Entry Tier-2 calibration reported n=10808 while only 62 rows carried an R at all — the
+   *  other 10746 were SKIP/untriggered-WAIT rows that resolve with netR:null by design (NOT_ENTERED, see
+   *  entry-exit-counterfactual.ts). The mean itself was always correct (rateView has divided by
+   *  netRTrackedN since it was written); what was missing was any way for the CONSUMER to see that. */
+  netRTrackedN: number;
+  /** Same idea for `winRate`: how many of `n` supplied a non-null win. A SKIP row has no win concept. */
+  winTrackedN: number;
   insufficientData: boolean;
   winRate: number | null;
   meanNetR: number | null;
@@ -380,6 +390,10 @@ function rateView(agg: RateAggregate, sampleSizeForGate?: number): RateView {
   const insufficientData = gateSize < DIRECTION_ENTRY_MIN_EXAMPLES_ACTIVE;
   return {
     n: agg.n,
+    // The real denominators behind meanNetR/winRate below — surfaced so a consumer can never mistake `n`
+    // for the evidence count. See RateView's doc for the concrete case this prevents.
+    netRTrackedN: agg.netRTrackedN,
+    winTrackedN: agg.winTrackedN,
     insufficientData,
     // Gated on winTrackedN (count of rows that actually supplied a win), NOT agg.n: a bucket whose rows
     // never carry a meaningful win concept (e.g. a calibration row) must report null, never a fabricated

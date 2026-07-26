@@ -191,6 +191,9 @@ export interface DirectionRawReadings {
   transitionRisk: number;
   longEdge: RawReadingInput;
   shortEdge: RawReadingInput;
+  /** Sample counts behind longEdge/shortEdge — lets the brain separate "unmeasured" from "proven bad". */
+  longEdgeN?: number | null;
+  shortEdgeN?: number | null;
   conviction: RawReadingInput;
   longLaneEdge: RawReadingInput;
   shortLaneEdge: RawReadingInput;
@@ -363,6 +366,8 @@ export function assembleFourBrainTick(input: FourBrainGatherInput): FourBrainGat
       transitionRisk: d.transitionRisk,
       longEdge: toTagged(readings.longEdge),
       shortEdge: toTagged(readings.shortEdge),
+      longEdgeN: d.longEdgeN ?? null,
+      shortEdgeN: d.shortEdgeN ?? null,
       conviction: toTagged(readings.conviction),
       longLaneEdge: toTagged(readings.longLaneEdge),
       shortLaneEdge: toTagged(readings.shortLaneEdge),

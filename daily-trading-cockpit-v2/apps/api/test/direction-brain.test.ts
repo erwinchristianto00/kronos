@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
-import { decideDirection } from "../src/lib/direction-brain.js";
+import { decideDirection, DIRECTION_EDGE_MIN_SAMPLES } from "../src/lib/direction-brain.js";
+import { EDGE_MIN_SAMPLES } from "../src/lib/regime-edge-memory.js";
 import { checkDirectionInvariants } from "../src/lib/four-brain-invariants.js";
 import { directionInput, src } from "./four-brain-fixtures.js";
 
@@ -96,4 +97,73 @@ describe("Direction Brain", () => {
     expect(d).not.toHaveProperty("order");
     expect(d).not.toHaveProperty("allocation");
   });
+});
+
+describe("edge standing: absence of evidence is not evidence of absence (2026-07-25)", () => {
+  // Reproduces the real testnet state that made SHORT structurally unreachable: the edge-memory store
+  // held exactly two slices — BULLISH×LONG (n=15, +0.051) and BEARISH×SHORT (n=4, −0.274) — so SHORT was
+  // null in bullish regimes and negative in bearish ones. Measured result: SHORT n=0 across 1865
+  // evaluated decisions while LONG went 126.
+  it("keeps DIRECTION_EDGE_MIN_SAMPLES in lockstep with regime-edge-memory's EDGE_MIN_SAMPLES", () => {
+    // Declared locally in direction-brain.ts (pure core must not import a file-backed store), so this
+    // equality is what stops the two from silently drifting apart.
+    expect(DIRECTION_EDGE_MIN_SAMPLES).toBe(EDGE_MIN_SAMPLES);
+    expect(DIRECTION_EDGE_MIN_SAMPLES).toBe(30);
+  });
+
+  it("does NOT bar a side whose edge is simply unmeasured (n=0 → UNPROVEN, not PROVEN_BELOW)", () => {
+    const d = decideDirection(
+      directionInput({
+        // strong non-edge evidence for SHORT, zero edge-memory data on either side
+        longEdge: src(null),
+        shortEdge: src(null),
+        longEdgeN: 0,
+        shortEdgeN: 0,
+        kronosAgree: src(-1), // fully short-agreeing
+        crowdingAlignLong: src(-1), // crowding favors short
+        controllerBias: "SHORT",
+        conviction: src(1),
+      }),
+    );
+    // FAILS WITHOUT FIX: the old gate required `shortEdge !== null && shortEdge > hurdle`, so an
+    // unmeasured side could never clear no matter how strong every other signal was.
+    expect(d.action).toBe("SHORT");
+    expect(d.supportingSignals.join(" ")).toContain("SHORT unproven");
+  });
+
+  it("STILL bars a side proven below the hurdle on a sufficient sample", () => {
+    const d = decideDirection(
+      directionInput({
+        longEdge: src(null),
+        shortEdge: src(-0.274), // the real BEARISH×SHORT value...
+        longEdgeN: 0,
+        shortEdgeN: 40, // ...but now with enough samples to actually prove it
+        kronosAgree: src(-1),
+        crowdingAlignLong: src(-1),
+        controllerBias: "SHORT",
+        conviction: src(1),
+      }),
+    );
+    expect(d.action).not.toBe("SHORT");
+    expect(d.conflictingSignals.join(" ")).toContain("SHORT proven at/below hurdle");
+  });
+
+  it("treats a thin-sample negative edge as UNPROVEN, not as proof (n=4 must not disqualify)", () => {
+    const d = decideDirection(
+      directionInput({
+        longEdge: src(null),
+        shortEdge: src(-0.274),
+        longEdgeN: 0,
+        shortEdgeN: 4, // the REAL testnet sample size — far below the proof bar
+        kronosAgree: src(-1),
+        crowdingAlignLong: src(-1),
+        controllerBias: "SHORT",
+        conviction: src(1),
+      }),
+    );
+    // 4 samples prove nothing either way; the side stays eligible and wins on the other evidence.
+    expect(d.action).toBe("SHORT");
+    expect(d.conflictingSignals.join(" ")).not.toContain("SHORT proven at/below hurdle");
+  });
+
 });

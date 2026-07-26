@@ -51,6 +51,12 @@ export interface DirectionInput {
   /** Proven regime×direction edge (R, net of cost). NULL when n < proven threshold (never a fabricated 0). */
   longEdge: TaggedSource;
   shortEdge: TaggedSource;
+  /** Sample count behind longEdge/shortEdge. Absence of evidence (n===0, or n below
+   *  DIRECTION_EDGE_MIN_SAMPLES) must NOT be treated as evidence of absence — see edgeStanding().
+   *  Undefined = caller didn't supply a count; the edge is then treated as UNPROVEN regardless of value,
+   *  which is the conservative reading (an R with unknown sample size proves nothing). */
+  longEdgeN?: number | null;
+  shortEdgeN?: number | null;
   /** True when edge-memory verdict is VETO_NEGATIVE (proven-negative, no positive-lane rescue). Penalty, not a gate. */
   longVeto?: boolean;
   shortVeto?: boolean;
@@ -95,6 +101,30 @@ const DEFAULT_TTL: Record<DirectionSourceKey, number> = {
 
 const edgeSub = (r: number | null): number => (r === null ? 0 : clamp01(r / EDGE_R_FULL)); // only POSITIVE edge scores; negative → 0
 
+/** Minimum resolved same-slice samples before an edge R is allowed to PROVE anything (either way).
+ *  Reuses regime-edge-memory.ts's EDGE_MIN_SAMPLES verbatim — the same "proven" bar the incumbent
+ *  smart-direction-gate uses, so the two layers can never disagree about what counts as proof. */
+/*  Declared as a literal rather than imported: regime-edge-memory.ts is a file-backed STORE, and this
+ *  brain is a pure core that must not pull I/O into its import graph (four-brain-architecture.test.ts
+ *  enforces that). direction-brain.test.ts asserts this stays equal to EDGE_MIN_SAMPLES, so the two can
+ *  never silently drift — the same local-const + equality-test idiom used for
+ *  DIRECTION_ENTRY_MIN_EXAMPLES_ACTIVE vs CORTEX_ATTR_MIN_EXAMPLES_ACTIVE. */
+export const DIRECTION_EDGE_MIN_SAMPLES = 30;
+
+export type EdgeStanding = "PROVEN_ABOVE" | "PROVEN_BELOW" | "UNPROVEN";
+/** 2026-07-25: absence of evidence is NOT evidence of absence. Before this, the action gate read
+ *  `edge !== null && edge > hurdle`, which collapsed three genuinely different states into two and made
+ *  one side structurally unreachable: on testnet the edge-memory store held exactly two slices
+ *  (BULLISH×LONG n=15 +0.051, BEARISH×SHORT n=4 −0.274), so SHORT was null in bullish regimes (no data)
+ *  and negative in bearish ones — it could never clear under ANY market condition, and the measured
+ *  record showed SHORT n=0 across 1865 evaluated decisions while LONG went 126. A side must be blocked
+ *  only by PROVEN-negative evidence; an unmeasured (or thin-sample) side stays eligible and competes on
+ *  score alone, where flatScore's own bothMissing floor (0.6) still makes it earn the decision. */
+function edgeStanding(edge: number | null, n: number | null | undefined, hurdle: number): EdgeStanding {
+  if (edge === null || n == null || !Number.isFinite(n) || n < DIRECTION_EDGE_MIN_SAMPLES) return "UNPROVEN";
+  return edge > hurdle ? "PROVEN_ABOVE" : "PROVEN_BELOW";
+}
+
 export function decideDirection(input: DirectionInput): DirectionDecision {
   const nowMs = input.nowMs;
   const ttls = { ...DEFAULT_TTL, ...(input.ttls ?? {}) };
@@ -120,6 +150,12 @@ export function decideDirection(input: DirectionInput): DirectionDecision {
   let longScore = 0;
   {
     const parts: number[] = [];
+    // NOTE: pushed UNCONDITIONALLY (edgeSub(null) === 0) and that is deliberate. Omitting the term for an
+    // unmeasured side was tried on 2026-07-25 and reverted: averaging over the remaining sub-signals
+    // INFLATES a side with no evidence above one with good measured evidence (it broke "BULLISH does not
+    // block SHORT when short edge is strong" by handing the decision to a no-edge LONG on conviction
+    // alone). Absence of edge should not boost a side — the structural unreachability it used to cause is
+    // fixed at the ACTION GATE instead, via edgeStanding(), where absence stops being disqualifying.
     parts.push(edgeSub(longEdge)); // proven edge-memory (R)
     if (longLaneEdge !== null) parts.push(edgeSub(longLaneEdge));
     if (conviction !== null && input.controllerBias === "LONG") parts.push(clamp01(conviction));
@@ -144,7 +180,7 @@ export function decideDirection(input: DirectionInput): DirectionDecision {
   let shortScore = 0;
   {
     const parts: number[] = [];
-    parts.push(edgeSub(shortEdge));
+    parts.push(edgeSub(shortEdge)); // unconditional — see the LONG block's note
     if (shortLaneEdge !== null) parts.push(edgeSub(shortLaneEdge));
     if (conviction !== null && input.controllerBias === "SHORT") parts.push(clamp01(conviction));
     if (kronos !== null) parts.push(clamp01((-kronos + 1) / 2)); // short-agreeing part
@@ -179,10 +215,22 @@ export function decideDirection(input: DirectionInput): DirectionDecision {
   if (input.longVeto && input.shortVeto) flatScore = Math.max(flatScore, 0.8);
 
   // ── Action ──────────────────────────────────────────────────────────────────────────────────────
-  const longClears = longScore > flatScore && longEdge !== null && longEdge > hurdle;
-  const shortClears = shortScore > flatScore && shortEdge !== null && shortEdge > hurdle;
+  // A side is barred ONLY by proven-negative evidence. UNPROVEN (no data, or n < DIRECTION_EDGE_MIN_SAMPLES)
+  // still competes — it just has to beat flatScore, which the bothMissing floor already raises to 0.6.
+  const longStanding = edgeStanding(longEdge, input.longEdgeN, hurdle);
+  const shortStanding = edgeStanding(shortEdge, input.shortEdgeN, hurdle);
+  const longClears = longScore > flatScore && longStanding !== "PROVEN_BELOW";
+  const shortClears = shortScore > flatScore && shortStanding !== "PROVEN_BELOW";
+  if (longStanding === "UNPROVEN" && longClears) supporting.push("LONG unproven (no/thin edge sample) — decided on score, not proof");
+  if (shortStanding === "UNPROVEN" && shortClears) supporting.push("SHORT unproven (no/thin edge sample) — decided on score, not proof");
+  if (longStanding === "PROVEN_BELOW") conflicting.push(`LONG proven at/below hurdle (${(longEdge as number).toFixed(3)}R ≤ ${hurdle}R)`);
+  if (shortStanding === "PROVEN_BELOW") conflicting.push(`SHORT proven at/below hurdle (${(shortEdge as number).toFixed(3)}R ≤ ${hurdle}R)`);
   let action: DirectionAction;
-  if (longClears && shortClears && Math.abs(longScore - shortScore) < 0.2 && Math.min(longScore, shortScore) >= 0.5) {
+  // BOTH is the most committing action (two simultaneous directional positions), so it keeps the STRICT
+  // bar: both sides must be PROVEN_ABOVE. Relaxing the gate to let unmeasured sides compete is meant to
+  // enable exploration of ONE under-measured direction — never to open two positions on absent evidence.
+  const bothProven = longStanding === "PROVEN_ABOVE" && shortStanding === "PROVEN_ABOVE";
+  if (bothProven && longClears && shortClears && Math.abs(longScore - shortScore) < 0.2 && Math.min(longScore, shortScore) >= 0.5) {
     action = "BOTH"; // genuinely independent two-sided opportunity (repo has both long + short lanes)
     supporting.push("independent two-sided edge → BOTH");
   } else if (longClears && longScore >= shortScore) {
