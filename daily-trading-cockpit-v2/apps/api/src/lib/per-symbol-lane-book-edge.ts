@@ -23,6 +23,8 @@
  * promote. Promotion to testnet/live must still be an explicit, separately-gated step.
  */
 
+import { applySubFloorExclusionForDecisions } from "./paper-subfloor-exclusion.js";
+
 const CLOSED = new Set(["PAPER_CLOSED_WIN", "PAPER_CLOSED_LOSS"]);
 const PERFECT_PF_SENTINEL = 999;
 
@@ -47,6 +49,48 @@ export interface PsleOrder {
   netR: number | null;
   paperOrderMode?: string | null;
   diagnosticLabel?: string | null;
+  /** T1-b: read only by the sub-admission-floor predicate. Absent ⇒ row is never excluded. */
+  sourceType?: string | null;
+  plannedStopDistanceBps?: number | null;
+}
+
+/**
+ * THE projection used to ship a local order to a peer instance over
+ * `/api/shadow/headline-closed-orders`. It exists as one exported function because the previous
+ * hand-written object literal in routes/shadow.ts silently dropped `sourceType` and
+ * `plannedStopDistanceBps` (review finding 2026-07-27): peer rows fetched from testnet 3102 and
+ * live 3103 arrived WITHOUT the two fields the sub-admission-floor predicate reads, so with
+ * PAPER_EXCLUDE_SUBFLOOR_ROWS_DECISIONS on, local sub-floor closes left a `lane symbol` cell while
+ * the peers' identically-contaminated closes (same pre-T1-a allocator, same 4-20bps geometry) stayed
+ * in it. `promotable` / `testnetCandidate` were then computed on a half-cleaned population and
+ * fetched by live/3103 through lane-symbol-curation-cache.ts as SYMBOL_NOT_CURATED /
+ * symbolPriorityTier on real money.
+ *
+ * ANY new field the predicate reads MUST be added here. Pinned by
+ * "[T1-b/7] peer projection carries every field the predicate reads".
+ */
+export function toPsleOrder(o: {
+  symbol: string;
+  selectedLaneId: string;
+  direction?: "LONG" | "SHORT" | null;
+  paperStatus: string;
+  netR: number | null;
+  paperOrderMode?: string | null;
+  diagnosticLabel?: string | null;
+  sourceType?: string | null;
+  plannedStopDistanceBps?: number | null;
+}): PsleOrder {
+  return {
+    symbol: o.symbol,
+    selectedLaneId: o.selectedLaneId,
+    direction: o.direction ?? null,
+    paperStatus: o.paperStatus,
+    netR: o.netR,
+    paperOrderMode: o.paperOrderMode ?? null,
+    diagnosticLabel: o.diagnosticLabel ?? null,
+    sourceType: o.sourceType ?? null,
+    plannedStopDistanceBps: o.plannedStopDistanceBps ?? null,
+  };
 }
 
 export type PsleVerdict = "BOOK_POSITIVE" | "BOOK_NEGATIVE" | "BOOK_MARGINAL" | "INSUFFICIENT";
@@ -219,8 +263,16 @@ export function buildPerSymbolLaneBookEdge(
   const suspiciousPf = opts.suspiciousPf ?? 10;
   const suspiciousWr = opts.suspiciousWr ?? 0.98;
 
+  // T1-b DECISION PATH — gated, DEFAULT OFF. This report is the HIGHEST-BLAST-RADIUS consumer:
+  // `promotable` / `testnetCandidate` feed getCuratedSymbolsForLane, which gates SYMBOL_NOT_CURATED
+  // in the allocator AND is fetched cross-instance by live/3103 via lane-symbol-curation-cache.ts.
+  // Measured 2026-07-26: on the two sentinel lanes, 25 of 33 cells with >=10 closes are 100%
+  // sub-floor, so exclusion empties them below `displayFloor` rather than re-scoring them.
+  // ROLLOUT HAZARD: live reads the report computed on RESEARCH. Turning the flag on for research
+  // changes what live curates with no live-side flag flip. See paper-subfloor-exclusion.ts header.
+  const scoped = applySubFloorExclusionForDecisions(orders);
   const groups = new Map<string, PsleOrder[]>();
-  for (const o of orders) {
+  for (const o of scoped) {
     if (!CLOSED.has(o.paperStatus)) continue;
     if (!o.selectedLaneId || !o.symbol) continue;
     const key = `${o.selectedLaneId} ${o.symbol}`;

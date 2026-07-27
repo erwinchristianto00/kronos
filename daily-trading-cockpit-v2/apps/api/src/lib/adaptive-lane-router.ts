@@ -30,6 +30,7 @@ import {
 } from "./current-guard-variant-matrix.js";
 import type { LiveTradingGateReport } from "./live-trading-gate.js";
 import type { PaperOrder } from "./paper-execution-router.js";
+import { applySubFloorExclusionForDecisions } from "./paper-subfloor-exclusion.js";
 import type { ShadowLaneScoreboard } from "./shadow-lane-scoreboard.js";
 
 export const ADAPTIVE_LANE_ROUTER_LANE = "ADAPTIVE_LANE_ROUTER_V1" as const;
@@ -556,7 +557,10 @@ function paperEvidenceForLane(
   laneId: string,
   orders: readonly PaperOrder[],
 ): Partial<CandidateLane> | null {
-  const closed = orders
+  // T1-b DECISION PATH (lane routing evidence) — gated, DEFAULT OFF. `stressedNetAvgR` below
+  // divides by plannedStopDistanceBps, so sub-floor rows dominate the stress term as well as the
+  // mean. With the flag off this is the caller's own array, unfiltered.
+  const closed = applySubFloorExclusionForDecisions(orders)
     .filter(
       (order) =>
         order.selectedLaneId === laneId &&

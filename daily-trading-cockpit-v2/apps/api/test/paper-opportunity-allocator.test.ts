@@ -36,10 +36,14 @@ import {
   type PaperOrderProvenance,
 } from "../src/lib/paper-execution-router.js";
 import {
+  admissionStopFloorBpsForVariant,
   buildCurrentGuardVariantMatrixReport,
   CurrentGuardVariantMatrixStore,
+  deriveVariantGeometry,
   mirrorVariantMatrixSignals,
   resolveVariantMatrixObservations,
+  VARIANT_MATRIX_DEFINITIONS,
+  WIDE_STOP_MIN_BPS,
   type VariantMatrixSignal,
   type KlineTuple,
   type CurrentGuardVariantMatrixReport,
@@ -595,6 +599,94 @@ describe("paper-opportunity-allocator", () => {
     expect(paperOpportunityStopFloorRejection(299.999)).toBe("STOP_DISTANCE_BELOW_FLOOR");
     expect(paperOpportunityStopFloorRejection(Number.NaN)).toBe("STOP_DISTANCE_BELOW_FLOOR");
     expect(paperOpportunityStopFloorRejection(300)).toBeNull();
+  });
+
+  // [5c] SENTINEL-FLOOR — the non-binding `stopFloorBps: 1` on the two "Sentil" lanes is a
+  // GEOMETRY instruction (route through the wide branch so the TP is re-placed), never a claim
+  // that a 1bps stop is admissible. Before the fix the allocator passed it straight into the
+  // admission gate, so CG_BASELINE_FAST_05 / CG_MAKER_FAST_05 admitted geometry their own parent
+  // lanes reject — breaking the "only the TP changed" A/B at the gate.
+  it("[5c] a non-binding stopFloorBps:1 sentinel does not lower the ADMISSION floor below WIDE_STOP_MIN_BPS", () => {
+    const defOf = (id: string) => {
+      const def = VARIANT_MATRIX_DEFINITIONS.find((d) => d.id === id);
+      if (!def) throw new Error(`variant definition missing: ${id}`);
+      return def;
+    };
+    const baselineFast05 = defOf("CG_BASELINE_FAST_05");
+    const makerFast05 = defOf("CG_MAKER_FAST_05");
+    const tightFast05 = defOf("CG_TIGHT_FAST_05");
+    const baselineCurrent = defOf("CG_BASELINE_CURRENT");
+
+    // The sentinel lanes must admit at exactly the same floor as the parents they A/B against.
+    expect(baselineFast05.stopFloorBps).toBe(1); // sentinel still declared (geometry needs it)
+    expect(makerFast05.stopFloorBps).toBe(1);
+    expect(admissionStopFloorBpsForVariant(baselineFast05)).toBe(WIDE_STOP_MIN_BPS);
+    expect(admissionStopFloorBpsForVariant(makerFast05)).toBe(WIDE_STOP_MIN_BPS);
+    // Parent lanes carry no floor at all and already admitted at WIDE_STOP_MIN_BPS.
+    expect(baselineCurrent.stopFloorBps).toBeUndefined();
+    expect(admissionStopFloorBpsForVariant(baselineCurrent)).toBe(WIDE_STOP_MIN_BPS);
+    // Genuinely binding floors are preserved byte-for-byte — this is what makes the fix narrow.
+    expect(admissionStopFloorBpsForVariant(tightFast05)).toBe(175);
+    for (const def of VARIANT_MATRIX_DEFINITIONS) {
+      if (def.stopFloorBps != null && def.stopFloorBps > 1) {
+        expect(admissionStopFloorBpsForVariant(def)).toBe(def.stopFloorBps);
+      }
+    }
+
+    // A 20bps stop (the LONG-book median for these lanes) must now be rejected.
+    expect(
+      paperOpportunityStopFloorRejection(20, admissionStopFloorBpsForVariant(baselineFast05)),
+    ).toBe("STOP_DISTANCE_BELOW_FLOOR");
+    // ...while the same 20bps stop under CG_TIGHT_FAST_05's REAL 175 floor is still rejected for
+    // its own reason, and a 200bps stop is still admitted there (real floor unchanged).
+    expect(
+      paperOpportunityStopFloorRejection(200, admissionStopFloorBpsForVariant(tightFast05)),
+    ).toBeNull();
+
+    // The sentinel's LEGITIMATE geometry use is untouched: it must NOT widen the stop to 300.
+    const geo = deriveVariantGeometry(
+      {
+        sourceSignalId: "sig-sentinel",
+        symbol: "ETHUSDT",
+        direction: "SHORT",
+        entryPrice: 100,
+        stopLoss: 100.2, // 20bps raw stop
+        tp1: 99,
+        tp2: null,
+        tp3: null,
+        stopDistanceBps: 20,
+        regime: "BEARISH_EXPANSION",
+        entryVariant: "base_current_entry",
+        openedAt: new Date().toISOString(),
+        closedAt: null,
+      },
+      baselineFast05,
+    );
+    expect(geo.kind).toBe("ok");
+    if (geo.kind === "ok") {
+      expect(geo.stopDistanceBps).toBeCloseTo(20, 6); // sentinel still non-binding on geometry
+      expect(geo.stopLoss).toBeCloseTo(100.2, 6);
+    }
+  });
+
+  // [5d] The gate itself, end to end — guards against the helper existing but never being wired
+  // into buildPaperOpportunityAllocatorReport.
+  it("[5d] allocator rejects sub-300bps candidates on the sentinel lanes while the 175bps lane still admits", async () => {
+    const dir = tmpDir();
+    const vmReport = await buildWinningVmReport(dir);
+    // SHORT, entry 100, stop 102 → 200bps raw. Above CG_TIGHT_FAST_05's real 175 floor, below the
+    // 300 floor its sentinel siblings should now be held to.
+    const report = buildPaperOpportunityAllocatorReport(
+      baseInputs({
+        vmReport,
+        candidates: [makeCandidate({ currentPrice: 100, stopLoss: 102, tp1: 96 })],
+        testnetCollectAllLanes: true,
+      }),
+    );
+    const laneEligible = (id: string) => report.byLane.find((l) => l.laneId === id)?.eligible ?? null;
+    expect(laneEligible("CG_TIGHT_FAST_05")).toBe(1); // real 175bps floor: still admits at 200bps
+    expect(laneEligible("CG_BASELINE_FAST_05")).toBe(0); // sentinel: now held to 300bps
+    expect(laneEligible("CG_MAKER_FAST_05")).toBe(0);
   });
 
   // [6]

@@ -56,7 +56,11 @@ function directionRecord(n: number, overrides: Partial<DirectionOutcomeRecord> =
     decisionId: `dir-${n}`,
     horizon: "INTRADAY",
     action: "LONG",
-    asOfMs: n * HOUR_MS,
+    // 2026-07-26: one full DAY apart, not one hour. The edge memory now gates on non-overlapping
+    // windows, and 1h spacing put 4 INTRADAY rows (and 24 SWING rows) inside a single window — so
+    // these fixtures were only ever "n rows", never "n independent observations". Day spacing makes
+    // every row its own window at every horizon, which is what the fixtures always meant.
+    asOfMs: n * 24 * HOUR_MS,
     status: "RESOLVED",
     chosenNetR: 0.1,
     win: 1,
@@ -89,9 +93,9 @@ describe("foldDirectionOutcomeRecordsForEdgeMemory — pure fold (diagnostic-exc
       directionRecord(4, { action: "LONG", horizon: "SWING", chosenNetR: 0.3 }),
     ];
     const buckets = foldDirectionOutcomeRecordsForEdgeMemory(records);
-    expect(buckets.get("LONG::INTRADAY")).toEqual({ n: 2, sumNetR: 0.1 });
-    expect(buckets.get("SHORT::INTRADAY")).toEqual({ n: 1, sumNetR: 0.05 });
-    expect(buckets.get("LONG::SWING")).toEqual({ n: 1, sumNetR: 0.3 });
+    expect(buckets.get("LONG::INTRADAY")).toMatchObject({ n: 2, sumNetR: 0.1 });
+    expect(buckets.get("SHORT::INTRADAY")).toMatchObject({ n: 1, sumNetR: 0.05 });
+    expect(buckets.get("LONG::SWING")).toMatchObject({ n: 1, sumNetR: 0.3 });
     expect(buckets.get("SHORT::SWING")).toBeUndefined();
   });
 
@@ -101,7 +105,7 @@ describe("foldDirectionOutcomeRecordsForEdgeMemory — pure fold (diagnostic-exc
       directionRecord(2, { action: "LONG", chosenNetR: 0.1 }),
     ];
     const buckets = foldDirectionOutcomeRecordsForEdgeMemory(records);
-    expect(buckets.get("LONG::INTRADAY")).toEqual({ n: 1, sumNetR: 0.1 });
+    expect(buckets.get("LONG::INTRADAY")).toMatchObject({ n: 1, sumNetR: 0.1 });
   });
 
   it("excludes FLAT rows (chosenNetR is pinned to exactly 0 — not a real directional outcome)", () => {
@@ -111,7 +115,7 @@ describe("foldDirectionOutcomeRecordsForEdgeMemory — pure fold (diagnostic-exc
     ];
     const buckets = foldDirectionOutcomeRecordsForEdgeMemory(records);
     expect(buckets.size).toBe(1);
-    expect(buckets.get("LONG::INTRADAY")).toEqual({ n: 1, sumNetR: 0.1 });
+    expect(buckets.get("LONG::INTRADAY")).toMatchObject({ n: 1, sumNetR: 0.1 });
   });
 
   it("excludes BOTH rows (chosenNetR is a blended mean, not attributable to either single side)", () => {
@@ -121,7 +125,7 @@ describe("foldDirectionOutcomeRecordsForEdgeMemory — pure fold (diagnostic-exc
     ];
     const buckets = foldDirectionOutcomeRecordsForEdgeMemory(records);
     expect(buckets.size).toBe(1);
-    expect(buckets.get("SHORT::INTRADAY")).toEqual({ n: 1, sumNetR: -0.2 });
+    expect(buckets.get("SHORT::INTRADAY")).toMatchObject({ n: 1, sumNetR: -0.2 });
   });
 });
 
@@ -129,7 +133,7 @@ describe("FourBrainEdgeMemoryStore", () => {
   it("lookup on an empty store returns n=0, avgNetR:null (never a fabricated zero)", () => {
     const outcomeStore = new DirectionEntryOutcomeStore(tmp());
     const edge = new FourBrainEdgeMemoryStore(outcomeStore);
-    expect(edge.lookup("LONG", "INTRADAY")).toEqual({ n: 0, avgNetR: null });
+    expect(edge.lookup("LONG", "INTRADAY")).toEqual({ n: 0, effectiveN: 0, avgNetR: null });
   });
 
   it("lookup reflects the outcome store's RESOLVED records at construction time", () => {
@@ -318,5 +322,80 @@ describe("End-to-end wiring: assembleFourBrainTick carries fourBrainLongVeto/fou
     const gathered = assembleFourBrainTick(gatherInput({}));
     expect(gathered.directionInputs[0]!.input.fourBrainLongVeto).toBeUndefined();
     expect(gathered.directionInputs[0]!.input.fourBrainShortVeto).toBeUndefined();
+  });
+});
+
+describe("[EFFECTIVE-N] the sufficiency gate counts non-overlapping windows, not raw rows (2026-07-26)", () => {
+  // Found on live testnet data: LONG/SWING was firing VETO_NEGATIVE off raw n=45 whose rows fell in
+  // only ~4 distinct 24h windows, with avgNetR -3.63R produced by that handful of overlapping
+  // decisions. The outcome store's own report already gates on effective sample size for exactly
+  // this reason; this memory was the one consumer still reading raw n, so it suppressed real LONG
+  // scores on evidence it did not have.
+  const DAY_MS = 24 * HOUR_MS;
+  /** Minimal stand-in for the outcome store — the edge memory only ever reads direction.records. */
+  const storeOf = (records: DirectionOutcomeRecord[]): FourBrainEdgeMemoryStore =>
+    new FourBrainEdgeMemoryStore({
+      getState: () => ({ direction: { records } }),
+    } as unknown as DirectionEntryOutcomeStore);
+
+  /** 60 LONG/SWING rows, strongly negative, but PACKED into `blocks` distinct 24h windows. */
+  const packed = (blocks: number): DirectionOutcomeRecord[] =>
+    Array.from({ length: 60 }, (_, i) =>
+      directionRecord(i, {
+        decisionId: `packed-${i}`,
+        action: "LONG",
+        horizon: "SWING",
+        chosenNetR: -3.6,
+        win: 0,
+        asOfMs: 30 * DAY_MS + (i % blocks) * DAY_MS + Math.floor(i / blocks) * 60_000,
+      }),
+    );
+
+  it("MANY rows packed into FEW windows do NOT reach sufficiency", () => {
+    const store = storeOf(packed(3));
+    const look = store.lookup("LONG", "SWING");
+    expect(look.n).toBe(60);
+    expect(look.effectiveN).toBe(3);
+    expect(look.avgNetR).toBeCloseTo(-3.6, 6);
+    // Strongly negative mean, plenty of raw rows — and still NOT enough evidence to veto.
+    expect(fourBrainEdgeVerdict(store, null, "LONG", "SWING").verdict).toBe("ALLOW_INSUFFICIENT");
+  });
+
+  it("FAILS-WITHOUT-FIX control: raw n clears MIN_SAMPLES while effectiveN does not", () => {
+    const look = storeOf(packed(3)).lookup("LONG", "SWING");
+    expect(look.n).toBeGreaterThanOrEqual(MIN_SAMPLES); // the old gate would have vetoed on this
+    expect(look.effectiveN).toBeLessThan(MIN_SAMPLES); // the new gate refuses on this
+  });
+
+  it("the SAME rows spread across enough windows DO reach sufficiency", () => {
+    const spread = Array.from({ length: 60 }, (_, i) =>
+      directionRecord(i, {
+        decisionId: `spread-${i}`,
+        action: "LONG",
+        horizon: "SWING",
+        chosenNetR: -3.6,
+        win: 0,
+        asOfMs: 30 * DAY_MS + i * DAY_MS,
+      }),
+    );
+    const store = storeOf(spread);
+    expect(store.lookup("LONG", "SWING").effectiveN).toBe(60);
+    expect(fourBrainEdgeVerdict(store, null, "LONG", "SWING").verdict).toBe("VETO_NEGATIVE");
+  });
+
+  it("INTRADAY blocks are 4h wide and effectiveN never exceeds n", () => {
+    const rows = Array.from({ length: 8 }, (_, i) =>
+      directionRecord(i, {
+        decisionId: `intra-${i}`,
+        action: "LONG",
+        horizon: "INTRADAY",
+        chosenNetR: 0.5,
+        asOfMs: 30 * DAY_MS + Math.floor(i / 2) * 4 * HOUR_MS + (i % 2) * 60_000,
+      }),
+    );
+    const look = storeOf(rows).lookup("LONG", "INTRADAY");
+    expect(look.n).toBe(8);
+    expect(look.effectiveN).toBe(4); // 2 rows per 4h block
+    expect(look.effectiveN).toBeLessThanOrEqual(look.n);
   });
 });

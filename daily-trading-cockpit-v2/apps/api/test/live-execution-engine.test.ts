@@ -5881,3 +5881,93 @@ describe("[BUG 2] manual entry decision staleness gate", () => {
     expect(isManualEntryDecisionStale("not-a-timestamp", observedMs)).toBe(true);
   });
 });
+
+// ── fee provenance (LiveIntent.feeSource) ────────────────────────────────────
+//
+// FAILS WITHOUT THE FIX: `LiveIntent.feeSource` does not exist on pre-fix code (verified: zero
+// occurrences of the identifier at HEAD), so every assertion below reads `undefined`.
+//
+// WHY IT MATTERS: every close path in this engine collapses to
+// `intent.feesUsd = settled?.feesUsd ?? null`, and realizedFromTrades returns `feesUsd: 0` from
+// THREE structurally different situations — a genuine zero-fee settlement, a settlement with no
+// order ids to look up (the exchange is never queried), and a query that matched none of our rows.
+// Across 182 closed intents there was no way to tell a measured commission from a structural zero,
+// which is exactly what makes an aggregate fee figure over this store untrustworthy.
+
+describe("LiveIntent.feeSource (fee provenance — report-only)", () => {
+  function openShort(client?: FakeLiveClient) {
+    const order = paperOrder({
+      symbol: "ETHUSDT",
+      selectedLaneId: "CG_VARIANT_MATRIX:CG_WIDE_FAST_SHORT",
+      direction: "SHORT",
+      entryPrice: 2000,
+      stopLoss: 2100,
+      variantExitRule: "tp1_full",
+    } as Partial<PaperOrder>);
+    return makeEngine({ ...(client ? { client } : {}), paper: makePaperStore([order]) });
+  }
+
+  it("EXCHANGE when the settlement summed at least one real /userTrades commission row", async () => {
+    const { engine, client, store } = openShort();
+    expect((await engine.arm()).ok).toBe(true);
+    await engine.tick();
+    const intent = store.getState().intents[0]!;
+
+    client.orderStatusById.set(intent.tp1OrderId!, "FILLED");
+    client.positionsBySymbol.set("ETHUSDT", 0);
+    client.trades = [
+      { symbol: "ETHUSDT", orderId: intent.tp1OrderId!, price: 1900, qty: intent.qty, realizedPnl: 5, commission: 0.04, commissionAsset: "USDT", time: 1 },
+    ];
+    await engine.tick();
+
+    const closed = store.getState().intents[0]!;
+    expect(closed.state).toBe("CLOSED");
+    expect(closed.feesUsd).toBeCloseTo(0.04, 9);
+    expect(closed.feeSource).toBe("EXCHANGE");
+  });
+
+  it("UNKNOWN (undefined) — not EXCHANGE — when the trades fetch fails outright and feesUsd is left null", async () => {
+    class FailingTradesClient extends FakeLiveClient {
+      async getUserTrades(): Promise<FuturesUserTrade[]> {
+        throw new Error("simulated getUserTrades outage");
+      }
+    }
+    const { engine, store } = openShort(new FailingTradesClient());
+    expect((await engine.arm()).ok).toBe(true);
+    await engine.tick();
+    const intent = store.getState().intents[0]!;
+
+    const res = await engine.manualCloseIntent(intent.paperOrderId);
+    expect(res.ok).toBe(true);
+
+    const closed = store.getState().intents[0]!;
+    expect(closed.state).toBe("CLOSED");
+    expect(closed.feesUsd).toBeNull();
+    expect(closed.feeSource).toBeUndefined();
+  });
+
+  it("a STRUCTURAL zero (feesUsd 0 with no commission row ever seen) is NOT labelled EXCHANGE", async () => {
+    // The real-money shape of this: an operator closes an intent whose exchange position is
+    // already flat. closeQty is 0, so no flatten order is placed, so requiredOrderIds is empty and
+    // the settlement short-circuits to "close is visible" with ZERO matching trade rows —
+    // realizedPnlUsd 0 and feesUsd 0. Before feeSource, that $0 fee was indistinguishable in the
+    // store from a real commission that happened to be $0, and it silently deflated every fee
+    // aggregate computed over closed intents.
+    const { engine, client, store } = openShort();
+    expect((await engine.arm()).ok).toBe(true);
+    await engine.tick();
+    const intent = store.getState().intents[0]!;
+
+    client.positionsBySymbol.set("ETHUSDT", 0); // already flat on the exchange
+    client.trades = []; // and nothing of ours in /userTrades
+    const res = await engine.manualCloseIntent(intent.paperOrderId);
+    expect(res.ok).toBe(true);
+
+    const closed = store.getState().intents[0]!;
+    expect(closed.state).toBe("CLOSED");
+    expect(closed.feesUsd).toBe(0); // unchanged behaviour — the number itself is not touched
+    expect(closed.feeSource).toBeUndefined(); // but it is now marked as NOT a measurement
+    // No flatten order was placed, which is what makes this the structural-zero path.
+    expect(client.placed.some((p) => p.newClientOrderId?.startsWith("dtc-opcl-"))).toBe(false);
+  });
+});

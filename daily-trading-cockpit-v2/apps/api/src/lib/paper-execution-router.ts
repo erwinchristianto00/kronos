@@ -44,7 +44,16 @@ import {
   walkVariantPath,
   MAKER_FILL_WINDOW_CANDLES,
   VARIANT_MATRIX_DEFINITIONS,
+  MAKER_ROUNDTRIP_BPS,
+  TAKER_ROUNDTRIP_BPS,
+  STOP_OUT_SLIPPAGE_BPS,
 } from "./current-guard-variant-matrix.js";
+import {
+  excludeSubFloorRowsForReport,
+  subFloorExclusionEnabledForDecisions,
+  type SubFloorExclusionSummary,
+} from "./paper-subfloor-exclusion.js";
+import { REALISTIC_FEE_BPS_PER_SIDE } from "./shadow-engine.js";
 import type { AdaptiveLaneRouterReport } from "./adaptive-lane-router.js";
 import type { LiveTradingGateReport } from "./live-trading-gate.js";
 import { recordHeatShadowSnapshot } from "./portfolio-heat-shadow.js";
@@ -120,6 +129,28 @@ export const PAPER_ORDER_EXPIRY_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 // FASTTP_HORIZON_HOURS / SIGNAL_DECAY_HORIZON_HOURS / the STALE-open warn bucket.
 export const PAPER_MAX_HOLD_MS = 72 * 60 * 60 * 1000; // 72 h
 export const DEFAULT_PAPER_EQUITY = 2000;
+const DEFAULT_PER_LANE_DIAGNOSTIC_FLOOR = 200;
+const DEFAULT_PAPER_MAX_CLOSED_DIAGNOSTIC = 5_000;
+
+/** Validated env parse for the two closed-diagnostic retention knobs below. Mirrors
+ *  getPaperEquityFromEnv()'s shape (this file's established idiom): FALL BACK to the compiled
+ *  default on anything invalid rather than clamping, so a typo can never silently install a
+ *  different retention policy.
+ *
+ *  Replaces `Number(process.env.X) || DEFAULT`, which catches NaN/""/0 but passes NEGATIVES
+ *  straight through (`Number("-1") || 200` → `-1`). A negative is not merely "a smaller cap":
+ *  pruneClosedDiagnostic() feeds these into Array.slice(), where a negative index counts from
+ *  the END. With PER_LANE_DIAGNOSTIC_FLOOR = -1, `bucket.slice(0, -1)` makes the per-lane FLOOR
+ *  "everything except the oldest row" and `bucket.slice(-1)` makes the remainder pool a single
+ *  row — the global cap then never binds and the store grows unbounded, i.e. exactly the OOM
+ *  class this cap exists to prevent, installed by a one-character env typo. */
+export function parseDiagnosticRetentionEnv(raw: string | undefined, fallback: number): number {
+  if (raw == null || raw.trim() === "") return fallback;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 1) return fallback;
+  return Math.floor(parsed);
+}
+
 /** Max DIAGNOSTIC closed orders retained in the paper store (rolling measurement window). The
  *  store loads fully each resolve cycle, so unbounded closed-order growth is a memory/latency risk
  *  (the OOM class). HEADLINE (real-ledger) + OPEN orders are NEVER pruned by this. Env-tunable.
@@ -127,15 +158,101 @@ export const DEFAULT_PAPER_EQUITY = 2000;
  *  research instance had grown to 11,213 total orders / 34MB and was never once pruned, directly
  *  correlated with that instance's 2x-higher OOM crash-restart rate vs live/testnet (whose smaller
  *  paper-order volume kept them under the same inert ceiling by chance, not by this cap doing
- *  anything). 5,000 keeps ~9-10 days of rolling diagnostic history at the observed ~540/day
- *  closed-diagnostic rate — ample for every lane's edgeReady sample-size checks (n>=30) while
- *  bounding the store to a small fraction of its previous size. */
-export const PAPER_MAX_CLOSED_DIAGNOSTIC = Number(process.env.PAPER_MAX_CLOSED_DIAGNOSTIC) || 5_000;
+ *  anything).
+ *
+ *  2026-07-26 — DEFAULT DELIBERATELY LEFT AT 5,000. A raise to 12,000 was implemented and then
+ *  REVERTED at gate. Read this before touching the number again.
+ *
+ *  The diagnosis that motivated the raise is correct BUT IS INSTANCE-SPECIFIC, and this is a
+ *  process-global constant with exactly one call site shared by every PaperExecutionRouterStore
+ *  on every instance. pruneClosedDiagnostic() keeps `Σ min(n_lane, PER_LANE_DIAGNOSTIC_FLOOR)`
+ *  unconditionally and only then spends `max(0, maxClosed − floorKept)` on the remainder, so the
+ *  cap does NOTHING once `laneCount × floor >= maxClosed`. Measured 2026-07-26, read-only:
+ *
+ *    testnet (/root/kronos-testnet, 117.9 MB): 35 lanes, floorKept 6,349 ⇒ remainderBudget
+ *      max(0, 5,000 − 6,349) = 0. Cap INERT; retention is exactly "newest 200 per lane", a
+ *      3.7–16 h window on the busy lanes. This is the starvation the raise was aimed at.
+ *    research (/root/kronos, 19.2 MB): 30 lanes, aggregate floor 3,173, closedDiag pinned at
+ *      EXACTLY 5,000 ⇒ remainderBudget 1,827. Cap FULLY BINDING. Closed-diagnostic rows are
+ *      15.4 MB of that 19.2 MB store at 3,085 B/row, so 12,000 would take it to ~40.8 MB
+ *      (+112%) — past the 34 MB size cited above as correlating with research's 2x OOM
+ *      crash-restart rate, i.e. straight back into the incident this cap was created to fix.
+ *      Research closes only ~150/day, so 12,000 buys it ~80 days of history, not 30 h.
+ *      Research also runs a SECOND store (data/realtime-short/, 11.1 MB) under this same cap.
+ *
+ *  Second reason the default must not move: the retained pool is the entire input to
+ *  computeAutoQuarantinedVariantLanes() (paper-opportunity-allocator.ts), which is a REAL
+ *  ADMISSION GATE — its output halts admission for variant diagnostic lanes. It averages netR
+ *  over the whole retained pool with NO recency weighting, so changing retention changes which
+ *  lanes are quarantined. It is default-ON (`PAPER_VARIANT_AUTO_QUARANTINE !== "0"`). Testnet
+ *  sets =0 so it is OFF there; research sets nothing so it is ON — and research is precisely
+ *  the instance where the cap binds and retention would actually change. A retention knob must
+ *  not silently move an admission gate.
+ *
+ *  THE SUPPORTED WAY TO RAISE RETENTION IS PER-INSTANCE ENV, NOT THIS DEFAULT:
+ *    testnet only:  PAPER_MAX_CLOSED_DIAGNOSTIC=12000
+ *  That is safe on testnet specifically because auto-quarantine is disabled there and the store
+ *  has the headroom (112 → ~128 MB). Do NOT set it on research or mainnet without re-measuring
+ *  that instance's own lane count, row size and quarantine setting.
+ *
+ *  Whatever value is chosen, it must clear `laneCount × PER_LANE_DIAGNOSTIC_FLOOR` or it governs
+ *  nothing at all — silently, with no error. Use closedDiagnosticRetentionBudget() below to check
+ *  before setting it. And it must NOT be raised far enough to restore multi-week history: 19 days
+ *  at testnet's ~8,700/day is ~165,000 rows ≈ 650 MB of closed-diagnostic alone, far past the
+ *  234 MB store that caused the 2026-07-20 testnet CPU incident.
+ *
+ *  Note also this cap governs only 22.4% of the testnet store — the other 77.6% (PAPER_SUBMITTED
+ *  43 MB, PAPER_CANCELED 29.7 MB, PAPER_NO_FILL 10.0 MB) is untouchable by
+ *  pruneClosedDiagnostic() at ANY cap value, and those terminal rows carry no closed-outcome
+ *  information. Reclaiming them is the real headroom, and is a separate change. */
+export const PAPER_MAX_CLOSED_DIAGNOSTIC = parseDiagnosticRetentionEnv(
+  process.env.PAPER_MAX_CLOSED_DIAGNOSTIC,
+  DEFAULT_PAPER_MAX_CLOSED_DIAGNOSTIC,
+);
 /** Never reduce a single lane's retained closed-diagnostic count below this purely because sibling
  *  lanes are busier — see pruneClosedDiagnostic()'s doc comment. Comfortably above every n>=30/
  *  n>=40 sample-size gate in the codebase. Env-tunable, mirrors PAPER_DIAGNOSTIC_MAX_OPEN_PER_LANE's
- *  naming in paper-opportunity-allocator.ts. */
-export const PER_LANE_DIAGNOSTIC_FLOOR = Number(process.env.PAPER_MAX_CLOSED_DIAGNOSTIC_PER_LANE_FLOOR) || 200;
+ *  naming in paper-opportunity-allocator.ts. Value deliberately UNCHANGED at 200 by the 2026-07-26
+ *  cap raise: the floor was never the broken part, the cap that had to clear it was. */
+export const PER_LANE_DIAGNOSTIC_FLOOR = parseDiagnosticRetentionEnv(
+  process.env.PAPER_MAX_CLOSED_DIAGNOSTIC_PER_LANE_FLOOR,
+  DEFAULT_PER_LANE_DIAGNOSTIC_FLOOR,
+);
+
+/**
+ * The floor-vs-cap arithmetic pruneClosedDiagnostic() performs, exposed as a pure function so the
+ * SILENT-INERTNESS failure mode has a name, a test and a pre-flight check.
+ *
+ * `capIsInert` is the whole point: when the aggregate per-lane floor already meets or exceeds the
+ * global cap, `remainderBudget` is 0, `remainder.slice(0, 0)` keeps nothing, and the cap governs
+ * NOTHING — retention silently collapses to "newest PER_LANE_DIAGNOSTIC_FLOOR per lane" with no
+ * error, no log and no observable difference from a correctly-configured cap. That is how a 5,000
+ * cap came to be inert on a 35-lane testnet instance while binding on a 30-lane research instance.
+ *
+ * It is a lane-COUNT problem, not a value problem: the condition returns whenever lanes grow past
+ * `maxClosed / floor` (at the shipped 5,000/200 that is 25 lanes; at 12,000/200 it is 60). Any new
+ * lane batch can re-introduce it. Check with this before choosing PAPER_MAX_CLOSED_DIAGNOSTIC.
+ *
+ * `laneClosedCounts` are the per-lane closed-DIAGNOSTIC row counts, in any order.
+ */
+export function closedDiagnosticRetentionBudget(
+  laneClosedCounts: readonly number[],
+  maxClosed: number = PAPER_MAX_CLOSED_DIAGNOSTIC,
+  perLaneFloor: number = PER_LANE_DIAGNOSTIC_FLOOR,
+): { aggregateFloor: number; remainderBudget: number; capIsInert: boolean; laneCount: number } {
+  let aggregateFloor = 0;
+  for (const n of laneClosedCounts) {
+    if (!Number.isFinite(n) || n <= 0) continue;
+    aggregateFloor += Math.min(n, perLaneFloor);
+  }
+  const remainderBudget = Math.max(0, maxClosed - aggregateFloor);
+  return {
+    aggregateFloor,
+    remainderBudget,
+    capIsInert: remainderBudget === 0,
+    laneCount: laneClosedCounts.filter((n) => Number.isFinite(n) && n > 0).length,
+  };
+}
 const RISK_PCT = 1; // 1% of equity per trade — never changed
 const DEFAULT_PAPER_MAX_NOTIONAL_CAP = 50_000;
 const PAPER_TAKER_COST_BPS = 22; // mirrors TAKER_ROUNDTRIP_BPS from CG variant matrix
@@ -301,8 +418,29 @@ export interface PaperOrder {
   sourceObservationId: string;
   sourceSignalId: string | null;
   dedupeKey: string; // `${sourceObservationId}:${selectedLaneId}`
+  /**
+   * DECISION time (ISO) — the instant admission stamped this order. Every label-shaped
+   * field on the row (regime, controllerMode/controllerConfidence, routerPermission,
+   * provenance, the forward-gate block) is as-of THIS instant, not openedAt.
+   * STRICTLY AFTER openedAt: measured over the 29,968-order testnet store on 2026-07-26,
+   * createdAt − openedAt was positive on 29,968/29,968 rows (closed cohort p50 +213.9s,
+   * p90 +394.2s, max +586.6s). There is no negative-skew cohort.
+   */
   createdAt: string;
   updatedAt: string;
+  /**
+   * OBSERVATION time (ISO) — the source scan instant at which `entryPrice` was observed.
+   * PRECEDES createdAt (see above). LABEL LEAK, measured not theoretical: the resolver
+   * anchors its candle walk here (`startTime = openedAtMs − CANDLE_MS`, and the walk loop
+   * admits the whole 5m bar containing openedAtMs), so an order can reach a terminal
+   * outcome from price action that closed BEFORE its own label existed. On the testnet
+   * store 2026-07-26, 106 of 6,229 closed rows carrying closedAtMs had
+   * closedAtMs < createdAt (86 of them TP1_HIT wins); 0 had closedAtMs < openedAt.
+   * Surfaced report-only by buildPaperLatencyDiagnostics as resolvedBeforeDecisionCount /
+   * labelLeak*Sec / preDecisionResolvableSecP50. Resolution semantics are deliberately
+   * UNCHANGED: entryPrice was observed at openedAt, so re-anchoring the walk to createdAt
+   * without also re-deriving the entry would simulate a fill that never existed.
+   */
   openedAt: string; // mirrors source observation
   symbol: string;
   direction: "LONG" | "SHORT";
@@ -343,6 +481,17 @@ export interface PaperOrder {
   paperStatus: PaperOrderStatus;
   grossR: number | null;
   costR: number | null;
+  /**
+   * Which cost model produced `costR`. COHORT DISCRIMINATOR — absent/1 and 2 are NOT comparable
+   * and must never be pooled silently.
+   *   absent (v1) — flat PAPER_TAKER_COST_BPS (22) on every close regardless of fillMode or exit:
+   *                 maker lanes overcharged 3.67x, stop-outs undercharged, and 2-7bps of the
+   *                 execution-realism slippage double-counted (already inside grossR).
+   *   2           — exit-aware: roundTrip(costModel) + STOP_OUT_SLIPPAGE_BPS on stop-like exits,
+   *                 minus the slippage grossR already realized. See PAPER_COST_MODEL_VERSION.
+   * Stamped only by resolvePaperOrders. Report-only metadata: no gate reads it.
+   */
+  costModelVersion?: number;
   netR: number | null;
   netPnlAmount: number | null;
   closeReason: string | null;
@@ -1734,9 +1883,194 @@ function effectiveExitRuleForOrder(order: PaperOrder): VariantExitRule {
   return "tp1_full";
 }
 
+/** FLAT legacy cost (v1): taker round-trip only, no maker discount, no stop-out surcharge, no credit
+ *  for slippage the execution-realism model already charged inside grossR. This is what every stored
+ *  row before the v2 cutover was priced at, and what _computePaperExitCostR still returns while
+ *  PAPER_COST_MODEL_V2 is off. */
 function _computePaperCostR(plannedStopDistanceBps: number): number {
   if (!(plannedStopDistanceBps > 0)) return 0;
   return -(PAPER_TAKER_COST_BPS / plannedStopDistanceBps);
+}
+
+// ─── exit-aware paper cost model (v2, 2026-07-26) ────────────────────────────
+//
+// The flat model above was asymmetric in three ways at once, and every one of them biased the
+// paper book's netR:
+//
+//  1. MAKER OVERCHARGE. A maker_limit variant posts a resting limit and never crosses the spread,
+//     so the VM matrix's own resolver charges it MAKER_ROUNDTRIP_BPS (6). The paper book charged
+//     every order TAKER_ROUNDTRIP_BPS (22) regardless of fillMode — a 3.67x overcharge on the
+//     maker lanes (CG_MAKER_LIMIT_SIM / CG_MAKER_FAST_05).
+//  2. MISSING STOP-OUT SURCHARGE. A stop-market exit fills during a fast ADVERSE move and slips
+//     more than a resting TP. The VM matrix charges STOP_OUT_SLIPPAGE_BPS extra on stop-triggered
+//     exits (current-guard-variant-matrix.ts, resolveVariantMatrixObservations); the paper book
+//     charged losers exactly what it charged winners. That made low-win-rate lanes look as cheap
+//     as high-WR ones — the exact bias STOP_OUT_SLIPPAGE_BPS exists to remove.
+//  3. DOUBLE-COUNTED SLIPPAGE. PAPER_TAKER_COST_BPS (22) is REALISTIC_ROUND_TRIP_FEE_SLIP_BPS =
+//     (5 fee + 6 slippage) x 2 sides — i.e. 10bps of fee and 12bps of SLIPPAGE. Meanwhile
+//     PAPER_EXECUTION_MODEL_REALISTIC (the DEFAULT model — routes/shadow.ts only falls back to
+//     IDEAL when PAPER_EXECUTION_REALISM=0) already moves the fill prices by entry 2 / stop 5 / tp
+//     0 bps, so that slippage is ALREADY inside grossR. The old comment on PaperExecutionModel
+//     claiming "no double-count" was wrong: an inline SL exit paid 12bps of slippage in costR AND
+//     7bps more in grossR.
+//
+// v2 charges a single honest total per exit — roundTrip(costModel) + stopOutSurcharge(if stop-like)
+// — and books in costR only the portion the gross path did NOT already realize. The ROUND-TRIP
+// component then lines up with the VM matrix: taker TP 22, taker stop 34, maker TP 6, maker stop 18.
+// It is NOT full parity with the matrix: the matrix ALSO charges
+// fundingR = floor(durationMin / 480) × FUNDING_BPS_PER_8H / stopDistanceBps
+// (current-guard-variant-matrix.ts) and the paper book still charges 0 funding. On the 849
+// MAX_HOLD_MTM rows at PAPER_MAX_HOLD_MS = 72h that is 9 periods × 1.5bps = 13.5bps uncharged —
+// LARGER than the −7bps MTM correction v2 makes to those same rows, so long-hold lanes will still
+// show a residual against the matrix. Funding is a separate, still-open change.
+//
+// Fixing only (1) would have been a purely cost-REDUCING change (a fake positive); (2) lands on
+// ~1/3 of all closes and pushes the other way. They ship together deliberately.
+type PaperExitKind =
+  /** Resting limit / favorable exit — grossR used the model's tpSlippageBps. */
+  | "TP_LIKE"
+  /** Stop-market-like fill on an ADVERSE move (hard stop, trailing stop, trail-to-breakeven,
+   *  MFE-giveback retrace) — grossR used the model's stopSlippageBps and the exit pays the
+   *  stop-out surcharge on top. */
+  | "STOP_LIKE"
+  /** Horizon mark-to-market close at a candle close. grossR used stopSlippageBps (conservative),
+   *  but it is NOT a stop trigger, so it pays no stop-out surcharge. */
+  | "MARK_TO_MARKET";
+
+/**
+ * v2 CUTOVER SWITCH — DEFAULT OFF. `PAPER_COST_MODEL_V2=1` to enable.
+ *
+ * The v2 model is more correct, but turning it on is a STORE-COHORT DECISION, not just a code
+ * change, and it is gated because nothing in the repo discriminates cohorts yet.
+ * `costModelVersion` is stamped but has ZERO readers (grep-confirmed): every netR consumer —
+ * laneEconomics(), computeAutoQuarantinedVariantLanes(), per-symbol-lane-book-edge.ts,
+ * meta-label-gate, and cortex-refit-runner-bindings.ts:274, which feeds CORTEX outcome
+ * observations directly — pools v1 and v2 rows silently.
+ *
+ * Flipping it moves per-trade netR with NO underlying edge change: maker lanes by up to
+ * +16bps/stopBps (22 → 6) and taker stop-heavy lanes by −5bps/stopBps. A CORTEX refit whose
+ * rolling window straddles the flip reads that as an edge shift. On testnet
+ * CENTRAL_BRAIN_MODE=live means promotion is ENABLED, so allocation moves on a pure accounting
+ * artifact. Research (CENTRAL_BRAIN_MODE=shadow) has no promotion and is the safe place to flip
+ * first.
+ *
+ * While OFF, EVERYTHING is v1 — resolver and the three what-if counterfactuals alike — so the
+ * paper book is byte-identical to its pre-change behaviour and the counterfactual deltas stay
+ * internally consistent. There is no half-applied state.
+ *
+ * Flip only together with a cohort plan: age the v1 rows out of the refit window, reset the
+ * store, or make the consumers version-aware. And flip T1-a (the sentinel stop-floor fix) FIRST
+ * or at the same time — without it the artifact is concentrated on maker TPs on sentinel
+ * geometries where stopBps is small and the R impact is largest.
+ */
+export const PAPER_COST_MODEL_V2_ENABLED = process.env.PAPER_COST_MODEL_V2 === "1";
+
+/** Cost-model generation stamped on every order this resolver closes. Two generations are NOT
+ *  comparable and must never be pooled silently. New v1 rows are stamped explicitly as 1 (an
+ *  ABSENT field means a legacy row written before stamping existed — also v1, but unverified). */
+export const PAPER_COST_MODEL_VERSION = PAPER_COST_MODEL_V2_ENABLED ? 2 : 1;
+
+/**
+ * walkVariantPath resolutionSources that are RESTING-STOP fills on an ADVERSE move, and therefore
+ * slip like a stop even when they book a win. THE single source of that classification — the walk
+ * path and the inline path both resolve through it, so the two can never disagree.
+ *
+ * This set existing is the fix for a real asymmetry: the walk path used to test only
+ * `status === "CLOSED_LOSS" || resolutionSource === "MFE_GIVEBACK_EXIT"`, so a walk-resolved
+ * TRAIL_BREAKEVEN_EXIT / TRAIL_BREAKEVEN_SAME_CANDLE / ATR_TRAIL_STOP /
+ * LIVE_LONG_RUNNER_BREAKEVEN_AFTER_COST **win** was charged as TP_LIKE and skipped the
+ * STOP_OUT_SLIPPAGE_BPS surcharge — while the INLINE path charged the identical exit as STOP_LIKE.
+ * Which path an order takes is decided purely by exitRule (scaleout_tp1_trail | mfe_giveback |
+ * maker_limit → walk; trail_after_tp1 → inline), so two taker lanes got different costs for the
+ * same exit: reproduced at 22bps (walk) vs 27bps (inline) on identical SHORT geometry. That is a
+ * systematic 5bps/stopBps discount to the scaleout lanes over the trail lanes on 221 rows in the
+ * testnet store, and cortex-refit-runner-bindings.ts reads exactly this netR per lane.
+ *
+ * NOT included: TRAIL_PATH_END and MAX_HOLD_MTM are horizon mark-to-market closes at a candle
+ * close, not stop triggers — they stay TP_LIKE / MARK_TO_MARKET, matching the inline path.
+ */
+const WALK_STOP_LIKE_RESOLUTION_SOURCES: ReadonlySet<string> = new Set([
+  "MFE_GIVEBACK_EXIT", // retrace AGAINST the position: a sell-stop below / buy-stop above
+  "ATR_TRAIL_STOP", // trailing stop
+  "TRAIL_BREAKEVEN_EXIT", // resting stop pulled up to entry, fills on the adverse retrace
+  "TRAIL_BREAKEVEN_SAME_CANDLE",
+  "LIVE_LONG_RUNNER_BREAKEVEN_AFTER_COST",
+]);
+
+/** Exit kind for a walk-resolved close. CLOSED_LOSS is always a stop; a WIN is stop-like only if it
+ *  came from one of the resting-stop sources above. */
+function _walkExitKind(status: string, resolutionSource: string | null | undefined): PaperExitKind {
+  if (status === "CLOSED_LOSS") return "STOP_LIKE";
+  return resolutionSource != null && WALK_STOP_LIKE_RESOLUTION_SOURCES.has(resolutionSource)
+    ? "STOP_LIKE"
+    : "TP_LIKE";
+}
+
+/** Cost basis for an order. Mirrors variantRoundTripBps()'s `def.costModel` in the VM matrix (the
+ *  declared cost basis, which is what the matrix charges), falling back to the order's persisted
+ *  fillMode for non-variant lanes. Today every VariantMatrixVariantDefinition has
+ *  costModel === fillMode, so this is identical to reading fillMode. */
+function _paperCostModelForOrder(order: PaperOrder): VariantFillMode {
+  const def = variantDefinitionForOrder(order);
+  return def?.costModel ?? order.fillMode ?? "taker";
+}
+
+/** Slippage (bps) this exit path ALREADY realized inside grossR, and must therefore not be charged
+ *  again in costR. walkVariantPath is handed raw E/S/T, so a walk-resolved close has none. */
+function _slipAlreadyInGrossBps(
+  kind: PaperExitKind,
+  model: PaperExecutionModel,
+  viaWalk: boolean,
+): number {
+  if (viaWalk) return 0;
+  const entry = Math.max(0, model.entrySlippageBps);
+  const exit = kind === "TP_LIKE" ? Math.max(0, model.tpSlippageBps) : Math.max(0, model.stopSlippageBps);
+  return entry + exit;
+}
+
+/** Exit-aware paper cost, in R, SIGNED NEGATIVE (paper convention: netR = grossR + costR — note the
+ *  VM matrix uses the opposite sign, netR = grossR - costR). Never charges less than the pure
+ *  exchange fee: the floor makes an over-configured PAPER_*_SLIPPAGE_BPS unable to drive the modeled
+ *  cost to zero or negative.
+ *
+ *  THE SINGLE ENTRY POINT for every paper cost — resolver branches and the three what-if
+ *  counterfactuals alike. While PAPER_COST_MODEL_V2 is off it returns the flat v1 value, so the
+ *  whole book stays on one model and no delta can straddle the two. */
+function _computePaperExitCostR(
+  order: PaperOrder,
+  kind: PaperExitKind,
+  model: PaperExecutionModel,
+  viaWalk: boolean,
+): number {
+  const stopBps = order.plannedStopDistanceBps;
+  if (!(stopBps > 0)) return 0;
+  if (!PAPER_COST_MODEL_V2_ENABLED) return _computePaperCostR(stopBps);
+  const costModel = _paperCostModelForOrder(order);
+  const roundTripBps = costModel === "maker_limit" ? MAKER_ROUNDTRIP_BPS : TAKER_ROUNDTRIP_BPS;
+  const feeOnlyFloorBps =
+    costModel === "maker_limit" ? MAKER_ROUNDTRIP_BPS : REALISTIC_FEE_BPS_PER_SIDE * 2;
+  const stopOutExtraBps = kind === "STOP_LIKE" ? Math.max(0, STOP_OUT_SLIPPAGE_BPS) : 0;
+  const chargedBps = Math.max(
+    feeOnlyFloorBps,
+    roundTripBps + stopOutExtraBps - _slipAlreadyInGrossBps(kind, model, viaWalk),
+  );
+  return -(chargedBps / stopBps);
+}
+
+/**
+ * Cost for a MANUAL operator close at the current mark (POST /api/shadow/paper-controls/
+ * realize-open). Exported so that endpoint stops hardcoding its own flat `-(22 / stopBps)`: it
+ * writes grossR/costR/netR into the SAME store the resolver writes, so a hardcoded literal there
+ * would leave maker lanes overcharged 3.67x and produce untagged rows in a cohort the resolver is
+ * versioning — the opposite of what a cohort discriminator is for.
+ *
+ * MARK_TO_MARKET (an operator close at mark is not a stop trigger, so no stop-out surcharge), and
+ * `viaWalk = true` because that path computes grossR from the RAW mark with no execution model, so
+ * there is no already-realized slippage to net out. Routes through the same
+ * PAPER_COST_MODEL_V2_ENABLED gate as everything else — pair it with PAPER_COST_MODEL_VERSION.
+ */
+export function paperManualRealizeCostR(order: PaperOrder): number {
+  return _computePaperExitCostR(order, "MARK_TO_MARKET", PAPER_EXECUTION_MODEL_IDEAL, true);
 }
 
 // ─── SIMULATED R-path capture (2026-07-26, REPORT-ONLY) ─────────────────────
@@ -1809,9 +2143,16 @@ function _recordSimulatedPaperPath(
 //
 // This assumes the live exit design is RESTING exchange orders (SL/TP placed at
 // entry) — the only design that avoids poll-delayed late exits. If live instead
-// polled for exits, telat-jual would be far worse than this models. Exchange FEES
-// are modeled separately by _computePaperCostR (PAPER_TAKER_COST_BPS); slippage is
-// additive on top of fees (price impact ≠ commission), so there is no double-count.
+// polled for exits, telat-jual would be far worse than this models.
+//
+// CORRECTED 2026-07-26 — the previous note here claimed these bps were "additive on top of fees
+// (price impact ≠ commission), so there is no double-count". That was FALSE.
+// PAPER_TAKER_COST_BPS (22) = REALISTIC_ROUND_TRIP_FEE_SLIP_BPS = (5 fee + 6 SLIPPAGE) × 2 sides,
+// i.e. it is 10bps of fee and 12bps of slippage, not fees alone — so every bps configured here WAS
+// double-counted against it. _computePaperExitCostR now nets whatever this model already moved into
+// grossR back out of costR, per exit kind. Do NOT zero these values "because cost covers slippage":
+// they are what produces the R-multiple drift (loss worse than −1R, win below nominal) that the
+// realism model exists to show; the cost model only stops charging for it twice.
 export interface PaperExecutionModel {
   /** Adverse entry slippage, bps of price (LONG buys higher, SHORT sells lower). */
   entrySlippageBps: number;
@@ -2073,9 +2414,16 @@ async function resolvePaperOrdersInner(
       // research view. This prevents silent mis-resolution — scaleout must NOT collapse to
       // tp1_full, an mfe_giveback exit must run its peak-retrace logic (not a full TP/stop), and a
       // maker post-only entry must NOT collapse to a taker fill (no-fill risk is real). tp1_full
-      // and trail_after_tp1 keep their existing inline paths untouched. The walk uses ideal
-      // E/S/T (slippage 0 under PAPER_EXECUTION_MODEL_IDEAL, which is the only model in use);
-      // costR is applied on top exactly as the inline paths do. No fabricated profit.
+      // and trail_after_tp1 keep their existing inline paths untouched.
+      //
+      // The walk is handed RAW E/S/T. The old note here said that meant "slippage 0 under
+      // PAPER_EXECUTION_MODEL_IDEAL, which is the only model in use" — WRONG on the second half:
+      // routes/shadow.ts builds PAPER_EXECUTION_MODEL_REALISTIC by default and only falls back to
+      // IDEAL when PAPER_EXECUTION_REALISM=0 (unset on testnet and research). What is still true is
+      // that this walk ignores the model, so a walk-resolved grossR carries NO slippage — hence
+      // viaWalk=true below, which charges the full round-trip with nothing netted out. The inline
+      // paths further down DO price Ef/Sf/Tf through the model and pass viaWalk=false.
+      // No fabricated profit either way.
       if (exitRule === "scaleout_tp1_trail" || exitRule === "mfe_giveback" || fillMode === "maker_limit") {
         const walk = await walkVariantPath(
           {
@@ -2109,7 +2457,14 @@ async function resolvePaperOrdersInner(
         }
         if (walk.status === "CLOSED_WIN" || walk.status === "CLOSED_LOSS") {
           const grossR = walk.grossR ?? 0;
-          const costR = _computePaperCostR(order.plannedStopDistanceBps);
+          // Shared with the inline path via WALK_STOP_LIKE_RESOLUTION_SOURCES: every resting-stop
+          // exit is stop-like regardless of which resolver path booked it. Previously this tested
+          // only MFE_GIVEBACK_EXIT, so a walk-resolved trail-to-breakeven WIN escaped the stop-out
+          // surcharge that the identical inline exit paid — a path-dependent cost.
+          const walkExitKind: PaperExitKind = _walkExitKind(walk.status, walk.resolutionSource);
+          // viaWalk=true: walkVariantPath is handed the RAW E/S/T above, so grossR carries no
+          // execution-model slippage and nothing has to be netted out of the cost.
+          const costR = _computePaperExitCostR(order, walkExitKind, executionModel, true);
           const netR = grossR + costR;
           // REPORT-ONLY side-record of the SIMULATED R path (Exit Brain SIMULATED tier). Wrapped +
           // fail-open: it runs AFTER the outcome numbers above are computed and cannot influence any
@@ -2120,6 +2475,7 @@ async function resolvePaperOrdersInner(
             paperStatus: netR > 0 ? "PAPER_CLOSED_WIN" : "PAPER_CLOSED_LOSS",
             grossR,
             costR,
+            costModelVersion: PAPER_COST_MODEL_VERSION,
             netR,
             netPnlAmount: netR * order.plannedRiskAmount,
             closeReason: walk.resolutionSource ?? (exitRule === "scaleout_tp1_trail" ? "SCALEOUT_EXIT" : "MAKER_EXIT"),
@@ -2138,12 +2494,15 @@ async function resolvePaperOrdersInner(
           const lastClose = lastCandle ? Number(lastCandle[4]) : E;
           const exitFill = _exitFill(dir, Number.isFinite(lastClose) ? lastClose : E, executionModel.stopSlippageBps);
           const grossR = _rewardR(dir, Ef, exitFill, risk);
-          const costR = _computePaperCostR(order.plannedStopDistanceBps);
+          // viaWalk=false: this horizon close is priced by THIS function's own Ef/_exitFill, not by
+          // walkVariantPath, so the model's entry+stop slippage IS already inside grossR.
+          const costR = _computePaperExitCostR(order, "MARK_TO_MARKET", executionModel, false);
           const netR = grossR + costR;
           store.update(order.paperOrderId, {
             paperStatus: netR > 0 ? "PAPER_CLOSED_WIN" : "PAPER_CLOSED_LOSS",
             grossR,
             costR,
+            costModelVersion: PAPER_COST_MODEL_VERSION,
             netR,
             netPnlAmount: netR * order.plannedRiskAmount,
             closeReason: "MAX_HOLD_MTM",
@@ -2162,6 +2521,13 @@ async function resolvePaperOrdersInner(
       let found = false;
       let tp1Touched = false;
       let lastPathClose = E;
+      // Cost is EXIT-DEPENDENT, so it can no longer be computed once per candle before the branch
+      // is known (it used to be, which is exactly how the stop-out surcharge went missing). Both
+      // possible values are precomputed here — they depend only on the order + execution model —
+      // and each branch below picks the one matching the exit it actually books.
+      // viaWalk=false throughout: every inline branch prices its own fills via Ef/Sf/Tf/_exitFill.
+      const inlineStopLikeCostR = _computePaperExitCostR(order, "STOP_LIKE", executionModel, false);
+      const inlineTpLikeCostR = _computePaperExitCostR(order, "TP_LIKE", executionModel, false);
       for (const c of candles) {
         const openMs = c[0];
         if (openMs < openedAtMs - CANDLE_MS) continue;
@@ -2172,7 +2538,6 @@ async function resolvePaperOrdersInner(
         if (Number.isFinite(close)) lastPathClose = close;
         const slHit = dir === "LONG" ? low <= S : high >= S;
         const tpHit = T != null && (dir === "LONG" ? high >= T : low <= T);
-        const costR = _computePaperCostR(order.plannedStopDistanceBps);
 
         if (exitRule === "trail_after_tp1") {
           const backToEntry = dir === "LONG" ? low <= E : high >= E;
@@ -2181,11 +2546,13 @@ async function resolvePaperOrdersInner(
               const refined = await _resolve1mForPaper(binanceClient, order.symbol, openMs, dir, E, S, T);
               if (refined !== "TP") {
                 const grossR = _rewardR(dir, Ef, Sf, risk);
+                const costR = inlineStopLikeCostR;
                 const netR = grossR + costR;
                 store.update(order.paperOrderId, {
                   paperStatus: "PAPER_CLOSED_LOSS",
                   grossR,
                   costR,
+                  costModelVersion: PAPER_COST_MODEL_VERSION,
                   netR,
                   netPnlAmount: netR * order.plannedRiskAmount,
                   closeReason: "TRAIL_SL_HIT_AMBIGUOUS",
@@ -2201,11 +2568,15 @@ async function resolvePaperOrdersInner(
               if (backToEntry) {
                 const breakEvenFill = _exitFill(dir, E, executionModel.stopSlippageBps);
                 const grossR = _rewardR(dir, Ef, breakEvenFill, risk);
+                // Trail-to-breakeven is a resting STOP order pulled up to entry: it fills on the
+                // adverse retrace, so it is stop-like for cost purposes even when it books a win.
+                const costR = inlineStopLikeCostR;
                 const netR = grossR + costR;
                 store.update(order.paperOrderId, {
                   paperStatus: netR > 0 ? "PAPER_CLOSED_WIN" : "PAPER_CLOSED_LOSS",
                   grossR,
                   costR,
+                  costModelVersion: PAPER_COST_MODEL_VERSION,
                   netR,
                   netPnlAmount: netR * order.plannedRiskAmount,
                   closeReason: "TRAIL_BREAKEVEN_SAME_CANDLE",
@@ -2221,11 +2592,13 @@ async function resolvePaperOrdersInner(
             }
             if (slHit) {
               const grossR = _rewardR(dir, Ef, Sf, risk);
+              const costR = inlineStopLikeCostR;
               const netR = grossR + costR;
               store.update(order.paperOrderId, {
                 paperStatus: "PAPER_CLOSED_LOSS",
                 grossR,
                 costR,
+                costModelVersion: PAPER_COST_MODEL_VERSION,
                 netR,
                 netPnlAmount: netR * order.plannedRiskAmount,
                 closeReason: "TRAIL_SL_HIT",
@@ -2241,11 +2614,15 @@ async function resolvePaperOrdersInner(
               if (backToEntry) {
                 const breakEvenFill = _exitFill(dir, E, executionModel.stopSlippageBps);
                 const grossR = _rewardR(dir, Ef, breakEvenFill, risk);
+                // Trail-to-breakeven is a resting STOP order pulled up to entry: it fills on the
+                // adverse retrace, so it is stop-like for cost purposes even when it books a win.
+                const costR = inlineStopLikeCostR;
                 const netR = grossR + costR;
                 store.update(order.paperOrderId, {
                   paperStatus: netR > 0 ? "PAPER_CLOSED_WIN" : "PAPER_CLOSED_LOSS",
                   grossR,
                   costR,
+                  costModelVersion: PAPER_COST_MODEL_VERSION,
                   netR,
                   netPnlAmount: netR * order.plannedRiskAmount,
                   closeReason: "TRAIL_BREAKEVEN_SAME_CANDLE",
@@ -2264,11 +2641,13 @@ async function resolvePaperOrdersInner(
           if (backToEntry) {
             const breakEvenFill = _exitFill(dir, E, executionModel.stopSlippageBps);
             const grossR = _rewardR(dir, Ef, breakEvenFill, risk);
+            const costR = inlineStopLikeCostR;
             const netR = grossR + costR;
             store.update(order.paperOrderId, {
               paperStatus: netR > 0 ? "PAPER_CLOSED_WIN" : "PAPER_CLOSED_LOSS",
               grossR,
               costR,
+              costModelVersion: PAPER_COST_MODEL_VERSION,
               netR,
               netPnlAmount: netR * order.plannedRiskAmount,
               closeReason: "TRAIL_BREAKEVEN_EXIT",
@@ -2287,11 +2666,13 @@ async function resolvePaperOrdersInner(
           const refined = await _resolve1mForPaper(binanceClient, order.symbol, openMs, dir, E, S, T);
           if (refined === "TP") {
             const grossR = _rewardR(dir, Ef, Tf, risk);
+            const costR = inlineTpLikeCostR;
             const netR = grossR + costR;
             store.update(order.paperOrderId, {
               paperStatus: "PAPER_CLOSED_WIN",
               grossR,
               costR,
+              costModelVersion: PAPER_COST_MODEL_VERSION,
               netR,
               netPnlAmount: netR * order.plannedRiskAmount,
               closeReason: "TP1_HIT_REFINED_1M",
@@ -2300,11 +2681,13 @@ async function resolvePaperOrdersInner(
             });
           } else {
             const grossR = _rewardR(dir, Ef, Sf, risk);
+            const costR = inlineStopLikeCostR;
             const netR = grossR + costR;
             store.update(order.paperOrderId, {
               paperStatus: "PAPER_CLOSED_LOSS",
               grossR,
               costR,
+              costModelVersion: PAPER_COST_MODEL_VERSION,
               netR,
               netPnlAmount: netR * order.plannedRiskAmount,
               closeReason: "SL_HIT_AMBIGUOUS",
@@ -2320,11 +2703,13 @@ async function resolvePaperOrdersInner(
 
         if (slHit) {
           const grossR = _rewardR(dir, Ef, Sf, risk);
+          const costR = inlineStopLikeCostR;
           const netR = grossR + costR;
           store.update(order.paperOrderId, {
             paperStatus: "PAPER_CLOSED_LOSS",
             grossR,
             costR,
+            costModelVersion: PAPER_COST_MODEL_VERSION,
             netR,
             netPnlAmount: netR * order.plannedRiskAmount,
             closeReason: "SL_HIT",
@@ -2338,11 +2723,13 @@ async function resolvePaperOrdersInner(
 
         if (tpHit) {
           const grossR = _rewardR(dir, Ef, Tf, risk);
+          const costR = inlineTpLikeCostR;
           const netR = grossR + costR;
           store.update(order.paperOrderId, {
             paperStatus: "PAPER_CLOSED_WIN",
             grossR,
             costR,
+            costModelVersion: PAPER_COST_MODEL_VERSION,
             netR,
             netPnlAmount: netR * order.plannedRiskAmount,
             closeReason: "TP1_HIT",
@@ -2358,12 +2745,15 @@ async function resolvePaperOrdersInner(
       if (!found && exitRule === "trail_after_tp1" && tp1Touched) {
         const pathEndFill = _exitFill(dir, lastPathClose, executionModel.tpSlippageBps);
         const grossR = _rewardR(dir, Ef, pathEndFill, risk);
-        const costR = _computePaperCostR(order.plannedStopDistanceBps);
+        // Path-end MTM on a runner that already banked TP1. It exits at the last close via the
+        // model's TP slippage (a working limit, not a stop trigger) — TP_LIKE, no stop surcharge.
+        const costR = _computePaperExitCostR(order, "TP_LIKE", executionModel, false);
         const netR = grossR + costR;
         store.update(order.paperOrderId, {
           paperStatus: netR > 0 ? "PAPER_CLOSED_WIN" : "PAPER_CLOSED_LOSS",
           grossR,
           costR,
+          costModelVersion: PAPER_COST_MODEL_VERSION,
           netR,
           netPnlAmount: netR * order.plannedRiskAmount,
           closeReason: "TRAIL_PATH_END",
@@ -2384,12 +2774,15 @@ async function resolvePaperOrdersInner(
       if (!found && nowMs - openedAtMs >= maxHoldMsForOrder(order)) {
         const exitFill = _exitFill(dir, lastPathClose, executionModel.stopSlippageBps);
         const grossR = _rewardR(dir, Ef, exitFill, risk);
-        const costR = _computePaperCostR(order.plannedStopDistanceBps);
+        // Horizon force-close at the last observed close — a market exit, NOT a stop trigger, so no
+        // stop-out surcharge; grossR already carries the model's entry+stop slippage.
+        const costR = _computePaperExitCostR(order, "MARK_TO_MARKET", executionModel, false);
         const netR = grossR + costR;
         store.update(order.paperOrderId, {
           paperStatus: netR > 0 ? "PAPER_CLOSED_WIN" : "PAPER_CLOSED_LOSS",
           grossR,
           costR,
+          costModelVersion: PAPER_COST_MODEL_VERSION,
           netR,
           netPnlAmount: netR * order.plannedRiskAmount,
           closeReason: "MAX_HOLD_MTM",
@@ -2468,7 +2861,9 @@ export interface ActiveLanePaperMetrics {
  * This leaves headline PnL untouched while admission evaluates its own lane.
  */
 export function buildActiveLanePaperMetrics(
-  orders: PaperOrder[],
+  // `readonly` (widened 2026-07-26, T1-b) so report builders can pass an already-filtered view.
+  // Purely a type widening — the body never mutated the array.
+  orders: readonly PaperOrder[],
   activeLaneId: string | null,
 ): ActiveLanePaperMetrics {
   const closedStatuses: PaperOrderStatus[] = ["PAPER_CLOSED_WIN", "PAPER_CLOSED_LOSS"];
@@ -2735,6 +3130,24 @@ export interface PaperPerformanceReport {
   /** Execution-realism model used to resolve fills (slippage). Undefined ⇒ IDEAL. */
   executionModel?: PaperExecutionModel;
 
+  /**
+   * T1-b: closed rows removed from EVERY aggregate above because their admitted stop distance is
+   * below the admission floor `admissionStopFloorBpsForVariant` now returns for their own variant
+   * — i.e. rows that could not exist under the fixed gate. Surfaced, never silent: it is rendered
+   * unconditionally by buildPaperExecutionRouterBriefLines, and an operator reconstructs the
+   * pre-exclusion aggregates as
+   *   closed             = retainedClosedCount + excludedCount
+   *   headlineClosed     = retainedHeadlineClosedCount + excludedHeadlineCount
+   *   headlineNetAvgR    = (retainedHeadlineNetRSum + excludedHeadlineNetRSum) / headlineClosed
+   *   realizedPaperPnl   = retainedHeadlineNetPnlAmount + excludedHeadlineNetPnlAmount
+   * USE THE HEADLINE SUMS FOR THE HEADLINE METRICS. `headlineNetAvgR` / `headlinePF` / `headlineWR`
+   * / `realizedPaperPnl` are HEADLINE-scoped; the report exposes no all-closed mean at all, so the
+   * all-closed sums reconstruct nothing that is printed. On the measured store only ~4 of ~599
+   * excluded rows are HEADLINE, so mixing the two bases is off by orders of magnitude.
+   * Nothing is deleted from the store; this is a read-time filter only.
+   */
+  subFloorExclusion: SubFloorExclusionSummary;
+
   reportOnly: true;
   paperOnly: true;
 }
@@ -2788,9 +3201,37 @@ export function buildPaperPerformanceReport(
     operationalSafetyStatus?: OperationalSafetyStatus;
     noOrderReason?: string | null;
     executionModel?: PaperExecutionModel;
+    /**
+     * T1-b. Default TRUE (report semantics), so an ad-hoc/diagnostic caller gets the clean view.
+     * EVERY production call site passes `subFloorExclusionEnabledForDecisions()` instead — see the
+     * CLASSIFICATION CORRECTION below, and the [T1-b/9] wiring-contract test that enforces it for
+     * routes/shadow.ts.
+     */
+    applySubFloorExclusion?: boolean;
   } = {},
 ): PaperPerformanceReport {
-  const orders = store.all;
+  // T1-b — drop closed rows the current admission gate would have rejected, and SURFACE what left
+  // as `subFloorExclusion` so the pre-exclusion number stays reconstructible.
+  //
+  // CLASSIFICATION CORRECTION (code over brief; revised after review 2026-07-27): this builder is
+  // NOT purely report-only, and treating it as such produced FIVE cross-population defects.
+  //   - routes/shadow.ts (~:2767) builds a report solely to populate `AllocatorLaneState` —
+  //     activeLane* go straight into `decideLaneAdmission`, which halts admission on a degraded lane.
+  //   - the post-resolve reconciliation (~:3049) OVERWRITES those same four fields on the allocator
+  //     report and recomputes paperLaneConfidence, and becomes `paperReport` for the brief + Telegram.
+  //   - the neural map (~:1855) renders this report's global tiles directly ABOVE per-lane rows that
+  //     come from `laneEconomics` / `buildPerSymbolLaneBookEdge`, both of which are flag-gated.
+  // A report on a different population than the decisions it is used to explain cannot be
+  // reconciled, so EVERY production call site now passes
+  // `applySubFloorExclusion: subFloorExclusionEnabledForDecisions()` — ONE population, ONE lever.
+  // The parameter still DEFAULTS to `true` so an ad-hoc/diagnostic caller gets the clean view.
+  // The summary is computed either way, so an operator always sees what WOULD be removed even when
+  // nothing is — but must read `subFloorExclusion.applied` to know which basis the metrics are on.
+  // buildPaperExecutionRouterBriefLines prints both bases side by side for exactly that reason.
+  const { rows: orders, exclusion: subFloorExclusion } = excludeSubFloorRowsForReport(
+    store.all,
+    opts.applySubFloorExclusion ?? true,
+  );
   const state = store.getState();
 
   // All orders aggregates
@@ -2988,6 +3429,7 @@ export function buildPaperPerformanceReport(
     currentBatchOrderMode: null,
     currentBatchCreatedCount: 0,
     executionModel: opts.executionModel,
+    subFloorExclusion,
     reportOnly: true,
     paperOnly: true,
   };
@@ -3031,6 +3473,8 @@ export interface PaperPerformanceBreakdown {
   avgWinR: number | null;
   avgLossR: number | null;
   payoffRatio: number | null;
+  /** T1-b: closed rows removed from every row above. See PaperPerformanceReport.subFloorExclusion. */
+  subFloorExclusion: SubFloorExclusionSummary;
   reportOnly: true;
   paperOnly: true;
 }
@@ -3107,8 +3551,16 @@ function _rowsFromGroups(groups: Map<string, PaperOrder[]>): PaperBreakdownRow[]
  */
 export function buildPaperPerformanceBreakdown(
   store: PaperExecutionRouterStore,
+  // T1-b. Default TRUE (report semantics). Same CLASSIFICATION CORRECTION as
+  // buildPaperPerformanceReport: routes/shadow.ts (~:2772) derives `symbolsWithPositiveCohort`
+  // from `bySymbol` — which OVERRIDES the SYMBOL_NET_NEGATIVE candidate gate — plus `worstSymbols`
+  // and `topLossContributors` into AllocatorLaneState. That call site passes the decision gate.
+  opts: { applySubFloorExclusion?: boolean } = {},
 ): PaperPerformanceBreakdown {
-  const orders = store.all;
+  const { rows: orders, exclusion: subFloorExclusion } = excludeSubFloorRowsForReport(
+    store.all,
+    opts.applySubFloorExclusion ?? true,
+  );
   const closedStatuses: PaperOrderStatus[] = ["PAPER_CLOSED_WIN", "PAPER_CLOSED_LOSS"];
   const closed = orders.filter(
     (o) =>
@@ -3190,6 +3642,7 @@ export function buildPaperPerformanceBreakdown(
     avgWinR,
     avgLossR,
     payoffRatio,
+    subFloorExclusion,
     reportOnly: true,
     paperOnly: true,
   };
@@ -3760,6 +4213,38 @@ export function simulateLoserFingerprintGate(
 //  - unresolvedTooLongCount   open orders whose elapsed-since-admission exceeds the SLA
 //    → sampleSource=OPEN_ORDER_BACKLOG when openOrderCount>0, else NONE.
 //
+// BLOCK C — LABEL LEAK (createdAt vs openedAt; closed cohort, all cycles):
+//  openedAt is the OBSERVATION instant (entryPrice belongs to it); createdAt is the
+//  DECISION instant (regime/controllerMode/routerPermission/provenance belong to IT).
+//  openedAt PRECEDES createdAt — 29,968/29,968 testnet rows positive on 2026-07-26,
+//  closed-cohort p50 +213.9s / p90 +394.2s / max +586.6s. The resolver anchors its walk
+//  on openedAt (:startTime = openedAtMs − CANDLE_MS) and its loop admits the WHOLE 5m bar
+//  containing openedAtMs, so up to 300s + (createdAt − openedAt) of price action can
+//  decide an outcome before the label exists. Measured, not hypothetical: on 6,229 closed
+//  testnet rows carrying closedAtMs, 114 had closedAtMs < createdAt and a further 197 had an
+//  exit bar STRADDLING createdAt (opened before it, closed after) — 311 possibly-leaked, 5.0%,
+//  not the 1.8% the strict counter alone implies. The win skew holds in both buckets (86 of the
+//  114 TP1_HIT; 119/197 = 60% wins in the straddling bucket), i.e. fast-TP contamination.
+//  - labelLeakP50/P90/MaxSec         RAW SIGNED (createdAt − openedAt) over closed orders
+//  - resolvedBeforeDecisionCount     exit BAR closed before createdAt — STRICT LOWER BOUND
+//  - exitBarStraddlesDecisionCount   exit bar opened before / closed after createdAt (unknowable
+//                                    at 5m); possiblyLeaked = the two summed
+//  - preDecisionResolvableSecUpperBoundAtP50   labelLeakP50Sec + CANDLE_MS/1000. An UPPER bound
+//                                    at the p50 delay, NOT a percentile of exposure: the 300s
+//                                    term is one WHOLE candle (median reach is ~150s).
+//    → labelLeakSampleSource      provenance of the PERCENTILE sample
+//    → labelLeakExitTsSampleSource provenance of the two COUNTERS (different denominator: rows
+//      carrying closedAtMs). NONE means UNMEASURED, never "clean".
+//
+//  WHY THIS ONLY REPORTS. Re-anchoring the walk to createdAt without also re-deriving
+//  entryPrice at createdAt would simulate a fill that never existed (the price is the one
+//  observed at openedAt), i.e. it would make the number MORE wrong. A correct semantic fix
+//  needs 1m data this resolver does not fetch on that path, and would split the store into
+//  two incomparable cohorts that laneEconomics / variant quarantine / per-symbol-lane-book-
+//  edge / meta-label-gate / CORTEX all pool without a version discriminator — on testnet
+//  (CENTRAL_BRAIN_MODE=live) that arrives as an allocation shift indistinguishable from a
+//  genuine edge change. Both timestamps are already persisted, so measurement costs nothing.
+//
 // Candidate data age anchors on the candle OPEN time (always ≥ 0): the most
 // recent 5m candle is typically still forming, so its close lies in the future
 // — using the open is the honest "how old is the price-bearing candle" age.
@@ -3838,6 +4323,13 @@ export type PaperLatencySampleSource = "ORDER_AND_SCAN" | "ORDER_ONLY" | "NO_NEW
 /** Block B (open-order backlog) sample provenance. */
 export type PaperBacklogSampleSource = "OPEN_ORDER_BACKLOG" | "NONE";
 
+/**
+ * Block C (label-leak cohort) sample provenance. NONE means "no closed orders were
+ * supplied", which is NOT the same as "no leak" — without this the caller cannot tell
+ * a clean book from an unmeasured one.
+ */
+export type PaperLabelLeakSampleSource = "CLOSED_ORDER_COHORT" | "NONE";
+
 export interface PaperLatencyDiagnostics {
   reportOnly: true;
   /** false = corridor measurement-only (no skips). */
@@ -3886,6 +4378,65 @@ export interface PaperLatencyDiagnostics {
   };
   /** Open orders in a status the resolver never processes (PAPER_FILLED/PARTIAL) — latent stuck. */
   resolverUnprocessableOpenCount: number;
+  // ── BLOCK C — LABEL LEAK (createdAt vs openedAt) — REPORT-ONLY ──
+  /** Closed (WIN/LOSS) orders in the supplied cohort with parseable timestamps. */
+  labelLeakClosedSampleCount: number;
+  /** p50 of the RAW SIGNED (createdAt − openedAt) over the closed cohort, sec. null = no sample. */
+  labelLeakP50Sec: number | null;
+  /** p90 of the same signed quantity, sec. */
+  labelLeakP90Sec: number | null;
+  /** max of the same signed quantity, sec. */
+  labelLeakMaxSec: number | null;
+  /**
+   * THE LOAD-BEARING COUNTER, and a STRICT LOWER BOUND — never the full magnitude.
+   * Closed orders whose exit BAR closed strictly before their own createdAt, i.e. the outcome
+   * was decided by price action that had entirely finished when the label was written.
+   * Counted only over rows carrying closedAtMs (market ts, not process ts), so
+   * labelLeakClosedWithExitTsCount is its honest denominator.
+   *
+   * Why a LOWER bound: closedAtMs is the exit bar's CLOSE (openMs + CANDLE_MS). A bar that
+   * OPENED before createdAt and closed after it is NOT counted here even though the SL/TP touch
+   * inside it may well have occurred pre-decision — at 5m granularity that is unknowable. The
+   * median admission delay (~214s) is smaller than one candle (300s), so that straddling
+   * population is LARGE. See exitBarStraddlesDecisionCount for it; the possibly-leaked total is
+   * `resolvedBeforeDecisionCount + exitBarStraddlesDecisionCount`. Measured on the testnet store
+   * 2026-07-26 (6,229 closed rows with closedAtMs): 114 counted + 197 straddling = 311 (5.0%),
+   * vs 1.8% if only this counter is read — a 2.7x understatement. The win skew persists in the
+   * straddling bucket (119/197 = 60% wins, 109 TP1_HIT), so it is the same fast-TP
+   * contamination, not noise.
+   */
+  resolvedBeforeDecisionCount: number;
+  /**
+   * Closed orders whose exit bar STRADDLES createdAt: the bar opened strictly before the label
+   * existed but closed at/after it (`exitMs − CANDLE_MS < createdMs <= exitMs`). Possibly leaked,
+   * not provably leaked. Reported separately so the two are never conflated, and so a
+   * quarantine decision can choose its own bound instead of inheriting the optimistic one.
+   */
+  exitBarStraddlesDecisionCount: number;
+  /** Denominator for both counters above: closed rows that carry a finite closedAtMs. */
+  labelLeakClosedWithExitTsCount: number;
+  /**
+   * UPPER BOUND on the width of the window of price action resolvable before the decision
+   * exists, evaluated at the p50 admission delay: p50(createdAt − openedAt) + CANDLE_MS/1000.
+   *
+   * NOT a percentile of the exposure itself — deliberately named accordingly. The CANDLE_MS term
+   * is the MAXIMUM pre-openedAt reach of the first admissible bar, not its median: the walk
+   * condition (`openMs < openedAtMs − CANDLE_MS` → continue) admits exactly the one bar
+   * containing openedAtMs, whose open lies uniformly in (openedAtMs − 300, openedAtMs], so the
+   * MEDIAN contribution is ~150s. Reading this as a median overstates typical exposure by ~150s.
+   * null when there is no sample.
+   */
+  preDecisionResolvableSecUpperBoundAtP50: number | null;
+  /** Block C provenance for the PERCENTILE sample (labelLeak*Sec). NONE ⇒ unmeasured, NOT "clean". */
+  labelLeakSampleSource: PaperLabelLeakSampleSource;
+  /**
+   * Provenance for the two exit-bar COUNTERS specifically. Distinct from labelLeakSampleSource
+   * because they have a different denominator: a cohort of legacy rows that predate the Track-1a
+   * closedAtMs field (added 2026-07-13) yields a full percentile sample but a ZERO counter
+   * denominator, and would otherwise report "measured" for something unmeasurable. 139 of the
+   * 6,368 closed rows on testnet 2026-07-26 carry no closedAtMs.
+   */
+  labelLeakExitTsSampleSource: PaperLabelLeakSampleSource;
   // ── meta / advisory corridor ──
   /** Admissions skipped by latency rules. ALWAYS 0 while rulesEnabled=false / enforcement unwired. */
   staleSkipped: number;
@@ -3934,6 +4485,16 @@ export interface PaperLatencyInputs {
    * expectedHold p50/p90. Defaults to []. Lets the backlog labels reference "normal".
    */
   closedHoldSamplesSec?: number[];
+  /**
+   * CLOSED (WIN/LOSS) orders for the Block C label-leak cohort. The builder re-filters by
+   * status internally, so passing the whole store is safe. Defaults to [] — and an empty
+   * cohort reports labelLeakSampleSource=NONE rather than a fabricated "zero leak".
+   *
+   * Deliberately a SEPARATE input from openOrders: openOrders is documented as "all orders
+   * OR at least all open ones", so deriving the closed cohort from it would silently report
+   * NONE for any caller that pre-filtered.
+   */
+  closedOrders?: PaperOrder[];
   thresholds?: PaperLatencyThresholds;
   futureThresholds?: PaperLatencyThresholds;
   /** Defaults to PAPER_LATENCY_RULES_ENABLED (false). When false, latencyBlocker is ADVISORY-prefixed. */
@@ -3946,6 +4507,23 @@ function _latencySec(fromMs: number, toMs: number): number | null {
   // Clamp tiny negatives (clock skew) to 0; preserve large negatives as null (bad data).
   if (sec < -1) return null;
   return Math.round(Math.max(0, sec) * 10) / 10;
+}
+
+/**
+ * RAW SIGNED admission delay (createdAt − openedAt) in seconds, or null when either
+ * timestamp is unparseable. The SINGLE source of this quantity — _admissionDelayBucket
+ * and the label-leak cohort both read it, so the two can never drift apart.
+ *
+ * Deliberately NOT _latencySec: that helper nulls large negatives and clamps small ones
+ * to 0, which would erase exactly the sign this diagnostic exists to prove. A negative
+ * here is a real finding (it would mean the decision predates its own observation), so
+ * it is preserved verbatim.
+ */
+function _admissionDelaySec(order: PaperOrder): number | null {
+  const created = new Date(order.createdAt).getTime();
+  const opened = new Date(order.openedAt).getTime();
+  if (!Number.isFinite(created) || !Number.isFinite(opened)) return null;
+  return (created - opened) / 1000;
 }
 
 /** Nearest-rank percentile (p in [0,1]) of a numeric sample. null for an empty sample. */
@@ -4108,6 +4686,60 @@ export function buildPaperLatencyDiagnostics(inputs: PaperLatencyInputs): PaperL
   const expectedHoldP50Sec = _percentile(closedHolds, 0.5);
   const expectedHoldP90Sec = _percentile(closedHolds, 0.9);
 
+  // ══ BLOCK C — LABEL LEAK (createdAt vs openedAt) ══
+  // REPORT-ONLY. Measures, and does NOT repair, the gap between the instant the price was
+  // observed (openedAt, which entryPrice belongs to) and the instant the label was written
+  // (createdAt). The resolver anchors on openedAt, so bars that closed before createdAt can
+  // decide the outcome. Nothing here changes resolution, grossR/costR/netR, or admission.
+  const leakClosed = (inputs.closedOrders ?? []).filter(
+    (o) => o.paperStatus === "PAPER_CLOSED_WIN" || o.paperStatus === "PAPER_CLOSED_LOSS",
+  );
+  const leakDeltas: number[] = [];
+  let resolvedBeforeDecisionCount = 0;
+  let exitBarStraddlesDecisionCount = 0;
+  let labelLeakClosedWithExitTsCount = 0;
+  for (const o of leakClosed) {
+    const delta = _admissionDelaySec(o);
+    if (delta === null) continue;
+    leakDeltas.push(Math.round(delta * 10) / 10);
+    // closedAtMs is the MARKET close ts of the exit bar (never process time), which is
+    // exactly what makes this comparison meaningful against the decision timestamp.
+    const exitMs = o.closedAtMs;
+    if (typeof exitMs === "number" && Number.isFinite(exitMs)) {
+      labelLeakClosedWithExitTsCount += 1;
+      const createdMs = new Date(o.createdAt).getTime();
+      if (Number.isFinite(createdMs)) {
+        if (exitMs < createdMs) {
+          // Provably pre-decision: the whole exit bar had closed before the label was written.
+          resolvedBeforeDecisionCount += 1;
+        } else if (exitMs - CANDLE_MS < createdMs) {
+          // POSSIBLY pre-decision: the exit bar opened before createdAt and closed at/after it,
+          // so the SL/TP touch inside it may or may not predate the label. Unknowable at 5m.
+          // Counted separately so resolvedBeforeDecisionCount is never mistaken for the total.
+          exitBarStraddlesDecisionCount += 1;
+        }
+      }
+    }
+  }
+  const labelLeakClosedSampleCount = leakDeltas.length;
+  const labelLeakP50Sec = _percentile(leakDeltas, 0.5);
+  const labelLeakP90Sec = _percentile(leakDeltas, 0.9);
+  // Fold, not Math.max(...spread): the closed cohort is the whole book (6.4k rows today,
+  // unbounded) and a spread of that size risks a call-stack overflow.
+  let labelLeakMaxSec: number | null = null;
+  for (const d of leakDeltas) {
+    if (labelLeakMaxSec === null || d > labelLeakMaxSec) labelLeakMaxSec = d;
+  }
+  const preDecisionResolvableSecUpperBoundAtP50 =
+    labelLeakP50Sec === null ? null : Math.round((labelLeakP50Sec + CANDLE_MS / 1000) * 10) / 10;
+  const labelLeakSampleSource: PaperLabelLeakSampleSource =
+    labelLeakClosedSampleCount > 0 ? "CLOSED_ORDER_COHORT" : "NONE";
+  // Separate provenance: the counters' denominator is rows carrying closedAtMs, which a legacy
+  // cohort can leave at zero even when the percentile sample is full. Without this, a
+  // 0/0 counter would be reported alongside sampleSource=CLOSED_ORDER_COHORT, i.e. "measured".
+  const labelLeakExitTsSampleSource: PaperLabelLeakSampleSource =
+    labelLeakClosedWithExitTsCount > 0 ? "CLOSED_ORDER_COHORT" : "NONE";
+
   // ── advisory rules corridor (NOT enforced) ──
   const evalRule = (
     rule: PaperLatencyRule,
@@ -4164,6 +4796,17 @@ export function buildPaperLatencyDiagnostics(inputs: PaperLatencyInputs): PaperL
     expectedHoldP90Sec,
     openHoldBuckets,
     resolverUnprocessableOpenCount,
+    // ── BLOCK C — LABEL LEAK (report-only; changes nothing) ──
+    labelLeakClosedSampleCount,
+    labelLeakP50Sec,
+    labelLeakP90Sec,
+    labelLeakMaxSec,
+    resolvedBeforeDecisionCount,
+    exitBarStraddlesDecisionCount,
+    labelLeakClosedWithExitTsCount,
+    preDecisionResolvableSecUpperBoundAtP50,
+    labelLeakSampleSource,
+    labelLeakExitTsSampleSource,
     // ── meta / advisory corridor ──
     // Enforcement is intentionally unwired: no admission is ever skipped by latency here.
     staleSkipped: 0,
@@ -4235,6 +4878,56 @@ export function buildPaperExecutionRouterBriefLines(
     `   headlineClosed=${report.headlineClosed}  diagnosticOnly=${report.diagnosticOnlyTotal}` +
       ` (closed=${report.diagnosticOnlyClosed}, excluded from headline metrics)`,
   );
+  // T1-b — SUB-ADMISSION-FLOOR EXCLUSION, rendered UNCONDITIONALLY.
+  //
+  // Printing this only when non-zero would make its absence ambiguous, and printing nothing at all
+  // is exactly the "quietly drops 14.6% of the book and shows a better number" failure this fix
+  // exists to prevent. `reportsApplied` says which of the two bases the metrics ABOVE are on; both
+  // bases are then printed side by side, so the operator never has to know which way to reconstruct.
+  //
+  // KNOWN, DELIBERATE DISAGREEMENT: the PROVENANCE V1 block below is built by
+  // buildPaperProvenanceAudit, which reads the FULL unfiltered book on purpose (it audits data
+  // coverage, not economics). Its `closed=` counts exceed headlineClosed above by exactly
+  // subFloorExcluded whenever reportsApplied=YES. Named here so a diff never looks like a bug.
+  {
+    const x = report.subFloorExclusion;
+    const decisionsApplied = subFloorExclusionEnabledForDecisions();
+    L.push(
+      `   subFloorExcluded=${x.excludedCount} (headline=${x.excludedHeadlineCount}` +
+        ` diagnosticOnly=${x.excludedDiagnosticOnlyCount})` +
+        `  reportsApplied=${x.applied ? "YES" : "NO"}  decisionsApplied=${decisionsApplied ? "YES" : "NO"}` +
+        `  predicateV${x.predicateVersion}`,
+    );
+    if (x.excludedCount > 0) {
+      // HEADLINE basis on both sides — headlineNet/headlineWR/headlinePnl above are HEADLINE-scoped,
+      // and the all-closed sums would reconstruct a number the brief never prints.
+      const withClosed = x.retainedHeadlineClosedCount + x.excludedHeadlineCount;
+      const withNet =
+        withClosed > 0 ? (x.retainedHeadlineNetRSum + x.excludedHeadlineNetRSum) / withClosed : null;
+      const withPnl = x.retainedHeadlineNetPnlAmount + x.excludedHeadlineNetPnlAmount;
+      L.push(
+        `     headline WITH subFloor: closed=${withClosed} net=${_r4(withNet)} pnl=${_d2(withPnl)} NTD` +
+          `  |  WITHOUT: closed=${x.retainedHeadlineClosedCount} net=${_r4(x.retainedHeadlineNetAvgR)}` +
+          ` pnl=${_d2(x.retainedHeadlineNetPnlAmount)} NTD`,
+      );
+      L.push(
+        `     subFloorByLane: ${x.byLane
+          .slice(0, 4)
+          .map(
+            (l) =>
+              `${l.laneId}(floor=${l.admissionStopFloorBps ?? "n/a"}bps n=${l.excludedCount}` +
+              ` avgR=${_r4(l.excludedNetAvgR)} stop=${_d2(l.minStopDistanceBps)}..${_d2(l.maxStopDistanceBps)}bps)`,
+          )
+          .join(" | ")}`,
+      );
+      if (x.applied) {
+        L.push(
+          `     note: provenance/audit blocks below intentionally count the FULL book` +
+            ` (+${x.excludedCount} closed vs the metrics above)`,
+        );
+      }
+    }
+  }
   L.push(
     `   headlineNet=${_r4(report.headlineNetAvgR)}  headlinePF=${_d2(report.headlinePF)}  headlineWR=${_p1(report.headlineWR)}`,
   );
@@ -4323,6 +5016,25 @@ export function buildPaperLatencyBriefLines(latency: PaperLatencyDiagnostics): s
       ` staleWideHold=${hb.staleWideHold} reviewRequired=${hb.reviewRequired} expiredBySla=${hb.expiredBySla}`,
   );
   L.push(`      resolverUnprocessableOpenCount=${latency.resolverUnprocessableOpenCount}`);
+  // ── BLOCK C — LABEL LEAK (report-only; resolution semantics deliberately unchanged) ──
+  L.push("   C. LABEL LEAK (createdAt vs openedAt — REPORT-ONLY, resolver UNCHANGED)");
+  L.push(
+    `      labelLeakP50=${_secFmt(latency.labelLeakP50Sec)}  p90=${_secFmt(latency.labelLeakP90Sec)}` +
+      `  max=${_secFmt(latency.labelLeakMaxSec)}  n=${latency.labelLeakClosedSampleCount}` +
+      `  sampleSource=${latency.labelLeakSampleSource}`,
+  );
+  L.push(
+    `      resolvedBeforeDecision=${latency.resolvedBeforeDecisionCount}/${latency.labelLeakClosedWithExitTsCount}` +
+      ` (exit bar closed BEFORE createdAt — LOWER BOUND)` +
+      `  +straddling=${latency.exitBarStraddlesDecisionCount} (bar opened before, closed after)` +
+      `  exitTsSource=${latency.labelLeakExitTsSampleSource}`,
+  );
+  L.push(
+    `      possiblyLeaked=${latency.resolvedBeforeDecisionCount + latency.exitBarStraddlesDecisionCount}` +
+      `/${latency.labelLeakClosedWithExitTsCount}` +
+      `  preDecisionResolvableUpperBound@p50=${_secFmt(latency.preDecisionResolvableSecUpperBoundAtP50)}` +
+      ` (UPPER bound, not a median — the 300s term is one WHOLE candle)`,
+  );
   L.push(
     `   thresholds[${t.profile}]: scanMax=${_threshFmt(t.scanMaxAgeSec)} candidateMax=${_threshFmt(t.candidateMaxAgeSec)}` +
       ` priceMax=${_threshFmt(t.priceMaxAgeSec)} admissionMax=${_threshFmt(t.admissionMaxDelaySec)}`,
@@ -4604,12 +5316,19 @@ async function runPaperAdmissionAndResolutionInner(
     store.setActiveLane(primaryEligibleLane.laneId, rotationResult.currentLaneConfidence);
   }
 
+  // T1-b: this report becomes routes/shadow.ts `paperReport` (section 10 + the Telegram snapshot)
+  // and sits next to allocator/per-lane numbers that are gated by
+  // PAPER_EXCLUDE_SUBFLOOR_ROWS_DECISIONS. It follows the SAME flag so the operator surface can
+  // never be on a different population than the decisions it is used to explain. Flag OFF (default)
+  // ⇒ byte-identical to pre-T1-b; the exclusion is still SURFACED via `subFloorExclusion` and the
+  // brief renders both bases side by side.
   return buildPaperPerformanceReport(store, {
     activeLaneId: effectiveActiveLaneId,
     laneConfidence: rotationResult.currentLaneConfidence,
     rotationResult,
     noOrderReason,
     executionModel,
+    applySubFloorExclusion: subFloorExclusionEnabledForDecisions(),
   });
 }
 
@@ -4723,7 +5442,14 @@ async function _timeboxOutcomeForOrder(
   const Ef = _entryFill(dir, E, model.entrySlippageBps);
   const Sf = _exitFill(dir, S, model.stopSlippageBps);
   const Tf = _exitFill(dir, T, model.tpSlippageBps);
-  const cost = _computePaperCostR(order.plannedStopDistanceBps);
+  // v2 exit-aware cost, matching what resolvePaperOrders now stores. These counterfactuals are
+  // compared AGAINST the order's own stored netR (expectancyDeltaR = counterfactual − real), so a
+  // v1 flat cost here would make the delta measure "policy change PLUS cost-model change". On a
+  // maker-lane cohort that is a spurious −16bps/stopBps, several times the ±0.05R verdict
+  // threshold. viaWalk=false: every branch below prices its own fills through `model`.
+  const costTpLike = _computePaperExitCostR(order, "TP_LIKE", model, false);
+  const costStopLike = _computePaperExitCostR(order, "STOP_LIKE", model, false);
+  const costMtm = _computePaperExitCostR(order, "MARK_TO_MARKET", model, false);
 
   const startTime = openedAtMs - CANDLE_MS;
   const endTime = boxEnd;
@@ -4752,14 +5478,14 @@ async function _timeboxOutcomeForOrder(
       const g = refined === "TP" ? _rewardR(dir, Ef, Tf, risk) : _rewardR(dir, Ef, Sf, risk);
       return {
         reason: refined === "TP" ? "TP_WITHIN_BOX" : "SL_WITHIN_BOX",
-        netR: g + cost,
+        netR: g + (refined === "TP" ? costTpLike : costStopLike),
         boxHoldSec: holdSec,
       };
     }
     if (slHit)
-      return { reason: "SL_WITHIN_BOX", netR: _rewardR(dir, Ef, Sf, risk) + cost, boxHoldSec: holdSec };
+      return { reason: "SL_WITHIN_BOX", netR: _rewardR(dir, Ef, Sf, risk) + costStopLike, boxHoldSec: holdSec };
     if (tpHit)
-      return { reason: "TP_WITHIN_BOX", netR: _rewardR(dir, Ef, Tf, risk) + cost, boxHoldSec: holdSec };
+      return { reason: "TP_WITHIN_BOX", netR: _rewardR(dir, Ef, Tf, risk) + costTpLike, boxHoldSec: holdSec };
   }
 
   // Neither TP nor SL inside the box → mark to market at the cap (taker exit).
@@ -4767,7 +5493,7 @@ async function _timeboxOutcomeForOrder(
   const mtmFill = _exitFill(dir, lastClose, model.stopSlippageBps);
   return {
     reason: "TIMEBOX_MTM",
-    netR: _rewardR(dir, Ef, mtmFill, risk) + cost,
+    netR: _rewardR(dir, Ef, mtmFill, risk) + costMtm,
     boxHoldSec: boxMs / 1000,
   };
 }
@@ -5091,7 +5817,14 @@ async function _simulateFastTpForOrder(
   const risk = Math.abs(E - S);
   if (!(risk > 0)) return "DATA_FAILURE";
 
-  const cost = _computePaperCostR(order.plannedStopDistanceBps);
+  // v2 exit-aware cost, matching what resolvePaperOrders now stores. These counterfactuals are
+  // compared AGAINST the order's own stored netR (expectancyDeltaR = counterfactual − real), so a
+  // v1 flat cost here would make the delta measure "policy change PLUS cost-model change". On a
+  // maker-lane cohort that is a spurious −16bps/stopBps, several times the ±0.05R verdict
+  // threshold. viaWalk=false: every branch below prices its own fills through `model`.
+  const costTpLike = _computePaperExitCostR(order, "TP_LIKE", model, false);
+  const costStopLike = _computePaperExitCostR(order, "STOP_LIKE", model, false);
+  const costMtm = _computePaperExitCostR(order, "MARK_TO_MARKET", model, false);
   const sign = dir === "SHORT" ? -1 : 1; // favorable price direction
   const tightTP = E + sign * variant.triggerR * risk;
   const Ef = _entryFill(dir, E, model.entrySlippageBps);
@@ -5128,15 +5861,21 @@ async function _simulateFastTpForOrder(
 
       if (resolveSL) {
         const r = _rewardR(dir, Ef, _exitFill(dir, S, model.stopSlippageBps), risk);
-        return { netR: r + cost, holdSec, cfWin: r + cost > 0, sameCandleAmbiguity, exitKind: "SL_FIRST" };
+        return {
+          netR: r + costStopLike,
+          holdSec,
+          cfWin: r + costStopLike > 0,
+          sameCandleAmbiguity,
+          exitKind: "SL_FIRST",
+        };
       }
       if (resolveTight) {
         const tightLegR = _rewardR(dir, Ef, _exitFill(dir, tightTP, model.tpSlippageBps), risk);
         if (variant.partialFraction <= 0) {
           return {
-            netR: tightLegR + cost,
+            netR: tightLegR + costTpLike,
             holdSec,
-            cfWin: tightLegR + cost > 0,
+            cfWin: tightLegR + costTpLike > 0,
             sameCandleAmbiguity,
             exitKind: "TIGHT_TP_FULL",
           };
@@ -5189,7 +5928,16 @@ async function _simulateFastTpForOrder(
           : variant.runnerRule === "MOVE_STOP_TO_BE"
             ? "RUNNER_BE_STOP"
             : "RUNNER_ORIGINAL_STOP";
-      return { netR: blended + cost, holdSec, cfWin: blended + cost > 0, sameCandleAmbiguity, exitKind };
+      // The runner leg dominates the blended R; charge on how the RUNNER exited (wide TP vs a
+      // trail/BE/original stop), matching the resolver's TP_LIKE / STOP_LIKE split.
+      const runnerCost = runnerIsTp ? costTpLike : costStopLike;
+      return {
+        netR: blended + runnerCost,
+        holdSec,
+        cfWin: blended + runnerCost > 0,
+        sameCandleAmbiguity,
+        exitKind,
+      };
     }
   }
 
@@ -5197,9 +5945,22 @@ async function _simulateFastTpForOrder(
   if (lastClose == null) return "DATA_FAILURE";
   const mtmR = _rewardR(dir, Ef, _exitFill(dir, lastClose, model.stopSlippageBps), risk);
   const holdSec = (endTimeMs - openedAtMs) / 1000;
-  if (phase === 1) return { netR: mtmR + cost, holdSec, cfWin: mtmR + cost > 0, sameCandleAmbiguity, exitKind: "MTM_NO_TIGHT" };
+  if (phase === 1)
+    return {
+      netR: mtmR + costMtm,
+      holdSec,
+      cfWin: mtmR + costMtm > 0,
+      sameCandleAmbiguity,
+      exitKind: "MTM_NO_TIGHT",
+    };
   const blended = realizedR + frac * mtmR;
-  return { netR: blended + cost, holdSec, cfWin: blended + cost > 0, sameCandleAmbiguity, exitKind: "RUNNER_MTM" };
+  return {
+    netR: blended + costMtm,
+    holdSec,
+    cfWin: blended + costMtm > 0,
+    sameCandleAmbiguity,
+    exitKind: "RUNNER_MTM",
+  };
 }
 
 /**
@@ -5468,6 +6229,13 @@ export function buildFastTpRankingBriefLines(
 // dimension here is admissionDelaySec (createdAt − openedAt) — the one entry-latency
 // signal the order actually carries. (Wiring scan/candidate age onto the order at
 // admission time is a separate future change.)
+//
+// admissionDelayBucket is ALSO a label-leak axis, not just a latency one: openedAt is the
+// observation instant the resolver anchors its candle walk on, while createdAt is when the
+// label was written. A row in a high bucket had more price action resolvable before its own
+// label existed. The bucket boundaries are unchanged; see BLOCK C of the latency corridor
+// (resolvedBeforeDecisionCount) for the measured magnitude. The "skew(<0)" branch has never
+// fired on real data — 29,968/29,968 testnet rows were positive on 2026-07-26.
 
 /** Large-cap majors; everything else is treated as a high-beta alt. */
 const COHORT_LARGE_CAP_SYMBOLS: ReadonlySet<string> = new Set([
@@ -5487,10 +6255,9 @@ function _stopBucketFromBps(bps: number): string {
 }
 
 function _admissionDelayBucket(order: PaperOrder): string | null {
-  const created = new Date(order.createdAt).getTime();
-  const opened = new Date(order.openedAt).getTime();
-  if (!Number.isFinite(created) || !Number.isFinite(opened)) return null;
-  const sec = (created - opened) / 1000;
+  // Same raw signed quantity the label-leak cohort reports — one source, no drift.
+  const sec = _admissionDelaySec(order);
+  if (sec === null) return null;
   if (sec < 0) return "skew(<0)";
   if (sec <= 60) return "<=60s";
   if (sec <= 180) return "60-180s";
@@ -6138,7 +6905,14 @@ async function _simDecayOffset(
   const newStop = newEntry + (S - E); // preserve geometry (same price offsets)
   const newTP = newEntry + (T - E);
   const Ef = _entryFill(dir, newEntry, model.entrySlippageBps);
-  const cost = _computePaperCostR(order.plannedStopDistanceBps);
+  // v2 exit-aware cost, matching what resolvePaperOrders now stores. These counterfactuals are
+  // compared AGAINST the order's own stored netR (expectancyDeltaR = counterfactual − real), so a
+  // v1 flat cost here would make the delta measure "policy change PLUS cost-model change". On a
+  // maker-lane cohort that is a spurious −16bps/stopBps, several times the ±0.05R verdict
+  // threshold. viaWalk=false: every branch below prices its own fills through `model`.
+  const costTpLike = _computePaperExitCostR(order, "TP_LIKE", model, false);
+  const costStopLike = _computePaperExitCostR(order, "STOP_LIKE", model, false);
+  const costMtm = _computePaperExitCostR(order, "MARK_TO_MARKET", model, false);
   const driftBps = E !== 0 ? ((newEntry - E) / E) * 10_000 : 0;
   const endMs = Math.min(nowMs, entryTimeMs + horizonMs);
 
@@ -6170,12 +6944,17 @@ async function _simDecayOffset(
     }
     if (exitAt != null) {
       const fill = _exitFill(dir, exitAt, isTp ? model.tpSlippageBps : model.stopSlippageBps);
-      return { netR: _rewardR(dir, Ef, fill, risk) + cost, holdSec, driftBps, ambiguity: amb };
+      return {
+        netR: _rewardR(dir, Ef, fill, risk) + (isTp ? costTpLike : costStopLike),
+        holdSec,
+        driftBps,
+        ambiguity: amb,
+      };
     }
   }
   if (last == null) return null; // no candles in window → skip
   const mtm = _rewardR(dir, Ef, _exitFill(dir, last, model.stopSlippageBps), risk);
-  return { netR: mtm + cost, holdSec: (endMs - entryTimeMs) / 1000, driftBps, ambiguity: amb };
+  return { netR: mtm + costMtm, holdSec: (endMs - entryTimeMs) / 1000, driftBps, ambiguity: amb };
 }
 
 /**

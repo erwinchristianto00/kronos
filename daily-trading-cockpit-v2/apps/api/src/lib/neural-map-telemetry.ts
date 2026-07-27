@@ -12,6 +12,7 @@ import {
 import type { MixedBudgetForwardValidationReport, MixedRegimeReport, OpenOrderStaleAudit } from "./mixed-regime-router.js";
 import type { PaperOrder, PaperPerformanceReport } from "./paper-execution-router.js";
 import { buildPerSymbolLaneBookEdge } from "./per-symbol-lane-book-edge.js";
+import { applySubFloorExclusionForDecisions } from "./paper-subfloor-exclusion.js";
 import { assessPaperTp, cgWideTpPctFromOrder } from "./paper-trading-controls.js";
 import type { RegimeDirectionControllerReport } from "./regime-direction-controller.js";
 import {
@@ -762,7 +763,11 @@ function fmtNtd(value: number | null | undefined): string {
 }
 
 function laneEconomics(orders: PaperOrder[], laneId: string) {
-  const scoped = orders.filter((order) => order.selectedLaneId === laneId);
+  // T1-b DECISION PATH — gated, DEFAULT OFF. laneEconomics itself renders a panel, but its output
+  // flows into paperBookStatus/cohortFromPaperBook and the neural map's `usePaperEvidence` branch,
+  // which is what the operator promotes lanes on. Gated with the same single flag as the rest so
+  // the map and the allocator can never disagree about what the book says.
+  const scoped = applySubFloorExclusionForDecisions(orders).filter((order) => order.selectedLaneId === laneId);
   const closed = scoped.filter((order) => CLOSED.has(order.paperStatus));
   const headline = closed.filter(
     (order) => order.paperOrderMode !== "DIAGNOSTIC_ONLY" && order.diagnosticLabel !== "BACKFILL_DIAGNOSTIC",
@@ -1581,7 +1586,14 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
   const PAPER_STALL_OPEN = Number(process.env.PAPER_STALL_OPEN_BACKLOG) || 300;
   const PAPER_STALL_AGE_H = Number(process.env.PAPER_STALL_OLDEST_AGE_H) || 120;
   const openPaperOrders = input.orders.filter((o) => OPEN.has(o.paperStatus));
-  if (openPaperOrders.length >= PAPER_STALL_OPEN && input.paper.closed < openPaperOrders.length * 0.03) {
+  // T1-b (review fix 2026-07-27): the numerator MUST come from the same array as the denominator.
+  // It used to read `input.paper.closed`, which the caller may build with the sub-admission-floor
+  // exclusion applied while `input.orders` is unfiltered — removing closes but no opens biases this
+  // detector toward firing a false "resolver has stalled" WARNING. Both sides are now the raw book;
+  // resolver liveness is a plumbing question, not an economics one, so it must not move with the
+  // exclusion flag at all.
+  const closedPaperOrderCount = input.orders.filter((o) => CLOSED.has(o.paperStatus)).length;
+  if (openPaperOrders.length >= PAPER_STALL_OPEN && closedPaperOrderCount < openPaperOrders.length * 0.03) {
     const ages = openPaperOrders
       .map((o) => nowParsedMs - Date.parse(o.openedAt))
       .filter((n) => Number.isFinite(n) && n >= 0);
@@ -1590,7 +1602,7 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
       alerts.push({
         severity: "WARNING",
         source: "Paper Resolver Stalled",
-        message: `${openPaperOrders.length} open / only ${input.paper.closed} closed, oldest ${Math.round(oldestAgeH)}h (near 7d expiry) — paper resolution has stalled`,
+        message: `${openPaperOrders.length} open / only ${closedPaperOrderCount} closed, oldest ${Math.round(oldestAgeH)}h (near 7d expiry) — paper resolution has stalled`,
       });
     }
   }

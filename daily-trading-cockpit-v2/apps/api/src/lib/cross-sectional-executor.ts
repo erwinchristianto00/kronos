@@ -21,6 +21,7 @@ import { dirname, resolve } from "node:path";
 
 import { resolveConfirmedFillPrice, type BinanceFuturesPrivateClient, type FillPriceResolution } from "./binance-futures-private.js";
 import type { CortexRealAttributionStore } from "./cortex-real-attribution.js";
+import { fillFromUserTrade, type ExecutionFill, type ExecutionFillRecorder, type ExecutionFillRole } from "./execution-fill-recorder.js";
 import {
   CROSS_SECTIONAL_ROUNDTRIP_BPS,
   deriveAdaptiveSymbolFilters,
@@ -132,6 +133,11 @@ const MAX_OPEN_BASKETS = () =>
 const MAX_STORED_BASKETS = () =>
   Math.max(1, Math.floor(Number(process.env.CROSS_SECTIONAL_EXEC_MAX_STORED_BASKETS) || 2000));
 const TAKER_FEE_RATE = 0.0005; // 5 bps per side, conservative
+/** The `limit` closeBasket() asks /fapi/v1/userTrades for, and therefore the row count at which a
+ *  page is SATURATED (Binance returns at most `limit` rows forward from `startTime`). Named so the
+ *  request and the saturation test cannot drift apart — if they do, ExecutionFillRecord.fetchComplete
+ *  starts claiming a completeness it cannot know. Recording-only; the fee sum is unaffected. */
+const USER_TRADES_PAGE_LIMIT = 1000;
 /**
  * Profit-bank trigger, expressed as net (cost-adjusted) return on deployed capital — same unit as
  * cross-sectional-edge.ts's netReturn. Default 0.6% is sourced from measured reality, not a guess:
@@ -186,6 +192,24 @@ export interface ExecutorBasket {
   closeReason: string | null;
   grossPnlUsd: number | null;
   feeEstimateUsd: number | null;
+  /** PROVENANCE of feeEstimateUsd (2026-07-26, purely additive, report-only — nothing reads it to
+   *  make a decision). Same contract and same values as SingleSymbolPosition.feeSource in
+   *  single-symbol-lane-executor.ts; see that field's doc comment for the full rationale.
+   *
+   *    "EXCHANGE"            — summed from getUserTrades commission rows for this basket's own leg
+   *                            order ids.
+   *    "ESTIMATE_TAKER_FLAT" — the notionalTouched × TAKER_FEE_RATE fallback, taken whenever ANY
+   *                            per-symbol fetch threw or no leg order id matched a trade at all.
+   *    undefined             — basket persisted before this field existed, never closed, or closed
+   *                            via the RECONCILED_POSITION_ALREADY_FLAT abort path (which sets
+   *                            feeEstimateUsd itself to null). UNKNOWN — never assume exchange-true.
+   *
+   *  CAVEAT, same as the single-symbol field: "EXCHANGE" documents the METHOD, not completeness.
+   *  The sum is taken over one 1000-row getUserTrades page per unique symbol; a basket whose legs
+   *  were pushed off that page by unrelated activity still labels EXCHANGE while under-counting.
+   *  Only `sawAnyTrade` (all-or-nothing) is checked today, not per-leg coverage — recording a
+   *  matched-vs-expected leg count would make that detectable and is a worthwhile follow-up. */
+  feeSource?: "EXCHANGE" | "ESTIMATE_TAKER_FLAT";
   netPnlUsd: number | null;
   /** Stamped by every profit-target check (5-min tick): the basket's CURRENT net return vs the
    *  TP threshold, so the dashboard can show the live TP gap per basket — "tinggal berapa lagi,
@@ -404,6 +428,14 @@ export interface CrossSectionalExecutorOptions {
    *  simply never recorded), silently omitting this whole execution architecture. Optional: omit
    *  and nothing is recorded, same as before this fix (existing single-instance tests unaffected). */
   cortexRealAttribution?: CortexRealAttributionStore;
+  /** Per-fill execution recorder (2026-07-27, report-only — see execution-fill-recorder.ts).
+   *  closeBasket() already fetches one getUserTrades page per unique symbol to sum the REAL
+   *  commissions, then keeps `t.commission` and discards every other field of every matched row —
+   *  so a basket's actual per-leg exit prices, per-fill commissions and exchange fill times exist
+   *  in memory for one loop iteration and are then gone forever. This option persists those rows
+   *  verbatim. NO EXTRA EXCHANGE CALL: it reuses the exact same `trades` pages that loop already
+   *  fetched. Optional — omit and this executor is byte-for-byte unchanged. */
+  executionFillRecorder?: ExecutionFillRecorder;
 }
 
 export class CrossSectionalExecutor {
@@ -428,6 +460,7 @@ export class CrossSectionalExecutor {
   private readonly maxNotionalPerSymbolAcrossLanesFn: () => number;
   private readonly rawLaneWeightPctFn: (() => number) | null;
   private readonly cortexRealAttribution: CortexRealAttributionStore | null;
+  private readonly executionFillRecorder: ExecutionFillRecorder | null;
 
   constructor(opts: CrossSectionalExecutorOptions) {
     this.client = opts.client;
@@ -448,6 +481,7 @@ export class CrossSectionalExecutor {
     this.sharedGetPositions = opts.sharedGetPositions ?? (() => this.client.getPositions());
     this.rawLaneWeightPctFn = opts.rawLaneWeightPct ?? null;
     this.cortexRealAttribution = opts.cortexRealAttribution ?? null;
+    this.executionFillRecorder = opts.executionFillRecorder ?? null;
   }
 
   /** This instance's own open (status OPEN), un-exited (exitOrderId===null) basket legs — the
@@ -1004,19 +1038,45 @@ export class CrossSectionalExecutor {
     let realFees: number | null = 0;
     let sawAnyTrade = false;
     const orderIdsBySymbol = new Map<string, Set<string>>();
+    // 2026-07-27 (RECORDING-ONLY): role lookup for the per-fill recorder. Built from the SAME leg
+    // walk that builds orderIdsBySymbol, purely so a matched row can be labelled ENTRY vs EXIT.
+    // KEYED `symbol|orderId`, deliberately matching orderIdsBySymbol's own scoping rather than a
+    // flat account-wide map: the surrounding code has always assumed order ids are only unique
+    // WITHIN a symbol, and a flat map would let one leg's exitOrderId overwrite another leg's
+    // entryOrderId and mislabel both symbols' fills (2026-07-27 review finding). A row whose key is
+    // in neither (impossible while `ids.has` gated it) records as "UNKNOWN" rather than being
+    // silently mislabelled.
+    const roleBySymbolOrderId = new Map<string, ExecutionFillRole>();
+    const roleKey = (symbol: string, orderId: string): string => `${symbol}|${orderId}`;
     for (const leg of basket.legs) {
       const ids = orderIdsBySymbol.get(leg.symbol) ?? new Set<string>();
       ids.add(leg.entryOrderId);
-      if (leg.exitOrderId !== null && leg.exitOrderId !== "POSITION_ALREADY_FLAT") ids.add(leg.exitOrderId);
+      roleBySymbolOrderId.set(roleKey(leg.symbol, leg.entryOrderId), "ENTRY");
+      if (leg.exitOrderId !== null && leg.exitOrderId !== "POSITION_ALREADY_FLAT") {
+        ids.add(leg.exitOrderId);
+        roleBySymbolOrderId.set(roleKey(leg.symbol, leg.exitOrderId), "EXIT");
+      }
       orderIdsBySymbol.set(leg.symbol, ids);
     }
+    // Per-fill rows for the recorder, collected from the pages this loop ALREADY fetches — no extra
+    // exchange call, no extra latency, and the arithmetic below is untouched.
+    const matchedFills: ExecutionFill[] = [];
+    // RECORDING-ONLY. True as soon as ANY per-symbol page came back FULL, i.e. Binance may have cut
+    // rows off its edge. Never consulted by the fee arithmetic below — only by fetchComplete.
+    let anyPageSaturated = false;
     for (const [symbol, ids] of orderIdsBySymbol) {
       try {
-        const trades = await this.client.getUserTrades(symbol, { startTime: new Date(basket.openedAt).getTime(), limit: 1000 });
+        const trades = await this.client.getUserTrades(symbol, { startTime: new Date(basket.openedAt).getTime(), limit: USER_TRADES_PAGE_LIMIT });
+        if (Array.isArray(trades) && trades.length >= USER_TRADES_PAGE_LIMIT) anyPageSaturated = true;
         for (const t of trades) {
           if (ids.has(t.orderId)) {
             realFees = (realFees ?? 0) + t.commission;
             sawAnyTrade = true;
+            try {
+              matchedFills.push(fillFromUserTrade(t, roleBySymbolOrderId.get(roleKey(symbol, t.orderId)) ?? "UNKNOWN"));
+            } catch {
+              // recording must never disturb the fee sum this loop exists for
+            }
           }
         }
       } catch {
@@ -1024,12 +1084,20 @@ export class CrossSectionalExecutor {
         break;
       }
     }
-    const fees = realFees !== null && sawAnyTrade ? realFees : notionalTouched * TAKER_FEE_RATE;
+    const feeIsExchangeSourced = realFees !== null && sawAnyTrade;
+    // `feeIsExchangeSourced` already implies `realFees !== null`, but TS cannot narrow through it:
+    // `realFees` is a `let` reassigned inside the loop above, which defeats aliased-condition
+    // narrowing. The redundant check is for the type checker only and changes no behaviour.
+    const fees = feeIsExchangeSourced && realFees !== null ? realFees : notionalTouched * TAKER_FEE_RATE;
     basket.status = "CLOSED";
     basket.closedAt = this.nowIso();
     basket.closeReason = reason;
     basket.grossPnlUsd = gross;
     basket.feeEstimateUsd = fees;
+    // Provenance recorded alongside the number (see ExecutorBasket.feeSource): which arm of the
+    // ternary above produced `fees` was previously discarded, leaving a real exchange commission
+    // and a flat TAKER_FEE_RATE model indistinguishable in the same field.
+    basket.feeSource = feeIsExchangeSourced ? "EXCHANGE" : "ESTIMATE_TAKER_FLAT";
     basket.netPnlUsd = gross - fees;
     // 2026-07-11: lastNetReturn/lastNetAt were previously only ever stamped by the periodic
     // mark-price check in closeBasketsHittingProfitTarget() — for a HORIZON (or any other) close,
@@ -1056,6 +1124,39 @@ export class CrossSectionalExecutor {
     basket.lastNetAt = basket.closedAt;
     this.store.save();
     this.recordCortexRealAttribution(basket);
+    // Per-fill execution record (2026-07-27, report-only, fail-safe — see its doc comment). Rows
+    // come from the getUserTrades pages the fee sum above already fetched. `fetchComplete` requires
+    // BOTH that no per-symbol fetch threw (realFees !== null) AND that no page came back saturated:
+    // a full limit:1000 page may have cut this basket's own rows off its edge, and a short fill list
+    // that claims completeness is the same silent understatement this store exists to eliminate
+    // (2026-07-27 review finding — `realFees !== null` alone detects only a THROWN fetch). A basket
+    // whose fetch threw on its FIRST symbol records nothing at all (empty list ⇒ no-op), which is
+    // honest — no record beats a record that reads as "these were all the fills".
+    this.recordExecutionFills(basket, matchedFills, realFees !== null && !anyPageSaturated);
+  }
+
+  /** Per-fill execution record for one fully closed basket (2026-07-27, report-only). Wrapped so a
+   *  failure can NEVER affect settlement or trading. Recording an EMPTY fill list is deliberately a
+   *  no-op — see recordFills' own contract. */
+  private recordExecutionFills(basket: ExecutorBasket, fills: ExecutionFill[], fetchComplete: boolean): void {
+    try {
+      const recorder = this.executionFillRecorder;
+      if (!recorder || !Array.isArray(fills) || fills.length === 0) return;
+      const closedMs = Date.parse(basket.closedAt ?? this.nowIso());
+      recorder.recordFills({
+        recordId: `xsec:${this.laneId}:${basket.basketId}`, // same identity as CORTEX attribution
+        source: "xsec",
+        laneId: this.laneId,
+        // A basket spans many symbols; join them the same way recordCortexRealAttribution does so
+        // the two stores describe the same close identically. Each FILL carries its own symbol.
+        symbol: basket.legs.map((leg) => leg.symbol).join("+"),
+        closedAtMs: Number.isFinite(closedMs) ? closedMs : Date.now(),
+        fetchComplete,
+        fills,
+      });
+    } catch {
+      // report-only bookkeeping — a failure here must NEVER affect trading
+    }
   }
 
   private async maybeOpenBasket(): Promise<void> {

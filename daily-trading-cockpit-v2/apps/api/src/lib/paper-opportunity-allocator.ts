@@ -35,6 +35,7 @@ import {
   BULL_SCALEOUT_VARIANT_ID,
   BULL_TREND_VARIANT_ID,
   VARIANT_MATRIX_DEFINITIONS,
+  admissionStopFloorBpsForVariant,
   deriveVariantGeometry,
   stopDistanceBpsOf,
   WIDE_STOP_MIN_BPS,
@@ -50,6 +51,7 @@ import {
   LONG_WIDE_PAPER_LANE_ID,
   type AdaptiveLaneRouterReport,
 } from "./adaptive-lane-router.js";
+import { applySubFloorExclusionForDecisions } from "./paper-subfloor-exclusion.js";
 import {
   PAPER_ADMISSION_MAX_AGE_MS,
   allocatorDedupeKey,
@@ -565,9 +567,14 @@ const AUTO_QUARANTINE_MAX_NETAVGR = -0.03;
  * (neural map), so the two stay in sync.
  */
 export function computeAutoQuarantinedVariantLanes(orders: readonly PaperOrder[]): string[] {
+  // T1-b DECISION PATH — gated, DEFAULT OFF. Sub-admission-floor rows are the dominant negative
+  // evidence on the two sentinel lanes (measured 2026-07-26: CG_LONG_VARIANT_MATRIX:
+  // CG_BASELINE_FAST_05 at -1.1094 over 206 closes, of which 202 are sub-floor; excluding them
+  // gives +0.4428 over 4). With the flag off this is the caller's own array, unfiltered.
+  const scoped = applySubFloorExclusionForDecisions(orders);
   const variantSuffixes = new Set<string>(VARIANT_MATRIX_DIAGNOSTIC_IDS);
   const byLane = new Map<string, { closed: number; sumNetR: number }>();
-  for (const o of orders) {
+  for (const o of scoped) {
     const id = o.selectedLaneId;
     if (!id) continue;
     if (!(id.startsWith("CG_VARIANT_MATRIX:") || id.startsWith("CG_LONG_VARIANT_MATRIX:"))) continue;
@@ -1613,9 +1620,14 @@ export function buildPaperOpportunityAllocatorReport(
         recordReject(symbol, direction, def.id, "LANE_NOT_PAPER_MODELED", rowFresh, rowNet);
         continue;
       }
+      // 2026-07-26: was `def.stopFloorBps ?? WIDE_STOP_MIN_BPS`, which let the NON-BINDING
+      // sentinel `stopFloorBps: 1` on CG_BASELINE_FAST_05 / CG_MAKER_FAST_05 become the ADMISSION
+      // floor — so those two lanes admitted geometry their own parent lanes reject. Genuinely
+      // binding floors (175/200/250/300) pass through unchanged; see
+      // admissionStopFloorBpsForVariant.
       const stopFloorRejection = paperOpportunityStopFloorRejection(
         geo.stopDistanceBps,
-        def.stopFloorBps ?? WIDE_STOP_MIN_BPS,
+        admissionStopFloorBpsForVariant(def),
       );
       if (stopFloorRejection) {
         recordReject(symbol, direction, def.id, stopFloorRejection, rowFresh, rowNet);

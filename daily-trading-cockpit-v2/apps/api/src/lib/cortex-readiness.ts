@@ -128,6 +128,16 @@ export interface CortexReadinessRefitInput {
     decisionRowsExcluded: number;
     transitionalOutcomesExcluded: number;
   } | null;
+  /** A configured boundary that was REFUSED (future-dated or unparseable). Present so an operator
+   *  can tell "no epoch set" apart from "epoch set and rejected" — the two look identical in the
+   *  meter but mean opposite things. */
+  learningEpochRejection?: {
+    reason: "MALFORMED" | "IN_FUTURE";
+    raw: string;
+    startMs: number | null;
+    nowMs: number;
+    aheadMs: number | null;
+  } | null;
 }
 
 export interface CortexReadinessCollectionInput {
@@ -166,6 +176,9 @@ export interface CortexReadinessInputs {
   history: CortexReadinessSnapshot[];
   /** CORTEX_LANE_ROSTER.length at the call site (injected so this module stays dependency-light). */
   rosterSize: number;
+  /** How many roster lanes were excluded as retired. Rendered in the laneCoverage detail so the
+   *  denominator is never silently different from CORTEX_LANE_ROSTER.length. */
+  retiredLaneCount?: number;
   nowMs: number;
 }
 
@@ -189,6 +202,9 @@ export interface CortexReadinessReport {
   readinessPct: number;
   ready: boolean;
   learningEpoch: CortexReadinessRefitInput["learningEpoch"];
+  /** Set when a boundary was configured and REFUSED. Distinguishes "no epoch" (both null) from
+   *  "epoch rejected" (this non-null) — identical in the meter, opposite in meaning. */
+  learningEpochRejection: CortexReadinessRefitInput["learningEpochRejection"];
   components: CortexReadinessComponent[];
   beta: {
     evaluationBeta: number;
@@ -302,6 +318,7 @@ export function computeCortexReadiness(inputs: CortexReadinessInputs): CortexRea
   const FLOOR = CORTEX_READINESS_BLIND_CAPITAL_FLOOR_PCT;
   const nowMs = inputs.nowMs;
   const rosterSize = Math.max(1, Math.floor(finiteOr(inputs.rosterSize, 0)) || 1);
+  const retiredLaneCount = Math.max(0, Math.floor(finiteOr(inputs.retiredLaneCount ?? 0, 0)));
 
   const cumulativeResolved = Math.max(0, finiteOr(inputs.brain?.cumulativeResolved, 0));
   const ledger = inputs.brain?.ledgerResolvedAtMs ?? [];
@@ -344,7 +361,11 @@ export function computeCortexReadiness(inputs: CortexReadinessInputs): CortexRea
       key: "laneCoverage",
       pct: round2(laneCoveragePct),
       weight: W.laneCoverage,
-      detail: learningActiveLanes == null ? noRefitNote : `${learningActiveLanes}/${rosterSize} roster lanes LEARNING_ACTIVE`,
+      detail:
+        learningActiveLanes == null
+          ? noRefitNote
+          : `${learningActiveLanes}/${rosterSize} roster lanes LEARNING_ACTIVE`
+            + (retiredLaneCount > 0 ? ` (${retiredLaneCount} retired lane(s) excluded from the denominator)` : ""),
     },
     {
       key: "regimeCoverage",
@@ -519,6 +540,7 @@ export function computeCortexReadiness(inputs: CortexReadinessInputs): CortexRea
     readinessPct,
     ready,
     learningEpoch: inputs.refit?.learningEpoch ?? null,
+    learningEpochRejection: inputs.refit?.learningEpochRejection ?? null,
     components,
     beta: {
       evaluationBeta: round2(inputs.refit ? finiteOr(inputs.refit.evaluationBeta, cortexBeta(cumulativeResolved)) : cortexBeta(cumulativeResolved)),

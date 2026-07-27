@@ -162,9 +162,28 @@ describe("app.ts real call site actually wires journalContext (source-level guar
     const text = readFileSync(appTsPath, "utf-8");
     const callIdx = text.indexOf("runFourBrainShadowCycle({");
     expect(callIdx, "runFourBrainShadowCycle call site not found in app.ts").toBeGreaterThanOrEqual(0);
-    // The call is a single object literal — find its matching close paren by scanning a generous window
-    // (the object literal itself is short; 1500 chars comfortably covers it without matching unrelated code).
-    const windowText = text.slice(callIdx, callIdx + 1500);
+    // 2026-07-27: this scanned a fixed 1500-char window on the theory that "the object literal
+    // itself is short". It stopped being short — the order-flow sensor was added to the same
+    // literal and pushed `journalContext:` out to char 2644, so the guard went red while the
+    // wiring it guards was present and correct the whole time. A brittle guard that cries wolf is
+    // worse than no guard: it teaches people that red means "probably the test again".
+    //
+    // Bound the window to the literal's OWN extent by matching braces, so it stays exact no matter
+    // how many fields the call grows. String/comment contents are not stripped — a stray brace
+    // inside either would skew the match — but every field here is code, and the assertions below
+    // would fail loudly rather than silently pass if it ever did.
+    const openIdx = text.indexOf("{", callIdx);
+    let depth = 0;
+    let closeIdx = -1;
+    for (let i = openIdx; i < text.length; i += 1) {
+      if (text[i] === "{") depth += 1;
+      else if (text[i] === "}") {
+        depth -= 1;
+        if (depth === 0) { closeIdx = i; break; }
+      }
+    }
+    expect(closeIdx, "could not brace-match the runFourBrainShadowCycle({...}) literal").toBeGreaterThan(openIdx);
+    const windowText = text.slice(openIdx, closeIdx + 1);
     expect(windowText).toContain("journalContext:");
     expect(windowText).toContain("buildFourBrainJournalContext");
   });

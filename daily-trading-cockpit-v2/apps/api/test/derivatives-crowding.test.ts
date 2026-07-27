@@ -1,12 +1,21 @@
 import { describe, it, expect } from "vitest";
 import {
   classifyCrowding,
+  classifyCrowdingAtThresholds,
   classifyOiTrend,
   classifyCrowdingState,
   classifyCrowdingStateWithFlow,
   isCrowdedAgainstFreshEntry,
   summarizeCrowding,
   fetchCrowdingSnapshot,
+  resolveFixedCrowdingThresholds,
+  deriveCrowdingThresholds,
+  PerSymbolCrowdingCalibrator,
+  FIXED_CROWDING_THRESHOLDS,
+  CROWDING_ELEVATED_BPS,
+  CROWDING_EXTREME_BPS,
+  DEFAULT_CROWDING_ELEVATED_BPS,
+  DEFAULT_CROWDING_EXTREME_BPS,
   type CrowdingSnapshot,
   type CrowdingLevel,
   type OiTrend,
@@ -24,6 +33,8 @@ const snap = (over: Partial<CrowdingSnapshot>): CrowdingSnapshot => ({
   crowdingLevel: "NEUTRAL",
   crowdingState: "NEUTRAL",
   flowConfirmed: null,
+  crowdingLevelShadow: "NEUTRAL",
+  crowdingShadowThresholds: null,
   fetchedAt: "t",
   ...over,
 });
@@ -70,7 +81,15 @@ describe("derivatives-crowding", () => {
       snap({ crowdingState: "UNWINDING" }),
       snap({ crowdingState: "NEUTRAL" }),
     ]);
-    expect(s).toEqual({ building: 1, exhausting: 1, unwinding: 1, neutral: 1, extreme: 1 });
+    expect(s).toEqual({
+      building: 1,
+      exhausting: 1,
+      unwinding: 1,
+      neutral: 1,
+      extreme: 1,
+      extremeShadow: 0,
+      shadowCalibrated: 0,
+    });
   });
 
   // ---------------------------------------------------------------------------------------------
@@ -195,5 +214,220 @@ describe("derivatives-crowding", () => {
     const s = await fetchCrowdingSnapshot(client, "TESTUSDT", "2026-07-10T00:00:00.000Z");
     expect(s.crowdingState).toBe("BUILDING");
     expect(s.flowConfirmed).toBeNull();
+  });
+
+  // ---------------------------------------------------------------------------------------------
+  // Per-symbol shadow calibration (2026-07-26). The FIXED thresholds are what every real-order gate
+  // reads (short-fade-edge's EXHAUSTING admission gate, realtime-short-mirror's veto, both
+  // regime-composite lanes, noTradeGuard's FUNDING_RISK_ABNORMAL) — their defaults must not move.
+  // ---------------------------------------------------------------------------------------------
+
+  it("[CALIBRATION] shipped defaults are pinned at 2 / 7 and env overrides fall back (never clamp) on invalid input", () => {
+    // The deliberate v1 judgment call, unchanged.
+    expect(DEFAULT_CROWDING_ELEVATED_BPS).toBe(2);
+    expect(DEFAULT_CROWDING_EXTREME_BPS).toBe(7);
+    expect(resolveFixedCrowdingThresholds({})).toEqual({ elevatedBps: 2, extremeBps: 7 });
+
+    // Invalid ⇒ FALL BACK to the default. A clamping implementation would yield some other number.
+    expect(resolveFixedCrowdingThresholds({ CROWDING_EXTREME_BPS: "-1" })).toEqual({ elevatedBps: 2, extremeBps: 7 });
+    expect(resolveFixedCrowdingThresholds({ CROWDING_EXTREME_BPS: "0" })).toEqual({ elevatedBps: 2, extremeBps: 7 });
+    expect(resolveFixedCrowdingThresholds({ CROWDING_EXTREME_BPS: "abc" })).toEqual({ elevatedBps: 2, extremeBps: 7 });
+    expect(resolveFixedCrowdingThresholds({ CROWDING_ELEVATED_BPS: "-5" })).toEqual({ elevatedBps: 2, extremeBps: 7 });
+
+    // Valid overrides apply.
+    expect(resolveFixedCrowdingThresholds({ CROWDING_EXTREME_BPS: "3" })).toEqual({ elevatedBps: 2, extremeBps: 3 });
+    expect(resolveFixedCrowdingThresholds({ CROWDING_ELEVATED_BPS: "1", CROWDING_EXTREME_BPS: "2.4" }))
+      .toEqual({ elevatedBps: 1, extremeBps: 2.4 });
+
+    // An ordering violation reverts BOTH — a half-applied pair (elevated >= extreme) would make
+    // EXTREME unreachable by construction, which is the exact defect this item exists to expose.
+    expect(resolveFixedCrowdingThresholds({ CROWDING_ELEVATED_BPS: "9", CROWDING_EXTREME_BPS: "3" }))
+      .toEqual({ elevatedBps: 2, extremeBps: 7 });
+    expect(resolveFixedCrowdingThresholds({ CROWDING_ELEVATED_BPS: "7" }))
+      .toEqual({ elevatedBps: 2, extremeBps: 7 });
+  });
+
+  it("[CALIBRATION] the live EXTREME threshold is still unreachable at the observed max, while a per-symbol shadow reaches it", () => {
+    // 5.5577 bps = the largest |funding| over 23,122 real testnet snapshots (2026-06-24 → 07-06).
+    const observedMaxFunding = 0.00055577;
+    // Live path: unchanged. Still ELEVATED, never EXTREME — so no gate in the banner can fire.
+    expect(classifyCrowding(observedMaxFunding).crowdingLevel).toBe("ELEVATED");
+    expect(CROWDING_ELEVATED_BPS).toBe(DEFAULT_CROWDING_ELEVATED_BPS);
+    expect(CROWDING_EXTREME_BPS).toBe(DEFAULT_CROWDING_EXTREME_BPS);
+
+    // INJUSDT-shaped history (measured p95 3.832 / p99 4.894 / max 5.558): a separable tail.
+    const injLike = [
+      ...Array<number>(900).fill(0.45),
+      ...Array<number>(90).fill(2.4),
+      ...Array<number>(10).fill(4.9),
+    ];
+    const injThresholds = deriveCrowdingThresholds(injLike);
+    expect(injThresholds).toEqual({ elevatedBps: 0.45, extremeBps: 2.4 });
+    expect(classifyCrowdingAtThresholds(observedMaxFunding, injThresholds!).crowdingLevel).toBe("EXTREME");
+    expect(classifyCrowdingAtThresholds(observedMaxFunding, injThresholds!).crowdSide).toBe("LONG");
+  });
+
+  it("[CALIBRATION] a degenerate per-symbol history is reported as uncalibratable, not fitted to its own point mass", () => {
+    // BTCUSDT-shaped: p90 = p99 = max = 1.0000 bps (Binance's 0.01%/8h base rate). Fitting a
+    // threshold here would flip the symbol to EXTREME on ~half its samples.
+    const btcLike = [...Array<number>(500).fill(0.556), ...Array<number>(500).fill(1.0)];
+    expect(deriveCrowdingThresholds(btcLike)).toBeNull();
+    // Too few samples is likewise null, not a threshold fitted to noise.
+    expect(deriveCrowdingThresholds([0.5, 1.0, 4.0])).toBeNull();
+    // All-zero history has no positive elevated band ⇒ null.
+    expect(deriveCrowdingThresholds(Array<number>(1000).fill(0))).toBeNull();
+  });
+
+  it("[CALIBRATION] fetchCrowdingSnapshot carries a per-symbol shadow level end-to-end without moving the live level", async () => {
+    const calibrator = new PerSymbolCrowdingCalibrator(2000, 200);
+    // Warm the window with an INJ-shaped calm history: 300 samples at 0.45 bps, tail at 2.4/4.9.
+    for (let i = 0; i < 900; i++) calibrator.record("INJUSDT", 0.000045);
+    for (let i = 0; i < 90; i++) calibrator.record("INJUSDT", 0.00024);
+    for (let i = 0; i < 10; i++) calibrator.record("INJUSDT", 0.00049);
+
+    const client = {
+      getFuturesFlow: async () => ({
+        fundingRate: 0.00055577, // the observed population max: 5.5577 bps
+        openInterestChangePercent: 2,
+        takerBuySellRatio: 1.4,
+        longShortRatio: 1.2,
+      }),
+    };
+    const s = await fetchCrowdingSnapshot(client, "INJUSDT", "2026-07-26T00:00:00.000Z", calibrator);
+
+    // LIVE fields byte-identical to pre-change behaviour — nothing a gate reads has moved.
+    expect(s.crowdingLevel).toBe("ELEVATED");
+    expect(s.crowdingState).toBe("BUILDING"); // NOT "EXHAUSTING" ⇒ short-fade still rejects
+    // SHADOW says what a per-symbol calibration would have called it.
+    expect(s.crowdingShadowThresholds).toEqual({ elevatedBps: 0.45, extremeBps: 2.4 });
+    expect(s.crowdingLevelShadow).toBe("EXTREME");
+  });
+
+  // The window must keep ROLLING after it saturates. The cache was keyed on `arr.length`, which
+  // record()'s splice pins at windowSize forever, so `arr.length − cached.at` was permanently 0 and
+  // the first post-saturation derivation was returned for the life of the process — every shadow
+  // number an operator reads off the crowding endpoint frozen at hour one. Keyed on a monotonic
+  // record counter instead.
+  it("[CALIBRATION] thresholds RE-DERIVE after the bounded window has fully turned over", () => {
+    const calibrator = new PerSymbolCrowdingCalibrator(1000, 200);
+    // INJ-shaped calm history, saturating the 1000-sample window exactly.
+    for (let i = 0; i < 900; i++) calibrator.record("INJUSDT", 0.000045);
+    for (let i = 0; i < 90; i++) calibrator.record("INJUSDT", 0.00024);
+    for (let i = 0; i < 10; i++) calibrator.record("INJUSDT", 0.00049);
+    const warm = calibrator.calibrationFor("INJUSDT");
+    expect(warm?.thresholds).toEqual({ elevatedBps: 0.45, extremeBps: 2.4 });
+    expect(calibrator.recordsSeen("INJUSDT")).toBe(1000);
+
+    // COMPLETE window replacement: 1000 further samples at a ~65x higher, still-separable funding
+    // regime — every original sample evicted. Without the fix this still reports 0.45 / 2.4.
+    for (let i = 0; i < 900; i++) calibrator.record("INJUSDT", 0.003); // 30 bps
+    for (let i = 0; i < 90; i++) calibrator.record("INJUSDT", 0.01); // 100 bps
+    for (let i = 0; i < 10; i++) calibrator.record("INJUSDT", 0.02); // 200 bps
+    expect(calibrator.recordsSeen("INJUSDT")).toBe(2000);
+    const after = calibrator.calibrationFor("INJUSDT");
+    expect(after?.thresholds).toEqual({ elevatedBps: 30, extremeBps: 100 });
+    expect(after?.thresholds).not.toEqual(warm?.thresholds);
+    expect(after?.maxBps).toBe(200);
+  });
+
+  // Second manifestation of the same bug: a symbol branded uncalibratable stayed branded forever.
+  it("[CALIBRATION] a degenerate symbol becomes calibratable once its window turns over", () => {
+    const calibrator = new PerSymbolCrowdingCalibrator(1000, 200);
+    // BTCUSDT-shaped: the whole window sits on the 1.0000 bps point mass ⇒ p90 == p99 ⇒ null.
+    for (let i = 0; i < 1000; i++) calibrator.record("BTCUSDT", 0.0001);
+    expect(calibrator.calibrationFor("BTCUSDT")).toBeNull();
+
+    // Full replacement with a cleanly separable distribution.
+    for (let i = 0; i < 900; i++) calibrator.record("BTCUSDT", 0.00005);
+    for (let i = 0; i < 90; i++) calibrator.record("BTCUSDT", 0.0004);
+    for (let i = 0; i < 10; i++) calibrator.record("BTCUSDT", 0.0009);
+    const after = calibrator.calibrationFor("BTCUSDT");
+    expect(after).not.toBeNull(); // without the fix: still null, permanently
+    expect(after!.thresholds).toEqual({ elevatedBps: 0.5, extremeBps: 4 });
+  });
+
+  // FIXED_CROWDING_THRESHOLDS is dereferenced by classifyCrowding on every call, and EXTREME is a
+  // hard admission gate on five real-order paths. It must not be a mutable shared global.
+  it("[NO-EXEC-COUPLING] FIXED_CROWDING_THRESHOLDS is frozen — no importer can arm a gate by assignment", () => {
+    expect(Object.isFrozen(FIXED_CROWDING_THRESHOLDS)).toBe(true);
+    const before = classifyCrowding(0.00024).crowdingLevel; // 2.4 bps → ELEVATED at the fixed 2/7
+    try {
+      (FIXED_CROWDING_THRESHOLDS as { extremeBps: number }).extremeBps = 2.4;
+    } catch {
+      /* strict mode throws; sloppy mode silently no-ops. Both are acceptable — the point is that
+         the live classification below must not move. */
+    }
+    expect(FIXED_CROWDING_THRESHOLDS.extremeBps).toBe(DEFAULT_CROWDING_EXTREME_BPS);
+    expect(classifyCrowding(0.00024).crowdingLevel).toBe(before);
+    expect(classifyCrowding(0.00024).crowdingLevel).toBe("ELEVATED"); // NOT EXTREME
+  });
+
+  it("[CALIBRATION] an uncalibrated symbol's shadow falls back to the live level and reports thresholds null", async () => {
+    const calibrator = new PerSymbolCrowdingCalibrator(2000, 200);
+    const client = { getFuturesFlow: async () => ({ fundingRate: 0.0003, openInterestChangePercent: 2, takerBuySellRatio: 1.4, longShortRatio: 1.2 }) };
+    const s = await fetchCrowdingSnapshot(client, "COLDUSDT", "2026-07-26T00:00:00.000Z", calibrator);
+    expect(s.crowdingShadowThresholds).toBeNull();
+    expect(s.crowdingLevelShadow).toBe(s.crowdingLevel);
+    expect(s.crowdingLevelShadow).toBe("ELEVATED");
+  });
+
+  it("[CALIBRATION] the current sample is never included in the window it is classified against (no self-look-ahead)", () => {
+    const calibrator = new PerSymbolCrowdingCalibrator(2000, 200);
+    for (let i = 0; i < 200; i++) calibrator.record("AUSDT", 0.00005);
+    // Degenerate so far ⇒ no calibration.
+    expect(calibrator.calibrationFor("AUSDT")).toBeNull();
+    // A bounded window never grows past windowSize.
+    const small = new PerSymbolCrowdingCalibrator(10, 5);
+    for (let i = 0; i < 100; i++) small.record("BUSDT", 0.0001);
+    expect(small.calibrationFor("BUSDT")?.samples ?? 0).toBeLessThanOrEqual(10);
+    // Non-finite / null funding carries no information and is ignored, never throws.
+    expect(() => small.record("BUSDT", null)).not.toThrow();
+    expect(() => small.record("BUSDT", Number.NaN)).not.toThrow();
+    expect(() => small.record("BUSDT", Number.POSITIVE_INFINITY)).not.toThrow();
+  });
+
+  it("[NO-EXEC-COUPLING] the entry veto reads crowdingLevel only — a shadow EXTREME cannot trip it", () => {
+    // If anyone ever wires crowdingLevelShadow into a gate, this is the tripwire.
+    const shadowOnly = snap({
+      crowdSide: "LONG",
+      crowdingLevel: "ELEVATED",
+      crowdingLevelShadow: "EXTREME",
+      crowdingShadowThresholds: { elevatedBps: 0.45, extremeBps: 2.4 },
+    });
+    expect(isCrowdedAgainstFreshEntry(shadowOnly, "LONG")).toBe(false);
+    expect(isCrowdedAgainstFreshEntry(shadowOnly, "SHORT")).toBe(false);
+    // And the state machine is fed the LIVE level, so EXHAUSTING (the short-fade admission
+    // condition) stays unreachable for a shadow-only extreme.
+    expect(classifyCrowdingState(shadowOnly.crowdingLevel, "RISING")).toBe("BUILDING");
+  });
+
+  it("[NO-EXEC-COUPLING] summarizeCrowding reports shadow extremes separately from live extremes", () => {
+    const s = summarizeCrowding([
+      snap({ crowdingLevel: "ELEVATED", crowdingLevelShadow: "EXTREME", crowdingShadowThresholds: { elevatedBps: 1, extremeBps: 2.4 } }),
+      snap({ crowdingLevel: "NEUTRAL", crowdingLevelShadow: "NEUTRAL", crowdingShadowThresholds: { elevatedBps: 1, extremeBps: 2.4 } }),
+      snap({ crowdingLevel: "NEUTRAL", crowdingLevelShadow: "NEUTRAL" }),
+    ]);
+    expect(s.extreme).toBe(0); // live: nothing extreme — gates see exactly what they saw before
+    expect(s.extremeShadow).toBe(1); // shadow: one would have been
+    expect(s.shadowCalibrated).toBe(2);
+  });
+
+  // extremeShadow must count only snapshots that HAVE a per-symbol calibration. For an
+  // uncalibrated symbol crowdingLevelShadow is assigned crowdingLevel, so an unrestricted filter
+  // reports a fixed-threshold EXTREME as if a per-symbol measurement agreed with it — when none
+  // exists. Invisible today (fixed EXTREME never fires) and actively misleading the moment anyone
+  // lowers CROWDING_EXTREME_BPS, i.e. exactly when this number is being used to decide.
+  it("[NO-EXEC-COUPLING] extremeShadow excludes uncalibrated snapshots instead of echoing the live level", () => {
+    const s = summarizeCrowding([
+      // Uncalibrated AND live-EXTREME: shadow falls back to the live level by construction.
+      snap({ crowdingLevel: "EXTREME", crowdingLevelShadow: "EXTREME" }),
+      // Genuinely calibrated shadow extreme.
+      snap({ crowdingLevel: "ELEVATED", crowdingLevelShadow: "EXTREME", crowdingShadowThresholds: { elevatedBps: 1, extremeBps: 2.4 } }),
+    ]);
+    expect(s.extreme).toBe(1); // live count untouched: only the first row is live-EXTREME
+    expect(s.shadowCalibrated).toBe(1);
+    // Without the fix this is 2 — the uncalibrated row double-counted as a shadow verdict.
+    expect(s.extremeShadow).toBe(1);
+    expect(s.extremeShadow).toBeLessThanOrEqual(s.shadowCalibrated); // reconcilable, by construction
   });
 });

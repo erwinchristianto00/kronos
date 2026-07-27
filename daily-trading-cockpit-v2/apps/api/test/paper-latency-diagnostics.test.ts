@@ -18,8 +18,8 @@ const iso = (ms: number): string => new Date(ms).toISOString();
 
 /**
  * Minimal PaperOrder for the latency builder. The builder only reads
- * openedAt / createdAt / updatedAt / paperStatus; the rest is filler so the
- * object satisfies the PaperOrder type.
+ * openedAt / createdAt / updatedAt / paperStatus / closedAtMs; the rest is filler so
+ * the object satisfies the PaperOrder type.
  */
 function mkOrder(args: {
   openedAt: string;
@@ -27,8 +27,11 @@ function mkOrder(args: {
   updatedAt: string;
   paperStatus?: PaperOrderStatus;
   symbol?: string;
+  /** MARKET ts of the exit bar. Omitted ⇒ the row carries no exit timestamp. */
+  closedAtMs?: number | null;
 }): PaperOrder {
   return {
+    ...(args.closedAtMs === undefined ? {} : { closedAtMs: args.closedAtMs }),
     paperOrderId: "lat-test",
     sourceObservationId: "obs",
     sourceSignalId: null,
@@ -534,5 +537,231 @@ describe("paper latency diagnostics (E2E corridor — measurement-only)", () => 
     expect(candRule.wouldTrip).toBe(true);
     expect(lat.latencyBlocker).toBe("ADVISORY:CANDIDATE_TOO_OLD_SKIP");
     expect(lat.staleSkipped).toBe(0);
+  });
+});
+
+// ════ BLOCK C — LABEL LEAK (createdAt vs openedAt) ════
+//
+// openedAt is the OBSERVATION instant (entryPrice belongs to it); createdAt is the
+// DECISION instant (regime / controllerMode / routerPermission / provenance belong to
+// IT). openedAt PRECEDES createdAt — verified on the live testnet store 2026-07-26:
+// createdAt − openedAt positive on 29,968/29,968 rows, closed cohort p50 +213.9s /
+// p90 +394.2s / max +586.6s. The resolver anchors its candle walk on openedAt, so 106 of
+// 6,229 closed rows carrying closedAtMs had closedAtMs < createdAt (86 of them TP1_HIT
+// wins) — the outcome was decided by price action that predated the label.
+//
+// These fields REPORT that leak. They must never change resolution or netR.
+describe("paper latency diagnostics — Block C label leak (report-only)", () => {
+  const T = BASE_TIME;
+  /** Median admission delay measured on the real testnet closed cohort. */
+  const LEAK_SEC = 214;
+  const CANDLE_SEC = 300;
+
+  function mkClosed(args: { leakSec: number; closedAtMs?: number | null; status?: PaperOrderStatus }) {
+    return mkOrder({
+      openedAt: iso(T),
+      createdAt: iso(T + args.leakSec * 1000),
+      updatedAt: iso(T + 900_000),
+      paperStatus: args.status ?? "PAPER_CLOSED_WIN",
+      closedAtMs: args.closedAtMs,
+    });
+  }
+
+  /** Builder call with no Block A/B sample — isolates Block C. */
+  function build(closedOrders: PaperOrder[]) {
+    return buildPaperLatencyDiagnostics({
+      now: iso(T + 1_000_000),
+      scanFinishedAt: null,
+      freshestCandidatePriceObservationMs: null,
+      latestOrders: [],
+      createdThisCycle: 0,
+      closedOrders,
+    });
+  }
+
+  // [C1] the load-bearing case: an order whose exit BAR closed before its own createdAt
+  it("[LABEL-LEAK] counts closed orders resolved before their own label existed and reports the leak percentiles", () => {
+    const lat = build([
+      // A — exit bar closed at T+120s, i.e. BEFORE createdAt (T+214s): pre-decision resolution.
+      mkClosed({ leakSec: LEAK_SEC, closedAtMs: T + 120_000 }),
+      mkClosed({ leakSec: LEAK_SEC, closedAtMs: T + 600_000 }),
+      mkClosed({ leakSec: LEAK_SEC, closedAtMs: T + 900_000 }),
+    ]);
+    expect(lat.resolvedBeforeDecisionCount).toBe(1);
+    expect(lat.labelLeakClosedWithExitTsCount).toBe(3);
+    expect(lat.labelLeakP50Sec).toBe(LEAK_SEC);
+    expect(lat.labelLeakP90Sec).toBe(LEAK_SEC);
+    expect(lat.labelLeakMaxSec).toBe(LEAK_SEC);
+    expect(lat.labelLeakClosedSampleCount).toBe(3);
+    expect(lat.labelLeakSampleSource).toBe("CLOSED_ORDER_COHORT");
+    expect(lat.labelLeakExitTsSampleSource).toBe("CLOSED_ORDER_COHORT");
+    // The resolver admits the WHOLE 5m bar containing openedAt, so the resolvable pre-decision
+    // window is the admission delay PLUS one WHOLE candle. Named an UPPER BOUND, not a p50:
+    // the 300s term is the maximum pre-openedAt reach of that bar, whose median reach is ~150s.
+    expect(lat.preDecisionResolvableSecUpperBoundAtP50).toBe(LEAK_SEC + CANDLE_SEC);
+  });
+
+  // [C1b] THE UNDERSTATEMENT. resolvedBeforeDecisionCount is a STRICT LOWER BOUND: an exit bar
+  //       that OPENED before createdAt and closed after it is equally suspect (the SL/TP touch
+  //       inside it may predate the label — unknowable at 5m) but is not counted by it. Since the
+  //       median admission delay (214s) is under one candle (300s), that straddling population is
+  //       large: measured 114 strict vs 197 straddling on the testnet store, so reading the strict
+  //       counter alone understates the possibly-leaked cohort by 2.7x (1.8% vs 5.0%).
+  it("[LABEL-LEAK] an exit bar STRADDLING createdAt is counted separately, not silently dropped", () => {
+    const lat = build([
+      // strict: whole exit bar closed before the label existed.
+      mkClosed({ leakSec: LEAK_SEC, closedAtMs: T + 120_000 }),
+      // straddling: bar spans (T+0, T+300s], createdAt is T+214s — opened before, closed after.
+      mkClosed({ leakSec: LEAK_SEC, closedAtMs: T + 300_000 }),
+      // also straddling: bar spans (T+213s, T+513s], createdAt T+214s sits just inside it.
+      mkClosed({ leakSec: LEAK_SEC, closedAtMs: T + 513_000 }),
+      // clean: bar opened at T+300s, strictly AFTER createdAt (T+214s).
+      mkClosed({ leakSec: LEAK_SEC, closedAtMs: T + 600_000 }),
+    ]);
+    expect(lat.resolvedBeforeDecisionCount).toBe(1);
+    expect(lat.exitBarStraddlesDecisionCount).toBe(2);
+    expect(lat.labelLeakClosedWithExitTsCount).toBe(4);
+    // The number a quarantine decision must actually use.
+    expect(lat.resolvedBeforeDecisionCount + lat.exitBarStraddlesDecisionCount).toBe(3);
+  });
+
+  // [C1c] provenance for the COUNTERS has a different denominator than provenance for the
+  //       PERCENTILES. A cohort of legacy rows predating the Track-1a closedAtMs field yields a
+  //       full percentile sample and a ZERO counter denominator; reporting "measured" for a 0/0
+  //       counter is the exact failure mode [C2] exists to prevent, one level down.
+  it("[LABEL-LEAK] a cohort with no closedAtMs at all reports exitTs provenance NONE, not a clean 0/0", () => {
+    const lat = build([
+      mkClosed({ leakSec: LEAK_SEC, closedAtMs: null }),
+      mkClosed({ leakSec: LEAK_SEC }),
+    ]);
+    expect(lat.labelLeakClosedSampleCount).toBe(2);
+    expect(lat.labelLeakSampleSource).toBe("CLOSED_ORDER_COHORT"); // percentiles ARE measured
+    expect(lat.labelLeakClosedWithExitTsCount).toBe(0);
+    expect(lat.resolvedBeforeDecisionCount).toBe(0);
+    expect(lat.exitBarStraddlesDecisionCount).toBe(0);
+    expect(lat.labelLeakExitTsSampleSource).toBe("NONE"); // …but the counters are NOT
+  });
+
+  // [C2] "no sample" must be distinguishable from "no leak" — otherwise an unmeasured
+  //      book reads as a clean one.
+  it("[LABEL-LEAK] an absent cohort reports NONE, not a fabricated zero-leak", () => {
+    const none = build([]);
+    expect(none.labelLeakSampleSource).toBe("NONE");
+    expect(none.labelLeakClosedSampleCount).toBe(0);
+    expect(none.labelLeakP50Sec).toBeNull();
+    expect(none.labelLeakMaxSec).toBeNull();
+    expect(none.preDecisionResolvableSecUpperBoundAtP50).toBeNull();
+    expect(none.labelLeakExitTsSampleSource).toBe("NONE");
+    expect(none.resolvedBeforeDecisionCount).toBe(0);
+
+    // A real cohort with zero pre-decision resolutions looks DIFFERENT.
+    const clean = build([mkClosed({ leakSec: LEAK_SEC, closedAtMs: T + 900_000 })]);
+    expect(clean.labelLeakSampleSource).toBe("CLOSED_ORDER_COHORT");
+    expect(clean.resolvedBeforeDecisionCount).toBe(0);
+    expect(clean.labelLeakClosedWithExitTsCount).toBe(1);
+  });
+
+  // [C3] denominator honesty: legacy rows without closedAtMs still carry a leak delta but
+  //      cannot be judged for pre-decision resolution.
+  it("[LABEL-LEAK] rows without closedAtMs count toward the percentiles but not the leak denominator", () => {
+    const lat = build([
+      mkClosed({ leakSec: 100, closedAtMs: null }),
+      mkClosed({ leakSec: 200 }), // omitted entirely (legacy row)
+      mkClosed({ leakSec: 300, closedAtMs: T + 10_000 }), // exit bar precedes createdAt(T+300s)
+    ]);
+    expect(lat.labelLeakClosedSampleCount).toBe(3);
+    expect(lat.labelLeakClosedWithExitTsCount).toBe(1);
+    expect(lat.resolvedBeforeDecisionCount).toBe(1);
+    expect(lat.labelLeakMaxSec).toBe(300);
+  });
+
+  // [C4] the sign must survive. The original task statement claimed openedAt FOLLOWS
+  //      createdAt; the real store says the opposite on 100% of rows. A diagnostic that
+  //      clamped or nulled negatives could never have settled that, so the raw signed
+  //      value is preserved.
+  it("[LABEL-LEAK] a negative (skewed) delta is reported as negative, never clamped to 0 or nulled", () => {
+    const lat = build([mkClosed({ leakSec: -45, closedAtMs: T + 900_000 })]);
+    expect(lat.labelLeakP50Sec).toBe(-45);
+    expect(lat.labelLeakMaxSec).toBe(-45);
+    expect(lat.labelLeakSampleSource).toBe("CLOSED_ORDER_COHORT");
+  });
+
+  // [C5] cohort scope: only real WIN/LOSS closes are labels. Expiries / no-fills / still-open
+  //      rows never produced an outcome label and must not dilute the leak stats.
+  it("[LABEL-LEAK] non-outcome statuses are excluded from the cohort", () => {
+    const lat = build([
+      mkClosed({ leakSec: 100, closedAtMs: T + 10_000, status: "PAPER_EXPIRED" }),
+      mkClosed({ leakSec: 100, closedAtMs: T + 10_000, status: "PAPER_NO_FILL" }),
+      mkClosed({ leakSec: 100, closedAtMs: T + 10_000, status: "PAPER_SUBMITTED" }),
+      mkClosed({ leakSec: 500, closedAtMs: T + 900_000, status: "PAPER_CLOSED_LOSS" }),
+    ]);
+    expect(lat.labelLeakClosedSampleCount).toBe(1);
+    expect(lat.labelLeakP50Sec).toBe(500);
+    expect(lat.resolvedBeforeDecisionCount).toBe(0);
+  });
+
+  // [C6] REPORT-ONLY guard: Block C is purely additive. Supplying the cohort must not move
+  //      a single Block A / Block B / corridor value. If a future change ever wires the leak
+  //      into enforcement, this fails.
+  it("[LABEL-LEAK] Block C is additive — Block A/B and the rules corridor are byte-identical with and without the cohort", () => {
+    const inputs = {
+      now: iso(T + 1_000_000),
+      scanFinishedAt: iso(T + 970_000),
+      freshestCandidatePriceObservationMs: T + 955_000,
+      latestOrders: [mkClosed({ leakSec: LEAK_SEC, closedAtMs: T + 120_000 })],
+      openOrders: [
+        mkOrder({
+          openedAt: iso(T + 900_000),
+          createdAt: iso(T + 900_100),
+          updatedAt: iso(T + 900_100),
+          paperStatus: "PAPER_SUBMITTED",
+        }),
+      ],
+      createdThisCycle: 1,
+    };
+    const without = buildPaperLatencyDiagnostics(inputs);
+    const withCohort = buildPaperLatencyDiagnostics({
+      ...inputs,
+      closedOrders: [mkClosed({ leakSec: LEAK_SEC, closedAtMs: T + 120_000 })],
+    });
+
+    const stripBlockC = (d: typeof without) => {
+      const {
+        labelLeakClosedSampleCount: _a,
+        labelLeakP50Sec: _b,
+        labelLeakP90Sec: _c,
+        labelLeakMaxSec: _d,
+        resolvedBeforeDecisionCount: _e,
+        labelLeakClosedWithExitTsCount: _f,
+        preDecisionResolvableSecUpperBoundAtP50: _g,
+        labelLeakSampleSource: _h,
+        exitBarStraddlesDecisionCount: _i,
+        labelLeakExitTsSampleSource: _j,
+        ...rest
+      } = d;
+      return rest;
+    };
+    expect(stripBlockC(withCohort)).toEqual(stripBlockC(without));
+    // ...and the corridor is still measurement-only.
+    expect(withCohort.reportOnly).toBe(true);
+    expect(withCohort.staleSkipped).toBe(0);
+    expect(withCohort.resolvedBeforeDecisionCount).toBe(1);
+    expect(without.labelLeakSampleSource).toBe("NONE");
+  });
+
+  // [C7] the operator has to be able to SEE it, otherwise "expose" did nothing.
+  it("[LABEL-LEAK] the brief renders Block C with the leak counter", () => {
+    const lat = build([
+      mkClosed({ leakSec: LEAK_SEC, closedAtMs: T + 120_000 }),
+      mkClosed({ leakSec: LEAK_SEC, closedAtMs: T + 900_000 }),
+    ]);
+    const text = buildPaperLatencyBriefLines(lat).join("\n");
+    expect(text).toContain("C. LABEL LEAK (createdAt vs openedAt — REPORT-ONLY, resolver UNCHANGED)");
+    expect(text).toContain("labelLeakP50=214.0s");
+    expect(text).toContain("resolvedBeforeDecision=1/2");
+    expect(text).toContain("possiblyLeaked=1/2");
+    expect(text).toContain("preDecisionResolvableUpperBound@p50=514.0s");
+    expect(text).toContain("exitTsSource=CLOSED_ORDER_COHORT");
+    expect(text).toContain("sampleSource=CLOSED_ORDER_COHORT");
   });
 });

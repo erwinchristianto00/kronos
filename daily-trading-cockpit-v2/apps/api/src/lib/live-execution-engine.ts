@@ -35,6 +35,7 @@ import {
   type FuturesOrder,
   type FuturesPosition,
   type FuturesSymbolFilters,
+  type FuturesUserTrade,
   type LiveBinanceEnv,
 } from "./binance-futures-private.js";
 import {
@@ -55,6 +56,7 @@ import {
 import { fetchCrowdingSnapshot, type CrowdSide, type CrowdingState } from "./derivatives-crowding.js";
 import { clusterOf, isMajorSymbol } from "./correlation-clusters.js";
 import type { CortexRealAttributionStore } from "./cortex-real-attribution.js";
+import { fillFromUserTrade, type ExecutionFill, type ExecutionFillRecorder, type ExecutionFillRole } from "./execution-fill-recorder.js";
 import type { PositionPathRecorder } from "./position-path-recorder.js";
 import type { BinanceClient } from "./binance.js";
 import type { PaperOrder } from "./paper-execution-router.js";
@@ -545,6 +547,21 @@ export type LiveIntentState =
   | "ERROR"
   | "KILLED";
 
+/**
+ * What realizedFromTrades() actually established, including the PROVENANCE of `feesUsd`.
+ *
+ * `feesUsd: 0` is ambiguous on its own — it is what you get from a genuinely fee-free settlement,
+ * from the `ids.size === 0` short-circuit (no order ids, exchange never queried), and from a query
+ * that returned rows but matched none of ours. `feeSource` disambiguates:
+ *   "EXCHANGE" — at least one real /userTrades commission row of ours was summed into feesUsd.
+ *   null       — no commission row was ever seen. feesUsd is a structural zero, not a measurement.
+ */
+interface SettledFromTrades {
+  netUsd: number;
+  feesUsd: number;
+  feeSource: "EXCHANGE" | null;
+}
+
 export interface LiveIntent {
   paperOrderId: string;
   symbol: string;
@@ -564,6 +581,29 @@ export interface LiveIntent {
   beStopOrderId: string | null;
   realizedPnlUsd: number | null;
   feesUsd: number | null;
+  /** PROVENANCE of feesUsd (2026-07-26, purely additive, report-only — nothing reads it to make a
+   *  decision). The single-symbol and cross-sectional executors already carry this field
+   *  (SingleSymbolPosition.feeSource / ExecutorBasket.feeSource); this engine — the path behind 182
+   *  closed intents — had NO way at all to tell a measured commission from an absent one, because
+   *  every settle path collapses to `intent.feesUsd = settled?.feesUsd ?? null` and a settlement
+   *  that queried the exchange and matched nothing returns feesUsd: 0, identical to a real $0.
+   *
+   *    "EXCHANGE"             — summed from at least one real /userTrades commission row for this
+   *                             intent's own order ids (see SettledFromTrades.feeSource).
+   *    "EXCHANGE_APPORTIONED" — the rescue-FLIP path only. ONE real exchange fee total, split
+   *                             across the N opposing intents that flip closed, pro-rata by qty.
+   *                             The total is measured; THIS ROW'S SLICE IS MODELLED. Deliberately
+   *                             not labelled "EXCHANGE" — a cost study that treats an apportioned
+   *                             slice as an observation of this intent is wrong in exactly the way
+   *                             this whole field exists to prevent.
+   *    undefined              — UNKNOWN. Intent closed before this field existed, never closed, the
+   *                             settlement fetch failed (feesUsd null), or the settlement matched
+   *                             no trade rows at all. NEVER assume exchange-true.
+   *
+   *  CAVEAT (same as the executors'): "EXCHANGE" documents the METHOD, not completeness. The sum is
+   *  taken over one 1000-row getUserTrades page; an intent whose rows were pushed off that page by
+   *  unrelated activity still labels EXCHANGE while under-counting. */
+  feeSource?: "EXCHANGE" | "EXCHANGE_APPORTIONED";
   exitRule?: VariantExitRule;
   maxFavorableR?: number | null;
   /** MAE persistence (Tier 2 audit, purely additive): running MOST NEGATIVE (worst) favorableR the
@@ -1095,6 +1135,15 @@ export interface LiveExecutionEngineOptions {
    *  per tick and a per-tick sweep marks terminal intents' paths closed — every call is wrapped so
    *  a failure can NEVER affect trading. */
   positionPathRecorder?: PositionPathRecorder;
+  /** Per-fill execution recorder (2026-07-27, report-only — see execution-fill-recorder.ts).
+   *  realizedFromTrades() already fetches the exchange's own per-fill rows on every settlement and
+   *  keeps exactly two summed scalars (`realizedPnl - commission`, `commission`), discarding EVERY
+   *  price: across the 182 closed intents in the live store there is not one exit fill price
+   *  anywhere. When present, the rows that settlement already matched are persisted verbatim.
+   *  NO EXTRA EXCHANGE CALL and no new round-trip — it is the same `matchedTrades` array. Same
+   *  optional-dep posture as the two recorders above: omit and the engine is byte-for-byte
+   *  unchanged; every use is wrapped so a failure can NEVER affect trading. */
+  executionFillRecorder?: ExecutionFillRecorder;
 }
 
 const ERROR_STREAK_DISARM = 3;
@@ -1130,6 +1179,12 @@ const LIVE_BREAKEVEN_EXIT_LANE_IDS = new Set([
   "CG_WIDE_LONG_RUNNER",
   "CG_VARIANT_MATRIX:CG_WIDE_LONG_RUNNER",
 ]);
+/** The `limit` realizedFromTrades asks /fapi/v1/userTrades for, and therefore the row count at which
+ *  the page is SATURATED — Binance returns at most `limit` rows forward from `startTime`, so a full
+ *  page means there may be rows we never saw. Named so the request and the saturation test cannot
+ *  drift apart; if they do, ExecutionFillRecord.fetchComplete starts claiming a completeness it
+ *  cannot know. RECORDING-ONLY: no settlement or gate decision reads the saturation flag. */
+const USER_TRADES_PAGE_LIMIT = 1000;
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
 const WEEK_MS = 7 * DAY_MS;
@@ -1669,6 +1724,7 @@ export class LiveExecutionEngine {
   private readonly laneDirectionForId: (laneId: string) => "LONG" | "SHORT" | "NEUTRAL" | null;
   private readonly cortexRealAttribution: CortexRealAttributionStore | null;
   private readonly positionPathRecorder: PositionPathRecorder | null;
+  private readonly executionFillRecorder: ExecutionFillRecorder | null;
 
   /** In-memory ONLY — restart always boots disarmed. */
   private armed = false;
@@ -1731,6 +1787,7 @@ export class LiveExecutionEngine {
     this.laneDirectionForId = options.laneDirectionForId ?? (() => null);
     this.cortexRealAttribution = options.cortexRealAttribution ?? null;
     this.positionPathRecorder = options.positionPathRecorder ?? null;
+    this.executionFillRecorder = options.executionFillRecorder ?? null;
     // Auto-arm must NOT punch through a latched kill: a restart preserves the kill until an
     // explicit resetKill(). (arm() already enforces this; the constructor path bypassed it.)
     if (this.config.autoArm && this.config.configErrors.length === 0 && !this.store.getState().killedAt) {
@@ -1896,6 +1953,7 @@ export class LiveExecutionEngine {
         const net = settled?.netUsd ?? null;
         intent.realizedPnlUsd = net;
         intent.feesUsd = settled?.feesUsd ?? null;
+        intent.feeSource = settled?.feeSource ?? undefined;
         this.applyRealizedToLedger(net, "adverse");
         intent.state = "KILLED";
         intent.closeReason = `EXCHANGE_FLATTEN: ${reason}`;
@@ -2717,6 +2775,13 @@ export class LiveExecutionEngine {
       // reader on the same tick it settles.
       this.sweepPositionPathRecorder();
 
+      // 3.7. Per-fill store retention (report-only, fail-safe). Deliberately NOT its own timer —
+      // the 234 MB unrotated-journal incident was caused by a file re-read on a poll, and adding a
+      // second independent schedule is how that class of bug gets re-introduced. This piggybacks on
+      // the tick that already runs, does no I/O unless something actually expired, and never reads
+      // the file (the store is read exactly once, in its constructor).
+      this.sweepExecutionFillRecorder();
+
       // 4. Testnet safety harvest: on every fresh regime/mode change, flatten any exposure
       // that can clear the conservative close-cost estimate. Between changes, preserve the
       // older opposing-direction breakeven harvest so stale contra exposure can still free slots.
@@ -2797,6 +2862,7 @@ export class LiveExecutionEngine {
       const net = settled?.netUsd ?? null;
       intent.realizedPnlUsd = net;
       intent.feesUsd = settled?.feesUsd ?? null;
+      intent.feeSource = settled?.feeSource ?? undefined;
       if (net === null) {
         intent.lastError = "operator close: P&L UNKNOWN — trades fetch failed after a real close; wallet-reconciliation will catch the true amount";
         this.applyRealizedToLedger(null);
@@ -3013,6 +3079,7 @@ export class LiveExecutionEngine {
       const net = settled?.netUsd ?? null;
       intent.realizedPnlUsd = net;
       intent.feesUsd = settled?.feesUsd ?? null;
+      intent.feeSource = settled?.feeSource ?? undefined;
       if (net === null) {
         intent.lastError = "kill flatten: P&L UNKNOWN — trades fetch failed; wallet-reconciliation will catch the true amount";
       }
@@ -3349,6 +3416,7 @@ export class LiveExecutionEngine {
               const net = settled?.netUsd ?? null;
               intent.realizedPnlUsd = net;
               intent.feesUsd = settled?.feesUsd ?? null;
+              intent.feeSource = settled?.feeSource ?? undefined;
               intent.state = "CLOSED";
               intent.closedAt = this.nowIso();
               this.stampExitControllerSnapshot(intent);
@@ -3467,6 +3535,7 @@ export class LiveExecutionEngine {
           const net = settled?.netUsd ?? null;
           intent.realizedPnlUsd = net;
           intent.feesUsd = settled?.feesUsd ?? null;
+          intent.feeSource = settled?.feeSource ?? undefined;
           intent.state = "CLOSED";
           intent.closedAt = this.nowIso();
           this.stampExitControllerSnapshot(intent);
@@ -3549,6 +3618,7 @@ export class LiveExecutionEngine {
     const net = settled?.netUsd ?? null;
     intent.realizedPnlUsd = net;
     intent.feesUsd = settled?.feesUsd ?? null;
+    intent.feeSource = settled?.feeSource ?? undefined;
     intent.state = "CLOSED";
     intent.closedAt = this.nowIso();
     this.stampExitControllerSnapshot(intent);
@@ -3840,6 +3910,7 @@ export class LiveExecutionEngine {
       const net = settled?.netUsd ?? null;
       intent.realizedPnlUsd = net;
       intent.feesUsd = settled?.feesUsd ?? null;
+      intent.feeSource = settled?.feeSource ?? undefined;
       intent.state = "CLOSED";
       intent.closedAt = this.nowIso();
       this.stampExitControllerSnapshot(intent);
@@ -3996,6 +4067,7 @@ export class LiveExecutionEngine {
     const liveLegRealized = liveLegSettled?.netUsd ?? null;
     rescueIntent.realizedPnlUsd = liveLegRealized;
     rescueIntent.feesUsd = liveLegSettled?.feesUsd ?? null;
+    rescueIntent.feeSource = liveLegSettled?.feeSource ?? undefined;
     rescueIntent.state = "CLOSED";
     rescueIntent.closedAt = this.nowIso();
     this.stampExitControllerSnapshot(rescueIntent);
@@ -4045,7 +4117,15 @@ export class LiveExecutionEngine {
       (earliest, i) => (i.createdAt < earliest.createdAt ? i : earliest),
       opposingIntents[0]!,
     );
-    const flipSettled = await this.settleIntentAfterClose(anchorIntent, [flip.orderId]);
+    // RECORDING-ONLY: suppress the per-fill record when this ONE settlement resolves more than one
+    // opposing intent — see settleIntentAfterClose's `recordFills` parameter for why a single
+    // anchor-keyed record carrying the whole flip qty would be confidently wrong (2026-07-27
+    // review). With exactly one opposing intent the record is exact and is written normally.
+    const flipSettled = await this.settleIntentAfterClose(
+      anchorIntent,
+      [flip.orderId],
+      opposingIntents.length === 1,
+    );
     const flipNet = flipSettled?.netUsd ?? null;
     const flipFees = flipSettled?.feesUsd ?? null;
     const totalOpposingQty = opposingIntents.reduce((sum, i) => sum + Math.abs(i.qty), 0);
@@ -4060,6 +4140,11 @@ export class LiveExecutionEngine {
       }
       oi.realizedPnlUsd = oiNet;
       oi.feesUsd = flipFees === null ? null : flipFees * share;
+      // NOT "EXCHANGE". `flipFees` is one real, exchange-measured total for the single flip fill;
+      // what lands on THIS intent is that total × its qty share — a modelled slice of a measured
+      // number. The shares sum back to the real amount, so an aggregate over all N is exchange-true,
+      // but no individual row here was ever observed at this granularity. See LiveIntent.feeSource.
+      oi.feeSource = flipSettled?.feeSource === "EXCHANGE" ? "EXCHANGE_APPORTIONED" : undefined;
       oi.state = "CLOSED";
       oi.closedAt = this.nowIso();
       this.stampExitControllerSnapshot(oi);
@@ -4154,6 +4239,7 @@ export class LiveExecutionEngine {
     const net = settled?.netUsd ?? null;
     intent.realizedPnlUsd = net;
     intent.feesUsd = settled?.feesUsd ?? null;
+    intent.feeSource = settled?.feeSource ?? undefined;
     intent.state = "CLOSED";
     intent.closedAt = this.nowIso();
     this.stampExitControllerSnapshot(intent);
@@ -4210,6 +4296,7 @@ export class LiveExecutionEngine {
     const net = settled?.netUsd ?? null;
     intent.realizedPnlUsd = net;
     intent.feesUsd = settled?.feesUsd ?? null;
+    intent.feeSource = settled?.feeSource ?? undefined;
     intent.state = "CLOSED";
     intent.closedAt = this.nowIso();
     this.stampExitControllerSnapshot(intent);
@@ -4264,6 +4351,7 @@ export class LiveExecutionEngine {
     const net = settled?.netUsd ?? null;
     intent.realizedPnlUsd = net;
     intent.feesUsd = settled?.feesUsd ?? null;
+    intent.feeSource = settled?.feeSource ?? undefined;
     intent.state = "CLOSED";
     intent.closedAt = this.nowIso();
     this.stampExitControllerSnapshot(intent);
@@ -4283,6 +4371,11 @@ export class LiveExecutionEngine {
     }
     let net: number | null = null;
     let fees: number | null = null;
+    // Provenance of `fees` (2026-07-26, recording-only — see LiveIntent.feeSource). Stays undefined
+    // on every abandonment path below: the algo-query escalation, a close that never became visible,
+    // and the outer catch all leave `fees` null, and a settlement that matched no rows leaves it 0.
+    // None of those is a measurement.
+    let feeSource: "EXCHANGE" | undefined;
     try {
       const triggeredAlgoOrderIds: string[] = [];
       let algoQueryFailed = false;
@@ -4310,13 +4403,14 @@ export class LiveExecutionEngine {
           intent.symbol,
           intent.createdAt,
           this.intentSettlementOrderIds(intent, triggeredAlgoOrderIds),
-          { requiredOrderIds: requiredCloseOrderIds },
+          { requiredOrderIds: requiredCloseOrderIds, fillRecord: this.fillRecordContextForIntent(intent) },
         );
         if (settled === null) {
           intent.lastError = "settle: closing trade not visible after retries — P&L left UNKNOWN; wallet reconciliation will catch the true amount";
         } else {
           net = settled.netUsd;
           fees = settled.feesUsd;
+          feeSource = settled.feeSource ?? undefined;
         }
       }
     } catch (error) {
@@ -4325,6 +4419,7 @@ export class LiveExecutionEngine {
 
     intent.realizedPnlUsd = net;
     intent.feesUsd = fees;
+    intent.feeSource = feeSource;
     intent.state = "CLOSED";
     intent.closedAt = this.nowIso();
     this.stampExitControllerSnapshot(intent);
@@ -4393,7 +4488,14 @@ export class LiveExecutionEngine {
    *  feesUsd=null and every fee report coerced them to $0 — while the exchange-true commission bill
    *  (-$15.59, 68.7% of the all-time loss) stayed invisible per-trade. Now returns both numbers so
    *  every close path records the commissions it already paid for the fetch of. Also bumped the
-   *  page limit 200→1000 to match settleIfStopTriggered's earlier fix (#112 rationale). */
+   *  page limit 200→1000 to match settleIfStopTriggered's earlier fix (#112 rationale).
+   *
+   *  2026-07-26 fee-PROVENANCE addition: also returns `feeSource` (see SettledFromTrades) so a
+   *  caller can tell a MEASURED commission from a structural zero. `feesUsd: 0` is returned by two
+   *  paths that never saw a commission row at all — the `ids.size === 0` short-circuit (no order
+   *  ids to look up, so the exchange is never even queried) and a query that matched no rows of
+   *  ours — and until now those were indistinguishable from a genuine $0 fee. Purely additive: not
+   *  one arithmetic result or control-flow decision below depends on the new field. */
   private async realizedFromTrades(
     symbol: string,
     sinceIso: string,
@@ -4404,10 +4506,20 @@ export class LiveExecutionEngine {
       requiredOrderIds?: Array<string | null>;
       retries?: number;
       retryDelayMs?: number;
+      /** RECORDING-ONLY (2026-07-27). Present ⇒ persist the rows this settlement matched to the
+       *  per-fill recorder (see executionFillRecorder). Absent ⇒ nothing is recorded and this
+       *  method is byte-for-byte its old self. It is passed in rather than derived here because
+       *  this method is deliberately intent-agnostic (symbol + order ids only); `entryOrderIds` is
+       *  what lets a matched row be labelled ENTRY vs EXIT, which is the caller's knowledge, not
+       *  this method's. NOTHING in the returned value depends on it. */
+      fillRecord?: { recordId: string; laneId: string; entryOrderIds: Array<string | null> };
     } = {},
-  ): Promise<{ netUsd: number; feesUsd: number } | null> {
+  ): Promise<SettledFromTrades | null> {
     const ids = new Set(orderIds.filter((id): id is string => typeof id === "string"));
-    if (ids.size === 0) return { netUsd: 0, feesUsd: 0 };
+    // No order ids to look up: the exchange is never queried, so this zero is a STRUCTURAL zero and
+    // feeSource stays null. Labelling it "EXCHANGE" would fabricate a measurement out of a
+    // short-circuit — precisely the ambiguity this field was added to remove.
+    if (ids.size === 0) return { netUsd: 0, feesUsd: 0, feeSource: null };
     const required = new Set(
       (opts.requiredOrderIds ?? []).filter((id): id is string => typeof id === "string"),
     );
@@ -4415,7 +4527,11 @@ export class LiveExecutionEngine {
     const retryDelayMs = Math.max(0, opts.retryDelayMs ?? this.fillConfirmRetryDelayMs);
     for (let attempt = 0; attempt <= retries; attempt += 1) {
       try {
-        const trades = await this.client.getUserTrades(symbol, { startTime: new Date(sinceIso).getTime(), limit: 1000 });
+        const trades = await this.client.getUserTrades(symbol, { startTime: new Date(sinceIso).getTime(), limit: USER_TRADES_PAGE_LIMIT });
+        // RECORDING-ONLY. A FULL page means Binance may have cut rows off its edge — see
+        // USER_TRADES_PAGE_LIMIT. Consumed ONLY by the fill recorder's fetchComplete below; the
+        // net/fee arithmetic and every settlement decision are untouched by it.
+        const pageSaturated = Array.isArray(trades) && trades.length >= USER_TRADES_PAGE_LIMIT;
         const visibleIds = new Set(trades.map((trade) => trade.orderId));
         const matchedTrades = trades.filter((trade) => ids.has(trade.orderId));
         // One of several candidate exit orders may be the actual fill (TP vs stop vs BE stop).
@@ -4429,13 +4545,39 @@ export class LiveExecutionEngine {
         } else {
           let net = 0;
           let fees = 0;
+          // Provenance counter (2026-07-26, recording-only): counts the rows that actually
+          // contributed to `fees`. NOT the same as matchedTrades.length in principle — the
+          // `ids.has()` re-check below is the authority on what was summed — and NOT the same as
+          // "fees > 0" either, since a real commission row can legitimately be 0 (a maker rebate,
+          // or a rounded-to-zero dust fill). Only a counted ROW proves an exchange measurement.
+          let feeRows = 0;
           for (const t of matchedTrades) {
             if (ids.has(t.orderId)) {
               net += t.realizedPnl - t.commission;
               fees += t.commission;
+              feeRows += 1;
             }
           }
-          return { netUsd: net, feesUsd: fees };
+          // Per-fill execution record (2026-07-27, report-only, fail-safe — see its doc comment).
+          // Placed AFTER the sum and immediately before the return so it cannot affect either: the
+          // rows are the same `matchedTrades` this loop just walked, no extra fetch, and the whole
+          // call is wrapped. `fetchComplete` is NOT unconditionally true (2026-07-27 review): a
+          // failed or never-close-visible fetch never reaches here, but a SATURATED page can — a
+          // long-lived intent on a symbol the account traded >1000 times since createdAt can lose
+          // its ENTRY row off the page edge and leave an exit-only record that reads as whole.
+          //
+          // DOUBLE-WRAPPED ON PURPOSE. recordIntentFills is itself fully try/caught, but this call
+          // sits INSIDE the enclosing `try` whose `catch` treats a throw as "the trades fetch
+          // failed" — i.e. a bookkeeping exception leaking out of it would turn a successful
+          // settlement into a retry and then a null P&L, which is a real trading consequence. The
+          // redundant local catch makes that structurally impossible even if a future edit removes
+          // the inner one.
+          try {
+            this.recordIntentFills(opts.fillRecord, symbol, matchedTrades, !pageSaturated);
+          } catch {
+            // report-only bookkeeping — never allowed to reach the enclosing settlement catch
+          }
+          return { netUsd: net, feesUsd: fees, feeSource: feeRows > 0 ? "EXCHANGE" : null };
         }
       } catch {
         if (attempt === retries) return null;
@@ -4454,15 +4596,85 @@ export class LiveExecutionEngine {
     ];
   }
 
+  /** Per-fill recorder context for one intent (2026-07-27, report-only). Pure field reads — no I/O,
+   *  no clock, nothing that can throw meaningfully — but wrapped anyway so a malformed intent can
+   *  never reach a settlement call site. Returns undefined when no recorder is injected, which
+   *  makes realizedFromTrades' recording branch a no-op. */
+  private fillRecordContextForIntent(
+    intent: LiveIntent,
+  ): { recordId: string; laneId: string; entryOrderIds: Array<string | null> } | undefined {
+    try {
+      if (!this.executionFillRecorder) return undefined;
+      return {
+        recordId: this.positionPathKeyForIntent(intent), // intent:<paperOrderId>:<createdAt>
+        laneId: intent.sourcePaperOrders?.[0]?.laneId ?? "UNKNOWN",
+        entryOrderIds: [intent.entryOrderId, ...(intent.entryOrderIds ?? [])],
+      };
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Persist the per-fill rows one settlement matched (2026-07-27, report-only). Never fetches —
+   *  `matched` is the array realizedFromTrades already had. Fully wrapped: a failure here must
+   *  NEVER affect settlement, P&L, the ledger or the kill-switch. An empty match records nothing
+   *  (see recordFills' contract: no record is honest, an empty record reads as "no fills"). */
+  private recordIntentFills(
+    ctx: { recordId: string; laneId: string; entryOrderIds: Array<string | null> } | undefined,
+    symbol: string,
+    matched: FuturesUserTrade[],
+    /** False when the userTrades page this match came from was SATURATED, so rows may have been cut
+     *  off its edge. Passed by the caller rather than assumed true — see the call site. */
+    fetchComplete: boolean,
+  ): void {
+    try {
+      const recorder = this.executionFillRecorder;
+      if (!recorder || !ctx || !Array.isArray(matched) || matched.length === 0) return;
+      // Everything the settlement id set contains that is NOT an entry order is a closing order
+      // (tp1, the triggered stop/breakeven's actualOrderId, or an explicit close order id) — the
+      // caller supplies the entry side because only it knows which is which.
+      const entryIds = new Set(ctx.entryOrderIds.filter((id): id is string => typeof id === "string"));
+      const fills: ExecutionFill[] = [];
+      for (const t of matched) {
+        const role: ExecutionFillRole = entryIds.has(t.orderId) ? "ENTRY" : "EXIT";
+        fills.push(fillFromUserTrade(t, role));
+      }
+      const nowMs = Date.parse(this.nowIso());
+      recorder.recordFills({
+        recordId: ctx.recordId,
+        source: "engine",
+        laneId: ctx.laneId,
+        symbol,
+        closedAtMs: Number.isFinite(nowMs) ? nowMs : Date.now(),
+        fetchComplete: fetchComplete === true,
+        fills,
+      });
+    } catch {
+      // report-only bookkeeping — a failure here must NEVER affect trading
+    }
+  }
+
   private settleIntentAfterClose(
     intent: LiveIntent,
     closeOrderIds: Array<string | null>,
-  ): Promise<{ netUsd: number; feesUsd: number } | null> {
+    /** RECORDING-ONLY. Set false on the rescue-FLIP path when ONE settlement resolves N>1 opposing
+     *  intents: exactly one record would be written, keyed to the ANCHOR intent, carrying the full
+     *  flip qty that actually covers all N — a consumer joining fills to intents by recordId would
+     *  score that intent's slippage against several times its real size and see "no fill data" for
+     *  the other N−1. There is no per-intent fill to record here (there was only one real fill), so
+     *  no record is the honest outcome — the same rule recordFills already applies to an empty
+     *  match. The apportioned P&L itself is still labelled EXCHANGE_APPORTIONED on every intent.
+     *  Purely a recording switch: `realizedFromTrades`' return value does not depend on it. */
+    recordFills = true,
+  ): Promise<SettledFromTrades | null> {
     return this.realizedFromTrades(
       intent.symbol,
       intent.createdAt,
       this.intentSettlementOrderIds(intent, closeOrderIds),
-      { requiredOrderIds: closeOrderIds },
+      {
+        requiredOrderIds: closeOrderIds,
+        fillRecord: recordFills ? this.fillRecordContextForIntent(intent) : undefined,
+      },
     );
   }
 
@@ -4616,6 +4828,30 @@ export class LiveExecutionEngine {
       }
       recorder.pruneExpired(Number.isFinite(nowMs) ? nowMs : Date.now(), { deferSave: true });
       recorder.flush(); // one write for the whole tick's samples + closes; no-op while clean
+    } catch {
+      // report-only bookkeeping — a failure here must NEVER affect trading
+    }
+  }
+
+  /** Per-fill store retention (2026-07-27, report-only). RETENTION ONLY — this never writes a
+   *  record and never reads the file; records are written at settlement by recordIntentFills. An
+   *  in-memory filter over ≤ MAX_FILL_RECORDS entries.
+   *
+   *  COST, STATED HONESTLY (an earlier version of this comment claimed "zero I/O in steady state",
+   *  which is inverted — steady state is exactly when records reach the 90-day horizon). Once the
+   *  store is older than FILL_RETENTION_MS, roughly one tick in 40 at ~7 closes/day will drop a
+   *  record and pay one synchronous whole-file write (~1–3 ms at the projected ~340 KB). This runs
+   *  at tick step 3.7, BEFORE mirrorNewSignals at step 5, so it is on the pre-order side of the
+   *  tick — flagged rather than buried. It is immaterial against the several signed Binance
+   *  round-trips the same tick already awaits (ensureTimeSync, reconcile, manageLifecycle) and
+   *  against sweepPositionPathRecorder at step 3.6, which already flushes to disk on this path.
+   *  Wrapped, like every other sweep here. */
+  private sweepExecutionFillRecorder(): void {
+    const recorder = this.executionFillRecorder;
+    if (!recorder) return;
+    try {
+      const nowMs = Date.parse(this.nowIso());
+      recorder.pruneExpired(Number.isFinite(nowMs) ? nowMs : Date.now());
     } catch {
       // report-only bookkeeping — a failure here must NEVER affect trading
     }
@@ -6039,6 +6275,7 @@ export class LiveExecutionEngine {
           const net = settled?.netUsd ?? null;
           intent.realizedPnlUsd = net;
           intent.feesUsd = settled?.feesUsd ?? null;
+          intent.feeSource = settled?.feeSource ?? undefined;
           this.applyRealizedToLedger(net, "adverse");
         }
       } catch (flattenError) {
@@ -6225,6 +6462,7 @@ export class LiveExecutionEngine {
           const net = settled?.netUsd ?? null;
           intent.realizedPnlUsd = net;
           intent.feesUsd = settled?.feesUsd ?? null;
+          intent.feeSource = settled?.feeSource ?? undefined;
           this.applyRealizedToLedger(net, "adverse");
         }
       } catch (flattenError) {

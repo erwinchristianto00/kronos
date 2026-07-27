@@ -382,6 +382,37 @@ describe("neural map telemetry", () => {
     expect(buildNeuralMapTelemetry(b).alerts.some((x) => x.source === "Resolver Stalled")).toBe(true);
   });
 
+  // T1-b review fix 2026-07-27. The stall detector used `input.paper.closed` as its numerator while
+  // taking its denominator from `input.orders`. `input.paper` is a PaperPerformanceReport the CALLER
+  // builds, and with PAPER_EXCLUDE_SUBFLOOR_ROWS_DECISIONS on it drops closed rows (never open ones),
+  // so a healthy resolver on a contaminated book reads as a freeze. Both sides must come from the
+  // same array: resolver liveness is a plumbing question and must not move with an economics flag.
+  it("does NOT flag a stall when the book has plenty of closes but input.paper.closed was filtered", () => {
+    const prev = process.env.PAPER_STALL_OPEN_BACKLOG;
+    process.env.PAPER_STALL_OPEN_BACKLOG = "3";
+    try {
+      const input = baseInput();
+      input.generatedAt = "2026-06-10T00:00:00.000Z";
+      // The filtered report says "0 closed" — exactly what an all-sub-floor lane produces.
+      input.paper.closed = 0;
+      const oldIso = "2026-06-04T00:00:00.000Z"; // 144h old > the 120h age bar
+      const mk = (status: string) => ({
+        paperStatus: status, openedAt: oldIso, direction: "LONG", paperOrderMode: "DIAGNOSTIC_ONLY",
+        diagnosticLabel: null, selectedLaneId: "X", netPnlAmount: null, netR: null,
+      });
+      // 3 open + 100 genuinely closed in the RAW book ⇒ the resolver is demonstrably alive.
+      input.orders = [
+        mk("CREATED"), mk("CREATED"), mk("PAPER_SUBMITTED"),
+        ...Array.from({ length: 100 }, () => mk("PAPER_CLOSED_LOSS")),
+      ] as never[];
+      const alerts = buildNeuralMapTelemetry(input).alerts;
+      expect(alerts.some((a) => a.source === "Paper Resolver Stalled")).toBe(false);
+    } finally {
+      if (prev === undefined) delete process.env.PAPER_STALL_OPEN_BACKLOG;
+      else process.env.PAPER_STALL_OPEN_BACKLOG = prev;
+    }
+  });
+
   it("flags a stalled PAPER resolver (big backlog, oldest near expiry, ~0 closed)", () => {
     const prev = process.env.PAPER_STALL_OPEN_BACKLOG;
     process.env.PAPER_STALL_OPEN_BACKLOG = "3";

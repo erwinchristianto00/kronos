@@ -307,6 +307,40 @@ export const PYRAMID_CONFIRMED_ADD_SIZE_MULTIPLE = Number(process.env.PYRAMID_CO
 
 // --- Geometry constants ---
 export const WIDE_STOP_MIN_BPS = 300; // Paper-admissible wide/trail variants require >= 300bps stops
+/**
+ * `stopFloorBps` values at or below this are NON-BINDING SENTINELS, not real floors.
+ *
+ * Exactly two lanes use it: the "Sentil" lanes CG_BASELINE_FAST_05 and CG_MAKER_FAST_05 set
+ * `stopFloorBps: 1` purely to route themselves through deriveVariantGeometry's wide-geometry
+ * branch (which keys off `stopFloorBps != null`) so the paired TP is re-placed at
+ * `tpRewardMultiple` × risk. Since raw stops are always > 1bps, `Math.max(rawStop, 1)` is a
+ * deliberate no-op — the entry AND stop stay identical to their parent lanes. It is a GEOMETRY
+ * instruction, never a claim that a 1bps stop is admissible.
+ *
+ * NOT env-tunable on purpose: this is a classification of the definitions in this file, not a
+ * market judgment. Raising it would silently reclassify the genuinely binding floors — 175
+ * (CG_TIGHT_FAST_05, CG_EXP_LONG_TIGHT_FAST_10X), 200 (BULL_TREND_VARIANT_ID,
+ * BULL_SCALEOUT_VARIANT_ID), 250 (LG_R12_STOP250_FULL) — as sentinels and change those lanes'
+ * admission behaviour too. Test [5c] in paper-opportunity-allocator.test.ts pins every one of them.
+ */
+export const NON_BINDING_STOP_FLOOR_MAX_BPS = 1;
+/**
+ * The ADMISSION floor for a variant — deliberately distinct from the stop-WIDENING floor inside
+ * deriveVariantGeometry's `usesWidePaperGeometry` branch. A non-binding sentinel widens nothing
+ * there (that stays true and is asserted by test [5c], see
+ * NON_BINDING_STOP_FLOOR_MAX_BPS) but must still be admitted at the standard wide floor, exactly
+ * like the parent lane it is supposed to A/B against: CG_BASELINE_CURRENT / CG_MAKER_LIMIT_SIM
+ * carry no `stopFloorBps` at all and therefore admit at WIDE_STOP_MIN_BPS.
+ *
+ * Before this existed the allocator passed `def.stopFloorBps ?? WIDE_STOP_MIN_BPS` straight into
+ * the admission gate, so the sentinel 1 became the floor and the two Sentil lanes admitted
+ * geometry their own parents reject — breaking the "only the TP changed" isolation at the gate
+ * rather than at the geometry.
+ */
+export function admissionStopFloorBpsForVariant(def: VariantMatrixVariantDefinition): number {
+  const floor = def.stopFloorBps;
+  return floor == null || floor <= NON_BINDING_STOP_FLOOR_MAX_BPS ? WIDE_STOP_MIN_BPS : floor;
+}
 export const MAKER_FILL_WINDOW_CANDLES = 12; // 1h on 5m candles to get a maker fill
 const CANDLE_MS = 5 * 60 * 1000;
 const EXPIRY_MS = 7 * 24 * 60 * 60 * 1000;

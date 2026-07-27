@@ -23,6 +23,8 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 
+import { applySubFloorExclusionForDecisions } from "./paper-subfloor-exclusion.js";
+
 export type EdgeDirection = "LONG" | "SHORT";
 export type RegimeFamily = "BULLISH_EXPANSION" | "BEARISH_EXPANSION" | "MIXED_ROTATION" | "OTHER";
 
@@ -119,6 +121,9 @@ export interface ClosedOrderLike {
   paperOrderMode?: string | null;
   diagnosticLabel?: string | null;
   selectedLaneId?: string | null;
+  /** T1-b: read only by the sub-admission-floor predicate. Absent ⇒ row is never excluded. */
+  sourceType?: string | null;
+  plannedStopDistanceBps?: number | null;
 }
 
 interface EdgeMemoryState {
@@ -271,6 +276,12 @@ export class RegimeEdgeMemoryStore {
    * un-veto from live data — re-seed to revisit a slice.) BACKFILL excluded too.
    */
   updateFromClosedOrders(orders: ClosedOrderLike[]): void {
+    // T1-b DECISION PATH (hard veto) — gated, DEFAULT OFF. This aggregate is HEADLINE-only, so it
+    // sees only the 4 sub-floor rows that carry paperOrderMode !== DIAGNOSTIC_ONLY — but those 4
+    // are the DURABLE contamination: pruneClosedDiagnostic never prunes HEADLINE closes, so unlike
+    // the diagnostic pool they never age out. Measured 2026-07-26 they were 4 of the 19 closes in
+    // this entire aggregate (21%), all Bullish expansion::LONG. No veto flips at today's sample.
+    const scoped = applySubFloorExclusionForDecisions(orders);
     const stats: Record<string, EdgeStat> = {};
     const laneStats: Record<string, EdgeStat> = {};
     const bump = (m: Record<string, EdgeStat>, k: string, netR: number) => {
@@ -280,7 +291,7 @@ export class RegimeEdgeMemoryStore {
       s.sumNetR += netR;
       m[k] = s;
     };
-    for (const o of orders) {
+    for (const o of scoped) {
       if (o.paperStatus !== "PAPER_CLOSED_WIN" && o.paperStatus !== "PAPER_CLOSED_LOSS") continue;
       if (o.paperOrderMode === "DIAGNOSTIC_ONLY" || o.diagnosticLabel === "BACKFILL_DIAGNOSTIC") continue;
       if (o.direction !== "LONG" && o.direction !== "SHORT") continue;

@@ -33,7 +33,16 @@ interface UnifiedProposalSourceOptions {
   minConfidence?: number;
 }
 
-const RECIPE_BY_DIRECTION = {
+/**
+ * Exported ONLY so paper-subfloor-exclusion.test.ts can assert the safety property this file relies
+ * on without knowing it: every recipe here must carry a BINDING `stopFloorBps` (> the non-binding
+ * sentinel). These proposals stamp `sourceType: "SCAN_CANDIDATE_LANE_ALLOCATOR"` and a real
+ * `plannedStopDistanceBps` WITHOUT ever running `paperOpportunityStopFloorRejection`, so a recipe
+ * with a sentinel/absent floor could emit rows the sub-admission-floor predicate would delete from
+ * every aggregate even though the gate never applied to them. See the SCOPE note in
+ * paper-subfloor-exclusion.ts.
+ */
+export const RECIPE_BY_DIRECTION = {
   LONG: {
     EXTENDED_TREND: "CG_EXP_LONG_MFE_GIVEBACK_10X",
     TACTICAL_OR_MIXED: "CG_WIDE_FAST_LONG",

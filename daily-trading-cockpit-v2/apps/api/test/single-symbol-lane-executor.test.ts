@@ -161,8 +161,31 @@ class FakeClient implements SingleSymbolExecClient {
   async cancelAlgoOrder(algoId: string): Promise<void> {
     this.algosCancelled.push(algoId);
   }
-  async getUserTrades(_symbol: string): Promise<FuturesUserTrade[]> {
-    return Array.from(this.userTradesByOrderId.values());
+  /** By DEFAULT this fake ignores `startTime` and hands back every seeded trade. That is exactly why
+   *  the 2026-07-26 fee-window bug survived a 62-test file: the production query anchored its window
+   *  at openedAt (stamped AFTER placeOrder, hence always later than Binance's own entry-fill
+   *  timestamp) so the entry row was never returned on the real exchange, while here it always was.
+   *  Set `honourStartTime` to model the endpoint's real semantics. Left off elsewhere so the 60+
+   *  pre-existing cases keep their original fixtures. */
+  honourStartTime = false;
+  /** The `startTime` of the most recent getUserTrades call — lets a test assert WHICH window was
+   *  actually requested, not merely what the sums came out to. */
+  lastUserTradesStartTime: number | undefined;
+  async getUserTrades(_symbol: string, opts: { startTime?: number; limit?: number } = {}): Promise<FuturesUserTrade[]> {
+    this.lastUserTradesStartTime = opts.startTime;
+    const all = Array.from(this.userTradesByOrderId.values());
+    if (!this.honourStartTime) return all;
+    const from = opts.startTime;
+    // Binance's startTime is INCLUSIVE and is compared against the exchange-stamped trade time.
+    return typeof from === "number" ? all.filter((t) => t.time >= from) : all;
+  }
+
+  /** Seed a trade row at an explicit exchange timestamp (triggerAlgo always stamps NOW_MS). */
+  seedTrade(orderId: string, over: Partial<FuturesUserTrade> = {}): void {
+    this.userTradesByOrderId.set(orderId, {
+      symbol: "BTCUSDT", orderId, price: 60000, qty: 1, realizedPnl: 0, commission: 0,
+      commissionAsset: "USDT", time: NOW_MS, ...over,
+    });
   }
 
   /** Test helper: mark a previously-placed algo stop as having triggered a real fill. */
@@ -938,6 +961,13 @@ describe("SingleSymbolLaneExecutor — exits", () => {
     expect(closed.grossPnlUsd).toBeCloseTo(-1.8, 6);
     expect(closed.feeEstimateUsd).toBeCloseTo(0.08, 6);
     expect(closed.netPnlUsd).toBeCloseTo(-1.88, 6);
+    // The entry leg is recorded on its own regardless of whether it was folded into the totals
+    // above — 0.02 is the entry commission, and the entry order realized nothing (it OPENED).
+    expect(closed.entryCommissionUsd).toBeCloseTo(0.02, 9);
+    expect(closed.entryRealizedPnlUsd).toBeCloseTo(0, 9);
+    // Folded here because this fixture's entry row is timestamped at openedAt, i.e. it is one of
+    // the rows the OLD openedAt-anchored window already returned. See the FEE-WINDOW tests below.
+    expect(closed.entryLegFoldedIntoPnl).toBe(true);
   });
 
   it("[MFE-GIVEBACK] a momentum-style (LONG) position banks a faded winner via the giveback policy", async () => {
@@ -1280,5 +1310,154 @@ describe("SingleSymbolLaneExecutorStore — fileName isolation", () => {
     expect(typeof pos.stopAlgoOrderId).toBe("string");
     expect(pos.stopAlgoOrderId).toBe("2000001266429768");
     expect(pos.exitOrderId).toBeNull(); // legitimately-null fields must stay null, not become ""
+  });
+});
+
+describe("SingleSymbolLaneExecutor — getUserTrades fee window (2026-07-26 fix)", () => {
+  /** Open a position, then place its protective stop. Returns the live position record. */
+  async function openWithStop(client: FakeClient) {
+    const { executor, store } = makeExecutor({ client, signals: [signal()], legUsd: 10_000 });
+    await executor.tick(); // open
+    await executor.tick(); // place stop
+    return { executor, store, pos: store.getState().positions[0]! };
+  }
+
+  it("[FEE-WINDOW] stamps the query's lower bound BEFORE the entry order is submitted, not from openedAt", async () => {
+    const client = new FakeClient();
+    const { pos } = await openWithStop(client);
+    // openedAt is written into the position literal AFTER placeOrder and AFTER resolveFillPrice;
+    // the window stamp is taken immediately BEFORE placeOrder. Under this frozen clock both read
+    // NOW_MS, so the only observable difference is the deliberate skew slack.
+    expect(Date.parse(pos.openedAt)).toBe(NOW_MS);
+    expect(pos.entryTradeWindowFromMs).toBe(NOW_MS - 10_000);
+  });
+
+  it("[FEE-WINDOW] captures the ENTRY commission for a fill Binance timestamped BEFORE openedAt — the row the old window always missed", async () => {
+    const client = new FakeClient();
+    // Model the real endpoint: startTime is honoured and compared against the exchange's own
+    // trade timestamp. Without this the fixture cannot express the bug at all.
+    client.honourStartTime = true;
+    const { executor, store, pos } = await openWithStop(client);
+    const fullQty = pos.qty;
+    const algoId = pos.stopAlgoOrderId!;
+
+    // The entry matched on Binance 5s before our process got as far as stamping openedAt — the
+    // ordinary case, since openedAt is written after the placeOrder round-trip AND after
+    // resolveFillPrice. Under the OLD window (startTime = openedAt = NOW_MS) this row is excluded.
+    client.seedTrade(pos.entryOrderId, { qty: fullQty, commission: 0.02, time: NOW_MS - 5_000 });
+    client.triggerAlgo(algoId, "9001", -0.9, 0.03, 61800, fullQty);
+    await executor.tick();
+
+    const closed = store.getState().positions[0]!;
+    expect(closed.status).toBe("CLOSED");
+    // The window that was actually requested — asserted directly, not inferred from the sums.
+    expect(client.lastUserTradesStartTime).toBe(NOW_MS - 10_000);
+    // THE POINT OF THE FIX: the entry commission is now visible and recorded. Before the fix this
+    // is `undefined` — the row never came back from the exchange at all.
+    expect(closed.entryCommissionUsd).toBeCloseTo(0.02, 9);
+    expect(closed.entryRealizedPnlUsd).toBeCloseTo(0, 9);
+
+    // BEHAVIOUR PRESERVATION, and it is the whole reason this is safe to deploy unattended:
+    // making the row VISIBLE must not silently move netPnlUsd, because netPnlUsd feeds the
+    // daily-loss entry gate and the account-wide consecutive-loss kill switch. This row was
+    // outside the OLD window, so it is recorded but NOT folded, and the totals are bit-identical
+    // to what shipped.
+    expect(closed.entryLegFoldedIntoPnl).toBe(false);
+    expect(closed.feeEstimateUsd).toBeCloseTo(0.03, 9);
+    expect(closed.grossPnlUsd).toBeCloseTo(-0.9, 9);
+    expect(closed.netPnlUsd).toBeCloseTo(-0.93, 9);
+    expect(closed.feeSource).toBe("EXCHANGE");
+  });
+
+  it("[FEE-WINDOW] SINGLE_SYMBOL_EXEC_FOLD_ENTRY_FEE=1 folds that same entry commission into the P&L totals (opt-in, execution-affecting)", async () => {
+    const prev = process.env.SINGLE_SYMBOL_EXEC_FOLD_ENTRY_FEE;
+    process.env.SINGLE_SYMBOL_EXEC_FOLD_ENTRY_FEE = "1";
+    try {
+      const client = new FakeClient();
+      client.honourStartTime = true;
+      const { executor, store, pos } = await openWithStop(client);
+      const fullQty = pos.qty;
+      client.seedTrade(pos.entryOrderId, { qty: fullQty, commission: 0.02, time: NOW_MS - 5_000 });
+      client.triggerAlgo(pos.stopAlgoOrderId!, "9001", -0.9, 0.03, 61800, fullQty);
+      await executor.tick();
+
+      const closed = store.getState().positions[0]!;
+      expect(closed.status).toBe("CLOSED");
+      expect(closed.entryLegFoldedIntoPnl).toBe(true);
+      // 0.03 exit + 0.02 entry — the true two-sided cost, vs. 0.03 exit-only in the test above.
+      expect(closed.feeEstimateUsd).toBeCloseTo(0.05, 9);
+      // The shift the operator is signing off on: netPnlUsd is one entry commission MORE negative,
+      // which tightens the daily-loss gate and the consecutive-loss kill switch by that much.
+      expect(closed.netPnlUsd).toBeCloseTo(-0.95, 9);
+      expect(closed.entryCommissionUsd).toBeCloseTo(0.02, 9);
+    } finally {
+      if (prev === undefined) delete process.env.SINGLE_SYMBOL_EXEC_FOLD_ENTRY_FEE;
+      else process.env.SINGLE_SYMBOL_EXEC_FOLD_ENTRY_FEE = prev;
+    }
+  });
+
+  it("[FEE-WINDOW] a foreign order's trade inside the widened window contributes nothing (matching is by exact orderId)", async () => {
+    const client = new FakeClient();
+    client.honourStartTime = true;
+    const { executor, store, pos } = await openWithStop(client);
+    const fullQty = pos.qty;
+    client.seedTrade(pos.entryOrderId, { qty: fullQty, commission: 0.02, time: NOW_MS - 5_000 });
+    // A sibling executor's fill on the SAME netted symbol, timestamped inside the newly-widened
+    // 10s slack — the one hazard widening the window could plausibly introduce. Deliberately huge
+    // so any leakage into the sums is unmissable.
+    client.seedTrade("77777", { qty: 99, commission: 5, realizedPnl: 999, time: NOW_MS - 3_000 });
+    client.triggerAlgo(pos.stopAlgoOrderId!, "9001", -0.9, 0.03, 61800, fullQty);
+    await executor.tick();
+
+    const closed = store.getState().positions[0]!;
+    expect(closed.status).toBe("CLOSED");
+    expect(closed.feeEstimateUsd).toBeCloseTo(0.03, 9);
+    expect(closed.grossPnlUsd).toBeCloseTo(-0.9, 9);
+    expect(closed.entryCommissionUsd).toBeCloseTo(0.02, 9);
+    // Also proves the foreign row never polluted the qty-weighted exit price.
+    expect(closed.exitPrice).toBeCloseTo(61800, 9);
+  });
+
+  it("[FEE-WINDOW] a throwing getUserTrades still closes the position and never fabricates an entry commission", async () => {
+    const client = new FakeClient();
+    client.honourStartTime = true;
+    const { executor, store, pos } = await openWithStop(client);
+    client.seedTrade(pos.entryOrderId, { qty: pos.qty, commission: 0.02, time: NOW_MS - 5_000 });
+    // Everything the fee-window fix added (the widened window, the fold predicate, the entry-leg
+    // read) lives inside sumOwnRealizedTrades' existing try/catch. Blow the fetch up and the close
+    // must still complete off the modelled fallback, exactly as before.
+    client.getUserTrades = async () => { throw new Error("userTrades 5xx"); };
+    client.markPriceBySymbol.set("BTCUSDT", 59_000); // 0.5R in favour -> the fixed-reward TP fires
+    await executor.tick();
+
+    const closed = store.getState().positions[0]!;
+    expect(closed.status).toBe("CLOSED");
+    expect(closed.netPnlUsd).not.toBeNull();
+    expect(closed.feeSource).toBe("ESTIMATE_TAKER_FLAT");
+    // UNKNOWN stays UNKNOWN — never back-filled from the flat model, which would look measured.
+    expect(closed.entryCommissionUsd).toBeUndefined();
+    expect(closed.entryLegFoldedIntoPnl).toBeUndefined();
+  });
+
+  it("[FEE-WINDOW] a position persisted WITHOUT entryTradeWindowFromMs falls back to openedAt and still settles", async () => {
+    const client = new FakeClient();
+    client.honourStartTime = true;
+    const { executor, store, pos } = await openWithStop(client);
+    const fullQty = pos.qty;
+    // Simulate a record written before this field existed.
+    delete (store.getState().positions[0] as { entryTradeWindowFromMs?: number }).entryTradeWindowFromMs;
+    store.save();
+
+    client.seedTrade(pos.entryOrderId, { qty: fullQty, commission: 0.02, time: NOW_MS - 5_000 });
+    client.triggerAlgo(pos.stopAlgoOrderId!, "9001", -0.9, 0.03, 61800, fullQty);
+    await executor.tick();
+
+    const closed = store.getState().positions[0]!;
+    expect(closed.status).toBe("CLOSED");
+    // Exactly the OLD window — never a fabricated retro-fit onto a record that never measured it.
+    expect(client.lastUserTradesStartTime).toBe(NOW_MS);
+    // ...and therefore exactly the OLD (mis-recording) outcome: the entry row was filtered out.
+    expect(closed.entryCommissionUsd).toBeUndefined();
+    expect(closed.feeEstimateUsd).toBeCloseTo(0.03, 9);
   });
 });

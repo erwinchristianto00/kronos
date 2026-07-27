@@ -93,11 +93,14 @@ import {
   PAPER_EXECUTION_MODEL_REALISTIC,
   type PaperExecutionModel,
   type PaperPerformanceReport,
+  paperManualRealizeCostR,
+  PAPER_COST_MODEL_VERSION,
   type PaperProvenanceAudit,
   type ShadowLoserFingerprintGateReport,
   type PaperKlineTuple,
   type PaperLatencyDiagnostics,
 } from "../lib/paper-execution-router.js";
+import { subFloorExclusionEnabledForDecisions } from "../lib/paper-subfloor-exclusion.js";
 import {
   buildMixedRegimeReport,
   buildOpenOrderStaleAudit,
@@ -184,7 +187,7 @@ import {
   buildSnapshotFromReport,
 } from "../lib/regime-direction-controller-snapshot.js";
 import { buildNeuralMapTelemetry, buildPaperUnrealizedSnapshot } from "../lib/neural-map-telemetry.js";
-import { buildPerSymbolLaneBookEdge, type PsleOrder } from "../lib/per-symbol-lane-book-edge.js";
+import { buildPerSymbolLaneBookEdge, toPsleOrder, type PsleOrder } from "../lib/per-symbol-lane-book-edge.js";
 import { getLaneSymbolCurationCacheStore } from "../lib/lane-symbol-curation-cache.js";
 import {
   runIntradayMomentumCycleGuarded,
@@ -472,7 +475,12 @@ export async function registerShadowRoutes(
         adaptiveDirectionBias: null,
         primaryValidationLane: null,
       });
-      const notificationPaperReport = buildPaperPerformanceReport(getPaperExecutionRouterStore());
+      // T1-b: same population as the brief's `paperReport` (which is built under the decision gate),
+      // otherwise the Telegram paperPnl/headlineBalance would differ depending on which of the two
+      // snapshot paths produced it, with no flag flip and nothing in the message saying why.
+      const notificationPaperReport = buildPaperPerformanceReport(getPaperExecutionRouterStore(), {
+        applySubFloorExclusion: subFloorExclusionEnabledForDecisions(),
+      });
       const notificationValidation = buildMixedBudgetForwardValidation(
         getPaperExecutionRouterStore().getState().orders,
       );
@@ -1542,15 +1550,10 @@ export async function registerShadowRoutes(
           typeof o.selectedLaneId === "string" &&
           typeof o.symbol === "string",
       )
-      .map((o) => ({
-        symbol: o.symbol,
-        selectedLaneId: o.selectedLaneId as string,
-        direction: o.direction ?? null,
-        paperStatus: o.paperStatus,
-        netR: o.netR,
-        paperOrderMode: o.paperOrderMode ?? null,
-        diagnosticLabel: o.diagnosticLabel ?? null,
-      }));
+      // Shared projection — see toPsleOrder. It carries sourceType + plannedStopDistanceBps, without
+      // which a peer's sub-admission-floor rows are invisible to the exclusion predicate while the
+      // local ones are not, leaving every pooled cell half-cleaned.
+      .map((o) => toPsleOrder({ ...o, selectedLaneId: o.selectedLaneId as string }));
     return { generatedAt: new Date().toISOString(), orders: headlineClosed };
   });
 
@@ -1849,7 +1852,16 @@ export async function registerShadowRoutes(
     });
     const paperStore = getPaperExecutionRouterStore();
     const orders = paperStore.getState().orders;
-    const paper = buildPaperPerformanceReport(paperStore);
+    // T1-b (review fix 2026-07-27): the neural map renders THIS report's global tiles
+    // (paper.total/open/closed/wins/losses/headlinePnl) directly above per-lane rows built by
+    // `laneEconomics(input.orders, …)` and `buildPerSymbolLaneBookEdge(input.orders)`, both of which
+    // are gated by PAPER_EXCLUDE_SUBFLOOR_ROWS_DECISIONS. Building this one ungated put the header
+    // and the rows on DIFFERENT populations, so the lane counts could not be summed to the header
+    // and the resolver-stall detector compared a filtered numerator to an unfiltered denominator.
+    // Same flag ⇒ one population.
+    const paper = buildPaperPerformanceReport(paperStore, {
+      applySubFloorExclusion: subFloorExclusionEnabledForDecisions(),
+    });
     const paperUnrealized = await buildPaperUnrealizedSnapshot(orders, opts.binanceClient, generatedAt);
     const variantMatrix = buildCurrentGuardVariantMatrixReport(
       getCurrentGuardVariantMatrixStore(),
@@ -1997,7 +2009,10 @@ export async function registerShadowRoutes(
         continue;
       }
       const grossR = order.direction === "SHORT" ? (entry - mark) / risk : (mark - entry) / risk;
-      const costR = order.plannedStopDistanceBps > 0 ? -(22 / order.plannedStopDistanceBps) : 0;
+      // Was a hardcoded flat `-(22 / stopBps)` with no cohort stamp, writing into the same store
+      // the resolver versions — maker lanes overcharged 3.67x and the rows untagged. Now shares the
+      // resolver's cost model and gate.
+      const costR = paperManualRealizeCostR(order);
       const netR = grossR + costR;
       const netPnlAmount = netR * order.plannedRiskAmount;
       if (mode === "PROFITABLE_DIAGNOSTIC" && netPnlAmount <= 0) {
@@ -2008,6 +2023,7 @@ export async function registerShadowRoutes(
         paperStatus: netR > 0 ? "PAPER_CLOSED_WIN" : "PAPER_CLOSED_LOSS",
         grossR,
         costR,
+        costModelVersion: PAPER_COST_MODEL_VERSION,
         netR,
         netPnlAmount,
         closeReason: mode === "PROFITABLE_DIAGNOSTIC"
@@ -2758,12 +2774,21 @@ export async function registerShadowRoutes(
               regimeFamily: _paperRouter.regimeFamily,
               paperValidationAllowed,
             });
+            // T1-b: THIS pair of builds is a DECISION path, not display — `_perf.activeLane*` and
+            // `_breakdown.bySymbol/worstSymbols/topLossContributors` below become AllocatorLaneState
+            // and the SYMBOL_NET_NEGATIVE override, both of which change admission. So both are
+            // built under the decision gate (DEFAULT OFF ⇒ byte-identical to pre-T1-b), unlike the
+            // display builds at ~:1854 / ~:3039 which always exclude and surface the summary.
+            const _subFloorExclusionForDecisions = subFloorExclusionEnabledForDecisions();
             const _perf = buildPaperPerformanceReport(paperStore, {
               activeLaneId: paperStore.getState().activeLaneId,
               laneConfidence: _rotation.currentLaneConfidence,
               rotationResult: _rotation,
+              applySubFloorExclusion: _subFloorExclusionForDecisions,
             });
-            const _breakdown = buildPaperPerformanceBreakdown(paperStore);
+            const _breakdown = buildPaperPerformanceBreakdown(paperStore, {
+              applySubFloorExclusion: _subFloorExclusionForDecisions,
+            });
             // Symbols with positive HEADLINE paper cohort evidence (≥3 closed, net>0)
             // override the SYMBOL_NET_NEGATIVE candidate gate for those symbols only.
             const _symbolsWithPositiveCohort = _breakdown.bySymbol
@@ -3030,6 +3055,12 @@ export async function registerShadowRoutes(
           // this, top-level closed=N+1 disagrees with activeLanePerf/provenanceAudit
           // closed=N. Pure reads; never authorize live trading or write positions.
           try {
+            // T1-b (review fix 2026-07-27): this build was previously UNGATED, so it always
+            // excluded — and then overwrote the four allocator fields (activeLaneClosed/NetAvgR/
+            // PF/WR) and recomputed paperLaneConfidence, i.e. it reported a lane verdict the
+            // allocator never made. `_perf` at ~:2774 is gated; this snapshot MUST use the same
+            // gate or the Section-10 reconciliation invariant this block exists to preserve is
+            // broken in the opposite direction. Flag OFF (default) ⇒ byte-identical to pre-T1-b.
             const _final = buildPaperPerformanceReport(paperStore, {
               activeLaneId: paperStore.getState().activeLaneId,
               laneConfidence:
@@ -3037,6 +3068,7 @@ export async function registerShadowRoutes(
                 paperStore.getState().laneConfidence ??
                 "MEDIUM",
               executionModel: _paperExecModel,
+              applySubFloorExclusion: subFloorExclusionEnabledForDecisions(),
             });
             if (allocatorReport) {
               _final.paperLaneConfidence =
@@ -3124,6 +3156,11 @@ export async function registerShadowRoutes(
                   )
                   .map((o) => (new Date(o.updatedAt).getTime() - new Date(o.openedAt).getTime()) / 1000)
                   .filter((v) => Number.isFinite(v) && v >= 0),
+                // Block C label-leak cohort (createdAt vs openedAt). REPORT-ONLY: the builder
+                // only measures the leak — it never re-anchors resolution or touches netR.
+                // Passing ALL orders is safe (the builder re-filters to WIN/LOSS); passing
+                // nothing would report sampleSource=NONE, i.e. UNMEASURED, not "clean".
+                closedOrders: paperStore.getState().orders,
                 // Block A admission metrics only render for admissions created THIS cycle.
                 createdThisCycle:
                   (allocatorReport?.createdHeadline ?? 0) + (allocatorReport?.createdDiagnostic ?? 0),
@@ -3223,7 +3260,10 @@ export async function registerShadowRoutes(
       if (opts.notificationService) {
         try {
           const notificationPaperReport =
-            paperReport ?? buildPaperPerformanceReport(getPaperExecutionRouterStore());
+            paperReport ??
+            buildPaperPerformanceReport(getPaperExecutionRouterStore(), {
+              applySubFloorExclusion: subFloorExclusionEnabledForDecisions(),
+            });
           const notificationValidation =
             mixedBudgetForwardValidation ??
             buildMixedBudgetForwardValidation(getPaperExecutionRouterStore().getState().orders);

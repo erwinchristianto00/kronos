@@ -172,6 +172,7 @@ import { getLiveMarkPriceCacheStore, refreshLiveMarkPriceCache } from "./lib/liv
 import { CORTEX_LANE_ROSTER, gatherCortexContext, normalizeCortexStaticWeightPctForLane } from "./lib/cortex-live-gather.js";
 import { buildLiveCortexGatherDeps } from "./lib/cortex-live-gather-bindings.js";
 import { getCortexRealAttributionStore } from "./lib/cortex-real-attribution.js";
+import { getExecutionFillRecorder } from "./lib/execution-fill-recorder.js";
 import { getPositionPathRecorder } from "./lib/position-path-recorder.js";
 import { getDirectionEntryOutcomeStore, buildDirectionEntryOutcomeReport, type DirectionEntryOutcomeReport } from "./lib/direction-entry-outcome-store.js";
 import {
@@ -735,6 +736,13 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       // and hands CLOSED paths to the Exit Brain shadow scorer's reader (routes/shadow.ts). The
       // SingleSymbolLaneExecutor instances below record into this SAME singleton.
       positionPathRecorder: getPositionPathRecorder(),
+      // Per-fill execution recorder (2026-07-27, report-only, fail-safe — see
+      // execution-fill-recorder.ts). This is the HIGHEST-VALUE writer of the three: the engine
+      // settles ~182 of the store's closed intents through realizedFromTrades, which already
+      // fetches every fill's price/qty/commission/time and keeps only two summed scalars — there is
+      // currently not one exit fill price persisted anywhere. No new exchange call: the rows are
+      // the ones settlement already matched. Same singleton as the executors below.
+      executionFillRecorder: getExecutionFillRecorder(),
       // Crowding-exit SHADOW measurement only (getStatus().crowdingExitShadow) — read-only market
       // data, never touches order placement. Reuses the same market-data client scan.ts uses.
       marketDataClient: binanceClient,
@@ -1305,6 +1313,11 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         // .cortexRealAttribution doc comments) — same pattern as every other lane below.
         rawLaneWeightPct: () => engineForGate?.rawLaneAllocationWeightPctForLane(CROSS_SECTIONAL_MARKET_NEUTRAL_LANE_ID) ?? 100,
         cortexRealAttribution: getCortexRealAttributionStore(),
+        // Per-fill execution recorder (2026-07-27, report-only — see execution-fill-recorder.ts).
+        // closeBasket() already fetches one getUserTrades page per unique symbol to sum the real
+        // commissions and discards every other field of every matched row; this persists them.
+        // No new exchange call. Same singleton as the engine and the single-symbol lanes.
+        executionFillRecorder: getExecutionFillRecorder(),
         entryHealthGate: () => {
           const report = buildCrossSectionalReport(getCrossSectionalStore(), Date.now(), { variant: "FILTERED" });
           return rollingNetEntryHealth(report.recentNetReturns);
@@ -1372,6 +1385,8 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         // 2026-07-22 bug-hunt fix: see the FILTERED instance above.
         rawLaneWeightPct: () => engineForGate?.rawLaneAllocationWeightPctForLane(CROSS_SECTIONAL_TREND_LANE_ID) ?? 100,
         cortexRealAttribution: getCortexRealAttributionStore(),
+        // Per-fill execution recorder — see the FILTERED instance above.
+        executionFillRecorder: getExecutionFillRecorder(),
         siblingOpenLegs: () => [
           ...(crossSectionalExecutor?.getOpenUnexitedLegs() ?? []),
           ...(crossSectionalMixedExecutor?.getOpenUnexitedLegs() ?? []),
@@ -1401,6 +1416,8 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         // 2026-07-22 bug-hunt fix: see the FILTERED instance above.
         rawLaneWeightPct: () => engineForGate?.rawLaneAllocationWeightPctForLane(CROSS_SECTIONAL_MIXED_LANE_ID) ?? 100,
         cortexRealAttribution: getCortexRealAttributionStore(),
+        // Per-fill execution recorder — see the FILTERED instance above.
+        executionFillRecorder: getExecutionFillRecorder(),
         siblingOpenLegs: () => [
           ...(crossSectionalExecutor?.getOpenUnexitedLegs() ?? []),
           ...(crossSectionalTrendExecutor?.getOpenUnexitedLegs() ?? []),
@@ -1457,6 +1474,10 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         // Dense per-tick R-path recorder (2026-07-22, report-only) — same shared singleton as the
         // engine's own wiring above; same line on every SingleSymbolLaneExecutor below.
         positionPathRecorder: getPositionPathRecorder(),
+        // Per-fill execution recorder (2026-07-27, report-only — see execution-fill-recorder.ts).
+        // Reuses the getUserTrades pages this executor already fetches at settlement; no new
+        // exchange call, no order-path work. Same process-wide singleton for every writer.
+        executionFillRecorder: getExecutionFillRecorder(),
         legUsd: SF_EXEC_LEG_USD,
         leverage: SF_EXEC_LEVERAGE,
         maxOpenPositions: SF_EXEC_MAX_CONCURRENT,
@@ -1516,6 +1537,10 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         rawLaneWeightPct: () => engineForGate?.rawLaneAllocationWeightPctForLane(IM_PAPER_LANE_ID) ?? 100,
         cortexRealAttribution: getCortexRealAttributionStore(),
         positionPathRecorder: getPositionPathRecorder(),
+        // Per-fill execution recorder (2026-07-27, report-only — see execution-fill-recorder.ts).
+        // Reuses the getUserTrades pages this executor already fetches at settlement; no new
+        // exchange call, no order-path work. Same process-wide singleton for every writer.
+        executionFillRecorder: getExecutionFillRecorder(),
         legUsd: IM_EXEC_LEG_USD,
         leverage: IM_EXEC_LEVERAGE,
         maxOpenPositions: IM_EXEC_MAX_CONCURRENT,
@@ -1581,6 +1606,10 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         rawLaneWeightPct: () => engineForGate?.rawLaneAllocationWeightPctForLane(RC_PAPER_LANE_ID) ?? 100,
         cortexRealAttribution: getCortexRealAttributionStore(),
         positionPathRecorder: getPositionPathRecorder(),
+        // Per-fill execution recorder (2026-07-27, report-only — see execution-fill-recorder.ts).
+        // Reuses the getUserTrades pages this executor already fetches at settlement; no new
+        // exchange call, no order-path work. Same process-wide singleton for every writer.
+        executionFillRecorder: getExecutionFillRecorder(),
         legUsd: RC_EXEC_LEG_USD,
         leverage: RC_EXEC_LEVERAGE,
         maxOpenPositions: RC_EXEC_MAX_CONCURRENT,
@@ -1630,6 +1659,10 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         rawLaneWeightPct: () => engineForGate?.rawLaneAllocationWeightPctForLane(RCS_PAPER_LANE_ID) ?? 100,
         cortexRealAttribution: getCortexRealAttributionStore(),
         positionPathRecorder: getPositionPathRecorder(),
+        // Per-fill execution recorder (2026-07-27, report-only — see execution-fill-recorder.ts).
+        // Reuses the getUserTrades pages this executor already fetches at settlement; no new
+        // exchange call, no order-path work. Same process-wide singleton for every writer.
+        executionFillRecorder: getExecutionFillRecorder(),
         legUsd: RCS_EXEC_LEG_USD,
         leverage: RCS_EXEC_LEVERAGE,
         maxOpenPositions: RCS_EXEC_MAX_CONCURRENT,
@@ -1684,6 +1717,10 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         rawLaneWeightPct: () => engineForGate?.rawLaneAllocationWeightPctForLane(PWR_PAPER_LANE_ID) ?? 100,
         cortexRealAttribution: getCortexRealAttributionStore(),
         positionPathRecorder: getPositionPathRecorder(),
+        // Per-fill execution recorder (2026-07-27, report-only — see execution-fill-recorder.ts).
+        // Reuses the getUserTrades pages this executor already fetches at settlement; no new
+        // exchange call, no order-path work. Same process-wide singleton for every writer.
+        executionFillRecorder: getExecutionFillRecorder(),
         legUsd: PWR_EXEC_LEG_USD,
         leverage: PWR_EXEC_LEVERAGE,
         maxOpenPositions: PWR_EXEC_MAX_CONCURRENT,
@@ -1761,6 +1798,10 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           rawLaneWeightPct: () => engineForGate?.rawLaneAllocationWeightPctForLane(laneId) ?? 100,
           cortexRealAttribution: getCortexRealAttributionStore(),
           positionPathRecorder: getPositionPathRecorder(),
+          // Per-fill execution recorder (2026-07-27, report-only — see execution-fill-recorder.ts).
+          // Reuses the getUserTrades pages this executor already fetches at settlement; no new
+          // exchange call, no order-path work. Same process-wide singleton for every writer.
+          executionFillRecorder: getExecutionFillRecorder(),
           legUsd: () => ceExecLegUsdForBucket(bucket),
           leverage: CE_EXEC_LEVERAGE,
           maxOpenPositions: CE_EXEC_MAX_CONCURRENT,

@@ -32,6 +32,7 @@ import {
   getLatestCortexShadowDecisionAlpha,
   CORTEX_LANE_ROSTER,
 } from "./cortex-refit-runner-bindings.js";
+import { cortexEffectiveRosterSize, cortexRetiredLaneIds } from "./cortex-live-gather.js";
 import {
   computeCortexReadiness,
   getCortexReadinessHistoryStore,
@@ -150,7 +151,8 @@ export function buildLocalCortexReadiness(deps: {
     collection,
     decisionAlpha,
     history: historyStore.all(),
-    rosterSize: CORTEX_LANE_ROSTER.length,
+    rosterSize: cortexEffectiveRosterSize(),
+    retiredLaneCount: cortexRetiredLaneIds().size,
     nowMs,
   });
 

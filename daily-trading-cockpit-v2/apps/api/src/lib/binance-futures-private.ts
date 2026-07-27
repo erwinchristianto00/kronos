@@ -212,12 +212,44 @@ export interface FuturesUserTrade {
   symbol: string;
   /** String, not number — see FuturesOrder.orderId's doc comment. */
   orderId: string;
+  /**
+   * Binance's own per-FILL trade id (`id` on /fapi/v1/userTrades), as a STRING for the same reason
+   * orderId is one. RECORDING ONLY — nothing in this codebase queries, cancels, or matches an order
+   * by it; it exists so execution-fill-recorder.ts can dedup a re-observed fill on the exchange's
+   * OWN key instead of a (orderId, time, price, qty, commission) tuple heuristic.
+   *
+   * PRECISION CAVEAT, identical in kind and consequence to FuturesIncomeEntry.tranId's: `id` is NOT
+   * run through preserveOrderIdPrecision (that guard is deliberately scoped to the 3 fields used to
+   * ACT on an order — orderId/algoId/actualOrderId — precisely so it can never stringify an
+   * unrelated numeric field, and `"id":` is far too generic a key to add to it safely). A value
+   * beyond 2^53 would therefore already have been rounded by JSON.parse before this mapper sees it.
+   * That is acceptable HERE and only here: a rounded trade id degrades dedup back to the tuple
+   * fallback, whereas a rounded orderId caused the real -2013 incident.
+   *
+   * OPTIONAL, and `""`/absent means the exchange did not report one — never fabricated.
+   */
+  tradeId?: string;
   price: number;
   qty: number;
   realizedPnl: number;
   commission: number;
   commissionAsset: string;
   time: number;
+  /**
+   * Binance's own liquidity flag for this fill (`maker` on /fapi/v1/userTrades): true = we provided
+   * liquidity, false = we crossed the spread (taker). RECORDING ONLY — nothing in this codebase
+   * branches on it, and nothing should: it exists so the "the live path is 100% taker" assumption
+   * (only MARKET and STOP_MARKET are ever placed by single-symbol-lane-executor.ts and
+   * cross-sectional-executor.ts, so the real cost is 5.0 bps/side taker commission) is VERIFIED per
+   * fill instead of assumed.
+   *
+   * OPTIONAL, and `undefined` means UNKNOWN — the exchange did not report a boolean for this row.
+   * It is deliberately NOT defaulted to `false`: `false` is exactly the value we expect, so
+   * defaulting would make "the field was missing" indistinguishable from "the exchange confirmed
+   * taker", destroying the only thing this field is for. Consumers must treat `undefined` as
+   * unmeasured and exclude it from any maker/taker ratio, never fold it into the taker bucket.
+   */
+  maker?: boolean;
 }
 
 /**
@@ -228,10 +260,19 @@ export interface FuturesUserTrade {
  * type we haven't seen yet still comes through instead of being dropped or throwing.
  *
  * tranId is NOT run through preserveOrderIdPrecision (that guard is intentionally scoped to the 3
- * fields actually used to act on an order/algo — orderId/algoId/actualOrderId). tranId is a
- * diagnostic transaction id only: this client never uses it to query, cancel, or match an order,
- * and the reconciliation math below never keys on it either, so a hypothetical precision loss here
- * has no safety consequence (unlike the real orderId incident that guard exists for).
+ * fields actually used to act on an order/algo — orderId/algoId/actualOrderId). This client never
+ * uses tranId to query, cancel, or match an order, and the reconciliation math never keys on it, so
+ * a precision loss here has no SAFETY consequence (unlike the real orderId incident that guard
+ * exists for).
+ *
+ * IT IS NO LONGER PURELY DIAGNOSTIC, THOUGH (2026-07-27). funding-fee-recorder.ts uses tranId as its
+ * exact-once dedup key, so a value above 2^53 — already rounded by JSON.parse before this mapper's
+ * toStrId ever sees it — could in principle collide with a neighbouring tranId and cause that store
+ * to silently DROP a funding row (an under-count, never a double-count: the rounding is
+ * deterministic, so re-fetches stay stable). Observed Binance income tranIds are ~10-13 digits, two
+ * to three orders of magnitude below the danger zone, so the regex is deliberately NOT widened —
+ * adding keys to a body-text regex that runs over every signed private response is the larger risk.
+ * Recorded here so the next person does not read "diagnostic only" and assume no consumer exists.
  */
 export interface FuturesIncomeEntry {
   symbol: string;
@@ -792,15 +833,28 @@ export class BinanceFuturesPrivateClient {
       limit: opts.limit ?? 100,
     });
     if (!Array.isArray(parsed)) return [];
-    return parsed.map((t) => ({
+    // The `maker: boolean | undefined` / `tradeId: string` intersection is a deliberate
+    // compile-time guard, not noise: both fields are OPTIONAL for consumers (so the many existing
+    // hand-built test fakes stay valid), but requiring the KEYS here means deleting either line
+    // below is a tsc error under `npx tsc --noEmit -p apps/api`. Without it, a future edit could
+    // silently drop the field again exactly as the original mapper did, and nothing would complain
+    // (this file's own tsconfig only includes src/**, so nothing in test/ can act as that guard).
+    return parsed.map((t): FuturesUserTrade & { maker: boolean | undefined; tradeId: string } => ({
       symbol: String((t as { symbol?: unknown }).symbol ?? ""),
       orderId: toStrId((t as { orderId?: unknown }).orderId),
+      // Binance calls the per-fill id `id` (orderId is the parent ORDER). Stringified via the same
+      // helper as orderId so the persisted type is stable; see FuturesUserTrade.tradeId for why it
+      // deliberately does NOT go through preserveOrderIdPrecision.
+      tradeId: toStrId((t as { id?: unknown }).id),
       price: toNum((t as { price?: unknown }).price),
       qty: toNum((t as { qty?: unknown }).qty),
       realizedPnl: toNum((t as { realizedPnl?: unknown }).realizedPnl),
       commission: toNum((t as { commission?: unknown }).commission),
       commissionAsset: String((t as { commissionAsset?: unknown }).commissionAsset ?? ""),
       time: toNum((t as { time?: unknown }).time),
+      // NOT `Boolean(t.maker)` — see the field's doc comment: coercing an absent/garbage value to
+      // `false` would fabricate the exact "we were taker" confirmation this field exists to supply.
+      maker: typeof (t as { maker?: unknown }).maker === "boolean" ? ((t as { maker: boolean }).maker) : undefined,
     }));
   }
 

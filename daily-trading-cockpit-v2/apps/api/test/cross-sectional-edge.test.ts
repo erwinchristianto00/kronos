@@ -19,9 +19,13 @@ import {
   CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST,
   CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST,
   CROSS_SECTIONAL_TREND_LONG_ALLOWLIST,
+  CROSS_SECTIONAL_TREND_LONG_BLOCKLIST,
   CROSS_SECTIONAL_TREND_SHORT_ALLOWLIST,
+  CROSS_SECTIONAL_TREND_SHORT_BLOCKLIST,
+  CROSS_SECTIONAL_UNIVERSE,
   CROSS_SECTIONAL_MIXED_MIN_SCORE_GAP,
   crossSectionalMixedLongAllowlist,
+  crossSectionalMixedShortBlocklist,
   isCrossSectionalMixedWideLongPoolEnabled,
   getCrossSectionalAdaptiveConfig,
   regimeSkewedK,
@@ -406,16 +410,153 @@ describe("[MIXED-POOL] CROSS_SECTIONAL_MIXED_WIDE_LONG_POOL — widening the dea
     for (const s of WIDENING_ADDS) expect(b.longLeg.map((l) => l.symbol)).not.toContain(s);
   });
 
-  it("[SHORT-LEG] widening the LONG pool leaves the short leg and the capital split untouched", () => {
+  it("[RISK-PARAMS] the flag moves pools only — capital split, TP and SL are identical", () => {
     const narrow = withMixedWideLongPool(undefined, () => buildMixedCrossSectionalBasket(bothFormScores, { ...BASKET_BASE }))!;
     const wide = withMixedWideLongPool("1", () => buildMixedCrossSectionalBasket(bothFormScores, { ...BASKET_BASE }))!;
     expect(wide.longLeg.map((l) => l.symbol)).toEqual(["ADAUSDT", "BNBUSDT", "SUIUSDT"]); // long side did change
-    expect(wide.shortLeg.map((l) => l.symbol)).toEqual(narrow.shortLeg.map((l) => l.symbol)); // short side did not
-    expect(wide.shortLeg.map((l) => l.weight)).toEqual(narrow.shortLeg.map((l) => l.weight));
     expect(wide.shortCapitalWeight).toBe(narrow.shortCapitalWeight);
     expect(wide.longCapitalWeight).toBe(narrow.longCapitalWeight);
     expect(wide.takeProfitReturn).toBe(narrow.takeProfitReturn);
     expect(wide.stopLossReturn).toBe(narrow.stopLossReturn);
+    expect(wide.riskDistanceAtOpen).toBe(narrow.riskDistanceAtOpen);
+    expect(wide.weightingModel).toBe(narrow.weightingModel);
+  });
+
+  // ── The short side. This is the half an earlier revision described as "untouched"; it is not. ──
+  //
+  // buildCrossSectionalBasket gives a both-sides-eligible symbol to whichever side selects first
+  // (long, in MIXED's unskewed 3/3 case). OPUSDT and 1000PEPEUSDT are on BOTH TREND allowlists, so
+  // widening the long pool alone makes the long leg stop claiming them on many bars and they fall
+  // THROUGH into the short leg — an unconfigured, rank-dependent short-side change. The shipped
+  // design blocks the widened long pool's symbols from MIXED's short side instead, which is a
+  // SMALLER-pool short-side change (6 candidates → 4) and a LARGER short-leg delta, but a fully
+  // enumerable one, after which the long side cannot influence the short leg at all.
+  it("[SHORT-POOL] the fixture is only meaningful while OPUSDT/1000PEPEUSDT are on BOTH TREND lists", () => {
+    const overlap = [...CROSS_SECTIONAL_TREND_LONG_ALLOWLIST].filter((s) => CROSS_SECTIONAL_TREND_SHORT_ALLOWLIST.has(s));
+    expect(overlap.sort()).toEqual(["1000PEPEUSDT", "OPUSDT"]);
+  });
+
+  it("[SHORT-POOL] flag off = today's short blocklist byte for byte; flag on adds the long-eligible pool", () => {
+    const off = withMixedWideLongPool(undefined, () => crossSectionalMixedShortBlocklist());
+    expect(off).toBe(CROSS_SECTIONAL_TREND_SHORT_BLOCKLIST); // same object — nothing derived, nothing added
+    const on = withMixedWideLongPool("1", () => crossSectionalMixedShortBlocklist());
+    for (const s of CROSS_SECTIONAL_TREND_SHORT_BLOCKLIST) expect(on.has(s)).toBe(true);
+    // Everything the widened long pool can select is blocked from the short side...
+    for (const s of CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST) {
+      if (!CROSS_SECTIONAL_TREND_LONG_BLOCKLIST.has(s)) expect(on.has(s)).toBe(true);
+    }
+    // ...and the OPERATIONALLY VISIBLE effect is exactly the two overlap symbols: MIXED's short
+    // candidate pool goes 6 → 4. This is the number that must appear in any operator description.
+    const shortCandidates = (bl: ReadonlySet<string>) => [...CROSS_SECTIONAL_TREND_SHORT_ALLOWLIST].filter((s) => !bl.has(s)).sort();
+    expect(shortCandidates(off)).toEqual(["1000PEPEUSDT", "APTUSDT", "DOGEUSDT", "OPUSDT", "SEIUSDT", "WLDUSDT"]);
+    expect(shortCandidates(on)).toEqual(["APTUSDT", "DOGEUSDT", "SEIUSDT", "WLDUSDT"]);
+  });
+
+  it("[SHORT-POOL] a long BLOCKLISTed symbol is not needlessly taken off the short side", () => {
+    // ARBUSDT is on CROSS_SECTIONAL_TREND_LONG_BLOCKLIST, so it can never reach the long leg and
+    // therefore never needs removing from the short side. Keeps the narrowing minimal.
+    expect(CROSS_SECTIONAL_TREND_LONG_BLOCKLIST.has("ARBUSDT")).toBe(true);
+    const on = withMixedWideLongPool("1", () =>
+      crossSectionalMixedShortBlocklist({ longAllowlist: new Set(["ARBUSDT", "SOLUSDT"]) }),
+    );
+    expect(on.has("SOLUSDT")).toBe(true);
+    expect(on.has("ARBUSDT")).toBe(false);
+  });
+
+  // The scores that expose the drift: OPUSDT is the STRONGEST of TREND's 4-symbol long pool, so
+  // mean-reversion's "long the 3 weakest" drops it — and today it lands on the short leg.
+  const driftScores = scored([
+    ["SOLUSDT", -0.30, 100], ["ETHUSDT", -0.28, 100], ["1000PEPEUSDT", -0.26, 100], ["OPUSDT", 0.40, 100],
+    ["ADAUSDT", -0.50, 100], ["BNBUSDT", -0.48, 100], ["SUIUSDT", -0.46, 100],
+    ["WLDUSDT", 0.30, 100], ["SEIUSDT", 0.28, 100], ["DOGEUSDT", 0.26, 100], ["APTUSDT", 0.24, 100],
+  ]);
+
+  it("[DRIFT] long widening ALONE pushes OPUSDT across to the short leg — the defect, pinned", () => {
+    const off = withMixedWideLongPool(undefined, () => buildMixedCrossSectionalBasket(driftScores, { ...BASKET_BASE }))!;
+    expect(off.shortLeg.map((l) => l.symbol)).toEqual(["OPUSDT", "WLDUSDT", "SEIUSDT"]);
+    // Reproduce the reviewed draft by pinning the short blocklist back to today's.
+    const draft = withMixedWideLongPool("1", () =>
+      buildMixedCrossSectionalBasket(driftScores, { ...BASKET_BASE, shortBlocklist: CROSS_SECTIONAL_TREND_SHORT_BLOCKLIST }),
+    )!;
+    expect(draft.shortLeg.map((l) => l.symbol)).toEqual(["OPUSDT", "WLDUSDT", "SEIUSDT"]);
+    // OPUSDT survives on the short leg here only because the long side never wanted it; flip its
+    // rank inside the WIDENED long pool and the short leg changes without any short config change.
+    const flipped = driftScores.map((s) => (s.symbol === "OPUSDT" ? { ...s, score: -0.60 } : s));
+    const draftFlipped = withMixedWideLongPool("1", () =>
+      buildMixedCrossSectionalBasket(flipped, { ...BASKET_BASE, shortBlocklist: CROSS_SECTIONAL_TREND_SHORT_BLOCKLIST }),
+    )!;
+    expect(draftFlipped.longLeg.map((l) => l.symbol)).toContain("OPUSDT");
+    expect(draftFlipped.shortLeg.map((l) => l.symbol)).not.toContain("OPUSDT"); // long-side rank moved the short leg
+  });
+
+  it("[SHORT-DETERMINISM] under the flag, long-side RANKING can no longer move the short leg", () => {
+    // The property this design actually buys, stated precisely. Corrected 2026-07-26: an earlier
+    // version of this test swept four different long ALLOWLISTS and demanded one identical short
+    // leg. That expectation is impossible by construction and the test failed: the short blocklist
+    // is DERIVED from the long allowlist to keep the pools disjoint, so a wider long allowlist
+    // necessarily blocks more short candidates (TREND ⇒ 9 blocked, FILTERED ⇒ 12, whole universe
+    // ⇒ 24, which swallows WLD/SEI/DOGE and forms no basket at all). Changing the long ALLOWLIST is
+    // an operator CONFIG change that legitimately moves both pools, and it is visible in the env.
+    // What must never happen again is the EMERGENT drift: the short leg moving because of where the
+    // long side's SCORES happened to rank, with no config change at all. So: hold the long pool
+    // fixed, vary only the long-side symbols' scores, and require the short leg to sit still.
+    const longSide = ["SOLUSDT", "ETHUSDT", "1000PEPEUSDT", "OPUSDT", "ADAUSDT", "BNBUSDT", "SUIUSDT"];
+    const rank = (seed: number): ScoredSymbol[] => {
+      let s = seed >>> 0;
+      const next = () => ((s = (s * 1664525 + 1013904223) >>> 0) / 4294967296) - 0.5;
+      const overrides = new Map(longSide.map((sym) => [sym, next()]));
+      return driftScores.map((r) => ({ ...r, score: overrides.get(r.symbol) ?? r.score }));
+    };
+    const legsOn = new Set<string>();
+    const legsOff = new Set<string>();
+    for (let seed = 1; seed <= 200; seed += 1) {
+      legsOn.add(
+        withMixedWideLongPool("1", () => {
+          const b = buildMixedCrossSectionalBasket(rank(seed), { ...BASKET_BASE });
+          return b === null ? "NO_BASKET" : b.shortLeg.map((l) => l.symbol).join(",");
+        }),
+      );
+      legsOff.add(
+        withMixedWideLongPool(undefined, () => {
+          const b = buildMixedCrossSectionalBasket(rank(seed), { ...BASKET_BASE });
+          return b === null ? "NO_BASKET" : b.shortLeg.map((l) => l.symbol).join(",");
+        }),
+      );
+    }
+    // Flag ON: the short pool is disjoint from the long pool, so no long-side ranking can reach it.
+    expect(legsOn.size).toBe(1);
+    expect([...legsOn][0]).not.toBe("NO_BASKET");
+    // Flag OFF (today): the same sweep DOES move the short leg — the defect this change removes.
+    expect(legsOff.size).toBeGreaterThan(1);
+  });
+
+  it("[DRIFT] the shipped design substitutes ONE short symbol, and never lets the long side pick it", () => {
+    const off = withMixedWideLongPool(undefined, () => buildMixedCrossSectionalBasket(driftScores, { ...BASKET_BASE }))!;
+    const on = withMixedWideLongPool("1", () => buildMixedCrossSectionalBasket(driftScores, { ...BASKET_BASE }))!;
+    // The short leg DID change — this is the honest claim, not "untouched".
+    expect(off.shortLeg.map((l) => l.symbol)).toEqual(["OPUSDT", "WLDUSDT", "SEIUSDT"]);
+    expect(on.shortLeg.map((l) => l.symbol)).toEqual(["WLDUSDT", "SEIUSDT", "DOGEUSDT"]);
+    // ...by exactly one 1-for-1 substitution: OPUSDT out, the next-ranked short candidate in.
+    const left = off.shortLeg.map((l) => l.symbol).filter((s) => !on.shortLeg.some((x) => x.symbol === s));
+    const joined = on.shortLeg.map((l) => l.symbol).filter((s) => !off.shortLeg.some((x) => x.symbol === s));
+    expect(left).toEqual(["OPUSDT"]);
+    expect(joined).toEqual(["DOGEUSDT"]);
+    // And the legs are disjoint by construction on both paths.
+    for (const l of on.longLeg) expect(on.shortLeg.map((x) => x.symbol)).not.toContain(l.symbol);
+  });
+
+  it("[SHORT-POOL] an exhausted short pool fails CLOSED — no basket, never an unfiltered short side", () => {
+    // allowed() treats an EMPTY allowlist as "allow everything". If the disjointness had been
+    // implemented by subtracting from the short ALLOWLIST, a total overlap would have flipped the
+    // short side to the whole universe. Expressed as a blocklist it can only ever starve.
+    const totalOverlap = new Set(CROSS_SECTIONAL_TREND_SHORT_ALLOWLIST);
+    const b = withMixedWideLongPool("1", () =>
+      buildMixedCrossSectionalBasket(driftScores, { ...BASKET_BASE, longAllowlist: totalOverlap }),
+    );
+    expect(b).toBeNull();
+    // Same starvation guard for an instance that approved nothing for FILTERED longs: there is
+    // nothing to widen to, so the flag keeps today's narrow pool rather than "allow everything".
+    expect(crossSectionalMixedLongAllowlist({ CROSS_SECTIONAL_MIXED_WIDE_LONG_POOL: "1" } as NodeJS.ProcessEnv).size).toBeGreaterThan(0);
   });
 
   it("[THRESHOLD] the 0.035 gap still binds under the widened pool — widening never lowers the bar", () => {
@@ -457,16 +598,106 @@ describe("[MIXED-POOL] CROSS_SECTIONAL_MIXED_WIDE_LONG_POOL — widening the dea
     for (const s of WIDENING_ADDS) expect(on.longLeg.map((l) => l.symbol)).not.toContain(s);
   });
 
-  it("[CONFIG] the adaptive config reports which long pool MIXED is actually running on", () => {
+  it("[CONFIG] the adaptive config reports BOTH pools MIXED is actually running on", () => {
     const off = withMixedWideLongPool(undefined, () => getCrossSectionalAdaptiveConfig());
     expect(off.mixedWideLongPool).toBe(false);
     expect(off.mixedLongAllowlist).toEqual([...CROSS_SECTIONAL_TREND_LONG_ALLOWLIST].sort());
+    expect(off.mixedShortBlocklist).toEqual([...CROSS_SECTIONAL_TREND_SHORT_BLOCKLIST].sort());
+    expect(off.mixedShortExcludedForLongOverlap).toEqual([]); // flag off ⇒ nothing removed
     const on = withMixedWideLongPool("1", () => getCrossSectionalAdaptiveConfig());
     expect(on.mixedWideLongPool).toBe(true);
     expect(on.mixedLongAllowlist).toEqual([...CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST].sort());
+    // The short side is reported as changed, and by exactly which symbols — an operator reading
+    // /research must be able to see the short-side narrowing without reading this file.
+    expect(on.mixedShortExcludedForLongOverlap).toEqual(["1000PEPEUSDT", "OPUSDT"]);
+    expect(on.mixedShortBlocklist.length).toBeGreaterThan(off.mixedShortBlocklist.length);
+    expect(on.mixedShortAllowlist).toEqual(off.mixedShortAllowlist); // the env ALLOWLIST really is unchanged
     // TREND's reported lists are the same object on both paths.
     expect(on.trendLongAllowlist).toEqual(off.trendLongAllowlist);
     expect(on.trendShortAllowlist).toEqual(off.trendShortAllowlist);
+    expect(on.trendShortBlocklist).toEqual(off.trendShortBlocklist);
+  });
+
+  // ── Randomized-draw regression pin ────────────────────────────────────────────────────────────
+  // A miniature of the 20,000-draw harness quoted in the source comment (same PRNG, same seed, same
+  // score distribution, 2,000 draws for suite speed). It fails if a future change either brings the
+  // nondeterministic spillover back or silently alters the shipped configuration's leg deltas.
+  function mulberry32(a: number): () => number {
+    return () => {
+      a |= 0;
+      a = (a + 0x6d2b79f5) | 0;
+      let t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  function normal(rnd: () => number): number {
+    return Math.sqrt(-2 * Math.log(Math.max(1e-12, rnd()))) * Math.cos(2 * Math.PI * rnd());
+  }
+
+  it("[DRAWS] over seeded random draws: spillover is eliminated and the short leg becomes deterministic", () => {
+    const rnd = mulberry32(20260726);
+    const shortAllow = CROSS_SECTIONAL_TREND_SHORT_ALLOWLIST;
+    let bothDraft = 0;
+    let bothShipped = 0;
+    let draftShortDiff = 0;
+    let shippedShortDiff = 0;
+    let shippedShortIsPoolOnly = 0;
+    let shippedFormed = 0;
+    let draftSpilloverSymbolsOnly = 0;
+    let trendDiff = 0;
+
+    for (let i = 0; i < 2000; i += 1) {
+      const s = CROSS_SECTIONAL_UNIVERSE.map((symbol) => ({ symbol, score: normal(rnd) * 0.35, price: 100 }));
+      const legs = (b: CrossSectionalObservation | null) => (b === null ? null : b.shortLeg.map((l) => l.symbol).sort().join(","));
+      const off = withMixedWideLongPool(undefined, () => buildMixedCrossSectionalBasket(s, { ...BASKET_BASE }));
+      const draft = withMixedWideLongPool("1", () =>
+        buildMixedCrossSectionalBasket(s, { ...BASKET_BASE, shortBlocklist: CROSS_SECTIONAL_TREND_SHORT_BLOCKLIST }),
+      );
+      const shipped = withMixedWideLongPool("1", () => buildMixedCrossSectionalBasket(s, { ...BASKET_BASE }));
+      if (shipped) shippedFormed += 1;
+
+      if (off && draft) {
+        bothDraft += 1;
+        if (legs(off) !== legs(draft)) {
+          draftShortDiff += 1;
+          const joined = draft.shortLeg.map((l) => l.symbol).filter((x) => !off.shortLeg.some((y) => y.symbol === x));
+          if (joined.every((x) => x === "OPUSDT" || x === "1000PEPEUSDT")) draftSpilloverSymbolsOnly += 1;
+        }
+      }
+      if (off && shipped) {
+        bothShipped += 1;
+        if (legs(off) !== legs(shipped)) shippedShortDiff += 1;
+      }
+      if (shipped) {
+        // The short leg the short POOL alone implies — computed with zero knowledge of the long side.
+        const bl = withMixedWideLongPool("1", () => crossSectionalMixedShortBlocklist());
+        const poolOnly = s
+          .filter((x) => shortAllow.has(x.symbol) && !bl.has(x.symbol))
+          .sort((a, b) => b.score - a.score) // MEAN_REVERSION shorts the strongest
+          .slice(0, 3)
+          .map((x) => x.symbol)
+          .sort()
+          .join(",");
+        if (legs(shipped) === poolOnly) shippedShortIsPoolOnly += 1;
+      }
+      const t = (v: string | undefined) => JSON.stringify(withMixedWideLongPool(v, () => buildTrendCrossSectionalBasket(s, { ...BASKET_BASE })));
+      if (t(undefined) !== t("1")) trendDiff += 1;
+    }
+
+    // Enough baskets formed for the ratios below to mean something.
+    expect(bothDraft).toBeGreaterThan(1500);
+    expect(bothShipped).toBeGreaterThan(1500);
+    // THE DEFECT: long-widening alone moves the short leg on a large fraction of baskets, and every
+    // such move is one of the two both-sides-eligible symbols arriving from the long pool.
+    expect(draftShortDiff / bothDraft).toBeGreaterThan(0.30);
+    expect(draftSpilloverSymbolsOnly).toBe(draftShortDiff);
+    // THE SHIPPED CONFIGURATION: the short leg moves MORE, not less — stated honestly — but it is
+    // now a pure function of the short pool in EVERY basket. That second line is the whole point.
+    expect(shippedShortDiff / bothShipped).toBeGreaterThan(0.40);
+    expect(shippedShortIsPoolOnly).toBe(shippedFormed);
+    // TREND never differs between flag states, on any draw.
+    expect(trendDiff).toBe(0);
   });
 });
 

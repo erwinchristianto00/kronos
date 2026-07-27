@@ -31,6 +31,7 @@ import {
   CORTEX_LANE_ROSTER,
 } from "./cortex-live-gather.js";
 
+import { applySubFloorExclusionForDecisions } from "./paper-subfloor-exclusion.js";
 import { getRegimeCompositeStore, RC_PAPER_LANE_ID } from "./regime-composite-edge.js";
 import { getRegimeCompositeShortStore, RCS_PAPER_LANE_ID } from "./regime-composite-short-edge.js";
 import { getShortFadeStore, SF_PAPER_LANE_ID } from "./short-fade-edge.js";
@@ -46,7 +47,8 @@ import {
 import { getCurrentGuardVariantMatrixStore } from "./current-guard-variant-matrix.js";
 import { peekPaperExecutionRouterStore } from "./paper-execution-router.js";
 import {
-  cortexLearningEpoch,
+  resolveCortexLearningEpoch,
+  type CortexLearningEpochRejection,
   filterCortexLearningEpochRows,
   type CortexLearningEpoch,
 } from "./cortex-learning-epoch.js";
@@ -146,6 +148,9 @@ export interface CortexCgRouterOrderLike {
   /** MARKET timestamp of the exit candle — the documented attribution key (never updatedAt/Date.now). */
   closedAtMs?: number | null;
   closeReason?: string | null;
+  /** T1-b: read only by the sub-admission-floor predicate. Absent ⇒ row is never excluded. */
+  sourceType?: string | null;
+  plannedStopDistanceBps?: number | null;
 }
 
 export interface CortexCgRouterLaneCounts {
@@ -238,7 +243,17 @@ export function collectCortexCgRouterObs(
     byLaneCounts[laneId] = emptyRouterLaneCounts();
   }
 
-  for (const ord of orders) {
+  // T1-b DECISION PATH (refit → promotion) — gated, DEFAULT OFF, and a GUARD RATHER THAN A FIX.
+  // Measured over the testnet store 2026-07-26: the three-lane allowlist below
+  // (CG_WIDE_FAST_LONG / CG_WIDE_LONG_RUNNER / CG_MFE_GIVEBACK) holds 408 closed non-MTM LONG
+  // router rows and EXACTLY ZERO of them are sub-floor — the two contaminated variants
+  // (CG_BASELINE_FAST_05 / CG_MAKER_FAST_05) are not on the allowlist and never have been. So
+  // enabling the flag changes no CORTEX weight, no readiness status and no promotion TODAY. It is
+  // wired anyway because CG_ROUTER_LONG_LANE_BY_VARIANT is a hand-maintained constant: without
+  // this, the next person to add a fourth lane inherits the contamination silently.
+  // The zero-delta claim is enforced by a test, not remembered.
+  const scoped = applySubFloorExclusionForDecisions(orders);
+  for (const ord of scoped) {
     const variantId = cortexCgRouterVariantId(ord?.selectedLaneId);
     if (variantId === null) continue; // not a variant-matrix router lane at all
     const laneId = CG_ROUTER_LONG_LANE_BY_VARIANT.get(variantId);
@@ -538,8 +553,11 @@ export function gatherCortexRefitInputs(deps: {
     decisionRowsExcluded: number;
     transitionalOutcomesExcluded: number;
   }) | null;
+  /** Non-null when a boundary WAS configured and refused — see resolveCortexLearningEpoch. Carried
+   *  into the readiness payload so a refusal is visible next to the meter it would have zeroed. */
+  learningEpochRejection: CortexLearningEpochRejection | null;
 } {
-  const epoch = cortexLearningEpoch(deps.env);
+  const { epoch, rejection: learningEpochRejection } = resolveCortexLearningEpoch(deps.env, deps.nowMs);
   const sinceMs = Math.max(
     deps.nowMs - CORTEX_REFIT_LOOKBACK_MS,
     epoch?.startMs ?? Number.NEGATIVE_INFINITY,
@@ -644,6 +662,7 @@ export function gatherCortexRefitInputs(deps: {
           transitionalOutcomesExcluded: epochRows.transitionalOutcomesExcluded,
         }
       : null,
+    learningEpochRejection,
   };
 }
 

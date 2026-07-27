@@ -18,6 +18,8 @@ import {
   PAPER_ADMISSION_MAX_AGE_MS,
   PAPER_MAX_CLOSED_DIAGNOSTIC,
   PER_LANE_DIAGNOSTIC_FLOOR,
+  parseDiagnosticRetentionEnv,
+  closedDiagnosticRetentionBudget,
   DEFAULT_PAPER_EQUITY,
   HEADLINE_MAX_OPEN,
   HEADLINE_MAX_PER_SYMBOL,
@@ -2335,8 +2337,180 @@ describe("headline concentration caps (anti-correlation safety)", () => {
   // instance had grown to 11,213 orders/34MB with the prune never once engaging, directly
   // correlated with that instance's disproportionate OOM crash-restart rate.
   it("[OOM-FIX] PAPER_MAX_CLOSED_DIAGNOSTIC default is a real, finite cap (not the old inert ~10M value)", () => {
+    // Bound restored to 10,000 after the 2026-07-26 raise to 12,000 was reverted at gate. The
+    // binding instance is research (/root/kronos): 15.4 MB of closed-diagnostic at 3,085 B/row
+    // against a 5,000 cap, so 10,000 already puts that store at ~34 MB — the size its own doc
+    // comment ties to a 2x OOM crash-restart rate. Raising retention is an ENV decision per
+    // instance (PAPER_MAX_CLOSED_DIAGNOSTIC=12000 on testnet), not a default change.
     expect(PAPER_MAX_CLOSED_DIAGNOSTIC).toBeLessThanOrEqual(10_000);
     expect(PAPER_MAX_CLOSED_DIAGNOSTIC).toBeGreaterThan(0);
+  });
+
+  // ── [FLOOR-VS-CAP] 2026-07-26 ────────────────────────────────────────────────────────────────
+  // pruneClosedDiagnostic() keeps Σ min(n_lane, PER_LANE_DIAGNOSTIC_FLOOR) UNCONDITIONALLY and only
+  // then spends `max(0, maxClosed − floorKept)` on the remainder. So whenever the aggregate per-lane
+  // floor equals or exceeds the global cap, remainderBudget is 0, `remainder.slice(0, 0)` keeps
+  // nothing, and the global cap governs NOTHING — retention collapses to "newest FLOOR per lane"
+  // no matter what the cap says. Measured on the real testnet store 2026-07-26: 35 distinct
+  // selectedLaneId, 6,349 closed-diagnostic rows, 30 of 35 lanes pinned at EXACTLY 200 and zero
+  // lanes above 200, i.e. floorKept = 6,349 = 100% of survivors against a cap of 5,000.
+  const PRODUCTION_LANE_COUNT = 35; // measured: distinct selectedLaneId on testnet 2026-07-26
+  const RESEARCH_LANE_COUNT = 30; // measured: distinct selectedLaneId on research 2026-07-26
+
+  /** Seed `laneCount × perLane` closed-DIAGNOSTIC rows, globally increasing by lane then index. */
+  const seedClosedDiag = (store: PaperExecutionRouterStore, laneCount: number, perLane: number) => {
+    const baseMs = Date.parse("2026-06-01T00:00:00.000Z");
+    let n = 0;
+    // beginBatch: add() → save() → full-array JSON.stringify + writeFileSync. Batching is the same
+    // reason admitPaperOrders wraps its own loop.
+    store.beginBatch();
+    for (let lane = 0; lane < laneCount; lane++) {
+      for (let i = 0; i < perLane; i++) {
+        store.add(makePaperOrder({
+          paperOrderId: `fc-${lane}-${i}`,
+          dedupeKey: `fc-${lane}-${i}`,
+          selectedLaneId: `LANE_${lane}`,
+          paperOrderMode: "DIAGNOSTIC_ONLY",
+          paperStatus: "PAPER_CLOSED_WIN",
+          updatedAt: new Date(baseMs + n++ * 60_000).toISOString(), // strictly increasing globally
+        }));
+      }
+    }
+    store.endBatch();
+  };
+  const retainedClosedDiag = (store: PaperExecutionRouterStore) =>
+    store.all.filter((o) => o.paperStatus === "PAPER_CLOSED_WIN" && o.paperOrderMode === "DIAGNOSTIC_ONLY");
+
+  it("[FLOOR-VS-CAP] closedDiagnosticRetentionBudget names the silent-inertness mode on BOTH measured instances", () => {
+    // testnet 2026-07-26: 35 lanes all at/above the floor → aggregate floor 7,000 > the shipped
+    // 5,000 cap → remainderBudget 0. The cap governs NOTHING and retention is exactly
+    // "newest 200 per lane" — silently, with no error. THIS IS THE SHIPPED DEFAULT'S BEHAVIOUR.
+    const testnet = closedDiagnosticRetentionBudget(
+      Array.from({ length: PRODUCTION_LANE_COUNT }, () => 250),
+      5_000,
+      PER_LANE_DIAGNOSTIC_FLOOR,
+    );
+    expect(testnet.aggregateFloor).toBe(7_000);
+    expect(testnet.remainderBudget).toBe(0);
+    expect(testnet.capIsInert).toBe(true);
+
+    // research 2026-07-26: 30 lanes but most BELOW the floor → aggregate floor 3,173 < 5,000, so
+    // the SAME constant is fully BINDING there (closedDiag pinned at exactly 5,000). This is why
+    // the 5,000 → 12,000 default raise was reverted at gate: it is a no-op on the instance it was
+    // measured on and a 2.4x retention increase on the instance it was not.
+    const researchCounts = [
+      ...Array.from({ length: 6 }, (_, i) => [1001, 570, 448, 411, 340, 257][i]!), // above floor
+      ...Array.from({ length: RESEARCH_LANE_COUNT - 6 }, () => 40), // below floor
+    ];
+    const research = closedDiagnosticRetentionBudget(researchCounts, 5_000, PER_LANE_DIAGNOSTIC_FLOOR);
+    expect(research.laneCount).toBe(RESEARCH_LANE_COUNT);
+    expect(research.aggregateFloor).toBe(6 * 200 + 24 * 40); // 2,160 — well under the cap
+    expect(research.capIsInert).toBe(false);
+    expect(research.remainderBudget).toBeGreaterThan(0);
+
+    // The supported remedy is per-instance ENV, not a default change: on the testnet shape a
+    // 12,000 cap clears the 7,000 floor and allocates 5,000 rows of genuine remainder budget.
+    const testnetRaised = closedDiagnosticRetentionBudget(
+      Array.from({ length: PRODUCTION_LANE_COUNT }, () => 250),
+      12_000,
+      PER_LANE_DIAGNOSTIC_FLOOR,
+    );
+    expect(testnetRaised.capIsInert).toBe(false);
+    expect(testnetRaised.remainderBudget).toBe(5_000);
+
+    // It is a lane-COUNT problem, not a value problem: any cap goes inert once lanes pass
+    // cap/floor. At 12,000/200 that is 60 lanes — reachable by one more lane batch.
+    expect(
+      closedDiagnosticRetentionBudget(Array.from({ length: 60 }, () => 250), 12_000, 200).capIsInert,
+    ).toBe(true);
+  });
+
+  it("[FLOOR-VS-CAP] when the cap clears the aggregate floor, prune SPENDS the remainder budget on the newest rows", () => {
+    // Seeded ABOVE the cap on purpose. The previous version of this test seeded 8,750 rows against
+    // a 12,000 cap, so `if (closedDiag.length <= maxClosed) return 0` fired and NOTHING was pruned —
+    // every assertion below passed vacuously. Confirmed by mutation: with `remainderBudget = 0`
+    // hardcoded in pruneClosedDiagnostic (i.e. the inert behaviour reintroduced at the algorithm
+    // level) the old test still passed. This one does not: it reports
+    // "expected 7000 to be greater than 7000" and "expected 0 to be greater than 0".
+    const store = new PaperExecutionRouterStore(tmpDir());
+    const maxClosed = 12_000;
+    const perLane = 400; // 35 × 400 = 14,000 seeded > 12,000 cap ⇒ the early-return does NOT fire
+    seedClosedDiag(store, PRODUCTION_LANE_COUNT, perLane);
+    const seeded = PRODUCTION_LANE_COUNT * perLane;
+    expect(seeded).toBeGreaterThan(maxClosed);
+
+    const pruned = store.pruneClosedDiagnostic(maxClosed);
+    const retained = retainedClosedDiag(store);
+    const aggregateFloor = PRODUCTION_LANE_COUNT * PER_LANE_DIAGNOSTIC_FLOOR; // 7,000
+
+    expect(pruned).toBeGreaterThan(0); // prune actually ran
+    expect(retained.length).toBe(seeded - pruned);
+    // THE assertion the remainder-budget path exists for: survivors exceed the floor-only keep.
+    expect(retained.length).toBeGreaterThan(aggregateFloor);
+    expect(retained.length).toBeLessThanOrEqual(maxClosed);
+
+    // No lane below its floor (the 2026-07-11 quiet-lane guarantee), and the surplus goes to the
+    // globally NEWEST rows — remainder-by-recency, not round-robin.
+    const byLane = new Map<string, number>();
+    for (const o of retained) byLane.set(o.selectedLaneId!, (byLane.get(o.selectedLaneId!) ?? 0) + 1);
+    expect(byLane.size).toBe(PRODUCTION_LANE_COUNT);
+    for (const count of byLane.values()) expect(count).toBeGreaterThanOrEqual(PER_LANE_DIAGNOSTIC_FLOOR);
+    const ids = new Set(retained.map((o) => o.paperOrderId));
+    expect(ids.has(`fc-${PRODUCTION_LANE_COUNT - 1}-${perLane - 1}`)).toBe(true); // globally newest kept
+    // …and the newest lane must have received remainder ABOVE its floor, which is only possible if
+    // the budget was actually spent.
+    expect(byLane.get(`LANE_${PRODUCTION_LANE_COUNT - 1}`)!).toBeGreaterThan(PER_LANE_DIAGNOSTIC_FLOOR);
+  });
+
+  it("[FLOOR-VS-CAP] at the SHIPPED default the cap is inert on the testnet lane shape — retention collapses to floor-per-lane", () => {
+    // Documents the real production behaviour rather than asserting it away. This is why raising
+    // retention on testnet requires PAPER_MAX_CLOSED_DIAGNOSTIC=12000 in that instance's .env.
+    const store = new PaperExecutionRouterStore(tmpDir());
+    const perLane = 250;
+    seedClosedDiag(store, PRODUCTION_LANE_COUNT, perLane);
+
+    const pruned = store.pruneClosedDiagnostic(5_000);
+    const retained = retainedClosedDiag(store);
+
+    expect(pruned).toBeGreaterThan(0);
+    // EXACTLY the aggregate floor — the 5,000 cap allocated not one single row of remainder.
+    expect(retained.length).toBe(PRODUCTION_LANE_COUNT * PER_LANE_DIAGNOSTIC_FLOOR);
+    expect(retained.length).toBeGreaterThan(5_000); // the store legitimately EXCEEDS its own cap
+    const byLane = new Map<string, number>();
+    for (const o of retained) byLane.set(o.selectedLaneId!, (byLane.get(o.selectedLaneId!) ?? 0) + 1);
+    for (const count of byLane.values()) expect(count).toBe(PER_LANE_DIAGNOSTIC_FLOOR);
+  });
+
+  // [FLOOR-VS-CAP] the `Number(env) || DEFAULT` idiom these two constants used catches NaN/""/0 but
+  // passes NEGATIVES through. That is not a benign "smaller cap": pruneClosedDiagnostic feeds them
+  // to Array.slice(), where a negative counts from the END — a FLOOR of -1 makes bucket.slice(0,-1)
+  // keep all-but-oldest as the untouchable floor, so the global cap never binds at all.
+  it("[FLOOR-VS-CAP] retention env parsing falls back to the default on invalid input instead of passing it through", () => {
+    expect(parseDiagnosticRetentionEnv(undefined, 12_000)).toBe(12_000);
+    expect(parseDiagnosticRetentionEnv("", 12_000)).toBe(12_000);
+    expect(parseDiagnosticRetentionEnv("   ", 12_000)).toBe(12_000);
+    expect(parseDiagnosticRetentionEnv("abc", 12_000)).toBe(12_000);
+    expect(parseDiagnosticRetentionEnv("0", 12_000)).toBe(12_000);
+    expect(parseDiagnosticRetentionEnv("-1", 12_000)).toBe(12_000); // the hole in `Number(x) || d`
+    expect(parseDiagnosticRetentionEnv("-500", 200)).toBe(200);
+    expect(parseDiagnosticRetentionEnv("NaN", 200)).toBe(200);
+    expect(parseDiagnosticRetentionEnv("Infinity", 200)).toBe(200);
+    // Valid input is honoured (fall back, never clamp), and truncated to an integer for slice().
+    expect(parseDiagnosticRetentionEnv("30000", 12_000)).toBe(30_000);
+    expect(parseDiagnosticRetentionEnv("250.9", 200)).toBe(250);
+  });
+
+  // Demonstrates WHY the negative is dangerous rather than merely small: this is the behaviour the
+  // validated parse now makes unreachable via env.
+  it("[FLOOR-VS-CAP] a negative per-lane floor would invert slice() and defeat the global cap (guarded at parse time)", () => {
+    const bucket = ["newest", "mid", "oldest"];
+    expect(bucket.slice(0, -1)).toEqual(["newest", "mid"]); // "floor" swallows all but the oldest
+    expect(bucket.slice(-1)).toEqual(["oldest"]); // remainder pool is a single row
+    // …whereas the real floor partitions correctly.
+    expect(bucket.slice(0, 2)).toEqual(["newest", "mid"]);
+    expect(bucket.slice(2)).toEqual(["oldest"]);
+    // And the parse guarantees PER_LANE_DIAGNOSTIC_FLOOR can never be negative.
+    expect(PER_LANE_DIAGNOSTIC_FLOOR).toBeGreaterThanOrEqual(1);
   });
 
   // [OOM-FIX] admitPaperOrders() used to call store.add() (→ save() → a full-array

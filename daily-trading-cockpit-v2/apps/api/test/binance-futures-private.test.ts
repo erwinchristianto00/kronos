@@ -8,6 +8,7 @@ import {
   resolveLiveBinanceEnv,
   signQueryString,
 } from "../src/lib/binance-futures-private.js";
+import { fillFromUserTrade } from "../src/lib/execution-fill-recorder.js";
 
 describe("binance-futures-private signing", () => {
   it("signs the official Binance documentation HMAC vector", () => {
@@ -114,6 +115,96 @@ describe("binance-futures-private signing", () => {
     const algo = await client.queryAlgoOrder(bigAlgoId);
     expect(algo.algoId).toBe(bigAlgoId);
     expect(algo.actualOrderId).toBe(bigOrderId);
+  });
+
+  it("[USER-TRADES] parses Binance's maker liquidity flag, and leaves it UNKNOWN when absent", async () => {
+    // Real /fapi/v1/userTrades shape. Row 1 is a taker fill (maker:false) — what the live path
+    // should ALWAYS produce, since single-symbol-lane-executor.ts and cross-sectional-executor.ts
+    // only ever place MARKET / STOP_MARKET. Row 2 is maker:true, which must NOT be silently
+    // flattened. Row 3 omits the field entirely and must stay `undefined`, NOT become `false` —
+    // `false` is the value we expect, so defaulting to it would fabricate the very confirmation
+    // this field exists to provide.
+    const rawTradesBody = JSON.stringify([
+      { symbol: "BTCUSDT", id: 991, orderId: "8389766229891298477", price: "61800.5", qty: "0.001", realizedPnl: "-1.8", commission: "0.0309", commissionAsset: "USDT", time: 1_700_000_000_000, maker: false },
+      { symbol: "BTCUSDT", id: 992, orderId: "8389766229891298478", price: "61801.0", qty: "0.001", realizedPnl: "0", commission: "0.0123", commissionAsset: "USDT", time: 1_700_000_000_001, maker: true },
+      { symbol: "BTCUSDT", id: 993, orderId: "8389766229891298479", price: "61802.0", qty: "0.001", realizedPnl: "0", commission: "0.0309", commissionAsset: "USDT", time: 1_700_000_000_002 },
+    ]);
+
+    const fetchImpl = (async (url: RequestInfo | URL) => {
+      const u = String(url);
+      if (u.includes("/fapi/v1/time")) {
+        return new Response(JSON.stringify({ serverTime: Date.now() }), { status: 200 });
+      }
+      return new Response(rawTradesBody, { status: 200 });
+    }) as typeof fetch;
+
+    const client = new BinanceFuturesPrivateClient({ apiKey: "k", apiSecret: "s", env: "testnet", fetchImpl });
+    const trades = await client.getUserTrades("BTCUSDT", { startTime: 1, limit: 1000 });
+
+    expect(trades).toHaveLength(3);
+    expect(trades[0]!.maker).toBe(false);
+    expect(trades[1]!.maker).toBe(true);
+    // The honesty assertion: absent must survive as unknown, and must be DISTINGUISHABLE from a
+    // genuine taker fill. `toBeUndefined()` alone would also pass a `Boolean(undefined) === false`
+    // implementation under a loose matcher, so assert the distinction explicitly.
+    expect(trades[2]!.maker).toBeUndefined();
+    expect(trades[2]!.maker).not.toBe(false);
+
+    // Guard the existing fields at the same time: the mapper is the only place these are read off
+    // the raw row, and orderId must stay an exact string (19-digit precision incident).
+    expect(trades[0]!.orderId).toBe("8389766229891298477");
+    expect(typeof trades[0]!.orderId).toBe("string");
+    expect(trades[0]!.commission).toBeCloseTo(0.0309, 6);
+    expect(trades[0]!.price).toBeCloseTo(61800.5, 6);
+  });
+
+  it("[USER-TRADES] the parsed maker flag survives into the persisted fill shape, unknown != taker", async () => {
+    // The parse above is only half the item: the flag is worthless if it is dropped at the boundary
+    // where fills are actually persisted. fillFromUserTrade() is that boundary (single-symbol-lane-
+    // executor.ts:1105/1116 hands it the whole trade row), so assert the whole client -> persisted
+    // path in one go rather than trusting the two halves separately.
+    //
+    // Row 3's `maker: "false"` is the nastiest case and the reason the mapper must use a `typeof`
+    // guard rather than `Boolean(...)`: the STRING "false" is truthy, so a naive coercion would
+    // persist `true` — i.e. it would claim Binance confirmed we PROVIDED liquidity on a MARKET
+    // order. That is worse than no data. It must land as `null` (unmeasured).
+    const rawTradesBody = JSON.stringify([
+      { symbol: "BTCUSDT", id: 991, orderId: "8389766229891298477", price: "61800.5", qty: "0.001", realizedPnl: "-1.8", commission: "0.0309", commissionAsset: "USDT", time: 1_700_000_000_000, maker: false },
+      { symbol: "BTCUSDT", id: 992, orderId: "8389766229891298478", price: "61801.0", qty: "0.001", realizedPnl: "0", commission: "0.0123", commissionAsset: "USDT", time: 1_700_000_000_001, maker: true },
+      { symbol: "BTCUSDT", id: 993, orderId: "8389766229891298479", price: "61802.0", qty: "0.001", realizedPnl: "0", commission: "0.0309", commissionAsset: "USDT", time: 1_700_000_000_002, maker: "false" },
+      { symbol: "BTCUSDT", id: 994, orderId: "8389766229891298480", price: "61803.0", qty: "0.001", realizedPnl: "0", commission: "0.0309", commissionAsset: "USDT", time: 1_700_000_000_003 },
+    ]);
+
+    const fetchImpl = (async (url: RequestInfo | URL) => {
+      const u = String(url);
+      if (u.includes("/fapi/v1/time")) {
+        return new Response(JSON.stringify({ serverTime: Date.now() }), { status: 200 });
+      }
+      return new Response(rawTradesBody, { status: 200 });
+    }) as typeof fetch;
+
+    const client = new BinanceFuturesPrivateClient({ apiKey: "k", apiSecret: "s", env: "testnet", fetchImpl });
+    const trades = await client.getUserTrades("BTCUSDT", { startTime: 1, limit: 1000 });
+    const fills = trades.map((t) => fillFromUserTrade(t, "EXIT"));
+
+    expect(fills).toHaveLength(4);
+    // A confirmed taker fill — the value the 5.0 bps/side cost model assumes and this field exists
+    // to verify rather than assume.
+    expect(fills[0]!.maker).toBe(false);
+    // A maker fill must NOT be flattened into the taker bucket on the way to disk.
+    expect(fills[1]!.maker).toBe(true);
+    // Garbage and absent both mean UNMEASURED, and neither may masquerade as a measurement.
+    expect(fills[2]!.maker).toBeNull();
+    expect(fills[2]!.maker).not.toBe(true);
+    expect(fills[2]!.maker).not.toBe(false);
+    expect(fills[3]!.maker).toBeNull();
+    expect(fills[3]!.maker).not.toBe(false);
+
+    // The persisted fill must also carry the raw price and the exact-string orderId, since the
+    // whole point of recording fills is that nothing upstream keeps them.
+    expect(fills[0]!.price).toBeCloseTo(61800.5, 6);
+    expect(fills[0]!.orderId).toBe("8389766229891298477");
+    expect(typeof fills[0]!.orderId).toBe("string");
   });
 
   it("maps Binance error payloads to typed errors with the binance code", async () => {

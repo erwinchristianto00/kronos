@@ -21,6 +21,7 @@ import { getCompositeEstimatorStore, buildCompositeEstimatorReport, ceLaneIdForB
 import { LANE_SELECTOR_V2_LIVE_SUPPORTED_VARIANT_IDS, laneSelectorV2LaneId } from "../lib/lane-selector-v2.js";
 import { buildLiveWalletReconciliationReport, resolveDayUtc } from "../lib/wallet-reconciliation.js";
 import { getCortexRealAttributionStore } from "../lib/cortex-real-attribution.js";
+import { getFundingFeeRecorder, withFundingFeeRecording } from "../lib/funding-fee-recorder.js";
 import { sumExternalClosedFeesUsd, sumExternalRealizedPnlUsd } from "../lib/live-executor-wiring.js";
 import type { UnifiedTestnetOrchestrator } from "../lib/unified-testnet-orchestrator.js";
 import type { UnifiedTestnetProposalStore } from "../lib/unified-testnet-proposal-source.js";
@@ -1526,12 +1527,72 @@ export async function registerLiveRoutes(
       const dayUtc = resolveDayUtc(query.day);
       const closedFees = engine.getClosedTodayFeesUsd() +
         sumExternalClosedFeesUsd(allCrossSectionalExecutors(), allSingleSymbolExecutors(), dayUtc);
-      const report = await buildLiveWalletReconciliationReport(engine, dayUtc, undefined, external.today, closedFees);
+      // FUNDING PERSISTENCE (2026-07-26, report-only — see lib/funding-fee-recorder.ts).
+      //
+      // This handler is the ONLY place in the process that ever fetches /fapi/v1/income. Every
+      // FUNDING_FEE row for the day is already in memory inside the report builder, gets summed
+      // into report.exchangeIncome.fundingFeeUsd, and is then discarded — funding, a real recurring
+      // cash cost on every perp position, was persisted NOWHERE. withFundingFeeRecording decorates
+      // the engine so those already-fetched rows are ALSO written to data/funding-fees.json on the
+      // way past.
+      //
+      // WHY HERE AND NOT IN wallet-reconciliation.ts: that module's "never mutates, never writes"
+      // contract is a stated safety property; decorating at the call site keeps it literally true
+      // and puts the side effect where side effects already live. The decorator adds NO exchange
+      // interaction (it observes the fetch immediately below), forwards arguments and the returned
+      // rows byte-identically on the same promise, and is fail-open at every layer — a recorder
+      // that threw on every call would leave `report` exactly as it is today.
+      const report = await buildLiveWalletReconciliationReport(
+        withFundingFeeRecording(engine),
+        dayUtc,
+        undefined,
+        external.today,
+        closedFees,
+      );
       return { ok: true, report };
     } catch (err) {
       reply.code(502);
       return { ok: false, reason: err instanceof Error ? err.message : "wallet reconciliation failed" };
     }
+  });
+
+  // Report-only reader over the funding rows persisted by the wallet-reconciliation handler above
+  // (see lib/funding-fee-recorder.ts). Touches no exchange endpoint and no engine state — it only
+  // reads the local store, so it works even when live execution is disabled. Exists so the operator
+  // can confirm funding is actually being captured without shelling into the box: a recorder nobody
+  // can observe is the "measurement blocked by its own params" failure all over again.
+  //
+  // `coverage` is NOT decoration. Funding is only ever seen for UTC days the reconciliation ticker
+  // actually ran on; a day missing from `coverage` contributes $0 to `totalUsd` and is
+  // INDISTINGUISHABLE from a genuinely zero-funding day without it. Never present the total as
+  // complete without checking coverage first.
+  app.get("/api/live/funding-fees", async (request) => {
+    const query = (request.query ?? {}) as { symbol?: string; days?: string; limit?: string };
+    const recorder = getFundingFeeRecorder();
+    const days = Math.min(400, Math.max(1, Math.floor(Number(query.days ?? 30)) || 30));
+    const limit = Math.min(2000, Math.max(1, Math.floor(Number(query.limit ?? 200)) || 200));
+    const fromMs = Date.now() - days * 86_400_000;
+    const symbol = typeof query.symbol === "string" && query.symbol.length > 0 ? query.symbol : undefined;
+    const rows = recorder.listFundingRows({ ...(symbol ? { symbol } : {}), fromMs });
+    const bySymbol = new Map<string, { symbol: string; rows: number; totalUsd: number }>();
+    for (const r of rows) {
+      const agg = bySymbol.get(r.symbol) ?? { symbol: r.symbol, rows: 0, totalUsd: 0 };
+      agg.rows += 1;
+      agg.totalUsd += r.income;
+      bySymbol.set(r.symbol, agg);
+    }
+    return {
+      ok: true,
+      windowDays: days,
+      symbol: symbol ?? null,
+      // Binance's own sign convention is preserved end to end: negative = funding PAID.
+      totalUsd: rows.reduce((sum, r) => sum + r.income, 0),
+      rowCount: rows.length,
+      bySymbol: Array.from(bySymbol.values()).sort((a, b) => a.totalUsd - b.totalUsd),
+      coverage: recorder.getDayCoverage().filter((c) => c.dayUtc >= new Date(fromMs).toISOString().slice(0, 10)),
+      rows: rows.slice(-limit), // newest `limit` rows; the store itself holds up to MAX_FUNDING_ROWS
+      truncated: rows.length > limit,
+    };
   });
 
   app.get("/api/live/lane-performance-series", async (request, reply) => {

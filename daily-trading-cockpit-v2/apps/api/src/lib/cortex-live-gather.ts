@@ -84,6 +84,37 @@ export const CORTEX_LANE_ROSTER: readonly CortexRosterEntry[] = [
   { laneId: CROSS_SECTIONAL_TREND_LANE_ID, direction: "NEUTRAL", isXsec: true },
   { laneId: CROSS_SECTIONAL_MIXED_LANE_ID, direction: "NEUTRAL", isXsec: true },
 ];
+/**
+ * Lanes DELIBERATELY RETIRED — kept on the roster (six other consumers read it: the default
+ * allocation at app.ts, the manual-direction validator, FOUR_BRAIN_LANE_SUPPORT, outcome
+ * attribution metadata, deriveDirectionVeto) but excluded from the readiness DENOMINATOR.
+ *
+ * Why the denominator specifically (2026-07-27): laneCoverage = learningActiveLanes / rosterSize.
+ * A lane whose executor is switched off can never reach LEARNING_ACTIVE, so leaving it in the
+ * denominator caps the component at 14/16 = 87.5% and the weighted headline at 97.5% — forever,
+ * for work nobody intends to do. A progress meter with an unreachable ceiling stops being read.
+ *
+ * This does NOT remove anything from the roster. Editing CORTEX_LANE_ROSTER would change the
+ * default allocation table and the direction validator, which is real blast radius for a
+ * reporting fix.
+ *
+ * Default EMPTY ⇒ byte-identical to pre-2026-07-27 behaviour on every instance. Ids not actually
+ * on the roster are ignored rather than silently shrinking the denominator on a typo.
+ */
+export function cortexRetiredLaneIds(env: NodeJS.ProcessEnv = process.env): ReadonlySet<string> {
+  const raw = (env.CORTEX_RETIRED_LANE_IDS ?? "").trim();
+  if (raw.length === 0) return new Set<string>();
+  const onRoster = new Set(CORTEX_LANE_ROSTER.map((e) => e.laneId));
+  return new Set(
+    raw.split(",").map((s) => s.trim()).filter((s) => s.length > 0 && onRoster.has(s)),
+  );
+}
+
+/** Roster size with retired lanes removed. Floored at 1 so the ratio can never divide by zero. */
+export function cortexEffectiveRosterSize(env: NodeJS.ProcessEnv = process.env): number {
+  return Math.max(1, CORTEX_LANE_ROSTER.length - cortexRetiredLaneIds(env).size);
+}
+
 
 /** A directional lane's OWN rolling realized report (R + PF + resolved count). */
 export interface CortexLaneReportLike {
