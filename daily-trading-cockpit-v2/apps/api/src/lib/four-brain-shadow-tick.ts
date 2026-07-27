@@ -162,6 +162,10 @@ export function runFourBrainShadowTick(deps: FourBrainShadowTickDeps): FourBrain
     }
 
     const executiveDecisions: ExecutiveDecision[] = [];
+    const identityByExecutiveDecisionId = new Map<
+      string,
+      { signalId: string | null; positionId: string | null }
+    >();
     const seenDecisionIds = new Set<string>();
 
     for (const c of gathered.entryCandidates) {
@@ -197,6 +201,10 @@ export function runFourBrainShadowTick(deps: FourBrainShadowTickDeps): FourBrain
         continue;
       }
       executiveDecisions.push(exec);
+      identityByExecutiveDecisionId.set(exec.decisionId, {
+        signalId: c.identity.signalId,
+        positionId: c.identity.positionId,
+      });
     }
 
     for (const c of gathered.exitCandidates) {
@@ -231,6 +239,10 @@ export function runFourBrainShadowTick(deps: FourBrainShadowTickDeps): FourBrain
         continue;
       }
       executiveDecisions.push(exec);
+      identityByExecutiveDecisionId.set(exec.decisionId, {
+        signalId: c.identity.signalId,
+        positionId: c.identity.positionId,
+      });
     }
     metrics.inferenceMs = perf() - i0;
 
@@ -244,7 +256,13 @@ export function runFourBrainShadowTick(deps: FourBrainShadowTickDeps): FourBrain
         metrics.byCandidateStatus[exec.candidateStatus] = (metrics.byCandidateStatus[exec.candidateStatus] ?? 0) + 1;
         metrics.decisions += 1;
         try {
-          deps.journalAppend(buildExecutiveDecisionRecord(exec, { ...ctx, invariantViolations: invExec.violations }));
+          const identity = identityByExecutiveDecisionId.get(exec.decisionId);
+          deps.journalAppend(buildExecutiveDecisionRecord(exec, {
+            ...ctx,
+            invariantViolations: invExec.violations,
+            signalId: identity?.signalId ?? null,
+            positionId: identity?.positionId ?? null,
+          }));
         } catch {
           metrics.journalErrors += 1;
         }

@@ -106,6 +106,7 @@ export function buildLocalCortexReadiness(deps: {
         archetypes: refitReport.archetypes.map((a) => ({ archetype: a.archetype, status: a.status, examples: a.examples })),
         perLane: refitReport.perLane.map((l) => ({ laneId: l.laneId, status: l.status, staticWeightPct: l.staticWeightPct })),
         reinforcement: refitReport.reinforcementByLane.map((r) => ({ laneId: r.laneId, positive: r.positive, noReward: r.noReward })),
+        learningEpoch: refitReport.learningEpoch,
       }
     : null;
 
@@ -138,6 +139,7 @@ export function buildLocalCortexReadiness(deps: {
         cumulativeTiltDeltaR: alphaCache.decisionAlpha.cumulativeTiltDeltaR,
         meanTiltDeltaR: alphaCache.decisionAlpha.meanTiltDeltaR,
         perLane: alphaCache.decisionAlpha.perLane,
+        clusteredCi95: alphaCache.decisionAlpha.clusteredCi95,
       }
     : null;
 

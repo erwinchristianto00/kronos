@@ -378,7 +378,7 @@ describe("cortexShadowDecisionAlpha (#219 — realized tilt-delta-R, 2026-07-20)
 
   it("zero examples ⇒ n=0, cumulativeTiltDeltaR=0, meanTiltDeltaR=null (never a fabricated 0-edge)", () => {
     const r = cortexShadowDecisionAlpha([]);
-    expect(r).toEqual({ n: 0, cumulativeTiltDeltaR: 0, meanTiltDeltaR: null, perLane: [] });
+    expect(r).toEqual({ n: 0, cumulativeTiltDeltaR: 0, meanTiltDeltaR: null, perLane: [], clusteredCi95: null });
   });
 
   it("an overweighted winner adds POSITIVE tilt-delta-R (the tilt correctly leaned into it)", () => {
@@ -420,6 +420,21 @@ describe("cortexShadowDecisionAlpha (#219 — realized tilt-delta-R, 2026-07-20)
     expect(byLane.L1!.cumulativeTiltDeltaR).toBeCloseTo(l1Expected, 9);
     expect(byLane.L2!.n).toBe(1);
     expect(byLane.L2!.cumulativeTiltDeltaR).toBeCloseTo(l2Expected, 9);
+  });
+
+  it("reports a day-clustered CI only after five independent UTC-day clusters exist", () => {
+    const examples = Array.from({ length: 10 }, (_, index) =>
+      ex({
+        observationId: `ci-${index}`,
+        resolvedAtMs: Date.UTC(2026, 6, 1 + Math.floor(index / 2)),
+        finalPctAtDecision: 0,
+        evalFinalPctAtDecision: 10,
+        netR: 1,
+      }),
+    );
+    const result = cortexShadowDecisionAlpha(examples);
+    expect(result.clusteredCi95?.clusters).toBe(5);
+    expect(result.clusteredCi95?.lowerMeanTiltDeltaR).toBeGreaterThan(0);
   });
 
   it("skips a non-finite weight or netR defensively rather than poisoning the sum with NaN", () => {

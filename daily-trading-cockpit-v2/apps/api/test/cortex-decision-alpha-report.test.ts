@@ -15,7 +15,7 @@ describe("buildCortexShadowDecisionAlphaReport (#219, 2026-07-20)", () => {
     expect(report.reportOnly).toBe(true);
     expect(report.examplesConsidered).toBe(0);
     expect(report.journalBadLines).toBe(0);
-    expect(report.decisionAlpha).toEqual({ n: 0, cumulativeTiltDeltaR: 0, meanTiltDeltaR: null, perLane: [] });
+    expect(report.decisionAlpha).toEqual({ n: 0, cumulativeTiltDeltaR: 0, meanTiltDeltaR: null, perLane: [], clusteredCi95: null });
   });
 
   it("before any refit cycle, the #219 'today' slice also reports zero examples with a correctly-derived UTC day boundary", () => {
@@ -24,7 +24,7 @@ describe("buildCortexShadowDecisionAlphaReport (#219, 2026-07-20)", () => {
     const nowMs = Date.parse("2026-07-21T09:12:00Z");
     const report = buildCortexShadowDecisionAlphaReport({ nowMs });
     expect(report.today.examplesConsidered).toBe(0);
-    expect(report.today.decisionAlpha).toEqual({ n: 0, cumulativeTiltDeltaR: 0, meanTiltDeltaR: null, perLane: [] });
+    expect(report.today.decisionAlpha).toEqual({ n: 0, cumulativeTiltDeltaR: 0, meanTiltDeltaR: null, perLane: [], clusteredCi95: null });
     expect(Date.parse(report.today.dayStart)).toBe(startOfUtcDayMs(nowMs));
   });
 
@@ -39,13 +39,13 @@ describe("buildCortexShadowDecisionAlphaReport (#219, 2026-07-20)", () => {
       generatedAtMs: Date.parse("2026-07-20T23:50:00Z"),
       dayStartMs: yesterdayDayStartMs,
       examplesConsidered: 42,
-      decisionAlpha: { n: 42, cumulativeTiltDeltaR: 1.23, meanTiltDeltaR: 0.0293, perLane: [] },
+      decisionAlpha: { n: 42, cumulativeTiltDeltaR: 1.23, meanTiltDeltaR: 0.0293, perLane: [], clusteredCi95: null },
     });
     const nowMs = Date.parse("2026-07-21T02:15:00Z"); // ~2h15m into the new UTC day
     const report = buildCortexShadowDecisionAlphaReport({ nowMs });
     // Must NOT surface yesterday's 42 examples / real deltaR under today's label.
     expect(report.today.examplesConsidered).toBe(0);
-    expect(report.today.decisionAlpha).toEqual({ n: 0, cumulativeTiltDeltaR: 0, meanTiltDeltaR: null, perLane: [] });
+    expect(report.today.decisionAlpha).toEqual({ n: 0, cumulativeTiltDeltaR: 0, meanTiltDeltaR: null, perLane: [], clusteredCi95: null });
     expect(Date.parse(report.today.dayStart)).toBe(startOfUtcDayMs(nowMs));
     expect(Date.parse(report.today.dayStart)).not.toBe(yesterdayDayStartMs);
   });
@@ -58,7 +58,7 @@ describe("buildCortexShadowDecisionAlphaReport (#219, 2026-07-20)", () => {
       generatedAtMs: nowMs,
       dayStartMs: startOfUtcDayMs(nowMs),
       examplesConsidered: 7,
-      decisionAlpha: { n: 7, cumulativeTiltDeltaR: 0.5, meanTiltDeltaR: 0.0714, perLane: [] },
+      decisionAlpha: { n: 7, cumulativeTiltDeltaR: 0.5, meanTiltDeltaR: 0.0714, perLane: [], clusteredCi95: null },
     });
     const report = buildCortexShadowDecisionAlphaReport({ nowMs: nowMs + 60_000 });
     expect(report.today.examplesConsidered).toBe(7);

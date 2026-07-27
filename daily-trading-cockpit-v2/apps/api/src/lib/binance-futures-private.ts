@@ -383,6 +383,14 @@ export interface BinanceFuturesPrivateClientOptions {
   nowMs?: () => number;
 }
 
+export interface FuturesExecutionBookTicker {
+  bid: number | null;
+  ask: number | null;
+  bidQty: number | null;
+  askQty: number | null;
+  time: number | null;
+}
+
 export class BinanceFuturesPrivateClient {
   private readonly apiKey: string;
   private readonly apiSecret: string;
@@ -585,6 +593,26 @@ export class BinanceFuturesPrivateClient {
   }
 
   // ── public endpoints ───────────────────────────────────────────────────────
+
+  /** Public book from the SAME testnet/mainnet USD-M base selected for private execution. */
+  async getBookTicker(symbol: string): Promise<FuturesExecutionBookTicker> {
+    const parsed = await this.requestPublic("/fapi/v1/ticker/bookTicker", { symbol });
+    const row = parsed as Record<string, unknown> | null;
+    if (!row || typeof row !== "object") {
+      throw new BinanceFuturesPrivateError("invalid_response", `book ticker missing for ${symbol}`);
+    }
+    const positiveOrNull = (value: unknown): number | null => {
+      const parsedValue = toNum(value);
+      return parsedValue > 0 ? parsedValue : null;
+    };
+    return {
+      bid: positiveOrNull(row.bidPrice),
+      ask: positiveOrNull(row.askPrice),
+      bidQty: positiveOrNull(row.bidQty),
+      askQty: positiveOrNull(row.askQty),
+      time: toNum(row.time) > 0 ? toNum(row.time) : null,
+    };
+  }
 
   async getExchangeFilters(): Promise<Map<string, FuturesSymbolFilters>> {
     if (this.exchangeFiltersCache && this.nowMs() - this.exchangeFiltersCacheAtMs < EXCHANGE_FILTERS_TTL_MS) {

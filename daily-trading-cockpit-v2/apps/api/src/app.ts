@@ -33,6 +33,7 @@ import { buildCrossSectionalReport, getCrossSectionalStore } from "./lib/cross-s
 import {
   SingleSymbolLaneExecutor,
   SingleSymbolLaneExecutorStore,
+  type PublicQuoteSnapshot,
   type SingleSymbolExitPolicy,
 } from "./lib/single-symbol-lane-executor.js";
 import {
@@ -146,6 +147,11 @@ import { standaloneCortexShadowAllowed } from "./lib/cortex-instance-diagnosis.j
 import { runFourBrainShadowCycle } from "./lib/four-brain-live-wiring.js";
 import { classifyIncumbentLanes } from "./lib/four-brain-lane-support.js";
 import { buildLaneContextSnapshotInputs } from "./lib/lane-context-snapshot-source.js";
+import {
+  computeExpectedSlippageBps,
+  computeSpreadBps,
+  parseDepthPayload,
+} from "./lib/order-flow-microstructure.js";
 import { journalLaneSnapshots, laneJournalActive } from "./lib/lane-context-journal-runtime.js";
 import { FourBrainMetricsAggregator } from "./lib/four-brain-metrics.js";
 import {
@@ -514,12 +520,75 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       env: liveConfig.env,
       fetchImpl: options.fetchImpl,
     });
+    // RECORDING-ONLY (2026-07-27). Keep the existing SPOT mid as the entry-quality gate input, while
+    // prewarming an independent book reference from the SAME USD-M testnet/mainnet base used for
+    // execution. The execution-book fetch runs in parallel and is capped at 750ms; failure/timeout
+    // falls back to the old cross-venue sample and never blocks an order.
+    //
+    // Bounded: one entry per symbol, capped, evicting the oldest insertion. This is a last-value
+    // cache, never a log — nothing reads it on a timer and nothing iterates it.
+    const MAX_PUBLIC_QUOTE_SYMBOLS = 256;
+    const publicQuoteCache = new Map<string, PublicQuoteSnapshot>();
+    const readPublicQuote = (symbol: string): PublicQuoteSnapshot | null => publicQuoteCache.get(symbol) ?? null;
+    const rememberPublicQuote = (symbol: string, snapshot: PublicQuoteSnapshot): void => {
+      try {
+        if (!publicQuoteCache.has(symbol) && publicQuoteCache.size >= MAX_PUBLIC_QUOTE_SYMBOLS) {
+          const oldest = publicQuoteCache.keys().next();
+          if (!oldest.done) publicQuoteCache.delete(oldest.value);
+        }
+        publicQuoteCache.set(symbol, snapshot);
+      } catch {
+        // Recording must never be able to disturb the gate that just fetched this quote.
+      }
+    };
     const currentPublicPrice = async (symbol: string): Promise<number | null> => {
-      const book = await binanceClient.getBookTicker(symbol);
-      if (book.bid !== null && book.ask !== null && book.bid > 0 && book.ask > 0) return (book.bid + book.ask) / 2;
-      if (book.bid !== null && book.bid > 0) return book.bid;
-      if (book.ask !== null && book.ask > 0) return book.ask;
-      return null;
+      const executionBookPromise = Promise.race([
+        liveClient.getBookTicker(symbol).catch(() => null),
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), 750)),
+      ]);
+      const [book, executionBook] = await Promise.all([
+        binanceClient.getBookTicker(symbol),
+        executionBookPromise,
+      ]);
+      // Stamped AFTER the await, so the age the executor derives from it is the age of the
+      // OBSERVATION, never of the request that produced it.
+      const atMs = Date.now();
+      // Identical precedence/return values to the pre-2026-07-27 body (both-sided mid, else the
+      // single usable side, else null) — restructured only so the quote can be remembered.
+      const mid = book.bid !== null && book.ask !== null && book.bid > 0 && book.ask > 0
+        ? (book.bid + book.ask) / 2
+        : book.bid !== null && book.bid > 0
+          ? book.bid
+          : book.ask !== null && book.ask > 0
+            ? book.ask
+            : null;
+      if (mid !== null) {
+        const executionMid =
+          executionBook?.bid && executionBook.ask
+            ? (executionBook.bid + executionBook.ask) / 2
+            : executionBook?.bid ?? executionBook?.ask ?? null;
+        rememberPublicQuote(
+          symbol,
+          executionMid !== null
+            ? {
+                bid: executionBook?.bid ?? null,
+                ask: executionBook?.ask ?? null,
+                mid: executionMid,
+                // Local response-observation time drives age. Exchange time is not substituted
+                // because even a healthy clock offset could make a fresh quote look future/stale.
+                atMs,
+                venue: "BINANCE_USDM_BOOK_TICKER",
+              }
+            : {
+                bid: book.bid !== null && book.bid > 0 ? book.bid : null,
+                ask: book.ask !== null && book.ask > 0 ? book.ask : null,
+                mid,
+                atMs,
+                venue: "BINANCE_SPOT_BOOK_TICKER",
+              },
+        );
+      }
+      return mid;
     };
     singleSymbolPriceTimeline = new SingleSymbolPriceTimelineService(
       (symbol, interval, limit) => binanceClient.getCandles(symbol, interval, limit),
@@ -1405,6 +1474,9 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         existingClusterOpenSymbols: (symbol, direction) => clusterOpenSymbolsExcluding(shortFadeExecutor, symbol, direction),
         maxClusterPositionsAcrossLanes: clusterCapAcrossLanes,
         currentPrice: currentPublicPrice,
+        // RECORDING-ONLY (2026-07-27): synchronous, zero-I/O read of the two-sided quote the
+        // currentPrice fetch above already produced. See SingleSymbolLaneExecutorOptions.readPublicQuote.
+        readPublicQuote,
         sharedGetPositions,
         // 2026-07-19 real-money audit fix: feed the account-wide consecutive-loss kill-switch
         // condition (LiveExecutionEngine.recordExternalConsecutiveLossOutcome's doc comment) —
@@ -1458,6 +1530,9 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         existingClusterOpenSymbols: (symbol, direction) => clusterOpenSymbolsExcluding(intradayMomentumExecutor, symbol, direction),
         maxClusterPositionsAcrossLanes: clusterCapAcrossLanes,
         currentPrice: currentPublicPrice,
+        // RECORDING-ONLY (2026-07-27): synchronous, zero-I/O read of the two-sided quote the
+        // currentPrice fetch above already produced. See SingleSymbolLaneExecutorOptions.readPublicQuote.
+        readPublicQuote,
         sharedGetPositions,
         // 2026-07-19 real-money audit fix — see shortFadeExecutor above.
         onPositionClosed: (netUsd) => engineForGate?.recordExternalConsecutiveLossOutcome(netUsd),
@@ -1517,6 +1592,9 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         existingClusterOpenSymbols: (symbol, direction) => clusterOpenSymbolsExcluding(regimeCompositeExecutor, symbol, direction),
         maxClusterPositionsAcrossLanes: clusterCapAcrossLanes,
         currentPrice: currentPublicPrice,
+        // RECORDING-ONLY (2026-07-27): synchronous, zero-I/O read of the two-sided quote the
+        // currentPrice fetch above already produced. See SingleSymbolLaneExecutorOptions.readPublicQuote.
+        readPublicQuote,
         sharedGetPositions,
         // 2026-07-19 real-money audit fix — see shortFadeExecutor above. This lane is one of the 3
         // holding 100% of today's real money — the original motivating gap for this fix.
@@ -1563,6 +1641,9 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         existingClusterOpenSymbols: (symbol, direction) => clusterOpenSymbolsExcluding(regimeCompositeShortExecutor, symbol, direction),
         maxClusterPositionsAcrossLanes: clusterCapAcrossLanes,
         currentPrice: currentPublicPrice,
+        // RECORDING-ONLY (2026-07-27): synchronous, zero-I/O read of the two-sided quote the
+        // currentPrice fetch above already produced. See SingleSymbolLaneExecutorOptions.readPublicQuote.
+        readPublicQuote,
         sharedGetPositions,
         // 2026-07-19 real-money audit fix — see shortFadeExecutor above.
         onPositionClosed: (netUsd) => engineForGate?.recordExternalConsecutiveLossOutcome(netUsd),
@@ -1614,6 +1695,9 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         existingClusterOpenSymbols: (symbol, direction) => clusterOpenSymbolsExcluding(panicWashoutExecutor, symbol, direction),
         maxClusterPositionsAcrossLanes: clusterCapAcrossLanes,
         currentPrice: currentPublicPrice,
+        // RECORDING-ONLY (2026-07-27): synchronous, zero-I/O read of the two-sided quote the
+        // currentPrice fetch above already produced. See SingleSymbolLaneExecutorOptions.readPublicQuote.
+        readPublicQuote,
         sharedGetPositions,
         // 2026-07-19 real-money audit fix — see shortFadeExecutor above.
         onPositionClosed: (netUsd) => engineForGate?.recordExternalConsecutiveLossOutcome(netUsd),
@@ -1702,6 +1786,8 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           existingClusterOpenSymbols: (symbol, entryDirection) => clusterOpenSymbolsExcluding(selfGetter(), symbol, entryDirection),
           maxClusterPositionsAcrossLanes: clusterCapAcrossLanes,
           currentPrice: currentPublicPrice,
+          // RECORDING-ONLY (2026-07-27) — see shortFadeExecutor above.
+          readPublicQuote,
           sharedGetPositions,
           // 2026-07-19 real-money audit fix — see shortFadeExecutor above. WIDE_LONG/FAST_LONG are 2
           // of the 3 lanes holding 100% of today's real money — the original motivating gap.
@@ -1928,6 +2014,15 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     // 3103 (live) never schedules this extra fetch either, matching every other four-brain-only interval in
     // this block.
     const btcAtrPercentileCache = getBtcAtrPercentileCacheStore();
+    let fourBrainBtcFlowCache: {
+      sentiment: number | null;
+      crowdAlignLong: number | null;
+      atMs: number;
+    } | null = null;
+    const ratioToSigned = (ratio: number | null): number | null =>
+      typeof ratio === "number" && Number.isFinite(ratio) && ratio > 0
+        ? Math.max(-1, Math.min(1, (ratio - 1) / (ratio + 1)))
+        : null;
     const CE_ALL_BUCKETS: CEBucket[] = ["WIDE_LONG", "FAST_LONG", "WIDE_SHORT", "FAST_SHORT"];
     // Retained handle for the report-only lane-context snapshot ticker (registered once, below) — see Stage-2 timer
     // ownership: single registration at boot, cleared on shutdown so a flush attempt never blocks termination.
@@ -2039,10 +2134,12 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         atrAtMs: btcAtrPercentileCache.get().atMs,
         advancersPct: latestSnap?.breadth.advancersPct ?? null,
         breadthAtMs: latestSnap?.at ? Date.parse(latestSnap.at) : null,
-        // No market-wide sentiment / crowd-align / kronos-agree −1..1 producer ⇒ MISSING (CORTEX
-        // neutral-fills the same inputs). Per-symbol async producers exist but are not sync-safe here.
-        sentiment: null,
-        sentimentAtMs: null,
+        // BTC USD-M global long/short ratio mapped monotonically from (0,+inf) to (-1,+1).
+        // This is a measured derivatives proxy, not fabricated market-wide certainty.
+        sentiment: fourBrainBtcFlowCache?.sentiment ?? null,
+        sentimentAtMs: fourBrainBtcFlowCache?.sentiment !== null
+          ? fourBrainBtcFlowCache?.atMs ?? null
+          : null,
         safetyEvents: [],
         regimeRaw: regime,
         edgeMemory: edgeMem,
@@ -2058,8 +2155,11 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         // builders CORTEX's own gather already reads (see four-brain-best-lane-report.ts's doc comment
         // for the exact selection rule + why n=0 lanes are never selectable).
         bestLaneReportForDirection: buildLiveBestLaneReportForDirection("data", ceBucketsOnce),
-        crowdAlignLong: null,
-        crowdAtMs: null,
+        // BTC taker buy/sell ratio uses the same signed transform; >0 means aggressive flow leans long.
+        crowdAlignLong: fourBrainBtcFlowCache?.crowdAlignLong ?? null,
+        crowdAtMs: fourBrainBtcFlowCache?.crowdAlignLong !== null
+          ? fourBrainBtcFlowCache?.atMs ?? null
+          : null,
         kronosAgree: null,
         kronosAtMs: null,
         openSignals: collectFourBrainOpenSignals(),
@@ -2152,6 +2252,34 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       void runFourBrainShadowCycle({
         buildDeps: buildFourBrainDepsForCycle,
         fetchCandles: (symbol) => binanceClient.getCandles(symbol, "15m", 150).catch(() => null),
+        fetchOrderflow: async (symbol) => {
+          try {
+            const payload = await binanceClient.getFuturesDepth(symbol, 100);
+            const depth = parseDepthPayload(payload);
+            const bestBid = depth.bids[0]?.price ?? null;
+            const bestAsk = depth.asks[0]?.price ?? null;
+            const configured = Number(process.env.FOUR_BRAIN_REFERENCE_NOTIONAL_USD ?? "250");
+            const referenceNotionalUsd = Number.isFinite(configured)
+              ? Math.min(5_000, Math.max(25, configured))
+              : 250;
+            const observedAtMs = Date.now();
+            const buySlip = computeExpectedSlippageBps(depth, "BUY", referenceNotionalUsd);
+            const sellSlip = computeExpectedSlippageBps(depth, "SELL", referenceNotionalUsd);
+            return {
+              spreadBps:
+                bestBid !== null && bestAsk !== null
+                  ? computeSpreadBps(bestBid, bestAsk)
+                  : null,
+              expectedSlippageBpsBuy: buySlip,
+              expectedSlippageBpsSell: sellSlip,
+              bookDepthOkBuy: buySlip !== null,
+              bookDepthOkSell: sellSlip !== null,
+              observedAtMs,
+            };
+          } catch {
+            return null;
+          }
+        },
         candleTimeframe: "15m",
         activeAllocation: activeFourBrainAllocation,
         // Wrapped so the SAME journalAppend call that writes the real file also mirrors records into two
@@ -2206,6 +2334,22 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       };
       setTimeout(runBtcAtrPercentileRefresh, 10_000);
       setInterval(runBtcAtrPercentileRefresh, 15 * 60_000);
+
+      const refreshFourBrainBtcFlow = (): void => {
+        void binanceClient.getFuturesFlow("BTCUSDT")
+          .then((flow) => {
+            fourBrainBtcFlowCache = {
+              sentiment: ratioToSigned(flow.longShortRatio),
+              crowdAlignLong: ratioToSigned(flow.takerBuySellRatio),
+              atMs: Date.now(),
+            };
+          })
+          .catch(() => {
+            // Preserve the last observation so normal freshness classification can turn it STALE.
+          });
+      };
+      setTimeout(refreshFourBrainBtcFlow, 20_000);
+      setInterval(refreshFourBrainBtcFlow, 5 * 60_000);
     }
 
     // ── Direction/Entry counterfactual outcome RECONCILER (2026-07-23) — its OWN interval, its OWN
@@ -2235,6 +2379,8 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
                 `directionProcessed=${res.directionProcessed} entryProcessed=${res.entryProcessed} ` +
                 `tier1Matched=${res.tier1Diagnostics?.matchedRows ?? 0} ` +
                 `tier1NoIdentityClose=${res.tier1Diagnostics?.rejectionReasons.NO_EXACT_LANE_SYMBOL_SIDE_CLOSE ?? 0} ` +
+                `tier1SignalMismatch=${res.tier1Diagnostics?.rejectionReasons.SIGNAL_ID_MISMATCH ?? 0} ` +
+                `tier1SignalMatches=${res.tier1Diagnostics?.signalIdentityMatches ?? 0} ` +
                 `error=${res.error ?? "none"}`,
             );
           })

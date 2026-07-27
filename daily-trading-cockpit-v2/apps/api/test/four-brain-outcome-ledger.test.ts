@@ -397,6 +397,19 @@ describe("extractPendingDirectionRow / extractPendingEntryRow", () => {
     });
   });
 
+  it("preserves an optional top-level signalId for exact causal matching", () => {
+    const rec = {
+      ...executiveRecord({
+        decisionId: "exec-signal",
+        asOfMs: 1000,
+        laneId: "RC_LANE",
+        symbolOrBasketId: "ETHUSDT",
+      }),
+      signalId: "obs-123",
+    };
+    expect(extractPendingEntryRow(rec)?.signalId).toBe("obs-123");
+  });
+
   it("returns null when brains.direction/brains.entry is null (a MISSING-input cycle) — never a fabricated row", () => {
     const rec = executiveRecord({ decisionId: "exec-1", asOfMs: 1000, direction: null, entry: null });
     expect(extractPendingDirectionRow(rec)).toBeNull();

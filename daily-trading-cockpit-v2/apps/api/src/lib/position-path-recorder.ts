@@ -72,6 +72,8 @@ export interface PositionPathMeta {
   laneId: string;
   symbol: string;
   direction: "LONG" | "SHORT";
+  /** Stable source-signal identity. Optional so historical path files remain readable. */
+  signalId?: string | null;
   /** Which writer recorded this path (documents the R convention of closeR — see markClosed). */
   source: "engine" | "executor";
 }
@@ -129,7 +131,13 @@ function sanitizeMeta(raw: unknown): PositionPathMeta | null {
   ) {
     return null;
   }
-  return { laneId: m.laneId, symbol: m.symbol, direction: m.direction, source: m.source };
+  return {
+    laneId: m.laneId,
+    symbol: m.symbol,
+    direction: m.direction,
+    ...(typeof m.signalId === "string" && m.signalId.length > 0 ? { signalId: m.signalId } : {}),
+    source: m.source,
+  };
 }
 
 function sanitizePath(raw: unknown): PositionPath | null {

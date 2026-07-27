@@ -66,6 +66,19 @@ export interface EntryMicrostructure {
   volumeConfirmed: boolean | null;
   candleFresh: boolean;
   observedAtMs: number | null;
+  spreadBps?: number | null;
+  expectedSlippageBps?: number | null;
+  bookDepthOk?: boolean | null;
+  orderflowObservedAtMs?: number | null;
+}
+
+export interface EntryOrderflowSnapshot {
+  spreadBps: number | null;
+  expectedSlippageBpsBuy: number | null;
+  expectedSlippageBpsSell: number | null;
+  bookDepthOkBuy: boolean | null;
+  bookDepthOkSell: boolean | null;
+  observedAtMs: number | null;
 }
 
 /** A minimal shape of packages/shared calculateTimeframeIndicators() output. */
@@ -96,6 +109,10 @@ export function microstructureFromIndicators(
     volumeConfirmed: finite(ind.volumeRatio) ? ind.volumeRatio! >= volumeConfirmThreshold : null,
     candleFresh: ind.isFresh === true,
     observedAtMs: finite(ind.lastOpenTime) ? ind.lastOpenTime : null,
+    spreadBps: null,
+    expectedSlippageBps: null,
+    bookDepthOk: null,
+    orderflowObservedAtMs: null,
   };
 }
 
@@ -105,6 +122,8 @@ export function microstructureFromIndicators(
 export interface EntryMicrostructureAccessorDeps {
   /** Sync candle read from an already-populated cache. null/throw ⇒ micro MISSING (never fabricated). */
   candlesFor: (symbol: string) => Candle[] | null;
+  /** Sync read from an async-prewarmed USD-M futures depth cache. */
+  orderflowFor?: (symbol: string) => EntryOrderflowSnapshot | null;
   timeframe?: "5m" | "15m" | "1h";
   /** The tick's as-of clock — drives candle-freshness deterministically (no Date.now in the pure path). */
   nowMs: number;
@@ -162,7 +181,25 @@ export function makeEntryMicrostructureAccessor(
       last ? last.close : null,
       deps.volumeConfirmThreshold,
     );
-    return ms;
+    let flow: EntryOrderflowSnapshot | null = null;
+    try {
+      flow = deps.orderflowFor?.(symbol) ?? null;
+    } catch {
+      flow = null;
+    }
+    return {
+      ...ms,
+      spreadBps: flow?.spreadBps ?? null,
+      expectedSlippageBps:
+        side === "LONG"
+          ? flow?.expectedSlippageBpsBuy ?? null
+          : flow?.expectedSlippageBpsSell ?? null,
+      bookDepthOk:
+        side === "LONG"
+          ? flow?.bookDepthOkBuy ?? null
+          : flow?.bookDepthOkSell ?? null,
+      orderflowObservedAtMs: flow?.observedAtMs ?? null,
+    };
   };
 }
 
@@ -347,9 +384,8 @@ export function buildFourBrainGatherInput(dep: FourBrainBindingDeps): FourBrainG
       killLatched: dep.killLatched,
       riskBlockedReason: riskBlockedReason(s.laneId, s.direction),
     };
-    // Adapter B: candle-derived microstructure (VWAP distance, extension, breakout, volume, candle freshness).
-    // null ⇒ no candle adapter wired for this symbol ⇒ micro stays MISSING (never fabricated). Order-book
-    // depth (spread/slippage) is NOT candle-derived and always stays MISSING here.
+    // Adapter B: candle-derived timing plus independently observed USD-M order-book cost.
+    // null ⇒ no adapter wired for this symbol, so every micro source remains MISSING.
     const ms = dep.entryMicrostructure?.(s.symbol, s.direction) ?? null;
     const microObsAt = ms && finite(ms.observedAtMs) ? ms.observedAtMs : null;
     return {
@@ -362,9 +398,7 @@ export function buildFourBrainGatherInput(dep: FourBrainBindingDeps): FourBrainG
       initialStopPrice: finite(s.stopPrice) ? s.stopPrice : null,
       atr: null,
       micro: {
-        // VWAP distance + extension come from the candle adapter (freshnessClass "candle" ⇒ the gather
-        // applies the candle TTL; a stale candle snapshot audits STALE). Order-book depth (spread/slippage)
-        // has NO source in-repo ⇒ stays MISSING — never fabricated as deep liquidity / zero slippage.
+        // VWAP/extension and order-book values retain their independent observation timestamps.
         distanceFromVwapAtr: ms && ms.distanceFromVwapAtr != null
           ? reading("vwap-distance", ms.distanceFromVwapAtr, "atr", microObsAt, "candle")
           : missing("vwap-distance", "atr", "candle", ms ? "vwap/atr absent in candle snapshot" : "no candle adapter"),
@@ -372,12 +406,17 @@ export function buildFourBrainGatherInput(dep: FourBrainBindingDeps): FourBrainG
           ? reading("candle-extension", ms.candleExtensionAtr, "atr", microObsAt, "candle")
           : missing("candle-extension", "atr", "candle", ms ? "extension absent in candle snapshot" : "no candle adapter"),
         pullbackDepthAtr: missing("pullback-depth", "atr", "candle", "pullback depth not derived from candle snapshot"),
-        spreadBps: missing("spread-bps", "bps", "orderflow", "order-book depth unavailable (MISSING)"),
-        expectedSlippageBps: missing("expected-slippage-bps", "bps", "orderflow", "order-book depth unavailable (MISSING)"),
+        spreadBps: ms && ms.spreadBps != null
+          ? reading("spread-bps", ms.spreadBps, "bps", ms.orderflowObservedAtMs ?? null, "orderflow")
+          : missing("spread-bps", "bps", "orderflow", "USD-M order-book spread unavailable"),
+        expectedSlippageBps: ms && ms.expectedSlippageBps != null
+          ? reading("expected-slippage-bps", ms.expectedSlippageBps, "bps", ms.orderflowObservedAtMs ?? null, "orderflow")
+          : missing("expected-slippage-bps", "bps", "orderflow", "USD-M depth cannot fill reference notional"),
       },
       breakoutConfirmed: ms ? ms.breakoutConfirmed : null,
       volumeConfirmed: ms ? ms.volumeConfirmed : null,
       candleFresh: ms ? ms.candleFresh : null,
+      bookDepthOk: ms?.bookDepthOk ?? null,
       crowdingState: dep.crowdingStateForSymbol?.(s.symbol) ?? null,
       expectedDirectionalR: s.direction === "LONG" ? longEdge : shortEdge,
       validityMs,

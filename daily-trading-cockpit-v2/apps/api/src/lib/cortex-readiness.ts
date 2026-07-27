@@ -121,6 +121,13 @@ export interface CortexReadinessRefitInput {
   archetypes: { archetype: string; status: string; examples: number }[];
   perLane: { laneId: string; status: string; staticWeightPct: number }[];
   reinforcement: { laneId: string; positive: number; noReward: number }[];
+  learningEpoch: {
+    id: "POST_LINEAGE_V2";
+    startIso: string;
+    startMs: number;
+    decisionRowsExcluded: number;
+    transitionalOutcomesExcluded: number;
+  } | null;
 }
 
 export interface CortexReadinessCollectionInput {
@@ -142,6 +149,12 @@ export interface CortexReadinessDecisionAlphaInput {
   cumulativeTiltDeltaR: number;
   meanTiltDeltaR: number | null;
   perLane: { laneId: string; n: number; cumulativeTiltDeltaR: number }[];
+  clusteredCi95?: {
+    clusterBy: "UTC_DAY";
+    clusters: number;
+    lowerMeanTiltDeltaR: number;
+    upperMeanTiltDeltaR: number;
+  } | null;
 }
 
 export interface CortexReadinessInputs {
@@ -175,6 +188,7 @@ export interface CortexReadinessReport {
   readyDefinition: string;
   readinessPct: number;
   ready: boolean;
+  learningEpoch: CortexReadinessRefitInput["learningEpoch"];
   components: CortexReadinessComponent[];
   beta: {
     evaluationBeta: number;
@@ -228,6 +242,22 @@ export interface CortexReadinessReport {
     refitRejected: number;
     refitNoExamples: number;
     decisionAlpha: CortexReadinessDecisionAlphaInput | null;
+  };
+  /** Evidence-quality gate separate from the collection-progress meter above. It never changes beta
+   * or auto-promotes; it states whether the accumulated alpha is diversified and statistically usable. */
+  promotionEvidence: {
+    ready: boolean;
+    minimumExamples: number;
+    examples: number;
+    alphaPositive: boolean;
+    clusteredCiLowerAboveZero: boolean;
+    clusteredCi95: CortexReadinessDecisionAlphaInput["clusteredCi95"];
+    largestPositiveLaneSharePct: number | null;
+    maxPositiveLaneSharePct: number;
+    largestRegimeFamilySharePct: number | null;
+    maxRegimeFamilySharePct: number;
+    allArchetypesAccepted: boolean;
+    blockers: string[];
   };
   inputsPresent: { brain: boolean; refit: boolean; collection: boolean; decisionAlpha: boolean; historyDays: number };
 }
@@ -442,6 +472,38 @@ export function computeCortexReadiness(inputs: CortexReadinessInputs): CortexRea
   const refitAccepted = archetypes.filter((a) => a.status === "ACCEPTED").length;
   const refitRejected = archetypes.filter((a) => a.status.startsWith("REJECTED")).length;
   const refitNoExamples = archetypes.filter((a) => a.status === "NO_EXAMPLES").length;
+  const minimumAlphaExamples = 200;
+  const maxPositiveLaneSharePct = 60;
+  const maxRegimeFamilySharePct = 70;
+  const alpha = inputs.decisionAlpha;
+  const positiveLaneTotal = (alpha?.perLane ?? []).reduce(
+    (sum, lane) => sum + Math.max(0, finiteOr(lane.cumulativeTiltDeltaR, 0)),
+    0,
+  );
+  const largestPositiveLaneSharePct =
+    positiveLaneTotal > 0
+      ? round2(
+          Math.max(
+            0,
+            ...(alpha?.perLane ?? []).map((lane) => Math.max(0, finiteOr(lane.cumulativeTiltDeltaR, 0))),
+          ) / positiveLaneTotal * 100,
+        )
+      : null;
+  const alphaPositive = (alpha?.cumulativeTiltDeltaR ?? 0) > 0 && (alpha?.meanTiltDeltaR ?? 0) > 0;
+  const clusteredCiLowerAboveZero = (alpha?.clusteredCi95?.lowerMeanTiltDeltaR ?? Number.NEGATIVE_INFINITY) > 0;
+  const allArchetypesAccepted = archetypes.length > 0 && archetypes.every((a) => a.status === "ACCEPTED");
+  const largestRegimeFamilySharePct = familyBalance.length > 0 ? familyBalance[0]!.sharePct : null;
+  const promotionEvidenceBlockers: string[] = [];
+  if ((alpha?.n ?? 0) < minimumAlphaExamples) promotionEvidenceBlockers.push(`decision alpha examples < ${minimumAlphaExamples}`);
+  if (!alphaPositive) promotionEvidenceBlockers.push("decision alpha is not positive");
+  if (!clusteredCiLowerAboveZero) promotionEvidenceBlockers.push("clustered 95% CI lower bound is not above zero");
+  if (largestPositiveLaneSharePct === null || largestPositiveLaneSharePct > maxPositiveLaneSharePct) {
+    promotionEvidenceBlockers.push(`positive alpha is concentrated above ${maxPositiveLaneSharePct}% in one lane`);
+  }
+  if (largestRegimeFamilySharePct === null || largestRegimeFamilySharePct > maxRegimeFamilySharePct) {
+    promotionEvidenceBlockers.push(`resolved outcomes are concentrated above ${maxRegimeFamilySharePct}% in one regime family`);
+  }
+  if (!allArchetypesAccepted) promotionEvidenceBlockers.push("not all archetype refits are accepted");
 
   return {
     formulaVersion: 1,
@@ -456,6 +518,7 @@ export function computeCortexReadiness(inputs: CortexReadinessInputs): CortexRea
       `Ini meteran progres — promosi tetap keputusan operator eksplisit, bukan otomatis.`,
     readinessPct,
     ready,
+    learningEpoch: inputs.refit?.learningEpoch ?? null,
     components,
     beta: {
       evaluationBeta: round2(inputs.refit ? finiteOr(inputs.refit.evaluationBeta, cortexBeta(cumulativeResolved)) : cortexBeta(cumulativeResolved)),
@@ -490,6 +553,20 @@ export function computeCortexReadiness(inputs: CortexReadinessInputs): CortexRea
       refitRejected,
       refitNoExamples,
       decisionAlpha: inputs.decisionAlpha,
+    },
+    promotionEvidence: {
+      ready: promotionEvidenceBlockers.length === 0,
+      minimumExamples: minimumAlphaExamples,
+      examples: alpha?.n ?? 0,
+      alphaPositive,
+      clusteredCiLowerAboveZero,
+      clusteredCi95: alpha?.clusteredCi95 ?? null,
+      largestPositiveLaneSharePct,
+      maxPositiveLaneSharePct,
+      largestRegimeFamilySharePct,
+      maxRegimeFamilySharePct,
+      allArchetypesAccepted,
+      blockers: promotionEvidenceBlockers,
     },
     inputsPresent: {
       brain: inputs.brain != null,

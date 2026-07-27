@@ -17,6 +17,7 @@ import {
   makeEntryMicrostructureAccessor,
   fourBrainInstanceAllowed,
   type FourBrainBindingDeps,
+  type EntryOrderflowSnapshot,
 } from "./four-brain-live-gather-bindings.js";
 import { assembleFourBrainTick } from "./four-brain-live-gather.js";
 import { runFourBrainShadowTick, type FourBrainTickResult } from "./four-brain-shadow-tick.js";
@@ -29,6 +30,8 @@ export interface FourBrainShadowCycleDeps {
   buildDeps: (nowMs: number) => Omit<FourBrainBindingDeps, "entryMicrostructure">;
   /** Async candle fetch for one symbol (injected — usually a binance testnet client). null ⇒ micro MISSING. */
   fetchCandles: (symbol: string) => Promise<Candle[] | null>;
+  /** Async USD-M futures order-book fetch, prewarmed beside candles. Optional and report-only. */
+  fetchOrderflow?: (symbol: string) => Promise<EntryOrderflowSnapshot | null>;
   candleTimeframe?: "5m" | "15m" | "1h";
   /** The current incumbent active lane allocation, for the capital-coverage report. */
   activeAllocation: () => { laneId: string; weightPct: number }[];
@@ -79,17 +82,32 @@ export async function runFourBrainShadowCycle(deps: FourBrainShadowCycleDeps): P
     // Pre-warm candles for the DISTINCT open-signal symbols (async), then expose a SYNC read for the gather.
     const symbols = Array.from(new Set(base.openSignals.map((s) => s.symbol)));
     const candleCache = new Map<string, Candle[] | null>();
+    const orderflowCache = new Map<string, EntryOrderflowSnapshot | null>();
     await Promise.all(
-      symbols.map(async (sym) => {
-        try {
-          candleCache.set(sym, await deps.fetchCandles(sym));
-        } catch {
-          candleCache.set(sym, null); // fetch failure ⇒ micro MISSING for this symbol, never fabricated
-        }
-      }),
+      symbols.flatMap((sym) => [
+        (async () => {
+          try {
+            candleCache.set(sym, await deps.fetchCandles(sym));
+          } catch {
+            candleCache.set(sym, null);
+          }
+        })(),
+        (async () => {
+          if (!deps.fetchOrderflow) {
+            orderflowCache.set(sym, null);
+            return;
+          }
+          try {
+            orderflowCache.set(sym, await deps.fetchOrderflow(sym));
+          } catch {
+            orderflowCache.set(sym, null);
+          }
+        })(),
+      ]),
     );
     const entryMicrostructure = makeEntryMicrostructureAccessor({
       candlesFor: (sym) => candleCache.get(sym) ?? null,
+      orderflowFor: (sym) => orderflowCache.get(sym) ?? null,
       timeframe: deps.candleTimeframe ?? "15m",
       nowMs,
     });

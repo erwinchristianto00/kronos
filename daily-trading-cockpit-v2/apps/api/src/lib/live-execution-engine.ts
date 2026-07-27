@@ -646,6 +646,8 @@ export interface LiveIntentSource {
   paperOrderId: string;
   laneId: string;
   qty: number;
+  /** Stable upstream observation identity used only for causal attribution. */
+  sourceObservationId?: string | null;
   regime?: string | null;
   controllerMode?: string | null;
   controllerConfidence?: string | null;
@@ -4569,6 +4571,9 @@ export class LiveExecutionEngine {
           laneId: intent.sourcePaperOrders?.[0]?.laneId ?? "UNKNOWN",
           symbol: intent.symbol,
           direction: intent.direction,
+          ...(intent.sourcePaperOrders?.[0]?.sourceObservationId
+            ? { signalId: intent.sourcePaperOrders[0].sourceObservationId }
+            : {}),
           source: "engine",
         },
         deferSave: true,
@@ -5878,6 +5883,7 @@ export class LiveExecutionEngine {
         paperOrderId: source.paperOrderId,
         laneId: source.selectedLaneId ?? "UNKNOWN",
         qty: sourcePlan.qty,
+        sourceObservationId: source.sourceObservationId,
         regime: source.regime ?? null,
         controllerMode: source.controllerMode ?? null,
         controllerConfidence: source.controllerConfidence ?? null,
@@ -6155,6 +6161,7 @@ export class LiveExecutionEngine {
           paperOrderId: paper.paperOrderId,
           laneId: paper.selectedLaneId ?? "UNKNOWN",
           qty: plan.qty,
+          sourceObservationId: paper.sourceObservationId,
           regime: paper.regime ?? null,
           controllerMode: paper.controllerMode ?? null,
           controllerConfidence: paper.controllerConfidence ?? null,
@@ -6239,6 +6246,7 @@ export class LiveExecutionEngine {
     return {
       ...source,
       laneId: source.laneId || paper?.selectedLaneId || "UNKNOWN",
+      sourceObservationId: source.sourceObservationId ?? paper?.sourceObservationId ?? null,
       regime: source.regime ?? paper?.regime ?? null,
       controllerMode: source.controllerMode ?? paper?.controllerMode ?? null,
       controllerConfidence: source.controllerConfidence ?? paper?.controllerConfidence ?? null,
@@ -6254,6 +6262,7 @@ export class LiveExecutionEngine {
       paperOrderId: intent.paperOrderId,
       laneId: paper?.selectedLaneId ?? "UNKNOWN",
       qty: intent.qty,
+      sourceObservationId: paper?.sourceObservationId ?? null,
     }, paper)];
   }
 

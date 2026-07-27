@@ -16,6 +16,7 @@ function pendingRow(over: Partial<PendingEntryRow> & { decisionId: string; asOfM
   return {
     decisionId: over.decisionId,
     asOfMs: over.asOfMs,
+    ...("signalId" in over ? { signalId: over.signalId } : {}),
     symbolOrBasketId: "symbolOrBasketId" in over ? (over.symbolOrBasketId as string | null) : "BTCUSDT",
     laneId: "laneId" in over ? (over.laneId as string | null) : "L1",
     side: over.side ?? "LONG",
@@ -35,6 +36,7 @@ function closedPath(over: {
   closedAtMs: number;
   closeR?: number | null;
   lastTickR?: number;
+  signalId?: string | null;
 }): PositionPath {
   return {
     key: over.key,
@@ -42,6 +44,7 @@ function closedPath(over: {
       laneId: over.laneId ?? "L1",
       symbol: over.symbol ?? "BTCUSDT",
       direction: over.direction ?? "LONG",
+      ...("signalId" in over ? { signalId: over.signalId } : {}),
       source: "engine",
     },
     ticks: [
@@ -94,6 +97,46 @@ describe("entry-brain-tier1-realized-resolver — strict windowed match", () => 
     expect(resolved.realizedR).toBe(0.7);
     expect(resolved.openedAtMs).toBe(openedAtMs);
     expect(resolved.closedAtMs).toBe(closedAtMs);
+  });
+
+  it("uses exact signal identity when multiple same-lane candidates share a time window", () => {
+    const pending = [
+      pendingRow({ decisionId: "wrong-signal", signalId: "obs-a", asOfMs: 11 * MIN }),
+      pendingRow({ decisionId: "owning-signal", signalId: "obs-b", asOfMs: 10 * MIN }),
+    ];
+    const closed = [
+      closedPath({
+        key: "pp:signal",
+        signalId: "obs-b",
+        firstTickMs: 12 * MIN,
+        closedAtMs: 50 * MIN,
+      }),
+    ];
+
+    const result = resolveEntryBrainTier1RealizedWithDiagnostics(pending, closed);
+    const byId = new Map(result.rows.map((row) => [row.decisionId, row]));
+    expect(byId.get("owning-signal")?.status).toBe("RESOLVED");
+    expect(byId.get("wrong-signal")?.status).toBe("PENDING");
+    expect(result.diagnostics.signalIdentityMatches).toBe(1);
+    expect(result.diagnostics.rejectionReasons.SIGNAL_ID_MISMATCH).toBe(1);
+  });
+
+  it("never falls back to a newer decision carrying a different non-null signal id", () => {
+    const pending = [
+      pendingRow({ decisionId: "different", signalId: "obs-other", asOfMs: 11 * MIN }),
+    ];
+    const closed = [
+      closedPath({
+        key: "pp:different",
+        signalId: "obs-real",
+        firstTickMs: 12 * MIN,
+        closedAtMs: 50 * MIN,
+      }),
+    ];
+
+    const result = resolveEntryBrainTier1RealizedWithDiagnostics(pending, closed);
+    expect(result.rows[0]?.status).toBe("PENDING");
+    expect(result.diagnostics.rejectionReasons.SIGNAL_ID_MISMATCH).toBe(1);
   });
 
   it("joins canonical and variant-matrix lane namespaces without rewriting historical identity", () => {

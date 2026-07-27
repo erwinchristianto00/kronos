@@ -45,6 +45,11 @@ import {
 } from "./cross-sectional-executor.js";
 import { getCurrentGuardVariantMatrixStore } from "./current-guard-variant-matrix.js";
 import { peekPaperExecutionRouterStore } from "./paper-execution-router.js";
+import {
+  cortexLearningEpoch,
+  filterCortexLearningEpochRows,
+  type CortexLearningEpoch,
+} from "./cortex-learning-epoch.js";
 
 /** Only pull outcomes resolved within this window — older ones can't attribute (their decisions rotated
  *  out of the ~26-day journal) and the refit's recency decay makes them ~zero weight anyway. Bounds the
@@ -526,8 +531,19 @@ export function gatherCortexRefitInputs(deps: {
   /** Test seam for the CG-router source. Defaults to the RESIDENT-ONLY reader (never a cold parse —
    *  see readResidentCgRouterOrders). Returning null means "no router data available this run". */
   readCgRouterOrders?: () => readonly CortexCgRouterOrderLike[] | null;
-}): CortexRefitInput & { journalBadLines: number; cgRouterOutcomes: CortexCgRouterOutcomeSummary } {
-  const sinceMs = deps.nowMs - CORTEX_REFIT_LOOKBACK_MS;
+}): CortexRefitInput & {
+  journalBadLines: number;
+  cgRouterOutcomes: CortexCgRouterOutcomeSummary;
+  learningEpoch: (CortexLearningEpoch & {
+    decisionRowsExcluded: number;
+    transitionalOutcomesExcluded: number;
+  }) | null;
+} {
+  const epoch = cortexLearningEpoch(deps.env);
+  const sinceMs = Math.max(
+    deps.nowMs - CORTEX_REFIT_LOOKBACK_MS,
+    epoch?.startMs ?? Number.NEGATIVE_INFINITY,
+  );
 
   const journal = readCortexDecisionRows([`${deps.journalFile}.1`, deps.journalFile]);
 
@@ -599,25 +615,35 @@ export function gatherCortexRefitInputs(deps: {
       })),
   }));
 
-  const { outcomes, skipsByLane } = collectCortexOutcomes({ directional, xsec, sinceMs });
+  const collected = collectCortexOutcomes({ directional, xsec, sinceMs });
+  // Resolution time alone is insufficient: a position opened before the epoch and closed after it
+  // carries pre-fix decision lineage. Keep it in its source artifact, but exclude it from this model.
+  const epochRows = filterCortexLearningEpochRows(journal.rows, collected.outcomes, epoch);
 
   const wiredLaneIds = cortexWiredOutcomeSourceLaneIds(directional, xsec);
   const roster = buildCortexAttrRoster(deps.staticWeightPctForLane, (laneId) => wiredLaneIds.has(laneId));
 
   return {
-    decisions: journal.rows,
-    outcomes,
+    decisions: epochRows.decisions,
+    outcomes: epochRows.outcomes,
     roster,
     nowMs: deps.nowMs,
     nowIso: deps.nowIso,
     currentSchemaVersion: CORTEX_FEATURE_SCHEMA_VERSION,
     ttlMsForLane: cortexLaneTtlMs,
-    skipsByLane,
+    skipsByLane: collected.skipsByLane,
     // Prune the counted-observation ledger STRICTLY OLDER than the bindings' lookback (5-day buffer) so an
     // outcome the bindings still return (resolvedAtMs ≥ sinceMs) can never be pruned and then re-counted.
     pruneBeforeMs: sinceMs - 5 * 86_400_000,
     journalBadLines: journal.badLines,
     cgRouterOutcomes: cgRouter.summary,
+    learningEpoch: epoch
+      ? {
+          ...epoch,
+          decisionRowsExcluded: epochRows.decisionRowsExcluded,
+          transitionalOutcomesExcluded: epochRows.transitionalOutcomesExcluded,
+        }
+      : null,
   };
 }
 
@@ -627,6 +653,10 @@ export function gatherCortexRefitInputs(deps: {
 export type CortexRefitReportWithMeta = CortexRefitReport & {
   journalBadLines: number;
   cgRouterOutcomes: CortexCgRouterOutcomeSummary;
+  learningEpoch: (CortexLearningEpoch & {
+    decisionRowsExcluded: number;
+    transitionalOutcomesExcluded: number;
+  }) | null;
 };
 let latestRefitReport: CortexRefitReportWithMeta | null = null;
 export function getLatestCortexRefitReport(): CortexRefitReportWithMeta | null {
@@ -699,7 +729,12 @@ export function runCortexNightlyRefit(deps: {
     readCgRouterOrders: deps.readCgRouterOrders,
   });
   const report = runCortexRefit(deps.store, { ...input, apply: deps.apply });
-  const withMeta = { ...report, journalBadLines: input.journalBadLines, cgRouterOutcomes: input.cgRouterOutcomes };
+  const withMeta = {
+    ...report,
+    journalBadLines: input.journalBadLines,
+    cgRouterOutcomes: input.cgRouterOutcomes,
+    learningEpoch: input.learningEpoch,
+  };
   latestRefitReport = withMeta;
 
   logCortexCgRouterOutcomeSummary(input.cgRouterOutcomes);

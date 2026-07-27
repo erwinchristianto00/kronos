@@ -134,6 +134,43 @@ describe("computeCortexReadiness — component math (the documented formula, no 
     expect(r.eta.reason).toContain("belum");
     expect(r.status.state).toBe("STUCK");
     expect(r.inputsPresent).toEqual({ brain: false, refit: false, collection: false, decisionAlpha: false, historyDays: 0 });
+    expect(r.promotionEvidence.ready).toBe(false);
+  });
+
+  it("keeps evidence readiness separate and blocks concentrated alpha despite ample samples", () => {
+    const r = computeCortexReadiness(makeInputs({
+      brain: {
+        cumulativeResolved: 350,
+        resolvedByFamily: { BREADTH: 200, NEUTRAL: 150 },
+        ledgerResolvedAtMs: [],
+        updatedAt: null,
+      },
+      refit: makeRefit({
+        archetypes: [
+          { archetype: "BREADTH", status: "ACCEPTED", examples: 200 },
+          { archetype: "NEUTRAL", status: "ACCEPTED", examples: 100 },
+          { archetype: "TACTICAL", status: "ACCEPTED", examples: 50 },
+        ],
+      }),
+      decisionAlpha: {
+        n: 300,
+        cumulativeTiltDeltaR: 3,
+        meanTiltDeltaR: 0.01,
+        perLane: [
+          { laneId: "DOMINANT", n: 250, cumulativeTiltDeltaR: 2.7 },
+          { laneId: "OTHER", n: 50, cumulativeTiltDeltaR: 0.3 },
+        ],
+        clusteredCi95: {
+          clusterBy: "UTC_DAY",
+          clusters: 8,
+          lowerMeanTiltDeltaR: 0.002,
+          upperMeanTiltDeltaR: 0.018,
+        },
+      },
+    }));
+    expect(r.promotionEvidence.ready).toBe(false);
+    expect(r.promotionEvidence.largestPositiveLaneSharePct).toBe(90);
+    expect(r.promotionEvidence.blockers.some((b) => b.includes("one lane"))).toBe(true);
   });
 
   it("READY exactly when all four gate conditions saturate (full ramp + families + blind ≤ floor + all lanes active)", () => {

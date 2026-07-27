@@ -44,6 +44,10 @@ export interface ExecutiveJournalContext {
   incumbent?: Record<string, unknown> | null;
   /** Invariant violations found this cycle (surfaced, not hidden). */
   invariantViolations?: string[];
+  /** Stable candidate identity copied from FourBrainIdentity. Optional for legacy records. */
+  signalId?: string | null;
+  /** Stable open-position identity copied from FourBrainIdentity. Optional for legacy records. */
+  positionId?: string | null;
 }
 
 /** Build the append-only report record. Carries schema versions, decision ids, validity, lane/symbol/
@@ -75,6 +79,8 @@ export function buildExecutiveDecisionRecord(exec: ExecutiveDecision, ctx: Execu
     },
     laneId: exec.laneId,
     symbolOrBasketId: exec.symbolOrBasketId,
+    signalId: ctx.signalId ?? null,
+    positionId: ctx.positionId ?? null,
     horizon: ctx.horizon ?? exec.direction?.horizon ?? null,
     candidateStatus: exec.candidateStatus,
     wouldAct,

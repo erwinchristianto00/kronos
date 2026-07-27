@@ -112,6 +112,7 @@ export type EntryBrainTier1Row = EntryBrainTier1PendingRow | EntryBrainTier1Reso
 export type EntryBrainTier1RejectionReason =
   | "MISSING_IDENTITY"
   | "NO_EXACT_LANE_SYMBOL_SIDE_CLOSE"
+  | "SIGNAL_ID_MISMATCH"
   | "DECISION_AFTER_OPEN"
   | "OUTSIDE_TTL"
   | "COMPETING_DECISION";
@@ -126,6 +127,8 @@ export interface EntryBrainTier1Diagnostics {
   /** Resolved joins where the journal and position path used different representations of the same
    * canonical lane (for example CG_WIDE_FAST_LONG vs CG_VARIANT_MATRIX:CG_WIDE_FAST_LONG). */
   namespaceNormalizedMatches: number;
+  /** Resolved joins owned by the exact stable signal id rather than the legacy time-window fallback. */
+  signalIdentityMatches: number;
   rejectedRows: number;
   rejectionReasons: Record<EntryBrainTier1RejectionReason, number>;
 }
@@ -139,6 +142,7 @@ function emptyRejectionReasons(): Record<EntryBrainTier1RejectionReason, number>
   return {
     MISSING_IDENTITY: 0,
     NO_EXACT_LANE_SYMBOL_SIDE_CLOSE: 0,
+    SIGNAL_ID_MISMATCH: 0,
     DECISION_AFTER_OPEN: 0,
     OUTSIDE_TTL: 0,
     COMPETING_DECISION: 0,
@@ -166,6 +170,10 @@ function matchKey(laneId: string, symbolOrBasketId: string, side: string): strin
   return `${normalizeEntryTier1LaneNamespace(laneId)}::${symbolOrBasketId.trim().toUpperCase()}::${side}`;
 }
 
+function signalMatchKey(laneId: string, symbolOrBasketId: string, side: string, signalId: string): string {
+  return `${matchKey(laneId, symbolOrBasketId, side)}::${signalId}`;
+}
+
 /** The real open-time proxy for a closed path: its own earliest recorded tick. Falls back to
  *  closedAtMs (narrows the window to zero-width, never widens it into a false match) when the path
  *  has no ticks at all — never fabricated. */
@@ -189,6 +197,7 @@ interface MatchableClose {
   closedAtMs: number;
   realizedR: number;
   realizedRSource: "engine" | "executor";
+  signalId: string | null;
 }
 
 /** Defensive extraction of the joinable closed paths: meta-less, not-actually-closed, or
@@ -208,6 +217,10 @@ function toMatchableCloses(paths: PositionPath[]): MatchableClose[] {
       closedAtMs: path.closedAtMs as number,
       realizedR,
       realizedRSource: path.meta.source,
+      signalId:
+        typeof path.meta.signalId === "string" && path.meta.signalId.length > 0
+          ? path.meta.signalId
+          : null,
     });
   }
   return out;
@@ -236,6 +249,7 @@ export function resolveEntryBrainTier1RealizedWithDiagnostics(
   // simply never inserted into the index, so they always fall through to PENDING below. No identity is
   // ever fabricated for them.
   const byKey = new Map<string, PendingEntryRow[]>();
+  const bySignalKey = new Map<string, PendingEntryRow[]>();
   for (const row of rows) {
     if (!row.laneId || !row.symbolOrBasketId) continue;
     if (!Number.isFinite(row.asOfMs)) continue;
@@ -243,8 +257,15 @@ export function resolveEntryBrainTier1RealizedWithDiagnostics(
     let arr = byKey.get(key);
     if (!arr) byKey.set(key, (arr = []));
     arr.push(row);
+    if (typeof row.signalId === "string" && row.signalId.length > 0) {
+      const exactKey = signalMatchKey(row.laneId, row.symbolOrBasketId, row.side, row.signalId);
+      let exact = bySignalKey.get(exactKey);
+      if (!exact) bySignalKey.set(exactKey, (exact = []));
+      exact.push(row);
+    }
   }
   for (const arr of byKey.values()) arr.sort((a, b) => a.asOfMs - b.asOfMs);
+  for (const arr of bySignalKey.values()) arr.sort((a, b) => a.asOfMs - b.asOfMs);
 
   // Deterministic order: oldest real open first (ties broken by path key), mirroring
   // cortex-attribution's own "oldest resolved first" determinism note.
@@ -255,12 +276,24 @@ export function resolveEntryBrainTier1RealizedWithDiagnostics(
   const consumedDecisionIds = new Set<string>(); // a decision, once it owns a close, can never own another
   const resolvedByDecisionId = new Map<string, EntryBrainTier1ResolvedRow>();
   let namespaceNormalizedMatches = 0;
+  let signalIdentityMatches = 0;
 
   for (const close of closes) {
     const meta = close.path.meta!;
     const key = matchKey(meta.laneId, meta.symbol, meta.direction);
-    const candidates = byKey.get(key);
-    if (!candidates) continue;
+    const exactCandidates = close.signalId
+      ? bySignalKey.get(signalMatchKey(meta.laneId, meta.symbol, meta.direction, close.signalId))
+      : undefined;
+    // Exact identity is authoritative when both sides carry it. The legacy fallback remains only
+    // for historical rows where at least one side predates signal-id persistence; a different
+    // non-null signal id can never claim this close merely because lane/symbol/side happen to match.
+    const candidates =
+      exactCandidates && exactCandidates.length > 0
+        ? exactCandidates
+        : (byKey.get(key) ?? []).filter(
+            (candidate) => close.signalId === null || !candidate.signalId,
+          );
+    if (candidates.length === 0) continue;
     const ttl = Math.max(0, ttlFor(meta.laneId));
     const lo = close.openedAtMs - ttl;
 
@@ -279,6 +312,7 @@ export function resolveEntryBrainTier1RealizedWithDiagnostics(
 
     consumedDecisionIds.add(owner.decisionId);
     if (owner.laneId !== meta.laneId) namespaceNormalizedMatches += 1;
+    if (close.signalId && owner.signalId === close.signalId) signalIdentityMatches += 1;
     resolvedByDecisionId.set(owner.decisionId, {
       decisionId: owner.decisionId,
       status: "RESOLVED",
@@ -314,12 +348,19 @@ export function resolveEntryBrainTier1RealizedWithDiagnostics(
 
   const rejectionReasons = emptyRejectionReasons();
   const closesByIdentity = new Map<string, typeof closes>();
+  const closesBySignalIdentity = new Map<string, typeof closes>();
   for (const close of closes) {
     const meta = close.path.meta!;
     const key = matchKey(meta.laneId, meta.symbol, meta.direction);
     const existing = closesByIdentity.get(key);
     if (existing) existing.push(close);
     else closesByIdentity.set(key, [close]);
+    if (close.signalId) {
+      const exactKey = signalMatchKey(meta.laneId, meta.symbol, meta.direction, close.signalId);
+      const exact = closesBySignalIdentity.get(exactKey);
+      if (exact) exact.push(close);
+      else closesBySignalIdentity.set(exactKey, [close]);
+    }
   }
   for (const row of outputRows) {
     if (row.status === "RESOLVED") continue;
@@ -329,9 +370,30 @@ export function resolveEntryBrainTier1RealizedWithDiagnostics(
       continue;
     }
     const key = matchKey(source.laneId, source.symbolOrBasketId, source.side);
-    const identityCloses = closesByIdentity.get(key) ?? [];
+    const laneCloses = closesByIdentity.get(key) ?? [];
+    const exactSignalCloses =
+      typeof source.signalId === "string" && source.signalId.length > 0
+        ? closesBySignalIdentity.get(
+            signalMatchKey(source.laneId, source.symbolOrBasketId, source.side, source.signalId),
+          ) ?? []
+        : [];
+    const legacyCloses = laneCloses.filter((close) => close.signalId === null);
+    const identityCloses =
+      exactSignalCloses.length > 0
+        ? exactSignalCloses
+        : typeof source.signalId === "string" && source.signalId.length > 0
+          ? legacyCloses
+          : laneCloses;
     if (identityCloses.length === 0) {
-      rejectionReasons.NO_EXACT_LANE_SYMBOL_SIDE_CLOSE += 1;
+      if (
+        typeof source.signalId === "string"
+        && source.signalId.length > 0
+        && laneCloses.some((close) => close.signalId !== null)
+      ) {
+        rejectionReasons.SIGNAL_ID_MISMATCH += 1;
+      } else {
+        rejectionReasons.NO_EXACT_LANE_SYMBOL_SIDE_CLOSE += 1;
+      }
       continue;
     }
     const ttl = Math.max(0, ttlFor(source.laneId));
@@ -361,6 +423,7 @@ export function resolveEntryBrainTier1RealizedWithDiagnostics(
       unusableClosedPaths: Math.max(0, (Array.isArray(closedPaths) ? closedPaths.length : 0) - closes.length),
       matchedRows: resolvedByDecisionId.size,
       namespaceNormalizedMatches,
+      signalIdentityMatches,
       rejectedRows: outputRows.length - resolvedByDecisionId.size,
       rejectionReasons,
     },

@@ -101,7 +101,11 @@ describe("Four-Brain journal — append-only, malformed-tolerant, deduped", () =
       nowMs: NOW, marketState: decideMarketState(marketInput()), direction: decideDirection(directionInput({ longEdge: src(0.1) })),
       entry: decideEntry(entryInput()), exit: null, laneId: "RC", symbolOrBasketId: "BTCUSDT", laneEligibleIncumbent: true, cortexAllocationPct: 40,
     });
-    const rec = buildExecutiveDecisionRecord(exec, { horizon: "INTRADAY", incumbent: { note: "incumbent baseline" } });
+    const rec = buildExecutiveDecisionRecord(exec, {
+      horizon: "INTRADAY",
+      signalId: "signal-1",
+      incumbent: { note: "incumbent baseline" },
+    });
     j.append(rec);
     j.append(rec); // duplicate id — must dedupe on read
     appendFileSync(file, '{"kind":"EXECUTIVE_DECISION","decisionIds":{bad json\n', "utf-8"); // malformed line
@@ -111,5 +115,6 @@ describe("Four-Brain journal — append-only, malformed-tolerant, deduped", () =
     expect(rows[0]!.candidateStatus).toBe("VALID");
     expect(rows[0]!.wouldAct).toBe(true);
     expect(rows[0]!.raw.reportOnly).toBe(true);
+    expect(rows[0]!.raw.signalId).toBe("signal-1");
   });
 });

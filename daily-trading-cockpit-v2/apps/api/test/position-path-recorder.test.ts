@@ -736,7 +736,13 @@ describe("SingleSymbolLaneExecutor dense R-path hook", () => {
     }
     const path = recorder.getPath(key)!;
     expect(path.ticks).toHaveLength(3);
-    expect(path.meta).toEqual({ laneId: "COMPOSITE_ESTIMATOR_WIDE_LONG", symbol: "ETHUSDT", direction: "LONG", source: "executor" });
+    expect(path.meta).toEqual({
+      laneId: "COMPOSITE_ESTIMATOR_WIDE_LONG",
+      symbol: "ETHUSDT",
+      direction: "LONG",
+      signalId: "ce:ETHUSDT:1",
+      source: "executor",
+    });
     marks.forEach((mark, i) => {
       expect(path.ticks[i]!.r).toBeCloseTo((mark - 2000) / 100, 4); // LONG favorableR, risk = 100
     });

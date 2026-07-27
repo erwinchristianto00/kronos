@@ -33,6 +33,7 @@ const EMPTY_DECISION_ALPHA: CortexShadowDecisionAlphaResult = {
   cumulativeTiltDeltaR: 0,
   meanTiltDeltaR: null,
   perLane: [],
+  clusteredCi95: null,
 };
 
 export function buildCortexShadowDecisionAlphaReport(

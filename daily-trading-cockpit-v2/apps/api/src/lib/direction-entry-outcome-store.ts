@@ -319,10 +319,12 @@ function sanitizeTier1Diagnostics(raw: unknown): EntryBrainTier1Diagnostics | nu
     unusableClosedPaths: nonNegInt(source.unusableClosedPaths),
     matchedRows: nonNegInt(source.matchedRows),
     namespaceNormalizedMatches: nonNegInt(source.namespaceNormalizedMatches),
+    signalIdentityMatches: nonNegInt(source.signalIdentityMatches),
     rejectedRows: nonNegInt(source.rejectedRows),
     rejectionReasons: {
       MISSING_IDENTITY: nonNegInt(reasons.MISSING_IDENTITY),
       NO_EXACT_LANE_SYMBOL_SIDE_CLOSE: nonNegInt(reasons.NO_EXACT_LANE_SYMBOL_SIDE_CLOSE),
+      SIGNAL_ID_MISMATCH: nonNegInt(reasons.SIGNAL_ID_MISMATCH),
       DECISION_AFTER_OPEN: nonNegInt(reasons.DECISION_AFTER_OPEN),
       OUTSIDE_TTL: nonNegInt(reasons.OUTSIDE_TTL),
       COMPETING_DECISION: nonNegInt(reasons.COMPETING_DECISION),

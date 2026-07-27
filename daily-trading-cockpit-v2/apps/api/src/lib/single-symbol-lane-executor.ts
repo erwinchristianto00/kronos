@@ -921,7 +921,13 @@ export class SingleSymbolLaneExecutor {
       const currentR = favorableR(pos.direction, pos.entryPrice, pos.stopPrice, mark);
       if (!Number.isFinite(currentR) || !Number.isFinite(tsMs)) return;
       recorder.recordTick(this.positionPathKey(pos), tsMs, currentR, {
-        meta: { laneId: this.laneId, symbol: pos.symbol, direction: pos.direction, source: "executor" },
+        meta: {
+          laneId: this.laneId,
+          symbol: pos.symbol,
+          direction: pos.direction,
+          signalId: pos.sourceObservationId,
+          source: "executor",
+        },
         deferSave: true,
       });
     } catch {

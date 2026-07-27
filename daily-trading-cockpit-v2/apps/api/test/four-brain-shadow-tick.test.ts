@@ -352,19 +352,27 @@ describe("Four-Brain incumbent parity", () => {
 
 describe("Adapter B — microstructure accessor wired through the gather into Entry", () => {
   const freshMicro: EntryMicrostructure = {
-    distanceFromVwapAtr: 0.5, candleExtensionAtr: 0.5, breakoutConfirmed: true, volumeConfirmed: true, candleFresh: true, observedAtMs: NOW - MIN,
+    distanceFromVwapAtr: 0.5,
+    candleExtensionAtr: 0.5,
+    breakoutConfirmed: true,
+    volumeConfirmed: true,
+    candleFresh: true,
+    observedAtMs: NOW - MIN,
+    spreadBps: 1.2,
+    expectedSlippageBps: 1.8,
+    bookDepthOk: true,
+    orderflowObservedAtMs: NOW - 1_000,
   };
 
-  it("accessor output populates VWAP-distance/extension FRESH while order-book depth stays MISSING", () => {
+  it("accessor output keeps candle and USD-M order-book sources independently FRESH", () => {
     const g = assembleFourBrainTick(buildFourBrainGatherInput(fakeDeps({ entryMicrostructure: () => freshMicro })));
     const input = g.entryCandidates[0]!.input;
     expect(input.candleFresh).toBe(true);
     const d = decideEntry(input);
     expect(d.sourceStatuses.distanceFromVwapAtr).toBe("FRESH");
     expect(d.sourceStatuses.candleExtensionAtr).toBe("FRESH");
-    // Order-book depth (spread/slippage) has no source ⇒ stays MISSING even with a candle adapter present.
-    expect(d.sourceStatuses.spreadBps).toBe("MISSING");
-    expect(d.sourceStatuses.expectedSlippageBps).toBe("MISSING");
+    expect(d.sourceStatuses.spreadBps).toBe("FRESH");
+    expect(d.sourceStatuses.expectedSlippageBps).toBe("FRESH");
   });
 
   it("accessor reporting candleFresh=false blocks ENTER_NOW through the gather (stale candles)", () => {

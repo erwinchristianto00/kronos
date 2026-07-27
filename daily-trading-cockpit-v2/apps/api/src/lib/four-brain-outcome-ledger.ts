@@ -80,6 +80,8 @@ export interface PendingDirectionRow {
 export interface PendingEntryRow {
   decisionId: string;
   asOfMs: number;
+  /** Stable candidate identity when emitted by the current journal schema; absent on legacy rows. */
+  signalId?: string | null;
   symbolOrBasketId: string | null;
   laneId: string | null;
   side: FourBrainOutcomeEntrySide;
@@ -287,6 +289,7 @@ export function extractPendingEntryRow(record: Record<string, unknown>): Pending
   return {
     decisionId,
     asOfMs,
+    ...(stringOrNull(record.signalId) ? { signalId: stringOrNull(record.signalId) } : {}),
     symbolOrBasketId: stringOrNull(record.symbolOrBasketId),
     laneId: stringOrNull(record.laneId),
     side,

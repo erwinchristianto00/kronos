@@ -96,10 +96,23 @@ describe("Adapter B — makeEntryMicrostructureAccessor (TTL + robustness)", () 
     expect(makeEntryMicrostructureAccessor({ candlesFor: () => null, nowMs: NOW })("X", "LONG")).toBeNull();
   });
 
-  it("EntryMicrostructure carries NO order-book fields — spread/slippage stay MISSING structurally", () => {
-    const acc = makeEntryMicrostructureAccessor({ candlesFor: () => makeCandles(60, NOW - MinutesMs(5)), nowMs: NOW });
+  it("merges independently prewarmed USD-M order-book cost without changing candle provenance", () => {
+    const acc = makeEntryMicrostructureAccessor({
+      candlesFor: () => makeCandles(60, NOW - MinutesMs(5)),
+      orderflowFor: () => ({
+        spreadBps: 1.2,
+        expectedSlippageBpsBuy: 2.1,
+        expectedSlippageBpsSell: 1.8,
+        bookDepthOkBuy: true,
+        bookDepthOkSell: true,
+        observedAtMs: NOW - 1_000,
+      }),
+      nowMs: NOW,
+    });
     const m = acc("X", "LONG")!;
-    expect(m).not.toHaveProperty("spreadBps");
-    expect(m).not.toHaveProperty("expectedSlippageBps");
+    expect(m.spreadBps).toBe(1.2);
+    expect(m.expectedSlippageBps).toBe(2.1);
+    expect(m.bookDepthOk).toBe(true);
+    expect(m.orderflowObservedAtMs).toBe(NOW - 1_000);
   });
 });

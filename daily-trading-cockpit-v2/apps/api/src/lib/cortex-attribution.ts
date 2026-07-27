@@ -403,6 +403,14 @@ export interface CortexShadowDecisionAlphaResult {
   /** cumulativeTiltDeltaR / n, or null if n===0 — the average per-outcome edge the tilt adds. */
   meanTiltDeltaR: number | null;
   perLane: CortexShadowDecisionAlphaLane[];
+  /** Cluster-robust 95% CI for mean tilt delta, clustered by UTC resolution day. null until at
+   * least five independent day clusters exist; a missing CI can never be interpreted as passing. */
+  clusteredCi95: {
+    clusterBy: "UTC_DAY";
+    clusters: number;
+    lowerMeanTiltDeltaR: number;
+    upperMeanTiltDeltaR: number;
+  } | null;
 }
 
 /**
@@ -414,6 +422,7 @@ export interface CortexShadowDecisionAlphaResult {
  */
 export function cortexShadowDecisionAlpha(examples: CortexAttributedExample[]): CortexShadowDecisionAlphaResult {
   const perLane = new Map<string, { n: number; sum: number }>();
+  const validRows: Array<{ resolvedAtMs: number; tiltDeltaR: number }> = [];
   let cumulativeTiltDeltaR = 0;
   let n = 0;
   for (const e of examples) {
@@ -422,17 +431,45 @@ export function cortexShadowDecisionAlpha(examples: CortexAttributedExample[]): 
     if (!Number.isFinite(tiltDeltaR)) continue;
     cumulativeTiltDeltaR += tiltDeltaR;
     n += 1;
+    validRows.push({ resolvedAtMs: e.resolvedAtMs, tiltDeltaR });
     const l = perLane.get(e.laneId) ?? { n: 0, sum: 0 };
     l.n += 1;
     l.sum += tiltDeltaR;
     perLane.set(e.laneId, l);
   }
+  const meanTiltDeltaR = n > 0 ? cumulativeTiltDeltaR / n : null;
+  const dayClusters = new Map<string, number[]>();
+  for (const row of validRows) {
+    if (!Number.isFinite(row.resolvedAtMs)) continue;
+    const day = new Date(row.resolvedAtMs).toISOString().slice(0, 10);
+    const values = dayClusters.get(day) ?? [];
+    values.push(row.tiltDeltaR);
+    dayClusters.set(day, values);
+  }
+  let clusteredCi95: CortexShadowDecisionAlphaResult["clusteredCi95"] = null;
+  if (meanTiltDeltaR !== null && dayClusters.size >= 5) {
+    let squaredClusterScoreSum = 0;
+    for (const values of dayClusters.values()) {
+      const clusterScore = values.reduce((sum, value) => sum + value - meanTiltDeltaR, 0);
+      squaredClusterScoreSum += clusterScore * clusterScore;
+    }
+    const g = dayClusters.size;
+    const variance = (g / (g - 1)) * squaredClusterScoreSum / (n * n);
+    const standardError = Math.sqrt(Math.max(0, variance));
+    clusteredCi95 = {
+      clusterBy: "UTC_DAY",
+      clusters: g,
+      lowerMeanTiltDeltaR: meanTiltDeltaR - 1.96 * standardError,
+      upperMeanTiltDeltaR: meanTiltDeltaR + 1.96 * standardError,
+    };
+  }
   return {
     n,
     cumulativeTiltDeltaR,
-    meanTiltDeltaR: n > 0 ? cumulativeTiltDeltaR / n : null,
+    meanTiltDeltaR,
     perLane: [...perLane.entries()]
       .map(([laneId, v]) => ({ laneId, n: v.n, cumulativeTiltDeltaR: v.sum }))
       .sort((a, b) => Math.abs(b.cumulativeTiltDeltaR) - Math.abs(a.cumulativeTiltDeltaR)),
+    clusteredCi95,
   };
 }

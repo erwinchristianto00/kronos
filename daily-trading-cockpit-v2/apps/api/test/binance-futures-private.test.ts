@@ -35,6 +35,30 @@ describe("binance-futures-private signing", () => {
     expect(resolveLiveBinanceBaseUrl("mainnet")).toContain("fapi.binance.com");
   });
 
+  it("reads the public book ticker from the same selected execution base", async () => {
+    const urls: string[] = [];
+    const fetchImpl = (async (url: RequestInfo | URL) => {
+      urls.push(String(url));
+      return new Response(JSON.stringify({
+        bidPrice: "64100.5",
+        askPrice: "64101.0",
+        bidQty: "2.5",
+        askQty: "3.5",
+        time: 1_700_000_000_000,
+      }), { status: 200 });
+    }) as typeof fetch;
+    const client = new BinanceFuturesPrivateClient({
+      apiKey: "k",
+      apiSecret: "s",
+      env: "testnet",
+      fetchImpl,
+    });
+    const book = await client.getBookTicker("BTCUSDT");
+    expect(book.bid).toBe(64100.5);
+    expect(book.ask).toBe(64101);
+    expect(urls[0]).toContain("testnet.binancefuture.com/fapi/v1/ticker/bookTicker");
+  });
+
   it("refuses signed requests when measured clock skew exceeds the guard", async () => {
     // Fake fetch: /fapi/v1/time replies with a server time 10s ahead of local.
     const fetchImpl = (async (url: RequestInfo | URL) => {

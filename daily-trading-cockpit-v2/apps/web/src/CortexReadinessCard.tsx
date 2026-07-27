@@ -16,6 +16,13 @@ type Readiness = {
   readyDefinition: string;
   readinessPct: number;
   ready: boolean;
+  learningEpoch: {
+    id: 'POST_LINEAGE_V2';
+    startIso: string;
+    startMs: number;
+    decisionRowsExcluded: number;
+    transitionalOutcomesExcluded: number;
+  } | null;
   components: Component[];
   beta: { evaluationBeta: number; promotedBeta: number; betaMax: number };
   rate: {
@@ -43,7 +50,27 @@ type Readiness = {
   reinforcement: {
     positive: number; noReward: number; positiveSharePct: number | null;
     refitAccepted: number; refitRejected: number; refitNoExamples: number;
-    decisionAlpha: { n: number; cumulativeTiltDeltaR: number; meanTiltDeltaR: number | null; perLane: Array<{ laneId: string; n: number; cumulativeTiltDeltaR: number }> } | null;
+    decisionAlpha: {
+      n: number;
+      cumulativeTiltDeltaR: number;
+      meanTiltDeltaR: number | null;
+      perLane: Array<{ laneId: string; n: number; cumulativeTiltDeltaR: number }>;
+      clusteredCi95?: { clusterBy: 'UTC_DAY'; clusters: number; lowerMeanTiltDeltaR: number; upperMeanTiltDeltaR: number } | null;
+    } | null;
+  };
+  promotionEvidence: {
+    ready: boolean;
+    minimumExamples: number;
+    examples: number;
+    alphaPositive: boolean;
+    clusteredCiLowerAboveZero: boolean;
+    clusteredCi95: { clusterBy: 'UTC_DAY'; clusters: number; lowerMeanTiltDeltaR: number; upperMeanTiltDeltaR: number } | null;
+    largestPositiveLaneSharePct: number | null;
+    maxPositiveLaneSharePct: number;
+    largestRegimeFamilySharePct: number | null;
+    maxRegimeFamilySharePct: number;
+    allArchetypesAccepted: boolean;
+    blockers: string[];
   };
   inputsPresent: { brain: boolean; refit: boolean; collection: boolean; decisionAlpha: boolean; historyDays: number };
 };
@@ -143,6 +170,20 @@ export function CortexReadinessCard() {
         <span style={{ color: C.dim, fontSize: 12 }}>refresh 60s</span>
       </header>
 
+      {r.learningEpoch && (
+        <div style={{ padding: '8px 16px', borderBottom: `1px solid ${C.border}`, background: C.sub, color: C.dim, fontSize: 11, lineHeight: 1.5 }}>
+          <b style={{ color: C.good }}>POST-LINEAGE V2</b>
+          {' · '}learning/promotion sejak {new Date(r.learningEpoch.startIso).toISOString()}
+          {' · '}all-time lineage tetap tersimpan: {r.lineage?.outcomesResolved ?? 'n/a'} resolved
+          {' · '}cohort baru: {r.quality.cumulativeResolved} labeled
+          {r.learningEpoch.transitionalOutcomesExcluded > 0 && (
+            <span style={{ color: C.accent }}>
+              {' · '}{r.learningEpoch.transitionalOutcomesExcluded} posisi transisi dikecualikan
+            </span>
+          )}
+        </div>
+      )}
+
       <div style={{ display: 'flex', flexWrap: 'wrap' }}>
         {/* headline + components */}
         <div style={{ flex: '1 1 340px', minWidth: 300, padding: '14px 16px', borderRight: `1px solid ${C.border}` }}>
@@ -166,6 +207,24 @@ export function CortexReadinessCard() {
           <div style={{ color: C.dim, fontSize: 10, marginTop: 8, lineHeight: 1.5 }}>
             Formula terbuka (hover angka besar / tiap bar): semua komponen = input gate promosi yang sebenarnya, tidak ada angka black-box.
           </div>
+          {r.promotionEvidence && (
+            <div style={{ marginTop: 10, padding: '8px 10px', border: `1px solid ${r.promotionEvidence.ready ? C.good : C.accent}`, borderRadius: 6, background: C.sub }}>
+              <div style={{ color: r.promotionEvidence.ready ? C.good : C.accent, fontSize: 12, fontWeight: 700 }}>
+                {r.promotionEvidence.ready ? 'EVIDENCE READY' : 'EVIDENCE NOT READY'}
+              </div>
+              <div style={{ color: C.dim, fontSize: 11, lineHeight: 1.5, marginTop: 3 }}>
+                alpha n={r.promotionEvidence.examples}/{r.promotionEvidence.minimumExamples}
+                {' · '}CI lower {r.promotionEvidence.clusteredCi95 ? fmtR(r.promotionEvidence.clusteredCi95.lowerMeanTiltDeltaR) : 'belum tersedia'}
+                {' · '}lane concentration {r.promotionEvidence.largestPositiveLaneSharePct == null ? 'n/a' : `${r.promotionEvidence.largestPositiveLaneSharePct.toFixed(1)}%`}
+                {' · '}regime concentration {r.promotionEvidence.largestRegimeFamilySharePct == null ? 'n/a' : `${r.promotionEvidence.largestRegimeFamilySharePct.toFixed(1)}%`}
+              </div>
+              {!r.promotionEvidence.ready && (
+                <div style={{ color: C.dim, fontSize: 10, lineHeight: 1.45, marginTop: 3 }}>
+                  blocker: {r.promotionEvidence.blockers.join(' · ')}
+                </div>
+              )}
+            </div>
+          )}
         </div>
 
         {/* rate + ETA + status — condensed to one always-visible line (2026-07-23 declutter;
