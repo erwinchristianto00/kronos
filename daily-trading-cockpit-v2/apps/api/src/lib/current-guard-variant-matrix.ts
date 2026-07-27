@@ -140,9 +140,29 @@ export type VariantMatrixStatus =
 // Wider stops therefore carry a smaller cost-in-R, which is the single most
 // important geometry fact the edge audit surfaced.
 export const TAKER_ROUNDTRIP_BPS = REALISTIC_ROUND_TRIP_FEE_SLIP_BPS; // 22 (fee+slippage, both sides)
-// Maker provides liquidity (limit, no spread cross). Binance USD-M maker fee
-// ~2bps/side; we add a conservative buffer so we never over-claim the maker edge.
-export const MAKER_ROUNDTRIP_BPS = REALISTIC_FEE_BPS_PER_SIDE + 1; // 6 (conservative maker round-trip)
+/**
+ * Both-sides-maker round trip: Binance USD-M maker is 2 bps/side, so 4. No spread cross on either
+ * leg, which is the whole point of posting a resting limit.
+ *
+ * 2026-07-27: was `REALISTIC_FEE_BPS_PER_SIDE + 1` = 6. That expression derived the MAKER cost from
+ * the TAKER per-side rate and added an arbitrary 1 — it was never 2×2 plus a buffer, it just landed
+ * near a plausible number. The taker side of that formula is now measured exactly (5.0000 bps/side,
+ * reconciled against /fapi/v1/income at 3.5e-8), which is precisely why it should not be the basis
+ * for the maker figure.
+ *
+ * WHAT THIS DOES NOT COVER, stated rather than buried: a maker_limit variant posts its ENTRY as a
+ * limit, but its EXIT is only maker when a TP limit fills. A stop-out exits at market and pays the
+ * 5 bps taker rate, so that round trip is really 2 + 5 = 7. One constant cannot be right for both
+ * paths. `_computePaperExitCostR` already branches on TP_LIKE vs STOP_LIKE and adds
+ * STOP_OUT_SLIPPAGE_BPS on the stop path, but it does NOT add the maker→taker fee difference
+ * (3 bps) there.
+ *
+ * So this change removes a ~2 bps OVERCHARGE on every maker close and leaves a smaller ~3 bps
+ * UNDERCHARGE on the maker closes that stop out. Net direction depends on a lane's stop rate; on
+ * CG_MAKER_LIMIT_SIM the overcharge dominated. Fixing the stop leg properly is a cost-model change,
+ * deliberately not bundled into a constant correction.
+ */
+export const MAKER_ROUNDTRIP_BPS = 4;
 export const STRESS_EXTRA_BPS = 10; // +10bps slippage stress test
 // Fresh-feed measurement: an observation is "fresh-valid" only if its entry was placed within this
 // window of now — i.e. a price you could ACTUALLY have taken live. The old engine hardcoded this
