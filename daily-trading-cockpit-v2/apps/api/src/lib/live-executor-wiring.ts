@@ -24,21 +24,56 @@ export interface LiveExecutorGateEngine {
  * and the plain allow-lane check (redundant once explicit inclusion is true, kept as a defensive
  * second check in case the two functions' semantics ever diverge).
  */
+/**
+ * The same gate as isNewExecutorLaneAllowed, but it NAMES the condition that bound.
+ *
+ * WHY (2026-07-27): REGIME_COMPOSITE_CONFIRMATION_LONG — the only lane on this account with a
+ * positive real-money record (9 closes, +$7.79) — stopped opening on 2026-07-14 while its signal
+ * store kept producing candidates as recently as 2026-07-26. Twelve days of silent refusal, and
+ * the executor's own status panel reported `entryBlockReason: null` throughout, because the only
+ * reason function wired into it was `() => edgeVeto(dir).reason` — ONE of the gate's conditions.
+ * A null reason therefore never meant "not blocked"; it meant "not blocked by the one thing I can
+ * see", which is indistinguishable from healthy at a glance. That is the failure this exists to
+ * end: a lane that declines every signal must say which rule declined it.
+ *
+ * isNewExecutorLaneAllowed is now a thin wrapper over this, so the predicate and its explanation
+ * cannot drift apart — the usual way this class of bug regenerates is a hand-maintained mirror of
+ * the conditions that falls one edit behind.
+ *
+ * Order matches the original exactly, so `.allowed` is unchanged for every caller.
+ */
+export function newExecutorLaneGate(
+  laneId: string,
+  env: "testnet" | "mainnet",
+  engine: LiveExecutorGateEngine | null,
+  opts: { mainnetEntryEligible?: boolean } = {},
+): { allowed: boolean; reason: string | null } {
+  if (!engine?.isArmed()) return { allowed: false, reason: "engine is not ARMED" };
+  if (!engine.canOpenNewEntries()) return { allowed: false, reason: "new-entry drain is active (operator paused new entries)" };
+  if (
+    env === "mainnet" &&
+    opts.mainnetEntryEligible === false &&
+    process.env.LIVE_UNPROVEN_EXECUTION_OVERRIDE !== "1"
+  ) {
+    return { allowed: false, reason: "lane is not mainnet-entry-eligible (unproven on real money; set LIVE_UNPROVEN_EXECUTION_OVERRIDE=1 to override)" };
+  }
+  const explicit = engine?.laneSelectionExplicitlyIncludesLane(laneId) ?? false;
+  if (!explicit) {
+    return { allowed: false, reason: `lane is not named in the operator allocation table (explicit inclusion required; "no allocation restricting anything" does NOT count)` };
+  }
+  if (!(engine?.laneSelectionAllowsLane(laneId) ?? true)) {
+    return { allowed: false, reason: "lane is present in the allocation table but disallowed (0% weight)" };
+  }
+  return { allowed: true, reason: null };
+}
+
 export function isNewExecutorLaneAllowed(
   laneId: string,
   env: "testnet" | "mainnet",
   engine: LiveExecutorGateEngine | null,
   opts: { mainnetEntryEligible?: boolean } = {},
 ): boolean {
-  if (!engine?.isArmed() || !engine.canOpenNewEntries()) return false;
-  if (
-    env === "mainnet" &&
-    opts.mainnetEntryEligible === false &&
-    process.env.LIVE_UNPROVEN_EXECUTION_OVERRIDE !== "1"
-  ) return false;
-  const explicit = engine?.laneSelectionExplicitlyIncludesLane(laneId) ?? false;
-  if (!explicit) return false;
-  return engine?.laneSelectionAllowsLane(laneId) ?? true;
+  return newExecutorLaneGate(laneId, env, engine, opts).allowed;
 }
 
 export function rollingNetEntryHealth(

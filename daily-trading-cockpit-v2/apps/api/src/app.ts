@@ -110,7 +110,7 @@ import {
   buildCompositeEstimatorReport,
   type CEBucket,
 } from "./lib/composite-estimator-edge.js";
-import { computeExternalManagedNetQty, computeNotionalPerSymbol, maxNotionalPerSymbolAcrossLanes, computeClusterOpenSymbols, maxClusterPositionsAcrossLanes, isNewExecutorLaneAllowed, rollingNetEntryHealth, sumExternalRealizedPnlUsd } from "./lib/live-executor-wiring.js";
+import { computeExternalManagedNetQty, computeNotionalPerSymbol, maxNotionalPerSymbolAcrossLanes, computeClusterOpenSymbols, maxClusterPositionsAcrossLanes, isNewExecutorLaneAllowed, newExecutorLaneGate, rollingNetEntryHealth, sumExternalRealizedPnlUsd } from "./lib/live-executor-wiring.js";
 import { clusterOf } from "./lib/correlation-clusters.js";
 import { RegimeAutopilot, isRegimeAutopilotEnabled } from "./lib/regime-autopilot.js";
 import { getRegimeEngineStore } from "./lib/regime-engine-service.js";
@@ -1240,6 +1240,40 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       ? unifiedOrchestrator.allowsLegacySingleSymbolEntry(laneId, direction)
       : fallback();
 
+    /**
+     * The explanation half of legacyEntryAllowed: which rule is actually holding this lane's
+     * isAllowed() false. Mirrors the predicate's branch order exactly, so a null here means "every
+     * condition passed", not "the one condition I happened to check passed".
+     *
+     * WHY (2026-07-27): every executor below was wired with `isAllowedReason: () => edgeVeto(dir).reason`
+     * — the LAST of five conditions. REGIME_COMPOSITE_CONFIRMATION_LONG, the only lane on this
+     * account with a positive real-money record (9 closes, +$7.79), stopped opening on 2026-07-14
+     * while its own signal store kept producing candidates through 2026-07-26. For twelve days its
+     * status panel showed `entryBlockReason: null` and nobody could see anything wrong, because the
+     * blocking condition was one of the four the reason function could not observe. Silence read as
+     * health. Every lane here now reports the rule that stopped it.
+     */
+    const legacyEntryBlockReason = (
+      laneId: string,
+      direction: "LONG" | "SHORT",
+      engine: Parameters<typeof newExecutorLaneGate>[2],
+      mainnetEntryEligible: boolean,
+    ): string | null => {
+      if (unifiedOrchestrator?.isEnabled()) {
+        return unifiedOrchestrator.allowsLegacySingleSymbolEntry(laneId, direction)
+          ? null
+          : "unified orchestrator is enabled and denied this legacy single-symbol entry";
+      }
+      return (
+        newExecutorLaneGate(
+          laneId,
+          liveConfig.env === "testnet" ? "testnet" : "mainnet",
+          engine,
+          { mainnetEntryEligible },
+        ).reason ?? edgeVeto(direction).reason
+      );
+    };
+
     // 2026-07-12 (profitability Stage 3): the learned regime×direction edge-memory veto — measured
     // to work where blanket regime-gating cost the book ~201R — was wired into the mode-2 mirror
     // admission and the live engine's controller snapshot, but NOT the single-symbol executors that
@@ -1465,7 +1499,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           "SHORT",
           () => isNewExecutorLaneAllowed(SF_PAPER_LANE_ID, liveConfig.env === "testnet" ? "testnet" : "mainnet", engineForGate, { mainnetEntryEligible: false }) && edgeVeto("SHORT").allowed,
         ),
-        isAllowedReason: () => edgeVeto("SHORT").reason,
+        isAllowedReason: () => legacyEntryBlockReason(SF_PAPER_LANE_ID, "SHORT", engineForGate, false),
         laneWeightPct: () => engineForGate?.laneSelectionWeightPctForLane(SF_PAPER_LANE_ID) ?? 100,
         // CORTEX real-USDT attribution (2026-07-21, report-only): raw static weight (never tilted)
         // + shared attribution sink — same pair on every SingleSymbolLaneExecutor below.
@@ -1532,7 +1566,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           "LONG",
           () => isNewExecutorLaneAllowed(IM_PAPER_LANE_ID, liveConfig.env === "testnet" ? "testnet" : "mainnet", engineForGate, { mainnetEntryEligible: false }) && edgeVeto("LONG").allowed,
         ),
-        isAllowedReason: () => edgeVeto("LONG").reason,
+        isAllowedReason: () => legacyEntryBlockReason(IM_PAPER_LANE_ID, "LONG", engineForGate, false),
         laneWeightPct: () => engineForGate?.laneSelectionWeightPctForLane(IM_PAPER_LANE_ID) ?? 100,
         rawLaneWeightPct: () => engineForGate?.rawLaneAllocationWeightPctForLane(IM_PAPER_LANE_ID) ?? 100,
         cortexRealAttribution: getCortexRealAttributionStore(),
@@ -1601,7 +1635,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           "LONG",
           () => isNewExecutorLaneAllowed(RC_PAPER_LANE_ID, liveConfig.env === "testnet" ? "testnet" : "mainnet", engineForGate, { mainnetEntryEligible: true }) && edgeVeto("LONG").allowed,
         ),
-        isAllowedReason: () => edgeVeto("LONG").reason,
+        isAllowedReason: () => legacyEntryBlockReason(RC_PAPER_LANE_ID, "LONG", engineForGate, true),
         laneWeightPct: () => engineForGate?.laneSelectionWeightPctForLane(RC_PAPER_LANE_ID) ?? 100,
         rawLaneWeightPct: () => engineForGate?.rawLaneAllocationWeightPctForLane(RC_PAPER_LANE_ID) ?? 100,
         cortexRealAttribution: getCortexRealAttributionStore(),
@@ -1654,7 +1688,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           "SHORT",
           () => isNewExecutorLaneAllowed(RCS_PAPER_LANE_ID, liveConfig.env === "testnet" ? "testnet" : "mainnet", engineForGate, { mainnetEntryEligible: true }) && edgeVeto("SHORT").allowed,
         ),
-        isAllowedReason: () => edgeVeto("SHORT").reason,
+        isAllowedReason: () => legacyEntryBlockReason(RCS_PAPER_LANE_ID, "SHORT", engineForGate, true),
         laneWeightPct: () => engineForGate?.laneSelectionWeightPctForLane(RCS_PAPER_LANE_ID) ?? 100,
         rawLaneWeightPct: () => engineForGate?.rawLaneAllocationWeightPctForLane(RCS_PAPER_LANE_ID) ?? 100,
         cortexRealAttribution: getCortexRealAttributionStore(),
@@ -1712,7 +1746,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           "LONG",
           () => isNewExecutorLaneAllowed(PWR_PAPER_LANE_ID, liveConfig.env === "testnet" ? "testnet" : "mainnet", engineForGate, { mainnetEntryEligible: false }) && edgeVeto("LONG").allowed,
         ),
-        isAllowedReason: () => edgeVeto("LONG").reason,
+        isAllowedReason: () => legacyEntryBlockReason(PWR_PAPER_LANE_ID, "LONG", engineForGate, false),
         laneWeightPct: () => engineForGate?.laneSelectionWeightPctForLane(PWR_PAPER_LANE_ID) ?? 100,
         rawLaneWeightPct: () => engineForGate?.rawLaneAllocationWeightPctForLane(PWR_PAPER_LANE_ID) ?? 100,
         cortexRealAttribution: getCortexRealAttributionStore(),
@@ -1793,7 +1827,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
             direction,
             () => isNewExecutorLaneAllowed(laneId, liveConfig.env === "testnet" ? "testnet" : "mainnet", engineForGate, { mainnetEntryEligible: bucket === "WIDE_LONG" || bucket === "FAST_LONG" }) && edgeVeto(direction).allowed,
           ),
-          isAllowedReason: () => edgeVeto(direction).reason,
+          isAllowedReason: () => legacyEntryBlockReason(laneId, direction, engineForGate, bucket === "WIDE_LONG" || bucket === "FAST_LONG"),
           laneWeightPct: () => engineForGate?.laneSelectionWeightPctForLane(laneId) ?? 100,
           rawLaneWeightPct: () => engineForGate?.rawLaneAllocationWeightPctForLane(laneId) ?? 100,
           cortexRealAttribution: getCortexRealAttributionStore(),
