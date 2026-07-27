@@ -1179,6 +1179,48 @@ const LIVE_BREAKEVEN_EXIT_LANE_IDS = new Set([
   "CG_WIDE_LONG_RUNNER",
   "CG_VARIANT_MATRIX:CG_WIDE_LONG_RUNNER",
 ]);
+
+/**
+ * PURE-GEOMETRY COHORT (2026-07-27) — the lanes listed in LIVE_PURE_GEOMETRY_LANE_IDS are left to
+ * their OWN declared exit geometry: every engine overlay skips them, so the thing that closes the
+ * position is the lane's own TP or stop and nothing else.
+ *
+ * WHY THIS EXISTS. An audit of this instance measured which rule actually produced each close:
+ * POSITION_FLAT — the lane's own TP/stop firing — accounted for **116 of 800 closes (14.5%)**. The
+ * rest were overlays that appear in no lane's definition: REGIME_OPPOSITION_* 199,
+ * LOSING_MAX_HOLD_CUT_4H 172, REGIME_CHANGE_HARVEST_* 127, PROFIT_BANK_NET_1.00 87,
+ * breakeven-after-cost 40. The corroborating number is maxFavorableR: p50 **0.0736R**, p90 0.214R,
+ * and only 3 of 654 intents ever reached +0.5R. A lane declaring a 0.5R take-profit cannot possibly
+ * be observed reaching it when the median position is closed by something else at +0.07R.
+ *
+ * So the standing conclusion "23 lanes were tested and none has edge" was never supported: ~18 of
+ * 23 compute their declared geometry correctly to floating-point and then never get to execute it.
+ * The lanes were not measured — they were preempted.
+ *
+ * WHY A SET AND NOT A GLOBAL SWITCH. Two of the four largest overlays (REGIME_OPPOSITION_* and
+ * REGIME_CHANGE_HARVEST_*, together 326/800 = 41% of closes) had NO env key and NO per-lane scope
+ * of any kind before this — they were unconditional, which is precisely why nobody could ever run a
+ * lane as designed even on testnet. A global off-switch would be the wrong repair: these overlays
+ * are real risk controls that were each added after a measured loss. A named cohort makes the
+ * experiment explicit, reversible, and comparable against the lanes that keep the overlays as a
+ * live control group.
+ *
+ * SAFETY. Empty by default, so unset ⇒ behaviour is byte-for-byte what it is today on every
+ * instance. Membership is matched on the full laneId OR its variant suffix, the same way
+ * LIVE_BREAKEVEN_EXIT_LANE_IDS matches. Intended for testnet: a lane in this cohort holds to its
+ * own stop, which is the point, but that also means the overlays that bound hold time and bank
+ * profit are not there to help it.
+ */
+export function pureGeometryLaneIds(env: NodeJS.ProcessEnv = process.env): ReadonlySet<string> {
+  const raw = (env.LIVE_PURE_GEOMETRY_LANE_IDS ?? "").trim();
+  if (raw.length === 0) return new Set<string>();
+  return new Set(
+    raw
+      .split(",")
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0),
+  );
+}
 /** The `limit` realizedFromTrades asks /fapi/v1/userTrades for, and therefore the row count at which
  *  the page is SATURATED — Binance returns at most `limit` rows forward from `startTime`, so a full
  *  page means there may be rows we never saw. Named so the request and the saturation test cannot
@@ -3578,6 +3620,21 @@ export class LiveExecutionEngine {
     });
   }
 
+  /** True when this intent belongs to the pure-geometry cohort (see pureGeometryLaneIds): every
+   *  engine overlay must skip it and leave the position to its own declared TP/stop. Matched on the
+   *  full laneId or its variant suffix, mirroring intentHasLiveBreakevenExitLane. Deliberately does
+   *  NOT require the lane to be de-allocated — unlike the orphan-escape sweep, this cohort is about
+   *  a FUNDED lane being allowed to demonstrate its own geometry. */
+  private isPureGeometryIntent(intent: LiveIntent): boolean {
+    const ids = pureGeometryLaneIds();
+    if (ids.size === 0) return false;
+    return this.intentSources(intent).some((source) => {
+      const laneId = source.laneId ?? "";
+      const variantId = laneId.split(":").pop() ?? laneId;
+      return ids.has(laneId) || ids.has(variantId);
+    });
+  }
+
   private async maybeCloseLiveBreakevenLaneAfterCost(
     intent: LiveIntent,
     pos: FuturesPosition,
@@ -3587,6 +3644,7 @@ export class LiveExecutionEngine {
     // Runs on both real envs (mainnet + testnet) — operator wants the long-lane positions to bail
     // the instant they're net-positive everywhere they exist.
     if (this.config.env !== "mainnet" && this.config.env !== "testnet") return { changed: false, closed: false };
+    if (this.isPureGeometryIntent(intent)) return { changed: false, closed: false }; // pure-geometry cohort: own stop/TP only
     if (!this.intentHasLiveBreakevenExitLane(intent)) return { changed: false, closed: false };
     const expectedSign = intent.direction === "LONG" ? 1 : -1;
     if (Math.sign(amt) !== expectedSign) return { changed: false, closed: false };
@@ -3827,6 +3885,12 @@ export class LiveExecutionEngine {
       // baskets silently un-hedged). Everything below operates on the ENGINE'S SHARE only.
       const externalClaim = externalClaims.get(intent.symbol) ?? 0;
       const engineAmt = amt - externalClaim;
+      // Pure-geometry cohort: the regime overlays (REGIME_OPPOSITION_* / REGIME_CHANGE_HARVEST_*)
+      // are the two that had no per-lane scope at all before 2026-07-27, and together they produced
+      // 41% of this instance's closes. Skipping them here is what actually lets a listed lane reach
+      // its own stop/TP. Both hard cuts live inside this loop too, which means a cohort lane keeps
+      // NO regime protection at all — deliberate, and the reason this is a named opt-in set.
+      if (this.isPureGeometryIntent(intent)) continue;
       if (Math.abs(engineAmt) < 1e-12) continue; // engine has no real exposure here
       const expectedSign = intent.direction === "LONG" ? 1 : -1;
       if (Math.sign(engineAmt) !== expectedSign) continue;
@@ -4206,6 +4270,7 @@ export class LiveExecutionEngine {
     amt: number,
     shareFrac = 1,
   ): Promise<{ changed: boolean; closed: boolean }> {
+    if (this.isPureGeometryIntent(intent)) return { changed: false, closed: false }; // pure-geometry cohort: own stop/TP only
     // R_BASED mode scales the bank to THIS position's own effective risk-at-stop; FLAT ignores it.
     const threshold = this.profitBankThresholdUsd(intent.effectiveRiskUsd ?? null);
     if (!(threshold > 0)) return { changed: false, closed: false };
@@ -4313,6 +4378,7 @@ export class LiveExecutionEngine {
    */
   private async maybeCutLosingMaxHold(intent: LiveIntent, pos: FuturesPosition, amt: number): Promise<{ changed: boolean; closed: boolean }> {
     if (this.config.losingMaxHoldMs <= 0) return { changed: false, closed: false };
+    if (this.isPureGeometryIntent(intent)) return { changed: false, closed: false }; // pure-geometry cohort: own stop/TP only
     const openedMs = Date.parse(intent.createdAt);
     const nowMs = Date.parse(this.nowIso());
     if (!Number.isFinite(openedMs) || !Number.isFinite(nowMs)) return { changed: false, closed: false };
