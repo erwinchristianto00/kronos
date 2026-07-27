@@ -204,7 +204,42 @@ export const CROSS_SECTIONAL_TREND_SHORT_BLOCKLIST = envSymbolSet(
   "AVAXUSDT,INJUSDT,FETUSDT,NEARUSDT,RNDRUSDT",
 );
 
-// --- MIXED long-pool widening (2026-07-26, measured dead-lane fix) — OFF BY DEFAULT ---
+// --- MIXED pool reconfiguration (2026-07-26, measured dead-lane fix) — OFF BY DEFAULT ---
+//
+// READ THIS FIRST — WHAT ENABLING CROSS_SECTIONAL_MIXED_WIDE_LONG_POOL=1 ACTUALLY DOES.
+// It changes BOTH LEGS of the MIXED basket. It is NOT a long-side-only change:
+//   • LONG side  — widened from CROSS_SECTIONAL_TREND_LONG_ALLOWLIST to this instance's own
+//                  CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST (the measured fix; see below).
+//   • SHORT side — NARROWED. Every symbol the widened long pool can now select is added to MIXED's
+//                  short BLOCKLIST, so the two legs are disjoint by construction. On the default
+//                  config that removes exactly OPUSDT and 1000PEPEUSDT from MIXED's short
+//                  candidates (6 → 4). On a given instance it removes whatever
+//                  (widened long allowlist \ long blocklist) ∩ short allowlist happens to be —
+//                  derived at call time, never hardcoded, because live's FILTERED long allowlist
+//                  (7 symbols) and testnet's (21) produce different overlaps.
+// The short ALLOWLIST env var is unchanged on both paths; the short LEG is not. Anyone enabling
+// this on an instance with CROSS_SECTIONAL_EXEC_ENABLED=1 is changing the short side of really
+// executed baskets. Measured deltas are at the bottom of this block.
+//
+// WHY THE SHORT SIDE HAS TO MOVE AT ALL (the defect an earlier draft of this change hid).
+// buildCrossSectionalBasket enforces long/short exclusivity: a symbol eligible for both sides is
+// claimed by whichever side selects first (long, in the unskewed 3/3 case MIXED runs), and the
+// other side only sees the leftovers. OPUSDT and 1000PEPEUSDT sit on BOTH
+// CROSS_SECTIONAL_TREND_LONG_ALLOWLIST and CROSS_SECTIONAL_TREND_SHORT_ALLOWLIST. Today the narrow
+// 4-symbol long pool claims them most of the time. Widen the long pool and the long leg often stops
+// picking them, so they fall THROUGH into the short leg — a short-side change nobody configured,
+// varying bar to bar with the long side's ranking. Blocking them from MIXED's short side instead
+// makes the short leg immune to long-side RANKING: with the pools disjoint, no arrangement of the
+// long side's scores can reach the short leg. Stated precisely, because the looser version of this
+// claim is false and was caught by [SHORT-DETERMINISM]: changing the long ALLOWLIST still changes
+// the short leg, because the blocklist below is DERIVED from the long pool to keep them disjoint
+// (TREND ⇒ 9 symbols blocked, FILTERED ⇒ 12, the whole universe ⇒ 24, which leaves too few short
+// candidates to form a basket at all). That is an operator CONFIG change, visible in the env and
+// deterministic. What this buys is the removal of the EMERGENT case — the short leg moving bar to
+// bar with no config change at all. Determinism, not invariance. (Removing the two symbols from the WIDENED LONG set would
+// NOT work: whether the long leg claims a symbol depends on its RANK, not on pool membership, so
+// the spillover would remain.)
+//
 // buildMixedCrossSectionalBasket borrows CROSS_SECTIONAL_TREND_LONG_ALLOWLIST, which is
 // deliberately narrow (4 symbols by default). Under MEAN_REVERSION selection that pool has almost
 // no room to move: the long side takes the 3 WEAKEST of 4 (mean ≈ the pool mean) while the short
@@ -218,7 +253,23 @@ export const CROSS_SECTIONAL_TREND_SHORT_BLOCKLIST = envSymbolSet(
 // So the binding constraint is the POOL, not the threshold and not the selection mode. The
 // threshold is therefore left at 0.035 on purpose: the same backtest shows that with the widened
 // pool 100% of bars would clear a 0.020 threshold, i.e. every MIXED_CHOP cycle would open a basket.
-// Widening the pool alone is sufficient (97.48%) and keeps a real, if shallow, dispersion filter.
+// Widening the pool keeps a real, if shallow, dispersion filter where lowering the threshold does not.
+//
+// CAVEAT ON THAT 97.48% — it describes LONG-WIDENING ALONE, which is NOT what this flag ships.
+// The short-side disjointness below cuts MIXED's short candidates from 6 to 4 on the default config,
+// and buildCrossSectionalBasket returns null whenever a side cannot fill shortK legs, so the shipped
+// configuration clears the threshold LESS often than 97.48%. The candle backtest was not re-run
+// against the shipped configuration (this checkout has no offline candles for that window and
+// Binance market data is geo-blocked here), so treat 97.48% as an upper bound, not as the shipped
+// number. The only evidence available for the shipped configuration is the seeded-draw harness
+// below, calibrated so the flag-off clearance matches the observed dead lane (N(0, 0.015) scores →
+// flag-off 2.29% of draws form a basket, vs the backtest's 2.10%): at that calibration long-widening
+// alone reaches 9.96% and the shipped configuration reaches 4.79%. i.e. roughly HALF the widening's
+// improvement is given back to buy the deterministic short leg. That is the trade this flag makes.
+// The IID harness cannot reproduce the backtest's absolute 97.48% (real ROCs co-move; IID draws do
+// not), so read 2.29→9.96→4.79 as a RATIO between configurations, never as a forecast of live
+// clearance. If the lane still looks starved once enabled on testnet, the short pool — not the
+// threshold — is where to look first.
 //
 // Why a flag and not a new hardcoded default list: /live and /testnet are rsync-only from this
 // shared source and have silently diverged before, so a changed shared default IS a change to live.
@@ -229,8 +280,32 @@ export const CROSS_SECTIONAL_TREND_SHORT_BLOCKLIST = envSymbolSet(
 // same instance; it can never import another instance's universe. This matters because
 // app.ts's isCrossSectionalTrendMixedAdmissionIndependent() branch can turn MIXED into real
 // mainnet baskets, so the widened pool must be safe under the assumption that someone later sets
-// that flag too. With the flag unset, crossSectionalMixedLongAllowlist() returns the exact same set
-// MIXED uses today, so an un-flagged deploy (including a live rsync) is a bit-for-bit no-op.
+// that flag too. With the flag unset, crossSectionalMixedLongAllowlist() and
+// crossSectionalMixedShortBlocklist() return the exact same sets MIXED uses today, so an un-flagged
+// deploy (including a live rsync) is a bit-for-bit no-op on BOTH legs.
+//
+// MEASURED LEG EFFECT — 20,000 seeded-random draws over CROSS_SECTIONAL_UNIVERSE (mulberry32 seed
+// 20260726, N(0, 0.35) scores, k=3; the [DRIFT] tests below re-run a smaller deterministic version
+// of exactly this comparison, so the invariants cannot silently rot):
+//     flag-off vs LONG-WIDENING ALONE — 18,961 baskets form in both states
+//       LONG leg differs 88.30% | SHORT leg differs 36.68%  ← the defect. Nobody configured this.
+//       Every one of those short-leg changes is OPUSDT (3,791) or 1000PEPEUSDT (3,637) arriving on
+//       the short leg because the widened long leg stopped claiming it. Which bars, and which of
+//       the two, depends on long-side RANKING — it is emergent, not configured.
+//     flag-off vs THE SHIPPED CONFIGURATION — 18,582 baskets form in both states
+//       LONG leg differs 88.27% | SHORT leg differs 47.75%  ← larger, and deliberately so.
+//       The short-leg delta is BIGGER than the defect's, and it is still a real short-side change on
+//       really executed baskets. The difference is that it is now completely enumerable: in all
+//       8,872 differing baskets the change is a single 1-for-1 substitution — OPUSDT (4,441) or
+//       1000PEPEUSDT (4,431) leaves the short leg and the next-ranked of SEI/WLD/DOGE/APT takes the
+//       slot. No other symbol ever moved, and never more than one per basket.
+//     DETERMINISM (why the bigger number is the better outcome) — "is the realized short leg equal
+//       to the top-shortK of the short pool, computed with no knowledge of the long side?"
+//         flag off / long-widening alone: TRUE in 55.18% of baskets — the long side moves the short leg
+//         shipped configuration:          TRUE in 100.00% of baskets (19,423/19,423)
+//       So after this change nothing on the long side can move the short leg, this flag or any
+//       future long-pool edit. That is the property being bought.
+//     TREND: 0 of 20,000 draws produced ANY difference in a TREND basket between flag states.
 export function isCrossSectionalMixedWideLongPoolEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return env.CROSS_SECTIONAL_MIXED_WIDE_LONG_POOL === "1";
 }
@@ -239,12 +314,51 @@ export function isCrossSectionalMixedWideLongPoolEnabled(env: NodeJS.ProcessEnv 
  *  rather than frozen at module load so the flag is testable and so nothing can read a stale value.
  *  The long BLOCKLIST is intentionally NOT switched — CROSS_SECTIONAL_TREND_LONG_BLOCKLIST stays
  *  applied on both paths, so widening can only ADD symbols the operator allows for longs and can
- *  never re-admit one they explicitly blocked. Only the LONG side is touched: the short side keeps
- *  CROSS_SECTIONAL_TREND_SHORT_ALLOWLIST/BLOCKLIST, and the TREND lane is untouched entirely. */
+ *  never re-admit one they explicitly blocked. The TREND lane reads CROSS_SECTIONAL_TREND_* directly
+ *  and never calls this, so TREND is untouched. The SHORT side is NOT untouched — see
+ *  crossSectionalMixedShortBlocklist. */
 export function crossSectionalMixedLongAllowlist(env: NodeJS.ProcessEnv = process.env): ReadonlySet<string> {
-  return isCrossSectionalMixedWideLongPoolEnabled(env)
+  if (!isCrossSectionalMixedWideLongPoolEnabled(env)) return CROSS_SECTIONAL_TREND_LONG_ALLOWLIST;
+  // An EMPTY allowlist means "allow every symbol" to allowed(). Widening to that would hand MIXED
+  // the whole universe on the long side and (via the disjointness below) blank its short side —
+  // the exact silent blast radius this flag exists to avoid. An instance that has explicitly
+  // approved nothing for FILTERED longs has nothing to widen to, so keep today's narrow pool.
+  return CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST.size > 0
     ? CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST
     : CROSS_SECTIONAL_TREND_LONG_ALLOWLIST;
+}
+
+/** The short-side BLOCKLIST the MIXED basket actually uses — the short half of this change.
+ *
+ *  Flag off: CROSS_SECTIONAL_TREND_SHORT_BLOCKLIST verbatim (today's behavior, byte for byte).
+ *  Flag on:  that blocklist PLUS every symbol the widened long pool can select, so MIXED's long and
+ *            short candidate pools are provably disjoint and buildCrossSectionalBasket's
+ *            long-claims-it-first exclusivity rule can never move a symbol between the legs.
+ *
+ *  Expressed as a BLOCKLIST rather than a narrowed allowlist on purpose: allowed() treats an EMPTY
+ *  allowlist as "allow everything", so subtracting from the allowlist could silently flip the short
+ *  side from "these 6 symbols" to "the entire universe" on an instance whose overlap happens to be
+ *  total. A blocklist has no such degenerate case — it only ever subtracts. If the subtraction
+ *  leaves fewer than shortK candidates the basket simply does not form (buildCrossSectionalBasket
+ *  returns null), which is the correct fail-closed outcome: an inert lane, never an unconfigured
+ *  short. Derived from the long lists passed in, so an explicit opts.longAllowlist override keeps
+ *  the disjointness guarantee instead of silently voiding it. */
+export function crossSectionalMixedShortBlocklist(
+  opts: {
+    longAllowlist?: ReadonlySet<string> | null;
+    longBlocklist?: ReadonlySet<string> | null;
+    env?: NodeJS.ProcessEnv;
+  } = {},
+): ReadonlySet<string> {
+  const env = opts.env ?? process.env;
+  if (!isCrossSectionalMixedWideLongPoolEnabled(env)) return CROSS_SECTIONAL_TREND_SHORT_BLOCKLIST;
+  const longAllowlist = opts.longAllowlist ?? crossSectionalMixedLongAllowlist(env);
+  const longBlocklist = opts.longBlocklist ?? CROSS_SECTIONAL_TREND_LONG_BLOCKLIST;
+  const out = new Set<string>(CROSS_SECTIONAL_TREND_SHORT_BLOCKLIST);
+  // A symbol the long blocklist already rejects can never reach the long leg, so it does not need
+  // to be taken off the short side — keep the narrowing as small as the guarantee allows.
+  for (const symbol of longAllowlist) if (!longBlocklist.has(symbol)) out.add(symbol);
+  return out;
 }
 // 2026-07-08 (operator-requested widening): a dedicated universe for cross-sectional, separate
 // from the main scanner's UNIVERSE (scan-service.ts) — widening THAT shared constant would also
@@ -734,21 +848,24 @@ export function buildMixedCrossSectionalBasket(
   opts: Omit<CrossSectionalBasketOpts, "variant" | "signal" | "longAllowlist" | "shortAllowlist" | "shortBlocklist" | "minScoreGap" | "selectionMode" | "strategyFamily"> &
     Partial<Pick<CrossSectionalBasketOpts, "signal" | "longAllowlist" | "longBlocklist" | "shortAllowlist" | "shortBlocklist" | "minScoreGap">>,
 ): CrossSectionalObservation | null {
+  // Mixed/chop reverses extremes, but keeps the same side-specific toxicity guardrails.
+  // CROSS_SECTIONAL_MIXED_WIDE_LONG_POOL=1 moves BOTH legs (see the block at
+  // isCrossSectionalMixedWideLongPoolEnabled): the long pool widens to this instance's own FILTERED
+  // long allowlist, and every symbol that pool can select is blocked from the short side so the two
+  // legs stay disjoint and the short leg cannot be moved by long-side ranking. With the flag unset
+  // both resolvers return exactly what MIXED uses today. Explicit opts from a caller still win.
+  const longAllowlist = opts.longAllowlist ?? crossSectionalMixedLongAllowlist();
+  const longBlocklist = opts.longBlocklist ?? CROSS_SECTIONAL_TREND_LONG_BLOCKLIST;
   return buildCrossSectionalBasket(scored, {
     ...opts,
     signal: opts.signal ?? CROSS_SECTIONAL_MIXED_SIGNAL,
     variant: "MIXED_MEAN_REVERSION",
     strategyFamily: "MEAN_REVERSION",
     selectionMode: "MEAN_REVERSION",
-    // Mixed/chop reverses extremes, but keeps the same side-specific toxicity guardrails.
-    // Long pool: TREND's narrow allowlist by default (today's behavior, unchanged), or the
-    // instance's own FILTERED long allowlist when CROSS_SECTIONAL_MIXED_WIDE_LONG_POOL=1 — see the
-    // measured rationale at crossSectionalMixedLongAllowlist. An explicit opts.longAllowlist from a
-    // caller still wins, exactly as before.
-    longAllowlist: opts.longAllowlist ?? crossSectionalMixedLongAllowlist(),
-    longBlocklist: opts.longBlocklist ?? CROSS_SECTIONAL_TREND_LONG_BLOCKLIST,
+    longAllowlist,
+    longBlocklist,
     shortAllowlist: opts.shortAllowlist ?? CROSS_SECTIONAL_TREND_SHORT_ALLOWLIST,
-    shortBlocklist: opts.shortBlocklist ?? CROSS_SECTIONAL_TREND_SHORT_BLOCKLIST,
+    shortBlocklist: opts.shortBlocklist ?? crossSectionalMixedShortBlocklist({ longAllowlist, longBlocklist }),
     minScoreGap: opts.minScoreGap ?? CROSS_SECTIONAL_MIXED_MIN_SCORE_GAP,
     longCapitalWeight: opts.longCapitalWeight ?? 0.5,
     shortCapitalWeight: opts.shortCapitalWeight ?? 0.5,
@@ -1311,11 +1428,18 @@ export function getCrossSectionalAdaptiveConfig(): {
   trendLongBlocklist: string[];
   trendShortAllowlist: string[];
   trendShortBlocklist: string[];
-  /** Which long pool the MIXED lane is actually running on, so /research shows the effective
-   *  universe instead of readers having to infer it from the TREND lists (additive/report-only). */
+  /** Which pools the MIXED lane is actually running on, so /research shows the effective universe
+   *  on BOTH sides instead of readers having to infer it from the TREND lists. When
+   *  mixedWideLongPool is true, mixedShortBlocklist is WIDER than trendShortBlocklist by exactly
+   *  mixedShortExcludedForLongOverlap — the symbols taken off MIXED's short side to keep the two
+   *  legs disjoint. Additive/report-only. */
   mixedWideLongPool: boolean;
   mixedLongAllowlist: string[];
   mixedLongBlocklist: string[];
+  mixedShortAllowlist: string[];
+  mixedShortBlocklist: string[];
+  /** Short-side candidates removed by the wide-pool flag (empty when the flag is off). */
+  mixedShortExcludedForLongOverlap: string[];
 } {
   return {
     trendSignal: CROSS_SECTIONAL_TREND_SIGNAL,
@@ -1334,5 +1458,10 @@ export function getCrossSectionalAdaptiveConfig(): {
     mixedWideLongPool: isCrossSectionalMixedWideLongPoolEnabled(),
     mixedLongAllowlist: [...crossSectionalMixedLongAllowlist()].sort(),
     mixedLongBlocklist: [...CROSS_SECTIONAL_TREND_LONG_BLOCKLIST].sort(),
+    mixedShortAllowlist: [...CROSS_SECTIONAL_TREND_SHORT_ALLOWLIST].sort(),
+    mixedShortBlocklist: [...crossSectionalMixedShortBlocklist()].sort(),
+    mixedShortExcludedForLongOverlap: [...CROSS_SECTIONAL_TREND_SHORT_ALLOWLIST]
+      .filter((s) => crossSectionalMixedShortBlocklist().has(s) && !CROSS_SECTIONAL_TREND_SHORT_BLOCKLIST.has(s))
+      .sort(),
   };
 }

@@ -40,6 +40,7 @@ import { dirname, resolve } from "node:path";
 import { BinanceFuturesPrivateError, resolveConfirmedFillPrice, roundToStep, type BinanceFuturesPrivateClient } from "./binance-futures-private.js";
 import { clusterOf, isMajorSymbol } from "./correlation-clusters.js";
 import type { CortexRealAttributionStore } from "./cortex-real-attribution.js";
+import { fillFromUserTrade, type ExecutionFill, type ExecutionFillRecorder } from "./execution-fill-recorder.js";
 import type { PositionPathRecorder } from "./position-path-recorder.js";
 
 export type SingleSymbolExecClient = Pick<
@@ -135,6 +136,93 @@ export function makeMfeGivebackExitPolicy(opts: { armR: number; givebackFrac: nu
   };
 }
 
+/** A public order-book quote this process has ALREADY observed for a symbol, offered to the
+ *  executor as a synchronous, zero-I/O read (see SingleSymbolLaneExecutorOptions.readPublicQuote).
+ *  Purely a recording input — nothing in this file branches on it. */
+export interface PublicQuoteSnapshot {
+  bid: number | null;
+  ask: number | null;
+  /** Whatever single reference price the producer derived (normally (bid+ask)/2). */
+  mid: number;
+  /** Epoch ms at which the producer observed this quote. */
+  atMs: number;
+  /** Verbatim venue/endpoint label from the producer, persisted with every sample so a consumer
+   *  can never silently forget WHICH book this came from. app.ts currently supplies
+   *  "BINANCE_SPOT_BOOK_TICKER" — see readPublicQuote's doc comment for why that matters. */
+  venue: string;
+}
+
+/** RECORDING-ONLY (2026-07-27). What the public market looked like immediately BEFORE this
+ *  position's entry order was submitted, so a later report can compare it against the exchange's
+ *  own fill. Never read by any gate, sizing, exit or admission path in this file — it is written
+ *  once, into the position record, and never looked at again here.
+ *
+ *  READING THIS HONESTLY — three caveats, all of them persisted rather than assumed away:
+ *   - `ageAtSubmitMs` is real and is NOT small. The quote is captured at the entry-chase gate;
+ *     between there and placeOrder the executor awaits 2-3 signed round-trips (getPositions,
+ *     getExchangeFilters, getPositions again, setLeverage). Expect hundreds of ms to low seconds
+ *     from Contabo, with a 6s-per-call timeout worst case. Any report MUST discard samples above
+ *     a threshold rather than average them in.
+ *   - `venue` may not be the venue we traded on. app.ts's currentPublicPrice is wired to
+ *     BinanceClient.getBookTicker(), which hits SPOT /api/v3/ticker/bookTicker — NOT the USD-M
+ *     perp book these orders actually execute against. A fill-vs-reference difference therefore
+ *     contains perp/spot BASIS as well as execution slippage, and the two cannot be separated
+ *     from this record alone.
+ *   - `mid` vs `bid`/`ask`. The live path is 100% taker, so a BUY lifts the ask and a SELL hits
+ *     the bid. `fill - mid` is the full round-trip cost INCLUDING half the spread; `fill - ask`
+ *     (BUY) or `bid - fill` (SELL) is the pure impact/latency component. Both are recorded so a
+ *     consumer can compute either; neither is "the" answer. (Note: measuring against the mid
+ *     yields a LARGER number than measuring against the touch, not a smaller one.)
+ *  `source` is "MID_ONLY" whenever a two-sided quote was not available — in that case bid and ask
+ *  are null and `atMs` is the instant BEFORE the price fetch started, so `ageAtSubmitMs` is a
+ *  deliberate OVER-estimate. It is never back-filled from the signal's own entryPrice. */
+export interface SubmitReferenceQuote {
+  mid: number;
+  bid: number | null;
+  ask: number | null;
+  atMs: number;
+  /** this.nowIso() sampled immediately before placeOrder, minus atMs. Floored at 0 — see
+   *  `clockAnomaly` for the case where that floor is hiding something. */
+  ageAtSubmitMs: number;
+  venue: string;
+  source: "BOOK_TICKER" | "MID_ONLY";
+  /** MACHINE-READABLE restatement of the venue caveat above, added 2026-07-27 because a caveat that
+   *  only exists as prose inside a `venue` STRING is a caveat that will be skipped. False means the
+   *  reference book is NOT the book this order executes on (today: SPOT vs USD-M perp), so
+   *  `fill - mid` contains perp/spot BASIS — routinely tens of bps on a mid-cap alt, i.e. an order
+   *  of magnitude larger than the 5.0 bps/side commission and capable of making execution look
+   *  several times more expensive than it is. Any slippage report MUST either filter to
+   *  `venueMatchesExecution === true` or model the basis explicitly; it must not average across
+   *  both. "UNKNOWN" venue is treated as NOT matching — an unlabelled book is not evidence of a
+   *  matching one. */
+  venueMatchesExecution: boolean;
+  /** Present and true ONLY when the raw (unfloored) age was NEGATIVE, i.e. the quote's `atMs`
+   *  (stamped by the producer's clock in app.ts) is later than the submit instant (stamped by this
+   *  executor's injected clock). `ageAtSubmitMs` is then 0 — the single most credible-looking value
+   *  the field can hold, since 0 reads as "the reference was live at submission" — so without this
+   *  marker a report that correctly keeps only low-age samples would preferentially retain exactly
+   *  the corrupted ones. Causes: an NTP step between the book fetch and placeOrder, or a test/caller
+   *  injecting a nowIso offset from app.ts's Date.now(). Absent = the delta was non-negative. */
+  clockAnomaly?: true;
+  /** Present and true ONLY when the two-sided quote recovered from the shared per-symbol cache has
+   *  a DIFFERENT mid than the one the entry-chase gate actually evaluated. The cache is
+   *  process-wide across every lane executor, so a sibling executor's fetch for the same symbol can
+   *  land between this executor's own fetch and its read-back; the freshness guard accepts it
+   *  (its atMs is newer) and the persisted reference is then a quote this position's gate never
+   *  saw. Recording-only, and rare, but without the marker the substitution is indistinguishable
+   *  from real slippage. Absent = the recorded mid is the gate's own. */
+  midDiffersFromGateMid?: true;
+}
+
+/** Venue labels whose book IS the one these orders execute against (Binance USD-M perpetual
+ *  futures). Anything else — including SPOT and "UNKNOWN" — sets venueMatchesExecution false. Kept
+ *  as an explicit allow-list rather than a substring test so a new producer label defaults to
+ *  "not the execution venue" instead of silently claiming to be. */
+const EXECUTION_VENUE_LABELS: ReadonlySet<string> = new Set([
+  "BINANCE_FUTURES_BOOK_TICKER",
+  "BINANCE_USDM_BOOK_TICKER",
+]);
+
 export interface SingleSymbolPosition {
   positionId: string;
   sourceObservationId: string;
@@ -172,6 +260,34 @@ export interface SingleSymbolPosition {
   exitPriceConfirmed: boolean | null;
   grossPnlUsd: number | null;
   feeEstimateUsd: number | null;
+  /** PROVENANCE of feeEstimateUsd (2026-07-26, purely additive, report-only — nothing reads it to
+   *  make a decision). The field name "feeEstimateUsd" has always covered two entirely different
+   *  numbers with no way to tell them apart, and a live audit of 21 closed positions found 14 real
+   *  exchange commissions and 7 bit-exact TAKER_FEE_RATE estimates sitting side by side under it.
+   *  The two errors point in OPPOSITE directions and partially cancel in any aggregate, which is
+   *  precisely why the ambiguity survived several fee audits.
+   *
+   *    "EXCHANGE"            — summed from getUserTrades commission rows (sumOwnRealizedTrades).
+   *    "ESTIMATE_TAKER_FLAT" — contains a modelled TAKER_FEE_RATE component: either the whole
+   *                            figure (trades unavailable this tick) or the final leg only, with an
+   *                            earlier partial leg's real commission folded in. Deliberately NOT
+   *                            split further: any figure carrying a modelled component must be
+   *                            excluded from cost analysis, so one label is enough.
+   *    undefined             — position persisted before this field existed, or never closed.
+   *                            UNKNOWN. Must never be assumed exchange-true.
+   *
+   *  "EXCHANGE" documents the METHOD, not completeness. It asserts the number came from Binance's
+   *  own commission rows; it does NOT assert that every row belonging to this position is in the
+   *  sum. By default it is still exit-side only (~50% of the true two-sided cost, confirmed against
+   *  the exchange on the BTCUSDT 2026-07-25/26 pair) — but the reason changed on 2026-07-26. It used
+   *  to be a QUERY bug (startTime = openedAt, stamped after the entry placeOrder, so the entry row
+   *  was never even returned); that is fixed, see entryTradeWindowFromMs. It is now a deliberate,
+   *  operator-gated CHOICE, because folding the entry commission in moves netPnlUsd and netPnlUsd
+   *  drives two execution gates — see FOLD_ENTRY_LEG_INTO_PNL. Read entryLegFoldedIntoPnl on the
+   *  record to know which you have; entryCommissionUsd tells you the exact size of what is missing
+   *  when it is false. This flag stays independent of both so the before/after shift attributable to
+   *  enabling the fold stays unambiguous. */
+  feeSource?: "EXCHANGE" | "ESTIMATE_TAKER_FLAT";
   netPnlUsd: number | null;
   /** Cumulative gross/fee P&L already realized from a PRIOR partial fill on this same position
    *  (2026-07-12 fix: a triggered stop can partially fill when a sibling executor's netting has
@@ -181,10 +297,59 @@ export interface SingleSymbolPosition {
    *  position's now-reduced remaining qty. */
   realizedPartialGrossUsd?: number;
   realizedPartialFeeUsd?: number;
-  /** Set true once the entry order's own realizedPnl/commission has been folded into
-   *  realizedPartial*Usd — prevents re-counting the SAME entry trade's fee/pnl on a second (or
-   *  third) partial-fill cycle, since getUserTrades is re-queried from openedAt every time. */
+  /** Set true once the entry order's own realizedPnl/commission has been ACCOUNTED FOR — folded into
+   *  realizedPartial*Usd when the fold predicate allowed it, and recorded into entryCommissionUsd /
+   *  entryRealizedPnlUsd either way. Prevents re-counting the SAME entry trade on a second (or
+   *  third) partial-fill cycle, since getUserTrades is re-queried over the same window every time. */
   entryFeeRealized?: boolean;
+  /** THE FEE-WINDOW FIX (2026-07-26). Epoch ms captured immediately BEFORE the entry placeOrder,
+   *  minus FEE_WINDOW_SLACK_MS — the correct lower bound for sumOwnRealizedTrades' getUserTrades
+   *  window.
+   *
+   *  openedAt (the previous lower bound, and still the fallback for positions persisted before this
+   *  field existed) is stamped AFTER placeOrder returns AND after resolveFillPrice, which can retry
+   *  4x400ms plus 4 queryOrder round-trips. Binance stamps a fill's `time` on its own clock at match,
+   *  i.e. before the HTTP response is even serialised, so openedAt is ALWAYS later than the entry
+   *  fill. startTime is inclusive on trade time, so the entry row was always outside the window and
+   *  the `t.orderId === pos.entryOrderId` branch in sumOwnRealizedTrades was unreachable — every
+   *  per-position fee on this path recorded the EXIT side only, ~50% of the true two-sided cost
+   *  (confirmed against the exchange on the BTCUSDT 2026-07-25/26 pair: charged 0.03218755 +
+   *  0.03216179, recorded 0.03216179).
+   *
+   *  VISIBILITY IS NOT FOLDING. This field only changes which rows come back. Whether the entry
+   *  commission then reaches feeEstimateUsd/netPnlUsd is a separate, operator-gated decision, because
+   *  netPnlUsd drives the daily-loss entry gate and the consecutive-loss kill switch — see
+   *  FOLD_ENTRY_LEG_INTO_PNL and sumOwnRealizedTrades. entryCommissionUsd is populated regardless.
+   *
+   *  Additive and optional; read by nothing but that window. Undefined = fall back to openedAt, i.e.
+   *  exactly the old (mis-recording) behaviour, never a fabricated retro-fit. */
+  entryTradeWindowFromMs?: number;
+  /** RECORDING-ONLY. The ENTRY order's own exchange-side commission, summed from getUserTrades once
+   *  entryTradeWindowFromMs makes it visible. Always populated when the entry row is seen, on every
+   *  close path, REGARDLESS of FOLD_ENTRY_LEG_INTO_PNL — this is the number that makes the
+   *  understatement measurable without moving anything the daily-loss gate or kill-switch reads.
+   *  Assigned (not accumulated) so a settle that retries next tick cannot double-count.
+   *  Undefined = the entry row was never observed (pre-fix position, or trades unavailable). */
+  entryCommissionUsd?: number;
+  /** RECORDING-ONLY. The entry order's own realizedPnl as Binance reports it. Normally 0 — an
+   *  opening trade realizes nothing. A NONZERO value means this "entry" actually reduced an opposite
+   *  position on this netted account, which is exactly the cross-executor netting hazard this file
+   *  documents elsewhere and is worth being able to see after the fact. */
+  entryRealizedPnlUsd?: number;
+  /** True when grossPnlUsd/feeEstimateUsd/netPnlUsd on THIS record include the entry leg above;
+   *  false when they are exit-side only. Lets a consumer tell a fully-costed record from a
+   *  half-costed one instead of inferring it from a ratio — which is exactly what the 2026-07-26
+   *  live audit had to do (14 records at ratio ~0.5, 7 at exactly 1.00) because nothing recorded it.
+   *  With FOLD_ENTRY_LEG_INTO_PNL off, `true` still occurs for an entry fill Binance timestamped at
+   *  or after openedAt — the rows the OLD window already returned, kept folded so this change cannot
+   *  loosen a gate. Undefined = closed before this field existed, the entry row was never observed,
+   *  or closed via the flat-estimate fallback. That last case is undefined and NOT false on purpose:
+   *  the estimate arm's feeEstimateUsd is notional*TAKER_FEE_RATE over BOTH sides, so it already
+   *  contains a modelled entry fee — `false` there would invite a consumer to add
+   *  entryCommissionUsd on top and double-count it. Read it strictly three-valued: true = the
+   *  exchange's entry commission is in the totals, false = the totals are exit-side only and
+   *  entryCommissionUsd is additive, undefined = not answerable, do not reconstruct. */
+  entryLegFoldedIntoPnl?: boolean;
   /** CORTEX real-USDT attribution capture (2026-07-21, report-only — see cortex-real-attribution.ts):
    *  the allocation weight this executor's sizing ACTUALLY applied to this entry (laneWeightPct —
    *  wired to laneSelectionWeightPctForLane in app.ts, so it includes any active CORTEX promoted
@@ -192,6 +357,16 @@ export interface SingleSymbolPosition {
    *  time. Undefined on positions persisted before this feature — those are never attributed. */
   cortexAppliedWeightPct?: number;
   cortexRawStaticWeightPct?: number;
+  /** RECORDING-ONLY (2026-07-27) — see SubmitReferenceQuote's doc comment for how to read it and
+   *  for the three caveats (age, venue, mid-vs-touch) that are persisted rather than assumed away.
+   *  Captured at the entry-chase gate from the quote currentPrice() already fetched; costs ZERO
+   *  extra exchange calls and adds ZERO awaits to the order path.
+   *  `null`      = no reference was available (currentPrice not wired, or it returned no usable
+   *                price). NEVER back-filled from signal.entryPrice, which is up to maxSignalAgeMs
+   *                (default 50 min) old and would look like a real benchmark while being one.
+   *  `undefined` = position persisted before this field existed. Same meaning as null; separate
+   *                only because rewriting old records would be a lie about when this was measured. */
+  submitRef?: SubmitReferenceQuote | null;
 }
 
 interface SingleSymbolExecutorState {
@@ -318,6 +493,13 @@ export interface SingleSymbolLaneExecutorOptions {
    *  position per tick and both close finalizations mark the path closed — every use is wrapped
    *  so a failure can NEVER affect trading or settlement. */
   positionPathRecorder?: PositionPathRecorder;
+  /** Per-fill execution recorder (2026-07-26, report-only — see execution-fill-recorder.ts).
+   *  Same optional posture as cortexRealAttribution/positionPathRecorder: omit and this executor is
+   *  byte-for-byte unchanged. When present, both close finalizations persist the exchange fill rows
+   *  sumOwnRealizedTrades ALREADY fetched (price/qty/commission/time per fill — today only their
+   *  summed realizedPnl and commission survive). No extra exchange call, no extra await on the
+   *  order path; every use is wrapped so a failure can NEVER affect trading or settlement. */
+  executionFillRecorder?: ExecutionFillRecorder;
   /** Base position notional in USD, BEFORE allocation-weight scaling. */
   legUsd: () => number;
   leverage: () => number;
@@ -371,6 +553,27 @@ export interface SingleSymbolLaneExecutorOptions {
   maxClusterPositionsAcrossLanes?: () => number;
   /** Public-market reference used to reject a signal after price already chased its edge. */
   currentPrice?: (symbol: string) => Promise<number | null>;
+  /** RECORDING-ONLY (2026-07-27). SYNCHRONOUS, zero-I/O read of the most recent public quote this
+   *  process has already observed for `symbol` — a plain in-memory lookup, NOT a fetch. Exists
+   *  purely so the two-sided quote that currentPrice() above already paid for (and then threw away,
+   *  keeping only the mid) can be persisted onto the position as SubmitReferenceQuote.
+   *
+   *  Contract this executor relies on, and the reasons it is an OPTIONAL INJECTION rather than an
+   *  import of some shared cache:
+   *   - It MUST NOT perform I/O, await, or throw a rejection. It is called on the entry path.
+   *     (It is still wrapped in try/catch here — a throw is contained, never propagated.)
+   *   - Omit it and this executor is byte-for-byte unchanged except that SubmitReferenceQuote
+   *     degrades to source:"MID_ONLY" (mid still captured from currentPrice's own return value).
+   *   - A returned quote is ACCEPTED only when its atMs is at or after the instant this executor
+   *     started its own currentPrice() await, so a stale entry left behind by an earlier tick can
+   *     never be mis-attributed to this submission. A SIBLING executor's concurrent quote for the
+   *     same symbol passing that test is fine — it is equally fresh or fresher — which is why the
+   *     record must be read as "best quote available for this symbol at this instant", not "the
+   *     exact quote this executor fetched".
+   *   - VENUE WARNING: app.ts wires this from BinanceClient.getBookTicker(), which is Binance
+   *     SPOT (/api/v3/ticker/bookTicker), not the USD-M perp book these orders execute against.
+   *     That is why `venue` is carried through verbatim rather than assumed. */
+  readPublicQuote?: (symbol: string) => PublicQuoteSnapshot | null;
   /** Maximum favorable drift since the signal, measured in entry-to-stop R. */
   maxEntryChaseStopFraction?: () => number;
   /** 2026-07-12 fix: monitorOpenPositions() reads client.getPositions() every tick purely for
@@ -407,6 +610,46 @@ export interface SingleSymbolLaneExecutorOptions {
 const MAX_STORED_POSITIONS = () =>
   Math.max(1, Math.floor(Number(process.env.SINGLE_SYMBOL_EXEC_MAX_STORED_POSITIONS) || 2000));
 const TAKER_FEE_RATE = 0.0005; // 5 bps per side, conservative
+/** getUserTrades' startTime is compared against BINANCE's clock, not ours. This client tolerates
+ *  |local − server| up to MAX_CLOCK_SKEW_MS (binance-futures-private.ts) before it refuses to sign a
+ *  request at all, so even a stamp taken locally IMMEDIATELY before placeOrder can legitimately land
+ *  after the exchange-stamped entry fill. Subtract comfortably more than that tolerance so the entry
+ *  trade can never fall outside the window on a drifted box (a pre-submit stamp alone would fix the
+ *  bug here and fail intermittently in production).
+ *  Widening is safe: /fapi/v1/userTrades is ACCOUNT-scoped, not market-wide, and this account does
+ *  single-digit trades per symbol per day — 10s of extra window cannot push our own rows off the
+ *  limit:1000 page, and matching is by exact orderId regardless, so no other position's trades can
+ *  ever be summed in. */
+const FEE_WINDOW_SLACK_MS = 10_000;
+/** The `limit` this executor asks /fapi/v1/userTrades for, and therefore the row count at which the
+ *  page is SATURATED — Binance returns at most `limit` rows forward from `startTime`, so a full page
+ *  means "there may be more rows we never saw". Kept as a named constant precisely so the request
+ *  and the saturation test can never drift apart: if they do, ExecutionFillRecord.fetchComplete
+ *  silently starts claiming completeness it cannot know (2026-07-27 review finding). */
+const USER_TRADES_PAGE_LIMIT = 1000;
+/** Default OFF, and deliberately so — but read what OFF means, because it is NOT "never fold".
+ *
+ *  Widening the query window (entryTradeWindowFromMs) makes the entry commission VISIBLE. That is
+ *  pure recording and always happens: entryCommissionUsd / entryRealizedPnlUsd are populated on
+ *  every close regardless of this flag. Folding that commission into feeEstimateUsd / grossPnlUsd /
+ *  netPnlUsd is NOT recording-only: netPnlUsd feeds dailyRealizedUsd() -> the dailyMaxLossUsd gate
+ *  that blocks NEW ENTRIES, and notifyPositionClosed() -> the account-wide consecutive-loss
+ *  kill-switch counter (recordExternalConsecutiveLossOutcome, whose scratch/loss classification
+ *  turns on |net| < scratchEpsilonUsd, default $0.10 — the same order of magnitude as one entry
+ *  commission at this account's $50-150 notional). A truer, larger fee therefore blocks admission
+ *  and trips a kill marginally SOONER. That is almost certainly the correct end state, but it is an
+ *  execution-decision change on a real-money path and must be the operator's explicit call, made
+ *  once the recorded-but-unfolded numbers show exactly how large the shift is.
+ *
+ *  So OFF does not mean "drop the entry leg" — dropping it would LOOSEN both gates relative to
+ *  shipped behaviour, which is the wrong direction and just as much of a change. OFF means
+ *  "fold exactly the entry rows the OLD window would have returned", i.e. those whose exchange
+ *  timestamp is at or after openedAt (see sumOwnRealizedTrades' entryVisibleToLegacyWindow). On the
+ *  live box that set is empty — which is the bug — so OFF reproduces today's totals bit for bit,
+ *  while a drifted clock that DID make the entry row visible keeps folding it exactly as before.
+ *  ON folds every entry row the widened window finds, i.e. the true two-sided cost.
+ *  Enable per instance with SINGLE_SYMBOL_EXEC_FOLD_ENTRY_FEE=1. */
+const FOLD_ENTRY_LEG_INTO_PNL = (): boolean => process.env.SINGLE_SYMBOL_EXEC_FOLD_ENTRY_FEE === "1";
 
 export class SingleSymbolLaneExecutor {
   private readonly client: SingleSymbolExecClient;
@@ -424,6 +667,7 @@ export class SingleSymbolLaneExecutor {
   private readonly rawLaneWeightPctFn: (() => number) | null;
   private readonly cortexRealAttribution: CortexRealAttributionStore | null;
   private readonly positionPathRecorder: PositionPathRecorder | null;
+  private readonly executionFillRecorder: ExecutionFillRecorder | null;
   private readonly legUsdFn: () => number;
   private readonly leverageFn: () => number;
   private readonly maxOpenPositionsFn: () => number;
@@ -436,6 +680,7 @@ export class SingleSymbolLaneExecutor {
   private readonly existingClusterOpenSymbolsFn: (symbol: string, direction: "LONG" | "SHORT") => ReadonlySet<string>;
   private readonly maxClusterPositionsAcrossLanesFn: () => number;
   private readonly currentPriceFn: ((symbol: string) => Promise<number | null>) | null;
+  private readonly readPublicQuoteFn: ((symbol: string) => PublicQuoteSnapshot | null) | null;
   private readonly maxEntryChaseStopFractionFn: () => number;
   private readonly sharedGetPositions: () => ReturnType<SingleSymbolExecClient["getPositions"]>;
   private readonly tryClaimEntrySymbol: (symbol: string) => boolean;
@@ -470,6 +715,7 @@ export class SingleSymbolLaneExecutor {
     this.rawLaneWeightPctFn = opts.rawLaneWeightPct ?? null;
     this.cortexRealAttribution = opts.cortexRealAttribution ?? null;
     this.positionPathRecorder = opts.positionPathRecorder ?? null;
+    this.executionFillRecorder = opts.executionFillRecorder ?? null;
     this.legUsdFn = opts.legUsd;
     this.leverageFn = opts.leverage;
     this.maxOpenPositionsFn = opts.maxOpenPositions ?? (() => 1);
@@ -482,6 +728,7 @@ export class SingleSymbolLaneExecutor {
     this.existingClusterOpenSymbolsFn = opts.existingClusterOpenSymbols ?? (() => new Set<string>());
     this.maxClusterPositionsAcrossLanesFn = opts.maxClusterPositionsAcrossLanes ?? (() => 0);
     this.currentPriceFn = opts.currentPrice ?? null;
+    this.readPublicQuoteFn = opts.readPublicQuote ?? null;
     this.maxEntryChaseStopFractionFn = opts.maxEntryChaseStopFraction ?? (() => {
       const n = Number.parseFloat(process.env.LIVE_MAX_ENTRY_CHASE_STOP_FRACTION ?? "");
       return Number.isFinite(n) && n >= 0 ? n : 0.2;
@@ -500,6 +747,102 @@ export class SingleSymbolLaneExecutor {
       this.onPositionClosed(netUsd);
     } catch {
       // best-effort — the position is already fully settled and persisted regardless
+    }
+  }
+
+  /** Epoch ms off the SAME injected clock every other timestamp in this file uses, so a test that
+   *  freezes or drives nowIso drives this too. Falls back to Date.now() only if a caller supplied a
+   *  clock that produces an unparseable string — never NaN. */
+  private nowMs(): number {
+    const ms = new Date(this.nowIso()).getTime();
+    return Number.isFinite(ms) ? ms : Date.now();
+  }
+
+  /** RECORDING-ONLY. Assemble the pre-submit reference from data ALREADY in hand: the mid
+   *  currentPrice() just returned, plus (when injected) the two-sided quote the very same fetch
+   *  produced. Zero I/O, zero awaits, and fully contained — any throw yields null and the entry
+   *  proceeds exactly as it would have without this feature.
+   *
+   *  `observeStartMs` is the clock reading taken immediately BEFORE the currentPrice() await. A
+   *  cached quote is accepted only if it was observed at or after that instant, which is what stops
+   *  a leftover entry from an earlier tick (or from an unrelated symbol-sharing code path) being
+   *  passed off as this submission's benchmark. When no such quote exists we still record the mid,
+   *  labelled MID_ONLY, and date it at observeStartMs — i.e. the age is deliberately OVER-stated
+   *  rather than flattered. */
+  private captureSubmitRefBase(
+    symbol: string,
+    mid: number | null,
+    observeStartMs: number,
+  ): Omit<SubmitReferenceQuote, "ageAtSubmitMs"> | null {
+    try {
+      if (!(typeof mid === "number" && Number.isFinite(mid) && mid > 0)) return null;
+      const raw = this.readPublicQuoteFn ? this.readPublicQuoteFn(symbol) : null;
+      const fresh =
+        raw
+        && Number.isFinite(raw.atMs)
+        && raw.atMs >= observeStartMs
+        && typeof raw.mid === "number"
+        && Number.isFinite(raw.mid)
+        && raw.mid > 0
+          ? raw
+          : null;
+      if (fresh) {
+        const bid = typeof fresh.bid === "number" && Number.isFinite(fresh.bid) && fresh.bid > 0 ? fresh.bid : null;
+        const ask = typeof fresh.ask === "number" && Number.isFinite(fresh.ask) && fresh.ask > 0 ? fresh.ask : null;
+        const venue = typeof fresh.venue === "string" && fresh.venue.length > 0 ? fresh.venue : "UNKNOWN";
+        return {
+          mid: fresh.mid,
+          bid,
+          ask,
+          atMs: fresh.atMs,
+          venue,
+          // Only a genuinely TWO-SIDED quote earns BOOK_TICKER: a one-sided book gives no touch
+          // price for one of the two directions, so calling it a book quote would overstate what
+          // the record can answer.
+          source: bid !== null && ask !== null ? "BOOK_TICKER" : "MID_ONLY",
+          venueMatchesExecution: EXECUTION_VENUE_LABELS.has(venue),
+          // The cache is shared process-wide across every lane executor, so the quote read back
+          // here is not guaranteed to be the one THIS gate evaluated — see midDiffersFromGateMid.
+          ...(fresh.mid !== mid ? { midDiffersFromGateMid: true as const } : {}),
+        };
+      }
+      // No usable cached quote: the mid the gate itself evaluated is by construction the gate's own,
+      // but we have no venue label for it, and an unlabelled book must not claim to be the
+      // execution book.
+      return {
+        mid,
+        bid: null,
+        ask: null,
+        atMs: observeStartMs,
+        venue: "UNKNOWN",
+        source: "MID_ONLY",
+        venueMatchesExecution: false,
+      };
+    } catch {
+      // Recording must never be able to block or alter an entry.
+      return null;
+    }
+  }
+
+  /** RECORDING-ONLY. Freeze how stale the reference is at the exact instant the real order goes
+   *  out. This is ONE clock read — no await, no network, nothing between it and placeOrder. */
+  private stampSubmitRef(base: Omit<SubmitReferenceQuote, "ageAtSubmitMs"> | null): SubmitReferenceQuote | null {
+    try {
+      if (!base) return null;
+      // base.atMs comes from the PRODUCER's clock (app.ts's Date.now()); this.nowMs() is this
+      // executor's injected clock. They are the same wall clock in production, but an NTP step
+      // backwards — or an injected offset clock — makes the raw delta negative. Floor it at 0 as
+      // before, and MARK it: 0 is the most trustworthy-looking value the field can hold, so an
+      // unmarked floored anomaly would be preferentially retained by any report that filters on
+      // low age. See SubmitReferenceQuote.clockAnomaly.
+      const rawAgeMs = this.nowMs() - base.atMs;
+      return {
+        ...base,
+        ageAtSubmitMs: Math.max(0, rawAgeMs),
+        ...(rawAgeMs < 0 ? { clockAnomaly: true as const } : {}),
+      };
+    } catch {
+      return null;
     }
   }
 
@@ -789,36 +1132,182 @@ export class SingleSymbolLaneExecutor {
    *  authoritative source (extracted 2026-07-12 from settleIfStopTriggered so closePosition's
    *  policy exits can record REAL commissions too instead of a flat TAKER_FEE_RATE estimate):
    *  the given exit order's trades plus the entry order's (once per lifetime, guarded by
-   *  entryFeeRealized — trades are re-queried from openedAt on every call, so a position that
+   *  entryFeeRealized — trades are re-queried over the same window on every call, so a position that
    *  already went through a partial-fill cycle would otherwise re-add the SAME entry commission).
+   *  The window starts at entryTradeWindowFromMs — stamped BEFORE the entry order went out. See
+   *  that field's doc comment for the bug this fixes and why openedAt was always too late.
    *  Binance's per-request cap is 1000 for this endpoint — not a guarantee against a very active
-   *  shared symbol exceeding that many trades since openedAt, but the widest page available.
-   *  Returns null when the fetch fails (caller falls back to an estimate or retries). */
+   *  shared symbol exceeding that many trades in the window, but the widest page available.
+   *  Returns null when the fetch fails (caller falls back to an estimate or retries).
+   *
+   *  2026-07-26 (RECORDING-ONLY): also returns `matchedFills` — the SAME rows this loop already
+   *  walked, mapped verbatim (price, qty, commission, commissionAsset, realizedPnl, exchange time,
+   *  orderId-as-string) for execution-fill-recorder.ts. Before this, every per-fill field except
+   *  the two summed scalars was discarded here and the exit price survived only as ONE qty-weighted
+   *  average, so a partial fill, a per-fill commission, or a fill-vs-quote comparison could never
+   *  be reconstructed afterwards. No extra fetch: it is the same `trades` page. The entry branch's
+   *  `&& !entryAlreadyBanked` guard moved from the `else if` CONDITION into the branch body purely
+   *  so an already-banked entry row can still be COLLECTED for that record; there is no `else` arm,
+   *  so which rows contribute to realized/fees/exitNotional/exitQty is unaffected by the move.
+   *
+   *  2026-07-26 (RECORDING-ONLY): entryRealized/entryFees/entryTradeSeen report the entry leg's own
+   *  numbers separately, so the size of the previously-invisible understatement is measurable per
+   *  position (entryCommissionUsd) WITHOUT that measurement moving anything a gate reads. They are
+   *  reported IN ADDITION to — not instead of — the entry leg's contribution to realized/fees.
+   *
+   *  WHY THE FOLD IS PREDICATED, AND WHY THAT IS EXACTLY BEHAVIOUR-PRESERVING. Widening the window
+   *  makes entry rows visible that the old query never returned. Summing them all into realized/fees
+   *  would make every closed position's netPnlUsd ~one entry commission more negative, and netPnlUsd
+   *  is NOT report-only: it feeds dailyRealizedUsd() -> the daily-loss gate on new entries, and
+   *  notifyPositionClosed() -> the account-wide consecutive-loss kill switch. Dropping them all
+   *  instead would be an equal-and-opposite change in the LOOSER direction. So an entry row is folded
+   *  iff it would ALSO have been inside the old openedAt-anchored window (entryVisibleToLegacyWindow
+   *  below), which reproduces the shipped totals row for row, or iff the operator has explicitly
+   *  opted in via FOLD_ENTRY_LEG_INTO_PNL. `entryLegFolded` reports which happened.
+   *  The ONE residual difference from the old query is page composition: /fapi/v1/userTrades returns
+   *  at most `limit` rows from `startTime` forward, so on a symbol doing >1000 trades inside the
+   *  window the extra 10s could in principle displace a row the old call would have returned. At
+   *  this account's single-digit trades per symbol per day that cannot happen. */
   private async sumOwnRealizedTrades(
     pos: SingleSymbolPosition,
     exitOrderId: string | null,
-  ): Promise<{ realized: number; fees: number; exitNotional: number; exitQty: number } | null> {
+  ): Promise<{
+    realized: number;
+    fees: number;
+    exitNotional: number;
+    exitQty: number;
+    matchedFills: ExecutionFill[];
+    /** ENTRY order's own rows, reported at most once per position lifetime. Zero/false when the
+     *  entry rows were already banked on an earlier leg or were not in the window. */
+    entryRealized: number;
+    entryFees: number;
+    entryTradeSeen: boolean;
+    /** True when the entry leg above is ALSO included in realized/fees (see the fold rationale). */
+    entryLegFolded: boolean;
+    /** True when the /fapi/v1/userTrades page came back FULL (rows === the requested limit), i.e.
+     *  there may be rows past the page edge we never saw. RECORDING-ONLY: it is the honest
+     *  completeness signal for ExecutionFillRecord.fetchComplete and is deliberately NOT consulted
+     *  by any settlement or gate decision — the fee sums behave exactly as before. */
+    pageSaturated: boolean;
+  } | null> {
     const entryAlreadyBanked = pos.entryFeeRealized === true;
     try {
-      const trades = await this.client.getUserTrades(pos.symbol, { startTime: new Date(pos.openedAt).getTime(), limit: 1000 });
+      // THE FEE-WINDOW FIX (2026-07-26): start the window at the stamp taken BEFORE the entry order
+      // went out, not at openedAt (stamped after placeOrder AND after resolveFillPrice, therefore
+      // always later than Binance's own entry-fill timestamp — see entryTradeWindowFromMs). Falls
+      // back to openedAt only for positions persisted before that field existed, or if a bad clock
+      // ever produced a non-finite stamp: the old behaviour, never a guess.
+      const stampedFromMs = pos.entryTradeWindowFromMs;
+      const legacyWindowFromMs = new Date(pos.openedAt).getTime();
+      const startTime =
+        typeof stampedFromMs === "number" && Number.isFinite(stampedFromMs)
+          ? stampedFromMs
+          : legacyWindowFromMs;
+      const trades = await this.client.getUserTrades(pos.symbol, { startTime, limit: USER_TRADES_PAGE_LIMIT });
+      // A FULL page means Binance may have had more rows past its edge. Recording-only signal.
+      const pageSaturated = Array.isArray(trades) && trades.length >= USER_TRADES_PAGE_LIMIT;
+      const foldEveryEntryRow = FOLD_ENTRY_LEG_INTO_PNL();
+      // When we cannot tell whether the old window would have returned a row (unparseable openedAt),
+      // treat it as visible: that errs toward the LARGER, truer fee, i.e. the conservative side of
+      // both gates, and it is the same answer the old code gave (it queried with that same value).
+      const legacyWindowUnknowable = !Number.isFinite(legacyWindowFromMs);
       let realized = 0;
       let fees = 0;
       let exitNotional = 0;
       let exitQty = 0;
+      let entryRealized = 0;
+      let entryFees = 0;
+      let entryTradeSeen = false;
+      let entryLegFolded = false;
+      const matchedFills: ExecutionFill[] = [];
       for (const t of trades) {
         if (exitOrderId !== null && t.orderId === exitOrderId) {
           exitNotional += t.price * t.qty;
           exitQty += t.qty;
           realized += t.realizedPnl;
           fees += t.commission;
-        } else if (t.orderId === pos.entryOrderId && !entryAlreadyBanked) {
-          realized += t.realizedPnl;
-          fees += t.commission;
+          matchedFills.push(fillFromUserTrade(t, "EXIT"));
+        } else if (t.orderId === pos.entryOrderId) {
+          if (!entryAlreadyBanked) {
+            // Always recorded — this is the measurement the window fix exists for.
+            entryRealized += t.realizedPnl;
+            entryFees += t.commission;
+            entryTradeSeen = true;
+            // Folded into the position's P&L totals only under the predicate documented above.
+            // `t.time <= 0` is the real "unknowable" shape, not NaN: the client's toNum maps an
+            // absent or non-numeric `time` to 0, so a NaN guard alone is DEAD and a timestamp-less
+            // row would evaluate 0 >= legacyWindowFromMs → false → dropped, i.e. the SMALLER fee and
+            // the LOOSER side of both gates — the opposite of what this comment block promises
+            // (2026-07-27 review finding). Treat any non-positive/non-finite stamp as visible.
+            const entryTimeUnknowable = !Number.isFinite(t.time) || t.time <= 0;
+            const entryVisibleToLegacyWindow =
+              legacyWindowUnknowable || entryTimeUnknowable || t.time >= legacyWindowFromMs;
+            if (foldEveryEntryRow || entryVisibleToLegacyWindow) {
+              realized += t.realizedPnl;
+              fees += t.commission;
+              entryLegFolded = true;
+            }
+          }
+          matchedFills.push(fillFromUserTrade(t, "ENTRY"));
         }
       }
-      return { realized, fees, exitNotional, exitQty };
+      return {
+        realized, fees, exitNotional, exitQty, matchedFills,
+        entryRealized, entryFees, entryTradeSeen, entryLegFolded, pageSaturated,
+      };
     } catch {
       return null;
+    }
+  }
+
+  /** RECORDING-ONLY (2026-07-26). Persist the entry leg's own exchange numbers onto the position so
+   *  the fee understatement the window fix exposes is measurable per position — see
+   *  entryCommissionUsd / entryRealizedPnlUsd / entryLegFoldedIntoPnl.
+   *  ASSIGNED, never accumulated, and only when this call actually saw the entry rows: a settle that
+   *  retries next tick, or the second leg of a partial fill (entryFeeRealized already true, so
+   *  entryTradeSeen is false), must not overwrite a good value with a zero.
+   *  `foldedIntoTotals` is passed by the CALLER rather than taken from `summed` because whether the
+   *  entry leg reached grossPnlUsd/feeEstimateUsd depends on which arm the caller took: the flat
+   *  TAKER_FEE_RATE fallback in closePosition discards `summed` entirely and models both sides
+   *  itself, so the entry leg is NOT folded there no matter what this call computed.
+   *  Wrapped so a failure can NEVER affect settlement or trading. */
+  private recordEntryLeg(
+    pos: SingleSymbolPosition,
+    summed: { entryRealized: number; entryFees: number; entryTradeSeen: boolean },
+    foldedIntoTotals: boolean | undefined,
+  ): void {
+    try {
+      if (!summed.entryTradeSeen) return;
+      pos.entryCommissionUsd = summed.entryFees;
+      pos.entryRealizedPnlUsd = summed.entryRealized;
+      pos.entryLegFoldedIntoPnl = foldedIntoTotals;
+    } catch {
+      // report-only bookkeeping — a failure here must NEVER affect trading
+    }
+  }
+
+  /** Per-fill execution record for one FULLY closed position (2026-07-26, report-only). Called from
+   *  the SAME two finalization blocks recordCortexRealAttribution/markPositionPathClosed are, with
+   *  the fill rows sumOwnRealizedTrades already fetched — never its own exchange call. Recording an
+   *  EMPTY fill list is deliberately a no-op: "no record" is honest for a close that settled from
+   *  the flat-fee estimate, whereas an empty record would read as "this close had no fills".
+   *  Wrapped so a failure can NEVER affect settlement or trading. */
+  private recordExecutionFills(pos: SingleSymbolPosition, fills: ExecutionFill[], fetchComplete: boolean): void {
+    try {
+      const recorder = this.executionFillRecorder;
+      if (!recorder || !Array.isArray(fills) || fills.length === 0) return;
+      const closedMs = Date.parse(pos.closedAt ?? this.nowIso());
+      recorder.recordFills({
+        recordId: this.positionPathKey(pos), // ssle:<laneId>:<positionId> — same identity as CORTEX attribution
+        source: "ssle",
+        laneId: this.laneId,
+        symbol: pos.symbol,
+        closedAtMs: Number.isFinite(closedMs) ? closedMs : Date.now(),
+        fetchComplete,
+        fills,
+      });
+    } catch {
+      // report-only bookkeeping — a failure here must NEVER affect trading
     }
   }
 
@@ -877,7 +1366,7 @@ export class SingleSymbolLaneExecutor {
       this.lastError = `settle: trades fetch failed — retrying next tick, P&L NOT recorded (never fabricated) for ${pos.positionId}`;
       return true; // exit already in-flight (exitOrderId set) — skip policy-exit eval this tick too
     }
-    const { realized, fees, exitNotional, exitQty } = summed;
+    const { realized, fees, exitNotional, exitQty, matchedFills } = summed;
     if (exitQty === 0) {
       // The exit order's own trade record hasn't shown up in this window yet (timing race right
       // after the stop fires, or — see the limit comment above — a very active shared symbol
@@ -900,11 +1389,24 @@ export class SingleSymbolLaneExecutor {
       pos.realizedPartialGrossUsd = (pos.realizedPartialGrossUsd ?? 0) + realized;
       pos.realizedPartialFeeUsd = (pos.realizedPartialFeeUsd ?? 0) + fees;
       pos.entryFeeRealized = true;
+      // RECORDING-ONLY: capture the entry leg's own numbers on the ONE call that can still see them
+      // (entryFeeRealized above makes every later call skip the entry rows). `summed.entryLegFolded`
+      // is honest here because this branch banks `fees` verbatim into realizedPartialFeeUsd.
+      this.recordEntryLeg(pos, summed, summed.entryLegFolded);
       pos.qty = remainingQty;
       pos.exitOrderId = null;
       pos.stopAlgoOrderId = null; // triggered algo order is spent; ensureStopOrder re-arms a fresh one sized to remainingQty next tick
       this.lastError = `settle: stop for ${pos.positionId} partially filled (${exitQty} of ${exitQty + remainingQty}) — banked partial P&L, re-arming protection for the remaining ${remainingQty}`;
       this.store.save();
+      // Per-fill record for THIS partial leg (2026-07-26, report-only, fail-safe). Recorded here and
+      // not only at the eventual full close because this leg's exit order id is cleared on the next
+      // line-of-code path (pos.exitOrderId = null above) and a fresh stop gets a NEW one — the next
+      // sumOwnRealizedTrades would no longer match these rows, so they would be lost forever. The
+      // recorder merges into the same recordId and dedups per fill, so this is idempotent.
+      // fetchComplete is NOT unconditionally true: a saturated (full) userTrades page may have cut
+      // rows off its edge, and a short fill list that claims completeness is exactly the silent
+      // understatement this store exists to eliminate (2026-07-27 review finding).
+      this.recordExecutionFills(pos, matchedFills, !summed.pageSaturated);
       return true;
     }
     pos.exitPrice = exitNotional / exitQty; // qty-weighted average of the ACTUAL fill(s), not the trigger price
@@ -918,6 +1420,13 @@ export class SingleSymbolLaneExecutor {
     // FULL lifetime, not just the final leg.
     pos.grossPnlUsd = (pos.realizedPartialGrossUsd ?? 0) + realized;
     pos.feeEstimateUsd = (pos.realizedPartialFeeUsd ?? 0) + fees;
+    // Provenance (see SingleSymbolPosition.feeSource): this path NEVER falls back to the flat
+    // estimate — it returns early and retries next tick rather than settling from a model — so
+    // both components here (this leg's `fees` and any earlier partial leg's realizedPartialFeeUsd,
+    // itself banked from getUserTrades a few lines up) are exchange commission rows.
+    pos.feeSource = "EXCHANGE";
+    // RECORDING-ONLY: no-op when an earlier partial leg already banked (and recorded) the entry row.
+    this.recordEntryLeg(pos, summed, summed.entryLegFolded);
     const netUsd = pos.grossPnlUsd - pos.feeEstimateUsd;
     pos.netPnlUsd = netUsd;
     this.store.save();
@@ -929,6 +1438,11 @@ export class SingleSymbolLaneExecutor {
     this.recordCortexRealAttribution(pos);
     // Dense R-path close handoff (2026-07-22, report-only, fail-safe — see its doc comment).
     this.markPositionPathClosed(pos);
+    // Per-fill execution record (2026-07-26, report-only, fail-safe — see its doc comment). The
+    // rows come from the sumOwnRealizedTrades call above. A failed fetch returned early
+    // (summed === null) rather than reaching here, so the only remaining incompleteness is a
+    // SATURATED page — rows Binance cut off the edge of the limit:1000 window (2026-07-27 review).
+    this.recordExecutionFills(pos, matchedFills, !summed.pageSaturated);
     return true;
   }
 
@@ -1121,14 +1635,36 @@ export class SingleSymbolLaneExecutor {
       // fails, so this position must still finish closing bookkeeping-wise this tick either way.
       let gross: number;
       let fees: number;
+      // Provenance of `fees`, recorded alongside it (see SingleSymbolPosition.feeSource). THIS
+      // branch is the whole reason the flag exists: both arms write the same field name with the
+      // same units, and until now the only difference between a measured commission and a modelled
+      // one was which side of this `if` it came out of — information that was thrown away
+      // immediately. 7 of 21 live closed positions turned out to be the estimate arm.
+      let feeSource: "EXCHANGE" | "ESTIMATE_TAKER_FLAT";
+      // RECORDING-ONLY: whether the entry leg actually reached gross/fees below.
+      // UNDEFINED — not false — on the estimate arm, matching entryLegFoldedIntoPnl's documented
+      // contract (2026-07-27 review finding). `false` there would be actively misleading, not merely
+      // undocumented: that arm's fees are `notional * TAKER_FEE_RATE` with
+      // notional = entryPrice*qty + exit*qty, i.e. it ALREADY models an entry-side fee, while
+      // `false` advertises the totals as exit-side only. A consumer doing the obvious
+      // reconstruction (`fee + (entryLegFoldedIntoPnl === false ? entryCommissionUsd : 0)`) would
+      // then count the entry commission TWICE. `undefined` means "not answerable for this record",
+      // which is the truth: the totals are modelled, so no exchange entry row is in them at all.
+      let entryLegInTotals: boolean | undefined;
       const settled = await this.sumOwnRealizedTrades(pos, pos.exitOrderId);
       if (settled !== null && settled.exitQty > 0) {
         gross = (pos.realizedPartialGrossUsd ?? 0) + settled.realized;
         fees = (pos.realizedPartialFeeUsd ?? 0) + settled.fees;
+        feeSource = "EXCHANGE";
+        entryLegInTotals = settled.entryLegFolded;
       } else {
         gross = (pos.realizedPartialGrossUsd ?? 0) + dir * (exit - pos.entryPrice) * pos.qty;
         const notional = pos.entryPrice * pos.qty + exit * pos.qty;
         fees = (pos.realizedPartialFeeUsd ?? 0) + notional * TAKER_FEE_RATE;
+        // ESTIMATE even when realizedPartialFeeUsd contributes a genuinely-measured component:
+        // the total carries a modelled part, and a mixed number must be excluded from cost
+        // analysis exactly as a fully-modelled one is. See feeSource's doc comment.
+        feeSource = "ESTIMATE_TAKER_FLAT";
         this.lastError = `close ${pos.positionId}: exit trades not retrievable this tick — P&L recorded from fill-price estimate (fees estimated at ${TAKER_FEE_RATE * 1e4}bps/side)`;
       }
       pos.status = "CLOSED";
@@ -1136,6 +1672,10 @@ export class SingleSymbolLaneExecutor {
       pos.closeReason = reason;
       pos.grossPnlUsd = gross;
       pos.feeEstimateUsd = fees;
+      pos.feeSource = feeSource;
+      // RECORDING-ONLY (see recordEntryLeg): no-op when the trades fetch failed outright, or when an
+      // earlier partial leg already banked the entry row.
+      if (settled !== null) this.recordEntryLeg(pos, settled, entryLegInTotals);
       const netUsd = gross - fees;
       pos.netPnlUsd = netUsd;
       this.store.save();
@@ -1146,6 +1686,12 @@ export class SingleSymbolLaneExecutor {
       this.recordCortexRealAttribution(pos);
       // Dense R-path close handoff (2026-07-22, report-only, fail-safe — see its doc comment).
       this.markPositionPathClosed(pos);
+      // Per-fill execution record (2026-07-26, report-only, fail-safe — see its doc comment). Rows
+      // come from the sumOwnRealizedTrades call above; when that fetch FAILED (settled === null)
+      // there are no rows and nothing is recorded — the absence of a record, paired with
+      // feeSource === "ESTIMATE_TAKER_FLAT", is the honest signal that this close was modelled.
+      // A SUCCESSFUL fetch is still only complete if its page was not saturated (2026-07-27 review).
+      this.recordExecutionFills(pos, settled?.matchedFills ?? [], settled !== null && !settled.pageSaturated);
     } finally {
       this.closingPositionIds.delete(pos.positionId);
     }
@@ -1214,7 +1760,15 @@ export class SingleSymbolLaneExecutor {
         }
       }
 
+      // RECORDING-ONLY (2026-07-27): the pre-submit execution reference for THIS candidate. Stays
+      // null unless the entry-quality gate below actually obtains a usable live price — it is never
+      // back-filled from signal.entryPrice, which can be 50 minutes stale and would masquerade as a
+      // real benchmark. See SubmitReferenceQuote.
+      let submitRefBase: Omit<SubmitReferenceQuote, "ageAtSubmitMs"> | null = null;
       if (this.currentPriceFn) {
+        // Clock read BEFORE the await, so a quote left in the cache by an earlier tick can be
+        // rejected as not belonging to this submission (see captureSubmitRefBase).
+        const priceObserveStartMs = this.nowMs();
         const currentPrice = await this.currentPriceFn(signal.symbol).catch(() => null);
         const risk = Math.abs(signal.entryPrice - signal.stopPrice);
         if (!(currentPrice !== null && currentPrice > 0) || !(risk > 0)) {
@@ -1234,6 +1788,9 @@ export class SingleSymbolLaneExecutor {
             : `${signal.symbol}: entry chase ${favorableDriftR.toFixed(2)}R exceeds ${chaseLimit.toFixed(2)}R`;
           continue;
         }
+        // Placed AFTER every gate decision above, so a rejected candidate pays literally nothing
+        // for this feature. Reuses the price/quote the gate already fetched — no extra call.
+        submitRefBase = this.captureSubmitRefBase(signal.symbol, currentPrice, priceObserveStartMs);
       }
 
       // 2026-07-09 fix: cap combined notional across ALL lanes for this symbol — checked FIRST,
@@ -1386,6 +1943,22 @@ export class SingleSymbolLaneExecutor {
         } catch {
           // best-effort (already set / position exists)
         }
+        // RECORDING-ONLY (2026-07-27). Freeze the reference's age at the LAST instant before the
+        // real order goes out. Deliberately placed here and not in the position literal below:
+        // that literal is built AFTER placeOrder AND after resolveFillPrice (which can burn
+        // 4x400ms plus 4 queryOrder round-trips), so stamping there would inflate every
+        // ageAtSubmitMs by the fill-confirmation latency and quietly destroy the one number that
+        // tells a consumer whether the sample is usable at all.
+        // Cost on the order path: ONE clock read (stampSubmitRef is Date arithmetic, wrapped in
+        // its own try/catch, no await, no I/O). Nothing else sits between it and placeOrder.
+        const submitRef = this.stampSubmitRef(submitRefBase);
+        // THE FEE-WINDOW FIX (2026-07-26) — the lower bound sumOwnRealizedTrades will later use for
+        // getUserTrades, taken HERE because openedAt (its previous lower bound, stamped in the
+        // position literal below) is written AFTER placeOrder returns AND after resolveFillPrice,
+        // therefore ALWAYS later than the timestamp Binance stamps on the entry fill at match time.
+        // See entryTradeWindowFromMs's doc comment. Cost on the order path: ONE clock read — same
+        // Date arithmetic as the line above, no await, no I/O, nothing between it and placeOrder.
+        const entryTradeWindowFromMs = this.nowMs() - FEE_WINDOW_SLACK_MS;
         const order = await this.client.placeOrder({
           symbol: signal.symbol,
           side: this.direction === "LONG" ? "BUY" : "SELL",
@@ -1411,6 +1984,7 @@ export class SingleSymbolLaneExecutor {
           closeFailureSinceIso: null,
           peakFavorableR: 0,
           openedAt: this.nowIso(),
+          entryTradeWindowFromMs,
           status: "OPEN",
           closedAt: null,
           closeReason: null,
@@ -1422,6 +1996,7 @@ export class SingleSymbolLaneExecutor {
           netPnlUsd: null,
           cortexAppliedWeightPct,
           cortexRawStaticWeightPct,
+          submitRef,
         };
         st.positions.push(position);
         this.store.save();

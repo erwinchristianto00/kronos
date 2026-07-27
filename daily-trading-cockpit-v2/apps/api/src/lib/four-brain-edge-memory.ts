@@ -50,6 +50,7 @@ import {
 } from "./direction-entry-outcome-store.js";
 import type { FourBrainOutcomeHorizon } from "./four-brain-outcome-ledger.js";
 import { EDGE_MIN_SAMPLES } from "./regime-edge-memory.js";
+import { HORIZON_MS } from "./direction-brain-resolver.js";
 
 export type FourBrainEdgeDirection = "LONG" | "SHORT";
 export type FourBrainEdgeVerdictDecision = "ALLOW_PROVEN" | "ALLOW_INSUFFICIENT" | "VETO_NEGATIVE";
@@ -60,7 +61,20 @@ export type FourBrainEdgeVerdictDecision = "ALLOW_PROVEN" | "ALLOW_INSUFFICIENT"
 export const MIN_SAMPLES = EDGE_MIN_SAMPLES;
 
 export interface FourBrainEdgeLookup {
+  /** Raw resolved-row count. Reported for transparency but NOT what gates the verdict — see effectiveN. */
   n: number;
+  /** Non-overlapping-window count: distinct floor(asOfMs / HORIZON_MS[horizon]) blocks among this
+   *  bucket's rows — the same block definition direction-brain-resolver.ts and
+   *  direction-entry-outcome-store.ts already use. THIS is what gates the verdict.
+   *
+   *  2026-07-26 fix. Previously the MIN_SAMPLES gate read raw n, which overstates the evidence badly
+   *  because a horizon's decisions overlap: measured on live testnet data, SWING carried raw n=881
+   *  against effectiveN=4, and LONG/SWING was firing VETO_NEGATIVE off 45 raw rows that were really
+   *  ~4 independent draws (avgNetR -3.63R, an artifact of a handful of overlapping windows).
+   *  INTRADAY was raw 1117 vs effectiveN 27. The outcome store's own report already gates on
+   *  effective sample size for exactly this reason; this memory was the one consumer that did not,
+   *  so it was suppressing a real LONG score on evidence it did not have. */
+  effectiveN: number;
   /** null when n===0 — NEVER a fabricated zero. See module doc's anti-fabrication section. */
   avgNetR: number | null;
 }
@@ -68,12 +82,20 @@ export interface FourBrainEdgeLookup {
 export interface FourBrainEdgeVerdict {
   verdict: FourBrainEdgeVerdictDecision;
   avgNetR: number | null;
+  /** Raw row count — reported, but NOT the sufficiency test. */
   n: number;
+  /** Non-overlapping windows — THIS is what MIN_SAMPLES is compared against. */
+  effectiveN: number;
 }
 
 interface Bucket {
   n: number;
   sumNetR: number;
+  /** Distinct non-overlapping horizon blocks this bucket's rows fall in. A Set (not a counter)
+   *  because rows arrive in no guaranteed order here — unlike the outcome store, which can use an
+   *  O(1) last-block-seen counter precisely because it books rows in non-decreasing asOfMs order.
+   *  Bounded by the store's own MAX_DIRECTION_RECORDS, so this cannot grow without limit. */
+  blocks: Set<number>;
 }
 
 function bucketKey(direction: FourBrainEdgeDirection, horizon: FourBrainOutcomeHorizon): string {
@@ -92,9 +114,11 @@ export function foldDirectionOutcomeRecordsForEdgeMemory(
     if (r.action !== "LONG" && r.action !== "SHORT") continue;
     if (typeof r.chosenNetR !== "number" || !Number.isFinite(r.chosenNetR)) continue; // defensive; should not arise
     const key = bucketKey(r.action, r.horizon);
-    const b = buckets.get(key) ?? { n: 0, sumNetR: 0 };
+    const b = buckets.get(key) ?? { n: 0, sumNetR: 0, blocks: new Set<number>() };
     b.n += 1;
     b.sumNetR += r.chosenNetR;
+    const horizonMs = HORIZON_MS[r.horizon];
+    if (Number.isFinite(r.asOfMs) && horizonMs > 0) b.blocks.add(Math.floor(r.asOfMs / horizonMs));
     buckets.set(key, b);
   }
   return buckets;
@@ -120,22 +144,28 @@ export class FourBrainEdgeMemoryStore {
     this.buckets = foldDirectionOutcomeRecordsForEdgeMemory(this.outcomeStore.getState().direction.records);
   }
 
-  /** {n, avgNetR} for one (direction, horizon) slice. n===0 ⇒ avgNetR:null (never a fabricated 0 — see
-   *  module doc's anti-fabrication section). */
+  /** {n, effectiveN, avgNetR} for one (direction, horizon) slice. n===0 ⇒ avgNetR:null (never a
+   *  fabricated 0 — see module doc's anti-fabrication section). effectiveN ≤ n always. */
   lookup(direction: FourBrainEdgeDirection, horizon: FourBrainOutcomeHorizon): FourBrainEdgeLookup {
     const b = this.buckets.get(bucketKey(direction, horizon));
-    if (!b || b.n === 0) return { n: 0, avgNetR: null };
-    return { n: b.n, avgNetR: b.sumNetR / b.n };
+    if (!b || b.n === 0) return { n: 0, effectiveN: 0, avgNetR: null };
+    return { n: b.n, effectiveN: b.blocks.size, avgNetR: b.sumNetR / b.n };
   }
 }
 
 /**
  * Pure verdict from a (direction, horizon) slice — the same 3-way rule as regime-edge-memory.ts's
  * edgeVerdict, applied to the Direction Brain's own self-referential accuracy:
- *  - n < MIN_SAMPLES        → ALLOW_INSUFFICIENT (cold-start; avgNetR reported null, never fabricated)
- *  - n ≥ MIN_SAMPLES, avg≤0 → VETO_NEGATIVE (proven-negative — a SOFT penalty at the call site, never a
- *    hard gate; see direction-brain.ts's fourBrainLongVeto/fourBrainShortVeto wiring)
- *  - n ≥ MIN_SAMPLES, avg>0 → ALLOW_PROVEN
+ *  - effectiveN < MIN_SAMPLES  → ALLOW_INSUFFICIENT (cold-start; avgNetR reported null, never fabricated)
+ *  - effectiveN ≥ MIN_SAMPLES, avg≤0 → VETO_NEGATIVE (proven-negative — a SOFT penalty at the call site,
+ *    never a hard gate; see direction-brain.ts's fourBrainLongVeto/fourBrainShortVeto wiring)
+ *  - effectiveN ≥ MIN_SAMPLES, avg>0 → ALLOW_PROVEN
+ *
+ * The gate reads effectiveN (non-overlapping windows), NOT raw n — 2026-07-26 fix. Gating on raw n
+ * let a bucket veto on evidence it did not have: live testnet had LONG/SWING at raw n=45 but only
+ * ~4 independent windows, and it was suppressing LONG scores off an avgNetR of -3.63R that a handful
+ * of overlapping windows produced. avgNetR is still the mean over ALL n rows (that is the best point
+ * estimate available); only the SUFFICIENCY test changed.
  *
  * `regimeRaw` is accepted (matching regime-edge-memory.ts's own verdict(regimeRaw, direction) shape and
  * this project's wiring call `fourBrainEdgeVerdict(fbEdge, dep.regimeRaw, "LONG", horizon)`) but currently
@@ -149,11 +179,11 @@ export function fourBrainEdgeVerdict(
   horizon: FourBrainOutcomeHorizon,
 ): FourBrainEdgeVerdict {
   void regimeRaw; // accepted for signature parity / forward-compat only — see module doc
-  const { n, avgNetR } = store.lookup(direction, horizon);
-  if (n < MIN_SAMPLES || avgNetR === null) {
-    return { verdict: "ALLOW_INSUFFICIENT", avgNetR: null, n };
+  const { n, effectiveN, avgNetR } = store.lookup(direction, horizon);
+  if (effectiveN < MIN_SAMPLES || avgNetR === null) {
+    return { verdict: "ALLOW_INSUFFICIENT", avgNetR: null, n, effectiveN };
   }
-  return { verdict: avgNetR <= 0 ? "VETO_NEGATIVE" : "ALLOW_PROVEN", avgNetR, n };
+  return { verdict: avgNetR <= 0 ? "VETO_NEGATIVE" : "ALLOW_PROVEN", avgNetR, n, effectiveN };
 }
 
 let _singleton: FourBrainEdgeMemoryStore | null = null;
