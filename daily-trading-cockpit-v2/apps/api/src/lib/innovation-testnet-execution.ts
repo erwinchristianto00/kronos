@@ -67,6 +67,15 @@ export function innovationTestnetWeight(selectedWeightPct: number): number {
     : 100;
 }
 
+export function startInnovationTestnetExecutorSchedule(
+  run: () => Promise<void>,
+  scheduleEvery: (handler: () => void, intervalMs: number) => ReturnType<typeof setInterval> = setInterval,
+): ReturnType<typeof setInterval> {
+  // Start before server.ts's 60-second paper cycle can monopolize the event loop for minutes.
+  void run();
+  return scheduleEvery(() => void run(), 5 * 60_000);
+}
+
 export function singleSignalsForDirection(
   observations:
     | readonly BtcLeadLagObservation[]

@@ -9,6 +9,7 @@ import {
   innovationTestnetWeight,
   isInnovationTestnetExecutionEnabled,
   singleSignalsForDirection,
+  startInnovationTestnetExecutorSchedule,
 } from "../src/lib/innovation-testnet-execution.js";
 import type { BtcLeadLagObservation } from "../src/lib/btc-leadlag-snap-edge.js";
 import type { FundingCarryObservation } from "../src/lib/funding-carry-edge.js";
@@ -32,6 +33,28 @@ describe("innovation testnet execution adapters", () => {
     expect(innovationTestnetWeight(0)).toBe(100);
     expect(innovationTestnetWeight(Number.NaN)).toBe(100);
     expect(innovationTestnetWeight(35)).toBe(35);
+  });
+
+  it("starts the executor immediately before registering its five-minute interval", async () => {
+    let runs = 0;
+    let scheduledMs = 0;
+    let scheduledHandler: (() => void) | null = null;
+    startInnovationTestnetExecutorSchedule(
+      async () => {
+        runs += 1;
+      },
+      ((handler: () => void, intervalMs: number) => {
+        scheduledHandler = handler;
+        scheduledMs = intervalMs;
+        return 1 as unknown as ReturnType<typeof setInterval>;
+      }),
+    );
+    await Promise.resolve();
+    expect(runs).toBe(1);
+    expect(scheduledMs).toBe(5 * 60_000);
+    (scheduledHandler as (() => void) | null)?.();
+    await Promise.resolve();
+    expect(runs).toBe(2);
   });
 
   it("preserves single-symbol direction, structural stop, target, and horizon", () => {

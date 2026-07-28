@@ -46,6 +46,7 @@ import {
   innovationTestnetWeight,
   isInnovationTestnetExecutionEnabled,
   singleSignalsForDirection,
+  startInnovationTestnetExecutorSchedule,
 } from "./lib/innovation-testnet-execution.js";
 import { BLS_LANE_ID, getBtcLeadLagSnapStore } from "./lib/btc-leadlag-snap-edge.js";
 import { FC_PAPER_LANE_ID, getFundingCarryStore } from "./lib/funding-carry-edge.js";
@@ -2053,8 +2054,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           for (const executor of innovationBasketExecutors) await executor.tick();
           for (const executor of innovationSingleSymbolExecutors) await executor.tick();
         };
-        setTimeout(() => void tickInnovations(), 75_000);
-        setInterval(() => void tickInnovations(), 5 * 60_000);
+        startInnovationTestnetExecutorSchedule(tickInnovations);
       }
     }
 
