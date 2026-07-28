@@ -16,6 +16,8 @@ import {
   type PaperOrder,
   type PaperOrderStatus,
 } from "../src/lib/paper-execution-router.js";
+import { STOP_OUT_SLIPPAGE_BPS, TAKER_ROUNDTRIP_BPS } from "../src/lib/current-guard-variant-matrix.js";
+import { REALISTIC_FEE_BPS_PER_SIDE } from "../src/lib/shadow-engine.js";
 import { registerShadowRoutes } from "../src/routes/shadow.js";
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -91,7 +93,36 @@ const client: PaperResolverClient = {
   },
 };
 
-const COST = -(22 / 300); // _computePaperCostR for 300bps
+/**
+ * v2 exit-aware cost (PAPER_COST_MODEL_V2, ON by default since 9d2bf3d), mirroring
+ * _computePaperExitCostR for these fixtures: taker fill, 300bps planned stop, priced through the
+ * IDEAL model with viaWalk=false.
+ *
+ *   chargedBps = max(feeOnlyFloor, roundTrip + stopOutSurcharge − slipAlreadyInGross)
+ *
+ * Derived from the SAME exported constants the implementation reads, not copied as a literal — the
+ * old `-(22 / 300)` silently encoded the v1 flat model and went stale the moment v2 became the
+ * default. The counterfactual re-walk calls the cost fn WITHOUT an exit timestamp, so no funding
+ * period is ever charged here (only resolvePaperOrders passes one).
+ *
+ * The only kind that moves vs v1 is STOP_LIKE, which now pays STOP_OUT_SLIPPAGE_BPS on top — the
+ * asymmetry v1 lacked, and the whole reason a timebox that converts winners into stop-outs must not
+ * be priced as if a stop cost the same as a take-profit.
+ */
+const STOP_BPS = 300;
+const costR = (kind: "TP_LIKE" | "STOP_LIKE" | "MARK_TO_MARKET"): number => {
+  const slipInGross =
+    PAPER_EXECUTION_MODEL_IDEAL.entrySlippageBps +
+    (kind === "TP_LIKE" ? PAPER_EXECUTION_MODEL_IDEAL.tpSlippageBps : PAPER_EXECUTION_MODEL_IDEAL.stopSlippageBps);
+  const charged = Math.max(
+    REALISTIC_FEE_BPS_PER_SIDE * 2,
+    TAKER_ROUNDTRIP_BPS + (kind === "STOP_LIKE" ? STOP_OUT_SLIPPAGE_BPS : 0) - slipInGross,
+  );
+  return -(charged / STOP_BPS);
+};
+const COST_TP = costR("TP_LIKE");
+const COST_STOP = costR("STOP_LIKE");
+const COST_MTM = costR("MARK_TO_MARKET");
 const cfg = (h: number) => ({ laneId: `CG_TIMEBOXED_EXIT_${h}H_DIAGNOSTIC`, timeboxHours: h, executionModel: PAPER_EXECUTION_MODEL_IDEAL });
 
 describe("timeboxed-exit counterfactual diagnostic (DIAGNOSTIC-ONLY)", () => {
@@ -116,16 +147,21 @@ describe("timeboxed-exit counterfactual diagnostic (DIAGNOSTIC-ONLY)", () => {
     expect(r.dataFailures).toBe(0);
     expect(r.closedSampleSize).toBe(2); // A, B
     expect(r.openWouldCloseCount).toBe(1); // C is open and would have exited
-    // box economics: TP=+1.26, SL=-1.0733, MTM(close98)=(100-98)/3+COST
-    const mtmNet = 2 / 3 + COST;
-    expect(r.boxNetAvgR!).toBeCloseTo((1.26 - 1.0733 + mtmNet) / 3, 3);
+    // Box economics, priced per exit kind (the box re-walks each leg; it does NOT reuse the
+    // order's stored netR). A(TP) and C(MTM) are unchanged from v1; B is a stop-out and now pays
+    // the STOP_OUT_SLIPPAGE_BPS surcharge, which is exactly the cost a timebox forcing an exit
+    // into a stop is supposed to be charged.
+    const tpNet = 4 / 3 + COST_TP;
+    const slNet = -1 + COST_STOP;
+    const mtmNet = 2 / 3 + COST_MTM; // MTM at close=98 → (100−98)/3
+    expect(r.boxNetAvgR!).toBeCloseTo((tpNet + slNet + mtmNet) / 3, 3);
     expect(r.verdict).toBe("INSUFFICIENT_SAMPLE"); // 2 < 20 closed
   });
 
   // [2] PRESERVES: box outcome == real outcome → delta ~0
   it("[2] verdict PRESERVES when timebox reproduces the real outcome", async () => {
     const old = Date.now() - 10 * HOUR;
-    const realTpNet = 4 / 3 + COST; // TP within box and real both hit TP
+    const realTpNet = 4 / 3 + COST_TP; // TP within box and real both hit TP
     const orders = Array.from({ length: 25 }, (_, i) =>
       order({ symbol: `TP_${i}`, openedAtMs: old, status: "PAPER_CLOSED_WIN", netR: realTpNet, id: `p${i}` }),
     );
@@ -138,13 +174,13 @@ describe("timeboxed-exit counterfactual diagnostic (DIAGNOSTIC-ONLY)", () => {
   // [3] DEGRADES: real eventually won (+R) but at the 4h cap it was underwater
   it("[3] verdict DEGRADES when the box exits a would-be winner at a loss", async () => {
     const old = Date.now() - 10 * HOUR;
-    const realWinNet = 4 / 3 + COST; // real run-to-completion won
+    const realWinNet = 4 / 3 + COST_TP; // real run-to-completion won
     const orders = Array.from({ length: 25 }, (_, i) =>
       order({ symbol: `MTMLOSS_${i}`, openedAtMs: old, status: "PAPER_CLOSED_WIN", netR: realWinNet, id: `d${i}` }),
     );
     const r = await buildTimeboxedExitDiagnostic(orders, client, cfg(4));
-    // box marks each to market at close=101 → (100-101)/3 + COST (a loss)
-    expect(r.boxNetAvgROnClosed!).toBeCloseTo(-1 / 3 + COST, 3);
+    // box marks each to market at close=101 → (100-101)/3 + COST_MTM (a loss)
+    expect(r.boxNetAvgROnClosed!).toBeCloseTo(-1 / 3 + COST_MTM, 3);
     expect(r.expectancyDeltaR!).toBeLessThan(-0.05);
     expect(r.verdict).toBe("TIMEBOX_DEGRADES_EXPECTANCY");
   });

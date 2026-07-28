@@ -15,6 +15,7 @@ import {
   PaperExecutionRouterStore,
   buildPaperPerformanceReport,
   PAPER_EXECUTION_MODEL_IDEAL,
+  PAPER_COST_MODEL_VERSION,
   getPaperExecutionRouterStore,
   _resetPaperExecutionRouterStoreForTests,
   type FastTpVariant,
@@ -23,6 +24,8 @@ import {
   type PaperOrder,
   type PaperOrderStatus,
 } from "../src/lib/paper-execution-router.js";
+import { STOP_OUT_SLIPPAGE_BPS, TAKER_ROUNDTRIP_BPS } from "../src/lib/current-guard-variant-matrix.js";
+import { REALISTIC_FEE_BPS_PER_SIDE } from "../src/lib/shadow-engine.js";
 import { buildLiveTradingGateReport } from "../src/lib/live-trading-gate.js";
 import { registerShadowRoutes } from "../src/routes/shadow.js";
 
@@ -31,7 +34,35 @@ import { registerShadowRoutes } from "../src/routes/shadow.js";
 const CANDLE_MS = 5 * 60 * 1000;
 const HOUR = 3_600_000;
 const iso = (ms: number) => new Date(ms).toISOString();
-const COST = -(22 / 300); // _computePaperCostR for 300bps
+/**
+ * v2 exit-aware cost (PAPER_COST_MODEL_V2, ON by default since 9d2bf3d), mirroring
+ * _computePaperExitCostR for these fixtures: taker fill, 300bps planned stop, priced through the
+ * IDEAL model with viaWalk=false.
+ *
+ *   chargedBps = max(feeOnlyFloor, roundTrip + stopOutSurcharge − slipAlreadyInGross)
+ *
+ * Derived from the SAME exported constants the implementation reads, not copied as a literal — the
+ * old `-(22 / 300)` silently encoded the v1 flat model and went stale the moment v2 became the
+ * default. The counterfactual re-walk calls the cost fn WITHOUT an exit timestamp, so no funding
+ * period is charged here (only resolvePaperOrders passes one).
+ *
+ * Which constant a case uses is NOT cosmetic: this diagnostic exists to compare a tight TP against
+ * the original wide target, and the two policies differ in HOW they exit. Pricing a trail-stop exit
+ * as if it were a resting take-profit is exactly the bias STOP_OUT_SLIPPAGE_BPS exists to remove,
+ * and it flatters every policy that converts winners into stop-outs.
+ */
+const STOP_BPS = 300;
+const costR = (kind: "TP_LIKE" | "STOP_LIKE" | "MARK_TO_MARKET"): number => {
+  const m = PAPER_EXECUTION_MODEL_IDEAL;
+  const slipInGross = m.entrySlippageBps + (kind === "TP_LIKE" ? m.tpSlippageBps : m.stopSlippageBps);
+  const charged = Math.max(
+    REALISTIC_FEE_BPS_PER_SIDE * 2,
+    TAKER_ROUNDTRIP_BPS + (kind === "STOP_LIKE" ? STOP_OUT_SLIPPAGE_BPS : 0) - slipInGross,
+  );
+  return -(charged / STOP_BPS);
+};
+const COST_TP = costR("TP_LIKE");
+const COST_STOP = costR("STOP_LIKE");
 const tmpDir = () => mkdtempSync(join(os.tmpdir(), "fast-tp-test-"));
 
 // SHORT, entry 100 / stop 103 (risk 3) / wide tp 96 / 300bps.
@@ -119,7 +150,7 @@ describe("fast/tight-TP counterfactual diagnostic (DIAGNOSTIC-ONLY)", () => {
       executionModel: PAPER_EXECUTION_MODEL_IDEAL,
     });
     expect(r.sampleSize).toBe(1);
-    expect(r.netAvgR!).toBeCloseTo(0.5 + COST, 4); // +0.5R − fees
+    expect(r.netAvgR!).toBeCloseTo(0.5 + COST_TP, 4); // +0.5R − fees
     expect(r.wr).toBe(1);
     expect(r.winsAccelerated).toBe(1); // real winner, closed far earlier
     expect(r.originalWinnersCutTooEarly).toBe(1); // 0.43R < real 1.26R
@@ -133,7 +164,7 @@ describe("fast/tight-TP counterfactual diagnostic (DIAGNOSTIC-ONLY)", () => {
     const [r] = await buildFastTpTightDiagnostic(orders, client, v("TP_0_50R_FULL"), {
       executionModel: PAPER_EXECUTION_MODEL_IDEAL,
     });
-    expect(r.netAvgR!).toBeCloseTo(-1 + COST, 4);
+    expect(r.netAvgR!).toBeCloseTo(-1 + COST_STOP, 4);
     expect(r.wr).toBe(0);
     expect(r.sameCandleAmbiguityCount).toBe(0);
   });
@@ -146,7 +177,51 @@ describe("fast/tight-TP counterfactual diagnostic (DIAGNOSTIC-ONLY)", () => {
       executionModel: PAPER_EXECUTION_MODEL_IDEAL,
     });
     expect(r.sameCandleAmbiguityCount).toBe(1);
-    expect(r.netAvgR!).toBeCloseTo(-1 + COST, 4); // conservative → stop-first loss
+    expect(r.netAvgR!).toBeCloseTo(-1 + COST_STOP, 4); // conservative → stop-first loss
+  });
+
+  // [COST-MODEL] The counterfactuals must price a stop-out ABOVE a take-profit.
+  //
+  // WHY THIS EXISTS (2026-07-28): 9d2bf3d flipped PAPER_COST_MODEL_V2 from opt-in (=== "1") to
+  // opt-out (!== "0") and added a funding term. These three diagnostic files priced their expected R
+  // from a hardcoded `-(22 / 300)` — the v1 FLAT cost — so they broke, and the shape of the break was
+  // the giveaway: exactly the stop-exit assertions moved, by exactly STOP_OUT_SLIPPAGE_BPS/stopBps.
+  //
+  // Asserting the numbers alone would go stale the same way. This asserts the CONTRACT through the
+  // public diagnostic API instead: whatever the absolute costs are, a stop-like exit must cost the
+  // stop-out surcharge MORE than a take-profit. Under the v1 flat model that gap is exactly 0, so
+  // this test fails the moment the diagnostics silently fall back to it — which is the failure
+  // nobody noticed for a full commit.
+  //
+  // It matters beyond bookkeeping: this diagnostic recommends tight-TP policies, and policies that
+  // convert winners into stop-outs are precisely the ones a flat cost model flatters.
+  it("[COST-MODEL] a stop exit costs the stop-out surcharge more than a TP exit", async () => {
+    expect(PAPER_COST_MODEL_VERSION).toBe(2); // names the cause if the default is ever flipped back
+
+    const tpClient = seqClient((i) => (i === 0 ? NEUTRAL : { h: 100, l: 98.4, c: 99 })); // tight TP, no stop
+    const stopClient = seqClient((i) => (i === 0 ? NEUTRAL : { h: 104, l: 99, c: 101 })); // stop, no TP
+    const opts = { executionModel: PAPER_EXECUTION_MODEL_IDEAL };
+    const [tp] = await buildFastTpTightDiagnostic(
+      [order({ openedAtMs: OLD, status: "PAPER_CLOSED_WIN", netR: 1.26 })],
+      tpClient,
+      v("TP_0_50R_FULL"),
+      opts,
+    );
+    const [stop] = await buildFastTpTightDiagnostic(
+      [order({ openedAtMs: OLD, status: "PAPER_CLOSED_LOSS", netR: -1.0733 })],
+      stopClient,
+      v("TP_0_50R_FULL"),
+      opts,
+    );
+
+    // Back out the cost each path was charged by removing its known gross R (+0.5R / −1R).
+    const tpCost = tp.netAvgR! - 0.5;
+    const stopCost = stop.netAvgR! - -1;
+    expect(tpCost).toBeCloseTo(COST_TP, 6);
+    expect(stopCost).toBeCloseTo(COST_STOP, 6);
+    // The asymmetry itself — 0 under v1's flat cost, STOP_OUT_SLIPPAGE_BPS/stopBps under v2.
+    expect(tpCost - stopCost).toBeCloseTo(STOP_OUT_SLIPPAGE_BPS / STOP_BPS, 6);
+    expect(stopCost).toBeLessThan(tpCost);
   });
 
   // [4] partial runner math: 50% at +0.5R, 50% runs to the original wide TP (+1.33R)
@@ -163,7 +238,7 @@ describe("fast/tight-TP counterfactual diagnostic (DIAGNOSTIC-ONLY)", () => {
       { executionModel: PAPER_EXECUTION_MODEL_IDEAL },
     );
     // 0.5*0.5R + 0.5*1.3333R − fees
-    expect(r.netAvgR!).toBeCloseTo(0.5 * 0.5 + 0.5 * (4 / 3) + COST, 4);
+    expect(r.netAvgR!).toBeCloseTo(0.5 * 0.5 + 0.5 * (4 / 3) + COST_TP, 4);
     expect(r.wr).toBe(1);
   });
 
@@ -179,7 +254,7 @@ describe("fast/tight-TP counterfactual diagnostic (DIAGNOSTIC-ONLY)", () => {
       v("TP_0_50R_PARTIAL_50_MOVE_STOP_TO_BE"),
       { executionModel: PAPER_EXECUTION_MODEL_IDEAL },
     );
-    expect(r.netAvgR!).toBeCloseTo(0.5 * 0.5 + 0.5 * 0 + COST, 4); // 0.25R − fees
+    expect(r.netAvgR!).toBeCloseTo(0.5 * 0.5 + 0.5 * 0 + COST_STOP, 4); // 0.25R − fees
   });
 
   // [5] losersSaved: a real LOSS where the tight TP triggers before the stop flips to a win
@@ -190,7 +265,7 @@ describe("fast/tight-TP counterfactual diagnostic (DIAGNOSTIC-ONLY)", () => {
       executionModel: PAPER_EXECUTION_MODEL_IDEAL,
     });
     expect(r.originalLosersSaved).toBe(1);
-    expect(r.netAvgR!).toBeCloseTo(0.5 + COST, 4);
+    expect(r.netAvgR!).toBeCloseTo(0.5 + COST_TP, 4);
   });
 
   // [6] ISOLATION: the diagnostic writes nothing to the paper store
@@ -319,9 +394,9 @@ describe("fast-TP trailing-stop sweep", () => {
     expect(wide.netAvgR!).toBeGreaterThan(tight.netAvgR!);
     expect(tight.avgHoldHours!).toBeLessThan(wide.avgHoldHours!);
     // tight runner exit ≈ 0.375 (partial) + 0.5*0.8167 (stop@97.55) − fees
-    expect(tight.netAvgR!).toBeCloseTo(0.5 * 0.75 + 0.5 * ((100 - 97.55) / 3) + COST, 3);
+    expect(tight.netAvgR!).toBeCloseTo(0.5 * 0.75 + 0.5 * ((100 - 97.55) / 3) + COST_STOP, 3);
     // wide runner exit ≈ 0.375 + 0.5*1.3333 (wide TP) − fees
-    expect(wide.netAvgR!).toBeCloseTo(0.5 * 0.75 + 0.5 * (4 / 3) + COST, 3);
+    expect(wide.netAvgR!).toBeCloseTo(0.5 * 0.75 + 0.5 * (4 / 3) + COST_TP, 3);
   });
 
   // [S4] ranking exposes bestBalancedTradeoff and the per-metric leaders
