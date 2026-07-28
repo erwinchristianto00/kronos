@@ -87,7 +87,23 @@ A comment saying something is unavailable records what was true when it was writ
   and was down until the missing file followed. Mechanical check, run BEFORE the restart:
   `grep -oE 'from "\./lib/[a-z0-9-]+\.js"' app.ts` and confirm each one exists on the target. Then
   restart, then confirm `/api/health` returns 200 — a deploy is not finished at rsync.
+- **`routes/shadow.ts` is now as undeployable to live as `app.ts`.** Measured 2026-07-28: HEAD's copy
+  imports 118 modules and **11 of them do not exist on live** (`four-brain-readiness`,
+  `paper-simulated-path-store`, `direction-entry-outcome-store`, `crisis-mode-cycle`, …). A full-file
+  rsync would crash-loop the instance on ERR_MODULE_NOT_FOUND. Enumerate first:
+  `grep -oE 'from "\.\./lib/[a-z0-9.-]+\.js"' routes/shadow.ts` and check each against the target.
+- **When a feature must reach an older instance, move the logic into a module with no imports and
+  make it tolerate both data shapes** — then the instance patch is one import plus one call. The Exit
+  readiness verdict shipped to live that way (2 hunks, 14 lines) instead of 31 hunks of unrelated
+  drift. Live emits a pre-tier-split report shape, so the derivation handles both and tests pin its
+  behavior on each.
+- **An env override is inert if that instance's code predates it.** Adding `EXIT_BRAIN_ARM_PEAK_R` to
+  live's `.env` changed nothing: live's `exit-brain-policy.ts` was a week old and still hardcoded
+  `armPeakR: 0.35` with no reader for the key. Always `grep` the KEY NAME in the target's source
+  before believing an env change will take, and re-read the value from the API after restarting.
 - Never print `.env` values. Back up `.env` before editing; verify the line count is unchanged.
+  Stronger proof that costs nothing: hash each line before and after and assert the original hashes
+  are still a prefix of the new list — it proves only appended lines differ without printing any.
 - **Never POST to `/api/live/copy-intent`** — it opens real mainnet positions.
 - A blanket `new-entry-drain` masks every executor's real reason (drain is checked before
   allocation, eligibility and veto). Once a targeted control exists, lift the blanket.
