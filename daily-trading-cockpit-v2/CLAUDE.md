@@ -80,6 +80,12 @@ A comment saying something is unavailable records what was true when it was writ
   server** before restarting — a broken file only fails at restart.
 - `/testnet` and `/live` are rsync-only and drift silently. Hash-diff before restarting anything.
 - Before any restart, `find src -newermt <process start>` — a restart activates whatever is on disk.
+- **A store rebuilt only by replaying the decision journal cannot outlive ~2.4 hours.** The journal
+  plus its rotation span that much (it burns ~25 MB/hour, almost all `EXECUTIVE_DECISION`), so before
+  `66db35b` only SCALP (1h) survived a restart — INTRADAY (4h) and SWING (24h) never did, and
+  research with its 250+ restarts had never once held a resolved SWING row. Pending rows now persist
+  to `four-brain-pending-ledger.json`. **Any future in-memory state rebuilt from that journal has the
+  same 2.4h ceiling — check it against the horizon before trusting it.**
 - **Deploying a file also deploys its imports, or the instance dies on restart.** rsyncing individual
   files onto a shared checkout breaks the moment the other agent has added a module: on 2026-07-28
   `app.ts` went to research importing `innovation-testnet-execution.js`, which existed locally (their
@@ -114,7 +120,16 @@ A comment saying something is unavailable records what was true when it was writ
   vitest's 5s default and produced a rotating cast of phantom failures; a root `vitest.config.ts`
   now fixes that, but `npm test` is still the canonical command.
 - Every fix needs a fail-without/pass-with test **and** a mutation check: break the fix, confirm
-  exactly the intended test goes red.
+  exactly the intended test goes red. **Verify the mutation actually applied** — a `perl -0pi` whose
+  regex silently fails to match leaves the file untouched and the surviving mutant reads as a passing
+  guard. Assert the anchor was found before rerunning.
+- **Test the function with the ids production actually sends.** `laneHorizon`'s staging test proved
+  `SHORT_FADE_EXHAUSTION_CROWDED` stays INTRADAY through the SCALP promotion, and the guarantee was
+  worthless: production only ever calls it with VARIANT-MATRIX ids (`CG_TIGHT_FAST_05`,
+  `CG_BASELINE_CURRENT`), none of which contains `SHORT_FADE`/`PANIC`/`INTRADAY`, so the retaining
+  branch is unreachable and enabling SCALP emptied INTRADAY completely. A test over roster ids tested
+  the function, not the behaviour. Grep the journal for the ids a function receives before believing
+  a substring guard protects anything.
 - Source-level guards: brace-match the method's own body via `{\n`. Three of the executor methods
   return `Promise<{ changed: boolean; closed: boolean }>`, so `indexOf("{")` lands in the return
   type and matches an empty body while the guard is present and correct.
