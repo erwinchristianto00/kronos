@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import os from "node:os";
-import { mkdtempSync, existsSync } from "node:fs";
+import { mkdtempSync, existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 
 import {
@@ -2284,6 +2284,50 @@ describe("headline concentration caps (anti-correlation safety)", () => {
     expect(ids).toContain("open-1"); // OPEN untouched
     expect(ids).toContain("hl-1"); // HEADLINE (real ledger) NEVER pruned
     expect(store.pruneClosedDiagnostic(100_000)).toBe(0); // below cap → no-op
+  });
+
+  it("[OOM-FIX] archives old terminal non-outcomes while preserving open and realized rows", () => {
+    const dir = tmpDir();
+    const store = new PaperExecutionRouterStore(dir);
+    const baseMs = Date.parse("2026-06-01T00:00:00.000Z");
+    for (let i = 0; i < 5; i++) {
+      store.add(makePaperOrder({
+        paperOrderId: `terminal-${i}`,
+        dedupeKey: `terminal-${i}`,
+        paperStatus: i % 2 === 0 ? "PAPER_CANCELED" : "PAPER_NO_FILL",
+        updatedAt: new Date(baseMs + i * 60_000).toISOString(),
+      }));
+    }
+    store.add(makePaperOrder({
+      paperOrderId: "open-preserved",
+      dedupeKey: "open-preserved",
+      paperStatus: "PAPER_SUBMITTED",
+    }));
+    store.add(makePaperOrder({
+      paperOrderId: "outcome-preserved",
+      dedupeKey: "outcome-preserved",
+      paperStatus: "PAPER_CLOSED_WIN",
+    }));
+
+    expect(store.pruneTerminalNonOutcome(2)).toBe(3);
+    expect(store.all.map((order) => order.paperOrderId)).toEqual(
+      expect.arrayContaining(["terminal-3", "terminal-4", "open-preserved", "outcome-preserved"]),
+    );
+    expect(store.all.map((order) => order.paperOrderId)).not.toContain("terminal-0");
+
+    const archiveDir = join(dir, "archive");
+    const archiveFile = readdirSync(archiveDir).find((name) =>
+      name.startsWith("paper-terminal-non-outcome."),
+    );
+    expect(archiveFile).toBeDefined();
+    const archive = JSON.parse(readFileSync(join(archiveDir, archiveFile!), "utf-8"));
+    expect(archive.count).toBe(3);
+    expect(archive.orders.map((order: PaperOrder) => order.paperOrderId)).toEqual([
+      "terminal-2",
+      "terminal-1",
+      "terminal-0",
+    ]);
+    expect(store.pruneTerminalNonOutcome(2)).toBe(0);
   });
 
   // [OOM-FIX] the flat global sort (pre-2026-07-11) would let a busy lane's newer timestamps

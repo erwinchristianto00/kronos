@@ -3262,18 +3262,12 @@ export async function registerShadowRoutes(
             })(),
             resolverMaxRuntimeMs,
           });
-          // The outer race is a backstop for the resolver failing to respect its own
-          // resolverMaxRuntimeMs budget (e.g. hanging inside a single candle fetch that doesn't
-          // hit the loop's time-check) — it must never be TIGHTER than that budget itself. It
-          // previously hardcoded 8_000ms while the budget defaulted to 12_000ms, so under default
-          // config this race ALWAYS discarded the resolver's work before it could finish normally,
-          // silently re-narrowing the very floor the 2026-06-22 SANITY FLOOR comment above raised.
-          // .catch() prevents an unhandled rejection if the abandoned promise fails after we've
-          // already moved on with the stale paperReport.
-          const result = await Promise.race([
-            paperRunPromise.catch(() => null),
-            new Promise<null>((res) => { setTimeout(() => res(null), resolverMaxRuntimeMs + 4_000); }),
-          ]);
+          // Await the owned pass. Returning on a timer left the resolver mutating and flushing the
+          // 100MB+ store in the background; the scheduler then considered the request complete and
+          // could start another pass on the same singleton. That overlap caused API stalls and OOM
+          // restarts. The resolver has its own bounded work/runtime budget, so single-flight must
+          // cover its actual lifetime rather than only the HTTP response lifetime.
+          const result = await paperRunPromise.catch(() => null);
           if (result !== null) paperReport = result;
 
           // Feed the honest-edge gate: rebuild the live aggregate from the

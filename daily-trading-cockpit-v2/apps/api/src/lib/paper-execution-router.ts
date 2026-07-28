@@ -131,6 +131,7 @@ export const PAPER_MAX_HOLD_MS = 72 * 60 * 60 * 1000; // 72 h
 export const DEFAULT_PAPER_EQUITY = 2000;
 const DEFAULT_PER_LANE_DIAGNOSTIC_FLOOR = 200;
 const DEFAULT_PAPER_MAX_CLOSED_DIAGNOSTIC = 5_000;
+const DEFAULT_PAPER_MAX_TERMINAL_NON_OUTCOME = 5_000;
 
 /** Validated env parse for the two closed-diagnostic retention knobs below. Mirrors
  *  getPaperEquityFromEnv()'s shape (this file's established idiom): FALL BACK to the compiled
@@ -208,6 +209,12 @@ export function parseDiagnosticRetentionEnv(raw: string | undefined, fallback: n
 export const PAPER_MAX_CLOSED_DIAGNOSTIC = parseDiagnosticRetentionEnv(
   process.env.PAPER_MAX_CLOSED_DIAGNOSTIC,
   DEFAULT_PAPER_MAX_CLOSED_DIAGNOSTIC,
+);
+/** Terminal rows with no PnL label are useful for audit, but not for learning or resolution.
+ * Keep a bounded hot tail and archive older rows before removing them from the active store. */
+export const PAPER_MAX_TERMINAL_NON_OUTCOME = parseDiagnosticRetentionEnv(
+  process.env.PAPER_MAX_TERMINAL_NON_OUTCOME,
+  DEFAULT_PAPER_MAX_TERMINAL_NON_OUTCOME,
 );
 /** Never reduce a single lane's retained closed-diagnostic count below this purely because sibling
  *  lanes are busier — see pruneClosedDiagnostic()'s doc comment. Comfortably above every n>=30/
@@ -839,6 +846,57 @@ export class PaperExecutionRouterStore {
     const pruned = before - this.state.orders.length;
     if (pruned > 0) this.save();
     return pruned;
+  }
+
+  /**
+   * Archive terminal rows that cannot produce an outcome before removing them from the hot store.
+   * OPEN and realized rows are never eligible. This keeps resolver persistence bounded without
+   * sacrificing the audit trail that explains rejects, no-fills, cancellations, or data failures.
+   */
+  pruneTerminalNonOutcome(maxRetained: number): number {
+    const terminalNonOutcome = new Set<PaperOrderStatus>([
+      "PAPER_CANCELED",
+      "PAPER_REJECTED",
+      "PAPER_EXPIRED",
+      "PAPER_NO_FILL",
+      "PAPER_DATA_FAILURE",
+    ]);
+    const eligible = this.state.orders.filter((order) => terminalNonOutcome.has(order.paperStatus));
+    if (eligible.length <= maxRetained) return 0;
+
+    const tsOf = (order: PaperOrder): number => {
+      const ms = new Date(order.updatedAt ?? order.createdAt ?? 0).getTime();
+      return Number.isFinite(ms) ? ms : 0;
+    };
+    eligible.sort((a, b) => tsOf(b) - tsOf(a));
+    const prunedOrders = eligible.slice(maxRetained);
+    const prunedIds = new Set(prunedOrders.map((order) => order.paperOrderId));
+
+    // Archive first. If preservation fails, leave the hot store untouched.
+    try {
+      const archiveDir = resolve(dirname(this.file), "archive");
+      mkdirSync(archiveDir, { recursive: true });
+      const archiveFile = resolve(
+        archiveDir,
+        `paper-terminal-non-outcome.${Date.now()}.${process.pid}.json`,
+      );
+      writeFileSync(
+        archiveFile,
+        JSON.stringify({
+          archivedAt: new Date().toISOString(),
+          source: this.file,
+          count: prunedOrders.length,
+          orders: prunedOrders,
+        }),
+        "utf-8",
+      );
+    } catch {
+      return 0;
+    }
+
+    this.state.orders = this.state.orders.filter((order) => !prunedIds.has(order.paperOrderId));
+    this.save();
+    return prunedOrders.length;
   }
 
   update(orderId: string, patch: Partial<PaperOrder>): void {
@@ -2817,6 +2875,7 @@ async function resolvePaperOrdersInner(
   // Bound memory: prune old DIAGNOSTIC closed orders beyond the rolling-window cap (HEADLINE/OPEN
   // untouched). No-op while under the cap, so it changes nothing today.
   store.pruneClosedDiagnostic(PAPER_MAX_CLOSED_DIAGNOSTIC);
+  store.pruneTerminalNonOutcome(PAPER_MAX_TERMINAL_NON_OUTCOME);
 
   return { resolved, expired, dataFailures, errors };
 }
