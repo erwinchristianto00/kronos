@@ -11,25 +11,31 @@ import {
   type HedgedResidualCandidate,
 } from "../src/lib/hedged-residual-short-v2.js";
 import {
+  buildFundingCarryCrowdingV2Report,
   passesFundingCarryCrowdingV2,
 } from "../src/lib/funding-carry-crowding-v2.js";
 import type {
   FundingCarryCandidate,
   FundingCarrySymbolSnapshot,
 } from "../src/lib/funding-carry-edge.js";
+import { FundingCarryStore } from "../src/lib/funding-carry-edge.js";
 import {
+  buildLiqRecoilStrictReclaimV2Report,
   evaluateStrictReclaim,
 } from "../src/lib/liq-recoil-strict-reclaim-v2.js";
 import type {
   LiquidationCascadeEvent,
   LqrFlowSample,
 } from "../src/lib/liq-recoil-edge.js";
+import { LiqRecoilStore } from "../src/lib/liq-recoil-edge.js";
 import {
+  buildCompressionRetestV2Report,
   evaluateCompressionRetest,
 } from "../src/lib/compression-retest-v2.js";
 import type {
   CompressionExpansionObservation,
 } from "../src/lib/compression-expansion-edge.js";
+import { CompressionExpansionStore } from "../src/lib/compression-expansion-edge.js";
 import {
   assessQueueImbalanceToxicFlow,
   resolveQueueImbalanceToxicFlowObservation,
@@ -201,6 +207,70 @@ describe("innovation V2 shadow lanes", () => {
 
     expect(passesFundingCarryCrowdingV2(crowded, snapshots)).toBe(true);
     expect(passesFundingCarryCrowdingV2(notCrowded, snapshots)).toBe(false);
+  });
+
+  it("normalizes parent-specific cycle funnels for the research dashboard", () => {
+    const funding = new FundingCarryStore(`/tmp/funding-v2-report-${process.pid}.json`);
+    funding.recordCycle("2026-07-28T00:00:00.000Z", {
+      scanned: 10,
+      pairsEvaluated: 7,
+      belowBreakeven: 3,
+      recorded: 2,
+      skippedMissingData: 1,
+      skippedOtherCluster: 1,
+      resolved: 0,
+      expired: 0,
+    });
+    const fundingReport = buildFundingCarryCrowdingV2Report(funding);
+    expect(fundingReport.cycleMeta).toMatchObject({
+      cycles: 1,
+      candidatesTotal: 7,
+      recordedTotal: 2,
+      rejectedTotal: 5,
+    });
+
+    const liq = new LiqRecoilStore(`/tmp/liq-v2-report-${process.pid}.json`);
+    liq.recordCycle("2026-07-28T00:00:00.000Z", {
+      scanned: 10,
+      flowSampled: 4,
+      skippedNoCandles: 0,
+      eventsDetected: 3,
+      ambiguous: 1,
+      skippedDuplicate: 0,
+      skippedNoFlowData: 1,
+      skippedFlowGate: 1,
+      skippedAlreadyRecoiled: 0,
+      skippedOpenCap: 0,
+      entered: 1,
+      resolved: 0,
+      expired: 0,
+      lastEventSymbol: "BTCUSDT",
+      lastEventCascadeDirection: "DOWN",
+    });
+    const liqReport = buildLiqRecoilStrictReclaimV2Report(liq);
+    expect(liqReport.cycleMeta).toMatchObject({
+      cycles: 1,
+      candidatesTotal: 3,
+      recordedTotal: 1,
+      rejectedTotal: 3,
+    });
+    expect(liqReport.v2Gate).toMatchObject({ interval: "5m" });
+
+    const compression = new CompressionExpansionStore(`/tmp/compression-v2-report-${process.pid}.json`);
+    compression.recordCycle("2026-07-28T00:00:00.000Z", {
+      scanned: 10,
+      compressionIgnitionCandidates: 4,
+      takerFlowRejected: 3,
+      recorded: 1,
+      resolved: 0,
+      expired: 0,
+    });
+    expect(buildCompressionRetestV2Report(compression).cycleMeta).toMatchObject({
+      cycles: 1,
+      candidatesTotal: 4,
+      recordedTotal: 1,
+      rejectedTotal: 3,
+    });
   });
 
   it("requires event-VWAP, retrace, candle confirmation, and taker-flow flip for liquidation reclaim", () => {

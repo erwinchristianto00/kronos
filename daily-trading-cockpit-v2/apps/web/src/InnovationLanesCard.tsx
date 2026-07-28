@@ -170,15 +170,23 @@ export function useShadowReport<T>(endpoint: string): LaneFetchState<T> {
   const [state, setState] = useState<LaneFetchState<T>>({ data: null, source: null, unreachable: false });
   const seqRef = useRef(0);
   useEffect(() => {
+    let disposed = false;
+    const controllers = new Set<AbortController>();
     const grab = async (url: string): Promise<T | null> => {
+      const controller = new AbortController();
+      controllers.add(controller);
+      const timeout = window.setTimeout(() => controller.abort(), 20_000);
       try {
-        const res = await fetch(url, { cache: 'no-store' });
+        const res = await fetch(url, { cache: 'no-store', signal: controller.signal });
         // A non-200 with a JSON error body would parse fine and land in state as a truthy object —
         // the field accesses below would then throw. Same bug class just fixed in ResearchDashboard.
         if (!res.ok) return null;
         return (await res.json()) as T;
       } catch {
         return null;
+      } finally {
+        window.clearTimeout(timeout);
+        controllers.delete(controller);
       }
     };
     const load = async () => {
@@ -189,13 +197,19 @@ export function useShadowReport<T>(endpoint: string): LaneFetchState<T> {
         source = 'local';
         data = await grab(`/api/shadow/${endpoint}`);
       }
-      if (seq !== seqRef.current) return; // a newer load already ran — this response is stale
+      if (disposed || seq !== seqRef.current) return; // a newer load already ran — this response is stale
       if (data != null) setState({ data, source, unreachable: false });
       else setState((prev) => ({ ...prev, unreachable: true })); // keep last good value, flag the row
     };
     void load();
     const timer = window.setInterval(() => void load(), 60_000);
-    return () => window.clearInterval(timer);
+    return () => {
+      disposed = true;
+      seqRef.current += 1;
+      window.clearInterval(timer);
+      for (const controller of controllers) controller.abort();
+      controllers.clear();
+    };
   }, [endpoint]);
   return state;
 }

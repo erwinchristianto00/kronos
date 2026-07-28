@@ -110,8 +110,19 @@ export async function runFundingCarryCrowdingV2CycleGuarded(
 
 export function buildFundingCarryCrowdingV2Report(store = getFundingCarryCrowdingV2Store()) {
   const parentShape = buildFundingCarryReport(store.all, store.cycleMeta);
+  const cycleMeta = parentShape.cycleMeta
+    ? {
+        ...parentShape.cycleMeta,
+        candidatesTotal: parentShape.cycleMeta.pairsEvaluatedTotal,
+        rejectedTotal:
+          parentShape.cycleMeta.belowBreakevenTotal +
+          parentShape.cycleMeta.skippedMissingDataTotal +
+          parentShape.cycleMeta.skippedOtherClusterTotal,
+      }
+    : null;
   return {
     ...parentShape,
+    cycleMeta,
     laneId: FC_V2_LANE_ID,
     parentLaneId: FC_V2_PARENT_LANE_ID,
     version: "V2" as const,

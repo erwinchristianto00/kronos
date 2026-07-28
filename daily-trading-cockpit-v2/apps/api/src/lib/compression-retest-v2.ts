@@ -208,8 +208,16 @@ export async function runCompressionRetestV2CycleGuarded(
 
 export function buildCompressionRetestV2Report(store = getCompressionRetestV2Store()) {
   const parentShape = buildCompressionExpansionReport(store.all, store.cycleMeta);
+  const cycleMeta = parentShape.cycleMeta
+    ? {
+        ...parentShape.cycleMeta,
+        candidatesTotal: parentShape.cycleMeta.compressionIgnitionCandidatesTotal,
+        rejectedTotal: parentShape.cycleMeta.takerFlowRejectedTotal,
+      }
+    : null;
   return {
     ...parentShape,
+    cycleMeta,
     laneId: CE_V2_LANE_ID,
     parentLaneId: CE_V2_PARENT_LANE_ID,
     version: "V2" as const,

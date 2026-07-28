@@ -299,20 +299,37 @@ export async function runLiqRecoilStrictReclaimV2CycleGuarded(
 
 export function buildLiqRecoilStrictReclaimV2Report(store = getLiqRecoilStrictReclaimV2Store()) {
   const parentShape = buildLiqRecoilReport(store.all, store.cycleMeta);
+  const cycleMeta = parentShape.cycleMeta
+    ? {
+        ...parentShape.cycleMeta,
+        candidatesTotal: parentShape.cycleMeta.eventsDetectedTotal,
+        recordedTotal: parentShape.cycleMeta.enteredTotal,
+        rejectedTotal:
+          parentShape.cycleMeta.ambiguousTotal +
+          parentShape.cycleMeta.skippedNoFlowDataTotal +
+          parentShape.cycleMeta.skippedFlowGateTotal +
+          parentShape.cycleMeta.skippedAlreadyRecoiledTotal,
+      }
+    : null;
+  const v2Gate = {
+    minRetraceFrac: LQR_V2_MIN_RETRACE_FRAC,
+    targetRetraceFrac: LQR_V2_TARGET_RETRACE_FRAC,
+    flowFlipRatio: LQR_V2_FLOW_FLIP_RATIO,
+    candleFetchLimit: LQR_CANDLE_FETCH_LIMIT,
+    interval: LQR_INTERVAL,
+  };
   return {
     ...parentShape,
+    cycleMeta,
     laneId: LQR_V2_LANE_ID,
     parentLaneId: LQR_V2_PARENT_LANE_ID,
     version: "V2" as const,
     thesis: "Fade a forced liquidation cascade only after event-VWAP, retrace, candle, and taker-flow reclaim.",
     signalSource: "OI_TAKER_FLOW_PROXY + CLOSED_CANDLE_EVENT_VWAP_RECLAIM",
+    v2Gate,
     params: {
       ...parentShape.params,
-      minRetraceFrac: LQR_V2_MIN_RETRACE_FRAC,
-      targetRetraceFrac: LQR_V2_TARGET_RETRACE_FRAC,
-      flowFlipRatio: LQR_V2_FLOW_FLIP_RATIO,
-      candleFetchLimit: LQR_CANDLE_FETCH_LIMIT,
-      interval: LQR_INTERVAL,
+      ...v2Gate,
     },
   };
 }
