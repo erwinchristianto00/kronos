@@ -20,6 +20,22 @@ conclusive, and the conclusion was stated with confidence and was wrong. Real in
 When a check returns nothing, the first hypothesis is that the check is wrong, not that the thing
 is absent. Say "I checked X and found nothing" — never "X does not happen".
 
+**In this repo, EMPTY almost always means UNREAD, not ABSENT.** Four times in one session a value
+was declared missing when the producer was running the whole time and only the reader was missing:
+
+- `kronosAgree: null` with the note "no sync kronos-agree producer" — Kronos was running on the VPS
+  (pm2 `kronos`, 127.0.0.1:8001) and the scanner already called it every cycle.
+- crowding/sentiment "missing" — the live journal showed `crowdAlignLong` and `sentiment` FRESH on
+  672 of 672 records. They had never been missing.
+- SCALP "has no caller" — one default list, `["INTRADAY","SWING"]`, never mentioned it. SCALP is
+  fully defined downstream (`HORIZON_MS.SCALP`, accepted by the outcome ledger).
+- `liquidity` "no market liquidity/depth feed in repo" — `/fapi/v1/depth` and bookTicker are both
+  in binance.ts.
+
+So before concluding a source does not exist: grep the client for the endpoint, grep pm2 for the
+process, and read the LIVE journal's `sourceStatuses` rather than a test fixture or a code comment.
+A comment saying something is unavailable records what was true when it was written.
+
 ## Before believing any lane number
 
 - `distinct(netR) / n`. A lane once read **+0.4200R at WR 100% on n=201** that was ONE value
