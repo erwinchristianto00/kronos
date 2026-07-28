@@ -134,14 +134,80 @@ describe("feature transforms", () => {
     expect(crowdingAlignFromSnapshot({ crowdSide: "NEUTRAL", crowdingLevel: "NEUTRAL" }, "LONG")).toBe(0);
   });
 
-  it("kronosAlignFeature: agreement × confidence; UNAVAILABLE/absent is null", () => {
-    expect(kronosAlignFeature("LONG", 0.8, "LONG")).toBeCloseTo(0.8);
-    expect(kronosAlignFeature("SHORT", 0.6, "LONG")).toBeCloseTo(-0.6);
-    expect(kronosAlignFeature("NEUTRAL", 0.9, "LONG")).toBe(0);
-    expect(kronosAlignFeature("UNAVAILABLE", 0.9, "LONG")).toBeNull();
-    expect(kronosAlignFeature(null, 0.9, "LONG")).toBeNull();
-    // missing confidence defaults to the 0.5 midpoint, not a fabricated certainty
-    expect(kronosAlignFeature("LONG", null, "LONG")).toBeCloseTo(0.5);
+  it("kronosAlignFeature: agreement × confidence on the producer's 0-100 scale", () => {
+    // 80 on the 0-100 scale tracker.ts's buckets define (<45 WEAK / <70 MEDIUM / >=70 STRONG).
+    expect(kronosAlignFeature("LONG", 80, "LONG")).toBeCloseTo(0.8);
+    expect(kronosAlignFeature("SHORT", 60, "LONG")).toBeCloseTo(-0.6);
+    // A NEUTRAL bias IS a reading ("no directional view") — 0, the schema's own neutral, not null.
+    expect(kronosAlignFeature("NEUTRAL", 90, "LONG")).toBe(0);
+    expect(kronosAlignFeature("UNAVAILABLE", 90, "LONG")).toBeNull();
+    expect(kronosAlignFeature(null, 90, "LONG")).toBeNull();
+    // An absent or zero confidence is an absent reading — never a fabricated 0.5 magnitude.
+    expect(kronosAlignFeature("LONG", null, "LONG")).toBeNull();
+    expect(kronosAlignFeature("LONG", 0, "LONG")).toBeNull();
+    expect(kronosAlignFeature("LONG", Number.NaN, "LONG")).toBeNull();
+  });
+
+  // ── the saturation regression ───────────────────────────────────────────────
+  // WHY (2026-07-28): `provenance.kronosConfidence` is 0-100 — the allocator copies the scan
+  // candidate's field through verbatim, and tracker.ts buckets it at <45 / <70 / >=70. The old
+  // `clamp(kronosConfidence, 0, 1)` therefore SATURATED every non-zero confidence to exactly 1.0.
+  // Measured in the deployed stores that day, `kronosAlign` held exactly two values across every
+  // record ever written — +1 and -1 (research 114/114, testnet 17,386/19,261). Each assertion below
+  // fails against that clamp.
+  it("[SCALE] distinguishes a WEAK confidence from a STRONG one instead of saturating both to 1", () => {
+    const weak = kronosAlignFeature("LONG", 46, "LONG")!;
+    const strong = kronosAlignFeature("LONG", 99, "LONG")!;
+    expect(weak).toBeCloseTo(0.46, 10);
+    expect(strong).toBeCloseTo(0.99, 10);
+    expect(weak).toBeLessThan(strong); // the old clamp made these identical (1 and 1)
+    expect(weak).toBeLessThan(1);
+    expect(strong).toBeLessThan(1);
+    // …and the sign still comes from agreement, at the same reduced magnitudes.
+    expect(kronosAlignFeature("SHORT", 46, "LONG")).toBeCloseTo(-0.46, 10);
+  });
+
+  it("[SCALE] maps the producer's actual value (100) to 1, so no stored training row changes", () => {
+    // Every kronosConfidence that has ever reached the meta-label store was exactly 100 (testnet
+    // 17,025/17,025, distinct=1). 100 -> 1.0 is also what the saturating clamp produced, which is
+    // precisely why the persisted weights survive this fix and featureSchemaVersion stays at 1.
+    expect(kronosAlignFeature("LONG", 100, "LONG")).toBe(1);
+    expect(kronosAlignFeature("SHORT", 100, "LONG")).toBe(-1);
+    // Out-of-range input still clamps rather than exploding the feature past the [-1,1] contract.
+    expect(kronosAlignFeature("LONG", 400, "LONG")).toBe(1);
+    expect(kronosAlignFeature("LONG", -20, "LONG")).toBeNull();
+  });
+
+  it("[SCALE] a 0-1-scaled value understates rather than saturating (the safe direction)", () => {
+    // No producer sends 0..1 today. If one ever does, 0.8 reads as a near-zero opinion — visible as
+    // weak, instead of masquerading as certainty the way the old clamp did.
+    expect(kronosAlignFeature("LONG", 0.8, "LONG")).toBeCloseTo(0.008, 10);
+  });
+
+  it("[SCALE] carries the real magnitude end-to-end through the snapshot builder", async () => {
+    // The path production actually uses: provenance -> buildMetaLabelFeatureSnapshot -> features.
+    // 30.83 is a real value observed in the research paper store's provenance.
+    const snap = await buildMetaLabelFeatureSnapshot(
+      makeOrder({
+        paperOrderId: "kronos-scale",
+        direction: "LONG",
+        provenance: { kronosBias: "LONG", kronosConfidence: 30.83 },
+      }),
+      NULL_SOURCES,
+    );
+    expect(snap.kronosAlign).toBeCloseTo(0.3083, 10);
+    expect(snap.kronosAlign).not.toBe(1);
+
+    // And a missing confidence stays an explicit null through the same path — the store's own
+    // "MISSING FEATURES ARE EXPLICIT NULLS" contract, which the old 0.5 default violated.
+    const absent = await buildMetaLabelFeatureSnapshot(
+      makeOrder({
+        paperOrderId: "kronos-absent",
+        provenance: { kronosBias: "LONG", kronosConfidence: null },
+      }),
+      NULL_SOURCES,
+    );
+    expect(absent.kronosAlign).toBeNull();
   });
 
   it("hourFeatures encode UTC hour-of-day on the unit circle", () => {

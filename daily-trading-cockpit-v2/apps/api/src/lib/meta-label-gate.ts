@@ -47,6 +47,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "
 import { dirname, resolve } from "node:path";
 
 import { solveLinear } from "./cortex-brain.js";
+import { KRONOS_CONFIDENCE_SCALE_MAX } from "./kronos-agree-reading.js";
 
 function envNum(name: string, dflt: number): number {
   const v = Number(process.env[name]);
@@ -199,9 +200,51 @@ export function crowdingAlignFromSnapshot(
   return sameSide ? -0.5 : 0.25;
 }
 
+/**
+ * `provenance.kronosConfidence` is on a **0–100 scale**, not 0–1 — the allocator copies the scan
+ * candidate's field through verbatim (`kronosConfidence: _num(c.kronosConfidence)` in
+ * paper-opportunity-allocator.ts), and tracker.ts's own buckets settle the scale beyond argument:
+ * `< 45 WEAK`, `< 70 MEDIUM`, `>= 70 STRONG`.
+ *
+ * This used to do `clamp(kronosConfidence, 0, 1)`, which SATURATES every non-zero confidence to
+ * exactly 1.0 — a 27 and a 100 became the same number, so the magnitude this feature exists to carry
+ * carried nothing. Measured 2026-07-28 in the stores themselves: `kronosAlign` took exactly two
+ * values across every record ever written — +1 and −1, never a fractional magnitude and never a
+ * NEUTRAL 0 (research 114/114 present, testnet 17,386/19,261).
+ *
+ * Divide first, then clamp — the same `normalizedConfidence()` shape fixed in kronos-agree-reading.ts
+ * (4866a23), which flagged this call site as the remaining instance. The scale constant is IMPORTED
+ * from there rather than redeclared: two readers of one producer's field must not be able to drift
+ * apart. A value that arrives already in 0..1 (no producer does this today) maps to a near-zero
+ * magnitude rather than a saturated one — understating an opinion is the safe direction, and it stays
+ * visible instead of masquerading as certainty.
+ *
+ * NO featureSchemaVersion BUMP, and this is a measurement not an assumption. A bump would discard
+ * every labeled row and cold-start the model; it is warranted only if stored rows would now mean
+ * something different from rows written after this change. They would not: every `kronosConfidence`
+ * that has ever reached this store was **exactly 100** (testnet 17,025/17,025 distinct=1; research's
+ * only non-100 values — 262 orders at 27–31 — all predate 2026-07-02, while the store's oldest record
+ * is 2026-07-22, so 0 of them appear in it). 100/100 = 1.0 = the value the saturating clamp produced,
+ * so 0 of 16,417 testnet and 0 of 86 research training rows change, and the persisted weights keep
+ * meaning exactly what they meant. Re-run that check before assuming it still holds: if a stored row
+ * ever carries a non-100, non-zero confidence, old and new rows ARE on different scales and the bump
+ * becomes mandatory.
+ *
+ * Missing/zero confidence is now null (was a fabricated 0.5 magnitude, and before that a 0). This
+ * file's own contract is "MISSING FEATURES ARE EXPLICIT NULLS, never fabricated"; a 0.5 is a
+ * fabrication and a 0 would be read as the schema's real "neutral/no-information" reading rather than
+ * as an absent one. A NEUTRAL bias with a real confidence still maps to 0 — Kronos having no
+ * directional view IS a reading, and 0 is what the schema defines it as.
+ */
+function normalizedKronosConfidence(raw: number | null | undefined): number | null {
+  if (!finite(raw)) return null;
+  const magnitude = clamp(raw / KRONOS_CONFIDENCE_SCALE_MAX, 0, 1);
+  return magnitude === 0 ? null : magnitude;
+}
+
 /** Kronos agreement × confidence, from the ADMISSION-TIME provenance already stamped on allocator
- *  orders (zero refetch, exactly at-signal-time). Null bias / "UNAVAILABLE" ⇒ null (missing —
- *  which is ~half the time and normal; the model must carry that honestly). */
+ *  orders (zero refetch, exactly at-signal-time). Null bias / "UNAVAILABLE", and now also an absent
+ *  or zero confidence, ⇒ null (missing — the model must carry that honestly). */
 export function kronosAlignFeature(
   kronosBias: string | null | undefined,
   kronosConfidence: number | null | undefined,
@@ -209,8 +252,9 @@ export function kronosAlignFeature(
 ): number | null {
   const bias = (kronosBias ?? "").toUpperCase();
   if (bias !== "LONG" && bias !== "SHORT" && bias !== "NEUTRAL") return null;
+  const conf = normalizedKronosConfidence(kronosConfidence);
+  if (conf === null) return null;
   const sign = bias === "NEUTRAL" ? 0 : bias === direction ? 1 : -1;
-  const conf = finite(kronosConfidence) ? clamp(kronosConfidence, 0, 1) : 0.5;
   return sign * conf;
 }
 
