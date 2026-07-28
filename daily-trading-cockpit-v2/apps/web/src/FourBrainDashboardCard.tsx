@@ -161,6 +161,33 @@ const readinessColor = (v: FourBrainReadinessScope['verdict']): string =>
 const readinessLabel = (v: FourBrainReadinessScope['verdict']): string =>
   v === 'READY' ? 'SIAP' : v === 'NOT_READY' ? 'BELUM SIAP' : v === 'NOT_READY_SIMULATED_ONLY' ? 'SIMULASI SAJA' : 'BUKTI KURANG';
 
+/**
+ * WHICH INSTANCE AM I LOOKING AT (2026-07-28). useShadowReport tries /testnet first and silently
+ * falls back to the LOCAL instance when testnet does not answer, re-deciding every 60 seconds — so
+ * the same panel alternates between two different datasets with no indication. An operator watching
+ * INTRADAY move from n=1867 to n=1674 and back reasonably reads that as data being reset or lost.
+ * The hook has always returned `source`; nothing displayed it.
+ */
+function SourceBadge({ source, unreachable }: { source: 'testnet' | 'local' | null; unreachable: boolean }) {
+  if (source == null) return null;
+  const testnet = source === 'testnet';
+  return (
+    <span
+      title={
+        testnet
+          ? 'Angka dari TESTNET (3102) — instance yang benar-benar mengeksekusi.'
+          : 'Testnet tidak menjawab, jadi angka ini dari instance LOKAL (research/3101) — dataset yang BERBEDA, bukan data testnet yang berubah.'
+      }
+      style={{
+        marginLeft: 8, fontSize: 10, padding: '1px 6px', borderRadius: 4, letterSpacing: 0.3,
+        border: `1px solid ${testnet ? C.measure : C.accent}`, color: testnet ? C.measure : C.accent,
+      }}
+    >
+      {testnet ? 'TESTNET' : 'RESEARCH (testnet tidak menjawab)'}{unreachable ? ' · STALE' : ''}
+    </span>
+  );
+}
+
 function ReadinessVerdict({ block, title }: { block: FourBrainReadinessBlock | undefined; title: string }) {
   if (!block) return null;
   return (
@@ -415,6 +442,7 @@ export function FourBrainDashboardCard() {
           <div style={{ padding: '12px 16px', borderBottom: `1px solid ${C.border}` }}>
             <div style={{ fontSize: 12, color: C.dim, textTransform: 'uppercase', letterSpacing: 0.4, marginBottom: 6 }}>
               Performance — Direction Brain (measured, BTCUSDT proxy)
+              <SourceBadge source={directionEntry.source} unreachable={directionEntry.unreachable} />
             </div>
             <ReadinessVerdict block={deo?.readiness?.direction} title="Vonis kesiapan" />
             {deo == null ? (
@@ -475,6 +503,7 @@ export function FourBrainDashboardCard() {
           <div style={{ padding: '12px 16px' }}>
             <div style={{ fontSize: 12, color: C.dim, textTransform: 'uppercase', letterSpacing: 0.4, marginBottom: 6 }}>
               Performance — Entry Brain (measured, Tier 1 real fill + Tier 2 simulated — tidak pernah digabung)
+              <SourceBadge source={directionEntry.source} unreachable={directionEntry.unreachable} />
             </div>
             <ReadinessVerdict block={deo?.readiness?.entry} title="Vonis kesiapan" />
             {deo == null ? (
