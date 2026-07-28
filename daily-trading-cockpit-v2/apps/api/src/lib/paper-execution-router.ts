@@ -54,6 +54,11 @@ import {
   type SubFloorExclusionSummary,
 } from "./paper-subfloor-exclusion.js";
 import { REALISTIC_FEE_BPS_PER_SIDE } from "./shadow-engine.js";
+import {
+  paperExitCostRV2,
+  paperFundingCostR,
+  slipAlreadyInGrossBps as _slipInGrossV2,
+} from "./paper-cost-model-v2.js";
 import type { AdaptiveLaneRouterReport } from "./adaptive-lane-router.js";
 import type { LiveTradingGateReport } from "./live-trading-gate.js";
 import { recordHeatShadowSnapshot } from "./portfolio-heat-shadow.js";
@@ -2120,9 +2125,7 @@ function _slipAlreadyInGrossBps(
   viaWalk: boolean,
 ): number {
   if (viaWalk) return 0;
-  const entry = Math.max(0, model.entrySlippageBps);
-  const exit = kind === "TP_LIKE" ? Math.max(0, model.tpSlippageBps) : Math.max(0, model.stopSlippageBps);
-  return entry + exit;
+  return _slipInGrossV2(kind, model.entrySlippageBps, model.tpSlippageBps, model.stopSlippageBps);
 }
 
 /** Exit-aware paper cost, in R, SIGNED NEGATIVE (paper convention: netR = grossR + costR — note the
@@ -2133,14 +2136,9 @@ function _slipAlreadyInGrossBps(
  *  THE SINGLE ENTRY POINT for every paper cost — resolver branches and the three what-if
  *  counterfactuals alike. While PAPER_COST_MODEL_V2 is off it returns the flat v1 value, so the
  *  whole book stays on one model and no delta can straddle the two. */
-const PAPER_FUNDING_BPS_PER_8H = 1.5;
-
 function _fundingCostR(order: PaperOrder, exitAtMs: number | null | undefined): number {
-  if (!PAPER_COST_MODEL_V2_ENABLED || !(order.plannedStopDistanceBps > 0) || !Number.isFinite(exitAtMs)) return 0;
-  const openedAtMs = Date.parse(order.openedAt);
-  if (!Number.isFinite(openedAtMs) || (exitAtMs as number) <= openedAtMs) return 0;
-  const periods = Math.floor(((exitAtMs as number) - openedAtMs) / (8 * 60 * 60 * 1000));
-  return periods > 0 ? -((periods * PAPER_FUNDING_BPS_PER_8H) / order.plannedStopDistanceBps) : 0;
+  if (!PAPER_COST_MODEL_V2_ENABLED) return 0;
+  return paperFundingCostR(order.plannedStopDistanceBps, Date.parse(order.openedAt), exitAtMs);
 }
 
 function _computePaperExitCostR(
@@ -2153,16 +2151,21 @@ function _computePaperExitCostR(
   const stopBps = order.plannedStopDistanceBps;
   if (!(stopBps > 0)) return 0;
   if (!PAPER_COST_MODEL_V2_ENABLED) return _computePaperCostR(stopBps);
-  const costModel = _paperCostModelForOrder(order);
-  const roundTripBps = costModel === "maker_limit" ? MAKER_ROUNDTRIP_BPS : TAKER_ROUNDTRIP_BPS;
-  const feeOnlyFloorBps =
-    costModel === "maker_limit" ? MAKER_ROUNDTRIP_BPS : REALISTIC_FEE_BPS_PER_SIDE * 2;
-  const stopOutExtraBps = kind === "STOP_LIKE" ? Math.max(0, STOP_OUT_SLIPPAGE_BPS) : 0;
-  const chargedBps = Math.max(
-    feeOnlyFloorBps,
-    roundTripBps + stopOutExtraBps - _slipAlreadyInGrossBps(kind, model, viaWalk),
-  );
-  return -(chargedBps / stopBps) + _fundingCostR(order, exitAtMs);
+  // The arithmetic lives in paper-cost-model-v2.ts (no imports) so live/3103, whose router is ~977
+  // lines behind this one, can charge the IDENTICAL cost without inheriting this file's dependency
+  // graph. One copy of the formula, or the two cohorts diverge silently.
+  return paperExitCostRV2({
+    stopBps,
+    costModel: _paperCostModelForOrder(order),
+    kind,
+    takerRoundTripBps: TAKER_ROUNDTRIP_BPS,
+    makerRoundTripBps: MAKER_ROUNDTRIP_BPS,
+    realisticFeeBpsPerSide: REALISTIC_FEE_BPS_PER_SIDE,
+    stopOutSlippageBps: STOP_OUT_SLIPPAGE_BPS,
+    slipAlreadyInGrossBps: _slipAlreadyInGrossBps(kind, model, viaWalk),
+    openedAtMs: Date.parse(order.openedAt),
+    exitAtMs,
+  });
 }
 
 /**
