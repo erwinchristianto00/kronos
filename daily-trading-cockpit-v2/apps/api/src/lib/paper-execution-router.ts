@@ -1853,6 +1853,50 @@ export interface PaperResolverClient {
   ): Promise<PaperKlineTuple[]>;
 }
 
+/**
+ * Binance caps a kline response at 1,000 rows. A paper lane may intentionally
+ * hold longer than that (for example the 144h runner needs 1,728 five-minute
+ * candles), so one request would silently mark the trade at an earlier candle.
+ * Page to the requested market horizon and deduplicate candle opens.
+ */
+async function fetchPaperKlinesRange(
+  client: PaperResolverClient,
+  symbol: string,
+  interval: "5m",
+  startTime: number,
+  endTime: number,
+): Promise<PaperKlineTuple[]> {
+  const out: PaperKlineTuple[] = [];
+  const seen = new Set<number>();
+  let cursor = startTime;
+  let pages = 0;
+  while (cursor < endTime && pages < 50) {
+    pages += 1;
+    const remaining = Math.ceil((endTime - cursor) / CANDLE_MS) + 2;
+    const limit = Math.min(Math.max(remaining, 12), 1000);
+    const page = await client.getKlines(symbol, interval, { startTime: cursor, endTime, limit });
+    if (!page.length) break;
+    let lastOpen = Number.NaN;
+    for (const candle of page) {
+      const open = Number(candle[0]);
+      if (!Number.isFinite(open)) continue;
+      lastOpen = open;
+      if (!seen.has(open)) {
+        seen.add(open);
+        out.push(candle);
+      }
+    }
+    if (!Number.isFinite(lastOpen) || lastOpen < cursor) break;
+    // A short page is the venue's end-of-range signal. Continuing would re-request
+    // the same mocked/stale page until the safety page cap and inflate resolver work.
+    if (page.length < limit) break;
+    const next = lastOpen + CANDLE_MS;
+    if (next <= cursor) break;
+    cursor = next;
+  }
+  return out.sort((a, b) => Number(a[0]) - Number(b[0]));
+}
+
 function _rewardR(direction: "LONG" | "SHORT", entry: number, tp: number, risk: number): number {
   if (!(risk > 0)) return 0;
   return direction === "LONG" ? (tp - entry) / risk : (entry - tp) / risk;
@@ -1975,12 +2019,8 @@ function _computePaperCostR(plannedStopDistanceBps: number): number {
 // v2 charges a single honest total per exit — roundTrip(costModel) + stopOutSurcharge(if stop-like)
 // — and books in costR only the portion the gross path did NOT already realize. The ROUND-TRIP
 // component then lines up with the VM matrix: taker TP 22, taker stop 34, maker TP 6, maker stop 18.
-// It is NOT full parity with the matrix: the matrix ALSO charges
-// fundingR = floor(durationMin / 480) × FUNDING_BPS_PER_8H / stopDistanceBps
-// (current-guard-variant-matrix.ts) and the paper book still charges 0 funding. On the 849
-// MAX_HOLD_MTM rows at PAPER_MAX_HOLD_MS = 72h that is 9 periods × 1.5bps = 13.5bps uncharged —
-// LARGER than the −7bps MTM correction v2 makes to those same rows, so long-hold lanes will still
-// show a residual against the matrix. Funding is a separate, still-open change.
+// It also charges completed 8h funding periods at exit time, so long-hold rows no longer receive
+// an unearned cost advantage over their matrix counterparts.
 //
 // Fixing only (1) would have been a purely cost-REDUCING change (a fake positive); (2) lands on
 // ~1/3 of all closes and pushes the other way. They ship together deliberately.
@@ -1996,10 +2036,11 @@ type PaperExitKind =
   | "MARK_TO_MARKET";
 
 /**
- * v2 CUTOVER SWITCH — DEFAULT OFF. `PAPER_COST_MODEL_V2=1` to enable.
+ * v2 is the default for every new book. `PAPER_COST_MODEL_V2=0` exists only
+ * for an explicit historical-replay compatibility run.
  *
- * The v2 model is more correct, but turning it on is a STORE-COHORT DECISION, not just a code
- * change, and it is gated because nothing in the repo discriminates cohorts yet.
+ * The v2 model is more correct, but this remains a STORE-COHORT decision, not just a code
+ * change: use it only for a fresh book or an explicitly version-isolated cohort.
  * `costModelVersion` is stamped but has ZERO readers (grep-confirmed): every netR consumer —
  * laneEconomics(), computeAutoQuarantinedVariantLanes(), per-symbol-lane-book-edge.ts,
  * meta-label-gate, and cortex-refit-runner-bindings.ts:274, which feeds CORTEX outcome
@@ -2007,10 +2048,8 @@ type PaperExitKind =
  *
  * Flipping it moves per-trade netR with NO underlying edge change: maker lanes by up to
  * +16bps/stopBps (22 → 6) and taker stop-heavy lanes by −5bps/stopBps. A CORTEX refit whose
- * rolling window straddles the flip reads that as an edge shift. On testnet
- * CENTRAL_BRAIN_MODE=live means promotion is ENABLED, so allocation moves on a pure accounting
- * artifact. Research (CENTRAL_BRAIN_MODE=shadow) has no promotion and is the safe place to flip
- * first.
+ * rolling window straddles a change reads that as an edge shift. A full internal reset avoids
+ * that artifact; otherwise, keep the legacy replay explicitly on v1.
  *
  * While OFF, EVERYTHING is v1 — resolver and the three what-if counterfactuals alike — so the
  * paper book is byte-identical to its pre-change behaviour and the counterfactual deltas stay
@@ -2021,7 +2060,7 @@ type PaperExitKind =
  * or at the same time — without it the artifact is concentrated on maker TPs on sentinel
  * geometries where stopBps is small and the R impact is largest.
  */
-export const PAPER_COST_MODEL_V2_ENABLED = process.env.PAPER_COST_MODEL_V2 === "1";
+export const PAPER_COST_MODEL_V2_ENABLED = process.env.PAPER_COST_MODEL_V2 !== "0";
 
 /** Cost-model generation stamped on every order this resolver closes. Two generations are NOT
  *  comparable and must never be pooled silently. New v1 rows are stamped explicitly as 1 (an
@@ -2094,11 +2133,22 @@ function _slipAlreadyInGrossBps(
  *  THE SINGLE ENTRY POINT for every paper cost — resolver branches and the three what-if
  *  counterfactuals alike. While PAPER_COST_MODEL_V2 is off it returns the flat v1 value, so the
  *  whole book stays on one model and no delta can straddle the two. */
+const PAPER_FUNDING_BPS_PER_8H = 1.5;
+
+function _fundingCostR(order: PaperOrder, exitAtMs: number | null | undefined): number {
+  if (!PAPER_COST_MODEL_V2_ENABLED || !(order.plannedStopDistanceBps > 0) || !Number.isFinite(exitAtMs)) return 0;
+  const openedAtMs = Date.parse(order.openedAt);
+  if (!Number.isFinite(openedAtMs) || (exitAtMs as number) <= openedAtMs) return 0;
+  const periods = Math.floor(((exitAtMs as number) - openedAtMs) / (8 * 60 * 60 * 1000));
+  return periods > 0 ? -((periods * PAPER_FUNDING_BPS_PER_8H) / order.plannedStopDistanceBps) : 0;
+}
+
 function _computePaperExitCostR(
   order: PaperOrder,
   kind: PaperExitKind,
   model: PaperExecutionModel,
   viaWalk: boolean,
+  exitAtMs?: number | null,
 ): number {
   const stopBps = order.plannedStopDistanceBps;
   if (!(stopBps > 0)) return 0;
@@ -2112,7 +2162,7 @@ function _computePaperExitCostR(
     feeOnlyFloorBps,
     roundTripBps + stopOutExtraBps - _slipAlreadyInGrossBps(kind, model, viaWalk),
   );
-  return -(chargedBps / stopBps);
+  return -(chargedBps / stopBps) + _fundingCostR(order, exitAtMs);
 }
 
 /**
@@ -2128,7 +2178,7 @@ function _computePaperExitCostR(
  * PAPER_COST_MODEL_V2_ENABLED gate as everything else — pair it with PAPER_COST_MODEL_VERSION.
  */
 export function paperManualRealizeCostR(order: PaperOrder): number {
-  return _computePaperExitCostR(order, "MARK_TO_MARKET", PAPER_EXECUTION_MODEL_IDEAL, true);
+  return _computePaperExitCostR(order, "MARK_TO_MARKET", PAPER_EXECUTION_MODEL_IDEAL, true, Date.now());
 }
 
 // ─── SIMULATED R-path capture (2026-07-26, REPORT-ONLY) ─────────────────────
@@ -2429,8 +2479,7 @@ async function resolvePaperOrdersInner(
     try {
       const startTime = openedAtMs - CANDLE_MS;
       const endTime = Math.min(nowMs, openedAtMs + 14 * 24 * 60 * 60 * 1000);
-      const limit = Math.min(Math.max(Math.ceil((endTime - startTime) / CANDLE_MS) + 2, 12), 1000);
-      const candles = await binanceClient.getKlines(order.symbol, "5m", { startTime, endTime, limit });
+      const candles = await fetchPaperKlinesRange(binanceClient, order.symbol, "5m", startTime, endTime);
 
       if (!Array.isArray(candles) || candles.length === 0) {
         store.update(order.paperOrderId, {
@@ -2522,7 +2571,7 @@ async function resolvePaperOrdersInner(
           const walkExitKind: PaperExitKind = _walkExitKind(walk.status, walk.resolutionSource);
           // viaWalk=true: walkVariantPath is handed the RAW E/S/T above, so grossR carries no
           // execution-model slippage and nothing has to be netted out of the cost.
-          const costR = _computePaperExitCostR(order, walkExitKind, executionModel, true);
+          const costR = _computePaperExitCostR(order, walkExitKind, executionModel, true, walk.closedAtMs ?? nowMs);
           const netR = grossR + costR;
           // REPORT-ONLY side-record of the SIMULATED R path (Exit Brain SIMULATED tier). Wrapped +
           // fail-open: it runs AFTER the outcome numbers above are computed and cannot influence any
@@ -2554,7 +2603,8 @@ async function resolvePaperOrdersInner(
           const grossR = _rewardR(dir, Ef, exitFill, risk);
           // viaWalk=false: this horizon close is priced by THIS function's own Ef/_exitFill, not by
           // walkVariantPath, so the model's entry+stop slippage IS already inside grossR.
-          const costR = _computePaperExitCostR(order, "MARK_TO_MARKET", executionModel, false);
+          const closedAtMs = lastCandle ? Number(lastCandle[0]) + CANDLE_MS : nowMs;
+          const costR = _computePaperExitCostR(order, "MARK_TO_MARKET", executionModel, false, closedAtMs);
           const netR = grossR + costR;
           store.update(order.paperOrderId, {
             paperStatus: netR > 0 ? "PAPER_CLOSED_WIN" : "PAPER_CLOSED_LOSS",
@@ -2565,7 +2615,7 @@ async function resolvePaperOrdersInner(
             netPnlAmount: netR * order.plannedRiskAmount,
             closeReason: "MAX_HOLD_MTM",
             // MARKET ts: the mark-to-market horizon exit happens at the LAST candle's close (open + interval).
-            closedAtMs: lastCandle ? Number(lastCandle[0]) + CANDLE_MS : null,
+            closedAtMs,
             updatedAt: new Date().toISOString(),
           });
           resolved += 1;
@@ -2579,13 +2629,12 @@ async function resolvePaperOrdersInner(
       let found = false;
       let tp1Touched = false;
       let lastPathClose = E;
-      // Cost is EXIT-DEPENDENT, so it can no longer be computed once per candle before the branch
-      // is known (it used to be, which is exactly how the stop-out surcharge went missing). Both
-      // possible values are precomputed here — they depend only on the order + execution model —
-      // and each branch below picks the one matching the exit it actually books.
-      // viaWalk=false throughout: every inline branch prices its own fills via Ef/Sf/Tf/_exitFill.
-      const inlineStopLikeCostR = _computePaperExitCostR(order, "STOP_LIKE", executionModel, false);
-      const inlineTpLikeCostR = _computePaperExitCostR(order, "TP_LIKE", executionModel, false);
+      // Cost is exit-time dependent as well as exit-kind dependent: funding is
+      // charged in completed 8h periods using the actual market close time.
+      const inlineStopLikeCostR = (closedAtMs: number) =>
+        _computePaperExitCostR(order, "STOP_LIKE", executionModel, false, closedAtMs);
+      const inlineTpLikeCostR = (closedAtMs: number) =>
+        _computePaperExitCostR(order, "TP_LIKE", executionModel, false, closedAtMs);
       for (const c of candles) {
         const openMs = c[0];
         if (openMs < openedAtMs - CANDLE_MS) continue;
@@ -2604,7 +2653,7 @@ async function resolvePaperOrdersInner(
               const refined = await _resolve1mForPaper(binanceClient, order.symbol, openMs, dir, E, S, T);
               if (refined !== "TP") {
                 const grossR = _rewardR(dir, Ef, Sf, risk);
-                const costR = inlineStopLikeCostR;
+                const costR = inlineStopLikeCostR(candleCloseMs);
                 const netR = grossR + costR;
                 store.update(order.paperOrderId, {
                   paperStatus: "PAPER_CLOSED_LOSS",
@@ -2628,7 +2677,7 @@ async function resolvePaperOrdersInner(
                 const grossR = _rewardR(dir, Ef, breakEvenFill, risk);
                 // Trail-to-breakeven is a resting STOP order pulled up to entry: it fills on the
                 // adverse retrace, so it is stop-like for cost purposes even when it books a win.
-                const costR = inlineStopLikeCostR;
+                const costR = inlineStopLikeCostR(candleCloseMs);
                 const netR = grossR + costR;
                 store.update(order.paperOrderId, {
                   paperStatus: netR > 0 ? "PAPER_CLOSED_WIN" : "PAPER_CLOSED_LOSS",
@@ -2650,7 +2699,7 @@ async function resolvePaperOrdersInner(
             }
             if (slHit) {
               const grossR = _rewardR(dir, Ef, Sf, risk);
-              const costR = inlineStopLikeCostR;
+              const costR = inlineStopLikeCostR(candleCloseMs);
               const netR = grossR + costR;
               store.update(order.paperOrderId, {
                 paperStatus: "PAPER_CLOSED_LOSS",
@@ -2674,7 +2723,7 @@ async function resolvePaperOrdersInner(
                 const grossR = _rewardR(dir, Ef, breakEvenFill, risk);
                 // Trail-to-breakeven is a resting STOP order pulled up to entry: it fills on the
                 // adverse retrace, so it is stop-like for cost purposes even when it books a win.
-                const costR = inlineStopLikeCostR;
+                const costR = inlineStopLikeCostR(candleCloseMs);
                 const netR = grossR + costR;
                 store.update(order.paperOrderId, {
                   paperStatus: netR > 0 ? "PAPER_CLOSED_WIN" : "PAPER_CLOSED_LOSS",
@@ -2699,7 +2748,7 @@ async function resolvePaperOrdersInner(
           if (backToEntry) {
             const breakEvenFill = _exitFill(dir, E, executionModel.stopSlippageBps);
             const grossR = _rewardR(dir, Ef, breakEvenFill, risk);
-            const costR = inlineStopLikeCostR;
+            const costR = inlineStopLikeCostR(candleCloseMs);
             const netR = grossR + costR;
             store.update(order.paperOrderId, {
               paperStatus: netR > 0 ? "PAPER_CLOSED_WIN" : "PAPER_CLOSED_LOSS",
@@ -2724,7 +2773,7 @@ async function resolvePaperOrdersInner(
           const refined = await _resolve1mForPaper(binanceClient, order.symbol, openMs, dir, E, S, T);
           if (refined === "TP") {
             const grossR = _rewardR(dir, Ef, Tf, risk);
-            const costR = inlineTpLikeCostR;
+            const costR = inlineTpLikeCostR(candleCloseMs);
             const netR = grossR + costR;
             store.update(order.paperOrderId, {
               paperStatus: "PAPER_CLOSED_WIN",
@@ -2739,7 +2788,7 @@ async function resolvePaperOrdersInner(
             });
           } else {
             const grossR = _rewardR(dir, Ef, Sf, risk);
-            const costR = inlineStopLikeCostR;
+            const costR = inlineStopLikeCostR(candleCloseMs);
             const netR = grossR + costR;
             store.update(order.paperOrderId, {
               paperStatus: "PAPER_CLOSED_LOSS",
@@ -2761,7 +2810,7 @@ async function resolvePaperOrdersInner(
 
         if (slHit) {
           const grossR = _rewardR(dir, Ef, Sf, risk);
-          const costR = inlineStopLikeCostR;
+          const costR = inlineStopLikeCostR(candleCloseMs);
           const netR = grossR + costR;
           store.update(order.paperOrderId, {
             paperStatus: "PAPER_CLOSED_LOSS",
@@ -2781,7 +2830,7 @@ async function resolvePaperOrdersInner(
 
         if (tpHit) {
           const grossR = _rewardR(dir, Ef, Tf, risk);
-          const costR = inlineTpLikeCostR;
+          const costR = inlineTpLikeCostR(candleCloseMs);
           const netR = grossR + costR;
           store.update(order.paperOrderId, {
             paperStatus: "PAPER_CLOSED_WIN",
@@ -2805,7 +2854,8 @@ async function resolvePaperOrdersInner(
         const grossR = _rewardR(dir, Ef, pathEndFill, risk);
         // Path-end MTM on a runner that already banked TP1. It exits at the last close via the
         // model's TP slippage (a working limit, not a stop trigger) — TP_LIKE, no stop surcharge.
-        const costR = _computePaperExitCostR(order, "TP_LIKE", executionModel, false);
+        const closedAtMs = candles.length ? Number(candles[candles.length - 1]![0]) + CANDLE_MS : nowMs;
+        const costR = _computePaperExitCostR(order, "TP_LIKE", executionModel, false, closedAtMs);
         const netR = grossR + costR;
         store.update(order.paperOrderId, {
           paperStatus: netR > 0 ? "PAPER_CLOSED_WIN" : "PAPER_CLOSED_LOSS",
@@ -2816,7 +2866,7 @@ async function resolvePaperOrdersInner(
           netPnlAmount: netR * order.plannedRiskAmount,
           closeReason: "TRAIL_PATH_END",
           // path-end MTM exit ⇒ market ts is the LAST candle's close (open + interval).
-          closedAtMs: candles.length ? Number(candles[candles.length - 1]![0]) + CANDLE_MS : null,
+          closedAtMs,
           updatedAt: new Date().toISOString(),
         });
         resolved += 1;
@@ -2834,7 +2884,8 @@ async function resolvePaperOrdersInner(
         const grossR = _rewardR(dir, Ef, exitFill, risk);
         // Horizon force-close at the last observed close — a market exit, NOT a stop trigger, so no
         // stop-out surcharge; grossR already carries the model's entry+stop slippage.
-        const costR = _computePaperExitCostR(order, "MARK_TO_MARKET", executionModel, false);
+        const closedAtMs = candles.length ? Number(candles[candles.length - 1]![0]) + CANDLE_MS : nowMs;
+        const costR = _computePaperExitCostR(order, "MARK_TO_MARKET", executionModel, false, closedAtMs);
         const netR = grossR + costR;
         store.update(order.paperOrderId, {
           paperStatus: netR > 0 ? "PAPER_CLOSED_WIN" : "PAPER_CLOSED_LOSS",
@@ -2845,7 +2896,7 @@ async function resolvePaperOrdersInner(
           netPnlAmount: netR * order.plannedRiskAmount,
           closeReason: "MAX_HOLD_MTM",
           // MTM force-exit at the last observed candle's close (open + interval) — market ts, not process time.
-          closedAtMs: candles.length ? Number(candles[candles.length - 1]![0]) + CANDLE_MS : null,
+          closedAtMs,
           updatedAt: new Date().toISOString(),
         });
         resolved += 1;

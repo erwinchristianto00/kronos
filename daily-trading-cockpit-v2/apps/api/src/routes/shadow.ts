@@ -2013,7 +2013,7 @@ export async function registerShadowRoutes(
       staleAudit,
       quarantinedLaneIds: [
         ...MANUAL_QUARANTINED_PAPER_LANE_IDS,
-        ...(process.env.PAPER_CHALLENGER_QUARANTINED !== "0"
+        ...(process.env.PAPER_CHALLENGER_QUARANTINED === "1"
           ? ["CG_VARIANT_MATRIX:CG_TRAIL_AFTER_TP1"]
           : []),
         // Variant lanes auto-quarantined for confirmed net-negative paper economics render violet too.
@@ -3085,12 +3085,11 @@ export async function registerShadowRoutes(
                 const n = Number(process.env.PAPER_CHALLENGER_DIAGNOSTIC_MAX_PER_SCAN);
                 return Number.isFinite(n) && n > 0 ? Math.floor(n) : 1;
               })(),
-              // Quarantine the CG_TRAIL_AFTER_TP1 challenger: trail_after_tp1 is
-              // falsified net-negative on this universe (no edge over tp1_full), so
-              // stop admitting new trail paper orders. Set PAPER_CHALLENGER_QUARANTINED=0
-              // to resume data collection.
+              // A fresh start must allow every geometry to re-collect. Keep the historical
+              // challenger bench as an explicit emergency override, not a hidden default.
+              // Auto-quarantine remains active once the new cohort reaches its own threshold.
               paperChallengerQuarantined:
-                process.env.PAPER_CHALLENGER_QUARANTINED !== "0",
+                process.env.PAPER_CHALLENGER_QUARANTINED === "1",
               // Full variant-matrix paper collection: admit DIAGNOSTIC_ONLY sleeves for
               // baseline/scaleout/no-fib500/maker in both directions (resolver honestly resolves
               // every exit/fill rule). Set PAPER_VARIANT_MATRIX_DIAGNOSTIC=0 to disable.

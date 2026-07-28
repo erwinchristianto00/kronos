@@ -1660,6 +1660,45 @@ export interface VariantMatrixBinanceClient {
   ) => Promise<KlineTuple[]>;
 }
 
+/** See paper-execution-router's equivalent: max-hold geometry may exceed the
+ * venue's 1,000-candle page cap, so a single page must never stand in for the
+ * requested market horizon. */
+async function fetchVariantKlinesRange(
+  client: VariantMatrixBinanceClient,
+  symbol: string,
+  startTime: number,
+  endTime: number,
+): Promise<KlineTuple[]> {
+  const out: KlineTuple[] = [];
+  const seen = new Set<number>();
+  let cursor = startTime;
+  let pages = 0;
+  while (cursor < endTime && pages < 50) {
+    pages += 1;
+    const remaining = Math.ceil((endTime - cursor) / CANDLE_MS) + 2;
+    const limit = Math.min(Math.max(remaining, 12), 1000);
+    const page = await client.getKlines(symbol, "5m", { startTime: cursor, endTime, limit });
+    if (!page.length) break;
+    let lastOpen = Number.NaN;
+    for (const candle of page) {
+      const open = Number(candle[0]);
+      if (!Number.isFinite(open)) continue;
+      lastOpen = open;
+      if (!seen.has(open)) {
+        seen.add(open);
+        out.push(candle);
+      }
+    }
+    if (!Number.isFinite(lastOpen) || lastOpen < cursor) break;
+    // A short page completes the requested range; do not keep polling a stale page.
+    if (page.length < limit) break;
+    const next = lastOpen + CANDLE_MS;
+    if (next <= cursor) break;
+    cursor = next;
+  }
+  return out.sort((a, b) => Number(a[0]) - Number(b[0]));
+}
+
 // ---------------------------------------------------------------------------
 // OPT-IN per-candle R series (2026-07-26). PURELY ADDITIVE — see VariantWalkInput.collectRPath.
 //
@@ -2763,11 +2802,7 @@ export async function resolveVariantMatrixObservations(
         const cacheKey = `${obs.symbol}|${startTime}|${endTime}`;
         let candles = candleCache.get(cacheKey);
         if (!candles) {
-          candles = await binanceClient.getKlines(obs.symbol, "5m", {
-            startTime,
-            endTime,
-            limit: Math.min(Math.max(Math.ceil((endTime - startTime) / CANDLE_MS) + 2, 12), 1000),
-          });
+          candles = await fetchVariantKlinesRange(binanceClient, obs.symbol, startTime, endTime);
           candleCache.set(cacheKey, candles);
         }
 

@@ -18,10 +18,9 @@ import { mkdtempSync } from "node:fs";
 import { join } from "node:path";
 import os from "node:os";
 
-// v2 is behind a DEFAULT-OFF cutover switch (PAPER_COST_MODEL_V2) because flipping it shifts
-// stored netR with no underlying edge change and every consumer pools cohorts silently — see
-// PAPER_COST_MODEL_V2_ENABLED's doc comment. vi.hoisted runs BEFORE the ESM imports below, which
-// is the only way to set it in time for the module-level constant.
+// v2 is the default for new cohorts. vi.hoisted runs BEFORE the ESM imports below, which
+// keeps the default explicit for this suite while the compatibility suite below checks
+// the opt-in v1 fallback.
 vi.hoisted(() => {
   process.env.PAPER_COST_MODEL_V2 = "1";
 });
@@ -330,7 +329,7 @@ describe("[COST-SYMMETRY] exit-aware + fillMode-aware paper cost model", () => {
     // The walk carries no model slippage (raw E/S/T) and the inline nets it out, so the two are
     // charged different BPS by design; what must match is the stop-out surcharge being applied on
     // BOTH. Compare each against its own path's stop-like expectation.
-    const walkStopBps = TAKER_ROUNDTRIP_BPS + STOP_OUT_SLIPPAGE_BPS; // 34, nothing netted out
+    const walkStopBps = TAKER_ROUNDTRIP_BPS + STOP_OUT_SLIPPAGE_BPS; // 34; this fixture closes before funding accrues
     expect(walk.costR!).toBeCloseTo(-walkStopBps / STOP_BPS, 6);
     expect(inline.costR!).toBeCloseTo(-TAKER_INLINE_STOP_BPS / STOP_BPS, 6); // 27
     // Without the fix the walk booked TP_LIKE: 22/300 instead of 34/300.
@@ -339,16 +338,16 @@ describe("[COST-SYMMETRY] exit-aware + fillMode-aware paper cost model", () => {
 });
 
 /**
- * J: THE CUTOVER SWITCH. v2 is default-OFF; with the flag unset the whole book — resolver AND the
+ * J: THE COMPATIBILITY SWITCH. v2 is default-ON; with the explicit v1 flag the whole book — resolver AND the
  * three what-if counterfactuals — must be byte-identical v1 flat cost, and stamp version 1. There
  * is no half-applied state in which some rows are v2 and some v1 within a single process.
  *
  * Uses a fresh module registry because PAPER_COST_MODEL_V2_ENABLED is read once at module load.
  */
-describe("[COST-SYMMETRY] PAPER_COST_MODEL_V2 default-OFF cutover switch", () => {
+describe("[COST-SYMMETRY] PAPER_COST_MODEL_V2 explicit v1 compatibility switch", () => {
   const prior = process.env.PAPER_COST_MODEL_V2;
   beforeAll(() => {
-    delete process.env.PAPER_COST_MODEL_V2;
+    process.env.PAPER_COST_MODEL_V2 = "0";
     vi.resetModules();
   });
   afterAll(() => {
@@ -357,7 +356,7 @@ describe("[COST-SYMMETRY] PAPER_COST_MODEL_V2 default-OFF cutover switch", () =>
     vi.resetModules();
   });
 
-  it("J: with the flag unset, every exit kind is charged the flat v1 taker cost and stamped v1", async () => {
+  it("J: with v1 explicitly selected, every exit kind is charged the flat v1 taker cost and stamped v1", async () => {
     const mod = await import("../src/lib/paper-execution-router.js");
     expect(mod.PAPER_COST_MODEL_V2_ENABLED).toBe(false);
     expect(mod.PAPER_COST_MODEL_VERSION).toBe(1);

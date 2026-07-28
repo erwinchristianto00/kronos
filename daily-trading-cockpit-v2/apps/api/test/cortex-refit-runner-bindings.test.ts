@@ -156,6 +156,18 @@ describe("gatherCortexRefitInputs — end-to-end roster wiring sanity", () => {
     // Before the fix this asserted the exact opposite (all 15 "wired") on this very same empty dataDir —
     // which was the bug in miniature: readers that yield nothing were being reported as live sources.
     const dataDir = tmp();
+    const nowMs = Date.parse("2026-07-19T00:00:00Z");
+    const blocked = gatherCortexRefitInputs({
+      dataDir,
+      journalFile: join(dataDir, "cortex-decisions.jsonl"),
+      nowMs,
+      nowIso: new Date(nowMs).toISOString(),
+      staticWeightPctForLane: () => 0,
+      env: {} as NodeJS.ProcessEnv,
+    });
+    expect(blocked.outcomes).toHaveLength(0);
+    expect(blocked.roster.every((lane) => lane.hasOutcomeSource === false)).toBe(true);
+
     const input = gatherCortexRefitInputs({
       dataDir,
       journalFile: join(dataDir, "cortex-decisions.jsonl"), // nonexistent — journal reads must tolerate this
@@ -210,6 +222,7 @@ describe("gatherCortexRefitInputs — end-to-end roster wiring sanity", () => {
       nowMs,
       nowIso: new Date(nowMs).toISOString(),
       staticWeightPctForLane: () => 0,
+      env: { CORTEX_ALLOW_RAW_STORE_TRAINING: "1" } as NodeJS.ProcessEnv,
     });
 
     const xsecOutcome = input.outcomes.find((o) => o.laneId === "CROSS_SECTIONAL_MARKET_NEUTRAL");
@@ -569,7 +582,7 @@ describe("[PASS-WITH] flag ON: the three dead LONG CG lanes reach LEARNING_ACTIV
   });
 
   it("[PASS-WITH] flag ON: all three flip to LEARNING_ACTIVE on router-sourced examples", () => {
-    const { byLane, input } = statuses({ CORTEX_CG_ROUTER_OUTCOMES: "1" });
+    const { byLane, input } = statuses({ CORTEX_CG_ROUTER_OUTCOMES: "1", CORTEX_ALLOW_RAW_STORE_TRAINING: "1" });
     for (const lane of LANES) {
       const l = byLane.get(lane.laneId)!;
       expect(l.status).toBe("LEARNING_ACTIVE");
@@ -581,7 +594,7 @@ describe("[PASS-WITH] flag ON: the three dead LONG CG lanes reach LEARNING_ACTIV
   });
 
   it("[PASS-WITH] CG_MFE_GIVEBACK_SHORT gains NOTHING — its 30 SHORT router orders are invisible to this source", () => {
-    const { byLane } = statuses({ CORTEX_CG_ROUTER_OUTCOMES: "1" });
+    const { byLane } = statuses({ CORTEX_CG_ROUTER_OUTCOMES: "1", CORTEX_ALLOW_RAW_STORE_TRAINING: "1" });
     const short = byLane.get("CG_MFE_GIVEBACK_SHORT")!;
     expect(short.outcomesSeen).toBe(0);
     expect(short.attributed).toBe(0);

@@ -1682,6 +1682,47 @@ describe("paper-execution-router", () => {
     expect(order.netR!).toBeGreaterThan(0);
   });
 
+  // [25b1] A six-day runner crosses Binance's 1,000-row kline cap. The resolver must
+  // fetch every page before applying its horizon mark, otherwise it would close on an
+  // ~83h stale candle and undercharge funding.
+  it("[25b1] runner horizon paginates beyond 1,000 candles and charges funding through the actual mark", async () => {
+    const nowMs = Date.now();
+    const dir = tmpDir();
+    const store = new PaperExecutionRouterStore(dir);
+    const openedAtMs = nowMs - 150 * 60 * 60_000;
+    store.add(
+      makePaperOrder({
+        paperOrderId: "runner-pagination-1",
+        dedupeKey: "runner-pagination-1:lane",
+        sourceObservationId: "obs-runner-pagination-1",
+        openedAt: new Date(openedAtMs).toISOString(),
+        selectedLaneId: "CG_VARIANT_MATRIX:CG_WIDE_LONG_RUNNER",
+        paperStatus: "CREATED",
+      }),
+    );
+
+    let fiveMinuteCalls = 0;
+    const pagedClient: PaperResolverClient = {
+      getKlines: async (_symbol, interval, opts) => {
+        if (interval === "1m") return [];
+        fiveMinuteCalls += 1;
+        const rows: PaperKlineTuple[] = [];
+        for (let openMs = opts.startTime; openMs < opts.endTime && rows.length < opts.limit; openMs += 300_000) {
+          rows.push([openMs, "0", "100.1", "99.9", "100", "0", openMs + 300_000] as PaperKlineTuple);
+        }
+        return rows;
+      },
+    };
+
+    await resolvePaperOrders(store, pagedClient);
+    const resolved = store.all.find((o) => o.paperOrderId === "runner-pagination-1")!;
+    expect(fiveMinuteCalls).toBeGreaterThan(1);
+    expect(resolved.closeReason).toBe("MAX_HOLD_MTM");
+    expect(resolved.closedAtMs).toBeGreaterThanOrEqual(openedAtMs + 150 * 60 * 60_000);
+    // Default ideal walk charges the 22bps taker round-trip + 18 completed 8h funding periods.
+    expect(resolved.costR!).toBeCloseTo(-(22 + 18 * 1.5) / 300, 10);
+  });
+
   // [25c] Guard: an order YOUNGER than the 72h horizon that has not hit TP/SL is
   // NOT force-closed — it stays PAPER_SUBMITTED to keep resolving. The time-stop
   // must only fire past the horizon, never cut live positions short.

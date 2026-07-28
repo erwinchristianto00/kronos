@@ -58,6 +58,17 @@ import {
  *  CG matrix read (which can hold 100k+ obs). */
 export const CORTEX_REFIT_LOOKBACK_MS = 45 * 86_400_000;
 
+/**
+ * Raw lane stores are paper/simulation measurement stores, not the normalized
+ * Experience Store. They cannot train CORTEX unless an operator explicitly
+ * enables this legacy research path. The safe default preserves the causal
+ * firewall: forward causal collection may continue, but no coefficient update
+ * is derived from an unproven provenance source.
+ */
+export function cortexRawStoreTrainingEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.CORTEX_ALLOW_RAW_STORE_TRAINING === "1";
+}
+
 /** Direction is part of the causal identity. CG_MFE is executable both ways, so its two books
  * must not share labels or training examples. */
 const CG_ROSTER: readonly { laneId: string; variantId: string; direction: "LONG" | "SHORT" }[] = [
@@ -541,7 +552,7 @@ export function gatherCortexRefitInputs(deps: {
   nowMs: number;
   nowIso: string;
   staticWeightPctForLane: (laneId: string) => number;
-  /** Env used for the CG-router source's two flags. Defaults to process.env. */
+  /** Env controls legacy raw-store compatibility. Defaults to process.env. */
   env?: NodeJS.ProcessEnv;
   /** Test seam for the CG-router source. Defaults to the RESIDENT-ONLY reader (never a cold parse —
    *  see readResidentCgRouterOrders). Returning null means "no router data available this run". */
@@ -564,6 +575,31 @@ export function gatherCortexRefitInputs(deps: {
   );
 
   const journal = readCortexDecisionRows([`${deps.journalFile}.1`, deps.journalFile]);
+
+  if (!cortexRawStoreTrainingEnabled(deps.env)) {
+    const epochRows = filterCortexLearningEpochRows(journal.rows, [], epoch);
+    const emptyRouter = emptyCortexCgRouterSummary();
+    return {
+      // Retain decision rows for audit/readiness, but do not create a training
+      // example until the forward Experience Store can provide a direct,
+      // eligible decision-to-outcome feature lineage.
+      decisions: epochRows.decisions,
+      outcomes: [],
+      roster: buildCortexAttrRoster(deps.staticWeightPctForLane, () => false),
+      nowMs: deps.nowMs,
+      nowIso: deps.nowIso,
+      currentSchemaVersion: CORTEX_FEATURE_SCHEMA_VERSION,
+      ttlMsForLane: cortexLaneTtlMs,
+      skipsByLane: {},
+      pruneBeforeMs: sinceMs - 5 * 86_400_000,
+      journalBadLines: journal.badLines,
+      cgRouterOutcomes: emptyRouter,
+      learningEpoch: epoch
+        ? { ...epoch, decisionRowsExcluded: epochRows.decisionRowsExcluded, transitionalOutcomesExcluded: 0 }
+        : null,
+      learningEpochRejection,
+    };
+  }
 
   // Directional edge stores → RawDirectionalObs (netR already in R).
   const dirObs = (all: { observationId: string; openedAtMs: number; resolvedAt: string | null; status: string; netR: number | null }[]): RawDirectionalObs[] =>

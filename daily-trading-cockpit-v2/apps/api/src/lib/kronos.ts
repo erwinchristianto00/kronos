@@ -258,8 +258,14 @@ export interface KronosRecentFailureSample {
   recordedAt: number;
 }
 
-function clampPercentage(value: number): number {
-  return Math.max(0, Math.min(100, value));
+/**
+ * Kronos sidecars have emitted both probability conventions over time: fractions
+ * (0..1) and percentages (0..100). Normalize once at the boundary so every
+ * downstream scorer continues to consume the shared 0..100 contract.
+ */
+function normalizePercentage(value: number): number {
+  const scaled = Math.abs(value) <= 1 ? value * 100 : value;
+  return Math.max(0, Math.min(100, scaled));
 }
 
 function parseNumeric(value: unknown): number | null {
@@ -833,10 +839,10 @@ export class HttpKronosClient implements KronosClient {
       });
     }
 
-    const normalizedLong = clampPercentage(longProbability);
-    const normalizedShort = clampPercentage(shortProbability);
-    const normalizedConfidence = clampPercentage(confidence);
-    const normalizedRisk = clampPercentage(risk);
+    const normalizedLong = normalizePercentage(longProbability);
+    const normalizedShort = normalizePercentage(shortProbability);
+    const normalizedConfidence = normalizePercentage(confidence);
+    const normalizedRisk = normalizePercentage(risk);
     const normalizedBias =
       selectedBias ??
       (payload.kronosBias === "LONG" || payload.kronosBias === "SHORT" || payload.kronosBias === "NEUTRAL"
@@ -869,8 +875,8 @@ export class HttpKronosClient implements KronosClient {
       expectedReturn15m: expectedReturn15m ?? undefined,
       expectedReturn1h: expectedReturn1h ?? undefined,
       expectedReturn4h: expectedReturn4h ?? undefined,
-      probabilityUp: probabilityUp !== null ? clampPercentage(probabilityUp) : undefined,
-      probabilityDown: probabilityDown !== null ? clampPercentage(probabilityDown) : undefined,
+      probabilityUp: probabilityUp !== null ? normalizePercentage(probabilityUp) : undefined,
+      probabilityDown: probabilityDown !== null ? normalizePercentage(probabilityDown) : undefined,
       kronosConfidenceBucket: confidenceBucket,
       horizonConflict: payload.horizonConflict ?? false,
       debugSymbol: payload.debugSymbol,

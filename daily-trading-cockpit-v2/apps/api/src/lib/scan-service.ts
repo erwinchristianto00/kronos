@@ -181,12 +181,16 @@ function calculateVolumeRatio5m(candles5m: Awaited<ReturnType<BinanceClient["get
 }
 
 function deriveMarketRegime(candidates: Candidate[]): string {
-  if (candidates.length === 0) {
+  const usable = candidates.filter((candidate) => candidate.status !== "SKIP");
+  if (usable.length === 0) {
     return "No usable market regime because all symbols were skipped.";
   }
 
-  const bullish = candidates.filter((candidate) => candidate.finalDirection === "LONG").length;
-  const bearish = candidates.filter((candidate) => candidate.finalDirection === "SHORT").length;
+  // Regime is a market measurement, not a property of the shortlist that the
+  // regime itself later constrains. Using every usable scanned symbol removes
+  // the rank-selection feedback loop from the controller input.
+  const bullish = usable.filter((candidate) => candidate.finalDirection === "LONG").length;
+  const bearish = usable.filter((candidate) => candidate.finalDirection === "SHORT").length;
 
   if (bullish >= bearish + 4) {
     return "Bullish expansion";
@@ -627,7 +631,7 @@ export class ScanService {
     timing?.finishStage("candidateRanking");
 
     timing?.startStage("marketRegime");
-    const marketRegime = deriveMarketRegime(mainCandidates.length ? mainCandidates : builtCandidates);
+    const marketRegime = deriveMarketRegime(builtCandidates);
     timing?.finishStage("marketRegime");
     const addMarketRegimeCaution = (candidate: Candidate): Candidate => {
       const regimeMismatch =
