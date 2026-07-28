@@ -80,6 +80,13 @@ A comment saying something is unavailable records what was true when it was writ
   server** before restarting — a broken file only fails at restart.
 - `/testnet` and `/live` are rsync-only and drift silently. Hash-diff before restarting anything.
 - Before any restart, `find src -newermt <process start>` — a restart activates whatever is on disk.
+- **Deploying a file also deploys its imports, or the instance dies on restart.** rsyncing individual
+  files onto a shared checkout breaks the moment the other agent has added a module: on 2026-07-28
+  `app.ts` went to research importing `innovation-testnet-execution.js`, which existed locally (their
+  commit, pulled) but had never been shipped there — research crash-looped on ERR_MODULE_NOT_FOUND
+  and was down until the missing file followed. Mechanical check, run BEFORE the restart:
+  `grep -oE 'from "\./lib/[a-z0-9-]+\.js"' app.ts` and confirm each one exists on the target. Then
+  restart, then confirm `/api/health` returns 200 — a deploy is not finished at rsync.
 - Never print `.env` values. Back up `.env` before editing; verify the line count is unchanged.
 - **Never POST to `/api/live/copy-intent`** — it opens real mainnet positions.
 - A blanket `new-entry-drain` masks every executor's real reason (drain is checked before
