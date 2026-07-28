@@ -5,6 +5,8 @@ import {
   INNOVATION_POLICY_ONLY_IDS,
   fundingCarryBaskets,
   hedgedResidualBaskets,
+  innovationTestnetAdmissionAllowed,
+  innovationTestnetWeight,
   isInnovationTestnetExecutionEnabled,
   singleSignalsForDirection,
 } from "../src/lib/innovation-testnet-execution.js";
@@ -22,6 +24,14 @@ describe("innovation testnet execution adapters", () => {
     for (const policyId of INNOVATION_POLICY_ONLY_IDS) {
       expect(EXECUTABLE_INNOVATION_LANE_IDS).not.toContain(policyId);
     }
+  });
+
+  it("bypasses research/allocation vetoes but never bypasses the operational account gate", () => {
+    expect(innovationTestnetAdmissionAllowed(true)).toBe(true);
+    expect(innovationTestnetAdmissionAllowed(false)).toBe(false);
+    expect(innovationTestnetWeight(0)).toBe(100);
+    expect(innovationTestnetWeight(Number.NaN)).toBe(100);
+    expect(innovationTestnetWeight(35)).toBe(35);
   });
 
   it("preserves single-symbol direction, structural stop, target, and horizon", () => {

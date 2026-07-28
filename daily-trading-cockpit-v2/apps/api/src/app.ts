@@ -42,6 +42,8 @@ import {
   asCrossSectionalSignalStore,
   fundingCarryBaskets,
   hedgedResidualBaskets,
+  innovationTestnetAdmissionAllowed,
+  innovationTestnetWeight,
   isInnovationTestnetExecutionEnabled,
   singleSignalsForDirection,
 } from "./lib/innovation-testnet-execution.js";
@@ -1922,9 +1924,12 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     // one-way netting, protective stops, allocation, notional caps, and cluster caps remain intact.
     if (liveEngine && isInnovationTestnetExecutionEnabled(liveConfig.env)) {
       const engineForGate = liveEngine;
-      const innovationAllowed = (laneId: string): boolean =>
-        engineForGate.canOpenNewEntriesIgnoringManualDirectional() &&
-        engineForGate.laneSelectionAllowsLane(laneId);
+      const innovationAllowed = (): boolean =>
+        innovationTestnetAdmissionAllowed(engineForGate.canOpenNewEntriesIgnoringManualDirectional());
+      const innovationWeight = (laneId: string): number => {
+        const selected = engineForGate.laneSelectionWeightPctForLane(laneId);
+        return innovationTestnetWeight(selected);
+      };
       const innovationLegUsd = (): number => {
         const configured = Number(process.env.INNOVATION_TESTNET_LEG_USD);
         return Number.isFinite(configured) && configured > 0 ? configured : 10;
@@ -1966,9 +1971,9 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           laneId: descriptor.laneId,
           idNamespace: descriptor.laneId,
           enabled: () => true,
-          isAllowed: () => innovationAllowed(descriptor.laneId),
-          laneWeightPct: () => engineForGate.laneSelectionWeightPctForLane(descriptor.laneId),
-          rawLaneWeightPct: () => engineForGate.rawLaneAllocationWeightPctForLane(descriptor.laneId),
+          isAllowed: innovationAllowed,
+          laneWeightPct: () => innovationWeight(descriptor.laneId),
+          rawLaneWeightPct: () => innovationWeight(descriptor.laneId),
           cortexRealAttribution: getCortexRealAttributionStore(),
           executionFillRecorder: getExecutionFillRecorder(),
           entryHealthGate: () => ({ allowed: true, reason: null }),
@@ -2016,9 +2021,9 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
               descriptor.policy === "TRAIL"
                 ? makeMfeGivebackExitPolicy({ armR: 0.5, givebackFrac: 0.5, maxHoldMs: 7 * 24 * 3_600_000 })
                 : makeFixedRewardExitPolicy({ rewardMultiple: 100, maxHoldMs: 7 * 24 * 3_600_000 }),
-            isAllowed: () => innovationAllowed(descriptor.laneId),
-            laneWeightPct: () => engineForGate.laneSelectionWeightPctForLane(descriptor.laneId),
-            rawLaneWeightPct: () => engineForGate.rawLaneAllocationWeightPctForLane(descriptor.laneId),
+            isAllowed: innovationAllowed,
+            laneWeightPct: () => innovationWeight(descriptor.laneId),
+            rawLaneWeightPct: () => innovationWeight(descriptor.laneId),
             cortexRealAttribution: getCortexRealAttributionStore(),
             positionPathRecorder: getPositionPathRecorder(),
             executionFillRecorder: getExecutionFillRecorder(),

@@ -55,6 +55,18 @@ export function isInnovationTestnetExecutionEnabled(
   return environment === "testnet" && env.INNOVATION_TESTNET_EXEC_DISABLED !== "1";
 }
 
+/** Research maturity/allocation never veto innovation execution; operational account safety does. */
+export function innovationTestnetAdmissionAllowed(canOpenIgnoringManualDirectional: boolean): boolean {
+  return canOpenIgnoringManualDirectional;
+}
+
+/** An absent allocation is permissive on testnet; an explicit positive allocation scales size. */
+export function innovationTestnetWeight(selectedWeightPct: number): number {
+  return Number.isFinite(selectedWeightPct) && selectedWeightPct > 0
+    ? Math.min(100, selectedWeightPct)
+    : 100;
+}
+
 export function singleSignalsForDirection(
   observations:
     | readonly BtcLeadLagObservation[]
