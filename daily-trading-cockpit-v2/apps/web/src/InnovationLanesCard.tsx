@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { C, fmtR, toneR, ago, laneEdgeBadge, LaneMaturityTable, type LaneMaturityRow } from './LaneMaturityTable';
+import { ReadinessVerdict, type FourBrainReadinessBlock } from './ReadinessVerdict';
 
 // Inovasi (shadow lanes) progress card (2026-07-22 operator ask) — /research only. Watches the
 // original five measurements plus four lineage-preserving V2 siblings and one new L2 signal lane.
@@ -70,6 +71,10 @@ export type ExitBrainReport = {
    *  unlabeled row — which was ALWAYS measured-only, so nothing is mislabeled either way. */
   measured?: ExitBrainTierBlock;
   simulated?: ExitBrainTierBlock;
+  /** Server-side verdict (four-brain-readiness.ts). Exit was the last brain still showing raw numbers
+   *  with nothing to judge them by. Optional because an instance may predate it — live/3103 only got
+   *  it on 2026-07-28, and it renders there as the untiered-build scope. */
+  readiness?: FourBrainReadinessBlock | null;
 };
 type FundingCarryReport = {
   openCount: number;
@@ -355,6 +360,7 @@ export function InnovationLanesCard() {
       expanded: eb && (
         <>
           {sourceNote(exitBrain) && <div style={{ fontSize: 10, color: C.measure, marginBottom: 4 }}>{sourceNote(exitBrain)}</div>}
+          <ReadinessVerdict block={eb.readiness} title="Vonis kesiapan" />
           {eb.measured && eb.simulated ? (
             // Dua tier bukti, DUA baris terpisah — tidak ada satu angka gabungan di mana pun.
             <>
@@ -392,7 +398,9 @@ export function InnovationLanesCard() {
             <Mini label="INSUFFICIENT_PATH_DATA" value={String(eb.coverage.insufficientPathData)} color={C.accent} />
             {(eb.coverage.coverageRatio ?? 0) === 0 && (
               <span style={{ fontSize: 12, color: C.accent }}>
-                menunggu data path padat — recorder tick baru mulai mengisi, ~0% cakupan itu expected, bukan bug
+                0% cakupan di sini bukan recorder yang belum jalan — recorder-nya ada dan bekerja, tapi hanya dua
+                eksekutor yang menulis tick (live-execution-engine, single-symbol-lane-executor). Instance yang tidak
+                menjalankan keduanya cuma punya kerangka 4 titik. Ini soal cakupan EKSEKUSI, bukan soal ambang.
               </span>
             )}
           </div>
