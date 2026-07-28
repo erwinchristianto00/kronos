@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { judgeFourBrainReadiness, rollUpFourBrainReadiness } from "../src/lib/four-brain-readiness.js";
+import { judgeFourBrainReadiness, rollUpFourBrainReadiness, exitBrainReadinessFromReport } from "../src/lib/four-brain-readiness.js";
 
 /**
  * Exit was the one brain left without a readiness verdict — four-brain-readiness.ts has supported it
@@ -49,26 +49,80 @@ describe("Exit Brain readiness on the live shape", () => {
   });
 });
 
-describe("the exit-brain route actually computes it (source-level guard)", () => {
-  /** FAILS WITHOUT THE FIX — the route returned the report with no verdict at all. */
-  it("judges both tiers separately and never blends them", () => {
+describe("the route delegates to the pure derivation (source-level guard)", () => {
+  it("calls exitBrainReadinessFromReport rather than re-deriving tiers inline", () => {
     const at = SHADOW_SRC.indexOf('app.get("/api/shadow/exit-brain"');
     expect(at).toBeGreaterThanOrEqual(0);
     const body = SHADOW_SRC.slice(at, at + 2200);
-    expect(body).toContain("judgeFourBrainReadiness");
-    expect(body).toContain('"measured"');
-    expect(body).toContain('"simulated"');
-    // EXACT pairing, not a loose proximity match: the first version of this guard used a
-    // fuzzy regex that happily matched the SCOPE string "SIMULATED (candle-walk)" further down,
-    // so flipping the simulated tier's basis to REAL — which would let a candle-walk qualify the
-    // brain — passed cleanly. Assert the literal tuple.
-    expect(body).toContain('{ key: "simulated", basis: "SIMULATED" }');
-    expect(body).toContain('{ key: "measured", basis: "REAL" }');
-    expect(body).not.toContain('{ key: "simulated", basis: "REAL" }');
+    expect(body).toContain("exitBrainReadinessFromReport");
+    expect(body).toContain("readiness");
   });
 
   it("cannot break the report if the verdict throws", () => {
     const at = SHADOW_SRC.indexOf('app.get("/api/shadow/exit-brain"');
     expect(SHADOW_SRC.slice(at, at + 2200)).toContain("catch");
+  });
+});
+
+/**
+ * Live/3103 runs a build a week behind research and testnet: no measured/simulated split, one flat
+ * `performance` block. Shipping the verdict there means the derivation must handle both shapes, and
+ * the dangerous direction is obvious — a fallback loose enough to label candle-walk rows REAL would
+ * let a simulation qualify the brain, which is the one thing the verdict exists to stop.
+ *
+ * Live's real numbers when this was written: n=12, meanDeltaR -0.0337, 11 of 12 rows ties.
+ */
+describe("both report shapes, because live is a week behind", () => {
+  const TIERED = {
+    measured: { n: 559, meanDeltaR: 0.0114 },
+    simulated: { n: 6015, meanDeltaR: -0.0096 },
+  };
+  const UNTIERED = { performance: { n: 12, meanDeltaR: -0.0337 } };
+
+  it("judges the two tiers separately on a current build", () => {
+    const r = exitBrainReadinessFromReport(TIERED)!;
+    expect(r.perScope).toHaveLength(2);
+    expect(r.perScope.find((p) => p.scope.startsWith("MEASURED"))!.measuredBasis).toBe("REAL");
+    expect(r.perScope.find((p) => p.scope.startsWith("SIMULATED"))!.measuredBasis).toBe("SIMULATED");
+    expect(r.verdict).toBe("NOT_READY");
+  });
+
+  /** FAILS WITHOUT THE FALLBACK — live returned no verdict at all. */
+  it("still returns a verdict on live's pre-tier shape", () => {
+    const r = exitBrainReadinessFromReport(UNTIERED)!;
+    expect(r).not.toBeNull();
+    expect(r.perScope).toHaveLength(1);
+    expect(r.verdict).toBe("INSUFFICIENT_EVIDENCE"); // n=12 is under the 20-sample floor
+  });
+
+  /** The fallback must say so, so nobody reads it as the same evidence as a current build. */
+  it("labels the fallback scope as an untiered build", () => {
+    expect(exitBrainReadinessFromReport(UNTIERED)!.perScope[0]!.scope).toContain("untiered");
+  });
+
+  /** THE GUARD. If either tier key is present we can classify the rows, so the flat `performance`
+   *  block must NOT be swept in alongside them as REAL — on a current build it is the same rows
+   *  counted twice, and the copy would carry no tier. Mutation checked: dropping the condition so the
+   *  fallback always fires turns both of these red. */
+  it("never falls back when a simulated tier is present", () => {
+    const r = exitBrainReadinessFromReport({ simulated: { n: 6015, meanDeltaR: -0.0096 }, performance: { n: 6015, meanDeltaR: -0.0096 } })!;
+    expect(r.perScope).toHaveLength(1);
+    expect(r.perScope[0]!.measuredBasis).toBe("SIMULATED");
+    expect(r.perScope.some((p) => p.scope.includes("untiered"))).toBe(false);
+    expect(r.verdict).toBe("NOT_READY_SIMULATED_ONLY");
+  });
+
+  it("never falls back when a measured tier is present", () => {
+    const r = exitBrainReadinessFromReport({ measured: { n: 559, meanDeltaR: 0.0114 }, performance: { n: 9999, meanDeltaR: 0.9 } })!;
+    expect(r.perScope).toHaveLength(1);
+    // the measured tier's 559, NOT the flat block's 9999 — the fallback did not fire
+    expect(r.perScope[0]!.gates.find((g) => g.gate === "EVIDENCE")!.value).toBe(559);
+    expect(r.perScope[0]!.measuredBasis).toBe("REAL");
+  });
+
+  it("returns null rather than a fake verdict when there is nothing to judge", () => {
+    expect(exitBrainReadinessFromReport(null)).toBeNull();
+    expect(exitBrainReadinessFromReport({})).toBeNull();
+    expect(exitBrainReadinessFromReport({ performance: { n: "12" } })).toBeNull();
   });
 });

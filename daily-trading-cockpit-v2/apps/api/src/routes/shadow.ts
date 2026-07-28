@@ -420,7 +420,7 @@ import {
 } from "../lib/price-impact-efficiency.js";
 import type { FourBrainMetricsSummary } from "../lib/four-brain-metrics.js";
 import type { DirectionEntryOutcomeReport } from "../lib/direction-entry-outcome-store.js";
-import { judgeFourBrainReadiness, rollUpFourBrainReadiness } from "../lib/four-brain-readiness.js";
+import { judgeFourBrainReadiness, rollUpFourBrainReadiness, exitBrainReadinessFromReport } from "../lib/four-brain-readiness.js";
 
 // Fail-open shape for /api/shadow/four-brain's `health` field on any instance where the four-brain
 // metrics aggregator was never constructed (mode off, test harness, etc.) — every count is honestly 0,
@@ -1680,29 +1680,16 @@ export async function registerShadowRoutes(
     // on 12.2% coverage and 507 of its 554 rows are ties, while the SIMULATED tier reads -0.0086 over
     // 5,960 rows at 92% coverage — the two disagree in SIGN, and the flattering one is the thin slice.
     // Both tiers are judged separately and never blended; SIMULATED can never qualify the brain.
-    const readiness = (() => {
-      try {
-        const tiers: Array<{ key: "measured" | "simulated"; basis: "REAL" | "SIMULATED" }> = [
-          { key: "measured", basis: "REAL" },
-          { key: "simulated", basis: "SIMULATED" },
-        ];
-        const parts = tiers.flatMap(({ key, basis }) => {
-          const b = (exitReport as unknown as Record<string, unknown>)[key] as Record<string, unknown> | undefined;
-          if (!b || typeof b.n !== "number") return [];
-          return [
-            judgeFourBrainReadiness("EXIT", {
-              scope: key === "measured" ? "MEASURED (real recorded paths)" : "SIMULATED (candle-walk)",
-              effectiveN: b.n,
-              meanNetR: typeof b.meanDeltaR === "number" ? b.meanDeltaR : null,
-              measuredBasis: basis,
-            }),
-          ];
-        });
-        return { ...rollUpFourBrainReadiness(parts), perScope: parts };
-      } catch {
-        return null; // a view over the report must never be able to break the report
-      }
-    })();
+    // Shape-tolerant on purpose: live/3103 runs a build that predates the measured/simulated split
+    // and emits one flat `performance` block. exitBrainReadinessFromReport handles both and its
+    // behavior on each is pinned by tests, so shipping the verdict to an older instance needs no
+    // bespoke edit to that instance's copy of this file. See its doc comment for the tier reasoning.
+    let readiness: ReturnType<typeof exitBrainReadinessFromReport> = null;
+    try {
+      readiness = exitBrainReadinessFromReport(exitReport);
+    } catch {
+      readiness = null; // a view over the report must never be able to break the report
+    }
     return {
       generatedAt: new Date().toISOString(),
       params: DEFAULT_EXIT_BRAIN_PARAMS,

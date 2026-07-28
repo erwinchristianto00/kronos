@@ -206,3 +206,56 @@ export function rollUpFourBrainReadiness(parts: readonly FourBrainReadiness[]): 
   }
   return { verdict: "INSUFFICIENT_EVIDENCE", summary: "not enough independent evidence anywhere yet" };
 }
+
+/**
+ * Derive the Exit Brain's readiness from whatever shape that instance's report happens to be in.
+ *
+ * This lives here, not inline in the route, for one reason: instances run different vintages of the
+ * code and this is the only piece that has to reason about that. Live/3103 is a week behind research
+ * and testnet, so shipping the verdict there means shipping a function whose behavior on BOTH shapes
+ * is pinned by tests — not a bespoke edit to that instance's route file.
+ *
+ * Two shapes exist:
+ *   - CURRENT: `measured` (real recorded paths) and `simulated` (candle-walk) as separate blocks.
+ *     Judged separately, never blended; SIMULATED can never qualify the brain.
+ *   - PRE-TIER: one flat `performance` block.
+ *
+ * Treating a flat `performance` as REAL is safe ONLY because the tier split and the candle-walk
+ * source landed in the same change: a build with neither tier key also has no simulated ingestion, so
+ * every evaluated row came from the dense recorder. The fallback is therefore gated on BOTH tier keys
+ * being absent. If only one were missing we would be inventing a tier for data we cannot classify,
+ * and labelling SIMULATED rows as REAL is the precise failure this verdict exists to prevent.
+ *
+ * Returns null when there is nothing to judge — the caller keeps serving its report either way.
+ */
+export function exitBrainReadinessFromReport(report: unknown): ({
+  verdict: FourBrainReadinessVerdict;
+  summary: string;
+  perScope: FourBrainReadiness[];
+}) | null {
+  if (!report || typeof report !== "object") return null;
+  const raw = report as Record<string, unknown>;
+  const block = (key: string): Record<string, unknown> | null => {
+    const b = raw[key] as Record<string, unknown> | undefined;
+    return b && typeof b === "object" && typeof b.n === "number" ? b : null;
+  };
+  const measured = block("measured");
+  const simulated = block("simulated");
+  const scopes: Array<{ b: Record<string, unknown>; scope: string; basis: "REAL" | "SIMULATED" }> = [];
+  if (measured) scopes.push({ b: measured, scope: "MEASURED (real recorded paths)", basis: "REAL" });
+  if (simulated) scopes.push({ b: simulated, scope: "SIMULATED (candle-walk)", basis: "SIMULATED" });
+  if (!measured && !simulated) {
+    const flat = block("performance");
+    if (flat) scopes.push({ b: flat, scope: "MEASURED (real recorded paths, untiered build)", basis: "REAL" });
+  }
+  if (scopes.length === 0) return null;
+  const perScope = scopes.map(({ b, scope, basis }) =>
+    judgeFourBrainReadiness("EXIT", {
+      scope,
+      effectiveN: b.n as number,
+      meanNetR: typeof b.meanDeltaR === "number" ? b.meanDeltaR : null,
+      measuredBasis: basis,
+    }),
+  );
+  return { ...rollUpFourBrainReadiness(perScope), perScope };
+}
