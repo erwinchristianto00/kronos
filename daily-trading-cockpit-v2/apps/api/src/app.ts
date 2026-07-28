@@ -136,6 +136,7 @@ import {
 import {
   buildCurrentGuardVariantMatrixReport,
   getCurrentGuardVariantMatrixStore,
+  variantMatrixOpenSignals,
 } from "./lib/current-guard-variant-matrix.js";
 import { getLatestScanCandidates } from "./lib/latest-scan-candidates-cache.js";
 import { buildRegimeDirectionControllerReport } from "./lib/regime-direction-controller.js";
@@ -2120,6 +2121,14 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       for (const bucket of CE_ALL_BUCKETS) {
         try { add(ceLaneIdForBucket(bucket), bucket.includes("SHORT") ? "SHORT" : "LONG", compositeEstimatorOpenSignals(getCompositeEstimatorStore(), bucket)); } catch { /* */ }
       }
+      // 2026-07-28: the six lanes above are the ONLY ones the four-brain used to see, and not one of
+      // them appears in a single closed position path — all 309 come from the CG variant matrix. That
+      // made Entry Brain Tier 1 a permanently empty join (0 of 1,664, every rejection
+      // NO_EXACT_LANE_SYMBOL_SIDE_CLOSE) and is the concrete reason the brains never connected to
+      // anything that trades. Each row carries its own variantId and side, so these are pushed
+      // directly rather than through add(); the bare variantId is deliberate — the Tier-1 matcher
+      // strips the CG_VARIANT_MATRIX:/CG_LONG_VARIANT_MATRIX: prefixes itself, so it joins to both.
+      try { for (const s of variantMatrixOpenSignals(getCurrentGuardVariantMatrixStore())) out.push(s); } catch { /* store unavailable ⇒ skip (no fabrication) */ }
       return out;
     };
 

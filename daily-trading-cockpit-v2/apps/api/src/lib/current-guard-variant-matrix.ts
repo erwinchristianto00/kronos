@@ -955,6 +955,81 @@ function observationKey(sourceObservationKey: string, variantId: string): string
   return `${sourceObservationKey}::${variantId}`;
 }
 
+/**
+ * The variant matrix's OPEN observations in the four-brain's fresh-signal shape (2026-07-28).
+ *
+ * WHY THIS EXISTS. Entry Brain Tier 1 had resolved 0 of 1,664 decisions and could never resolve
+ * one, because the four-brain evaluated a lane set that shares NOTHING with the lane set that
+ * actually opens positions:
+ *
+ *   evaluated  : COMPOSITE_ESTIMATOR_BIDI_* , INTRADAY_MOMENTUM_BREAKOUT_LONG ,
+ *                REGIME_COMPOSITE_CONFIRMATION_LONG/SHORT   (CE and IM have never traded at all)
+ *   executed   : all 309 closed position paths are CG_VARIANT_MATRIX:* / CG_LONG_VARIANT_MATRIX:*
+ *   intersection: EMPTY
+ *
+ * Every one of the 1,664 rejections was NO_EXACT_LANE_SYMBOL_SIDE_CLOSE — not a TTL, not an
+ * identity mismatch, not a competing decision. The two halves of the measurement were simply
+ * looking at different universes, so waiting could never fill that column.
+ *
+ * NAMESPACE: emit the BARE variantId. The Tier-1 matcher's own join key is
+ * `normalizeEntryTier1LaneNamespace(laneId)::SYMBOL::SIDE`, and that function strips exactly the
+ * `CG_VARIANT_MATRIX:` / `CG_LONG_VARIANT_MATRIX:` prefixes — its doc comment names this pair as
+ * the example it exists for. So a bare id joins to BOTH namespaces, which is what we want: the
+ * same variantId legitimately appears in both (12 of them do), and the observation itself does not
+ * record which writer will pick it up.
+ *
+ * BOUNDED on purpose: the store holds ~3,254 OPEN rows, while the sibling lane accessors return a
+ * handful. Feeding all of them into every five-minute tick would change the four-brain's cost
+ * profile, so this returns the freshest `cap` within `maxAgeMs`. The default window matches the
+ * consumer's own maxSignalAgeMs (50 min) with headroom, because a decision older than that can
+ * never own a close anyway.
+ */
+export function variantMatrixOpenSignals(
+  store: CurrentGuardVariantMatrixStore,
+  opts: { nowMs?: number; maxAgeMs?: number; cap?: number } = {},
+): Array<{
+  laneId: string;
+  symbol: string;
+  direction: Direction;
+  observationId: string;
+  openedAtMs: number;
+  entryPrice: number;
+  stopPrice: number;
+}> {
+  const nowMs = opts.nowMs ?? Date.now();
+  const maxAgeMs = opts.maxAgeMs ?? 60 * 60_000;
+  const cap = Math.max(1, opts.cap ?? 400);
+  const out: Array<{
+    laneId: string;
+    symbol: string;
+    direction: Direction;
+    observationId: string;
+    openedAtMs: number;
+    entryPrice: number;
+    stopPrice: number;
+  }> = [];
+  for (const o of store.all) {
+    if (o.status !== "OPEN") continue;
+    const openedAtMs = Date.parse(o.openedAt);
+    if (!Number.isFinite(openedAtMs) || nowMs - openedAtMs > maxAgeMs) continue;
+    const entryPrice = o.simulatedEntryPrice;
+    const stopPrice = o.simulatedStopLoss;
+    // Never fabricate geometry: a row without a usable entry/stop is skipped, not defaulted.
+    if (!(entryPrice > 0) || !(stopPrice > 0)) continue;
+    out.push({
+      laneId: o.variantId,
+      symbol: o.symbol,
+      direction: o.direction,
+      observationId: o.observationId,
+      openedAtMs,
+      entryPrice,
+      stopPrice,
+    });
+  }
+  out.sort((a, b) => b.openedAtMs - a.openedAtMs);
+  return out.slice(0, cap);
+}
+
 export class CurrentGuardVariantMatrixStore {
   private readonly file: string;
   private observations: CurrentGuardVariantMatrixObservation[];
