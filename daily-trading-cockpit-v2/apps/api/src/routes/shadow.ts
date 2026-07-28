@@ -1673,10 +1673,41 @@ export async function registerShadowRoutes(
   // to score — the honest "do we need a dense path recorder first?" answer) + the exact params
   // the transparent policy ran with. See exit-brain-policy.ts / exit-brain-shadow.ts.
   app.get("/api/shadow/exit-brain", async () => {
+    const exitReport = getExitBrainShadowStore().buildReport();
+    // 2026-07-28: Exit was the one brain left without a readiness verdict — four-brain-readiness.ts
+    // has supported it since it was written and only Direction and Entry were wired. Its headline is
+    // exactly the shape that verdict exists to interrogate: the MEASURED tier reads +0.0114 meanDeltaR
+    // on 12.2% coverage and 507 of its 554 rows are ties, while the SIMULATED tier reads -0.0086 over
+    // 5,960 rows at 92% coverage — the two disagree in SIGN, and the flattering one is the thin slice.
+    // Both tiers are judged separately and never blended; SIMULATED can never qualify the brain.
+    const readiness = (() => {
+      try {
+        const tiers: Array<{ key: "measured" | "simulated"; basis: "REAL" | "SIMULATED" }> = [
+          { key: "measured", basis: "REAL" },
+          { key: "simulated", basis: "SIMULATED" },
+        ];
+        const parts = tiers.flatMap(({ key, basis }) => {
+          const b = (exitReport as unknown as Record<string, unknown>)[key] as Record<string, unknown> | undefined;
+          if (!b || typeof b.n !== "number") return [];
+          return [
+            judgeFourBrainReadiness("EXIT", {
+              scope: key === "measured" ? "MEASURED (real recorded paths)" : "SIMULATED (candle-walk)",
+              effectiveN: b.n,
+              meanNetR: typeof b.meanDeltaR === "number" ? b.meanDeltaR : null,
+              measuredBasis: basis,
+            }),
+          ];
+        });
+        return { ...rollUpFourBrainReadiness(parts), perScope: parts };
+      } catch {
+        return null; // a view over the report must never be able to break the report
+      }
+    })();
     return {
       generatedAt: new Date().toISOString(),
       params: DEFAULT_EXIT_BRAIN_PARAMS,
-      ...getExitBrainShadowStore().buildReport(),
+      readiness,
+      ...exitReport,
     };
   });
 
