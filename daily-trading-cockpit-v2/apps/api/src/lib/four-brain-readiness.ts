@@ -153,6 +153,15 @@ export function judgeFourBrainReadiness(
   let verdict: FourBrainReadinessVerdict;
   let summary: string;
 
+  // EDGE UNMEASURED CAN NEVER BE READY (2026-07-28, caught on the first live read of this module).
+  // The first version treated a null gate as "not applicable" and required only that the applicable
+  // ones pass — so INTRADAY/SHORT, a bucket with ZERO decisions in the store's entire life, reported
+  // READY: every quality gate was null for want of data, leaving EVIDENCE alone, which passed
+  // because it was reading the HORIZON's effectiveN rather than the bucket's own. A readiness meter
+  // that returns READY for a bucket holding nothing is the exact failure this file exists to end.
+  // EDGE is the load-bearing gate: unmeasured there means "no idea", which is INSUFFICIENT_EVIDENCE.
+  const edgeUnmeasured = input.meanNetR === null;
+
   if (input.measuredBasis !== "REAL") {
     verdict = "NOT_READY_SIMULATED_ONLY";
     summary =
@@ -162,6 +171,9 @@ export function judgeFourBrainReadiness(
   } else if (!evidenceOk) {
     verdict = "INSUFFICIENT_EVIDENCE";
     summary = `only ${n ?? 0} independent samples — needs ≥ ${minN} before any verdict is meaningful`;
+  } else if (edgeUnmeasured) {
+    verdict = "INSUFFICIENT_EVIDENCE";
+    summary = "no outcome has ever been recorded for this scope — nothing to judge";
   } else if (applicable.every((g) => g.passed === true)) {
     verdict = "READY";
     summary = "clears every gate on real measured outcomes";

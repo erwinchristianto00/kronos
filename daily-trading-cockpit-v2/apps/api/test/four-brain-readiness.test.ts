@@ -156,3 +156,31 @@ describe("thresholds are pinned to the edge hurdle they are scaled from", () => 
     expect(FOUR_BRAIN_READY_MIN_EFFECTIVE_N).toBe(20);
   });
 });
+
+describe("a scope with no data can never report READY", () => {
+  /** CAUGHT ON THE FIRST LIVE READ: INTRADAY/SHORT has ZERO decisions in the store's entire life and
+   *  the first version of this module reported it READY — every quality gate was null for want of
+   *  data, leaving only EVIDENCE, which passed because it read the HORIZON's effectiveN rather than
+   *  the bucket's own. A readiness meter that says READY about an empty bucket is precisely the
+   *  defect this file exists to end. FAILS WITHOUT THE FIX. */
+  it("an unmeasured EDGE is INSUFFICIENT_EVIDENCE, never READY", () => {
+    const r = judgeFourBrainReadiness("DIRECTION", {
+      scope: "INTRADAY/SHORT",
+      effectiveN: 38, // the horizon has plenty — this bucket has none
+      meanNetR: null,
+      meanRegretR: null,
+      meanCalibrationGapR: null,
+      measuredBasis: "REAL",
+    });
+    expect(r.verdict).toBe("INSUFFICIENT_EVIDENCE");
+    expect(r.verdict).not.toBe("READY");
+    expect(r.summary).toContain("no outcome has ever been recorded");
+  });
+
+  it("and it does not poison the roll-up into a false READY", () => {
+    const empty = judgeFourBrainReadiness("DIRECTION", {
+      scope: "INTRADAY/SHORT", effectiveN: 38, meanNetR: null, measuredBasis: "REAL",
+    });
+    expect(rollUpFourBrainReadiness([empty]).verdict).toBe("INSUFFICIENT_EVIDENCE");
+  });
+});
