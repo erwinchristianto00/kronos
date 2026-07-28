@@ -139,6 +139,7 @@ import {
   variantMatrixOpenSignals,
 } from "./lib/current-guard-variant-matrix.js";
 import { getLatestScanCandidates } from "./lib/latest-scan-candidates-cache.js";
+import { kronosAgreeFromScan } from "./lib/kronos-agree-reading.js";
 import { buildRegimeDirectionControllerReport } from "./lib/regime-direction-controller.js";
 import { getRegimeDirectionControllerSnapshotStore } from "./lib/regime-direction-controller-snapshot.js";
 import { getRegimeEdgeMemory } from "./lib/regime-edge-memory.js";
@@ -2244,8 +2245,17 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         crowdAtMs: fourBrainBtcFlowCache?.crowdAlignLong !== null
           ? fourBrainBtcFlowCache?.atMs ?? null
           : null,
-        kronosAgree: null,
-        kronosAtMs: null,
+        // 2026-07-28: was a hardcoded null with the note "no sync kronos-agree producer", which left
+        // the Direction Brain calling market direction on ~2 of its 5 sub-signals. Kronos was never
+        // unreachable — it runs on this host (pm2 `kronos`, 127.0.0.1:8001) and the scanner already
+        // calls it every cycle. Read from THAT result rather than issuing a second predict(): kronos.ts
+        // serialises inference through one global concurrency slot, so an independent per-tick consumer
+        // would contend with the scanner for it. See kronos-agree-reading.ts for the −1..1 mapping and
+        // for why an absent/zero-confidence opinion returns null rather than 0.
+        ...(() => {
+          const k = kronosAgreeFromScan(scanCached?.candidates, "BTCUSDT", parseAtMs(scanCached?.scanFinishedAt));
+          return { kronosAgree: k.agree, kronosAtMs: k.atMs };
+        })(),
         openSignals: collectFourBrainOpenSignals(),
         maxSignalAgeMs: 50 * 60_000,
         crowdingStateForSymbol: (symbol) => crowdingShadow[symbol]?.crowdingState ?? null,
