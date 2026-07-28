@@ -2112,9 +2112,26 @@ export async function registerShadowRoutes(
     let closed = 0;
     let skipped = 0;
     let skippedNonProfit = 0;
+    let raced = 0;
     let realizedPnl = 0;
     let realizedR = 0;
+    // Re-read the store AFTER the awaited candle fetches above. `orders` was snapshotted before
+    // them, and the background resolver (resolvePaperOrders) filters the identical two open statuses
+    // on its own ~7-minute cycle — so it can close any of these inside that async gap. Since
+    // store.update() merges unconditionally with no status check, writing from the stale snapshot
+    // would overwrite the resolver's real TP/SL-derived outcome with a mark-based one (potentially
+    // flipping WIN to LOSS) and pair the resolver's original close timestamp with a grossR/costR/netR
+    // computed against a later mark — paperManualRealizeCostR bases its funding leg on Date.now(),
+    // not the true exit time. The loop below contains no `await`, so this one fresh snapshot cannot
+    // go stale mid-loop.
+    const statusNow = new Map(
+      paperStore.getState().orders.map((o) => [o.paperOrderId, o.paperStatus] as const),
+    );
     for (const order of orders) {
+      if (!openStatuses.has(statusNow.get(order.paperOrderId) ?? "")) {
+        raced += 1; // resolved by the resolver while we were fetching marks — leave its outcome alone
+        continue;
+      }
       const mark = latest.get(order.symbol);
       const entry = order.entryPrice;
       const risk = order.direction === "LONG" ? entry - order.stopLoss : order.stopLoss - entry;
@@ -2150,7 +2167,7 @@ export async function registerShadowRoutes(
       realizedR += netR;
     }
 
-    return { ok: true, mode, closed, skipped, skippedNonProfit, realizedPnl, realizedR, lane: laneFilter ?? "ALL" };
+    return { ok: true, mode, closed, skipped, skippedNonProfit, raced, realizedPnl, realizedR, lane: laneFilter ?? "ALL" };
   });
 
   // ── Compact operator brief (report-only read, no writes, no behavior changes) ──

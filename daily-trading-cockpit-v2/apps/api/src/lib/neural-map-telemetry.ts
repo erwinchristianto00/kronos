@@ -13,6 +13,7 @@ import type { MixedBudgetForwardValidationReport, MixedRegimeReport, OpenOrderSt
 import type { PaperOrder, PaperPerformanceReport } from "./paper-execution-router.js";
 import { buildPerSymbolLaneBookEdge } from "./per-symbol-lane-book-edge.js";
 import { applySubFloorExclusionForDecisions } from "./paper-subfloor-exclusion.js";
+import { selectNewestCostCohort } from "./paper-cost-cohort.js";
 import { assessPaperTp, cgWideTpPctFromOrder } from "./paper-trading-controls.js";
 import type { RegimeDirectionControllerReport } from "./regime-direction-controller.js";
 import {
@@ -768,7 +769,13 @@ function laneEconomics(orders: PaperOrder[], laneId: string) {
   // which is what the operator promotes lanes on. Gated with the same single flag as the rest so
   // the map and the allocator can never disagree about what the book says.
   const scoped = applySubFloorExclusionForDecisions(orders).filter((order) => order.selectedLaneId === laneId);
-  const closed = scoped.filter((order) => CLOSED.has(order.paperStatus));
+  // NEVER pool cost-model generations: a generation change moves netR/PF with no edge change at all,
+  // and this feeds paperBookStatus/cohortFromPaperBook — the surface an operator promotes lanes on.
+  // A lane accumulating rows under a newer, cheaper basis would otherwise drift upward through the
+  // WATCHABLE/PAPER_EVIDENCE/HEADLINE_CONFIRMED thresholds on bookkeeping alone. minRows=0: this
+  // panel has no sample gate of its own, it just must not average two bases together.
+  const closedAllGenerations = scoped.filter((order) => CLOSED.has(order.paperStatus));
+  const closed = selectNewestCostCohort(closedAllGenerations)?.rows ?? [];
   const headline = closed.filter(
     (order) => order.paperOrderMode !== "DIAGNOSTIC_ONLY" && order.diagnosticLabel !== "BACKFILL_DIAGNOSTIC",
   );

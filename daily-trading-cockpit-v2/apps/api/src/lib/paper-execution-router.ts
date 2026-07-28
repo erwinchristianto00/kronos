@@ -2067,9 +2067,25 @@ type PaperExitKind =
  */
 export const PAPER_COST_MODEL_V2_ENABLED = process.env.PAPER_COST_MODEL_V2 !== "0";
 
-/** Cost-model generation stamped on every order this resolver closes. Two generations are NOT
- *  comparable and must never be pooled silently. New v1 rows are stamped explicitly as 1 (an
- *  ABSENT field means a legacy row written before stamping existed — also v1, but unverified). */
+/**
+ * Cost-model generation stamped on every order this resolver closes. Two generations are NOT
+ * comparable and must never be pooled silently. New v1 rows are stamped explicitly as 1 (an
+ * ABSENT field means a legacy row written before stamping existed — also v1, but unverified).
+ *
+ * NOT BUMPED to 3 for the 2026-07-28 arithmetic corrections (maker stop-outs now charged
+ * maker-in/taker-out; funding counted on the venue's fixed UTC grid instead of elapsed-time-since-
+ * open) — a measurement, not an assumption. Both are corrections WITHIN v2's own stated contract
+ * ("exit-aware" and "funded"); it simply implemented each slightly wrong. Measured against the live
+ * stores the day of the change: of 668 closed rows across research+testnet, exactly **3** would
+ * reprice under the maker fix (maker-lane LOSSES: 0 on research, 3 on testnet) and **0** under the
+ * funding fix (no stored hold spans a settlement boundary — every current hold is short). Bumping
+ * would have invalidated 668 rows, blanking lane telemetry and quarantine evidence, to represent a
+ * divergence affecting 0.45% of them.
+ *
+ * Re-derive before assuming this still holds. It stops being true the moment maker-lane losses or
+ * multi-hour holds accumulate in a store whose older rows predate this change: at that point old and
+ * new rows really are on different bases and a bump becomes the honest call.
+ */
 export const PAPER_COST_MODEL_VERSION = PAPER_COST_MODEL_V2_ENABLED ? 2 : 1;
 
 /**
@@ -5566,10 +5582,13 @@ async function _timeboxOutcomeForOrder(
 
   const startTime = openedAtMs - CANDLE_MS;
   const endTime = boxEnd;
-  const limit = Math.min(Math.max(Math.ceil((endTime - startTime) / CANDLE_MS) + 2, 12), 1000);
+  // Paginated, like the main resolver: a single getKlines call is capped at Binance's 1,000-row
+  // limit, which silently truncates any window past ~83h of 5m candles and reports a timebox
+  // outcome computed from a short candle set with no error and no data-quality flag. `boxes` is an
+  // operator-supplied query parameter with no upper bound, so this window is directly reachable.
   let candles: PaperKlineTuple[];
   try {
-    candles = await client.getKlines(order.symbol, "5m", { startTime, endTime, limit });
+    candles = await fetchPaperKlinesRange(client, order.symbol, "5m", startTime, endTime);
   } catch {
     return "DATA_FAILURE";
   }
@@ -6128,10 +6147,11 @@ export async function buildFastTpTightDiagnostic(
     }
     const endTimeMs = Math.min(nowMs, openedAtMs + horizonMs);
     const startTime = openedAtMs - CANDLE_MS;
-    const limit = Math.min(Math.max(Math.ceil((endTimeMs - startTime) / CANDLE_MS) + 2, 12), 1000);
+    // Paginated: see _timeboxOutcomeForOrder. A fast-TP horizon past ~83h of 5m candles would
+    // otherwise be truncated at Binance's 1,000-row cap and scored on a partial path.
     let candles: PaperKlineTuple[];
     try {
-      candles = await client.getKlines(o.symbol, "5m", { startTime, endTime: endTimeMs, limit });
+      candles = await fetchPaperKlinesRange(client, o.symbol, "5m", startTime, endTimeMs);
     } catch {
       for (const a of acc) a.dataFailures += 1;
       continue;
@@ -7098,11 +7118,12 @@ export async function buildSignalDecayDiagnostic(
     if (!Number.isFinite(openedAtMs)) continue;
     const fiveStart = openedAtMs - 15 * 60_000;
     const fiveEnd = Math.min(nowMs, openedAtMs + horizonMs + 15 * 60_000);
-    const fiveLimit = Math.min(Math.max(Math.ceil((fiveEnd - fiveStart) / CANDLE_MS) + 2, 12), 1000);
+    // Paginated: see _timeboxOutcomeForOrder. The 1m leg below stays a single call on purpose — its
+    // window is a fixed ±11 minutes (30 rows), nowhere near the 1,000-row cap.
     let fiveM: PaperKlineTuple[];
     let oneM: PaperKlineTuple[];
     try {
-      fiveM = await client.getKlines(o.symbol, "5m", { startTime: fiveStart, endTime: fiveEnd, limit: fiveLimit });
+      fiveM = await fetchPaperKlinesRange(client, o.symbol, "5m", fiveStart, fiveEnd);
       oneM = await client.getKlines(o.symbol, "1m", {
         startTime: openedAtMs - 11 * 60_000,
         endTime: openedAtMs + 11 * 60_000,

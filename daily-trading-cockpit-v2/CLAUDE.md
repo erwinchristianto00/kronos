@@ -52,7 +52,12 @@ A comment saying something is unavailable records what was true when it was writ
 ## Attribution on live
 
 - **Live intents carry no `laneId`.** Attribute through `position-paths.json` → `meta.laneId`,
-  keyed `intent:<paperOrderId>:<openedAt>`.
+  keyed `intent:<paperOrderId>:<createdAt>` — **`createdAt`, not `openedAt`**. This doc said
+  `openedAt` until 2026-07-28; every writer and reader has always used `createdAt`
+  (`positionPathKeyForIntent`, the `sweepCortexRealAttribution` recordId, `fillRecordContextForIntent`,
+  and position-path-recorder.ts's own header). Building the key the documented way missed every row,
+  and per the EMPTY-means-UNREAD rule below the natural conclusion was "this position has no path" —
+  the exact mistake this file exists to prevent.
 - `paperOrderId` values beginning `rts-` come from `realtime-short-mirror.ts` and **exist in no
   paper store**. Any join through the paper router returns zero rows — that is not evidence of
   absence.

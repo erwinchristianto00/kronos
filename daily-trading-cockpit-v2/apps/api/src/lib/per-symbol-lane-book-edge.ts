@@ -52,6 +52,10 @@ export interface PsleOrder {
   /** T1-b: read only by the sub-admission-floor predicate. Absent ⇒ row is never excluded. */
   sourceType?: string | null;
   plannedStopDistanceBps?: number | null;
+  /** Cost-model generation this row's netR was priced under. Carried so a future consumer can avoid
+   *  pooling generations; absent on peer rows from instances whose projection predates it (see
+   *  econOf above for why that makes filtering here unsafe today). */
+  costModelVersion?: number | null;
 }
 
 /**
@@ -79,6 +83,7 @@ export function toPsleOrder(o: {
   diagnosticLabel?: string | null;
   sourceType?: string | null;
   plannedStopDistanceBps?: number | null;
+  costModelVersion?: number | null;
 }): PsleOrder {
   return {
     symbol: o.symbol,
@@ -90,6 +95,7 @@ export function toPsleOrder(o: {
     diagnosticLabel: o.diagnosticLabel ?? null,
     sourceType: o.sourceType ?? null,
     plannedStopDistanceBps: o.plannedStopDistanceBps ?? null,
+    costModelVersion: o.costModelVersion ?? null,
   };
 }
 
@@ -104,6 +110,26 @@ interface Econ {
   totalR: number;
 }
 
+/**
+ * NOT cohort-filtered, deliberately — and this is the one consumer where filtering would be the
+ * more dangerous choice.
+ *
+ * The pooling is real: this averages netR across cost-model generations, and a generation change
+ * moves netR/PF with no underlying edge change. But this function's population is local rows POOLED
+ * WITH PEER ROWS fetched over `/api/shadow/headline-closed-orders` (PSLE_PEER_SOURCE_URLS, default
+ * `localhost:3102,localhost:3103`), and measured 2026-07-28 neither peer's `toPsleOrder` sends
+ * `costModelVersion` at all. Since an absent stamp is defined as generation 1, selecting the newest
+ * generation would classify EVERY peer row as legacy and silently drop all of it the moment one
+ * local newer-generation row existed — reproducing precisely the failure this module's own header
+ * documents (peer rows arriving without a field the local logic reads, producing decisions computed
+ * on a half-cleaned population, consumed by live/3103 on real money).
+ *
+ * Losing all peer evidence outright is worse than pooling two bases that, as of 2026-07-28, are the
+ * same single generation everywhere (measured: 668/668 closed rows across research+testnet stamped
+ * v2, 0 rows v1). `costModelVersion` IS now carried on PsleOrder and in the projection below, so once
+ * the peers ship a projection that sends it, switch this to `selectNewestCostCohort(all)?.rows ?? []`
+ * — check that peers actually populate the field first, exactly as this comment did.
+ */
 function econOf(list: PsleOrder[]): Econ {
   const nets = list.map((o) => o.netR).filter(finite);
   const positive = nets.filter((v) => v > 0).reduce((a, b) => a + b, 0);

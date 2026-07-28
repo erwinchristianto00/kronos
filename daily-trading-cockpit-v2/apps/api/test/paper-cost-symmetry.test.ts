@@ -40,6 +40,7 @@ import {
   STOP_OUT_SLIPPAGE_BPS,
   VARIANT_MATRIX_DEFINITIONS,
 } from "../src/lib/current-guard-variant-matrix.js";
+import { REALISTIC_FEE_BPS_PER_SIDE } from "../src/lib/shadow-engine.js";
 
 // ── fixture ──────────────────────────────────────────────────────────────────
 
@@ -147,8 +148,19 @@ const STOP_SLIP = PAPER_EXECUTION_MODEL_REALISTIC.stopSlippageBps; // 5
 const TP_SLIP = PAPER_EXECUTION_MODEL_REALISTIC.tpSlippageBps; // 0
 
 /** walk-resolved: grossR carries NO model slippage, so nothing is netted out. */
-const MAKER_WALK_TP_BPS = MAKER_ROUNDTRIP_BPS; // 6
-const MAKER_WALK_STOP_BPS = MAKER_ROUNDTRIP_BPS + STOP_OUT_SLIPPAGE_BPS; // 18
+const MAKER_WALK_TP_BPS = MAKER_ROUNDTRIP_BPS; // a TP LIMIT fills as maker on both legs
+/**
+ * A maker_limit order posts its ENTRY as a resting limit, but a stop-out exits at MARKET and pays
+ * the taker rate — so the round trip on that path is maker-in + taker-out, not all-maker.
+ *
+ * This constant used to be `MAKER_ROUNDTRIP_BPS + STOP_OUT_SLIPPAGE_BPS`, pinning a ~3bps/stopBps
+ * UNDERCHARGE on every maker-lane loss: the fee floor was pinned to the same all-maker constant, so
+ * the Math.max could not catch the shortfall either. current-guard-variant-matrix.ts named this gap
+ * when MAKER_ROUNDTRIP_BPS was corrected to 4 ("that round trip is really 2 + 5 = 7 ... does NOT add
+ * the maker->taker fee difference (3 bps) there") and deferred it as a cost-model change.
+ */
+const MAKER_IN_TAKER_OUT_BPS = MAKER_ROUNDTRIP_BPS / 2 + REALISTIC_FEE_BPS_PER_SIDE; // 2 + 5 = 7
+const MAKER_WALK_STOP_BPS = MAKER_IN_TAKER_OUT_BPS + STOP_OUT_SLIPPAGE_BPS; // 19, was 16
 /** inline: grossR already realized entry + (tp|stop) slippage. */
 const TAKER_INLINE_STOP_BPS = TAKER_ROUNDTRIP_BPS + STOP_OUT_SLIPPAGE_BPS - (ENTRY_SLIP + STOP_SLIP); // 27
 const TAKER_INLINE_TP_BPS = TAKER_ROUNDTRIP_BPS - (ENTRY_SLIP + TP_SLIP); // 20
@@ -279,11 +291,12 @@ describe("[COST-SYMMETRY] exit-aware + fillMode-aware paper cost model", () => {
     );
     // PATH: inline taker (SL_HIT), NOT the maker walk (which would report MAKER_* / no-fill).
     expect(o.closeReason).toBe("SL_HIT");
-    // BASIS: maker, taken from def.costModel — inline, so the model slippage already in grossR is
-    // netted out. The floor (MAKER_ROUNDTRIP_BPS) binds: 6 + 12 − 7 = 11.
+    // BASIS: maker ENTRY, taker EXIT (a stop-out leaves at market) — taken from def.costModel;
+    // inline, so the model slippage already in grossR is netted out. Floor and round-trip both use
+    // the maker-in/taker-out basis, so the floor cannot mask an undercharge: 7 + 12 − 7 = 12.
     const expectedBps = Math.max(
-      MAKER_ROUNDTRIP_BPS,
-      MAKER_ROUNDTRIP_BPS + STOP_OUT_SLIPPAGE_BPS - (ENTRY_SLIP + STOP_SLIP),
+      MAKER_IN_TAKER_OUT_BPS,
+      MAKER_IN_TAKER_OUT_BPS + STOP_OUT_SLIPPAGE_BPS - (ENTRY_SLIP + STOP_SLIP),
     );
     expect(o.costR!).toBeCloseTo(-expectedBps / STOP_BPS, 6);
     // The divergence is real and this is its magnitude vs. the taker basis the PATH simulated.

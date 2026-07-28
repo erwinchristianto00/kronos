@@ -32,6 +32,7 @@ import {
 } from "./cortex-live-gather.js";
 
 import { applySubFloorExclusionForDecisions } from "./paper-subfloor-exclusion.js";
+import { selectNewestCostCohort } from "./paper-cost-cohort.js";
 import { getRegimeCompositeStore, RC_PAPER_LANE_ID } from "./regime-composite-edge.js";
 import { getRegimeCompositeShortStore, RCS_PAPER_LANE_ID } from "./regime-composite-short-edge.js";
 import { getShortFadeStore, SF_PAPER_LANE_ID } from "./short-fade-edge.js";
@@ -59,11 +60,29 @@ import {
 export const CORTEX_REFIT_LOOKBACK_MS = 45 * 86_400_000;
 
 /**
- * Raw lane stores are paper/simulation measurement stores, not the normalized
- * Experience Store. They cannot train CORTEX unless an operator explicitly
- * enables this legacy research path. The safe default preserves the causal
- * firewall: forward causal collection may continue, but no coefficient update
- * is derived from an unproven provenance source.
+ * Raw lane stores are paper/simulation measurement stores, not the normalized Experience Store. They
+ * cannot train CORTEX unless an operator explicitly enables this legacy research path.
+ *
+ * WHAT THIS ACTUALLY DOES, stated plainly because the original wording invited a wrong reading (it
+ * was summarised elsewhere as "CORTEX now trains only on causal-eligible data", which is not what
+ * either branch does):
+ *
+ *   - flag UNSET (the default, and the state on every instance today): gatherCortexRefitInputs
+ *     returns `outcomes: []` with `hasOutcomeSource === false` for EVERY lane. That is a total
+ *     training freeze, not a narrower/cleaner data source — coefficients hold at whatever they were
+ *     when this shipped, indefinitely.
+ *   - flag SET to "1": falls through to the pre-existing raw-store reads, UNFILTERED. There is no
+ *     causal-eligibility predicate anywhere in this repo (no causalEligible / CAUSAL_ELIGIBLE /
+ *     isCausalEligible symbol exists); the same rows that trained CORTEX before are used again.
+ *
+ * So the two branches are "train on nothing" and "train on everything raw" — the causal firewall is
+ * enforced by refusing to train at all, not by discriminating between rows. The replacement source
+ * does not exist yet: a forward Experience Store providing direct decision-to-outcome lineage is the
+ * stated prerequisite, and nothing in this codebase provides one.
+ *
+ * Left at the safe default deliberately. Re-enabling is an operator decision about model staleness
+ * versus provenance, not a code cleanup — turning it on restores exactly the training population the
+ * firewall was raised against.
  */
 export function cortexRawStoreTrainingEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return env.CORTEX_ALLOW_RAW_STORE_TRAINING === "1";
@@ -162,6 +181,9 @@ export interface CortexCgRouterOrderLike {
   /** T1-b: read only by the sub-admission-floor predicate. Absent ⇒ row is never excluded. */
   sourceType?: string | null;
   plannedStopDistanceBps?: number | null;
+  /** Cost-model generation `netR` was priced under. Generations are NOT comparable, and netR is the
+   *  training reward here — see the cohort selection in collectCortexCgRouterObs. */
+  costModelVersion?: number | null;
 }
 
 export interface CortexCgRouterLaneCounts {
@@ -263,7 +285,15 @@ export function collectCortexCgRouterObs(
   // wired anyway because CG_ROUTER_LONG_LANE_BY_VARIANT is a hand-maintained constant: without
   // this, the next person to add a fourth lane inherits the contamination silently.
   // The zero-delta claim is enforced by a test, not remembered.
-  const scoped = applySubFloorExclusionForDecisions(orders);
+  // NEVER pool cost-model generations into CORTEX training. netR IS the reward signal here, and a
+  // generation change moves it with no edge change whatsoever (the v1->v2 cutover alone moved maker
+  // lanes up to +16bps/stopBps and taker stop-heavy lanes -5bps). Pooled, the identical setup would
+  // appear to pay differently depending only on WHEN it closed relative to the cutover — a step
+  // change in the reward that is indistinguishable, to a fitted coefficient, from a real edge shift.
+  // Judge on the newest generation present; minRows=0 because the refit's own min-examples gate
+  // downstream is what decides whether the sample is adequate.
+  const subFloorScoped = applySubFloorExclusionForDecisions(orders);
+  const scoped = selectNewestCostCohort(subFloorScoped)?.rows ?? [];
   for (const ord of scoped) {
     const variantId = cortexCgRouterVariantId(ord?.selectedLaneId);
     if (variantId === null) continue; // not a variant-matrix router lane at all

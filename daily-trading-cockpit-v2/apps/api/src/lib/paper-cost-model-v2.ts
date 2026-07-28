@@ -59,14 +59,27 @@ export interface PaperCostV2Inputs {
 const finite = (n: unknown): n is number => typeof n === "number" && Number.isFinite(n);
 
 /**
- * Completed 8h funding periods, in R, signed negative. PARTIAL periods are deliberately NOT
- * prorated: funding is charged by the venue at discrete settlement times, so a position closed at
- * 7h59m has genuinely paid nothing. Prorating would invent a cost that was never incurred.
+ * Funding settlements CROSSED by the hold, in R, signed negative. Partial periods are deliberately
+ * not prorated: the venue charges funding at discrete settlement instants, so what matters is how
+ * many of those instants the position was open across — not how much wall-clock elapsed.
+ *
+ * Counted on the venue's own fixed UTC grid (00:00 / 08:00 / 16:00), not as elapsed-time-since-open.
+ * This used to be `floor((exitAtMs - openedAtMs) / 8h)`, which measures 8h blocks from whenever the
+ * position happened to open. For a hold of length L opened at phase offset r into a period, the true
+ * number of crossings is floor((r + L) / 8h) >= floor(L / 8h), with equality only when r === 0 — so
+ * the old form could only ever MATCH or UNDER-count real funding, never over-count, biasing paper
+ * netR cheaper than reality on essentially every close (almost no open lands exactly on the grid).
+ * The clearest case it got wrong: open 07:58 UTC, close 08:05 UTC pays one real funding charge but
+ * scored `floor(7min / 8h) = 0`.
+ *
+ * The epoch is itself 00:00 UTC and 8h divides 24h evenly, so `floor(t / 8h)` IS the grid index and
+ * the crossing count is just the difference. A settlement exactly at the open instant is not charged
+ * (the position did not hold across it); one exactly at the exit instant is.
  */
 export function paperFundingCostR(stopBps: number, openedAtMs?: number | null, exitAtMs?: number | null): number {
   if (!(stopBps > 0) || !finite(openedAtMs) || !finite(exitAtMs)) return 0;
   if (exitAtMs <= openedAtMs) return 0;
-  const periods = Math.floor((exitAtMs - openedAtMs) / EIGHT_HOURS_MS);
+  const periods = Math.floor(exitAtMs / EIGHT_HOURS_MS) - Math.floor(openedAtMs / EIGHT_HOURS_MS);
   return periods > 0 ? -((periods * PAPER_FUNDING_BPS_PER_8H) / stopBps) : 0;
 }
 
@@ -82,8 +95,31 @@ export function paperExitCostRV2(input: PaperCostV2Inputs): number {
   const { stopBps } = input;
   if (!(stopBps > 0)) return 0;
   const maker = input.costModel === "maker_limit";
-  const roundTripBps = maker ? input.makerRoundTripBps : input.takerRoundTripBps;
-  const feeOnlyFloorBps = maker ? input.makerRoundTripBps : input.realisticFeeBpsPerSide * 2;
+  // A maker_limit order posts its ENTRY as a resting limit, but its exit is only maker when a TP
+  // LIMIT fills. A stop-out exits at market, and so does a mark-to-market horizon close — both pay
+  // the TAKER rate on the way out. So the all-maker round trip applies to TP_LIKE only; the other
+  // two kinds are maker-in / taker-out.
+  //
+  // Both `roundTripBps` AND `feeOnlyFloorBps` used to be pinned to makerRoundTripBps for every kind,
+  // which meant the Math.max floor could not catch the shortfall either: the most a maker-lane
+  // stop-out could ever be charged was 4 + 12 = 16bps against a real ~19bps, a fixed ~3bps/stopBps
+  // undercharge on every maker-lane loss. current-guard-variant-matrix.ts flagged exactly this when
+  // MAKER_ROUNDTRIP_BPS was corrected to 4 ("that round trip is really 2 + 5 = 7 ... does NOT add
+  // the maker->taker fee difference (3 bps) there"), and deferred it as a cost-model change. This is
+  // that change. Undercharging losses specifically is the same asymmetry STOP_OUT_SLIPPAGE_BPS
+  // exists to remove: it flatters low-win-rate maker lanes.
+  const makerPerSideBps = input.makerRoundTripBps / 2;
+  const makerInTakerOutBps = makerPerSideBps + input.realisticFeeBpsPerSide;
+  const roundTripBps = !maker
+    ? input.takerRoundTripBps
+    : input.kind === "TP_LIKE"
+      ? input.makerRoundTripBps
+      : makerInTakerOutBps;
+  const feeOnlyFloorBps = !maker
+    ? input.realisticFeeBpsPerSide * 2
+    : input.kind === "TP_LIKE"
+      ? input.makerRoundTripBps
+      : makerInTakerOutBps;
   const stopOutExtraBps = input.kind === "STOP_LIKE" ? Math.max(0, input.stopOutSlippageBps) : 0;
   const chargedBps = Math.max(
     feeOnlyFloorBps,

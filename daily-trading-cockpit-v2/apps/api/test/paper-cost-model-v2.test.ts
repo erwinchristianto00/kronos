@@ -95,6 +95,86 @@ describe("funding charges completed periods only", () => {
   });
 });
 
+describe("[FUNDING-GRID] funding follows the venue's fixed UTC grid, not time-since-open", () => {
+  const H = 3_600_000;
+  const DAY = 24 * H;
+  // A day boundary in ms is grid-aligned by construction (the epoch is 00:00 UTC and 8h divides
+  // 24h), so `base + 7h58m` sits 2 minutes before a REAL 08:00 UTC settlement.
+  const base = 20_000 * DAY;
+
+  /**
+   * The case the old `floor((exit - open) / 8h)` form got wrong. A position opened at 07:58 UTC and
+   * closed at 08:05 UTC is held across one real funding settlement and pays for it; measuring 8h
+   * blocks from the open scored `floor(7min / 8h) = 0` and charged nothing.
+   */
+  it("charges a 7-minute hold that straddles a settlement", () => {
+    const cost = paperFundingCostR(300, base + 7 * H + 58 * 60_000, base + 8 * H + 5 * 60_000);
+    expect(cost).toBeCloseTo(-PAPER_FUNDING_BPS_PER_8H / 300, 9);
+    // The elapsed-time form would have returned exactly 0 here.
+    expect(cost).not.toBe(0);
+  });
+
+  /** The mirror case: a hold nearly 8h long that crosses NO settlement is still free. Length alone
+   *  decides nothing — only how many settlement instants the position spanned. */
+  it("charges nothing for an equally long hold that crosses no settlement", () => {
+    expect(paperFundingCostR(300, base + 8 * H + 1000, base + 15 * H)).toBe(0);
+  });
+
+  /** Old and new agree whenever the open happens to be phase-aligned, which is why every
+   *  pre-existing funding test (all opening at the epoch) kept passing through this change. */
+  it("still matches the elapsed-time answer when the open IS grid-aligned", () => {
+    expect(paperFundingCostR(300, base, base + 24 * H)).toBeCloseTo(-(3 * PAPER_FUNDING_BPS_PER_8H) / 300, 9);
+  });
+
+  /** Boundary convention: a settlement exactly at the open is not held across; one exactly at the
+   *  exit is. Stated explicitly so it cannot drift into an off-by-one later. */
+  it("excludes a settlement at the open instant and includes one at the exit instant", () => {
+    expect(paperFundingCostR(300, base, base + 8 * H - 1)).toBe(0);
+    expect(paperFundingCostR(300, base, base + 8 * H)).toBeCloseTo(-PAPER_FUNDING_BPS_PER_8H / 300, 9);
+  });
+});
+
+describe("[MAKER-STOP] a maker lane exits at market on a stop, and pays the taker rate to do it", () => {
+  const maker = (kind: "TP_LIKE" | "STOP_LIKE" | "MARK_TO_MARKET") =>
+    paperExitCostRV2({ ...REF, costModel: "maker_limit", kind, slipAlreadyInGrossBps: 0 });
+
+  /**
+   * A maker_limit order posts its ENTRY as a resting limit, but only a TP LIMIT fill exits as maker.
+   * A stop-out leaves at market and pays the 5bps taker rate, so the round trip is 2 + 5 = 7, not 4.
+   * Both roundTrip AND the fee floor used to be pinned to the all-maker constant, so the Math.max
+   * floor could not catch the shortfall: the most a maker stop-out could ever be charged was
+   * 4 + 12 = 16bps against a real 19bps — a fixed 3bps/stopBps undercharge on every maker-lane LOSS,
+   * i.e. the same flatter-the-low-win-rate-lane asymmetry STOP_OUT_SLIPPAGE_BPS exists to remove.
+   */
+  it("charges maker-in/taker-out plus the stop-out surcharge on a stop", () => {
+    expect(maker("STOP_LIKE")).toBeCloseTo(-(2 + 5 + 12) / 300, 9); // 19/300, was 16/300
+  });
+
+  it("leaves the all-maker basis on a TP, where both legs really are maker", () => {
+    expect(maker("TP_LIKE")).toBeCloseTo(-4 / 300, 9);
+  });
+
+  /** An MTM horizon close also exits at market — no resting limit protects it — so it carries the
+   *  taker exit fee too, while still paying NO stop-out surcharge (nothing was triggered). */
+  it("charges the taker exit on a mark-to-market close, but no stop-out surcharge", () => {
+    expect(maker("MARK_TO_MARKET")).toBeCloseTo(-(2 + 5) / 300, 9);
+  });
+
+  /** The floor must track the same basis, or it silently re-introduces the undercharge whenever
+   *  configured slippage is large enough to bind. */
+  it("floors a maker stop at the maker-in/taker-out fee, not at the all-maker fee", () => {
+    const overSlipped = paperExitCostRV2({
+      ...REF, costModel: "maker_limit", kind: "STOP_LIKE", slipAlreadyInGrossBps: 10_000,
+    });
+    expect(overSlipped).toBeCloseTo(-(2 + 5) / 300, 9); // floor binds at 7, not at 4
+  });
+
+  it("keeps a maker stop strictly cheaper than the taker equivalent", () => {
+    const takerStop = paperExitCostRV2({ ...REF, kind: "STOP_LIKE", slipAlreadyInGrossBps: 0 });
+    expect(maker("STOP_LIKE")).toBeGreaterThan(takerStop); // less negative
+  });
+});
+
 describe("it stays portable to an older instance", () => {
   /** The whole reason this file exists. An import here would drag live's missing dependency graph
    *  back in and the port would stall again. */

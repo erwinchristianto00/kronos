@@ -2367,17 +2367,37 @@ export class LiveExecutionEngine {
     return this.client.getIncomeHistory({ startTime: startTimeMs, endTime: endTimeMs });
   }
 
-  /** Actual commissions attributed to engine intents CLOSED today. Open-entry commissions are
-   * deliberately excluded so wallet reconciliation compares closed economics to closed economics. */
+  /**
+   * Actual commissions attributed to engine intents that REALIZED today. Open-entry commissions are
+   * deliberately excluded so wallet reconciliation compares closed economics to closed economics.
+   *
+   * Every TERMINAL state counts, not just "CLOSED" — matching `sweepCortexRealAttribution`'s
+   * `if (OPEN_INTENT_STATES.has(intent.state)) continue;`, the codebase's canonical "has this intent
+   * realized dollars" test. This used to filter `state === "CLOSED"` alone, which silently dropped
+   * every KILLED close (kill-switch flatten and operator panic-flatten) and every ERROR close
+   * (emergency flatten with no stop). All three of those paths set a real `intent.feesUsd` and feed
+   * `applyRealizedToLedger`, so their fees ARE inside `dailyLedger.realizedPnlUsd` — the numerator
+   * wallet-reconciliation grosses back up. Omitting them from the grossup understated
+   * comparisonInternalUsd by exactly the omitted fee sum and produced a spurious "WALLET
+   * RECONCILIATION MISMATCH" on precisely the days a kill-switch tripped, i.e. the days an operator
+   * most needs that signal to be trustworthy.
+   *
+   * Day bucket: `closedAt` when the path stamped one (both KILLED paths do), else `updatedAt`. The
+   * ERROR emergency-flatten path realizes P&L without stamping `closedAt`, and dropping it for want
+   * of a timestamp would reintroduce the same understatement it is being fixed for.
+   */
   getClosedTodayFeesUsd(): number {
     const dayUtc = this.nowIso().slice(0, 10);
     return this.store.getState().intents
-      .filter((intent) =>
-        intent.state === "CLOSED" &&
-        intent.closedAt?.startsWith(dayUtc) &&
-        typeof intent.feesUsd === "number" &&
-        Number.isFinite(intent.feesUsd),
-      )
+      .filter((intent) => {
+        if (OPEN_INTENT_STATES.has(intent.state)) return false;
+        const realizedAt = intent.closedAt ?? intent.updatedAt;
+        return (
+          realizedAt?.startsWith(dayUtc) === true &&
+          typeof intent.feesUsd === "number" &&
+          Number.isFinite(intent.feesUsd)
+        );
+      })
       .reduce((sum, intent) => sum + (intent.feesUsd ?? 0), 0);
   }
 

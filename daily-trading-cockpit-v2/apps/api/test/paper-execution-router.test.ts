@@ -1689,7 +1689,15 @@ describe("paper-execution-router", () => {
     const nowMs = Date.now();
     const dir = tmpDir();
     const store = new PaperExecutionRouterStore(dir);
-    const openedAtMs = nowMs - 150 * 60 * 60_000;
+    // Funding is counted by SETTLEMENTS CROSSED on the venue's fixed 8h UTC grid, not by elapsed
+    // time since the open. This close lands at ~`nowMs`, whose grid phase is arbitrary, so an open
+    // placed a raw 150h earlier spans either 18 or 19 settlements depending purely on when the suite
+    // happens to run — flaky by construction. Anchoring the open a whole number of settlements
+    // before the CURRENT grid point makes the crossing count exact (19) at any phase, while keeping
+    // the span >150h so it still exceeds the 1,000-candle page cap this case exists to prove.
+    const EIGHT_HOURS_MS = 8 * 60 * 60_000;
+    const FUNDING_PERIODS = 19;
+    const openedAtMs = Math.floor(nowMs / EIGHT_HOURS_MS) * EIGHT_HOURS_MS - FUNDING_PERIODS * EIGHT_HOURS_MS;
     store.add(
       makePaperOrder({
         paperOrderId: "runner-pagination-1",
@@ -1719,8 +1727,8 @@ describe("paper-execution-router", () => {
     expect(fiveMinuteCalls).toBeGreaterThan(1);
     expect(resolved.closeReason).toBe("MAX_HOLD_MTM");
     expect(resolved.closedAtMs).toBeGreaterThanOrEqual(openedAtMs + 150 * 60 * 60_000);
-    // Default ideal walk charges the 22bps taker round-trip + 18 completed 8h funding periods.
-    expect(resolved.costR!).toBeCloseTo(-(22 + 18 * 1.5) / 300, 10);
+    // Default ideal walk charges the 22bps taker round-trip + the funding settlements crossed.
+    expect(resolved.costR!).toBeCloseTo(-(22 + FUNDING_PERIODS * 1.5) / 300, 10);
   });
 
   // [25c] Guard: an order YOUNGER than the 72h horizon that has not hit TP/SL is

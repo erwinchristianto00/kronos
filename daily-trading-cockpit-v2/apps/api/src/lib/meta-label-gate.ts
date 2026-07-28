@@ -48,6 +48,7 @@ import { dirname, resolve } from "node:path";
 
 import { solveLinear } from "./cortex-brain.js";
 import { KRONOS_CONFIDENCE_SCALE_MAX } from "./kronos-agree-reading.js";
+import { selectNewestCostCohort } from "./paper-cost-cohort.js";
 
 function envNum(name: string, dflt: number): number {
   const v = Number(process.env[name]);
@@ -298,6 +299,9 @@ export interface MetaLabelOrderLike {
   selectedLaneId: string;
   paperStatus: string;
   netR: number | null;
+  /** Cost-model generation this order's netR was priced under. Generations are NOT comparable and
+   *  must never be pooled — see buildMetaLabelCohortTable. */
+  costModelVersion?: number | null;
   provenance?: { kronosBias: string | null; kronosConfidence: number | null } | null;
 }
 
@@ -573,6 +577,8 @@ export interface MetaLabelRecord {
   score: number | null;
   modelVersion: number | null;
   label?: { netR: number; win: boolean } | null;
+  /** Cost-model generation the labeled netR was priced under, frozen at label time alongside it. */
+  costModelVersion?: number | null;
   labeledAtIso?: string | null;
   /** Terminal without a usable netR (NO_FILL / CANCELED / REJECTED / DATA_FAILURE / netR-less
    *  expiry) — excluded from cohorts and training, counted honestly. */
@@ -668,12 +674,15 @@ export class MetaLabelStore {
 
   /** Exactly-once labeling: only an unlabeled, un-voided record accepts a label; the first label
    *  is FROZEN (a re-sweep of the same resolved order is a no-op). */
-  label(signalId: string, netR: number, atIso: string): boolean {
+  label(signalId: string, netR: number, atIso: string, costModelVersion?: number | null): boolean {
     const r = this.byId.get(signalId);
     if (!r || r.voided || (r.label != null && r.labeledAtIso != null)) return false;
     if (!finite(netR)) return false;
     r.label = { netR, win: netR > 0 };
     r.labeledAtIso = atIso;
+    // Frozen alongside the netR it describes: the cohort table must be able to tell two cost
+    // generations apart later, and the order it came from may be pruned from the paper store first.
+    r.costModelVersion = costModelVersion ?? null;
     return true;
   }
 
@@ -852,7 +861,7 @@ export async function runMetaLabelCycle(opts: {
     const order = orderById.get(record.signalId);
     if (!order || !isTerminalStatus(order.paperStatus)) continue;
     if (finite(order.netR)) {
-      if (store.label(record.signalId, order.netR, nowIso)) result.labeled += 1;
+      if (store.label(record.signalId, order.netR, nowIso, order.costModelVersion)) result.labeled += 1;
     } else if (store.void(record.signalId, nowIso)) {
       result.voided += 1;
     }
@@ -1036,13 +1045,21 @@ export function buildMetaLabelCohortTable(
     modelVersion?: number | null;
   } = {},
 ): MetaLabelCohortRow[] {
-  const population = records.filter(
+  const scored = records.filter(
     (r) =>
       r.label != null &&
       !r.voided &&
       finite(r.score) &&
       (opts.modelVersion == null || r.modelVersion === opts.modelVersion),
   );
+  // Second anti-pooling axis, for the same reason as modelVersion above. netR is the quantity every
+  // number in this table is built from, and a COST-MODEL generation change moves it with no edge
+  // change at all — so a mixed-generation population would drift ungatedNetAvgR/gatedNetAvgR/lift
+  // exactly the way pooling scorer versions was measured to on 2026-07-26 (pooled lift at tau=0.70
+  // read +0.0118R against true per-cohort answers of +0.0853R and −0.2125R; the pooled figure
+  // described neither cohort). If this lift is ever the basis for wiring the tau gate into live
+  // admission, it must not be an artifact of when the rows happened to close.
+  const population = selectNewestCostCohort(scored)?.rows ?? [];
   const allNets = population.map((r) => r.label!.netR);
   const ungatedNetAvgR = mean(allNets);
   const ungatedPF = pf(allNets);

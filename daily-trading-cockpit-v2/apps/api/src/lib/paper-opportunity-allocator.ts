@@ -52,6 +52,7 @@ import {
   type AdaptiveLaneRouterReport,
 } from "./adaptive-lane-router.js";
 import { applySubFloorExclusionForDecisions } from "./paper-subfloor-exclusion.js";
+import { selectNewestCostCohort } from "./paper-cost-cohort.js";
 import {
   PAPER_ADMISSION_MAX_AGE_MS,
   allocatorDedupeKey,
@@ -573,7 +574,7 @@ export function computeAutoQuarantinedVariantLanes(orders: readonly PaperOrder[]
   // gives +0.4428 over 4). With the flag off this is the caller's own array, unfiltered.
   const scoped = applySubFloorExclusionForDecisions(orders);
   const variantSuffixes = new Set<string>(VARIANT_MATRIX_DIAGNOSTIC_IDS);
-  const byLane = new Map<string, { closed: number; sumNetR: number }>();
+  const byLane = new Map<string, PaperOrder[]>();
   for (const o of scoped) {
     const id = o.selectedLaneId;
     if (!id) continue;
@@ -581,16 +582,23 @@ export function computeAutoQuarantinedVariantLanes(orders: readonly PaperOrder[]
     const suffix = id.slice(id.indexOf(":") + 1);
     if (!variantSuffixes.has(suffix)) continue;
     if (o.netR == null || !Number.isFinite(o.netR)) continue; // resolved win/loss only (skip open/no-fill)
-    const agg = byLane.get(id) ?? { closed: 0, sumNetR: 0 };
-    agg.closed += 1;
-    agg.sumNetR += o.netR;
-    byLane.set(id, agg);
+    const bucket = byLane.get(id);
+    if (bucket) bucket.push(o);
+    else byLane.set(id, [o]);
   }
   const out: string[] = [];
-  for (const [id, agg] of byLane) {
-    if (agg.closed >= AUTO_QUARANTINE_MIN_CLOSED && agg.sumNetR / agg.closed <= AUTO_QUARANTINE_MAX_NETAVGR) {
-      out.push(id);
-    }
+  for (const [id, rows] of byLane) {
+    // NEVER pool cost-model generations. A generation change moves netR with no edge change at all
+    // (the v1->v2 cutover moved maker lanes up to +16bps/stopBps and taker stop-heavy lanes -5bps),
+    // and this function HALTS a lane's paper admission with no human in the loop — so a pooled
+    // average could flip admission on or off purely from bookkeeping and leave no record that a
+    // cost-model changeover, not an edge change, was the cause. Judge the newest generation that
+    // carries a full sample; if none does, that is the same "not enough evidence" answer
+    // AUTO_QUARANTINE_MIN_CLOSED already encodes, and it fails toward NOT quarantining.
+    const cohort = selectNewestCostCohort(rows, AUTO_QUARANTINE_MIN_CLOSED);
+    if (!cohort) continue;
+    const netAvgR = cohort.rows.reduce((sum, o) => sum + (o.netR as number), 0) / cohort.rows.length;
+    if (netAvgR <= AUTO_QUARANTINE_MAX_NETAVGR) out.push(id);
   }
   return out;
 }
