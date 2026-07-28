@@ -240,8 +240,43 @@ export function decideDirection(input: DirectionInput): DirectionDecision {
   // still competes — it just has to beat flatScore, which the bothMissing floor already raises to 0.6.
   const longStanding = edgeStanding(longEdge, input.longEdgeN, hurdle);
   const shortStanding = edgeStanding(shortEdge, input.shortEdgeN, hurdle);
-  const longClears = longScore > flatScore && longStanding !== "PROVEN_BELOW";
-  const shortClears = shortScore > flatScore && shortStanding !== "PROVEN_BELOW";
+  /**
+   * EXPLORATION PASS (2026-07-28) — the repair the LONG block's note promised but never delivered.
+   *
+   * `edgeSub(null) === 0` is deliberate and stays: omitting the term for an unmeasured side was
+   * tried on 2026-07-25 and reverted because averaging over the survivors INFLATES a no-evidence
+   * side above a measured-good one. That note then says the "structural unreachability it used to
+   * cause is fixed at the ACTION GATE instead, via edgeStanding()". It is not: edgeStanding only
+   * stops absence from DISQUALIFYING a side, while the gate below still requires
+   * `score > flatScore`, and a side whose only sub-signal is edgeSub(null) scores 0 against a FLAT
+   * baseline of 0.35 (0.6 when both edges are missing). Absence was non-disqualifying and still
+   * unreachable.
+   *
+   * Measured consequence on the live store: SHORT has produced **ZERO decisions in this store's
+   * entire life**, while LONG sits at n=305 / −0.475R. SHORT cannot score without an edge, and
+   * cannot acquire an edge without ever being chosen. A closed loop, not a verdict.
+   *
+   * So a side may also clear when it is UNPROVEN and the opposite side is PROVEN_BELOW: the only
+   * MEASURED alternative has been proven bad, and standing aside forever then means never learning
+   * whether the other direction works. This is the "exploration of ONE under-measured direction"
+   * the BOTH-gate comment below already describes as the intent.
+   *
+   * Deliberately narrow, and it cannot reopen the 2026-07-25 regression:
+   *   • never fires while the opposite side is PROVEN_ABOVE — a strong measured side still wins;
+   *   • never fires when both sides are UNPROVEN — with no information either way, FLAT is right;
+   *   • never fires against a veto, and PROVEN_BELOW still bars the side outright;
+   *   • BOTH is untouched: it requires both sides PROVEN_ABOVE, so exploration can never open two.
+   */
+  const explorationOpen = (self: EdgeStanding, other: EdgeStanding): boolean =>
+    self === "UNPROVEN" && other === "PROVEN_BELOW";
+  const longExplores =
+    explorationOpen(longStanding, shortStanding) && !input.longVeto && !input.fourBrainLongVeto;
+  const shortExplores =
+    explorationOpen(shortStanding, longStanding) && !input.shortVeto && !input.fourBrainShortVeto;
+  if (longExplores) supporting.push("LONG unmeasured while SHORT is proven-below → exploration pass (not conviction)");
+  if (shortExplores) supporting.push("SHORT unmeasured while LONG is proven-below → exploration pass (not conviction)");
+  const longClears = (longScore > flatScore || longExplores) && longStanding !== "PROVEN_BELOW";
+  const shortClears = (shortScore > flatScore || shortExplores) && shortStanding !== "PROVEN_BELOW";
   // 2026-07-26: report evidence standing UNCONDITIONALLY. The UNPROVEN notes below used to be gated
   // on `&& xClears`, i.e. announced only when the thin evidence did NOT bind, and silent in exactly
   // the case an operator needs to see — a side sitting on real but sub-threshold evidence that never
@@ -276,9 +311,16 @@ export function decideDirection(input: DirectionInput): DirectionDecision {
   if (bothProven && longClears && shortClears && Math.abs(longScore - shortScore) < 0.2 && Math.min(longScore, shortScore) >= 0.5) {
     action = "BOTH"; // genuinely independent two-sided opportunity (repo has both long + short lanes)
     supporting.push("independent two-sided edge → BOTH");
-  } else if (longClears && longScore >= shortScore) {
+    // 2026-07-28: compare only among sides that actually CLEARED. These used to read
+    // `longClears && longScore >= shortScore` / `shortClears && shortScore > longScore`, which let a
+    // side that did NOT clear still veto the one that did, purely by out-scoring it — so a cleared
+    // side could lose to a barred one and the action fell through to FLAT. That silently cancelled
+    // the exploration pass above (an exploring side scores 0 by construction, since its only
+    // sub-signal is edgeSub(null)), and it was already wrong on its own terms. Behaviour when BOTH
+    // clear is unchanged: higher score wins, ties go LONG.
+  } else if (longClears && (!shortClears || longScore >= shortScore)) {
     action = "LONG";
-  } else if (shortClears && shortScore > longScore) {
+  } else if (shortClears) {
     action = "SHORT";
   } else {
     action = "FLAT";
