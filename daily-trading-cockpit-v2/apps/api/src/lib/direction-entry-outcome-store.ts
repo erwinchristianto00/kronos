@@ -152,6 +152,11 @@ export interface EntryOutcomeRecord {
   /** Tier 2 only — see entry-brain-tier2-simulated-resolver.ts's own doc. Null for Tier 1 (n/a) and for
    *  EXPIRED_UNRESOLVABLE rows that never reached a tier. */
   horizonTruncated: boolean | null;
+  /** Tier 2 SKIP only: the netR an immediate entry WOULD have earned on the same path — the actual
+   *  cost of the caution. evaluateEntryActions has always computed it; it was simply never carried
+   *  here, which left SKIP (97% of all Entry decisions) permanently unevaluable. Null everywhere
+   *  else. */
+  opportunityCostR?: number | null;
   /** Tier 1 only — the PositionPath.key of the real close this row was joined to (verbatim from
    *  EntryBrainTier1ResolvedRow.matchedCloseKey). Recorded here (and in the store's own persisted
    *  claimed-key set — see hasClaimedTier1CloseKey) so the reconciler can exclude an already-claimed
@@ -191,6 +196,14 @@ interface RateAggregate {
    *  there; equals n for Direction (regretR always finite) ⇒ unchanged behavior there. See rateView. */
   regretTrackedN: number;
   cumCalibrationGapR: number;
+  /** SKIP's OPPORTUNITY COST — the netR an immediate entry WOULD have earned on the same path.
+   *  entry-exit-counterfactual.ts has always attached this to the SKIP result (`opportunityCostR:
+   *  now.netR`) and it was dropped on the floor, which left SKIP — 97% of every Entry decision — as
+   *  the one action that could never be evaluated at all: its own realizedNetR is null by design
+   *  (NOT_ENTERED), so "was the caution right?" had no number anywhere. Positive means declining
+   *  cost money; negative means it saved money. Separate counter because only SKIP rows supply it. */
+  cumOpportunityCostR: number;
+  opportunityCostN: number;
   calibrationN: number; // count of rows with a non-null calibrationGapR — direction only
 }
 
@@ -203,7 +216,7 @@ function emptyRateAggregate(): RateAggregate {
     netRTrackedN: 0,
     cumRegretR: 0,
     regretTrackedN: 0,
-    cumCalibrationGapR: 0,
+    cumCalibrationGapR: 0, cumOpportunityCostR: 0, opportunityCostN: 0,
     calibrationN: 0,
   };
 }
@@ -388,6 +401,10 @@ function sanitizeRateAggregate(raw: unknown): RateAggregate {
     regretTrackedN: nonNegInt(c.regretTrackedN),
     cumCalibrationGapR: finiteOr(c.cumCalibrationGapR, 0),
     calibrationN: nonNegInt(c.calibrationN),
+    // Pre-existing persisted state predates opportunity-cost tracking; 0 is correct there (no SKIP row
+    // ever supplied one), and the counter gate means a 0/0 bucket reports null rather than a fake 0R.
+    cumOpportunityCostR: Number.isFinite(c.cumOpportunityCostR) ? (c.cumOpportunityCostR as number) : 0,
+    opportunityCostN: nonNegInt(c.opportunityCostN),
   };
 }
 
@@ -416,6 +433,8 @@ interface RateView {
   cumNetR: number;
   meanRegretR: number | null;
   meanCalibrationGapR: number | null;
+  /** SKIP only: mean netR an immediate entry would have earned. Positive ⇒ the caution cost money. */
+  meanOpportunityCostR: number | null;
 }
 function rateView(agg: RateAggregate, sampleSizeForGate?: number): RateView {
   const gateSize = sampleSizeForGate ?? agg.n;
@@ -445,10 +464,13 @@ function rateView(agg: RateAggregate, sampleSizeForGate?: number): RateView {
     // even track.
     meanRegretR: !insufficientData && agg.regretTrackedN > 0 ? round4(agg.cumRegretR / agg.regretTrackedN) : null,
     meanCalibrationGapR: !insufficientData && agg.calibrationN > 0 ? round4(agg.cumCalibrationGapR / agg.calibrationN) : null,
+    // Gated on its own counter: only SKIP rows carry an opportunity cost, so dividing by n would
+    // report a fabricated "+0.000R" on every other action.
+    meanOpportunityCostR: !insufficientData && agg.opportunityCostN > 0 ? round4(agg.cumOpportunityCostR / agg.opportunityCostN) : null,
   };
 }
 
-function addToRateAggregate(agg: RateAggregate, win: 0 | 1 | null, netR: number | null, regretR: number | null, calibrationGapR: number | null): void {
+function addToRateAggregate(agg: RateAggregate, win: 0 | 1 | null, netR: number | null, regretR: number | null, calibrationGapR: number | null, opportunityCostR: number | null = null): void {
   agg.n += 1;
   if (win !== null) {
     agg.winTrackedN += 1;
@@ -461,6 +483,10 @@ function addToRateAggregate(agg: RateAggregate, win: 0 | 1 | null, netR: number 
   if (regretR != null && Number.isFinite(regretR)) {
     agg.cumRegretR += regretR;
     agg.regretTrackedN += 1;
+  }
+  if (opportunityCostR != null && Number.isFinite(opportunityCostR)) {
+    agg.cumOpportunityCostR += opportunityCostR;
+    agg.opportunityCostN += 1;
   }
   if (calibrationGapR != null && Number.isFinite(calibrationGapR)) {
     agg.cumCalibrationGapR += calibrationGapR;
@@ -759,7 +785,7 @@ export class DirectionEntryOutcomeStore {
         const actionKey = `${tier}|${record.action}|${record.confidence}`;
         const actionAgg =
           e.perActionConfidence[actionKey] ?? { ...emptyRateAggregate(), tier, action: record.action, confidence: record.confidence };
-        addToRateAggregate(actionAgg, win, record.realizedNetR, null, null);
+        addToRateAggregate(actionAgg, win, record.realizedNetR, null, null, record.opportunityCostR ?? null);
         e.perActionConfidence[actionKey] = actionAgg;
 
         const rawLaneKey = record.laneId ? `${tier}|${record.laneId}` : `${tier}|${OVERFLOW_ID}`;

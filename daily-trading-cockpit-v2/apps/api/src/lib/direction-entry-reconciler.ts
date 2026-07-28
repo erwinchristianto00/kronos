@@ -406,6 +406,9 @@ export async function runDirectionEntryReconciliationCycle(
           realizedNetR: tier2Result.result.outcome.netR,
           realizedRSource: null,
           horizonTruncated: tier2Result.horizonTruncated,
+          // SKIP's real cost of caution — computed by evaluateEntryActions all along and dropped here
+          // until 2026-07-28, which is why SKIP could never be judged despite being 97% of decisions.
+          opportunityCostR: tier2Result.result.opportunityCostR ?? null,
           matchedCloseKey: null,
         };
         const booked = deps.store.recordEntryOutcome(record, { deferSave: true });
