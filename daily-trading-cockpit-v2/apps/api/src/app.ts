@@ -1967,7 +1967,11 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         executor = new CrossSectionalExecutor({
           client: liveClient,
           signalStore: asCrossSectionalSignalStore(descriptor.observations),
-          store: new CrossSectionalExecutorStore("data", `innovation-${descriptor.laneId.toLowerCase()}.json`),
+          store: new CrossSectionalExecutorStore(
+            "data",
+            `innovation-${descriptor.laneId.toLowerCase()}.json`,
+            Date.now() - innovationFreshMs(),
+          ),
           targetVariant: "FILTERED",
           laneId: descriptor.laneId,
           idNamespace: descriptor.laneId,

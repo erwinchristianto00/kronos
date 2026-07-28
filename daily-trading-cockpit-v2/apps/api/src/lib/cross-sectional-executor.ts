@@ -275,7 +275,11 @@ export class CrossSectionalExecutorStore {
   private readonly file: string;
   private state: ExecutorState;
 
-  constructor(dataDir = "data", fileName = "cross-sectional-executor.json") {
+  constructor(
+    dataDir = "data",
+    fileName = "cross-sectional-executor.json",
+    private readonly initialLastSeenSignalMs = Date.now(),
+  ) {
     this.file = resolve(dataDir, fileName);
     try {
       mkdirSync(dirname(this.file), { recursive: true });
@@ -312,7 +316,7 @@ export class CrossSectionalExecutorStore {
     } catch {
       // corrupt → fresh (positions reconcile against the exchange on next tick)
     }
-    return { version: 1, baskets: [], lastSeenSignalMs: Date.now(), orphanedLegs: [] };
+    return { version: 1, baskets: [], lastSeenSignalMs: this.initialLastSeenSignalMs, orphanedLegs: [] };
   }
 
   getState(): ExecutorState {

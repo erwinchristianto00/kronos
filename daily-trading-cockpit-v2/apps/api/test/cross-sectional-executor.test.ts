@@ -206,6 +206,12 @@ function makeExecutor(opts: { client?: FakeExecClient; allowed?: boolean; laneWe
 }
 
 describe("cross-sectional executor (basket execution, testnet-first)", () => {
+  it("supports an explicit first-boot watermark while preserving the default replay guard", () => {
+    const initialWatermark = NOW_MS - 60 * 60_000;
+    const store = new CrossSectionalExecutorStore(tmpDir(), "innovation.json", initialWatermark);
+    expect(store.getState().lastSeenSignalMs).toBe(initialWatermark);
+  });
+
   it("opens the FULL hedged basket from a fresh FILTERED signal (long buy + short sell, sized per leg USD)", async () => {
     const { executor, client, store } = makeExecutor({ signalMs: NOW_MS - 5 * 60_000 });
     await executor.tick();
