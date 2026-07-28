@@ -60,11 +60,15 @@ export function innovationTestnetAdmissionAllowed(canOpenIgnoringManualDirection
   return canOpenIgnoringManualDirectional;
 }
 
-/** An absent allocation is permissive on testnet; an explicit positive allocation scales size. */
+/** Innovation collection is full test-size; allocation is informational and cannot starve it. */
 export function innovationTestnetWeight(selectedWeightPct: number): number {
-  return Number.isFinite(selectedWeightPct) && selectedWeightPct > 0
-    ? Math.min(100, selectedWeightPct)
-    : 100;
+  void selectedWeightPct;
+  return 100;
+}
+
+export function innovationTestnetLegUsd(configured: number): number {
+  // Binance USD-M testnet currently rejects non-reduce-only orders below 50 USDT.
+  return Number.isFinite(configured) && configured > 0 ? Math.max(55, configured) : 55;
 }
 
 export function startInnovationTestnetExecutorSchedule(

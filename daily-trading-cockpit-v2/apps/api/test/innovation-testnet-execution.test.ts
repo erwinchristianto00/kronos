@@ -6,6 +6,7 @@ import {
   fundingCarryBaskets,
   hedgedResidualBaskets,
   innovationTestnetAdmissionAllowed,
+  innovationTestnetLegUsd,
   innovationTestnetWeight,
   isInnovationTestnetExecutionEnabled,
   singleSignalsForDirection,
@@ -32,7 +33,10 @@ describe("innovation testnet execution adapters", () => {
     expect(innovationTestnetAdmissionAllowed(false)).toBe(false);
     expect(innovationTestnetWeight(0)).toBe(100);
     expect(innovationTestnetWeight(Number.NaN)).toBe(100);
-    expect(innovationTestnetWeight(35)).toBe(35);
+    expect(innovationTestnetWeight(35)).toBe(100);
+    expect(innovationTestnetLegUsd(Number.NaN)).toBe(55);
+    expect(innovationTestnetLegUsd(10)).toBe(55);
+    expect(innovationTestnetLegUsd(75)).toBe(75);
   });
 
   it("starts the executor immediately before registering its five-minute interval", async () => {

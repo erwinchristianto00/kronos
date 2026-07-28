@@ -43,6 +43,7 @@ import {
   fundingCarryBaskets,
   hedgedResidualBaskets,
   innovationTestnetAdmissionAllowed,
+  innovationTestnetLegUsd,
   innovationTestnetWeight,
   isInnovationTestnetExecutionEnabled,
   singleSignalsForDirection,
@@ -1933,7 +1934,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       };
       const innovationLegUsd = (): number => {
         const configured = Number(process.env.INNOVATION_TESTNET_LEG_USD);
-        return Number.isFinite(configured) && configured > 0 ? configured : 10;
+        return innovationTestnetLegUsd(configured);
       };
       const innovationLeverage = (): number => {
         const configured = Number(process.env.INNOVATION_TESTNET_LEVERAGE);
