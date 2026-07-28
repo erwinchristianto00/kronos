@@ -58,7 +58,37 @@ import type {
 } from "./four-brain-outcome-ledger.js";
 
 /** Newest-N detail records kept on disk per section (aggregates keep counting past this). */
-const MAX_DIRECTION_RECORDS = 800;
+/**
+ * THIS CAP DECIDES WHETHER THE FOUR-BRAIN CAN EVER INFLUENCE A DECISION (2026-07-28).
+ *
+ * The four-brain is a measurement layer with exactly ONE wire into anything decisional:
+ * direction-brain.ts:189/:216 halves the LONG/SHORT score when
+ * `fourBrainLongVeto`/`fourBrainShortVeto` is set. That flag comes from
+ * fourBrainEdgeVerdict(...) === "VETO_NEGATIVE", which requires
+ * `effectiveN >= MIN_SAMPLES` (= EDGE_MIN_SAMPLES = 30), where effectiveN counts DISTINCT
+ * `floor(asOfMs / HORIZON_MS)` blocks — not rows.
+ *
+ * So the veto needs 30 x 4h = 120h of retained coverage for INTRADAY and 30 x 24h = 720h for
+ * SWING. At the observed decision rate 800 records spanned ~53h. The gate was therefore
+ * unreachable by ~2.3x for INTRADAY and ~13.6x for SWING, at any tick rate faster than one per
+ * ~18 minutes: the system measured LONG/INTRADAY at -0.475R over n=305 and reported it to the
+ * operator as "insufficient evidence", because the evidence had already been evicted.
+ *
+ * Note the asymmetry this replaces: MAX_ENTRY_RECORDS was 2500 while the DIRECTION side — the
+ * only one wired to a decision — got 800. Nothing documented that choice.
+ *
+ * 2000 records is ~120h at the observed rate (~15/h), i.e. INTRADAY becomes reachable and the
+ * veto can finally be EVALUATED. SWING stays out of reach on purpose: it would need ~11k records
+ * (~30MB), and there is no point paying that until INTRADAY shows the wire works at all.
+ *
+ * Raising this does NOT connect the brains to execution — the four-brain remains report-only, and
+ * on mainnet it is off entirely (FOUR_BRAIN_MODE=off). It only makes a designed gate observable
+ * instead of arithmetically impossible.
+ */
+export function maxDirectionRecords(env: NodeJS.ProcessEnv = process.env): number {
+  return Math.max(800, Math.floor(Number(env.FOUR_BRAIN_MAX_DIRECTION_RECORDS) || 2000));
+}
+const MAX_DIRECTION_RECORDS = maxDirectionRecords();
 const MAX_ENTRY_RECORDS = 2500;
 /** Dedup ids retained (FIFO), sized well above the ledger's own capacities (500 direction / 2000 entry)
  *  so a resolved id cannot be re-offered and double-booked for a long horizon. */
