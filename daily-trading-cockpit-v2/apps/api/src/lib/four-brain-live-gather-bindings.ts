@@ -304,7 +304,26 @@ export function unrealizedRFromPosition(side: "LONG" | "SHORT", entry: number | 
 /** Build the pure assembler's input from the live deps. Deterministic in deps. */
 export function buildFourBrainGatherInput(dep: FourBrainBindingDeps): FourBrainGatherInput {
   const nowMs = dep.nowMs;
-  const horizons = dep.horizons ?? (["INTRADAY", "SWING"] as DirectionHorizon[]);
+  /**
+   * 2026-07-28: SCALP added. It was absent from this default — not because nothing could call it,
+   * but because this one line never listed it, and the dashboard has therefore shown SCALP/LONG and
+   * SCALP/SHORT at "0 independent samples" for the layer's entire life while enumerating them as
+   * gaps. A horizon nobody ever asks for reads identically to one that is failing.
+   *
+   * Adding it is a real measurement, not a filled-in blank: the brain makes a genuine 1h directional
+   * call and direction-brain-resolver.ts scores it against the price move that actually happened,
+   * exactly as it does for the other two.
+   *
+   * And it is the fastest evidence this layer can produce. effectiveN counts DISTINCT horizon
+   * blocks, so at 1h SCALP accumulates 4x faster than INTRADAY and 24x faster than SWING: it reaches
+   * the ≥20 readiness bar in roughly a day, against ~5 days for INTRADAY and ~20 for SWING. The
+   * readiness verdict has nothing to report until some horizon clears that bar, so the shortest loop
+   * is worth more than the longest one here.
+   *
+   * Cost is one extra Direction evaluation per tick — the brain is a pure function and the tick runs
+   * every five minutes.
+   */
+  const horizons = dep.horizons ?? (["SCALP", "INTRADAY", "SWING"] as DirectionHorizon[]);
   const validityMs = dep.marketValidityMs ?? 15 * 60_000;
 
   // ── Market State readings ──
