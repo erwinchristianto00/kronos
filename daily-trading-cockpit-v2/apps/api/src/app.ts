@@ -33,9 +33,26 @@ import { buildCrossSectionalReport, getCrossSectionalStore } from "./lib/cross-s
 import {
   SingleSymbolLaneExecutor,
   SingleSymbolLaneExecutorStore,
+  makeFixedRewardExitPolicy,
+  makeMfeGivebackExitPolicy,
   type PublicQuoteSnapshot,
   type SingleSymbolExitPolicy,
 } from "./lib/single-symbol-lane-executor.js";
+import {
+  asCrossSectionalSignalStore,
+  fundingCarryBaskets,
+  hedgedResidualBaskets,
+  isInnovationTestnetExecutionEnabled,
+  singleSignalsForDirection,
+} from "./lib/innovation-testnet-execution.js";
+import { BLS_LANE_ID, getBtcLeadLagSnapStore } from "./lib/btc-leadlag-snap-edge.js";
+import { FC_PAPER_LANE_ID, getFundingCarryStore } from "./lib/funding-carry-edge.js";
+import { FC_V2_LANE_ID, getFundingCarryCrowdingV2Store } from "./lib/funding-carry-crowding-v2.js";
+import { HRS_V2_LANE_ID, getHedgedResidualShortV2Store } from "./lib/hedged-residual-short-v2.js";
+import { LQR_LANE_ID, getLiqRecoilStore } from "./lib/liq-recoil-edge.js";
+import { LQR_V2_LANE_ID, getLiqRecoilStrictReclaimV2Store } from "./lib/liq-recoil-strict-reclaim-v2.js";
+import { CE_V2_LANE_ID, getCompressionRetestV2Store } from "./lib/compression-retest-v2.js";
+import { QITF_LANE_ID, getQueueImbalanceToxicFlowStore } from "./lib/queue-imbalance-toxic-flow-edge.js";
 import {
   getShortFadeStore,
   isShortFadeExecEnabled,
@@ -414,6 +431,11 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
   // panic-washout-reclaim-edge.ts. Wired straight to live on operator's explicit request with ZERO
   // prior measurement of this exact 3-stage signal.
   let panicWashoutExecutor: SingleSymbolLaneExecutor | null = null;
+  // Testnet-only bridge from /research observations into the proven exchange executors. These
+  // arrays stay empty on research/mainnet, making the feature structurally incapable of touching
+  // real-money 3103 even if an innovation flag is accidentally copied there.
+  const innovationBasketExecutors: CrossSectionalExecutor[] = [];
+  const innovationSingleSymbolExecutors: SingleSymbolLaneExecutor[] = [];
   let regimeAutopilot: RegimeAutopilot | null = null;
   let unifiedOrchestrator: UnifiedTestnetOrchestrator | null = null;
   let unifiedProposalStore: UnifiedTestnetProposalStore | null = null;
@@ -438,6 +460,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     crossSectionalExecutor,
     crossSectionalTrendExecutor,
     crossSectionalMixedExecutor,
+    ...innovationBasketExecutors,
   ];
   const allSingleSymbolLaneExecutors = (): Array<SingleSymbolLaneExecutor | null> => [
     shortFadeExecutor,
@@ -449,6 +472,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     compositeEstimatorFastLongExecutor,
     compositeEstimatorFastShortExecutor,
     panicWashoutExecutor,
+    ...innovationSingleSymbolExecutors,
   ];
   /** Notional already committed to `symbol` by every OTHER single-symbol executor (excludes
    *  `self` — an instance's own admission is already bounded by its own maxOpenPositions, and
@@ -1892,6 +1916,143 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       }
     }
 
+    // /research innovation execution bridge. This is deliberately testnet-only and has no
+    // strategy-evidence, promotion, quarantine, regime, edge-memory, or unified-orchestrator gate.
+    // It still uses the established executors, so armed/kill/drain state, exchange filters,
+    // one-way netting, protective stops, allocation, notional caps, and cluster caps remain intact.
+    if (liveEngine && isInnovationTestnetExecutionEnabled(liveConfig.env)) {
+      const engineForGate = liveEngine;
+      const innovationAllowed = (laneId: string): boolean =>
+        engineForGate.canOpenNewEntriesIgnoringManualDirectional() &&
+        engineForGate.laneSelectionAllowsLane(laneId);
+      const innovationLegUsd = (): number => {
+        const configured = Number(process.env.INNOVATION_TESTNET_LEG_USD);
+        return Number.isFinite(configured) && configured > 0 ? configured : 10;
+      };
+      const innovationLeverage = (): number => {
+        const configured = Number(process.env.INNOVATION_TESTNET_LEVERAGE);
+        return Number.isFinite(configured) && configured >= 1 ? Math.floor(configured) : 3;
+      };
+      const innovationMaxOpen = (): number => {
+        const configured = Number(process.env.INNOVATION_TESTNET_MAX_OPEN_PER_EXECUTOR);
+        return Number.isFinite(configured) && configured >= 1 ? Math.floor(configured) : 4;
+      };
+      const innovationFreshMs = (): number => {
+        const configured = Number(process.env.INNOVATION_TESTNET_MAX_SIGNAL_AGE_MS);
+        return Number.isFinite(configured) && configured >= 60_000 ? Math.floor(configured) : 60 * 60_000;
+      };
+
+      const basketDescriptors = [
+        {
+          laneId: FC_PAPER_LANE_ID,
+          observations: () => fundingCarryBaskets(getFundingCarryStore().all),
+        },
+        {
+          laneId: FC_V2_LANE_ID,
+          observations: () => fundingCarryBaskets(getFundingCarryCrowdingV2Store().all),
+        },
+        {
+          laneId: HRS_V2_LANE_ID,
+          observations: () => hedgedResidualBaskets(getHedgedResidualShortV2Store().all),
+        },
+      ];
+      for (const descriptor of basketDescriptors) {
+        let executor: CrossSectionalExecutor;
+        executor = new CrossSectionalExecutor({
+          client: liveClient,
+          signalStore: asCrossSectionalSignalStore(descriptor.observations),
+          store: new CrossSectionalExecutorStore("data", `innovation-${descriptor.laneId.toLowerCase()}.json`),
+          targetVariant: "FILTERED",
+          laneId: descriptor.laneId,
+          idNamespace: descriptor.laneId,
+          enabled: () => true,
+          isAllowed: () => innovationAllowed(descriptor.laneId),
+          laneWeightPct: () => engineForGate.laneSelectionWeightPctForLane(descriptor.laneId),
+          rawLaneWeightPct: () => engineForGate.rawLaneAllocationWeightPctForLane(descriptor.laneId),
+          cortexRealAttribution: getCortexRealAttributionStore(),
+          executionFillRecorder: getExecutionFillRecorder(),
+          entryHealthGate: () => ({ allowed: true, reason: null }),
+          legUsd: innovationLegUsd,
+          leverage: innovationLeverage,
+          maxOpenBaskets: innovationMaxOpen,
+          maxSignalAgeMs: innovationFreshMs,
+          dailyMaxLossUsd: () => 0,
+          respectSignalRiskGeometry: true,
+          siblingOpenLegs: () =>
+            allCrossSectionalLaneExecutors()
+              .filter((candidate): candidate is CrossSectionalExecutor => candidate !== null && candidate !== executor)
+              .flatMap((candidate) => candidate.getOpenUnexitedLegs()),
+          siblingDailyRealizedUsd: (nowIso) =>
+            allCrossSectionalLaneExecutors()
+              .filter((candidate): candidate is CrossSectionalExecutor => candidate !== null && candidate !== executor)
+              .reduce((sum, candidate) => sum + candidate.getDailyRealizedUsd(nowIso), 0),
+          sharedGetPositions,
+          existingNotionalForSymbol: (symbol) => crossSectionalNotionalForSymbolExcluding(executor, symbol),
+          maxNotionalPerSymbolAcrossLanes,
+        });
+        innovationBasketExecutors.push(executor);
+      }
+
+      const singleDescriptors = [
+        { laneId: BLS_LANE_ID, observations: () => getBtcLeadLagSnapStore().all, policy: "FIXED" },
+        { laneId: LQR_LANE_ID, observations: () => getLiqRecoilStore().all, policy: "FIXED" },
+        { laneId: LQR_V2_LANE_ID, observations: () => getLiqRecoilStrictReclaimV2Store().all, policy: "FIXED" },
+        { laneId: CE_V2_LANE_ID, observations: () => getCompressionRetestV2Store().all, policy: "TRAIL" },
+        { laneId: QITF_LANE_ID, observations: () => getQueueImbalanceToxicFlowStore().all, policy: "FIXED" },
+      ] as const;
+      for (const descriptor of singleDescriptors) {
+        for (const direction of ["LONG", "SHORT"] as const) {
+          let executor: SingleSymbolLaneExecutor;
+          executor = new SingleSymbolLaneExecutor({
+            client: liveClient,
+            store: new SingleSymbolLaneExecutorStore(
+              "data",
+              `innovation-${descriptor.laneId.toLowerCase()}-${direction.toLowerCase()}.json`,
+            ),
+            laneId: descriptor.laneId,
+            direction,
+            getOpenSignals: () => singleSignalsForDirection(descriptor.observations(), direction),
+            exitPolicy:
+              descriptor.policy === "TRAIL"
+                ? makeMfeGivebackExitPolicy({ armR: 0.5, givebackFrac: 0.5, maxHoldMs: 7 * 24 * 3_600_000 })
+                : makeFixedRewardExitPolicy({ rewardMultiple: 100, maxHoldMs: 7 * 24 * 3_600_000 }),
+            isAllowed: () => innovationAllowed(descriptor.laneId),
+            laneWeightPct: () => engineForGate.laneSelectionWeightPctForLane(descriptor.laneId),
+            rawLaneWeightPct: () => engineForGate.rawLaneAllocationWeightPctForLane(descriptor.laneId),
+            cortexRealAttribution: getCortexRealAttributionStore(),
+            positionPathRecorder: getPositionPathRecorder(),
+            executionFillRecorder: getExecutionFillRecorder(),
+            legUsd: innovationLegUsd,
+            leverage: innovationLeverage,
+            maxOpenPositions: innovationMaxOpen,
+            maxSignalAgeMs: innovationFreshMs,
+            dailyMaxLossUsd: () => 0,
+            existingNotionalForSymbol: (symbol) => notionalForSymbolExcluding(executor, symbol),
+            maxNotionalPerSymbolAcrossLanes,
+            existingClusterOpenSymbols: (symbol, entryDirection) =>
+              clusterOpenSymbolsExcluding(executor, symbol, entryDirection),
+            maxClusterPositionsAcrossLanes: clusterCapAcrossLanes,
+            currentPrice: currentPublicPrice,
+            readPublicQuote,
+            maxEntryChaseStopFraction: () => 10,
+            sharedGetPositions,
+            onPositionClosed: (netUsd) => engineForGate.recordExternalConsecutiveLossOutcome(netUsd),
+            ...singleSymbolEntryClaims,
+          });
+          innovationSingleSymbolExecutors.push(executor);
+        }
+      }
+
+      if (!isTest) {
+        const tickInnovations = async () => {
+          for (const executor of innovationBasketExecutors) await executor.tick();
+          for (const executor of innovationSingleSymbolExecutors) await executor.tick();
+        };
+        setTimeout(() => void tickInnovations(), 75_000);
+        setInterval(() => void tickInnovations(), 5 * 60_000);
+      }
+    }
+
     // Regime auto-pilot (Tier 1) — auto-syncs the lane allocation to the report-only regime engine's
     // detected regime, with anti-whipsaw guards. Env-gated (REGIME_AUTOPILOT_ENABLED), testnet-first.
     // Requires the regime engine to be producing snapshots (REGIME_ENGINE_ENABLED=1). Never arms.
@@ -2509,6 +2670,8 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     compositeEstimatorFastLongExecutor: () => compositeEstimatorFastLongExecutor,
     compositeEstimatorFastShortExecutor: () => compositeEstimatorFastShortExecutor,
     panicWashoutExecutor: () => panicWashoutExecutor,
+    innovationBasketExecutors: () => innovationBasketExecutors,
+    innovationSingleSymbolExecutors: () => innovationSingleSymbolExecutors,
     regimeAutopilot: () => regimeAutopilot,
     unifiedOrchestrator: () => unifiedOrchestrator,
     unifiedProposalStore: () => unifiedProposalStore,

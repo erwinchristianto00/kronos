@@ -186,6 +186,9 @@ export interface ExecutorBasket {
   variant: string;
   openedAt: string;
   closesAtMs: number;
+  /** Optional observation-owned basket geometry, enabled only for dedicated innovation executors. */
+  takeProfitReturn?: number | null;
+  stopLossReturn?: number | null;
   legs: ExecutorLeg[];
   status: "OPEN" | "CLOSED" | "ABORTED";
   closedAt: string | null;
@@ -346,7 +349,7 @@ export class CrossSectionalExecutorStore {
 
 export interface CrossSectionalExecutorOptions {
   client: CrossSectionalExecClient;
-  signalStore: CrossSectionalStore;
+  signalStore: Pick<CrossSectionalStore, "all">;
   store: CrossSectionalExecutorStore;
   /** Master permission gate. Testnet: () => true. Mainnet: () => engine.isArmed(). */
   isAllowed: () => boolean;
@@ -436,11 +439,22 @@ export interface CrossSectionalExecutorOptions {
    *  verbatim. NO EXTRA EXCHANGE CALL: it reuses the exact same `trades` pages that loop already
    *  fetched. Optional — omit and this executor is byte-for-byte unchanged. */
   executionFillRecorder?: ExecutionFillRecorder;
+  /** Per-instance sizing/cadence overrides. Existing executors retain the global defaults. */
+  legUsd?: () => number;
+  leverage?: () => number;
+  maxOpenBaskets?: () => number;
+  maxSignalAgeMs?: () => number;
+  /** Prevents client-order-id collisions between isolated innovation stores sharing a timestamp. */
+  idNamespace?: string;
+  /** Honor signal-owned basket TP/SL. Off by default so existing live behavior is unchanged. */
+  respectSignalRiskGeometry?: boolean;
+  /** Status-only enabled marker for executors that have a dedicated feature gate. */
+  enabled?: () => boolean;
 }
 
 export class CrossSectionalExecutor {
   private readonly client: CrossSectionalExecClient;
-  private readonly signalStore: CrossSectionalStore;
+  private readonly signalStore: Pick<CrossSectionalStore, "all">;
   private readonly store: CrossSectionalExecutorStore;
   private readonly isAllowed: () => boolean;
   private readonly fillConfirmRetryDelayMs: number;
@@ -461,6 +475,13 @@ export class CrossSectionalExecutor {
   private readonly rawLaneWeightPctFn: (() => number) | null;
   private readonly cortexRealAttribution: CortexRealAttributionStore | null;
   private readonly executionFillRecorder: ExecutionFillRecorder | null;
+  private readonly legUsdFn: () => number;
+  private readonly leverageFn: () => number;
+  private readonly maxOpenBasketsFn: () => number;
+  private readonly maxSignalAgeMsFn: () => number;
+  private readonly idNamespace: string;
+  private readonly respectSignalRiskGeometry: boolean;
+  private readonly enabledFn: () => boolean;
 
   constructor(opts: CrossSectionalExecutorOptions) {
     this.client = opts.client;
@@ -482,6 +503,13 @@ export class CrossSectionalExecutor {
     this.rawLaneWeightPctFn = opts.rawLaneWeightPct ?? null;
     this.cortexRealAttribution = opts.cortexRealAttribution ?? null;
     this.executionFillRecorder = opts.executionFillRecorder ?? null;
+    this.legUsdFn = opts.legUsd ?? LEG_USD;
+    this.leverageFn = opts.leverage ?? EXEC_LEVERAGE;
+    this.maxOpenBasketsFn = opts.maxOpenBaskets ?? MAX_OPEN_BASKETS;
+    this.maxSignalAgeMsFn = opts.maxSignalAgeMs ?? MAX_SIGNAL_AGE_MS;
+    this.idNamespace = (opts.idNamespace ?? this.targetVariant).replace(/[^a-zA-Z0-9]/g, "").slice(-6).toLowerCase() || "basket";
+    this.respectSignalRiskGeometry = opts.respectSignalRiskGeometry ?? false;
+    this.enabledFn = opts.enabled ?? isCrossSectionalExecEnabled;
   }
 
   /** This instance's own open (status OPEN), un-exited (exitOrderId===null) basket legs — the
@@ -562,7 +590,7 @@ export class CrossSectionalExecutor {
   }
 
   private effectiveLegUsd(): number {
-    return LEG_USD() * (this.allocationWeightPct() / 100);
+    return this.legUsdFn() * (this.allocationWeightPct() / 100);
   }
 
   /** Raw-static counterpart of allocationWeightPct (CORTEX real-USDT attribution, 2026-07-22 fix):
@@ -660,15 +688,15 @@ export class CrossSectionalExecutor {
       .filter((o) => (o.variant ?? "RAW") === targetVariant)
       .sort((a, b) => b.openedAtMs - a.openedAtMs);
     const signalAgeMs = matching[0] ? nowMs - matching[0].openedAtMs : null;
-    const signalMaxAgeMs = MAX_SIGNAL_AGE_MS();
+    const signalMaxAgeMs = this.maxSignalAgeMsFn();
     return {
-      enabled: isCrossSectionalExecEnabled(),
+      enabled: this.enabledFn(),
       allowed: this.isAllowed() && this.entryHealth().allowed,
       laneId: this.laneId,
       legUsd: this.effectiveLegUsd(),
-      baseLegUsd: LEG_USD(),
+      baseLegUsd: this.legUsdFn(),
       allocationWeightPct: this.allocationWeightPct(),
-      leverage: EXEC_LEVERAGE(),
+      leverage: this.leverageFn(),
       variant: targetVariant,
       tpNetReturnPct: TP_NET_RETURN() * 100,
       dailyRealizedUsd: this.dailyRealizedUsd(this.nowIso()),
@@ -683,7 +711,7 @@ export class CrossSectionalExecutor {
       signalAgeMs,
       signalMaxAgeMs,
       signalStale: signalAgeMs === null || signalAgeMs > signalMaxAgeMs,
-      adaptiveFilters: deriveAdaptiveSymbolFilters(this.signalStore).provenance,
+      adaptiveFilters: deriveAdaptiveSymbolFilters(this.signalStore as CrossSectionalStore).provenance,
       orphanedLegs: st.orphanedLegs ?? [],
     };
   }
@@ -811,7 +839,6 @@ export class CrossSectionalExecutor {
       if (Number.isFinite(p.markPrice) && p.markPrice > 0) markBySymbol.set(p.symbol, p.markPrice);
     }
 
-    const threshold = TP_NET_RETURN();
     let stamped = false;
     for (const basket of openBaskets) {
       const longLegs = basket.legs.filter((l) => l.side === "LONG");
@@ -833,6 +860,9 @@ export class CrossSectionalExecutor {
       basket.lastNetReturn = netReturn;
       basket.lastNetAt = this.nowIso();
       stamped = true;
+      const threshold = this.respectSignalRiskGeometry
+        ? basket.takeProfitReturn ?? Number.POSITIVE_INFINITY
+        : TP_NET_RETURN();
       if (netReturn >= threshold) {
         // 2026-07-19 real-money audit fix (BUG 2): isolate this basket's close attempt so one
         // wedged basket (repeated throw, e.g. a persistent margin/rate-limit condition) cannot
@@ -842,6 +872,17 @@ export class CrossSectionalExecutor {
           await this.closeBasket(basket, "PROFIT_BANK");
         } catch (error) {
           this.lastError = (error as Error).message ?? "profit-bank close failed";
+        }
+      } else if (
+        this.respectSignalRiskGeometry &&
+        basket.stopLossReturn !== undefined &&
+        basket.stopLossReturn !== null &&
+        netReturn <= -basket.stopLossReturn
+      ) {
+        try {
+          await this.closeBasket(basket, "SIGNAL_STOP");
+        } catch (error) {
+          this.lastError = (error as Error).message ?? "signal-stop close failed";
         }
       }
     }
@@ -867,7 +908,7 @@ export class CrossSectionalExecutor {
   }
 
   private async ensureOpenBasketLeverage(): Promise<void> {
-    const leverage = EXEC_LEVERAGE();
+    const leverage = this.leverageFn();
     const symbols = new Set<string>();
     for (const basket of this.store.getState().baskets) {
       if (basket.status !== "OPEN") continue;
@@ -1176,7 +1217,7 @@ export class CrossSectionalExecutor {
       }
     }
     this.openHalted = null;
-    if (st.baskets.filter((b) => b.status === "OPEN").length >= MAX_OPEN_BASKETS()) return;
+    if (st.baskets.filter((b) => b.status === "OPEN").length >= this.maxOpenBasketsFn()) return;
 
     const nowMs = new Date(this.nowIso()).getTime();
     // Newest FRESH, still-OPEN signal of the target variant we haven't executed yet.
@@ -1189,7 +1230,7 @@ export class CrossSectionalExecutor {
           o.status === "OPEN" &&
           (o.variant ?? "RAW") === targetVariant &&
           o.openedAtMs > st.lastSeenSignalMs &&
-          nowMs - o.openedAtMs <= MAX_SIGNAL_AGE_MS(),
+          nowMs - o.openedAtMs <= this.maxSignalAgeMsFn(),
       )
       .sort((a: CrossSectionalObservation, b: CrossSectionalObservation) => b.openedAtMs - a.openedAtMs);
     const signal = candidates[0];
@@ -1238,12 +1279,14 @@ export class CrossSectionalExecutor {
       // on newClientOrderId, and Binance's per-account idempotency would treat the second instance's
       // real order as a duplicate of the first's. The variant suffix is appended at the END (not
       // the middle) so it always survives basketId.slice(-12) regardless of the timestamp's length.
-      basketId: `xb-${signal.openedAtMs.toString(36)}-${this.targetVariant.slice(0, 4).toLowerCase()}`,
+      basketId: `xb-${signal.openedAtMs.toString(36)}-${this.idNamespace}`,
       sourceObservationId: signal.observationId,
       signal: signal.signal,
       variant: signal.variant ?? "RAW",
       openedAt: this.nowIso(),
       closesAtMs: signal.openedAtMs + signal.horizonMs,
+      takeProfitReturn: this.respectSignalRiskGeometry ? signal.takeProfitReturn ?? null : undefined,
+      stopLossReturn: this.respectSignalRiskGeometry ? signal.stopLossReturn ?? null : undefined,
       legs: [],
       status: "OPEN",
       closedAt: null,
@@ -1276,7 +1319,7 @@ export class CrossSectionalExecutor {
     try {
       for (const planned of plannedLegs) {
         try {
-          await this.client.setLeverage(planned.symbol, EXEC_LEVERAGE());
+          await this.client.setLeverage(planned.symbol, this.leverageFn());
         } catch {
           // best-effort (already set / position exists)
         }

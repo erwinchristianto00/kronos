@@ -10,6 +10,10 @@ import type { FastifyInstance } from "fastify";
 import type { LiveExecutionEngine } from "../lib/live-execution-engine.js";
 import { type CrossSectionalExecutor } from "../lib/cross-sectional-executor.js";
 import type { SingleSymbolLaneExecutor } from "../lib/single-symbol-lane-executor.js";
+import {
+  EXECUTABLE_INNOVATION_LANE_IDS,
+  INNOVATION_POLICY_ONLY_IDS,
+} from "../lib/innovation-testnet-execution.js";
 import type { SingleSymbolPriceTimelineService } from "../lib/single-symbol-price-timeline.js";
 import { REGIME_AUTOPILOT_PRESETS, type RegimeAutopilot } from "../lib/regime-autopilot.js";
 import { getShortFadeStore, buildShortFadeReport, SF_PAPER_LANE_ID } from "../lib/short-fade-edge.js";
@@ -54,6 +58,7 @@ const OPERATOR_ALLOCATION_LANE_IDS = [
   RC_PAPER_LANE_ID,
   RCS_PAPER_LANE_ID,
   PWR_PAPER_LANE_ID,
+  ...EXECUTABLE_INNOVATION_LANE_IDS,
   ...(["WIDE_LONG", "WIDE_SHORT", "FAST_LONG", "FAST_SHORT"] as CEBucket[]).map(ceLaneIdForBucket),
 ];
 
@@ -595,6 +600,8 @@ export async function registerLiveRoutes(
     compositeEstimatorFastLongExecutor?: () => SingleSymbolLaneExecutor | null;
     compositeEstimatorFastShortExecutor?: () => SingleSymbolLaneExecutor | null;
     panicWashoutExecutor?: () => SingleSymbolLaneExecutor | null;
+    innovationBasketExecutors?: () => CrossSectionalExecutor[];
+    innovationSingleSymbolExecutors?: () => SingleSymbolLaneExecutor[];
     regimeAutopilot?: () => RegimeAutopilot | null;
     unifiedOrchestrator?: () => UnifiedTestnetOrchestrator | null;
     unifiedProposalStore?: () => UnifiedTestnetProposalStore | null;
@@ -620,7 +627,12 @@ export async function registerLiveRoutes(
   const appendCopyAudit = (event: Omit<CopyAuditEvent, "at">): { ok: boolean; reason: string | null } =>
     copyAuditLogger.append({ ...event, at: new Date(copyNowMs()).toISOString() });
   const allCrossSectionalExecutors = () =>
-    [opts.crossSectionalExecutor?.() ?? null, opts.crossSectionalTrendExecutor?.() ?? null, opts.crossSectionalMixedExecutor?.() ?? null].filter(
+    [
+      opts.crossSectionalExecutor?.() ?? null,
+      opts.crossSectionalTrendExecutor?.() ?? null,
+      opts.crossSectionalMixedExecutor?.() ?? null,
+      ...(opts.innovationBasketExecutors?.() ?? []),
+    ].filter(
       (exec): exec is CrossSectionalExecutor => exec !== null,
     );
   const allSingleSymbolExecutors = () =>
@@ -634,6 +646,7 @@ export async function registerLiveRoutes(
       opts.compositeEstimatorFastLongExecutor?.() ?? null,
       opts.compositeEstimatorFastShortExecutor?.() ?? null,
       opts.panicWashoutExecutor?.() ?? null,
+      ...(opts.innovationSingleSymbolExecutors?.() ?? []),
     ].filter((exec): exec is SingleSymbolLaneExecutor => exec !== null);
   app.get("/api/live/status", async () => {
     if (!engine) {
@@ -655,6 +668,12 @@ export async function registerLiveRoutes(
 
   app.get("/api/live/allocation-lanes", async () => ({
     lanes: Array.from(new Set(OPERATOR_ALLOCATION_LANE_IDS)).sort(),
+  }));
+  app.get("/api/live/innovation-executors", async () => ({
+    executableLaneIds: EXECUTABLE_INNOVATION_LANE_IDS,
+    policyOnly: INNOVATION_POLICY_ONLY_IDS,
+    basket: (opts.innovationBasketExecutors?.() ?? []).map((executor) => executor.getStatus()),
+    singleSymbol: (opts.innovationSingleSymbolExecutors?.() ?? []).map((executor) => executor.getStatus()),
   }));
 
   // Shared BTC/ETH/SOL price timeline for the operator and the optional single-symbol execution

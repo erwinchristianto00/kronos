@@ -169,7 +169,7 @@ class FakeExecClient implements CrossSectionalExecClient {
   }
 }
 
-function makeExecutor(opts: { client?: FakeExecClient; allowed?: boolean; laneWeightPct?: number; rawLaneWeightPct?: number; cortexRealAttribution?: CortexRealAttributionStore; laneId?: string; signalMs?: number; dailyMaxLossUsd?: number; entryHealthAllowed?: boolean; siblingOpenLegs?: () => Array<{ symbol: string; side: "LONG" | "SHORT"; qty: number }>; existingNotionalForSymbol?: (symbol: string) => number; maxNotionalPerSymbolAcrossLanes?: number } = {}) {
+function makeExecutor(opts: { client?: FakeExecClient; allowed?: boolean; laneWeightPct?: number; rawLaneWeightPct?: number; cortexRealAttribution?: CortexRealAttributionStore; laneId?: string; signalMs?: number; dailyMaxLossUsd?: number; entryHealthAllowed?: boolean; siblingOpenLegs?: () => Array<{ symbol: string; side: "LONG" | "SHORT"; qty: number }>; existingNotionalForSymbol?: (symbol: string) => number; maxNotionalPerSymbolAcrossLanes?: number; respectSignalRiskGeometry?: boolean } = {}) {
   const client = opts.client ?? new FakeExecClient();
   const signalStore = new CrossSectionalStore(tmpDir());
   const storeDir = tmpDir();
@@ -197,6 +197,9 @@ function makeExecutor(opts: { client?: FakeExecClient; allowed?: boolean; laneWe
     ...(opts.existingNotionalForSymbol !== undefined ? { existingNotionalForSymbol: opts.existingNotionalForSymbol } : {}),
     ...(opts.maxNotionalPerSymbolAcrossLanes !== undefined
       ? { maxNotionalPerSymbolAcrossLanes: () => opts.maxNotionalPerSymbolAcrossLanes! }
+      : {}),
+    ...(opts.respectSignalRiskGeometry !== undefined
+      ? { respectSignalRiskGeometry: opts.respectSignalRiskGeometry }
       : {}),
   });
   return { executor, client, signalStore, store, storeDir };
@@ -230,6 +233,24 @@ describe("cross-sectional executor (basket execution, testnet-first)", () => {
       { symbol: "SOLUSDT", leverage: 3 },
       { symbol: "DOGEUSDT", leverage: 3 },
     ]);
+  });
+
+  it("honors an innovation basket's own stop without changing the default executor geometry", async () => {
+    const { executor, client, signalStore, store } = makeExecutor({
+      signalMs: NOW_MS - 5 * 60_000,
+      respectSignalRiskGeometry: true,
+    });
+    signalStore.all[0]!.takeProfitReturn = null;
+    signalStore.all[0]!.stopLossReturn = 0.001;
+    await executor.tick();
+    expect(store.getState().baskets[0]!.status).toBe("OPEN");
+
+    client.markPriceBySymbol.set("SOLUSDT", 99.8);
+    client.markPriceBySymbol.set("DOGEUSDT", 0.1002);
+    await executor.tick();
+
+    expect(store.getState().baskets[0]!.status).toBe("CLOSED");
+    expect(store.getState().baskets[0]!.closeReason).toBe("SIGNAL_STOP");
   });
 
   it("skips stale signals (older than the freshness window)", async () => {

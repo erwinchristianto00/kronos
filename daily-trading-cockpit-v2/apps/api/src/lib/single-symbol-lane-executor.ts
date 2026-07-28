@@ -62,6 +62,10 @@ export interface SingleSymbolFreshSignal {
   entryPrice: number;
   stopPrice: number;
   openedAtMs: number;
+  /** Optional observation-owned target. Existing lanes omit this and keep their static policy. */
+  targetPrice?: number | null;
+  /** Optional observation-owned horizon. Existing lanes omit this and keep their static policy. */
+  maxHoldMs?: number | null;
 }
 
 export interface SingleSymbolExitContext {
@@ -233,6 +237,10 @@ export interface SingleSymbolPosition {
   entryOrderId: string;
   entryPriceConfirmed: boolean;
   stopPrice: number;
+  /** Frozen signal geometry for research-lane execution. Undefined on legacy persisted positions. */
+  targetPrice?: number | null;
+  /** Frozen signal horizon for research-lane execution. Undefined on legacy persisted positions. */
+  maxHoldMs?: number | null;
   /** Exchange-side protective stop algo order id. Null only in the brief window between a
    *  confirmed entry and the stop placement succeeding — see ensureStopOrder(). */
   stopAlgoOrderId: string | null;
@@ -1526,6 +1534,23 @@ export class SingleSymbolLaneExecutor {
         peakFavorableR: portfolioDecision?.nextPeakFavorableR ?? exitContext.peakFavorableR,
       });
       let decision = portfolioDecision?.shouldExit ? portfolioDecision : laneDecision;
+      if (!decision.shouldExit && pos.targetPrice !== undefined && pos.targetPrice !== null) {
+        const targetHit = pos.direction === "LONG" ? mark >= pos.targetPrice : mark <= pos.targetPrice;
+        if (targetHit) {
+          decision = {
+            shouldExit: true,
+            reason: "SIGNAL_TARGET",
+            nextPeakFavorableR: laneDecision.nextPeakFavorableR,
+          };
+        }
+      }
+      if (!decision.shouldExit && pos.maxHoldMs !== undefined && pos.maxHoldMs !== null && msHeld >= pos.maxHoldMs) {
+        decision = {
+          shouldExit: true,
+          reason: "SIGNAL_MAX_HOLD",
+          nextPeakFavorableR: laneDecision.nextPeakFavorableR,
+        };
+      }
       // A timeline reversal may bank/cut a position only after the lane's own risk/TP rule has
       // declined to exit. A timeline fetch failure is fail-open for exits: the protective stop and
       // established lane policy keep managing the real position rather than a stale chart closing it.
@@ -1983,6 +2008,8 @@ export class SingleSymbolLaneExecutor {
           entryOrderId: order.orderId,
           entryPriceConfirmed: resolvedEntry.confirmed,
           stopPrice: signal.stopPrice,
+          targetPrice: signal.targetPrice,
+          maxHoldMs: signal.maxHoldMs,
           stopAlgoOrderId: null,
           stopFailureCount: 0,
           stopUnprotectedSinceIso: null,

@@ -3737,11 +3737,21 @@ describe("CORTEX real-USDT attribution (2026-07-21: realizedPnlUsd × open-time 
       onPositionClosed: (netUsd) => engine.recordExternalConsecutiveLossOutcome(netUsd),
     });
 
-    signals.push({ observationId: "ce:ETHUSDT:1", symbol: "ETHUSDT", entryPrice: 2000, stopPrice: 1900, openedAtMs: new Date(NOW_ISO).getTime() - 5_000 });
+    signals.push({
+      observationId: "ce:ETHUSDT:1",
+      symbol: "ETHUSDT",
+      entryPrice: 2000,
+      stopPrice: 1900,
+      targetPrice: 2100,
+      maxHoldMs: 90_000,
+      openedAtMs: new Date(NOW_ISO).getTime() - 5_000,
+    });
     await executor.tick();
     const pos = executorStore.getState().positions.find((p) => p.status === "OPEN")!;
     expect(pos.cortexAppliedWeightPct).toBeCloseTo(53.3, 9);
     expect(pos.cortexRawStaticWeightPct).toBe(50);
+    expect(pos.targetPrice).toBe(2100);
+    expect(pos.maxHoldMs).toBe(90_000);
     // legUsd scaled by the SAME captured applied weight: 200 × 0.533 / 2000 = 0.0533 → step 0.053.
     expect(pos.qty).toBeCloseTo(0.053, 9);
     expect(attribution.getState().records).toHaveLength(0);
