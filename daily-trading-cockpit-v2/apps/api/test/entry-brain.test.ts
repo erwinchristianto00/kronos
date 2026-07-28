@@ -95,7 +95,11 @@ describe("Entry Brain", () => {
   it("dry-run regression: a MISSING slippage {value:null, asOfMs:null} is NOT 'book too thin' → cautious, can ENTER_NOW", () => {
     // The gather emits a MISSING source as {value:null, asOfMs:null}; that must NOT be read as thin-book
     // (which forces SKIP). It should be the cautious-default path so a clean fresh signal can still ENTER_NOW.
-    const d = decideEntry(entryInput({ spreadBps: { value: null, asOfMs: null }, expectedSlippageBps: { value: null, asOfMs: null }, candleExtensionAtr: { value: null, asOfMs: null }, distanceFromVwapAtr: { value: null, asOfMs: null } }));
+    // 2026-07-28: the chase inputs are left at their MEASURED fixture defaults on purpose. This test
+    // is about SLIPPAGE; it used to null distanceFromVwapAtr + candleExtensionAtr as well, which
+    // quietly made it assert the chase fail-open (unmeasured chase ⇒ ENTER_NOW) while claiming to
+    // test something else. The unmeasured-chase case now has its own tests below.
+    const d = decideEntry(entryInput({ spreadBps: { value: null, asOfMs: null }, expectedSlippageBps: { value: null, asOfMs: null } }));
     expect(d.slippageRisk).toBeLessThan(0.9); // NOT the 0.95 thin-book value
     expect(d.action).toBe("ENTER_NOW");
     // A PRESENT null value WITH a fresh timestamp IS thin-book → SKIP (the real signal is preserved).
@@ -156,6 +160,66 @@ describe("Entry Brain", () => {
       expect(withSalt.action).toBe(withoutSalt.action);
       expect(withSalt.chaseRisk).toBe(withoutSalt.chaseRisk);
       expect(withSalt.decisionId).not.toBe(withoutSalt.decisionId);
+    });
+  });
+
+  /**
+   * 2026-07-28: the chase gate used to FAIL OPEN. chaseRisk initialises to 0 and both contributors
+   * are conditional, so with both inputs unusable the score stayed 0 — indistinguishable from
+   * "measured, price exactly at fair value" — and the >=0.9 SKIP / >=0.7 WAIT_PULLBACK gates simply
+   * could not fire. An ABSENT input removed a veto. Measured over 6 days of real journals: all 72
+   * ENTER_NOW events on 3101+3102 landed on a STALE distanceFromVwapAtr, not one on a fresh reading.
+   */
+  describe("unmeasured chase must not pass as safe (fail-OPEN fix)", () => {
+    const bothUnmeasured = { distanceFromVwapAtr: { value: null, asOfMs: null }, candleExtensionAtr: { value: null, asOfMs: null } };
+
+    it("FAIL-WITHOUT: both chase inputs unusable ⇒ WAIT_CONFIRMATION, not ENTER_NOW", () => {
+      const d = decideEntry(entryInput(bothUnmeasured));
+      expect(d.action).toBe("WAIT_CONFIRMATION");
+      expect(d.reasons.join(" ")).toContain("chase risk UNMEASURED");
+      // The score is still reported as 0 — that is the value it computed; the point is that a 0 born
+      // of absence no longer silently satisfies the gates.
+      expect(d.chaseRisk).toBe(0);
+    });
+
+    it("a STALE chase reading counts as unmeasured too, not as a safe 0", () => {
+      const stale = 30 * 60_000; // older than the chase TTL
+      const d = decideEntry(entryInput({
+        distanceFromVwapAtr: src(0.5, stale),
+        candleExtensionAtr: src(0.8, stale),
+      }));
+      expect(d.action).toBe("WAIT_CONFIRMATION");
+      expect(d.sourceStatuses.distanceFromVwapAtr).toBe("STALE");
+    });
+
+    it("ONE usable chase input is enough to evaluate — no false block", () => {
+      const d = decideEntry(entryInput({ distanceFromVwapAtr: { value: null, asOfMs: null } }));
+      expect(d.action).toBe("ENTER_NOW"); // candleExtensionAtr still measured
+    });
+
+    it("a measured, genuinely extended price still SKIPs — the real veto is untouched", () => {
+      const d = decideEntry(entryInput({ candleExtensionAtr: src(3), distanceFromVwapAtr: src(3) }));
+      expect(d.chaseRisk).toBeGreaterThanOrEqual(0.9);
+      expect(d.action).toBe("SKIP");
+    });
+
+    it("the chase TTL now covers a 15m bar stamp — the reading that made this bug", () => {
+      // The chase inputs are stamped with the 15m bar's openTime, so their age runs 0 -> 15 min
+      // within a single bar. Under the old 10-minute budget the last third of every bar was STALE
+      // for no reason but a unit mismatch.
+      const midBar = 12 * 60_000; // would have been STALE at the old TTL
+      const d = decideEntry(entryInput({
+        distanceFromVwapAtr: src(0.5, midBar),
+        candleExtensionAtr: src(0.8, midBar),
+      }));
+      expect(d.sourceStatuses.distanceFromVwapAtr).toBe("FRESH");
+      expect(d.action).toBe("ENTER_NOW");
+      // ...and a reading genuinely older than one bar + grace is still STALE.
+      const old = decideEntry(entryInput({
+        distanceFromVwapAtr: src(0.5, 21 * 60_000),
+        candleExtensionAtr: src(0.8, 21 * 60_000),
+      }));
+      expect(old.sourceStatuses.distanceFromVwapAtr).toBe("STALE");
     });
   });
 });

@@ -40,10 +40,24 @@ export const ENTRY_MAX_SLIPPAGE_BPS = 25;
 /** Per-source staleness TTLs (ms) for the Entry Brain's microstructure inputs. Order-book-derived reads
  *  (spread/slippage) decay fast; chase geometry (VWAP/extension/pullback) a bit slower. */
 export type EntryMicroSourceKey = "distanceFromVwapAtr" | "candleExtensionAtr" | "pullbackDepthAtr" | "spreadBps" | "expectedSlippageBps";
+/** 2026-07-28: the three chase budgets were 10 min, but the readings they judge are stamped with the
+ *  15-MINUTE BAR's openTime (four-brain-live-gather-bindings.ts:136 ← packages/shared indicators
+ *  `lastOpenTime`). A 10-minute budget against a 15-minute stamp is unsatisfiable for the last third
+ *  of every bar, deterministically: `(asOfMs mod 900_000) > 10min ⇒ STALE` predicted the flag on 33
+ *  of 33 ticks with zero mismatches. So the chase inputs went STALE ~33% of the time for no reason
+ *  other than a unit mismatch — and, before the fail-open fix at the action gate below, that is what
+ *  let every one of 72 measured ENTER_NOW events through on an unevaluated chase gate.
+ *  One bar (15 min) + one tick-interval of grace. The order-book budgets are untouched: spread and
+ *  slippage carry real per-read timestamps and genuinely do decay in minutes.
+ *  NOTE two other budgets still describe this same timestamp elsewhere — 90 min
+ *  (four-brain-live-gather.ts FRESHNESS_TTL_MS.candle) and 45 min (indicators timeframeMs×3). They
+ *  gate different things (gather admission, indicator self-report) and are left alone deliberately;
+ *  this constant is the one the Entry action gates actually read. */
+const ENTRY_CHASE_TTL_MS = 20 * 60_000;
 const ENTRY_MICRO_TTL: Record<EntryMicroSourceKey, number> = {
-  distanceFromVwapAtr: 10 * 60_000,
-  candleExtensionAtr: 10 * 60_000,
-  pullbackDepthAtr: 10 * 60_000,
+  distanceFromVwapAtr: ENTRY_CHASE_TTL_MS,
+  candleExtensionAtr: ENTRY_CHASE_TTL_MS,
+  pullbackDepthAtr: ENTRY_CHASE_TTL_MS,
   spreadBps: 5 * 60_000,
   expectedSlippageBps: 5 * 60_000,
 };
@@ -172,6 +186,15 @@ export function decideEntry(input: EntryInput): EntryDecision {
   if (vwapDist !== null) chaseRisk = Math.max(chaseRisk, clamp01((dirSign * vwapDist) / 3)); // ran away from fair value in our direction
   if (pullback !== null && pullback > 0.5) chaseRisk *= 0.6; // a real pullback lowers chase risk
   chaseRisk = clamp01(chaseRisk);
+  /** 2026-07-28: did either chase input actually produce a number this tick?
+   *
+   *  chaseRisk initialises to 0 and both contributors are conditional, so when BOTH are null the
+   *  score stays 0 — indistinguishable from "measured, and price sits exactly at fair value". The
+   *  two chase gates below then silently cannot fire, i.e. an ABSENT input read as MAXIMALLY SAFE
+   *  and removed a veto instead of raising one. Measured over 6 days of journals: all 72 ENTER_NOW
+   *  events on 3101+3102 landed on a STALE distanceFromVwapAtr — not one on a fresh reading.
+   *  Unmeasured is not zero; it is unknown, and it is handled at the action gate below. */
+  const chaseMeasured = extension !== null || vwapDist !== null;
 
   // ── Slippage risk (0..1) ────────────────────────────────────────────────────────────────────────
   let slippageRisk: number;
@@ -210,6 +233,17 @@ export function decideEntry(input: EntryInput): EntryDecision {
   } else if (chaseRisk >= 0.7) {
     action = "WAIT_PULLBACK";
     reasons.push("price extended (high chase risk) → wait for a pullback");
+  } else if (!chaseMeasured) {
+    // 2026-07-28 fail-OPEN fix. Reaching here means BOTH chase inputs were unusable, so the two
+    // gates above could not fire and chaseRisk is a default 0, not a measurement. Previously that
+    // fell straight through to ENTER_NOW — an absent input LIFTED a veto. Same posture (and same
+    // action) as the `candleFresh === false` rule above: cannot evaluate ⇒ do not enter, wait.
+    // This deliberately does NOT escalate to SKIP: the module contract reserves fail-safe SKIP for
+    // stale signal, invalid geometry and excessive slippage, and chase is not one of them.
+    action = "WAIT_CONFIRMATION";
+    reasons.push(
+      `chase risk UNMEASURED (distanceFromVwapAtr ${st.distanceFromVwapAtr ?? "?"}, candleExtensionAtr ${st.candleExtensionAtr ?? "?"}) → wait, never enter on a chase gate that never ran`,
+    );
   } else if (input.breakoutConfirmed === false) {
     action = "WAIT_BREAKOUT";
     reasons.push("breakout not yet confirmed → wait");
