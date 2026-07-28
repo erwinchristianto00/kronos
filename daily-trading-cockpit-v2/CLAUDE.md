@@ -99,6 +99,14 @@ A comment saying something is unavailable records what was true when it was writ
 ## Environment
 
 - A concurrent Codex agent shares this checkout and commits to it. `git log --oneline -5` first.
+- **A web `dist/` deploy silently overwrites whatever the other agent deployed**, and nothing on the
+  page says which build it is. On 2026-07-28 a dashboard card deployed at 05:09 was gone by 05:23
+  because the other agent pushed a `dist` built from a checkout that predated it — the API was
+  healthy the whole time, so it looked like a backend regression. Before deploying `dist`: rebuild
+  from current HEAD (never ship a stale local build), deploy the SAME bundle to every instance, and
+  verify with `grep` for a string unique to your change plus a `sha256sum` of `index.html` matching
+  across instances. If a panel vanishes and the endpoint still returns the data, suspect the bundle
+  first.
 - Binance market data is geo-blocked from Indonesia (testnet is fine); mainnet reads need WARP.
 - Deeper history lives in `~/.claude/projects/-Users-erwin-Projects/memory/`. `MEMORY.md` is only
   the index — the file contents do **not** load automatically. Read the specific file before
