@@ -232,6 +232,10 @@ export interface FourBrainBindingDeps {
   instanceId: string;
   nowMs: number;
   horizons?: DirectionHorizon[];
+  /** How many outcomes each horizon has ever resolved. An explicit 0 unlocks the Direction Brain's
+   *  cold-start exploration — see direction-brain.ts's coldStart. Absent ⇒ undefined per horizon,
+   *  which preserves every pre-2026-07-28 behaviour. */
+  directionResolvedNByHorizon?: Partial<Record<DirectionHorizon, number>>;
   /** True once INTRADAY has earned a verdict — promotes the FAST lanes to the SCALP horizon.
    *  See laneHorizon(). Absent/false keeps the pre-2026-07-28 behaviour exactly. */
   scalpHorizonEnabled?: boolean;
@@ -407,6 +411,7 @@ export function buildFourBrainGatherInput(dep: FourBrainBindingDeps): FourBrainG
       shortVeto,
       fourBrainLongVeto,
       fourBrainShortVeto,
+      horizonResolvedN: dep.directionResolvedNByHorizon?.[horizon],
       validityMs,
     };
   });

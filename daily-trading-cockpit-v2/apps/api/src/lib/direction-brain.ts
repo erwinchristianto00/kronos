@@ -67,6 +67,12 @@ export interface DirectionInput {
    *  never a hard gate; see the score blocks below. */
   fourBrainLongVeto?: boolean;
   fourBrainShortVeto?: boolean;
+  /** How many outcomes THIS horizon has ever resolved. An explicit 0 means the horizon has never
+   *  learned anything and unlocks cold-start exploration (see coldStart below) — without it a fresh
+   *  horizon can only ever emit FLAT, because neither side can be PROVEN_ anything and an unmeasured
+   *  side scores 0 against a FLAT baseline that floors at 0.6. undefined = "caller does not track
+   *  this", which preserves every pre-2026-07-28 behaviour including FLAT-as-a-real-baseline. */
+  horizonResolvedN?: number | null;
 
   /** The graduated controller's directional conviction (0..1) + which sides its posture leans to (SOFT). */
   conviction: TaggedSource; // 0..1
@@ -267,8 +273,29 @@ export function decideDirection(input: DirectionInput): DirectionDecision {
    *   • never fires against a veto, and PROVEN_BELOW still bars the side outright;
    *   • BOTH is untouched: it requires both sides PROVEN_ABOVE, so exploration can never open two.
    */
+  /**
+   * COLD START (2026-07-28, same day, second pass). The rule below opens exploration when the
+   * OPPOSITE side is PROVEN_BELOW — which unlocked SHORT on INTRADAY, where LONG was measured at
+   * -0.475R. It cannot unlock anything on a horizon that has never resolved a single outcome,
+   * because nothing there can be PROVEN_ anything. Enabling SCALP the same day proved it: 376 SCALP
+   * decisions, 376 of them FLAT, and no path out — never non-FLAT, so never any evidence, so never
+   * proven, so never non-FLAT. Exactly the deadlock this exploration pass was written to end,
+   * recreated on a fresh horizon.
+   *
+   * The earlier reasoning — "with no information either way, FLAT is right" — is true of a mature
+   * horizon and false of a newborn one, where it guarantees the newborn stays newborn.
+   *
+   * So a horizon that has resolved NOTHING may compete on the evidence it does have (lane edge,
+   * conviction, kronos, crowding — the sub-signals that are not edge-memory). Requires an EXPLICIT
+   * zero: `horizonResolvedN` undefined means "the caller does not track this", which keeps every
+   * existing behaviour, including FLAT-as-a-real-baseline when both edges are simply missing on a
+   * mature horizon. The 2026-07-25 regression is untouched — a side with a measured edge makes this
+   * false, so a no-evidence side still cannot outrank a measured-good one.
+   */
+  const coldStart = longEdge === null && shortEdge === null && input.horizonResolvedN === 0;
+  if (coldStart) supporting.push("horizon has resolved nothing yet → cold-start exploration (not conviction)");
   const explorationOpen = (self: EdgeStanding, other: EdgeStanding): boolean =>
-    self === "UNPROVEN" && other === "PROVEN_BELOW";
+    (self === "UNPROVEN" && other === "PROVEN_BELOW") || (coldStart && self === "UNPROVEN");
   const longExplores =
     explorationOpen(longStanding, shortStanding) && !input.longVeto && !input.fourBrainLongVeto;
   const shortExplores =

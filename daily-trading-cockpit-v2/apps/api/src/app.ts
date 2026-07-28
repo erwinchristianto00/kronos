@@ -2432,6 +2432,16 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         scalpHorizonEnabled:
           (directionEntryOutcomeStore.getState().direction.perHorizon.INTRADAY?.effectiveN ?? 0) >=
           DIRECTION_ENTRY_MIN_EXAMPLES_ACTIVE,
+        // Per-horizon resolved counts, so a horizon that has learned NOTHING can bootstrap out of
+        // all-FLAT (direction-brain.ts's coldStart). Enabling SCALP hours ago proved the need: 376
+        // decisions, 376 FLAT, with no path out — a fresh horizon cannot make either side PROVEN_
+        // anything, and an unmeasured side scores 0 against a FLAT baseline that floors at 0.6.
+        // Read live each tick, so the allowance closes by itself the moment the horizon has any
+        // evidence of its own.
+        directionResolvedNByHorizon: (() => {
+          const ph = directionEntryOutcomeStore.getState().direction.perHorizon;
+          return { SCALP: ph.SCALP?.n ?? 0, INTRADAY: ph.INTRADAY?.n ?? 0, SWING: ph.SWING?.n ?? 0 };
+        })(),
         openSignals: collectFourBrainOpenSignals(),
         maxSignalAgeMs: 50 * 60_000,
         crowdingStateForSymbol: (symbol) => crowdingShadow[symbol]?.crowdingState ?? null,
