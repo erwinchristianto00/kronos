@@ -420,6 +420,7 @@ import {
 } from "../lib/price-impact-efficiency.js";
 import type { FourBrainMetricsSummary } from "../lib/four-brain-metrics.js";
 import type { DirectionEntryOutcomeReport } from "../lib/direction-entry-outcome-store.js";
+import { judgeFourBrainReadiness, rollUpFourBrainReadiness } from "../lib/four-brain-readiness.js";
 
 // Fail-open shape for /api/shadow/four-brain's `health` field on any instance where the four-brain
 // metrics aggregator was never constructed (mode off, test harness, etc.) — every count is honestly 0,
@@ -1710,10 +1711,56 @@ export async function registerShadowRoutes(
   // — never a 500, mirrors /api/shadow/four-brain's own fail-open discipline exactly.
   app.get("/api/shadow/direction-entry-outcomes", async () => {
     const report = opts.directionEntryOutcomeReportGetter?.() ?? null;
+    // 2026-07-28: CORTEX has had a readiness verdict since it was built; the four brains had none, so
+    // an operator saw four raw columns ("LONG n=305 · WR 21% · meanR -0.475R · regret +0.564R ·
+    // calib-gap +0.526R") and no answer to the only question that matters — is this usable yet.
+    // Every input was already computed here; only the judgement was missing. Purely additive.
+    //
+    // measuredBasis is the load-bearing field. DIRECTION is REAL: its outcome is whether the price
+    // actually moved the way it called, and that move happened. ENTRY Tier 2 is SIMULATED: a forward
+    // candle walk of a trade that was never placed — it can never qualify the brain, which is why
+    // Tier 1 (real fills, currently 0) is read separately and Tier 2 is judged on its own line.
+    const readiness = (() => {
+      if (!report) return null;
+      try {
+        const direction = (report.direction?.perHorizon ?? []).flatMap((h: Record<string, unknown>) =>
+          ((h.perAction ?? []) as Record<string, unknown>[])
+            .filter((a) => a.action === "LONG" || a.action === "SHORT")
+            .map((a) =>
+              judgeFourBrainReadiness("DIRECTION", {
+                scope: `${String(h.horizon)}/${String(a.action)}`,
+                effectiveN: typeof h.effectiveN === "number" ? h.effectiveN : null,
+                meanNetR: (a.meanNetR as number | null) ?? null,
+                meanRegretR: (a.meanRegretR as number | null) ?? null,
+                meanCalibrationGapR: (a.meanCalibrationGapR as number | null) ?? null,
+                measuredBasis: "REAL",
+              }),
+            ),
+        );
+        const cov = (report.entry?.coverage ?? {}) as Record<string, unknown>;
+        const tier1N = typeof cov.resolvedRealMatch === "number" ? cov.resolvedRealMatch : 0;
+        const entry = [
+          judgeFourBrainReadiness("ENTRY", {
+            scope: "TIER1/ENTER_NOW (real fills)",
+            effectiveN: tier1N,
+            meanNetR: null,
+            meanCalibrationGapR: null,
+            measuredBasis: tier1N > 0 ? "REAL" : "NONE",
+          }),
+        ];
+        return {
+          direction: { ...rollUpFourBrainReadiness(direction), perScope: direction },
+          entry: { ...rollUpFourBrainReadiness(entry), perScope: entry },
+        };
+      } catch {
+        return null; // readiness is a view over the report — it must never be able to break the report
+      }
+    })();
     return {
       reportOnly: true,
       generatedAt: new Date().toISOString(),
       enabled: report !== null,
+      readiness,
       report,
     };
   });
