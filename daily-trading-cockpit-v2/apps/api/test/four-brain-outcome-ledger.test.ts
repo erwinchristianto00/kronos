@@ -272,12 +272,42 @@ describe("FourBrainOutcomeLedger", () => {
     expect(ledger.droppedPendingBeforeResolution.direction).toBe(0);
   });
 
-  it("defaults to Direction capacity 2000 / Entry capacity 10000 and tolerates bad capacity options", () => {
+  it("defaults to Direction capacity 2000 / Entry capacity 64000 and tolerates bad capacity options", () => {
     const ledger = new FourBrainOutcomeLedger({ directionCapacity: -1, entryCapacity: Number.NaN });
     for (let i = 0; i < 2001; i++) ledger.pushDirection(directionRow(i));
-    for (let i = 0; i < 10_001; i++) ledger.pushEntry(entryRow(i));
+    for (let i = 0; i < 64_001; i++) ledger.pushEntry(entryRow(i));
     expect(ledger.directionSize).toBe(2000);
-    expect(ledger.entrySize).toBe(10_000);
+    expect(ledger.entrySize).toBe(64_000);
+  });
+
+  /**
+   * 2026-07-28. The Entry capacity is not a round number picked for comfort — it is the retention
+   * Tier 1 needs to resolve anything at all, and it had been 6× too small. A pending decision must
+   * survive from decision-time until the position it caused CLOSES, because the match is only ever
+   * attempted against closed paths. This test pins the DERIVATION so the constant cannot be lowered
+   * back without confronting the measurement.
+   */
+  it("Entry capacity covers the measured close-hold distribution (why 64000, not 10000)", () => {
+    // Measured on testnet 2026-07-28 over all 300 recorded position paths.
+    const HOLD_HOURS = { p50: 2.41, p75: 4.0, p95: 4.13, max: 8.18 };
+    // Measured on the running instance: 10,310 retained rows spanning 1.75 h.
+    const DECISIONS_PER_HOUR = 10_310 / 1.75;
+    // entry-brain-tier1-realized-resolver.ts: decision.asOfMs ∈ [openedAtMs − TTL, openedAtMs].
+    const MATCH_TTL_HOURS = 50 / 60;
+    const capacity = 64_000;
+
+    const retentionHours = capacity / DECISIONS_PER_HOUR;
+    // What has to fit is decision → close: the whole hold, plus the TTL slack by which the decision
+    // may precede the open. Sizing to the median silently discards every slower trade, which biases
+    // whatever Tier 1 eventually measures toward fast exits.
+    expect(retentionHours).toBeGreaterThan(HOLD_HOURS.max + MATCH_TTL_HOURS);
+    // The old 10,000 could not even reach p50; that is why matchedRows was 0 rather than merely low.
+    expect(10_000 / DECISIONS_PER_HOUR).toBeLessThan(HOLD_HOURS.p50);
+
+    // ...and it really is the default, not just arithmetic in a test.
+    const ledger = new FourBrainOutcomeLedger({});
+    for (let i = 0; i < capacity + 1; i++) ledger.pushEntry(entryRow(i));
+    expect(ledger.entrySize).toBe(capacity);
   });
 
   it("getPendingDirectionRows/getPendingEntryRows return fresh arrays — callers cannot mutate internal state", () => {

@@ -105,7 +105,43 @@ export interface FourBrainOutcomeLedgerOptions {
 }
 
 const DEFAULT_DIRECTION_CAPACITY = 2000;
-const DEFAULT_ENTRY_CAPACITY = 10_000;
+/**
+ * 2026-07-28 — INTERIM, sized from measured hold time. Entry Tier 1 had resolved 0 of 10,000 rows,
+ * ever (`claimedTier1CloseKeys` = 0 across all cycles).
+ *
+ * A pending decision must survive from the moment it is made until the position it caused CLOSES,
+ * because the match is only attempted against CLOSED paths. The match rule itself
+ * (entry-brain-tier1-realized-resolver.ts) requires `decision.asOfMs ∈ [openedAtMs − TTL, openedAtMs]`
+ * with TTL = 50 min, so decision and open are near-simultaneous; it is the close that arrives hours
+ * later. Rate measured on the running testnet instance: 10,310 rows spanning 1.75 h ≈ 5,900
+ * decisions/hour, so a 10,000-row FIFO retained only ~1.7 h.
+ *
+ * Measured hold time over testnet's 300 recorded position paths (2026-07-28):
+ *     p50 2.41 h · p75 4.00 h · p95 4.13 h · max 8.18 h
+ *     ≤1.7 h: 117/300 (39%)   ≤4 h: 255 (85%)   ≤7 h: 298 (99%)   ≤12 h: 300 (100%)
+ * So the old cap could not even see 61% of closes — not a matcher bug, an arithmetic one. The join
+ * itself is sound: replaying it over the real stores, 120 of 121 distinct close keys have a matching
+ * decision key. Lane namespace, symbol and side all line up; only the time axis failed.
+ *
+ * 64,000 ≈ 10.9 h at that rate. What has to fit is decision → close, i.e. hold (≤ 8.18 h) plus the
+ * 50-min TTL ≈ 9.0 h worst case, leaving ~1.9 h of margin. It also sits just past
+ * ENTRY_TIER2_ELIGIBLE_AFTER_MS (10 h, direction-entry-reconciler.ts): rows are drained on Tier-2
+ * resolve anyway, so beyond that point the FIFO stops being the binding constraint and the natural
+ * lifecycle takes over. Cost is ~13 MB resident (the row is a handful of primitives).
+ *
+ * This only fixes matching GOING FORWARD. position-paths.json retains closes for 129.6 h (5.4 days)
+ * and the resolver retries all of them every run, but the decisions behind the older ones were
+ * evicted days ago and are not recoverable from any store — 298 of the 300 currently-retained closes
+ * are permanently unmatchable. Expect matchedRows to climb from 0 as new closes land, not to
+ * back-fill. Do not read a low matchedRows in the first few hours as the fix having failed.
+ *
+ * THIS IS A STOPGAP, and it is O(decisions) — it retains ~64k rows to catch a few hundred closes,
+ * because every candidate is kept on the chance it becomes a position. The correct fix is O(open
+ * positions): bind pathKey → decisionId when the position OPENS (the match rule only needs 50 min of
+ * retention for that) and resolve through the persisted binding at close. Once that lands this cap
+ * should come back down — see the note in direction-entry-reconciler.ts.
+ */
+const DEFAULT_ENTRY_CAPACITY = 64_000;
 const DEFAULT_DIRECTION_SEEN_CAPACITY = 8000;
 
 function resolveCapacity(cap: number | undefined, fallback: number): number {
