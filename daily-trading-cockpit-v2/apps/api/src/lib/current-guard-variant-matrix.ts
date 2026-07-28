@@ -42,6 +42,7 @@ import {
   REALISTIC_ROUND_TRIP_FEE_SLIP_BPS,
 } from "./shadow-engine.js";
 import { isStrongTrendRegime } from "./regime-direction-controller.js";
+import { computeATR } from "./candle-indicators.js";
 
 export const CURRENT_GUARD_VARIANT_MATRIX_LANE = "CURRENT_GUARD_VARIANT_MATRIX_V1" as const;
 export const CURRENT_GUARD_VARIANT_MATRIX_POLICY_VERSION = "current-guard-variant-matrix-v1" as const;
@@ -86,7 +87,15 @@ export type VariantMatrixVariantId =
 export const BULL_TREND_VARIANT_ID = "BL_TREND_R15_STOP200_FULL" as const;
 export const BULL_SCALEOUT_VARIANT_ID = "BL_TREND_SCALEOUT_STOP200" as const;
 
-export type VariantExitRule = "tp1_full" | "trail_after_tp1" | "scaleout_tp1_trail" | "mfe_giveback";
+// "atr_trail" and the pyramid-add simulation (walkPyramidOnConfirmedWinner, below) are OFFLINE
+// ANALYSIS additions only (Tier-2 exit-ablation audit item). Neither is referenced by any entry in
+// VARIANT_MATRIX_DEFINITIONS, so neither is ever mirrored/resolved by the live report-only cycle,
+// picked up by paper-execution-router.ts's effectiveExitRuleForOrder (which only ever returns an
+// exitRule sourced from a real PaperOrder's persisted variantExitRule or a VARIANT_MATRIX_DEFINITIONS
+// lookup), or used as a default exitRule anywhere. They exist purely so an operator-run offline
+// script (scripts/cgwide-fast-long-exit-ablation.ts) can re-walk REAL historical entries under these
+// exit architectures for comparison. liveBlocked/microPilotAllowed semantics are unaffected.
+export type VariantExitRule = "tp1_full" | "trail_after_tp1" | "scaleout_tp1_trail" | "mfe_giveback" | "atr_trail";
 export type VariantFillMode = "taker" | "maker_limit";
 
 export type VariantObservationStatus =
@@ -141,6 +150,29 @@ export const STOP_OUT_SLIPPAGE_BPS = Number(process.env.STOP_OUT_SLIPPAGE_BPS) |
 // Env-tunable so the arm/giveback can be swept without a rebuild.
 export const MFE_GIVEBACK_ARM_R = Number(process.env.MFE_GIVEBACK_ARM_R) || 0.75;
 export const MFE_GIVEBACK_FRAC = Number(process.env.MFE_GIVEBACK_FRAC) || 0.5;
+
+// --- ATR/structure trailing stop exit (offline analysis only, see VariantExitRule note above) ---
+// Ports the exact ratchet mechanic already proven out in outcome-checker.ts's trail_after_tp1
+// ATR trail (`currentStop = Math.max(currentStop, candle.close - atr)` for LONG, symmetric for
+// SHORT): once armed, the stop is a Wilder ATR multiple behind the candle CLOSE, ratcheted with
+// Math.max/Math.min so it only ever tightens toward the position, never loosens. Unlike
+// trail_after_tp1 (one-time jump to breakeven, then flat), the stop keeps moving every candle —
+// the "let a proven winner ride, protected by structure" alternative. Arms on the SAME touch
+// condition trail_after_tp1 uses (a touch of `target`), so the two are directly comparable: same
+// arm point, different post-arm management.
+export const ATR_TRAIL_ARM_TOUCHES_TARGET = true as const; // documents the arm condition (see above)
+export const ATR_TRAIL_PERIOD = Number(process.env.ATR_TRAIL_PERIOD) || 14;
+export const ATR_TRAIL_MULT = Number(process.env.ATR_TRAIL_MULT) || 1.5;
+
+// --- Pyramid-only-on-confirmed-winner (offline analysis only, see VariantExitRule note above) ---
+// This repo snapshot has no live "no-further-adds-without-progress" pyramid gate to port verbatim
+// (grepped clean), so this threshold is taken directly from the Tier-2 audit item's own spec: only
+// simulate a same-direction second entry once the FIRST leg has reached this many R of favorable
+// excursion (a direct high/low touch, mirroring the tpHit/tp1Touched convention used throughout
+// walkVariantPath) — i.e. only pyramid onto a leg that is already a "confirmed winner", never a
+// flat or losing one. See walkPyramidOnConfirmedWinner below.
+export const PYRAMID_ADD_TRIGGER_R = Number(process.env.PYRAMID_ADD_TRIGGER_R) || 1.0;
+export const PYRAMID_ADD_SIZE_MULTIPLE = Number(process.env.PYRAMID_ADD_SIZE_MULTIPLE) || 1.0;
 
 // --- Geometry constants ---
 export const WIDE_STOP_MIN_BPS = 300; // Paper-admissible wide/trail variants require >= 300bps stops
@@ -1183,6 +1215,20 @@ export async function walkVariantPath(
   // Shared trail state (trail_after_tp1 / scaleout_tp1_trail).
   let tp1Touched = false;
 
+  // atr_trail state (offline analysis only — see VariantExitRule note near its declaration).
+  // The ATR series is computed once, up front, over the FULL candle window (never recomputed
+  // per-index), the same "precompute the indicator series once, index into it per bar" pattern
+  // h6-trend-edge.ts uses. Only built when actually needed so no other exitRule pays for it.
+  let atrArmed = false;
+  let atrStopLevel = 0;
+  const atrSeries: (number | null)[] | null =
+    exitRule === "atr_trail"
+      ? computeATR(
+          candles.map((c) => ({ high: candleHigh(c), low: candleLow(c), close: candleClose(c) })),
+          ATR_TRAIL_PERIOD,
+        )
+      : null;
+
   for (let i = fillIdx; i < candles.length; i += 1) {
     const candle = candles[i]!;
     const high = candleHigh(candle);
@@ -1241,47 +1287,106 @@ export async function walkVariantPath(
       continue;
     }
 
-    // trail_after_tp1 and scaleout_tp1_trail share pre-touch + runner logic.
-    if (!tp1Touched) {
-      const slHit = slHitAtStop(S);
-      if (slHit && tpHit) {
-        const decided = resolve1m ? await resolve1m(cOpen) : null;
-        if (decided === "SL" || decided === null) {
-          return finalize("CLOSED_LOSS", -1, cCloseTime, "AMBIGUOUS_SL_FIRST", decided === "SL" ? "RESOLVED_BY_1M" : "AMBIGUOUS_SAME_CANDLE_SL_FIRST", true);
+    if (exitRule === "atr_trail") {
+      // Pre-arm: identical shape to trail_after_tp1's pre-touch block (same arm condition — a
+      // touch of `target` — so the two variants are apples-to-apples on WHEN they arm; only the
+      // post-arm management differs).
+      if (!atrArmed) {
+        const slHit = slHitAtStop(S);
+        if (slHit && tpHit) {
+          const decided = resolve1m ? await resolve1m(cOpen) : null;
+          if (decided === "SL" || decided === null) {
+            return finalize("CLOSED_LOSS", -1, cCloseTime, "AMBIGUOUS_SL_FIRST", decided === "SL" ? "RESOLVED_BY_1M" : "AMBIGUOUS_SAME_CANDLE_SL_FIRST", true);
+          }
+          // decided === "TP": armed this candle.
+          atrArmed = true;
+          atrStopLevel = E; // start the ratchet at breakeven, same floor trail_after_tp1 uses
+          if (backToEntry) {
+            return finalize("CLOSED_LOSS", 0, cCloseTime, "ATR_TRAIL_BREAKEVEN_SAME_CANDLE", "RESOLVED_BY_1M", true);
+          }
+          continue;
         }
-        // decided === "TP": TP1 reached first this candle.
-        tp1Touched = true;
-        if (backToEntry) {
-          const runnerR = 0;
-          const grossR = exitRule === "scaleout_tp1_trail" ? 0.5 * fullRewardR + 0.5 * runnerR : runnerR;
-          const status = grossR > 0 ? "CLOSED_WIN" : "CLOSED_LOSS";
-          return finalize(status, grossR, cCloseTime, "TRAIL_BREAKEVEN_SAME_CANDLE", "RESOLVED_BY_1M", true);
+        if (slHit) return finalize("CLOSED_LOSS", -1, cCloseTime, "CANDLE_WALK_SL", "VALID_5M_ORDERED", true);
+        if (tpHit) {
+          atrArmed = true;
+          atrStopLevel = E;
+          if (backToEntry) {
+            return finalize("CLOSED_LOSS", 0, cCloseTime, "ATR_TRAIL_BREAKEVEN_SAME_CANDLE", "VALID_5M_ORDERED", true);
+          }
+          continue;
         }
         continue;
       }
-      if (slHit) return finalize("CLOSED_LOSS", -1, cCloseTime, "CANDLE_WALK_SL", "VALID_5M_ORDERED", true);
-      if (tpHit) {
-        tp1Touched = true;
-        if (backToEntry) {
-          // touched TP1 then returned to entry within the same candle
-          const runnerR = 0;
-          const grossR = exitRule === "scaleout_tp1_trail" ? 0.5 * fullRewardR + 0.5 * runnerR : runnerR;
-          const status = grossR > 0 ? "CLOSED_WIN" : "CLOSED_LOSS";
-          return finalize(status, grossR, cCloseTime, "TRAIL_BREAKEVEN_SAME_CANDLE", "VALID_5M_ORDERED", true);
-        }
-        continue;
+
+      // Armed: ratchet the stop to (candle CLOSE − N×ATR) for LONG (symmetric + for SHORT), taking
+      // Math.max/Math.min so it only ever tightens toward the position — ports the exact mechanic
+      // proven out in outcome-checker.ts's trail_after_tp1 ATR trail
+      // (`currentStop = Math.max(currentStop, candle.close - atr)`), generalized to a rolling ATR
+      // series instead of a single static pre-signal ATR value. Same ordering convention as that
+      // reference: ratchet FIRST using this candle's own close, THEN test this candle's own
+      // low/high against the just-ratcheted level.
+      const atrVal = atrSeries ? atrSeries[i] : null;
+      if (atrVal !== null && atrVal !== undefined && atrVal > 0) {
+        const rawTrail = dir === "LONG" ? cClose - ATR_TRAIL_MULT * atrVal : cClose + ATR_TRAIL_MULT * atrVal;
+        atrStopLevel = dir === "LONG" ? Math.max(atrStopLevel, rawTrail) : Math.min(atrStopLevel, rawTrail);
+      }
+      const atrStopTouched = dir === "LONG" ? low <= atrStopLevel : high >= atrStopLevel;
+      if (atrStopTouched) {
+        const grossR = rewardR(dir, E, atrStopLevel, risk);
+        const status = grossR > 0 ? "CLOSED_WIN" : "CLOSED_LOSS";
+        return finalize(status, grossR, cCloseTime, "ATR_TRAIL_EXIT", "VALID_5M_ORDERED", true);
       }
       continue;
     }
 
-    // tp1Touched: trailing stop is at breakeven (E).
-    if (backToEntry) {
-      const runnerR = 0;
-      const grossR = exitRule === "scaleout_tp1_trail" ? 0.5 * fullRewardR + 0.5 * runnerR : runnerR;
-      const status = grossR > 0 ? "CLOSED_WIN" : "CLOSED_LOSS";
-      return finalize(status, grossR, cCloseTime, "TRAIL_BREAKEVEN_EXIT", "VALID_5M_ORDERED", true);
+    // trail_after_tp1 and scaleout_tp1_trail share pre-touch + runner logic.
+    if (exitRule === "trail_after_tp1" || exitRule === "scaleout_tp1_trail") {
+      if (!tp1Touched) {
+        const slHit = slHitAtStop(S);
+        if (slHit && tpHit) {
+          const decided = resolve1m ? await resolve1m(cOpen) : null;
+          if (decided === "SL" || decided === null) {
+            return finalize("CLOSED_LOSS", -1, cCloseTime, "AMBIGUOUS_SL_FIRST", decided === "SL" ? "RESOLVED_BY_1M" : "AMBIGUOUS_SAME_CANDLE_SL_FIRST", true);
+          }
+          // decided === "TP": TP1 reached first this candle.
+          tp1Touched = true;
+          if (backToEntry) {
+            const runnerR = 0;
+            const grossR = exitRule === "scaleout_tp1_trail" ? 0.5 * fullRewardR + 0.5 * runnerR : runnerR;
+            const status = grossR > 0 ? "CLOSED_WIN" : "CLOSED_LOSS";
+            return finalize(status, grossR, cCloseTime, "TRAIL_BREAKEVEN_SAME_CANDLE", "RESOLVED_BY_1M", true);
+          }
+          continue;
+        }
+        if (slHit) return finalize("CLOSED_LOSS", -1, cCloseTime, "CANDLE_WALK_SL", "VALID_5M_ORDERED", true);
+        if (tpHit) {
+          tp1Touched = true;
+          if (backToEntry) {
+            // touched TP1 then returned to entry within the same candle
+            const runnerR = 0;
+            const grossR = exitRule === "scaleout_tp1_trail" ? 0.5 * fullRewardR + 0.5 * runnerR : runnerR;
+            const status = grossR > 0 ? "CLOSED_WIN" : "CLOSED_LOSS";
+            return finalize(status, grossR, cCloseTime, "TRAIL_BREAKEVEN_SAME_CANDLE", "VALID_5M_ORDERED", true);
+          }
+          continue;
+        }
+        continue;
+      }
+
+      // tp1Touched: trailing stop is at breakeven (E).
+      if (backToEntry) {
+        const runnerR = 0;
+        const grossR = exitRule === "scaleout_tp1_trail" ? 0.5 * fullRewardR + 0.5 * runnerR : runnerR;
+        const status = grossR > 0 ? "CLOSED_WIN" : "CLOSED_LOSS";
+        return finalize(status, grossR, cCloseTime, "TRAIL_BREAKEVEN_EXIT", "VALID_5M_ORDERED", true);
+      }
+      // otherwise keep riding
+      continue;
     }
-    // otherwise keep riding
+
+    // Unknown exitRule reaching here would otherwise silently fall through with no action taken
+    // for this candle; stop the walk rather than mis-resolve it as some other rule's semantics.
+    return empty;
   }
 
   // Path ended.
@@ -1294,7 +1399,182 @@ export async function walkVariantPath(
     return finalize(status, grossR, candleCloseTime(lastCandle), "TRAIL_PATH_END", "VALID_5M_ORDERED", true);
   }
 
+  if (exitRule === "atr_trail" && atrArmed) {
+    const lastCandle = candles[candles.length - 1]!;
+    const lastClose = candleClose(lastCandle);
+    const grossR = rewardR(dir, E, lastClose, risk);
+    const status = grossR > 0 ? "CLOSED_WIN" : "CLOSED_LOSS";
+    return finalize(status, grossR, candleCloseTime(lastCandle), "ATR_TRAIL_PATH_END", "VALID_5M_ORDERED", true);
+  }
+
   return empty;
+}
+
+// ---------------------------------------------------------------------------
+// Pyramid-only-on-confirmed-winner (OFFLINE ANALYSIS ONLY — see the VariantExitRule note above).
+//
+// This is a genuinely different kind of simulation from anything else in this file: a SECOND
+// same-direction entry, added only once the FIRST leg has already shown real favorable progress
+// (a "confirmed winner"), never onto a flat or losing leg. walkVariantPath itself stays untouched
+// and single-entry for every existing caller; this is a new, additive, separately-exported
+// function that REUSES walkVariantPath for both legs rather than re-implementing exit-rule
+// branching a second time.
+// ---------------------------------------------------------------------------
+export interface PyramidWalkInput {
+  direction: Direction;
+  entryPrice: number;
+  stopLoss: number;
+  target: number;
+  exitRule: VariantExitRule;
+  fillMode: VariantFillMode;
+  openedAtMs: number;
+  candles: KlineTuple[];
+  /** R-multiple of favorable excursion (a direct high/low touch of leg 1's own risk distance,
+   *  the same touch convention tpHit/tp1Touched use elsewhere in this file) leg 1 must reach
+   *  before a same-direction add is simulated. Defaults to PYRAMID_ADD_TRIGGER_R. */
+  addTriggerR?: number;
+  /** Size of the second leg relative to the first (1.0 = equal size). Defaults to
+   *  PYRAMID_ADD_SIZE_MULTIPLE. Combined R is normalized to ONE unit of leg 1's own risk
+   *  distance, so a value <= 0 disables the add entirely (single-entry, unchanged). */
+  addSizeMultiple?: number;
+  makerFillWindowCandles?: number;
+}
+
+export interface PyramidWalkResult {
+  leg1: VariantWalkResult;
+  /** null when the add never triggered (leg 1 never reached addTriggerR while still open). */
+  leg2: VariantWalkResult | null;
+  addTriggered: boolean;
+  addOpenedAtMs: number | null;
+  addEntryPrice: number | null;
+  addSizeMultiple: number;
+  /**
+   * Combined R normalized to ONE unit of leg 1's own risk distance (leg 2 shares that exact risk
+   * distance by construction, so its grossR is already expressed in the same unit and is directly
+   * additive, scaled by addSizeMultiple). Equals leg1.grossR whenever the add never triggers or
+   * either leg is still unresolved — the single-entry case is the clean degenerate case.
+   */
+  combinedGrossR: number | null;
+}
+
+/**
+ * Walks leg 1 exactly as walkVariantPath would (in fact BY calling walkVariantPath — no exit-rule
+ * logic is duplicated). Separately scans the SAME candle path, bounded to the window leg 1 was
+ * actually open (an add can only happen while leg 1 is still live and already showing real
+ * progress — never after it has already closed), for the first direct touch of the add-trigger
+ * level. If found, opens leg 2 at that exact level with the SAME absolute risk distance and the
+ * SAME target price as leg 1 (so grossR2 is expressed in the same risk unit as grossR1 and both
+ * ride toward the same take-profit), walked forward via a second, independent walkVariantPath
+ * call. Never throws; a candle-fetch/derivation failure anywhere degrades to the leg-1-only
+ * result. Report-only; touches nothing live.
+ */
+export async function walkPyramidOnConfirmedWinner(
+  input: PyramidWalkInput,
+  resolve1m?: (fillCandleOpenMs: number) => Promise<"SL" | "TP" | null>,
+): Promise<PyramidWalkResult> {
+  const addTriggerR = input.addTriggerR ?? PYRAMID_ADD_TRIGGER_R;
+  const addSizeMultiple = input.addSizeMultiple ?? PYRAMID_ADD_SIZE_MULTIPLE;
+
+  const leg1 = await walkVariantPath(
+    {
+      direction: input.direction,
+      entryPrice: input.entryPrice,
+      stopLoss: input.stopLoss,
+      target: input.target,
+      exitRule: input.exitRule,
+      fillMode: input.fillMode,
+      openedAtMs: input.openedAtMs,
+      candles: input.candles,
+      makerFillWindowCandles: input.makerFillWindowCandles,
+    },
+    resolve1m,
+  );
+
+  const noAdd: PyramidWalkResult = {
+    leg1,
+    leg2: null,
+    addTriggered: false,
+    addOpenedAtMs: null,
+    addEntryPrice: null,
+    addSizeMultiple,
+    combinedGrossR: leg1.grossR,
+  };
+
+  if (!(addTriggerR > 0) || !(addSizeMultiple > 0)) return noAdd;
+
+  const dir = input.direction;
+  const E = input.entryPrice;
+  const S = input.stopLoss;
+  const risk = dir === "LONG" ? E - S : S - E;
+  if (!(risk > 0) || input.candles.length === 0) return noAdd;
+
+  const candles = input.candles;
+  const candleOpen = (c: KlineTuple) => Number(c[0]);
+  const candleHigh = (c: KlineTuple) => Number(c[2]);
+  const candleLow = (c: KlineTuple) => Number(c[3]);
+
+  // Only scan for the add trigger over the window leg 1 was actually open — never after it has
+  // already closed (leg1.closedAtMs). If leg 1 is still UNRESOLVED, scan the whole supplied path.
+  const legOpenMs = leg1.openedAtMs ?? input.openedAtMs;
+  const legCloseMs = leg1.closedAtMs ?? Number.POSITIVE_INFINITY;
+  const addLevel = dir === "LONG" ? E + addTriggerR * risk : E - addTriggerR * risk;
+
+  let addIdx = -1;
+  for (let i = 0; i < candles.length; i += 1) {
+    const c = candles[i]!;
+    const openMs = candleOpen(c);
+    if (openMs < legOpenMs) continue;
+    // A candle whose OPEN time is at/after leg 1's close time starts strictly AFTER leg 1 was
+    // already closed — out of scope entirely (checked BEFORE the touch test, so it can never
+    // itself trigger an add). The candle that actually closes leg 1 has openMs < legCloseMs (its
+    // own close time), so it stays in scope and a same-candle touch is still correctly evaluated.
+    if (openMs >= legCloseMs) break;
+    const touched = dir === "LONG" ? candleHigh(c) >= addLevel : candleLow(c) <= addLevel;
+    if (touched) {
+      addIdx = i;
+      break;
+    }
+  }
+
+  if (addIdx < 0) return noAdd;
+
+  const addEntryPrice = addLevel;
+  const addOpenedAtMs = candleOpen(candles[addIdx]!);
+  // Leg 2 mirrors leg 1's EXACT risk distance (so grossR2 is directly additive with grossR1 in
+  // leg-1 risk units) and rides toward the SAME take-profit price — a same-direction add, not an
+  // independent second signal.
+  const S2 = dir === "LONG" ? addEntryPrice - risk : addEntryPrice + risk;
+  const leg2Candles = candles.slice(addIdx);
+
+  const leg2 = await walkVariantPath(
+    {
+      direction: dir,
+      entryPrice: addEntryPrice,
+      stopLoss: S2,
+      target: input.target,
+      exitRule: input.exitRule,
+      fillMode: "taker", // a same-direction market add, not a fresh post-only limit
+      openedAtMs: addOpenedAtMs,
+      candles: leg2Candles,
+      makerFillWindowCandles: input.makerFillWindowCandles,
+    },
+    resolve1m,
+  );
+
+  const combinedGrossR =
+    typeof leg1.grossR === "number" && typeof leg2.grossR === "number"
+      ? leg1.grossR + leg2.grossR * addSizeMultiple
+      : leg1.grossR; // leg 2 unresolved (still open/no-fill) — report leg-1-only, conservative
+
+  return {
+    leg1,
+    leg2,
+    addTriggered: true,
+    addOpenedAtMs,
+    addEntryPrice,
+    addSizeMultiple,
+    combinedGrossR,
+  };
 }
 
 export async function resolveVariantMatrixObservations(
