@@ -80,3 +80,44 @@ describe("the trigger is wired to INTRADAY's own sample count", () => {
     expect(APP_SRC.indexOf("scalpHorizonEnabled:")).toBeGreaterThan(depsAt);
   });
 });
+
+/**
+ * CORRECTION (2026-07-28). Everything above calls laneHorizon with ROSTER lane ids. Production never
+ * does. The ids that actually reach it are variant-matrix ids, observed in the four-brain journal on
+ * both instances, and against those the "INTRADAY keeps a population" guarantee is empty: enabling
+ * SCALP moved every INTRADAY row to SCALP and left the horizon at zero. The stores agree to the
+ * minute — INTRADAY's last decision 07-27 23:48 / 07-28 01:12, SCALP's first 07-28 04:00 on both.
+ *
+ * These tests pin the TRUTH so the guarantee above is never read as protection again.
+ */
+describe("against the ids production actually sends, INTRADAY empties", () => {
+  /** Verbatim from the executive-decision journal on research and testnet, most frequent first. */
+  const REAL_CANDIDATE_IDS = [
+    "CG_WIDE_STOP_TP_WIDE", "CG_TRAIL_AFTER_TP1", "CG_TIGHT_FAST_05", "CG_BE_AFTER_05",
+    "CG_MFE_GIVEBACK", "CG_BASELINE_FAST_05", "CG_MAKER_FAST_05", "CG_BASELINE_CURRENT",
+    "CG_SCALEOUT_TP1_TRAIL", "CG_NO_FIB500_ENTRYSET", "CG_MAKER_LIMIT_SIM",
+  ];
+  const partition = (scalpEnabled: boolean) => {
+    const m: Record<string, string[]> = { SCALP: [], INTRADAY: [], SWING: [] };
+    for (const id of REAL_CANDIDATE_IDS) m[laneHorizon(id, { scalpEnabled })]!.push(id);
+    return m;
+  };
+
+  it("no real candidate id contains INTRADAY, SHORT_FADE or PANIC — the retaining branch is unreachable", () => {
+    for (const id of REAL_CANDIDATE_IDS) {
+      expect(id).not.toMatch(/INTRADAY|SHORT_FADE|PANIC/i);
+    }
+  });
+
+  it("before the promotion, INTRADAY's whole population is the FAST variants", () => {
+    expect(partition(false).INTRADAY).toEqual(["CG_TIGHT_FAST_05", "CG_BASELINE_FAST_05", "CG_MAKER_FAST_05"]);
+  });
+
+  /** THE CORRECTION. Not "INTRADAY survives with a smaller population" — it survives with none. */
+  it("after the promotion INTRADAY is EMPTY, and every one of its ids is now SCALP", () => {
+    const after = partition(true);
+    expect(after.INTRADAY).toEqual([]);
+    expect(after.SCALP).toEqual(["CG_TIGHT_FAST_05", "CG_BASELINE_FAST_05", "CG_MAKER_FAST_05"]);
+    expect(after.SWING).toEqual(partition(false).SWING); // SWING is untouched by the switch
+  });
+});

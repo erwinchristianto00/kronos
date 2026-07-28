@@ -187,6 +187,7 @@ import {
   wrapFourBrainJournalAppendForOutcomeLedger,
   type FourBrainOutcomeHorizon,
 } from "./lib/four-brain-outcome-ledger.js";
+import { loadPendingLedgerSnapshot, savePendingLedgerSnapshot } from "./lib/four-brain-pending-ledger-store.js";
 import { resolveFourBrainInstanceId, fourBrainInstanceAllowed, fourBrainShadowActive, type FourBrainBindingDeps } from "./lib/four-brain-live-gather-bindings.js";
 import { fourBrainMode } from "./lib/four-brain-types.js";
 import { getBtcAtrPercentileCacheStore, refreshBtcAtrPercentileCache } from "./lib/btc-atr-percentile-cache.js";
@@ -2212,14 +2213,32 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     // gated.
     const directionEntryOutcomeStore = getDirectionEntryOutcomeStore();
     if (directionEntryReconcilerActive(process.env)) {
+      // Durable snapshot FIRST (2026-07-28). The journal replay below can only see ~2.4h — the two
+      // journal files together — so INTRADAY (4h) and SWING (24h) rows could never survive a restart,
+      // and research/3101 with its 254 restarts had never once held a resolved SWING row. This file
+      // holds the pending rows themselves and has no such window. Journal replay still runs after, as
+      // a second source; ids restored here are fed through its existing hasProcessed* predicates so a
+      // row present in both is admitted exactly once (pushEntry, unlike pushDirection, does not dedup).
+      const snapshot = loadPendingLedgerSnapshot();
+      for (const row of snapshot.direction) fourBrainOutcomeLedger.pushDirection(row);
+      for (const row of snapshot.entry) fourBrainOutcomeLedger.pushEntry(row);
+      const restoredDirectionIds = new Set(snapshot.direction.map((r) => r.decisionId));
+      const restoredEntryIds = new Set(snapshot.entry.map((r) => r.decisionId));
+      console.log(
+        `[four-brain-pending-snapshot] instance=${resolveFourBrainInstanceId(process.env)} ` +
+          `direction=${snapshot.direction.length} entry=${snapshot.entry.length} ` +
+          `skipped=${snapshot.skippedReason ?? "none"}`,
+      );
       const rehydrated = rehydrateFourBrainOutcomeLedgerFromJournals({
         ledger: fourBrainOutcomeLedger,
         journalFiles: [
           "data/four-brain-decision-journal.jsonl.1",
           "data/four-brain-decision-journal.jsonl",
         ],
-        hasProcessedDirection: (decisionId) => directionEntryOutcomeStore.hasProcessedDirection(decisionId),
-        hasProcessedEntry: (decisionId) => directionEntryOutcomeStore.hasProcessedEntry(decisionId),
+        hasProcessedDirection: (decisionId) =>
+          restoredDirectionIds.has(decisionId) || directionEntryOutcomeStore.hasProcessedDirection(decisionId),
+        hasProcessedEntry: (decisionId) =>
+          restoredEntryIds.has(decisionId) || directionEntryOutcomeStore.hasProcessedEntry(decisionId),
       });
       console.log(
         `[four-brain-outcome-rehydrate] instance=${resolveFourBrainInstanceId(process.env)} ` +
@@ -2659,6 +2678,14 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         })
           .then((res) => {
             if (!res) return; // single-flight skip — a prior cycle is still in flight
+            // Persist the pending rows every cycle. This is the ONLY thing standing between a SWING
+            // decision and the next restart: rows are small and bounded by the ledger's own FIFO, so
+            // the write is cheap next to the candle fetches this cycle just did. Failure is swallowed
+            // inside the store — durability must never cost the reconciler its cycle.
+            savePendingLedgerSnapshot({
+              direction: fourBrainOutcomeLedger.getPendingDirectionRows(),
+              entry: fourBrainOutcomeLedger.getPendingEntryRows(),
+            });
             console.log(
               `[direction-entry-reconciler] instance=${resolveFourBrainInstanceId(process.env)} ` +
                 `directionProcessed=${res.directionProcessed} entryProcessed=${res.entryProcessed} ` +

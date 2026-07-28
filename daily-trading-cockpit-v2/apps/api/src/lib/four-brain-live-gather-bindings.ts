@@ -50,6 +50,24 @@ const SCALP_ELIGIBLE = (id: string): boolean => id.includes("FAST");
  * The cutover is clean rather than destructive — a decision's horizon is stamped when it is made, so
  * everything already pending resolves under the horizon it was taken at. INTRADAY keeps every sample
  * it earned; SCALP starts fresh from the switch.
+ *
+ * CORRECTION (2026-07-28, measured hours after the above shipped). The first paragraph's promise —
+ * that SHORT_FADE / PANIC / INTRADAY hold INTRADAY's population through the promotion — is FALSE in
+ * production, and the test that "proved" it only ever called this function with roster lane ids.
+ * The ids that actually reach here are VARIANT-MATRIX ids (`CG_TIGHT_FAST_05`, `CG_BASELINE_CURRENT`,
+ * `CG_WIDE_STOP_TP_WIDE`, `CG_TRAIL_AFTER_TP1`, …). None contains INTRADAY, SHORT_FADE or PANIC, so
+ * the branch that was meant to retain a population retains NOTHING: every id containing FAST promotes
+ * to SCALP and every other id falls through to SWING.
+ *
+ * The handover is visible to the millisecond in both stores. INTRADAY's last decision: 07-27 23:48
+ * (research) / 07-28 01:12 (testnet). SCALP's first: 07-28 04:00 on both. **Enabling SCALP emptied
+ * INTRADAY completely** — the exact outcome the staging was built to avoid.
+ *
+ * Left in place deliberately rather than reverted: INTRADAY had already earned its verdict at
+ * effectiveN 39-44 (LONG -0.4753R, WR 20.7% ⇒ NOT_READY, proven negative), which is precisely the
+ * condition the promotion waits for. Measurement moved from a question already answered to one that
+ * is not. What was wrong was the CLAIM, not the promotion — so INTRADAY is now a frozen horizon
+ * holding a finished verdict, and anyone reading its unchanging n should know that is why.
  */
 export function laneHorizon(laneId: string, opts?: { scalpEnabled?: boolean }): DirectionHorizon {
   const id = laneId.toUpperCase();
