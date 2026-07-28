@@ -75,3 +75,33 @@ describe("the invariants it must not break", () => {
     expect(d.action).not.toBe("SHORT");
   });
 });
+
+describe("an inherited regime edge must not block the bootstrap", () => {
+  /** THE REASON THE FIRST ATTEMPT NEVER FIRED. edge-memory is scoped by REGIME and shared across
+   *  horizons, so a newborn horizon inherits readings from decisions taken elsewhere — live SCALP
+   *  carried "SHORT -0.274R at n=4 < 30". Requiring both edges to be null meant coldStart was never
+   *  true and SCALP stayed 100% FLAT. FAILS WITHOUT THE FIX. */
+  it("fires even when an inherited sub-threshold edge exists", () => {
+    const d = decideDirection(
+      directionInput({
+        longEdge: src(null), shortEdge: src(-0.274), shortEdgeN: 4,
+        longLaneEdge: src(null), shortLaneEdge: src(0.2), controllerBias: "SHORT",
+        horizonResolvedN: 0,
+      }),
+    );
+    expect(d.action).not.toBe("FLAT");
+    expect(d.supportingSignals.some((s) => s.includes("cold-start"))).toBe(true);
+  });
+
+  /** ...but an inherited edge that IS conclusive still bars that side. */
+  it("still respects an inherited PROVEN_BELOW", () => {
+    const d = decideDirection(
+      directionInput({
+        longEdge: src(null), shortEdge: src(-0.5), shortEdgeN: DIRECTION_EDGE_MIN_SAMPLES,
+        longLaneEdge: src(null), shortLaneEdge: src(0.3), controllerBias: "SHORT",
+        horizonResolvedN: 0,
+      }),
+    );
+    expect(d.action).not.toBe("SHORT");
+  });
+});

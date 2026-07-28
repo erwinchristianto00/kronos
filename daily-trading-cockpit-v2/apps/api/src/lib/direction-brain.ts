@@ -292,7 +292,14 @@ export function decideDirection(input: DirectionInput): DirectionDecision {
    * mature horizon. The 2026-07-25 regression is untouched — a side with a measured edge makes this
    * false, so a no-evidence side still cannot outrank a measured-good one.
    */
-  const coldStart = longEdge === null && shortEdge === null && input.horizonResolvedN === 0;
+  /* Keyed ONLY on the horizon's own resolved count. The first attempt also demanded both edges be
+   * null, which never held and so never fired: edge-memory is scoped by REGIME and shared across
+   * every horizon, so a newborn horizon inherits readings like "SHORT -0.274R at n=4" from decisions
+   * taken elsewhere. Those are not this horizon's evidence, and they are exactly what the deadlock
+   * hides behind — sub-threshold numbers that prove nothing yet still make the side look measured.
+   * PROVEN_BELOW still bars a side outright below, so an inherited edge that IS conclusive keeps its
+   * veto. */
+  const coldStart = input.horizonResolvedN === 0;
   if (coldStart) supporting.push("horizon has resolved nothing yet → cold-start exploration (not conviction)");
   const explorationOpen = (self: EdgeStanding, other: EdgeStanding): boolean =>
     (self === "UNPROVEN" && other === "PROVEN_BELOW") || (coldStart && self === "UNPROVEN");
