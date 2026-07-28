@@ -161,6 +161,7 @@ import {
 } from "./lib/current-guard-variant-matrix.js";
 import { getLatestScanCandidates } from "./lib/latest-scan-candidates-cache.js";
 import { kronosAgreeFromScan } from "./lib/kronos-agree-reading.js";
+import { getKronosBtcAnchorCache, refreshKronosBtcAnchor } from "./lib/kronos-btc-anchor-cache.js";
 import { buildRegimeDirectionControllerReport } from "./lib/regime-direction-controller.js";
 import { getRegimeDirectionControllerSnapshotStore } from "./lib/regime-direction-controller-snapshot.js";
 import { getRegimeEdgeMemory } from "./lib/regime-edge-memory.js";
@@ -2281,6 +2282,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     // 3103 (live) never schedules this extra fetch either, matching every other four-brain-only interval in
     // this block.
     const btcAtrPercentileCache = getBtcAtrPercentileCacheStore();
+    const kronosBtcAnchorCache = getKronosBtcAnchorCache();
     let fourBrainBtcFlowCache: {
       sentiment: number | null;
       crowdAlignLong: number | null;
@@ -2442,9 +2444,16 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         // serialises inference through one global concurrency slot, so an independent per-tick consumer
         // would contend with the scanner for it. See kronos-agree-reading.ts for the −1..1 mapping and
         // for why an absent/zero-confidence opinion returns null rather than 0.
+        // 2026-07-28 (second pass): the scan reading alone was MISSING on 100% of decisions, because
+        // `top10` is an OPPORTUNITY ranking and BTC — the calmest large-cap there is — almost never
+        // earns a slot in one. An anchor must not have to qualify as an opportunity first. So the
+        // scan stays the PREFERRED source (free, in memory, freshest) and the dedicated BTC producer
+        // below is the fallback for the usual case where BTC did not make the list.
         ...(() => {
-          const k = kronosAgreeFromScan(scanCached?.candidates, "BTCUSDT", parseAtMs(scanCached?.scanFinishedAt));
-          return { kronosAgree: k.agree, kronosAtMs: k.atMs };
+          const fromScan = kronosAgreeFromScan(scanCached?.candidates, "BTCUSDT", parseAtMs(scanCached?.scanFinishedAt));
+          if (fromScan.agree !== null) return { kronosAgree: fromScan.agree, kronosAtMs: fromScan.atMs };
+          const anchor = kronosBtcAnchorCache.get();
+          return { kronosAgree: anchor.agree, kronosAtMs: anchor.atMs };
         })(),
         // STAGED SCALP (2026-07-28). SCALP was unreachable — laneHorizon() could only return INTRADAY
         // or SWING, so no candidate ever carried it and the SCALP direction decision could never
@@ -2631,6 +2640,18 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       // ample (mirrors SYMBOL_VOLATILITY_REFRESH_INTERVAL_MS's 20min choice for the same reason). Near-immediate
       // warm-up fire so the value isn't null for the first full interval if avoidable; both calls are
       // fire-and-forget (refreshBtcAtrPercentileCache never throws — fail-open, see its own doc comment).
+      // BTC anchor for kronosAgree — same 15-min cadence and same gating as the ATR producer beside
+      // it, so 3103 (live) never schedules this extra inference either. Deliberately NOT per-tick:
+      // kronos.ts serialises inference through one global concurrency slot and a five-minute consumer
+      // would contend with the scanner for it.
+      const runKronosBtcAnchorRefresh = (): void => {
+        void refreshKronosBtcAnchor(
+          kronosBtcAnchorCache,
+          (symbol, interval, limit) => binanceClient.getCandles(symbol, interval, limit),
+          (symbol, timeframe, candles) => kronosClient.predict(symbol, timeframe, candles),
+          Date.now(),
+        );
+      };
       const runBtcAtrPercentileRefresh = (): void => {
         void refreshBtcAtrPercentileCache(btcAtrPercentileCache, (symbol, interval, limit) =>
           binanceClient.getCandles(symbol, interval, limit),
@@ -2638,6 +2659,9 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       };
       setTimeout(runBtcAtrPercentileRefresh, 10_000);
       setInterval(runBtcAtrPercentileRefresh, 15 * 60_000);
+      // Offset from the ATR refresh so the two BTC producers never fire in the same tick.
+      setTimeout(runKronosBtcAnchorRefresh, 20_000);
+      setInterval(runKronosBtcAnchorRefresh, 15 * 60_000);
 
       const refreshFourBrainBtcFlow = (): void => {
         void binanceClient.getFuturesFlow("BTCUSDT")

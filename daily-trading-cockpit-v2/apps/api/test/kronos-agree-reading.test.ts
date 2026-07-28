@@ -1,3 +1,11 @@
+/**
+ * SCALE CORRECTION (2026-07-28). The fixtures below used to pass 0.8 / 0.1 / 0.95, i.e. the 0..1
+ * scale the implementation wrongly assumed. `kronosConfidence` is 0..100 — tracker.ts's own buckets
+ * settle it (<45 WEAK, <70 MEDIUM, >=70 STRONG) and every live scan row measured that day carried
+ * exactly 100. Under the old code `Math.min(1, confidence)` saturated every real reading to 1.0, so
+ * these tests passed while production could not distinguish a 46 from a 99. Fixtures now use the
+ * scale producers actually emit. See kronos-btc-anchor.test.ts for the fail-without/pass-with pair.
+ */
 import { describe, it, expect } from "vitest";
 import { kronosAgreeFromScan } from "../src/lib/kronos-agree-reading.js";
 import type { Candidate } from "@dtc/shared";
@@ -11,7 +19,7 @@ import type { Candidate } from "@dtc/shared";
  */
 const AT = 1_800_000_000_000;
 const cand = (o: Partial<Candidate> = {}): Candidate =>
-  ({ symbol: "BTCUSDT", selectedKronosBias: "LONG", kronosConfidence: 0.8, ...o }) as unknown as Candidate;
+  ({ symbol: "BTCUSDT", selectedKronosBias: "LONG", kronosConfidence: 80, ...o }) as unknown as Candidate;
 
 describe("kronosAgreeFromScan — mapping to −1..1", () => {
   it("LONG is positive and SHORT is negative, scaled by the model's own confidence", () => {
@@ -20,13 +28,13 @@ describe("kronosAgreeFromScan — mapping to −1..1", () => {
   });
 
   it("a hesitant call cannot push as hard as a certain one", () => {
-    const weak = kronosAgreeFromScan([cand({ kronosConfidence: 0.1 })], "BTCUSDT", AT).agree!;
-    const strong = kronosAgreeFromScan([cand({ kronosConfidence: 0.95 })], "BTCUSDT", AT).agree!;
+    const weak = kronosAgreeFromScan([cand({ kronosConfidence: 10 })], "BTCUSDT", AT).agree!;
+    const strong = kronosAgreeFromScan([cand({ kronosConfidence: 95 })], "BTCUSDT", AT).agree!;
     expect(Math.abs(weak)).toBeLessThan(Math.abs(strong));
   });
 
   it("stays inside −1..1 even if a confidence ever arrives out of range", () => {
-    expect(kronosAgreeFromScan([cand({ kronosConfidence: 4 })], "BTCUSDT", AT).agree).toBe(1);
+    expect(kronosAgreeFromScan([cand({ kronosConfidence: 400 })], "BTCUSDT", AT).agree).toBe(1);
   });
 
   it("prefers the scanner's resolved pick over the single-timeframe fallback", () => {

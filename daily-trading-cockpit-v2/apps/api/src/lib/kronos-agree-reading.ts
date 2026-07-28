@@ -1,4 +1,4 @@
-import type { Candidate } from "@dtc/shared";
+import type { Candidate, KronosPrediction } from "@dtc/shared";
 
 /**
  * KRONOS-AGREE for the four-brain Direction Brain (2026-07-28, PURE — no I/O).
@@ -29,6 +29,33 @@ import type { Candidate } from "@dtc/shared";
  * null — never 0, which the consumer would read as a real "no opinion" reading rather than as an
  * absent one, and which classifySource would then stamp FRESH.
  */
+/**
+ * `kronosConfidence` is on a **0–100 scale**, not 0–1. tracker.ts's own bucket thresholds settle it
+ * beyond argument: `< 45 WEAK`, `< 70 MEDIUM`, `>= 70 STRONG`. Every live scan row measured on
+ * 2026-07-28 carried exactly `100`.
+ *
+ * Both readers here used to do `Math.min(1, confidence)`, which SATURATES every non-zero confidence
+ * to 1.0 — a 46 and a 99 pushed the Direction score identically hard. That silently defeated the one
+ * thing the magnitude exists to do, stated in this file's own doc: "a hesitant call cannot push the
+ * score as hard as a certain one." It could, and always did.
+ *
+ * Divide first, then clamp. A value that arrives already in 0..1 (no producer does this today) maps
+ * to a near-zero magnitude rather than a saturated one — understating an opinion is the safe
+ * direction here, and it stays visible instead of masquerading as certainty.
+ *
+ * NOTE, not fixed here: meta-label-gate.ts:213 does `clamp(kronosConfidence, 0, 1)` on the same
+ * field and has the same saturation. Different lane, different consumer — flagged, not touched.
+ */
+export const KRONOS_CONFIDENCE_SCALE_MAX = 100;
+
+function normalizedConfidence(raw: unknown): number | null {
+  if (typeof raw !== "number" || !Number.isFinite(raw)) return null;
+  const magnitude = Math.max(0, Math.min(1, raw / KRONOS_CONFIDENCE_SCALE_MAX));
+  // A zero-confidence LONG is not an opinion. Returning 0 would be indistinguishable from a genuine
+  // neutral reading and would be stamped FRESH by the consumer; absent is the honest answer.
+  return magnitude === 0 ? null : magnitude;
+}
+
 export interface KronosAgreeReading {
   /** −1..1, or null when Kronos had no usable opinion for this symbol. NEVER 0-as-missing. */
   agree: number | null;
@@ -53,14 +80,41 @@ export function kronosAgreeFromScan(
   const bias = row.selectedKronosBias ?? row.kronosBias ?? null;
   if (bias !== "LONG" && bias !== "SHORT") return NONE; // UNAVAILABLE / null / anything else
 
-  const confidence = row.kronosConfidence;
-  if (typeof confidence !== "number" || !Number.isFinite(confidence)) return NONE;
-
-  const magnitude = Math.max(0, Math.min(1, confidence));
-  // A zero-confidence LONG is not an opinion. Returning 0 would be indistinguishable from a genuine
-  // neutral reading and would be stamped FRESH by the consumer; absent is the honest answer.
-  if (magnitude === 0) return NONE;
+  const magnitude = normalizedConfidence(row.kronosConfidence);
+  if (magnitude === null) return NONE;
   if (scanFinishedAtMs === null || !Number.isFinite(scanFinishedAtMs)) return NONE;
 
   return { agree: bias === "LONG" ? magnitude : -magnitude, atMs: scanFinishedAtMs };
+}
+
+/**
+ * The SAME mapping, applied to a prediction fetched directly rather than lifted out of a scan row.
+ *
+ * WHY THIS EXISTS (2026-07-28, measured). The scan reader above needs BTCUSDT to be present in the
+ * scan's `top10`, and `top10` is an OPPORTUNITY RANKING — it is ordered by how tradeable a symbol
+ * looks right now, so it fills with movers (measured that day: SEI, SUI, WLD, NEAR, BNB, SOL, every
+ * one of them carrying a perfectly good Kronos bias). BTC is the calmest large-cap in the universe
+ * and therefore almost never earns a slot. Result: `kronosAgree` read MISSING on 100% of Direction
+ * decisions on both instances, with the data sitting right there.
+ *
+ * The defect is conceptual, not mechanical. BTC is used here as the MARKET ANCHOR, and an anchor
+ * must not have to qualify as an opportunity first. So the anchor gets its own reading.
+ *
+ * The scan reader stays the preferred source — it is free, already in memory, and freshest. This is
+ * the fallback for the (usual) case where BTC did not make the list. Its producer runs on its OWN
+ * low-frequency interval rather than per four-brain tick, because kronos.ts serialises inference
+ * through one global concurrency slot: a per-tick consumer would contend with the scanner for it,
+ * which is exactly why the original author read from the scan instead of calling predict().
+ */
+export function kronosAgreeFromPrediction(
+  prediction: KronosPrediction | null | undefined,
+  observedAtMs: number | null,
+): KronosAgreeReading {
+  if (!prediction || prediction.available !== true) return NONE;
+  const bias = prediction.selectedKronosBias ?? prediction.kronosBias ?? null;
+  if (bias !== "LONG" && bias !== "SHORT") return NONE;
+  const magnitude = normalizedConfidence(prediction.kronosConfidence);
+  if (magnitude === null) return NONE;
+  if (observedAtMs === null || !Number.isFinite(observedAtMs)) return NONE;
+  return { agree: bias === "LONG" ? magnitude : -magnitude, atMs: observedAtMs };
 }
