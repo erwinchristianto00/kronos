@@ -123,12 +123,65 @@ type DirectionEntryOutcomeReport = {
   };
   cycleMeta: { lastRunAtIso: string | null; lastProcessed: number; lastError: string | null };
 };
+// 2026-07-28: the READINESS VERDICT. Until now this card showed four raw columns (n / WR / meanR /
+// regret / calib-gap) and no answer to the only question an operator actually has — is this brain
+// good enough to act on yet. CORTEX has had a readiness meter since it was built; the four brains
+// had none. Computed server-side (four-brain-readiness.ts); optional here so an older backend that
+// does not send it simply renders nothing rather than breaking the card.
+type FourBrainReadinessGate = {
+  gate: 'EVIDENCE' | 'EDGE' | 'SELECTION' | 'CALIBRATION';
+  passed: boolean | null;
+  value: number | null;
+  detail: string;
+};
+type FourBrainReadinessScope = {
+  scope: string;
+  verdict: 'READY' | 'NOT_READY' | 'INSUFFICIENT_EVIDENCE' | 'NOT_READY_SIMULATED_ONLY';
+  summary: string;
+  gates: FourBrainReadinessGate[];
+};
+type FourBrainReadinessBlock = {
+  verdict: FourBrainReadinessScope['verdict'];
+  summary: string;
+  perScope: FourBrainReadinessScope[];
+};
 type DirectionEntryOutcomesResponse = {
   reportOnly: true;
   generatedAt: string;
   enabled: boolean;
+  readiness?: { direction: FourBrainReadinessBlock; entry: FourBrainReadinessBlock } | null;
   report: DirectionEntryOutcomeReport | null;
 };
+
+/** READY is the only green. NOT_READY_SIMULATED_ONLY is deliberately NOT neutral — a brain whose
+ *  numbers look excellent but come entirely from a counterfactual walk is the single most dangerous
+ *  thing on this card, so it reads as a warning, not as "still collecting". */
+const readinessColor = (v: FourBrainReadinessScope['verdict']): string =>
+  v === 'READY' ? C.good : v === 'NOT_READY' ? C.bad : v === 'NOT_READY_SIMULATED_ONLY' ? C.accent : C.dim;
+const readinessLabel = (v: FourBrainReadinessScope['verdict']): string =>
+  v === 'READY' ? 'SIAP' : v === 'NOT_READY' ? 'BELUM SIAP' : v === 'NOT_READY_SIMULATED_ONLY' ? 'SIMULASI SAJA' : 'BUKTI KURANG';
+
+function ReadinessVerdict({ block, title }: { block: FourBrainReadinessBlock | undefined; title: string }) {
+  if (!block) return null;
+  return (
+    <div style={{ marginBottom: 10, padding: '8px 10px', borderRadius: 6, background: C.track, border: `1px solid ${C.border}` }}>
+      <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap' }}>
+        <span style={{ fontSize: 11, color: C.dim, textTransform: 'uppercase', letterSpacing: 0.4 }}>{title}</span>
+        <span style={{ fontSize: 14, fontWeight: 700, color: readinessColor(block.verdict) }}>{readinessLabel(block.verdict)}</span>
+        <span style={{ fontSize: 12, color: C.sub }}>{block.summary}</span>
+      </div>
+      <div style={{ marginTop: 6, display: 'grid', gap: 2 }}>
+        {block.perScope.map((s) => (
+          <div key={s.scope} style={{ fontSize: 11, color: C.dim, display: 'flex', gap: 6 }}>
+            <span style={{ minWidth: 150, color: C.sub }}>{s.scope}</span>
+            <span style={{ minWidth: 92, color: readinessColor(s.verdict) }}>{readinessLabel(s.verdict)}</span>
+            <span>{s.summary}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
 
 const isExecutiveDecision = (r: RecentRecord): r is ExecutiveDecisionRecord => r.kind === 'EXECUTIVE_DECISION';
 const isMarketSnapshot = (r: RecentRecord): r is MarketSnapshotRecord => r.kind === 'MARKET_SNAPSHOT';
@@ -363,6 +416,7 @@ export function FourBrainDashboardCard() {
             <div style={{ fontSize: 12, color: C.dim, textTransform: 'uppercase', letterSpacing: 0.4, marginBottom: 6 }}>
               Performance — Direction Brain (measured, BTCUSDT proxy)
             </div>
+            <ReadinessVerdict block={deo?.readiness?.direction} title="Vonis kesiapan" />
             {deo == null ? (
               <div style={{ fontSize: 12, color: C.dim }}>loading…</div>
             ) : !deo.enabled || deReport == null ? (
@@ -422,6 +476,7 @@ export function FourBrainDashboardCard() {
             <div style={{ fontSize: 12, color: C.dim, textTransform: 'uppercase', letterSpacing: 0.4, marginBottom: 6 }}>
               Performance — Entry Brain (measured, Tier 1 real fill + Tier 2 simulated — tidak pernah digabung)
             </div>
+            <ReadinessVerdict block={deo?.readiness?.entry} title="Vonis kesiapan" />
             {deo == null ? (
               <div style={{ fontSize: 12, color: C.dim }}>loading…</div>
             ) : !deo.enabled || deReport == null ? (
