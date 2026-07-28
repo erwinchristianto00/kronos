@@ -512,8 +512,8 @@ export class ExitBrainShadowStore {
       processed === 0
         ? "No resolved trades processed yet."
         : coverageRatio === 0
-          ? "0% of resolved trades carry enough recorded path ticks to score the exit policy — today's stores persist at most a 4-point skeleton (open, MFE-peak, MAE-trough, close). A dense per-tick path recorder must land before the Exit Brain can be shadow-proven."
-          : `${(coverageRatio! * 100).toFixed(1)}% of resolved trades were dense enough to score (min ${DEFAULT_EXIT_BRAIN_PARAMS.minEvaluableTicks} ticks).`;
+          ? "0% of resolved trades carry a recorded path. The dense recorder EXISTS (position-path-recorder.ts) — it is simply not attached to whatever executed these trades. Only two writers call recordTick: live-execution-engine.ts and single-symbol-lane-executor.ts. An instance running neither (research) can only ever hold 4-point skeletons rebuilt from aggregates, and this reads 0% by construction, not by defect. Do NOT respond by lowering minEvaluableTicks — see the DO-NOT-LOWER note in exit-brain-policy.ts."
+          : `${(coverageRatio! * 100).toFixed(1)}% of resolved trades were dense enough to score (min ${DEFAULT_EXIT_BRAIN_PARAMS.minEvaluableTicks} ticks). The rest are 4-point skeletons from executors that write no ticks — coverage is bounded by which executor ran the trade, never by the threshold.`;
     return {
       reportOnly: true,
       coverage: {
