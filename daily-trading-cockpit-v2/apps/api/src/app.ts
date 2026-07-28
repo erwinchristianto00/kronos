@@ -11,7 +11,7 @@ import { HttpSocialClient } from "./lib/social.js";
 import { SignalTracker } from "./lib/tracker.js";
 import { BinanceWhaleClient } from "./lib/whale.js";
 import { registerKronosRoutes } from "./routes/kronos.js";
-import { registerLiveRoutes } from "./routes/live.js";
+import { registerLiveRoutes, type WalletReconciliationDeps } from "./routes/live.js";
 import { registerNotificationRoutes } from "./routes/notifications.js";
 import { registerOutcomesRoutes } from "./routes/outcomes.js";
 import { registerScanRoute } from "./routes/scan.js";
@@ -112,6 +112,10 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
   // no private client is constructed, no loop runs, nothing else in the app changes.
   // Strategy code is untouched — the engine only READS the paper store's decisions.
   const liveConfig = parseLiveExecutionConfig();
+  // Wallet-reconciliation deps: report-only, additive. Built from the SAME already-authenticated
+  // liveClient (no second client/credential path) plus a read-only view of liveEngine's status.
+  // See lib/wallet-reconciliation.ts — never touches order/position/ledger-accumulation logic.
+  let walletReconciliation: WalletReconciliationDeps | null = null;
   if (liveConfig.enabled && liveConfig.configErrors.length === 0 && liveConfig.env) {
     const liveClient = new BinanceFuturesPrivateClient({
       apiKey: liveConfig.apiKey,
@@ -125,9 +129,13 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       store: new LiveExecutionStore(),
       paperStore: getPaperExecutionRouterStore(),
     });
+    walletReconciliation = { client: liveClient, ledgerSource: liveEngine };
     if (!isTest) liveEngine.start();
   }
-  await registerLiveRoutes(app, liveEngine, { configErrors: liveConfig.enabled ? liveConfig.configErrors : [] });
+  await registerLiveRoutes(app, liveEngine, {
+    configErrors: liveConfig.enabled ? liveConfig.configErrors : [],
+    walletReconciliation,
+  });
 
   return app;
 }

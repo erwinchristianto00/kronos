@@ -72,3 +72,40 @@ if (process.env.PAPER_AUTO_CYCLE !== "0") {
   setInterval(tick, intervalMin * 60_000);
   console.log(`[API] PAPER_AUTO_CYCLE on — paper admission+resolution every ${intervalMin}min (timeout ${timeoutMs}ms)`);
 }
+
+// ── Headless wallet-reconciliation ticker ────────────────────────────────────
+// Report-only: periodically hits GET /api/live/wallet-reconciliation, whose handler compares
+// LiveDailyLedger's internal realized PnL against Binance's own /fapi/v1/income history for the
+// UTC day and (server-side, in that handler) logs a warning if the delta exceeds tolerance. This
+// block is ONLY a trigger — same role as the PAPER_AUTO_CYCLE tick above — so the check still
+// runs even when no dashboard is polling it. It never arms/disarms/kills/cancels/closes anything;
+// see lib/wallet-reconciliation.ts. Route responds {enabled:false} harmlessly when live execution
+// is off, so this is safe to always schedule; it's still gated on LIVE_EXECUTION_ENABLED to avoid
+// pointless requests (and log noise) on instances that never run live at all.
+if (process.env.LIVE_EXECUTION_ENABLED === "1" && process.env.WALLET_RECONCILIATION_AUTO_CHECK !== "0") {
+  const intervalHours = Math.max(1, Number(process.env.WALLET_RECONCILIATION_CHECK_HOURS ?? 6));
+  const url = `http://127.0.0.1:${port}/api/live/wallet-reconciliation`;
+  let reconciliationCheckInFlight = false;
+  const reconciliationTick = (): void => {
+    if (reconciliationCheckInFlight) {
+      console.warn("[API] wallet-reconciliation tick skipped: previous tick still running");
+      return;
+    }
+    reconciliationCheckInFlight = true;
+    fetch(url)
+      .then(async (res) => {
+        if (!res.ok) {
+          console.warn(`[API] wallet-reconciliation tick returned HTTP ${res.status}`);
+        }
+        // Note: the route handler itself already console.warn()s on an over-tolerance mismatch —
+        // this block only surfaces transport-level failures, it never re-derives the verdict.
+      })
+      .catch((e) => console.warn(`[API] wallet-reconciliation tick failed: ${(e as Error).message}`))
+      .finally(() => {
+        reconciliationCheckInFlight = false;
+      });
+  };
+  setTimeout(reconciliationTick, 90_000); // stagger after the paper-cycle's first run
+  setInterval(reconciliationTick, intervalHours * 60 * 60_000);
+  console.log(`[API] WALLET_RECONCILIATION_AUTO_CHECK on — every ${intervalHours}h (report-only, GET ${url})`);
+}

@@ -148,6 +148,23 @@ export interface FuturesUserTrade {
   time: number;
 }
 
+/**
+ * A single row from GET /fapi/v1/income — the exchange's own ledger of everything actually
+ * posted to the futures wallet (realized PnL, funding, commission, transfers, etc). This is
+ * ground truth: unlike userTrades (which the engine must match back to its own order ids to
+ * attribute PnL), income rows are exactly "what the wallet balance changed by and why".
+ */
+export interface FuturesIncomeEntry {
+  symbol: string;
+  /** e.g. REALIZED_PNL | FUNDING_FEE | COMMISSION | TRANSFER | WELCOME_BONUS | INSURANCE_CLEAR | ... */
+  incomeType: string;
+  /** Signed USD-margined amount (Binance returns this as a string; already parsed to number). */
+  income: number;
+  asset: string;
+  time: number;
+  tranId: number;
+}
+
 export interface PlaceOrderParams {
   symbol: string;
   side: "BUY" | "SELL";
@@ -542,6 +559,40 @@ export class BinanceFuturesPrivateClient {
       commissionAsset: String((t as { commissionAsset?: unknown }).commissionAsset ?? ""),
       time: toNum((t as { time?: unknown }).time),
     }));
+  }
+
+  /**
+   * GET /fapi/v1/income — the exchange's own income ledger (realized PnL, funding, commission,
+   * transfers, etc). Read-only reporting endpoint; used by the wallet-reconciliation module to
+   * cross-check LiveDailyLedger against what Binance actually posted. Same signed-GET path as
+   * every other signed getter here (retries on timeout/429/network, refuses on clock skew).
+   * Binance caps a single call at 1000 rows — callers wanting a full day should page on time
+   * themselves (see wallet-reconciliation.ts) rather than this method silently looping.
+   */
+  async getIncomeHistory(
+    opts: { symbol?: string; incomeType?: string; startTime?: number; endTime?: number; limit?: number } = {},
+  ): Promise<FuturesIncomeEntry[]> {
+    const parsed = await this.requestSigned("GET", "/fapi/v1/income", {
+      symbol: opts.symbol,
+      incomeType: opts.incomeType,
+      startTime: opts.startTime,
+      endTime: opts.endTime,
+      limit: opts.limit ?? 1000,
+    });
+    if (!Array.isArray(parsed)) return [];
+    return parsed.map((e) => this.mapIncomeEntry(e));
+  }
+
+  private mapIncomeEntry(raw: unknown): FuturesIncomeEntry {
+    const e = raw as Record<string, unknown>;
+    return {
+      symbol: String(e.symbol ?? ""),
+      incomeType: String(e.incomeType ?? ""),
+      income: toNum(e.income),
+      asset: String(e.asset ?? ""),
+      time: toNum(e.time),
+      tranId: toNum(e.tranId),
+    };
   }
 
   private mapOrder(raw: unknown): FuturesOrder {

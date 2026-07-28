@@ -8,11 +8,21 @@
 import type { FastifyInstance } from "fastify";
 
 import type { LiveExecutionEngine } from "../lib/live-execution-engine.js";
+import {
+  runWalletReconciliationCheck,
+  type WalletReconciliationClient,
+  type WalletReconciliationLedgerSource,
+} from "../lib/wallet-reconciliation.js";
+
+export interface WalletReconciliationDeps {
+  client: WalletReconciliationClient;
+  ledgerSource: WalletReconciliationLedgerSource;
+}
 
 export async function registerLiveRoutes(
   app: FastifyInstance,
   engine: LiveExecutionEngine | null,
-  opts: { configErrors?: string[] } = {},
+  opts: { configErrors?: string[]; walletReconciliation?: WalletReconciliationDeps | null } = {},
 ): Promise<void> {
   app.get("/api/live/status", async () => {
     if (!engine) {
@@ -144,5 +154,31 @@ export async function registerLiveRoutes(
     }
     engine.resetKill();
     return { ok: true, armed: engine.isArmed() };
+  });
+
+  /**
+   * Report-only: compares LiveDailyLedger's internal realized PnL against Binance's own
+   * GET /fapi/v1/income history for the same UTC day. Never arms/disarms/kills/cancels/closes
+   * anything — see lib/wallet-reconciliation.ts. Logs a warning (server-side) when the delta
+   * exceeds tolerance; the operator still decides what (if anything) to do about it.
+   * Optional query: ?date=YYYY-MM-DD (defaults to the current UTC day).
+   */
+  app.get("/api/live/wallet-reconciliation", async (request, reply) => {
+    if (!engine || !opts.walletReconciliation) {
+      reply.code(503);
+      return { ok: false, reason: "live execution disabled" };
+    }
+    const query = (request.query ?? {}) as { date?: string };
+    try {
+      const { report, warned } = await runWalletReconciliationCheck({
+        client: opts.walletReconciliation.client,
+        ledgerSource: opts.walletReconciliation.ledgerSource,
+        dateUtc: query.date,
+      });
+      return { ok: true, warned, report };
+    } catch (err) {
+      reply.code(502);
+      return { ok: false, reason: err instanceof Error ? err.message : "wallet reconciliation failed" };
+    }
   });
 }
