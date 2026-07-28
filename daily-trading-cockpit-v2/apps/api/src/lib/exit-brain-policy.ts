@@ -117,6 +117,31 @@ export const DEFAULT_EXIT_BRAIN_PARAMS: ExitBrainParams = {
   roundTripGuardR: 0.05,
   staleWinnerMaxAgeHours: 48,
   bankPenaltyR: 0,
+  /**
+   * DO NOT LOWER THIS TO RAISE COVERAGE (investigated 2026-07-28, conclusion is the opposite of
+   * where it started).
+   *
+   * The Exit Brain reports ~12% coverage — 554 scored of 4,524 processed — and the tick histogram
+   * is bimodal in a way that looks like this threshold is set just above the population:
+   *   2 ticks: 820   4 ticks: 3,142   5..12: ~18   13+: 539
+   * Almost everything excluded sits at exactly 4, two short of the bar. That reads as the classic
+   * "measurement blocked by its own parameter", and it is not.
+   *
+   * Those 4-tick entries are SHADOW-POSITION SKELETONS (resolvedTradesFromShadowPositions), not
+   * price paths. Each is four synthetic points reconstructed from aggregates: open at R=0, the MFE
+   * timestamp, the MAE timestamp, and the close at realizedNetR. A 2-tick entry is the same thing
+   * with the peak/trough timestamps missing. There is no intra-trade movement in them at all.
+   *
+   * This policy is retrace-based — it arms on peak-R and exits on a giveback fraction of that peak.
+   * Scoring it against four points derived from the very extremes it is meant to detect is circular:
+   * coverage would jump to ~90% and the number would stop meaning anything.
+   *
+   * The 539 entries at 13+ ticks are the real recorded paths (position-path-recorder.ts, ~25s
+   * cadence — measured live: 288 ticks over 240 minutes). 12% is therefore the HONEST share of
+   * trades that carry a real path, and the only way to raise it is for more trades to be executed
+   * through a path the recorder observes. It is a coverage-of-execution question, never a threshold
+   * question.
+   */
   minEvaluableTicks: 6,
 };
 
