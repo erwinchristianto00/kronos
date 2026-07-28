@@ -3,6 +3,9 @@ import { useShadowReport } from './InnovationLanesCard';
 import { Disclosure } from './LaneMaturityTable';
 import { ReadinessVerdict, type FourBrainReadinessBlock } from './ReadinessVerdict';
 
+/** Module-level constant: a fresh object literal here would be a new effect dependency every render. */
+const DIRECTION_TESTNET_ONLY = { testnetOnly: true } as const;
+
 // Four-Brain operator dashboard card (2026-07-23 operator ask — "gw bisa liat performance dan decision
 // dan dibuat sama four brain di mana? Biar gw bisa liat, bener ga, dan bisa adjust"). /research only,
 // mounted alongside CortexReadinessCard / InnovationLanesCard (same place, same convention — those are
@@ -152,7 +155,7 @@ function SourceBadge({ source, unreachable }: { source: 'testnet' | 'local' | nu
       title={
         testnet
           ? 'Angka dari TESTNET (3102) — instance yang benar-benar mengeksekusi.'
-          : 'Testnet tidak menjawab, jadi angka ini dari instance LOKAL (research/3101) — dataset yang BERBEDA, bukan data testnet yang berubah.'
+          : 'Testnet tidak menjawab. Panel Direction/Entry sengaja TIDAK jatuh ke research/3101 — edge memory di sana cuma 3 sampel dan tidak satu pun di regime saat ini, jadi vonisnya tidak bisa dipercaya. Angka yang tampil adalah nilai testnet terakhir yang baik.'
       }
       style={{
         marginLeft: 8, fontSize: 10, padding: '1px 6px', borderRadius: 4, letterSpacing: 0.3,
@@ -233,7 +236,12 @@ function RateStatsInline({ rv, dim }: { rv: RateView; dim?: boolean }) {
 
 export function FourBrainDashboardCard() {
   const report = useShadowReport<FourBrainReport>('four-brain');
-  const directionEntry = useShadowReport<DirectionEntryOutcomesResponse>('direction-entry-outcomes');
+  // TESTNET ONLY, deliberately (2026-07-28). Research's edge memory holds 3 samples against testnet's
+  // 19, and none in the regime family the market is in — its Direction longEdge/shortEdge can never
+  // resolve, so its readiness verdict is noise dressed as evidence. Falling back to it on a testnet
+  // blink swapped the answer for a different one with nothing on screen saying so, which is also what
+  // made this panel look like it was flipping between two datasets by itself.
+  const directionEntry = useShadowReport<DirectionEntryOutcomesResponse>('direction-entry-outcomes', DIRECTION_TESTNET_ONLY);
   const r = report.data;
   const [showAllDecisions, setShowAllDecisions] = useState(false);
   const [showEntryTier2, setShowEntryTier2] = useState(false);

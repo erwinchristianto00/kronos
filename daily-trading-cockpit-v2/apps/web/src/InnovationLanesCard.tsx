@@ -171,7 +171,20 @@ export type LaneFetchState<T> = { data: T | null; source: Source | null; unreach
  *  res.ok discipline, seq-guarded. Each endpoint fails independently of its siblings. Exported so other
  *  report-only cards (e.g. FourBrainDashboardCard) reuse this exact fetch/fallback/seq-guard logic
  *  instead of re-implementing it. */
-export function useShadowReport<T>(endpoint: string): LaneFetchState<T> {
+/**
+ * TESTNET-ONLY MODE (2026-07-28). Some panels must never quietly show research's numbers.
+ *
+ * The Direction Brain is the case that forced this. Research's edge memory holds THREE samples in
+ * total (`BULLISH_EXPANSION::LONG` n=2, `MIXED_ROTATION::SHORT` n=1) against testnet's nineteen, and
+ * none of research's are in the regime family the market is actually in — so research's longEdge and
+ * shortEdge can never resolve, and its readiness verdict is noise dressed as evidence. Falling back
+ * to it when testnet blinks does not degrade gracefully; it swaps the answer for a different one and
+ * says nothing. That is also what made the panel appear to flip between two datasets on its own.
+ *
+ * With `testnetOnly`, a testnet miss reports unreachable and keeps the last good testnet value,
+ * rather than silently substituting a dataset that cannot answer the question.
+ */
+export function useShadowReport<T>(endpoint: string, opts?: { testnetOnly?: boolean }): LaneFetchState<T> {
   const [state, setState] = useState<LaneFetchState<T>>({ data: null, source: null, unreachable: false });
   const seqRef = useRef(0);
   useEffect(() => {
@@ -198,7 +211,7 @@ export function useShadowReport<T>(endpoint: string): LaneFetchState<T> {
       const seq = ++seqRef.current;
       let source: Source = 'testnet';
       let data = await grab(`/testnet/api/shadow/${endpoint}`);
-      if (data == null) {
+      if (data == null && opts?.testnetOnly !== true) {
         source = 'local';
         data = await grab(`/api/shadow/${endpoint}`);
       }
@@ -215,7 +228,7 @@ export function useShadowReport<T>(endpoint: string): LaneFetchState<T> {
       for (const controller of controllers) controller.abort();
       controllers.clear();
     };
-  }, [endpoint]);
+  }, [endpoint, opts?.testnetOnly]);
   return state;
 }
 
