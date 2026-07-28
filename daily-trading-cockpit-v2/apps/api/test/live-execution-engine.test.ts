@@ -311,7 +311,7 @@ function makeEngine(opts: {
   paper?: PaperStoreReader;
   config?: Partial<LiveExecutionConfig>;
   isPaperOrderLiveEligible?: (order: PaperOrder, nowIso: string) => boolean;
-  getControllerSnapshot?: () => { regime: string | null; mode: string | null; capturedAt?: string | null } | null;
+  getControllerSnapshot?: () => { regime: string | null; mode: string | null; confidence?: string | null; capturedAt?: string | null } | null;
   nowIso?: () => string;
   marketDataClient?: Pick<BinanceClient, "getFuturesFlow">;
   externalManagedNetQty?: () => Map<string, number>;
@@ -3496,6 +3496,167 @@ describe("manualCloseIntent (operator Close button — real-money manual control
     const res = await engine.manualCloseIntent("paper-nope");
     expect(res.ok).toBe(false);
     expect(client.placed.length).toBe(before);
+  });
+});
+
+describe("MAE/regime-exit persistence (Tier 2 audit, purely additive — new recorded fields only)", () => {
+  it("REGRESSION: maxFavorableR still behaves exactly as before (unchanged peak, same arm/giveback close) — and maxAdverseR stays 0 on a path that never goes adverse", async () => {
+    // Identical scenario to the pre-existing "mfe_giveback lane tracks favorable R…" test: entry
+    // 2000/short, +1R favorable, then a retrace to +0.5R that triggers the giveback close. Price
+    // never crosses to adverse (favorableR is 0.5-1.0 throughout), so maxAdverseR must stay at its
+    // floor (0) the whole time — this is the documented "never goes adverse ⇒ stays at 0" case.
+    const order = paperOrder({
+      selectedLaneId: "CG_VARIANT_MATRIX:CG_MFE_GIVEBACK",
+      variantExitRule: "mfe_giveback",
+      takeProfitLevels: [1700],
+    } as Partial<PaperOrder>);
+    const { engine, client, store } = makeEngine({ paper: makePaperStore([order]) });
+    expect((await engine.arm()).ok).toBe(true);
+
+    await engine.tick();
+    expect(client.placed.map((p) => p.type)).toEqual(["MARKET", "STOP_MARKET", "LIMIT"]);
+    // Freshly-opened this tick: manageMfeGiveback (the shared tick hook) hasn't run against it yet,
+    // same as maxFavorableR — both stay at their construction-time null until the next tick.
+    expect(store.getState().intents[0]!.maxFavorableR).toBeNull();
+    expect(store.getState().intents[0]!.maxAdverseR).toBeNull();
+
+    client.markPriceBySymbol.set("ETHUSDT", 1900); // +1R favorable on a short
+    await engine.tick();
+    expect(store.getState().intents[0]!.state).toBe("OPEN");
+    expect(store.getState().intents[0]!.maxFavorableR).toBeCloseTo(1, 6); // exact pre-existing assertion
+    expect(store.getState().intents[0]!.maxAdverseR).toBe(0); // still never adverse
+
+    client.markPriceBySymbol.set("ETHUSDT", 1950); // retraces to +0.5R; default giveback threshold
+    client.flattenRealizedPnl = 2.2;
+    await engine.tick();
+
+    const closed = store.getState().intents[0]!;
+    expect(closed.state).toBe("CLOSED");
+    expect(closed.closeReason).toBe("MFE_GIVEBACK_EXIT"); // exact pre-existing assertion
+    expect(closed.realizedPnlUsd).toBeCloseTo(2.2, 6); // exact pre-existing assertion
+    expect(closed.maxFavorableR).toBeCloseTo(1, 6); // peak untouched by the new trough tracking
+    expect(closed.maxAdverseR).toBe(0); // favorableR was 0.5 at close — never negative
+    expect(store.getState().dailyLedger.wins).toBe(1); // exact pre-existing assertion
+  });
+
+  it("maxAdverseR tracks the running WORST (most negative) favorableR on a synthetic price path, independent of maxFavorableR's own peak", async () => {
+    // Keep favorableR below the 0.75R arm threshold throughout so the giveback close never fires —
+    // this isolates the tracking math (peak/trough) from the exit DECISION entirely.
+    const order = paperOrder({
+      selectedLaneId: "CG_VARIANT_MATRIX:CG_MFE_GIVEBACK",
+      variantExitRule: "mfe_giveback",
+      takeProfitLevels: [1700],
+    } as Partial<PaperOrder>);
+    const { engine, client, store } = makeEngine({ paper: makePaperStore([order]) });
+    expect((await engine.arm()).ok).toBe(true);
+    await engine.tick(); // mirror/open at entry 2000, stop 2100 (short; risk = 100)
+
+    // Tick: price moves ADVERSE first (mark 2050 ⇒ favorableR = (2000-2050)/100 = -0.5).
+    client.markPriceBySymbol.set("ETHUSDT", 2050);
+    await engine.tick();
+    let intent = store.getState().intents[0]!;
+    expect(intent.state).toBe("OPEN");
+    expect(intent.maxFavorableR).toBe(0); // never favorable yet — peak stays at its floor
+    expect(intent.maxAdverseR).toBeCloseTo(-0.5, 6); // worst point recorded
+
+    // Tick: price recovers to favorable but well under the arm threshold (mark 1980 ⇒ +0.2R).
+    client.markPriceBySymbol.set("ETHUSDT", 1980);
+    await engine.tick();
+    intent = store.getState().intents[0]!;
+    expect(intent.state).toBe("OPEN");
+    expect(intent.maxFavorableR).toBeCloseTo(0.2, 6);
+    expect(intent.maxAdverseR).toBeCloseTo(-0.5, 6); // recovery does NOT improve the stored trough
+
+    // Tick: price makes a NEW, deeper adverse excursion (mark 2080 ⇒ -0.8R).
+    client.markPriceBySymbol.set("ETHUSDT", 2080);
+    await engine.tick();
+    intent = store.getState().intents[0]!;
+    expect(intent.state).toBe("OPEN");
+    expect(intent.maxFavorableR).toBeCloseTo(0.2, 6); // peak unaffected by the new worse trough
+    expect(intent.maxAdverseR).toBeCloseTo(-0.8, 6); // trough only updates when this tick is worse
+  });
+
+  it("stamps the exit-side regime snapshot with the LIVE controller state at close time (not the frozen entry-time regime), and leaves it absent while an intent has never closed", async () => {
+    // Intent A: stays OPEN across multiple ticks — the exit-side fields must never appear.
+    const openOrder = paperOrder({
+      paperOrderId: "paper-open-forever",
+      regime: "Bearish",
+      controllerMode: "SHORT_ONLY",
+      controllerConfidence: "MEDIUM",
+    } as Partial<PaperOrder>);
+    const { engine: openEngine, store: openStore } = makeEngine({
+      paper: makePaperStore([openOrder]),
+      getControllerSnapshot: () => ({
+        regime: "Mixed",
+        mode: "VALIDATION_ONLY",
+        confidence: "LOW",
+        capturedAt: "2099-01-02T12:00:00.000Z",
+      }),
+    });
+    expect((await openEngine.arm()).ok).toBe(true);
+    await openEngine.tick();
+    await openEngine.tick(); // a second tick — still never closed
+    const stillOpen = openStore.getState().intents[0]!;
+    expect(stillOpen.state).toBe("OPEN");
+    expect(stillOpen.exitRegime).toBeUndefined();
+    expect(stillOpen.exitControllerMode).toBeUndefined();
+    expect(stillOpen.exitControllerConfidence).toBeUndefined();
+    // Entry-side snapshot is the frozen ENTRY value — unaffected by the live "Mixed" controller.
+    expect(stillOpen.sourcePaperOrders?.[0]?.regime).toBe("Bearish");
+
+    // Intent B: closes via the operator manual-close path. The live controller reads "Mixed" at
+    // this moment, deliberately different from the "Bullish" entry-time regime, to prove the exit
+    // stamp reads CURRENT state via currentControllerSnapshot(), not the stale entry snapshot.
+    const closingOrder = paperOrder({
+      paperOrderId: "paper-will-close",
+      regime: "Bullish",
+      controllerMode: "LONG_ONLY",
+      controllerConfidence: "HIGH",
+    } as Partial<PaperOrder>);
+    const { engine: closeEngine, store: closeStore } = makeEngine({
+      paper: makePaperStore([closingOrder]),
+      getControllerSnapshot: () => ({
+        regime: "Mixed",
+        mode: "VALIDATION_ONLY",
+        confidence: "LOW",
+        capturedAt: "2099-01-02T12:00:00.000Z",
+      }),
+    });
+    expect((await closeEngine.arm()).ok).toBe(true);
+    await closeEngine.tick();
+    const beforeClose = closeStore.getState().intents[0]!;
+    expect(beforeClose.exitRegime).toBeUndefined();
+
+    const res = await closeEngine.manualCloseIntent(beforeClose.paperOrderId);
+    expect(res.ok).toBe(true);
+    const closed = closeStore.getState().intents[0]!;
+    expect(closed.state).toBe("CLOSED");
+    expect(closed.exitRegime).toBe("Mixed");
+    expect(closed.exitControllerMode).toBe("VALIDATION_ONLY");
+    expect(closed.exitControllerConfidence).toBe("LOW");
+    // Entry-side snapshot remains the frozen ENTRY regime ("Bullish"), untouched by the exit stamp.
+    expect(closed.sourcePaperOrders?.[0]?.regime).toBe("Bullish");
+  });
+
+  it("exit-side regime snapshot fields are null (never the stale entry snapshot) when no live controller is wired at close", async () => {
+    const order = paperOrder({
+      regime: "Bullish",
+      controllerMode: "LONG_ONLY",
+      controllerConfidence: "HIGH",
+    } as Partial<PaperOrder>);
+    // No getControllerSnapshot passed ⇒ engine defaults to () => null (see constructor).
+    const { engine, store } = makeEngine({ paper: makePaperStore([order]) });
+    expect((await engine.arm()).ok).toBe(true);
+    await engine.tick();
+    const intent = store.getState().intents[0]!;
+
+    const res = await engine.manualCloseIntent(intent.paperOrderId);
+    expect(res.ok).toBe(true);
+    const closed = store.getState().intents[0]!;
+    expect(closed.state).toBe("CLOSED");
+    expect(closed.exitRegime).toBeNull();
+    expect(closed.exitControllerMode).toBeNull();
+    expect(closed.exitControllerConfidence).toBeNull();
   });
 });
 

@@ -438,11 +438,25 @@ export interface LiveIntent {
   feesUsd: number | null;
   exitRule?: VariantExitRule;
   maxFavorableR?: number | null;
+  /** MAE persistence (Tier 2 audit, purely additive): running MOST NEGATIVE (worst) favorableR the
+   *  position has reached, mirroring maxFavorableR's own update (same tick hook inside
+   *  manageMfeGiveback(), same intents tracked). 0 while the position has never gone underwater;
+   *  null on intents that never pass through that hook (rescue legs — same as maxFavorableR).
+   *  Report-only: never read by any exit/close decision. */
+  maxAdverseR?: number | null;
   createdAt: string;
   updatedAt: string;
   closedAt: string | null;
   closeReason: string | null;
   lastError: string | null;
+  /** Exit-side regime snapshot (Tier 2 audit, purely additive): the SAME three controller fields
+   *  captured at entry (see LiveIntentSource.regime/controllerMode/controllerConfidence) but read
+   *  LIVE at the moment of close via currentControllerSnapshot() — the same mechanism the regime
+   *  harvest already uses. Lets a closed trade be compared entry-regime vs exit-regime. null when
+   *  no controller snapshot was available at close time; undefined on intents that never closed. */
+  exitRegime?: string | null;
+  exitControllerMode?: string | null;
+  exitControllerConfidence?: string | null;
   /** Paper orders netted into this one-way Binance symbol position. */
   sourcePaperOrders?: LiveIntentSource[];
   /** True when this intent was opened WHILE an operator lane selection/allocation was active
@@ -1285,6 +1299,22 @@ export class LiveExecutionEngine {
     return Math.abs(Date.now() - capturedMs) <= REGIME_EXIT_SNAPSHOT_MAX_AGE_MS;
   }
 
+  /**
+   * Regime-exit persistence (Tier 2 audit, purely additive): stamps the SAME three controller
+   * fields captured at entry (LiveIntentSource.regime/controllerMode/controllerConfidence) onto
+   * the intent at the moment it closes, read LIVE via currentControllerSnapshot() — the identical
+   * mechanism the regime harvest already reads for its cut/hold decision. No freshness gating here
+   * (unlike controllerSnapshotIsFresh, which gates a live DECISION): this is a report-only
+   * best-effort snapshot for post-hoc entry-vs-exit comparison, never read by any exit/close
+   * decision. null when no controller is wired/available at close time.
+   */
+  private stampExitControllerSnapshot(intent: LiveIntent): void {
+    const controller = this.currentControllerSnapshot();
+    intent.exitRegime = controller?.regime ?? null;
+    intent.exitControllerMode = controller?.mode ?? null;
+    intent.exitControllerConfidence = controller?.confidence ?? null;
+  }
+
   /** Manual emergency kill: cancel everything, flatten everything, disarm, latch. */
   async kill(reason: string): Promise<void> {
     await this.engageKillSwitch(`manual: ${reason}`);
@@ -1371,6 +1401,7 @@ export class LiveExecutionEngine {
       intent.state = "KILLED";
       intent.closeReason = `EXCHANGE_FLATTEN: ${reason}`;
       intent.closedAt = this.nowIso();
+      this.stampExitControllerSnapshot(intent);
       intent.updatedAt = this.nowIso();
       if (failed.some((item) => item.symbol === intent.symbol)) {
         intent.lastError = `exchange flatten had symbol-level failures; check /api/live/status`;
@@ -2076,6 +2107,7 @@ export class LiveExecutionEngine {
       intent.state = "CLOSED";
       intent.closeReason = "OPERATOR_CLOSE";
       intent.closedAt = this.nowIso();
+      this.stampExitControllerSnapshot(intent);
       intent.updatedAt = this.nowIso();
       this.store.save();
       return { ok: true, reason: null, realizedPnlUsd: net };
@@ -2149,6 +2181,7 @@ export class LiveExecutionEngine {
         intent.state = "KILLED";
         intent.closeReason = `KILL_SWITCH: ${reason}`;
         intent.closedAt = this.nowIso();
+        this.stampExitControllerSnapshot(intent);
         intent.updatedAt = this.nowIso();
       } catch (error) {
         intent.lastError = `kill flatten failed: ${(error as Error).message}`;
@@ -2358,6 +2391,7 @@ export class LiveExecutionEngine {
               intent.feesUsd = null;
               intent.state = "CLOSED";
               intent.closedAt = this.nowIso();
+              this.stampExitControllerSnapshot(intent);
               intent.closeReason = "BREAKEVEN_ALREADY_TOUCHED_MARKET_CLOSE";
               this.applyRealizedToLedger(net);
             }
@@ -2426,6 +2460,7 @@ export class LiveExecutionEngine {
     intent.feesUsd = null;
     intent.state = "CLOSED";
     intent.closedAt = this.nowIso();
+    this.stampExitControllerSnapshot(intent);
     intent.updatedAt = this.nowIso();
     intent.closeReason = "LIVE_LONG_RUNNER_BREAKEVEN_AFTER_COST";
     this.applyRealizedToLedger(net);
@@ -2671,6 +2706,7 @@ export class LiveExecutionEngine {
       intent.feesUsd = null;
       intent.state = "CLOSED";
       intent.closedAt = this.nowIso();
+      this.stampExitControllerSnapshot(intent);
       intent.updatedAt = this.nowIso();
       intent.closeReason = !green
         ? (lossHardCutThis
@@ -2822,6 +2858,7 @@ export class LiveExecutionEngine {
     rescueIntent.feesUsd = null;
     rescueIntent.state = "CLOSED";
     rescueIntent.closedAt = this.nowIso();
+    this.stampExitControllerSnapshot(rescueIntent);
     rescueIntent.updatedAt = this.nowIso();
     rescueIntent.closeReason = action.reason.startsWith("max-hold") ? "RESCUE_MAXHOLD_CUT" : "RESCUE_FLATTEN_TARGET";
     this.applyRealizedToLedger(liveLegRealized);
@@ -2861,6 +2898,7 @@ export class LiveExecutionEngine {
       oi.feesUsd = null;
       oi.state = "CLOSED";
       oi.closedAt = this.nowIso();
+      this.stampExitControllerSnapshot(oi);
       oi.updatedAt = this.nowIso();
       oi.closeReason = "RESCUE_FLIP";
       this.applyRealizedToLedger(r);
@@ -2954,6 +2992,7 @@ export class LiveExecutionEngine {
     intent.feesUsd = null;
     intent.state = "CLOSED";
     intent.closedAt = this.nowIso();
+    this.stampExitControllerSnapshot(intent);
     intent.updatedAt = this.nowIso();
     intent.closeReason = `PROFIT_BANK_NET_${threshold.toFixed(2)}`;
     this.applyRealizedToLedger(net);
@@ -2968,8 +3007,14 @@ export class LiveExecutionEngine {
     const favorableR = intent.direction === "SHORT" ? (entry - mark) / risk : (mark - entry) / risk;
     const previousPeak = intent.maxFavorableR ?? 0;
     const peak = Math.max(previousPeak, favorableR);
-    const changed = peak !== previousPeak;
+    // MAE persistence (Tier 2 audit): running worst (most negative) favorableR, mirroring the peak
+    // update above exactly — same tick hook, same intents, same "only update if this tick is worse
+    // than the stored value" style. Purely additive: never read by the exit/close decision below.
+    const previousTrough = intent.maxAdverseR ?? 0;
+    const trough = Math.min(previousTrough, favorableR);
+    const changed = peak !== previousPeak || trough !== previousTrough;
     intent.maxFavorableR = peak;
+    intent.maxAdverseR = trough;
     if (peak < MFE_GIVEBACK_ARM_R) return { changed, closed: false };
 
     const exitR = peak * (1 - MFE_GIVEBACK_FRAC);
@@ -3006,6 +3051,7 @@ export class LiveExecutionEngine {
     intent.feesUsd = null;
     intent.state = "CLOSED";
     intent.closedAt = this.nowIso();
+    this.stampExitControllerSnapshot(intent);
     intent.updatedAt = this.nowIso();
     intent.closeReason = "MFE_GIVEBACK_EXIT";
     this.applyRealizedToLedger(net);
@@ -3062,6 +3108,7 @@ export class LiveExecutionEngine {
     intent.feesUsd = null;
     intent.state = "CLOSED";
     intent.closedAt = this.nowIso();
+    this.stampExitControllerSnapshot(intent);
     intent.updatedAt = this.nowIso();
     intent.closeReason = `LOSING_MAX_HOLD_CUT_${Math.round(this.config.losingMaxHoldMs / 3_600_000)}H`;
     this.applyRealizedToLedger(net);
@@ -3112,6 +3159,7 @@ export class LiveExecutionEngine {
     intent.feesUsd = fees;
     intent.state = "CLOSED";
     intent.closedAt = this.nowIso();
+    this.stampExitControllerSnapshot(intent);
     intent.updatedAt = this.nowIso();
     intent.closeReason = intent.closeReason ?? "POSITION_FLAT";
 
@@ -4035,6 +4083,7 @@ export class LiveExecutionEngine {
       feesUsd: null,
       exitRule: this.paperExitRule(paper),
       maxFavorableR: null,
+      maxAdverseR: null,
       // Tagged so a losing close of an operator-selected position can auto-reset the selection.
       operatorLaneSelection: this.operatorSelectionActiveFor(paper) || undefined,
       createdAt: now,
