@@ -304,6 +304,11 @@ import { buildRegimeEngineReport, getRegimeEngineStore, isRegimeEngineEnabled } 
 import { buildFreshVariantMatrixReport } from "../lib/fresh-variant-matrix-feed.js";
 import { buildCrowdingReport } from "../lib/derivatives-crowding.js";
 import { buildRegimeGatedLaneReport, type RgObservation } from "../lib/regime-gated-lane-performance.js";
+import {
+  getPriceImpactEfficiencyStore,
+  runPriceImpactEfficiencyCycleGuarded,
+  buildPriceImpactEfficiencyReport,
+} from "../lib/price-impact-efficiency.js";
 
 const mixedLaneIdForDirection = (direction: string | null | undefined): string =>
   direction === "LONG"
@@ -849,6 +854,28 @@ export async function registerShadowRoutes(
       return { error: "NO_MARKET_CLIENT", message: "binance market-data client unavailable" };
     }
     return buildCrowdingReport(opts.binanceClient, [...CURRENT_SCANNER_UNIVERSE].slice(0, 15), new Date().toISOString());
+  });
+
+  // Price-impact efficiency (Tier 2 audit item #6, report-only): absolutePriceMove / aggressiveNotional
+  // per 5m bucket, buy/sell split, with own-history + cluster-relative z-scores (see
+  // price-impact-efficiency.ts's header for the exact windowing). Live-fetches + persists a fresh
+  // reading per universe symbol on each call (same universe-slicing convention as crowding-report),
+  // then returns the accumulated store's per-symbol snapshots. This is the underlying z-score
+  // machinery for the documented gap where decision-scoring.ts's fundingZScore is hardcoded null —
+  // wiring it in there is separate follow-up work, not done by this route.
+  app.get("/api/shadow/price-impact-efficiency-report", async (_request, reply) => {
+    if (!opts.binanceClient) {
+      reply.code(503);
+      return { error: "NO_MARKET_CLIENT", message: "binance market-data client unavailable" };
+    }
+    const pieStore = getPriceImpactEfficiencyStore();
+    await runPriceImpactEfficiencyCycleGuarded({
+      store: pieStore,
+      client: opts.binanceClient,
+      symbols: [...CURRENT_SCANNER_UNIVERSE].slice(0, 15),
+      nowMs: Date.now(),
+    });
+    return buildPriceImpactEfficiencyReport(pieStore);
   });
 
   // Regime switching engine — REPORT-ONLY history of what the hypothesis framework
