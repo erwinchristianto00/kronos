@@ -544,6 +544,13 @@ export async function runFundingCarryCycle(opts: {
   maxOpenPairs?: number;
   maxNewPairsPerCycle?: number;
   pairDedupeWindowMs?: number;
+  /** Optional sibling-experiment admission gate. The parent leaves this undefined. */
+  candidateFilter?: (
+    candidate: FundingCarryCandidate,
+    snapshots: ReadonlyMap<string, FundingCarrySymbolSnapshot>,
+  ) => boolean;
+  /** Keeps sibling observation identity explicit while preserving the parent's default IDs. */
+  observationIdPrefix?: string;
 }): Promise<FCCycleResult> {
   const result: FCCycleResult = {
     scanned: 0,
@@ -623,6 +630,7 @@ export async function runFundingCarryCycle(opts: {
   let openCount = opts.store.all.filter((o) => o.status === "OPEN").length;
   let openedThisCycle = 0;
   for (const cand of scan.candidates) {
+    if (opts.candidateFilter && !opts.candidateFilter(cand, snapshotBySymbol)) continue;
     if (openCount >= maxOpenPairs || openedThisCycle >= maxNewPairsPerCycle) break;
     if (busySymbols.has(cand.longSymbol) || busySymbols.has(cand.shortSymbol)) continue;
     const pairKey = [cand.longSymbol, cand.shortSymbol].sort().join("|");
@@ -631,7 +639,7 @@ export async function runFundingCarryCycle(opts: {
     );
     if (recentSamePair) continue;
 
-    const observationId = `fc:${pairKey}:${opts.now}`;
+    const observationId = `${opts.observationIdPrefix ?? "fc"}:${pairKey}:${opts.now}`;
     const added = opts.store.add({
       observationId,
       pairKey,

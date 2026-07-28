@@ -1,18 +1,19 @@
 import { useEffect, useRef, useState } from 'react';
 import { C, fmtR, toneR, ago, laneEdgeBadge, LaneMaturityTable, type LaneMaturityRow } from './LaneMaturityTable';
 
-// Inovasi (shadow lanes) progress card (2026-07-22 operator ask) — /research only. Watches the 5
-// newly-deployed shadow measurement endpoints. Testnet (3102) is the proving ground, so each row
+// Inovasi (shadow lanes) progress card (2026-07-22 operator ask) — /research only. Watches the
+// original five measurements plus four lineage-preserving V2 siblings and one new L2 signal lane.
+// Testnet (3102) is the proving ground, so each row
 // prefers TESTNET's numbers via a browser-side fetch through the /testnet Caddy prefix (same
 // cross-instance precedent as CortexReadinessCard), falling back to this instance's local endpoint.
 // Polls 60s (all five stores only advance on the ~7min shadow cycle anyway). Per-endpoint
-// independent failure: one dead endpoint marks its own row unreachable, the other four keep
+// independent failure: one dead endpoint marks its own row unreachable, the other rows keep
 // updating. Every fetch checks res.ok BEFORE parsing (a proxy error page parsing as JSON is
 // exactly the bug just fixed in ResearchDashboard's grab helper) and keeps the last good value on
 // transient failure, with a seq-guard against a stale slow response overwriting a newer one (same
 // pattern as loadCortexDecisionAlpha in TestnetExchangeDashboard).
 //
-// 2026-07-23 declutter: the 5 lanes used to each render as a full-width always-visible block
+// 2026-07-23 declutter: the original lanes used to each render as a full-width always-visible block
 // (LaneRow). None of them has traded or proven anything yet (all pending edgeReady thresholds), so
 // they're now one compact LaneMaturityTable — click a row to expand its rich detail. C / fmtR /
 // toneR / ago / laneEdgeBadge are the shared helpers (same values this file used to duplicate
@@ -133,6 +134,30 @@ type LiqRecoilReport = {
     lastCycleError: string | null;
   } | null;
 };
+type InnovationVariantReport = {
+  laneId: string;
+  parentLaneId?: string | null;
+  version?: 'V1' | 'V2';
+  thesis?: string;
+  signalSource: string;
+  openCount: number;
+  resolvedCount: number;
+  netAvgR: number | null;
+  wr: number | null;
+  pf: number | null;
+  totalNetR?: number;
+  edgeReady: boolean;
+  details?: Record<string, unknown>;
+  v2Gate?: Record<string, unknown>;
+  cycleMeta: {
+    lastCycleAt: string | null;
+    lastCycleError: string | null;
+    cycles?: number;
+    candidatesTotal?: number;
+    recordedTotal?: number;
+    rejectedTotal?: number;
+  } | null;
+};
 
 type Source = 'testnet' | 'local';
 export type LaneFetchState<T> = { data: T | null; source: Source | null; unreachable: boolean };
@@ -233,6 +258,11 @@ export function InnovationLanesCard() {
   const leadLag = useShadowReport<BtcLeadLagReport>('btc-leadlag-snap');
   const metaLabel = useShadowReport<MetaLabelReport>('meta-label');
   const liqRecoil = useShadowReport<LiqRecoilReport>('liq-recoil');
+  const residualV2 = useShadowReport<InnovationVariantReport>('hedged-residual-short-v2');
+  const fundingV2 = useShadowReport<InnovationVariantReport>('funding-carry-crowding-v2');
+  const liqV2 = useShadowReport<InnovationVariantReport>('liq-recoil-strict-reclaim-v2');
+  const compressionV2 = useShadowReport<InnovationVariantReport>('compression-retest-v2');
+  const queueToxic = useShadowReport<InnovationVariantReport>('queue-imbalance-toxic-flow');
 
   const eb = exitBrain.data;
   const fc = fundingCarry.data;
@@ -242,6 +272,52 @@ export function InnovationLanesCard() {
 
   const ebCoveragePct = eb?.coverage.coverageRatio == null ? null : `${(eb.coverage.coverageRatio * 100).toFixed(1)}%`;
   const mlCohorts = (ml?.cohorts ?? []).filter((c) => c.n > 0);
+  const variantRow = (
+    key: string,
+    name: string,
+    detail: string,
+    fetchState: LaneFetchState<InnovationVariantReport>,
+  ): LaneMaturityRow => {
+    const report = fetchState.data;
+    const config = report?.v2Gate ?? report?.details ?? {};
+    return {
+      key,
+      name,
+      detail,
+      badge: report ? laneEdgeBadge(report.edgeReady, report.cycleMeta?.lastCycleError) : null,
+      nLabel: report ? `${report.resolvedCount} res / ${report.openCount} open` : '—',
+      netAvgR: report?.netAvgR ?? null,
+      wr: report?.wr ?? null,
+      pf: report?.pf ?? null,
+      lastCycleLabel: report?.cycleMeta?.lastCycleAt ? ago(report.cycleMeta.lastCycleAt) : null,
+      loading: report == null,
+      unreachable: fetchState.unreachable,
+      expanded: report && (
+        <>
+          {sourceNote(fetchState) && <div style={{ fontSize: 10, color: C.measure, marginBottom: 4 }}>{sourceNote(fetchState)}</div>}
+          <div style={statRow}>
+            <Mini label="lane" value={report.laneId} />
+            <Mini label="version" value={report.version ?? 'V2'} color={C.accent} />
+            <Mini label="parent" value={report.parentLaneId ?? 'new family'} />
+            <Mini label="total" value={fmtR(report.totalNetR ?? null)} color={toneR(report.totalNetR ?? null)} />
+          </div>
+          {report.thesis && <div style={{ fontSize: 12, color: C.text, marginTop: 7 }}>{report.thesis}</div>}
+          <div style={{ fontSize: 11, color: C.dim, marginTop: 5 }}>source: {report.signalSource}</div>
+          <div style={{ fontSize: 11, color: C.dim, marginTop: 5, overflowWrap: 'anywhere' }}>
+            gate: {JSON.stringify(config)}
+          </div>
+          {report.cycleMeta && (
+            <div style={statRow}>
+              <Mini label="cycles" value={String(report.cycleMeta.cycles ?? '—')} />
+              <Mini label="candidates" value={String(report.cycleMeta.candidatesTotal ?? '—')} />
+              <Mini label="recorded" value={String(report.cycleMeta.recordedTotal ?? '—')} />
+              <Mini label="rejected" value={String(report.cycleMeta.rejectedTotal ?? '—')} />
+            </div>
+          )}
+        </>
+      ),
+    };
+  };
 
   const rows: LaneMaturityRow[] = [
     // 1 — Exit Brain: policy-vs-actual counterfactual. Shape differs from the other 4 (processed/
@@ -448,6 +524,36 @@ export function InnovationLanesCard() {
         </>
       ),
     },
+    variantRow(
+      'hedged-residual-short-v2',
+      'Hedged Residual Short V2',
+      'short bottom-residual persisten + hedge beta BTC, basket after-cost',
+      residualV2,
+    ),
+    variantRow(
+      'funding-carry-crowding-v2',
+      'Funding Carry + Crowding V2',
+      'parent funding carry dengan absolute + percentile crowding gate',
+      fundingV2,
+    ),
+    variantRow(
+      'liq-recoil-strict-reclaim-v2',
+      'Liq Recoil Strict Reclaim V2',
+      'cascade forced-flow + event-VWAP reclaim + flow flip sebelum entry',
+      liqV2,
+    ),
+    variantRow(
+      'compression-retest-v2',
+      'Compression Retest V2',
+      'flow-confirmed ignition lalu bounded range-edge retest/reclaim',
+      compressionV2,
+    ),
+    variantRow(
+      'queue-imbalance-toxic-flow',
+      'Queue Imbalance + Toxic Flow',
+      'REST L2 + aggTrades markout; signal-only, tanpa asumsi queue fill',
+      queueToxic,
+    ),
   ];
 
   return (

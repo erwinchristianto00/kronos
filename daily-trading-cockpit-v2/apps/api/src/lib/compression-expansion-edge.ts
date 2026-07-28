@@ -286,6 +286,10 @@ export interface CompressionExpansionObservation extends CompressionExpansionGeo
   openedAt: string;
   openedAtMs: number;
   atrAtBreakout: number;
+  /** Preserved so sibling admission experiments can test a causal retest without reconstructing
+   *  the range from future data. Older observations legitimately omit these fields. */
+  compressionRangeHigh?: number;
+  compressionRangeLow?: number;
   atrPercentileAtCompression: number;
   bbWidthPercentileAtCompression: number;
   volumeRatio: number;
@@ -581,6 +585,8 @@ export async function runCompressionExpansionCycle(opts: {
       openedAt: new Date(signal.breakoutOpenMs).toISOString(),
       openedAtMs: signal.breakoutOpenMs,
       atrAtBreakout: signal.atrAtBreakout,
+      compressionRangeHigh: signal.compressionRangeHigh,
+      compressionRangeLow: signal.compressionRangeLow,
       atrPercentileAtCompression: signal.atrPercentileAtCompression,
       bbWidthPercentileAtCompression: signal.bbWidthPercentileAtCompression,
       volumeRatio: signal.volumeRatio,

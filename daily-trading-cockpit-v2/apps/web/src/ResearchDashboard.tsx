@@ -576,8 +576,8 @@ function ResearchDashboardInner() {
         ) : <div style={{ padding: 16, color: C.dim }}>computing (fetches real candles on first load)…</div>}
       </Card>
 
-      {/* 5 — Research & Innovation Lanes: the 5 shadow measurement lanes (exit-brain / funding-carry /
-          btc-leadlag-snap / meta-label / liq-recoil), one data-maturity table — see
+      {/* 5 — Research & Innovation Lanes: parent shadow measurements plus their isolated V2
+          admission siblings and the queue-imbalance signal lane, one data-maturity table — see
           InnovationLanesCard.tsx. Positioned after the Cross-Sectional composite above since none of
           these 5 lanes has traded or proven anything yet (all pending edgeReady thresholds), unlike
           the live-executing cross-sectional strategy. */}

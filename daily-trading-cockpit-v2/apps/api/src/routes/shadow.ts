@@ -1,5 +1,9 @@
 import type { FastifyInstance } from "fastify";
-import { buildStrategyExperienceRecords, buildStrategyIntelligenceFoundationReport } from "@dtc/shared";
+import {
+  buildStrategyExperienceRecords,
+  buildStrategyIntelligenceFoundationReport,
+  type Candle,
+} from "@dtc/shared";
 
 import type { ShadowExecutionEngine } from "../lib/shadow-engine.js";
 import { buildExpansionReport } from "../lib/expansion-report.js";
@@ -247,6 +251,11 @@ import {
   RM_INTERVAL,
 } from "../lib/residual-momentum-edge.js";
 import {
+  runHedgedResidualShortV2CycleGuarded,
+  buildHedgedResidualShortV2Report,
+  getHedgedResidualShortV2Store,
+} from "../lib/hedged-residual-short-v2.js";
+import {
   runLiquidationRecoilXsCycleGuarded,
   buildLiquidationRecoilXsReport,
   getLiquidationRecoilXsStore,
@@ -260,10 +269,20 @@ import {
   CE_UNIVERSE as CEE_UNIVERSE,
 } from "../lib/compression-expansion-edge.js";
 import {
+  runCompressionRetestV2CycleGuarded,
+  buildCompressionRetestV2Report,
+  getCompressionRetestV2Store,
+} from "../lib/compression-retest-v2.js";
+import {
   runFundingCarryCycleGuarded,
   buildFundingCarryReport,
   getFundingCarryStore,
 } from "../lib/funding-carry-edge.js";
+import {
+  runFundingCarryCrowdingV2CycleGuarded,
+  buildFundingCarryCrowdingV2Report,
+  getFundingCarryCrowdingV2Store,
+} from "../lib/funding-carry-crowding-v2.js";
 import {
   runMetaLabelCycleGuarded,
   buildMetaLabelReport,
@@ -286,6 +305,16 @@ import {
   LQR_INTERVAL,
   LQR_CANDLE_FETCH_LIMIT,
 } from "../lib/liq-recoil-edge.js";
+import {
+  runLiqRecoilStrictReclaimV2CycleGuarded,
+  buildLiqRecoilStrictReclaimV2Report,
+  getLiqRecoilStrictReclaimV2Store,
+} from "../lib/liq-recoil-strict-reclaim-v2.js";
+import {
+  runQueueImbalanceToxicFlowCycleGuarded,
+  buildQueueImbalanceToxicFlowReport,
+  getQueueImbalanceToxicFlowStore,
+} from "../lib/queue-imbalance-toxic-flow-edge.js";
 import { getGeopoliticalConflictFeedStore } from "../lib/geopolitical-conflict-feed.js";
 import {
   runCrisisModeCycleGuarded,
@@ -1743,6 +1772,10 @@ export async function registerShadowRoutes(
     return { generatedAt: new Date().toISOString(), ...buildResidualMomentumReport(rmStore.all, rmStore.cycleMeta) };
   });
 
+  app.get("/api/shadow/hedged-residual-short-v2", async () => {
+    return { generatedAt: new Date().toISOString(), ...buildHedgedResidualShortV2Report() };
+  });
+
   // Liquidation-recoil cross-sectional ranking report (2026-07-10, Tier-3 audit item C). Report-only;
   // not wired to any executor. See liquidation-recoil-cross-sectional.ts.
   app.get("/api/shadow/liquidation-recoil-xs-report", async () => {
@@ -1757,6 +1790,10 @@ export async function registerShadowRoutes(
     return { generatedAt: new Date().toISOString(), ...buildCompressionExpansionReport(ceeStore.all, ceeStore.cycleMeta) };
   });
 
+  app.get("/api/shadow/compression-retest-v2", async () => {
+    return { generatedAt: new Date().toISOString(), ...buildCompressionRetestV2Report() };
+  });
+
   // Funding-carry market-neutral pair report (2026-07-21) — report-only measurement, nothing
   // trades on it and it has NO executor. Aggregates n/open/netAvgR/WR/PF plus the honest
   // decomposition (avg funding captured vs avg divergence cost vs fees, all in R) and the
@@ -1764,6 +1801,10 @@ export async function registerShadowRoutes(
   app.get("/api/shadow/funding-carry", async () => {
     const fcStore = getFundingCarryStore();
     return { generatedAt: new Date().toISOString(), ...buildFundingCarryReport(fcStore.all, fcStore.cycleMeta) };
+  });
+
+  app.get("/api/shadow/funding-carry-crowding-v2", async () => {
+    return { generatedAt: new Date().toISOString(), ...buildFundingCarryCrowdingV2Report() };
   });
 
   // Meta-label per-signal gate report (2026-07-22) — report-only shadow scorer; nothing reads the
@@ -1793,6 +1834,14 @@ export async function registerShadowRoutes(
   app.get("/api/shadow/liq-recoil", async () => {
     const lqrStore = getLiqRecoilStore();
     return { generatedAt: new Date().toISOString(), ...buildLiqRecoilReport(lqrStore.all, lqrStore.cycleMeta) };
+  });
+
+  app.get("/api/shadow/liq-recoil-strict-reclaim-v2", async () => {
+    return { generatedAt: new Date().toISOString(), ...buildLiqRecoilStrictReclaimV2Report() };
+  });
+
+  app.get("/api/shadow/queue-imbalance-toxic-flow", async () => {
+    return { generatedAt: new Date().toISOString(), ...buildQueueImbalanceToxicFlowReport() };
   });
 
   // Crisis-mode report (2026-07-22) — TESTNET/RESEARCH REPORT-ONLY. Current escalation score +
@@ -2346,13 +2395,40 @@ export async function registerShadowRoutes(
         // item A): beta-neutralized residual return ranking + cluster catch-up detection — see
         // residual-momentum-edge.ts. Report-only measurement, same discipline as every other lane;
         // never wired to any executor or lane allocation.
-        if (process.env.RESIDUAL_MOMENTUM_DISABLED !== "1") {
+        if (
+          process.env.RESIDUAL_MOMENTUM_DISABLED !== "1" ||
+          process.env.HEDGED_RESIDUAL_SHORT_V2_DISABLED !== "1"
+        ) {
           const _rmc = opts.binanceClient;
-          void runResidualMomentumCycleGuarded({
-            store: getResidualMomentumStore(),
-            now: Date.now(),
-            fetchCandles: async (symbol: string) => _rmc.getCandles(symbol, RM_INTERVAL, 200),
-          }).catch(() => undefined);
+          const now = Date.now();
+          const candleCache = new Map<string, Promise<Candle[]>>();
+          const fetchCandles = (symbol: string) => {
+            let pending = candleCache.get(symbol);
+            if (!pending) {
+              pending = _rmc.getCandles(symbol, RM_INTERVAL, 200);
+              candleCache.set(symbol, pending);
+            }
+            return pending;
+          };
+          void (async () => {
+            const parentStore = getResidualMomentumStore();
+            if (process.env.RESIDUAL_MOMENTUM_DISABLED !== "1") {
+              await runResidualMomentumCycleGuarded({
+                store: parentStore,
+                now,
+                fetchCandles,
+              });
+            }
+            if (process.env.HEDGED_RESIDUAL_SHORT_V2_DISABLED !== "1") {
+              await runHedgedResidualShortV2CycleGuarded({
+                store: getHedgedResidualShortV2Store(),
+                now,
+                fetchCandles,
+                rankHistoryFor: (symbol) => parentStore.rankHistoryFor(symbol),
+                regimeAtEntry: getLatestScanCandidates()?.marketRegime ?? null,
+              });
+            }
+          })().catch(() => undefined);
         }
         // Liquidation-recoil cross-sectional ranking (2026-07-10, Tier-3 audit item C): the
         // cross-symbol extension of panic-washout-reclaim-edge.ts — detects a broad liquidation
@@ -2372,15 +2448,42 @@ export async function registerShadowRoutes(
         // missing entry side of the CG long-volatility-expansion thesis — ATR/Bollinger-width
         // compression followed by an order-flow-confirmed breakout. See compression-expansion-edge.ts.
         // Report-only measurement; never wired to any executor or lane allocation.
-        if (process.env.COMPRESSION_EXPANSION_DISABLED !== "1") {
+        if (
+          process.env.COMPRESSION_EXPANSION_DISABLED !== "1" ||
+          process.env.COMPRESSION_RETEST_V2_DISABLED !== "1"
+        ) {
           const _cee = opts.binanceClient;
-          void runCompressionExpansionCycleGuarded({
-            store: getCompressionExpansionStore(),
-            universe: CEE_UNIVERSE,
-            now: Date.now(),
-            fetchCandles: async (symbol: string) => _cee.getCandles(symbol, CEE_INTERVAL, 200),
-            client: _cee,
-          }).catch(() => undefined);
+          const now = Date.now();
+          const candleCache = new Map<string, Promise<Candle[]>>();
+          const fetchCandles = (symbol: string) => {
+            let pending = candleCache.get(symbol);
+            if (!pending) {
+              pending = _cee.getCandles(symbol, CEE_INTERVAL, 200);
+              candleCache.set(symbol, pending);
+            }
+            return pending;
+          };
+          void (async () => {
+            const parentStore = getCompressionExpansionStore();
+            if (process.env.COMPRESSION_EXPANSION_DISABLED !== "1") {
+              await runCompressionExpansionCycleGuarded({
+                store: parentStore,
+                universe: CEE_UNIVERSE,
+                now,
+                fetchCandles,
+                client: _cee,
+              });
+            }
+            if (process.env.COMPRESSION_RETEST_V2_DISABLED !== "1") {
+              await runCompressionRetestV2CycleGuarded({
+                store: getCompressionRetestV2Store(),
+                parentStore,
+                universe: CEE_UNIVERSE,
+                now,
+                fetchCandles,
+              });
+            }
+          })().catch(() => undefined);
         }
         // FUNDING-CARRY MARKET-NEUTRAL PAIR (2026-07-21): LONG the low-funding leg, SHORT the
         // high-funding leg of a SAME-cluster pair (correlation-clusters.ts — beta approximately
@@ -2390,18 +2493,43 @@ export async function registerShadowRoutes(
         // shadow measurement — report-only, fire-and-forget, env-gated, own store/cycle/report;
         // does NOT pass through the allocator, paper book, live engine, or any strategy gate, and
         // has NO executor. See funding-carry-edge.ts.
-        if (process.env.FUNDING_CARRY_DISABLED !== "1") {
+        if (
+          process.env.FUNDING_CARRY_DISABLED !== "1" ||
+          process.env.FUNDING_CARRY_CROWDING_V2_DISABLED !== "1"
+        ) {
           const _fcc = opts.binanceClient;
-          void runFundingCarryCycleGuarded({
-            store: getFundingCarryStore(),
-            now: Date.now(),
-            // One existing-client call per symbol: current-period funding rate + mark price
-            // (same getFuturesPremiumIndex the moonshot lane already uses for mark prices).
-            fetchPremiumIndex: async (symbol: string) => {
-              const p = await _fcc.getFuturesPremiumIndex(symbol);
-              return { fundingRate: p.fundingRate, markPrice: p.markPrice };
-            },
-          }).catch(() => undefined);
+          const now = Date.now();
+          const premiumCache = new Map<
+            string,
+            Promise<{ fundingRate: number | null; markPrice: number | null }>
+          >();
+          const fetchPremiumIndex = (symbol: string) => {
+            let pending = premiumCache.get(symbol);
+            if (!pending) {
+              pending = _fcc.getFuturesPremiumIndex(symbol).then((premium) => ({
+                fundingRate: premium.fundingRate,
+                markPrice: premium.markPrice,
+              }));
+              premiumCache.set(symbol, pending);
+            }
+            return pending;
+          };
+          void (async () => {
+            if (process.env.FUNDING_CARRY_DISABLED !== "1") {
+              await runFundingCarryCycleGuarded({
+                store: getFundingCarryStore(),
+                now,
+                fetchPremiumIndex,
+              });
+            }
+            if (process.env.FUNDING_CARRY_CROWDING_V2_DISABLED !== "1") {
+              await runFundingCarryCrowdingV2CycleGuarded({
+                store: getFundingCarryCrowdingV2Store(),
+                now,
+                fetchPremiumIndex,
+              });
+            }
+          })().catch(() => undefined);
         }
         // BTC LEAD-LAG RESIDUAL SNAP (2026-07-21): when BTC makes a sharp move (short-window
         // return ≥ k × its OWN recent vol — self-normalizing), rank correlated alts by how far
@@ -2432,13 +2560,49 @@ export async function registerShadowRoutes(
         // env-gated, own store/cycle/report; NO executor, never touches admission/allocation/live
         // behavior. Distinct from the PWR candle lane and the Tier-3 cross-sectional ranking
         // module (both candle-shape-driven; this one is flow-driven and bidirectional).
-        if (process.env.LIQ_RECOIL_DISABLED !== "1") {
+        if (
+          process.env.LIQ_RECOIL_DISABLED !== "1" ||
+          process.env.LIQ_RECOIL_STRICT_RECLAIM_V2_DISABLED !== "1"
+        ) {
           const _lqc = opts.binanceClient;
-          void runLiqRecoilCycleGuarded({
-            store: getLiqRecoilStore(),
+          const now = Date.now();
+          const candleCache = new Map<string, Promise<Candle[]>>();
+          const fetchCandles = (symbol: string) => {
+            let pending = candleCache.get(symbol);
+            if (!pending) {
+              pending = _lqc.getCandles(symbol, LQR_INTERVAL, LQR_CANDLE_FETCH_LIMIT);
+              candleCache.set(symbol, pending);
+            }
+            return pending;
+          };
+          void (async () => {
+            const parentStore = getLiqRecoilStore();
+            if (process.env.LIQ_RECOIL_DISABLED !== "1") {
+              await runLiqRecoilCycleGuarded({
+                store: parentStore,
+                now,
+                fetchCandles,
+                crowdingClient: _lqc,
+              });
+            }
+            if (process.env.LIQ_RECOIL_STRICT_RECLAIM_V2_DISABLED !== "1") {
+              await runLiqRecoilStrictReclaimV2CycleGuarded({
+                store: getLiqRecoilStrictReclaimV2Store(),
+                parentStore,
+                now,
+                fetchCandles,
+              });
+            }
+          })().catch(() => undefined);
+        }
+        // REST L2 depth + aggregate taker-flow signal markout. This is explicitly NOT an MBO queue
+        // simulator and makes no fill assumption; it only measures whether an aligned, non-toxic
+        // snapshot predicts the next sampled mid-price after realistic taker costs.
+        if (process.env.QUEUE_IMBALANCE_TOXIC_FLOW_DISABLED !== "1") {
+          void runQueueImbalanceToxicFlowCycleGuarded({
+            store: getQueueImbalanceToxicFlowStore(),
+            client: opts.binanceClient,
             now: Date.now(),
-            fetchCandles: async (symbol: string) => _lqc.getCandles(symbol, LQR_INTERVAL, LQR_CANDLE_FETCH_LIMIT),
-            crowdingClient: _lqc,
           }).catch(() => undefined);
         }
         // META-LABEL PER-SIGNAL GATE (2026-07-22): López-de-Prado-style secondary classifier that
