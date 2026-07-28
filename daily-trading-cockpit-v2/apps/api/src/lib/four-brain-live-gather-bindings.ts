@@ -27,10 +27,35 @@ import {
   type RawReadingInput,
 } from "./four-brain-live-gather.js";
 
-/** Each roster lane's supported horizon (tactical lanes are INTRADAY; composite/basket are SWING). */
-export function laneHorizon(laneId: string): DirectionHorizon {
+/** Lanes that move to SCALP once INTRADAY has earned a verdict — the genuinely fast ones (0.5R TP,
+ *  minutes-to-an-hour holds). SHORT_FADE / PANIC / INTRADAY keep their horizon so INTRADAY never
+ *  loses its whole population to the promotion. */
+const SCALP_ELIGIBLE = (id: string): boolean => id.includes("FAST");
+
+/**
+ * Each roster lane's supported horizon (tactical lanes are INTRADAY; composite/basket are SWING).
+ *
+ * SCALP IS STAGED, NOT OFF (2026-07-28). It used to be unreachable: this function could only return
+ * INTRADAY or SWING, so no candidate ever carried horizon SCALP, so the SCALP direction decision the
+ * gather computes could never attach to an executive decision (four-brain-shadow-tick.ts:185 joins
+ * `directionByHorizon.get(candidate.identity.horizon)`), so SCALP/LONG and SCALP/SHORT sat at zero
+ * samples forever while the readiness panel enumerated them as gaps.
+ *
+ * Simply reassigning the FAST lanes would have fixed that at a real cost: those lanes ARE INTRADAY's
+ * population, and moving them mid-flight restarts INTRADAY's evidence from scratch — trading a
+ * horizon that is nearly measurable for one that is not. So the switch waits: while INTRADAY is
+ * still accumulating, everything behaves exactly as before; once INTRADAY has enough independent
+ * samples to be judged at all, the fast lanes promote themselves to the shorter horizon.
+ *
+ * The cutover is clean rather than destructive — a decision's horizon is stamped when it is made, so
+ * everything already pending resolves under the horizon it was taken at. INTRADAY keeps every sample
+ * it earned; SCALP starts fresh from the switch.
+ */
+export function laneHorizon(laneId: string, opts?: { scalpEnabled?: boolean }): DirectionHorizon {
   const id = laneId.toUpperCase();
-  if (id.includes("INTRADAY") || id.includes("SHORT_FADE") || id.includes("PANIC") || id.includes("FAST")) return "INTRADAY";
+  if (id.includes("INTRADAY") || id.includes("SHORT_FADE") || id.includes("PANIC") || id.includes("FAST")) {
+    return opts?.scalpEnabled === true && SCALP_ELIGIBLE(id) ? "SCALP" : "INTRADAY";
+  }
   return "SWING";
 }
 const laneDirection = new Map(FOUR_BRAIN_LANE_SUPPORT.map((e) => [e.laneId, e.direction]));
@@ -207,6 +232,9 @@ export interface FourBrainBindingDeps {
   instanceId: string;
   nowMs: number;
   horizons?: DirectionHorizon[];
+  /** True once INTRADAY has earned a verdict — promotes the FAST lanes to the SCALP horizon.
+   *  See laneHorizon(). Absent/false keeps the pre-2026-07-28 behaviour exactly. */
+  scalpHorizonEnabled?: boolean;
 
   // ── Market State (normalized values + observed timestamps) ──
   axisScore: number | null; // −1..1
@@ -394,7 +422,7 @@ export function buildFourBrainGatherInput(dep: FourBrainBindingDeps): FourBrainG
   const entryCandidatesRaw: EntryCandidateRaw[] = dep.openSignals.map((s) => {
     const identity: FourBrainIdentity = {
       instanceId: dep.instanceId, laneId: s.laneId, symbolOrBasketId: s.symbol, side: s.direction,
-      signalId: s.observationId, positionId: null, horizon: laneHorizon(s.laneId), decisionAtMs: nowMs,
+      signalId: s.observationId, positionId: null, horizon: laneHorizon(s.laneId, { scalpEnabled: dep.scalpHorizonEnabled === true }), decisionAtMs: nowMs,
     };
     const exec: ExecContext = {
       cortexDecisionId: dep.cortexDecisionId,
@@ -457,7 +485,7 @@ export function buildFourBrainGatherInput(dep: FourBrainBindingDeps): FourBrainG
       (finite(usableMark) && finite(p.stopPrice) && (p.direction === "LONG" ? usableMark <= p.stopPrice : usableMark >= p.stopPrice));
     const identity: FourBrainIdentity = {
       instanceId: dep.instanceId, laneId: p.laneId, symbolOrBasketId: p.symbol, side: p.direction,
-      signalId: null, positionId: p.paperOrderId, horizon: laneHorizon(p.laneId), decisionAtMs: nowMs,
+      signalId: null, positionId: p.paperOrderId, horizon: laneHorizon(p.laneId, { scalpEnabled: dep.scalpHorizonEnabled === true }), decisionAtMs: nowMs,
     };
     const exec: ExecContext = {
       cortexDecisionId: dep.cortexDecisionId,

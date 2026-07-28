@@ -176,7 +176,7 @@ import { buildLiveCortexGatherDeps } from "./lib/cortex-live-gather-bindings.js"
 import { getCortexRealAttributionStore } from "./lib/cortex-real-attribution.js";
 import { getExecutionFillRecorder } from "./lib/execution-fill-recorder.js";
 import { getPositionPathRecorder } from "./lib/position-path-recorder.js";
-import { getDirectionEntryOutcomeStore, buildDirectionEntryOutcomeReport, type DirectionEntryOutcomeReport } from "./lib/direction-entry-outcome-store.js";
+import { getDirectionEntryOutcomeStore, buildDirectionEntryOutcomeReport, DIRECTION_ENTRY_MIN_EXAMPLES_ACTIVE, type DirectionEntryOutcomeReport } from "./lib/direction-entry-outcome-store.js";
 import {
   runDirectionEntryReconciliationCycleGuarded,
   directionEntryReconcilerActive,
@@ -2256,6 +2256,16 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           const k = kronosAgreeFromScan(scanCached?.candidates, "BTCUSDT", parseAtMs(scanCached?.scanFinishedAt));
           return { kronosAgree: k.agree, kronosAtMs: k.atMs };
         })(),
+        // STAGED SCALP (2026-07-28). SCALP was unreachable — laneHorizon() could only return INTRADAY
+        // or SWING, so no candidate ever carried it and the SCALP direction decision could never
+        // attach to anything. Reassigning the FAST lanes outright would have fixed that by gutting
+        // INTRADAY, whose population those lanes ARE. So the promotion waits until INTRADAY has enough
+        // independent samples to be judged at all; from that point the fast lanes move to the shorter
+        // horizon on their own. Read fresh each tick — no restart or operator step is needed to flip
+        // it, and it can flip back if retention ever drops INTRADAY below the bar again.
+        scalpHorizonEnabled:
+          (directionEntryOutcomeStore.getState().direction.perHorizon.INTRADAY?.effectiveN ?? 0) >=
+          DIRECTION_ENTRY_MIN_EXAMPLES_ACTIVE,
         openSignals: collectFourBrainOpenSignals(),
         maxSignalAgeMs: 50 * 60_000,
         crowdingStateForSymbol: (symbol) => crowdingShadow[symbol]?.crowdingState ?? null,
