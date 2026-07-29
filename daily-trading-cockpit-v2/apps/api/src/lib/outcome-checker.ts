@@ -20,6 +20,7 @@ import {
   CURRENT_DECISION_POLICY_VERSION,
   CURRENT_EVIDENCE_ERA,
   EVIDENCE_POLICY_VERSION,
+  END_TO_END_CORRECTNESS_DEPLOYED_AT,
 } from "@dtc/shared";
 
 import type { BinanceClient } from "./binance.js";
@@ -1794,7 +1795,8 @@ function computePerformanceInternal(
   const isPostFix = (signal: TrackedSignal): boolean =>
     signal.selectedExecutionPlan?.evidenceEra === CURRENT_EVIDENCE_ERA &&
     signal.selectedExecutionPlan?.decisionPolicyVersion === CURRENT_DECISION_POLICY_VERSION &&
-    signal.selectedExecutionPlan?.evidencePolicyVersion === EVIDENCE_POLICY_VERSION;
+    signal.selectedExecutionPlan?.evidencePolicyVersion === EVIDENCE_POLICY_VERSION &&
+    signal.selectedExecutionPlan?.policyDeploymentAt === END_TO_END_CORRECTNESS_DEPLOYED_AT;
   const postFixSignalCount = uniqueSignals.filter(isPostFix).length;
   const legacySignalCount = uniqueSignals.length - postFixSignalCount;
   const homogeneousPostFix = uniqueSignals.length > 0 && legacySignalCount === 0;

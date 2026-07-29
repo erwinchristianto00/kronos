@@ -21,7 +21,7 @@ import {
   CURRENT_DECISION_POLICY_VERSION,
   CURRENT_EVIDENCE_ERA,
 } from "./evidence-era.js";
-import { EVIDENCE_POLICY_VERSION, EXECUTION_POLICY_VERSION } from "./policy-versions.js";
+import { END_TO_END_CORRECTNESS_DEPLOYED_AT, EVIDENCE_POLICY_VERSION, EXECUTION_POLICY_VERSION } from "./policy-versions.js";
 
 function clamp(value: number, min: number, max: number) {
   return Math.min(Math.max(value, min), max);
@@ -614,6 +614,7 @@ export function buildVariantSelection(
     decisionPolicyVersion: CURRENT_DECISION_POLICY_VERSION,
     executionPolicyVersion: EXECUTION_POLICY_VERSION,
     evidencePolicyVersion: EVIDENCE_POLICY_VERSION,
+    policyDeploymentAt: END_TO_END_CORRECTNESS_DEPLOYED_AT,
     selectionSource: "heuristic_fallback",
     costAssumption: `1h replay uses ${decisionPerf ? `${decisionPerf.executionCost.roundTripCostBps}bps round-trip` : "configured round-trip costs"}${candidate.spread.percent !== null ? ` + ${candidate.spread.percent.toFixed(4)}% spread` : ""}`,
     selectionReason: reason,

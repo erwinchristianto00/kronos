@@ -7,6 +7,7 @@ import {
   CURRENT_DECISION_POLICY_VERSION,
   CURRENT_EVIDENCE_ERA,
   EVIDENCE_POLICY_VERSION,
+  END_TO_END_CORRECTNESS_DEPLOYED_AT,
   type TrackedSignal,
 } from "@dtc/shared";
 
@@ -136,6 +137,7 @@ describe("computePerformance", () => {
       evidenceEra: CURRENT_EVIDENCE_ERA,
       decisionPolicyVersion: CURRENT_DECISION_POLICY_VERSION,
       evidencePolicyVersion: EVIDENCE_POLICY_VERSION,
+      policyDeploymentAt: END_TO_END_CORRECTNESS_DEPLOYED_AT,
     } as TrackedSignal["selectedExecutionPlan"];
     const current = computePerformance([makeSignal({ id: "current", selectedExecutionPlan: currentPlan })]);
     expect(current.evidenceEra).toBe(CURRENT_EVIDENCE_ERA);

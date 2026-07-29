@@ -793,6 +793,8 @@ export interface VariantSelectionSnapshot {
   executionPolicyVersion?: string;
   /** Evidence aggregation semantics used to evaluate this plan. */
   evidencePolicyVersion?: string;
+  /** Immutable deployment cutover for the policy versions stamped above. */
+  policyDeploymentAt?: string;
   selectionSource: "replay" | "heuristic_fallback";
   costAssumption: string;
   selectionReason: string;

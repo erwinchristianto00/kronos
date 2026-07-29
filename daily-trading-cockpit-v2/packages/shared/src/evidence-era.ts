@@ -16,7 +16,7 @@
  */
 
 import type { VariantSelectionSnapshot } from "./types.js";
-import { DECISION_PIPELINE_POLICY_VERSION } from "./policy-versions.js";
+import { DECISION_PIPELINE_POLICY_VERSION, END_TO_END_CORRECTNESS_DEPLOYED_AT } from "./policy-versions.js";
 
 export type EvidenceEra =
   | "LEGACY_PRE_END_TO_END_CORRECTNESS_FIX"
@@ -46,6 +46,7 @@ export interface EvidenceEraSubject {
     | "calibrationVerdict"
     | "evidenceEra"
     | "decisionPolicyVersion"
+    | "policyDeploymentAt"
   > | null;
 }
 
