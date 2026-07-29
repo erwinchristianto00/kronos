@@ -70,6 +70,10 @@ const outcome = (overrides: Partial<ExecutiveReviewOutcomeLink> = {}): Executive
   costR: 0.05,
   executionCostKnown: true,
   executionCostProvenance: "EXCHANGE_MEASURED",
+  settlementFetchComplete: true,
+  requiredOrderIds: ["order-1", "exit-1"],
+  matchedRequiredOrderIds: ["order-1", "exit-1"],
+  missingRequiredOrderIds: [],
   netR: 0.2,
   decisionPipelinePolicyVersion: "decision/1",
   executionPolicyVersion: "execution/1",
@@ -106,6 +110,10 @@ const tier1 = (): ExecutiveReviewOutcome => ({
   grossR: 0.25,
   costR: 0.05,
   executionCostProvenance: "EXCHANGE_MEASURED",
+  settlementFetchComplete: true,
+  requiredOrderIds: ["order-1", "exit-1"],
+  matchedRequiredOrderIds: ["order-1", "exit-1"],
+  missingRequiredOrderIds: [],
   netR: 0.2,
   decisionPipelinePolicyVersion: "decision/1",
   executionPolicyVersion: "execution/1",
@@ -284,6 +292,7 @@ describe("Executive Review Store", () => {
         entryOrderId: "order-1",
         createdAt: new Date(110).toISOString(),
         effectiveRiskUsd: 10,
+        originalRiskUsd: 10,
         executiveReviewLink: firstLink,
         sourcePaperOrders: [{ paperOrderId: "paper-1", laneId: "LANE", qty: 1, executiveReviewLink: firstLink }],
       } as LiveIntent;
@@ -330,9 +339,14 @@ describe("Executive Review Store", () => {
         closedAt: new Date(1_000).toISOString(),
         state: "CLOSED",
         effectiveRiskUsd: 10,
+        originalRiskUsd: 10,
         realizedPnlUsd: 2,
         feesUsd: 0,
         feeSource: "EXCHANGE",
+        settlementFetchComplete: true,
+        requiredOrderIds: ["order-1", "exit-1"],
+        matchedRequiredOrderIds: ["order-1", "exit-1"],
+        missingRequiredOrderIds: [],
         executiveReviewLink: link,
         sourcePaperOrders: [{ paperOrderId: "paper-1", laneId: "LANE", qty: 1, executiveReviewLink: link }],
       } as LiveIntent;
@@ -344,6 +358,30 @@ describe("Executive Review Store", () => {
       expect(store.get().tier1[0]).toMatchObject({ grossR: 0.2, costR: 0, netR: 0.2, executionCostProvenance: "EXCHANGE_MEASURED" });
       expect(resolveExecutiveReviewPositions(store, [closed], 900_000).linked).toBe(0);
       expect(store.get().tier1).toHaveLength(1);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps incomplete exchange settlement out of Tier 1 while the position lifecycle resolves", () => {
+    const dir = mkdtempSync(join(tmpdir(), "executive-review-incomplete-"));
+    try {
+      const store = new ExecutiveReviewStore(join(dir, "reviews.json"));
+      expect(store.addReview(review())).toBe(true);
+      const intent = {
+        paperOrderId: "paper-1", executionIntentId: "intent-1", positionId: "position-1", entryOrderId: "order-1",
+        createdAt: new Date(110).toISOString(), closedAt: new Date(1_000).toISOString(), state: "CLOSED",
+        originalRiskUsd: 10, effectiveRiskUsd: 10, realizedPnlUsd: 2, feesUsd: 0, feeSource: "EXCHANGE",
+        settlementFetchComplete: false, requiredOrderIds: ["order-1", "exit-1"], matchedRequiredOrderIds: ["exit-1"], missingRequiredOrderIds: ["order-1"],
+        executiveReviewLink: {
+          executiveReviewId: "review-1", candidateId: "candidate-1", opportunityId: "opportunity-1", laneId: "LANE",
+          marketContextSnapshotId: "market-1", allocationSnapshotId: null, direction: "LONG", marketState: "BULLISH_TACTICAL", evidenceEra: "post-fix/1",
+          decisionPipelinePolicyVersion: "decision/1", executionPolicyVersion: "execution/1", evidencePolicyVersion: "evidence/1", fourBrainPolicyVersion: "four-brain/1",
+        },
+      } as LiveIntent;
+      resolveExecutiveReviewPositions(store, [intent], 900_000);
+      expect(store.get().tier1).toHaveLength(0);
+      expect(store.get().reviews[0]?.reasonCode).toBe("SETTLEMENT_INCOMPLETE");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

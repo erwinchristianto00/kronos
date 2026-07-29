@@ -65,10 +65,10 @@ import { recordHeatShadowSnapshot } from "./portfolio-heat-shadow.js";
 import {
   CURRENT_DECISION_POLICY_VERSION,
   CURRENT_EVIDENCE_ERA,
-  END_TO_END_CORRECTNESS_DEPLOYED_AT,
   EVIDENCE_POLICY_VERSION,
   EXECUTION_POLICY_VERSION,
   MIN_EXECUTION_RR,
+  resolveEndToEndCorrectnessDeploymentAt,
 } from "@dtc/shared";
 import { getSimulatedPaperPathStore, simulatedPaperPathDirFor } from "./paper-simulated-path-store.js";
 import {
@@ -1376,7 +1376,7 @@ function _buildBaseOrder(
     decisionPolicyVersion: CURRENT_DECISION_POLICY_VERSION,
     evidencePolicyVersion: EVIDENCE_POLICY_VERSION,
     evidenceEra: CURRENT_EVIDENCE_ERA,
-    policyDeploymentAt: END_TO_END_CORRECTNESS_DEPLOYED_AT,
+    policyDeploymentAt: resolveEndToEndCorrectnessDeploymentAt(),
     actualStopDistanceBps: actualGeometry.stopDistanceBps,
     actualRiskReward: actualGeometry.riskReward,
     symbol: obs.symbol,
@@ -1678,7 +1678,7 @@ function _buildAllocatorOrder(
     decisionPolicyVersion: CURRENT_DECISION_POLICY_VERSION,
     evidencePolicyVersion: EVIDENCE_POLICY_VERSION,
     evidenceEra: CURRENT_EVIDENCE_ERA,
-    policyDeploymentAt: END_TO_END_CORRECTNESS_DEPLOYED_AT,
+    policyDeploymentAt: resolveEndToEndCorrectnessDeploymentAt(),
     actualStopDistanceBps: actualGeometry.stopDistanceBps,
     actualRiskReward: actualGeometry.riskReward,
     symbol: o.symbol,

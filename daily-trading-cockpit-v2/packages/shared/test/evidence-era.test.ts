@@ -7,10 +7,14 @@ import {
   hasCurrentPostFixPolicyStamp,
 } from "../src/evidence-era.js";
 import {
-  END_TO_END_CORRECTNESS_DEPLOYED_AT,
+  END_TO_END_CORRECTNESS_DEPLOYED_AT_ENV,
   EVIDENCE_POLICY_VERSION,
   EXECUTION_POLICY_VERSION,
+  resolveEndToEndCorrectnessDeploymentAt,
 } from "../src/policy-versions.js";
+
+const deploymentEnv = { [END_TO_END_CORRECTNESS_DEPLOYED_AT_ENV]: "2026-07-28T00:00:00.000Z" };
+const deploymentAt = resolveEndToEndCorrectnessDeploymentAt(deploymentEnv, Date.parse("2026-07-29T00:00:00.000Z"))!;
 
 describe("classifyEvidenceEra", () => {
   it("returns LEGACY_PRE_ROUTING when there is no variantSelection", () => {
@@ -63,10 +67,10 @@ describe("classifyEvidenceEra", () => {
       decisionPolicyVersion: CURRENT_DECISION_POLICY_VERSION,
       executionPolicyVersion: EXECUTION_POLICY_VERSION,
       evidencePolicyVersion: EVIDENCE_POLICY_VERSION,
-      policyDeploymentAt: END_TO_END_CORRECTNESS_DEPLOYED_AT,
+      policyDeploymentAt: deploymentAt,
     };
-    expect(hasCurrentPostFixPolicyStamp(current)).toBe(true);
-    expect(hasCurrentPostFixPolicyStamp({ ...current, executionPolicyVersion: null })).toBe(false);
-    expect(hasCurrentPostFixPolicyStamp({ ...current, policyDeploymentAt: "2026-01-01T00:00:00.000Z" })).toBe(false);
+    expect(hasCurrentPostFixPolicyStamp(current, deploymentEnv)).toBe(true);
+    expect(hasCurrentPostFixPolicyStamp({ ...current, executionPolicyVersion: null }, deploymentEnv)).toBe(false);
+    expect(hasCurrentPostFixPolicyStamp({ ...current, policyDeploymentAt: "2026-01-01T00:00:00.000Z" }, deploymentEnv)).toBe(false);
   });
 });

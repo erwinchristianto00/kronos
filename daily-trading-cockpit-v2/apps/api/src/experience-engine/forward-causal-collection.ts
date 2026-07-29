@@ -17,6 +17,7 @@ import {
   CURRENT_EVIDENCE_ERA,
   EVIDENCE_POLICY_VERSION,
   EXECUTION_POLICY_VERSION,
+  resolveEndToEndCorrectnessDeploymentAt,
 } from "@dtc/shared";
 
 export const CAUSAL_LINEAGE_SCHEMA_VERSION = "causal-lineage-1" as const;
@@ -42,6 +43,7 @@ export interface CausalIdentity {
   executionPolicyVersion: string;
   evidencePolicyVersion: string;
   evidenceEra: string;
+  policyDeploymentAt: string;
 }
 
 export interface CausalCollectionActivation {
@@ -55,6 +57,9 @@ export interface ForwardPaperOrderLike {
   sourceCandidateId?: string | null;
   sourceObservationId: string;
   openedAt: string;
+  /** Decision-admission clock. `firstSeenAt` is preferred when supplied by PaperOrder. */
+  createdAt?: string | null;
+  firstSeenAt?: string | null;
   selectedLaneId: string;
   symbol: string;
   direction: "LONG" | "SHORT";
@@ -78,6 +83,7 @@ export interface ForwardPaperOrderLike {
   executionPolicyVersion?: string | null;
   evidencePolicyVersion?: string | null;
   evidenceEra?: string | null;
+  policyDeploymentAt?: string | null;
   causalIdentity?: CausalIdentity | null;
   cortexDecisionSnapshot?: CortexDecisionSnapshot | null;
 }
@@ -150,6 +156,10 @@ const openedAtMsOf = (order: ForwardPaperOrderLike): number | null => {
   const value = Date.parse(order.openedAt);
   return Number.isFinite(value) ? value : null;
 };
+const decisionTimeMsOf = (order: ForwardPaperOrderLike): number | null => {
+  const value = Date.parse(order.firstSeenAt ?? order.createdAt ?? order.openedAt);
+  return Number.isFinite(value) ? value : null;
+};
 const originKeyOf = (order: ForwardPaperOrderLike): string => order.sourceCandidateId || order.sourceObservationId;
 const validCortexSnapshot = (order: ForwardPaperOrderLike, openedAtMs: number): CortexDecisionSnapshot | null => {
   const snapshot = order.cortexDecisionSnapshot ?? null;
@@ -176,17 +186,23 @@ export function prepareForwardCausalIdentity(order: ForwardPaperOrderLike, env: 
   const activation = resolveCausalCollectionActivation(env);
   if (!activation.active) return null;
   if (order.causalIdentity) return order.causalIdentity;
-  const asOfMs = openedAtMsOf(order);
+  const openedAtMs = openedAtMsOf(order);
+  const decisionTimeMs = decisionTimeMsOf(order);
+  const policyDeploymentAt = resolveEndToEndCorrectnessDeploymentAt(env);
+  const policyDeploymentAtMs = policyDeploymentAt == null ? Number.NaN : Date.parse(policyDeploymentAt);
   if (
-    asOfMs == null || !order.paperOrderId || !order.selectedLaneId || !order.symbol ||
+    openedAtMs == null || decisionTimeMs == null || !Number.isFinite(policyDeploymentAtMs) ||
+    decisionTimeMs < policyDeploymentAtMs || openedAtMs < policyDeploymentAtMs ||
+    order.policyDeploymentAt !== policyDeploymentAt ||
+    !order.paperOrderId || !order.selectedLaneId || !order.symbol ||
     order.decisionPolicyVersion !== CURRENT_DECISION_POLICY_VERSION ||
     order.executionPolicyVersion !== EXECUTION_POLICY_VERSION ||
     order.evidencePolicyVersion !== EVIDENCE_POLICY_VERSION ||
     order.evidenceEra !== CURRENT_EVIDENCE_ERA
   ) return null;
   const originKey = originKeyOf(order);
-  const cortex = validCortexSnapshot(order, asOfMs);
-  const decisionId = `causal-decision-${hash([CAUSAL_LINEAGE_SCHEMA_VERSION, activation.instanceId, originKey, order.selectedLaneId, order.symbol, order.direction, asOfMs])}`;
+  const cortex = validCortexSnapshot(order, decisionTimeMs);
+  const decisionId = `causal-decision-${hash([CAUSAL_LINEAGE_SCHEMA_VERSION, activation.instanceId, originKey, order.selectedLaneId, order.symbol, order.direction, decisionTimeMs])}`;
   return {
     lineageSchemaVersion: CAUSAL_LINEAGE_SCHEMA_VERSION,
     decisionId,
@@ -206,6 +222,7 @@ export function prepareForwardCausalIdentity(order: ForwardPaperOrderLike, env: 
     executionPolicyVersion: order.executionPolicyVersion,
     evidencePolicyVersion: order.evidencePolicyVersion,
     evidenceEra: order.evidenceEra,
+    policyDeploymentAt: policyDeploymentAt!,
   };
 }
 
@@ -242,13 +259,14 @@ function featureSnapshot(order: ForwardPaperOrderLike, asOfMs: number): Decision
 
 function openEvents(order: ForwardPaperOrderLike): ForwardEvent[] {
   const identity = order.causalIdentity;
-  const asOfMs = openedAtMsOf(order);
-  if (!identity || asOfMs == null) return [];
+  const openedAtMs = openedAtMsOf(order);
+  const decisionTimeMs = decisionTimeMsOf(order);
+  if (!identity || openedAtMs == null || decisionTimeMs == null) return [];
   const originKey = originKeyOf(order);
-  const features = featureSnapshot(order, asOfMs);
-  const cortex = validCortexSnapshot(order, asOfMs);
+  const features = featureSnapshot(order, decisionTimeMs);
+  const cortex = validCortexSnapshot(order, decisionTimeMs);
   const decision: DecisionSnapshotEvent = {
-    eventType: "DECISION_SNAPSHOT", eventId: identity.decisionId, identity, asOfMs, reportOnly: true,
+    eventType: "DECISION_SNAPSHOT", eventId: identity.decisionId, identity, asOfMs: decisionTimeMs, reportOnly: true,
     codeVersion: null,
     marketState: { regime: order.regime ?? null, status: order.regime ? "PRESENT" : "MISSING" },
     directionDecision: { direction: order.direction, controllerMode: order.controllerMode ?? null, status: order.controllerMode ? "PRESENT" : "MISSING" },
@@ -275,7 +293,7 @@ function openEvents(order: ForwardPaperOrderLike): ForwardEvent[] {
   };
   const opportunity: OpportunityOpenEvent = {
     eventType: "OPPORTUNITY_OPEN", eventId: identity.opportunityId, identity, decisionId: identity.decisionId,
-    openedAtMs: asOfMs, entryPrice: order.entryPrice, stopDistance: Math.abs(order.entryPrice - order.stopLoss),
+    openedAtMs, entryPrice: order.entryPrice, stopDistance: Math.abs(order.entryPrice - order.stopLoss),
     expectedCostAssumptions: {
       costR: finite(order.provenance?.costR) ? order.provenance!.costR as number : null,
       feeSlippageR: finite(order.provenance?.feeSlippageR) ? order.provenance!.feeSlippageR as number : null,

@@ -18,9 +18,9 @@
 import type { VariantSelectionSnapshot } from "./types.js";
 import {
   DECISION_PIPELINE_POLICY_VERSION,
-  END_TO_END_CORRECTNESS_DEPLOYED_AT,
   EVIDENCE_POLICY_VERSION,
   EXECUTION_POLICY_VERSION,
+  resolveEndToEndCorrectnessDeploymentAt,
 } from "./policy-versions.js";
 
 export type EvidenceEra =
@@ -56,12 +56,17 @@ export interface PostFixPolicyStampedPlan {
   policyDeploymentAt?: string | null;
 }
 
-export function hasCurrentPostFixPolicyStamp(plan: PostFixPolicyStampedPlan | null | undefined): boolean {
+export function hasCurrentPostFixPolicyStamp(
+  plan: PostFixPolicyStampedPlan | null | undefined,
+  env?: Record<string, string | undefined>,
+): boolean {
+  const deploymentAt = resolveEndToEndCorrectnessDeploymentAt(env);
   return plan?.evidenceEra === CURRENT_EVIDENCE_ERA &&
     plan.decisionPolicyVersion === CURRENT_DECISION_POLICY_VERSION &&
     plan.executionPolicyVersion === EXECUTION_POLICY_VERSION &&
     plan.evidencePolicyVersion === EVIDENCE_POLICY_VERSION &&
-    plan.policyDeploymentAt === END_TO_END_CORRECTNESS_DEPLOYED_AT;
+    deploymentAt !== null &&
+    plan.policyDeploymentAt === deploymentAt;
 }
 
 /** Minimal shape needed to classify — keeps callers from importing all of ShadowPosition. */

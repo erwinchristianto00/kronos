@@ -19,13 +19,15 @@ import { buildCortexExperienceBridge } from "../src/experience-engine/cortex-exp
 import { CORTEX_FEATURE_SCHEMA_VERSION } from "../src/lib/cortex-brain.js";
 import { CURRENT_DECISION_POLICY_VERSION, CURRENT_EVIDENCE_ERA, EVIDENCE_POLICY_VERSION, EXECUTION_POLICY_VERSION } from "@dtc/shared";
 
+const DEPLOYMENT_AT = "1970-01-01T00:00:00.500Z";
+
 const dirs: string[] = [];
 afterEach(() => dirs.splice(0).forEach((dir) => rmSync(dir, { recursive: true, force: true })));
 
 function order(): ForwardPaperOrderLike {
   return {
     paperOrderId: "paper-semantic-1", sourceCandidateId: "candidate-semantic-1", sourceObservationId: "observation-1",
-    openedAt: new Date(1_000).toISOString(), selectedLaneId: "CG_WIDE_FAST_LONG", symbol: "BTCUSDT", direction: "LONG",
+    openedAt: new Date(1_000).toISOString(), createdAt: new Date(900).toISOString(), firstSeenAt: new Date(900).toISOString(), selectedLaneId: "CG_WIDE_FAST_LONG", symbol: "BTCUSDT", direction: "LONG",
     regime: "BULLISH", controllerMode: "LONG_ONLY", entryPrice: 100, stopLoss: 95, takeProfitLevels: [110],
     plannedStopDistanceBps: 500, provenance: { routeScore: 0.8, expectedNetR: 0.4, costR: -0.02, feeSlippageR: -0.01, spreadR: -0.01 },
     provenanceFieldMissing: [], paperStatus: "PAPER_SUBMITTED",
@@ -33,10 +35,11 @@ function order(): ForwardPaperOrderLike {
     executionPolicyVersion: EXECUTION_POLICY_VERSION,
     evidencePolicyVersion: EVIDENCE_POLICY_VERSION,
     evidenceEra: CURRENT_EVIDENCE_ERA,
+    policyDeploymentAt: DEPLOYMENT_AT,
   };
 }
 function shadowEnv(dir: string): NodeJS.ProcessEnv {
-  return { PORT: "3102", CAUSAL_EXPERIENCE_COLLECTION_MODE: "shadow", CAUSAL_EXPERIENCE_COLLECTION_DIR: dir };
+  return { PORT: "3102", CAUSAL_EXPERIENCE_COLLECTION_MODE: "shadow", CAUSAL_EXPERIENCE_COLLECTION_DIR: dir, END_TO_END_CORRECTNESS_DEPLOYED_AT: DEPLOYMENT_AT };
 }
 
 describe("forward causal collection", () => {
@@ -55,6 +58,14 @@ describe("forward causal collection", () => {
     const dir = mkdtempSync(join(tmpdir(), "causal-policy-")); dirs.push(dir);
     const env = shadowEnv(dir);
     expect(prepareForwardCausalIdentity({ ...order(), executionPolicyVersion: "stale" }, env)).toBeNull();
+  });
+
+  it("rejects decisions and opens before the actual deployment boundary", () => {
+    const dir = mkdtempSync(join(tmpdir(), "causal-boundary-")); dirs.push(dir);
+    const env = shadowEnv(dir);
+    expect(prepareForwardCausalIdentity({ ...order(), firstSeenAt: new Date(400).toISOString() }, env)).toBeNull();
+    expect(prepareForwardCausalIdentity({ ...order(), openedAt: new Date(400).toISOString() }, env)).toBeNull();
+    expect(prepareForwardCausalIdentity(order(), env)).not.toBeNull();
   });
 
   it("preserves exact IDs across decision, open, resolution, duplicate calls, and restart", () => {

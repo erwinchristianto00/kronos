@@ -29,6 +29,8 @@ export interface ExperienceRecord {
   provenance: "OBSERVED" | "HISTORICAL_CAUSAL" | "OBSERVED_PATH_COUNTERFACTUAL" | "SIMULATED" | "ADVERSARIAL";
   decisionTimeMs: number | null;
   openedTimeMs: number | null;
+  /** Runtime UTC cutover that bound this observed decision to the corrected policy. */
+  policyDeploymentAt?: string | null;
   marketCloseTimeMs: number | null;
   resolvedTimeMs: number | null;
   laneId: string | null;
@@ -60,6 +62,14 @@ export function assessExperienceEligibility(record: Omit<ExperienceRecord, "elig
   if (!LEARNING_SOURCES.has(record.source)) return { eligibility: "INELIGIBLE_FOR_DIRECT_TRAINING", eligibilityReasons: ["synthetic_or_adversarial_source"] };
   if (!record.decisionId || !record.opportunityId || !record.outcomeId) reasons.push("missing_exact_causal_identity");
   if (record.decisionTimeMs == null) reasons.push("missing_decision_time");
+  if (record.source === "OBSERVED_SHADOW_OUTCOME" || record.source === "OBSERVED_LIVE_CONTEXT_WITH_PAPER_OUTCOME") {
+    const deploymentAtMs = record.policyDeploymentAt == null ? Number.NaN : Date.parse(record.policyDeploymentAt);
+    if (!Number.isFinite(deploymentAtMs)) reasons.push("missing_or_invalid_policy_deployment_at");
+    else {
+      if (record.decisionTimeMs != null && record.decisionTimeMs < deploymentAtMs) reasons.push("decision_before_policy_deployment");
+      if (record.openedTimeMs != null && record.openedTimeMs < deploymentAtMs) reasons.push("open_before_policy_deployment");
+    }
+  }
   if (record.openedTimeMs != null && record.decisionTimeMs != null && record.decisionTimeMs > record.openedTimeMs) reasons.push("post_open_decision_leakage");
   if (record.marketCloseTimeMs == null || record.resolvedTimeMs == null) reasons.push("missing_market_close_or_resolution_time");
   if (record.marketCloseTimeMs != null && record.openedTimeMs != null && record.marketCloseTimeMs < record.openedTimeMs) reasons.push("close_before_open");

@@ -7,10 +7,12 @@ import {
   CURRENT_DECISION_POLICY_VERSION,
   CURRENT_EVIDENCE_ERA,
   EVIDENCE_POLICY_VERSION,
-  END_TO_END_CORRECTNESS_DEPLOYED_AT,
   EXECUTION_POLICY_VERSION,
   type TrackedSignal,
 } from "@dtc/shared";
+
+const deploymentAt = "2026-07-28T00:00:00.000Z";
+process.env.END_TO_END_CORRECTNESS_DEPLOYED_AT = deploymentAt;
 
 import { computePerformance } from "../src/lib/outcome-checker.js";
 import { PerformanceStatsProvider } from "../src/lib/performance-cache.js";
@@ -139,7 +141,7 @@ describe("computePerformance", () => {
       decisionPolicyVersion: CURRENT_DECISION_POLICY_VERSION,
       executionPolicyVersion: EXECUTION_POLICY_VERSION,
       evidencePolicyVersion: EVIDENCE_POLICY_VERSION,
-      policyDeploymentAt: END_TO_END_CORRECTNESS_DEPLOYED_AT,
+      policyDeploymentAt: deploymentAt,
     } as TrackedSignal["selectedExecutionPlan"];
     const current = computePerformance([makeSignal({ id: "current", selectedExecutionPlan: currentPlan })]);
     expect(current.evidenceEra).toBe(CURRENT_EVIDENCE_ERA);
@@ -162,7 +164,7 @@ describe("computePerformance", () => {
       evidenceEra: CURRENT_EVIDENCE_ERA,
       decisionPolicyVersion: CURRENT_DECISION_POLICY_VERSION,
       evidencePolicyVersion: EVIDENCE_POLICY_VERSION,
-      policyDeploymentAt: END_TO_END_CORRECTNESS_DEPLOYED_AT,
+      policyDeploymentAt: deploymentAt,
     } as TrackedSignal["selectedExecutionPlan"];
     const report = computePerformance([makeSignal({ selectedExecutionPlan: partial })]);
     expect(report.postFixSignalCount).toBe(0);

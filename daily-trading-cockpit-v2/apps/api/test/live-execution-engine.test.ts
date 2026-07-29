@@ -19,6 +19,7 @@ import {
   LiveExecutionStore,
   MANUAL_ENTRY_DECISION_MAX_AGE_MS,
   combinedWorstCaseNotionalUsd,
+  collectUserTradesSettlementCoverage,
   computeLiveOrderPlan,
   crowdingExitRecommendation,
   interleaveTestnetCollectionCandidates,
@@ -69,6 +70,44 @@ const FILTERS: FuturesSymbolFilters = {
   pricePrecision: 2,
   quantityPrecision: 3,
 };
+
+function settlementTrade(orderId: string, tradeId: string): FuturesUserTrade {
+  return { symbol: "ETHUSDT", orderId, tradeId, price: 2_000, qty: 1, realizedPnl: 0, commission: 0.1, commissionAsset: "USDT", time: Number(tradeId) };
+}
+
+describe("userTrades settlement coverage", () => {
+  it("continues after a saturated first page until required entry and exit fills are found", async () => {
+    const first = Array.from({ length: 1_000 }, (_, index) => settlementTrade(`noise-${index}`, String(index + 1)));
+    const second = [settlementTrade("entry-1", "1001"), settlementTrade("exit-1", "1002")];
+    const cursors: Array<string | undefined> = [];
+    const client = {
+      async getUserTrades(_symbol: string, opts: { fromId?: string } = {}): Promise<FuturesUserTrade[]> {
+        cursors.push(opts.fromId);
+        return opts.fromId ? second : first;
+      },
+    } as Pick<LivePrivateClient, "getUserTrades">;
+    const result = await collectUserTradesSettlementCoverage(client, "ETHUSDT", 0, ["entry-1", "exit-1"]);
+    expect(result.settlementFetchComplete).toBe(true);
+    expect(result.pageSaturated).toBe(true);
+    expect(result.missingRequiredOrderIds).toEqual([]);
+    expect(cursors).toEqual([undefined, "1001"]);
+  });
+
+  it("keeps a missing required entry diagnostic-only and deduplicates a fill repeated across pages", async () => {
+    const duplicate = settlementTrade("exit-1", "2000");
+    const first = [...Array.from({ length: 999 }, (_, index) => settlementTrade(`noise-${index}`, String(index + 1))), duplicate];
+    const second = [duplicate, settlementTrade("exit-1", "2001")];
+    const client = {
+      async getUserTrades(_symbol: string, opts: { fromId?: string } = {}): Promise<FuturesUserTrade[]> {
+        return opts.fromId ? second : first;
+      },
+    } as Pick<LivePrivateClient, "getUserTrades">;
+    const result = await collectUserTradesSettlementCoverage(client, "ETHUSDT", 0, ["entry-missing", "exit-1"]);
+    expect(result.settlementFetchComplete).toBe(false);
+    expect(result.missingRequiredOrderIds).toEqual(["entry-missing"]);
+    expect(result.trades.filter((trade) => trade.tradeId === "2000")).toHaveLength(1);
+  });
+});
 
 class FakeLiveClient {
   env = "testnet" as const;

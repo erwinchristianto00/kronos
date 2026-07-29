@@ -562,6 +562,11 @@ interface SettledFromTrades {
   netUsd: number;
   feesUsd: number;
   feeSource: "EXCHANGE" | null;
+  settlementFetchComplete: boolean;
+  requiredOrderIds: string[];
+  matchedRequiredOrderIds: string[];
+  missingRequiredOrderIds: string[];
+  pageSaturated: boolean;
 }
 
 export interface LiveIntent {
@@ -610,6 +615,14 @@ export interface LiveIntent {
    *  taken over one 1000-row getUserTrades page; an intent whose rows were pushed off that page by
    *  unrelated activity still labels EXCHANGE while under-counting. */
   feeSource?: "EXCHANGE" | "EXCHANGE_APPORTIONED";
+  /** Exact order-id coverage for the exchange settlement that produced fees/PnL. */
+  settlementFetchComplete?: boolean;
+  requiredOrderIds?: string[];
+  matchedRequiredOrderIds?: string[];
+  missingRequiredOrderIds?: string[];
+  pageSaturated?: boolean;
+  /** Immutable initial execution risk. Missing values remain diagnostic-only evidence. */
+  originalRiskUsd?: number;
   exitRule?: VariantExitRule;
   maxFavorableR?: number | null;
   /** MAE persistence (Tier 2 audit, purely additive): running MOST NEGATIVE (worst) favorableR the
@@ -1238,6 +1251,80 @@ export function pureGeometryLaneIds(env: NodeJS.ProcessEnv = process.env): Reado
  *  drift apart; if they do, ExecutionFillRecord.fetchComplete starts claiming a completeness it
  *  cannot know. RECORDING-ONLY: no settlement or gate decision reads the saturation flag. */
 const USER_TRADES_PAGE_LIMIT = 1000;
+const MAX_USER_TRADES_SETTLEMENT_PAGES = 20;
+
+export interface UserTradesSettlementCoverage {
+  trades: FuturesUserTrade[];
+  settlementFetchComplete: boolean;
+  requiredOrderIds: string[];
+  matchedRequiredOrderIds: string[];
+  missingRequiredOrderIds: string[];
+  pageSaturated: boolean;
+}
+
+function settlementFillKey(trade: FuturesUserTrade): string {
+  if (typeof trade.tradeId === "string" && trade.tradeId.length > 0) return `trade:${trade.tradeId}`;
+  return `order:${trade.orderId}:${trade.time}:${trade.price}:${trade.qty}:${trade.commission}:${trade.realizedPnl}`;
+}
+
+function nextTradeCursor(trades: readonly FuturesUserTrade[], current: string | undefined): string | null {
+  let largest: bigint | null = null;
+  for (const trade of trades) {
+    if (!/^\d+$/.test(trade.tradeId ?? "")) continue;
+    const id = BigInt(trade.tradeId!);
+    if (largest === null || id > largest) largest = id;
+  }
+  if (largest === null) return null;
+  const next = (largest + 1n).toString();
+  return current === next ? null : next;
+}
+
+/**
+ * Fetches only as far as needed to prove exact order-id coverage. A full page
+ * is not treated as complete by itself: the cursor must advance, a later page
+ * must end, or every required entry/exit order must be observed. This helper
+ * is evidence-only; callers still complete the exchange lifecycle if coverage
+ * is incomplete.
+ */
+export async function collectUserTradesSettlementCoverage(
+  client: Pick<LivePrivateClient, "getUserTrades">,
+  symbol: string,
+  startTime: number,
+  requiredOrderIds: readonly string[],
+  limit = USER_TRADES_PAGE_LIMIT,
+  maxPages = MAX_USER_TRADES_SETTLEMENT_PAGES,
+): Promise<UserTradesSettlementCoverage> {
+  const required = [...new Set(requiredOrderIds.filter((id) => typeof id === "string" && id.length > 0))].sort();
+  const seen = new Map<string, FuturesUserTrade>();
+  let fromId: string | undefined;
+  let pageSaturated = false;
+  let exhausted = false;
+  for (let pageNo = 0; pageNo < Math.max(1, maxPages); pageNo += 1) {
+    const page = await client.getUserTrades(symbol, { startTime, limit, fromId });
+    for (const trade of page) seen.set(settlementFillKey(trade), trade);
+    const visible = new Set([...seen.values()].map((trade) => trade.orderId));
+    const matched = required.filter((id) => visible.has(id));
+    if (matched.length === required.length && required.length > 0) {
+      return { trades: [...seen.values()], settlementFetchComplete: true, requiredOrderIds: required, matchedRequiredOrderIds: matched, missingRequiredOrderIds: [], pageSaturated };
+    }
+    if (page.length < limit) { exhausted = true; break; }
+    pageSaturated = true;
+    const next = nextTradeCursor(page, fromId);
+    if (!next || next === fromId) break;
+    fromId = next;
+  }
+  const visible = new Set([...seen.values()].map((trade) => trade.orderId));
+  const matched = required.filter((id) => visible.has(id));
+  const missing = required.filter((id) => !visible.has(id));
+  return {
+    trades: [...seen.values()],
+    settlementFetchComplete: required.length > 0 ? missing.length === 0 : exhausted && !pageSaturated,
+    requiredOrderIds: required,
+    matchedRequiredOrderIds: matched,
+    missingRequiredOrderIds: missing,
+    pageSaturated,
+  };
+}
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
 const WEEK_MS = 7 * DAY_MS;
@@ -4506,7 +4593,10 @@ export class LiveExecutionEngine {
           intent.symbol,
           intent.createdAt,
           this.intentSettlementOrderIds(intent, triggeredAlgoOrderIds),
-          { requiredOrderIds: requiredCloseOrderIds, fillRecord: this.fillRecordContextForIntent(intent) },
+          {
+            requiredOrderIds: [intent.entryOrderId, ...(intent.entryOrderIds ?? []), ...requiredCloseOrderIds],
+            fillRecord: this.fillRecordContextForIntent(intent),
+          },
         );
         if (settled === null) {
           intent.lastError = "settle: closing trade not visible after retries — P&L left UNKNOWN; wallet reconciliation will catch the true amount";
@@ -4514,6 +4604,7 @@ export class LiveExecutionEngine {
           net = settled.netUsd;
           fees = settled.feesUsd;
           feeSource = settled.feeSource ?? undefined;
+          this.applySettlementMetadata(intent, settled);
         }
       }
     } catch (error) {
@@ -4622,29 +4713,31 @@ export class LiveExecutionEngine {
     // No order ids to look up: the exchange is never queried, so this zero is a STRUCTURAL zero and
     // feeSource stays null. Labelling it "EXCHANGE" would fabricate a measurement out of a
     // short-circuit — precisely the ambiguity this field was added to remove.
-    if (ids.size === 0) return { netUsd: 0, feesUsd: 0, feeSource: null };
+    if (ids.size === 0) {
+      return {
+        netUsd: 0, feesUsd: 0, feeSource: null,
+        settlementFetchComplete: false, requiredOrderIds: [], matchedRequiredOrderIds: [], missingRequiredOrderIds: [], pageSaturated: false,
+      };
+    }
     const required = new Set(
       (opts.requiredOrderIds ?? []).filter((id): id is string => typeof id === "string"),
     );
     const retries = Math.max(0, Math.floor(opts.retries ?? (required.size > 0 ? 6 : 0)));
     const retryDelayMs = Math.max(0, opts.retryDelayMs ?? this.fillConfirmRetryDelayMs);
+    let lastIncomplete: SettledFromTrades | null = null;
     for (let attempt = 0; attempt <= retries; attempt += 1) {
       try {
-        const trades = await this.client.getUserTrades(symbol, { startTime: new Date(sinceIso).getTime(), limit: USER_TRADES_PAGE_LIMIT });
-        // RECORDING-ONLY. A FULL page means Binance may have cut rows off its edge — see
-        // USER_TRADES_PAGE_LIMIT. Consumed ONLY by the fill recorder's fetchComplete below; the
-        // net/fee arithmetic and every settlement decision are untouched by it.
-        const pageSaturated = Array.isArray(trades) && trades.length >= USER_TRADES_PAGE_LIMIT;
-        const visibleIds = new Set(trades.map((trade) => trade.orderId));
+        const coverage = await collectUserTradesSettlementCoverage(
+          this.client,
+          symbol,
+          new Date(sinceIso).getTime(),
+          [...required],
+        );
+        const trades = coverage.trades;
         const matchedTrades = trades.filter((trade) => ids.has(trade.orderId));
-        // One of several candidate exit orders may be the actual fill (TP vs stop vs BE stop).
-        // A matched non-zero realized row is also definitive close evidence for legacy records
-        // whose exact close order id was not persisted; entry rows have realizedPnl=0.
-        const closeVisible = required.size === 0 ||
-          [...required].some((id) => visibleIds.has(id)) ||
-          matchedTrades.some((trade) => Math.abs(trade.realizedPnl) > 1e-12);
-        if (!closeVisible) {
-          if (attempt === retries) return null;
+        if (!coverage.settlementFetchComplete && attempt < retries) {
+          // A just-filled order can lag /userTrades. Retry the bounded collector, but retain the
+          // final partial result so the lifecycle can close diagnostic-only instead of hanging.
         } else {
           let net = 0;
           let fees = 0;
@@ -4676,18 +4769,29 @@ export class LiveExecutionEngine {
           // redundant local catch makes that structurally impossible even if a future edit removes
           // the inner one.
           try {
-            this.recordIntentFills(opts.fillRecord, symbol, matchedTrades, !pageSaturated);
+            this.recordIntentFills(opts.fillRecord, symbol, matchedTrades, coverage.settlementFetchComplete);
           } catch {
             // report-only bookkeeping — never allowed to reach the enclosing settlement catch
           }
-          return { netUsd: net, feesUsd: fees, feeSource: feeRows > 0 ? "EXCHANGE" : null };
+          const settled = {
+            netUsd: net,
+            feesUsd: fees,
+            feeSource: feeRows > 0 ? "EXCHANGE" as const : null,
+            settlementFetchComplete: coverage.settlementFetchComplete,
+            requiredOrderIds: coverage.requiredOrderIds,
+            matchedRequiredOrderIds: coverage.matchedRequiredOrderIds,
+            missingRequiredOrderIds: coverage.missingRequiredOrderIds,
+            pageSaturated: coverage.pageSaturated,
+          };
+          if (coverage.settlementFetchComplete) return settled;
+          lastIncomplete = settled;
         }
       } catch {
         if (attempt === retries) return null;
       }
       if (retryDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
     }
-    return null;
+    return lastIncomplete;
   }
 
   private intentSettlementOrderIds(intent: LiveIntent, extra: Array<string | null> = []): Array<string | null> {
@@ -4697,6 +4801,22 @@ export class LiveExecutionEngine {
       intent.tp1OrderId,
       ...extra,
     ];
+  }
+
+  private applySettlementMetadata(intent: LiveIntent, settled: SettledFromTrades | null): void {
+    if (!settled) {
+      intent.settlementFetchComplete = false;
+      intent.requiredOrderIds = [];
+      intent.matchedRequiredOrderIds = [];
+      intent.missingRequiredOrderIds = [];
+      intent.pageSaturated = false;
+      return;
+    }
+    intent.settlementFetchComplete = settled.settlementFetchComplete;
+    intent.requiredOrderIds = settled.requiredOrderIds.slice();
+    intent.matchedRequiredOrderIds = settled.matchedRequiredOrderIds.slice();
+    intent.missingRequiredOrderIds = settled.missingRequiredOrderIds.slice();
+    intent.pageSaturated = settled.pageSaturated;
   }
 
   /** Per-fill recorder context for one intent (2026-07-27, report-only). Pure field reads — no I/O,
@@ -4757,7 +4877,7 @@ export class LiveExecutionEngine {
     }
   }
 
-  private settleIntentAfterClose(
+  private async settleIntentAfterClose(
     intent: LiveIntent,
     closeOrderIds: Array<string | null>,
     /** RECORDING-ONLY. Set false on the rescue-FLIP path when ONE settlement resolves N>1 opposing
@@ -4770,15 +4890,17 @@ export class LiveExecutionEngine {
      *  Purely a recording switch: `realizedFromTrades`' return value does not depend on it. */
     recordFills = true,
   ): Promise<SettledFromTrades | null> {
-    return this.realizedFromTrades(
+    const settled = await this.realizedFromTrades(
       intent.symbol,
       intent.createdAt,
       this.intentSettlementOrderIds(intent, closeOrderIds),
       {
-        requiredOrderIds: closeOrderIds,
+        requiredOrderIds: [intent.entryOrderId, ...(intent.entryOrderIds ?? []), ...closeOrderIds],
         fillRecord: recordFills ? this.fillRecordContextForIntent(intent) : undefined,
       },
     );
+    this.applySettlementMetadata(intent, settled);
+    return settled;
   }
 
   private rollDailyLedger(): void {
@@ -6217,6 +6339,7 @@ export class LiveExecutionEngine {
       // Tagged so a losing close of an operator-selected position can auto-reset the selection.
       operatorLaneSelection: this.operatorSelectionActiveFor(paper) || undefined,
       effectiveRiskUsd: plan.effectiveRiskUsd,
+      originalRiskUsd: plan.effectiveRiskUsd,
       riskClippedByNotionalCap: plan.riskClippedByNotionalCap,
       plannedRiskUsd: plan.plannedRiskUsd,
       requiredNotionalUsd: plan.requiredNotionalUsd,

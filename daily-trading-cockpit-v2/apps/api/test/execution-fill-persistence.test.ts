@@ -472,7 +472,7 @@ describe("live execution engine → per-fill recorder", () => {
     expect(exit.maker).toBe(false);
   });
 
-  it("[2026-07-27 SATURATION] a FULL userTrades page records fetchComplete=false — the entry row can be off the page edge", async () => {
+  it("[SETTLEMENT COVERAGE] a saturated response is complete when every required entry/exit order is present", async () => {
     const recorder = new ExecutionFillRecorder(tmp());
     const { engine, client, store } = makeEngine(recorder);
     // Pad the page to Binance's limit with unrelated rows. This is the real hazard: a long-lived
@@ -490,8 +490,8 @@ describe("live execution engine → per-fill recorder", () => {
 
     const rec = recorder.getRecord(`intent:${intent.paperOrderId}:${intent.createdAt}`);
     expect(rec).not.toBeNull();
-    // Was hardcoded `fetchComplete: true` before this fix.
-    expect(rec!.fetchComplete).toBe(false);
+    // Saturation alone is not incompleteness: exact required order-id coverage proves this record.
+    expect(rec!.fetchComplete).toBe(true);
     // Settlement itself is untouched — the same two own rows, the same P&L.
     expect(rec!.fills.length).toBe(2);
     expect(store.getState().intents[0]!.state).toBe("CLOSED");

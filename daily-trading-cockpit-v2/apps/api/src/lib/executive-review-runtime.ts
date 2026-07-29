@@ -54,7 +54,7 @@ function positionLink(
     laneId: link.laneId,
     marketContextSnapshotId: link.marketContextSnapshotId,
     entryAtMs: Number.isFinite(entryAtMs) ? entryAtMs : null,
-    originalRisk: intent.effectiveRiskUsd ?? null,
+    originalRisk: intent.originalRiskUsd ?? null,
     ambiguousOwnership,
     decisionPipelinePolicyVersion: link.decisionPipelinePolicyVersion,
     executionPolicyVersion: link.executionPolicyVersion,
@@ -77,7 +77,9 @@ function outcomeLink(
   const closedCandleAtMs = Number.isFinite(closedAtMs)
     ? (Math.floor(closedAtMs / COMPLETED_CANDLE_MS) + 1) * COMPLETED_CANDLE_MS
     : Number.POSITIVE_INFINITY;
-  const costKnown = intent.feeSource === "EXCHANGE";
+  const settlementComplete = intent.settlementFetchComplete === true &&
+    Array.isArray(intent.missingRequiredOrderIds) && intent.missingRequiredOrderIds.length === 0;
+  const costKnown = intent.feeSource === "EXCHANGE" && settlementComplete;
   const canCalculateR =
     typeof risk === "number" && Number.isFinite(risk) && risk > 0 &&
     typeof netUsd === "number" && Number.isFinite(netUsd) &&
@@ -104,6 +106,10 @@ function outcomeLink(
     fourBrainPolicyVersion: link.fourBrainPolicyVersion,
     completedCandle: Number.isFinite(nowMs) && nowMs >= closedCandleAtMs,
     ambiguousOwnership,
+    settlementFetchComplete: intent.settlementFetchComplete === true,
+    requiredOrderIds: intent.requiredOrderIds?.slice() ?? [],
+    matchedRequiredOrderIds: intent.matchedRequiredOrderIds?.slice() ?? [],
+    missingRequiredOrderIds: intent.missingRequiredOrderIds?.slice() ?? [],
   };
 }
 

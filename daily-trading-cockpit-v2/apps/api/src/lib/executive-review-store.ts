@@ -15,7 +15,7 @@ export type ExecutiveReviewReasonCode =
   | "POSITION_ID_MISMATCH" | "OPPORTUNITY_ID_MISMATCH" | "CANDIDATE_ID_MISMATCH" | "MARKET_SNAPSHOT_MISMATCH" | "AMBIGUOUS_OWNERSHIP"
   | "NO_REAL_POSITION" | "POSITION_NOT_RESOLVED" | "COUNTERFACTUAL_ONLY" | "POLICY_LINEAGE_INCOMPLETE" | "POLICY_VERSION_MISMATCH"
   | "ORIGINAL_RISK_MISSING" | "ORIGINAL_RISK_INVALID" | "GROSS_R_INVALID" | "EXECUTION_COST_MISSING" | "EXECUTION_COST_NONFINITE"
-  | "EXECUTION_COST_INVALID" | "EXECUTION_COST_PROVENANCE_MISSING" | "NET_R_INVALID" | "OUTCOME_TIME_INVALID" | "OUTCOME_ALREADY_LINKED" | "EXECUTIVE_REVIEW_ALREADY_RESOLVED";
+  | "EXECUTION_COST_INVALID" | "EXECUTION_COST_PROVENANCE_MISSING" | "SETTLEMENT_INCOMPLETE" | "NET_R_INVALID" | "OUTCOME_TIME_INVALID" | "OUTCOME_ALREADY_LINKED" | "EXECUTIVE_REVIEW_ALREADY_RESOLVED";
 
 export type ExecutiveReviewDirection = "LONG" | "SHORT" | "NEUTRAL";
 export type ExecutiveCostProvenance = "EXCHANGE_MEASURED" | "EXECUTION_MODEL_ESTIMATE";
@@ -95,6 +95,10 @@ export interface ExecutiveReviewOutcomeLink {
   executionCostKnown: boolean;
   /** A known zero is valid only when its measurement/model source is explicit. */
   executionCostProvenance: ExecutiveCostProvenance | null;
+  settlementFetchComplete: boolean;
+  requiredOrderIds: string[];
+  matchedRequiredOrderIds: string[];
+  missingRequiredOrderIds: string[];
   netR: number | null;
   decisionPipelinePolicyVersion: string | null;
   executionPolicyVersion: string | null;
@@ -130,6 +134,10 @@ export interface ExecutiveReviewOutcome {
   grossR: number;
   costR: number;
   executionCostProvenance: ExecutiveCostProvenance;
+  settlementFetchComplete: true;
+  requiredOrderIds: string[];
+  matchedRequiredOrderIds: string[];
+  missingRequiredOrderIds: [];
   netR: number;
   decisionPipelinePolicyVersion: string;
   executionPolicyVersion: string;
@@ -169,6 +177,7 @@ export function eligibleTier1ExecutiveReview(row: ExecutiveReviewOutcome): boole
     && [row.executiveReviewOutcomeId, row.executiveReviewId, row.candidateId, row.opportunityId, row.executionIntentId, row.positionId, row.outcomeId, row.laneId, row.marketContextSnapshotId, row.decisionPipelinePolicyVersion, row.executionPolicyVersion, row.evidencePolicyVersion, row.fourBrainPolicyVersion].every((v) => typeof v === "string" && v.length > 0)
     && [row.entryAtMs, row.resolvedAtMs, row.originalRisk, row.grossR, row.costR, row.netR].every((v) => typeof v === "number" && Number.isFinite(v))
     && row.originalRisk > 0 && row.costR >= 0 && row.resolvedAtMs >= row.entryAtMs
+    && row.settlementFetchComplete === true && Array.isArray(row.missingRequiredOrderIds) && row.missingRequiredOrderIds.length === 0
     && (row.executionCostProvenance === "EXCHANGE_MEASURED" || row.executionCostProvenance === "EXECUTION_MODEL_ESTIMATE")
     && Math.abs((row.grossR - row.costR) - row.netR) <= 1e-9;
 }
@@ -315,6 +324,10 @@ export class ExecutiveReviewStore {
       grossR: outcome.grossR!,
       costR: outcome.costR!,
       executionCostProvenance: outcome.executionCostProvenance!,
+      settlementFetchComplete: true,
+      requiredOrderIds: outcome.requiredOrderIds.slice(),
+      matchedRequiredOrderIds: outcome.matchedRequiredOrderIds.slice(),
+      missingRequiredOrderIds: [],
       netR: outcome.netR!,
       decisionPipelinePolicyVersion: review.decisionPipelinePolicyVersion,
       executionPolicyVersion: review.executionPolicyVersion,
@@ -416,6 +429,7 @@ function outcomeReason(review: ExecutiveReviewRecord, position: ExecutiveReviewP
   if (outcome.resolvedAtMs == null || !Number.isFinite(outcome.resolvedAtMs)) return "POSITION_NOT_RESOLVED";
   if (outcome.resolvedAtMs < (position.entryAtMs ?? Infinity)) return "OUTCOME_TIME_INVALID";
   if (outcome.grossR == null || !Number.isFinite(outcome.grossR)) return "GROSS_R_INVALID";
+  if (!outcome.settlementFetchComplete || outcome.missingRequiredOrderIds.length > 0) return "SETTLEMENT_INCOMPLETE";
   if (!outcome.executionCostKnown) return "EXECUTION_COST_MISSING";
   if (outcome.costR == null) return "EXECUTION_COST_MISSING";
   if (outcome.executionCostProvenance !== "EXCHANGE_MEASURED" && outcome.executionCostProvenance !== "EXECUTION_MODEL_ESTIMATE") return "EXECUTION_COST_PROVENANCE_MISSING";

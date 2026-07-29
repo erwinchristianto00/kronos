@@ -826,10 +826,11 @@ export class BinanceFuturesPrivateClient {
     await this.requestSigned("DELETE", "/fapi/v1/algoOpenOrders", { symbol });
   }
 
-  async getUserTrades(symbol: string, opts: { startTime?: number; limit?: number } = {}): Promise<FuturesUserTrade[]> {
+  async getUserTrades(symbol: string, opts: { startTime?: number; limit?: number; fromId?: string } = {}): Promise<FuturesUserTrade[]> {
     const parsed = await this.requestSigned("GET", "/fapi/v1/userTrades", {
       symbol,
       startTime: opts.startTime,
+      fromId: opts.fromId,
       limit: opts.limit ?? 100,
     });
     if (!Array.isArray(parsed)) return [];

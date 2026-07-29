@@ -81,6 +81,7 @@ export function buildCortexExperienceBridge(events: readonly ForwardEvent[]): Co
       provenance: "OBSERVED",
       decisionTimeMs: decision.asOfMs,
       openedTimeMs: outcome.openedAtMs,
+      policyDeploymentAt: decision.identity.policyDeploymentAt,
       marketCloseTimeMs: outcome.closedAtMs,
       resolvedTimeMs: outcome.resolvedAtMs,
       laneId: outcome.identity.laneId,
