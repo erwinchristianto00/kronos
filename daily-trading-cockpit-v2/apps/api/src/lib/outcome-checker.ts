@@ -16,6 +16,11 @@ import type {
   TrackedSignal,
   VariantCombinationStats,
 } from "@dtc/shared";
+import {
+  CURRENT_DECISION_POLICY_VERSION,
+  CURRENT_EVIDENCE_ERA,
+  EVIDENCE_POLICY_VERSION,
+} from "@dtc/shared";
 
 import type { BinanceClient } from "./binance.js";
 import { collapseTrackedSignals } from "./tracker.js";
@@ -984,12 +989,12 @@ function replayTradeOutcome(
     fillPrice = deriveEntryPrice(signal) ?? entryAnchor;
     fillAt = signal.scannedAt;
   } else {
-    const zone: [number, number] = entryVariant === "no_chase_atr_entry" && signal.entryZone
-      ? signal.entryZone
-      : [entryAnchor, entryAnchor];
-    fillIndex = candles.findIndex((candle) => zone[0] === zone[1] ? candleTouchesLevel(candle, entryAnchor) : candleTouchesZone(candle, zone));
+    // Every pending variant has one explicit limit/order price.  A touch of a
+    // broad candidate zone is not a fill at an invented midpoint (nor price
+    // improvement): the exact selected anchor must trade inside the candle.
+    fillIndex = candles.findIndex((candle) => candleTouchesLevel(candle, entryAnchor));
     if (fillIndex !== -1) {
-      fillPrice = zone[0] === zone[1] ? entryAnchor : midpoint(zone) ?? entryAnchor;
+      fillPrice = entryAnchor;
       fillAt = new Date(candles[fillIndex]!.openTime).toISOString();
     }
   }
@@ -1019,6 +1024,40 @@ function replayTradeOutcome(
   }
 
   const stopLoss = signal.stopLoss;
+  const riskDistance = stopLoss === null ? null : Math.abs(fillPrice - stopLoss);
+  // Intrabar ordering is unknown.  For a newly-filled pending order, a candle
+  // that also reaches the stop is conservative-stop, and TP evaluation starts
+  // only on the next candle.  Existing positions retain the established
+  // stop-first policy in the loop below.
+  if (entryVariant !== "base_current_entry" && fillIndex >= 0 && stopLoss !== null && riskDistance !== null && riskDistance > 0) {
+    const fillCandle = candles[fillIndex]!;
+    const stopTouchedOnFill = signal.direction === "LONG" ? fillCandle.low <= stopLoss : fillCandle.high >= stopLoss;
+    if (stopTouchedOnFill) {
+      const gross = signal.direction === "LONG" ? (stopLoss - fillPrice) / riskDistance : (fillPrice - stopLoss) / riskDistance;
+      const net = computeNetRWithSpread(signal, fillPrice, stopLoss, gross);
+      return {
+        attempted: true,
+        filled: true,
+        noFill: false,
+        resolved: true,
+        ambiguousSameCandle: true,
+        result: "SL",
+        entryFilledAt: fillAt,
+        entryFillPrice: fillPrice,
+        exitPrice: stopLoss,
+        grossRResult: roundMetric(gross),
+        netRResult: net,
+        profitableAfterCosts: false,
+        tp1Hit: false,
+        tp2Hit: false,
+        tp3Hit: false,
+        slHit: true,
+        maxFavorableExcursionPct: 0,
+        maxAdverseExcursionPct: roundMetric(Math.abs(((stopLoss - fillPrice) / fillPrice) * 100)),
+        outcomeQuality: "VALID_RISK",
+      };
+    }
+  }
   let currentStop = stopLoss;
   let state: "PRE_TP1" | "RUNNER" | "CLOSED" = "PRE_TP1";
   let remaining = 1;
@@ -1034,7 +1073,6 @@ function replayTradeOutcome(
   let maxFavorableExcursionPct = 0;
   let maxAdverseExcursionPct = 0;
 
-  const riskDistance = stopLoss === null ? null : Math.abs(fillPrice - stopLoss);
   const atr = finiteOrNull(signal.analysisContext?.fiveMinuteAtr14 ?? null) ?? 0;
   const ema20 = finiteOrNull(signal.analysisContext?.fiveMinuteEma20 ?? null);
   const vwap = finiteOrNull(signal.analysisContext?.fiveMinuteVwap ?? null);
@@ -1753,6 +1791,13 @@ function computePerformanceInternal(
       ? Math.min(...activeOpenSignals.map((signal) => new Date(signal.firstSeenAt).getTime()))
       : null;
 
+  const isPostFix = (signal: TrackedSignal): boolean =>
+    signal.selectedExecutionPlan?.evidenceEra === CURRENT_EVIDENCE_ERA &&
+    signal.selectedExecutionPlan?.decisionPolicyVersion === CURRENT_DECISION_POLICY_VERSION &&
+    signal.selectedExecutionPlan?.evidencePolicyVersion === EVIDENCE_POLICY_VERSION;
+  const postFixSignalCount = uniqueSignals.filter(isPostFix).length;
+  const legacySignalCount = uniqueSignals.length - postFixSignalCount;
+  const homogeneousPostFix = uniqueSignals.length > 0 && legacySignalCount === 0;
   const performance: PerformanceStats = {
     primaryWindow: PRIMARY_WINDOW,
     secondaryWindow: SECONDARY_WINDOW,
@@ -1798,6 +1843,10 @@ function computePerformanceInternal(
       "4h": secondary,
     },
     generatedAt: new Date().toISOString(),
+    postFixSignalCount,
+    legacySignalCount,
+    evidencePolicyVersion: homogeneousPostFix ? EVIDENCE_POLICY_VERSION : null,
+    evidenceEra: homogeneousPostFix ? CURRENT_EVIDENCE_ERA : null,
   };
   addPerformanceTiming(timing, "diagnosticsBuildMs", diagnosticsStartMs);
   return performance;

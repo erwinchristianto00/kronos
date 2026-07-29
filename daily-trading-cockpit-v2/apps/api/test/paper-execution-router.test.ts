@@ -26,11 +26,13 @@ import {
   HEADLINE_MAX_PER_DIRECTION,
   isOpenHeadlineOrder,
   headlineConcentrationRejectReason,
+  paperActualEntryGeometry,
   type PaperOrder,
   type PaperKlineTuple,
   type PaperResolverClient,
   type PaperEligibleLane,
 } from "../src/lib/paper-execution-router.js";
+import { EXECUTION_POLICY_VERSION } from "@dtc/shared";
 import {
   buildAdaptiveLaneRouterReport,
 } from "../src/lib/adaptive-lane-router.js";
@@ -337,8 +339,8 @@ describe("paper-execution-router", () => {
     expect(rejected).toBeDefined();
   });
 
-  // [9] paper order openedAt comes from source obs
-  it("[9] paper order openedAt comes from source observation, not request time", () => {
+  // [9] post-fix orders keep source observation as provenance but begin at decision time.
+  it("[9] paper order separates source observation from decision/fill time", () => {
     const dir = tmpDir();
     const store = new PaperExecutionRouterStore(dir);
     const vmStore = new CurrentGuardVariantMatrixStore(dir);
@@ -347,18 +349,21 @@ describe("paper-execution-router", () => {
     vmStore.add(makeVmObs({ observationId: "fresh-obs-1", openedAt: freshOpenedAt }));
     store.ensurePaperStartAt(new Date(Date.now() - 5 * 60 * 1000).toISOString());
 
+    const admissionNow = new Date().toISOString();
     admitPaperOrders({
       store,
       vmStore,
       eligibleLane: ELIGIBLE_LANE,
       routerReport: routerOf("Bearish pressure"),
       gateReport: emptyGate(),
-      now: new Date().toISOString(),
+      now: admissionNow,
     });
 
     const order = store.all.find((o) => o.paperStatus === "CREATED");
     expect(order).toBeDefined();
-    expect(order!.openedAt).toBe(freshOpenedAt);
+    expect(order!.openedAt).toBe(admissionNow);
+    expect(order!.sourceObservedAt).toBe(freshOpenedAt);
+    expect(order!.entryFilledAt).toBe(admissionNow);
     expect(order!.paperOrderMode).toBe("HEADLINE");
   });
 
@@ -379,7 +384,7 @@ describe("paper-execution-router", () => {
       controllerMode: "LONG_ONLY",
       entryPrice: 100,
       stopLoss: 95,
-      takeProfitLevels: [104],
+      takeProfitLevels: [108],
       variantExitRule: "scaleout_tp1_trail" as const,
       fillMode: "taker" as const,
       plannedStopDistanceBps: 500,
@@ -412,7 +417,8 @@ describe("paper-execution-router", () => {
     expect(order).toMatchObject({
       symbol: "BTCUSDT",
       direction: "LONG",
-      openedAt,
+      openedAt: now.toISOString(),
+      sourceObservedAt: openedAt,
       paperStatus: "CREATED",
       paperOrderMode: "HEADLINE",
       variantExitRule: "scaleout_tp1_trail",
@@ -442,7 +448,7 @@ describe("paper-execution-router", () => {
       controllerMode: "LONG_ONLY",
       entryPrice: 100,
       stopLoss: 95,
-      takeProfitLevels: [104],
+      takeProfitLevels: [108],
       variantExitRule: "scaleout_tp1_trail" as const,
       fillMode: "taker" as const,
       plannedStopDistanceBps: 500,
@@ -2638,6 +2644,82 @@ describe("headline concentration caps (anti-correlation safety)", () => {
 
 // Eliminate "unused import" lint complaints
 void buildPaperExecutionRouterBriefLines;
+
+describe("[POST-FIX-EXECUTION] causal paper entry semantics", () => {
+  function postFixLimitOrder(overrides: Partial<PaperOrder> = {}): PaperOrder {
+    const now = new Date().toISOString();
+    return makePaperOrder({
+      paperOrderId: `post-fix-${Math.random()}`,
+      createdAt: now,
+      updatedAt: now,
+      openedAt: now,
+      sourceObservedAt: now,
+      firstSeenAt: new Date(Date.now() - 10 * 60_000).toISOString(),
+      entryFilledAt: null,
+      entryOrderType: "LIMIT",
+      entryOrderPrice: 100,
+      executionPolicyVersion: EXECUTION_POLICY_VERSION,
+      direction: "LONG",
+      entryPrice: 100,
+      stopLoss: 97,
+      takeProfitLevels: [104.5],
+      paperStatus: "PAPER_SUBMITTED",
+      ...overrides,
+    });
+  }
+
+  const resolverWith = (candles: PaperKlineTuple[]): PaperResolverClient => ({
+    getKlines: async () => candles,
+  });
+
+  it("does not fill a pending limit merely because a broad zone would have touched", async () => {
+    const dir = tmpDir();
+    const store = new PaperExecutionRouterStore(dir);
+    const order = postFixLimitOrder({ entryOrderPrice: 100 });
+    store.add(order);
+    await resolvePaperOrders(store, resolverWith([
+      [Date.now() + 1, "0", "101", "100.1", "100.5", "0", Date.now() + 2] as PaperKlineTuple,
+    ]));
+    const saved = store.all.find((o) => o.paperOrderId === order.paperOrderId)!;
+    expect(saved.paperStatus).toBe("PAPER_SUBMITTED");
+    expect(saved.entryFilledAt).toBeNull();
+  });
+
+  it("records a conservative loss when a pending fill and stop share an ambiguous candle", async () => {
+    const dir = tmpDir();
+    const store = new PaperExecutionRouterStore(dir);
+    const order = postFixLimitOrder();
+    store.add(order);
+    await resolvePaperOrders(store, resolverWith([
+      [Date.now() + 1, "0", "101", "96.5", "99", "0", Date.now() + 2] as PaperKlineTuple,
+    ]));
+    const saved = store.all.find((o) => o.paperOrderId === order.paperOrderId)!;
+    expect(saved.paperStatus).toBe("PAPER_CLOSED_LOSS");
+    expect(saved.closeReason).toBe("PENDING_FILL_STOP_AMBIGUOUS");
+    expect(saved.closeIntrabarAmbiguous).toBe(true);
+  });
+
+  it("defers TP evaluation when a pending fill candle only reaches target", async () => {
+    const dir = tmpDir();
+    const store = new PaperExecutionRouterStore(dir);
+    const order = postFixLimitOrder();
+    store.add(order);
+    await resolvePaperOrders(store, resolverWith([
+      [Date.now() + 1, "0", "105", "99", "104", "0", Date.now() + 2] as PaperKlineTuple,
+    ]));
+    const saved = store.all.find((o) => o.paperOrderId === order.paperOrderId)!;
+    expect(saved.paperStatus).toBe("PAPER_SUBMITTED");
+    expect(saved.entryFilledAt).not.toBeNull();
+    expect(saved.closeReason).toBeNull();
+  });
+
+  it("uses actual selected-entry geometry and the shared execution RR floor", () => {
+    expect(paperActualEntryGeometry("LONG", 100, 99, [100.5]).ok).toBe(false);
+    const valid = paperActualEntryGeometry("SHORT", 100, 103, [95]);
+    expect(valid.ok).toBe(true);
+    expect(valid.riskReward).toBeCloseTo(5 / 3, 8);
+  });
+});
 
 describe("[CONTROLLER-CONF-PERSIST] PaperOrder.controllerConfidence is actually populated (2026-07-26)", () => {
   // REGRESSION GUARD for a silent dead-feature bug: PaperOrder.controllerConfidence was DECLARED on

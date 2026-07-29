@@ -9,7 +9,7 @@ import type {
 
 import { buildCohortPerformanceReport } from "../src/lib/cohort-performance.js";
 
-type EraFlavor = "LEGACY" | "POST_ROUTING" | "POST_CALIBRATION";
+type EraFlavor = "LEGACY" | "POST_ROUTING" | "POST_CALIBRATION" | "POST_FIX";
 
 function makeSelection(flavor: EraFlavor): VariantSelectionSnapshot | null {
   if (flavor === "LEGACY") return null;
@@ -39,8 +39,7 @@ function makeSelection(flavor: EraFlavor): VariantSelectionSnapshot | null {
     chaseRisk: "LOW",
   };
   if (flavor === "POST_ROUTING") return base;
-  // POST_CALIBRATION
-  return {
+  const calibrated = {
     ...base,
     calibratedExpectedNetR: 0.2,
     calibrationVerdict: "CALIBRATED_POSITIVE",
@@ -49,9 +48,10 @@ function makeSelection(flavor: EraFlavor): VariantSelectionSnapshot | null {
     calibrationSourceUsed: "combo",
     calibrationPenaltyR: -0.2,
     calibrationDiagnosisCodes: [],
-    evidenceEra: "POST_CALIBRATION",
+    evidenceEra: flavor === "POST_FIX" ? "POST_END_TO_END_CORRECTNESS_FIX_V1" : "POST_CALIBRATION",
     decisionPolicyVersion: "calibrated-expectancy-v1",
   };
+  return calibrated;
 }
 
 function makePosition(
@@ -116,14 +116,14 @@ describe("buildCohortPerformanceReport", () => {
     expect(r.byEra.POST_CALIBRATION?.closedCount).toBe(2);
   });
 
-  it("currentEra POST_CALIBRATION metrics exclude legacy records", () => {
+  it("current post-fix-era metrics exclude legacy records", () => {
     const positions = [
       makePosition("L1", "LEGACY", -1.5),
-      makePosition("C1", "POST_CALIBRATION", 0.5),
-      makePosition("C2", "POST_CALIBRATION", 0.4),
+      makePosition("C1", "POST_FIX", 0.5),
+      makePosition("C2", "POST_FIX", 0.4),
     ];
     const r = buildCohortPerformanceReport({ positions });
-    const current = r.byEra.POST_CALIBRATION!;
+    const current = r.byEra.POST_END_TO_END_CORRECTNESS_FIX_V1!;
     expect(current.avgRealizedNetR).toBeCloseTo(0.45, 4);
   });
 
@@ -131,8 +131,8 @@ describe("buildCohortPerformanceReport", () => {
     const positions = [
       makePosition("L1", "LEGACY", -1.0),
       makePosition("L2", "LEGACY", -1.0),
-      makePosition("C1", "POST_CALIBRATION", 0.5),
-      makePosition("C2", "POST_CALIBRATION", 0.5),
+      makePosition("C1", "POST_FIX", 0.5),
+      makePosition("C2", "POST_FIX", 0.5),
     ];
     const r = buildCohortPerformanceReport({ positions });
     expect(r.currentEraVsLegacyDelta).not.toBeNull();
@@ -141,15 +141,15 @@ describe("buildCohortPerformanceReport", () => {
 
   it("delta is null when one of the eras is missing", () => {
     const positions = [
-      makePosition("C1", "POST_CALIBRATION", 0.4),
-      makePosition("C2", "POST_CALIBRATION", 0.4),
+      makePosition("C1", "POST_FIX", 0.4),
+      makePosition("C2", "POST_FIX", 0.4),
     ];
     const r = buildCohortPerformanceReport({ positions });
     expect(r.currentEraVsLegacyDelta).toBeNull();
   });
 
-  it("currentEra is POST_CALIBRATION and exposed in the report", () => {
+  it("currentEra is the explicit post-fix boundary and exposed in the report", () => {
     const r = buildCohortPerformanceReport({ positions: [] });
-    expect(r.currentEra).toBe("POST_CALIBRATION");
+    expect(r.currentEra).toBe("POST_END_TO_END_CORRECTNESS_FIX_V1");
   });
 });

@@ -101,7 +101,10 @@ function emaScore(indicator: TimeframeIndicatorSnapshot): number {
   score += price >= indicator.ema20 ? 0.35 : -0.35;
   score += indicator.ema20 >= indicator.ema50 ? 0.35 : -0.35;
   score += price >= indicator.vwap ? 0.2 : -0.2;
-  if (indicator.timeframe === "1h") score += price >= indicator.ema200 ? 0.25 : -0.25;
+  if (indicator.timeframe === "1h") {
+    if (indicator.ema200 === null) return -1;
+    score += price >= indicator.ema200 ? 0.25 : -0.25;
+  }
   return clamp(score, -1, 1);
 }
 
@@ -157,7 +160,7 @@ export function buildSingleSymbolPriceTimelineState(
   candles: { m5: Candle[]; h1: Candle[] },
   nowMs = Date.now(),
 ): SingleSymbolPriceTimelineSymbolState {
-  if (candles.m5.length < 60 || candles.h1.length < 200) {
+  if (candles.m5.length < 60 || candles.h1.length < 250) {
     return buildUnavailable(symbol, "insufficient 5m/1h candle history");
   }
   let m5: TimeframeIndicatorSnapshot;
@@ -169,6 +172,7 @@ export function buildSingleSymbolPriceTimelineState(
     return buildUnavailable(symbol, error instanceof Error ? error.message : "indicator calculation failed");
   }
   if (!m5.isFresh || !h1.isFresh) return buildUnavailable(symbol, "5m or 1h candle feed is stale");
+  if (!h1.ema200Available) return buildUnavailable(symbol, "insufficient completed 1h candles for EMA200");
 
   const m5Closes = candles.m5.map((c) => c.close);
   const h1Closes = candles.h1.map((c) => c.close);
@@ -261,7 +265,9 @@ export class SingleSymbolPriceTimelineService {
     this.inFlight = Promise.all(
       SINGLE_SYMBOL_TIMELINE_SYMBOLS.map(async (symbol) => {
         try {
-          const [m5, h1] = await Promise.all([this.fetchCandles(symbol, "5m", 220), this.fetchCandles(symbol, "1h", 220)]);
+          // One extra raw bar may still be active. Fetch enough history to
+          // leave the required 250 completed 1h bars after that exclusion.
+          const [m5, h1] = await Promise.all([this.fetchCandles(symbol, "5m", 300), this.fetchCandles(symbol, "1h", 300)]);
           return buildSingleSymbolPriceTimelineState(symbol, { m5, h1 }, now);
         } catch (error) {
           return buildUnavailable(symbol, error instanceof Error ? error.message : "market data unavailable");

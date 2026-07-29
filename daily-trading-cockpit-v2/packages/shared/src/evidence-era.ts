@@ -16,18 +16,26 @@
  */
 
 import type { VariantSelectionSnapshot } from "./types.js";
+import { DECISION_PIPELINE_POLICY_VERSION } from "./policy-versions.js";
 
 export type EvidenceEra =
+  | "LEGACY_PRE_END_TO_END_CORRECTNESS_FIX"
+  | "POST_END_TO_END_CORRECTNESS_FIX_V1"
   | "LEGACY_PRE_ROUTING"
   | "POST_ROUTING_PRE_CALIBRATION"
   | "POST_CALIBRATION"
   | "UNKNOWN";
 
 /** Bumped whenever decision-policy changes meaningfully. Stamped on every new plan. */
-export const CURRENT_DECISION_POLICY_VERSION = "profit-focused-admission-v2";
+export const CURRENT_DECISION_POLICY_VERSION = DECISION_PIPELINE_POLICY_VERSION;
 
 /** The era that all new records are emitted under. */
-export const CURRENT_EVIDENCE_ERA: EvidenceEra = "POST_CALIBRATION";
+/**
+ * The versioned post-fix era is only emitted by this deployment.  Records
+ * without an explicit stamp remain legacy; no filesystem timestamp inference
+ * is used anywhere in this classifier.
+ */
+export const CURRENT_EVIDENCE_ERA: EvidenceEra = "POST_END_TO_END_CORRECTNESS_FIX_V1";
 
 /** Minimal shape needed to classify — keeps callers from importing all of ShadowPosition. */
 export interface EvidenceEraSubject {
@@ -57,6 +65,8 @@ export function classifyEvidenceEra(subject: EvidenceEraSubject | null | undefin
     sel.calibratedExpectedNetR !== undefined ||
     sel.calibrationVerdict !== undefined;
 
+  // Shape inference exists solely to display historical audit data. It never
+  // grants a record the post-fix era or makes it eligible for new routing.
   if (!hasRouteMode && !hasCalibration) return "LEGACY_PRE_ROUTING";
   if (hasRouteMode && !hasCalibration) return "POST_ROUTING_PRE_CALIBRATION";
   if (hasCalibration) return "POST_CALIBRATION";

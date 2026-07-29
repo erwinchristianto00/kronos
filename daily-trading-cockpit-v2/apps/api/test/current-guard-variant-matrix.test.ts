@@ -295,7 +295,7 @@ describe("current-guard-variant-matrix", () => {
   });
 
   // 2. Wide stop + wide TP improves payoff geometry.
-  it("[2] wide stop + wide TP widens stop, targets ~1R, and lowers cost-in-R", () => {
+  it("[2] wide stop + wide TP widens stop, targets the 1.5R execution floor, and lowers cost-in-R", () => {
     const signal = makeSignal();
     const baseline = deriveVariantGeometry(signal, defOf(BASELINE_VARIANT_ID));
     const wide = deriveVariantGeometry(signal, defOf("CG_WIDE_STOP_TP_WIDE"));
@@ -306,7 +306,7 @@ describe("current-guard-variant-matrix", () => {
     expect(wide.stopDistanceBps).toBeGreaterThanOrEqual(WIDE_STOP_MIN_BPS); // 300
     const payoff =
       (wide.takeProfitLevels[0]! - wide.entryPrice) / (wide.entryPrice - wide.stopLoss);
-    expect(payoff).toBeCloseTo(1.0, 6);
+    expect(payoff).toBeCloseTo(1.5, 6);
     expect(wide.costR).toBeCloseTo(TAKER_ROUNDTRIP_BPS / 300, 6); // 22/300 ~= 0.0733
     expect(wide.costR).toBeLessThan(baseline.costR);
   });

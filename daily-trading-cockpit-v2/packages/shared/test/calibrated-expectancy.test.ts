@@ -218,7 +218,7 @@ describe("computeCalibratedExpectedR — source resolution", () => {
     expect(r.calibrationSampleSize).toBe(8);
   });
 
-  it("falls back to routeMode when nothing else has enough sample", () => {
+  it("does not use routeMode as pre-route calibration evidence", () => {
     const evidence: CalibrationEvidence = {
       ...emptyCalibrationEvidence(),
       routeModes: {
@@ -231,7 +231,8 @@ describe("computeCalibratedExpectedR — source resolution", () => {
       },
     };
     const r = computeCalibratedExpectedR(baseInput({ evidence }));
-    expect(r.calibrationSourceUsed).toBe("routeMode");
-    expect(r.calibrationSampleSize).toBe(25);
+    expect(r.calibrationSourceUsed).toBe("none");
+    expect(r.calibrationSampleSize).toBe(0);
+    expect(r.calibrationVerdict).toBe("INSUFFICIENT_SAMPLE");
   });
 });

@@ -70,8 +70,8 @@ export interface CalibrationPoint {
   fillStatus: "FILLED" | "NO_FILL";
   /** Calibration-adjusted R at the time the plan was emitted (if available). */
   calibratedExpectedNetR?: number | null;
-  /** Era classified from the persisted plan shape; lets us split post-calibration from legacy. */
-  evidenceEra?: "LEGACY_PRE_ROUTING" | "POST_ROUTING_PRE_CALIBRATION" | "POST_CALIBRATION" | "UNKNOWN";
+  /** Explicit post-fix era, with old values retained only for audit import. */
+  evidenceEra?: "LEGACY_PRE_END_TO_END_CORRECTNESS_FIX" | "POST_END_TO_END_CORRECTNESS_FIX_V1" | "LEGACY_PRE_ROUTING" | "POST_ROUTING_PRE_CALIBRATION" | "POST_CALIBRATION" | "UNKNOWN";
 }
 
 export interface CalibrationGroup {

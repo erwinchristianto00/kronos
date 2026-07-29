@@ -64,7 +64,8 @@ describe("Adapter B — makeEntryMicrostructureAccessor (TTL + robustness)", () 
     const m = acc("BTCUSDT", "LONG");
     expect(m).not.toBeNull();
     expect(m!.candleFresh).toBe(true);
-    expect(m!.observedAtMs).toBe(NOW - MinutesMs(5));
+    // The active 15m bar is excluded; the prior completed bar is the source.
+    expect(m!.observedAtMs).toBe(NOW - MinutesMs(20));
     expect(typeof m!.distanceFromVwapAtr === "number" || m!.distanceFromVwapAtr === null).toBe(true);
   });
 

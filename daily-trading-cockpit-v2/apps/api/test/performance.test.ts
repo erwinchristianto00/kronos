@@ -3,7 +3,12 @@ import { mkdtempSync } from "node:fs";
 import os from "node:os";
 import { join } from "node:path";
 
-import type { TrackedSignal } from "@dtc/shared";
+import {
+  CURRENT_DECISION_POLICY_VERSION,
+  CURRENT_EVIDENCE_ERA,
+  EVIDENCE_POLICY_VERSION,
+  type TrackedSignal,
+} from "@dtc/shared";
 
 import { computePerformance } from "../src/lib/outcome-checker.js";
 import { PerformanceStatsProvider } from "../src/lib/performance-cache.js";
@@ -126,6 +131,28 @@ function makeSignal(overrides: Partial<TrackedSignal> = {}): TrackedSignal {
 }
 
 describe("computePerformance", () => {
+  it("only marks a homogeneous explicitly stamped cohort as post-fix evidence", () => {
+    const currentPlan = {
+      evidenceEra: CURRENT_EVIDENCE_ERA,
+      decisionPolicyVersion: CURRENT_DECISION_POLICY_VERSION,
+      evidencePolicyVersion: EVIDENCE_POLICY_VERSION,
+    } as TrackedSignal["selectedExecutionPlan"];
+    const current = computePerformance([makeSignal({ id: "current", selectedExecutionPlan: currentPlan })]);
+    expect(current.evidenceEra).toBe(CURRENT_EVIDENCE_ERA);
+    expect(current.evidencePolicyVersion).toBe(EVIDENCE_POLICY_VERSION);
+    expect(current.postFixSignalCount).toBe(1);
+    expect(current.legacySignalCount).toBe(0);
+
+    const mixed = computePerformance([
+      makeSignal({ id: "current", selectedExecutionPlan: currentPlan }),
+      makeSignal({ id: "legacy", selectedExecutionPlan: null }),
+    ]);
+    expect(mixed.evidenceEra).toBeNull();
+    expect(mixed.evidencePolicyVersion).toBeNull();
+    expect(mixed.postFixSignalCount).toBe(1);
+    expect(mixed.legacySignalCount).toBe(1);
+  });
+
   it("counts Kronos agreement only for matching directional bias and ignores neutral/unavailable", () => {
     const signals: TrackedSignal[] = [
       makeSignal({ id: "agree-long", direction: "LONG", kronosBias: "LONG", kronosConfidenceBucket: "STRONG" }),

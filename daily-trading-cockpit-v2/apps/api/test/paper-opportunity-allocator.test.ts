@@ -178,7 +178,8 @@ function makeCandidate(o: CandOverrides = {}): Candidate {
     currentPrice: o.currentPrice === undefined ? 100 : o.currentPrice,
     stopLoss: o.stopLoss === undefined ? 103 : o.stopLoss,
     takeProfits: {
-      tp1: o.tp1 === undefined ? 96 : o.tp1,
+      // 3 points reward / 2 points risk = the shared 1.5R execution floor.
+      tp1: o.tp1 === undefined ? 95.5 : o.tp1,
       tp2: o.tp2 ?? null,
       tp3: o.tp3 ?? null,
     },

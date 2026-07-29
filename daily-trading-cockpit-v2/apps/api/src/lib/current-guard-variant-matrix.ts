@@ -491,11 +491,14 @@ export const VARIANT_MATRIX_DEFINITIONS: readonly VariantMatrixVariantDefinition
   },
   {
     id: "CG_WIDE_STOP_TP_WIDE",
-    label: "Wide stop (>=300bps) with widened TP (~1R payoff)",
+    label: "Wide stop (>=300bps) with widened TP (1.5R payoff)",
     exitRule: "tp1_full",
     fillMode: "taker",
     costModel: "taker",
-    description: "Widen stop to >=300bps AND widen TP to ~1R so the payoff ratio targets ~1.0 (never widen stop alone).",
+    // The execution resolver enforces a 1.5R floor using the actual fill price.
+    // Keep this baseline geometry admissible rather than relying on a later reject.
+    tpRewardMultiple: 1.5,
+    description: "Widen stop to >=300bps AND widen TP to 1.5R so the executable payoff clears the conservative admission floor.",
   },
   {
     id: "CG_TRAIL_AFTER_TP1",

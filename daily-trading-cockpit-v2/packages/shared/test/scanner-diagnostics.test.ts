@@ -41,19 +41,18 @@ describe("computeScannerDiagnostics", () => {
     expect(diag.topPositiveEvidence.length).toBeGreaterThan(0);
   });
 
-  it("RESEARCH_ONLY with toxic variant gets high risk score", () => {
+  it("does not expose a static toxic label without direct selected-combo evidence", () => {
     const input = baseInput({
       selectedEntryVariant: "ema20_pullback_entry",
       expectedNetR: 0.2,
       variantConfidenceTier: "usable",
     });
     const decision = computeProfitRoute(input);
-    expect(decision.routeMode).toBe("RESEARCH_ONLY");
+    expect(decision.routeMode).toBe("PROFIT_CANDIDATE");
 
     const diag = computeScannerDiagnostics(input, decision);
-    expect(diag.researchRiskScore).toBeGreaterThan(35);
-    expect(diag.topNegativeEvidence.some((e) => /toxic/i.test(e))).toBe(true);
-    expect(diag.closestPathToProfitCandidate).toMatch(/toxic|symbol/i);
+    expect(diag.topNegativeEvidence.some((e) => /toxic/i.test(e))).toBe(false);
+    expect(diag.closestPathToProfitCandidate).toMatch(/already routed/i);
   });
 
   it("RESEARCH_ONLY with negative net R shows path to positive net R", () => {
@@ -101,7 +100,7 @@ describe("computeScannerDiagnostics", () => {
     expect(diag.topPositiveEvidence.some((e) => /whale/i.test(e))).toBe(true);
   });
 
-  it("all replay combos negative gives correct blocker in path", () => {
+  it("keeps aggregate replay negative as diagnostic rather than a route blocker", () => {
     const input = baseInput({
       expectedNetR: -0.2,
       variantConfidenceTier: "usable",
@@ -112,7 +111,7 @@ describe("computeScannerDiagnostics", () => {
     const decision = computeProfitRoute(input);
     const diag = computeScannerDiagnostics(input, decision);
 
-    expect(diag.topNegativeEvidence.some((e) => /replay/i.test(e))).toBe(true);
-    expect(diag.closestPathToProfitCandidate).toMatch(/replay|negative/i);
+    expect(diag.topNegativeEvidence.some((e) => /negative/i.test(e))).toBe(true);
+    expect(diag.closestPathToProfitCandidate).toMatch(/turn positive/i);
   });
 });

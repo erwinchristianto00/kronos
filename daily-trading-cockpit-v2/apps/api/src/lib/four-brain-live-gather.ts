@@ -198,6 +198,9 @@ export interface DirectionRawReadings {
   longLaneEdge: RawReadingInput;
   shortLaneEdge: RawReadingInput;
   kronosAgree: RawReadingInput;
+  /** Optional while the CPU challenger sidecar is disabled or warming up. */
+  chronos2Agree?: RawReadingInput;
+  timesfmAgree?: RawReadingInput;
   crowdingAlignLong: RawReadingInput;
   controllerBias?: "LONG" | "SHORT" | "NEUTRAL" | "MIXED" | "UNKNOWN";
   leansLong?: boolean;
@@ -356,6 +359,14 @@ export function assembleFourBrainTick(input: FourBrainGatherInput): FourBrainGat
       longLaneEdge: rd(d.longLaneEdge),
       shortLaneEdge: rd(d.shortLaneEdge),
       kronosAgree: rd(d.kronosAgree),
+      chronos2Agree: rd(d.chronos2Agree ?? {
+        sourceId: "chronos2-agree", raw: null, normalized: null, unit: "-1..1",
+        observedAtMs: null, freshnessClass: "derivatives", missingReason: "Chronos-2 challenger unavailable",
+      }),
+      timesfmAgree: rd(d.timesfmAgree ?? {
+        sourceId: "timesfm-agree", raw: null, normalized: null, unit: "-1..1",
+        observedAtMs: null, freshnessClass: "derivatives", missingReason: "TimesFM challenger unavailable",
+      }),
       crowdingAlignLong: rd(d.crowdingAlignLong),
     };
     const di: DirectionInput = {
@@ -372,6 +383,8 @@ export function assembleFourBrainTick(input: FourBrainGatherInput): FourBrainGat
       longLaneEdge: toTagged(readings.longLaneEdge),
       shortLaneEdge: toTagged(readings.shortLaneEdge),
       kronosAgree: toTagged(readings.kronosAgree),
+      chronos2Agree: toTagged(readings.chronos2Agree),
+      timesfmAgree: toTagged(readings.timesfmAgree),
       crowdingAlignLong: toTagged(readings.crowdingAlignLong),
       controllerBias: d.controllerBias,
       leansLong: d.leansLong,

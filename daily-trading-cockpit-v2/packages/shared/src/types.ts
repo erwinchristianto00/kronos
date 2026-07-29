@@ -39,7 +39,9 @@ export interface TimeframeIndicatorSnapshot {
   latestClose: number;
   ema20: number;
   ema50: number;
-  ema200: number;
+  /** Null until at least 250 *completed* candles are available. */
+  ema200: number | null;
+  ema200Available: boolean;
   sma20: number;
   rsi14: number;
   macd: MacdSnapshot;
@@ -60,6 +62,10 @@ export interface TimeframeIndicatorSnapshot {
   trend: TrendLabel;
   isFresh: boolean;
   lastOpenTime: number;
+  /** Exact completed candle used as the newest indicator input. */
+  sourceCandleOpenTime: number;
+  sourceCandleCloseTime: number;
+  completedCandleCount: number;
 }
 
 export interface FibonacciLevels {
@@ -221,6 +227,16 @@ export interface Candidate {
   reason: string[];
   blockers: string[];
   chart: ChartPoint[];
+  /** Immutable decision-input identity for dedupe, execution and evidence joins. */
+  candidateFingerprint: {
+    policyVersion: string;
+    symbol: string;
+    direction: Direction;
+    fiveMinuteSourceCloseTime: number;
+    fifteenMinuteSourceCloseTime: number;
+    oneHourSourceCloseTime: number;
+    value: string;
+  };
   selectedExecutionPlan?: VariantSelectionSnapshot | null;
 }
 
@@ -743,6 +759,8 @@ export interface VariantSelectionSnapshot {
   variantConfidenceTier: VariantConfidenceTier;
   routeMode: ProfitRouteMode;
   routeScore?: number;
+  /** Compatibility alias retained for older clients; never a routing threshold. */
+  routeDiagnosticScore?: number;
   routeReasonCodes?: ProfitRouteReasonCode[];
   routeExplanation?: string;
   primaryProfitEligible?: boolean;
@@ -752,6 +770,10 @@ export interface VariantSelectionSnapshot {
   /** Calibration-adjusted expectancy fields (optional — populated when evidence is available). */
   rawExpectedNetR?: number | null;
   calibratedExpectedNetR?: number | null;
+  /** Direct post-fix evidence after uncertainty handling; only this may route. */
+  conservativeNetR?: number | null;
+  canonicalRoutingNetR?: number | null;
+  heuristicSelectionScore?: number | null;
   calibrationPenaltyR?: number;
   calibrationConfidence?: "LOW" | "MEDIUM" | "HIGH";
   calibrationSampleSize?: number;
@@ -763,10 +785,14 @@ export interface VariantSelectionSnapshot {
     | "CALIBRATED_NEGATIVE"
     | "INSUFFICIENT_SAMPLE";
   calibrationExplanation?: string;
-  /** Evidence era stamped at plan-build time; "POST_CALIBRATION" for new records. */
-  evidenceEra?: "LEGACY_PRE_ROUTING" | "POST_ROUTING_PRE_CALIBRATION" | "POST_CALIBRATION" | "UNKNOWN";
+  /** Evidence era stamped at plan-build time. Old values remain readable for audit. */
+  evidenceEra?: "LEGACY_PRE_END_TO_END_CORRECTNESS_FIX" | "POST_END_TO_END_CORRECTNESS_FIX_V1" | "LEGACY_PRE_ROUTING" | "POST_ROUTING_PRE_CALIBRATION" | "POST_CALIBRATION" | "UNKNOWN";
   /** Decision-policy version string; bump when planner rules change. */
   decisionPolicyVersion?: string;
+  /** Execution semantics used when the plan is admitted/resolved. */
+  executionPolicyVersion?: string;
+  /** Evidence aggregation semantics used to evaluate this plan. */
+  evidencePolicyVersion?: string;
   selectionSource: "replay" | "heuristic_fallback";
   costAssumption: string;
   selectionReason: string;
@@ -1101,4 +1127,10 @@ export interface PerformanceStats {
     "4h": PerformanceWindowSnapshot;
   };
   generatedAt: string;
+  /** Null when this snapshot mixes legacy or unstamped records. Such a cohort
+   * is audit-only and cannot influence a new decision's evidence/routing. */
+  evidencePolicyVersion?: string | null;
+  evidenceEra?: import("./evidence-era.js").EvidenceEra | null;
+  legacySignalCount?: number;
+  postFixSignalCount?: number;
 }

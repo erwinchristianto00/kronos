@@ -62,6 +62,7 @@ import {
 import type { AdaptiveLaneRouterReport } from "./adaptive-lane-router.js";
 import type { LiveTradingGateReport } from "./live-trading-gate.js";
 import { recordHeatShadowSnapshot } from "./portfolio-heat-shadow.js";
+import { EXECUTION_POLICY_VERSION, MIN_EXECUTION_RR } from "@dtc/shared";
 import { getSimulatedPaperPathStore, simulatedPaperPathDirFor } from "./paper-simulated-path-store.js";
 import {
   prepareForwardCausalIdentity,
@@ -86,6 +87,12 @@ export type PaperOrderStatus =
   | "PAPER_EXPIRED"
   | "PAPER_NO_FILL"
   | "PAPER_DATA_FAILURE";
+
+/**
+ * Market entries fill at the decision timestamp. Limit entries are deliberately
+ * pending until their exact order price trades; a broad zone touch is not a fill.
+ */
+export type PaperEntryOrderType = "MARKET" | "LIMIT";
 
 export type PaperRiskLabel = "NORMAL" | "EXPERIMENTAL" | "DEGRADED";
 export type OperationalSafetyStatus = "OK" | "BLOCKED";
@@ -454,6 +461,20 @@ export interface PaperOrder {
    * without also re-deriving the entry would simulate a fill that never existed.
    */
   openedAt: string; // mirrors source observation
+  /** Original scanner-observation timestamp. Kept separate from decision/fill time post-fix. */
+  sourceObservedAt?: string | null;
+  /** Pending expiry clock. Post-fix orders stamp this at decision admission. */
+  firstSeenAt?: string | null;
+  /** Actual position clock. Null only while a post-fix limit entry remains pending. */
+  entryFilledAt?: string | null;
+  entryOrderType?: PaperEntryOrderType;
+  /** Exact resting price for LIMIT entries; never inferred from a touched zone. */
+  entryOrderPrice?: number | null;
+  /** Explicit policy stamp: unstamped orders are legacy-only evidence. */
+  executionPolicyVersion?: string | null;
+  /** Geometry recomputed from the actual selected/fill price. */
+  actualStopDistanceBps?: number | null;
+  actualRiskReward?: number | null;
   symbol: string;
   direction: "LONG" | "SHORT";
   regime: string | null;
@@ -1308,6 +1329,13 @@ function _buildBaseOrder(
     !gateReport.killSwitchReady ||
     !gateReport.orderReconciliationReady ||
     !gateReport.exchangeHealthReady;
+  const isMarketEntry = obs.entryVariant == null || obs.entryVariant === "base_current_entry";
+  const actualGeometry = paperActualEntryGeometry(
+    obs.direction,
+    obs.simulatedEntryPrice,
+    obs.simulatedStopLoss,
+    obs.simulatedTakeProfitLevels,
+  );
   const order = _stampForwardGate({
     paperOrderId: `paper-${randomUUID()}`,
     sourceType: "VARIANT_MATRIX_OBSERVATION",
@@ -1318,7 +1346,17 @@ function _buildBaseOrder(
     dedupeKey: `${obs.observationId}:${eligibleLane.laneId}`,
     createdAt: now,
     updatedAt: now,
-    openedAt: obs.openedAt,
+    // The observation time remains provenance only. A new market order exists
+    // at decision time, never retroactively at the scanner's source candle.
+    openedAt: now,
+    sourceObservedAt: obs.openedAt,
+    firstSeenAt: now,
+    entryFilledAt: isMarketEntry ? now : null,
+    entryOrderType: isMarketEntry ? "MARKET" : "LIMIT",
+    entryOrderPrice: obs.simulatedEntryPrice,
+    executionPolicyVersion: EXECUTION_POLICY_VERSION,
+    actualStopDistanceBps: actualGeometry.stopDistanceBps,
+    actualRiskReward: actualGeometry.riskReward,
     symbol: obs.symbol,
     direction: obs.direction,
     regime: obs.regime ?? null,
@@ -1590,6 +1628,9 @@ function _buildAllocatorOrder(
   const dedupeKey = allocatorDedupeKey(o);
   const riskMultiplier = opportunityRiskMultiplier(o);
   const effectiveRiskPct = RISK_PCT * riskMultiplier;
+  const selectedEntryVariant = o.provenance?.selectedEntryVariant ?? "base_current_entry";
+  const isMarketEntry = selectedEntryVariant === "base_current_entry";
+  const actualGeometry = paperActualEntryGeometry(o.direction, o.entryPrice, o.stopLoss, o.takeProfitLevels);
   const order = _stampForwardGate({
     paperOrderId: `paper-${randomUUID()}`,
     sourceType: "SCAN_CANDIDATE_LANE_ALLOCATOR",
@@ -1600,7 +1641,15 @@ function _buildAllocatorOrder(
     dedupeKey,
     createdAt: now,
     updatedAt: now,
-    openedAt: o.openedAt,
+    openedAt: now,
+    sourceObservedAt: o.openedAt,
+    firstSeenAt: now,
+    entryFilledAt: isMarketEntry ? now : null,
+    entryOrderType: isMarketEntry ? "MARKET" : "LIMIT",
+    entryOrderPrice: o.entryPrice,
+    executionPolicyVersion: EXECUTION_POLICY_VERSION,
+    actualStopDistanceBps: actualGeometry.stopDistanceBps,
+    actualRiskReward: actualGeometry.riskReward,
     symbol: o.symbol,
     direction: o.direction,
     regime: o.regime ?? null,
@@ -1772,6 +1821,21 @@ function admitPaperOpportunitiesInner(
       continue;
     }
 
+    // Admission and resolver share the same actual-entry contract. A pending
+    // limit will be checked again at fill time, but an invalid planned geometry
+    // must never enter the paper book in the first place.
+    const plannedGeometry = paperActualEntryGeometry(
+      o.direction,
+      o.entryPrice,
+      o.stopLoss,
+      o.takeProfitLevels,
+    );
+    if (!plannedGeometry.ok) {
+      result.rejected += 1;
+      result.skippedReasons.push(`geometry:${plannedGeometry.reason ?? "INVALID"}:${o.sourceCandidateId}`);
+      continue;
+    }
+
     const openedAtMs = new Date(o.openedAt).getTime();
 
     // Source freshness (anti-lookahead)
@@ -1938,6 +2002,77 @@ function variantDefinitionForOrder(order: PaperOrder) {
 function paperOrderOpenedAtMs(order: PaperOrder, fallbackMs: number): number {
   const openedAtMs = new Date(order.openedAt).getTime();
   return Number.isFinite(openedAtMs) ? openedAtMs : fallbackMs;
+}
+
+/** Legacy rows had one `openedAt` field and were already treated as filled. New
+ * rows carry an explicit decision/fill lifecycle. This boundary is intentionally
+ * fail-closed for post-fix LIMIT orders: missing price means no fill. */
+function paperOrderFirstSeenAtMs(order: PaperOrder, fallbackMs: number): number {
+  const firstSeenMs = new Date(order.firstSeenAt ?? order.createdAt).getTime();
+  return Number.isFinite(firstSeenMs) ? firstSeenMs : paperOrderOpenedAtMs(order, fallbackMs);
+}
+
+function paperOrderEntryFilledAtMs(order: PaperOrder, fallbackMs: number): number {
+  const filledMs = new Date(order.entryFilledAt ?? order.openedAt).getTime();
+  return Number.isFinite(filledMs) ? filledMs : fallbackMs;
+}
+
+function isPendingPaperEntry(order: PaperOrder): boolean {
+  return order.executionPolicyVersion === EXECUTION_POLICY_VERSION &&
+    order.entryOrderType === "LIMIT" &&
+    !order.entryFilledAt;
+}
+
+export interface PaperActualEntryGeometry {
+  ok: boolean;
+  stopDistanceBps: number | null;
+  riskReward: number | null;
+  reason: string | null;
+}
+
+/** Recompute the executable geometry from the actual fill, not an entry-zone midpoint. */
+export function paperActualEntryGeometry(
+  direction: "LONG" | "SHORT",
+  entryPrice: number,
+  stopLoss: number,
+  takeProfitLevels: readonly number[],
+): PaperActualEntryGeometry {
+  const tp1 = takeProfitLevels[0];
+  if (!(Number.isFinite(entryPrice) && entryPrice > 0 && Number.isFinite(stopLoss) && Number.isFinite(tp1))) {
+    return { ok: false, stopDistanceBps: null, riskReward: null, reason: "INVALID_GEOMETRY" };
+  }
+  const directionallyValid = direction === "LONG"
+    ? stopLoss < entryPrice && entryPrice < tp1
+    : stopLoss > entryPrice && entryPrice > tp1;
+  if (!directionallyValid) return { ok: false, stopDistanceBps: null, riskReward: null, reason: "INVALID_DIRECTIONAL_GEOMETRY" };
+  const risk = Math.abs(entryPrice - stopLoss);
+  const reward = Math.abs(tp1 - entryPrice);
+  const riskReward = risk > 0 ? reward / risk : null;
+  const stopDistanceBps = (risk / entryPrice) * 10_000;
+  // Decimal arithmetic around an exact configured floor (for example 4.5/3)
+  // must not reject a geometrically valid order due only to IEEE rounding.
+  if (riskReward === null || !Number.isFinite(riskReward) || !Number.isFinite(stopDistanceBps) || riskReward + 1e-9 < MIN_EXECUTION_RR) {
+    return { ok: false, stopDistanceBps, riskReward, reason: "ACTUAL_RR_BELOW_EXECUTION_FLOOR" };
+  }
+  return { ok: true, stopDistanceBps, riskReward, reason: null };
+}
+
+type PendingEntryResolution = "NO_FILL" | "FILLED" | "AMBIGUOUS_STOP";
+
+/** A limit must trade at its exact price. On an unresolvable fill+stop candle,
+ * adverse-first is the only defensible paper result. TP is intentionally not
+ * evaluated on a fill-only candle; the next candle owns the exit evaluation. */
+function resolvePendingEntryCandle(
+  order: PaperOrder,
+  candle: PaperKlineTuple,
+): PendingEntryResolution {
+  const price = order.entryOrderPrice;
+  if (!(typeof price === "number" && Number.isFinite(price))) return "NO_FILL";
+  const high = Number(candle[2]);
+  const low = Number(candle[3]);
+  if (!(Number.isFinite(high) && Number.isFinite(low)) || low > price || high < price) return "NO_FILL";
+  const stopHit = order.direction === "LONG" ? low <= order.stopLoss : high >= order.stopLoss;
+  return stopHit ? "AMBIGUOUS_STOP" : "FILLED";
 }
 
 function latestCloseTouchesExit(order: PaperOrder, close: number): boolean {
@@ -2443,8 +2578,12 @@ async function resolvePaperOrdersInner(
 
   const processableOrders: PaperOrder[] = [];
   for (const order of openOrders) {
-    const openedAtMs = paperOrderOpenedAtMs(order, nowMs);
-    if (nowMs - openedAtMs > PAPER_ORDER_EXPIRY_MS) {
+    // A resting entry expires from first-seen. A filled position instead owns a
+    // full holding window from its actual fill; pending time never consumes it.
+    const expiryAnchorMs = isPendingPaperEntry(order)
+      ? paperOrderFirstSeenAtMs(order, nowMs)
+      : paperOrderEntryFilledAtMs(order, nowMs);
+    if (nowMs - expiryAnchorMs > PAPER_ORDER_EXPIRY_MS) {
       store.update(order.paperOrderId, {
         paperStatus: "PAPER_EXPIRED",
         closeReason: "EXPIRED_UNRESOLVED",
@@ -2462,7 +2601,9 @@ async function resolvePaperOrdersInner(
     : new Set<string>();
   const rankedOrders = processableOrders
     .map((order) => {
-      const openedAtMs = paperOrderOpenedAtMs(order, nowMs);
+      const openedAtMs = isPendingPaperEntry(order)
+        ? paperOrderFirstSeenAtMs(order, nowMs)
+        : paperOrderEntryFilledAtMs(order, nowMs);
       const updatedAtMs = new Date(order.updatedAt).getTime();
       const rank = nowMs - openedAtMs >= maxHoldMsForOrder(order)
         ? 0
@@ -2486,7 +2627,7 @@ async function resolvePaperOrdersInner(
   for (const item of rankedOrders) {
     const order = item.order;
     if (Date.now() - startedMs >= maxRuntimeMs) break;
-    const openedAtMs = item.openedAtMs;
+    let openedAtMs = item.openedAtMs;
 
     // The budget applies ONLY to real fetch-walk resolution.
     if (processed >= maxOrders) break;
@@ -2496,7 +2637,12 @@ async function resolvePaperOrdersInner(
     }
 
     try {
-      const startTime = openedAtMs - CANDLE_MS;
+      // Post-fix fills may occur inside a candle. Resolve exits only from the
+      // next whole candle, otherwise its high/low can include pre-fill path.
+      const resolutionStartMs = order.executionPolicyVersion === EXECUTION_POLICY_VERSION
+        ? Math.ceil(openedAtMs / CANDLE_MS) * CANDLE_MS
+        : openedAtMs - CANDLE_MS;
+      const startTime = resolutionStartMs;
       const endTime = Math.min(nowMs, openedAtMs + 14 * 24 * 60 * 60 * 1000);
       const candles = await fetchPaperKlinesRange(binanceClient, order.symbol, "5m", startTime, endTime);
 
@@ -2509,6 +2655,82 @@ async function resolvePaperOrdersInner(
         dataFailures += 1;
         continue;
       }
+
+      if (isPendingPaperEntry(order)) {
+        const firstSeenAtMs = paperOrderFirstSeenAtMs(order, nowMs);
+        let pendingResolution: PendingEntryResolution = "NO_FILL";
+        let fillCandle: PaperKlineTuple | null = null;
+        for (const candle of candles) {
+          // Never use the candle already in progress at the decision time: its
+          // high/low contains unknown pre-decision path. The first fully causal
+          // candidate is the next 5m candle.
+          if (Number(candle[0]) < firstSeenAtMs) continue;
+          pendingResolution = resolvePendingEntryCandle(order, candle);
+          if (pendingResolution !== "NO_FILL") {
+            fillCandle = candle;
+            break;
+          }
+        }
+
+        if (pendingResolution === "NO_FILL" || !fillCandle) {
+          store.update(order.paperOrderId, { paperStatus: "PAPER_SUBMITTED", updatedAt: new Date().toISOString() });
+          continue;
+        }
+
+        const actualEntry = order.entryOrderPrice!;
+        const geometry = paperActualEntryGeometry(order.direction, actualEntry, order.stopLoss, order.takeProfitLevels);
+        const fillClosedAtMs = Number(fillCandle[0]) + CANDLE_MS;
+        const risk = Math.abs(actualEntry - order.stopLoss);
+        const Ef = _entryFill(order.direction, actualEntry, executionModel.entrySlippageBps);
+        if (!geometry.ok || !(risk > 0)) {
+          store.update(order.paperOrderId, {
+            paperStatus: "PAPER_REJECTED",
+            closeReason: geometry.reason ?? "INVALID_GEOMETRY",
+            updatedAt: new Date().toISOString(),
+          });
+          dataFailures += 1;
+          continue;
+        }
+
+        if (pendingResolution === "AMBIGUOUS_STOP") {
+          const Sf = _exitFill(order.direction, order.stopLoss, executionModel.stopSlippageBps);
+          const grossR = _rewardR(order.direction, Ef, Sf, risk);
+          const costR = _computePaperExitCostR(order, "STOP_LIKE", executionModel, false, fillClosedAtMs);
+          const netR = grossR + costR;
+          store.update(order.paperOrderId, {
+            entryPrice: actualEntry,
+            entryFilledAt: new Date(fillClosedAtMs).toISOString(),
+            actualStopDistanceBps: geometry.stopDistanceBps,
+            actualRiskReward: geometry.riskReward,
+            paperStatus: "PAPER_CLOSED_LOSS",
+            grossR,
+            costR,
+            costModelVersion: PAPER_COST_MODEL_VERSION,
+            netR,
+            netPnlAmount: netR * order.plannedRiskAmount,
+            closeReason: "PENDING_FILL_STOP_AMBIGUOUS",
+            closedAtMs: fillClosedAtMs,
+            closeIntrabarAmbiguous: true,
+            updatedAt: new Date().toISOString(),
+          });
+          resolved += 1;
+          continue;
+        }
+
+        // Fill-only candle: TP/SL evaluation starts at the following candle so
+        // we never invent intrabar ordering or a free TP on entry.
+        store.update(order.paperOrderId, {
+          entryPrice: actualEntry,
+          entryFilledAt: new Date(fillClosedAtMs).toISOString(),
+          actualStopDistanceBps: geometry.stopDistanceBps,
+          actualRiskReward: geometry.riskReward,
+          paperStatus: "PAPER_SUBMITTED",
+          updatedAt: new Date().toISOString(),
+        });
+        continue;
+      }
+
+      openedAtMs = paperOrderEntryFilledAtMs(order, nowMs);
 
       const E = order.entryPrice;
       const S = order.stopLoss;
@@ -2559,7 +2781,7 @@ async function resolvePaperOrdersInner(
             target: T,
             exitRule,
             fillMode,
-            openedAtMs,
+            openedAtMs: resolutionStartMs,
             candles,
             makerFillWindowCandles: MAKER_FILL_WINDOW_CANDLES,
             ...(variantDef ? { mfeGivebackArmR: effectiveMfeGivebackArmR(variantDef, order.plannedStopDistanceBps) } : {}),
@@ -2656,7 +2878,7 @@ async function resolvePaperOrdersInner(
         _computePaperExitCostR(order, "TP_LIKE", executionModel, false, closedAtMs);
       for (const c of candles) {
         const openMs = c[0];
-        if (openMs < openedAtMs - CANDLE_MS) continue;
+        if (openMs < resolutionStartMs) continue;
         const candleCloseMs = Number(openMs) + CANDLE_MS; // MARKET close time of THIS candle — the exit bar's ts (Track 1a)
         const high = Number(c[2]);
         const low = Number(c[3]);

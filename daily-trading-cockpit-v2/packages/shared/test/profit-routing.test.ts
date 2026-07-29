@@ -42,43 +42,18 @@ describe("computeProfitRoute", () => {
     expect(decision.routeReasonCodes).toContain("NEGATIVE_NET_EVIDENCE");
   });
 
-  it("ema20_pullback_entry becomes RESEARCH_ONLY unless strong symbol-specific positive evidence exists", () => {
-    const toxic = computeProfitRoute(
+  it("does not permanently classify an entry variant without direct selected-combo evidence", () => {
+    const noDirectEvidence = computeProfitRoute(
       baseInput({
         selectedEntryVariant: "ema20_pullback_entry",
         expectedNetR: 0.2,
         variantConfidenceTier: "usable",
       }),
     );
-    expect(toxic.routeMode).toBe("RESEARCH_ONLY");
-    expect(toxic.routeReasonCodes).toContain("TOXIC_VARIANT");
-
-    // Requires ≥15 resolved AND netAvgR ≥ 0.10 — thin early evidence (resolved=10) is not enough.
-    const thinEvidence = computeProfitRoute(
-      baseInput({
-        selectedEntryVariant: "ema20_pullback_entry",
-        expectedNetR: 0.2,
-        variantConfidenceTier: "usable",
-        symbolStats: { symbol: "BTCUSDT", netAvgR: 0.18, resolved: 10 },
-      }),
-    );
-    expect(thinEvidence.routeMode).toBe("RESEARCH_ONLY");
-    expect(thinEvidence.routeReasonCodes).toContain("TOXIC_VARIANT");
-
-    // Override fires only with ≥15 resolved AND netAvgR ≥ 0.10.
-    const overridden = computeProfitRoute(
-      baseInput({
-        selectedEntryVariant: "ema20_pullback_entry",
-        expectedNetR: 0.2,
-        variantConfidenceTier: "usable",
-        symbolStats: { symbol: "BTCUSDT", netAvgR: 0.18, resolved: 25 },
-      }),
-    );
-    expect(overridden.routeMode).toBe("PROFIT_CANDIDATE");
-    expect(overridden.routeReasonCodes).toContain("TOXIC_VARIANT_OVERRIDDEN_BY_SYMBOL");
+    expect(noDirectEvidence.routeReasonCodes).not.toContain("TOXIC_VARIANT");
   });
 
-  it("all replay variants negative cannot become PROFIT_CANDIDATE", () => {
+  it("does not let aggregate replay rows veto a different selected combo", () => {
     const decision = computeProfitRoute(
       baseInput({
         expectedNetR: 0.1,
@@ -91,8 +66,8 @@ describe("computeProfitRoute", () => {
         ],
       }),
     );
-    expect(decision.routeMode).not.toBe("PROFIT_CANDIDATE");
-    expect(decision.routeReasonCodes).toContain("ALL_REPLAY_VARIANTS_NEGATIVE");
+    expect(decision.routeMode).toBe("PROFIT_CANDIDATE");
+    expect(decision.routeReasonCodes).not.toContain("ALL_REPLAY_VARIANTS_NEGATIVE");
   });
 
   it("Kronos horizon conflict blocks runner exit selection", () => {

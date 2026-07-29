@@ -61,7 +61,9 @@ function baseCandidate(overrides: Partial<Candidate> = {}): Candidate {
     },
     whale: { available: true, signal: "BULLISH", score: 75, reason: "aligned" },
     sentiment: { available: false, signal: "UNAVAILABLE", score: 0, source: "none" },
-    now: Date.UTC(2026, 4, 6, 15, 0, 0),
+    // The 1h fixture spans 160 hours, so evaluate after its final bar has
+    // completed rather than accidentally scoring future synthetic candles.
+    now: Date.UTC(2026, 4, 13, 0, 0, 0),
   });
   return {
     ...candidate,

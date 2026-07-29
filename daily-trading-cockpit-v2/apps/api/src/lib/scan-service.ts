@@ -466,9 +466,11 @@ export class ScanService {
           const candleStartedMs = Date.now();
           const [candles5m, candles15m, candles1h, ticker24h, bookTicker] = await withTimeout(
             Promise.all([
-              this.binanceClient.getCandles(symbol, "5m", 150),
-              this.binanceClient.getCandles(symbol, "15m", 150),
-              this.binanceClient.getCandles(symbol, "1h", 150),
+              // 300 leaves a real 250-bar EMA200 after Binance's active kline
+              // is excluded, with modest warm-up room for delayed responses.
+              this.binanceClient.getCandles(symbol, "5m", 300),
+              this.binanceClient.getCandles(symbol, "15m", 300),
+              this.binanceClient.getCandles(symbol, "1h", 300),
               this.binanceClient.getTicker24h(symbol),
               this.binanceClient.getBookTicker(symbol),
             ]),
@@ -580,6 +582,7 @@ export class ScanService {
             kronos,
             whale,
             sentiment,
+            now: Date.now(),
           });
           candidateScoringMs = Date.now() - scoringStartedMs;
           recordSymbol("COMPLETED");

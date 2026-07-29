@@ -82,6 +82,8 @@ describe("buildFourBrainJournalContext — pure builder", () => {
     expect(statuses.btcAtrPercentile).toBe("MISSING");
     expect(statuses.crowdAlignLong).toBe("MISSING");
     expect(statuses.kronosAgree).toBe("MISSING");
+    expect(statuses.chronos2Agree).toBe("MISSING");
+    expect(statuses.timesfmAgree).toBe("MISSING");
 
     const reasons = ctx.missingReasons as Record<string, string>;
     expect(reasons.sentiment).toBeTruthy();
@@ -94,12 +96,14 @@ describe("buildFourBrainJournalContext — pure builder", () => {
   });
 
   it("MISSING flips to FRESH when the underlying binding value is present (never a static/fabricated map)", () => {
-    const ctx = buildFourBrainJournalContext(fakeDeps({ sentiment: 0.3, btcAtrPercentile: 40, crowdAlignLong: 0.1, kronosAgree: -0.2 }), []);
+    const ctx = buildFourBrainJournalContext(fakeDeps({ sentiment: 0.3, btcAtrPercentile: 40, crowdAlignLong: 0.1, kronosAgree: -0.2, chronos2Agree: 0.4, timesfmAgree: -0.5 }), []);
     const statuses = ctx.sourceStatuses as Record<string, string>;
     expect(statuses.sentiment).toBe("FRESH");
     expect(statuses.btcAtrPercentile).toBe("FRESH");
     expect(statuses.crowdAlignLong).toBe("FRESH");
     expect(statuses.kronosAgree).toBe("FRESH");
+    expect(statuses.chronos2Agree).toBe("FRESH");
+    expect(statuses.timesfmAgree).toBe("FRESH");
     const reasons = ctx.missingReasons as Record<string, string>;
     expect(reasons.sentiment).toBeUndefined();
   });

@@ -144,14 +144,18 @@ function latestComparableVolume(values: number[]): { current: number | null; bas
     return { current: null, baseline: null };
   }
 
-  const current = values.at(-2) ?? null;
-  const baselineWindow = values.slice(-22, -2);
+  // `values` is already the completed-candle series. Using -2 here used to
+  // skip the newest completed volume for no reason and mixed the accounting
+  // rule with the old active-candle workaround.
+  const current = values.at(-1) ?? null;
+  const baselineWindow = values.slice(-21, -1);
   const baseline = baselineWindow.length > 0 ? average(baselineWindow) : null;
 
   return { current, baseline };
 }
 
-function detectTrend(close: number, ema20Value: number, ema50Value: number, ema200Value: number): TrendLabel {
+function detectTrend(close: number, ema20Value: number, ema50Value: number, ema200Value: number | null): TrendLabel {
+  if (ema200Value === null) return "SIDEWAYS";
   if (close > ema20Value && ema20Value >= ema50Value && ema50Value >= ema200Value) {
     return "BULLISH";
   }
@@ -167,26 +171,51 @@ function timeframeMs(timeframe: "5m" | "15m" | "1h"): number {
   return 60 * 60 * 1000;
 }
 
+/**
+ * Binance kline responses can include the currently-forming bar.  Scanner
+ * features are strictly close-to-close: a bar participates only after its
+ * interval has elapsed.  This helper is exported so callers that calculate
+ * non-indicator features (for example Fibonacci) use exactly the same rule.
+ */
+export function completedCandles(
+  candles: Candle[],
+  timeframe: "5m" | "15m" | "1h",
+  now = Date.now(),
+): Candle[] {
+  const closeAfterMs = timeframeMs(timeframe);
+  return candles.filter((candle) => candle.openTime + closeAfterMs <= now);
+}
+
 export function calculateTimeframeIndicators(
   candles: Candle[],
   timeframe: "5m" | "15m" | "1h",
   now = Date.now(),
 ): TimeframeIndicatorSnapshot {
-  if (candles.length < 30) {
-    throw new Error(`At least 30 candles are required for ${timeframe} indicators.`);
+  const completed = completedCandles(candles, timeframe, now);
+  // MACD requires 26 completed observations. Twenty-nine completed candles
+  // preserve the legacy 30-raw-candle minimum when the final raw candle is
+  // actively forming; EMA200 remains separately fail-closed at 250 completed.
+  if (completed.length < 29) {
+    throw new Error(`At least 29 completed candles are required for ${timeframe} indicators.`);
   }
 
-  const closes = candles.map((candle) => candle.close);
-  const volumes = candles.map((candle) => candle.volume);
-  const last = candles.at(-1)!;
+  const closes = completed.map((candle) => candle.close);
+  const volumes = completed.map((candle) => candle.volume);
+  const last = completed.at(-1)!;
   const ema20Value = ema(closes, 20);
   const ema50Value = ema(closes, 50);
-  const ema200Value = ema(closes, 200);
+  // A 200-period baseline needs burn-in.  Returning a shortened EMA here is
+  // mathematically a different indicator and previously made 150-bar scans
+  // look valid.
+  const ema200Value = completed.length >= 250 ? ema(closes, 200) : null;
   const sma20Value = sma(closes, 20);
-  const atrValue = atr(candles, 14);
-  const vwapValue = vwap(candles);
-  const recent = candles.slice(-20);
-  const previousRecent = candles.slice(-21, -1);
+  // Every historical feature must share the same completed-candle cutoff.
+  // Using raw `candles` here leaked an active bar into ATR/VWAP/range/volume
+  // while EMA used the completed series above.
+  const atrValue = atr(completed, 14);
+  const vwapValue = vwap(completed);
+  const recent = completed.slice(-20);
+  const previousRecent = completed.slice(-21, -1);
   const latestBody = Math.abs(last.close - last.open);
   const upperWick = last.high - Math.max(last.open, last.close);
   const lowerWick = Math.min(last.open, last.close) - last.low;
@@ -210,7 +239,8 @@ export function calculateTimeframeIndicators(
     latestClose: roundPrice(last.close),
     ema20: roundPrice(ema20Value, last.close),
     ema50: roundPrice(ema50Value, last.close),
-    ema200: roundPrice(ema200Value, last.close),
+    ema200: ema200Value === null ? null : roundPrice(ema200Value, last.close),
+    ema200Available: ema200Value !== null,
     sma20: roundPrice(sma20Value, last.close),
     rsi14: round(rsi(closes, 14), 4),
     macd: macd(closes),
@@ -229,8 +259,11 @@ export function calculateTimeframeIndicators(
     breakoutHigh: last.close > previousHigh,
     breakoutLow: last.close < previousLow,
     trend: detectTrend(last.close, ema20Value, ema50Value, ema200Value),
-    isFresh: now - last.openTime <= freshnessGrace,
+    isFresh: now - (last.openTime + timeframeMs(timeframe)) < freshnessGrace,
     lastOpenTime: last.openTime,
+    sourceCandleOpenTime: last.openTime,
+    sourceCandleCloseTime: last.openTime + timeframeMs(timeframe),
+    completedCandleCount: completed.length,
   };
 }
 

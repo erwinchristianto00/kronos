@@ -200,15 +200,15 @@ export function makeEntryMicrostructureAccessor(
     } catch {
       return null;
     }
-    const last = candles[candles.length - 1];
     const openTime = finite(snap.lastOpenTime) ? snap.lastOpenTime : null;
+    const hasFutureCandle = candles.some((candle) => candle.openTime > deps.nowMs);
     // candleFresh = the STRICTER of two budgets so a stale bar can NEVER ENTER_NOW:
     //   (a) causal + within the four-brain candle TTL ceiling (FRESHNESS_TTL_MS.candle, ~1h-bar budget), AND
     //   (b) the shared indicator's OWN timeframe-aware grace (snap.isFresh = timeframeMs(tf)×3 — e.g. 45min
     //       for 15m). The fixed ceiling alone would treat a 15m bar up to 90min (6 bars) old as fresh; ANDing
     //       the timeframe-aware grace keeps it tight per the operator's stale-candle requirement.
     const causalWithinTtl = openTime !== null && openTime <= deps.nowMs + 60_000 && deps.nowMs - openTime <= candleTtlMs;
-    const candleFresh = causalWithinTtl && snap.isFresh === true;
+    const candleFresh = !hasFutureCandle && causalWithinTtl && snap.isFresh === true;
     const ms = microstructureFromIndicators(
       {
         vwap: snap.vwap,
@@ -221,7 +221,10 @@ export function makeEntryMicrostructureAccessor(
         lastOpenTime: openTime,
       },
       side,
-      last ? last.close : null,
+      // The microstructure decision uses the same completed-candle price as
+      // its VWAP/ATR/breakout inputs. Current price is an execution concern,
+      // not a historical scoring input.
+      snap.latestClose,
       deps.volumeConfirmThreshold,
     );
     let flow: EntryOrderflowSnapshot | null = null;
@@ -295,6 +298,10 @@ export interface FourBrainBindingDeps {
   crowdAtMs: number | null;
   kronosAgree: number | null; // −1..1 or null (~55% MISSING)
   kronosAtMs: number | null;
+  chronos2Agree?: number | null; // −1..1 or null; independent challenger
+  chronos2AtMs?: number | null;
+  timesfmAgree?: number | null; // −1..1 or null; independent challenger
+  timesfmAtMs?: number | null;
 
   // ── Entry candidates (open signals) ──
   openSignals: Array<{ laneId: string; symbol: string; direction: "LONG" | "SHORT"; observationId: string; openedAtMs: number; entryPrice: number; stopPrice: number }>;
@@ -421,6 +428,8 @@ export function buildFourBrainGatherInput(dep: FourBrainBindingDeps): FourBrainG
       longLaneEdge: reading("lane-report-long", longLane && longLane.resolvedCount > 0 ? longLane.netAvgR : null, "R", laneAtMs(longLane), "regime", "no resolved long-lane closes"),
       shortLaneEdge: reading("lane-report-short", shortLane && shortLane.resolvedCount > 0 ? shortLane.netAvgR : null, "R", laneAtMs(shortLane), "regime", "no resolved short-lane closes"),
       kronosAgree: reading("kronos-agree", finite(dep.kronosAgree) ? dep.kronosAgree : null, "-1..1", dep.kronosAtMs, "derivatives", "kronos ~55% MISSING"),
+      chronos2Agree: reading("chronos2-agree", finite(dep.chronos2Agree) ? dep.chronos2Agree : null, "-1..1", dep.chronos2AtMs ?? null, "derivatives", "Chronos-2 challenger unavailable"),
+      timesfmAgree: reading("timesfm-agree", finite(dep.timesfmAgree) ? dep.timesfmAgree : null, "-1..1", dep.timesfmAtMs ?? null, "derivatives", "TimesFM challenger unavailable"),
       crowdingAlignLong: reading("crowding-align-long", finite(dep.crowdAlignLong) ? dep.crowdAlignLong : null, "-1..1", dep.crowdAtMs, "derivatives"),
       controllerBias: dep.controllerBias,
       leansLong: dep.allowsLong,

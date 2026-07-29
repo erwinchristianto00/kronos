@@ -1,6 +1,12 @@
 import Fastify, { type FastifyInstance } from "fastify";
 import { BinanceClient } from "./lib/binance.js";
 import { HttpKronosClient } from "./lib/kronos.js";
+import { HttpForecastChallengerClient } from "./lib/forecast-challenger.js";
+import {
+  ForecastChallengerBtcAnchorCache,
+  refreshForecastChallengerBtcAnchor,
+} from "./lib/forecast-challenger-btc-anchor.js";
+import { TlobCollector } from "./lib/tlob-collector.js";
 import { OutcomeChecker } from "./lib/outcome-checker.js";
 import { PerformanceStatsProvider } from "./lib/performance-cache.js";
 import { ScanService } from "./lib/scan-service.js";
@@ -165,7 +171,7 @@ import { getKronosBtcAnchorCache, refreshKronosBtcAnchor } from "./lib/kronos-bt
 import { buildRegimeDirectionControllerReport } from "./lib/regime-direction-controller.js";
 import { getRegimeDirectionControllerSnapshotStore } from "./lib/regime-direction-controller-snapshot.js";
 import { getRegimeEdgeMemory } from "./lib/regime-edge-memory.js";
-import { cortexBrainMode, cortexPromotionBlockedByEnv } from "./lib/cortex-brain.js";
+import { cortexBrainMode } from "./lib/cortex-brain.js";
 import { CortexBrainStore, CortexDecisionJournal, runCortexShadowTick } from "./lib/cortex-brain-store.js";
 import { standaloneCortexShadowAllowed } from "./lib/cortex-instance-diagnosis.js";
 import { runFourBrainShadowCycle } from "./lib/four-brain-live-wiring.js";
@@ -228,6 +234,8 @@ import { UnifiedTestnetProposalStore } from "./lib/unified-testnet-proposal-sour
 export interface AppOptions {
   fetchImpl?: typeof fetch;
   kronosBaseUrl?: string;
+  /** Optional local-only Python sidecar. It is advisory and testnet-gated below. */
+  challengerBaseUrl?: string;
   notificationDataDir?: string;
   notificationService?: NotificationService;
 }
@@ -263,6 +271,8 @@ export function buildFourBrainJournalContext(
     | "allowsShort"
     | "crowdAlignLong"
     | "kronosAgree"
+    | "chronos2Agree"
+    | "timesfmAgree"
     | "killLatched"
     | "killReason"
     | "openPositions"
@@ -280,6 +290,8 @@ export function buildFourBrainJournalContext(
   if (base.sentiment == null) missingReasons.sentiment = "no market-wide sentiment producer (sync-safe)";
   if (base.crowdAlignLong == null) missingReasons.crowdAlignLong = "no sync crowd-align producer";
   if (base.kronosAgree == null) missingReasons.kronosAgree = "no sync kronos-agree producer";
+  if (base.chronos2Agree == null) missingReasons.chronos2Agree = "Chronos-2 challenger unavailable, neutral, or not yet warm";
+  if (base.timesfmAgree == null) missingReasons.timesfmAgree = "TimesFM challenger unavailable, neutral, or not yet warm";
 
   const sourceStatuses: Record<string, string> = {
     axisScore: base.axisScore != null ? "FRESH" : "MISSING",
@@ -290,6 +302,8 @@ export function buildFourBrainJournalContext(
     sentiment: base.sentiment != null ? "FRESH" : "MISSING",
     crowdAlignLong: base.crowdAlignLong != null ? "FRESH" : "MISSING",
     kronosAgree: base.kronosAgree != null ? "FRESH" : "MISSING",
+    chronos2Agree: base.chronos2Agree != null ? "FRESH" : "MISSING",
+    timesfmAgree: base.timesfmAgree != null ? "FRESH" : "MISSING",
   };
 
   return {
@@ -303,6 +317,8 @@ export function buildFourBrainJournalContext(
       sentiment: base.sentiment,
       crowdAlignLong: base.crowdAlignLong,
       kronosAgree: base.kronosAgree,
+      chronos2Agree: base.chronos2Agree,
+      timesfmAgree: base.timesfmAgree,
       convictionScore: base.convictionScore,
       controllerBias: base.controllerBias,
       killLatched: base.killLatched,
@@ -317,6 +333,8 @@ export function buildFourBrainJournalContext(
       convictionScore: base.convictionScore,
       allowsLong: base.allowsLong,
       allowsShort: base.allowsShort,
+      chronos2Agree: base.chronos2Agree,
+      timesfmAgree: base.timesfmAgree,
     },
     sourceStatuses,
     missingReasons,
@@ -346,6 +364,23 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
   const binanceClient = new BinanceClient(options.fetchImpl);
   const kronosClient = new HttpKronosClient(
     options.kronosBaseUrl ?? process.env.KRONOS_BASE_URL ?? DEFAULT_KRONOS_BASE_URL,
+    options.fetchImpl,
+  );
+  // Do not configure the sidecar by default. The process is additionally gated to
+  // the 3102 testnet instance below, so an env copied onto 3103 cannot affect live.
+  const challengerBaseUrl =
+    options.challengerBaseUrl ??
+    (process.env.CORTEX_CHALLENGERS_ENABLED === "1"
+      ? process.env.CHALLENGER_BASE_URL ?? "http://127.0.0.1:8002"
+      : undefined);
+  const chronos2Client = new HttpForecastChallengerClient(
+    challengerBaseUrl,
+    "chronos2",
+    options.fetchImpl,
+  );
+  const timesfmClient = new HttpForecastChallengerClient(
+    challengerBaseUrl,
+    "timesfm",
     options.fetchImpl,
   );
   const whaleClient = new BinanceWhaleClient(binanceClient);
@@ -1172,21 +1207,11 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           killBudgetUsd: status.limits?.maxDrawdownUsd ?? null,
         });
         const context = gatherCortexContext(deps);
-        // 2026-07-21 operator ask: only the roster lanes the nightly refit has actually proven
-        // LEARNING_ACTIVE may receive CORTEX's tilt — everything else stays pinned to its exact
-        // static value inside runCortexShadowTick, while shadow collection/attribution continues for
-        // every lane regardless (unaffected by this set).
-        const learningActiveLaneIds = new Set(
-          (getLatestCortexRefitReport()?.perLane ?? []).filter((l) => l.status === "LEARNING_ACTIVE").map((l) => l.laneId),
-        );
-        const promotion = mode === "live"
-          ? {
-              regimeCoverageGateMet: getLatestCortexRefitReport()?.coverage.regimeCoverageGateMet ?? false,
-              blindCapitalPct: getLatestCortexRefitReport()?.coverage.blindCapitalPct ?? 100,
-              envBlocked: cortexPromotionBlockedByEnv(process.env),
-              learningActiveLaneIds,
-            }
-          : null;
+        // End-to-end correctness migration: the legacy logistic learner is
+        // diagnostic-only. Its output cannot become an allocation authority
+        // while post-fix economic evidence and exact ownership are incomplete.
+        // Passing null actively clears a prior override on every tick.
+        const promotion = null;
         const { promotedWeights } = runCortexShadowTick({
           store: cortexStore,
           journal: cortexJournal,
@@ -2283,6 +2308,14 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     // this block.
     const btcAtrPercentileCache = getBtcAtrPercentileCacheStore();
     const kronosBtcAnchorCache = getKronosBtcAnchorCache();
+    // New CPU forecasters are strictly a 3102 observation source. They only feed
+    // Direction Brain's report-only shadow tick; CORTEX/execution remains unchanged.
+    const challengerTestnetEnabled =
+      process.env.CORTEX_CHALLENGERS_ENABLED === "1" &&
+      resolveFourBrainInstanceId(process.env) === "3102";
+    const chronos2BtcAnchorCache = new ForecastChallengerBtcAnchorCache();
+    const timesfmBtcAnchorCache = new ForecastChallengerBtcAnchorCache();
+    const tlobCollector = new TlobCollector();
     let fourBrainBtcFlowCache: {
       sentiment: number | null;
       crowdAlignLong: number | null;
@@ -2455,6 +2488,12 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           const anchor = kronosBtcAnchorCache.get();
           return { kronosAgree: anchor.agree, kronosAtMs: anchor.atMs };
         })(),
+        // Advisory only. A missing/failed/challenger-neutral result is passed as
+        // null, never as a fabricated zero vote.
+        chronos2Agree: chronos2BtcAnchorCache.get().agree,
+        chronos2AtMs: chronos2BtcAnchorCache.get().atMs,
+        timesfmAgree: timesfmBtcAnchorCache.get().agree,
+        timesfmAtMs: timesfmBtcAnchorCache.get().atMs,
         // STAGED SCALP (2026-07-28). SCALP was unreachable — laneHorizon() could only return INTRADAY
         // or SWING, so no candidate ever carried it and the SCALP direction decision could never
         // attach to anything. Reassigning the FAST lanes outright would have fixed that by gutting
@@ -2662,6 +2701,45 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       // Offset from the ATR refresh so the two BTC producers never fire in the same tick.
       setTimeout(runKronosBtcAnchorRefresh, 20_000);
       setInterval(runKronosBtcAnchorRefresh, 15 * 60_000);
+
+      if (challengerTestnetEnabled) {
+        // The Python process uses a global inference lock. These offsets also
+        // prevent model loading or a cold inference burst at application boot.
+        const refreshChronos2 = (): void => {
+          void refreshForecastChallengerBtcAnchor(
+            chronos2BtcAnchorCache,
+            (symbol, interval, limit) => binanceClient.getCandles(symbol, interval, limit),
+            (symbol, timeframe, candles) => chronos2Client.predict(symbol, timeframe, candles),
+          );
+        };
+        const refreshTimesfm = (): void => {
+          void refreshForecastChallengerBtcAnchor(
+            timesfmBtcAnchorCache,
+            (symbol, interval, limit) => binanceClient.getCandles(symbol, interval, limit),
+            (symbol, timeframe, candles) => timesfmClient.predict(symbol, timeframe, candles),
+          );
+        };
+        const collectTlob = (): void => {
+          const symbols = (process.env.TLOB_COLLECT_SYMBOLS ?? "BTCUSDT,ETHUSDT,SOLUSDT")
+            .split(",")
+            .map((symbol) => symbol.trim().toUpperCase())
+            .filter((symbol) => /^[A-Z0-9]{5,20}$/.test(symbol));
+          if (symbols.length === 0) return;
+          void tlobCollector.collect(binanceClient, symbols).then((result) => {
+            if (result.failed > 0) {
+              console.warn(`[tlob-collector] captured=${result.captured} failed=${result.failed}`);
+            }
+          }).catch((error) => console.warn("[tlob-collector] collection failed", error));
+        };
+        setTimeout(refreshChronos2, 45_000);
+        setInterval(refreshChronos2, 20 * 60_000);
+        setTimeout(refreshTimesfm, 105_000);
+        setInterval(refreshTimesfm, 20 * 60_000);
+        if (process.env.TLOB_COLLECTOR_ENABLED === "1") {
+          setTimeout(collectTlob, 135_000);
+          setInterval(collectTlob, 60_000);
+        }
+      }
 
       const refreshFourBrainBtcFlow = (): void => {
         void binanceClient.getFuturesFlow("BTCUSDT")

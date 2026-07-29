@@ -2,10 +2,18 @@ import {
   buildAtrPlan,
   calculateFibonacciLevels,
   calculateTimeframeIndicators,
+  completedCandles,
   clamp,
   roundPrice,
   round,
 } from "./indicators.js";
+import {
+  DECISION_PIPELINE_POLICY_VERSION,
+  MAX_SCANNER_SPREAD_PERCENT,
+  MIN_EXECUTION_RR,
+  MIN_RAW_QUOTE_VOLUME_24H,
+  MIN_STRUCTURAL_RR,
+} from "./policy-versions.js";
 import type {
   Candidate,
   Candle,
@@ -31,31 +39,6 @@ export interface CandidateBuildInput {
   whale: WhaleSignal;
   sentiment: SentimentSignal;
   now?: number;
-}
-
-function hasSourceConflict(kronos: KronosPrediction, whale: WhaleSignal): boolean {
-  if (!kronos.available || !whale.available || !kronos.kronosBias) {
-    return false;
-  }
-  return (
-    (kronos.kronosBias === "LONG" && whale.signal === "BEARISH") ||
-    (kronos.kronosBias === "SHORT" && whale.signal === "BULLISH")
-  );
-}
-
-function downgradeStatus(status: Candidate["status"]): Candidate["status"] {
-  switch (status) {
-    case "TRADE_NOW":
-      return "READY";
-    case "READY":
-      return "WAIT";
-    case "WAIT":
-      return "WATCH";
-    case "WATCH":
-      return "SKIP";
-    default:
-      return "SKIP";
-  }
 }
 
 function capAtWait(status: Candidate["status"]): Candidate["status"] {
@@ -158,11 +141,16 @@ function scoreFibonacci(price: number, fib: FibonacciLevels, direction: Directio
 }
 
 function scoreVolume(volume: VolumeSnapshot, spread: SpreadSnapshot): { volumeScore: number; liquidityScore: number } {
-  const volumeRatio = volume.volumeRatio5m ?? 1;
-  const quoteVolume = volume.quoteVolume24h ?? 10_000_000;
-  const spreadPenalty = spread.percent === null ? 10 : spread.percent * 1400;
-  const volumeScore = clamp(30 + volumeRatio * 35 + Math.log10(Math.max(quoteVolume, 1)) * 8, 0, 100);
-  const liquidityScore = clamp(100 - spreadPenalty + Math.log10(Math.max(quoteVolume, 1)) * 10, 0, 100);
+  // Missing inputs are not neutral values.  They simply do not contribute to
+  // the optional quality score; required fields are rejected by eligibility.
+  const volumeScore =
+    volume.volumeRatio5m === null || volume.quoteVolume24h === null
+      ? 0
+      : clamp(30 + volume.volumeRatio5m * 35 + Math.log10(Math.max(volume.quoteVolume24h, 1)) * 8, 0, 100);
+  const liquidityScore =
+    spread.percent === null || volume.quoteVolume24h === null
+      ? 0
+      : clamp(100 - spread.percent * 1400 + Math.log10(Math.max(volume.quoteVolume24h, 1)) * 10, 0, 100);
   return {
     volumeScore: round(volumeScore),
     liquidityScore: round(liquidityScore),
@@ -194,8 +182,8 @@ function computeDataQuality(
   )
     ? 100
     : 40;
-  const spreadPenalty = spread.percent === null ? 0 : clamp(spread.percent * 1200, 0, 30);
-  const volumePenalty = volume.quoteVolume24h !== null && volume.quoteVolume24h < 10_000_000 ? 20 : 0;
+  const spreadPenalty = spread.percent === null ? 30 : clamp(spread.percent * 1200, 0, 30);
+  const volumePenalty = volume.quoteVolume24h === null || volume.quoteVolume24h < MIN_RAW_QUOTE_VOLUME_24H ? 20 : 0;
   return round(clamp(freshnessScore - spreadPenalty - volumePenalty, 0, 100));
 }
 
@@ -218,43 +206,20 @@ export function calculateDangerScore(
     oneHourTrendConflict: boolean;
   },
 ): number {
-  const { indicators, spread, volume, riskReward, whale, sentiment, oneHourTrendConflict } = args;
+  const { indicators, oneHourTrendConflict } = args;
   let danger = 10;
 
-  if (![indicators.fiveMinute, indicators.fifteenMinute, indicators.oneHour].every((snapshot) => snapshot.isFresh)) {
-    danger += 28;
-  }
-  if (spread.percent !== null && spread.percent > 0.12) {
-    danger += 18;
-  }
+  // Structural danger only.  Data freshness, spread, raw liquidity, RR and
+  // external opinions are eligibility/confidence concerns and must not get
+  // silently counted again here.
   if (indicators.fiveMinute.atrPercent > 4 || indicators.fiveMinute.atrPercent < 0.2) {
     danger += 14;
   }
   if (Math.abs(indicators.fiveMinute.distanceFromEma20) > 2.4 || Math.abs(indicators.fiveMinute.distanceFromVwap) > 2.4) {
     danger += 10;
   }
-  if ((volume.volumeRatio5m !== null && volume.volumeRatio5m < 0.9) || (volume.quoteVolume24h !== null && volume.quoteVolume24h < 10_000_000)) {
-    danger += 12;
-  }
-  if ((riskReward ?? 0) < 1.5) {
-    danger += 15;
-  }
   if (oneHourTrendConflict) {
     danger += 12;
-  }
-  if (
-    whale.available &&
-    ((args.direction === "LONG" && whale.signal === "BEARISH") ||
-      (args.direction === "SHORT" && whale.signal === "BULLISH"))
-  ) {
-    danger += 6;
-  }
-  if (
-    sentiment.available &&
-    ((args.direction === "LONG" && sentiment.signal === "BEARISH") ||
-      (args.direction === "SHORT" && sentiment.signal === "BULLISH"))
-  ) {
-    danger += 6;
   }
 
   return round(clamp(danger, 0, 100));
@@ -269,8 +234,9 @@ export function classifyStatus(args: {
   dangerScore: number;
   riskReward: number | null;
   hasTradePlan: boolean;
-  kronosAgrees: boolean;
+  kronosAgrees?: boolean;
   liquidityScore: number;
+  eligible?: boolean;
 }): Candidate["status"] {
   const {
     dataFresh,
@@ -281,20 +247,19 @@ export function classifyStatus(args: {
     dangerScore,
     riskReward,
     hasTradePlan,
-    kronosAgrees,
     liquidityScore,
+    eligible = true,
   } = args;
 
-  if (!dataFresh || liquidityScore < 35 || !spreadAcceptable || dangerScore > 75 || direction === "NEUTRAL" || (riskReward ?? 0) < 1.2) {
+  if (!eligible || !dataFresh || liquidityScore < 35 || !spreadAcceptable || dangerScore > 75 || direction === "NEUTRAL" || (riskReward ?? 0) < MIN_STRUCTURAL_RR) {
     return "SKIP";
   }
   if (
     opportunityScore >= 75 &&
     confidence >= 70 &&
     dangerScore <= 45 &&
-    (riskReward ?? 0) >= 1.5 &&
-    hasTradePlan &&
-    kronosAgrees
+    (riskReward ?? 0) >= MIN_EXECUTION_RR &&
+    hasTradePlan
   ) {
     return "TRADE_NOW";
   }
@@ -316,33 +281,33 @@ export function buildCandidate(input: CandidateBuildInput): Candidate {
   const fiveMinute = calculateTimeframeIndicators(input.candles5m, "5m", now);
   const fifteenMinute = calculateTimeframeIndicators(input.candles15m, "15m", now);
   const oneHour = calculateTimeframeIndicators(input.candles1h, "1h", now);
-  const fibonacci = calculateFibonacciLevels(input.candles1h);
+  const fibonacci = calculateFibonacciLevels(completedCandles(input.candles1h, "1h", now));
 
   const longTrendComposite = round(scoreTrend(fiveMinute, "LONG") * 0.35 + scoreTrend(fifteenMinute, "LONG") * 0.25 + scoreTrend(oneHour, "LONG") * 0.4);
   const shortTrendComposite = round(scoreTrend(fiveMinute, "SHORT") * 0.35 + scoreTrend(fifteenMinute, "SHORT") * 0.25 + scoreTrend(oneHour, "SHORT") * 0.4);
-  const direction = chooseDirection(longTrendComposite, shortTrendComposite);
-  const atrPlan = buildAtrPlan(fiveMinute.latestClose, fiveMinute.atr14, fiveMinute.atrPercent, direction, fibonacci);
-  const fibonacciScore = scoreFibonacci(fiveMinute.latestClose, fibonacci, direction);
   const { volumeScore, liquidityScore } = scoreVolume(input.volume, spread);
   const volatilityScore = scoreVolatility(fiveMinute.atrPercent);
-  const kronosScore = scoreKronos(input.kronos, direction);
-  const whaleComponent = input.whale.available ? externalSignalContribution(input.whale.signal, input.whale.score, direction) : 0;
-  const sentimentComponent = input.sentiment.available ? externalSignalContribution(input.sentiment.signal, input.sentiment.score, direction) : 0;
-  const socialWeight = sentimentWeight(input.sentiment);
-  const activeWeight = (input.kronos.available ? 35 : 0) + 25 + 15 + 10 + 10 + (input.whale.available ? 5 : 0) + socialWeight;
+  const longFibScore = scoreFibonacci(fiveMinute.latestClose, fibonacci, "LONG");
+  const shortFibScore = scoreFibonacci(fiveMinute.latestClose, fibonacci, "SHORT");
+  const optionalQuality = input.volume.volumeRatio5m === null || input.volume.quoteVolume24h === null || spread.percent === null
+    ? null
+    : (volumeScore + liquidityScore) / 2;
+  const publicDirectionScore = (trend: number, fib: number): number => {
+    const parts: Array<[number, number]> = [[trend, 0.65], [fib, 0.2], [volatilityScore, 0.1]];
+    if (optionalQuality !== null) parts.push([optionalQuality, 0.05]);
+    const weight = parts.reduce((total, [, partWeight]) => total + partWeight, 0);
+    return round(parts.reduce((total, [value, partWeight]) => total + value * partWeight, 0) / weight);
+  };
+  // These public scores are the canonical directional decision.  Forecast,
+  // whale, sentiment and telemetry cannot secretly choose a different side.
+  const longScore = publicDirectionScore(longTrendComposite, longFibScore);
+  const shortScore = publicDirectionScore(shortTrendComposite, shortFibScore);
+  const direction = chooseDirection(longScore, shortScore);
+  const atrPlan = buildAtrPlan(fiveMinute.latestClose, fiveMinute.atr14, fiveMinute.atrPercent, direction, fibonacci);
   const indicatorComposite = direction === "LONG" ? longTrendComposite : direction === "SHORT" ? shortTrendComposite : Math.max(longTrendComposite, shortTrendComposite);
-  const opportunityScore = round(
-    (
-      kronosScore * (input.kronos.available ? 35 : 0) +
-      indicatorComposite * 25 +
-      ((volumeScore + liquidityScore) / 2) * 15 +
-      volatilityScore * 10 +
-      fibonacciScore * 10 +
-      whaleComponent * (input.whale.available ? 5 : 0) +
-      sentimentComponent * socialWeight
-    ) / Math.max(activeWeight, 1),
-  );
+  const opportunityScore = direction === "LONG" ? longScore : direction === "SHORT" ? shortScore : Math.max(longScore, shortScore);
   const riskReward = atrPlan.riskReward;
+  const kronosScore = scoreKronos(input.kronos, direction);
   const oneHourTrendConflict =
     (direction === "LONG" && oneHour.trend === "BEARISH") || (direction === "SHORT" && oneHour.trend === "BULLISH");
   const indicators: IndicatorSet = {
@@ -363,62 +328,42 @@ export function buildCandidate(input: CandidateBuildInput): Candidate {
     sentiment: input.sentiment,
     oneHourTrendConflict,
   });
-  const confidenceWeight = 45 + 20 + 20 + (input.kronos.available ? 15 : 0);
-  const confidenceBase =
-    (opportunityScore * 45 +
-      dataQualityScore * 20 +
-      indicatorComposite * 20 +
-      kronosScore * (input.kronos.available ? 15 : 0)) /
-    Math.max(confidenceWeight, 1);
-  const conflictPenalty =
-    (oneHourTrendConflict ? 6 : 0) +
-    (input.whale.available &&
-    ((direction === "LONG" && input.whale.signal === "BEARISH") ||
-      (direction === "SHORT" && input.whale.signal === "BULLISH"))
-      ? 4
-      : 0) +
-    (input.sentiment.available &&
-    ((direction === "LONG" && input.sentiment.signal === "BEARISH") ||
-      (direction === "SHORT" && input.sentiment.signal === "BULLISH"))
-      ? 4
-      : 0);
-  const confidence = round(clamp(confidenceBase - dangerScore * 0.15 - conflictPenalty, 0, 100));
-  const sentimentAlignment =
-    input.sentiment.available && direction !== "NEUTRAL"
-      ? input.sentiment.signal === "NEUTRAL"
-        ? 0
-        : (input.sentiment.signal === "BULLISH" && direction === "LONG") ||
-            (input.sentiment.signal === "BEARISH" && direction === "SHORT")
-          ? 1
-          : -1
-      : 0;
-  const adjustedConfidence = round(
-    clamp(
-      confidence +
-        sentimentAlignment *
-          (((input.sentiment.confidence ?? input.sentiment.score) / 100) * (input.sentiment.scope === "SYMBOL" ? 4 : 2)),
-      0,
-      100,
-    ),
-  );
-  const kronosAgrees =
-    input.kronos.available && input.kronos.kronosBias
-      ? input.kronos.kronosBias === direction
-      : false;
-  const sourceConflict = hasSourceConflict(input.kronos, input.whale);
+  // Keep room for real external opinions.  A score margin is a confidence
+  // contributor, not a substitute for certainty.
+  const confidenceParts: Array<[number, number]> = [[clamp(50 + Math.abs(longScore - shortScore) * 1.5, 0, 100), 0.45]];
+  if (input.kronos.available && input.kronos.kronosBias && input.kronos.kronosBias !== "NEUTRAL" && direction !== "NEUTRAL") {
+    const strength = clamp(input.kronos.kronosConfidence ?? 50, 0, 100);
+    confidenceParts.push([input.kronos.kronosBias === direction ? strength : 100 - strength, 0.25]);
+  }
+  const appendOpinion = (available: boolean, signal: WhaleSignal["signal"] | SentimentSignal["signal"], score: number, weight: number) => {
+    if (available && direction !== "NEUTRAL" && signal !== "NEUTRAL" && signal !== "UNAVAILABLE") {
+      confidenceParts.push([externalSignalContribution(signal, clamp(score, 0, 100), direction), weight]);
+    }
+  };
+  appendOpinion(input.whale.available, input.whale.signal, input.whale.score, 0.2);
+  appendOpinion(input.sentiment.available, input.sentiment.signal, input.sentiment.confidence ?? input.sentiment.score, sentimentWeight(input.sentiment) / 100);
+  const confidenceWeight = confidenceParts.reduce((total, [, weight]) => total + weight, 0);
+  const adjustedConfidence = round(confidenceParts.reduce((total, [value, weight]) => total + value * weight, 0) / confidenceWeight);
+  const sourceConflict =
+    (input.kronos.available && input.whale.available && input.kronos.kronosBias !== undefined &&
+      ((input.kronos.kronosBias === "LONG" && input.whale.signal === "BEARISH") ||
+        (input.kronos.kronosBias === "SHORT" && input.whale.signal === "BULLISH"))) ||
+    (input.whale.available && direction !== "NEUTRAL" && externalSignalContribution(input.whale.signal, input.whale.score, direction) < 35) ||
+    (input.sentiment.available && direction !== "NEUTRAL" && externalSignalContribution(input.sentiment.signal, input.sentiment.score, direction) < 35);
   const baseStatus = classifyStatus({
     dataFresh: [fiveMinute, fifteenMinute, oneHour].every((snapshot) => snapshot.isFresh),
-    spreadAcceptable: spread.percent === null || spread.percent <= 0.12,
+    spreadAcceptable: spread.bid !== null && spread.ask !== null && spread.bid > 0 && spread.ask >= spread.bid && spread.percent !== null && spread.percent <= MAX_SCANNER_SPREAD_PERCENT,
     direction,
     opportunityScore,
     confidence: adjustedConfidence,
     dangerScore,
     riskReward,
     hasTradePlan: Boolean(atrPlan.stopLoss && atrPlan.takeProfit1 && atrPlan.takeProfit2 && atrPlan.takeProfit3),
-    kronosAgrees,
     liquidityScore,
+    eligible:
+      [fiveMinute, fifteenMinute, oneHour].every((snapshot) => snapshot.ema200Available) &&
+      input.volume.quoteVolume24h !== null && input.volume.quoteVolume24h >= MIN_RAW_QUOTE_VOLUME_24H,
   });
-  const afterSourceConflict = sourceConflict ? downgradeStatus(baseStatus) : baseStatus;
   const STRONG_AGAINST_THRESHOLD = 65;
   const whaleStronglyAgainst =
     input.whale.available &&
@@ -431,28 +376,7 @@ export function buildCandidate(input: CandidateBuildInput): Candidate {
       (direction === "SHORT" && input.sentiment.signal === "BULLISH")) &&
     input.sentiment.score >= STRONG_AGAINST_THRESHOLD;
   const directionConflict = whaleStronglyAgainst || sentimentStronglyAgainst;
-  const status = directionConflict ? capAtWait(afterSourceConflict) : afterSourceConflict;
-
-  const longScore = round(
-    clamp(
-      longTrendComposite * 0.55 +
-        volumeScore * 0.15 +
-        volatilityScore * 0.1 +
-        (input.kronos.available ? (input.kronos.kronosLongProbability ?? 0) : 0) * 0.2,
-      0,
-      100,
-    ),
-  );
-  const shortScore = round(
-    clamp(
-      shortTrendComposite * 0.55 +
-        volumeScore * 0.15 +
-        volatilityScore * 0.1 +
-        (input.kronos.available ? (input.kronos.kronosShortProbability ?? 0) : 0) * 0.2,
-      0,
-      100,
-    ),
-  );
+  const status = directionConflict ? capAtWait(baseStatus) : baseStatus;
 
   const reason: string[] = [];
   const blockers: string[] = [];
@@ -480,16 +404,24 @@ export function buildCandidate(input: CandidateBuildInput): Candidate {
   if (input.sentiment.available && input.sentiment.reason) {
     reason.push(input.sentiment.reason);
   }
-  if ((riskReward ?? 0) < 1.5) {
-    blockers.push(`Risk/reward is ${riskReward ?? 0}, below the preferred 1.5 threshold.`);
+  if ((riskReward ?? 0) < MIN_EXECUTION_RR) {
+    blockers.push(`Risk/reward is ${riskReward ?? 0}, below the execution threshold ${MIN_EXECUTION_RR}.`);
   } else if (riskReward) {
     reason.push(`Risk/reward is ${riskReward}, meeting the paper-trade threshold.`);
   }
-  if (spread.percent !== null && spread.percent > 0.12) {
+  if (spread.percent !== null && spread.percent > MAX_SCANNER_SPREAD_PERCENT) {
     blockers.push(`Spread is ${spread.percent}% which is too wide for the main list.`);
   }
   if (spread.percent === null) {
-    reason.push("Spread is unknown, so liquidity checks stay neutral instead of punitive.");
+    blockers.push("Spread is unavailable; scanner eligibility fails closed.");
+  }
+  if (input.volume.quoteVolume24h === null) {
+    blockers.push("24h quote volume is unavailable; scanner eligibility fails closed.");
+  } else if (input.volume.quoteVolume24h < MIN_RAW_QUOTE_VOLUME_24H) {
+    blockers.push(`24h quote volume is below the required ${MIN_RAW_QUOTE_VOLUME_24H}.`);
+  }
+  if (![fiveMinute, fifteenMinute, oneHour].every((snapshot) => snapshot.ema200Available)) {
+    blockers.push("EMA200 is unavailable: each timeframe requires 250 completed candles.");
   }
   if (![fiveMinute, fifteenMinute, oneHour].every((snapshot) => snapshot.isFresh)) {
     blockers.push("One or more Binance candle sets are stale.");
@@ -571,9 +503,25 @@ export function buildCandidate(input: CandidateBuildInput): Candidate {
     riskReward,
     reason,
     blockers,
-    chart: input.candles5m.slice(-60).map((candle) => ({
+    chart: completedCandles(input.candles5m, "5m", now).slice(-60).map((candle) => ({
       time: Math.floor(candle.openTime / 1000),
       value: roundPrice(candle.close),
     })),
+    candidateFingerprint: {
+      policyVersion: DECISION_PIPELINE_POLICY_VERSION,
+      symbol: input.symbol,
+      direction,
+      fiveMinuteSourceCloseTime: fiveMinute.sourceCandleCloseTime,
+      fifteenMinuteSourceCloseTime: fifteenMinute.sourceCandleCloseTime,
+      oneHourSourceCloseTime: oneHour.sourceCandleCloseTime,
+      value: [
+        DECISION_PIPELINE_POLICY_VERSION,
+        input.symbol,
+        direction,
+        fiveMinute.sourceCandleCloseTime,
+        fifteenMinute.sourceCandleCloseTime,
+        oneHour.sourceCandleCloseTime,
+      ].join(":"),
+    },
   };
 }

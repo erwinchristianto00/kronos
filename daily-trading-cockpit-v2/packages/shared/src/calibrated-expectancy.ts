@@ -87,7 +87,8 @@ export interface CalibratedExpectancyInput {
   selectedExitVariant: ShadowPositionVariant;
   symbol: string;
   direction: "LONG" | "SHORT";
-  routeMode: ProfitRouteMode;
+  /** Pre-route calibration must not invent a route-mode just to find evidence. */
+  routeMode?: ProfitRouteMode | null;
   selectionSource: "replay" | "heuristic_fallback";
   evidence: CalibrationEvidence;
 }
@@ -149,7 +150,7 @@ function resolveGroup(input: CalibratedExpectancyInput): Resolved | null {
   const symbolStat = evidence.symbols[symbol];
   const entryStat = evidence.entries[selectedEntryVariant];
   const exitStat = evidence.exits[selectedExitVariant];
-  const routeStat = evidence.routeModes[routeMode];
+  const routeStat = routeMode ? evidence.routeModes[routeMode] : undefined;
 
   const contextDiagnoses: CalibrationDiagnosisCode[] = [];
   for (const g of [combo, symbolCombo, symbolStat, entryStat, exitStat, routeStat]) {
@@ -168,37 +169,10 @@ function resolveGroup(input: CalibratedExpectancyInput): Resolved | null {
   if (symbolCombo && symbolCombo.count >= MIN_USABLE_SAMPLE) {
     return { group: symbolCombo, source: "symbol+combo", contextDiagnoses };
   }
-  // Else marginal entry+exit average (synthesize from entry & exit stats).
-  if (entryStat && exitStat) {
-    const sample = Math.min(entryStat.count, exitStat.count);
-    if (sample >= MIN_USABLE_SAMPLE) {
-      // Average the two marginal errors. This is a coarse proxy but better
-      // than nothing — the combo-level call is the preferred path.
-      const errA = entryStat.expectationError ?? 0;
-      const errB = exitStat.expectationError ?? 0;
-      const expA = entryStat.avgExpectedNetR ?? 0;
-      const expB = exitStat.avgExpectedNetR ?? 0;
-      const realA = entryStat.avgRealizedNetR ?? 0;
-      const realB = exitStat.avgRealizedNetR ?? 0;
-      const synth: CalibrationGroupStat = {
-        count: sample,
-        avgExpectedNetR: r4((expA + expB) / 2),
-        avgRealizedNetR: r4((realA + realB) / 2),
-        expectationError: r4((errA + errB) / 2),
-      };
-      return { group: synth, source: "entry+exit", contextDiagnoses };
-    }
-  }
-  // Else routeMode-level fallback.
-  if (routeStat && routeStat.count >= MIN_USABLE_SAMPLE) {
-    return { group: routeStat, source: "routeMode", contextDiagnoses };
-  }
-
   // Even with a tiny combo sample we still return it for low-confidence
   // diagnostic context, but the caller will not hard-downgrade on it.
   if (combo) return { group: combo, source: "combo", contextDiagnoses };
   if (symbolCombo) return { group: symbolCombo, source: "symbol+combo", contextDiagnoses };
-  if (routeStat) return { group: routeStat, source: "routeMode", contextDiagnoses };
   return null;
 }
 

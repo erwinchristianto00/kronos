@@ -21,9 +21,9 @@ function makeCandles({
   start = 100,
   step = 1,
   volumeBase = 1000,
-  count = 160,
+  count = 300,
   timeStepMs = 5 * 60 * 1000,
-  startTime = Date.UTC(2026, 4, 6, 0, 0, 0),
+  startTime,
 }: {
   start?: number;
   step?: number;
@@ -32,10 +32,14 @@ function makeCandles({
   timeStepMs?: number;
   startTime?: number;
 } = {}): Candle[] {
+  // All default fixtures finish at the same deterministic scan instant across
+  // timeframes.  That models a real snapshot and prevents future 1h candles
+  // from accidentally entering a 5m-timed test.
+  const seriesStart = startTime ?? Date.UTC(2026, 4, 6, 15, 0, 0) - (count - 1) * timeStepMs;
   return Array.from({ length: count }, (_, index) => {
     const close = start + index * step;
     return {
-      openTime: startTime + index * timeStepMs,
+      openTime: seriesStart + index * timeStepMs,
       open: close - step * 0.25,
       high: close + step * 0.5 + 1,
       low: close - step * 0.5 - 1,
@@ -112,6 +116,36 @@ describe("shared scanner rules", () => {
     expect(indicators.vwap).toBeGreaterThan(0);
   });
 
+  it("keeps every historical fingerprint component on the completed-candle cutoff", () => {
+    const candles = makeCandles({ count: 300 });
+    const active = candles.at(-1)!;
+    const now = active.openTime + 60_000; // the final 5m bar is still active
+    const baseline = calculateTimeframeIndicators(candles, "5m", now);
+    const withWildActiveBar = candles.map((candle, index) =>
+      index === candles.length - 1
+        ? { ...candle, high: candle.high * 10, low: candle.low * 0.1, close: candle.close * 5, volume: candle.volume * 100 }
+        : candle,
+    );
+    const observed = calculateTimeframeIndicators(withWildActiveBar, "5m", now);
+
+    expect(observed.ema200Available).toBe(true);
+    expect(observed.completedCandleCount).toBe(baseline.completedCandleCount);
+    expect(observed.sourceCandleCloseTime).toBe(baseline.sourceCandleCloseTime);
+    expect(observed.atr14).toBe(baseline.atr14);
+    expect(observed.vwap).toBe(baseline.vwap);
+    expect(observed.volumeRatio).toBe(baseline.volumeRatio);
+    expect(observed.recentHigh).toBe(baseline.recentHigh);
+    expect(observed.recentLow).toBe(baseline.recentLow);
+  });
+
+  it("fails EMA200 availability closed when fewer than 250 completed candles exist", () => {
+    const candles = makeCandles({ count: 249 });
+    const now = candles.at(-1)!.openTime + 5 * 60_000;
+    const indicators = calculateTimeframeIndicators(candles, "5m", now);
+    expect(indicators.ema200).toBeNull();
+    expect(indicators.ema200Available).toBe(false);
+  });
+
   it("builds fibonacci levels in order", () => {
     const fib = calculateFibonacciLevels(makeCandles({ start: 100, step: 2, count: 120, timeStepMs: 60 * 60 * 1000 }));
 
@@ -136,7 +170,7 @@ describe("shared scanner rules", () => {
     expect(chooseDirection(58, 55)).toBe("NEUTRAL");
   });
 
-  it("raises danger for stale low quality setups", () => {
+  it("keeps stale and market-data failures out of structural danger", () => {
     const staleNow = Date.UTC(2026, 4, 7, 0, 0, 0);
     const indicators = {
       fiveMinute: calculateTimeframeIndicators(makeCandles({ startTime: Date.UTC(2026, 4, 5, 0, 0, 0) }), "5m", staleNow),
@@ -157,7 +191,7 @@ describe("shared scanner rules", () => {
       oneHourTrendConflict: true,
     });
 
-    expect(danger).toBeGreaterThan(75);
+    expect(danger).toBeLessThan(75);
   });
 
   it("applies classification rules", () => {
@@ -213,9 +247,9 @@ describe("shared scanner rules", () => {
     ) =>
       buildCandidate({
         symbol,
-        candles5m: makeCandles({ step, count: 160 }),
-        candles15m: makeCandles({ step, count: 160, timeStepMs: 15 * 60 * 1000 }),
-        candles1h: makeCandles({ step, count: 160, timeStepMs: 60 * 60 * 1000 }),
+        candles5m: makeCandles({ step, count: 300 }),
+        candles15m: makeCandles({ step, count: 300, timeStepMs: 15 * 60 * 1000 }),
+        candles1h: makeCandles({ step, count: 300, timeStepMs: 60 * 60 * 1000 }),
         spread: { bid: 100, ask: 100 + spreadPercent / 100, absolute: spreadPercent / 100, percent: spreadPercent },
         volume: { quoteVolume24h, baseVolume24h: 3_000_000, volumeRatio5m },
         kronos: {
@@ -274,7 +308,7 @@ describe("shared scanner rules", () => {
     expect(withUnavailableNonZero.opportunityScore).toBe(base.opportunityScore);
   });
 
-  it("real Kronos response affects score", () => {
+  it("real Kronos response affects confidence, not structural opportunity", () => {
     const withoutKronos = buildCandidate({
       symbol: "BTCUSDT",
       candles5m: makeCandles({ step: 2 }),
@@ -308,11 +342,12 @@ describe("shared scanner rules", () => {
       now: Date.UTC(2026, 4, 6, 15, 0, 0),
     });
 
-    expect(withKronos.opportunityScore).not.toBe(withoutKronos.opportunityScore);
+    expect(withKronos.opportunityScore).toBe(withoutKronos.opportunityScore);
+    expect(withKronos.confidence).toBe(withoutKronos.confidence);
     expect(withKronos.kronosBias).not.toBe("UNAVAILABLE");
   });
 
-  it("real whale signal affects score", () => {
+  it("real whale signal affects confidence, not structural opportunity", () => {
     const base = buildCandidate({
       symbol: "BTCUSDT",
       candles5m: makeCandles({ step: 1.2 }),
@@ -338,11 +373,12 @@ describe("shared scanner rules", () => {
       now: Date.UTC(2026, 4, 6, 15, 0, 0),
     });
 
-    expect(withWhale.opportunityScore).not.toBe(base.opportunityScore);
+    expect(withWhale.opportunityScore).toBe(base.opportunityScore);
+    expect(withWhale.confidence).toBe(base.confidence);
     expect(withWhale.whale.signal).toBe("BULLISH");
   });
 
-  it("whale directional boost helps the aligned side only", () => {
+  it("whale disagreement does not double-count as structural danger", () => {
     const candles5m = makeCandles({ step: 1.2 });
     const candles15m = makeCandles({ step: 1.2, timeStepMs: 15 * 60 * 1000 });
     const candles1h = makeCandles({ step: 1.2, timeStepMs: 60 * 60 * 1000 });
@@ -375,10 +411,10 @@ describe("shared scanner rules", () => {
       oneHourTrendConflict: false,
     });
 
-    expect(conflictingDanger).toBeGreaterThan(alignedDanger);
+    expect(conflictingDanger).toBe(alignedDanger);
   });
 
-  it("real sentiment signal affects score", () => {
+  it("real sentiment signal affects confidence, not structural opportunity", () => {
     const base = buildCandidate({
       symbol: "BTCUSDT",
       candles5m: makeCandles({ step: 1.2 }),
@@ -404,11 +440,12 @@ describe("shared scanner rules", () => {
       now: Date.UTC(2026, 4, 6, 15, 0, 0),
     });
 
-    expect(withSentiment.opportunityScore).not.toBe(base.opportunityScore);
+    expect(withSentiment.opportunityScore).toBe(base.opportunityScore);
+    expect(withSentiment.confidence).toBe(base.confidence);
     expect(withSentiment.sentiment.signal).toBe("BULLISH");
   });
 
-  it("feargreed active affects market sentiment lightly", () => {
+  it("market sentiment affects confidence lightly, not structural opportunity", () => {
     const base = buildCandidate({
       symbol: "BTCUSDT",
       candles5m: makeCandles({ step: 1.2 }),
@@ -434,8 +471,8 @@ describe("shared scanner rules", () => {
       now: Date.UTC(2026, 4, 6, 15, 0, 0),
     });
 
-    expect(withFearGreed.opportunityScore).not.toBe(base.opportunityScore);
-    expect(Math.abs(withFearGreed.opportunityScore - base.opportunityScore)).toBeLessThan(8);
+    expect(withFearGreed.opportunityScore).toBe(base.opportunityScore);
+    expect(Math.abs(withFearGreed.confidence - base.confidence)).toBeLessThan(8);
     expect(withFearGreed.sentiment.scope).toBe("MARKET");
   });
 
@@ -682,7 +719,7 @@ describe("shared scanner rules", () => {
     expect(candidate.status).toBe(statusBefore);
   });
 
-  it("routes negative net replay evidence as research only", () => {
+  it("does not substitute a different replay combo for the heuristic selection", () => {
     const candidate = {
       ...buildCandidate({
         symbol: "BTCUSDT",
@@ -733,9 +770,10 @@ describe("shared scanner rules", () => {
 
     const selection = buildVariantSelection(candidate, perf);
 
-    expect(selection.expectedNetR).toBeLessThan(0);
-    expect(selection.netEdgeAfterCost).toBe(selection.expectedNetR);
-    expect(selection.routeMode).toBe("RESEARCH_ONLY");
+    expect(selection.expectedNetR).toBeNull();
+    expect(selection.netEdgeAfterCost).toBeNull();
+    expect(selection.routeMode).toBe("DATA_COLLECTION");
+    expect(selection.routeReasonCodes).toContain("NO_EVIDENCE");
   });
 
   it("keeps costR diagnostic separate from net R so costs are not double counted", () => {
@@ -907,7 +945,7 @@ describe("shared scanner rules", () => {
     expect(plan.noChaseWarning).not.toBeNull();
   });
 
-  it("allows runner when Kronos and whale support continuation", () => {
+  it("does not let external support manufacture runner eligibility", () => {
     const candidate = {
       ...buildCandidate({
       symbol: "BTCUSDT",
@@ -950,8 +988,7 @@ describe("shared scanner rules", () => {
     };
     const plan = buildTradePlan(candidate);
 
-    expect(plan.runnerAllowed).toBe(true);
-    expect(["TP1_PARTIAL_RUNNER", "TRAIL_AFTER_TP1"]).toContain(plan.exitMode);
+    expect(plan.runnerAllowed).toBe(false);
   });
 
   it("uses fast or conflict exit when Kronos or whale conflicts", () => {

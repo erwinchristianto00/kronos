@@ -5,6 +5,16 @@ import { checkDirectionInvariants } from "../src/lib/four-brain-invariants.js";
 import { directionInput, src } from "./four-brain-fixtures.js";
 
 describe("Direction Brain", () => {
+  it("treats challenger forecasts as advisory votes and leaves legacy scoring unchanged when absent", () => {
+    const base = directionInput({ longEdge: src(null), shortEdge: src(null), longLaneEdge: src(null), shortLaneEdge: src(null) });
+    const legacy = decideDirection(base);
+    const absent = decideDirection({ ...base, chronos2Agree: src(null), timesfmAgree: src(null) });
+    const supported = decideDirection({ ...base, chronos2Agree: src(1), timesfmAgree: src(1) });
+    expect(absent.longScore).toBeCloseTo(legacy.longScore, 10);
+    expect(supported.longScore).toBeGreaterThan(legacy.longScore);
+    expect(supported.shortScore).toBeCloseTo(legacy.shortScore, 10);
+  });
+
   it("FLAT defeats weak long AND weak short scores (FLAT is a real baseline)", () => {
     const d = decideDirection(directionInput({ longEdge: src(null), shortEdge: src(null), longLaneEdge: src(null), shortLaneEdge: src(null), transitionRisk: 0.3 }));
     expect(d.action).toBe("FLAT");

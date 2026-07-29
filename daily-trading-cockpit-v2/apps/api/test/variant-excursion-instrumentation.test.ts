@@ -51,11 +51,15 @@ function makeCandles({
 }
 
 function baseCandidate(overrides: Partial<Candidate> = {}): Candidate {
+  const now = Date.UTC(2026, 4, 6, 15, 0, 0);
+  const completedStart = (timeStepMs: number) => now - 160 * timeStepMs;
   const candidate = buildCandidate({
     symbol: "BTCUSDT",
-    candles5m: makeCandles({ start: 95, step: 0.2 }),
-    candles15m: makeCandles({ start: 95, step: 0.2, timeStepMs: 15 * 60 * 1000 }),
-    candles1h: makeCandles({ start: 95, step: 0.2, timeStepMs: 60 * 60 * 1000 }),
+    // Every bar must have closed at the decision timestamp. The old fixture
+    // put most 1h bars in the future and implicitly depended on lookahead.
+    candles5m: makeCandles({ start: 95, step: 0.2, startTime: completedStart(5 * 60 * 1000) }),
+    candles15m: makeCandles({ start: 95, step: 0.2, timeStepMs: 15 * 60 * 1000, startTime: completedStart(15 * 60 * 1000) }),
+    candles1h: makeCandles({ start: 95, step: 0.2, timeStepMs: 60 * 60 * 1000, startTime: completedStart(60 * 60 * 1000) }),
     spread: { bid: 100, ask: 100.02, absolute: 0.02, percent: 0.02 },
     volume: { quoteVolume24h: 150_000_000, baseVolume24h: 2_000_000, volumeRatio5m: 1.4 },
     kronos: {
@@ -75,7 +79,7 @@ function baseCandidate(overrides: Partial<Candidate> = {}): Candidate {
     },
     whale: { available: true, signal: "BULLISH", score: 75, reason: "aligned" },
     sentiment: { available: false, signal: "UNAVAILABLE", score: 0, source: "none" },
-    now: Date.UTC(2026, 4, 6, 15, 0, 0),
+    now,
   });
   return {
     ...candidate,

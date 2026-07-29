@@ -86,6 +86,9 @@ export interface DirectionInput {
 
   /** Optional confirmations: −1..+1 directional agreement. Often MISSING (kronos ~55%). */
   kronosAgree?: TaggedSource;
+  /** Independent CPU challenger forecasts. Advisory only; missing means no opinion, never neutral. */
+  chronos2Agree?: TaggedSource;
+  timesfmAgree?: TaggedSource;
   crowdingAlignLong?: TaggedSource; // −1..+1, aligned to LONG (short = −this)
 
   ttls?: Partial<Record<DirectionSourceKey, number>>;
@@ -93,7 +96,8 @@ export interface DirectionInput {
 }
 
 export type DirectionSourceKey =
-  | "longEdge" | "shortEdge" | "conviction" | "longLaneEdge" | "shortLaneEdge" | "kronosAgree" | "crowdingAlignLong";
+  | "longEdge" | "shortEdge" | "conviction" | "longLaneEdge" | "shortLaneEdge"
+  | "kronosAgree" | "chronos2Agree" | "timesfmAgree" | "crowdingAlignLong";
 
 const DEFAULT_TTL: Record<DirectionSourceKey, number> = {
   longEdge: 24 * 60 * 60_000, // edge-memory refreshes on closes; slow
@@ -102,6 +106,8 @@ const DEFAULT_TTL: Record<DirectionSourceKey, number> = {
   longLaneEdge: 24 * 60 * 60_000,
   shortLaneEdge: 24 * 60 * 60_000,
   kronosAgree: 15 * 60_000,
+  chronos2Agree: 20 * 60_000,
+  timesfmAgree: 20 * 60_000,
   crowdingAlignLong: 15 * 60_000,
 };
 
@@ -146,7 +152,14 @@ export function decideDirection(input: DirectionInput): DirectionDecision {
   const longLaneEdge = fresh("longLaneEdge");
   const shortLaneEdge = fresh("shortLaneEdge");
   const kronos = fresh("kronosAgree");
+  const chronos2 = fresh("chronos2Agree");
+  const timesfm = fresh("timesfmAgree");
   const crowdLong = fresh("crowdingAlignLong");
+
+  // Challenger models get a deliberately smaller contribution than Kronos. They are new
+  // on this venue and have no authority to reverse a proven incumbent edge by themselves.
+  const challengerLong = (value: number): number => clamp01(0.5 + 0.25 * value);
+  const challengerShort = (value: number): number => clamp01(0.5 - 0.25 * value);
 
   const supporting: string[] = [];
   const conflicting: string[] = [];
@@ -176,6 +189,8 @@ export function decideDirection(input: DirectionInput): DirectionDecision {
     if (longLaneEdge !== null) parts.push(edgeSub(longLaneEdge));
     if (conviction !== null && input.controllerBias === "LONG") parts.push(clamp01(conviction));
     if (kronos !== null) parts.push(clamp01((kronos + 1) / 2)); // −1..1 → 0..1, only the long-agreeing part
+    if (chronos2 !== null) parts.push(challengerLong(chronos2));
+    if (timesfm !== null) parts.push(challengerLong(timesfm));
     if (crowdLong !== null) parts.push(clamp01((crowdLong + 1) / 2));
     longScore = parts.length ? parts.reduce((a, b) => a + b, 0) / parts.length : 0;
     if (input.marketBias === "BULLISH") longScore = clamp01(longScore + 0.05); // SOFT nudge only
@@ -208,6 +223,8 @@ export function decideDirection(input: DirectionInput): DirectionDecision {
     if (shortLaneEdge !== null) parts.push(edgeSub(shortLaneEdge));
     if (conviction !== null && input.controllerBias === "SHORT") parts.push(clamp01(conviction));
     if (kronos !== null) parts.push(clamp01((-kronos + 1) / 2)); // short-agreeing part
+    if (chronos2 !== null) parts.push(challengerShort(chronos2));
+    if (timesfm !== null) parts.push(challengerShort(timesfm));
     if (crowdLong !== null) parts.push(clamp01((-crowdLong + 1) / 2));
     shortScore = parts.length ? parts.reduce((a, b) => a + b, 0) / parts.length : 0;
     if (input.marketBias === "BEARISH") shortScore = clamp01(shortScore + 0.05);
@@ -368,7 +385,13 @@ export function decideDirection(input: DirectionInput): DirectionDecision {
   const scores = [longScore, shortScore, flatScore].sort((a, b) => b - a);
   const separation = scores[0]! - scores[1]!;
   const freshCount = Object.values(st).filter((s) => s === "FRESH").length;
-  let confidence = clamp01(0.5 * separation + 0.5 * (freshCount / Object.keys(DEFAULT_TTL).length));
+  // An unavailable challenger is not adverse evidence and must not lower the
+  // legacy model's confidence merely because the feature was added. It enters
+  // coverage only once it supplies a fresh directional opinion.
+  const activeSourceCount = Object.keys(DEFAULT_TTL).length
+    - (chronos2 === null ? 1 : 0)
+    - (timesfm === null ? 1 : 0);
+  let confidence = clamp01(0.5 * separation + 0.5 * (freshCount / activeSourceCount));
   if (conflicting.length > 0) confidence *= 0.8; // conflicting signals reduce confidence
   confidence = clamp01(confidence);
 

@@ -62,6 +62,8 @@ export interface ProfitRouteInput {
   selectionSource: "replay" | "heuristic_fallback";
   /** Calibration-adjusted expectancy; when provided, routing prefers this over `expectedNetR`. */
   calibratedExpectedNetR?: number | null;
+  /** Only conservative, direct-combo evidence has routing authority. */
+  canonicalRoutingNetR?: number | null;
   calibrationVerdict?:
     | "RAW_EDGE_NOT_VALIDATED"
     | "CALIBRATED_POSITIVE"
@@ -82,6 +84,7 @@ export interface ProfitRouteInput {
 export interface ProfitRouteDecision {
   routeMode: ProfitRouteMode;
   routeScore: number;
+  routeDiagnosticScore: number;
   routeReasonCodes: ProfitRouteReasonCode[];
   routeExplanation: string;
   primaryProfitEligible: boolean;
@@ -139,7 +142,9 @@ export function computeProfitRoute(input: ProfitRouteInput): ProfitRouteDecision
   let score = 0;
   const explanationParts: string[] = [];
 
-  const net = input.expectedNetR;
+  // New planner calls always provide canonicalRoutingNetR.  Keep the legacy
+  // argument behavior for historical/audit callers that predate this field.
+  const net = input.canonicalRoutingNetR === undefined ? input.expectedNetR : input.canonicalRoutingNetR;
   if (net === null) {
     codes.push("NO_EVIDENCE");
     score -= 10;
@@ -158,7 +163,12 @@ export function computeProfitRoute(input: ProfitRouteInput): ProfitRouteDecision
     score -= 15;
   }
 
-  const replayNegative = allReplayVariantsNegative(input.allReplayCombosForVariant);
+  // Aggregated replay rows are diagnostic only. They must not classify a
+  // different selected combo as toxic or profitable.
+  const replayNegative =
+    input.variantCombo !== null &&
+    input.variantCombo.resolved >= TOXIC_VARIANT_MIN_RESOLVED &&
+    (input.variantCombo.netAvgR ?? Number.POSITIVE_INFINITY) < 0;
   if (replayNegative) {
     codes.push("ALL_REPLAY_VARIANTS_NEGATIVE");
     score -= 25;
@@ -190,7 +200,11 @@ export function computeProfitRoute(input: ProfitRouteInput): ProfitRouteDecision
     score -= 10;
   }
 
-  const toxic = isToxicVariant(input.selectedEntryVariant);
+  const toxic =
+    isToxicVariant(input.selectedEntryVariant) &&
+    input.variantCombo !== null &&
+    input.variantCombo.resolved >= TOXIC_VARIANT_MIN_RESOLVED &&
+    (input.variantCombo.netAvgR ?? Number.POSITIVE_INFINITY) <= -TOXIC_VARIANT_MIN_NET_R;
   let toxicOverridden = false;
   if (toxic) {
     // Override requires stronger symbol evidence than generic symbolPositive:
@@ -347,6 +361,14 @@ export function computeProfitRoute(input: ProfitRouteInput): ProfitRouteDecision
     }
   }
 
+  // A profit route needs observed cost/stop geometry. Missing values are not
+  // zero-cost evidence and may continue only as data collection.
+  if (routeMode === "PROFIT_CANDIDATE" && input.canonicalRoutingNetR !== undefined && (input.cost.costR === null || input.cost.stopDistanceBps === null)) {
+    codes.push("NO_EVIDENCE");
+    routeMode = "DATA_COLLECTION";
+    dataCollectionReason = "Required cost or stop-geometry evidence is unavailable.";
+  }
+
   // ULTRA-TIGHT STOP CREDIBILITY GUARD
   // stopDistanceBps < 100: POST_CALIBRATION evidence shows 0% win rate, -1.66R avg net R,
   // and inflated projected RR driven by tight-stop denominator, not genuine upside.
@@ -403,6 +425,7 @@ export function computeProfitRoute(input: ProfitRouteInput): ProfitRouteDecision
   return {
     routeMode,
     routeScore: Math.round(score * 100) / 100,
+    routeDiagnosticScore: Math.round(score * 100) / 100,
     routeReasonCodes: codes,
     routeExplanation,
     primaryProfitEligible,

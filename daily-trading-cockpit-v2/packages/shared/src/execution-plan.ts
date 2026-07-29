@@ -21,6 +21,7 @@ import {
   CURRENT_DECISION_POLICY_VERSION,
   CURRENT_EVIDENCE_ERA,
 } from "./evidence-era.js";
+import { EVIDENCE_POLICY_VERSION, EXECUTION_POLICY_VERSION } from "./policy-versions.js";
 
 function clamp(value: number, min: number, max: number) {
   return Math.min(Math.max(value, min), max);
@@ -113,7 +114,10 @@ function costDiagnostics(candidate: Candidate, entryPrice: number | null, perf: 
     return { costR: null, spreadR: null, feeSlippageR: null, stopDistanceBps: null };
   }
   const feeSlippagePct = (perf?.executionCost.roundTripCostBps ?? 28) / 100;
-  const spreadPct = candidate.spread.percent ?? 0;
+  const spreadPct = candidate.spread.percent;
+  if (spreadPct === null || !Number.isFinite(spreadPct) || spreadPct < 0) {
+    return { costR: null, spreadR: null, feeSlippageR: null, stopDistanceBps: null };
+  }
   const feeSlippageR = round(feeSlippagePct / riskPct, 2);
   const spreadR = round(spreadPct / riskPct, 2);
   return {
@@ -406,31 +410,30 @@ export function buildVariantSelection(
   perf: PerformanceStats | null,
   calibration: CalibrationEvidence | null = null,
 ): VariantSelectionSnapshot {
-  const replayCombos = replayCombinationCandidates(candidate, perf)
-    .map((combo) => ({ combo, score: replayCombinationScore(candidate, combo) }))
-    .sort((left, right) => right.score - left.score);
-  const positiveReplayChoice = replayCombos.find(({ combo }) => combo.sampleTier !== "early" && combo.resolved >= 30 && (combo.netAvgR ?? Number.NEGATIVE_INFINITY) > 0)?.combo ?? null;
-  const replayChoice = positiveReplayChoice ?? replayCombos[0]?.combo ?? null;
-  const useReplay = positiveReplayChoice !== null;
+  // Historical/mixed performance is retained for audit only. New decisions
+  // require an explicit post-fix cohort before any replay statistic can affect
+  // geometry selection, expected R, calibration, or routing.
+  const performanceEligible =
+    perf?.evidenceEra === CURRENT_EVIDENCE_ERA &&
+    perf.evidencePolicyVersion === EVIDENCE_POLICY_VERSION;
+  const decisionPerf = performanceEligible ? perf : null;
   const chaseRiskUpFront = computeChaseRisk(candidate);
-  const entry = chooseEntryVariant(candidate, perf, chaseRiskUpFront);
-  const exit = chooseExitVariant(candidate, perf, chaseRiskUpFront);
+  const entry = chooseEntryVariant(candidate, decisionPerf, chaseRiskUpFront);
+  const exit = chooseExitVariant(candidate, decisionPerf, chaseRiskUpFront);
   const entryStats = entry.stats;
   const exitStats = exit.stats;
-  const selectedEntryVariant = useReplay ? replayChoice.entryVariant : entry.key;
-  const selectedExitVariant = useReplay ? replayChoice.exitVariant : exit.key;
-  const expectedGrossR = useReplay
-    ? replayChoice.grossAvgR
-    : (entryStats?.avgGrossRResult !== null || exitStats?.avgGrossRResult !== null
-      ? round((((entryStats?.avgGrossRResult ?? 0) * sampleWeight(entryStats)) + ((exitStats?.avgGrossRResult ?? 0) * sampleWeight(exitStats))) / Math.max(sampleWeight(entryStats) + sampleWeight(exitStats), 0.0001), 2)
-      : null);
-  const expectedNetR = useReplay
-    ? replayChoice.netAvgR
-    : (entryStats?.avgNetRResult !== null || exitStats?.avgNetRResult !== null
-      ? round((((entryStats?.avgNetRResult ?? 0) * sampleWeight(entryStats)) + ((exitStats?.avgNetRResult ?? 0) * sampleWeight(exitStats))) / Math.max(sampleWeight(entryStats) + sampleWeight(exitStats), 0.0001), 2)
-      : null);
-  const sampleSize = useReplay ? replayChoice.filled : Math.max(entryStats?.resolved ?? 0, exitStats?.resolved ?? 0);
-  const tier = useReplay ? replayChoice.sampleTier : toTier(sampleSize);
+  // Geometry selection is heuristic and current-context only. Historical combo
+  // evidence evaluates this exact choice; it must never choose the geometry.
+  const selectedEntryVariant = entry.key;
+  const selectedExitVariant = exit.key;
+  const directCombo = replayCombinationCandidates(candidate, decisionPerf).find(
+    (combo) => combo.entryVariant === selectedEntryVariant && combo.exitVariant === selectedExitVariant,
+  ) ?? null;
+  const hasDirectEvidence = directCombo !== null && directCombo.resolved > 0 && Number.isFinite(directCombo.netAvgR);
+  const expectedGrossR = hasDirectEvidence ? directCombo.grossAvgR : null;
+  const expectedNetR = hasDirectEvidence ? directCombo.netAvgR : null;
+  const sampleSize = hasDirectEvidence ? directCombo.resolved : 0;
+  const tier = hasDirectEvidence ? directCombo.sampleTier : "early";
   const anchor =
     selectedEntryVariant === "base_current_entry"
       ? candidate.indicators.fiveMinute.latestClose
@@ -445,17 +448,21 @@ export function buildVariantSelection(
               : selectedEntryVariant === "ema20_pullback_entry"
                 ? candidate.indicators.fiveMinute.ema20
                 : entryMid(candidate);
-  const costs = costDiagnostics(candidate, anchor, perf);
+  // Cost assumptions are part of the evidence contract too. A mixed legacy
+  // performance record may remain visible in the UI, but must not influence a
+  // post-fix decision; use the canonical configured fallback until a homogeneous
+  // post-fix cohort exists.
+  const costs = costDiagnostics(candidate, anchor, decisionPerf);
   const precision = entryPrecision(candidate, anchor);
   const exitDetails = exitPrecision(candidate, selectedExitVariant);
   const structurallyBadCost = (costs.costR ?? 0) >= 0.45;
   const netEdgeAfterCost = expectedNetR;
 
-  const symbolStat = (perf?.windows["1h"].bySymbol ?? []).find((s) => s.symbol === candidate.symbol) ?? null;
+  const symbolStat = (decisionPerf?.windows["1h"].bySymbol ?? []).find((s) => s.symbol === candidate.symbol) ?? null;
   const sideKey: "LONG" | "SHORT" =
     candidate.finalDirection === "SHORT" ? "SHORT" : "LONG";
-  const sideStat = perf?.windows["1h"].byDirection?.[sideKey] ?? null;
-  const allReplayCombosForVariant = (perf?.windows["1h"].variantCombinations ?? []).filter(
+  const sideStat = decisionPerf?.windows["1h"].byDirection?.[sideKey] ?? null;
+  const allReplayCombosForVariant = (decisionPerf?.windows["1h"].variantCombinations ?? []).filter(
     (combo) => combo.entryVariant === selectedEntryVariant,
   );
   const whaleAgrees =
@@ -475,12 +482,13 @@ export function buildVariantSelection(
     selectedExitVariant,
     symbol: candidate.symbol,
     direction: sideKey,
-    // We pass a "raw" routeMode at this point — the calibration helper just
-    // uses it to look up routeMode-level evidence, not to decide routing.
-    routeMode: "DATA_COLLECTION",
-    selectionSource: useReplay ? "replay" : "heuristic_fallback",
+    selectionSource: "heuristic_fallback",
     evidence: calibrationEvidence,
   });
+  const conservativeNetR =
+    hasDirectEvidence && sampleSize >= 30 && expectedNetR !== null
+      ? calibrationResult.calibratedExpectedNetR ?? expectedNetR
+      : null;
 
   const routeDecision = computeProfitRoute({
     symbol: candidate.symbol,
@@ -494,9 +502,9 @@ export function buildVariantSelection(
       ? { symbol: symbolStat.symbol, netAvgR: symbolStat.avgNetRResult, resolved: symbolStat.resolved }
       : null,
     sideStats: sideStat
-      ? { side: sideKey, netAvgR: sideStat.avgRResult, resolved: sideStat.resolved }
+      ? { side: sideKey, netAvgR: sideStat.avgNetRResult, resolved: sideStat.resolved }
       : null,
-    variantCombo: useReplay ? replayChoice : null,
+    variantCombo: hasDirectEvidence ? directCombo : null,
     allReplayCombosForVariant,
     entryVariantStats: entryStats,
     exitVariantStats: exitStats,
@@ -517,10 +525,11 @@ export function buildVariantSelection(
       feeSlippageR: costs.feeSlippageR,
       stopDistanceBps: costs.stopDistanceBps,
     },
-    profitableTp1Rate: useReplay && replayChoice.resolved > 0 ? replayChoice.profitableTp1 / replayChoice.resolved : null,
-    runnerSuccessRate: useReplay ? replayChoice.runnerSuccessRate : null,
-    selectionSource: useReplay ? "replay" : "heuristic_fallback",
+    profitableTp1Rate: hasDirectEvidence && directCombo.resolved > 0 ? directCombo.profitableTp1 / directCombo.resolved : null,
+    runnerSuccessRate: hasDirectEvidence ? directCombo.runnerSuccessRate : null,
+    selectionSource: "heuristic_fallback",
     calibratedExpectedNetR: calibrationResult.calibratedExpectedNetR,
+    canonicalRoutingNetR: conservativeNetR,
     calibrationVerdict: calibrationResult.calibrationVerdict,
     calibrationSampleSize: calibrationResult.calibrationSampleSize,
     calibrationDiagnosisCodes: calibrationResult.calibrationDiagnosisCodes,
@@ -540,8 +549,8 @@ export function buildVariantSelection(
       expectedGrossR,
       variantConfidenceTier: tier,
       symbolStats: symbolStat ? { symbol: symbolStat.symbol, netAvgR: symbolStat.avgNetRResult, resolved: symbolStat.resolved } : null,
-      sideStats: sideStat ? { side: sideKey, netAvgR: sideStat.avgRResult, resolved: sideStat.resolved } : null,
-      variantCombo: useReplay ? replayChoice : null,
+      sideStats: sideStat ? { side: sideKey, netAvgR: sideStat.avgNetRResult, resolved: sideStat.resolved } : null,
+      variantCombo: hasDirectEvidence ? directCombo : null,
       allReplayCombosForVariant,
       entryVariantStats: entryStats,
       exitVariantStats: exitStats,
@@ -553,17 +562,15 @@ export function buildVariantSelection(
       },
       whale: { available: candidate.whale.available, agrees: whaleAgrees, disagrees: whaleDisagrees },
       cost: { costR: costs.costR, spreadR: costs.spreadR, feeSlippageR: costs.feeSlippageR, stopDistanceBps: costs.stopDistanceBps },
-      profitableTp1Rate: useReplay && replayChoice.resolved > 0 ? replayChoice.profitableTp1 / replayChoice.resolved : null,
-      runnerSuccessRate: useReplay ? replayChoice.runnerSuccessRate : null,
-      selectionSource: useReplay ? "replay" : "heuristic_fallback",
+      profitableTp1Rate: hasDirectEvidence && directCombo.resolved > 0 ? directCombo.profitableTp1 / directCombo.resolved : null,
+      runnerSuccessRate: hasDirectEvidence ? directCombo.runnerSuccessRate : null,
+      selectionSource: "heuristic_fallback",
     },
     routeDecision,
   );
   const reason = [
-    useReplay
-      ? `${selectedEntryVariant} + ${selectedExitVariant} selected from replay-backed 1h path performance.`
-      : `${entry.label} and ${exit.label} selected from geometry plus heuristic variant evidence.`,
-    expectedNetR !== null ? `expected net R ${expectedNetR.toFixed(2)} with ${sampleSize} ${useReplay ? "filled replay" : "resolved"} samples.` : `variant evidence is ${tier}, so keep this paper/shadow only.`,
+    `${entry.label} and ${exit.label} selected from geometry plus heuristic variant evidence.`,
+    expectedNetR !== null ? `direct selected-combo net R ${expectedNetR.toFixed(2)} with ${sampleSize} resolved samples.` : `no direct evidence exists for the selected combo, so keep this paper/shadow only.`,
     structurallyBadCost ? `cost drag is high at ${(costs.costR ?? 0).toFixed(2)}R because stop distance is only ${(costs.stopDistanceBps ?? 0).toFixed(2)}bps; cost is diagnostic because expected net R already includes execution cost.` : `cost drag ${(costs.costR ?? 0).toFixed(2)}R is included in net edge.`,
   ].join(" ");
 
@@ -573,9 +580,9 @@ export function buildVariantSelection(
     expectedGrossR,
     expectedNetR,
     netEdgeAfterCost,
-    profitFactor: useReplay ? replayChoice.profitFactor : (exitStats?.profitFactor ?? entryStats?.profitFactor ?? null),
-    fillRate: useReplay && replayChoice.attempted > 0 ? round((replayChoice.filled / replayChoice.attempted) * 100, 2) : null,
-    noFillRate: useReplay && replayChoice.attempted > 0 ? round((replayChoice.noFill / replayChoice.attempted) * 100, 2) : null,
+    profitFactor: hasDirectEvidence ? directCombo.profitFactor : null,
+    fillRate: hasDirectEvidence && directCombo.attempted > 0 ? round((directCombo.filled / directCombo.attempted) * 100, 2) : null,
+    noFillRate: hasDirectEvidence && directCombo.attempted > 0 ? round((directCombo.noFill / directCombo.attempted) * 100, 2) : null,
     costR: costs.costR,
     spreadR: costs.spreadR,
     feeSlippageR: costs.feeSlippageR,
@@ -584,6 +591,7 @@ export function buildVariantSelection(
     variantConfidenceTier: tier,
     routeMode,
     routeScore: routeDecision.routeScore,
+    routeDiagnosticScore: routeDecision.routeDiagnosticScore,
     routeReasonCodes: routeDecision.routeReasonCodes,
     routeExplanation: routeDecision.routeExplanation,
     primaryProfitEligible: routeDecision.primaryProfitEligible,
@@ -592,6 +600,9 @@ export function buildVariantSelection(
     diagnostics,
     rawExpectedNetR: calibrationResult.rawExpectedNetR,
     calibratedExpectedNetR: calibrationResult.calibratedExpectedNetR,
+    conservativeNetR,
+    canonicalRoutingNetR: conservativeNetR,
+    heuristicSelectionScore: round(entry.score + exit.score, 2),
     calibrationPenaltyR: calibrationResult.calibrationPenaltyR,
     calibrationConfidence: calibrationResult.calibrationConfidence,
     calibrationSampleSize: calibrationResult.calibrationSampleSize,
@@ -601,8 +612,10 @@ export function buildVariantSelection(
     calibrationExplanation: calibrationResult.calibrationExplanation,
     evidenceEra: CURRENT_EVIDENCE_ERA,
     decisionPolicyVersion: CURRENT_DECISION_POLICY_VERSION,
-    selectionSource: useReplay ? "replay" : "heuristic_fallback",
-    costAssumption: `1h replay uses ${perf ? `${perf.executionCost.roundTripCostBps}bps round-trip` : "configured round-trip costs"}${candidate.spread.percent !== null ? ` + ${candidate.spread.percent.toFixed(4)}% spread` : ""}`,
+    executionPolicyVersion: EXECUTION_POLICY_VERSION,
+    evidencePolicyVersion: EVIDENCE_POLICY_VERSION,
+    selectionSource: "heuristic_fallback",
+    costAssumption: `1h replay uses ${decisionPerf ? `${decisionPerf.executionCost.roundTripCostBps}bps round-trip` : "configured round-trip costs"}${candidate.spread.percent !== null ? ` + ${candidate.spread.percent.toFixed(4)}% spread` : ""}`,
     selectionReason: reason,
     entryDriftPct: precision.driftPct,
     entryDriftAtr: precision.driftAtr,

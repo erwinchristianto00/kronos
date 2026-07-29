@@ -7,7 +7,7 @@ import {
 
 const NOW = Date.UTC(2026, 6, 17, 12, 0, 0);
 
-function candles(intervalMs: number, slope: number, count = 220, volumeAt?: (i: number) => number): Candle[] {
+function candles(intervalMs: number, slope: number, count = 260, volumeAt?: (i: number) => number): Candle[] {
   const start = NOW - (count - 1) * intervalMs;
   return Array.from({ length: count }, (_, i) => {
     const base = 200 + i * slope;
@@ -27,22 +27,32 @@ function candles(intervalMs: number, slope: number, count = 220, volumeAt?: (i: 
 }
 
 describe("single-symbol price timeline", () => {
-  it("produces a causal bullish directive and upward forecast from aligned 5m/1h inputs", () => {
+  it("keeps an upward forecast but waits rather than chasing a completed-candle top", () => {
     const state = buildSingleSymbolPriceTimelineState("BTCUSDT", { m5: candles(5 * 60_000, 0.14), h1: candles(60 * 60_000, 0.25) }, NOW);
     expect(state.available).toBe(true);
-    expect(state.directive, JSON.stringify({ score: state.score, confidence: state.confidence, reason: state.entryReason, indicators: state.indicators })).toBe("ENTER_LONG");
+    expect(state.directive, JSON.stringify({ score: state.score, confidence: state.confidence, reason: state.entryReason, indicators: state.indicators })).toBe("WAIT");
     expect(state.score).toBeGreaterThan(0.34);
     expect(state.forecasts[0]!.targetPrice).toBeGreaterThan(state.price!);
     expect(state.exitShortReason).toBe("TIMELINE_BULL_REVERSAL_CONFIRMED");
   });
 
   it("does not chase an already-oversold bearish move even when the causal forecast remains downward", () => {
-    const state = buildSingleSymbolPriceTimelineState("ETHUSDT", { m5: candles(5 * 60_000, -0.14), h1: candles(60 * 60_000, -0.25) }, NOW);
+    const m5 = candles(5 * 60_000, -0.14);
+    // Force a completed downside extension, not merely a weak downtrend.
+    for (let i = m5.length - 8; i < m5.length; i += 1) {
+      const candle = m5[i]!;
+      const drop = (i - (m5.length - 8) + 1) * 3;
+      candle.close -= drop;
+      candle.low = Math.min(candle.low, candle.close - 0.25);
+    }
+    const state = buildSingleSymbolPriceTimelineState("ETHUSDT", { m5, h1: candles(60 * 60_000, -0.25) }, NOW);
     expect(state.available).toBe(true);
     expect(state.directive).toBe("WAIT");
     expect(state.score).toBeLessThan(-0.34);
     expect(state.forecasts[0]!.targetPrice).toBeLessThan(state.price!);
-    expect(state.exitLongReason).toBe("TIMELINE_BEAR_REVERSAL_CONFIRMED");
+    // An oversold downtrend is not enough to liquidate a long: only the stricter
+    // reversal threshold may request an exit, avoiding exit-chasing at the bottom.
+    expect(state.exitLongReason).toBeNull();
   });
 
   it("fails closed for a tracked entry when the public candle feed is unavailable, but never requests a forced exit", async () => {
@@ -52,7 +62,7 @@ describe("single-symbol price timeline", () => {
   });
 
   it("fails safe to WAIT when the 5m volume baseline is corrupted (avg<=0), instead of treating it as confirmed", () => {
-    const count = 220;
+    const count = 260;
     // 20-candle baseline window `calculateTimeframeIndicators` reads is candles.slice(-22,-2);
     // zeroing it makes the SMA baseline <=0, which is exactly the real Binance feed glitch that
     // makes `volumeRatio` null (see packages/shared/src/indicators.ts latestComparableVolume).
