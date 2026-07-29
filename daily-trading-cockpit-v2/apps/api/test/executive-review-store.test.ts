@@ -363,6 +363,211 @@ describe("Executive Review Store", () => {
     }
   });
 
+  it("computes canonical R from immutable originalRiskUsd even when effectiveRiskUsd changed after entry", () => {
+    const dir = mkdtempSync(join(tmpdir(), "executive-review-"));
+    try {
+      const store = new ExecutiveReviewStore(join(dir, "reviews.json"));
+      const record = review();
+      expect(store.addReview(record)).toBe(true);
+      const link = {
+        executiveReviewId: record.executiveReviewId,
+        candidateId: record.candidateId,
+        opportunityId: record.opportunityId,
+        laneId: record.laneId,
+        marketContextSnapshotId: record.marketContextSnapshotId,
+        allocationSnapshotId: record.allocationSnapshotId,
+        direction: record.direction,
+        marketState: record.marketState,
+        evidenceEra: record.evidenceEra,
+        decisionPipelinePolicyVersion: record.decisionPipelinePolicyVersion,
+        executionPolicyVersion: record.executionPolicyVersion,
+        evidencePolicyVersion: record.evidencePolicyVersion,
+        fourBrainPolicyVersion: record.fourBrainPolicyVersion,
+      };
+      const closed = {
+        paperOrderId: "paper-1",
+        executionIntentId: "intent-1",
+        positionId: "position-1",
+        entryOrderId: "order-1",
+        createdAt: new Date(110).toISOString(),
+        closedAt: new Date(1_000).toISOString(),
+        state: "CLOSED",
+        // effectiveRiskUsd is R-clipping telemetry and can drift after entry (pyramid/rescue
+        // additions); originalRiskUsd is fixed once, at creation, and never reassigned. Canonical
+        // R must key off originalRiskUsd only — using effectiveRiskUsd here would silently produce
+        // netR = 2 / 25 = 0.08 instead of the correct 2 / 10 = 0.2.
+        originalRiskUsd: 10,
+        effectiveRiskUsd: 25,
+        realizedPnlUsd: 2,
+        feesUsd: 0,
+        feeSource: "EXCHANGE",
+        settlementFetchComplete: true,
+        requiredOrderIds: ["order-1", "exit-1"],
+        matchedRequiredOrderIds: ["order-1", "exit-1"],
+        missingRequiredOrderIds: [],
+        executiveReviewLink: link,
+        sourcePaperOrders: [{ paperOrderId: "paper-1", laneId: "LANE", qty: 1, executiveReviewLink: link }],
+      } as LiveIntent;
+      expect(resolveExecutiveReviewPositions(store, [closed], 900_000).linked).toBe(1);
+      expect(store.get().tier1).toHaveLength(1);
+      expect(store.get().tier1[0]).toMatchObject({ grossR: 0.2, costR: 0, netR: 0.2, originalRisk: 10 });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("derives entryFilledAtMs from the exact fill event, distinct from intent-creation time (createdAt)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "executive-review-"));
+    try {
+      const store = new ExecutiveReviewStore(join(dir, "reviews.json"));
+      const record = review();
+      expect(store.addReview(record)).toBe(true);
+      const link = {
+        executiveReviewId: record.executiveReviewId,
+        candidateId: record.candidateId,
+        opportunityId: record.opportunityId,
+        laneId: record.laneId,
+        marketContextSnapshotId: record.marketContextSnapshotId,
+        allocationSnapshotId: record.allocationSnapshotId,
+        direction: record.direction,
+        marketState: record.marketState,
+        evidenceEra: record.evidenceEra,
+        decisionPipelinePolicyVersion: record.decisionPipelinePolicyVersion,
+        executionPolicyVersion: record.executionPolicyVersion,
+        evidencePolicyVersion: record.evidencePolicyVersion,
+        fourBrainPolicyVersion: record.fourBrainPolicyVersion,
+      };
+      const closed = {
+        paperOrderId: "paper-1",
+        executionIntentId: "intent-1",
+        positionId: "position-1",
+        entryOrderId: "order-1",
+        createdAt: new Date(110).toISOString(), // intent CREATED at 110ms...
+        entryFilledAt: new Date(500).toISOString(), // ...but the order actually FILLED later, at 500ms.
+        closedAt: new Date(1_000).toISOString(),
+        state: "CLOSED",
+        originalRiskUsd: 10,
+        effectiveRiskUsd: 10,
+        realizedPnlUsd: 2,
+        feesUsd: 0,
+        feeSource: "EXCHANGE",
+        settlementFetchComplete: true,
+        requiredOrderIds: ["order-1", "exit-1"],
+        matchedRequiredOrderIds: ["order-1", "exit-1"],
+        missingRequiredOrderIds: [],
+        executiveReviewLink: link,
+        sourcePaperOrders: [{ paperOrderId: "paper-1", laneId: "LANE", qty: 1, executiveReviewLink: link }],
+      } as LiveIntent;
+      expect(resolveExecutiveReviewPositions(store, [closed], 900_000).linked).toBe(1);
+      const tier1 = store.get().tier1[0];
+      expect(tier1?.entryFilledAtMs).toBe(500);
+      expect(tier1?.entryFilledAtMs).not.toBe(Date.parse(closed.createdAt));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("yields a null entryFilledAtMs — never fabricated from createdAt — when no exact fill time was ever recorded", () => {
+    const dir = mkdtempSync(join(tmpdir(), "executive-review-"));
+    try {
+      const store = new ExecutiveReviewStore(join(dir, "reviews.json"));
+      const record = review();
+      expect(store.addReview(record)).toBe(true);
+      const link = {
+        executiveReviewId: record.executiveReviewId,
+        candidateId: record.candidateId,
+        opportunityId: record.opportunityId,
+        laneId: record.laneId,
+        marketContextSnapshotId: record.marketContextSnapshotId,
+        allocationSnapshotId: record.allocationSnapshotId,
+        direction: record.direction,
+        marketState: record.marketState,
+        evidenceEra: record.evidenceEra,
+        decisionPipelinePolicyVersion: record.decisionPipelinePolicyVersion,
+        executionPolicyVersion: record.executionPolicyVersion,
+        evidencePolicyVersion: record.evidencePolicyVersion,
+        fourBrainPolicyVersion: record.fourBrainPolicyVersion,
+      };
+      const closed = {
+        paperOrderId: "paper-1",
+        executionIntentId: "intent-1",
+        positionId: "position-1",
+        entryOrderId: "order-1",
+        createdAt: new Date(110).toISOString(),
+        // entryFilledAt intentionally omitted — this intent predates the fill-time capture.
+        closedAt: new Date(1_000).toISOString(),
+        state: "CLOSED",
+        originalRiskUsd: 10,
+        effectiveRiskUsd: 10,
+        realizedPnlUsd: 2,
+        feesUsd: 0,
+        feeSource: "EXCHANGE",
+        settlementFetchComplete: true,
+        requiredOrderIds: ["order-1", "exit-1"],
+        matchedRequiredOrderIds: ["order-1", "exit-1"],
+        missingRequiredOrderIds: [],
+        executiveReviewLink: link,
+        sourcePaperOrders: [{ paperOrderId: "paper-1", laneId: "LANE", qty: 1, executiveReviewLink: link }],
+      } as LiveIntent;
+      expect(resolveExecutiveReviewPositions(store, [closed], 900_000).linked).toBe(1);
+      expect(store.get().tier1[0]?.entryFilledAtMs).toBeNull();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps marketClosedAtMs (exchange close) and settlementResolvedAtMs (settlement completeness) as independent, possibly-differing clocks", () => {
+    const dir = mkdtempSync(join(tmpdir(), "executive-review-"));
+    try {
+      const store = new ExecutiveReviewStore(join(dir, "reviews.json"));
+      const record = review();
+      expect(store.addReview(record)).toBe(true);
+      const link = {
+        executiveReviewId: record.executiveReviewId,
+        candidateId: record.candidateId,
+        opportunityId: record.opportunityId,
+        laneId: record.laneId,
+        marketContextSnapshotId: record.marketContextSnapshotId,
+        allocationSnapshotId: record.allocationSnapshotId,
+        direction: record.direction,
+        marketState: record.marketState,
+        evidenceEra: record.evidenceEra,
+        decisionPipelinePolicyVersion: record.decisionPipelinePolicyVersion,
+        executionPolicyVersion: record.executionPolicyVersion,
+        evidencePolicyVersion: record.evidencePolicyVersion,
+        fourBrainPolicyVersion: record.fourBrainPolicyVersion,
+      };
+      const closed = {
+        paperOrderId: "paper-1",
+        executionIntentId: "intent-1",
+        positionId: "position-1",
+        entryOrderId: "order-1",
+        createdAt: new Date(110).toISOString(),
+        closedAt: new Date(1_000).toISOString(), // exact exchange/position close...
+        settlementResolvedAt: new Date(800).toISOString(), // ...settlement was established BEFORE that, on reconciliation of an earlier partial fill.
+        state: "CLOSED",
+        originalRiskUsd: 10,
+        effectiveRiskUsd: 10,
+        realizedPnlUsd: 2,
+        feesUsd: 0,
+        feeSource: "EXCHANGE",
+        settlementFetchComplete: true,
+        requiredOrderIds: ["order-1", "exit-1"],
+        matchedRequiredOrderIds: ["order-1", "exit-1"],
+        missingRequiredOrderIds: [],
+        executiveReviewLink: link,
+        sourcePaperOrders: [{ paperOrderId: "paper-1", laneId: "LANE", qty: 1, executiveReviewLink: link }],
+      } as LiveIntent;
+      expect(resolveExecutiveReviewPositions(store, [closed], 900_000).linked).toBe(1);
+      const tier1 = store.get().tier1[0];
+      expect(tier1?.marketClosedAtMs).toBe(1_000);
+      expect(tier1?.settlementResolvedAtMs).toBe(800);
+      expect(tier1?.marketClosedAtMs).not.toBe(tier1?.settlementResolvedAtMs);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("keeps incomplete exchange settlement out of Tier 1 while the position lifecycle resolves", () => {
     const dir = mkdtempSync(join(tmpdir(), "executive-review-incomplete-"));
     try {

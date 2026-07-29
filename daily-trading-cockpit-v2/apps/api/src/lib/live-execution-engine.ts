@@ -623,6 +623,16 @@ export interface LiveIntent {
   pageSaturated?: boolean;
   /** Immutable initial execution risk. Missing values remain diagnostic-only evidence. */
   originalRiskUsd?: number;
+  /** 2026-07-30 (additive, report-only): the exact moment the entry MARKET order's fill was
+   *  confirmed (see resolveConfirmedFillPrice's caller) — distinct from `createdAt` (intent
+   *  creation) and never a fallback to it. Undefined on intents created before this field existed,
+   *  or on synthetic (rescue) intents that never go through the confirmed-fill path. */
+  entryFilledAt?: string;
+  /** 2026-07-30 (additive, report-only): the exact moment `applySettlementMetadata` last observed
+   *  `settlementFetchComplete === true` — distinct from `closedAt` (market close) and from any
+   *  earlier call that left settlement incomplete. Undefined until settlement is genuinely
+   *  established complete at least once. */
+  settlementResolvedAt?: string;
   exitRule?: VariantExitRule;
   maxFavorableR?: number | null;
   /** MAE persistence (Tier 2 audit, purely additive): running MOST NEGATIVE (worst) favorableR the
@@ -4817,6 +4827,7 @@ export class LiveExecutionEngine {
     intent.matchedRequiredOrderIds = settled.matchedRequiredOrderIds.slice();
     intent.missingRequiredOrderIds = settled.missingRequiredOrderIds.slice();
     intent.pageSaturated = settled.pageSaturated;
+    if (settled.settlementFetchComplete) intent.settlementResolvedAt = this.nowIso();
   }
 
   /** Per-fill recorder context for one intent (2026-07-27, report-only). Pure field reads — no I/O,
@@ -6438,6 +6449,7 @@ export class LiveExecutionEngine {
       });
       intent.filledEntryPrice = entryResolved.price;
       intent.entryPriceConfirmed = entryResolved.confirmed;
+      intent.entryFilledAt = this.nowIso();
       // FINAL_FILL: the entry MARKET fill is resolved. This path observes only the resolved fill, not incremental
       // partials, so FIRST_FILL is intentionally not emitted separately (documented fill contract).
       logEntryLc("FINAL_FILL", plan.qty);

@@ -34,8 +34,40 @@ export interface FourBrainExecutiveIdentity {
    *  to outcome resolution for anything but the shortest-horizon lanes. */
   brainFeatureSnapshot?: Record<string, unknown> | null;
   brainFeatureSchemaVersions?: Record<string, unknown> | null;
-  /** Merged per-brain freshness at decision time (marketState + direction + entry). */
-  sourceStatuses?: Record<string, string> | null;
+  /** Per-brain freshness at decision time, namespaced by brain (marketState/direction/entry) so two
+   *  brains that happen to use the same feature-source key (e.g. "candle") can never overwrite each
+   *  other — never a single flat-merged map. */
+  sourceStatuses?: Record<string, Record<string, string>> | null;
+  /** Exact Entry-attribution ledger, persisted at admission from the SAME executive.entry object
+   *  already snapshotted above — these are convenience top-level fields for exact comparison against
+   *  the later-resolved actual fill, without reaching into the nested entryDecision. */
+  entryDecisionId?: string | null;
+  /** The exact PaperOrder matched at admission (order.paperOrderId) — never re-derived later. */
+  paperOrderId?: string | null;
+  decidedSide?: "LONG" | "SHORT" | null;
+  decidedTargetEntry?: number | null;
+  decidedInitialStop?: number | null;
+}
+
+/**
+ * Exact resolution-time facts about how the Entry decision's selected order actually filled and
+ * closed — known only once the real position resolves, so these live separately from
+ * FourBrainExecutiveIdentity (admission-time only). One meaning per field; none of them substitutes
+ * for another, and a missing one is never silently backfilled from a different clock.
+ */
+export interface FourBrainEntryResolution {
+  /** Exact confirmed entry-fill time (LiveIntent.entryFilledAt) — never intent creation time. */
+  entryFilledAtMs?: number | null;
+  /** Exact exchange/position close time (LiveIntent.closedAt). */
+  marketClosedAtMs?: number | null;
+  /** Exact time settlement completeness was established (LiveIntent.settlementResolvedAt) — distinct
+   *  from market close; settlement can complete well after the position itself closed. */
+  settlementResolvedAtMs?: number | null;
+  /** The real confirmed fill price (LiveIntent.filledEntryPrice) — never the planned/decided price. */
+  actualEntryPrice?: number | null;
+  /** Every exchange order id whose fill produced this position's entry (LiveIntent.entryOrderIds,
+   *  falling back to the single entryOrderId already carried as Outcome.orderId). */
+  entryFillOrderIds?: readonly string[] | null;
 }
 
 export type ExecutiveReviewTier = "TIER_1_REAL" | "TIER_2_COUNTERFACTUAL";
@@ -115,7 +147,7 @@ export interface ExecutiveReviewPositionLink {
   fourBrainPolicyVersion: string | null;
 }
 
-export interface ExecutiveReviewOutcomeLink {
+export interface ExecutiveReviewOutcomeLink extends FourBrainEntryResolution {
   executiveReviewId: string | null;
   opportunityId: string | null;
   positionId: string | null;
@@ -140,7 +172,7 @@ export interface ExecutiveReviewOutcomeLink {
   ambiguousOwnership: boolean;
 }
 
-export interface ExecutiveReviewOutcome extends FourBrainExecutiveIdentity {
+export interface ExecutiveReviewOutcome extends FourBrainExecutiveIdentity, FourBrainEntryResolution {
   executiveReviewOutcomeId: string;
   executiveReviewId: string;
   tier: ExecutiveReviewTier;
@@ -385,8 +417,20 @@ export class ExecutiveReviewStore {
       brainFeatureSnapshot: review.brainFeatureSnapshot ?? null,
       brainFeatureSchemaVersions: review.brainFeatureSchemaVersions ?? null,
       sourceStatuses: review.sourceStatuses ?? null,
+      entryDecisionId: review.entryDecisionId ?? null,
+      paperOrderId: review.paperOrderId ?? null,
+      decidedSide: review.decidedSide ?? null,
+      decidedTargetEntry: review.decidedTargetEntry ?? null,
+      decidedInitialStop: review.decidedInitialStop ?? null,
       // Copied from the already-validated OutcomeLink, not re-derived — see the field's own doc comment.
       exactCloseTimeMs: Number.isFinite(outcome.resolvedAtMs) ? outcome.resolvedAtMs! : null,
+      // One meaning each, all sourced directly from the OutcomeLink the caller already validated —
+      // never re-derived from resolvedAtMs or from one another.
+      entryFilledAtMs: outcome.entryFilledAtMs ?? null,
+      marketClosedAtMs: outcome.marketClosedAtMs ?? null,
+      settlementResolvedAtMs: outcome.settlementResolvedAtMs ?? null,
+      actualEntryPrice: outcome.actualEntryPrice ?? null,
+      entryFillOrderIds: outcome.entryFillOrderIds ?? null,
     };
     if (!eligibleTier1ExecutiveReview(tier1)) return this.reject(review, "NET_R_INVALID");
     review.state = "TIER1_ELIGIBLE";

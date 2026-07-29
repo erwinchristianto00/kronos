@@ -1,11 +1,4 @@
 /** Exact review-to-paper admission bridge. It never selects, changes, or blocks an incumbent order. */
-import {
-  CURRENT_DECISION_POLICY_VERSION,
-  CURRENT_EVIDENCE_ERA,
-  EVIDENCE_POLICY_VERSION,
-  EXECUTION_POLICY_VERSION,
-} from "@dtc/shared";
-
 import { validMarketContextLineage } from "./authority-contract.js";
 import {
   ExecutiveReviewStore,
@@ -15,6 +8,11 @@ import {
 } from "./executive-review-store.js";
 import type { ExecutiveDecision } from "./four-brain-types.js";
 import type { PaperExecutionRouterStore, PaperOrder } from "./paper-execution-router.js";
+import {
+  isCausalIdentityCurrentlyValid,
+  resolveCanonicalPolicyContext,
+  resolveCausalCollectionActivation,
+} from "../experience-engine/forward-causal-collection.js";
 
 export type ExecutiveReviewAdmissionResult =
   | "ATTACHED"
@@ -24,6 +22,7 @@ export type ExecutiveReviewAdmissionResult =
   | "ORDER_ALREADY_LINKED"
   | "AMBIGUOUS_PAPER_OWNERSHIP"
   | "POST_FIX_POLICY_MISSING"
+  | "STALE_CAUSAL_IDENTITY"
   | "REVIEW_CONFLICT";
 
 function actionFor(exec: ExecutiveDecision): "ENTER" | "WAIT" | "SKIP" {
@@ -39,13 +38,6 @@ function verdictFor(exec: ExecutiveDecision): ExecutiveVerdict {
   if (exec.candidateStatus === "FLAT") return "FLAT";
   if (exec.candidateStatus === "BLOCKED_BY_RISK") return "BLOCKED_BY_RISK";
   return "INCUMBENT_ONLY";
-}
-
-function hasCurrentPolicy(order: PaperOrder): boolean {
-  return order.decisionPolicyVersion === CURRENT_DECISION_POLICY_VERSION
-    && order.executionPolicyVersion === EXECUTION_POLICY_VERSION
-    && order.evidencePolicyVersion === EVIDENCE_POLICY_VERSION
-    && order.evidenceEra === CURRENT_EVIDENCE_ERA;
 }
 
 function sameReview(left: ExecutiveReviewRecord, right: ExecutiveReviewRecord): boolean {
@@ -106,8 +98,12 @@ export function attachExecutiveReviewToExactPaperOrder(input: {
   /** The raw/normalized feature snapshot this tick's brains actually consumed, if the caller already
    *  has it in hand (e.g. the same gather-cycle state that feeds the four-brain journal). Omitted ⇒
    *  persisted as null — the economic-experience adapter must then treat this review as
-   *  EVALUATION_ONLY on feature-snapshot grounds, never fabricate one. */
+   *  EVALUATION_ONLY on feature-snapshot grounds, never fabricate one. Deep-cloned before persisting
+   *  so a later mutation of the caller's own object can never alter the stored snapshot. */
   brainFeatureSnapshot?: Record<string, unknown> | null;
+  /** Defaults to process.env, exactly like prepareForwardCausalIdentity's own default — tests pass a
+   *  controlled object instead for deterministic activation/cutover resolution. */
+  env?: NodeJS.ProcessEnv;
 }): ExecutiveReviewAdmissionResult {
   const { executive, candidateId } = input;
   if (!candidateId || !executive.entry || !executive.laneId || !executive.symbolOrBasketId) return "NO_EXACT_CANDIDATE";
@@ -124,7 +120,16 @@ export function attachExecutiveReviewToExactPaperOrder(input: {
   const order = exactOrders[0]!;
   if (input.executingPaperOrderIds.has(order.paperOrderId)) return "ORDER_ALREADY_EXECUTING";
   if (order.executiveReviewLink) return "ORDER_ALREADY_LINKED";
-  if (!hasCurrentPolicy(order) || !order.causalIdentity?.opportunityId) return "POST_FIX_POLICY_MISSING";
+
+  // Exact current causal identity, reusing the SAME validator the paper-order causal system itself
+  // uses (isCausalIdentityCurrentlyValid) — never a weaker, admission-local duplicate. A stale or
+  // mismatched identity (wrong instance, wrong lane/symbol/direction, an earlier policy generation,
+  // or a cutover that no longer matches) is never copied into an Executive Review record.
+  const env = input.env ?? process.env;
+  const causalActivation = resolveCausalCollectionActivation(env);
+  const causalPolicyContext = resolveCanonicalPolicyContext(env);
+  if (!causalPolicyContext || !order.causalIdentity) return "POST_FIX_POLICY_MISSING";
+  if (!isCausalIdentityCurrentlyValid(order.causalIdentity, order, causalActivation, causalPolicyContext)) return "STALE_CAUSAL_IDENTITY";
 
   const record: ExecutiveReviewRecord = {
     executiveReviewId: `executive-review:${executive.decisionId}:${order.causalIdentity.opportunityId}`,
@@ -161,17 +166,29 @@ export function attachExecutiveReviewToExactPaperOrder(input: {
     marketStateDecision: executive.marketState,
     directionDecision: executive.direction,
     entryDecision: executive.entry,
-    brainFeatureSnapshot: input.brainFeatureSnapshot ?? null,
+    // Exact Entry-attribution ledger — convenience top-level fields mirroring executive.entry, so the
+    // adapter can compare against the actual fill without reaching into the nested snapshot.
+    entryDecisionId: executive.entry.decisionId,
+    paperOrderId: order.paperOrderId,
+    decidedSide: executive.entry.side,
+    decidedTargetEntry: executive.entry.targetEntry,
+    decidedInitialStop: executive.entry.initialStopPrice,
+    // Deep-cloned (JSON round-trip — the snapshot is always plain, JSON-safe data) so a later
+    // mutation of the caller's own gather-cycle object can never alter what was persisted here.
+    brainFeatureSnapshot: input.brainFeatureSnapshot ? JSON.parse(JSON.stringify(input.brainFeatureSnapshot)) : null,
     brainFeatureSchemaVersions: {
       executive: executive.schemaVersion,
       marketState: executive.marketState.schemaVersion,
       direction: executive.direction?.schemaVersion ?? null,
       entry: executive.entry?.schemaVersion ?? null,
     },
+    // Namespaced by brain — never a flat merge — so MARKET_STATE, DIRECTION, and ENTRY can each use
+    // the same feature-source key name (e.g. "candle") without one brain's freshness silently
+    // overwriting another's.
     sourceStatuses: {
-      ...executive.marketState.sourceStatuses,
-      ...(executive.direction?.sourceStatuses ?? {}),
-      ...(executive.entry?.sourceStatuses ?? {}),
+      marketState: executive.marketState.sourceStatuses ?? {},
+      direction: executive.direction?.sourceStatuses ?? {},
+      entry: executive.entry?.sourceStatuses ?? {},
     },
   };
   const existing = input.reviewStore.get().reviews.find((review) => review.executiveReviewId === record.executiveReviewId);

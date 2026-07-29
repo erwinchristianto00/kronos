@@ -12,7 +12,42 @@ import {
 import { attachExecutiveReviewToExactPaperOrder } from "../src/lib/executive-review-admission.js";
 import { ExecutiveReviewStore } from "../src/lib/executive-review-store.js";
 import { PaperExecutionRouterStore, type PaperOrder } from "../src/lib/paper-execution-router.js";
+import type { CausalIdentity } from "../src/experience-engine/forward-causal-collection.js";
 import type { ExecutiveDecision } from "../src/lib/four-brain-types.js";
+
+// Every fixture order below is created/opened at 1_000ms (1970-01-01T00:00:01.000Z); the
+// deployment boundary must be at or before that instant for isCausalIdentityCurrentlyValid's
+// decision/open-clock check to accept it.
+const POLICY_DEPLOYED_AT = "1970-01-01T00:00:00.000Z";
+const shadowEnv = {
+  CAUSAL_EXPERIENCE_COLLECTION_MODE: "shadow",
+  END_TO_END_CORRECTNESS_DEPLOYED_AT: POLICY_DEPLOYED_AT,
+} as NodeJS.ProcessEnv;
+
+function causalIdentity(overrides: Partial<CausalIdentity> = {}): CausalIdentity {
+  return {
+    lineageSchemaVersion: "causal-lineage-1",
+    decisionId: "causal-decision-1",
+    opportunityId: "opportunity-1",
+    outcomeId: null,
+    instanceId: "3101",
+    laneId: "LANE",
+    symbolOrBasketId: "BTCUSDT",
+    direction: "LONG",
+    featureSchemaVersion: "causal-paper-opportunity/1",
+    decisionRuleVersion: "paper-opportunity-admission/1",
+    attributionRuleVersion: "direct-paper-order-link/1",
+    cortexDecisionId: null,
+    allocationSnapshotId: null,
+    cortexFeatureSchemaVersion: null,
+    decisionPolicyVersion: CURRENT_DECISION_POLICY_VERSION,
+    executionPolicyVersion: EXECUTION_POLICY_VERSION,
+    evidencePolicyVersion: EVIDENCE_POLICY_VERSION,
+    evidenceEra: CURRENT_EVIDENCE_ERA,
+    policyDeploymentAt: POLICY_DEPLOYED_AT,
+    ...overrides,
+  };
+}
 
 function paper(overrides: Partial<PaperOrder> = {}): PaperOrder {
   const now = new Date(1_000).toISOString();
@@ -54,22 +89,7 @@ function paper(overrides: Partial<PaperOrder> = {}): PaperOrder {
     executionPolicyVersion: EXECUTION_POLICY_VERSION,
     evidencePolicyVersion: EVIDENCE_POLICY_VERSION,
     evidenceEra: CURRENT_EVIDENCE_ERA,
-    causalIdentity: {
-      lineageSchemaVersion: "causal-lineage-1",
-      decisionId: "causal-decision-1",
-      opportunityId: "opportunity-1",
-      outcomeId: null,
-      instanceId: "3101",
-      laneId: "LANE",
-      symbolOrBasketId: "BTCUSDT",
-      direction: "LONG",
-      featureSchemaVersion: "causal-paper-opportunity/1",
-      decisionRuleVersion: "paper-opportunity-admission/1",
-      attributionRuleVersion: "direct-paper-order-link/1",
-      cortexDecisionId: null,
-      allocationSnapshotId: null,
-      cortexFeatureSchemaVersion: null,
-    },
+    causalIdentity: causalIdentity(),
     reportOnly: true,
     paperOnly: true,
     ...overrides,
@@ -122,6 +142,7 @@ describe("Executive Review admission", () => {
         executive: executive(),
         candidateId: "candidate-1",
         executingPaperOrderIds: new Set(),
+        env: shadowEnv,
       })).toBe("ATTACHED");
       expect(reviewStore.get().reviews).toHaveLength(1);
       expect(paperStore.all[0]?.executiveReviewLink).toMatchObject({
@@ -141,11 +162,104 @@ describe("Executive Review admission", () => {
       paperStore.add(paper());
       paperStore.add(paper({ paperOrderId: "paper-2", sourceObservationId: "candidate-2", sourceSignalId: "candidate-2", dedupeKey: "candidate-2:LANE" }));
       const reviewStore = new ExecutiveReviewStore(join(dir, "reviews.json"));
-      expect(attachExecutiveReviewToExactPaperOrder({ reviewStore, paperStore, executive: executive(), candidateId: "candidate-other", executingPaperOrderIds: new Set() })).toBe("NO_EXACT_CANDIDATE");
-      expect(attachExecutiveReviewToExactPaperOrder({ reviewStore, paperStore, executive: executive(), candidateId: "candidate-1", executingPaperOrderIds: new Set(["paper-1"]) })).toBe("ORDER_ALREADY_EXECUTING");
-      paperStore.update("paper-1", { executionPolicyVersion: null });
-      expect(attachExecutiveReviewToExactPaperOrder({ reviewStore, paperStore, executive: executive(), candidateId: "candidate-1", executingPaperOrderIds: new Set() })).toBe("POST_FIX_POLICY_MISSING");
+      expect(attachExecutiveReviewToExactPaperOrder({ reviewStore, paperStore, executive: executive(), candidateId: "candidate-other", executingPaperOrderIds: new Set(), env: shadowEnv })).toBe("NO_EXACT_CANDIDATE");
+      expect(attachExecutiveReviewToExactPaperOrder({ reviewStore, paperStore, executive: executive(), candidateId: "candidate-1", executingPaperOrderIds: new Set(["paper-1"]), env: shadowEnv })).toBe("ORDER_ALREADY_EXECUTING");
+      // Genuinely unstamped legacy evidence: never received a causal identity at all.
+      paperStore.update("paper-1", { causalIdentity: null });
+      expect(attachExecutiveReviewToExactPaperOrder({ reviewStore, paperStore, executive: executive(), candidateId: "candidate-1", executingPaperOrderIds: new Set(), env: shadowEnv })).toBe("POST_FIX_POLICY_MISSING");
       expect(reviewStore.get().reviews).toHaveLength(0);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a present causal identity that no longer matches the current policy context", () => {
+    const dir = mkdtempSync(join(tmpdir(), "executive-review-admission-"));
+    try {
+      const paperStore = new PaperExecutionRouterStore(dir);
+      paperStore.add(paper({ causalIdentity: causalIdentity({ executionPolicyVersion: "execution-resolver-correctness-v1" }) }));
+      const reviewStore = new ExecutiveReviewStore(join(dir, "reviews.json"));
+      expect(attachExecutiveReviewToExactPaperOrder({
+        reviewStore,
+        paperStore,
+        executive: executive(),
+        candidateId: "candidate-1",
+        executingPaperOrderIds: new Set(),
+        env: shadowEnv,
+      })).toBe("STALE_CAUSAL_IDENTITY");
+      expect(reviewStore.get().reviews).toHaveLength(0);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("deep-clones the supplied brainFeatureSnapshot so a later mutation of the caller's object cannot alter what was persisted", () => {
+    const dir = mkdtempSync(join(tmpdir(), "executive-review-admission-"));
+    try {
+      const paperStore = new PaperExecutionRouterStore(dir);
+      paperStore.add(paper());
+      const reviewStore = new ExecutiveReviewStore(join(dir, "reviews.json"));
+      const snapshot: Record<string, unknown> = { trendScore: 0.4, nested: { axisScore: 1 } };
+      expect(attachExecutiveReviewToExactPaperOrder({
+        reviewStore,
+        paperStore,
+        executive: executive(),
+        candidateId: "candidate-1",
+        executingPaperOrderIds: new Set(),
+        env: shadowEnv,
+        brainFeatureSnapshot: snapshot,
+      })).toBe("ATTACHED");
+      // Mutate the caller's own object AFTER admission — the persisted copy must be unaffected.
+      snapshot.trendScore = 999;
+      (snapshot.nested as Record<string, unknown>).axisScore = 999;
+      expect(reviewStore.get().reviews[0]?.brainFeatureSnapshot).toEqual({ trendScore: 0.4, nested: { axisScore: 1 } });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("persists a null brainFeatureSnapshot (never fabricated) when the caller doesn't supply one", () => {
+    const dir = mkdtempSync(join(tmpdir(), "executive-review-admission-"));
+    try {
+      const paperStore = new PaperExecutionRouterStore(dir);
+      paperStore.add(paper());
+      const reviewStore = new ExecutiveReviewStore(join(dir, "reviews.json"));
+      expect(attachExecutiveReviewToExactPaperOrder({
+        reviewStore,
+        paperStore,
+        executive: executive(),
+        candidateId: "candidate-1",
+        executingPaperOrderIds: new Set(),
+        env: shadowEnv,
+      })).toBe("ATTACHED");
+      expect(reviewStore.get().reviews[0]?.brainFeatureSnapshot ?? null).toBeNull();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("namespaces per-brain sourceStatuses so a shared feature-source key name never collides across brains", () => {
+    const dir = mkdtempSync(join(tmpdir(), "executive-review-admission-"));
+    try {
+      const paperStore = new PaperExecutionRouterStore(dir);
+      paperStore.add(paper());
+      const reviewStore = new ExecutiveReviewStore(join(dir, "reviews.json"));
+      expect(attachExecutiveReviewToExactPaperOrder({
+        reviewStore,
+        paperStore,
+        // marketState and entry both use the key "candle" with DIFFERENT freshness — a flat merge
+        // would silently let one overwrite the other.
+        executive: executive({
+          marketState: { schemaVersion: "market-state/1", decisionId: "market-1", asOfMs: 1_000, validUntilMs: 2_000, family: "BULLISH", bias: "BULLISH", transitionRisk: 0.1, confidence: 0.8, reasons: [], sourceStatuses: { candle: "STALE" } },
+          entry: { schemaVersion: "entry/1", decisionId: "entry-1", asOfMs: 1_000, side: "LONG", action: "ENTER_NOW", score: 0.8, reasons: [], sourceStatuses: { candle: "FRESH" } },
+        }),
+        candidateId: "candidate-1",
+        executingPaperOrderIds: new Set(),
+        env: shadowEnv,
+      })).toBe("ATTACHED");
+      const stamped = reviewStore.get().reviews[0]?.sourceStatuses;
+      expect(stamped?.marketState?.candle).toBe("STALE");
+      expect(stamped?.entry?.candle).toBe("FRESH");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

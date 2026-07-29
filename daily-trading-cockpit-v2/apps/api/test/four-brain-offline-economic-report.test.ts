@@ -96,6 +96,17 @@ function outcome(dayIndex: number, netR: number, laneId = "CG_WIDE_FAST_LONG"): 
     brainFeatureSchemaVersions: { executive: "executive/2" },
     sourceStatuses: { trend: "FRESH" },
     exactCloseTimeMs: resolvedAtMs,
+    // Exact Entry-attribution ledger, mirroring entry()'s own decisionId/side/targetEntry/stop.
+    entryDecisionId: "entry-1",
+    paperOrderId: `paper-order-${laneId}-${dayIndex}`,
+    decidedSide: "LONG",
+    decidedTargetEntry: 65_000,
+    decidedInitialStop: 64_000,
+    entryFilledAtMs: entryAtMs,
+    entryFillOrderIds: [`order-${dayIndex}`],
+    actualEntryPrice: 65_000,
+    marketClosedAtMs: resolvedAtMs,
+    settlementResolvedAtMs: resolvedAtMs,
   };
 }
 

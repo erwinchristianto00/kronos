@@ -2696,6 +2696,12 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
               executive,
               candidateId: identity.signalId,
               executingPaperOrderIds: new Set((liveExecutionStore?.getState().intents ?? []).map((intent) => intent.paperOrderId)),
+              // The SAME this-cycle gather deps that already feed journalContext above — never a
+              // later/current rehydration — so this snapshot is exactly what this tick's brains
+              // consumed. Deep-cloned by attachExecutiveReviewToExactPaperOrder before persisting.
+              brainFeatureSnapshot: lastFourBrainGatherBase
+                ? buildFourBrainJournalContext(lastFourBrainGatherBase, activeFourBrainAllocation())
+                : null,
             });
           } catch {
             // Executive review creation cannot affect incumbent paper/exchange execution.

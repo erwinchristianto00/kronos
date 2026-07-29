@@ -149,6 +149,19 @@ function validOutcome(overrides: Partial<ExecutiveReviewOutcome> = {}): Executiv
     brainFeatureSchemaVersions: { executive: "executive/2" },
     sourceStatuses: { trend: "FRESH" },
     exactCloseTimeMs: resolvedAtMs,
+    // Exact Entry-attribution ledger: admission-time identity mirrors entryDecision() exactly;
+    // resolution-time facts prove a real fill actually happened. actualEntryPrice deliberately
+    // differs from decidedTargetEntry — the adapter must never require these to be equal.
+    entryDecisionId: "entry-1",
+    paperOrderId: "paper-order-1",
+    decidedSide: "LONG",
+    decidedTargetEntry: 65_000,
+    decidedInitialStop: 64_000,
+    entryFilledAtMs: entryAtMs,
+    entryFillOrderIds: ["order-1"],
+    actualEntryPrice: 65_010,
+    marketClosedAtMs: resolvedAtMs,
+    settlementResolvedAtMs: resolvedAtMs,
     ...overrides,
   };
 }
@@ -205,12 +218,28 @@ describe("Four-Brain economic experience adapter (hardened)", () => {
       expect(result.rejected.STALE_POLICY_CONTEXT).toBe(1);
     });
 
-    it("rejects same policy versions but a decision/entry time before the cutover (PRE_CUTOVER)", () => {
+    it("rejects a matching cutover stamp whose OWN decision/entry time is before that cutover (PRE_CUTOVER)", () => {
       const laterCutover = new Date(DEPLOY_MS + 5 * DAY_MS).toISOString();
-      const result = run(validOutcome(), { ...POLICY, policyDeploymentAt: laterCutover });
+      // policyDeploymentAt matches on both sides — only the outcome's own internal clocks
+      // (executiveDecisionTimeMs/entryAtMs, both still anchored to the ORIGINAL, earlier DEPLOY_MS)
+      // are before the (matching) cutover instant, so this exercises the clock-ordering guard, not
+      // the cutover-equality guard below.
+      const outcome = validOutcome({ policyDeploymentAt: laterCutover });
+      const result = run(outcome, { ...POLICY, policyDeploymentAt: laterCutover });
       expect(result.experiences).toHaveLength(0);
       expect(result.rejected.PRE_CUTOVER).toBe(1);
       expect(result.rejected.STALE_POLICY_CONTEXT).toBe(0);
+    });
+
+    it("rejects a present but different (non-null) policyDeploymentAt stamp as STALE_POLICY_CONTEXT, never PRE_CUTOVER", () => {
+      const laterCutover = new Date(DEPLOY_MS + 5 * DAY_MS).toISOString();
+      // The outcome keeps its ORIGINAL stamp while the current expected context has moved on to a
+      // later one — a genuinely different, non-null cutover generation, not merely an internal
+      // clock that predates a shared cutover.
+      const result = run(validOutcome(), { ...POLICY, policyDeploymentAt: laterCutover });
+      expect(result.experiences).toHaveLength(0);
+      expect(result.rejected.STALE_POLICY_CONTEXT).toBe(1);
+      expect(result.rejected.PRE_CUTOVER).toBe(0);
     });
 
     it("rejects a future policyDeploymentAt as a malformed/untrustworthy cutover", () => {
@@ -273,6 +302,18 @@ describe("Four-Brain economic experience adapter (hardened)", () => {
       for (const experience of result.experiences) {
         expect(experience.attributionEligibility).toBe("EVALUATION_ONLY");
         expect(experience.evaluationOnlyReasons).toContain("MISSING_FEATURE_SNAPSHOT");
+      }
+    });
+
+    it("settlementFetchComplete:true with no settlementResolvedAtMs (a pre-capture legacy close) is EVALUATION_ONLY, not silently treated as exact", () => {
+      // settlementFetchComplete alone (already hard-gated elsewhere) proves the COST is exact; it
+      // does not prove a distinct settlement-resolution CLOCK was ever captured for this record.
+      const outcome = validOutcome({ settlementResolvedAtMs: null });
+      const result = run(outcome);
+      expect(result.experiences.length).toBeGreaterThan(0);
+      for (const experience of result.experiences) {
+        expect(experience.attributionEligibility).toBe("EVALUATION_ONLY");
+        expect(experience.evaluationOnlyReasons).toContain("MISSING_SETTLEMENT_RESOLUTION_TIME");
       }
     });
   });
@@ -349,6 +390,47 @@ describe("Four-Brain economic experience adapter (hardened)", () => {
       const result = run(validOutcome({ entryDecision: entryDecision({ action: "WAIT_PULLBACK" }) }));
       const byBrain = new Map(result.experiences.map((e) => [e.brain, e]));
       expect(byBrain.get("ENTRY")!.attributionEligibility).toBe("EVALUATION_ONLY");
+    });
+
+    it("Entry ledger present but entryDecisionId doesn't match the entry decision's own id (mismatch) is not directly eligible", () => {
+      const result = run(validOutcome({ entryDecisionId: "some-other-decision" }));
+      const byBrain = new Map(result.experiences.map((e) => [e.brain, e]));
+      expect(byBrain.get("ENTRY")!.attributionEligibility).toBe("EVALUATION_ONLY");
+      expect(byBrain.get("ENTRY")!.evaluationOnlyReasons).toContain("BRAIN_DECISION_INEXACT");
+    });
+
+    it("Entry ledger missing the selected paper order is not directly eligible", () => {
+      const result = run(validOutcome({ paperOrderId: null }));
+      const byBrain = new Map(result.experiences.map((e) => [e.brain, e]));
+      expect(byBrain.get("ENTRY")!.attributionEligibility).toBe("EVALUATION_ONLY");
+      expect(byBrain.get("ENTRY")!.evaluationOnlyReasons).toContain("BRAIN_DECISION_INEXACT");
+    });
+
+    it("Entry ledger with no actual fill order id (wrong/missing fill ID) is not directly eligible", () => {
+      const result = run(validOutcome({ entryFillOrderIds: null }));
+      const byBrain = new Map(result.experiences.map((e) => [e.brain, e]));
+      expect(byBrain.get("ENTRY")!.attributionEligibility).toBe("EVALUATION_ONLY");
+      expect(byBrain.get("ENTRY")!.evaluationOnlyReasons).toContain("BRAIN_DECISION_INEXACT");
+    });
+
+    it("Entry ledger missing the actual fill time is not directly eligible", () => {
+      const result = run(validOutcome({ entryFilledAtMs: null }));
+      const byBrain = new Map(result.experiences.map((e) => [e.brain, e]));
+      expect(byBrain.get("ENTRY")!.attributionEligibility).toBe("EVALUATION_ONLY");
+      expect(byBrain.get("ENTRY")!.evaluationOnlyReasons).toContain("BRAIN_DECISION_INEXACT");
+    });
+
+    it("Entry ledger missing the actual fill price is not directly eligible", () => {
+      const result = run(validOutcome({ actualEntryPrice: null }));
+      const byBrain = new Map(result.experiences.map((e) => [e.brain, e]));
+      expect(byBrain.get("ENTRY")!.attributionEligibility).toBe("EVALUATION_ONLY");
+      expect(byBrain.get("ENTRY")!.evaluationOnlyReasons).toContain("BRAIN_DECISION_INEXACT");
+    });
+
+    it("Entry accepts an exact decision/order/fill chain even when the actual fill price differs from the decided target (slippage is not a rejection)", () => {
+      const result = run(validOutcome({ actualEntryPrice: 65_250 })); // well away from decidedTargetEntry: 65_000
+      const byBrain = new Map(result.experiences.map((e) => [e.brain, e]));
+      expect(byBrain.get("ENTRY")!.attributionEligibility).toBe("DIRECT_LEARNING_ELIGIBLE");
     });
 
     it("when the outcome itself fails a hard gate, no brain gets any experience at all", () => {

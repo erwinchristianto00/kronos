@@ -30,7 +30,7 @@ import {
   classifyTradeEconomic,
 } from "./success-goal-contract.js";
 import type { ExecutiveReviewOutcome } from "./executive-review-store.js";
-import type { DirectionDecision, EntryDecision, MarketStateDecision } from "./four-brain-types.js";
+import type { DirectionDecision, MarketStateDecision } from "./four-brain-types.js";
 
 export const FOUR_BRAIN_ECONOMIC_SCHEMA_VERSION = "four-brain-economic-experience/2";
 
@@ -59,6 +59,7 @@ export type FourBrainEvaluationOnlyReason =
   | "LEGACY_UNSTAMPED_RECORD"
   | "MISSING_FEATURE_SNAPSHOT"
   | "MISSING_EXACT_CLOSE_TIME"
+  | "MISSING_SETTLEMENT_RESOLUTION_TIME"
   | "BRAIN_DECISION_ABSENT"
   | "BRAIN_DECISION_INEXACT";
 
@@ -158,14 +159,33 @@ function directionCheck(decision: DirectionDecision | null | undefined, outcomeD
   return { present: true, exact: true, reasons: [] };
 }
 
-function entryCheck(decision: EntryDecision | null | undefined, outcomeDirection: "LONG" | "SHORT" | "FLAT"): BrainCheck {
+/**
+ * Entry needs a genuinely exact chain, not just a present decision object: the persisted
+ * entryDecisionId must match the snapshot's own decisionId (never stamped from a different tick), a
+ * real selected paper order must be identified, the decided side/target/stop must be finite and
+ * exact, and the ACTUAL fill (order id(s), fill time, fill price) must all be present — a decision
+ * that looks right but was never linked to a real fill stays EVALUATION_ONLY. The decided target
+ * price is deliberately never required to equal the actual fill price: both are persisted so a
+ * downstream consumer can judge execution slippage itself, not so this gate can reject on it.
+ */
+function entryCheck(outcome: ExecutiveReviewOutcome, outcomeDirection: "LONG" | "SHORT" | "FLAT"): BrainCheck {
+  const decision = outcome.entryDecision;
   if (!decision) return { present: false, exact: false, reasons: ["BRAIN_DECISION_ABSENT"] };
-  if (
-    decision.action !== "ENTER_NOW" ||
-    decision.side !== outcomeDirection ||
-    !Number.isFinite(decision.targetEntry) ||
-    !Number.isFinite(decision.initialStopPrice)
-  ) return { present: true, exact: false, reasons: ["BRAIN_DECISION_INEXACT"] };
+  const decisionShapeValid =
+    decision.action === "ENTER_NOW" &&
+    decision.side === outcomeDirection &&
+    Number.isFinite(decision.targetEntry) &&
+    Number.isFinite(decision.initialStopPrice);
+  const exactChainLinked =
+    !!outcome.entryDecisionId && outcome.entryDecisionId === decision.decisionId &&
+    !!outcome.paperOrderId &&
+    outcome.decidedSide === outcomeDirection &&
+    Number.isFinite(outcome.decidedTargetEntry) &&
+    Number.isFinite(outcome.decidedInitialStop) &&
+    outcome.entryFilledAtMs != null &&
+    Array.isArray(outcome.entryFillOrderIds) && outcome.entryFillOrderIds.length > 0 &&
+    typeof outcome.actualEntryPrice === "number" && Number.isFinite(outcome.actualEntryPrice);
+  if (!decisionShapeValid || !exactChainLinked) return { present: true, exact: false, reasons: ["BRAIN_DECISION_INEXACT"] };
   return { present: true, exact: true, reasons: [] };
 }
 
@@ -210,7 +230,11 @@ export function buildFourBrainExecutiveExperiences(
         outcome.executionPolicyVersion !== expectedPolicy.executionPolicyVersion ||
         outcome.evidencePolicyVersion !== expectedPolicy.evidencePolicyVersion ||
         outcome.evidenceEra !== expectedPolicy.evidenceEra ||
-        outcome.fourBrainPolicyVersion !== expectedPolicy.fourBrainPolicyVersion
+        outcome.fourBrainPolicyVersion !== expectedPolicy.fourBrainPolicyVersion ||
+        // Direct persisted-cutover equality — NOT inferred from decision/open-clock ordering below.
+        // An outcome stamped under a different (even if earlier and internally-consistent) deployment
+        // generation is a stale cohort, not merely a pre-cutover one.
+        outcome.policyDeploymentAt !== expectedPolicy.policyDeploymentAt
       ) { bump(rejected, "STALE_POLICY_CONTEXT"); continue; }
       const deploymentMs = Date.parse(expectedPolicy.policyDeploymentAt);
       if (!Number.isFinite(deploymentMs) || deploymentMs > nowMs) { bump(rejected, "STALE_POLICY_CONTEXT"); continue; }
@@ -221,6 +245,11 @@ export function buildFourBrainExecutiveExperiences(
 
     if (!outcome.brainFeatureSnapshot) baseReasons.push("MISSING_FEATURE_SNAPSHOT");
     if (outcome.exactCloseTimeMs == null) baseReasons.push("MISSING_EXACT_CLOSE_TIME");
+    // settlementFetchComplete (hard-gated above) proves the COST is exact; it does not prove WHEN
+    // settlement completeness was established — a record from before that capture existed can have
+    // settlementFetchComplete:true yet no settlementResolvedAtMs. Soft-cap those, never hard-reject:
+    // the economics are still usable, only this one clock is unavailable.
+    if (outcome.settlementResolvedAtMs == null) baseReasons.push("MISSING_SETTLEMENT_RESOLUTION_TIME");
 
     // decisionTimeMs/closedTimeMs: the EXACT fields when present; a best-effort proxy only for an
     // EVALUATION_ONLY record's economic classification — never presented as if it were exact, and
@@ -256,7 +285,7 @@ export function buildFourBrainExecutiveExperiences(
     const brainChecks: Array<[FourBrainName, BrainCheck]> = [
       ["MARKET_STATE", marketStateCheck(outcome.marketStateDecision)],
       ["DIRECTION", directionCheck(outcome.directionDecision, outcomeDirection)],
-      ["ENTRY", entryCheck(outcome.entryDecision, outcomeDirection)],
+      ["ENTRY", entryCheck(outcome, outcomeDirection)],
     ];
 
     for (const [brain, check] of brainChecks) {

@@ -22,6 +22,12 @@ export interface ExecutiveReviewResolutionSummary {
 const COMPLETED_CANDLE_MS = 15 * 60_000;
 const TERMINAL_INTENT_STATES = new Set(["CLOSED", "ERROR", "KILLED"]);
 
+function dateOrNull(iso: string | null | undefined): number | null {
+  if (!iso) return null;
+  const ms = Date.parse(iso);
+  return Number.isFinite(ms) ? ms : null;
+}
+
 export interface ExecutiveReviewTier2Summary {
   examined: number;
   markedTier2Only: number;
@@ -71,7 +77,11 @@ function outcomeLink(
 ): ExecutiveReviewOutcomeLink | null {
   if (!TERMINAL_INTENT_STATES.has(intent.state)) return null;
   const closedAtMs = intent.closedAt ? Date.parse(intent.closedAt) : Number.NaN;
-  const risk = intent.effectiveRiskUsd;
+  // Canonical Four-Brain R uses the IMMUTABLE risk fixed at admission, never effectiveRiskUsd — that
+  // field is documented R-clipping TELEMETRY (report-only) and can change after entry (pyramid/rescue
+  // additions), which would make the same closed position's canonical R drift depending on when it
+  // was read. originalRiskUsd is assigned exactly once, at intent creation, and never reassigned.
+  const risk = intent.originalRiskUsd;
   const netUsd = intent.realizedPnlUsd;
   const feesUsd = intent.feesUsd;
   const closedCandleAtMs = Number.isFinite(closedAtMs)
@@ -110,6 +120,13 @@ function outcomeLink(
     requiredOrderIds: intent.requiredOrderIds?.slice() ?? [],
     matchedRequiredOrderIds: intent.matchedRequiredOrderIds?.slice() ?? [],
     missingRequiredOrderIds: intent.missingRequiredOrderIds?.slice() ?? [],
+    // One dedicated field per clock — none of these substitutes for another, and each is null (not
+    // backfilled from a different clock) when the exact source is unavailable.
+    entryFilledAtMs: dateOrNull(intent.entryFilledAt),
+    marketClosedAtMs: Number.isFinite(closedAtMs) ? closedAtMs : null,
+    settlementResolvedAtMs: dateOrNull(intent.settlementResolvedAt),
+    actualEntryPrice: typeof intent.filledEntryPrice === "number" && Number.isFinite(intent.filledEntryPrice) ? intent.filledEntryPrice : null,
+    entryFillOrderIds: intent.entryOrderIds?.length ? intent.entryOrderIds.slice() : intent.entryOrderId ? [intent.entryOrderId] : null,
   };
 }
 
