@@ -249,6 +249,107 @@ export function evaluateChronologicalOutOfSampleSharpe(
   };
 }
 
+export const MIN_OOS_TRAINING_SAMPLE = 30;
+
+/** One realized netR per UTC calendar day. Distinct from `DatedNetR`, which makes no per-day guarantee. */
+export interface DatedDailyNetR {
+  readonly utcDay: string;
+  readonly atMs: number;
+  readonly netR: number;
+  readonly observationCount: number;
+}
+
+/**
+ * Deterministic UTC-calendar-day aggregation: every observation whose timestamp falls in the same
+ * UTC day is SUMMED into one `DatedDailyNetR` row (independent same-day realized R compounds by
+ * addition, not averaging). This is the fold `evaluateHardenedOutOfSampleSharpe` requires before any
+ * `sqrt(365)` annualization — without it, multiple trade-level rows sharing a day would silently
+ * annualize as if each were its own full day.
+ */
+export function aggregateNetRByUtcDay(series: readonly DatedNetR[]): DatedDailyNetR[] {
+  const byDay = new Map<string, { atMs: number; netR: number; observationCount: number }>();
+  for (const row of series) {
+    if (!finite(row.atMs) || !finite(row.netR)) continue;
+    const dayStartMs = Math.floor(row.atMs / 86_400_000) * 86_400_000;
+    const utcDay = new Date(dayStartMs).toISOString().slice(0, 10);
+    const bucket = byDay.get(utcDay) ?? { atMs: dayStartMs, netR: 0, observationCount: 0 };
+    bucket.netR += row.netR;
+    bucket.observationCount += 1;
+    byDay.set(utcDay, bucket);
+  }
+  return [...byDay.entries()]
+    .map(([utcDay, bucket]) => ({ utcDay, atMs: bucket.atMs, netR: bucket.netR, observationCount: bucket.observationCount }))
+    .sort((left, right) => left.atMs - right.atMs);
+}
+
+export type HardenedOutOfSampleSharpeStatus =
+  | "AVAILABLE"
+  | "INSUFFICIENT_TRAINING_SAMPLE"
+  | "INSUFFICIENT_EVALUATION_SAMPLE"
+  | "INVALID_WINDOWS"
+  | "UNAVAILABLE";
+
+export interface HardenedOutOfSampleSharpeResult {
+  readonly status: HardenedOutOfSampleSharpeStatus;
+  readonly outOfSampleSharpe: number | null;
+  readonly trainingDayCount: number;
+  readonly evaluationDayCount: number;
+}
+
+const unavailableHardenedOOS = (
+  status: HardenedOutOfSampleSharpeStatus,
+  trainingDayCount: number,
+  evaluationDayCount: number,
+): HardenedOutOfSampleSharpeResult => ({ status, outOfSampleSharpe: null, trainingDayCount, evaluationDayCount });
+
+/**
+ * Additive, stricter sibling of `evaluateChronologicalOutOfSampleSharpe` — that function stays
+ * exactly as-is for its existing callers. This one closes the two gaps a direct read of it leaves
+ * open: (1) it aggregates the input to one realized netR per UTC day FIRST, so trade-level rows
+ * sharing a day can never inflate the `sqrt(365)` annualization; (2) it gates on a minimum TRAINING
+ * sample, not only the evaluation sample — a training window that chronologically precedes
+ * evaluation but holds only a handful of days proves nothing, even though the un-gated function
+ * would happily return AVAILABLE off evaluation size alone. Never falls back to `chronologicalDailyMetrics`'s
+ * raw/full-sample Sharpe — `UNAVAILABLE`/`INSUFFICIENT_*` are terminal, not a trigger to substitute it.
+ */
+export function evaluateHardenedOutOfSampleSharpe(
+  series: readonly DatedNetR[],
+  trainingWindow: ChronologicalWindow,
+  evaluationWindow: ChronologicalWindow,
+): HardenedOutOfSampleSharpeResult {
+  if (
+    !finite(trainingWindow.startMs) || !finite(trainingWindow.endMs) ||
+    !finite(evaluationWindow.startMs) || !finite(evaluationWindow.endMs) ||
+    trainingWindow.startMs >= trainingWindow.endMs ||
+    evaluationWindow.startMs >= evaluationWindow.endMs ||
+    trainingWindow.endMs > evaluationWindow.startMs
+  ) return unavailableHardenedOOS("INVALID_WINDOWS", 0, 0);
+
+  const daily = aggregateNetRByUtcDay(series);
+  const inWindow = (atMs: number, window: ChronologicalWindow) => atMs >= window.startMs && atMs < window.endMs;
+  const trainingDays = daily.filter((row) => inWindow(row.atMs, trainingWindow));
+  const evaluationDays = daily.filter((row) => inWindow(row.atMs, evaluationWindow));
+
+  if (trainingDays.length < MIN_OOS_TRAINING_SAMPLE) {
+    return unavailableHardenedOOS("INSUFFICIENT_TRAINING_SAMPLE", trainingDays.length, evaluationDays.length);
+  }
+  if (evaluationDays.length < MIN_OOS_EVALUATION_SAMPLE) {
+    return unavailableHardenedOOS("INSUFFICIENT_EVALUATION_SAMPLE", trainingDays.length, evaluationDays.length);
+  }
+
+  const evaluationValues = evaluationDays.map((row) => row.netR);
+  const meanNetR = evaluationValues.reduce((sum, value) => sum + value, 0) / evaluationValues.length;
+  const variance = evaluationValues.reduce((sum, value) => sum + (value - meanNetR) ** 2, 0) / (evaluationValues.length - 1);
+  if (!(variance > 0)) return unavailableHardenedOOS("UNAVAILABLE", trainingDays.length, evaluationDays.length);
+
+  return {
+    status: "AVAILABLE",
+    outOfSampleSharpe: (meanNetR / Math.sqrt(variance)) * Math.sqrt(365),
+    trainingDayCount: trainingDays.length,
+    evaluationDayCount: evaluationDays.length,
+  };
+}
+
 export function evaluateImprovement(input: {
   completeLineage: boolean;
   effectiveN: number;

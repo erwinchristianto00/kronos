@@ -3,10 +3,13 @@ import { describe, expect, it } from "vitest";
 import {
   ECONOMIC_HURDLE_R,
   MIN_OOS_EVALUATION_SAMPLE,
+  MIN_OOS_TRAINING_SAMPLE,
+  aggregateNetRByUtcDay,
   chronologicalDailyMetrics,
   classifyLaneEvidence,
   classifyTradeEconomic,
   evaluateChronologicalOutOfSampleSharpe,
+  evaluateHardenedOutOfSampleSharpe,
   evaluateImprovement,
   normalizeEconomicCostR,
   normalizeSignedCostDragR,
@@ -29,6 +32,7 @@ describe("canonical economic goal contract", () => {
     expect(classifyTradeEconomic(valid(-0.02))).toBe("NEUTRAL");
     expect(classifyTradeEconomic(valid(-0.04))).toBe("NEGATIVE");
     expect(classifyTradeEconomic({ ...valid(0.5), costKnownComplete: false })).toBe("INVALID");
+    expect(classifyTradeEconomic({ ...valid(0.5), intrabarAmbiguous: true })).toBe("INVALID");
   });
 
   it("preserves negative magnitude in the reward summary", () => {
@@ -203,6 +207,117 @@ describe("canonical economic goal contract", () => {
       expect(incumbent.outOfSampleSharpe).toBeNull();
       expect(challenger.outOfSampleSharpe).toBeNull();
       expect(evaluateImprovement({ completeLineage: true, effectiveN: 30, incumbent, challenger })).toBe("INVALID_COMPARISON");
+    });
+  });
+
+  describe("hardened daily out-of-sample Sharpe (Four-Brain qualification)", () => {
+    const DAY_MS = 86_400_000;
+    const TRAINING_DAYS = 40;
+    const EVAL_DAYS = 40;
+    const trainingReturns = Array.from({ length: TRAINING_DAYS }, (_, i) => (i % 2 === 0 ? 0.5 : -0.5));
+    const evaluationReturns = Array.from({ length: EVAL_DAYS }, (_, i) => (i % 3 === 0 ? 0.02 : 0.01));
+    const trainingWindow = { startMs: 0, endMs: TRAINING_DAYS * DAY_MS };
+    const evaluationWindow = { startMs: TRAINING_DAYS * DAY_MS, endMs: (TRAINING_DAYS + EVAL_DAYS) * DAY_MS };
+    const buildSeries = (training: readonly number[], evaluation: readonly number[]): DatedNetR[] => [
+      ...training.map((netR, i) => ({ atMs: i * DAY_MS, netR })),
+      ...evaluation.map((netR, i) => ({ atMs: (TRAINING_DAYS + i) * DAY_MS, netR })),
+    ];
+
+    it("deterministically sums duplicate same-UTC-day observations into one row", () => {
+      const series: DatedNetR[] = [
+        { atMs: 1_000, netR: 0.02 },
+        { atMs: 40_000, netR: 0.01 },
+        { atMs: 80_000, netR: -0.005 },
+        { atMs: DAY_MS + 1_000, netR: 0.03 },
+      ];
+      const daily = aggregateNetRByUtcDay(series);
+      expect(daily).toHaveLength(2);
+      expect(daily[0]!.observationCount).toBe(3);
+      expect(daily[0]!.netR).toBeCloseTo(0.02 + 0.01 - 0.005, 9);
+      expect(daily[1]!.observationCount).toBe(1);
+      expect(daily[1]!.netR).toBeCloseTo(0.03, 9);
+      // Aggregation is order-independent — shuffled input folds to the same per-day sums.
+      const shuffled = aggregateNetRByUtcDay([series[3]!, series[1]!, series[0]!, series[2]!]);
+      expect(shuffled).toEqual(daily);
+    });
+
+    it("rejects invalid or empty windows (reversed, non-finite, or non-preceding)", () => {
+      const series = buildSeries(trainingReturns, evaluationReturns);
+      expect(evaluateHardenedOutOfSampleSharpe(series, { startMs: 100, endMs: 50 }, evaluationWindow).status).toBe("INVALID_WINDOWS");
+      expect(evaluateHardenedOutOfSampleSharpe(series, { startMs: Number.NaN, endMs: 50 }, evaluationWindow).status).toBe("INVALID_WINDOWS");
+      expect(evaluateHardenedOutOfSampleSharpe(series, trainingWindow, { startMs: 10, endMs: 10 }).status).toBe("INVALID_WINDOWS");
+      const overlapping = { startMs: evaluationWindow.startMs - DAY_MS, endMs: evaluationWindow.endMs };
+      expect(evaluateHardenedOutOfSampleSharpe(series, overlapping, evaluationWindow).status).toBe("INVALID_WINDOWS");
+    });
+
+    it("rejects an empty training sample distinctly from an insufficient one", () => {
+      const emptyTrainingWindow = { startMs: -DAY_MS, endMs: 0 }; // strictly precedes, but contains nothing
+      const result = evaluateHardenedOutOfSampleSharpe(buildSeries(trainingReturns, evaluationReturns), emptyTrainingWindow, evaluationWindow);
+      expect(result.status).toBe("INSUFFICIENT_TRAINING_SAMPLE");
+      expect(result.trainingDayCount).toBe(0);
+      expect(result.outOfSampleSharpe).toBeNull();
+    });
+
+    it("distinguishes insufficient training from insufficient evaluation as separate statuses", () => {
+      const shortTraining = trainingReturns.slice(0, MIN_OOS_TRAINING_SAMPLE - 1);
+      const shortTrainingWindow = { startMs: 0, endMs: shortTraining.length * DAY_MS };
+      const gapEvaluationWindow = { startMs: shortTrainingWindow.endMs, endMs: shortTrainingWindow.endMs + EVAL_DAYS * DAY_MS };
+      const series = [
+        ...shortTraining.map((netR, i) => ({ atMs: i * DAY_MS, netR })),
+        ...evaluationReturns.map((netR, i) => ({ atMs: shortTrainingWindow.endMs + i * DAY_MS, netR })),
+      ];
+      const insufficientTraining = evaluateHardenedOutOfSampleSharpe(series, shortTrainingWindow, gapEvaluationWindow);
+      expect(insufficientTraining.status).toBe("INSUFFICIENT_TRAINING_SAMPLE");
+      expect(insufficientTraining.trainingDayCount).toBe(shortTraining.length);
+
+      const shortEvaluation = evaluationReturns.slice(0, MIN_OOS_EVALUATION_SAMPLE - 1);
+      const shortEvalWindow = { startMs: evaluationWindow.startMs, endMs: evaluationWindow.startMs + shortEvaluation.length * DAY_MS };
+      const insufficientEval = evaluateHardenedOutOfSampleSharpe(buildSeries(trainingReturns, shortEvaluation), trainingWindow, shortEvalWindow);
+      expect(insufficientEval.status).toBe("INSUFFICIENT_EVALUATION_SAMPLE");
+      expect(insufficientEval.trainingDayCount).toBe(TRAINING_DAYS);
+      expect(insufficientEval.evaluationDayCount).toBe(shortEvaluation.length);
+    });
+
+    it("never substitutes raw full-sample Sharpe when the hardened evaluator is insufficient/unavailable", () => {
+      // A single wild trade-level day dominates the raw full-sample Sharpe...
+      const wildValues = [...trainingReturns, ...evaluationReturns, 50];
+      const rawWithOutlier = chronologicalDailyMetrics(wildValues).rawSharpe!;
+      expect(Number.isFinite(rawWithOutlier)).toBe(true);
+      // ...but an evaluation window too short for the hardened minimum reports INSUFFICIENT, never that raw number.
+      const tooShortEval = evaluationReturns.slice(0, 5);
+      const tooShortWindow = { startMs: evaluationWindow.startMs, endMs: evaluationWindow.startMs + tooShortEval.length * DAY_MS };
+      const result = evaluateHardenedOutOfSampleSharpe(buildSeries(trainingReturns, tooShortEval), trainingWindow, tooShortWindow);
+      expect(result.status).toBe("INSUFFICIENT_EVALUATION_SAMPLE");
+      expect(result.outOfSampleSharpe).toBeNull();
+      expect(result.outOfSampleSharpe).not.toBe(rawWithOutlier);
+    });
+
+    it("computes the hardened OOS Sharpe from daily-aggregated evaluation returns only", () => {
+      const result = evaluateHardenedOutOfSampleSharpe(buildSeries(trainingReturns, evaluationReturns), trainingWindow, evaluationWindow);
+      expect(result.status).toBe("AVAILABLE");
+      expect(result.trainingDayCount).toBe(TRAINING_DAYS);
+      expect(result.evaluationDayCount).toBe(EVAL_DAYS);
+      const mean = evaluationReturns.reduce((sum, value) => sum + value, 0) / evaluationReturns.length;
+      const variance = evaluationReturns.reduce((sum, value) => sum + (value - mean) ** 2, 0) / (evaluationReturns.length - 1);
+      expect(result.outOfSampleSharpe).toBeCloseTo((mean / Math.sqrt(variance)) * Math.sqrt(365), 9);
+    });
+
+    it("ignores changes to training-window returns when computing the evaluation return series", () => {
+      const resultA = evaluateHardenedOutOfSampleSharpe(buildSeries(trainingReturns, evaluationReturns), trainingWindow, evaluationWindow);
+      const resultB = evaluateHardenedOutOfSampleSharpe(buildSeries(trainingReturns.map((v) => v * 100), evaluationReturns), trainingWindow, evaluationWindow);
+      expect(resultA.status).toBe("AVAILABLE");
+      expect(resultA.outOfSampleSharpe).toBeCloseTo(resultB.outOfSampleSharpe!, 9);
+    });
+
+    it("excludes a future observation from training purely by its own timestamp", () => {
+      // One UTC day beyond the last day evaluationReturns already fills, so the aggregator folds it
+      // into a genuinely NEW day row rather than summing into an existing one.
+      const widenedEvaluationWindow = { startMs: evaluationWindow.startMs, endMs: evaluationWindow.endMs + DAY_MS };
+      const sneakyFutureReturn: DatedNetR = { atMs: evaluationWindow.endMs, netR: 999 };
+      const series = [sneakyFutureReturn, ...buildSeries(trainingReturns, evaluationReturns)];
+      const result = evaluateHardenedOutOfSampleSharpe(series, trainingWindow, widenedEvaluationWindow);
+      expect(result.trainingDayCount).toBe(TRAINING_DAYS); // membership is by timestamp, not array position
+      expect(result.evaluationDayCount).toBe(EVAL_DAYS + 1); // its timestamp really is inside the evaluation window
     });
   });
 });
