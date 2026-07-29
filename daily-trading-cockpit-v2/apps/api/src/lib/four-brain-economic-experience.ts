@@ -2,29 +2,42 @@
  * Four-Brain economic learning wiring (report-only, shadow evaluation). Joins the ALREADY-EXISTING
  * exact-lineage outcome chain in executive-review-store.ts — Tier 1 REAL rows are cost-aware,
  * immutable-risk-aware, and explicitly labelled `eligibleForFourBrainEvaluation: true` — to the
- * Four-Brain executive decision journal, and classifies the result through the canonical
- * success-goal-contract.ts. It mints no new identities, no new policy versions, and no new cost
- * convention: it is strictly an adapter over what those two modules already guarantee.
+ * additive Four-Brain identity/decision-snapshot fields persisted on that SAME outcome at admission
+ * time (see FourBrainExecutiveIdentity in executive-review-store.ts), and classifies the result
+ * through the canonical success-goal-contract.ts. It mints no new identities, no new policy versions,
+ * and no new cost convention: it is strictly an adapter over what those two modules already
+ * guarantee.
  *
- * Market State, Direction, and Entry can all be credited from the SAME resolved review: one
+ * Three-level eligibility, not two: an outcome that fails a hard gate (identity mismatch, incomplete
+ * cost, bad arithmetic, wrong cohort) is INELIGIBLE and produces no experience at all. An outcome that
+ * passes every hard gate but is missing one of the NEW exact fields this hardening added — a legacy
+ * record from before this shipped, a missing persisted feature snapshot, a missing dedicated close
+ * time, or a brain whose own decision object is absent/inexact — is DIRECT_LEARNING_ELIGIBLE for
+ * nothing; it is EVALUATION_ONLY, with the specific reason(s) recorded, never silently dropped. Only
+ * an outcome with every exact field present, verified, and internally consistent reaches
+ * DIRECT_LEARNING_ELIGIBLE, and even then independently per brain — Market State, Direction, and
+ * Entry each need their OWN exact match, not just "an object happened to be present."
+ *
+ * Market State, Direction, and Entry can all be credited from the SAME resolved outcome — one
  * ExecutiveDecision bundles all three on one tick, and executive-review-admission.ts links exactly
- * one executiveReviewId to exactly one resolved outcome. Exit is deliberately never produced here —
- * an exit action is decided on a LATER tick with its own, unlinked decisionId, so no exact chain from
- * an ExitDecision to a resolved economic outcome exists yet (see `fourBrainExitAttributionStatus`).
+ * one review to exactly one resolved outcome. Exit is deliberately never produced here — an exit
+ * action is decided on a LATER tick with its own, unlinked decisionId, so no exact chain from an
+ * ExitDecision to a resolved economic outcome exists yet (see `fourBrainExitAttributionStatus`).
  */
 import {
   type EconomicOutcomeInput,
   type TradeEconomicClass,
   classifyTradeEconomic,
 } from "./success-goal-contract.js";
-import type { ExecutiveReviewOutcome, ExecutiveReviewRecord } from "./executive-review-store.js";
-import type { ExecutiveJournalRow } from "./four-brain-journal.js";
+import type { ExecutiveReviewOutcome } from "./executive-review-store.js";
+import type { DirectionDecision, EntryDecision, MarketStateDecision } from "./four-brain-types.js";
 
-export const FOUR_BRAIN_ECONOMIC_SCHEMA_VERSION = "four-brain-economic-experience/1";
+export const FOUR_BRAIN_ECONOMIC_SCHEMA_VERSION = "four-brain-economic-experience/2";
 
 export type FourBrainName = "MARKET_STATE" | "DIRECTION" | "ENTRY" | "EXIT";
 export type FourBrainAttributionEligibility = "DIRECT_LEARNING_ELIGIBLE" | "EVALUATION_ONLY" | "INELIGIBLE";
 
+/** Hard failures: the outcome as a whole is unusable, no experience is produced for any brain. */
 export type FourBrainEconomicRejectionReason =
   | "MISSING_CAUSAL_IDENTITY"
   | "IDENTITY_MISMATCH"
@@ -39,6 +52,15 @@ export type FourBrainEconomicRejectionReason =
   | "MISSING_FEATURE_SNAPSHOT"
   | "SOURCE_ERROR"
   | "UNRESOLVED";
+
+/** Soft caps: the outcome (or one specific brain) is real and usable, but not exact enough yet for
+ *  direct learning. Never silently dropped — always recorded on the experience that carries them. */
+export type FourBrainEvaluationOnlyReason =
+  | "LEGACY_UNSTAMPED_RECORD"
+  | "MISSING_FEATURE_SNAPSHOT"
+  | "MISSING_EXACT_CLOSE_TIME"
+  | "BRAIN_DECISION_ABSENT"
+  | "BRAIN_DECISION_INEXACT";
 
 const ZERO_REJECTED: Record<FourBrainEconomicRejectionReason, number> = {
   MISSING_CAUSAL_IDENTITY: 0,
@@ -62,23 +84,21 @@ const ZERO_REJECTED: Record<FourBrainEconomicRejectionReason, number> = {
 export interface FourBrainEconomicExperience extends EconomicOutcomeInput {
   readonly schemaVersion: string;
   readonly brain: FourBrainName;
-  readonly executiveDecisionId: string;
-  readonly executiveReviewId: string;
+  /** Null only for a legacy (pre-hardening) outcome — such a record is always capped at
+   *  EVALUATION_ONLY; see LEGACY_UNSTAMPED_RECORD. */
+  readonly executiveDecisionId: string | null;
+  readonly instanceId: string | null;
   readonly opportunityId: string;
   readonly outcomeId: string;
   readonly laneId: string;
   readonly symbolOrBasketId: string | null;
   readonly direction: "LONG" | "SHORT" | "FLAT";
   readonly attributionEligibility: FourBrainAttributionEligibility;
+  readonly evaluationOnlyReasons: readonly FourBrainEvaluationOnlyReason[];
   readonly economicClass: TradeEconomicClass;
-  /** Four-Brain's own schema-version stamp (`exec.schemaVersion`, e.g. "executive/2") — a separate
-   *  lineage from the paper-order causal identity's decision/execution/evidence policy versions. */
   readonly fourBrainCodeVersion: string;
-  /** The joined journal row's normalized (preferred) or raw feature snapshot. Four-Brain has no fixed-
-   *  length numeric feature vector today (unlike CORTEX's cortexDecisionSnapshot.featureVector) — this
-   *  is the richest available snapshot, kept as an opaque record rather than fabricating a vector. */
-  readonly featureSnapshot: Record<string, unknown>;
-  readonly featureSchemaVersions: Record<string, unknown>;
+  readonly featureSnapshot: Record<string, unknown> | null;
+  readonly featureSchemaVersions: Record<string, unknown> | null;
 }
 
 export interface FourBrainEconomicAdapterResult {
@@ -86,23 +106,27 @@ export interface FourBrainEconomicAdapterResult {
   readonly rejected: Record<FourBrainEconomicRejectionReason, number>;
 }
 
-/** The CURRENT expected 4-part Four-Brain/executive-review policy lineage. Supplied by the caller —
- *  never read from process.env inside this pure module, so the exact "current policy" enforced is
- *  always visible at the call site. */
+/** The CURRENT expected exact policy/cohort context. Supplied by the caller — never read from
+ *  process.env or derived from the data being classified, so the exact "current policy" enforced is
+ *  always visible at the call site, and 3101/3102 can never be blended without the caller explicitly
+ *  choosing to run this adapter twice with two different contexts. */
 export interface FourBrainPolicyContext {
+  readonly instanceId: "3101" | "3102";
   readonly decisionPipelinePolicyVersion: string;
   readonly executionPolicyVersion: string;
   readonly evidencePolicyVersion: string;
+  readonly evidenceEra: string;
   readonly fourBrainPolicyVersion: string;
+  readonly policyDeploymentAt: string;
 }
 
 const EXECUTIVE_REVIEW_ID_PATTERN = /^executive-review:(.+):([^:]+)$/;
 
 /**
- * Decodes the exec decisionId back out of the deterministic construction in
- * executive-review-admission.ts (`executive-review:${exec.decisionId}:${opportunityId}`). This is
- * exact ID decoding, not a fuzzy match — the two identities are joined 1:1 by construction, and the
- * decoded id is verified against the caller-supplied opportunityId before use.
+ * Decodes the exec decisionId out of the deterministic construction in executive-review-admission.ts
+ * (`executive-review:${exec.decisionId}:${opportunityId}`) for DIAGNOSTIC use on legacy records only
+ * (records predating the persisted `executiveDecisionId` field). The adapter itself never calls this
+ * to determine eligibility — a decisionId recovered this way can only ever support EVALUATION_ONLY.
  */
 export function executiveDecisionIdFromReviewId(executiveReviewId: string, opportunityId: string): string | null {
   const match = EXECUTIVE_REVIEW_ID_PATTERN.exec(executiveReviewId);
@@ -117,65 +141,53 @@ function bump(counts: Record<FourBrainEconomicRejectionReason, number>, reason: 
   counts[reason] += 1;
 }
 
-function hasSourceError(raw: Record<string, unknown>): boolean {
-  const statuses = raw.sourceStatuses;
-  if (!statuses || typeof statuses !== "object") return false;
-  return Object.values(statuses as Record<string, unknown>).some((status) => status === "ERROR");
+interface BrainCheck {
+  readonly present: boolean;
+  readonly exact: boolean;
+  readonly reasons: readonly FourBrainEvaluationOnlyReason[];
 }
 
-function featureSnapshotOf(raw: Record<string, unknown>): Record<string, unknown> | null {
-  const normalized = raw.normalizedFeatures;
-  if (normalized && typeof normalized === "object") return normalized as Record<string, unknown>;
-  const rawFeatures = raw.rawFeatures;
-  if (rawFeatures && typeof rawFeatures === "object") return rawFeatures as Record<string, unknown>;
-  return null;
+function marketStateCheck(decision: MarketStateDecision | null | undefined): BrainCheck {
+  if (!decision) return { present: false, exact: false, reasons: ["BRAIN_DECISION_ABSENT"] };
+  return { present: true, exact: true, reasons: [] };
 }
 
-function brainDecisionPresent(raw: Record<string, unknown>, brain: "marketState" | "direction" | "entry"): boolean {
-  const brains = raw.brains;
-  if (!brains || typeof brains !== "object") return false;
-  return (brains as Record<string, unknown>)[brain] != null;
+function directionCheck(decision: DirectionDecision | null | undefined, outcomeDirection: "LONG" | "SHORT" | "FLAT"): BrainCheck {
+  if (!decision) return { present: false, exact: false, reasons: ["BRAIN_DECISION_ABSENT"] };
+  if (decision.marketDirection !== outcomeDirection) return { present: true, exact: false, reasons: ["BRAIN_DECISION_INEXACT"] };
+  return { present: true, exact: true, reasons: [] };
+}
+
+function entryCheck(decision: EntryDecision | null | undefined, outcomeDirection: "LONG" | "SHORT" | "FLAT"): BrainCheck {
+  if (!decision) return { present: false, exact: false, reasons: ["BRAIN_DECISION_ABSENT"] };
+  if (
+    decision.action !== "ENTER_NOW" ||
+    decision.side !== outcomeDirection ||
+    !Number.isFinite(decision.targetEntry) ||
+    !Number.isFinite(decision.initialStopPrice)
+  ) return { present: true, exact: false, reasons: ["BRAIN_DECISION_INEXACT"] };
+  return { present: true, exact: true, reasons: [] };
 }
 
 /**
- * Builds DIRECT_LEARNING_ELIGIBLE Four-Brain economic experiences for Market State, Direction, and
- * Entry from Tier-1 REAL executive review outcomes, joined against the executive decision journal for
- * the feature snapshot the brains actually saw. Fails closed with an explicit reason code per
- * candidate — never a silent drop.
+ * Builds Four-Brain economic experiences for Market State, Direction, and Entry from Tier-1 REAL
+ * executive review outcomes. `nowMs` is caller-supplied (never Date.now() internally) so the
+ * "policyDeploymentAt is not in the future" check stays a pure function of its inputs. Fails closed
+ * with an explicit reason code per candidate at the outcome level; never a silent drop. A record or
+ * brain that is real but not yet exact enough is EVALUATION_ONLY with explicit reasons, never
+ * DIRECT_LEARNING_ELIGIBLE and never simply omitted.
  */
 export function buildFourBrainExecutiveExperiences(
   outcomes: readonly ExecutiveReviewOutcome[],
-  reviews: readonly ExecutiveReviewRecord[],
-  journalRowsByDecisionId: ReadonlyMap<string, ExecutiveJournalRow>,
   expectedPolicy: FourBrainPolicyContext,
+  nowMs: number,
 ): FourBrainEconomicAdapterResult {
-  const reviewById = new Map(reviews.map((review) => [review.executiveReviewId, review]));
   const experiences: FourBrainEconomicExperience[] = [];
   const rejected: Record<FourBrainEconomicRejectionReason, number> = { ...ZERO_REJECTED };
 
   for (const outcome of outcomes) {
     if (outcome.tier !== "TIER_1_REAL" || outcome.eligibleForFourBrainEvaluation !== true) { bump(rejected, "SOURCE_ERROR"); continue; }
     if (!outcome.resolvedAtMs) { bump(rejected, "UNRESOLVED"); continue; }
-
-    const review = reviewById.get(outcome.executiveReviewId);
-    if (!review) { bump(rejected, "MISSING_CAUSAL_IDENTITY"); continue; }
-    if (
-      review.executiveReviewId !== outcome.executiveReviewId ||
-      review.candidateId !== outcome.candidateId ||
-      review.opportunityId !== outcome.opportunityId ||
-      review.laneId !== outcome.laneId
-    ) { bump(rejected, "IDENTITY_MISMATCH"); continue; }
-
-    const execDecisionId = executiveDecisionIdFromReviewId(outcome.executiveReviewId, outcome.opportunityId);
-    if (!execDecisionId) { bump(rejected, "MISSING_CAUSAL_IDENTITY"); continue; }
-
-    if (
-      outcome.decisionPipelinePolicyVersion !== expectedPolicy.decisionPipelinePolicyVersion ||
-      outcome.executionPolicyVersion !== expectedPolicy.executionPolicyVersion ||
-      outcome.evidencePolicyVersion !== expectedPolicy.evidencePolicyVersion ||
-      outcome.fourBrainPolicyVersion !== expectedPolicy.fourBrainPolicyVersion
-    ) { bump(rejected, "STALE_POLICY_CONTEXT"); continue; }
-
     if (!Number.isFinite(outcome.originalRisk) || outcome.originalRisk <= 0) { bump(rejected, "MISSING_IMMUTABLE_RISK"); continue; }
     if (!outcome.settlementFetchComplete || outcome.missingRequiredOrderIds.length > 0) { bump(rejected, "INCOMPLETE_COST"); continue; }
     if (!Number.isFinite(outcome.costR) || outcome.costR < 0) { bump(rejected, "INVALID_COST_CONVENTION"); continue; }
@@ -184,13 +196,39 @@ export function buildFourBrainExecutiveExperiences(
     }
     if (!(outcome.resolvedAtMs >= outcome.entryAtMs)) { bump(rejected, "INVALID_OUTCOME_QUALITY"); continue; }
 
-    const journalRow = journalRowsByDecisionId.get(execDecisionId);
-    if (!journalRow) { bump(rejected, "MISSING_FEATURE_SNAPSHOT"); continue; }
-    if (hasSourceError(journalRow.raw)) { bump(rejected, "SOURCE_ERROR"); continue; }
-    const featureSnapshot = featureSnapshotOf(journalRow.raw);
-    if (!featureSnapshot) { bump(rejected, "MISSING_FEATURE_SNAPSHOT"); continue; }
-    const schemaVersions = journalRow.raw.schemaVersions;
-    if (!schemaVersions || typeof schemaVersions !== "object") { bump(rejected, "MISSING_FEATURE_SNAPSHOT"); continue; }
+    // ---- Exact policy/cohort context: hard-reject a WRONG cohort; soft-cap an ABSENT one. ----
+    const baseReasons: FourBrainEvaluationOnlyReason[] = [];
+    const hasStampedIdentity = outcome.executiveDecisionId != null && outcome.instanceId != null
+      && outcome.policyDeploymentAt != null && outcome.executiveDecisionTimeMs != null;
+
+    if (!hasStampedIdentity) {
+      baseReasons.push("LEGACY_UNSTAMPED_RECORD");
+    } else {
+      if (outcome.instanceId !== expectedPolicy.instanceId) { bump(rejected, "IDENTITY_MISMATCH"); continue; }
+      if (
+        outcome.decisionPipelinePolicyVersion !== expectedPolicy.decisionPipelinePolicyVersion ||
+        outcome.executionPolicyVersion !== expectedPolicy.executionPolicyVersion ||
+        outcome.evidencePolicyVersion !== expectedPolicy.evidencePolicyVersion ||
+        outcome.evidenceEra !== expectedPolicy.evidenceEra ||
+        outcome.fourBrainPolicyVersion !== expectedPolicy.fourBrainPolicyVersion
+      ) { bump(rejected, "STALE_POLICY_CONTEXT"); continue; }
+      const deploymentMs = Date.parse(expectedPolicy.policyDeploymentAt);
+      if (!Number.isFinite(deploymentMs) || deploymentMs > nowMs) { bump(rejected, "STALE_POLICY_CONTEXT"); continue; }
+      if (outcome.executiveDecisionTimeMs! < deploymentMs || outcome.entryAtMs < deploymentMs) { bump(rejected, "PRE_CUTOVER"); continue; }
+      // Only after every check above has genuinely passed — never set defensively/optimistically.
+    }
+    const policyLineageMatches = hasStampedIdentity;
+
+    if (!outcome.brainFeatureSnapshot) baseReasons.push("MISSING_FEATURE_SNAPSHOT");
+    if (outcome.exactCloseTimeMs == null) baseReasons.push("MISSING_EXACT_CLOSE_TIME");
+
+    // decisionTimeMs/closedTimeMs: the EXACT fields when present; a best-effort proxy only for an
+    // EVALUATION_ONLY record's economic classification — never presented as if it were exact, and
+    // `review.reviewedAtMs` (a field that no longer even exists on this merged outcome type) is never
+    // consulted for either.
+    const decisionTimeMs = outcome.executiveDecisionTimeMs ?? outcome.entryAtMs;
+    const closedTimeMs = outcome.exactCloseTimeMs ?? outcome.resolvedAtMs;
+    if (decisionTimeMs > outcome.entryAtMs || closedTimeMs < outcome.entryAtMs) { bump(rejected, "INVALID_OUTCOME_QUALITY"); continue; }
 
     const base = {
       exactOwnership: true,
@@ -199,41 +237,49 @@ export function buildFourBrainExecutiveExperiences(
       costR: outcome.costR,
       netR: outcome.netR,
       costKnownComplete: true,
-      policyLineageMatches: true,
+      policyLineageMatches,
       resolved: true,
       // Real exchange-settled fills carry exact fill/close timestamps — never a simulated candle-walk
       // resolution — so the classic same-bar OHLC ambiguity this flag exists to catch cannot occur here.
       intrabarAmbiguous: false,
-      decisionTimeMs: review.reviewedAtMs,
+      decisionTimeMs,
       openedTimeMs: outcome.entryAtMs,
-      closedTimeMs: outcome.resolvedAtMs,
+      closedTimeMs,
     };
+    // Every condition classifyTradeEconomic checks other than policyLineageMatches has already been
+    // hard-gated above, so the only way this can still read INVALID is an unverified (legacy) cohort
+    // — an honest classification for that case, not a signal to drop the experience: attribution
+    // eligibility is judged by evaluationOnlyReasons, not by this field.
     const economicClass = classifyTradeEconomic(base);
-    if (economicClass === "INVALID") { bump(rejected, "ECONOMIC_ARITHMETIC_MISMATCH"); continue; }
 
-    const brainKeys: Array<[FourBrainName, "marketState" | "direction" | "entry"]> = [
-      ["MARKET_STATE", "marketState"],
-      ["DIRECTION", "direction"],
-      ["ENTRY", "entry"],
+    const outcomeDirection = directionOf(outcome.direction);
+    const brainChecks: Array<[FourBrainName, BrainCheck]> = [
+      ["MARKET_STATE", marketStateCheck(outcome.marketStateDecision)],
+      ["DIRECTION", directionCheck(outcome.directionDecision, outcomeDirection)],
+      ["ENTRY", entryCheck(outcome.entryDecision, outcomeDirection)],
     ];
-    for (const [brain, key] of brainKeys) {
-      if (!brainDecisionPresent(journalRow.raw, key)) continue; // this brain did not fire on the joined tick — no credit fabricated
+
+    for (const [brain, check] of brainChecks) {
+      const evaluationOnlyReasons = [...baseReasons, ...check.reasons];
+      const attributionEligibility: FourBrainAttributionEligibility =
+        evaluationOnlyReasons.length === 0 ? "DIRECT_LEARNING_ELIGIBLE" : "EVALUATION_ONLY";
       experiences.push({
         ...base,
         schemaVersion: FOUR_BRAIN_ECONOMIC_SCHEMA_VERSION,
         brain,
-        executiveDecisionId: execDecisionId,
-        executiveReviewId: outcome.executiveReviewId,
+        executiveDecisionId: outcome.executiveDecisionId ?? null,
+        instanceId: outcome.instanceId ?? null,
         opportunityId: outcome.opportunityId,
         outcomeId: outcome.outcomeId,
         laneId: outcome.laneId,
-        symbolOrBasketId: journalRow.symbolOrBasketId,
-        direction: directionOf(outcome.direction),
-        attributionEligibility: "DIRECT_LEARNING_ELIGIBLE",
+        symbolOrBasketId: outcome.symbolOrBasketId ?? null,
+        direction: outcomeDirection,
+        attributionEligibility,
+        evaluationOnlyReasons,
         economicClass,
         fourBrainCodeVersion: outcome.fourBrainPolicyVersion,
-        featureSnapshot,
-        featureSchemaVersions: schemaVersions as Record<string, unknown>,
+        featureSnapshot: outcome.brainFeatureSnapshot ?? null,
+        featureSchemaVersions: outcome.brainFeatureSchemaVersions ?? null,
       });
     }
   }
@@ -261,7 +307,7 @@ export function fourBrainExitAttributionStatus(): FourBrainExitAttributionStatus
     missingFields: [
       "An exit-outcome ledger analogous to executive-review-store.ts, keyed by ExitDecision.decisionId or an exposed (non-hashed) candidateKey.",
       "originalRisk / grossR / costR / netR captured at the exact position this exit action applied to.",
-      "decisionPipelinePolicyVersion / executionPolicyVersion / evidencePolicyVersion / fourBrainPolicyVersion stamped on that ledger, matching the pattern executive-review-store.ts already uses.",
+      "instanceId / decisionPipelinePolicyVersion / executionPolicyVersion / evidencePolicyVersion / evidenceEra / fourBrainPolicyVersion / policyDeploymentAt stamped on that ledger, matching the pattern executive-review-store.ts already uses.",
     ],
   };
 }

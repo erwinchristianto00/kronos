@@ -5,6 +5,38 @@
  */
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
+import type { DirectionDecision, EntryDecision, MarketStateDecision } from "./four-brain-types.js";
+
+/**
+ * Additive Four-Brain economic-learning identity, persisted once at admission and copied verbatim
+ * into the resolved Tier-1 outcome — never derived by parsing another id, never rehydrated from
+ * current state. Absent on any review created before this was added (a "legacy" record): those stay
+ * fully readable/parseable but the economic-experience adapter must treat them as EVALUATION_ONLY at
+ * best, never DIRECT_LEARNING_ELIGIBLE, per the Four-Brain economic-learning hardening.
+ */
+export interface FourBrainExecutiveIdentity {
+  /** The bundling ExecutiveDecision.decisionId — NOT parsed back out of executiveReviewId. */
+  executiveDecisionId?: string | null;
+  instanceId?: string | null;
+  symbolOrBasketId?: string | null;
+  /** The exact policy-deployment cutover in force when this review was admitted. */
+  policyDeploymentAt?: string | null;
+  /** ExecutiveDecision.asOfMs — the exact decision timestamp. Never review.reviewedAtMs by convention;
+   *  reviewedAtMs is retained only as this file's own bookkeeping field, not a decision-time contract. */
+  executiveDecisionTimeMs?: number | null;
+  /** Immutable snapshots of what each brain actually decided at executiveDecisionTimeMs — never
+   *  rehydrated from a later/current tick. Null when a brain did not fire this tick. */
+  marketStateDecision?: MarketStateDecision | null;
+  directionDecision?: DirectionDecision | null;
+  entryDecision?: EntryDecision | null;
+  /** The raw/normalized feature snapshot the brains consumed, as of executiveDecisionTimeMs — an
+   *  immutable substitute for the four-brain-decision-journal, whose retention is too short to survive
+   *  to outcome resolution for anything but the shortest-horizon lanes. */
+  brainFeatureSnapshot?: Record<string, unknown> | null;
+  brainFeatureSchemaVersions?: Record<string, unknown> | null;
+  /** Merged per-brain freshness at decision time (marketState + direction + entry). */
+  sourceStatuses?: Record<string, string> | null;
+}
 
 export type ExecutiveReviewTier = "TIER_1_REAL" | "TIER_2_COUNTERFACTUAL";
 export type ExecutiveIncumbentAction = "ENTERED" | "SKIPPED" | "HELD" | "EXITED";
@@ -21,7 +53,7 @@ export type ExecutiveReviewDirection = "LONG" | "SHORT" | "NEUTRAL";
 export type ExecutiveCostProvenance = "EXCHANGE_MEASURED" | "EXECUTION_MODEL_ESTIMATE";
 
 /** Immutable reviewer metadata attached by an incumbent producer before it creates an intent. */
-export interface ExecutiveReviewRecord {
+export interface ExecutiveReviewRecord extends FourBrainExecutiveIdentity {
   executiveReviewId: string;
   candidateId: string;
   opportunityId: string;
@@ -108,7 +140,7 @@ export interface ExecutiveReviewOutcomeLink {
   ambiguousOwnership: boolean;
 }
 
-export interface ExecutiveReviewOutcome {
+export interface ExecutiveReviewOutcome extends FourBrainExecutiveIdentity {
   executiveReviewOutcomeId: string;
   executiveReviewId: string;
   tier: ExecutiveReviewTier;
@@ -145,6 +177,13 @@ export interface ExecutiveReviewOutcome {
   fourBrainPolicyVersion: string;
   eligibleForFourBrainEvaluation: true;
   eligibleForCortexLearning: false;
+  /** The exact exit/market-close timestamp, distinct from resolvedAtMs (settlement/reconciliation
+   *  completion). Copied at resolve() time from the already-validated OutcomeLink.resolvedAtMs — that
+   *  field is itself derived upstream from the real exchange close (see executive-review-runtime.ts),
+   *  so this is a dedicated, separately-named field for the "exact close time" concept rather than
+   *  the economic adapter reaching for resolvedAtMs under a different name. Absent on legacy outcomes
+   *  resolved before this field existed. */
+  exactCloseTimeMs?: number | null;
 }
 
 export interface ExecutiveReviewState {
@@ -335,6 +374,19 @@ export class ExecutiveReviewStore {
       fourBrainPolicyVersion: review.fourBrainPolicyVersion,
       eligibleForFourBrainEvaluation: true,
       eligibleForCortexLearning: false,
+      executiveDecisionId: review.executiveDecisionId ?? null,
+      instanceId: review.instanceId ?? null,
+      symbolOrBasketId: review.symbolOrBasketId ?? null,
+      policyDeploymentAt: review.policyDeploymentAt ?? null,
+      executiveDecisionTimeMs: review.executiveDecisionTimeMs ?? null,
+      marketStateDecision: review.marketStateDecision ?? null,
+      directionDecision: review.directionDecision ?? null,
+      entryDecision: review.entryDecision ?? null,
+      brainFeatureSnapshot: review.brainFeatureSnapshot ?? null,
+      brainFeatureSchemaVersions: review.brainFeatureSchemaVersions ?? null,
+      sourceStatuses: review.sourceStatuses ?? null,
+      // Copied from the already-validated OutcomeLink, not re-derived — see the field's own doc comment.
+      exactCloseTimeMs: Number.isFinite(outcome.resolvedAtMs) ? outcome.resolvedAtMs! : null,
     };
     if (!eligibleTier1ExecutiveReview(tier1)) return this.reject(review, "NET_R_INVALID");
     review.state = "TIER1_ELIGIBLE";

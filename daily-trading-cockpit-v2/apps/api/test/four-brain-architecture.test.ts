@@ -36,6 +36,7 @@ const FOUR_BRAIN_FILES = [
   "executive-review-store.ts",
   "four-brain-economic-experience.ts",
   "four-brain-shadow-learning-report.ts",
+  "four-brain-offline-economic-report.ts",
 ];
 
 // Modules that place orders / mutate positions / mutate stops / set allocations. NO brain may import these.

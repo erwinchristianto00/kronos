@@ -103,6 +103,11 @@ export function attachExecutiveReviewToExactPaperOrder(input: {
   executive: ExecutiveDecision;
   candidateId: string | null;
   executingPaperOrderIds: ReadonlySet<string>;
+  /** The raw/normalized feature snapshot this tick's brains actually consumed, if the caller already
+   *  has it in hand (e.g. the same gather-cycle state that feeds the four-brain journal). Omitted ⇒
+   *  persisted as null — the economic-experience adapter must then treat this review as
+   *  EVALUATION_ONLY on feature-snapshot grounds, never fabricate one. */
+  brainFeatureSnapshot?: Record<string, unknown> | null;
 }): ExecutiveReviewAdmissionResult {
   const { executive, candidateId } = input;
   if (!candidateId || !executive.entry || !executive.laneId || !executive.symbolOrBasketId) return "NO_EXACT_CANDIDATE";
@@ -144,6 +149,30 @@ export function attachExecutiveReviewToExactPaperOrder(input: {
     reasonCode: null,
     positionId: null,
     outcomeId: null,
+    // Additive Four-Brain economic-learning identity — every value below is read straight off
+    // `executive`/`order.causalIdentity`, both already exact and already validated by the checks
+    // above (hasCurrentPolicy + opportunityId presence); none of it is parsed back out of a
+    // composite id or rehydrated from later/current state.
+    executiveDecisionId: executive.decisionId,
+    instanceId: order.causalIdentity.instanceId,
+    symbolOrBasketId: executive.symbolOrBasketId,
+    policyDeploymentAt: order.causalIdentity.policyDeploymentAt,
+    executiveDecisionTimeMs: executive.asOfMs,
+    marketStateDecision: executive.marketState,
+    directionDecision: executive.direction,
+    entryDecision: executive.entry,
+    brainFeatureSnapshot: input.brainFeatureSnapshot ?? null,
+    brainFeatureSchemaVersions: {
+      executive: executive.schemaVersion,
+      marketState: executive.marketState.schemaVersion,
+      direction: executive.direction?.schemaVersion ?? null,
+      entry: executive.entry?.schemaVersion ?? null,
+    },
+    sourceStatuses: {
+      ...executive.marketState.sourceStatuses,
+      ...(executive.direction?.sourceStatuses ?? {}),
+      ...(executive.entry?.sourceStatuses ?? {}),
+    },
   };
   const existing = input.reviewStore.get().reviews.find((review) => review.executiveReviewId === record.executiveReviewId);
   if (existing && !sameReview(existing, record)) return "REVIEW_CONFLICT";

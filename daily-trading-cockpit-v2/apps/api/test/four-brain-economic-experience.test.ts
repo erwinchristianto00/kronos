@@ -6,53 +6,106 @@ import {
   executiveDecisionIdFromReviewId,
   fourBrainExitAttributionStatus,
   type FourBrainEconomicRejectionReason,
+  type FourBrainPolicyContext,
 } from "../src/lib/four-brain-economic-experience.js";
-import type { ExecutiveReviewOutcome, ExecutiveReviewRecord } from "../src/lib/executive-review-store.js";
-import type { ExecutiveJournalRow } from "../src/lib/four-brain-journal.js";
+import type { ExecutiveReviewOutcome } from "../src/lib/executive-review-store.js";
+import type { DirectionDecision, EntryDecision, MarketStateDecision } from "../src/lib/four-brain-types.js";
 
-const POLICY = {
+const DAY_MS = 86_400_000;
+const POLICY: FourBrainPolicyContext = {
+  instanceId: "3101",
   decisionPipelinePolicyVersion: "pipeline/v2",
   executionPolicyVersion: "execution/v2",
   evidencePolicyVersion: "evidence/v2",
+  evidenceEra: "post-fix/2",
   fourBrainPolicyVersion: "executive/2",
+  policyDeploymentAt: "2026-07-29T00:00:00.000Z",
 };
+const DEPLOY_MS = Date.parse(POLICY.policyDeploymentAt);
+const NOW_MS = DEPLOY_MS + 10 * DAY_MS;
 
-const EXEC_DECISION_ID = "exec-dec-123";
-const OPPORTUNITY_ID = "opportunity-abc";
-const EXECUTIVE_REVIEW_ID = `executive-review:${EXEC_DECISION_ID}:${OPPORTUNITY_ID}`;
-
-function validReview(overrides: Partial<ExecutiveReviewRecord> = {}): ExecutiveReviewRecord {
+function marketStateDecision(overrides: Partial<MarketStateDecision> = {}): MarketStateDecision {
   return {
-    executiveReviewId: EXECUTIVE_REVIEW_ID,
-    candidateId: "candidate-1",
-    opportunityId: OPPORTUNITY_ID,
-    laneId: "CG_WIDE_FAST_LONG",
-    marketContextSnapshotId: "snapshot-1",
-    allocationSnapshotId: null,
-    strategyAction: "ENTER",
-    direction: "LONG",
-    marketState: "TREND",
-    evidenceEra: "POST_END_TO_END_CORRECTNESS_FIX_V2",
-    advisoryVerdict: "VALID",
-    advisoryOnly: true,
-    reviewedAtMs: 1_000,
-    sourceCutoffMs: 500,
-    ...POLICY,
-    state: "TIER1_ELIGIBLE",
-    reasonCode: null,
-    positionId: "position-1",
-    outcomeId: "outcome-1",
+    schemaVersion: "market-state/1",
+    decisionId: "ms-1",
+    asOfMs: DEPLOY_MS + DAY_MS - 60_000,
+    validUntilMs: DEPLOY_MS + DAY_MS,
+    family: "TREND",
+    bias: "BULLISH",
+    volatility: "NORMAL",
+    liquidity: "NORMAL",
+    transitionRisk: 0.1,
+    confidence: 0.8,
+    components: { trendScore: 0.4, volatilityScore: 0.2, liquidityScore: 0.3, breadthScore: null, momentumScore: null, eventRiskScore: null, sentimentScore: null },
+    reasons: [],
+    sourceStatuses: { trend: "FRESH" },
+    ...overrides,
+  };
+}
+
+function directionDecision(overrides: Partial<DirectionDecision> = {}): DirectionDecision {
+  return {
+    schemaVersion: "direction/1",
+    decisionId: "dir-1",
+    asOfMs: DEPLOY_MS + DAY_MS - 60_000,
+    validUntilMs: DEPLOY_MS + DAY_MS,
+    horizon: "INTRADAY",
+    modelScope: "MARKET_LEVEL",
+    evaluationHorizon: "INTRADAY",
+    marketDirection: "LONG",
+    action: "LONG",
+    longScore: 0.8,
+    shortScore: 0.1,
+    flatScore: 0.1,
+    confidence: 0.8,
+    directionConfidence: 0.8,
+    dataCoverage: 1,
+    directionEvidenceFamilies: {
+      marketStructure: { available: true, contribution: 0.5, credibilityPenalty: 0, reasons: [] },
+      incumbentEconomic: { available: true, contribution: 0.3, credibilityPenalty: 0, reasons: [] },
+      externalForecasts: { available: false, contribution: null, credibilityPenalty: null, reasons: [] },
+      flow: { available: false, contribution: null, credibilityPenalty: null, reasons: [] },
+      selfEvidence: { available: false, contribution: null, credibilityPenalty: null, reasons: [] },
+    },
+    expectedDirectionalR: 0.3,
+    supportingSignals: [],
+    conflictingSignals: [],
+    sourceStatuses: { trend: "FRESH" },
+    ...overrides,
+  };
+}
+
+function entryDecision(overrides: Partial<EntryDecision> = {}): EntryDecision {
+  return {
+    schemaVersion: "entry/1",
+    decisionId: "entry-1",
+    asOfMs: DEPLOY_MS + DAY_MS - 60_000,
+    validUntilMs: DEPLOY_MS + DAY_MS,
+    action: "ENTER_NOW",
+    side: "LONG",
+    orderType: "MARKET",
+    targetEntry: 65_000,
+    invalidationPrice: 64_000,
+    initialStopPrice: 64_000,
+    expectedNetR: 0.3,
+    chaseRisk: 0.1,
+    slippageRisk: 0.1,
+    confidence: 0.8,
+    reasons: [],
+    sourceStatuses: { candle: "FRESH" },
     ...overrides,
   };
 }
 
 function validOutcome(overrides: Partial<ExecutiveReviewOutcome> = {}): ExecutiveReviewOutcome {
+  const entryAtMs = DEPLOY_MS + DAY_MS;
+  const resolvedAtMs = entryAtMs + 60_000;
   return {
     executiveReviewOutcomeId: "executive-review-outcome:1",
-    executiveReviewId: EXECUTIVE_REVIEW_ID,
+    executiveReviewId: "executive-review:exec-1:opp-1",
     tier: "TIER_1_REAL",
     candidateId: "candidate-1",
-    opportunityId: OPPORTUNITY_ID,
+    opportunityId: "opp-1",
     executionIntentId: "intent-1",
     orderId: "order-1",
     positionId: "position-1",
@@ -62,13 +115,13 @@ function validOutcome(overrides: Partial<ExecutiveReviewOutcome> = {}): Executiv
     laneId: "CG_WIDE_FAST_LONG",
     direction: "LONG",
     marketState: "TREND",
-    evidenceEra: "POST_END_TO_END_CORRECTNESS_FIX_V2",
+    evidenceEra: POLICY.evidenceEra,
     strategyAction: "ENTER",
     advisoryVerdict: "VALID",
     incumbentAction: "ENTERED",
     advisoryOnly: true,
-    entryAtMs: 2_000,
-    resolvedAtMs: 3_000,
+    entryAtMs,
+    resolvedAtMs,
     originalRisk: 100,
     grossR: 0.5,
     costR: 0.05,
@@ -78,222 +131,228 @@ function validOutcome(overrides: Partial<ExecutiveReviewOutcome> = {}): Executiv
     matchedRequiredOrderIds: ["order-1"],
     missingRequiredOrderIds: [],
     netR: 0.45,
-    ...POLICY,
+    decisionPipelinePolicyVersion: POLICY.decisionPipelinePolicyVersion,
+    executionPolicyVersion: POLICY.executionPolicyVersion,
+    evidencePolicyVersion: POLICY.evidencePolicyVersion,
+    fourBrainPolicyVersion: POLICY.fourBrainPolicyVersion,
     eligibleForFourBrainEvaluation: true,
     eligibleForCortexLearning: false,
+    executiveDecisionId: "exec-1",
+    instanceId: "3101",
+    symbolOrBasketId: "BTCUSDT",
+    policyDeploymentAt: POLICY.policyDeploymentAt,
+    executiveDecisionTimeMs: entryAtMs - 60_000,
+    marketStateDecision: marketStateDecision(),
+    directionDecision: directionDecision(),
+    entryDecision: entryDecision(),
+    brainFeatureSnapshot: { trendScore: 0.4 },
+    brainFeatureSchemaVersions: { executive: "executive/2" },
+    sourceStatuses: { trend: "FRESH" },
+    exactCloseTimeMs: resolvedAtMs,
     ...overrides,
   };
 }
 
-function validJournalRow(overrides: Partial<Record<string, unknown>> = {}): ExecutiveJournalRow {
-  const raw: Record<string, unknown> = {
-    kind: "EXECUTIVE_DECISION",
-    reportOnly: true,
-    schemaVersions: { executive: "executive/2", marketState: "market-state/1", direction: "direction/1", entry: "entry/1", exit: null },
-    decisionIds: { executive: EXEC_DECISION_ID },
-    laneId: "CG_WIDE_FAST_LONG",
-    symbolOrBasketId: "BTCUSDT",
-    candidateStatus: "VALID",
-    wouldAct: true,
-    sourceStatuses: { trend: "FRESH", liquidity: "FRESH" },
-    normalizedFeatures: { trendScore: 0.4, momentumScore: 0.2 },
-    rawFeatures: { trendScoreRaw: 0.41 },
-    brains: {
-      marketState: { family: "TREND" },
-      direction: { marketDirection: "LONG" },
-      entry: { action: "ENTER_NOW" },
-      exit: null,
-    },
-    ...overrides,
-  };
-  return {
-    decisionId: EXEC_DECISION_ID,
-    asOfMs: 1_000,
-    candidateStatus: "VALID",
-    wouldAct: true,
-    laneId: "CG_WIDE_FAST_LONG",
-    symbolOrBasketId: "BTCUSDT",
-    disagreements: [],
-    raw,
-  };
+function run(outcome: ExecutiveReviewOutcome, policy: FourBrainPolicyContext = POLICY) {
+  return buildFourBrainExecutiveExperiences([outcome], policy, NOW_MS);
 }
 
-function journalMap(...rows: ExecutiveJournalRow[]): Map<string, ExecutiveJournalRow> {
-  return new Map(rows.map((row) => [row.decisionId, row]));
-}
-
-describe("Four-Brain economic experience adapter", () => {
-  it("exact valid chain: builds MarketState, Direction, and Entry experiences from one resolved Tier-1 review", () => {
-    const result = buildFourBrainExecutiveExperiences([validOutcome()], [validReview()], journalMap(validJournalRow()), POLICY);
+describe("Four-Brain economic experience adapter (hardened)", () => {
+  it("exact valid chain: all three brains reach DIRECT_LEARNING_ELIGIBLE from one resolved review", () => {
+    const result = run(validOutcome());
     expect(result.experiences).toHaveLength(3);
-    const brains = result.experiences.map((e) => e.brain).sort();
-    expect(brains).toEqual(["DIRECTION", "ENTRY", "MARKET_STATE"]);
     for (const experience of result.experiences) {
       expect(experience.attributionEligibility).toBe("DIRECT_LEARNING_ELIGIBLE");
+      expect(experience.evaluationOnlyReasons).toEqual([]);
       expect(experience.economicClass).toBe("POSITIVE");
       expect(experience.schemaVersion).toBe(FOUR_BRAIN_ECONOMIC_SCHEMA_VERSION);
-      expect(experience.executiveDecisionId).toBe(EXEC_DECISION_ID);
-      expect(experience.opportunityId).toBe(OPPORTUNITY_ID);
-      expect(experience.outcomeId).toBe("outcome-1");
-      expect(experience.laneId).toBe("CG_WIDE_FAST_LONG");
-      expect(experience.symbolOrBasketId).toBe("BTCUSDT");
     }
-    const totalRejected = Object.values(result.rejected).reduce((a, b) => a + b, 0);
-    expect(totalRejected).toBe(0);
+    expect(Object.values(result.rejected).reduce((a, b) => a + b, 0)).toBe(0);
   });
 
-  it("preserves continuous fractional netR exactly, never rounding or binarizing it", () => {
+  it("preserves continuous fractional netR exactly", () => {
     const outcome = validOutcome({ grossR: 0.173456, costR: 0.02, netR: 0.153456 });
-    const result = buildFourBrainExecutiveExperiences([outcome], [validReview()], journalMap(validJournalRow()), POLICY);
-    expect(result.experiences.length).toBeGreaterThan(0);
+    const result = run(outcome);
     for (const experience of result.experiences) expect(experience.netR).toBeCloseTo(0.153456, 9);
   });
 
-  it("decodes the executive decisionId embedded in the deterministic executiveReviewId construction", () => {
-    expect(executiveDecisionIdFromReviewId(EXECUTIVE_REVIEW_ID, OPPORTUNITY_ID)).toBe(EXEC_DECISION_ID);
-    expect(executiveDecisionIdFromReviewId(EXECUTIVE_REVIEW_ID, "wrong-opportunity")).toBeNull();
-    expect(executiveDecisionIdFromReviewId("not-the-right-shape", OPPORTUNITY_ID)).toBeNull();
+  it("decodes the executive decisionId embedded in the legacy executiveReviewId construction (diagnostic use only)", () => {
+    expect(executiveDecisionIdFromReviewId("executive-review:exec-1:opp-1", "opp-1")).toBe("exec-1");
+    expect(executiveDecisionIdFromReviewId("executive-review:exec-1:opp-1", "wrong-opportunity")).toBeNull();
   });
 
-  const rejectionCase = (
-    name: string,
-    mutate: (ctx: { review: ExecutiveReviewRecord; outcome: ExecutiveReviewOutcome; journal: ExecutiveJournalRow }) => void,
-    expectedReason: FourBrainEconomicRejectionReason,
-  ) =>
-    it(name, () => {
-      const ctx = { review: validReview(), outcome: validOutcome(), journal: validJournalRow() };
-      mutate(ctx);
-      const result = buildFourBrainExecutiveExperiences([ctx.outcome], [ctx.review], journalMap(ctx.journal), POLICY);
+  describe("exact policy/cohort context", () => {
+    it("rejects a wrong-instance outcome even with otherwise-correct policy versions", () => {
+      const outcome = validOutcome({ instanceId: "3102" });
+      const result = run(outcome, POLICY); // POLICY expects 3101
       expect(result.experiences).toHaveLength(0);
-      expect(result.rejected[expectedReason]).toBeGreaterThan(0);
+      expect(result.rejected.IDENTITY_MISMATCH).toBe(1);
     });
 
-  describe("causality", () => {
-    rejectionCase(
-      "mismatched opportunity/outcome ownership is rejected",
-      (ctx) => { ctx.outcome.opportunityId = "some-other-opportunity"; },
-      "IDENTITY_MISMATCH",
-    );
-    rejectionCase(
-      "wrong lane between review and outcome is rejected",
-      (ctx) => { ctx.outcome.laneId = "CG_WIDE_FAST_SHORT"; },
-      "IDENTITY_MISMATCH",
-    );
-    rejectionCase(
-      "stale policy context is rejected (a different 4-tuple than the expected current one)",
-      (ctx) => { ctx.outcome.fourBrainPolicyVersion = "executive/1"; },
-      "STALE_POLICY_CONTEXT",
-    );
-    it("this source has no separate policyDeploymentAt cutover — staleness is instead fully covered by the exact 4-tuple match, so an old-era record is caught by STALE_POLICY_CONTEXT rather than a PRE_CUTOVER check that has no field to test against", () => {
-      const outcome = validOutcome({ decisionPipelinePolicyVersion: "pipeline/v1" });
-      const result = buildFourBrainExecutiveExperiences([outcome], [validReview()], journalMap(validJournalRow()), POLICY);
+    it("never combines 3101 and 3102 — the same outcome set yields opposite results under each instance context", () => {
+      const outcome3101 = validOutcome({ instanceId: "3101" });
+      const resultAs3101 = run(outcome3101, { ...POLICY, instanceId: "3101" });
+      expect(resultAs3101.experiences).toHaveLength(3);
+      const resultAs3102 = run(outcome3101, { ...POLICY, instanceId: "3102" });
+      expect(resultAs3102.experiences).toHaveLength(0);
+      expect(resultAs3102.rejected.IDENTITY_MISMATCH).toBe(1);
+    });
+
+    it("rejects stale policy versions (a different 4/5-tuple than the expected current one)", () => {
+      const outcome = validOutcome({ fourBrainPolicyVersion: "executive/1" });
+      const result = run(outcome);
       expect(result.experiences).toHaveLength(0);
       expect(result.rejected.STALE_POLICY_CONTEXT).toBe(1);
-      expect(result.rejected.PRE_CUTOVER).toBe(0);
     });
-    it("a missing review for the outcome's executiveReviewId is rejected, not silently dropped", () => {
-      const result = buildFourBrainExecutiveExperiences([validOutcome()], [], journalMap(validJournalRow()), POLICY);
+
+    it("rejects same policy versions but a decision/entry time before the cutover (PRE_CUTOVER)", () => {
+      const laterCutover = new Date(DEPLOY_MS + 5 * DAY_MS).toISOString();
+      const result = run(validOutcome(), { ...POLICY, policyDeploymentAt: laterCutover });
       expect(result.experiences).toHaveLength(0);
-      expect(result.rejected.MISSING_CAUSAL_IDENTITY).toBe(1);
+      expect(result.rejected.PRE_CUTOVER).toBe(1);
+      expect(result.rejected.STALE_POLICY_CONTEXT).toBe(0);
     });
-    it("intrabarAmbiguous is always false from this source (real exchange-settled fills, not a simulated candle-walk)", () => {
-      const result = buildFourBrainExecutiveExperiences([validOutcome()], [validReview()], journalMap(validJournalRow()), POLICY);
-      for (const experience of result.experiences) expect(experience.intrabarAmbiguous).toBe(false);
+
+    it("rejects a future policyDeploymentAt as a malformed/untrustworthy cutover", () => {
+      const futureCutover = new Date(NOW_MS + DAY_MS).toISOString();
+      const result = run(validOutcome({ policyDeploymentAt: futureCutover }), { ...POLICY, policyDeploymentAt: futureCutover });
+      expect(result.experiences).toHaveLength(0);
+      expect(result.rejected.STALE_POLICY_CONTEXT).toBe(1);
+    });
+
+    it("this source has no separate PRE_CUTOVER field on legacy records — an unstamped record is EVALUATION_ONLY via LEGACY_UNSTAMPED_RECORD, not a hard PRE_CUTOVER rejection", () => {
+      const legacy = validOutcome({ executiveDecisionId: null, instanceId: null, policyDeploymentAt: null, executiveDecisionTimeMs: null });
+      const result = run(legacy);
+      expect(result.experiences.length).toBeGreaterThan(0);
+      expect(result.rejected.PRE_CUTOVER).toBe(0);
+      for (const experience of result.experiences) {
+        expect(experience.attributionEligibility).toBe("EVALUATION_ONLY");
+        expect(experience.evaluationOnlyReasons).toContain("LEGACY_UNSTAMPED_RECORD");
+      }
     });
   });
 
-  describe("economic adapter", () => {
-    rejectionCase(
-      "missing immutable risk is rejected",
-      (ctx) => { ctx.outcome.originalRisk = 0; },
-      "MISSING_IMMUTABLE_RISK",
-    );
-    rejectionCase(
-      "non-finite immutable risk is rejected",
-      (ctx) => { ctx.outcome.originalRisk = Number.NaN; },
-      "MISSING_IMMUTABLE_RISK",
-    );
-    rejectionCase(
-      "incomplete settlement (missing required order ids) is rejected",
-      (ctx) => { ctx.outcome.missingRequiredOrderIds = ["order-2"]; },
-      "INCOMPLETE_COST",
-    );
-    rejectionCase(
-      "negative canonical cost is rejected even if arithmetically self-consistent",
-      (ctx) => { ctx.outcome.costR = -0.05; ctx.outcome.grossR = 0.4; ctx.outcome.netR = 0.45; },
-      "INVALID_COST_CONVENTION",
-    );
-    rejectionCase(
-      "an arithmetic mismatch between gross, cost, and net is rejected",
-      (ctx) => { ctx.outcome.grossR = 1.0; ctx.outcome.costR = 0.05; ctx.outcome.netR = 0.9; },
-      "ECONOMIC_ARITHMETIC_MISMATCH",
-    );
-    rejectionCase(
-      "a resolvedAtMs before entryAtMs is rejected",
-      (ctx) => { ctx.outcome.resolvedAtMs = ctx.outcome.entryAtMs - 1; },
-      "INVALID_OUTCOME_QUALITY",
-    );
-    it("a missing feature snapshot (journal retention gap — no matching journal row at all) is rejected, not silently dropped", () => {
-      const result = buildFourBrainExecutiveExperiences([validOutcome()], [validReview()], new Map(), POLICY);
-      expect(result.experiences).toHaveLength(0);
-      expect(result.rejected.MISSING_FEATURE_SNAPSHOT).toBe(1);
+  describe("causal clocks", () => {
+    it("uses the persisted executiveDecisionTimeMs, never review.reviewedAtMs (which no longer even exists on this merged type)", () => {
+      const distinctDecisionTimeMs = DEPLOY_MS + DAY_MS - 12_345;
+      const outcome = validOutcome({ executiveDecisionTimeMs: distinctDecisionTimeMs });
+      const result = run(outcome);
+      for (const experience of result.experiences) expect(experience.decisionTimeMs).toBe(distinctDecisionTimeMs);
     });
-    it("a journal row present but with neither normalizedFeatures nor rawFeatures is rejected the same way", () => {
-      const journal = validJournalRow({ normalizedFeatures: null, rawFeatures: null });
-      const result = buildFourBrainExecutiveExperiences([validOutcome()], [validReview()], journalMap(journal), POLICY);
-      expect(result.experiences).toHaveLength(0);
-      expect(result.rejected.MISSING_FEATURE_SNAPSHOT).toBe(1);
+
+    it("accepts the exact persisted decision time end-to-end (direct-learning eligible)", () => {
+      const result = run(validOutcome());
+      expect(result.experiences[0]!.attributionEligibility).toBe("DIRECT_LEARNING_ELIGIBLE");
     });
-    it("unresolved (no resolvedAtMs) is never counted as negative — it is its own distinct rejection", () => {
-      const outcome = validOutcome({ resolvedAtMs: 0 as unknown as number });
-      const result = buildFourBrainExecutiveExperiences([outcome], [validReview()], journalMap(validJournalRow()), POLICY);
+
+    it("a missing exact close time caps eligibility at EVALUATION_ONLY rather than silently substituting resolvedAtMs", () => {
+      const outcome = validOutcome({ exactCloseTimeMs: null });
+      const result = run(outcome);
+      expect(result.experiences.length).toBeGreaterThan(0);
+      for (const experience of result.experiences) {
+        expect(experience.attributionEligibility).toBe("EVALUATION_ONLY");
+        expect(experience.evaluationOnlyReasons).toContain("MISSING_EXACT_CLOSE_TIME");
+        // The economic class is still computed from a best-effort clock (never thrown away)...
+        expect(experience.economicClass).not.toBe("INVALID");
+        // ...but that best-effort value is never claimed to be the exact close time.
+        expect(experience.closedTimeMs).toBe(outcome.resolvedAtMs);
+      }
+    });
+
+    it("a persisted feature snapshot surviving independently of any journal proves the journal-retention gap is closed", () => {
+      // No journal object is ever passed to this adapter — feature availability depends only on
+      // whether admission captured brainFeatureSnapshot on the outcome itself.
+      const result = run(validOutcome());
+      expect(result.experiences.every((e) => e.attributionEligibility === "DIRECT_LEARNING_ELIGIBLE")).toBe(true);
+    });
+
+    it("a missing persisted feature snapshot is EVALUATION_ONLY, not silently dropped", () => {
+      const outcome = validOutcome({ brainFeatureSnapshot: null });
+      const result = run(outcome);
+      expect(result.experiences.length).toBeGreaterThan(0);
+      for (const experience of result.experiences) {
+        expect(experience.attributionEligibility).toBe("EVALUATION_ONLY");
+        expect(experience.evaluationOnlyReasons).toContain("MISSING_FEATURE_SNAPSHOT");
+      }
+    });
+  });
+
+  describe("economic adapter (hard gates, unchanged)", () => {
+    const rejectionCase = (
+      name: string,
+      mutate: (o: ExecutiveReviewOutcome) => ExecutiveReviewOutcome,
+      expectedReason: FourBrainEconomicRejectionReason,
+    ) =>
+      it(name, () => {
+        const result = run(mutate(validOutcome()));
+        expect(result.experiences).toHaveLength(0);
+        expect(result.rejected[expectedReason]).toBeGreaterThan(0);
+      });
+
+    rejectionCase("missing immutable risk is rejected", (o) => ({ ...o, originalRisk: 0 }), "MISSING_IMMUTABLE_RISK");
+    rejectionCase("non-finite immutable risk is rejected", (o) => ({ ...o, originalRisk: Number.NaN }), "MISSING_IMMUTABLE_RISK");
+    rejectionCase("incomplete settlement is rejected", (o) => ({ ...o, missingRequiredOrderIds: ["order-2"] }), "INCOMPLETE_COST");
+    rejectionCase("negative canonical cost is rejected", (o) => ({ ...o, costR: -0.05, grossR: 0.4, netR: 0.45 }), "INVALID_COST_CONVENTION");
+    rejectionCase("an arithmetic mismatch is rejected", (o) => ({ ...o, grossR: 1.0, costR: 0.05, netR: 0.9 }), "ECONOMIC_ARITHMETIC_MISMATCH");
+    rejectionCase("resolvedAtMs before entryAtMs is rejected", (o) => ({ ...o, resolvedAtMs: o.entryAtMs - 1 }), "INVALID_OUTCOME_QUALITY");
+
+    it("unresolved is never counted as negative", () => {
+      const result = run({ ...validOutcome(), resolvedAtMs: 0 as unknown as number });
       expect(result.experiences).toHaveLength(0);
       expect(result.rejected.UNRESOLVED).toBe(1);
-      expect(result.rejected.ECONOMIC_ARITHMETIC_MISMATCH).toBe(0);
     });
 
-    it("does not silently drop non-Tier-1 or non-eligible rows — SOURCE_ERROR is counted", () => {
-      const tier2 = validOutcome({ tier: "TIER_2_COUNTERFACTUAL" as never });
-      const result = buildFourBrainExecutiveExperiences([tier2], [validReview()], journalMap(validJournalRow()), POLICY);
+    it("non-Tier-1 or non-eligible rows are counted as SOURCE_ERROR, never silently dropped", () => {
+      const result = run({ ...validOutcome(), tier: "TIER_2_COUNTERFACTUAL" as never });
       expect(result.experiences).toHaveLength(0);
       expect(result.rejected.SOURCE_ERROR).toBe(1);
     });
 
-    it("a source-status ERROR anywhere in the joined journal row is rejected", () => {
-      const journal = validJournalRow({ sourceStatuses: { trend: "ERROR" } });
-      const result = buildFourBrainExecutiveExperiences([validOutcome()], [validReview()], journalMap(journal), POLICY);
-      expect(result.experiences).toHaveLength(0);
-      expect(result.rejected.SOURCE_ERROR).toBe(1);
+    it("intrabarAmbiguous is always false (real exchange-settled fills, never a simulated candle-walk)", () => {
+      for (const experience of run(validOutcome()).experiences) expect(experience.intrabarAmbiguous).toBe(false);
     });
   });
 
-  describe("brain-level attribution", () => {
-    it("Market State only receives credit when its own decision object was present at the joined tick", () => {
-      const journal = validJournalRow({ brains: { marketState: null, direction: { marketDirection: "LONG" }, entry: { action: "ENTER_NOW" }, exit: null } });
-      const result = buildFourBrainExecutiveExperiences([validOutcome()], [validReview()], journalMap(journal), POLICY);
-      const brains = result.experiences.map((e) => e.brain);
-      expect(brains).not.toContain("MARKET_STATE");
-      expect(brains).toContain("DIRECTION");
-      expect(brains).toContain("ENTRY");
+  describe("brain-level attribution — object presence alone is insufficient", () => {
+    it("Market State is EVALUATION_ONLY when its own decision object is absent, without affecting Direction/Entry", () => {
+      const result = run(validOutcome({ marketStateDecision: null }));
+      const byBrain = new Map(result.experiences.map((e) => [e.brain, e]));
+      expect(byBrain.get("MARKET_STATE")!.attributionEligibility).toBe("EVALUATION_ONLY");
+      expect(byBrain.get("MARKET_STATE")!.evaluationOnlyReasons).toContain("BRAIN_DECISION_ABSENT");
+      expect(byBrain.get("DIRECTION")!.attributionEligibility).toBe("DIRECT_LEARNING_ELIGIBLE");
+      expect(byBrain.get("ENTRY")!.attributionEligibility).toBe("DIRECT_LEARNING_ELIGIBLE");
     });
 
-    it("a lane-A outcome never produces an experience attributed to lane B", () => {
-      const laneAJournal = validJournalRow({ decisionIds: { executive: "exec-a" }, laneId: "LANE_A" });
-      const laneAReview = validReview({ executiveReviewId: "executive-review:exec-a:opp-a", opportunityId: "opp-a", laneId: "LANE_A" });
-      const laneAOutcome = validOutcome({ executiveReviewId: "executive-review:exec-a:opp-a", opportunityId: "opp-a", laneId: "LANE_A" });
-      const result = buildFourBrainExecutiveExperiences(
-        [laneAOutcome],
-        [laneAReview],
-        journalMap({ ...laneAJournal, decisionId: "exec-a" }),
-        POLICY,
-      );
-      expect(result.experiences.every((e) => e.laneId === "LANE_A")).toBe(true);
-      expect(result.experiences.some((e) => e.laneId === "LANE_B")).toBe(false);
+    it("Direction object present but its OWN call disagrees with the realized outcome direction is not directly eligible", () => {
+      const result = run(validOutcome({ directionDecision: directionDecision({ marketDirection: "SHORT" }) }));
+      const byBrain = new Map(result.experiences.map((e) => [e.brain, e]));
+      expect(byBrain.get("DIRECTION")!.attributionEligibility).toBe("EVALUATION_ONLY");
+      expect(byBrain.get("DIRECTION")!.evaluationOnlyReasons).toContain("BRAIN_DECISION_INEXACT");
+      expect(byBrain.get("ENTRY")!.attributionEligibility).toBe("DIRECT_LEARNING_ELIGIBLE");
     });
 
-    it("when the outcome itself is invalid (missing immutable risk), no brain gets any credit — not just Entry", () => {
-      const outcome = validOutcome({ originalRisk: 0 });
-      const result = buildFourBrainExecutiveExperiences([outcome], [validReview()], journalMap(validJournalRow()), POLICY);
+    it("Entry object present but its side disagrees with the realized outcome direction is not directly eligible", () => {
+      const result = run(validOutcome({ entryDecision: entryDecision({ side: "SHORT" }) }));
+      const byBrain = new Map(result.experiences.map((e) => [e.brain, e]));
+      expect(byBrain.get("ENTRY")!.attributionEligibility).toBe("EVALUATION_ONLY");
+      expect(byBrain.get("ENTRY")!.evaluationOnlyReasons).toContain("BRAIN_DECISION_INEXACT");
+    });
+
+    it("Entry object present but missing an exact price/stop snapshot is not directly eligible", () => {
+      const result = run(validOutcome({ entryDecision: entryDecision({ targetEntry: null }) }));
+      const byBrain = new Map(result.experiences.map((e) => [e.brain, e]));
+      expect(byBrain.get("ENTRY")!.attributionEligibility).toBe("EVALUATION_ONLY");
+      expect(byBrain.get("ENTRY")!.evaluationOnlyReasons).toContain("BRAIN_DECISION_INEXACT");
+    });
+
+    it("Entry object present but not an ENTER_NOW action is not directly eligible", () => {
+      const result = run(validOutcome({ entryDecision: entryDecision({ action: "WAIT_PULLBACK" }) }));
+      const byBrain = new Map(result.experiences.map((e) => [e.brain, e]));
+      expect(byBrain.get("ENTRY")!.attributionEligibility).toBe("EVALUATION_ONLY");
+    });
+
+    it("when the outcome itself fails a hard gate, no brain gets any experience at all", () => {
+      const result = run(validOutcome({ originalRisk: 0 }));
       expect(result.experiences).toHaveLength(0);
     });
   });
