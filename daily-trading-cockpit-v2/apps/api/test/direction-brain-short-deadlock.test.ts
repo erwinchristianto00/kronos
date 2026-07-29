@@ -68,8 +68,12 @@ describe("the guards that keep it narrow", () => {
     expect(d.action).toBe("FLAT");
   });
 
-  it.each([["shortVeto"], ["fourBrainShortVeto"]])("does NOT explore against %s", (veto) => {
-    expect(decideDirection(deadlock({ [veto]: true })).action).toBe("FLAT");
+  it("does not let a derivative incumbent veto become a duplicate Direction gate", () => {
+    expect(decideDirection(deadlock({ shortVeto: true })).action).toBe("SHORT");
+  });
+
+  it("does not explore against the independent Four-Brain self-evidence penalty", () => {
+    expect(decideDirection(deadlock({ fourBrainShortVeto: true })).action).toBe("FLAT");
   });
 
   it("PROVEN_BELOW still bars a side outright — exploration never rescues it", () => {

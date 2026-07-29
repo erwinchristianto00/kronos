@@ -1,4 +1,5 @@
 import Fastify, { type FastifyInstance } from "fastify";
+import { DECISION_PIPELINE_POLICY_VERSION } from "@dtc/shared";
 import { BinanceClient } from "./lib/binance.js";
 import { HttpKronosClient } from "./lib/kronos.js";
 import { HttpForecastChallengerClient } from "./lib/forecast-challenger.js";
@@ -151,7 +152,7 @@ import {
 } from "./lib/live-execution-engine.js";
 import { getLaneSymbolCurationCacheStore } from "./lib/lane-symbol-curation-cache.js";
 import type { LaneSymbolCurationTier } from "./lib/per-symbol-lane-book-edge.js";
-import { getPaperExecutionRouterStore } from "./lib/paper-execution-router.js";
+import { getPaperExecutionRouterStore, peekPaperExecutionRouterStore } from "./lib/paper-execution-router.js";
 import {
   isForceEligibleForDirection,
   getRealtimeShortMirrorStore,
@@ -196,6 +197,12 @@ import {
 } from "./lib/four-brain-outcome-ledger.js";
 import { loadPendingLedgerSnapshot, savePendingLedgerSnapshot } from "./lib/four-brain-pending-ledger-store.js";
 import { resolveFourBrainInstanceId, fourBrainInstanceAllowed, fourBrainShadowActive, type FourBrainBindingDeps } from "./lib/four-brain-live-gather-bindings.js";
+import { FRESHNESS_TTL_MS } from "./lib/four-brain-live-gather.js";
+import { staticAllocationContext, unavailableMarketContext } from "./lib/authority-contract.js";
+import { ExecutiveReviewStore } from "./lib/executive-review-store.js";
+import { attachExecutiveReviewToExactPaperOrder } from "./lib/executive-review-admission.js";
+import { markTerminalExecutiveReviewsTier2Only } from "./lib/executive-review-runtime.js";
+import { MarketContextSnapshotStore } from "./lib/market-context-snapshot-store.js";
 import { fourBrainMode } from "./lib/four-brain-types.js";
 import { getBtcAtrPercentileCacheStore, refreshBtcAtrPercentileCache } from "./lib/btc-atr-percentile-cache.js";
 import { buildLiveBestLaneReportForDirection } from "./lib/four-brain-best-lane-report.js";
@@ -407,6 +414,14 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
 
   // Disable tracking in test environments to avoid disk I/O during tests.
   const isTest = Boolean(process.env.VITEST);
+  // Executive review is strictly shadow-only and is hard-blocked on 3103 by the shared instance guard.
+  // Constructing the store does not create a review; only an incumbent producer with exact IDs may do that.
+  const executiveReviewStore = !isTest && fourBrainShadowActive(process.env)
+    ? new ExecutiveReviewStore("data/executive-review-store.json")
+    : null;
+  const marketContextSnapshotStore = !isTest && fourBrainShadowActive(process.env)
+    ? new MarketContextSnapshotStore("data")
+    : null;
   const tracker = isTest ? null : new SignalTracker();
   const performanceProvider = tracker ? new PerformanceStatsProvider(tracker) : null;
   const outcomeChecker = tracker ? new OutcomeChecker(tracker, binanceClient) : null;
@@ -810,6 +825,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       // currently not one exit fill price persisted anywhere. No new exchange call: the rows are
       // the ones settlement already matched. Same singleton as the executors below.
       executionFillRecorder: getExecutionFillRecorder(),
+      executiveReviewStore: executiveReviewStore ?? undefined,
       // Crowding-exit SHADOW measurement only (getStatus().crowdingExitShadow) — read-only market
       // data, never touches order placement. Reuses the same market-data client scan.ts uses.
       marketDataClient: binanceClient,
@@ -2531,11 +2547,23 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         // {price:null, atMs:null} exactly like the old stub did — the difference is a symbol WITH a real,
         // fresh position now gets a genuine mark instead of a permanent null.
         markPriceForSymbol: (symbol) => getLiveMarkPriceCacheStore().get(symbol),
-        // CORTEX exposes no decision id; at β=0 its finalPct equals the incumbent static weight, which is
-        // the correct allocation CONTEXT for the report-only executive linkage.
-        cortexDecisionId: `four-brain:${nowMs}`,
-        cortexFinalPctForLane: (laneId) => (engine ? engine.laneSelectionWeightPctForLane(laneId) : null),
-        laneEligibleIncumbent: (laneId) => (engine ? engine.laneSelectionWeightPctForLane(laneId) > 0 : true),
+        // Four-Brain receives strictly read-only, incumbent operator allocation telemetry. No synthetic
+        // CORTEX id is created: beta remains zero and no exact promoted snapshot exists to hand off.
+        allocationContextForLane: (laneId) =>
+          staticAllocationContext(engine ? engine.rawLaneAllocationWeightPctForLane(laneId) : null),
+        // A review may only use a scanner context that was atomically persisted before the decision.
+        // Missing/future scanner timestamps remain explicit unavailable lineage, never a latest-cache join.
+        marketContext: (() => {
+          const sourceCutoffMs = parseAtMs(scanCached?.scanFinishedAt);
+          const fresh = sourceCutoffMs !== null && nowMs - sourceCutoffMs <= FRESHNESS_TTL_MS.regime;
+          return marketContextSnapshotStore?.capture({
+            instanceId: resolveFourBrainInstanceId(process.env),
+            asOfMs: nowMs,
+            sourceCutoffMs: fresh ? sourceCutoffMs : Number.NaN,
+            decisionPipelinePolicyVersion: DECISION_PIPELINE_POLICY_VERSION,
+          }) ?? unavailableMarketContext(nowMs);
+        })(),
+        laneEligibleIncumbent: (laneId) => (engine ? engine.rawLaneAllocationWeightPctForLane(laneId) > 0 : true),
         killLatched: status?.killedAt != null,
         killReason: status?.killReason ?? null,
       };
@@ -2657,11 +2685,41 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           lastFourBrainGatherBase
             ? buildFourBrainJournalContext(lastFourBrainGatherBase, activeFourBrainAllocation())
             : { instanceId: resolveFourBrainInstanceId(process.env) },
+        onExecutiveDecision: (executive, identity) => {
+          if (!executiveReviewStore) return;
+          try {
+            const paperStore = peekPaperExecutionRouterStore();
+            if (!paperStore) return;
+            attachExecutiveReviewToExactPaperOrder({
+              reviewStore: executiveReviewStore,
+              paperStore,
+              executive,
+              candidateId: identity.signalId,
+              executingPaperOrderIds: new Set((liveExecutionStore?.getState().intents ?? []).map((intent) => intent.paperOrderId)),
+            });
+          } catch {
+            // Executive review creation cannot affect incumbent paper/exchange execution.
+          }
+        },
         metrics: fourBrainMetrics,
         now: () => Date.now(),
         perfNow: () => performance.now(), // monotonic clock for gather/inference/journal LATENCY only
       })
         .then((res) => {
+          if (executiveReviewStore) {
+            try {
+              const paperStore = peekPaperExecutionRouterStore();
+              if (paperStore) {
+                markTerminalExecutiveReviewsTier2Only(
+                  executiveReviewStore,
+                  paperStore.all,
+                  new Set((liveExecutionStore?.getState().intents ?? []).map((intent) => intent.paperOrderId)),
+                );
+              }
+            } catch {
+              // Tier classification remains fail-open relative to the incumbent cycle.
+            }
+          }
           if (!res.ran) return;
           const s = fourBrainMetrics.summary();
           console.log(

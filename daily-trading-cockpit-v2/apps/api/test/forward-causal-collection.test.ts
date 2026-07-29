@@ -126,6 +126,7 @@ describe("forward causal collection", () => {
     const env = shadowEnv(dir); const o = order();
     o.cortexDecisionSnapshot = {
       decisionId: "cortex-decision:900:1:CG_WIDE_FAST_LONG",
+      allocationSnapshotId: "cortex-allocation:cortex-decision:900:1:CG_WIDE_FAST_LONG",
       atMs: 900,
       laneId: "CG_WIDE_FAST_LONG",
       direction: "LONG",
@@ -171,7 +172,7 @@ describe("forward causal collection", () => {
     const dir = mkdtempSync(join(tmpdir(), "causal-legacy-cortex-")); dirs.push(dir);
     const env = shadowEnv(dir); const o = order();
     o.cortexDecisionSnapshot = {
-      decisionId: "cortex-decision:900:1:CG_WIDE_FAST_LONG", atMs: 900, laneId: "CG_WIDE_FAST_LONG", direction: "LONG",
+      decisionId: "cortex-decision:900:1:CG_WIDE_FAST_LONG", allocationSnapshotId: "cortex-allocation:cortex-decision:900:1:CG_WIDE_FAST_LONG", atMs: 900, laneId: "CG_WIDE_FAST_LONG", direction: "LONG",
       featureSchemaVersion: CORTEX_FEATURE_SCHEMA_VERSION, featureVector: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0.5],
       regimeFamily: "BULL", eligible: true, finalPct: 0, evalFinalPct: 0,
     };

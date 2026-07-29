@@ -203,12 +203,8 @@ export function decideDirection(input: DirectionInput): DirectionDecision {
       // on BOTH sides; the SHORT twin below was found first, but the LONG one was equally silent.
       reportOnlyConflicts.push("LONG discounted 30% — regime controller posture does not lean LONG");
     }
-    if (input.longVeto) {
-      longScore *= 0.25; // proven-negative penalty
-      conflicting.push("LONG proven-negative edge (edge-memory VETO)");
-    }
     if (input.fourBrainLongVeto) {
-      longScore *= 0.5; // second, independent proven-negative penalty (four-brain's own self-outcome memory)
+      longScore *= 0.85; // one bounded, independent credibility adjustment
       conflicting.push("LONG proven-negative (Four-Brain self-outcome VETO)");
     }
     longScore = clamp01(longScore);
@@ -232,12 +228,8 @@ export function decideDirection(input: DirectionInput): DirectionDecision {
       shortScore *= 0.7; // see the LONG twin above — same discount, same reporting obligation
       reportOnlyConflicts.push("SHORT discounted 30% — regime controller posture does not lean SHORT");
     }
-    if (input.shortVeto) {
-      shortScore *= 0.25;
-      conflicting.push("SHORT proven-negative edge (edge-memory VETO)");
-    }
     if (input.fourBrainShortVeto) {
-      shortScore *= 0.5; // second, independent proven-negative penalty (four-brain's own self-outcome memory)
+      shortScore *= 0.85; // one bounded, independent credibility adjustment
       conflicting.push("SHORT proven-negative (Four-Brain self-outcome VETO)");
     }
     shortScore = clamp01(shortScore);
@@ -256,7 +248,6 @@ export function decideDirection(input: DirectionInput): DirectionDecision {
   flatScore = Math.max(flatScore, clamp01(input.transitionRisk) * 0.8); // high transition risk favors standing aside
   const bestDir = Math.max(longScore, shortScore);
   flatScore = clamp01(Math.max(flatScore, 1 - bestDir - 0.1)); // as directional conviction rises, flat recedes
-  if (input.longVeto && input.shortVeto) flatScore = Math.max(flatScore, 0.8);
 
   // ── Action ──────────────────────────────────────────────────────────────────────────────────────
   // A side is barred ONLY by proven-negative evidence. UNPROVEN (no data, or n < DIRECTION_EDGE_MIN_SAMPLES)
@@ -321,9 +312,9 @@ export function decideDirection(input: DirectionInput): DirectionDecision {
   const explorationOpen = (self: EdgeStanding, other: EdgeStanding): boolean =>
     (self === "UNPROVEN" && other === "PROVEN_BELOW") || (coldStart && self === "UNPROVEN");
   const longExplores =
-    explorationOpen(longStanding, shortStanding) && !input.longVeto && !input.fourBrainLongVeto;
+    explorationOpen(longStanding, shortStanding) && !input.fourBrainLongVeto;
   const shortExplores =
-    explorationOpen(shortStanding, longStanding) && !input.shortVeto && !input.fourBrainShortVeto;
+    explorationOpen(shortStanding, longStanding) && !input.fourBrainShortVeto;
   if (longExplores) supporting.push("LONG unmeasured while SHORT is proven-below → exploration pass (not conviction)");
   if (shortExplores) supporting.push("SHORT unmeasured while LONG is proven-below → exploration pass (not conviction)");
   const longClears = (longScore > flatScore || longExplores) && longStanding !== "PROVEN_BELOW";
@@ -391,9 +382,22 @@ export function decideDirection(input: DirectionInput): DirectionDecision {
   const activeSourceCount = Object.keys(DEFAULT_TTL).length
     - (chronos2 === null ? 1 : 0)
     - (timesfm === null ? 1 : 0);
-  let confidence = clamp01(0.5 * separation + 0.5 * (freshCount / activeSourceCount));
+  // Availability is audit metadata, not directional conviction. A large number
+  // of fresh but non-directional sources must not manufacture confidence.
+  const dataCoverage = clamp01(freshCount / activeSourceCount);
+  let confidence = clamp01(separation);
   if (conflicting.length > 0) confidence *= 0.8; // conflicting signals reduce confidence
   confidence = clamp01(confidence);
+
+  const family = (available: boolean, contribution: number | null, credibilityPenalty: number | null, reasons: string[]) =>
+    ({ available, contribution, credibilityPenalty, reasons });
+  const externalValues = [kronos, chronos2, timesfm].filter((v): v is number => v !== null);
+  const incumbentValues = [longEdge, shortEdge].filter((v): v is number => v !== null);
+  const marketContribution =
+    input.marketBias === "BULLISH" ? 0.05 : input.marketBias === "BEARISH" ? -0.05 : 0;
+  const canonicalDirection: "LONG" | "SHORT" | "FLAT" =
+    action === "BOTH" ? (longScore >= shortScore ? "LONG" : "SHORT")
+      : action === "LONG" ? "LONG" : action === "SHORT" ? "SHORT" : "FLAT";
 
   const validUntilMs = nowMs + Math.max(0, input.validityMs || 0);
   return {
@@ -402,11 +406,43 @@ export function decideDirection(input: DirectionInput): DirectionDecision {
     asOfMs: nowMs,
     validUntilMs,
     horizon: input.horizon,
+    modelScope: "MARKET_LEVEL",
+    evaluationHorizon: input.horizon,
+    marketDirection: canonicalDirection,
     action,
     longScore: clamp01(longScore),
     shortScore: clamp01(shortScore),
     flatScore: clamp01(flatScore),
     confidence,
+    directionConfidence: confidence,
+    dataCoverage,
+    directionEvidenceFamilies: {
+      marketStructure: family(
+        conviction !== null || input.marketBias !== "NEUTRAL",
+        conviction === null ? marketContribution : clamp01(conviction) * (input.controllerBias === "SHORT" ? -1 : input.controllerBias === "LONG" ? 1 : 0) + marketContribution,
+        null,
+        ["market-state/controller contribution"],
+      ),
+      incumbentEconomic: family(
+        incumbentValues.length > 0,
+        incumbentValues.length ? Math.max(...incumbentValues) : null,
+        null,
+        ["one conservative regime/lane contribution; no derivative veto multiplier"],
+      ),
+      externalForecasts: family(
+        externalValues.length > 0,
+        externalValues.length ? externalValues.reduce((sum, value) => sum + value, 0) / externalValues.length : null,
+        null,
+        ["Kronos/Chronos/TimesFM bounded as one family"],
+      ),
+      flow: family(crowdLong !== null, crowdLong, null, ["crowding/flow contribution"]),
+      selfEvidence: family(
+        input.fourBrainLongVeto === true || input.fourBrainShortVeto === true,
+        null,
+        input.fourBrainLongVeto || input.fourBrainShortVeto ? 0.5 : null,
+        ["Four-Brain review history is a bounded credibility adjustment"],
+      ),
+    },
     expectedDirectionalR: expectedDirectionalR === null ? null : Number(expectedDirectionalR),
     supportingSignals: supporting,
     conflictingSignals: [...conflicting, ...reportOnlyConflicts],

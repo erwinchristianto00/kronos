@@ -8,7 +8,6 @@
  *   • Direction passes its hurdle (a directional action + cleared hurdle).
  *   • The lane is eligible under the INCUMBENT system (staticWeightPct>0 / FORCE_ELIGIBLE).
  *   • Entry is valid (ENTER_NOW).
- *   • CORTEX allocation for the lane is > 0.
  *   • The existing risk rails allow the opportunity (kill switch not latched, no rail block).
  *
  * Disagreements between the brains + incumbent are always journaled (never hidden) — they are the whole
@@ -24,6 +23,7 @@ import {
   type ExitDecision,
   type MarketStateDecision,
 } from "./four-brain-types.js";
+import { staticAllocationContext, unavailableMarketContext, type AllocationContext, type MarketContextLineage } from "./authority-contract.js";
 
 /**
  * Run a brain decision, failing OPEN on ANY exception (returns `fallback`, default null). The future
@@ -45,14 +45,15 @@ export interface ExecutiveInput {
   entry: EntryDecision | null;
   exit: ExitDecision | null;
 
-  cortexDecisionId?: string | null;
   laneId?: string | null;
   symbolOrBasketId?: string | null;
 
   /** Incumbent lane eligibility (staticWeightPct>0 / FORCE_ELIGIBLE). */
   laneEligibleIncumbent?: boolean;
-  /** CORTEX finalPct for the lane (0..100). 0 ⇒ not funded. null ⇒ unknown. */
-  cortexAllocationPct?: number | null;
+  /** Read-only operational telemetry. It cannot become a Direction/Entry score or execution gate. */
+  allocationContext?: AllocationContext;
+  /** Exact market snapshot lineage, or explicit unavailable. */
+  marketContext?: MarketContextLineage;
   /** Did direction clear its hurdle (a real directional preference)? Defaults to (action is directional). */
   directionHurdlePassed?: boolean;
 
@@ -74,7 +75,7 @@ function detectDisagreements(input: ExecutiveInput): string[] {
   const dir = input.direction;
   const entry = input.entry;
   const exit = input.exit;
-  const alloc = input.cortexAllocationPct;
+  const alloc = input.allocationContext;
 
   if (dir) {
     if (ms.bias === "BULLISH" && dir.action === "SHORT") d.push("Market State BULLISH, Direction SHORT");
@@ -85,10 +86,7 @@ function detectDisagreements(input: ExecutiveInput): string[] {
     // Strong direction resting on stale liquidity data.
     if (dir.confidence >= 0.6 && ms.sourceStatuses.liquidity === "STALE") d.push("Strong direction but STALE liquidity data");
   }
-  if (entry?.action === "ENTER_NOW" && alloc != null && alloc <= 0) d.push("Entry ENTER_NOW, CORTEX allocation zero");
-  if (alloc != null && alloc > 0 && entry && entry.action !== "ENTER_NOW") {
-    d.push("CORTEX favors the lane while Entry Brain rejects current timing");
-  }
+  if (alloc?.source === "UNAVAILABLE") d.push("allocation context unavailable (telemetry only)");
   if (exit?.action === "HOLD" && input.hardExitTriggered === true) d.push("Exit HOLD, hard stop already triggered");
   return d;
 }
@@ -97,7 +95,8 @@ export function buildExecutiveDecision(input: ExecutiveInput): ExecutiveDecision
   const ms = input.marketState;
   const dir = input.direction;
   const entry = input.entry;
-  const alloc = input.cortexAllocationPct;
+  const allocationContext = input.allocationContext ?? staticAllocationContext(null);
+  const marketContext = input.marketContext ?? unavailableMarketContext(input.nowMs);
   const reasons: string[] = [];
   const disagreements = detectDisagreements(input);
 
@@ -127,19 +126,18 @@ export function buildExecutiveDecision(input: ExecutiveInput): ExecutiveDecision
     candidateStatus = "WAIT";
     reasons.push(`Entry Brain ${entry.action}`);
   } else {
-    // entry.action === ENTER_NOW — evaluate the full VALID hurdle.
+    // Entry approval is an advisory quality verdict. Allocation is recorded for audit only;
+    // incumbent routing and risk rails remain the sole execution authorities.
     const eligible = input.laneEligibleIncumbent === true;
-    const funded = alloc != null && alloc > 0;
-    if (hurdlePassed && eligible && funded) {
+    if (hurdlePassed && eligible) {
       candidateStatus = "VALID";
-      reasons.push("all conditions pass (direction + incumbent eligibility + entry + CORTEX>0 + rails) — REPORT ONLY, no execution");
+      reasons.push("direction + incumbent eligibility + entry pass — ADVISORY ONLY; incumbent and rails retain authority");
     } else {
       candidateStatus = "INCUMBENT_ONLY";
       const missing: string[] = [];
       if (!hurdlePassed) missing.push("direction hurdle");
       if (!eligible) missing.push("incumbent lane eligibility");
-      if (!funded) missing.push("CORTEX allocation > 0");
-      reasons.push(`Entry approved but not funded/eligible (${missing.join(", ")}) — deferring to incumbent`);
+      reasons.push(`Entry approved but incumbent conditions unavailable (${missing.join(", ")}) — deferring to incumbent`);
     }
   }
 
@@ -160,12 +158,14 @@ export function buildExecutiveDecision(input: ExecutiveInput): ExecutiveDecision
     direction: dir,
     entry,
     exit: input.exit,
-    cortexDecisionId: input.cortexDecisionId ?? null,
+    allocationContext,
+    marketContext,
     laneId: input.laneId ?? null,
     symbolOrBasketId: input.symbolOrBasketId ?? null,
     candidateStatus,
     disagreements,
     reasons,
     reportOnly: true,
+    advisoryOnly: true,
   };
 }

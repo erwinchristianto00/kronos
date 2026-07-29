@@ -36,16 +36,15 @@ describe("Executive Decision layer", () => {
     expect(exec.disagreements).toContain("Exit HOLD, hard stop already triggered");
   });
 
-  it("CORTEX zero allocation yields a NON-VALID candidate (INCUMBENT_ONLY) even when entry is ENTER_NOW", () => {
+  it("CORTEX allocation is telemetry and cannot suppress an otherwise valid advisory review", () => {
     const entry = decideEntry(entryInput());
     expect(entry.action).toBe("ENTER_NOW");
     const exec = buildExecutiveDecision({
       nowMs: NOW, marketState: ms(), direction: dirLong(), entry, exit: null,
       laneId: "RC", symbolOrBasketId: "BTCUSDT", laneEligibleIncumbent: true, cortexAllocationPct: 0,
     });
-    expect(exec.candidateStatus).not.toBe("VALID");
-    expect(exec.candidateStatus).toBe("INCUMBENT_ONLY");
-    expect(exec.disagreements).toContain("Entry ENTER_NOW, CORTEX allocation zero");
+    expect(exec.candidateStatus).toBe("VALID");
+    expect(exec.advisoryOnly).toBe(true);
   });
 
   it("a risk-rail block OVERRIDES all brain approvals → BLOCKED_BY_RISK", () => {

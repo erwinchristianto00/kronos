@@ -92,12 +92,12 @@ describe("Direction readings carry their OWN timestamp, not the regime axis's", 
     }
   });
 
-  it("a lane whose store tracks no cycleMeta (IM) stays untimed ⇒ STALE, never borrowed, never guessed", () => {
+  it("a lane without post-fix qualified evidence stays MISSING, never borrowed or guessed", () => {
     const lane: LaneReportLike = { netAvgR: 0.05, resolvedCount: 42 }; // no lastCycleAt — the IM case
     const deps = baseDeps({ axisAtMs: NOW, bestLaneReportForDirection: () => lane });
     const dir = buildFourBrainGatherInput(deps).directions[0]!;
     expect(dir.longLaneEdge.observedAtMs).toBeNull(); // did NOT fall back to the fresh axis clock
-    expect(auditReading(dir.longLaneEdge, NOW).status).toBe("STALE");
+    expect(auditReading(dir.longLaneEdge, NOW).status).toBe("MISSING");
   });
 
   it("an unparseable lastCycleAt is treated as untimed, not as NaN", () => {

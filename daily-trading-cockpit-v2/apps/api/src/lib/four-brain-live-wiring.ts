@@ -21,7 +21,7 @@ import {
 } from "./four-brain-live-gather-bindings.js";
 import { assembleFourBrainTick } from "./four-brain-live-gather.js";
 import { runFourBrainShadowTick, type FourBrainTickResult } from "./four-brain-shadow-tick.js";
-import { fourBrainMode } from "./four-brain-types.js";
+import { fourBrainMode, type ExecutiveDecision } from "./four-brain-types.js";
 import { classifyIncumbentLanes, type IncumbentCoverageReport } from "./four-brain-lane-support.js";
 import type { FourBrainMetricsAggregator } from "./four-brain-metrics.js";
 
@@ -42,6 +42,8 @@ export interface FourBrainShadowCycleDeps {
   perfNow?: () => number;
   /** Optional extra journal context. */
   journalContext?: (nowMs: number) => Record<string, unknown>;
+  /** Optional shadow-only exact-review observer. No order/executor dependency is introduced here. */
+  onExecutiveDecision?: (decision: ExecutiveDecision, identity: { signalId: string | null; positionId: string | null }) => void;
   env?: NodeJS.ProcessEnv;
 }
 
@@ -120,6 +122,7 @@ export async function runFourBrainShadowCycle(deps: FourBrainShadowCycleDeps): P
       gather: (n) => assembleFourBrainTick(buildFourBrainGatherInput({ ...gatherDeps, nowMs: n })),
       journalAppend: deps.journalAppend,
       journalContext: () => (deps.journalContext ? deps.journalContext(nowMs) : {}),
+      onExecutiveDecision: deps.onExecutiveDecision,
       perfNow: deps.perfNow,
       tickId: `four-brain-tick:${nowMs}`,
     });

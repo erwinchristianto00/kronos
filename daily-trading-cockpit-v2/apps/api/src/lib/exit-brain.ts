@@ -23,6 +23,7 @@ import {
   EXIT_SCHEMA_VERSION,
   fourBrainDecisionId,
   type ExitAction,
+  type ExitPathAssessment,
   type ExitDecision,
   type SourceStatuses,
 } from "./four-brain-types.js";
@@ -149,31 +150,39 @@ export function decideExit(input: ExitInput): ExitDecision {
   // ── Action (fail-safe: hard rail first) ─────────────────────────────────────────────────────────
   const hardExit = hardExitTriggered(input);
   let action: ExitAction;
+  let pathAssessment: ExitPathAssessment;
   let exitFraction = 0;
   if (hardExit) {
     action = "EXIT_NOW";
+    pathAssessment = "HARD_RISK_EXIT";
     exitFraction = 1;
     reasons.push("hard stop / kill switch already triggered — Exit Brain defers to the rail");
   } else if (reversalRisk >= 0.7 && (edgeRemainingR === null || edgeRemainingR <= 0)) {
     action = "EXIT_NOW";
+    pathAssessment = "TIGHTEN_PATH_RISK";
     exitFraction = 1;
     reasons.push("high reversal risk with no remaining edge → exit");
   } else if (maxHoldExceeded) {
     action = "EXIT_NOW";
+    pathAssessment = "TIME_DECAY";
     exitFraction = 1;
     reasons.push("max-hold exceeded → exit");
   } else if (givebackFrac !== null && givebackFrac >= 0.5 && (uR ?? 0) > 0.2) {
     action = reversalRisk >= 0.5 ? "SCALE_OUT" : "TRAIL";
+    pathAssessment = "TIGHTEN_PATH_RISK";
     exitFraction = action === "SCALE_OUT" ? clamp01(input.scaleOutFraction ?? 0.4) : 0;
     reasons.push("banking against giveback while some edge remains");
   } else if (uR !== null && uR >= 1 && reversalRisk >= 0.4) {
     action = "TIGHTEN_STOP";
+    pathAssessment = "TIGHTEN_PATH_RISK";
     reasons.push("in profit with rising reversal risk → tighten");
   } else if (uR !== null && uR >= 0.5 && reversalRisk >= 0.3) {
     action = "MOVE_TO_BREAKEVEN";
+    pathAssessment = "TIGHTEN_PATH_RISK";
     reasons.push("past 0.5R with moderate reversal risk → protect to breakeven");
   } else {
     action = "HOLD";
+    pathAssessment = thesisIntact == null ? "MISSING_THESIS_STATE" : "HOLD_PATH_OK";
     reasons.push(
       continuationProbability > 0.6
         ? "remaining edge outweighs reversal risk → hold (premature-exit risk noted)"
@@ -217,6 +226,7 @@ export function decideExit(input: ExitInput): ExitDecision {
     asOfMs: nowMs,
     validUntilMs: nowMs + Math.max(0, input.validityMs || 0),
     action,
+    pathAssessment,
     exitFraction: clamp01(exitFraction),
     edgeRemainingR,
     reversalRisk,

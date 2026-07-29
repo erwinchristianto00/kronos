@@ -60,6 +60,8 @@ import { fillFromUserTrade, type ExecutionFill, type ExecutionFillRecorder, type
 import type { PositionPathRecorder } from "./position-path-recorder.js";
 import type { BinanceClient } from "./binance.js";
 import type { PaperOrder } from "./paper-execution-router.js";
+import type { ExecutiveReviewExecutionLink, ExecutiveReviewStore } from "./executive-review-store.js";
+import { resolveExecutiveReviewPositions } from "./executive-review-runtime.js";
 import { recordExecLifecycle } from "./lane-context-journal-runtime.js";
 import type { LifecycleEvent } from "./execution-lifecycle-log.js";
 import { isProfitCoreShortLaneId } from "./realtime-short-mirror.js";
@@ -564,6 +566,10 @@ interface SettledFromTrades {
 
 export interface LiveIntent {
   paperOrderId: string;
+  /** Exact immutable execution identity. Present only on intents created after Executive Review wiring. */
+  executionIntentId?: string;
+  /** Exact persisted position identity. It is never inferred from symbol, side, price, or time window. */
+  positionId?: string;
   symbol: string;
   direction: "LONG" | "SHORT";
   state: LiveIntentState;
@@ -680,6 +686,8 @@ export interface LiveIntent {
    *  terminal intent and a double-booking (FIFO eviction, LIVE_MAX_STORED_INTENTS raised above the
    *  FIFO cap, or a lost/corrupt attribution file are all covered by this flag). */
   cortexAttributed?: boolean;
+  /** Optional immutable review lineage. Its absence never blocks incumbent execution. */
+  executiveReviewLink?: ExecutiveReviewExecutionLink;
 }
 
 export interface LiveIntentSource {
@@ -691,6 +699,7 @@ export interface LiveIntentSource {
   regime?: string | null;
   controllerMode?: string | null;
   controllerConfidence?: string | null;
+  executiveReviewLink?: ExecutiveReviewExecutionLink;
 }
 
 export type LivePerformanceView = "hourly" | "daily" | "weekly" | "monthly" | "yearly";
@@ -1144,6 +1153,8 @@ export interface LiveExecutionEngineOptions {
    *  optional-dep posture as the two recorders above: omit and the engine is byte-for-byte
    *  unchanged; every use is wrapped so a failure can NEVER affect trading. */
   executionFillRecorder?: ExecutionFillRecorder;
+  /** Optional shadow-only Executive Review resolver sink. app.ts never injects it on 3103. */
+  executiveReviewStore?: ExecutiveReviewStore;
 }
 
 const ERROR_STREAK_DISARM = 3;
@@ -1767,6 +1778,7 @@ export class LiveExecutionEngine {
   private readonly cortexRealAttribution: CortexRealAttributionStore | null;
   private readonly positionPathRecorder: PositionPathRecorder | null;
   private readonly executionFillRecorder: ExecutionFillRecorder | null;
+  private readonly executiveReviewStore: ExecutiveReviewStore | null;
 
   /** In-memory ONLY — restart always boots disarmed. */
   private armed = false;
@@ -1830,6 +1842,7 @@ export class LiveExecutionEngine {
     this.cortexRealAttribution = options.cortexRealAttribution ?? null;
     this.positionPathRecorder = options.positionPathRecorder ?? null;
     this.executionFillRecorder = options.executionFillRecorder ?? null;
+    this.executiveReviewStore = options.executiveReviewStore ?? null;
     // Auto-arm must NOT punch through a latched kill: a restart preserves the kill until an
     // explicit resetKill(). (arm() already enforces this; the constructor path bypassed it.)
     if (this.config.autoArm && this.config.configErrors.length === 0 && !this.store.getState().killedAt) {
@@ -2836,6 +2849,10 @@ export class LiveExecutionEngine {
       // comment). Runs right after lifecycle management so a close is handed to the Exit Brain's
       // reader on the same tick it settles.
       this.sweepPositionPathRecorder();
+
+      // 3.65. Exact Executive Review intent -> position linkage. This is shadow bookkeeping only:
+      // it cannot create an outcome from USD P&L, cannot change an order, and is never injected on 3103.
+      this.sweepExecutiveReviewPositions();
 
       // 3.7. Per-fill store retention (report-only, fail-safe). Deliberately NOT its own timer —
       // the 234 MB unrotated-journal incident was caused by a file re-read on a poll, and adding a
@@ -4919,6 +4936,21 @@ export class LiveExecutionEngine {
     }
   }
 
+  /** Persist only explicit executive-review links carried by the incumbent intent. */
+  private sweepExecutiveReviewPositions(): void {
+    if (!this.executiveReviewStore) return;
+    try {
+      const nowMs = Date.parse(this.nowIso());
+      resolveExecutiveReviewPositions(
+        this.executiveReviewStore,
+        this.store.getState().intents,
+        Number.isFinite(nowMs) ? nowMs : Date.now(),
+      );
+    } catch {
+      // Review telemetry is strictly fail-open relative to the incumbent execution engine.
+    }
+  }
+
   /** Per-fill store retention (2026-07-27, report-only). RETENTION ONLY — this never writes a
    *  record and never reads the file; records are written at settlement by recordIntentFills. An
    *  in-memory filter over ≤ MAX_FILL_RECORDS entries.
@@ -6162,6 +6194,8 @@ export class LiveExecutionEngine {
     const now = this.nowIso();
     const intent: LiveIntent = {
       paperOrderId: paper.paperOrderId,
+      executionIntentId: paper.paperOrderId,
+      positionId: `intent:${paper.paperOrderId}:${now}`,
       symbol: paper.symbol,
       direction: paper.direction,
       state: "MIRRORED",
@@ -6196,6 +6230,7 @@ export class LiveExecutionEngine {
       // -tilted and are deliberately left out of the attribution sweep.
       cortexAppliedWeightPct: planned[0]!.cortexAppliedWeightPct,
       cortexRawStaticWeightPct: planned[0]!.cortexRawStaticWeightPct,
+      executiveReviewLink: paper.executiveReviewLink ?? undefined,
       createdAt: now,
       updatedAt: now,
       closedAt: null,
@@ -6209,6 +6244,7 @@ export class LiveExecutionEngine {
         regime: source.regime ?? null,
         controllerMode: source.controllerMode ?? null,
         controllerConfidence: source.controllerConfidence ?? null,
+        executiveReviewLink: source.executiveReviewLink ?? undefined,
       })),
     };
     st.intents.push(intent);
@@ -6488,6 +6524,7 @@ export class LiveExecutionEngine {
           regime: paper.regime ?? null,
           controllerMode: paper.controllerMode ?? null,
           controllerConfidence: paper.controllerConfidence ?? null,
+          executiveReviewLink: paper.executiveReviewLink ?? undefined,
         })),
       ];
 

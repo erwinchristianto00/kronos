@@ -38,21 +38,20 @@ describe("Direction Brain", () => {
     expect(d.longScore).toBeGreaterThan(d.shortScore);
   });
 
-  it("edge-memory VETO is a strong penalty (not a hard zero) and lifts FLAT", () => {
+  it("does not double-count an incumbent edge as both a score and a veto multiplier", () => {
     const clean = decideDirection(directionInput({ longEdge: src(0.12) }));
     const vetoed = decideDirection(directionInput({ longEdge: src(0.12), longVeto: true }));
-    expect(vetoed.longScore).toBeLessThan(clean.longScore);
-    expect(vetoed.conflictingSignals.some((s) => s.includes("VETO"))).toBe(true);
-    expect(vetoed.flatScore).toBeGreaterThan(clean.flatScore - 0.001);
+    expect(vetoed.longScore).toBe(clean.longScore);
+    expect(vetoed.conflictingSignals.some((s) => s.includes("edge-memory VETO"))).toBe(false);
   });
 
-  it("conflicting signals reduce confidence", () => {
+  it("coverage and a derivative incumbent veto do not manufacture or reduce confidence", () => {
     const clean = decideDirection(directionInput({ longEdge: src(0.12) }));
     const conflicted = decideDirection(directionInput({ longEdge: src(0.12), longVeto: true }));
-    expect(conflicted.confidence).toBeLessThan(clean.confidence);
+    expect(conflicted.confidence).toBe(clean.confidence);
   });
 
-  it("four-brain's OWN self-outcome VETO (fourBrainLongVeto) is a SECOND, independent soft penalty — never a hard zero — stacked next to the incumbent edge-memory longVeto", () => {
+  it("Four-Brain self evidence is one bounded independent adjustment, not a stack with incumbent evidence", () => {
     const clean = decideDirection(directionInput({ longEdge: src(0.12) }));
     const fourBrainOnly = decideDirection(directionInput({ longEdge: src(0.12), fourBrainLongVeto: true }));
     const incumbentOnly = decideDirection(directionInput({ longEdge: src(0.12), longVeto: true }));
@@ -63,9 +62,9 @@ describe("Direction Brain", () => {
     expect(fourBrainOnly.longScore).toBeGreaterThan(0);
     expect(fourBrainOnly.conflictingSignals.some((s) => s.includes("Four-Brain self-outcome VETO"))).toBe(true);
 
-    // The two penalties are independent and compose: stacking both reduces the score further than either alone.
-    expect(both.longScore).toBeLessThan(fourBrainOnly.longScore);
-    expect(both.longScore).toBeLessThan(incumbentOnly.longScore);
+    // The derivative incumbent veto has no second score path.
+    expect(both.longScore).toBe(fourBrainOnly.longScore);
+    expect(incumbentOnly.longScore).toBe(clean.longScore);
     expect(both.longScore).toBeGreaterThan(0);
   });
 
@@ -234,31 +233,26 @@ describe("edge standing: absence of evidence is not evidence of absence (2026-07
     expect(notes).not.toContain("LONG edge UNMEASURED");
   });
 
-  it("reporting is additive only — action, scores AND confidence match the pre-fix values exactly", () => {
-    // Guards against an observability change quietly becoming a behaviour change. These constants were
-    // taken by running HEAD's pre-fix decideDirection side-by-side with this one over the same inputs
-    // (git show of the file into a temp module), not by copying whatever the new code happened to emit.
-    //
-    // confidence is the subtle one: it is damped by `conflicting.length > 0`, so routing the two new
-    // regime-posture notes through conflictingSignals directly would have moved it. They go through
-    // reportOnlyConflicts instead and are merged only at the return — hence confidence is unchanged.
+  it("separates market confidence from source coverage", () => {
     const d = decideDirection(directionInput({ longEdge: src(0.12), shortEdge: src(null) }));
     expect(d.action).toBe("LONG");
     expect(d.longScore).toBe(0.6300000000000001);
     expect(d.shortScore).toBe(0.25);
     expect(d.flatScore).toBe(0.35);
-    expect(d.confidence).toBe(0.4971428571428572);
+    expect(d.confidence).toBe(0.28000000000000014);
+    expect(d.directionConfidence).toBe(d.confidence);
+    expect(d.dataCoverage).toBeGreaterThan(d.confidence);
   });
 
-  it("the posture haircut is visible in the payload yet does NOT damp confidence", () => {
+  it("the posture haircut is visible and confidence remains a score-separation measure", () => {
     const leaning = decideDirection(directionInput({ shortEdge: src(0.2), leansShort: true }));
     const discounted = decideDirection(directionInput({ shortEdge: src(0.2), leansShort: false }));
     expect(discounted.conflictingSignals.some((s) => s.includes("SHORT discounted 30%"))).toBe(true);
-    // Pre-fix baseline for the leansShort=false case, measured against HEAD: identical confidence.
-    // (It does NOT equal the leansShort=true confidence, and must not — confidence also tracks score
-    // separation, which the haircut genuinely moves. That is the pre-existing behaviour, untouched.)
-    expect(discounted.confidence).toBe(0.5127380952380952);
-    expect(leaning.confidence).toBe(0.4319047619047619);
+    expect(discounted.confidence).toBe(0.16833333333333333);
+    // A posture haircut can reduce ambiguity by making one side clearly lose; it must not be
+    // confused with data coverage, so neither ordering is assumed beyond finite score separation.
+    expect(leaning.directionConfidence).toBe(leaning.confidence);
+    expect(discounted.directionConfidence).toBe(discounted.confidence);
   });
 
 });

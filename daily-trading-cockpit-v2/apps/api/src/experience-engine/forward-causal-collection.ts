@@ -30,6 +30,7 @@ export interface CausalIdentity {
   attributionRuleVersion: string;
   /** Present only when an exact CORTEX decision snapshot was handed to admission. */
   cortexDecisionId: string | null;
+  allocationSnapshotId: string | null;
   cortexFeatureSchemaVersion: number | null;
 }
 
@@ -139,7 +140,7 @@ const originKeyOf = (order: ForwardPaperOrderLike): string => order.sourceCandid
 const validCortexSnapshot = (order: ForwardPaperOrderLike, openedAtMs: number): CortexDecisionSnapshot | null => {
   const snapshot = order.cortexDecisionSnapshot ?? null;
   if (!snapshot || snapshot.laneId !== order.selectedLaneId || snapshot.atMs > openedAtMs) return null;
-  if (!snapshot.decisionId || !Number.isInteger(snapshot.featureSchemaVersion)) return null;
+  if (!snapshot.decisionId || !snapshot.allocationSnapshotId || !Number.isInteger(snapshot.featureSchemaVersion)) return null;
   if (!Array.isArray(snapshot.featureVector) || !snapshot.featureVector.length || !snapshot.featureVector.every(finite)) return null;
   return snapshot;
 };
@@ -179,6 +180,7 @@ export function prepareForwardCausalIdentity(order: ForwardPaperOrderLike, env: 
     decisionRuleVersion: "paper-opportunity-admission/1",
     attributionRuleVersion: "direct-paper-order-link/1",
     cortexDecisionId: cortex?.decisionId ?? null,
+    allocationSnapshotId: cortex?.allocationSnapshotId ?? null,
     cortexFeatureSchemaVersion: cortex?.featureSchemaVersion ?? null,
   };
 }

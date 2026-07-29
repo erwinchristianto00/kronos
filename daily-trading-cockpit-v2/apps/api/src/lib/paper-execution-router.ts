@@ -62,7 +62,14 @@ import {
 import type { AdaptiveLaneRouterReport } from "./adaptive-lane-router.js";
 import type { LiveTradingGateReport } from "./live-trading-gate.js";
 import { recordHeatShadowSnapshot } from "./portfolio-heat-shadow.js";
-import { EXECUTION_POLICY_VERSION, MIN_EXECUTION_RR } from "@dtc/shared";
+import {
+  CURRENT_DECISION_POLICY_VERSION,
+  CURRENT_EVIDENCE_ERA,
+  END_TO_END_CORRECTNESS_DEPLOYED_AT,
+  EVIDENCE_POLICY_VERSION,
+  EXECUTION_POLICY_VERSION,
+  MIN_EXECUTION_RR,
+} from "@dtc/shared";
 import { getSimulatedPaperPathStore, simulatedPaperPathDirFor } from "./paper-simulated-path-store.js";
 import {
   prepareForwardCausalIdentity,
@@ -73,6 +80,7 @@ import {
   type CausalIdentity,
 } from "../experience-engine/forward-causal-collection.js";
 import { latestCortexDecisionSnapshotForLane, type CortexDecisionSnapshot } from "./cortex-decision-snapshot.js";
+import type { ExecutiveReviewExecutionLink } from "./executive-review-store.js";
 
 // ─── public enums / type tokens ──────────────────────────────────────────────
 
@@ -473,6 +481,11 @@ export interface PaperOrder {
   entryOrderPrice?: number | null;
   /** Explicit policy stamp: unstamped orders are legacy-only evidence. */
   executionPolicyVersion?: string | null;
+  /** Complete post-fix evidence policy lineage. Missing values remain legacy-only. */
+  decisionPolicyVersion?: string | null;
+  evidencePolicyVersion?: string | null;
+  evidenceEra?: string | null;
+  policyDeploymentAt?: string | null;
   /** Geometry recomputed from the actual selected/fill price. */
   actualStopDistanceBps?: number | null;
   actualRiskReward?: number | null;
@@ -552,6 +565,8 @@ export interface PaperOrder {
   causalIdentity?: CausalIdentity | null;
   /** Exact CORTEX x captured at admission; absent means explicitly ineligible for CORTEX learning. */
   cortexDecisionSnapshot?: CortexDecisionSnapshot | null;
+  /** Present only when an exact Four-Brain review was persisted before admission. */
+  executiveReviewLink?: ExecutiveReviewExecutionLink | null;
   // ── forward-gate shadow label (report-only OOS validation; NEVER blocks admission) ──
   forwardGateId?: string;
   forwardGateVersion?: number;
@@ -1358,6 +1373,10 @@ function _buildBaseOrder(
     entryOrderType: isMarketEntry ? "MARKET" : "LIMIT",
     entryOrderPrice: obs.simulatedEntryPrice,
     executionPolicyVersion: EXECUTION_POLICY_VERSION,
+    decisionPolicyVersion: CURRENT_DECISION_POLICY_VERSION,
+    evidencePolicyVersion: EVIDENCE_POLICY_VERSION,
+    evidenceEra: CURRENT_EVIDENCE_ERA,
+    policyDeploymentAt: END_TO_END_CORRECTNESS_DEPLOYED_AT,
     actualStopDistanceBps: actualGeometry.stopDistanceBps,
     actualRiskReward: actualGeometry.riskReward,
     symbol: obs.symbol,
@@ -1570,6 +1589,8 @@ export interface PaperOpportunity {
   riskMultiplierAfterOccupancy?: number;
   budgetUsed?: unknown;
   budgetReason?: string;
+  /** Optional exact Four-Brain review hand-off supplied by the originating candidate producer. */
+  executiveReviewLink?: ExecutiveReviewExecutionLink | null;
 }
 
 export interface PaperOpportunityAdmissionInputs {
@@ -1654,6 +1675,10 @@ function _buildAllocatorOrder(
     entryOrderType: isMarketEntry ? "MARKET" : "LIMIT",
     entryOrderPrice: o.entryPrice,
     executionPolicyVersion: EXECUTION_POLICY_VERSION,
+    decisionPolicyVersion: CURRENT_DECISION_POLICY_VERSION,
+    evidencePolicyVersion: EVIDENCE_POLICY_VERSION,
+    evidenceEra: CURRENT_EVIDENCE_ERA,
+    policyDeploymentAt: END_TO_END_CORRECTNESS_DEPLOYED_AT,
     actualStopDistanceBps: actualGeometry.stopDistanceBps,
     actualRiskReward: actualGeometry.riskReward,
     symbol: o.symbol,
@@ -1701,6 +1726,7 @@ function _buildAllocatorOrder(
     paperRiskMultiplier: o.paperRiskMultiplier,
     budgetUsed: o.budgetUsed,
     budgetReason: o.budgetReason,
+    executiveReviewLink: o.executiveReviewLink ?? null,
     reportOnly: true,
     paperOnly: true,
   }, now);

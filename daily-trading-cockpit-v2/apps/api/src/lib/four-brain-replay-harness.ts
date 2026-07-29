@@ -11,6 +11,7 @@ import { assembleFourBrainTick } from "./four-brain-live-gather.js";
 import { buildFourBrainGatherInput, type FourBrainBindingDeps, type EntryMicrostructure } from "./four-brain-live-gather-bindings.js";
 import { runFourBrainShadowTick, _resetFourBrainSingleFlightForTests } from "./four-brain-shadow-tick.js";
 import type { ExecutiveDecision } from "./four-brain-types.js";
+import { staticAllocationContext, unavailableMarketContext } from "./authority-contract.js";
 
 const REPLAY_NOW = 1_800_000_000_000;
 const MIN = 60_000;
@@ -58,8 +59,8 @@ function baseDeps(o: Partial<FourBrainBindingDeps> = {}): FourBrainBindingDeps {
     entryMicrostructure: () => freshMicro,
     openPositions: [],
     markPriceForSymbol: () => ({ price: 101, atMs: REPLAY_NOW - 30_000 }),
-    cortexDecisionId: "REPLAY_DECISION:x",
-    cortexFinalPctForLane: () => 40,
+    allocationContextForLane: () => staticAllocationContext(40),
+    marketContext: unavailableMarketContext(REPLAY_NOW),
     laneEligibleIncumbent: () => true,
     killLatched: false,
     killReason: null,

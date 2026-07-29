@@ -19,6 +19,7 @@ import type { MarketSafetyEvent, MarketStateInput } from "./market-state-brain.j
 import type { DirectionInput } from "./direction-brain.js";
 import type { EntryInput } from "./entry-brain.js";
 import type { ExitInput } from "./exit-brain.js";
+import type { AllocationContext, MarketContextLineage } from "./authority-contract.js";
 
 /** Which freshness budget a source belongs to — each has its OWN TTL (never one global TTL). */
 export type FreshnessClass = "regime" | "candle" | "signal" | "orderflow" | "derivatives" | "sentiment" | "position";
@@ -164,8 +165,10 @@ export function freshnessTally(readings: SourceReading[]): Record<string, { fres
 
 /** Incumbent context for a candidate — the SAME semantics the live executor uses (parity-tested). */
 export interface ExecContext {
-  cortexDecisionId: string | null;
-  cortexAllocationPct: number | null; // decideCortex finalPct 0..100; 0 = unfunded, null = unknown
+  /** Read-only only. It cannot influence a brain score, candidate, or risk rail. */
+  allocationContext: AllocationContext;
+  /** Immutable shared market lineage, or explicit unavailable (never nearest/latest). */
+  marketContext: MarketContextLineage;
   laneEligibleIncumbent: boolean;
   directionHurdlePassed?: boolean;
   killLatched: boolean;

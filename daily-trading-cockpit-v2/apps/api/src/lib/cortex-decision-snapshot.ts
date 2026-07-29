@@ -10,6 +10,8 @@ import type { CortexLaneDir } from "./cortex-attribution.js";
 
 export interface CortexDecisionSnapshot {
   decisionId: string;
+  /** Immutable allocation payload identity, captured with the CORTEX decision. */
+  allocationSnapshotId: string;
   atMs: number;
   laneId: string;
   direction: CortexLaneDir | null;
@@ -27,10 +29,14 @@ export function cortexDecisionId(atMs: number, laneId: string, featureSchemaVers
   return `cortex-decision:${atMs}:${featureSchemaVersion}:${laneId}`;
 }
 
+export function cortexAllocationSnapshotId(decisionId: string): string {
+  return `cortex-allocation:${decisionId}`;
+}
+
 export function publishCortexDecisionSnapshots(snapshots: readonly CortexDecisionSnapshot[]): void {
   for (const snapshot of snapshots) {
     if (
-      !snapshot.decisionId || !snapshot.laneId || !Number.isFinite(snapshot.atMs) ||
+      !snapshot.decisionId || !snapshot.allocationSnapshotId || !snapshot.laneId || !Number.isFinite(snapshot.atMs) ||
       !Number.isInteger(snapshot.featureSchemaVersion) ||
       !Array.isArray(snapshot.featureVector) || !snapshot.featureVector.every(Number.isFinite) ||
       !Number.isFinite(snapshot.finalPct) || !Number.isFinite(snapshot.evalFinalPct)

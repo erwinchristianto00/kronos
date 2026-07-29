@@ -11,6 +11,7 @@ import { decideMarketState } from "../src/lib/market-state-brain.js";
 import { decideDirection } from "../src/lib/direction-brain.js";
 import { decideEntry } from "../src/lib/entry-brain.js";
 import { marketInput, directionInput, entryInput, src, NOW } from "./four-brain-fixtures.js";
+import { CORTEX_ALLOW_FOUR_BRAIN_FEATURES, staticAllocationContext, unavailableMarketContext } from "../src/lib/authority-contract.js";
 
 const LIB = resolve(dirname(fileURLToPath(import.meta.url)), "../src/lib");
 const FOUR_BRAIN_FILES = [
@@ -31,6 +32,8 @@ const FOUR_BRAIN_FILES = [
   "four-brain-metrics.ts",
   "four-brain-replay-harness.ts",
   "four-brain-live-wiring.ts",
+  "authority-contract.ts",
+  "executive-review-store.ts",
 ];
 
 // Modules that place orders / mutate positions / mutate stops / set allocations. NO brain may import these.
@@ -47,6 +50,7 @@ const FORBIDDEN_IMPORT_SUBSTRINGS = [
 ];
 // Call-sites that would mutate live state — must not appear in any brain source.
 const FORBIDDEN_CALL_SUBSTRINGS = ["setAllocations(", "placeOrder(", "placeAlgoOrder(", "closePosition(", "submitOrder(", "cancelOrder(", "engageKillSwitch("];
+const CORTEX_AUTHORITY_FILES = ["cortex-brain.ts", "cortex-brain-store.ts", "cortex-decision-snapshot.ts"];
 
 function importLines(src: string): string[] {
   return src.split("\n").filter((l) => /^\s*import\b/.test(l) || /\bfrom\s+["']/.test(l));
@@ -81,6 +85,35 @@ describe("Four-Brain architecture boundary (report-only proof)", () => {
     expect(text.includes("cortex-brain-store")).toBe(true); // reuse, not re-implement
     for (const bad of FORBIDDEN_IMPORT_SUBSTRINGS) expect(text.includes(bad)).toBe(false);
   });
+
+  it("keeps Four-Brain outside CORTEX features and removes synthetic CORTEX lineage", () => {
+    const cortex = readFileSync(join(LIB, "cortex-brain.ts"), "utf-8");
+    const fourBrainSources = FOUR_BRAIN_FILES.map((f) => readFileSync(join(LIB, f), "utf-8")).join("\n");
+    expect(CORTEX_ALLOW_FOUR_BRAIN_FEATURES).toBe(false);
+    expect(cortex).not.toContain("fourBrain");
+    expect(fourBrainSources).not.toContain("four-brain:${");
+  });
+
+  it("keeps CORTEX as an allocator without exchange or order authority", () => {
+    for (const file of CORTEX_AUTHORITY_FILES) {
+      const text = readFileSync(join(LIB, file), "utf-8");
+      const imports = importLines(text).join("\n");
+      for (const bad of FORBIDDEN_IMPORT_SUBSTRINGS) expect(imports.includes(bad), `${file} imports ${bad}`).toBe(false);
+      for (const bad of FORBIDDEN_CALL_SUBSTRINGS) expect(text.includes(bad), `${file} contains ${bad}`).toBe(false);
+    }
+  });
+
+  it("makes allocation context read-only telemetry, never a review approval gate", () => {
+    const shared = {
+      nowMs: NOW, marketState: decideMarketState(marketInput()), direction: decideDirection(directionInput({ longEdge: src(0.1) })),
+      entry: decideEntry(entryInput()), exit: null, laneId: "RC", symbolOrBasketId: "BTCUSDT", laneEligibleIncumbent: true,
+      marketContext: unavailableMarketContext(NOW),
+    } as const;
+    expect(buildExecutiveDecision({ ...shared, allocationContext: staticAllocationContext(40) }).candidateStatus).toBe("VALID");
+    const unavailable = buildExecutiveDecision({ ...shared, allocationContext: staticAllocationContext(null) });
+    expect(unavailable.candidateStatus).toBe("VALID");
+    expect(unavailable.advisoryOnly).toBe(true);
+  });
 });
 
 const dirs: string[] = [];
@@ -99,7 +132,8 @@ describe("Four-Brain journal — append-only, malformed-tolerant, deduped", () =
     const j = new CortexDecisionJournal(file);
     const exec = buildExecutiveDecision({
       nowMs: NOW, marketState: decideMarketState(marketInput()), direction: decideDirection(directionInput({ longEdge: src(0.1) })),
-      entry: decideEntry(entryInput()), exit: null, laneId: "RC", symbolOrBasketId: "BTCUSDT", laneEligibleIncumbent: true, cortexAllocationPct: 40,
+      entry: decideEntry(entryInput()), exit: null, laneId: "RC", symbolOrBasketId: "BTCUSDT", laneEligibleIncumbent: true,
+      allocationContext: staticAllocationContext(40), marketContext: unavailableMarketContext(NOW),
     });
     const rec = buildExecutiveDecisionRecord(exec, {
       horizon: "INTRADAY",

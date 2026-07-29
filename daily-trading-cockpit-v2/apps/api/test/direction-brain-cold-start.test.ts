@@ -62,8 +62,8 @@ describe("the invariants it must not break", () => {
     expect(d.action).toBe("SHORT");
   });
 
-  it("a veto still bars the side outright", () => {
-    expect(decideDirection(cold({ shortLaneEdge: src(0.2), controllerBias: "SHORT", shortVeto: true, longVeto: true })).action).toBe("FLAT");
+  it("derivative incumbent vetoes do not become a second Direction authority", () => {
+    expect(decideDirection(cold({ shortLaneEdge: src(0.2), controllerBias: "SHORT", shortVeto: true, longVeto: true })).action).toBe("SHORT");
   });
 
   it("BOTH still requires both sides PROVEN_ABOVE", () => {

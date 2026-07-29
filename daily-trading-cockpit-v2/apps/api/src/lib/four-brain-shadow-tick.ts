@@ -10,6 +10,7 @@
  */
 import {
   fourBrainMode,
+  fourBrainDecisionId,
   type DirectionDecision,
   type ExecutiveDecision,
   type FourBrainMode,
@@ -75,6 +76,8 @@ export interface FourBrainShadowTickDeps {
   journalAppend: (record: Record<string, unknown>) => void;
   /** Extra journal context (incumbent snapshot, etc.). */
   journalContext?: (gathered: FourBrainGatheredTick) => ExecutiveJournalContext;
+  /** Shadow-only observer for exact review attachment. It is never an execution authority. */
+  onExecutiveDecision?: (decision: ExecutiveDecision, identity: { signalId: string | null; positionId: string | null }) => void;
   /** Monotonic perf clock for LATENCY only (never affects decisions). Defaults to () => 0. */
   perfNow?: () => number;
   emitMetrics?: (m: FourBrainTickMetrics) => void;
@@ -148,14 +151,21 @@ export function runFourBrainShadowTick(deps: FourBrainShadowTickDeps): FourBrain
     const marketState = decideMarketState(gathered.marketStateInput);
     const directionByHorizon = new Map<string, DirectionDecision>();
     const directions: DirectionDecision[] = [];
+    // All current horizons consume the same market-level inputs. Evaluate it ONCE, then stamp
+    // compatibility projections with different outcome windows; this is not three independent models.
+    const canonicalInput = gathered.directionInputs[0]?.input;
+    const canonical = canonicalInput
+      ? runBrainSafely(() => decideDirection({ ...canonicalInput, marketBias: marketState.bias, transitionRisk: marketState.transitionRisk }))
+      : null;
+    if (canonicalInput && canonical === null) metrics.brainErrors += 1;
     for (const d of gathered.directionInputs) {
-      // The Market State Brain is the SINGLE source of bias/transitionRisk (a soft nudge to Direction) —
-      // patch them from the just-computed marketState so there is no second, divergent bias estimate.
-      const dec = runBrainSafely(() => decideDirection({ ...d.input, marketBias: marketState.bias, transitionRisk: marketState.transitionRisk }));
-      if (dec === null) {
-        metrics.brainErrors += 1;
-        continue; // this horizon's direction is skipped; other horizons + the tick as a whole still complete
-      }
+      if (canonical === null) continue;
+      const dec: DirectionDecision = {
+        ...canonical,
+        horizon: d.horizon,
+        evaluationHorizon: d.horizon,
+        decisionId: fourBrainDecisionId("dir", nowMs, `MARKET_LEVEL:${d.horizon}:${canonical.marketDirection}`),
+      };
       directionByHorizon.set(d.horizon, dec);
       directions.push(dec);
       metrics.byBrainAction[`dir:${dec.action}`] = (metrics.byBrainAction[`dir:${dec.action}`] ?? 0) + 1;
@@ -185,11 +195,11 @@ export function runFourBrainShadowTick(deps: FourBrainShadowTickDeps): FourBrain
           direction: directionByHorizon.get(c.identity.horizon ?? "") ?? null,
           entry,
           exit: null,
-          cortexDecisionId: c.exec.cortexDecisionId,
+          allocationContext: c.exec.allocationContext,
+          marketContext: c.exec.marketContext,
           laneId: c.identity.laneId,
           symbolOrBasketId: c.identity.symbolOrBasketId,
           laneEligibleIncumbent: c.exec.laneEligibleIncumbent,
-          cortexAllocationPct: c.exec.cortexAllocationPct,
           directionHurdlePassed: c.exec.directionHurdlePassed,
           killLatched: c.exec.killLatched,
           riskBlockedReason: c.exec.riskBlockedReason,
@@ -223,11 +233,11 @@ export function runFourBrainShadowTick(deps: FourBrainShadowTickDeps): FourBrain
           direction: null,
           entry: null,
           exit,
-          cortexDecisionId: c.exec.cortexDecisionId,
+          allocationContext: c.exec.allocationContext,
+          marketContext: c.exec.marketContext,
           laneId: c.identity.laneId,
           symbolOrBasketId: c.identity.symbolOrBasketId,
           laneEligibleIncumbent: c.exec.laneEligibleIncumbent,
-          cortexAllocationPct: c.exec.cortexAllocationPct,
           killLatched: c.exec.killLatched,
           riskBlockedReason: c.exec.riskBlockedReason,
           hardExitTriggered: c.exec.hardExitTriggered,
@@ -263,6 +273,14 @@ export function runFourBrainShadowTick(deps: FourBrainShadowTickDeps): FourBrain
             signalId: identity?.signalId ?? null,
             positionId: identity?.positionId ?? null,
           }));
+          try {
+            deps.onExecutiveDecision?.(exec, {
+              signalId: identity?.signalId ?? null,
+              positionId: identity?.positionId ?? null,
+            });
+          } catch {
+            // Review attachment remains fail-open relative to the shadow tick.
+          }
         } catch {
           metrics.journalErrors += 1;
         }

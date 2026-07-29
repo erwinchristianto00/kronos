@@ -75,7 +75,7 @@ export function buildExecutiveDecisionRecord(exec: ExecutiveDecision, ctx: Execu
       direction: exec.direction?.decisionId ?? null,
       entry: exec.entry?.decisionId ?? null,
       exit: exec.exit?.decisionId ?? null,
-      cortex: exec.cortexDecisionId,
+      allocationSnapshot: exec.allocationContext.snapshotId,
     },
     laneId: exec.laneId,
     symbolOrBasketId: exec.symbolOrBasketId,
@@ -84,6 +84,9 @@ export function buildExecutiveDecisionRecord(exec: ExecutiveDecision, ctx: Execu
     horizon: ctx.horizon ?? exec.direction?.horizon ?? null,
     candidateStatus: exec.candidateStatus,
     wouldAct,
+    advisoryOnly: exec.advisoryOnly,
+    allocationContext: exec.allocationContext,
+    marketContext: exec.marketContext,
     disagreements: exec.disagreements,
     reasons: exec.reasons,
     brains: {

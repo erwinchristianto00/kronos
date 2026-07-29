@@ -38,7 +38,7 @@ import {
   type CortexStoreState,
 } from "./cortex-brain.js";
 import { engineLaneIdForStaticWeight } from "./cortex-live-gather.js";
-import { cortexDecisionId, publishCortexDecisionSnapshots } from "./cortex-decision-snapshot.js";
+import { cortexAllocationSnapshotId, cortexDecisionId, publishCortexDecisionSnapshots } from "./cortex-decision-snapshot.js";
 
 export class CortexBrainStore {
   private state: CortexStoreState;
@@ -285,18 +285,22 @@ export function runCortexShadowTick(deps: {
   );
   const decisionAtMs = Date.parse(deps.nowIso);
   if (Number.isFinite(decisionAtMs)) {
-    publishCortexDecisionSnapshots(decision.lanes.map((lane) => ({
-      decisionId: cortexDecisionId(decisionAtMs, lane.laneId, decision.featureSchemaVersion),
-      atMs: decisionAtMs,
-      laneId: lane.laneId,
-      direction: deps.context.lanes.find((input) => input.laneId === lane.laneId)?.direction ?? null,
-      featureSchemaVersion: decision.featureSchemaVersion,
-      featureVector: lane.featureVector,
-      regimeFamily: deps.context.regimeFamily,
-      eligible: lane.eligible,
-      finalPct: lane.finalPct,
-      evalFinalPct: evalDecision.lanes.find((candidate) => candidate.laneId === lane.laneId)?.finalPct ?? lane.finalPct,
-    })));
+    publishCortexDecisionSnapshots(decision.lanes.map((lane) => {
+      const decisionId = cortexDecisionId(decisionAtMs, lane.laneId, decision.featureSchemaVersion);
+      return {
+        decisionId,
+        allocationSnapshotId: cortexAllocationSnapshotId(decisionId),
+        atMs: decisionAtMs,
+        laneId: lane.laneId,
+        direction: deps.context.lanes.find((input) => input.laneId === lane.laneId)?.direction ?? null,
+        featureSchemaVersion: decision.featureSchemaVersion,
+        featureVector: lane.featureVector,
+        regimeFamily: deps.context.regimeFamily,
+        eligible: lane.eligible,
+        finalPct: lane.finalPct,
+        evalFinalPct: evalDecision.lanes.find((candidate) => candidate.laneId === lane.laneId)?.finalPct ?? lane.finalPct,
+      };
+    }));
   }
 
   let promotedWeights: Record<string, number> | null = null;

@@ -2,7 +2,7 @@
  * Four-Brain intelligence layer — shared types (Phase 1, REPORT-ONLY). Four SEPARATE brains sit on top of
  * the existing CORTEX allocator + the incumbent lane/signal engine + safety rails; each reasons about ONE
  * thing (market state / direction / entry timing / exit timing), emits a typed decision, and DRIVES
- * NOTHING. CORTEX stays the capital-allocation + risk executive. Every brain fails OPEN to incumbent
+ * NOTHING. CORTEX stays the capital allocator and risk rails retain final safety authority. Every brain fails OPEN to incumbent
  * behavior: missing/stale data → a conservative UNKNOWN/FLAT/SKIP/HOLD that never forces an action.
  *
  * Target flow (each arrow is report-only in Phase 1):
@@ -14,6 +14,8 @@
  * executive-decision.ts; invariants in four-brain-invariants.ts; the append-only report journal in
  * four-brain-journal.ts. NONE import execution / order-placement / setAllocations / position-mutation.
  */
+
+import type { AllocationContext, MarketContextLineage } from "./authority-contract.js";
 
 /** off (default) = zero new-brain I/O (a pure no-op — nothing computed, nothing journaled); shadow = the
  *  four brains decide + journal, driving NOTHING; live = reserved for a future, separately-approved phase.
@@ -28,7 +30,7 @@ export const MARKET_STATE_SCHEMA_VERSION = "market-state/1";
 export const DIRECTION_SCHEMA_VERSION = "direction/1";
 export const ENTRY_SCHEMA_VERSION = "entry/1";
 export const EXIT_SCHEMA_VERSION = "exit/1";
-export const EXECUTIVE_SCHEMA_VERSION = "executive/1";
+export const EXECUTIVE_SCHEMA_VERSION = "executive/2";
 
 /** Per-source freshness/availability. FRESH = usable; STALE = too old (neutral-filled); MISSING = absent
  *  (neutral-filled, never fabricated); ERROR = present-but-invalid (NaN / future timestamp / causal break). */
@@ -77,17 +79,37 @@ export interface MarketStateDecision {
 export type DirectionHorizon = "SCALP" | "INTRADAY" | "SWING";
 export type DirectionAction = "LONG" | "SHORT" | "BOTH" | "FLAT";
 
+export interface DirectionEvidenceFamily {
+  available: boolean;
+  contribution: number | null;
+  credibilityPenalty: number | null;
+  reasons: string[];
+}
+
 export interface DirectionDecision {
   schemaVersion: string;
   decisionId: string;
   asOfMs: number;
   validUntilMs: number;
   horizon: DirectionHorizon;
+  modelScope: "MARKET_LEVEL";
+  evaluationHorizon: DirectionHorizon;
+  /** The one canonical verdict; `action` is retained as a compatibility projection. */
+  marketDirection: "LONG" | "SHORT" | "FLAT";
   action: DirectionAction;
   longScore: number; // 0..1
   shortScore: number; // 0..1
   flatScore: number; // 0..1 — a REAL competing baseline
   confidence: number; // 0..1
+  directionConfidence: number;
+  dataCoverage: number;
+  directionEvidenceFamilies: {
+    marketStructure: DirectionEvidenceFamily;
+    incumbentEconomic: DirectionEvidenceFamily;
+    externalForecasts: DirectionEvidenceFamily;
+    flow: DirectionEvidenceFamily;
+    selfEvidence: DirectionEvidenceFamily;
+  };
   expectedDirectionalR: number | null; // R (net of cost), from proven edge-memory; null if unknown
   supportingSignals: string[];
   conflictingSignals: string[];
@@ -118,6 +140,7 @@ export interface EntryDecision {
 }
 
 export type ExitAction = "HOLD" | "TIGHTEN_STOP" | "MOVE_TO_BREAKEVEN" | "SCALE_OUT" | "TRAIL" | "EXIT_NOW";
+export type ExitPathAssessment = "HOLD_PATH_OK" | "TIGHTEN_PATH_RISK" | "TIME_DECAY" | "HARD_RISK_EXIT" | "MISSING_THESIS_STATE";
 
 export interface ExitDecision {
   schemaVersion: string;
@@ -125,6 +148,8 @@ export interface ExitDecision {
   asOfMs: number;
   validUntilMs: number;
   action: ExitAction;
+  /** Advisory path assessment. It never mutates a stop, TP, or order. */
+  pathAssessment: ExitPathAssessment;
   exitFraction: number; // 0..1
   edgeRemainingR: number | null; // R; null if unknown
   reversalRisk: number; // 0..1
@@ -152,13 +177,15 @@ export interface ExecutiveDecision {
   direction: DirectionDecision | null;
   entry: EntryDecision | null;
   exit: ExitDecision | null;
-  cortexDecisionId: string | null;
+  allocationContext: AllocationContext;
+  marketContext: MarketContextLineage;
   laneId: string | null;
   symbolOrBasketId: string | null;
   candidateStatus: ExecutiveCandidateStatus;
   disagreements: string[];
   reasons: string[];
   reportOnly: true;
+  advisoryOnly: true;
 }
 
 // ── Shared pure helpers ───────────────────────────────────────────────────────────────────────────

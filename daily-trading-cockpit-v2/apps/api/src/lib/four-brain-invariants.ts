@@ -14,6 +14,7 @@ import {
   type ExitDecision,
   type MarketStateDecision,
 } from "./four-brain-types.js";
+import { validAllocationContext, validMarketContextLineage } from "./authority-contract.js";
 
 export interface FourBrainInvariantResult {
   ok: boolean;
@@ -110,6 +111,9 @@ export function checkExitInvariants(d: ExitDecision, ctx: ExitInvariantContext =
 export function checkExecutiveInvariants(d: ExecutiveDecision): FourBrainInvariantResult {
   const v: string[] = [];
   if (d.reportOnly !== true) v.push("reportOnly is not true"); // the whole layer is report-only in Phase 1
+  if (d.advisoryOnly !== true) v.push("advisoryOnly is not true");
+  if (!validAllocationContext(d.allocationContext)) v.push("invalid allocation context");
+  if (!validMarketContextLineage(d.marketContext)) v.push("invalid or causally inconsistent market context lineage");
   const ms = checkMarketStateInvariants(d.marketState);
   if (!ms.ok) v.push(...ms.violations.map((x) => `marketState: ${x}`));
   if (d.direction) {

@@ -16,6 +16,7 @@ import { deriveDirectionVeto, CORTEX_LANE_ROSTER, type CortexLaneDirection } fro
 import { FOUR_BRAIN_LANE_SUPPORT, FOUR_BRAIN_SUPPORTED_LANES as SUPPORTED_LANES } from "./four-brain-lane-support.js";
 import type { MarketSafetyEvent } from "./market-state-brain.js";
 import { fourBrainMode, type DirectionHorizon } from "./four-brain-types.js";
+import { staticAllocationContext, unavailableMarketContext, type AllocationContext, type MarketContextLineage } from "./authority-contract.js";
 import { getFourBrainEdgeMemory, fourBrainEdgeVerdict } from "./four-brain-edge-memory.js";
 import {
   FRESHNESS_TTL_MS,
@@ -84,6 +85,11 @@ export const FOUR_BRAIN_SUPPORTED_LANES: ReadonlySet<string> = SUPPORTED_LANES;
 export interface LaneReportLike {
   netAvgR: number | null;
   resolvedCount: number;
+  /** Only reports that explicitly satisfy this post-fix conservative contract may inform Direction. */
+  conservativeNetR?: number | null;
+  postFixExactLineage?: boolean;
+  costValid?: boolean;
+  fresh?: boolean;
   /** 2026-07-26: when this lane's store last ran a cycle — the report's OWN age.
    *
    *  liveLaneReport() has always returned this (`store.cycleMeta.lastCycleAt`); this narrowed
@@ -316,8 +322,8 @@ export interface FourBrainBindingDeps {
   maxHoldMsForLane?: (laneId: string) => number | null;
 
   // ── Executive / incumbent ──
-  cortexDecisionId: string | null;
-  cortexFinalPctForLane: (laneId: string) => number | null;
+  allocationContextForLane?: (laneId: string) => AllocationContext;
+  marketContext?: MarketContextLineage;
   laneEligibleIncumbent: (laneId: string) => boolean;
   killLatched: boolean;
   killReason: string | null;
@@ -348,6 +354,13 @@ function laneAtMs(report: LaneReportLike | null): number | null {
   if (typeof at !== "string") return null;
   const ms = Date.parse(at);
   return Number.isFinite(ms) ? ms : null;
+}
+
+/** A raw best-of-many mean is not usable evidence. Missing qualification fails closed. */
+function qualifiedLaneEvidence(report: LaneReportLike | null): number | null {
+  if (!report || report.postFixExactLineage !== true || report.costValid !== true || report.fresh !== true) return null;
+  const value = report.conservativeNetR;
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : null;
 }
 
 /** riskDistance-normalized unrealized R for an open position (LONG: up = profit). null when data insufficient. */
@@ -425,8 +438,8 @@ export function buildFourBrainGatherInput(dep: FourBrainBindingDeps): FourBrainG
       longEdgeN,
       shortEdgeN,
       conviction: reading("controller-conviction", finite(dep.convictionScore) ? dep.convictionScore : null, "0..1", dep.controllerCapturedAtMs ?? null, "regime"),
-      longLaneEdge: reading("lane-report-long", longLane && longLane.resolvedCount > 0 ? longLane.netAvgR : null, "R", laneAtMs(longLane), "regime", "no resolved long-lane closes"),
-      shortLaneEdge: reading("lane-report-short", shortLane && shortLane.resolvedCount > 0 ? shortLane.netAvgR : null, "R", laneAtMs(shortLane), "regime", "no resolved short-lane closes"),
+      longLaneEdge: reading("lane-report-long", qualifiedLaneEvidence(longLane), "R", laneAtMs(longLane), "regime", "no qualified post-fix conservative long-lane evidence"),
+      shortLaneEdge: reading("lane-report-short", qualifiedLaneEvidence(shortLane), "R", laneAtMs(shortLane), "regime", "no qualified post-fix conservative short-lane evidence"),
       kronosAgree: reading("kronos-agree", finite(dep.kronosAgree) ? dep.kronosAgree : null, "-1..1", dep.kronosAtMs, "derivatives", "kronos ~55% MISSING"),
       chronos2Agree: reading("chronos2-agree", finite(dep.chronos2Agree) ? dep.chronos2Agree : null, "-1..1", dep.chronos2AtMs ?? null, "derivatives", "Chronos-2 challenger unavailable"),
       timesfmAgree: reading("timesfm-agree", finite(dep.timesfmAgree) ? dep.timesfmAgree : null, "-1..1", dep.timesfmAtMs ?? null, "derivatives", "TimesFM challenger unavailable"),
@@ -457,8 +470,8 @@ export function buildFourBrainGatherInput(dep: FourBrainBindingDeps): FourBrainG
       signalId: s.observationId, positionId: null, horizon: laneHorizon(s.laneId, { scalpEnabled: dep.scalpHorizonEnabled === true }), decisionAtMs: nowMs,
     };
     const exec: ExecContext = {
-      cortexDecisionId: dep.cortexDecisionId,
-      cortexAllocationPct: dep.cortexFinalPctForLane(s.laneId),
+      allocationContext: dep.allocationContextForLane?.(s.laneId) ?? staticAllocationContext(null),
+      marketContext: dep.marketContext ?? unavailableMarketContext(nowMs),
       laneEligibleIncumbent: dep.laneEligibleIncumbent(s.laneId),
       killLatched: dep.killLatched,
       riskBlockedReason: riskBlockedReason(s.laneId, s.direction),
@@ -520,8 +533,8 @@ export function buildFourBrainGatherInput(dep: FourBrainBindingDeps): FourBrainG
       signalId: null, positionId: p.paperOrderId, horizon: laneHorizon(p.laneId, { scalpEnabled: dep.scalpHorizonEnabled === true }), decisionAtMs: nowMs,
     };
     const exec: ExecContext = {
-      cortexDecisionId: dep.cortexDecisionId,
-      cortexAllocationPct: dep.cortexFinalPctForLane(p.laneId),
+      allocationContext: dep.allocationContextForLane?.(p.laneId) ?? staticAllocationContext(null),
+      marketContext: dep.marketContext ?? unavailableMarketContext(nowMs),
       laneEligibleIncumbent: dep.laneEligibleIncumbent(p.laneId),
       killLatched: dep.killLatched,
       riskBlockedReason: dep.killLatched ? dep.killReason ?? "kill switch latched" : null,

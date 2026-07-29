@@ -156,13 +156,13 @@ describe("bestLaneReportForDirection stub vs real value → four-brain gather in
     expect(dir.shortLaneEdge.missingReason).toBeTruthy();
   });
 
-  it("a real selectBestLaneReportForDirection-backed accessor flows through as a non-null longLaneEdge reading when resolvedCount>0", () => {
+  it("a qualified post-fix conservative report flows through as one long-lane evidence reading", () => {
     const roster: LaneRosterEntryLike[] = [
       { laneId: "LONG_A", direction: "LONG" },
       { laneId: "SHORT_A", direction: "SHORT" },
     ];
     const reports: Record<string, LaneReportLike | null> = {
-      LONG_A: { netAvgR: 0.08, resolvedCount: 60 },
+      LONG_A: { netAvgR: 0.08, conservativeNetR: 0.06, postFixExactLineage: true, costValid: true, fresh: true, resolvedCount: 60 },
       SHORT_A: { netAvgR: 0.02, resolvedCount: 0 }, // n=0 ⇒ SHORT stays MISSING
     };
     const accessor = (direction: "LONG" | "SHORT") =>
@@ -172,8 +172,8 @@ describe("bestLaneReportForDirection stub vs real value → four-brain gather in
     const input = buildFourBrainGatherInput(deps);
     const dir = input.directions[0]!;
 
-    expect(dir.longLaneEdge.raw).toBe(0.08);
-    expect(dir.longLaneEdge.normalized).toBe(0.08);
+    expect(dir.longLaneEdge.raw).toBe(0.06);
+    expect(dir.longLaneEdge.normalized).toBe(0.06);
     expect(dir.longLaneEdge.missingReason).toBeNull();
     expect(dir.longLaneEdge.sourceId).toBe("lane-report-long");
 

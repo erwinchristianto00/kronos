@@ -394,6 +394,21 @@ describe("paper-execution-router", () => {
       openedAt,
       provenance: null,
       provenanceFieldMissing: [],
+      executiveReviewLink: {
+        executiveReviewId: "review-h6-1",
+        candidateId: "h6trend:BTCUSDT:123",
+        opportunityId: "opportunity-h6-1",
+        laneId: H6_TREND_PAPER_LANE_ID,
+        marketContextSnapshotId: "market-h6-1",
+        allocationSnapshotId: null,
+        direction: "LONG" as const,
+        marketState: "BULLISH_TACTICAL",
+        evidenceEra: "post-fix/1",
+        decisionPipelinePolicyVersion: "decision/1",
+        executionPolicyVersion: "execution/1",
+        evidencePolicyVersion: "evidence/1",
+        fourBrainPolicyVersion: "four-brain/1",
+      },
     };
 
     const first = admitPaperOpportunities({
@@ -422,6 +437,7 @@ describe("paper-execution-router", () => {
       paperStatus: "CREATED",
       paperOrderMode: "HEADLINE",
       variantExitRule: "scaleout_tp1_trail",
+      executiveReviewLink: { executiveReviewId: "review-h6-1", opportunityId: "opportunity-h6-1" },
     });
   });
 
