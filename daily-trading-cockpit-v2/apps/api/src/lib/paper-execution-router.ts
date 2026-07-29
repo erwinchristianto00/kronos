@@ -2052,15 +2052,6 @@ function paperOrderEntryFilledAtMs(order: PaperOrder, fallbackMs: number): numbe
   return Number.isFinite(filledMs) ? filledMs : fallbackMs;
 }
 
-function hasRequiredLifecycleTimestamp(order: PaperOrder): boolean {
-  // New orders have an explicit two-clock lifecycle.  Do not inherit the
-  // legacy openedAt fallback: it can make a pending order consume position
-  // holding time or let an unfilled row resolve as if it were executable.
-  if (order.executionPolicyVersion !== EXECUTION_POLICY_VERSION) return true;
-  const value = isPendingPaperEntry(order) ? order.firstSeenAt : order.entryFilledAt;
-  return typeof value === "string" && Number.isFinite(new Date(value).getTime());
-}
-
 function isPendingPaperEntry(order: PaperOrder): boolean {
   return order.executionPolicyVersion === EXECUTION_POLICY_VERSION &&
     order.entryOrderType === "LIMIT" &&
@@ -2622,15 +2613,6 @@ async function resolvePaperOrdersInner(
 
   const processableOrders: PaperOrder[] = [];
   for (const order of openOrders) {
-    if (!hasRequiredLifecycleTimestamp(order)) {
-      store.update(order.paperOrderId, {
-        paperStatus: "PAPER_DATA_FAILURE",
-        closeReason: isPendingPaperEntry(order) ? "MISSING_FIRST_SEEN_TIME" : "MISSING_ENTRY_FILL_TIME",
-        updatedAt: new Date().toISOString(),
-      });
-      dataFailures += 1;
-      continue;
-    }
     // A resting entry expires from first-seen. A filled position instead owns a
     // full holding window from its actual fill; pending time never consumes it.
     const expiryAnchorMs = isPendingPaperEntry(order)
