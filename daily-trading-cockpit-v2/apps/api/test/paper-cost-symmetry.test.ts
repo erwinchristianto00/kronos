@@ -129,7 +129,19 @@ async function resolveOne(o: PaperOrder, bars: Bar[]): Promise<PaperOrder> {
   return store.all[0]!;
 }
 
-const openedAt = () => new Date(Date.now() - 20 * 60_000).toISOString();
+/**
+ * Keep the fixture inside one UTC funding block. The assertions below isolate
+ * exit costs, so crossing 00:00/08:00/16:00 UTC would add a real funding debit
+ * and make the suite depend on the wall clock that happened to run it.
+ */
+const openedAt = () => {
+  const fundingBlockMs = 8 * 60 * 60_000;
+  const oneHourMs = 60 * 60_000;
+  const now = Date.now();
+  let safeOpenMs = Math.floor(now / fundingBlockMs) * fundingBlockMs + oneHourMs;
+  if (safeOpenMs > now - 20 * 60_000) safeOpenMs -= fundingBlockMs;
+  return new Date(safeOpenMs).toISOString();
+};
 
 // SHORT: SL when high >= 103, TP when low <= 96.
 const NEUTRAL: Bar = { high: 100.2, low: 99.8, close: 100 };
