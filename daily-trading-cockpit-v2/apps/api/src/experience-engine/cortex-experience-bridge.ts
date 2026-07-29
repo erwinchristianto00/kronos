@@ -50,9 +50,12 @@ export function buildCortexExperienceBridge(events: readonly ForwardEvent[]): Co
       outcome.identity.decisionId !== decision.identity.decisionId ||
       outcome.identity.opportunityId !== opportunity.identity.opportunityId
     ) { bump(rejected, "identity_mismatch"); continue; }
+    // Pre-hardening journals do not carry a CORTEX snapshot. Treat them as
+    // ineligible legacy evidence instead of allowing a malformed row to abort
+    // an otherwise report-only refit pass.
     const cortex = decision.cortexTraining;
     if (
-      cortex.status !== "PRESENT" || !cortex.decisionId ||
+      !cortex || cortex.status !== "PRESENT" || !cortex.decisionId ||
       cortex.decisionId !== outcome.identity.cortexDecisionId ||
       cortex.featureSchemaVersion !== outcome.identity.cortexFeatureSchemaVersion ||
       cortex.featureSchemaVersion !== CORTEX_FEATURE_SCHEMA_VERSION ||

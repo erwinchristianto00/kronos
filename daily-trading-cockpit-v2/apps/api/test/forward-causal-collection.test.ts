@@ -167,6 +167,25 @@ describe("forward causal collection", () => {
     expect(auditForwardCausalEvents(futureDecision).audits[0]?.rejectionReason).toBe("FUTURE_FEATURE_LEAKAGE");
   });
 
+  it("rejects a pre-hardening journal row without cortexTraining instead of aborting the refit", () => {
+    const dir = mkdtempSync(join(tmpdir(), "causal-legacy-cortex-")); dirs.push(dir);
+    const env = shadowEnv(dir); const o = order();
+    o.cortexDecisionSnapshot = {
+      decisionId: "cortex-decision:900:1:CG_WIDE_FAST_LONG", atMs: 900, laneId: "CG_WIDE_FAST_LONG", direction: "LONG",
+      featureSchemaVersion: CORTEX_FEATURE_SCHEMA_VERSION, featureVector: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0.5],
+      regimeFamily: "BULL", eligible: true, finalPct: 0, evalFinalPct: 0,
+    };
+    o.causalIdentity = prepareForwardCausalIdentity(o, env); recordForwardOpportunity(o, env);
+    o.paperStatus = "PAPER_CLOSED_WIN"; o.closedAtMs = 2_000; o.resolvedAtMs = 3_000; o.grossR = 0.2; o.costR = -0.02; o.netR = 0.18;
+    o.causalIdentity = withResolvedCausalIdentity(o); recordForwardOutcome(o, env);
+    const events = readFileSync(forwardCausalJournalPath(env)!, "utf8").trim().split("\n").map((line) => JSON.parse(line) as ForwardCausalEvent);
+    const legacy = events.map((event) => event.eventType === "DECISION_SNAPSHOT"
+      ? (() => { const { cortexTraining: _removed, ...row } = event; return row as ForwardCausalEvent; })()
+      : event);
+    expect(buildCortexExperienceBridge(legacy).outcomes).toEqual([]);
+    expect(buildCortexExperienceBridge(legacy).rejected).toMatchObject({ missing_or_incompatible_cortex_snapshot: 1 });
+  });
+
   it("fails open on journal failure without mutating the incumbent order", () => {
     const o = order(); const env = shadowEnv("/dev/null");
     o.causalIdentity = prepareForwardCausalIdentity(o, env);
