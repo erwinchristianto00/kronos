@@ -9,7 +9,7 @@ import { classifyEvidenceEra, CURRENT_EVIDENCE_ERA } from "@dtc/shared";
  *   LEGACY_PRE_ROUTING           — pre-fix toxic data
  *   POST_ROUTING_PRE_CALIBRATION — after no_chase/runner patches
  *   POST_CALIBRATION             — historical calibrated cohort
- *   POST_END_TO_END_CORRECTNESS_FIX_V1 — current correctness-migrated cohort
+ *   POST_END_TO_END_CORRECTNESS_FIX_V2 — current correctness-migrated cohort
  *
  * Reporting only. Does not mutate inputs and does not change any decision
  * rule. Old records keep their original shape; era is inferred read-only.
@@ -270,7 +270,7 @@ export function buildCohortPerformanceReport(
     currentEraVsLegacyDelta,
     notes: [
       "Era classification is deterministic and read-only. No historical record is mutated.",
-      "Legacy/calibration eras are audit-only. POST_END_TO_END_CORRECTNESS_FIX_V1 is the current decision policy.",
+      "Legacy/calibration eras are audit-only. POST_END_TO_END_CORRECTNESS_FIX_V2 is the current decision policy.",
       "Reporting only — does not change routing, scanner, shadow execution, or live readiness.",
     ],
   };

@@ -52,7 +52,7 @@ describe("classifyEvidenceEra", () => {
   });
 
   it("exports stable constants", () => {
-    expect(CURRENT_EVIDENCE_ERA).toBe("POST_END_TO_END_CORRECTNESS_FIX_V1");
+    expect(CURRENT_EVIDENCE_ERA).toBe("POST_END_TO_END_CORRECTNESS_FIX_V2");
     expect(typeof CURRENT_DECISION_POLICY_VERSION).toBe("string");
     expect(CURRENT_DECISION_POLICY_VERSION.length).toBeGreaterThan(0);
   });

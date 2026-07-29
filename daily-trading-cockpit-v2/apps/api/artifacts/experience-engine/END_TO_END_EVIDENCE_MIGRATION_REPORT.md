@@ -23,6 +23,9 @@ CORTEX candidate learning only when all of the following are true:
 ## Contamination treatment
 
 - Existing unstamped or legacy records remain audit-only.
+- The historical-catchup repair advances the current policy to the V2 evidence
+  era. Rows stamped V1 are intentionally legacy for routing and learning,
+  even when their IDs and arithmetic are otherwise valid.
 - New policy-stamped rows lacking any boundary above fail closed and are
   diagnostic-only; they cannot be promoted into current evidence.
 - This patch does not assert that pre-patch historical catchup outcomes are

@@ -48,7 +48,7 @@ function makeSelection(flavor: EraFlavor): VariantSelectionSnapshot | null {
     calibrationSourceUsed: "combo",
     calibrationPenaltyR: -0.2,
     calibrationDiagnosisCodes: [],
-    evidenceEra: flavor === "POST_FIX" ? "POST_END_TO_END_CORRECTNESS_FIX_V1" : "POST_CALIBRATION",
+    evidenceEra: flavor === "POST_FIX" ? "POST_END_TO_END_CORRECTNESS_FIX_V2" : "POST_CALIBRATION",
     decisionPolicyVersion: "calibrated-expectancy-v1",
   };
   return calibrated;
@@ -123,7 +123,7 @@ describe("buildCohortPerformanceReport", () => {
       makePosition("C2", "POST_FIX", 0.4),
     ];
     const r = buildCohortPerformanceReport({ positions });
-    const current = r.byEra.POST_END_TO_END_CORRECTNESS_FIX_V1!;
+    const current = r.byEra.POST_END_TO_END_CORRECTNESS_FIX_V2!;
     expect(current.avgRealizedNetR).toBeCloseTo(0.45, 4);
   });
 
@@ -150,6 +150,6 @@ describe("buildCohortPerformanceReport", () => {
 
   it("currentEra is the explicit post-fix boundary and exposed in the report", () => {
     const r = buildCohortPerformanceReport({ positions: [] });
-    expect(r.currentEra).toBe("POST_END_TO_END_CORRECTNESS_FIX_V1");
+    expect(r.currentEra).toBe("POST_END_TO_END_CORRECTNESS_FIX_V2");
   });
 });

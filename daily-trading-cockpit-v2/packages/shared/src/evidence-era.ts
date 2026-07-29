@@ -26,6 +26,7 @@ import {
 export type EvidenceEra =
   | "LEGACY_PRE_END_TO_END_CORRECTNESS_FIX"
   | "POST_END_TO_END_CORRECTNESS_FIX_V1"
+  | "POST_END_TO_END_CORRECTNESS_FIX_V2"
   | "LEGACY_PRE_ROUTING"
   | "POST_ROUTING_PRE_CALIBRATION"
   | "POST_CALIBRATION"
@@ -40,7 +41,7 @@ export const CURRENT_DECISION_POLICY_VERSION = DECISION_PIPELINE_POLICY_VERSION;
  * without an explicit stamp remain legacy; no filesystem timestamp inference
  * is used anywhere in this classifier.
  */
-export const CURRENT_EVIDENCE_ERA: EvidenceEra = "POST_END_TO_END_CORRECTNESS_FIX_V1";
+export const CURRENT_EVIDENCE_ERA: EvidenceEra = "POST_END_TO_END_CORRECTNESS_FIX_V2";
 
 /**
  * The only cohort allowed to influence current expectancy, routing, or

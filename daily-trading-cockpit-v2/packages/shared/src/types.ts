@@ -786,7 +786,7 @@ export interface VariantSelectionSnapshot {
     | "INSUFFICIENT_SAMPLE";
   calibrationExplanation?: string;
   /** Evidence era stamped at plan-build time. Old values remain readable for audit. */
-  evidenceEra?: "LEGACY_PRE_END_TO_END_CORRECTNESS_FIX" | "POST_END_TO_END_CORRECTNESS_FIX_V1" | "LEGACY_PRE_ROUTING" | "POST_ROUTING_PRE_CALIBRATION" | "POST_CALIBRATION" | "UNKNOWN";
+  evidenceEra?: "LEGACY_PRE_END_TO_END_CORRECTNESS_FIX" | "POST_END_TO_END_CORRECTNESS_FIX_V1" | "POST_END_TO_END_CORRECTNESS_FIX_V2" | "LEGACY_PRE_ROUTING" | "POST_ROUTING_PRE_CALIBRATION" | "POST_CALIBRATION" | "UNKNOWN";
   /** Decision-policy version string; bump when planner rules change. */
   decisionPolicyVersion?: string;
   /** Execution semantics used when the plan is admitted/resolved. */
