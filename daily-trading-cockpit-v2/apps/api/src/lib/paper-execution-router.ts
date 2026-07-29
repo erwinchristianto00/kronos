@@ -2651,6 +2651,16 @@ async function resolvePaperOrdersInner(
       const resolutionStartMs = order.executionPolicyVersion === EXECUTION_POLICY_VERSION
         ? Math.ceil(openedAtMs / CANDLE_MS) * CANDLE_MS
         : openedAtMs - CANDLE_MS;
+      // A post-fix fill may happen at any point inside its opening candle. That
+      // candle is deliberately excluded from causal resolution, so there is no
+      // valid market path until the following whole candle has closed. Treat the
+      // interval before that boundary as pending, not as a permanent data gap.
+      if (
+        order.executionPolicyVersion === EXECUTION_POLICY_VERSION
+        && nowMs < resolutionStartMs + CANDLE_MS
+      ) {
+        continue;
+      }
       const startTime = resolutionStartMs;
       const endTime = Math.min(nowMs, openedAtMs + 14 * 24 * 60 * 60 * 1000);
       const candles = await fetchPaperKlinesRange(binanceClient, order.symbol, "5m", startTime, endTime);

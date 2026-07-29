@@ -2014,8 +2014,32 @@ describe("paper-execution-router", () => {
     expect(result.dataFailures).toBe(0);
   });
 
-  // [33] resetTransientFailures resets DATA_FETCH_ERROR orders back to PAPER_SUBMITTED
-  it("[33] resetTransientFailures resets DATA_FETCH_ERROR orders and leaves hard failures untouched", () => {
+  it("[33] post-fix order waits for its first completed exit candle", async () => {
+    const dir = tmpDir();
+    const store = new PaperExecutionRouterStore(dir);
+    const openedAt = new Date().toISOString();
+    store.add(makePaperOrder({
+      paperOrderId: "post-fix-awaits-closed-candle",
+      dedupeKey: "post-fix-awaits-closed-candle:lane",
+      sourceObservationId: "obs-post-fix-awaits-closed-candle",
+      openedAt,
+      executionPolicyVersion: EXECUTION_POLICY_VERSION,
+      paperStatus: "CREATED",
+    }));
+
+    const noCandlesClient: PaperResolverClient = {
+      getKlines: async () => [],
+    };
+    const result = await resolvePaperOrders(store, noCandlesClient);
+
+    const order = store.all.find((o) => o.paperOrderId === "post-fix-awaits-closed-candle");
+    expect(order!.paperStatus).toBe("CREATED");
+    expect(order!.closeReason).toBeNull();
+    expect(result.dataFailures).toBe(0);
+  });
+
+  // [34] resetTransientFailures resets DATA_FETCH_ERROR orders back to PAPER_SUBMITTED
+  it("[34] resetTransientFailures resets DATA_FETCH_ERROR orders and leaves hard failures untouched", () => {
     const dir = tmpDir();
     const store = new PaperExecutionRouterStore(dir);
 
