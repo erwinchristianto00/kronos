@@ -6,8 +6,9 @@
  * decision-to-outcome ownership is available for every training record.
  */
 import { CORTEX_FEATURE_SCHEMA_VERSION, solveLinear } from "./cortex-brain.js";
+import { ECONOMIC_HURDLE_R } from "./success-goal-contract.js";
 
-export const CORTEX_ECONOMIC_HURDLE_R = 0.03;
+export const CORTEX_ECONOMIC_HURDLE_R = ECONOMIC_HURDLE_R;
 export const CORTEX_ECONOMIC_MIN_EFFECTIVE_N = 20;
 const DEFAULT_HALF_LIFE_DAYS = 45;
 const DEFAULT_RIDGE = 1;

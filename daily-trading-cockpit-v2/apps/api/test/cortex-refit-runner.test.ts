@@ -53,7 +53,13 @@ describe("runCortexRefit — end-to-end + monotonic counters + liveBeta wall", (
 
     expect(report.examplesTotal).toBe(30);
     expect(report.examplesNew).toBe(30);
-    expect(report.reinforcementByLane).toEqual([{ laneId: RC, positive: 15, noReward: 15 }]);
+    // Legacy binary telemetry remains visible, while the canonical summary keeps the economic
+    // magnitude: 15 x +0.3R and 15 x -0.4R is net negative, not a "winning" learner cohort.
+    expect(report.reinforcementByLane).toMatchObject([{
+      laneId: RC, positive: 15, noReward: 15,
+      positiveCount: 15, neutralCount: 0, negativeCount: 15,
+    }]);
+    expect(report.reinforcementByLane[0]?.sumRewardR).toBeCloseTo(-1.5, 12);
     expect(store.get().cumulativeResolved).toBe(30);
     expect(report.coverage.regimeFamiliesWithOutcomes).toBe(2);
     expect(report.coverage.regimeCoverageGateMet).toBe(true);

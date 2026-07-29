@@ -20,6 +20,7 @@ import {
   type CortexRefitStatus,
 } from "./cortex-brain.js";
 import { refitCortexEconomicModel } from "./cortex-economic-model.js";
+import { ECONOMIC_HURDLE_R } from "./success-goal-contract.js";
 import type { CortexBrainStore } from "./cortex-brain-store.js";
 import {
   attributeOutcomes,
@@ -71,8 +72,16 @@ export interface CortexArchetypeRefit {
  * it explains what the learner saw without exposing a coefficient update as a trading decision. */
 export interface CortexLaneReinforcementSummary {
   laneId: string;
+  /** Legacy UI aliases derived from the economic class, never a learner target. */
   positive: number;
   noReward: number;
+  positiveCount: number;
+  neutralCount: number;
+  negativeCount: number;
+  sumRewardR: number;
+  averageRewardR: number | null;
+  downsideRewardR: number | null;
+  conservativeExpectedNetR: number | null;
 }
 
 export interface CortexPromotionCoverage {
@@ -135,15 +144,14 @@ export function runCortexRefit(store: CortexBrainStore, input: CortexRefitInput)
   // Per-archetype refit on the FULL derivable example set (recency-decayed inside the refit). Write only on
   // ACCEPTED — a rejected fit leaves the last healthy coefficients untouched.
   const byArch = new Map<CortexArchetype, Array<{ x: number[]; realizedNetR: number; tMs: number; schemaVersion: number }>>();
-  const reinforcementByLane = new Map<string, CortexLaneReinforcementSummary>();
+  const reinforcementByLane = new Map<string, { laneId: string; rewards: number[] }>();
   for (const a of ARCHETYPES) byArch.set(a, []);
   for (const e of attr.examples) {
     // Economic realized R is the canonical learner target.  The binary win
     // label remains ledger telemetry only, never a coefficient target.
     byArch.get(e.archetype)?.push({ x: e.x, realizedNetR: e.netR, tMs: e.tMs, schemaVersion: e.schemaVersion });
-    const summary = reinforcementByLane.get(e.laneId) ?? { laneId: e.laneId, positive: 0, noReward: 0 };
-    if (e.y === 1) summary.positive += 1;
-    else summary.noReward += 1;
+    const summary = reinforcementByLane.get(e.laneId) ?? { laneId: e.laneId, rewards: [] };
+    summary.rewards.push(e.netR);
     reinforcementByLane.set(e.laneId, summary);
   }
 
@@ -197,7 +205,29 @@ export function runCortexRefit(store: CortexBrainStore, input: CortexRefitInput)
     examplesNew: newlyCounted,
     perLane: attr.perLane,
     archetypes,
-    reinforcementByLane: [...reinforcementByLane.values()].sort((a, b) => a.laneId.localeCompare(b.laneId)),
+    reinforcementByLane: [...reinforcementByLane.values()]
+      .map((summary): CortexLaneReinforcementSummary => {
+        const positiveCount = summary.rewards.filter((reward) => reward > ECONOMIC_HURDLE_R).length;
+        const negativeCount = summary.rewards.filter((reward) => reward < -ECONOMIC_HURDLE_R).length;
+        const neutralCount = summary.rewards.length - positiveCount - negativeCount;
+        const sumRewardR = summary.rewards.reduce((total, reward) => total + reward, 0);
+        const averageRewardR = summary.rewards.length ? sumRewardR / summary.rewards.length : null;
+        const downside = summary.rewards.filter((reward) => reward < 0);
+        const variance = averageRewardR === null || summary.rewards.length < 2 ? null : summary.rewards.reduce((total, reward) => total + (reward - averageRewardR) ** 2, 0) / (summary.rewards.length - 1);
+        return {
+          laneId: summary.laneId,
+          positive: positiveCount,
+          noReward: neutralCount + negativeCount,
+          positiveCount,
+          neutralCount,
+          negativeCount,
+          sumRewardR,
+          averageRewardR,
+          downsideRewardR: downside.length ? downside.reduce((total, reward) => total + reward, 0) / downside.length : null,
+          conservativeExpectedNetR: averageRewardR === null || variance === null ? null : averageRewardR - 1.96 * Math.sqrt(variance / summary.rewards.length),
+        };
+      })
+      .sort((a, b) => a.laneId.localeCompare(b.laneId)),
     coverage,
     skipsByLane: input.skipsByLane ?? {},
     applied: apply,
