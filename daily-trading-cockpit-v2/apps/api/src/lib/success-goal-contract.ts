@@ -16,6 +16,7 @@ export interface EconomicOutcomeInput {
   exactOwnership: boolean;
   originalRisk: number | null;
   grossR: number | null;
+  /** Canonical: a non-negative cost MAGNITUDE, never a signed drag. `grossR - costR = netR`. */
   costR: number | null;
   netR: number | null;
   costKnownComplete: boolean;
@@ -25,6 +26,40 @@ export interface EconomicOutcomeInput {
   decisionTimeMs: number | null;
   openedTimeMs: number | null;
   closedTimeMs: number | null;
+}
+
+/**
+ * Producers disagree on how they store cost. Live settlement / Executive Review already write a
+ * non-negative magnitude (CANONICAL_MAGNITUDE) straight into `EconomicOutcomeInput.costR` — that
+ * path needs no adapter. Paper/CORTEX outcome stores instead keep a signed drag on gross
+ * (SIGNED_DRAG, e.g. `costR = -0.10` for a 0.10R cost), which `classifyTradeEconomic` must never
+ * accept directly: self-consistent arithmetic (`grossR - (-0.10) = grossR + 0.10`) would silently
+ * reward the cost instead of charging it. `costConvention` is untyped `string` on purpose — it is
+ * meant to carry whatever tag a store actually persisted, so an unrecognized value fails closed
+ * here rather than being coerced by a cast at the call site.
+ */
+export type EconomicCostConvention = "CANONICAL_MAGNITUDE" | "SIGNED_DRAG";
+
+export interface RawEconomicCost {
+  costConvention: string;
+  costValue: number | null;
+}
+
+/**
+ * Returns a canonical non-negative cost magnitude, or `null` if the value cannot be normalized
+ * under its stated convention — including an unrecognized convention, which must never be guessed.
+ */
+export function normalizeEconomicCostR(raw: RawEconomicCost): number | null {
+  if (!finite(raw.costValue)) return null;
+  if (raw.costConvention === "CANONICAL_MAGNITUDE") return raw.costValue >= 0 ? raw.costValue : null;
+  // A positive value under SIGNED_DRAG means the drag was already flipped once upstream (double-negated); reject rather than flip it again.
+  if (raw.costConvention === "SIGNED_DRAG") return raw.costValue <= 0 ? -raw.costValue : null;
+  return null;
+}
+
+/** Convenience adapter for the paper/CORTEX outcome shape: `costR = -0.10` -> canonical `+0.10`. */
+export function normalizeSignedCostDragR(signedCostR: number | null): number | null {
+  return normalizeEconomicCostR({ costConvention: "SIGNED_DRAG", costValue: signedCostR });
 }
 
 export interface EconomicReinforcementSummary {
@@ -42,6 +77,7 @@ export interface EconomicReinforcementSummary {
 export interface LaneEconomicMetrics {
   effectiveN: number;
   conservativeExpectedNetR: number | null;
+  /** Must come from `evaluateChronologicalOutOfSampleSharpe`'s AVAILABLE result — never raw/full-sample Sharpe. */
   outOfSampleSharpe: number | null;
   profitFactor: number | null;
   costCompletenessRate: number | null;
@@ -68,6 +104,7 @@ export function classifyTradeEconomic(input: EconomicOutcomeInput): TradeEconomi
   if (
     !input.exactOwnership || !input.costKnownComplete || !input.policyLineageMatches || input.intrabarAmbiguous ||
     !finite(input.originalRisk) || input.originalRisk <= 0 || !finite(input.grossR) || !finite(input.costR) || !finite(input.netR) ||
+    input.costR < 0 || // canonical costR is a magnitude; a signed drag must go through normalizeEconomicCostR first, never straight in
     !finite(input.decisionTimeMs) || !finite(input.openedTimeMs) || !finite(input.closedTimeMs) ||
     input.decisionTimeMs > input.openedTimeMs || input.closedTimeMs < input.openedTimeMs ||
     Math.abs((input.grossR - input.costR) - input.netR) > EPSILON
@@ -110,6 +147,13 @@ export function classifyLaneEvidence(metrics: LaneEconomicMetrics): LaneEvidence
   return "MIXED_OR_UNSTABLE";
 }
 
+/**
+ * Full-sample/raw statistics only. `rawSharpe` is computed over every value handed in — training
+ * and evaluation alike — so it is not an out-of-sample measurement and must never be reported as
+ * one. `outOfSampleSharpe` is always `null` here; it can only come from
+ * `evaluateChronologicalOutOfSampleSharpe`, which enforces a training window strictly preceding
+ * the evaluation window it scores.
+ */
 export function chronologicalDailyMetrics(dailyNetR: readonly number[]): ChronologicalDailyMetrics {
   const values = dailyNetR.filter(finite);
   if (values.length === 0) return { rawSharpe: null, outOfSampleSharpe: null, sortino: null, maxDrawdown: null, profitFactor: null, expectedShortfall: null, meanNetR: null, medianNetR: null, sharpeConfidenceStatus: "SHARPE_CONFIDENCE_UNAVAILABLE" };
@@ -125,13 +169,82 @@ export function chronologicalDailyMetrics(dailyNetR: readonly number[]): Chronol
   const sorted = [...values].sort((left, right) => left - right);
   const tailCount = Math.max(1, Math.ceil(sorted.length * 0.05));
   return {
-    rawSharpe, outOfSampleSharpe: rawSharpe,
+    rawSharpe, outOfSampleSharpe: null,
     sortino: downsideDeviation && downsideDeviation > 0 ? meanNetR / downsideDeviation * Math.sqrt(365) : null,
     maxDrawdown,
     profitFactor: losses > 0 ? gains / losses : gains > 0 ? Number.POSITIVE_INFINITY : null,
     expectedShortfall: sorted.slice(0, tailCount).reduce((sum, value) => sum + value, 0) / tailCount,
     meanNetR,
     medianNetR: sorted.length % 2 ? sorted[Math.floor(sorted.length / 2)]! : (sorted[sorted.length / 2 - 1]! + sorted[sorted.length / 2]!) / 2,
+    sharpeConfidenceStatus: "SHARPE_CONFIDENCE_UNAVAILABLE",
+  };
+}
+
+export const MIN_OOS_EVALUATION_SAMPLE = 30;
+
+export type OutOfSampleSharpeStatus = "AVAILABLE" | "INSUFFICIENT_SAMPLE" | "INVALID_WINDOWS" | "UNAVAILABLE";
+
+export interface DatedNetR {
+  readonly atMs: number;
+  readonly netR: number;
+}
+
+/** Half-open: an observation belongs to a window when `atMs >= startMs && atMs < endMs`. */
+export interface ChronologicalWindow {
+  readonly startMs: number;
+  readonly endMs: number;
+}
+
+export interface ChronologicalOutOfSampleSharpeResult {
+  status: OutOfSampleSharpeStatus;
+  outOfSampleSharpe: number | null;
+  trainingSampleSize: number;
+  evaluationSampleSize: number;
+  sharpeConfidenceStatus: "SHARPE_CONFIDENCE_UNAVAILABLE";
+}
+
+const unavailableOOS = (
+  status: OutOfSampleSharpeStatus,
+  trainingSampleSize: number,
+  evaluationSampleSize: number,
+): ChronologicalOutOfSampleSharpeResult => ({
+  status, outOfSampleSharpe: null, trainingSampleSize, evaluationSampleSize, sharpeConfidenceStatus: "SHARPE_CONFIDENCE_UNAVAILABLE",
+});
+
+/**
+ * The only honest OOS Sharpe in this module: training window membership and evaluation window
+ * membership are both derived from each observation's own timestamp, never from array position or
+ * caller intent, and never shuffled. A training window that does not strictly precede the
+ * evaluation window is rejected outright (`INVALID_WINDOWS`) rather than silently evaluated —
+ * this is what stops a "future" return from ever entering training. The returned Sharpe is
+ * computed only from returns whose timestamp falls inside the evaluation window; nothing about the
+ * training subset (its values or its size) participates in that number besides gating readiness.
+ */
+export function evaluateChronologicalOutOfSampleSharpe(
+  series: readonly DatedNetR[],
+  trainingWindow: ChronologicalWindow,
+  evaluationWindow: ChronologicalWindow,
+): ChronologicalOutOfSampleSharpeResult {
+  if (
+    !finite(trainingWindow.startMs) || !finite(trainingWindow.endMs) || !finite(evaluationWindow.startMs) || !finite(evaluationWindow.endMs) ||
+    trainingWindow.endMs > evaluationWindow.startMs
+  ) return unavailableOOS("INVALID_WINDOWS", 0, 0);
+
+  const inWindow = (atMs: number, window: ChronologicalWindow) => finite(atMs) && atMs >= window.startMs && atMs < window.endMs;
+  const trainingSampleSize = series.filter((row) => inWindow(row.atMs, trainingWindow) && finite(row.netR)).length;
+  const evaluationValues = series.filter((row) => inWindow(row.atMs, evaluationWindow) && finite(row.netR)).map((row) => row.netR);
+
+  if (evaluationValues.length < MIN_OOS_EVALUATION_SAMPLE) return unavailableOOS("INSUFFICIENT_SAMPLE", trainingSampleSize, evaluationValues.length);
+
+  const meanNetR = evaluationValues.reduce((sum, value) => sum + value, 0) / evaluationValues.length;
+  const variance = evaluationValues.reduce((sum, value) => sum + (value - meanNetR) ** 2, 0) / (evaluationValues.length - 1);
+  if (!(variance > 0)) return unavailableOOS("UNAVAILABLE", trainingSampleSize, evaluationValues.length);
+
+  return {
+    status: "AVAILABLE",
+    outOfSampleSharpe: (meanNetR / Math.sqrt(variance)) * Math.sqrt(365),
+    trainingSampleSize,
+    evaluationSampleSize: evaluationValues.length,
     sharpeConfidenceStatus: "SHARPE_CONFIDENCE_UNAVAILABLE",
   };
 }
