@@ -581,6 +581,56 @@ function trailStopPrice(position: ShadowPosition, candidate: Candidate): number 
   return Math.min(position.entryPrice, candidate.indicators.fiveMinute.ema20, candidate.indicators.fiveMinute.vwap + atr * 0.25);
 }
 
+/**
+ * Dynamic exit inputs (Kronos/whale/VWAP/EMA/trail) are scan-time facts, not
+ * candle-time facts.  They must never be replayed across a historical catchup
+ * range using the most recent candidate.  Historical candles use only the
+ * immutable entry geometry in updateVariantFromCandle(); the current scan may
+ * apply a dynamic exit once at its own timestamp through this helper.
+ */
+function applyCurrentDynamicExit(
+  position: ShadowPosition,
+  variant: ShadowVariantPosition,
+  candidate: Candidate,
+  price: number,
+  nowIso: string,
+  events: ShadowExecutionEvent[],
+) {
+  if (variant.state === "CLOSED" || !variant.tp1Hit) return;
+
+  if (variant.variant === "trail_after_tp1") {
+    const trail = trailStopPrice(position, candidate);
+    if (trail !== null) {
+      variant.stopPrice = position.direction === "LONG"
+        ? Math.max(variant.stopPrice ?? trail, trail)
+        : Math.min(variant.stopPrice ?? trail, trail);
+    }
+  }
+
+  const shouldExitOnWhale = variant.variant === "whale_conflict_exit" && whaleConflicts(candidate, position.direction);
+  const shouldExitOnKronos = variant.variant === "kronos_flip_exit" && kronosConflicts(candidate, position.direction);
+  const shouldExitOnVwap =
+    variant.variant === "vwap_loss_exit" &&
+    (position.direction === "LONG" ? longLosesVwapOrEma(price, candidate) : shortLosesVwapOrEma(price, candidate));
+  const shouldTrailExit =
+    variant.variant === "trail_after_tp1" &&
+    (position.direction === "LONG"
+      ? price <= (variant.stopPrice ?? position.entryPrice)
+      : price >= (variant.stopPrice ?? position.entryPrice));
+
+  if (!shouldExitOnWhale && !shouldExitOnKronos && !shouldExitOnVwap && !shouldTrailExit) return;
+  const closeReason: ShadowCloseReason = shouldExitOnWhale
+    ? "WHALE_CONFLICT"
+    : shouldExitOnKronos
+      ? "KRONOS_FLIP"
+      : shouldExitOnVwap
+        ? "VWAP_LOSS"
+        : "TRAIL_STOP";
+  closeVariant(variant, position, nowIso, price, closeReason);
+  events.push(makeEvent(position, variant.variant, "RUNNER_EXIT", nowIso, `Runner exited on current ${closeReason.toLowerCase().replace("_", " ")} signal.`, price, variant.realizedNetR));
+  events.push(makeEvent(position, variant.variant, "CLOSED", nowIso, "Runner closed.", price, variant.realizedNetR));
+}
+
 function updateVariantFromCandle(
   position: ShadowPosition,
   variant: ShadowVariantPosition,
@@ -1054,7 +1104,9 @@ export class ShadowExecutionEngine {
         const filledOnThisCandle = fillPendingPosition(position, candle, log);
         if (filledOnThisCandle) continue;
         for (const variant of position.variants) {
-          updateVariantFromCandle(position, variant, candle, candidate, log);
+          // A current scan candidate cannot causally describe an older candle.
+          // Historical catchup therefore resolves only fixed SL/TP geometry.
+          updateVariantFromCandle(position, variant, candle, null, log);
         }
       }
       const latestPrice = candidate ? currentPrice(candidate) : freshCandles.at(-1)?.close ?? position.entryPrice;
@@ -1062,10 +1114,29 @@ export class ShadowExecutionEngine {
         variant.currentPrice = latestPrice;
         if (variant.state !== "CLOSED") {
           variant.unrealizedR = variant.remainingSizePct > 0 ? unrealizedR(position.direction, position.entryPrice, latestPrice, position.stopLoss) * variant.remainingSizePct : 0;
-          if (nowMs - new Date(position.firstSeenAt).getTime() >= ACTIVE_POSITION_MAX_MS) {
+          const entryFilledAtMs = position.entryFilledAt ? new Date(position.entryFilledAt).getTime() : Number.NaN;
+          if (!Number.isFinite(entryFilledAtMs)) {
+            // Post-fix evidence must never invent a holding clock from firstSeenAt.
+            // Keep the position diagnostic-only until a valid fill timestamp exists.
+            const alreadyLogged = log.some((event) =>
+              event.positionId === position.id && event.message.includes("missing entryFilledAt"),
+            );
+            if (!alreadyLogged) {
+              log.push(makeEvent(position, variant.variant, "ENTRY_SKIPPED", nowIso, "Invalid filled position: missing entryFilledAt; holding clock and outcome eligibility are blocked.", latestPrice, null));
+            }
+            continue;
+          }
+          if (nowMs - entryFilledAtMs >= ACTIVE_POSITION_MAX_MS) {
             closeVariant(variant, position, nowIso, latestPrice, "TIME_EXPIRED");
             log.push(makeEvent(position, variant.variant, "CLOSED", nowIso, "Position expired after 24h shadow window.", latestPrice, variant.realizedNetR));
           }
+        }
+      }
+      // Dynamic inputs are valid only at the current scan timestamp.  Apply at
+      // most one current-price decision after all historical candles are done.
+      if (candidate) {
+        for (const variant of position.variants) {
+          applyCurrentDynamicExit(position, variant, candidate, latestPrice, nowIso, log);
         }
       }
       if ((position.entryState ?? "FILLED") === "PENDING_ENTRY" && nowMs - new Date(position.firstSeenAt).getTime() >= ACTIVE_POSITION_MAX_MS) {

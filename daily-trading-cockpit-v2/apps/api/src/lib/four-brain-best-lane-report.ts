@@ -44,8 +44,10 @@ export interface LaneRosterEntryLike {
 }
 
 /**
- * PURE: pick the single best LaneReportLike for `direction` among `roster` entries, via the injected
- * per-lane report lookup. See the module doc comment for the exact selection + tie-break rule.
+ * PURE: pick the single best qualified LaneReportLike for `direction` among
+ * `roster`. Raw mean R is deliberately not a ranking input: a report must
+ * prove exact post-fix lineage, finite costs, freshness, and a positive
+ * conservative expected R before it can represent a Direction-Brain edge.
  *
  * `laneReportForId` is allowed to throw (a defensive DI contract, matching `liveLaneReport`'s own
  * try/catch convention) — a single lane's accessor failing must never abort the selection for the
@@ -66,13 +68,10 @@ export function selectBestLaneReportForDirection(
       continue; // one lane's report accessor throwing must never break selection for the rest
     }
     if (!report) continue;
-    if (!(report.resolvedCount > 0)) continue; // never fabricate: n=0 lanes are not selectable
-    // Defensive: this codebase's report builders guarantee resolvedCount>0 ⇒ netAvgR is a finite mean
-    // (see regime-composite-edge.ts's `mean()`), but never trust an injected accessor blindly — a
-    // non-finite netAvgR must not silently win a Math.max-style comparison (NaN comparisons are always
-    // false, which would falsely tolerate it as neither better nor worse than a real candidate).
-    if (!Number.isFinite(report.netAvgR as number)) continue;
-    if (best === null || (report.netAvgR as number) > (best.netAvgR as number)) {
+    if (!(report.resolvedCount > 0)) continue;
+    if (report.postFixExactLineage !== true || report.costValid !== true || report.fresh !== true) continue;
+    if (!(typeof report.conservativeNetR === "number" && Number.isFinite(report.conservativeNetR) && report.conservativeNetR > 0)) continue;
+    if (best === null || report.conservativeNetR > (best.conservativeNetR as number)) {
       best = report;
     }
   }

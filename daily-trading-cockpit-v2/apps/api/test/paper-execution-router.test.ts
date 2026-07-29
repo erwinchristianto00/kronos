@@ -2039,6 +2039,7 @@ describe("paper-execution-router", () => {
       dedupeKey: "post-fix-awaits-closed-candle:lane",
       sourceObservationId: "obs-post-fix-awaits-closed-candle",
       openedAt,
+      entryFilledAt: openedAt,
       executionPolicyVersion: EXECUTION_POLICY_VERSION,
       paperStatus: "CREATED",
     }));
@@ -2052,6 +2053,26 @@ describe("paper-execution-router", () => {
     expect(order!.paperStatus).toBe("CREATED");
     expect(order!.closeReason).toBeNull();
     expect(result.dataFailures).toBe(0);
+  });
+
+  it("fails closed when a post-fix filled order has no exact entry-fill timestamp", async () => {
+    const dir = tmpDir();
+    const store = new PaperExecutionRouterStore(dir);
+    store.add(makePaperOrder({
+      paperOrderId: "post-fix-missing-fill-time",
+      dedupeKey: "post-fix-missing-fill-time:lane",
+      sourceObservationId: "obs-post-fix-missing-fill-time",
+      openedAt: new Date().toISOString(),
+      executionPolicyVersion: EXECUTION_POLICY_VERSION,
+      paperStatus: "CREATED",
+      entryFilledAt: null,
+    }));
+
+    const result = await resolvePaperOrders(store, { getKlines: async () => [] });
+    const order = store.all.find((o) => o.paperOrderId === "post-fix-missing-fill-time");
+    expect(order?.paperStatus).toBe("PAPER_DATA_FAILURE");
+    expect(order?.closeReason).toBe("MISSING_ENTRY_FILL_TIME");
+    expect(result.dataFailures).toBe(1);
   });
 
   // [34] resetTransientFailures resets DATA_FETCH_ERROR orders back to PAPER_SUBMITTED

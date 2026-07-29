@@ -13,14 +13,13 @@
  * report-only — promotion still requires the full pre-registered gate + explicit operator approval.
  */
 import {
-  refitArchetypeCoefficients,
   evaluationBeta,
   CORTEX_LIVE_BETA,
   CORTEX_FEATURE_SCHEMA_VERSION,
   type CortexArchetype,
   type CortexRefitStatus,
-  type CortexTrainingExample,
 } from "./cortex-brain.js";
+import { refitCortexEconomicModel } from "./cortex-economic-model.js";
 import type { CortexBrainStore } from "./cortex-brain-store.js";
 import {
   attributeOutcomes,
@@ -135,11 +134,13 @@ export function runCortexRefit(store: CortexBrainStore, input: CortexRefitInput)
 
   // Per-archetype refit on the FULL derivable example set (recency-decayed inside the refit). Write only on
   // ACCEPTED — a rejected fit leaves the last healthy coefficients untouched.
-  const byArch = new Map<CortexArchetype, CortexTrainingExample[]>();
+  const byArch = new Map<CortexArchetype, Array<{ x: number[]; realizedNetR: number; tMs: number; schemaVersion: number }>>();
   const reinforcementByLane = new Map<string, CortexLaneReinforcementSummary>();
   for (const a of ARCHETYPES) byArch.set(a, []);
   for (const e of attr.examples) {
-    byArch.get(e.archetype)?.push({ x: e.x, y: e.y, tMs: e.tMs, schemaVersion: e.schemaVersion });
+    // Economic realized R is the canonical learner target.  The binary win
+    // label remains ledger telemetry only, never a coefficient target.
+    byArch.get(e.archetype)?.push({ x: e.x, realizedNetR: e.netR, tMs: e.tMs, schemaVersion: e.schemaVersion });
     const summary = reinforcementByLane.get(e.laneId) ?? { laneId: e.laneId, positive: 0, noReward: 0 };
     if (e.y === 1) summary.positive += 1;
     else summary.noReward += 1;
@@ -153,7 +154,11 @@ export function runCortexRefit(store: CortexBrainStore, input: CortexRefitInput)
       archetypes.push({ archetype: a, examples: 0, status: "NO_EXAMPLES", applied: false, nEff: store.get().archetypes[a].nEff });
       continue;
     }
-    const result = refitArchetypeCoefficients(ex, store.get().archetypes[a].w, { nowMs: input.nowMs });
+    const economic = refitCortexEconomicModel(ex, store.get().archetypes[a].w, { nowMs: input.nowMs });
+    const status: CortexRefitStatus = economic.status === "INSUFFICIENT_DATA"
+      ? "REJECTED_LOW_NEFF"
+      : economic.status;
+    const result = { w: economic.coefficients, nEff: economic.effectiveSampleSize, status };
     const applied = apply ? store.applyRefit(a, result, input.nowIso) : result.status === "ACCEPTED";
     archetypes.push({ archetype: a, examples: ex.length, status: result.status, applied, nEff: result.nEff });
   }

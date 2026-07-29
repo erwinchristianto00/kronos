@@ -107,6 +107,16 @@ describe("forward causal collection", () => {
     expect(readFileSync(forwardCausalJournalPath(env)!, "utf8").trim().split("\n")).toHaveLength(2);
   });
 
+  it("rejects an arithmetically inconsistent gross/cost/net outcome", () => {
+    const dir = mkdtempSync(join(tmpdir(), "causal-cost-invariant-")); dirs.push(dir);
+    const env = shadowEnv(dir); const o = order(); o.causalIdentity = prepareForwardCausalIdentity(o, env);
+    expect(recordForwardOpportunity(o, env)).toBe(true);
+    o.paperStatus = "PAPER_CLOSED_WIN"; o.closedAtMs = 2_000; o.resolvedAtMs = 3_000;
+    o.grossR = 0.3; o.costR = -0.02; o.netR = 0.3; // must be 0.28
+    expect(recordForwardOutcome(o, env)).toBe(false);
+    expect(readFileSync(forwardCausalJournalPath(env)!, "utf8").trim().split("\n")).toHaveLength(2);
+  });
+
   it("uses direct opportunity linkage, not a nearby alternative decision", () => {
     const dir = mkdtempSync(join(tmpdir(), "causal-exact-")); dirs.push(dir);
     const env = shadowEnv(dir); const o = order(); o.causalIdentity = prepareForwardCausalIdentity(o, env);

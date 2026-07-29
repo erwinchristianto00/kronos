@@ -226,6 +226,22 @@ describe("shared scanner rules", () => {
     ).toBe("SKIP");
   });
 
+  it("never reports READY when geometry clears structural RR but fails execution RR", () => {
+    expect(
+      classifyStatus({
+        dataFresh: true,
+        spreadAcceptable: true,
+        direction: "LONG",
+        opportunityScore: 70,
+        confidence: 65,
+        dangerScore: 30,
+        riskReward: 1.3,
+        hasTradePlan: true,
+        liquidityScore: 88,
+      }),
+    ).toBe("WAIT");
+  });
+
   it("sorts top candidates by opportunity score", () => {
     const build = (
       symbol: string,

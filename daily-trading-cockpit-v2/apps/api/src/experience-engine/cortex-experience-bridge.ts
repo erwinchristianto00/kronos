@@ -20,6 +20,8 @@ export interface CortexExperienceBridgeResult {
 
 const finite = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value);
 const bump = (counts: Record<string, number>, reason: string): void => { counts[reason] = (counts[reason] ?? 0) + 1; };
+const economicallyConsistent = (grossR: unknown, costR: unknown, netR: unknown): boolean =>
+  finite(grossR) && finite(costR) && finite(netR) && Math.abs((grossR + costR) - netR) <= 1e-9;
 
 export function buildCortexExperienceBridge(events: readonly ForwardEvent[]): CortexExperienceBridgeResult {
   const paperDecisions = new Map<string, DecisionSnapshotEvent>();
@@ -64,9 +66,9 @@ export function buildCortexExperienceBridge(events: readonly ForwardEvent[]): Co
     if (
       !finite(decision.asOfMs) || decision.asOfMs > outcome.openedAtMs ||
       outcome.openedAtMs > outcome.closedAtMs || outcome.closedAtMs > outcome.resolvedAtMs ||
-      outcome.outcomeQuality !== "RESOLVED_VALID" || !finite(outcome.netR) ||
+      outcome.outcomeQuality !== "RESOLVED_VALID" || !economicallyConsistent(outcome.grossR, outcome.costR, outcome.netR) ||
       Object.values(decision.features.sourceStatuses).some((status) => status === "ERROR")
-    ) { bump(rejected, "causal_or_outcome_quality_failure"); continue; }
+    ) { bump(rejected, "causal_outcome_cost_or_quality_failure"); continue; }
     const meta = cortexOutcomeLaneMeta(outcome.identity.laneId);
     if (!meta || (meta.direction !== "NEUTRAL" && meta.direction !== outcome.identity.direction)) { bump(rejected, "lane_direction_mismatch"); continue; }
 

@@ -290,6 +290,29 @@ describe("shadow execution engine", () => {
     expect(snapshot.recentLog.some((entry) => entry.type === "SL_HIT" || entry.type === "TP1_HIT")).toBe(false);
   });
 
+  it("does not apply the latest VWAP/EMA candidate to a historical catchup candle", async () => {
+    const { engine, client } = makeEngine();
+    const opened = baseCandidate({ selectedExecutionPlan: selectedPlan("base_current_entry", "vwap_loss_exit") });
+    await engine.processScan(makeScanResult("2026-05-08T00:00:00.000Z", opened));
+    // This old candle reaches TP1, but closes beneath the *future* candidate's
+    // VWAP/EMA. Replaying that future state here would fabricate a VWAP exit.
+    client.setCandles("BTCUSDT", [
+      { openTime: Date.UTC(2026, 4, 8, 0, 5, 0), open: 100, high: 103.5, low: 99.8, close: 102.8, volume: 1000 },
+    ]);
+    const current = baseCandidate({
+      selectedExecutionPlan: selectedPlan("base_current_entry", "vwap_loss_exit"),
+      indicators: {
+        ...opened.indicators,
+        fiveMinute: { ...opened.indicators.fiveMinute, latestClose: 105, ema20: 104, vwap: 104 },
+      },
+    });
+    await engine.processScan(makeScanResult("2026-05-08T00:10:00.000Z", current));
+
+    const variant = engine.getAllPositions()[0]!.variants[0]!;
+    expect(variant.tp1Hit).toBe(true);
+    expect(variant.closeReason).toBe("OPEN");
+  });
+
   it("different entry zone opens new position", async () => {
     const { engine } = makeEngine();
     await engine.processScan(makeScanResult("2026-05-08T00:00:00.000Z", baseCandidate({ selectedExecutionPlan: selectedPlan("base_current_entry", "tp1_full_exit") })));

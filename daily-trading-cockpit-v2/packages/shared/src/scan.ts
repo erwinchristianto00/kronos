@@ -263,6 +263,12 @@ export function classifyStatus(args: {
   ) {
     return "TRADE_NOW";
   }
+  // Structural geometry may be worth observing, but it is not executable
+  // until it clears the stricter execution RR. READY must not become a
+  // side-door around the same admission threshold used by the resolver.
+  if ((riskReward ?? 0) < MIN_EXECUTION_RR) {
+    return "WAIT";
+  }
   if (opportunityScore >= 68 && confidence >= 62 && dangerScore <= 55) {
     return "READY";
   }

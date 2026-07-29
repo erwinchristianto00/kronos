@@ -33,26 +33,35 @@ const ROSTER: LaneRosterEntryLike[] = [
   { laneId: "NEUTRAL_A", direction: "NEUTRAL" },
 ];
 
+const qualified = (netAvgR: number, resolvedCount: number, conservativeNetR = netAvgR): LaneReportLike => ({
+  netAvgR,
+  conservativeNetR,
+  resolvedCount,
+  postFixExactLineage: true,
+  costValid: true,
+  fresh: true,
+});
+
 describe("selectBestLaneReportForDirection — pure selection logic", () => {
-  it("picks the lane with the HIGHEST netAvgR among resolvedCount>0 lanes for the requested direction", () => {
+  it("picks the highest conservative R only among qualified resolved lanes", () => {
     const reports: Record<string, LaneReportLike | null> = {
-      LONG_A: { netAvgR: 0.05, resolvedCount: 40 },
-      LONG_B: { netAvgR: 0.12, resolvedCount: 30 }, // highest netAvgR ⇒ should win
+      LONG_A: qualified(0.05, 40),
+      LONG_B: qualified(0.12, 30),
       LONG_C_ZERO: { netAvgR: 999, resolvedCount: 0 }, // fabricated-looking but n=0 ⇒ must be excluded
-      SHORT_A: { netAvgR: 0.5, resolvedCount: 50 }, // wrong direction ⇒ must be ignored
+      SHORT_A: qualified(0.5, 50), // wrong direction ⇒ must be ignored
     };
     const result = selectBestLaneReportForDirection("LONG", ROSTER, (id) => reports[id] ?? null);
-    expect(result).toEqual({ netAvgR: 0.12, resolvedCount: 30 });
+    expect(result).toBe(reports.LONG_B);
   });
 
   it("excludes resolvedCount===0 lanes even when their netAvgR would otherwise win (never fabricate)", () => {
     const reports: Record<string, LaneReportLike | null> = {
-      LONG_A: { netAvgR: 0.01, resolvedCount: 5 },
+      LONG_A: qualified(0.01, 5),
       LONG_B: { netAvgR: 50, resolvedCount: 0 }, // would trivially "win" on magnitude alone
       LONG_C_ZERO: { netAvgR: 100, resolvedCount: 0 },
     };
     const result = selectBestLaneReportForDirection("LONG", ROSTER, (id) => reports[id] ?? null);
-    expect(result).toEqual({ netAvgR: 0.01, resolvedCount: 5 });
+    expect(result).toBe(reports.LONG_A);
   });
 
   it("returns null when EVERY lane for the direction has resolvedCount===0", () => {
@@ -76,38 +85,44 @@ describe("selectBestLaneReportForDirection — pure selection logic", () => {
   it("treats a null per-lane report (not sourced) as absent, not as a zero candidate", () => {
     const reports: Record<string, LaneReportLike | null> = {
       LONG_A: null,
-      LONG_B: { netAvgR: 0.07, resolvedCount: 10 },
+      LONG_B: qualified(0.07, 10),
       LONG_C_ZERO: null,
     };
     const result = selectBestLaneReportForDirection("LONG", ROSTER, (id) => reports[id] ?? null);
-    expect(result).toEqual({ netAvgR: 0.07, resolvedCount: 10 });
+    expect(result).toBe(reports.LONG_B);
   });
 
   it("a single lane's report accessor throwing never aborts the scan for the remaining lanes", () => {
     const result = selectBestLaneReportForDirection("LONG", ROSTER, (id) => {
       if (id === "LONG_A") throw new Error("store unavailable");
-      if (id === "LONG_B") return { netAvgR: 0.09, resolvedCount: 20 };
+      if (id === "LONG_B") return qualified(0.09, 20);
       return null;
     });
-    expect(result).toEqual({ netAvgR: 0.09, resolvedCount: 20 });
+    expect(result).toMatchObject({ netAvgR: 0.09, conservativeNetR: 0.09, resolvedCount: 20 });
   });
 
   it("a non-finite netAvgR with resolvedCount>0 is never selected as best (defensive — should not arise from real report builders)", () => {
     const reports: Record<string, LaneReportLike | null> = {
-      LONG_A: { netAvgR: Number.NaN, resolvedCount: 10 },
-      LONG_B: { netAvgR: 0.02, resolvedCount: 8 },
+      LONG_A: qualified(Number.NaN, 10),
+      LONG_B: qualified(0.02, 8),
     };
     const result = selectBestLaneReportForDirection("LONG", ROSTER, (id) => reports[id] ?? null);
-    expect(result).toEqual({ netAvgR: 0.02, resolvedCount: 8 });
+    expect(result).toBe(reports.LONG_B);
   });
 
   it("ties keep the FIRST roster-order lane encountered (deterministic tie-break)", () => {
     const reports: Record<string, LaneReportLike | null> = {
-      LONG_A: { netAvgR: 0.1, resolvedCount: 10 },
-      LONG_B: { netAvgR: 0.1, resolvedCount: 999 }, // identical netAvgR, later in roster order
+      LONG_A: qualified(0.1, 10),
+      LONG_B: qualified(0.1, 999), // identical conservative R, later in roster order
     };
     const result = selectBestLaneReportForDirection("LONG", ROSTER, (id) => reports[id] ?? null);
-    expect(result).toEqual({ netAvgR: 0.1, resolvedCount: 10 }); // LONG_A, not LONG_B
+    expect(result).toBe(reports.LONG_A); // LONG_A, not LONG_B
+  });
+
+  it("rejects a raw-positive report that lacks exact post-fix qualification", () => {
+    expect(selectBestLaneReportForDirection("LONG", ROSTER, (id) =>
+      id === "LONG_A" ? { netAvgR: 9, resolvedCount: 500 } : null,
+    )).toBeNull();
   });
 });
 

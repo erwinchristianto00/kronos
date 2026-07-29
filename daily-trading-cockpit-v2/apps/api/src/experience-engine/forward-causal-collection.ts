@@ -266,7 +266,14 @@ function outcomeEvent(order: ForwardPaperOrderLike): OutcomeResolutionEvent | nu
   const identity = order.causalIdentity;
   const openedAtMs = openedAtMsOf(order);
   const outcomeId = deterministicOutcomeId(order);
-  if (!identity || !outcomeId || openedAtMs == null || !finite(order.closedAtMs) || !finite(order.resolvedAtMs) || !finite(order.grossR) || !finite(order.costR) || !finite(order.netR)) return null;
+  // costR is signed in the paper book, so the invariant is net = gross + cost.
+  // No incomplete or arithmetically impossible terminal row may enter the
+  // append-only causal journal and later look like a learnable outcome.
+  if (
+    !identity || !outcomeId || openedAtMs == null || !finite(order.closedAtMs) || !finite(order.resolvedAtMs) ||
+    !finite(order.grossR) || !finite(order.costR) || !finite(order.netR) ||
+    Math.abs((order.grossR + order.costR) - order.netR) > 1e-9
+  ) return null;
   return {
     eventType: "OUTCOME_RESOLUTION", eventId: outcomeId, identity: { ...identity, outcomeId }, outcomeId,
     opportunityId: identity.opportunityId, decisionId: identity.decisionId, openedAtMs, closedAtMs: order.closedAtMs,
