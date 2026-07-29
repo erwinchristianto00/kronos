@@ -10,6 +10,7 @@ import {
   recordForwardOpportunity,
   recordForwardOutcome,
   recordForwardOutcomes,
+  resolveCanonicalPolicyContext,
   resolveCausalCollectionActivation,
   withResolvedCausalIdentity,
   type ForwardPaperOrderLike,
@@ -175,7 +176,7 @@ describe("forward causal collection", () => {
     o.causalIdentity = withResolvedCausalIdentity(o);
     recordForwardOutcome(o, env);
     const events = readFileSync(forwardCausalJournalPath(env)!, "utf8").trim().split("\n").map((line) => JSON.parse(line) as ForwardCausalEvent);
-    const bridge = buildCortexExperienceBridge(events);
+    const bridge = buildCortexExperienceBridge(events, resolveCanonicalPolicyContext(env)!);
     expect(bridge.experiences).toHaveLength(1);
     expect(bridge.outcomes).toHaveLength(1);
     expect(bridge.outcomes[0]?.decisionId).toBe(o.cortexDecisionSnapshot.decisionId);
@@ -215,8 +216,9 @@ describe("forward causal collection", () => {
     const legacy = events.map((event) => event.eventType === "DECISION_SNAPSHOT"
       ? (() => { const { cortexTraining: _removed, ...row } = event; return row as ForwardCausalEvent; })()
       : event);
-    expect(buildCortexExperienceBridge(legacy).outcomes).toEqual([]);
-    expect(buildCortexExperienceBridge(legacy).rejected).toMatchObject({ missing_or_incompatible_cortex_snapshot: 1 });
+    const expectedPolicy = resolveCanonicalPolicyContext(env)!;
+    expect(buildCortexExperienceBridge(legacy, expectedPolicy).outcomes).toEqual([]);
+    expect(buildCortexExperienceBridge(legacy, expectedPolicy).rejected).toMatchObject({ missing_or_incompatible_cortex_snapshot: 1 });
   });
 
   it("fails open on journal failure without mutating the incumbent order", () => {
@@ -225,5 +227,121 @@ describe("forward causal collection", () => {
     const before = JSON.parse(JSON.stringify(o));
     expect(recordForwardOpportunity(o, env)).toBe(false);
     expect(o).toEqual(before);
+  });
+});
+
+// Closes the bypass where `if (order.causalIdentity) return order.causalIdentity;` reused a
+// persisted identity unconditionally. Every case here starts from a MINTED, valid identity so a
+// failure necessarily comes from the currently-valid check, not from an incidentally-malformed
+// fixture.
+describe("closes the stale-identity-reuse bypass", () => {
+  it("rejects a persisted identity minted under an earlier decision-policy / evidence-era generation", () => {
+    const dir = mkdtempSync(join(tmpdir(), "causal-v1-identity-")); dirs.push(dir);
+    const env = shadowEnv(dir);
+    const current = prepareForwardCausalIdentity(order(), env)!;
+    expect(current).not.toBeNull();
+    const v1Identity = { ...current, decisionPolicyVersion: "policy-v1-legacy", evidenceEra: "POST_END_TO_END_CORRECTNESS_FIX_V1" };
+    expect(prepareForwardCausalIdentity({ ...order(), causalIdentity: v1Identity }, env)).toBeNull();
+  });
+
+  it("rejects a persisted identity stamped with a deployment boundary that is no longer current", () => {
+    const dir = mkdtempSync(join(tmpdir(), "causal-stale-cutover-")); dirs.push(dir);
+    const env = shadowEnv(dir);
+    const current = prepareForwardCausalIdentity(order(), env)!;
+    const staleDeployment = { ...current, policyDeploymentAt: "1970-01-01T00:00:00.100Z" };
+    expect(prepareForwardCausalIdentity({ ...order(), causalIdentity: staleDeployment }, env)).toBeNull();
+  });
+
+  it("rejects a persisted identity whose instance, lane, symbol, or direction no longer matches the order", () => {
+    const dir = mkdtempSync(join(tmpdir(), "causal-mismatch-")); dirs.push(dir);
+    const env = shadowEnv(dir);
+    const current = prepareForwardCausalIdentity(order(), env)!;
+    expect(prepareForwardCausalIdentity({ ...order(), causalIdentity: { ...current, instanceId: "some-other-instance" } }, env)).toBeNull();
+    expect(prepareForwardCausalIdentity({ ...order(), causalIdentity: { ...current, laneId: "OTHER_LANE" } }, env)).toBeNull();
+    expect(prepareForwardCausalIdentity({ ...order(), causalIdentity: { ...current, symbolOrBasketId: "ETHUSDT" } }, env)).toBeNull();
+    expect(prepareForwardCausalIdentity({ ...order(), causalIdentity: { ...current, direction: "SHORT" } }, env)).toBeNull();
+  });
+
+  it("reuses an exact current identity by reference instead of minting a replacement", () => {
+    const dir = mkdtempSync(join(tmpdir(), "causal-reuse-")); dirs.push(dir);
+    const env = shadowEnv(dir);
+    const identity = prepareForwardCausalIdentity(order(), env)!;
+    const rehydrated = { ...order(), causalIdentity: identity };
+    expect(prepareForwardCausalIdentity(rehydrated, env)).toBe(identity); // same object: never re-minted
+  });
+
+  it("never mints a V2 identity for an order whose decision predates the deployment boundary, even on repeated calls", () => {
+    const dir = mkdtempSync(join(tmpdir(), "causal-precutover-")); dirs.push(dir);
+    const env = shadowEnv(dir);
+    const preCutover: ForwardPaperOrderLike = {
+      ...order(),
+      firstSeenAt: new Date(100).toISOString(), createdAt: new Date(100).toISOString(), openedAt: new Date(200).toISOString(),
+    };
+    expect(prepareForwardCausalIdentity(preCutover, env)).toBeNull();
+    expect(prepareForwardCausalIdentity(preCutover, env)).toBeNull(); // not a one-shot fluke
+    expect(preCutover.causalIdentity).toBeUndefined(); // never silently attached
+  });
+
+  it("refuses to emit open or outcome events for a stale identity attached to a rehydrated order", () => {
+    const dir = mkdtempSync(join(tmpdir(), "causal-stale-events-")); dirs.push(dir);
+    const env = shadowEnv(dir);
+    const current = prepareForwardCausalIdentity(order(), env)!;
+    const stale = { ...current, decisionPolicyVersion: "policy-v1-legacy", evidenceEra: "POST_END_TO_END_CORRECTNESS_FIX_V1" };
+    // Simulates a persisted/rehydrated order exactly as it would be read back from a store after a
+    // restart: the identity is already attached and never re-derived via prepareForwardCausalIdentity.
+    const o: ForwardPaperOrderLike = { ...order(), causalIdentity: stale };
+    expect(recordForwardOpportunity(o, env)).toBe(false);
+    o.paperStatus = "PAPER_CLOSED_WIN"; o.closedAtMs = 2_000; o.resolvedAtMs = 3_000; o.grossR = 0.2; o.costR = -0.02; o.netR = 0.18;
+    expect(recordForwardOutcome(o, env)).toBe(false);
+    expect(existsSync(join(dir, "causal-experience"))).toBe(false);
+  });
+
+  it("rejects a self-consistent but stale-policy forged event chain at the CORTEX bridge boundary", () => {
+    const dir = mkdtempSync(join(tmpdir(), "causal-forged-")); dirs.push(dir);
+    const env = shadowEnv(dir); const o = order();
+    o.cortexDecisionSnapshot = {
+      decisionId: "cortex-decision:900:1:CG_WIDE_FAST_LONG", allocationSnapshotId: "cortex-allocation:cortex-decision:900:1:CG_WIDE_FAST_LONG",
+      atMs: 900, laneId: "CG_WIDE_FAST_LONG", direction: "LONG", featureSchemaVersion: CORTEX_FEATURE_SCHEMA_VERSION,
+      featureVector: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0.5], regimeFamily: "BULL", eligible: true, finalPct: 0, evalFinalPct: 0,
+    };
+    o.causalIdentity = prepareForwardCausalIdentity(o, env);
+    recordForwardOpportunity(o, env);
+    o.paperStatus = "PAPER_CLOSED_WIN"; o.closedAtMs = 2_000; o.resolvedAtMs = 3_000; o.grossR = 0.2; o.costR = -0.02; o.netR = 0.18;
+    o.causalIdentity = withResolvedCausalIdentity(o);
+    recordForwardOutcome(o, env);
+    const events = readFileSync(forwardCausalJournalPath(env)!, "utf8").trim().split("\n").map((line) => JSON.parse(line) as ForwardCausalEvent);
+    // Forge: every event's embedded identity is downgraded to a stale policy generation while the
+    // decisionId/opportunityId linkage between decision/opportunity/outcome stays self-consistent.
+    const forged = events.map((event) => ({
+      ...event,
+      identity: { ...event.identity, decisionPolicyVersion: "policy-v1-legacy", evidenceEra: "POST_END_TO_END_CORRECTNESS_FIX_V1" },
+    })) as ForwardCausalEvent[];
+    const bridge = buildCortexExperienceBridge(forged, resolveCanonicalPolicyContext(env)!);
+    expect(bridge.experiences).toEqual([]);
+    expect(bridge.outcomes).toEqual([]);
+    expect(bridge.rejected).toMatchObject({ stale_or_mismatched_policy_identity: 1 });
+  });
+
+  it("keeps 3103 blocked even when the order already carries an exact-current-looking identity", () => {
+    const dir = mkdtempSync(join(tmpdir(), "causal-3103-")); dirs.push(dir);
+    const shadow = shadowEnv(dir);
+    const identity = prepareForwardCausalIdentity(order(), shadow)!;
+    const liveEnv = { ...shadow, PORT: "3103" };
+    const o: ForwardPaperOrderLike = { ...order(), causalIdentity: { ...identity, instanceId: "3103" } };
+    expect(prepareForwardCausalIdentity(o, liveEnv)).toBeNull();
+    expect(recordForwardOpportunity(o, liveEnv)).toBe(false);
+    expect(existsSync(join(dir, "causal-experience"))).toBe(false);
+  });
+
+  it("writes nothing in mode-off even when the order already carries an existing identity", () => {
+    const dir = mkdtempSync(join(tmpdir(), "causal-modeoff-")); dirs.push(dir);
+    const shadow = shadowEnv(dir);
+    const identity = prepareForwardCausalIdentity(order(), shadow)!;
+    const modeOffEnv = { ...shadow, CAUSAL_EXPERIENCE_COLLECTION_MODE: "" };
+    const o: ForwardPaperOrderLike = { ...order(), causalIdentity: identity };
+    expect(resolveCausalCollectionActivation(modeOffEnv).reason).toBe("mode-off");
+    expect(prepareForwardCausalIdentity(o, modeOffEnv)).toBeNull();
+    expect(recordForwardOpportunity(o, modeOffEnv)).toBe(false);
+    expect(existsSync(join(dir, "causal-experience"))).toBe(false);
   });
 });

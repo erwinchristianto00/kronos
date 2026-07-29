@@ -9,7 +9,14 @@ import { CORTEX_FEATURE_DIM, CORTEX_FEATURE_SCHEMA_VERSION } from "../lib/cortex
 import type { CortexDecisionRow, CortexLaneOutcome } from "../lib/cortex-attribution.js";
 import { cortexOutcomeLaneMeta } from "../lib/cortex-outcome-source.js";
 import { candidateLearningRows, normalizeExperience, type ExperienceRecord } from "./experience-engine.js";
-import type { DecisionSnapshotEvent, ForwardEvent, OpportunityOpenEvent, OutcomeResolutionEvent } from "./forward-causal-collection.js";
+import type {
+  CanonicalPolicyContext,
+  CausalIdentity,
+  DecisionSnapshotEvent,
+  ForwardEvent,
+  OpportunityOpenEvent,
+  OutcomeResolutionEvent,
+} from "./forward-causal-collection.js";
 
 export interface CortexExperienceBridgeResult {
   decisions: CortexDecisionRow[];
@@ -22,8 +29,25 @@ const finite = (value: unknown): value is number => typeof value === "number" &&
 const bump = (counts: Record<string, number>, reason: string): void => { counts[reason] = (counts[reason] ?? 0) + 1; };
 const economicallyConsistent = (grossR: unknown, costR: unknown, netR: unknown): boolean =>
   finite(grossR) && finite(costR) && finite(netR) && Math.abs((grossR + costR) - netR) <= 1e-9;
+// Exact match only. A V1/mismatched-policy identity must never produce a candidate-learning row
+// even when its own embedded timestamps look internally consistent — this is what stops a stale
+// or forged pre-cutover chain from being read as current-era evidence.
+const identityMatchesCurrentPolicy = (identity: CausalIdentity, expected: CanonicalPolicyContext): boolean =>
+  identity.decisionPolicyVersion === expected.decisionPolicyVersion &&
+  identity.executionPolicyVersion === expected.executionPolicyVersion &&
+  identity.evidencePolicyVersion === expected.evidencePolicyVersion &&
+  identity.evidenceEra === expected.evidenceEra &&
+  identity.policyDeploymentAt === expected.policyDeploymentAt;
 
-export function buildCortexExperienceBridge(events: readonly ForwardEvent[]): CortexExperienceBridgeResult {
+/**
+ * `expectedPolicy` is supplied by the runtime caller (see cortex-refit-runner-bindings.ts) rather
+ * than read from process.env here — this module stays a pure function of its inputs so the exact
+ * "current policy" it enforces is always visible at the call site, not hidden inside a helper.
+ */
+export function buildCortexExperienceBridge(
+  events: readonly ForwardEvent[],
+  expectedPolicy: CanonicalPolicyContext,
+): CortexExperienceBridgeResult {
   const paperDecisions = new Map<string, DecisionSnapshotEvent>();
   const opportunities = new Map<string, OpportunityOpenEvent>();
   const outcomes: OutcomeResolutionEvent[] = [];
@@ -52,6 +76,15 @@ export function buildCortexExperienceBridge(events: readonly ForwardEvent[]): Co
       outcome.identity.decisionId !== decision.identity.decisionId ||
       outcome.identity.opportunityId !== opportunity.identity.opportunityId
     ) { bump(rejected, "identity_mismatch"); continue; }
+    // A V1 or otherwise stale-policy identity can be internally self-consistent (its own
+    // decisionId/opportunityId links line up) while still carrying an old policy generation —
+    // that must not become a candidate-learning row regardless of how valid its embedded
+    // decision/open timestamps look against ITS OWN policyDeploymentAt.
+    if (
+      !identityMatchesCurrentPolicy(decision.identity, expectedPolicy) ||
+      !identityMatchesCurrentPolicy(opportunity.identity, expectedPolicy) ||
+      !identityMatchesCurrentPolicy(outcome.identity, expectedPolicy)
+    ) { bump(rejected, "stale_or_mismatched_policy_identity"); continue; }
     // Pre-hardening journals do not carry a CORTEX snapshot. Treat them as
     // ineligible legacy evidence instead of allowing a malformed row to abort
     // an otherwise report-only refit pass.

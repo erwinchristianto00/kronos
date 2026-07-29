@@ -181,24 +181,96 @@ export function resolveCausalCollectionActivation(env: NodeJS.ProcessEnv = proce
   return { active: true, instanceId, reason: "shadow-active" };
 }
 
-/** Stamps IDs once during opportunity construction. A restart reuses the persisted identity and cannot mint another. */
+/**
+ * The runtime's current canonical policy generation. `null` whenever the deployment boundary is
+ * unset, malformed, or in the future — `resolveEndToEndCorrectnessDeploymentAt` already fails
+ * closed on all three, so nothing here re-derives that decision, only carries its result alongside
+ * the version constants it must be checked against as one unit.
+ */
+export interface CanonicalPolicyContext {
+  decisionPolicyVersion: string;
+  executionPolicyVersion: string;
+  evidencePolicyVersion: string;
+  evidenceEra: string;
+  policyDeploymentAt: string;
+}
+
+export function resolveCanonicalPolicyContext(env: NodeJS.ProcessEnv = process.env): CanonicalPolicyContext | null {
+  const policyDeploymentAt = resolveEndToEndCorrectnessDeploymentAt(env);
+  if (policyDeploymentAt == null) return null;
+  return {
+    decisionPolicyVersion: CURRENT_DECISION_POLICY_VERSION,
+    executionPolicyVersion: EXECUTION_POLICY_VERSION,
+    evidencePolicyVersion: EVIDENCE_POLICY_VERSION,
+    evidenceEra: CURRENT_EVIDENCE_ERA,
+    policyDeploymentAt,
+  };
+}
+
+/**
+ * The only place allowed to say an already-persisted `CausalIdentity` may be reused. Every
+ * criterion is exact equality (or a `>=` boundary) against the CURRENT canonical context — never
+ * against whatever the identity itself claims, since a stale identity claims exactly that about
+ * itself. A `false` here means "mint nothing, emit nothing, reuse nothing" — callers must not fall
+ * back to minting a fresh identity for an order that already has one; see `prepareForwardCausalIdentity`.
+ */
+export function isCausalIdentityCurrentlyValid(
+  identity: CausalIdentity,
+  order: ForwardPaperOrderLike,
+  activation: CausalCollectionActivation,
+  context: CanonicalPolicyContext,
+): boolean {
+  if (!activation.active || activation.instanceId === "3103") return false;
+  if (identity.instanceId !== activation.instanceId) return false;
+  if (identity.laneId !== order.selectedLaneId) return false;
+  if (identity.symbolOrBasketId !== order.symbol) return false;
+  if (identity.direction !== order.direction) return false;
+  if (identity.decisionPolicyVersion !== context.decisionPolicyVersion) return false;
+  if (identity.executionPolicyVersion !== context.executionPolicyVersion) return false;
+  if (identity.evidencePolicyVersion !== context.evidencePolicyVersion) return false;
+  if (identity.evidenceEra !== context.evidenceEra) return false;
+  if (identity.policyDeploymentAt !== context.policyDeploymentAt) return false;
+  const deploymentAtMs = Date.parse(context.policyDeploymentAt);
+  if (!Number.isFinite(deploymentAtMs)) return false;
+  const openedAtMs = openedAtMsOf(order);
+  const decisionTimeMs = decisionTimeMsOf(order);
+  if (openedAtMs == null || decisionTimeMs == null) return false;
+  if (decisionTimeMs < deploymentAtMs || openedAtMs < deploymentAtMs) return false;
+  if (
+    !identity.lineageSchemaVersion || identity.lineageSchemaVersion !== CAUSAL_LINEAGE_SCHEMA_VERSION ||
+    !identity.decisionId || !identity.opportunityId
+  ) return false;
+  return true;
+}
+
+/**
+ * Stamps IDs once during opportunity construction. A restart reuses the persisted identity ONLY
+ * if it is still exactly current (`isCausalIdentityCurrentlyValid`); a stale or mismatched one
+ * (wrong instance, wrong lane/symbol/direction, an earlier policy generation, or a deployment
+ * timestamp that no longer matches) returns `null` rather than being reused or silently migrated.
+ * A `null` here is final for this call — it never falls through to minting a fresh identity for an
+ * order that already carries one, and it never mints a V2 identity for a pre-cutover order.
+ */
 export function prepareForwardCausalIdentity(order: ForwardPaperOrderLike, env: NodeJS.ProcessEnv = process.env): CausalIdentity | null {
   const activation = resolveCausalCollectionActivation(env);
   if (!activation.active) return null;
-  if (order.causalIdentity) return order.causalIdentity;
+  const context = resolveCanonicalPolicyContext(env);
+  if (!context) return null;
+  if (order.causalIdentity) {
+    return isCausalIdentityCurrentlyValid(order.causalIdentity, order, activation, context) ? order.causalIdentity : null;
+  }
   const openedAtMs = openedAtMsOf(order);
   const decisionTimeMs = decisionTimeMsOf(order);
-  const policyDeploymentAt = resolveEndToEndCorrectnessDeploymentAt(env);
-  const policyDeploymentAtMs = policyDeploymentAt == null ? Number.NaN : Date.parse(policyDeploymentAt);
+  const policyDeploymentAtMs = Date.parse(context.policyDeploymentAt);
   if (
     openedAtMs == null || decisionTimeMs == null || !Number.isFinite(policyDeploymentAtMs) ||
     decisionTimeMs < policyDeploymentAtMs || openedAtMs < policyDeploymentAtMs ||
-    order.policyDeploymentAt !== policyDeploymentAt ||
+    order.policyDeploymentAt !== context.policyDeploymentAt ||
     !order.paperOrderId || !order.selectedLaneId || !order.symbol ||
-    order.decisionPolicyVersion !== CURRENT_DECISION_POLICY_VERSION ||
-    order.executionPolicyVersion !== EXECUTION_POLICY_VERSION ||
-    order.evidencePolicyVersion !== EVIDENCE_POLICY_VERSION ||
-    order.evidenceEra !== CURRENT_EVIDENCE_ERA
+    order.decisionPolicyVersion !== context.decisionPolicyVersion ||
+    order.executionPolicyVersion !== context.executionPolicyVersion ||
+    order.evidencePolicyVersion !== context.evidencePolicyVersion ||
+    order.evidenceEra !== context.evidenceEra
   ) return null;
   const originKey = originKeyOf(order);
   const cortex = validCortexSnapshot(order, decisionTimeMs);
@@ -222,7 +294,7 @@ export function prepareForwardCausalIdentity(order: ForwardPaperOrderLike, env: 
     executionPolicyVersion: order.executionPolicyVersion,
     evidencePolicyVersion: order.evidencePolicyVersion,
     evidenceEra: order.evidenceEra,
-    policyDeploymentAt: policyDeploymentAt!,
+    policyDeploymentAt: context.policyDeploymentAt,
   };
 }
 
@@ -257,11 +329,20 @@ function featureSnapshot(order: ForwardPaperOrderLike, asOfMs: number): Decision
   return { names, values, availableAtMs, sourceStatuses };
 }
 
-function openEvents(order: ForwardPaperOrderLike): ForwardEvent[] {
+/**
+ * Re-validates the persisted identity against the CURRENT canonical context before emitting
+ * anything. `order` is rehydrated from a persisted store on every call — trusting admission-time
+ * validation alone would let a stale identity written under an earlier policy generation keep
+ * producing events forever, across restarts, long after that generation stopped being current.
+ */
+function openEvents(order: ForwardPaperOrderLike, env: NodeJS.ProcessEnv): ForwardEvent[] {
   const identity = order.causalIdentity;
   const openedAtMs = openedAtMsOf(order);
   const decisionTimeMs = decisionTimeMsOf(order);
   if (!identity || openedAtMs == null || decisionTimeMs == null) return [];
+  const activation = resolveCausalCollectionActivation(env);
+  const context = resolveCanonicalPolicyContext(env);
+  if (!context || !isCausalIdentityCurrentlyValid(identity, order, activation, context)) return [];
   const originKey = originKeyOf(order);
   const features = featureSnapshot(order, decisionTimeMs);
   const cortex = validCortexSnapshot(order, decisionTimeMs);
@@ -304,7 +385,7 @@ function openEvents(order: ForwardPaperOrderLike): ForwardEvent[] {
   return [decision, opportunity];
 }
 
-function outcomeEvent(order: ForwardPaperOrderLike): OutcomeResolutionEvent | null {
+function outcomeEvent(order: ForwardPaperOrderLike, env: NodeJS.ProcessEnv): OutcomeResolutionEvent | null {
   const identity = order.causalIdentity;
   const openedAtMs = openedAtMsOf(order);
   const outcomeId = deterministicOutcomeId(order);
@@ -316,6 +397,11 @@ function outcomeEvent(order: ForwardPaperOrderLike): OutcomeResolutionEvent | nu
     !finite(order.grossR) || !finite(order.costR) || !finite(order.netR) ||
     Math.abs((order.grossR + order.costR) - order.netR) > 1e-9
   ) return null;
+  // Same rationale as openEvents: this order is rehydrated from a persisted/resolved store, so
+  // admission-time validity is not evidence of current validity at resolution time.
+  const activation = resolveCausalCollectionActivation(env);
+  const context = resolveCanonicalPolicyContext(env);
+  if (!context || !isCausalIdentityCurrentlyValid(identity, order, activation, context)) return null;
   return {
     eventType: "OUTCOME_RESOLUTION", eventId: outcomeId, identity: { ...identity, outcomeId }, outcomeId,
     opportunityId: identity.opportunityId, decisionId: identity.decisionId, openedAtMs, closedAtMs: order.closedAtMs,
@@ -378,12 +464,12 @@ function appendEvents(events: readonly ForwardEvent[], env: NodeJS.ProcessEnv): 
 
 /** Call immediately after the existing paper store has accepted a new opportunity. */
 export function recordForwardOpportunity(order: ForwardPaperOrderLike, env: NodeJS.ProcessEnv = process.env): boolean {
-  return appendEvents(openEvents(order), env);
+  return appendEvents(openEvents(order, env), env);
 }
 
 /** Call after the resolver has persisted terminal fields. It never modifies the resolved order. */
 export function recordForwardOutcome(order: ForwardPaperOrderLike, env: NodeJS.ProcessEnv = process.env): boolean {
-  const event = outcomeEvent(order);
+  const event = outcomeEvent(order, env);
   return event ? appendEvents([event], env) : false;
 }
 
@@ -394,7 +480,7 @@ export function recordForwardOutcome(order: ForwardPaperOrderLike, env: NodeJS.P
  */
 export function recordForwardOutcomes(orders: readonly ForwardPaperOrderLike[], env: NodeJS.ProcessEnv = process.env): boolean {
   return appendEvents(orders.flatMap((order) => {
-    const event = outcomeEvent(order);
+    const event = outcomeEvent(order, env);
     return event ? [event] : [];
   }), env);
 }

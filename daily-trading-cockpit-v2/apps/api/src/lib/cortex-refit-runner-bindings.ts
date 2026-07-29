@@ -53,7 +53,7 @@ import {
   filterCortexLearningEpochRows,
   type CortexLearningEpoch,
 } from "./cortex-learning-epoch.js";
-import { forwardCausalJournalPath, readForwardCausalEvents } from "../experience-engine/forward-causal-collection.js";
+import { forwardCausalJournalPath, readForwardCausalEvents, resolveCanonicalPolicyContext } from "../experience-engine/forward-causal-collection.js";
 import { buildCortexExperienceBridge } from "../experience-engine/cortex-experience-bridge.js";
 
 /** Only pull outcomes resolved within this window — older ones can't attribute (their decisions rotated
@@ -600,7 +600,13 @@ export function gatherCortexRefitInputs(deps: {
 
   if (!cortexRawStoreTrainingEnabled(deps.env)) {
     const causalJournal = forwardCausalJournalPath(deps.env ?? process.env);
-    const bridge = causalJournal ? buildCortexExperienceBridge(readForwardCausalEvents(causalJournal)) : null;
+    // A missing canonical policy context (unset/malformed/future deployment stamp) is treated
+    // exactly like a missing journal: no bridge, zero rows. It must never fall back to reading
+    // policy expectations off the events themselves — that is what let a stale identity through.
+    const expectedPolicy = resolveCanonicalPolicyContext(deps.env ?? process.env);
+    const bridge = (causalJournal && expectedPolicy)
+      ? buildCortexExperienceBridge(readForwardCausalEvents(causalJournal), expectedPolicy)
+      : null;
     const decisions = (bridge?.decisions ?? []).filter((row) => row.atMs >= sinceMs);
     const outcomes = (bridge?.outcomes ?? []).filter((row) => row.openedAtMs >= sinceMs && row.resolvedAtMs >= sinceMs);
     const directLaneIds = new Set(outcomes.map((outcome) => outcome.laneId));
