@@ -17,6 +17,7 @@ import {
 import { auditForwardCausalEvents, type ForwardCausalEvent } from "../src/experience-engine/forward-causal-auditor.js";
 import { buildCortexExperienceBridge } from "../src/experience-engine/cortex-experience-bridge.js";
 import { CORTEX_FEATURE_SCHEMA_VERSION } from "../src/lib/cortex-brain.js";
+import { CURRENT_DECISION_POLICY_VERSION, CURRENT_EVIDENCE_ERA, EVIDENCE_POLICY_VERSION, EXECUTION_POLICY_VERSION } from "@dtc/shared";
 
 const dirs: string[] = [];
 afterEach(() => dirs.splice(0).forEach((dir) => rmSync(dir, { recursive: true, force: true })));
@@ -28,6 +29,10 @@ function order(): ForwardPaperOrderLike {
     regime: "BULLISH", controllerMode: "LONG_ONLY", entryPrice: 100, stopLoss: 95, takeProfitLevels: [110],
     plannedStopDistanceBps: 500, provenance: { routeScore: 0.8, expectedNetR: 0.4, costR: -0.02, feeSlippageR: -0.01, spreadR: -0.01 },
     provenanceFieldMissing: [], paperStatus: "PAPER_SUBMITTED",
+    decisionPolicyVersion: CURRENT_DECISION_POLICY_VERSION,
+    executionPolicyVersion: EXECUTION_POLICY_VERSION,
+    evidencePolicyVersion: EVIDENCE_POLICY_VERSION,
+    evidenceEra: CURRENT_EVIDENCE_ERA,
   };
 }
 function shadowEnv(dir: string): NodeJS.ProcessEnv {
@@ -44,6 +49,12 @@ describe("forward causal collection", () => {
     expect(recordForwardOpportunity(o, env)).toBe(false);
     expect(existsSync(join(dir, "causal-experience"))).toBe(false);
     expect(resolveCausalCollectionActivation({ ...env, PORT: "3103", CAUSAL_EXPERIENCE_COLLECTION_MODE: "shadow" }).reason).toBe("live-3103-blocked");
+  });
+
+  it("refuses to mint a forward identity without all exact current policy stamps", () => {
+    const dir = mkdtempSync(join(tmpdir(), "causal-policy-")); dirs.push(dir);
+    const env = shadowEnv(dir);
+    expect(prepareForwardCausalIdentity({ ...order(), executionPolicyVersion: "stale" }, env)).toBeNull();
   });
 
   it("preserves exact IDs across decision, open, resolution, duplicate calls, and restart", () => {

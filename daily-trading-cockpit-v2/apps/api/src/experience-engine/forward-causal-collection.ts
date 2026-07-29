@@ -12,6 +12,12 @@ import { dirname, resolve } from "node:path";
 
 import { resolveFourBrainInstanceId } from "../lib/four-brain-live-gather-bindings.js";
 import type { CortexDecisionSnapshot } from "../lib/cortex-decision-snapshot.js";
+import {
+  CURRENT_DECISION_POLICY_VERSION,
+  CURRENT_EVIDENCE_ERA,
+  EVIDENCE_POLICY_VERSION,
+  EXECUTION_POLICY_VERSION,
+} from "@dtc/shared";
 
 export const CAUSAL_LINEAGE_SCHEMA_VERSION = "causal-lineage-1" as const;
 export type CausalDirection = "LONG" | "SHORT" | "NEUTRAL" | "BOTH";
@@ -32,6 +38,10 @@ export interface CausalIdentity {
   cortexDecisionId: string | null;
   allocationSnapshotId: string | null;
   cortexFeatureSchemaVersion: number | null;
+  decisionPolicyVersion: string;
+  executionPolicyVersion: string;
+  evidencePolicyVersion: string;
+  evidenceEra: string;
 }
 
 export interface CausalCollectionActivation {
@@ -64,6 +74,10 @@ export interface ForwardPaperOrderLike {
   closedAtMs?: number | null;
   resolvedAtMs?: number | null;
   closeIntrabarAmbiguous?: boolean;
+  decisionPolicyVersion?: string | null;
+  executionPolicyVersion?: string | null;
+  evidencePolicyVersion?: string | null;
+  evidenceEra?: string | null;
   causalIdentity?: CausalIdentity | null;
   cortexDecisionSnapshot?: CortexDecisionSnapshot | null;
 }
@@ -163,7 +177,13 @@ export function prepareForwardCausalIdentity(order: ForwardPaperOrderLike, env: 
   if (!activation.active) return null;
   if (order.causalIdentity) return order.causalIdentity;
   const asOfMs = openedAtMsOf(order);
-  if (asOfMs == null || !order.paperOrderId || !order.selectedLaneId || !order.symbol) return null;
+  if (
+    asOfMs == null || !order.paperOrderId || !order.selectedLaneId || !order.symbol ||
+    order.decisionPolicyVersion !== CURRENT_DECISION_POLICY_VERSION ||
+    order.executionPolicyVersion !== EXECUTION_POLICY_VERSION ||
+    order.evidencePolicyVersion !== EVIDENCE_POLICY_VERSION ||
+    order.evidenceEra !== CURRENT_EVIDENCE_ERA
+  ) return null;
   const originKey = originKeyOf(order);
   const cortex = validCortexSnapshot(order, asOfMs);
   const decisionId = `causal-decision-${hash([CAUSAL_LINEAGE_SCHEMA_VERSION, activation.instanceId, originKey, order.selectedLaneId, order.symbol, order.direction, asOfMs])}`;
@@ -182,6 +202,10 @@ export function prepareForwardCausalIdentity(order: ForwardPaperOrderLike, env: 
     cortexDecisionId: cortex?.decisionId ?? null,
     allocationSnapshotId: cortex?.allocationSnapshotId ?? null,
     cortexFeatureSchemaVersion: cortex?.featureSchemaVersion ?? null,
+    decisionPolicyVersion: order.decisionPolicyVersion,
+    executionPolicyVersion: order.executionPolicyVersion,
+    evidencePolicyVersion: order.evidencePolicyVersion,
+    evidenceEra: order.evidenceEra,
   };
 }
 
