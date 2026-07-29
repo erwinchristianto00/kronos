@@ -53,6 +53,8 @@ import {
   filterCortexLearningEpochRows,
   type CortexLearningEpoch,
 } from "./cortex-learning-epoch.js";
+import { forwardCausalJournalPath, readForwardCausalEvents } from "../experience-engine/forward-causal-collection.js";
+import { buildCortexExperienceBridge } from "../experience-engine/cortex-experience-bridge.js";
 
 /** Only pull outcomes resolved within this window — older ones can't attribute (their decisions rotated
  *  out of the ~26-day journal) and the refit's recency decay makes them ~zero weight anyway. Bounds the
@@ -61,31 +63,19 @@ export const CORTEX_REFIT_LOOKBACK_MS = 45 * 86_400_000;
 
 /**
  * Raw lane stores are paper/simulation measurement stores, not the normalized Experience Store. They
- * cannot train CORTEX unless an operator explicitly enables this legacy research path.
+ * are permanently ineligible for CORTEX training because they do not carry an
+ * exact decision → opportunity → outcome identity chain.
  *
  * WHAT THIS ACTUALLY DOES, stated plainly because the original wording invited a wrong reading (it
  * was summarised elsewhere as "CORTEX now trains only on causal-eligible data", which is not what
  * either branch does):
  *
- *   - flag UNSET (the default, and the state on every instance today): gatherCortexRefitInputs
- *     returns `outcomes: []` with `hasOutcomeSource === false` for EVERY lane. That is a total
- *     training freeze, not a narrower/cleaner data source — coefficients hold at whatever they were
- *     when this shipped, indefinitely.
- *   - flag SET to "1": falls through to the pre-existing raw-store reads, UNFILTERED. There is no
- *     causal-eligibility predicate anywhere in this repo (no causalEligible / CAUSAL_ELIGIBLE /
- *     isCausalEligible symbol exists); the same rows that trained CORTEX before are used again.
- *
- * So the two branches are "train on nothing" and "train on everything raw" — the causal firewall is
- * enforced by refusing to train at all, not by discriminating between rows. The replacement source
- * does not exist yet: a forward Experience Store providing direct decision-to-outcome lineage is the
- * stated prerequisite, and nothing in this codebase provides one.
- *
- * Left at the safe default deliberately. Re-enabling is an operator decision about model staleness
- * versus provenance, not a code cleanup — turning it on restores exactly the training population the
- * firewall was raised against.
+ * The deprecated environment variable is intentionally ignored. A future
+ * Experience Store bridge must pass direct identities and eligibility through
+ * this binding; it may not re-enable this raw fallback.
  */
-export function cortexRawStoreTrainingEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  return env.CORTEX_ALLOW_RAW_STORE_TRAINING === "1";
+export function cortexRawStoreTrainingEnabled(_env: NodeJS.ProcessEnv = process.env): boolean {
+  return false;
 }
 
 /** Direction is part of the causal identity. CG_MFE is executable both ways, so its two books
@@ -587,6 +577,8 @@ export function gatherCortexRefitInputs(deps: {
   /** Test seam for the CG-router source. Defaults to the RESIDENT-ONLY reader (never a cold parse —
    *  see readResidentCgRouterOrders). Returning null means "no router data available this run". */
   readCgRouterOrders?: () => readonly CortexCgRouterOrderLike[] | null;
+  /** Standalone research has no allocation table; never fabricate one for readiness. */
+  baselineAvailable?: boolean;
 }): CortexRefitInput & {
   journalBadLines: number;
   cgRouterOutcomes: CortexCgRouterOutcomeSummary;
@@ -607,25 +599,30 @@ export function gatherCortexRefitInputs(deps: {
   const journal = readCortexDecisionRows([`${deps.journalFile}.1`, deps.journalFile]);
 
   if (!cortexRawStoreTrainingEnabled(deps.env)) {
-    const epochRows = filterCortexLearningEpochRows(journal.rows, [], epoch);
+    const causalJournal = forwardCausalJournalPath(deps.env ?? process.env);
+    const bridge = causalJournal ? buildCortexExperienceBridge(readForwardCausalEvents(causalJournal)) : null;
+    const decisions = (bridge?.decisions ?? []).filter((row) => row.atMs >= sinceMs);
+    const outcomes = (bridge?.outcomes ?? []).filter((row) => row.openedAtMs >= sinceMs && row.resolvedAtMs >= sinceMs);
+    const directLaneIds = new Set(outcomes.map((outcome) => outcome.laneId));
     const emptyRouter = emptyCortexCgRouterSummary();
     return {
-      // Retain decision rows for audit/readiness, but do not create a training
-      // example until the forward Experience Store can provide a direct,
-      // eligible decision-to-outcome feature lineage.
-      decisions: epochRows.decisions,
-      outcomes: [],
-      roster: buildCortexAttrRoster(deps.staticWeightPctForLane, () => false),
+      // The only learner input is the direct, eligibility-checked Experience
+      // Store bridge. Missing lineage yields zero examples, never a TTL guess.
+      decisions,
+      outcomes,
+      roster: buildCortexAttrRoster(deps.staticWeightPctForLane, (laneId) => directLaneIds.has(laneId)),
       nowMs: deps.nowMs,
       nowIso: deps.nowIso,
       currentSchemaVersion: CORTEX_FEATURE_SCHEMA_VERSION,
       ttlMsForLane: cortexLaneTtlMs,
       skipsByLane: {},
       pruneBeforeMs: sinceMs - 5 * 86_400_000,
+      baselineAvailable: deps.baselineAvailable,
+      requireExactOwnership: true,
       journalBadLines: journal.badLines,
       cgRouterOutcomes: emptyRouter,
       learningEpoch: epoch
-        ? { ...epoch, decisionRowsExcluded: epochRows.decisionRowsExcluded, transitionalOutcomesExcluded: 0 }
+        ? { ...epoch, decisionRowsExcluded: 0, transitionalOutcomesExcluded: 0 }
         : null,
       learningEpochRejection,
     };
@@ -719,6 +716,7 @@ export function gatherCortexRefitInputs(deps: {
     // Prune the counted-observation ledger STRICTLY OLDER than the bindings' lookback (5-day buffer) so an
     // outcome the bindings still return (resolvedAtMs ≥ sinceMs) can never be pruned and then re-counted.
     pruneBeforeMs: sinceMs - 5 * 86_400_000,
+    baselineAvailable: deps.baselineAvailable,
     journalBadLines: journal.badLines,
     cgRouterOutcomes: cgRouter.summary,
     learningEpoch: epoch
@@ -803,6 +801,7 @@ export function runCortexNightlyRefit(deps: {
   /** Both forwarded to gatherCortexRefitInputs; see the CG-router source above. */
   env?: NodeJS.ProcessEnv;
   readCgRouterOrders?: () => readonly CortexCgRouterOrderLike[] | null;
+  baselineAvailable?: boolean;
 }): CortexRefitReportWithMeta {
   const input = gatherCortexRefitInputs({
     dataDir: deps.dataDir,
@@ -812,6 +811,7 @@ export function runCortexNightlyRefit(deps: {
     staticWeightPctForLane: deps.staticWeightPctForLane,
     env: deps.env,
     readCgRouterOrders: deps.readCgRouterOrders,
+    baselineAvailable: deps.baselineAvailable,
   });
   const report = runCortexRefit(deps.store, { ...input, apply: deps.apply });
   const withMeta = {

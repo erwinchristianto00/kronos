@@ -21,6 +21,10 @@ export type SourceStatus = "FRESH" | "STALE" | "MISSING" | "ERROR" | "UNSUPPORTE
 export interface ExperienceRecord {
   schemaVersion: typeof EXPERIENCE_SCHEMA_VERSION;
   experienceId: string;
+  /** Stable causal lineage. Missing ids are visible but never candidate-learning eligible. */
+  decisionId?: string | null;
+  opportunityId?: string | null;
+  outcomeId?: string | null;
   source: ExperienceSource;
   provenance: "OBSERVED" | "HISTORICAL_CAUSAL" | "OBSERVED_PATH_COUNTERFACTUAL" | "SIMULATED" | "ADVERSARIAL";
   decisionTimeMs: number | null;
@@ -54,6 +58,7 @@ export function assessExperienceEligibility(record: Omit<ExperienceRecord, "elig
   const reasons: string[] = [];
   if (record.source === "EXECUTION_CALIBRATION") return { eligibility: "EVALUATION_ONLY", eligibilityReasons: ["execution_calibration_never_directional_alpha"] };
   if (!LEARNING_SOURCES.has(record.source)) return { eligibility: "INELIGIBLE_FOR_DIRECT_TRAINING", eligibilityReasons: ["synthetic_or_adversarial_source"] };
+  if (!record.decisionId || !record.opportunityId || !record.outcomeId) reasons.push("missing_exact_causal_identity");
   if (record.decisionTimeMs == null) reasons.push("missing_decision_time");
   if (record.openedTimeMs != null && record.decisionTimeMs != null && record.decisionTimeMs > record.openedTimeMs) reasons.push("post_open_decision_leakage");
   if (record.marketCloseTimeMs == null || record.resolvedTimeMs == null) reasons.push("missing_market_close_or_resolution_time");

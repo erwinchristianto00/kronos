@@ -10,6 +10,7 @@
 import {
   calculateTimeframeIndicators,
   clamp,
+  completedCandles,
   macd,
   type Candle,
   type TimeframeIndicatorSnapshot,
@@ -174,8 +175,13 @@ export function buildSingleSymbolPriceTimelineState(
   if (!m5.isFresh || !h1.isFresh) return buildUnavailable(symbol, "5m or 1h candle feed is stale");
   if (!h1.ema200Available) return buildUnavailable(symbol, "insufficient completed 1h candles for EMA200");
 
-  const m5Closes = candles.m5.map((c) => c.close);
-  const h1Closes = candles.h1.map((c) => c.close);
+  // Keep every decision feature on the same completed-candle boundary as the
+  // shared indicator snapshots. The display price may be live, but it must
+  // never alter a directive before its bar is final.
+  const completedM5 = completedCandles(candles.m5, "5m", nowMs);
+  const completedH1 = completedCandles(candles.h1, "1h", nowMs);
+  const m5Closes = completedM5.map((c) => c.close);
+  const h1Closes = completedH1.map((c) => c.close);
   const m5Momentum = clamp(returnPct(m5Closes, 6) / Math.max((m5.atrPercent / 100) * 2, 0.001), -1, 1);
   const h1Momentum = clamp(returnPct(h1Closes, 6) / Math.max((h1.atrPercent / 100) * 2, 0.001), -1, 1);
   const m5Macd = macdScore(m5Closes, Math.max(m5.atr14, 1e-9));
@@ -210,7 +216,9 @@ export function buildSingleSymbolPriceTimelineState(
     : directive === "ENTER_SHORT"
       ? `ENTER SHORT: consensus ${signed(score)} / ${(confidence * 100).toFixed(0)}% · H1 + 5m aligned`
       : `WAIT: consensus ${signed(score)} / ${(confidence * 100).toFixed(0)}%${turningPoint !== "NONE" ? ` · ${turningPoint.replace("_", " ")}` : ""}`;
-  const strongBearReversal = score <= -0.55 && confidence >= 0.72 && trend <= -0.3 && tactical <= -0.25;
+  // An oversold downtrend is not a confirmed reason to liquidate a long.
+  // Keep the established bullish exit behaviour unchanged for short exposure.
+  const strongBearReversal = score <= -0.55 && confidence >= 0.72 && trend <= -0.3 && tactical <= -0.25 && m5.rsi14 > 30;
   const strongBullReversal = score >= 0.55 && confidence >= 0.72 && trend >= 0.3 && tactical >= 0.25;
   const atrFraction = Math.max(h1.atrPercent / 100, 0.001);
   const forecasts = HORIZONS.map((hours) => {

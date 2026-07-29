@@ -16,7 +16,12 @@
  */
 
 import type { VariantSelectionSnapshot } from "./types.js";
-import { DECISION_PIPELINE_POLICY_VERSION, END_TO_END_CORRECTNESS_DEPLOYED_AT } from "./policy-versions.js";
+import {
+  DECISION_PIPELINE_POLICY_VERSION,
+  END_TO_END_CORRECTNESS_DEPLOYED_AT,
+  EVIDENCE_POLICY_VERSION,
+  EXECUTION_POLICY_VERSION,
+} from "./policy-versions.js";
 
 export type EvidenceEra =
   | "LEGACY_PRE_END_TO_END_CORRECTNESS_FIX"
@@ -36,6 +41,27 @@ export const CURRENT_DECISION_POLICY_VERSION = DECISION_PIPELINE_POLICY_VERSION;
  * is used anywhere in this classifier.
  */
 export const CURRENT_EVIDENCE_ERA: EvidenceEra = "POST_END_TO_END_CORRECTNESS_FIX_V1";
+
+/**
+ * The only cohort allowed to influence current expectancy, routing, or
+ * learning. A matching era name alone is not enough: every stage that can
+ * change economic meaning must carry its exact deployment stamp.
+ */
+export interface PostFixPolicyStampedPlan {
+  evidenceEra?: EvidenceEra | null;
+  decisionPolicyVersion?: string | null;
+  executionPolicyVersion?: string | null;
+  evidencePolicyVersion?: string | null;
+  policyDeploymentAt?: string | null;
+}
+
+export function hasCurrentPostFixPolicyStamp(plan: PostFixPolicyStampedPlan | null | undefined): boolean {
+  return plan?.evidenceEra === CURRENT_EVIDENCE_ERA &&
+    plan.decisionPolicyVersion === CURRENT_DECISION_POLICY_VERSION &&
+    plan.executionPolicyVersion === EXECUTION_POLICY_VERSION &&
+    plan.evidencePolicyVersion === EVIDENCE_POLICY_VERSION &&
+    plan.policyDeploymentAt === END_TO_END_CORRECTNESS_DEPLOYED_AT;
+}
 
 /** Minimal shape needed to classify — keeps callers from importing all of ShadowPosition. */
 export interface EvidenceEraSubject {

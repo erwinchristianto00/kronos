@@ -77,6 +77,22 @@ describe("single-symbol price timeline", () => {
     expect(state.directive, JSON.stringify({ score: state.score, confidence: state.confidence, reason: state.entryReason })).toBe("WAIT");
   });
 
+  it("does not change an execution directive when only the active final candle mutates", () => {
+    const m5 = candles(5 * 60_000, 0.14);
+    const h1 = candles(60 * 60_000, 0.25);
+    const baseline = buildSingleSymbolPriceTimelineState("BTCUSDT", { m5, h1 }, NOW);
+    const mutatedM5 = m5.map((candle) => ({ ...candle }));
+    const mutatedH1 = h1.map((candle) => ({ ...candle }));
+    // Both fixture tails open exactly at NOW, so they are still forming.
+    Object.assign(mutatedM5.at(-1)!, { close: 1_000_000, high: 1_000_001, low: 1 });
+    Object.assign(mutatedH1.at(-1)!, { close: 1, high: 1_000_000, low: 0.01 });
+    const mutated = buildSingleSymbolPriceTimelineState("BTCUSDT", { m5: mutatedM5, h1: mutatedH1 }, NOW);
+    expect(mutated.directive).toBe(baseline.directive);
+    expect(mutated.score).toBe(baseline.score);
+    expect(mutated.confidence).toBe(baseline.confidence);
+    expect(mutated.turningPoint).toBe(baseline.turningPoint);
+  });
+
   it("does not restrict symbols outside the explicitly monitored BTC/ETH/SOL set", async () => {
     const service = new SingleSymbolPriceTimelineService(async () => [], { enabledForExecution: true, nowMs: () => NOW });
     await expect(service.entryGate("DOGEUSDT", "LONG")).resolves.toEqual({ allowed: true, reason: null });

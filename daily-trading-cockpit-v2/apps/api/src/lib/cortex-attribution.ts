@@ -42,6 +42,10 @@ export interface CortexLaneOutcome {
   netR: number;
   /** Diagnostics only: the risk denominator used (XSEC), null for lanes that store netR natively. */
   riskDistanceAtOpen?: number | null;
+  /** Required when the caller enables strict Experience Store ownership. */
+  decisionId?: string | null;
+  opportunityId?: string | null;
+  outcomeId?: string | null;
 }
 
 /** One journaled brain decision, reduced to what attribution needs. `lanes` is keyed by laneId.
@@ -50,6 +54,8 @@ export interface CortexLaneOutcome {
  *  against what the tilt WOULD have weighted it, for #219's decision-alpha (see cortexShadowDecisionAlpha
  *  below). Not used by the refit itself (which only needs x/y). */
 export interface CortexDecisionRow {
+  /** Stable CORTEX decision identifier when sourced from the Experience Store. */
+  decisionId?: string | null;
   atMs: number;
   featureSchemaVersion: number;
   regimeFamily: string;
@@ -111,6 +117,10 @@ export interface CortexAttributedExample extends CortexTrainingExample {
    *  lane, at decision time — for cortexShadowDecisionAlpha below. Diagnostic only, never a training input. */
   finalPctAtDecision: number;
   evalFinalPctAtDecision: number;
+  /** Direct lineage retained with the example whenever strict ownership is required. */
+  decisionId: string | null;
+  opportunityId: string | null;
+  outcomeId: string | null;
 }
 
 export interface CortexAttributionResult {
@@ -135,9 +145,12 @@ export interface CortexAttributionOpts {
    *  become wrong (a vetoed context otherwise gets zero data → the veto self-perpetuates). The eligible
    *  flag is always recorded on the example either way. */
   requireEligible?: boolean;
+  /** Reject all time-nearest attribution; owner ids must be explicit and complete. */
+  requireExactOwnership?: boolean;
 }
 
 interface LaneSlice {
+  decisionId: string | null;
   atMs: number;
   x: number[];
   eligible: boolean;
@@ -170,6 +183,7 @@ export function attributeOutcomes(
       let arr = byLane.get(laneId);
       if (!arr) byLane.set(laneId, (arr = []));
       arr.push({
+        decisionId: d.decisionId ?? null,
         atMs: d.atMs,
         x: l.x,
         eligible: l.eligible,
@@ -276,6 +290,12 @@ export function attributeOutcomes(
         const s = slices[i]!;
         if (s.atMs > o.openedAtMs) continue; // decision after the open — cannot own it
         if (s.atMs < lo) break; // past the TTL window; everything earlier is older still
+        if (opts.requireExactOwnership && (
+          !o.decisionId || !o.opportunityId || !o.outcomeId || s.decisionId !== o.decisionId
+        )) {
+          sawOtherReasonRejection = true;
+          continue;
+        }
         if (opts.requireEligible && !s.eligible) {
           sawOtherReasonRejection = true;
           continue;
@@ -325,6 +345,9 @@ export function attributeOutcomes(
       eligibleAtDecision: owner.eligible,
       finalPctAtDecision: owner.finalPct,
       evalFinalPctAtDecision: owner.evalFinalPct,
+      decisionId: owner.decisionId,
+      opportunityId: o.opportunityId ?? null,
+      outcomeId: o.outcomeId ?? null,
     });
     regimeCoverageThisRun[owner.regimeFamily] = (regimeCoverageThisRun[owner.regimeFamily] ?? 0) + 1;
     if (o.resolvedAtMs > maxResolvedAtMs) maxResolvedAtMs = o.resolvedAtMs;

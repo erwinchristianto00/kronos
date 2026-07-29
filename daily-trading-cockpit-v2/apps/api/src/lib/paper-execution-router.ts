@@ -72,6 +72,7 @@ import {
   withResolvedCausalIdentity,
   type CausalIdentity,
 } from "../experience-engine/forward-causal-collection.js";
+import { latestCortexDecisionSnapshotForLane, type CortexDecisionSnapshot } from "./cortex-decision-snapshot.js";
 
 // ─── public enums / type tokens ──────────────────────────────────────────────
 
@@ -549,6 +550,8 @@ export interface PaperOrder {
   provenanceFieldMissing?: string[];
   /** Forward-only causal identity. Absent on legacy orders and whenever collection mode is off. */
   causalIdentity?: CausalIdentity | null;
+  /** Exact CORTEX x captured at admission; absent means explicitly ineligible for CORTEX learning. */
+  cortexDecisionSnapshot?: CortexDecisionSnapshot | null;
   // ── forward-gate shadow label (report-only OOS validation; NEVER blocks admission) ──
   forwardGateId?: string;
   forwardGateVersion?: number;
@@ -1396,6 +1399,9 @@ function _buildBaseOrder(
     reportOnly: true,
     paperOnly: true,
   }, now);
+  // Persist the exact CORTEX lane snapshot available at admission. This is a
+  // direct hand-off, never a later nearest-timestamp attribution.
+  order.cortexDecisionSnapshot = latestCortexDecisionSnapshotForLane(order.selectedLaneId);
   const identity = prepareForwardCausalIdentity(order);
   if (identity) order.causalIdentity = identity;
   return order;
@@ -1698,6 +1704,9 @@ function _buildAllocatorOrder(
     reportOnly: true,
     paperOnly: true,
   }, now);
+  // Persist the exact CORTEX lane snapshot available at admission. This is a
+  // direct hand-off, never a later nearest-timestamp attribution.
+  order.cortexDecisionSnapshot = latestCortexDecisionSnapshotForLane(order.selectedLaneId);
   const identity = prepareForwardCausalIdentity(order);
   if (identity) order.causalIdentity = identity;
   return order;

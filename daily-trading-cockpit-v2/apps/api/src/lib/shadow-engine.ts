@@ -7,6 +7,7 @@ import {
   buildVariantSelection,
   buildTradePlan,
   buildStrategyContextSnapshot,
+  MIN_EXECUTION_RR,
   round,
   type Candle,
   type Candidate,
@@ -198,7 +199,7 @@ function isEntryConditionMet(candidate: Candidate): boolean {
     plan.entryAction !== "CANCEL_IF_INVALIDATED" &&
     candidate.stopLoss !== null &&
     candidate.takeProfits.tp1 !== null &&
-    (candidate.riskReward ?? 0) >= 1.5 &&
+    (candidate.riskReward ?? 0) >= MIN_EXECUTION_RR &&
     candidate.dangerScore <= 45
   );
 }

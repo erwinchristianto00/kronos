@@ -182,6 +182,13 @@ describe("short-fade — resolution (SL-first-conservative, SHORT direction)", (
     expect(patch?.exitReason).toBe("INITIAL_STOP");
   });
 
+  it("does not resolve from a still-forming candle even when its temporary high/low touches exits", () => {
+    const now = 2_000_000_000_000;
+    const active: Candle = { openTime: now, open: 100, high: 104, low: 97, close: 100, volume: 100 };
+    const patch = resolveShortFadeObservation(obs({ openedAtMs: now - 3_600_000, openedAt: new Date(now - 3_600_000).toISOString() }), [active], now);
+    expect(patch).toBeNull();
+  });
+
   it("marks to market at max hold when neither stop nor TP fires", () => {
     const flatBars = Array.from({ length: 48 }, () => ({ close: 100.5, high: 100.6, low: 100.4 }));
     const patch = resolveShortFadeObservation(obs(), fwd(flatBars), Date.now());

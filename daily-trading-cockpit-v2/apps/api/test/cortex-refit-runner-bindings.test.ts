@@ -181,7 +181,7 @@ describe("gatherCortexRefitInputs — end-to-end roster wiring sanity", () => {
     }
   });
 
-  it("[REGRESSION 2026-07-22] a real CLOSED cross-sectional observation on disk is actually read into outcomes — the store constructor path bug made this always empty", () => {
+  it("does not admit a CLOSED cross-sectional store observation without exact causal lineage", () => {
     const dataDir = tmp();
     const nowMs = Date.parse("2026-07-22T00:00:00Z");
     // Written at the exact real on-disk shape CrossSectionalStore persists (cross-sectional-edge.ts's
@@ -225,15 +225,11 @@ describe("gatherCortexRefitInputs — end-to-end roster wiring sanity", () => {
       env: { CORTEX_ALLOW_RAW_STORE_TRAINING: "1" } as NodeJS.ProcessEnv,
     });
 
-    const xsecOutcome = input.outcomes.find((o) => o.laneId === "CROSS_SECTIONAL_MARKET_NEUTRAL");
-    expect(xsecOutcome).toBeDefined();
-    expect(xsecOutcome!.observationId).toBe("xsec:MOM24_FILTERED:1");
-    expect(xsecOutcome!.netR).toBeCloseTo(0.017 / 0.01, 10);
-
-    // …and ONLY that lane is reported as having a source: the other two xsec variants share the same
-    // (now non-empty) store file yet have zero rows of their own, so they must stay NO_OUTCOME_SOURCE.
+    // A raw store has no decision -> opportunity -> outcome chain. The deprecated
+    // compatibility env cannot opt it back into direct CORTEX training.
+    expect(input.outcomes).toEqual([]);
     const byLane = new Map(input.roster.map((r) => [r.laneId, r.hasOutcomeSource]));
-    expect(byLane.get("CROSS_SECTIONAL_MARKET_NEUTRAL")).toBe(true);
+    expect(byLane.get("CROSS_SECTIONAL_MARKET_NEUTRAL")).toBe(false);
     expect(byLane.get("CROSS_SECTIONAL_TREND")).toBe(false);
     expect(byLane.get("CROSS_SECTIONAL_MIXED")).toBe(false);
   });
@@ -581,16 +577,15 @@ describe("[PASS-WITH] flag ON: the three dead LONG CG lanes reach LEARNING_ACTIV
     }
   });
 
-  it("[PASS-WITH] flag ON: all three flip to LEARNING_ACTIVE on router-sourced examples", () => {
+  it("does not let the deprecated raw-router flags bypass exact causal ownership", () => {
     const { byLane, input } = statuses({ CORTEX_CG_ROUTER_OUTCOMES: "1", CORTEX_ALLOW_RAW_STORE_TRAINING: "1" });
     for (const lane of LANES) {
       const l = byLane.get(lane.laneId)!;
-      expect(l.status).toBe("LEARNING_ACTIVE");
-      expect(l.attributed).toBe(22);
+      expect(l.status).toBe("NO_OUTCOME_SOURCE");
+      expect(l.attributed).toBe(0);
     }
-    expect(input.cgRouterOutcomes).toMatchObject({ enabled: true, storeResident: true, ordersScanned: 96 });
-    // Every admitted observationId is router-namespaced, so it can never collide with a variant-matrix id.
-    for (const o of input.outcomes) expect(o.observationId.startsWith("router:")).toBe(true);
+    expect(input.cgRouterOutcomes.enabled).toBe(false);
+    expect(input.outcomes).toEqual([]);
   });
 
   it("[PASS-WITH] CG_MFE_GIVEBACK_SHORT gains NOTHING — its 30 SHORT router orders are invisible to this source", () => {

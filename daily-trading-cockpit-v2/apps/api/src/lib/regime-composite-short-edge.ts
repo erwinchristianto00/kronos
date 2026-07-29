@@ -37,7 +37,7 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 
-import type { Candle } from "@dtc/shared";
+import { completedCandles, type Candle } from "@dtc/shared";
 import { computeATR, computeEMA, computeRSI } from "./candle-indicators.js";
 import { fetchCrowdingSnapshot, type CrowdingSnapshot, type CrowdingState } from "./derivatives-crowding.js";
 import type { BinanceClient } from "./binance.js";
@@ -236,7 +236,8 @@ export function resolveRegimeCompositeShortObservation(
   forwardCandles: Candle[],
   nowMs: number,
 ): Partial<RegimeCompositeShortObservation> | null {
-  const fwd = forwardCandles.filter((c) => c.openTime > obs.openedAtMs).sort((a, b) => a.openTime - b.openTime);
+  const fwd = completedCandles(forwardCandles, RCS_INTERVAL, nowMs)
+    .filter((c) => c.openTime > obs.openedAtMs).sort((a, b) => a.openTime - b.openTime);
   const risk = obs.initialStop - obs.entryPrice;
   if (!(risk > 0)) return null;
 

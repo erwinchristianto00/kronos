@@ -2121,7 +2121,9 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
   if (!isTest && standaloneCortexShadowAllowed({ env: process.env, liveEnginePresent: liveEngine != null })) {
     const cortexStore = new CortexBrainStore("data/cortex-brain.json");
     const cortexJournal = new CortexDecisionJournal("data/cortex-decision-journal.jsonl");
-    const staticWeightPctForLane = normalizeCortexStaticWeightPctForLane(() => 100);
+    // No live engine means no incumbent allocation. A synthetic 100%-per-lane
+    // baseline made research coverage look funded when it was not.
+    const staticWeightPctForLane = normalizeCortexStaticWeightPctForLane(() => 0);
     const cortexStandaloneContext = () => {
       const cached = getLatestScanCandidates();
       const scanStatus = coreScanAutoRefreshController.getStatus();
@@ -2186,13 +2188,14 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           dataDir: "data",
           journalFile: "data/cortex-decision-journal.jsonl",
           staticWeightPctForLane,
+          baselineAvailable: false,
           nowMs: now.getTime(),
           nowIso: now.toISOString(),
         });
         console.log(
           `[cortex-refit-standalone] examples=${report.examplesTotal} (+${report.examplesNew} new) ` +
             `resolved=${report.coverage.cumulativeResolved} families=${report.coverage.regimeFamiliesWithOutcomes} ` +
-            `blindCapital=${report.coverage.blindCapitalPct.toFixed(0)}%`,
+            `blindCapital=${report.coverage.baselineAvailable ? `${report.coverage.blindCapitalPct.toFixed(0)}%` : "n/a"}`,
         );
       } catch (err) {
         console.error("[cortex-refit-standalone] pass failed", err);

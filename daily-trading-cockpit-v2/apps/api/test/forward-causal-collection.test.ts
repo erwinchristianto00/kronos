@@ -15,6 +15,8 @@ import {
   type ForwardPaperOrderLike,
 } from "../src/experience-engine/forward-causal-collection.js";
 import { auditForwardCausalEvents, type ForwardCausalEvent } from "../src/experience-engine/forward-causal-auditor.js";
+import { buildCortexExperienceBridge } from "../src/experience-engine/cortex-experience-bridge.js";
+import { CORTEX_FEATURE_SCHEMA_VERSION } from "../src/lib/cortex-brain.js";
 
 const dirs: string[] = [];
 afterEach(() => dirs.splice(0).forEach((dir) => rmSync(dir, { recursive: true, force: true })));
@@ -117,6 +119,34 @@ describe("forward causal collection", () => {
     const audit = auditForwardCausalEvents(events);
     expect(audit.audits[0]?.selectedDecisionId).toBe(real.identity.decisionId);
     expect(audit.completeChains).toBe(1);
+  });
+
+  it("emits a CORTEX sample only from an exact persisted CORTEX snapshot and direct three-id chain", () => {
+    const dir = mkdtempSync(join(tmpdir(), "causal-cortex-")); dirs.push(dir);
+    const env = shadowEnv(dir); const o = order();
+    o.cortexDecisionSnapshot = {
+      decisionId: "cortex-decision:900:1:CG_WIDE_FAST_LONG",
+      atMs: 900,
+      laneId: "CG_WIDE_FAST_LONG",
+      direction: "LONG",
+      featureSchemaVersion: CORTEX_FEATURE_SCHEMA_VERSION,
+      featureVector: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0.5],
+      regimeFamily: "BULL",
+      eligible: true,
+      finalPct: 0,
+      evalFinalPct: 0,
+    };
+    o.causalIdentity = prepareForwardCausalIdentity(o, env);
+    recordForwardOpportunity(o, env);
+    o.paperStatus = "PAPER_CLOSED_WIN"; o.closedAtMs = 2_000; o.resolvedAtMs = 3_000; o.grossR = 0.2; o.costR = -0.02; o.netR = 0.18;
+    o.causalIdentity = withResolvedCausalIdentity(o);
+    recordForwardOutcome(o, env);
+    const events = readFileSync(forwardCausalJournalPath(env)!, "utf8").trim().split("\n").map((line) => JSON.parse(line) as ForwardCausalEvent);
+    const bridge = buildCortexExperienceBridge(events);
+    expect(bridge.experiences).toHaveLength(1);
+    expect(bridge.outcomes).toHaveLength(1);
+    expect(bridge.outcomes[0]?.decisionId).toBe(o.cortexDecisionSnapshot.decisionId);
+    expect(bridge.rejected).toEqual({});
   });
 
   it("rejects legacy, identity-mismatched, schema-mismatched, and future-decision chains", () => {

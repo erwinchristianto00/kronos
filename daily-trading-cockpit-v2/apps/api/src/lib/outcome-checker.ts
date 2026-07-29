@@ -21,6 +21,8 @@ import {
   CURRENT_EVIDENCE_ERA,
   EVIDENCE_POLICY_VERSION,
   END_TO_END_CORRECTNESS_DEPLOYED_AT,
+  hasCurrentPostFixPolicyStamp,
+  MIN_EXECUTION_RR,
 } from "@dtc/shared";
 
 import type { BinanceClient } from "./binance.js";
@@ -744,7 +746,7 @@ function isVariantEligible(signal: TrackedSignal, outcome: OutcomeWindow, varian
     case "fib_entry_plus_whale_confirm":
       return !!context?.fibonacci && whaleAgrees(signal);
     case "indicator_confluence_only":
-      return isDirectionAligned(signal) && (signal.analysisContext?.riskReward ?? 0) >= 1.5;
+      return isDirectionAligned(signal) && (signal.analysisContext?.riskReward ?? 0) >= MIN_EXECUTION_RR;
     default:
       return outcome.result !== "EXPIRED";
   }
@@ -1792,11 +1794,7 @@ function computePerformanceInternal(
       ? Math.min(...activeOpenSignals.map((signal) => new Date(signal.firstSeenAt).getTime()))
       : null;
 
-  const isPostFix = (signal: TrackedSignal): boolean =>
-    signal.selectedExecutionPlan?.evidenceEra === CURRENT_EVIDENCE_ERA &&
-    signal.selectedExecutionPlan?.decisionPolicyVersion === CURRENT_DECISION_POLICY_VERSION &&
-    signal.selectedExecutionPlan?.evidencePolicyVersion === EVIDENCE_POLICY_VERSION &&
-    signal.selectedExecutionPlan?.policyDeploymentAt === END_TO_END_CORRECTNESS_DEPLOYED_AT;
+  const isPostFix = (signal: TrackedSignal): boolean => hasCurrentPostFixPolicyStamp(signal.selectedExecutionPlan);
   const postFixSignalCount = uniqueSignals.filter(isPostFix).length;
   const legacySignalCount = uniqueSignals.length - postFixSignalCount;
   const homogeneousPostFix = uniqueSignals.length > 0 && legacySignalCount === 0;

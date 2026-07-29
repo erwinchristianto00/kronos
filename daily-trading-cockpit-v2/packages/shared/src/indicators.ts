@@ -165,10 +165,30 @@ function detectTrend(close: number, ema20Value: number, ema50Value: number, ema2
   return "SIDEWAYS";
 }
 
+const INTERVAL_MS: Readonly<Record<string, number>> = {
+  "1m": 60_000,
+  "3m": 3 * 60_000,
+  "5m": 5 * 60_000,
+  "15m": 15 * 60_000,
+  "30m": 30 * 60_000,
+  "1h": 60 * 60_000,
+  "2h": 2 * 60 * 60_000,
+  "4h": 4 * 60 * 60_000,
+  "6h": 6 * 60 * 60_000,
+  "8h": 8 * 60 * 60_000,
+  "12h": 12 * 60 * 60_000,
+  "1d": 24 * 60 * 60_000,
+  "3d": 3 * 24 * 60 * 60_000,
+  "1w": 7 * 24 * 60 * 60_000,
+};
+
+/** The fixed duration of a supported Binance kline interval, or null for a calendar interval. */
+export function candleIntervalMs(interval: string): number | null {
+  return INTERVAL_MS[interval] ?? null;
+}
+
 function timeframeMs(timeframe: "5m" | "15m" | "1h"): number {
-  if (timeframe === "5m") return 5 * 60 * 1000;
-  if (timeframe === "15m") return 15 * 60 * 1000;
-  return 60 * 60 * 1000;
+  return candleIntervalMs(timeframe)!;
 }
 
 /**
@@ -179,10 +199,13 @@ function timeframeMs(timeframe: "5m" | "15m" | "1h"): number {
  */
 export function completedCandles(
   candles: Candle[],
-  timeframe: "5m" | "15m" | "1h",
+  timeframe: string,
   now = Date.now(),
 ): Candle[] {
-  const closeAfterMs = timeframeMs(timeframe);
+  const closeAfterMs = candleIntervalMs(timeframe);
+  // Calendar-month klines have no fixed duration. Refuse them rather than
+  // accidentally treating a still-forming month as a completed observation.
+  if (closeAfterMs === null) return [];
   return candles.filter((candle) => candle.openTime + closeAfterMs <= now);
 }
 

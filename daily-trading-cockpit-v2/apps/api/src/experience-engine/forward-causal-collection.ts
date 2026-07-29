@@ -11,6 +11,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync } from "n
 import { dirname, resolve } from "node:path";
 
 import { resolveFourBrainInstanceId } from "../lib/four-brain-live-gather-bindings.js";
+import type { CortexDecisionSnapshot } from "../lib/cortex-decision-snapshot.js";
 
 export const CAUSAL_LINEAGE_SCHEMA_VERSION = "causal-lineage-1" as const;
 export type CausalDirection = "LONG" | "SHORT" | "NEUTRAL" | "BOTH";
@@ -27,6 +28,9 @@ export interface CausalIdentity {
   featureSchemaVersion: string;
   decisionRuleVersion: string;
   attributionRuleVersion: string;
+  /** Present only when an exact CORTEX decision snapshot was handed to admission. */
+  cortexDecisionId: string | null;
+  cortexFeatureSchemaVersion: number | null;
 }
 
 export interface CausalCollectionActivation {
@@ -60,9 +64,10 @@ export interface ForwardPaperOrderLike {
   resolvedAtMs?: number | null;
   closeIntrabarAmbiguous?: boolean;
   causalIdentity?: CausalIdentity | null;
+  cortexDecisionSnapshot?: CortexDecisionSnapshot | null;
 }
 
-interface DecisionSnapshotEvent {
+export interface DecisionSnapshotEvent {
   eventType: "DECISION_SNAPSHOT";
   eventId: string;
   identity: CausalIdentity;
@@ -75,10 +80,20 @@ interface DecisionSnapshotEvent {
   cortexRecommendation: { status: "MISSING"; value: null };
   incumbentDecision: { status: "PRESENT" | "MISSING"; value: string | null };
   features: { names: string[]; values: number[]; availableAtMs: number[]; sourceStatuses: Record<string, "FRESH" | "MISSING" | "STALE" | "ERROR"> };
+  cortexTraining: {
+    status: "PRESENT" | "MISSING";
+    decisionId: string | null;
+    featureSchemaVersion: number | null;
+    featureVector: number[] | null;
+    regimeFamily: string | null;
+    eligible: boolean | null;
+    finalPct: number | null;
+    evalFinalPct: number | null;
+  };
   provenance: { originKey: string; sourceObservationId: string; missingFields: string[] };
 }
 
-interface OpportunityOpenEvent {
+export interface OpportunityOpenEvent {
   eventType: "OPPORTUNITY_OPEN";
   eventId: string;
   identity: CausalIdentity;
@@ -91,7 +106,7 @@ interface OpportunityOpenEvent {
   reportOnly: true;
 }
 
-interface OutcomeResolutionEvent {
+export interface OutcomeResolutionEvent {
   eventType: "OUTCOME_RESOLUTION";
   eventId: string;
   identity: CausalIdentity;
@@ -111,7 +126,7 @@ interface OutcomeResolutionEvent {
   reportOnly: true;
 }
 
-type ForwardEvent = DecisionSnapshotEvent | OpportunityOpenEvent | OutcomeResolutionEvent;
+export type ForwardEvent = DecisionSnapshotEvent | OpportunityOpenEvent | OutcomeResolutionEvent;
 
 const hash = (parts: readonly (string | number)[]): string =>
   createHash("sha256").update(parts.join("\u001f")).digest("hex").slice(0, 32);
@@ -121,6 +136,13 @@ const openedAtMsOf = (order: ForwardPaperOrderLike): number | null => {
   return Number.isFinite(value) ? value : null;
 };
 const originKeyOf = (order: ForwardPaperOrderLike): string => order.sourceCandidateId || order.sourceObservationId;
+const validCortexSnapshot = (order: ForwardPaperOrderLike, openedAtMs: number): CortexDecisionSnapshot | null => {
+  const snapshot = order.cortexDecisionSnapshot ?? null;
+  if (!snapshot || snapshot.laneId !== order.selectedLaneId || snapshot.atMs > openedAtMs) return null;
+  if (!snapshot.decisionId || !Number.isInteger(snapshot.featureSchemaVersion)) return null;
+  if (!Array.isArray(snapshot.featureVector) || !snapshot.featureVector.length || !snapshot.featureVector.every(finite)) return null;
+  return snapshot;
+};
 
 /** Strict gate owned by this feature. Unlike the older lane journal, it has no COLLECT_ONLY exception for 3103. */
 export function resolveCausalCollectionActivation(env: NodeJS.ProcessEnv = process.env): CausalCollectionActivation {
@@ -142,6 +164,7 @@ export function prepareForwardCausalIdentity(order: ForwardPaperOrderLike, env: 
   const asOfMs = openedAtMsOf(order);
   if (asOfMs == null || !order.paperOrderId || !order.selectedLaneId || !order.symbol) return null;
   const originKey = originKeyOf(order);
+  const cortex = validCortexSnapshot(order, asOfMs);
   const decisionId = `causal-decision-${hash([CAUSAL_LINEAGE_SCHEMA_VERSION, activation.instanceId, originKey, order.selectedLaneId, order.symbol, order.direction, asOfMs])}`;
   return {
     lineageSchemaVersion: CAUSAL_LINEAGE_SCHEMA_VERSION,
@@ -155,6 +178,8 @@ export function prepareForwardCausalIdentity(order: ForwardPaperOrderLike, env: 
     featureSchemaVersion: "causal-paper-opportunity/1",
     decisionRuleVersion: "paper-opportunity-admission/1",
     attributionRuleVersion: "direct-paper-order-link/1",
+    cortexDecisionId: cortex?.decisionId ?? null,
+    cortexFeatureSchemaVersion: cortex?.featureSchemaVersion ?? null,
   };
 }
 
@@ -195,6 +220,7 @@ function openEvents(order: ForwardPaperOrderLike): ForwardEvent[] {
   if (!identity || asOfMs == null) return [];
   const originKey = originKeyOf(order);
   const features = featureSnapshot(order, asOfMs);
+  const cortex = validCortexSnapshot(order, asOfMs);
   const decision: DecisionSnapshotEvent = {
     eventType: "DECISION_SNAPSHOT", eventId: identity.decisionId, identity, asOfMs, reportOnly: true,
     codeVersion: null,
@@ -204,6 +230,21 @@ function openEvents(order: ForwardPaperOrderLike): ForwardEvent[] {
     cortexRecommendation: { status: "MISSING", value: null },
     incumbentDecision: { status: order.controllerMode ? "PRESENT" : "MISSING", value: order.controllerMode ?? null },
     features,
+    cortexTraining: cortex
+      ? {
+          status: "PRESENT",
+          decisionId: cortex.decisionId,
+          featureSchemaVersion: cortex.featureSchemaVersion,
+          featureVector: [...cortex.featureVector],
+          regimeFamily: cortex.regimeFamily,
+          eligible: cortex.eligible,
+          finalPct: cortex.finalPct,
+          evalFinalPct: cortex.evalFinalPct,
+        }
+      : {
+          status: "MISSING", decisionId: null, featureSchemaVersion: null, featureVector: null,
+          regimeFamily: null, eligible: null, finalPct: null, evalFinalPct: null,
+        },
     provenance: { originKey, sourceObservationId: order.sourceObservationId, missingFields: order.provenanceFieldMissing?.slice() ?? [] },
   };
   const opportunity: OpportunityOpenEvent = {
@@ -310,4 +351,23 @@ export function recordForwardOutcomes(orders: readonly ForwardPaperOrderLike[], 
 export function forwardCausalJournalPath(env: NodeJS.ProcessEnv = process.env): string | null {
   const activation = resolveCausalCollectionActivation(env);
   return activation.active ? journalPath(env, activation.instanceId) : null;
+}
+
+/** Read-only parser used by the Experience Store bridge. Torn/unknown rows are never eligible. */
+export function readForwardCausalEvents(file: string): ForwardEvent[] {
+  if (!existsSync(file)) return [];
+  const events: ForwardEvent[] = [];
+  for (const line of readFileSync(file, "utf8").split("\n")) {
+    try {
+      const parsed = JSON.parse(line) as ForwardEvent;
+      if (
+        parsed && typeof parsed === "object" &&
+        (parsed.eventType === "DECISION_SNAPSHOT" || parsed.eventType === "OPPORTUNITY_OPEN" || parsed.eventType === "OUTCOME_RESOLUTION") &&
+        typeof parsed.eventId === "string"
+      ) events.push(parsed);
+    } catch {
+      // Partial append tails are intentionally ignored and cannot become labels.
+    }
+  }
+  return events;
 }

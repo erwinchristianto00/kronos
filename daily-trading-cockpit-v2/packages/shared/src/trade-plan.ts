@@ -1,4 +1,5 @@
 import type { Candidate, EntryPlaybook, EntryTimingAction, ExitMode, TradePlanSnapshot } from "./types.js";
+import { MIN_EXECUTION_RR } from "./policy-versions.js";
 
 function clamp(value: number, min: number, max: number) {
   return Math.min(Math.max(value, min), max);
@@ -234,7 +235,7 @@ function runnerAllowed(candidate: Candidate): boolean {
     kronosContinuation(candidate) &&
     !whaleConflict(candidate) &&
     !weakVolume(candidate) &&
-    (effectiveRiskReward(candidate) ?? 0) >= 1.5 &&
+    (effectiveRiskReward(candidate) ?? 0) >= MIN_EXECUTION_RR &&
     (
       candidate.finalDirection === "LONG"
         ? (candidate.forecastMaxHigh ?? Number.NEGATIVE_INFINITY) >= (targets.tp2 ?? Number.POSITIVE_INFINITY)

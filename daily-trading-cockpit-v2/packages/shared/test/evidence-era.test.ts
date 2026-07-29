@@ -4,7 +4,13 @@ import {
   CURRENT_DECISION_POLICY_VERSION,
   CURRENT_EVIDENCE_ERA,
   classifyEvidenceEra,
+  hasCurrentPostFixPolicyStamp,
 } from "../src/evidence-era.js";
+import {
+  END_TO_END_CORRECTNESS_DEPLOYED_AT,
+  EVIDENCE_POLICY_VERSION,
+  EXECUTION_POLICY_VERSION,
+} from "../src/policy-versions.js";
 
 describe("classifyEvidenceEra", () => {
   it("returns LEGACY_PRE_ROUTING when there is no variantSelection", () => {
@@ -49,5 +55,18 @@ describe("classifyEvidenceEra", () => {
     expect(CURRENT_EVIDENCE_ERA).toBe("POST_END_TO_END_CORRECTNESS_FIX_V1");
     expect(typeof CURRENT_DECISION_POLICY_VERSION).toBe("string");
     expect(CURRENT_DECISION_POLICY_VERSION.length).toBeGreaterThan(0);
+  });
+
+  it("requires every economic policy stamp for post-fix eligibility", () => {
+    const current = {
+      evidenceEra: CURRENT_EVIDENCE_ERA,
+      decisionPolicyVersion: CURRENT_DECISION_POLICY_VERSION,
+      executionPolicyVersion: EXECUTION_POLICY_VERSION,
+      evidencePolicyVersion: EVIDENCE_POLICY_VERSION,
+      policyDeploymentAt: END_TO_END_CORRECTNESS_DEPLOYED_AT,
+    };
+    expect(hasCurrentPostFixPolicyStamp(current)).toBe(true);
+    expect(hasCurrentPostFixPolicyStamp({ ...current, executionPolicyVersion: null })).toBe(false);
+    expect(hasCurrentPostFixPolicyStamp({ ...current, policyDeploymentAt: "2026-01-01T00:00:00.000Z" })).toBe(false);
   });
 });

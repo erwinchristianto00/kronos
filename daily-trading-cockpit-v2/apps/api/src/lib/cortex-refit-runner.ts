@@ -54,6 +54,10 @@ export interface CortexRefitInput {
   pruneBeforeMs?: number;
   /** If true, apply ACCEPTED refits + advance counters + save. Default true; false = dry-run report. */
   apply?: boolean;
+  /** False means no incumbent allocation exists. Coverage must fail closed rather than invent one. */
+  baselineAvailable?: boolean;
+  /** The Experience Store path requires direct identifiers, never TTL ownership. */
+  requireExactOwnership?: boolean;
 }
 
 export interface CortexArchetypeRefit {
@@ -79,6 +83,8 @@ export interface CortexPromotionCoverage {
   regimeCoverageGateMet: boolean;
   /** Σ static weight of roster lanes NOT LEARNING_ACTIVE — the capital the brain would tilt blind. */
   blindCapitalPct: number;
+  /** Whether blind-capital is measured from a real incumbent allocation. */
+  baselineAvailable: boolean;
   learningActiveLanes: number;
   /** Always 0 until the full gate + approval. Surfaced so the report can never imply β auto-rose. */
   liveBeta: number;
@@ -117,6 +123,7 @@ export function runCortexRefit(store: CortexBrainStore, input: CortexRefitInput)
     roster: input.roster,
     ttlMsForLane: input.ttlMsForLane,
     minExamplesForActive: input.minExamplesForActive,
+    requireExactOwnership: input.requireExactOwnership,
   });
 
   // Count only outcomes not already in the persisted exact-once ledger (idempotent, out-of-order-safe —
@@ -170,7 +177,10 @@ export function runCortexRefit(store: CortexBrainStore, input: CortexRefitInput)
     resolvedByFamily: { ...s.resolvedByFamily },
     regimeFamiliesWithOutcomes,
     regimeCoverageGateMet: regimeFamiliesWithOutcomes >= CORTEX_GATE_MIN_REGIME_FAMILIES,
-    blindCapitalPct: cortexBlindCapitalPct(attr.perLane),
+    // An unavailable incumbent is not a zero-weight portfolio. Report it as
+    // fully blind so every downstream promotion calculation remains blocked.
+    blindCapitalPct: input.baselineAvailable === false ? 100 : cortexBlindCapitalPct(attr.perLane),
+    baselineAvailable: input.baselineAvailable !== false,
     learningActiveLanes,
     liveBeta: CORTEX_LIVE_BETA,
     evaluationBeta: evaluationBeta(s.cumulativeResolved),

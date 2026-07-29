@@ -1,4 +1,4 @@
-import type { Candle } from "@dtc/shared";
+import { completedCandles, type Candle } from "@dtc/shared";
 
 const BINANCE_BASE_URL = "https://api.binance.com";
 export const BINANCE_SPOT_BASE_URLS = [BINANCE_BASE_URL, "https://api-gcp.binance.com"] as const;
@@ -503,7 +503,7 @@ export class BinanceClient {
       throw new BinanceRequestError("invalid_response", `candles_${interval}`, `invalid_response: Binance klines were malformed for ${symbol} ${interval}`);
     }
 
-    return payload.map((entry) => ({
+    const candles = payload.map((entry) => ({
       openTime: entry[0],
       open: Number(entry[1]),
       high: Number(entry[2]),
@@ -511,6 +511,10 @@ export class BinanceClient {
       close: Number(entry[4]),
       volume: Number(entry[5]),
     }));
+    // Binance includes the in-progress kline. `getCandles` is the shared
+    // decision/resolver boundary, so no downstream lane can accidentally use
+    // a mutable candle as a feature or as a terminal outcome bar.
+    return completedCandles(candles, interval, Date.now());
   }
 
   async getTicker24h(symbol: string): Promise<Ticker24hSnapshot> {

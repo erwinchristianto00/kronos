@@ -8,6 +8,7 @@ import {
   CURRENT_EVIDENCE_ERA,
   EVIDENCE_POLICY_VERSION,
   END_TO_END_CORRECTNESS_DEPLOYED_AT,
+  EXECUTION_POLICY_VERSION,
   type TrackedSignal,
 } from "@dtc/shared";
 
@@ -136,6 +137,7 @@ describe("computePerformance", () => {
     const currentPlan = {
       evidenceEra: CURRENT_EVIDENCE_ERA,
       decisionPolicyVersion: CURRENT_DECISION_POLICY_VERSION,
+      executionPolicyVersion: EXECUTION_POLICY_VERSION,
       evidencePolicyVersion: EVIDENCE_POLICY_VERSION,
       policyDeploymentAt: END_TO_END_CORRECTNESS_DEPLOYED_AT,
     } as TrackedSignal["selectedExecutionPlan"];
@@ -153,6 +155,18 @@ describe("computePerformance", () => {
     expect(mixed.evidencePolicyVersion).toBeNull();
     expect(mixed.postFixSignalCount).toBe(1);
     expect(mixed.legacySignalCount).toBe(1);
+  });
+
+  it("treats a partially stamped migration plan as legacy evidence", () => {
+    const partial = {
+      evidenceEra: CURRENT_EVIDENCE_ERA,
+      decisionPolicyVersion: CURRENT_DECISION_POLICY_VERSION,
+      evidencePolicyVersion: EVIDENCE_POLICY_VERSION,
+      policyDeploymentAt: END_TO_END_CORRECTNESS_DEPLOYED_AT,
+    } as TrackedSignal["selectedExecutionPlan"];
+    const report = computePerformance([makeSignal({ selectedExecutionPlan: partial })]);
+    expect(report.postFixSignalCount).toBe(0);
+    expect(report.legacySignalCount).toBe(1);
   });
 
   it("counts Kronos agreement only for matching directional bias and ignores neutral/unavailable", () => {

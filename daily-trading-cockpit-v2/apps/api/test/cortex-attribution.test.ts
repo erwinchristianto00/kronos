@@ -68,6 +68,20 @@ describe("cortex-attribution — the anti-leakage property (operator's core conc
     expect(l1.outcomesSeen).toBe(1);
   });
 
+  it("requires an explicit decision, opportunity, and outcome identity in strict Experience Store mode", () => {
+    const directDecision = { ...decision(0, { lanes: { L1: {} } }), decisionId: "cortex-1" };
+    const directOutcome = {
+      ...outcome("L1", 3 * MIN, 60 * MIN, 0.2, "observation-1"),
+      decisionId: "cortex-1",
+      opportunityId: "opportunity-1",
+      outcomeId: "outcome-1",
+    };
+    const strict = { ...OPTS, requireExactOwnership: true };
+    expect(attributeOutcomes([directDecision], [directOutcome], strict).examples).toHaveLength(1);
+    expect(attributeOutcomes([directDecision], [{ ...directOutcome, decisionId: "other" }], strict).examples).toHaveLength(0);
+    expect(attributeOutcomes([directDecision], [{ ...directOutcome, opportunityId: null }], strict).examples).toHaveLength(0);
+  });
+
   it("drops (and COUNTS) a trade with no decision inside the TTL window — never a stale match", () => {
     const decisions = Array.from({ length: 10 }, (_, i) => decision(i * 5 * MIN, { lanes: { L1: {} } }));
     // Trade opens at t=200min; latest decision is t=45min → 155min gap > 50min TTL.

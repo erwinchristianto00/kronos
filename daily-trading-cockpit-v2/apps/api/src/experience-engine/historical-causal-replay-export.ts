@@ -25,8 +25,14 @@ export function exportHistoricalCausalReplay(
       const direction = directionOf(row.action);
       const horizonMs = HORIZON_BARS[row.horizon as DirectionHorizon] * HOUR;
       const vector = row.x.length === 3 && row.x.every(Number.isFinite) ? row.x.slice() : null;
+      const identity = `historical-tier-a:${opts.manifestHash}:${row.symbol}:${row.horizon}:${row.tMs}:${direction}`;
       return normalizeExperience({
-        experienceId: `historical-tier-a:${opts.manifestHash}:${row.symbol}:${row.horizon}:${row.tMs}:${direction}`,
+        experienceId: identity,
+        // Tier-A rows are deterministic causal replays from one frozen decision
+        // record. Keep every stage addressable instead of relying on tuple joins.
+        decisionId: `${identity}:decision`,
+        opportunityId: direction === "FLAT" ? null : `${identity}:opportunity`,
+        outcomeId: `${identity}:outcome`,
         source: "HISTORICAL_CAUSAL_REPLAY",
         provenance: "HISTORICAL_CAUSAL",
         decisionTimeMs: row.tMs,

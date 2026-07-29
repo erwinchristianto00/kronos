@@ -4,6 +4,7 @@ import { eligibilityFor, isDirectTrainingForbidden } from "../src/simulation/sim
 
 const complete = {
   experienceId: "real-1", source: "OBSERVED_SHADOW_OUTCOME" as const, provenance: "OBSERVED" as const,
+  decisionId: "decision-real-1", opportunityId: "opportunity-real-1", outcomeId: "outcome-real-1",
   decisionTimeMs: 1, openedTimeMs: 2, marketCloseTimeMs: 3, resolvedTimeMs: 4, laneId: "lane", symbolOrBasketId: "BTCUSDT", direction: "LONG" as const,
   featureSchemaVersion: "v1", codeVersion: "c1", featureVector: [1, 0], sourceStatuses: { price: "FRESH" as const }, attributionStatus: "ATTRIBUTED" as const,
   outcomeQuality: "RESOLVED_VALID" as const, outcomeNetR: 0.2, labels: {}, executionLabelKind: "PAPER_OUTCOME" as const,

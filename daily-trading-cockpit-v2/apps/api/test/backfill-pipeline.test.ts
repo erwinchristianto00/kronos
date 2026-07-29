@@ -54,6 +54,10 @@ describe("backfill: outcome (netR + hurdle + risk denominator)", () => {
     expect(computeOutcomeR({ ...base, netR: null, grossR: 0.01, costR: 0, riskDistanceAtOpen: 0 })).toMatchObject({ ok: false, reason: "risk-denominator-nonpositive" });
     expect(computeOutcomeR({ ...base, netR: null, grossR: 0.01, costR: 0, riskDistanceAtOpen: -1 })).toMatchObject({ ok: false, reason: "risk-denominator-nonpositive" });
   });
+  it("rejects missing or non-finite execution cost instead of assuming zero cost", () => {
+    expect(computeOutcomeR({ ...base, netR: null, grossR: 0.01, costR: null, riskDistanceAtOpen: 0.003 })).toMatchObject({ ok: false, reason: "cost-missing" });
+    expect(computeOutcomeR({ ...base, netR: null, grossR: 0.01, costR: Number.NaN, riskDistanceAtOpen: 0.003 })).toMatchObject({ ok: false, reason: "cost-nonfinite" });
+  });
 });
 
 function dec(o: Partial<HistoricalDecision>): HistoricalDecision {

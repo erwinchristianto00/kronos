@@ -23,6 +23,8 @@ export interface OutcomeOpts {
 
 export type OutcomeRejectReason =
   | "no-netR-and-no-return-components"
+  | "cost-missing"
+  | "cost-nonfinite"
   | "risk-denominator-missing"
   | "risk-denominator-nonfinite"
   | "risk-denominator-nonpositive"
@@ -62,10 +64,14 @@ export function computeOutcomeR(o: HistoricalOutcome, opts: OutcomeOpts = {}): O
   const gross = o.grossR;
   const cost = o.costR;
   if (typeof gross !== "number" || !Number.isFinite(gross)) return { ok: false, reason: "no-netR-and-no-return-components" };
+  // A return-based row has no native net R. Treating unavailable execution
+  // cost as zero fabricates profitability and is forbidden for learning.
+  if (cost == null) return { ok: false, reason: "cost-missing" };
+  if (typeof cost !== "number" || !Number.isFinite(cost)) return { ok: false, reason: "cost-nonfinite" };
   if (denom == null) return { ok: false, reason: "risk-denominator-missing" };
   if (!denomFinite) return { ok: false, reason: "risk-denominator-nonfinite" };
   if ((denom as number) <= 0) return { ok: false, reason: "risk-denominator-nonpositive" };
-  const netReturn = gross - (typeof cost === "number" && Number.isFinite(cost) ? cost : 0);
+  const netReturn = gross - cost;
   const netR = netReturn / (denom as number);
   if (!Number.isFinite(netR)) return { ok: false, reason: "netR-nonfinite" };
   return { ok: true, netR, y: cortexWinLabel(netR), riskDenominator: denom as number, denominatorProvenance: "riskDistanceAtOpen", riskDenominatorSource: source };
