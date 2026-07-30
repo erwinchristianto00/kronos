@@ -6020,3 +6020,123 @@ describe("LiveIntent.feeSource (fee provenance — report-only)", () => {
     expect(client.placed.some((p) => p.newClientOrderId?.startsWith("dtc-opcl-"))).toBe(false);
   });
 });
+
+// ── confirmedEntryFills (4th hardening pass — exact confirmed-fill identity) ────────────────
+//
+// entryPriceConfirmed proves SOME real fill price was established; it does not identify WHICH
+// order id actually filled. confirmedEntryFills closes that gap: it is populated only from real
+// /userTrades rows whose orderId equals the intent's SINGULAR, never-reassigned entryOrderId —
+// never from entryOrderIds (plural, grows with pyramid adds) and never merely because
+// entryPriceConfirmed is true.
+
+describe("LiveIntent.confirmedEntryFills (exact confirmed-fill identity)", () => {
+  it("captures a single confirmed entry fill from a real /userTrades record matching the entry order id", async () => {
+    const order = paperOrder(); // SHORT ETHUSDT, entry 2000, stop 2100
+    const { engine, client, store } = makeEngine({ paper: makePaperStore([order]) });
+    expect((await engine.arm()).ok).toBe(true);
+    await engine.tick(); // opens: MARKET entry + STOP_MARKET + LIMIT tp1
+    const intent = store.getState().intents[0]!;
+    const entryOrderId = intent.entryOrderId!;
+
+    client.positionsBySymbol.set("ETHUSDT", 0); // already flat on the exchange
+    client.trades = [
+      { symbol: "ETHUSDT", orderId: entryOrderId, tradeId: "t-entry-1", price: 2000, qty: 0.05, realizedPnl: 0, commission: 0.04, commissionAsset: "USDT", time: 1000, maker: false },
+    ];
+    const res = await engine.manualCloseIntent(intent.paperOrderId);
+    expect(res.ok).toBe(true);
+
+    const closed = store.getState().intents[0]!;
+    expect(closed.state).toBe("CLOSED");
+    expect(closed.confirmedEntryFills).toHaveLength(1);
+    expect(closed.confirmedEntryFills![0]!.orderId).toBe(entryOrderId);
+    expect(closed.confirmedEntryFills![0]!.tradeId).toBe("t-entry-1");
+    expect(closed.confirmedEntryFills![0]!.price).toBeCloseTo(2000, 9);
+    expect(closed.confirmedEntryFills![0]!.qty).toBeCloseTo(0.05, 9);
+    expect(closed.confirmedEntryFills![0]!.role).toBe("ENTRY");
+  });
+
+  it("aggregates two partial fills on the same entry order id — both appear in confirmedEntryFills, not just one", async () => {
+    const order = paperOrder();
+    const { engine, client, store } = makeEngine({ paper: makePaperStore([order]) });
+    expect((await engine.arm()).ok).toBe(true);
+    await engine.tick();
+    const intent = store.getState().intents[0]!;
+    const entryOrderId = intent.entryOrderId!;
+
+    client.positionsBySymbol.set("ETHUSDT", 0);
+    client.trades = [
+      { symbol: "ETHUSDT", orderId: entryOrderId, tradeId: "t-entry-1", price: 1999, qty: 0.03, realizedPnl: 0, commission: 0.024, commissionAsset: "USDT", time: 1000 },
+      { symbol: "ETHUSDT", orderId: entryOrderId, tradeId: "t-entry-2", price: 2002, qty: 0.02, realizedPnl: 0, commission: 0.016, commissionAsset: "USDT", time: 1005 },
+    ];
+    const res = await engine.manualCloseIntent(intent.paperOrderId);
+    expect(res.ok).toBe(true);
+
+    const closed = store.getState().intents[0]!;
+    expect(closed.confirmedEntryFills).toHaveLength(2);
+    expect(new Set(closed.confirmedEntryFills!.map((f) => f.tradeId))).toEqual(new Set(["t-entry-1", "t-entry-2"]));
+    expect(closed.confirmedEntryFills!.every((f) => f.orderId === entryOrderId)).toBe(true);
+  });
+
+  it("confirmedEntryFills is an empty array, never undefined, when no /userTrades record matches the entry order id", async () => {
+    const order = paperOrder();
+    const { engine, client, store } = makeEngine({ paper: makePaperStore([order]) });
+    expect((await engine.arm()).ok).toBe(true);
+    await engine.tick();
+    const intent = store.getState().intents[0]!;
+
+    client.positionsBySymbol.set("ETHUSDT", 0);
+    client.trades = []; // nothing of ours in /userTrades
+    const res = await engine.manualCloseIntent(intent.paperOrderId);
+    expect(res.ok).toBe(true);
+
+    const closed = store.getState().intents[0]!;
+    expect(closed.confirmedEntryFills).toEqual([]);
+  });
+
+  it("never attributes a pyramid-add's fill to the original Entry decision — confirmedEntryFills is scoped to the singular entryOrderId, not the plural entryOrderIds array", async () => {
+    const orders: PaperOrder[] = [
+      paperOrder({
+        paperOrderId: "p1", direction: "LONG", entryPrice: 2000, stopLoss: 1900, takeProfitLevels: [2100],
+        paperStatus: "PAPER_SUBMITTED", createdAt: "2099-01-02T00:00:00.000Z",
+      } as Partial<PaperOrder>),
+    ];
+    const client = new FakeLiveClient();
+    const { engine, store } = makeEngine({
+      client,
+      paper: makePaperStore(orders),
+      config: { mirrorAllPaperOrders: true, maxAggregateIntentRiskUsd: 10 },
+    });
+    await engine.arm();
+    await engine.tick(); // opens p1
+    const originalEntryOrderId = store.getState().intents[0]!.entryOrderId!;
+
+    orders.push(
+      paperOrder({
+        paperOrderId: "p2", direction: "LONG", entryPrice: 2000, stopLoss: 1900, takeProfitLevels: [2100],
+        paperStatus: "PAPER_SUBMITTED", createdAt: "2099-01-02T01:00:00.000Z",
+      } as Partial<PaperOrder>),
+    );
+    await engine.tick(); // pyramid-adds p2 into the same intent
+    const intent = store.getState().intents[0]!;
+    expect(intent.entryOrderId).toBe(originalEntryOrderId); // singular anchor never reassigned
+    expect(intent.entryOrderIds!.length).toBeGreaterThanOrEqual(2); // plural array grew with the add
+    const pyramidAddOrderId = intent.entryOrderIds!.find((id) => id !== originalEntryOrderId)!;
+    expect(pyramidAddOrderId).toBeTruthy();
+
+    client.positionsBySymbol.set("ETHUSDT", 0);
+    client.trades = [
+      { symbol: "ETHUSDT", orderId: originalEntryOrderId, tradeId: "t-original", price: 2000, qty: 0.05, realizedPnl: 0, commission: 0.04, commissionAsset: "USDT", time: 1000 },
+      // The pyramid add's own fill — present in the same settlement window (its order id IS in
+      // intentSettlementOrderIds, so it is fetched and would sum into realized P&L/fees), but it
+      // must never appear in confirmedEntryFills, which is scoped to the ORIGINAL entry decision.
+      { symbol: "ETHUSDT", orderId: pyramidAddOrderId, tradeId: "t-pyramid-add", price: 1998, qty: 0.05, realizedPnl: 0, commission: 0.04, commissionAsset: "USDT", time: 4_000_000 },
+    ];
+    const res = await engine.manualCloseIntent(intent.paperOrderId);
+    expect(res.ok).toBe(true);
+
+    const closed = store.getState().intents[0]!;
+    expect(closed.confirmedEntryFills).toHaveLength(1);
+    expect(closed.confirmedEntryFills![0]!.orderId).toBe(originalEntryOrderId);
+    expect(closed.confirmedEntryFills!.some((f) => f.orderId === pyramidAddOrderId)).toBe(false);
+  });
+});

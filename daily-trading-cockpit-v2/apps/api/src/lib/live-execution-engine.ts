@@ -567,6 +567,11 @@ interface SettledFromTrades {
   matchedRequiredOrderIds: string[];
   missingRequiredOrderIds: string[];
   pageSaturated: boolean;
+  /** Real exchange fill rows for the ORIGINAL entry order only (trade.orderId === the singular
+   *  intent.entryOrderId, never the entryOrderIds array, which also absorbs pyramid adds) — see
+   *  realizedFromTrades' own doc note. Always an array, never undefined: empty is the honest "no
+   *  confirmed entry-side trade rows were matched" result, not "unknown". */
+  entryFills: ExecutionFill[];
 }
 
 export interface LiveIntent {
@@ -633,6 +638,14 @@ export interface LiveIntent {
    *  earlier call that left settlement incomplete. Undefined until settlement is genuinely
    *  established complete at least once. */
   settlementResolvedAt?: string;
+  /** 2026-07-30 (additive, report-only). Real /userTrades rows for the ORIGINAL entry order ONLY —
+   *  matched by the singular entryOrderId, never the entryOrderIds array (which also absorbs pyramid
+   *  adds; see that field's own doc note). Populated exclusively from exchange fill/trade records
+   *  that report their own executedQty (ExecutionFill.qty) — never inferred from order
+   *  acknowledgment, never merely because entryPriceConfirmed is true. Undefined on intents settled
+   *  before this field existed; `[]` is the honest "settlement ran but matched no entry-side rows"
+   *  result, distinct from "never settled". */
+  confirmedEntryFills?: ExecutionFill[];
   exitRule?: VariantExitRule;
   maxFavorableR?: number | null;
   /** MAE persistence (Tier 2 audit, purely additive): running MOST NEGATIVE (worst) favorableR the
@@ -4606,6 +4619,7 @@ export class LiveExecutionEngine {
           {
             requiredOrderIds: [intent.entryOrderId, ...(intent.entryOrderIds ?? []), ...requiredCloseOrderIds],
             fillRecord: this.fillRecordContextForIntent(intent),
+            entryOrderId: intent.entryOrderId,
           },
         );
         if (settled === null) {
@@ -4717,6 +4731,11 @@ export class LiveExecutionEngine {
        *  what lets a matched row be labelled ENTRY vs EXIT, which is the caller's knowledge, not
        *  this method's. NOTHING in the returned value depends on it. */
       fillRecord?: { recordId: string; laneId: string; entryOrderIds: Array<string | null> };
+      /** 2026-07-30 (additive). The intent's SINGULAR, immutable entry order id (never the
+       *  entryOrderIds array, which also absorbs pyramid adds — see LiveIntent.entryOrderIds' own
+       *  doc note). Used ONLY to isolate entryFills below; independent of fillRecord so the original
+       *  entry's confirmed-fill identity is always captured, even when no fill recorder is injected. */
+      entryOrderId?: string | null;
     } = {},
   ): Promise<SettledFromTrades | null> {
     const ids = new Set(orderIds.filter((id): id is string => typeof id === "string"));
@@ -4727,6 +4746,7 @@ export class LiveExecutionEngine {
       return {
         netUsd: 0, feesUsd: 0, feeSource: null,
         settlementFetchComplete: false, requiredOrderIds: [], matchedRequiredOrderIds: [], missingRequiredOrderIds: [], pageSaturated: false,
+        entryFills: [],
       };
     }
     const required = new Set(
@@ -4764,6 +4784,15 @@ export class LiveExecutionEngine {
               feeRows += 1;
             }
           }
+          // Exact confirmed-fill identity for the ORIGINAL entry order only (2026-07-30). Matched by
+          // the SINGULAR opts.entryOrderId, never the entryOrderIds array — that array also absorbs
+          // pyramid adds (see LiveIntent.entryOrderIds' own doc note), and a pyramid-add fill must
+          // never be attributed to the original Entry decision. Each row comes straight from a real
+          // /userTrades record with its own executedQty (t.qty) — never inferred from an
+          // acknowledgment-only order id, and never gated on entryPriceConfirmed alone.
+          const entryFills: ExecutionFill[] = opts.entryOrderId
+            ? matchedTrades.filter((t) => t.orderId === opts.entryOrderId).map((t) => fillFromUserTrade(t, "ENTRY"))
+            : [];
           // Per-fill execution record (2026-07-27, report-only, fail-safe — see its doc comment).
           // Placed AFTER the sum and immediately before the return so it cannot affect either: the
           // rows are the same `matchedTrades` this loop just walked, no extra fetch, and the whole
@@ -4792,6 +4821,7 @@ export class LiveExecutionEngine {
             matchedRequiredOrderIds: coverage.matchedRequiredOrderIds,
             missingRequiredOrderIds: coverage.missingRequiredOrderIds,
             pageSaturated: coverage.pageSaturated,
+            entryFills,
           };
           if (coverage.settlementFetchComplete) return settled;
           lastIncomplete = settled;
@@ -4820,6 +4850,7 @@ export class LiveExecutionEngine {
       intent.matchedRequiredOrderIds = [];
       intent.missingRequiredOrderIds = [];
       intent.pageSaturated = false;
+      intent.confirmedEntryFills = [];
       return;
     }
     intent.settlementFetchComplete = settled.settlementFetchComplete;
@@ -4827,6 +4858,10 @@ export class LiveExecutionEngine {
     intent.matchedRequiredOrderIds = settled.matchedRequiredOrderIds.slice();
     intent.missingRequiredOrderIds = settled.missingRequiredOrderIds.slice();
     intent.pageSaturated = settled.pageSaturated;
+    // 2026-07-30: real exchange fill rows for the ORIGINAL entry order only (never pyramid adds —
+    // see realizedFromTrades' own doc note). Persisted verbatim so identity is never re-derived from
+    // the acknowledged entryOrderId/entryOrderIds arrays downstream.
+    intent.confirmedEntryFills = settled.entryFills.slice();
     if (settled.settlementFetchComplete) intent.settlementResolvedAt = this.nowIso();
   }
 
@@ -4908,6 +4943,7 @@ export class LiveExecutionEngine {
       {
         requiredOrderIds: [intent.entryOrderId, ...(intent.entryOrderIds ?? []), ...closeOrderIds],
         fillRecord: recordFills ? this.fillRecordContextForIntent(intent) : undefined,
+        entryOrderId: intent.entryOrderId,
       },
     );
     this.applySettlementMetadata(intent, settled);

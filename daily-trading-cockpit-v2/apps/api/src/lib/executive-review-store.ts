@@ -56,18 +56,34 @@ export interface FourBrainExecutiveIdentity {
  * for another, and a missing one is never silently backfilled from a different clock.
  */
 export interface FourBrainEntryResolution {
-  /** Exact confirmed entry-fill time (LiveIntent.entryFilledAt) — never intent creation time. */
+  /** Exact confirmed entry-fill time — the earliest confirmedEntryFillOrderIds/TradeIds fill time
+   *  when confirmed fills exist, else a fallback to LiveIntent.entryFilledAt. Never intent creation
+   *  time either way. */
   entryFilledAtMs?: number | null;
   /** Exact exchange/position close time (LiveIntent.closedAt). */
   marketClosedAtMs?: number | null;
   /** Exact time settlement completeness was established (LiveIntent.settlementResolvedAt) — distinct
    *  from market close; settlement can complete well after the position itself closed. */
   settlementResolvedAtMs?: number | null;
-  /** The real confirmed fill price (LiveIntent.filledEntryPrice) — never the planned/decided price. */
+  /** Deterministic quantity-weighted average price across confirmedEntryFills when present, else a
+   *  fallback to LiveIntent.filledEntryPrice (itself gated on entryPriceConfirmed===true) — never the
+   *  planned/decided price. */
   actualEntryPrice?: number | null;
-  /** Every exchange order id whose fill produced this position's entry (LiveIntent.entryOrderIds,
-   *  falling back to the single entryOrderId already carried as Outcome.orderId). */
+  /** LEGACY/COMPATIBILITY ONLY (2026-07-29). Populated from LiveIntent.entryOrderId(s), gated only
+   *  on the entryPriceConfirmed BOOLEAN — never proof that THIS specific id filled, since
+   *  entryOrderId/entryOrderIds are stamped at order acknowledgment, before any fill is confirmed.
+   *  The adapter must use confirmedEntryFillOrderIds for direct-learning eligibility, never this. */
   entryFillOrderIds?: readonly string[] | null;
+  /** Exact confirmed-fill identity (2026-07-30) — the distinct exchange order id(s) that actually
+   *  produced a real, executed-quantity fill for the ORIGINAL entry order (LiveIntent.entryOrderId,
+   *  never a later pyramid add), sourced exclusively from LiveIntent.confirmedEntryFills. `null` when
+   *  no confirmed entry fill exists yet (or on a legacy record); never fabricated from an
+   *  acknowledged/submitted order id array. */
+  confirmedEntryFillOrderIds?: readonly string[] | null;
+  /** The exchange's own per-fill trade id(s) backing confirmedEntryFillOrderIds, when the exchange
+   *  reported one (LiveIntent.confirmedEntryFills[].tradeId). May be `[]` when confirmed fills exist
+   *  but none carried a trade id; `null` only when there are no confirmed entry fills at all. */
+  confirmedEntryTradeIds?: readonly string[] | null;
 }
 
 export type ExecutiveReviewTier = "TIER_1_REAL" | "TIER_2_COUNTERFACTUAL";
@@ -442,6 +458,8 @@ export class ExecutiveReviewStore {
       settlementResolvedAtMs: outcome.settlementResolvedAtMs ?? null,
       actualEntryPrice: outcome.actualEntryPrice ?? null,
       entryFillOrderIds: outcome.entryFillOrderIds ?? null,
+      confirmedEntryFillOrderIds: outcome.confirmedEntryFillOrderIds ?? null,
+      confirmedEntryTradeIds: outcome.confirmedEntryTradeIds ?? null,
     };
     if (!eligibleTier1ExecutiveReview(tier1)) return this.reject(review, "NET_R_INVALID");
     review.state = "TIER1_ELIGIBLE";

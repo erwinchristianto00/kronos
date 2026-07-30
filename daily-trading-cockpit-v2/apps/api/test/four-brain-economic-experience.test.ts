@@ -159,6 +159,8 @@ function validOutcome(overrides: Partial<ExecutiveReviewOutcome> = {}): Executiv
     decidedInitialStop: 64_000,
     entryFilledAtMs: entryAtMs,
     entryFillOrderIds: ["order-1"],
+    confirmedEntryFillOrderIds: ["order-1"],
+    confirmedEntryTradeIds: ["trade-1"],
     actualEntryPrice: 65_010,
     marketClosedAtMs: resolvedAtMs,
     settlementResolvedAtMs: resolvedAtMs,
@@ -482,7 +484,7 @@ describe("Four-Brain economic experience adapter (hardened)", () => {
     });
 
     it("Entry ledger with no actual fill order id (wrong/missing fill ID) is not directly eligible", () => {
-      const result = run(validOutcome({ entryFillOrderIds: null }));
+      const result = run(validOutcome({ confirmedEntryFillOrderIds: null }));
       const byBrain = new Map(result.experiences.map((e) => [e.brain, e]));
       expect(byBrain.get("ENTRY")!.attributionEligibility).toBe("EVALUATION_ONLY");
       expect(byBrain.get("ENTRY")!.evaluationOnlyReasons).toContain("BRAIN_DECISION_INEXACT");
@@ -509,21 +511,34 @@ describe("Four-Brain economic experience adapter (hardened)", () => {
     });
 
     it("Entry accepts when the exact exchange entry order id IS a member of the confirmed fill order ids", () => {
-      // orderId ("order-1") is explicitly included in entryFillOrderIds — the exact chain the adapter
-      // must verify, not merely "some fills exist".
-      const result = run(validOutcome({ orderId: "order-1", entryFillOrderIds: ["order-0", "order-1", "order-2"] }));
+      // orderId ("order-1") is explicitly included in confirmedEntryFillOrderIds — the exact chain the
+      // adapter must verify, not merely "some fills exist". The legacy entryFillOrderIds field is
+      // deliberately left wider here (it may include acknowledged-but-unfilled ids too) to prove the
+      // adapter reads the confirmed field, not the legacy one.
+      const result = run(validOutcome({ orderId: "order-1", confirmedEntryFillOrderIds: ["order-0", "order-1", "order-2"] }));
       const byBrain = new Map(result.experiences.map((e) => [e.brain, e]));
       expect(byBrain.get("ENTRY")!.attributionEligibility).toBe("DIRECT_LEARNING_ELIGIBLE");
     });
 
     it("Entry rejects when confirmed fills exist but belong to a DIFFERENT order than this outcome's own exact entry order", () => {
-      // entryFillOrderIds is non-empty (a naive "length > 0" check would wrongly pass this), but it
-      // never contains outcome.orderId ("order-1") — these are confirmed fills for some OTHER order,
-      // not proof this specific position's entry order ever filled.
-      const result = run(validOutcome({ orderId: "order-1", entryFillOrderIds: ["order-999"] }));
+      // confirmedEntryFillOrderIds is non-empty (a naive "length > 0" check would wrongly pass this),
+      // but it never contains outcome.orderId ("order-1") — these are confirmed fills for some OTHER
+      // order (e.g. a rescue/replacement order that filled instead), not proof this specific position's
+      // own entry order ever filled.
+      const result = run(validOutcome({ orderId: "order-1", confirmedEntryFillOrderIds: ["order-999"] }));
       const byBrain = new Map(result.experiences.map((e) => [e.brain, e]));
       expect(byBrain.get("ENTRY")!.attributionEligibility).toBe("EVALUATION_ONLY");
       expect(byBrain.get("ENTRY")!.evaluationOnlyReasons).toContain("BRAIN_DECISION_INEXACT");
+    });
+
+    it("Market State and Direction stay DIRECT_LEARNING_ELIGIBLE when Entry alone fails on confirmed-fill identity", () => {
+      // Entry-specific fill-ID failure must not leak into the other two brains' own, independent
+      // eligibility checks — each brain's check function reads only its own decision object.
+      const result = run(validOutcome({ confirmedEntryFillOrderIds: null }));
+      const byBrain = new Map(result.experiences.map((e) => [e.brain, e]));
+      expect(byBrain.get("ENTRY")!.attributionEligibility).toBe("EVALUATION_ONLY");
+      expect(byBrain.get("MARKET_STATE")!.attributionEligibility).toBe("DIRECT_LEARNING_ELIGIBLE");
+      expect(byBrain.get("DIRECTION")!.attributionEligibility).toBe("DIRECT_LEARNING_ELIGIBLE");
     });
 
     it("Entry rejects when the outcome has no exact exchange entry order id of its own, even if confirmed fills exist elsewhere", () => {

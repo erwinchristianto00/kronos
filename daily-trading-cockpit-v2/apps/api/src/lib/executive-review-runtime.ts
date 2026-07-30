@@ -4,6 +4,7 @@
  */
 import type { LiveIntent } from "./live-execution-engine.js";
 import type { PaperOrder } from "./paper-execution-router.js";
+import type { ExecutionFill } from "./execution-fill-recorder.js";
 import {
   type ExecutiveReviewExecutionLink,
   type ExecutiveReviewOutcomeLink,
@@ -11,6 +12,15 @@ import {
   type ExecutiveReviewReasonCode,
   ExecutiveReviewStore,
 } from "./executive-review-store.js";
+
+/** Deterministic quantity-weighted average price across real confirmed fills. `null` when there is
+ *  nothing to weight (empty input or zero total quantity) — never a fabricated price. */
+function weightedAverageEntryPrice(fills: readonly ExecutionFill[]): number | null {
+  const totalQty = fills.reduce((sum, f) => sum + f.qty, 0);
+  if (!(totalQty > 0)) return null;
+  const totalNotional = fills.reduce((sum, f) => sum + f.price * f.qty, 0);
+  return totalNotional / totalQty;
+}
 
 export interface ExecutiveReviewResolutionSummary {
   examined: number;
@@ -103,6 +113,19 @@ function outcomeLink(
   const netR = canCalculateR ? netUsd / risk : null;
   const costR = canCalculateR ? feesUsd / risk : null;
   const grossR = canCalculateR && netR !== null && costR !== null ? netR + costR : null;
+  // Real per-trade fill evidence only (see LiveIntent.confirmedEntryFills) — never derived from
+  // acknowledged/submitted order ids and never fabricated when no confirmed fill exists yet.
+  const confirmedFills = intent.confirmedEntryFills ?? [];
+  const confirmedEntryFillOrderIds = confirmedFills.length > 0
+    ? [...new Set(confirmedFills.map((f) => f.orderId))]
+    : null;
+  const confirmedEntryTradeIds = confirmedFills.length > 0
+    ? [...new Set(confirmedFills.map((f) => f.tradeId).filter((id): id is string => typeof id === "string" && id.length > 0))]
+    : null;
+  const confirmedEntryFilledAtMs = confirmedFills.length > 0
+    ? Math.min(...confirmedFills.map((f) => f.time))
+    : null;
+  const confirmedActualEntryPrice = weightedAverageEntryPrice(confirmedFills);
   return {
     executiveReviewId: link.executiveReviewId,
     opportunityId: link.opportunityId,
@@ -128,19 +151,31 @@ function outcomeLink(
     missingRequiredOrderIds: intent.missingRequiredOrderIds?.slice() ?? [],
     // One dedicated field per clock — none of these substitutes for another, and each is null (not
     // backfilled from a different clock) when the exact source is unavailable.
-    entryFilledAtMs: dateOrNull(intent.entryFilledAt),
+    // confirmedEntryFills is real per-trade evidence (/userTrades rows matched to the singular,
+    // never-reassigned entryOrderId — see live-execution-engine.ts). It is preferred over every
+    // legacy derivation below; those remain only for records that predate this field.
+    entryFilledAtMs: confirmedEntryFilledAtMs ?? dateOrNull(intent.entryFilledAt),
     marketClosedAtMs: Number.isFinite(closedAtMs) ? closedAtMs : null,
     settlementResolvedAtMs: dateOrNull(intent.settlementResolvedAt),
-    actualEntryPrice: typeof intent.filledEntryPrice === "number" && Number.isFinite(intent.filledEntryPrice) ? intent.filledEntryPrice : null,
-    // Confirmed-fill identity ONLY — never the generic submitted/ack'd order id standing in as proof
-    // of a fill. entryOrderId/entryOrderIds are stamped at EXCHANGE_ACK (order placement), BEFORE the
-    // fill itself is confirmed; entryPriceConfirmed is the one field that actually asserts a real
-    // (non-fallback) fill was established, possibly across more than one partial/rescue fill. When
-    // unconfirmed, this is null — the submitted id is available separately via Outcome.orderId for
-    // diagnostics, never smuggled in here as if it proved a fill.
+    actualEntryPrice: confirmedActualEntryPrice ?? (
+      intent.entryPriceConfirmed === true &&
+        typeof intent.filledEntryPrice === "number" && Number.isFinite(intent.filledEntryPrice)
+        ? intent.filledEntryPrice
+        : null
+    ),
+    // LEGACY/COMPATIBILITY ONLY. entryOrderId/entryOrderIds are stamped at EXCHANGE_ACK (order
+    // placement), BEFORE any fill is confirmed — this field never proves a fill happened, only that
+    // entryPriceConfirmed was true when some order id was already on the intent. Direct-learning
+    // eligibility must use confirmedEntryFillOrderIds instead; this stays only for older records and
+    // diagnostics.
     entryFillOrderIds: intent.entryPriceConfirmed === true
       ? (intent.entryOrderIds?.length ? intent.entryOrderIds.slice() : intent.entryOrderId ? [intent.entryOrderId] : null)
       : null,
+    // Exact confirmed-fill identity: order ids and trade ids that come ONLY from real per-trade
+    // exchange records (LiveIntent.confirmedEntryFills), never from acknowledgment/submission alone.
+    // null (not []) when no confirmed fill evidence exists yet.
+    confirmedEntryFillOrderIds,
+    confirmedEntryTradeIds,
   };
 }
 

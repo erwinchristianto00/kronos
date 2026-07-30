@@ -104,6 +104,8 @@ function outcome(dayIndex: number, netR: number, laneId = "CG_WIDE_FAST_LONG"): 
     decidedInitialStop: 64_000,
     entryFilledAtMs: entryAtMs,
     entryFillOrderIds: [`order-${dayIndex}`],
+    confirmedEntryFillOrderIds: [`order-${dayIndex}`],
+    confirmedEntryTradeIds: [`trade-${dayIndex}`],
     actualEntryPrice: 65_000,
     marketClosedAtMs: resolvedAtMs,
     settlementResolvedAtMs: resolvedAtMs,

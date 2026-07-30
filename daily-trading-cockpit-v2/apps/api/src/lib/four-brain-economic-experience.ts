@@ -186,7 +186,12 @@ function entryCheck(outcome: ExecutiveReviewOutcome, outcomeDirection: "LONG" | 
     outcome.decidedInitialStop === decision.initialStopPrice &&
     !!outcome.paperOrderId &&
     !!outcome.orderId &&
-    Array.isArray(outcome.entryFillOrderIds) && outcome.entryFillOrderIds.includes(outcome.orderId) &&
+    // Confirmed-filled, not merely acknowledged/submitted: entryFillOrderIds (legacy) is populated at
+    // exchange ack, before any fill is confirmed, and must never gate this. confirmedEntryFillOrderIds
+    // comes only from real per-trade fill records (see LiveIntent.confirmedEntryFills), so a rescue or
+    // replacement order that never filled cannot satisfy this even if it is still on the intent.
+    Array.isArray(outcome.confirmedEntryFillOrderIds) && outcome.confirmedEntryFillOrderIds.length > 0 &&
+    outcome.confirmedEntryFillOrderIds.includes(outcome.orderId) &&
     outcome.entryFilledAtMs != null &&
     typeof outcome.actualEntryPrice === "number" && Number.isFinite(outcome.actualEntryPrice);
   if (!decisionShapeValid || !exactChainLinked) return { present: true, exact: false, reasons: ["BRAIN_DECISION_INEXACT"] };

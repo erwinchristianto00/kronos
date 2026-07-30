@@ -561,7 +561,76 @@ describe("Executive Review Store", () => {
         sourcePaperOrders: [{ paperOrderId: "paper-1", laneId: "LANE", qty: 1, executiveReviewLink: link }],
       } as LiveIntent;
       expect(resolveExecutiveReviewPositions(store, [closed], 900_000).linked).toBe(1);
-      expect(store.get().tier1[0]?.entryFillOrderIds).toBeNull();
+      const tier1 = store.get().tier1[0];
+      expect(tier1?.entryFillOrderIds).toBeNull();
+      // Legacy intent: no confirmedEntryFills field at all. The new exact fields must read null —
+      // never inherited from the legacy entryOrderId/entryOrderIds, and never [] (which would wrongly
+      // imply "confirmed empty" rather than "no confirmed-fill evidence exists for this record").
+      expect(tier1?.confirmedEntryFillOrderIds).toBeNull();
+      expect(tier1?.confirmedEntryTradeIds).toBeNull();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("derives actualEntryPrice as a quantity-weighted average across multiple confirmed entry fills, and entryFilledAtMs as the earliest of them", () => {
+    const dir = mkdtempSync(join(tmpdir(), "executive-review-"));
+    try {
+      const store = new ExecutiveReviewStore(join(dir, "reviews.json"));
+      const record = review();
+      expect(store.addReview(record)).toBe(true);
+      const link = {
+        executiveReviewId: record.executiveReviewId,
+        candidateId: record.candidateId,
+        opportunityId: record.opportunityId,
+        laneId: record.laneId,
+        marketContextSnapshotId: record.marketContextSnapshotId,
+        allocationSnapshotId: record.allocationSnapshotId,
+        direction: record.direction,
+        marketState: record.marketState,
+        evidenceEra: record.evidenceEra,
+        decisionPipelinePolicyVersion: record.decisionPipelinePolicyVersion,
+        executionPolicyVersion: record.executionPolicyVersion,
+        evidencePolicyVersion: record.evidencePolicyVersion,
+        fourBrainPolicyVersion: record.fourBrainPolicyVersion,
+      };
+      const closed = {
+        paperOrderId: "paper-1",
+        executionIntentId: "intent-1",
+        positionId: "position-1",
+        entryOrderId: "order-1",
+        createdAt: new Date(110).toISOString(),
+        // Legacy fallback fields are deliberately present but WRONG (999, 999) — proving the adapter
+        // prefers confirmedEntryFills over them, rather than merely "also using" one or the other.
+        entryFilledAt: new Date(999).toISOString(),
+        filledEntryPrice: 999,
+        entryPriceConfirmed: true,
+        confirmedEntryFills: [
+          { orderId: "order-1", tradeId: "trade-2", symbol: "ETHUSDT", role: "ENTRY", price: 105, qty: 2, commission: 0.1, commissionAsset: "USDT", realizedPnl: 0, time: 300, maker: false },
+          { orderId: "order-1", tradeId: "trade-1", symbol: "ETHUSDT", role: "ENTRY", price: 100, qty: 1, commission: 0.05, commissionAsset: "USDT", realizedPnl: 0, time: 200, maker: true },
+        ],
+        closedAt: new Date(1_000).toISOString(),
+        state: "CLOSED",
+        originalRiskUsd: 10,
+        effectiveRiskUsd: 10,
+        realizedPnlUsd: 2,
+        feesUsd: 0,
+        feeSource: "EXCHANGE",
+        settlementFetchComplete: true,
+        requiredOrderIds: ["order-1", "exit-1"],
+        matchedRequiredOrderIds: ["order-1", "exit-1"],
+        missingRequiredOrderIds: [],
+        executiveReviewLink: link,
+        sourcePaperOrders: [{ paperOrderId: "paper-1", laneId: "LANE", qty: 1, executiveReviewLink: link }],
+      } as LiveIntent;
+      expect(resolveExecutiveReviewPositions(store, [closed], 900_000).linked).toBe(1);
+      const tier1 = store.get().tier1[0];
+      // Earliest confirmed fill (200ms), NOT entryFilledAt (999ms) and NOT createdAt (110ms).
+      expect(tier1?.entryFilledAtMs).toBe(200);
+      // Quantity-weighted: (100*1 + 105*2) / 3 = 103.333..., NOT filledEntryPrice (999).
+      expect(tier1?.actualEntryPrice).toBeCloseTo((100 * 1 + 105 * 2) / 3, 9);
+      expect(tier1?.confirmedEntryFillOrderIds).toEqual(["order-1"]);
+      expect(new Set(tier1?.confirmedEntryTradeIds ?? [])).toEqual(new Set(["trade-1", "trade-2"]));
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
