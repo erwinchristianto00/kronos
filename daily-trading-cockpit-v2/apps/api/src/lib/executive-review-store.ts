@@ -138,7 +138,11 @@ export interface ExecutiveReviewPositionLink {
   positionId: string | null;
   laneId: string | null;
   marketContextSnapshotId: string | null;
+  /** Legacy name/meaning: intent-CREATION time (LiveIntent.createdAt). Never the exact open clock
+   *  for direct economic eligibility — see FourBrainEntryResolution.entryFilledAtMs. */
   entryAtMs: number | null;
+  /** Honestly-named duplicate of the same intent.createdAt value carried above as entryAtMs. */
+  intentCreatedAtMs: number | null;
   originalRisk: number | null;
   ambiguousOwnership: boolean;
   decisionPipelinePolicyVersion: string | null;
@@ -192,7 +196,13 @@ export interface ExecutiveReviewOutcome extends FourBrainExecutiveIdentity, Four
   advisoryVerdict: ExecutiveVerdict;
   incumbentAction: ExecutiveIncumbentAction;
   advisoryOnly: true;
+  /** Legacy name/meaning: intent-CREATION time. Never the exact open clock for direct economic
+   *  eligibility — the Four-Brain adapter must use entryFilledAtMs (FourBrainEntryResolution). */
   entryAtMs: number;
+  /** Honestly-named duplicate of the same value as entryAtMs, for any reader that wants "intent
+   *  creation time" without inheriting entryAtMs's misleading name. Absent on outcomes resolved
+   *  before this field existed. */
+  intentCreatedAtMs?: number | null;
   resolvedAtMs: number;
   originalRisk: number;
   grossR: number;
@@ -390,6 +400,7 @@ export class ExecutiveReviewStore {
       incumbentAction: "ENTERED",
       advisoryOnly: true,
       entryAtMs: position.entryAtMs!,
+      intentCreatedAtMs: position.intentCreatedAtMs ?? null,
       resolvedAtMs: outcome.resolvedAtMs!,
       originalRisk: position.originalRisk!,
       grossR: outcome.grossR!,

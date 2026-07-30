@@ -516,6 +516,57 @@ describe("Executive Review Store", () => {
     }
   });
 
+  it("a generic submitted (but unconfirmed) entry order id never masquerades as a confirmed fill id", () => {
+    const dir = mkdtempSync(join(tmpdir(), "executive-review-"));
+    try {
+      const store = new ExecutiveReviewStore(join(dir, "reviews.json"));
+      const record = review();
+      expect(store.addReview(record)).toBe(true);
+      const link = {
+        executiveReviewId: record.executiveReviewId,
+        candidateId: record.candidateId,
+        opportunityId: record.opportunityId,
+        laneId: record.laneId,
+        marketContextSnapshotId: record.marketContextSnapshotId,
+        allocationSnapshotId: record.allocationSnapshotId,
+        direction: record.direction,
+        marketState: record.marketState,
+        evidenceEra: record.evidenceEra,
+        decisionPipelinePolicyVersion: record.decisionPipelinePolicyVersion,
+        executionPolicyVersion: record.executionPolicyVersion,
+        evidencePolicyVersion: record.evidencePolicyVersion,
+        fourBrainPolicyVersion: record.fourBrainPolicyVersion,
+      };
+      const closed = {
+        paperOrderId: "paper-1",
+        executionIntentId: "intent-1",
+        positionId: "position-1",
+        entryOrderId: "order-1", // stamped at EXCHANGE_ACK, before fill confirmation
+        entryOrderIds: ["order-1"],
+        entryPriceConfirmed: false, // the fill itself was never confirmed (e.g. avgPrice=0 fallback)
+        createdAt: new Date(110).toISOString(),
+        entryFilledAt: new Date(500).toISOString(),
+        closedAt: new Date(1_000).toISOString(),
+        state: "CLOSED",
+        originalRiskUsd: 10,
+        effectiveRiskUsd: 10,
+        realizedPnlUsd: 2,
+        feesUsd: 0,
+        feeSource: "EXCHANGE",
+        settlementFetchComplete: true,
+        requiredOrderIds: ["order-1", "exit-1"],
+        matchedRequiredOrderIds: ["order-1", "exit-1"],
+        missingRequiredOrderIds: [],
+        executiveReviewLink: link,
+        sourcePaperOrders: [{ paperOrderId: "paper-1", laneId: "LANE", qty: 1, executiveReviewLink: link }],
+      } as LiveIntent;
+      expect(resolveExecutiveReviewPositions(store, [closed], 900_000).linked).toBe(1);
+      expect(store.get().tier1[0]?.entryFillOrderIds).toBeNull();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("keeps marketClosedAtMs (exchange close) and settlementResolvedAtMs (settlement completeness) as independent, possibly-differing clocks", () => {
     const dir = mkdtempSync(join(tmpdir(), "executive-review-"));
     try {

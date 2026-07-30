@@ -274,17 +274,29 @@ describe("Four-Brain economic experience adapter (hardened)", () => {
       expect(result.experiences[0]!.attributionEligibility).toBe("DIRECT_LEARNING_ELIGIBLE");
     });
 
-    it("a missing exact close time caps eligibility at EVALUATION_ONLY rather than silently substituting resolvedAtMs", () => {
-      const outcome = validOutcome({ exactCloseTimeMs: null });
+    it("a missing exact market-close time caps eligibility at EVALUATION_ONLY rather than silently substituting resolvedAtMs", () => {
+      const outcome = validOutcome({ marketClosedAtMs: null });
       const result = run(outcome);
       expect(result.experiences.length).toBeGreaterThan(0);
       for (const experience of result.experiences) {
         expect(experience.attributionEligibility).toBe("EVALUATION_ONLY");
-        expect(experience.evaluationOnlyReasons).toContain("MISSING_EXACT_CLOSE_TIME");
+        expect(experience.evaluationOnlyReasons).toContain("MISSING_MARKET_CLOSE_TIME");
         // The economic class is still computed from a best-effort clock (never thrown away)...
         expect(experience.economicClass).not.toBe("INVALID");
         // ...but that best-effort value is never claimed to be the exact close time.
         expect(experience.closedTimeMs).toBe(outcome.resolvedAtMs);
+      }
+    });
+
+    it("exactCloseTimeMs is a backward-compatible alias only — it is never consulted to establish new-record eligibility", () => {
+      // marketClosedAtMs is present (so the record is NOT capped on that basis); exactCloseTimeMs is
+      // absent. If the adapter still read the legacy alias for eligibility, this would be unaffected
+      // either way — the point is that marketClosedAtMs alone is sufficient, and exactCloseTimeMs is
+      // simply not part of the direct-learning determination for new records.
+      const result = run(validOutcome({ exactCloseTimeMs: null }));
+      for (const experience of result.experiences) {
+        expect(experience.attributionEligibility).toBe("DIRECT_LEARNING_ELIGIBLE");
+        expect(experience.closedTimeMs).toBe(validOutcome().marketClosedAtMs);
       }
     });
 
@@ -315,6 +327,69 @@ describe("Four-Brain economic experience adapter (hardened)", () => {
         expect(experience.attributionEligibility).toBe("EVALUATION_ONLY");
         expect(experience.evaluationOnlyReasons).toContain("MISSING_SETTLEMENT_RESOLUTION_TIME");
       }
+    });
+
+    it("openedTimeMs uses the exact entry-fill clock, never intent-creation time, when the two differ", () => {
+      // entryAtMs (intent creation, T1) and entryFilledAtMs (confirmed fill, T2) are deliberately
+      // different instants — openedTimeMs must reflect T2, never T1.
+      const t1 = DEPLOY_MS + DAY_MS; // intent created
+      const t2 = t1 + 45_000; // filled 45s later
+      const outcome = validOutcome({ entryAtMs: t1, entryFilledAtMs: t2, marketClosedAtMs: t2 + 60_000, settlementResolvedAtMs: t2 + 60_000, resolvedAtMs: t2 + 60_000 });
+      const result = run(outcome);
+      for (const experience of result.experiences) {
+        expect(experience.openedTimeMs).toBe(t2);
+        expect(experience.openedTimeMs).not.toBe(t1);
+      }
+    });
+
+    it("a pre-cutover intent whose confirmed fill lands after cutover is judged by the fill, not the intent (post-cutover cohort)", () => {
+      // The intent was created (entryAtMs) BEFORE cutover, but the exact confirmed fill happened
+      // AFTER it — and the decision itself was also made after cutover. This must NOT be rejected as
+      // PRE_CUTOVER: what matters for cohort membership is the exact decision/fill clocks, never the
+      // informal intent-creation timestamp.
+      const preCutoverIntentMs = DEPLOY_MS - DAY_MS;
+      const postCutoverDecisionMs = DEPLOY_MS + 60_000;
+      const postCutoverFillMs = postCutoverDecisionMs + 30_000;
+      const outcome = validOutcome({
+        entryAtMs: preCutoverIntentMs,
+        executiveDecisionTimeMs: postCutoverDecisionMs,
+        entryFilledAtMs: postCutoverFillMs,
+        marketClosedAtMs: postCutoverFillMs + 60_000,
+        settlementResolvedAtMs: postCutoverFillMs + 60_000,
+        resolvedAtMs: postCutoverFillMs + 60_000,
+      });
+      const result = run(outcome);
+      expect(result.rejected.PRE_CUTOVER).toBe(0);
+      expect(result.experiences.length).toBeGreaterThan(0);
+      for (const experience of result.experiences) expect(experience.attributionEligibility).toBe("DIRECT_LEARNING_ELIGIBLE");
+    });
+
+    it("missing entry-fill time caps ALL THREE brains at EVALUATION_ONLY, not just Entry", () => {
+      const result = run(validOutcome({ entryFilledAtMs: null }));
+      const byBrain = new Map(result.experiences.map((e) => [e.brain, e]));
+      for (const brain of ["MARKET_STATE", "DIRECTION", "ENTRY"] as const) {
+        expect(byBrain.get(brain)!.attributionEligibility).toBe("EVALUATION_ONLY");
+        expect(byBrain.get(brain)!.evaluationOnlyReasons).toContain("MISSING_ENTRY_FILL_TIME");
+      }
+    });
+
+    it("a present but non-monotonic exact-clock chain (close before fill) is hard-rejected as INVALID_OUTCOME_QUALITY", () => {
+      // All four clocks are present, but marketClosedAtMs is BEFORE entryFilledAtMs — a genuine
+      // outcome-quality defect, not merely an absent clock, so this must hard-reject, not soft-cap.
+      const outcome = validOutcome({
+        entryFilledAtMs: validOutcome().marketClosedAtMs! + 60_000,
+      });
+      const result = run(outcome);
+      expect(result.experiences).toHaveLength(0);
+      expect(result.rejected.INVALID_OUTCOME_QUALITY).toBe(1);
+    });
+
+    it("equal timestamps across the exact-clock chain are valid (instant settlement resolution at close)", () => {
+      const t = validOutcome().entryFilledAtMs!;
+      const outcome = validOutcome({ entryFilledAtMs: t, marketClosedAtMs: t, settlementResolvedAtMs: t, resolvedAtMs: t });
+      const result = run(outcome);
+      expect(result.rejected.INVALID_OUTCOME_QUALITY).toBe(0);
+      for (const experience of result.experiences) expect(experience.attributionEligibility).toBe("DIRECT_LEARNING_ELIGIBLE");
     });
   });
 
@@ -431,6 +506,53 @@ describe("Four-Brain economic experience adapter (hardened)", () => {
       const result = run(validOutcome({ actualEntryPrice: 65_250 })); // well away from decidedTargetEntry: 65_000
       const byBrain = new Map(result.experiences.map((e) => [e.brain, e]));
       expect(byBrain.get("ENTRY")!.attributionEligibility).toBe("DIRECT_LEARNING_ELIGIBLE");
+    });
+
+    it("Entry accepts when the exact exchange entry order id IS a member of the confirmed fill order ids", () => {
+      // orderId ("order-1") is explicitly included in entryFillOrderIds — the exact chain the adapter
+      // must verify, not merely "some fills exist".
+      const result = run(validOutcome({ orderId: "order-1", entryFillOrderIds: ["order-0", "order-1", "order-2"] }));
+      const byBrain = new Map(result.experiences.map((e) => [e.brain, e]));
+      expect(byBrain.get("ENTRY")!.attributionEligibility).toBe("DIRECT_LEARNING_ELIGIBLE");
+    });
+
+    it("Entry rejects when confirmed fills exist but belong to a DIFFERENT order than this outcome's own exact entry order", () => {
+      // entryFillOrderIds is non-empty (a naive "length > 0" check would wrongly pass this), but it
+      // never contains outcome.orderId ("order-1") — these are confirmed fills for some OTHER order,
+      // not proof this specific position's entry order ever filled.
+      const result = run(validOutcome({ orderId: "order-1", entryFillOrderIds: ["order-999"] }));
+      const byBrain = new Map(result.experiences.map((e) => [e.brain, e]));
+      expect(byBrain.get("ENTRY")!.attributionEligibility).toBe("EVALUATION_ONLY");
+      expect(byBrain.get("ENTRY")!.evaluationOnlyReasons).toContain("BRAIN_DECISION_INEXACT");
+    });
+
+    it("Entry rejects when the outcome has no exact exchange entry order id of its own, even if confirmed fills exist elsewhere", () => {
+      const result = run(validOutcome({ orderId: null }));
+      const byBrain = new Map(result.experiences.map((e) => [e.brain, e]));
+      expect(byBrain.get("ENTRY")!.attributionEligibility).toBe("EVALUATION_ONLY");
+      expect(byBrain.get("ENTRY")!.evaluationOnlyReasons).toContain("BRAIN_DECISION_INEXACT");
+    });
+
+    it("Entry rejects when the persisted decidedTargetEntry differs from the immutable nested Entry snapshot's own targetEntry", () => {
+      // decidedTargetEntry independently looks finite/plausible, but no longer matches decision.targetEntry.
+      const result = run(validOutcome({ decidedTargetEntry: 66_000 })); // entryDecision().targetEntry stays 65_000
+      const byBrain = new Map(result.experiences.map((e) => [e.brain, e]));
+      expect(byBrain.get("ENTRY")!.attributionEligibility).toBe("EVALUATION_ONLY");
+      expect(byBrain.get("ENTRY")!.evaluationOnlyReasons).toContain("BRAIN_DECISION_INEXACT");
+    });
+
+    it("Entry rejects when the persisted decidedInitialStop differs from the immutable nested Entry snapshot's own initialStopPrice", () => {
+      const result = run(validOutcome({ decidedInitialStop: 63_500 })); // entryDecision().initialStopPrice stays 64_000
+      const byBrain = new Map(result.experiences.map((e) => [e.brain, e]));
+      expect(byBrain.get("ENTRY")!.attributionEligibility).toBe("EVALUATION_ONLY");
+      expect(byBrain.get("ENTRY")!.evaluationOnlyReasons).toContain("BRAIN_DECISION_INEXACT");
+    });
+
+    it("Entry rejects when the persisted decidedSide differs from the immutable nested Entry snapshot's own side", () => {
+      const result = run(validOutcome({ decidedSide: "SHORT" })); // entryDecision().side stays LONG; outcome.direction stays LONG
+      const byBrain = new Map(result.experiences.map((e) => [e.brain, e]));
+      expect(byBrain.get("ENTRY")!.attributionEligibility).toBe("EVALUATION_ONLY");
+      expect(byBrain.get("ENTRY")!.evaluationOnlyReasons).toContain("BRAIN_DECISION_INEXACT");
     });
 
     it("when the outcome itself fails a hard gate, no brain gets any experience at all", () => {

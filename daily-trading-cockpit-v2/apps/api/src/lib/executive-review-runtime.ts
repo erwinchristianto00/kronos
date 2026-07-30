@@ -59,7 +59,13 @@ function positionLink(
     positionId: intent.positionId,
     laneId: link.laneId,
     marketContextSnapshotId: link.marketContextSnapshotId,
+    // Legacy name, legacy meaning: intent-CREATION time, kept for backward compatibility and the
+    // store's own structural sanity gate. Never the exact open clock for direct economic eligibility
+    // — that is entryFilledAtMs below, sourced only from a confirmed fill.
     entryAtMs: Number.isFinite(entryAtMs) ? entryAtMs : null,
+    // Honestly-named duplicate of the same intent.createdAt value, for any future reader that wants
+    // "when was the intent created" without inheriting entryAtMs's misleading name.
+    intentCreatedAtMs: Number.isFinite(entryAtMs) ? entryAtMs : null,
     originalRisk: intent.originalRiskUsd ?? null,
     ambiguousOwnership,
     decisionPipelinePolicyVersion: link.decisionPipelinePolicyVersion,
@@ -126,7 +132,15 @@ function outcomeLink(
     marketClosedAtMs: Number.isFinite(closedAtMs) ? closedAtMs : null,
     settlementResolvedAtMs: dateOrNull(intent.settlementResolvedAt),
     actualEntryPrice: typeof intent.filledEntryPrice === "number" && Number.isFinite(intent.filledEntryPrice) ? intent.filledEntryPrice : null,
-    entryFillOrderIds: intent.entryOrderIds?.length ? intent.entryOrderIds.slice() : intent.entryOrderId ? [intent.entryOrderId] : null,
+    // Confirmed-fill identity ONLY — never the generic submitted/ack'd order id standing in as proof
+    // of a fill. entryOrderId/entryOrderIds are stamped at EXCHANGE_ACK (order placement), BEFORE the
+    // fill itself is confirmed; entryPriceConfirmed is the one field that actually asserts a real
+    // (non-fallback) fill was established, possibly across more than one partial/rescue fill. When
+    // unconfirmed, this is null — the submitted id is available separately via Outcome.orderId for
+    // diagnostics, never smuggled in here as if it proved a fill.
+    entryFillOrderIds: intent.entryPriceConfirmed === true
+      ? (intent.entryOrderIds?.length ? intent.entryOrderIds.slice() : intent.entryOrderId ? [intent.entryOrderId] : null)
+      : null,
   };
 }
 

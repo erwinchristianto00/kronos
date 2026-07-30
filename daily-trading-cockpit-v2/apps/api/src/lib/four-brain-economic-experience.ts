@@ -58,7 +58,8 @@ export type FourBrainEconomicRejectionReason =
 export type FourBrainEvaluationOnlyReason =
   | "LEGACY_UNSTAMPED_RECORD"
   | "MISSING_FEATURE_SNAPSHOT"
-  | "MISSING_EXACT_CLOSE_TIME"
+  | "MISSING_ENTRY_FILL_TIME"
+  | "MISSING_MARKET_CLOSE_TIME"
   | "MISSING_SETTLEMENT_RESOLUTION_TIME"
   | "BRAIN_DECISION_ABSENT"
   | "BRAIN_DECISION_INEXACT";
@@ -160,12 +161,14 @@ function directionCheck(decision: DirectionDecision | null | undefined, outcomeD
 }
 
 /**
- * Entry needs a genuinely exact chain, not just a present decision object: the persisted
- * entryDecisionId must match the snapshot's own decisionId (never stamped from a different tick), a
- * real selected paper order must be identified, the decided side/target/stop must be finite and
- * exact, and the ACTUAL fill (order id(s), fill time, fill price) must all be present — a decision
- * that looks right but was never linked to a real fill stays EVALUATION_ONLY. The decided target
- * price is deliberately never required to equal the actual fill price: both are persisted so a
+ * Entry needs a genuinely exact chain, not just a present decision object and "some fill exists
+ * somewhere": the persisted entryDecisionId must match the snapshot's own decisionId (never stamped
+ * from a different tick), the persisted decided side/target/stop must exactly equal the immutable
+ * nested Entry snapshot (not just independently look plausible), a real selected paper order AND its
+ * exact exchange entry order id must both be identified, that SPECIFIC exact order id must be a
+ * member of the CONFIRMED fill order ids (never merely "the array is non-empty" — a fill belonging to
+ * a different order must not count), and the actual fill price/time must be present. The decided
+ * target price is deliberately never required to equal the actual fill price: both are persisted so a
  * downstream consumer can judge execution slippage itself, not so this gate can reject on it.
  */
 function entryCheck(outcome: ExecutiveReviewOutcome, outcomeDirection: "LONG" | "SHORT" | "FLAT"): BrainCheck {
@@ -178,12 +181,13 @@ function entryCheck(outcome: ExecutiveReviewOutcome, outcomeDirection: "LONG" | 
     Number.isFinite(decision.initialStopPrice);
   const exactChainLinked =
     !!outcome.entryDecisionId && outcome.entryDecisionId === decision.decisionId &&
+    outcome.decidedSide === decision.side &&
+    outcome.decidedTargetEntry === decision.targetEntry &&
+    outcome.decidedInitialStop === decision.initialStopPrice &&
     !!outcome.paperOrderId &&
-    outcome.decidedSide === outcomeDirection &&
-    Number.isFinite(outcome.decidedTargetEntry) &&
-    Number.isFinite(outcome.decidedInitialStop) &&
+    !!outcome.orderId &&
+    Array.isArray(outcome.entryFillOrderIds) && outcome.entryFillOrderIds.includes(outcome.orderId) &&
     outcome.entryFilledAtMs != null &&
-    Array.isArray(outcome.entryFillOrderIds) && outcome.entryFillOrderIds.length > 0 &&
     typeof outcome.actualEntryPrice === "number" && Number.isFinite(outcome.actualEntryPrice);
   if (!decisionShapeValid || !exactChainLinked) return { present: true, exact: false, reasons: ["BRAIN_DECISION_INEXACT"] };
   return { present: true, exact: true, reasons: [] };
@@ -238,26 +242,54 @@ export function buildFourBrainExecutiveExperiences(
       ) { bump(rejected, "STALE_POLICY_CONTEXT"); continue; }
       const deploymentMs = Date.parse(expectedPolicy.policyDeploymentAt);
       if (!Number.isFinite(deploymentMs) || deploymentMs > nowMs) { bump(rejected, "STALE_POLICY_CONTEXT"); continue; }
-      if (outcome.executiveDecisionTimeMs! < deploymentMs || outcome.entryAtMs < deploymentMs) { bump(rejected, "PRE_CUTOVER"); continue; }
+      // The exact entry-FILL clock decides pre-cutover status when it is known — never the intent-
+      // creation clock (entryAtMs/intentCreatedAtMs). When the fill clock is not yet known this term
+      // is simply skipped (never treated as pre-cutover on that basis alone); the record is already
+      // soft-capped below via MISSING_ENTRY_FILL_TIME. A position whose INTENT predates cutover but
+      // whose ACTUAL FILL lands after it is judged by the fill, not the intent.
+      if (
+        outcome.executiveDecisionTimeMs! < deploymentMs ||
+        (outcome.entryFilledAtMs != null && outcome.entryFilledAtMs < deploymentMs)
+      ) { bump(rejected, "PRE_CUTOVER"); continue; }
       // Only after every check above has genuinely passed — never set defensively/optimistically.
     }
     const policyLineageMatches = hasStampedIdentity;
 
     if (!outcome.brainFeatureSnapshot) baseReasons.push("MISSING_FEATURE_SNAPSHOT");
-    if (outcome.exactCloseTimeMs == null) baseReasons.push("MISSING_EXACT_CLOSE_TIME");
+    // Shared by ALL brains, not just Entry: Market State and Direction are credited from the SAME
+    // resolved outcome, so if the trade's own exact lifecycle clocks are unavailable none of the
+    // three can honestly claim to be learning from an exactly-timed, fully-resolved example.
+    if (outcome.entryFilledAtMs == null) baseReasons.push("MISSING_ENTRY_FILL_TIME");
+    if (outcome.marketClosedAtMs == null) baseReasons.push("MISSING_MARKET_CLOSE_TIME");
     // settlementFetchComplete (hard-gated above) proves the COST is exact; it does not prove WHEN
     // settlement completeness was established — a record from before that capture existed can have
     // settlementFetchComplete:true yet no settlementResolvedAtMs. Soft-cap those, never hard-reject:
     // the economics are still usable, only this one clock is unavailable.
     if (outcome.settlementResolvedAtMs == null) baseReasons.push("MISSING_SETTLEMENT_RESOLUTION_TIME");
 
-    // decisionTimeMs/closedTimeMs: the EXACT fields when present; a best-effort proxy only for an
-    // EVALUATION_ONLY record's economic classification — never presented as if it were exact, and
-    // `review.reviewedAtMs` (a field that no longer even exists on this merged outcome type) is never
-    // consulted for either.
+    // Exact clock chain — decision <= fill <= close <= settlement — checked ONLY among clocks that
+    // are ALL present (an absent one is already soft-capped above via the MISSING_* reasons; a
+    // comparison against a missing clock would be meaningless, not a violation). Equal timestamps are
+    // valid. A PRESENT but non-monotonic chain is a genuine outcome-quality defect, hard-rejected —
+    // never merely soft-capped.
+    if (
+      hasStampedIdentity &&
+      outcome.entryFilledAtMs != null && outcome.marketClosedAtMs != null && outcome.settlementResolvedAtMs != null &&
+      (
+        outcome.executiveDecisionTimeMs! > outcome.entryFilledAtMs ||
+        outcome.entryFilledAtMs > outcome.marketClosedAtMs ||
+        outcome.marketClosedAtMs > outcome.settlementResolvedAtMs
+      )
+    ) { bump(rejected, "INVALID_OUTCOME_QUALITY"); continue; }
+
+    // decisionTimeMs/openedTimeMs/closedTimeMs: the EXACT fields when present; a best-effort LEGACY
+    // proxy only for an EVALUATION_ONLY record's economic classification — never presented as exact
+    // and never a basis for DIRECT_LEARNING_ELIGIBLE (that is judged solely by evaluationOnlyReasons
+    // and the hard gates above). entryAtMs/intentCreatedAtMs/resolvedAtMs/exactCloseTimeMs are
+    // legacy/compatibility fields, read here only as this classification fallback.
     const decisionTimeMs = outcome.executiveDecisionTimeMs ?? outcome.entryAtMs;
-    const closedTimeMs = outcome.exactCloseTimeMs ?? outcome.resolvedAtMs;
-    if (decisionTimeMs > outcome.entryAtMs || closedTimeMs < outcome.entryAtMs) { bump(rejected, "INVALID_OUTCOME_QUALITY"); continue; }
+    const openedTimeMs = outcome.entryFilledAtMs ?? outcome.entryAtMs;
+    const closedTimeMs = outcome.marketClosedAtMs ?? outcome.resolvedAtMs;
 
     const base = {
       exactOwnership: true,
@@ -272,7 +304,7 @@ export function buildFourBrainExecutiveExperiences(
       // resolution — so the classic same-bar OHLC ambiguity this flag exists to catch cannot occur here.
       intrabarAmbiguous: false,
       decisionTimeMs,
-      openedTimeMs: outcome.entryAtMs,
+      openedTimeMs,
       closedTimeMs,
     };
     // Every condition classifyTradeEconomic checks other than policyLineageMatches has already been
