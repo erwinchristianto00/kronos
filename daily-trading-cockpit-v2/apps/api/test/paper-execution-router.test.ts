@@ -498,6 +498,44 @@ describe("paper-execution-router", () => {
     flushSpy.mockRestore();
   });
 
+  it("persists only an exact same-opportunity CORTEX snapshot handoff", () => {
+    const dir = tmpDir();
+    const store = new PaperExecutionRouterStore(dir);
+    const now = new Date();
+    const openedAt = new Date(now.getTime() - 60_000).toISOString();
+    store.ensurePaperStartAt(new Date(now.getTime() - 120_000).toISOString());
+    const snapshot = {
+      decisionId: "cortex-decision-1", allocationSnapshotId: "cortex-allocation-1", atMs: now.getTime() - 70_000,
+      laneId: H6_TREND_PAPER_LANE_ID, direction: "LONG" as const, featureSchemaVersion: 1,
+      featureVector: [0.1], regimeFamily: "BULLISH", eligible: true, finalPct: 1, evalFinalPct: 0,
+    };
+    const base = {
+      scanBatchId: "snapshot", direction: "LONG" as const, regime: "Bullish expansion", laneId: H6_TREND_PAPER_LANE_ID,
+      variantId: H6_TREND_PAPER_LANE_ID, controllerMode: "LONG_ONLY", entryPrice: 100, stopLoss: 95,
+      takeProfitLevels: [108], plannedStopDistanceBps: 500, oosUnconfirmed: true,
+      paperRiskLabel: "EXPERIMENTAL" as const, paperOrderMode: "HEADLINE" as const, openedAt,
+      provenance: null, provenanceFieldMissing: [], cortexDecisionSnapshot: snapshot,
+    };
+    const result = admitPaperOpportunities({
+      store,
+      opportunities: [
+        { ...base, sourceCandidateId: "snapshot-exact", symbol: "BTCUSDT", cortexDecisionId: snapshot.decisionId, cortexAllocationSnapshotId: snapshot.allocationSnapshotId },
+        { ...base, sourceCandidateId: "snapshot-wrong-allocation", symbol: "ETHUSDT", cortexDecisionId: snapshot.decisionId, cortexAllocationSnapshotId: "other" },
+        { ...base, sourceCandidateId: "snapshot-wrong-decision", symbol: "SOLUSDT", cortexDecisionId: "other", cortexAllocationSnapshotId: snapshot.allocationSnapshotId },
+        { ...base, sourceCandidateId: "snapshot-wrong-direction", symbol: "XRPUSDT", cortexDecisionSnapshot: { ...snapshot, direction: "SHORT" }, cortexDecisionId: snapshot.decisionId, cortexAllocationSnapshotId: snapshot.allocationSnapshotId },
+        { ...base, sourceCandidateId: "snapshot-prior-cycle", symbol: "BNBUSDT", cortexDecisionSnapshot: { ...snapshot, atMs: now.getTime() - 10 * 60_000 }, cortexDecisionId: snapshot.decisionId, cortexAllocationSnapshotId: snapshot.allocationSnapshotId },
+      ],
+      routerReport: routerOf("Bullish expansion"), gateReport: emptyGate(), now: now.toISOString(),
+    });
+    expect(result.admitted).toBe(5);
+    const orders = store.all.filter((order) => order.sourceCandidateId?.startsWith("snapshot-"));
+    expect(orders.find((order) => order.sourceCandidateId === "snapshot-exact")?.cortexDecisionSnapshot).toMatchObject({ decisionId: snapshot.decisionId, allocationSnapshotId: snapshot.allocationSnapshotId, atMs: snapshot.atMs });
+    expect(orders.find((order) => order.sourceCandidateId === "snapshot-wrong-allocation")?.cortexDecisionSnapshot).toBeUndefined();
+    expect(orders.find((order) => order.sourceCandidateId === "snapshot-wrong-decision")?.cortexDecisionSnapshot).toBeUndefined();
+    expect(orders.find((order) => order.sourceCandidateId === "snapshot-wrong-direction")?.cortexDecisionSnapshot).toBeUndefined();
+    expect(orders.find((order) => order.sourceCandidateId === "snapshot-prior-cycle")?.cortexDecisionSnapshot).toBeUndefined();
+  });
+
   // [10] Bearish SHORT_ONLY + scaleout (headline) eligible
   it("[10] Bearish SHORT_ONLY with eligible scaleout lane admits paper order", async () => {
     const dir = tmpDir();

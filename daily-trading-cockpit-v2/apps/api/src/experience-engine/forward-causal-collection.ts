@@ -86,6 +86,10 @@ export interface ForwardPaperOrderLike {
   policyDeploymentAt?: string | null;
   causalIdentity?: CausalIdentity | null;
   cortexDecisionSnapshot?: CortexDecisionSnapshot | null;
+  /** Producer-side immutable handoff IDs. Legacy/incomplete rows may retain a snapshot for audit,
+   * but cannot turn it into a CORTEX learning identity. */
+  cortexDecisionId?: string | null;
+  cortexAllocationSnapshotId?: string | null;
 }
 
 export interface DecisionSnapshotEvent {
@@ -152,6 +156,7 @@ export type ForwardEvent = DecisionSnapshotEvent | OpportunityOpenEvent | Outcom
 const hash = (parts: readonly (string | number)[]): string =>
   createHash("sha256").update(parts.join("\u001f")).digest("hex").slice(0, 32);
 const finite = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value);
+const CORTEX_SNAPSHOT_MAX_HANDOFF_AGE_MS = 5 * 60_000;
 const openedAtMsOf = (order: ForwardPaperOrderLike): number | null => {
   const value = Date.parse(order.openedAt);
   return Number.isFinite(value) ? value : null;
@@ -163,7 +168,12 @@ const decisionTimeMsOf = (order: ForwardPaperOrderLike): number | null => {
 const originKeyOf = (order: ForwardPaperOrderLike): string => order.sourceCandidateId || order.sourceObservationId;
 const validCortexSnapshot = (order: ForwardPaperOrderLike, openedAtMs: number): CortexDecisionSnapshot | null => {
   const snapshot = order.cortexDecisionSnapshot ?? null;
-  if (!snapshot || snapshot.laneId !== order.selectedLaneId || snapshot.atMs > openedAtMs) return null;
+  if (
+    !snapshot || order.cortexDecisionId !== snapshot.decisionId ||
+    order.cortexAllocationSnapshotId !== snapshot.allocationSnapshotId ||
+    snapshot.laneId !== order.selectedLaneId || snapshot.direction !== order.direction ||
+    snapshot.atMs > openedAtMs || snapshot.atMs < openedAtMs - CORTEX_SNAPSHOT_MAX_HANDOFF_AGE_MS
+  ) return null;
   if (!snapshot.decisionId || !snapshot.allocationSnapshotId || !Number.isInteger(snapshot.featureSchemaVersion)) return null;
   if (!Array.isArray(snapshot.featureVector) || !snapshot.featureVector.length || !snapshot.featureVector.every(finite)) return null;
   return snapshot;
@@ -507,4 +517,29 @@ export function readForwardCausalEvents(file: string): ForwardEvent[] {
     }
   }
   return events;
+}
+
+export type ForwardCausalStrictStatus = "VALID" | "FORWARD_CAUSAL_JOURNAL_CORRUPTED" | "FORWARD_CAUSAL_DUPLICATE_CONFLICT" | "FORWARD_CAUSAL_SCHEMA_MISMATCH";
+export interface ForwardCausalStrictRead { status: ForwardCausalStrictStatus; events: readonly ForwardEvent[]; ignoredTornTail: boolean; malformed: number; duplicates: number; }
+/** Strict operator-only reader. A single malformed unterminated final line is tolerated as a torn
+ * append tail; every other malformed/unknown row blocks learner input. */
+export function readForwardCausalEventsStrict(file: string): ForwardCausalStrictRead {
+  if (!existsSync(file)) return { status: "FORWARD_CAUSAL_JOURNAL_CORRUPTED", events: [], ignoredTornTail: false, malformed: 1, duplicates: 0 };
+  const lines = readFileSync(file, "utf8").split("\n"); const events: ForwardEvent[] = []; const byId = new Map<string, string>();
+  let malformed = 0; let duplicates = 0; let ignoredTornTail = false;
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i]!; if (!line.trim()) continue;
+    let event: ForwardEvent;
+    try { event = JSON.parse(line) as ForwardEvent; } catch {
+      if (i === lines.length - 1) { ignoredTornTail = true; continue; }
+      malformed += 1; continue;
+    }
+    if (!event || typeof event !== "object" || !["DECISION_SNAPSHOT", "OPPORTUNITY_OPEN", "OUTCOME_RESOLUTION"].includes((event as ForwardEvent).eventType) || typeof (event as ForwardEvent).eventId !== "string" || !(event as ForwardEvent).identity?.decisionId || !(event as ForwardEvent).identity?.opportunityId) { malformed += 1; continue; }
+    const canonical = JSON.stringify(event); const existing = byId.get(event.eventId);
+    if (existing && existing !== canonical) { duplicates += 1; continue; }
+    if (!existing) { byId.set(event.eventId, canonical); events.push(event); }
+  }
+  if (duplicates) return { status: "FORWARD_CAUSAL_DUPLICATE_CONFLICT", events: [], ignoredTornTail, malformed, duplicates };
+  if (malformed) return { status: "FORWARD_CAUSAL_JOURNAL_CORRUPTED", events: [], ignoredTornTail, malformed, duplicates };
+  return { status: "VALID", events, ignoredTornTail, malformed, duplicates };
 }

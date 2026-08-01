@@ -35,10 +35,11 @@ function row(index: number, overrides: Partial<ExecutiveReviewOutcome> = {}): { 
   const closedTimeMs = openedTimeMs + 1_000;
   const cortexId = `cortex-${index}`;
   const opportunityId = `opp-${index}`;
-  const outcomeId = `out-${index}`;
+  const outcomeId = `executive-out-${index}`;
+  const paperOutcomeId = `paper-out-${index}`;
   const allocationSnapshotId = `allocation-${index}`;
   const identity = {
-    lineageSchemaVersion: "causal-lineage-1" as const, decisionId: `paper-${index}`, opportunityId, outcomeId,
+    lineageSchemaVersion: "causal-lineage-1" as const, decisionId: `paper-${index}`, opportunityId, outcomeId: null,
     instanceId: policy.instanceId, laneId: "CG_WIDE_FAST_LONG", symbolOrBasketId: index % 3 ? "BTCUSDT" : "ETHUSDT", direction: "LONG" as const,
     featureSchemaVersion: "1", decisionRuleVersion: "rule", attributionRuleVersion: "attr", cortexDecisionId: cortexId,
     allocationSnapshotId, cortexFeatureSchemaVersion: 1, decisionPolicyVersion: policy.decisionPolicyVersion,
@@ -69,6 +70,7 @@ function row(index: number, overrides: Partial<ExecutiveReviewOutcome> = {}): { 
     settlementResolvedAtMs: closedTimeMs + 1_000, exactCloseTimeMs: closedTimeMs,
     ...overrides,
   } as unknown as ExecutiveReviewOutcome;
+  const resolvedIdentity = { ...identity, outcomeId: paperOutcomeId };
   const events = [
     {
       eventType: "DECISION_SNAPSHOT", eventId: `decision-event-${index}`, identity, asOfMs: decisionTimeMs, reportOnly: true,
@@ -82,7 +84,7 @@ function row(index: number, overrides: Partial<ExecutiveReviewOutcome> = {}): { 
     { eventType: "OPPORTUNITY_OPEN", eventId: `open-event-${index}`, identity, decisionId: identity.decisionId, openedAtMs: openedTimeMs, entryPrice: 100, stopDistance: 10, expectedCostAssumptions: { costR: 0.02, feeSlippageR: 0.02, spreadR: 0 }, provenance: { sourceObservationId: `source-${index}`, originKey: `origin-${index}` }, reportOnly: true },
     // Forward causal records use signed costR (gross + negative cost = net); Executive Review uses
     // the canonical positive cost magnitude. Both are exact representations of the same settlement.
-    { eventType: "OUTCOME_RESOLUTION", eventId: `out-event-${index}`, identity, outcomeId, opportunityId, decisionId: identity.decisionId, openedAtMs: openedTimeMs, closedAtMs: closedTimeMs, resolvedAtMs: closedTimeMs + 1_000, grossR: outcome.grossR, costR: -outcome.costR, netR: outcome.netR, exitReason: "TP", intrabarAmbiguous: false, outcomeQuality: "RESOLVED_VALID", directAttribution: "DIRECT_CAUSAL_LINK", reportOnly: true },
+    { eventType: "OUTCOME_RESOLUTION", eventId: `out-event-${index}`, identity: resolvedIdentity, outcomeId: paperOutcomeId, opportunityId, decisionId: identity.decisionId, openedAtMs: openedTimeMs, closedAtMs: closedTimeMs, resolvedAtMs: closedTimeMs + 1_000, grossR: outcome.grossR, costR: -outcome.costR, netR: outcome.netR, exitReason: "TP", intrabarAmbiguous: false, outcomeQuality: "RESOLVED_VALID", directAttribution: "DIRECT_CAUSAL_LINK", reportOnly: true },
   ] as unknown as ForwardEvent[];
   return { outcome, events };
 }
@@ -195,6 +197,34 @@ describe("CORTEX shadow refit learner v1", () => {
     const policyMismatch = dataset(1);
     (policyMismatch.forwardEvents[0] as any).identity.executionPolicyVersion = "wrong-policy";
     expect(buildCortexShadowTrainingDataset({ ...policyMismatch, policy, nowMs: epochMs + 99_999_999 }).rejected.CORTEX_POLICY_LINEAGE_MISMATCH).toBe(1);
+  });
+
+  it("joins one exact economic chain while retaining the independent paper outcome namespace", () => {
+    const input = dataset(1);
+    const forwardOutcome = input.forwardEvents.find((event) => event.eventType === "OUTCOME_RESOLUTION") as any;
+    // Deliberately make the paper economics wildly different. The canonical example must retain
+    // the Executive Review net R, not substitute the paper resolver's accounting.
+    forwardOutcome.grossR = 9; forwardOutcome.costR = -1; forwardOutcome.netR = 8;
+    const accepted = buildCortexShadowTrainingDataset({ ...input, policy, nowMs: epochMs + 99_999_999 });
+    expect(accepted.examples).toHaveLength(1);
+    expect(accepted.examples[0]?.outcomeId).toBe(input.outcomes[0]?.outcomeId);
+    expect(accepted.examples[0]?.netR).toBe(input.outcomes[0]?.netR);
+    expect((input.forwardEvents[0] as any).identity.outcomeId).toBeNull();
+    expect((input.forwardEvents[1] as any).identity.outcomeId).toBeNull();
+    expect(forwardOutcome.outcomeId).not.toBe(input.outcomes[0]?.outcomeId);
+
+    for (const mutate of [
+      (row: any) => { row.opportunityId = "other-opportunity"; },
+      (row: any) => { row.allocationSnapshotId = "other-allocation"; },
+    ]) {
+      const mismatched = dataset(1);
+      mutate(mismatched.outcomes[0]);
+      const rejected = buildCortexShadowTrainingDataset({ ...mismatched, policy, nowMs: epochMs + 99_999_999 });
+      expect(rejected.examples).toHaveLength(0);
+      // The upstream direct-outcome guard may reject first; either way this cannot borrow the
+      // original opportunity/allocation chain through a similarity fallback.
+      expect(Object.values(rejected.rejected).reduce((total, count) => total + count, 0)).toBeGreaterThan(0);
+    }
   });
 
   it("requires the exact lane, symbol, direction, and instance identity rather than a nearest snapshot", () => {

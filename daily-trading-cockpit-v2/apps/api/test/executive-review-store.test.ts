@@ -1,11 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
   ExecutiveReviewStore,
   eligibleTier1ExecutiveReview,
   executiveReviewTier1Aggregates,
+  readExecutiveReviewStoreStrict,
   type ExecutiveReviewOutcome,
   type ExecutiveReviewOutcomeLink,
   type ExecutiveReviewPositionLink,
@@ -124,6 +125,27 @@ const tier1 = (): ExecutiveReviewOutcome => ({
 });
 
 describe("Executive Review Store", () => {
+  it("gives the operator a strict corruption signal instead of silently dropping malformed Tier 1 evidence", () => {
+    const dir = mkdtempSync(join(tmpdir(), "executive-review-strict-"));
+    try {
+      const file = join(dir, "reviews.json");
+      const store = new ExecutiveReviewStore(file);
+      expect(store.addReview(review())).toBe(true);
+      expect(store.resolve("review-1", position(), outcome())).toBeNull();
+      store.save();
+      expect(readExecutiveReviewStoreStrict(file)).toMatchObject({
+        status: "VALID", counts: { reviews: 1, tier1: 1, malformed: 0, duplicates: 0 },
+      });
+
+      writeFileSync(file, JSON.stringify({ ...store.get(), tier1: [{ ...tier1(), executiveReviewId: "missing-parent" }] }));
+      expect(readExecutiveReviewStoreStrict(file)).toMatchObject({
+        status: "EXECUTIVE_REVIEW_STORE_CORRUPTED", counts: { malformed: 1, duplicates: 0 },
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("requires an exact persisted lineage and resolves each review outcome once", () => {
     const dir = mkdtempSync(join(tmpdir(), "executive-review-"));
     try {

@@ -215,6 +215,8 @@ export interface DirectionRawReadings {
    *  straight through to DirectionInput; see direction-brain.ts. */
   fourBrainLongVeto?: boolean;
   fourBrainShortVeto?: boolean;
+  /** Resolved Direction outcomes for this exact evaluation horizon. */
+  horizonResolvedN?: number | null;
   validityMs: number;
 }
 
@@ -396,6 +398,7 @@ export function assembleFourBrainTick(input: FourBrainGatherInput): FourBrainGat
       shortVeto: d.shortVeto,
       fourBrainLongVeto: d.fourBrainLongVeto,
       fourBrainShortVeto: d.fourBrainShortVeto,
+      horizonResolvedN: d.horizonResolvedN,
     };
     return { horizon: d.horizon, input: di, readings: Object.values(readings) };
   });

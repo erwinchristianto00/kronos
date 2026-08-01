@@ -10,6 +10,7 @@ import {
   recordForwardOpportunity,
   recordForwardOutcome,
   recordForwardOutcomes,
+  readForwardCausalEventsStrict,
   resolveCanonicalPolicyContext,
   resolveCausalCollectionActivation,
   withResolvedCausalIdentity,
@@ -44,6 +45,17 @@ function shadowEnv(dir: string): NodeJS.ProcessEnv {
 }
 
 describe("forward causal collection", () => {
+  it("strict reader accepts one torn final append tail but blocks malformed historical rows", () => {
+    const dir = mkdtempSync(join(tmpdir(), "causal-strict-")); dirs.push(dir);
+    const env = shadowEnv(dir); const o = order();
+    o.causalIdentity = prepareForwardCausalIdentity(o, env);
+    expect(recordForwardOpportunity(o, env)).toBe(true);
+    const journal = forwardCausalJournalPath(env)!;
+    appendFileSync(journal, "{torn");
+    expect(readForwardCausalEventsStrict(journal)).toMatchObject({ status: "VALID", ignoredTornTail: true });
+    appendFileSync(journal, "\n{bad}\n");
+    expect(readForwardCausalEventsStrict(journal).status).toBe("FORWARD_CAUSAL_JOURNAL_CORRUPTED");
+  });
   it("is default-off and hard-blocks 3103 without filesystem I/O", () => {
     const dir = mkdtempSync(join(tmpdir(), "causal-off-")); dirs.push(dir);
     const env = { PORT: "3102", CAUSAL_EXPERIENCE_COLLECTION_DIR: dir };
@@ -170,6 +182,8 @@ describe("forward causal collection", () => {
       finalPct: 0,
       evalFinalPct: 0,
     };
+    o.cortexDecisionId = o.cortexDecisionSnapshot.decisionId;
+    o.cortexAllocationSnapshotId = o.cortexDecisionSnapshot.allocationSnapshotId;
     o.causalIdentity = prepareForwardCausalIdentity(o, env);
     recordForwardOpportunity(o, env);
     o.paperStatus = "PAPER_CLOSED_WIN"; o.closedAtMs = 2_000; o.resolvedAtMs = 3_000; o.grossR = 0.2; o.costR = -0.02; o.netR = 0.18;
@@ -209,6 +223,8 @@ describe("forward causal collection", () => {
       featureSchemaVersion: CORTEX_FEATURE_SCHEMA_VERSION, featureVector: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0.5],
       regimeFamily: "BULL", eligible: true, finalPct: 0, evalFinalPct: 0,
     };
+    o.cortexDecisionId = o.cortexDecisionSnapshot.decisionId;
+    o.cortexAllocationSnapshotId = o.cortexDecisionSnapshot.allocationSnapshotId;
     o.causalIdentity = prepareForwardCausalIdentity(o, env); recordForwardOpportunity(o, env);
     o.paperStatus = "PAPER_CLOSED_WIN"; o.closedAtMs = 2_000; o.resolvedAtMs = 3_000; o.grossR = 0.2; o.costR = -0.02; o.netR = 0.18;
     o.causalIdentity = withResolvedCausalIdentity(o); recordForwardOutcome(o, env);
@@ -304,6 +320,8 @@ describe("closes the stale-identity-reuse bypass", () => {
       atMs: 900, laneId: "CG_WIDE_FAST_LONG", direction: "LONG", featureSchemaVersion: CORTEX_FEATURE_SCHEMA_VERSION,
       featureVector: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0.5], regimeFamily: "BULL", eligible: true, finalPct: 0, evalFinalPct: 0,
     };
+    o.cortexDecisionId = o.cortexDecisionSnapshot.decisionId;
+    o.cortexAllocationSnapshotId = o.cortexDecisionSnapshot.allocationSnapshotId;
     o.causalIdentity = prepareForwardCausalIdentity(o, env);
     recordForwardOpportunity(o, env);
     o.paperStatus = "PAPER_CLOSED_WIN"; o.closedAtMs = 2_000; o.resolvedAtMs = 3_000; o.grossR = 0.2; o.costR = -0.02; o.netR = 0.18;

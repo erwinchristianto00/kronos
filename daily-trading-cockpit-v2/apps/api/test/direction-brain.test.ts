@@ -38,17 +38,17 @@ describe("Direction Brain", () => {
     expect(d.longScore).toBeGreaterThan(d.shortScore);
   });
 
-  it("does not double-count an incumbent edge as both a score and a veto multiplier", () => {
+  it("applies the documented bounded incumbent-veto penalty and exposes it", () => {
     const clean = decideDirection(directionInput({ longEdge: src(0.12) }));
     const vetoed = decideDirection(directionInput({ longEdge: src(0.12), longVeto: true }));
-    expect(vetoed.longScore).toBe(clean.longScore);
-    expect(vetoed.conflictingSignals.some((s) => s.includes("edge-memory VETO"))).toBe(false);
+    expect(vetoed.longScore).toBeLessThan(clean.longScore);
+    expect(vetoed.conflictingSignals.some((s) => s.includes("incumbent edge-memory VETO"))).toBe(true);
   });
 
-  it("coverage and a derivative incumbent veto do not manufacture or reduce confidence", () => {
+  it("incumbent veto remains advisory but can lower directional confidence", () => {
     const clean = decideDirection(directionInput({ longEdge: src(0.12) }));
     const conflicted = decideDirection(directionInput({ longEdge: src(0.12), longVeto: true }));
-    expect(conflicted.confidence).toBe(clean.confidence);
+    expect(conflicted.confidence).toBeLessThan(clean.confidence);
   });
 
   it("Four-Brain self evidence is one bounded independent adjustment, not a stack with incumbent evidence", () => {
@@ -62,9 +62,9 @@ describe("Direction Brain", () => {
     expect(fourBrainOnly.longScore).toBeGreaterThan(0);
     expect(fourBrainOnly.conflictingSignals.some((s) => s.includes("Four-Brain self-outcome VETO"))).toBe(true);
 
-    // The derivative incumbent veto has no second score path.
-    expect(both.longScore).toBe(fourBrainOnly.longScore);
-    expect(incumbentOnly.longScore).toBe(clean.longScore);
+    // The two independently measured vetoes are independently observable and compose.
+    expect(both.longScore).toBeLessThan(fourBrainOnly.longScore);
+    expect(incumbentOnly.longScore).toBeLessThan(clean.longScore);
     expect(both.longScore).toBeGreaterThan(0);
   });
 

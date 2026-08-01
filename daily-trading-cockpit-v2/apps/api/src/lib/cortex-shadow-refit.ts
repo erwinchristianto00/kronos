@@ -268,17 +268,31 @@ function snapshotConsistencyReason(input: {
   if (!policyMatches) return "CORTEX_POLICY_LINEAGE_MISMATCH";
   if (!experience || !decision) return "FORWARD_CAUSAL_INELIGIBLE";
   const symbol = outcome.symbolOrBasketId;
-  const identityMatches = !!symbol && identities.every((identity) =>
-    identity.opportunityId === outcome.opportunityId && identity.outcomeId === outcome.outcomeId &&
-    identity.laneId === outcome.laneId && identity.symbolOrBasketId === symbol &&
-    identity.direction === outcome.direction && identity.allocationSnapshotId === outcome.allocationSnapshotId,
-  ) && forwardDecision.identity.cortexDecisionId === forwardDecision.cortexTraining.decisionId &&
+  // Forward-Causal records the paper lifecycle; Executive Review records the real execution
+  // lifecycle. Their outcome IDs deliberately live in different namespaces. The immutable
+  // bridge is the admission-time decision/opportunity/allocation chain, never an outcome-ID
+  // equality or a time/price heuristic.
+  const decisionOpenIdentity = [forwardDecision.identity, forwardOpen.identity];
+  const identityMatches = !!symbol &&
+    decisionOpenIdentity.every((identity) =>
+      identity.opportunityId === outcome.opportunityId && identity.outcomeId === null &&
+      identity.laneId === outcome.laneId && identity.symbolOrBasketId === symbol &&
+      identity.direction === outcome.direction && identity.allocationSnapshotId === outcome.allocationSnapshotId,
+    ) &&
+    forwardOutcome.identity.outcomeId === forwardOutcome.outcomeId &&
+    forwardOutcome.identity.opportunityId === outcome.opportunityId &&
+    forwardOutcome.identity.laneId === outcome.laneId &&
+    forwardOutcome.identity.symbolOrBasketId === symbol &&
+    forwardOutcome.identity.direction === outcome.direction &&
+    forwardOutcome.identity.allocationSnapshotId === outcome.allocationSnapshotId &&
+    forwardDecision.identity.cortexDecisionId === forwardDecision.cortexTraining.decisionId &&
     forwardDecision.identity.cortexFeatureSchemaVersion === forwardDecision.cortexTraining.featureSchemaVersion &&
     forwardDecision.asOfMs === outcome.executiveDecisionTimeMs &&
     forwardOpen.decisionId === forwardDecision.identity.decisionId && forwardOutcome.decisionId === forwardDecision.identity.decisionId &&
-    forwardOutcome.opportunityId === outcome.opportunityId && forwardOutcome.outcomeId === outcome.outcomeId &&
+    forwardOutcome.opportunityId === outcome.opportunityId &&
     experience.decisionId === forwardDecision.cortexTraining.decisionId && experience.opportunityId === outcome.opportunityId &&
-    experience.outcomeId === outcome.outcomeId && experience.laneId === outcome.laneId &&
+    // This experience is feature provenance only. Its paper outcome is never an economic label.
+    experience.outcomeId === forwardOutcome.outcomeId && experience.laneId === outcome.laneId &&
     experience.symbolOrBasketId === symbol && experience.direction === outcome.direction &&
     decision.decisionId === forwardDecision.cortexTraining.decisionId;
   if (!identityMatches) return "CORTEX_DECISION_IDENTITY_MISMATCH";
@@ -316,7 +330,7 @@ export function buildCortexShadowTrainingDataset(input: {
     policyDeploymentAt: input.policy.policyDeploymentAt,
   }, input.nowMs);
   const bridge: CortexExperienceBridgeResult = buildCortexExperienceBridge(input.forwardEvents, input.policy);
-  const bridgeByOutcome = new Map(bridge.experiences.map((row) => [row.outcomeId, row]));
+  const bridgeByOpportunity = new Map(bridge.experiences.map((row) => [row.opportunityId, row]));
   const decisionByCortexLane = new Map(bridge.decisions.map((row) => [`${row.decisionId ?? ""}\u001f${[...row.lanes.keys()][0] ?? ""}`, row]));
   const forwardDecisionByAllocation = new Map(input.forwardEvents
     .filter((event): event is Extract<ForwardEvent, { eventType: "DECISION_SNAPSHOT" }> => event.eventType === "DECISION_SNAPSHOT")
@@ -324,9 +338,9 @@ export function buildCortexShadowTrainingDataset(input: {
   const forwardOpenByOpportunity = new Map(input.forwardEvents
     .filter((event): event is ForwardOpen => event.eventType === "OPPORTUNITY_OPEN")
     .map((event) => [event.identity.opportunityId, event]));
-  const forwardOutcomeByOutcome = new Map(input.forwardEvents
+  const forwardOutcomeByOpportunity = new Map(input.forwardEvents
     .filter((event): event is ForwardOutcome => event.eventType === "OUTCOME_RESOLUTION")
-    .map((event) => [event.outcomeId, event]));
+    .map((event) => [event.opportunityId, event]));
   const seen = new Set<string>();
   let archivedPreEpoch = 0;
   const examples: CortexShadowTrainingExample[] = [];
@@ -342,7 +356,7 @@ export function buildCortexShadowTrainingDataset(input: {
       rejected.INVALID_OR_INCOMPLETE_COST += 1; continue;
     }
     if (!directOutcomeIds.has(outcome.outcomeId)) { rejected.FOUR_BRAIN_NOT_DIRECT += 1; continue; }
-    const experience = bridgeByOutcome.get(outcome.outcomeId);
+    const experience = bridgeByOpportunity.get(outcome.opportunityId);
     const forwardDecision = outcome.allocationSnapshotId ? forwardDecisionByAllocation.get(outcome.allocationSnapshotId) : undefined;
     const decision = forwardDecision?.cortexTraining.decisionId
       ? decisionByCortexLane.get(`${forwardDecision.cortexTraining.decisionId}\u001f${outcome.laneId}`)
@@ -360,7 +374,7 @@ export function buildCortexShadowTrainingDataset(input: {
     const consistency = snapshotConsistencyReason({
       outcome, experience, decision, forwardDecision,
       forwardOpen: forwardOpenByOpportunity.get(outcome.opportunityId),
-      forwardOutcome: forwardOutcomeByOutcome.get(outcome.outcomeId), policy: input.policy,
+      forwardOutcome: forwardOutcomeByOpportunity.get(outcome.opportunityId), policy: input.policy,
     });
     if (consistency) { rejected[consistency] += 1; continue; }
     // snapshotConsistencyReason has just proven these exact representations exist; repeat the

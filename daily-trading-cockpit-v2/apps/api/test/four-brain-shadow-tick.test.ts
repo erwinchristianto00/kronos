@@ -95,9 +95,25 @@ describe("Four-Brain shadow tick — gate + single-flight + fail-open", () => {
   });
 
   it("a journal exception does NOT fail the tick (report-only, fail-open)", () => {
-    const r = runFourBrainShadowTick({ mode: "shadow", nowMs: NOW, gather: gatherFrom(fakeDeps()), journalAppend: () => { throw new Error("disk full"); }, tickId: "t" });
+    const attached: string[] = [];
+    const r = runFourBrainShadowTick({ mode: "shadow", nowMs: NOW, gather: gatherFrom(fakeDeps()), journalAppend: () => { throw new Error("disk full"); }, onExecutiveDecision: (d) => attached.push(d.decisionId), tickId: "t" });
     expect(r.ran).toBe(true);
     expect(r.metrics.journalErrors).toBeGreaterThan(0);
+    expect(attached).toEqual(r.executiveDecisions.map((d) => d.decisionId));
+  });
+
+  it("evaluates each horizon independently rather than cloning the first result", () => {
+    const gathered = assembleFourBrainTick(buildFourBrainGatherInput(fakeDeps()));
+    const scalp = gathered.directionInputs.find((d) => d.horizon === "SCALP")!.input;
+    const swing = gathered.directionInputs.find((d) => d.horizon === "SWING")!.input;
+    scalp.longEdge = { value: null, asOfMs: NOW };
+    scalp.shortEdge = { value: 0.15, asOfMs: NOW };
+    scalp.shortEdgeN = 100;
+    swing.longEdge = { value: 0.15, asOfMs: NOW };
+    swing.longEdgeN = 100;
+    const r = runFourBrainShadowTick({ mode: "shadow", nowMs: NOW, gather: () => gathered, journalAppend: () => {}, tickId: "horizons" });
+    expect(r.directions.find((d) => d.horizon === "SCALP")?.action).toBe("SHORT");
+    expect(r.directions.find((d) => d.horizon === "SWING")?.action).toBe("LONG");
   });
 
   it("single-flight: a re-entrant tick while one is running is SKIPPED (never overlaps)", () => {

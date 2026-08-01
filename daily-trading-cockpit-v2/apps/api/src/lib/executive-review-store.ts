@@ -282,6 +282,42 @@ export function eligibleTier1ExecutiveReview(row: ExecutiveReviewOutcome): boole
 /** Tier 2 stays separately labelled and is never blended into real review evidence. */
 export function eligibleTier2ExecutiveReview(_row: ExecutiveReviewOutcome): boolean { return false; }
 
+/** Read-only validation for the operator. Runtime keeps its tolerant reader for availability, while
+ * the learner must fail closed if that reader would have silently discarded evidence. */
+export type ExecutiveReviewStrictStatus =
+  | "VALID" | "EXECUTIVE_REVIEW_STORE_MISSING" | "EXECUTIVE_REVIEW_STORE_CORRUPTED"
+  | "EXECUTIVE_REVIEW_STORE_SCHEMA_MISMATCH";
+export interface ExecutiveReviewStrictRead {
+  status: ExecutiveReviewStrictStatus;
+  outcomes: readonly ExecutiveReviewOutcome[];
+  counts: { reviews: number; tier1: number; malformed: number; duplicates: number };
+}
+export function readExecutiveReviewStoreStrict(file: string): ExecutiveReviewStrictRead {
+  if (!existsSync(file)) return { status: "EXECUTIVE_REVIEW_STORE_MISSING", outcomes: [], counts: { reviews: 0, tier1: 0, malformed: 0, duplicates: 0 } };
+  let raw: unknown;
+  try { raw = JSON.parse(readFileSync(file, "utf8")); } catch { return { status: "EXECUTIVE_REVIEW_STORE_CORRUPTED", outcomes: [], counts: { reviews: 0, tier1: 0, malformed: 1, duplicates: 0 } }; }
+  if (!raw || typeof raw !== "object" || (raw as { version?: unknown }).version !== 1) return { status: "EXECUTIVE_REVIEW_STORE_SCHEMA_MISMATCH", outcomes: [], counts: { reviews: 0, tier1: 0, malformed: 1, duplicates: 0 } };
+  const state = raw as Partial<ExecutiveReviewState>;
+  if (!Array.isArray(state.reviews) || !Array.isArray(state.tier1) || !Array.isArray(state.tier2) || !Array.isArray(state.processedIds) || !Array.isArray(state.rejected)) {
+    return { status: "EXECUTIVE_REVIEW_STORE_SCHEMA_MISMATCH", outcomes: [], counts: { reviews: 0, tier1: 0, malformed: 1, duplicates: 0 } };
+  }
+  const reviewIds = new Set<string>(); let malformed = 0; let duplicates = 0;
+  for (const review of state.reviews) {
+    if (!validReviewRecord(review as ExecutiveReviewRecord)) malformed += 1;
+    else if (reviewIds.has((review as ExecutiveReviewRecord).executiveReviewId)) duplicates += 1;
+    else reviewIds.add((review as ExecutiveReviewRecord).executiveReviewId);
+  }
+  const outcomeIds = new Set<string>();
+  for (const row of state.tier1) {
+    const outcome = row as ExecutiveReviewOutcome;
+    if (!eligibleTier1ExecutiveReview(outcome) || !reviewIds.has(outcome.executiveReviewId)) malformed += 1;
+    else if (outcomeIds.has(outcome.executiveReviewOutcomeId)) duplicates += 1;
+    else outcomeIds.add(outcome.executiveReviewOutcomeId);
+  }
+  if (malformed || duplicates) return { status: "EXECUTIVE_REVIEW_STORE_CORRUPTED", outcomes: [], counts: { reviews: state.reviews.length, tier1: state.tier1.length, malformed, duplicates } };
+  return { status: "VALID", outcomes: state.tier1 as ExecutiveReviewOutcome[], counts: { reviews: state.reviews.length, tier1: state.tier1.length, malformed, duplicates } };
+}
+
 /** Advisory counts only. This intentionally publishes no alpha, routing, or allocation claim. */
 export function executiveReviewTier1Aggregates(state: Pick<ExecutiveReviewState, "tier1">): ExecutiveReviewTier1Aggregate[] {
   const dimensions: Array<ExecutiveReviewTier1Aggregate["dimension"]> = [
@@ -450,7 +486,9 @@ export class ExecutiveReviewStore {
       decidedTargetEntry: review.decidedTargetEntry ?? null,
       decidedInitialStop: review.decidedInitialStop ?? null,
       // Copied from the already-validated OutcomeLink, not re-derived — see the field's own doc comment.
-      exactCloseTimeMs: Number.isFinite(outcome.resolvedAtMs) ? outcome.resolvedAtMs! : null,
+      // Market close and settlement resolution are distinct clocks. The exact close must retain
+      // the exchange/market-close clock rather than being aliased to later settlement time.
+      exactCloseTimeMs: Number.isFinite(outcome.marketClosedAtMs) ? outcome.marketClosedAtMs! : null,
       // One meaning each, all sourced directly from the OutcomeLink the caller already validated —
       // never re-derived from resolvedAtMs or from one another.
       entryFilledAtMs: outcome.entryFilledAtMs ?? null,
