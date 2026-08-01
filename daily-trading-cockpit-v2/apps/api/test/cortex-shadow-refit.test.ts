@@ -42,14 +42,14 @@ function row(index: number, overrides: Partial<ExecutiveReviewOutcome> = {}): { 
     lineageSchemaVersion: "causal-lineage-1" as const, decisionId: `paper-${index}`, opportunityId, outcomeId: null,
     instanceId: policy.instanceId, laneId: "CG_WIDE_FAST_LONG", symbolOrBasketId: index % 3 ? "BTCUSDT" : "ETHUSDT", direction: "LONG" as const,
     featureSchemaVersion: "1", decisionRuleVersion: "rule", attributionRuleVersion: "attr", cortexDecisionId: cortexId,
-    allocationSnapshotId, cortexFeatureSchemaVersion: 1, decisionPolicyVersion: policy.decisionPolicyVersion,
+    allocationSnapshotId, canonicalCortexLaneId: "CG_WIDE_FAST_LONG", cortexFeatureSchemaVersion: 1, decisionPolicyVersion: policy.decisionPolicyVersion,
     executionPolicyVersion: policy.executionPolicyVersion, evidencePolicyVersion: policy.evidencePolicyVersion,
     evidenceEra: policy.evidenceEra, policyDeploymentAt: policy.policyDeploymentAt,
   };
   const outcome = {
     executiveReviewOutcomeId: `review-out-${index}`, executiveReviewId: `review-${index}`, tier: "TIER_1_REAL",
     candidateId: `candidate-${index}`, opportunityId, executionIntentId: `intent-${index}`, orderId: `order-${index}`,
-    positionId: `position-${index}`, outcomeId, marketContextSnapshotId: `market-${index}`, allocationSnapshotId,
+    positionId: `position-${index}`, outcomeId, marketContextSnapshotId: `market-${index}`, allocationSnapshotId, canonicalCortexLaneId: "CG_WIDE_FAST_LONG",
     laneId: "CG_WIDE_FAST_LONG", direction: "LONG", marketState: "BULLISH", evidenceEra: policy.evidenceEra,
     strategyAction: "ENTER", advisoryVerdict: "VALID", incumbentAction: "ENTERED", advisoryOnly: true,
     entryAtMs: openedTimeMs, resolvedAtMs: closedTimeMs + 1_000, originalRisk: 100, grossR: index % 2 ? 0.32 : -0.18,
@@ -132,6 +132,8 @@ describe("CORTEX shadow refit learner v1", () => {
     expect(first.datasetHash).toBe(second.datasetHash);
     expect(first.examples).toEqual(second.examples);
     expect(first.examples[0]!.x).toEqual(x(1));
+    expect(first.examples[0]!.cortexDecisionTimeMs).toBe(epochMs + 60_000 - 1);
+    expect(first.examples[0]!.paperAdmissionTimeMs).toBe(epochMs + 60_000);
     expect(first.examples[0]!.decisionTimeMs).toBeLessThan(first.examples[0]!.openedTimeMs);
   });
 

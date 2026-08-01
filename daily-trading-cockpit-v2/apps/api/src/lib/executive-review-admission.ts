@@ -13,6 +13,7 @@ import {
   resolveCanonicalPolicyContext,
   resolveCausalCollectionActivation,
 } from "../experience-engine/forward-causal-collection.js";
+import { recordCortexProductionChainDiagnostic } from "./cortex-production-chain-diagnostics.js";
 
 export type ExecutiveReviewAdmissionResult =
   | "ATTACHED"
@@ -48,6 +49,7 @@ function sameReview(left: ExecutiveReviewRecord, right: ExecutiveReviewRecord): 
     && left.laneId === right.laneId
     && left.marketContextSnapshotId === right.marketContextSnapshotId
     && left.allocationSnapshotId === right.allocationSnapshotId
+    && left.canonicalCortexLaneId === right.canonicalCortexLaneId
     && left.decisionPipelinePolicyVersion === right.decisionPipelinePolicyVersion
     && left.executionPolicyVersion === right.executionPolicyVersion
     && left.evidencePolicyVersion === right.evidencePolicyVersion
@@ -62,6 +64,7 @@ function linkFrom(record: ExecutiveReviewRecord): ExecutiveReviewExecutionLink {
     laneId,
     marketContextSnapshotId,
     allocationSnapshotId,
+    canonicalCortexLaneId,
     direction,
     marketState,
     evidenceEra,
@@ -77,6 +80,7 @@ function linkFrom(record: ExecutiveReviewRecord): ExecutiveReviewExecutionLink {
     laneId,
     marketContextSnapshotId,
     allocationSnapshotId,
+    canonicalCortexLaneId,
     direction,
     marketState,
     evidenceEra,
@@ -136,7 +140,14 @@ export function attachExecutiveReviewToExactPaperOrder(input: {
   // order may reach Tier 1 only if the producer carries an explicit bridge to the same immutable
   // CORTEX allocation identity; a matching lane/time is never a substitute.
   const cortexAllocationSnapshotId = order.causalIdentity.allocationSnapshotId;
-  if (!cortexAllocationSnapshotId || executive.allocationContext.cortexAllocationSnapshotId !== cortexAllocationSnapshotId) {
+  const canonicalCortexLaneId = order.causalIdentity.canonicalCortexLaneId;
+  if (!cortexAllocationSnapshotId || !canonicalCortexLaneId ||
+    order.canonicalCortexLaneId !== canonicalCortexLaneId ||
+    order.cortexDecisionSnapshot?.laneId !== canonicalCortexLaneId ||
+    order.cortexDecisionSnapshot?.allocationSnapshotId !== cortexAllocationSnapshotId ||
+    order.cortexDecisionSnapshot?.decisionId !== order.causalIdentity.cortexDecisionId ||
+    executive.allocationContext.cortexAllocationSnapshotId !== cortexAllocationSnapshotId) {
+    recordCortexProductionChainDiagnostic("CORTEX_EXECUTIVE_ATTACHMENT_REJECTED");
     return "CORTEX_ALLOCATION_LINK_MISSING";
   }
 
@@ -147,6 +158,7 @@ export function attachExecutiveReviewToExactPaperOrder(input: {
     laneId: executive.laneId,
     marketContextSnapshotId: executive.marketContext.marketContextSnapshotId,
     allocationSnapshotId: cortexAllocationSnapshotId,
+    canonicalCortexLaneId,
     strategyAction: actionFor(executive),
     direction: executive.entry.side,
     marketState: executive.marketState.family,
@@ -163,6 +175,7 @@ export function attachExecutiveReviewToExactPaperOrder(input: {
     reasonCode: null,
     positionId: null,
     outcomeId: null,
+    executionIntentId: null,
     // Additive Four-Brain economic-learning identity — every value below is read straight off
     // `executive`/`order.causalIdentity`, both already exact and already validated by the checks
     // above (hasCurrentPolicy + opportunityId presence); none of it is parsed back out of a

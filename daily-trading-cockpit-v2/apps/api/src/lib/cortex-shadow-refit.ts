@@ -71,10 +71,16 @@ export interface CortexShadowTrainingExample {
   readonly opportunityId: string;
   readonly outcomeId: string;
   readonly laneId: string;
+  readonly canonicalCortexLaneId: string;
   readonly symbolOrBasketId: string;
   readonly direction: "LONG" | "SHORT";
   readonly archetype: CortexArchetype;
   readonly regimeFamily: string;
+  /** Original CORTEX snapshot clock; this is the only model chronology clock. */
+  readonly cortexDecisionTimeMs: number;
+  /** Paper-admission provenance, retained separately from the model clock. */
+  readonly paperAdmissionTimeMs: number;
+  /** Compatibility alias for persisted readers; equal to cortexDecisionTimeMs. */
   readonly decisionTimeMs: number;
   readonly openedTimeMs: number;
   readonly closedTimeMs: number;
@@ -269,6 +275,7 @@ function snapshotConsistencyReason(input: {
     identity.opportunityId === outcome.opportunityId && identity.laneId === outcome.laneId &&
     identity.symbolOrBasketId === symbol && identity.direction === outcome.direction &&
     identity.allocationSnapshotId === outcome.allocationSnapshotId &&
+    identity.canonicalCortexLaneId === outcome.canonicalCortexLaneId &&
     identity.cortexDecisionId === forwardDecision.cortexTraining.decisionId &&
     identity.cortexFeatureSchemaVersion === forwardDecision.cortexTraining.featureSchemaVersion &&
     forwardOpen.decisionId === identity.decisionId && decision.decisionId === identity.cortexDecisionId;
@@ -282,7 +289,7 @@ function snapshotConsistencyReason(input: {
     (outcome.marketClosedAtMs != null && outcome.entryAtMs > outcome.marketClosedAtMs) ||
     (outcome.settlementResolvedAtMs != null && outcome.marketClosedAtMs != null && outcome.marketClosedAtMs > outcome.settlementResolvedAtMs)
   ) return "CORTEX_CAUSAL_CLOCK_ORDER_INVALID";
-  const lane = decision.lanes.get(outcome.laneId);
+  const lane = outcome.canonicalCortexLaneId ? decision.lanes.get(outcome.canonicalCortexLaneId) : undefined;
   const raw = forwardDecision.cortexTraining;
   if (!lane || lane.direction !== outcome.direction || raw.featureSchemaVersion !== decision.featureSchemaVersion ||
     !raw.featureVector || !equalVector(raw.featureVector, lane.x)) {
@@ -363,7 +370,7 @@ export function buildCortexShadowTrainingDataset(input: {
     // guard so TypeScript also retains that fact rather than allowing an accidental future access.
     if (!feature || !forwardDecision) { rejected.FORWARD_CAUSAL_INELIGIBLE += 1; continue; }
     const decision = feature.decision;
-    const lane = decision.lanes.get(outcome.laneId);
+    const lane = outcome.canonicalCortexLaneId ? decision.lanes.get(outcome.canonicalCortexLaneId) : undefined;
     if (!lane || lane.x.length !== CORTEX_FEATURE_DIM || !lane.x.every(finite)) { rejected.MISSING_EXACT_CORTEX_SNAPSHOT += 1; continue; }
     const regimeFamily = decision.regimeFamily.trim().toUpperCase();
     if (!regimeFamily || regimeFamily === "UNKNOWN" || regimeFamily === "UNKNOWN_CONTEXT") { rejected.UNKNOWN_CONTEXT += 1; continue; }
@@ -374,11 +381,14 @@ export function buildCortexShadowTrainingDataset(input: {
       opportunityId: outcome.opportunityId,
       outcomeId: outcome.outcomeId,
       laneId: outcome.laneId,
+      canonicalCortexLaneId: outcome.canonicalCortexLaneId!,
       symbolOrBasketId: outcome.symbolOrBasketId!,
       direction: outcome.direction,
-      archetype: cortexArchetypeForLane(outcome.laneId),
+      archetype: cortexArchetypeForLane(outcome.canonicalCortexLaneId!),
       regimeFamily,
-      decisionTimeMs: forwardDecision.asOfMs,
+      cortexDecisionTimeMs: rawSnapshot.snapshotAtMs!,
+      paperAdmissionTimeMs: forwardDecision.asOfMs,
+      decisionTimeMs: rawSnapshot.snapshotAtMs!,
       openedTimeMs: outcome.entryFilledAtMs,
       closedTimeMs: outcome.marketClosedAtMs ?? outcome.resolvedAtMs,
       resolvedTimeMs: outcome.resolvedAtMs,
@@ -387,7 +397,7 @@ export function buildCortexShadowTrainingDataset(input: {
       policyDeploymentAt: outcome.policyDeploymentAt ?? "",
     });
   }
-  const ordered = sorted(examples, (a, b) => a.resolvedTimeMs - b.resolvedTimeMs || a.exampleId.localeCompare(b.exampleId));
+  const ordered = sorted(examples, (a, b) => a.cortexDecisionTimeMs - b.cortexDecisionTimeMs || a.exampleId.localeCompare(b.exampleId));
   return {
     resetEpoch: new Date(epochMs).toISOString(),
     examined: input.outcomes.length,
@@ -458,8 +468,9 @@ function metricsFromHeldOut(
 ): CortexShadowMetrics {
   const rows: CortexShadowTrainingExample[] = heldOut.map((row) => ({
     exampleId: row.exampleId, decisionId: row.exampleId, opportunityId: row.opportunityId, outcomeId: row.exampleId,
-    laneId: "held-out", symbolOrBasketId: row.symbolOrBasketId, direction: "LONG", archetype: "BREADTH",
-    regimeFamily: row.regimeFamily, decisionTimeMs: row.decisionTimeMs, openedTimeMs: row.decisionTimeMs,
+    laneId: "held-out", canonicalCortexLaneId: "held-out", symbolOrBasketId: row.symbolOrBasketId, direction: "LONG", archetype: "BREADTH",
+    regimeFamily: row.regimeFamily, cortexDecisionTimeMs: row.decisionTimeMs, paperAdmissionTimeMs: row.decisionTimeMs,
+    decisionTimeMs: row.decisionTimeMs, openedTimeMs: row.decisionTimeMs,
     closedTimeMs: row.resolvedTimeMs, resolvedTimeMs: row.resolvedTimeMs, x: [], netR: row.netR, policyDeploymentAt: "held-out",
   }));
   const base = metrics(rows, null);

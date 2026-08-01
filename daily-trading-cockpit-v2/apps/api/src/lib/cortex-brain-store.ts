@@ -303,6 +303,8 @@ export function runCortexShadowTick(deps: {
   journal: CortexDecisionJournal;
   context: CortexContext;
   nowIso: string;
+  /** Exact scanner batch that supplied this CORTEX context, if one exists. */
+  scanBatchId?: string | null;
   mode: CortexBrainMode;
   resolvedThisCycle?: number;
   promotion?: {
@@ -349,6 +351,7 @@ export function runCortexShadowTick(deps: {
         eligible: lane.eligible,
         finalPct: lane.finalPct,
         evalFinalPct: evalDecision.lanes.find((candidate) => candidate.laneId === lane.laneId)?.finalPct ?? lane.finalPct,
+        sourceScanBatchId: deps.scanBatchId ?? null,
       };
     })
     : [];

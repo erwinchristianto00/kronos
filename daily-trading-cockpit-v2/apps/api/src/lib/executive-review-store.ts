@@ -108,6 +108,7 @@ export interface ExecutiveReviewRecord extends FourBrainExecutiveIdentity {
   laneId: string;
   marketContextSnapshotId: string;
   allocationSnapshotId: string | null;
+  canonicalCortexLaneId: string | null;
   strategyAction: "ENTER" | "WAIT" | "SKIP";
   direction: ExecutiveReviewDirection;
   marketState: string;
@@ -124,6 +125,8 @@ export interface ExecutiveReviewRecord extends FourBrainExecutiveIdentity {
   reasonCode: ExecutiveReviewReasonCode | null;
   positionId: string | null;
   outcomeId: string | null;
+  /** Set exactly once when the immutable incumbent intent is linked. */
+  executionIntentId?: string | null;
 }
 
 /** The exact metadata that is allowed to cross incumbent execution boundaries. */
@@ -135,6 +138,7 @@ export type ExecutiveReviewExecutionLink = Pick<
   | "laneId"
   | "marketContextSnapshotId"
   | "allocationSnapshotId"
+  | "canonicalCortexLaneId"
   | "direction"
   | "marketState"
   | "evidenceEra"
@@ -155,6 +159,7 @@ export interface ExecutiveReviewPositionLink {
   laneId: string | null;
   marketContextSnapshotId: string | null;
   allocationSnapshotId: string | null;
+  canonicalCortexLaneId: string | null;
   /** Legacy name/meaning: intent-CREATION time (LiveIntent.createdAt). Never the exact open clock
    *  for direct economic eligibility — see FourBrainEntryResolution.entryFilledAtMs. */
   entryAtMs: number | null;
@@ -173,6 +178,7 @@ export interface ExecutiveReviewOutcomeLink extends FourBrainEntryResolution {
   opportunityId: string | null;
   positionId: string | null;
   allocationSnapshotId: string | null;
+  canonicalCortexLaneId: string | null;
   outcomeId: string | null;
   resolvedAtMs: number | null;
   grossR: number | null;
@@ -206,6 +212,7 @@ export interface ExecutiveReviewOutcome extends FourBrainExecutiveIdentity, Four
   outcomeId: string;
   marketContextSnapshotId: string;
   allocationSnapshotId: string | null;
+  canonicalCortexLaneId: string | null;
   laneId: string;
   direction: ExecutiveReviewDirection;
   marketState: string;
@@ -273,7 +280,7 @@ const MAX_IDS = 10_000;
 export function eligibleTier1ExecutiveReview(row: ExecutiveReviewOutcome): boolean {
   return row.tier === "TIER_1_REAL"
     && row.advisoryOnly === true && row.eligibleForFourBrainEvaluation === true && row.eligibleForCortexLearning === false
-    && [row.executiveReviewOutcomeId, row.executiveReviewId, row.candidateId, row.opportunityId, row.executionIntentId, row.positionId, row.outcomeId, row.laneId, row.marketContextSnapshotId, row.allocationSnapshotId, row.paperOrderId, row.decisionPipelinePolicyVersion, row.executionPolicyVersion, row.evidencePolicyVersion, row.fourBrainPolicyVersion].every((v) => typeof v === "string" && v.length > 0)
+    && [row.executiveReviewOutcomeId, row.executiveReviewId, row.candidateId, row.opportunityId, row.executionIntentId, row.positionId, row.outcomeId, row.laneId, row.canonicalCortexLaneId, row.marketContextSnapshotId, row.allocationSnapshotId, row.paperOrderId, row.decisionPipelinePolicyVersion, row.executionPolicyVersion, row.evidencePolicyVersion, row.fourBrainPolicyVersion].every((v) => typeof v === "string" && v.length > 0)
     && [row.entryAtMs, row.resolvedAtMs, row.originalRisk, row.grossR, row.costR, row.netR].every((v) => typeof v === "number" && Number.isFinite(v))
     && row.originalRisk > 0 && row.costR >= 0 && row.resolvedAtMs >= row.entryAtMs
     && row.settlementFetchComplete === true && Array.isArray(row.missingRequiredOrderIds) && row.missingRequiredOrderIds.length === 0
@@ -313,33 +320,32 @@ export function readExecutiveReviewStoreStrict(file: string): ExecutiveReviewStr
       reviewsById.set(typed.executiveReviewId, typed);
     }
   }
-  const outcomeIds = new Set<string>();
-  const ownership = new Map<string, Set<string>>();
-  const claim = (kind: string, id: string, reviewId: string) => {
-    const key = `${kind}:${id}`; const owners = ownership.get(key) ?? new Set<string>(); owners.add(reviewId); ownership.set(key, owners);
+  const occurrences = new Map<string, number>();
+  const claim = (kind: string, id: string) => {
+    const key = `${kind}:${id}`;
+    occurrences.set(key, (occurrences.get(key) ?? 0) + 1);
   };
   for (const row of state.tier1) {
     const outcome = row as ExecutiveReviewOutcome;
     const parent = reviewsById.get(outcome.executiveReviewId);
     const parentMatches = parent?.state === "TIER1_ELIGIBLE" && parent.candidateId === outcome.candidateId &&
-      parent.opportunityId === outcome.opportunityId && parent.laneId === outcome.laneId &&
+      parent.opportunityId === outcome.opportunityId && parent.laneId === outcome.laneId && parent.canonicalCortexLaneId === outcome.canonicalCortexLaneId &&
       parent.direction === outcome.direction && parent.allocationSnapshotId === outcome.allocationSnapshotId &&
-      parent.positionId === outcome.positionId && parent.outcomeId === outcome.outcomeId &&
+      parent.executionIntentId === outcome.executionIntentId && parent.positionId === outcome.positionId && parent.outcomeId === outcome.outcomeId &&
       parent.paperOrderId != null && parent.paperOrderId === outcome.paperOrderId && parent.executionPolicyVersion === outcome.executionPolicyVersion &&
       parent.evidencePolicyVersion === outcome.evidencePolicyVersion && parent.decisionPipelinePolicyVersion === outcome.decisionPipelinePolicyVersion &&
       parent.fourBrainPolicyVersion === outcome.fourBrainPolicyVersion;
     if (!eligibleTier1ExecutiveReview(outcome) || !parentMatches) malformed += 1;
-    else if (outcomeIds.has(outcome.executiveReviewOutcomeId)) duplicates += 1;
     else {
-      outcomeIds.add(outcome.executiveReviewOutcomeId);
-      claim("outcome", outcome.outcomeId, outcome.executiveReviewId);
-      claim("position", outcome.positionId, outcome.executiveReviewId);
-      claim("intent", outcome.executionIntentId, outcome.executiveReviewId);
-      claim("opportunity", outcome.opportunityId, outcome.executiveReviewId);
-      claim("paper", outcome.paperOrderId ?? "", outcome.executiveReviewId);
+      claim("review-outcome", outcome.executiveReviewOutcomeId);
+      claim("outcome", outcome.outcomeId);
+      claim("position", outcome.positionId);
+      claim("intent", outcome.executionIntentId);
+      claim("opportunity", outcome.opportunityId);
+      claim("paper", outcome.paperOrderId ?? "");
     }
   }
-  if ([...ownership.values()].some((owners) => owners.size !== 1)) duplicates += 1;
+  duplicates += [...occurrences.values()].filter((count) => count !== 1).length;
   if (malformed || duplicates) return { status: "EXECUTIVE_REVIEW_STORE_CORRUPTED", outcomes: [], counts: { reviews: state.reviews.length, tier1: state.tier1.length, malformed, duplicates } };
   return { status: "VALID", outcomes: state.tier1 as ExecutiveReviewOutcome[], counts: { reviews: state.reviews.length, tier1: state.tier1.length, malformed, duplicates } };
 }
@@ -448,6 +454,7 @@ export class ExecutiveReviewStore {
     const positionFailure = positionReason(review, position);
     if (positionFailure) return this.reject(review, positionFailure);
     review.positionId = position.positionId;
+    review.executionIntentId = position.executionIntentId;
     review.state = "PENDING_OUTCOME";
     if (!outcome) return "POSITION_NOT_RESOLVED";
     const outcomeFailure = outcomeReason(review, position, outcome);
@@ -473,6 +480,7 @@ export class ExecutiveReviewStore {
       evidenceEra: review.evidenceEra,
       marketContextSnapshotId: review.marketContextSnapshotId,
       allocationSnapshotId: review.allocationSnapshotId,
+      canonicalCortexLaneId: review.canonicalCortexLaneId,
       strategyAction: "ENTER",
       advisoryVerdict: review.advisoryVerdict,
       incumbentAction: "ENTERED",
@@ -555,10 +563,12 @@ export function executiveReviewOutcomeId(executiveReviewId: string, positionId: 
 
 function validReviewRecord(value: ExecutiveReviewRecord): boolean {
   return value.advisoryOnly === true
-    && [value.executiveReviewId, value.candidateId, value.opportunityId, value.laneId, value.marketContextSnapshotId, value.marketState, value.evidenceEra, value.decisionPipelinePolicyVersion, value.executionPolicyVersion, value.evidencePolicyVersion, value.fourBrainPolicyVersion].every((v) => typeof v === "string" && v.length > 0)
+    && [value.executiveReviewId, value.candidateId, value.opportunityId, value.laneId, value.canonicalCortexLaneId, value.marketContextSnapshotId, value.marketState, value.evidenceEra, value.decisionPipelinePolicyVersion, value.executionPolicyVersion, value.evidencePolicyVersion, value.fourBrainPolicyVersion].every((v) => typeof v === "string" && v.length > 0)
     && ["LONG", "SHORT", "NEUTRAL"].includes(value.direction)
     && ["PENDING_EXECUTION_LINK", "PENDING_OUTCOME", "TIER1_ELIGIBLE", "TIER2_ONLY", "REJECTED"].includes(value.state)
-    && Number.isFinite(value.reviewedAtMs) && Number.isFinite(value.sourceCutoffMs) && value.sourceCutoffMs <= value.reviewedAtMs;
+    && Number.isFinite(value.reviewedAtMs) && Number.isFinite(value.sourceCutoffMs) && value.sourceCutoffMs <= value.reviewedAtMs
+    && (value.executionIntentId === undefined || value.executionIntentId === null || (typeof value.executionIntentId === "string" && value.executionIntentId.length > 0))
+    && (value.state !== "TIER1_ELIGIBLE" || (typeof value.executionIntentId === "string" && value.executionIntentId.length > 0));
 }
 
 function positionReason(review: ExecutiveReviewRecord, position: ExecutiveReviewPositionLink): ExecutiveReviewReasonCode | null {
@@ -575,6 +585,7 @@ function positionReason(review: ExecutiveReviewRecord, position: ExecutiveReview
   if (position.laneId !== review.laneId) return "AMBIGUOUS_OWNERSHIP";
   if (position.marketContextSnapshotId !== review.marketContextSnapshotId) return "MARKET_SNAPSHOT_MISMATCH";
   if (position.allocationSnapshotId !== review.allocationSnapshotId) return "AMBIGUOUS_OWNERSHIP";
+  if (position.canonicalCortexLaneId !== review.canonicalCortexLaneId) return "AMBIGUOUS_OWNERSHIP";
   const positionPolicy = [
     position.decisionPipelinePolicyVersion,
     position.executionPolicyVersion,
@@ -602,6 +613,7 @@ function outcomeReason(review: ExecutiveReviewRecord, position: ExecutiveReviewP
   if (outcome.executiveReviewId !== review.executiveReviewId || outcome.positionId !== position.positionId) return "POSITION_ID_MISMATCH";
   if (outcome.opportunityId !== review.opportunityId) return "OPPORTUNITY_ID_MISMATCH";
   if (outcome.allocationSnapshotId !== review.allocationSnapshotId) return "AMBIGUOUS_OWNERSHIP";
+  if (outcome.canonicalCortexLaneId !== review.canonicalCortexLaneId) return "AMBIGUOUS_OWNERSHIP";
   if (outcome.ambiguousOwnership) return "AMBIGUOUS_OWNERSHIP";
   if (!outcome.completedCandle) return "POSITION_NOT_RESOLVED";
   const outcomePolicy = [

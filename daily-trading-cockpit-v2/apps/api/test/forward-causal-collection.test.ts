@@ -48,6 +48,7 @@ describe("forward causal collection", () => {
   it("strict reader accepts one torn final append tail but blocks malformed historical rows", () => {
     const dir = mkdtempSync(join(tmpdir(), "causal-strict-")); dirs.push(dir);
     const env = shadowEnv(dir); const o = order();
+    o.scanBatchId = "cortex-batch-1";
     o.causalIdentity = prepareForwardCausalIdentity(o, env);
     expect(recordForwardOpportunity(o, env)).toBe(true);
     const journal = forwardCausalJournalPath(env)!;
@@ -185,6 +186,7 @@ describe("forward causal collection", () => {
   it("emits a CORTEX sample only from an exact persisted CORTEX snapshot and direct three-id chain", () => {
     const dir = mkdtempSync(join(tmpdir(), "causal-cortex-")); dirs.push(dir);
     const env = shadowEnv(dir); const o = order();
+    o.scanBatchId = "cortex-batch-1";
     o.cortexDecisionSnapshot = {
       decisionId: "cortex-decision:900:1:CG_WIDE_FAST_LONG",
       allocationSnapshotId: "cortex-allocation:cortex-decision:900:1:CG_WIDE_FAST_LONG",
@@ -197,9 +199,11 @@ describe("forward causal collection", () => {
       eligible: true,
       finalPct: 0,
       evalFinalPct: 0,
+      scanBatchId: "cortex-batch-1", sourceScanBatchId: "cortex-batch-1",
     };
     o.cortexDecisionId = o.cortexDecisionSnapshot.decisionId;
     o.cortexAllocationSnapshotId = o.cortexDecisionSnapshot.allocationSnapshotId;
+    o.canonicalCortexLaneId = o.cortexDecisionSnapshot.laneId;
     o.causalIdentity = prepareForwardCausalIdentity(o, env);
     expect(o.causalIdentity).toMatchObject({
       cortexDecisionId: o.cortexDecisionSnapshot.decisionId,

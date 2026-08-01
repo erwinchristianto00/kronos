@@ -50,6 +50,7 @@ import {
   TAKER_ROUNDTRIP_BPS,
   STOP_OUT_SLIPPAGE_BPS,
 } from "./current-guard-variant-matrix.js";
+import { CORTEX_FEATURE_DIM, CORTEX_FEATURE_SCHEMA_VERSION } from "./cortex-brain.js";
 import {
   excludeSubFloorRowsForReport,
   subFloorExclusionEnabledForDecisions,
@@ -567,6 +568,8 @@ export interface PaperOrder {
   causalIdentity?: CausalIdentity | null;
   /** Exact CORTEX x captured at admission; absent means explicitly ineligible for CORTEX learning. */
   cortexDecisionSnapshot?: CortexDecisionSnapshot | null;
+  /** Exact roster lane whose CORTEX vector was captured. Separate from selectedLaneId. */
+  canonicalCortexLaneId?: string | null;
   /** Immutable IDs paired with the exact snapshot at admission. They are persisted separately so
    * rehydrated causal collection can prove the handoff without an in-memory lookup. */
   cortexDecisionId?: string | null;
@@ -1602,6 +1605,7 @@ export interface PaperOpportunity {
   executiveReviewLink?: ExecutiveReviewExecutionLink | null;
   /** Exact CORTEX snapshot handed over by the same admission decision. Never populated by lookup. */
   cortexDecisionSnapshot?: CortexDecisionSnapshot | null;
+  canonicalCortexLaneId?: string | null;
   /** Immutable handoff identities created with this opportunity. A snapshot is not causally valid
    * unless it matches both; lane, direction, and age are defensive checks only. */
   cortexDecisionId?: string | null;
@@ -1742,6 +1746,7 @@ function _buildAllocatorOrder(
     budgetUsed: o.budgetUsed,
     budgetReason: o.budgetReason,
     executiveReviewLink: o.executiveReviewLink ?? null,
+    canonicalCortexLaneId: o.canonicalCortexLaneId ?? null,
     reportOnly: true,
     paperOnly: true,
   }, now);
@@ -1751,15 +1756,18 @@ function _buildAllocatorOrder(
   if (
     snapshot && o.cortexDecisionId === snapshot.decisionId &&
     o.cortexAllocationSnapshotId === snapshot.allocationSnapshotId &&
-    snapshot.laneId === order.selectedLaneId && snapshot.direction === order.direction &&
-    Number.isInteger(snapshot.featureSchemaVersion) && Array.isArray(snapshot.featureVector) &&
-    snapshot.featureVector.length > 0 && snapshot.featureVector.every(Number.isFinite) &&
+    o.canonicalCortexLaneId !== null && o.canonicalCortexLaneId !== undefined &&
+    snapshot.laneId === o.canonicalCortexLaneId && snapshot.direction === order.direction &&
+    snapshot.scanBatchId === order.scanBatchId && snapshot.sourceScanBatchId === order.scanBatchId &&
+    snapshot.featureSchemaVersion === CORTEX_FEATURE_SCHEMA_VERSION && Array.isArray(snapshot.featureVector) &&
+    snapshot.featureVector.length === CORTEX_FEATURE_DIM && snapshot.featureVector.every(Number.isFinite) &&
     Number.isFinite(snapshot.atMs) && snapshot.atMs <= Date.parse(order.firstSeenAt ?? order.createdAt) &&
     snapshot.atMs >= Date.parse(order.firstSeenAt ?? order.createdAt) - CORTEX_SNAPSHOT_MAX_ADMISSION_AGE_MS
   ) {
     order.cortexDecisionSnapshot = { ...snapshot, featureVector: [...snapshot.featureVector] };
     order.cortexDecisionId = snapshot.decisionId;
     order.cortexAllocationSnapshotId = snapshot.allocationSnapshotId;
+    order.canonicalCortexLaneId = o.canonicalCortexLaneId;
   }
   const identity = prepareForwardCausalIdentity(order);
   if (identity) order.causalIdentity = identity;

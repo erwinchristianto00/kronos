@@ -75,7 +75,8 @@ export function buildCortexFeatureProvenance(
       decision.identity.symbolOrBasketId === open.identity.symbolOrBasketId &&
       decision.identity.direction === open.identity.direction &&
       decision.identity.allocationSnapshotId === open.identity.allocationSnapshotId &&
-      decision.identity.cortexDecisionId === open.identity.cortexDecisionId;
+      decision.identity.cortexDecisionId === open.identity.cortexDecisionId &&
+      decision.identity.canonicalCortexLaneId === open.identity.canonicalCortexLaneId;
     if (!sameIdentity) { bump(rejected, "identity_mismatch"); continue; }
     if (!identityMatchesCurrentPolicy(decision.identity, expectedPolicy) || !identityMatchesCurrentPolicy(open.identity, expectedPolicy)) {
       bump(rejected, "stale_or_mismatched_policy_identity"); continue;
@@ -92,7 +93,8 @@ export function buildCortexFeatureProvenance(
       cortex.snapshotAtMs > decision.asOfMs || decision.asOfMs > open.openedAtMs ||
       Object.values(decision.features.sourceStatuses).some((status) => status === "ERROR")
     ) { bump(rejected, "invalid_feature_provenance_clock"); continue; }
-    const meta = cortexOutcomeLaneMeta(decision.identity.laneId);
+    const canonicalCortexLaneId = decision.identity.canonicalCortexLaneId;
+    const meta = canonicalCortexLaneId ? cortexOutcomeLaneMeta(canonicalCortexLaneId) : null;
     if (!meta || (meta.direction !== "NEUTRAL" && meta.direction !== decision.identity.direction)) { bump(rejected, "lane_direction_mismatch"); continue; }
     rows.push({
       identity: decision.identity,

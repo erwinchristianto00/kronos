@@ -507,14 +507,14 @@ describe("paper-execution-router", () => {
     const snapshot = {
       decisionId: "cortex-decision-1", allocationSnapshotId: "cortex-allocation-1", atMs: now.getTime() - 70_000,
       laneId: H6_TREND_PAPER_LANE_ID, direction: "LONG" as const, featureSchemaVersion: 1,
-      featureVector: [0.1], regimeFamily: "BULLISH", eligible: true, finalPct: 1, evalFinalPct: 0,
+      featureVector: [0.1, 0, 0, 0, 0, 0, 0, 0, 0, 0], regimeFamily: "BULLISH", eligible: true, finalPct: 1, evalFinalPct: 0, scanBatchId: "snapshot", sourceScanBatchId: "snapshot",
     };
     const base = {
       scanBatchId: "snapshot", direction: "LONG" as const, regime: "Bullish expansion", laneId: H6_TREND_PAPER_LANE_ID,
       variantId: H6_TREND_PAPER_LANE_ID, controllerMode: "LONG_ONLY", entryPrice: 100, stopLoss: 95,
       takeProfitLevels: [108], plannedStopDistanceBps: 500, oosUnconfirmed: true,
       paperRiskLabel: "EXPERIMENTAL" as const, paperOrderMode: "HEADLINE" as const, openedAt,
-      provenance: null, provenanceFieldMissing: [], cortexDecisionSnapshot: snapshot,
+      provenance: null, provenanceFieldMissing: [], cortexDecisionSnapshot: snapshot, canonicalCortexLaneId: H6_TREND_PAPER_LANE_ID,
     };
     const result = admitPaperOpportunities({
       store,

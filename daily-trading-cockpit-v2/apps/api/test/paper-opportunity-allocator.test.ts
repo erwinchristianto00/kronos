@@ -1380,19 +1380,22 @@ describe("paper-opportunity-allocator", () => {
     const now = new Date();
     const common = baseInputs({
       vmReport,
-      candidates: [makeCandidate()],
+      candidates: [makeCandidate({ direction: "LONG", stopLoss: 97, tp1: 104 })],
       now: now.toISOString(),
       scanFinishedAt: now.toISOString(),
       scanBatchId: "cortex-exact-batch",
+      marketRegime: "Bullish expansion",
+      routerReport: routerOf("Bullish expansion"),
+      testnetCollectAllLanes: true,
     });
     const unlabelled = buildPaperOpportunityAllocatorReport(common);
-    expect(unlabelled.selectedOpportunities).toHaveLength(1);
-    const selected = unlabelled.selectedOpportunities[0]!;
+    const selected = unlabelled.selectedOpportunities.find((opportunity) => opportunity.canonicalCortexLaneId !== null)!;
+    expect(selected).toBeDefined();
     const snapshot = {
       decisionId: "cortex-decision:allocator-cycle",
       allocationSnapshotId: "cortex-allocation:allocator-cycle",
       atMs: now.getTime() - 1_000,
-      laneId: selected.laneId,
+      laneId: selected.canonicalCortexLaneId!,
       direction: selected.direction,
       featureSchemaVersion: CORTEX_FEATURE_SCHEMA_VERSION,
       featureVector: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
@@ -1400,9 +1403,11 @@ describe("paper-opportunity-allocator", () => {
       eligible: true,
       finalPct: 0,
       evalFinalPct: 0,
+      scanBatchId: common.scanBatchId,
+      sourceScanBatchId: common.scanBatchId,
     } as const;
     const report = buildPaperOpportunityAllocatorReport({ ...common, cortexDecisionSnapshots: [snapshot] });
-    const opportunity = report.selectedOpportunities[0]!;
+    const opportunity = report.selectedOpportunities.find((candidate) => candidate.laneId === selected.laneId)!;
     expect(opportunity.cortexDecisionSnapshot).toEqual(snapshot);
     expect(opportunity.cortexDecisionId).toBe(snapshot.decisionId);
     expect(opportunity.cortexAllocationSnapshotId).toBe(snapshot.allocationSnapshotId);
@@ -1420,7 +1425,7 @@ describe("paper-opportunity-allocator", () => {
       process.env.END_TO_END_CORRECTNESS_DEPLOYED_AT = new Date(now.getTime() - 60_000).toISOString();
       const store = new PaperExecutionRouterStore(dir);
       store.ensurePaperStartAt(new Date(now.getTime() - 60_000).toISOString());
-      expect(admitPaperOpportunities({ store, opportunities: report.selectedOpportunities, routerReport: routerOf("Bearish pressure"), gateReport: emptyGate(), now: now.toISOString() }).admitted).toBe(1);
+      expect(admitPaperOpportunities({ store, opportunities: [opportunity], routerReport: routerOf("Bullish expansion"), gateReport: emptyGate(), now: now.toISOString() }).admitted).toBe(1);
       const order = store.all[0]!;
       expect(order.cortexDecisionSnapshot).toEqual(snapshot);
       expect(order.causalIdentity).toMatchObject({ cortexDecisionId: snapshot.decisionId, allocationSnapshotId: snapshot.allocationSnapshotId });

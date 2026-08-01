@@ -12,6 +12,7 @@ import { dirname, resolve } from "node:path";
 
 import { resolveFourBrainInstanceId } from "../lib/four-brain-live-gather-bindings.js";
 import type { CortexDecisionSnapshot } from "../lib/cortex-decision-snapshot.js";
+import { CORTEX_FEATURE_DIM, CORTEX_FEATURE_SCHEMA_VERSION } from "../lib/cortex-brain.js";
 import {
   CURRENT_DECISION_POLICY_VERSION,
   CURRENT_EVIDENCE_ERA,
@@ -38,6 +39,8 @@ export interface CausalIdentity {
   /** Present only when an exact CORTEX decision snapshot was handed to admission. */
   cortexDecisionId: string | null;
   allocationSnapshotId: string | null;
+  /** CORTEX roster identity; laneId remains exact paper ownership. */
+  canonicalCortexLaneId: string | null;
   cortexFeatureSchemaVersion: number | null;
   decisionPolicyVersion: string;
   executionPolicyVersion: string;
@@ -84,12 +87,15 @@ export interface ForwardPaperOrderLike {
   evidencePolicyVersion?: string | null;
   evidenceEra?: string | null;
   policyDeploymentAt?: string | null;
+  /** Scanner batch that owned this paper admission; required for CORTEX hand-off identity. */
+  scanBatchId?: string | null;
   causalIdentity?: CausalIdentity | null;
   cortexDecisionSnapshot?: CortexDecisionSnapshot | null;
   /** Producer-side immutable handoff IDs. Legacy/incomplete rows may retain a snapshot for audit,
    * but cannot turn it into a CORTEX learning identity. */
   cortexDecisionId?: string | null;
   cortexAllocationSnapshotId?: string | null;
+  canonicalCortexLaneId?: string | null;
 }
 
 export interface DecisionSnapshotEvent {
@@ -174,11 +180,12 @@ const validCortexSnapshot = (order: ForwardPaperOrderLike, openedAtMs: number): 
   if (
     !snapshot || order.cortexDecisionId !== snapshot.decisionId ||
     order.cortexAllocationSnapshotId !== snapshot.allocationSnapshotId ||
-    snapshot.laneId !== order.selectedLaneId || snapshot.direction !== order.direction ||
+    !order.canonicalCortexLaneId || snapshot.laneId !== order.canonicalCortexLaneId || snapshot.direction !== order.direction ||
+    !order.scanBatchId || snapshot.scanBatchId !== order.scanBatchId || snapshot.sourceScanBatchId !== order.scanBatchId ||
     snapshot.atMs > openedAtMs || snapshot.atMs < openedAtMs - CORTEX_SNAPSHOT_MAX_HANDOFF_AGE_MS
   ) return null;
-  if (!snapshot.decisionId || !snapshot.allocationSnapshotId || !Number.isInteger(snapshot.featureSchemaVersion)) return null;
-  if (!Array.isArray(snapshot.featureVector) || !snapshot.featureVector.length || !snapshot.featureVector.every(finite)) return null;
+  if (!snapshot.decisionId || !snapshot.allocationSnapshotId || snapshot.featureSchemaVersion !== CORTEX_FEATURE_SCHEMA_VERSION) return null;
+  if (!Array.isArray(snapshot.featureVector) || snapshot.featureVector.length !== CORTEX_FEATURE_DIM || !snapshot.featureVector.every(finite)) return null;
   return snapshot;
 };
 
@@ -302,6 +309,7 @@ export function prepareForwardCausalIdentity(order: ForwardPaperOrderLike, env: 
     attributionRuleVersion: "direct-paper-order-link/1",
     cortexDecisionId: cortex?.decisionId ?? null,
     allocationSnapshotId: cortex?.allocationSnapshotId ?? null,
+    canonicalCortexLaneId: cortex?.laneId ?? null,
     cortexFeatureSchemaVersion: cortex?.featureSchemaVersion ?? null,
     decisionPolicyVersion: order.decisionPolicyVersion,
     executionPolicyVersion: order.executionPolicyVersion,
@@ -537,8 +545,11 @@ const validIdentity = (value: unknown, outcomeId: string | null): value is Causa
       identity.decisionPolicyVersion, identity.executionPolicyVersion, identity.evidencePolicyVersion,
       identity.evidenceEra, identity.policyDeploymentAt].every(nonEmpty) &&
     ["LONG", "SHORT", "NEUTRAL", "BOTH"].includes(identity.direction) &&
-    nullableString(identity.cortexDecisionId) && nullableString(identity.allocationSnapshotId) &&
-    (identity.cortexFeatureSchemaVersion === null || Number.isInteger(identity.cortexFeatureSchemaVersion)) &&
+    nullableString(identity.cortexDecisionId) && nullableString(identity.allocationSnapshotId) && nullableString(identity.canonicalCortexLaneId) &&
+    (identity.cortexFeatureSchemaVersion === null || identity.cortexFeatureSchemaVersion === CORTEX_FEATURE_SCHEMA_VERSION) &&
+    (identity.cortexDecisionId === null
+      ? identity.allocationSnapshotId === null && identity.canonicalCortexLaneId === null && identity.cortexFeatureSchemaVersion === null
+      : identity.allocationSnapshotId !== null && identity.canonicalCortexLaneId !== null && identity.cortexFeatureSchemaVersion === CORTEX_FEATURE_SCHEMA_VERSION) &&
     identity.outcomeId === outcomeId;
 };
 const validDecisionEvent = (event: unknown): event is DecisionSnapshotEvent => {
@@ -549,14 +560,17 @@ const validDecisionEvent = (event: unknown): event is DecisionSnapshotEvent => {
     [value.entryDecision.entryPrice, value.entryDecision.stopLoss, value.entryDecision.plannedStopDistanceBps].every(finite) &&
     Array.isArray(value.entryDecision.takeProfitLevels) && value.entryDecision.takeProfitLevels.every(finite) &&
     c != null && ["PRESENT", "MISSING"].includes(c.status) && nullableString(c.decisionId) &&
-    nullableFinite(c.snapshotAtMs) && (c.featureSchemaVersion === null || Number.isInteger(c.featureSchemaVersion)) &&
+    nullableFinite(c.snapshotAtMs) && (c.featureSchemaVersion === null || c.featureSchemaVersion === CORTEX_FEATURE_SCHEMA_VERSION) &&
     (c.featureVector === null || (Array.isArray(c.featureVector) && c.featureVector.every(finite))) &&
-    (c.status === "MISSING" || (
+    ((c.status === "PRESENT" && (
       nonEmpty(c.decisionId) && nonEmpty(value.identity.cortexDecisionId) && c.decisionId === value.identity.cortexDecisionId &&
-      nonEmpty(value.identity.allocationSnapshotId) && Number.isInteger(c.featureSchemaVersion) &&
+      nonEmpty(value.identity.allocationSnapshotId) && nonEmpty(value.identity.canonicalCortexLaneId) && c.featureSchemaVersion === CORTEX_FEATURE_SCHEMA_VERSION &&
       c.featureSchemaVersion === value.identity.cortexFeatureSchemaVersion && Array.isArray(c.featureVector) && c.featureVector.length > 0 &&
-      finite(c.snapshotAtMs) && c.snapshotAtMs <= value.asOfMs
-    ));
+      c.featureVector.length === CORTEX_FEATURE_DIM && finite(c.snapshotAtMs) && c.snapshotAtMs <= value.asOfMs &&
+      nonEmpty(c.regimeFamily) && c.regimeFamily.trim().toUpperCase() !== "UNKNOWN" &&
+      finite(c.finalPct) && finite(c.evalFinalPct) && typeof c.eligible === "boolean"
+    )) || (c.status === "MISSING" && c.decisionId === null && c.featureSchemaVersion === null && c.featureVector === null &&
+      c.snapshotAtMs === null && c.regimeFamily === null && c.eligible === null && c.finalPct === null && c.evalFinalPct === null));
 };
 const validOpenEvent = (event: unknown): event is OpportunityOpenEvent => {
   const value = event as OpportunityOpenEvent;

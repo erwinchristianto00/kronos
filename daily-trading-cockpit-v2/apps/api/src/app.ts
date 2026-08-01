@@ -178,6 +178,8 @@ import { getRegimeEdgeMemory } from "./lib/regime-edge-memory.js";
 import { cortexBrainMode } from "./lib/cortex-brain.js";
 import { CortexBrainStore, CortexDecisionJournal, runCortexShadowTick } from "./lib/cortex-brain-store.js";
 import { publishCortexDecisionSnapshotsForScan } from "./lib/cortex-decision-snapshot.js";
+import { allocationContextWithExactCortexPaperBridge } from "./lib/cortex-paper-allocation-bridge.js";
+import { cortexProductionChainDiagnostics } from "./lib/cortex-production-chain-diagnostics.js";
 import { standaloneCortexShadowAllowed } from "./lib/cortex-instance-diagnosis.js";
 import { runFourBrainShadowCycle } from "./lib/four-brain-live-wiring.js";
 import { classifyIncumbentLanes } from "./lib/four-brain-lane-support.js";
@@ -385,6 +387,12 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       service: "daily-trading-cockpit-v2-api",
     };
   });
+  // Read-only observability for exact CORTEX chain hand-offs. This endpoint has no control-plane
+  // side effects and cannot alter execution, allocation, or the shadow learner.
+  app.get("/api/cortex/production-chain-diagnostics", async () => ({
+    reportOnly: true,
+    counters: cortexProductionChainDiagnostics(),
+  }));
 
   const binanceClient = new BinanceClient(options.fetchImpl);
   const kronosClient = new HttpKronosClient(
@@ -1244,6 +1252,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           journal: cortexJournal,
           context,
           nowIso: new Date().toISOString(),
+          scanBatchId: cached?.scanBatchId ?? null,
           mode,
           resolvedThisCycle: 0,
           promotion,
@@ -2191,16 +2200,17 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     const cortexStandaloneShadowTick = () => {
       try {
         if (!standaloneCortexShadowAllowed({ env: process.env, liveEnginePresent: liveEngine != null })) return;
+        const cached = getLatestScanCandidates();
         const result = runCortexShadowTick({
           store: cortexStore,
           journal: cortexJournal,
           context: cortexStandaloneContext(),
           nowIso: new Date().toISOString(),
+          scanBatchId: cached?.scanBatchId ?? null,
           mode: "shadow",
           resolvedThisCycle: 0,
           promotion: null,
         });
-        const cached = getLatestScanCandidates();
         if (cached?.scanBatchId) publishCortexDecisionSnapshotsForScan(cached.scanBatchId, result.snapshots);
       } catch (err) {
         console.error("[cortex-shadow-standalone] tick failed", err);
@@ -2563,8 +2573,15 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         markPriceForSymbol: (symbol) => getLiveMarkPriceCacheStore().get(symbol),
         // Four-Brain receives strictly read-only, incumbent operator allocation telemetry. No synthetic
         // CORTEX id is created: beta remains zero and no exact promoted snapshot exists to hand off.
-        allocationContextForLane: (laneId) =>
-          staticAllocationContext(engine ? engine.rawLaneAllocationWeightPctForLane(laneId) : null),
+        allocationContextForLane: (laneId, candidate) => {
+          const base = staticAllocationContext(engine ? engine.rawLaneAllocationWeightPctForLane(laneId) : null);
+          return allocationContextWithExactCortexPaperBridge({
+            base,
+            candidate,
+            laneId,
+            orders: peekPaperExecutionRouterStore()?.all ?? [],
+          });
+        },
         // A review may only use a scanner context that was atomically persisted before the decision.
         // Missing/future scanner timestamps remain explicit unavailable lineage, never a latest-cache join.
         marketContext: (() => {

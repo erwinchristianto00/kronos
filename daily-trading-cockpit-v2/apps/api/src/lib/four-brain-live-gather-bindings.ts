@@ -322,7 +322,9 @@ export interface FourBrainBindingDeps {
   maxHoldMsForLane?: (laneId: string) => number | null;
 
   // ── Executive / incumbent ──
-  allocationContextForLane?: (laneId: string) => AllocationContext;
+  /** Candidate-owned allocation bridge. Callers may return a CORTEX identity only when the
+   * exact persisted paper candidate proves it; lane-only contexts remain static/null. */
+  allocationContextForLane?: (laneId: string, candidate?: { signalId: string | null; direction: "LONG" | "SHORT" }) => AllocationContext;
   marketContext?: MarketContextLineage;
   laneEligibleIncumbent: (laneId: string) => boolean;
   killLatched: boolean;
@@ -470,7 +472,7 @@ export function buildFourBrainGatherInput(dep: FourBrainBindingDeps): FourBrainG
       signalId: s.observationId, positionId: null, horizon: laneHorizon(s.laneId, { scalpEnabled: dep.scalpHorizonEnabled === true }), decisionAtMs: nowMs,
     };
     const exec: ExecContext = {
-      allocationContext: dep.allocationContextForLane?.(s.laneId) ?? staticAllocationContext(null),
+      allocationContext: dep.allocationContextForLane?.(s.laneId, { signalId: s.observationId, direction: s.direction }) ?? staticAllocationContext(null),
       marketContext: dep.marketContext ?? unavailableMarketContext(nowMs),
       laneEligibleIncumbent: dep.laneEligibleIncumbent(s.laneId),
       killLatched: dep.killLatched,

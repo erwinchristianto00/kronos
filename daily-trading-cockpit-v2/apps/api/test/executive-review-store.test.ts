@@ -23,6 +23,7 @@ const review = (overrides: Partial<ExecutiveReviewRecord> = {}): ExecutiveReview
   laneId: "LANE",
   marketContextSnapshotId: "market-1",
   allocationSnapshotId: "cortex-allocation-1",
+  canonicalCortexLaneId: "CG_WIDE_FAST_LONG",
   strategyAction: "ENTER",
   direction: "LONG",
   marketState: "BULLISH_TACTICAL",
@@ -39,6 +40,7 @@ const review = (overrides: Partial<ExecutiveReviewRecord> = {}): ExecutiveReview
   reasonCode: null,
   positionId: null,
   outcomeId: null,
+  executionIntentId: null,
   paperOrderId: "paper-1",
   ...overrides,
 });
@@ -53,6 +55,7 @@ const position = (overrides: Partial<ExecutiveReviewPositionLink> = {}): Executi
   laneId: "LANE",
   marketContextSnapshotId: "market-1",
   allocationSnapshotId: "cortex-allocation-1",
+  canonicalCortexLaneId: "CG_WIDE_FAST_LONG",
   entryAtMs: 110,
   originalRisk: 10,
   ambiguousOwnership: false,
@@ -68,6 +71,7 @@ const outcome = (overrides: Partial<ExecutiveReviewOutcomeLink> = {}): Executive
   opportunityId: "opportunity-1",
   positionId: "position-1",
   allocationSnapshotId: "cortex-allocation-1",
+  canonicalCortexLaneId: "CG_WIDE_FAST_LONG",
   outcomeId: "outcome-1",
   resolvedAtMs: 200,
   grossR: 0.25,
@@ -101,6 +105,7 @@ const tier1 = (): ExecutiveReviewOutcome => ({
   outcomeId: "outcome-1",
   marketContextSnapshotId: "market-1",
   allocationSnapshotId: "cortex-allocation-1",
+  canonicalCortexLaneId: "CG_WIDE_FAST_LONG",
   laneId: "LANE",
   direction: "LONG",
   marketState: "BULLISH_TACTICAL",
@@ -130,6 +135,21 @@ const tier1 = (): ExecutiveReviewOutcome => ({
 });
 
 describe("Executive Review Store", () => {
+  it("strictly rejects duplicate Tier-1 rows even when they reuse the same review owner", () => {
+    const dir = mkdtempSync(join(tmpdir(), "executive-review-duplicate-"));
+    try {
+      const file = join(dir, "reviews.json");
+      const resolved = review({
+        state: "TIER1_ELIGIBLE", executionIntentId: "intent-1", positionId: "position-1", outcomeId: "outcome-1",
+      });
+      const row = tier1();
+      writeFileSync(file, JSON.stringify({ version: 1, reviews: [resolved], tier1: [row, { ...row }], tier2: [], processedIds: [row.executiveReviewOutcomeId], rejected: [] }));
+      expect(readExecutiveReviewStoreStrict(file)).toMatchObject({ status: "EXECUTIVE_REVIEW_STORE_CORRUPTED" });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("gives the operator a strict corruption signal instead of silently dropping malformed Tier 1 evidence", () => {
     const dir = mkdtempSync(join(tmpdir(), "executive-review-strict-"));
     try {
@@ -255,6 +275,7 @@ describe("Executive Review Store", () => {
         laneId: record.laneId,
         marketContextSnapshotId: record.marketContextSnapshotId,
         allocationSnapshotId: record.allocationSnapshotId,
+        canonicalCortexLaneId: record.canonicalCortexLaneId,
         direction: record.direction,
         marketState: record.marketState,
         evidenceEra: record.evidenceEra,
@@ -303,6 +324,7 @@ describe("Executive Review Store", () => {
         laneId: first.laneId,
         marketContextSnapshotId: first.marketContextSnapshotId,
         allocationSnapshotId: first.allocationSnapshotId,
+        canonicalCortexLaneId: first.canonicalCortexLaneId,
         direction: first.direction,
         marketState: first.marketState,
         evidenceEra: first.evidenceEra,
@@ -349,6 +371,7 @@ describe("Executive Review Store", () => {
         laneId: record.laneId,
         marketContextSnapshotId: record.marketContextSnapshotId,
         allocationSnapshotId: record.allocationSnapshotId,
+        canonicalCortexLaneId: record.canonicalCortexLaneId,
         direction: record.direction,
         marketState: record.marketState,
         evidenceEra: record.evidenceEra,
@@ -403,6 +426,7 @@ describe("Executive Review Store", () => {
         laneId: record.laneId,
         marketContextSnapshotId: record.marketContextSnapshotId,
         allocationSnapshotId: record.allocationSnapshotId,
+        canonicalCortexLaneId: record.canonicalCortexLaneId,
         direction: record.direction,
         marketState: record.marketState,
         evidenceEra: record.evidenceEra,
@@ -456,6 +480,7 @@ describe("Executive Review Store", () => {
         laneId: record.laneId,
         marketContextSnapshotId: record.marketContextSnapshotId,
         allocationSnapshotId: record.allocationSnapshotId,
+        canonicalCortexLaneId: record.canonicalCortexLaneId,
         direction: record.direction,
         marketState: record.marketState,
         evidenceEra: record.evidenceEra,
@@ -507,6 +532,7 @@ describe("Executive Review Store", () => {
         laneId: record.laneId,
         marketContextSnapshotId: record.marketContextSnapshotId,
         allocationSnapshotId: record.allocationSnapshotId,
+        canonicalCortexLaneId: record.canonicalCortexLaneId,
         direction: record.direction,
         marketState: record.marketState,
         evidenceEra: record.evidenceEra,
@@ -556,6 +582,7 @@ describe("Executive Review Store", () => {
         laneId: record.laneId,
         marketContextSnapshotId: record.marketContextSnapshotId,
         allocationSnapshotId: record.allocationSnapshotId,
+        canonicalCortexLaneId: record.canonicalCortexLaneId,
         direction: record.direction,
         marketState: record.marketState,
         evidenceEra: record.evidenceEra,
@@ -613,6 +640,7 @@ describe("Executive Review Store", () => {
         laneId: record.laneId,
         marketContextSnapshotId: record.marketContextSnapshotId,
         allocationSnapshotId: record.allocationSnapshotId,
+        canonicalCortexLaneId: record.canonicalCortexLaneId,
         direction: record.direction,
         marketState: record.marketState,
         evidenceEra: record.evidenceEra,
@@ -676,6 +704,7 @@ describe("Executive Review Store", () => {
         laneId: record.laneId,
         marketContextSnapshotId: record.marketContextSnapshotId,
         allocationSnapshotId: record.allocationSnapshotId,
+        canonicalCortexLaneId: record.canonicalCortexLaneId,
         direction: record.direction,
         marketState: record.marketState,
         evidenceEra: record.evidenceEra,
@@ -727,7 +756,7 @@ describe("Executive Review Store", () => {
         settlementFetchComplete: false, requiredOrderIds: ["order-1", "exit-1"], matchedRequiredOrderIds: ["exit-1"], missingRequiredOrderIds: ["order-1"],
         executiveReviewLink: {
           executiveReviewId: "review-1", candidateId: "candidate-1", opportunityId: "opportunity-1", laneId: "LANE",
-          marketContextSnapshotId: "market-1", allocationSnapshotId: "cortex-allocation-1", direction: "LONG", marketState: "BULLISH_TACTICAL", evidenceEra: "post-fix/1",
+          marketContextSnapshotId: "market-1", allocationSnapshotId: "cortex-allocation-1", canonicalCortexLaneId: "CG_WIDE_FAST_LONG", direction: "LONG", marketState: "BULLISH_TACTICAL", evidenceEra: "post-fix/1",
           decisionPipelinePolicyVersion: "decision/1", executionPolicyVersion: "execution/1", evidencePolicyVersion: "evidence/1", fourBrainPolicyVersion: "four-brain/1",
         },
       } as LiveIntent;

@@ -69,7 +69,9 @@ import {
   type LaneConfidence,
   type PaperOrder,
 } from "./paper-execution-router.js";
-import type { CortexDecisionSnapshot } from "./cortex-decision-snapshot.js";
+import { exactCortexDecisionSnapshotForScan, type CortexDecisionSnapshot } from "./cortex-decision-snapshot.js";
+import { canonicalCortexLaneForPaperLane } from "./paper-cortex-lane-mapping.js";
+import { recordCortexProductionChainDiagnostic } from "./cortex-production-chain-diagnostics.js";
 import {
   buildMixedAdmissionDecisionLedger,
   buildMixedRegimeReport,
@@ -203,6 +205,12 @@ export interface PaperOpportunityAllocatorReport {
   paperOrdersCreated: number;
   duplicateSuppressed: number;
   rejected: number;
+  /** Report-only exact CORTEX hand-off diagnostics. They never affect allocation or admission. */
+  cortexLinkageDiagnostics: {
+    CORTEX_SNAPSHOT_SCAN_MISSING: number;
+    CORTEX_PAPER_LANE_UNMAPPED: number;
+    CORTEX_CANONICAL_LANE_MISMATCH: number;
+  };
 
   // ── adaptive lane quarantine / diagnostic-mode state ──────────────────────
   /** Posture of the active paper lane this batch. */
@@ -1402,6 +1410,11 @@ export function buildPaperOpportunityAllocatorReport(
     paperOrdersCreated: 0,
     duplicateSuppressed: 0,
     rejected: 0,
+    cortexLinkageDiagnostics: {
+      CORTEX_SNAPSHOT_SCAN_MISSING: 0,
+      CORTEX_PAPER_LANE_UNMAPPED: 0,
+      CORTEX_CANONICAL_LANE_MISMATCH: 0,
+    },
     laneAdmissionStatus: laneDecision.laneAdmissionStatus,
     rotationAction: laneDecision.rotationAction,
     paperOrderMode: laneDecision.batchOrderMode === "DIAGNOSTIC_ONLY" ? "DIAGNOSTIC_ONLY" : "HEADLINE",
@@ -2092,9 +2105,31 @@ export function buildPaperOpportunityAllocatorReport(
       }
 
       const buildOpportunity = (mode: PaperOrderMode): PaperOpportunity => {
-        const cortexDecisionSnapshot = inputs.cortexDecisionSnapshots?.find((snapshot) =>
-          snapshot.laneId === laneId && snapshot.direction === direction,
-        ) ?? null;
+        const canonicalCortexLaneId = canonicalCortexLaneForPaperLane(laneId, direction);
+        if (!canonicalCortexLaneId) {
+          report.cortexLinkageDiagnostics.CORTEX_PAPER_LANE_UNMAPPED += 1;
+          recordCortexProductionChainDiagnostic("CORTEX_PAPER_LANE_UNMAPPED");
+        }
+        const sameScanSnapshots = (inputs.cortexDecisionSnapshots ?? []).filter((snapshot) =>
+          snapshot.scanBatchId === inputs.scanBatchId && snapshot.direction === direction,
+        );
+        const cortexDecisionSnapshot = canonicalCortexLaneId
+          ? exactCortexDecisionSnapshotForScan({
+            scanBatchId: inputs.scanBatchId,
+            canonicalCortexLaneId,
+            direction,
+            snapshots: inputs.cortexDecisionSnapshots,
+          })
+          : null;
+        if (canonicalCortexLaneId && !cortexDecisionSnapshot) {
+          if (sameScanSnapshots.some((snapshot) => snapshot.laneId !== canonicalCortexLaneId)) {
+            report.cortexLinkageDiagnostics.CORTEX_CANONICAL_LANE_MISMATCH += 1;
+            recordCortexProductionChainDiagnostic("CORTEX_CANONICAL_LANE_MISMATCH");
+          } else {
+            report.cortexLinkageDiagnostics.CORTEX_SNAPSHOT_SCAN_MISSING += 1;
+            recordCortexProductionChainDiagnostic("CORTEX_SNAPSHOT_SCAN_MISSING");
+          }
+        }
         const manualCgWideTarget =
           def.id === "CG_WIDE_STOP_TP_WIDE"
             ? cgWideTargetFromEntry(geo.entryPrice, direction, paperControls.cgWideTpPct)
@@ -2188,6 +2223,7 @@ export function buildPaperOpportunityAllocatorReport(
           budgetUsed: mixedBudgetLedgerEntry?.budgetUsed,
           budgetReason: mixedBudgetLedgerEntry?.occupancyReason,
           cortexDecisionSnapshot,
+          canonicalCortexLaneId,
           cortexDecisionId: cortexDecisionSnapshot?.decisionId ?? null,
           cortexAllocationSnapshotId: cortexDecisionSnapshot?.allocationSnapshotId ?? null,
         };
