@@ -29,7 +29,7 @@ import {
 } from "../experience-engine/cortex-experience-bridge.js";
 import type { CanonicalPolicyContext, ForwardEvent } from "../experience-engine/forward-causal-collection.js";
 
-export const CORTEX_SHADOW_REFIT_SCHEMA_VERSION = "cortex-shadow-refit/2" as const;
+export const CORTEX_SHADOW_REFIT_SCHEMA_VERSION = "cortex-shadow-refit/3" as const;
 export const CORTEX_SHADOW_REFIT_DEFAULT_EPOCH = "2026-08-01T07:19:35.000Z";
 export const CORTEX_SHADOW_REFIT_REGISTRY_FILE = "cortex-shadow-refit-candidates.json";
 export const CORTEX_SHADOW_REFIT_SCHEDULER_ENV = "CORTEX_SHADOW_REFIT_SCHEDULER_ENABLED";
@@ -179,6 +179,8 @@ export interface CortexShadowRefitRegistry {
   readonly schemaVersion: typeof CORTEX_SHADOW_REFIT_SCHEMA_VERSION;
   readonly integrityStatus: "HEALTHY" | "REGISTRY_CORRUPTED";
   readonly integrityError: string | null;
+  /** Covers every persisted audit/readiness field as well as candidate content. */
+  readonly registryIntegrityHash: string;
   readonly candidates: readonly CortexShadowCandidateGeneration[];
   readonly lastDatasetHash: string | null;
   readonly lastGenerationFingerprint: string | null;
@@ -589,11 +591,29 @@ function candidateForDataset(
   return { ...unsigned, integrityHash: hash(candidateIntegrityContent(unsigned)) };
 }
 
+type UnsignedCortexShadowRefitRegistry = Omit<CortexShadowRefitRegistry, "registryIntegrityHash">;
+
+/** Runtime corruption state is deliberately excluded. The on-disk signature covers every canonical
+ * persisted field, including `lastAudit`, so readiness counters cannot be edited independently. */
+function registryIntegrityContent(registry: UnsignedCortexShadowRefitRegistry | CortexShadowRefitRegistry): unknown {
+  const {
+    integrityStatus: _integrityStatus,
+    integrityError: _integrityError,
+    registryIntegrityHash: _registryIntegrityHash,
+    ...content
+  } = registry as CortexShadowRefitRegistry;
+  return content;
+}
+
+function sealRegistry(registry: UnsignedCortexShadowRefitRegistry): CortexShadowRefitRegistry {
+  return { ...registry, registryIntegrityHash: hash(registryIntegrityContent(registry)) };
+}
+
 function defaultRegistry(): CortexShadowRefitRegistry {
-  return {
+  return sealRegistry({
     schemaVersion: CORTEX_SHADOW_REFIT_SCHEMA_VERSION, integrityStatus: "HEALTHY", integrityError: null,
     candidates: [], lastDatasetHash: null, lastGenerationFingerprint: null, lastAudit: null,
-  };
+  });
 }
 
 function validCandidate(candidate: CortexShadowCandidateGeneration): boolean {
@@ -633,25 +653,28 @@ export class CortexShadowRefitRegistryStore {
   }
   get(): CortexShadowRefitRegistry { return this.state; }
   isCorrupted(): boolean { return this.state.integrityStatus === "REGISTRY_CORRUPTED"; }
-  save(next: CortexShadowRefitRegistry): void {
+  save(next: UnsignedCortexShadowRefitRegistry | CortexShadowRefitRegistry): void {
     if (this.isCorrupted()) throw new Error("refusing to overwrite a corrupted CORTEX shadow registry");
-    if (next.schemaVersion !== CORTEX_SHADOW_REFIT_SCHEMA_VERSION || next.integrityStatus !== "HEALTHY" || !next.candidates.every(validCandidate)) {
+    const persisted = sealRegistry({ ...next, integrityStatus: "HEALTHY", integrityError: null });
+    if (persisted.schemaVersion !== CORTEX_SHADOW_REFIT_SCHEMA_VERSION || !persisted.candidates.every(validCandidate)) {
       throw new Error("refusing to persist an invalid CORTEX shadow registry");
     }
-    this.atomicWrite(this.file, JSON.stringify(next));
+    this.atomicWrite(this.file, JSON.stringify(persisted));
     // Keep a parseable last-known-good snapshot after the primary rename succeeds. It is only used
     // when a later crash/truncation corrupts the primary file, never as a normal alternate source.
-    this.atomicWrite(`${this.file}.bak`, JSON.stringify(next));
-    this.state = next;
+    this.atomicWrite(`${this.file}.bak`, JSON.stringify(persisted));
+    this.state = persisted;
   }
   private readValid(file: string): CortexShadowRefitRegistry | null {
     try {
       const parsed = JSON.parse(readFileSync(file, "utf8")) as CortexShadowRefitRegistry;
       if (
         parsed.schemaVersion !== CORTEX_SHADOW_REFIT_SCHEMA_VERSION || parsed.integrityStatus !== "HEALTHY" ||
+        typeof parsed.registryIntegrityHash !== "string" || parsed.registryIntegrityHash.length !== 64 ||
         !Array.isArray(parsed.candidates) || !parsed.candidates.every(validCandidate) ||
         !(parsed.lastDatasetHash === null || typeof parsed.lastDatasetHash === "string") ||
-        !(parsed.lastGenerationFingerprint === null || typeof parsed.lastGenerationFingerprint === "string")
+        !(parsed.lastGenerationFingerprint === null || typeof parsed.lastGenerationFingerprint === "string") ||
+        parsed.registryIntegrityHash !== hash(registryIntegrityContent(parsed))
       ) return null;
       return { ...parsed, candidates: [...parsed.candidates], integrityError: null };
     } catch { return null; }

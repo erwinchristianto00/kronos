@@ -306,6 +306,20 @@ describe("CORTEX shadow refit learner v1", () => {
     expect(blocked.blockers).toContain("REGISTRY_CORRUPTED");
   });
 
+  it("detects tampered audit/readiness fields even when every candidate remains intact", () => {
+    const dir = temp(); const file = join(dir, "registry.json"); const registry = new CortexShadowRefitRegistryStore(file);
+    const input = dataset(44);
+    runCortexShadowRefit({ ...input, policy, incumbent: emptyCortexState(), registry, nowMs: epochMs + 200_000_000 });
+    const tampered = JSON.parse(readFileSync(file, "utf8"));
+    tampered.lastAudit.dataset.examined += 100;
+    tampered.lastAudit.status = "NO_NEW_ELIGIBLE_DATA";
+    writeFileSync(file, JSON.stringify(tampered));
+    const recovered = new CortexShadowRefitRegistryStore(file);
+    expect(recovered.get().integrityStatus).toBe("REGISTRY_CORRUPTED");
+    expect(recovered.get().candidates).toHaveLength(1);
+    expect(recovered.get().lastAudit!.dataset.examined).toBe(44); // valid .bak, not forged readiness
+  });
+
   it("fails closed for insufficient effective evidence instead of inventing zero coefficients", () => {
     const dir = temp(); const registry = new CortexShadowRefitRegistryStore(join(dir, "registry.json"));
     const report = runCortexShadowRefit({ ...dataset(4), policy, incumbent: emptyCortexState(), registry, nowMs: epochMs + 200_000_000 });
