@@ -41,6 +41,10 @@ describe("CORTEX operator deployed-code provenance", () => {
       "daily-trading-cockpit-v2/apps/api/src/lib/four-brain-live-gather-bindings.ts",
       "daily-trading-cockpit-v2/apps/api/src/lib/four-brain-economic-experience.ts",
       "daily-trading-cockpit-v2/apps/api/src/experience-engine/cortex-experience-bridge.ts",
+      "daily-trading-cockpit-v2/apps/api/package.json",
+      "daily-trading-cockpit-v2/apps/api/tsconfig.json",
+      "daily-trading-cockpit-v2/tsconfig.base.json",
+      "daily-trading-cockpit-v2/packages/shared/package.json",
     ]));
   });
 
@@ -67,10 +71,27 @@ describe("CORTEX operator deployed-code provenance", () => {
     expect(verifyCortexOperatorCodeProvenance(repo.api, {}, { value: repo.sha, source: "git:HEAD" }).status).toBe("VALID");
   });
 
+  it("fails closed when the operator invocation contract changes", () => {
+    const repo = repository(); const packageFile = resolve(repo.api, "package.json");
+    const packageJson = JSON.parse(readFileSync(packageFile, "utf8")) as { scripts: Record<string, string> };
+    packageJson.scripts["cortex:shadow-refit"] = "tsx scripts/not-the-operator.ts";
+    writeFileSync(packageFile, JSON.stringify(packageJson));
+    expect(verifyCortexOperatorCodeProvenance(repo.api, {}, { value: repo.sha, source: "git:HEAD" }).status).toBe("IMPORT_CLOSURE_INVALID");
+    git(repo.root, ["checkout", "--", "daily-trading-cockpit-v2/apps/api/package.json"]);
+    const tsconfigFile = resolve(repo.api, "tsconfig.json");
+    const tsconfig = JSON.parse(readFileSync(tsconfigFile, "utf8")) as { compilerOptions: { paths: Record<string, string[]> } };
+    tsconfig.compilerOptions.paths["@dtc/shared"] = ["../../packages/shared/src/other.ts"];
+    writeFileSync(tsconfigFile, JSON.stringify(tsconfig));
+    expect(verifyCortexOperatorCodeProvenance(repo.api, {}, { value: repo.sha, source: "git:HEAD" }).status).toBe("IMPORT_CLOSURE_INVALID");
+  });
+
   it("requires an exact manifest closure and Git blob identity", () => {
     const repo = repository(); const file = resolve(repo.api, "manifest.json");
     writeFileSync(file, JSON.stringify(manifest(repo)));
     expect(verifyCortexOperatorCodeProvenance(repo.api, { DEPLOYMENT_MANIFEST_PATH: "manifest.json" }, { value: repo.sha, source: "git:HEAD" })).toMatchObject({ status: "VALID", sha: repo.sha });
+    const tree = git(repo.root, ["rev-parse", `${repo.sha}^{tree}`]);
+    writeFileSync(file, JSON.stringify(manifest(repo, tree)));
+    expect(verifyCortexOperatorCodeProvenance(repo.api, { DEPLOYMENT_MANIFEST_PATH: "manifest.json" }, { value: repo.sha, source: "git:HEAD" }).status).toBe("DEPLOYMENT_MANIFEST_INVALID");
     writeFileSync(file, JSON.stringify({ ...manifest(repo), schemaVersion: "unknown" }));
     expect(verifyCortexOperatorCodeProvenance(repo.api, { DEPLOYMENT_MANIFEST_PATH: "manifest.json" }, { value: repo.sha, source: "git:HEAD" }).status).toBe("DEPLOYMENT_MANIFEST_INVALID");
     const traversal = manifest(repo); traversal.files[0] = { ...traversal.files[0]!, path: "../escape.ts" }; writeFileSync(file, JSON.stringify(traversal));

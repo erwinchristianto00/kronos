@@ -69,6 +69,12 @@ const sha = (contents: Buffer | string): string => createHash("sha256").update(c
 const validSha = (value: string | null): value is string => value != null && /^[a-f0-9]{40}$/i.test(value);
 const inside = (root: string, candidate: string): boolean => relative(root, candidate) === "" || !relative(root, candidate).startsWith(".." + "/") && relative(root, candidate) !== "..";
 export const OPERATOR_SOURCE_ENTRYPOINTS = ["scripts/cortex-shadow-refit-operator.ts", "src/lib/cortex-shadow-refit-operator.ts"] as const;
+const OPERATOR_CONFIGURATION_FILES = [
+  "daily-trading-cockpit-v2/apps/api/package.json",
+  "daily-trading-cockpit-v2/apps/api/tsconfig.json",
+  "daily-trading-cockpit-v2/tsconfig.base.json",
+  "daily-trading-cockpit-v2/packages/shared/package.json",
+] as const;
 export interface CortexOperatorCodeProvenance {
   readonly status: "VALID" | "CODE_VERSION_UNRESOLVED" | "GIT_ROOT_UNRESOLVED" | "IMPORT_CLOSURE_INVALID" | "DEPLOYMENT_MANIFEST_INVALID" | "DEPLOYED_SOURCE_HASH_MISMATCH" | "GIT_SOURCE_MISMATCH";
   readonly sha: string | null;
@@ -153,6 +159,19 @@ function resolveProductionImport(root: string, appRoot: string, source: string, 
   }
   return null;
 }
+function validOperatorInvocationContracts(root: string): boolean {
+  try {
+    const apiPackage = JSON.parse(readFileSync(resolve(root, OPERATOR_CONFIGURATION_FILES[0]), "utf8")) as { scripts?: Record<string, unknown> };
+    const apiTsconfig = JSON.parse(readFileSync(resolve(root, OPERATOR_CONFIGURATION_FILES[1]), "utf8")) as { compilerOptions?: { paths?: Record<string, unknown> } };
+    const sharedAlias = apiTsconfig.compilerOptions?.paths?.["@dtc/shared"];
+    JSON.parse(readFileSync(resolve(root, OPERATOR_CONFIGURATION_FILES[2]), "utf8"));
+    JSON.parse(readFileSync(resolve(root, OPERATOR_CONFIGURATION_FILES[3]), "utf8"));
+    return apiPackage.scripts?.["cortex:shadow-refit"] === "tsx scripts/cortex-shadow-refit-operator.ts"
+      && Array.isArray(sharedAlias)
+      && sharedAlias.length === 1
+      && sharedAlias[0] === "../../packages/shared/src/index.ts";
+  } catch { return false; }
+}
 /** Deterministic recursive TypeScript production import closure for the operator's two entrypoints. */
 export function resolveCortexOperatorSourceClosure(cwd: string): { readonly root: string; readonly files: readonly CortexOperatorFile[] } | { readonly blocker: "GIT_ROOT_UNRESOLVED" | "IMPORT_CLOSURE_INVALID" } {
   const root = gitWorktreeRoot(cwd); if (!root) return { blocker: "GIT_ROOT_UNRESOLVED" };
@@ -160,6 +179,9 @@ export function resolveCortexOperatorSourceClosure(cwd: string): { readonly root
   try { appRoot = realpathSync(cwd); } catch { return { blocker: "GIT_ROOT_UNRESOLVED" }; }
   const starts = OPERATOR_SOURCE_ENTRYPOINTS.map((entry) => repoPath(root, resolve(appRoot, entry)));
   if (starts.some((entry) => entry == null)) return { blocker: "IMPORT_CLOSURE_INVALID" };
+  if (!OPERATOR_CONFIGURATION_FILES.every((path) => {
+    try { return lstatSync(resolve(root, path)).isFile(); } catch { return false; }
+  }) || !validOperatorInvocationContracts(root)) return { blocker: "IMPORT_CLOSURE_INVALID" };
   const queue = [...starts as string[]]; const seen = new Set<string>();
   const importPattern = /\b(?:from|import)\s*\(?\s*["']([^"']+)["']/g;
   while (queue.length) {
@@ -173,7 +195,7 @@ export function resolveCortexOperatorSourceClosure(cwd: string): { readonly root
     }
   }
   try {
-    return { root, files: [...seen].sort().map((path) => {
+    return { root, files: [...new Set([...seen, ...OPERATOR_CONFIGURATION_FILES])].sort().map((path) => {
       const contents = readFileSync(resolve(root, path)); const stat = statSync(resolve(root, path));
       return { path, sha256: sha(contents), size: contents.length, mtimeMs: stat.mtimeMs };
     }) };
@@ -190,6 +212,8 @@ function readDeploymentManifest(file: string, root: string, files: readonly Cort
     const raw = JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>;
     const commit = typeof raw.commitSha === "string" ? raw.commitSha : null; const entries = raw.files;
     if (raw.schemaVersion !== "cortex-operator-deployment-manifest/1" || !validSha(commit) || !Array.isArray(entries)) return { status: "DEPLOYMENT_MANIFEST_INVALID", sha: null, source: `manifest:${file}`, files: [] };
+    const resolvedCommit = command(root, ["rev-parse", `${commit}^{commit}`]);
+    if (resolvedCommit !== commit) return { status: "DEPLOYMENT_MANIFEST_INVALID", sha: null, source: `manifest:${file}`, files: [] };
     const expected = new Map(files.map((entry) => [entry.path, entry.sha256])); const actual = new Map<string, string>();
     for (const entry of entries) {
       if (!entry || typeof entry !== "object" || Array.isArray(entry)) return { status: "DEPLOYMENT_MANIFEST_INVALID", sha: null, source: `manifest:${file}`, files: [] };
