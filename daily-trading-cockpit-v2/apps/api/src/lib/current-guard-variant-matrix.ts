@@ -136,6 +136,28 @@ export type VariantMatrixStatus =
   | "PROMOTION_CANDIDATE"
   | "REJECT";
 
+/**
+ * The canonical proof cohort. Direction and market context are intentionally a
+ * single key: a lane can be valid for LONG_BULLISH without claiming anything
+ * about the same geometry during a mixed or bearish market.
+ */
+export type ExactLaneContext =
+  | "LONG_BULLISH"
+  | "SHORT_BEARISH"
+  | "LONG_MIXED"
+  | "SHORT_MIXED";
+
+export type ContextLaneStatus = VariantMatrixStatus | "NOT_APPLICABLE";
+
+const ALL_EXACT_LANE_CONTEXTS: readonly ExactLaneContext[] = [
+  "LONG_BULLISH",
+  "SHORT_BEARISH",
+  "LONG_MIXED",
+  "SHORT_MIXED",
+];
+const LONG_EXACT_LANE_CONTEXTS: readonly ExactLaneContext[] = ["LONG_BULLISH", "LONG_MIXED"];
+const SHORT_EXACT_LANE_CONTEXTS: readonly ExactLaneContext[] = ["SHORT_BEARISH", "SHORT_MIXED"];
+
 // --- Cost model (per-variant, honest: cost in R = roundTripBps / stopDistanceBps) ---
 // Wider stops therefore carry a smaller cost-in-R, which is the single most
 // important geometry fact the edge audit surfaced.
@@ -438,6 +460,8 @@ export const PROMOTION_MIN_DISTINCT_REGIMES = 2;
 export interface VariantMatrixVariantDefinition {
   id: VariantMatrixVariantId;
   label: string;
+  /** Exact market contexts this geometry is designed to prove. Never inferred from its label. */
+  applicableContexts: readonly ExactLaneContext[];
   exitRule: VariantExitRule;
   fillMode: VariantFillMode;
   costModel: VariantFillMode; // "taker" or "maker_limit" cost basis
@@ -484,6 +508,7 @@ export const VARIANT_MATRIX_DEFINITIONS: readonly VariantMatrixVariantDefinition
   {
     id: "CG_BASELINE_CURRENT",
     label: "Baseline current geometry (tp1 full exit)",
+    applicableContexts: ALL_EXACT_LANE_CONTEXTS,
     exitRule: "tp1_full",
     fillMode: "taker",
     costModel: "taker",
@@ -492,6 +517,7 @@ export const VARIANT_MATRIX_DEFINITIONS: readonly VariantMatrixVariantDefinition
   {
     id: "CG_WIDE_STOP_TP_WIDE",
     label: "Wide stop (>=300bps) with widened TP (1.5R payoff)",
+    applicableContexts: ALL_EXACT_LANE_CONTEXTS,
     exitRule: "tp1_full",
     fillMode: "taker",
     costModel: "taker",
@@ -503,6 +529,7 @@ export const VARIANT_MATRIX_DEFINITIONS: readonly VariantMatrixVariantDefinition
   {
     id: "CG_TRAIL_AFTER_TP1",
     label: "Wide stop (>=300bps) with trail after 1R touch",
+    applicableContexts: ALL_EXACT_LANE_CONTEXTS,
     exitRule: "trail_after_tp1",
     fillMode: "taker",
     costModel: "taker",
@@ -511,6 +538,7 @@ export const VARIANT_MATRIX_DEFINITIONS: readonly VariantMatrixVariantDefinition
   {
     id: "CG_SCALEOUT_TP1_TRAIL",
     label: "Scale out 50% at TP1, trail the runner",
+    applicableContexts: ALL_EXACT_LANE_CONTEXTS,
     exitRule: "scaleout_tp1_trail",
     fillMode: "taker",
     costModel: "taker",
@@ -519,6 +547,7 @@ export const VARIANT_MATRIX_DEFINITIONS: readonly VariantMatrixVariantDefinition
   {
     id: "CG_NO_FIB500_ENTRYSET",
     label: "Baseline excluding fib_500_entry signals",
+    applicableContexts: ALL_EXACT_LANE_CONTEXTS,
     exitRule: "tp1_full",
     fillMode: "taker",
     costModel: "taker",
@@ -527,6 +556,7 @@ export const VARIANT_MATRIX_DEFINITIONS: readonly VariantMatrixVariantDefinition
   {
     id: "CG_MAKER_LIMIT_SIM",
     label: "Maker/limit entry (no-fill risk) with maker cost",
+    applicableContexts: ALL_EXACT_LANE_CONTEXTS,
     exitRule: "tp1_full",
     fillMode: "maker_limit",
     costModel: "maker_limit",
@@ -535,6 +565,7 @@ export const VARIANT_MATRIX_DEFINITIONS: readonly VariantMatrixVariantDefinition
   {
     id: BULL_TREND_VARIANT_ID,
     label: "Bull trend: stop >=200bps, TP 1.5R (full exit)",
+    applicableContexts: ["LONG_BULLISH"],
     exitRule: "tp1_full",
     fillMode: "taker",
     costModel: "taker",
@@ -550,6 +581,7 @@ export const VARIANT_MATRIX_DEFINITIONS: readonly VariantMatrixVariantDefinition
   {
     id: BULL_SCALEOUT_VARIANT_ID,
     label: "Bull trend: stop >=200bps, scaleout 50% at 1R + BE runner",
+    applicableContexts: ["LONG_BULLISH"],
     exitRule: "scaleout_tp1_trail",
     fillMode: "taker",
     costModel: "taker",
@@ -565,6 +597,7 @@ export const VARIANT_MATRIX_DEFINITIONS: readonly VariantMatrixVariantDefinition
   {
     id: "LG_R12_STOP250_FULL",
     label: "Long: stop ≥250bps, TP 1.2R (full exit)",
+    applicableContexts: LONG_EXACT_LANE_CONTEXTS,
     exitRule: "tp1_full",
     fillMode: "taker",
     costModel: "taker",
@@ -576,6 +609,7 @@ export const VARIANT_MATRIX_DEFINITIONS: readonly VariantMatrixVariantDefinition
   {
     id: "LG_R12_STOP300_FULL",
     label: "Long: stop ≥300bps, TP 1.2R (full exit)",
+    applicableContexts: LONG_EXACT_LANE_CONTEXTS,
     exitRule: "tp1_full",
     fillMode: "taker",
     costModel: "taker",
@@ -591,6 +625,7 @@ export const VARIANT_MATRIX_DEFINITIONS: readonly VariantMatrixVariantDefinition
     // ranker selects it on score — competing on evidence, not list position.
     id: "CG_WIDE_LONG_RUNNER",
     label: "LONG let-it-run: wide >=300bps stop, far 3R TP, ~6-day hold",
+    applicableContexts: ["LONG_BULLISH"],
     exitRule: "tp1_full",
     fillMode: "taker",
     costModel: "taker",
@@ -617,6 +652,7 @@ export const VARIANT_MATRIX_DEFINITIONS: readonly VariantMatrixVariantDefinition
     // SHORT-only. Placed last so it never preempts a default lane on a score tie.
     id: "CG_WIDE_FAST_SHORT",
     label: "SHORT fast-TP: wide >=300bps stop, near 0.5R TP",
+    applicableContexts: SHORT_EXACT_LANE_CONTEXTS,
     exitRule: "tp1_full",
     fillMode: "taker",
     costModel: "taker",
@@ -641,6 +677,7 @@ export const VARIANT_MATRIX_DEFINITIONS: readonly VariantMatrixVariantDefinition
     // shadow positions close, not a fast-maturing lane.
     id: "CG_WIDE_FAST_LONG",
     label: "LONG fast-TP: wide >=300bps stop, near 0.5R TP",
+    applicableContexts: LONG_EXACT_LANE_CONTEXTS,
     exitRule: "tp1_full",
     fillMode: "taker",
     costModel: "taker",
@@ -659,6 +696,7 @@ export const VARIANT_MATRIX_DEFINITIONS: readonly VariantMatrixVariantDefinition
     // test whether the wide-stop tail (not the entry) is what kills the longs.
     id: "CG_TIGHT_FAST_05",
     label: "Tight native stop (~175bps) + fast 0.5R TP",
+    applicableContexts: ALL_EXACT_LANE_CONTEXTS,
     exitRule: "tp1_full",
     fillMode: "taker",
     costModel: "taker",
@@ -676,6 +714,7 @@ export const VARIANT_MATRIX_DEFINITIONS: readonly VariantMatrixVariantDefinition
     // re-introducing the wide-stop tail.
     id: "CG_BE_AFTER_05",
     label: "Breakeven after 0.5R touch, ride the runner",
+    applicableContexts: ALL_EXACT_LANE_CONTEXTS,
     exitRule: "trail_after_tp1",
     fillMode: "taker",
     costModel: "taker",
@@ -699,6 +738,7 @@ export const VARIANT_MATRIX_DEFINITIONS: readonly VariantMatrixVariantDefinition
     // on the SAME far-TP geometry: does banking the fade beat riding to TP/stop?
     id: "CG_MFE_GIVEBACK",
     label: "MFE-giveback exit (wide stop, 3R TP — bank the faded runner)",
+    applicableContexts: ALL_EXACT_LANE_CONTEXTS,
     exitRule: "mfe_giveback",
     fillMode: "taker",
     costModel: "taker",
@@ -720,6 +760,7 @@ export const VARIANT_MATRIX_DEFINITIONS: readonly VariantMatrixVariantDefinition
     // baseline's miss purely a TP-placement problem?". Direction-agnostic; prove OOS before promotion.
     id: "CG_BASELINE_FAST_05",
     label: "Baseline entry + fast 0.5R TP (raw stop)",
+    applicableContexts: ALL_EXACT_LANE_CONTEXTS,
     exitRule: "tp1_full",
     fillMode: "taker",
     costModel: "taker",
@@ -738,6 +779,7 @@ export const VARIANT_MATRIX_DEFINITIONS: readonly VariantMatrixVariantDefinition
     // and TP (0.5R) differ from CG_BASELINE_FAST_05. Direction-agnostic; prove OOS before promotion.
     id: "CG_MAKER_FAST_05",
     label: "Maker entry + fast 0.5R TP (raw stop, maker cost)",
+    applicableContexts: ALL_EXACT_LANE_CONTEXTS,
     exitRule: "tp1_full",
     fillMode: "maker_limit",
     costModel: "maker_limit",
@@ -751,6 +793,7 @@ export const VARIANT_MATRIX_DEFINITIONS: readonly VariantMatrixVariantDefinition
   {
     id: "CG_EXP_LONG_WIDE_FAST_10X",
     label: "EXP LONG 10x: wide stop, ultra-fast 0.25R TP",
+    applicableContexts: LONG_EXACT_LANE_CONTEXTS,
     exitRule: "tp1_full",
     fillMode: "taker",
     costModel: "taker",
@@ -768,6 +811,7 @@ export const VARIANT_MATRIX_DEFINITIONS: readonly VariantMatrixVariantDefinition
   {
     id: "CG_EXP_LONG_TIGHT_FAST_10X",
     label: "EXP LONG 10x: tight stop, ultra-fast 0.25R TP",
+    applicableContexts: LONG_EXACT_LANE_CONTEXTS,
     exitRule: "tp1_full",
     fillMode: "taker",
     costModel: "taker",
@@ -785,6 +829,7 @@ export const VARIANT_MATRIX_DEFINITIONS: readonly VariantMatrixVariantDefinition
   {
     id: "CG_EXP_LONG_MFE_GIVEBACK_10X",
     label: "EXP LONG 10x: MFE giveback, 1R cap",
+    applicableContexts: LONG_EXACT_LANE_CONTEXTS,
     exitRule: "mfe_giveback",
     fillMode: "taker",
     costModel: "taker",
@@ -802,6 +847,7 @@ export const VARIANT_MATRIX_DEFINITIONS: readonly VariantMatrixVariantDefinition
   {
     id: "CG_EXP_SHORT_MFE_GIVEBACK_10X",
     label: "EXP SHORT 10x: MFE giveback, 1R cap",
+    applicableContexts: SHORT_EXACT_LANE_CONTEXTS,
     exitRule: "mfe_giveback",
     fillMode: "taker",
     costModel: "taker",
@@ -819,6 +865,7 @@ export const VARIANT_MATRIX_DEFINITIONS: readonly VariantMatrixVariantDefinition
   {
     id: "CG_EXP_SHORT_WIDE_FAST_10X",
     label: "EXP SHORT 10x: wide stop, ultra-fast 0.25R TP",
+    applicableContexts: SHORT_EXACT_LANE_CONTEXTS,
     exitRule: "tp1_full",
     fillMode: "taker",
     costModel: "taker",
@@ -3077,6 +3124,54 @@ export interface CurrentGuardVariantMatrixRow {
   statusReason: string;
   blockers: string[];
   cautions: string[];
+
+  /** Aggregate-only diagnostic. It must never veto an exact-context proof. */
+  aggregateDiagnosticStatus?: VariantMatrixStatus;
+  aggregateDiagnosticStatusReason?: string;
+  aggregateDiagnosticBlockers?: string[];
+  aggregateDiagnosticCautions?: string[];
+  applicableContexts?: readonly ExactLaneContext[];
+  contextRows?: Partial<Record<ExactLaneContext, VariantContextEvidenceRow>>;
+  /** Contexts disagree, so the lane has no universal claim. */
+  contextSummary?: "UNIFORM" | "CONTEXT_SPLIT";
+}
+
+/**
+ * Independent evidence for one canonical proof unit: laneId × exact context.
+ * Aggregate metrics deliberately stay on CurrentGuardVariantMatrixRow instead.
+ */
+export interface VariantContextEvidenceRow {
+  context: ExactLaneContext;
+  freshValid: number;
+  netAvgR: number | null;
+  grossAvgR: number | null;
+  pf: number | null;
+  wr: number | null;
+  payoffRatio: number | null;
+  plus10bpsNetAvgR: number | null;
+  plus10bpsStillPositive: boolean;
+  approxMaxDrawdownR: number | null;
+  topSymbolPnlShare: number | null;
+  calendarDays: number | null;
+  distinctRegimes: number;
+  oosThirds: [VariantSegmentStat, VariantSegmentStat, VariantSegmentStat] | null;
+  allThreeOosPositive: boolean;
+  status: ContextLaneStatus;
+  statusReason: string;
+  blockers: string[];
+  cautions: string[];
+}
+
+export interface ContextLaneStatusLookup {
+  laneId: string;
+  context: ExactLaneContext | null;
+  applicable: boolean;
+  direct: boolean;
+  status: ContextLaneStatus;
+  statusReason: string;
+  blockers: string[];
+  cautions: string[];
+  evidence: VariantContextEvidenceRow | null;
 }
 
 export interface CurrentGuardVariantMatrixReportOptions {
@@ -3245,6 +3340,25 @@ function observationRegimeFamilyKey(obs: CurrentGuardVariantMatrixObservation): 
   return validAxisRegimeFamily(obs.axisRegimeFamily) ?? regimeFamilyKey(obs.regime);
 }
 
+/** Convert a resolved direction/regime pair into a promotable proof context. */
+export function exactLaneContextFor(
+  direction: Direction | null | undefined,
+  regimeFamily: AxisRegimeFamily | string | null | undefined,
+): ExactLaneContext | null {
+  if (direction === "LONG" && regimeFamily === "BULLISH") return "LONG_BULLISH";
+  if (direction === "SHORT" && regimeFamily === "BEARISH") return "SHORT_BEARISH";
+  if (direction === "LONG" && regimeFamily === "MIXED") return "LONG_MIXED";
+  if (direction === "SHORT" && regimeFamily === "MIXED") return "SHORT_MIXED";
+  return null;
+}
+
+/** Legacy records with no exact direction/regime pairing remain aggregate-only diagnostics. */
+export function exactLaneContextForObservation(
+  obs: CurrentGuardVariantMatrixObservation,
+): ExactLaneContext | "UNKNOWN_CONTEXT" {
+  return exactLaneContextFor(obs.axisDirection ?? obs.direction, observationRegimeFamilyKey(obs)) ?? "UNKNOWN_CONTEXT";
+}
+
 function stampObservationAxis(obs: CurrentGuardVariantMatrixObservation): void {
   const family = observationRegimeFamilyKey(obs);
   obs.axisVersion = 1;
@@ -3262,6 +3376,66 @@ function topSymbolPnlShare(slice: CurrentGuardVariantMatrixObservation[]): numbe
   return Math.max(...bySymbol.values()) / totalAbs;
 }
 
+function oosThirdsFor(
+  fresh: CurrentGuardVariantMatrixObservation[],
+): { oosThirds: [VariantSegmentStat, VariantSegmentStat, VariantSegmentStat] | null; allThreeOosPositive: boolean } {
+  if (fresh.length < 3) return { oosThirds: null, allThreeOosPositive: false };
+  const third = Math.floor(fresh.length / 3);
+  const s1 = segmentStat("oos_1", fresh.slice(0, third));
+  const s2 = segmentStat("oos_2", fresh.slice(third, 2 * third));
+  const s3 = segmentStat("oos_3", fresh.slice(2 * third));
+  const oosThirds: [VariantSegmentStat, VariantSegmentStat, VariantSegmentStat] = [s1, s2, s3];
+  return {
+    oosThirds,
+    allThreeOosPositive: oosThirds.every((segment) => segment.netAvgR !== null && segment.netAvgR > 0),
+  };
+}
+
+function buildContextEvidenceRow(
+  def: VariantMatrixVariantDefinition,
+  context: ExactLaneContext,
+  observations: CurrentGuardVariantMatrixObservation[],
+  infra: { killSwitchReady: boolean; orderReconciliationReady: boolean; exchangeHealthReady: boolean },
+): VariantContextEvidenceRow {
+  const fresh = observations.filter(isFreshValidObs).sort(orderByResolved);
+  const netValues = fresh.map((obs) => obs.netR);
+  const grossValues = fresh.map((obs) => obs.grossR);
+  const winners = fresh.filter((obs) => (obs.netR ?? 0) > 0);
+  const losers = fresh.filter((obs) => (obs.netR ?? 0) <= 0);
+  const avgWinR = mean(winners.map((obs) => obs.netR));
+  const avgLossR = mean(losers.map((obs) => obs.netR));
+  const payoffRatio = avgWinR !== null && avgLossR !== null && avgLossR < 0 ? avgWinR / Math.abs(avgLossR) : null;
+  const stressRoundTrip = roundTripBpsForCostModel(def.costModel) + STRESS_EXTRA_BPS;
+  const plus10bpsNetAvgR = mean(fresh.map((obs) => {
+    if (typeof obs.grossR !== "number" || obs.stopDistanceBps === null || !(obs.stopDistanceBps > 0)) return null;
+    return obs.grossR - stressRoundTrip / obs.stopDistanceBps;
+  }));
+  const { drawdownR } = drawdownAndStreak(fresh.map((obs) => obs.netR ?? 0));
+  const { oosThirds, allThreeOosPositive } = oosThirdsFor(fresh);
+  const partial = {
+    freshValid: fresh.length,
+    netAvgR: mean(netValues),
+    grossAvgR: mean(grossValues),
+    pf: profitFactor(netValues),
+    payoffRatio,
+    approxMaxDrawdownR: drawdownR,
+    topSymbolPnlShare: topSymbolPnlShare(fresh),
+    plus10bpsStillPositive: plus10bpsNetAvgR !== null && plus10bpsNetAvgR > 0,
+    calendarDays: calendarDays(fresh),
+    distinctRegimes: new Set(fresh.map((obs) => obs.regime ?? "UNKNOWN")).size,
+    allThreeOosPositive,
+  };
+  const status = deriveVariantStatus(partial, infra);
+  return {
+    context,
+    ...partial,
+    wr: fresh.length > 0 ? winners.length / fresh.length : null,
+    plus10bpsNetAvgR,
+    oosThirds,
+    ...status,
+  };
+}
+
 function calendarDays(slice: CurrentGuardVariantMatrixObservation[]): number | null {
   const times = slice.map((o) => toMs(o.resolvedAt) ?? toMs(o.openedAt)).filter((v): v is number => v !== null);
   if (times.length === 0) return null;
@@ -3272,8 +3446,22 @@ function roundTripBpsForCostModel(costModel: VariantFillMode): number {
   return costModel === "maker_limit" ? MAKER_ROUNDTRIP_BPS : TAKER_ROUNDTRIP_BPS;
 }
 
+type VariantStatusEvidence = Pick<
+  CurrentGuardVariantMatrixRow,
+  | "freshValid"
+  | "netAvgR"
+  | "pf"
+  | "payoffRatio"
+  | "approxMaxDrawdownR"
+  | "topSymbolPnlShare"
+  | "plus10bpsStillPositive"
+  | "calendarDays"
+  | "distinctRegimes"
+  | "allThreeOosPositive"
+>;
+
 export function deriveVariantStatus(
-  row: Omit<CurrentGuardVariantMatrixRow, "status" | "statusReason" | "blockers" | "cautions">,
+  row: VariantStatusEvidence,
   infra: { killSwitchReady: boolean; orderReconciliationReady: boolean; exchangeHealthReady: boolean },
 ): { status: VariantMatrixStatus; statusReason: string; blockers: string[]; cautions: string[] } {
   const blockers: string[] = [];
@@ -3443,16 +3631,7 @@ function buildRow(
   const byEntryVariant = breakdownRows(fresh, (o) => o.entryVariant ?? "unknown");
   const bySymbol = breakdownRows(fresh, (o) => o.symbol);
 
-  let oosThirds: [VariantSegmentStat, VariantSegmentStat, VariantSegmentStat] | null = null;
-  let allThreeOosPositive = false;
-  if (fresh.length >= 3) {
-    const third = Math.floor(fresh.length / 3);
-    const s1 = segmentStat("oos_1", fresh.slice(0, third));
-    const s2 = segmentStat("oos_2", fresh.slice(third, 2 * third));
-    const s3 = segmentStat("oos_3", fresh.slice(2 * third));
-    oosThirds = [s1, s2, s3];
-    allThreeOosPositive = [s1, s2, s3].every((s) => s.netAvgR !== null && s.netAvgR > 0);
-  }
+  const { oosThirds, allThreeOosPositive } = oosThirdsFor(fresh);
 
   const rolling = [
     rollingStat("last_10", fresh, 10),
@@ -3507,8 +3686,113 @@ function buildRow(
     rolling,
   };
 
-  const { status, statusReason, blockers, cautions } = deriveVariantStatus(partial, infra);
-  return { ...partial, status, statusReason, blockers, cautions };
+  const aggregate = deriveVariantStatus(partial, infra);
+  const contextRows: Partial<Record<ExactLaneContext, VariantContextEvidenceRow>> = {};
+  for (const context of def.applicableContexts) {
+    contextRows[context] = buildContextEvidenceRow(
+      def,
+      context,
+      obsForVariant.filter((obs) => exactLaneContextForObservation(obs) === context),
+      infra,
+    );
+  }
+  const contextStatuses = def.applicableContexts.map((context) => contextRows[context]!.status);
+  const contextSummary = new Set(contextStatuses).size > 1 ? "CONTEXT_SPLIT" : "UNIFORM";
+
+  // `status` remains an aggregate diagnostic for old report consumers. It is deliberately not a
+  // proof verdict: conditional lanes must be read through laneStatusForContext below.
+  return {
+    ...partial,
+    status: aggregate.status,
+    statusReason: aggregate.statusReason,
+    blockers: aggregate.blockers,
+    cautions: aggregate.cautions,
+    aggregateDiagnosticStatus: aggregate.status,
+    aggregateDiagnosticStatusReason: aggregate.statusReason,
+    aggregateDiagnosticBlockers: aggregate.blockers,
+    aggregateDiagnosticCautions: aggregate.cautions,
+    applicableContexts: def.applicableContexts,
+    contextRows,
+    contextSummary,
+  };
+}
+
+/**
+ * Canonical proof lookup. Missing context/evidence fails closed as COLLECTING: callers must never
+ * promote a lane using a broad direction or aggregate status as a substitute for exact proof.
+ */
+export function laneStatusForContext(
+  report: CurrentGuardVariantMatrixReport,
+  laneId: string,
+  context: ExactLaneContext | null,
+): ContextLaneStatusLookup {
+  const variantId = laneId.split(":").pop() ?? laneId;
+  const definition = VARIANT_MATRIX_DEFINITIONS.find((candidate) => candidate.id === variantId);
+  if (!definition) {
+    return {
+      laneId,
+      context,
+      applicable: false,
+      direct: false,
+      status: "COLLECTING",
+      statusReason: "unknown lane has no canonical exact-context proof",
+      blockers: ["missing canonical lane definition"],
+      cautions: [],
+      evidence: null,
+    };
+  }
+  if (context === null) {
+    return {
+      laneId,
+      context,
+      applicable: false,
+      direct: false,
+      status: "COLLECTING",
+      statusReason: "missing exact direction/regime context",
+      blockers: ["exact context is required for promotion/readiness"],
+      cautions: [],
+      evidence: null,
+    };
+  }
+  if (!definition.applicableContexts.includes(context)) {
+    return {
+      laneId,
+      context,
+      applicable: false,
+      direct: true,
+      status: "NOT_APPLICABLE",
+      statusReason: `${context} is outside this lane's explicit applicability map`,
+      blockers: [],
+      cautions: [],
+      evidence: null,
+    };
+  }
+  const row = report.rows.find((candidate) => candidate.variantId === definition.id);
+  const evidence = row?.contextRows?.[context] ?? null;
+  if (!evidence) {
+    return {
+      laneId,
+      context,
+      applicable: true,
+      direct: false,
+      status: "COLLECTING",
+      statusReason: "missing exact-context cohort; aggregate status is diagnostic only",
+      blockers: ["no exact-context evidence"],
+      cautions: [],
+      evidence: null,
+    };
+  }
+  return {
+    laneId,
+    context,
+    applicable: true,
+    direct: true,
+    status: evidence.status,
+    statusReason: evidence.statusReason,
+    blockers: evidence.blockers,
+    cautions: evidence.cautions,
+    evidence,
+  };
 }
 
 /**

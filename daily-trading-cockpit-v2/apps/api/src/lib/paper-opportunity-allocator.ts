@@ -37,6 +37,8 @@ import {
   VARIANT_MATRIX_DEFINITIONS,
   admissionStopFloorBpsForVariant,
   deriveVariantGeometry,
+  exactLaneContextFor,
+  laneStatusForContext,
   stopDistanceBpsOf,
   WIDE_STOP_MIN_BPS,
   WATCHABLE_MIN_FRESH,
@@ -1551,11 +1553,16 @@ export function buildPaperOpportunityAllocatorReport(
       symbolRollup(symbol).evaluated += 1;
 
       const row = inputs.vmReport.rows.find((r) => r.variantId === def.id) ?? null;
-      const rowFresh = row?.freshValid ?? null;
-      const rowNet = row?.netAvgR ?? null;
+      const contextProof = laneStatusForContext(
+        inputs.vmReport,
+        def.id,
+        exactLaneContextFor(direction, regimeFamily),
+      );
+      const rowFresh = contextProof.evidence?.freshValid ?? null;
+      const rowNet = contextProof.evidence?.netAvgR ?? null;
       const headlineVariant = isHeadlineVariantId(def.id);
       const headlineStableOk =
-        !PAPER_HEADLINE_REQUIRE_STABLE || row?.status === "STABLE_CANDIDATE";
+        !PAPER_HEADLINE_REQUIRE_STABLE || contextProof.status === "STABLE_CANDIDATE";
 
       const geo = deriveVariantGeometry(signal, def);
       if (geo.kind === "rejected") {

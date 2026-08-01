@@ -8,6 +8,7 @@ import type { ShadowPosition } from "@dtc/shared";
 import {
   VARIANT_MATRIX_DEFINITIONS,
   BASELINE_VARIANT_ID,
+  BULL_TREND_VARIANT_ID,
   CurrentGuardVariantMatrixStore,
   getCurrentGuardVariantMatrixStore,
   _resetCurrentGuardVariantMatrixStoreForTests,
@@ -20,6 +21,9 @@ import {
   selectVariantMatrixSignals,
   resolveVariantMatrixObservations,
   buildCurrentGuardVariantMatrixReport,
+  exactLaneContextFor,
+  exactLaneContextForObservation,
+  laneStatusForContext,
   TAKER_ROUNDTRIP_BPS,
   MAKER_ROUNDTRIP_BPS,
   WIDE_STOP_MIN_BPS,
@@ -64,6 +68,41 @@ function makeSignal(overrides: Partial<VariantMatrixSignal> = {}): VariantMatrix
     closedAt: null,
     ...overrides,
   };
+}
+
+function addResolvedContextCohort(
+  store: CurrentGuardVariantMatrixStore,
+  options: {
+    variantId: VariantMatrixVariantDefinition["id"];
+    direction: "LONG" | "SHORT";
+    regime: string;
+    count: number;
+    netR: (index: number) => number;
+    prefix: string;
+  },
+): void {
+  const observations = Array.from({ length: options.count }, (_, index) => {
+    const base = buildVariantMatrixObservationsForSignal(makeSignal({
+      sourceSignalId: `${options.prefix}-${index}`,
+      symbol: `CTX${index % 5}USDT`,
+      direction: options.direction,
+      regime: options.regime,
+      openedAt: new Date(Date.UTC(2026, 5, 1) + index * 24 * 60 * 60 * 1000).toISOString(),
+    })).find((candidate) => candidate.variantId === options.variantId)!;
+    const netR = options.netR(index);
+    return {
+      ...base,
+      observationId: `${options.prefix}-${index}`,
+      sourceObservationKey: `${options.prefix}-${index}`,
+      status: netR > 0 ? "CLOSED_WIN" as const : "CLOSED_LOSS" as const,
+      grossR: netR + 0.12,
+      netR,
+      costR: 0.12,
+      isFreshValid: true,
+      resolvedAt: new Date(Date.UTC(2026, 6, 1) + index * 24 * 60 * 60 * 1000).toISOString(),
+    };
+  });
+  store.addMany(observations);
 }
 
 // 5m candle: [openTimeMs, "0", high, low, close, "0", closeTimeMs]
@@ -715,6 +754,155 @@ describe("current-guard-variant-matrix", () => {
     if (gate.bestVariantMatrixCandidate !== null) {
       expect(gate.bestVariantMatrixCandidate.liveBlocked).toBe(true);
     }
+  });
+
+  describe("exact lane-context proof", () => {
+    function splitEvidenceReport() {
+      const store = new CurrentGuardVariantMatrixStore(tmpDir());
+      // LONG_BULLISH is independently strong while the aggregate is pulled negative by a separate
+      // SHORT_BEARISH cohort. This is the regression shape the proof model must preserve.
+      addResolvedContextCohort(store, {
+        variantId: "CG_WIDE_STOP_TP_WIDE",
+        direction: "LONG",
+        regime: "Bullish expansion",
+        count: 100,
+        netR: (index) => index % 5 === 0 ? -0.5 : 1,
+        prefix: "lb",
+      });
+      addResolvedContextCohort(store, {
+        variantId: "CG_WIDE_STOP_TP_WIDE",
+        direction: "SHORT",
+        regime: "Bearish pressure",
+        count: 100,
+        netR: () => -1,
+        prefix: "sb",
+      });
+      return buildCurrentGuardVariantMatrixReport(store);
+    }
+
+    it("[CTX-1] preserves a stable exact context when the aggregate diagnostic rejects", () => {
+      const report = splitEvidenceReport();
+      const row = report.rows.find((candidate) => candidate.variantId === "CG_WIDE_STOP_TP_WIDE")!;
+      expect(row.aggregateDiagnosticStatus).toBe("REJECT");
+      expect(row.contextRows?.LONG_BULLISH?.status).toBe("STABLE_CANDIDATE");
+      expect(row.contextRows?.SHORT_BEARISH?.status).toBe("REJECT");
+      expect(row.contextSummary).toBe("CONTEXT_SPLIT");
+    });
+
+    it("[CTX-2] uses direct proof only and never falls back to aggregate/direction", () => {
+      const report = splitEvidenceReport();
+      expect(laneStatusForContext(report, "CG_VARIANT_MATRIX:CG_WIDE_STOP_TP_WIDE", "LONG_BULLISH").status)
+        .toBe("STABLE_CANDIDATE");
+      expect(laneStatusForContext(report, "CG_WIDE_STOP_TP_WIDE", "SHORT_BEARISH").status).toBe("REJECT");
+      expect(laneStatusForContext(report, "CG_WIDE_STOP_TP_WIDE", "LONG_MIXED").status).toBe("COLLECTING");
+    });
+
+    it("[CTX-3] returns NOT_APPLICABLE for an explicitly unsupported context", () => {
+      const store = new CurrentGuardVariantMatrixStore(tmpDir());
+      const report = buildCurrentGuardVariantMatrixReport(store);
+      const result = laneStatusForContext(report, BULL_TREND_VARIANT_ID, "SHORT_BEARISH");
+      expect(result.status).toBe("NOT_APPLICABLE");
+      expect(result.applicable).toBe(false);
+      expect(result.direct).toBe(true);
+    });
+
+    it("[CTX-4] fails closed for unknown lane, missing exact context, and absent cohort", () => {
+      const report = splitEvidenceReport();
+      expect(laneStatusForContext(report, "NOT_A_LANE", "LONG_BULLISH").status).toBe("COLLECTING");
+      expect(laneStatusForContext(report, "CG_WIDE_STOP_TP_WIDE", null).status).toBe("COLLECTING");
+      expect(laneStatusForContext(report, BULL_TREND_VARIANT_ID, "LONG_BULLISH").status).toBe("COLLECTING");
+    });
+
+    it("[CTX-5] classifies only the four registered direction/regime contexts", () => {
+      expect(exactLaneContextFor("LONG", "BULLISH")).toBe("LONG_BULLISH");
+      expect(exactLaneContextFor("SHORT", "BEARISH")).toBe("SHORT_BEARISH");
+      expect(exactLaneContextFor("LONG", "MIXED")).toBe("LONG_MIXED");
+      expect(exactLaneContextFor("SHORT", "MIXED")).toBe("SHORT_MIXED");
+      expect(exactLaneContextFor("LONG", "BEARISH")).toBeNull();
+      expect(exactLaneContextFor("SHORT", "BULLISH")).toBeNull();
+    });
+
+    it("[CTX-6] keeps unresolved regime provenance aggregate-only", () => {
+      const observation = buildVariantMatrixObservationsForSignal(makeSignal({ regime: "unclassified" }))[0]!;
+      expect(exactLaneContextForObservation(observation)).toBe("UNKNOWN_CONTEXT");
+    });
+
+    it("[CTX-7] exposes exactly the definition-declared contexts and no inferred context", () => {
+      const report = splitEvidenceReport();
+      const wide = report.rows.find((candidate) => candidate.variantId === "CG_WIDE_STOP_TP_WIDE")!;
+      const bull = report.rows.find((candidate) => candidate.variantId === BULL_TREND_VARIANT_ID)!;
+      expect(Object.keys(wide.contextRows ?? []).sort()).toEqual([
+        "LONG_BULLISH", "LONG_MIXED", "SHORT_BEARISH", "SHORT_MIXED",
+      ]);
+      expect(Object.keys(bull.contextRows ?? [])).toEqual(["LONG_BULLISH"]);
+    });
+
+    it("[CTX-8] recomputes chronological OOS thirds inside the exact cohort", () => {
+      const store = new CurrentGuardVariantMatrixStore(tmpDir());
+      addResolvedContextCohort(store, {
+        variantId: "CG_WIDE_STOP_TP_WIDE",
+        direction: "LONG",
+        regime: "Bullish expansion",
+        count: 100,
+        netR: (index) => index < 34 ? -0.1 : 1,
+        prefix: "oos",
+      });
+      const exact = buildCurrentGuardVariantMatrixReport(store).rows
+        .find((candidate) => candidate.variantId === "CG_WIDE_STOP_TP_WIDE")!.contextRows!.LONG_BULLISH!;
+      expect(exact.oosThirds?.[0].netAvgR).toBeLessThan(0);
+      expect(exact.allThreeOosPositive).toBe(false);
+      expect(exact.status).toBe("WATCHABLE");
+    });
+
+    it("[CTX-9] applies stress and costs independently to the exact cohort", () => {
+      const report = splitEvidenceReport();
+      const exact = report.rows.find((candidate) => candidate.variantId === "CG_WIDE_STOP_TP_WIDE")!
+        .contextRows!.LONG_BULLISH!;
+      expect(exact.grossAvgR).toBeGreaterThan(exact.netAvgR!);
+      expect(exact.plus10bpsNetAvgR).toBeGreaterThan(0);
+      expect(exact.plus10bpsStillPositive).toBe(true);
+    });
+
+    it("[CTX-10] keeps aggregate accounting intact as a diagnostic-only population", () => {
+      const report = splitEvidenceReport();
+      const row = report.rows.find((candidate) => candidate.variantId === "CG_WIDE_STOP_TP_WIDE")!;
+      expect(row.freshValid).toBe(200);
+      expect(row.contextRows!.LONG_BULLISH!.freshValid + row.contextRows!.SHORT_BEARISH!.freshValid).toBe(200);
+      expect(row.aggregateDiagnosticStatus).toBe(row.status);
+      expect(row.aggregateDiagnosticStatusReason).toBe(row.statusReason);
+    });
+
+    it("[CTX-11] does not make an aggregate or exact status an authority grant", () => {
+      const report = splitEvidenceReport();
+      expect(report.liveBlocked).toBe(true);
+      expect(report.microPilotAllowed).toBe(false);
+      expect(laneStatusForContext(report, "CG_WIDE_STOP_TP_WIDE", "LONG_BULLISH").status).toBe("STABLE_CANDIDATE");
+    });
+
+    it("[CTX-12] returns exact reasons and blockers instead of broad-row explanations", () => {
+      const report = splitEvidenceReport();
+      const positive = laneStatusForContext(report, "CG_WIDE_STOP_TP_WIDE", "LONG_BULLISH");
+      const negative = laneStatusForContext(report, "CG_WIDE_STOP_TP_WIDE", "SHORT_BEARISH");
+      expect(positive.statusReason).toContain("stable");
+      expect(negative.blockers).toContain("negative fresh-valid economics at adequate sample");
+    });
+
+    it("[CTX-13] treats opposite trend-direction evidence as unknown rather than a promotable context", () => {
+      const store = new CurrentGuardVariantMatrixStore(tmpDir());
+      addResolvedContextCohort(store, {
+        variantId: "CG_WIDE_STOP_TP_WIDE",
+        direction: "LONG",
+        regime: "Bearish pressure",
+        count: 30,
+        netR: () => 1,
+        prefix: "opposite",
+      });
+      const row = buildCurrentGuardVariantMatrixReport(store).rows
+        .find((candidate) => candidate.variantId === "CG_WIDE_STOP_TP_WIDE")!;
+      expect(row.freshValid).toBe(30);
+      expect(row.contextRows!.LONG_BULLISH!.freshValid).toBe(0);
+      expect(row.contextRows!.LONG_MIXED!.freshValid).toBe(0);
+    });
   });
 
   // 10. shadow-positions.json is never touched.

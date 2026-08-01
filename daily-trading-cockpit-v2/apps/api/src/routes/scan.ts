@@ -543,6 +543,8 @@ export async function registerScanRoute(
             byRegimeFamily: r.byRegimeFamily,
             byAxisSymbol: r.byAxisSymbol,
             bySymbol: r.bySymbol,
+            // The mirror resolves these per candidate. Aggregate row status remains diagnostic.
+            contextRows: r.contextRows,
           }));
         // Smart direction gate (2026-07-01): hard-veto a direction whose realized, honestly-accounted
         // edge (regimeFamily × direction) has proven non-positive at adequate sample (n>=30), unless a

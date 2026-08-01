@@ -212,13 +212,23 @@ export function buildRegimeRotationShortlistReport(
   const minWatchSample = options.minWatchSample ?? DEFAULT_MIN_WATCH_SAMPLE;
   const maxSymbolsPerSide = options.maxSymbolsPerSide ?? DEFAULT_MAX_SYMBOLS_PER_SIDE;
   const rows = report.rows as Array<CurrentGuardVariantMatrixRow & { byAxisSymbol?: VariantBreakdownRow[] }>;
-  const lanes = rows.map((row): RotationShortlistLane => ({
-    laneId: rotationLaneIdForVariant(row.variantId),
-    variantId: row.variantId,
-    label: row.label,
-    bearish: buildSymbols(row.byAxisSymbol, "SHORT_BEARISH", minAllowSample, minWatchSample, maxSymbolsPerSide),
-    bullish: buildSymbols(row.byAxisSymbol, "LONG_BULLISH", minAllowSample, minWatchSample, maxSymbolsPerSide),
-  }));
+  const lanes = rows.map((row): RotationShortlistLane => {
+    const definition = VARIANT_MATRIX_DEFINITIONS.find((candidate) => candidate.id === row.variantId);
+    const applicable = definition?.applicableContexts ?? [];
+    return {
+      laneId: rotationLaneIdForVariant(row.variantId),
+      variantId: row.variantId,
+      label: row.label,
+      // A symbol shortlist is a refinement of an exact proof context, never an implicit expansion
+      // to a side the lane was not designed to trade.
+      bearish: applicable.includes("SHORT_BEARISH")
+        ? buildSymbols(row.byAxisSymbol, "SHORT_BEARISH", minAllowSample, minWatchSample, maxSymbolsPerSide)
+        : [],
+      bullish: applicable.includes("LONG_BULLISH")
+        ? buildSymbols(row.byAxisSymbol, "LONG_BULLISH", minAllowSample, minWatchSample, maxSymbolsPerSide)
+        : [],
+    };
+  });
   return {
     generatedAt: options.generatedAt ?? report.computedAt,
     minAllowSample,

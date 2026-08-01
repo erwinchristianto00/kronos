@@ -44,6 +44,8 @@ interface LaneCohortStats {
   pf: number | null;
   wr: number | null;
   payoffRatio: number | null;
+  status?: string | null;
+  statusReason?: string | null;
 }
 
 interface RotationShortlistSymbol {
@@ -482,7 +484,7 @@ interface LaneContextInfo {
 }
 
 interface LaneDecisionContext {
-  key: 'LONG_BULLISH' | 'SHORT_BEARISH' | 'MIXED';
+  key: 'LONG_BULLISH' | 'SHORT_BEARISH' | 'LONG_MIXED' | 'SHORT_MIXED';
   title: string;
   subtitle: string;
   tone: 'long' | 'short' | 'mixed';
@@ -512,9 +514,15 @@ const LANE_DECISION_CONTEXTS: LaneDecisionContext[] = [
     tone: 'short',
   },
   {
-    key: 'MIXED',
-    title: 'MIXED / choppy',
-    subtitle: 'Use when market is range/rotation; mixed is a regime subset, not a third direction.',
+    key: 'LONG_MIXED',
+    title: 'LONG / mixed',
+    subtitle: 'Use only when the exact LONG + mixed cohort is proven.',
+    tone: 'mixed',
+  },
+  {
+    key: 'SHORT_MIXED',
+    title: 'SHORT / mixed',
+    subtitle: 'Use only when the exact SHORT + mixed cohort is proven.',
     tone: 'mixed',
   },
 ];
@@ -527,25 +535,30 @@ function miniCohort(cohort: LaneCohortStats | null | undefined): string {
 function cohortForDecision(lane: NeuralLane, context: LaneDecisionContext['key']): LaneContextInfo {
   const cohorts = lane.cohorts;
   if (context === 'LONG_BULLISH') {
-    const exact = cohorts?.LONG_BULLISH ?? null;
     return {
-      cohort: exact ?? cohorts?.LONG ?? null,
-      source: exact ? 'exact LONG+BULLISH' : 'fallback LONG direction',
+      cohort: cohorts?.LONG_BULLISH ?? null,
+      source: 'exact LONG+BULLISH canonical proof',
       secondary: `bullish family ${miniCohort(cohorts?.BULLISH)}`,
     };
   }
   if (context === 'SHORT_BEARISH') {
-    const exact = cohorts?.SHORT_BEARISH ?? null;
     return {
-      cohort: exact ?? cohorts?.SHORT ?? null,
-      source: exact ? 'exact SHORT+BEARISH' : 'fallback SHORT direction',
+      cohort: cohorts?.SHORT_BEARISH ?? null,
+      source: 'exact SHORT+BEARISH canonical proof',
       secondary: `bearish family ${miniCohort(cohorts?.BEARISH)}`,
     };
   }
+  if (context === 'LONG_MIXED') {
+    return {
+      cohort: cohorts?.LONG_MIXED ?? null,
+      source: 'exact LONG+MIXED canonical proof',
+      secondary: `mixed family ${miniCohort(cohorts?.MIXED)}`,
+    };
+  }
   return {
-    cohort: cohorts?.MIXED ?? null,
-    source: 'regime-family MIXED',
-    secondary: `L-mix ${miniCohort(cohorts?.LONG_MIXED)} · S-mix ${miniCohort(cohorts?.SHORT_MIXED)}`,
+    cohort: cohorts?.SHORT_MIXED ?? null,
+    source: 'exact SHORT+MIXED canonical proof',
+    secondary: `mixed family ${miniCohort(cohorts?.MIXED)}`,
   };
 }
 
@@ -554,13 +567,15 @@ function laneContextVerdict(lane: NeuralLane, cohort: LaneCohortStats | null): P
   if (!cohort || cohort.n <= 0 || cohort.netAvgR === null || !Number.isFinite(cohort.netAvgR)) {
     return { verdict: blocked ? 'BLOCKED / NO DATA' : 'NO DATA', tone: blocked ? 'blocked' : 'measure', score: blocked ? -20 : -10 };
   }
+  if (cohort.status === 'NOT_APPLICABLE') return { verdict: 'NOT APPLICABLE', tone: 'measure', score: -15 };
+  if (cohort.status === 'REJECT') return { verdict: blocked ? 'BLOCKED' : 'NO EDGE', tone: blocked ? 'blocked' : 'critical', score: -5 };
   const pf = cohort.pf ?? 0;
   const wr = cohort.wr ?? 0;
   const net = cohort.netAvgR;
   const sampleScore = Math.min(2, Math.log10(Math.max(1, cohort.n)));
   const economicsScore = Math.max(-2, Math.min(5, net * 10)) + Math.min(3, Math.max(0, pf)) + wr + sampleScore;
-  const proven = cohort.n >= STABLE_MIN_FRESH && net > 0.05 && (pf > HEADLINE_PF_FLOOR || pf >= 999_999);
-  const watch = cohort.n >= 10 && net > 0 && (pf > 1 || pf >= 999_999);
+  const proven = cohort.status === 'STABLE_CANDIDATE' || cohort.status === 'PROMOTION_CANDIDATE';
+  const watch = cohort.status === 'WATCHABLE';
   if (blocked && (proven || watch)) {
     // The VM-sim cohort looks positive, but the lane is benched by its REALIZED (paper-book)
     // economics. "BENCHED" (not "BLOCKED EDGE") + the book number rendered alongside makes it
@@ -609,6 +624,18 @@ function bestContextLabel(lane: NeuralLane): string {
   candidates.sort((a, b) => b.verdict.score - a.verdict.score);
   const best = candidates[0]!;
   return `${best.context.title} · ${best.verdict.verdict}`;
+}
+
+function exactContextStatusSummary(lane: NeuralLane): string {
+  const entries: Array<[string, LaneCohortStats | null | undefined]> = [
+    ['L/B', lane.cohorts?.LONG_BULLISH],
+    ['S/B', lane.cohorts?.SHORT_BEARISH],
+    ['L/M', lane.cohorts?.LONG_MIXED],
+    ['S/M', lane.cohorts?.SHORT_MIXED],
+  ];
+  const applicable = entries.filter(([, cohort]) => cohort);
+  if (applicable.length === 0) return 'No exact cohort';
+  return applicable.map(([label, cohort]) => `${label}: ${cohort!.status ?? 'COLLECTING'}`).join(' · ');
 }
 
 function rotationShortlistItems(items: RotationShortlistSymbol[] | null | undefined): RotationShortlistSymbol[] {
@@ -1601,7 +1628,8 @@ export default function NeuralMindmap() {
             <thead>
               <tr>
                 <th>Lane</th>
-                <th>Stage</th>
+                <th title="Aggregate VM status. Diagnostic only; it cannot veto exact-context proof.">Aggregate diagnostic</th>
+                <th title="Canonical laneId × direction × regime proof statuses. Only these are used for readiness.">Exact context proof</th>
                 <th title="Fresh-valid out-of-sample observations vs the threshold for the next stage">OOS progress</th>
                 <th title="The first gate blocking this lane from the next stage">Blocking gate</th>
                 <th title="Market context where this lane has the best evidence">Best use</th>
@@ -1616,7 +1644,7 @@ export default function NeuralMindmap() {
               {milestoneSections.map((section) => (
                 <Fragment key={`milestone-section-${section.key}`}>
                   <tr className={`neural-direction-row direction-${section.key.toLowerCase()}`}>
-                    <td colSpan={10}>
+                    <td colSpan={11}>
                       <span>{section.label}</span>
                       <small>{section.lanes.length} lane{section.lanes.length === 1 ? '' : 's'} · {section.detail}</small>
                     </td>
@@ -1632,6 +1660,7 @@ export default function NeuralMindmap() {
                       >
                         <td><i className={`health-${healthOf(lane.id).toLowerCase()}`} />{compactLaneLabel(lane.label)}</td>
                         <td><span className={`neural-stage-pill ${evidencePillClass(lane, milestone)}`}>{isQuarantinedLane(lane) ? 'Quarantined' : stageLabel(milestone.stage)}</span></td>
+                        <td className="neural-best-use-cell">{exactContextStatusSummary(lane)}</td>
                         <td>{`${lane.oosFreshValid ?? lane.closed} / ${lane.oosThreshold} fresh · ${progress.progressPct}%`}</td>
                         <td className="neural-missing-cell">{progress.blockers[0] ?? 'None'}</td>
                         <td className="neural-best-use-cell">{bestContextLabel(lane)}</td>

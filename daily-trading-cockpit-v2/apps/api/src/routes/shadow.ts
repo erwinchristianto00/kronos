@@ -1994,7 +1994,9 @@ export async function registerShadowRoutes(
       orders,
       nowMs: Date.now(),
       trailLaneAvailable: variantMatrix.rows.some(
-        (row) => row.variantId === "CG_TRAIL_AFTER_TP1" && row.status !== "REJECT",
+        (row) =>
+          row.variantId === "CG_TRAIL_AFTER_TP1" &&
+          Object.values(row.contextRows ?? {}).some((context) => context.status !== "REJECT"),
       ),
     });
     const mixedValidation = buildMixedBudgetForwardValidation(orders, generatedAt);

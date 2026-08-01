@@ -8,6 +8,7 @@ import {
   WATCHABLE_MIN_FRESH,
   type CurrentGuardVariantMatrixReport,
   type VariantBreakdownRow,
+  type VariantContextEvidenceRow,
 } from "./current-guard-variant-matrix.js";
 import type { MixedBudgetForwardValidationReport, MixedRegimeReport, OpenOrderStaleAudit } from "./mixed-regime-router.js";
 import type { PaperOrder, PaperPerformanceReport } from "./paper-execution-router.js";
@@ -75,6 +76,9 @@ export interface NeuralLaneCohortStats {
   pf: number | null;
   wr: number | null;
   payoffRatio: number | null;
+  /** Canonical VM proof status for an exact direction × regime context. */
+  status?: string | null;
+  statusReason?: string | null;
 }
 
 export interface NeuralMapLane {
@@ -395,6 +399,19 @@ function cohortFromBreakdown(row: VariantBreakdownRow | undefined): NeuralLaneCo
     pf: row.pf ?? null,
     wr: row.wr ?? null,
     payoffRatio: row.payoffRatio ?? null,
+  };
+}
+
+function cohortFromContextEvidence(row: VariantContextEvidenceRow | undefined): NeuralLaneCohortStats | null {
+  if (!row) return null;
+  return {
+    n: row.freshValid,
+    netAvgR: row.netAvgR,
+    pf: row.pf,
+    wr: row.wr,
+    payoffRatio: row.payoffRatio,
+    status: row.status,
+    statusReason: row.statusReason,
   };
 }
 
@@ -1274,10 +1291,12 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
         MIXED: cohortFromBreakdown(regimeFamilyRows.find((candidate) => candidate.key === "MIXED")),
         BULLISH: cohortFromBreakdown(regimeFamilyRows.find((candidate) => candidate.key === "BULLISH")),
         BEARISH: cohortFromBreakdown(regimeFamilyRows.find((candidate) => candidate.key === "BEARISH")),
-        LONG_BULLISH: cohortFromBreakdown(axisRows.find((candidate) => candidate.key === "LONG_BULLISH")),
-        SHORT_BEARISH: cohortFromBreakdown(axisRows.find((candidate) => candidate.key === "SHORT_BEARISH")),
-        LONG_MIXED: cohortFromBreakdown(axisRows.find((candidate) => candidate.key === "LONG_MIXED")),
-        SHORT_MIXED: cohortFromBreakdown(axisRows.find((candidate) => candidate.key === "SHORT_MIXED")),
+        // Exact contexts are the canonical promotion/readiness evidence. The broad direction and
+        // regime rows above remain diagnostic only and must never be used as a proof fallback.
+        LONG_BULLISH: cohortFromContextEvidence(evidenceRow?.contextRows?.LONG_BULLISH),
+        SHORT_BEARISH: cohortFromContextEvidence(evidenceRow?.contextRows?.SHORT_BEARISH),
+        LONG_MIXED: cohortFromContextEvidence(evidenceRow?.contextRows?.LONG_MIXED),
+        SHORT_MIXED: cohortFromContextEvidence(evidenceRow?.contextRows?.SHORT_MIXED),
       },
       rotationShortlist: rotationShortlist
         ? {

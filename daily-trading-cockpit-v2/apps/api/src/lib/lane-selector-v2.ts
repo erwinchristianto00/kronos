@@ -1,6 +1,8 @@
 import {
   deriveVariantGeometry,
   VARIANT_MATRIX_DEFINITIONS,
+  type ExactLaneContext,
+  type VariantContextEvidenceRow,
   type VariantExitRule,
   type VariantMatrixSignal,
   type VariantMatrixVariantDefinition,
@@ -39,6 +41,8 @@ export interface LaneSelectorV2LaneState {
   byRegimeFamily?: LaneSelectorV2BreakdownRow[] | null;
   byAxisSymbol?: LaneSelectorV2BreakdownRow[] | null;
   bySymbol?: LaneSelectorV2BreakdownRow[] | null;
+  /** Canonical proof rows supplied by the scan runtime. Generic `status` is diagnostic only there. */
+  contextRows?: Partial<Record<ExactLaneContext, VariantContextEvidenceRow>>;
 }
 
 export interface LaneSelectorV2Candidate {

@@ -26,6 +26,7 @@ import {
   STABLE_MIN_FRESH,
   VARIANT_MATRIX_DEFINITIONS,
   WATCHABLE_MIN_FRESH,
+  type ExactLaneContext,
   type CurrentGuardVariantMatrixReport,
 } from "./current-guard-variant-matrix.js";
 import type { LiveTradingGateReport } from "./live-trading-gate.js";
@@ -628,34 +629,47 @@ function paperEvidenceForLane(
 
 function lanesFromVariantMatrix(
   vm: CurrentGuardVariantMatrixReport,
-  paperOrders: readonly PaperOrder[],
+  _paperOrders: readonly PaperOrder[],
 ): CandidateLane[] {
-  return vm.rows.map((row) => {
+  const contextShape = (context: ExactLaneContext): Pick<CandidateLane, "directionBias" | "regimeFamily"> => {
+    switch (context) {
+      case "LONG_BULLISH": return { directionBias: "LONG", regimeFamily: "BULLISH" };
+      case "SHORT_BEARISH": return { directionBias: "SHORT", regimeFamily: "BEARISH" };
+      case "LONG_MIXED": return { directionBias: "LONG", regimeFamily: "MIXED" };
+      case "SHORT_MIXED": return { directionBias: "SHORT", regimeFamily: "MIXED" };
+    }
+  };
+  return vm.rows.flatMap((row) => {
     const definition = VARIANT_MATRIX_DEFINITIONS.find((candidate) => candidate.id === row.variantId);
-    const longOnly = definition?.longOnly === true;
-    const laneId = longOnly
+    if (!definition) return [];
+    return definition.applicableContexts.flatMap((context) => {
+      const evidence = row.contextRows?.[context] ?? null;
+      const shape = contextShape(context);
+      const laneId = definition.longOnly
         ? `CG_LONG_VARIANT_MATRIX:${row.variantId}`
         : `CG_VARIANT_MATRIX:${row.variantId}`;
-    const paperEvidence = longOnly ? paperEvidenceForLane(laneId, paperOrders) : null;
-    return {
-      laneId,
-      source: "VARIANT_MATRIX",
-      // Generic current-guard rows are bearish/SHORT evidence. Explicit long-only
-      // definitions get an isolated LONG+BULLISH lane and never borrow SHORT stats.
-      directionBias: longOnly ? "LONG" as const : "SHORT" as const,
-      regimeFamily: longOnly ? "BULLISH" as const : "ANY" as const,
-      freshValid: paperEvidence?.freshValid ?? row.freshValid,
-      netAvgR: paperEvidence?.netAvgR ?? row.netAvgR,
-      pf: paperEvidence?.pf ?? row.pf,
-      wr: paperEvidence?.wr ?? row.wr,
-      payoffRatio: paperEvidence?.payoffRatio ?? row.payoffRatio,
-      oosAllPositive: paperEvidence?.oosAllPositive ?? row.allThreeOosPositive,
-      plus10bpsPositive: paperEvidence?.plus10bpsPositive ?? row.plus10bpsStillPositive,
-      maxDrawdownR: paperEvidence?.maxDrawdownR ?? row.approxMaxDrawdownR,
-      topSymbolShare: paperEvidence?.topSymbolShare ?? row.topSymbolPnlShare,
-      status: paperEvidence?.status ?? row.status,
-      blockers: paperEvidence?.blockers ?? row.blockers ?? [],
-    };
+      // Fixed LONG-only research lanes pre-date the VM exact-context store. Their isolated paper
+      // book is still a direction/regime-constrained observation source, so preserve it as a
+      // compatibility bridge while generic geometries use only VM exact cohorts.
+      const paperEvidence = definition.longOnly ? paperEvidenceForLane(laneId, _paperOrders) : null;
+      if (!paperEvidence && evidence?.freshValid === 0 && !definition.longOnly) return [];
+      return [{
+        laneId,
+        source: "VARIANT_MATRIX_EXACT_CONTEXT",
+        ...shape,
+        freshValid: paperEvidence?.freshValid ?? evidence?.freshValid ?? 0,
+        netAvgR: paperEvidence?.netAvgR ?? evidence?.netAvgR ?? null,
+        pf: paperEvidence?.pf ?? evidence?.pf ?? null,
+        wr: paperEvidence?.wr ?? evidence?.wr ?? null,
+        payoffRatio: paperEvidence?.payoffRatio ?? evidence?.payoffRatio ?? null,
+        oosAllPositive: paperEvidence?.oosAllPositive ?? evidence?.allThreeOosPositive ?? false,
+        plus10bpsPositive: paperEvidence?.plus10bpsPositive ?? evidence?.plus10bpsStillPositive ?? false,
+        maxDrawdownR: paperEvidence?.maxDrawdownR ?? evidence?.approxMaxDrawdownR ?? null,
+        topSymbolShare: paperEvidence?.topSymbolShare ?? evidence?.topSymbolPnlShare ?? null,
+        status: paperEvidence?.status ?? evidence?.status ?? "COLLECTING",
+        blockers: paperEvidence?.blockers ?? evidence?.blockers ?? ["missing exact-context evidence"],
+      }];
+    });
   });
 }
 

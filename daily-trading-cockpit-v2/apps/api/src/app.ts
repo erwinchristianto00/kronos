@@ -163,7 +163,9 @@ import {
 } from "./lib/realtime-short-mirror.js";
 import {
   buildCurrentGuardVariantMatrixReport,
+  exactLaneContextFor,
   getCurrentGuardVariantMatrixStore,
+  laneStatusForContext,
   variantMatrixOpenSignals,
 } from "./lib/current-guard-variant-matrix.js";
 import { getLatestScanCandidates } from "./lib/latest-scan-candidates-cache.js";
@@ -929,7 +931,6 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         const report = buildCurrentGuardVariantMatrixReport(getCurrentGuardVariantMatrixStore());
         const rotationShortlist = buildRegimeRotationShortlistReport(report);
         const laneVariantId = order.selectedLaneId.split(":").pop() ?? order.selectedLaneId;
-        const row = report.rows.find((candidate) => candidate.variantId === laneVariantId);
         // Force-eligible lanes (operator opt-in REALTIME_SHORT_FORCE_FAST_LONG/SHORT=1 +
         // FORCE_ELIGIBLE_LONG_VARIANT_IDS/FORCE_ELIGIBLE_SHORT_VARIANT_IDS below) are meant to trade
         // regardless of THIS instance's own thin/decaying STABLE_CANDIDATE label — live's local VM
@@ -939,18 +940,23 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         // operator's own opt-in the moment freshValid decayed (2026-07-11 incident: CG_WIDE_FAST_LONG
         // went dark for 32h+ this way despite REALTIME_SHORT_FORCE_FAST_LONG=1 being set).
         const forceEligibleForDirection = isForceEligibleForDirection(order.direction, laneVariantId);
-        if (
-          liveConfig.env === "mainnet" &&
-          row?.status !== "STABLE_CANDIDATE" &&
-          process.env.LIVE_UNPROVEN_EXECUTION_OVERRIDE !== "1" &&
-          !forceEligibleForDirection
-        ) return false;
         const regimeFamily =
           orderEstimatedRegime.direction === "LONG"
             ? "BULLISH"
             : orderEstimatedRegime.direction === "SHORT"
               ? "BEARISH"
               : rotationRegimeFamilyForLabel(order.regime);
+        const contextProof = laneStatusForContext(
+          report,
+          laneVariantId,
+          exactLaneContextFor(order.direction, regimeFamily),
+        );
+        if (
+          liveConfig.env === "mainnet" &&
+          contextProof.status !== "STABLE_CANDIDATE" &&
+          process.env.LIVE_UNPROVEN_EXECUTION_OVERRIDE !== "1" &&
+          !forceEligibleForDirection
+        ) return false;
         const rotationEligible = rotationShortlistDecision(rotationShortlist, {
           laneId: order.selectedLaneId,
           variantId: laneVariantId,
@@ -984,7 +990,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           return false;
         }
         return (
-          row?.status === "STABLE_CANDIDATE" ||
+          contextProof.status === "STABLE_CANDIDATE" ||
           // Operator force-enabled lanes (e.g. CG_WIDE_FAST_SHORT/CG_WIDE_FAST_LONG) trade before
           // STABLE — only when the matching REALTIME_SHORT_FORCE_FAST_LONG/SHORT flag is set (off
           // by default ⇒ stable-only gate preserved). LONG counterpart (2026-07-07): lets

@@ -40,7 +40,9 @@ import type {
   VariantRPathPoint,
 } from "./current-guard-variant-matrix.js";
 import {
+  exactLaneContextFor,
   effectiveMfeGivebackArmR,
+  laneStatusForContext,
   walkVariantPath,
   MAKER_FILL_WINDOW_CANDLES,
   VARIANT_MATRIX_DEFINITIONS,
@@ -1247,6 +1249,8 @@ export interface SelectEligiblePaperLaneInputs {
   vmReport: CurrentGuardVariantMatrixReport;
   controllerMode: string;
   regimeFamily: string;
+  /** Exact trade direction is mandatory for canonical readiness; absent context fails closed. */
+  direction?: "LONG" | "SHORT" | null;
   paperValidationAllowed?: boolean;
 }
 
@@ -1277,30 +1281,32 @@ export function selectEligiblePaperLanes(
   const out: PaperEligibleLane[] = [];
   for (const variantId of PAPER_ELIGIBLE_VARIANT_IDS) {
     if (PAPER_REJECT_VARIANT_IDS.includes(variantId) && !isConfiguredPaperHeadlineVariant(variantId)) continue;
-    const row = vmReport.rows.find((r) => r.variantId === variantId);
-    if (!row) continue;
+    const exactContext = exactLaneContextFor(inputs.direction, regimeFamily);
+    const contextProof = laneStatusForContext(vmReport, variantId, exactContext);
+    const evidence = contextProof.evidence;
+    if (!evidence) continue;
     if (PAPER_HEADLINE_REQUIRE_STABLE) {
-      if (row.status !== "STABLE_CANDIDATE") continue;
-    } else if (row.status === "REJECT") {
+      if (contextProof.status !== "STABLE_CANDIDATE") continue;
+    } else if (contextProof.status === "REJECT" || contextProof.status === "NOT_APPLICABLE") {
       continue;
     }
-    if (row.freshValid < 50) continue;
-    if ((row.netAvgR ?? 0) <= 0) continue;
+    if (evidence.freshValid < 50) continue;
+    if ((evidence.netAvgR ?? 0) <= 0) continue;
     // PF can be null when there are no losses; treat as "infinite, passes".
     // Otherwise it must exceed 1.2.
-    const pfVal = row.pf;
+    const pfVal = evidence.pf;
     if (pfVal !== null && Number.isFinite(pfVal) && pfVal <= 1.2) continue;
-    if (row.plus10bpsStillPositive !== true) continue;
+    if (evidence.plus10bpsStillPositive !== true) continue;
 
-    const oosUnconfirmed = !row.allThreeOosPositive;
+    const oosUnconfirmed = !evidence.allThreeOosPositive;
     const isExperimental = oosUnconfirmed;
     const paperRiskLabel: PaperRiskLabel = oosUnconfirmed ? "EXPERIMENTAL" : "NORMAL";
     out.push({
       laneId: `CG_VARIANT_MATRIX:${variantId}`,
       variantId,
-      freshValid: row.freshValid,
-      netAvgR: row.netAvgR,
-      pf: row.pf,
+      freshValid: evidence.freshValid,
+      netAvgR: evidence.netAvgR,
+      pf: evidence.pf,
       isExperimental,
       oosUnconfirmed,
       paperRiskLabel,
@@ -3357,20 +3363,26 @@ export function evaluatePaperLaneRotation(
     activeLaneId?.startsWith("CG_VARIANT_MATRIX:") === true
       ? activeLaneId.split(":")[1] ?? null
       : null;
-  const currentLaneVmRow = currentLaneVariantId
-    ? vmReport.rows.find((row) => row.variantId === currentLaneVariantId)
-    : undefined;
-  const currentLaneFreshValid = currentLaneVmRow?.freshValid ?? 0;
+  const currentLaneContext = exactLaneContextFor(
+    controllerMode === "SHORT_ONLY" ? "SHORT" : controllerMode === "LONG_ONLY" ? "LONG" : null,
+    regimeFamily,
+  );
+  const currentLaneProof = currentLaneVariantId
+    ? laneStatusForContext(vmReport, currentLaneVariantId, currentLaneContext)
+    : null;
+  const currentLaneEvidence = currentLaneProof?.evidence ?? null;
+  const currentLaneFreshValid = currentLaneEvidence?.freshValid ?? 0;
   const vmEconomicsRejected =
-    currentLaneVmRow?.status === "REJECT" ||
+    currentLaneProof?.status === "REJECT" ||
     (
-      (currentLaneVmRow?.freshValid ?? 0) >= 50 &&
+      currentLaneEvidence !== null &&
+      currentLaneEvidence.freshValid >= 50 &&
       (
-        (currentLaneVmRow?.netAvgR !== null && (currentLaneVmRow?.netAvgR ?? 0) < 0) ||
+        (currentLaneEvidence.netAvgR !== null && currentLaneEvidence.netAvgR < 0) ||
         (
-          currentLaneVmRow?.pf !== null &&
-          Number.isFinite(currentLaneVmRow?.pf) &&
-          (currentLaneVmRow?.pf ?? Infinity) < 1
+          currentLaneEvidence.pf !== null &&
+          Number.isFinite(currentLaneEvidence.pf) &&
+          currentLaneEvidence.pf < 1
         )
       )
     );
@@ -3422,9 +3434,9 @@ export function evaluatePaperLaneRotation(
   } else {
     action = "PAPER_ONLY_NO_REAL_APPROVAL";
     reason = vmEconomicsRejected
-      ? `confidence=DEGRADED; active lane variant-matrix status=${currentLaneVmRow?.status ?? "REJECT"} ` +
-        `(n=${currentLaneVmRow?.freshValid ?? 0}, net=${currentLaneVmRow?.netAvgR?.toFixed(4) ?? "n/a"}, ` +
-        `PF=${currentLaneVmRow?.pf?.toFixed(2) ?? "n/a"}); quarantine new paper admission`
+      ? `confidence=DEGRADED; active lane exact-context status=${currentLaneProof?.status ?? "COLLECTING"} ` +
+        `(n=${currentLaneEvidence?.freshValid ?? 0}, net=${currentLaneEvidence?.netAvgR?.toFixed(4) ?? "n/a"}, ` +
+        `PF=${currentLaneEvidence?.pf?.toFixed(2) ?? "n/a"}); quarantine new paper admission`
       : "confidence=DEGRADED; no better eligible lane; continue paper only with no live approval";
   }
 
@@ -5617,6 +5629,12 @@ async function runPaperAdmissionAndResolutionInner(
     vmReport,
     controllerMode: routerReport.controllerMode,
     regimeFamily: routerReport.regimeFamily,
+    direction:
+      routerReport.controllerMode === "SHORT_ONLY"
+        ? "SHORT"
+        : routerReport.controllerMode === "LONG_ONLY"
+          ? "LONG"
+          : null,
     paperValidationAllowed,
   });
 

@@ -38,7 +38,10 @@ import {
   type LaneSelectorV2EstimatedRegime,
   type LaneSelectorV2LaneState,
 } from "./lane-selector-v2.js";
-import type { VariantMatrixVariantId } from "./current-guard-variant-matrix.js";
+import {
+  exactLaneContextFor,
+  type VariantMatrixVariantId,
+} from "./current-guard-variant-matrix.js";
 import type { RegimeRotationShortlistReport } from "./regime-rotation-shortlist.js";
 
 export const REALTIME_SHORT_LANE_VARIANT_ID = "CG_WIDE_FAST_SHORT";
@@ -317,6 +320,57 @@ function effectiveLaneStates(
 }
 
 /**
+ * Resolve the status and scoring metrics from the exact candidate context before selection. The
+ * aggregate row is intentionally not a fallback: old/manual test states without `contextRows`
+ * retain their supplied status, but scan-originated states always carry the canonical map.
+ */
+function laneStatesForCandidate(
+  states: RealtimeShortLaneState[],
+  candidate: RealtimeShortCandidate,
+  estimated: LaneSelectorV2EstimatedRegime,
+  regime: string | null,
+): RealtimeShortLaneState[] {
+  const family =
+    estimated.direction === "LONG"
+      ? "BULLISH"
+      : estimated.direction === "SHORT"
+        ? "BEARISH"
+        : /mixed|chop|range|rotation|sideways/i.test(regime ?? "")
+          ? "MIXED"
+          : null;
+  const context = exactLaneContextFor(candidate.direction, family);
+  return states.map((state) => {
+    // This branch only exists for backward-compatible direct callers. The production scan feeds
+    // `contextRows`, making missing context fail closed rather than borrowing aggregate evidence.
+    if (!state.contextRows) return state;
+    const proof = context === null ? null : state.contextRows[context] ?? null;
+    if (!proof) {
+      return {
+        ...state,
+        status: "COLLECTING",
+        freshValid: 0,
+        netAvgR: null,
+        pf: null,
+        wr: null,
+        payoffRatio: null,
+      };
+    }
+    return {
+      ...state,
+      status: proof.status,
+      freshValid: proof.freshValid,
+      netAvgR: proof.netAvgR,
+      pf: proof.pf,
+      wr: proof.wr,
+      payoffRatio: proof.payoffRatio,
+      approxMaxDrawdownR: proof.approxMaxDrawdownR,
+      topSymbolPnlShare: proof.topSymbolPnlShare,
+      plus10bpsStillPositive: proof.plus10bpsStillPositive,
+    };
+  });
+}
+
+/**
  * The live engine derives every Binance clientOrderId from the TAIL of paperOrderId
  * (`live-execution-engine.ts`: `idTail = paperOrderId.slice(-18)` → `dtc-${idTail}-e/-s/-t`),
  * capped at Binance's 36-char limit. So paperOrderId MUST be short, charset-safe ([a-z0-9-]),
@@ -429,7 +483,7 @@ export function runRealtimeShortMirror(
         takeProfitLevels: c.takeProfitLevels,
         stopDistanceBps: c.stopDistanceBps,
       },
-      laneStates,
+      laneStates: laneStatesForCandidate(laneStates, c, estimatedRegime, inputs.regime),
       regime: inputs.regime,
       controllerMode: inputs.controllerMode,
       controllerConfidence: inputs.controllerConfidence,

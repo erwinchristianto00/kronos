@@ -97,7 +97,7 @@ async function buildWinningVmStore(dir: string): Promise<CurrentGuardVariantMatr
     tp2: null,
     tp3: null,
     stopDistanceBps: 300,
-    regime: "BULLISH_EXPANSION",
+    regime: "Bearish pressure",
     entryVariant: "base_current_entry",
     openedAt: new Date(recentBase + i * 5_000).toISOString(),
     closedAt: null,
@@ -511,6 +511,7 @@ describe("paper-execution-router", () => {
       vmReport: vm,
       controllerMode: "SHORT_ONLY",
       regimeFamily: "BEARISH",
+      direction: "SHORT",
     });
 
     expect(lane).not.toBeNull();
@@ -535,8 +536,8 @@ describe("paper-execution-router", () => {
     expect(lane).toBeNull();
   });
 
-  // [12] Mixed VALIDATION_ONLY + paperValidationAllowed → eligible
-  it("[12] Mixed VALIDATION_ONLY + paperValidationAllowed=true admits paper lane", async () => {
+  // [12] Mixed VALIDATION_ONLY without an exact mixed-direction cohort fails closed.
+  it("[12] Mixed VALIDATION_ONLY + paperValidationAllowed=true does not borrow bearish proof", async () => {
     const dir = tmpDir();
     const vmStore = await buildWinningVmStore(dir);
     const vm = buildCurrentGuardVariantMatrixReport(vmStore, { capturedAt: new Date().toISOString() });
@@ -545,11 +546,11 @@ describe("paper-execution-router", () => {
       vmReport: vm,
       controllerMode: "VALIDATION_ONLY",
       regimeFamily: "MIXED",
+      direction: "SHORT",
       paperValidationAllowed: true,
     });
 
-    expect(lane).not.toBeNull();
-    expect(lane!.variantId).toBe("CG_SCALEOUT_TP1_TRAIL");
+    expect(lane).toBeNull();
   });
 
   // [13] LONG_ONLY → null
@@ -577,6 +578,7 @@ describe("paper-execution-router", () => {
       vmReport: vm,
       controllerMode: "SHORT_ONLY",
       regimeFamily: "BEARISH",
+      direction: "SHORT",
     });
 
     expect(lane).toBeNull();
@@ -592,6 +594,7 @@ describe("paper-execution-router", () => {
       vmReport: vm,
       controllerMode: "SHORT_ONLY",
       regimeFamily: "BEARISH",
+      direction: "SHORT",
     });
     if (lane !== null) {
       expect(lane.variantId).not.toBe("CG_NO_FIB500_ENTRYSET");
@@ -640,6 +643,7 @@ describe("paper-execution-router", () => {
       vmReport: vm,
       controllerMode: "SHORT_ONLY",
       regimeFamily: "BEARISH",
+      direction: "SHORT",
     });
 
     expect(lane).not.toBeNull();
@@ -1016,15 +1020,16 @@ describe("paper-execution-router", () => {
     expect(report.paperLaneConfidence).toBe("DEGRADED");
   });
 
-  it("[22c] variant-matrix REJECT quarantines the active lane despite positive historical paper results", async () => {
+  it("[22c] exact-context REJECT quarantines the active lane despite positive historical paper results", async () => {
     const dir = tmpDir();
     const vmStore = await buildWinningVmStore(dir);
     const vm = buildCurrentGuardVariantMatrixReport(vmStore, { capturedAt: new Date().toISOString() });
     const wide = vm.rows.find((row) => row.variantId === "CG_WIDE_STOP_TP_WIDE")!;
-    wide.status = "REJECT";
-    wide.freshValid = 60;
-    wide.netAvgR = -0.2;
-    wide.pf = 0.6;
+    const bearishProof = wide.contextRows!.SHORT_BEARISH!;
+    bearishProof.status = "REJECT";
+    bearishProof.freshValid = 60;
+    bearishProof.netAvgR = -0.2;
+    bearishProof.pf = 0.6;
 
     const activeLane = "CG_VARIANT_MATRIX:CG_WIDE_STOP_TP_WIDE";
     const closedOrders = Array.from({ length: 12 }, (_, i) =>
