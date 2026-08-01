@@ -42,7 +42,7 @@ export interface CortexOperatorReport {
   readonly verdict: CortexOperatorVerdict;
   readonly exitCode: number;
   readonly blockers: readonly string[];
-  readonly invocation: { readonly mode: CortexOperatorMode; readonly requestedInstance: string | null; readonly runtimeInstance: string | null; readonly cwd: string; readonly dataDir: string | null; readonly codeVersion: string | null; readonly codeVersionSource: string | null; readonly resetEpoch: string; readonly generatedAt: string; };
+  readonly invocation: { readonly mode: CortexOperatorMode; readonly requestedInstance: string | null; readonly runtimeInstance: string | null; readonly cwd: string; readonly dataDir: string | null; readonly codeVersion: string | null; readonly codeVersionSource: string | null; readonly verifiedCodeVersion: string | null; readonly verifiedCodeSource: string | null; readonly verifiedSourceFiles: readonly CortexOperatorFile[]; readonly resetEpoch: string; readonly generatedAt: string; };
   readonly policy: (CanonicalPolicyContext & { readonly fourBrainPolicyVersion: string }) | null;
   readonly sourceSnapshot: { readonly stable: boolean; readonly files: readonly CortexOperatorFile[]; readonly executiveOutcomeCount: number; readonly forwardEventCount: number; };
   readonly incumbent: { readonly generation: number | null; readonly generationZeroProven: boolean; readonly featureSchemaVersion: number | null; readonly coefficientFingerprint: string | null; readonly archetypes: Record<string, { readonly nEff: number; readonly refitAt: string | null }> | null; };
@@ -58,6 +58,8 @@ export interface CortexOperatorDeps {
   /** Test-only injection. The production CLI exposes no data directory override. */
   readonly dataDir?: string;
   readonly codeVersion?: () => { value: string | null; source: string | null };
+  /** Test-only provenance seam. The production CLI always verifies manifest/Git closure itself. */
+  readonly verifyCodeProvenance?: (candidate: { value: string | null; source: string | null }) => CortexOperatorCodeProvenance;
   readonly onAfterRead?: () => void;
   /** Test-only hook to prove registry identity is checked immediately before persistence. */
   readonly onBeforePersist?: () => void;
@@ -66,6 +68,25 @@ export interface CortexOperatorDeps {
 const sha = (contents: Buffer | string): string => createHash("sha256").update(contents).digest("hex");
 const validSha = (value: string | null): value is string => value != null && /^[a-f0-9]{40}$/i.test(value);
 const inside = (root: string, candidate: string): boolean => relative(root, candidate) === "" || !relative(root, candidate).startsWith(".." + "/") && relative(root, candidate) !== "..";
+export const OPERATOR_SOURCE_CLOSURE = [
+  "apps/api/scripts/cortex-shadow-refit-operator.ts",
+  "apps/api/src/lib/cortex-shadow-refit-operator.ts",
+  "apps/api/src/lib/cortex-shadow-refit.ts",
+  "apps/api/src/lib/cortex-brain-store.ts",
+  "apps/api/src/lib/cortex-brain.ts",
+  "apps/api/src/lib/cortex-economic-model.ts",
+  "apps/api/src/lib/executive-review-store.ts",
+  "apps/api/src/experience-engine/forward-causal-collection.ts",
+  "apps/api/src/lib/four-brain-types.ts",
+  "packages/shared/src/evidence-era.ts",
+  "packages/shared/src/policy-versions.ts",
+] as const;
+export interface CortexOperatorCodeProvenance {
+  readonly status: "VALID" | "CODE_VERSION_UNRESOLVED" | "DEPLOYMENT_MANIFEST_INVALID" | "DEPLOYED_SOURCE_HASH_MISMATCH" | "GIT_SOURCE_MISMATCH";
+  readonly sha: string | null;
+  readonly source: string | null;
+  readonly files: readonly CortexOperatorFile[];
+}
 
 export function parseCortexShadowRefitOperatorArgs(argv: readonly string[]): { args: CortexOperatorArgs | null; blocker: string | null; exitCode: number } {
   let instance: string | null = null; let mode: CortexOperatorMode = "dry-run"; let modeSeen = false; let json = false;
@@ -116,6 +137,49 @@ function resolveCodeVersion(cwd: string, env: NodeJS.ProcessEnv, injected?: Cort
   for (const key of ["DEPLOYMENT_COMMIT_SHA", "GIT_COMMIT_SHA", "CODE_VERSION"]) { const value = env[key]?.trim() ?? ""; if (validSha(value)) return { value, source: `env:${key}` }; }
   try { const value = execFileSync("git", ["rev-parse", "HEAD"], { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim(); return validSha(value) ? { value, source: "git:HEAD" } : { value: null, source: null }; } catch { return { value: null, source: null }; }
 }
+function command(cwd: string, args: readonly string[]): string | null {
+  try { return execFileSync("git", [...args], { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim(); } catch { return null; }
+}
+function closureFiles(repoRoot: string): CortexOperatorFile[] | null {
+  try {
+    return OPERATOR_SOURCE_CLOSURE.map((entry) => {
+      const path = resolve(repoRoot, entry); const contents = readFileSync(path);
+      return { path: entry, sha256: sha(contents), size: contents.length, mtimeMs: statSync(path).mtimeMs };
+    });
+  } catch { return null; }
+}
+function readDeploymentManifest(file: string, repoRoot: string): CortexOperatorCodeProvenance | null {
+  if (!existsSync(file)) return { status: "DEPLOYMENT_MANIFEST_INVALID", sha: null, source: `manifest:${file}`, files: [] };
+  try {
+    const raw = JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>;
+    const commit = typeof raw.commitSha === "string" ? raw.commitSha : typeof raw.commitSHA === "string" ? raw.commitSHA : null;
+    const hashes = raw.sourceHashes && typeof raw.sourceHashes === "object" && !Array.isArray(raw.sourceHashes) ? raw.sourceHashes as Record<string, unknown> : null;
+    const files = closureFiles(repoRoot);
+    if (!validSha(commit) || !hashes || !files) return { status: "DEPLOYMENT_MANIFEST_INVALID", sha: null, source: `manifest:${file}`, files: [] };
+    if (files.some((entry) => hashes[entry.path] !== entry.sha256)) return { status: "DEPLOYED_SOURCE_HASH_MISMATCH", sha: commit, source: `manifest:${file}`, files };
+    return { status: "VALID", sha: commit, source: `manifest:${file}`, files };
+  } catch { return { status: "DEPLOYMENT_MANIFEST_INVALID", sha: null, source: `manifest:${file}`, files: [] }; }
+}
+export function verifyCortexOperatorCodeProvenance(cwd: string, env: NodeJS.ProcessEnv, candidate: { value: string | null; source: string | null }): CortexOperatorCodeProvenance {
+  const repoRoot = resolve(cwd, "../..");
+  const manifest = env.DEPLOYMENT_MANIFEST_PATH?.trim();
+  if (manifest) return readDeploymentManifest(resolve(manifest), repoRoot)!;
+  if (!validSha(candidate.value)) return { status: "CODE_VERSION_UNRESOLVED", sha: null, source: candidate.source, files: [] };
+  const resolved = command(repoRoot, ["rev-parse", `${candidate.value}^{commit}`]);
+  const files = closureFiles(repoRoot);
+  if (!resolved || !validSha(resolved) || !files) return { status: "CODE_VERSION_UNRESOLVED", sha: null, source: candidate.source, files: [] };
+  for (const file of files) {
+    const expected = command(repoRoot, ["show", `${resolved}:${file.path}`]);
+    // `git show` text is not sufficient for arbitrary bytes; source closure is TypeScript text,
+    // and Git's blob hash check below independently proves exact byte identity.
+    const blob = command(repoRoot, ["rev-parse", `${resolved}:${file.path}`]);
+    const localBlob = command(repoRoot, ["hash-object", resolve(repoRoot, file.path)]);
+    if (expected == null || blob == null || localBlob !== blob) return { status: "DEPLOYED_SOURCE_HASH_MISMATCH", sha: resolved, source: candidate.source, files };
+  }
+  const clean = command(repoRoot, ["status", "--porcelain", "--", ...OPERATOR_SOURCE_CLOSURE]);
+  if (clean == null || clean !== "") return { status: "GIT_SOURCE_MISMATCH", sha: resolved, source: candidate.source, files };
+  return { status: "VALID", sha: resolved, source: candidate.source === "git:HEAD" ? "git:HEAD+closure" : `${candidate.source}+closure`, files };
+}
 function registryIdentity(file: string, registry: CortexShadowRefitRegistryStore): { exists: boolean; sha256: string | null; schemaVersion: string; integrityHash: string; lastGenerationFingerprint: string | null } {
   const current = registry.get();
   return {
@@ -135,7 +199,7 @@ function strictIncumbentBlocker(status: ReturnType<typeof readCortexBrainStoreSt
 }
 
 function blank(mode: CortexOperatorMode, requestedInstance: string | null, cwd: string, nowMs: number): CortexOperatorReport {
-  return { schemaVersion: "cortex-operator-runner/1", verdict: "CORTEX_OPERATOR_BLOCKED", exitCode: CORTEX_OPERATOR_EXIT.BLOCKED, blockers: [], invocation: { mode, requestedInstance, runtimeInstance: null, cwd, dataDir: null, codeVersion: null, codeVersionSource: null, resetEpoch: CORTEX_SHADOW_REFIT_DEFAULT_EPOCH, generatedAt: new Date(nowMs).toISOString() }, policy: null, sourceSnapshot: { stable: false, files: [], executiveOutcomeCount: 0, forwardEventCount: 0 }, incumbent: { generation: null, generationZeroProven: false, featureSchemaVersion: null, coefficientFingerprint: null, archetypes: null }, registry: { path: null, exists: false, schemaVersion: null, integrityStatus: null, latestCandidateGeneration: null, latestAuditStatus: null }, prospective: { status: null, datasetHash: null, generationFingerprint: null, candidateGenerationId: null, totalExamined: 0, directEligible: 0, archivedPreEpoch: 0, rejected: {}, beta: { evaluationBeta: 0, liveBeta: 0 }, promotion: "OFF" }, mutationPlan: { writeAuthorized: false, filesToChange: [], persisted: false } };
+  return { schemaVersion: "cortex-operator-runner/1", verdict: "CORTEX_OPERATOR_BLOCKED", exitCode: CORTEX_OPERATOR_EXIT.BLOCKED, blockers: [], invocation: { mode, requestedInstance, runtimeInstance: null, cwd, dataDir: null, codeVersion: null, codeVersionSource: null, verifiedCodeVersion: null, verifiedCodeSource: null, verifiedSourceFiles: [], resetEpoch: CORTEX_SHADOW_REFIT_DEFAULT_EPOCH, generatedAt: new Date(nowMs).toISOString() }, policy: null, sourceSnapshot: { stable: false, files: [], executiveOutcomeCount: 0, forwardEventCount: 0 }, incumbent: { generation: null, generationZeroProven: false, featureSchemaVersion: null, coefficientFingerprint: null, archetypes: null }, registry: { path: null, exists: false, schemaVersion: null, integrityStatus: null, latestCandidateGeneration: null, latestAuditStatus: null }, prospective: { status: null, datasetHash: null, generationFingerprint: null, candidateGenerationId: null, totalExamined: 0, directEligible: 0, archivedPreEpoch: 0, rejected: {}, beta: { evaluationBeta: 0, liveBeta: 0 }, promotion: "OFF" }, mutationPlan: { writeAuthorized: false, filesToChange: [], persisted: false } };
 }
 
 export function runCortexShadowRefitOperator(argv: readonly string[], deps: CortexOperatorDeps = {}): CortexOperatorReport {
@@ -151,8 +215,11 @@ export function runCortexShadowRefitOperator(argv: readonly string[], deps: Cort
   if (!Number.isFinite(Date.parse(canonical.policyDeploymentAt))) return { ...report, blockers: ["POLICY_CONTEXT_INVALID"] };
   if (!EXECUTIVE_SCHEMA_VERSION) return { ...report, blockers: ["FOUR_BRAIN_POLICY_VERSION_UNRESOLVED"] };
   const policy = { ...canonical, instanceId: args.instance, fourBrainPolicyVersion: EXECUTIVE_SCHEMA_VERSION } as const;
-  const code = resolveCodeVersion(cwd, env, deps.codeVersion); report = { ...report, invocation: { ...report.invocation, codeVersion: code.value, codeVersionSource: code.source }, policy };
-  if (!code.value) return { ...report, blockers: ["CODE_VERSION_UNRESOLVED"] };
+  const code = resolveCodeVersion(cwd, env, deps.codeVersion);
+  const provenance = deps.verifyCodeProvenance?.(code) ?? verifyCortexOperatorCodeProvenance(cwd, env, code);
+  report = { ...report, invocation: { ...report.invocation, codeVersion: code.value, codeVersionSource: code.source, verifiedCodeVersion: provenance.sha, verifiedCodeSource: provenance.source, verifiedSourceFiles: provenance.files }, policy };
+  if (provenance.status !== "VALID") return { ...report, blockers: [provenance.status] };
+  if (!provenance.sha) return { ...report, blockers: ["CODE_VERSION_UNRESOLVED"] };
   const causalDir = resolve((env.CAUSAL_EXPERIENCE_COLLECTION_DIR ?? "data").toString());
   try { if (realpathSync(causalDir) !== data.dataDir) return { ...report, blockers: ["ACTIVE_DATA_DIR_AMBIGUOUS"] }; } catch { return { ...report, blockers: ["ACTIVE_DATA_DIR_AMBIGUOUS"] }; }
   const executiveFile = resolve(data.dataDir, "executive-review-store.json");
@@ -169,7 +236,7 @@ export function runCortexShadowRefitOperator(argv: readonly string[], deps: Cort
     let fd: number | null = null;
     try {
       fd = openSync(lock, "wx"); ownsLock = true;
-      writeFileSync(fd, JSON.stringify({ schemaVersion: "cortex-shadow-refit-operator-lock/1", pid: process.pid, instance: args.instance, startedAt: new Date(nowMs).toISOString(), codeVersion: code.value, runId: randomUUID() }));
+      writeFileSync(fd, JSON.stringify({ schemaVersion: "cortex-shadow-refit-operator-lock/1", pid: process.pid, instance: args.instance, startedAt: new Date(nowMs).toISOString(), codeVersion: provenance.sha, runId: randomUUID() }));
       closeSync(fd); fd = null;
     } catch (error) {
       if (fd != null) closeSync(fd);
@@ -196,7 +263,7 @@ export function runCortexShadowRefitOperator(argv: readonly string[], deps: Cort
     report = { ...report, sourceSnapshot: { stable: true, files, executiveOutcomeCount: outcomes.length, forwardEventCount: events.length }, incumbent: { generation: incumbentGeneration.generation, generationZeroProven: incumbentGeneration.proven, featureSchemaVersion: incumbent.featureSchemaVersion, coefficientFingerprint: coefficientFingerprint(incumbent), archetypes }, registry: { path: registryFile, exists: existsSync(registryFile), schemaVersion: registryState.schemaVersion, integrityStatus: registryState.integrityStatus, latestCandidateGeneration: registryState.candidates.at(-1)?.generationId ?? null, latestAuditStatus: registryState.lastAudit?.status ?? null } };
     if (!incumbentGeneration.proven || incumbentGeneration.generation == null) return { ...report, blockers: ["INCUMBENT_GENERATION_UNRESOLVED"] };
     if (registry.isCorrupted()) return { ...report, blockers: ["REGISTRY_CORRUPTED"] };
-    const plan: CortexShadowRefitPlan = planCortexShadowRefit({ outcomes, forwardEvents: events, policy, incumbent, registry, nowMs, codeVersion: code.value, incumbentGeneration: incumbentGeneration.generation });
+    const plan: CortexShadowRefitPlan = planCortexShadowRefit({ outcomes, forwardEvents: events, policy, incumbent, registry, nowMs, codeVersion: provenance.sha, incumbentGeneration: incumbentGeneration.generation });
     const p = plan.report; const prospective = { status: p.status, datasetHash: p.dataset.datasetHash, generationFingerprint: p.candidate?.generationFingerprint ?? registryState.lastGenerationFingerprint, candidateGenerationId: p.candidate?.generationId ?? null, totalExamined: p.dataset.examined, directEligible: p.dataset.examples.length, archivedPreEpoch: p.dataset.archivedPreEpoch, rejected: p.dataset.rejected, beta: p.beta, promotion: "OFF" as const };
     report = { ...report, prospective, blockers: p.blockers };
     if (p.status === "BLOCKED" || !plan.nextRegistry) return { ...report, blockers: [...p.blockers, "REFIT_PLAN_BLOCKED"] };
