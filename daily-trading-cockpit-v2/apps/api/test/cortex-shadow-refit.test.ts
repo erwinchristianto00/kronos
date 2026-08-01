@@ -231,6 +231,34 @@ describe("CORTEX shadow refit learner v1", () => {
     expect(report.candidate!.archetypes[0]!.oos.calibrationMae).toBeCloseTo(expectedCandidateMae);
   });
 
+  it("freezes fold recency weighting at the training cutoff, not the held-out end time", () => {
+    const baselineInput = dataset(44);
+    const delayedInput = structuredClone(baselineInput);
+    const delayMs = 365 * 86_400_000;
+    for (let index = 20; index < delayedInput.outcomes.length; index += 1) {
+      const outcome = delayedInput.outcomes[index]! as any;
+      outcome.marketClosedAtMs += delayMs;
+      outcome.settlementResolvedAtMs += delayMs;
+      outcome.exactCloseTimeMs += delayMs;
+      outcome.resolvedAtMs += delayMs;
+    }
+    for (let index = 20 * 3; index < delayedInput.forwardEvents.length; index += 3) {
+      const outcome = delayedInput.forwardEvents[index + 2] as any;
+      outcome.closedAtMs += delayMs;
+      outcome.resolvedAtMs += delayMs;
+    }
+    const hyperparameters = { ...CORTEX_SHADOW_REFIT_HYPERPARAMETERS, halfLifeDays: 1, minEffectiveN: 1 } as any;
+    const baseline = runCortexShadowRefit({ ...baselineInput, policy, incumbent: emptyCortexState(), registry: new CortexShadowRefitRegistryStore(join(temp(), "baseline.json")), nowMs: epochMs + 400_000_000, hyperparameters });
+    const delayed = runCortexShadowRefit({ ...delayedInput, policy, incumbent: emptyCortexState(), registry: new CortexShadowRefitRegistryStore(join(temp(), "delayed.json")), nowMs: epochMs + 800_000_000, hyperparameters });
+    const baselineFold = baseline.candidate!.archetypes[0]!.folds[0]!;
+    const delayedFold = delayed.candidate!.archetypes[0]!.folds[0]!;
+    expect(baselineFold.trainingCutoffMs).toBe(baselineFold.trainEndMs);
+    expect(delayedFold.trainingCutoffMs).toBe(delayedFold.trainEndMs);
+    expect(baselineFold.trainingCutoffMs).toBeLessThan(baselineFold.oosStartMs!);
+    expect(delayedFold.trainingCutoffMs).toBeLessThan(delayedFold.oosStartMs!);
+    expect(delayedFold.heldOut.map((row) => row.candidatePrediction)).toEqual(baselineFold.heldOut.map((row) => row.candidatePrediction));
+  });
+
   it("applies purgeMs to held-out membership instead of leaving it as unused configuration", () => {
     const dir = temp(); const registry = new CortexShadowRefitRegistryStore(join(dir, "registry.json"));
     const report = runCortexShadowRefit({

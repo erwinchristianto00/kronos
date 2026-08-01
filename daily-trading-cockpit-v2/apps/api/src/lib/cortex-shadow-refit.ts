@@ -110,6 +110,8 @@ export interface CortexShadowFoldResult {
   readonly fold: number;
   readonly trainStartMs: number | null;
   readonly trainEndMs: number | null;
+  /** The only recency-weighting clock allowed for this fold: the final resolved training row. */
+  readonly trainingCutoffMs: number | null;
   readonly oosStartMs: number | null;
   readonly oosEndMs: number | null;
   readonly trainN: number;
@@ -493,9 +495,18 @@ function fitArchetype(
     const train = ordered.slice(0, trainEnd);
     const oos = ordered.slice(trainEnd, Math.min(ordered.length, trainEnd + foldSize));
     const opportunities = new Set(train.map((row) => row.opportunityId));
-    const purgeBoundaryMs = (train.at(-1)?.resolvedTimeMs ?? -Infinity) + hyperparameters.purgeMs;
+    const trainingCutoffMs = train.at(-1)?.resolvedTimeMs;
+    const purgeBoundaryMs = (trainingCutoffMs ?? -Infinity) + hyperparameters.purgeMs;
     const safeOos = oos.filter((row) => !opportunities.has(row.opportunityId) && row.decisionTimeMs > purgeBoundaryMs);
-    const fit = refitCortexEconomicModel(train.map((row) => ({ x: [...row.x], realizedNetR: row.netR, tMs: row.resolvedTimeMs, schemaVersion: CORTEX_FEATURE_SCHEMA_VERSION })), [...prior], { nowMs: safeOos.at(-1)?.resolvedTimeMs ?? nowMs, ...hyperparameters });
+    // OOS rows must never influence recency weights. The model's clock is frozen at the last
+    // resolved training observation, even when the held-out period extends far into the future.
+    const fit: CortexEconomicFit = trainingCutoffMs == null
+      ? { coefficients: [...prior], residualScale: null, effectiveSampleSize: 0, status: "INSUFFICIENT_DATA" }
+      : refitCortexEconomicModel(
+        train.map((row) => ({ x: [...row.x], realizedNetR: row.netR, tMs: row.resolvedTimeMs, schemaVersion: CORTEX_FEATURE_SCHEMA_VERSION })),
+        [...prior],
+        { nowMs: trainingCutoffMs, ...hyperparameters },
+      );
     const heldOut = safeOos.map((row) => ({
       exampleId: row.exampleId, opportunityId: row.opportunityId, decisionTimeMs: row.decisionTimeMs,
       resolvedTimeMs: row.resolvedTimeMs, netR: row.netR, regimeFamily: row.regimeFamily, symbolOrBasketId: row.symbolOrBasketId,
@@ -507,7 +518,7 @@ function fitArchetype(
     const expectedEconomicDeltaR = heldOutDelta(heldOut);
     folds.push({
       fold: fold + 1,
-      trainStartMs: train[0]?.decisionTimeMs ?? null, trainEndMs: train.at(-1)?.resolvedTimeMs ?? null,
+      trainStartMs: train[0]?.decisionTimeMs ?? null, trainEndMs: trainingCutoffMs ?? null, trainingCutoffMs: trainingCutoffMs ?? null,
       oosStartMs: safeOos[0]?.decisionTimeMs ?? null, oosEndMs: safeOos.at(-1)?.resolvedTimeMs ?? null,
       trainN: train.length, oosN: safeOos.length, trainExampleIds: train.map((row) => row.exampleId), heldOut, fitStatus: fit.status,
       candidate, incumbent, expectedEconomicDeltaR,
