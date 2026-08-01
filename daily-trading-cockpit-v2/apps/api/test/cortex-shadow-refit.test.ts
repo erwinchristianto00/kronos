@@ -11,6 +11,7 @@ import {
   buildCortexShadowTrainingDataset,
   compareCortexShadowPrediction,
   cortexShadowRefitReadiness,
+  planCortexShadowRefit,
   runCortexShadowRefit,
 } from "../src/lib/cortex-shadow-refit.js";
 import type { ExecutiveReviewOutcome } from "../src/lib/executive-review-store.js";
@@ -152,6 +153,13 @@ describe("CORTEX shadow refit learner v1", () => {
     expect(second.status).toBe("NO_NEW_ELIGIBLE_DATA");
     expect(registry.get().candidates).toHaveLength(1);
     expect(JSON.parse(readFileSync(join(dir, "registry.json"), "utf8")).candidates).toHaveLength(1);
+  });
+
+  it("freezes full-fit candidate content at the evidence cutoff, not invocation wall time", () => {
+    const input = dataset(44); const incumbent = emptyCortexState();
+    const first = planCortexShadowRefit({ ...input, policy, incumbent, registry: new CortexShadowRefitRegistryStore(join(temp(), "registry.json")), nowMs: epochMs + 200_000_000, codeVersion: "test" });
+    const second = planCortexShadowRefit({ ...input, policy, incumbent, registry: new CortexShadowRefitRegistryStore(join(temp(), "registry.json")), nowMs: epochMs + 900_000_000, codeVersion: "test" });
+    expect(first.report.candidate).toEqual(second.report.candidate);
   });
 
   it("creates a new candidate only when eligible data changes and rejects corrupted stored registry", () => {

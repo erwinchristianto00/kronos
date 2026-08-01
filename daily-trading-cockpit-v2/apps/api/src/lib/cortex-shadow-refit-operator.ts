@@ -3,12 +3,12 @@
  * It reads the same canonical stores as runtime attribution but has no route to
  * execution, allocation, promotion, or process control.
  */
-import { createHash } from "node:crypto";
-import { existsSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { closeSync, existsSync, lstatSync, openSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { dirname, resolve, relative } from "node:path";
 
-import { CortexBrainStore } from "./cortex-brain-store.js";
+import { readCortexBrainStoreStrict } from "./cortex-brain-store.js";
 import { emptyCortexState, type CortexStoreState } from "./cortex-brain.js";
 import { EXECUTIVE_SCHEMA_VERSION } from "./four-brain-types.js";
 import { resolveFourBrainInstanceId } from "./four-brain-live-gather-bindings.js";
@@ -59,6 +59,8 @@ export interface CortexOperatorDeps {
   readonly dataDir?: string;
   readonly codeVersion?: () => { value: string | null; source: string | null };
   readonly onAfterRead?: () => void;
+  /** Test-only hook to prove registry identity is checked immediately before persistence. */
+  readonly onBeforePersist?: () => void;
 }
 
 const sha = (contents: Buffer | string): string => createHash("sha256").update(contents).digest("hex");
@@ -106,13 +108,30 @@ function coefficientFingerprint(state: CortexStoreState): string { return sha(JS
 function generation(state: CortexStoreState): { generation: number | null; proven: boolean } {
   const zero = emptyCortexState();
   const zeroVectors = ["BREADTH", "NEUTRAL", "TACTICAL"].every((a) => state.archetypes[a as keyof typeof state.archetypes].w.every((v, i) => v === zero.archetypes[a as keyof typeof zero.archetypes].w[i]));
-  const noHistory = state.cumulativeResolved === 0 && Object.keys(state.countedObservations).length === 0 && ["BREADTH", "NEUTRAL", "TACTICAL"].every((a) => state.archetypes[a as keyof typeof state.archetypes].refitAt == null && state.archetypes[a as keyof typeof state.archetypes].nEff === 0);
+  const noHistory = state.cumulativeResolved === 0 && state.updatedAt === null && Object.keys(state.countedObservations).length === 0 && Object.values(state.resolvedByFamily).every((count) => count === 0) && ["BREADTH", "NEUTRAL", "TACTICAL"].every((a) => state.archetypes[a as keyof typeof state.archetypes].refitAt == null && state.archetypes[a as keyof typeof state.archetypes].nEff === 0);
   return zeroVectors && noHistory ? { generation: 0, proven: true } : { generation: null, proven: false };
 }
 function resolveCodeVersion(cwd: string, env: NodeJS.ProcessEnv, injected?: CortexOperatorDeps["codeVersion"]): { value: string | null; source: string | null } {
   if (injected) return injected();
   for (const key of ["DEPLOYMENT_COMMIT_SHA", "GIT_COMMIT_SHA", "CODE_VERSION"]) { const value = env[key]?.trim() ?? ""; if (validSha(value)) return { value, source: `env:${key}` }; }
   try { const value = execFileSync("git", ["rev-parse", "HEAD"], { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim(); return validSha(value) ? { value, source: "git:HEAD" } : { value: null, source: null }; } catch { return { value: null, source: null }; }
+}
+function registryIdentity(file: string, registry: CortexShadowRefitRegistryStore): { exists: boolean; sha256: string | null; schemaVersion: string; integrityHash: string; lastGenerationFingerprint: string | null } {
+  const current = registry.get();
+  return {
+    exists: existsSync(file), sha256: existsSync(file) ? sha(readFileSync(file)) : null,
+    schemaVersion: current.schemaVersion, integrityHash: current.registryIntegrityHash,
+    lastGenerationFingerprint: current.lastGenerationFingerprint,
+  };
+}
+function sameRegistryIdentity(left: ReturnType<typeof registryIdentity>, right: ReturnType<typeof registryIdentity>): boolean {
+  return left.exists === right.exists && left.sha256 === right.sha256 && left.schemaVersion === right.schemaVersion && left.integrityHash === right.integrityHash && left.lastGenerationFingerprint === right.lastGenerationFingerprint;
+}
+function strictIncumbentBlocker(status: ReturnType<typeof readCortexBrainStoreStrict>["status"]): string {
+  if (status === "FILE_MISSING") return "INCUMBENT_STORE_MISSING";
+  if (status === "JSON_CORRUPTED") return "INCUMBENT_STORE_CORRUPTED";
+  if (status === "SCHEMA_MISMATCH") return "INCUMBENT_STORE_SCHEMA_MISMATCH";
+  return "INCUMBENT_STORE_PARTIAL_INVALID";
 }
 
 function blank(mode: CortexOperatorMode, requestedInstance: string | null, cwd: string, nowMs: number): CortexOperatorReport {
@@ -144,19 +163,36 @@ export function runCortexShadowRefitOperator(argv: readonly string[], deps: Cort
   try { journal = realpathSync(configuredJournal); } catch { return { ...report, blockers: ["REQUIRED_SOURCE_STORE_MISSING"] }; }
   if (!inside(data.root, journal)) return { ...report, blockers: ["ACTIVE_DATA_DIR_OUTSIDE_RUNTIME_ROOT"] };
   const registryFile = resolve(data.dataDir, CORTEX_SHADOW_REFIT_REGISTRY_FILE);
-  let files: CortexOperatorFile[];
-  try {
-    files = [readStable(executiveFile, data.root), readStable(brainFile, data.root), readStable(journal, data.root)];
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    return { ...report, blockers: [message.split(":")[0]!] };
+  const lock = resolve(data.dataDir, "cortex-shadow-refit-operator.lock");
+  let ownsLock = false;
+  if (args.mode === "commit") {
+    let fd: number | null = null;
+    try {
+      fd = openSync(lock, "wx"); ownsLock = true;
+      writeFileSync(fd, JSON.stringify({ schemaVersion: "cortex-shadow-refit-operator-lock/1", pid: process.pid, instance: args.instance, startedAt: new Date(nowMs).toISOString(), codeVersion: code.value, runId: randomUUID() }));
+      closeSync(fd); fd = null;
+    } catch (error) {
+      if (fd != null) closeSync(fd);
+      if (ownsLock) { try { rmSync(lock); } catch { /* best effort: never remove a foreign lock */ } }
+      return { ...report, blockers: [ownsLock ? "OPERATOR_LOCK_METADATA_WRITE_FAILED" : "RUN_ALREADY_IN_PROGRESS"] };
+    }
   }
   try {
+    let files: CortexOperatorFile[];
+    try {
+      files = [readStable(executiveFile, data.root), readStable(brainFile, data.root), readStable(journal, data.root)];
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return { ...report, blockers: [message.split(":")[0]!] };
+    }
     const executiveStore = new ExecutiveReviewStore(executiveFile); const outcomes = executiveStore.get().tier1 as readonly ExecutiveReviewOutcome[];
-    const events = readForwardCausalEvents(journal); const incumbent = new CortexBrainStore(brainFile).get(); deps.onAfterRead?.();
+    const events = readForwardCausalEvents(journal); const strictIncumbent = readCortexBrainStoreStrict(brainFile); deps.onAfterRead?.();
     if (!files.every(unchanged)) return { ...report, blockers: ["SOURCE_SNAPSHOT_CHANGED"] };
+    if (strictIncumbent.status !== "VALID") return { ...report, blockers: [strictIncumbentBlocker(strictIncumbent.status)] };
+    const incumbent = strictIncumbent.state;
     const incumbentGeneration = generation(incumbent); const archetypes = Object.fromEntries(["BREADTH", "NEUTRAL", "TACTICAL"].map((a) => [a, { nEff: incumbent.archetypes[a as keyof typeof incumbent.archetypes].nEff, refitAt: incumbent.archetypes[a as keyof typeof incumbent.archetypes].refitAt }]));
     const registry = new CortexShadowRefitRegistryStore(registryFile); const registryState = registry.get();
+    const initialRegistryIdentity = registryIdentity(registryFile, registry);
     report = { ...report, sourceSnapshot: { stable: true, files, executiveOutcomeCount: outcomes.length, forwardEventCount: events.length }, incumbent: { generation: incumbentGeneration.generation, generationZeroProven: incumbentGeneration.proven, featureSchemaVersion: incumbent.featureSchemaVersion, coefficientFingerprint: coefficientFingerprint(incumbent), archetypes }, registry: { path: registryFile, exists: existsSync(registryFile), schemaVersion: registryState.schemaVersion, integrityStatus: registryState.integrityStatus, latestCandidateGeneration: registryState.candidates.at(-1)?.generationId ?? null, latestAuditStatus: registryState.lastAudit?.status ?? null } };
     if (!incumbentGeneration.proven || incumbentGeneration.generation == null) return { ...report, blockers: ["INCUMBENT_GENERATION_UNRESOLVED"] };
     if (registry.isCorrupted()) return { ...report, blockers: ["REGISTRY_CORRUPTED"] };
@@ -165,18 +201,18 @@ export function runCortexShadowRefitOperator(argv: readonly string[], deps: Cort
     report = { ...report, prospective, blockers: p.blockers };
     if (p.status === "BLOCKED" || !plan.nextRegistry) return { ...report, blockers: [...p.blockers, "REFIT_PLAN_BLOCKED"] };
     if (args.mode === "dry-run") return { ...report, exitCode: CORTEX_OPERATOR_EXIT.SUCCESS, verdict: p.status === "NO_NEW_ELIGIBLE_DATA" ? "CORTEX_OPERATOR_NO_NEW_ELIGIBLE_DATA" : p.status === "NO_REFIT" ? "CORTEX_OPERATOR_NO_REFIT" : "CORTEX_OPERATOR_DRY_RUN_PASS" };
-    const lock = resolve(data.dataDir, "cortex-shadow-refit-operator.lock"); let lockFd: number | null = null;
+    deps.onBeforePersist?.();
+    if (!files.every(unchanged)) return { ...report, blockers: ["SOURCE_SNAPSHOT_CHANGED"] };
+    const registryBeforePersist = new CortexShadowRefitRegistryStore(registryFile);
+    if (!sameRegistryIdentity(initialRegistryIdentity, registryIdentity(registryFile, registryBeforePersist))) return { ...report, blockers: ["REGISTRY_CHANGED_DURING_RUN"] };
     try {
-      mkdirSync(dirname(lock), { recursive: true }); lockFd = openSync(lock, "wx"); writeFileSync(lockFd, JSON.stringify({ pid: process.pid, instance: args.instance, startedAt: new Date(nowMs).toISOString(), codeVersion: code.value }));
-    } catch { return { ...report, blockers: ["RUN_ALREADY_IN_PROGRESS"] }; }
-    try {
-      if (!files.every(unchanged)) return { ...report, blockers: ["SOURCE_SNAPSHOT_CHANGED"] };
       registry.save(plan.nextRegistry);
       return { ...report, exitCode: CORTEX_OPERATOR_EXIT.SUCCESS, verdict: p.status === "NO_NEW_ELIGIBLE_DATA" ? "CORTEX_OPERATOR_NO_NEW_ELIGIBLE_DATA" : p.status === "NO_REFIT" ? "CORTEX_OPERATOR_NO_REFIT" : "CORTEX_OPERATOR_COMMIT_PASS", mutationPlan: { writeAuthorized: true, filesToChange: [registryFile, `${registryFile}.bak`], persisted: true } };
     } catch { return { ...report, exitCode: CORTEX_OPERATOR_EXIT.VALIDATION, verdict: "CORTEX_OPERATOR_VALIDATION_FAILURE", blockers: ["REGISTRY_PERSISTENCE_FAILED"] }; }
-    finally { if (lockFd != null) try { rmSync(lock); } catch { /* operator must inspect an unexpected lock cleanup failure */ } }
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
     return { ...report, exitCode: CORTEX_OPERATOR_EXIT.UNEXPECTED, verdict: "CORTEX_OPERATOR_VALIDATION_FAILURE", blockers: [`OPERATOR_UNEXPECTED_FAILURE:${detail}`] };
+  } finally {
+    if (ownsLock) try { rmSync(lock); } catch { /* only this process's exclusive lock may be removed */ }
   }
 }

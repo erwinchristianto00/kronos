@@ -481,11 +481,14 @@ function heldOutDelta(heldOut: readonly CortexShadowHeldOutPrediction[]): number
 }
 
 function fitArchetype(
-  rows: readonly CortexShadowTrainingExample[], prior: readonly number[], nowMs: number,
+  rows: readonly CortexShadowTrainingExample[], prior: readonly number[], fitCutoffMs: number | null,
   hyperparameters: CortexShadowRefitHyperparameters,
 ): { fit: CortexEconomicFit; folds: CortexShadowFoldResult[]; blockers: string[]; cautions: string[] } {
   const ordered = sorted(rows, (a, b) => a.resolvedTimeMs - b.resolvedTimeMs || a.exampleId.localeCompare(b.exampleId));
-  const fullFit = refitCortexEconomicModel(ordered.map((row) => ({ x: [...row.x], realizedNetR: row.netR, tMs: row.resolvedTimeMs, schemaVersion: CORTEX_FEATURE_SCHEMA_VERSION })), [...prior], { nowMs, ...hyperparameters });
+  // A candidate must be a function of immutable evidence, not the operator's wall clock.
+  const fullFit = fitCutoffMs == null
+    ? { coefficients: [...prior], residualScale: null, effectiveSampleSize: 0, status: "INSUFFICIENT_DATA" as const }
+    : refitCortexEconomicModel(ordered.map((row) => ({ x: [...row.x], realizedNetR: row.netR, tMs: row.resolvedTimeMs, schemaVersion: CORTEX_FEATURE_SCHEMA_VERSION })), [...prior], { nowMs: fitCutoffMs, ...hyperparameters });
   const folds: CortexShadowFoldResult[] = [];
   const blockers: string[] = [];
   const cautions: string[] = [];
@@ -553,15 +556,16 @@ function candidateIntegrityContent(candidate: Omit<CortexShadowCandidateGenerati
 }
 
 function candidateForDataset(
-  dataset: CortexShadowDataset, incumbent: CortexStoreState, incumbentGeneration: number, nowMs: number,
+  dataset: CortexShadowDataset, incumbent: CortexStoreState, incumbentGeneration: number, generatedAtMs: number,
   codeVersion: string, hyperparameters: CortexShadowRefitHyperparameters,
 ): CortexShadowCandidateGeneration {
   const incumbentCoefficientFingerprint = incumbentFingerprint(incumbent);
   const fingerprint = generationFingerprint({ datasetHash: dataset.datasetHash, incumbentGeneration, incumbentCoefficientFingerprint, hyperparameters, codeVersion });
+  const fitCutoffMs = dataset.examples.at(-1)?.resolvedTimeMs ?? null;
   const archetypes = ARCHETYPES.map((archetype) => {
     const rows = dataset.examples.filter((row) => row.archetype === archetype);
     const prior = incumbent.archetypes[archetype].w;
-    const result = fitArchetype(rows, prior, nowMs, hyperparameters);
+    const result = fitArchetype(rows, prior, fitCutoffMs, hyperparameters);
     const coefficients = result.fit.status === "ACCEPTED" ? result.fit.coefficients : [...prior];
     const train = metrics(rows, coefficients);
     const heldOut = result.folds.flatMap((fold) => fold.heldOut);
@@ -581,8 +585,9 @@ function candidateForDataset(
     generationFingerprint: fingerprint,
     parentIncumbentGeneration: incumbentGeneration,
     incumbentCoefficientFingerprint,
-    createdAt: new Date(nowMs).toISOString(), resetEpoch: dataset.resetEpoch,
-    trainingCutoffMs: dataset.examples.at(-1)?.resolvedTimeMs ?? nowMs,
+    // Candidate identity/content is evidence-derived. The audit report retains invocation time.
+    createdAt: new Date(fitCutoffMs ?? generatedAtMs).toISOString(), resetEpoch: dataset.resetEpoch,
+    trainingCutoffMs: fitCutoffMs ?? generatedAtMs,
     featureSchemaVersion: CORTEX_FEATURE_SCHEMA_VERSION, datasetHash: dataset.datasetHash,
     exampleIds: dataset.examples.map((row) => row.exampleId), sourceLineage: dataset.sourceLineage,
     hyperparameters, archetypes,

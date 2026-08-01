@@ -80,4 +80,21 @@ describe("CORTEX shadow-refit operator", () => {
     const unresolved = runCortexShadowRefitOperator(["--instance=3101", "--commit"], { cwd: f.cwd, env: f.env, codeVersion: () => ({ value: null, source: null }) });
     expect(unresolved.blockers).toEqual(["CODE_VERSION_UNRESOLVED"]);
   });
+
+  it("never treats a corrupt incumbent file as canonical generation zero", () => {
+    const f = fixture(); writeFileSync(join(f.data, "cortex-brain.json"), "{not-json");
+    const result = runCortexShadowRefitOperator(["--instance=3101"], { cwd: f.cwd, env: f.env, codeVersion: () => ({ value: SHA, source: "test" }) });
+    expect(result.blockers).toEqual(["INCUMBENT_STORE_CORRUPTED"]);
+    expect(result.incumbent.generationZeroProven).toBe(false);
+  });
+
+  it("rejects a registry change between planning and persistence without removing a foreign registry", () => {
+    const f = fixture(); const registry = join(f.data, "cortex-shadow-refit-candidates.json");
+    const result = runCortexShadowRefitOperator(["--instance=3101", "--commit"], {
+      cwd: f.cwd, env: f.env, codeVersion: () => ({ value: SHA, source: "test" }),
+      onBeforePersist: () => writeFileSync(registry, "{concurrent-change"),
+    });
+    expect(result.blockers).toEqual(["REGISTRY_CHANGED_DURING_RUN"]);
+    expect(existsSync(join(f.data, "cortex-shadow-refit-operator.lock"))).toBe(false);
+  });
 });

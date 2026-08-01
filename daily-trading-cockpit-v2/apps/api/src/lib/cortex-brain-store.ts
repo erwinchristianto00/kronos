@@ -40,6 +40,56 @@ import {
 import { engineLaneIdForStaticWeight } from "./cortex-live-gather.js";
 import { cortexAllocationSnapshotId, cortexDecisionId, publishCortexDecisionSnapshots } from "./cortex-decision-snapshot.js";
 
+/** Strict, read-only decoder for operators/auditors. Runtime deliberately seeds on a bad file so
+ * an unavailable shadow learner cannot stop trading; an operator must instead fail closed. */
+export type CortexBrainStrictReadStatus =
+  | "VALID" | "FILE_MISSING" | "JSON_CORRUPTED" | "SCHEMA_MISMATCH"
+  | "PARTIAL_INVALID" | "NONFINITE_COEFFICIENT" | "FEATURE_DIMENSION_MISMATCH" | "HISTORY_INCONSISTENT";
+export type CortexBrainStrictRead =
+  | { readonly status: "VALID"; readonly state: CortexStoreState }
+  | { readonly status: Exclude<CortexBrainStrictReadStatus, "VALID">; readonly state: null };
+
+const strictFiniteNonNegative = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value) && value >= 0;
+const strictIsoOrNull = (value: unknown): value is string | null => value === null || (typeof value === "string" && Number.isFinite(Date.parse(value)));
+
+/** Does not normalize, repair, or write. Callers receive a canonical copy only after raw proof. */
+export function readCortexBrainStoreStrict(file: string): CortexBrainStrictRead {
+  if (!existsSync(file)) return { status: "FILE_MISSING", state: null };
+  let raw: unknown;
+  try { raw = JSON.parse(readFileSync(file, "utf8")); } catch { return { status: "JSON_CORRUPTED", state: null }; }
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { status: "PARTIAL_INVALID", state: null };
+  const value = raw as Record<string, unknown>;
+  if (value.version !== 1 || value.featureSchemaVersion !== CORTEX_FEATURE_SCHEMA_VERSION) return { status: "SCHEMA_MISMATCH", state: null };
+  if (!value.archetypes || typeof value.archetypes !== "object" || Array.isArray(value.archetypes)) return { status: "PARTIAL_INVALID", state: null };
+  const archetypes = {} as CortexStoreState["archetypes"];
+  for (const archetype of ["BREADTH", "NEUTRAL", "TACTICAL"] as CortexArchetype[]) {
+    const row = (value.archetypes as Record<string, unknown>)[archetype];
+    if (!row || typeof row !== "object" || Array.isArray(row)) return { status: "PARTIAL_INVALID", state: null };
+    const entry = row as Record<string, unknown>;
+    if (!Array.isArray(entry.w)) return { status: "PARTIAL_INVALID", state: null };
+    if (entry.w.length !== CORTEX_FEATURE_DIM) return { status: "FEATURE_DIMENSION_MISMATCH", state: null };
+    if (!entry.w.every((coefficient) => typeof coefficient === "number" && Number.isFinite(coefficient))) return { status: "NONFINITE_COEFFICIENT", state: null };
+    if (!strictFiniteNonNegative(entry.nEff) || !strictIsoOrNull(entry.refitAt)) return { status: "PARTIAL_INVALID", state: null };
+    archetypes[archetype] = { w: [...entry.w] as number[], nEff: entry.nEff, refitAt: entry.refitAt };
+  }
+  if (!strictFiniteNonNegative(value.cumulativeResolved) || !strictIsoOrNull(value.updatedAt)) return { status: "PARTIAL_INVALID", state: null };
+  const counters = (field: "resolvedByFamily" | "countedObservations"): Record<string, number> | null => {
+    const source = value[field];
+    if (!source || typeof source !== "object" || Array.isArray(source)) return null;
+    const result: Record<string, number> = {};
+    for (const [key, count] of Object.entries(source)) {
+      if (!key || !strictFiniteNonNegative(count)) return null;
+      result[key] = count;
+    }
+    return result;
+  };
+  const resolvedByFamily = counters("resolvedByFamily"); const countedObservations = counters("countedObservations");
+  if (!resolvedByFamily || !countedObservations) return { status: "PARTIAL_INVALID", state: null };
+  const familyTotal = Object.values(resolvedByFamily).reduce((total, count) => total + count, 0);
+  if (familyTotal !== value.cumulativeResolved || Object.keys(countedObservations).length > value.cumulativeResolved) return { status: "HISTORY_INCONSISTENT", state: null };
+  return { status: "VALID", state: { version: 1, featureSchemaVersion: CORTEX_FEATURE_SCHEMA_VERSION, archetypes, cumulativeResolved: value.cumulativeResolved, resolvedByFamily, countedObservations, updatedAt: value.updatedAt } };
+}
+
 export class CortexBrainStore {
   private state: CortexStoreState;
   constructor(private readonly file: string) {
