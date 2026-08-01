@@ -694,8 +694,13 @@ export class CortexShadowRefitRegistryStore {
   }
 }
 
-/** Manual-only entry point. No module registers this function with a scheduler. */
-export function runCortexShadowRefit(input: {
+export interface CortexShadowRefitPlan {
+  readonly report: CortexShadowRunReport;
+  /** Null means the registry was already corrupt and must remain untouched. */
+  readonly nextRegistry: UnsignedCortexShadowRefitRegistry | null;
+}
+
+type CortexShadowRefitInput = {
   outcomes: readonly ExecutiveReviewOutcome[];
   forwardEvents: readonly ForwardEvent[];
   policy: CanonicalPolicyContext & { instanceId: "3101" | "3102"; fourBrainPolicyVersion: string };
@@ -706,16 +711,23 @@ export function runCortexShadowRefit(input: {
   codeVersion?: string;
   incumbentGeneration?: number;
   hyperparameters?: CortexShadowRefitHyperparameters;
-}): CortexShadowRunReport {
+};
+
+/**
+ * Pure planning half of the manual shadow refit. This deliberately shares every
+ * dataset/fit calculation with the persistent path so an operator dry-run cannot
+ * drift from the prospective commit for the same immutable input snapshot.
+ */
+export function planCortexShadowRefit(input: CortexShadowRefitInput): CortexShadowRefitPlan {
   const dataset = buildCortexShadowTrainingDataset(input);
   const previous = input.registry.get();
   const generatedAt = new Date(input.nowMs).toISOString();
   if (input.registry.isCorrupted()) {
-    return {
+    return { report: {
       status: "BLOCKED", generatedAt, resetEpoch: dataset.resetEpoch, dataset,
       candidate: previous.candidates.at(-1) ?? null, beta: { evaluationBeta: 0, liveBeta: 0 },
       blockers: ["REGISTRY_CORRUPTED", previous.integrityError ?? "unknown registry integrity error"],
-    };
+    }, nextRegistry: null };
   }
   const codeVersion = input.codeVersion ?? "unknown";
   const hyperparameters = input.hyperparameters ?? CORTEX_SHADOW_REFIT_HYPERPARAMETERS;
@@ -729,26 +741,30 @@ export function runCortexShadowRefit(input: {
     const report: CortexShadowRunReport = { status: "NO_NEW_ELIGIBLE_DATA", generatedAt, resetEpoch: dataset.resetEpoch, dataset, candidate, beta: { evaluationBeta: 0, liveBeta: 0 }, blockers: [] };
     // Audit freshness is independent of candidate idempotence: a newly-arrived rejected outcome
     // changes examined/rejection counters even when the eligible dataset is byte-identical.
-    input.registry.save({ ...previous, lastDatasetHash: dataset.datasetHash, lastGenerationFingerprint: nextFingerprint, lastAudit: report });
-    return report;
+    return { report, nextRegistry: { ...previous, lastDatasetHash: dataset.datasetHash, lastGenerationFingerprint: nextFingerprint, lastAudit: report } };
   }
   if (dataset.examples.length === 0) {
     const report: CortexShadowRunReport = { status: "NO_REFIT", generatedAt, resetEpoch: dataset.resetEpoch, dataset, candidate: null, beta: { evaluationBeta: 0, liveBeta: 0 }, blockers: ["NO_ELIGIBLE_EXAMPLES"] };
-    input.registry.save({ ...previous, lastDatasetHash: dataset.datasetHash, lastGenerationFingerprint: nextFingerprint, lastAudit: report });
-    return report;
+    return { report, nextRegistry: { ...previous, lastDatasetHash: dataset.datasetHash, lastGenerationFingerprint: nextFingerprint, lastAudit: report } };
   }
   const candidate = candidateForDataset(dataset, input.incumbent, incumbentGeneration, input.nowMs, codeVersion, hyperparameters);
   // Per-archetype failures remain explicit blockers on the persisted candidate. They must not erase
   // a valid BREADTH/NEUTRAL/Tactical fit merely because a different archetype has no observations.
   const hasAnyAcceptedFit = candidate.archetypes.some((row) => row.fitStatus === "ACCEPTED");
   const report: CortexShadowRunReport = { status: hasAnyAcceptedFit ? "CANDIDATE_CREATED" : "NO_REFIT", generatedAt, resetEpoch: dataset.resetEpoch, dataset, candidate, beta: { evaluationBeta: 0, liveBeta: 0 }, blockers: candidate.blockers };
-  input.registry.save({
+  return { report, nextRegistry: {
     schemaVersion: CORTEX_SHADOW_REFIT_SCHEMA_VERSION, integrityStatus: "HEALTHY", integrityError: null,
     candidates: previous.candidates.some((row) => row.generationFingerprint === candidate.generationFingerprint) ? previous.candidates : [...previous.candidates, candidate],
     lastDatasetHash: dataset.datasetHash, lastGenerationFingerprint: nextFingerprint,
     lastAudit: report,
-  });
-  return report;
+  } };
+}
+
+/** Manual-only entry point. No module registers this function with a scheduler. */
+export function runCortexShadowRefit(input: CortexShadowRefitInput): CortexShadowRunReport {
+  const plan = planCortexShadowRefit(input);
+  if (plan.nextRegistry) input.registry.save(plan.nextRegistry);
+  return plan.report;
 }
 
 export function cortexShadowRefitRegistryPath(dataDir = "data"): string {

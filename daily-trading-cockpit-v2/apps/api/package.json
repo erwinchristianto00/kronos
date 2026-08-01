@@ -12,7 +12,8 @@
     "reset:internal-state": "tsx scripts/reset-internal-state.ts",
     "reset:regime-gate": "tsx scripts/reset-regime-gate.ts",
     "repair:axis-history": "tsx scripts/repair-axis-history.ts",
-    "validate:regime": "tsx scripts/run-regime-validation.ts"
+    "validate:regime": "tsx scripts/run-regime-validation.ts",
+    "cortex:shadow-refit": "tsx scripts/cortex-shadow-refit-operator.ts"
   },
   "dependencies": {
     "@dtc/shared": "0.1.0",
