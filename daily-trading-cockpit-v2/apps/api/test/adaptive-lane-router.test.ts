@@ -145,6 +145,62 @@ describe("adaptive-lane-router", () => {
     if (ranked.length > 0) expect(ranked[0]!.laneId).toBe("NEUTRAL_OK");
   });
 
+  it("keeps exact-context candidates isolated from the current regime and from each other", () => {
+    const bullishCollecting = makeLane({
+      laneId: "CONTEXT_LANE",
+      exactContext: "LONG_BULLISH",
+      directionBias: "LONG",
+      regimeFamily: "BULLISH",
+      status: "COLLECTING",
+      freshValid: 5,
+      netAvgR: 0.02,
+      pf: 1.05,
+    });
+    const mixedStable = makeLane({
+      laneId: "CONTEXT_LANE",
+      exactContext: "LONG_MIXED",
+      directionBias: "LONG",
+      regimeFamily: "MIXED",
+      status: "STABLE_CANDIDATE",
+      freshValid: 200,
+      netAvgR: 0.8,
+      pf: 4,
+    });
+    const bullish = rankCandidateLanes([bullishCollecting, mixedStable], BULLISH_LONG_CTX);
+    expect(bullish.rejected.map((candidate) => candidate.laneId)).toContain("CONTEXT_LANE:LONG_MIXED");
+    expect(bullish.ranked.map((candidate) => candidate.laneId)).not.toContain("CONTEXT_LANE:LONG_MIXED");
+    expect(bullish.collectingWatchlist.map((candidate) => candidate.laneId)).toContain("CONTEXT_LANE:LONG_BULLISH");
+
+    const mixed = rankCandidateLanes([bullishCollecting, mixedStable], {
+      regimeFamily: "MIXED",
+      controllerMode: "BOTH_ALLOWED",
+      infraReady: false,
+    });
+    expect(mixed.rejected.map((candidate) => candidate.laneId)).toContain("CONTEXT_LANE:LONG_BULLISH");
+    expect(mixed.ranked.map((candidate) => candidate.laneId)).toContain("CONTEXT_LANE:LONG_MIXED");
+  });
+
+  it("does not let a rejected mixed cohort veto a stable bullish cohort", () => {
+    const bullishStable = makeLane({
+      laneId: "SPLIT_LANE",
+      exactContext: "LONG_BULLISH",
+      directionBias: "LONG",
+      regimeFamily: "BULLISH",
+    });
+    const mixedRejected = makeLane({
+      laneId: "SPLIT_LANE",
+      exactContext: "LONG_MIXED",
+      directionBias: "LONG",
+      regimeFamily: "MIXED",
+      status: "REJECT",
+      netAvgR: -0.5,
+      pf: 0.2,
+    });
+    const { ranked, rejected } = rankCandidateLanes([bullishStable, mixedRejected], BULLISH_LONG_CTX);
+    expect(ranked.map((candidate) => candidate.laneId)).toContain("SPLIT_LANE:LONG_BULLISH");
+    expect(rejected.map((candidate) => candidate.laneId)).toContain("SPLIT_LANE:LONG_MIXED");
+  });
+
   // 4. Choppy range → NO_TRADE.
   it("[4] choppy range maps to NO_TRADE", () => {
     const r = buildAdaptiveLaneRouterReport(routerInputs("Choppy range"));
@@ -263,12 +319,12 @@ describe("adaptive-lane-router", () => {
     const r = buildAdaptiveLaneRouterReport(routerInputs("Bullish expansion"));
     expect(r.regimeFamily).toBe("BULLISH");
     expect(r.controllerMode).toBe("LONG_ONLY");
-    expect(r.selectedCurrentLane).toBe(BULL_TREND_PAPER_LANE_ID);
+    expect(r.selectedCurrentLane).toBe(`${BULL_TREND_PAPER_LANE_ID}:LONG_BULLISH`);
     expect(r.collectionAction).toBeNull();
     expect(r.currentPermission).toBe("SHADOW_ONLY");
     expect(r.rankedCandidates[0]!.directionBias).toBe("LONG");
     expect(r.rankedCandidates[0]!.maturity).toBe("INSUFFICIENT");
-    expect(r.perRegimePolicy.BULLISH.recommendedLaneId).toBe(BULL_TREND_PAPER_LANE_ID);
+    expect(r.perRegimePolicy.BULLISH.recommendedLaneId).toBe(`${BULL_TREND_PAPER_LANE_ID}:LONG_BULLISH`);
     expect(r.perRegimePolicy.BULLISH.permission).toBe("SHADOW_ONLY");
     // BEARISH per-regime still shows the CG advisory lane (SHORT qualifies for BEAR).
     expect(r.perRegimePolicy.BEARISH.recommendedLaneId).not.toBeNull();
@@ -285,6 +341,8 @@ describe("adaptive-lane-router", () => {
       netR: index < 8 ? 1.39 : -1.11,
       plannedStopDistanceBps: 200,
       symbol: `SYM${index % 4}USDT`,
+      direction: "LONG",
+      regime: "Bullish expansion",
       updatedAt: new Date(Date.parse(now) + index * 60_000).toISOString(),
     }));
     const r = buildAdaptiveLaneRouterReport({
@@ -295,14 +353,41 @@ describe("adaptive-lane-router", () => {
       ...r.rankedCandidates,
       ...r.experimentalUpsideCandidates,
       ...r.collectingWatchlist,
-    ].find((candidate) => candidate.laneId === BULL_TREND_PAPER_LANE_ID);
+    ].find((candidate) => candidate.laneId === `${BULL_TREND_PAPER_LANE_ID}:LONG_BULLISH`);
     expect(bull?.freshValid).toBe(12);
     expect(bull?.netAvgR).toBeGreaterThan(0);
     expect(bull?.pf).toBeGreaterThan(1);
     expect(bull?.maturity).toBe("COLLECTING");
     expect(r.experimentalUpsideCandidates.map((candidate) => candidate.laneId)).toContain(
-      BULL_TREND_PAPER_LANE_ID,
+      `${BULL_TREND_PAPER_LANE_ID}:LONG_BULLISH`,
     );
+  });
+
+  it("does not copy long paper evidence across exact contexts or admit unknown context", () => {
+    const laneId = "CG_LONG_VARIANT_MATRIX:LG_R12_STOP250_FULL";
+    const paperOrders = [
+      { selectedLaneId: laneId, paperStatus: "PAPER_CLOSED_WIN", netR: 0.4, plannedStopDistanceBps: 250, symbol: "ETHUSDT", direction: "LONG", regime: "Bullish expansion", updatedAt: "2026-07-30T00:00:00.000Z" },
+      { selectedLaneId: laneId, paperStatus: "PAPER_CLOSED_WIN", netR: 0.3, plannedStopDistanceBps: 250, symbol: "SOLUSDT", direction: "LONG", regime: "Bullish expansion", updatedAt: "2026-07-30T00:01:00.000Z" },
+      { selectedLaneId: laneId, paperStatus: "PAPER_CLOSED_LOSS", netR: -0.6, plannedStopDistanceBps: 250, symbol: "ETHUSDT", direction: "LONG", regime: "Mixed rotation", updatedAt: "2026-07-30T00:02:00.000Z" },
+      { selectedLaneId: laneId, paperStatus: "PAPER_CLOSED_WIN", netR: 9, plannedStopDistanceBps: 250, symbol: "BTCUSDT", direction: "LONG", regime: "unclassified", updatedAt: "2026-07-30T00:03:00.000Z" },
+    ];
+    const r = buildAdaptiveLaneRouterReport({
+      ...routerInputs("Bullish expansion"),
+      paperOrders: paperOrders as never,
+    });
+    const all = [
+      ...r.rankedCandidates,
+      ...r.experimentalUpsideCandidates,
+      ...r.collectingWatchlist,
+      ...r.rejectedOrDeprioritizedLanes,
+    ];
+    const bull = all.find((candidate) => candidate.laneId === `${laneId}:LONG_BULLISH`);
+    const mixed = all.find((candidate) => candidate.laneId === `${laneId}:LONG_MIXED`);
+    expect(bull?.freshValid).toBe(2);
+    expect(bull?.netAvgR).toBeGreaterThan(0);
+    expect(mixed?.freshValid).toBe(1);
+    expect(mixed?.netAvgR).toBeLessThan(0);
+    expect(r.rankedCandidates.map((candidate) => candidate.laneId)).not.toContain(`${laneId}:LONG_MIXED`);
   });
 
   // 14. Regime map BULL / current selection consistency: no contradiction.

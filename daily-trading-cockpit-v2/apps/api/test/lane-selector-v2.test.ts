@@ -5,6 +5,139 @@ import {
   laneSelectorV2LaneId,
   selectLaneV2,
 } from "../src/lib/lane-selector-v2.js";
+import type {
+  ContextLaneStatus,
+  ExactLaneContext,
+  VariantContextEvidenceRow,
+} from "../src/lib/current-guard-variant-matrix.js";
+
+function exactProof(context: ExactLaneContext, status: ContextLaneStatus): VariantContextEvidenceRow {
+  return {
+    context,
+    status,
+    statusReason: "test exact proof",
+    blockers: [],
+    cautions: [],
+    freshValid: 12,
+    netAvgR: 0.1,
+    grossAvgR: 0.1,
+    pf: 1.3,
+    wr: 0.6,
+    payoffRatio: 1,
+    plus10bpsNetAvgR: 0.1,
+    plus10bpsStillPositive: true,
+    approxMaxDrawdownR: 1,
+    topSymbolPnlShare: 0.2,
+    calendarDays: 1,
+    distinctRegimes: 1,
+    oosThirds: null,
+    allThreeOosPositive: false,
+  };
+}
+
+describe("LaneSelectorV2 — exact-context operator force", () => {
+  function selectForced(
+    direction: "LONG" | "SHORT",
+    state: Parameters<typeof selectLaneV2>[0]["laneStates"][number],
+    over: Partial<Parameters<typeof selectLaneV2>[0]> = {},
+  ) {
+    const bullish = direction === "LONG";
+    return selectLaneV2({
+      candidate: {
+        symbol: bullish ? "ETHUSDT" : "WLDUSDT",
+        direction,
+        currentPrice: 100,
+        stopLoss: bullish ? 97 : 103,
+        takeProfitLevels: [bullish ? 104 : 96],
+        stopDistanceBps: 300,
+      },
+      regime: bullish ? "Bullish expansion" : "Bearish pressure",
+      controllerMode: bullish ? "LONG_ONLY" : "SHORT_ONLY",
+      controllerConfidence: "MEDIUM",
+      estimatedRegime: bullish
+        ? { posture: "EXTENDED_TREND", direction: "LONG", policy: "WIDE_TREND", reason: "test" }
+        : { posture: "EXTENDED_TREND", direction: "SHORT", policy: "WIDE_TREND", reason: "test" },
+      now: "2026-07-30T00:00:00.000Z",
+      laneStates: [state],
+      ...over,
+    });
+  }
+
+  it("allows forced FAST_SHORT with exact SHORT_BEARISH COLLECTING evidence without mutating it", () => {
+    const state = {
+      variantId: "CG_WIDE_FAST_SHORT",
+      status: "COLLECTING",
+      contextRows: { SHORT_BEARISH: exactProof("SHORT_BEARISH", "COLLECTING") },
+      exactContext: "SHORT_BEARISH" as const,
+      exactContextResolved: true,
+      operatorForceEligible: true,
+    };
+    const result = selectForced("SHORT", state);
+    expect(result.selected?.lane.selectedLaneId).toBe(laneSelectorV2LaneId("CG_WIDE_FAST_SHORT"));
+    expect(state.status).toBe("COLLECTING");
+    expect(state.contextRows.SHORT_BEARISH.status).toBe("COLLECTING");
+  });
+
+  it("allows forced FAST_LONG with exact LONG_BULLISH COLLECTING evidence", () => {
+    const result = selectForced("LONG", {
+      variantId: "CG_WIDE_FAST_LONG",
+      status: "COLLECTING",
+      contextRows: { LONG_BULLISH: exactProof("LONG_BULLISH", "COLLECTING") },
+      exactContext: "LONG_BULLISH",
+      exactContextResolved: true,
+      operatorForceEligible: true,
+    });
+    expect(result.selected?.lane.selectedLaneId).toBe(laneSelectorV2LaneId("CG_WIDE_FAST_LONG"));
+  });
+
+  it("fails closed for forced lanes that are not applicable or lack exact context", () => {
+    const wrongContext = selectForced("LONG", {
+      variantId: "CG_WIDE_FAST_SHORT",
+      status: "NOT_APPLICABLE",
+      exactContext: "LONG_BULLISH",
+      exactContextResolved: true,
+      operatorForceEligible: true,
+    });
+    expect(wrongContext.selected).toBeNull();
+    expect(wrongContext.rejected).toContain("CG_WIDE_FAST_SHORT:context_not_applicable");
+
+    const missingContext = selectForced("SHORT", {
+      variantId: "CG_WIDE_FAST_SHORT",
+      status: "COLLECTING",
+      exactContext: null,
+      exactContextResolved: false,
+      operatorForceEligible: true,
+    });
+    expect(missingContext.selected).toBeNull();
+    expect(missingContext.rejected).toContain("CG_WIDE_FAST_SHORT:missing_exact_context");
+  });
+
+  it("does not let force bypass controller, symbol, or geometry gates", () => {
+    const forced = {
+      variantId: "CG_WIDE_FAST_SHORT",
+      status: "COLLECTING",
+      contextRows: { SHORT_BEARISH: exactProof("SHORT_BEARISH", "COLLECTING") },
+      exactContext: "SHORT_BEARISH" as const,
+      exactContextResolved: true,
+      operatorForceEligible: true,
+    };
+    const controller = selectForced("SHORT", forced, { controllerMode: "LONG_ONLY" });
+    expect(controller.selected).toBeNull();
+    expect(controller.rejected).toContain("controller_blocks_SHORT");
+
+    const excluded = selectForced("SHORT", forced, {
+      candidate: { symbol: "NEARUSDT", direction: "SHORT", currentPrice: 100, stopLoss: 103, takeProfitLevels: [96], stopDistanceBps: 300 },
+    });
+    expect(excluded.selected).toBeNull();
+    expect(excluded.rejected).toContain("CG_WIDE_FAST_SHORT:symbol_excluded_NEARUSDT");
+
+    const invalidGeometry = selectForced("SHORT", forced, {
+      candidate: { symbol: "WLDUSDT", direction: "SHORT", currentPrice: 100, stopLoss: 90, takeProfitLevels: [96], stopDistanceBps: 300 },
+    });
+    expect(invalidGeometry.selected).toBeNull();
+    expect(invalidGeometry.rejected).toContain("CG_WIDE_FAST_SHORT:geometry_failed");
+  });
+});
 
 // 2026-07-08 operator per-symbol audit: CG_WIDE_FAST_SHORT's pooled testnet/live stats looked
 // flat-to-negative (WR ~55%, meanR ~-0.2) despite the SAME week showing WLD/SUI/FET at 87-100%

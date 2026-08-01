@@ -16,10 +16,56 @@ import {
   profitCoreShortRejectionReason,
   type RealtimeShortCandidate,
   type RealtimeShortMirrorInputs,
+  type RealtimeShortLaneState,
 } from "../src/lib/realtime-short-mirror.js";
+import type {
+  ContextLaneStatus,
+  ExactLaneContext,
+  VariantContextEvidenceRow,
+} from "../src/lib/current-guard-variant-matrix.js";
 
 function freshStore(): PaperExecutionRouterStore {
   return new PaperExecutionRouterStore(mkdtempSync(join(tmpdir(), "rtshort-")));
+}
+
+function exactProof(
+  context: ExactLaneContext,
+  status: ContextLaneStatus,
+  metrics: Pick<RealtimeShortLaneState, "freshValid" | "netAvgR" | "pf"> = {},
+): VariantContextEvidenceRow {
+  return {
+    context,
+    status,
+    statusReason: "test exact proof",
+    blockers: [],
+    cautions: [],
+    freshValid: metrics.freshValid ?? 20,
+    netAvgR: metrics.netAvgR ?? 0.1,
+    grossAvgR: metrics.netAvgR ?? 0.1,
+    pf: metrics.pf ?? 1.3,
+    wr: 0.6,
+    payoffRatio: 1,
+    plus10bpsNetAvgR: metrics.netAvgR ?? 0.1,
+    plus10bpsStillPositive: true,
+    approxMaxDrawdownR: 1,
+    topSymbolPnlShare: 0.2,
+    calendarDays: 1,
+    distinctRegimes: 1,
+    oosThirds: null,
+    allThreeOosPositive: false,
+  };
+}
+
+function withExactProof(
+  state: RealtimeShortLaneState,
+  context: ExactLaneContext,
+): RealtimeShortLaneState {
+  return {
+    ...state,
+    contextRows: {
+      [context]: exactProof(context, state.status as ContextLaneStatus, state),
+    },
+  };
 }
 
 // A valid SHORT candidate: stop ABOVE entry, tp1 BELOW entry.
@@ -184,8 +230,14 @@ describe("realtime-short-mirror — fresh short live-mirror source (mode 2)", ()
         forceFastShort: true,
         // Neither short lane is STABLE — CG_WIDE_FAST_SHORT is only WATCHABLE, CG_WIDE_STOP_TP_WIDE COLLECTING.
         stableShortLanes: [
-          { variantId: "CG_WIDE_STOP_TP_WIDE", status: "COLLECTING", freshValid: 285, netAvgR: 0.02, pf: 1.05 },
-          { variantId: "CG_WIDE_FAST_SHORT", status: "WATCHABLE", freshValid: 378, netAvgR: 0.11, pf: 1.4 },
+          withExactProof(
+            { variantId: "CG_WIDE_STOP_TP_WIDE", status: "COLLECTING", freshValid: 285, netAvgR: 0.02, pf: 1.05 },
+            "SHORT_BEARISH",
+          ),
+          withExactProof(
+            { variantId: "CG_WIDE_FAST_SHORT", status: "WATCHABLE", freshValid: 378, netAvgR: 0.11, pf: 1.4 },
+            "SHORT_BEARISH",
+          ),
         ],
       }),
       store,
@@ -350,7 +402,10 @@ describe("realtime-short-mirror — fresh short live-mirror source (mode 2)", ()
       inputs([shortCand("SEIUSDT", { currentPrice: 0.5, stopLoss: 0.515 })], {
         stableShortLaneActive: false,
         stableShortLanes: [
-          { variantId: "CG_EXP_SHORT_MFE_GIVEBACK_10X", status: "QUARANTINED", freshValid: 64, netAvgR: -0.3, pf: 0.9 },
+          withExactProof(
+            { variantId: "CG_EXP_SHORT_MFE_GIVEBACK_10X", status: "QUARANTINED", freshValid: 64, netAvgR: -0.3, pf: 0.9 },
+            "SHORT_BEARISH",
+          ),
         ],
         manualEnabledVariantIds: new Set(["CG_EXP_SHORT_MFE_GIVEBACK_10X"]),
         rotationShortlist: {
@@ -456,7 +511,10 @@ describe("realtime-short-mirror — fresh short live-mirror source (mode 2)", ()
           controllerConfidence: "MEDIUM",
           stableShortLaneActive: false,
           stableShortLanes: [
-            { variantId: "CG_WIDE_FAST_SHORT", status: "STABLE_CANDIDATE", freshValid: 200, netAvgR: 9, pf: 9 },
+            withExactProof(
+              { variantId: "CG_WIDE_FAST_LONG", status: "COLLECTING", freshValid: 0, netAvgR: null, pf: null },
+              "LONG_BULLISH",
+            ),
           ],
         },
       ),
@@ -479,7 +537,12 @@ describe("realtime-short-mirror — fresh short live-mirror source (mode 2)", ()
       controllerConfidence: "MEDIUM",
       estimatedRegime: { posture: "TACTICAL_OR_MIXED", direction: "MIXED", policy: "TACTICAL_70_30", reason: "test" } as const,
       stableShortLaneActive: false,
-      stableShortLanes: [],
+      stableShortLanes: [
+        withExactProof(
+          { variantId: "CG_WIDE_FAST_LONG", status: "COLLECTING", freshValid: 0, netAvgR: null, pf: null },
+          "LONG_BULLISH",
+        ),
+      ],
     };
     const longCand = { symbol: "ETHUSDT", direction: "LONG" as const, currentPrice: 100, stopLoss: 97, takeProfitLevels: [110] };
 
@@ -694,7 +757,12 @@ describe("realtime-short-mirror — fresh short live-mirror source (mode 2)", ()
       controllerConfidence: "MEDIUM",
       estimatedRegime: { posture: "TACTICAL_OR_MIXED", direction: "MIXED", policy: "TACTICAL_70_30", reason: "test" } as const,
       stableShortLaneActive: false,
-      stableShortLanes: [],
+      stableShortLanes: [
+        withExactProof(
+          { variantId: "CG_WIDE_LONG_RUNNER", status: "COLLECTING", freshValid: 0, netAvgR: null, pf: null },
+          "LONG_BULLISH",
+        ),
+      ],
     };
     const longCand = { symbol: "ETHUSDT", direction: "LONG" as const, currentPrice: 100, stopLoss: 97, takeProfitLevels: [110] };
     const result = runRealtimeShortMirror(inputs([longCand], tacticalBull), freshStore());
@@ -708,7 +776,12 @@ describe("realtime-short-mirror — fresh short live-mirror source (mode 2)", ()
       controllerConfidence: "MEDIUM",
       estimatedRegime: { posture: "TACTICAL_OR_MIXED", direction: "MIXED", policy: "TACTICAL_70_30", reason: "test" } as const,
       stableShortLaneActive: false,
-      stableShortLanes: [],
+      stableShortLanes: [
+        withExactProof(
+          { variantId: "CG_WIDE_LONG_RUNNER", status: "COLLECTING", freshValid: 0, netAvgR: null, pf: null },
+          "LONG_BULLISH",
+        ),
+      ],
     };
     const longCand = { symbol: "ETHUSDT", direction: "LONG" as const, currentPrice: 100, stopLoss: 97, takeProfitLevels: [110] };
     const store = freshStore();
@@ -729,7 +802,12 @@ describe("realtime-short-mirror — fresh short live-mirror source (mode 2)", ()
       controllerConfidence: "MEDIUM",
       estimatedRegime: { posture: "TACTICAL_OR_MIXED", direction: "MIXED", policy: "TACTICAL_70_30", reason: "test" } as const,
       stableShortLaneActive: false,
-      stableShortLanes: [],
+      stableShortLanes: [
+        withExactProof(
+          { variantId: "CG_WIDE_FAST_LONG", status: "COLLECTING", freshValid: 0, netAvgR: null, pf: null },
+          "LONG_BULLISH",
+        ),
+      ],
       forceFastLong: true,
     };
     const longCand = { symbol: "ETHUSDT", direction: "LONG" as const, currentPrice: 100, stopLoss: 97, takeProfitLevels: [110] };

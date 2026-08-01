@@ -43,6 +43,12 @@ export interface LaneSelectorV2LaneState {
   bySymbol?: LaneSelectorV2BreakdownRow[] | null;
   /** Canonical proof rows supplied by the scan runtime. Generic `status` is diagnostic only there. */
   contextRows?: Partial<Record<ExactLaneContext, VariantContextEvidenceRow>>;
+  /** Exact context resolved by the scan adapter for this candidate. */
+  exactContext?: ExactLaneContext | null;
+  /** When true, missing exact proof is a hard stop rather than a legacy direct-caller fallback. */
+  exactContextResolved?: boolean;
+  /** Explicit operator force. This bypasses maturity only; it never changes evidence status. */
+  operatorForceEligible?: boolean;
 }
 
 export interface LaneSelectorV2Candidate {
@@ -469,17 +475,27 @@ export function selectLaneV2(inputs: LaneSelectorV2Inputs): LaneSelectorV2Result
   const shortlistGateActive = rotationShortlistGateActive(inputs, estimated);
 
   for (const state of inputs.laneStates) {
+    if (state.exactContextResolved === false) {
+      rejected.push(`${state.variantId}:missing_exact_context`);
+      continue;
+    }
+    if (state.status === "NOT_APPLICABLE") {
+      rejected.push(`${state.variantId}:context_not_applicable`);
+      continue;
+    }
     const shortlistAllowed = isLaneSelectorV2SupportedVariantId(state.variantId) &&
       rotationShortlistAllowsState(inputs, state, estimated);
+    const forcedMaturityEligible = state.operatorForceEligible === true && state.exactContextResolved === true;
     const statusAllowed =
       shortlistGateActive
         ? shortlistAllowed
-        : state.status === "STABLE_CANDIDATE" ||
-          isLaneSelectorV2LongWideStopOverride({
+        : forcedMaturityEligible ||
+          state.status === "STABLE_CANDIDATE" ||
+          (!state.contextRows && isLaneSelectorV2LongWideStopOverride({
             variantId: state.variantId,
             direction: candidate.direction,
             estimatedRegime: estimated,
-          });
+          }));
     if (!statusAllowed) {
       rejected.push(shortlistGateActive
         ? `${state.variantId}:rotation_shortlist_blocked`

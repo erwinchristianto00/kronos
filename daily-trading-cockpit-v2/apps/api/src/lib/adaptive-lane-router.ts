@@ -26,6 +26,7 @@ import {
   STABLE_MIN_FRESH,
   VARIANT_MATRIX_DEFINITIONS,
   WATCHABLE_MIN_FRESH,
+  exactLaneContextFor,
   type ExactLaneContext,
   type CurrentGuardVariantMatrixReport,
 } from "./current-guard-variant-matrix.js";
@@ -63,6 +64,8 @@ export type LaneDirectionBias = "LONG" | "SHORT" | "NEUTRAL" | "UNKNOWN";
 
 export interface CandidateLane {
   laneId: string;
+  /** Exact proof identity when this candidate comes from a context-conditioned lane. */
+  exactContext?: ExactLaneContext | null;
   source: string;
   directionBias: LaneDirectionBias;
   /** Regime family this lane carries evidence for; "ANY" = direction/regime-agnostic. */
@@ -86,6 +89,7 @@ export interface CandidateLane {
 
 export interface RankedCandidate {
   laneId: string;
+  exactContext?: ExactLaneContext | null;
   source: string;
   directionBias: LaneDirectionBias;
   regimeFamily: RegimeFamily | "ANY";
@@ -112,6 +116,14 @@ export interface RankedCandidate {
    * collectingWatchlist bucket for monitoring only.
    */
   isWatchlist: boolean;
+}
+
+function regimeFamilyForExactContext(context: ExactLaneContext): RegimeFamily {
+  return context === "LONG_BULLISH"
+    ? "BULLISH"
+    : context === "SHORT_BEARISH"
+      ? "BEARISH"
+      : "MIXED";
 }
 
 export interface RegimePolicyEntry {
@@ -287,9 +299,17 @@ export interface LaneRankingContext {
 }
 
 function scoreCandidate(lane: CandidateLane, ctx: LaneRankingContext): RankedCandidate {
+  const candidateId =
+    lane.exactContext && !lane.laneId.endsWith(`:${lane.exactContext}`)
+      ? `${lane.laneId}:${lane.exactContext}`
+      : lane.laneId;
   const maturity = classifyLaneMaturity(lane, ctx.infraReady);
   const regimeMatch = lane.regimeFamily === "ANY" || lane.regimeFamily === ctx.regimeFamily;
   const directionCompatible = directionCompatibleWithMode(lane.directionBias, ctx.controllerMode);
+  const exactContextCompatible =
+    lane.exactContext === undefined ||
+    lane.exactContext === null ||
+    regimeFamilyForExactContext(lane.exactContext) === ctx.regimeFamily;
   const legacy = isLegacyNegativeLane(lane);
 
   const rejectReasons: string[] = [];
@@ -297,9 +317,11 @@ function scoreCandidate(lane: CandidateLane, ctx: LaneRankingContext): RankedCan
   if (maturity === "REJECT") rejectReasons.push("fails hard edge gates (netAvgR>0, PF>1.2, +10bps)");
   if (!directionCompatible)
     rejectReasons.push(`direction ${lane.directionBias} incompatible with mode ${ctx.controllerMode}`);
+  if (!exactContextCompatible)
+    rejectReasons.push(`exact context ${lane.exactContext} incompatible with current ${ctx.regimeFamily} regime`);
 
   const recommendable =
-    !legacy && maturity !== "REJECT" && directionCompatible && maturityRank(maturity) >= 2;
+    !legacy && maturity !== "REJECT" && directionCompatible && exactContextCompatible && maturityRank(maturity) >= 2;
 
   // Ranking priority (highest weight first):
   //  1 regime match  2 direction compat  3 maturity  4 OOS positive (stability gate)
@@ -335,7 +357,8 @@ function scoreCandidate(lane: CandidateLane, ctx: LaneRankingContext): RankedCan
   const isWatchlist = !isExperimental && failsMinEcon && maturity !== "REJECT";
 
   return {
-    laneId: lane.laneId,
+    laneId: candidateId,
+    exactContext: lane.exactContext,
     source: lane.source,
     directionBias: lane.directionBias,
     regimeFamily: lane.regimeFamily,
@@ -347,7 +370,7 @@ function scoreCandidate(lane: CandidateLane, ctx: LaneRankingContext): RankedCan
     score,
     recommendable,
     regimeMatch,
-    directionCompatible,
+    directionCompatible: directionCompatible && exactContextCompatible,
     rejectReasons,
     isExperimental,
     isWatchlist,
@@ -405,8 +428,18 @@ const REGIME_PREF: Record<RegimeFamily, "LONG" | "SHORT" | null> = {
 
 function laneQualifiesForRegime(lane: RankedCandidate, regime: RegimeFamily): boolean {
   if (regime === "CHOP" || regime === "UNKNOWN") return false;
+  if (
+    lane.exactContext !== undefined &&
+    lane.exactContext !== null &&
+    regimeFamilyForExactContext(lane.exactContext) !== regime
+  ) return false;
   const pref = REGIME_PREF[regime];
-  if (pref === null) return lane.directionBias === "NEUTRAL"; // MIXED: neutral evidence only
+  // Context-conditioned MIXED evidence may be directional, but only when its exact context
+  // matches this MIXED policy. Legacy/context-free lanes retain the neutral-only rule.
+  if (pref === null)
+    return lane.exactContext !== undefined && lane.exactContext !== null
+      ? lane.regimeFamily === "MIXED"
+      : lane.directionBias === "NEUTRAL";
   return lane.directionBias === pref || lane.directionBias === "NEUTRAL";
 }
 
@@ -557,6 +590,7 @@ function laneFromPostCutover(pc: PostCutoverReport): CandidateLane {
 function paperEvidenceForLane(
   laneId: string,
   orders: readonly PaperOrder[],
+  exactContext?: ExactLaneContext,
 ): Partial<CandidateLane> | null {
   // T1-b DECISION PATH (lane routing evidence) — gated, DEFAULT OFF. `stressedNetAvgR` below
   // divides by plannedStopDistanceBps, so sub-floor rows dominate the stress term as well as the
@@ -565,6 +599,7 @@ function paperEvidenceForLane(
     .filter(
       (order) =>
         order.selectedLaneId === laneId &&
+        (exactContext === undefined || exactLaneContextFor(order.direction, normalizeRegimeFamily(order.axisRegimeFamily ?? order.regime)) === exactContext) &&
         (order.paperStatus === "PAPER_CLOSED_WIN" || order.paperStatus === "PAPER_CLOSED_LOSS") &&
         typeof order.netR === "number" &&
         Number.isFinite(order.netR),
@@ -645,16 +680,14 @@ function lanesFromVariantMatrix(
     return definition.applicableContexts.flatMap((context) => {
       const evidence = row.contextRows?.[context] ?? null;
       const shape = contextShape(context);
-      const laneId = definition.longOnly
+      const baseLaneId = definition.longOnly
         ? `CG_LONG_VARIANT_MATRIX:${row.variantId}`
         : `CG_VARIANT_MATRIX:${row.variantId}`;
-      // Fixed LONG-only research lanes pre-date the VM exact-context store. Their isolated paper
-      // book is still a direction/regime-constrained observation source, so preserve it as a
-      // compatibility bridge while generic geometries use only VM exact cohorts.
-      const paperEvidence = definition.longOnly ? paperEvidenceForLane(laneId, _paperOrders) : null;
+      const paperEvidence = definition.longOnly ? paperEvidenceForLane(baseLaneId, _paperOrders, context) : null;
       if (!paperEvidence && evidence?.freshValid === 0 && !definition.longOnly) return [];
       return [{
-        laneId,
+        laneId: `${baseLaneId}:${context}`,
+        exactContext: context,
         source: "VARIANT_MATRIX_EXACT_CONTEXT",
         ...shape,
         freshValid: paperEvidence?.freshValid ?? evidence?.freshValid ?? 0,
@@ -674,9 +707,11 @@ function lanesFromVariantMatrix(
 }
 
 function longPaperCollectionLane(paperOrders: readonly PaperOrder[]): CandidateLane {
-  const paperEvidence = paperEvidenceForLane(LONG_WIDE_PAPER_LANE_ID, paperOrders);
+  const exactContext: ExactLaneContext = "LONG_BULLISH";
+  const paperEvidence = paperEvidenceForLane(LONG_WIDE_PAPER_LANE_ID, paperOrders, exactContext);
   return {
-    laneId: LONG_WIDE_PAPER_LANE_ID,
+    laneId: `${LONG_WIDE_PAPER_LANE_ID}:${exactContext}`,
+    exactContext,
     source: "LONG_PAPER_DIAGNOSTIC",
     directionBias: "LONG",
     regimeFamily: "BULLISH",

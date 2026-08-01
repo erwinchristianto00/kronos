@@ -13,7 +13,8 @@
  *
  * Safety posture (enforced here + re-checked downstream by the engine):
  *   - controller-direction gate — LONG/SHORT candidates require the controller to allow that side.
- *   - stable-candidate only     — only exact STABLE_CANDIDATE VM rows can emit.
+ *   - exact-context maturity   — only exact STABLE_CANDIDATE rows emit, unless an explicit
+ *                                operator force bypasses maturity alone after every other gate.
  *   - live-supported geometry   — maker_limit lanes are not mirrored as MARKET orders.
  *   - no stale                  — openedAt = now, so the engine's freshness gate passes honestly.
  *   - experimental, env-gated   — only runs when REALTIME_SHORT_MIRROR_ENABLED=1 (testnet only).
@@ -39,6 +40,7 @@ import {
   type LaneSelectorV2LaneState,
 } from "./lane-selector-v2.js";
 import {
+  VARIANT_MATRIX_DEFINITIONS,
   exactLaneContextFor,
   type VariantMatrixVariantId,
 } from "./current-guard-variant-matrix.js";
@@ -278,20 +280,18 @@ function effectiveLaneStates(
   })
     ? (() => {
         const found = base.some((state) => state.variantId === LONG_WIDE_VARIANT_ID);
-        const lifted = base.map((state) =>
+        const marked = base.map((state) =>
           state.variantId === LONG_WIDE_VARIANT_ID
-            ? { ...state, status: "STABLE_CANDIDATE" }
+            ? { ...state, operatorForceEligible: true }
             : state,
         );
         return found
-          ? lifted
-          : [{ variantId: LONG_WIDE_VARIANT_ID, status: "STABLE_CANDIDATE" }, ...lifted];
+          ? marked
+          : [{ variantId: LONG_WIDE_VARIANT_ID, status: "COLLECTING", operatorForceEligible: true }, ...marked];
       })()
     : base;
-  // Force-enabled lanes → lift to STABLE_CANDIDATE so the mirror emits them before they naturally
-  // mature. OFF by default (preserves the stable-only safety gate); the operator turns each side on
-  // per-instance via REALTIME_SHORT_FORCE_FAST_SHORT / REALTIME_SHORT_FORCE_FAST_LONG. selectLaneV2's
-  // direction gate still blocks a forced lane whenever the regime doesn't allow that side.
+  // Force-enabled lanes retain their real evidence status. `operatorForceEligible` is a narrow,
+  // explicit maturity-only override evaluated after exact-context applicability in selectLaneV2.
   //
   // 2026-07-08 (operator: "wire lane baru ke allocation selection, jangan sampe ada blocker"):
   // ALSO force-lift whatever the operator/regime-autopilot has EXPLICITLY allocated right now
@@ -312,17 +312,17 @@ function effectiveLaneStates(
     if (!isRealtimeShortSelectableVariantId(variantId, inputs.manualEnabledVariantIds?.has(variantId) === true)) continue;
     withForced = withForced.some((state) => state.variantId === variantId)
       ? withForced.map((state) =>
-          state.variantId === variantId ? { ...state, status: "STABLE_CANDIDATE" } : state,
+          state.variantId === variantId ? { ...state, operatorForceEligible: true } : state,
         )
-      : [{ variantId, status: "STABLE_CANDIDATE" }, ...withForced];
+      : [{ variantId, status: "COLLECTING", operatorForceEligible: true }, ...withForced];
   }
   return withForced;
 }
 
 /**
  * Resolve the status and scoring metrics from the exact candidate context before selection. The
- * aggregate row is intentionally not a fallback: old/manual test states without `contextRows`
- * retain their supplied status, but scan-originated states always carry the canonical map.
+ * aggregate row is intentionally not a fallback. Any scan-originated state is marked as requiring
+ * exact proof, so a missing or unresolved context cannot be rescued by operator force.
  */
 function laneStatesForCandidate(
   states: RealtimeShortLaneState[],
@@ -335,19 +335,46 @@ function laneStatesForCandidate(
       ? "BULLISH"
       : estimated.direction === "SHORT"
         ? "BEARISH"
-        : /mixed|chop|range|rotation|sideways/i.test(regime ?? "")
-          ? "MIXED"
-          : null;
+        : /bull|long/i.test(regime ?? "")
+          ? "BULLISH"
+          : /bear|short/i.test(regime ?? "")
+            ? "BEARISH"
+            : /mixed|chop|range|rotation|sideways/i.test(regime ?? "")
+              ? "MIXED"
+              : null;
   const context = exactLaneContextFor(candidate.direction, family);
   return states.map((state) => {
-    // This branch only exists for backward-compatible direct callers. The production scan feeds
-    // `contextRows`, making missing context fail closed rather than borrowing aggregate evidence.
-    if (!state.contextRows) return state;
+    // Legacy direct callers pre-date exact proof maps. Preserve their explicit status unless they
+    // are trying to use the new force path, which must fail closed without an exact context.
+    if (!state.contextRows) {
+      return {
+        ...state,
+        exactContext: context,
+        exactContextResolved: state.operatorForceEligible === true ? false : undefined,
+      };
+    }
+    const definition = VARIANT_MATRIX_DEFINITIONS.find((item) => item.id === state.variantId);
+    const applicable = context !== null && definition?.applicableContexts.includes(context) === true;
     const proof = context === null ? null : state.contextRows[context] ?? null;
+    if (!applicable) {
+      return {
+        ...state,
+        status: "NOT_APPLICABLE",
+        exactContext: context,
+        exactContextResolved: true,
+        freshValid: 0,
+        netAvgR: null,
+        pf: null,
+        wr: null,
+        payoffRatio: null,
+      };
+    }
     if (!proof) {
       return {
         ...state,
         status: "COLLECTING",
+        exactContext: context,
+        exactContextResolved: false,
         freshValid: 0,
         netAvgR: null,
         pf: null,
@@ -358,6 +385,8 @@ function laneStatesForCandidate(
     return {
       ...state,
       status: proof.status,
+      exactContext: context,
+      exactContextResolved: true,
       freshValid: proof.freshValid,
       netAvgR: proof.netAvgR,
       pf: proof.pf,
@@ -406,7 +435,7 @@ export function runRealtimeShortMirror(
   const profitCoreEnabled = inputs.profitCoreShortEnabled === true;
 
   const hasAnyStableLane = laneStates.some((state) =>
-    state.status === "STABLE_CANDIDATE" &&
+    (state.status === "STABLE_CANDIDATE" || state.operatorForceEligible === true) &&
     isRealtimeShortSelectableVariantId(state.variantId, inputs.manualEnabledVariantIds?.has(state.variantId) === true),
   );
   if (!hasAnyStableLane && !inputs.rotationShortlist && !profitCoreEnabled) {
