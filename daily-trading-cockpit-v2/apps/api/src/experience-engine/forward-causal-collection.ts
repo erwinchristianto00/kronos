@@ -525,25 +525,79 @@ export function readForwardCausalEvents(file: string): ForwardEvent[] {
 
 export type ForwardCausalStrictStatus = "VALID" | "FORWARD_CAUSAL_JOURNAL_CORRUPTED" | "FORWARD_CAUSAL_DUPLICATE_CONFLICT" | "FORWARD_CAUSAL_SCHEMA_MISMATCH";
 export interface ForwardCausalStrictRead { status: ForwardCausalStrictStatus; events: readonly ForwardEvent[]; ignoredTornTail: boolean; malformed: number; duplicates: number; }
+const nonEmpty = (value: unknown): value is string => typeof value === "string" && value.length > 0;
+const nullableString = (value: unknown): value is string | null => value === null || nonEmpty(value);
+const nullableFinite = (value: unknown): value is number | null => value === null || finite(value);
+const validIdentity = (value: unknown, outcomeId: string | null): value is CausalIdentity => {
+  if (!value || typeof value !== "object") return false;
+  const identity = value as CausalIdentity;
+  return identity.lineageSchemaVersion === CAUSAL_LINEAGE_SCHEMA_VERSION &&
+    [identity.decisionId, identity.opportunityId, identity.instanceId, identity.laneId, identity.symbolOrBasketId,
+      identity.featureSchemaVersion, identity.decisionRuleVersion, identity.attributionRuleVersion,
+      identity.decisionPolicyVersion, identity.executionPolicyVersion, identity.evidencePolicyVersion,
+      identity.evidenceEra, identity.policyDeploymentAt].every(nonEmpty) &&
+    ["LONG", "SHORT", "NEUTRAL", "BOTH"].includes(identity.direction) &&
+    nullableString(identity.cortexDecisionId) && nullableString(identity.allocationSnapshotId) &&
+    (identity.cortexFeatureSchemaVersion === null || Number.isInteger(identity.cortexFeatureSchemaVersion)) &&
+    identity.outcomeId === outcomeId;
+};
+const validDecisionEvent = (event: unknown): event is DecisionSnapshotEvent => {
+  const value = event as DecisionSnapshotEvent;
+  const c = value?.cortexTraining;
+  return value?.eventType === "DECISION_SNAPSHOT" && nonEmpty(value.eventId) && validIdentity(value.identity, null) &&
+    finite(value.asOfMs) && value.reportOnly === true && value.entryDecision != null &&
+    [value.entryDecision.entryPrice, value.entryDecision.stopLoss, value.entryDecision.plannedStopDistanceBps].every(finite) &&
+    Array.isArray(value.entryDecision.takeProfitLevels) && value.entryDecision.takeProfitLevels.every(finite) &&
+    c != null && ["PRESENT", "MISSING"].includes(c.status) && nullableString(c.decisionId) &&
+    nullableFinite(c.snapshotAtMs) && (c.featureSchemaVersion === null || Number.isInteger(c.featureSchemaVersion)) &&
+    (c.featureVector === null || (Array.isArray(c.featureVector) && c.featureVector.every(finite))) &&
+    (c.status === "MISSING" || (
+      nonEmpty(c.decisionId) && nonEmpty(value.identity.cortexDecisionId) && c.decisionId === value.identity.cortexDecisionId &&
+      nonEmpty(value.identity.allocationSnapshotId) && Number.isInteger(c.featureSchemaVersion) &&
+      c.featureSchemaVersion === value.identity.cortexFeatureSchemaVersion && Array.isArray(c.featureVector) && c.featureVector.length > 0 &&
+      finite(c.snapshotAtMs) && c.snapshotAtMs <= value.asOfMs
+    ));
+};
+const validOpenEvent = (event: unknown): event is OpportunityOpenEvent => {
+  const value = event as OpportunityOpenEvent;
+  return value?.eventType === "OPPORTUNITY_OPEN" && nonEmpty(value.eventId) && validIdentity(value.identity, null) &&
+    value.decisionId === value.identity.decisionId && value.eventId === value.identity.opportunityId && finite(value.openedAtMs) &&
+    [value.entryPrice, value.stopDistance].every(finite) && value.stopDistance > 0 && value.reportOnly === true &&
+    value.expectedCostAssumptions != null && [value.expectedCostAssumptions.costR, value.expectedCostAssumptions.feeSlippageR, value.expectedCostAssumptions.spreadR].every(nullableFinite);
+};
+const validOutcomeEvent = (event: unknown): event is OutcomeResolutionEvent => {
+  const value = event as OutcomeResolutionEvent;
+  return value?.eventType === "OUTCOME_RESOLUTION" && nonEmpty(value.eventId) && nonEmpty(value.outcomeId) &&
+    value.eventId === value.outcomeId && validIdentity(value.identity, value.outcomeId) &&
+    value.decisionId === value.identity.decisionId && value.opportunityId === value.identity.opportunityId &&
+    [value.openedAtMs, value.closedAtMs, value.resolvedAtMs, value.grossR, value.costR, value.netR].every(finite) &&
+    value.openedAtMs <= value.closedAtMs && value.closedAtMs <= value.resolvedAtMs && Math.abs((value.grossR + value.costR) - value.netR) <= 1e-9 &&
+    value.reportOnly === true;
+};
+const validForwardEvent = (event: unknown): event is ForwardEvent =>
+  validDecisionEvent(event) || validOpenEvent(event) || validOutcomeEvent(event);
 /** Strict operator-only reader. A single malformed unterminated final line is tolerated as a torn
  * append tail; every other malformed/unknown row blocks learner input. */
 export function readForwardCausalEventsStrict(file: string): ForwardCausalStrictRead {
   if (!existsSync(file)) return { status: "FORWARD_CAUSAL_JOURNAL_CORRUPTED", events: [], ignoredTornTail: false, malformed: 1, duplicates: 0 };
-  const lines = readFileSync(file, "utf8").split("\n"); const events: ForwardEvent[] = []; const byId = new Map<string, string>();
-  let malformed = 0; let duplicates = 0; let ignoredTornTail = false;
+  const raw = readFileSync(file, "utf8");
+  const newlineTerminated = raw.endsWith("\n");
+  const lines = raw.split("\n"); const events: ForwardEvent[] = []; const byId = new Map<string, string>();
+  let malformed = 0; let schemaMismatch = 0; let duplicates = 0; let ignoredTornTail = false;
   for (let i = 0; i < lines.length; i += 1) {
     const line = lines[i]!; if (!line.trim()) continue;
     let event: ForwardEvent;
     try { event = JSON.parse(line) as ForwardEvent; } catch {
-      if (i === lines.length - 1) { ignoredTornTail = true; continue; }
+      if (i === lines.length - 1 && !newlineTerminated) { ignoredTornTail = true; continue; }
       malformed += 1; continue;
     }
-    if (!event || typeof event !== "object" || !["DECISION_SNAPSHOT", "OPPORTUNITY_OPEN", "OUTCOME_RESOLUTION"].includes((event as ForwardEvent).eventType) || typeof (event as ForwardEvent).eventId !== "string" || !(event as ForwardEvent).identity?.decisionId || !(event as ForwardEvent).identity?.opportunityId) { malformed += 1; continue; }
+    if (!validForwardEvent(event)) { schemaMismatch += 1; continue; }
     const canonical = JSON.stringify(event); const existing = byId.get(event.eventId);
     if (existing && existing !== canonical) { duplicates += 1; continue; }
     if (!existing) { byId.set(event.eventId, canonical); events.push(event); }
   }
-  if (duplicates) return { status: "FORWARD_CAUSAL_DUPLICATE_CONFLICT", events: [], ignoredTornTail, malformed, duplicates };
+  if (duplicates) return { status: "FORWARD_CAUSAL_DUPLICATE_CONFLICT", events: [], ignoredTornTail, malformed: malformed + schemaMismatch, duplicates };
   if (malformed) return { status: "FORWARD_CAUSAL_JOURNAL_CORRUPTED", events: [], ignoredTornTail, malformed, duplicates };
+  if (schemaMismatch) return { status: "FORWARD_CAUSAL_SCHEMA_MISMATCH", events: [], ignoredTornTail, malformed: schemaMismatch, duplicates };
   return { status: "VALID", events, ignoredTornTail, malformed, duplicates };
 }

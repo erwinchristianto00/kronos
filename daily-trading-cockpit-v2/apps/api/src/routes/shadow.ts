@@ -133,6 +133,7 @@ import {
   type AllocatorLaneState,
 } from "../lib/paper-opportunity-allocator.js";
 import { getLatestScanCandidates } from "../lib/latest-scan-candidates-cache.js";
+import { cortexDecisionSnapshotsForScan } from "../lib/cortex-decision-snapshot.js";
 import {
   getLatestScanTimingDiagnostics,
   recordAdmissionTimingTrace,
@@ -3073,6 +3074,7 @@ export async function registerShadowRoutes(
               candidates: cached?.candidates ?? [],
               scanBatchId: cached?.scanBatchId ?? "no-scan",
               scanFinishedAt: cached?.scanFinishedAt ?? paperNow,
+              cortexDecisionSnapshots: cached ? cortexDecisionSnapshotsForScan(cached.scanBatchId) : [],
               marketRegime: cached?.marketRegime ?? null,
               vmReport: variantMatrixReport,
               routerReport: _paperRouter,

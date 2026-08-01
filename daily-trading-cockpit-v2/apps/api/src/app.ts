@@ -177,6 +177,7 @@ import { getRegimeDirectionControllerSnapshotStore } from "./lib/regime-directio
 import { getRegimeEdgeMemory } from "./lib/regime-edge-memory.js";
 import { cortexBrainMode } from "./lib/cortex-brain.js";
 import { CortexBrainStore, CortexDecisionJournal, runCortexShadowTick } from "./lib/cortex-brain-store.js";
+import { publishCortexDecisionSnapshotsForScan } from "./lib/cortex-decision-snapshot.js";
 import { standaloneCortexShadowAllowed } from "./lib/cortex-instance-diagnosis.js";
 import { runFourBrainShadowCycle } from "./lib/four-brain-live-wiring.js";
 import { classifyIncumbentLanes } from "./lib/four-brain-lane-support.js";
@@ -1238,7 +1239,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         // while post-fix economic evidence and exact ownership are incomplete.
         // Passing null actively clears a prior override on every tick.
         const promotion = null;
-        const { promotedWeights } = runCortexShadowTick({
+        const { promotedWeights, snapshots } = runCortexShadowTick({
           store: cortexStore,
           journal: cortexJournal,
           context,
@@ -1247,6 +1248,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           resolvedThisCycle: 0,
           promotion,
         });
+        if (cached?.scanBatchId) publishCortexDecisionSnapshotsForScan(cached.scanBatchId, snapshots);
         // Every cycle re-derives this from scratch and pushes it (including null) — a lost gate, a
         // failed invariant check, or the mode dropping back to 'shadow' all self-heal to the incumbent
         // table within one tick.
@@ -2189,7 +2191,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     const cortexStandaloneShadowTick = () => {
       try {
         if (!standaloneCortexShadowAllowed({ env: process.env, liveEnginePresent: liveEngine != null })) return;
-        runCortexShadowTick({
+        const result = runCortexShadowTick({
           store: cortexStore,
           journal: cortexJournal,
           context: cortexStandaloneContext(),
@@ -2198,6 +2200,8 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           resolvedThisCycle: 0,
           promotion: null,
         });
+        const cached = getLatestScanCandidates();
+        if (cached?.scanBatchId) publishCortexDecisionSnapshotsForScan(cached.scanBatchId, result.snapshots);
       } catch (err) {
         console.error("[cortex-shadow-standalone] tick failed", err);
       }

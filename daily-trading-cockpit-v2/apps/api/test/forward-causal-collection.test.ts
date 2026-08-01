@@ -56,6 +56,22 @@ describe("forward causal collection", () => {
     appendFileSync(journal, "\n{bad}\n");
     expect(readForwardCausalEventsStrict(journal).status).toBe("FORWARD_CAUSAL_JOURNAL_CORRUPTED");
   });
+  it("strict reader rejects structurally incomplete decision/open rows and conflicting event IDs", () => {
+    const dir = mkdtempSync(join(tmpdir(), "causal-strict-schema-")); dirs.push(dir);
+    const env = shadowEnv(dir); const o = order();
+    o.causalIdentity = prepareForwardCausalIdentity(o, env);
+    expect(recordForwardOpportunity(o, env)).toBe(true);
+    const journal = forwardCausalJournalPath(env)!;
+    const rows = readFileSync(journal, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    rows[0].cortexTraining = { ...rows[0].cortexTraining, status: "PRESENT", featureVector: [Number.NaN] };
+    appendFileSync(journal, `${JSON.stringify(rows[0])}\n`);
+    expect(readForwardCausalEventsStrict(journal).status).toBe("FORWARD_CAUSAL_SCHEMA_MISMATCH");
+
+    const clean = join(dir, "clean.jsonl");
+    const first = JSON.parse(readFileSync(journal, "utf8").split("\n")[0]!);
+    appendFileSync(clean, `${JSON.stringify(first)}\n${JSON.stringify({ ...first, marketState: { regime: "OTHER", status: "PRESENT" } })}\n`);
+    expect(readForwardCausalEventsStrict(clean).status).toBe("FORWARD_CAUSAL_DUPLICATE_CONFLICT");
+  });
   it("is default-off and hard-blocks 3103 without filesystem I/O", () => {
     const dir = mkdtempSync(join(tmpdir(), "causal-off-")); dirs.push(dir);
     const env = { PORT: "3102", CAUSAL_EXPERIENCE_COLLECTION_DIR: dir };

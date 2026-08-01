@@ -23,6 +23,7 @@ export type ExecutiveReviewAdmissionResult =
   | "AMBIGUOUS_PAPER_OWNERSHIP"
   | "POST_FIX_POLICY_MISSING"
   | "STALE_CAUSAL_IDENTITY"
+  | "CORTEX_ALLOCATION_LINK_MISSING"
   | "REVIEW_CONFLICT";
 
 function actionFor(exec: ExecutiveDecision): "ENTER" | "WAIT" | "SKIP" {
@@ -46,6 +47,7 @@ function sameReview(left: ExecutiveReviewRecord, right: ExecutiveReviewRecord): 
     && left.opportunityId === right.opportunityId
     && left.laneId === right.laneId
     && left.marketContextSnapshotId === right.marketContextSnapshotId
+    && left.allocationSnapshotId === right.allocationSnapshotId
     && left.decisionPipelinePolicyVersion === right.decisionPipelinePolicyVersion
     && left.executionPolicyVersion === right.executionPolicyVersion
     && left.evidencePolicyVersion === right.evidencePolicyVersion
@@ -130,6 +132,13 @@ export function attachExecutiveReviewToExactPaperOrder(input: {
   const causalPolicyContext = resolveCanonicalPolicyContext(env);
   if (!causalPolicyContext || !order.causalIdentity) return "POST_FIX_POLICY_MISSING";
   if (!isCausalIdentityCurrentlyValid(order.causalIdentity, order, causalActivation, causalPolicyContext)) return "STALE_CAUSAL_IDENTITY";
+  // Four-Brain's allocation context has its own snapshot namespace. An exact CORTEX-labelled
+  // order may reach Tier 1 only if the producer carries an explicit bridge to the same immutable
+  // CORTEX allocation identity; a matching lane/time is never a substitute.
+  const cortexAllocationSnapshotId = order.causalIdentity.allocationSnapshotId;
+  if (!cortexAllocationSnapshotId || executive.allocationContext.cortexAllocationSnapshotId !== cortexAllocationSnapshotId) {
+    return "CORTEX_ALLOCATION_LINK_MISSING";
+  }
 
   const record: ExecutiveReviewRecord = {
     executiveReviewId: `executive-review:${executive.decisionId}:${order.causalIdentity.opportunityId}`,
@@ -137,7 +146,7 @@ export function attachExecutiveReviewToExactPaperOrder(input: {
     opportunityId: order.causalIdentity.opportunityId,
     laneId: executive.laneId,
     marketContextSnapshotId: executive.marketContext.marketContextSnapshotId,
-    allocationSnapshotId: executive.allocationContext.snapshotId,
+    allocationSnapshotId: cortexAllocationSnapshotId,
     strategyAction: actionFor(executive),
     direction: executive.entry.side,
     marketState: executive.marketState.family,

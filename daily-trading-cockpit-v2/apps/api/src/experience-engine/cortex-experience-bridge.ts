@@ -25,6 +25,95 @@ export interface CortexExperienceBridgeResult {
   rejected: Record<string, number>;
 }
 
+/** Feature-only provenance for real CORTEX learning. Unlike the legacy paper-experience bridge,
+ * this intentionally stops at admission: Executive Review supplies economics later. */
+export interface CortexFeatureProvenance {
+  readonly identity: CausalIdentity;
+  readonly decisionEvent: DecisionSnapshotEvent;
+  readonly opportunityEvent: OpportunityOpenEvent;
+  readonly decision: CortexDecisionRow;
+}
+export interface CortexFeatureProvenanceResult {
+  readonly rows: readonly CortexFeatureProvenance[];
+  readonly rejected: Readonly<Record<string, number>>;
+}
+
+/** Reconstruct exact CORTEX features from the append-only decision/open pair only. This has no
+ * paper outcome dependency and therefore cannot leak paper exit economics into a real Tier-1 label. */
+export function buildCortexFeatureProvenance(
+  events: readonly ForwardEvent[],
+  expectedPolicy: CanonicalPolicyContext,
+): CortexFeatureProvenanceResult {
+  const decisions = new Map<string, DecisionSnapshotEvent>();
+  const opens = new Map<string, OpportunityOpenEvent>();
+  const duplicateDecisionIds = new Set<string>();
+  const duplicateOpportunityIds = new Set<string>();
+  const rejected: Record<string, number> = {};
+  for (const event of events) {
+    if (event.eventType === "DECISION_SNAPSHOT") {
+      if (decisions.has(event.identity.decisionId)) { duplicateDecisionIds.add(event.identity.decisionId); bump(rejected, "duplicate_decision"); }
+      else decisions.set(event.identity.decisionId, event);
+    }
+    if (event.eventType === "OPPORTUNITY_OPEN") {
+      if (opens.has(event.identity.opportunityId)) { duplicateOpportunityIds.add(event.identity.opportunityId); bump(rejected, "duplicate_opportunity"); }
+      else opens.set(event.identity.opportunityId, event);
+    }
+  }
+  const rows: CortexFeatureProvenance[] = [];
+  for (const open of opens.values()) {
+    if (duplicateOpportunityIds.has(open.identity.opportunityId) || duplicateDecisionIds.has(open.decisionId)) {
+      bump(rejected, "ambiguous_duplicate_provenance"); continue;
+    }
+    const decision = decisions.get(open.decisionId);
+    if (!decision) { bump(rejected, "missing_decision_snapshot"); continue; }
+    const sameIdentity =
+      decision.identity.decisionId === open.identity.decisionId &&
+      decision.identity.opportunityId === open.identity.opportunityId &&
+      decision.identity.outcomeId === null && open.identity.outcomeId === null &&
+      decision.identity.instanceId === open.identity.instanceId &&
+      decision.identity.laneId === open.identity.laneId &&
+      decision.identity.symbolOrBasketId === open.identity.symbolOrBasketId &&
+      decision.identity.direction === open.identity.direction &&
+      decision.identity.allocationSnapshotId === open.identity.allocationSnapshotId &&
+      decision.identity.cortexDecisionId === open.identity.cortexDecisionId;
+    if (!sameIdentity) { bump(rejected, "identity_mismatch"); continue; }
+    if (!identityMatchesCurrentPolicy(decision.identity, expectedPolicy) || !identityMatchesCurrentPolicy(open.identity, expectedPolicy)) {
+      bump(rejected, "stale_or_mismatched_policy_identity"); continue;
+    }
+    const cortex = decision.cortexTraining;
+    if (
+      cortex.status !== "PRESENT" || !cortex.decisionId || !finite(cortex.snapshotAtMs) ||
+      cortex.decisionId !== decision.identity.cortexDecisionId ||
+      cortex.featureSchemaVersion !== decision.identity.cortexFeatureSchemaVersion ||
+      cortex.featureSchemaVersion !== CORTEX_FEATURE_SCHEMA_VERSION ||
+      !Array.isArray(cortex.featureVector) || cortex.featureVector.length !== CORTEX_FEATURE_DIM || !cortex.featureVector.every(finite)
+    ) { bump(rejected, "missing_or_incompatible_cortex_snapshot"); continue; }
+    if (
+      cortex.snapshotAtMs > decision.asOfMs || decision.asOfMs > open.openedAtMs ||
+      Object.values(decision.features.sourceStatuses).some((status) => status === "ERROR")
+    ) { bump(rejected, "invalid_feature_provenance_clock"); continue; }
+    const meta = cortexOutcomeLaneMeta(decision.identity.laneId);
+    if (!meta || (meta.direction !== "NEUTRAL" && meta.direction !== decision.identity.direction)) { bump(rejected, "lane_direction_mismatch"); continue; }
+    rows.push({
+      identity: decision.identity,
+      decisionEvent: decision,
+      opportunityEvent: open,
+      decision: {
+        decisionId: cortex.decisionId,
+        atMs: decision.asOfMs,
+        featureSchemaVersion: cortex.featureSchemaVersion,
+        regimeFamily: cortex.regimeFamily ?? "UNKNOWN",
+        lanes: new Map([[meta.laneId, {
+          x: [...cortex.featureVector], eligible: cortex.eligible === true, direction: meta.direction,
+          finalPct: finite(cortex.finalPct) ? cortex.finalPct : 0,
+          evalFinalPct: finite(cortex.evalFinalPct) ? cortex.evalFinalPct : 0,
+        }]]),
+      },
+    });
+  }
+  return { rows, rejected };
+}
+
 const finite = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value);
 const bump = (counts: Record<string, number>, reason: string): void => { counts[reason] = (counts[reason] ?? 0) + 1; };
 const economicallyConsistent = (grossR: unknown, costR: unknown, netR: unknown): boolean =>

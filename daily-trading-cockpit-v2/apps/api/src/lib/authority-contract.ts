@@ -9,6 +9,12 @@ export type AllocationSource = "UNAVAILABLE" | "STATIC_BASELINE" | "CORTEX_SHADO
 export interface AllocationContext {
   source: AllocationSource;
   snapshotId: string | null;
+  /**
+   * Exact CORTEX allocation identity when an executive decision is reviewing a
+   * CORTEX-labelled paper order. `snapshotId` remains Four-Brain's own
+   * allocation-context namespace; it must never be compared implicitly.
+   */
+  cortexAllocationSnapshotId?: string | null;
   staticWeightPct: number | null;
   evaluatedWeightPct: number | null;
   appliedWeightPct: number | null;
@@ -50,6 +56,8 @@ export function staticAllocationContext(staticWeightPct: number | null): Allocat
 
 export function validAllocationContext(value: AllocationContext): boolean {
   if (!Number.isFinite(value.beta) || value.beta < 0) return false;
+  if (value.cortexAllocationSnapshotId !== undefined && value.cortexAllocationSnapshotId !== null &&
+    (typeof value.cortexAllocationSnapshotId !== "string" || !value.cortexAllocationSnapshotId)) return false;
   if (value.source === "CORTEX_PROMOTED") return value.beta > 0 && value.snapshotId !== null && value.appliedWeightPct !== null;
   if (value.source === "STATIC_BASELINE") {
     return value.beta === 0 && value.snapshotId === null && value.appliedWeightPct === value.staticWeightPct;

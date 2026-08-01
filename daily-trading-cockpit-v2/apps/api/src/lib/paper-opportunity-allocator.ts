@@ -69,6 +69,7 @@ import {
   type LaneConfidence,
   type PaperOrder,
 } from "./paper-execution-router.js";
+import type { CortexDecisionSnapshot } from "./cortex-decision-snapshot.js";
 import {
   buildMixedAdmissionDecisionLedger,
   buildMixedRegimeReport,
@@ -288,6 +289,9 @@ export interface PaperOpportunityAllocatorInputs {
   /** Immutable paper-start anchor; candidates before it are excluded from admission. */
   paperStartAt: string | null;
   paperValidationAllowed?: boolean;
+  /** Snapshots captured for this exact `scanBatchId` by the CORTEX allocation tick. They are
+   * producer-owned data, not a router lookup; missing input leaves the opportunity unlabelled. */
+  cortexDecisionSnapshots?: readonly CortexDecisionSnapshot[];
   /**
    * Testnet-only high-throughput collection mode. Every fresh candidate × lane
    * with valid executable geometry is admitted as DIAGNOSTIC_ONLY, including
@@ -2088,6 +2092,9 @@ export function buildPaperOpportunityAllocatorReport(
       }
 
       const buildOpportunity = (mode: PaperOrderMode): PaperOpportunity => {
+        const cortexDecisionSnapshot = inputs.cortexDecisionSnapshots?.find((snapshot) =>
+          snapshot.laneId === laneId && snapshot.direction === direction,
+        ) ?? null;
         const manualCgWideTarget =
           def.id === "CG_WIDE_STOP_TP_WIDE"
             ? cgWideTargetFromEntry(geo.entryPrice, direction, paperControls.cgWideTpPct)
@@ -2180,6 +2187,9 @@ export function buildPaperOpportunityAllocatorReport(
           riskMultiplierAfterOccupancy: mixedBudgetState?.risk.riskMultiplier,
           budgetUsed: mixedBudgetLedgerEntry?.budgetUsed,
           budgetReason: mixedBudgetLedgerEntry?.occupancyReason,
+          cortexDecisionSnapshot,
+          cortexDecisionId: cortexDecisionSnapshot?.decisionId ?? null,
+          cortexAllocationSnapshotId: cortexDecisionSnapshot?.allocationSnapshotId ?? null,
         };
       };
 
