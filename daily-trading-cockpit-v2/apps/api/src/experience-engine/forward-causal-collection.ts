@@ -110,6 +110,9 @@ export interface DecisionSnapshotEvent {
     decisionId: string | null;
     featureSchemaVersion: number | null;
     featureVector: number[] | null;
+    /** Original snapshot clock. `asOfMs` is the paper admission decision clock and must never
+     * overwrite this earlier source timestamp. */
+    snapshotAtMs: number | null;
     regimeFamily: string | null;
     eligible: boolean | null;
     finalPct: number | null;
@@ -371,13 +374,14 @@ function openEvents(order: ForwardPaperOrderLike, env: NodeJS.ProcessEnv): Forwa
           decisionId: cortex.decisionId,
           featureSchemaVersion: cortex.featureSchemaVersion,
           featureVector: [...cortex.featureVector],
+          snapshotAtMs: cortex.atMs,
           regimeFamily: cortex.regimeFamily,
           eligible: cortex.eligible,
           finalPct: cortex.finalPct,
           evalFinalPct: cortex.evalFinalPct,
         }
       : {
-          status: "MISSING", decisionId: null, featureSchemaVersion: null, featureVector: null,
+          status: "MISSING", decisionId: null, featureSchemaVersion: null, featureVector: null, snapshotAtMs: null,
           regimeFamily: null, eligible: null, finalPct: null, evalFinalPct: null,
         },
     provenance: { originKey, sourceObservationId: order.sourceObservationId, missingFields: order.provenanceFieldMissing?.slice() ?? [] },

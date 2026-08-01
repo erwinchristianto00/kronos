@@ -530,6 +530,7 @@ describe("paper-execution-router", () => {
     expect(result.admitted).toBe(5);
     const orders = store.all.filter((order) => order.sourceCandidateId?.startsWith("snapshot-"));
     expect(orders.find((order) => order.sourceCandidateId === "snapshot-exact")?.cortexDecisionSnapshot).toMatchObject({ decisionId: snapshot.decisionId, allocationSnapshotId: snapshot.allocationSnapshotId, atMs: snapshot.atMs });
+    expect(orders.find((order) => order.sourceCandidateId === "snapshot-exact")).toMatchObject({ cortexDecisionId: snapshot.decisionId, cortexAllocationSnapshotId: snapshot.allocationSnapshotId });
     expect(orders.find((order) => order.sourceCandidateId === "snapshot-wrong-allocation")?.cortexDecisionSnapshot).toBeUndefined();
     expect(orders.find((order) => order.sourceCandidateId === "snapshot-wrong-decision")?.cortexDecisionSnapshot).toBeUndefined();
     expect(orders.find((order) => order.sourceCandidateId === "snapshot-wrong-direction")?.cortexDecisionSnapshot).toBeUndefined();

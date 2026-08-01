@@ -60,6 +60,7 @@ export type CortexShadowRejectionReason =
   | "INVALID_IMMUTABLE_RISK"
   | "CORTEX_SNAPSHOT_VECTOR_MISMATCH"
   | "CORTEX_DECISION_IDENTITY_MISMATCH"
+  | "CORTEX_CAUSAL_CLOCK_ORDER_INVALID"
   | "CORTEX_POLICY_LINEAGE_MISMATCH";
 
 export type CortexShadowRunStatus = "CANDIDATE_CREATED" | "NO_NEW_ELIGIBLE_DATA" | "NO_REFIT" | "BLOCKED";
@@ -211,6 +212,7 @@ const emptyRejections = (): Record<CortexShadowRejectionReason, number> => ({
   INVALID_IMMUTABLE_RISK: 0,
   CORTEX_SNAPSHOT_VECTOR_MISMATCH: 0,
   CORTEX_DECISION_IDENTITY_MISMATCH: 0,
+  CORTEX_CAUSAL_CLOCK_ORDER_INVALID: 0,
   CORTEX_POLICY_LINEAGE_MISMATCH: 0,
 });
 
@@ -287,6 +289,8 @@ function snapshotConsistencyReason(input: {
     forwardOutcome.identity.allocationSnapshotId === outcome.allocationSnapshotId &&
     forwardDecision.identity.cortexDecisionId === forwardDecision.cortexTraining.decisionId &&
     forwardDecision.identity.cortexFeatureSchemaVersion === forwardDecision.cortexTraining.featureSchemaVersion &&
+    Number.isFinite(forwardDecision.cortexTraining.snapshotAtMs) &&
+    forwardDecision.cortexTraining.snapshotAtMs! <= forwardDecision.asOfMs &&
     forwardDecision.asOfMs === outcome.executiveDecisionTimeMs &&
     forwardOpen.decisionId === forwardDecision.identity.decisionId && forwardOutcome.decisionId === forwardDecision.identity.decisionId &&
     forwardOutcome.opportunityId === outcome.opportunityId &&
@@ -296,6 +300,11 @@ function snapshotConsistencyReason(input: {
     experience.symbolOrBasketId === symbol && experience.direction === outcome.direction &&
     decision.decisionId === forwardDecision.cortexTraining.decisionId;
   if (!identityMatches) return "CORTEX_DECISION_IDENTITY_MISMATCH";
+  if (
+    forwardDecision.asOfMs > outcome.entryAtMs ||
+    (outcome.marketClosedAtMs != null && outcome.entryAtMs > outcome.marketClosedAtMs) ||
+    (outcome.settlementResolvedAtMs != null && outcome.marketClosedAtMs != null && outcome.marketClosedAtMs > outcome.settlementResolvedAtMs)
+  ) return "CORTEX_CAUSAL_CLOCK_ORDER_INVALID";
   const lane = decision.lanes.get(outcome.laneId);
   const raw = forwardDecision.cortexTraining;
   if (!lane || lane.direction !== outcome.direction || raw.featureSchemaVersion !== decision.featureSchemaVersion ||
@@ -355,13 +364,24 @@ export function buildCortexShadowTrainingDataset(input: {
     if (!outcome.settlementFetchComplete || outcome.missingRequiredOrderIds.length > 0 || !finite(outcome.costR) || !finite(outcome.netR) || Math.abs((outcome.grossR - outcome.costR) - outcome.netR) > 1e-9) {
       rejected.INVALID_OR_INCOMPLETE_COST += 1; continue;
     }
-    if (!directOutcomeIds.has(outcome.outcomeId)) { rejected.FOUR_BRAIN_NOT_DIRECT += 1; continue; }
     const experience = bridgeByOpportunity.get(outcome.opportunityId);
     const forwardDecision = outcome.allocationSnapshotId ? forwardDecisionByAllocation.get(outcome.allocationSnapshotId) : undefined;
+    const forwardOpen = forwardOpenByOpportunity.get(outcome.opportunityId);
+    const forwardOutcome = forwardOutcomeByOpportunity.get(outcome.opportunityId);
+    const rawSnapshot = forwardDecision?.cortexTraining;
+    // Clock integrity is a source invariant, not an attribute of Four-Brain eligibility. Check it
+    // before any downstream direct-outcome filter so a malformed real chain remains observable.
+    if (
+      rawSnapshot?.snapshotAtMs != null && forwardOpen &&
+      (!finite(rawSnapshot.snapshotAtMs) || rawSnapshot.snapshotAtMs > forwardDecision!.asOfMs ||
+        forwardDecision!.asOfMs > outcome.entryAtMs ||
+        (outcome.marketClosedAtMs != null && outcome.entryAtMs > outcome.marketClosedAtMs) ||
+        (outcome.settlementResolvedAtMs != null && outcome.marketClosedAtMs != null && outcome.marketClosedAtMs > outcome.settlementResolvedAtMs))
+    ) { rejected.CORTEX_CAUSAL_CLOCK_ORDER_INVALID += 1; continue; }
+    if (!directOutcomeIds.has(outcome.outcomeId)) { rejected.FOUR_BRAIN_NOT_DIRECT += 1; continue; }
     const decision = forwardDecision?.cortexTraining.decisionId
       ? decisionByCortexLane.get(`${forwardDecision.cortexTraining.decisionId}\u001f${outcome.laneId}`)
       : undefined;
-    const rawSnapshot = forwardDecision?.cortexTraining;
     if (!rawSnapshot || rawSnapshot.status !== "PRESENT" || !rawSnapshot.featureVector) {
       rejected.MISSING_EXACT_CORTEX_SNAPSHOT += 1; continue;
     }
@@ -372,9 +392,7 @@ export function buildCortexShadowTrainingDataset(input: {
       rejected.UNKNOWN_CONTEXT += 1; continue;
     }
     const consistency = snapshotConsistencyReason({
-      outcome, experience, decision, forwardDecision,
-      forwardOpen: forwardOpenByOpportunity.get(outcome.opportunityId),
-      forwardOutcome: forwardOutcomeByOpportunity.get(outcome.opportunityId), policy: input.policy,
+      outcome, experience, decision, forwardDecision, forwardOpen, forwardOutcome, policy: input.policy,
     });
     if (consistency) { rejected[consistency] += 1; continue; }
     // snapshotConsistencyReason has just proven these exact representations exist; repeat the

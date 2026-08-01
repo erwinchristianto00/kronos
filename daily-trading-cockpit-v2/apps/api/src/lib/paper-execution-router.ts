@@ -567,6 +567,10 @@ export interface PaperOrder {
   causalIdentity?: CausalIdentity | null;
   /** Exact CORTEX x captured at admission; absent means explicitly ineligible for CORTEX learning. */
   cortexDecisionSnapshot?: CortexDecisionSnapshot | null;
+  /** Immutable IDs paired with the exact snapshot at admission. They are persisted separately so
+   * rehydrated causal collection can prove the handoff without an in-memory lookup. */
+  cortexDecisionId?: string | null;
+  cortexAllocationSnapshotId?: string | null;
   /** Present only when an exact Four-Brain review was persisted before admission. */
   executiveReviewLink?: ExecutiveReviewExecutionLink | null;
   // ── forward-gate shadow label (report-only OOS validation; NEVER blocks admission) ──
@@ -1748,10 +1752,14 @@ function _buildAllocatorOrder(
     snapshot && o.cortexDecisionId === snapshot.decisionId &&
     o.cortexAllocationSnapshotId === snapshot.allocationSnapshotId &&
     snapshot.laneId === order.selectedLaneId && snapshot.direction === order.direction &&
+    Number.isInteger(snapshot.featureSchemaVersion) && Array.isArray(snapshot.featureVector) &&
+    snapshot.featureVector.length > 0 && snapshot.featureVector.every(Number.isFinite) &&
     Number.isFinite(snapshot.atMs) && snapshot.atMs <= Date.parse(order.firstSeenAt ?? order.createdAt) &&
     snapshot.atMs >= Date.parse(order.firstSeenAt ?? order.createdAt) - CORTEX_SNAPSHOT_MAX_ADMISSION_AGE_MS
   ) {
     order.cortexDecisionSnapshot = { ...snapshot, featureVector: [...snapshot.featureVector] };
+    order.cortexDecisionId = snapshot.decisionId;
+    order.cortexAllocationSnapshotId = snapshot.allocationSnapshotId;
   }
   const identity = prepareForwardCausalIdentity(order);
   if (identity) order.causalIdentity = identity;

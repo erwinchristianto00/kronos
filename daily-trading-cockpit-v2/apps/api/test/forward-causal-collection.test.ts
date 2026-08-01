@@ -185,6 +185,10 @@ describe("forward causal collection", () => {
     o.cortexDecisionId = o.cortexDecisionSnapshot.decisionId;
     o.cortexAllocationSnapshotId = o.cortexDecisionSnapshot.allocationSnapshotId;
     o.causalIdentity = prepareForwardCausalIdentity(o, env);
+    expect(o.causalIdentity).toMatchObject({
+      cortexDecisionId: o.cortexDecisionSnapshot.decisionId,
+      allocationSnapshotId: o.cortexDecisionSnapshot.allocationSnapshotId,
+    });
     recordForwardOpportunity(o, env);
     o.paperStatus = "PAPER_CLOSED_WIN"; o.closedAtMs = 2_000; o.resolvedAtMs = 3_000; o.grossR = 0.2; o.costR = -0.02; o.netR = 0.18;
     o.causalIdentity = withResolvedCausalIdentity(o);
@@ -195,6 +199,9 @@ describe("forward causal collection", () => {
     expect(bridge.outcomes).toHaveLength(1);
     expect(bridge.outcomes[0]?.decisionId).toBe(o.cortexDecisionSnapshot.decisionId);
     expect(bridge.rejected).toEqual({});
+    const decision = events.find((event) => event.eventType === "DECISION_SNAPSHOT") as Extract<ForwardCausalEvent, { eventType: "DECISION_SNAPSHOT" }>;
+    expect(decision.cortexTraining.snapshotAtMs).toBe(o.cortexDecisionSnapshot.atMs);
+    expect(decision.cortexTraining.snapshotAtMs).toBeLessThanOrEqual(decision.asOfMs);
   });
 
   it("rejects legacy, identity-mismatched, schema-mismatched, and future-decision chains", () => {

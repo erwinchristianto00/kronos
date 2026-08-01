@@ -78,7 +78,7 @@ function row(index: number, overrides: Partial<ExecutiveReviewOutcome> = {}): { 
       directionDecision: { direction: "LONG", controllerMode: "LONG" }, entryDecision: { entryPrice: 100, stopLoss: 90, takeProfitLevels: [110], plannedStopDistanceBps: 100 },
       cortexRecommendation: { status: "MISSING", value: null }, incumbentDecision: { status: "PRESENT", value: "incumbent" },
       features: { names: [], values: [], availableAtMs: [], sourceStatuses: { candle: "FRESH" } },
-      cortexTraining: { status: "PRESENT", decisionId: cortexId, featureSchemaVersion: 1, featureVector: x(index), regimeFamily: "BULLISH", eligible: true, finalPct: 0, evalFinalPct: 0 },
+      cortexTraining: { status: "PRESENT", decisionId: cortexId, featureSchemaVersion: 1, featureVector: x(index), snapshotAtMs: decisionTimeMs - 1, regimeFamily: "BULLISH", eligible: true, finalPct: 0, evalFinalPct: 0 },
       provenance: { originKey: `origin-${index}`, sourceObservationId: `source-${index}`, missingFields: [] },
     },
     { eventType: "OPPORTUNITY_OPEN", eventId: `open-event-${index}`, identity, decisionId: identity.decisionId, openedAtMs: openedTimeMs, entryPrice: 100, stopDistance: 10, expectedCostAssumptions: { costR: 0.02, feeSlippageR: 0.02, spreadR: 0 }, provenance: { sourceObservationId: `source-${index}`, originKey: `origin-${index}` }, reportOnly: true },
@@ -225,6 +225,15 @@ describe("CORTEX shadow refit learner v1", () => {
       // original opportunity/allocation chain through a similarity fallback.
       expect(Object.values(rejected.rejected).reduce((total, count) => total + count, 0)).toBeGreaterThan(0);
     }
+  });
+
+  it("rejects a CORTEX chain whose snapshot, admission, fill, close, and settlement clocks are out of order", () => {
+    const input = dataset(1);
+    const outcome = input.outcomes[0]!;
+    outcome.marketClosedAtMs = outcome.entryAtMs - 1;
+    const rejected = buildCortexShadowTrainingDataset({ ...input, policy, nowMs: epochMs + 99_999_999 });
+    expect(rejected.examples).toHaveLength(0);
+    expect(rejected.rejected.CORTEX_CAUSAL_CLOCK_ORDER_INVALID).toBe(1);
   });
 
   it("requires the exact lane, symbol, direction, and instance identity rather than a nearest snapshot", () => {
