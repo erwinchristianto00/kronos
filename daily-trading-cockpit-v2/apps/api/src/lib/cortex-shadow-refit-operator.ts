@@ -68,21 +68,9 @@ export interface CortexOperatorDeps {
 const sha = (contents: Buffer | string): string => createHash("sha256").update(contents).digest("hex");
 const validSha = (value: string | null): value is string => value != null && /^[a-f0-9]{40}$/i.test(value);
 const inside = (root: string, candidate: string): boolean => relative(root, candidate) === "" || !relative(root, candidate).startsWith(".." + "/") && relative(root, candidate) !== "..";
-export const OPERATOR_SOURCE_CLOSURE = [
-  "apps/api/scripts/cortex-shadow-refit-operator.ts",
-  "apps/api/src/lib/cortex-shadow-refit-operator.ts",
-  "apps/api/src/lib/cortex-shadow-refit.ts",
-  "apps/api/src/lib/cortex-brain-store.ts",
-  "apps/api/src/lib/cortex-brain.ts",
-  "apps/api/src/lib/cortex-economic-model.ts",
-  "apps/api/src/lib/executive-review-store.ts",
-  "apps/api/src/experience-engine/forward-causal-collection.ts",
-  "apps/api/src/lib/four-brain-types.ts",
-  "packages/shared/src/evidence-era.ts",
-  "packages/shared/src/policy-versions.ts",
-] as const;
+export const OPERATOR_SOURCE_ENTRYPOINTS = ["scripts/cortex-shadow-refit-operator.ts", "src/lib/cortex-shadow-refit-operator.ts"] as const;
 export interface CortexOperatorCodeProvenance {
-  readonly status: "VALID" | "CODE_VERSION_UNRESOLVED" | "DEPLOYMENT_MANIFEST_INVALID" | "DEPLOYED_SOURCE_HASH_MISMATCH" | "GIT_SOURCE_MISMATCH";
+  readonly status: "VALID" | "CODE_VERSION_UNRESOLVED" | "GIT_ROOT_UNRESOLVED" | "IMPORT_CLOSURE_INVALID" | "DEPLOYMENT_MANIFEST_INVALID" | "DEPLOYED_SOURCE_HASH_MISMATCH" | "GIT_SOURCE_MISMATCH";
   readonly sha: string | null;
   readonly source: string | null;
   readonly files: readonly CortexOperatorFile[];
@@ -140,43 +128,94 @@ function resolveCodeVersion(cwd: string, env: NodeJS.ProcessEnv, injected?: Cort
 function command(cwd: string, args: readonly string[]): string | null {
   try { return execFileSync("git", [...args], { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim(); } catch { return null; }
 }
-function closureFiles(repoRoot: string): CortexOperatorFile[] | null {
+function gitWorktreeRoot(cwd: string): string | null {
+  const root = command(cwd, ["rev-parse", "--show-toplevel"]);
   try {
-    return OPERATOR_SOURCE_CLOSURE.map((entry) => {
-      const path = resolve(repoRoot, entry); const contents = readFileSync(path);
-      return { path: entry, sha256: sha(contents), size: contents.length, mtimeMs: statSync(path).mtimeMs };
-    });
+    const canonicalRoot = root && existsSync(root) ? realpathSync(root) : null;
+    const canonicalCwd = realpathSync(cwd);
+    return canonicalRoot && inside(canonicalRoot, canonicalCwd) ? canonicalRoot : null;
   } catch { return null; }
 }
-function readDeploymentManifest(file: string, repoRoot: string): CortexOperatorCodeProvenance | null {
+function repoPath(root: string, file: string): string | null {
+  const path = relative(root, file).split("\\").join("/");
+  return path && !path.startsWith("../") && path !== ".." ? path : null;
+}
+function resolveProductionImport(root: string, appRoot: string, source: string, specifier: string): string | null {
+  let base: string | null = null;
+  if (specifier.startsWith(".")) base = resolve(dirname(resolve(root, source)), specifier);
+  else if (specifier === "@dtc/shared") base = resolve(appRoot, "../../packages/shared/src/index.ts");
+  else return ""; // External/node imports have no repository source closure.
+  const withoutJs = base.endsWith(".js") ? `${base.slice(0, -3)}.ts` : base;
+  for (const candidate of [base, withoutJs, `${base}.ts`, `${base}.tsx`, resolve(base, "index.ts")]) {
+    try {
+      if (lstatSync(candidate).isFile() && inside(root, realpathSync(candidate))) return repoPath(root, candidate);
+    } catch { /* Try the next TypeScript resolution candidate. */ }
+  }
+  return null;
+}
+/** Deterministic recursive TypeScript production import closure for the operator's two entrypoints. */
+export function resolveCortexOperatorSourceClosure(cwd: string): { readonly root: string; readonly files: readonly CortexOperatorFile[] } | { readonly blocker: "GIT_ROOT_UNRESOLVED" | "IMPORT_CLOSURE_INVALID" } {
+  const root = gitWorktreeRoot(cwd); if (!root) return { blocker: "GIT_ROOT_UNRESOLVED" };
+  let appRoot: string;
+  try { appRoot = realpathSync(cwd); } catch { return { blocker: "GIT_ROOT_UNRESOLVED" }; }
+  const starts = OPERATOR_SOURCE_ENTRYPOINTS.map((entry) => repoPath(root, resolve(appRoot, entry)));
+  if (starts.some((entry) => entry == null)) return { blocker: "IMPORT_CLOSURE_INVALID" };
+  const queue = [...starts as string[]]; const seen = new Set<string>();
+  const importPattern = /\b(?:from|import)\s*\(?\s*["']([^"']+)["']/g;
+  while (queue.length) {
+    const source = queue.shift()!; if (seen.has(source)) continue; seen.add(source);
+    let text: string;
+    try { text = readFileSync(resolve(root, source), "utf8"); } catch { return { blocker: "IMPORT_CLOSURE_INVALID" }; }
+    for (const match of text.matchAll(importPattern)) {
+      const resolved = resolveProductionImport(root, appRoot, source, match[1]!);
+      if (resolved === null) return { blocker: "IMPORT_CLOSURE_INVALID" };
+      if (resolved) queue.push(resolved);
+    }
+  }
+  try {
+    return { root, files: [...seen].sort().map((path) => {
+      const contents = readFileSync(resolve(root, path)); const stat = statSync(resolve(root, path));
+      return { path, sha256: sha(contents), size: contents.length, mtimeMs: stat.mtimeMs };
+    }) };
+  } catch { return { blocker: "IMPORT_CLOSURE_INVALID" }; }
+}
+function blobMatches(root: string, commit: string, file: CortexOperatorFile): boolean {
+  const blob = command(root, ["rev-parse", `${commit}:${file.path}`]);
+  const localBlob = command(root, ["hash-object", resolve(root, file.path)]);
+  return blob != null && blob === localBlob;
+}
+function readDeploymentManifest(file: string, root: string, files: readonly CortexOperatorFile[]): CortexOperatorCodeProvenance {
   if (!existsSync(file)) return { status: "DEPLOYMENT_MANIFEST_INVALID", sha: null, source: `manifest:${file}`, files: [] };
   try {
     const raw = JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>;
-    const commit = typeof raw.commitSha === "string" ? raw.commitSha : typeof raw.commitSHA === "string" ? raw.commitSHA : null;
-    const hashes = raw.sourceHashes && typeof raw.sourceHashes === "object" && !Array.isArray(raw.sourceHashes) ? raw.sourceHashes as Record<string, unknown> : null;
-    const files = closureFiles(repoRoot);
-    if (!validSha(commit) || !hashes || !files) return { status: "DEPLOYMENT_MANIFEST_INVALID", sha: null, source: `manifest:${file}`, files: [] };
-    if (files.some((entry) => hashes[entry.path] !== entry.sha256)) return { status: "DEPLOYED_SOURCE_HASH_MISMATCH", sha: commit, source: `manifest:${file}`, files };
+    const commit = typeof raw.commitSha === "string" ? raw.commitSha : null; const entries = raw.files;
+    if (raw.schemaVersion !== "cortex-operator-deployment-manifest/1" || !validSha(commit) || !Array.isArray(entries)) return { status: "DEPLOYMENT_MANIFEST_INVALID", sha: null, source: `manifest:${file}`, files: [] };
+    const expected = new Map(files.map((entry) => [entry.path, entry.sha256])); const actual = new Map<string, string>();
+    for (const entry of entries) {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) return { status: "DEPLOYMENT_MANIFEST_INVALID", sha: null, source: `manifest:${file}`, files: [] };
+      const row = entry as Record<string, unknown>; const path = row.path; const digest = row.sha256;
+      if (typeof path !== "string" || !path || path.startsWith("/") || path.includes("\\") || path.split("/").includes("..") || !/^[a-f0-9]{64}$/i.test(typeof digest === "string" ? digest : "") || actual.has(path)) return { status: "DEPLOYMENT_MANIFEST_INVALID", sha: null, source: `manifest:${file}`, files: [] };
+      actual.set(path, digest as string);
+    }
+    if (actual.size !== expected.size || [...expected].some(([path, digest]) => actual.get(path) !== digest)) return { status: "DEPLOYMENT_MANIFEST_INVALID", sha: null, source: `manifest:${file}`, files: [] };
+    if (files.some((entry) => !blobMatches(root, commit, entry))) return { status: "DEPLOYED_SOURCE_HASH_MISMATCH", sha: commit, source: `manifest:${file}`, files };
     return { status: "VALID", sha: commit, source: `manifest:${file}`, files };
   } catch { return { status: "DEPLOYMENT_MANIFEST_INVALID", sha: null, source: `manifest:${file}`, files: [] }; }
 }
 export function verifyCortexOperatorCodeProvenance(cwd: string, env: NodeJS.ProcessEnv, candidate: { value: string | null; source: string | null }): CortexOperatorCodeProvenance {
-  const repoRoot = resolve(cwd, "../..");
   const manifest = env.DEPLOYMENT_MANIFEST_PATH?.trim();
-  if (manifest) return readDeploymentManifest(resolve(manifest), repoRoot)!;
+  if (!manifest && !validSha(candidate.value)) return { status: "CODE_VERSION_UNRESOLVED", sha: null, source: candidate.source, files: [] };
+  const closure = resolveCortexOperatorSourceClosure(cwd);
+  if ("blocker" in closure) return { status: closure.blocker, sha: null, source: candidate.source, files: [] };
+  const repoRoot = closure.root; const files = closure.files;
+  if (manifest) return readDeploymentManifest(resolve(cwd, manifest), repoRoot, files);
   if (!validSha(candidate.value)) return { status: "CODE_VERSION_UNRESOLVED", sha: null, source: candidate.source, files: [] };
   const resolved = command(repoRoot, ["rev-parse", `${candidate.value}^{commit}`]);
-  const files = closureFiles(repoRoot);
-  if (!resolved || !validSha(resolved) || !files) return { status: "CODE_VERSION_UNRESOLVED", sha: null, source: candidate.source, files: [] };
+  if (!resolved || !validSha(resolved)) return { status: "CODE_VERSION_UNRESOLVED", sha: null, source: candidate.source, files: [] };
   for (const file of files) {
-    const expected = command(repoRoot, ["show", `${resolved}:${file.path}`]);
-    // `git show` text is not sufficient for arbitrary bytes; source closure is TypeScript text,
-    // and Git's blob hash check below independently proves exact byte identity.
-    const blob = command(repoRoot, ["rev-parse", `${resolved}:${file.path}`]);
-    const localBlob = command(repoRoot, ["hash-object", resolve(repoRoot, file.path)]);
-    if (expected == null || blob == null || localBlob !== blob) return { status: "DEPLOYED_SOURCE_HASH_MISMATCH", sha: resolved, source: candidate.source, files };
+    if (!blobMatches(repoRoot, resolved, file)) return { status: "DEPLOYED_SOURCE_HASH_MISMATCH", sha: resolved, source: candidate.source, files };
   }
-  const clean = command(repoRoot, ["status", "--porcelain", "--", ...OPERATOR_SOURCE_CLOSURE]);
+  const clean = command(repoRoot, ["status", "--porcelain", "--", ...files.map((file) => file.path)]);
   if (clean == null || clean !== "") return { status: "GIT_SOURCE_MISMATCH", sha: resolved, source: candidate.source, files };
   return { status: "VALID", sha: resolved, source: candidate.source === "git:HEAD" ? "git:HEAD+closure" : `${candidate.source}+closure`, files };
 }

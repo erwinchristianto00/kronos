@@ -52,6 +52,8 @@ describe("CORTEX shadow-refit operator", () => {
     expect(result.prospective.directEligible).toBe(0);
     expect(result.prospective.beta).toEqual({ evaluationBeta: 0, liveBeta: 0 });
     expect(result.prospective.promotion).toBe("OFF");
+    expect(result.invocation.verifiedCodeVersion).toBe(SHA);
+    expect(result.invocation.verifiedCodeSource).toBe("test:verified");
     expect(result.mutationPlan).toEqual({ writeAuthorized: false, filesToChange: [], persisted: false });
     expect(readdirSync(f.data).sort()).toEqual(before);
     expect(existsSync(join(f.data, "cortex-shadow-refit-candidates.json"))).toBe(false);
