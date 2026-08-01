@@ -41,6 +41,7 @@ import {
   VARIANT_MATRIX_DEFINITIONS,
 } from "../src/lib/current-guard-variant-matrix.js";
 import { REALISTIC_FEE_BPS_PER_SIDE } from "../src/lib/shadow-engine.js";
+import { paperFundingCostR } from "../src/lib/paper-cost-model-v2.js";
 
 // ── fixture ──────────────────────────────────────────────────────────────────
 
@@ -228,7 +229,13 @@ describe("[COST-SYMMETRY] exit-aware + fillMode-aware paper cost model", () => {
       [NEUTRAL, NEUTRAL, NEUTRAL],
     );
     expect(o.closeReason).toBe("MAX_HOLD_MTM");
-    expect(o.costR!).toBeCloseTo(-TAKER_INLINE_MTM_BPS / STOP_BPS, 6); // -15/300
+    // A horizon close is not a stop, so it pays no STOP surcharge. It can still cross real
+    // eight-hour funding settlements; assert that separately instead of accidentally assuming
+    // Date.now()-80h stays inside one settlement interval.
+    expect(o.costR!).toBeCloseTo(
+      -TAKER_INLINE_MTM_BPS / STOP_BPS + paperFundingCostR(STOP_BPS, Date.parse(o.openedAt), o.closedAtMs),
+      6,
+    );
   });
 
   it("F: GUARD — a stop exit must cost strictly MORE than a TP exit on the same geometry", async () => {

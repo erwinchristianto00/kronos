@@ -205,6 +205,28 @@ export interface CortexReadinessReport {
   /** Set when a boundary was configured and REFUSED. Distinguishes "no epoch" (both null) from
    *  "epoch rejected" (this non-null) — identical in the meter, opposite in meaning. */
   learningEpochRejection: CortexReadinessRefitInput["learningEpochRejection"];
+  /** Additive, report-only v1 shadow-refit status. It is optional so the pure readiness formula
+   * remains usable by old tests and callers without reading a candidate registry. */
+  shadowRefit?: {
+    resetEpoch: string | null;
+    totalExamined: number;
+    directLearningEligible: number;
+    rejected: Readonly<Record<string, number>>;
+    datasetHash: string | null;
+    latestStatus: string | null;
+    candidateGenerationId: string | null;
+    incumbentGeneration: 0;
+    perArchetype: readonly {
+      archetype: "BREADTH" | "NEUTRAL" | "TACTICAL";
+      eligible: number;
+      nEff: number;
+      fitStatus: string;
+      coefficientMaxDelta: number;
+      oosVerdict: "VALID" | "BLOCKED";
+    }[];
+    beta: { evaluationBeta: 0; liveBeta: 0 };
+    promotion: "OFF";
+  };
   components: CortexReadinessComponent[];
   beta: {
     evaluationBeta: number;

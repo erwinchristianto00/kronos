@@ -1,0 +1,202 @@
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
+
+import { emptyCortexState } from "../src/lib/cortex-brain.js";
+import {
+  CORTEX_SHADOW_REFIT_DEFAULT_EPOCH,
+  CortexShadowRefitRegistryStore,
+  buildCortexShadowTrainingDataset,
+  compareCortexShadowPrediction,
+  cortexShadowRefitReadiness,
+  runCortexShadowRefit,
+} from "../src/lib/cortex-shadow-refit.js";
+import type { ExecutiveReviewOutcome } from "../src/lib/executive-review-store.js";
+import type { CanonicalPolicyContext, ForwardEvent } from "../src/experience-engine/forward-causal-collection.js";
+
+const epochMs = Date.parse(CORTEX_SHADOW_REFIT_DEFAULT_EPOCH);
+const policy: CanonicalPolicyContext & { instanceId: "3102"; fourBrainPolicyVersion: string } = {
+  instanceId: "3102", decisionPolicyVersion: "decision/v1", executionPolicyVersion: "execution/v1",
+  evidencePolicyVersion: "evidence/v1", evidenceEra: "era/v1", fourBrainPolicyVersion: "four/v1",
+  policyDeploymentAt: CORTEX_SHADOW_REFIT_DEFAULT_EPOCH,
+};
+const dirs: string[] = [];
+const temp = (): string => { const dir = mkdtempSync(join(tmpdir(), "cortex-shadow-refit-")); dirs.push(dir); return dir; };
+afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
+
+function x(index: number): number[] { return [1, index % 2 ? 0.4 : -0.4, 0.1, 0.2, 0.6, 0.1, 0.2, 0, 0, 0.7]; }
+
+function row(index: number, overrides: Partial<ExecutiveReviewOutcome> = {}): { outcome: ExecutiveReviewOutcome; events: ForwardEvent[] } {
+  const decisionTimeMs = epochMs + index * 60_000;
+  const openedTimeMs = decisionTimeMs + 1_000;
+  const closedTimeMs = openedTimeMs + 1_000;
+  const cortexId = `cortex-${index}`;
+  const opportunityId = `opp-${index}`;
+  const outcomeId = `out-${index}`;
+  const allocationSnapshotId = `allocation-${index}`;
+  const identity = {
+    lineageSchemaVersion: "causal-lineage-1" as const, decisionId: `paper-${index}`, opportunityId, outcomeId,
+    instanceId: policy.instanceId, laneId: "CG_WIDE_FAST_LONG", symbolOrBasketId: index % 3 ? "BTCUSDT" : "ETHUSDT", direction: "LONG" as const,
+    featureSchemaVersion: "1", decisionRuleVersion: "rule", attributionRuleVersion: "attr", cortexDecisionId: cortexId,
+    allocationSnapshotId, cortexFeatureSchemaVersion: 1, decisionPolicyVersion: policy.decisionPolicyVersion,
+    executionPolicyVersion: policy.executionPolicyVersion, evidencePolicyVersion: policy.evidencePolicyVersion,
+    evidenceEra: policy.evidenceEra, policyDeploymentAt: policy.policyDeploymentAt,
+  };
+  const outcome = {
+    executiveReviewOutcomeId: `review-out-${index}`, executiveReviewId: `review-${index}`, tier: "TIER_1_REAL",
+    candidateId: `candidate-${index}`, opportunityId, executionIntentId: `intent-${index}`, orderId: `order-${index}`,
+    positionId: `position-${index}`, outcomeId, marketContextSnapshotId: `market-${index}`, allocationSnapshotId,
+    laneId: "CG_WIDE_FAST_LONG", direction: "LONG", marketState: "BULLISH", evidenceEra: policy.evidenceEra,
+    strategyAction: "ENTER", advisoryVerdict: "VALID", incumbentAction: "ENTERED", advisoryOnly: true,
+    entryAtMs: openedTimeMs, resolvedAtMs: closedTimeMs + 1_000, originalRisk: 100, grossR: index % 2 ? 0.32 : -0.18,
+    costR: 0.02, executionCostProvenance: "EXCHANGE_MEASURED", settlementFetchComplete: true,
+    requiredOrderIds: [`order-${index}`], matchedRequiredOrderIds: [`order-${index}`], missingRequiredOrderIds: [],
+    netR: index % 2 ? 0.30 : -0.20, decisionPipelinePolicyVersion: policy.decisionPolicyVersion,
+    executionPolicyVersion: policy.executionPolicyVersion, evidencePolicyVersion: policy.evidencePolicyVersion,
+    fourBrainPolicyVersion: policy.fourBrainPolicyVersion, eligibleForFourBrainEvaluation: true, eligibleForCortexLearning: false,
+    executiveDecisionId: `exec-${index}`, instanceId: policy.instanceId, symbolOrBasketId: identity.symbolOrBasketId,
+    policyDeploymentAt: policy.policyDeploymentAt, executiveDecisionTimeMs: decisionTimeMs,
+    marketStateDecision: { decisionId: `ms-${index}` }, directionDecision: { decisionId: `dir-${index}`, marketDirection: "LONG" },
+    entryDecision: { decisionId: `entry-${index}`, action: "ENTER_NOW", side: "LONG", targetEntry: 100, initialStopPrice: 90 },
+    brainFeatureSnapshot: { cycle: index }, brainFeatureSchemaVersions: { executive: "four/v1" },
+    sourceStatuses: { marketState: { candle: "FRESH" }, direction: { candle: "FRESH" }, entry: { candle: "FRESH" } },
+    entryDecisionId: `entry-${index}`, paperOrderId: `paper-order-${index}`, decidedSide: "LONG", decidedTargetEntry: 100,
+    decidedInitialStop: 90, entryFilledAtMs: openedTimeMs, confirmedEntryFillOrderIds: [`order-${index}`],
+    confirmedEntryTradeIds: [`trade-${index}`], actualEntryPrice: 100, marketClosedAtMs: closedTimeMs,
+    settlementResolvedAtMs: closedTimeMs + 1_000, exactCloseTimeMs: closedTimeMs,
+    ...overrides,
+  } as unknown as ExecutiveReviewOutcome;
+  const events = [
+    {
+      eventType: "DECISION_SNAPSHOT", eventId: `decision-event-${index}`, identity, asOfMs: decisionTimeMs, reportOnly: true,
+      codeVersion: "test", marketState: { regime: "BULLISH", status: "PRESENT" },
+      directionDecision: { direction: "LONG", controllerMode: "LONG" }, entryDecision: { entryPrice: 100, stopLoss: 90, takeProfitLevels: [110], plannedStopDistanceBps: 100 },
+      cortexRecommendation: { status: "MISSING", value: null }, incumbentDecision: { status: "PRESENT", value: "incumbent" },
+      features: { names: [], values: [], availableAtMs: [], sourceStatuses: { candle: "FRESH" } },
+      cortexTraining: { status: "PRESENT", decisionId: cortexId, featureSchemaVersion: 1, featureVector: x(index), regimeFamily: "BULLISH", eligible: true, finalPct: 0, evalFinalPct: 0 },
+      provenance: { originKey: `origin-${index}`, sourceObservationId: `source-${index}`, missingFields: [] },
+    },
+    { eventType: "OPPORTUNITY_OPEN", eventId: `open-event-${index}`, identity, decisionId: identity.decisionId, openedAtMs: openedTimeMs, entryPrice: 100, stopDistance: 10, expectedCostAssumptions: { costR: 0.02, feeSlippageR: 0.02, spreadR: 0 }, provenance: { sourceObservationId: `source-${index}`, originKey: `origin-${index}` }, reportOnly: true },
+    // Forward causal records use signed costR (gross + negative cost = net); Executive Review uses
+    // the canonical positive cost magnitude. Both are exact representations of the same settlement.
+    { eventType: "OUTCOME_RESOLUTION", eventId: `out-event-${index}`, identity, outcomeId, opportunityId, decisionId: identity.decisionId, openedAtMs: openedTimeMs, closedAtMs: closedTimeMs, resolvedAtMs: closedTimeMs + 1_000, grossR: outcome.grossR, costR: -outcome.costR, netR: outcome.netR, exitReason: "TP", intrabarAmbiguous: false, outcomeQuality: "RESOLVED_VALID", directAttribution: "DIRECT_CAUSAL_LINK", reportOnly: true },
+  ] as unknown as ForwardEvent[];
+  return { outcome, events };
+}
+
+function dataset(count = 1, mutate?: (outcome: ExecutiveReviewOutcome, events: ForwardEvent[]) => void) {
+  const rows = Array.from({ length: count }, (_, index) => row(index + 1));
+  for (const item of rows) mutate?.(item.outcome, item.events);
+  return { outcomes: rows.map((item) => item.outcome), forwardEvents: rows.flatMap((item) => item.events) };
+}
+function build(count = 1, mutate?: (outcome: ExecutiveReviewOutcome, events: ForwardEvent[]) => void) {
+  const input = dataset(count, mutate);
+  return buildCortexShadowTrainingDataset({ ...input, policy, nowMs: epochMs + 99_999_999 });
+}
+
+describe("CORTEX shadow refit learner v1", () => {
+  it("keeps pre-reset, Tier-2, evaluation-only, incomplete, unknown, duplicate, stale, and missing-feature records out", () => {
+    const pre = row(1, { executiveDecisionTimeMs: epochMs - 1 });
+    const tier2 = row(2, { tier: "TIER_2_COUNTERFACTUAL" });
+    const missingFeature = row(3); (missingFeature.events[0] as any).cortexTraining.featureVector = null;
+    const incomplete = row(4, { missingRequiredOrderIds: ["order-4"] as [] });
+    const unknown = row(5); (unknown.events[0] as any).cortexTraining.regimeFamily = "UNKNOWN_CONTEXT";
+    const stale = row(6, { evidencePolicyVersion: "old" });
+    const valid = row(7);
+    const result = buildCortexShadowTrainingDataset({ outcomes: [pre.outcome, tier2.outcome, missingFeature.outcome, incomplete.outcome, unknown.outcome, stale.outcome, valid.outcome, valid.outcome], forwardEvents: [...pre.events, ...tier2.events, ...missingFeature.events, ...incomplete.events, ...unknown.events, ...stale.events, ...valid.events], policy, nowMs: epochMs + 99_999_999 });
+    expect(result.examples).toHaveLength(1);
+    expect(result.archivedPreEpoch).toBe(1);
+    expect(result.rejected.PRE_RESET_EPOCH).toBe(1);
+    expect(result.rejected.FOUR_BRAIN_NOT_DIRECT).toBeGreaterThanOrEqual(2);
+    expect(result.rejected.INVALID_OR_INCOMPLETE_COST).toBe(1);
+    expect(result.rejected.UNKNOWN_CONTEXT).toBe(1);
+    expect(result.rejected.DUPLICATE_OUTCOME).toBe(1);
+  });
+
+  it("fails closed with separate stable reasons for a missing or incompatible CORTEX feature schema", () => {
+    const missing = build(1, (_outcome, events) => { (events[0] as any).cortexTraining.featureVector = null; });
+    const incompatible = build(1, (_outcome, events) => { (events[0] as any).cortexTraining.featureSchemaVersion = 99; });
+    expect(missing.examples).toHaveLength(0);
+    expect(missing.rejected.MISSING_EXACT_CORTEX_SNAPSHOT).toBe(1);
+    expect(incompatible.examples).toHaveLength(0);
+    expect(incompatible.rejected.FEATURE_SCHEMA_MISMATCH).toBe(1);
+  });
+
+  it("is deterministic, hashes exact examples, and uses the original event-time snapshot", () => {
+    const first = build(3); const second = build(3);
+    expect(first.datasetHash).toBe(second.datasetHash);
+    expect(first.examples).toEqual(second.examples);
+    expect(first.examples[0]!.x).toEqual(x(1));
+    expect(first.examples[0]!.decisionTimeMs).toBeLessThan(first.examples[0]!.openedTimeMs);
+  });
+
+  it("returns a healthy no-refit audit for an empty fresh epoch with both betas exactly zero", () => {
+    const dir = temp(); const registry = new CortexShadowRefitRegistryStore(join(dir, "registry.json"));
+    const report = runCortexShadowRefit({ ...dataset(0), policy, incumbent: emptyCortexState(), registry, nowMs: epochMs + 1 });
+    expect(report.status).toBe("NO_REFIT");
+    expect(report.beta).toEqual({ evaluationBeta: 0, liveBeta: 0 });
+    expect(cortexShadowRefitReadiness(registry.get()).directLearningEligible).toBe(0);
+  });
+
+  it("persists a candidate atomically, never changes incumbent, and is idempotent for the same data", () => {
+    const dir = temp(); const registry = new CortexShadowRefitRegistryStore(join(dir, "registry.json"));
+    const incumbent = emptyCortexState(); const before = JSON.stringify(incumbent);
+    const input = dataset(44);
+    const first = runCortexShadowRefit({ ...input, policy, incumbent, registry, nowMs: epochMs + 200_000_000, codeVersion: "test" });
+    expect(first.status).toBe("CANDIDATE_CREATED");
+    expect(registry.get().candidates).toHaveLength(1);
+    expect(JSON.stringify(incumbent)).toBe(before);
+    const second = runCortexShadowRefit({ ...input, policy, incumbent, registry, nowMs: epochMs + 200_000_000, codeVersion: "test" });
+    expect(second.status).toBe("NO_NEW_ELIGIBLE_DATA");
+    expect(registry.get().candidates).toHaveLength(1);
+    expect(JSON.parse(readFileSync(join(dir, "registry.json"), "utf8")).candidates).toHaveLength(1);
+  });
+
+  it("creates a new candidate only when eligible data changes and rejects corrupted stored registry", () => {
+    const dir = temp(); const file = join(dir, "registry.json"); const registry = new CortexShadowRefitRegistryStore(file);
+    const first = dataset(44); const incumbent = emptyCortexState();
+    runCortexShadowRefit({ ...first, policy, incumbent, registry, nowMs: epochMs + 200_000_000 });
+    const second = dataset(45);
+    runCortexShadowRefit({ ...second, policy, incumbent, registry, nowMs: epochMs + 210_000_000 });
+    expect(registry.get().candidates).toHaveLength(2);
+    writeFileSync(file, "{not-json");
+    expect(new CortexShadowRefitRegistryStore(file).get().candidates).toEqual([]);
+  });
+
+  it("uses purged chronological OOS folds without opportunity overlap or future training", () => {
+    const dir = temp(); const registry = new CortexShadowRefitRegistryStore(join(dir, "registry.json"));
+    const report = runCortexShadowRefit({ ...dataset(44), policy, incumbent: emptyCortexState(), registry, nowMs: epochMs + 200_000_000 });
+    const folds = report.candidate!.archetypes[0]!.folds;
+    expect(folds).toHaveLength(3);
+    for (const fold of folds) {
+      expect(fold.trainEndMs).toBeLessThan(fold.oosStartMs!);
+      expect(fold.trainN).toBeGreaterThanOrEqual(20);
+      expect(fold.oosN).toBeGreaterThanOrEqual(8);
+    }
+  });
+
+  it("fails closed for insufficient effective evidence instead of inventing zero coefficients", () => {
+    const dir = temp(); const registry = new CortexShadowRefitRegistryStore(join(dir, "registry.json"));
+    const report = runCortexShadowRefit({ ...dataset(4), policy, incumbent: emptyCortexState(), registry, nowMs: epochMs + 200_000_000 });
+    expect(report.status).toBe("NO_REFIT");
+    expect(report.candidate!.archetypes[0]!.fitStatus).toBe("INSUFFICIENT_DATA");
+    expect(report.candidate!.archetypes[0]!.coefficients).toEqual(emptyCortexState().archetypes.BREADTH.w);
+  });
+
+  it("keeps an extreme target bounded by the robust fit movement cap", () => {
+    const input = dataset(44);
+    input.outcomes[43] = { ...input.outcomes[43]!, grossR: 100, netR: 99.98 };
+    const dir = temp(); const registry = new CortexShadowRefitRegistryStore(join(dir, "registry.json"));
+    const report = runCortexShadowRefit({ ...input, policy, incumbent: emptyCortexState(), registry, nowMs: epochMs + 200_000_000 });
+    const breadth = report.candidate!.archetypes[0]!;
+    expect(breadth.coefficientMaxDelta).toBeLessThanOrEqual(8);
+    expect(breadth.coefficients.every(Number.isFinite)).toBe(true);
+  });
+
+  it("reports comparison only and keeps scheduler/promotion/authority off", () => {
+    const comparison = compareCortexShadowPrediction({ x: [1, 2], incumbent: [0, 0], candidate: [0.1, 0.2], context: "BULLISH" });
+    expect(comparison).toMatchObject({ reportOnly: true, incumbentPrediction: 0, candidatePrediction: 0.5, decisionDelta: 0.5 });
+    expect(process.env.CORTEX_SHADOW_REFIT_SCHEDULER_ENABLED).not.toBe("1");
+  });
+});

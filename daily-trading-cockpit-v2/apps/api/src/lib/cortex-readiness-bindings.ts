@@ -42,6 +42,11 @@ import {
   type CortexReadinessReport,
 } from "./cortex-readiness.js";
 import { diagnoseCortexInstance, type CortexInstanceDiagnosis } from "./cortex-instance-diagnosis.js";
+import {
+  CortexShadowRefitRegistryStore,
+  cortexShadowRefitReadiness,
+  cortexShadowRefitRegistryPath,
+} from "./cortex-shadow-refit.js";
 
 const PEER_FETCH_TIMEOUT_MS = 3_000;
 
@@ -145,7 +150,7 @@ export function buildLocalCortexReadiness(deps: {
     : null;
 
   const historyStore = deps.historyStore ?? getCortexReadinessHistoryStore(dataDir);
-  const report = computeCortexReadiness({
+  const baseReport = computeCortexReadiness({
     brain,
     refit,
     collection,
@@ -155,6 +160,13 @@ export function buildLocalCortexReadiness(deps: {
     retiredLaneCount: cortexRetiredLaneIds().size,
     nowMs,
   });
+
+  // Candidate state is read-only here. No API poll can run a refit, mutate an incumbent, or enable a
+  // scheduler; a manual caller must invoke runCortexShadowRefit explicitly.
+  const report: CortexReadinessReport = {
+    ...baseReport,
+    shadowRefit: cortexShadowRefitReadiness(new CortexShadowRefitRegistryStore(cortexShadowRefitRegistryPath(dataDir)).get()),
+  };
 
   // Upsert today's snapshot AFTER computing (the rate basis only ever uses previous days' snapshots,
   // so recording order can't feed today's value back into today's rate).
