@@ -215,7 +215,9 @@ export interface CortexReadinessReport {
     datasetHash: string | null;
     latestStatus: string | null;
     candidateGenerationId: string | null;
-    incumbentGeneration: 0;
+    incumbentGeneration: number | null;
+    registryIntegrity: "HEALTHY" | "REGISTRY_CORRUPTED";
+    registryIntegrityError: string | null;
     perArchetype: readonly {
       archetype: "BREADTH" | "NEUTRAL" | "TACTICAL";
       eligible: number;

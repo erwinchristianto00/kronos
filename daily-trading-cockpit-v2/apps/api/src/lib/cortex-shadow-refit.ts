@@ -7,7 +7,7 @@
  * allocator, execution engine, or mutable incumbent CORTEX store.
  */
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 
 import {
@@ -29,7 +29,7 @@ import {
 } from "../experience-engine/cortex-experience-bridge.js";
 import type { CanonicalPolicyContext, ForwardEvent } from "../experience-engine/forward-causal-collection.js";
 
-export const CORTEX_SHADOW_REFIT_SCHEMA_VERSION = "cortex-shadow-refit/1" as const;
+export const CORTEX_SHADOW_REFIT_SCHEMA_VERSION = "cortex-shadow-refit/2" as const;
 export const CORTEX_SHADOW_REFIT_DEFAULT_EPOCH = "2026-08-01T07:19:35.000Z";
 export const CORTEX_SHADOW_REFIT_REGISTRY_FILE = "cortex-shadow-refit-candidates.json";
 export const CORTEX_SHADOW_REFIT_SCHEDULER_ENV = "CORTEX_SHADOW_REFIT_SCHEDULER_ENABLED";
@@ -45,6 +45,7 @@ export const CORTEX_SHADOW_REFIT_HYPERPARAMETERS = {
   folds: 3,
   purgeMs: 0,
 } as const;
+export type CortexShadowRefitHyperparameters = typeof CORTEX_SHADOW_REFIT_HYPERPARAMETERS;
 
 export type CortexShadowRejectionReason =
   | "DUPLICATE_OUTCOME"
@@ -56,7 +57,10 @@ export type CortexShadowRejectionReason =
   | "UNKNOWN_CONTEXT"
   | "LINEAGE_MISMATCH"
   | "INVALID_OR_INCOMPLETE_COST"
-  | "INVALID_IMMUTABLE_RISK";
+  | "INVALID_IMMUTABLE_RISK"
+  | "CORTEX_SNAPSHOT_VECTOR_MISMATCH"
+  | "CORTEX_DECISION_IDENTITY_MISMATCH"
+  | "CORTEX_POLICY_LINEAGE_MISMATCH";
 
 export type CortexShadowRunStatus = "CANDIDATE_CREATED" | "NO_NEW_ELIGIBLE_DATA" | "NO_REFIT" | "BLOCKED";
 
@@ -110,10 +114,26 @@ export interface CortexShadowFoldResult {
   readonly oosEndMs: number | null;
   readonly trainN: number;
   readonly oosN: number;
+  /** Exact expanding-window membership, persisted to prove no held-out row trained its own fold. */
+  readonly trainExampleIds: readonly string[];
+  /** Exact held-out rows only. Aggregate OOS is built exclusively from these immutable snapshots. */
+  readonly heldOut: readonly CortexShadowHeldOutPrediction[];
   readonly fitStatus: CortexEconomicFit["status"] | "NO_FOLD";
   readonly candidate: CortexShadowMetrics;
   readonly incumbent: CortexShadowMetrics;
   readonly expectedEconomicDeltaR: number | null;
+}
+
+export interface CortexShadowHeldOutPrediction {
+  readonly exampleId: string;
+  readonly opportunityId: string;
+  readonly decisionTimeMs: number;
+  readonly resolvedTimeMs: number;
+  readonly netR: number;
+  readonly regimeFamily: string;
+  readonly symbolOrBasketId: string;
+  readonly candidatePrediction: number | null;
+  readonly incumbentPrediction: number | null;
 }
 
 export interface CortexShadowArchetypeCandidate {
@@ -134,7 +154,10 @@ export interface CortexShadowArchetypeCandidate {
 
 export interface CortexShadowCandidateGeneration {
   readonly generationId: string;
-  readonly parentIncumbentGeneration: 0;
+  readonly generationFingerprint: string;
+  readonly integrityHash: string;
+  readonly parentIncumbentGeneration: number;
+  readonly incumbentCoefficientFingerprint: string;
   readonly createdAt: string;
   readonly resetEpoch: string;
   readonly trainingCutoffMs: number;
@@ -142,7 +165,7 @@ export interface CortexShadowCandidateGeneration {
   readonly datasetHash: string;
   readonly exampleIds: readonly string[];
   readonly sourceLineage: CortexShadowDataset["sourceLineage"];
-  readonly hyperparameters: typeof CORTEX_SHADOW_REFIT_HYPERPARAMETERS;
+  readonly hyperparameters: CortexShadowRefitHyperparameters;
   readonly archetypes: readonly CortexShadowArchetypeCandidate[];
   readonly shadowReady: false;
   readonly blockers: readonly string[];
@@ -152,8 +175,11 @@ export interface CortexShadowCandidateGeneration {
 
 export interface CortexShadowRefitRegistry {
   readonly schemaVersion: typeof CORTEX_SHADOW_REFIT_SCHEMA_VERSION;
+  readonly integrityStatus: "HEALTHY" | "REGISTRY_CORRUPTED";
+  readonly integrityError: string | null;
   readonly candidates: readonly CortexShadowCandidateGeneration[];
   readonly lastDatasetHash: string | null;
+  readonly lastGenerationFingerprint: string | null;
   readonly lastAudit: CortexShadowRunReport | null;
 }
 
@@ -179,6 +205,9 @@ const emptyRejections = (): Record<CortexShadowRejectionReason, number> => ({
   LINEAGE_MISMATCH: 0,
   INVALID_OR_INCOMPLETE_COST: 0,
   INVALID_IMMUTABLE_RISK: 0,
+  CORTEX_SNAPSHOT_VECTOR_MISMATCH: 0,
+  CORTEX_DECISION_IDENTITY_MISMATCH: 0,
+  CORTEX_POLICY_LINEAGE_MISMATCH: 0,
 });
 
 const finite = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value);
@@ -194,6 +223,69 @@ function fourBrainDirectOutcomeIds(outcomes: readonly ExecutiveReviewOutcome[], 
     byOutcome.set(row.outcomeId, set);
   }
   return new Set([...byOutcome].filter(([, brains]) => brains.has("MARKET_STATE") && brains.has("DIRECTION") && brains.has("ENTRY")).map(([id]) => id));
+}
+
+const equalVector = (left: readonly number[], right: readonly number[]): boolean =>
+  left.length === right.length && left.every((value, index) => Object.is(value, right[index]));
+
+type ForwardDecision = Extract<ForwardEvent, { eventType: "DECISION_SNAPSHOT" }>;
+type ForwardOpen = Extract<ForwardEvent, { eventType: "OPPORTUNITY_OPEN" }>;
+type ForwardOutcome = Extract<ForwardEvent, { eventType: "OUTCOME_RESOLUTION" }>;
+
+/** Every identity comparison is exact. This is intentionally stricter than the bridge: the bridge
+ * proves its own causal chain, while this boundary proves that Executive Review, the raw decision
+ * snapshot, the bridge representation, and the reconstructed lane slice are the SAME decision. */
+function snapshotConsistencyReason(input: {
+  outcome: ExecutiveReviewOutcome;
+  experience: CortexExperienceBridgeResult["experiences"][number] | undefined;
+  decision: CortexExperienceBridgeResult["decisions"][number] | undefined;
+  forwardDecision: ForwardDecision | undefined;
+  forwardOpen: ForwardOpen | undefined;
+  forwardOutcome: ForwardOutcome | undefined;
+  policy: CanonicalPolicyContext & { instanceId: "3101" | "3102"; fourBrainPolicyVersion: string };
+}): CortexShadowRejectionReason | null {
+  const { outcome, experience, decision, forwardDecision, forwardOpen, forwardOutcome, policy } = input;
+  if (!forwardDecision || !forwardOpen || !forwardOutcome) return "FORWARD_CAUSAL_INELIGIBLE";
+  const identities = [forwardDecision.identity, forwardOpen.identity, forwardOutcome.identity];
+  const policyMatches = identities.every((identity) =>
+    identity.instanceId === policy.instanceId &&
+    identity.decisionPolicyVersion === policy.decisionPolicyVersion &&
+    identity.executionPolicyVersion === policy.executionPolicyVersion &&
+    identity.evidencePolicyVersion === policy.evidencePolicyVersion &&
+    identity.evidenceEra === policy.evidenceEra &&
+    identity.policyDeploymentAt === policy.policyDeploymentAt,
+  ) && outcome.instanceId === policy.instanceId &&
+    outcome.decisionPipelinePolicyVersion === policy.decisionPolicyVersion &&
+    outcome.executionPolicyVersion === policy.executionPolicyVersion &&
+    outcome.evidencePolicyVersion === policy.evidencePolicyVersion &&
+    outcome.evidenceEra === policy.evidenceEra &&
+    outcome.fourBrainPolicyVersion === policy.fourBrainPolicyVersion &&
+    outcome.policyDeploymentAt === policy.policyDeploymentAt;
+  if (!policyMatches) return "CORTEX_POLICY_LINEAGE_MISMATCH";
+  if (!experience || !decision) return "FORWARD_CAUSAL_INELIGIBLE";
+  const symbol = outcome.symbolOrBasketId;
+  const identityMatches = !!symbol && identities.every((identity) =>
+    identity.opportunityId === outcome.opportunityId && identity.outcomeId === outcome.outcomeId &&
+    identity.laneId === outcome.laneId && identity.symbolOrBasketId === symbol &&
+    identity.direction === outcome.direction && identity.allocationSnapshotId === outcome.allocationSnapshotId,
+  ) && forwardDecision.identity.cortexDecisionId === forwardDecision.cortexTraining.decisionId &&
+    forwardDecision.identity.cortexFeatureSchemaVersion === forwardDecision.cortexTraining.featureSchemaVersion &&
+    forwardDecision.asOfMs === outcome.executiveDecisionTimeMs &&
+    forwardOpen.decisionId === forwardDecision.identity.decisionId && forwardOutcome.decisionId === forwardDecision.identity.decisionId &&
+    forwardOutcome.opportunityId === outcome.opportunityId && forwardOutcome.outcomeId === outcome.outcomeId &&
+    experience.decisionId === forwardDecision.cortexTraining.decisionId && experience.opportunityId === outcome.opportunityId &&
+    experience.outcomeId === outcome.outcomeId && experience.laneId === outcome.laneId &&
+    experience.symbolOrBasketId === symbol && experience.direction === outcome.direction &&
+    decision.decisionId === forwardDecision.cortexTraining.decisionId;
+  if (!identityMatches) return "CORTEX_DECISION_IDENTITY_MISMATCH";
+  const lane = decision.lanes.get(outcome.laneId);
+  const raw = forwardDecision.cortexTraining;
+  if (!lane || lane.direction !== outcome.direction || raw.featureSchemaVersion !== decision.featureSchemaVersion ||
+    experience.featureSchemaVersion !== String(raw.featureSchemaVersion) || !raw.featureVector || !experience.featureVector ||
+    !equalVector(raw.featureVector, experience.featureVector) || !equalVector(raw.featureVector, lane.x)) {
+    return "CORTEX_SNAPSHOT_VECTOR_MISMATCH";
+  }
+  return null;
 }
 
 /** Canonical strict builder. It is intentionally an intersection, never a merge: the Four-Brain
@@ -221,10 +313,16 @@ export function buildCortexShadowTrainingDataset(input: {
   }, input.nowMs);
   const bridge: CortexExperienceBridgeResult = buildCortexExperienceBridge(input.forwardEvents, input.policy);
   const bridgeByOutcome = new Map(bridge.experiences.map((row) => [row.outcomeId, row]));
-  const decisionByCortexId = new Map(bridge.decisions.map((row) => [row.decisionId ?? "", row]));
+  const decisionByCortexLane = new Map(bridge.decisions.map((row) => [`${row.decisionId ?? ""}\u001f${[...row.lanes.keys()][0] ?? ""}`, row]));
   const forwardDecisionByAllocation = new Map(input.forwardEvents
     .filter((event): event is Extract<ForwardEvent, { eventType: "DECISION_SNAPSHOT" }> => event.eventType === "DECISION_SNAPSHOT")
     .map((event) => [event.identity.allocationSnapshotId ?? "", event]));
+  const forwardOpenByOpportunity = new Map(input.forwardEvents
+    .filter((event): event is ForwardOpen => event.eventType === "OPPORTUNITY_OPEN")
+    .map((event) => [event.identity.opportunityId, event]));
+  const forwardOutcomeByOutcome = new Map(input.forwardEvents
+    .filter((event): event is ForwardOutcome => event.eventType === "OUTCOME_RESOLUTION")
+    .map((event) => [event.outcomeId, event]));
   const seen = new Set<string>();
   let archivedPreEpoch = 0;
   const examples: CortexShadowTrainingExample[] = [];
@@ -242,7 +340,9 @@ export function buildCortexShadowTrainingDataset(input: {
     if (!directOutcomeIds.has(outcome.outcomeId)) { rejected.FOUR_BRAIN_NOT_DIRECT += 1; continue; }
     const experience = bridgeByOutcome.get(outcome.outcomeId);
     const forwardDecision = outcome.allocationSnapshotId ? forwardDecisionByAllocation.get(outcome.allocationSnapshotId) : undefined;
-    const decision = forwardDecision?.cortexTraining.decisionId ? decisionByCortexId.get(forwardDecision.cortexTraining.decisionId) : undefined;
+    const decision = forwardDecision?.cortexTraining.decisionId
+      ? decisionByCortexLane.get(`${forwardDecision.cortexTraining.decisionId}\u001f${outcome.laneId}`)
+      : undefined;
     const rawSnapshot = forwardDecision?.cortexTraining;
     if (!rawSnapshot || rawSnapshot.status !== "PRESENT" || !rawSnapshot.featureVector) {
       rejected.MISSING_EXACT_CORTEX_SNAPSHOT += 1; continue;
@@ -253,14 +353,15 @@ export function buildCortexShadowTrainingDataset(input: {
     if (!rawSnapshot.regimeFamily || rawSnapshot.regimeFamily.trim().toUpperCase() === "UNKNOWN" || rawSnapshot.regimeFamily.trim().toUpperCase() === "UNKNOWN_CONTEXT") {
       rejected.UNKNOWN_CONTEXT += 1; continue;
     }
-    if (
-      !experience || !decision || !forwardDecision || !experience.decisionId ||
-      forwardDecision.identity.allocationSnapshotId !== outcome.allocationSnapshotId ||
-      forwardDecision.asOfMs !== outcome.executiveDecisionTimeMs ||
-      experience.opportunityId !== outcome.opportunityId || experience.laneId !== outcome.laneId
-    ) {
-      rejected.FORWARD_CAUSAL_INELIGIBLE += 1; continue;
-    }
+    const consistency = snapshotConsistencyReason({
+      outcome, experience, decision, forwardDecision,
+      forwardOpen: forwardOpenByOpportunity.get(outcome.opportunityId),
+      forwardOutcome: forwardOutcomeByOutcome.get(outcome.outcomeId), policy: input.policy,
+    });
+    if (consistency) { rejected[consistency] += 1; continue; }
+    // snapshotConsistencyReason has just proven these exact representations exist; repeat the
+    // guard so TypeScript also retains that fact rather than allowing an accidental future access.
+    if (!experience || !experience.decisionId || !decision || !forwardDecision) { rejected.FORWARD_CAUSAL_INELIGIBLE += 1; continue; }
     if (!experience.featureVector || experience.featureSchemaVersion !== String(CORTEX_FEATURE_SCHEMA_VERSION)) { rejected.MISSING_EXACT_CORTEX_SNAPSHOT += 1; continue; }
     if (experience.featureVector.length !== CORTEX_FEATURE_DIM || !experience.featureVector.every(finite)) { rejected.FEATURE_SCHEMA_MISMATCH += 1; continue; }
     const lane = decision.lanes.get(outcome.laneId);
@@ -274,7 +375,7 @@ export function buildCortexShadowTrainingDataset(input: {
       opportunityId: outcome.opportunityId,
       outcomeId: outcome.outcomeId,
       laneId: outcome.laneId,
-      symbolOrBasketId: outcome.symbolOrBasketId ?? "",
+      symbolOrBasketId: outcome.symbolOrBasketId!,
       direction: outcome.direction,
       archetype: cortexArchetypeForLane(outcome.laneId),
       regimeFamily,
@@ -346,54 +447,113 @@ function meanPredictionDelta(rows: readonly CortexShadowTrainingExample[], candi
   return total / rows.length;
 }
 
-function fitArchetype(rows: readonly CortexShadowTrainingExample[], prior: readonly number[], nowMs: number): { fit: CortexEconomicFit; folds: CortexShadowFoldResult[]; blockers: string[]; cautions: string[] } {
+function predict(coefficients: readonly number[], x: readonly number[]): number | null {
+  if (coefficients.length !== x.length || !coefficients.every(finite) || !x.every(finite)) return null;
+  const value = x.reduce((sum, feature, index) => sum + feature * coefficients[index]!, 0);
+  return finite(value) ? value : null;
+}
+
+function metricsFromHeldOut(
+  heldOut: readonly CortexShadowHeldOutPrediction[],
+  kind: "candidate" | "incumbent",
+): CortexShadowMetrics {
+  const rows: CortexShadowTrainingExample[] = heldOut.map((row) => ({
+    exampleId: row.exampleId, decisionId: row.exampleId, opportunityId: row.opportunityId, outcomeId: row.exampleId,
+    laneId: "held-out", symbolOrBasketId: row.symbolOrBasketId, direction: "LONG", archetype: "BREADTH",
+    regimeFamily: row.regimeFamily, decisionTimeMs: row.decisionTimeMs, openedTimeMs: row.decisionTimeMs,
+    closedTimeMs: row.resolvedTimeMs, resolvedTimeMs: row.resolvedTimeMs, x: [], netR: row.netR, policyDeploymentAt: "held-out",
+  }));
+  const base = metrics(rows, null);
+  const errors = heldOut.flatMap((row) => {
+    const prediction = kind === "candidate" ? row.candidatePrediction : row.incumbentPrediction;
+    return prediction == null ? [] : [Math.abs(prediction - row.netR)];
+  });
+  return { ...base, calibrationMae: errors.length ? errors.reduce((sum, value) => sum + value, 0) / errors.length : null };
+}
+
+function heldOutDelta(heldOut: readonly CortexShadowHeldOutPrediction[]): number | null {
+  if (!heldOut.length || heldOut.some((row) => row.candidatePrediction == null || row.incumbentPrediction == null)) return null;
+  return heldOut.reduce((sum, row) => sum + row.candidatePrediction! - row.incumbentPrediction!, 0) / heldOut.length;
+}
+
+function fitArchetype(
+  rows: readonly CortexShadowTrainingExample[], prior: readonly number[], nowMs: number,
+  hyperparameters: CortexShadowRefitHyperparameters,
+): { fit: CortexEconomicFit; folds: CortexShadowFoldResult[]; blockers: string[]; cautions: string[] } {
   const ordered = sorted(rows, (a, b) => a.resolvedTimeMs - b.resolvedTimeMs || a.exampleId.localeCompare(b.exampleId));
-  const fullFit = refitCortexEconomicModel(ordered.map((row) => ({ x: [...row.x], realizedNetR: row.netR, tMs: row.resolvedTimeMs, schemaVersion: CORTEX_FEATURE_SCHEMA_VERSION })), [...prior], { nowMs, ...CORTEX_SHADOW_REFIT_HYPERPARAMETERS });
+  const fullFit = refitCortexEconomicModel(ordered.map((row) => ({ x: [...row.x], realizedNetR: row.netR, tMs: row.resolvedTimeMs, schemaVersion: CORTEX_FEATURE_SCHEMA_VERSION })), [...prior], { nowMs, ...hyperparameters });
   const folds: CortexShadowFoldResult[] = [];
   const blockers: string[] = [];
   const cautions: string[] = [];
-  if (ordered.length < CORTEX_SHADOW_REFIT_HYPERPARAMETERS.minTrainExamples + CORTEX_SHADOW_REFIT_HYPERPARAMETERS.minOosExamples) blockers.push("INSUFFICIENT_CHRONOLOGICAL_OOS_DATA");
-  const foldSize = Math.floor((ordered.length - CORTEX_SHADOW_REFIT_HYPERPARAMETERS.minTrainExamples) / CORTEX_SHADOW_REFIT_HYPERPARAMETERS.folds);
-  if (foldSize < CORTEX_SHADOW_REFIT_HYPERPARAMETERS.minOosExamples) blockers.push("OOS_FOLDS_BELOW_MINIMUM");
-  else for (let fold = 0; fold < CORTEX_SHADOW_REFIT_HYPERPARAMETERS.folds; fold += 1) {
-    const trainEnd = CORTEX_SHADOW_REFIT_HYPERPARAMETERS.minTrainExamples + fold * foldSize;
+  if (ordered.length < hyperparameters.minTrainExamples + hyperparameters.minOosExamples) blockers.push("INSUFFICIENT_CHRONOLOGICAL_OOS_DATA");
+  const foldSize = Math.floor((ordered.length - hyperparameters.minTrainExamples) / hyperparameters.folds);
+  if (foldSize < hyperparameters.minOosExamples) blockers.push("OOS_FOLDS_BELOW_MINIMUM");
+  else for (let fold = 0; fold < hyperparameters.folds; fold += 1) {
+    const trainEnd = hyperparameters.minTrainExamples + fold * foldSize;
     const train = ordered.slice(0, trainEnd);
     const oos = ordered.slice(trainEnd, Math.min(ordered.length, trainEnd + foldSize));
     const opportunities = new Set(train.map((row) => row.opportunityId));
-    const safeOos = oos.filter((row) => !opportunities.has(row.opportunityId) && row.decisionTimeMs > (train.at(-1)?.resolvedTimeMs ?? -Infinity));
-    const fit = refitCortexEconomicModel(train.map((row) => ({ x: [...row.x], realizedNetR: row.netR, tMs: row.resolvedTimeMs, schemaVersion: CORTEX_FEATURE_SCHEMA_VERSION })), [...prior], { nowMs: safeOos.at(-1)?.resolvedTimeMs ?? nowMs, ...CORTEX_SHADOW_REFIT_HYPERPARAMETERS });
-    const candidate = metrics(safeOos, fit.status === "ACCEPTED" ? fit.coefficients : null);
-    const incumbent = metrics(safeOos, prior);
-    const expectedEconomicDeltaR = fit.status === "ACCEPTED" ? meanPredictionDelta(safeOos, fit.coefficients, prior) : null;
+    const purgeBoundaryMs = (train.at(-1)?.resolvedTimeMs ?? -Infinity) + hyperparameters.purgeMs;
+    const safeOos = oos.filter((row) => !opportunities.has(row.opportunityId) && row.decisionTimeMs > purgeBoundaryMs);
+    const fit = refitCortexEconomicModel(train.map((row) => ({ x: [...row.x], realizedNetR: row.netR, tMs: row.resolvedTimeMs, schemaVersion: CORTEX_FEATURE_SCHEMA_VERSION })), [...prior], { nowMs: safeOos.at(-1)?.resolvedTimeMs ?? nowMs, ...hyperparameters });
+    const heldOut = safeOos.map((row) => ({
+      exampleId: row.exampleId, opportunityId: row.opportunityId, decisionTimeMs: row.decisionTimeMs,
+      resolvedTimeMs: row.resolvedTimeMs, netR: row.netR, regimeFamily: row.regimeFamily, symbolOrBasketId: row.symbolOrBasketId,
+      candidatePrediction: fit.status === "ACCEPTED" ? predict(fit.coefficients, row.x) : null,
+      incumbentPrediction: predict(prior, row.x),
+    }));
+    const candidate = metricsFromHeldOut(heldOut, "candidate");
+    const incumbent = metricsFromHeldOut(heldOut, "incumbent");
+    const expectedEconomicDeltaR = heldOutDelta(heldOut);
     folds.push({
       fold: fold + 1,
       trainStartMs: train[0]?.decisionTimeMs ?? null, trainEndMs: train.at(-1)?.resolvedTimeMs ?? null,
       oosStartMs: safeOos[0]?.decisionTimeMs ?? null, oosEndMs: safeOos.at(-1)?.resolvedTimeMs ?? null,
-      trainN: train.length, oosN: safeOos.length, fitStatus: fit.status,
+      trainN: train.length, oosN: safeOos.length, trainExampleIds: train.map((row) => row.exampleId), heldOut, fitStatus: fit.status,
       candidate, incumbent, expectedEconomicDeltaR,
     });
   }
   if (fullFit.status !== "ACCEPTED") blockers.push(`FIT_${fullFit.status}`);
-  if (folds.some((fold) => fold.fitStatus !== "ACCEPTED" || fold.oosN < CORTEX_SHADOW_REFIT_HYPERPARAMETERS.minOosExamples)) blockers.push("INVALID_OOS_FOLD");
+  if (folds.some((fold) => fold.fitStatus !== "ACCEPTED" || fold.oosN < hyperparameters.minOosExamples)) blockers.push("INVALID_OOS_FOLD");
   if (metrics(ordered, null).symbolConcentrationPct != null && metrics(ordered, null).symbolConcentrationPct! > 60) cautions.push("SYMBOL_CONCENTRATION_ABOVE_60_PCT");
   return { fit: fullFit, folds, blockers: [...new Set(blockers)], cautions };
 }
 
 function emptyMetrics(): CortexShadowMetrics { return metrics([], null); }
 
-function candidateForDataset(dataset: CortexShadowDataset, incumbent: CortexStoreState, nowMs: number, codeVersion: string): CortexShadowCandidateGeneration {
+function incumbentFingerprint(incumbent: CortexStoreState): string {
+  return hash({ featureSchemaVersion: incumbent.featureSchemaVersion, archetypes: ARCHETYPES.map((archetype) => ({ archetype, w: incumbent.archetypes[archetype].w })) });
+}
+
+function generationFingerprint(input: {
+  datasetHash: string;
+  incumbentGeneration: number;
+  incumbentCoefficientFingerprint: string;
+  hyperparameters: CortexShadowRefitHyperparameters;
+  codeVersion: string;
+}): string {
+  return hash({ learnerSchemaVersion: CORTEX_SHADOW_REFIT_SCHEMA_VERSION, featureSchemaVersion: CORTEX_FEATURE_SCHEMA_VERSION, ...input });
+}
+
+function candidateIntegrityContent(candidate: Omit<CortexShadowCandidateGeneration, "integrityHash">): unknown {
+  return candidate;
+}
+
+function candidateForDataset(
+  dataset: CortexShadowDataset, incumbent: CortexStoreState, incumbentGeneration: number, nowMs: number,
+  codeVersion: string, hyperparameters: CortexShadowRefitHyperparameters,
+): CortexShadowCandidateGeneration {
+  const incumbentCoefficientFingerprint = incumbentFingerprint(incumbent);
+  const fingerprint = generationFingerprint({ datasetHash: dataset.datasetHash, incumbentGeneration, incumbentCoefficientFingerprint, hyperparameters, codeVersion });
   const archetypes = ARCHETYPES.map((archetype) => {
     const rows = dataset.examples.filter((row) => row.archetype === archetype);
     const prior = incumbent.archetypes[archetype].w;
-    const result = fitArchetype(rows, prior, nowMs);
+    const result = fitArchetype(rows, prior, nowMs, hyperparameters);
     const coefficients = result.fit.status === "ACCEPTED" ? result.fit.coefficients : [...prior];
     const train = metrics(rows, coefficients);
-    const oosRows = rows.filter((row) => result.folds.some((fold) =>
-      fold.oosStartMs != null && fold.oosEndMs != null && row.decisionTimeMs >= fold.oosStartMs && row.resolvedTimeMs <= fold.oosEndMs,
-    ));
-    const oos = metrics(oosRows, coefficients);
-    const incumbentOos = metrics(oosRows, prior);
-    const expectedEconomicDeltaR = meanPredictionDelta(oosRows, coefficients, prior);
+    const heldOut = result.folds.flatMap((fold) => fold.heldOut);
+    const oos = metricsFromHeldOut(heldOut, "candidate");
+    const expectedEconomicDeltaR = heldOutDelta(heldOut);
     const coefficientMaxDelta = Math.max(0, ...coefficients.map((value, index) => Math.abs(value - prior[index]!)));
     return {
       archetype, n: rows.length, nEff: result.fit.effectiveSampleSize, coefficients, incumbentCoefficients: [...prior],
@@ -403,46 +563,100 @@ function candidateForDataset(dataset: CortexShadowDataset, incumbent: CortexStor
   });
   const blockers = archetypes.flatMap((row) => row.blockers.map((blocker) => `${row.archetype}:${blocker}`));
   const cautions = archetypes.flatMap((row) => row.cautions.map((caution) => `${row.archetype}:${caution}`));
-  return {
-    generationId: `shadow-${dataset.datasetHash.slice(0, 20)}`,
-    parentIncumbentGeneration: 0,
+  const unsigned = {
+    generationId: `shadow-${fingerprint.slice(0, 20)}`,
+    generationFingerprint: fingerprint,
+    parentIncumbentGeneration: incumbentGeneration,
+    incumbentCoefficientFingerprint,
     createdAt: new Date(nowMs).toISOString(), resetEpoch: dataset.resetEpoch,
     trainingCutoffMs: dataset.examples.at(-1)?.resolvedTimeMs ?? nowMs,
     featureSchemaVersion: CORTEX_FEATURE_SCHEMA_VERSION, datasetHash: dataset.datasetHash,
     exampleIds: dataset.examples.map((row) => row.exampleId), sourceLineage: dataset.sourceLineage,
-    hyperparameters: CORTEX_SHADOW_REFIT_HYPERPARAMETERS, archetypes,
+    hyperparameters, archetypes,
     shadowReady: false, blockers, cautions, codeVersion,
-  };
+  } satisfies Omit<CortexShadowCandidateGeneration, "integrityHash">;
+  return { ...unsigned, integrityHash: hash(candidateIntegrityContent(unsigned)) };
 }
 
 function defaultRegistry(): CortexShadowRefitRegistry {
-  return { schemaVersion: CORTEX_SHADOW_REFIT_SCHEMA_VERSION, candidates: [], lastDatasetHash: null, lastAudit: null };
+  return {
+    schemaVersion: CORTEX_SHADOW_REFIT_SCHEMA_VERSION, integrityStatus: "HEALTHY", integrityError: null,
+    candidates: [], lastDatasetHash: null, lastGenerationFingerprint: null, lastAudit: null,
+  };
 }
 
 function validCandidate(candidate: CortexShadowCandidateGeneration): boolean {
+  const { integrityHash: _integrityHash, ...unsigned } = candidate;
+  const expectedGenerationFingerprint = generationFingerprint({
+    datasetHash: candidate.datasetHash,
+    incumbentGeneration: candidate.parentIncumbentGeneration,
+    incumbentCoefficientFingerprint: candidate.incumbentCoefficientFingerprint,
+    hyperparameters: candidate.hyperparameters,
+    codeVersion: candidate.codeVersion,
+  });
   return candidate.featureSchemaVersion === CORTEX_FEATURE_SCHEMA_VERSION &&
+    Number.isInteger(candidate.parentIncumbentGeneration) && candidate.parentIncumbentGeneration >= 0 &&
+    typeof candidate.incumbentCoefficientFingerprint === "string" && candidate.incumbentCoefficientFingerprint.length === 64 &&
+    candidate.generationFingerprint === expectedGenerationFingerprint &&
     candidate.archetypes.length === ARCHETYPES.length &&
     candidate.archetypes.every((row) => row.coefficients.length === CORTEX_FEATURE_DIM && row.coefficients.every(finite)) &&
-    candidate.generationId === `shadow-${candidate.datasetHash.slice(0, 20)}`;
+    candidate.generationId === `shadow-${candidate.generationFingerprint.slice(0, 20)}` &&
+    candidate.integrityHash === hash(candidateIntegrityContent(unsigned));
 }
 
 export class CortexShadowRefitRegistryStore {
   private state: CortexShadowRefitRegistry = defaultRegistry();
   constructor(private readonly file: string) {
     if (!existsSync(file)) return;
-    try {
-      const parsed = JSON.parse(readFileSync(file, "utf8")) as CortexShadowRefitRegistry;
-      if (parsed.schemaVersion !== CORTEX_SHADOW_REFIT_SCHEMA_VERSION || !Array.isArray(parsed.candidates) || !parsed.candidates.every(validCandidate)) return;
-      this.state = { ...parsed, candidates: [...parsed.candidates] };
-    } catch { this.state = defaultRegistry(); }
+    const primary = this.readValid(file);
+    if (primary) { this.state = primary; return; }
+    // A complete previous registry is retained as a local last-known-good snapshot. Recovery is
+    // report-only and visibly degraded: callers may inspect it but cannot overwrite the corrupt
+    // primary state until an operator resolves the storage problem.
+    const backup = this.readValid(`${file}.bak`);
+    if (backup) {
+      this.state = { ...backup, integrityStatus: "REGISTRY_CORRUPTED", integrityError: "primary registry failed schema or integrity validation; recovered last known valid backup" };
+      return;
+    }
+    this.state = { ...defaultRegistry(), integrityStatus: "REGISTRY_CORRUPTED", integrityError: "registry failed schema or integrity validation; no safe backup available" };
   }
   get(): CortexShadowRefitRegistry { return this.state; }
+  isCorrupted(): boolean { return this.state.integrityStatus === "REGISTRY_CORRUPTED"; }
   save(next: CortexShadowRefitRegistry): void {
-    mkdirSync(dirname(this.file), { recursive: true });
-    const tmp = `${this.file}.tmp`;
-    writeFileSync(tmp, JSON.stringify(next), "utf8");
-    renameSync(tmp, this.file);
+    if (this.isCorrupted()) throw new Error("refusing to overwrite a corrupted CORTEX shadow registry");
+    if (next.schemaVersion !== CORTEX_SHADOW_REFIT_SCHEMA_VERSION || next.integrityStatus !== "HEALTHY" || !next.candidates.every(validCandidate)) {
+      throw new Error("refusing to persist an invalid CORTEX shadow registry");
+    }
+    this.atomicWrite(this.file, JSON.stringify(next));
+    // Keep a parseable last-known-good snapshot after the primary rename succeeds. It is only used
+    // when a later crash/truncation corrupts the primary file, never as a normal alternate source.
+    this.atomicWrite(`${this.file}.bak`, JSON.stringify(next));
     this.state = next;
+  }
+  private readValid(file: string): CortexShadowRefitRegistry | null {
+    try {
+      const parsed = JSON.parse(readFileSync(file, "utf8")) as CortexShadowRefitRegistry;
+      if (
+        parsed.schemaVersion !== CORTEX_SHADOW_REFIT_SCHEMA_VERSION || parsed.integrityStatus !== "HEALTHY" ||
+        !Array.isArray(parsed.candidates) || !parsed.candidates.every(validCandidate) ||
+        !(parsed.lastDatasetHash === null || typeof parsed.lastDatasetHash === "string") ||
+        !(parsed.lastGenerationFingerprint === null || typeof parsed.lastGenerationFingerprint === "string")
+      ) return null;
+      return { ...parsed, candidates: [...parsed.candidates], integrityError: null };
+    } catch { return null; }
+  }
+  private atomicWrite(file: string, contents: string): void {
+    mkdirSync(dirname(file), { recursive: true });
+    const tmp = `${file}.tmp`;
+    try {
+      writeFileSync(tmp, contents, "utf8");
+      const fd = openSync(tmp, "r");
+      try { fsyncSync(fd); } finally { closeSync(fd); }
+      renameSync(tmp, file);
+    } catch (error) {
+      try { unlinkSync(tmp); } catch { /* best effort cleanup */ }
+      throw error;
+    }
   }
 }
 
@@ -456,27 +670,48 @@ export function runCortexShadowRefit(input: {
   nowMs: number;
   resetEpoch?: string;
   codeVersion?: string;
+  incumbentGeneration?: number;
+  hyperparameters?: CortexShadowRefitHyperparameters;
 }): CortexShadowRunReport {
   const dataset = buildCortexShadowTrainingDataset(input);
   const previous = input.registry.get();
   const generatedAt = new Date(input.nowMs).toISOString();
-  if (previous.lastDatasetHash === dataset.datasetHash) {
-    return { status: "NO_NEW_ELIGIBLE_DATA", generatedAt, resetEpoch: dataset.resetEpoch, dataset, candidate: previous.candidates.at(-1) ?? null, beta: { evaluationBeta: 0, liveBeta: 0 }, blockers: [] };
+  if (input.registry.isCorrupted()) {
+    return {
+      status: "BLOCKED", generatedAt, resetEpoch: dataset.resetEpoch, dataset,
+      candidate: previous.candidates.at(-1) ?? null, beta: { evaluationBeta: 0, liveBeta: 0 },
+      blockers: ["REGISTRY_CORRUPTED", previous.integrityError ?? "unknown registry integrity error"],
+    };
+  }
+  const codeVersion = input.codeVersion ?? "unknown";
+  const hyperparameters = input.hyperparameters ?? CORTEX_SHADOW_REFIT_HYPERPARAMETERS;
+  const incumbentGeneration = input.incumbentGeneration ?? 0;
+  const nextFingerprint = generationFingerprint({
+    datasetHash: dataset.datasetHash, incumbentGeneration,
+    incumbentCoefficientFingerprint: incumbentFingerprint(input.incumbent), hyperparameters, codeVersion,
+  });
+  if (previous.lastGenerationFingerprint === nextFingerprint) {
+    const candidate = previous.candidates.find((row) => row.generationFingerprint === nextFingerprint) ?? previous.candidates.at(-1) ?? null;
+    const report: CortexShadowRunReport = { status: "NO_NEW_ELIGIBLE_DATA", generatedAt, resetEpoch: dataset.resetEpoch, dataset, candidate, beta: { evaluationBeta: 0, liveBeta: 0 }, blockers: [] };
+    // Audit freshness is independent of candidate idempotence: a newly-arrived rejected outcome
+    // changes examined/rejection counters even when the eligible dataset is byte-identical.
+    input.registry.save({ ...previous, lastDatasetHash: dataset.datasetHash, lastGenerationFingerprint: nextFingerprint, lastAudit: report });
+    return report;
   }
   if (dataset.examples.length === 0) {
     const report: CortexShadowRunReport = { status: "NO_REFIT", generatedAt, resetEpoch: dataset.resetEpoch, dataset, candidate: null, beta: { evaluationBeta: 0, liveBeta: 0 }, blockers: ["NO_ELIGIBLE_EXAMPLES"] };
-    input.registry.save({ ...previous, lastDatasetHash: dataset.datasetHash, lastAudit: report });
+    input.registry.save({ ...previous, lastDatasetHash: dataset.datasetHash, lastGenerationFingerprint: nextFingerprint, lastAudit: report });
     return report;
   }
-  const candidate = candidateForDataset(dataset, input.incumbent, input.nowMs, input.codeVersion ?? "unknown");
+  const candidate = candidateForDataset(dataset, input.incumbent, incumbentGeneration, input.nowMs, codeVersion, hyperparameters);
   // Per-archetype failures remain explicit blockers on the persisted candidate. They must not erase
   // a valid BREADTH/NEUTRAL/Tactical fit merely because a different archetype has no observations.
   const hasAnyAcceptedFit = candidate.archetypes.some((row) => row.fitStatus === "ACCEPTED");
   const report: CortexShadowRunReport = { status: hasAnyAcceptedFit ? "CANDIDATE_CREATED" : "NO_REFIT", generatedAt, resetEpoch: dataset.resetEpoch, dataset, candidate, beta: { evaluationBeta: 0, liveBeta: 0 }, blockers: candidate.blockers };
   input.registry.save({
-    schemaVersion: CORTEX_SHADOW_REFIT_SCHEMA_VERSION,
-    candidates: previous.candidates.some((row) => row.datasetHash === candidate.datasetHash) ? previous.candidates : [...previous.candidates, candidate],
-    lastDatasetHash: dataset.datasetHash,
+    schemaVersion: CORTEX_SHADOW_REFIT_SCHEMA_VERSION, integrityStatus: "HEALTHY", integrityError: null,
+    candidates: previous.candidates.some((row) => row.generationFingerprint === candidate.generationFingerprint) ? previous.candidates : [...previous.candidates, candidate],
+    lastDatasetHash: dataset.datasetHash, lastGenerationFingerprint: nextFingerprint,
     lastAudit: report,
   });
   return report;
@@ -494,7 +729,9 @@ export interface CortexShadowRefitReadiness {
   readonly datasetHash: string | null;
   readonly latestStatus: CortexShadowRunStatus | null;
   readonly candidateGenerationId: string | null;
-  readonly incumbentGeneration: 0;
+  readonly incumbentGeneration: number | null;
+  readonly registryIntegrity: "HEALTHY" | "REGISTRY_CORRUPTED";
+  readonly registryIntegrityError: string | null;
   readonly perArchetype: readonly {
     archetype: CortexArchetype;
     eligible: number;
@@ -545,7 +782,8 @@ export function cortexShadowRefitReadiness(registry: CortexShadowRefitRegistry):
     directLearningEligible: audit?.dataset.examples.length ?? 0,
     rejected: audit?.dataset.rejected ?? {}, datasetHash: audit?.dataset.datasetHash ?? null,
     latestStatus: audit?.status ?? null, candidateGenerationId: audit?.candidate?.generationId ?? null,
-    incumbentGeneration: 0,
+    incumbentGeneration: audit?.candidate?.parentIncumbentGeneration ?? null,
+    registryIntegrity: registry.integrityStatus, registryIntegrityError: registry.integrityError,
     perArchetype: audit?.candidate?.archetypes.map((row) => ({
       archetype: row.archetype, eligible: row.n, nEff: row.nEff, fitStatus: row.fitStatus,
       coefficientMaxDelta: row.coefficientMaxDelta,

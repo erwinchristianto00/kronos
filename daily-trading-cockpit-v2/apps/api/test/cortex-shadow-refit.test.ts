@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { emptyCortexState } from "../src/lib/cortex-brain.js";
 import {
   CORTEX_SHADOW_REFIT_DEFAULT_EPOCH,
+  CORTEX_SHADOW_REFIT_HYPERPARAMETERS,
   CortexShadowRefitRegistryStore,
   buildCortexShadowTrainingDataset,
   compareCortexShadowPrediction,
@@ -161,7 +162,52 @@ describe("CORTEX shadow refit learner v1", () => {
     runCortexShadowRefit({ ...second, policy, incumbent, registry, nowMs: epochMs + 210_000_000 });
     expect(registry.get().candidates).toHaveLength(2);
     writeFileSync(file, "{not-json");
-    expect(new CortexShadowRefitRegistryStore(file).get().candidates).toEqual([]);
+    const recovered = new CortexShadowRefitRegistryStore(file).get();
+    expect(recovered.integrityStatus).toBe("REGISTRY_CORRUPTED");
+    expect(recovered.candidates).toHaveLength(2); // recovered from the last known valid .bak
+  });
+
+  it("fails closed when raw, bridge, and reconstructed CORTEX vectors do not match exactly", () => {
+    const input = dataset(1);
+    const conflicting = structuredClone(input.forwardEvents[0] as any);
+    conflicting.cortexTraining.featureVector[1] += 0.001;
+    input.forwardEvents.push(conflicting);
+    const result = buildCortexShadowTrainingDataset({ ...input, policy, nowMs: epochMs + 99_999_999 });
+    expect(result.examples).toHaveLength(0);
+    expect(result.rejected.CORTEX_SNAPSHOT_VECTOR_MISMATCH).toBe(1);
+  });
+
+  it("rejects mismatched CORTEX identity and policy lineage rather than falling back", () => {
+    const identityMismatch = dataset(1);
+    const duplicate = structuredClone(identityMismatch.forwardEvents[0] as any);
+    duplicate.identity.cortexDecisionId = "another-cortex-decision";
+    identityMismatch.forwardEvents.push(duplicate);
+    expect(buildCortexShadowTrainingDataset({ ...identityMismatch, policy, nowMs: epochMs + 99_999_999 }).rejected.CORTEX_DECISION_IDENTITY_MISMATCH).toBe(1);
+
+    const policyMismatch = dataset(1);
+    (policyMismatch.forwardEvents[0] as any).identity.executionPolicyVersion = "wrong-policy";
+    expect(buildCortexShadowTrainingDataset({ ...policyMismatch, policy, nowMs: epochMs + 99_999_999 }).rejected.CORTEX_POLICY_LINEAGE_MISMATCH).toBe(1);
+  });
+
+  it("requires the exact lane, symbol, direction, and instance identity rather than a nearest snapshot", () => {
+    for (const [field, value] of [
+      ["laneId", "CG_WIDE_FAST_SHORT"],
+      ["symbolOrBasketId", "SOLUSDT"],
+      ["direction", "SHORT"],
+    ] as const) {
+      const input = dataset(1);
+      const conflicting = structuredClone(input.forwardEvents[0] as any);
+      conflicting.identity[field] = value;
+      input.forwardEvents.push(conflicting);
+      const result = buildCortexShadowTrainingDataset({ ...input, policy, nowMs: epochMs + 99_999_999 });
+      expect(result.examples).toHaveLength(0);
+      expect(result.rejected.CORTEX_DECISION_IDENTITY_MISMATCH).toBe(1);
+    }
+    const wrongInstance = dataset(1);
+    const conflicting = structuredClone(wrongInstance.forwardEvents[0] as any);
+    conflicting.identity.instanceId = "3101";
+    wrongInstance.forwardEvents.push(conflicting);
+    expect(buildCortexShadowTrainingDataset({ ...wrongInstance, policy, nowMs: epochMs + 99_999_999 }).rejected.CORTEX_POLICY_LINEAGE_MISMATCH).toBe(1);
   });
 
   it("uses purged chronological OOS folds without opportunity overlap or future training", () => {
@@ -173,7 +219,63 @@ describe("CORTEX shadow refit learner v1", () => {
       expect(fold.trainEndMs).toBeLessThan(fold.oosStartMs!);
       expect(fold.trainN).toBeGreaterThanOrEqual(20);
       expect(fold.oosN).toBeGreaterThanOrEqual(8);
+      expect(fold.trainExampleIds).toHaveLength(fold.trainN);
+      expect(new Set(fold.heldOut.map((row) => row.exampleId)).size).toBe(fold.heldOut.length);
+      expect(fold.heldOut.some((row) => fold.trainExampleIds.includes(row.exampleId))).toBe(false);
     }
+    const heldOut = folds.flatMap((fold) => fold.heldOut);
+    expect(report.candidate!.archetypes[0]!.oos.n).toBe(heldOut.length);
+    expect(new Set(heldOut.map((row) => row.exampleId)).size).toBe(heldOut.length);
+    const predicted = heldOut.filter((row) => row.candidatePrediction != null);
+    const expectedCandidateMae = predicted.reduce((total, row) => total + Math.abs(row.candidatePrediction! - row.netR), 0) / predicted.length;
+    expect(report.candidate!.archetypes[0]!.oos.calibrationMae).toBeCloseTo(expectedCandidateMae);
+  });
+
+  it("applies purgeMs to held-out membership instead of leaving it as unused configuration", () => {
+    const dir = temp(); const registry = new CortexShadowRefitRegistryStore(join(dir, "registry.json"));
+    const report = runCortexShadowRefit({
+      ...dataset(44), policy, incumbent: emptyCortexState(), registry, nowMs: epochMs + 200_000_000,
+      hyperparameters: { ...CORTEX_SHADOW_REFIT_HYPERPARAMETERS, purgeMs: 60_001 },
+    });
+    for (const fold of report.candidate!.archetypes[0]!.folds) expect(fold.oosN).toBe(7);
+  });
+
+  it("fingerprints incumbent generation, coefficient state, hyperparameters, and code version", () => {
+    const dir = temp(); const registry = new CortexShadowRefitRegistryStore(join(dir, "registry.json"));
+    const input = dataset(44); const base = emptyCortexState();
+    const first = runCortexShadowRefit({ ...input, policy, incumbent: base, incumbentGeneration: 7, registry, nowMs: epochMs + 200_000_000, codeVersion: "a" });
+    const shifted = structuredClone(base); shifted.archetypes.BREADTH.w[1] = 0.2;
+    const second = runCortexShadowRefit({ ...input, policy, incumbent: shifted, incumbentGeneration: 8, registry, nowMs: epochMs + 201_000_000, codeVersion: "a" });
+    const third = runCortexShadowRefit({ ...input, policy, incumbent: shifted, incumbentGeneration: 8, registry, nowMs: epochMs + 202_000_000, codeVersion: "b", hyperparameters: { ...CORTEX_SHADOW_REFIT_HYPERPARAMETERS, ridge: 2 } });
+    expect(first.candidate!.generationId).not.toBe(second.candidate!.generationId);
+    expect(second.candidate!.generationId).not.toBe(third.candidate!.generationId);
+    expect(third.candidate!.parentIncumbentGeneration).toBe(8);
+  });
+
+  it("updates audit freshness for new rejected rows without making another candidate", () => {
+    const dir = temp(); const registry = new CortexShadowRefitRegistryStore(join(dir, "registry.json"));
+    const firstInput = dataset(44); const incumbent = emptyCortexState();
+    runCortexShadowRefit({ ...firstInput, policy, incumbent, registry, nowMs: epochMs + 200_000_000 });
+    const rejected = row(99, { executiveDecisionTimeMs: epochMs - 1 });
+    const second = runCortexShadowRefit({ outcomes: [...firstInput.outcomes, rejected.outcome], forwardEvents: [...firstInput.forwardEvents, ...rejected.events], policy, incumbent, registry, nowMs: epochMs + 201_000_000 });
+    expect(second.status).toBe("NO_NEW_ELIGIBLE_DATA");
+    expect(registry.get().candidates).toHaveLength(1);
+    expect(registry.get().lastAudit!.dataset.examined).toBe(45);
+    expect(registry.get().lastAudit!.dataset.rejected.PRE_RESET_EPOCH).toBe(1);
+  });
+
+  it("detects modified candidate contents and exposes an explicit corrupted registry blocker", () => {
+    const dir = temp(); const file = join(dir, "registry.json"); const registry = new CortexShadowRefitRegistryStore(file);
+    const input = dataset(44);
+    runCortexShadowRefit({ ...input, policy, incumbent: emptyCortexState(), registry, nowMs: epochMs + 200_000_000 });
+    const tampered = JSON.parse(readFileSync(file, "utf8")); tampered.candidates[0].archetypes[0].coefficients[0] += 1;
+    writeFileSync(file, JSON.stringify(tampered));
+    const recovered = new CortexShadowRefitRegistryStore(file);
+    expect(recovered.get().integrityStatus).toBe("REGISTRY_CORRUPTED");
+    expect(recovered.get().candidates).toHaveLength(1);
+    const blocked = runCortexShadowRefit({ ...input, policy, incumbent: emptyCortexState(), registry: recovered, nowMs: epochMs + 201_000_000 });
+    expect(blocked.status).toBe("BLOCKED");
+    expect(blocked.blockers).toContain("REGISTRY_CORRUPTED");
   });
 
   it("fails closed for insufficient effective evidence instead of inventing zero coefficients", () => {
