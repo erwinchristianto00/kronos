@@ -166,6 +166,7 @@ import {
   exactLaneContextFor,
   getCurrentGuardVariantMatrixStore,
   laneStatusForContext,
+  type ContextLaneStatusLookup,
   variantMatrixOpenSignals,
 } from "./lib/current-guard-variant-matrix.js";
 import { getLatestScanCandidates } from "./lib/latest-scan-candidates-cache.js";
@@ -356,6 +357,20 @@ export function buildFourBrainJournalContext(
       killReason: base.killReason,
     },
   };
+}
+
+/**
+ * Execution readiness may relax maturity only after the order has an actual canonical proof unit.
+ * This is deliberately independent of operator force, rotation, and mainnet override policy.
+ */
+export function hasExactContextReadinessProof(contextProof: ContextLaneStatusLookup): boolean {
+  return (
+    contextProof.context !== null &&
+    contextProof.applicable === true &&
+    contextProof.direct === true &&
+    contextProof.evidence !== null &&
+    contextProof.status !== "NOT_APPLICABLE"
+  );
 }
 
 export async function buildApp(options: AppOptions = {}): Promise<FastifyInstance> {
@@ -931,31 +946,35 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         const report = buildCurrentGuardVariantMatrixReport(getCurrentGuardVariantMatrixStore());
         const rotationShortlist = buildRegimeRotationShortlistReport(report);
         const laneVariantId = order.selectedLaneId.split(":").pop() ?? order.selectedLaneId;
-        // Force-eligible lanes (operator opt-in REALTIME_SHORT_FORCE_FAST_LONG/SHORT=1 +
-        // FORCE_ELIGIBLE_LONG_VARIANT_IDS/FORCE_ELIGIBLE_SHORT_VARIANT_IDS below) are meant to trade
-        // regardless of THIS instance's own thin/decaying STABLE_CANDIDATE label — live's local VM
-        // book accrues observations slowly, so freshValid can dip back under the STABLE threshold
-        // long after a lane was proven. Without this check, the hard gate below returned false
-        // BEFORE the force-eligible bypass further down was ever consulted, silently defeating the
-        // operator's own opt-in the moment freshValid decayed (2026-07-11 incident: CG_WIDE_FAST_LONG
-        // went dark for 32h+ this way despite REALTIME_SHORT_FORCE_FAST_LONG=1 being set).
-        const forceEligibleForDirection = isForceEligibleForDirection(order.direction, laneVariantId);
         const regimeFamily =
           orderEstimatedRegime.direction === "LONG"
             ? "BULLISH"
             : orderEstimatedRegime.direction === "SHORT"
               ? "BEARISH"
               : rotationRegimeFamilyForLabel(order.regime);
+        const exactContext = exactLaneContextFor(order.direction, regimeFamily);
         const contextProof = laneStatusForContext(
           report,
           laneVariantId,
-          exactLaneContextFor(order.direction, regimeFamily),
+          exactContext,
         );
+        // Exact applicability is a hard execution boundary. Force, rotation, and the explicit
+        // unproven override may relax maturity only; none may invent or borrow a proof context.
+        if (!hasExactContextReadinessProof(contextProof)) return false;
+        const forceEligibleForDirection = isForceEligibleForDirection(order.direction, laneVariantId);
+        const authorizedLongWideOverride = isLaneSelectorV2LongWideStopOverride({
+          variantId: laneVariantId,
+          direction: order.direction,
+          estimatedRegime: orderEstimatedRegime,
+        });
+        const maturityEligible =
+          contextProof.status === "STABLE_CANDIDATE" ||
+          forceEligibleForDirection ||
+          authorizedLongWideOverride;
         if (
           liveConfig.env === "mainnet" &&
-          contextProof.status !== "STABLE_CANDIDATE" &&
-          process.env.LIVE_UNPROVEN_EXECUTION_OVERRIDE !== "1" &&
-          !forceEligibleForDirection
+          !maturityEligible &&
+          process.env.LIVE_UNPROVEN_EXECUTION_OVERRIDE !== "1"
         ) return false;
         const rotationEligible = rotationShortlistDecision(rotationShortlist, {
           laneId: order.selectedLaneId,
@@ -989,22 +1008,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           }
           return false;
         }
-        return (
-          contextProof.status === "STABLE_CANDIDATE" ||
-          // Operator force-enabled lanes (e.g. CG_WIDE_FAST_SHORT/CG_WIDE_FAST_LONG) trade before
-          // STABLE — only when the matching REALTIME_SHORT_FORCE_FAST_LONG/SHORT flag is set (off
-          // by default ⇒ stable-only gate preserved). LONG counterpart (2026-07-07): lets
-          // CG_WIDE_FAST_LONG trade in a long-permissive regime whose estimate direction is not
-          // (yet) LONG — e.g. controller LONG_ONLY while the estimate still reads MIXED.
-          // Bullish-estimate longs take the rotation-shortlist path above instead; this only
-          // covers the fallback branch.
-          isForceEligibleForDirection(order.direction, laneVariantId) ||
-          isLaneSelectorV2LongWideStopOverride({
-            variantId: laneVariantId,
-            direction: order.direction,
-            estimatedRegime: orderEstimatedRegime,
-          })
-        );
+        return maturityEligible;
       },
       getControllerSnapshot: () => {
         const cached = getLatestScanCandidates();
