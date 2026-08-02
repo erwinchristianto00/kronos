@@ -182,7 +182,7 @@ const allowingEdge = {
 // causal collection, and canonical policy off process.env — never a caller-supplied override — so
 // the test stamps process.env itself and restores it afterward. ──────────────────────────────────
 
-interface ChainEnv {
+export interface ChainEnv {
   dirs: string[];
   paperDir: string;
   causalDir: string;
@@ -197,7 +197,7 @@ interface ChainEnv {
 }
 
 let seq = 0;
-function setupChainEnv(): ChainEnv {
+export function setupChainEnv(): ChainEnv {
   seq += 1;
   const dirs: string[] = [];
   const dir = (prefix: string): string => {
@@ -233,7 +233,7 @@ function setupChainEnv(): ChainEnv {
     previousEnv,
   };
 }
-function teardownChainEnv(ctx: ChainEnv): void {
+export function teardownChainEnv(ctx: ChainEnv): void {
   for (const [key, value] of Object.entries(ctx.previousEnv)) {
     if (value === undefined) delete process.env[key];
     else process.env[key] = value;
@@ -241,18 +241,29 @@ function teardownChainEnv(ctx: ChainEnv): void {
   for (const d of ctx.dirs) rmSync(d, { recursive: true, force: true });
 }
 
-const CANONICAL_CORTEX_LANE_ID = CORTEX_CG_MFE_GIVEBACK_LONG_LANE_ID; // "CG_MFE_GIVEBACK_LONG"
+export const CANONICAL_CORTEX_LANE_ID = CORTEX_CG_MFE_GIVEBACK_LONG_LANE_ID; // "CG_MFE_GIVEBACK_LONG"
 const PAPER_LANE_ID = "CG_VARIANT_MATRIX:CG_MFE_GIVEBACK"; // the one real, mapped paper lane for this roster id
 
 /** Steps 1-5 of the plan: real scan batch + candidates, real CORTEX tick, real publish, real
  *  allocator report, real admission. Returns the persisted PaperOrder plus everything a later step
- *  needs, all read back from production stores/functions — nothing hand-assembled. */
-async function buildAdmittedOrder(ctx: ChainEnv): Promise<{
+ *  needs, all read back from production stores/functions — nothing hand-assembled.
+ *
+ *  `options.scanBatchId` (optional, additive — every existing call site omits it and gets the exact
+ *  original behavior: `ctx.scanBatchId`) lets a caller admit a SECOND, genuinely distinct real
+ *  PaperOrder for the SAME candidate/symbol/lane/direction within the same ChainEnv — e.g. to prove
+ *  a live-execution pyramid-add/netted scenario. A different scanBatchId is threaded through the
+ *  real CORTEX shadow tick + publish + allocator report, which is enough for the pipeline to
+ *  produce a genuinely distinct order: paper-execution-router.ts's allocatorDedupeKey is
+ *  `alloc:${scanBatchId}:${sourceCandidateId}:${symbol}:${direction}:${laneId}`, so two calls under
+ *  two different scanBatchIds are never suppressed as duplicates of each other, each getting its own
+ *  `paper-${randomUUID()}` paperOrderId — never a hand-typed/cloned second PaperOrder. */
+export async function buildAdmittedOrder(ctx: ChainEnv, options?: { scanBatchId?: string }): Promise<{
   store: PaperExecutionRouterStore;
   order: PaperOrder;
   opportunity: PaperOpportunity;
   publicationResult: ReturnType<typeof publishCortexDecisionSnapshotsForScan>;
 }> {
+  const scanBatchId = options?.scanBatchId ?? ctx.scanBatchId;
   const vmReport = await buildVmReport(ctx.paperDir);
   const scanFinishedAt = new Date(ctx.NOW - 30_000).toISOString();
   const admissionNow = new Date(ctx.NOW).toISOString();
@@ -293,19 +304,19 @@ async function buildAdmittedOrder(ctx: ChainEnv): Promise<{
     journal: cortexJournal,
     context: cortexContext,
     nowIso: new Date(ctx.NOW - 60_000).toISOString(),
-    scanBatchId: ctx.scanBatchId,
+    scanBatchId,
     mode: "shadow",
   });
   expect(snapshots.length).toBeGreaterThan(0);
 
   // Step 3: publish through the now-immutable publisher.
-  const publicationResult = publishCortexDecisionSnapshotsForScan(ctx.scanBatchId, snapshots);
+  const publicationResult = publishCortexDecisionSnapshotsForScan(scanBatchId, snapshots);
   expect(publicationResult).toBe("PUBLISHED");
 
   // Step 4: real paper allocator report, fed the real published snapshots for this exact scan.
   const common: PaperOpportunityAllocatorInputs = {
     candidates: [makeLongCandidate()],
-    scanBatchId: ctx.scanBatchId,
+    scanBatchId,
     scanFinishedAt,
     marketRegime: "Bullish expansion",
     routerReport: routerOf("Bullish expansion"),
@@ -314,7 +325,7 @@ async function buildAdmittedOrder(ctx: ChainEnv): Promise<{
     paperValidationAllowed: false,
     vmReport,
     testnetCollectAllLanes: true,
-    cortexDecisionSnapshots: cortexDecisionSnapshotsForScan(ctx.scanBatchId),
+    cortexDecisionSnapshots: cortexDecisionSnapshotsForScan(scanBatchId),
   };
   const report = buildPaperOpportunityAllocatorReport(common);
   const opportunity = report.selectedOpportunities.find(
@@ -322,7 +333,7 @@ async function buildAdmittedOrder(ctx: ChainEnv): Promise<{
   );
   expect(opportunity).toBeDefined();
   expect(opportunity!.cortexDecisionSnapshot).not.toBeNull();
-  expect(opportunity!.cortexDecisionSnapshot!.scanBatchId).toBe(ctx.scanBatchId);
+  expect(opportunity!.cortexDecisionSnapshot!.scanBatchId).toBe(scanBatchId);
 
   // Step 5: real admission.
   const store = new PaperExecutionRouterStore(ctx.paperDir);
@@ -335,7 +346,10 @@ async function buildAdmittedOrder(ctx: ChainEnv): Promise<{
     now: admissionNow,
   });
   expect(result.admitted).toBe(1);
-  const order = store.all.find((o) => o.selectedLaneId === PAPER_LANE_ID && o.direction === "LONG");
+  // Scoped by scanBatchId too (not just lane+direction) — with `options.scanBatchId` supplied, the
+  // SAME store can already hold an earlier call's order under the same lane/direction, and `.find()`
+  // must resolve to the order THIS call just admitted, never whichever one happens to be first.
+  const order = store.all.find((o) => o.selectedLaneId === PAPER_LANE_ID && o.direction === "LONG" && o.scanBatchId === scanBatchId);
   expect(order).toBeDefined();
   expect(order!.causalIdentity).not.toBeNull();
   expect(order!.causalIdentity!.canonicalCortexLaneId).toBe(CANONICAL_CORTEX_LANE_ID);
@@ -348,7 +362,7 @@ async function buildAdmittedOrder(ctx: ChainEnv): Promise<{
  *  directly off the admitted PaperOrder (never a hand-built candidate id), run through the real
  *  Four-Brain gather + shadow tick. Returns the captured ExecutiveDecision + candidateId exactly as
  *  app.ts's onExecutiveDecision receives them. */
-function runFourBrainTickForOrder(
+export function runFourBrainTickForOrder(
   ctx: ChainEnv,
   store: PaperExecutionRouterStore,
   order: PaperOrder,
@@ -422,14 +436,14 @@ function runFourBrainTickForOrder(
     openPositions: [],
     markPriceForSymbol: () => ({ price: order.entryPrice + 1, atMs: tickNowMs - 30_000 }),
     // Real allocation bridge, built off the real per-tick ownership index — exactly app.ts's
-    // allocationContextForLane closure.
-    allocationContextForLane: (laneId, candidate) =>
-      allocationContextWithExactCortexPaperBridge({
-        base: { source: "STATIC_BASELINE", snapshotId: null, staticWeightPct: 20, evaluatedWeightPct: 20, appliedWeightPct: 20, beta: 0, capturedAtMs: null, policyVersion: "authority-contract/1" },
-        candidate,
-        laneId,
-        ownershipIndex,
-      }),
+    // allocationContextForLane closure, including its BRIDGED-only unwrap (see cortex-paper-
+    // allocation-bridge.ts's CortexPaperBridgeResult: OWNERSHIP_MISSING/OWNERSHIP_AMBIGUOUS carry
+    // no context at all, so a non-BRIDGED result falls back to `base` exactly as app.ts does).
+    allocationContextForLane: (laneId, candidate) => {
+      const base = { source: "STATIC_BASELINE" as const, snapshotId: null, staticWeightPct: 20, evaluatedWeightPct: 20, appliedWeightPct: 20, beta: 0, capturedAtMs: null, policyVersion: "authority-contract/1" };
+      const result = allocationContextWithExactCortexPaperBridge({ base, candidate, laneId, ownershipIndex });
+      return result.status === "BRIDGED" ? result.context : base;
+    },
     marketContext: marketContext!,
     laneEligibleIncumbent: () => true,
     killLatched: false,
@@ -477,15 +491,30 @@ function resolveRealTier1(
   const settlementResolvedAtMs = closedAtMs + 60_000;
   const entryOrderId = "e2e-entry-order-1";
   const exitOrderId = "e2e-exit-order-1";
-  const intent = {
+  // Fully-typed LiveIntent literal — every field the interface requires is present with a
+  // realistic value, so this never needs `as unknown as LiveIntent` to satisfy the compiler.
+  const intent: LiveIntent = {
     paperOrderId: order.paperOrderId,
     executionIntentId: "e2e-intent-1",
     positionId: "e2e-position-1",
-    entryOrderId,
-    createdAt: new Date(createdAtMs).toISOString(),
-    closedAt: new Date(closedAtMs).toISOString(),
+    symbol: order.symbol,
+    direction: order.direction,
     state: "CLOSED",
-    effectiveRiskUsd: 100,
+    qty: 1,
+    tp1Qty: 1,
+    plannedEntryPrice: order.entryPrice,
+    stopLossPrice: order.stopLoss,
+    tp1Price: order.takeProfitLevels[0] ?? order.entryPrice,
+    filledEntryPrice: order.entryPrice,
+    entryOrderId,
+    stopOrderId: "e2e-stop-order-1",
+    tp1OrderId: "e2e-tp1-order-1",
+    beStopOrderId: null,
+    createdAt: new Date(createdAtMs).toISOString(),
+    updatedAt: new Date(closedAtMs).toISOString(),
+    closedAt: new Date(closedAtMs).toISOString(),
+    closeReason: "TP1_FULL",
+    lastError: null,
     originalRiskUsd: 100,
     realizedPnlUsd: 25,
     feesUsd: 5,
@@ -514,13 +543,13 @@ function resolveRealTier1(
     executiveReviewLink: link,
     sourcePaperOrders: [{ paperOrderId: order.paperOrderId, laneId: order.selectedLaneId, qty: 1, executiveReviewLink: link }],
     ...overrides,
-  } as unknown as LiveIntent;
+  };
   const nowMs = closedAtMs + 20 * 60_000; // well past the completed-candle boundary
   const summary = resolveExecutiveReviewPositions(reviewStore, [intent], nowMs);
   return { summary, nowMs };
 }
 
-const policyFor = (ctx: ChainEnv): CanonicalPolicyContext & { instanceId: "3102"; fourBrainPolicyVersion: string } => ({
+export const policyFor = (ctx: ChainEnv): CanonicalPolicyContext & { instanceId: "3102"; fourBrainPolicyVersion: string } => ({
   instanceId: "3102",
   decisionPolicyVersion: CURRENT_DECISION_POLICY_VERSION,
   executionPolicyVersion: EXECUTION_POLICY_VERSION,
@@ -998,7 +1027,9 @@ describe("CORTEX <-> Four-Brain production causal chain (e2e, real functions onl
       laneId: order.selectedLaneId,
       ownershipIndex,
     });
-    expect(bridged.cortexAllocationSnapshotId ?? null).toBeNull();
+    // Explicit, distinct fail-fast result — never a fallthrough "base" guess (point 3).
+    expect(bridged.status).toBe("OWNERSHIP_AMBIGUOUS");
+    expect((bridged as { context?: unknown }).context).toBeUndefined();
     expect(cortexProductionChainDiagnostics().CORTEX_CANDIDATE_OWNERSHIP_AMBIGUOUS).toBeGreaterThanOrEqual(1);
   });
 

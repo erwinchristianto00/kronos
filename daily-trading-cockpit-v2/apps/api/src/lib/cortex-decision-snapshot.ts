@@ -8,6 +8,7 @@
  */
 import { createHash } from "node:crypto";
 import type { CortexLaneDir } from "./cortex-attribution.js";
+import { CORTEX_FEATURE_DIM, CORTEX_FEATURE_SCHEMA_VERSION } from "./cortex-brain.js";
 
 export interface CortexDecisionSnapshot {
   decisionId: string;
@@ -45,10 +46,31 @@ const MAX_SCAN_BATCH_HANDOFFS = 32;
  * the batch is poisoned and all downstream readers now see nothing for it. INVALID = malformed input. */
 export type CortexScanPublicationResult = "PUBLISHED" | "IDEMPOTENT" | "CONFLICT" | "INVALID";
 
+/** The three real CortexLaneDir values. `null` is a value the producer can legitimately emit
+ * (cortex-brain-store.ts, when deps.context.lanes has no matching entry for a lane), but such a
+ * snapshot is already functionally dead — exactCortexDecisionSnapshotForScan's `direction` input is
+ * typed non-null CortexLaneDir, so a null-direction snapshot can never match there. Rejecting it here
+ * makes that dead-on-arrival state explicit at publish time instead of silently storing an unusable row. */
+const VALID_DIRECTIONS: ReadonlySet<CortexLaneDir> = new Set(["LONG", "SHORT", "NEUTRAL"]);
+
+/** Exhaustive, pre-write gate: every field is checked against the real canonical shape the one true
+ * producer (runCortexShadowTick, cortex-brain-store.ts) emits, not just "present" or "some integer".
+ * decisionId/allocationSnapshotId must exactly match what the canonical derivation functions below
+ * would produce from the snapshot's own atMs/laneId/featureSchemaVersion/decisionId — a snapshot
+ * whose id doesn't match its own content is malformed, not merely "different", so it is INVALID here
+ * rather than reaching the CONFLICT path with a mismatched identity. */
 const validSnapshot = (snapshot: CortexDecisionSnapshot): boolean =>
   Boolean(snapshot.decisionId && snapshot.allocationSnapshotId && snapshot.laneId) &&
-  Number.isFinite(snapshot.atMs) && Number.isInteger(snapshot.featureSchemaVersion) &&
-  Array.isArray(snapshot.featureVector) && snapshot.featureVector.length > 0 && snapshot.featureVector.every(Number.isFinite) &&
+  Number.isFinite(snapshot.atMs) &&
+  snapshot.featureSchemaVersion === CORTEX_FEATURE_SCHEMA_VERSION &&
+  snapshot.decisionId === cortexDecisionId(snapshot.atMs, snapshot.laneId, snapshot.featureSchemaVersion) &&
+  snapshot.allocationSnapshotId === cortexAllocationSnapshotId(snapshot.decisionId) &&
+  Array.isArray(snapshot.featureVector) &&
+  snapshot.featureVector.length === CORTEX_FEATURE_DIM &&
+  snapshot.featureVector.every(Number.isFinite) &&
+  snapshot.direction !== null && VALID_DIRECTIONS.has(snapshot.direction) &&
+  (snapshot.sourceScanBatchId === undefined || snapshot.sourceScanBatchId === null ||
+    (typeof snapshot.sourceScanBatchId === "string" && snapshot.sourceScanBatchId.length > 0)) &&
   Number.isFinite(snapshot.finalPct) && Number.isFinite(snapshot.evalFinalPct);
 const copySnapshot = (snapshot: CortexDecisionSnapshot): CortexDecisionSnapshot => ({ ...snapshot, featureVector: [...snapshot.featureVector] });
 
@@ -124,6 +146,17 @@ export function publishCortexDecisionSnapshotsForScan(
   if (byScanBatchHash.get(scanBatchId) === fingerprint) return "IDEMPOTENT";
   conflictedScanBatchIds.add(scanBatchId);
   return "CONFLICT";
+}
+
+/** Read-only: true once ANY content has been accepted (PUBLISHED) for this scanBatchId, whether or
+ *  not it was later conflicted. Lets a periodic re-firing caller (the ONLY realistic source of a
+ *  same-scanBatchId republish today — app.ts's two CORTEX ticks, 5-min cadence vs a 7-min scan
+ *  cache) skip attempting a fresh publish of its own routine repeat entirely, so its own wall-clock
+ *  re-fire never reaches the CONFLICT-detection path. A genuine different-content publish from any
+ *  OTHER source under the same scanBatchId is unaffected: publishCortexDecisionSnapshotsForScan
+ *  itself is unchanged and still fails closed to CONFLICT exactly as before. */
+export function isScanBatchPublished(scanBatchId: string): boolean {
+  return byScanBatch.has(scanBatchId);
 }
 
 /** Returns only an exact scan-cycle/lane/direction handoff. No latest, nearest, or timestamp fallback

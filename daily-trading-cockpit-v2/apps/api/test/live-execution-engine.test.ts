@@ -109,7 +109,7 @@ describe("userTrades settlement coverage", () => {
   });
 });
 
-class FakeLiveClient {
+export class FakeLiveClient {
   env = "testnet" as const;
   placed: PlaceOrderParams[] = [];
   leverageCalls: Array<{ symbol: string; leverage: number }> = [];
@@ -310,7 +310,7 @@ class FakeLiveClient {
   }
 }
 
-function paperOrder(overrides: Partial<PaperOrder> = {}): PaperOrder {
+export function paperOrder(overrides: Partial<PaperOrder> = {}): PaperOrder {
   return {
     paperOrderId: `paper-${Math.random().toString(36).slice(2, 10)}`,
     symbol: "ETHUSDT",
@@ -328,11 +328,11 @@ function paperOrder(overrides: Partial<PaperOrder> = {}): PaperOrder {
   } as unknown as PaperOrder;
 }
 
-function makePaperStore(orders: PaperOrder[], halted = false): PaperStoreReader {
+export function makePaperStore(orders: PaperOrder[], halted = false): PaperStoreReader {
   return { all: orders, isAdmissionHalted: () => halted };
 }
 
-function makeConfig(overrides: Partial<LiveExecutionConfig> = {}): LiveExecutionConfig {
+export function makeConfig(overrides: Partial<LiveExecutionConfig> = {}): LiveExecutionConfig {
   return {
     enabled: true,
     env: "testnet",
@@ -391,7 +391,7 @@ function makeConfig(overrides: Partial<LiveExecutionConfig> = {}): LiveExecution
   };
 }
 
-function makeEngine(opts: {
+export function makeEngine(opts: {
   client?: FakeLiveClient;
   paper?: PaperStoreReader;
   config?: Partial<LiveExecutionConfig>;
@@ -5502,6 +5502,74 @@ describe("openIntent execution-lifecycle tap — report-only, cannot alter the e
         else process.env[k] = saved[k]!;
       }
     }
+  });
+});
+
+describe("LiveIntent.causalLineage (point 2): immutable lineage snapshot stamped once at intent open", () => {
+  const causalIdentity = {
+    lineageSchemaVersion: "causal-lineage-1",
+    decisionId: "causal-decision-1",
+    opportunityId: "opportunity-1",
+    outcomeId: null,
+    instanceId: "3101",
+    laneId: "LANE",
+    symbolOrBasketId: "ETHUSDT",
+    direction: "SHORT",
+    featureSchemaVersion: "causal-paper-opportunity/1",
+    decisionRuleVersion: "paper-opportunity-admission/1",
+    attributionRuleVersion: "direct-paper-order-link/1",
+    cortexDecisionId: "cortex-decision-1",
+    allocationSnapshotId: "cortex-allocation-1",
+    canonicalCortexLaneId: "CG_WIDE_FAST_LONG",
+    cortexFeatureSchemaVersion: 1,
+    decisionPolicyVersion: "decision-policy/1",
+    executionPolicyVersion: "execution-policy/1",
+    evidencePolicyVersion: "evidence-policy/1",
+    evidenceEra: "era/1",
+    policyDeploymentAt: "2099-01-01T00:00:00.000Z",
+  };
+
+  it("stamps causalLineage on the primary intent AND its sourcePaperOrders entry, verbatim off the PaperOrder's causalIdentity at open time", async () => {
+    const order = paperOrder({ paperOrderId: "paper-lineage01", variantExitRule: "tp1_full", causalIdentity });
+    const { engine, store } = makeEngine({ paper: makePaperStore([order]) });
+    expect((await engine.arm()).ok).toBe(true);
+    await engine.tick();
+    const intent = store.getState().intents[0]!;
+    expect(intent.state).toBe("OPEN");
+    const expectedLineage = {
+      opportunityId: "opportunity-1",
+      cortexDecisionId: "cortex-decision-1",
+      allocationSnapshotId: "cortex-allocation-1",
+      canonicalCortexLaneId: "CG_WIDE_FAST_LONG",
+      instanceId: "3101",
+      policyDeploymentAt: "2099-01-01T00:00:00.000Z",
+    };
+    // Only the immutable subset is copied — never the whole CausalIdentity, never re-derived.
+    expect(intent.causalLineage).toEqual(expectedLineage);
+    expect(intent.sourcePaperOrders?.[0]?.causalLineage).toEqual(expectedLineage);
+  });
+
+  it("leaves causalLineage undefined when the PaperOrder carried no causalIdentity at open time — never fabricated", async () => {
+    const order = paperOrder({ paperOrderId: "paper-lineage02", variantExitRule: "tp1_full" });
+    const { engine, store } = makeEngine({ paper: makePaperStore([order]) });
+    expect((await engine.arm()).ok).toBe(true);
+    await engine.tick();
+    const intent = store.getState().intents[0]!;
+    expect(intent.state).toBe("OPEN");
+    expect(intent.causalLineage).toBeUndefined();
+    expect(intent.sourcePaperOrders?.[0]?.causalLineage).toBeUndefined();
+  });
+
+  it("never overwrites causalLineage on a later tick — the snapshot stays exactly what it was stamped at open", async () => {
+    const order = paperOrder({ paperOrderId: "paper-lineage03", variantExitRule: "tp1_full", causalIdentity });
+    const { engine, store } = makeEngine({ paper: makePaperStore([order]) });
+    expect((await engine.arm()).ok).toBe(true);
+    await engine.tick();
+    const beforeLineage = store.getState().intents[0]!.causalLineage;
+    expect(beforeLineage).toBeDefined();
+    // A later tick with no new candidates must not touch the already-open intent's lineage.
+    await engine.tick();
+    expect(store.getState().intents[0]!.causalLineage).toEqual(beforeLineage);
   });
 });
 

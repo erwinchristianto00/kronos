@@ -16,7 +16,15 @@ export type CortexProductionChainDiagnosticCode =
   | "CORTEX_TIER1_RESOLVED"
   | "CORTEX_LEARNER_ELIGIBLE"
   | "CORTEX_CHAIN_ELIGIBLE_CANDIDATE"
-  | "GENERIC_FOUR_BRAIN_DIAGNOSTIC_CANDIDATE";
+  | "GENERIC_FOUR_BRAIN_DIAGNOSTIC_CANDIDATE"
+  // Point 2 (late-binding executive review attach) — one code per distinct non-ATTACHED late-binding
+  // outcome, so app.ts's onExecutiveDecision never discards attachExecutiveReviewToExactPaperOrder's
+  // result silently. Report-only, like every other code in this file.
+  | "CORTEX_LATE_BINDING_INTENT_TERMINAL"
+  | "CORTEX_LATE_BINDING_LINEAGE_MISSING"
+  | "CORTEX_LATE_BINDING_LINEAGE_CONFLICT"
+  | "CORTEX_LATE_BINDING_REVIEW_CONFLICT"
+  | "CORTEX_LATE_BINDING_INDEX_MISS";
 
 const codes: readonly CortexProductionChainDiagnosticCode[] = [
   "CORTEX_SNAPSHOT_SCAN_MISSING",
@@ -32,6 +40,11 @@ const codes: readonly CortexProductionChainDiagnosticCode[] = [
   "CORTEX_LEARNER_ELIGIBLE",
   "CORTEX_CHAIN_ELIGIBLE_CANDIDATE",
   "GENERIC_FOUR_BRAIN_DIAGNOSTIC_CANDIDATE",
+  "CORTEX_LATE_BINDING_INTENT_TERMINAL",
+  "CORTEX_LATE_BINDING_LINEAGE_MISSING",
+  "CORTEX_LATE_BINDING_LINEAGE_CONFLICT",
+  "CORTEX_LATE_BINDING_REVIEW_CONFLICT",
+  "CORTEX_LATE_BINDING_INDEX_MISS",
 ] as const;
 
 const counters: Record<CortexProductionChainDiagnosticCode, number> = Object.fromEntries(

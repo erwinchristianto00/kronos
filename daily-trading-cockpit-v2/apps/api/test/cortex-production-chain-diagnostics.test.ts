@@ -23,6 +23,12 @@ const ALL_CODES: readonly CortexProductionChainDiagnosticCode[] = [
   "CORTEX_LEARNER_ELIGIBLE",
   "CORTEX_CHAIN_ELIGIBLE_CANDIDATE",
   "GENERIC_FOUR_BRAIN_DIAGNOSTIC_CANDIDATE",
+  // Point 2 (late-binding executive review attach) additions.
+  "CORTEX_LATE_BINDING_INTENT_TERMINAL",
+  "CORTEX_LATE_BINDING_LINEAGE_MISSING",
+  "CORTEX_LATE_BINDING_LINEAGE_CONFLICT",
+  "CORTEX_LATE_BINDING_REVIEW_CONFLICT",
+  "CORTEX_LATE_BINDING_INDEX_MISS",
 ];
 
 describe("cortex-production-chain-diagnostics", () => {
@@ -57,6 +63,11 @@ describe("cortex-production-chain-diagnostics", () => {
       "CORTEX_LEARNER_ELIGIBLE",
       "CORTEX_CHAIN_ELIGIBLE_CANDIDATE",
       "GENERIC_FOUR_BRAIN_DIAGNOSTIC_CANDIDATE",
+      "CORTEX_LATE_BINDING_INTENT_TERMINAL",
+      "CORTEX_LATE_BINDING_LINEAGE_MISSING",
+      "CORTEX_LATE_BINDING_LINEAGE_CONFLICT",
+      "CORTEX_LATE_BINDING_REVIEW_CONFLICT",
+      "CORTEX_LATE_BINDING_INDEX_MISS",
     ];
     for (const code of newCodes) {
       _resetCortexProductionChainDiagnosticsForTests();

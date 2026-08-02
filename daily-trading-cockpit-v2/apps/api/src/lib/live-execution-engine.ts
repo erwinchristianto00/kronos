@@ -724,6 +724,27 @@ export interface LiveIntent {
   cortexAttributed?: boolean;
   /** Optional immutable review lineage. Its absence never blocks incumbent execution. */
   executiveReviewLink?: ExecutiveReviewExecutionLink;
+  /** Immutable CORTEX/PaperOrder lineage identity, copied verbatim from the PRIMARY paper.causalIdentity
+   *  at openIntent() and never overwritten afterward — an intent is opened exactly once. Absent when the
+   *  primary PaperOrder carried no causalIdentity at open time (e.g. non-mirror/operator-copy opens).
+   *  Late-binding review attachment (executive-review-admission.ts) must compare against this, never
+   *  re-derive or guess, and must fail closed (not overwrite) if the PaperOrder's current causalIdentity
+   *  has since diverged (see paper-execution-router.ts's `if (identity && identity !== order.causalIdentity)
+   *  store.update(...)` re-price path — causalIdentity CAN be reassigned post-admission). */
+  causalLineage?: LiveIntentCausalLineage;
+}
+
+/** Immutable subset of CausalIdentity (forward-causal-collection.ts) captured on a LiveIntent at open
+ *  time, so a late-binding Executive Review attach can compare against exactly what this intent was
+ *  opened for, without ever re-deriving or reading a PaperOrder's (possibly since-reassigned)
+ *  causalIdentity as the source of truth. */
+export interface LiveIntentCausalLineage {
+  opportunityId: string;
+  cortexDecisionId: string | null;
+  allocationSnapshotId: string | null;
+  canonicalCortexLaneId: string | null;
+  instanceId: string;
+  policyDeploymentAt: string;
 }
 
 export interface LiveIntentSource {
@@ -736,6 +757,27 @@ export interface LiveIntentSource {
   controllerMode?: string | null;
   controllerConfidence?: string | null;
   executiveReviewLink?: ExecutiveReviewExecutionLink;
+  /** Same immutable lineage contract as LiveIntent.causalLineage, but for THIS source order — a
+   *  non-primary netted/pyramid source's PaperOrder can carry distinct/independently-drifting
+   *  lineage from the primary, so each source order gets its own snapshot taken at the moment it is
+   *  added to sourcePaperOrders (open, or a later pyramid add), never overwritten afterward. */
+  causalLineage?: LiveIntentCausalLineage;
+}
+
+/** Snapshots a PaperOrder's causalIdentity into the immutable subset a LiveIntent/LiveIntentSource
+ *  persists, at the exact moment the order becomes (or is added to) an intent. Undefined when the
+ *  order carried no causalIdentity at that moment — never fabricated, never re-derived later. */
+function lineageFromPaperOrder(order: PaperOrder): LiveIntentCausalLineage | undefined {
+  const identity = order.causalIdentity;
+  if (!identity) return undefined;
+  return {
+    opportunityId: identity.opportunityId,
+    cortexDecisionId: identity.cortexDecisionId,
+    allocationSnapshotId: identity.allocationSnapshotId,
+    canonicalCortexLaneId: identity.canonicalCortexLaneId,
+    instanceId: identity.instanceId,
+    policyDeploymentAt: identity.policyDeploymentAt,
+  };
 }
 
 export type LivePerformanceView = "hourly" | "daily" | "weekly" | "monthly" | "yearly";
@@ -6401,6 +6443,9 @@ export class LiveExecutionEngine {
       cortexAppliedWeightPct: planned[0]!.cortexAppliedWeightPct,
       cortexRawStaticWeightPct: planned[0]!.cortexRawStaticWeightPct,
       executiveReviewLink: paper.executiveReviewLink ?? undefined,
+      // Immutable lineage snapshot, taken once here at intent creation — see LiveIntent.causalLineage's
+      // doc comment. Never revisited by any later mutation of this intent.
+      causalLineage: lineageFromPaperOrder(paper),
       createdAt: now,
       updatedAt: now,
       closedAt: null,
@@ -6415,6 +6460,7 @@ export class LiveExecutionEngine {
         controllerMode: source.controllerMode ?? null,
         controllerConfidence: source.controllerConfidence ?? null,
         executiveReviewLink: source.executiveReviewLink ?? undefined,
+        causalLineage: lineageFromPaperOrder(source),
       })),
     };
     st.intents.push(intent);
@@ -6696,6 +6742,7 @@ export class LiveExecutionEngine {
           controllerMode: paper.controllerMode ?? null,
           controllerConfidence: paper.controllerConfidence ?? null,
           executiveReviewLink: paper.executiveReviewLink ?? undefined,
+          causalLineage: lineageFromPaperOrder(paper),
         })),
       ];
 

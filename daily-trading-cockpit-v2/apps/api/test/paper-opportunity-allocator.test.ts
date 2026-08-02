@@ -59,6 +59,7 @@ import {
   type MixedRegimeReport,
 } from "../src/lib/mixed-regime-router.js";
 import { CORTEX_FEATURE_SCHEMA_VERSION } from "../src/lib/cortex-brain.js";
+import { cortexAllocationSnapshotId, cortexDecisionId } from "../src/lib/cortex-decision-snapshot.js";
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -1391,11 +1392,20 @@ describe("paper-opportunity-allocator", () => {
     const unlabelled = buildPaperOpportunityAllocatorReport(common);
     const selected = unlabelled.selectedOpportunities.find((opportunity) => opportunity.canonicalCortexLaneId !== null)!;
     expect(selected).toBeDefined();
+    // Point 4 hardening (cortex-decision-snapshot.ts): validSnapshot() now requires decisionId/
+    // allocationSnapshotId to exactly match the canonical derivation from atMs/laneId/
+    // featureSchemaVersion — the same identity functions the one real producer (runCortexShadowTick)
+    // uses — so this hand-built fixture must derive them the same way rather than pick arbitrary
+    // strings, or exactCortexDecisionSnapshotForScan (called inside buildPaperOpportunityAllocatorReport)
+    // now refuses it as INVALID.
+    const snapshotAtMs = now.getTime() - 1_000;
+    const snapshotLaneId = selected.canonicalCortexLaneId!;
+    const snapshotDecisionId = cortexDecisionId(snapshotAtMs, snapshotLaneId, CORTEX_FEATURE_SCHEMA_VERSION);
     const snapshot = {
-      decisionId: "cortex-decision:allocator-cycle",
-      allocationSnapshotId: "cortex-allocation:allocator-cycle",
-      atMs: now.getTime() - 1_000,
-      laneId: selected.canonicalCortexLaneId!,
+      decisionId: snapshotDecisionId,
+      allocationSnapshotId: cortexAllocationSnapshotId(snapshotDecisionId),
+      atMs: snapshotAtMs,
+      laneId: snapshotLaneId,
       direction: selected.direction,
       featureSchemaVersion: CORTEX_FEATURE_SCHEMA_VERSION,
       featureVector: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0],

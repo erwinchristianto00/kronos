@@ -177,9 +177,10 @@ import { getRegimeDirectionControllerSnapshotStore } from "./lib/regime-directio
 import { getRegimeEdgeMemory } from "./lib/regime-edge-memory.js";
 import { cortexBrainMode } from "./lib/cortex-brain.js";
 import { CortexBrainStore, CortexDecisionJournal, runCortexShadowTick } from "./lib/cortex-brain-store.js";
-import { publishCortexDecisionSnapshotsForScan } from "./lib/cortex-decision-snapshot.js";
+import { isScanBatchPublished, publishCortexDecisionSnapshotsForScan } from "./lib/cortex-decision-snapshot.js";
 import { allocationContextWithExactCortexPaperBridge } from "./lib/cortex-paper-allocation-bridge.js";
 import { buildPaperOrderOwnershipIndex } from "./lib/paper-order-ownership-index.js";
+import { buildLiveIntentIndexByPaperOrderId } from "./lib/live-intent-index.js";
 import { cortexProductionChainDiagnostics, recordCortexProductionChainDiagnostic } from "./lib/cortex-production-chain-diagnostics.js";
 import { standaloneCortexShadowAllowed } from "./lib/cortex-instance-diagnosis.js";
 import { runFourBrainShadowCycle } from "./lib/four-brain-live-wiring.js";
@@ -1258,7 +1259,14 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           resolvedThisCycle: 0,
           promotion,
         });
-        if (cached?.scanBatchId) {
+        if (cached?.scanBatchId && !isScanBatchPublished(cached.scanBatchId)) {
+          // Point 1 fix: this 5-min tick can re-fire against the SAME scanBatchId as its own prior
+          // call (the scan cache refreshes only every 7 min) — that repeat must never be attempted as
+          // a fresh publish, since its content (a new nowIso ⇒ new atMs ⇒ new decisionIds) can never
+          // byte-match the first call and would poison the batch as a false CONFLICT. Once ANY content
+          // has been accepted for this scanBatchId, skip re-publishing entirely. A genuinely different
+          // publish under this scanBatchId from any OTHER source is unaffected — this guard only ever
+          // skips OUR OWN routine repeat, publishCortexDecisionSnapshotsForScan itself is unchanged.
           const publication = publishCortexDecisionSnapshotsForScan(cached.scanBatchId, snapshots);
           if (publication === "CONFLICT" || publication === "INVALID") {
             recordCortexProductionChainDiagnostic("CORTEX_SCAN_PUBLICATION_CONFLICT");
@@ -2217,7 +2225,10 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           resolvedThisCycle: 0,
           promotion: null,
         });
-        if (cached?.scanBatchId) {
+        if (cached?.scanBatchId && !isScanBatchPublished(cached.scanBatchId)) {
+          // Point 1 fix: see the identical guard/rationale in cortexShadowTick above — this standalone
+          // tick is the other of the only two callers of publishCortexDecisionSnapshotsForScan in the
+          // repo, and re-fires on the same 5-min-vs-7-min-cache cadence.
           const publication = publishCortexDecisionSnapshotsForScan(cached.scanBatchId, result.snapshots);
           if (publication === "CONFLICT" || publication === "INVALID") {
             recordCortexProductionChainDiagnostic("CORTEX_SCAN_PUBLICATION_CONFLICT");
@@ -2388,6 +2399,11 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     // through it instead of a fresh linear scan over the full order book — GAP A. Reused rather than
     // rebuilt, exactly like lastFourBrainGatherBase's own per-cycle retention contract further down.
     let lastPaperOrderOwnershipIndex: ReturnType<typeof buildPaperOrderOwnershipIndex> | null = null;
+    // Retained handle: the SAME per-tick live-intent index buildFourBrainDeps just built (below), so
+    // onExecutiveDecision's late-binding attach (point 2) can do an O(1)-ish lookup through it instead
+    // of a fresh linear scan over the full intent store — point 5, mirroring
+    // lastPaperOrderOwnershipIndex's identical per-cycle retention contract immediately above.
+    let lastLiveIntentIndexByPaperOrderId: ReturnType<typeof buildLiveIntentIndexByPaperOrderId> | null = null;
 
     const collectFourBrainOpenSignals = (): FourBrainBindingDeps["openSignals"] => {
       const out: FourBrainBindingDeps["openSignals"] = [];
@@ -2547,6 +2563,11 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       // index instead of each candidate re-deriving its own O(orders) scan/filter.
       const paperOrderOwnershipIndex = buildPaperOrderOwnershipIndex(peekPaperExecutionRouterStore()?.all ?? []);
       lastPaperOrderOwnershipIndex = paperOrderOwnershipIndex;
+      // Built ONCE per gather/tick from the SAME liveExecutionStore intents this cycle's `intents`
+      // local (above) already read — point 5. Every subsequent late-binding attach lookup this cycle
+      // (onExecutiveDecision, below) is then O(1) through this index rather than a fresh linear scan.
+      const liveIntentIndexByPaperOrderId = buildLiveIntentIndexByPaperOrderId(intents);
+      lastLiveIntentIndexByPaperOrderId = liveIntentIndexByPaperOrderId;
       // Memoized PER-CALL (one buildFourBrainDeps() == one gather/tick, per its own doc comment above) so
       // the 4 CE bucket lanes share ONE composite-estimator report build, not one per direction × per CE
       // lane bestLaneReportForDirection ends up scanning — mirrors buildLiveCortexGatherDeps's identical
@@ -2663,12 +2684,18 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         // CORTEX id is created: beta remains zero and no exact promoted snapshot exists to hand off.
         allocationContextForLane: (laneId, candidate) => {
           const base = staticAllocationContext(engine ? engine.rawLaneAllocationWeightPctForLane(laneId) : null);
-          return allocationContextWithExactCortexPaperBridge({
+          // The bridge itself fails immediately/distinctly on OWNERSHIP_MISSING/OWNERSHIP_AMBIGUOUS
+          // (never a fallthrough guess) — see cortex-paper-allocation-bridge.ts. This callback's own
+          // contract (four-brain-live-gather-bindings.ts) is fixed to return a plain AllocationContext,
+          // so a non-BRIDGED result here still falls back to `base` exactly as before, preserving the
+          // downstream contract while the bridge's own return has already been made explicit.
+          const result = allocationContextWithExactCortexPaperBridge({
             base,
             candidate,
             laneId,
             ownershipIndex: paperOrderOwnershipIndex,
           });
+          return result.status === "BRIDGED" ? result.context : base;
         },
         // A review may only use a scanner context that was atomically persisted before the decision.
         // Missing/future scanner timestamps remain explicit unavailable lineage, never a latest-cache join.
@@ -2809,17 +2836,35 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           try {
             const paperStore = peekPaperExecutionRouterStore();
             if (!paperStore) return;
-            attachExecutiveReviewToExactPaperOrder({
+            const result = attachExecutiveReviewToExactPaperOrder({
               reviewStore: executiveReviewStore,
               paperStore,
               executive,
               candidateId: identity.signalId,
-              executingPaperOrderIds: new Set((liveExecutionStore?.getState().intents ?? []).map((intent) => intent.paperOrderId)),
+              // The SAME this-cycle intent index buildFourBrainDeps already built (point 5) — never a
+              // fresh linear scan/map over liveExecutionStore.getState().intents per candidate.
+              // Includes conflictedPaperOrderIds (live-intent-index.ts's documented collision
+              // policy) alongside the resolvable keys: a paperOrderId the index could not resolve
+              // to exactly one owning intent still unambiguously belongs to at least one live
+              // intent, so it must still be treated as executing — attachExecutiveReviewToExactPaperOrder
+              // then fails closed on it via its pre-existing INTENT_INDEX_MISS path (the index has
+              // no resolvable entry for it), never guessing which intent owns it.
+              executingPaperOrderIds: new Set([
+                ...(lastLiveIntentIndexByPaperOrderId?.keys() ?? []),
+                ...(lastLiveIntentIndexByPaperOrderId?.conflictedPaperOrderIds ?? []),
+              ]),
               // The SAME this-cycle ownership index buildFourBrainDeps already built (GAP A) — never a
               // fresh linear scan. Empty-map fallback only if no cycle has run yet this process, which
               // fails closed exactly like a real 0-match lookup (NO_EXACT_CANDIDATE), never fabricating
               // a match.
               paperOrderOwnershipIndex: lastPaperOrderOwnershipIndex ?? new Map(),
+              // Point 2/5: enables late-binding attach when the order already turned into a live
+              // execution intent before this review ran. Omitting either param (no cycle has produced
+              // an index yet, or no liveExecutionStore configured) falls back to today's exact
+              // ORDER_ALREADY_EXECUTING behavior — see attachExecutiveReviewToExactPaperOrder's own
+              // doc comment.
+              liveIntentIndexByPaperOrderId: lastLiveIntentIndexByPaperOrderId ?? new Map(),
+              saveLiveIntents: () => liveExecutionStore?.save(),
               // The SAME this-cycle gather deps that already feed journalContext above — never a
               // later/current rehydration — so this snapshot is exactly what this tick's brains
               // consumed. Deep-cloned by attachExecutiveReviewToExactPaperOrder before persisting.
@@ -2827,6 +2872,32 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
                 ? buildFourBrainJournalContext(lastFourBrainGatherBase, activeFourBrainAllocation())
                 : null,
             });
+            // Result is no longer discarded — report-only visibility into every distinct late-binding
+            // rejection (point 2), never read anywhere that influences selection/admission/allocation/
+            // execution. Every other ExecutiveReviewAdmissionResult already records its own diagnostic
+            // internally (CORTEX_CANDIDATE_OWNERSHIP_MISSING/AMBIGUOUS, CORTEX_EXECUTIVE_ATTACHMENT_
+            // REJECTED) or is an ordinary, expected non-event (NO_EXACT_CANDIDATE, MARKET_CONTEXT_
+            // UNAVAILABLE, ORDER_ALREADY_LINKED, ORDER_ALREADY_EXECUTING, POST_FIX_POLICY_MISSING,
+            // STALE_CAUSAL_IDENTITY, REVIEW_CONFLICT).
+            switch (result) {
+              case "INTENT_TERMINAL":
+                recordCortexProductionChainDiagnostic("CORTEX_LATE_BINDING_INTENT_TERMINAL");
+                break;
+              case "INTENT_LINEAGE_MISSING":
+                recordCortexProductionChainDiagnostic("CORTEX_LATE_BINDING_LINEAGE_MISSING");
+                break;
+              case "INTENT_LINEAGE_CONFLICT":
+                recordCortexProductionChainDiagnostic("CORTEX_LATE_BINDING_LINEAGE_CONFLICT");
+                break;
+              case "INTENT_REVIEW_CONFLICT":
+                recordCortexProductionChainDiagnostic("CORTEX_LATE_BINDING_REVIEW_CONFLICT");
+                break;
+              case "INTENT_INDEX_MISS":
+                recordCortexProductionChainDiagnostic("CORTEX_LATE_BINDING_INDEX_MISS");
+                break;
+              default:
+                break;
+            }
           } catch {
             // Executive review creation cannot affect incumbent paper/exchange execution.
           }
