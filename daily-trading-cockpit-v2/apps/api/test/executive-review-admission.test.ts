@@ -12,8 +12,25 @@ import {
 import { attachExecutiveReviewToExactPaperOrder } from "../src/lib/executive-review-admission.js";
 import { ExecutiveReviewStore } from "../src/lib/executive-review-store.js";
 import { PaperExecutionRouterStore, type PaperOrder } from "../src/lib/paper-execution-router.js";
+import { buildPaperOrderOwnershipIndex } from "../src/lib/paper-order-ownership-index.js";
 import type { CausalIdentity } from "../src/experience-engine/forward-causal-collection.js";
 import type { ExecutiveDecision } from "../src/lib/four-brain-types.js";
+import {
+  _resetCortexProductionChainDiagnosticsForTests,
+  cortexProductionChainDiagnostics,
+} from "../src/lib/cortex-production-chain-diagnostics.js";
+
+// The shared per-tick ownership index (paper-order-ownership-index.ts), rebuilt fresh off the
+// store's CURRENT orders immediately before each attach call below — exactly mirroring the old
+// `input.paperStore.all.filter(...)` scan's always-current-state semantics, so every existing
+// assertion below still proves identical matching behavior, just reached through the index instead
+// of a linear scan. Production instead builds this once per tick (app.ts) and reuses it across the
+// whole tick's decisions; per-call rebuilding here is what "always reflects the current store"
+// requires when a single test performs several sequential attach calls with store mutations
+// between them (e.g. the cross-link test below).
+function ownershipIndexFor(store: PaperExecutionRouterStore): ReturnType<typeof buildPaperOrderOwnershipIndex> {
+  return buildPaperOrderOwnershipIndex(store.all);
+}
 
 // Every fixture order below is created/opened at 1_000ms (1970-01-01T00:00:01.000Z); the
 // deployment boundary must be at or before that instant for isCausalIdentityCurrentlyValid's
@@ -151,6 +168,7 @@ describe("Executive Review admission", () => {
         candidateId: "candidate-1",
         executingPaperOrderIds: new Set(),
         env: shadowEnv,
+        paperOrderOwnershipIndex: ownershipIndexFor(paperStore),
       })).toBe("ATTACHED");
       expect(reviewStore.get().reviews).toHaveLength(1);
       expect(paperStore.all[0]?.executiveReviewLink).toMatchObject({
@@ -164,17 +182,41 @@ describe("Executive Review admission", () => {
   });
 
   it("does not cross-link same-symbol records, executing orders, or unstamped legacy evidence", () => {
+    _resetCortexProductionChainDiagnosticsForTests();
     const dir = mkdtempSync(join(tmpdir(), "executive-review-admission-"));
     try {
       const paperStore = new PaperExecutionRouterStore(dir);
       paperStore.add(paper());
       paperStore.add(paper({ paperOrderId: "paper-2", sourceObservationId: "candidate-2", sourceSignalId: "candidate-2", dedupeKey: "candidate-2:LANE" }));
       const reviewStore = new ExecutiveReviewStore(join(dir, "reviews.json"));
-      expect(attachExecutiveReviewToExactPaperOrder({ reviewStore, paperStore, executive: executive(), candidateId: "candidate-other", executingPaperOrderIds: new Set(), env: shadowEnv })).toBe("NO_EXACT_CANDIDATE");
-      expect(attachExecutiveReviewToExactPaperOrder({ reviewStore, paperStore, executive: executive(), candidateId: "candidate-1", executingPaperOrderIds: new Set(["paper-1"]), env: shadowEnv })).toBe("ORDER_ALREADY_EXECUTING");
+      expect(attachExecutiveReviewToExactPaperOrder({ reviewStore, paperStore, executive: executive(), candidateId: "candidate-other", executingPaperOrderIds: new Set(), env: shadowEnv, paperOrderOwnershipIndex: ownershipIndexFor(paperStore) })).toBe("NO_EXACT_CANDIDATE");
+      // Point 11: report-only — a 0-match ownership lookup is recorded distinctly from the ambiguous
+      // case, never influencing the NO_EXACT_CANDIDATE result itself.
+      expect(cortexProductionChainDiagnostics().CORTEX_CANDIDATE_OWNERSHIP_MISSING).toBe(1);
+      expect(cortexProductionChainDiagnostics().CORTEX_CANDIDATE_OWNERSHIP_AMBIGUOUS).toBe(0);
+      expect(attachExecutiveReviewToExactPaperOrder({ reviewStore, paperStore, executive: executive(), candidateId: "candidate-1", executingPaperOrderIds: new Set(["paper-1"]), env: shadowEnv, paperOrderOwnershipIndex: ownershipIndexFor(paperStore) })).toBe("ORDER_ALREADY_EXECUTING");
       // Genuinely unstamped legacy evidence: never received a causal identity at all.
       paperStore.update("paper-1", { causalIdentity: null });
-      expect(attachExecutiveReviewToExactPaperOrder({ reviewStore, paperStore, executive: executive(), candidateId: "candidate-1", executingPaperOrderIds: new Set(), env: shadowEnv })).toBe("POST_FIX_POLICY_MISSING");
+      expect(attachExecutiveReviewToExactPaperOrder({ reviewStore, paperStore, executive: executive(), candidateId: "candidate-1", executingPaperOrderIds: new Set(), env: shadowEnv, paperOrderOwnershipIndex: ownershipIndexFor(paperStore) })).toBe("POST_FIX_POLICY_MISSING");
+      expect(reviewStore.get().reviews).toHaveLength(0);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed with AMBIGUOUS_PAPER_OWNERSHIP, and records the ownership-index-ambiguous diagnostic, when two admissible orders share the exact same ownership key", () => {
+    _resetCortexProductionChainDiagnosticsForTests();
+    const dir = mkdtempSync(join(tmpdir(), "executive-review-admission-ambiguous-"));
+    try {
+      const paperStore = new PaperExecutionRouterStore(dir);
+      // Duplicate admission: same sourceObservationId + selectedLaneId + direction, both still
+      // actionable (CREATED) — a real, if unwanted, ambiguity in the persisted order book.
+      paperStore.add(paper());
+      paperStore.add(paper({ paperOrderId: "paper-1-duplicate" }));
+      const reviewStore = new ExecutiveReviewStore(join(dir, "reviews.json"));
+      expect(attachExecutiveReviewToExactPaperOrder({ reviewStore, paperStore, executive: executive(), candidateId: "candidate-1", executingPaperOrderIds: new Set(), env: shadowEnv, paperOrderOwnershipIndex: ownershipIndexFor(paperStore) })).toBe("AMBIGUOUS_PAPER_OWNERSHIP");
+      expect(cortexProductionChainDiagnostics().CORTEX_CANDIDATE_OWNERSHIP_AMBIGUOUS).toBe(1);
+      expect(cortexProductionChainDiagnostics().CORTEX_CANDIDATE_OWNERSHIP_MISSING).toBe(0);
       expect(reviewStore.get().reviews).toHaveLength(0);
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -194,6 +236,7 @@ describe("Executive Review admission", () => {
         candidateId: "candidate-1",
         executingPaperOrderIds: new Set(),
         env: shadowEnv,
+        paperOrderOwnershipIndex: ownershipIndexFor(paperStore),
       })).toBe("STALE_CAUSAL_IDENTITY");
       expect(reviewStore.get().reviews).toHaveLength(0);
     } finally {
@@ -216,6 +259,7 @@ describe("Executive Review admission", () => {
         executingPaperOrderIds: new Set(),
         env: shadowEnv,
         brainFeatureSnapshot: snapshot,
+        paperOrderOwnershipIndex: ownershipIndexFor(paperStore),
       })).toBe("ATTACHED");
       // Mutate the caller's own object AFTER admission — the persisted copy must be unaffected.
       snapshot.trendScore = 999;
@@ -239,6 +283,7 @@ describe("Executive Review admission", () => {
         candidateId: "candidate-1",
         executingPaperOrderIds: new Set(),
         env: shadowEnv,
+        paperOrderOwnershipIndex: ownershipIndexFor(paperStore),
       })).toBe("ATTACHED");
       expect(reviewStore.get().reviews[0]?.brainFeatureSnapshot ?? null).toBeNull();
     } finally {
@@ -264,10 +309,81 @@ describe("Executive Review admission", () => {
         candidateId: "candidate-1",
         executingPaperOrderIds: new Set(),
         env: shadowEnv,
+        paperOrderOwnershipIndex: ownershipIndexFor(paperStore),
       })).toBe("ATTACHED");
       const stamped = reviewStore.get().reviews[0]?.sourceStatuses;
       expect(stamped?.marketState?.candle).toBe("STALE");
       expect(stamped?.entry?.candle).toBe("FRESH");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // GAP A: prove the lookup now goes through the shared O(1) ownership index instead of a fresh
+  // linear `.filter(...)` scan over `paperStore.all`, and that the result is identical either way
+  // once the index is actually given the matching data.
+  it("resolves the exact candidate strictly through the supplied ownership index, never by independently scanning paperStore.all", () => {
+    const dir = mkdtempSync(join(tmpdir(), "executive-review-admission-index-"));
+    try {
+      const paperStore = new PaperExecutionRouterStore(dir);
+      paperStore.add(paper());
+      const reviewStore = new ExecutiveReviewStore(join(dir, "reviews.json"));
+
+      // Deliberately built from an EMPTY order list, not from paperStore.all — paperStore itself
+      // still holds the exact matching order (paper-1 / candidate-1 / LANE / LONG / CREATED). If
+      // the function still ran its own linear scan over `input.paperStore.all` (the pre-fix
+      // behavior), this call would return ATTACHED regardless of what index is supplied. Getting
+      // NO_EXACT_CANDIDATE here instead proves the lookup is resolved strictly through
+      // `paperOrderOwnershipIndex`, not re-derived from the store.
+      const staleEmptyIndex = buildPaperOrderOwnershipIndex([]);
+      expect(attachExecutiveReviewToExactPaperOrder({
+        reviewStore,
+        paperStore,
+        executive: executive(),
+        candidateId: "candidate-1",
+        executingPaperOrderIds: new Set(),
+        env: shadowEnv,
+        paperOrderOwnershipIndex: staleEmptyIndex,
+      })).toBe("NO_EXACT_CANDIDATE");
+      expect(reviewStore.get().reviews).toHaveLength(0);
+
+      // Same store, same candidate — now looked up through the correct index built off the
+      // store's current orders (buildPaperOrderOwnershipIndex(paperStore.all), THE per-tick
+      // contract app.ts follows). Matching behavior is unchanged from the pre-fix scan: it still
+      // attaches exactly once the ownership triple is actually resolvable.
+      expect(attachExecutiveReviewToExactPaperOrder({
+        reviewStore,
+        paperStore,
+        executive: executive(),
+        candidateId: "candidate-1",
+        executingPaperOrderIds: new Set(),
+        env: shadowEnv,
+        paperOrderOwnershipIndex: ownershipIndexFor(paperStore),
+      })).toBe("ATTACHED");
+      expect(reviewStore.get().reviews).toHaveLength(1);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("trusts the supplied index's own order data rather than re-deriving the candidate from paperStore.all", () => {
+    const dir = mkdtempSync(join(tmpdir(), "executive-review-admission-index2-"));
+    try {
+      // Deliberately empty — nothing ever added via paperStore.add(...). The old `.filter(...)`
+      // scan over `input.paperStore.all` would have found zero orders here no matter what.
+      const paperStore = new PaperExecutionRouterStore(dir);
+      const reviewStore = new ExecutiveReviewStore(join(dir, "reviews.json"));
+      const externallyBuiltIndex = buildPaperOrderOwnershipIndex([paper()]);
+      expect(paperStore.all).toHaveLength(0);
+      expect(attachExecutiveReviewToExactPaperOrder({
+        reviewStore,
+        paperStore,
+        executive: executive(),
+        candidateId: "candidate-1",
+        executingPaperOrderIds: new Set(),
+        env: shadowEnv,
+        paperOrderOwnershipIndex: externallyBuiltIndex,
+      })).toBe("ATTACHED");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

@@ -446,6 +446,14 @@ export interface PaperOrder {
   sourceCandidateId?: string | null;
   /** Allocator-lane only: the scan batch (generatedAt) this order belongs to. */
   scanBatchId?: string | null;
+  /**
+   * Half of THE canonical persisted candidate-ownership identity, together with `selectedLaneId`
+   * (below) and `direction`. This triple — never anything else — is what every downstream
+   * consumer (the CORTEX/paper allocation bridge, the executive-review admission path, Tier-1
+   * outcome attribution) joins a live candidate back to this order through. See
+   * `paperOrderOwnershipKey`/`buildPaperOrderOwnershipIndex` in paper-order-ownership-index.ts
+   * for the one shared implementation of that join — never reimplement the equality inline.
+   */
   sourceObservationId: string;
   sourceSignalId: string | null;
   dedupeKey: string; // `${sourceObservationId}:${selectedLaneId}`
@@ -502,6 +510,12 @@ export interface PaperOrder {
   axisKey?: string;
   controllerMode: string;
   controllerConfidence?: string | null;
+  /**
+   * The other half of THE canonical persisted candidate-ownership identity — see the doc comment
+   * on `sourceObservationId` above. Prefixed (e.g. `CG_LONG_VARIANT_MATRIX:CG_WIDE_FAST_LONG`),
+   * exact, and the same value every downstream ownership-key consumer compares against; never
+   * substitute the bare variant/lane id.
+   */
   selectedLaneId: string;
   routerPermission: string;
   entryPrice: number;

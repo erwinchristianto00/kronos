@@ -108,6 +108,16 @@ export interface FourBrainIdentity {
   positionId: string | null;
   horizon: string | null;
   decisionAtMs: number;
+  /**
+   * Report-only entry-candidate provenance tag (see FourBrainBindingDeps.openSignals' doc comment
+   * in four-brain-live-gather-bindings.ts for the full contract). "PAPER_ORDER_OWNED" candidates
+   * carry THE canonical ownership key and are attachable to a real Executive Review;
+   * "VARIANT_MATRIX_SHADOW" candidates are shadow-tape diagnostics only and structurally cannot
+   * attach. null for exit candidates (positionId-identified) and legacy named-lane entry
+   * candidates whose ownership chain is untouched by this stage. Never read by any brain's
+   * decision logic — visibility only.
+   */
+  sourceKind?: "PAPER_ORDER_OWNED" | "VARIANT_MATRIX_SHADOW" | null;
 }
 
 /** A canonical key for duplicate detection. Two candidates with the SAME (laneId, symbol, side, signalId|

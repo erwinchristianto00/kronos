@@ -28,6 +28,7 @@ import {
   type CortexFeatureProvenance,
 } from "../experience-engine/cortex-experience-bridge.js";
 import type { CanonicalPolicyContext, ForwardEvent } from "../experience-engine/forward-causal-collection.js";
+import { recordCortexProductionChainDiagnostic } from "./cortex-production-chain-diagnostics.js";
 
 export const CORTEX_SHADOW_REFIT_SCHEMA_VERSION = "cortex-shadow-refit/3" as const;
 export const CORTEX_SHADOW_REFIT_DEFAULT_EPOCH = "2026-08-01T07:19:35.000Z";
@@ -117,8 +118,18 @@ export interface CortexShadowFoldResult {
   readonly fold: number;
   readonly trainStartMs: number | null;
   readonly trainEndMs: number | null;
-  /** The only recency-weighting clock allowed for this fold: the final resolved training row. */
+  /** The only recency-weighting clock allowed for this fold: an explicit max over the resolvedTimeMs
+   * of every row actually included in `trainExampleIds`. Never derived from array position — fold
+   * membership is ordered by cortexDecisionTimeMs, so the last element in that order is not
+   * guaranteed to be the latest-resolved one (a later-decided row can resolve before an
+   * earlier-decided one still open). */
   readonly trainingCutoffMs: number | null;
+  /** Decision-time boundary between this fold's training window and its held-out window (the arrival
+   * time of the first held-out candidate). Fold membership, the train/OOS split, and the purge/embargo
+   * boundary are all defined on this clock. A row decided inside the training window is promoted into
+   * `trainExampleIds` only once its own resolvedTimeMs is <= this cutoff: a decided-but-still-open
+   * position is real future information relative to this fold and must never train it. */
+  readonly evidenceCutoffMs: number | null;
   readonly oosStartMs: number | null;
   readonly oosEndMs: number | null;
   readonly trainN: number;
@@ -396,6 +407,10 @@ export function buildCortexShadowTrainingDataset(input: {
       netR: outcome.netR,
       policyDeploymentAt: outcome.policyDeploymentAt ?? "",
     });
+    // Point 11: report-only — this resolved outcome just fed the shadow-learner training dataset.
+    // Never read by fitArchetype/candidateForDataset or anything downstream; purely a visibility
+    // counter for how much Tier-1 evidence actually becomes learner-eligible.
+    recordCortexProductionChainDiagnostic("CORTEX_LEARNER_ELIGIBLE");
   }
   const ordered = sorted(examples, (a, b) => a.cortexDecisionTimeMs - b.cortexDecisionTimeMs || a.exampleId.localeCompare(b.exampleId));
   return {
@@ -487,14 +502,18 @@ function heldOutDelta(heldOut: readonly CortexShadowHeldOutPrediction[]): number
 }
 
 function fitArchetype(
-  rows: readonly CortexShadowTrainingExample[], prior: readonly number[], fitCutoffMs: number | null,
+  rows: readonly CortexShadowTrainingExample[], prior: readonly number[], latestTrainingResolvedTimeMs: number | null,
   hyperparameters: CortexShadowRefitHyperparameters,
 ): { fit: CortexEconomicFit; folds: CortexShadowFoldResult[]; blockers: string[]; cautions: string[] } {
-  const ordered = sorted(rows, (a, b) => a.resolvedTimeMs - b.resolvedTimeMs || a.exampleId.localeCompare(b.exampleId));
+  // Chronology for fold construction is the CORTEX decision clock, never the resolution clock — this
+  // is the order candidates actually arrive in production. Evidence *availability* inside each fold
+  // is still governed by resolution time (see the resolvedTimeMs filter below); the two clocks are
+  // deliberately different and must never be collapsed back into one sort key.
+  const ordered = sorted(rows, (a, b) => a.cortexDecisionTimeMs - b.cortexDecisionTimeMs || a.exampleId.localeCompare(b.exampleId));
   // A candidate must be a function of immutable evidence, not the operator's wall clock.
-  const fullFit = fitCutoffMs == null
+  const fullFit = latestTrainingResolvedTimeMs == null
     ? { coefficients: [...prior], residualScale: null, effectiveSampleSize: 0, status: "INSUFFICIENT_DATA" as const }
-    : refitCortexEconomicModel(ordered.map((row) => ({ x: [...row.x], realizedNetR: row.netR, tMs: row.resolvedTimeMs, schemaVersion: CORTEX_FEATURE_SCHEMA_VERSION })), [...prior], { nowMs: fitCutoffMs, ...hyperparameters });
+    : refitCortexEconomicModel(ordered.map((row) => ({ x: [...row.x], realizedNetR: row.netR, tMs: row.resolvedTimeMs, schemaVersion: CORTEX_FEATURE_SCHEMA_VERSION })), [...prior], { nowMs: latestTrainingResolvedTimeMs, ...hyperparameters });
   const folds: CortexShadowFoldResult[] = [];
   const blockers: string[] = [];
   const cautions: string[] = [];
@@ -503,13 +522,33 @@ function fitArchetype(
   if (foldSize < hyperparameters.minOosExamples) blockers.push("OOS_FOLDS_BELOW_MINIMUM");
   else for (let fold = 0; fold < hyperparameters.folds; fold += 1) {
     const trainEnd = hyperparameters.minTrainExamples + fold * foldSize;
-    const train = ordered.slice(0, trainEnd);
-    const oos = ordered.slice(trainEnd, Math.min(ordered.length, trainEnd + foldSize));
+    const decisionWindow = ordered.slice(0, trainEnd);
+    const oosCandidate = ordered.slice(trainEnd, Math.min(ordered.length, trainEnd + foldSize));
+    // The actual decision-time boundary of the training window (last decided row inside it). This is
+    // the anchor for the purge/embargo gap — the same role the old resolvedTimeMs-based
+    // trainingCutoffMs played, just expressed on the decision clock as the spec requires.
+    const trainWindowDecisionEndMs = decisionWindow.at(-1)?.cortexDecisionTimeMs ?? null;
+    // The fold's evidence cutoff is the decision-time arrival of the first held-out candidate — the
+    // exact moment a real system would need a prediction. It is deliberately NOT
+    // trainWindowDecisionEndMs: a decision can never resolve before itself, so using the training
+    // window's own last decision time here would always fail the resolvedTimeMs filter below and
+    // silently shrink every fold's training set by one.
+    const evidenceCutoffMs = oosCandidate[0]?.cortexDecisionTimeMs ?? trainWindowDecisionEndMs;
+    // Evidence availability gate: a row decided inside the window but not yet resolved by the
+    // evidence cutoff is real future information relative to this fold and must not train it — even
+    // though its decision time places it inside the window. No future-resolved outcome leaks into an
+    // earlier fold; it becomes trainable again once a later fold's cutoff has moved past its
+    // resolution.
+    const train = evidenceCutoffMs == null ? [] : decisionWindow.filter((row) => row.resolvedTimeMs <= evidenceCutoffMs);
     const opportunities = new Set(train.map((row) => row.opportunityId));
-    const trainingCutoffMs = train.at(-1)?.resolvedTimeMs;
-    const purgeBoundaryMs = (trainingCutoffMs ?? -Infinity) + hyperparameters.purgeMs;
-    const safeOos = oos.filter((row) => !opportunities.has(row.opportunityId) && row.decisionTimeMs > purgeBoundaryMs);
-    // OOS rows must never influence recency weights. The model's clock is frozen at the last
+    // Explicit max over the *included* training rows, never the last element of a decision-ordered
+    // array: a later-decided row inside this fold can still resolve earlier than an earlier-decided
+    // one, so "last by decision order" is not "latest resolved" — the same class of bug as the
+    // dataset-level fitCutoffMs this mirrors.
+    const trainingCutoffMs = train.length ? Math.max(...train.map((row) => row.resolvedTimeMs)) : null;
+    const purgeBoundaryMs = (trainWindowDecisionEndMs ?? -Infinity) + hyperparameters.purgeMs;
+    const safeOos = oosCandidate.filter((row) => !opportunities.has(row.opportunityId) && row.decisionTimeMs > purgeBoundaryMs);
+    // OOS rows must never influence recency weights. The model's clock is frozen at the true latest
     // resolved training observation, even when the held-out period extends far into the future.
     const fit: CortexEconomicFit = trainingCutoffMs == null
       ? { coefficients: [...prior], residualScale: null, effectiveSampleSize: 0, status: "INSUFFICIENT_DATA" }
@@ -530,6 +569,7 @@ function fitArchetype(
     folds.push({
       fold: fold + 1,
       trainStartMs: train[0]?.decisionTimeMs ?? null, trainEndMs: trainingCutoffMs ?? null, trainingCutoffMs: trainingCutoffMs ?? null,
+      evidenceCutoffMs: evidenceCutoffMs ?? null,
       oosStartMs: safeOos[0]?.decisionTimeMs ?? null, oosEndMs: safeOos.at(-1)?.resolvedTimeMs ?? null,
       trainN: train.length, oosN: safeOos.length, trainExampleIds: train.map((row) => row.exampleId), heldOut, fitStatus: fit.status,
       candidate, incumbent, expectedEconomicDeltaR,
@@ -567,7 +607,14 @@ function candidateForDataset(
 ): CortexShadowCandidateGeneration {
   const incumbentCoefficientFingerprint = incumbentFingerprint(incumbent);
   const fingerprint = generationFingerprint({ datasetHash: dataset.datasetHash, incumbentGeneration, incumbentCoefficientFingerprint, hyperparameters, codeVersion });
-  const fitCutoffMs = dataset.examples.at(-1)?.resolvedTimeMs ?? null;
+  // Explicit max over the whole dataset, independent of examples' sort order. dataset.examples is
+  // sorted by cortexDecisionTimeMs (buildCortexShadowTrainingDataset), so the last element is the
+  // latest-DECIDED example, not necessarily the latest-RESOLVED one: a later decision with a short
+  // hold can resolve before an earlier decision with a long hold that is still open.
+  const latestTrainingResolvedTimeMs = dataset.examples.length
+    ? Math.max(...dataset.examples.map((example) => example.resolvedTimeMs))
+    : null;
+  const fitCutoffMs = latestTrainingResolvedTimeMs;
   const archetypes = ARCHETYPES.map((archetype) => {
     const rows = dataset.examples.filter((row) => row.archetype === archetype);
     const prior = incumbent.archetypes[archetype].w;

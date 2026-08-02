@@ -179,7 +179,8 @@ import { cortexBrainMode } from "./lib/cortex-brain.js";
 import { CortexBrainStore, CortexDecisionJournal, runCortexShadowTick } from "./lib/cortex-brain-store.js";
 import { publishCortexDecisionSnapshotsForScan } from "./lib/cortex-decision-snapshot.js";
 import { allocationContextWithExactCortexPaperBridge } from "./lib/cortex-paper-allocation-bridge.js";
-import { cortexProductionChainDiagnostics } from "./lib/cortex-production-chain-diagnostics.js";
+import { buildPaperOrderOwnershipIndex } from "./lib/paper-order-ownership-index.js";
+import { cortexProductionChainDiagnostics, recordCortexProductionChainDiagnostic } from "./lib/cortex-production-chain-diagnostics.js";
 import { standaloneCortexShadowAllowed } from "./lib/cortex-instance-diagnosis.js";
 import { runFourBrainShadowCycle } from "./lib/four-brain-live-wiring.js";
 import { classifyIncumbentLanes } from "./lib/four-brain-lane-support.js";
@@ -1257,7 +1258,12 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           resolvedThisCycle: 0,
           promotion,
         });
-        if (cached?.scanBatchId) publishCortexDecisionSnapshotsForScan(cached.scanBatchId, snapshots);
+        if (cached?.scanBatchId) {
+          const publication = publishCortexDecisionSnapshotsForScan(cached.scanBatchId, snapshots);
+          if (publication === "CONFLICT" || publication === "INVALID") {
+            recordCortexProductionChainDiagnostic("CORTEX_SCAN_PUBLICATION_CONFLICT");
+          }
+        }
         // Every cycle re-derives this from scratch and pushes it (including null) — a lost gate, a
         // failed invariant check, or the mode dropping back to 'shadow' all self-heal to the incumbent
         // table within one tick.
@@ -2211,7 +2217,12 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           resolvedThisCycle: 0,
           promotion: null,
         });
-        if (cached?.scanBatchId) publishCortexDecisionSnapshotsForScan(cached.scanBatchId, result.snapshots);
+        if (cached?.scanBatchId) {
+          const publication = publishCortexDecisionSnapshotsForScan(cached.scanBatchId, result.snapshots);
+          if (publication === "CONFLICT" || publication === "INVALID") {
+            recordCortexProductionChainDiagnostic("CORTEX_SCAN_PUBLICATION_CONFLICT");
+          }
+        }
       } catch (err) {
         console.error("[cortex-shadow-standalone] tick failed", err);
       }
@@ -2372,6 +2383,11 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     // Retained handle for the report-only lane-context snapshot ticker (registered once, below) — see Stage-2 timer
     // ownership: single registration at boot, cleared on shutdown so a flush attempt never blocks termination.
     let laneContextSnapshotTimer: ReturnType<typeof setInterval> | null = null;
+    // Retained handle: the SAME per-tick ownership index buildFourBrainDeps just built (below), so
+    // onExecutiveDecision's attachExecutiveReviewToExactPaperOrder call can do an O(1)-ish lookup
+    // through it instead of a fresh linear scan over the full order book — GAP A. Reused rather than
+    // rebuilt, exactly like lastFourBrainGatherBase's own per-cycle retention contract further down.
+    let lastPaperOrderOwnershipIndex: ReturnType<typeof buildPaperOrderOwnershipIndex> | null = null;
 
     const collectFourBrainOpenSignals = (): FourBrainBindingDeps["openSignals"] => {
       const out: FourBrainBindingDeps["openSignals"] = [];
@@ -2394,10 +2410,77 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       // them appears in a single closed position path — all 309 come from the CG variant matrix. That
       // made Entry Brain Tier 1 a permanently empty join (0 of 1,664, every rejection
       // NO_EXACT_LANE_SYMBOL_SIDE_CLOSE) and is the concrete reason the brains never connected to
-      // anything that trades. Each row carries its own variantId and side, so these are pushed
-      // directly rather than through add(); the bare variantId is deliberate — the Tier-1 matcher
-      // strips the CG_VARIANT_MATRIX:/CG_LONG_VARIANT_MATRIX: prefixes itself, so it joins to both.
-      try { for (const s of variantMatrixOpenSignals(getCurrentGuardVariantMatrixStore())) out.push(s); } catch { /* store unavailable ⇒ skip (no fabrication) */ }
+      // anything that trades.
+      //
+      // 2026-08-02 (four-brain-sourcing, point 3): CG signals now come from TWO distinct,
+      // separately-tagged sources rather than one — see FourBrainBindingDeps.openSignals' doc
+      // comment (four-brain-live-gather-bindings.ts) for the full sourceKind contract.
+      //
+      //   1. PAPER_ORDER_OWNED — real, currently-actionable PaperOrder rows (paperStatus CREATED
+      //      or PAPER_SUBMITTED), for both sourceTypes that can carry a CG candidate
+      //      (VARIANT_MATRIX_OBSERVATION and SCAN_CANDIDATE_LANE_ALLOCATOR). laneId/observationId
+      //      are read verbatim off order.selectedLaneId/order.sourceObservationId — THE canonical
+      //      persisted ownership triple (paper-order-ownership-index.ts) — so these candidates are
+      //      trivially attachable to a real Executive Review BY CONSTRUCTION: the
+      //      allocationContextForLane ownership-index lookup below, and later
+      //      attachExecutiveReviewToExactPaperOrder, both key on this exact triple. A
+      //      VARIANT_MATRIX_OBSERVATION order structurally can never carry a CORTEX link (no
+      //      scanBatchId, forward-causal-collection.ts's validCortexSnapshot hard-requires one) —
+      //      it is deliberately NOT excluded here; it truthfully resolves to
+      //      CORTEX_ALLOCATION_LINK_MISSING downstream instead of silently vanishing.
+      //   2. VARIANT_MATRIX_SHADOW — the original CG variant-matrix shadow tape
+      //      (CurrentGuardVariantMatrixObservation via variantMatrixOpenSignals), kept EXACTLY as
+      //      before (not removed) for report-only Entry Brain diagnostic coverage. Its ids are
+      //      vmStore's own synthetic ids in a disjoint id space from any real PaperOrder, so it is
+      //      structurally NEVER attachable to a real Executive Review — no extra gating is needed
+      //      to enforce that; the ownership-key equality simply never matches. The bare variantId
+      //      (no CG_VARIANT_MATRIX:/CG_LONG_VARIANT_MATRIX: prefix) is what visibly distinguishes
+      //      it from a PAPER_ORDER_OWNED row's prefixed selectedLaneId, on top of the explicit
+      //      sourceKind tag.
+      //
+      // The two sources can both report the SAME underlying vmStore observation once it has been
+      // admitted into a PaperOrder (a VARIANT_MATRIX_OBSERVATION order's sourceObservationId IS
+      // the vmStore observationId it was built from) — that is deliberate, not a duplicate bug:
+      // the rows carry different laneId strings (prefixed vs bare), so identityKey() in
+      // four-brain-live-gather.ts never collides them; the shadow-tape row simply stays a
+      // non-attachable, report-only echo of the same signal alongside the real, attachable one.
+      try {
+        const paperStore = peekPaperExecutionRouterStore();
+        if (paperStore) {
+          for (const order of paperStore.all) {
+            if (order.paperStatus !== "CREATED" && order.paperStatus !== "PAPER_SUBMITTED") continue;
+            if (order.sourceType !== "VARIANT_MATRIX_OBSERVATION" && order.sourceType !== "SCAN_CANDIDATE_LANE_ALLOCATOR") continue;
+            const openedAtMs = Date.parse(order.firstSeenAt ?? order.createdAt);
+            if (!Number.isFinite(openedAtMs)) continue; // never fabricate a signal age from an unparseable timestamp
+            if (!Number.isFinite(order.entryPrice) || !Number.isFinite(order.stopLoss)) continue; // never fabricate geometry
+            // Point 11: report-only visibility split by admission path — never read by any selection,
+            // admission, allocation, or execution branch. Path A (VARIANT_MATRIX_OBSERVATION) is
+            // structurally non-attachable (no scanBatchId), so it is flagged generically rather than
+            // conflated with a real rejection; Path B (SCAN_CANDIDATE_LANE_ALLOCATOR) can carry a real
+            // CORTEX link, so it is flagged as chain-eligible.
+            recordCortexProductionChainDiagnostic(
+              order.sourceType === "SCAN_CANDIDATE_LANE_ALLOCATOR"
+                ? "CORTEX_CHAIN_ELIGIBLE_CANDIDATE"
+                : "GENERIC_FOUR_BRAIN_DIAGNOSTIC_CANDIDATE",
+            );
+            out.push({
+              laneId: order.selectedLaneId,
+              symbol: order.symbol,
+              direction: order.direction,
+              observationId: order.sourceObservationId,
+              openedAtMs,
+              entryPrice: order.entryPrice,
+              stopPrice: order.stopLoss,
+              sourceKind: "PAPER_ORDER_OWNED",
+            });
+          }
+        }
+      } catch { /* store unavailable ⇒ skip (no fabrication) */ }
+      try {
+        for (const s of variantMatrixOpenSignals(getCurrentGuardVariantMatrixStore())) {
+          out.push({ ...s, sourceKind: "VARIANT_MATRIX_SHADOW" });
+        }
+      } catch { /* store unavailable ⇒ skip (no fabrication) */ }
       return out;
     };
 
@@ -2459,6 +2542,11 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           createdAtMs: Date.parse(i.createdAt),
         }));
       const crowdingShadow = status?.crowdingExitShadow ?? {};
+      // Built ONCE per gather/tick (same PER-CALL contract as ceBucketsOnce below) from the current
+      // PaperOrder list, so every lane's allocationContextForLane call this tick shares one O(orders)
+      // index instead of each candidate re-deriving its own O(orders) scan/filter.
+      const paperOrderOwnershipIndex = buildPaperOrderOwnershipIndex(peekPaperExecutionRouterStore()?.all ?? []);
+      lastPaperOrderOwnershipIndex = paperOrderOwnershipIndex;
       // Memoized PER-CALL (one buildFourBrainDeps() == one gather/tick, per its own doc comment above) so
       // the 4 CE bucket lanes share ONE composite-estimator report build, not one per direction × per CE
       // lane bestLaneReportForDirection ends up scanning — mirrors buildLiveCortexGatherDeps's identical
@@ -2579,7 +2667,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
             base,
             candidate,
             laneId,
-            orders: peekPaperExecutionRouterStore()?.all ?? [],
+            ownershipIndex: paperOrderOwnershipIndex,
           });
         },
         // A review may only use a scanner context that was atomically persisted before the decision.
@@ -2727,6 +2815,11 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
               executive,
               candidateId: identity.signalId,
               executingPaperOrderIds: new Set((liveExecutionStore?.getState().intents ?? []).map((intent) => intent.paperOrderId)),
+              // The SAME this-cycle ownership index buildFourBrainDeps already built (GAP A) — never a
+              // fresh linear scan. Empty-map fallback only if no cycle has run yet this process, which
+              // fails closed exactly like a real 0-match lookup (NO_EXACT_CANDIDATE), never fabricating
+              // a match.
+              paperOrderOwnershipIndex: lastPaperOrderOwnershipIndex ?? new Map(),
               // The SAME this-cycle gather deps that already feed journalContext above — never a
               // later/current rehydration — so this snapshot is exactly what this tick's brains
               // consumed. Deep-cloned by attachExecutiveReviewToExactPaperOrder before persisting.

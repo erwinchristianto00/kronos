@@ -16,6 +16,10 @@ import {
 } from "../src/lib/cortex-shadow-refit.js";
 import type { ExecutiveReviewOutcome } from "../src/lib/executive-review-store.js";
 import type { CanonicalPolicyContext, ForwardEvent } from "../src/experience-engine/forward-causal-collection.js";
+import {
+  _resetCortexProductionChainDiagnosticsForTests,
+  cortexProductionChainDiagnostics,
+} from "../src/lib/cortex-production-chain-diagnostics.js";
 
 const epochMs = Date.parse(CORTEX_SHADOW_REFIT_DEFAULT_EPOCH);
 const policy: CanonicalPolicyContext & { instanceId: "3102"; fourBrainPolicyVersion: string } = {
@@ -101,6 +105,7 @@ function build(count = 1, mutate?: (outcome: ExecutiveReviewOutcome, events: For
 
 describe("CORTEX shadow refit learner v1", () => {
   it("keeps pre-reset, Tier-2, evaluation-only, incomplete, unknown, duplicate, stale, and missing-feature records out", () => {
+    _resetCortexProductionChainDiagnosticsForTests();
     const pre = row(1, { executiveDecisionTimeMs: epochMs - 1 });
     const tier2 = row(2, { tier: "TIER_2_COUNTERFACTUAL" });
     const missingFeature = row(3); (missingFeature.events[0] as any).cortexTraining.featureVector = null;
@@ -116,6 +121,9 @@ describe("CORTEX shadow refit learner v1", () => {
     expect(result.rejected.INVALID_OR_INCOMPLETE_COST).toBe(1);
     expect(result.rejected.UNKNOWN_CONTEXT).toBe(1);
     expect(result.rejected.DUPLICATE_OUTCOME).toBe(1);
+    // Point 11: report-only — recorded exactly once, matching the single accepted example, never
+    // once per rejected/duplicate/pre-epoch row.
+    expect(cortexProductionChainDiagnostics().CORTEX_LEARNER_ELIGIBLE).toBe(1);
   });
 
   it("fails closed with separate stable reasons for a missing or incompatible CORTEX feature schema", () => {
@@ -342,6 +350,84 @@ describe("CORTEX shadow refit learner v1", () => {
       hyperparameters: { ...CORTEX_SHADOW_REFIT_HYPERPARAMETERS, purgeMs: 60_001 },
     });
     for (const fold of report.candidate!.archetypes[0]!.folds) expect(fold.oosN).toBe(7);
+  });
+
+  it("derives the dataset-wide training cutoff from the true max resolvedTimeMs, not the last-decided example (point 8)", () => {
+    // dataset.examples is sorted by cortexDecisionTimeMs. Row 5 is decided early (5th) but given an
+    // overlapping, very long hold; row 44 is decided last but resolves on the normal short schedule.
+    // If the cutoff were naively taken from the last-by-decision-order example (the old bug), it
+    // would read row 44's (early) resolvedTimeMs and completely miss row 5's later resolution.
+    const overlapDelayMs = 2_500_000; // long enough that row 5's resolution lands after row 44's
+    const input = dataset(44, (outcome, events) => {
+      if (outcome.opportunityId !== "opp-5") return;
+      (outcome as any).marketClosedAtMs += overlapDelayMs;
+      (outcome as any).settlementResolvedAtMs += overlapDelayMs;
+      (outcome as any).exactCloseTimeMs += overlapDelayMs;
+      (outcome as any).resolvedAtMs += overlapDelayMs;
+      const resolution = events.find((event) => event.eventType === "OUTCOME_RESOLUTION") as any;
+      resolution.closedAtMs += overlapDelayMs;
+      resolution.resolvedAtMs += overlapDelayMs;
+    });
+    const dir = temp(); const registry = new CortexShadowRefitRegistryStore(join(dir, "registry.json"));
+    const report = runCortexShadowRefit({ ...input, policy, incumbent: emptyCortexState(), registry, nowMs: epochMs + 900_000_000 });
+    const row5 = report.dataset.examples.find((example) => example.opportunityId === "opp-5")!;
+    const lastDecided = report.dataset.examples.at(-1)!; // row 44 — last by cortexDecisionTimeMs sort
+    const trueMaxResolvedTimeMs = Math.max(...report.dataset.examples.map((example) => example.resolvedTimeMs));
+    // Sanity: the scenario genuinely inverts decision order vs. resolution order.
+    expect(lastDecided.opportunityId).toBe("opp-44");
+    expect(row5.resolvedTimeMs).toBeGreaterThan(lastDecided.resolvedTimeMs);
+    expect(trueMaxResolvedTimeMs).toBe(row5.resolvedTimeMs);
+    expect(report.candidate!.trainingCutoffMs).toBe(trueMaxResolvedTimeMs);
+    expect(report.candidate!.trainingCutoffMs).not.toBe(lastDecided.resolvedTimeMs);
+  });
+
+  it("orders fold membership by decision time but gates training inclusion by resolution time, with no leak into an earlier fold (point 7)", () => {
+    // Row 5 is decided early (falls inside every fold's decision-time training window by index) but
+    // given a long overlapping hold; row 44 is decided last (never falls inside any fold's training
+    // window) and resolves on the normal short schedule — decided later, resolved earlier.
+    const overlapDelayMs = 1_900_000; // resolves after fold 0/1's cutoff and after row 36's normal
+    // resolution, but before fold 2's evidence cutoff — late enough to become fold 2's true max.
+    const input = dataset(44, (outcome, events) => {
+      if (outcome.opportunityId !== "opp-5") return;
+      (outcome as any).marketClosedAtMs += overlapDelayMs;
+      (outcome as any).settlementResolvedAtMs += overlapDelayMs;
+      (outcome as any).exactCloseTimeMs += overlapDelayMs;
+      (outcome as any).resolvedAtMs += overlapDelayMs;
+      const resolution = events.find((event) => event.eventType === "OUTCOME_RESOLUTION") as any;
+      resolution.closedAtMs += overlapDelayMs;
+      resolution.resolvedAtMs += overlapDelayMs;
+    });
+    const dir = temp(); const registry = new CortexShadowRefitRegistryStore(join(dir, "registry.json"));
+    const report = runCortexShadowRefit({ ...input, policy, incumbent: emptyCortexState(), registry, nowMs: epochMs + 900_000_000 });
+    const row5 = report.dataset.examples.find((example) => example.opportunityId === "opp-5")!;
+    const row44 = report.dataset.examples.find((example) => example.opportunityId === "opp-44")!;
+    const folds = report.candidate!.archetypes[0]!.folds;
+    expect(folds).toHaveLength(3);
+    // Chronology follows decision time: row 5's decision places it inside every fold's training
+    // window (it is never held out), while row 44's decision is too late to ever enter a training
+    // window (it is never a training candidate for any fold).
+    for (const fold of folds) {
+      expect(fold.trainExampleIds).not.toContain(row44.exampleId);
+      expect(fold.heldOut.some((held) => held.exampleId === row5.exampleId)).toBe(false);
+    }
+    // Evidence availability follows resolution time: row 5 is excluded from the first two folds
+    // because it had not yet resolved by their evidence cutoffs — no future-resolved outcome leaks
+    // into an earlier fold — and becomes trainable once the third fold's cutoff passes its actual
+    // resolution.
+    expect(folds[0]!.trainExampleIds).not.toContain(row5.exampleId);
+    expect(folds[1]!.trainExampleIds).not.toContain(row5.exampleId);
+    expect(folds[2]!.trainExampleIds).toContain(row5.exampleId);
+    // The fold's reported trainingCutoffMs must be the true max resolvedTimeMs among the rows it
+    // actually trained on — never accidentally taken from whichever row happens to be last by
+    // decision order inside the window (row 5 sits early in decision order yet, once included,
+    // dominates fold 2's true cutoff).
+    for (const fold of folds) {
+      if (fold.trainN === 0) continue;
+      const trainRows = fold.trainExampleIds.map((id) => report.dataset.examples.find((example) => example.exampleId === id)!);
+      const trueCutoff = Math.max(...trainRows.map((row) => row.resolvedTimeMs));
+      expect(fold.trainingCutoffMs).toBe(trueCutoff);
+    }
+    expect(folds[2]!.trainingCutoffMs).toBe(row5.resolvedTimeMs);
   });
 
   it("fingerprints incumbent generation, coefficient state, hyperparameters, and code version", () => {

@@ -6,6 +6,7 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import type { DirectionDecision, EntryDecision, MarketStateDecision } from "./four-brain-types.js";
+import { recordCortexProductionChainDiagnostic } from "./cortex-production-chain-diagnostics.js";
 
 /**
  * Additive Four-Brain economic-learning identity, persisted once at admission and copied verbatim
@@ -537,6 +538,9 @@ export class ExecutiveReviewStore {
     review.state = "TIER1_ELIGIBLE";
     review.outcomeId = outcome.outcomeId;
     this.state.tier1.push(tier1);
+    // Point 11: report-only — an outcome just reached real Tier-1 resolution. Never read by any
+    // control-plane path; purely a visibility counter for how much evidence reaches this stage.
+    recordCortexProductionChainDiagnostic("CORTEX_TIER1_RESOLVED");
     this.state.processedIds.push(outcomeId);
     if (this.state.processedIds.length > MAX_IDS) this.state.processedIds.splice(0, this.state.processedIds.length - MAX_IDS);
     return null;

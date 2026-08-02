@@ -310,7 +310,27 @@ export interface FourBrainBindingDeps {
   timesfmAtMs?: number | null;
 
   // ── Entry candidates (open signals) ──
-  openSignals: Array<{ laneId: string; symbol: string; direction: "LONG" | "SHORT"; observationId: string; openedAtMs: number; entryPrice: number; stopPrice: number }>;
+  /**
+   * `sourceKind` is a report-only provenance tag, orthogonal to `PaperOrder.provenance` (paper
+   * admission forensics) — do not conflate the two. Set by the caller (see
+   * collectFourBrainOpenSignals in app.ts):
+   *   "PAPER_ORDER_OWNED"    — signalId/laneId read straight off a real, currently-actionable
+   *                            PaperOrder (sourceObservationId/selectedLaneId). By construction
+   *                            this is THE canonical ownership key, so it is trivially attachable
+   *                            to a real Executive Review via the ownership index.
+   *   "VARIANT_MATRIX_SHADOW" — sourced from the CG variant-matrix shadow tape
+   *                            (CurrentGuardVariantMatrixObservation), a separate store with its
+   *                            own synthetic ids that no real PaperOrder carries verbatim. Kept
+   *                            for report-only Entry Brain diagnostic coverage; structurally
+   *                            never resolves to an ownership-index match, so it can never attach
+   *                            to a real Executive Review.
+   *   undefined                — legacy named-lane feeds (SF/IM/RC/RCS/PWR/CE); their own
+   *                            ownership chain is out of this stage's scope (see CLAUDE.md /
+   *                            four-brain-sourcing plan "unresolved item 2") and is left exactly
+   *                            as before.
+   * Never read by admission/selection/execution — diagnostics/journal visibility only.
+   */
+  openSignals: Array<{ laneId: string; symbol: string; direction: "LONG" | "SHORT"; observationId: string; openedAtMs: number; entryPrice: number; stopPrice: number; sourceKind?: "PAPER_ORDER_OWNED" | "VARIANT_MATRIX_SHADOW" }>;
   maxSignalAgeMs: number;
   crowdingStateForSymbol?: (symbol: string) => "BUILDING" | "EXHAUSTING" | "UNWINDING" | "NEUTRAL" | null;
   /** Candle-microstructure (adapter B). null ⇒ no candle data for the symbol (micro stays MISSING). */
@@ -470,6 +490,7 @@ export function buildFourBrainGatherInput(dep: FourBrainBindingDeps): FourBrainG
     const identity: FourBrainIdentity = {
       instanceId: dep.instanceId, laneId: s.laneId, symbolOrBasketId: s.symbol, side: s.direction,
       signalId: s.observationId, positionId: null, horizon: laneHorizon(s.laneId, { scalpEnabled: dep.scalpHorizonEnabled === true }), decisionAtMs: nowMs,
+      sourceKind: s.sourceKind ?? null,
     };
     const exec: ExecContext = {
       allocationContext: dep.allocationContextForLane?.(s.laneId, { signalId: s.observationId, direction: s.direction }) ?? staticAllocationContext(null),

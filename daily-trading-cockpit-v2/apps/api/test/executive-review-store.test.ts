@@ -15,6 +15,10 @@ import {
 import { markTerminalExecutiveReviewsTier2Only, resolveExecutiveReviewPositions } from "../src/lib/executive-review-runtime.js";
 import type { LiveIntent } from "../src/lib/live-execution-engine.js";
 import type { PaperOrder } from "../src/lib/paper-execution-router.js";
+import {
+  _resetCortexProductionChainDiagnosticsForTests,
+  cortexProductionChainDiagnostics,
+} from "../src/lib/cortex-production-chain-diagnostics.js";
 
 const review = (overrides: Partial<ExecutiveReviewRecord> = {}): ExecutiveReviewRecord => ({
   executiveReviewId: "review-1",
@@ -172,6 +176,7 @@ describe("Executive Review Store", () => {
   });
 
   it("requires an exact persisted lineage and resolves each review outcome once", () => {
+    _resetCortexProductionChainDiagnosticsForTests();
     const dir = mkdtempSync(join(tmpdir(), "executive-review-"));
     try {
       const store = new ExecutiveReviewStore(join(dir, "reviews.json"));
@@ -181,8 +186,13 @@ describe("Executive Review Store", () => {
       expect(store.resolve("review-1", position(), outcome())).toBeNull();
       expect(store.get().reviews[0]?.state).toBe("TIER1_ELIGIBLE");
       expect(store.get().tier1).toHaveLength(1);
+      // Point 11: report-only — recorded exactly once, on the real Tier-1 transition, never on the
+      // earlier POSITION_NOT_RESOLVED attempt.
+      expect(cortexProductionChainDiagnostics().CORTEX_TIER1_RESOLVED).toBe(1);
       expect(store.resolve("review-1", position(), outcome())).toBe("EXECUTIVE_REVIEW_ALREADY_RESOLVED");
       expect(store.get().tier1).toHaveLength(1);
+      // A second, already-resolved call must never double-count the diagnostic.
+      expect(cortexProductionChainDiagnostics().CORTEX_TIER1_RESOLVED).toBe(1);
       expect(executiveReviewTier1Aggregates(store.get())).toContainEqual({
         dimension: "direction", key: "LONG", resolvedCount: 1, averageNetR: 0.2, positiveCount: 1, negativeCount: 0,
       });

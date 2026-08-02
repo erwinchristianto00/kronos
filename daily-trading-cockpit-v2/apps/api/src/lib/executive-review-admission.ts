@@ -14,6 +14,7 @@ import {
   resolveCausalCollectionActivation,
 } from "../experience-engine/forward-causal-collection.js";
 import { recordCortexProductionChainDiagnostic } from "./cortex-production-chain-diagnostics.js";
+import { paperOrderOwnershipKey } from "./paper-order-ownership-index.js";
 
 export type ExecutiveReviewAdmissionResult =
   | "ATTACHED"
@@ -101,6 +102,13 @@ export function attachExecutiveReviewToExactPaperOrder(input: {
   executive: ExecutiveDecision;
   candidateId: string | null;
   executingPaperOrderIds: ReadonlySet<string>;
+  /** THE canonical persisted ownership index (paper-order-ownership-index.ts), built once per tick
+   *  by the caller from the SAME `paperStore` above (`buildPaperOrderOwnershipIndex`) and reused
+   *  here instead of a fresh linear scan over the full order book. Keyed by
+   *  `paperOrderOwnershipKey(sourceObservationId, selectedLaneId, direction)`; already pre-filtered
+   *  to admissible statuses (CREATED/PAPER_SUBMITTED) by the index builder itself, so the lookup
+   *  below reproduces the exact same match set the old `.filter(...)` scan produced. */
+  paperOrderOwnershipIndex: ReadonlyMap<string, readonly PaperOrder[]>;
   /** The raw/normalized feature snapshot this tick's brains actually consumed, if the caller already
    *  has it in hand (e.g. the same gather-cycle state that feeds the four-brain journal). Omitted ⇒
    *  persisted as null — the economic-experience adapter must then treat this review as
@@ -115,14 +123,25 @@ export function attachExecutiveReviewToExactPaperOrder(input: {
   if (!candidateId || !executive.entry || !executive.laneId || !executive.symbolOrBasketId) return "NO_EXACT_CANDIDATE";
   if (!validMarketContextLineage(executive.marketContext) || executive.marketContext.marketContextSnapshotId === null) return "MARKET_CONTEXT_UNAVAILABLE";
 
-  const exactOrders = input.paperStore.all.filter((order) =>
-    order.sourceObservationId === candidateId &&
-    order.selectedLaneId === executive.laneId &&
-    order.direction === executive.entry!.side &&
-    (order.paperStatus === "CREATED" || order.paperStatus === "PAPER_SUBMITTED"),
-  );
-  if (exactOrders.length === 0) return "NO_EXACT_CANDIDATE";
-  if (exactOrders.length !== 1) return "AMBIGUOUS_PAPER_OWNERSHIP";
+  // O(1)-ish lookup through the shared per-tick ownership index instead of a fresh linear scan over
+  // the full order book — same ownership triple (sourceObservationId, selectedLaneId, direction),
+  // same admissible-status prefilter (CREATED/PAPER_SUBMITTED), so this reproduces exactly the same
+  // candidate set the old `.filter(...)` scan produced, never a looser or stricter one.
+  const exactOrders = input.paperOrderOwnershipIndex.get(
+    paperOrderOwnershipKey(candidateId, executive.laneId, executive.entry!.side),
+  ) ?? [];
+  // Point 11: report-only counters mirroring the same 0-match / >1-match distinction the shared
+  // ownership index (paper-order-ownership-index.ts) makes elsewhere — purely additive, never read
+  // by any branch below; the real admission outcome is still exactly NO_EXACT_CANDIDATE /
+  // AMBIGUOUS_PAPER_OWNERSHIP as returned two lines down.
+  if (exactOrders.length === 0) {
+    recordCortexProductionChainDiagnostic("CORTEX_CANDIDATE_OWNERSHIP_MISSING");
+    return "NO_EXACT_CANDIDATE";
+  }
+  if (exactOrders.length !== 1) {
+    recordCortexProductionChainDiagnostic("CORTEX_CANDIDATE_OWNERSHIP_AMBIGUOUS");
+    return "AMBIGUOUS_PAPER_OWNERSHIP";
+  }
   const order = exactOrders[0]!;
   if (input.executingPaperOrderIds.has(order.paperOrderId)) return "ORDER_ALREADY_EXECUTING";
   if (order.executiveReviewLink) return "ORDER_ALREADY_LINKED";
