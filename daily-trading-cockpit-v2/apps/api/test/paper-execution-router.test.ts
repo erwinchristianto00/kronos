@@ -101,6 +101,10 @@ async function buildWinningVmStore(dir: string): Promise<CurrentGuardVariantMatr
     entryVariant: "base_current_entry",
     openedAt: new Date(recentBase + i * 5_000).toISOString(),
     closedAt: null,
+    // Point 3b: exact-context proof requires the fresh-feed axis stamp (posture + regimeDirection).
+    // Without it these rows are legacy-shaped and can never stand alone as exact-context proof.
+    posture: "TACTICAL",
+    regimeDirection: "SHORT",
   }));
   mirrorVariantMatrixSignals(signals, vmStore, new Date().toISOString());
   // Resolve them all as wins so CG_WIDE has positive economics.

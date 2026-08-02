@@ -50,6 +50,7 @@ import {
   type SingleSymbolExitPolicy,
   type SingleSymbolFreshSignal,
 } from "./single-symbol-lane-executor.js";
+import { EDGE_LANE_COST_MODEL_VERSION } from "./edge-lane-cost-model.js";
 
 function envNum(name: string, dflt: number): number {
   const v = Number(process.env[name]);
@@ -221,6 +222,10 @@ export interface PanicWashoutObservation extends PanicWashoutGeometry {
   maxFavorableR: number | null;
   exitReason: "MFE_GIVEBACK" | "INITIAL_STOP" | "MAX_HOLD_MTM" | null;
   resolvedAt: string | null;
+  /** LIVE-LANE WIRING (2026-08-02) — see edge-lane-cost-model.ts / lane-edge-report-fields.ts.
+   *  Stamped only by THIS module's own new-observation creation code, below — never backfilled. */
+  postFixLineageV1?: boolean;
+  costModelVersion?: number;
 }
 
 /**
@@ -479,6 +484,8 @@ export async function runPanicWashoutCycle(opts: {
       maxFavorableR: null,
       exitReason: null,
       resolvedAt: null,
+      postFixLineageV1: true,
+      costModelVersion: EDGE_LANE_COST_MODEL_VERSION,
     });
     if (added) result.recorded += 1;
   }

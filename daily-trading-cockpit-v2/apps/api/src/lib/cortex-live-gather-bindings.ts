@@ -16,12 +16,19 @@
  *    small read-only engine accessor is added. killLatched + killBudgetUsd ARE sourced.
  */
 
-import { buildRegimeCompositeReport, getRegimeCompositeStore, RC_PAPER_LANE_ID } from "./regime-composite-edge.js";
-import { buildRegimeCompositeShortReport, getRegimeCompositeShortStore, RCS_PAPER_LANE_ID } from "./regime-composite-short-edge.js";
-import { buildShortFadeReport, getShortFadeStore, SF_PAPER_LANE_ID } from "./short-fade-edge.js";
-import { buildIntradayMomentumReport, getIntradayMomentumStore, IM_PAPER_LANE_ID } from "./intraday-momentum-edge.js";
-import { buildPanicWashoutReport, getPanicWashoutStore, PWR_PAPER_LANE_ID } from "./panic-washout-reclaim-edge.js";
-import { buildCompositeEstimatorReport, getCompositeEstimatorStore, ceLaneIdForBucket, type CEBucket } from "./composite-estimator-edge.js";
+import { buildRegimeCompositeReport, getRegimeCompositeStore, RC_PAPER_LANE_ID, RC_MAX_HOLD_BARS } from "./regime-composite-edge.js";
+import { buildRegimeCompositeShortReport, getRegimeCompositeShortStore, RCS_PAPER_LANE_ID, RCS_MAX_HOLD_BARS } from "./regime-composite-short-edge.js";
+import { buildShortFadeReport, getShortFadeStore, SF_PAPER_LANE_ID, SF_MAX_HOLD_BARS } from "./short-fade-edge.js";
+import { buildIntradayMomentumReport, getIntradayMomentumStore, IM_PAPER_LANE_ID, IM_MAX_HOLD_BARS } from "./intraday-momentum-edge.js";
+import { buildPanicWashoutReport, getPanicWashoutStore, PWR_PAPER_LANE_ID, PWR_MAX_HOLD_BARS } from "./panic-washout-reclaim-edge.js";
+import {
+  buildCompositeEstimatorReport,
+  getCompositeEstimatorStore,
+  ceLaneIdForBucket,
+  CE_WIDE_MAX_HOLD_HOURS,
+  CE_FAST_MAX_HOLD_HOURS,
+  type CEBucket,
+} from "./composite-estimator-edge.js";
 import {
   buildCrossSectionalReport,
   getCrossSectionalStore,
@@ -32,6 +39,7 @@ import {
   CROSS_SECTIONAL_TREND_LANE_ID,
   CROSS_SECTIONAL_MIXED_LANE_ID,
 } from "./cross-sectional-executor.js";
+import { computeLaneEdgeReportFields, type LaneEdgeReportObservationLike } from "./lane-edge-report-fields.js";
 import type {
   CortexGatherDeps,
   CortexControllerLike,
@@ -39,6 +47,25 @@ import type {
   CortexLaneReportLike,
   CortexXsecReportLike,
 } from "./cortex-live-gather.js";
+
+/**
+ * How stale a lane's own store cycle may be before its report reads `fresh: false`. A dedicated
+ * constant (not a reuse of four-brain-live-gather.ts's FRESHNESS_TTL_MS classes, none of which is
+ * "how recently did this lane's OWN paper-cycle tick run" — candle/signal/orderflow/etc. are all
+ * different concepts): the paper auto-cycle ticks roughly every 7 minutes
+ * (paper-cycle-headless-ticker), so 60 minutes is generous headroom against normal jitter while
+ * still catching a genuinely dead/frozen cycle (this codebase has hit that exact failure mode —
+ * PAPER_AUTO_CYCLE=0 froze six lane stores at the same second).
+ */
+export const LANE_REPORT_FRESHNESS_TTL_MS = 60 * 60_000;
+
+/** `blockWidthMs` for effectiveN clustering, per lane — that lane's own MAX_HOLD_BARS/MAX_HOLD_HOURS
+ *  (its own holding-period characteristic), never an arbitrary constant. All six lanes walk forward
+ *  on ~1h candles (each module's own doc comments confirm "@ 1h bars"). */
+const HOUR_MS = 3_600_000;
+function ceBlockWidthMs(bucket: CEBucket): number {
+  return (bucket === "WIDE_LONG" || bucket === "WIDE_SHORT" ? CE_WIDE_MAX_HOLD_HOURS : CE_FAST_MAX_HOLD_HOURS) * HOUR_MS;
+}
 
 const CE_BUCKET_BY_LANE_ID: Record<string, CEBucket> = {
   [ceLaneIdForBucket("WIDE_LONG")]: "WIDE_LONG",
@@ -65,39 +92,92 @@ export type CEBucketStatsList = ReturnType<typeof buildCompositeEstimatorReport>
  *  laneId→store/report-builder mapping instead of re-deriving it. Every store getter/report builder
  *  this function calls is a synchronous, idempotent read (not a one-shot), so a second caller in the
  *  same tick is safe. */
-export function liveLaneReport(laneId: string, dataDir: string, ceBucketsOnce: () => CEBucketStatsList): CortexLaneReportLike | null {
+export function liveLaneReport(
+  laneId: string,
+  dataDir: string,
+  ceBucketsOnce: () => CEBucketStatsList,
+  nowMs: number = Date.now(),
+): CortexLaneReportLike | null {
   try {
     if (laneId === RC_PAPER_LANE_ID) {
       const store = getRegimeCompositeStore(dataDir);
       const r = buildRegimeCompositeReport(store.all);
-      return { netAvgR: r.netAvgR, pf: r.pf, resolvedCount: r.resolvedCount, lastCycleAt: store.cycleMeta.lastCycleAt };
+      const fields = computeLaneEdgeReportFields({
+        observations: store.all as readonly LaneEdgeReportObservationLike[],
+        blockWidthMs: RC_MAX_HOLD_BARS * HOUR_MS,
+        lastCycleAt: store.cycleMeta.lastCycleAt,
+        nowMs,
+        freshnessTtlMs: LANE_REPORT_FRESHNESS_TTL_MS,
+      });
+      return { netAvgR: r.netAvgR, pf: r.pf, resolvedCount: r.resolvedCount, lastCycleAt: store.cycleMeta.lastCycleAt, ...fields };
     }
     if (laneId === RCS_PAPER_LANE_ID) {
       const store = getRegimeCompositeShortStore(dataDir);
       const r = buildRegimeCompositeShortReport(store.all);
-      return { netAvgR: r.netAvgR, pf: r.pf, resolvedCount: r.resolvedCount, lastCycleAt: store.cycleMeta.lastCycleAt };
+      const fields = computeLaneEdgeReportFields({
+        observations: store.all as readonly LaneEdgeReportObservationLike[],
+        blockWidthMs: RCS_MAX_HOLD_BARS * HOUR_MS,
+        lastCycleAt: store.cycleMeta.lastCycleAt,
+        nowMs,
+        freshnessTtlMs: LANE_REPORT_FRESHNESS_TTL_MS,
+      });
+      return { netAvgR: r.netAvgR, pf: r.pf, resolvedCount: r.resolvedCount, lastCycleAt: store.cycleMeta.lastCycleAt, ...fields };
     }
     if (laneId === SF_PAPER_LANE_ID) {
       const store = getShortFadeStore(dataDir);
       const r = buildShortFadeReport(store.all);
-      return { netAvgR: r.netAvgR, pf: r.pf, resolvedCount: r.resolvedCount, lastCycleAt: store.cycleMeta.lastCycleAt };
+      const fields = computeLaneEdgeReportFields({
+        observations: store.all as readonly LaneEdgeReportObservationLike[],
+        blockWidthMs: SF_MAX_HOLD_BARS * HOUR_MS,
+        lastCycleAt: store.cycleMeta.lastCycleAt,
+        nowMs,
+        freshnessTtlMs: LANE_REPORT_FRESHNESS_TTL_MS,
+      });
+      return { netAvgR: r.netAvgR, pf: r.pf, resolvedCount: r.resolvedCount, lastCycleAt: store.cycleMeta.lastCycleAt, ...fields };
     }
     if (laneId === IM_PAPER_LANE_ID) {
       // 2026-07-22 note: this store does not track a cycleMeta timestamp — lastCycleAt omitted
       // (never guessed), so this lane simply cannot be marked STALE yet, same as before this fix.
-      const r = buildIntradayMomentumReport(getIntradayMomentumStore(dataDir).all);
-      return { netAvgR: r.netAvgR, pf: r.pf, resolvedCount: r.resolvedCount };
+      // fresh therefore stays permanently false (computeLaneEdgeReportFields with lastCycleAt
+      // undefined), which is the honest answer, never a fabricated true.
+      const store = getIntradayMomentumStore(dataDir);
+      const r = buildIntradayMomentumReport(store.all);
+      const fields = computeLaneEdgeReportFields({
+        observations: store.all as readonly LaneEdgeReportObservationLike[],
+        blockWidthMs: IM_MAX_HOLD_BARS * HOUR_MS,
+        lastCycleAt: undefined,
+        nowMs,
+        freshnessTtlMs: LANE_REPORT_FRESHNESS_TTL_MS,
+      });
+      return { netAvgR: r.netAvgR, pf: r.pf, resolvedCount: r.resolvedCount, ...fields };
     }
     if (laneId === PWR_PAPER_LANE_ID) {
       const store = getPanicWashoutStore(dataDir);
       const r = buildPanicWashoutReport(store.all);
-      return { netAvgR: r.netAvgR, pf: r.pf, resolvedCount: r.resolvedCount, lastCycleAt: store.cycleMeta.lastCycleAt };
+      const fields = computeLaneEdgeReportFields({
+        observations: store.all as readonly LaneEdgeReportObservationLike[],
+        blockWidthMs: PWR_MAX_HOLD_BARS * HOUR_MS,
+        lastCycleAt: store.cycleMeta.lastCycleAt,
+        nowMs,
+        freshnessTtlMs: LANE_REPORT_FRESHNESS_TTL_MS,
+      });
+      return { netAvgR: r.netAvgR, pf: r.pf, resolvedCount: r.resolvedCount, lastCycleAt: store.cycleMeta.lastCycleAt, ...fields };
     }
     const bucket = CE_BUCKET_BY_LANE_ID[laneId];
     if (bucket) {
       const stats = ceBucketsOnce().find((b) => b.bucket === bucket);
-      const lastCycleAt = getCompositeEstimatorStore(dataDir).cycleMeta.lastCycleAt;
-      return stats ? { netAvgR: stats.netAvgR, pf: stats.pf, resolvedCount: stats.resolvedCount, lastCycleAt } : null;
+      if (!stats) return null;
+      const store = getCompositeEstimatorStore(dataDir);
+      const lastCycleAt = store.cycleMeta.lastCycleAt;
+      const bucketObservations = store.all.filter((o) => o.bucket === bucket) as readonly LaneEdgeReportObservationLike[];
+      const fields = computeLaneEdgeReportFields({
+        observations: bucketObservations,
+        blockWidthMs: ceBlockWidthMs(bucket),
+        lastCycleAt,
+        nowMs,
+        freshnessTtlMs: LANE_REPORT_FRESHNESS_TTL_MS,
+      });
+      return { netAvgR: stats.netAvgR, pf: stats.pf, resolvedCount: stats.resolvedCount, lastCycleAt, ...fields };
     }
     return null; // CG paper-mirror lanes + unknown ids → own-report not sourced (edge-memory drives magnitude)
   } catch {
@@ -157,7 +237,7 @@ export function buildLiveCortexGatherDeps(input: LiveCortexGatherInputs): Cortex
   };
   return {
     staticWeightPctForLane: (laneId) => input.staticWeightPctForLane(laneId),
-    laneReport: (laneId) => liveLaneReport(laneId, dataDir, ceBucketsOnce),
+    laneReport: (laneId) => liveLaneReport(laneId, dataDir, ceBucketsOnce, nowMs),
     xsecReport: (laneId) => liveXsecReport(laneId, dataDir, nowMs),
     crowdSidesForLane: () => [], // Phase 1: not sourced → crowdingAlign MISSING (neutral-filled)
     kronosAgreeForLane: () => null, // Phase 1: not sourced → kronosAgree MISSING (neutral-filled)

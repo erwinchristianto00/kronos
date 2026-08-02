@@ -125,6 +125,17 @@ export interface CortexLaneReportLike {
    *  (RC/RCS/SF/PWR/CE do; IM currently does not) — omit/undefined for stores that don't, never a
    *  guessed value. Feeds STALE detection in cortex-brain-gather.ts's guard functions. */
   lastCycleAt?: string | null;
+  /**
+   * 2026-08-02 LIVE-LANE WIRING fix (mirrors four-brain-live-gather-bindings.ts's LaneReportLike,
+   * which already gates on these four strictly — see selectBestLaneReportForDirection). Genuinely
+   * computed by liveLaneReport() (see lane-edge-report-fields.ts); never defaulted to true.
+   * buildCortexLaneRaw below deliberately never reads any of these four — CORTEX's own gather
+   * consumes raw netAvgR/pf, not the post-fix-qualified view; only the four-brain layer's
+   * bestLaneReportForDirection consumer requires them. */
+  conservativeNetR?: number | null;
+  postFixExactLineage?: boolean;
+  costValid?: boolean;
+  fresh?: boolean;
 }
 /** A NEUTRAL basket's report (fractional per-basket net return + resolved basket count). */
 export interface CortexXsecReportLike {

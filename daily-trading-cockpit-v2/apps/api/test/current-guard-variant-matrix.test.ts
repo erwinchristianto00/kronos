@@ -28,6 +28,7 @@ import {
   MAKER_ROUNDTRIP_BPS,
   WIDE_STOP_MIN_BPS,
   WATCHABLE_MIN_FRESH,
+  STABLE_MIN_FRESH,
   PRODUCTION_BREAKEVEN_CONTROL_COST_PCT,
   type VariantMatrixSignal,
   type VariantMatrixVariantDefinition,
@@ -79,15 +80,48 @@ function addResolvedContextCohort(
     count: number;
     netR: (index: number) => number;
     prefix: string;
+    /** Point 3b axis-stamp control. Defaults to a genuine fresh-feed stamp (posture + regimeDirection
+     *  set, matching the trade direction) so this cohort represents real exact-axis proof — the shape
+     *  every pre-existing "exact context proof" fixture in this suite is meant to model. Pass
+     *  `legacy: true` to build UN-stamped, legacy-shaped rows (posture/regimeDirection left null, the
+     *  shape selectVariantMatrixSignals actually produces) for adversarial tests proving legacy data
+     *  alone can never reach STABLE/PROMOTION context status, however large or profitable. */
+    legacy?: boolean;
+    /** Days between consecutive observations' resolvedAt (default 1). Widening this spreads a fixed
+     *  `count` across MORE distinct effectiveN time-blocks per symbol; narrowing it (e.g. a fraction
+     *  of a day, via a custom openedAt/resolvedAt spacing) clusters rows into FEWER blocks. Exposed so
+     *  effectiveN tests can build genuinely-clustered vs genuinely-spread cohorts of the same size. */
+    spacingDays?: number;
+    /** Per-index regime string override (falls back to the constant `regime` when absent). Lets a
+     *  test build a chronologically-drifting-label OR a genuinely-flipping-family cohort so
+     *  distinctRegimes (episode) computation can be exercised end to end. */
+    regimeFor?: (index: number) => string;
+    /** Point 3a override. Defaults to `true` (genuinely fresh) like every pre-existing fixture in
+     *  this suite. Pass `null` to build ambiguous-freshness rows (ends up isFreshValid:null on the
+     *  observation) for adversarial tests proving ambiguous freshness never counts as proof. */
+    isFreshValid?: boolean | null;
+    /** Point 4: override the base openedAt/resolvedAt epoch-ms this cohort's timestamps are built
+     *  from (default Date.UTC(2026,5,1)/Date.UTC(2026,6,1), same as every pre-existing fixture).
+     *  Lets a test insert a SECOND, chronologically-earlier-or-later cohort into the SAME store —
+     *  e.g. a "backfilled" batch dated well before an already-frozen holdout cut — without
+     *  colliding with a first cohort's timestamps. */
+    baseOpenedAtMs?: number;
+    baseResolvedAtMs?: number;
   },
 ): void {
+  const spacingMs = (options.spacingDays ?? 1) * 24 * 60 * 60 * 1000;
+  const baseOpenedAtMs = options.baseOpenedAtMs ?? Date.UTC(2026, 5, 1);
+  const baseResolvedAtMs = options.baseResolvedAtMs ?? Date.UTC(2026, 6, 1);
   const observations = Array.from({ length: options.count }, (_, index) => {
     const base = buildVariantMatrixObservationsForSignal(makeSignal({
       sourceSignalId: `${options.prefix}-${index}`,
       symbol: `CTX${index % 5}USDT`,
       direction: options.direction,
-      regime: options.regime,
-      openedAt: new Date(Date.UTC(2026, 5, 1) + index * 24 * 60 * 60 * 1000).toISOString(),
+      regime: options.regimeFor ? options.regimeFor(index) : options.regime,
+      openedAt: new Date(baseOpenedAtMs + index * spacingMs).toISOString(),
+      ...(options.legacy
+        ? {}
+        : { posture: "TACTICAL" as const, regimeDirection: options.direction }),
     })).find((candidate) => candidate.variantId === options.variantId)!;
     const netR = options.netR(index);
     return {
@@ -98,8 +132,8 @@ function addResolvedContextCohort(
       grossR: netR + 0.12,
       netR,
       costR: 0.12,
-      isFreshValid: true,
-      resolvedAt: new Date(Date.UTC(2026, 6, 1) + index * 24 * 60 * 60 * 1000).toISOString(),
+      isFreshValid: options.isFreshValid === undefined ? true : options.isFreshValid,
+      resolvedAt: new Date(baseResolvedAtMs + index * spacingMs).toISOString(),
     };
   });
   store.addMany(observations);
@@ -598,13 +632,16 @@ describe("current-guard-variant-matrix", () => {
   it("[PROMO] a proven high-WR low-payoff (~0.4) lane reaches STABLE; the 0.5 payoff floor used to bench it", () => {
     const row = {
       variantId: "CG_WIDE_FAST_SHORT", label: "x", exitRule: "tp1_full", fillMode: "taker", costModel: "taker",
-      total: 130, open: 0, resolved: 130, freshValid: 110, rejected: 0, noFill: 0, expired: 0, dataFailure: 0,
+      total: 130, open: 0, resolved: 130, freshValid: 110, effectiveN: 110, rejected: 0, noFill: 0, expired: 0, dataFailure: 0,
       netAvgR: 0.15, grossAvgR: 0.2, pf: 1.8, wr: 0.8, avgWinR: 0.4, avgLossR: -1,
       payoffRatio: 0.4, breakEvenWR: 1 / 3, actualWR: 0.8, avgCostR: 0.1, costDragR: 0.1,
       noFillRate: 0, expiredRate: 0, avgHoldingMinutes: 60, approxMaxDrawdownR: 1, maxAdverseStreak: 1,
       topSymbolPnlShare: 0.2, plus10bpsNetAvgR: 0.1, plus10bpsStillPositive: true,
       calendarDays: 6, distinctRegimes: 2, byRegime: [], byEntryVariant: [], oosThirds: null,
       allThreeOosPositive: true, rolling: [],
+      // Point 4: this test isolates the payoff-floor gate, not the holdout gate — give it a
+      // passing holdout so it reaches STABLE on payoff alone, same as before Point 4 existed.
+      holdoutFreshValid: 30, holdoutSufficient: true, holdoutNegative: false,
     } as Parameters<typeof deriveVariantStatus>[0];
     const infra = { killSwitchReady: false, orderReconciliationReady: false, exchangeHealthReady: false };
     // payoff 0.4 (win ~0.5R / lose ~1R, 80% WR) clears net/PF/OOS/+10bps — must now reach STABLE.
@@ -620,13 +657,16 @@ describe("current-guard-variant-matrix", () => {
   it("[DDBLK] drawdown cap scales with cumulative R; blocker is surfaced when it still binds", () => {
     const row = {
       variantId: "CG_WIDE_FAST_SHORT", label: "x", exitRule: "tp1_full", fillMode: "taker", costModel: "taker",
-      total: 134, open: 0, resolved: 134, freshValid: 134, rejected: 0, noFill: 0, expired: 0, dataFailure: 0,
+      total: 134, open: 0, resolved: 134, freshValid: 134, effectiveN: 134, rejected: 0, noFill: 0, expired: 0, dataFailure: 0,
       netAvgR: 0.27, grossAvgR: 0.3, pf: 3.2, wr: 0.8, avgWinR: 0.4, avgLossR: -1,
       payoffRatio: 0.4, breakEvenWR: 1 / 3, actualWR: 0.8, avgCostR: 0.1, costDragR: 0.1,
       noFillRate: 0, expiredRate: 0, avgHoldingMinutes: 60, approxMaxDrawdownR: 7.76, maxAdverseStreak: 1,
       topSymbolPnlShare: 0.18, plus10bpsNetAvgR: 0.1, plus10bpsStillPositive: true,
       calendarDays: 3, distinctRegimes: 3, byRegime: [], byEntryVariant: [], oosThirds: null,
       allThreeOosPositive: true, rolling: [],
+      // Point 4: this test isolates the drawdown gate, not the holdout gate — give it a passing
+      // holdout so it reaches STABLE on drawdown alone, same as before Point 4 existed.
+      holdoutFreshValid: 30, holdoutSufficient: true, holdoutNegative: false,
     } as Parameters<typeof deriveVariantStatus>[0];
     const infra = { killSwitchReady: false, orderReconciliationReady: false, exchangeHealthReady: false };
     // cumulativeNetR = 0.27 × 134 = 36.2 → cap = max(5, 0.3×36.2) = 10.85R; dd 7.76 < 10.85 → STABLE.
@@ -902,6 +942,298 @@ describe("current-guard-variant-matrix", () => {
       expect(row.freshValid).toBe(30);
       expect(row.contextRows!.LONG_BULLISH!.freshValid).toBe(0);
       expect(row.contextRows!.LONG_MIXED!.freshValid).toBe(0);
+    });
+  });
+
+  // Point 3 — tightened proof cohort: strict isFreshValid, explicit axis-stamp requirement,
+  // effectiveN (independent time-block clustering) instead of raw freshValid, and distinctRegimes as
+  // independent regime EPISODES instead of distinct string labels. Every gate below is proven with a
+  // fail-without/pass-with pair over the SAME shape of cohort, differing only in the one dimension the
+  // fix tightens — so a revert of any one fix turns exactly its own adversarial case red.
+  describe("Point 3 — tightened proof cohort", () => {
+    // Shared profitable-but-not-degenerate shape used by every cohort below (matches the existing
+    // [CTX-1]/splitEvidenceReport pattern): 80% win rate, real losers so payoffRatio is defined.
+    const bullishNetR = (index: number) => (index % 5 === 0 ? -0.5 : 1);
+
+    it("[3A-FAIL] ambiguous freshness (isFreshValid=null) never counts as proof, however large or profitable", () => {
+      const store = new CurrentGuardVariantMatrixStore(tmpDir());
+      addResolvedContextCohort(store, {
+        variantId: "CG_WIDE_STOP_TP_WIDE",
+        direction: "LONG",
+        regime: "Bullish expansion",
+        count: 100,
+        netR: bullishNetR,
+        prefix: "ambiguous",
+        isFreshValid: null,
+      });
+      const report = buildCurrentGuardVariantMatrixReport(store);
+      const row = report.rows.find((c) => c.variantId === "CG_WIDE_STOP_TP_WIDE")!;
+      expect(row.freshValid).toBe(0);
+      expect(row.contextRows!.LONG_BULLISH!.freshValid).toBe(0);
+      expect(row.contextRows!.LONG_BULLISH!.status).toBe("COLLECTING");
+      expect(laneStatusForContext(report, "CG_WIDE_STOP_TP_WIDE", "LONG_BULLISH").status).toBe("COLLECTING");
+    });
+
+    it("[3A-PASS] the identical cohort with isFreshValid=true reaches STABLE_CANDIDATE", () => {
+      const store = new CurrentGuardVariantMatrixStore(tmpDir());
+      addResolvedContextCohort(store, {
+        variantId: "CG_WIDE_STOP_TP_WIDE",
+        direction: "LONG",
+        regime: "Bullish expansion",
+        count: 100,
+        netR: bullishNetR,
+        prefix: "fresh",
+        isFreshValid: true,
+      });
+      const row = buildCurrentGuardVariantMatrixReport(store).rows.find((c) => c.variantId === "CG_WIDE_STOP_TP_WIDE")!;
+      expect(row.contextRows!.LONG_BULLISH!.freshValid).toBe(100);
+      expect(row.contextRows!.LONG_BULLISH!.status).toBe("STABLE_CANDIDATE");
+    });
+
+    it("[3B-FAIL] legacy/parsed regime data (no posture+regimeDirection axis stamp) can never stand alone as exact-context proof", () => {
+      const store = new CurrentGuardVariantMatrixStore(tmpDir());
+      addResolvedContextCohort(store, {
+        variantId: "CG_WIDE_STOP_TP_WIDE",
+        direction: "LONG",
+        regime: "Bullish expansion",
+        count: 100,
+        netR: bullishNetR,
+        prefix: "legacy",
+        legacy: true,
+      });
+      const report = buildCurrentGuardVariantMatrixReport(store);
+      const row = report.rows.find((c) => c.variantId === "CG_WIDE_STOP_TP_WIDE")!;
+      // Legacy rows still land in the AGGREGATE diagnostic (buildRow never filters on the axis stamp)...
+      expect(row.freshValid).toBe(100);
+      // ...but the exact-context proof row must stay at COLLECTING: string-classified regime alone is
+      // not exact-axis proof, so it may never stand in for a STABLE/PROMOTION verdict on its own.
+      expect(row.contextRows!.LONG_BULLISH!.freshValid).toBe(0);
+      expect(row.contextRows!.LONG_BULLISH!.status).toBe("COLLECTING");
+      expect(laneStatusForContext(report, "CG_WIDE_STOP_TP_WIDE", "LONG_BULLISH").status).toBe("COLLECTING");
+    });
+
+    it("[3B-PASS] the identical cohort WITH the fresh-feed axis stamp reaches STABLE_CANDIDATE", () => {
+      const store = new CurrentGuardVariantMatrixStore(tmpDir());
+      addResolvedContextCohort(store, {
+        variantId: "CG_WIDE_STOP_TP_WIDE",
+        direction: "LONG",
+        regime: "Bullish expansion",
+        count: 100,
+        netR: bullishNetR,
+        prefix: "stamped",
+        // legacy left unset -> default axis stamp applied
+      });
+      const row = buildCurrentGuardVariantMatrixReport(store).rows.find((c) => c.variantId === "CG_WIDE_STOP_TP_WIDE")!;
+      expect(row.contextRows!.LONG_BULLISH!.status).toBe("STABLE_CANDIDATE");
+    });
+
+    it("[3C-FAIL] rows clustered into one time block do not inflate effectiveN even though freshValid clears the bar", () => {
+      const store = new CurrentGuardVariantMatrixStore(tmpDir());
+      addResolvedContextCohort(store, {
+        variantId: "CG_WIDE_STOP_TP_WIDE",
+        direction: "LONG",
+        regime: "Bullish expansion",
+        count: 100,
+        netR: bullishNetR,
+        prefix: "clustered",
+        spacingDays: 0, // all 100 share the same instant -> one time block per symbol
+      });
+      const row = buildCurrentGuardVariantMatrixReport(store).rows.find((c) => c.variantId === "CG_WIDE_STOP_TP_WIDE")!;
+      const ctx = row.contextRows!.LONG_BULLISH!;
+      expect(ctx.freshValid).toBe(100); // raw count alone would clear STABLE_MIN_FRESH
+      // Only 5 independent (symbol, time-block) draws exist (5 rotating symbols, 1 shared instant).
+      expect(ctx.effectiveN).toBe(5);
+      expect(ctx.effectiveN).toBeLessThan(STABLE_MIN_FRESH);
+      expect(ctx.status).not.toBe("STABLE_CANDIDATE");
+      expect(ctx.status).toBe("WATCHABLE");
+      expect(ctx.blockers.some((b) => b.includes("effectiveN"))).toBe(true);
+    });
+
+    it("[3C-PASS] a genuinely diverse, fresh, axis-stamped, well-attested cohort spread across distinct time blocks still reaches STABLE_CANDIDATE", () => {
+      const store = new CurrentGuardVariantMatrixStore(tmpDir());
+      addResolvedContextCohort(store, {
+        variantId: "CG_WIDE_STOP_TP_WIDE",
+        direction: "LONG",
+        regime: "Bullish expansion",
+        count: 100,
+        netR: bullishNetR,
+        prefix: "diverse",
+        // default spacingDays=1: each of the 5 rotating symbols' successive rows land 5 days apart,
+        // well beyond this variant's ~3-day (72h) max-hold block width -> all 100 are independent.
+      });
+      const row = buildCurrentGuardVariantMatrixReport(store).rows.find((c) => c.variantId === "CG_WIDE_STOP_TP_WIDE")!;
+      const ctx = row.contextRows!.LONG_BULLISH!;
+      expect(ctx.effectiveN).toBe(100);
+      expect(ctx.status).toBe("STABLE_CANDIDATE");
+    });
+
+    it("[3D-FAIL] chronological label drift within the SAME regime family counts as ONE episode, not several", () => {
+      const store = new CurrentGuardVariantMatrixStore(tmpDir());
+      addResolvedContextCohort(store, {
+        variantId: "CG_WIDE_STOP_TP_WIDE",
+        direction: "LONG",
+        regime: "Bullish expansion",
+        count: 100,
+        netR: bullishNetR,
+        prefix: "drift",
+        // Label churns every row but never leaves the BULLISH family — a raw string Set would read 2.
+        regimeFor: (index) => (index % 2 === 0 ? "Bullish expansion" : "Bullish pressure"),
+      });
+      const row = buildCurrentGuardVariantMatrixReport(store).rows.find((c) => c.variantId === "CG_WIDE_STOP_TP_WIDE")!;
+      expect(row.distinctRegimes).toBe(1);
+      expect(row.contextRows!.LONG_BULLISH!.distinctRegimes).toBe(1);
+    });
+
+    it("[3D-PASS] a genuine chronological regime-family flip counts as 2 distinct episodes", () => {
+      const store = new CurrentGuardVariantMatrixStore(tmpDir());
+      addResolvedContextCohort(store, {
+        variantId: "CG_WIDE_STOP_TP_WIDE",
+        direction: "LONG",
+        regime: "Bullish expansion",
+        count: 100,
+        netR: bullishNetR,
+        prefix: "flip",
+        // First half BULLISH family, second half BEARISH family, in chronological (resolvedAt) order.
+        regimeFor: (index) => (index < 50 ? "Bullish expansion" : "Bearish pressure"),
+      });
+      const row = buildCurrentGuardVariantMatrixReport(store).rows.find((c) => c.variantId === "CG_WIDE_STOP_TP_WIDE")!;
+      expect(row.distinctRegimes).toBe(2);
+    });
+  });
+
+  // Point 4 — immutable chronological development/holdout split. A lane must not reach
+  // STABLE/PROMOTION on development-cohort economics alone: a chronologically later, LOCKED slice
+  // of the same fresh-valid population ("holdout") must independently also show non-negative
+  // net/PF/stress, and must itself carry enough evidence (>= HOLDOUT_MIN_FRESH) before it counts.
+  describe("Point 4 — development/holdout split", () => {
+    it("[4-FAIL] a lane with excellent development-side economics but a genuinely negative holdout stays below STABLE_CANDIDATE", () => {
+      const store = new CurrentGuardVariantMatrixStore(tmpDir());
+      addResolvedContextCohort(store, {
+        variantId: "CG_WIDE_STOP_TP_WIDE",
+        direction: "LONG",
+        regime: "Bullish expansion",
+        count: 100,
+        // First 70 (development side, once the cut freezes at 0.70) are strong winners; the last
+        // 30 (holdout side) are uniform small losers. Every OTHER gate (net/pf/payoff/drawdown/
+        // effectiveN/all-three-OOS-thirds) still clears comfortably on the FULL population — this
+        // isolates the holdout gate as the ONLY thing standing between this lane and STABLE.
+        netR: (index) => (index < 70 ? 2 : -0.1),
+        prefix: "holdout-neg",
+      });
+      const row = buildCurrentGuardVariantMatrixReport(store).rows.find((c) => c.variantId === "CG_WIDE_STOP_TP_WIDE")!;
+      const ctx = row.contextRows!.LONG_BULLISH!;
+      // Every non-holdout STABLE gate genuinely clears — proves this isn't accidentally blocked by
+      // something else (effectiveN, OOS thirds, net/pf/payoff/drawdown all pass).
+      expect(ctx.effectiveN).toBeGreaterThanOrEqual(100);
+      expect(ctx.allThreeOosPositive).toBe(true);
+      expect(ctx.netAvgR).toBeGreaterThan(0);
+      expect(ctx.pf).toBeGreaterThan(1.2);
+      // The holdout itself is genuinely sufficient in size — so this is NEGATIVITY blocking it, not
+      // insufficiency (that's the separate [4-INSUFFICIENT] case below).
+      expect(ctx.holdoutFreshValid).toBeGreaterThanOrEqual(30);
+      expect(ctx.holdoutSufficient).toBe(true);
+      expect(ctx.holdoutNegative).toBe(true);
+      expect(ctx.status).not.toBe("STABLE_CANDIDATE");
+      expect(ctx.status).toBe("WATCHABLE");
+      expect(ctx.blockers.some((b) => b.toLowerCase().includes("holdout"))).toBe(true);
+    });
+
+    it("[4-PASS] the identical shape with a genuinely non-negative development AND holdout reaches STABLE_CANDIDATE", () => {
+      const store = new CurrentGuardVariantMatrixStore(tmpDir());
+      addResolvedContextCohort(store, {
+        variantId: "CG_WIDE_STOP_TP_WIDE",
+        direction: "LONG",
+        regime: "Bullish expansion",
+        count: 100,
+        // Development side (first 70): strong winners with real, periodic losers (so the FULL
+        // population has a well-defined PF, matching every other proven-positive fixture in this
+        // suite). Holdout side (last 30): also genuinely profitable, no losers at all.
+        netR: (index) => (index < 70 ? (index % 5 === 0 ? -0.5 : 2) : 0.5),
+        prefix: "holdout-pos",
+      });
+      const row = buildCurrentGuardVariantMatrixReport(store).rows.find((c) => c.variantId === "CG_WIDE_STOP_TP_WIDE")!;
+      const ctx = row.contextRows!.LONG_BULLISH!;
+      expect(ctx.holdoutSufficient).toBe(true);
+      expect(ctx.holdoutNegative).toBe(false);
+      expect(ctx.holdoutNetAvgR).toBeGreaterThan(0);
+      expect(ctx.status).toBe("STABLE_CANDIDATE");
+    });
+
+    it("[4-INSUFFICIENT / adversarial] an already-frozen holdout stays exactly as small as it was — backfilling more development-side data can never inflate it, retroactively satisfy the size floor, or move the cut", () => {
+      const store = new CurrentGuardVariantMatrixStore(tmpDir());
+      // Step 1: a first, small cohort (exactly HOLDOUT_CUT_MIN_FRESH=20 fresh rows) — enough to
+      // freeze a cut, but the resulting holdout (30% of 20 ≈ 6 rows) is far short of
+      // HOLDOUT_MIN_FRESH=30. Strong, clean economics throughout so nothing else blocks STABLE.
+      addResolvedContextCohort(store, {
+        variantId: "CG_WIDE_STOP_TP_WIDE",
+        direction: "LONG",
+        regime: "Bullish expansion",
+        count: 20,
+        netR: (index) => (index % 5 === 0 ? -0.5 : 1),
+        prefix: "first-cohort",
+      });
+      const firstReport = buildCurrentGuardVariantMatrixReport(store);
+      const firstCtx = firstReport.rows.find((c) => c.variantId === "CG_WIDE_STOP_TP_WIDE")!.contextRows!.LONG_BULLISH!;
+      expect(firstCtx.holdoutCutMs).not.toBeNull();
+      expect(firstCtx.holdoutFreshValid).toBeLessThan(30);
+      const frozenCutMs = firstCtx.holdoutCutMs;
+      const frozenHoldoutCount = firstCtx.holdoutFreshValid;
+
+      // Step 2: backfill 80 MORE fresh, well-attested, genuinely profitable rows — but dated well
+      // BEFORE the frozen cut (a totally different, earlier year), so every one of them lands on
+      // the development side. This is exactly the "changing only development-cohort data" scenario:
+      // the population now easily clears effectiveN>=STABLE_MIN_FRESH (100) and every other
+      // development-side gate, with NOTHING done to the holdout side at all.
+      addResolvedContextCohort(store, {
+        variantId: "CG_WIDE_STOP_TP_WIDE",
+        direction: "LONG",
+        regime: "Bullish expansion",
+        count: 80,
+        netR: () => 1, // uniform winners; the first cohort already supplies the population's losers
+        prefix: "backfilled",
+        baseOpenedAtMs: Date.UTC(2020, 0, 1),
+        baseResolvedAtMs: Date.UTC(2020, 0, 1),
+      });
+      const secondReport = buildCurrentGuardVariantMatrixReport(store);
+      const secondCtx = secondReport.rows.find((c) => c.variantId === "CG_WIDE_STOP_TP_WIDE")!.contextRows!.LONG_BULLISH!;
+
+      // The development-cohort gates now genuinely pass (proves this isn't blocked by anything else):
+      expect(secondCtx.freshValid).toBe(100);
+      expect(secondCtx.effectiveN).toBeGreaterThanOrEqual(100);
+      expect(secondCtx.allThreeOosPositive).toBe(true);
+      expect(secondCtx.netAvgR).toBeGreaterThan(0);
+      expect(secondCtx.pf).toBeGreaterThan(1.2);
+
+      // …but the cut and the holdout it defines are byte-for-byte unchanged — no amount of
+      // development-side data, however large or well-shaped, can move an already-frozen cut or
+      // grow an already-measured holdout.
+      expect(secondCtx.holdoutCutMs).toBe(frozenCutMs);
+      expect(secondCtx.holdoutFreshValid).toBe(frozenHoldoutCount);
+      expect(secondCtx.holdoutSufficient).toBe(false);
+      expect(secondCtx.status).not.toBe("STABLE_CANDIDATE");
+      expect(secondCtx.status).not.toBe("PROMOTION_CANDIDATE");
+      expect(secondCtx.blockers.some((b) => b.toLowerCase().includes("holdout insufficient"))).toBe(true);
+    });
+
+    it("[4-PROMOTION] PROMOTION_CANDIDATE inherits the holdout requirement — a lane clearing every OTHER promotion gate still cannot reach PROMOTION_CANDIDATE (or STABLE_CANDIDATE) with an insufficient holdout, but can with a sufficient one", () => {
+      const row = {
+        variantId: "CG_WIDE_FAST_SHORT", label: "x", exitRule: "tp1_full", fillMode: "taker", costModel: "taker",
+        total: 260, open: 0, resolved: 260, freshValid: 220, effectiveN: 220, rejected: 0, noFill: 0, expired: 0, dataFailure: 0,
+        netAvgR: 0.15, grossAvgR: 0.2, pf: 1.8, wr: 0.8, avgWinR: 0.4, avgLossR: -1,
+        payoffRatio: 0.4, breakEvenWR: 1 / 3, actualWR: 0.8, avgCostR: 0.1, costDragR: 0.1,
+        noFillRate: 0, expiredRate: 0, avgHoldingMinutes: 60, approxMaxDrawdownR: 1, maxAdverseStreak: 1,
+        topSymbolPnlShare: 0.2, plus10bpsNetAvgR: 0.1, plus10bpsStillPositive: true,
+        calendarDays: 10, distinctRegimes: 3, byRegime: [], byEntryVariant: [], oosThirds: null,
+        allThreeOosPositive: true, rolling: [],
+        holdoutFreshValid: 10, holdoutSufficient: false, holdoutNegative: false,
+      } as Parameters<typeof deriveVariantStatus>[0];
+      const infra = { killSwitchReady: true, orderReconciliationReady: true, exchangeHealthReady: true };
+      const insufficient = deriveVariantStatus(row, infra);
+      expect(insufficient.status).not.toBe("PROMOTION_CANDIDATE");
+      expect(insufficient.status).not.toBe("STABLE_CANDIDATE");
+      expect(insufficient.status).toBe("WATCHABLE");
+      const sufficient = deriveVariantStatus({ ...row, holdoutSufficient: true }, infra);
+      expect(sufficient.status).toBe("PROMOTION_CANDIDATE");
     });
   });
 

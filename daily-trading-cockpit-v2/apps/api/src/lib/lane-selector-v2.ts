@@ -486,18 +486,27 @@ export function selectLaneV2(inputs: LaneSelectorV2Inputs): LaneSelectorV2Result
     const shortlistAllowed = isLaneSelectorV2SupportedVariantId(state.variantId) &&
       rotationShortlistAllowsState(inputs, state, estimated);
     const forcedMaturityEligible = state.operatorForceEligible === true && state.exactContextResolved === true;
-    const statusAllowed =
-      shortlistGateActive
-        ? shortlistAllowed
-        : forcedMaturityEligible ||
-          state.status === "STABLE_CANDIDATE" ||
-          (!state.contextRows && isLaneSelectorV2LongWideStopOverride({
-            variantId: state.variantId,
-            direction: candidate.direction,
-            estimatedRegime: estimated,
-          }));
+    // The rotation shortlist is a symbol-level REFINEMENT, never a substitute for exact-context
+    // maturity proof. Previously, when the shortlist gate was active, `statusAllowed` was set to
+    // `shortlistAllowed` ALONE — a COLLECTING/WATCHABLE/REJECT lane (or one with missing proof, or
+    // a null-PF axis row) could be selected purely because the shortlist happened to ALLOW that
+    // symbol. `maturityEligible` is now computed identically regardless of `shortlistGateActive`,
+    // and the shortlist is ANDed in only as an additional narrowing when its gate is active. The
+    // operator-force override (`forcedMaturityEligible`) is preserved exactly as one of the ORed
+    // maturity conditions — it can still skip the STABLE_CANDIDATE bar through its own explicit,
+    // visible path, but it can never rewrite `state.status` itself, and it still requires real
+    // `exactContextResolved === true` proof, so it cannot invent context that was never resolved.
+    const maturityEligible =
+      forcedMaturityEligible ||
+      state.status === "STABLE_CANDIDATE" ||
+      (!state.contextRows && isLaneSelectorV2LongWideStopOverride({
+        variantId: state.variantId,
+        direction: candidate.direction,
+        estimatedRegime: estimated,
+      }));
+    const statusAllowed = maturityEligible && (!shortlistGateActive || shortlistAllowed);
     if (!statusAllowed) {
-      rejected.push(shortlistGateActive
+      rejected.push(maturityEligible
         ? `${state.variantId}:rotation_shortlist_blocked`
         : `${state.variantId}:status_${state.status ?? "unknown"}`);
       continue;

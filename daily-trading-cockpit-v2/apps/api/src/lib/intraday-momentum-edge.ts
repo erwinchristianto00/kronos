@@ -22,6 +22,7 @@ import {
   type SingleSymbolExitPolicy,
   type SingleSymbolFreshSignal,
 } from "./single-symbol-lane-executor.js";
+import { EDGE_LANE_COST_MODEL_VERSION } from "./edge-lane-cost-model.js";
 
 function envNum(name: string, dflt: number): number {
   const v = Number(process.env[name]);
@@ -94,6 +95,10 @@ export interface IntradayMomentumObservation extends IntradayMomentumSignal {
   takerBuyRatioAtEntry?: number | null;
   spreadBpsAtEntry?: number | null;
   decisionScoreAtEntry?: number | null;
+  /** LIVE-LANE WIRING (2026-08-02) — see edge-lane-cost-model.ts / lane-edge-report-fields.ts.
+   *  Stamped only by THIS module's own new-observation creation code, below — never backfilled. */
+  postFixLineageV1?: boolean;
+  costModelVersion?: number;
 }
 
 function finite(v: number | null | undefined): v is number {
@@ -362,6 +367,8 @@ export async function runIntradayMomentumCycle(opts: {
       takerBuyRatioAtEntry: enrichment?.takerBuyRatio ?? null,
       spreadBpsAtEntry: enrichment?.spreadBps ?? null,
       decisionScoreAtEntry: enrichment?.decisionScore ?? null,
+      postFixLineageV1: true,
+      costModelVersion: EDGE_LANE_COST_MODEL_VERSION,
     });
     if (added) result.recorded += 1;
   }

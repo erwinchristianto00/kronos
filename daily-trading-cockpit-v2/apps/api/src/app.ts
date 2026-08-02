@@ -149,10 +149,11 @@ import {
   LiveExecutionStore,
   parseLiveExecutionConfig,
   symbolPriorityTier,
+  type LiveExecutionConfig,
 } from "./lib/live-execution-engine.js";
 import { getLaneSymbolCurationCacheStore } from "./lib/lane-symbol-curation-cache.js";
 import type { LaneSymbolCurationTier } from "./lib/per-symbol-lane-book-edge.js";
-import { getPaperExecutionRouterStore, peekPaperExecutionRouterStore } from "./lib/paper-execution-router.js";
+import { getPaperExecutionRouterStore, peekPaperExecutionRouterStore, type PaperOrder } from "./lib/paper-execution-router.js";
 import {
   isForceEligibleForDirection,
   getRealtimeShortMirrorStore,
@@ -167,6 +168,7 @@ import {
   getCurrentGuardVariantMatrixStore,
   laneStatusForContext,
   type ContextLaneStatusLookup,
+  type CurrentGuardVariantMatrixStore,
   variantMatrixOpenSignals,
 } from "./lib/current-guard-variant-matrix.js";
 import { getLatestScanCandidates } from "./lib/latest-scan-candidates-cache.js";
@@ -376,6 +378,164 @@ export function hasExactContextReadinessProof(contextProof: ContextLaneStatusLoo
     contextProof.evidence !== null &&
     contextProof.status !== "NOT_APPLICABLE"
   );
+}
+
+/**
+ * The rotation shortlist is a symbol-level REFINEMENT, never a substitute for exact-context lane
+ * maturity proof. `isPaperOrderLiveEligible` used to gate this on `liveConfig.env === "mainnet"`
+ * only — on any non-mainnet env (testnet, research) the function fell straight through to the
+ * rotation-shortlist branch below, so a COLLECTING/WATCHABLE/REJECT lane (or one with missing
+ * proof) could be admitted purely because the shortlist happened to ALLOW that symbol. This gate
+ * is now environment-independent: it blocks whenever maturity has not been proven and the operator
+ * has not set the explicit, visible `LIVE_UNPROVEN_EXECUTION_OVERRIDE=1` escape hatch. It never
+ * rewrites or fakes `contextProof.status` — `maturityEligible` is computed upstream from the real
+ * evidence status (plus the operator-force / long-wide-stop overrides, which themselves require
+ * real `exactContextResolved`/context proof and are left untouched by this gate).
+ */
+export function paperOrderMaturityGateBlocks(
+  maturityEligible: boolean,
+  unprovenExecutionOverrideActive: boolean,
+): boolean {
+  return !maturityEligible && !unprovenExecutionOverrideActive;
+}
+
+export interface IsPaperOrderLiveEligibleDeps {
+  liveConfig: LiveExecutionConfig;
+  getUnifiedOrchestrator: () => UnifiedTestnetOrchestrator | null;
+  getLiveEngine: () => LiveExecutionEngine | null;
+  getVariantMatrixStore: () => CurrentGuardVariantMatrixStore;
+}
+
+/**
+ * 2026-08 remediation: this is the REAL body of the `isPaperOrderLiveEligible` closure that
+ * buildApp() wires into LiveExecutionEngine (invoked at live-execution-engine.ts's
+ * `paperSourceEligibleForMirror`/mirror-funnel call sites, surfaced there as the "not_live_eligible"
+ * mirror-drop reason). It used to be defined ONLY inline inside buildApp(), so the only test that
+ * ever existed for the env-independence fix (`paperOrderMaturityGateBlocks`, above) exercised the
+ * extracted pure gate with hand-picked booleans and never this wiring — a mutation reinstating the
+ * original `liveConfig.env === "mainnet" &&` restriction right here left the whole suite green.
+ * Extracted (byte-identical logic, same free variables now passed as `deps`) purely so a test can
+ * construct this SAME function with a real, non-mainnet `liveConfig` and a real
+ * `CurrentGuardVariantMatrixStore` and call it directly — buildApp() below calls this with its own
+ * live singletons/getters, unchanged in every observable way. `getUnifiedOrchestrator`/`getLiveEngine`
+ * are getters, not plain values, because buildApp() assigns those `let` bindings AFTER this factory
+ * runs (this factory is called from inside the very `new LiveExecutionEngine({...})` call that
+ * assigns `liveEngine`) — the original inline closure read them from the enclosing scope at
+ * INVOCATION time (when the mirror actually runs), and getters preserve that exactly.
+ */
+export function buildIsPaperOrderLiveEligible(
+  deps: IsPaperOrderLiveEligibleDeps,
+): (order: PaperOrder) => boolean {
+  return (order) => {
+    const { liveConfig } = deps;
+    const unifiedOrchestrator = deps.getUnifiedOrchestrator();
+    const liveEngine = deps.getLiveEngine();
+    if (unifiedOrchestrator?.isEnabled()) {
+      return unifiedOrchestrator.allowsPaperOrder({
+        selectedLaneId: order.selectedLaneId,
+        direction: order.direction,
+      });
+    }
+    // Operator manual directional mode is a narrow admission override: it may bypass maturity,
+    // book, and regime-policy blockers only for the currently selected Entry Decision side and
+    // explicitly selected lane. The engine still enforces freshness, geometry, caps, and all
+    // exchange/account safety before it can open anything.
+    if (liveEngine?.isManualEntryAllowedForPaper(order)) return true;
+    const useTestnetPolicy =
+      liveConfig.env === "testnet" ||
+      (liveConfig.env === "mainnet" && liveConfig.mainnetKeepTestnetPolicy);
+    const manuallySelected = liveEngine?.laneSelectionExplicitlyIncludesLane(order.selectedLaneId) ?? false;
+    if (isProfitCoreShortLaneId(order.selectedLaneId)) {
+      // The new lane is an OOS forward test, not a backdoor around mainnet's proven-only gate.
+      return liveConfig.env === "testnet" && order.direction === "SHORT";
+    }
+    if (
+      useTestnetPolicy &&
+      !(
+        isRealtimeShortAllowedLaneId(order.selectedLaneId) ||
+        isRealtimeShortSelectableLaneId(order.selectedLaneId, manuallySelected)
+      )
+    ) return false;
+    const orderEstimatedRegime = estimateLaneSelectorV2Regime({
+      regime: order.regime,
+      controllerMode: order.controllerMode,
+      confidence: order.controllerConfidence ?? null,
+    });
+    if (
+      useTestnetPolicy &&
+      orderEstimatedRegime.direction === "MIXED" &&
+      order.symbol.toUpperCase() === "NEARUSDT"
+    ) {
+      return false;
+    }
+    const report = buildCurrentGuardVariantMatrixReport(deps.getVariantMatrixStore());
+    const rotationShortlist = buildRegimeRotationShortlistReport(report);
+    const laneVariantId = order.selectedLaneId.split(":").pop() ?? order.selectedLaneId;
+    const regimeFamily =
+      orderEstimatedRegime.direction === "LONG"
+        ? "BULLISH"
+        : orderEstimatedRegime.direction === "SHORT"
+          ? "BEARISH"
+          : rotationRegimeFamilyForLabel(order.regime);
+    const exactContext = exactLaneContextFor(order.direction, regimeFamily);
+    const contextProof = laneStatusForContext(
+      report,
+      laneVariantId,
+      exactContext,
+    );
+    // Exact applicability is a hard execution boundary. Force, rotation, and the explicit
+    // unproven override may relax maturity only; none may invent or borrow a proof context.
+    if (!hasExactContextReadinessProof(contextProof)) return false;
+    const forceEligibleForDirection = isForceEligibleForDirection(order.direction, laneVariantId);
+    const authorizedLongWideOverride = isLaneSelectorV2LongWideStopOverride({
+      variantId: laneVariantId,
+      direction: order.direction,
+      estimatedRegime: orderEstimatedRegime,
+    });
+    const maturityEligible =
+      contextProof.status === "STABLE_CANDIDATE" ||
+      forceEligibleForDirection ||
+      authorizedLongWideOverride;
+    if (
+      paperOrderMaturityGateBlocks(
+        maturityEligible,
+        process.env.LIVE_UNPROVEN_EXECUTION_OVERRIDE === "1",
+      )
+    ) return false;
+    const rotationEligible = rotationShortlistDecision(rotationShortlist, {
+      laneId: order.selectedLaneId,
+      variantId: laneVariantId,
+      symbol: order.symbol,
+      direction: order.direction,
+      regimeFamily,
+    }).allowed;
+    const rotationGateActive =
+      (order.direction === "LONG" && regimeFamily === "BULLISH") ||
+      (order.direction === "SHORT" && regimeFamily === "BEARISH");
+    if (rotationGateActive) {
+      if (rotationEligible) return true;
+      // 2026-07-08: the shortlist is built from THIS instance's own VM book. Live never
+      // accrues VM observations, so in an extended regime its shortlist is structurally
+      // EMPTY and vetoed every candidate (`symbol_not_shortlisted` on all symbols → zero
+      // trades under FAST_SHORT 100%). Empty-because-no-data is not "no good symbols":
+      // fall back to the /research curation whitelist (the operator's mandated brain) —
+      // still proven-symbols-only (tier ≤ 1), never a free pass.
+      if (!rotationShortlistFamilyHasSymbols(rotationShortlist, regimeFamily)) {
+        const curationCache = getLaneSymbolCurationCacheStore().get();
+        const tier = symbolPriorityTier(
+          order.symbol,
+          order.direction,
+          order.selectedLaneId,
+          curationCache?.report ?? null,
+          curationCache?.fetchedAt ?? null,
+          (process.env.LANE_SYMBOL_CURATION_TIER as LaneSymbolCurationTier | undefined) ?? null,
+        );
+        return tier <= 1;
+      }
+      return false;
+    }
+    return maturityEligible;
+  };
 }
 
 export async function buildApp(options: AppOptions = {}): Promise<FastifyInstance> {
@@ -915,112 +1075,12 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       paperLaneWeightPct: (order) => unifiedOrchestrator?.isEnabled()
         ? (unifiedOrchestrator.allowsPaperOrder({ selectedLaneId: order.selectedLaneId, direction: order.direction }) ? 100 : 0)
         : null,
-      isPaperOrderLiveEligible: (order) => {
-        if (unifiedOrchestrator?.isEnabled()) {
-          return unifiedOrchestrator.allowsPaperOrder({
-            selectedLaneId: order.selectedLaneId,
-            direction: order.direction,
-          });
-        }
-        // Operator manual directional mode is a narrow admission override: it may bypass maturity,
-        // book, and regime-policy blockers only for the currently selected Entry Decision side and
-        // explicitly selected lane. The engine still enforces freshness, geometry, caps, and all
-        // exchange/account safety before it can open anything.
-        if (liveEngine?.isManualEntryAllowedForPaper(order)) return true;
-        const useTestnetPolicy =
-          liveConfig.env === "testnet" ||
-          (liveConfig.env === "mainnet" && liveConfig.mainnetKeepTestnetPolicy);
-        const manuallySelected = liveEngine?.laneSelectionExplicitlyIncludesLane(order.selectedLaneId) ?? false;
-        if (isProfitCoreShortLaneId(order.selectedLaneId)) {
-          // The new lane is an OOS forward test, not a backdoor around mainnet's proven-only gate.
-          return liveConfig.env === "testnet" && order.direction === "SHORT";
-        }
-        if (
-          useTestnetPolicy &&
-          !(
-            isRealtimeShortAllowedLaneId(order.selectedLaneId) ||
-            isRealtimeShortSelectableLaneId(order.selectedLaneId, manuallySelected)
-          )
-        ) return false;
-        const orderEstimatedRegime = estimateLaneSelectorV2Regime({
-          regime: order.regime,
-          controllerMode: order.controllerMode,
-          confidence: order.controllerConfidence ?? null,
-        });
-        if (
-          useTestnetPolicy &&
-          orderEstimatedRegime.direction === "MIXED" &&
-          order.symbol.toUpperCase() === "NEARUSDT"
-        ) {
-          return false;
-        }
-        const report = buildCurrentGuardVariantMatrixReport(getCurrentGuardVariantMatrixStore());
-        const rotationShortlist = buildRegimeRotationShortlistReport(report);
-        const laneVariantId = order.selectedLaneId.split(":").pop() ?? order.selectedLaneId;
-        const regimeFamily =
-          orderEstimatedRegime.direction === "LONG"
-            ? "BULLISH"
-            : orderEstimatedRegime.direction === "SHORT"
-              ? "BEARISH"
-              : rotationRegimeFamilyForLabel(order.regime);
-        const exactContext = exactLaneContextFor(order.direction, regimeFamily);
-        const contextProof = laneStatusForContext(
-          report,
-          laneVariantId,
-          exactContext,
-        );
-        // Exact applicability is a hard execution boundary. Force, rotation, and the explicit
-        // unproven override may relax maturity only; none may invent or borrow a proof context.
-        if (!hasExactContextReadinessProof(contextProof)) return false;
-        const forceEligibleForDirection = isForceEligibleForDirection(order.direction, laneVariantId);
-        const authorizedLongWideOverride = isLaneSelectorV2LongWideStopOverride({
-          variantId: laneVariantId,
-          direction: order.direction,
-          estimatedRegime: orderEstimatedRegime,
-        });
-        const maturityEligible =
-          contextProof.status === "STABLE_CANDIDATE" ||
-          forceEligibleForDirection ||
-          authorizedLongWideOverride;
-        if (
-          liveConfig.env === "mainnet" &&
-          !maturityEligible &&
-          process.env.LIVE_UNPROVEN_EXECUTION_OVERRIDE !== "1"
-        ) return false;
-        const rotationEligible = rotationShortlistDecision(rotationShortlist, {
-          laneId: order.selectedLaneId,
-          variantId: laneVariantId,
-          symbol: order.symbol,
-          direction: order.direction,
-          regimeFamily,
-        }).allowed;
-        const rotationGateActive =
-          (order.direction === "LONG" && regimeFamily === "BULLISH") ||
-          (order.direction === "SHORT" && regimeFamily === "BEARISH");
-        if (rotationGateActive) {
-          if (rotationEligible) return true;
-          // 2026-07-08: the shortlist is built from THIS instance's own VM book. Live never
-          // accrues VM observations, so in an extended regime its shortlist is structurally
-          // EMPTY and vetoed every candidate (`symbol_not_shortlisted` on all symbols → zero
-          // trades under FAST_SHORT 100%). Empty-because-no-data is not "no good symbols":
-          // fall back to the /research curation whitelist (the operator's mandated brain) —
-          // still proven-symbols-only (tier ≤ 1), never a free pass.
-          if (!rotationShortlistFamilyHasSymbols(rotationShortlist, regimeFamily)) {
-            const curationCache = getLaneSymbolCurationCacheStore().get();
-            const tier = symbolPriorityTier(
-              order.symbol,
-              order.direction,
-              order.selectedLaneId,
-              curationCache?.report ?? null,
-              curationCache?.fetchedAt ?? null,
-              (process.env.LANE_SYMBOL_CURATION_TIER as LaneSymbolCurationTier | undefined) ?? null,
-            );
-            return tier <= 1;
-          }
-          return false;
-        }
-        return maturityEligible;
-      },
+      isPaperOrderLiveEligible: buildIsPaperOrderLiveEligible({
+        liveConfig,
+        getUnifiedOrchestrator: () => unifiedOrchestrator,
+        getLiveEngine: () => liveEngine,
+        getVariantMatrixStore: () => getCurrentGuardVariantMatrixStore(),
+      }),
       getControllerSnapshot: () => {
         const cached = getLatestScanCandidates();
         const scanStatus = coreScanAutoRefreshController.getStatus();
@@ -2627,7 +2687,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         // resolvedCount>0 for the requested direction, reusing the SAME RC/RCS/SF/IM/PWR/CE store+report
         // builders CORTEX's own gather already reads (see four-brain-best-lane-report.ts's doc comment
         // for the exact selection rule + why n=0 lanes are never selectable).
-        bestLaneReportForDirection: buildLiveBestLaneReportForDirection("data", ceBucketsOnce),
+        bestLaneReportForDirection: buildLiveBestLaneReportForDirection("data", ceBucketsOnce, nowMs),
         // BTC taker buy/sell ratio uses the same signed transform; >0 means aggressive flow leans long.
         crowdAlignLong: fourBrainBtcFlowCache?.crowdAlignLong ?? null,
         crowdAtMs: fourBrainBtcFlowCache?.crowdAlignLong !== null

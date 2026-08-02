@@ -246,7 +246,44 @@ describe("realtime-short-mirror — fresh short live-mirror source (mode 2)", ()
     expect(store.all[0]!.selectedLaneId).toBe(realtimeShortSelectedLaneId("CG_WIDE_FAST_SHORT"));
   });
 
-  it("[ROTATION-SHORTLIST] can emit a non-stable lane only for an allowed bearish symbol", () => {
+  // Point 2 fix note: this test used to be titled "[ROTATION-SHORTLIST] can emit a non-stable lane
+  // only for an allowed bearish symbol" and asserted a REJECT-status lane got emitted purely
+  // because the rotation shortlist ALLOWed the symbol — the same maturity-substitution bug fixed
+  // in lane-selector-v2.ts (runRealtimeShortMirror calls selectLaneV2 internally, so it inherited
+  // the bug through that shared code path). Rewritten: REJECT must now block regardless of the
+  // shortlist, and a companion positive test proves a genuinely mature (STABLE_CANDIDATE) lane is
+  // still correctly narrowed/emitted by the same shortlist.
+  function injRotationShortlist() {
+    return {
+      generatedAt: "2026-07-05T04:00:00.000Z",
+      minAllowSample: 10,
+      minWatchSample: 5,
+      bearishGlobal: [],
+      bullishGlobal: [],
+      lanes: [
+        {
+          laneId: realtimeShortSelectedLaneId("CG_WIDE_STOP_TP_WIDE"),
+          variantId: "CG_WIDE_STOP_TP_WIDE",
+          label: "Wide",
+          bullish: [],
+          bearish: [
+            {
+              symbol: "INJUSDT",
+              n: 18,
+              netAvgR: 0.22,
+              pf: 2.1,
+              wr: 0.78,
+              score: 30,
+              verdict: "ALLOW",
+              reason: "test allow",
+            },
+          ],
+        },
+      ],
+    };
+  }
+
+  it("[ROTATION-SHORTLIST / ADVERSARIAL] does NOT emit a REJECT-status lane even though the rotation shortlist ALLOWs that exact bearish symbol", () => {
     const store = freshStore();
     const res = runRealtimeShortMirror(
       inputs([shortCand("INJUSDT")], {
@@ -261,33 +298,31 @@ describe("realtime-short-mirror — fresh short live-mirror source (mode 2)", ()
             byAxisSymbol: [{ key: "SHORT_BEARISH|INJUSDT", n: 18, netAvgR: 0.22 }],
           },
         ],
-        rotationShortlist: {
-          generatedAt: "2026-07-05T04:00:00.000Z",
-          minAllowSample: 10,
-          minWatchSample: 5,
-          bearishGlobal: [],
-          bullishGlobal: [],
-          lanes: [
-            {
-              laneId: realtimeShortSelectedLaneId("CG_WIDE_STOP_TP_WIDE"),
-              variantId: "CG_WIDE_STOP_TP_WIDE",
-              label: "Wide",
-              bullish: [],
-              bearish: [
-                {
-                  symbol: "INJUSDT",
-                  n: 18,
-                  netAvgR: 0.22,
-                  pf: 2.1,
-                  wr: 0.78,
-                  score: 30,
-                  verdict: "ALLOW",
-                  reason: "test allow",
-                },
-              ],
-            },
-          ],
-        },
+        rotationShortlist: injRotationShortlist(),
+      }),
+      store,
+    );
+    expect(res.emitted).toBe(0);
+    expect(store.all).toHaveLength(0);
+    expect(res.reasons).toContain("CG_WIDE_STOP_TP_WIDE:status_REJECT:INJUSDT");
+  });
+
+  it("[ROTATION-SHORTLIST / PASS-WITH] emits a genuinely STABLE_CANDIDATE lane for that same allowed bearish symbol (post-fix regression guard)", () => {
+    const store = freshStore();
+    const res = runRealtimeShortMirror(
+      inputs([shortCand("INJUSDT")], {
+        stableShortLaneActive: false,
+        stableShortLanes: [
+          {
+            variantId: "CG_WIDE_STOP_TP_WIDE",
+            status: "STABLE_CANDIDATE",
+            freshValid: 200,
+            netAvgR: 0.3,
+            pf: 1.3,
+            byAxisSymbol: [{ key: "SHORT_BEARISH|INJUSDT", n: 18, netAvgR: 0.22 }],
+          },
+        ],
+        rotationShortlist: injRotationShortlist(),
       }),
       store,
     );
