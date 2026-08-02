@@ -75,6 +75,21 @@ export class LiveIntentIndex extends Map<string, LiveIntent> {
  * disagree. Fail closed: never assume which one is stale." A collision is reported through the same
  * mechanism as a stale/missing index, deliberately — both are "we cannot safely resolve this id",
  * and the caller must never guess in either case.
+ *
+ * DUPLICATE SOURCE ROW WITHIN ONE INTENT (documented 2026-08-02): the "owners" Set above is grouped
+ * by DISTINCT INTENT OBJECT, so if a single intent lists the SAME paperOrderId twice (or more) in
+ * its own `sourcePaperOrders` — a genuine data-integrity anomaly, e.g. a double-recorded pyramid add
+ * — the Set collapses both rows to one member (it is the same intent object both times) and the
+ * ordinary `candidates.size > 1` check above cannot see it. That is still ambiguous: the two rows
+ * are two separate PaperOrder-lineage records that both claim the same id, and this index has no
+ * basis for picking one over the other even though they resolve to the same intent. So a SEPARATE
+ * `sourceOccurrences` counter tracks the raw number of (non-self-echo) `sourcePaperOrders` rows seen
+ * for each id, across every intent, independent of the Set's per-intent dedupe — and any id whose
+ * occurrence count exceeds 1 is retracted into `conflictedPaperOrderIds` exactly like a cross-intent
+ * collision, even when `candidates.size === 1`. This does not apply to the routine primary self-echo
+ * (`source.paperOrderId === intent.paperOrderId`), which is skipped before either counter sees it, as
+ * before — only a genuine duplicate SOURCE row (or a duplicated self-echo-shaped row, which is its
+ * own anomaly) is affected.
  */
 export function buildLiveIntentIndexByPaperOrderId(
   intents: readonly LiveIntent[],
@@ -85,6 +100,11 @@ export function buildLiveIntentIndexByPaperOrderId(
   // so a genuine collision (size > 1) is detectable rather than silently overwritten — regardless of
   // whether the colliding paperOrderId is a PRIMARY, a SOURCE, or both, on either side.
   const owners = new Map<string, Set<LiveIntent>>();
+  // Raw count of (non-self-echo) sourcePaperOrders ROWS seen for each id, across every intent —
+  // deliberately NOT deduped by intent identity, unlike `owners` above. See the "DUPLICATE SOURCE
+  // ROW WITHIN ONE INTENT" doc section above: this is what catches a single intent listing the same
+  // paperOrderId twice in its own sourcePaperOrders, which `owners`'s Set-of-intents dedupe cannot.
+  const sourceRowOccurrences = new Map<string, number>();
   const addOwner = (id: string, intent: LiveIntent) => {
     let set = owners.get(id);
     if (!set) {
@@ -98,13 +118,17 @@ export function buildLiveIntentIndexByPaperOrderId(
     for (const source of intent.sourcePaperOrders ?? []) {
       if (source.paperOrderId === intent.paperOrderId) continue; // routine self-echo, not new info
       addOwner(source.paperOrderId, intent);
+      sourceRowOccurrences.set(source.paperOrderId, (sourceRowOccurrences.get(source.paperOrderId) ?? 0) + 1);
     }
   }
 
   const resolved = new Map<string, LiveIntent>();
   const conflicted = new Set<string>();
   for (const [paperOrderId, candidates] of owners) {
-    if (candidates.size > 1) {
+    // Either shape of ambiguity retracts the id: claimed by 2+ DISTINCT intents (candidates.size > 1)
+    // or listed 2+ TIMES as a source row, even from within one intent's own sourcePaperOrders
+    // (sourceRowOccurrences > 1 — see doc section above).
+    if (candidates.size > 1 || (sourceRowOccurrences.get(paperOrderId) ?? 0) > 1) {
       // COLLISION — see policy doc above. Retract (never overwrite with a guess) and record.
       conflicted.add(paperOrderId);
     } else {

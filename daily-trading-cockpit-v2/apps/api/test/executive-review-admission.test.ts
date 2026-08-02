@@ -806,6 +806,129 @@ describe("Executive Review admission — late-binding (point 2)", () => {
     });
   });
 
+  describe("blocker 2(b) — duplicate source row within one intent must fail closed as ambiguous, never silently resolved to the first match", () => {
+    it("a genuine (non-primary) source paperOrderId listed TWICE within one intent's own sourcePaperOrders is retracted by live-intent-index.ts itself (blocker 2a) — never even reaches the admission-side ambiguity check, and fails closed as INTENT_INDEX_MISS via the REAL index", () => {
+      const dir = mkdtempSync(join(tmpdir(), "executive-review-admission-late-dupsource-retracted-"));
+      try {
+        const paperStore = new PaperExecutionRouterStore(dir);
+        paperStore.add(paper());
+        const reviewStore = new ExecutiveReviewStore(join(dir, "reviews.json"));
+        const intent = liveIntent({
+          paperOrderId: "primary-a",
+          causalLineage: lineage({ opportunityId: "opportunity-primary" }),
+          sourcePaperOrders: [
+            { paperOrderId: "paper-1", laneId: "LANE", qty: 1, causalLineage: lineage() },
+            { paperOrderId: "paper-1", laneId: "LANE", qty: 1, causalLineage: lineage() },
+          ],
+        });
+        const intentIndex = buildLiveIntentIndexByPaperOrderId([intent]);
+        expect(intentIndex.get("paper-1")).toBeUndefined(); // retracted at the index level
+        expect(intentIndex.conflictedPaperOrderIds.has("paper-1")).toBe(true);
+        const result = attachExecutiveReviewToExactPaperOrder({
+          reviewStore,
+          paperStore,
+          executive: executive(),
+          candidateId: "candidate-1",
+          // Exactly app.ts's real derivation: index keys UNION conflictedPaperOrderIds.
+          executingPaperOrderIds: new Set([...intentIndex.keys(), ...intentIndex.conflictedPaperOrderIds]),
+          env: shadowEnv,
+          paperOrderOwnershipIndex: ownershipIndexFor(paperStore),
+          liveIntentIndexByPaperOrderId: intentIndex,
+          saveLiveIntents: () => {},
+        });
+        expect(result).toBe("INTENT_INDEX_MISS");
+        expect(reviewStore.get().reviews).toHaveLength(0);
+        // Neither duplicate row was mutated by the rejected attempt.
+        expect(intent.sourcePaperOrders?.[0]?.executiveReviewLink).toBeUndefined();
+        expect(intent.sourcePaperOrders?.[1]?.executiveReviewLink).toBeUndefined();
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("defense in depth: a duplicated PRIMARY self-echo row (which live-intent-index.ts deliberately never counts) still fails closed as INTENT_SOURCE_ROW_AMBIGUOUS — never silently resolved to the first row, even though both duplicate rows carry IDENTICAL lineage/link", () => {
+      const dir = mkdtempSync(join(tmpdir(), "executive-review-admission-late-dupsource-identical-"));
+      try {
+        const paperStore = new PaperExecutionRouterStore(dir);
+        paperStore.add(paper());
+        const reviewStore = new ExecutiveReviewStore(join(dir, "reviews.json"));
+        // Both rows equal the intent's OWN primary paperOrderId — self-echo-shaped — so
+        // live-intent-index.ts's `source.paperOrderId === intent.paperOrderId` skip means NEITHER
+        // row is ever counted by the index's owners/sourceRowOccurrences tracking: the index resolves
+        // "paper-1" cleanly to this intent with zero conflict. Only the admission-side check (which
+        // looks at the intent's OWN sourcePaperOrders array directly, not through the index) can catch
+        // this anomaly — proving the defense-in-depth check is genuinely reachable, not dead code.
+        const identicalLineage = lineage();
+        const intent = liveIntent({
+          paperOrderId: "paper-1",
+          causalLineage: identicalLineage,
+          sourcePaperOrders: [
+            { paperOrderId: "paper-1", laneId: "LANE", qty: 1, causalLineage: identicalLineage },
+            { paperOrderId: "paper-1", laneId: "LANE", qty: 1, causalLineage: identicalLineage },
+          ],
+        });
+        const intentIndex = buildLiveIntentIndexByPaperOrderId([intent]);
+        expect(intentIndex.get("paper-1")).toBe(intent); // index resolves cleanly — no conflict there
+        expect(intentIndex.conflictedPaperOrderIds.size).toBe(0);
+        const result = attachExecutiveReviewToExactPaperOrder({
+          reviewStore,
+          paperStore,
+          executive: executive(),
+          candidateId: "candidate-1",
+          executingPaperOrderIds: new Set(["paper-1"]),
+          env: shadowEnv,
+          paperOrderOwnershipIndex: ownershipIndexFor(paperStore),
+          liveIntentIndexByPaperOrderId: intentIndex,
+          saveLiveIntents: () => {},
+        });
+        expect(result).toBe("INTENT_SOURCE_ROW_AMBIGUOUS");
+        expect(reviewStore.get().reviews).toHaveLength(0);
+        // Never overwritten.
+        expect(intent.executiveReviewLink).toBeUndefined();
+        expect(intent.sourcePaperOrders?.[0]?.executiveReviewLink).toBeUndefined();
+        expect(intent.sourcePaperOrders?.[1]?.executiveReviewLink).toBeUndefined();
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("defense in depth: a duplicated PRIMARY self-echo row still fails closed as INTENT_SOURCE_ROW_AMBIGUOUS when the two duplicate rows carry DIFFERENT lineage/link — never resolves by picking either one", () => {
+      const dir = mkdtempSync(join(tmpdir(), "executive-review-admission-late-dupsource-different-"));
+      try {
+        const paperStore = new PaperExecutionRouterStore(dir);
+        paperStore.add(paper());
+        const reviewStore = new ExecutiveReviewStore(join(dir, "reviews.json"));
+        const intent = liveIntent({
+          paperOrderId: "paper-1",
+          causalLineage: lineage(),
+          sourcePaperOrders: [
+            { paperOrderId: "paper-1", laneId: "LANE", qty: 1, causalLineage: lineage() },
+            { paperOrderId: "paper-1", laneId: "LANE", qty: 1, causalLineage: lineage({ opportunityId: "opportunity-DIFFERENT" }) },
+          ],
+        });
+        const intentIndex = buildLiveIntentIndexByPaperOrderId([intent]);
+        expect(intentIndex.get("paper-1")).toBe(intent); // index resolves cleanly — no conflict there
+        expect(intentIndex.conflictedPaperOrderIds.size).toBe(0);
+        const result = attachExecutiveReviewToExactPaperOrder({
+          reviewStore,
+          paperStore,
+          executive: executive(),
+          candidateId: "candidate-1",
+          executingPaperOrderIds: new Set(["paper-1"]),
+          env: shadowEnv,
+          paperOrderOwnershipIndex: ownershipIndexFor(paperStore),
+          liveIntentIndexByPaperOrderId: intentIndex,
+          saveLiveIntents: () => {},
+        });
+        expect(result).toBe("INTENT_SOURCE_ROW_AMBIGUOUS");
+        expect(reviewStore.get().reviews).toHaveLength(0);
+        expect(intent.executiveReviewLink).toBeUndefined();
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  });
+
   it("fails closed as INTENT_TERMINAL for an already-closed/settled intent", () => {
     const dir = mkdtempSync(join(tmpdir(), "executive-review-admission-late-terminal-"));
     try {
@@ -929,6 +1052,39 @@ describe("Executive Review admission — late-binding (point 2)", () => {
       expect(reviewStore.get().reviews).toHaveLength(0);
       // Never overwritten.
       expect(intent.executiveReviewLink).toBe(otherLink);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("blocker 1 — fails closed as INTENT_REVIEW_CONFLICT even when the intent's existing link shares the SAME executiveReviewId as the canonical one but disagrees on another field (full structural equality, not just executiveReviewId)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "executive-review-admission-late-review-conflict-samereviewid-"));
+    try {
+      const paperStore = new PaperExecutionRouterStore(dir);
+      paperStore.add(paper());
+      const reviewStore = new ExecutiveReviewStore(join(dir, "reviews.json"));
+      // Same executiveReviewId as the canonical link this (executive, order) pair would derive, but
+      // marketState disagrees (e.g. a stale link captured before a since-corrected upstream bug) —
+      // under the OLD id-only check this was silently treated as "already correctly linked"; the
+      // fixed structural check must fail closed instead.
+      const staleSameIdLink: ExecutiveReviewExecutionLink = { ...defaultReviewLink(), marketState: "BEARISH" };
+      const intent = liveIntent({ executiveReviewLink: staleSameIdLink });
+      const intentIndex = buildLiveIntentIndexByPaperOrderId([intent]);
+      const result = attachExecutiveReviewToExactPaperOrder({
+        reviewStore,
+        paperStore,
+        executive: executive(),
+        candidateId: "candidate-1",
+        executingPaperOrderIds: new Set(["paper-1"]),
+        env: shadowEnv,
+        paperOrderOwnershipIndex: ownershipIndexFor(paperStore),
+        liveIntentIndexByPaperOrderId: intentIndex,
+        saveLiveIntents: () => {},
+      });
+      expect(result).toBe("INTENT_REVIEW_CONFLICT");
+      expect(reviewStore.get().reviews).toHaveLength(0);
+      // Never overwritten.
+      expect(intent.executiveReviewLink).toBe(staleSameIdLink);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

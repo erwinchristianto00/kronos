@@ -10,6 +10,7 @@ import {
   latestCortexDecisionSnapshotForLane,
   publishCortexDecisionSnapshots,
   publishCortexDecisionSnapshotsForScan,
+  scanBatchTickBinding,
   type CortexDecisionSnapshot,
 } from "../src/lib/cortex-decision-snapshot.js";
 
@@ -257,6 +258,80 @@ describe("Point 4: validSnapshot() pre-write exhaustive schema validation", () =
   });
 });
 
+describe("Blocker 3: regimeFamily/eligible pre-write checks", () => {
+  it("rejects a missing regimeFamily (undefined) as INVALID before any write", () => {
+    _resetCortexDecisionSnapshotsForTests();
+    const malformed = { ...snapshot(), regimeFamily: undefined } as unknown as CortexDecisionSnapshot;
+    const result = publishCortexDecisionSnapshotsForScan("batch-1", [malformed]);
+    expect(result).toBe("INVALID");
+    expect(cortexDecisionSnapshotsForScan("batch-1")).toEqual([]);
+  });
+
+  it("rejects an empty-string regimeFamily as INVALID before any write", () => {
+    _resetCortexDecisionSnapshotsForTests();
+    const malformed = snapshot({ regimeFamily: "" });
+    const result = publishCortexDecisionSnapshotsForScan("batch-1", [malformed]);
+    expect(result).toBe("INVALID");
+    expect(cortexDecisionSnapshotsForScan("batch-1")).toEqual([]);
+  });
+
+  it("rejects a wrong-type regimeFamily (number) as INVALID before any write", () => {
+    _resetCortexDecisionSnapshotsForTests();
+    const malformed = { ...snapshot(), regimeFamily: 1 } as unknown as CortexDecisionSnapshot;
+    const result = publishCortexDecisionSnapshotsForScan("batch-1", [malformed]);
+    expect(result).toBe("INVALID");
+    expect(cortexDecisionSnapshotsForScan("batch-1")).toEqual([]);
+  });
+
+  it("rejects a missing eligible (undefined) as INVALID before any write", () => {
+    _resetCortexDecisionSnapshotsForTests();
+    const malformed = { ...snapshot(), eligible: undefined } as unknown as CortexDecisionSnapshot;
+    const result = publishCortexDecisionSnapshotsForScan("batch-1", [malformed]);
+    expect(result).toBe("INVALID");
+    expect(cortexDecisionSnapshotsForScan("batch-1")).toEqual([]);
+  });
+
+  it("rejects a wrong-type eligible (string \"true\") as INVALID before any write", () => {
+    _resetCortexDecisionSnapshotsForTests();
+    const malformed = { ...snapshot(), eligible: "true" } as unknown as CortexDecisionSnapshot;
+    const result = publishCortexDecisionSnapshotsForScan("batch-1", [malformed]);
+    expect(result).toBe("INVALID");
+    expect(cortexDecisionSnapshotsForScan("batch-1")).toEqual([]);
+  });
+
+  it("rejects a wrong-type eligible (0/1 numeric truthy/falsy) as INVALID before any write", () => {
+    _resetCortexDecisionSnapshotsForTests();
+    const zero = publishCortexDecisionSnapshotsForScan(
+      "batch-1",
+      [{ ...snapshot(), eligible: 0 } as unknown as CortexDecisionSnapshot],
+    );
+    expect(zero).toBe("INVALID");
+    expect(cortexDecisionSnapshotsForScan("batch-1")).toEqual([]);
+    const one = publishCortexDecisionSnapshotsForScan(
+      "batch-1",
+      [{ ...snapshot(), eligible: 1 } as unknown as CortexDecisionSnapshot],
+    );
+    expect(one).toBe("INVALID");
+    expect(cortexDecisionSnapshotsForScan("batch-1")).toEqual([]);
+  });
+
+  it("a malformed regimeFamily/eligible in one snapshot rejects the WHOLE publish call before any write, even when other snapshots in the same array are valid", () => {
+    _resetCortexDecisionSnapshotsForTests();
+    const valid = snapshot({ laneId: "CG_WIDE_FAST_LONG" });
+    const malformed = snapshot({ laneId: "CG_WIDE_LONG_RUNNER", regimeFamily: "" });
+    const result = publishCortexDecisionSnapshotsForScan("batch-1", [valid, malformed]);
+    expect(result).toBe("INVALID");
+    expect(cortexDecisionSnapshotsForScan("batch-1")).toEqual([]);
+  });
+
+  it("accepts a canonically shaped snapshot with a real regimeFamily string and boolean eligible", () => {
+    _resetCortexDecisionSnapshotsForTests();
+    const s = snapshot({ regimeFamily: "BEARISH", eligible: false });
+    expect(publishCortexDecisionSnapshotsForScan("batch-1", [s])).toBe("PUBLISHED");
+    expect(cortexDecisionSnapshotsForScan("batch-1")).toHaveLength(1);
+  });
+});
+
 describe("Point 1: isScanBatchPublished guards the periodic-tick re-fire", () => {
   it("is false before any publish and true once a batch has been PUBLISHED, even after a later CONFLICT", () => {
     _resetCortexDecisionSnapshotsForTests();
@@ -292,5 +367,46 @@ describe("Point 1: isScanBatchPublished guards the periodic-tick re-fire", () =>
     expect(isScanBatchPublished("batch-1")).toBe(true);
     _resetCortexDecisionSnapshotsForTests();
     expect(isScanBatchPublished("batch-1")).toBe(false);
+  });
+});
+
+describe("Blocker 4: scanBatchTickBinding — single pure helper for the periodic-tick scanBatchId decision", () => {
+  it("binds the real scanBatchId and signals shouldPublish for a batch that has not yet been published", () => {
+    _resetCortexDecisionSnapshotsForTests();
+    expect(scanBatchTickBinding("batch-1")).toEqual({ shouldPublish: true, tickScanBatchId: "batch-1" });
+  });
+
+  it("runs fully unbound (tickScanBatchId: null) and signals no publish once the batch is already published", () => {
+    _resetCortexDecisionSnapshotsForTests();
+    expect(publishCortexDecisionSnapshotsForScan("batch-1", [snapshot()])).toBe("PUBLISHED");
+    expect(scanBatchTickBinding("batch-1")).toEqual({ shouldPublish: false, tickScanBatchId: null });
+  });
+
+  it("still runs unbound even after the published batch was later CONFLICTed — isScanBatchPublished stays true, so does the unbound decision", () => {
+    _resetCortexDecisionSnapshotsForTests();
+    expect(publishCortexDecisionSnapshotsForScan("batch-1", [snapshot()])).toBe("PUBLISHED");
+    const differentVector = Array.from({ length: CORTEX_FEATURE_DIM }, (_, i) => i + 100);
+    expect(publishCortexDecisionSnapshotsForScan("batch-1", [snapshot({ featureVector: differentVector })])).toBe("CONFLICT");
+    expect(scanBatchTickBinding("batch-1")).toEqual({ shouldPublish: false, tickScanBatchId: null });
+  });
+
+  it("runs unbound for null/undefined/empty-string scanBatchId — no cached scan yet is not the same as an unpublished real id, but both must never attempt a publish", () => {
+    _resetCortexDecisionSnapshotsForTests();
+    expect(scanBatchTickBinding(null)).toEqual({ shouldPublish: false, tickScanBatchId: null });
+    expect(scanBatchTickBinding(undefined)).toEqual({ shouldPublish: false, tickScanBatchId: null });
+    expect(scanBatchTickBinding("")).toEqual({ shouldPublish: false, tickScanBatchId: null });
+  });
+
+  it("two consecutive calls for the same still-unpublished batch both bind real — the decision is a pure function of isScanBatchPublished, not a latch", () => {
+    _resetCortexDecisionSnapshotsForTests();
+    expect(scanBatchTickBinding("batch-1")).toEqual({ shouldPublish: true, tickScanBatchId: "batch-1" });
+    expect(scanBatchTickBinding("batch-1")).toEqual({ shouldPublish: true, tickScanBatchId: "batch-1" });
+  });
+
+  it("distinct scanBatchIds do not leak into each other's binding decision", () => {
+    _resetCortexDecisionSnapshotsForTests();
+    expect(publishCortexDecisionSnapshotsForScan("batch-1", [snapshot()])).toBe("PUBLISHED");
+    expect(scanBatchTickBinding("batch-1")).toEqual({ shouldPublish: false, tickScanBatchId: null });
+    expect(scanBatchTickBinding("batch-2")).toEqual({ shouldPublish: true, tickScanBatchId: "batch-2" });
   });
 });

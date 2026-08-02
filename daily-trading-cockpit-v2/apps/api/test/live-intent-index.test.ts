@@ -112,9 +112,11 @@ describe("live intent index", () => {
     expect(index.get("primary-a")).toBe(intentA);
   });
 
-  it("a paperOrderId appearing in TWO DIFFERENT intents' sourcePaperOrders but resolving to the SAME set (deduped by intent identity) is not a false-positive collision", () => {
-    // Same intent object referenced twice inside one array — defensive case, should just dedupe via
-    // Set-by-reference and resolve cleanly, not spuriously conflict with itself.
+  it("DUPLICATE SOURCE ROW (blocker 2a): a single intent listing the SAME paperOrderId twice in its own sourcePaperOrders is ambiguous — retracted into conflictedPaperOrderIds even though it is only ONE owning intent by the Set-of-intents dedupe", () => {
+    // Same intent object referenced twice inside one array. Two DISTINCT PaperOrder-lineage rows
+    // both claim this id — the index has no basis to pick one over the other, even though both rows
+    // happen to resolve to the same intent, so this must fail closed exactly like a cross-intent
+    // collision, never silently resolve to "the" (first/either) row.
     const intentA = intent({
       paperOrderId: "primary-a",
       sourcePaperOrders: [
@@ -123,7 +125,49 @@ describe("live intent index", () => {
       ],
     });
     const index = buildLiveIntentIndexByPaperOrderId([intentA]);
-    expect(index.get("dup")).toBe(intentA);
+    expect(index.get("dup")).toBeUndefined(); // retracted, never a guess
+    expect(index.conflictedPaperOrderIds.has("dup")).toBe(true);
+    // The unrelated primary id is unaffected — the collision is scoped to "dup" only.
+    expect(index.get("primary-a")).toBe(intentA);
+  });
+
+  it("DUPLICATE SOURCE ROW (blocker 2a): three occurrences of the same id in one intent's sourcePaperOrders is still just one conflict entry, not an error", () => {
+    const intentA = intent({
+      paperOrderId: "primary-a",
+      sourcePaperOrders: [
+        { paperOrderId: "dup", laneId: "LANE", qty: 1 },
+        { paperOrderId: "dup", laneId: "LANE", qty: 1 },
+        { paperOrderId: "dup", laneId: "LANE", qty: 1 },
+      ],
+    });
+    const index = buildLiveIntentIndexByPaperOrderId([intentA]);
+    expect(index.get("dup")).toBeUndefined();
+    expect(index.conflictedPaperOrderIds.has("dup")).toBe(true);
+  });
+
+  it("a paperOrderId appearing exactly ONCE in a single intent's sourcePaperOrders is not a duplicate — resolves cleanly (control for blocker 2a: the fix must not flag single occurrences)", () => {
+    const intentA = intent({
+      paperOrderId: "primary-a",
+      sourcePaperOrders: [{ paperOrderId: "not-dup", laneId: "LANE", qty: 1 }],
+    });
+    const index = buildLiveIntentIndexByPaperOrderId([intentA]);
+    expect(index.get("not-dup")).toBe(intentA);
     expect(index.conflictedPaperOrderIds.size).toBe(0);
+  });
+
+  it("DUPLICATE SOURCE ROW (blocker 2a) does not false-positive on the routine primary self-echo appearing once alongside a genuinely duplicated OTHER source id", () => {
+    const intentA = intent({
+      paperOrderId: "primary-a",
+      sourcePaperOrders: [
+        { paperOrderId: "primary-a", laneId: "LANE", qty: 1 }, // routine self-echo, skipped entirely
+        { paperOrderId: "dup", laneId: "LANE", qty: 1 },
+        { paperOrderId: "dup", laneId: "LANE", qty: 1 },
+      ],
+    });
+    const index = buildLiveIntentIndexByPaperOrderId([intentA]);
+    expect(index.get("primary-a")).toBe(intentA); // self-echo never counted as a duplicate
+    expect(index.get("dup")).toBeUndefined();
+    expect(index.conflictedPaperOrderIds.has("dup")).toBe(true);
+    expect(index.conflictedPaperOrderIds.has("primary-a")).toBe(false);
   });
 });

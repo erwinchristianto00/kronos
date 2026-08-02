@@ -71,6 +71,8 @@ const validSnapshot = (snapshot: CortexDecisionSnapshot): boolean =>
   snapshot.direction !== null && VALID_DIRECTIONS.has(snapshot.direction) &&
   (snapshot.sourceScanBatchId === undefined || snapshot.sourceScanBatchId === null ||
     (typeof snapshot.sourceScanBatchId === "string" && snapshot.sourceScanBatchId.length > 0)) &&
+  typeof snapshot.regimeFamily === "string" && snapshot.regimeFamily.length > 0 &&
+  typeof snapshot.eligible === "boolean" &&
   Number.isFinite(snapshot.finalPct) && Number.isFinite(snapshot.evalFinalPct);
 const copySnapshot = (snapshot: CortexDecisionSnapshot): CortexDecisionSnapshot => ({ ...snapshot, featureVector: [...snapshot.featureVector] });
 
@@ -166,6 +168,35 @@ export function publishCortexDecisionSnapshotsForScan(
  *  itself is unchanged and still fails closed to CONFLICT exactly as before. */
 export function isScanBatchPublished(scanBatchId: string): boolean {
   return byScanBatch.has(scanBatchId);
+}
+
+/** Decision returned by scanBatchTickBinding — see that function's doc. A discriminated union so
+ * callers get compile-time narrowing: shouldPublish===true guarantees tickScanBatchId is the real
+ * (non-null) scanBatchId, shouldPublish===false guarantees it is null. */
+export type ScanBatchTickBinding =
+  | { shouldPublish: true; tickScanBatchId: string }
+  | { shouldPublish: false; tickScanBatchId: null };
+
+/** Pure, single source of truth for the scanBatchId-binding decision every periodic CORTEX tick must
+ * make (app.ts's cortexShadowTick and cortexStandaloneShadowTick, and any test that exercises the
+ * same "two real periodic ticks" scenario) — do not re-derive this conditional inline anywhere else.
+ *
+ * Given the scanBatchId currently cached for this cycle (or null/undefined when nothing is cached
+ * yet), decides both:
+ *  - what scanBatchId the tick itself should run WITH (`tickScanBatchId`): the real id when this
+ *    batch has not yet been published, so the tick's output snapshots are correctly tagged with it;
+ *    null (unbound/report-only) once the batch is already published, so a routine re-fire on the
+ *    same cadence never re-tags with a stale-but-real id it must not attempt to publish again.
+ *  - whether the caller should attempt a publish after the tick runs (`shouldPublish`) — exactly
+ *    when tickScanBatchId is the real id.
+ *
+ * See isScanBatchPublished's doc for why a repeat tick against an already-published batch must run
+ * fully unbound rather than being silently skipped while still tagged with the real id. */
+export function scanBatchTickBinding(scanBatchId: string | null | undefined): ScanBatchTickBinding {
+  if (scanBatchId && !isScanBatchPublished(scanBatchId)) {
+    return { shouldPublish: true, tickScanBatchId: scanBatchId };
+  }
+  return { shouldPublish: false, tickScanBatchId: null };
 }
 
 /** Returns only an exact scan-cycle/lane/direction handoff. No latest, nearest, or timestamp fallback

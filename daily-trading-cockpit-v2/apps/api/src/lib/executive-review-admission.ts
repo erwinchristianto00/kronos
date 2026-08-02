@@ -36,7 +36,15 @@ export type ExecutiveReviewAdmissionResult =
   | "INTENT_LINEAGE_MISSING"
   | "INTENT_LINEAGE_CONFLICT"
   | "INTENT_REVIEW_CONFLICT"
-  | "INTENT_INDEX_MISS";
+  | "INTENT_INDEX_MISS"
+  // Blocker 2(b): the resolved intent's sourcePaperOrders array contains MORE THAN ONE row whose
+  // paperOrderId equals the order being attached. live-intent-index.ts's own duplicate-row detection
+  // (blocker 2(a)) already retracts a paperOrderId with this shape into conflictedPaperOrderIds
+  // before it ever reaches here in production — this is defense in depth for any intent the index
+  // itself DID resolve (e.g. a duplicated primary self-echo row, which the index deliberately never
+  // counts — see live-intent-index.ts's doc comment). Never resolved by picking the first match, even
+  // when every duplicate row happens to carry identical lineage/link.
+  | "INTENT_SOURCE_ROW_AMBIGUOUS";
 
 function actionFor(exec: ExecutiveDecision): "ENTER" | "WAIT" | "SKIP" {
   if (exec.entry?.action === "ENTER_NOW") return "ENTER";
@@ -100,6 +108,31 @@ function linkFrom(record: ExecutiveReviewRecord): ExecutiveReviewExecutionLink {
     evidencePolicyVersion,
     fourBrainPolicyVersion,
   };
+}
+
+/**
+ * Blocker 1: FULL structural equality between two ExecutiveReviewExecutionLink values, field by
+ * field across all 14 fields — never just `executiveReviewId`. Two links can share the same
+ * executiveReviewId while disagreeing on some other field (e.g. a stale laneId/direction captured
+ * before a since-corrected upstream bug); that is just as much a real conflict as an entirely
+ * different review and must be treated identically — fail closed, never overwritten, never treated
+ * as "already correctly linked".
+ */
+function linksEqual(left: ExecutiveReviewExecutionLink, right: ExecutiveReviewExecutionLink): boolean {
+  return left.executiveReviewId === right.executiveReviewId
+    && left.candidateId === right.candidateId
+    && left.opportunityId === right.opportunityId
+    && left.laneId === right.laneId
+    && left.marketContextSnapshotId === right.marketContextSnapshotId
+    && left.allocationSnapshotId === right.allocationSnapshotId
+    && left.canonicalCortexLaneId === right.canonicalCortexLaneId
+    && left.direction === right.direction
+    && left.marketState === right.marketState
+    && left.evidenceEra === right.evidenceEra
+    && left.decisionPipelinePolicyVersion === right.decisionPipelinePolicyVersion
+    && left.executionPolicyVersion === right.executionPolicyVersion
+    && left.evidencePolicyVersion === right.evidencePolicyVersion
+    && left.fourBrainPolicyVersion === right.fourBrainPolicyVersion;
 }
 
 /**
@@ -286,19 +319,40 @@ export function attachExecutiveReviewToExactPaperOrder(input: {
   if (intent.state === "CLOSED" || intent.state === "ERROR" || intent.state === "KILLED") return "INTENT_TERMINAL";
 
   const primary = intent.paperOrderId === order.paperOrderId;
-  const sourceEntry = intent.sourcePaperOrders?.find((s) => s.paperOrderId === order.paperOrderId);
+  // Blocker 2(b): find ALL rows matching order.paperOrderId within this intent's sourcePaperOrders —
+  // never a first-match .find(). live-intent-index.ts's own duplicate-row detection (blocker 2(a))
+  // already retracts a paperOrderId with this shape into conflictedPaperOrderIds before it can reach
+  // here in production, but this check is defense in depth for any intent the index itself DID
+  // resolve — e.g. a duplicated primary self-echo row, which the index deliberately never counts
+  // (self-echo is skipped before either of the index's counters sees it). Two or more matching rows
+  // fails closed as its own distinct result, never silently resolved to the first match — even when
+  // every duplicate row happens to carry identical lineage/link.
+  const matchingSourceEntries = intent.sourcePaperOrders?.filter((s) => s.paperOrderId === order.paperOrderId) ?? [];
+  if (matchingSourceEntries.length > 1) return "INTENT_SOURCE_ROW_AMBIGUOUS";
+  const sourceEntry = matchingSourceEntries[0];
   if (!primary && !sourceEntry) return "INTENT_INDEX_MISS";
+
+  // The persisted review under this record's deterministic id, if a prior attach (this order or an
+  // earlier partial attempt) already created it. Looked up once here, ahead of the link-equality
+  // check below, and reused unchanged for the REVIEW_CONFLICT / addReview / repair steps further
+  // down — the SAME `existing ?? record` pattern in both places, never two independently-derived
+  // "canonical" values.
+  const existing = input.reviewStore.get().reviews.find((review) => review.executiveReviewId === record.executiveReviewId);
+  const canonicalLink = linkFrom(existing ?? record);
 
   // Partial-write recovery (blocker 1): a prior attach attempt may have written the link onto some
   // but not all of the three independently-settable locations (PaperOrder, intent, and — for a
   // primary order — the self-echoed sourcePaperOrders entry, see live-execution-engine.ts's
   // openIntent doc comment). Check each location independently rather than short-circuiting on the
-  // PaperOrder's link alone, so any missing location can still be repaired below.
+  // PaperOrder's link alone, so any missing location can still be repaired below. Compared via FULL
+  // structural equality against canonicalLink (all 14 ExecutiveReviewExecutionLink fields, see
+  // linksEqual) — never just executiveReviewId: a present link sharing the same executiveReviewId but
+  // disagreeing on any other field is exactly as much a conflict as a wholly different review.
   const orderLink = order.executiveReviewLink;
   const intentLink = primary ? intent.executiveReviewLink : undefined;
   const sourceLink = sourceEntry?.executiveReviewLink;
   for (const link of [orderLink, intentLink, sourceLink]) {
-    if (link && link.executiveReviewId !== record.executiveReviewId) return "INTENT_REVIEW_CONFLICT"; // never overwrite a DIFFERENT existing link
+    if (link && !linksEqual(link, canonicalLink)) return "INTENT_REVIEW_CONFLICT"; // never overwrite a DIFFERENT/DIVERGENT existing link
   }
 
   // Compare against the intent's OWN immutable lineage snapshot (captured once at open, see
@@ -323,7 +377,6 @@ export function attachExecutiveReviewToExactPaperOrder(input: {
     intentLineage.direction === order.direction;
   if (!lineageMatches) return "INTENT_LINEAGE_CONFLICT";
 
-  const existing = input.reviewStore.get().reviews.find((review) => review.executiveReviewId === record.executiveReviewId);
   if (existing && !sameReview(existing, record)) return "REVIEW_CONFLICT";
   if (!existing && !input.reviewStore.addReview(record)) return "REVIEW_CONFLICT";
   input.reviewStore.save();
@@ -331,7 +384,7 @@ export function attachExecutiveReviewToExactPaperOrder(input: {
   // Repair only whichever of the three locations is actually missing the link — a genuinely fresh
   // attach (nothing anywhere) writes everywhere; a full idempotent replay (everything already
   // matches) writes nowhere; a partial state (one or two locations missing) repairs only those.
-  const link = linkFrom(existing ?? record);
+  const link = canonicalLink;
   let repaired = false;
   if (primary && !intent.executiveReviewLink) { intent.executiveReviewLink = link; repaired = true; }
   if (sourceEntry && !sourceEntry.executiveReviewLink) { sourceEntry.executiveReviewLink = link; repaired = true; }
