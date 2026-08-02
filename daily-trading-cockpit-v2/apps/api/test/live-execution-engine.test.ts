@@ -5543,6 +5543,16 @@ describe("LiveIntent.causalLineage (point 2): immutable lineage snapshot stamped
       canonicalCortexLaneId: "CG_WIDE_FAST_LONG",
       instanceId: "3101",
       policyDeploymentAt: "2099-01-01T00:00:00.000Z",
+      // 6 additional fields (blocker 2), read directly off `order`, not off causalIdentity — the
+      // paperOrder() fixture here uses a loose cast (`as unknown as PaperOrder`) and never sets
+      // sourceObservationId/scanBatchId/selectedLaneId, so those come through as their real
+      // (undefined/undefined/null) values, exactly like production would for an order missing them.
+      paperOrderId: "paper-lineage01",
+      sourceObservationId: undefined,
+      scanBatchId: null,
+      paperLaneId: undefined,
+      symbol: "ETHUSDT",
+      direction: "SHORT",
     };
     // Only the immutable subset is copied — never the whole CausalIdentity, never re-derived.
     expect(intent.causalLineage).toEqual(expectedLineage);

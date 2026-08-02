@@ -51,12 +51,13 @@ describe("live intent index", () => {
     expect(index.size).toBe(2);
   });
 
-  it("is a plain 1:1 map, not a bucket map — a later intent with a repeated paperOrderId simply overwrites the earlier entry (paperOrderId is unique per intent by construction)", () => {
+  it("COLLISION POLICY: fails closed (retracts + records) a paperOrderId shared by two intents as PRIMARY of both — never last-write-wins", () => {
     const first = intent({ paperOrderId: "paper-1", state: "OPEN" });
-    const second = intent({ paperOrderId: "paper-1", state: "CLOSED" });
+    const second = intent({ paperOrderId: "paper-1", state: "ERROR" });
     const index = buildLiveIntentIndexByPaperOrderId([first, second]);
-    expect(index.get("paper-1")?.state).toBe("CLOSED");
-    expect(index.size).toBe(1);
+    expect(index.get("paper-1")).toBeUndefined();
+    expect(index.conflictedPaperOrderIds.has("paper-1")).toBe(true);
+    expect(index.size).toBe(0);
   });
 
   it("builds an empty index from an empty intent list", () => {

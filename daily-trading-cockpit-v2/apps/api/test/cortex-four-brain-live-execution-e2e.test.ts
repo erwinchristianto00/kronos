@@ -205,6 +205,13 @@ describe("CORTEX <-> LiveExecutionEngine live-execution e2e (point 6, real funct
       canonicalCortexLaneId: order.causalIdentity!.canonicalCortexLaneId,
       instanceId: order.causalIdentity!.instanceId,
       policyDeploymentAt: order.causalIdentity!.policyDeploymentAt,
+      // 6 additional fields (blocker 2), read directly off the real PaperOrder, not off causalIdentity.
+      paperOrderId: order.paperOrderId,
+      sourceObservationId: order.sourceObservationId,
+      scanBatchId: order.scanBatchId ?? null,
+      paperLaneId: order.selectedLaneId,
+      symbol: order.symbol,
+      direction: order.direction,
     });
     const placedBeforeAttach = client.placed.map((p) => ({ ...p }));
     const sizingBeforeAttach = sizingSnapshot(intent);

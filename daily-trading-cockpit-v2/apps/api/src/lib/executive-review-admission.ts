@@ -165,7 +165,6 @@ export function attachExecutiveReviewToExactPaperOrder(input: {
     return "AMBIGUOUS_PAPER_OWNERSHIP";
   }
   const order = exactOrders[0]!;
-  if (order.executiveReviewLink) return "ORDER_ALREADY_LINKED";
 
   // Exact current causal identity, reusing the SAME validator the paper-order causal system itself
   // uses (isCausalIdentityCurrentlyValid) — never a weaker, admission-local duplicate. A stale or
@@ -263,65 +262,80 @@ export function attachExecutiveReviewToExactPaperOrder(input: {
     return "ORDER_ALREADY_EXECUTING";
   }
 
-  if (executing) {
-    // ── Late-binding path (point 2): the intent already exists; attach the review directly onto it,
-    //    via the per-tick intent index (point 5) — never a fresh linear scan of the intent store. ──
-    const intent = input.liveIntentIndexByPaperOrderId!.get(order.paperOrderId);
-    // executingPaperOrderIds said this order is executing, but the index (built from the SAME
-    // liveExecutionStore this tick) has no entry for it — the two inputs disagree. Fail closed:
-    // never assume which one is stale.
-    if (!intent) return "INTENT_INDEX_MISS";
-    if (intent.state === "CLOSED" || intent.state === "ERROR" || intent.state === "KILLED") return "INTENT_TERMINAL";
+  if (!executing) {
+    // ── Non-executing path: there is no intent/sourceEntry to reconcile against, only the
+    //    PaperOrder itself, so the short-circuit is legitimate here (nothing to repair). ──
+    if (order.executiveReviewLink) return "ORDER_ALREADY_LINKED";
 
-    const primary = intent.paperOrderId === order.paperOrderId;
-    const sourceEntry = intent.sourcePaperOrders?.find((s) => s.paperOrderId === order.paperOrderId);
-    if (!primary && !sourceEntry) return "INTENT_INDEX_MISS";
-
-    // Idempotent replay / conflicting-link detection, exactly mirroring order.executiveReviewLink's
-    // own short-circuit above but read off the intent (or its matching source entry) instead — the
-    // intent may already carry a link from an earlier late-bind attempt that never reached the
-    // PaperOrder (e.g. a process restart between steps).
-    const existingLink = primary ? intent.executiveReviewLink : sourceEntry?.executiveReviewLink;
-    if (existingLink) {
-      if (existingLink.executiveReviewId === record.executiveReviewId) return "ORDER_ALREADY_LINKED";
-      return "INTENT_REVIEW_CONFLICT"; // never overwrite a DIFFERENT existing link
-    }
-
-    // Compare against the intent's OWN immutable lineage snapshot (captured once at open, see
-    // LiveIntent.causalLineage) — never re-derive from the PaperOrder's current causalIdentity as
-    // the source of truth, since that field can be reassigned after admission
-    // (paper-execution-router.ts's re-price path).
-    const intentLineage = primary ? intent.causalLineage : sourceEntry?.causalLineage;
-    if (!intentLineage) return "INTENT_LINEAGE_MISSING";
-    const identity = order.causalIdentity!; // already validated non-null/current by the STALE_CAUSAL_IDENTITY check above
-    const lineageMatches =
-      intentLineage.opportunityId === identity.opportunityId &&
-      intentLineage.cortexDecisionId === identity.cortexDecisionId &&
-      intentLineage.allocationSnapshotId === identity.allocationSnapshotId &&
-      intentLineage.canonicalCortexLaneId === identity.canonicalCortexLaneId &&
-      intentLineage.instanceId === identity.instanceId &&
-      intentLineage.policyDeploymentAt === identity.policyDeploymentAt;
-    if (!lineageMatches) return "INTENT_LINEAGE_CONFLICT";
-
+    // ── Normal (non-executing) path — unchanged. ──
     const existing = input.reviewStore.get().reviews.find((review) => review.executiveReviewId === record.executiveReviewId);
     if (existing && !sameReview(existing, record)) return "REVIEW_CONFLICT";
     if (!existing && !input.reviewStore.addReview(record)) return "REVIEW_CONFLICT";
     input.reviewStore.save();
-    const link = linkFrom(existing ?? record);
-    // Attach across all three: the intent (or its matching source entry), and the PaperOrder — kept
-    // in sync exactly like the normal (non-late-binding) path below does.
-    if (primary) intent.executiveReviewLink = link;
-    if (sourceEntry) sourceEntry.executiveReviewLink = link;
-    input.saveLiveIntents!();
-    input.paperStore.update(order.paperOrderId, { executiveReviewLink: link });
+    input.paperStore.update(order.paperOrderId, { executiveReviewLink: linkFrom(existing ?? record) });
     return "ATTACHED";
   }
 
-  // ── Normal (non-executing) path — unchanged. ──
+  // ── Late-binding path (point 2): the intent already exists; attach the review directly onto it,
+  //    via the per-tick intent index (point 5) — never a fresh linear scan of the intent store. ──
+  const intent = input.liveIntentIndexByPaperOrderId!.get(order.paperOrderId);
+  // executingPaperOrderIds said this order is executing, but the index (built from the SAME
+  // liveExecutionStore this tick) has no entry for it — the two inputs disagree. Fail closed:
+  // never assume which one is stale.
+  if (!intent) return "INTENT_INDEX_MISS";
+  if (intent.state === "CLOSED" || intent.state === "ERROR" || intent.state === "KILLED") return "INTENT_TERMINAL";
+
+  const primary = intent.paperOrderId === order.paperOrderId;
+  const sourceEntry = intent.sourcePaperOrders?.find((s) => s.paperOrderId === order.paperOrderId);
+  if (!primary && !sourceEntry) return "INTENT_INDEX_MISS";
+
+  // Partial-write recovery (blocker 1): a prior attach attempt may have written the link onto some
+  // but not all of the three independently-settable locations (PaperOrder, intent, and — for a
+  // primary order — the self-echoed sourcePaperOrders entry, see live-execution-engine.ts's
+  // openIntent doc comment). Check each location independently rather than short-circuiting on the
+  // PaperOrder's link alone, so any missing location can still be repaired below.
+  const orderLink = order.executiveReviewLink;
+  const intentLink = primary ? intent.executiveReviewLink : undefined;
+  const sourceLink = sourceEntry?.executiveReviewLink;
+  for (const link of [orderLink, intentLink, sourceLink]) {
+    if (link && link.executiveReviewId !== record.executiveReviewId) return "INTENT_REVIEW_CONFLICT"; // never overwrite a DIFFERENT existing link
+  }
+
+  // Compare against the intent's OWN immutable lineage snapshot (captured once at open, see
+  // LiveIntent.causalLineage) — never re-derive from the PaperOrder's current causalIdentity as
+  // the source of truth, since that field can be reassigned after admission
+  // (paper-execution-router.ts's re-price path).
+  const intentLineage = primary ? intent.causalLineage : sourceEntry?.causalLineage;
+  if (!intentLineage) return "INTENT_LINEAGE_MISSING";
+  const identity = order.causalIdentity!; // already validated non-null/current by the STALE_CAUSAL_IDENTITY check above
+  const lineageMatches =
+    intentLineage.opportunityId === identity.opportunityId &&
+    intentLineage.cortexDecisionId === identity.cortexDecisionId &&
+    intentLineage.allocationSnapshotId === identity.allocationSnapshotId &&
+    intentLineage.canonicalCortexLaneId === identity.canonicalCortexLaneId &&
+    intentLineage.instanceId === identity.instanceId &&
+    intentLineage.policyDeploymentAt === identity.policyDeploymentAt &&
+    intentLineage.paperOrderId === order.paperOrderId &&
+    intentLineage.sourceObservationId === order.sourceObservationId &&
+    intentLineage.scanBatchId === (order.scanBatchId ?? null) &&
+    intentLineage.paperLaneId === order.selectedLaneId &&
+    intentLineage.symbol === order.symbol &&
+    intentLineage.direction === order.direction;
+  if (!lineageMatches) return "INTENT_LINEAGE_CONFLICT";
+
   const existing = input.reviewStore.get().reviews.find((review) => review.executiveReviewId === record.executiveReviewId);
   if (existing && !sameReview(existing, record)) return "REVIEW_CONFLICT";
   if (!existing && !input.reviewStore.addReview(record)) return "REVIEW_CONFLICT";
   input.reviewStore.save();
-  input.paperStore.update(order.paperOrderId, { executiveReviewLink: linkFrom(existing ?? record) });
-  return "ATTACHED";
+
+  // Repair only whichever of the three locations is actually missing the link — a genuinely fresh
+  // attach (nothing anywhere) writes everywhere; a full idempotent replay (everything already
+  // matches) writes nowhere; a partial state (one or two locations missing) repairs only those.
+  const link = linkFrom(existing ?? record);
+  let repaired = false;
+  if (primary && !intent.executiveReviewLink) { intent.executiveReviewLink = link; repaired = true; }
+  if (sourceEntry && !sourceEntry.executiveReviewLink) { sourceEntry.executiveReviewLink = link; repaired = true; }
+  if (repaired) input.saveLiveIntents!();
+  if (!orderLink) { input.paperStore.update(order.paperOrderId, { executiveReviewLink: link }); repaired = true; }
+  return (orderLink || intentLink || sourceLink) ? "ORDER_ALREADY_LINKED" : "ATTACHED";
 }

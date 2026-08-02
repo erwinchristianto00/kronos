@@ -1204,6 +1204,13 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         }
         const engine = liveEngine;
         const cached = getLatestScanCandidates();
+        // Point 1 tidy-up: compute the already-published state ONCE, up front, and use it both to
+        // decide what scanBatchId the tick itself runs with AND whether to attempt a publish. A
+        // repeat tick against an already-published batch must run fully unbound (scanBatchId: null,
+        // i.e. report-only — see runCortexShadowTick's own doc: the only thing scanBatchId affects
+        // is the sourceScanBatchId stamped on the tick's own output snapshots), not just skip the
+        // publish call while still tagging its output with the real (already-published) batch id.
+        const scanBatchAlreadyPublished = cached?.scanBatchId ? isScanBatchPublished(cached.scanBatchId) : false;
         const scanStatus = coreScanAutoRefreshController.getStatus();
         const fallbackSnapshot =
           cached || scanStatus.lastAutoRefreshResultSummary ? null : getRegimeDirectionControllerSnapshotStore().readLatest();
@@ -1254,19 +1261,20 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           journal: cortexJournal,
           context,
           nowIso: new Date().toISOString(),
-          scanBatchId: cached?.scanBatchId ?? null,
+          scanBatchId: cached?.scanBatchId && !scanBatchAlreadyPublished ? cached.scanBatchId : null,
           mode,
           resolvedThisCycle: 0,
           promotion,
         });
-        if (cached?.scanBatchId && !isScanBatchPublished(cached.scanBatchId)) {
+        if (cached?.scanBatchId && !scanBatchAlreadyPublished) {
           // Point 1 fix: this 5-min tick can re-fire against the SAME scanBatchId as its own prior
           // call (the scan cache refreshes only every 7 min) — that repeat must never be attempted as
           // a fresh publish, since its content (a new nowIso ⇒ new atMs ⇒ new decisionIds) can never
           // byte-match the first call and would poison the batch as a false CONFLICT. Once ANY content
-          // has been accepted for this scanBatchId, skip re-publishing entirely. A genuinely different
-          // publish under this scanBatchId from any OTHER source is unaffected — this guard only ever
-          // skips OUR OWN routine repeat, publishCortexDecisionSnapshotsForScan itself is unchanged.
+          // has been accepted for this scanBatchId, the tick above already ran unbound (scanBatchId:
+          // null) so there is nothing new to publish here either. A genuinely different publish under
+          // this scanBatchId from any OTHER source is unaffected — this guard only ever skips OUR OWN
+          // routine repeat, publishCortexDecisionSnapshotsForScan itself is unchanged.
           const publication = publishCortexDecisionSnapshotsForScan(cached.scanBatchId, snapshots);
           if (publication === "CONFLICT" || publication === "INVALID") {
             recordCortexProductionChainDiagnostic("CORTEX_SCAN_PUBLICATION_CONFLICT");
@@ -2215,17 +2223,21 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       try {
         if (!standaloneCortexShadowAllowed({ env: process.env, liveEnginePresent: liveEngine != null })) return;
         const cached = getLatestScanCandidates();
+        // Point 1 tidy-up: see the identical guard/rationale in cortexShadowTick above — compute the
+        // already-published state once, up front, and use it both for the tick's own scanBatchId
+        // (null ⇒ unbound/report-only when already published) and for the publish gate.
+        const scanBatchAlreadyPublished = cached?.scanBatchId ? isScanBatchPublished(cached.scanBatchId) : false;
         const result = runCortexShadowTick({
           store: cortexStore,
           journal: cortexJournal,
           context: cortexStandaloneContext(),
           nowIso: new Date().toISOString(),
-          scanBatchId: cached?.scanBatchId ?? null,
+          scanBatchId: cached?.scanBatchId && !scanBatchAlreadyPublished ? cached.scanBatchId : null,
           mode: "shadow",
           resolvedThisCycle: 0,
           promotion: null,
         });
-        if (cached?.scanBatchId && !isScanBatchPublished(cached.scanBatchId)) {
+        if (cached?.scanBatchId && !scanBatchAlreadyPublished) {
           // Point 1 fix: see the identical guard/rationale in cortexShadowTick above — this standalone
           // tick is the other of the only two callers of publishCortexDecisionSnapshotsForScan in the
           // repo, and re-fires on the same 5-min-vs-7-min-cache cadence.

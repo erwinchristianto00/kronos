@@ -80,6 +80,38 @@ function lineage(overrides: Partial<LiveIntentCausalLineage> = {}): LiveIntentCa
     canonicalCortexLaneId: "CG_WIDE_FAST_LONG",
     instanceId: "3101",
     policyDeploymentAt: POLICY_DEPLOYED_AT,
+    // 6 additional fields (blocker 2), matching paper()'s default field values exactly so a
+    // default lineage() and default paper() line up.
+    paperOrderId: "paper-1",
+    sourceObservationId: "candidate-1", // paper()'s default sourceObservationId
+    scanBatchId: "batch-1", // paper()'s default scanBatchId
+    paperLaneId: "LANE", // mirrors paper()'s default selectedLaneId
+    symbol: "BTCUSDT", // paper()'s default symbol
+    direction: "LONG", // paper()'s default direction
+    ...overrides,
+  };
+}
+
+// The ExecutiveReviewExecutionLink deterministically derived by attachExecutiveReviewToExactPaperOrder
+// from the default paper()/executive() fixtures — i.e. the SAME link a fresh attach would compute.
+// Shared by the partial-write-recovery and idempotent-replay tests below so they don't each hand-roll
+// a slightly different (and easy to typo) copy.
+function defaultReviewLink(overrides: Partial<ExecutiveReviewExecutionLink> = {}): ExecutiveReviewExecutionLink {
+  return {
+    executiveReviewId: "executive-review:executive-1:opportunity-1",
+    candidateId: "candidate-1",
+    opportunityId: "opportunity-1",
+    laneId: "LANE",
+    marketContextSnapshotId: "market-context-1",
+    allocationSnapshotId: "cortex-allocation-1",
+    canonicalCortexLaneId: "CG_WIDE_FAST_LONG",
+    direction: "LONG",
+    marketState: "BULLISH",
+    evidenceEra: CURRENT_EVIDENCE_ERA,
+    decisionPipelinePolicyVersion: CURRENT_DECISION_POLICY_VERSION,
+    executionPolicyVersion: EXECUTION_POLICY_VERSION,
+    evidencePolicyVersion: EVIDENCE_POLICY_VERSION,
+    fourBrainPolicyVersion: "executive/2",
     ...overrides,
   };
 }
@@ -902,7 +934,7 @@ describe("Executive Review admission — late-binding (point 2)", () => {
     }
   });
 
-  it("late-binding: an idempotent replay onto an intent that already carries the SAME link returns ORDER_ALREADY_LINKED, never a duplicate review", () => {
+  it("late-binding: an idempotent replay onto an intent that already carries the SAME link returns ORDER_ALREADY_LINKED, repairs the PaperOrder side, and creates exactly one (not zero, not two) ExecutiveReviewRecord", () => {
     const dir = mkdtempSync(join(tmpdir(), "executive-review-admission-late-idempotent-"));
     try {
       const paperStore = new PaperExecutionRouterStore(dir);
@@ -911,22 +943,7 @@ describe("Executive Review admission — late-binding (point 2)", () => {
       // The intent already carries the SAME link this exact (executive, order) pair would derive —
       // e.g. a previous late-bind attempt persisted the intent but crashed before paperStore.update
       // landed (a real reachable process-restart gap), so the PaperOrder itself has no link yet.
-      const sameLink: ExecutiveReviewExecutionLink = {
-        executiveReviewId: "executive-review:executive-1:opportunity-1",
-        candidateId: "candidate-1",
-        opportunityId: "opportunity-1",
-        laneId: "LANE",
-        marketContextSnapshotId: "market-context-1",
-        allocationSnapshotId: "cortex-allocation-1",
-        canonicalCortexLaneId: "CG_WIDE_FAST_LONG",
-        direction: "LONG",
-        marketState: "BULLISH",
-        evidenceEra: CURRENT_EVIDENCE_ERA,
-        decisionPipelinePolicyVersion: CURRENT_DECISION_POLICY_VERSION,
-        executionPolicyVersion: EXECUTION_POLICY_VERSION,
-        evidencePolicyVersion: EVIDENCE_POLICY_VERSION,
-        fourBrainPolicyVersion: "executive/2",
-      };
+      const sameLink = defaultReviewLink();
       const intent = liveIntent({ executiveReviewLink: sameLink });
       const intentIndex = buildLiveIntentIndexByPaperOrderId([intent]);
       const result = attachExecutiveReviewToExactPaperOrder({
@@ -941,7 +958,13 @@ describe("Executive Review admission — late-binding (point 2)", () => {
         saveLiveIntents: () => {},
       });
       expect(result).toBe("ORDER_ALREADY_LINKED");
-      expect(reviewStore.get().reviews).toHaveLength(0);
+      // The review store started empty even though the intent already carried `sameLink` — this is
+      // an artificial-but-valid whitebox state. Under the fixed partial-write-recovery logic, the
+      // review under `record.executiveReviewId` (deterministic) gets created here since none existed
+      // yet — this is the first-and-only review under that id, NOT a duplicate.
+      expect(reviewStore.get().reviews).toHaveLength(1);
+      // Repair of the PaperOrder side — the part blocker 1 exists to fix.
+      expect(paperStore.all[0]?.executiveReviewLink).toEqual(sameLink);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -969,5 +992,240 @@ describe("Executive Review admission — late-binding (point 2)", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  describe("blocker 1 — partial-write recovery: every combination of PaperOrder/intent/sourceEntry already carrying the link", () => {
+    // Primary-order shape: openIntent()'s self-echo means a primary admission has THREE
+    // independently-settable link locations — the PaperOrder, the intent itself, and the intent's
+    // own sourcePaperOrders entry for paper-1 (live-execution-engine.ts:6454, planned.map includes
+    // planned[0]). Build a fixture with any subset of the three already carrying `defaultReviewLink()`
+    // (the SAME link a fresh attach would compute) and confirm the missing ones get repaired, exactly
+    // one review ever exists, and only genuinely-missing locations are written to.
+    function buildFixture(dir: string, present: { order?: boolean; intent?: boolean; source?: boolean }) {
+      const link = defaultReviewLink();
+      const paperStore = new PaperExecutionRouterStore(dir);
+      paperStore.add(paper({ executiveReviewLink: present.order ? link : undefined }));
+      const reviewStore = new ExecutiveReviewStore(join(dir, "reviews.json"));
+      const intent = liveIntent({
+        executiveReviewLink: present.intent ? link : undefined,
+        sourcePaperOrders: [
+          {
+            paperOrderId: "paper-1",
+            laneId: "LANE",
+            qty: 1,
+            causalLineage: lineage(),
+            executiveReviewLink: present.source ? link : undefined,
+          },
+        ],
+      });
+      const intentIndex = buildLiveIntentIndexByPaperOrderId([intent]);
+      return { link, paperStore, reviewStore, intent, intentIndex };
+    }
+
+    function runAttach(fx: ReturnType<typeof buildFixture>, saveTracker: { count: number }) {
+      return attachExecutiveReviewToExactPaperOrder({
+        reviewStore: fx.reviewStore,
+        paperStore: fx.paperStore,
+        executive: executive(),
+        candidateId: "candidate-1",
+        executingPaperOrderIds: new Set(["paper-1"]),
+        env: shadowEnv,
+        paperOrderOwnershipIndex: ownershipIndexFor(fx.paperStore),
+        liveIntentIndexByPaperOrderId: fx.intentIndex,
+        saveLiveIntents: () => { saveTracker.count += 1; },
+      });
+    }
+
+    it("PaperOrder-only linked: repairs intent + sourceEntry", () => {
+      const dir = mkdtempSync(join(tmpdir(), "eram-partial-order-only-"));
+      try {
+        const fx = buildFixture(dir, { order: true });
+        const saveTracker = { count: 0 };
+        const result = runAttach(fx, saveTracker);
+        expect(result).toBe("ORDER_ALREADY_LINKED");
+        expect(fx.reviewStore.get().reviews).toHaveLength(1);
+        expect(fx.intent.executiveReviewLink).toEqual(fx.link);
+        expect(fx.intent.sourcePaperOrders?.[0]?.executiveReviewLink).toEqual(fx.link);
+        expect(fx.paperStore.all[0]?.executiveReviewLink).toEqual(fx.link);
+        expect(saveTracker.count).toBe(1); // intent/sourceEntry mutated -> saveLiveIntents called once
+
+        // Re-running now that all three agree must be a true no-op (still one review, no extra saves).
+        const second = runAttach({ ...fx, intentIndex: buildLiveIntentIndexByPaperOrderId([fx.intent]) }, saveTracker);
+        expect(second).toBe("ORDER_ALREADY_LINKED");
+        expect(fx.reviewStore.get().reviews).toHaveLength(1);
+        expect(saveTracker.count).toBe(1); // unchanged — nothing left to repair
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("intent-only linked: repairs sourceEntry + PaperOrder", () => {
+      const dir = mkdtempSync(join(tmpdir(), "eram-partial-intent-only-"));
+      try {
+        const fx = buildFixture(dir, { intent: true });
+        const saveTracker = { count: 0 };
+        const result = runAttach(fx, saveTracker);
+        expect(result).toBe("ORDER_ALREADY_LINKED");
+        expect(fx.reviewStore.get().reviews).toHaveLength(1);
+        expect(fx.intent.sourcePaperOrders?.[0]?.executiveReviewLink).toEqual(fx.link);
+        expect(fx.paperStore.all[0]?.executiveReviewLink).toEqual(fx.link);
+        expect(saveTracker.count).toBe(1); // sourceEntry mutated -> saveLiveIntents called once
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("sourceEntry-only linked: repairs intent + PaperOrder", () => {
+      const dir = mkdtempSync(join(tmpdir(), "eram-partial-source-only-"));
+      try {
+        const fx = buildFixture(dir, { source: true });
+        const saveTracker = { count: 0 };
+        const result = runAttach(fx, saveTracker);
+        expect(result).toBe("ORDER_ALREADY_LINKED");
+        expect(fx.reviewStore.get().reviews).toHaveLength(1);
+        expect(fx.intent.executiveReviewLink).toEqual(fx.link);
+        expect(fx.paperStore.all[0]?.executiveReviewLink).toEqual(fx.link);
+        expect(saveTracker.count).toBe(1); // intent mutated -> saveLiveIntents called once
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("PaperOrder + intent linked (pair): repairs sourceEntry only", () => {
+      const dir = mkdtempSync(join(tmpdir(), "eram-partial-order-intent-"));
+      try {
+        const fx = buildFixture(dir, { order: true, intent: true });
+        const saveTracker = { count: 0 };
+        const result = runAttach(fx, saveTracker);
+        expect(result).toBe("ORDER_ALREADY_LINKED");
+        expect(fx.reviewStore.get().reviews).toHaveLength(1);
+        expect(fx.intent.sourcePaperOrders?.[0]?.executiveReviewLink).toEqual(fx.link);
+        expect(saveTracker.count).toBe(1); // sourceEntry mutated -> saveLiveIntents called once
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("PaperOrder + sourceEntry linked (pair): repairs intent only", () => {
+      const dir = mkdtempSync(join(tmpdir(), "eram-partial-order-source-"));
+      try {
+        const fx = buildFixture(dir, { order: true, source: true });
+        const saveTracker = { count: 0 };
+        const result = runAttach(fx, saveTracker);
+        expect(result).toBe("ORDER_ALREADY_LINKED");
+        expect(fx.reviewStore.get().reviews).toHaveLength(1);
+        expect(fx.intent.executiveReviewLink).toEqual(fx.link);
+        expect(saveTracker.count).toBe(1); // intent mutated -> saveLiveIntents called once
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("intent + sourceEntry linked (pair): repairs PaperOrder only, and never calls saveLiveIntents (nothing to repair there)", () => {
+      const dir = mkdtempSync(join(tmpdir(), "eram-partial-intent-source-"));
+      try {
+        const fx = buildFixture(dir, { intent: true, source: true });
+        const saveTracker = { count: 0 };
+        const result = runAttach(fx, saveTracker);
+        expect(result).toBe("ORDER_ALREADY_LINKED");
+        expect(fx.reviewStore.get().reviews).toHaveLength(1);
+        expect(fx.paperStore.all[0]?.executiveReviewLink).toEqual(fx.link);
+        // Neither the intent nor its sourceEntry needed a write — saveLiveIntents must stay untouched.
+        expect(saveTracker.count).toBe(0);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("all three already linked (full idempotent replay): zero writes anywhere, exactly one review", () => {
+      const dir = mkdtempSync(join(tmpdir(), "eram-partial-all-"));
+      try {
+        const fx = buildFixture(dir, { order: true, intent: true, source: true });
+        const saveTracker = { count: 0 };
+        const result = runAttach(fx, saveTracker);
+        expect(result).toBe("ORDER_ALREADY_LINKED");
+        expect(fx.reviewStore.get().reviews).toHaveLength(1);
+        expect(saveTracker.count).toBe(0);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe("blocker 2 — 12-field lineage: each of the 6 newly-added fields individually causes INTENT_LINEAGE_CONFLICT", () => {
+    function attachWithLineageOverride(dir: string, overrides: Partial<LiveIntentCausalLineage>): ReturnType<typeof attachExecutiveReviewToExactPaperOrder> {
+      const paperStore = new PaperExecutionRouterStore(dir);
+      paperStore.add(paper());
+      const reviewStore = new ExecutiveReviewStore(join(dir, "reviews.json"));
+      const intent = liveIntent({ causalLineage: lineage(overrides) });
+      const intentIndex = buildLiveIntentIndexByPaperOrderId([intent]);
+      const result = attachExecutiveReviewToExactPaperOrder({
+        reviewStore,
+        paperStore,
+        executive: executive(),
+        candidateId: "candidate-1",
+        executingPaperOrderIds: new Set(["paper-1"]),
+        env: shadowEnv,
+        paperOrderOwnershipIndex: ownershipIndexFor(paperStore),
+        liveIntentIndexByPaperOrderId: intentIndex,
+        saveLiveIntents: () => {},
+      });
+      expect(reviewStore.get().reviews).toHaveLength(0); // never written on a rejected attach
+      return result;
+    }
+
+    it("wrong sourceObservationId individually causes INTENT_LINEAGE_CONFLICT", () => {
+      const dir = mkdtempSync(join(tmpdir(), "eram-lineage-sourceobs-"));
+      try {
+        expect(attachWithLineageOverride(dir, { sourceObservationId: "candidate-WRONG" })).toBe("INTENT_LINEAGE_CONFLICT");
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("wrong scanBatchId individually causes INTENT_LINEAGE_CONFLICT", () => {
+      const dir = mkdtempSync(join(tmpdir(), "eram-lineage-scanbatch-"));
+      try {
+        expect(attachWithLineageOverride(dir, { scanBatchId: "batch-WRONG" })).toBe("INTENT_LINEAGE_CONFLICT");
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("wrong paperLaneId individually causes INTENT_LINEAGE_CONFLICT", () => {
+      const dir = mkdtempSync(join(tmpdir(), "eram-lineage-lane-"));
+      try {
+        expect(attachWithLineageOverride(dir, { paperLaneId: "LANE-WRONG" })).toBe("INTENT_LINEAGE_CONFLICT");
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("wrong symbol individually causes INTENT_LINEAGE_CONFLICT", () => {
+      const dir = mkdtempSync(join(tmpdir(), "eram-lineage-symbol-"));
+      try {
+        expect(attachWithLineageOverride(dir, { symbol: "ETHUSDT" })).toBe("INTENT_LINEAGE_CONFLICT");
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("wrong direction individually causes INTENT_LINEAGE_CONFLICT", () => {
+      const dir = mkdtempSync(join(tmpdir(), "eram-lineage-direction-"));
+      try {
+        expect(attachWithLineageOverride(dir, { direction: "SHORT" })).toBe("INTENT_LINEAGE_CONFLICT");
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("wrong paperOrderId individually causes INTENT_LINEAGE_CONFLICT", () => {
+      const dir = mkdtempSync(join(tmpdir(), "eram-lineage-paperorderid-"));
+      try {
+        expect(attachWithLineageOverride(dir, { paperOrderId: "paper-WRONG" })).toBe("INTENT_LINEAGE_CONFLICT");
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
   });
 });

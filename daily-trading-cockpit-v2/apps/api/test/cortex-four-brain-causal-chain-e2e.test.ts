@@ -52,6 +52,7 @@ import {
   publishCortexDecisionSnapshotsForScan,
   cortexDecisionSnapshotsForScan,
   exactCortexDecisionSnapshotForScan,
+  isScanBatchPublished,
   _resetCortexDecisionSnapshotsForTests,
 } from "../src/lib/cortex-decision-snapshot.js";
 import { CORTEX_CG_MFE_GIVEBACK_LONG_LANE_ID } from "../src/lib/cortex-live-gather.js";
@@ -1058,6 +1059,53 @@ describe("CORTEX <-> Four-Brain production causal chain (e2e, real functions onl
       scanBatchId: ctx.scanBatchId, canonicalCortexLaneId: CANONICAL_CORTEX_LANE_ID, direction: "LONG",
       snapshots: cortexDecisionSnapshotsForScan(ctx.scanBatchId),
     })).toBeNull();
+  });
+
+  it("[negative] two real periodic ticks with the same scanBatchId — the second runs unbound (scanBatchId: null) rather than skipping", () => {
+    // Mirrors app.ts's actual periodic-tick sequence (both cortexShadowTick and
+    // cortexStandaloneShadowTick share this exact shape) directly against the real underlying
+    // functions — app.ts's own closures are unexported locals and cannot be imported/driven directly.
+    const laneObs = (finalPct: number) => [{
+      laneId: CANONICAL_CORTEX_LANE_ID, direction: "LONG" as const, edgeMemAvgNetR: 0.1, edgeMemN: 40,
+      laneNetAvgR: 0.1, laneNetAvgN: 40, lanePf: 1.2, crowdingAlign: 0, kronosAgree: null,
+      convictionScore: 0.7, vetoed: false, staticWeightPct: finalPct,
+    }];
+    const top = { regimeFamily: "BULLISH_EXPANSION", axisScore: 0.5, axisSlopePerHour: 0.02, allowLong: true, allowShort: true, portfolioDrawdownPct: 0, killBudgetUtilization: 0, killLatched: false };
+    const cortexStore = new CortexBrainStore(join(ctx.cortexDir, "cortex.json"));
+    const cortexJournal = new CortexDecisionJournal(join(ctx.cortexDir, "journal.jsonl"));
+
+    // Tick 1: scanBatchId not yet published -> real scanBatchId, then attempt publish (unchanged
+    // behavior for the not-yet-published case).
+    const alreadyPublished1 = isScanBatchPublished(ctx.scanBatchId);
+    expect(alreadyPublished1).toBe(false);
+    const first = runCortexShadowTick({
+      store: cortexStore, journal: cortexJournal, context: assembleCortexContext(top, laneObs(20)),
+      nowIso: new Date(ctx.NOW - 60_000).toISOString(),
+      scanBatchId: alreadyPublished1 ? null : ctx.scanBatchId, mode: "shadow",
+    });
+    expect(first.snapshots.every((s) => s.sourceScanBatchId === ctx.scanBatchId)).toBe(true);
+    expect(publishCortexDecisionSnapshotsForScan(ctx.scanBatchId, first.snapshots)).toBe("PUBLISHED");
+
+    // Tick 2 (repeat, same scanBatchId — the scan cache has not refreshed, exactly like the real
+    // 5-min-tick-vs-7-min-scan-cache cadence): the batch is now already published, so this tick must
+    // run UNBOUND (scanBatchId: null), not be silently skipped and not re-tagged with the real id.
+    const alreadyPublished2 = isScanBatchPublished(ctx.scanBatchId);
+    expect(alreadyPublished2).toBe(true);
+    const second = runCortexShadowTick({
+      store: cortexStore, journal: cortexJournal, context: assembleCortexContext(top, laneObs(20)),
+      nowIso: new Date(ctx.NOW - 50_000).toISOString(),
+      scanBatchId: alreadyPublished2 ? null : ctx.scanBatchId, mode: "shadow",
+    });
+    // Ran unbound, not skipped: the tick still produced real output snapshots...
+    expect(second.snapshots.length).toBeGreaterThan(0);
+    // ...but stamped with a null sourceScanBatchId, exactly as runCortexShadowTick does when handed
+    // scanBatchId: null (cortex-brain-store.ts's only use of deps.scanBatchId).
+    expect(second.snapshots.every((s) => s.sourceScanBatchId === null)).toBe(true);
+    // No publish attempted for tick 2 (mirrors app.ts's `if (cached?.scanBatchId &&
+    // !scanBatchAlreadyPublished)` gate) — the real batch's stored content is unaffected, still tick 1's.
+    expect(cortexDecisionSnapshotsForScan(ctx.scanBatchId)).toEqual(
+      first.snapshots.map((s) => ({ ...s, scanBatchId: ctx.scanBatchId })),
+    );
   });
 
   it("[negative] wrong execution intent — a position link whose executionIntentId does not match any review link stays pending, never fabricates a Tier-1 row", async () => {

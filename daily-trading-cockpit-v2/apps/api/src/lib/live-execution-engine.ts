@@ -745,6 +745,17 @@ export interface LiveIntentCausalLineage {
   canonicalCortexLaneId: string | null;
   instanceId: string;
   policyDeploymentAt: string;
+  /** PaperOrder identity/lineage fields captured directly off the order (not via causalIdentity) —
+   *  see lineageFromPaperOrder's doc comment for why these are read straight from `order`. */
+  paperOrderId: string;
+  sourceObservationId: string;
+  scanBatchId: string | null;
+  /** Value comes from PaperOrder.selectedLaneId — the canonical persisted lane-ownership field.
+   *  This is a distinct concept from the `paperLaneId` identifier used elsewhere in
+   *  paper-cortex-lane-mapping.ts; do not confuse the two. */
+  paperLaneId: string;
+  symbol: string;
+  direction: "LONG" | "SHORT";
 }
 
 export interface LiveIntentSource {
@@ -777,6 +788,12 @@ function lineageFromPaperOrder(order: PaperOrder): LiveIntentCausalLineage | und
     canonicalCortexLaneId: identity.canonicalCortexLaneId,
     instanceId: identity.instanceId,
     policyDeploymentAt: identity.policyDeploymentAt,
+    paperOrderId: order.paperOrderId,
+    sourceObservationId: order.sourceObservationId,
+    scanBatchId: order.scanBatchId ?? null,
+    paperLaneId: order.selectedLaneId,
+    symbol: order.symbol,
+    direction: order.direction,
   };
 }
 

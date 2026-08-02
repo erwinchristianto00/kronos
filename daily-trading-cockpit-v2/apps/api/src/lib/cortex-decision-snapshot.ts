@@ -130,6 +130,15 @@ export function publishCortexDecisionSnapshotsForScan(
   if (!scanBatchId || !snapshots.length || snapshots.some((snapshot) =>
     !validSnapshot(snapshot) || snapshot.sourceScanBatchId !== scanBatchId,
   )) return "INVALID";
+  // A single scanBatchId publication is only ever supposed to carry one snapshot per lane+direction
+  // combination — reject the whole call before any write if two snapshots in this same array share
+  // the same (laneId, direction) pair.
+  const seenLaneDirection = new Set<string>();
+  for (const snapshot of snapshots) {
+    const key = `${snapshot.laneId}\0${snapshot.direction ?? ""}`;
+    if (seenLaneDirection.has(key)) return "INVALID";
+    seenLaneDirection.add(key);
+  }
   const stamped = snapshots.map((snapshot) => copySnapshot({ ...snapshot, scanBatchId }));
   const fingerprint = scanBatchContentFingerprint(stamped);
   if (!byScanBatch.has(scanBatchId)) {

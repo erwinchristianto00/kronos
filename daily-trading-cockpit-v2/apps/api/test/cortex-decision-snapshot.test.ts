@@ -141,6 +141,14 @@ describe("publishCortexDecisionSnapshotsForScan immutability contract", () => {
     expect(publishCortexDecisionSnapshotsForScan("batch-1", [snapshot()])).toBe("PUBLISHED");
     expect(cortexDecisionSnapshotsForScan("batch-1")).toHaveLength(1);
   });
+
+  it("returns INVALID when two snapshots in the same publish call share the same (laneId, direction) pair", () => {
+    _resetCortexDecisionSnapshotsForTests();
+    const a = snapshot({ atMs: 1 });
+    const b = snapshot({ atMs: 2 }); // same default laneId "CG_WIDE_FAST_LONG" + direction "LONG", different decisionId
+    expect(publishCortexDecisionSnapshotsForScan("batch-1", [a, b])).toBe("INVALID");
+    expect(cortexDecisionSnapshotsForScan("batch-1")).toEqual([]); // nothing written
+  });
 });
 
 describe("Point 4: validSnapshot() pre-write exhaustive schema validation", () => {

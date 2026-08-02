@@ -42,18 +42,27 @@ export class LiveIntentIndex extends Map<string, LiveIntent> {
  *
  * COLLISION POLICY (fail-closed, documented 2026-08-02): a paperOrderId is expected to resolve to
  * exactly ONE owning intent. A genuine collision is a paperOrderId that resolves to TWO OR MORE
- * DISTINCT intents — either as the PRIMARY of one intent and a (non-self) SOURCE of a different
- * intent, or as a SOURCE of two different intents at once. (Two different intents sharing the same
- * PRIMARY id is not a case this index disambiguates — that is impossible by construction per the
- * comment above, and is left exactly as before: last-write-wins over `intents`, matching this
- * index's original single-map contract.)
+ * DISTINCT intents — as the PRIMARY of two different intents, as the PRIMARY of one intent and a
+ * (non-self) SOURCE of a different intent, or as a SOURCE of two different intents at once. There is
+ * NO exception for primary-vs-primary: it is tempting to assume that's "impossible by construction"
+ * (paperOrderId is unique per intent — executionIntentId === paper.paperOrderId, live-execution-
+ * engine.ts's openIntent()) and fall back to last-write-wins, but construction-time uniqueness of a
+ * single intent's own id says nothing about two SEPARATE intents ending up primaried on the same
+ * paperOrderId — see the concrete counterexample below. Every collision shape is handled identically
+ * by this index: retract from the resolvable map, record in `conflictedPaperOrderIds`, never guess.
  *
  * This is not supposed to happen: mirrorNewSignals()'s `mirrored` de-dupe set is meant to prevent a
  * paperOrderId already sourced into a live intent from being mirrored again. But that guard only
  * covers intents that are NOT already ERROR/KILLED (`intent.state !== "ERROR" && intent.state !==
  * "KILLED"`), so a paperOrderId that was sourced into a now-terminal (ERROR/KILLED) intent is
  * legally eligible to be mirrored again into a brand-new intent later — this index must not assume
- * that never happens; it must check, and it does, every time it is built.
+ * that never happens; it must check, and it does, every time it is built. Concretely, this is also
+ * how a PRIMARY-vs-PRIMARY collision arises, not just source collisions: `mirrorAttempts` retry logic
+ * allows re-mirroring the same paperOrderId up to `MAX_MIRROR_ATTEMPTS` (=2) times
+ * (live-execution-engine.ts:1431, checked at 5885/5913), and `openIntent()` never checks primary-id
+ * uniqueness before `st.intents.push(intent)` (live-execution-engine.ts:6466) — so two ticks apart, a
+ * paper order whose first mirror attempt ended in ERROR can be re-mirrored into a second, live
+ * intent, producing two distinct LiveIntents that share one primary paperOrderId.
  *
  * On a genuine collision, this index NEVER silently picks one of the candidate intents (oldest,
  * newest, primary-over-source, or any other tiebreak). The colliding paperOrderId is retracted from
@@ -70,39 +79,33 @@ export class LiveIntentIndex extends Map<string, LiveIntent> {
 export function buildLiveIntentIndexByPaperOrderId(
   intents: readonly LiveIntent[],
 ): LiveIntentIndex {
-  // Pass 1: primary index — last-write-wins over `intents`, exactly the original (pre-source-index)
-  // behavior. Two different intents sharing the same primary id is impossible by construction, so
-  // this index does not attempt to disambiguate that case; it is untouched by the collision policy
-  // below.
-  const primaryIndex = new Map<string, LiveIntent>();
-  for (const intent of intents) primaryIndex.set(intent.paperOrderId, intent);
-
-  // Pass 2: every DISTINCT id that appears in some intent's sourcePaperOrders, excluding the
-  // routine self-echo (an intent's own primary order is always ALSO one of its own
-  // sourcePaperOrders entries at open — see the doc above). Grouped by the SET of intents that
-  // claim each id, so a genuine collision (size > 1) is detectable rather than silently overwritten.
-  const sourceOwners = new Map<string, Set<LiveIntent>>();
+  // Single unified "owners per id" pass: a primary id is indexed exactly like a source id, through
+  // the SAME accumulator, so there is no separate primary-only structure that could silently
+  // last-write-win a primary-vs-primary collision. Grouped by the SET of intents that claim each id,
+  // so a genuine collision (size > 1) is detectable rather than silently overwritten — regardless of
+  // whether the colliding paperOrderId is a PRIMARY, a SOURCE, or both, on either side.
+  const owners = new Map<string, Set<LiveIntent>>();
+  const addOwner = (id: string, intent: LiveIntent) => {
+    let set = owners.get(id);
+    if (!set) {
+      set = new Set<LiveIntent>();
+      owners.set(id, set);
+    }
+    set.add(intent);
+  };
   for (const intent of intents) {
+    addOwner(intent.paperOrderId, intent);
     for (const source of intent.sourcePaperOrders ?? []) {
       if (source.paperOrderId === intent.paperOrderId) continue; // routine self-echo, not new info
-      let owners = sourceOwners.get(source.paperOrderId);
-      if (!owners) {
-        owners = new Set<LiveIntent>();
-        sourceOwners.set(source.paperOrderId, owners);
-      }
-      owners.add(intent);
+      addOwner(source.paperOrderId, intent);
     }
   }
 
-  const resolved = new Map<string, LiveIntent>(primaryIndex);
+  const resolved = new Map<string, LiveIntent>();
   const conflicted = new Set<string>();
-  for (const [paperOrderId, owners] of sourceOwners) {
-    const candidates = new Set<LiveIntent>(owners);
-    const primaryOwner = primaryIndex.get(paperOrderId);
-    if (primaryOwner) candidates.add(primaryOwner);
+  for (const [paperOrderId, candidates] of owners) {
     if (candidates.size > 1) {
       // COLLISION — see policy doc above. Retract (never overwrite with a guess) and record.
-      resolved.delete(paperOrderId);
       conflicted.add(paperOrderId);
     } else {
       resolved.set(paperOrderId, [...candidates][0]!);
