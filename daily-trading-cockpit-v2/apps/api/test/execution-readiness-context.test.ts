@@ -156,7 +156,10 @@ describe("isPaperOrderLiveEligible — real wiring (buildIsPaperOrderLiveEligibl
       prefix: string;
     },
   ): void {
-    const spacingMs = 24 * 60 * 60 * 1000;
+    // Point 3c (current-guard-variant-matrix): effectiveN's grouping key no longer crosses symbol
+    // into the time block, so rows must be spaced beyond this variant's ~3-day (72h) max-hold block
+    // width to land in distinct blocks and stay independent — 4 days, same as that file's [3C-PASS].
+    const spacingMs = 4 * 24 * 60 * 60 * 1000;
     const baseOpenedAtMs = Date.UTC(2026, 5, 1);
     const baseResolvedAtMs = Date.UTC(2026, 6, 1);
     const observations = Array.from({ length: options.count }, (_, index) => {
@@ -232,7 +235,12 @@ describe("isPaperOrderLiveEligible — real wiring (buildIsPaperOrderLiveEligibl
       variantId: "CG_WIDE_STOP_TP_WIDE",
       direction: "LONG",
       regime: "Sideways rotation",
-      count: 100,
+      // Point 4b (current-guard-variant-matrix): once a holdout cut freezes (>= HOLDOUT_CUT_MIN_FRESH
+      // =20), freshValid/effectiveN are dev-only (pre-cut). floor(143*HOLDOUT_DEV_FRACTION)=100 keeps
+      // this cohort's dev-side effectiveN at STABLE_MIN_FRESH (100) with a sufficient 43-row holdout
+      // (same n=143 boundary as current-guard-variant-matrix.test.ts's [3A-PASS]/[4-PASS]), so it
+      // still reaches STABLE_CANDIDATE post-fix.
+      count: 143,
       netR: stableNetR,
       prefix: "pass",
     });

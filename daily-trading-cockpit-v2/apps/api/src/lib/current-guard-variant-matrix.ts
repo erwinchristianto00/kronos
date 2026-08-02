@@ -456,6 +456,14 @@ export const DRAWDOWN_R_TO_CUM_SHARE = Number(process.env.DRAWDOWN_R_TO_CUM_SHAR
 export const MAX_TOP_SYMBOL_SHARE = 0.4;
 export const PROMOTION_MIN_CALENDAR_DAYS = 5;
 export const PROMOTION_MIN_DISTINCT_REGIMES = 2;
+// Point 3c — symbol-diversity floor, kept SEPARATE from effectiveN (independent-episode count).
+// Without this, a cohort could clear STABLE/PROMOTION's effectiveN bar using one or two symbols
+// repeated across many genuinely-independent episodes — real independent draws, but not evidence the
+// edge is market-wide rather than an artifact of one or two instruments. 5 matches the existing
+// 5-symbol rotation convention already used by every addResolvedContextCohort test fixture; 3 is
+// meaningfully stricter than the one-or-two-symbol abuse case while reachable before PROMOTION.
+export const STABLE_MIN_DISTINCT_SYMBOLS = 3;
+export const PROMOTION_MIN_DISTINCT_SYMBOLS = 5;
 
 // --- Point 4: immutable chronological development/holdout split -----------------------------
 // A lane's STABLE/PROMOTION economics (net/pf/effectiveN/etc. above) are still computed on the
@@ -950,6 +958,10 @@ export interface VariantMatrixSignal {
   regimeDirection?: VariantRegimeDirection | null;
   /** Derivatives crowding state at signal time (BUILDING/EXHAUSTING/UNWINDING/NEUTRAL); fresh feed. */
   crowdingState?: string | null;
+  /** Shared-origin scan/episode identity (e.g. the scan cycle's generatedAt). Fresh-feed populates
+   *  this; null on legacy/shadow-position-derived signals which have no batch identity. Used as the
+   *  PRIMARY independence key by computeEffectiveN — see its doc comment. */
+  scanBatchId?: string | null;
 }
 
 export interface CurrentGuardVariantMatrixObservation {
@@ -966,6 +978,10 @@ export interface CurrentGuardVariantMatrixObservation {
   axisDirection?: Direction;
   axisRegimeFamily?: AxisRegimeFamily;
   axisKey?: string;
+  /** Shared-origin scan/episode identity, copied from the source signal. Optional — absent/null on
+   *  legacy rows and on rows produced from signals with no batch identity (e.g. shadow-position
+   *  derived). Never backfilled. Primary grouping key for computeEffectiveN when present. */
+  scanBatchId?: string | null;
   entryVariant: string | null;
   createdAt: string;
   openedAt: string;
@@ -1706,6 +1722,7 @@ export function buildVariantMatrixObservationsForSignal(
       posture: signal.posture ?? null,
       regimeDirection: signal.regimeDirection ?? null,
       crowdingState: signal.crowdingState ?? null,
+      scanBatchId: signal.scanBatchId ?? null,
       exactAxisProof,
       reportOnly: true as const,
       laneVersion: CURRENT_GUARD_VARIANT_MATRIX_LANE,
@@ -3203,6 +3220,10 @@ export interface CurrentGuardVariantMatrixRow {
 
   calendarDays: number | null;
   distinctRegimes: number;
+  /** Point 3c: count of distinct `symbol` values in this row's fresh population — reported SEPARATELY
+   *  from effectiveN (independent-episode count) so symbol diversity and statistical independence are
+   *  never conflated. See STABLE_MIN_DISTINCT_SYMBOLS/PROMOTION_MIN_DISTINCT_SYMBOLS. */
+  distinctSymbolCount: number;
   byRegime: VariantBreakdownRow[];
   /** Direction cohort performance for the same fresh-valid row population. */
   byDirection?: VariantBreakdownRow[];
@@ -3235,6 +3256,20 @@ export interface CurrentGuardVariantMatrixRow {
   holdoutNegative: boolean;
   /** The frozen cut boundary in epoch ms, or null when no cut has been frozen yet. */
   holdoutCutMs: number | null;
+  // Point 4b — true dev/holdout separation. `freshValid`/`effectiveN`/`distinctRegimes`/
+  // `distinctSymbolCount` above are now ALWAYS computed from rows strictly before the frozen cut
+  // (devFresh) — never the full fresh set once a cut exists. These four fields make that split
+  // externally visible instead of leaving it as an internal local: `devN`/`devEffectiveN` are
+  // explicit aliases of `freshValid`/`effectiveN` (same values, named so a caller never has to
+  // infer which side of the cut a bare `freshValid` means), and `holdoutN`/`holdoutEffectiveN` are
+  // the holdout-side counterparts (`holdoutN` aliases `holdoutFreshValid` — a field name with real
+  // production readers of its own; `holdoutEffectiveN` is genuinely new, from computeHoldoutEvidence).
+  // operator-brief.ts's `devHoldoutLine` reads all four of these to surface the dev/holdout evidence
+  // split to the operator (section 4's per-variant rows).
+  devN: number;
+  devEffectiveN: number;
+  holdoutN: number;
+  holdoutEffectiveN: number;
 
   status: VariantMatrixStatus;
   statusReason: string;
@@ -3272,6 +3307,10 @@ export interface VariantContextEvidenceRow {
   topSymbolPnlShare: number | null;
   calendarDays: number | null;
   distinctRegimes: number;
+  /** Point 3c: distinct `symbol` count for THIS exact context's fresh rows — see the same-named field
+   *  on CurrentGuardVariantMatrixRow for the full doc comment. This copy is what actually gates
+   *  STABLE_CANDIDATE/PROMOTION_CANDIDATE in deriveVariantStatus below. */
+  distinctSymbolCount: number;
   oosThirds: [VariantSegmentStat, VariantSegmentStat, VariantSegmentStat] | null;
   allThreeOosPositive: boolean;
   // Point 4 — see the same-named fields on CurrentGuardVariantMatrixRow for the full doc comment.
@@ -3284,6 +3323,15 @@ export interface VariantContextEvidenceRow {
   holdoutSufficient: boolean;
   holdoutNegative: boolean;
   holdoutCutMs: number | null;
+  // Point 4b — see the same-named fields on CurrentGuardVariantMatrixRow for the full doc comment.
+  // THIS copy is the one that actually gates STABLE/PROMOTION: `freshValid`/`effectiveN` above are
+  // dev-only (pre-cut) once a cut exists, and `devN`/`devEffectiveN` are explicit aliases of them.
+  // Note: operator-brief.ts's `devHoldoutLine` reads the CurrentGuardVariantMatrixRow copies of
+  // these four fields (the aggregate row in `vm.rows`), not this per-context copy.
+  devN: number;
+  devEffectiveN: number;
+  holdoutN: number;
+  holdoutEffectiveN: number;
   status: ContextLaneStatus;
   statusReason: string;
   blockers: string[];
@@ -3409,24 +3457,49 @@ function resolvedMsOf(obs: CurrentGuardVariantMatrixObservation): number {
 }
 
 /**
- * Point 3c — effectiveN: DISTINCT non-overlapping (symbol, time-block) pairs touched, not a raw row
- * count. Same idiom as direction-brain-resolver.ts's horizonBlockKey/computeDirectionEffectiveSampleSize
- * (Math.floor(ts / windowMs) Set-of-blocks). `symbol` is crossed INTO the block key (not just the
- * timestamp) because several symbols firing off the SAME market-wide regime reading at the same
- * instant are correlated draws of one episode, not independent observations, but two DIFFERENT
- * symbols in the same time block are still two separate signals — collapsing them together would
- * UNDER-count, not over-count. blockWidthMs is the variant's own max-hold characteristic
- * (variantMaxHoldMs), so the block width scales with how long one observation of this variant's
- * geometry can stay "in flight" and therefore correlated with a near-neighbor.
+ * Point 3c — effectiveN: count of DISTINCT INDEPENDENT MARKET EPISODES, not a raw row count and
+ * never one-per-symbol. Per this repo's own standing methodology (CLAUDE.md: "Signals fire on
+ * several symbols at the same instant from one market-wide reading; those are one observation"),
+ * multiple symbols resolving off the SAME shared-origin episode are ONE independent draw, full stop
+ * — symbol must never be crossed into the grouping key (a prior version of this function did exactly
+ * that and produced effectiveN=100 for 100 symbols firing off one scan cycle, when the true
+ * independent-draw count for that episode is 1).
+ *
+ * Grouping key, in priority order:
+ *   1. `scanBatchId` when present — a real persisted shared-origin identity (the scan cycle that
+ *      produced the signal). This is the PRIMARY mechanism per the operator's instruction: use a
+ *      real batch/source-event identity when available. All rows sharing a batch id collapse to one
+ *      draw regardless of how far apart in time or how many symbols they cover.
+ *   2. Deterministic non-overlapping time block (Math.floor(resolvedMs / blockWidthMs)) when no
+ *      `scanBatchId` exists — same idiom as direction-brain-resolver.ts's
+ *      horizonBlockKey/computeDirectionEffectiveSampleSize. The block key ALONE is the group; symbol
+ *      is never crossed in. blockWidthMs is the variant's own max-hold characteristic
+ *      (variantMaxHoldMs), so the block width scales with how long one observation of this variant's
+ *      geometry can stay "in flight" and therefore correlated with a near-neighbor.
+ *   3. Defensive per-row fallback (only reachable when blockWidthMs is not a positive number) —
+ *      keeps the old obs.length behavior instead of silently collapsing everything to one group.
+ *
+ * Symbol diversity (how many distinct symbols contributed) is a SEPARATE concern — see
+ * distinctSymbolCount and STABLE_MIN_DISTINCT_SYMBOLS/PROMOTION_MIN_DISTINCT_SYMBOLS below. It must
+ * never be conflated with independence: a cohort can have effectiveN=50 and distinctSymbolCount=1
+ * (one symbol, many genuinely separate episodes) or effectiveN=1 and distinctSymbolCount=100 (100
+ * symbols, one shared episode) — both are real, and reporting only one of the two would hide either
+ * the "not enough independent evidence" risk or the "not genuinely market-wide" risk.
  */
 function computeEffectiveN(obs: readonly CurrentGuardVariantMatrixObservation[], blockWidthMs: number): number {
-  if (!(blockWidthMs > 0)) return obs.length;
-  const blocks = new Set<string>();
+  const groups = new Set<string>();
+  const blockWidthValid = blockWidthMs > 0;
   for (const o of obs) {
-    const blockIndex = Math.floor(resolvedMsOf(o) / blockWidthMs);
-    blocks.add(`${o.symbol}::${blockIndex}`);
+    if (o.scanBatchId) {
+      groups.add(`batch::${o.scanBatchId}`);
+    } else if (blockWidthValid) {
+      const blockIndex = Math.floor(resolvedMsOf(o) / blockWidthMs);
+      groups.add(`block::${blockIndex}`);
+    } else {
+      groups.add(`row::${o.observationId}`);
+    }
   }
-  return blocks.size;
+  return groups.size;
 }
 
 /**
@@ -3459,6 +3532,10 @@ interface HoldoutEvidenceFields {
   holdoutSufficient: boolean;
   holdoutNegative: boolean;
   holdoutCutMs: number | null;
+  /** Point 4b: distinct-episode count (computeEffectiveN, same grouping-key rules as the dev side)
+   *  over ONLY the holdout-side rows (resolvedMs >= cutMs). 0 when no cut exists yet — same
+   *  fail-closed convention as every other holdout field above. */
+  holdoutEffectiveN: number;
 }
 
 /**
@@ -3477,6 +3554,15 @@ interface HoldoutEvidenceFields {
  * Before any cut exists, the holdout requirement is unmet — fails closed, same discipline as every
  * other missing-evidence branch in this file (isFreshValidObs, buildContextEvidenceRow's exact-axis
  * filter, etc.).
+ *
+ * Point 4b — `blockWidthMs` (the caller's own `variantMaxHoldMs(def.id)`, computed once and reused)
+ * is passed through so `holdoutEffectiveN` uses the SAME grouping-key rules as the development side's
+ * `effectiveN` (computeEffectiveN) — batch identity first, symbol-free time block otherwise. The
+ * caller is responsible for the other half of true separation: development-side metrics (netAvgR,
+ * PF, payoff, OOS thirds, drawdown, concentration, effectiveN, distinctRegimes, distinctSymbolCount)
+ * must be recomputed from a `devFresh` slice — `chronologicalFresh` filtered to
+ * `resolvedMs(obs) < holdoutCutMs` — never from the full `chronologicalFresh` passed in here. This
+ * function only ever reads/returns the holdout side; it is not the guard against dev-side leakage.
  */
 function computeHoldoutEvidence(
   key: string,
@@ -3484,6 +3570,7 @@ function computeHoldoutEvidence(
   stressRoundTripBps: number,
   store: CurrentGuardVariantMatrixStore,
   nowIso: string,
+  blockWidthMs: number,
 ): HoldoutEvidenceFields {
   let cut = store.getHoldoutCut(key);
   if (!cut && chronologicalFresh.length >= HOLDOUT_CUT_MIN_FRESH) {
@@ -3507,6 +3594,7 @@ function computeHoldoutEvidence(
       holdoutSufficient: false,
       holdoutNegative: false,
       holdoutCutMs: null,
+      holdoutEffectiveN: 0,
     };
   }
   const cutMs = cut.cutMs;
@@ -3533,6 +3621,7 @@ function computeHoldoutEvidence(
     holdoutSufficient,
     holdoutNegative,
     holdoutCutMs: cutMs,
+    holdoutEffectiveN: computeEffectiveN(holdout, blockWidthMs),
   };
 }
 
@@ -3668,44 +3757,68 @@ function buildContextEvidenceRow(
   // but without the axis stamp it may never stand alone as strong individual proof of THIS lane x
   // context — only the aggregate (buildRow, diagnostic-only) may still include it.
   const fresh = observations.filter(isFreshValidObs).filter((obs) => obs.exactAxisProof === true).sort(orderByResolved);
-  const netValues = fresh.map((obs) => obs.netR);
-  const grossValues = fresh.map((obs) => obs.grossR);
-  const winners = fresh.filter((obs) => (obs.netR ?? 0) > 0);
-  const losers = fresh.filter((obs) => (obs.netR ?? 0) <= 0);
+  const stressRoundTrip = roundTripBpsForCostModel(def.costModel) + STRESS_EXTRA_BPS;
+  const blockWidthMs = variantMaxHoldMs(def.id);
+  // Point 4: this exact lane x context proof unit gets its own immutable cut, independent of the
+  // aggregate's and of every other context's — a lane can be genuinely proven in LONG_BULLISH while
+  // its SHORT_BEARISH cut is still unfrozen or its holdout still negative. The cut must be computed
+  // from the FULL chronological `fresh` population (the cut boundary is a fraction of the total
+  // population's chronological index) — scoping `fresh` before this call would be circular.
+  const holdoutEvidence = computeHoldoutEvidence(`${def.id}::${context}`, fresh, stressRoundTrip, store, nowIso, blockWidthMs);
+  // Point 4b — true development/holdout separation: once a cut is frozen, EVERY development-side
+  // metric below (netAvgR, PF, payoff, drawdown, concentration, OOS thirds, effectiveN,
+  // distinctRegimes, distinctSymbolCount, wr) is computed ONLY from rows strictly before the cut
+  // (`devFresh`), never from the full `fresh` set — holdout rows must never leak into development
+  // evidence. Before any cut exists (`holdoutCutMs === null`) this is a safe no-op: `holdoutSufficient`
+  // is false in that state regardless, so deriveVariantStatus's holdoutOk gate already blocks
+  // STABLE/PROMOTION.
+  const devFresh =
+    holdoutEvidence.holdoutCutMs !== null
+      ? fresh.filter((obs) => resolvedMsOf(obs) < holdoutEvidence.holdoutCutMs!)
+      : fresh;
+  const netValues = devFresh.map((obs) => obs.netR);
+  const grossValues = devFresh.map((obs) => obs.grossR);
+  const winners = devFresh.filter((obs) => (obs.netR ?? 0) > 0);
+  const losers = devFresh.filter((obs) => (obs.netR ?? 0) <= 0);
   const avgWinR = mean(winners.map((obs) => obs.netR));
   const avgLossR = mean(losers.map((obs) => obs.netR));
   const payoffRatio = avgWinR !== null && avgLossR !== null && avgLossR < 0 ? avgWinR / Math.abs(avgLossR) : null;
-  const stressRoundTrip = roundTripBpsForCostModel(def.costModel) + STRESS_EXTRA_BPS;
-  const plus10bpsNetAvgR = mean(fresh.map((obs) => {
+  const plus10bpsNetAvgR = mean(devFresh.map((obs) => {
     if (typeof obs.grossR !== "number" || obs.stopDistanceBps === null || !(obs.stopDistanceBps > 0)) return null;
     return obs.grossR - stressRoundTrip / obs.stopDistanceBps;
   }));
-  const { drawdownR } = drawdownAndStreak(fresh.map((obs) => obs.netR ?? 0));
-  const { oosThirds, allThreeOosPositive } = oosThirdsFor(fresh);
-  // Point 4: this exact lane x context proof unit gets its own immutable cut, independent of the
-  // aggregate's and of every other context's — a lane can be genuinely proven in LONG_BULLISH while
-  // its SHORT_BEARISH cut is still unfrozen or its holdout still negative.
-  const holdoutEvidence = computeHoldoutEvidence(`${def.id}::${context}`, fresh, stressRoundTrip, store, nowIso);
+  const { drawdownR } = drawdownAndStreak(devFresh.map((obs) => obs.netR ?? 0));
+  const { oosThirds, allThreeOosPositive } = oosThirdsFor(devFresh);
+  const devEffectiveN = computeEffectiveN(devFresh, blockWidthMs);
   const partial = {
-    freshValid: fresh.length,
-    effectiveN: computeEffectiveN(fresh, variantMaxHoldMs(def.id)),
+    freshValid: devFresh.length,
+    effectiveN: devEffectiveN,
     netAvgR: mean(netValues),
     grossAvgR: mean(grossValues),
     pf: profitFactor(netValues),
     payoffRatio,
     approxMaxDrawdownR: drawdownR,
-    topSymbolPnlShare: topSymbolPnlShare(fresh),
+    topSymbolPnlShare: topSymbolPnlShare(devFresh),
     plus10bpsStillPositive: plus10bpsNetAvgR !== null && plus10bpsNetAvgR > 0,
-    calendarDays: calendarDays(fresh),
-    distinctRegimes: countDistinctRegimeEpisodes(fresh),
+    calendarDays: calendarDays(devFresh),
+    distinctRegimes: countDistinctRegimeEpisodes(devFresh),
+    distinctSymbolCount: new Set(devFresh.map((obs) => obs.symbol)).size,
     allThreeOosPositive,
+    // Point 4b — real, externally-visible fields (not just the internal `devFresh`/`devEffectiveN`
+    // locals). `devN`/`devEffectiveN` alias `freshValid`/`effectiveN` above (same values, explicit
+    // names); `holdoutN` aliases `holdoutEvidence.holdoutFreshValid` (kept, not renamed — it has its
+    // own production readers). Note: operator-brief.ts reads the CurrentGuardVariantMatrixRow copies
+    // of these four fields (`vm.rows`), not this per-context VariantContextEvidenceRow copy.
+    devN: devFresh.length,
+    devEffectiveN,
+    holdoutN: holdoutEvidence.holdoutFreshValid,
     ...holdoutEvidence,
   };
   const status = deriveVariantStatus(partial, infra);
   return {
     context,
     ...partial,
-    wr: fresh.length > 0 ? winners.length / fresh.length : null,
+    wr: devFresh.length > 0 ? winners.length / devFresh.length : null,
     plus10bpsNetAvgR,
     oosThirds,
     ...status,
@@ -3734,6 +3847,7 @@ type VariantStatusEvidence = Pick<
   | "plus10bpsStillPositive"
   | "calendarDays"
   | "distinctRegimes"
+  | "distinctSymbolCount"
   | "allThreeOosPositive"
   // Point 4 — the immutable development/holdout split. holdoutFreshValid is carried only so a
   // blocker message can report a count; the actual gate reads exclusively the two booleans.
@@ -3771,6 +3885,12 @@ export function deriveVariantStatus(
   const drawdownLimitR = Math.max(MAX_DRAWDOWN_R_LIMIT, DRAWDOWN_R_TO_CUM_SHARE * cumulativeNetR);
   const drawdownOk = dd === null || dd <= drawdownLimitR;
   const shareOk = share === null || share <= MAX_TOP_SYMBOL_SHARE;
+  // Point 3c: symbol diversity is a SEPARATE requirement from effectiveN (independent-episode count)
+  // — a cohort must not clear STABLE/PROMOTION on one or two symbols repeated across many episodes
+  // alone, since that would not be genuine market-wide proof even though the episodes themselves are
+  // independent.
+  const stableSymbolsOk = row.distinctSymbolCount >= STABLE_MIN_DISTINCT_SYMBOLS;
+  const promotionSymbolsOk = row.distinctSymbolCount >= PROMOTION_MIN_DISTINCT_SYMBOLS;
   const infraReady = infra.killSwitchReady && infra.orderReconciliationReady && infra.exchangeHealthReady;
   // Point 4: a genuinely locked, later-in-time slice of the same population must ALSO, independently,
   // show non-negative economics. This can never be satisfied by development-side (pre-cut) data alone,
@@ -3793,6 +3913,7 @@ export function deriveVariantStatus(
     drawdownOk && shareOk &&
     (row.calendarDays ?? 0) >= PROMOTION_MIN_CALENDAR_DAYS &&
     row.distinctRegimes >= PROMOTION_MIN_DISTINCT_REGIMES &&
+    promotionSymbolsOk &&
     infraReady &&
     holdoutOk
   ) {
@@ -3813,11 +3934,13 @@ export function deriveVariantStatus(
     pf !== null && pf > PF_STRONG &&
     payoff !== null && payoff >= PAYOFF_AUTHORIZE &&
     drawdownOk && shareOk &&
+    stableSymbolsOk &&
     holdoutOk
   ) {
     if (row.effectiveN < PROMOTION_MIN_FRESH) blockers.push(`effectiveN ${row.effectiveN} < ${PROMOTION_MIN_FRESH} for promotion`);
     if ((row.calendarDays ?? 0) < PROMOTION_MIN_CALENDAR_DAYS) blockers.push("needs more calendar-day coverage");
     if (row.distinctRegimes < PROMOTION_MIN_DISTINCT_REGIMES) blockers.push("needs multiple market regimes");
+    if (!promotionSymbolsOk) blockers.push(`distinctSymbolCount ${row.distinctSymbolCount} < ${PROMOTION_MIN_DISTINCT_SYMBOLS} for promotion`);
     if (!infraReady) blockers.push("live infra gates not ready (kill-switch/order-recon/exchange-health)");
     return {
       status: "STABLE_CANDIDATE",
@@ -3844,6 +3967,11 @@ export function deriveVariantStatus(
     // WATCHABLE with an EMPTY blocker list — the operator can't see why it won't advance to STABLE.
     if (row.effectiveN >= STABLE_MIN_FRESH && !drawdownOk && dd !== null) {
       blockers.push(`drawdown ${dd.toFixed(1)}R > ${drawdownLimitR.toFixed(1)}R cap (sole gate left below STABLE)`);
+    }
+    // Point 3c: surface the diversity gate the same way — a lane with plenty of independent episodes
+    // but too few distinct symbols must not show WATCHABLE with an empty blocker list.
+    if (row.effectiveN >= STABLE_MIN_FRESH && !stableSymbolsOk) {
+      blockers.push(`distinctSymbolCount ${row.distinctSymbolCount} < ${STABLE_MIN_DISTINCT_SYMBOLS} for stable`);
     }
     // Point 4: surface the holdout gate the same way — otherwise a lane with perfect development-side
     // economics but an insufficient/negative holdout shows WATCHABLE with no indication why it is
@@ -3892,34 +4020,60 @@ function buildRow(
   const resolvedObs = obsForVariant.filter((o) => o.status === "CLOSED_WIN" || o.status === "CLOSED_LOSS");
   const fresh = resolvedObs.filter(isFreshValidObs).sort(orderByResolved);
 
-  const netVals = fresh.map((o) => o.netR);
-  const grossVals = fresh.map((o) => o.grossR);
+  const stressRoundTrip = roundTripBpsForCostModel(def.costModel) + STRESS_EXTRA_BPS;
+  const blockWidthMs = variantMaxHoldMs(def.id);
+  // Point 4: aggregate-level holdout split, computed from the FULL chronological `fresh` population
+  // (the cut boundary is a fraction of the total population's chronological index — scoping `fresh`
+  // before this call would be circular). Diagnostic-only, same status as this row's own
+  // status/statusReason/blockers (see the "aggregate diagnostic" comment below) — the exact-context
+  // rows built via buildContextEvidenceRow below are what actually gate proof. Keyed distinctly
+  // (`__aggregate__`) so it never collides with any real ExactLaneContext key.
+  const holdoutEvidence = computeHoldoutEvidence(`${def.id}::__aggregate__`, fresh, stressRoundTrip, store, nowIso, blockWidthMs);
+  // Point 4b — true development/holdout separation, identical discipline to buildContextEvidenceRow:
+  // once a cut is frozen, every status-relevant metric below is recomputed from `devFresh` (rows
+  // strictly before the cut), never from the full `fresh` set. Before any cut exists this is a
+  // safe no-op (holdoutSufficient is false regardless, so deriveVariantStatus already blocks
+  // STABLE/PROMOTION on this row).
+  //
+  // EXPLICIT DECISION: byRegime/byDirection/byRegimeFamily/byAxis/byAxisSymbol/byEntryVariant/
+  // bySymbol (breakdown tables) and `rolling` (last_10/20/50) stay computed on the FULL `fresh`
+  // population, unchanged. None of these feed VariantStatusEvidence/deriveVariantStatus — they are
+  // pure diagnostics, and this row's own `status` is already labeled diagnostic-only
+  // (aggregateDiagnosticStatus). Rescoping them is not required for correctness and would make a
+  // diagnostic breakdown less informative for no benefit; noted here so it is not mistaken for an
+  // oversight.
+  const devFresh =
+    holdoutEvidence.holdoutCutMs !== null
+      ? fresh.filter((o) => resolvedMsOf(o) < holdoutEvidence.holdoutCutMs!)
+      : fresh;
+
+  const netVals = devFresh.map((o) => o.netR);
+  const grossVals = devFresh.map((o) => o.grossR);
   const netAvgR = mean(netVals);
   const grossAvgR = mean(grossVals);
   const pf = profitFactor(netVals);
 
-  const netWinners = fresh.filter((o) => (o.netR ?? 0) > 0);
-  const netLosers = fresh.filter((o) => (o.netR ?? 0) <= 0);
+  const netWinners = devFresh.filter((o) => (o.netR ?? 0) > 0);
+  const netLosers = devFresh.filter((o) => (o.netR ?? 0) <= 0);
   const avgWinR = mean(netWinners.map((o) => o.netR));
   const avgLossR = mean(netLosers.map((o) => o.netR));
   const payoffRatio = avgWinR !== null && avgLossR !== null && avgLossR < 0 ? avgWinR / Math.abs(avgLossR) : null;
   const breakEvenWR = payoffRatio !== null ? 1 / (1 + payoffRatio) : null;
-  const actualWR = fresh.length > 0 ? netWinners.length / fresh.length : null;
+  const actualWR = devFresh.length > 0 ? netWinners.length / devFresh.length : null;
   const wr = actualWR;
 
-  const avgCostR = mean(fresh.map((o) => o.costR));
+  const avgCostR = mean(devFresh.map((o) => o.costR));
   const costDragR = grossAvgR !== null && netAvgR !== null ? grossAvgR - netAvgR : null;
 
   const attemptDenom = total - rejected; // attempts that could fill/resolve
   const noFillRate = attemptDenom > 0 ? noFill / attemptDenom : null;
   const expiredRate = attemptDenom > 0 ? expired / attemptDenom : null;
-  const avgHoldingMinutes = mean(fresh.map((o) => o.durationMinutes));
+  const avgHoldingMinutes = mean(devFresh.map((o) => o.durationMinutes));
 
-  const { drawdownR, streak } = drawdownAndStreak(fresh.map((o) => o.netR ?? 0));
-  const symbolShare = topSymbolPnlShare(fresh);
+  const { drawdownR, streak } = drawdownAndStreak(devFresh.map((o) => o.netR ?? 0));
+  const symbolShare = topSymbolPnlShare(devFresh);
 
-  const stressRoundTrip = roundTripBpsForCostModel(def.costModel) + STRESS_EXTRA_BPS;
-  const plus10Vals = fresh.map((o) => {
+  const plus10Vals = devFresh.map((o) => {
     if (typeof o.grossR !== "number" || o.stopDistanceBps === null || !(o.stopDistanceBps > 0)) return null;
     return o.grossR - stressRoundTrip / o.stopDistanceBps;
   });
@@ -3928,8 +4082,9 @@ function buildRow(
 
   // Point 3d: independent regime EPISODES (chronological run-length-encode over the family key),
   // not distinct string labels — many rows from the same underlying episode must not inflate this.
-  const distinctRegimes = countDistinctRegimeEpisodes(fresh);
-  const effectiveN = computeEffectiveN(fresh, variantMaxHoldMs(def.id));
+  const distinctRegimes = countDistinctRegimeEpisodes(devFresh);
+  const effectiveN = computeEffectiveN(devFresh, blockWidthMs);
+  const distinctSymbolCount = new Set(devFresh.map((o) => o.symbol)).size;
   const byRegime = breakdownRows(fresh, (o) => o.regime ?? "UNKNOWN");
   const byDirection = breakdownRows(fresh, (o) => o.direction);
   const byRegimeFamily = breakdownRows(fresh, observationRegimeFamilyKey);
@@ -3938,19 +4093,13 @@ function buildRow(
   const byEntryVariant = breakdownRows(fresh, (o) => o.entryVariant ?? "unknown");
   const bySymbol = breakdownRows(fresh, (o) => o.symbol);
 
-  const { oosThirds, allThreeOosPositive } = oosThirdsFor(fresh);
+  const { oosThirds, allThreeOosPositive } = oosThirdsFor(devFresh);
 
   const rolling = [
     rollingStat("last_10", fresh, 10),
     rollingStat("last_20", fresh, 20),
     rollingStat("last_50", fresh, 50),
   ];
-
-  // Point 4: aggregate-level holdout split. Diagnostic-only, same status as this row's own
-  // status/statusReason/blockers (see the "aggregate diagnostic" comment below) — the exact-context
-  // rows built via buildContextEvidenceRow below are what actually gate proof. Keyed distinctly
-  // (`__aggregate__`) so it never collides with any real ExactLaneContext key.
-  const holdoutEvidence = computeHoldoutEvidence(`${def.id}::__aggregate__`, fresh, stressRoundTrip, store, nowIso);
 
   const partial = {
     variantId: def.id,
@@ -3961,7 +4110,7 @@ function buildRow(
     total,
     open,
     resolved: resolvedObs.length,
-    freshValid: fresh.length,
+    freshValid: devFresh.length,
     effectiveN,
     rejected,
     noFill,
@@ -3986,8 +4135,9 @@ function buildRow(
     topSymbolPnlShare: symbolShare,
     plus10bpsNetAvgR,
     plus10bpsStillPositive,
-    calendarDays: calendarDays(fresh),
+    calendarDays: calendarDays(devFresh),
     distinctRegimes,
+    distinctSymbolCount,
     byRegime,
     byDirection,
     byRegimeFamily,
@@ -3998,6 +4148,14 @@ function buildRow(
     oosThirds,
     allThreeOosPositive,
     rolling,
+    // Point 4b — real, externally-visible fields on the report row (not just internal locals).
+    // `devN`/`devEffectiveN` alias `freshValid`/`effectiveN` above; `holdoutN` aliases
+    // `holdoutEvidence.holdoutFreshValid` (kept, not renamed — it has its own production readers).
+    // operator-brief.ts's `devHoldoutLine` reads all four to surface the dev/holdout evidence split
+    // for the top-3 and router-selected variant rows in the operator brief (section 4).
+    devN: devFresh.length,
+    devEffectiveN: effectiveN,
+    holdoutN: holdoutEvidence.holdoutFreshValid,
     ...holdoutEvidence,
   };
 

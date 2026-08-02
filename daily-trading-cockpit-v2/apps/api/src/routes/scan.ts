@@ -708,6 +708,7 @@ export async function registerScanRoute(
             controllerConfidence: freshController.confidence,
             crowdingBySymbol: freshCrowdingBySymbol,
             now: new Date().toISOString(),
+            scanBatchId: result.generatedAt,
           },
           freshStore,
         );

@@ -343,11 +343,14 @@ describe("operator-brief", () => {
     const vmStore = new CurrentGuardVariantMatrixStore(dir);
 
     // Entries must be FRESH at creation: isFreshValid = (now − openedAt) ≤ FRESH_ENTRY_MAX_MINUTES (10).
-    // Pack all 60 within the last ~5 min so every obs is fresh-valid (well within the 7-day expiry too).
-    const recentBase = Date.now() - 5 * 60_000;
+    // Pack all 80 within the last ~7 min so every obs is fresh-valid (well within the 7-day expiry too).
+    const recentBase = Date.now() - 7 * 60_000;
 
-    // Mirror 60 unique-symbol signals so every variant gets freshValid ≥ 50.
-    const signals: VariantMatrixSignal[] = Array.from({ length: 60 }, (_, i) => ({
+    // Mirror 80 unique-symbol signals so every variant gets freshValid ≥ 50.
+    // Point 4b (current-guard-variant-matrix): once a holdout cut freezes (>= HOLDOUT_CUT_MIN_FRESH=20),
+    // freshValid is dev-only (pre-cut) — floor(count*HOLDOUT_DEV_FRACTION). 80, not 60: floor(80*0.7)=56
+    // clears the freshValid>=50 assertion below; the old 60 only reached floor(60*0.7)=42.
+    const signals: VariantMatrixSignal[] = Array.from({ length: 80 }, (_, i) => ({
       sourceSignalId: `sig-${i}`,
       symbol: `SYM${String(i).padStart(3, "0")}USDT`,
       direction: "LONG" as const,
@@ -435,6 +438,73 @@ describe("operator-brief", () => {
     expect(brief).toContain("CG_WIDE_STOP_TP_WIDE: QUARANTINE new paper admission");
     expect(brief).toContain("quarantine CG_WIDE_STOP_TP_WIDE");
     expect(brief).not.toContain("CG_WIDE_STOP_TP_WIDE: wait OOS confirmation");
+  });
+
+  // [15] Section 4's per-variant rows surface the dev/holdout evidence split (devN/devEffectiveN/
+  // holdoutN/holdoutEffectiveN) — not just aggregate freshValid/net/PF. Uses 100 fresh, unique-symbol
+  // signals so a holdout cut freezes (>= HOLDOUT_CUT_MIN_FRESH=20) at floor(100*0.7)=70 dev rows,
+  // leaving 30 holdout rows — >= HOLDOUT_MIN_FRESH=30, so the split is real and non-trivial on both
+  // sides (devN=70, holdoutN=30), not a degenerate 0/N case.
+  it("[15] brief surfaces devN/devEffectiveN/holdoutN/holdoutEffectiveN for CG_WIDE_STOP_TP_WIDE", async () => {
+    const dir = tmpDir();
+    const vmStore = new CurrentGuardVariantMatrixStore(dir);
+    const recentBase = Date.now() - 8 * 60_000;
+    const signals: VariantMatrixSignal[] = Array.from({ length: 100 }, (_, i) => ({
+      sourceSignalId: `dh-sig-${i}`,
+      symbol: `DH${String(i).padStart(3, "0")}USDT`,
+      direction: "LONG" as const,
+      entryPrice: 100,
+      stopLoss: 98,
+      tp1: 104,
+      tp2: null,
+      tp3: null,
+      stopDistanceBps: 200,
+      regime: "BULLISH_EXPANSION",
+      entryVariant: "base_current_entry",
+      openedAt: new Date(recentBase + i * 5_000).toISOString(),
+      closedAt: null,
+    }));
+
+    const flexWinningBinance = {
+      getKlines: async (
+        _symbol: string,
+        interval: string,
+        opts: { startTime: number; endTime: number; limit: number },
+      ): Promise<KlineTuple[]> => {
+        if (interval === "1m") return [];
+        const signalOpenMs = opts.startTime + 300_000;
+        return [
+          candle(signalOpenMs - 300_000, 100.2, 99.9, 100),
+          candle(signalOpenMs, 104.5, 100.1, 104), // TP hit, no SL
+          candle(signalOpenMs + 300_000, 105, 103, 104.5),
+        ];
+      },
+    };
+
+    mirrorVariantMatrixSignals(signals, vmStore, new Date().toISOString());
+    await resolveVariantMatrixObservations(vmStore, flexWinningBinance);
+    const vm = buildCurrentGuardVariantMatrixReport(vmStore, { capturedAt: new Date().toISOString() });
+
+    const wideRow = vm.rows.find((r) => r.variantId === "CG_WIDE_STOP_TP_WIDE");
+    expect(wideRow).toBeDefined();
+    // Sanity: dev and holdout sides are genuinely distinct evidence, neither degenerate.
+    expect(wideRow!.devN).toBe(70);
+    expect(wideRow!.holdoutN).toBe(30);
+    expect(wideRow!.devN).not.toBe(wideRow!.holdoutN);
+    expect(wideRow!.devEffectiveN).toBeGreaterThan(0);
+    expect(wideRow!.holdoutEffectiveN).toBeGreaterThan(0);
+
+    const brief = buildOperatorBrief(makeInputs({ variantMatrixReport: vm }));
+
+    // The brief must genuinely surface the row's own dev/holdout numbers, not placeholder text.
+    expect(brief).toContain(
+      `dev n=${wideRow!.devN} (effN=${wideRow!.devEffectiveN})  holdout n=${wideRow!.holdoutN} (effN=${wideRow!.holdoutEffectiveN})`,
+    );
+    expect(brief).toContain("dev n=70");
+    expect(brief).toContain("holdout n=30");
+
+    const lines = brief.split("\n").length;
+    expect(lines).toBeLessThanOrEqual(OPERATOR_BRIEF_MAX_LINES);
   });
 
   it("[14] renders compact scan timing line in section 1", () => {

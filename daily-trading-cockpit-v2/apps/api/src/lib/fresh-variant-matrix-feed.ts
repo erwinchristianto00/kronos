@@ -40,6 +40,11 @@ export interface FreshVariantMatrixFeedInputs {
   crowdingBySymbol?: Record<string, string | null>;
   now: string; // ISO
   maxPerCycle?: number;
+  /** Shared-origin scan-cycle identity (the scan service's own generatedAt). Every candidate created
+   *  from the SAME call is one market episode — this is threaded onto every signal in the batch so
+   *  computeEffectiveN can count them as one independent draw instead of one-per-symbol. Optional;
+   *  omitted falls through to the deterministic time-block fallback. */
+  scanBatchId?: string | null;
 }
 
 export interface FreshVariantMatrixFeedResult {
@@ -218,6 +223,7 @@ export function runFreshVariantMatrixFeed(
       posture,
       regimeDirection,
       crowdingState: inputs.crowdingBySymbol?.[c.symbol] ?? null,
+      scanBatchId: inputs.scanBatchId ?? null,
     };
     const observations = buildVariantMatrixObservationsForSignal(signal, inputs.now);
     store.addMany(observations);

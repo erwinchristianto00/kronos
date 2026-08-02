@@ -81,13 +81,16 @@ function routerOf(regime: string | null) {
   });
 }
 
-/** Build a VM store with 60 winning SHORT signals so CG_WIDE_STOP_TP_WIDE row passes economics gates. */
+/** Build a VM store with 80 winning SHORT signals so CG_WIDE_STOP_TP_WIDE row passes economics gates. */
 async function buildWinningVmStore(dir: string): Promise<CurrentGuardVariantMatrixStore> {
   const vmStore = new CurrentGuardVariantMatrixStore(dir);
   // Entries must be FRESH at creation: isFreshValid = (now − openedAt) ≤ FRESH_ENTRY_MAX_MINUTES (10).
-  // Pack all 60 within the last ~5 min so every obs is fresh-valid and clears the economics sample gate.
-  const recentBase = Date.now() - 5 * 60_000;
-  const signals: VariantMatrixSignal[] = Array.from({ length: 60 }, (_, i) => ({
+  // Pack all 80 within the last ~7 min so every obs is fresh-valid and clears the economics sample gate.
+  // Point 4b (current-guard-variant-matrix): once a holdout cut freezes (>= HOLDOUT_CUT_MIN_FRESH=20),
+  // freshValid is dev-only (pre-cut) — floor(count*HOLDOUT_DEV_FRACTION). 80, not 60: floor(80*0.7)=56
+  // clears the [10]/[17] assertion's freshValid>=50 bar; the old 60 only reached floor(60*0.7)=42.
+  const recentBase = Date.now() - 7 * 60_000;
+  const signals: VariantMatrixSignal[] = Array.from({ length: 80 }, (_, i) => ({
     sourceSignalId: `sig-${i}`,
     symbol: `SYM${String(i).padStart(3, "0")}USDT`,
     direction: "SHORT" as const,

@@ -29,6 +29,8 @@ import {
   WIDE_STOP_MIN_BPS,
   WATCHABLE_MIN_FRESH,
   STABLE_MIN_FRESH,
+  STABLE_MIN_DISTINCT_SYMBOLS,
+  PROMOTION_MIN_DISTINCT_SYMBOLS,
   PRODUCTION_BREAKEVEN_CONTROL_COST_PCT,
   type VariantMatrixSignal,
   type VariantMatrixVariantDefinition,
@@ -107,6 +109,15 @@ function addResolvedContextCohort(
      *  colliding with a first cohort's timestamps. */
     baseOpenedAtMs?: number;
     baseResolvedAtMs?: number;
+    /** Point 3c: per-index symbol override. Defaults to the existing `CTX${index % 5}USDT` rotation
+     *  (unchanged) so every pre-existing fixture keeps its symbol shape. Lets a test build cohorts
+     *  with genuinely many distinct symbols (diversity/adversarial episode tests) or genuinely few
+     *  (diversity-gate-fail tests). */
+    symbolFor?: (index: number) => string;
+    /** Point 3c: per-index shared-origin scan/episode identity. Defaults to `undefined` (no batch id
+     *  → computeEffectiveN falls through to the deterministic time-block grouping). Lets a test prove
+     *  the batch-id grouping path directly, independent of time spacing. */
+    scanBatchIdFor?: (index: number) => string | null;
   },
 ): void {
   const spacingMs = (options.spacingDays ?? 1) * 24 * 60 * 60 * 1000;
@@ -115,10 +126,11 @@ function addResolvedContextCohort(
   const observations = Array.from({ length: options.count }, (_, index) => {
     const base = buildVariantMatrixObservationsForSignal(makeSignal({
       sourceSignalId: `${options.prefix}-${index}`,
-      symbol: `CTX${index % 5}USDT`,
+      symbol: options.symbolFor ? options.symbolFor(index) : `CTX${index % 5}USDT`,
       direction: options.direction,
       regime: options.regimeFor ? options.regimeFor(index) : options.regime,
       openedAt: new Date(baseOpenedAtMs + index * spacingMs).toISOString(),
+      scanBatchId: options.scanBatchIdFor ? options.scanBatchIdFor(index) : undefined,
       ...(options.legacy
         ? {}
         : { posture: "TACTICAL" as const, regimeDirection: options.direction }),
@@ -637,7 +649,7 @@ describe("current-guard-variant-matrix", () => {
       payoffRatio: 0.4, breakEvenWR: 1 / 3, actualWR: 0.8, avgCostR: 0.1, costDragR: 0.1,
       noFillRate: 0, expiredRate: 0, avgHoldingMinutes: 60, approxMaxDrawdownR: 1, maxAdverseStreak: 1,
       topSymbolPnlShare: 0.2, plus10bpsNetAvgR: 0.1, plus10bpsStillPositive: true,
-      calendarDays: 6, distinctRegimes: 2, byRegime: [], byEntryVariant: [], oosThirds: null,
+      calendarDays: 6, distinctRegimes: 2, distinctSymbolCount: 5, byRegime: [], byEntryVariant: [], oosThirds: null,
       allThreeOosPositive: true, rolling: [],
       // Point 4: this test isolates the payoff-floor gate, not the holdout gate — give it a
       // passing holdout so it reaches STABLE on payoff alone, same as before Point 4 existed.
@@ -662,7 +674,7 @@ describe("current-guard-variant-matrix", () => {
       payoffRatio: 0.4, breakEvenWR: 1 / 3, actualWR: 0.8, avgCostR: 0.1, costDragR: 0.1,
       noFillRate: 0, expiredRate: 0, avgHoldingMinutes: 60, approxMaxDrawdownR: 7.76, maxAdverseStreak: 1,
       topSymbolPnlShare: 0.18, plus10bpsNetAvgR: 0.1, plus10bpsStillPositive: true,
-      calendarDays: 3, distinctRegimes: 3, byRegime: [], byEntryVariant: [], oosThirds: null,
+      calendarDays: 3, distinctRegimes: 3, distinctSymbolCount: 5, byRegime: [], byEntryVariant: [], oosThirds: null,
       allThreeOosPositive: true, rolling: [],
       // Point 4: this test isolates the drawdown gate, not the holdout gate — give it a passing
       // holdout so it reaches STABLE on drawdown alone, same as before Point 4 existed.
@@ -805,9 +817,16 @@ describe("current-guard-variant-matrix", () => {
         variantId: "CG_WIDE_STOP_TP_WIDE",
         direction: "LONG",
         regime: "Bullish expansion",
-        count: 100,
+        // Point 4b: 143, not 100 — once a holdout cut freezes (>= HOLDOUT_CUT_MIN_FRESH=20),
+        // freshValid/effectiveN are dev-only (pre-cut). floor(143*HOLDOUT_DEV_FRACTION)=100 keeps
+        // this context's dev-side effectiveN at exactly STABLE_MIN_FRESH (100) with a comfortably
+        // sufficient 43-row holdout, so it still reaches STABLE_CANDIDATE post-fix.
+        count: 143,
         netR: (index) => index % 5 === 0 ? -0.5 : 1,
         prefix: "lb",
+        // Point 3c: spacingDays:4 (> this variant's 3-day/72h block width) keeps every row an
+        // independent time-block draw under the new block-only key, same as [3C-PASS].
+        spacingDays: 4,
       });
       addResolvedContextCohort(store, {
         variantId: "CG_WIDE_STOP_TP_WIDE",
@@ -816,6 +835,7 @@ describe("current-guard-variant-matrix", () => {
         count: 100,
         netR: () => -1,
         prefix: "sb",
+        spacingDays: 4,
       });
       return buildCurrentGuardVariantMatrixReport(store);
     }
@@ -906,8 +926,13 @@ describe("current-guard-variant-matrix", () => {
     it("[CTX-10] keeps aggregate accounting intact as a diagnostic-only population", () => {
       const report = splitEvidenceReport();
       const row = report.rows.find((candidate) => candidate.variantId === "CG_WIDE_STOP_TP_WIDE")!;
-      expect(row.freshValid).toBe(200);
-      expect(row.contextRows!.LONG_BULLISH!.freshValid + row.contextRows!.SHORT_BEARISH!.freshValid).toBe(200);
+      // Point 4b: the aggregate row is itself dev-scoped once its OWN (`__aggregate__`-keyed) cut
+      // freezes — 243 total fresh rows (143 LONG_BULLISH + 100 SHORT_BEARISH) → floor(243*0.7)=170.
+      // This is still a diagnostic-only population count (not a proof gate); the invariant under
+      // test — aggregate accounting stays internally consistent — now reads on `devN`/`170` instead
+      // of the raw 200/243, which is why devN is asserted directly rather than re-deriving 170 by hand.
+      expect(row.freshValid).toBe(row.devN);
+      expect(row.contextRows!.LONG_BULLISH!.freshValid + row.contextRows!.SHORT_BEARISH!.freshValid).toBe(170);
       expect(row.aggregateDiagnosticStatus).toBe(row.status);
       expect(row.aggregateDiagnosticStatusReason).toBe(row.statusReason);
     });
@@ -939,7 +964,9 @@ describe("current-guard-variant-matrix", () => {
       });
       const row = buildCurrentGuardVariantMatrixReport(store).rows
         .find((candidate) => candidate.variantId === "CG_WIDE_STOP_TP_WIDE")!;
-      expect(row.freshValid).toBe(30);
+      // Point 4b: count=30 clears HOLDOUT_CUT_MIN_FRESH(20), so the aggregate's own cut freezes and
+      // freshValid becomes dev-only: floor(30*0.7)=21, not the raw 30.
+      expect(row.freshValid).toBe(21);
       expect(row.contextRows!.LONG_BULLISH!.freshValid).toBe(0);
       expect(row.contextRows!.LONG_MIXED!.freshValid).toBe(0);
     });
@@ -980,10 +1007,14 @@ describe("current-guard-variant-matrix", () => {
         variantId: "CG_WIDE_STOP_TP_WIDE",
         direction: "LONG",
         regime: "Bullish expansion",
-        count: 100,
+        // Point 4b: 143, not 100 — see splitEvidenceReport's comment; floor(143*0.7)=100 keeps
+        // dev-side effectiveN at exactly STABLE_MIN_FRESH post-fix.
+        count: 143,
         netR: bullishNetR,
         prefix: "fresh",
         isFreshValid: true,
+        // Point 3c: keep every row independent under the new block-only key (see [3C-PASS]).
+        spacingDays: 4,
       });
       const row = buildCurrentGuardVariantMatrixReport(store).rows.find((c) => c.variantId === "CG_WIDE_STOP_TP_WIDE")!;
       expect(row.contextRows!.LONG_BULLISH!.freshValid).toBe(100);
@@ -996,7 +1027,10 @@ describe("current-guard-variant-matrix", () => {
         variantId: "CG_WIDE_STOP_TP_WIDE",
         direction: "LONG",
         regime: "Bullish expansion",
-        count: 100,
+        // Point 4b: 143, not 100 — the aggregate row's OWN cut freezes once fresh clears
+        // HOLDOUT_CUT_MIN_FRESH(20); floor(143*0.7)=100 keeps the round-number assertion below
+        // meaningful post-fix instead of silently becoming a dev-scoped 70.
+        count: 143,
         netR: bullishNetR,
         prefix: "legacy",
         legacy: true,
@@ -1018,10 +1052,13 @@ describe("current-guard-variant-matrix", () => {
         variantId: "CG_WIDE_STOP_TP_WIDE",
         direction: "LONG",
         regime: "Bullish expansion",
-        count: 100,
+        // Point 4b: 143, not 100 — see [3A-PASS]'s comment.
+        count: 143,
         netR: bullishNetR,
         prefix: "stamped",
         // legacy left unset -> default axis stamp applied
+        // Point 3c: keep every row independent under the new block-only key (see [3C-PASS]).
+        spacingDays: 4,
       });
       const row = buildCurrentGuardVariantMatrixReport(store).rows.find((c) => c.variantId === "CG_WIDE_STOP_TP_WIDE")!;
       expect(row.contextRows!.LONG_BULLISH!.status).toBe("STABLE_CANDIDATE");
@@ -1033,16 +1070,26 @@ describe("current-guard-variant-matrix", () => {
         variantId: "CG_WIDE_STOP_TP_WIDE",
         direction: "LONG",
         regime: "Bullish expansion",
-        count: 100,
+        // Point 4b: 143, not 100 — see [3A-PASS]'s comment; floor(143*0.7)=100 keeps the dev-scoped
+        // freshValid assertion below meaningful post-fix.
+        count: 143,
         netR: bullishNetR,
         prefix: "clustered",
-        spacingDays: 0, // all 100 share the same instant -> one time block per symbol
+        // Point 4b: exactly-tied timestamps (spacingDays:0) make EVERY row's resolvedMs equal the
+        // frozen cutMs, so the holdout's `>= cutMs` filter would swallow the WHOLE population and
+        // devFresh would collapse to 0 — a spacingDays:0 artifact of the cut mechanism, not the
+        // effectiveN behavior this test exists to isolate. A tiny nonzero spacing (43.2s apart, ~1h43m
+        // total span for 143 rows) keeps every row's timestamp DISTINCT for chronological/cut
+        // purposes while staying far inside this variant's 72h block width, so every row still lands
+        // in the SAME time block for effectiveN.
+        spacingDays: 0.0005,
       });
       const row = buildCurrentGuardVariantMatrixReport(store).rows.find((c) => c.variantId === "CG_WIDE_STOP_TP_WIDE")!;
       const ctx = row.contextRows!.LONG_BULLISH!;
-      expect(ctx.freshValid).toBe(100); // raw count alone would clear STABLE_MIN_FRESH
-      // Only 5 independent (symbol, time-block) draws exist (5 rotating symbols, 1 shared instant).
-      expect(ctx.effectiveN).toBe(5);
+      expect(ctx.freshValid).toBe(100); // dev-scoped count alone would clear STABLE_MIN_FRESH
+      // Point 3c fix: symbol is NEVER crossed into the block key — 5 symbols sharing one instant is
+      // ONE independent market draw, not 5. (Prior, backwards behavior crossed symbol in and read 5.)
+      expect(ctx.effectiveN).toBe(1);
       expect(ctx.effectiveN).toBeLessThan(STABLE_MIN_FRESH);
       expect(ctx.status).not.toBe("STABLE_CANDIDATE");
       expect(ctx.status).toBe("WATCHABLE");
@@ -1055,16 +1102,169 @@ describe("current-guard-variant-matrix", () => {
         variantId: "CG_WIDE_STOP_TP_WIDE",
         direction: "LONG",
         regime: "Bullish expansion",
-        count: 100,
+        // Point 4b: 143, not 100 — see [3A-PASS]'s comment; floor(143*0.7)=100 dev-side rows, each
+        // still its own independent block thanks to spacingDays:4.
+        count: 143,
         netR: bullishNetR,
         prefix: "diverse",
-        // default spacingDays=1: each of the 5 rotating symbols' successive rows land 5 days apart,
-        // well beyond this variant's ~3-day (72h) max-hold block width -> all 100 are independent.
+        // spacingDays=4: with the NEW block-only key (no scanBatchId), 4 days > this variant's 3-day
+        // (72h) max-hold block width guarantees every successive row lands in a strictly later block
+        // regardless of symbol -> all dev-side rows are independent draws.
+        spacingDays: 4,
       });
       const row = buildCurrentGuardVariantMatrixReport(store).rows.find((c) => c.variantId === "CG_WIDE_STOP_TP_WIDE")!;
       const ctx = row.contextRows!.LONG_BULLISH!;
       expect(ctx.effectiveN).toBe(100);
       expect(ctx.status).toBe("STABLE_CANDIDATE");
+    });
+
+    it("[3C-EPISODE] adversarial: 100 DISTINCT symbols all firing off ONE shared instant (no scanBatchId) must NOT produce effectiveN=100 — it collapses toward 1 independent market draw", () => {
+      const store = new CurrentGuardVariantMatrixStore(tmpDir());
+      addResolvedContextCohort(store, {
+        variantId: "CG_WIDE_STOP_TP_WIDE",
+        direction: "LONG",
+        regime: "Bullish expansion",
+        // Point 4b: 143, not 100 — see [3C-FAIL]'s comment; floor(143*0.7)=100 dev-side rows, still
+        // 100 genuinely distinct symbols (symbolFor is 1:1 with index, and dev takes the
+        // chronologically-first 100 of 143).
+        count: 143,
+        netR: bullishNetR,
+        prefix: "episode",
+        symbolFor: (index) => `SYM${index}USDT`, // genuinely distinct symbols
+        // Point 4b: near-tied (not exactly-tied) spacing — see [3C-FAIL]'s comment for why exact ties
+        // (spacingDays:0) would collapse devFresh to 0 under the holdout cut's `>= cutMs` filter.
+        spacingDays: 0.0005,
+      });
+      const row = buildCurrentGuardVariantMatrixReport(store).rows.find((c) => c.variantId === "CG_WIDE_STOP_TP_WIDE")!;
+      const ctx = row.contextRows!.LONG_BULLISH!;
+      expect(ctx.freshValid).toBe(100);
+      // Symbol diversity is real and reported separately...
+      expect(ctx.distinctSymbolCount).toBe(100);
+      // ...but it must never be conflated with independence: one shared instant is ONE market episode,
+      // so effectiveN collapses to 1 — the exact backwards behavior the operator flagged (100 symbols
+      // in one block used to read effectiveN=100).
+      expect(ctx.effectiveN).toBe(1);
+      expect(ctx.effectiveN).not.toBe(100);
+    });
+
+    it("[3C-BATCH] a real scanBatchId takes priority over time-blocking — one shared batch across many days still collapses to effectiveN=1", () => {
+      const store = new CurrentGuardVariantMatrixStore(tmpDir());
+      addResolvedContextCohort(store, {
+        variantId: "CG_WIDE_STOP_TP_WIDE",
+        direction: "LONG",
+        regime: "Bullish expansion",
+        count: 100,
+        netR: bullishNetR,
+        prefix: "batch",
+        scanBatchIdFor: () => "batch-x", // one shared real batch id for every row
+        // default spacingDays=1 spreads rows over many days/blocks by TIME alone -> proves the batch
+        // key, not the block fallback, is what's actually grouping these.
+      });
+      const row = buildCurrentGuardVariantMatrixReport(store).rows.find((c) => c.variantId === "CG_WIDE_STOP_TP_WIDE")!;
+      const ctx = row.contextRows!.LONG_BULLISH!;
+      expect(ctx.effectiveN).toBe(1);
+    });
+
+    it("[3C-MIXED] scanBatchId and time-block grouping coexist per-row without cross-contamination", () => {
+      const store = new CurrentGuardVariantMatrixStore(tmpDir());
+      addResolvedContextCohort(store, {
+        variantId: "CG_WIDE_STOP_TP_WIDE",
+        direction: "LONG",
+        regime: "Bullish expansion",
+        count: 100,
+        netR: bullishNetR,
+        prefix: "mixed",
+        // Half the rows share one real batch id (-> collapse to 1 group); the other half carry no
+        // batch id and rely on the time-block fallback, spaced (spacingDays:4 > the 3-day block width)
+        // so each of the 50 lands in its OWN distinct block.
+        scanBatchIdFor: (index) => (index % 2 === 0 ? "batch-y" : null),
+        spacingDays: 4,
+      });
+      const row = buildCurrentGuardVariantMatrixReport(store).rows.find((c) => c.variantId === "CG_WIDE_STOP_TP_WIDE")!;
+      const ctx = row.contextRows!.LONG_BULLISH!;
+      // Point 4b: count=100 clears HOLDOUT_CUT_MIN_FRESH(20), so this context's own cut freezes and
+      // effectiveN is recomputed over devFresh only (the chronologically-first floor(100*0.7)=70
+      // rows, indices 0..69) — not the full 100. Within that dev slice, index%2===0 still splits it
+      // evenly: 35 rows share "batch-y" (1 group) + 35 rows fall through to individually-distinct
+      // time blocks (spacingDays:4 keeps each one separate) = 1 + 35 = 36.
+      expect(ctx.effectiveN).toBe(36);
+    });
+
+    // NOTE on isolation: topSymbolPnlShare (the pre-existing concentration gate) is computed as
+    // max(|netR| per symbol) / total(|netR|). With ONLY 1-2 distinct symbols in an evenly-weighted
+    // cohort that value is mathematically bounded BELOW by 1/(distinct symbol count) — 1.0 for one
+    // symbol, >=0.5 for two — both already > MAX_TOP_SYMBOL_SHARE (0.4), so a synthetic 1-2-symbol
+    // cohort built through addResolvedContextCohort would ALSO trip the concentration gate and never
+    // even reach the WATCHABLE branch where the new distinctSymbolCount blocker is surfaced. That
+    // coupling is real and desirable (the concentration gate already incidentally guards against
+    // 1-2 symbol abuse at the STABLE tier) but it means isolating distinctSymbolCount as its OWN,
+    // independently-failing gate needs topSymbolPnlShare held fixed at a passing value — done here via
+    // a literal evidence row (same pattern as [PROMO]/[DDBLK]/[DIVERSITY-PROMOTION] above), not a
+    // synthetic store cohort.
+    it("[DIVERSITY-FAIL] distinctSymbolCount below STABLE_MIN_DISTINCT_SYMBOLS blocks STABLE_CANDIDATE even when every other gate (including concentration) independently passes", () => {
+      const row = {
+        variantId: "CG_WIDE_FAST_SHORT", label: "x", exitRule: "tp1_full", fillMode: "taker", costModel: "taker",
+        total: 130, open: 0, resolved: 130, freshValid: 110, effectiveN: 110, rejected: 0, noFill: 0, expired: 0, dataFailure: 0,
+        netAvgR: 0.15, grossAvgR: 0.2, pf: 1.8, wr: 0.8, avgWinR: 0.4, avgLossR: -1,
+        payoffRatio: 0.4, breakEvenWR: 1 / 3, actualWR: 0.8, avgCostR: 0.1, costDragR: 0.1,
+        noFillRate: 0, expiredRate: 0, avgHoldingMinutes: 60, approxMaxDrawdownR: 1, maxAdverseStreak: 1,
+        topSymbolPnlShare: 0.2, plus10bpsNetAvgR: 0.1, plus10bpsStillPositive: true,
+        calendarDays: 6, distinctRegimes: 2, distinctSymbolCount: STABLE_MIN_DISTINCT_SYMBOLS - 1, // below the floor
+        byRegime: [], byEntryVariant: [], oosThirds: null,
+        allThreeOosPositive: true, rolling: [],
+        holdoutFreshValid: 30, holdoutSufficient: true, holdoutNegative: false,
+      } as Parameters<typeof deriveVariantStatus>[0];
+      const infra = { killSwitchReady: false, orderReconciliationReady: false, exchangeHealthReady: false };
+      const result = deriveVariantStatus(row, infra);
+      expect(result.status).not.toBe("STABLE_CANDIDATE");
+      expect(result.status).not.toBe("PROMOTION_CANDIDATE");
+      expect(result.status).toBe("WATCHABLE");
+      expect(result.blockers.some((b) => b.toLowerCase().includes("distinctsymbolcount"))).toBe(true);
+      // Same row with enough distinct symbols reaches STABLE_CANDIDATE — proves the gate, not
+      // something else, is what was blocking it.
+      const passing = deriveVariantStatus({ ...row, distinctSymbolCount: STABLE_MIN_DISTINCT_SYMBOLS }, infra);
+      expect(passing.status).toBe("STABLE_CANDIDATE");
+    });
+
+    it("[DIVERSITY-PASS] the identical shape with enough distinct symbols reaches STABLE_CANDIDATE", () => {
+      const store = new CurrentGuardVariantMatrixStore(tmpDir());
+      addResolvedContextCohort(store, {
+        variantId: "CG_WIDE_STOP_TP_WIDE",
+        direction: "LONG",
+        regime: "Bullish expansion",
+        // Point 4b: 143, not 100 — see [3A-PASS]'s comment; floor(143*0.7)=100 dev-side rows clears
+        // STABLE_MIN_FRESH for effectiveN.
+        count: 143,
+        netR: bullishNetR,
+        prefix: "highdiv",
+        symbolFor: (index) => `SYM${index % STABLE_MIN_DISTINCT_SYMBOLS}USDT`,
+        spacingDays: 4,
+      });
+      const row = buildCurrentGuardVariantMatrixReport(store).rows.find((c) => c.variantId === "CG_WIDE_STOP_TP_WIDE")!;
+      const ctx = row.contextRows!.LONG_BULLISH!;
+      expect(ctx.distinctSymbolCount).toBeGreaterThanOrEqual(STABLE_MIN_DISTINCT_SYMBOLS);
+      expect(ctx.status).toBe("STABLE_CANDIDATE");
+    });
+
+    it("[DIVERSITY-PROMOTION] distinctSymbolCount gates PROMOTION_CANDIDATE with its OWN, higher floor — independent from STABLE's floor", () => {
+      const row = {
+        variantId: "CG_WIDE_FAST_SHORT", label: "x", exitRule: "tp1_full", fillMode: "taker", costModel: "taker",
+        total: 260, open: 0, resolved: 260, freshValid: 220, effectiveN: 220, rejected: 0, noFill: 0, expired: 0, dataFailure: 0,
+        netAvgR: 0.15, grossAvgR: 0.2, pf: 1.8, wr: 0.8, avgWinR: 0.4, avgLossR: -1,
+        payoffRatio: 0.4, breakEvenWR: 1 / 3, actualWR: 0.8, avgCostR: 0.1, costDragR: 0.1,
+        noFillRate: 0, expiredRate: 0, avgHoldingMinutes: 60, approxMaxDrawdownR: 1, maxAdverseStreak: 1,
+        topSymbolPnlShare: 0.2, plus10bpsNetAvgR: 0.1, plus10bpsStillPositive: true,
+        calendarDays: 10, distinctRegimes: 3, distinctSymbolCount: STABLE_MIN_DISTINCT_SYMBOLS, // clears STABLE's floor (3), not PROMOTION's (5)
+        byRegime: [], byEntryVariant: [], oosThirds: null,
+        allThreeOosPositive: true, rolling: [],
+        holdoutFreshValid: 30, holdoutSufficient: true, holdoutNegative: false,
+      } as Parameters<typeof deriveVariantStatus>[0];
+      const infra = { killSwitchReady: true, orderReconciliationReady: true, exchangeHealthReady: true };
+      const belowPromotionFloor = deriveVariantStatus(row, infra);
+      expect(belowPromotionFloor.status).toBe("STABLE_CANDIDATE");
+      expect(belowPromotionFloor.blockers.some((b) => b.toLowerCase().includes("distinctsymbolcount"))).toBe(true);
+      const atPromotionFloor = deriveVariantStatus({ ...row, distinctSymbolCount: PROMOTION_MIN_DISTINCT_SYMBOLS }, infra);
+      expect(atPromotionFloor.status).toBe("PROMOTION_CANDIDATE");
     });
 
     it("[3D-FAIL] chronological label drift within the SAME regime family counts as ONE episode, not several", () => {
@@ -1112,25 +1312,38 @@ describe("current-guard-variant-matrix", () => {
         variantId: "CG_WIDE_STOP_TP_WIDE",
         direction: "LONG",
         regime: "Bullish expansion",
-        count: 100,
-        // First 70 (development side, once the cut freezes at 0.70) are strong winners; the last
-        // 30 (holdout side) are uniform small losers. Every OTHER gate (net/pf/payoff/drawdown/
-        // effectiveN/all-three-OOS-thirds) still clears comfortably on the FULL population — this
-        // isolates the holdout gate as the ONLY thing standing between this lane and STABLE.
-        netR: (index) => (index < 70 ? 2 : -0.1),
+        // Point 4b: 143, not 100 — once dev/holdout metrics are TRULY separated (never leaking
+        // holdout rows into development economics), reaching STABLE_MIN_FRESH(100) on the dev side
+        // alone needs floor(count*HOLDOUT_DEV_FRACTION) >= 100, i.e. count >= 143. The dev/holdout
+        // boundary at n=143 is index 100 (floor(143*0.7)=100 dev rows, 43 holdout rows — comfortably
+        // above HOLDOUT_MIN_FRESH=30).
+        count: 143,
+        // Development side (first 100, once the cut freezes at 0.70): strong winners with real,
+        // periodic losers so PF/payoff are genuinely well-defined ON THE DEV SLICE ALONE (dev-only
+        // scoping means a dev side of uniform winners would leave PF undefined — see the sibling
+        // [4-PASS] case for the same shape). Holdout side (last 43): uniform small losers. Every
+        // OTHER gate (net/pf/payoff/drawdown/effectiveN/all-three-OOS-thirds) still clears
+        // comfortably on the DEV-ONLY population — this isolates the holdout gate as the ONLY thing
+        // standing between this lane and STABLE.
+        netR: (index) => (index < 100 ? (index % 5 === 0 ? -0.5 : 2) : -0.1),
         prefix: "holdout-neg",
+        // Point 3c: keep every row independent under the new block-only key (see [3C-PASS]).
+        spacingDays: 4,
       });
       const row = buildCurrentGuardVariantMatrixReport(store).rows.find((c) => c.variantId === "CG_WIDE_STOP_TP_WIDE")!;
       const ctx = row.contextRows!.LONG_BULLISH!;
-      // Every non-holdout STABLE gate genuinely clears — proves this isn't accidentally blocked by
-      // something else (effectiveN, OOS thirds, net/pf/payoff/drawdown all pass).
+      // Every non-holdout STABLE gate genuinely clears on the DEV-ONLY population — proves this
+      // isn't accidentally blocked by something else (effectiveN, OOS thirds, net/pf all pass).
       expect(ctx.effectiveN).toBeGreaterThanOrEqual(100);
+      expect(ctx.devN).toBe(100);
+      expect(ctx.devEffectiveN).toBeGreaterThanOrEqual(100);
       expect(ctx.allThreeOosPositive).toBe(true);
       expect(ctx.netAvgR).toBeGreaterThan(0);
       expect(ctx.pf).toBeGreaterThan(1.2);
       // The holdout itself is genuinely sufficient in size — so this is NEGATIVITY blocking it, not
       // insufficiency (that's the separate [4-INSUFFICIENT] case below).
       expect(ctx.holdoutFreshValid).toBeGreaterThanOrEqual(30);
+      expect(ctx.holdoutN).toBe(ctx.holdoutFreshValid);
       expect(ctx.holdoutSufficient).toBe(true);
       expect(ctx.holdoutNegative).toBe(true);
       expect(ctx.status).not.toBe("STABLE_CANDIDATE");
@@ -1144,15 +1357,19 @@ describe("current-guard-variant-matrix", () => {
         variantId: "CG_WIDE_STOP_TP_WIDE",
         direction: "LONG",
         regime: "Bullish expansion",
-        count: 100,
-        // Development side (first 70): strong winners with real, periodic losers (so the FULL
-        // population has a well-defined PF, matching every other proven-positive fixture in this
-        // suite). Holdout side (last 30): also genuinely profitable, no losers at all.
-        netR: (index) => (index < 70 ? (index % 5 === 0 ? -0.5 : 2) : 0.5),
+        // Point 4b: 143, not 100 — see [4-FAIL]'s comment for the n=143 -> 100 dev / 43 holdout math.
+        count: 143,
+        // Development side (first 100): strong winners with real, periodic losers (so the dev-only
+        // slice has a well-defined PF, matching every other proven-positive fixture in this suite).
+        // Holdout side (last 43): also genuinely profitable, no losers at all.
+        netR: (index) => (index < 100 ? (index % 5 === 0 ? -0.5 : 2) : 0.5),
         prefix: "holdout-pos",
+        // Point 3c: keep every row independent under the new block-only key (see [3C-PASS]).
+        spacingDays: 4,
       });
       const row = buildCurrentGuardVariantMatrixReport(store).rows.find((c) => c.variantId === "CG_WIDE_STOP_TP_WIDE")!;
       const ctx = row.contextRows!.LONG_BULLISH!;
+      expect(ctx.devN).toBe(100);
       expect(ctx.holdoutSufficient).toBe(true);
       expect(ctx.holdoutNegative).toBe(false);
       expect(ctx.holdoutNetAvgR).toBeGreaterThan(0);
@@ -1171,6 +1388,8 @@ describe("current-guard-variant-matrix", () => {
         count: 20,
         netR: (index) => (index % 5 === 0 ? -0.5 : 1),
         prefix: "first-cohort",
+        // Point 3c: keep every row independent under the new block-only key (see [3C-PASS]).
+        spacingDays: 4,
       });
       const firstReport = buildCurrentGuardVariantMatrixReport(store);
       const firstCtx = firstReport.rows.find((c) => c.variantId === "CG_WIDE_STOP_TP_WIDE")!.contextRows!.LONG_BULLISH!;
@@ -1193,13 +1412,27 @@ describe("current-guard-variant-matrix", () => {
         prefix: "backfilled",
         baseOpenedAtMs: Date.UTC(2020, 0, 1),
         baseResolvedAtMs: Date.UTC(2020, 0, 1),
+        // Point 3c: keep every row independent under the new block-only key (see [3C-PASS]).
+        spacingDays: 4,
       });
       const secondReport = buildCurrentGuardVariantMatrixReport(store);
       const secondCtx = secondReport.rows.find((c) => c.variantId === "CG_WIDE_STOP_TP_WIDE")!.contextRows!.LONG_BULLISH!;
 
-      // The development-cohort gates now genuinely pass (proves this isn't blocked by anything else):
-      expect(secondCtx.freshValid).toBe(100);
-      expect(secondCtx.effectiveN).toBeGreaterThanOrEqual(100);
+      // Point 4b: freshValid is now dev-only (devFresh, strictly before the frozen cut) — the first
+      // cohort contributes its 14 dev rows (floor(20*0.7)=14) and ALL 80 backfilled rows land before
+      // the frozen cut too (dated 2020, well earlier than the cut), for 14+80=94 dev rows — NOT the
+      // raw 100 (20+80) the population actually contains, because the 6 holdout rows from the first
+      // cohort are correctly excluded from development metrics. Verified by direct computation, not
+      // guessed: this is the specified behavior (regression risk), not a bug to compensate for by
+      // lowering STABLE_MIN_FRESH/PROMOTION_MIN_FRESH/HOLDOUT_DEV_FRACTION.
+      expect(secondCtx.freshValid).toBe(94);
+      expect(secondCtx.devN).toBe(94);
+      // effectiveN is likewise recomputed over the 94 dev-only rows (still each its own independent
+      // block thanks to spacingDays:4 on both cohorts) — genuinely 94, not >=100. The test's actual
+      // point is "the frozen holdout can't grow," proven below; this just pins the honest dev-side
+      // number instead of asserting a round bar this shape no longer clears.
+      expect(secondCtx.effectiveN).toBe(94);
+      expect(secondCtx.devEffectiveN).toBe(94);
       expect(secondCtx.allThreeOosPositive).toBe(true);
       expect(secondCtx.netAvgR).toBeGreaterThan(0);
       expect(secondCtx.pf).toBeGreaterThan(1.2);
@@ -1209,6 +1442,7 @@ describe("current-guard-variant-matrix", () => {
       // grow an already-measured holdout.
       expect(secondCtx.holdoutCutMs).toBe(frozenCutMs);
       expect(secondCtx.holdoutFreshValid).toBe(frozenHoldoutCount);
+      expect(secondCtx.holdoutN).toBe(frozenHoldoutCount);
       expect(secondCtx.holdoutSufficient).toBe(false);
       expect(secondCtx.status).not.toBe("STABLE_CANDIDATE");
       expect(secondCtx.status).not.toBe("PROMOTION_CANDIDATE");
@@ -1223,7 +1457,7 @@ describe("current-guard-variant-matrix", () => {
         payoffRatio: 0.4, breakEvenWR: 1 / 3, actualWR: 0.8, avgCostR: 0.1, costDragR: 0.1,
         noFillRate: 0, expiredRate: 0, avgHoldingMinutes: 60, approxMaxDrawdownR: 1, maxAdverseStreak: 1,
         topSymbolPnlShare: 0.2, plus10bpsNetAvgR: 0.1, plus10bpsStillPositive: true,
-        calendarDays: 10, distinctRegimes: 3, byRegime: [], byEntryVariant: [], oosThirds: null,
+        calendarDays: 10, distinctRegimes: 3, distinctSymbolCount: 5, byRegime: [], byEntryVariant: [], oosThirds: null,
         allThreeOosPositive: true, rolling: [],
         holdoutFreshValid: 10, holdoutSufficient: false, holdoutNegative: false,
       } as Parameters<typeof deriveVariantStatus>[0];
@@ -1234,6 +1468,46 @@ describe("current-guard-variant-matrix", () => {
       expect(insufficient.status).toBe("WATCHABLE");
       const sufficient = deriveVariantStatus({ ...row, holdoutSufficient: true }, infra);
       expect(sufficient.status).toBe("PROMOTION_CANDIDATE");
+    });
+
+    // [4-SYMMETRIC] — the operator explicitly requires BOTH directions of the mutation test.
+    // [4-FAIL] above already proves direction (b): excellent development cannot rescue a genuinely
+    // negative holdout. This proves direction (a): an excellent, sufficient holdout cannot rescue
+    // genuinely bad development-side economics — the mirror image, and the one direction that was
+    // NOT covered before true dev/holdout separation existed (before this fix, holdout rows leaked
+    // into the "development" netAvgR/PF computation, so a strong post-cut holdout could numerically
+    // drag a bad pre-cut population positive and slip through).
+    it("[4-SYMMETRIC] a lane with genuinely bad development-side economics cannot be rescued into STABLE/PROMOTION by an excellent, sufficient holdout", () => {
+      const store = new CurrentGuardVariantMatrixStore(tmpDir());
+      addResolvedContextCohort(store, {
+        variantId: "CG_WIDE_STOP_TP_WIDE",
+        direction: "LONG",
+        regime: "Bullish expansion",
+        // Point 4b: n=143 -> 100 dev rows / 43 holdout rows, same boundary as [4-FAIL]/[4-PASS].
+        count: 143,
+        // Development side (first 100): uniform, genuinely value-destructive losers. Holdout side
+        // (last 43): uniform strong winners — as good as evidence gets, and comfortably sufficient.
+        netR: (index) => (index < 100 ? -0.3 : 2),
+        prefix: "symmetric",
+        // Point 3c: keep every row independent under the new block-only key (see [3C-PASS]).
+        spacingDays: 4,
+      });
+      const row = buildCurrentGuardVariantMatrixReport(store).rows.find((c) => c.variantId === "CG_WIDE_STOP_TP_WIDE")!;
+      const ctx = row.contextRows!.LONG_BULLISH!;
+      // The development side is genuinely bad (proves this isn't blocked by insufficient sample):
+      expect(ctx.devN).toBe(100);
+      expect(ctx.netAvgR).toBeLessThan(0);
+      // The holdout is genuinely excellent and sufficient — proves the holdout side is NOT what's
+      // blocking this lane; only the bad development-side economics are.
+      expect(ctx.holdoutN).toBeGreaterThanOrEqual(30);
+      expect(ctx.holdoutSufficient).toBe(true);
+      expect(ctx.holdoutNegative).toBe(false);
+      expect(ctx.holdoutNetAvgR).toBeGreaterThan(0);
+      // Negative dev-side economics at adequate sample hits deriveVariantStatus's REJECT branch
+      // first, regardless of how good the holdout looks.
+      expect(ctx.status).toBe("REJECT");
+      expect(ctx.status).not.toBe("STABLE_CANDIDATE");
+      expect(ctx.status).not.toBe("PROMOTION_CANDIDATE");
     });
   });
 

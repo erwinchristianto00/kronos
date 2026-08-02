@@ -100,6 +100,15 @@ function eta50(current: number, perDay: number | null | undefined): string {
   if (!perDay || !Number.isFinite(perDay) || perDay <= 0) return "n/a";
   return d2((50 - current) / perDay) + "d";
 }
+/** Development-vs-holdout evidence split line for a variant matrix row. */
+function devHoldoutLine(row: {
+  devN: number;
+  devEffectiveN: number;
+  holdoutN: number;
+  holdoutEffectiveN: number;
+}): string {
+  return `     dev n=${row.devN} (effN=${row.devEffectiveN})  holdout n=${row.holdoutN} (effN=${row.holdoutEffectiveN})`;
+}
 
 // ── dynamic section helpers ──────────────────────────────────────────────────
 
@@ -294,6 +303,7 @@ export function buildOperatorBrief(inputs: OperatorBriefInputs): string {
         `     +10bps=${yn(row.plus10bpsStillPositive)}  OOS+=${yn(row.allThreeOosPositive)}` +
         `  maxDD=${d2(row.approxMaxDrawdownR)}R  status=${row.status}`,
       );
+      L.push(devHoldoutLine(row));
       if (row.blockers.length > 0)
         L.push(`     blockers: ${row.blockers.slice(0, 2).join(" | ")}`);
     }
@@ -325,6 +335,7 @@ export function buildOperatorBrief(inputs: OperatorBriefInputs): string {
             `     +10bps=${yn(selRow.plus10bpsStillPositive)}  OOS+=${yn(selRow.allThreeOosPositive)}` +
             `  maxDD=${d2(selRow.approxMaxDrawdownR)}R  status=${selRow.status}`,
           );
+          L.push(devHoldoutLine(selRow));
         }
       }
     }
