@@ -422,6 +422,9 @@ import {
 import type { FourBrainMetricsSummary } from "../lib/four-brain-metrics.js";
 import type { DirectionEntryOutcomeReport } from "../lib/direction-entry-outcome-store.js";
 import { judgeFourBrainReadiness, rollUpFourBrainReadiness, exitBrainReadinessFromReport } from "../lib/four-brain-readiness.js";
+// Cross-caller mutual exclusion for Surface B (paper admission/resolution) of the 2026-08
+// concurrency remediation — see the module doc comment for the join-semantics contract.
+import { runExclusiveForStore } from "../lib/store-mutation-single-flight.js";
 
 // Fail-open shape for /api/shadow/four-brain's `health` field on any instance where the four-brain
 // metrics aggregator was never constructed (mode off, test harness, etc.) — every count is honestly 0,
@@ -2947,8 +2950,19 @@ export async function registerShadowRoutes(
       let admissionTrace: AdmissionTimingTrace | null = null;
       if (request.query?.paper === "1" && opts.binanceClient && variantMatrixReport) {
         const _pbc = opts.binanceClient;
+        // Cross-caller mutual exclusion (Surface B, 2026-08 concurrency remediation): this
+        // whole block (admitPaperOpportunities followed by runPaperAdmissionAndResolution,
+        // both against the SAME paperStore singleton, plus the post-resolve reconciliation
+        // that reads/writes the same store) is one logical pass against one store, not
+        // independent operations safe to let a second, uncoordinated request interleave with.
+        // paperStore is fetched here, before the lock, so the singleton itself can serve as
+        // the lock's own key (see store-mutation-single-flight.ts). A joining caller's own
+        // local variables (allocatorReport, admissionTrace, paperReport, etc.) are populated
+        // from the joined promise's resolved value right after the lock below, not left at
+        // their pre-block defaults.
+        const paperStore = getPaperExecutionRouterStore();
+        const _paperBlockResult = await runExclusiveForStore(paperStore, async () => {
         try {
-          const paperStore = getPaperExecutionRouterStore();
           const _paperRouter = buildAdaptiveLaneRouterReport({
             generatedAt,
             regimeReport,
@@ -3446,6 +3460,36 @@ export async function registerShadowRoutes(
             } catch { /* mixed router must never break the brief */ }
           } catch { /* reconciliation failure must never break the brief */ }
         } catch { /* paper=1 failure must never break the brief */ }
+        // Carries this pass's outcome back to whichever caller(s) are awaiting
+        // `_paperBlockResult` below — the original caller (whose closure variables above were
+        // just mutated in place) and any joiner alike, so both assign identical values.
+        return {
+          paperReport,
+          allocatorReport,
+          provenanceAudit,
+          shadowGateReport,
+          diagnosticShadowGateReport,
+          latencyDiagnostics,
+          mixedRegimeReport,
+          mixedBudgetForwardValidation,
+          admissionTrace,
+        };
+        });
+        // Populate this request's own local variables from the pass's result — required for a
+        // JOINING caller, whose own callback above never ran (it joined the in-flight promise
+        // instead), and harmless/idempotent for the caller that actually ran the pass (its
+        // closure variables already hold these exact values).
+        ({
+          paperReport,
+          allocatorReport,
+          provenanceAudit,
+          shadowGateReport,
+          diagnosticShadowGateReport,
+          latencyDiagnostics,
+          mixedRegimeReport,
+          mixedBudgetForwardValidation,
+          admissionTrace,
+        } = _paperBlockResult);
       }
       if (request.query?.headless === "1") {
         void reply.type("application/json");

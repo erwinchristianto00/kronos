@@ -369,6 +369,25 @@ export function buildFourBrainJournalContext(
 /**
  * Execution readiness may relax maturity only after the order has an actual canonical proof unit.
  * This is deliberately independent of operator force, rotation, and mainnet override policy.
+ *
+ * 2026-08 remediation (gap #2): `applicable`/`direct`/`evidence !== null` alone are NOT sufficient.
+ * Every context a lane declares applicable gets an evidence row the moment that lane is evaluated
+ * (see the unconditional per-context loop in buildCurrentGuardVariantMatrixReport), so a context
+ * with ZERO real observations, or with observations that are ALL legacy-shaped
+ * (`exactAxisProof !== true`), still produces a non-null `evidence` row. `evidence.freshValid` is
+ * the size of the `fresh` population inside buildContextEvidenceRow, which is filtered on
+ * `exactAxisProof === true` (in addition to isFreshValidObs) before anything is counted — so
+ * `freshValid > 0` is the practical realization of "at least one real exact-axis-proof observation
+ * exists for this exact lane x context" under the current construction. No separate boolean is
+ * needed on the evidence row for this; requiring `freshValid > 0` here IS the check. This does not
+ * change behavior for a genuinely-proven STABLE_CANDIDATE context: STABLE_CANDIDATE structurally
+ * requires `freshValid >= WATCHABLE_MIN_FRESH` (> 0) already, so this only closes the gap for
+ * contexts that were never really proven in the first place.
+ *
+ * Called from exactly one production call site (buildIsPaperOrderLiveEligible below, evaluated
+ * once, up front, before any override path — manual, force, rotation, or the explicit unproven
+ * override — is even considered), so strengthening this function in place closes gap #2 for every
+ * path that reads it, not just the manual-path ordering bug that motivated this remediation.
  */
 export function hasExactContextReadinessProof(contextProof: ContextLaneStatusLookup): boolean {
   return (
@@ -376,6 +395,7 @@ export function hasExactContextReadinessProof(contextProof: ContextLaneStatusLoo
     contextProof.applicable === true &&
     contextProof.direct === true &&
     contextProof.evidence !== null &&
+    contextProof.evidence.freshValid > 0 &&
     contextProof.status !== "NOT_APPLICABLE"
   );
 }
@@ -422,6 +442,44 @@ export interface IsPaperOrderLiveEligibleDeps {
  * runs (this factory is called from inside the very `new LiveExecutionEngine({...})` call that
  * assigns `liveEngine`) — the original inline closure read them from the enclosing scope at
  * INVOCATION time (when the mirror actually runs), and getters preserve that exactly.
+ *
+ * 2026-08 remediation (defect 1 — ordering): the exact-context proof gate used to sit AFTER the
+ * manual-entry early return, so any order admitted by operator manual directional mode never
+ * reached it — manual mode could open a lane x context with NO real proof behind it at all (no
+ * observations, or only legacy-shaped ones). The gate now runs FIRST, right after the two
+ * lane-identity branches that must precede it. Current, authoritative top-to-bottom order:
+ *   1. unifiedOrchestrator delegation — unchanged.
+ *   2. isProfitCoreShortLaneId — MUST run before the proof gate: this lane is deliberately absent
+ *      from VARIANT_MATRIX_DEFINITIONS (it is a separate OOS forward test, not a variant-matrix
+ *      lane) and would always fail the proof gate if judged against one.
+ *   3. laneVariantId / orderEstimatedRegime / regimeFamily / exactContext / contextProof — computed
+ *      once, up front, from `order` (and the report) alone.
+ *   4. hasExactContextReadinessProof(contextProof) — the hard existence boundary. Computed and
+ *      checked ONCE; nothing below recomputes exactContext/contextProof.
+ *   5. isManualEntryAllowedForPaper — now gated behind step 4, so manual mode still bypasses
+ *      maturity/book/regime-policy blockers (its own, narrower job) but can never bypass proof
+ *      EXISTENCE.
+ *   6. useTestnetPolicy / manuallySelected — pure, unchanged.
+ *   7. realtime-short lane-id gate — unchanged.
+ *   8. MIXED-regime NEARUSDT block — unchanged.
+ *   9. forceEligibleForDirection / authorizedLongWideOverride / maturityEligible /
+ *      paperOrderMaturityGateBlocks — unchanged logic, now reading the contextProof from step 3.
+ *  10. rotation-shortlist logic — unchanged (rotationShortlist itself is still derived from
+ *      `report`, just built lazily right before this step instead of alongside `report` in step 3,
+ *      since nothing before step 10 reads it — a side-effect-free deferral, not a behavior change).
+ * For every input where NO override (manual/force/authorized-override/unproven-override) is active,
+ * this reordering changes nothing observable: every gate that returns `false` still returns `false`
+ * for the exact same reason, just resequenced among other `false`-returning checks. In particular, a
+ * genuinely-proven STABLE_CANDIDATE context with no override active reaches the exact same
+ * maturityEligible/rotation computation as before, fed the exact same values. The only behavior
+ * changes are: (a) manual entry (and, incidentally, force/rotation/unproven-override, which already
+ * ran after this gate) can no longer proceed against a context with zero genuine exact-axis-proof
+ * observations — see hasExactContextReadinessProof's own doc comment for gap #2; and (b) a
+ * manually-selected PROFIT_CORE_SHORT_TRAIL order outside testnet+SHORT — previously admissible via
+ * the manual override, since isManualEntryAllowedForPaper itself checks neither `liveConfig.env` nor
+ * direction against that lane's own restriction — can no longer be, because isProfitCoreShortLaneId's
+ * unconditional check now runs before the manual check for that lane id specifically. Both (a) and
+ * (b) are direct, intended consequences of the required ordering above, not incidental ones.
  */
 export function buildIsPaperOrderLiveEligible(
   deps: IsPaperOrderLiveEligibleDeps,
@@ -436,41 +494,28 @@ export function buildIsPaperOrderLiveEligible(
         direction: order.direction,
       });
     }
-    // Operator manual directional mode is a narrow admission override: it may bypass maturity,
-    // book, and regime-policy blockers only for the currently selected Entry Decision side and
-    // explicitly selected lane. The engine still enforces freshness, geometry, caps, and all
-    // exchange/account safety before it can open anything.
-    if (liveEngine?.isManualEntryAllowedForPaper(order)) return true;
-    const useTestnetPolicy =
-      liveConfig.env === "testnet" ||
-      (liveConfig.env === "mainnet" && liveConfig.mainnetKeepTestnetPolicy);
-    const manuallySelected = liveEngine?.laneSelectionExplicitlyIncludesLane(order.selectedLaneId) ?? false;
     if (isProfitCoreShortLaneId(order.selectedLaneId)) {
       // The new lane is an OOS forward test, not a backdoor around mainnet's proven-only gate.
+      // MUST run before the exact-context proof gate below: this lane is deliberately absent from
+      // VARIANT_MATRIX_DEFINITIONS (see laneStatusForContext's `!definition` branch), so it can
+      // never carry an exact proof context — gating it on context-proof would permanently and
+      // silently disable this lane's entire testnet forward test. Also, deliberately, MUST run
+      // before the manual-entry check below: isManualEntryAllowedForPaper does not itself restrict
+      // by env or direction, so this lane's own testnet+SHORT-only restriction must be checked first.
       return liveConfig.env === "testnet" && order.direction === "SHORT";
     }
-    if (
-      useTestnetPolicy &&
-      !(
-        isRealtimeShortAllowedLaneId(order.selectedLaneId) ||
-        isRealtimeShortSelectableLaneId(order.selectedLaneId, manuallySelected)
-      )
-    ) return false;
+    // Exact applicability is a hard execution boundary, computed once and checked immediately,
+    // before ANY override path (manual, force, rotation, or the explicit unproven override) is even
+    // considered. Those paths may relax MATURITY only; none may invent, borrow, or bypass a proof
+    // context or a genuine exact-axis-proof observation population (see
+    // hasExactContextReadinessProof's own doc comment for the freshValid>0 requirement).
+    const report = buildCurrentGuardVariantMatrixReport(deps.getVariantMatrixStore());
+    const laneVariantId = order.selectedLaneId.split(":").pop() ?? order.selectedLaneId;
     const orderEstimatedRegime = estimateLaneSelectorV2Regime({
       regime: order.regime,
       controllerMode: order.controllerMode,
       confidence: order.controllerConfidence ?? null,
     });
-    if (
-      useTestnetPolicy &&
-      orderEstimatedRegime.direction === "MIXED" &&
-      order.symbol.toUpperCase() === "NEARUSDT"
-    ) {
-      return false;
-    }
-    const report = buildCurrentGuardVariantMatrixReport(deps.getVariantMatrixStore());
-    const rotationShortlist = buildRegimeRotationShortlistReport(report);
-    const laneVariantId = order.selectedLaneId.split(":").pop() ?? order.selectedLaneId;
     const regimeFamily =
       orderEstimatedRegime.direction === "LONG"
         ? "BULLISH"
@@ -483,9 +528,32 @@ export function buildIsPaperOrderLiveEligible(
       laneVariantId,
       exactContext,
     );
-    // Exact applicability is a hard execution boundary. Force, rotation, and the explicit
-    // unproven override may relax maturity only; none may invent or borrow a proof context.
     if (!hasExactContextReadinessProof(contextProof)) return false;
+    // Operator manual directional mode is a narrow admission override: it may bypass maturity,
+    // book, and regime-policy blockers only for the currently selected Entry Decision side and
+    // explicitly selected lane. The engine still enforces freshness, geometry, caps, and all
+    // exchange/account safety before it can open anything. Runs AFTER the exact-context proof gate
+    // above: manual entry must never admit an order for a lane x context with no real,
+    // exact-axis-proof observations at all.
+    if (liveEngine?.isManualEntryAllowedForPaper(order)) return true;
+    const useTestnetPolicy =
+      liveConfig.env === "testnet" ||
+      (liveConfig.env === "mainnet" && liveConfig.mainnetKeepTestnetPolicy);
+    const manuallySelected = liveEngine?.laneSelectionExplicitlyIncludesLane(order.selectedLaneId) ?? false;
+    if (
+      useTestnetPolicy &&
+      !(
+        isRealtimeShortAllowedLaneId(order.selectedLaneId) ||
+        isRealtimeShortSelectableLaneId(order.selectedLaneId, manuallySelected)
+      )
+    ) return false;
+    if (
+      useTestnetPolicy &&
+      orderEstimatedRegime.direction === "MIXED" &&
+      order.symbol.toUpperCase() === "NEARUSDT"
+    ) {
+      return false;
+    }
     const forceEligibleForDirection = isForceEligibleForDirection(order.direction, laneVariantId);
     const authorizedLongWideOverride = isLaneSelectorV2LongWideStopOverride({
       variantId: laneVariantId,
@@ -502,6 +570,7 @@ export function buildIsPaperOrderLiveEligible(
         process.env.LIVE_UNPROVEN_EXECUTION_OVERRIDE === "1",
       )
     ) return false;
+    const rotationShortlist = buildRegimeRotationShortlistReport(report);
     const rotationEligible = rotationShortlistDecision(rotationShortlist, {
       laneId: order.selectedLaneId,
       variantId: laneVariantId,

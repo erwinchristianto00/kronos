@@ -39,6 +39,10 @@ import { computeATR } from "./candle-indicators.js";
 // rounding function does not pull in any exchange/network/order-placement code (roundToStep has
 // no side effects and no other imports).
 import { roundToStep } from "./binance-futures-private.js";
+// Cross-caller mutual exclusion for this store's own mutating resolver pass (see Surface A of
+// the 2026-08 concurrency remediation) — beginBatch/endBatch below is flush-coalescing only and
+// provides no such guarantee on its own.
+import { runExclusiveForStore } from "./store-mutation-single-flight.js";
 
 function writeJsonAtomic(file: string, value: unknown): void {
   const tmp = `${file}.tmp`;
@@ -3218,6 +3222,22 @@ function variantMaxHoldMs(variantId: VariantMatrixVariantId): number {
 }
 
 export async function resolveVariantMatrixObservations(
+  store: CurrentGuardVariantMatrixStore,
+  binanceClient: VariantMatrixBinanceClient,
+  opts: { maxObservations?: number; maxRuntimeMs?: number; yieldEvery?: number } = {},
+): Promise<{ resolved: number; expired: number; dataFailures: number; errors: number }> {
+  // Cross-caller mutual exclusion (Surface A, 2026-08 concurrency remediation): two independent
+  // production triggers call this exported name against the SAME store (routes/shadow.ts's
+  // fire-and-forget dashboard-audit-summary call, and its operator-brief ?resolve=1 call, whose
+  // own `Promise.race` against a timeout can leave a prior call's real work still running in the
+  // background past its own caller's wait). A second concurrent call now JOINS the first's
+  // in-flight pass instead of starting a second one over the same on-disk store. Signature and
+  // return type are unchanged; every existing test awaits this once, sequentially, per its own
+  // fresh store, so a solo call is unaffected — it still just awaits its own single pass.
+  return runExclusiveForStore(store, () => resolveVariantMatrixObservationsInner(store, binanceClient, opts));
+}
+
+async function resolveVariantMatrixObservationsInner(
   store: CurrentGuardVariantMatrixStore,
   binanceClient: VariantMatrixBinanceClient,
   opts: { maxObservations?: number; maxRuntimeMs?: number; yieldEvery?: number } = {},
