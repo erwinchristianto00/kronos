@@ -249,6 +249,13 @@ function scoreLane(
   candidate: LaneSelectorV2Candidate,
   regime: string | null,
 ): LaneSelectorV2ScoreBreakdown {
+  // `state.freshValid` is the variant matrix's FULL fresh-valid close count for this lane × context
+  // (P_all), and it grows for as long as the lane trades. It is deliberately NOT a proof-stage
+  // development slice: this term scales how much weight the scorer puts on `globalEdge`, so a
+  // count bounded by a frozen window would pin the confidence at that window's size forever —
+  // log10(41)/log10(250) ~ 0.67 for a lane with a thousand closes. See
+  // current-guard-variant-matrix.ts's `freshValid` doc; stage separation is enforced at the STABLE/
+  // PROMOTION gate, never by starving the live scorer.
   const fresh = Math.max(0, numeric(state.freshValid));
   const confidence = clamp(Math.log10(fresh + 1) / Math.log10(250), 0, 1);
   const globalNet = numeric(state.netAvgR);

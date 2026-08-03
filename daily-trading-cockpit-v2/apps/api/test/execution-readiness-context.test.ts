@@ -235,11 +235,18 @@ describe("isPaperOrderLiveEligible — real wiring (buildIsPaperOrderLiveEligibl
       variantId: "CG_WIDE_STOP_TP_WIDE",
       direction: "LONG",
       regime: "Sideways rotation",
-      // Point 4b (current-guard-variant-matrix): once a holdout cut freezes (>= HOLDOUT_CUT_MIN_FRESH
-      // =20), freshValid/effectiveN are dev-only (pre-cut). floor(143*HOLDOUT_DEV_FRACTION)=100 keeps
-      // this cohort's dev-side effectiveN at STABLE_MIN_FRESH (100) with a sufficient 43-row holdout
-      // (same n=143 boundary as current-guard-variant-matrix.test.ts's [3A-PASS]/[4-PASS]), so it
-      // still reaches STABLE_CANDIDATE post-fix.
+      // Point 4 (current-guard-variant-matrix, stage model): `freshValid`/`effectiveN` are the FULL
+      // population — measured, both read 143 here, because the 4-day spacing above puts every row in
+      // its own 72h episode. STABLE is gated by the frozen `stableProof` WINDOW, not by any headline
+      // row count: measured, this cohort freezes dev at 40 rows / 40 episodes and holdout at 20 rows /
+      // 20 episodes, i.e. the ROW floors (STABLE_MIN_DEV_ROWS=40, STABLE_MIN_HOLDOUT_ROWS=20) bind and
+      // the episode floors (10 / 5) are satisfied well before them. Same n=143 as
+      // current-guard-variant-matrix.test.ts's [3A-PASS]/[4-PASS].
+      // SUPERSEDED MODEL, recorded so the old arithmetic is not re-derived: this comment used to say
+      // freshValid/effectiveN were the dev-only slice and that floor(143*HOLDOUT_DEV_FRACTION)=100 was
+      // what put dev-side effectiveN on STABLE_MIN_FRESH (100). That single cut is deleted, and
+      // STABLE_MIN_FRESH is no longer read by the matrix's status derivation at all — it survives only
+      // as the adaptive-lane-router's coarser raw-row ladder floor.
       count: 143,
       netR: stableNetR,
       prefix: "pass",

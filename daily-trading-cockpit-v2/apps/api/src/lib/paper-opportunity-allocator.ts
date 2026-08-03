@@ -1751,6 +1751,8 @@ export function buildPaperOpportunityAllocatorReport(
         recordReject(symbol, direction, def.id, "ECONOMICS_REJECT", econFresh, econNet);
         continue;
       }
+      // Raw closes over the full fresh-valid population (P_all) against a raw-row floor — see
+      // current-guard-variant-matrix.ts's `freshValid` doc. Never an independent-episode count.
       if (!skipEconomics && econ!.freshValid < WATCHABLE_MIN_FRESH) {
         if (econ!.source === "AGGREGATE") {
           recordReject(symbol, direction, def.id, "ECONOMICS_INSUFFICIENT_SAMPLE", econFresh, econNet);

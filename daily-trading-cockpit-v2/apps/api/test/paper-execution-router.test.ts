@@ -86,9 +86,14 @@ async function buildWinningVmStore(dir: string): Promise<CurrentGuardVariantMatr
   const vmStore = new CurrentGuardVariantMatrixStore(dir);
   // Entries must be FRESH at creation: isFreshValid = (now − openedAt) ≤ FRESH_ENTRY_MAX_MINUTES (10).
   // Pack all 80 within the last ~7 min so every obs is fresh-valid and clears the economics sample gate.
-  // Point 4b (current-guard-variant-matrix): once a holdout cut freezes (>= HOLDOUT_CUT_MIN_FRESH=20),
-  // freshValid is dev-only (pre-cut) — floor(count*HOLDOUT_DEV_FRACTION). 80, not 60: floor(80*0.7)=56
-  // clears the [10]/[17] assertion's freshValid>=50 bar; the old 60 only reached floor(60*0.7)=42.
+  // Point 4d (current-guard-variant-matrix): `freshValid` is the FULL fresh-valid population and is
+  // never scoped to a proof window, so all 80 rows count — measured, [10]'s `scaleoutRow.freshValid`
+  // reads 80 exactly, and [17] runs off this same store.
+  // SUPERSEDED MODEL, recorded so the old arithmetic is not re-derived: this comment used to say
+  // freshValid was the dev-only slice, floor(count*HOLDOUT_DEV_FRACTION), and justified 80-over-60 by
+  // floor(80*0.7)=56. That single-cut model and both of its constants (HOLDOUT_DEV_FRACTION,
+  // HOLDOUT_CUT_MIN_FRESH) were DELETED this round; development/holdout separation now lives in the
+  // per-stage `stableProof`/`promotionProof` windows, which the freshValid≥50 bar never reads.
   const recentBase = Date.now() - 7 * 60_000;
   const signals: VariantMatrixSignal[] = Array.from({ length: 80 }, (_, i) => ({
     sourceSignalId: `sig-${i}`,

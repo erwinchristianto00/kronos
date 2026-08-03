@@ -14,6 +14,7 @@ import { buildLiveTradingGateReport } from "../src/lib/live-trading-gate.js";
 import { buildPostCutoverReport } from "../src/lib/frozen-current-guard-post-cutover.js";
 import {
   buildCurrentGuardVariantMatrixReport,
+  buildVariantMatrixObservationsForSignal,
   CurrentGuardVariantMatrixStore,
   mirrorVariantMatrixSignals,
   resolveVariantMatrixObservations,
@@ -347,9 +348,14 @@ describe("operator-brief", () => {
     const recentBase = Date.now() - 7 * 60_000;
 
     // Mirror 80 unique-symbol signals so every variant gets freshValid ≥ 50.
-    // Point 4b (current-guard-variant-matrix): once a holdout cut freezes (>= HOLDOUT_CUT_MIN_FRESH=20),
-    // freshValid is dev-only (pre-cut) — floor(count*HOLDOUT_DEV_FRACTION). 80, not 60: floor(80*0.7)=56
-    // clears the freshValid>=50 assertion below; the old 60 only reached floor(60*0.7)=42.
+    // Point 4d (current-guard-variant-matrix): `freshValid` is the FULL fresh-valid population and is
+    // never scoped to a proof window, so all 80 mirrored rows count — measured, the row asserted
+    // below reads freshValid=80 exactly.
+    // SUPERSEDED MODEL, recorded so the old arithmetic is not re-derived: this comment used to say
+    // freshValid was the dev-only slice, floor(count*HOLDOUT_DEV_FRACTION), and justified 80-over-60
+    // by floor(80*0.7)=56. That single-cut model and both of its constants (HOLDOUT_DEV_FRACTION,
+    // HOLDOUT_CUT_MIN_FRESH) were DELETED this round; development/holdout separation now lives in the
+    // per-stage `stableProof`/`promotionProof` windows, which the freshValid≥50 bar never reads.
     const signals: VariantMatrixSignal[] = Array.from({ length: 80 }, (_, i) => ({
       sourceSignalId: `sig-${i}`,
       symbol: `SYM${String(i).padStart(3, "0")}USDT`,
@@ -440,18 +446,105 @@ describe("operator-brief", () => {
     expect(brief).not.toContain("CG_WIDE_STOP_TP_WIDE: wait OOS confirmation");
   });
 
-  // [15] Section 4's per-variant rows surface the dev/holdout evidence split (devN/devEffectiveN/
-  // holdoutN/holdoutEffectiveN) — not just aggregate freshValid/net/PF. Uses 100 fresh, unique-symbol
-  // signals so a holdout cut freezes (>= HOLDOUT_CUT_MIN_FRESH=20) at floor(100*0.7)=70 dev rows,
-  // leaving 30 holdout rows — >= HOLDOUT_MIN_FRESH=30, so the split is real and non-trivial on both
-  // sides (devN=70, holdoutN=30), not a degenerate 0/N case.
-  it("[15] brief surfaces devN/devEffectiveN/holdoutN/holdoutEffectiveN for CG_WIDE_STOP_TP_WIDE", async () => {
+  // [15] Section 4's per-variant rows surface the dev/holdout evidence split — not just aggregate
+  // freshValid/net/PF.
+  //
+  // Point 4 (stage model) reshaped this test in two ways.
+  //
+  // (1) THE COHORT. There are now TWO immutable proof windows, and STABLE's alone needs
+  //     >= STABLE_MIN_DEV_ROWS(40) development rows carrying >= STABLE_MIN_EFFECTIVE_N(10) INDEPENDENT
+  //     MARKET EPISODES, plus a bounded holdout of >= 20 rows / >= 5 episodes, all of them behind a
+  //     7-day settlement horizon. Episodes are non-overlapping 72 h origin-time windows, so that is
+  //     ~46 calendar days of openedAt span — unreachable through mirrorVariantMatrixSignals, which
+  //     (correctly) refuses born-stale signals older than EXPIRY_MS=7d. The old cohort's 100 signals
+  //     five SECONDS apart is exactly the shape the episode rule exists to reject: one market look
+  //     wearing 100 hats. It is therefore built directly as resolved observations here, spread across
+  //     months, which is the only shape that can legitimately freeze a window.
+  // (2) THE RENDERING. The brief now prints BOTH stages on their own labelled lines, because a bare
+  //     "dev/holdout" pair became a lie by omission once a promotion window can exist beside a stable
+  //     one. Both are asserted, and so is the "-- not frozen --" form for a lane with no window.
+  it("[15] brief surfaces the STABLE and PROMOTION dev/holdout evidence split for CG_WIDE_STOP_TP_WIDE", () => {
     const dir = tmpDir();
     const vmStore = new CurrentGuardVariantMatrixStore(dir);
+    const DAY_MS = 24 * 60 * 60 * 1000;
+    const baseOpenedMs = Date.UTC(2026, 0, 1);
+    const observations = Array.from({ length: 200 }, (_, i) => {
+      const openedAtMs = baseOpenedMs + i * 4 * DAY_MS; // 4 days > the 72 h episode width
+      const netR = i % 5 === 0 ? -0.5 : 1; // net 0.7R, PF 8, payoff 2 — clears every economic gate
+      const base = buildVariantMatrixObservationsForSignal({
+        sourceSignalId: `dh-sig-${i}`,
+        symbol: `DH${i % 5}USDT`,
+        direction: "LONG" as const,
+        entryPrice: 100,
+        stopLoss: 98,
+        tp1: 104,
+        tp2: null,
+        tp3: null,
+        stopDistanceBps: 200,
+        regime: "Bullish expansion",
+        entryVariant: "base_current_entry",
+        openedAt: new Date(openedAtMs).toISOString(),
+        closedAt: null,
+        posture: "TACTICAL" as const,
+        regimeDirection: "LONG" as const,
+      }).find((c) => c.variantId === "CG_WIDE_STOP_TP_WIDE")!;
+      return {
+        ...base,
+        observationId: `dh-obs-${i}`,
+        sourceObservationKey: `dh-obs-${i}`,
+        status: netR > 0 ? ("CLOSED_WIN" as const) : ("CLOSED_LOSS" as const),
+        grossR: netR + 0.12,
+        netR,
+        costR: 0.12,
+        isFreshValid: true,
+        resolvedAt: new Date(openedAtMs + DAY_MS).toISOString(),
+      };
+    });
+    vmStore.addMany(observations);
+    const vm = buildCurrentGuardVariantMatrixReport(vmStore, { capturedAt: new Date().toISOString() });
+
+    const wideRow = vm.rows.find((r) => r.variantId === "CG_WIDE_STOP_TP_WIDE");
+    expect(wideRow).toBeDefined();
+    // Sanity: BOTH windows froze, and each stage's dev and holdout sides are genuinely distinct
+    // evidence — neither degenerate, and the two stages' holdouts are different cohorts.
+    expect(wideRow!.stableProof.frozen).toBe(true);
+    expect(wideRow!.promotionProof.frozen).toBe(true);
+    expect(wideRow!.devN).toBe(40);
+    expect(wideRow!.holdoutN).toBe(20);
+    expect(wideRow!.devN).not.toBe(wideRow!.holdoutN);
+    expect(wideRow!.devEffectiveN).toBeGreaterThan(0);
+    expect(wideRow!.holdoutEffectiveN).toBeGreaterThan(0);
+    expect(wideRow!.promotionDevN).toBe(90);
+    expect(wideRow!.promotionHoldoutN).toBe(110);
+
+    const brief = buildOperatorBrief(makeInputs({ variantMatrixReport: vm }));
+
+    // The brief must genuinely surface the row's own numbers for BOTH stages, not placeholder text.
+    expect(brief).toContain(
+      `STABLE    dev n=${wideRow!.devN} (effN=${wideRow!.devEffectiveN})  holdout n=${wideRow!.holdoutN} (effN=${wideRow!.holdoutEffectiveN})`,
+    );
+    expect(brief).toContain(
+      `PROMOTION dev n=${wideRow!.promotionDevN} (effN=${wideRow!.promotionDevEffectiveN})  holdout n=${wideRow!.promotionHoldoutN} (effN=${wideRow!.promotionHoldoutEffectiveN})`,
+    );
+    expect(brief).toContain("dev n=40");
+    expect(brief).toContain("holdout n=20");
+
+    const lines = brief.split("\n").length;
+    expect(lines).toBeLessThanOrEqual(OPERATOR_BRIEF_MAX_LINES);
+  });
+
+  // [15b] A lane whose windows have NOT frozen must say so explicitly. "-- not frozen --" is a
+  // materially different statement from "a window that happens to contain zero rows", and rendering
+  // `dev n=0 (effN=0)` for it would read as measured emptiness rather than as absence of proof.
+  it("[15b] brief renders '-- not frozen --' for a variant with no frozen stage window", async () => {
+    const dir = tmpDir();
+    const vmStore = new CurrentGuardVariantMatrixStore(dir);
+    // Signals five seconds apart: plenty of rows, exactly ONE independent market episode, and
+    // entirely inside the settlement quarantine — nothing can freeze.
     const recentBase = Date.now() - 8 * 60_000;
     const signals: VariantMatrixSignal[] = Array.from({ length: 100 }, (_, i) => ({
-      sourceSignalId: `dh-sig-${i}`,
-      symbol: `DH${String(i).padStart(3, "0")}USDT`,
+      sourceSignalId: `nf-sig-${i}`,
+      symbol: `NF${String(i).padStart(3, "0")}USDT`,
       direction: "LONG" as const,
       entryPrice: 100,
       stopLoss: 98,
@@ -464,7 +557,6 @@ describe("operator-brief", () => {
       openedAt: new Date(recentBase + i * 5_000).toISOString(),
       closedAt: null,
     }));
-
     const flexWinningBinance = {
       getKlines: async (
         _symbol: string,
@@ -480,31 +572,20 @@ describe("operator-brief", () => {
         ];
       },
     };
-
     mirrorVariantMatrixSignals(signals, vmStore, new Date().toISOString());
     await resolveVariantMatrixObservations(vmStore, flexWinningBinance);
     const vm = buildCurrentGuardVariantMatrixReport(vmStore, { capturedAt: new Date().toISOString() });
 
     const wideRow = vm.rows.find((r) => r.variantId === "CG_WIDE_STOP_TP_WIDE");
-    expect(wideRow).toBeDefined();
-    // Sanity: dev and holdout sides are genuinely distinct evidence, neither degenerate.
-    expect(wideRow!.devN).toBe(70);
-    expect(wideRow!.holdoutN).toBe(30);
-    expect(wideRow!.devN).not.toBe(wideRow!.holdoutN);
-    expect(wideRow!.devEffectiveN).toBeGreaterThan(0);
-    expect(wideRow!.holdoutEffectiveN).toBeGreaterThan(0);
+    expect(wideRow!.freshValid).toBeGreaterThan(0); // rows exist and are counted…
+    expect(wideRow!.effectiveN).toBe(1); // …but they are one market look
+    expect(wideRow!.stableProof.frozen).toBe(false);
+    expect(wideRow!.promotionProof.frozen).toBe(false);
 
     const brief = buildOperatorBrief(makeInputs({ variantMatrixReport: vm }));
-
-    // The brief must genuinely surface the row's own dev/holdout numbers, not placeholder text.
-    expect(brief).toContain(
-      `dev n=${wideRow!.devN} (effN=${wideRow!.devEffectiveN})  holdout n=${wideRow!.holdoutN} (effN=${wideRow!.holdoutEffectiveN})`,
-    );
-    expect(brief).toContain("dev n=70");
-    expect(brief).toContain("holdout n=30");
-
-    const lines = brief.split("\n").length;
-    expect(lines).toBeLessThanOrEqual(OPERATOR_BRIEF_MAX_LINES);
+    expect(brief).toContain("STABLE    -- not frozen --");
+    expect(brief).toContain("PROMOTION -- not frozen --");
+    expect(brief).not.toContain("STABLE    dev n=0");
   });
 
   it("[14] renders compact scan timing line in section 1", () => {

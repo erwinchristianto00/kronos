@@ -1311,6 +1311,9 @@ export function selectEligiblePaperLanes(
     } else if (contextProof.status === "REJECT" || contextProof.status === "NOT_APPLICABLE") {
       continue;
     }
+    // Raw closes, full fresh-valid population (P_all) — see current-guard-variant-matrix.ts's
+    // `freshValid` doc. This is an admission DEPTH floor, not an independence or out-of-sample
+    // claim: `contextProof.status` above is what carries the stage-proof verdict.
     if (evidence.freshValid < 50) continue;
     if ((evidence.netAvgR ?? 0) <= 0) continue;
     // PF can be null when there are no losses; treat as "infinite, passes".

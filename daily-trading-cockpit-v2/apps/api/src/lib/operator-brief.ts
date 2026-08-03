@@ -100,14 +100,39 @@ function eta50(current: number, perDay: number | null | undefined): string {
   if (!perDay || !Number.isFinite(perDay) || perDay <= 0) return "n/a";
   return d2((50 - current) / perDay) + "d";
 }
-/** Development-vs-holdout evidence split line for a variant matrix row. */
-function devHoldoutLine(row: {
+/**
+ * Development-vs-holdout evidence split for a variant matrix row.
+ *
+ * There are now TWO immutable proof stages with DISJOINT holdout cohorts (STABLE's holdout is
+ * bounded; PROMOTION's begins at or after that bound), so this renders BOTH. Showing only one pair
+ * under a bare "dev/holdout" label — which is what this line did while the model had a single cut —
+ * would be a lie by omission the moment a lane freezes its promotion window: the operator would read
+ * STABLE's numbers and believe they were the promotion evidence.
+ *
+ * `--` means that stage has no frozen window yet, which is different from "a window with zero rows".
+ */
+function stageEvidenceLines(row: {
   devN: number;
   devEffectiveN: number;
   holdoutN: number;
   holdoutEffectiveN: number;
-}): string {
-  return `     dev n=${row.devN} (effN=${row.devEffectiveN})  holdout n=${row.holdoutN} (effN=${row.holdoutEffectiveN})`;
+  promotionDevN: number;
+  promotionDevEffectiveN: number;
+  promotionHoldoutN: number;
+  promotionHoldoutEffectiveN: number;
+  stableProof?: { frozen: boolean };
+  promotionProof?: { frozen: boolean };
+}): string[] {
+  const stableFrozen = row.stableProof?.frozen === true;
+  const promotionFrozen = row.promotionProof?.frozen === true;
+  return [
+    stableFrozen
+      ? `     STABLE    dev n=${row.devN} (effN=${row.devEffectiveN})  holdout n=${row.holdoutN} (effN=${row.holdoutEffectiveN})`
+      : "     STABLE    -- not frozen --",
+    promotionFrozen
+      ? `     PROMOTION dev n=${row.promotionDevN} (effN=${row.promotionDevEffectiveN})  holdout n=${row.promotionHoldoutN} (effN=${row.promotionHoldoutEffectiveN})`
+      : "     PROMOTION -- not frozen --",
+  ];
 }
 
 // ── dynamic section helpers ──────────────────────────────────────────────────
@@ -303,7 +328,7 @@ export function buildOperatorBrief(inputs: OperatorBriefInputs): string {
         `     +10bps=${yn(row.plus10bpsStillPositive)}  OOS+=${yn(row.allThreeOosPositive)}` +
         `  maxDD=${d2(row.approxMaxDrawdownR)}R  status=${row.status}`,
       );
-      L.push(devHoldoutLine(row));
+      L.push(...stageEvidenceLines(row));
       if (row.blockers.length > 0)
         L.push(`     blockers: ${row.blockers.slice(0, 2).join(" | ")}`);
     }
@@ -335,7 +360,7 @@ export function buildOperatorBrief(inputs: OperatorBriefInputs): string {
             `     +10bps=${yn(selRow.plus10bpsStillPositive)}  OOS+=${yn(selRow.allThreeOosPositive)}` +
             `  maxDD=${d2(selRow.approxMaxDrawdownR)}R  status=${selRow.status}`,
           );
-          L.push(devHoldoutLine(selRow));
+          L.push(...stageEvidenceLines(selRow));
         }
       }
     }

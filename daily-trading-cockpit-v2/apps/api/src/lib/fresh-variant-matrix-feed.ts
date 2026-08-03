@@ -42,8 +42,9 @@ export interface FreshVariantMatrixFeedInputs {
   maxPerCycle?: number;
   /** Shared-origin scan-cycle identity (the scan service's own generatedAt). Every candidate created
    *  from the SAME call is one market episode — this is threaded onto every signal in the batch so
-   *  computeEffectiveN can count them as one independent draw instead of one-per-symbol. Optional;
-   *  omitted falls through to the deterministic time-block fallback. */
+   *  computeEffectiveN can count them as one independent draw instead of one-per-symbol. Optional,
+   *  and merge-only: when omitted, rows are still grouped into independent draws by openedAt episode
+   *  chaining, so its absence can never manufacture extra draws. */
   scanBatchId?: string | null;
 }
 
