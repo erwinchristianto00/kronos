@@ -517,7 +517,8 @@ export const PROMOTION_MIN_DISTINCT_SYMBOLS = 5;
 // EPISODE EDGE (episodeEdgeMsOf) — a timestamp at which no episode has rows on both sides. Dev
 // takes whole episodes, the holdout opens with the next episode's FIRST row, and
 // devEffectiveN + holdoutEffectiveN === effectiveN over their union is an identity rather than an
-// approximation. That is what makes the sign-test p-values quoted below the honest ones.
+// approximation. That identity is what makes each stage's holdout a genuinely unseen cohort — see
+// WHAT THESE FLOORS DO AND DO NOT CLAIM below for what it does and does not license.
 //
 // MEMBERSHIP CLOCK — openedAt (`episodeTimeMsOf`), ONE clock everywhere in the proof path.
 // The previous model used resolvedAt for membership and openedAt for independence. Under resolved
@@ -584,35 +585,31 @@ export const PROMOTION_MIN_DISTINCT_SYMBOLS = 5;
 // For contrast, the bar this round REPLACED (effectiveN >= 100 / >= 200, i.e. the MIN_FRESH reuse
 // described above) worked out to ~331 d and ~654 d at W=72h. It is no longer reachable in the code.
 //
-// HONEST LIMITATION, stated because it is load-bearing: at a 0.333 episodes/day ceiling NO
-// reachable threshold delivers statistical significance for realistic effect sizes. At 10 episodes
-// with per-episode sigma ~1R, SE ~0.32R and the 2-sided/80%-power MDE is ~0.89R — larger than any
-// effect measured in this book. These constants are HAZARD BOUNDS, not significance tests: they
-// guarantee the evidence spans N separate non-overlapping market windows and therefore cap how
-// much of a status can be one lucky regime. The one genuinely computable statistical claim at
-// these sizes is the sign test on episode-level means — 5 independent windows all non-negative is
-// p = 1/32 ~ 0.031, 10 windows is p = 1/1024 ~ 0.001. That, and nothing grander, is the
-// justification for the two holdout effectiveN floors.
+// WHAT THESE FLOORS DO AND DO NOT CLAIM. They are HAZARD / DIVERSITY BOUNDS. They guarantee that
+// the evidence behind a status spans N separate, non-overlapping, episode-aligned market windows,
+// and therefore cap how much of that status can be one lucky regime. They are NOT significance
+// tests and they carry NO p-value, NO false-positive rate, and NO power claim.
 //
-// WHY THOSE p-VALUES ARE THE HONEST ONES. A sign test counts INDEPENDENT trials, so it is only
-// valid if every holdout episode is genuinely new evidence. Because boundaries are episode-aligned,
-// no episode can be split across a boundary: a holdout of E episodes is E market windows the
-// development side never saw, and the development slice's own episode count plus the holdout's adds
-// up exactly to the union's. Before alignment that was false by exactly one episode per boundary —
-// the tail of the last development window opened the holdout, so "5 holdout episodes" was really 4
-// new ones plus a re-count (p = 1/16, not 1/32) and PROMOTION's 10 was really 9 (p = 1/512, not
-// 1/1024). The claims below are restored to 1/32 and 1/1024 by fixing the boundary, not by
-// re-labelling the arithmetic.
+// This is a deliberate correction. An earlier revision of this block justified the two holdout
+// episode floors with a sign test — "5 independent windows all non-negative is p = 1/32, 10 is
+// p = 1/1024". THE CODE NEVER COMPUTED THAT EVENT. buildStageProof evaluates the holdout with
+// AGGREGATE, ROW-LEVEL statistics: mean(holdoutNet), profitFactor(holdoutNet) and
+// mean(stressNetR). A positive aggregate is not "every episode non-negative" — one large positive
+// episode can outweigh several negative ones and still clear every term the gate actually checks.
+// Quoting a p-value for an event no gate requires overstates the evidence, so the claim is removed
+// rather than reworded. If a sign test is ever wanted it has to be BUILT: partition the holdout
+// with the same EpisodeAccumulator, compute a cost-adjusted and stressed mean R per episode,
+// persist episodeCount / nonNegativeEpisodeCount, and gate on a predeclared threshold.
 //
-// THE SECOND PRECONDITION, which episode alignment does NOT supply, and which is the weaker of the
-// two. Disjointness makes the trials DISTINCT; it does not make them INDEPENDENT and it does not
-// fix the per-trial null at 1/2. p = 1/32 additionally assumes each episode's mean is non-negative
-// with probability 1/2 under the null — i.e. a per-episode null that is continuous and median-zero,
-// and episodes with no shared driver. Neither is guaranteed here: consecutive max-hold windows can
-// sit inside one regime, and a lane with genuine cost-adjusted drift has a per-episode median above
-// zero by construction. So 1/32 is the strength of the claim UNDER AN IDEALISED NULL, not a
-// measured false-positive rate for this book. That is the same caveat the HONEST LIMITATION
-// paragraph above applies to these constants as a whole: hazard bounds first, statistics second.
+// The independence work these floors DO rest on is real and is enforced: because every boundary is
+// snapped to an episode edge, a holdout of E episodes is E market windows no earlier stage scored,
+// and devEffectiveN + holdoutEffectiveN === effectiveN over the union is an identity. That buys
+// genuine out-of-sample separation. It does not by itself buy a significance claim.
+//
+// The ceiling is the reason to be modest here: at 0.333 episodes/day NO reachable threshold
+// delivers significance for realistic effect sizes. At 10 episodes with per-episode sigma ~1R,
+// SE ~0.32R and the 2-sided/80%-power MDE is ~0.89R — larger than any effect measured in this
+// book. Sizing these floors as diversity bounds is the honest reading of what that ceiling allows.
 //
 // NOT ENV-TUNABLE, any of them. These define what counts as PROOF. Making proof tunable by
 // environment variable is precisely the "measurement blocked by its own params" failure family
@@ -644,11 +641,12 @@ export const STABLE_MIN_HOLDOUT_ROWS = 20;
 //   EPISODES 5 — half the dev floor, deliberately. A holdout is a CONFIRMATION, not a second
 //   independent full proof; requiring parity would double the calendar for no additional
 //   information because the dev side already carries the point estimate. 5 is the smallest count
-//   with any discriminating power at all: under a fair-coin null, five independent windows all
-//   non-negative is p = 1/32 = 0.031 — a claim that holds ONLY because the boundary is
-//   episode-aligned, so all five are windows development never saw (unaligned, one of the five was
-//   the tail of a development episode and the honest figure was p = 1/16). Costs 5*3 d = 15 d of
-//   post-dev span at W=72h: this window is BOUNDED above, so it also waits for the closing episode.
+//   that still spans a meaningful spread of market conditions: an episode-aligned boundary makes
+//   all five windows development never saw, so clearing the holdout's economics on them is
+//   genuinely out-of-sample rather than a re-read of the training slice. NO p-value is claimed —
+//   see WHAT THESE FLOORS DO AND DO NOT CLAIM above; the gate checks aggregate holdout economics,
+//   not per-episode signs. Costs 5*3 d = 15 d of post-dev span at W=72h: this window is BOUNDED
+//   above, so it also waits for the closing episode.
 export const STABLE_MIN_HOLDOUT_EFFECTIVE_N = 5;
 
 // PROMOTION, development side. Its window deliberately SUBSUMES the whole of STABLE's (dev AND
@@ -667,9 +665,10 @@ export const PROMOTION_MIN_EFFECTIVE_N = 20;
 // p >= stableCut.holdoutEndMs, and no episode straddles that boundary because it is episode-aligned).
 //   ROWS 40 — 2x STABLE's holdout rows, 40/10 = 4.0 closes per window.
 export const PROMOTION_MIN_HOLDOUT_ROWS = 40;
-//   EPISODES 10 — 2x STABLE's holdout floor; sign-test p = 1/1024 ~ 0.001, honest for the same
-//   reason STABLE's 1/32 is: an episode-aligned boundary means all ten are windows no earlier stage
-//   scored (unaligned it was really 9 new plus a re-count, p = 1/512). Deliberately identical to the
+//   EPISODES 10 — 2x STABLE's holdout floor, on the same diversity-bound reasoning: an
+//   episode-aligned boundary means all ten are windows no earlier stage scored, so PROMOTION's
+//   confirmation is drawn entirely from market conditions neither STABLE's dev nor STABLE's holdout
+//   has seen. NO p-value is claimed here either. Deliberately identical to the
 //   outgoing single-stage HOLDOUT_MIN_EFFECTIVE_N so the STRICTEST rung of the new two-stage ladder
 //   is no weaker than the single rung of the old one. Costs (10-1)*3 = 27 d at W=72h — the ONE
 //   window whose cost episode alignment did not raise, because it is OPEN-ENDED and therefore needs
