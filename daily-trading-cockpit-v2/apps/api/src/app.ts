@@ -789,6 +789,52 @@ export function buildUnifiedRegimeEntryGate(
   };
 }
 
+export interface ManualDirectionalRegimeSafetyGateDeps {
+  /** Same shared, single accessor every other canonical-regime consumer in this file uses (see
+   *  UnifiedRegimeEntryGateDeps's/IsPaperOrderLiveEligibleDeps's own identical field) — buildApp()
+   *  wires this from the ONE `getCanonicalMarketRegimeSnapshot` closure variable it defines once. */
+  getCanonicalMarketRegimeSnapshot: () => CanonicalMarketRegimeSnapshot | null;
+}
+
+/**
+ * 2026-08 manual-directional canonical-regime enforcement fix.
+ * `LiveExecutionEngine.canOpenNewEntries()`'s manual-directional branch (live-execution-engine.ts)
+ * used to short-circuit straight to `isManualDirectionalEntryEnabled()` — a maturity/proof-boundary
+ * check only — and never reached `strategyEntryGate()`/`newEntryGate()` (`buildUnifiedRegimeEntryGate`
+ * above), the ONLY path that otherwise consults `canonicalMarketRegimeExecutionPolicy` for new-entry
+ * admission. That meant an operator's manual directional selection could open through a market-wide
+ * PANIC or a LOW_COVERAGE data blackout that every non-manual lane already refuses. Manual mode is
+ * meant to relax MATURITY only (skip "has this lane proven itself enough" checks) — never
+ * account-risk or market-state safety checks; see this task's own design note.
+ *
+ * This factory is a second, independent, narrower gate dedicated to that one branch — modeled
+ * byte-for-byte on `buildIsPaperOrderLiveEligible`'s own step 4b above (an unconditional,
+ * un-escape-hatched call to `canonicalMarketRegimeExecutionPolicy`), the already-shipped precedent
+ * for the identical problem on the paper-mirror path (landed `72b9a1a`). Deliberately NOT
+ * `buildUnifiedRegimeEntryGate` itself (left byte-identical and untouched, so its own existing
+ * structural/behavioral test coverage stays valid) and deliberately NOT honoring
+ * `LIVE_REGIME_NO_TRADE_OVERRIDE`/`REGIME_ENGINE_EXECUTION_GATE_ENABLED` (those two escape hatches
+ * only ever existed inside `buildUnifiedRegimeEntryGate`'s own tail) — this is strictly MORE
+ * conservative, never less safe, than either existing gate.
+ *
+ * Wired into `LiveExecutionEngine`'s new `regimeSafetyGate` option (live-execution-engine.ts) and
+ * AND-ed there with the pre-existing `isManualDirectionalEntryEnabled()` check inside
+ * `canOpenNewEntries()`'s manual branch — see that method's own doc comment. For any input, the new
+ * combined result being `true` implies the old (maturity-only) result was already `true`: this can
+ * only ever narrow what manual mode admits, never widen it.
+ */
+export function buildManualDirectionalRegimeSafetyGate(
+  deps: ManualDirectionalRegimeSafetyGateDeps,
+): () => LiveNewEntryGateDecision {
+  return () => {
+    const decision = canonicalMarketRegimeExecutionPolicy({
+      snapshot: deps.getCanonicalMarketRegimeSnapshot(),
+      nowMs: Date.now(),
+    });
+    return { allowed: decision.allowed, reason: decision.reason };
+  };
+}
+
 export async function buildApp(options: AppOptions = {}): Promise<FastifyInstance> {
   const app = Fastify({
     logger: false,
@@ -1352,6 +1398,11 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       // data, never touches order placement. Reuses the same market-data client scan.ts uses.
       marketDataClient: binanceClient,
       newEntryGate: unifiedRegimeEntryGate,
+      // 2026-08 manual-directional canonical-regime enforcement fix — see
+      // buildManualDirectionalRegimeSafetyGate's own doc comment above for the full rationale.
+      // Shares the SAME getCanonicalMarketRegimeSnapshot closure every other consumer in this
+      // function uses (shorthand reference, not a redefinition).
+      regimeSafetyGate: buildManualDirectionalRegimeSafetyGate({ getCanonicalMarketRegimeSnapshot }),
       // Cross-sectional basket legs (and now the 2 single-symbol executors' positions) share this
       // Binance account but are NOT engine intents — reconcile must know about them or it flags
       // every leg/position as an orphan and disarms one tick after it opens. Lazy closure: the

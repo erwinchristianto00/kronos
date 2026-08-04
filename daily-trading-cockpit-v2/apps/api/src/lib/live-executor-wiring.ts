@@ -13,6 +13,13 @@ export interface LiveExecutorGateEngine {
   canOpenNewEntries(): boolean;
   laneSelectionExplicitlyIncludesLane(laneId: string): boolean;
   laneSelectionAllowsLane(laneId: string): boolean;
+  /** 2026-08 manual-directional canonical-regime enforcement fix: the explanation half of
+   *  canOpenNewEntries() (LiveExecutionEngine.newEntryBlockReason()) — optional so existing fakes
+   *  in tests that predate this field (e.g. live-executor-wiring.test.ts's fakeEngine()) keep
+   *  compiling unchanged and keep newExecutorLaneGate's prior fallback-string behavior. Real
+   *  LiveExecutionEngine instances always define it, so real callers get an accurate, specific
+   *  reason instead of the generic drain-string fallback below. */
+  newEntryBlockReason?(): string | null;
 }
 
 /**
@@ -49,7 +56,15 @@ export function newExecutorLaneGate(
   opts: { mainnetEntryEligible?: boolean } = {},
 ): { allowed: boolean; reason: string | null } {
   if (!engine?.isArmed()) return { allowed: false, reason: "engine is not ARMED" };
-  if (!engine.canOpenNewEntries()) return { allowed: false, reason: "new-entry drain is active (operator paused new entries)" };
+  if (!engine.canOpenNewEntries()) {
+    // 2026-08 manual-directional canonical-regime enforcement fix: this used to hard-code the
+    // drain string for EVERY cause of canOpenNewEntries()===false (kill switch, a non-manual
+    // strategy-gate block, and — now that manual mode is also gated by the canonical regime-policy
+    // check — a manual-mode regime-safety block too). engine.newEntryBlockReason(), when present,
+    // reports the actual condition that bound; the drain string remains the fallback for engines
+    // (or test fakes) that don't define it.
+    return { allowed: false, reason: engine.newEntryBlockReason?.() ?? "new-entry drain is active (operator paused new entries)" };
+  }
   if (
     env === "mainnet" &&
     opts.mainnetEntryEligible === false &&

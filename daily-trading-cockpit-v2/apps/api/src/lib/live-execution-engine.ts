@@ -1192,6 +1192,14 @@ export interface LiveExecutionEngineOptions {
   externalManagedNetQty?: () => Map<string, number>;
   /** Shared strategy/regime admission gate. It affects NEW exposure only; exits always continue. */
   newEntryGate?: () => LiveNewEntryGateDecision;
+  /** 2026-08 manual-directional canonical-regime enforcement fix: an ADDITIONAL, independent gate
+   *  consulted ONLY inside canOpenNewEntries()'s manual-directional branch, AND-ed with
+   *  isManualDirectionalEntryEnabled() — see that method's own doc comment for why. Omit (tests, or
+   *  a hypothetical future construction site that forgets to wire it) to default to always-allowed,
+   *  matching newEntryGate's own default-permissive convention above — the one real production call
+   *  site (app.ts's buildManualDirectionalRegimeSafetyGate) always wires the real
+   *  canonical-regime-backed function, so this default is theoretical, not live risk. */
+  regimeSafetyGate?: () => LiveNewEntryGateDecision;
   /**
    * Real realized P&L (today's UTC-day total + all-time) from every CrossSectionalExecutor and
    * SingleSymbolLaneExecutor instance — lanes that are separate classes with their own stores and
@@ -1941,6 +1949,7 @@ export class LiveExecutionEngine {
   private readonly fillConfirmRetryDelayMs: number;
   private readonly externalManagedNetQty: () => Map<string, number>;
   private readonly newEntryGate: () => LiveNewEntryGateDecision;
+  private readonly regimeSafetyGate: () => LiveNewEntryGateDecision;
   private readonly getExternalRealizedPnlUsd: () => { today: number; allTime: number };
   private readonly onKillSwitchEngaged: ((reason: string) => Promise<void>) | null;
   private readonly laneDirectionForId: (laneId: string) => "LONG" | "SHORT" | "NEUTRAL" | null;
@@ -2005,6 +2014,7 @@ export class LiveExecutionEngine {
     this.fillConfirmRetryDelayMs = options.fillConfirmRetryDelayMs ?? 400;
     this.externalManagedNetQty = options.externalManagedNetQty ?? (() => new Map());
     this.newEntryGate = options.newEntryGate ?? (() => ({ allowed: true, reason: null }));
+    this.regimeSafetyGate = options.regimeSafetyGate ?? (() => ({ allowed: true, reason: null }));
     this.getExternalRealizedPnlUsd = options.getExternalRealizedPnlUsd ?? (() => ({ today: 0, allTime: 0 }));
     this.onKillSwitchEngaged = options.onKillSwitchEngaged ?? null;
     this.laneDirectionForId = options.laneDirectionForId ?? (() => null);
@@ -2261,25 +2271,85 @@ export class LiveExecutionEngine {
     }
   }
 
-  /** Armed means exits/reconcile are active. This stricter method controls NEW exposure only. */
-  canOpenNewEntries(): boolean {
+  /** 2026-08 manual-directional canonical-regime enforcement fix: the SAME fail-closed try/catch
+   *  shape as strategyEntryGate() above, wrapping the injected regimeSafetyGate — the canonical
+   *  regime-policy check (panic/coverage) manual mode used to bypass entirely. Consulted ONLY from
+   *  entryGateDecision()'s manual-directional branch below; never replaces
+   *  isManualDirectionalEntryEnabled(), only ANDs with it. */
+  private manualRegimeSafetyGate(): LiveNewEntryGateDecision {
+    try {
+      const result = this.regimeSafetyGate();
+      return result && typeof result.allowed === "boolean"
+        ? { allowed: result.allowed, reason: result.reason ?? null }
+        : { allowed: false, reason: "invalid manual regime-safety gate response" };
+    } catch (error) {
+      return { allowed: false, reason: `manual regime-safety gate failed: ${(error as Error).message}` };
+    }
+  }
+
+  /** Single source of truth for BOTH canOpenNewEntries()'s boolean and newEntryBlockReason()'s
+   *  explanation, so the two can never drift apart — see live-executor-wiring.ts's
+   *  newExecutorLaneGate header comment for the exact incident class (a hand-maintained mirror of a
+   *  predicate's branch order silently falling one edit behind) this same shape exists to end here
+   *  too. Branch order and every condition are UNCHANGED from the pre-2026-08 canOpenNewEntries()
+   *  body; `!this.armed || st.killedAt` is split into two sequential ifs (both pure reads, no side
+   *  effects) purely to attach distinct reasons. The only actual behavior change is the manual
+   *  branch gaining a second, AND-ed condition (manualRegimeSafetyGate() — 2026-08 fix, see its own
+   *  doc comment and app.ts's buildManualDirectionalRegimeSafetyGate). */
+  private entryGateDecision(): LiveNewEntryGateDecision {
     const st = this.store.getState();
-    if (!this.armed || st.killedAt) return false;
-    if (this.isNewEntryDrainActive()) return false;
+    if (!this.armed) return { allowed: false, reason: "engine is not ARMED" };
+    if (st.killedAt) return { allowed: false, reason: st.killReason ?? "kill switch latched" };
+    if (this.isNewEntryDrainActive()) {
+      return { allowed: false, reason: "new-entry drain is active (operator paused new entries)" };
+    }
     // Testnet collect-all still honours arm/disarm, the kill switch, and an
     // operator drain. It deliberately does not inherit strategy admission.
-    if (this.config.mirrorAllPaperOrders) return true;
-    // Manual mode bypasses strategy/admission blockers only when the scanner has produced a current
-    // directional Entry Decision. Exchange health, stop/TP placement, caps, and the kill switch remain.
-    if (st.manualSelectorMode && st.manualDirectionalAllocations) return this.isManualDirectionalEntryEnabled();
-    return this.strategyEntryGate().allowed;
+    if (this.config.mirrorAllPaperOrders) return { allowed: true, reason: null };
+    if (st.manualSelectorMode && st.manualDirectionalAllocations) {
+      // Manual mode bypasses strategy/admission blockers only when the scanner has produced a
+      // current directional Entry Decision. Exchange health, stop/TP placement, caps, and the kill
+      // switch remain (all checked above, unconditionally, before this branch is ever reached).
+      if (!this.isManualDirectionalEntryEnabled()) {
+        return {
+          allowed: false,
+          reason: "manual-directional mode is waiting for a fresh Entry Decision (no current directional bias)",
+        };
+      }
+      // 2026-08 manual-directional canonical-regime enforcement fix: manual mode may relax MATURITY
+      // only (isManualDirectionalEntryEnabled() above) — it must never bypass the canonical regime
+      // engine's own panic/coverage safety check the way it previously did. AND, never OR: for any
+      // input, this can only narrow what manual mode admits relative to the old behavior, never
+      // widen it.
+      const safety = this.manualRegimeSafetyGate();
+      return safety.allowed ? { allowed: true, reason: null } : safety;
+    }
+    return this.strategyEntryGate();
+  }
+
+  /** Armed means exits/reconcile are active. This stricter method controls NEW exposure only. */
+  canOpenNewEntries(): boolean {
+    return this.entryGateDecision().allowed;
+  }
+
+  /** The explanation half of canOpenNewEntries() — which specific condition is holding new entries
+   *  false right now, computed from the SAME decision canOpenNewEntries() reads (entryGateDecision()
+   *  above) so the boolean and its reason can never disagree. null means every condition passed.
+   *  Surfaced via getStatus().newEntries.blockReason and, for SingleSymbolLaneExecutor lanes
+   *  specifically, via live-executor-wiring.ts's newExecutorLaneGate -> app.ts's
+   *  legacyEntryBlockReason -> each lane's own getStatus().entryBlockReason field. */
+  newEntryBlockReason(): string | null {
+    return this.entryGateDecision().reason;
   }
 
   /** Same as canOpenNewEntries() but never delegates to the manual-directional bias gate — for
    *  baskets (e.g. CROSS_SECTIONAL_MARKET_NEUTRAL) whose own signal has no single-symbol
    *  directional bias to align with, so the manual selector's LONG/SHORT allocation is simply
    *  irrelevant to them. Manual mode still resolves via strategyEntryGate() below, exactly as
-   *  when manual mode is off — this only removes the mode-specific short-circuit. */
+   *  when manual mode is off — this only removes the mode-specific short-circuit. Unaffected by the
+   *  2026-08 manual-directional canonical-regime enforcement fix above: this method never took the
+   *  manual short-circuit to begin with, so it already always ran the full
+   *  canonical-regime-backed strategyEntryGate() check. */
   canOpenNewEntriesIgnoringManualDirectional(): boolean {
     const st = this.store.getState();
     if (!this.armed || st.killedAt) return false;
@@ -2338,6 +2408,11 @@ export class LiveExecutionEngine {
       armed: this.armed,
       newEntries: {
         allowed: this.canOpenNewEntries(),
+        // 2026-08 manual-directional canonical-regime enforcement fix: surfaces WHICH condition is
+        // holding `allowed` false right now (armed/kill/drain/manual-decision-stale/regime-safety/
+        // strategy-gate) — same source as `allowed` (entryGateDecision()), so they can never
+        // disagree. See newEntryBlockReason()'s own doc comment.
+        blockReason: this.newEntryBlockReason(),
         drainActive: this.isNewEntryDrainActive(),
         persistedDrain: st.newEntriesPaused === true,
         pausedAt: st.newEntriesPausedAt ?? null,
