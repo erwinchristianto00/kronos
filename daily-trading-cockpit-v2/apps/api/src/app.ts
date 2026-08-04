@@ -149,6 +149,7 @@ import {
   innovationCampaignAdmission,
   computeInnovationExposure,
   buildInnovationCampaignDiagnostics,
+  campaignCapForLane,
   type InnovationCampaignDiagnostics,
 } from "./lib/innovation-campaign.js";
 import { clusterOf } from "./lib/correlation-clusters.js";
@@ -2727,6 +2728,11 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           existingNotionalForSymbol: (symbol) => crossSectionalNotionalForSymbolExcluding(executor, symbol),
           maxNotionalPerSymbolAcrossLanes,
           ...sharedExposureReservation,
+          // Atomic campaign-cap enforcement (account-exposure-coordinator.ts's reserve() gate 2) —
+          // re-read fresh on every call, same "no caching, operator edit takes effect immediately"
+          // contract as loadInnovationCampaign itself. Only these innovation construction sites ever
+          // populate campaignCap; every mainnet executor below gets the default () => undefined.
+          campaignCap: () => campaignCapForLane(loadInnovationCampaign("data", "innovation-campaign.json"), descriptor.laneId),
         });
         innovationBasketExecutors.push(executor);
       }
@@ -2778,6 +2784,9 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
             onPositionClosed: (netUsd) => engineForGate.recordExternalConsecutiveLossOutcome(netUsd),
             ...singleSymbolEntryClaims,
             ...sharedExposureReservation,
+            // Atomic campaign-cap enforcement — see the identical comment at the basket-descriptor
+            // construction site above.
+            campaignCap: () => campaignCapForLane(loadInnovationCampaign("data", "innovation-campaign.json"), descriptor.laneId),
           });
           innovationSingleSymbolExecutors.push(executor);
         }

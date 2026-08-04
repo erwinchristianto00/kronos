@@ -8,6 +8,7 @@ import {
   AccountExposureReservationStore,
   type AccountExposureCoordinatorOptions,
   type ExposureReservation,
+  type ExposureReserveCampaignCap,
   type LegacyMirrorOpenIntent,
   type ReservationStatus,
 } from "../src/lib/account-exposure-coordinator.js";
@@ -822,5 +823,391 @@ describe("restart safety: pending exposure is never silently lost", () => {
     expect(sweep).toEqual({ checked: 1, committed: 0, released: 0, inconclusive: 1 });
     expect(revivedStore.getState().reservations[0]!.status).toBe("RESERVED");
     expect(revivedCoord.reserve({ executorId: "NEW2", symbol: "BTCUSDT", direction: "SHORT", requestedNotionalUsd: 10, clientOrderId: "new-2" }).ok).toBe(false);
+  });
+});
+
+// =================================================================================================
+// INNOVATION-CAMPAIGN CAPS — reserve()'s gate 2 (2026-08-05 fix). Everything above this line proves
+// the pre-existing 5 axes; everything below proves the NEW campaign axis folded into the SAME atomic
+// synchronous call, fed by req.campaignCap (account-exposure-coordinator.ts's own
+// ExposureReserveCampaignCap — populated ONLY by innovation-campaign.ts's campaignCapForLane, see
+// innovation-campaign.test.ts's own "campaignCapForLane" describe block for that translation layer).
+// Every existing describe block above is completely untouched and still passes unmodified — gate 2
+// lives entirely inside `if (req.campaignCap)`, dead code for every request above this line.
+// =================================================================================================
+
+// ─── campaign-specific fakes (laneId-bearing — the pre-existing fakes above deliberately omit
+// laneId since buildSnapshot()'s own 5 axes never read it; buildCampaignExposure() does) ───────────
+
+function fakeSingleSymbolExecutorLane(laneId: string, positions: SingleSymbolPosition[]): SingleSymbolLaneExecutor {
+  return { getStatus: () => ({ laneId, openPositions: positions }) } as unknown as SingleSymbolLaneExecutor;
+}
+function fakeXsecExecutorLane(laneId: string, baskets: ExecutorBasket[], orphanedLegs: OrphanedLeg[] = []): CrossSectionalExecutor {
+  return { getStatus: () => ({ laneId, openBaskets: baskets, orphanedLegs }) } as unknown as CrossSectionalExecutor;
+}
+/** basketId defaults to "b1" via the shared fakeBasket() helper above — override it explicitly
+ *  whenever a test needs to correlate this basket with specific S5 reservation rows sharing the
+ *  same basketId (see the S2/S5 handoff test below). */
+function fakeBasketWithId(basketId: string, legs: ExecutorBasket["legs"], status: ExecutorBasket["status"] = "COMPLETE"): ExecutorBasket {
+  return { ...fakeBasket(legs), basketId, status };
+}
+function fakeCampaignCap(over: Partial<ExposureReserveCampaignCap> = {}): ExposureReserveCampaignCap {
+  return {
+    campaignId: "camp-1",
+    campaignLaneIds: ["INNOV_A", "INNOV_B"],
+    // Deliberately huge, not 0/disabled like the OTHER axes' test defaults above — an ExposureReserveCampaignCap
+    // is only ever present at all when campaignCapForLane already found an ACTIVE campaign, so "no cap
+    // configured" isn't a real state this object can represent; tests that want to exercise ONE axis
+    // in isolation override just that field, matching makeCoordinator()'s own convention above.
+    globalMaxPositions: 1_000_000,
+    globalNotionalCap: 1_000_000,
+    ...over,
+  };
+}
+
+describe("AccountExposureCoordinator.reserve — innovation-campaign caps (gate 2, default-off)", () => {
+  it("[REQ-1 coordinator layer] req.campaignCap absent -> gate 2 is a complete no-op, even when an innovation-lane-shaped pre-existing exposure would blow a HYPOTHETICAL cap of 1 — proves gate 2 cannot leak into any request that doesn't explicitly opt in (mainnet posture unaffected)", () => {
+    const dir = tmpDir();
+    const exec = fakeSingleSymbolExecutorLane("INNOV_A", [fakePosition("SOLUSDT", "LONG", 1, 100)]);
+    const coord = makeCoordinator({ dataDir: dir, singleSymbol: [exec] });
+    // No campaignCap on this request at all — matches every mainnet SingleSymbolLaneExecutor /
+    // CrossSectionalExecutor construction site in app.ts, which never populates this field.
+    const res = coord.reserve({ executorId: "INNOV_A", symbol: "AVAXUSDT", direction: "LONG", requestedNotionalUsd: 10, clientOrderId: "c1" });
+    expect(res.ok).toBe(true);
+  });
+});
+
+describe("AccountExposureCoordinator.reserve — innovation-campaign caps (gate 2): global position cap", () => {
+  it("[REQ-4] denies the reservation that would be the (cap+1)th innovation position; allows when strictly below the cap", () => {
+    const dir = tmpDir();
+    const execA = fakeSingleSymbolExecutorLane("INNOV_A", [fakePosition("SOLUSDT", "LONG", 1, 100)]); // 1 pre-existing position
+    const coord = makeCoordinator({ dataDir: dir, singleSymbol: [execA] });
+    const laneIds = ["INNOV_A", "INNOV_B"];
+    const atCap = coord.reserve({
+      executorId: "INNOV_B", symbol: "AVAXUSDT", direction: "LONG", requestedNotionalUsd: 10, clientOrderId: "c1",
+      campaignCap: fakeCampaignCap({ campaignLaneIds: laneIds, globalMaxPositions: 1 }),
+    });
+    expect(atCap.ok).toBe(false);
+    expect(atCap.reason).toMatch(/campaign camp-1 global innovation position cap reached \(1\/1\)/);
+
+    const dir2 = tmpDir();
+    const coord2 = makeCoordinator({ dataDir: dir2 }); // zero pre-existing exposure anywhere
+    const belowCap = coord2.reserve({
+      executorId: "INNOV_B", symbol: "AVAXUSDT", direction: "LONG", requestedNotionalUsd: 10, clientOrderId: "c1",
+      campaignCap: fakeCampaignCap({ campaignLaneIds: laneIds, globalMaxPositions: 1 }),
+    });
+    expect(belowCap.ok).toBe(true);
+  });
+
+  it("EXACTLY the next reservation attempt is denied once the cap is reached — not merely 'eventually', proven by immediately retrying on a fresh symbol right after the cap-filling reservation lands", () => {
+    const dir = tmpDir();
+    const coord = makeCoordinator({ dataDir: dir });
+    const laneIds = ["INNOV_A"];
+    const cap = fakeCampaignCap({ campaignLaneIds: laneIds, globalMaxPositions: 1 });
+    const first = coord.reserve({ executorId: "INNOV_A", symbol: "SOLUSDT", direction: "LONG", requestedNotionalUsd: 10, clientOrderId: "c1", campaignCap: cap });
+    expect(first.ok).toBe(true);
+    const second = coord.reserve({ executorId: "INNOV_A", symbol: "AVAXUSDT", direction: "LONG", requestedNotionalUsd: 10, clientOrderId: "c2", campaignCap: cap });
+    expect(second.ok).toBe(false);
+    expect(second.reason).toMatch(/global innovation position cap reached \(1\/1\)/);
+  });
+
+  it("a lane OUTSIDE campaignLaneIds contributes NOTHING to the global count (buildCampaignExposure is correctly scoped, not account-wide)", () => {
+    const dir = tmpDir();
+    const outsider = fakeSingleSymbolExecutorLane("NOT_AN_INNOVATION_LANE", [fakePosition("SOLUSDT", "LONG", 1, 100), fakePosition("BTCUSDT", "LONG", 1, 100)]);
+    const coord = makeCoordinator({ dataDir: dir, singleSymbol: [outsider] });
+    const res = coord.reserve({
+      executorId: "INNOV_A", symbol: "AVAXUSDT", direction: "LONG", requestedNotionalUsd: 10, clientOrderId: "c1",
+      campaignCap: fakeCampaignCap({ campaignLaneIds: ["INNOV_A"], globalMaxPositions: 1 }),
+    });
+    expect(res.ok).toBe(true); // the outsider's 2 positions never counted against this campaign's cap of 1
+  });
+});
+
+describe("AccountExposureCoordinator.reserve — innovation-campaign caps (gate 2): global notional cap", () => {
+  it("[REQ-4] denies once existing+requested EXCEEDS the cap, allows exactly AT the cap (matches this coordinator's own established '+requested > cap' convention, NOT the old campaign module's looser pre-add '>=' form)", () => {
+    const dir = tmpDir();
+    const execA = fakeSingleSymbolExecutorLane("INNOV_A", [fakePosition("SOLUSDT", "LONG", 1, 60)]); // $60 existing
+    const coord = makeCoordinator({ dataDir: dir, singleSymbol: [execA] });
+    const laneIds = ["INNOV_A", "INNOV_B"];
+    const over = coord.reserve({
+      executorId: "INNOV_B", symbol: "AVAXUSDT", direction: "LONG", requestedNotionalUsd: 41, clientOrderId: "c1", // 60+41=101>100
+      campaignCap: fakeCampaignCap({ campaignLaneIds: laneIds, globalNotionalCap: 100 }),
+    });
+    expect(over.ok).toBe(false);
+    expect(over.reason).toMatch(/campaign camp-1 global innovation notional cap exceeded/);
+
+    const exact = coord.reserve({
+      executorId: "INNOV_B", symbol: "NEARUSDT", direction: "LONG", requestedNotionalUsd: 40, clientOrderId: "c2", // 60+40=100, exactly at cap
+      campaignCap: fakeCampaignCap({ campaignLaneIds: laneIds, globalNotionalCap: 100 }),
+    });
+    expect(exact.ok).toBe(true);
+  });
+});
+
+describe("AccountExposureCoordinator.reserve — innovation-campaign caps (gate 2): per-lane caps", () => {
+  it("[REQ-4] per-lane position cap blocks only the REQUESTING lane's own supplied cap value; a sibling lane with equal raw exposure but no cap entry (campaignCapForLane -> laneMaxPositions undefined) is unaffected", () => {
+    const dir = tmpDir();
+    const execA = fakeSingleSymbolExecutorLane("INNOV_A", [fakePosition("SOLUSDT", "LONG", 1, 10), fakePosition("BTCUSDT", "LONG", 1, 10)]); // 2 on A
+    const execB = fakeSingleSymbolExecutorLane("INNOV_B", [fakePosition("NEARUSDT", "LONG", 1, 10), fakePosition("ETHUSDT", "LONG", 1, 10)]); // 2 on B, identical raw count
+    const coord = makeCoordinator({ dataDir: dir, singleSymbol: [execA, execB] });
+    const laneIds = ["INNOV_A", "INNOV_B"];
+
+    // campaignCapForLane would build THIS shape for lane A (perLaneCaps has an entry for A only).
+    const blockedA = coord.reserve({
+      executorId: "INNOV_A", symbol: "SUIUSDT", direction: "LONG", requestedNotionalUsd: 5, clientOrderId: "ca",
+      campaignCap: fakeCampaignCap({ campaignLaneIds: laneIds, laneMaxPositions: 2 }),
+    });
+    expect(blockedA.ok).toBe(false);
+    expect(blockedA.reason).toMatch(/campaign camp-1 lane INNOV_A position cap reached \(2\/2\)/);
+
+    // campaignCapForLane would build THIS shape for lane B (no perLaneCaps entry -> undefined).
+    const allowedB = coord.reserve({
+      executorId: "INNOV_B", symbol: "OPUSDT", direction: "LONG", requestedNotionalUsd: 5, clientOrderId: "cb",
+      campaignCap: fakeCampaignCap({ campaignLaneIds: laneIds }), // laneMaxPositions left undefined
+    });
+    expect(allowedB.ok).toBe(true);
+  });
+
+  it("per-lane notional cap blocks only the requesting lane; a sibling lane with equal raw notional but no cap entry is unaffected", () => {
+    const dir = tmpDir();
+    const execA = fakeSingleSymbolExecutorLane("INNOV_A", [fakePosition("SOLUSDT", "LONG", 1, 100)]); // $100 on A
+    const execB = fakeSingleSymbolExecutorLane("INNOV_B", [fakePosition("NEARUSDT", "LONG", 1, 100)]); // $100 on B
+    const coord = makeCoordinator({ dataDir: dir, singleSymbol: [execA, execB] });
+    const laneIds = ["INNOV_A", "INNOV_B"];
+
+    const blockedA = coord.reserve({
+      executorId: "INNOV_A", symbol: "SUIUSDT", direction: "LONG", requestedNotionalUsd: 1, clientOrderId: "ca", // 100+1=101>100
+      campaignCap: fakeCampaignCap({ campaignLaneIds: laneIds, laneMaxNotionalUsd: 100 }),
+    });
+    expect(blockedA.ok).toBe(false);
+    expect(blockedA.reason).toMatch(/campaign camp-1 lane INNOV_A notional cap exceeded/);
+
+    const allowedB = coord.reserve({
+      executorId: "INNOV_B", symbol: "OPUSDT", direction: "LONG", requestedNotionalUsd: 50, clientOrderId: "cb",
+      campaignCap: fakeCampaignCap({ campaignLaneIds: laneIds }), // laneMaxNotionalUsd left undefined
+    });
+    expect(allowedB.ok).toBe(true);
+  });
+});
+
+// ─── multi-leg CrossSectionalExecutor basket position-count semantics — the subtlest part of this
+// axis (design's own §6 risk item): campaign "position" means ONE PER BASKET, never one per leg, and
+// a basket mid-open (its full leg plan already RESERVED, but not yet visible via S2's openBaskets, OR
+// already pushed to the executor's own store with legs:[] and ALSO still visible via S5) must land on
+// exactly one count either way — never zero (silently permissive), never more than one (self-defeating
+// a lane's own basket against its own in-flight legs). ───────────────────────────────────────────────
+
+describe("AccountExposureCoordinator.reserve — innovation-campaign caps (gate 2): multi-leg CrossSectionalExecutor basket position-count semantics", () => {
+  it("[SELF-EXCLUSION] a fresh N-leg basket's own leg-2 reservation is NOT rejected by leg-1's own just-inserted reservation — globalMaxPositions=1 with ZERO pre-existing exposure still allows a full 2-leg basket to open in one atomic sizing pass", () => {
+    const dir = tmpDir();
+    const coord = makeCoordinator({ dataDir: dir });
+    const cap = fakeCampaignCap({ campaignLaneIds: ["XSEC_INNOV"], globalMaxPositions: 1 });
+    const leg1 = coord.reserve({ executorId: "XSEC_INNOV", symbol: "SOLUSDT", direction: "LONG", requestedNotionalUsd: 10, clientOrderId: "leg1", basketId: "basket-1", campaignCap: cap });
+    expect(leg1.ok).toBe(true);
+    const leg2 = coord.reserve({ executorId: "XSEC_INNOV", symbol: "DOGEUSDT", direction: "SHORT", requestedNotionalUsd: 10, clientOrderId: "leg2", basketId: "basket-1", campaignCap: cap });
+    expect(leg2.ok).toBe(true); // must NOT be rejected by its own sibling leg's reservation
+  });
+
+  it("[SELF-EXCLUSION SCOPE] the self-exclusion is scoped to (executorId, basketId) of THIS request only — a DIFFERENT basket's in-flight leg reservation is NOT excluded, and correctly consumes the slot against a third party's fresh-basket attempt", () => {
+    const dir = tmpDir();
+    const coord = makeCoordinator({ dataDir: dir });
+    const cap = fakeCampaignCap({ campaignLaneIds: ["XSEC_INNOV"], globalMaxPositions: 1 });
+    const otherBasketLeg = coord.reserve({ executorId: "XSEC_INNOV", symbol: "SOLUSDT", direction: "LONG", requestedNotionalUsd: 10, clientOrderId: "ob1", basketId: "basket-OTHER", campaignCap: cap });
+    expect(otherBasketLeg.ok).toBe(true);
+    const freshBasketLeg1 = coord.reserve({ executorId: "XSEC_INNOV", symbol: "DOGEUSDT", direction: "SHORT", requestedNotionalUsd: 10, clientOrderId: "fb1", basketId: "basket-FRESH", campaignCap: cap });
+    expect(freshBasketLeg1.ok).toBe(false); // the slot is already consumed by the OTHER basket's own leg
+    expect(freshBasketLeg1.reason).toMatch(/global innovation position cap reached \(1\/1\)/);
+  });
+
+  it("[S2/S5 HANDOFF, design §6 risk item] a basket already pushed to its own executor store (status RESERVED, legs still []) while its 2 leg reservations are STILL RESERVED in the ledger counts as EXACTLY ONE position — proves seenBasketIds excludes S5 double-counting what S2 already counted, reproducing cross-sectional-executor.ts's real maybeOpenBasket() ordering (basket pushed BEFORE any leg's order is placed)", () => {
+    const dir = tmpDir();
+    const store = new AccountExposureReservationStore(dir);
+    // The 2 leg reservations maybeOpenBasket()'s own sizing loop already took, synchronously, before
+    // the basket record itself was ever pushed to the executor's store.
+    pushRawReservation(store, { reservationId: "leg-1", executorId: "XSEC_INNOV", kind: "CROSS_SECTIONAL_LEG", basketId: "basket-1", symbol: "SOLUSDT", direction: "LONG", requestedNotionalUsd: 30, clientOrderId: "e0" });
+    pushRawReservation(store, { reservationId: "leg-2", executorId: "XSEC_INNOV", kind: "CROSS_SECTIONAL_LEG", basketId: "basket-1", symbol: "DOGEUSDT", direction: "SHORT", requestedNotionalUsd: 20, clientOrderId: "e1" });
+    // The basket record itself, already visible via getStatus().openBaskets (isBasketLive() is true
+    // for RESERVED) — legs:[] exactly matches real production state at this instant (no leg has
+    // placed an order yet), so S2 contributes 0 notional here; the REAL notional comes from S5 above.
+    const xsec = fakeXsecExecutorLane("XSEC_INNOV", [fakeBasketWithId("basket-1", [], "RESERVED")]);
+    const coord = makeCoordinator({ dataDir: dir, store, crossSectional: [xsec] });
+
+    // A THIRD PARTY's attempt (different executorId+basketId) must be rejected — the cap of 1 is
+    // already fully consumed by this ONE basket, never 2 (S2) + 2 more (S5's two legs) = 3, and
+    // never 0 (if S2/S5 accidentally cancelled each other out to nothing).
+    const thirdParty = coord.reserve({
+      executorId: "XSEC_INNOV", symbol: "AVAXUSDT", direction: "LONG", requestedNotionalUsd: 5, clientOrderId: "c-new", basketId: "basket-DIFFERENT",
+      campaignCap: fakeCampaignCap({ campaignLaneIds: ["XSEC_INNOV"], globalMaxPositions: 1 }),
+    });
+    expect(thirdParty.ok).toBe(false);
+    expect(thirdParty.reason).toMatch(/global innovation position cap reached \(1\/1\)/); // exactly 1, never 2 or 3, never 0
+  });
+
+  it("once a basket is fully COMMITTED (S1/S2-visible with real legs, ledger rows no longer RESERVED), it still counts as exactly ONE position via S2 alone — S5 correctly stops contributing the instant status leaves RESERVED", () => {
+    const dir = tmpDir();
+    const store = new AccountExposureReservationStore(dir);
+    const r1 = pushRawReservation(store, { executorId: "XSEC_INNOV", kind: "CROSS_SECTIONAL_LEG", basketId: "basket-1", symbol: "SOLUSDT", requestedNotionalUsd: 30, clientOrderId: "e0", status: "COMMITTED", committedQty: 3, committedNotionalUsd: 30 });
+    const r2 = pushRawReservation(store, { executorId: "XSEC_INNOV", kind: "CROSS_SECTIONAL_LEG", basketId: "basket-1", symbol: "DOGEUSDT", requestedNotionalUsd: 20, clientOrderId: "e1", status: "COMMITTED", committedQty: 200, committedNotionalUsd: 20 });
+    expect(r1.status).toBe("COMMITTED");
+    expect(r2.status).toBe("COMMITTED");
+    const xsec = fakeXsecExecutorLane("XSEC_INNOV", [
+      fakeBasketWithId("basket-1", [fakeLeg("SOLUSDT", "LONG", 3, 10), fakeLeg("DOGEUSDT", "SHORT", 200, 0.1)], "COMPLETE"),
+    ]);
+    const coord = makeCoordinator({ dataDir: dir, store, crossSectional: [xsec] });
+    const thirdParty = coord.reserve({
+      executorId: "XSEC_INNOV", symbol: "AVAXUSDT", direction: "LONG", requestedNotionalUsd: 5, clientOrderId: "c-new",
+      campaignCap: fakeCampaignCap({ campaignLaneIds: ["XSEC_INNOV"], globalMaxPositions: 1 }),
+    });
+    expect(thirdParty.ok).toBe(false);
+    expect(thirdParty.reason).toMatch(/global innovation position cap reached \(1\/1\)/); // still 1, not 3 (2 COMMITTED rows + 1 basket)
+  });
+});
+
+// =================================================================================================
+// [REQ-5] THE CORE RACE TEST — the entire reason this axis exists. "Simultaneous" here means exactly
+// what this coordinator's own atomicity argument requires (see account-exposure-coordinator.ts's own
+// header comment and reserve()'s own doc comment: reserve() has ZERO internal `await`, so two
+// SYNCHRONOUS back-to-back calls with nothing awaited in between is the REAL interleaving two
+// executors' own event-loop continuations would produce — not a simplification of it). This is the
+// exact same "simultaneity" model this file's own PRE-EXISTING single-flight-per-symbol tests above
+// already use (e.g. "rejects a second reservation for the same symbol while the first is RESERVED"),
+// now applied to the campaign axis. See the approved design doc's own §5 for the full argument this
+// test embodies.
+// =================================================================================================
+
+describe("[REQ-5] THE CORE RACE TEST — two back-to-back reserve() calls for the LAST unit of campaign capacity", () => {
+  it("exactly ONE of two DIFFERENT executor instances (two different innovation lanes) racing the same global position cap succeeds; the other is rejected with a campaign-cap reason — never both, never neither", () => {
+    const dir = tmpDir();
+    const coord = makeCoordinator({ dataDir: dir }); // zero pre-existing exposure anywhere
+    const laneIds = ["INNOV_SS_LANE", "INNOV_XSEC_LANE"]; // mirrors the ground truth's own example:
+    // "an innovation SingleSymbol lane racing an innovation CrossSectional lane"
+    const capA = fakeCampaignCap({ campaignLaneIds: laneIds, globalMaxPositions: 1 });
+    const capB = fakeCampaignCap({ campaignLaneIds: laneIds, globalMaxPositions: 1 });
+
+    const resultA = coord.reserve({ executorId: "INNOV_SS_LANE", symbol: "SOLUSDT", direction: "LONG", requestedNotionalUsd: 10, clientOrderId: "race-a", campaignCap: capA });
+    const resultB = coord.reserve({ executorId: "INNOV_XSEC_LANE", symbol: "AVAXUSDT", direction: "LONG", requestedNotionalUsd: 10, clientOrderId: "race-b", campaignCap: capB });
+
+    const results = [resultA, resultB];
+    expect(results.filter((r) => r.ok)).toHaveLength(1); // never both
+    const rejected = results.filter((r) => !r.ok);
+    expect(rejected).toHaveLength(1); // never neither
+    expect(rejected[0]!.reason).toMatch(/campaign camp-1 global innovation position cap reached \(1\/1\)/);
+  });
+
+  it("order-independent: swapping which executor calls reserve() first still yields exactly one winner — not a first-mover artifact of the test's own call order", () => {
+    const dir = tmpDir();
+    const coord = makeCoordinator({ dataDir: dir });
+    const laneIds = ["INNOV_SS_LANE", "INNOV_XSEC_LANE"];
+    const capB = fakeCampaignCap({ campaignLaneIds: laneIds, globalMaxPositions: 1 });
+    const capA = fakeCampaignCap({ campaignLaneIds: laneIds, globalMaxPositions: 1 });
+
+    const resultB = coord.reserve({ executorId: "INNOV_XSEC_LANE", symbol: "AVAXUSDT", direction: "LONG", requestedNotionalUsd: 10, clientOrderId: "race-b2", campaignCap: capB });
+    const resultA = coord.reserve({ executorId: "INNOV_SS_LANE", symbol: "SOLUSDT", direction: "LONG", requestedNotionalUsd: 10, clientOrderId: "race-a2", campaignCap: capA });
+
+    expect([resultA, resultB].filter((r) => r.ok)).toHaveLength(1);
+  });
+
+  it("also holds for the SAME lane's own per-signal loop (ONE SingleSymbolLaneExecutor attempting two entries within the same tick) — the second reserve() call sees the first's own just-inserted row", () => {
+    const dir = tmpDir();
+    const coord = makeCoordinator({ dataDir: dir });
+    const cap = fakeCampaignCap({ campaignLaneIds: ["INNOV_SS_LANE"], globalMaxPositions: 1 });
+    const first = coord.reserve({ executorId: "INNOV_SS_LANE", symbol: "SOLUSDT", direction: "LONG", requestedNotionalUsd: 10, clientOrderId: "sig-1", campaignCap: cap });
+    const second = coord.reserve({ executorId: "INNOV_SS_LANE", symbol: "AVAXUSDT", direction: "LONG", requestedNotionalUsd: 10, clientOrderId: "sig-2", campaignCap: cap });
+    expect([first, second].filter((r) => r.ok)).toHaveLength(1);
+    expect([first, second].find((r) => !r.ok)!.reason).toMatch(/global innovation position cap reached \(1\/1\)/);
+  });
+
+  it("also holds for the GLOBAL NOTIONAL axis: two concurrent reservations that would TOGETHER exceed globalNotionalCap — exactly one succeeds", () => {
+    const dir = tmpDir();
+    const coord = makeCoordinator({ dataDir: dir });
+    const laneIds = ["INNOV_A", "INNOV_B"];
+    const cap = fakeCampaignCap({ campaignLaneIds: laneIds, globalNotionalCap: 100 });
+    const first = coord.reserve({ executorId: "INNOV_A", symbol: "SOLUSDT", direction: "LONG", requestedNotionalUsd: 60, clientOrderId: "n1", campaignCap: cap });
+    const second = coord.reserve({ executorId: "INNOV_B", symbol: "AVAXUSDT", direction: "LONG", requestedNotionalUsd: 60, clientOrderId: "n2", campaignCap: cap }); // 60+60=120>100
+    expect(first.ok).toBe(true);
+    expect(second.ok).toBe(false);
+    expect(second.reason).toMatch(/global innovation notional cap exceeded/);
+  });
+});
+
+// =================================================================================================
+// RESTART — req #6: a RESERVED-but-ambiguous campaign reservation survives a simulated restart (a
+// BRAND NEW coordinator/store instance re-reading the SAME on-disk ledger file — same convention as
+// the pre-existing "restart safety: pending exposure is never silently lost" block above) and is
+// resolved via reconciliation — never silently dropped (stays occupied until resolved), never
+// silently double-counted (a resolved-to-COMMITTED row stops contributing to the CAMPAIGN axis the
+// same instant it stops contributing to every other axis: the shared `status !== "RESERVED"` guard
+// at the top of buildCampaignExposure's own S5 walk).
+// =================================================================================================
+
+describe("restart safety: a campaign-relevant reservation is never silently lost or double-counted across a restart", () => {
+  it("[REQ-6] a RESERVED campaign reservation survives a simulated restart and still occupies the campaign's global slot; reconciliation that stays inconclusive (exchange unreachable) leaves it RESERVED and STILL occupying that slot — never silently dropped", async () => {
+    const dir = tmpDir();
+    const laneIds = ["XSEC_INNOV"];
+    {
+      const deadStore = new AccountExposureReservationStore(dir);
+      const deadCoord = makeCoordinator({ dataDir: dir, store: deadStore });
+      const r = deadCoord.reserve({
+        executorId: "XSEC_INNOV", symbol: "SOLUSDT", direction: "LONG", requestedNotionalUsd: 50, clientOrderId: "dead-1",
+        campaignCap: fakeCampaignCap({ campaignLaneIds: laneIds, globalMaxPositions: 1 }),
+      });
+      expect(r.ok).toBe(true);
+      deadStore.save();
+    }
+
+    // "Restart": a brand-new store instance reloading the SAME on-disk ledger file — no executor,
+    // no coordinator, no in-memory state survives from the "dead" process above.
+    const revivedStore = new AccountExposureReservationStore(dir);
+    expect(revivedStore.getState().reservations).toHaveLength(1);
+    expect(revivedStore.getState().reservations[0]!.status).toBe("RESERVED");
+    expect(revivedStore.getState().reservations[0]!.campaignId).toBe("camp-1"); // the audit tag survives persistence too
+
+    const laterNow = new Date(NOW_MS + 60_000).toISOString(); // past the default 30s staleness window
+    const revivedCoord = makeCoordinator({
+      dataDir: dir, store: revivedStore, nowIso: () => laterNow,
+      queryOrderByClientId: async () => { throw new Error("simulated: exchange unreachable immediately after restart"); },
+    });
+
+    // Before reconciliation runs: the campaign's global slot is STILL correctly treated as occupied.
+    const cap = fakeCampaignCap({ campaignLaneIds: laneIds, globalMaxPositions: 1 });
+    const stillBlockedBeforeSweep = revivedCoord.reserve({ executorId: "XSEC_INNOV", symbol: "AVAXUSDT", direction: "LONG", requestedNotionalUsd: 5, clientOrderId: "new-1", campaignCap: cap });
+    expect(stillBlockedBeforeSweep.ok).toBe(false);
+    expect(stillBlockedBeforeSweep.reason).toMatch(/global innovation position cap reached \(1\/1\)/);
+
+    const sweep = await revivedCoord.reconcileOnStartup();
+    expect(sweep).toEqual({ checked: 1, committed: 0, released: 0, inconclusive: 1 });
+    expect(revivedStore.getState().reservations[0]!.status).toBe("RESERVED"); // never silently dropped
+
+    const stillBlockedAfterSweep = revivedCoord.reserve({ executorId: "XSEC_INNOV", symbol: "AVAXUSDT", direction: "LONG", requestedNotionalUsd: 5, clientOrderId: "new-2", campaignCap: cap });
+    expect(stillBlockedAfterSweep.ok).toBe(false);
+  });
+
+  it("[REQ-6] a campaign reservation that reconciles to a CONFIRMED fill (COMMITTED) is never double-counted against the campaign cap afterward — the shared RESERVED-only filter excludes it the instant it commits, exactly like the pre-existing non-campaign double-counting invariant above", async () => {
+    const symbol = "SOLUSDT";
+    const dir = tmpDir();
+    const store = new AccountExposureReservationStore(dir);
+    pushRawReservation(store, { executorId: "XSEC_INNOV", symbol, requestedNotionalUsd: 50, clientOrderId: "dead-2", campaignId: "camp-1" });
+
+    const laterNow = new Date(NOW_MS + 60_000).toISOString();
+    const revivedCoord = makeCoordinator({
+      dataDir: dir, store, nowIso: () => laterNow,
+      queryOrderByClientId: async () => fakeOrder({ symbol, status: "FILLED", executedQty: 0.5, avgPrice: 100 }),
+    });
+
+    const sweep = await revivedCoord.reconcileOnStartup();
+    expect(sweep).toEqual({ checked: 1, committed: 1, released: 0, inconclusive: 0 });
+    expect(store.getState().reservations[0]!.status).toBe("COMMITTED");
+    expect(store.getState().reservations[0]!.campaignId).toBe("camp-1"); // audit tag survives commit too
+
+    // A fresh reserve() call re-walks the SAME ledger: the now-COMMITTED row is invisible to S5
+    // (status !== RESERVED) — capacity bookkeeping responsibility has correctly passed to the
+    // owning executor's own S1/S2 store (out of THIS coordinator's own scope alone, matching the
+    // pre-existing restart test [B1] in account-exposure-coordinator-integration.test.ts, which
+    // documents this exact residual boundary for the non-campaign axes).
+    const afterCommit = revivedCoord.reserve({
+      executorId: "XSEC_INNOV", symbol: "AVAXUSDT", direction: "LONG", requestedNotionalUsd: 5, clientOrderId: "new-3",
+      campaignCap: fakeCampaignCap({ campaignLaneIds: ["XSEC_INNOV"], globalMaxPositions: 1 }),
+    });
+    expect(afterCommit.ok).toBe(true); // not double-counted as "2 already used"
   });
 });

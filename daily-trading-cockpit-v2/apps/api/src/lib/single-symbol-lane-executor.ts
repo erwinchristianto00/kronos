@@ -37,7 +37,7 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 
-import type { ExposureReserveRequest, ExposureReserveResult } from "./account-exposure-coordinator.js";
+import type { ExposureReserveCampaignCap, ExposureReserveRequest, ExposureReserveResult } from "./account-exposure-coordinator.js";
 import { BinanceFuturesPrivateError, resolveConfirmedFillPrice, roundToStep, type BinanceFuturesPrivateClient } from "./binance-futures-private.js";
 import { clusterOf, isMajorSymbol } from "./correlation-clusters.js";
 import type { CortexRealAttributionStore } from "./cortex-real-attribution.js";
@@ -613,6 +613,12 @@ export interface SingleSymbolLaneExecutorOptions {
   /** Releases unused capacity on rejection, timeout, cancellation, or failure. Optional, defaults to
    *  a no-op — see reserveExposure above. */
   releaseExposureReservation?: (reservationId: string, reason: string) => void;
+  /** Innovation-campaign cap context (account-exposure-coordinator.ts's ExposureReserveCampaignCap),
+   *  folded onto every reserveExposureFn() call below — see that type's own doc comment. Optional,
+   *  defaults to () => undefined so every mainnet construction site (and every existing test) is
+   *  byte-for-byte unaffected; only app.ts's innovation construction block ever wires this, via
+   *  innovation-campaign.ts's campaignCapForLane(). */
+  campaignCap?: () => ExposureReserveCampaignCap | undefined;
   /** 2026-07-19 real-money audit fix: best-effort notification fired exactly once per position
    *  fully closed (stop-triggered, policy exit, manual close, or an orderly kill-switch wind-down —
    *  every one of those paths funnels through settleIfStopTriggered()/closePosition()'s own single
@@ -712,6 +718,7 @@ export class SingleSymbolLaneExecutor {
   private readonly reserveExposureFn: (req: ExposureReserveRequest) => ExposureReserveResult;
   private readonly commitExposureReservationFn: (reservationId: string, filled: { qty: number; avgPrice: number }) => void;
   private readonly releaseExposureReservationFn: (reservationId: string, reason: string) => void;
+  private readonly campaignCapFn: () => ExposureReserveCampaignCap | undefined;
   private readonly onPositionClosed: (netUsd: number) => void;
   private ticking = false;
   /** 2026-07-11 real-money audit fix: closePosition()'s `pos.exitOrderId !== null` reentry guard
@@ -766,6 +773,7 @@ export class SingleSymbolLaneExecutor {
     this.reserveExposureFn = opts.reserveExposure ?? (() => ({ ok: true, reservationId: null }));
     this.commitExposureReservationFn = opts.commitExposureReservation ?? (() => {});
     this.releaseExposureReservationFn = opts.releaseExposureReservation ?? (() => {});
+    this.campaignCapFn = opts.campaignCap ?? (() => undefined);
     this.onPositionClosed = opts.onPositionClosed ?? (() => {});
   }
 
@@ -1922,6 +1930,7 @@ export class SingleSymbolLaneExecutor {
         direction: this.direction,
         requestedNotionalUsd: this.effectiveLegUsd(),
         clientOrderId: entryClientOrderId,
+        campaignCap: this.campaignCapFn(),
       });
       if (!reservation.ok) {
         this.releaseEntrySymbol(signal.symbol);

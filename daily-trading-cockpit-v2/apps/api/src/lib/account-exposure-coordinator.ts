@@ -183,6 +183,10 @@ export interface ExposureReservation {
   /** e.g. "ENTRY_FAILED:<message>", "FRESH_POSITION_EXISTS", "RECONCILED_NOT_FILLED",
    *  "RECONCILED_NEVER_REACHED_EXCHANGE". */
   releaseReason?: string;
+  /** Audit trail only — set iff req.campaignCap was present at reserve() time. Never consulted by
+   *  commitReservation/releaseReservation/reconcileStaleReservations, and never branched on inside
+   *  buildCampaignExposure's own S5 walk (which keys off executorId/basketId, not this field). */
+  campaignId?: string;
 }
 
 export interface ExposureReserveRequest {
@@ -193,6 +197,39 @@ export interface ExposureReserveRequest {
   clientOrderId: string;
   /** Present only for a CrossSectionalExecutor leg reservation. */
   basketId?: string;
+  /** Present ONLY on a reservation request from an innovation-testnet lane currently governed by an
+   *  active campaign (see innovation-campaign.ts's campaignCapForLane, and reserve()'s gate 2 below)
+   *  — every mainnet SingleSymbolLaneExecutor/CrossSectionalExecutor construction site in app.ts
+   *  leaves this undefined, making gate 2 dead code for them. Deliberately generic (not
+   *  innovation-branded): the type system alone cannot enforce that only innovation call sites
+   *  populate it, so only app.ts's innovation construction block should ever set this field. */
+  campaignCap?: ExposureReserveCampaignCap;
+}
+
+/**
+ * One MORE capacity axis alongside the 5 this file already enforces (gross/directional/per-symbol/
+ * cluster/concurrent) — see reserve()'s gate 2. Supplied by the CALLER (innovation-campaign.ts's
+ * campaignCapForLane, via each innovation executor's own campaignCap closure — see
+ * single-symbol-lane-executor.ts / cross-sectional-executor.ts). This file stays fully ignorant of
+ * innovation-campaign.ts's own types: nothing here is ever imported FROM that module, matching this
+ * file's own established precedent of never importing live-execution-engine.ts "for one tiny status
+ * projection" (see this file's header, S3).
+ */
+export interface ExposureReserveCampaignCap {
+  /** Audit-trail only (see ExposureReservation.campaignId) — never branched on inside this file. */
+  campaignId: string;
+  /** The FULL static universe of executable innovation lane ids (EXECUTABLE_INNOVATION_LANE_IDS),
+   *  NOT campaign.allowedLaneIds — a campaign edit that narrows allowedLaneIds must not stop
+   *  counting an older lane's still-open exposure against the global cap, matching
+   *  innovation-campaign.ts's own computeInnovationExposure scope (always the full lane arrays,
+   *  never filtered by allowedLaneIds). Kept as a plain readonly string[] here (not the concrete
+   *  ExecutableInnovationLaneId union) precisely so this file never has to import that type either. */
+  campaignLaneIds: readonly string[];
+  globalMaxPositions: number;
+  globalNotionalCap: number;
+  /** Mirrors InnovationCampaignPerLaneCap exactly (innovation-campaign.ts). */
+  laneMaxPositions?: number;
+  laneMaxNotionalUsd?: number;
 }
 
 export interface ExposureReserveResult {
@@ -555,6 +592,111 @@ export class AccountExposureCoordinator {
   }
 
   /**
+   * Campaign-scoped exposure snapshot for reserve()'s gate 2 — computed FRESH on every call (same
+   * no-stale-snapshot discipline as buildSnapshot()), from the SAME S1/S2/S5 sources, but with
+   * campaign "position" semantics: ONE position per CrossSectionalExecutor BASKET regardless of leg
+   * count (verbatim innovation-campaign.ts's own computeInnovationExposure convention), never
+   * buildSnapshot()'s own concurrentCount, which bumps once per LEG. Reusing that accumulator here
+   * would silently overcount every multi-leg basket against a campaign's globalMaxPositions/
+   * perLaneCaps.
+   *
+   * `self` identifies the CURRENT reserve() request (never a third party's) so this basket's own
+   * earlier, still-RESERVED sibling leg(s) — inserted synchronously by THIS SAME basket-open
+   * attempt's own sizing loop, strictly before this leg's own reserve() call — never inflate the
+   * "already consumed" count against themselves. Without this exclusion, leg 2 of a fresh N-leg
+   * basket would see leg 1's own reservation as "1 position already used" and self-reject even when
+   * the campaign has exactly enough headroom for the ONE basket being opened — e.g.
+   * globalMaxPositions=1, 0 pre-existing positions, a fresh 2-leg basket MUST still be able to open
+   * (see this file's own mutation-guarded test for this exact scenario). NOTIONAL is never excluded
+   * this way — self's own prior sibling legs' requestedNotionalUsd DOES accumulate, since a basket's
+   * aggregate notional legitimately grows leg by leg and must be checked cumulatively against the
+   * cap.
+   */
+  private buildCampaignExposure(
+    laneIds: ReadonlySet<string>,
+    self: { executorId: string; basketId?: string },
+  ): {
+    totalPositions: number;
+    totalNotionalUsd: number;
+    perLane: Map<string, { positions: number; notionalUsd: number }>;
+  } {
+    const perLane = new Map<string, { positions: number; notionalUsd: number }>();
+    let totalPositions = 0;
+    let totalNotionalUsd = 0;
+    const bump = (laneId: string, positions: number, notionalUsd: number): void => {
+      const cur = perLane.get(laneId) ?? { positions: 0, notionalUsd: 0 };
+      cur.positions += positions;
+      cur.notionalUsd += notionalUsd;
+      perLane.set(laneId, cur);
+      totalPositions += positions;
+      totalNotionalUsd += notionalUsd;
+    };
+
+    // S1 — SingleSymbolLaneExecutor open positions, scoped to the campaign's own lane universe
+    // (laneIds — see ExposureReserveCampaignCap.campaignLaneIds's own doc comment for why this is
+    // the FULL static universe, not campaign.allowedLaneIds).
+    for (const exec of this.getSingleSymbolExecutors()) {
+      if (!exec) continue;
+      const status = exec.getStatus();
+      if (!laneIds.has(status.laneId)) continue;
+      for (const pos of status.openPositions) {
+        if (pos.exitOrderId !== null) continue;
+        bump(status.laneId, 1, Math.abs(pos.qty * pos.entryPrice));
+      }
+    }
+
+    // S2 — CrossSectionalExecutor open baskets: ONE position per basket (verbatim
+    // innovation-campaign.ts's computeInnovationExposure formula), notional summed across its still-
+    // open legs, PLUS one position per orphaned leg. seenBasketIds feeds S5 exclusion (a) below —
+    // a basket already visible here has its "+1" already counted, the instant its full sizing loop
+    // finishes and the basket object is pushed onto its executor's own store (always strictly BEFORE
+    // any of its legs can be filled/committed).
+    const seenBasketIds = new Set<string>();
+    for (const exec of this.getCrossSectionalExecutors()) {
+      if (!exec) continue;
+      const status = exec.getStatus();
+      if (!laneIds.has(status.laneId)) continue;
+      for (const basket of status.openBaskets) {
+        seenBasketIds.add(basket.basketId);
+        const notional = basket.legs.reduce(
+          (sum, leg) => sum + (leg.exitOrderId === null ? Math.abs(leg.qty * leg.entryPrice) : 0),
+          0,
+        );
+        bump(status.laneId, 1, notional);
+      }
+      for (const orphan of status.orphanedLegs) {
+        bump(status.laneId, 1, Math.abs(orphan.qty * orphan.entryPrice));
+      }
+    }
+
+    // S5 — this coordinator's OWN in-flight RESERVED reservations, scoped to laneIds. NOTIONAL
+    // always accumulates unconditionally (matches this file's established S5 philosophy elsewhere:
+    // a reservation's notional is consumed capacity the instant it exists, before any order is
+    // placed). POSITION count is skipped when:
+    //  (a) the row's basketId is already visible via S2 above;
+    //  (b) the row shares THIS request's own (executorId, basketId) — see this method's own doc
+    //      comment above.
+    // Grouped by (executorId, basketId ?? reservationId) so — defensively — any rows surviving both
+    // exclusions for the same basket still contribute only ONE position, never one per leg (today's
+    // single-threaded synchronous reserve() means this grouping should be unreachable in practice —
+    // see (a)/(b) above — but it costs nothing to guard regardless).
+    const positionGroupsCounted = new Set<string>();
+    for (const r of this.store.getState().reservations) {
+      if (r.status !== "RESERVED") continue;
+      if (!laneIds.has(r.executorId)) continue;
+      bump(r.executorId, 0, r.requestedNotionalUsd);
+      if (r.basketId && seenBasketIds.has(r.basketId)) continue;
+      if (r.basketId && r.basketId === self.basketId && r.executorId === self.executorId) continue;
+      const groupKey = `${r.executorId}:${r.basketId ?? r.reservationId}`;
+      if (positionGroupsCounted.has(groupKey)) continue;
+      positionGroupsCounted.add(groupKey);
+      bump(r.executorId, 1, 0);
+    }
+
+    return { totalPositions, totalNotionalUsd, perLane };
+  }
+
+  /**
    * Reserve risk capacity for one about-to-be-placed order. 100% synchronous — see this file's
    * header comment for why that is the entire correctness argument. Never throws for a capacity
    * rejection (matches this codebase's `{allowed/ok, reason}`-never-throw idiom for expected
@@ -562,12 +704,14 @@ export class AccountExposureCoordinator {
    *
    * Gate order (fixed, fail-fast, one reason per rejection):
    *   1. single-flight-per-symbol (unconditional, not env-gated)
-   *   2. gross cap
-   *   3. directional cap (whichever side req.direction is)
-   *   4. per-symbol cap
-   *   5. correlation-cluster cap (non-MAJOR only)
-   *   6. account-wide concurrent-position-count cap
-   *   7. all pass → insert RESERVED
+   *   2. innovation-campaign caps (present only when req.campaignCap is supplied — see
+   *      ExposureReserveCampaignCap; dead code for every mainnet reservation)
+   *   3. gross cap
+   *   4. directional cap (whichever side req.direction is)
+   *   5. per-symbol cap
+   *   6. correlation-cluster cap (non-MAJOR only)
+   *   7. account-wide concurrent-position-count cap
+   *   8. all pass → insert RESERVED
    */
   reserve(req: ExposureReserveRequest): ExposureReserveResult {
     if (!req.symbol || typeof req.symbol !== "string") {
@@ -596,15 +740,60 @@ export class AccountExposureCoordinator {
       return { ok: false, reservationId: null, reason: `${symbol}: another reservation is already in flight for this symbol` };
     }
 
+    // Gate 2: innovation-campaign caps — an ADDITIONAL capacity axis, present ONLY when the caller
+    // supplied campaignCap (the innovation construction sites in app.ts only, via
+    // innovation-campaign.ts's campaignCapForLane). Computed fresh from THIS SAME reservation ledger
+    // + the SAME executor accessors every other gate uses (buildCampaignExposure) — never
+    // innovation-campaign.ts's own computeInnovationExposure, a separately-timed getStatus()
+    // snapshot that is exactly the race this axis exists to close. Dead code for every mainnet
+    // reservation (req.campaignCap is always undefined there).
+    if (req.campaignCap) {
+      const cap = req.campaignCap;
+      const campaignLaneIds = new Set(cap.campaignLaneIds);
+      const campaignExposure = this.buildCampaignExposure(campaignLaneIds, {
+        executorId: req.executorId,
+        basketId: req.basketId,
+      });
+      const lane = campaignExposure.perLane.get(req.executorId) ?? { positions: 0, notionalUsd: 0 };
+      if (campaignExposure.totalPositions >= cap.globalMaxPositions) {
+        return {
+          ok: false,
+          reservationId: null,
+          reason: `${symbol}: campaign ${cap.campaignId} global innovation position cap reached (${campaignExposure.totalPositions}/${cap.globalMaxPositions})`,
+        };
+      }
+      if (campaignExposure.totalNotionalUsd + req.requestedNotionalUsd > cap.globalNotionalCap) {
+        return {
+          ok: false,
+          reservationId: null,
+          reason: `${symbol}: campaign ${cap.campaignId} global innovation notional cap exceeded (cap ${cap.globalNotionalCap})`,
+        };
+      }
+      if (cap.laneMaxPositions !== undefined && lane.positions >= cap.laneMaxPositions) {
+        return {
+          ok: false,
+          reservationId: null,
+          reason: `${symbol}: campaign ${cap.campaignId} lane ${req.executorId} position cap reached (${lane.positions}/${cap.laneMaxPositions})`,
+        };
+      }
+      if (cap.laneMaxNotionalUsd !== undefined && lane.notionalUsd + req.requestedNotionalUsd > cap.laneMaxNotionalUsd) {
+        return {
+          ok: false,
+          reservationId: null,
+          reason: `${symbol}: campaign ${cap.campaignId} lane ${req.executorId} notional cap exceeded (cap ${cap.laneMaxNotionalUsd})`,
+        };
+      }
+    }
+
     const snapshot = this.buildSnapshot();
 
-    // Gate 2: gross cap.
+    // Gate 3: gross cap.
     const grossCap = this.maxGrossExposureUsdFn();
     if (grossCap > 0 && snapshot.grossUsd + req.requestedNotionalUsd > grossCap) {
       return { ok: false, reservationId: null, reason: `${symbol}: account gross exposure cap exceeded (cap ${grossCap})` };
     }
 
-    // Gate 3: directional cap.
+    // Gate 4: directional cap.
     if (req.direction === "LONG") {
       const longCap = this.maxLongExposureUsdFn();
       if (longCap > 0 && snapshot.longUsd + req.requestedNotionalUsd > longCap) {
@@ -617,14 +806,14 @@ export class AccountExposureCoordinator {
       }
     }
 
-    // Gate 4: per-symbol cap.
+    // Gate 5: per-symbol cap.
     const perSymbolCap = this.maxNotionalPerSymbolUsdFn();
     const perSymbolCurrent = snapshot.perSymbolUsd.get(symbol) ?? 0;
     if (perSymbolCap > 0 && perSymbolCurrent + req.requestedNotionalUsd > perSymbolCap) {
       return { ok: false, reservationId: null, reason: `${symbol}: per-symbol notional cap exceeded (cap ${perSymbolCap})` };
     }
 
-    // Gate 5: correlation-cluster cap (MAJORS exempt, matching every other cluster cap in this repo).
+    // Gate 6: correlation-cluster cap (MAJORS exempt, matching every other cluster cap in this repo).
     const clusterCap = this.maxClusterPositionsFn();
     if (clusterCap > 0 && !isMajorSymbol(symbol)) {
       const key = `${clusterKey}:${req.direction}`;
@@ -638,7 +827,7 @@ export class AccountExposureCoordinator {
       }
     }
 
-    // Gate 6: account-wide concurrent-position-count cap.
+    // Gate 7: account-wide concurrent-position-count cap.
     const concurrentCap = this.maxConcurrentPositionsAcrossAccountFn();
     if (concurrentCap > 0 && snapshot.concurrentCount >= concurrentCap) {
       return { ok: false, reservationId: null, reason: `account-wide concurrent-position cap reached (cap ${concurrentCap})` };
@@ -663,6 +852,7 @@ export class AccountExposureCoordinator {
       createdAt: nowIso,
       createdAtMs: nowMs,
       status: "RESERVED",
+      ...(req.campaignCap ? { campaignId: req.campaignCap.campaignId } : {}),
     };
     this.store.getState().reservations.push(record);
     this.store.save();

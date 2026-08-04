@@ -37,6 +37,7 @@ import {
   AccountExposureCoordinator,
   AccountExposureReservationStore,
   type AccountExposureCoordinatorOptions,
+  type ExposureReserveCampaignCap,
   type ExposureReserveRequest,
   type ExposureReserveResult,
 } from "../src/lib/account-exposure-coordinator.js";
@@ -845,5 +846,83 @@ describe("C. Other required proofs", () => {
     const basket = xsecStore.getState().baskets.find((b) => b.basketId === "xb-due")!;
     expect(basket.status).toBe("CLOSED");
     expect(reserveCalls).toBe(0); // the close path never touches reserveExposure at all
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+// SECTION D — INNOVATION-CAMPAIGN GATE (campaignCap, 2026-08-05 fix): req #7 — position management
+// (exits/reductions/protective stops) for an innovation-lane position must NEVER be gated by the
+// campaign check, regardless of campaign state. Extends section C's own proof (reserveExposure is
+// never called on a close path) by ALSO wiring a maximally-exhausted campaignCap closure and
+// asserting it is never even EVALUATED during a close-only tick — not just that reserve() itself
+// isn't reached, but that the campaign-cap computation is skipped too (both executors only read
+// their own campaignCapFn() from inside the entry-only method — maybeOpenPosition() /
+// maybeOpenBasket() — never from any close/reduction/protective-order path).
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+
+describe("D. Innovation-campaign gate (campaignCap) — position management is never gated by it", () => {
+  it("[D1 / REQ-7] SingleSymbolLaneExecutor: closing an already-OPEN position via the exit policy NEVER calls reserveExposure OR even evaluates campaignCap, even when campaignCap is wired to a maximally-exhausted cap (globalMaxPositions: 0) that would reject ANY new entry outright", async () => {
+    const client = new RaceClient();
+    client.markPriceBySymbol.set("BTCUSDT", 106); // entry 100 / stop 90 -> r=0.6 >= 0.5 rewardMultiple -> TP_HIT
+    let reserveCalls = 0;
+    let campaignCapCalls = 0;
+    const hostileReserve = (_req: ExposureReserveRequest): ExposureReserveResult => {
+      reserveCalls += 1;
+      return { ok: false, reservationId: null, reason: "hostile test cap — should never be reached by a close" };
+    };
+    const hostileCampaignCap = (): ExposureReserveCampaignCap | undefined => {
+      campaignCapCalls += 1;
+      return { campaignId: "camp-hostile", campaignLaneIds: ["LANE_EXIT_ONLY"], globalMaxPositions: 0, globalNotionalCap: 0 };
+    };
+    const storeDir = tmpDir();
+    const store = new SingleSymbolLaneExecutorStore(storeDir, "lane.json");
+    store.getState().positions.push(seedOpenPosition({ symbol: "BTCUSDT", direction: "LONG", entryPrice: 100, stopPrice: 90 }));
+    const exec = new SingleSymbolLaneExecutor({
+      client, store, laneId: "LANE_EXIT_ONLY", direction: "LONG", getOpenSignals: () => [],
+      exitPolicy: makeFixedRewardExitPolicy({ rewardMultiple: 0.5, maxHoldMs: 48 * 3_600_000 }),
+      isAllowed: () => true, legUsd: () => 100, leverage: () => 3, nowIso: () => NOW, fillConfirmRetryDelayMs: 0,
+      reserveExposure: hostileReserve,
+      campaignCap: hostileCampaignCap,
+    });
+
+    await exec.tick();
+
+    const pos = store.getState().positions[0]!;
+    expect(pos.status).toBe("CLOSED");
+    expect(pos.closeReason).toBe("TP_HIT");
+    expect(client.placed.some((p) => p.reduceOnly === true)).toBe(true);
+    expect(reserveCalls).toBe(0); // the close/reduction path never touches reserveExposure at all
+    expect(campaignCapCalls).toBe(0); // ...nor does it even EVALUATE the campaign-cap closure
+  });
+
+  it("[D2 / REQ-7] CrossSectionalExecutor: closing an already-due basket (HORIZON close) NEVER calls reserveExposure OR even evaluates campaignCap, even when campaignCap is wired to a maximally-exhausted cap", async () => {
+    const client = new RaceClient();
+    client.fillPriceBySymbol.set("SOLUSDT", 100);
+    let reserveCalls = 0;
+    let campaignCapCalls = 0;
+    const hostileReserve = (_req: ExposureReserveRequest): ExposureReserveResult => {
+      reserveCalls += 1;
+      return { ok: false, reservationId: null, reason: "hostile test cap — should never be reached by a close" };
+    };
+    const hostileCampaignCap = (): ExposureReserveCampaignCap | undefined => {
+      campaignCapCalls += 1;
+      return { campaignId: "camp-hostile", campaignLaneIds: ["XSEC_EXIT_ONLY"], globalMaxPositions: 0, globalNotionalCap: 0 };
+    };
+    const signalStore = new CrossSectionalStore(tmpDir()); // deliberately empty — no fresh signal to open
+    const xsecStoreDir = tmpDir();
+    const xsecStore = new CrossSectionalExecutorStore(xsecStoreDir);
+    xsecStore.getState().baskets.push(seedOpenBasket("xb-due-2", "SOLUSDT", NOW_MS - 60_000)); // already past closesAtMs
+    const exec = new CrossSectionalExecutor({
+      client, signalStore, store: xsecStore, isAllowed: () => true, nowIso: () => NOW, fillConfirmRetryDelayMs: 0,
+      reserveExposure: hostileReserve,
+      campaignCap: hostileCampaignCap,
+    });
+
+    await exec.tick();
+
+    const basket = xsecStore.getState().baskets.find((b) => b.basketId === "xb-due-2")!;
+    expect(basket.status).toBe("CLOSED");
+    expect(reserveCalls).toBe(0); // the close path never touches reserveExposure at all
+    expect(campaignCapCalls).toBe(0); // ...nor does it even EVALUATE the campaign-cap closure
   });
 });

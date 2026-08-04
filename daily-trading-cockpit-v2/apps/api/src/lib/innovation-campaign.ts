@@ -20,12 +20,27 @@
  * `retryOrphanedLegFlattens` / `ensureOpenBasketLeverage` / `closeAllPositionsOrderly` — those run
  * unconditionally, every tick, regardless of campaign state, so an expired or absent campaign can
  * only ever block a NEW entry, never position management or closing of what is already open.
+ *
+ * CAP ENFORCEMENT (2026-08-05 fix): `evaluateInnovationCampaignAdmission`'s own globalMaxPositions/
+ * globalNotionalCap/perLaneCaps branches below are consulted ONCE PER TICK, against a
+ * computeInnovationExposure() snapshot taken BEFORE any of that tick's entries actually open — a
+ * fast, cheap pre-filter, but no longer the AUTHORITATIVE check for those three fields. The
+ * authoritative check is account-exposure-coordinator.ts's `reserve()` gate 2, fed by this file's own
+ * `campaignCapForLane()` below: it re-derives live campaign exposure INSIDE that coordinator's single
+ * atomic synchronous call, from the SAME reservation ledger its other 5 capacity axes already read —
+ * never from this module's own getStatus()-snapshot-based computeInnovationExposure. This closes the
+ * race a per-tick snapshot check cannot: multiple entries within one tick (a SingleSymbolLaneExecutor's
+ * own per-signal loop, a CrossSectionalExecutor's per-leg loop) and two DIFFERENT executor instances
+ * racing each other can no longer both observe "capacity available" and both proceed. The `enabled`/
+ * window/`allowedLaneIds` decision below remains authoritative exactly as before — those are
+ * admission/policy checks, not arithmetic over a shared ledger, and stay checked once per tick.
  */
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import type { CrossSectionalExecutor } from "./cross-sectional-executor.js";
 import type { SingleSymbolLaneExecutor } from "./single-symbol-lane-executor.js";
 import { EXECUTABLE_INNOVATION_LANE_IDS, type ExecutableInnovationLaneId } from "./innovation-testnet-execution.js";
+import type { ExposureReserveCampaignCap } from "./account-exposure-coordinator.js";
 
 // ---------------------------------------------------------------------------------------------
 // Schema
@@ -358,6 +373,16 @@ export function loadInnovationCampaign(
 // returns a single allow/deny decision with a specific reason. Assumes `campaign`, if non-null,
 // already passed validateInnovationCampaign (or is a hand-built valid test fixture) — this
 // function re-checks enabled/window/lane/caps but does not re-validate schema-level shape.
+//
+// AUTHORITY (2026-08-05 fix — see this module's own header comment): enabled/window/lane-allowlist
+// remain fully authoritative here — nothing else in the codebase re-checks those. The THREE cap
+// branches (globalMaxPositions/globalNotionalCap/perLaneCaps) below are now a fast, racy,
+// NON-authoritative pre-filter only — cheap enough to run once per tick before wasting a
+// signal-loop iteration, but no longer what actually prevents an oversubscribed campaign.
+// account-exposure-coordinator.ts's `reserve()` (fed by campaignCapForLane() below) is the real
+// enforcement point for those three fields; it re-derives exposure atomically, inside its own
+// single-flight-per-symbol-and-beyond synchronous call, from the same ledger its other 5 capacity
+// axes already read.
 // ---------------------------------------------------------------------------------------------
 
 export interface InnovationCampaignAdmissionContext {
@@ -426,6 +451,52 @@ export function evaluateInnovationCampaignAdmission(
   }
 
   return { allowed: true, reason: null };
+}
+
+// ---------------------------------------------------------------------------------------------
+// campaignCapForLane — the translation point from "a freshly loaded campaign" to
+// account-exposure-coordinator.ts's ExposureReserveCampaignCap, the shape reserve()'s gate 2
+// atomically enforces (see this module's own header comment). Pure, no I/O: `loaded` is assumed
+// already produced by loadInnovationCampaign. This is the ONE place a loaded campaign's cap fields
+// become the coordinator's own capacity axis — callers (the innovation executor construction sites
+// in app.ts) must route through this function rather than hand-building an
+// ExposureReserveCampaignCap, so there is exactly one source of truth for campaignLaneIds (see its
+// own doc comment below) instead of a second, independently-maintainable copy that could drift.
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Returns undefined whenever there is no CURRENTLY ACTIVE campaign to enforce for `laneId` — checks
+ * `loaded.active`, NOT merely `loaded.campaign !== null`: loadInnovationCampaign returns a non-null
+ * campaign even when merely `enabled:false` or outside its start/expiry window (see this file's own
+ * `disabledResult` call sites above), so checking only `!loaded.campaign` would apply a DISABLED or
+ * EXPIRED campaign's caps — backwards; the correct behavior for an inactive campaign is to apply NO
+ * gate at all, not a stale one. Must never be simplified to drop the `active` check.
+ *
+ * Deliberately laneId-agnostic about allowedLaneIds: campaignCapForLane does not itself check
+ * whether `laneId` is in `campaign.allowedLaneIds` — that remains isAllowed()/entryHealthGate()'s
+ * own job via innovationCampaignAdmissionForLane (app.ts), checked once per tick, unchanged by this
+ * fix. This function only ever supplies the three CAP fields; a lane outside allowedLaneIds simply
+ * never reaches reserve() in the first place, so gate 2 never runs for it either.
+ */
+export function campaignCapForLane(
+  loaded: InnovationCampaignLoadResult,
+  laneId: string,
+): ExposureReserveCampaignCap | undefined {
+  if (!loaded.active || !loaded.campaign) return undefined;
+  const laneCap = (loaded.campaign.perLaneCaps as Partial<Record<string, InnovationCampaignPerLaneCap>>)[laneId];
+  return {
+    campaignId: loaded.campaign.campaignId,
+    // The FULL static universe, NOT loaded.campaign.allowedLaneIds — see
+    // ExposureReserveCampaignCap.campaignLaneIds's own doc comment (account-exposure-coordinator.ts)
+    // for why a narrowed allowedLaneIds must not stop counting an older lane's exposure against the
+    // global cap. EXECUTABLE_INNOVATION_LANE_IDS is the ONE source of truth for this array — never
+    // hand-duplicate it at a call site, or a 9th lane added later silently under-counts here.
+    campaignLaneIds: EXECUTABLE_INNOVATION_LANE_IDS,
+    globalMaxPositions: loaded.campaign.globalMaxPositions,
+    globalNotionalCap: loaded.campaign.globalNotionalCap,
+    laneMaxPositions: laneCap?.maxPositions,
+    laneMaxNotionalUsd: laneCap?.maxNotionalUsd,
+  };
 }
 
 // ---------------------------------------------------------------------------------------------

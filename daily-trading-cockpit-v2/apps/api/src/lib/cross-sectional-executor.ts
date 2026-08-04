@@ -19,7 +19,7 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 
-import type { ExposureReserveRequest, ExposureReserveResult } from "./account-exposure-coordinator.js";
+import type { ExposureReserveCampaignCap, ExposureReserveRequest, ExposureReserveResult } from "./account-exposure-coordinator.js";
 import { BinanceFuturesPrivateError, resolveConfirmedFillPrice, type BinanceFuturesPrivateClient, type FillPriceResolution, type FuturesOrder } from "./binance-futures-private.js";
 import type { CortexRealAttributionStore } from "./cortex-real-attribution.js";
 import { fillFromUserTrade, type ExecutionFill, type ExecutionFillRecorder, type ExecutionFillRole } from "./execution-fill-recorder.js";
@@ -575,6 +575,12 @@ export interface CrossSectionalExecutorOptions {
   /** Releases unused capacity on rejection, timeout, cancellation, or failure. Optional, defaults to
    *  a no-op — see reserveExposure above. */
   releaseExposureReservation?: (reservationId: string, reason: string) => void;
+  /** Innovation-campaign cap context (account-exposure-coordinator.ts's ExposureReserveCampaignCap),
+   *  folded onto every leg's reserveExposureFn() call in the sizing loop — see that type's own doc
+   *  comment. Optional, defaults to () => undefined so every mainnet construction site (and every
+   *  existing test) is byte-for-byte unaffected; only app.ts's innovation construction block ever
+   *  wires this, via innovation-campaign.ts's campaignCapForLane(). */
+  campaignCap?: () => ExposureReserveCampaignCap | undefined;
   /** CORTEX real-USDT attribution (2026-07-22 bug-hunt fix): the operator's untouched static-table
    *  weight, read the same way laneWeightPct reads the (possibly CORTEX-tilted) applied weight.
    *  Same optional posture as single-symbol-lane-executor.ts's rawLaneWeightPct — omit and this
@@ -634,6 +640,7 @@ export class CrossSectionalExecutor {
   private readonly reserveExposureFn: (req: ExposureReserveRequest) => ExposureReserveResult;
   private readonly commitExposureReservationFn: (reservationId: string, filled: { qty: number; avgPrice: number }) => void;
   private readonly releaseExposureReservationFn: (reservationId: string, reason: string) => void;
+  private readonly campaignCapFn: () => ExposureReserveCampaignCap | undefined;
   private readonly rawLaneWeightPctFn: (() => number) | null;
   private readonly cortexRealAttribution: CortexRealAttributionStore | null;
   private readonly executionFillRecorder: ExecutionFillRecorder | null;
@@ -660,6 +667,7 @@ export class CrossSectionalExecutor {
     this.reserveExposureFn = opts.reserveExposure ?? (() => ({ ok: true, reservationId: null }));
     this.commitExposureReservationFn = opts.commitExposureReservation ?? (() => {});
     this.releaseExposureReservationFn = opts.releaseExposureReservation ?? (() => {});
+    this.campaignCapFn = opts.campaignCap ?? (() => undefined);
     this.dailyMaxLossUsdFn = opts.dailyMaxLossUsd ?? XSEC_DAILY_MAX_LOSS_USD;
     this.entryHealthGate = opts.entryHealthGate ?? (() => ({ allowed: true, reason: null }));
     this.siblingOpenLegs = opts.siblingOpenLegs ?? (() => []);
@@ -1683,6 +1691,11 @@ export class CrossSectionalExecutor {
     // exposure reservation in the sizing loop can carry the basketId that groups its sibling leg
     // reservations — account-exposure-coordinator.ts's ExposureReservation.basketId.
     const basketId = `xb-${signal.openedAtMs.toString(36)}-${this.idNamespace}`;
+    // Computed ONCE here, before the per-leg loop below — not once per leg. Avoids re-reading the
+    // campaign file up to N times for an N-leg basket, and guarantees every leg of THIS basket-open
+    // attempt is evaluated against the identical loaded campaign snapshot, even if an operator edit
+    // lands on disk mid-loop.
+    const campaignCap = this.campaignCapFn();
     const plannedLegs: PlannedLeg[] = [];
     // Releases every reservation already taken earlier in THIS sizing pass. Called at every early
     // `return` below so a later leg's rejection (missing filters, un-sizeable qty, notional cap, or
@@ -1737,6 +1750,7 @@ export class CrossSectionalExecutor {
           requestedNotionalUsd: qty * leg.entryPrice,
           clientOrderId: entryClientOrderId,
           basketId,
+          campaignCap,
         });
         if (!legReservation.ok) {
           releasePlannedSoFar(`SIBLING_LEG_RESERVE_FAILED:${legReservation.reason ?? "unknown"}`);

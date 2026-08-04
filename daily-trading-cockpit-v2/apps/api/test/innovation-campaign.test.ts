@@ -10,6 +10,7 @@ import {
   innovationCampaignAdmission,
   computeInnovationExposure,
   buildInnovationCampaignDiagnostics,
+  campaignCapForLane,
   type InnovationCampaign,
   type InnovationCampaignAdmissionContext,
   type InnovationCampaignLoadResult,
@@ -976,5 +977,187 @@ describe("buildInnovationCampaignDiagnostics", () => {
       [LANE_2]: { openPositions: 1, openNotionalUsd: 50 },
     });
     expect(roundTripped.exposure.perLane).not.toEqual({});
+  });
+});
+
+// =================================================================================================
+// campaignCapForLane (2026-08-05 fix) — the translation point from a loaded campaign to
+// account-exposure-coordinator.ts's ExposureReserveCampaignCap, the shape reserve()'s gate 2
+// atomically enforces. Pure function, no I/O of its own. See this module's own header comment: this
+// is now the ONLY path a campaign's cap fields reach the authoritative, atomic enforcement point —
+// evaluateInnovationCampaignAdmission's own cap branches (tested above) are a non-authoritative
+// pre-filter as of this fix. Every test below either writes a real file through loadInnovationCampaign
+// (matching the "loadInnovationCampaign" describe block's own conventions) or hand-builds an
+// InnovationCampaignLoadResult (matching "innovationCampaignAdmission"'s own conventions) — never a
+// third, ad hoc shape.
+// =================================================================================================
+describe("campaignCapForLane", () => {
+  const STARTS_AT = "2026-08-01T00:00:00.000Z";
+  const EXPIRES_AT = "2026-08-10T00:00:00.000Z";
+  const INSIDE_WINDOW_MS = Date.parse("2026-08-05T00:00:00.000Z");
+  const FILE = "innovation-campaign.json";
+
+  function admissionCtx(laneId: string): InnovationCampaignAdmissionContext {
+    return {
+      laneId,
+      nowIso: new Date(INSIDE_WINDOW_MS).toISOString(),
+      currentGlobalPositions: 0,
+      currentGlobalNotionalUsd: 0,
+      currentLanePositions: 0,
+      currentLaneNotionalUsd: 0,
+    };
+  }
+
+  it("[REQ-1] absent campaign file -> undefined (gate 2 inert); the pre-existing evaluateInnovationCampaignAdmission gate independently denies with 'no active innovation campaign' — the full chain still blocks a new innovation entry, not just one layer", () => {
+    const dir = tmpDir();
+    const loaded = loadInnovationCampaign(dir, FILE, INSIDE_WINDOW_MS);
+    expect(loaded.campaign).toBeNull();
+    expect(campaignCapForLane(loaded, LANE_1)).toBeUndefined();
+    const admission = evaluateInnovationCampaignAdmission(loaded.campaign, admissionCtx(LANE_1));
+    expect(admission).toEqual({ allowed: false, reason: "no active innovation campaign" });
+  });
+
+  it("[REQ-2a] disabled campaign (enabled:false) -> undefined, even though loaded.campaign is non-null (the exact trap the function's own doc comment warns against)", () => {
+    const dir = tmpDir();
+    writeFileSync(resolve(dir, FILE), JSON.stringify(validCampaignJson({ enabled: false, startsAt: STARTS_AT, expiresAt: EXPIRES_AT })), "utf-8");
+    const loaded = loadInnovationCampaign(dir, FILE, INSIDE_WINDOW_MS);
+    expect(loaded.campaign).not.toBeNull();
+    expect(loaded.active).toBe(false);
+    expect(campaignCapForLane(loaded, LANE_1)).toBeUndefined();
+  });
+
+  it("[REQ-2b] malformed campaign (fails schema validation) -> undefined", () => {
+    const dir = tmpDir();
+    writeFileSync(resolve(dir, FILE), JSON.stringify({ enabled: true }), "utf-8"); // missing campaignId etc.
+    const loaded = loadInnovationCampaign(dir, FILE, INSIDE_WINDOW_MS);
+    expect(loaded.campaign).toBeNull();
+    expect(campaignCapForLane(loaded, LANE_1)).toBeUndefined();
+  });
+
+  it("[REQ-2b variant] not valid JSON at all -> undefined", () => {
+    const dir = tmpDir();
+    writeFileSync(resolve(dir, FILE), "{ not json", "utf-8");
+    const loaded = loadInnovationCampaign(dir, FILE, INSIDE_WINDOW_MS);
+    expect(campaignCapForLane(loaded, LANE_1)).toBeUndefined();
+  });
+
+  it("[REQ-2c / MUTATION TARGET] expired campaign -> undefined, even though loaded.campaign is non-null and every cap field is fully populated — this is the EXACT regression campaignCapForLane's own doc comment warns against (checking !loaded.campaign instead of !loaded.active)", () => {
+    const dir = tmpDir();
+    writeFileSync(resolve(dir, FILE), JSON.stringify(validCampaignJson({ startsAt: STARTS_AT, expiresAt: EXPIRES_AT })), "utf-8");
+    const afterExpiry = Date.parse(EXPIRES_AT) + 60_000;
+    const loaded = loadInnovationCampaign(dir, FILE, afterExpiry);
+    expect(loaded.campaign).not.toBeNull();
+    expect(loaded.expired).toBe(true);
+    expect(loaded.campaign!.globalMaxPositions).toBeGreaterThan(0); // cap fields ARE populated...
+    expect(campaignCapForLane(loaded, LANE_1)).toBeUndefined(); // ...but must still be undefined
+  });
+
+  it("[REQ-2c variant] not-yet-started campaign -> undefined", () => {
+    const dir = tmpDir();
+    writeFileSync(resolve(dir, FILE), JSON.stringify(validCampaignJson({ startsAt: STARTS_AT, expiresAt: EXPIRES_AT })), "utf-8");
+    const beforeStart = Date.parse(STARTS_AT) - 60_000;
+    const loaded = loadInnovationCampaign(dir, FILE, beforeStart);
+    expect(loaded.campaign).not.toBeNull();
+    expect(campaignCapForLane(loaded, LANE_1)).toBeUndefined();
+  });
+
+  it("active + valid campaign -> a fully-populated cap: campaignLaneIds is the FULL static universe (never allowedLaneIds, even when it is a strict subset), global fields copied verbatim, per-lane fields pulled from perLaneCaps for THIS laneId specifically", () => {
+    const dir = tmpDir();
+    writeFileSync(
+      resolve(dir, FILE),
+      JSON.stringify(validCampaignJson({
+        allowedLaneIds: [LANE_1], // a STRICT SUBSET of the full universe
+        startsAt: STARTS_AT,
+        expiresAt: EXPIRES_AT,
+        globalMaxPositions: 7,
+        globalNotionalCap: 2500,
+        perLaneCaps: { [LANE_1]: { maxPositions: 3, maxNotionalUsd: 400 } },
+      })),
+      "utf-8",
+    );
+    const loaded = loadInnovationCampaign(dir, FILE, INSIDE_WINDOW_MS);
+    const cap = campaignCapForLane(loaded, LANE_1);
+    expect(cap).toBeDefined();
+    expect(cap!.campaignId).toBe("camp-1");
+    expect(cap!.campaignLaneIds).toEqual(EXECUTABLE_INNOVATION_LANE_IDS); // NOT [LANE_1]
+    expect(cap!.globalMaxPositions).toBe(7);
+    expect(cap!.globalNotionalCap).toBe(2500);
+    expect(cap!.laneMaxPositions).toBe(3);
+    expect(cap!.laneMaxNotionalUsd).toBe(400);
+  });
+
+  it("a lane with NO entry in perLaneCaps gets undefined lane-level fields (global fields still populated) — never throws on a missing key", () => {
+    const dir = tmpDir();
+    writeFileSync(
+      resolve(dir, FILE),
+      JSON.stringify(validCampaignJson({
+        allowedLaneIds: [LANE_1, LANE_2],
+        startsAt: STARTS_AT,
+        expiresAt: EXPIRES_AT,
+        perLaneCaps: { [LANE_1]: { maxPositions: 3 } }, // LANE_2 absent
+      })),
+      "utf-8",
+    );
+    const loaded = loadInnovationCampaign(dir, FILE, INSIDE_WINDOW_MS);
+    const cap = campaignCapForLane(loaded, LANE_2);
+    expect(cap).toBeDefined();
+    expect(cap!.laneMaxPositions).toBeUndefined();
+    expect(cap!.laneMaxNotionalUsd).toBeUndefined();
+  });
+
+  it("[REQ-3] a lane OUTSIDE allowedLaneIds still gets a DEFINED cap — campaignCapForLane is deliberately laneId-agnostic about authorization (by design, per its own doc comment); the actual denial for an unauthorized lane comes from the separate, unchanged evaluateInnovationCampaignAdmission gate, proven directly here too so this test cannot pass on the wrong half of the story alone", () => {
+    const dir = tmpDir();
+    writeFileSync(
+      resolve(dir, FILE),
+      JSON.stringify(validCampaignJson({ allowedLaneIds: [LANE_1], startsAt: STARTS_AT, expiresAt: EXPIRES_AT })),
+      "utf-8",
+    );
+    const loaded = loadInnovationCampaign(dir, FILE, INSIDE_WINDOW_MS);
+
+    // campaignCapForLane itself does not gate on allowedLaneIds:
+    const capForUnauthorizedLane = campaignCapForLane(loaded, LANE_2);
+    expect(capForUnauthorizedLane).toBeDefined();
+    expect(capForUnauthorizedLane!.campaignLaneIds).toContain(LANE_2); // still part of the full universe
+
+    // ...but the SEPARATE, unchanged admission gate still denies LANE_2 outright — this is the gate
+    // that actually keeps an unauthorized lane's signals from ever reaching reserve() in the first
+    // place (see this file's own header comment / this module's AUTHORITY doc comment).
+    const admission = evaluateInnovationCampaignAdmission(loaded.campaign, admissionCtx(LANE_2));
+    expect(admission.allowed).toBe(false);
+    expect(admission.reason).toContain(LANE_2);
+
+    // A DIFFERENT lane that IS authorized is unaffected.
+    const admittedLane1 = evaluateInnovationCampaignAdmission(loaded.campaign, admissionCtx(LANE_1));
+    expect(admittedLane1.allowed).toBe(true);
+  });
+
+  it("[GLOBAL-SCOPE risk item] campaignLaneIds always covers the FULL universe, so a lane dropped from a narrowed allowedLaneIds still counts toward the global cap the coordinator computes — proven by asserting cap.campaignLaneIds is unaffected by allowedLaneIds shrinking to a single lane", () => {
+    const dir = tmpDir();
+    writeFileSync(
+      resolve(dir, FILE),
+      JSON.stringify(validCampaignJson({ allowedLaneIds: [LANE_1], startsAt: STARTS_AT, expiresAt: EXPIRES_AT })),
+      "utf-8",
+    );
+    const loaded = loadInnovationCampaign(dir, FILE, INSIDE_WINDOW_MS);
+    const cap = campaignCapForLane(loaded, LANE_1);
+    // The cap's own campaignLaneIds is still the FULL roster (length > 1), so
+    // account-exposure-coordinator.ts's buildCampaignExposure will still sum a DIFFERENT,
+    // no-longer-allowed lane's still-open exposure against the global cap, exactly per
+    // ExposureReserveCampaignCap.campaignLaneIds's own doc comment.
+    expect(cap!.campaignLaneIds).toEqual(EXECUTABLE_INNOVATION_LANE_IDS);
+    expect(cap!.campaignLaneIds.length).toBeGreaterThan(1);
+    expect(cap!.campaignLaneIds).toContain(LANE_3); // a lane NOT in allowedLaneIds at all
+  });
+
+  it("[RESTART] campaignCapForLane over two successive loads of the identical file/instant is deep-equal — no hidden module-level cache, matching loadInnovationCampaign's own no-cache contract", () => {
+    const dir = tmpDir();
+    writeFileSync(
+      resolve(dir, FILE),
+      JSON.stringify(validCampaignJson({ startsAt: STARTS_AT, expiresAt: EXPIRES_AT })),
+      "utf-8",
+    );
+    const first = campaignCapForLane(loadInnovationCampaign(dir, FILE, INSIDE_WINDOW_MS), LANE_1);
+    const second = campaignCapForLane(loadInnovationCampaign(dir, FILE, INSIDE_WINDOW_MS), LANE_1);
+    expect(second).toEqual(first);
   });
 });
