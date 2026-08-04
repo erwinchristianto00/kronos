@@ -435,6 +435,253 @@ describe("CrossSectionalExecutor — account-exposure reservation wiring (2026-0
   });
 });
 
+describe("[LIVE-TICK RECONCILIATION] an ambiguous entry-leg failure reconciles against the exchange BEFORE deciding hedge/rollback, instead of assuming (2026-08-05)", () => {
+  /** Resolves queryOrderByClientId by SYMBOL rather than requiring the executor-generated
+   *  entryClientOrderId string (unpredictable from a test written before the tick runs — unlike the
+   *  [RESTART-RECOVERY] tests above, which seed a basket directly on disk and so control that string
+   *  themselves). Falls through to the base class's own (queryOrderByClientIdResponses /
+   *  queryOrderByClientIdNetworkError / default-unconfigured-throws--2013) behavior for any symbol
+   *  not explicitly scripted here, and increments queryOrderByClientIdCallCount exactly once per
+   *  call either way — never double counted. */
+  class SymbolScriptedReconcileClient extends FakeExecClient {
+    filledResolutionBySymbol = new Map<string, { qty: number; avgPrice: number; orderId: string }>();
+    override async queryOrderByClientId(symbol: string, origClientOrderId: string): Promise<FuturesOrder> {
+      const filled = this.filledResolutionBySymbol.get(symbol);
+      if (!filled) return super.queryOrderByClientId(symbol, origClientOrderId);
+      this.queryOrderByClientIdCallCount++;
+      return {
+        symbol,
+        orderId: filled.orderId,
+        clientOrderId: origClientOrderId,
+        status: "FILLED",
+        type: "MARKET",
+        side: "SELL",
+        reduceOnly: false,
+        price: 0,
+        stopPrice: 0,
+        origQty: filled.qty,
+        executedQty: filled.qty,
+        avgPrice: filled.avgPrice,
+        updateTime: 0,
+      };
+    }
+  }
+
+  it("[FILLED] an ambiguous local failure whose immediate reconciliation confirms the order DID reach the exchange adopts the real fill — exactly like the crash-path's own FILLED branch — instead of aborting a leg that is actually live", async () => {
+    const ledger = makeFakeReservationLedger();
+    const client = new SymbolScriptedReconcileClient();
+    client.failOnSymbol = "DOGEUSDT"; // placeOrder throws a plain, ambiguous Error locally...
+    client.filledResolutionBySymbol.set("DOGEUSDT", { qty: 97, avgPrice: 0.099, orderId: "dgo-real-fill-1" }); // ...but the order genuinely reached and filled on the exchange
+    const { executor, store } = makeExecutor({
+      client,
+      signalMs: NOW_MS - 5 * 60_000,
+      reserveExposure: ledger.reserveExposure,
+      commitExposureReservation: ledger.commitExposureReservation,
+      releaseExposureReservation: ledger.releaseExposureReservation,
+    });
+
+    await executor.tick();
+
+    const basket = store.getState().baskets[0]!;
+    expect(basket.status).toBe("COMPLETE"); // both legs real — never aborted a working position
+    expect(basket.legs).toHaveLength(2);
+    const doge = basket.legs.find((l) => l.symbol === "DOGEUSDT")!;
+    // Adopted from the RECONCILIATION result — the real pre-existing fill — not from a fresh
+    // placeOrder call (DOGE's placeOrder call THREW; it never returned an order at all).
+    expect(doge.qty).toBe(97);
+    expect(doge.entryPrice).toBe(0.099);
+    expect(doge.entryOrderId).toBe("dgo-real-fill-1");
+    expect(doge.entryPriceConfirmed).toBe(true);
+    expect(basket.plan![1]).toMatchObject({ symbol: "DOGEUSDT", status: "FILLED" });
+    // FAIL-WITHOUT-FIX: before this fix, this exact scenario decided hedge/rollback blind, this SAME
+    // tick, while the real DOGE fill above was never recorded anywhere — a naked, untracked short
+    // position no later restart would ever rediscover (recoverIncompleteBaskets only revisits
+    // non-terminal baskets, and ABORTED/COMPLETE are both terminal).
+    const bySymbol = new Map([...ledger.reservations.values()].map((r) => [r.req.symbol, r]));
+    expect(bySymbol.get("SOLUSDT")!.status).toBe("COMMITTED");
+    // Committed (never released) from the RECONCILED fill data, not the originally requested qty.
+    expect(bySymbol.get("DOGEUSDT")!.status).toBe("COMMITTED");
+    expect(bySymbol.get("DOGEUSDT")!.committed).toEqual({ qty: 97, avgPrice: 0.099 });
+    // No second/duplicate placeOrder call for DOGE — the leg was adopted, never re-placed.
+    expect(client.placed.filter((p) => p.symbol === "DOGEUSDT")).toHaveLength(0);
+    expect(client.queryOrderByClientIdCallCount).toBe(1);
+  });
+
+  it("[NOT_PLACED, keeps a genuine hedge] an ambiguous failure on the LAST leg whose immediate reconciliation confirms it never reached the exchange still keeps an already-balanced partial basket OPEN as a real hedge, exactly like a confirmed-rejection would", async () => {
+    // Same 3-leg (1 long, 2 short) shape as the [HEDGE-OR-ROLLBACK] suite above (duplicated locally
+    // — matches this file's own established convention for describe-scoped fixtures) so the
+    // already-filled subset (SOL long + DOGE short) is genuinely two-sided by the time RNDR fails.
+    function threeLegSignal(openedAtMs: number): CrossSectionalObservation {
+      return {
+        observationId: `xsec:MOM24:${openedAtMs}`,
+        openedAt: new Date(openedAtMs).toISOString(),
+        openedAtMs,
+        horizonMs: 24 * 3_600_000,
+        signal: "MOM24_FILTERED",
+        variant: "FILTERED",
+        k: 1,
+        longLeg: [{ symbol: "SOLUSDT", entryPrice: 100, exitPrice: null }],
+        shortLeg: [
+          { symbol: "DOGEUSDT", entryPrice: 0.1, exitPrice: null },
+          { symbol: "RNDRUSDT", entryPrice: 10, exitPrice: null },
+        ],
+        status: "OPEN",
+        grossReturn: null,
+        costReturn: null,
+        netReturn: null,
+        longLegReturn: null,
+        shortLegReturn: null,
+        resolvedAt: null,
+      };
+    }
+    const ledger = makeFakeReservationLedger();
+    const client = new FakeExecClient();
+    client.fillPriceBySymbol.set("SOLUSDT", 100);
+    client.fillPriceBySymbol.set("DOGEUSDT", 0.1);
+    client.failOnSymbol = "RNDRUSDT"; // ambiguous — SOL(long) and DOGE(short) already filled
+    // queryOrderByClientIdResponses left EMPTY for RNDR's clientOrderId -> default Binance -2013
+    // shape -> a CONFIRMED (not assumed) NOT_PLACED, exactly like the [AMBIGUOUS FAILURE,
+    // RECONCILED NOT_PLACED] fixture above.
+    const signalStore = new CrossSectionalStore(tmpDir());
+    signalStore.add(threeLegSignal(NOW_MS - 5 * 60_000));
+    const storeDir = tmpDir();
+    const store = new CrossSectionalExecutorStore(storeDir);
+    store.getState().lastSeenSignalMs = NOW_MS - 3_600_000;
+    const executor = new CrossSectionalExecutor({
+      client, signalStore, store, isAllowed: () => true, nowIso: () => NOW, fillConfirmRetryDelayMs: 0,
+      reserveExposure: ledger.reserveExposure,
+      commitExposureReservation: ledger.commitExposureReservation,
+      releaseExposureReservation: ledger.releaseExposureReservation,
+    });
+
+    await executor.tick();
+
+    const basket = store.getState().baskets[0]!;
+    expect(basket.status).toBe("COMPLETE"); // kept as a smaller, still-balanced hedge, not aborted
+    expect(basket.legs).toHaveLength(2);
+    expect(basket.legs.map((l) => l.symbol).sort()).toEqual(["DOGEUSDT", "SOLUSDT"]);
+    expect(basket.plan![2]).toMatchObject({ symbol: "RNDRUSDT", status: "FAILED" });
+    expect(client.placed.filter((p) => p.reduceOnly)).toHaveLength(0); // neither open leg unwound
+    expect(client.queryOrderByClientIdCallCount).toBe(1); // reconciled BEFORE deciding hedge-vs-rollback
+    const rndr = [...ledger.reservations.values()].find((r) => r.req.symbol === "RNDRUSDT")!;
+    expect(rndr.status).toBe("RELEASED");
+    expect(rndr.releaseReason).toMatch(/^ENTRY_FAILED_RECONCILED_NOT_PLACED:/);
+    const sol = [...ledger.reservations.values()].find((r) => r.req.symbol === "SOLUSDT")!;
+    const doge = [...ledger.reservations.values()].find((r) => r.req.symbol === "DOGEUSDT")!;
+    expect(sol.status).toBe("COMMITTED");
+    expect(doge.status).toBe("COMMITTED");
+  });
+
+  it("[INCONCLUSIVE] an ambiguous failure whose immediate reconciliation ALSO fails never guesses — the basket does NOT finalize this tick, diagnostics are visible via getStatus().lastError, and a SUBSEQUENT tick's recovery pass resolves it with no duplicate order for that same leg", async () => {
+    const ledger = makeFakeReservationLedger();
+    const client = new FakeExecClient();
+    client.failOnSymbol = "DOGEUSDT"; // ambiguous local placeOrder failure
+    client.queryOrderByClientIdNetworkError = true; // the immediate reconciliation ITSELF is also unreachable
+    client.fillPriceBySymbol.set("DOGEUSDT", 0.1); // lets a later, genuinely-fresh retry fill cleanly
+    const { executor, store } = makeExecutor({
+      client,
+      signalMs: NOW_MS - 5 * 60_000,
+      reserveExposure: ledger.reserveExposure,
+      commitExposureReservation: ledger.commitExposureReservation,
+      releaseExposureReservation: ledger.releaseExposureReservation,
+    });
+
+    await executor.tick();
+
+    let basket = store.getState().baskets[0]!;
+    expect(basket.status).toBe("PARTIALLY_FILLED"); // non-terminal — never finalized this tick
+    expect(basket.legs).toHaveLength(1);
+    expect(basket.legs[0]!.symbol).toBe("SOLUSDT");
+    // No new status/enum value invented — stays exactly "PLACING", never "FAILED".
+    expect(basket.plan![1]).toMatchObject({ symbol: "DOGEUSDT", status: "PLACING" });
+    let bySymbol = new Map([...ledger.reservations.values()].map((r) => [r.req.symbol, r]));
+    expect(bySymbol.get("SOLUSDT")!.status).toBe("COMMITTED");
+    expect(bySymbol.get("DOGEUSDT")!.status).toBe("RESERVED"); // untouched — neither committed nor released
+    expect(client.placed.filter((p) => p.symbol === "DOGEUSDT")).toHaveLength(0); // no order this tick
+    expect(client.queryOrderByClientIdCallCount).toBe(1);
+    expect(executor.getStatus().lastError).toMatch(/INCONCLUSIVE/);
+
+    // The transient condition clears — a later tick self-heals with NO operator action, via
+    // recoverIncompleteBaskets (which every tick already scans RESERVED/PLACING/PARTIALLY_FILLED
+    // baskets for), not a special retry path.
+    client.queryOrderByClientIdNetworkError = false;
+    client.failOnSymbol = null;
+    await executor.tick();
+
+    basket = store.getState().baskets[0]!;
+    expect(basket.status).toBe("COMPLETE");
+    expect(basket.legs).toHaveLength(2);
+    const doge = basket.legs.find((l) => l.symbol === "DOGEUSDT")!;
+    expect(doge.entryPriceConfirmed).toBe(true);
+    expect(client.queryOrderByClientIdCallCount).toBe(2); // reconciled again on tick 2 (default -> NOT_PLACED)
+    // The critical safety property: exactly ONE real DOGE order ever reached the exchange across
+    // BOTH ticks — the ambiguous tick-1 attempt never landed (confirmed NOT_PLACED), so tick 2's
+    // fresh attempt is not a duplicate.
+    expect(client.placed.filter((p) => p.symbol === "DOGEUSDT" && !p.reduceOnly)).toHaveLength(1);
+    bySymbol = new Map([...ledger.reservations.values()].map((r) => [r.req.symbol, r]));
+    expect(bySymbol.get("DOGEUSDT")!.status).toBe("COMMITTED");
+    expect(store.getState().baskets).toHaveLength(1); // never opened a second, duplicate basket
+  });
+
+  it("[BLOCK RETRY] while an ambiguous leg's reservation stays outstanding (INCONCLUSIVE), the REAL AccountExposureCoordinator's single-flight-per-symbol gate rejects any fresh reservation attempt on the SAME symbol — from a brand-new basket, a sibling instance, or a SingleSymbolLaneExecutor — while leaving other symbols unaffected", async () => {
+    const reservationStore = new AccountExposureReservationStore(tmpDir());
+    const coordinator = new AccountExposureCoordinator({
+      store: reservationStore,
+      getSingleSymbolExecutors: () => [],
+      getCrossSectionalExecutors: () => [],
+      nowIso: () => NOW,
+      maxGrossExposureUsd: () => 0,
+      maxLongExposureUsd: () => 0,
+      maxShortExposureUsd: () => 0,
+      maxNotionalPerSymbolUsd: () => 0,
+      maxClusterPositions: () => 0,
+      maxConcurrentPositionsAcrossAccount: () => 0,
+    });
+    const client = new FakeExecClient();
+    client.failOnSymbol = "DOGEUSDT";
+    client.queryOrderByClientIdNetworkError = true; // genuinely INCONCLUSIVE this tick
+    const { executor, store } = makeExecutor({
+      client,
+      signalMs: NOW_MS - 5 * 60_000,
+      reserveExposure: coordinator.reserve.bind(coordinator),
+      commitExposureReservation: coordinator.commitReservation.bind(coordinator),
+      releaseExposureReservation: coordinator.releaseReservation.bind(coordinator),
+    });
+
+    await executor.tick();
+
+    const basket = store.getState().baskets[0]!;
+    expect(basket.status).toBe("PARTIALLY_FILLED"); // left pending, not finalized
+    const dogeReservation = reservationStore.getState().reservations.find((r) => r.symbol === "DOGEUSDT")!;
+    expect(dogeReservation.status).toBe("RESERVED"); // still outstanding in the REAL coordinator store
+
+    // A fresh attempt on the EXACT SAME symbol — could be a brand-new basket's leg, a sibling
+    // executor instance, or a SingleSymbolLaneExecutor entry; Gate 1 is unconditional and doesn't
+    // care about the caller's identity — must be rejected while this reservation stays RESERVED.
+    const blocked = coordinator.reserve({
+      executorId: "SOME_OTHER_EXECUTOR_OR_NEW_BASKET",
+      symbol: "DOGEUSDT",
+      direction: "SHORT",
+      requestedNotionalUsd: 25,
+      clientOrderId: "fresh-attempt-same-symbol-e0",
+    });
+    expect(blocked.ok).toBe(false);
+    expect(blocked.reservationId).toBeNull();
+    expect(blocked.reason).toMatch(/another reservation is already in flight/);
+
+    // A DIFFERENT, unrelated symbol is NOT blocked — proves this is a scoped per-symbol gate, not
+    // an account-wide halt.
+    const unrelated = coordinator.reserve({
+      executorId: "SOME_OTHER_EXECUTOR_OR_NEW_BASKET",
+      symbol: "ADAUSDT",
+      direction: "LONG",
+      requestedNotionalUsd: 25,
+      clientOrderId: "fresh-attempt-different-symbol-e0",
+    });
+    expect(unrelated.ok).toBe(true);
+  });
+});
+
 describe("cross-sectional executor (basket execution, testnet-first)", () => {
   it("supports an explicit first-boot watermark while preserving the default replay guard", () => {
     const initialWatermark = NOW_MS - 60 * 60_000;
