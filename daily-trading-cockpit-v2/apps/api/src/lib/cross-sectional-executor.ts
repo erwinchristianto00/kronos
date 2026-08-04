@@ -2281,6 +2281,28 @@ export class CrossSectionalExecutor {
    * shared abstraction would couple two independently-owned concerns for no real gain. Never
    * throws — an unwired client or a network failure both resolve to INCONCLUSIVE, the same
    * "don't guess, retry later" outcome as any other unrecognized state.
+   *
+   * 2026-08-05 (adversarial-review fix, live-tick reconciliation task): executedQty>0 is checked
+   * FIRST, independent of the order's overall terminal status string. Binance Futures MARKET
+   * orders (the ONLY type this executor ever places — see placeRemainingLegsLocked) that can only
+   * partially match available book depth commonly terminate the UNFILLED remainder with status
+   * EXPIRED (sometimes CANCELED), not FILLED/PARTIALLY_FILLED — while still reporting the genuinely
+   * executed portion via a nonzero executedQty. The PREVIOUS status-string-first ordering matched
+   * "EXPIRED"/"CANCELED"/"REJECTED" before ever looking at executedQty and returned NOT_PLACED for
+   * that real, nonzero fill — a false negative that (a) released the reservation for capacity
+   * genuinely in use and (b) discarded the fill entirely (never adopted into basket.legs, never
+   * tracked as an orphan either, since orphan-tracking only ever begins from a leg already present
+   * in basket.legs) — exactly the "genuinely naked, untracked position" failure mode this task's own
+   * live-tick fix exists to close, reached via a different trigger. This is the SAME
+   * "executedQty alone, no status gate" rule placeRemainingLegsLocked's own direct (non-error)
+   * placeOrder-response handling already uses (see its filledQty derivation, BUG 3) — this fix
+   * brings the RECONCILIATION classification into alignment with that already-established
+   * convention rather than inventing a new one. Any status string, terminal or not, with
+   * executedQty>0 is unconditionally a real fill; NOT_PLACED is now reached only for a genuinely
+   * empty (executedQty<=0) terminal-no-fill status. Purely additive/widening — every case the OLD
+   * condition already classified FILLED is still FILLED (a strict subset), so this cannot change
+   * the outcome for any status/executedQty combination the existing test suite already covered
+   * (confirmed: no existing test paired a terminal-no-fill status with a nonzero executedQty).
    */
   private async reconcilePlannedLeg(
     symbol: string,
@@ -2294,16 +2316,10 @@ export class CrossSectionalExecutor {
       const order = await this.client.queryOrderByClientId(symbol, entryClientOrderId);
       const status = (order.status ?? "").trim().toUpperCase();
       const executedQty = Number.isFinite(order.executedQty) ? order.executedQty : 0;
-      if ((status === "FILLED" || status === "PARTIALLY_FILLED") && executedQty > 0) {
+      if (executedQty > 0) {
         return { outcome: "FILLED", qty: executedQty, avgPrice: order.avgPrice, orderId: order.orderId };
       }
-      if (
-        status === "CANCELED" ||
-        status === "CANCELLED" ||
-        status === "EXPIRED" ||
-        status === "REJECTED" ||
-        (status === "FILLED" && executedQty <= 0)
-      ) {
+      if (status === "CANCELED" || status === "CANCELLED" || status === "EXPIRED" || status === "REJECTED" || status === "FILLED") {
         return { outcome: "NOT_PLACED" };
       }
       return { outcome: "INCONCLUSIVE" };

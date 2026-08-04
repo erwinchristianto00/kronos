@@ -680,6 +680,65 @@ describe("[LIVE-TICK RECONCILIATION] an ambiguous entry-leg failure reconciles a
     });
     expect(unrelated.ok).toBe(true);
   });
+
+  it("[EXPIRED WITH PARTIAL FILL] an ambiguous failure whose immediate reconciliation returns a terminal non-FILLED/PARTIALLY_FILLED status that STILL carries a nonzero executedQty is adopted as a real fill, not misread as NOT_PLACED — a genuine Binance Futures MARKET-order shape (the unfilled remainder of a thin-book partial match commonly terminates EXPIRED, not FILLED), exactly the 'thin-liquidity basket-universe symbol' case this file's own placeRemainingLegsLocked success path (BUG 3) already treats as real by reading executedQty alone, with no status gate at all", async () => {
+    // Deliberately local to this one test (not merged into SymbolScriptedReconcileClient above,
+    // which hardcodes status:"FILLED") — this is a DISTINCT exchange response shape under test.
+    class ExpiredWithPartialFillClient extends FakeExecClient {
+      override async queryOrderByClientId(symbol: string, origClientOrderId: string): Promise<FuturesOrder> {
+        if (symbol !== "DOGEUSDT") return super.queryOrderByClientId(symbol, origClientOrderId);
+        this.queryOrderByClientIdCallCount++;
+        return {
+          symbol,
+          orderId: "dgo-partial-expired-1",
+          clientOrderId: origClientOrderId,
+          status: "EXPIRED", // terminal, NOT "FILLED"/"PARTIALLY_FILLED" — the unfilled remainder
+          type: "MARKET",
+          side: "SELL",
+          reduceOnly: false,
+          price: 0,
+          stopPrice: 0,
+          origQty: 100,
+          executedQty: 47, // ...but a REAL, nonzero quantity genuinely matched before it expired
+          avgPrice: 0.099,
+          updateTime: 0,
+        };
+      }
+    }
+    const ledger = makeFakeReservationLedger();
+    const client = new ExpiredWithPartialFillClient();
+    client.failOnSymbol = "DOGEUSDT"; // placeOrder throws a plain, ambiguous Error locally...
+    const { executor, store } = makeExecutor({
+      client,
+      signalMs: NOW_MS - 5 * 60_000,
+      reserveExposure: ledger.reserveExposure,
+      commitExposureReservation: ledger.commitExposureReservation,
+      releaseExposureReservation: ledger.releaseExposureReservation,
+    });
+
+    await executor.tick();
+
+    const basket = store.getState().baskets[0]!;
+    // FAIL-WITHOUT-FIX: reconcilePlannedLeg's status-string branch matched "EXPIRED" BEFORE ever
+    // looking at executedQty, returning NOT_PLACED — the basket rolled back (one-sided: only SOL
+    // had a leg) with the REAL 47-qty DOGE fill never recorded anywhere (not basket.legs, not
+    // orphanedLegs) and its reservation wrongly released while genuine exchange exposure sat open
+    // and permanently untracked — precisely the failure mode this whole fix exists to close, via a
+    // different trigger (a status-classification gap, not a missing reconciliation call).
+    expect(basket.status).toBe("COMPLETE");
+    expect(basket.legs).toHaveLength(2);
+    const doge = basket.legs.find((l) => l.symbol === "DOGEUSDT")!;
+    expect(doge.qty).toBe(47);
+    expect(doge.entryPrice).toBe(0.099);
+    expect(doge.entryOrderId).toBe("dgo-partial-expired-1");
+    expect(doge.entryPriceConfirmed).toBe(true);
+    expect(basket.plan![1]).toMatchObject({ symbol: "DOGEUSDT", status: "FILLED" });
+    const bySymbol = new Map([...ledger.reservations.values()].map((r) => [r.req.symbol, r]));
+    expect(bySymbol.get("DOGEUSDT")!.status).toBe("COMMITTED");
+    expect(bySymbol.get("DOGEUSDT")!.committed).toEqual({ qty: 47, avgPrice: 0.099 });
+    expect(client.placed.filter((p) => p.symbol === "DOGEUSDT")).toHaveLength(0); // adopted, never re-placed
+    expect(store.getState().orphanedLegs ?? []).toHaveLength(0); // never lost, so never needed rediscovery
+  });
 });
 
 describe("cross-sectional executor (basket execution, testnet-first)", () => {
