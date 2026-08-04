@@ -6,6 +6,7 @@ import {
   computeClusterOpenSymbols,
   maxClusterPositionsAcrossLanes,
   isNewExecutorLaneAllowed,
+  newExecutorLaneGate,
   rollingNetEntryHealth,
   type LiveExecutorGateEngine,
 } from "../src/lib/live-executor-wiring.js";
@@ -73,6 +74,55 @@ describe("isNewExecutorLaneAllowed", () => {
 
   it("null engine: blocked on testnet too (explicit inclusion defaults to false with no engine)", () => {
     expect(isNewExecutorLaneAllowed("MY_LANE", "testnet", null)).toBe(false);
+  });
+});
+
+describe("newExecutorLaneGate reason plumbing (2026-08 manual-directional canonical-regime enforcement fix)", () => {
+  it("surfaces engine.newEntryBlockReason() verbatim when the engine defines it and canOpenNewEntries() is false", () => {
+    const engine = fakeEngine({
+      canOpenNewEntries: () => false,
+      newEntryBlockReason: () => "canonical regime PANIC active",
+    });
+    expect(newExecutorLaneGate("MY_LANE", "testnet", engine)).toEqual({ allowed: false, reason: "canonical regime PANIC active" });
+  });
+
+  it("falls back to the generic drain string when newEntryBlockReason() itself returns null (`??` is nullish-coalescing, not a presence check — it substitutes for BOTH a missing method and a present method returning null/undefined)", () => {
+    const engine = fakeEngine({
+      canOpenNewEntries: () => false,
+      newEntryBlockReason: () => null,
+    });
+    // In practice this combination (canOpenNewEntries()===false but newEntryBlockReason()===null)
+    // cannot happen on a REAL LiveExecutionEngine — both are sourced from the same
+    // entryGateDecision() by construction (see that method's own doc comment), so they can never
+    // disagree. This test pins the fakeEngine-reachable EDGE behavior precisely (a `??` fallback,
+    // not a stricter `??  only-if-undefined` check some readers might expect from the `?.()` call
+    // immediately to its left) so a future refactor cannot silently change it without this test
+    // noticing either way.
+    expect(newExecutorLaneGate("MY_LANE", "testnet", engine)).toEqual({
+      allowed: false,
+      reason: "new-entry drain is active (operator paused new entries)",
+    });
+  });
+
+  it("falls back to the generic drain string when the engine does not define newEntryBlockReason at all (pre-2026-08 fake/engine shape)", () => {
+    const engine = fakeEngine({ canOpenNewEntries: () => false });
+    expect(newExecutorLaneGate("MY_LANE", "testnet", engine)).toEqual({
+      allowed: false,
+      reason: "new-entry drain is active (operator paused new entries)",
+    });
+  });
+
+  it("never consults newEntryBlockReason at all when canOpenNewEntries() is true (reason stays null on the allowed path)", () => {
+    let called = false;
+    const engine = fakeEngine({
+      canOpenNewEntries: () => true,
+      newEntryBlockReason: () => {
+        called = true;
+        return "should never be read";
+      },
+    });
+    expect(newExecutorLaneGate("MY_LANE", "testnet", engine)).toEqual({ allowed: true, reason: null });
+    expect(called).toBe(false);
   });
 });
 

@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import {
   buildIsPaperOrderLiveEligible,
+  buildManualDirectionalRegimeSafetyGate,
   buildUnifiedRegimeEntryGate,
   hasExactContextReadinessProof,
 } from "../src/app.js";
@@ -236,8 +237,16 @@ const STABLE_NET_R = (index: number) => (index % 5 === 0 ? -0.5 : 1);
 // execution-readiness-context.test.ts's own PROOF-BOUNDARY suite standardizes on.
 const TEST_LANE_VARIANT_ID: VariantMatrixVariantDefinition["id"] = "CG_WIDE_STOP_TP_WIDE";
 
-function makeManualEngineForLongLane(laneVariantId: string, newEntryGate?: () => { allowed: boolean; reason: string | null }) {
-  const { engine } = makeEngine({ newEntryGate });
+function makeManualEngineForLongLane(
+  laneVariantId: string,
+  newEntryGate?: () => { allowed: boolean; reason: string | null },
+  // 2026-08 manual-directional canonical-regime enforcement fix: optional so every PRE-EXISTING
+  // caller of this helper (which predates the fix) is byte-for-byte unaffected — omitted, this
+  // engine gets LiveExecutionEngine's own default-permissive regimeSafetyGate fallback, exactly
+  // the OLD (buggy) behavior. [H8] below is the only caller that now passes a real one.
+  regimeSafetyGate?: () => { allowed: boolean; reason: string | null },
+) {
+  const { engine } = makeEngine({ newEntryGate, regimeSafetyGate });
   const setup = engine.setManualDirectionalLaneAllocations({
     long: [{ laneId: laneVariantId, weightPct: 100 }],
     short: [],
@@ -417,20 +426,46 @@ describe("[ADVERSARIAL-H] LOW_COVERAGE blocks every entry path", () => {
     expect(edgeMemoryLabelForCanonicalFamily(forcedFamily)).toBe("CANONICAL_MIXED_ROTATION");
   });
 
-  it("[H8, honesty/scope] the PRE-EXISTING (unchanged by this round) manual-directional bypass in LiveExecutionEngine.canOpenNewEntries() still bypasses the canonical regime gate for a fresh manual directional decision — contrasted directly against canOpenNewEntriesIgnoringManualDirectional(), which does NOT bypass it (H4). This is not a new gap introduced by this round: canOpenNewEntries()'s manual-mode branch structure is untouched — only strategyEntryGate()'s underlying DATA SOURCE changed. It qualifies H's 'blocks every entry path' claim for SingleSymbolLaneExecutor specifically when an operator has manual directional mode active.", async () => {
+  it("[H8, FIXED 2026-08] the formerly-bypassing manual-directional branch in LiveExecutionEngine.canOpenNewEntries() now ALSO blocks under LOW_COVERAGE, via the new independent regimeSafetyGate — closing the exact gap this test used to document as out-of-scope. Contrasted directly against canOpenNewEntriesIgnoringManualDirectional() (H4), which never took the manual short-circuit at all and was already unaffected by this bug.", async () => {
     const newEntryGate = buildUnifiedRegimeEntryGate({
       getUnifiedOrchestrator: () => null,
       getCanonicalMarketRegimeSnapshot: () => lowCoverageSnapshot(),
       env: {},
     });
-    const manualEngine = makeManualEngineForLongLane(TEST_LANE_VARIANT_ID, newEntryGate);
+    // 2026-08 fix: production (app.ts) wires BOTH newEntryGate and regimeSafetyGate from the SAME
+    // shared getCanonicalMarketRegimeSnapshot accessor — reproduced here with two independently
+    // constructed real factories reading the SAME lowCoverageSnapshot(), exactly mirroring that
+    // shared-accessor shape (see [I2] above for the structural guarantee that app.ts itself does
+    // this, not merely that it's possible to do).
+    const regimeSafetyGate = buildManualDirectionalRegimeSafetyGate({
+      getCanonicalMarketRegimeSnapshot: () => lowCoverageSnapshot(),
+    });
+    const manualEngine = makeManualEngineForLongLane(TEST_LANE_VARIANT_ID, newEntryGate, regimeSafetyGate);
     expect((await manualEngine.arm()).ok).toBe(true);
-    // The manual-directional short-circuit bypasses strategyEntryGate()/newEntryGate entirely —
-    // canOpenNewEntries() returns true DESPITE LOW_COVERAGE.
-    expect(manualEngine.canOpenNewEntries()).toBe(true);
-    // canOpenNewEntriesIgnoringManualDirectional() never takes that short-circuit — same engine,
-    // same manual-mode state, same LOW_COVERAGE snapshot, opposite (and correct) answer.
+    // FIXED: the manual-directional branch now ALSO consults the canonical regime policy (via the
+    // new, independent regimeSafetyGate) — canOpenNewEntries() returns false under LOW_COVERAGE,
+    // exactly like every non-manual lane already did.
+    expect(manualEngine.canOpenNewEntries()).toBe(false);
+    expect(manualEngine.newEntryBlockReason()).toMatch(/coverage/i);
+    // canOpenNewEntriesIgnoringManualDirectional() never took the manual short-circuit to begin
+    // with — same engine, same manual-mode state, same LOW_COVERAGE snapshot, same (unchanged)
+    // answer as before this fix.
     expect(manualEngine.canOpenNewEntriesIgnoringManualDirectional()).toBe(false);
+  });
+
+  it("[H8-control] the SAME manual engine, fed a HEALTHY snapshot through BOTH newEntryGate and the new regimeSafetyGate, still opens — proves H8's `false` above is caused by LOW_COVERAGE specifically, and that the fix narrows (never removes) the manual-directional maturity bypass. Mirrors [H3-control]'s discipline for the non-manual path.", async () => {
+    const newEntryGate = buildUnifiedRegimeEntryGate({
+      getUnifiedOrchestrator: () => null,
+      getCanonicalMarketRegimeSnapshot: () => freshSnapshot("BULLISH"),
+      env: {},
+    });
+    const regimeSafetyGate = buildManualDirectionalRegimeSafetyGate({
+      getCanonicalMarketRegimeSnapshot: () => freshSnapshot("BULLISH"),
+    });
+    const manualEngine = makeManualEngineForLongLane(TEST_LANE_VARIANT_ID, newEntryGate, regimeSafetyGate);
+    expect((await manualEngine.arm()).ok).toBe(true);
+    expect(manualEngine.canOpenNewEntries()).toBe(true);
+    expect(manualEngine.newEntryBlockReason()).toBeNull();
   });
 });
 
@@ -507,17 +542,17 @@ describe("[ADVERSARIAL-I] identical policy across every real integration point",
     expect(paperEligibleBlock).toMatch(/^\s*getCanonicalMarketRegimeSnapshot,\s*$/m);
   });
 
-  it("[I3, structural] exactly 4 call sites of canonicalMarketRegimeExecutionPolicy( and exactly 2 of edgeMemoryLabelForCanonicalFamily( exist in app.ts, and every one of the 4 reads its snapshot from the shared accessor (deps.getCanonicalMarketRegimeSnapshot() or the bare closure-captured getCanonicalMarketRegimeSnapshot()) — never an independent, differently-named getter", () => {
+  it("[I3, structural] exactly 5 call sites of canonicalMarketRegimeExecutionPolicy( and exactly 2 of edgeMemoryLabelForCanonicalFamily( exist in app.ts, and every one of the 5 reads its snapshot from the shared accessor (deps.getCanonicalMarketRegimeSnapshot() or the bare closure-captured getCanonicalMarketRegimeSnapshot()) — never an independent, differently-named getter. (2026-08: was 4 before the manual-directional canonical-regime enforcement fix added buildManualDirectionalRegimeSafetyGate's own call — see that factory's doc comment in app.ts. The count growing by exactly 1, matching the SAME shared-accessor shape, is proof the new gate is real and shares the one canonical function; a jump by more than 1, or a call not sourced from the shared accessor, would mean an independent reimplementation and must still fail this test.)", () => {
     const text = readAppTsSource();
-    expect(countMatches(text, /canonicalMarketRegimeExecutionPolicy\(/g)).toBe(4);
+    expect(countMatches(text, /canonicalMarketRegimeExecutionPolicy\(/g)).toBe(5);
     expect(countMatches(text, /edgeMemoryLabelForCanonicalFamily\(/g)).toBe(2);
 
     // Every canonicalMarketRegimeExecutionPolicy({ call is immediately followed by a snapshot: line
     // reading one of the two accepted forms — collected via a single regex over the whole file so a
-    // 5th, differently-sourced call site would be caught by the count assertion above, and a
-    // MIS-sourced one of the 4 would be caught here.
+    // 6th, differently-sourced call site would be caught by the count assertion above, and a
+    // MIS-sourced one of the 5 would be caught here.
     const callBlocks = text.match(/canonicalMarketRegimeExecutionPolicy\(\{\s*\n\s*snapshot: [^\n]+,/g) ?? [];
-    expect(callBlocks).toHaveLength(4);
+    expect(callBlocks).toHaveLength(5);
     for (const block of callBlocks) {
       expect(block).toMatch(/snapshot: (deps\.)?getCanonicalMarketRegimeSnapshot\(\),/);
     }

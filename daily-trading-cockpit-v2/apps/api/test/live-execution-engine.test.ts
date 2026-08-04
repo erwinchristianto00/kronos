@@ -400,6 +400,11 @@ export function makeEngine(opts: {
   paperLaneWeightPct?: (order: PaperOrder) => number | null;
   getControllerSnapshot?: () => { regime: string | null; mode: string | null; confidence?: string | null; capturedAt?: string | null } | null;
   newEntryGate?: () => { allowed: boolean; reason: string | null };
+  // 2026-08 manual-directional canonical-regime enforcement fix: optional, mirrors newEntryGate's
+  // own plumbing exactly. Omitted (most existing tests) => LiveExecutionEngine's own
+  // default-permissive fallback, matching production's default-permissive convention for an
+  // options field with exactly one real (always-wired) call site.
+  regimeSafetyGate?: () => { allowed: boolean; reason: string | null };
   nowIso?: () => string;
   marketDataClient?: Pick<BinanceClient, "getFuturesFlow">;
   externalManagedNetQty?: () => Map<string, number>;
@@ -421,6 +426,7 @@ export function makeEngine(opts: {
     paperLaneWeightPct: opts.paperLaneWeightPct,
     getControllerSnapshot: opts.getControllerSnapshot,
     newEntryGate: opts.newEntryGate,
+    regimeSafetyGate: opts.regimeSafetyGate,
     nowIso: opts.nowIso ?? (() => "2099-01-02T12:00:00.000Z"),
     marketDataClient: opts.marketDataClient,
     fillConfirmRetryDelayMs: 0,
