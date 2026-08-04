@@ -1212,6 +1212,27 @@ export class CrossSectionalExecutor {
       // safety fix) — it still has its own HORIZON exit (closeBasket doesn't care about leg-count
       // symmetry when actually settling) as the safety valve.
       if (longLegs.length === 0 || shortLegs.length === 0) continue;
+      // 2026-08-05 (review round 3 fix): the check above only catches a FULLY one-sided basket.
+      // placeRemainingLegsLocked's hedge-vs-rollback decision (ground truth item (d)) can now keep a
+      // basket COMPLETE with BOTH sides non-empty yet fewer legs than its own plan — e.g. a 3-long/
+      // 3-short plan whose 5th leg (2nd short) fails keeps 3 long + 1 short open as a "genuine,
+      // already-balanced hedge" per that method's own check (longLegs.length>0 && shortLegs.length>0
+      // — the SAME test as the line above, deliberately reused per that fix's own doc comment). That
+      // check only proves "not naked", not "notionally balanced": this executor sizes every leg at
+      // the SAME fixed legUsd regardless of side (see maybeOpenBasket's sizing loop, no per-side
+      // capital split), so 3 long legs vs. 1 short leg is genuinely ~75%/25% notional-tilted, not the
+      // 50/50 split grossReturn below assumes (mirroring legReturnContribution's equal-notional-per-
+      // side convention) — that assumption holds for a basket matching its own FULL plan (symmetric
+      // or intentionally regime-skewed alike), not for one reduced by an ACCIDENT of wherever a
+      // mid-open failure struck. Scoring it anyway would misprice the position's real blended return
+      // and could wrongly trigger, or wrongly withhold, a profit-bank close on a basket that isn't
+      // the hedge this formula assumes. Same "skip, don't invent a new formula" fix as immediately
+      // above; `Array.isArray` guards the handful of close-path-only test fixtures that seed a
+      // COMPLETE basket with no `plan` at all (see ExecutorBasket.plan's own doc comment) — those
+      // fall through to the pre-existing behavior, unchanged. This basket still has its own HORIZON
+      // exit (closeBasket's PnL is summed per-leg in real dollars — see its own `gross` accumulator
+      // — and never assumes a 50/50 split) as the safety valve.
+      if (Array.isArray(basket.plan) && basket.legs.length !== basket.plan.length) continue;
       const legReturn = (leg: ExecutorLeg, direction: "LONG" | "SHORT"): number | null => {
         const mark = markBySymbol.get(leg.symbol);
         if (mark === undefined || !(leg.entryPrice > 0)) return null;

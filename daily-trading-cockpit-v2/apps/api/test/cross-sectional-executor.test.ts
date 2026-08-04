@@ -1972,6 +1972,130 @@ describe("[TP-MATH FIX] closeBasketsHittingProfitTarget skips lopsided (non-two-
     expect(basket.status).toBe("CLOSED");
     expect(basket.closeReason).toBe("PROFIT_BANK");
   });
+
+  it("[REVIEW ROUND 3 FIX] a COMPLETE basket kept as a REDUCED hedge by the hedge-vs-rollback partial-failure path (both sides present, but fewer legs than its own plan) is never scored or PROFIT_BANK-closed, even with a huge implied gain", async () => {
+    // FAIL-WITHOUT-FIX: `longLegs.length === 0 || shortLegs.length === 0` alone does not catch this
+    // shape — 2 long + 1 short has neither side empty, so the old check let it straight through to
+    // the equal-weight (meanLong/2 + meanShort/2) formula. That formula is only correct when the
+    // basket matches its own plan: this executor sizes every leg at the SAME fixed legUsd regardless
+    // of side (see maybeOpenBasket's sizing loop — no per-side capital split), so 2 long legs vs. 1
+    // short leg is genuinely ~67%/33% notional-tilted, not the 50/50 split the formula assumes.
+    const client = new FakeExecClient();
+    client.fillPriceBySymbol.set("SOLUSDT", 100);
+    client.fillPriceBySymbol.set("ADAUSDT", 1);
+    client.fillPriceBySymbol.set("DOGEUSDT", 0.1);
+    client.failOnSymbol = "RNDRUSDT"; // 4th (last) leg — SOL, ADA (long) and DOGE (short) already filled
+    const signal: CrossSectionalObservation = {
+      observationId: `xsec:MOM24:${NOW_MS - 5 * 60_000}`,
+      openedAt: new Date(NOW_MS - 5 * 60_000).toISOString(),
+      openedAtMs: NOW_MS - 5 * 60_000,
+      horizonMs: 24 * 3_600_000,
+      signal: "MOM24_FILTERED",
+      variant: "FILTERED",
+      k: 2,
+      longLeg: [
+        { symbol: "SOLUSDT", entryPrice: 100, exitPrice: null },
+        { symbol: "ADAUSDT", entryPrice: 1, exitPrice: null },
+      ],
+      shortLeg: [
+        { symbol: "DOGEUSDT", entryPrice: 0.1, exitPrice: null },
+        { symbol: "RNDRUSDT", entryPrice: 10, exitPrice: null },
+      ],
+      status: "OPEN",
+      grossReturn: null,
+      costReturn: null,
+      netReturn: null,
+      longLegReturn: null,
+      shortLegReturn: null,
+      resolvedAt: null,
+    };
+    const signalStore = new CrossSectionalStore(tmpDir());
+    signalStore.add(signal);
+    const storeDir = tmpDir();
+    const store = new CrossSectionalExecutorStore(storeDir);
+    store.getState().lastSeenSignalMs = NOW_MS - 3_600_000;
+    const executor = new CrossSectionalExecutor({
+      client, signalStore, store, isAllowed: () => true, nowIso: () => NOW, fillConfirmRetryDelayMs: 0,
+    });
+
+    await executor.tick(); // opens, fails on RNDR — kept COMPLETE as a 2-long/1-short reduced hedge
+
+    const basket = store.getState().baskets[0]!;
+    expect(basket.status).toBe("COMPLETE");
+    expect(basket.legs).toHaveLength(3);
+    expect(basket.legs.filter((l) => l.side === "LONG")).toHaveLength(2);
+    expect(basket.legs.filter((l) => l.side === "SHORT")).toHaveLength(1); // unequal — not the plan's shape
+    expect(basket.plan).toHaveLength(4);
+
+    // Try to trivially trigger PROFIT_BANK: a huge implied gain on every real leg.
+    client.markPriceBySymbol.set("SOLUSDT", 1000);
+    client.markPriceBySymbol.set("ADAUSDT", 1000);
+    client.markPriceBySymbol.set("DOGEUSDT", 0.001);
+    await executor.tick();
+
+    expect(basket.status).toBe("COMPLETE"); // never closed
+    expect(basket.closeReason).toBeNull();
+    expect(basket.lastNetReturn).toBeUndefined(); // never even stamped — skipped entirely, not scored
+    expect(client.placed.filter((p) => p.reduceOnly)).toHaveLength(0); // no close order ever fired
+  });
+
+  it("[REVIEW ROUND 3 FIX] a genuinely two-sided COMPLETE basket with MULTIPLE legs per side that fully matches its own plan is unaffected — still scores and PROFIT_BANKs normally", async () => {
+    // Guards the new plan-length check above against being overzealous: a fully-filled multi-leg-
+    // per-side basket (2 long + 2 short, nothing failed, legs.length === plan.length) must still
+    // score and close via PROFIT_BANK exactly like the pre-existing 1-vs-1 case above.
+    const client = new FakeExecClient();
+    client.fillPriceBySymbol.set("SOLUSDT", 100);
+    client.fillPriceBySymbol.set("ADAUSDT", 1);
+    client.fillPriceBySymbol.set("DOGEUSDT", 0.1);
+    client.fillPriceBySymbol.set("RNDRUSDT", 10);
+    const signal: CrossSectionalObservation = {
+      observationId: `xsec:MOM24:${NOW_MS - 5 * 60_000}`,
+      openedAt: new Date(NOW_MS - 5 * 60_000).toISOString(),
+      openedAtMs: NOW_MS - 5 * 60_000,
+      horizonMs: 24 * 3_600_000,
+      signal: "MOM24_FILTERED",
+      variant: "FILTERED",
+      k: 2,
+      longLeg: [
+        { symbol: "SOLUSDT", entryPrice: 100, exitPrice: null },
+        { symbol: "ADAUSDT", entryPrice: 1, exitPrice: null },
+      ],
+      shortLeg: [
+        { symbol: "DOGEUSDT", entryPrice: 0.1, exitPrice: null },
+        { symbol: "RNDRUSDT", entryPrice: 10, exitPrice: null },
+      ],
+      status: "OPEN",
+      grossReturn: null,
+      costReturn: null,
+      netReturn: null,
+      longLegReturn: null,
+      shortLegReturn: null,
+      resolvedAt: null,
+    };
+    const signalStore = new CrossSectionalStore(tmpDir());
+    signalStore.add(signal);
+    const storeDir = tmpDir();
+    const store = new CrossSectionalExecutorStore(storeDir);
+    store.getState().lastSeenSignalMs = NOW_MS - 3_600_000;
+    const executor = new CrossSectionalExecutor({
+      client, signalStore, store, isAllowed: () => true, nowIso: () => NOW, fillConfirmRetryDelayMs: 0,
+    });
+
+    await executor.tick();
+    const basket = store.getState().baskets[0]!;
+    expect(basket.status).toBe("COMPLETE");
+    expect(basket.legs).toHaveLength(4);
+    expect(basket.plan).toHaveLength(4);
+
+    client.markPriceBySymbol.set("SOLUSDT", 104);
+    client.markPriceBySymbol.set("ADAUSDT", 1.04);
+    client.markPriceBySymbol.set("DOGEUSDT", 0.1);
+    client.markPriceBySymbol.set("RNDRUSDT", 10);
+    await executor.tick();
+
+    expect(basket.status).toBe("CLOSED");
+    expect(basket.closeReason).toBe("PROFIT_BANK");
+  });
 });
 
 // ── Phase (c): restart-recovery — THE CORE GAP this task closes ────────────
