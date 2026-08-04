@@ -37,6 +37,7 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 
+import type { ExposureReserveRequest, ExposureReserveResult } from "./account-exposure-coordinator.js";
 import { BinanceFuturesPrivateError, resolveConfirmedFillPrice, roundToStep, type BinanceFuturesPrivateClient } from "./binance-futures-private.js";
 import { clusterOf, isMajorSymbol } from "./correlation-clusters.js";
 import type { CortexRealAttributionStore } from "./cortex-real-attribution.js";
@@ -597,6 +598,21 @@ export interface SingleSymbolLaneExecutorOptions {
   tryClaimEntrySymbol?: (symbol: string) => boolean;
   /** Releases an entry-symbol claim after every success, rejection, or failure path. */
   releaseEntrySymbol?: (symbol: string) => void;
+  /** Shared account-exposure coordinator (account-exposure-coordinator.ts). Reserves risk capacity
+   *  BEFORE an entry order is placed, synchronous and back-to-back with tryClaimEntrySymbol above
+   *  (no `await` between them) — closes the gap where sizing/admission had no shared, cross-instance
+   *  view of gross/directional/per-symbol/cluster/concurrent-position exposure (existingNotionalFor-
+   *  Symbol/existingClusterOpenSymbols above are consulted only as allow-or-skip admission gates,
+   *  never inside sizing). Defaults to an always-succeeds no-op ({ok:true, reservationId:null}) so
+   *  every existing test that doesn't wire this stays byte-for-byte unaffected — same optional-
+   *  closure-with-safe-default convention as every other injected accessor above. */
+  reserveExposure?: (req: ExposureReserveRequest) => ExposureReserveResult;
+  /** Commits a reservation from the ACTUAL fill (never the requested qty) once one lands. Optional,
+   *  defaults to a no-op — see reserveExposure above. */
+  commitExposureReservation?: (reservationId: string, filled: { qty: number; avgPrice: number }) => void;
+  /** Releases unused capacity on rejection, timeout, cancellation, or failure. Optional, defaults to
+   *  a no-op — see reserveExposure above. */
+  releaseExposureReservation?: (reservationId: string, reason: string) => void;
   /** 2026-07-19 real-money audit fix: best-effort notification fired exactly once per position
    *  fully closed (stop-triggered, policy exit, manual close, or an orderly kill-switch wind-down —
    *  every one of those paths funnels through settleIfStopTriggered()/closePosition()'s own single
@@ -693,6 +709,9 @@ export class SingleSymbolLaneExecutor {
   private readonly sharedGetPositions: () => ReturnType<SingleSymbolExecClient["getPositions"]>;
   private readonly tryClaimEntrySymbol: (symbol: string) => boolean;
   private readonly releaseEntrySymbol: (symbol: string) => void;
+  private readonly reserveExposureFn: (req: ExposureReserveRequest) => ExposureReserveResult;
+  private readonly commitExposureReservationFn: (reservationId: string, filled: { qty: number; avgPrice: number }) => void;
+  private readonly releaseExposureReservationFn: (reservationId: string, reason: string) => void;
   private readonly onPositionClosed: (netUsd: number) => void;
   private ticking = false;
   /** 2026-07-11 real-money audit fix: closePosition()'s `pos.exitOrderId !== null` reentry guard
@@ -744,6 +763,9 @@ export class SingleSymbolLaneExecutor {
     this.sharedGetPositions = opts.sharedGetPositions ?? (() => this.client.getPositions());
     this.tryClaimEntrySymbol = opts.tryClaimEntrySymbol ?? (() => true);
     this.releaseEntrySymbol = opts.releaseEntrySymbol ?? (() => {});
+    this.reserveExposureFn = opts.reserveExposure ?? (() => ({ ok: true, reservationId: null }));
+    this.commitExposureReservationFn = opts.commitExposureReservation ?? (() => {});
+    this.releaseExposureReservationFn = opts.releaseExposureReservation ?? (() => {});
     this.onPositionClosed = opts.onPositionClosed ?? (() => {});
   }
 
@@ -1883,10 +1905,35 @@ export class SingleSymbolLaneExecutor {
         this.lastEntrySkipReason = `${signal.symbol}: another executor is admitting this netted symbol`;
         continue;
       }
+      // Hoisted from its previous call site further below (pure reorder — this formula depends only
+      // on this.laneId/signal.symbol/signal.openedAtMs, all already available here). Needed now so
+      // the exposure reservation below can carry the EXACT clientOrderId this entry will submit to
+      // placeOrder — account-exposure-coordinator.ts's reconciliation join key.
+      const positionId = `ssl-${this.laneId.slice(0, 4).toLowerCase()}-${signal.symbol.slice(0, 3).toLowerCase()}-${signal.openedAtMs.toString(36)}`;
+      const entryClientOrderId = `ssle-${positionId.slice(-18)}-e`;
+      // Account-exposure reservation (account-exposure-coordinator.ts). Synchronous, back-to-back
+      // with tryClaimEntrySymbol above — no `await` between the two, so together they form one
+      // atomic "claim symbol + reserve capacity" compound step; no concurrent reserve() call from a
+      // sibling executor can ever observe the state in between. Sized from effectiveLegUsd(), the
+      // SAME pre-fill notional estimate the per-symbol cap check above already uses.
+      const reservation = this.reserveExposureFn({
+        executorId: this.laneId,
+        symbol: signal.symbol,
+        direction: this.direction,
+        requestedNotionalUsd: this.effectiveLegUsd(),
+        clientOrderId: entryClientOrderId,
+      });
+      if (!reservation.ok) {
+        this.releaseEntrySymbol(signal.symbol);
+        this.lastEntrySkipReason = reservation.reason ?? `${signal.symbol}: exposure reservation rejected`;
+        continue;
+      }
+      const reservationId = reservation.reservationId;
       try {
         const freshPositions = await this.client.getPositions(signal.symbol);
         if (freshPositions.some((p) => p.symbol === signal.symbol && Math.abs(p.positionAmt) > 1e-9)) {
           this.lastEntrySkipReason = `${signal.symbol}: fresh exchange position already exists; refusing one-way-mode netting`;
+          if (reservationId) this.releaseExposureReservationFn(reservationId, "FRESH_POSITION_EXISTS");
           continue;
         }
 
@@ -1907,10 +1954,14 @@ export class SingleSymbolLaneExecutor {
         // 2026-07-19 real-money audit fix: see the notional-cap skip's identical comment above —
         // this was another silent structural rejection.
         this.lastEntrySkipReason = `${signal.symbol}: invalid leg size (legUsd=${legUsd})`;
+        // No order will ever be placed for this reservation — release now rather than let it sit
+        // RESERVED until the periodic staleness sweep eventually reconciles it as never-reached.
+        if (reservationId) this.releaseExposureReservationFn(reservationId, "ENTRY_REJECTED:invalid_leg_size");
         continue;
       }
       if (!(signal.entryPrice > 0)) {
         this.lastEntrySkipReason = `${signal.symbol}: entry price unavailable`;
+        if (reservationId) this.releaseExposureReservationFn(reservationId, "ENTRY_REJECTED:no_entry_price");
         continue;
       }
 
@@ -1926,6 +1977,7 @@ export class SingleSymbolLaneExecutor {
         if (!f) {
           // 2026-07-19 real-money audit fix: see the notional-cap skip's comment above.
           this.lastEntrySkipReason = `${signal.symbol}: exchange filters unavailable`;
+          if (reservationId) this.releaseExposureReservationFn(reservationId, "ENTRY_REJECTED:no_exchange_filters");
           continue;
         }
         const rawQty = legUsd / signal.entryPrice;
@@ -1943,18 +1995,20 @@ export class SingleSymbolLaneExecutor {
         if (!(qty >= f.minQty)) {
           // 2026-07-19 real-money audit fix: see the notional-cap skip's comment above.
           this.lastEntrySkipReason = `${signal.symbol}: quantity ${qty} below exchange minQty ${f.minQty}`;
+          if (reservationId) this.releaseExposureReservationFn(reservationId, "ENTRY_REJECTED:below_min_qty");
           continue;
         }
         const notional = qty * signal.entryPrice;
         if (!(notional >= f.minNotional)) {
           // Binance rejects an order that clears minQty but misses MIN_NOTIONAL.
           this.lastEntrySkipReason = `${signal.symbol}: notional ${notional.toFixed(2)} below exchange minNotional ${f.minNotional}`;
+          if (reservationId) this.releaseExposureReservationFn(reservationId, "ENTRY_REJECTED:below_min_notional");
           continue;
         }
 
-        // Symbol fragment keeps this unique even when 2+ candidates share the identical openedAtMs
-        // (the exact scenario that exposed the dedup bug above).
-        const positionId = `ssl-${this.laneId.slice(0, 4).toLowerCase()}-${signal.symbol.slice(0, 3).toLowerCase()}-${signal.openedAtMs.toString(36)}`;
+        // positionId (and its unique-even-when-2+-candidates-share-openedAtMs symbol fragment) is
+        // computed earlier now — see the tryClaimEntrySymbol/reserveExposureFn block above; hoisted
+        // there so the exposure reservation could carry this entry's exact clientOrderId.
         // 2026-07-12 fix: leverage is a shared, symbol-scoped Binance account setting, not
         // per-strategy — this call used to run unconditionally on every entry with zero awareness
         // that a SIBLING executor (a different SingleSymbolLaneExecutor instance, or any other
@@ -1995,9 +2049,16 @@ export class SingleSymbolLaneExecutor {
           side: this.direction === "LONG" ? "BUY" : "SELL",
           type: "MARKET",
           quantity: qty,
-          newClientOrderId: `ssle-${positionId.slice(-18)}-e`,
+          newClientOrderId: entryClientOrderId,
         });
         const resolvedEntry = await this.resolveFillPrice(signal.symbol, order.orderId, order.avgPrice, signal.entryPrice);
+        // Commit the reservation from the ACTUAL fill — never the requested qty (order.executedQty
+        // can legitimately fall short of `qty` on a genuine partial MARKET fill; falls back to the
+        // requested qty only when the exchange never reports a usable executedQty, same convention
+        // as cross-sectional-executor.ts's own filledQty). Idempotent no-op when reservationId is
+        // null (reserveExposure not wired — the safe default).
+        const committedQty = Number.isFinite(order.executedQty) && order.executedQty > 0 ? order.executedQty : qty;
+        if (reservationId) this.commitExposureReservationFn(reservationId, { qty: committedQty, avgPrice: resolvedEntry.price });
         const position: SingleSymbolPosition = {
           positionId,
           sourceObservationId: signal.observationId,
@@ -2047,6 +2108,21 @@ export class SingleSymbolLaneExecutor {
         st.attemptedObservationIds = Array.from(attempted);
         this.lastEntrySkipReason = `${signal.symbol}: entry failed (${(error as Error).message}) — will retry next tick`;
         this.store.save();
+        // Idempotent no-op if already COMMITTED (e.g. this throw came from ensureStopOrder AFTER a
+        // real fill, not from placeOrder itself — commitExposureReservationFn above already ran for
+        // that case; see releaseReservation's idempotent-no-op contract).
+        //
+        // Only release on an UNAMBIGUOUS in-band rejection — Binance received the request and
+        // explicitly answered no, so no order was created. Every OTHER failure (timeout/429/network/
+        // http_error/invalid_response/clock_skew, or a non-Binance error) means we do NOT know
+        // whether the order actually reached the exchange; releasing capacity here would recreate
+        // the exact race this coordinator exists to close. Left RESERVED, it is picked up by the
+        // periodic staleness sweep, which resolves it against Binance directly via
+        // queryOrderByClientId (account-exposure-coordinator.ts's reconcileStaleReservations).
+        // Mirrors cross-sectional-executor.ts's basket-abort catch — same reasoning, same guard.
+        if (reservationId && error instanceof BinanceFuturesPrivateError && error.failureType === "binance_error") {
+          this.releaseExposureReservationFn(reservationId, `ENTRY_FAILED:${(error as Error).message}`);
+        }
       }
       } finally {
         this.releaseEntrySymbol(signal.symbol);

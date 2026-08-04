@@ -55,9 +55,24 @@ export function isInnovationTestnetExecutionEnabled(
   return environment === "testnet" && env.INNOVATION_TESTNET_EXEC_DISABLED !== "1";
 }
 
-/** Research maturity/allocation never veto innovation execution; operational account safety does. */
-export function innovationTestnetAdmissionAllowed(canOpenIgnoringManualDirectional: boolean): boolean {
-  return canOpenIgnoringManualDirectional;
+/**
+ * Research maturity/allocation never veto innovation execution; operational account safety does.
+ *
+ * 2026-08 canonical-market-regime addition (requirement #7 of the canonical-market-regime rollout —
+ * see canonical-market-regime-execution-policy.ts): `canonicalRegimeAllowed` is a REQUIRED second
+ * parameter, not defaulted — this codebase's explicit-over-implicit convention for anything
+ * safety-relevant (e.g. `isInnovationTestnetExecutionEnabled`'s own required `environment`
+ * parameter) — AND-ed alongside the existing armed/kill/drain check. The caller (app.ts) passes the
+ * SAME shared `canonicalMarketRegimeExecutionPolicy` decision every other execution-affecting path
+ * this round now consults; this function does not compute or import that decision itself, it only
+ * ANDs in whatever boolean it is handed, keeping this file free of any dependency on the canonical
+ * engine's own types/module.
+ */
+export function innovationTestnetAdmissionAllowed(
+  canOpenIgnoringManualDirectional: boolean,
+  canonicalRegimeAllowed: boolean,
+): boolean {
+  return canOpenIgnoringManualDirectional && canonicalRegimeAllowed;
 }
 
 /** Innovation collection is full test-size; allocation is informational and cannot starve it. */

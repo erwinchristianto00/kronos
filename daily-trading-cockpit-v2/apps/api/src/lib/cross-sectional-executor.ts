@@ -19,7 +19,8 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 
-import { resolveConfirmedFillPrice, type BinanceFuturesPrivateClient, type FillPriceResolution } from "./binance-futures-private.js";
+import type { ExposureReserveRequest, ExposureReserveResult } from "./account-exposure-coordinator.js";
+import { BinanceFuturesPrivateError, resolveConfirmedFillPrice, type BinanceFuturesPrivateClient, type FillPriceResolution, type FuturesOrder } from "./binance-futures-private.js";
 import type { CortexRealAttributionStore } from "./cortex-real-attribution.js";
 import { fillFromUserTrade, type ExecutionFill, type ExecutionFillRecorder, type ExecutionFillRole } from "./execution-fill-recorder.js";
 import {
@@ -44,7 +45,17 @@ export const CROSS_SECTIONAL_MIXED_LANE_ID = "CROSS_SECTIONAL_MIXED";
 export type CrossSectionalExecClient = Pick<
   BinanceFuturesPrivateClient,
   "getExchangeFilters" | "placeOrder" | "setLeverage" | "getPositions" | "queryOrder" | "getUserTrades"
->;
+> & {
+  /** Restart-recovery reconciliation only (see recoverIncompleteBaskets/reconcilePlannedLeg below) —
+   *  deliberately OPTIONAL, not added to the Pick<...> list above, so every existing fake/test client
+   *  that never wires it keeps compiling and behaves exactly as it does today (an ambiguous leg with
+   *  no way to query the exchange is treated as INCONCLUSIVE and simply retried next tick, never a
+   *  crash). Real production wiring is a real BinanceFuturesPrivateClient, which already implements
+   *  this (see binance-futures-private.ts's own queryOrderByClientId, added for
+   *  account-exposure-coordinator.ts's restart/staleness reconciliation — same endpoint, same idea,
+   *  reused here for the BASKET's own bookkeeping rather than the exposure ledger's). */
+  queryOrderByClientId?: (symbol: string, origClientOrderId: string) => Promise<FuturesOrder>;
+};
 
 export function isCrossSectionalExecEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return env.CROSS_SECTIONAL_EXEC_ENABLED === "1";
@@ -177,6 +188,53 @@ export interface ExecutorLeg {
   exitOrderId: string | null;
   /** Same caveat as entryPriceConfirmed, for the exit fill. Null while still open. */
   exitPriceConfirmed: boolean | null;
+  /** Index into ExecutorBasket.plan this fill resolves — legs are always pushed in strict plan
+   *  order (see placeRemainingLegs), so legs[k] always resolves plan[k] for k < legs.length, but
+   *  this makes that pairing explicit rather than implicit-by-array-position. Optional: baskets
+   *  persisted before `plan` existed (or test fixtures that never exercise the open/recovery path)
+   *  never carry it, and nothing reads it as load-bearing — purely a debugging/audit aid. */
+  planIndex?: number;
+}
+
+/**
+ * The RESTART-DURABLE record of one planned leg's expected shape and where it is in the placement
+ * lifecycle — persisted on ExecutorBasket.plan the moment a basket is sized (before ANY order is
+ * placed), so a crash between "planned" and "fully filled" leaves enough on disk to resume the
+ * EXACT same plan rather than guess one from whatever happens to be in `legs` (see
+ * recoverIncompleteBaskets/placeRemainingLegs). requestedQty/refPrice are the REQUESTED side of the
+ * requested-vs-actual pair; the ACTUAL side (once filled) lives on the corresponding ExecutorLeg —
+ * see ExecutorLeg.planIndex for the pairing.
+ *
+ * status:
+ *   "PENDING"          — planned and reserved, this leg's own placeOrder has never been attempted
+ *                         by ANY process (this or a since-crashed one).
+ *   "PLACING"          — a placeOrder attempt for THIS leg was in flight the moment this was last
+ *                         persisted. Ambiguous on restart (see reconcilePlannedLeg) — the ONLY
+ *                         status that triggers an exchange reconciliation query before resuming.
+ *   "FILLED"           — real fill recorded (in `legs`), whether from a normal placeOrder response
+ *                         or adopted via restart reconciliation.
+ *   "FAILED"           — this leg's own placement definitively failed (the basket aborts).
+ *   "NEVER_ATTEMPTED"  — a LATER leg, never reached because an earlier one in the same basket
+ *                         failed (hedge-integrity: one failed leg aborts the whole basket).
+ */
+export interface PlannedLeg {
+  planIndex: number;
+  symbol: string;
+  side: "LONG" | "SHORT";
+  requestedQty: number;
+  refPrice: number;
+  /** account-exposure-coordinator.ts reservation id for THIS leg, or null when reserveExposure
+   *  isn't wired (the safe no-op default — see CrossSectionalExecutorOptions.reserveExposure).
+   *  Persisted (not just kept in a local closure) specifically so a restart-recovery process that
+   *  never called reserveExposure itself can still commit/release the SAME reservation the
+   *  original, now-dead process created. */
+  reservationId: string | null;
+  /** Deterministic, computed ONCE at sizing time — the exact string every placeOrder attempt for
+   *  this leg (original or resumed after a restart) submits as newClientOrderId, and the exact
+   *  string a restart-recovery query looks up via queryOrderByClientId. */
+  entryClientOrderId: string;
+  status: "PENDING" | "PLACING" | "FILLED" | "FAILED" | "NEVER_ATTEMPTED";
+  failureReason: string | null;
 }
 
 export interface ExecutorBasket {
@@ -190,7 +248,42 @@ export interface ExecutorBasket {
   takeProfitReturn?: number | null;
   stopLossReturn?: number | null;
   legs: ExecutorLeg[];
-  status: "OPEN" | "CLOSED" | "ABORTED";
+  /**
+   * RESERVED           — basket row created, plan finalized + exposure reserved, no leg's
+   *                       placeOrder has been attempted yet (legs.length === 0).
+   * PLACING            — attempting the VERY FIRST leg (legs.length === 0, one attempt in flight).
+   * PARTIALLY_FILLED   — at least one leg filled, fewer than plan.length total. Per-leg placement
+   *                       progress for whichever leg is currently being attempted lives on
+   *                       plan[i].status, not a second basket-level PLACING re-entry — the basket
+   *                       stays PARTIALLY_FILLED throughout every subsequent leg attempt.
+   * COMPLETE           — every planned leg filled. The healthy, steady-state, live basket — this is
+   *                       what plain "OPEN" meant before this field grew real granularity.
+   * CLOSED / ABORTED   — unchanged terminal states from before this field grew granularity.
+   *
+   * See isBasketLive() for "still relevant to exposure/leverage/netting bookkeeping" (everything
+   * except CLOSED/ABORTED) vs. the strict "healthy and fully filled" COMPLETE check that gates
+   * TP/HORIZON closing (see closeBasketsHittingProfitTarget/closeDueBaskets).
+   */
+  status: "RESERVED" | "PLACING" | "PARTIALLY_FILLED" | "COMPLETE" | "CLOSED" | "ABORTED";
+  /** The expected leg plan, persisted before any order is placed — see PlannedLeg's doc comment.
+   *  Optional: baskets persisted before this field existed (or a handful of test fixtures that seed
+   *  a basket directly for close-path-only testing, never exercising open/recovery) don't carry it.
+   *  recoverIncompleteBaskets() never touches a basket whose plan isn't a real array — it cannot
+   *  safely guess a plan it was never given. */
+  plan?: PlannedLeg[];
+  /**
+   * 2026-08-04 (concurrent-close race fix, ground truth #8): set by closeAllBasketsOrderly() when
+   * it needs THIS basket closed but an in-flight placeRemainingLegs() call currently owns it (see
+   * claimBasket/releaseBasket) — closeAllBasketsOrderly runs OUTSIDE tick()'s own single-flight
+   * `this.ticking` guard (app.ts's kill-switch handler calls it directly), so without this field a
+   * racing close could finalize the basket from whatever legs exist RIGHT NOW while the in-flight
+   * loop is about to push ANOTHER leg fill onto the same object — silently overwriting the
+   * finalized status and leaving that next leg permanently unaccounted for. Picked up by the SAME
+   * in-flight call's own between-legs recheck (see placeRemainingLegs) within, at most, one leg's
+   * placeOrder round-trip — never silently dropped. Cleared the moment it's consumed; never read
+   * once a basket reaches a terminal status.
+   */
+  pendingKillReason?: string;
   closedAt: string | null;
   closeReason: string | null;
   grossPnlUsd: number | null;
@@ -310,6 +403,47 @@ export class CrossSectionalExecutorStore {
           if (!Array.isArray((parsed as { orphanedLegs?: unknown }).orphanedLegs)) {
             (parsed as { orphanedLegs: OrphanedLeg[] }).orphanedLegs = [];
           }
+          // Legacy status migration: records persisted before this task's richer status enum
+          // existed used status "OPEN" for BOTH "mid-placement" and "fully filled, healthy" —
+          // there is no way to recover which one a bare "OPEN" meant after the fact, but every
+          // real basket that ever survived to be read back here (i.e. wasn't lost to the exact
+          // CORE GAP this task closes) has `legs` reflecting what actually filled, so the safest,
+          // most conservative reading is "treat every already-placed leg as the complete plan" —
+          // never silently reopen/guess at continuing a placement attempt from years-old data.
+          // Same defensive spirit as the entryOrderId/orphanedLegs normalization just above.
+          for (const b of parsed.baskets as Array<Record<string, unknown>>) {
+            const legacyStatus = b.status;
+            if (legacyStatus === "OPEN") {
+              const legs = Array.isArray(b.legs) ? (b.legs as Array<Record<string, unknown>>) : [];
+              if (legs.length > 0) {
+                // Backfill a plan 1:1 from the real legs — every entry already resolved FILLED, so
+                // this basket is immediately eligible for the normal COMPLETE-only close paths
+                // again (TP/HORIZON) instead of being silently stuck in permanent limbo.
+                b.plan = legs.map((leg, i) => ({
+                  planIndex: i,
+                  symbol: leg.symbol,
+                  side: leg.side,
+                  requestedQty: leg.qty,
+                  refPrice: leg.entryPrice,
+                  reservationId: null,
+                  entryClientOrderId: typeof leg.entryOrderId === "string" ? leg.entryOrderId : String(leg.entryOrderId ?? ""),
+                  status: "FILLED",
+                  failureReason: null,
+                }));
+                b.status = "COMPLETE";
+              } else {
+                // The exact "CORE GAP" scenario: OPEN with zero real legs and no recorded plan —
+                // cannot safely guess what was intended, and cannot safely resume placing an
+                // unknown plan with real money. There is no QUARANTINED state in this phase (see
+                // the next phase's critical-latch work), so the safest available terminal state is
+                // ABORTED — never touched again by any close/recovery path, never silently dropped.
+                b.plan = [];
+                b.status = "ABORTED";
+                b.closedAt = b.closedAt ?? new Date().toISOString();
+                b.closeReason = "PRE_MIGRATION_UNKNOWN_PLAN";
+              }
+            }
+          }
           return parsed as ExecutorState;
         }
       }
@@ -326,9 +460,13 @@ export class CrossSectionalExecutorStore {
   private prune(): void {
     const max = MAX_STORED_BASKETS();
     if (this.state.baskets.length <= max) return;
-    const open = this.state.baskets.filter((b) => b.status === "OPEN");
+    // Every non-terminal status (RESERVED/PLACING/PARTIALLY_FILLED/COMPLETE) is kept unconditionally
+    // — same "never prune a still-live basket" intent as the original OPEN-only check, just widened
+    // to match the richer enum (a basket mid-recovery must never be pruned out from under it).
+    const isTerminal = (status: ExecutorBasket["status"]): boolean => status === "CLOSED" || status === "ABORTED";
+    const open = this.state.baskets.filter((b) => !isTerminal(b.status));
     const settled = this.state.baskets
-      .filter((b) => b.status !== "OPEN")
+      .filter((b) => isTerminal(b.status))
       .sort((a, b) => new Date(b.openedAt).getTime() - new Date(a.openedAt).getTime())
       .slice(0, Math.max(0, max - open.length));
     this.state.baskets = [...open, ...settled];
@@ -422,6 +560,21 @@ export interface CrossSectionalExecutorOptions {
    *  — the watermark is already advanced before this check runs, so the signal is not retried, but
    *  the NEXT fresh signal on the same symbol gets a clean re-evaluation. */
   maxNotionalPerSymbolAcrossLanes?: () => number;
+  /** Shared account-exposure coordinator (account-exposure-coordinator.ts) — this executor's
+   *  FIRST-EVER in-flight per-symbol claim mechanism (unlike SingleSymbolLaneExecutor, which already
+   *  has tryClaimEntrySymbol/releaseEntrySymbol; CrossSectionalExecutor has never had an equivalent,
+   *  nor any cluster-based admission gate). Reserves risk capacity for EVERY planned leg, atomically,
+   *  inside the sizing loop BEFORE any leg's order is placed — see maybeOpenBasket's plannedLegs
+   *  loop. Optional, defaults to an always-succeeds no-op ({ok:true, reservationId:null}) so every
+   *  existing test that doesn't wire this stays byte-for-byte unaffected — same optional-closure-
+   *  with-safe-default convention as existingNotionalForSymbol above. */
+  reserveExposure?: (req: ExposureReserveRequest) => ExposureReserveResult;
+  /** Commits a reservation from the ACTUAL fill (never the requested qty) once one lands. Optional,
+   *  defaults to a no-op — see reserveExposure above. */
+  commitExposureReservation?: (reservationId: string, filled: { qty: number; avgPrice: number }) => void;
+  /** Releases unused capacity on rejection, timeout, cancellation, or failure. Optional, defaults to
+   *  a no-op — see reserveExposure above. */
+  releaseExposureReservation?: (reservationId: string, reason: string) => void;
   /** CORTEX real-USDT attribution (2026-07-22 bug-hunt fix): the operator's untouched static-table
    *  weight, read the same way laneWeightPct reads the (possibly CORTEX-tilted) applied weight.
    *  Same optional posture as single-symbol-lane-executor.ts's rawLaneWeightPct — omit and this
@@ -469,6 +622,8 @@ export class CrossSectionalExecutor {
   private ticking = false;
   private lastError: string | null = null;
   private openHalted: string | null = null;
+  /** See claimBasket/releaseBasket's own doc comment (ground truth #8, concurrent-close race). */
+  private busyBasketIds = new Set<string>();
   private readonly dailyMaxLossUsdFn: () => number;
   private readonly entryHealthGate: () => { allowed: boolean; reason: string | null };
   private readonly siblingOpenLegs: () => Array<{ symbol: string; side: "LONG" | "SHORT"; qty: number }>;
@@ -476,6 +631,9 @@ export class CrossSectionalExecutor {
   private readonly sharedGetPositions: () => ReturnType<CrossSectionalExecClient["getPositions"]>;
   private readonly existingNotionalForSymbolFn: (symbol: string) => number;
   private readonly maxNotionalPerSymbolAcrossLanesFn: () => number;
+  private readonly reserveExposureFn: (req: ExposureReserveRequest) => ExposureReserveResult;
+  private readonly commitExposureReservationFn: (reservationId: string, filled: { qty: number; avgPrice: number }) => void;
+  private readonly releaseExposureReservationFn: (reservationId: string, reason: string) => void;
   private readonly rawLaneWeightPctFn: (() => number) | null;
   private readonly cortexRealAttribution: CortexRealAttributionStore | null;
   private readonly executionFillRecorder: ExecutionFillRecorder | null;
@@ -499,6 +657,9 @@ export class CrossSectionalExecutor {
     this.fillConfirmRetryDelayMs = opts.fillConfirmRetryDelayMs ?? 400;
     this.existingNotionalForSymbolFn = opts.existingNotionalForSymbol ?? (() => 0);
     this.maxNotionalPerSymbolAcrossLanesFn = opts.maxNotionalPerSymbolAcrossLanes ?? (() => 0);
+    this.reserveExposureFn = opts.reserveExposure ?? (() => ({ ok: true, reservationId: null }));
+    this.commitExposureReservationFn = opts.commitExposureReservation ?? (() => {});
+    this.releaseExposureReservationFn = opts.releaseExposureReservation ?? (() => {});
     this.dailyMaxLossUsdFn = opts.dailyMaxLossUsd ?? XSEC_DAILY_MAX_LOSS_USD;
     this.entryHealthGate = opts.entryHealthGate ?? (() => ({ allowed: true, reason: null }));
     this.siblingOpenLegs = opts.siblingOpenLegs ?? (() => []);
@@ -516,12 +677,48 @@ export class CrossSectionalExecutor {
     this.enabledFn = opts.enabled ?? isCrossSectionalExecEnabled;
   }
 
-  /** This instance's own open (status OPEN), un-exited (exitOrderId===null) basket legs — the
-   *  surface a sibling CrossSectionalExecutor instance needs to see THIS instance's exposure. */
+  /** "Still relevant to exposure/leverage/netting bookkeeping" — everything except the two terminal
+   *  statuses. Deliberately BROADER than "healthy and fully filled" (see ExecutorBasket.status's own
+   *  doc comment): a RESERVED/PLACING/PARTIALLY_FILLED basket can already hold REAL, exchange-filled
+   *  legs (or be about to), and every consumer below existed before this task's richer enum, back
+   *  when "OPEN" already covered that same mid-placement window transiently — this preserves that
+   *  exact prior behavior instead of narrowing it to COMPLETE-only (which would make a stuck/
+   *  recovering basket's real legs invisible to sibling-netting and leverage bookkeeping). Contrast
+   *  with the strict `status === "COMPLETE"` gate closeBasketsHittingProfitTarget/closeDueBaskets use
+   *  — TP/HORIZON math specifically requires the FULL intended hedge to be present. */
+  private isBasketLive(basket: ExecutorBasket): boolean {
+    return basket.status !== "CLOSED" && basket.status !== "ABORTED";
+  }
+
+  /**
+   * 2026-08-04 (concurrent-close race fix, ground truth #8): per-basket mutual exclusion between
+   * placeRemainingLegs() (which mutates basket.legs/basket.status across a whole placement
+   * attempt — possibly several sequential `await`s) and closeAllBasketsOrderly()'s own
+   * closeBasket() call, the ONE close path that runs OUTSIDE tick()'s `this.ticking` single-flight
+   * guard (see closeAllBasketsOrderly's own doc comment). closeDueBaskets/
+   * closeBasketsHittingProfitTarget never need this: they only ever touch status==="COMPLETE"
+   * baskets, and placeRemainingLegs only ever runs on RESERVED/PLACING/PARTIALLY_FILLED ones — the
+   * two sets can't overlap by construction, so a claim there would be inert, not protective.
+   * Plain synchronous Set ops: safe without a lock library for the exact reason
+   * account-exposure-coordinator.ts's own reserve()/commitReservation() are (see that file's own
+   * doc comment) — Node only preempts at `await` points, so "check then insert" here is atomic
+   * against every other already-queued synchronous call.
+   */
+  private claimBasket(basketId: string): boolean {
+    if (this.busyBasketIds.has(basketId)) return false;
+    this.busyBasketIds.add(basketId);
+    return true;
+  }
+  private releaseBasket(basketId: string): void {
+    this.busyBasketIds.delete(basketId);
+  }
+
+  /** This instance's own live, un-exited (exitOrderId===null) basket legs — the surface a sibling
+   *  CrossSectionalExecutor instance needs to see THIS instance's exposure. */
   getOpenUnexitedLegs(): Array<{ symbol: string; side: "LONG" | "SHORT"; qty: number }> {
     const out: Array<{ symbol: string; side: "LONG" | "SHORT"; qty: number }> = [];
     for (const basket of this.store.getState().baskets) {
-      if (basket.status !== "OPEN") continue;
+      if (!this.isBasketLive(basket)) continue;
       for (const leg of basket.legs) {
         if (leg.exitOrderId === null) out.push({ symbol: leg.symbol, side: leg.side, qty: leg.qty });
       }
@@ -537,7 +734,7 @@ export class CrossSectionalExecutor {
   private ownOpenNotionalForSymbol(symbol: string): number {
     let sum = 0;
     for (const basket of this.store.getState().baskets) {
-      if (basket.status !== "OPEN") continue;
+      if (!this.isBasketLive(basket)) continue;
       for (const leg of basket.legs) {
         if (leg.exitOrderId === null && leg.symbol === symbol) sum += leg.qty * leg.entryPrice;
       }
@@ -685,7 +882,7 @@ export class CrossSectionalExecutor {
   } {
     const st = this.store.getState();
     const closed = st.baskets.filter((b) => b.status === "CLOSED");
-    const openBaskets = st.baskets.filter((b) => b.status === "OPEN");
+    const openBaskets = st.baskets.filter((b) => this.isBasketLive(b));
     const targetVariant = this.targetVariant;
     const nowMs = new Date(this.nowIso()).getTime();
     const matching = this.signalStore.all
@@ -788,6 +985,19 @@ export class CrossSectionalExecutor {
       await this.closeBasketsHittingProfitTarget();
       await this.closeDueBaskets();
       await this.ensureOpenBasketLeverage();
+      // Restart-recovery (see recoverIncompleteBaskets' own doc comment): gated on isAllowed() —
+      // the SAME master armed/testnet gate maybeOpenBasket itself requires — because resuming a
+      // stuck placement means placing MORE real entry orders, exactly the same risk category as
+      // opening a brand new basket. Deliberately NOT gated on entryHealth() (the rolling-evidence
+      // quality gate for NEW signals): completing a basket this executor already committed capital
+      // to is a safety operation (resolve dangling naked exposure), not a new-signal-quality
+      // decision, so a "don't open new things" evidence verdict must not leave a stuck basket
+      // stranded. While disarmed, a stuck basket is simply left exactly as-is (its real legs, if
+      // any, stay fully visible via isBasketLive()-gated bookkeeping above and remain flattenable
+      // by closeAllBasketsOrderly regardless of this gate) — never guessed at, never force-resumed.
+      if (this.isAllowed()) {
+        await this.recoverIncompleteBaskets();
+      }
       const health = this.entryHealth();
       if (!health.allowed) {
         this.openHalted = health.reason ?? "rolling evidence gate blocked new baskets";
@@ -809,20 +1019,161 @@ export class CrossSectionalExecutor {
    *  basket wedges (that basket stays OPEN and keeps retrying on its own tick). */
   async closeAllBasketsOrderly(reason: string): Promise<{ closed: number; failed: number }> {
     const st = this.store.getState();
-    const open = st.baskets.filter((b) => b.status === "OPEN");
+    // Broadened from the old status==="OPEN" check to isBasketLive() — a RESERVED/PLACING/
+    // PARTIALLY_FILLED basket can already hold real, exchange-filled legs (or, for RESERVED with
+    // zero legs, none at all), and the old single "OPEN" string already covered that exact
+    // mid-placement window transiently; excluding it here would be a REGRESSION (a kill-switch that
+    // can no longer see a mid-placement basket's real legs at all) rather than new behavior.
+    // closeBasket() only ever iterates basket.legs (never basket.plan), so it is already safe to
+    // call on a basket with fewer legs than planned — it just flattens whatever is real right now.
+    const open = st.baskets.filter((b) => this.isBasketLive(b));
     let closed = 0;
     let failed = 0;
     for (const basket of open) {
+      // 2026-08-04 fix (ground truth #8): this method runs OUTSIDE tick()'s own `this.ticking`
+      // single-flight guard (app.ts's kill-switch handler calls it directly, independent of the
+      // scheduled tick interval). If an in-flight placeRemainingLegs() call already claimed this
+      // EXACT basket (see claimBasket), calling closeBasket() here concurrently would race:
+      // closeBasket would finalize the basket CLOSED from whatever legs exist RIGHT NOW, and the
+      // still-running placement loop would then push its NEXT leg's fill onto an object already
+      // finalized CLOSED — silently overwriting that CLOSED status back to
+      // COMPLETE/PARTIALLY_FILLED, with the leg closeBasket just exited now looking re-opened and
+      // the newly-filled leg never accounted for by either path. Recording pendingKillReason
+      // instead is safe and lossless: the in-flight loop's own between-legs recheck (see
+      // placeRemainingLegs) reads this exact field and picks it up within, at most, one leg's
+      // placeOrder round-trip — the kill/drain intent is deferred, never dropped.
+      if (!this.claimBasket(basket.basketId)) {
+        basket.pendingKillReason = reason;
+        this.store.save();
+        failed += 1; // not resolved by THIS call — the in-flight placement loop will finish the job
+        continue;
+      }
       try {
+        // 2026-08-04 (review round 1 fix): reconcile any ambiguous PLACING plan entry BEFORE
+        // closeBasket runs — see reconcileAmbiguousLegBeforeClose's own doc comment. Without this,
+        // a basket reached by the kill-switch before recoverIncompleteBaskets ever got a chance to
+        // (the cross-sectional tick's own first run is deliberately delayed 90-150s after process
+        // start, but nothing delays a kill-switch trip) would have its ambiguous leg's real,
+        // possibly-already-filled pre-crash order silently dropped: closeBasket only ever iterates
+        // basket.legs, never basket.plan, so that fill would never become an ExecutorLeg at all, on
+        // a basket about to be marked CLOSED — permanently outside every future recovery pass.
+        await this.reconcileAmbiguousLegBeforeClose(basket);
         await this.closeBasket(basket, reason);
-        if (basket.status !== "OPEN") closed += 1;
+        if (basket.status === "CLOSED" || basket.status === "ABORTED") closed += 1;
         else failed += 1;
       } catch (error) {
         failed += 1;
         this.lastError = (error as Error).message ?? "kill-switch basket close failed";
+      } finally {
+        this.releaseBasket(basket.basketId);
       }
     }
     return { closed, failed };
+  }
+
+  /**
+   * 2026-08-04 (review round 1 fix): reconciles basket.plan's one possibly-ambiguous entry (the
+   * plan entry at index basket.legs.length, if its OWN status is "PLACING" — see PlannedLeg's own
+   * doc comment) against the real exchange, adopting a genuine fill if one is found — BEFORE
+   * closeBasket ever runs. closeBasket only ever iterates basket.legs, never basket.plan, so
+   * without this a genuinely-filled pre-crash order sitting in "PLACING" limbo would be silently
+   * finalized as gone: no ExecutorLeg ever created for it, on a basket closeBasket is about to mark
+   * CLOSED — permanently outside every future recovery pass's purview (recoverIncompleteBaskets
+   * only ever revisits RESERVED/PLACING/PARTIALLY_FILLED baskets) and outside the orphaned-leg
+   * retry mechanism (which only ever tracks a leg closeBasket/flattenFilledLegs already knows
+   * about in basket.legs). Needed specifically because closeAllBasketsOrderly (unlike
+   * closeDueBaskets/closeBasketsHittingProfitTarget, both strictly COMPLETE-gated — a COMPLETE
+   * basket's plan is by construction all-FILLED, never ambiguous) can reach a crash-persisted
+   * basket BEFORE recoverIncompleteBaskets ever gets a chance to reconcile it: the cross-sectional
+   * tick's own first run after a restart is deliberately delayed 90-150s (see app.ts's
+   * setTimeout(execTick, 90_000) and siblings), but nothing delays a kill-switch trip, which is
+   * driven by an entirely independent, typically much-faster-cadence engine tick.
+   *
+   * This is the SAME query-then-adopt-if-FILLED logic recoverIncompleteBaskets uses against
+   * reconcilePlannedLeg — deliberately duplicated here rather than having recoverIncompleteBaskets
+   * call this shared helper too, to keep this fix's diff isolated and that already-tested method's
+   * internals untouched; both sites are small, and reconcilePlannedLeg itself remains the single
+   * source of truth for the actual exchange-query/classification logic.
+   *
+   * INCONCLUSIVE: nothing to adopt, reservation left untouched (never guess) — closeBasket proceeds
+   * exactly as before this fix, flattening whatever is real right now. NOT_PLACED: nothing to
+   * adopt either, but — unlike recoverIncompleteBaskets' own NOT_PLACED handling, which reuses the
+   * SAME reservation to place the leg fresh — this basket is being killed, not resumed, so the
+   * reservation is released immediately rather than left for the coordinator's own staleness sweep.
+   * Never throws (reconcilePlannedLeg's own contract), so a failed reconciliation attempt never
+   * blocks the close it precedes.
+   *
+   * 2026-08-05 (review round 2 fix): the ambiguous entry at `idx` was the ONLY plan entry this
+   * method ever resolved. For a basket with more than one un-filled leg remaining (a 3+-leg basket
+   * killed with two or more legs never attempted, or — the more common case — a RESERVED basket
+   * with an all-"PENDING" plan killed before its very first leg was ever attempted, so `idx` itself
+   * is never even "PLACING") every entry strictly after `idx`, and `idx` itself whenever it was
+   * never "PLACING" to begin with, fell straight through to closeBasket() untouched: closeBasket
+   * only ever iterates basket.legs, never basket.plan, so those entries' reservationIds stayed
+   * "RESERVED" forever from THIS basket's own perspective — closed, terminal, never revisited by
+   * recoverIncompleteBaskets again — silently leaking real reserved capacity until (if ever) the
+   * coordinator's OWN staleness sweep independently rediscovers and releases them. That is exactly
+   * the fallback this method's own NOT_PLACED branch above was written to avoid for the one entry
+   * it handles ("released immediately... rather than left for the coordinator's own staleness
+   * sweep") — applied inconsistently to the rest of an identical, equally-never-attempted tail.
+   * Every entry from `sweepFrom` onward below has never been attempted by ANY process (placement is
+   * strictly sequential — only `idx` can ever be genuinely mid-flight), so releasing them now is
+   * exactly as unambiguous as the NOT_PLACED branch's own release, never a guess.
+   */
+  private async reconcileAmbiguousLegBeforeClose(basket: ExecutorBasket): Promise<void> {
+    const plan = basket.plan;
+    if (!Array.isArray(plan)) return;
+    const idx = basket.legs.length;
+    if (idx >= plan.length) return;
+    const ambiguous = plan[idx]!;
+    // First index NOT resolved by this method's own idx-specific handling below — starts at `idx`
+    // (safe to sweep immediately) and only advances past it when `idx` itself needed its own
+    // dedicated handling (it was genuinely "PLACING" — adopted, marked FAILED, or, for INCONCLUSIVE,
+    // deliberately left untouched and excluded from the generic sweep either way).
+    let sweepFrom = idx;
+    if (ambiguous.status === "PLACING") {
+      sweepFrom = idx + 1;
+      const resolution = await this.reconcilePlannedLeg(ambiguous.symbol, ambiguous.entryClientOrderId);
+      if (resolution.outcome === "NOT_PLACED") {
+        // Unlike recoverIncompleteBaskets' own NOT_PLACED handling (which falls through to placing
+        // this leg fresh, reusing the SAME reservation), this basket is being KILLED, not resumed —
+        // the leg will never be placed. Release the reservation NOW instead of leaving it RESERVED
+        // for the coordinator's own (bounded, but non-zero) staleness sweep to eventually catch —
+        // same unambiguous-only-release discipline as placeRemainingLegsLocked's own catch block:
+        // this IS unambiguous (the exchange confirmed a terminal non-fill status, or that no order
+        // with this clientOrderId ever reached it).
+        ambiguous.status = "FAILED";
+        ambiguous.failureReason = "BASKET_CLOSED_BEFORE_RECOVERY_RECONCILED_NOT_PLACED";
+        if (ambiguous.reservationId) {
+          this.releaseExposureReservationFn(ambiguous.reservationId, "BASKET_CLOSED_BEFORE_RECOVERY:NOT_PLACED");
+        }
+      } else if (resolution.outcome === "FILLED") {
+        if (ambiguous.reservationId) {
+          this.commitExposureReservationFn(ambiguous.reservationId, { qty: resolution.qty, avgPrice: resolution.avgPrice });
+        }
+        basket.legs.push({
+          symbol: ambiguous.symbol,
+          side: ambiguous.side,
+          qty: resolution.qty,
+          entryPrice: resolution.avgPrice,
+          entryOrderId: resolution.orderId,
+          entryPriceConfirmed: true,
+          exitPrice: null,
+          exitOrderId: null,
+          exitPriceConfirmed: null,
+          planIndex: idx,
+        });
+        ambiguous.status = "FILLED";
+        basket.status = basket.legs.length === plan.length ? "COMPLETE" : "PARTIALLY_FILLED";
+      }
+      // else INCONCLUSIVE — never guess, leave `ambiguous` (idx) completely untouched; sweepFrom
+      // already excludes it from the generic release pass below.
+    }
+    // Every remaining plan entry has never been attempted by any process — release it now (see this
+    // method's own 2026-08-05 doc-comment addendum above). No-op when sweepFrom === plan.length
+    // (the common 2-leg-basket case: the ambiguous entry above was the last one, nothing left).
+    this.markRemainingNeverAttempted(basket, sweepFrom, "BASKET_CLOSED_BEFORE_RECOVERY:NEVER_ATTEMPTED");
+    this.store.save();
   }
 
   /**
@@ -834,7 +1185,12 @@ export class CrossSectionalExecutor {
    */
   private async closeBasketsHittingProfitTarget(): Promise<void> {
     const st = this.store.getState();
-    const openBaskets = st.baskets.filter((b) => b.status === "OPEN");
+    // Strict COMPLETE-only (not the broader isBasketLive()) — TP math below assumes the FULL
+    // intended hedge is present (see the longLegs/shortLegs skip immediately inside the loop). A
+    // RESERVED/PLACING/PARTIALLY_FILLED basket is mid-open, not a settled hedge to score; letting
+    // recoverIncompleteBaskets() finish (or abort) it first is the correct path, not a live TP read
+    // against an incomplete position.
+    const openBaskets = st.baskets.filter((b) => b.status === "COMPLETE");
     if (openBaskets.length === 0) return;
 
     const positions = await this.sharedGetPositions();
@@ -847,6 +1203,15 @@ export class CrossSectionalExecutor {
     for (const basket of openBaskets) {
       const longLegs = basket.legs.filter((l) => l.side === "LONG");
       const shortLegs = basket.legs.filter((l) => l.side === "SHORT");
+      // Bug fix: a basket with real legs on only ONE side (e.g. a legacy pre-migration record — see
+      // CrossSectionalExecutorStore._load() — or any other lopsided-but-COMPLETE edge case) is not
+      // an actual hedge. The two-sided TP formula below defaults an empty side's mean return to 0
+      // and silently scores a "hedge" return off a single real leg divided by 2 — a wrong number
+      // that could wrongly trigger, or wrongly withhold, a profit-target close. Skip it entirely
+      // rather than invent a new lopsided-basket formula (that would be strategy-tuning, not a
+      // safety fix) — it still has its own HORIZON exit (closeBasket doesn't care about leg-count
+      // symmetry when actually settling) as the safety valve.
+      if (longLegs.length === 0 || shortLegs.length === 0) continue;
       const legReturn = (leg: ExecutorLeg, direction: "LONG" | "SHORT"): number | null => {
         const mark = markBySymbol.get(leg.symbol);
         if (mark === undefined || !(leg.entryPrice > 0)) return null;
@@ -915,7 +1280,7 @@ export class CrossSectionalExecutor {
     const leverage = this.leverageFn();
     const symbols = new Set<string>();
     for (const basket of this.store.getState().baskets) {
-      if (basket.status !== "OPEN") continue;
+      if (!this.isBasketLive(basket)) continue;
       for (const leg of basket.legs) symbols.add(leg.symbol);
     }
     for (const symbol of symbols) {
@@ -931,7 +1296,13 @@ export class CrossSectionalExecutor {
     const st = this.store.getState();
     const nowMs = new Date(this.nowIso()).getTime();
     for (const basket of st.baskets) {
-      if (basket.status !== "OPEN") continue;
+      // Strict COMPLETE-only, same rationale as closeBasketsHittingProfitTarget above: a basket
+      // still mid-open (RESERVED/PLACING/PARTIALLY_FILLED) reaching its horizon must not be closed
+      // as though its CURRENT (possibly partial) leg set were the whole intended hedge — that is
+      // exactly the CORE GAP this task closes. recoverIncompleteBaskets() gets first chance to
+      // finish or abort it; if it's genuinely stuck (e.g. persistently INCONCLUSIVE reconciliation),
+      // it now stays visibly incomplete past its horizon instead of being silently mis-closed.
+      if (basket.status !== "COMPLETE") continue;
       if (nowMs < basket.closesAtMs) continue;
       // 2026-07-19 real-money audit fix (BUG 2): same per-basket isolation as
       // closeBasketsHittingProfitTarget above — one basket's HORIZON close failing must not block
@@ -957,7 +1328,7 @@ export class CrossSectionalExecutor {
   private siblingOppositeUnexitedQty(basket: ExecutorBasket, symbol: string, side: "LONG" | "SHORT"): number {
     let qty = 0;
     for (const other of this.store.getState().baskets) {
-      if (other === basket || other.status !== "OPEN") continue;
+      if (other === basket || !this.isBasketLive(other)) continue;
       for (const leg of other.legs) {
         if (leg.symbol === symbol && leg.side !== side && leg.exitOrderId === null) qty += leg.qty;
       }
@@ -1204,7 +1575,35 @@ export class CrossSectionalExecutor {
     }
   }
 
+  /**
+   * 2026-08-04 (critical latch, ground truth item (c)): true while at least one OrphanedLeg is
+   * unresolved — REAL, still-open exchange exposure this executor's normal HORIZON/PROFIT_BANK/
+   * kill-switch close paths can no longer reach on their own (see OrphanedLeg's own doc comment
+   * for its two origins: an abort-flatten that itself failed, or a partial-exit-fill remainder).
+   * Deliberately reuses the EXISTING OrphanedLeg list — no new status/field/parallel bookkeeping —
+   * both origins leave real, unaccounted-for exposure, which is exactly the condition under which
+   * taking on MORE new risk is unsafe. Consulted by maybeOpenBasket (blocks a brand-new basket) AND,
+   * as of 2026-08-04 (review round 1 fix), by recoverIncompleteBaskets (blocks resuming placement on
+   * a plan entry that has never been attempted by any process — the same new-risk order placement
+   * under a different call path; see that method's own doc comment) — every exposure-REDUCING or
+   * purely-recording path (closeBasket/closeDueBaskets/closeBasketsHittingProfitTarget/
+   * closeAllBasketsOrderly/retryOrphanedLegFlattens/ensureOpenBasketLeverage, and
+   * recoverIncompleteBaskets' own ambiguous-leg reconciliation/adoption) reads none of this, so
+   * "block NEW real-money order placement, exposure reduction/bookkeeping unaffected" falls out for
+   * free. Self-healing: tick() runs retryOrphanedLegFlattens() every tick BEFORE either consumer —
+   * the latch clears itself the instant the real exchange confirms the exposure is gone, never on a
+   * guess or a timer.
+   */
+  private hasUnresolvedOrphanedExposure(): boolean {
+    return (this.store.getState().orphanedLegs ?? []).length > 0;
+  }
+
   private async maybeOpenBasket(): Promise<void> {
+    if (this.hasUnresolvedOrphanedExposure()) {
+      this.openHalted =
+        "CRITICAL: unresolved orphaned exchange exposure from a rollback/flatten failure — new baskets blocked until every orphaned leg clears (see getStatus().orphanedLegs); existing baskets keep closing normally.";
+      return;
+    }
     const st = this.store.getState();
     // Basket safety breaker: halt NEW opens after a bad realized day; never touches open baskets.
     const lossLimit = this.dailyMaxLossUsdFn();
@@ -1221,7 +1620,11 @@ export class CrossSectionalExecutor {
       }
     }
     this.openHalted = null;
-    if (st.baskets.filter((b) => b.status === "OPEN").length >= this.maxOpenBasketsFn()) return;
+    // Broadened to isBasketLive(): a RESERVED/PLACING/PARTIALLY_FILLED basket (stuck mid-open,
+    // e.g. awaiting restart-recovery reconciliation) still occupies a real slot — it must keep
+    // counting against the cap exactly as a fully-open basket already did before this enum grew
+    // granularity, or a stuck basket would silently let MORE concurrent baskets open than intended.
+    if (st.baskets.filter((b) => this.isBasketLive(b)).length >= this.maxOpenBasketsFn()) return;
 
     const nowMs = new Date(this.nowIso()).getTime();
     // Newest FRESH, still-OPEN signal of the target variant we haven't executed yet.
@@ -1248,14 +1651,36 @@ export class CrossSectionalExecutor {
     const legUsd = this.effectiveLegUsd();
     if (!(legUsd > 0)) return;
     const notionalCap = this.maxNotionalPerSymbolAcrossLanesFn();
-    const plannedLegs: Array<{ symbol: string; side: "LONG" | "SHORT"; qty: number; refPrice: number }> = [];
+    // 2026-07-12 fix: derived only from the signal's timestamp, with no variant component — the
+    // 3 CrossSectionalExecutor instances (FILTERED/TREND/MIXED) each have their OWN store file
+    // but share ONE netted Binance account, and newClientOrderId is built from this id's LAST 12
+    // chars. Two instances opening baskets whose signals share the same openedAtMs would collide
+    // on newClientOrderId, and Binance's per-account idempotency would treat the second instance's
+    // real order as a duplicate of the first's. The variant suffix is appended at the END (not
+    // the middle) so it always survives basketId.slice(-12) regardless of the timestamp's length.
+    // Hoisted here (previously computed only inside the basket literal below) so every leg's
+    // exposure reservation in the sizing loop can carry the basketId that groups its sibling leg
+    // reservations — account-exposure-coordinator.ts's ExposureReservation.basketId.
+    const basketId = `xb-${signal.openedAtMs.toString(36)}-${this.idNamespace}`;
+    const plannedLegs: PlannedLeg[] = [];
+    // Releases every reservation already taken earlier in THIS sizing pass. Called at every early
+    // `return` below so a later leg's rejection (missing filters, un-sizeable qty, notional cap, or
+    // this executor's OWN first-ever in-flight claim rejecting) never leaves an earlier leg's
+    // capacity reserved with no basket ever going on to consume it — this executor's hedge-integrity
+    // constraint means ANY leg failing aborts the WHOLE basket, so every already-taken reservation
+    // for THIS attempt is dead the moment any leg fails.
+    const releasePlannedSoFar = (reason: string): void => {
+      for (const planned of plannedLegs) {
+        if (planned.reservationId) this.releaseExposureReservationFn(planned.reservationId, reason);
+      }
+    };
     for (const [side, legs] of [["LONG", signal.longLeg], ["SHORT", signal.shortLeg]] as const) {
       for (const leg of legs) {
         const f = filters.get(leg.symbol);
-        if (!f || !(leg.entryPrice > 0)) return; // missing filters/price ⇒ skip whole basket
+        if (!f || !(leg.entryPrice > 0)) { releasePlannedSoFar("SIBLING_LEG_MISSING_FILTERS"); return; } // missing filters/price ⇒ skip whole basket
         const rawQty = legUsd / leg.entryPrice;
         const qty = Math.floor(rawQty / f.stepSize) * f.stepSize;
-        if (!(qty >= f.minQty)) return; // any un-sizeable leg ⇒ skip whole basket (hedge integrity)
+        if (!(qty >= f.minQty)) { releasePlannedSoFar("SIBLING_LEG_UNDERSIZED"); return; } // any un-sizeable leg ⇒ skip whole basket (hedge integrity)
         // 2026-07-19 real-money audit fix: this leg's notional, ADDED to whatever every OTHER
         // executor sharing this netted account (the 9 single-symbol lanes AND this instance's own
         // 2 cross-sectional siblings, PLUS this instance's own already-open legs on the symbol)
@@ -1269,21 +1694,53 @@ export class CrossSectionalExecutor {
         if (
           notionalCap > 0 &&
           this.existingNotionalForSymbolFn(leg.symbol) + this.ownOpenNotionalForSymbol(leg.symbol) + qty * leg.entryPrice > notionalCap
-        ) return;
-        plannedLegs.push({ symbol: leg.symbol, side, qty: Number(qty.toFixed(8)), refPrice: leg.entryPrice });
+        ) { releasePlannedSoFar("SIBLING_LEG_NOTIONAL_CAP"); return; }
+        // Account-exposure reservation (account-exposure-coordinator.ts) — this executor's FIRST-EVER
+        // in-flight per-symbol claim (see CrossSectionalExecutorOptions.reserveExposure doc comment).
+        // Reserves ALL legs upfront, atomically, before ANY leg's order fires for this basket — no
+        // `await` runs between one leg's reservation and the next, so no sibling executor's tick can
+        // interleave partway through this basket's sizing pass. clientOrderId matches EXACTLY what
+        // the placement loop below will submit for this same leg index: basket.legs.length ===
+        // plannedLegs.length at placement time for a given leg, since both are filled strictly in
+        // order (see the placement loop's own newClientOrderId, built from basket.legs.length).
+        // Computed ONCE here — the single source of truth both the reservation call below AND
+        // every later placement/reconciliation attempt (fresh or resumed after a restart) reuse
+        // verbatim, replacing the old implicit assumption that plannedLegs.length at reservation
+        // time would always coincide with basket.legs.length at placement time.
+        const planIndex = plannedLegs.length;
+        const entryClientOrderId = `xsec-${basketId.slice(-12)}-e${planIndex}`;
+        const legReservation = this.reserveExposureFn({
+          executorId: this.laneId,
+          symbol: leg.symbol,
+          direction: side,
+          requestedNotionalUsd: qty * leg.entryPrice,
+          clientOrderId: entryClientOrderId,
+          basketId,
+        });
+        if (!legReservation.ok) {
+          releasePlannedSoFar(`SIBLING_LEG_RESERVE_FAILED:${legReservation.reason ?? "unknown"}`);
+          return;
+        }
+        plannedLegs.push({
+          planIndex,
+          symbol: leg.symbol,
+          side,
+          requestedQty: Number(qty.toFixed(8)),
+          refPrice: leg.entryPrice,
+          reservationId: legReservation.reservationId,
+          entryClientOrderId,
+          status: "PENDING",
+          failureReason: null,
+        });
       }
     }
-    if (plannedLegs.length !== signal.longLeg.length + signal.shortLeg.length) return;
+    if (plannedLegs.length !== signal.longLeg.length + signal.shortLeg.length) {
+      releasePlannedSoFar("PLANNED_LEG_COUNT_MISMATCH");
+      return;
+    }
 
     const basket: ExecutorBasket = {
-      // 2026-07-12 fix: derived only from the signal's timestamp, with no variant component — the
-      // 3 CrossSectionalExecutor instances (FILTERED/TREND/MIXED) each have their OWN store file
-      // but share ONE netted Binance account, and newClientOrderId is built from this id's LAST 12
-      // chars. Two instances opening baskets whose signals share the same openedAtMs would collide
-      // on newClientOrderId, and Binance's per-account idempotency would treat the second instance's
-      // real order as a duplicate of the first's. The variant suffix is appended at the END (not
-      // the middle) so it always survives basketId.slice(-12) regardless of the timestamp's length.
-      basketId: `xb-${signal.openedAtMs.toString(36)}-${this.idNamespace}`,
+      basketId,
       sourceObservationId: signal.observationId,
       signal: signal.signal,
       variant: signal.variant ?? "RAW",
@@ -1292,7 +1749,8 @@ export class CrossSectionalExecutor {
       takeProfitReturn: this.respectSignalRiskGeometry ? signal.takeProfitReturn ?? null : undefined,
       stopLossReturn: this.respectSignalRiskGeometry ? signal.stopLossReturn ?? null : undefined,
       legs: [],
-      status: "OPEN",
+      status: "RESERVED",
+      plan: plannedLegs,
       closedAt: null,
       closeReason: null,
       grossPnlUsd: null,
@@ -1320,8 +1778,181 @@ export class CrossSectionalExecutor {
     st.baskets.push(basket);
     this.store.save();
 
+    // Placement itself lives in placeRemainingLegs — the SAME method recoverIncompleteBaskets()
+    // calls to resume a basket a restart interrupted, starting from index 0 here vs. wherever
+    // basket.legs.length landed there. Sharing one implementation is the point: a fresh open and a
+    // resumed one must behave identically for every leg they both place, or the two paths drift.
+    await this.placeRemainingLegs(basket, 0);
+  }
+
+  /** Marks every plan entry from `fromIndex` onward NEVER_ATTEMPTED (idempotent — skips one
+   *  already FILLED, which should be unreachable this far but is defensive against future
+   *  reordering) and releases each one's reservation with `releaseReason`. Shared by both
+   *  placeRemainingLegs interrupt paths (an ordinary leg failure calls this for everything AFTER
+   *  the one it already marked FAILED itself; a kill/drain interrupt calls this starting AT the
+   *  not-yet-attempted leg, since nothing failed — the loop simply stopped). */
+  private markRemainingNeverAttempted(basket: ExecutorBasket, fromIndex: number, releaseReason: string): void {
+    const plan = basket.plan ?? [];
+    for (let j = fromIndex; j < plan.length; j++) {
+      const entry = plan[j]!;
+      if (entry.status === "FILLED") continue; // defensive — should be unreachable this far
+      entry.status = "NEVER_ATTEMPTED";
+      if (entry.reservationId) this.releaseExposureReservationFn(entry.reservationId, releaseReason);
+    }
+  }
+
+  /** Flattens every already-filled leg on `basket` that isn't already exited (reduceOnly MARKET,
+   *  one at a time) — the ROLLBACK half of the hedge-vs-rollback decision (see placeRemainingLegs).
+   *  Extracted verbatim (same reduceOnly call, same executedQty/shortfall honoring, same
+   *  recordOrphanedLeg-on-failure) from what used to be placeRemainingLegs' own inline abort
+   *  handler — now shared by BOTH the ordinary-entry-failure rollback and the kill/drain-interrupt
+   *  rollback (see ground truth items (d) and (a)/(b)), which is the point: one flatten
+   *  implementation, not two copies that can drift. The `exitOrderId !== null` guard is new and
+   *  purely defensive — under claimBasket's mutual exclusion (see its own doc comment) nothing else
+   *  can be closing THIS basket's legs while this runs, so it should never trigger, but it costs
+   *  nothing and matches closeBasket's own identical guard on its retry path. */
+  private async flattenFilledLegs(basket: ExecutorBasket): Promise<void> {
+    for (const leg of basket.legs) {
+      if (leg.exitOrderId !== null) continue; // already flattened by a previous attempt
+      try {
+        const flat = await this.client.placeOrder({
+          symbol: leg.symbol,
+          side: leg.side === "LONG" ? "SELL" : "BUY",
+          type: "MARKET",
+          quantity: leg.qty,
+          reduceOnly: true,
+          newClientOrderId: `xsec-${basket.basketId.slice(-12)}-a${basket.legs.indexOf(leg)}`,
+        });
+        leg.exitOrderId = flat.orderId;
+        const resolvedFlat = await this.resolveFillPrice(leg.symbol, flat.orderId, flat.avgPrice, leg.entryPrice);
+        leg.exitPrice = resolvedFlat.price;
+        leg.exitPriceConfirmed = resolvedFlat.confirmed;
+        // 2026-07-19 real-money audit follow-up: same executedQty honoring as closeBasket's exit
+        // path (see BUG 3) — a genuine partial fill on this rollback-flatten must not be recorded
+        // as fully closed. Guarded with `> 0` exactly like the other sites, since an
+        // unconfirmed-at-ACK (avgPrice=0/executedQty=0) but genuinely full fill must fall back to
+        // the requested qty, not be misread as a 100% shortfall.
+        const flatExecutedQty = Number.isFinite(flat.executedQty) && flat.executedQty > 0 ? flat.executedQty : leg.qty;
+        const flatShortfall = leg.qty - flatExecutedQty;
+        if (flatShortfall > 1e-9) {
+          this.recordOrphanedLeg(
+            basket,
+            { ...leg, qty: flatShortfall },
+            new Error(`rollback-flatten partial fill: requested ${leg.qty}, executed ${flatExecutedQty} — residual ${flatShortfall} still open`),
+          );
+        }
+      } catch (flattenError) {
+        // 2026-07-19 real-money audit fix (BUG 1, HIGH — real-money risk): this leg is now a REAL,
+        // still-open exchange position (e.g. a sibling XSEC executor already holds the opposite
+        // side on this symbol, or a transient exchange/network error) that this basket's own
+        // bookkeeping can never reach again — it is recorded ABORTED with exitOrderId still null,
+        // and nothing else in this file ever revisits an ABORTED basket. Track it explicitly so
+        // retryOrphanedLegFlattens() (called every tick) keeps trying to flatten it, and
+        // getStatus().orphanedLegs surfaces it prominently AND engages the critical latch (see
+        // hasUnresolvedOrphanedExposure) — it must never again just silently fall out of this
+        // basket's bookkeeping.
+        this.recordOrphanedLeg(basket, leg, flattenError);
+      }
+    }
+    this.store.save();
+  }
+
+  /**
+   * Places every planned leg from `startIndex` onward, sequentially — one leg at a time, never in
+   * parallel, never retried within a single attempt. Shared by TWO callers:
+   *  - maybeOpenBasket(), fresh open, always startIndex=0, basket.legs empty.
+   *  - recoverIncompleteBaskets(), resuming after a restart, startIndex===basket.legs.length, with
+   *    the leg AT that index possibly already reconciled (adopted) by the caller beforehand.
+   *
+   * Claims `basket.basketId` for its entire duration (see claimBasket) so closeAllBasketsOrderly
+   * can never mutate the same basket concurrently (ground truth #8) — released in a `finally`
+   * regardless of how this method exits.
+   *
+   * Between every leg (ground truth item (a) — previously checked exactly once, at tick()'s top
+   * level, before this loop ever started), re-reads the SAME `isAllowed` closure tick() already
+   * consults, plus `basket.pendingKillReason` (set by a closeAllBasketsOrderly call that lost the
+   * claim race — see claimBasket/closeAllBasketsOrderly). Either one stops the loop immediately.
+   *
+   * On a STOP (kill/drain interrupt, or an ordinary leg failure — ground truth item (d)) the
+   * decision is HEDGE vs ROLLBACK:
+   *  - Kill/drain interrupt: ALWAYS rolls back (flattens every already-filled leg) — a kill/drain
+   *    signal means "reduce risk now", and an accidentally-balanced partial basket is not a reason
+   *    to keep new exposure open through it.
+   *  - An ordinary entry failure: rolls back ONLY when the already-filled legs are NOT already a
+   *    real hedge (empty on either side — the same test the TP-math fix uses). When they already
+   *    span BOTH sides, unwinding a working hedge would trade it for guaranteed roundtrip
+   *    cost/slippage on both a close and (if a future signal re-opens) a re-open for no safety
+   *    benefit — so those legs are left open and the basket is marked COMPLETE as the
+   *    smaller-than-planned but genuinely balanced final shape (see ExecutorBasket.status's own
+   *    doc comment). No further attempt is ever made on the un-placed legs — recoverIncompleteBaskets
+   *    only revisits RESERVED/PLACING/PARTIALLY_FILLED baskets, and COMPLETE is deliberately outside
+   *    that set.
+   *
+   * Never throws: every failure (leg placement, rollback, hedge decision, kill/drain interrupt) is
+   * fully handled internally (this.lastError set) so BOTH callers can treat this as a plain,
+   * non-throwing terminal outcome — recoverIncompleteBaskets in particular needs this, since it may
+   * process several independent baskets in the same tick and one's failure must never stop the rest.
+   */
+  private async placeRemainingLegs(basket: ExecutorBasket, startIndex: number): Promise<void> {
+    if (!this.claimBasket(basket.basketId)) {
+      // Defensive, not a real code path: within one executor instance, placeRemainingLegs is only
+      // ever invoked sequentially (maybeOpenBasket opens at most one basket per tick;
+      // recoverIncompleteBaskets claims the basket itself — see placeRemainingLegsLocked's own doc
+      // comment — before ever reaching this method), so this basket's own id can never already be
+      // claimed by another placeRemainingLegs call. The only OTHER claimant is closeAllBasketsOrderly,
+      // which never calls this method. Never silently proceeds against a basket something else owns.
+      this.lastError = `basket ${basket.basketId}: placement re-entered while already claimed — skipped this attempt`;
+      return;
+    }
     try {
-      for (const planned of plannedLegs) {
+      await this.placeRemainingLegsLocked(basket, startIndex);
+    } finally {
+      this.releaseBasket(basket.basketId);
+    }
+  }
+
+  /**
+   * 2026-08-04 (review round 1 — race-condition fix): the actual placement loop, factored out of
+   * placeRemainingLegs so recoverIncompleteBaskets can hold ONE claim across BOTH its ambiguous-leg
+   * reconciliation query (see reconcilePlannedLeg) AND this loop, instead of claiming only once this
+   * loop starts. Before this split, the reconciliation step's own FILLED-adoption (basket.legs.push +
+   * basket.status mutation, in recoverIncompleteBaskets) ran with NO claim held at all — a
+   * closeAllBasketsOrderly call racing that exact `await this.reconcilePlannedLeg(...)` window could
+   * claim the (still-unclaimed) basket and fully CLOSE it — flattening every leg present at that
+   * instant, setting status/closedAt/grossPnlUsd — and then, the instant it released, the
+   * reconciliation's own adoption would run unopposed and silently overwrite status back to
+   * COMPLETE/PARTIALLY_FILLED while pushing a brand-new leg with exitOrderId===null: REAL,
+   * genuinely-filled exchange exposure the kill-switch pass believed it had just closed (it reports
+   * `closed`, not `failed`), left permanently unflattened and invisible to every COMPLETE-only close
+   * path until isAllowed() is true again. Confirmed via a direct interleaving test before this fix
+   * (see [RESTART-RECOVERY: CONCURRENT CLOSE RACE] below) — reproduced exactly that corruption.
+   * Caller MUST already hold basket.basketId's claim (see claimBasket/releaseBasket) — this method
+   * itself never claims or releases, so it must never be called except from inside a claim/finally-
+   * release pair (see placeRemainingLegs and recoverIncompleteBaskets, its only two callers).
+   */
+  private async placeRemainingLegsLocked(basket: ExecutorBasket, startIndex: number): Promise<void> {
+    const plan = basket.plan ?? [];
+    for (let i = startIndex; i < plan.length; i++) {
+      const planned = plan[i]!;
+      if (planned.status === "FILLED") continue; // idempotent — already resolved (e.g. by recovery)
+
+      if (!this.isAllowed() || basket.pendingKillReason) {
+        const reason = basket.pendingKillReason ?? "KILL_OR_DRAIN_MID_OPEN";
+        basket.pendingKillReason = undefined;
+        this.markRemainingNeverAttempted(basket, i, `KILL_OR_DRAIN_BASKET_INTERRUPTED:${reason}`);
+        basket.status = "ABORTED";
+        basket.closedAt = this.nowIso();
+        basket.closeReason = reason;
+        this.store.save();
+        await this.flattenFilledLegs(basket); // always rolls back — see this method's own doc comment
+        this.lastError = `basket ${basket.basketId} interrupted mid-open (${reason}) — rolled back`;
+        return;
+      }
+
+      basket.status = basket.legs.length === 0 ? "PLACING" : "PARTIALLY_FILLED";
+      planned.status = "PLACING";
+      this.store.save();
+      try {
         try {
           await this.client.setLeverage(planned.symbol, this.leverageFn());
         } catch {
@@ -1331,8 +1962,8 @@ export class CrossSectionalExecutor {
           symbol: planned.symbol,
           side: planned.side === "LONG" ? "BUY" : "SELL",
           type: "MARKET",
-          quantity: planned.qty,
-          newClientOrderId: `xsec-${basket.basketId.slice(-12)}-e${basket.legs.length}`,
+          quantity: planned.requestedQty,
+          newClientOrderId: planned.entryClientOrderId,
         });
         const resolvedEntry = await this.resolveFillPrice(planned.symbol, order.orderId, order.avgPrice, planned.refPrice);
         // 2026-07-19 real-money audit fix (BUG 3): a genuine partial MARKET fill (realistic on
@@ -1341,7 +1972,12 @@ export class CrossSectionalExecutor {
         // quantity filled. Record the REAL executedQty so downstream P&L/exposure tracking
         // reflects what actually happened on the exchange, not what was requested.
         const filledQty =
-          Number.isFinite(order.executedQty) && order.executedQty > 0 ? order.executedQty : planned.qty;
+          Number.isFinite(order.executedQty) && order.executedQty > 0 ? order.executedQty : planned.requestedQty;
+        // Commit the reservation from this SAME real executedQty (never the requested planned.qty)
+        // — idempotent no-op when reservationId is null (reserveExposure not wired, the safe default).
+        if (planned.reservationId) {
+          this.commitExposureReservationFn(planned.reservationId, { qty: filledQty, avgPrice: resolvedEntry.price });
+        }
         basket.legs.push({
           symbol: planned.symbol,
           side: planned.side,
@@ -1352,58 +1988,228 @@ export class CrossSectionalExecutor {
           exitPrice: null,
           exitOrderId: null,
           exitPriceConfirmed: null,
+          planIndex: i,
         });
+        planned.status = "FILLED";
+        basket.status = basket.legs.length === plan.length ? "COMPLETE" : "PARTIALLY_FILLED";
         this.store.save(); // persist per leg so a crash mid-open still records this filled leg
-      }
-    } catch (error) {
-      // A partial basket is a NAKED directional bet — flatten whatever opened, record ABORTED.
-      basket.status = "ABORTED";
-      basket.closedAt = this.nowIso();
-      basket.closeReason = `OPEN_FAILED:${(error as Error).message}`;
-      for (const leg of basket.legs) {
-        try {
-          const flat = await this.client.placeOrder({
-            symbol: leg.symbol,
-            side: leg.side === "LONG" ? "SELL" : "BUY",
-            type: "MARKET",
-            quantity: leg.qty,
-            reduceOnly: true,
-            newClientOrderId: `xsec-${basket.basketId.slice(-12)}-a${basket.legs.indexOf(leg)}`,
-          });
-          leg.exitOrderId = flat.orderId;
-          const resolvedFlat = await this.resolveFillPrice(leg.symbol, flat.orderId, flat.avgPrice, leg.entryPrice);
-          leg.exitPrice = resolvedFlat.price;
-          leg.exitPriceConfirmed = resolvedFlat.confirmed;
-          // 2026-07-19 real-money audit follow-up: same executedQty honoring as closeBasket's exit
-          // path (see BUG 3) — a genuine partial fill on this abort-flatten must not be recorded
-          // as fully closed. Guarded with `> 0` exactly like the other two sites, since an
-          // unconfirmed-at-ACK (avgPrice=0/executedQty=0) but genuinely full fill must fall back
-          // to the requested qty, not be misread as a 100% shortfall.
-          const flatExecutedQty = Number.isFinite(flat.executedQty) && flat.executedQty > 0 ? flat.executedQty : leg.qty;
-          const flatShortfall = leg.qty - flatExecutedQty;
-          if (flatShortfall > 1e-9) {
-            this.recordOrphanedLeg(
-              basket,
-              { ...leg, qty: flatShortfall },
-              new Error(`abort-flatten partial fill: requested ${leg.qty}, executed ${flatExecutedQty} — residual ${flatShortfall} still open`),
-            );
+      } catch (error) {
+        const message = (error as Error).message ?? "placeOrder failed";
+        planned.status = "FAILED";
+        planned.failureReason = message;
+        // Account-exposure reservation cleanup (account-exposure-coordinator.ts). setLeverage
+        // failures are caught inline (best-effort) and resolveFillPrice never throws (see
+        // resolveConfirmedFillPrice) — so the ONLY call that can reach this catch is placeOrder()
+        // itself, for this one failed leg.
+        if (planned.reservationId) {
+          // Only release on an UNAMBIGUOUS in-band rejection — Binance received the request and
+          // explicitly answered no, so no order was created. Every OTHER failure (timeout/429/
+          // network/http_error/invalid_response/clock_skew, or a non-Binance error) means we do
+          // NOT know whether the order actually reached the exchange; releasing capacity here
+          // would recreate the exact race this coordinator exists to close. Left RESERVED, it is
+          // picked up by the periodic staleness sweep, which resolves it against Binance directly
+          // via queryOrderByClientId (account-exposure-coordinator.ts's reconcileStaleReservations).
+          if (error instanceof BinanceFuturesPrivateError && error.failureType === "binance_error") {
+            this.releaseExposureReservationFn(planned.reservationId, `ENTRY_FAILED:${message}`);
           }
-        } catch (flattenError) {
-          // 2026-07-19 real-money audit fix (BUG 1, HIGH — real-money risk): this leg is now a
-          // REAL, still-open exchange position (e.g. a sibling XSEC executor already holds the
-          // opposite side on this symbol, or a transient exchange/network error) that this
-          // basket's own bookkeeping can never reach again — it is recorded ABORTED with
-          // exitOrderId still null, and nothing else in this file ever revisits an ABORTED
-          // basket. Track it explicitly so retryOrphanedLegFlattens() (called every tick) keeps
-          // trying to flatten it, and getStatus().orphanedLegs surfaces it prominently — it must
-          // never again just silently fall out of this basket's bookkeeping.
-          this.recordOrphanedLeg(basket, leg, flattenError);
         }
+        // Every leg planned AFTER the failed one was never even attempted (this loop is
+        // sequential and stops at the first throw) — those reservations are unambiguously safe
+        // to release now.
+        this.markRemainingNeverAttempted(basket, i + 1, "NEVER_ATTEMPTED_BASKET_ABORTED");
+        this.store.save();
+
+        // (d) hedge-vs-rollback: an ordinary entry failure — unlike a kill/drain interrupt above
+        // — must not unwind an already-safely-hedged partial basket. "Safe" means the SAME test
+        // the TP-math fix uses: real legs already present on BOTH sides, i.e. not one-sided.
+        const longLegs = basket.legs.filter((l) => l.side === "LONG");
+        const shortLegs = basket.legs.filter((l) => l.side === "SHORT");
+        if (longLegs.length > 0 && shortLegs.length > 0) {
+          basket.status = "COMPLETE"; // smaller than planned, but a genuine, already-balanced hedge
+          this.store.save();
+          this.lastError =
+            `basket ${basket.basketId}: leg ${i} (${planned.symbol}) failed (${message}) — kept as a ` +
+            `reduced ${basket.legs.length}/${plan.length}-leg hedge instead of unwinding a working position`;
+          return;
+        }
+
+        // Not a hedge (one-sided, or zero legs) — a partial basket here is a NAKED directional
+        // bet. Roll back: flatten whatever opened, record ABORTED.
+        basket.status = "ABORTED";
+        basket.closedAt = this.nowIso();
+        basket.closeReason = `OPEN_FAILED:${message}`;
+        this.store.save();
+        await this.flattenFilledLegs(basket);
+        this.lastError = message;
+        return; // handled internally — see this method's own doc comment for why this never throws
       }
-      // basket was already pushed into st.baskets before the loop started (see comment above) —
-      // no second push here, just persist the final ABORTED status/legs.
-      this.store.save();
-      throw error;
+    }
+    if (basket.pendingKillReason) {
+      // The loop placed every remaining leg successfully (basket now COMPLETE) before this
+      // between-legs check ever got a chance to catch the kill/drain signal — the claim race
+      // window landed exactly at the end. Nothing left to interrupt mid-placement; hand off to
+      // the SAME safe close path closeAllBasketsOrderly itself uses, now that the caller's claim
+      // (see placeRemainingLegs/recoverIncompleteBaskets) is about to be released.
+      const reason = basket.pendingKillReason;
+      basket.pendingKillReason = undefined;
+      try {
+        await this.closeBasket(basket, reason);
+      } catch (error) {
+        this.lastError = (error as Error).message ?? "post-completion kill-switch close failed";
+      }
+    }
+  }
+
+  /**
+   * THE CORE GAP this task closes: before this method existed, nothing ever detected a basket that
+   * crashed mid-open (persisted RESERVED/PLACING/PARTIALLY_FILLED, fewer legs than its own plan)
+   * and tried to finish it — it just sat there until closeDueBaskets eventually closed whatever
+   * legs it happened to have as though that were the whole intended hedge (see
+   * closeBasketsHittingProfitTarget/closeDueBaskets' own COMPLETE-only gating, added alongside this
+   * method specifically to stop that). Runs every tick (like retryOrphanedLegFlattens), not just
+   * once at startup — a genuine process restart is the common case, but this also self-heals a
+   * basket left stuck by a transient INCONCLUSIVE reconciliation (see reconcilePlannedLeg) on a
+   * later tick once the exchange query stops failing. Gated by the caller (tick()) on isAllowed()
+   * only — see tick()'s own comment for why.
+   *
+   * Algorithm per incomplete basket:
+   *  1. skip anything without a real plan array — cannot safely resume a plan it was never given
+   *     (see ExecutorBasket.plan's own doc comment; ONLY legacy pre-migration data can even reach
+   *     this, and _load() already migrates every reachable legacy shape away from these statuses).
+   *  2. startIndex = basket.legs.length — the first plan entry not yet resolved.
+   *  3. if that entry's OWN status is "PLACING", a placeOrder attempt for it may have been in
+   *     flight when the process died — genuinely ambiguous, reconcile against the real exchange via
+   *     reconcilePlannedLeg BEFORE touching it any further:
+   *       - FILLED       → adopt the real fill (push to legs, commit the reservation, mark FILLED)
+   *                         and continue.
+   *       - NOT_PLACED   → the order never reached the exchange — safe to fall through to the
+   *                         ordinary placement loop, which places it fresh.
+   *       - INCONCLUSIVE → do NOT guess. Leave the basket exactly as-is and move on to the next
+   *                         basket this tick; the next tick's recovery pass retries the query.
+   *     Any other status at that index ("PENDING") means NO attempt was ever made for it by any
+   *     process (RESERVED, or PARTIALLY_FILLED between two legs) — safe to place fresh, no query.
+   *  4. resume placeRemainingLegsLocked() from wherever legs.length now stands (this basket's claim,
+   *     taken before step 3, is already held — see this method's own race-condition-fix note below).
+   *
+   * Each basket is isolated in its own try/catch (same BUG-2 convention as
+   * closeBasketsHittingProfitTarget/closeDueBaskets) so one basket's recovery failure can never
+   * block another's in the same tick.
+   *
+   * 2026-08-04 (review round 1 — race-condition fix): claims `basket.basketId` (see
+   * claimBasket/releaseBasket) BEFORE step 3's reconcilePlannedLeg query, not just around the
+   * placeRemainingLegsLocked call in step 4 — the reconciliation query is a real, awaited exchange
+   * round-trip, and its own FILLED-adoption mutates basket.legs/basket.status directly. Previously
+   * that mutation ran completely unclaimed, so a closeAllBasketsOrderly call landing in that exact
+   * window could claim and fully close the basket out from under the still-in-flight reconciliation
+   * — see placeRemainingLegsLocked's own doc comment for the exact corruption this produced
+   * (confirmed via a direct interleaving test, [RESTART-RECOVERY: CONCURRENT CLOSE RACE] below). A
+   * failed claim here means something else (that same race) already owns this basket this instant;
+   * skip it for this tick — self-healing, same "never guess, retry later" posture INCONCLUSIVE
+   * already uses below, and the very next tick's recovery pass retries once the claim is free.
+   */
+  private async recoverIncompleteBaskets(): Promise<void> {
+    const st = this.store.getState();
+    const incomplete = st.baskets.filter(
+      (b) => (b.status === "RESERVED" || b.status === "PLACING" || b.status === "PARTIALLY_FILLED") && Array.isArray(b.plan),
+    );
+    for (const basket of incomplete) {
+      if (!this.claimBasket(basket.basketId)) continue; // owned by a concurrent close — retry next tick
+      try {
+        const plan = basket.plan!;
+        const startIndex = basket.legs.length;
+        if (startIndex >= plan.length) continue; // defensive — nothing left to do
+        const ambiguous = plan[startIndex]!;
+        if (ambiguous.status === "PLACING") {
+          const resolution = await this.reconcilePlannedLeg(ambiguous.symbol, ambiguous.entryClientOrderId);
+          if (resolution.outcome === "INCONCLUSIVE") continue; // never guess — retry next tick
+          if (resolution.outcome === "FILLED") {
+            if (ambiguous.reservationId) {
+              this.commitExposureReservationFn(ambiguous.reservationId, { qty: resolution.qty, avgPrice: resolution.avgPrice });
+            }
+            basket.legs.push({
+              symbol: ambiguous.symbol,
+              side: ambiguous.side,
+              qty: resolution.qty,
+              entryPrice: resolution.avgPrice,
+              entryOrderId: resolution.orderId,
+              entryPriceConfirmed: true,
+              exitPrice: null,
+              exitOrderId: null,
+              exitPriceConfirmed: null,
+              planIndex: startIndex,
+            });
+            ambiguous.status = "FILLED";
+            basket.status = basket.legs.length === plan.length ? "COMPLETE" : "PARTIALLY_FILLED";
+            this.store.save();
+          }
+          // NOT_PLACED: nothing to adopt — falls through to placeRemainingLegsLocked below, which
+          // will place it fresh (ambiguous.status is still "PLACING" here, but that loop overwrites
+          // it unconditionally the moment it (re)starts that plan index).
+        }
+        // 2026-08-04 (review round 1 fix — critical-latch coverage gap): maybeOpenBasket already
+        // refuses to open a brand-new basket while hasUnresolvedOrphanedExposure() is true (REAL,
+        // unaccounted-for exchange exposure from a prior rollback/flatten failure) — but until this
+        // check, THIS path could still place a plan entry that has never been attempted by any
+        // process (a RESERVED basket that crashed before its very first leg, or any entry still
+        // PENDING/just-classified-NOT_PLACED here), which is structurally identical new-risk
+        // real-money order placement going around the same latch. Gated on `legs.length < plan.length`
+        // (i.e. only when a NEW placeOrder is actually about to happen): the reconciliation/adoption
+        // above is pure bookkeeping — recording a fill that already happened on the exchange
+        // pre-crash — and must never be blocked by this latch, and neither must the pendingKillReason
+        // tail check inside placeRemainingLegsLocked when nothing new needs placing (legs.length
+        // already === plan.length, e.g. adoption alone just completed this basket). Self-heals
+        // exactly like maybeOpenBasket's own check: left exactly as-is, retried next tick once the
+        // orphan resolves — this basket's already-real legs, if any, stay fully visible/flattenable
+        // regardless (see isBasketLive()/closeAllBasketsOrderly, neither of which reads this latch).
+        if (basket.legs.length < plan.length && this.hasUnresolvedOrphanedExposure()) continue;
+        await this.placeRemainingLegsLocked(basket, basket.legs.length);
+      } catch (error) {
+        this.lastError = (error as Error).message ?? "basket recovery failed";
+      } finally {
+        this.releaseBasket(basket.basketId);
+      }
+    }
+  }
+
+  /**
+   * Classifies ONE ambiguous plan entry during restart-recovery, via the same queryOrderByClientId
+   * endpoint and the same FILLED/terminal-no-fill/-2013-never-reached/anything-else classification
+   * account-exposure-coordinator.ts's own reconcileStaleReservations already uses — duplicated
+   * here, deliberately, rather than extracted into a shared helper: it is a small, stable
+   * classification, and the two consumers differ (this decides whether to ADOPT a leg into a
+   * basket vs. place it fresh; the coordinator only ever resolves its own reservation ledger), so a
+   * shared abstraction would couple two independently-owned concerns for no real gain. Never
+   * throws — an unwired client or a network failure both resolve to INCONCLUSIVE, the same
+   * "don't guess, retry later" outcome as any other unrecognized state.
+   */
+  private async reconcilePlannedLeg(
+    symbol: string,
+    entryClientOrderId: string,
+  ): Promise<
+    | { outcome: "FILLED"; qty: number; avgPrice: number; orderId: string }
+    | { outcome: "NOT_PLACED" | "INCONCLUSIVE" }
+  > {
+    if (!this.client.queryOrderByClientId) return { outcome: "INCONCLUSIVE" };
+    try {
+      const order = await this.client.queryOrderByClientId(symbol, entryClientOrderId);
+      const status = (order.status ?? "").trim().toUpperCase();
+      const executedQty = Number.isFinite(order.executedQty) ? order.executedQty : 0;
+      if ((status === "FILLED" || status === "PARTIALLY_FILLED") && executedQty > 0) {
+        return { outcome: "FILLED", qty: executedQty, avgPrice: order.avgPrice, orderId: order.orderId };
+      }
+      if (
+        status === "CANCELED" ||
+        status === "CANCELLED" ||
+        status === "EXPIRED" ||
+        status === "REJECTED" ||
+        (status === "FILLED" && executedQty <= 0)
+      ) {
+        return { outcome: "NOT_PLACED" };
+      }
+      return { outcome: "INCONCLUSIVE" };
+    } catch (error) {
+      if (error instanceof BinanceFuturesPrivateError && error.binanceCode === -2013) return { outcome: "NOT_PLACED" };
+      return { outcome: "INCONCLUSIVE" };
     }
   }
 

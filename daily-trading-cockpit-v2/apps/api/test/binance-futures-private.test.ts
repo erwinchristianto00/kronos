@@ -455,6 +455,37 @@ describe("binance-futures-private signing", () => {
     expect(timeCalls).toBeGreaterThan(1);
   });
 
+  it("queryOrderByClientId signs a GET to /fapi/v1/order keyed by origClientOrderId, not orderId", async () => {
+    // Same 19-digit precision fixture as the queryOrder(orderId) test above — this method must go
+    // through the exact same mapOrder() precision-preserving path, not a hand-rolled parse.
+    const bigOrderId = "8389766229891298477";
+    const rawOrderBody = `{"symbol":"BTCUSDT","orderId":${bigOrderId},"clientOrderId":"my-client-id","status":"FILLED","type":"MARKET","side":"BUY","reduceOnly":false,"price":"0","stopPrice":"0","origQty":"1","executedQty":"1","avgPrice":"61800.5","updateTime":1}`;
+    const urls: string[] = [];
+    const fetchImpl = (async (url: RequestInfo | URL) => {
+      const u = String(url);
+      urls.push(u);
+      if (u.includes("/fapi/v1/time")) {
+        return new Response(JSON.stringify({ serverTime: Date.now() }), { status: 200 });
+      }
+      return new Response(rawOrderBody, { status: 200 });
+    }) as typeof fetch;
+
+    const client = new BinanceFuturesPrivateClient({ apiKey: "k", apiSecret: "s", env: "testnet", fetchImpl });
+    const order = await client.queryOrderByClientId("BTCUSDT", "my-client-id");
+
+    const orderUrl = urls.find((u) => u.includes("/fapi/v1/order?"));
+    expect(orderUrl).toBeDefined();
+    expect(orderUrl).toContain("origClientOrderId=my-client-id");
+    // Must NOT also (accidentally) send a bare `orderId=` param — this is a lookup BY client id, the
+    // whole point being that no exchange-assigned orderId is known yet.
+    expect(orderUrl).not.toMatch(/[?&]orderId=/);
+    expect(order.orderId).toBe(bigOrderId);
+    expect(typeof order.orderId).toBe("string");
+    expect(order.status).toBe("FILLED");
+    expect(order.executedQty).toBe(1);
+    expect(order.avgPrice).toBeCloseTo(61800.5, 6);
+  });
+
   it("still fails closed when the very first time-sync attempt never succeeds", async () => {
     const fetchImpl = (async (url: RequestInfo | URL) => {
       const u = String(url);

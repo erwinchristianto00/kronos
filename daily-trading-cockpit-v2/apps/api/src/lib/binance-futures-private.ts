@@ -761,6 +761,23 @@ export class BinanceFuturesPrivateClient {
     return this.mapOrder(parsed);
   }
 
+  /**
+   * Same endpoint as queryOrder, looked up by the client-supplied idempotency key instead of the
+   * exchange-assigned orderId — Binance's /fapi/v1/order accepts EITHER as an alternative lookup key.
+   * Added for account-exposure-coordinator.ts's restart/staleness reconciliation: a reservation
+   * persisted before an order-placement attempt knows its own clientOrderId (it must, by
+   * construction — see ExposureReservation.clientOrderId) but has no orderId to query by if the
+   * process died before placeOrder()'s response (containing the exchange-assigned orderId) was ever
+   * recorded. Reuses the exact same signed GET path queryOrder does (requestSigned, GET retries on
+   * timeout/429/network, the clock-skew guard) — this file's own header comment states it is "the
+   * ONLY module that talks to Binance private endpoints" for a reason; a second, hand-rolled request
+   * path here would be a real regression risk, not just style.
+   */
+  async queryOrderByClientId(symbol: string, origClientOrderId: string): Promise<FuturesOrder> {
+    const parsed = await this.requestSigned("GET", "/fapi/v1/order", { symbol, origClientOrderId });
+    return this.mapOrder(parsed);
+  }
+
   async placeOrder(params: PlaceOrderParams): Promise<FuturesOrder> {
     const filters = await this.getSymbolFilters(params.symbol);
     const quantity = filters

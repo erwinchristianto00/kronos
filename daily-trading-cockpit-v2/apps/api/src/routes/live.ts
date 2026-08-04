@@ -14,6 +14,7 @@ import {
   EXECUTABLE_INNOVATION_LANE_IDS,
   INNOVATION_POLICY_ONLY_IDS,
 } from "../lib/innovation-testnet-execution.js";
+import type { InnovationCampaignDiagnostics } from "../lib/innovation-campaign.js";
 import type { SingleSymbolPriceTimelineService } from "../lib/single-symbol-price-timeline.js";
 import { REGIME_AUTOPILOT_PRESETS, type RegimeAutopilot } from "../lib/regime-autopilot.js";
 import { getShortFadeStore, buildShortFadeReport, SF_PAPER_LANE_ID } from "../lib/short-fade-edge.js";
@@ -602,6 +603,7 @@ export async function registerLiveRoutes(
     panicWashoutExecutor?: () => SingleSymbolLaneExecutor | null;
     innovationBasketExecutors?: () => CrossSectionalExecutor[];
     innovationSingleSymbolExecutors?: () => SingleSymbolLaneExecutor[];
+    innovationCampaign?: () => InnovationCampaignDiagnostics;
     regimeAutopilot?: () => RegimeAutopilot | null;
     unifiedOrchestrator?: () => UnifiedTestnetOrchestrator | null;
     unifiedProposalStore?: () => UnifiedTestnetProposalStore | null;
@@ -672,6 +674,7 @@ export async function registerLiveRoutes(
   app.get("/api/live/innovation-executors", async () => ({
     executableLaneIds: EXECUTABLE_INNOVATION_LANE_IDS,
     policyOnly: INNOVATION_POLICY_ONLY_IDS,
+    campaign: opts.innovationCampaign?.() ?? null,
     basket: (opts.innovationBasketExecutors?.() ?? []).map((executor) => executor.getStatus()),
     singleSymbol: (opts.innovationSingleSymbolExecutors?.() ?? []).map((executor) => executor.getStatus()),
   }));

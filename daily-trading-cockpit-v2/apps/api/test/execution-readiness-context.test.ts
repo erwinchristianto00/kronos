@@ -23,6 +23,48 @@ import {
 } from "../src/lib/realtime-short-mirror.js";
 import type { PaperOrder } from "../src/lib/paper-execution-router.js";
 import { makeConfig, makeEngine, paperOrder } from "./live-execution-engine.test.js";
+import type { CanonicalMarketRegimeSnapshot } from "../src/lib/canonical-market-regime-execution-policy.js";
+
+// 2026-08 canonical-market-regime redirect: buildIsPaperOrderLiveEligible's step 3 (regimeFamily) now
+// reads deps.getCanonicalMarketRegimeSnapshot() instead of re-deriving regimeFamily from order.regime
+// (see app.ts). Every fixture below previously relied on order.regime ("Bullish expansion" / "Sideways
+// rotation" / etc.) flowing through estimateLaneSelectorV2Regime/rotationRegimeFamilyForLabel to reach
+// a specific regimeFamily (BULLISH/MIXED); this helper reproduces that SAME target family via an
+// explicit snapshot fixture instead, so every existing test below keeps testing exactly what it always
+// tested (the maturity/proof-boundary gates), completely unaffected by the regime-family SOURCE swap.
+// `atMs` is always "now" (computed at call time, not a fixed historical date) so the new step 4b
+// staleness check never trips regardless of when the suite actually runs. Coverage/panic/overlays are
+// all deliberately "healthy" (VALID, no panic, no lowCoverage) so canonicalMarketRegimeExecutionPolicy's
+// new step 4b never itself blocks a test that expects to reach `true` — every test below verifies the
+// PRE-EXISTING maturity/proof-boundary gates, not the new regime-policy gate (that gate has its own
+// dedicated test file, canonical-market-regime-execution-policy.test.ts).
+function canonicalSnapshotFixture(regimeFamily: "BULLISH" | "BEARISH" | "MIXED"): CanonicalMarketRegimeSnapshot {
+  const nowMs = Date.now();
+  return {
+    schemaVersion: 1,
+    engineVersion: "test-fixture-v1",
+    calibrationVersion: "v1-hand-set-defaults",
+    atMs: nowMs,
+    atIso: new Date(nowMs).toISOString(),
+    universeVersion: "test-fixture-universe-v1",
+    universeSize: 60,
+    sourceObservationIds: {},
+    perSymbol: [],
+    directionFast: 0,
+    directionSlow: 0,
+    breadth: 0,
+    cohesion: 1,
+    dispersion: 0,
+    riskStress: 0,
+    coverage: { validSymbolCount: 60, requiredSymbolCount: 60, coveragePct: 100, status: "VALID", reasons: [] },
+    projection: regimeFamily,
+    regimeFamily,
+    overlays: { transition: false, highStress: false, panic: false, lowCoverage: false, rotational: false, fragmented: false },
+    confidence: 1,
+    stateHistory: { projectionSinceMs: nowMs, cyclesInProjection: 1, lastFlipAtMs: null, panicSinceMs: null, panicCyclesSinceExitCandidate: 0 },
+    status: "VALID",
+  };
+}
 
 function proof(overrides: Partial<ContextLaneStatusLookup> = {}): ContextLaneStatusLookup {
   return {
@@ -217,6 +259,10 @@ describe("isPaperOrderLiveEligible — real wiring (buildIsPaperOrderLiveEligibl
       getUnifiedOrchestrator: () => null,
       getLiveEngine: () => null,
       getVariantMatrixStore: () => store,
+      // order.regime "Bullish expansion" used to reach regimeFamily BULLISH via
+      // estimateLaneSelectorV2Regime; reproduced directly here now that regimeFamily comes from the
+      // canonical snapshot instead (see this file's canonicalSnapshotFixture doc comment).
+      getCanonicalMarketRegimeSnapshot: () => canonicalSnapshotFixture("BULLISH"),
     });
     const order = paperOrder({
       paperOrderId: "reject-order",
@@ -262,6 +308,10 @@ describe("isPaperOrderLiveEligible — real wiring (buildIsPaperOrderLiveEligibl
       getUnifiedOrchestrator: () => null,
       getLiveEngine: () => null,
       getVariantMatrixStore: () => store,
+      // order.regime "Sideways rotation" used to reach regimeFamily MIXED via
+      // rotationRegimeFamilyForLabel; reproduced directly here now that regimeFamily comes from the
+      // canonical snapshot instead (see this file's canonicalSnapshotFixture doc comment).
+      getCanonicalMarketRegimeSnapshot: () => canonicalSnapshotFixture("MIXED"),
     });
     const order = paperOrder({
       paperOrderId: "pass-order",
@@ -444,6 +494,10 @@ describe("[PROOF-BOUNDARY] buildIsPaperOrderLiveEligible — defect 1 adversaria
       getUnifiedOrchestrator: () => null,
       getLiveEngine: () => manualEngine,
       getVariantMatrixStore: () => store,
+      // UNRESOLVABLE_REGIME used to reach regimeFamily "UNKNOWN" (both estimateLaneSelectorV2Regime
+      // and rotationRegimeFamilyForLabel fall through) -> exactContext null regardless of direction.
+      // A null snapshot reproduces the same "no resolvable context" outcome directly.
+      getCanonicalMarketRegimeSnapshot: () => null,
     });
     expect(isEligible(order)).toBe(false);
   });
@@ -484,6 +538,9 @@ describe("[PROOF-BOUNDARY] buildIsPaperOrderLiveEligible — defect 1 adversaria
       getUnifiedOrchestrator: () => null,
       getLiveEngine: () => manualEngine,
       getVariantMatrixStore: () => store,
+      // order.regime "Bullish expansion" used to reach regimeFamily BULLISH -> exactContext
+      // LONG_BULLISH, matching the "LONG_BULLISH" probed manually above.
+      getCanonicalMarketRegimeSnapshot: () => canonicalSnapshotFixture("BULLISH"),
     });
     expect(isEligible(order)).toBe(false);
   });
@@ -524,6 +581,9 @@ describe("[PROOF-BOUNDARY] buildIsPaperOrderLiveEligible — defect 1 adversaria
       getUnifiedOrchestrator: () => null,
       getLiveEngine: () => manualEngine,
       getVariantMatrixStore: () => store,
+      // order.regime "Bullish expansion" used to reach regimeFamily BULLISH -> exactContext
+      // LONG_BULLISH, matching the "LONG_BULLISH" probed manually above.
+      getCanonicalMarketRegimeSnapshot: () => canonicalSnapshotFixture("BULLISH"),
     });
     expect(isEligible(order)).toBe(false);
   });
@@ -559,6 +619,12 @@ describe("[PROOF-BOUNDARY] buildIsPaperOrderLiveEligible — defect 1 adversaria
       getUnifiedOrchestrator: () => null,
       getLiveEngine: () => manualEngine,
       getVariantMatrixStore: () => store,
+      // order.regime "Bullish expansion" used to reach regimeFamily BULLISH -> exactContext
+      // LONG_BULLISH. Must be a HEALTHY snapshot (VALID coverage, no panic) since this test expects
+      // `true` at the end — the new step 4b sits before the manual-entry check this test exercises,
+      // so an unhealthy snapshot here would incorrectly block for a reason unrelated to what this
+      // test verifies.
+      getCanonicalMarketRegimeSnapshot: () => canonicalSnapshotFixture("BULLISH"),
     });
     expect(isEligible(order)).toBe(true); // real proof exists -> the manual override's own job (bypass MATURITY) may proceed
   });
@@ -578,6 +644,9 @@ describe("[PROOF-BOUNDARY] buildIsPaperOrderLiveEligible — defect 1 adversaria
       getUnifiedOrchestrator: () => null,
       getLiveEngine: () => null,
       getVariantMatrixStore: () => store,
+      // UNRESOLVABLE_REGIME used to reach regimeFamily "UNKNOWN" -> exactContext null regardless of
+      // direction/force-eligibility. A null snapshot reproduces the same outcome directly.
+      getCanonicalMarketRegimeSnapshot: () => null,
     });
     withEnvVar("REALTIME_SHORT_FORCE_FAST_LONG", "1", () => {
       // Forensic: force-eligibility is genuinely ACTIVE for this fixture, not a vacuous test that
@@ -625,6 +694,9 @@ describe("[PROOF-BOUNDARY] buildIsPaperOrderLiveEligible — defect 1 adversaria
       getUnifiedOrchestrator: () => null,
       getLiveEngine: () => null,
       getVariantMatrixStore: () => store,
+      // order.regime "Bullish expansion" used to reach regimeFamily BULLISH -> exactContext
+      // LONG_BULLISH, matching the "LONG_BULLISH" probed manually above.
+      getCanonicalMarketRegimeSnapshot: () => canonicalSnapshotFixture("BULLISH"),
     });
     withEnvVar("LIVE_UNPROVEN_EXECUTION_OVERRIDE", "1", () => {
       expect(isEligible(order)).toBe(false);
@@ -656,6 +728,11 @@ describe("[PROOF-BOUNDARY] buildIsPaperOrderLiveEligible — defect 1 adversaria
       getUnifiedOrchestrator: () => null,
       getLiveEngine: () => null, // no manual mode, no force, no override — the ordinary path
       getVariantMatrixStore: () => store,
+      // order.regime "Bullish expansion" used to reach regimeFamily BULLISH -> exactContext
+      // LONG_BULLISH, matching the "LONG_BULLISH" probed manually above. Healthy snapshot so this
+      // test still fails for the MATURITY reason (COLLECTING, not STABLE_CANDIDATE) it verifies, not
+      // an unrelated regime-policy block.
+      getCanonicalMarketRegimeSnapshot: () => canonicalSnapshotFixture("BULLISH"),
     });
     expect(isEligible(order)).toBe(false);
   });
@@ -689,6 +766,10 @@ describe("[PROOF-BOUNDARY] buildIsPaperOrderLiveEligible — defect 1 adversaria
       getUnifiedOrchestrator: () => null,
       getLiveEngine: () => null,
       getVariantMatrixStore: () => store,
+      // order.regime "Sideways rotation" used to reach regimeFamily MIXED -> exactContext
+      // LONG_MIXED, matching the "LONG_MIXED" probed manually above. Healthy snapshot so this test
+      // still passes for the MATURITY reason (genuine STABLE_CANDIDATE) it verifies.
+      getCanonicalMarketRegimeSnapshot: () => canonicalSnapshotFixture("MIXED"),
     });
     expect(isEligible(order)).toBe(true);
   });
@@ -708,7 +789,119 @@ describe("[PROOF-BOUNDARY] buildIsPaperOrderLiveEligible — defect 1 adversaria
       getUnifiedOrchestrator: () => null,
       getLiveEngine: () => null,
       getVariantMatrixStore: () => store,
+      // isProfitCoreShortLaneId short-circuits at step 2, BEFORE step 3's regimeFamily lookup is
+      // ever reached — this getter is provably never called for this test; `() => null` is used
+      // purely so the (now-required) field is supplied.
+      getCanonicalMarketRegimeSnapshot: () => null,
     });
     expect(isEligible(order)).toBe(true);
+  });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // 2026-08 canonical-market-regime addition — step 4b's REAL WIRING into this closure.
+  // canonical-market-regime-execution-policy.test.ts already proves canonicalMarketRegimeExecutionPolicy
+  // itself blocks correctly on PANIC/LOW_COVERAGE in ISOLATION. Every test above (A-H, REGRESSION)
+  // deliberately supplies a HEALTHY canonicalSnapshotFixture, so step 4b is a no-op for all of them —
+  // none of them would fail if step 4b were deleted from app.ts entirely. These three tests close that
+  // gap: they reuse [PROOF-BOUNDARY-H]'s and [PROOF-BOUNDARY-D]'s exact fixtures (both proven `true`
+  // under a healthy snapshot above) and flip ONLY the snapshot's overlays, isolating this one new gate.
+  // ───────────────────────────────────────────────────────────────────────────
+  it("[CANONICAL-REGIME-POLICY / new step 4b, fail-without/pass-with pair with PROOF-BOUNDARY-H] a genuine STABLE_CANDIDATE lane with no override active — otherwise identical to PROOF-BOUNDARY-H, which returns true under a HEALTHY snapshot — is BLOCKED when the canonical snapshot reports PANIC", () => {
+    const store = new CurrentGuardVariantMatrixStore(tmpDir());
+    addResolvedContextCohort(store, {
+      variantId: TEST_LANE_VARIANT_ID,
+      direction: "LONG",
+      regime: "Sideways rotation",
+      count: 143,
+      netR: STABLE_NET_R,
+      prefix: "policy-panic-stable",
+    });
+    const report = buildCurrentGuardVariantMatrixReport(store);
+    expect(laneStatusForContext(report, TEST_LANE_VARIANT_ID, "LONG_MIXED").status).toBe("STABLE_CANDIDATE");
+    const order = paperOrder({
+      paperOrderId: "policy-panic-order",
+      selectedLaneId: `CG_VARIANT_MATRIX:${TEST_LANE_VARIANT_ID}`,
+      direction: "LONG",
+      symbol: "ETHUSDT",
+      regime: "Sideways rotation",
+      controllerConfidence: null,
+    } as Partial<PaperOrder>);
+    const isEligible = buildIsPaperOrderLiveEligible({
+      liveConfig: makeConfig({ env: "testnet" }),
+      getUnifiedOrchestrator: () => null,
+      getLiveEngine: () => null,
+      getVariantMatrixStore: () => store,
+      getCanonicalMarketRegimeSnapshot: () => ({
+        ...canonicalSnapshotFixture("MIXED"),
+        overlays: { ...canonicalSnapshotFixture("MIXED").overlays, panic: true },
+      }),
+    });
+    expect(isEligible(order)).toBe(false);
+  });
+
+  it("[CANONICAL-REGIME-POLICY / new step 4b, fail-without/pass-with pair with PROOF-BOUNDARY-H] the same genuine STABLE_CANDIDATE lane is BLOCKED when the canonical snapshot reports LOW_COVERAGE", () => {
+    const store = new CurrentGuardVariantMatrixStore(tmpDir());
+    addResolvedContextCohort(store, {
+      variantId: TEST_LANE_VARIANT_ID,
+      direction: "LONG",
+      regime: "Sideways rotation",
+      count: 143,
+      netR: STABLE_NET_R,
+      prefix: "policy-lowcoverage-stable",
+    });
+    const report = buildCurrentGuardVariantMatrixReport(store);
+    expect(laneStatusForContext(report, TEST_LANE_VARIANT_ID, "LONG_MIXED").status).toBe("STABLE_CANDIDATE");
+    const order = paperOrder({
+      paperOrderId: "policy-lowcoverage-order",
+      selectedLaneId: `CG_VARIANT_MATRIX:${TEST_LANE_VARIANT_ID}`,
+      direction: "LONG",
+      symbol: "ETHUSDT",
+      regime: "Sideways rotation",
+      controllerConfidence: null,
+    } as Partial<PaperOrder>);
+    const isEligible = buildIsPaperOrderLiveEligible({
+      liveConfig: makeConfig({ env: "testnet" }),
+      getUnifiedOrchestrator: () => null,
+      getLiveEngine: () => null,
+      getVariantMatrixStore: () => store,
+      getCanonicalMarketRegimeSnapshot: () => ({
+        ...canonicalSnapshotFixture("MIXED"),
+        overlays: { ...canonicalSnapshotFixture("MIXED").overlays, lowCoverage: true },
+      }),
+    });
+    expect(isEligible(order)).toBe(false);
+  });
+
+  it("[CANONICAL-REGIME-POLICY / new step 4b, fail-without/pass-with pair with PROOF-BOUNDARY-D] manual directional mode can no longer bypass PANIC — contrasts directly with PROOF-BOUNDARY-D's `true` under an otherwise-identical HEALTHY snapshot", () => {
+    const store = new CurrentGuardVariantMatrixStore(tmpDir());
+    addResolvedContextCohort(store, {
+      variantId: TEST_LANE_VARIANT_ID,
+      direction: "LONG",
+      regime: "Bullish expansion",
+      count: 5,
+      netR: () => 1,
+      prefix: "policy-panic-manual-collecting",
+    });
+    const manualEngine = makeManualEngineForLongLane(TEST_LANE_VARIANT_ID);
+    const order = paperOrder({
+      paperOrderId: "policy-panic-manual-order",
+      selectedLaneId: `CG_VARIANT_MATRIX:${TEST_LANE_VARIANT_ID}`,
+      direction: "LONG",
+      symbol: "ETHUSDT",
+      regime: "Bullish expansion",
+      controllerConfidence: null,
+    } as Partial<PaperOrder>);
+    expect(manualEngine.isManualEntryAllowedForPaper(order)).toBe(true); // manual alone would still admit it
+    const isEligible = buildIsPaperOrderLiveEligible({
+      liveConfig: makeConfig({ env: "testnet" }),
+      getUnifiedOrchestrator: () => null,
+      getLiveEngine: () => manualEngine,
+      getVariantMatrixStore: () => store,
+      getCanonicalMarketRegimeSnapshot: () => ({
+        ...canonicalSnapshotFixture("BULLISH"),
+        overlays: { ...canonicalSnapshotFixture("BULLISH").overlays, panic: true },
+      }),
+    });
+    expect(isEligible(order)).toBe(false);
   });
 });

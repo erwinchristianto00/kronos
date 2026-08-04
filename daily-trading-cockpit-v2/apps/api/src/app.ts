@@ -1,5 +1,5 @@
 import Fastify, { type FastifyInstance } from "fastify";
-import { DECISION_PIPELINE_POLICY_VERSION } from "@dtc/shared";
+import { DECISION_PIPELINE_POLICY_VERSION, completedCandles } from "@dtc/shared";
 import { BinanceClient } from "./lib/binance.js";
 import { HttpKronosClient } from "./lib/kronos.js";
 import { HttpForecastChallengerClient } from "./lib/forecast-challenger.js";
@@ -139,6 +139,18 @@ import {
   type CEBucket,
 } from "./lib/composite-estimator-edge.js";
 import { computeExternalManagedNetQty, computeNotionalPerSymbol, maxNotionalPerSymbolAcrossLanes, computeClusterOpenSymbols, maxClusterPositionsAcrossLanes, isNewExecutorLaneAllowed, newExecutorLaneGate, rollingNetEntryHealth, sumExternalRealizedPnlUsd } from "./lib/live-executor-wiring.js";
+import {
+  AccountExposureCoordinator,
+  AccountExposureReservationStore,
+  reservationReconcileIntervalMs,
+} from "./lib/account-exposure-coordinator.js";
+import {
+  loadInnovationCampaign,
+  innovationCampaignAdmission,
+  computeInnovationExposure,
+  buildInnovationCampaignDiagnostics,
+  type InnovationCampaignDiagnostics,
+} from "./lib/innovation-campaign.js";
 import { clusterOf } from "./lib/correlation-clusters.js";
 import { RegimeAutopilot, isRegimeAutopilotEnabled } from "./lib/regime-autopilot.js";
 import { getRegimeEngineStore } from "./lib/regime-engine-service.js";
@@ -150,6 +162,7 @@ import {
   parseLiveExecutionConfig,
   symbolPriorityTier,
   type LiveExecutionConfig,
+  type LiveNewEntryGateDecision,
 } from "./lib/live-execution-engine.js";
 import { getLaneSymbolCurationCacheStore } from "./lib/lane-symbol-curation-cache.js";
 import type { LaneSymbolCurationTier } from "./lib/per-symbol-lane-book-edge.js";
@@ -171,6 +184,40 @@ import {
   type CurrentGuardVariantMatrixStore,
   variantMatrixOpenSignals,
 } from "./lib/current-guard-variant-matrix.js";
+import {
+  canonicalMarketRegimeExecutionPolicy,
+  edgeMemoryLabelForCanonicalFamily,
+  type CanonicalMarketRegimeSnapshot,
+} from "./lib/canonical-market-regime-execution-policy.js";
+// 2026-08 canonical-market-regime rollout — canonical-market-regime-engine.ts (requirement #3) has
+// now landed. `getCanonicalMarketRegimeSnapshot` is its THE non-nullable public getter (kill-switch
+// -> ENGINE_DISABLED degraded snapshot; otherwise the store's own `latest` if one has ever been
+// recorded, else a cold-start degraded snapshot — never null/undefined). Aliased on import solely to
+// avoid shadowing the shared `getCanonicalMarketRegimeSnapshot` closure buildApp() itself defines
+// below (which every execution-affecting consumer in this file calls) — that closure's only job is
+// to delegate to this real accessor now that it exists; see its own doc comment for why the
+// indirection is kept even though it is currently a single pass-through. The engine's own real
+// `CanonicalMarketRegimeSnapshot` (canonical-market-regime-engine.ts) is a strict field-superset of
+// this file's imported structural-mirror type of the same name (two extra fields,
+// `enterCandidate`/`enterCandidateCycles`, that no consumer in this file reads) — every field the
+// mirror declares matches the real type exactly, so a real snapshot satisfies the mirror structurally
+// with zero adapter code, exactly as canonical-market-regime-execution-policy.ts's own header
+// predicted.
+import { getCanonicalMarketRegimeSnapshot as getLatestCanonicalMarketRegimeEngineSnapshot } from "./lib/canonical-market-regime-engine.js";
+import {
+  ingestCanonicalMarketRegimeRawObservations,
+  recordCanonicalMarketRegimeSnapshot,
+  getCanonicalMarketRegimeSnapshotStore,
+} from "./lib/canonical-market-regime-engine.js";
+import { resolveCanonicalMarketRegimeUniverse } from "./lib/canonical-market-regime-universe.js";
+// 2026-08 canonical-market-regime scheduler wiring fix — see canonical-market-regime-scheduler.ts's own
+// header for why this file (not canonical-market-regime-engine.ts/-universe.ts, both of which
+// explicitly defer cadence scheduling + the impure fetch shell to "a later wiring stage") owns the
+// ingest -> compute -> record orchestration cycle. Call site is right after `liveEngine.start()` below.
+import {
+  runCanonicalMarketRegimeEngineCycleGuarded,
+  CANONICAL_MARKET_REGIME_ENGINE_TICK_INTERVAL_MS,
+} from "./lib/canonical-market-regime-scheduler.js";
 import { getLatestScanCandidates } from "./lib/latest-scan-candidates-cache.js";
 import { kronosAgreeFromScan } from "./lib/kronos-agree-reading.js";
 import { getKronosBtcAnchorCache, refreshKronosBtcAnchor } from "./lib/kronos-btc-anchor-cache.js";
@@ -214,7 +261,7 @@ import { attachExecutiveReviewToExactPaperOrder } from "./lib/executive-review-a
 import { markTerminalExecutiveReviewsTier2Only } from "./lib/executive-review-runtime.js";
 import { MarketContextSnapshotStore } from "./lib/market-context-snapshot-store.js";
 import { fourBrainMode } from "./lib/four-brain-types.js";
-import { getBtcAtrPercentileCacheStore, refreshBtcAtrPercentileCache } from "./lib/btc-atr-percentile-cache.js";
+import { getBtcAtrPercentileCacheStore, refreshBtcAtrPercentileCache, BTC_ATR_PERCENTILE_SYMBOL, BTC_ATR_PERCENTILE_INTERVAL, BTC_ATR_PERCENTILE_CANDLES_NEEDED } from "./lib/btc-atr-percentile-cache.js";
 import { buildLiveBestLaneReportForDirection } from "./lib/four-brain-best-lane-report.js";
 import { getLiveMarkPriceCacheStore, refreshLiveMarkPriceCache } from "./lib/live-mark-price-cache.js";
 import { CORTEX_LANE_ROSTER, gatherCortexContext, normalizeCortexStaticWeightPctForLane } from "./lib/cortex-live-gather.js";
@@ -235,7 +282,6 @@ import {
 } from "./lib/lane-selector-v2.js";
 import {
   buildRegimeRotationShortlistReport,
-  rotationRegimeFamilyForLabel,
   rotationShortlistDecision,
   rotationShortlistFamilyHasSymbols,
 } from "./lib/regime-rotation-shortlist.js";
@@ -424,6 +470,18 @@ export interface IsPaperOrderLiveEligibleDeps {
   getUnifiedOrchestrator: () => UnifiedTestnetOrchestrator | null;
   getLiveEngine: () => LiveExecutionEngine | null;
   getVariantMatrixStore: () => CurrentGuardVariantMatrixStore;
+  /**
+   * 2026-08 canonical-market-regime redirect: the live canonical snapshot this function's step 3
+   * (regimeFamily) and new step 4b (the canonical regime-policy block) both read. Matches the
+   * existing getter pattern (`getVariantMatrixStore`, `getUnifiedOrchestrator`, `getLiveEngine`) —
+   * a getter, not a plain value, for the same reason those are: buildApp() wires this from a
+   * singleton/accessor that may not be fully constructed yet at the moment this factory itself
+   * runs. Nullable defensively (the real accessor's own contract never actually returns null — see
+   * canonical-market-regime-engine.ts's `getCanonicalMarketRegimeSnapshot`) — canonicalMarketRegimeExecutionPolicy
+   * treats null as blocked, never as allowed-by-default (see that module's own header), so a future
+   * caller passing null by mistake can never silently widen eligibility.
+   */
+  getCanonicalMarketRegimeSnapshot: () => CanonicalMarketRegimeSnapshot | null;
 }
 
 /**
@@ -453,12 +511,29 @@ export interface IsPaperOrderLiveEligibleDeps {
  *      from VARIANT_MATRIX_DEFINITIONS (it is a separate OOS forward test, not a variant-matrix
  *      lane) and would always fail the proof gate if judged against one.
  *   3. laneVariantId / orderEstimatedRegime / regimeFamily / exactContext / contextProof — computed
- *      once, up front, from `order` (and the report) alone.
+ *      once, up front, from `order` (and the report) alone. 2026-08 canonical-market-regime
+ *      redirect: `regimeFamily` now comes from a live lookup of `deps.getCanonicalMarketRegimeSnapshot()`
+ *      instead of being re-derived from the frozen `order.regime` string (producer A). See the code
+ *      comment at this step's own definition below for the full rationale; `orderEstimatedRegime`
+ *      itself is UNCHANGED and still computed the same way, since steps 8/9 still read its
+ *      `.direction` field, not `regimeFamily`.
  *   4. hasExactContextReadinessProof(contextProof) — the hard existence boundary. Computed and
  *      checked ONCE; nothing below recomputes exactContext/contextProof.
- *   5. isManualEntryAllowedForPaper — now gated behind step 4, so manual mode still bypasses
- *      maturity/book/regime-policy blockers (its own, narrower job) but can never bypass proof
- *      EXISTENCE.
+ *  4b. 2026-08 canonical-market-regime addition (requirement #8): `canonicalMarketRegimeExecutionPolicy`
+ *      — an ADDITIONAL, independent AND-ed gate (LOW_COVERAGE/PANIC), never a replacement for step 4
+ *      or anything below. Deliberately placed BEFORE step 5 (manual entry): unlike step 5's
+ *      "regime-policy blockers" reference below (which is the PRE-EXISTING step 8 MIXED-NEARUSDT
+ *      check, still bypassed by manual mode exactly as before), THIS new block is NOT bypassable by
+ *      manual mode — a manually-selected entry must not be able to open through a market-wide PANIC
+ *      or data-quality blackout the automated paths already refuse, mirroring how armed/killed/drain
+ *      inside canOpenNewEntries() also has no manual-mode exemption. This is a real, intentional
+ *      behavior change (an operator's manual override can now be blocked here where it previously
+ *      could not), not a silent side effect. This block never itself checks
+ *      armed/kill/drain/caps/reconciliation/exchange-filters/protective-exits — see
+ *      canonical-market-regime-execution-policy.ts's own header for that boundary.
+ *   5. isManualEntryAllowedForPaper — now gated behind steps 4 AND 4b, so manual mode still bypasses
+ *      the PRE-EXISTING step 8 MIXED-regime/NEARUSDT lane-book restriction (its own, narrower job)
+ *      but can never bypass proof EXISTENCE (step 4) or the new canonical regime-policy block (4b).
  *   6. useTestnetPolicy / manuallySelected — pure, unchanged.
  *   7. realtime-short lane-id gate — unchanged.
  *   8. MIXED-regime NEARUSDT block — unchanged.
@@ -474,12 +549,16 @@ export interface IsPaperOrderLiveEligibleDeps {
  * maturityEligible/rotation computation as before, fed the exact same values. The only behavior
  * changes are: (a) manual entry (and, incidentally, force/rotation/unproven-override, which already
  * ran after this gate) can no longer proceed against a context with zero genuine exact-axis-proof
- * observations — see hasExactContextReadinessProof's own doc comment for gap #2; and (b) a
+ * observations — see hasExactContextReadinessProof's own doc comment for gap #2; (b) a
  * manually-selected PROFIT_CORE_SHORT_TRAIL order outside testnet+SHORT — previously admissible via
  * the manual override, since isManualEntryAllowedForPaper itself checks neither `liveConfig.env` nor
  * direction against that lane's own restriction — can no longer be, because isProfitCoreShortLaneId's
- * unconditional check now runs before the manual check for that lane id specifically. Both (a) and
- * (b) are direct, intended consequences of the required ordering above, not incidental ones.
+ * unconditional check now runs before the manual check for that lane id specifically; and (c), new
+ * this round, manual entry (and force/rotation/unproven-override) can no longer proceed while the
+ * canonical regime engine reports LOW_COVERAGE or PANIC (step 4b) — this is a materially larger
+ * blast radius than (a)/(b) since it can block ANY lane/context/override, not just unproven ones,
+ * whenever the market-wide snapshot itself is untrustworthy or in a declared panic. (a), (b), and
+ * (c) are direct, intended consequences of the required ordering above, not incidental ones.
  */
 export function buildIsPaperOrderLiveEligible(
   deps: IsPaperOrderLiveEligibleDeps,
@@ -511,17 +590,25 @@ export function buildIsPaperOrderLiveEligible(
     // hasExactContextReadinessProof's own doc comment for the freshValid>0 requirement).
     const report = buildCurrentGuardVariantMatrixReport(deps.getVariantMatrixStore());
     const laneVariantId = order.selectedLaneId.split(":").pop() ?? order.selectedLaneId;
+    // orderEstimatedRegime is STILL computed here, unchanged — step 8's MIXED-NEARUSDT block and
+    // step 9's forceEligibleForDirection/authorizedLongWideOverride read orderEstimatedRegime.direction,
+    // not regimeFamily, and must keep doing so unchanged (see this function's own top-of-file doc).
     const orderEstimatedRegime = estimateLaneSelectorV2Regime({
       regime: order.regime,
       controllerMode: order.controllerMode,
       confidence: order.controllerConfidence ?? null,
     });
-    const regimeFamily =
-      orderEstimatedRegime.direction === "LONG"
-        ? "BULLISH"
-        : orderEstimatedRegime.direction === "SHORT"
-          ? "BEARISH"
-          : rotationRegimeFamilyForLabel(order.regime);
+    // 2026-08 canonical-market-regime redirect: regimeFamily now comes from a LIVE lookup of the
+    // canonical engine's snapshot at evaluation time, not a re-derivation of the FROZEN order.regime
+    // string (producer A, stamped once at order-creation — routes/scan.ts's `regime:
+    // result.marketRegime` — order.regime itself is untouched and still stored for history/display).
+    // estimateLaneSelectorV2Regime/rotationRegimeFamilyForLabel are no longer called for
+    // regime-FAMILY purposes here (rotationRegimeFamilyForLabel is no longer called at all in this
+    // function); orderEstimatedRegime.direction above is a separate, still-legitimate use. A
+    // missing/never-ticked snapshot resolves to "UNKNOWN" — never a silent fallback to any real
+    // family — which structurally fails exactLaneContextFor below (it has no UNKNOWN branch),
+    // matching this whole rollout's fail-closed discipline.
+    const regimeFamily = deps.getCanonicalMarketRegimeSnapshot()?.regimeFamily ?? "UNKNOWN";
     const exactContext = exactLaneContextFor(order.direction, regimeFamily);
     const contextProof = laneStatusForContext(
       report,
@@ -529,12 +616,29 @@ export function buildIsPaperOrderLiveEligible(
       exactContext,
     );
     if (!hasExactContextReadinessProof(contextProof)) return false;
+    // 2026-08 canonical-market-regime addition (requirement #8) — see this function's own
+    // top-of-file doc, step 4b. An ADDITIONAL, independent AND-ed gate, never a replacement for the
+    // proof-existence check above or anything below. Placed here (before manual-entry) deliberately:
+    // a manually-selected entry must not be able to bypass a market-wide PANIC or LOW_COVERAGE
+    // blackout the automated paths already refuse — mirrors how armed/killed/drain inside
+    // canOpenNewEntries() also has no manual-mode exemption. This check never itself reads
+    // armed/kill/drain/caps/reconciliation/exchange-filters/protective-exits — see
+    // canonical-market-regime-execution-policy.ts's own header for that boundary; it can only ADD
+    // restriction on top of whatever those (unrelated, untouched) gates already decided elsewhere.
+    const canonicalRegimeDecision = canonicalMarketRegimeExecutionPolicy({
+      snapshot: deps.getCanonicalMarketRegimeSnapshot(),
+      nowMs: Date.now(),
+    });
+    if (!canonicalRegimeDecision.allowed) return false;
     // Operator manual directional mode is a narrow admission override: it may bypass maturity,
     // book, and regime-policy blockers only for the currently selected Entry Decision side and
     // explicitly selected lane. The engine still enforces freshness, geometry, caps, and all
     // exchange/account safety before it can open anything. Runs AFTER the exact-context proof gate
     // above: manual entry must never admit an order for a lane x context with no real,
-    // exact-axis-proof observations at all.
+    // exact-axis-proof observations at all. ("regime-policy blockers" here refers to the PRE-
+    // EXISTING step 8 MIXED-NEARUSDT check further below, which manual mode still bypasses exactly
+    // as before — NOT the new canonical regime-policy block just above, which manual mode can never
+    // bypass; see step 4b's own comment.)
     if (liveEngine?.isManualEntryAllowedForPaper(order)) return true;
     const useTestnetPolicy =
       liveConfig.env === "testnet" ||
@@ -604,6 +708,84 @@ export function buildIsPaperOrderLiveEligible(
       return false;
     }
     return maturityEligible;
+  };
+}
+
+export interface UnifiedRegimeEntryGateDeps {
+  getUnifiedOrchestrator: () => UnifiedTestnetOrchestrator | null;
+  /**
+   * 2026-08 canonical-market-regime redirect: the live canonical snapshot this gate now consults
+   * instead of regime-engine-service's own snapshot store. Matches the exact getter-pattern
+   * `IsPaperOrderLiveEligibleDeps.getCanonicalMarketRegimeSnapshot` already uses above — in
+   * production buildApp() wires BOTH from the SAME single shared accessor
+   * (`getCanonicalMarketRegimeSnapshot`, defined once inside buildApp()), never two independently
+   * duplicated placeholders that could silently drift apart.
+   */
+  getCanonicalMarketRegimeSnapshot: () => CanonicalMarketRegimeSnapshot | null;
+  /** Injectable for tests; defaults to the real `process.env` (same convention
+   *  `isInnovationTestnetExecutionEnabled`'s own `env` parameter already uses). */
+  env?: NodeJS.ProcessEnv;
+}
+
+/**
+ * 2026-08 canonical-market-regime rollout — extracted, testable body of the master
+ * `unifiedRegimeEntryGate` closure buildApp() wires as `newEntryGate` into LiveExecutionEngine. This
+ * IS the shared master gate underneath `canOpenNewEntries()` /
+ * `canOpenNewEntriesIgnoringManualDirectional()` — LiveExecutionEngine's own paper mirror
+ * (`mirrorNewSignals` starts `if (!this.canOpenNewEntries()) return;`), SingleSymbolLaneExecutor
+ * (via `newExecutorLaneGate` -> `engine.canOpenNewEntries()`, live-executor-wiring.ts), CrossSectionalExecutor
+ * (MARKET_NEUTRAL and the admission-independent TREND/MIXED variants), and every innovation testnet
+ * executor all inherit whatever this function decides — changing it here propagates to all of them
+ * automatically, with no per-lane code change required.
+ *
+ * Extracted (mirroring `buildIsPaperOrderLiveEligible`'s own precedent immediately above, for the
+ * identical reason) because this closure used to be defined ONLY inline inside buildApp() —
+ * unexported and untested; no test file has ever referenced it by name. The hard rule that every fix
+ * needs a fail-without/pass-with test cannot be met against an inline closure with no way to
+ * construct it against hand-built fixtures, so this stage extracts it the same way: byte-identical
+ * logic, same free variables now passed as `deps`. buildApp() below calls
+ * `buildUnifiedRegimeEntryGate({...})` with its own live singletons/getters and wires the returned
+ * zero-arg closure exactly where the inline version used to sit
+ * (`newEntryGate: unifiedRegimeEntryGate`), unchanged in every observable way.
+ *
+ * 2026-08 canonical-market-regime redirect (this round's actual behavior change): the body used to
+ * read regime-engine-service's OWN snapshot store (`getRegimeEngineStore().snapshots`) directly —
+ * staleness against `LIVE_REGIME_GATE_MAX_AGE_MS` and an `action === "NO_TRADE"` check. It now
+ * consults the ONE canonical engine's shared `canonicalMarketRegimeExecutionPolicy` decision instead,
+ * so there is genuinely one provider gating entries, not two independent ones that could disagree.
+ * regime-engine-service.ts, detectRegime.ts, and regime-autopilot.ts are completely untouched by this
+ * redirect — regime-engine-service.ts keeps recording its own snapshots exactly as before
+ * (RegimeAutopilot still reads them for lane-ALLOCATION weighting, unchanged, out of scope this
+ * round); this call site simply stops READING them for the entry-eligibility decision, which
+ * incidentally makes that module's own "report-only, never wired to execution" header comment
+ * accurate again rather than aspirational.
+ *
+ * The two existing escape hatches (`LIVE_REGIME_NO_TRADE_OVERRIDE=1`,
+ * `REGIME_ENGINE_EXECUTION_GATE_ENABLED=0`) keep their exact names/positions/semantics, still
+ * short-circuiting BEFORE the (now-redirected) canonical-regime check — an operator relying on
+ * either today sees no behavior change from this redirect.
+ */
+export function buildUnifiedRegimeEntryGate(
+  deps: UnifiedRegimeEntryGateDeps,
+): () => LiveNewEntryGateDecision {
+  return () => {
+    const unifiedOrchestrator = deps.getUnifiedOrchestrator();
+    if (unifiedOrchestrator?.isEnabled() && !unifiedOrchestrator.canOpenNewEntries()) {
+      const status = unifiedOrchestrator.getStatus();
+      return {
+        allowed: false,
+        reason: `unified orchestrator ${status.brainState}: ${status.lastTrace?.reason ?? "direction not confirmed"}`,
+      };
+    }
+    const env = deps.env ?? process.env;
+    if (env.LIVE_REGIME_NO_TRADE_OVERRIDE === "1" || env.REGIME_ENGINE_EXECUTION_GATE_ENABLED === "0") {
+      return { allowed: true, reason: null };
+    }
+    const decision = canonicalMarketRegimeExecutionPolicy({
+      snapshot: deps.getCanonicalMarketRegimeSnapshot(),
+      nowMs: Date.now(),
+    });
+    return { allowed: decision.allowed, reason: decision.reason };
   };
 }
 
@@ -749,6 +931,24 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
   // real-money 3103 even if an innovation flag is accidentally copied there.
   const innovationBasketExecutors: CrossSectionalExecutor[] = [];
   const innovationSingleSymbolExecutors: SingleSymbolLaneExecutor[] = [];
+  // Fail-closed campaign control (see innovation-campaign.ts). Unconditional so diagnostics work
+  // even when the gate below never fires (mainnet, or INNOVATION_TESTNET_EXEC_DISABLED=1) — same
+  // reasoning as allCrossSectionalLaneExecutors() below being safe to reference before any
+  // executor is constructed: these closures are only ever CALLED during a tick or an HTTP
+  // request, well after every executor below has been constructed and assigned. Engine-agnostic
+  // by design — only innovationAllowed() inside the gate further below ANDs in the engine's own
+  // canOpenNewEntriesIgnoringManualDirectional(); this pair never references liveEngine at all.
+  const innovationCampaignAdmissionForLane = (laneId: string): { allowed: boolean; reason: string | null } =>
+    innovationCampaignAdmission(
+      loadInnovationCampaign("data", "innovation-campaign.json"),
+      laneId,
+      computeInnovationExposure(innovationBasketExecutors, innovationSingleSymbolExecutors),
+    );
+  const innovationCampaignSnapshot = (): InnovationCampaignDiagnostics =>
+    buildInnovationCampaignDiagnostics(
+      loadInnovationCampaign("data", "innovation-campaign.json"),
+      computeInnovationExposure(innovationBasketExecutors, innovationSingleSymbolExecutors),
+    );
   let regimeAutopilot: RegimeAutopilot | null = null;
   let unifiedOrchestrator: UnifiedTestnetOrchestrator | null = null;
   let unifiedProposalStore: UnifiedTestnetProposalStore | null = null;
@@ -950,7 +1150,17 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     const ensureCachedPositions = (): { at: number; promise: ReturnType<typeof liveClient.getPositions> } => {
       const now = Date.now();
       if (!cachedPositions || now - cachedPositions.at > 30_000) {
-        cachedPositions = { at: now, promise: liveClient.getPositions() };
+        const promise = liveClient.getPositions();
+        // Piggyback the account-exposure coordinator's manual/external-position snapshot onto this
+        // SAME promise — ZERO new Binance calls (see AccountExposureCoordinator.updatePositionSnapshot's
+        // doc comment). Attached only here, at the point a NEW promise is created, not on every
+        // ensureCachedPositions() call within the 30s window — every other consumer below still reads
+        // this identical, unmodified promise. exposureCoordinator is declared further below (same
+        // forward-reference-by-closure pattern already used throughout this function, e.g.
+        // allCrossSectionalLaneExecutors reading `let crossSectionalExecutor` before it is assigned) —
+        // safe because this closure is never CALLED until well after that const has been initialized.
+        promise.then((positions) => exposureCoordinator.updatePositionSnapshot(positions)).catch(() => {});
+        cachedPositions = { at: now, promise };
       }
       return cachedPositions;
     };
@@ -1013,30 +1223,85 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       timelineExitGate: (symbol: string, direction: "LONG" | "SHORT") =>
         singleSymbolPriceTimeline?.exitGate(symbol, direction) ?? Promise.resolve({ shouldExit: false, reason: null }),
     };
-    const unifiedRegimeEntryGate = () => {
-      if (unifiedOrchestrator?.isEnabled() && !unifiedOrchestrator.canOpenNewEntries()) {
-        const status = unifiedOrchestrator.getStatus();
-        return {
-          allowed: false,
-          reason: `unified orchestrator ${status.brainState}: ${status.lastTrace?.reason ?? "direction not confirmed"}`,
-        };
-      }
-      if (process.env.LIVE_REGIME_NO_TRADE_OVERRIDE === "1" || process.env.REGIME_ENGINE_EXECUTION_GATE_ENABLED === "0") {
-        return { allowed: true, reason: null };
-      }
-      const snapshots = getRegimeEngineStore().snapshots;
-      const latest = snapshots.length > 0 ? snapshots[snapshots.length - 1]! : null;
-      if (!latest) return { allowed: false, reason: "regime engine has no snapshot" };
-      const ageMs = Date.now() - new Date(latest.at).getTime();
-      const maxAgeMs = Math.max(60_000, Number(process.env.LIVE_REGIME_GATE_MAX_AGE_MS) || 20 * 60_000);
-      if (!Number.isFinite(ageMs) || ageMs > maxAgeMs) {
-        return { allowed: false, reason: `regime engine snapshot stale (${Math.round(ageMs / 1000)}s)` };
-      }
-      if (latest.action === "NO_TRADE") {
-        return { allowed: false, reason: `regime engine NO_TRADE${latest.rejectedBy ? ` (${latest.rejectedBy})` : ""}` };
-      }
-      return { allowed: true, reason: null };
+    // Shared account-exposure coordinator (account-exposure-coordinator.ts) — the reserve-then-
+    // commit-then-release capacity ledger for EVERY SingleSymbolLaneExecutor/CrossSectionalExecutor
+    // real exchange-entry path, mainnet AND innovation-testnet lanes alike. Constructed ONCE here,
+    // alongside entrySymbolsInFlight/cachedPositions above — same "one shared instance, spread into
+    // every constructor call site" pattern as singleSymbolEntryClaims/sharedGetPositions.
+    const exposureCoordinator = new AccountExposureCoordinator({
+      store: new AccountExposureReservationStore("data", "account-exposure-reservations.json"),
+      // Same shared closures every other cross-lane exposure accessor above already reuses (see
+      // notionalForSymbolExcluding/clusterOpenSymbolsExcluding) — never a second, independently
+      // maintained executor list.
+      getSingleSymbolExecutors: allSingleSymbolLaneExecutors,
+      getCrossSectionalExecutors: allCrossSectionalLaneExecutors,
+      // Optional; the legacy mirror's own open intents (S3 in the coordinator's own doc comment).
+      // liveEngine is assigned further below — this closure is only ever called during a tick, well
+      // after that assignment has run (same forward-reference pattern as unifiedRegimeEntryGate and
+      // every isAllowed gate below that reads `engineForGate`/`liveEngine`).
+      getLegacyMirrorOpenIntents: () => liveEngine?.getStatus().openIntents ?? [],
+      // Restart/staleness reconciliation join key lookup (see binance-futures-private.ts's
+      // queryOrderByClientId doc comment) — reuses the SAME signed client every executor below
+      // shares, never a second HTTP path.
+      queryOrderByClientId: liveClient.queryOrderByClientId.bind(liveClient),
+    });
+    // Spread into every SingleSymbolLaneExecutor AND CrossSectionalExecutor constructor call below
+    // (mainnet and innovation-testnet alike) — same spread-object convention as singleSymbolEntryClaims.
+    // .bind() (not a wrapper closure) so each function keeps the coordinator's own exact signature.
+    const sharedExposureReservation = {
+      reserveExposure: exposureCoordinator.reserve.bind(exposureCoordinator),
+      commitExposureReservation: exposureCoordinator.commitReservation.bind(exposureCoordinator),
+      releaseExposureReservation: exposureCoordinator.releaseReservation.bind(exposureCoordinator),
     };
+    if (!isTest) {
+      // One-time restart reconciliation, then the SAME routine again on a recurring timer — see
+      // reconcileStaleReservations' doc comment for why these are deliberately unified rather than
+      // two separate mechanisms. Gated identically to every other interval in this file.
+      void exposureCoordinator.reconcileOnStartup();
+      setInterval(() => void exposureCoordinator.reconcileStaleReservations(), reservationReconcileIntervalMs());
+    }
+    // 2026-08 canonical-market-regime rollout — the ONE shared accessor for the canonical engine's
+    // snapshot. canonical-market-regime-engine.ts (requirement #3 of this rollout) now exists and
+    // exports its own non-nullable `getCanonicalMarketRegimeSnapshot` (imported above as
+    // `getLatestCanonicalMarketRegimeEngineSnapshot`). EVERY execution-affecting consumer of the
+    // canonical regime — unifiedRegimeEntryGate below, edgeVeto's regime-string source (both call
+    // sites, including the REGIME_EDGE_MEMORY vote inside tickUnifiedOrchestrator),
+    // CrossSectionalExecutor MARKET_NEUTRAL's entryHealthGate, innovationTestnetAdmissionAllowed's
+    // call site, and IsPaperOrderLiveEligibleDeps.getCanonicalMarketRegimeSnapshot below — calls this
+    // SAME function, never an independently duplicated accessor per call site. This is load-bearing,
+    // not cosmetic: adversarial test I ("all executors receive identical policy for the same
+    // snapshot") is only a meaningful check of genuinely shared wiring if there is exactly one
+    // accessor, not several copies that happen to agree today. It also means any future change to
+    // HOW the live snapshot is obtained (e.g. adding caching, a different store path) is a one-line
+    // change here, not a hunt across 6 call sites.
+    //
+    // UPDATE (2026-08, deployment-scope-gap fix) — this reconnection ALONE used to not make the engine
+    // "live": until this fix, nothing in the codebase called `ingestCanonicalMarketRegimeRawObservations`
+    // / `computeCanonicalMarketRegimeSnapshot` / `recordCanonicalMarketRegimeSnapshot` on any cadence
+    // (grepped repo-wide; confirmed absent outside canonical-market-regime-engine.ts's own test and
+    // canonical-market-regime-calibration.ts's offline replay tooling), so
+    // `getLatestCanonicalMarketRegimeEngineSnapshot()` could only ever resolve to its cold-start
+    // degraded default. The impure fetch shell (BinanceClient candles + getFuturesFlow), universe
+    // resolution, and cadence scheduling were explicitly out of scope for
+    // canonical-market-regime-engine.ts itself (see that file's own header, "STAGE 4" section:
+    // "Deliberately NOT in this stage... left for a genuinely separate, later wiring stage") — that
+    // later stage now exists: `runCanonicalMarketRegimeEngineCycleGuarded` is registered on a
+    // setInterval right after `liveEngine.start()` below (see that call site's own comment for the
+    // full wiring). Once deployed, a healthy tick replaces the degraded default with a real snapshot;
+    // until then (not-yet-deployed, first-tick-still-pending, or the engine explicitly disabled via
+    // CANONICAL_MARKET_REGIME_ENGINE_DISABLED), this accessor still resolves to
+    // `degradedLowCoverageSnapshot(...)` — the SAME safe, fail-closed, all-new-entries-blocked behavior
+    // the original `() => null` stub produced (canonicalMarketRegimeExecutionPolicy treats both
+    // identically: null snapshot -> blocked; a non-null but LOW_COVERAGE snapshot -> also blocked). DO
+    // NOT replace this with anything that could ever resolve to an allowed-by-default decision (e.g.
+    // an `?? { allowed: true }`-shaped fallback) — a missing/cold-start/disabled engine must only ever
+    // narrow eligibility.
+    const getCanonicalMarketRegimeSnapshot = (): CanonicalMarketRegimeSnapshot | null =>
+      getLatestCanonicalMarketRegimeEngineSnapshot();
+    const unifiedRegimeEntryGate = buildUnifiedRegimeEntryGate({
+      getUnifiedOrchestrator: () => unifiedOrchestrator,
+      getCanonicalMarketRegimeSnapshot,
+    });
     const unifiedEnabled = isUnifiedTestnetOrchestratorEnabled(
       process.env,
       liveConfig.env === "testnet" ? "testnet" : "mainnet",
@@ -1149,6 +1414,23 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         getUnifiedOrchestrator: () => unifiedOrchestrator,
         getLiveEngine: () => liveEngine,
         getVariantMatrixStore: () => getCurrentGuardVariantMatrixStore(),
+        // 2026-08 canonical-market-regime redirect: wired to the SAME shared
+        // `getCanonicalMarketRegimeSnapshot` accessor defined once above (see its own doc comment
+        // right before `unifiedRegimeEntryGate`) — every other execution-affecting consumer this
+        // round (unifiedRegimeEntryGate, edgeVeto's two call sites, CrossSectionalExecutor
+        // MARKET_NEUTRAL's entryHealthGate, innovationTestnetAdmissionAllowed's call site) reads the
+        // exact same function, never an independently duplicated placeholder. It resolves to a real
+        // canonical-market-regime-engine.ts snapshot now that module exists, but that snapshot is
+        // still always the cold-start `degradedLowCoverageSnapshot(...)` (LOW_COVERAGE, regimeFamily
+        // forced MIXED-then-UNKNOWN-mapped as applicable) until a later, separate wiring stage adds
+        // the live ingestion cadence (see the shared accessor's own doc comment above for why).
+        // canonicalMarketRegimeExecutionPolicy treats both a null AND a LOW_COVERAGE snapshot as
+        // blocked, and a missing/degraded regimeFamily read here resolves to "UNKNOWN", which
+        // structurally fails exactLaneContextFor (step 3) — so this deliberately narrows paper->live
+        // eligibility rather than silently widening it while the engine has not yet ticked. The day
+        // that ingestion cadence lands, this accessor starts returning real market-derived snapshots
+        // with zero further changes to this call site or any of the other 5.
+        getCanonicalMarketRegimeSnapshot,
       }),
       getControllerSnapshot: () => {
         const cached = getLatestScanCandidates();
@@ -1272,7 +1554,19 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       // so it can only ever block a demonstrated loser, never become a new blanket gate. Uses the same
       // regime string the brain's primaryDirection is derived from (controller.regime), so they agree.
       if (primaryDirection === "LONG" || primaryDirection === "SHORT") {
-        const regimeForEdge = controller?.regime ?? null;
+        // 2026-08 canonical-market-regime redirect: regime SOURCE only — every line below in this
+        // block (mem.verdict/hasPositiveLane/the veto vote push) is byte-identical; `controller`
+        // itself and every OTHER field read off it elsewhere in this function (mode, bias,
+        // confidence, convictionScore, gradedConfidence, estimatedRegime, reasons, capturedAt) are
+        // completely unaffected — only this one local variable's source changes, from the live
+        // producer-A read (controller.regime) to the canonical engine's regimeFamily mapped onto the
+        // SAME three edge-memory buckets producer A's free-text already landed in (see
+        // edgeMemoryLabelForCanonicalFamily's doc comment, verified directly against the real
+        // regime-edge-memory.ts normalizeRegimeFamily by
+        // canonical-market-regime-execution-policy.test.ts).
+        const regimeForEdge = edgeMemoryLabelForCanonicalFamily(
+          getCanonicalMarketRegimeSnapshot()?.regimeFamily ?? "UNKNOWN",
+        );
         if (regimeForEdge && regimeForEdge.trim().length > 0) {
           const edgeMem = getRegimeEdgeMemory();
           const edgeV = edgeMem.verdict(regimeForEdge, primaryDirection);
@@ -1528,20 +1822,38 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     // executors (a per-direction veto would break their long/short hedge invariant). Fails OPEN on
     // a missing/blank regime — it protects, it does not become a new blanket gate. Uses the SAME
     // regime string the live engine's own controller snapshot reads, so the two never disagree.
-    const currentRegimeStringForVeto = (): string | null => {
-      const cached = getLatestScanCandidates();
-      const scanStatus = coreScanAutoRefreshController.getStatus();
-      const fallbackSnapshot =
-        cached || scanStatus.lastAutoRefreshResultSummary
-          ? null
-          : getRegimeDirectionControllerSnapshotStore().readLatest();
-      return (
-        cached?.marketRegime ??
-        scanStatus.lastAutoRefreshResultSummary?.marketRegime ??
-        fallbackSnapshot?.currentRegime ??
-        null
-      );
-    };
+    //
+    // 2026-08 canonical-market-regime redirect: `currentRegimeStringForVeto` used to read the LIVE
+    // producer-A regime string (scan cache -> auto-refresh summary -> regime-direction-controller
+    // snapshot fallback, exactly like `getControllerSnapshot` above). It now returns the canonical
+    // engine's regimeFamily mapped onto the SAME three edge-memory buckets producer A's free-text
+    // already landed in (see `edgeMemoryLabelForCanonicalFamily`'s doc comment, verified directly
+    // against the real regime-edge-memory.ts `normalizeRegimeFamily` by
+    // canonical-market-regime-execution-policy.test.ts). `edgeVeto` itself below (the
+    // mem.verdict(...)/hasPositiveLane(...) logic) is BYTE-IDENTICAL — only this string source
+    // changes.
+    //
+    // Note on the "fails OPEN on a missing/blank regime" line immediately below: with the shared
+    // accessor now reconnected to the real (if still perpetually cold-start, pending a future
+    // ingestion-cadence stage) engine, `getCanonicalMarketRegimeSnapshot()` is NEVER null anymore —
+    // `degradedLowCoverageSnapshot()` forces `regimeFamily: "MIXED"` (requirement #5), which
+    // `edgeMemoryLabelForCanonicalFamily` maps to the truthy string "CANONICAL_MIXED_ROTATION", not
+    // null/empty. So this fail-open branch is no longer reached on cold start (it WAS, when the
+    // shared accessor was a `() => null` stub) — `edgeVeto` now genuinely queries
+    // `getRegimeEdgeMemory().verdict("CANONICAL_MIXED_ROTATION", direction)` even during cold start.
+    // This still does not widen anything for the ALLOWED boolean: every direct `.allowed` caller of
+    // `edgeVeto` (every SingleSymbolLaneExecutor `isAllowed` below) is gated behind
+    // `isNewExecutorLaneAllowed`/`newExecutorLaneGate` -> `engine.canOpenNewEntries()` -> the
+    // now-redirected `unifiedRegimeEntryGate`, which blocks FIRST via `&&` short-circuit whenever the
+    // canonical snapshot is LOW_COVERAGE (cold start included) — `edgeVeto(...).allowed` is never
+    // even evaluated for gating while the engine has not ticked. The ONE place this genuinely changes
+    // observable behavior is the REGIME_EDGE_MEMORY vote site below (not gated behind
+    // canOpenNewEntries()): it can now push a real veto vote for "CANONICAL_MIXED_ROTATION" where it
+    // previously silently never fired — but a veto can only ever SUPPRESS a direction, never grant
+    // one, so this is a strictly more-conservative activation, not a widening. See this round's
+    // report for the full reasoning.
+    const currentRegimeStringForVeto = (): string | null =>
+      edgeMemoryLabelForCanonicalFamily(getCanonicalMarketRegimeSnapshot()?.regimeFamily ?? "UNKNOWN");
     const edgeVeto = (direction: "LONG" | "SHORT"): { allowed: boolean; reason: string | null } => {
       const regime = currentRegimeStringForVeto();
       if (!regime || regime.trim().length === 0) return { allowed: true, reason: null }; // fail-open
@@ -1558,6 +1870,60 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       ? (ctx) => unifiedOrchestrator!.legacyExitDecision(ctx)
       : undefined;
     if (!isTest) liveEngine.start();
+
+    // 2026-08 canonical-market-regime scheduler wiring fix (HIGH deployment-scope gap) — the missing
+    // orchestration cycle itself. Before this, ingestCanonicalMarketRegimeRawObservations /
+    // computeCanonicalMarketRegimeSnapshot / recordCanonicalMarketRegimeSnapshot had zero production
+    // callers, so getCanonicalMarketRegimeSnapshot() above could only ever resolve to its cold-start
+    // degraded default. runCanonicalMarketRegimeEngineCycleGuarded (canonical-market-regime-scheduler.ts)
+    // owns the ordering (resolveUniverse -> ingestRawObservations -> fetch BTC candles/per-symbol
+    // funding+OI -> compute -> record), the overlap guard (a module-level single-flight latch — see
+    // that file's own OVERLAP GUARD note for why module-level, not a buildApp()-local `let`, is what
+    // keeps this safe even if buildApp() were somehow invoked twice), and the coarse kill switch
+    // (CANONICAL_MARKET_REGIME_ENGINE_DISABLED, re-checked every cycle before any I/O — same env key
+    // getCanonicalMarketRegimeSnapshot() already honors, not a second flag). This call site only
+    // supplies the real dependencies: `binanceClient` (already used identically for the BTC
+    // ATR-percentile/Kronos-anchor refreshes below) satisfies both CanonicalMarketRegimeUniverseFetchCtx
+    // and the funding/OI/candle fetchers structurally, zero adapter code — mirrors
+    // tlobCollector.collect(binanceClient, ...) below. getPriorSnapshot reads the store's own nullable
+    // `.get()` (never the non-nullable degraded-default accessor above) so a genuine cold start is
+    // never fed into the hysteresis/dedup logic as if it were a real prior cycle. BTC candles are run
+    // through the same completedCandles(...) causal filter the engine's own per-symbol ingestion
+    // applies internally (and refreshBtcAtrPercentileCache applies for this identical BTCUSDT/1h
+    // series) — without it a still-forming hourly bar would repaint riskStress mid-hour. Cadence is
+    // CANONICAL_MARKET_REGIME_ENGINE_TICK_INTERVAL_MS (5 minutes, that module's own doc-comment-stated
+    // constant, matching the engine's own "5-minute tick / 1h-candle cadence" design) — not invented
+    // here. Registration is unconditional under `!isTest` (mirrors cortexShadowTick's own registration
+    // earlier in this function: the coarse kill switch is re-checked INSIDE the guarded cycle every
+    // tick, not at registration time, so no second gate is needed here). Never throws (see that
+    // function's own doc comment); a failed cycle is still logged so a dead engine is visible in the
+    // process logs rather than silently stuck at its degraded default again.
+    const runCanonicalMarketRegimeEngineTick = (): void => {
+      void runCanonicalMarketRegimeEngineCycleGuarded({
+        resolveUniverse: (nowMs) => resolveCanonicalMarketRegimeUniverse({ nowMs, ctx: binanceClient }),
+        ingestRawObservations: ingestCanonicalMarketRegimeRawObservations,
+        fetchBtcCandles: () =>
+          binanceClient
+            .getCandles(BTC_ATR_PERCENTILE_SYMBOL, BTC_ATR_PERCENTILE_INTERVAL, BTC_ATR_PERCENTILE_CANDLES_NEEDED)
+            .then((candles) => completedCandles(candles, BTC_ATR_PERCENTILE_INTERVAL)),
+        fetchFuturesFlow: (symbol) => binanceClient.getFuturesFlow(symbol),
+        getPriorSnapshot: () => getCanonicalMarketRegimeSnapshotStore().get(),
+        recordSnapshot: recordCanonicalMarketRegimeSnapshot,
+      })
+        .then((result) => {
+          if (result && !result.ok) {
+            console.error(`[canonical-market-regime] cycle failed: ${result.error}`);
+          }
+        })
+        .catch((err) => console.error("[canonical-market-regime] scheduler tick threw unexpectedly", err));
+    };
+    if (!isTest) {
+      // 30s warm-up offset: after the ATR-percentile(10s)/Kronos-anchor(20s) BTC producers immediately
+      // below get their own head start, before this heavier per-universe-symbol (up to 60) funding+OI
+      // fan-out fires — avoids stacking every network-bound startup producer into the same instant.
+      setTimeout(runCanonicalMarketRegimeEngineTick, 30_000);
+      setInterval(runCanonicalMarketRegimeEngineTick, CANONICAL_MARKET_REGIME_ENGINE_TICK_INTERVAL_MS);
+    }
 
     // Cross-sectional market-neutral EXECUTOR (testnet-first). Env-gated; on mainnet
     // it additionally requires the engine to be ARMED, so the flag alone can never
@@ -1598,7 +1964,24 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         executionFillRecorder: getExecutionFillRecorder(),
         entryHealthGate: () => {
           const report = buildCrossSectionalReport(getCrossSectionalStore(), Date.now(), { variant: "FILTERED" });
-          return rollingNetEntryHealth(report.recentNetReturns);
+          const rolling = rollingNetEntryHealth(report.recentNetReturns);
+          if (!rolling.allowed) return rolling; // existing PnL-rolling-health gate wins first, unchanged
+          // 2026-08 canonical-market-regime addition (requirement #7): an ADDITIONAL AND-ed term,
+          // never a replacement for the rolling-health gate above — same shared
+          // canonicalMarketRegimeExecutionPolicy decision every other execution-affecting path this
+          // round now consults, not a reimplementation. TREND/MIXED variants need no equivalent
+          // change here: they already read canOpenNewEntriesIgnoringManualDirectional() ->
+          // unifiedRegimeEntryGate when admission-independent (isCrossSectionalTrendMixedAdmissionIndependent),
+          // which inherits the canonical engine via that one redirect automatically, with no
+          // per-lane code change. cross-sectional-edge.ts's own signal-production regime
+          // conditioning (classifyCrossSectionalRegime / basket selection) is untouched — this is
+          // execution policy only.
+          const regimeDecision = canonicalMarketRegimeExecutionPolicy({
+            snapshot: getCanonicalMarketRegimeSnapshot(),
+            nowMs: Date.now(),
+          });
+          if (!regimeDecision.allowed) return { allowed: false, reason: regimeDecision.reason };
+          return rolling;
         },
         // 2026-07-11 real-money audit fix: FILTERED/TREND/MIXED share ONE netted exchange account —
         // closures over these `let`s so each sees the OTHER TWO's CURRENT legs at tick time, not
@@ -1619,6 +2002,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         // (RC/CE-WIDE_LONG/CE-FAST_LONG included) already-open same-symbol exposure.
         existingNotionalForSymbol: (symbol) => crossSectionalNotionalForSymbolExcluding(crossSectionalExecutor, symbol),
         maxNotionalPerSymbolAcrossLanes,
+        ...sharedExposureReservation,
       });
       if (!isTest) {
         const execTick = () => void crossSectionalExecutor?.tick();
@@ -1676,6 +2060,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         // Same 2026-07-19 real-money audit fix as the foundation instance above.
         existingNotionalForSymbol: (symbol) => crossSectionalNotionalForSymbolExcluding(crossSectionalTrendExecutor, symbol),
         maxNotionalPerSymbolAcrossLanes,
+        ...sharedExposureReservation,
       });
       crossSectionalMixedExecutor = new CrossSectionalExecutor({
         client: liveClient,
@@ -1707,6 +2092,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         // Same 2026-07-19 real-money audit fix as the foundation instance above.
         existingNotionalForSymbol: (symbol) => crossSectionalNotionalForSymbolExcluding(crossSectionalMixedExecutor, symbol),
         maxNotionalPerSymbolAcrossLanes,
+        ...sharedExposureReservation,
       });
       if (!isTest) {
         // Staggered start/interval offsets vs. the FILTERED tick above — purely to avoid dispatching
@@ -1784,6 +2170,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         // below, regardless of current allocation weight.
         onPositionClosed: (netUsd) => engineForGate?.recordExternalConsecutiveLossOutcome(netUsd),
         ...singleSymbolEntryClaims,
+        ...sharedExposureReservation,
       });
       if (!isTest) {
         const sfTick = () => void shortFadeExecutor?.tick();
@@ -1840,6 +2227,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         // 2026-07-19 real-money audit fix — see shortFadeExecutor above.
         onPositionClosed: (netUsd) => engineForGate?.recordExternalConsecutiveLossOutcome(netUsd),
         ...singleSymbolEntryClaims,
+        ...sharedExposureReservation,
       });
       if (!isTest) {
         const imTick = () => void intradayMomentumExecutor?.tick();
@@ -1907,6 +2295,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         // holding 100% of today's real money — the original motivating gap for this fix.
         onPositionClosed: (netUsd) => engineForGate?.recordExternalConsecutiveLossOutcome(netUsd),
         ...singleSymbolEntryClaims,
+        ...sharedExposureReservation,
       });
       if (!isTest) {
         const rcTick = () => void regimeCompositeExecutor?.tick();
@@ -1959,6 +2348,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         // 2026-07-19 real-money audit fix — see shortFadeExecutor above.
         onPositionClosed: (netUsd) => engineForGate?.recordExternalConsecutiveLossOutcome(netUsd),
         ...singleSymbolEntryClaims,
+        ...sharedExposureReservation,
       });
       if (!isTest) {
         const rcsTick = () => void regimeCompositeShortExecutor?.tick();
@@ -2017,6 +2407,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         // 2026-07-19 real-money audit fix — see shortFadeExecutor above.
         onPositionClosed: (netUsd) => engineForGate?.recordExternalConsecutiveLossOutcome(netUsd),
         ...singleSymbolEntryClaims,
+        ...sharedExposureReservation,
       });
       if (!isTest) {
         const pwrTick = () => void panicWashoutExecutor?.tick();
@@ -2112,6 +2503,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           // of the 3 lanes holding 100% of today's real money — the original motivating gap.
           onPositionClosed: (netUsd) => engineForGate?.recordExternalConsecutiveLossOutcome(netUsd),
           ...singleSymbolEntryClaims,
+          ...sharedExposureReservation,
         });
       };
       compositeEstimatorWideLongExecutor = buildCompositeEstimatorExecutor("WIDE_LONG", "LONG", "composite-estimator-wide-long-executor.json", () => compositeEstimatorWideLongExecutor);
@@ -2135,13 +2527,39 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     }
 
     // /research innovation execution bridge. This is deliberately testnet-only and has no
-    // strategy-evidence, promotion, quarantine, regime, edge-memory, or unified-orchestrator gate.
+    // strategy-evidence, promotion, quarantine, edge-memory, or unified-orchestrator gate.
     // It still uses the established executors, so armed/kill/drain state, exchange filters,
     // one-way netting, protective stops, allocation, notional caps, and cluster caps remain intact.
+    // 2026-08 canonical-market-regime addition (requirement #7): this bridge now ALSO has a regime
+    // gate — see innovationAllowed below — an ADDITIONAL AND-ed term alongside the pre-existing
+    // armed/kill/drain check, never a research-maturity/allocation gate (those remain intentionally
+    // absent, per the rest of this comment).
     if (liveEngine && isInnovationTestnetExecutionEnabled(liveConfig.env)) {
       const engineForGate = liveEngine;
-      const innovationAllowed = (): boolean =>
-        innovationTestnetAdmissionAllowed(engineForGate.canOpenNewEntriesIgnoringManualDirectional());
+      // Fail-closed campaign control (innovation-campaign.ts): AND, never a replacement —
+      // canOpenNewEntriesIgnoringManualDirectional() still runs and still governs
+      // armed/kill/drain/regime exactly as before. Only a lane the CURRENT campaign explicitly
+      // admits (enabled, within window, named in allowedLaneIds, under every cap) can ever reach
+      // that engine check at all.
+      const innovationAllowed = (laneId: string): boolean =>
+        innovationCampaignAdmissionForLane(laneId).allowed &&
+        innovationTestnetAdmissionAllowed(
+          engineForGate.canOpenNewEntriesIgnoringManualDirectional(),
+          // 2026-08 canonical-market-regime addition (requirement #7): the SAME shared
+          // canonicalMarketRegimeExecutionPolicy decision every other execution-affecting path this
+          // round now consults, AND-ed alongside the pre-existing armed/kill/drain check inside
+          // innovationTestnetAdmissionAllowed. Deliberate belt-and-suspenders with the
+          // unifiedRegimeEntryGate redirect above: canOpenNewEntriesIgnoringManualDirectional()
+          // already inherits the canonical engine transitively (it calls into the now-redirected
+          // unifiedRegimeEntryGate), so today this AND is redundant with that inherited block —
+          // made explicit anyway per the operator's own "make the call explicit either way and say
+          // so" instruction, so innovationTestnetAdmissionAllowed stays correct in isolation (it is
+          // directly unit-tested) rather than correct only by accident of today's caller.
+          canonicalMarketRegimeExecutionPolicy({
+            snapshot: getCanonicalMarketRegimeSnapshot(),
+            nowMs: Date.now(),
+          }).allowed,
+        );
       const innovationWeight = (laneId: string): number => {
         const selected = engineForGate.laneSelectionWeightPctForLane(laneId);
         return innovationTestnetWeight(selected);
@@ -2191,12 +2609,12 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           laneId: descriptor.laneId,
           idNamespace: descriptor.laneId,
           enabled: () => true,
-          isAllowed: innovationAllowed,
+          isAllowed: () => innovationAllowed(descriptor.laneId),
           laneWeightPct: () => innovationWeight(descriptor.laneId),
           rawLaneWeightPct: () => innovationWeight(descriptor.laneId),
           cortexRealAttribution: getCortexRealAttributionStore(),
           executionFillRecorder: getExecutionFillRecorder(),
-          entryHealthGate: () => ({ allowed: true, reason: null }),
+          entryHealthGate: () => innovationCampaignAdmissionForLane(descriptor.laneId),
           legUsd: innovationLegUsd,
           leverage: innovationLeverage,
           maxOpenBaskets: innovationMaxOpen,
@@ -2214,6 +2632,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           sharedGetPositions,
           existingNotionalForSymbol: (symbol) => crossSectionalNotionalForSymbolExcluding(executor, symbol),
           maxNotionalPerSymbolAcrossLanes,
+          ...sharedExposureReservation,
         });
         innovationBasketExecutors.push(executor);
       }
@@ -2241,7 +2660,8 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
               descriptor.policy === "TRAIL"
                 ? makeMfeGivebackExitPolicy({ armR: 0.5, givebackFrac: 0.5, maxHoldMs: 7 * 24 * 3_600_000 })
                 : makeFixedRewardExitPolicy({ rewardMultiple: 100, maxHoldMs: 7 * 24 * 3_600_000 }),
-            isAllowed: innovationAllowed,
+            isAllowed: () => innovationAllowed(descriptor.laneId),
+            isAllowedReason: () => innovationCampaignAdmissionForLane(descriptor.laneId).reason,
             laneWeightPct: () => innovationWeight(descriptor.laneId),
             rawLaneWeightPct: () => innovationWeight(descriptor.laneId),
             cortexRealAttribution: getCortexRealAttributionStore(),
@@ -2263,6 +2683,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
             sharedGetPositions,
             onPositionClosed: (netUsd) => engineForGate.recordExternalConsecutiveLossOutcome(netUsd),
             ...singleSymbolEntryClaims,
+            ...sharedExposureReservation,
           });
           innovationSingleSymbolExecutors.push(executor);
         }
@@ -3223,6 +3644,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     panicWashoutExecutor: () => panicWashoutExecutor,
     innovationBasketExecutors: () => innovationBasketExecutors,
     innovationSingleSymbolExecutors: () => innovationSingleSymbolExecutors,
+    innovationCampaign: () => innovationCampaignSnapshot(),
     regimeAutopilot: () => regimeAutopilot,
     unifiedOrchestrator: () => unifiedOrchestrator,
     unifiedProposalStore: () => unifiedProposalStore,

@@ -21,6 +21,7 @@ import {
   type SingleSymbolExecClient,
   type SingleSymbolExitPolicy,
   type SingleSymbolFreshSignal,
+  type SingleSymbolPosition,
 } from "../src/lib/single-symbol-lane-executor.js";
 
 const NOW = "2026-07-08T03:00:00.000Z";
@@ -54,6 +55,12 @@ class FakeClient implements SingleSymbolExecClient {
   algosPlaced: PlaceAlgoOrderParams[] = [];
   algosCancelled: string[] = [];
   failOnSymbol: string | null = null;
+  /** [2026-08-04 exposure-reservation test support] Symbol whose ENTRY (non-reduceOnly) placeOrder
+   *  throws an UNAMBIGUOUS BinanceFuturesPrivateError (failureType "binance_error") — distinct from
+   *  `failOnSymbol` above, which throws a plain, ambiguous Error (simulating a network/timeout
+   *  failure where whether the order reached the exchange is genuinely unknown). Mirrors
+   *  cross-sectional-executor.test.ts's FakeExecClient field of the same name. */
+  failOnSymbolWithBinanceError: string | null = null;
   failAlgoOnce = false;
   /** Reject the NEXT reduceOnly placeOrder call with the given Binance error code (e.g. -2022),
    *  then clear itself. Non-reduceOnly retries are NOT rejected. */
@@ -120,6 +127,12 @@ class FakeClient implements SingleSymbolExecClient {
     return symbol ? entries.filter((p) => p.symbol === symbol) : entries;
   }
   async placeOrder(params: PlaceOrderParams): Promise<FuturesOrder> {
+    if (this.failOnSymbolWithBinanceError === params.symbol && !params.reduceOnly) {
+      throw new BinanceFuturesPrivateError("binance_error", `Binance error HTTP 400 code -2019: Margin is insufficient.`, {
+        httpStatus: 400,
+        binanceCode: -2019,
+      });
+    }
     if (this.failOnSymbol === params.symbol) throw new Error(`exchange rejected ${params.symbol}`);
     if (this.failAllPlaceOrders) throw new Error("exchange rejected (persistent, non-recoverable)");
     if (params.reduceOnly && this.rejectNextReduceOnlyWithCode !== null) {
@@ -225,6 +238,15 @@ function makeExecutor(opts: {
   tryClaimEntrySymbol?: (symbol: string) => boolean;
   releaseEntrySymbol?: (symbol: string) => void;
   timelineEntryGate?: (signal: SingleSymbolFreshSignal, direction: "LONG" | "SHORT") => Promise<{ allowed: boolean; reason: string | null }>;
+  reserveExposure?: (req: {
+    executorId: string;
+    symbol: string;
+    direction: "LONG" | "SHORT";
+    requestedNotionalUsd: number;
+    clientOrderId: string;
+  }) => { ok: boolean; reservationId: string | null; reason?: string };
+  commitExposureReservation?: (reservationId: string, filled: { qty: number; avgPrice: number }) => void;
+  releaseExposureReservation?: (reservationId: string, reason: string) => void;
 } = {}) {
   const client = opts.client ?? new FakeClient();
   const storeDir = tmpDir();
@@ -255,9 +277,244 @@ function makeExecutor(opts: {
     ...(opts.tryClaimEntrySymbol ? { tryClaimEntrySymbol: opts.tryClaimEntrySymbol } : {}),
     ...(opts.releaseEntrySymbol ? { releaseEntrySymbol: opts.releaseEntrySymbol } : {}),
     ...(opts.timelineEntryGate ? { timelineEntryGate: opts.timelineEntryGate } : {}),
+    ...(opts.reserveExposure ? { reserveExposure: opts.reserveExposure } : {}),
+    ...(opts.commitExposureReservation ? { commitExposureReservation: opts.commitExposureReservation } : {}),
+    ...(opts.releaseExposureReservation ? { releaseExposureReservation: opts.releaseExposureReservation } : {}),
   });
   return { executor, client, store, storeDir };
 }
+
+/** Minimal in-memory stand-in for AccountExposureCoordinator's reserve/commit/release contract —
+ *  NOT a reimplementation of its capacity math (that is exhaustively covered by
+ *  account-exposure-coordinator.test.ts's own 45 tests). This exists purely to verify the WIRING:
+ *  does the executor call reserve() at the right point with the right data, commit from the actual
+ *  fill, and release on every failure path (never only the happy path) — exactly the property that
+ *  testing the coordinator in isolation cannot exercise. */
+function makeFakeReservationLedger() {
+  const reservations = new Map<
+    string,
+    {
+      status: "RESERVED" | "COMMITTED" | "RELEASED";
+      req: { executorId: string; symbol: string; direction: "LONG" | "SHORT"; requestedNotionalUsd: number; clientOrderId: string };
+      committed?: { qty: number; avgPrice: number };
+      releaseReason?: string;
+    }
+  >();
+  let seq = 0;
+  let forceNextRejectReason: string | null = null;
+  return {
+    reservations,
+    forceNextReserveRejection(reason: string) {
+      forceNextRejectReason = reason;
+    },
+    reserveExposure: (req: {
+      executorId: string;
+      symbol: string;
+      direction: "LONG" | "SHORT";
+      requestedNotionalUsd: number;
+      clientOrderId: string;
+    }) => {
+      if (forceNextRejectReason !== null) {
+        const reason = forceNextRejectReason;
+        forceNextRejectReason = null;
+        return { ok: false, reservationId: null, reason };
+      }
+      const reservationId = `res-${++seq}`;
+      reservations.set(reservationId, { status: "RESERVED", req });
+      return { ok: true, reservationId };
+    },
+    commitExposureReservation: (reservationId: string, filled: { qty: number; avgPrice: number }) => {
+      const r = reservations.get(reservationId);
+      if (!r || r.status !== "RESERVED") return; // idempotent no-op, matches the real coordinator
+      r.status = "COMMITTED";
+      r.committed = filled;
+    },
+    releaseExposureReservation: (reservationId: string, reason: string) => {
+      const r = reservations.get(reservationId);
+      if (!r || r.status !== "RESERVED") return; // idempotent no-op, matches the real coordinator
+      r.status = "RELEASED";
+      r.releaseReason = reason;
+    },
+  };
+}
+
+describe("SingleSymbolLaneExecutor — account-exposure reservation wiring (2026-08-04)", () => {
+  it("reserves before placing the order (with the SAME clientOrderId placeOrder submits) and commits from the actual fill, not requested qty", async () => {
+    const ledger = makeFakeReservationLedger();
+    const client = new FakeClient();
+    client.fillPriceBySymbol.set("BTCUSDT", 59_950); // avgPrice differs from signal.entryPrice
+    const { executor, store } = makeExecutor({
+      client,
+      signals: [signal()],
+      legUsd: 120_000,
+      laneWeightPct: 50, // effective legUsd 60,000 -> qty 1.0 exactly
+      reserveExposure: ledger.reserveExposure,
+      commitExposureReservation: ledger.commitExposureReservation,
+      releaseExposureReservation: ledger.releaseExposureReservation,
+    });
+
+    await executor.tick();
+
+    expect(store.getState().positions).toHaveLength(1);
+    expect(ledger.reservations.size).toBe(1);
+    const [reservationId, record] = [...ledger.reservations.entries()][0]!;
+    expect(record.status).toBe("COMMITTED");
+    expect(record.req.executorId).toBe("SHORT_FADE_EXHAUSTION_CROWDED");
+    expect(record.req.symbol).toBe("BTCUSDT");
+    expect(record.req.direction).toBe("SHORT");
+    expect(record.req.requestedNotionalUsd).toBeCloseTo(60_000, 6);
+    // The reconciliation join key: reserve()'s clientOrderId must be the EXACT string placeOrder
+    // submitted, not merely a similarly-shaped one.
+    expect(client.placed[0]!.newClientOrderId).toBe(record.req.clientOrderId);
+    // Committed from the REAL fill (order.executedQty/avgPrice), never the requested qty/price.
+    expect(record.committed!.qty).toBeCloseTo(1, 6);
+    expect(record.committed!.avgPrice).toBe(59_950);
+    void reservationId;
+  });
+
+  it("a rejected reservation blocks the entry entirely (no order placed) and surfaces the coordinator's reason", async () => {
+    const ledger = makeFakeReservationLedger();
+    ledger.forceNextReserveRejection("BTCUSDT: correlation-cluster cap (L1, cap 3) reached");
+    const client = new FakeClient();
+    const sig = signal();
+    const { executor, store } = makeExecutor({
+      client,
+      signals: [sig],
+      legUsd: 10_000,
+      reserveExposure: ledger.reserveExposure,
+      commitExposureReservation: ledger.commitExposureReservation,
+      releaseExposureReservation: ledger.releaseExposureReservation,
+    });
+
+    await executor.tick();
+
+    expect(client.placed).toHaveLength(0);
+    expect(store.getState().positions).toHaveLength(0);
+    expect(ledger.reservations.size).toBe(0); // reserve() itself refused to insert anything
+    expect(executor.getStatus().lastEntrySkipReason).toContain("correlation-cluster cap");
+    // Not permanently blacklisted — a capacity rejection is transient (see maxNotionalPerSymbolAcrossLanes's
+    // own doc comment on this exact convention), so the same signal must remain retryable.
+    expect(store.getState().attemptedObservationIds ?? []).not.toContain(sig.observationId);
+  });
+
+  it("[FRESH_POSITION_EXISTS] releases the reservation when the final pre-placement exchange recheck finds a real position", async () => {
+    const ledger = makeFakeReservationLedger();
+    const client = new FakeClient();
+    client.positionAmtBySymbol.set("BTCUSDT", 0.02); // only visible to the FRESH (uncached) check
+    const { executor, store } = makeExecutor({
+      client,
+      signals: [signal()],
+      legUsd: 10_000,
+      sharedGetPositions: async () => [], // the cached/stale check sees flat
+      reserveExposure: ledger.reserveExposure,
+      commitExposureReservation: ledger.commitExposureReservation,
+      releaseExposureReservation: ledger.releaseExposureReservation,
+    });
+
+    await executor.tick();
+
+    expect(client.placed).toHaveLength(0);
+    expect(store.getState().positions).toHaveLength(0);
+    expect(executor.getStatus().lastEntrySkipReason).toMatch(/fresh exchange position/);
+    expect(ledger.reservations.size).toBe(1);
+    const record = [...ledger.reservations.values()][0]!;
+    expect(record.status).toBe("RELEASED");
+    expect(record.releaseReason).toBe("FRESH_POSITION_EXISTS");
+  });
+
+  it("[STRUCTURAL REJECTION] a signal that fails exchange minNotional releases its reservation instead of leaking it as RESERVED", async () => {
+    // Same fixture as "skips an entry that clears minQty but fails MIN_NOTIONAL" above.
+    const ledger = makeFakeReservationLedger();
+    const dogeSignal = signal({ observationId: "sf:DOGEUSDT:1", symbol: "DOGEUSDT", entryPrice: 0.1, stopPrice: 0.103 });
+    const { executor, store } = makeExecutor({
+      signals: [dogeSignal],
+      legUsd: 0.5,
+      reserveExposure: ledger.reserveExposure,
+      commitExposureReservation: ledger.commitExposureReservation,
+      releaseExposureReservation: ledger.releaseExposureReservation,
+    });
+
+    await executor.tick();
+
+    expect(store.getState().positions).toHaveLength(0);
+    expect(executor.getStatus().lastEntrySkipReason).toMatch(/below exchange minNotional/i);
+    expect(ledger.reservations.size).toBe(1);
+    const record = [...ledger.reservations.values()][0]!;
+    // This is the exact gap a naive implementation (matching only the wiringPlan's literal prose,
+    // which calls out FRESH_POSITION_EXISTS and the catch block but not this structural branch)
+    // would leave RESERVED for up to RESERVATION_STALE_MS despite no order ever being attempted.
+    expect(record.status).toBe("RELEASED");
+    expect(record.releaseReason).toBe("ENTRY_REJECTED:below_min_notional");
+  });
+
+  it("[AMBIGUOUS FAILURE] leaves the reservation RESERVED (not released) via the catch path when placeOrder throws a plain, non-Binance error", async () => {
+    // [2026-08-04] failOnSymbol throws a plain Error — simulates a network/timeout blip where
+    // whether the order actually reached the exchange is genuinely unknown. Releasing capacity here
+    // would reopen the oversubscription race the coordinator exists to close, so the reservation
+    // must stay RESERVED for the periodic staleness sweep (reconcileStaleReservations) to resolve
+    // against Binance directly. Mirrors cross-sectional-executor.test.ts's own
+    // "[AMBIGUOUS FAILURE] leaves the failed leg's reservation RESERVED..." test.
+    const ledger = makeFakeReservationLedger();
+    const client = new FakeClient();
+    client.failOnSymbol = "BTCUSDT";
+    const sig = signal();
+    const { executor, store } = makeExecutor({
+      client,
+      signals: [sig],
+      legUsd: 10_000,
+      reserveExposure: ledger.reserveExposure,
+      commitExposureReservation: ledger.commitExposureReservation,
+      releaseExposureReservation: ledger.releaseExposureReservation,
+    });
+
+    await executor.tick();
+
+    expect(store.getState().positions).toHaveLength(0);
+    // Same transient-retry contract as the pre-existing [ENTRY-RETRY] test above — retry-eligibility
+    // is orthogonal to reservation-release and unaffected by this fix.
+    expect(store.getState().attemptedObservationIds ?? []).not.toContain(sig.observationId);
+    expect(ledger.reservations.size).toBe(1);
+    const record = [...ledger.reservations.values()][0]!;
+    expect(record.status).toBe("RESERVED");
+    expect(record.releaseReason).toBeUndefined();
+  });
+
+  it("[UNAMBIGUOUS FAILURE] releases the reservation via the catch path when placeOrder throws a typed, in-band Binance rejection", async () => {
+    // [2026-08-04] failOnSymbolWithBinanceError throws BinanceFuturesPrivateError with
+    // failureType "binance_error" — Binance received the request and explicitly answered no, so no
+    // order was created. This is the one case where releasing immediately is safe.
+    const ledger = makeFakeReservationLedger();
+    const client = new FakeClient();
+    client.failOnSymbolWithBinanceError = "BTCUSDT";
+    const sig = signal();
+    const { executor, store } = makeExecutor({
+      client,
+      signals: [sig],
+      legUsd: 10_000,
+      reserveExposure: ledger.reserveExposure,
+      commitExposureReservation: ledger.commitExposureReservation,
+      releaseExposureReservation: ledger.releaseExposureReservation,
+    });
+
+    await executor.tick();
+
+    expect(store.getState().positions).toHaveLength(0);
+    expect(store.getState().attemptedObservationIds ?? []).not.toContain(sig.observationId);
+    expect(ledger.reservations.size).toBe(1);
+    const record = [...ledger.reservations.values()][0]!;
+    expect(record.status).toBe("RELEASED");
+    expect(record.releaseReason).toMatch(/^ENTRY_FAILED:/);
+  });
+
+  it("defaults to a no-op coordinator when reserveExposure/commit/release are omitted — existing behavior is byte-for-byte unaffected", async () => {
+    // No ledger wired at all. If this executor's ONLY option were `reserveExposure` without a safe
+    // default, this test (and every other test in this file that predates 2026-08-04) would throw.
+    const { executor, store, client } = makeExecutor({ signals: [signal()], legUsd: 10_000 });
+    await executor.tick();
+    expect(store.getState().positions).toHaveLength(1);
+    expect(client.placed).toHaveLength(1);
+  });
+});
 
 describe("makeFixedRewardExitPolicy (SHORT_FADE_EXHAUSTION geometry)", () => {
   const policy = makeFixedRewardExitPolicy({ rewardMultiple: 0.5, maxHoldMs: 48 * 3_600_000 });
@@ -807,6 +1064,82 @@ describe("SingleSymbolLaneExecutor — exits", () => {
     expect(pos.closeReason).toBe("TP_HIT");
     expect(client.algosCancelled).toContain(algoId);
     expect(client.placed.some((p) => p.reduceOnly === true)).toBe(true);
+  });
+
+  // ── 2026-08-04 fail-closed innovation campaign control ────────────────────────────────────
+  // The campaign gate (innovation-campaign.ts) is wired ONLY into isAllowed() at app.ts's 13
+  // innovation-executor construction sites — never into tick()'s monitorOpenPositions() prefix,
+  // and never into the outer construction gate. These two tests are the load-bearing proof that
+  // holds: an absent/expired/disabled campaign (isAllowed() false) can only ever block a NEW
+  // entry, never the management or closing of a position that is already OPEN.
+  describe("[FAIL-CLOSED CAMPAIGN] position management/closing continues even with no active innovation campaign", () => {
+    function openShortPosition(over: Partial<SingleSymbolPosition> = {}) {
+      return {
+        positionId: "seed-nocamp", sourceObservationId: "seed-nocamp", symbol: "BTCUSDT", direction: "SHORT" as const,
+        qty: 0.001, entryPrice: 60000, entryOrderId: "1", entryPriceConfirmed: true, stopPrice: 61800,
+        stopAlgoOrderId: "900", stopFailureCount: 0, stopUnprotectedSinceIso: null, closeFailureCount: 0,
+        closeFailureSinceIso: null, peakFavorableR: 0, openedAt: NOW, status: "OPEN" as const, closedAt: null,
+        closeReason: null, exitPrice: null, exitOrderId: null, exitPriceConfirmed: false,
+        grossPnlUsd: null, feeEstimateUsd: 0, netPnlUsd: null,
+        ...over,
+      };
+    }
+
+    it("monitorOpenPositions still closes an already-OPEN position via the exit policy when isAllowed() is false the whole time (no active campaign)", async () => {
+      const client = new FakeClient();
+      const { executor, store } = makeExecutor({ client, allowed: false });
+      store.getState().positions.push(openShortPosition());
+      // 0.5R favorable for the SHORT (entry 60000, stop 61800 -> risk 1800, target 59100) -> TP_HIT.
+      client.markPriceBySymbol.set("BTCUSDT", 59000);
+
+      await executor.tick();
+
+      const pos = store.getState().positions[0]!;
+      expect(pos.status).toBe("CLOSED");
+      expect(pos.closeReason).toBe("TP_HIT");
+      expect(client.placed.some((p) => p.reduceOnly === true)).toBe(true);
+      // The campaign gate itself is still doing its job — NEW entries stay blocked throughout.
+      expect(executor.getStatus().allowed).toBe(false);
+    });
+
+    it("[RESTART] a freshly constructed executor (simulating a process restart) still loads and closes an already-OPEN position from disk even though isAllowed() reflects 'no active campaign' from the very first tick", async () => {
+      const storeDir = tmpDir();
+      const fileName = "restart-campaign.json";
+
+      // "Process A": a position opens and is persisted; the process then ends.
+      const store1 = new SingleSymbolLaneExecutorStore(storeDir, fileName);
+      store1.getState().positions.push(openShortPosition());
+      store1.save();
+
+      // "Process B" (restart): a BRAND NEW store instance re-reads the SAME directory/file — this
+      // is exactly what app.ts's construction gate does on every process start, unconditionally,
+      // regardless of campaign state (see innovation-campaign.ts's module doc comment and the
+      // outer `if (liveEngine && isInnovationTestnetExecutionEnabled(...))` gate in app.ts, which
+      // this design never touches).
+      const store2 = new SingleSymbolLaneExecutorStore(storeDir, fileName);
+      expect(store2.getState().positions.find((p) => p.positionId === "seed-nocamp")?.status).toBe("OPEN");
+
+      const client2 = new FakeClient();
+      client2.markPriceBySymbol.set("BTCUSDT", 59000);
+      const executor2 = new SingleSymbolLaneExecutor({
+        client: client2,
+        store: store2,
+        laneId: "FUNDING_CARRY_NEUTRAL_PAIR",
+        direction: "SHORT",
+        getOpenSignals: () => [],
+        exitPolicy: makeFixedRewardExitPolicy({ rewardMultiple: 0.5, maxHoldMs: 48 * 3_600_000 }),
+        isAllowed: () => false, // no active campaign — the ONLY gate this design ever touches
+        legUsd: () => 25,
+        leverage: () => 3,
+        nowIso: () => NOW,
+        fillConfirmRetryDelayMs: 0,
+      });
+
+      await executor2.tick();
+
+      const pos = store2.getState().positions.find((p) => p.positionId === "seed-nocamp")!;
+      expect(pos.status).toBe("CLOSED"); // position management survives the restart, campaign or no campaign
+    });
   });
 
   it("[STOP-TRIGGERED] settles from getUserTrades when the exchange-side stop has actually fired", async () => {
