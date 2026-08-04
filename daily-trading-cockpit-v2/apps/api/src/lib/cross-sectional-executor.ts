@@ -2030,23 +2030,88 @@ export class CrossSectionalExecutor {
         this.store.save(); // persist per leg so a crash mid-open still records this filled leg
       } catch (error) {
         const message = (error as Error).message ?? "placeOrder failed";
+
+        // "Timeout means UNKNOWN, not failure." (2026-08-05 live-tick reconciliation fix.) An
+        // UNAMBIGUOUS BinanceFuturesPrivateError with failureType==="binance_error" is a confirmed
+        // in-band rejection — Binance received the request and explicitly answered no, so no order
+        // was created. Every OTHER failure (timeout/429/network/http_error/invalid_response/
+        // clock_skew, or a plain non-Binance Error) is AMBIGUOUS: we do NOT know whether the order
+        // actually reached the exchange. Reconcile by client/order identity via the SAME helper
+        // recoverIncompleteBaskets already uses for its own crash-path "PLACING" reconciliation
+        // (reconcilePlannedLeg) — ONE immediate attempt — before deciding anything. Deciding
+        // hedge-vs-rollback blind here (the pre-fix bug) could push the basket to a terminal status
+        // (ABORTED, or COMPLETE-as-a-reduced-hedge) this SAME tick while a leg that actually filled
+        // never reached basket.legs — permanently invisible to recoverIncompleteBaskets, which only
+        // ever revisits non-terminal (RESERVED/PLACING/PARTIALLY_FILLED) baskets: a genuinely naked,
+        // untracked position no later restart would ever rediscover.
+        const isConfirmedRejection = error instanceof BinanceFuturesPrivateError && error.failureType === "binance_error";
+
+        if (!isConfirmedRejection) {
+          const resolution = await this.reconcilePlannedLeg(planned.symbol, planned.entryClientOrderId);
+
+          if (resolution.outcome === "FILLED") {
+            // Adopt exactly like recoverIncompleteBaskets' own FILLED branch — the order actually
+            // reached and filled on the exchange despite the local timeout/network error. Commit
+            // (never release) the reservation and push the real fill into legs, exactly as a normal
+            // in-loop fill would.
+            if (planned.reservationId) {
+              this.commitExposureReservationFn(planned.reservationId, { qty: resolution.qty, avgPrice: resolution.avgPrice });
+            }
+            basket.legs.push({
+              symbol: planned.symbol,
+              side: planned.side,
+              qty: resolution.qty,
+              entryPrice: resolution.avgPrice,
+              entryOrderId: resolution.orderId,
+              entryPriceConfirmed: true,
+              exitPrice: null,
+              exitOrderId: null,
+              exitPriceConfirmed: null,
+              planIndex: i,
+            });
+            planned.status = "FILLED";
+            basket.status = basket.legs.length === plan.length ? "COMPLETE" : "PARTIALLY_FILLED";
+            this.store.save();
+            continue; // proceed to the next leg this SAME tick, exactly as a normal fill would
+          }
+
+          if (resolution.outcome === "INCONCLUSIVE") {
+            // Never guess. planned.status stays exactly "PLACING" (set at the top of this loop
+            // iteration, before the try — see PlannedLeg's own doc comment: it is the ONLY status
+            // that triggers a reconciliation query before resuming) — no new enum value, never
+            // "FAILED". The reservation is NOT released. basket.status stays exactly what this
+            // iteration's top already set (PLACING/PARTIALLY_FILLED — both non-terminal).
+            // recoverIncompleteBaskets() already scans every RESERVED/PLACING/PARTIALLY_FILLED
+            // basket EVERY tick (not just after a crash) and will re-run this SAME reconciliation
+            // next tick against the identical entryClientOrderId — zero new scheduling/retry code.
+            // "Block retry": the reservation staying RESERVED means
+            // AccountExposureCoordinator.reserve()'s own unconditional single-flight-per-symbol Gate
+            // 1 rejects any OTHER reservation on this symbol — a fresh basket, a sibling instance, or
+            // a SingleSymbolLaneExecutor entry — for as long as this one stays outstanding.
+            this.lastError =
+              `basket ${basket.basketId}: leg ${i} (${planned.symbol}) placement ambiguous (${message}) — ` +
+              `exchange reconciliation INCONCLUSIVE, retaining reservation and deferring to next tick's recovery pass`;
+            this.store.save();
+            return;
+          }
+          // resolution.outcome === "NOT_PLACED": the exchange itself confirmed this attempt never
+          // resulted in a live/filled order — now unambiguous, falls into the confirmed-failure
+          // handling below exactly like isConfirmedRejection.
+        }
+
         planned.status = "FAILED";
         planned.failureReason = message;
-        // Account-exposure reservation cleanup (account-exposure-coordinator.ts). setLeverage
-        // failures are caught inline (best-effort) and resolveFillPrice never throws (see
-        // resolveConfirmedFillPrice) — so the ONLY call that can reach this catch is placeOrder()
-        // itself, for this one failed leg.
+        // Account-exposure reservation cleanup (account-exposure-coordinator.ts). Release on an
+        // UNAMBIGUOUS non-fill only: either Binance's own in-band rejection (isConfirmedRejection),
+        // or an ambiguous failure THIS tick's own reconciliation just above confirmed NOT_PLACED —
+        // both mean the exchange itself has now answered "no order", so releasing capacity here
+        // cannot recreate the race this coordinator exists to close. A still-INCONCLUSIVE ambiguous
+        // failure never reaches this line (it returned above, reservation untouched).
         if (planned.reservationId) {
-          // Only release on an UNAMBIGUOUS in-band rejection — Binance received the request and
-          // explicitly answered no, so no order was created. Every OTHER failure (timeout/429/
-          // network/http_error/invalid_response/clock_skew, or a non-Binance error) means we do
-          // NOT know whether the order actually reached the exchange; releasing capacity here
-          // would recreate the exact race this coordinator exists to close. Left RESERVED, it is
-          // picked up by the periodic staleness sweep, which resolves it against Binance directly
-          // via queryOrderByClientId (account-exposure-coordinator.ts's reconcileStaleReservations).
-          if (error instanceof BinanceFuturesPrivateError && error.failureType === "binance_error") {
-            this.releaseExposureReservationFn(planned.reservationId, `ENTRY_FAILED:${message}`);
-          }
+          this.releaseExposureReservationFn(
+            planned.reservationId,
+            isConfirmedRejection ? `ENTRY_FAILED:${message}` : `ENTRY_FAILED_RECONCILED_NOT_PLACED:${message}`,
+          );
         }
         // Every leg planned AFTER the failed one was never even attempted (this loop is
         // sequential and stops at the first throw) — those reservations are unambiguously safe

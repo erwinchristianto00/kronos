@@ -366,9 +366,14 @@ describe("CrossSectionalExecutor — account-exposure reservation wiring (2026-0
     expect(sol.releaseReason).toBe("SIBLING_LEG_RESERVE_FAILED:DOGEUSDT: forced test rejection");
   });
 
-  it("[AMBIGUOUS FAILURE] leaves the failed leg's reservation RESERVED (not released) when placeOrder throws a plain, non-Binance error", async () => {
+  it("[AMBIGUOUS FAILURE, RECONCILED NOT_PLACED] releases the failed leg's reservation once THIS tick's own exchange reconciliation confirms it never reached the exchange, still decides hedge/rollback the SAME tick", async () => {
     // Same fixture as the [BUG 1] orphaned-leg suite above: SOL (long, sized/reserved first) opens,
-    // DOGE (short) throws a plain Error — genuinely ambiguous whether it reached the exchange.
+    // DOGE (short) throws a plain Error — genuinely ambiguous, from the LOCAL process's own
+    // perspective, whether it reached the exchange. (2026-08-05 live-tick reconciliation fix:)
+    // FakeExecClient's queryOrderByClientId is left unconfigured for DOGE's clientOrderId, so the
+    // live catch block's new reconciliation attempt (reconcilePlannedLeg — the SAME helper the
+    // crash-restart path already used) gets Binance's real -2013 "order does not exist" shape back
+    // -> NOT_PLACED, a CONFIRMED (not assumed) non-fill, before this tick decides anything.
     const ledger = makeFakeReservationLedger();
     const client = new FakeExecClient();
     client.failOnSymbol = "DOGEUSDT";
@@ -387,10 +392,17 @@ describe("CrossSectionalExecutor — account-exposure reservation wiring (2026-0
     const bySymbol = new Map([...ledger.reservations.values()].map((r) => [r.req.symbol, r]));
     // SOL genuinely filled — its reservation is already COMMITTED and must stay that way.
     expect(bySymbol.get("SOLUSDT")!.status).toBe("COMMITTED");
-    // DOGE's failure is AMBIGUOUS (a plain Error, not an unambiguous Binance in-band rejection) —
-    // releasing it here would recreate the exact race this coordinator exists to close if the order
-    // actually reached the exchange. It must stay RESERVED for the periodic staleness sweep.
-    expect(bySymbol.get("DOGEUSDT")!.status).toBe("RESERVED");
+    // DOGE's failure was AMBIGUOUS (a plain Error, not an unambiguous Binance in-band rejection),
+    // but this tick's own reconciliation query — not a blind assumption — confirmed against the
+    // exchange itself that the order never reached it, so releasing now is safe and correct. (Before
+    // this fix, this same outcome was reached by ASSUMING an ambiguous failure was safe to leave
+    // RESERVED without ever checking the exchange — see the now-superseded assertion this test used
+    // to make. The genuinely-unresolved case — reconciliation itself failing — is covered by the
+    // dedicated [RESTART-RECOVERY] INCONCLUSIVE test and is the next phase's job to add for the live
+    // (non-crash) path too.)
+    expect(bySymbol.get("DOGEUSDT")!.status).toBe("RELEASED");
+    expect(bySymbol.get("DOGEUSDT")!.releaseReason).toMatch(/^ENTRY_FAILED_RECONCILED_NOT_PLACED:/);
+    expect(client.queryOrderByClientIdCallCount).toBe(1); // reconciled BEFORE deciding, not blindly
   });
 
   it("[UNAMBIGUOUS REJECTION] releases the failed leg's reservation when placeOrder throws a real Binance in-band rejection", async () => {
