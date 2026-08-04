@@ -3372,6 +3372,40 @@ describe("copyExternalIntent (testnet→live copy button)", () => {
     expect(res.reason).toMatch(/geometry/);
   });
 
+  // 2026-08 adversarial-review follow-up to the manual-directional canonical-regime enforcement
+  // fix: this composed its OWN reason string from this.strategyEntryGate() (the NON-manual gate)
+  // instead of the new this.newEntryBlockReason() (entryGateDecision()'s own reason, which is
+  // manual-mode-aware). The two only ever disagree when canOpenNewEntries() is false for a
+  // manual-mode-specific cause (here, the new regimeSafetyGate) while the ordinary strategy gate
+  // would itself have said "allowed" for the SAME tick — exactly what this test constructs, by
+  // leaving newEntryGate at its default-permissive fallback while regimeSafetyGate blocks.
+  it("[diagnostics] a manual-directional entry blocked by the regime-safety gate reports the ACTUAL block reason via copyExternalIntent, not the generic 'new-entry gate is closed' fallback", async () => {
+    const { engine } = makeEngine({
+      // newEntryGate left unset ⇒ engine's own default-permissive fallback (allowed: true) — the
+      // ordinary (non-manual) gate is NOT what is blocking this tick.
+      regimeSafetyGate: () => ({ allowed: false, reason: "canonical regime PANIC active" }),
+    });
+    expect((await engine.arm()).ok).toBe(true);
+    engine.setManualDirectionalLaneAllocations({
+      long: [{ laneId: "CG_WIDE_FAST_LONG", weightPct: 100 }],
+      short: [],
+    });
+    engine.setManualSelectorMode(true);
+    engine.setManualEntryDecision({
+      action: "WAIT_PULLBACK",
+      directionalBias: "LONG",
+      reason: "test",
+      observedAt: "2099-01-02T12:00:00.000Z",
+    });
+    // Sanity: canOpenNewEntries() really is false, and for the regime-safety cause specifically —
+    // not armed/kill/drain (none configured here) and not a stale decision (fresh, matches nowIso()).
+    expect(engine.canOpenNewEntries()).toBe(false);
+    expect(engine.newEntryBlockReason()).toBe("canonical regime PANIC active");
+    const res = await engine.copyExternalIntent(spec);
+    expect(res.ok).toBe(false);
+    expect(res.reason).toBe("canonical regime PANIC active");
+  });
+
   it("getOpenIntentCopySpec returns the relay spec for an OPEN intent only", async () => {
     const order = paperOrder(); // SHORT ETHUSDT 2000/2100/1900
     const { engine, store } = makeEngine({ paper: makePaperStore([order]) });

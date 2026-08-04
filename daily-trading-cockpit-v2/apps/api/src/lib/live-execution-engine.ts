@@ -5767,10 +5767,16 @@ export class LiveExecutionEngine {
     if (this.store.getState().killedAt) return { ok: false, reason: "kill switch latched" };
     if (!this.armed) return { ok: false, reason: "live engine is DISARMED — arm it first, then copy" };
     if (!this.canOpenNewEntries()) {
-      const gate = this.strategyEntryGate();
+      // 2026-08 adversarial-review follow-up (manual-directional canonical-regime enforcement
+      // fix): this used to re-derive its reason from this.strategyEntryGate() — the NON-manual
+      // gate, which knows nothing about manual mode's own regimeSafetyGate block. When manual mode
+      // was the actual, specific cause, that produced a misleading generic fallback instead of the
+      // real reason. newEntryBlockReason() is entryGateDecision()'s own explanation — the exact
+      // same source canOpenNewEntries() just read above — so it is correct for manual AND non-
+      // manual causes alike, with no separate re-derivation to drift out of sync.
       const reason = this.isNewEntryDrainActive()
         ? "new-entry drain is active — exits remain managed, but copy/open is blocked"
-        : gate.reason ?? "new-entry gate is closed";
+        : this.newEntryBlockReason() ?? "new-entry gate is closed";
       return { ok: false, reason };
     }
     if (!(req.qty > 0) || !(req.entryPrice > 0) || !(req.stopLossPrice > 0) || !(req.tp1Price > 0)) {

@@ -205,6 +205,72 @@ describe("[FIX-1] manual-directional mode is blocked by the canonical regime pol
     expect(engine.canOpenNewEntries()).toBe(true); // recovers once the snapshot recovers
     expect(engine.newEntryBlockReason()).toBeNull();
   });
+
+  // [1e]/[1f] below were added by the 2026-08 adversarial review pass. buildManualDirectionalRegimeSafetyGate's
+  // own doc comment (app.ts) and this file's own header both narrate, in prose, that the gate is
+  // "deliberately NOT honoring LIVE_REGIME_NO_TRADE_OVERRIDE/REGIME_ENGINE_EXECUTION_GATE_ENABLED" —
+  // but until now nothing behaviorally proved it: a grep for either env-var name across every test
+  // file this fix touches returned zero hits. Left untested, a future "helpful" refactor that makes
+  // buildManualDirectionalRegimeSafetyGate reuse buildUnifiedRegimeEntryGate's env-aware body (for
+  // "consistency") would silently let an operator's blanket regime-gate override also reach manual
+  // mode — reopening a narrower version of the exact class of gap this whole fix closed — and every
+  // OTHER test in this file would stay green, since none of them ever sets either env var. Mutates
+  // the REAL process.env (save/restore in finally), mirroring unified-regime-entry-gate.test.ts's own
+  // "defaults `env` to the real process.env when not supplied" convention, so a future regression
+  // that makes buildManualDirectionalRegimeSafetyGate read process.env directly (the realistic
+  // copy-the-sibling mistake) is caught even though its own deps type has no `env` field to inject.
+  it("[1e, adversarial] LIVE_REGIME_NO_TRADE_OVERRIDE=1 bypasses the NON-manual gate (proven directly, so the contrast below isn't vacuous) but does NOT reach manual mode — regimeSafetyGate takes no `env` at all, so a manual entry still blocks on the SAME PANIC snapshot the operator just waived for every automated lane", async () => {
+    const original = process.env.LIVE_REGIME_NO_TRADE_OVERRIDE;
+    process.env.LIVE_REGIME_NO_TRADE_OVERRIDE = "1";
+    try {
+      const getCanonicalMarketRegimeSnapshot = () => panicSnapshot();
+      // No `env` passed — defaults to real process.env, the exact production shape (buildApp() never
+      // passes `env` explicitly either).
+      const newEntryGate = buildUnifiedRegimeEntryGate({ getUnifiedOrchestrator: () => null, getCanonicalMarketRegimeSnapshot });
+      expect(newEntryGate().allowed).toBe(true); // sanity: the override genuinely flips the non-manual gate for THIS snapshot
+
+      const regimeSafetyGate = buildManualDirectionalRegimeSafetyGate({ getCanonicalMarketRegimeSnapshot });
+      const { engine } = makeEngine({ newEntryGate, regimeSafetyGate });
+      expect((await engine.arm()).ok).toBe(true);
+
+      // Non-manual path: bypassed by the operator's own override, exactly as buildUnifiedRegimeEntryGate
+      // has always allowed (unchanged by this fix — see canOpenNewEntriesIgnoringManualDirectional's own
+      // doc comment).
+      expect(engine.canOpenNewEntriesIgnoringManualDirectional()).toBe(true);
+
+      // Manual path: the SAME PANIC snapshot and the SAME real process.env override active, but
+      // buildManualDirectionalRegimeSafetyGate never reads env at all — manual mode stays blocked even
+      // though the operator waived the check globally.
+      activateManualLongMode(engine);
+      expect(engine.canOpenNewEntries()).toBe(false);
+      expect(engine.newEntryBlockReason()).toMatch(/panic/i);
+    } finally {
+      if (original === undefined) delete process.env.LIVE_REGIME_NO_TRADE_OVERRIDE;
+      else process.env.LIVE_REGIME_NO_TRADE_OVERRIDE = original;
+    }
+  });
+
+  it("[1f, adversarial] same property for the second escape hatch, REGIME_ENGINE_EXECUTION_GATE_ENABLED=0 — bypasses non-manual, never reaches manual", async () => {
+    const original = process.env.REGIME_ENGINE_EXECUTION_GATE_ENABLED;
+    process.env.REGIME_ENGINE_EXECUTION_GATE_ENABLED = "0";
+    try {
+      const getCanonicalMarketRegimeSnapshot = () => lowCoverageSnapshot();
+      const newEntryGate = buildUnifiedRegimeEntryGate({ getUnifiedOrchestrator: () => null, getCanonicalMarketRegimeSnapshot });
+      expect(newEntryGate().allowed).toBe(true); // sanity, same reason as [1e]
+
+      const regimeSafetyGate = buildManualDirectionalRegimeSafetyGate({ getCanonicalMarketRegimeSnapshot });
+      const { engine } = makeEngine({ newEntryGate, regimeSafetyGate });
+      expect((await engine.arm()).ok).toBe(true);
+      expect(engine.canOpenNewEntriesIgnoringManualDirectional()).toBe(true);
+
+      activateManualLongMode(engine);
+      expect(engine.canOpenNewEntries()).toBe(false);
+      expect(engine.newEntryBlockReason()).toMatch(/coverage/i);
+    } finally {
+      if (original === undefined) delete process.env.REGIME_ENGINE_EXECUTION_GATE_ENABLED;
+      else process.env.REGIME_ENGINE_EXECUTION_GATE_ENABLED = original;
+    }
+  });
 });
 
 // ═════════════════════════════════════════════════════════════════════════════════════════════════
