@@ -1255,6 +1255,33 @@ export interface CurrentGuardVariantMatrixObservation {
    * explicitly-approved decision, not something to slip in.
    */
   marketEpisodeId?: string | null;
+  /**
+   * The variant's own variantMaxHoldMs(variantId) AT THE MOMENT this row was opened (recorded once,
+   * in buildVariantMatrixObservationsForSignal, never backfilled). Optional and ABSENT on every row
+   * this repo wrote before 2026-08-05 — a genuine "we don't know" for legacy data, not a 0/null
+   * standing in for one.
+   *
+   * 2026-08-05 evidence-integrity fix (isolated-runtime-validation goal, requirement C): before this
+   * field existed, variantMaxHoldMs(variantId) was looked up LIVE against the variant's CURRENT
+   * config every time episode identity was computed, for every row regardless of age — so changing a
+   * variant's maxHoldHours retroactively re-chained every already-recorded row under the new width,
+   * and a position force-closed early by exactly that kind of reduction (resolutionSource:
+   * "MAX_HOLD_MTM") was counted identically to one that organically ran its own full course. Both are
+   * proven, executed regressions, not theoretical — see current-guard-variant-matrix.test.ts's
+   * [EVIDENCE-INTEGRITY-A]/[EVIDENCE-INTEGRITY-B] and [[maxholdhours-versioning-evidence-integrity-gap-2026-08-05]].
+   *
+   * isFreshValidObs is the fix's one enforcement point: a row only counts toward current evidence
+   * when openMaxHoldMs is ABSENT (legacy row — grandfathered in exactly as before, so this field's
+   * addition changes zero observable behavior until it has been live long enough to matter) or equals
+   * variantMaxHoldMs(variantId) evaluated NOW. A row whose recorded value has since drifted from the
+   * live config — because the variant's maxHoldHours changed after this row opened, whether it later
+   * resolved organically or was force-closed by that exact change — silently drops out of freshValid,
+   * exactly like a MAX_HOLD_MTM-caused early exit already implicitly represents different economics
+   * than the row's own regime intended. This is deliberately NOT retroactive for existing data (no
+   * historical openMaxHoldMs is recoverable after the fact) and deliberately NOT a full "report both
+   * lane versions separately" system — it closes the silent-contamination gap, nothing more.
+   */
+  openMaxHoldMs?: number;
   entryVariant: string | null;
   createdAt: string;
   openedAt: string;
@@ -2110,6 +2137,10 @@ export function buildVariantMatrixObservationsForSignal(
       // reached ~200MB / 129k+ observations in production and a null-valued key on every row is
       // pure disk and JSON.parse cost for zero information.
       ...(signal.marketEpisodeId ? { marketEpisodeId: signal.marketEpisodeId } : {}),
+      // 2026-08-05 evidence-integrity fix — see the field's own doc comment on the interface.
+      // Unconditional (unlike marketEpisodeId above): this variant's max-hold width is always known
+      // at creation time, for every row, so there is no "irrelevant" case to omit.
+      openMaxHoldMs: variantMaxHoldMs(def.id),
       exactAxisProof,
       reportOnly: true as const,
       laneVersion: CURRENT_GUARD_VARIANT_MATRIX_LANE,
@@ -3991,7 +4022,14 @@ function isFreshValidObs(obs: CurrentGuardVariantMatrixObservation): boolean {
     typeof obs.grossR === "number" &&
     Number.isFinite(obs.grossR) &&
     typeof obs.netR === "number" &&
-    Number.isFinite(obs.netR)
+    Number.isFinite(obs.netR) &&
+    // 2026-08-05 evidence-integrity fix — see openMaxHoldMs's own doc comment on the interface.
+    // `undefined` (every row written before this field existed) is grandfathered in exactly as
+    // before; a row that recorded a value which no longer matches the variant's CURRENT max-hold
+    // width — because maxHoldHours changed since it opened, whether it went on to resolve organically
+    // or was force-closed by that exact change — silently drops out of current evidence rather than
+    // being re-chained under a width it was never actually measured against.
+    (obs.openMaxHoldMs === undefined || obs.openMaxHoldMs === variantMaxHoldMs(obs.variantId))
   );
 }
 

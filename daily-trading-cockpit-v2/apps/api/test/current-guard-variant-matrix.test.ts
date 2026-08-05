@@ -2037,20 +2037,25 @@ describe("current-guard-variant-matrix", () => {
       expect(ctx.status).not.toBe("PROMOTION_CANDIDATE");
     });
 
-    // 2026-08-05 evidence-integrity validation (isolated-runtime-validation goal, requirement C):
-    // "36h lane versions are distinct from prior 72h evidence" and "changing maxHoldHours does not
-    // change episode identity for identical market events". Both FAIL against the code as it stands
-    // today. `variantMaxHoldMs(variantId)` (blockWidthMs's sole source, see the two call sites above
-    // `buildContextEvidenceRow`) does a LIVE `.find()` against VARIANT_MATRIX_DEFINITIONS on every
-    // read — no observation records what maxHoldHours was in effect when IT opened, so a later config
-    // change re-chains every already-recorded row under the NEW width. This is not hypothetical: it
-    // is exactly what shipped for CG_WIDE_FAST_LONG/CG_BE_AFTER_05/BL_TREND_SCALEOUT_STOP200 on
-    // 2026-08-04 (72h -> 36h) — "episode count jumped same-second on both instances" for OLD rows
-    // that had already resolved under the 72h regime, not just new ones.
-    it("[EVIDENCE-INTEGRITY-A, FINDING — invariant does NOT hold] changing a variant's maxHoldHours retroactively changes episode identity for ALREADY-RECORDED rows of the SAME market events", () => {
+    // 2026-08-05 evidence-integrity fix (isolated-runtime-validation goal, requirement C): "36h lane
+    // versions are distinct from prior 72h evidence" and "changing maxHoldHours does not change
+    // episode identity for identical market events". Both were FALSE against the code before this fix
+    // — variantMaxHoldMs(variantId) did a LIVE .find() against VARIANT_MATRIX_DEFINITIONS on every
+    // read, with no observation recording what maxHoldHours was in effect when IT opened, so a later
+    // config change silently re-chained every already-recorded row under the NEW width. Not
+    // hypothetical: this is exactly what shipped for CG_WIDE_FAST_LONG/CG_BE_AFTER_05/
+    // BL_TREND_SCALEOUT_STOP200 on 2026-08-04 (72h -> 36h) — "episode count jumped same-second on
+    // both instances" for OLD rows that had already resolved under the 72h regime.
+    //
+    // Fixed via openMaxHoldMs (see the field's own doc comment on CurrentGuardVariantMatrixObservation):
+    // recorded once at row creation, and isFreshValidObs — the ONE gate every stage/episode/promotion
+    // computation is built from — now excludes any row whose recorded value no longer matches the
+    // variant's CURRENT live width. `undefined` (every row this repo wrote before this fix) is
+    // grandfathered in unchanged.
+    it("[EVIDENCE-INTEGRITY-A, FIX VERIFIED] changing a variant's maxHoldHours excludes already-recorded rows from current evidence instead of silently re-clustering them under the new width — and they return once the config matches again", () => {
       const store = new CurrentGuardVariantMatrixStore(tmpDir());
-      // Identical cohort to [4C-EPISODE-OVERLAP]: 72 hourly-spaced rows, all within the variant's
-      // default 72h max-hold window -> one episode there.
+      // Identical cohort to [4C-EPISODE-OVERLAP]: 72 hourly-spaced rows, all opened (and recorded)
+      // under the variant's default 72h max-hold width.
       addScanChainCohort(store, "retro", HOUR_MS, 72);
       const before = contextRowOf(store);
       expect(before.freshValid).toBe(72);
@@ -2065,53 +2070,91 @@ describe("current-guard-variant-matrix", () => {
       def.maxHoldHours = 36;
       try {
         const after = contextRowOf(store);
-        // SAME 72 rows, SAME store, SAME market events — only the live config differs. A system that
-        // pinned episode identity to the maxHoldHours in effect when each row opened would still
-        // read 1 here. It reads 2: the chain re-anchors at the row opening +36h (rows 0-35 stay
-        // episode 1, rows 36-71 become episode 2 — see the file's own re-anchoring rule, [4C-EPISODE-CHAIN]).
-        expect(after.freshValid).toBe(72);
-        expect(after.effectiveN).toBe(2);
-        expect(after.effectiveN).not.toBe(before.effectiveN);
+        // The OLD behavior (pre-fix) re-chained these 72 rows under the new 36h width and reported
+        // freshValid=72, effectiveN=2 — silently blending 72h-regime evidence into a 36h reading.
+        // The FIX instead drops every row whose recorded openMaxHoldMs (72h) no longer matches the
+        // live config (36h): no row is re-interpreted under a width it was never actually measured
+        // against, and none is destroyed — they simply stop counting toward CURRENT evidence.
+        expect(after.freshValid).toBe(0);
+        expect(after.effectiveN).toBe(0);
       } finally {
         delete def.maxHoldHours;
       }
 
-      // Confirms this is a live, uncached recomputation on every single read (not a one-time
-      // migration side effect) — restoring the config and reading the identical store again
-      // reproduces the original count exactly.
+      // Confirms this is a live, uncached recomputation on every single read, and that exclusion is
+      // reversible, not destructive: restoring the config and reading the identical store again
+      // reproduces the ORIGINAL count exactly — the rows were never mutated or dropped from the
+      // store, only excluded from evidence while the live config didn't match what they were opened
+      // under.
       const restored = contextRowOf(store);
+      expect(restored.freshValid).toBe(72);
       expect(restored.effectiveN).toBe(1);
     });
 
-    it("[EVIDENCE-INTEGRITY-B, FINDING — invariant does NOT hold] resolutionSource=MAX_HOLD_MTM rows (the tag produced when a position is force-closed at its hold ceiling, including a maxHoldHours-reduction-caused one) are counted IDENTICALLY to organically-resolved rows — nothing in this file's fresh/learning/STABLE/holdout/episode/promotion path filters on resolutionSource", () => {
-      // Exhaustive source check (not just this test): resolutionSource is written in several places
-      // (finalize(), the NO_FILL/EXPIRED_UNRESOLVED branches, the context-row builder copying
-      // walk.resolutionSource through) but read as a filter/branch condition in exactly one place in
-      // the whole file (a resolutionSource === "MFE_GIVEBACK_EXIT" check unrelated to population
-      // membership). isFreshValidObs — the ONE gate that decides whether a row enters `fresh` (which
-      // every stage/episode/promotion computation is built from) — checks only status/isFreshValid/
-      // grossR/netR. It never references resolutionSource.
+    it("[EVIDENCE-INTEGRITY-B, FIX VERIFIED] a lane opened under the NEW maxHoldHours is measured independently of stale rows still sitting in the same store from the OLD regime — the two never blend into one reading", () => {
       const store = new CurrentGuardVariantMatrixStore(tmpDir());
-      addScanChainCohort(store, "tag-control", HOUR_MS, 72);
-      const control = contextRowOf(store);
+      // OLD-regime cohort, recorded while this variant's default was 72h (openMaxHoldMs baked in at
+      // creation as 72h's ms value).
+      addScanChainCohort(store, "old-regime", HOUR_MS, 40);
 
-      // Retag every row for this variant as MAX_HOLD_MTM — same netR/grossR/status/isFreshValid/
-      // openedAt/symbol/scanBatchId, only resolutionSource changes. This is the exact shape the 183
-      // real paper positions took on 2026-08-04 when the maxHoldHours reduction force-closed them.
-      for (const obs of store.all) {
-        if (obs.variantId === EPISODE_VARIANT_ID) {
-          store.update(obs.observationId, { resolutionSource: "MAX_HOLD_MTM" });
-        }
+      // Now the config changes to 36h — simulating the real 2026-08-04 deploy — and STAYS there for
+      // every row recorded after this point (openMaxHoldMs's whole point: it is set from
+      // variantMaxHoldMs(def.id) AT CREATION, so anything added from here on is a genuine "36h
+      // version" row).
+      const def = VARIANT_MATRIX_DEFINITIONS.find((d) => d.id === EPISODE_VARIANT_ID)!;
+      expect(def.maxHoldHours).toBeUndefined();
+      def.maxHoldHours = 36;
+      try {
+        // NEW-regime cohort: 50 more hourly rows, added to the SAME store, dated well after the old
+        // cohort (a distinct prefix keeps sourceObservationKey unique).
+        addScanChainCohort(store, "new-regime", HOUR_MS, 50);
+        const ctx = contextRowOf(store);
+        // Only the 50 new-regime rows count — the 40 old-regime rows are excluded ([EVIDENCE-
+        // INTEGRITY-A]'s mechanism), not silently merged into this variant's current reading. This is
+        // the literal claim requirement C makes: a 36h lane "version" is distinct from — never
+        // blended with — the prior 72h evidence sitting in the same store.
+        expect(ctx.freshValid).toBe(50);
+        // 50 hourly rows inside one 36h window still chain into fewer than 50 independent episodes
+        // (re-anchoring every 36h, mirroring [4C-EPISODE-CHAIN]'s own math) — the exact figure isn't
+        // the point here, only that it is computed EXCLUSIVELY from the 50 new-regime rows.
+        expect(ctx.effectiveN).toBeGreaterThan(0);
+        expect(ctx.effectiveN).toBeLessThan(50);
+      } finally {
+        delete def.maxHoldHours;
       }
-      const tagged = contextRowOf(store);
+    });
 
-      // If MAX_HOLD_MTM/transition rows were excluded from the learning population per requirement
-      // C, every field below would drop (fewer fresh rows -> fewer episodes -> a worse-or-equal
-      // status, never byte-identical). Nothing moves at all.
-      expect(tagged.freshValid).toBe(control.freshValid);
-      expect(tagged.effectiveN).toBe(control.effectiveN);
-      expect(tagged.netAvgR).toBe(control.netAvgR);
-      expect(tagged.status).toBe(control.status);
+    it("[EVIDENCE-INTEGRITY-C, FIX VERIFIED] a transition-forced MAX_HOLD_MTM row (opened under the OLD width, force-closed by the maxHoldHours reduction) is excluded from current evidence — while an ORGANIC MAX_HOLD_MTM row that still matches the current config keeps counting normally", () => {
+      // resolutionSource itself is still never read as a filter anywhere in this file (unchanged —
+      // confirmed by exhaustive grep, same as before this fix). The fix works one layer beneath it:
+      // openMaxHoldMs vs the live config. This test proves the PRACTICAL consequence requirement C
+      // actually cares about — a transition-caused MAX_HOLD_MTM row is a row whose openMaxHoldMs was
+      // recorded under a width that has SINCE changed, which is exactly the case [EVIDENCE-
+      // INTEGRITY-A]'s mechanism excludes, regardless of what resolutionSource says.
+      const store = new CurrentGuardVariantMatrixStore(tmpDir());
+      addScanChainCohort(store, "organic-control", HOUR_MS, 10);
+      // Tag them MAX_HOLD_MTM while the config still matches what they were opened under — an
+      // ORGANIC max-hold expiry, not a transition artifact.
+      for (const obs of store.all) {
+        if (obs.variantId === EPISODE_VARIANT_ID) store.update(obs.observationId, { resolutionSource: "MAX_HOLD_MTM" });
+      }
+      const organic = contextRowOf(store);
+      // Organic MAX_HOLD_MTM rows still count — resolutionSource alone was never, and still isn't,
+      // an exclusion signal. Excluding every max-hold expiry regardless of cause would be its own
+      // over-broad bug (this lane's own real p90 resolve times sit near its ceiling by design).
+      expect(organic.freshValid).toBe(10);
+      expect(organic.effectiveN).toBeGreaterThan(0);
+
+      // Now change the config — these SAME already-tagged rows become transition-shaped: opened
+      // under 72h, MAX_HOLD_MTM-closed under 72h, but the live config has since moved to 36h.
+      const def = VARIANT_MATRIX_DEFINITIONS.find((d) => d.id === EPISODE_VARIANT_ID)!;
+      def.maxHoldHours = 36;
+      try {
+        const afterTransition = contextRowOf(store);
+        expect(afterTransition.freshValid).toBe(0);
+      } finally {
+        delete def.maxHoldHours;
+      }
     });
 
     it("[4C-ORIGIN-CLOCK] resolvedAt is never consulted: positions ORIGINATED inside one episode stay one episode however far apart they resolve", () => {
