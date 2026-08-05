@@ -175,6 +175,9 @@ export interface NeuralMapLane {
   promotionProof: NeuralLaneStageProof | null;
   netAvgR: number | null;
   pf: number | null;
+  /** See NeuralPfStatus's own doc comment. Display-only — never gate, sort, rank, or color a lane;
+   *  `pf` is already `null` (not a sentinel) in every case this isn't "COMPUTED". */
+  pfStatus: NeuralPfStatus;
   wr: number | null;
   /**
    * Where netAvgR/pf/wr/closed come from. The sources are DIFFERENT measurements — without this tag
@@ -192,6 +195,11 @@ export interface NeuralMapLane {
   legacyExcludedRows: number;
   legacyExclusionReasons: { reason: string; count: number }[];
   previousEvidenceVersion: string | null;
+  policyVersion: string | null;
+  /** "INFERRED" for every lane today (no canonical reset registry exists yet — see
+   *  resolveCanonicalCutoverMetadata's own doc comment in current-guard-variant-matrix.ts). Exposed
+   *  for auditability: a dashboard/operator can tell a derived fact from a stored one. */
+  cutoverSource: "CANONICAL" | "INFERRED";
   cohorts: {
     LONG: NeuralLaneCohortStats | null;
     SHORT: NeuralLaneCohortStats | null;
@@ -416,7 +424,20 @@ const CLOSED = new Set(["PAPER_CLOSED_WIN", "PAPER_CLOSED_LOSS"]);
 const OPEN = new Set(["CREATED", "PAPER_SUBMITTED"]);
 const MARK_CANDLE_MS = 5 * 60 * 1000;
 const DEFAULT_MARK_FETCH_TIMEOUT_MS = 2_500;
-const PERFECT_PF_SENTINEL = 999_999;
+
+/**
+ * 2026-08-05 fix: PF is mathematically undefined (a division by zero) when a lane has wins but no
+ * losses yet — the removed `PERFECT_PF_SENTINEL = 999_999` stood in for that, and being a real
+ * finite number, it silently cleared every `pf > PF_STRONG`/`HEADLINE_PF_FLOOR` gate a lane with a
+ * single lucky winning trade and zero loss data could reach, promoting/coloring/ranking it as
+ * exceptional on an insufficient sample. `pf` is now `null` in every zero-denominator case (matching
+ * current-guard-variant-matrix.ts's own profitFactor(), which never used a sentinel) — every existing
+ * `pf !== null && pf > X` / `pf ?? NEGATIVE_INFINITY` consumer already treats null as "does not clear
+ * the floor", so this alone removes the ranking/coloring hazard. `pfStatus` exists ONLY to pick the
+ * right display wording (NO_LOSSES_YET vs NO_WINS_YET vs no data at all) — it must never gate, sort,
+ * rank, or color anything itself.
+ */
+export type NeuralPfStatus = "COMPUTED" | "NO_LOSSES_YET" | "NO_WINS_YET" | "NO_DATA";
 
 export interface PaperMarkPriceClient {
   getCandles(symbol: string, interval: string, limit: number): Promise<Array<{
@@ -938,18 +959,33 @@ function laneEconomics(orders: PaperOrder[], laneId: string) {
   const nets = closed.map((order) => order.netR).filter(finite);
   const positive = nets.filter((value) => value > 0).reduce((sum, value) => sum + value, 0);
   const negative = nets.filter((value) => value < 0).reduce((sum, value) => sum + Math.abs(value), 0);
+  // Real division only when BOTH sides are nonzero; every zero-denominator/zero-numerator case is
+  // `null` (mathematically undefined, never a finite stand-in) — see NeuralPfStatus's own doc comment.
+  const pf = positive > 0 && negative > 0 ? positive / negative : null;
+  const pfStatus: NeuralPfStatus =
+    nets.length === 0 ? "NO_DATA" :
+    positive > 0 && negative === 0 ? "NO_LOSSES_YET" :
+    negative > 0 && positive === 0 ? "NO_WINS_YET" :
+    "COMPUTED";
   return {
     open: scoped.filter((order) => OPEN.has(order.paperStatus)).length,
     closed: closed.length,
     headlineClosed: headline.length,
     netAvgR: nets.length > 0 ? nets.reduce((sum, value) => sum + value, 0) / nets.length : null,
-    // JSON serializes Infinity as null, so use a large finite sentinel for no-loss profitable lanes.
-    pf: negative > 0 ? positive / negative : positive > 0 ? PERFECT_PF_SENTINEL : null,
+    pf,
+    pfStatus,
     wr: closed.length > 0 ? closed.filter((order) => order.paperStatus === "PAPER_CLOSED_WIN").length / closed.length : null,
     headlinePnl: headline.reduce((sum, order) => sum + (order.netPnlAmount ?? 0), 0),
     diagnosticPnl: diagnostic.reduce((sum, order) => sum + (order.netPnlAmount ?? 0), 0),
     totalPnl: closed.reduce((sum, order) => sum + (order.netPnlAmount ?? 0), 0),
   };
+}
+
+function fmtPfForStatusText(pf: number | null, pfStatus: NeuralPfStatus): string {
+  if (pfStatus === "NO_LOSSES_YET") return "N/A (no losing outcome yet — insufficient sample)";
+  if (pfStatus === "NO_WINS_YET") return "N/A (no winning outcome yet — insufficient sample)";
+  if (pf === null) return "n/a";
+  return pf.toFixed(2);
 }
 
 function paperBookStatus(economics: ReturnType<typeof laneEconomics>): {
@@ -962,6 +998,9 @@ function paperBookStatus(economics: ReturnType<typeof laneEconomics>): {
   const freshValid = economics.closed;
   const net = economics.netAvgR;
   const pf = economics.pf;
+  // pf is null (never a sentinel) whenever pfStatus !== "COMPUTED" — `pf !== null && pf > PF_STRONG`
+  // already fails closed for NO_LOSSES_YET/NO_WINS_YET/NO_DATA on its own; this line is unchanged
+  // from before the PF-sentinel fix precisely because removing the sentinel was the whole fix.
   const clearsHeadline =
     freshValid >= WATCHABLE_MIN_FRESH &&
     net !== null && net > 0 &&
@@ -971,7 +1010,7 @@ function paperBookStatus(economics: ReturnType<typeof laneEconomics>): {
     if (freshValid < STABLE_MIN_FRESH) blockers.push(`freshValid ${freshValid} < ${STABLE_MIN_FRESH} for stable`);
     return {
       status: "WATCHABLE",
-      statusReason: `paper-realized freshValid=${freshValid}, net=${fmtR(net)} PF=${pf >= PERFECT_PF_SENTINEL ? "inf" : pf.toFixed(2)} — headline/watchable`,
+      statusReason: `paper-realized freshValid=${freshValid}, net=${fmtR(net)} PF=${fmtPfForStatusText(pf, economics.pfStatus)} — headline/watchable`,
       blockers,
       cautions: ["paper-book lane: VM-only OOS/payoff/stress fields are not required for headline display"],
     };
@@ -979,12 +1018,18 @@ function paperBookStatus(economics: ReturnType<typeof laneEconomics>): {
 
   if (freshValid < WATCHABLE_MIN_FRESH) blockers.push(`freshValid ${freshValid} < ${WATCHABLE_MIN_FRESH}`);
   if (net === null || net <= 0) blockers.push("netAvgR not positive");
-  if (pf === null || pf <= PF_STRONG) blockers.push(`PF <= ${PF_STRONG}`);
+  if (pf === null || pf <= PF_STRONG) {
+    blockers.push(
+      economics.pfStatus === "NO_LOSSES_YET"
+        ? "PF undefined — no losing outcome yet (insufficient sample, not evidence of an edge)"
+        : `PF <= ${PF_STRONG}`,
+    );
+  }
 
   return {
     status: economics.open > 0 || freshValid > 0 ? "PAPER_EVIDENCE" : "COLLECTING",
     statusReason: economics.open > 0 || freshValid > 0
-      ? `paper-realized evidence: freshValid=${freshValid}, net=${fmtR(net)} PF=${pf !== null && pf >= PERFECT_PF_SENTINEL ? "inf" : pf !== null ? pf.toFixed(2) : "n/a"}`
+      ? `paper-realized evidence: freshValid=${freshValid}, net=${fmtR(net)} PF=${fmtPfForStatusText(pf, economics.pfStatus)}`
       : "no paper-book evidence yet",
     blockers,
     cautions: ["paper-book lane: VM-only OOS/payoff/stress fields are not available until a VM row exists"],
@@ -1384,6 +1429,23 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
     // rendered next to paper PnL dollars can never read as one dataset. Lanes without a VM row
     // (e.g. CG_LONG_VARIANT_MATRIX:*) show paper-realized stats under the same fields.
     const statsSource: NeuralLaneStatsSource = evidenceRow ? "VM_SIM" : "PAPER_BOOK";
+    // evidenceRow.pf already comes from profitFactor() in current-guard-variant-matrix.ts, which has
+    // never used a sentinel (null on every zero-denominator case) — only laneEconomics()'s pfStatus
+    // needed the fix. wr===1/wr===0 is the closest available signal to "no losses yet"/"no wins yet"
+    // for a VM row (no win/loss ROW COUNT field exists at this granularity, only wr); a lane with a
+    // breakeven (netR===0) row that is neither a win nor counted as a loss can fall through to
+    // COMPUTED with pf still null — a known, narrow edge case, not the case this fix targets.
+    const pfStatus: NeuralPfStatus = evidenceRow
+      ? evidenceRow.pf !== null
+        ? "COMPUTED"
+        : evidenceRow.freshValid === 0
+          ? "NO_DATA"
+          : evidenceRow.wr === 1
+            ? "NO_LOSSES_YET"
+            : evidenceRow.wr === 0
+              ? "NO_WINS_YET"
+              : "COMPUTED"
+      : economics.pfStatus;
     const infraReady = row
       ? input.variantMatrix.killSwitchReady && input.variantMatrix.orderReconciliationReady && input.variantMatrix.exchangeHealthReady
       : null;
@@ -1445,6 +1507,7 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
       promotionProof: neuralStageProof("promotion", evidenceRow?.promotionProof),
       netAvgR,
       pf: evidenceRow?.pf ?? economics.pf,
+      pfStatus,
       wr: evidenceRow?.wr ?? economics.wr,
       statsSource,
       // Read from the raw VM row (not the conditionally-nulled evidenceRow) — the version split is
@@ -1458,6 +1521,10 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
       legacyExcludedRows: row?.evidenceVersionSummary?.legacyExcludedRows ?? 0,
       legacyExclusionReasons: row?.evidenceVersionSummary?.legacyExclusionReasons ?? [],
       previousEvidenceVersion: row?.evidenceVersionSummary?.previousEvidenceVersion ?? null,
+      policyVersion: row?.evidenceVersionSummary?.policyVersion ?? null,
+      // INFERRED is the correct fail-closed default when evidenceVersionSummary itself is absent —
+      // absence of a summary is itself "not a stored canonical fact".
+      cutoverSource: row?.evidenceVersionSummary?.cutoverSource ?? "INFERRED",
       cohorts: {
         LONG: cohortFromBreakdown(directionRows.find((candidate) => candidate.key === "LONG")) ?? paperOnlyLongCohort,
         SHORT: cohortFromBreakdown(directionRows.find((candidate) => candidate.key === "SHORT")) ?? paperOnlyShortCohort,

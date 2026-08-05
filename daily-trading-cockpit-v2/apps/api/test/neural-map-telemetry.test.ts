@@ -636,6 +636,9 @@ describe("neural map telemetry", () => {
       blockers: ["freshValid 0 < 10"],
       cautions: [],
     } as never];
+    // 18 wins + 2 losses (not all-wins): a genuinely computable PF is the only way this scenario can
+    // legitimately clear the headline gate — see the dedicated all-wins/zero-losses test just below
+    // for the case this mix deliberately avoids (PF undefined must never look like an edge).
     input.orders = Array.from({ length: 20 }, (_, idx) => ({
       id: `paper-long-win-${idx}`,
       observationId: `obs-long-win-${idx}`,
@@ -648,9 +651,9 @@ describe("neural map telemetry", () => {
       entryPrice: 100,
       stopLoss: 97,
       takeProfitLevels: [101.5],
-      paperStatus: "PAPER_CLOSED_WIN",
-      netR: 0.4,
-      netPnlAmount: 4,
+      paperStatus: idx < 18 ? "PAPER_CLOSED_WIN" : "PAPER_CLOSED_LOSS",
+      netR: idx < 18 ? 0.4 : -0.5,
+      netPnlAmount: idx < 18 ? 4 : -5,
       plannedStopDistanceBps: 300,
       openedAt: "2026-06-06T11:00:00.000Z",
       updatedAt: "2026-06-06T12:00:00.000Z",
@@ -662,22 +665,64 @@ describe("neural map telemetry", () => {
     } as never));
 
     const lane = buildNeuralMapTelemetry(input).lanes.find((candidate) => candidate.id === "CG_LONG_VARIANT_MATRIX:CG_WIDE_FAST_LONG");
+    // pf = (18*0.4) / (2*0.5) = 7.2 / 1.0 ≈ 7.2 — genuinely computed, not a sentinel (floating-point,
+    // hence toBeCloseTo rather than exact equality).
     expect(lane).toMatchObject({
       status: "WATCHABLE",
       statsSource: "PAPER_BOOK",
       closed: 20,
-      pf: 999_999,
+      pfStatus: "COMPUTED",
     });
-    expect(lane?.netAvgR).toBeCloseTo(0.4, 9);
+    expect(lane?.pf).toBeCloseTo(7.2, 9);
+    expect(lane?.netAvgR).toBeCloseTo((7.2 - 1.0) / 20, 9);
     expect(lane?.cohorts.LONG).toMatchObject({
       n: 20,
-      pf: 999_999,
-      wr: 1,
+      wr: 0.9,
     });
-    expect(lane?.cohorts.LONG?.netAvgR).toBeCloseTo(0.4, 9);
+    expect(lane?.cohorts.LONG?.pf).toBeCloseTo(7.2, 9);
     expect(lane?.cohorts.SHORT).toBeNull();
     expect(lane?.blockers).toEqual(["freshValid 20 < 100 for stable"]);
     expect(lane?.cautions.join(" ")).toContain("VM-only OOS/payoff/stress");
+  });
+
+  // Goal issue A regression: a lane with real sample size (>= WATCHABLE_MIN_FRESH), positive net R,
+  // but ZERO losing closes must NEVER be treated as an exceptional/promotable result — PF is
+  // mathematically undefined there, not "practically infinite". This is the exact scenario the
+  // removed PERFECT_PF_SENTINEL (999_999) used to paper over: a real finite number that cleared
+  // `pf > PF_STRONG`/`HEADLINE_PF_FLOOR` on nothing but an insufficient sample.
+  it("PF sentinel removal: 20 winning closes with ZERO losses never clears the headline/watchable gate — PF is null with pfStatus NO_LOSSES_YET, never 999999", () => {
+    const input = baseInput();
+    input.variantMatrix.rows = [{
+      ...input.variantMatrix.rows[0]!,
+      variantId: "CG_WIDE_FAST_LONG",
+      label: "Wide Fast Long",
+      total: 0, open: 0, resolved: 0, freshValid: 0, netAvgR: null, pf: null, wr: null,
+      byDirection: [], status: "COLLECTING", statusReason: "VM row has not caught up",
+      blockers: ["freshValid 0 < 10"], cautions: [],
+    } as never];
+    input.orders = Array.from({ length: 20 }, (_, idx) => ({
+      id: `paper-allwin-${idx}`,
+      observationId: `obs-allwin-${idx}`,
+      sourceObservationKey: `BTCUSDT|LONG|2026-06-06T11:${String(idx).padStart(2, "0")}:00.000Z`,
+      sourceType: "ALLOCATOR_LANE",
+      selectedLaneId: "CG_LONG_VARIANT_MATRIX:CG_WIDE_FAST_LONG",
+      symbol: "BTCUSDT", direction: "LONG", regime: "Bullish expansion",
+      entryPrice: 100, stopLoss: 97, takeProfitLevels: [101.5],
+      paperStatus: "PAPER_CLOSED_WIN", netR: 0.4, netPnlAmount: 4, plannedStopDistanceBps: 300,
+      openedAt: "2026-06-06T11:00:00.000Z", updatedAt: "2026-06-06T12:00:00.000Z", closedAt: "2026-06-06T12:00:00.000Z",
+      paperOrderMode: "HEADLINE", paperRiskLabel: "EXPERIMENTAL", reportOnly: true, paperOnly: true,
+    } as never));
+
+    const lane = buildNeuralMapTelemetry(input).lanes.find((candidate) => candidate.id === "CG_LONG_VARIANT_MATRIX:CG_WIDE_FAST_LONG");
+    expect(lane?.pf).toBeNull();
+    expect(lane?.pf).not.toBe(999_999);
+    expect(lane?.pfStatus).toBe("NO_LOSSES_YET");
+    expect(lane?.cohorts.LONG?.pf).toBeNull();
+    // The whole point: real sample size (20 >= WATCHABLE_MIN_FRESH) and positive net R alone must NOT
+    // promote this lane — clearsHeadline requires a genuinely computed PF, which does not exist here.
+    expect(lane?.status).not.toBe("WATCHABLE");
+    expect(lane?.status).toBe("PAPER_EVIDENCE");
+    expect(lane?.blockers).toEqual(["PF undefined — no losing outcome yet (insufficient sample, not evidence of an edge)"]);
   });
 
   // 2026-08-05 evidence-version fix: laneEconomics()/PaperOrder has no knowledge of
@@ -700,7 +745,9 @@ describe("neural map telemetry", () => {
         previousEvidenceVersion: null,
       },
       total: 1, open: 0, resolved: 1, freshValid: 1, rejected: 0, noFill: 0, expired: 0, dataFailure: 0,
-      netAvgR: 0.6, grossAvgR: 0.7, pf: 999_999, wr: 1, avgWinR: 0.6, avgLossR: null,
+      // pf: null (never a sentinel) matches the real profitFactor() output for a single winner with
+      // zero losses — see the PF-sentinel fix tests below.
+      netAvgR: 0.6, grossAvgR: 0.7, pf: null, wr: 1, avgWinR: 0.6, avgLossR: null,
       payoffRatio: null, breakEvenWR: null, actualWR: 1, avgCostR: 0.1, costDragR: 0.1,
       noFillRate: 0, expiredRate: 0, avgHoldingMinutes: 60, approxMaxDrawdownR: 0,
       maxAdverseStreak: 0, topSymbolPnlShare: 1, plus10bpsNetAvgR: 0.5, plus10bpsStillPositive: true,
