@@ -1966,60 +1966,6 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       : undefined;
     if (!isTest) liveEngine.start();
 
-    // 2026-08 canonical-market-regime scheduler wiring fix (HIGH deployment-scope gap) — the missing
-    // orchestration cycle itself. Before this, ingestCanonicalMarketRegimeRawObservations /
-    // computeCanonicalMarketRegimeSnapshot / recordCanonicalMarketRegimeSnapshot had zero production
-    // callers, so getCanonicalMarketRegimeSnapshot() above could only ever resolve to its cold-start
-    // degraded default. runCanonicalMarketRegimeEngineCycleGuarded (canonical-market-regime-scheduler.ts)
-    // owns the ordering (resolveUniverse -> ingestRawObservations -> fetch BTC candles/per-symbol
-    // funding+OI -> compute -> record), the overlap guard (a module-level single-flight latch — see
-    // that file's own OVERLAP GUARD note for why module-level, not a buildApp()-local `let`, is what
-    // keeps this safe even if buildApp() were somehow invoked twice), and the coarse kill switch
-    // (CANONICAL_MARKET_REGIME_ENGINE_DISABLED, re-checked every cycle before any I/O — same env key
-    // getCanonicalMarketRegimeSnapshot() already honors, not a second flag). This call site only
-    // supplies the real dependencies: `binanceClient` (already used identically for the BTC
-    // ATR-percentile/Kronos-anchor refreshes below) satisfies both CanonicalMarketRegimeUniverseFetchCtx
-    // and the funding/OI/candle fetchers structurally, zero adapter code — mirrors
-    // tlobCollector.collect(binanceClient, ...) below. getPriorSnapshot reads the store's own nullable
-    // `.get()` (never the non-nullable degraded-default accessor above) so a genuine cold start is
-    // never fed into the hysteresis/dedup logic as if it were a real prior cycle. BTC candles are run
-    // through the same completedCandles(...) causal filter the engine's own per-symbol ingestion
-    // applies internally (and refreshBtcAtrPercentileCache applies for this identical BTCUSDT/1h
-    // series) — without it a still-forming hourly bar would repaint riskStress mid-hour. Cadence is
-    // CANONICAL_MARKET_REGIME_ENGINE_TICK_INTERVAL_MS (5 minutes, that module's own doc-comment-stated
-    // constant, matching the engine's own "5-minute tick / 1h-candle cadence" design) — not invented
-    // here. Registration is unconditional under `!isTest` (mirrors cortexShadowTick's own registration
-    // earlier in this function: the coarse kill switch is re-checked INSIDE the guarded cycle every
-    // tick, not at registration time, so no second gate is needed here). Never throws (see that
-    // function's own doc comment); a failed cycle is still logged so a dead engine is visible in the
-    // process logs rather than silently stuck at its degraded default again.
-    const runCanonicalMarketRegimeEngineTick = (): void => {
-      void runCanonicalMarketRegimeEngineCycleGuarded({
-        resolveUniverse: (nowMs) => resolveCanonicalMarketRegimeUniverse({ nowMs, ctx: binanceClient }),
-        ingestRawObservations: ingestCanonicalMarketRegimeRawObservations,
-        fetchBtcCandles: () =>
-          binanceClient
-            .getCandles(BTC_ATR_PERCENTILE_SYMBOL, BTC_ATR_PERCENTILE_INTERVAL, BTC_ATR_PERCENTILE_CANDLES_NEEDED)
-            .then((candles) => completedCandles(candles, BTC_ATR_PERCENTILE_INTERVAL)),
-        fetchFuturesFlow: (symbol) => binanceClient.getFuturesFlow(symbol),
-        getPriorSnapshot: () => getCanonicalMarketRegimeSnapshotStore().get(),
-        recordSnapshot: recordCanonicalMarketRegimeSnapshot,
-      })
-        .then((result) => {
-          if (result && !result.ok) {
-            console.error(`[canonical-market-regime] cycle failed: ${result.error}`);
-          }
-        })
-        .catch((err) => console.error("[canonical-market-regime] scheduler tick threw unexpectedly", err));
-    };
-    if (!isTest) {
-      // 30s warm-up offset: after the ATR-percentile(10s)/Kronos-anchor(20s) BTC producers immediately
-      // below get their own head start, before this heavier per-universe-symbol (up to 60) funding+OI
-      // fan-out fires — avoids stacking every network-bound startup producer into the same instant.
-      setTimeout(runCanonicalMarketRegimeEngineTick, 30_000);
-      setInterval(runCanonicalMarketRegimeEngineTick, CANONICAL_MARKET_REGIME_ENGINE_TICK_INTERVAL_MS);
-    }
-
     // Cross-sectional market-neutral EXECUTOR (testnet-first). Env-gated; on mainnet
     // it additionally requires the engine to be ARMED, so the flag alone can never
     // trade real money. Consumes the same store the measurement lane writes.
@@ -2826,6 +2772,71 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       }
     }
   }
+
+  // 2026-08 canonical-market-regime scheduler wiring fix (HIGH deployment-scope gap) — the missing
+  // orchestration cycle itself. Before this, ingestCanonicalMarketRegimeRawObservations /
+  // computeCanonicalMarketRegimeSnapshot / recordCanonicalMarketRegimeSnapshot had zero production
+  // callers, so getCanonicalMarketRegimeSnapshot() above could only ever resolve to its cold-start
+  // degraded default. runCanonicalMarketRegimeEngineCycleGuarded (canonical-market-regime-scheduler.ts)
+  // owns the ordering (resolveUniverse -> ingestRawObservations -> fetch BTC candles/per-symbol
+  // funding+OI -> compute -> record), the overlap guard (a module-level single-flight latch — see
+  // that file's own OVERLAP GUARD note for why module-level, not a buildApp()-local `let`, is what
+  // keeps this safe even if buildApp() were somehow invoked twice), and the coarse kill switch
+  // (CANONICAL_MARKET_REGIME_ENGINE_DISABLED, re-checked every cycle before any I/O — same env key
+  // getCanonicalMarketRegimeSnapshot() already honors, not a second flag). This call site only
+  // supplies the real dependencies: `binanceClient` (already used identically for the BTC
+  // ATR-percentile/Kronos-anchor refreshes below) satisfies both CanonicalMarketRegimeUniverseFetchCtx
+  // and the funding/OI/candle fetchers structurally, zero adapter code — mirrors
+  // tlobCollector.collect(binanceClient, ...) below. getPriorSnapshot reads the store's own nullable
+  // `.get()` (never the non-nullable degraded-default accessor above) so a genuine cold start is
+  // never fed into the hysteresis/dedup logic as if it were a real prior cycle. BTC candles are run
+  // through the same completedCandles(...) causal filter the engine's own per-symbol ingestion
+  // applies internally (and refreshBtcAtrPercentileCache applies for this identical BTCUSDT/1h
+  // series) — without it a still-forming hourly bar would repaint riskStress mid-hour. Cadence is
+  // CANONICAL_MARKET_REGIME_ENGINE_TICK_INTERVAL_MS (5 minutes, that module's own doc-comment-stated
+  // constant, matching the engine's own "5-minute tick / 1h-candle cadence" design).
+  //
+  // PLACEMENT FIX (2026-08-05): this block originally lived a few hundred lines earlier, physically
+  // inside `if (liveConfig.enabled && liveConfig.configErrors.length === 0 && liveConfig.env) { ... }`
+  // (right after `liveEngine.start()`), while its own doc comment claimed registration was
+  // "unconditional under `!isTest`". That claim was false as deployed: LIVE_EXECUTION_ENABLED is "0" on
+  // both research instances (3101 and the 3111 staging mirror), so the scheduler never registered
+  // there at all — confirmed live via a research-staging instance that produced zero
+  // "[canonical-market-regime-universe] resolved" log lines across its full runtime, versus a
+  // testnet-staging instance (LIVE_EXECUTION_ENABLED=1) that logged a successful cycle within seconds
+  // of boot. getCanonicalMarketRegimeSnapshot() on research was therefore still stuck at its cold-start
+  // degraded default the whole time this "fix" was believed shipped. Moved here, past the liveConfig
+  // block's closing brace, so registration is actually unconditional under `!isTest` as intended —
+  // regime classification has nothing to do with whether live execution is configured. Never throws
+  // (see that function's own doc comment); a failed cycle is still logged so a dead engine is visible
+  // in the process logs rather than silently stuck at its degraded default again.
+  const runCanonicalMarketRegimeEngineTick = (): void => {
+    void runCanonicalMarketRegimeEngineCycleGuarded({
+      resolveUniverse: (nowMs) => resolveCanonicalMarketRegimeUniverse({ nowMs, ctx: binanceClient }),
+      ingestRawObservations: ingestCanonicalMarketRegimeRawObservations,
+      fetchBtcCandles: () =>
+        binanceClient
+          .getCandles(BTC_ATR_PERCENTILE_SYMBOL, BTC_ATR_PERCENTILE_INTERVAL, BTC_ATR_PERCENTILE_CANDLES_NEEDED)
+          .then((candles) => completedCandles(candles, BTC_ATR_PERCENTILE_INTERVAL)),
+      fetchFuturesFlow: (symbol) => binanceClient.getFuturesFlow(symbol),
+      getPriorSnapshot: () => getCanonicalMarketRegimeSnapshotStore().get(),
+      recordSnapshot: recordCanonicalMarketRegimeSnapshot,
+    })
+      .then((result) => {
+        if (result && !result.ok) {
+          console.error(`[canonical-market-regime] cycle failed: ${result.error}`);
+        }
+      })
+      .catch((err) => console.error("[canonical-market-regime] scheduler tick threw unexpectedly", err));
+  };
+  if (!isTest) {
+    // 30s warm-up offset: after the ATR-percentile(10s)/Kronos-anchor(20s) BTC producers get their own
+    // head start, before this heavier per-universe-symbol (up to 60) funding+OI fan-out fires — avoids
+    // stacking every network-bound startup producer into the same instant.
+    setTimeout(runCanonicalMarketRegimeEngineTick, 30_000);
+    setInterval(runCanonicalMarketRegimeEngineTick, CANONICAL_MARKET_REGIME_ENGINE_TICK_INTERVAL_MS);
+  }
+
   // Research/testnet-only CORTEX lifecycle for an allowlisted instance with execution disabled.
   // This is shadow-only and has no engine reference, promotion object, allocation setter, or execution
   // callback. The hard instance gate excludes 3103 independently of environment configuration.

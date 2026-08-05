@@ -380,4 +380,48 @@ describe("app.ts wiring (source-level guard, mirrors kronos-btc-anchor.test.ts's
     // call (which would mean lastIndexOf latched onto the wrong, non-enclosing block by coincidence).
     expect(APP.slice(openBraceAt + 1, at)).not.toContain("if (!isTest) {");
   });
+
+  it("[REGRESSION 2026-08-05] registration sits OUTSIDE `if (liveConfig.enabled && ...) { ... }` — the scheduler must run on instances with LIVE_EXECUTION_ENABLED unset/0 (research: 3101), not only on instances where live execution happens to be configured", () => {
+    // FOUND live, on the 3111 research-staging mirror of 3101: this block originally lived physically
+    // inside the liveConfig.enabled section (right after `liveEngine.start()`), so on any instance
+    // where LIVE_EXECUTION_ENABLED !== "1" (3101 and its staging mirror both run with it unset/0 by
+    // design — research does no live execution) the setTimeout/setInterval calls below never ran at
+    // all, silently, despite this exact file's own doc comment insisting registration was
+    // "unconditional under `!isTest`". Confirmed via live instrumentation: a research-staging instance
+    // produced zero canonical-market-regime log lines across its full runtime; the same code on a
+    // LIVE_EXECUTION_ENABLED=1 instance logged a successful cycle within seconds of boot. The prior
+    // test above only proves the setTimeout is inside SOME `if (!isTest) {` block — it says nothing
+    // about whether THAT block is itself nested inside a larger conditional, which is exactly how this
+    // regression slipped past it.
+    const liveConfigGuardAt = APP.indexOf(
+      "if (liveConfig.enabled && liveConfig.configErrors.length === 0 && liveConfig.env) {",
+    );
+    expect(liveConfigGuardAt).toBeGreaterThanOrEqual(0);
+    const liveConfigOpenBraceAt = APP.indexOf("{", liveConfigGuardAt);
+    let depth = 0;
+    let liveConfigBlockEndAt = -1;
+    for (let i = liveConfigOpenBraceAt; i < APP.length; i++) {
+      if (APP[i] === "{") depth++;
+      else if (APP[i] === "}") {
+        depth--;
+        if (depth === 0) {
+          liveConfigBlockEndAt = i;
+          break;
+        }
+      }
+    }
+    expect(liveConfigBlockEndAt).toBeGreaterThan(liveConfigOpenBraceAt);
+
+    const tickDefAt = APP.indexOf("const runCanonicalMarketRegimeEngineTick = ");
+    const registrationAt = APP.indexOf("setTimeout(runCanonicalMarketRegimeEngineTick, 30_000);");
+    expect(tickDefAt).toBeGreaterThanOrEqual(0);
+    expect(registrationAt).toBeGreaterThanOrEqual(0);
+
+    // Neither the tick closure's own definition nor its setTimeout/setInterval registration may fall
+    // strictly inside [liveConfigOpenBraceAt, liveConfigBlockEndAt) — either wholly before the block
+    // starts, or (as placed by this fix) wholly after it ends.
+    const insideLiveConfigBlock = (pos: number) => pos > liveConfigOpenBraceAt && pos < liveConfigBlockEndAt;
+    expect(insideLiveConfigBlock(tickDefAt)).toBe(false);
+    expect(insideLiveConfigBlock(registrationAt)).toBe(false);
+  });
 });
