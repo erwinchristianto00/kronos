@@ -260,3 +260,161 @@ Re-checked every consumer this session's commits touch against each named risk:
 ## 12. Status at time of writing
 
 All of A-F complete. Verdict: **`KRONOS_ACTIVE_RESEARCH_TESTNET_PROMOTION_READY`**.
+
+## 13. Phase 1 closure
+
+Closure verification (read-only) discovered one safety-critical defect in-scope under the closure
+goal's own exception ("causal identity/evidence corruption"). Found, fixed, tested, and re-verified
+against real production data before this closure could be honestly declared; no other source,
+runtime, config, or data change was made during closure.
+
+### 13.1 Defect found and fixed: `FORWARD_CAUSAL_SCHEMA_MISMATCH` on the real production journal
+
+Closure verification read active 3102's real causal journal (`data/causal-experience/3102/
+events.jsonl`, real production data spanning 2026-08-01 onward) through the strict reader promoted
+in §10. It returned `FORWARD_CAUSAL_SCHEMA_MISMATCH`, `malformed: 11370` of 11432 — the identity
+schema fields added earlier this session (§4's `logicalRole`, and the CORTEX-link cluster) are an
+**all-or-nothing** gate: one field absent on a legacy row blocks that entire read, and nearly the
+whole pre-existing journal predates those fields. Diagnosed and fixed in three stages, each via a
+standalone per-field diagnostic script against the real file (never guessed, never assumed one fix
+was sufficient without re-verifying against the real journal):
+
+| Stage | Cause (field absent, not null, on legacy rows) | Malformed before → after | Commit |
+|---|---|---|---|
+| 1 | `identity.logicalRole` | 11370 → 3666 | (this session, pre-closure) |
+| 2 | `identity.allocationSnapshotId` / `canonicalCortexLaneId` / `cortexFeatureSchemaVersion` (paired with explicit `cortexDecisionId: null`) | 3666 → 1404 | (this session, pre-closure) |
+| 3 | `cortexTraining.snapshotAtMs` on `DECISION_SNAPSHOT` rows with `cortexTraining.status: "MISSING"` | 1404 → 0 | `6a9bf83` |
+
+All three are the same defect class: a nullable field added to a persisted schema, validated with a
+strict `=== null` check that rejects `undefined` (key absent) from rows written before the field
+existed. Each fix follows the pattern already established for `openMaxHoldMs` (§1): treat `undefined`
+as exactly equivalent to `null`, scoped only to the specific field found broken, never widened
+speculatively to fields real data showed no problem with. Stage 3 fix: new `nullableOptFinite` helper
+in `forward-causal-collection.ts`; regression test constructs a real event via the normal write path,
+deletes `cortexTraining.snapshotAtMs` to reproduce the exact legacy shape, asserts the strict reader
+now accepts it. Verified: typecheck clean; full suite green (7358/7359 relevant tests passing — one
+unrelated pre-existing git-blob-provenance test timeout at the full-suite concurrency level, confirmed
+transient by re-running that file alone at 16s against its own 20s timeout); mutation check confirmed
+exactly the new test goes red when either changed line is reverted, all 32 other tests in the file
+stay green, restoration verified byte-identical. Committed `6a9bf83`, pushed.
+
+**Deployment**: the fixed source file was copied (not restarted) into both active release directories
+(`/root/kronos-releases/2c93a9c/` and `/root/kronos-testnet-releases/2c93a9c/`). No pm2 restart was
+performed or is required: `readForwardCausalEventsStrict` has exactly one production caller,
+`scripts/cortex-shadow-refit-operator.ts`, a standalone CLI tool with no cron or systemd wiring found
+on the VPS (checked directly — the only root crontab entry is an unrelated `lane-performance-check.py`
+at 04:13 daily) — it is never called by the running `dtc-api`/`dtc-api-testnet` request-handling code,
+and loads fresh source from disk on each invocation. The file overlay is therefore sufficient and
+complete for this fix; a restart or new versioned release would be an unforced action the closure
+goal's own hard rules exclude, not a requirement of the fix. `dtc-api`/`dtc-api-testnet` restart counts
+confirmed unchanged (0/0, since promotion) after this fix, both before and after deployment.
+
+**Re-verified against real data after Stage 3**: both active journals now read
+`status: VALID, malformed: 0, duplicates: 0` — 3102: 11524 events (growing live), 1128 valid
+`OUTCOME_RESOLUTION` events, all `RESOLVED_VALID`; 3101: 409 events, 105 valid `OUTCOME_RESOLUTION`
+events, all `RESOLVED_VALID`. Cross-checked against the independently-computed `/api/shadow/
+cortex-collection-status` figures on both instances — `outcomesResolved`/`totalEvents` match exactly,
+confirming the fix and the operator status endpoint now agree.
+
+### 13.2 Closure re-verification (read-only, all items reconfirmed live)
+
+- **Health**: `GET /api/health` → `{"ok":true}` on both 3101 and 3102.
+- **Restart counts**: `dtc-api` 0, `dtc-api-testnet` 0 (unchanged since the `2c93a9c` promotion);
+  `dtc-api-live` (3103) **8378, unchanged** — 3103 confirmed untouched throughout, including
+  throughout this closure session (no file under `/root/kronos-live/` read for write, no restart, no
+  deploy).
+- **Active release identity**: both `dtc-api` and `dtc-api-testnet` pm2 entries still point at
+  `.../2c93a9c/.../deploy/run-api.sh` — the promoted release directory name is unchanged. Final
+  reviewed commit (HEAD, pushed) is `6a9bf83`, three commits ahead of the promoted `2c93a9c` docs
+  commit; the delta is exactly the Phase-1-closure-authorized causal-journal hotfix in §13.1 plus this
+  closure section, both source-only in `forward-causal-collection.ts`/its test and doc-only,
+  respectively. The release directories are `git archive` extractions (no `.git`), so "RELEASE_SHA" is
+  the directory name `2c93a9c`; the one hotfixed file inside them now matches `6a9bf83`'s content
+  specifically, deliberately (§13.1), not the rest of the tree.
+- **CORTEX authority**: `liveBeta: 0`, `cumulativeResolved: 0`, `blindCapitalPct: 100`,
+  `regimeCoverageGateMet: false`, `learningActiveLanes: 0` — identical on both instances. CORTEX
+  remains strictly OBSERVE_ONLY; zero capital is under any learned weighting.
+- **Campaigns**: `GET /api/live/innovation-executors` → `campaign.configured: false,
+  campaign.active: false` ("no innovation campaign file present") on both instances — unchanged,
+  default OFF.
+- **3 reset lanes**: not independently re-run this closure pass (the mechanism lives entirely in
+  `current-guard-variant-matrix.ts`, a file untouched by any commit since the §10 promotion
+  verification already proved `freshValid: 0` for all three against live production data, with a
+  control lane still counting) — re-deriving an unchanged result from an unchanged file was judged
+  outside what closure needed, consistent with the closure goal's own "do not continuously inspect"
+  instruction. No mechanism exists by which the causal-journal fix in §13.1 (a different file, a
+  different store) could have affected it.
+- **No unresolved safety-critical error remains**: the one defect found (§13.1) is fixed, tested,
+  mutation-checked, committed, pushed, deployed, and re-verified against real data on both instances.
+
+### 13.3 Current real causal-evidence counts (honest, as of this closure, not fabricated)
+
+| Instance | Journal events | Resolved outcomes (`OUTCOME_RESOLUTION`, all `RESOLVED_VALID`) | Distinct `netR` values | Coverage span |
+|---|---|---|---|---|
+| 3101 | 409 | 105 | 43 | 2026-08-01T21:05Z → 2026-08-05T08:30Z |
+| 3102 | 11524 (growing live) | 1128 | 354 | 2026-08-01T14:00Z → 2026-08-04T21:00Z |
+
+**Independent episode count — known limitation, not computed rigorously here.** A rough 5-minute
+time-bucket clustering gives ~35 (3101) / ~129 (3102) buckets, but this almost certainly *overstates*
+true independence: it groups only by time proximity, not by the same concurrent-multi-symbol-signal
+mechanism that collapses book-wide closes 7,653→52 elsewhere in this system (see project memory and
+this repo's own `CLAUDE.md` "Before believing any lane number"). Computing a rigorous count requires
+grouping by originating decision/scan batch, not wall-clock proximity — deliberately not attempted
+during this closure pass, both because it is genuinely more analysis than "report the current real
+counts" calls for and because the closure goal explicitly says not to continuously inspect the system.
+Treat 35/129 as a loose upper bound, not the real figure; do not use it to compute SE/MDE or readiness.
+CORTEX's own gates (`cumulativeResolved: 0`, `regimeCoverageGateMet: false` on both instances) confirm
+independently that no refit/eligibility threshold has been reached yet regardless of the exact
+episode count.
+
+### 13.4 Known non-critical limitations (backlog, correctly out of scope for this closure)
+
+- Rigorous (batch-clustered, not time-bucketed) independent-episode counting for the causal journal —
+  see §13.3.
+- The shadow-refit operator (`scripts/cortex-shadow-refit-operator.ts`) cannot currently run cleanly
+  against the active release directories: its own provenance check (git blob / manifest closure,
+  matching the mechanism `cortex-shadow-refit-operator-provenance.test.ts` exercises) will correctly
+  detect that `forward-causal-collection.ts` inside `.../2c93a9c/` now hashes to `6a9bf83`'s content,
+  not `2c93a9c`'s. This is expected and correct — the safety check is working — but means a full
+  `--dry-run` operator pass (which would give a precise `CANDIDATE_LEARNING_ELIGIBLE`/rejected
+  breakdown) needs a clean, single-commit versioned release cut first. Deliberately not done during
+  this closure pass: cutting a new release is a deploy action, and Phase 2 is observation-only.
+- 3102's `unresolvedOpportunities: 4070` (vs. 152 on 3101) reflects 3102's much longer/denser real
+  history; not itself investigated further this closure (no evidence it indicates a defect — it is
+  the expected shape of an append-only journal with many more OPEN-but-not-yet-CLOSED rows given the
+  much higher event volume).
+
+### 13.5 Next observation checkpoint
+
+Continue passive observation per the goal's Phase 2 instructions — no further action scheduled.
+Re-check at the next natural session using the same read-only method (`readForwardCausalEventsStrict`
+against both real journals via a standalone script, plus `/api/shadow/cortex-collection-status`) and
+watch specifically for: `cumulativeResolved` moving off 0 on either instance, `regimeCoverageGateMet`
+flipping true, `learningActiveLanes` moving off 0, any lane's `schemaMismatch`/`duplicateDropped`/
+`invalidData` counters moving off 0 (would indicate a NEW legacy-shape or a genuine new defect, not
+one of the three already closed in §13.1), and continued growth of `outcomesResolved` on both
+instances. No specific ETA is asserted for reaching ~100 independent episodes — §13.3 explains why a
+precise count isn't available yet, and asserting a date from an unrigorous estimate would itself be a
+form of fabricated readiness.
+
+### 13.6 Verdict
+
+**`KRONOS_PHASE_1_CLOSED_AND_FROZEN`**
+
+- Final commit (HEAD, pushed): `6a9bf83382885efe6e8843e37f20b85f511ae301`
+- Active release identity: `2c93a9c` (both 3101 and 3102 release directories), with the §13.1 hotfix
+  file overlaid on disk on both (source matches `6a9bf83` for that one file only, deliberately)
+- Health: OK on both (3101, 3102)
+- Scheduler: unchanged since §10 promotion (not independently re-run this closure pass — no code
+  path touched by §13.1 affects it)
+- CORTEX: `liveBeta: 0`, OBSERVE_ONLY, confirmed both instances
+- Campaigns: disabled (`configured: false`) on both instances
+- Causal journal: **VALID, 0 malformed**, both instances (was the one defect found; now fixed)
+- Current causal rows/episodes: §13.3 (409/11524 events, 105/1128 resolved outcomes, 43/354 distinct
+  netR, 3101/3102 respectively; rigorous episode count not yet computed, loose upper bound ~35/~129)
+- Known non-critical limitations: §13.4
+- Next observation checkpoint: §13.5
+- No source/runtime/config/data change was made beyond the one authorized, tested, committed
+  safety-critical fix in §13.1 (`forward-causal-collection.ts` + its test file only)
+- 3103 confirmed untouched: restart count 8378 unchanged, no file read for write under
+  `/root/kronos-live/`, no restart, no deploy, at any point in this closure session
