@@ -69,11 +69,35 @@ export interface FrozenCandidate {
   readonly title: string;
   readonly thesis: string;
   readonly direction: Direction;
-  readonly frozenAt: string;
+  /**
+   * The persisted instant this exact content hash was FIRST evaluated, or null when that is not
+   * known. NEVER the report time — a freeze stamp minted at read time would land after the very
+   * observations it is supposed to precede, turning the one field that carries the "frozen before
+   * outcome" proof into a claim that reads as its own refutation.
+   */
+  readonly frozenAt: string | null;
+  readonly frozenAtSource: FrozenAtSource;
   readonly rule: EdgeRule;
 }
 
-export function freezeCandidate(rule: EdgeRule, frozenAt: string, version = 1): FrozenCandidate {
+/**
+ * Where `frozenAt` came from. Explicit because "we know the freeze instant" and "we have no record"
+ * must never be indistinguishable to a reader deciding whether to trust the evidence.
+ */
+export type FrozenAtSource =
+  /** Read from the persisted attempt registry — a real, monotone lower bound on the freeze time. */
+  | "FIRST_EVALUATED"
+  /** The rule exists in source but no cycle has evaluated it yet, so there is nothing to prove. */
+  | "NOT_YET_EVALUATED"
+  /** Registry entry predates this field. Honest unknown; never back-filled with a guess. */
+  | "UNKNOWN_PRE_MIGRATION";
+
+export function freezeCandidate(
+  rule: EdgeRule,
+  frozenAt: string | null,
+  version = 1,
+  frozenAtSource: FrozenAtSource = frozenAt === null ? "NOT_YET_EVALUATED" : "FIRST_EVALUATED",
+): FrozenCandidate {
   return {
     candidateId: candidateIdFor(rule, version),
     ruleId: rule.ruleId,
@@ -83,6 +107,7 @@ export function freezeCandidate(rule: EdgeRule, frozenAt: string, version = 1): 
     thesis: rule.thesis,
     direction: rule.direction,
     frozenAt,
+    frozenAtSource,
     rule,
   };
 }
@@ -526,9 +551,66 @@ export interface CandidateReport {
   };
   readonly comparisons: readonly { label: string; netExpectancyR: number | null; beatsCandidate: boolean }[];
   readonly gates: readonly EdgeGate[];
+  readonly freezeIntegrity: FreezeIntegrity;
   readonly decision: "CANDIDATE" | "REJECT";
   readonly rejectionReasons: readonly string[];
   readonly evidenceStillNeeded: readonly string[];
+}
+
+/**
+ * Checks the claim the whole engine rests on: every observation was opened under an ALREADY-FROZEN
+ * rule. Verified against the persisted freeze anchor rather than asserted in prose, and surfaced as
+ * data so a reader can see it was actually checked. A candidate that fails is disqualified — no
+ * amount of forward evidence rescues evidence gathered under a rule that was still moving.
+ */
+export interface FreezeIntegrity {
+  readonly frozenAt: string | null;
+  readonly frozenAtSource: FrozenAtSource;
+  /** Earliest observation this candidate ever opened, or null when it has never fired. */
+  readonly earliestObservationAt: string | null;
+  /** Rows opened at/before the freeze anchor. Must be 0. */
+  readonly rowsOpenedBeforeFreeze: number;
+  readonly ok: boolean;
+  readonly note: string;
+}
+
+function checkFreezeIntegrity(
+  candidate: FrozenCandidate,
+  rows: readonly ShadowObservation[],
+): FreezeIntegrity {
+  const openedAts = rows.map((r) => r.openedAt).filter((v): v is string => typeof v === "string");
+  const earliest = openedAts.length > 0 ? openedAts.slice().sort()[0] : null;
+
+  if (rows.length === 0) {
+    return {
+      frozenAt: candidate.frozenAt, frozenAtSource: candidate.frozenAtSource,
+      earliestObservationAt: null, rowsOpenedBeforeFreeze: 0, ok: true,
+      note: "no observations — nothing to contradict the freeze",
+    };
+  }
+  if (candidate.frozenAt === null) {
+    // Cannot be proven either way. Fails CLOSED: unproven is not the same as proven, and this
+    // engine's entire value is that it does not let those two states blur together.
+    return {
+      frozenAt: null, frozenAtSource: candidate.frozenAtSource,
+      earliestObservationAt: earliest, rowsOpenedBeforeFreeze: 0, ok: false,
+      note: candidate.frozenAtSource === "UNKNOWN_PRE_MIGRATION"
+        ? "freeze anchor predates the field — cannot prove these rows were gathered under a frozen rule"
+        : "rows exist but no freeze anchor was recorded — cannot prove the rule was frozen first",
+    };
+  }
+  const frozenMs = Date.parse(candidate.frozenAt);
+  const before = rows.filter((r) => {
+    const t = Date.parse(r.openedAt ?? "");
+    return Number.isFinite(t) && Number.isFinite(frozenMs) && t < frozenMs;
+  }).length;
+  return {
+    frozenAt: candidate.frozenAt, frozenAtSource: candidate.frozenAtSource,
+    earliestObservationAt: earliest, rowsOpenedBeforeFreeze: before, ok: before === 0,
+    note: before === 0
+      ? `all ${rows.length} row(s) opened at or after the freeze anchor`
+      : `${before} row(s) predate the freeze anchor — the rule was not frozen before this evidence`,
+  };
 }
 
 function splitBy(
@@ -635,6 +717,10 @@ export function buildCandidateReport(
     rejectionReasons.push("unstable splits: DEV and validation/OOS expectancy disagree in sign");
   }
   if (comparisons[0]!.beatsCandidate) rejectionReasons.push("NO_TRADE (flat) beats the candidate after cost");
+  // Evidence gathered under a rule that cannot be shown to have been frozen first is not forward
+  // evidence at all, however good it looks. This is checked BEFORE the numeric gates matter.
+  const freezeIntegrity = checkFreezeIntegrity(candidate, rows);
+  if (!freezeIntegrity.ok) rejectionReasons.push(`freeze integrity: ${freezeIntegrity.note}`);
   for (const g of gates) {
     if (!g.pass) {
       rejectionReasons.push(
@@ -671,6 +757,7 @@ export function buildCandidateReport(
     topSymbolShare,
     metrics,
     bootstrap,
+    freezeIntegrity,
     partitions,
     splits: {
       bySymbol: splitBy(resolved, (r) => r.symbol),
@@ -695,6 +782,20 @@ export interface AttemptRegistryEntry {
   readonly cyclesEvaluated: number;
   readonly cyclesFired: number;
   readonly observationsEmitted: number;
+  /**
+   * The FIRST cycle at which this exact candidateId (rule id + content hash) was evaluated, as
+   * persisted at that moment and never rewritten afterwards.
+   *
+   * This is the engine's freeze anchor, and it is the only timestamp here that can support the
+   * "frozen before outcome" claim. It is a genuine lower bound: the rule's content hash provably
+   * existed and was being evaluated at this instant, so every observation opened later was opened
+   * under an already-fixed rule. Changing any threshold, direction or geometry mints a new
+   * candidateId and therefore starts a fresh clock — which is the whole point of hashing the rule.
+   *
+   * Null only for entries written before this field existed; those report UNKNOWN rather than
+   * inventing a time.
+   */
+  readonly firstEvaluatedAt: string | null;
 }
 
 export interface LiveEdgeDiggerReport {
@@ -732,9 +833,19 @@ export function buildLiveEdgeDiggerReport(input: {
   frontier?: readonly EdgeRule[];
 }): LiveEdgeDiggerReport {
   const frontier = input.frontier ?? EDGE_RULE_FRONTIER;
-  const frozenAt = input.generatedAt;
+  // The freeze anchor is READ from the persisted registry, never minted here. Keyed by candidateId
+  // (rule id + content hash) so editing a threshold starts a new clock instead of inheriting the
+  // previous rule's history.
+  const anchorByCandidateId = new Map(input.attempts.map((a) => [a.candidateId, a]));
   const candidates = frontier
-    .map((rule) => buildCandidateReport(freezeCandidate(rule, frozenAt), input.observations))
+    .map((rule) => {
+      const entry = anchorByCandidateId.get(candidateIdFor(rule));
+      const frozenAt = entry?.firstEvaluatedAt ?? null;
+      const source: FrozenAtSource = frozenAt !== null
+        ? "FIRST_EVALUATED"
+        : entry === undefined ? "NOT_YET_EVALUATED" : "UNKNOWN_PRE_MIGRATION";
+      return buildCandidateReport(freezeCandidate(rule, frozenAt, 1, source), input.observations);
+    })
     // Report every rule, including ones with zero evidence — a rule that never fired is itself a
     // finding, and hiding it would understate the number of tests run.
     .sort((a, b) => b.independentEpisodes - a.independentEpisodes);

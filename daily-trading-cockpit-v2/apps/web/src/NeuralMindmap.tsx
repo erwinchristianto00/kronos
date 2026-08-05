@@ -1173,7 +1173,14 @@ interface ShortFadeReport {
 /** Mirror of the API's LiveEdgeDiggerReport (read-only research scanner). Every field is optional-
  *  tolerant because an instance that has not shipped the scanner simply returns nothing. */
 interface LiveEdgeDiscoveryCandidate {
-  candidate: { candidateId: string; ruleId: string; title: string; thesis: string; direction: string };
+  candidate: {
+    candidateId: string; ruleId: string; title: string; thesis: string; direction: string;
+    frozenAt: string | null; frozenAtSource: string;
+  };
+  freezeIntegrity: {
+    frozenAt: string | null; frozenAtSource: string; earliestObservationAt: string | null;
+    rowsOpenedBeforeFreeze: number; ok: boolean; note: string;
+  };
   rawRows: number;
   openRows: number;
   resolvedRows: number;
@@ -2070,6 +2077,18 @@ export default function NeuralMindmap() {
                         </span>
                       </div>
                       <div className="neural-evidence-gate-metrics">
+                        <div><span>Rule frozen at</span>
+                          <strong className={c.freezeIntegrity.ok ? 'tone-healthy' : 'tone-critical'}>
+                            {c.candidate.frozenAt === null
+                              ? `UNPROVEN (${c.candidate.frozenAtSource})`
+                              : `${c.candidate.frozenAt.replace('T', ' ').slice(0, 19)}Z`}
+                          </strong>
+                        </div>
+                        <div><span>Rows opened pre-freeze</span>
+                          <strong className={c.freezeIntegrity.rowsOpenedBeforeFreeze === 0 ? 'tone-healthy' : 'tone-critical'}>
+                            {c.freezeIntegrity.rowsOpenedBeforeFreeze}
+                          </strong>
+                        </div>
                         <div><span>Raw rows</span><strong>{c.rawRows} ({c.openRows} open)</strong></div>
                         <div><span>Independent episodes</span><strong className="tone-warning">{c.independentEpisodes}</strong></div>
                         <div><span>Rows / episode</span><strong>{c.rowsPerEpisode ?? 'n/a'}</strong></div>

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Candle } from "@dtc/shared";
@@ -513,6 +513,133 @@ describe("live-edge-digger", () => {
       const store = new LiveEdgeDiggerStore(file);
       expect(store.all).toEqual([]);
       expect(store.cycleMeta.cycles).toBe(0);
+    });
+
+    it("[FREEZE-ANCHOR] frozenAt comes from the first evaluation, NOT report time", async () => {
+      const dir = tmpDir();
+      const now = BASE + 200 * HOUR;
+      const d = deps(dir, now);
+      await runLiveEdgeDiggerCycle(d);
+
+      const fired = d.store.attempts.filter((a) => a.observationsEmitted > 0);
+      expect(fired.length).toBeGreaterThan(0);
+
+      // Report generated LONG after the cycle. The freeze anchor must not follow it.
+      const generatedAt = new Date(now + 500 * HOUR).toISOString();
+      const report = buildLiveEdgeDiggerReport({
+        generatedAt, observations: d.store.all, attempts: d.store.attempts,
+        scanner: {
+          cyclesRun: 1, lastCycleAt: new Date(now).toISOString(), lastError: null,
+          universeSize: 4, regime: "r", regimeFamily: "BULLISH",
+          breadth: 0.5, cohesion: 0.5, dispersion: 0.02,
+        },
+      });
+
+      for (const entry of fired) {
+        const c = report.candidates.find((x) => x.candidate.candidateId === entry.candidateId)!;
+        expect(c.candidate.frozenAt).toBe(entry.firstEvaluatedAt);
+        expect(c.candidate.frozenAt).not.toBe(generatedAt);
+        expect(c.candidate.frozenAtSource).toBe("FIRST_EVALUATED");
+        // The proof itself: nothing was opened before the rule was frozen.
+        expect(c.freezeIntegrity.rowsOpenedBeforeFreeze).toBe(0);
+        expect(c.freezeIntegrity.ok).toBe(true);
+        expect(Date.parse(c.candidate.frozenAt!))
+          .toBeLessThanOrEqual(Date.parse(c.freezeIntegrity.earliestObservationAt!));
+      }
+    });
+
+    it("[FREEZE-ANCHOR] the anchor is written once and never moves on later cycles", async () => {
+      const dir = tmpDir();
+      const first = BASE + 200 * HOUR;
+      const store = new LiveEdgeDiggerStore(join(dir, "led.json"));
+      await runLiveEdgeDiggerCycle({ ...deps(dir, first), store });
+      const anchors = new Map(store.attempts.map((a) => [a.candidateId, a.firstEvaluatedAt]));
+      expect([...anchors.values()].every((v) => v !== null)).toBe(true);
+
+      // A second cycle a day later, and a process restart, must both leave the anchor alone.
+      await runLiveEdgeDiggerCycle({ ...deps(dir, first + 24 * HOUR), store });
+      store.save();
+      const reloaded = new LiveEdgeDiggerStore(join(dir, "led.json"));
+      for (const a of reloaded.attempts) {
+        expect(a.firstEvaluatedAt).toBe(anchors.get(a.candidateId));
+        expect(a.cyclesEvaluated).toBe(2); // the COUNT advances even though the anchor does not
+      }
+    });
+
+    it("[FREEZE-ANCHOR] editing a rule mints a new candidate rather than inheriting the old clock", () => {
+      const dir = tmpDir();
+      const store = new LiveEdgeDiggerStore(join(dir, "led.json"));
+      const rule = EDGE_RULE_FRONTIER[0]!;
+      const retuned = { ...rule, geometry: { ...rule.geometry, targetRMultiple: 9.5 } };
+      expect(candidateIdFor(retuned)).not.toBe(candidateIdFor(rule));
+
+      store.recordAttempts(
+        [{ ruleId: rule.ruleId, candidateId: candidateIdFor(rule), matched: 1, emitted: 1 }],
+        "2026-08-01T00:00:00.000Z",
+      );
+      store.recordAttempts(
+        [{ ruleId: retuned.ruleId, candidateId: candidateIdFor(retuned), matched: 1, emitted: 1 }],
+        "2026-08-06T00:00:00.000Z",
+      );
+
+      // Same ruleId, different content: two separate tests, two separate clocks. Keying the registry
+      // by ruleId would collapse these into one and hide that a second test was ever run.
+      expect(store.attempts).toHaveLength(2);
+      const original = store.attempts.find((a) => a.candidateId === candidateIdFor(rule))!;
+      const edited = store.attempts.find((a) => a.candidateId === candidateIdFor(retuned))!;
+      expect(original.firstEvaluatedAt).toBe("2026-08-01T00:00:00.000Z");
+      expect(edited.firstEvaluatedAt).toBe("2026-08-06T00:00:00.000Z");
+      expect(edited.cyclesEvaluated).toBe(1);
+    });
+
+    it("[FREEZE-ANCHOR] rows with no recorded anchor FAIL CLOSED instead of being trusted", () => {
+      const rule = EDGE_RULE_FRONTIER[0]!;
+      const cid = candidateIdFor(rule);
+      const row: ShadowObservation = {
+        observationId: "o1", candidateId: cid, contentHash: "h", symbol: "BTCUSDT", direction: "LONG",
+        cycleId: "c1", openedAt: new Date(BASE).toISOString(), openedAtMs: BASE,
+        entryPrice: 100, stopPrice: 98, targetPrice: 103, stopDistanceBps: 200, maxHoldHours: 24,
+        regimeAtEntry: "r", features: {} as never, status: "CLOSED_WIN", resolvedAt: "x",
+        exitPrice: 103, exitReason: "TARGET", grossR: 1.5, costR: -0.1, netR: 1.4, holdHours: 1,
+      };
+      // A legacy registry entry: it predates `firstEvaluatedAt`, so the anchor is genuinely unknown.
+      const legacy = buildCandidateReport(
+        freezeCandidate(rule, null, 1, "UNKNOWN_PRE_MIGRATION"), [row],
+      );
+      expect(legacy.freezeIntegrity.ok).toBe(false);
+      expect(legacy.decision).toBe("REJECT");
+      expect(legacy.rejectionReasons.some((r) => r.startsWith("freeze integrity:"))).toBe(true);
+
+      // And an anchor set AFTER the row it claims to precede is caught, not rounded away.
+      const backdated = buildCandidateReport(
+        freezeCandidate(rule, new Date(BASE + HOUR).toISOString()), [row],
+      );
+      expect(backdated.freezeIntegrity.rowsOpenedBeforeFreeze).toBe(1);
+      expect(backdated.freezeIntegrity.ok).toBe(false);
+      expect(backdated.decision).toBe("REJECT");
+    });
+
+    it("[FREEZE-ANCHOR] a pre-migration store re-keys to candidateId with a null anchor", () => {
+      const dir = tmpDir();
+      const file = join(dir, "led.json");
+      const cid = candidateIdFor(EDGE_RULE_FRONTIER[0]!);
+      // The shape written before this fix: keyed by ruleId, no firstEvaluatedAt field at all.
+      writeFileSync(file, JSON.stringify({
+        version: 1, observations: [],
+        attempts: {
+          [EDGE_RULE_FRONTIER[0]!.ruleId]: {
+            ruleId: EDGE_RULE_FRONTIER[0]!.ruleId, candidateId: cid,
+            cyclesEvaluated: 7, cyclesFired: 3, observationsEmitted: 11,
+          },
+        },
+        cycleMeta: {},
+      }));
+      const store = new LiveEdgeDiggerStore(file);
+      expect(store.attempts).toHaveLength(1);
+      const e = store.attempts[0]!;
+      expect(e.candidateId).toBe(cid);
+      expect(e.cyclesEvaluated).toBe(7);       // history preserved
+      expect(e.firstEvaluatedAt).toBeNull();   // absent, and NOT back-filled with load time
     });
 
     it("open positions are never pruned away, even past the retention cap", () => {

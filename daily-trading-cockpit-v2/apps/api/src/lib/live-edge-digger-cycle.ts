@@ -68,6 +68,35 @@ const emptyState = (): StoreState => ({
   },
 });
 
+/**
+ * Reads the persisted attempt map, tolerating the shape written before the registry was keyed by
+ * candidateId and before `firstEvaluatedAt` existed.
+ *
+ * Two rules here, both learned the hard way in this repo. A field that PREDATES its own existence is
+ * absent, not null, so the check must treat `undefined` and `null` alike. And a missing freeze
+ * anchor is left as null rather than back-filled with load time — inventing a timestamp would
+ * manufacture exactly the proof this field exists to supply, and it would look identical to a real
+ * one. Those entries surface as UNKNOWN_PRE_MIGRATION and fail the freeze-integrity check closed.
+ */
+function migrateAttempts(raw: unknown): Record<string, AttemptRegistryEntry> {
+  if (!raw || typeof raw !== "object") return {};
+  const out: Record<string, AttemptRegistryEntry> = {};
+  for (const value of Object.values(raw as Record<string, unknown>)) {
+    if (!value || typeof value !== "object") continue;
+    const e = value as Partial<AttemptRegistryEntry>;
+    if (typeof e.candidateId !== "string" || typeof e.ruleId !== "string") continue;
+    out[e.candidateId] = {
+      ruleId: e.ruleId,
+      candidateId: e.candidateId,
+      cyclesEvaluated: typeof e.cyclesEvaluated === "number" ? e.cyclesEvaluated : 0,
+      cyclesFired: typeof e.cyclesFired === "number" ? e.cyclesFired : 0,
+      observationsEmitted: typeof e.observationsEmitted === "number" ? e.observationsEmitted : 0,
+      firstEvaluatedAt: typeof e.firstEvaluatedAt === "string" ? e.firstEvaluatedAt : null,
+    };
+  }
+  return out;
+}
+
 export class LiveEdgeDiggerStore {
   private state: StoreState = emptyState();
 
@@ -78,7 +107,7 @@ export class LiveEdgeDiggerStore {
         this.state = {
           version: 1,
           observations: Array.isArray(parsed.observations) ? parsed.observations : [],
-          attempts: parsed.attempts && typeof parsed.attempts === "object" ? parsed.attempts : {},
+          attempts: migrateAttempts(parsed.attempts),
           cycleMeta: { ...emptyState().cycleMeta, ...(parsed.cycleMeta ?? {}) },
         };
       }
@@ -108,18 +137,32 @@ export class LiveEdgeDiggerStore {
     if (idx >= 0) this.state.observations[idx] = next;
   }
 
-  /** Accumulates the attempt registry across cycles — the multiple-testing record. */
-  recordAttempts(entries: readonly { ruleId: string; candidateId: string; matched: number; emitted: number }[]): void {
+  /**
+   * Accumulates the attempt registry across cycles — the multiple-testing record AND the freeze
+   * anchor.
+   *
+   * Keyed by candidateId, NOT ruleId. The candidateId carries the rule's content hash, so editing
+   * any threshold, direction or geometry starts a genuinely new entry. Keying by ruleId would let a
+   * re-tuned rule silently inherit the old rule's evaluation count and freeze time — the count
+   * would understate how many tests had really been run, and the freeze anchor would vouch for
+   * content that never existed at that instant.
+   *
+   * `firstEvaluatedAt` is written once and never rewritten: it is only a valid lower bound on the
+   * freeze time if it cannot move.
+   */
+  recordAttempts(
+    entries: readonly { ruleId: string; candidateId: string; matched: number; emitted: number }[],
+    atIso: string,
+  ): void {
     for (const e of entries) {
-      const prior = this.state.attempts[e.ruleId] ?? {
-        ruleId: e.ruleId, candidateId: e.candidateId, cyclesEvaluated: 0, cyclesFired: 0, observationsEmitted: 0,
-      };
-      this.state.attempts[e.ruleId] = {
+      const prior = this.state.attempts[e.candidateId];
+      this.state.attempts[e.candidateId] = {
         ruleId: e.ruleId,
         candidateId: e.candidateId,
-        cyclesEvaluated: prior.cyclesEvaluated + 1,
-        cyclesFired: prior.cyclesFired + (e.emitted > 0 ? 1 : 0),
-        observationsEmitted: prior.observationsEmitted + e.emitted,
+        cyclesEvaluated: (prior?.cyclesEvaluated ?? 0) + 1,
+        cyclesFired: (prior?.cyclesFired ?? 0) + (e.emitted > 0 ? 1 : 0),
+        observationsEmitted: (prior?.observationsEmitted ?? 0) + e.emitted,
+        firstEvaluatedAt: prior?.firstEvaluatedAt ?? atIso,
       };
     }
   }
@@ -275,7 +318,9 @@ export async function runLiveEdgeDiggerCycle(deps: LiveEdgeDiggerDeps): Promise<
   for (const obs of observations) {
     if (deps.store.add(obs)) emitted += 1;
   }
-  deps.store.recordAttempts(attempts);
+  // `atIso` is the DECISION instant of this cycle, so a candidate first evaluated now is anchored
+  // at or before every observation this same cycle emits.
+  deps.store.recordAttempts(attempts, atIso);
 
   deps.store.recordCycle(atIso, {
     resolvedTotal: deps.store.cycleMeta.resolvedTotal + resolvedCount,
