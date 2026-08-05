@@ -263,4 +263,75 @@ describe("NeuralMindmap — evidence version panel", () => {
     expect(statusLabel.nextElementSibling?.textContent).toBe("COLLECTING");
     expect(screen.queryByText("WATCHABLE")).toBeNull();
   });
+
+  // ── Point 4e — CURRENT PRE-FREEZE COLLECTION ────────────────────────────────────────────────────
+  // The reported defect: DEV/Validation-OOS/Recent-Live-Testnet all read 0 rows / 0 episodes while
+  // the lane genuinely had fresh rows on tape, because those three panels can only ever describe a
+  // FROZEN window. "Collecting, 3 of 10 episodes in" was indistinguishable from "nothing here".
+  const preFreezeFixture = () => ({
+    eligibleRows: 11,
+    provisionalEpisodes: 3,
+    rowsPerEpisode: 11 / 3,
+    calendarDays: 21,
+    distinctSymbolCount: 4,
+    distinctRegimes: 2,
+    largestEpisodeRows: 4,
+    largestEpisodeShare: 4 / 11,
+    topSymbolPnlShare: 0.35,
+    evidenceVersion: "CG_WIDE_FAST_LONG@36H-v1",
+    cutoverSource: "INFERRED" as const,
+    freezeBlockers: [
+      "eligible current rows 11 < 60 needed before a STABLE window is attempted (dev 40 + holdout 20)",
+      "provisional independent episodes 3 < 10 needed for the STABLE dev side",
+    ],
+    minRowsToAttemptFreeze: 60,
+    minDevRows: 40,
+    minDevEpisodes: 10,
+  });
+
+  it("renders real provisional accumulation (11 rows / 3 of 10 episodes) while the frozen DEV section still reads NOT FROZEN — the two are separate sections, never merged", async () => {
+    const lane = { ...resetLaneFixture(), preFreezeCollection: preFreezeFixture() };
+    // The frozen proofs are genuinely unfrozen and all-zero, exactly like the live defect.
+    lane.stableProof = { ...lane.stableProof, frozen: false, devRows: 0, devEffectiveN: 0, holdoutRows: 0, holdoutEffectiveN: 0 };
+    lane.promotionProof = { ...lane.promotionProof, frozen: false, devRows: 0, devEffectiveN: 0, holdoutRows: 0, holdoutEffectiveN: 0 };
+    vi.stubGlobal("fetch", mockFetch(baseTelemetry([lane])));
+    render(<NeuralMindmap />);
+
+    await waitFor(() => expect(screen.getByText("CURRENT PRE-FREEZE COLLECTION")).toBeTruthy());
+    const section = screen.getByText("CURRENT PRE-FREEZE COLLECTION").closest(".neural-evidence-gate") as HTMLElement;
+
+    // Real accumulation is visible — NOT zero — and shown against the floor it must reach.
+    expect(within(section).getByText("Provisional independent episodes").nextElementSibling?.textContent).toBe("3 / 10");
+    expect(within(section).getByText("Eligible current rows").nextElementSibling?.textContent).toBe("11 / 40");
+    // Episode concentration, the thing a bare count hides.
+    expect(within(section).getByText("Largest episode").nextElementSibling?.textContent).toBe("4 (36%)");
+    expect(within(section).getByText("Rows / episode").nextElementSibling?.textContent).toBe("3.67");
+    // Evidence version + cutover source are readable without cross-referencing another panel.
+    expect(within(section).getByText("Cutover source").nextElementSibling?.textContent).toBe("INFERRED");
+    // Explicitly PROVISIONAL — never a PASS, so it cannot read as an earned verdict.
+    expect(within(section).getByText("PROVISIONAL")).toBeTruthy();
+    expect(within(section).queryByText("PASS")).toBeNull();
+    // And it states exactly what freezing DEV still needs.
+    expect(section.textContent).toContain("To freeze DEV:");
+    expect(section.textContent).toContain("provisional independent episodes 3 < 10");
+
+    // The three frozen sections remain separate and still honestly say NOT FROZEN — the provisional
+    // numbers must not leak into them.
+    const devSection = screen.getByText("DEV").closest(".neural-evidence-gate") as HTMLElement;
+    expect(within(devSection).getByText("NOT FROZEN")).toBeTruthy();
+    expect(devSection.textContent).not.toContain("Provisional independent episodes");
+    for (const title of ["Validation / OOS", "Recent / Live / Testnet"]) {
+      const s = screen.getByText(title).closest(".neural-evidence-gate") as HTMLElement;
+      expect(within(s).getByText("NOT FROZEN")).toBeTruthy();
+    }
+  });
+
+  it("omits the pre-freeze section entirely when the backend does not supply it — an older instance renders no provisional panel rather than a fabricated all-zero one", async () => {
+    const lane = { ...resetLaneFixture() }; // no preFreezeCollection key at all
+    vi.stubGlobal("fetch", mockFetch(baseTelemetry([lane])));
+    render(<NeuralMindmap />);
+
+    await waitFor(() => expect(screen.getByText("CG_WIDE_FAST_LONG@36H-v1")).toBeTruthy());
+    expect(screen.queryByText("CURRENT PRE-FREEZE COLLECTION")).toBeNull();
+  });
 });

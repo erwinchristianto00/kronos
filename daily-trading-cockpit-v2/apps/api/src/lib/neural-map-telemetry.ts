@@ -21,6 +21,7 @@ import {
   type VariantBreakdownRow,
   type VariantContextEvidenceRow,
   type VariantMatrixStageProof,
+  type VariantMatrixPreFreezeCollection,
 } from "./current-guard-variant-matrix.js";
 import type { MixedBudgetForwardValidationReport, MixedRegimeReport, OpenOrderStaleAudit } from "./mixed-regime-router.js";
 import type { PaperOrder, PaperPerformanceReport } from "./paper-execution-router.js";
@@ -142,6 +143,34 @@ export interface NeuralLaneStageProof {
   blockers: string[];
 }
 
+/**
+ * Display projection of one lane's provisional (unfrozen) collection progress.
+ *
+ * READ-ONLY. This exists so the dashboard can tell "collecting, 3 of 10 episodes in" apart from
+ * "nothing here" — both of which the frozen proofs render identically as zeros. It must never be
+ * substituted for `stableProof`/`promotionProof` in any readiness, promotion, campaign, or CORTEX
+ * decision: it is the full current population with no dev/holdout split, so it is in-sample by
+ * construction. See VariantMatrixPreFreezeCollection in current-guard-variant-matrix.ts.
+ */
+export interface NeuralLanePreFreezeCollection {
+  eligibleRows: number;
+  provisionalEpisodes: number;
+  rowsPerEpisode: number | null;
+  calendarDays: number | null;
+  distinctSymbolCount: number;
+  distinctRegimes: number;
+  largestEpisodeRows: number;
+  largestEpisodeShare: number | null;
+  topSymbolPnlShare: number | null;
+  evidenceVersion: string | null;
+  cutoverSource: "CANONICAL" | "INFERRED";
+  /** What is still missing before a STABLE DEV window can FREEZE — distinct from a gate failure. */
+  freezeBlockers: string[];
+  minRowsToAttemptFreeze: number;
+  minDevRows: number;
+  minDevEpisodes: number;
+}
+
 export interface NeuralMapLane {
   id: string;
   label: string;
@@ -173,6 +202,10 @@ export interface NeuralMapLane {
    */
   stableProof: NeuralLaneStageProof | null;
   promotionProof: NeuralLaneStageProof | null;
+  /** Provisional, UNFROZEN collection progress for the current evidence version. Rendered as its own
+   *  section, never merged into the three frozen-proof sections above. Null when the upstream report
+   *  predates this field. */
+  preFreezeCollection: NeuralLanePreFreezeCollection | null;
   netAvgR: number | null;
   pf: number | null;
   /** See NeuralPfStatus's own doc comment. Display-only — never gate, sort, rank, or color a lane;
@@ -571,6 +604,39 @@ function neuralStageProof(
     holdoutSufficient: proof.holdout?.sufficient === true,
     holdoutNegative: proof.holdout?.negative === true,
     blockers: Array.isArray(proof.blockers) ? proof.blockers : [],
+  };
+}
+
+/**
+ * Display projection of `VariantMatrixPreFreezeCollection` — provisional, UNFROZEN collection
+ * progress for the lane's current evidence version.
+ *
+ * Defensive `?? `-defaults throughout for the same reason `neuralStageProof` has them: an older
+ * instance's report shape may not carry this field at all, and a dashboard must render "nothing
+ * collected yet" rather than crash or silently show a stale panel. Returns null when the field is
+ * absent entirely, which the UI renders as "no provisional data" — never as zeros, which would be
+ * indistinguishable from a real empty collection.
+ */
+function neuralPreFreezeCollection(
+  preFreeze: VariantMatrixPreFreezeCollection | undefined,
+): NeuralLanePreFreezeCollection | null {
+  if (!preFreeze) return null;
+  return {
+    eligibleRows: preFreeze.eligibleRows ?? 0,
+    provisionalEpisodes: preFreeze.provisionalEpisodes ?? 0,
+    rowsPerEpisode: preFreeze.rowsPerEpisode ?? null,
+    calendarDays: preFreeze.calendarDays ?? null,
+    distinctSymbolCount: preFreeze.distinctSymbolCount ?? 0,
+    distinctRegimes: preFreeze.distinctRegimes ?? 0,
+    largestEpisodeRows: preFreeze.largestEpisodeRows ?? 0,
+    largestEpisodeShare: preFreeze.largestEpisodeShare ?? null,
+    topSymbolPnlShare: preFreeze.topSymbolPnlShare ?? null,
+    evidenceVersion: preFreeze.evidenceVersion ?? null,
+    cutoverSource: preFreeze.cutoverSource ?? "INFERRED",
+    freezeBlockers: Array.isArray(preFreeze.freezeBlockers) ? preFreeze.freezeBlockers : [],
+    minRowsToAttemptFreeze: preFreeze.minRowsToAttemptFreeze ?? 0,
+    minDevRows: preFreeze.minDevRows ?? 0,
+    minDevEpisodes: preFreeze.minDevEpisodes ?? 0,
   };
 }
 
@@ -1505,6 +1571,9 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
       // hand-built evidence object): absent proof renders as "no proof", never as satisfied.
       stableProof: neuralStageProof("stable", evidenceRow?.stableProof),
       promotionProof: neuralStageProof("promotion", evidenceRow?.promotionProof),
+      // Read off the aggregate `row` (not evidenceRow): preFreezeCollection is built once per lane on
+      // the aggregate row, alongside evidenceVersionSummary, whose identity it mirrors.
+      preFreezeCollection: neuralPreFreezeCollection(row?.preFreezeCollection),
       netAvgR,
       pf: evidenceRow?.pf ?? economics.pf,
       pfStatus,

@@ -603,6 +603,15 @@
   background: rgba(9, 20, 26, 0.6);
 }
 
+/* Provisional pre-freeze collection: deliberately distinguished from the frozen gate sections it
+   sits above — dashed border + no gate-colored verdict, so accumulated-but-unproven progress can
+   never be misread as an earned PASS. */
+.neural-evidence-gate-prefreeze {
+  border-style: dashed;
+  border-color: #35505c;
+  background: rgba(9, 20, 26, 0.35);
+}
+
 .neural-evidence-gate-head {
   display: flex;
   align-items: center;

@@ -71,6 +71,27 @@ interface NeuralProvenSymbol {
  * Mirror of the API's NeuralLaneStageProof. `ok` is the flag deriveVariantStatus actually read to
  * produce `status`; `blockers` already carry the numeric shortfall per failing term.
  */
+/** Provisional, UNFROZEN collection progress for a lane's current evidence version. Report-only —
+ *  in-sample by construction (no dev/holdout split), so it may never gate anything. Mirrors the API's
+ *  NeuralLanePreFreezeCollection. */
+interface NeuralPreFreezeCollection {
+  eligibleRows: number;
+  provisionalEpisodes: number;
+  rowsPerEpisode: number | null;
+  calendarDays: number | null;
+  distinctSymbolCount: number;
+  distinctRegimes: number;
+  largestEpisodeRows: number;
+  largestEpisodeShare: number | null;
+  topSymbolPnlShare: number | null;
+  evidenceVersion: string | null;
+  cutoverSource: 'CANONICAL' | 'INFERRED';
+  freezeBlockers: string[];
+  minRowsToAttemptFreeze: number;
+  minDevRows: number;
+  minDevEpisodes: number;
+}
+
 interface NeuralStageProof {
   stage: 'stable' | 'promotion';
   frozen: boolean;
@@ -120,6 +141,10 @@ interface NeuralLane {
   /** Frozen stage-proof windows behind `status`. null ⇒ no VM evidence row (paper-book lane). */
   stableProof?: NeuralStageProof | null;
   promotionProof?: NeuralStageProof | null;
+  /** Provisional, UNFROZEN collection progress. Rendered as its own section so "collecting, 3 of 10
+   *  episodes in" is distinguishable from the all-zeros a frozen proof shows before it exists.
+   *  Never a readiness/promotion input — see the API's VariantMatrixPreFreezeCollection doc. */
+  preFreezeCollection?: NeuralPreFreezeCollection | null;
   netAvgR: number | null;
   pf: number | null;
   pfStatus?: NeuralPfStatus;
@@ -1302,6 +1327,60 @@ function renderExplicitMaturitySection(
   );
 }
 
+/**
+ * The provisional, pre-freeze counterpart to the three frozen sections above.
+ *
+ * WHY IT IS SEPARATE AND LOOKS DIFFERENT. Every number here is in-sample (the whole current
+ * population, no dev/holdout split) and no window has frozen, so it is deliberately NOT given a
+ * PASS/BLOCKED badge, not colored like a gate verdict, and labelled PROVISIONAL — nothing about it
+ * may read as an earned verdict. It answers only "how much has accumulated so far", which the frozen
+ * sections structurally cannot show before they exist (they read 0/0 whether a lane has collected
+ * nothing or is most of the way to a freeze).
+ *
+ * The counts come from the backend's own canonical episode rule; this component does no clustering.
+ */
+function renderPreFreezeCollectionSection(preFreeze: NeuralPreFreezeCollection | null | undefined) {
+  if (!preFreeze) return null;
+  const {
+    eligibleRows, provisionalEpisodes, rowsPerEpisode, calendarDays, distinctSymbolCount,
+    distinctRegimes, largestEpisodeRows, largestEpisodeShare, topSymbolPnlShare,
+    evidenceVersion, cutoverSource, freezeBlockers, minDevRows, minDevEpisodes,
+  } = preFreeze;
+  return (
+    <div className="neural-evidence-gate neural-evidence-gate-prefreeze" key="CURRENT PRE-FREEZE COLLECTION">
+      <div className="neural-evidence-gate-head">
+        <span>CURRENT PRE-FREEZE COLLECTION</span>
+        <small>provisional · in-sample · not a readiness input</small>
+        <b className="tone-measure">PROVISIONAL</b>
+      </div>
+      <div className="neural-evidence-gate-metrics">
+        <div><span>Eligible current rows</span><strong>{eligibleRows} / {minDevRows}</strong></div>
+        <div>
+          <span>Provisional independent episodes</span>
+          <strong>{provisionalEpisodes} / {minDevEpisodes}</strong>
+        </div>
+        <div><span>Rows / episode</span><strong>{rowsPerEpisode === null ? 'n/a' : rowsPerEpisode.toFixed(2)}</strong></div>
+        <div><span>Calendar days</span><strong>{calendarDays ?? 'n/a'}</strong></div>
+        <div><span>Distinct symbols</span><strong>{distinctSymbolCount}</strong></div>
+        <div><span>Distinct regimes</span><strong>{distinctRegimes}</strong></div>
+        <div>
+          <span>Largest episode</span>
+          <strong>{largestEpisodeRows}{largestEpisodeShare === null ? '' : ` (${(largestEpisodeShare * 100).toFixed(0)}%)`}</strong>
+        </div>
+        <div>
+          <span>Top-symbol PnL share</span>
+          <strong>{topSymbolPnlShare === null ? 'n/a' : `${(topSymbolPnlShare * 100).toFixed(0)}%`}</strong>
+        </div>
+        <div><span>Evidence version</span><strong>{evidenceVersion ?? 'none yet'}</strong></div>
+        <div><span>Cutover source</span><strong>{cutoverSource}</strong></div>
+      </div>
+      {freezeBlockers.length > 0 && (
+        <p className="neural-evidence-gate-blockers">To freeze DEV: {freezeBlockers.join('; ')}</p>
+      )}
+    </div>
+  );
+}
+
 function renderLaneEvidenceVersionCard(lane: NeuralLane, thresholds: NeuralMapPolicyThresholds | undefined) {
   const freshValid = lane.oosFreshValid ?? lane.closed;
   return (
@@ -1350,6 +1429,9 @@ function renderLaneEvidenceVersionCard(lane: NeuralLane, thresholds: NeuralMapPo
         </div>
       )}
       <div className="neural-evidence-gate-sides neural-evidence-gate-sides-stacked">
+        {/* Provisional collection first: it is what is actually happening right now, and it explains
+            the zeros in the three frozen sections below rather than leaving them unexplained. */}
+        {renderPreFreezeCollectionSection(lane.preFreezeCollection)}
         {renderExplicitMaturitySection(
           'DEV', 'STABLE proof, development side', lane.stableProof, 'dev',
           thresholds ? { rows: thresholds.stable.minDevRows, effectiveN: thresholds.stable.minDevEffectiveN } : null,

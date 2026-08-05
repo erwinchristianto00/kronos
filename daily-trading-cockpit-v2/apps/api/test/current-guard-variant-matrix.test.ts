@@ -55,6 +55,10 @@ import {
   PF_FLOOR,
   emptyVariantMatrixStageProof,
   stageSlicesForCut,
+  countIndependentEpisodes,
+  describeIndependentEpisodes,
+  currentEvidenceVersionLabel,
+  EVIDENCE_RESET_CUTOVER_VARIANT_IDS as RESET_LANE_IDS_FOR_PREFREEZE,
   PRODUCTION_BREAKEVEN_CONTROL_COST_PCT,
   type VariantMatrixSignal,
   type VariantMatrixVariantDefinition,
@@ -2725,12 +2729,21 @@ describe("current-guard-variant-matrix", () => {
       });
     });
 
-    it("a reset lane with ZERO rows returns the all-null/zero EVIDENCE summary, but a real policyVersion — no canonical registry exists yet, so cutoverSource is INFERRED even with nothing to infer from", () => {
+    it("a reset lane with ZERO rows still reports its CONFIG-derived evidenceVersion (a policy fact, true with nothing on tape) while every row-derived field stays null", () => {
       expect(summarizeLaneEvidenceVersion("CG_WIDE_FAST_LONG", [])).toEqual({
-        evidenceVersion: null, resetCutoverAt: null, resetCutoverAtMs: null,
+        // CONFIG-derived (currentEvidenceVersionLabel), not row-derived: the active version is a
+        // statement about the width in force RIGHT NOW, knowable before any row closes under it.
+        // Deriving it from rows made the label lag a width change by up to a full max-hold window —
+        // reading "no current-version evidence yet" while source, runtime and every newly-opened row
+        // were already on the new width, which is the exact disagreement this label exists to expose.
+        evidenceVersion: "CG_WIDE_FAST_LONG@36H-v1",
+        // Still null, and deliberately so: "when did this version actually start producing evidence"
+        // is an EMPIRICAL question with no answer yet. A policy label and an observed start are
+        // different facts and must not be conflated.
+        resetCutoverAt: null, resetCutoverAtMs: null,
         legacyExcludedRows: 0, legacyExclusionReasons: [], previousEvidenceVersion: null,
         // policyVersion is NOT evidence-dependent — it names the policy this reset LANE operates
-        // under, which is true even with zero rows on tape. Only the row-derived fields are null.
+        // under, which is true even with zero rows on tape.
         policyVersion: CURRENT_GUARD_VARIANT_MATRIX_POLICY_VERSION, cutoverSource: "INFERRED",
       });
     });
@@ -2791,6 +2804,187 @@ describe("current-guard-variant-matrix", () => {
       const summary = summarizeLaneEvidenceVersion("CG_WIDE_FAST_LONG", obsForVariant);
       expect(summary.legacyExcludedRows).toBe(0);
       expect(summary.legacyExclusionReasons).toEqual([]);
+    });
+
+    // ── Point 4e — the 36h policy label, and provisional pre-freeze collection progress. ──────────
+    //
+    // Two defects motivated this block, both visible on the live dashboard on 2026-08-05:
+    //  (A) all three reset lanes displayed `@72H-v1` although their approved policy is 36h — the
+    //      `maxHoldHours: 36` hunks had never been committed, so every release built by `git archive`
+    //      silently shipped the 72h default while a committed comment still referenced them;
+    //  (B) DEV/OOS/live proof all read rows=0/episodes=0 with real fresh rows on tape, because those
+    //      panels can only ever show a FROZEN window and no window had frozen yet.
+    const PREFREEZE_LANE = "CG_WIDE_FAST_LONG" as const;
+    const preFreezeAggregateRowOf = (store: CurrentGuardVariantMatrixStore) =>
+      buildCurrentGuardVariantMatrixReport(store).rows.find((r) => r.variantId === PREFREEZE_LANE)!;
+
+    it("[PREFREEZE-A] all three reset lanes derive @36H-v1 from CONFIG — source, runtime, row metadata and label agree, and none is a hardcoded string", () => {
+      // The approved policy for exactly these three lanes. Read off the definitions themselves, so
+      // this fails if a release ever again ships without the 36h hunks (defect A above).
+      for (const variantId of ["CG_WIDE_FAST_LONG", "CG_BE_AFTER_05", "BL_TREND_SCALEOUT_STOP200"] as const) {
+        const def = VARIANT_MATRIX_DEFINITIONS.find((d) => d.id === variantId)!;
+        expect(def.maxHoldHours).toBe(36);
+        expect(RESET_LANE_IDS_FOR_PREFREEZE.has(variantId)).toBe(true);
+        expect(currentEvidenceVersionLabel(variantId)).toBe(`${variantId}@36H-v1`);
+
+        // The label is not merely a matching string — it is derived from the SAME width that stamps
+        // rows and drives clustering. A row opened under the current config carries the identical
+        // label, which is what makes "source, runtime, row metadata and UI agree" structural.
+        const store = new CurrentGuardVariantMatrixStore(tmpDir());
+        addResolvedContextCohort(store, {
+          variantId, direction: "LONG", regime: "Bullish expansion",
+          count: 3, netR: () => 1, prefix: `label-${variantId}`,
+        });
+        const rows = store.all.filter((o) => o.variantId === variantId);
+        expect(rows.length).toBeGreaterThan(0);
+        for (const obs of rows) {
+          expect(obs.openMaxHoldMs).toBe(36 * 60 * 60 * 1000);
+          expect(evidenceVersionLabel(obs)).toBe(`${variantId}@36H-v1`);
+        }
+        expect(summarizeLaneEvidenceVersion(variantId, rows).evidenceVersion).toBe(`${variantId}@36H-v1`);
+      }
+    });
+
+    it("[PREFREEZE-B] 11 fresh rows clustered into 3 episodes report eligibleRows=11 and provisionalEpisodes=3 while DEV stays NOT FROZEN", () => {
+      const store = new CurrentGuardVariantMatrixStore(tmpDir());
+      // 11 rows in 3 genuine market episodes: three tight bursts, each burst's rows minutes apart
+      // (so they chain into ONE episode at the 36h width), the bursts themselves 10 days apart (so
+      // they cannot chain to each other). Sizes 4/4/3 = 11.
+      const BURST_STARTS = [Date.UTC(2026, 5, 1), Date.UTC(2026, 5, 11), Date.UTC(2026, 5, 21)];
+      const burstOf = (index: number) => (index < 4 ? 0 : index < 8 ? 1 : 2);
+      addResolvedContextCohort(store, {
+        variantId: PREFREEZE_LANE, direction: "LONG", regime: "Bullish expansion",
+        count: 11, netR: () => 1, prefix: "prefreeze-11",
+        openedAtMsFor: (index) => BURST_STARTS[burstOf(index)]! + (index % 4) * 5 * 60 * 1000,
+      });
+
+      const row = preFreezeAggregateRowOf(store);
+      const pre = row.preFreezeCollection;
+
+      // The provisional counts show REAL accumulation...
+      expect(pre.eligibleRows).toBe(11);
+      expect(pre.provisionalEpisodes).toBe(3);
+      expect(pre.rowsPerEpisode).toBeCloseTo(11 / 3, 9);
+      // ...and agree with the row's own canonical headline figures by construction (same population,
+      // same rule) — a provisional count that disagreed with effectiveN would be a second opinion.
+      expect(pre.eligibleRows).toBe(row.freshValid);
+      expect(pre.provisionalEpisodes).toBe(row.effectiveN);
+      // Largest episode is one of the 4-row bursts — the concentration signal a bare count hides.
+      expect(pre.largestEpisodeRows).toBe(4);
+      expect(pre.largestEpisodeShare).toBeCloseTo(4 / 11, 9);
+
+      // ...while DEV remains genuinely NOT FROZEN. This is the whole point: provisional progress is
+      // visible WITHOUT anything being promoted, frozen, or counted as proof.
+      expect(row.stableProof.frozen).toBe(false);
+      expect(row.stableProof.dev.rows).toBe(0);
+      expect(row.stableProof.dev.effectiveN).toBe(0);
+      expect(row.stableProof.ok).toBe(false);
+      expect(row.promotionProof.frozen).toBe(false);
+
+      // And the blockers say exactly what is missing, against the real floors.
+      expect(pre.minRowsToAttemptFreeze).toBe(STABLE_MIN_DEV_ROWS + STABLE_MIN_HOLDOUT_ROWS);
+      expect(pre.freezeBlockers.join(" ")).toContain(`${STABLE_MIN_DEV_ROWS + STABLE_MIN_HOLDOUT_ROWS}`);
+      expect(pre.freezeBlockers.some((b) => b.includes("independent episodes"))).toBe(true);
+    });
+
+    it("[PREFREEZE-C] 500 legacy rows never enter the current or provisional counts, however large", () => {
+      const store = new CurrentGuardVariantMatrixStore(tmpDir());
+      addResolvedContextCohort(store, {
+        variantId: PREFREEZE_LANE, direction: "LONG", regime: "Bullish expansion",
+        count: 500, netR: () => 1, prefix: "prefreeze-legacy", spacingDays: 4,
+      });
+      // Genuine pre-reset shape: openMaxHoldMs absent, exactly as every row written before the field
+      // existed. 500 profitable rows — nothing about their economics is the reason they are excluded.
+      for (const obs of store.all.filter((o) => o.variantId === PREFREEZE_LANE)) {
+        store.update(obs.observationId, { openMaxHoldMs: undefined });
+      }
+
+      const row = preFreezeAggregateRowOf(store);
+      expect(row.freshValid).toBe(0);
+      expect(row.preFreezeCollection.eligibleRows).toBe(0);
+      expect(row.preFreezeCollection.provisionalEpisodes).toBe(0);
+      expect(row.preFreezeCollection.rowsPerEpisode).toBeNull();
+      expect(row.preFreezeCollection.largestEpisodeRows).toBe(0);
+      // They are visible as legacy, not silently vanished — the audit trail the reset promises.
+      expect(row.evidenceVersionSummary.legacyExcludedRows).toBe(500);
+      // The version label is still correct: a lane with zero current rows is still ON 36h policy.
+      expect(row.preFreezeCollection.evidenceVersion).toBe(`${PREFREEZE_LANE}@36H-v1`);
+    });
+
+    it("[PREFREEZE-D] a store mixing 72h-stamped and 36h-stamped rows FAILS CLOSED — only the current-width rows count, the two never blend", () => {
+      const store = new CurrentGuardVariantMatrixStore(tmpDir());
+      addResolvedContextCohort(store, {
+        variantId: PREFREEZE_LANE, direction: "LONG", regime: "Bullish expansion",
+        count: 20, netR: () => 1, prefix: "prefreeze-mixed", spacingDays: 4,
+      });
+      const ids = store.all.filter((o) => o.variantId === PREFREEZE_LANE).map((o) => o.observationId);
+      // First 12 rows re-stamped to the OLD 72h width (the exact contamination shape a width change
+      // creates); the remaining 8 keep the current 36h stamp addResolvedContextCohort gave them.
+      for (const id of ids.slice(0, 12)) store.update(id, { openMaxHoldMs: 72 * 60 * 60 * 1000 });
+
+      const row = preFreezeAggregateRowOf(store);
+      expect(row.preFreezeCollection.eligibleRows).toBe(8);
+      expect(row.freshValid).toBe(8);
+      // The 12 stale-width rows are reported as legacy with the STALE reason, never merged in.
+      expect(row.evidenceVersionSummary.legacyExcludedRows).toBe(12);
+      expect(row.evidenceVersionSummary.legacyExclusionReasons).toContainEqual({
+        reason: "openMaxHoldMs stale (recorded value no longer matches this lane's current config)",
+        count: 12,
+      });
+      // Fail-closed direction: the mixed store reports FEWER rows than are on tape, never more.
+      expect(row.preFreezeCollection.eligibleRows).toBeLessThan(20);
+    });
+
+    it("[PREFREEZE-E] provisional counts are deterministic across a store reload and independent of row order — a restart/cache rebuild reproduces them exactly", () => {
+      const dir = tmpDir();
+      const store = new CurrentGuardVariantMatrixStore(dir);
+      addResolvedContextCohort(store, {
+        variantId: PREFREEZE_LANE, direction: "LONG", regime: "Bullish expansion",
+        count: 11, netR: () => 1, prefix: "prefreeze-restart",
+        openedAtMsFor: (index) => Date.UTC(2026, 5, 1 + index * 10),
+      });
+      const before = preFreezeAggregateRowOf(store).preFreezeCollection;
+
+      // A genuinely new store object reading the SAME persisted directory — the restart path.
+      const reloaded = new CurrentGuardVariantMatrixStore(dir);
+      const after = preFreezeAggregateRowOf(reloaded).preFreezeCollection;
+      expect(after).toEqual(before);
+
+      // And the underlying rule is order-independent: the canonical counter sorts defensively, so a
+      // permuted input cannot change the answer (nothing here reads a clock or mutable module state).
+      const rows = reloaded.all
+        .filter((o) => o.variantId === PREFREEZE_LANE)
+        .map((o) => ({ episodeMs: Date.parse(o.openedAt), observationId: o.observationId, batchId: null, episodeId: null }));
+      const forward = describeIndependentEpisodes(rows, 36 * 60 * 60 * 1000);
+      const reversed = describeIndependentEpisodes(rows.slice().reverse(), 36 * 60 * 60 * 1000);
+      expect(reversed).toEqual(forward);
+      expect(countIndependentEpisodes(rows, 36 * 60 * 60 * 1000)).toBe(forward.episodes);
+    });
+
+    it("[PREFREEZE-F] provisional progress can never satisfy a gate — a lane far past every DEV floor provisionally is still not STABLE while unfrozen", () => {
+      const store = new CurrentGuardVariantMatrixStore(tmpDir());
+      // 300 profitable rows spread 4 days apart: provisionally this clears STABLE_MIN_DEV_ROWS(40)
+      // and STABLE_MIN_EFFECTIVE_N(10) many times over. The holdout can never satisfy its own floors
+      // here, so no window freezes — and the lane must NOT be treated as proven on that basis.
+      addResolvedContextCohort(store, {
+        variantId: PREFREEZE_LANE, direction: "LONG", regime: "Bullish expansion",
+        count: 300, netR: (index) => (index % 5 === 0 ? -0.5 : 1), prefix: "prefreeze-gate",
+        scanBatchIdFor: (index) => (index >= STABLE_MIN_DEV_ROWS ? "prefreeze-one-scan" : null),
+        spacingDays: 4,
+      });
+      const row = preFreezeAggregateRowOf(store);
+
+      // Provisional numbers are large and healthy...
+      expect(row.preFreezeCollection.eligibleRows).toBeGreaterThan(STABLE_MIN_DEV_ROWS);
+      expect(row.preFreezeCollection.provisionalEpisodes).toBeGreaterThan(STABLE_MIN_EFFECTIVE_N);
+      expect(row.netAvgR).toBeGreaterThan(0);
+      // ...and the gate is still closed, because nothing froze. The provisional section is reporting,
+      // never authority: status must not read STABLE/PROMOTION off in-sample accumulation.
+      expect(row.stableProof.frozen).toBe(false);
+      expect(row.stableProof.ok).toBe(false);
+      expect(row.promotionProof.ok).toBe(false);
+      expect(row.status).not.toBe("STABLE_CANDIDATE");
+      expect(row.status).not.toBe("PROMOTION_CANDIDATE");
     });
 
     it("previousEvidenceVersion is MEASURED from a legacy MAX_HOLD_MTM close's real durationMinutes, never a remembered/assumed number", () => {

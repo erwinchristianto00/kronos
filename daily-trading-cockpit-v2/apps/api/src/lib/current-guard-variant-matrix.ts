@@ -881,6 +881,12 @@ export const VARIANT_MATRIX_DEFINITIONS: readonly VariantMatrixVariantDefinition
     costModel: "taker",
     stopFloorBps: 200,
     tpRewardMultiple: 1.0,
+    // 2026-08-05: measured resolution time over 151 fresh-valid closes: p90 38.9h, p95 62.3h,
+    // only 5.3% ever reach the 72h default. 36h sits just under p90 (barely touches the
+    // legitimate tail) while halving the effectiveN episode-clustering window (blockWidthMs =
+    // variantMaxHoldMs), which is what was keeping this lane's independent-episode count pinned
+    // near 1 despite 150+ raw rows. See STABLE_MIN_DEV_EFFECTIVE_N.
+    maxHoldHours: 36,
     longOnly: true,
     bullishOnly: true,
     description:
@@ -977,6 +983,12 @@ export const VARIANT_MATRIX_DEFINITIONS: readonly VariantMatrixVariantDefinition
     costModel: "taker",
     stopFloorBps: 300,
     tpRewardMultiple: 0.5,
+    // 2026-08-05: measured resolution time over 189 fresh-valid closes: p90 33.2h, p95 41.2h,
+    // only 1.1% ever reach the 72h default. 36h sits just above p90 (barely touches the
+    // legitimate tail) while halving the effectiveN episode-clustering window (blockWidthMs =
+    // variantMaxHoldMs), which is what was keeping this lane's independent-episode count pinned
+    // at 2 despite 189 raw rows. See STABLE_MIN_DEV_EFFECTIVE_N.
+    maxHoldHours: 36,
     longOnly: true,
     description:
       "Disambiguation lane: the exact LONG mirror of CG_WIDE_FAST_SHORT (wide >=300bps stop, fast 0.5R " +
@@ -1014,6 +1026,13 @@ export const VARIANT_MATRIX_DEFINITIONS: readonly VariantMatrixVariantDefinition
     costModel: "taker",
     stopFloorBps: 300,
     tpRewardMultiple: 0.5,
+    // 2026-08-05: measured resolution time over 357 fresh-valid closes: p90 35.6h, p95 52.2h,
+    // only 3.1% ever reach the 72h default (and that MAX_HOLD_MTM tail is where this lane's real
+    // bleed lives — 6.7% WR / -0.60R avg on those forced closes vs 79.5% WR clean, ~34% of total
+    // R lost to a 4.2%-of-rows tail). 36h sits just above p90 while halving the effectiveN
+    // episode-clustering window (blockWidthMs = variantMaxHoldMs), which is what was keeping this
+    // lane's independent-episode count pinned at 2 despite 357 raw rows.
+    maxHoldHours: 36,
     description:
       "Wide >=300bps stop, 0.5R trigger: on a 0.5R touch move the stop to breakeven and ride the exact " +
       "candle path. Tests early risk-removal + free upside vs the fast full-exit. Direction-agnostic; " +
@@ -3700,6 +3719,63 @@ export interface VariantMatrixStageProof {
   blockers: string[];
 }
 
+/**
+ * Point 4e — what has accumulated in the CURRENT evidence version so far, BEFORE any window has been
+ * frozen.
+ *
+ * WHY THIS EXISTS. Every field of `stableProof`/`promotionProof` is fail-closed at 0/null until a
+ * window freezes, and freezing needs STABLE_MIN_DEV_ROWS + STABLE_MIN_HOLDOUT_ROWS (60) eligible
+ * rows before it is even ATTEMPTED. A lane that has legitimately collected e.g. 5 rows across 3
+ * independent episodes therefore renders as an unbroken wall of zeros — indistinguishable on the
+ * dashboard from a lane that has collected nothing at all, or from one whose evidence was just reset
+ * to zero. That is a real reporting defect: the operator cannot tell "not started" from "collecting,
+ * 3 of 10 episodes in".
+ *
+ * WHAT IT IS NOT. Provisional. Unfrozen. In-sample by construction — it is the whole current
+ * population with no dev/holdout split, so it can never be out-of-sample evidence of anything. It is
+ * therefore READ-ONLY REPORTING and must never be read by a gate: `deriveVariantStatus` reads
+ * `stableProof.ok`/`promotionProof.ok` and nothing here, readiness/promotion/campaign/CORTEX all
+ * consume those same frozen proofs, and adding a consumer of these counts to any of them would
+ * re-introduce exactly the in-sample self-grading this stage machinery was built to end.
+ *
+ * Counts come from the SAME `describeIndependentEpisodes` implementation and the SAME
+ * `isFreshValidObs` active-evidence filter the frozen proofs are built from, so a provisional
+ * episode count can never disagree with the frozen one it will later become.
+ */
+export interface VariantMatrixPreFreezeCollection {
+  /** Eligible rows in the CURRENT evidence version — identical to the row's own `freshValid`
+   *  (same `fresh` population), restated here so the section is self-contained. */
+  eligibleRows: number;
+  /** Independent episodes over those rows, at the variant's CURRENT max-hold width. Identical to the
+   *  row's `effectiveN`; named "provisional" here because no window is frozen. */
+  provisionalEpisodes: number;
+  /** eligibleRows / provisionalEpisodes. Null when there are no episodes yet. High values mean the
+   *  rows are clustered into few real draws — the exact illusion effectiveN exists to expose. */
+  rowsPerEpisode: number | null;
+  calendarDays: number | null;
+  distinctSymbolCount: number;
+  /** Independent regime EPISODES (run-length-encoded), matching the row's `distinctRegimes`. */
+  distinctRegimes: number;
+  /** Rows in the single largest independent episode, and its share of `eligibleRows`. The episode-axis
+   *  companion to topSymbolPnlShare: 11 rows in 1 episode is not 11 draws. */
+  largestEpisodeRows: number;
+  largestEpisodeShare: number | null;
+  /** Fraction of PnL from the single largest-PnL symbol, same measure the frozen dev gate uses. */
+  topSymbolPnlShare: number | null;
+  /** Mirrors the lane's evidence-version identity so this section can be read without cross-
+   *  referencing another panel — null for lanes with no active reset. */
+  evidenceVersion: string | null;
+  cutoverSource: "CANONICAL" | "INFERRED";
+  /** Exactly what is still missing before a STABLE DEV window can FREEZE, each with its numeric
+   *  shortfall. Empty once freezing is possible — which is not the same as the gate passing, and is
+   *  deliberately phrased "freeze" rather than "pass" everywhere. */
+  freezeBlockers: string[];
+  /** The floors the blockers above are measured against, echoed so no consumer hardcodes them. */
+  minRowsToAttemptFreeze: number;
+  minDevRows: number;
+  minDevEpisodes: number;
+}
+
 export interface CurrentGuardVariantMatrixRow {
   variantId: VariantMatrixVariantId;
   label: string;
@@ -3801,6 +3877,9 @@ export interface CurrentGuardVariantMatrixRow {
    *  holdout = episodeTime >= devEndMs, open-ended and, because devEndMs >= stableProof.holdoutEndMs,
    *  DISJOINT from STABLE's holdout by construction. Never frozen before `stableProof` is. */
   promotionProof: VariantMatrixStageProof;
+  /** Point 4e — provisional, UNFROZEN collection progress for the current evidence version. Strictly
+   *  report-only; see VariantMatrixPreFreezeCollection's own doc for why no gate may read it. */
+  preFreezeCollection: VariantMatrixPreFreezeCollection;
 
   // ---- Legacy aliases of the STABLE stage. Kept at their existing names and shapes so external
   // readers (operator-brief.ts's `stageEvidenceLines`, renamed this round from `devHoldoutLine` when
@@ -4054,14 +4133,44 @@ export function evidenceVersionLabel(obs: CurrentGuardVariantMatrixObservation):
   return `${obs.variantId}@${hours}H-v1`;
 }
 
+/**
+ * The lane's CURRENT evidence-version identity, derived from CONFIG (`variantMaxHoldMs`) rather than
+ * from whichever row happens to have closed.
+ *
+ * WHY CONFIG AND NOT DATA. A lane's active evidence version is a statement about the policy in force
+ * RIGHT NOW; it is knowable the instant the config changes and does not depend on a row having
+ * resolved under it yet. Deriving it from rows made the label lag reality by up to a full max-hold
+ * window: immediately after a width change every existing row is (correctly) legacy, so the row-derived
+ * label read `null` — "no current-version evidence yet" — while source, runtime and every newly-opened
+ * row were already on the new width. That is precisely the source/runtime/UI disagreement the version
+ * label exists to make visible, reproduced by the label itself.
+ *
+ * Agreement is by construction, not by convention: this reads the SAME `variantMaxHoldMs` that stamps
+ * `openMaxHoldMs` on every new row, that `isFreshValidObs` tests rows against, and that supplies
+ * `blockWidthMs` for episode clustering. So `evidenceVersionLabel(row) === currentEvidenceVersionLabel(id)`
+ * holds for exactly the rows that count, and is `null` for exactly the rows that do not.
+ *
+ * `resetCutoverAt` deliberately stays row-derived (empirical "when did this version actually start
+ * producing evidence") and remains null until a real current row exists — a policy label and an
+ * observed start are different facts and are not conflated.
+ */
+export function currentEvidenceVersionLabel(variantId: VariantMatrixVariantId): string | null {
+  if (!EVIDENCE_RESET_CUTOVER_VARIANT_IDS.has(variantId)) return null;
+  const hours = Math.round(variantMaxHoldMs(variantId) / (60 * 60 * 1000));
+  return `${variantId}@${hours}H-v1`;
+}
+
 /** Dashboard/telemetry-only summary of a lane's evidence-version split. Never used by any admission,
  *  sizing, or eligibility decision — those all read `isFreshValidObs`/`freshValid` directly, and this
  *  function's CURRENT branch is verified to agree with `isFreshValidObs` by construction below (same
  *  reset-lane exact-match test, applied to the same field). All-zero/null for every lane outside
  *  EVIDENCE_RESET_CUTOVER_VARIANT_IDS — there is nothing to split for a lane with no reset. */
 export interface LaneEvidenceVersionSummary {
-  /** evidenceVersionLabel() of the most recent CURRENT row, or null if this lane has none yet
-   *  (reset shipped but no post-reset row has closed fresh-valid) or is not a reset lane at all. */
+  /** The lane's CURRENT evidence-version identity, derived from CONFIG via
+   *  `currentEvidenceVersionLabel` — see that function for why config and not row data. Non-null for
+   *  every reset lane the moment its width is set, including before any row has closed under it (that
+   *  state reads as evidenceVersion set + 0 current rows + N legacy rows, which is the honest
+   *  description of a just-reset lane). Null only for a lane outside EVIDENCE_RESET_CUTOVER_VARIANT_IDS. */
   evidenceVersion: string | null;
   /** ISO openedAt of the EARLIEST currently-counting (CURRENT) row — i.e. when this lane's active
    *  evidence version empirically began. There is no stored wall-clock cutover constant (the reset
@@ -4208,7 +4317,12 @@ export function summarizeLaneEvidenceVersion(
     };
   }
   return {
-    evidenceVersion,
+    // Config-derived, so it is correct the instant the width changes rather than lagging until a row
+    // closes under the new one. `evidenceVersion` (accumulated from rows above) is retained as a
+    // cross-check: when any current row exists the two agree by construction, and this asserts that
+    // rather than assuming it — a mismatch means a row was stamped with a width the config no longer
+    // has, which is exactly the contamination this whole reset mechanism exists to catch.
+    evidenceVersion: currentEvidenceVersionLabel(variantId) ?? evidenceVersion,
     resetCutoverAt: earliestCurrentMs !== null ? new Date(earliestCurrentMs).toISOString() : null,
     resetCutoverAtMs: earliestCurrentMs,
     legacyExcludedRows,
@@ -4576,7 +4690,26 @@ export function countIndependentEpisodes(
   rows: readonly EpisodeIdentityRow[],
   blockWidthMs: number,
 ): number {
-  if (rows.length === 0) return 0;
+  return describeIndependentEpisodes(rows, blockWidthMs).episodes;
+}
+
+/** The independent-episode partition of a cohort, described rather than merely counted.
+ *
+ *  `episodes` is bit-for-bit what `countIndependentEpisodes` returns (that function delegates here),
+ *  so a caller can never show an episode COUNT that disagrees with the episode SIZES beside it.
+ *  `largestEpisodeRows` answers the concentration question a bare count cannot — "is this cohort's
+ *  independence real, or is one episode carrying most of the rows" — which is the same hazard
+ *  topSymbolPnlShare exists for, on the episode axis instead of the symbol axis.
+ *
+ *  Sizes come from `EpisodeAccumulator.rootOf` — the class's own per-row view of the partition
+ *  `count()` summarises — so this adds NO second opinion about what an episode is (the exact thing
+ *  EpisodeAccumulator's doc comment forbids). Report-only: nothing here gates any stage.
+ */
+export function describeIndependentEpisodes(
+  rows: readonly EpisodeIdentityRow[],
+  blockWidthMs: number,
+): { episodes: number; largestEpisodeRows: number } {
+  if (rows.length === 0) return { episodes: 0, largestEpisodeRows: 0 };
   const sorted = rows.slice();
   sorted.sort((a, b) => {
     if (a.episodeMs === null || b.episodeMs === null) {
@@ -4589,8 +4722,20 @@ export function countIndependentEpisodes(
     return 0;
   });
   const accumulator = new EpisodeAccumulator(blockWidthMs);
-  for (const row of sorted) accumulator.push(row);
-  return accumulator.count();
+  // Nodes are collected first and resolved to roots only after EVERY row is pushed: a merge arriving
+  // later can still fuse two nodes that were separate earlier, exactly as `rootOf`'s doc warns.
+  const nodes: number[] = [];
+  for (const row of sorted) nodes.push(accumulator.push(row));
+  const rowsPerRoot = new Map<number, number>();
+  for (const node of nodes) {
+    const root = accumulator.rootOf(node);
+    rowsPerRoot.set(root, (rowsPerRoot.get(root) ?? 0) + 1);
+  }
+  let largestEpisodeRows = 0;
+  for (const count of rowsPerRoot.values()) {
+    if (count > largestEpisodeRows) largestEpisodeRows = count;
+  }
+  return { episodes: accumulator.count(), largestEpisodeRows };
 }
 
 /**
@@ -5355,6 +5500,99 @@ interface VariantMatrixStageProofBundle {
 }
 
 /**
+ * Point 4e — describe the CURRENT (unfrozen) evidence version's accumulated collection progress.
+ *
+ * Pure and report-only: it derives everything from the same `fresh` population the frozen proofs are
+ * searched over (already filtered by `isFreshValidObs`, so for a reset lane it is current-version-only
+ * by construction) and the same `describeIndependentEpisodes` rule. It reads no store, freezes
+ * nothing, and no caller may gate on it — see VariantMatrixPreFreezeCollection's doc comment.
+ *
+ * `freezeBlockers` answers "why is DEV still NOT FROZEN", which is a strictly different question from
+ * "why did the gate fail" (`VariantMatrixStageProof.blockers`). A window is only ATTEMPTED once the
+ * combined dev+holdout row floor is reachable, so the row shortfall is reported against that sum,
+ * while the episode shortfall is reported against the dev floor it must eventually satisfy.
+ */
+function buildPreFreezeCollection(
+  fresh: readonly CurrentGuardVariantMatrixObservation[],
+  blockWidthMs: number,
+  stableProof: VariantMatrixStageProof,
+  evidenceVersionSummary: LaneEvidenceVersionSummary,
+  calendarDays: number | null,
+  distinctRegimes: number,
+  distinctSymbolCount: number,
+  topSymbolPnlShareValue: number | null,
+): VariantMatrixPreFreezeCollection {
+  const { episodes, largestEpisodeRows } = describeIndependentEpisodes(
+    fresh.map(episodeIdentityRowOf),
+    blockWidthMs,
+  );
+  const eligibleRows = fresh.length;
+  const minRowsToAttemptFreeze = STABLE_MIN_DEV_ROWS + STABLE_MIN_HOLDOUT_ROWS;
+  const freezeBlockers: string[] = [];
+  if (stableProof.frozen) {
+    // Already frozen ⇒ this section is history; say so rather than inventing a shortfall.
+    return {
+      eligibleRows,
+      provisionalEpisodes: episodes,
+      rowsPerEpisode: episodes > 0 ? eligibleRows / episodes : null,
+      calendarDays,
+      distinctSymbolCount,
+      distinctRegimes,
+      largestEpisodeRows,
+      largestEpisodeShare: eligibleRows > 0 ? largestEpisodeRows / eligibleRows : null,
+      topSymbolPnlShare: topSymbolPnlShareValue,
+      evidenceVersion: evidenceVersionSummary.evidenceVersion,
+      cutoverSource: evidenceVersionSummary.cutoverSource,
+      freezeBlockers,
+      minRowsToAttemptFreeze,
+      minDevRows: STABLE_MIN_DEV_ROWS,
+      minDevEpisodes: STABLE_MIN_EFFECTIVE_N,
+    };
+  }
+  if (eligibleRows < minRowsToAttemptFreeze) {
+    freezeBlockers.push(
+      `eligible current rows ${eligibleRows} < ${minRowsToAttemptFreeze} needed before a STABLE window is attempted ` +
+        `(dev ${STABLE_MIN_DEV_ROWS} + holdout ${STABLE_MIN_HOLDOUT_ROWS})`,
+    );
+  }
+  if (episodes < STABLE_MIN_EFFECTIVE_N) {
+    freezeBlockers.push(
+      `provisional independent episodes ${episodes} < ${STABLE_MIN_EFFECTIVE_N} needed for the STABLE dev side`,
+    );
+  }
+  if (distinctSymbolCount < STABLE_MIN_DISTINCT_SYMBOLS) {
+    freezeBlockers.push(
+      `distinct symbols ${distinctSymbolCount} < ${STABLE_MIN_DISTINCT_SYMBOLS} needed for the STABLE dev side`,
+    );
+  }
+  if (freezeBlockers.length === 0) {
+    // Enough raw material exists; the boundary search itself has not yet found a split that satisfies
+    // both sides at once (or the newest rows are still inside the settlement quarantine).
+    freezeBlockers.push(
+      "enough rows and episodes collected; awaiting a boundary that satisfies both dev and holdout floors " +
+        "(newest rows are held back by the settlement quarantine until they can no longer move)",
+    );
+  }
+  return {
+    eligibleRows,
+    provisionalEpisodes: episodes,
+    rowsPerEpisode: episodes > 0 ? eligibleRows / episodes : null,
+    calendarDays,
+    distinctSymbolCount,
+    distinctRegimes,
+    largestEpisodeRows,
+    largestEpisodeShare: eligibleRows > 0 ? largestEpisodeRows / eligibleRows : null,
+    topSymbolPnlShare: topSymbolPnlShareValue,
+    evidenceVersion: evidenceVersionSummary.evidenceVersion,
+    cutoverSource: evidenceVersionSummary.cutoverSource,
+    freezeBlockers,
+    minRowsToAttemptFreeze,
+    minDevRows: STABLE_MIN_DEV_ROWS,
+    minDevEpisodes: STABLE_MIN_EFFECTIVE_N,
+  };
+}
+
+/**
  * Point 4 — attempt both stage freezes for one proof unit (`key`) and report both stages' proofs.
  *
  * The freezes are add-only: the first build with enough evidence locks each window, every later
@@ -5891,6 +6129,9 @@ function buildRow(
 
   const { drawdownR, streak } = drawdownAndStreak(fresh.map((o) => o.netR ?? 0));
   const symbolShare = topSymbolPnlShare(fresh);
+  // Hoisted (was inlined in `partial`) so preFreezeCollection can reuse the SAME summary object the
+  // row publishes, rather than recomputing it and risking a second, drifting answer.
+  const evidenceVersionSummary = summarizeLaneEvidenceVersion(def.id, obsForVariant);
 
   // Same helper the stage proofs use, so the headline stress figure and each stage's
   // `dev.stressNetAvgR`/`holdout.stressNetAvgR` can never be computed two different ways.
@@ -5925,7 +6166,7 @@ function buildRow(
     exitRule: def.exitRule,
     fillMode: def.fillMode,
     costModel: def.costModel,
-    evidenceVersionSummary: summarizeLaneEvidenceVersion(def.id, obsForVariant),
+    evidenceVersionSummary,
     total,
     open,
     resolved: resolvedObs.length,
@@ -5975,6 +6216,20 @@ function buildRow(
     // because it now renders BOTH stages rather than one dev/holdout pair) reads these to surface the
     // split in section 4.
     ...stageProofs,
+    // Point 4e — provisional, unfrozen collection progress. Built from the SAME `fresh` population
+    // and the SAME episode rule the stage proofs above use, so the provisional episode count and the
+    // frozen one it will become can never disagree. Report-only: `deriveVariantStatus` below reads
+    // `stableProof`/`promotionProof` and never this.
+    preFreezeCollection: buildPreFreezeCollection(
+      fresh,
+      blockWidthMs,
+      stageProofs.stableProof,
+      evidenceVersionSummary,
+      calendarDays(fresh),
+      distinctRegimes,
+      distinctSymbolCount,
+      symbolShare,
+    ),
   };
 
   const aggregate = deriveVariantStatus(partial, infra);
