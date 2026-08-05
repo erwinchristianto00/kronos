@@ -307,6 +307,18 @@ export interface ExecutorBasket {
    *  matched-vs-expected leg count would make that detectable and is a worthwhile follow-up. */
   feeSource?: "EXCHANGE" | "ESTIMATE_TAKER_FLAT";
   netPnlUsd: number | null;
+  /** Set ONLY at one site: closeBasket()'s staleBookReconciled branch, when a leg was closed
+   *  OUT-OF-BAND (e.g. by POST /api/live/flatten-exchange's flattenAllExchangePositions(), a
+   *  SEPARATE raw close path that never touches this store — see that function's own doc comment)
+   *  and this basket's own bookkeeping only learns about it later, via a -2022/"already flat"
+   *  reconciliation with no real fill/exit price to compute a return from. Orthogonal to `status`
+   *  above (that stays ABORTED for its own lifecycle purposes) — this is a SEPARATE axis: whether
+   *  the basket's P&L is a known number or a genuinely UNKNOWN one. It never replaces `status` and
+   *  is never coerced to 0 — a $0 return and an UNKNOWN return are different facts. Every consumer
+   *  reading closed-basket P&L for learning/PF/WR/promotion/CORTEX-label purposes MUST exclude a
+   *  basket carrying this flag (`=== "ACCOUNTING_INCOMPLETE"`), never zero-fill it. undefined for
+   *  every normal basket — no migration needed, same optional-field convention as feeSource above. */
+  accountingStatus?: "ACCOUNTING_INCOMPLETE";
   /** Stamped by every profit-target check (5-min tick): the basket's CURRENT net return vs the
    *  TP threshold, so the dashboard can show the live TP gap per basket — "tinggal berapa lagi,
    *  bakal nyampe atau engga, ada yang macet atau engga" (2026-07-07 operator ask). */
@@ -887,9 +899,15 @@ export class CrossSectionalExecutor {
      *  every retry so far having failed — an operator (or a future account-wide reconciliation)
      *  must never mistake a still-failing retry for "handled". */
     orphanedLegs: OrphanedLeg[];
+    /** Baskets whose real P&L is UNKNOWN, not zero — closed out-of-band (e.g. a panic
+     *  flatten-exchange call) before this basket's own bookkeeping ever saw a real exit price. See
+     *  ExecutorBasket.accountingStatus's own doc comment. Every learning/PF-WR/promotion/CORTEX-
+     *  label consumer must exclude these, never zero-fill them — surfaced here (same shape
+     *  discipline as orphanedLegs above) so an operator can never mistake "excluded" for "handled". */
+    accountingIncompleteBaskets: ExecutorBasket[];
   } {
     const st = this.store.getState();
-    const closed = st.baskets.filter((b) => b.status === "CLOSED");
+    const closed = st.baskets.filter((b) => b.status === "CLOSED" && b.accountingStatus !== "ACCOUNTING_INCOMPLETE");
     const openBaskets = st.baskets.filter((b) => this.isBasketLive(b));
     const targetVariant = this.targetVariant;
     const nowMs = new Date(this.nowIso()).getTime();
@@ -922,6 +940,7 @@ export class CrossSectionalExecutor {
       signalStale: signalAgeMs === null || signalAgeMs > signalMaxAgeMs,
       adaptiveFilters: deriveAdaptiveSymbolFilters(this.signalStore as CrossSectionalStore).provenance,
       orphanedLegs: st.orphanedLegs ?? [],
+      accountingIncompleteBaskets: st.baskets.filter((b) => b.accountingStatus === "ACCOUNTING_INCOMPLETE"),
     };
   }
 
@@ -939,7 +958,7 @@ export class CrossSectionalExecutor {
     symbols: string[];
     lastClosedAt: string | null;
   } {
-    const closed = this.store.getState().baskets.filter((b) => b.status === "CLOSED");
+    const closed = this.store.getState().baskets.filter((b) => b.status === "CLOSED" && b.accountingStatus !== "ACCOUNTING_INCOMPLETE");
     const symbols = new Set<string>();
     let realized = 0;
     let fees = 0;
@@ -963,14 +982,16 @@ export class CrossSectionalExecutor {
    *  the CROSS_SECTIONAL_REGIME_SKEW tilt (which converts the only true hedge into more same-side
    *  beta) is actually being rewarded, before deciding to keep or disable it. Never affects trading. */
   getRegimeSkewCounterfactual(): RegimeSkewCounterfactual {
-    const closed = this.store.getState().baskets.filter((b) => b.status === "CLOSED");
+    const closed = this.store.getState().baskets.filter((b) => b.status === "CLOSED" && b.accountingStatus !== "ACCOUNTING_INCOMPLETE");
     return regimeSkewCounterfactual(closed);
   }
 
   /** Every CLOSED basket, store order — feeds account-level merges that need per-basket
-   *  closedAt/netPnl (e.g. the lane-performance timeline) rather than the aggregate summary. */
+   *  closedAt/netPnl (e.g. the lane-performance timeline) rather than the aggregate summary.
+   *  Excludes ACCOUNTING_INCOMPLETE baskets (see ExecutorBasket.accountingStatus) — their P&L is
+   *  UNKNOWN, not zero, and every consumer of this list feeds learning/PF-WR-shaped surfaces. */
   getClosedBaskets(): ExecutorBasket[] {
-    return this.store.getState().baskets.filter((b) => b.status === "CLOSED");
+    return this.store.getState().baskets.filter((b) => b.status === "CLOSED" && b.accountingStatus !== "ACCOUNTING_INCOMPLETE");
   }
 
   /** Single-flight tick: bank early winners, close due baskets, then consider opening a new one. */
@@ -1298,7 +1319,7 @@ export class CrossSectionalExecutor {
     const day = nowIso.slice(0, 10);
     let sum = 0;
     for (const b of this.store.getState().baskets) {
-      if (b.status === "CLOSED" && b.closedAt && b.closedAt.slice(0, 10) === day && b.netPnlUsd !== null) {
+      if (b.status === "CLOSED" && b.accountingStatus !== "ACCOUNTING_INCOMPLETE" && b.closedAt && b.closedAt.slice(0, 10) === day && b.netPnlUsd !== null) {
         sum += b.netPnlUsd;
       }
     }
@@ -1460,6 +1481,12 @@ export class CrossSectionalExecutor {
       basket.grossPnlUsd = null;
       basket.feeEstimateUsd = null;
       basket.netPnlUsd = null;
+      // Operator spec (2026-08-05, panic-flatten accounting gap): the leg was closed OUT-OF-BAND
+      // (e.g. flattenAllExchangePositions(), a SEPARATE raw close path — see accountingStatus's own
+      // doc comment) with no real fill/exit price ever available to this basket. null P&L alone is
+      // not enough — every learning/PF-WR/promotion/CORTEX-label consumer must be able to tell
+      // "genuinely unknown" apart from a real $0 close, and exclude it rather than zero-fill it.
+      basket.accountingStatus = "ACCOUNTING_INCOMPLETE";
       this.store.save();
       return;
     }

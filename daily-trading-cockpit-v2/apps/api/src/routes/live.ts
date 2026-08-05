@@ -201,7 +201,7 @@ export function mergeCrossSectionalIntoLaneSeries(
   let closedCount = 0;
   const symbols = new Set<string>();
   for (const basket of executor.getClosedBaskets()) {
-    if (!basket.closedAt || basket.netPnlUsd === null) continue;
+    if (!basket.closedAt || basket.netPnlUsd === null || basket.accountingStatus === "ACCOUNTING_INCOMPLETE") continue;
     const closedMs = new Date(basket.closedAt).getTime();
     if (!Number.isFinite(closedMs) || closedMs < sinceMs || closedMs >= untilMs) continue;
     // Greatest bucket start <= closedAt (bucket lengths vary across views, e.g. monthly).

@@ -1717,6 +1717,12 @@ describe("closeBasket under cross-basket netting", () => {
     expect(reconciled.netPnlUsd).toBeNull(); // no fabricated fill/P&L
     expect(reconciled.legs[0]!.exitOrderId).toBe("POSITION_ALREADY_FLAT");
     expect(client.placed).toHaveLength(0); // critically: no plain SELL that creates a new short
+    // 2026-08-05 (panic-flatten accounting gap fix): a null netPnlUsd alone doesn't distinguish
+    // "genuinely unknown, closed out-of-band" from any other null — the basket must carry an
+    // explicit, separate flag so downstream learning/PF-WR/promotion/CORTEX consumers can exclude
+    // it rather than risk zero-filling a fabricated outcome.
+    expect(reconciled.accountingStatus).toBe("ACCOUNTING_INCOMPLETE");
+    expect(executor.getStatus().accountingIncompleteBaskets.map((b) => b.basketId)).toEqual(["flat"]);
   });
 
   it("[RETRY-PNL] finalizing after a partial close counts the ALREADY-exited legs' P&L", async () => {
@@ -1735,6 +1741,110 @@ describe("closeBasket under cross-basket netting", () => {
     // gross = (108−100)*1 + (1−0.9)*10 = 9; fees = ((100+108)*1 + (1+0.9)*10) * 0.0005 = 0.1135
     expect(a.grossPnlUsd).toBeCloseTo(9, 6);
     expect(a.netPnlUsd).toBeCloseTo(9 - 227 * 0.0005, 6);
+  });
+});
+
+// 2026-08-05 (panic-flatten accounting gap fix, operator spec): a basket whose leg was closed
+// OUT-OF-BAND (e.g. POST /api/live/flatten-exchange) and reconciled with no real fill price must
+// be excluded — never zero-filled — by EVERY consumer that reads closed-basket P&L for
+// learning/PF-WR/promotion/CORTEX-label purposes. These fixtures deliberately set
+// `status: "CLOSED"` (not the real code path's "ABORTED") alongside `accountingStatus:
+// "ACCOUNTING_INCOMPLETE"` — an impossible-today combination — specifically to prove each
+// consumer's OWN accountingStatus guard works in isolation, independent of the `status ===
+// "CLOSED"` filter every one of them already had (see design risk #1: the guard is deliberate
+// defense-in-depth against a future change that ever repoints staleBookReconciled to
+// status="CLOSED"). The flagged basket's netPnlUsd is deliberately large ($1000) so any leak is
+// unmistakable in every sum/count assertion below.
+describe("[ACCOUNTING-INCOMPLETE] every closed-basket P&L consumer excludes an ACCOUNTING_INCOMPLETE basket", () => {
+  function closedLeg(symbol: string, entryPrice: number, exitPrice: number): ExecutorBasket["legs"][number] {
+    return { symbol, side: "LONG", qty: 1, entryPrice, entryOrderId: "1", entryPriceConfirmed: true, exitPrice, exitOrderId: "2", exitPriceConfirmed: true };
+  }
+  function makeBasket(over: Partial<ExecutorBasket> & { basketId: string; legs: ExecutorBasket["legs"] }): ExecutorBasket {
+    return {
+      sourceObservationId: `src-${over.basketId}`,
+      signal: "MOM24_FILTERED",
+      variant: "FILTERED",
+      openedAt: new Date(NOW_MS - 24 * 3_600_000).toISOString(),
+      closesAtMs: NOW_MS - 3_600_000,
+      status: "CLOSED",
+      closedAt: NOW,
+      closeReason: "HORIZON",
+      grossPnlUsd: null,
+      feeEstimateUsd: null,
+      netPnlUsd: null,
+      ...over,
+    };
+  }
+
+  function seed(store: ReturnType<typeof makeExecutor>["store"]) {
+    const normal = makeBasket({
+      basketId: "normal",
+      closedAt: "2026-07-02T01:00:00.000Z",
+      legs: [closedLeg("SOLUSDT", 100, 110)], // skewed (1 long, 0 short)
+      grossPnlUsd: 5.5,
+      feeEstimateUsd: 0.5,
+      netPnlUsd: 5,
+    });
+    const flaggedClosed = makeBasket({
+      basketId: "flagged-closed",
+      closedAt: "2026-07-02T02:00:00.000Z",
+      legs: [closedLeg("RNDRUSDT", 10, 20)], // also skewed — would leak into skew stats if unguarded
+      grossPnlUsd: 1000,
+      feeEstimateUsd: 0,
+      netPnlUsd: 1000, // deliberately large/wrong-looking — any leak becomes obvious
+      accountingStatus: "ACCOUNTING_INCOMPLETE",
+    });
+    const flaggedAborted = makeBasket({
+      basketId: "flagged-aborted",
+      status: "ABORTED", // the REAL shape closeBasket's staleBookReconciled branch produces
+      legs: [closedLeg("ADAUSDT", 1, 1)],
+      accountingStatus: "ACCOUNTING_INCOMPLETE",
+    });
+    store.getState().baskets.push(normal, flaggedClosed, flaggedAborted);
+    return { normal, flaggedClosed, flaggedAborted };
+  }
+
+  it("getStatus(): closedCount/totalNetPnlUsd/dailyRealizedUsd exclude it; accountingIncompleteBaskets lists every flagged basket regardless of status", () => {
+    const { executor, store } = makeExecutor();
+    seed(store);
+    const status = executor.getStatus();
+    expect(status.closedCount).toBe(1);
+    expect(status.totalNetPnlUsd).toBe(5);
+    expect(status.dailyRealizedUsd).toBe(5);
+    expect(status.accountingIncompleteBaskets.map((b) => b.basketId).sort()).toEqual(["flagged-aborted", "flagged-closed"]);
+  });
+
+  it("getDailyRealizedUsd(): excludes it even though closedAt falls on the same UTC day", () => {
+    const { executor, store } = makeExecutor();
+    seed(store);
+    expect(executor.getDailyRealizedUsd(NOW)).toBe(5);
+  });
+
+  it("getClosedSummary(): closedCount/wins/realizedPnlUsd/feesUsd/symbols all exclude it", () => {
+    const { executor, store } = makeExecutor();
+    seed(store);
+    const summary = executor.getClosedSummary();
+    expect(summary.closedCount).toBe(1);
+    expect(summary.wins).toBe(1);
+    expect(summary.losses).toBe(0);
+    expect(summary.realizedPnlUsd).toBe(5);
+    expect(summary.feesUsd).toBe(0.5);
+    expect(summary.symbols).toEqual(["SOLUSDT"]);
+  });
+
+  it("getClosedBaskets(): omits it entirely (feeds routes/live.ts's lane-performance timeline merge)", () => {
+    const { executor, store } = makeExecutor();
+    seed(store);
+    const closed = executor.getClosedBaskets();
+    expect(closed.map((b) => b.basketId)).toEqual(["normal"]);
+  });
+
+  it("getRegimeSkewCounterfactual(): its skewed cohort excludes it even though it IS skewed with a resolved exit price", () => {
+    const { executor, store } = makeExecutor();
+    seed(store);
+    const rsc = executor.getRegimeSkewCounterfactual();
+    expect(rsc.skewedCount).toBe(1); // only "normal" — "flagged-closed" would double this if leaked
+    expect(rsc.skewedMeanNetUsd).toBe(5); // (5+1000)/2 = 502.5 if leaked
   });
 });
 
