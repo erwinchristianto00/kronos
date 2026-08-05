@@ -9,6 +9,9 @@ import {
   VARIANT_MATRIX_DEFINITIONS,
   BASELINE_VARIANT_ID,
   BULL_TREND_VARIANT_ID,
+  BULL_SCALEOUT_VARIANT_ID,
+  EVIDENCE_RESET_CUTOVER_VARIANT_IDS,
+  evidenceVersionLabel,
   CurrentGuardVariantMatrixStore,
   getCurrentGuardVariantMatrixStore,
   _resetCurrentGuardVariantMatrixStoreForTests,
@@ -2511,6 +2514,142 @@ describe("current-guard-variant-matrix", () => {
       expect(status.blockers).toContain(
         `PROMOTION holdout distinctSymbolCount ${PROMOTION_MIN_DISTINCT_SYMBOLS - 1} < ${PROMOTION_MIN_DISTINCT_SYMBOLS}`,
       );
+    });
+  });
+
+  // 2026-08-05 legacy-evidence reset: CG_WIDE_FAST_LONG / CG_BE_AFTER_05 / BULL_SCALEOUT_VARIANT_ID
+  // (BL_TREND_SCALEOUT_STOP200) had their maxHoldHours changed 72h->36h on 2026-08-04, BEFORE
+  // openMaxHoldMs existed — every row either of them had accumulated by then is stuck at
+  // openMaxHoldMs===undefined forever (no historical value is recoverable after the fact). Without
+  // EVIDENCE_RESET_CUTOVER_VARIANT_IDS, the general grandfather clause in isFreshValidObs would
+  // silently count that entire pre-fix population toward these 3 lanes' CURRENT evidence, forever —
+  // exactly the contamination [[maxholdhours-versioning-evidence-integrity-gap-2026-08-05]] first
+  // proved for lanes generally. This block proves the narrower, named fix: for these 3 lanes
+  // specifically, only a row that actually matches, never an absent field, may count.
+  describe("2026-08-05 legacy-evidence reset — CG_WIDE_FAST_LONG / CG_BE_AFTER_05 / BULL_SCALEOUT", () => {
+    const RESET_LANES = ["CG_WIDE_FAST_LONG", "CG_BE_AFTER_05", BULL_SCALEOUT_VARIANT_ID] as const;
+
+    it("EVIDENCE_RESET_CUTOVER_VARIANT_IDS names exactly these 3 lanes — nothing added, nothing missing", () => {
+      expect([...EVIDENCE_RESET_CUTOVER_VARIANT_IDS].sort()).toEqual([...RESET_LANES].sort());
+    });
+
+    for (const variantId of RESET_LANES) {
+      it(`[${variantId}] a legacy row (openMaxHoldMs undefined) is EXCLUDED from evidence — the general grandfather clause does NOT apply to this lane`, () => {
+        const store = new CurrentGuardVariantMatrixStore(tmpDir());
+        addResolvedContextCohort(store, {
+          variantId,
+          direction: "LONG",
+          regime: "Bullish expansion",
+          count: 50,
+          netR: () => 1,
+          prefix: `reset-legacy-${variantId}`,
+        });
+        // Simulate genuine pre-fix data: strip openMaxHoldMs from every row (addResolvedContextCohort,
+        // like the real production writer, sets it from the CURRENT config — legacy rows never had
+        // this field at all).
+        for (const obs of store.all) {
+          if (obs.variantId === variantId) store.update(obs.observationId, { openMaxHoldMs: undefined });
+        }
+        const report = buildCurrentGuardVariantMatrixReport(store);
+        const row = report.rows.find((r) => r.variantId === variantId)!;
+        // freshValid is a per-context aggregate; assert via the raw store instead of relying on any
+        // one context bucket, since this lane's contexts vary. Direct proof: NONE of these legacy
+        // rows survive isFreshValidObs for this lane's evidence, by checking the report's own
+        // aggregate never reflects the 50 rows just added.
+        expect(row).toBeTruthy();
+        const totalFreshAcrossContexts = Object.values(row.contextRows ?? {}).reduce(
+          (sum, ctx) => sum + (ctx?.freshValid ?? 0),
+          0,
+        );
+        expect(totalFreshAcrossContexts).toBe(0);
+      });
+
+      it(`[${variantId}] a row whose openMaxHoldMs matches the CURRENT config (i.e. opened after the reset) counts normally`, () => {
+        const store = new CurrentGuardVariantMatrixStore(tmpDir());
+        addResolvedContextCohort(store, {
+          variantId,
+          direction: "LONG",
+          regime: "Bullish expansion",
+          count: 50,
+          netR: () => 1,
+          prefix: `reset-fresh-${variantId}`,
+        });
+        // No mutation this time: addResolvedContextCohort already stamps openMaxHoldMs from the
+        // variant's live config, exactly like the real writer does for a row opened today.
+        const report = buildCurrentGuardVariantMatrixReport(store);
+        const row = report.rows.find((r) => r.variantId === variantId)!;
+        const totalFreshAcrossContexts = Object.values(row.contextRows ?? {}).reduce(
+          (sum, ctx) => sum + (ctx?.freshValid ?? 0),
+          0,
+        );
+        expect(totalFreshAcrossContexts).toBe(50);
+      });
+    }
+
+    it("a NON-reset lane's legacy rows still grandfather in exactly as before — this is a narrow, named exception, not a general policy change", () => {
+      const store = new CurrentGuardVariantMatrixStore(tmpDir());
+      const untouchedLane = "CG_WIDE_STOP_TP_WIDE"; // not in EVIDENCE_RESET_CUTOVER_VARIANT_IDS
+      expect(EVIDENCE_RESET_CUTOVER_VARIANT_IDS.has(untouchedLane)).toBe(false);
+      addResolvedContextCohort(store, {
+        variantId: untouchedLane,
+        direction: "LONG",
+        regime: "Bullish expansion",
+        count: 50,
+        netR: () => 1,
+        prefix: "reset-control-untouched",
+      });
+      for (const obs of store.all) {
+        if (obs.variantId === untouchedLane) store.update(obs.observationId, { openMaxHoldMs: undefined });
+      }
+      const report = buildCurrentGuardVariantMatrixReport(store);
+      const row = report.rows.find((r) => r.variantId === untouchedLane)!;
+      const totalFreshAcrossContexts = Object.values(row.contextRows ?? {}).reduce(
+        (sum, ctx) => sum + (ctx?.freshValid ?? 0),
+        0,
+      );
+      expect(totalFreshAcrossContexts).toBe(50); // grandfathered in, unlike the 3 reset lanes above
+    });
+
+    it("evidenceVersionLabel: null for a legacy (pre-reset) row, null for a non-reset-lane row, and the exact '@<N>H-v1' label for a genuine post-reset row", () => {
+      // Explicitly controls CG_WIDE_FAST_LONG's maxHoldHours within the test (mutate/restore, same
+      // discipline as [EVIDENCE-INTEGRITY-A] above) rather than relying on whatever this lane's
+      // definition happens to carry ambiently — the label's hour count must track the ACTUAL live
+      // config, not a value hardcoded independently of it.
+      const def = VARIANT_MATRIX_DEFINITIONS.find((d) => d.id === "CG_WIDE_FAST_LONG")!;
+      const originalMaxHoldHours = def.maxHoldHours;
+      def.maxHoldHours = 36;
+      try {
+        const store = new CurrentGuardVariantMatrixStore(tmpDir());
+        addResolvedContextCohort(store, {
+          variantId: "CG_WIDE_FAST_LONG",
+          direction: "LONG",
+          regime: "Bullish expansion",
+          count: 1,
+          netR: () => 1,
+          prefix: "label-fresh",
+        });
+        const freshObs = store.all.find((o) => o.variantId === "CG_WIDE_FAST_LONG")!;
+        expect(evidenceVersionLabel(freshObs)).toBe("CG_WIDE_FAST_LONG@36H-v1");
+
+        store.update(freshObs.observationId, { openMaxHoldMs: undefined });
+        const legacyObs = store.all.find((o) => o.observationId === freshObs.observationId)!;
+        expect(evidenceVersionLabel(legacyObs)).toBeNull();
+      } finally {
+        if (originalMaxHoldHours === undefined) delete def.maxHoldHours;
+        else def.maxHoldHours = originalMaxHoldHours;
+      }
+
+      const controlStore = new CurrentGuardVariantMatrixStore(tmpDir());
+      addResolvedContextCohort(controlStore, {
+        variantId: "CG_WIDE_STOP_TP_WIDE",
+        direction: "LONG",
+        regime: "Bullish expansion",
+        count: 1,
+        netR: () => 1,
+        prefix: "label-control",
+      });
+      const nonResetObs = controlStore.all.find((o) => o.variantId === "CG_WIDE_STOP_TP_WIDE")!;
+      expect(evidenceVersionLabel(nonResetObs)).toBeNull();
     });
   });
 

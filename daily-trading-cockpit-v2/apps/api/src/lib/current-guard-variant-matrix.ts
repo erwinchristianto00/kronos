@@ -4012,6 +4012,43 @@ export interface CurrentGuardVariantMatrixReport {
   notes: string[];
 }
 
+/**
+ * 2026-08-05 legacy-evidence reset: the 3 lanes whose maxHoldHours moved 72h -> 36h on 2026-08-04
+ * (see the maxHoldHours: 36 fields on their own definitions, and
+ * [[maxholdhours-versioning-evidence-integrity-gap-2026-08-05]]) already accumulated real evidence
+ * — including transition-forced MAX_HOLD_MTM closes — BEFORE openMaxHoldMs existed. Every one of
+ * those rows has openMaxHoldMs===undefined, so the general grandfather clause in isFreshValidObs
+ * would count them exactly as it counts any other pre-fix legacy row: silently, forever, blended
+ * into whatever the lane's CURRENT (36h) config says.
+ *
+ * That is the specific gap this constant closes, for these 3 lanes ONLY: undefined no longer
+ * grandfathers in. A row counts toward these lanes' evidence if, and only if, it carries a
+ * genuine, current-matching openMaxHoldMs — i.e. it was opened AFTER this reset shipped. Nothing
+ * about the pre-reset rows is deleted or mutated; they simply stop counting, and remain on disk,
+ * readable, for audit (see the operator-run backup taken before this reset was deployed).
+ *
+ * Every OTHER lane's legacy rows keep grandfathering in exactly as before — this is a narrow,
+ * named exception, not a policy change to isFreshValidObs' general contract.
+ */
+export const EVIDENCE_RESET_CUTOVER_VARIANT_IDS: ReadonlySet<VariantMatrixVariantId> = new Set([
+  "CG_WIDE_FAST_LONG",
+  "CG_BE_AFTER_05",
+  BULL_SCALEOUT_VARIANT_ID,
+]);
+
+/** Display-only version label for a row that counts toward one of the reset lanes' evidence — never
+ *  used for any grouping/filtering decision (isFreshValidObs above is the only enforcement point).
+ *  `null` for every row outside the reset set, and for a reset-lane row that hasn't been proven to
+ *  match the current regime (isFreshValidObs would already exclude it from evidence, but a caller
+ *  building a diagnostic view over ALL rows — not just fresh-valid ones — must not label an
+ *  excluded legacy row as if it belonged to the new version). */
+export function evidenceVersionLabel(obs: CurrentGuardVariantMatrixObservation): string | null {
+  if (!EVIDENCE_RESET_CUTOVER_VARIANT_IDS.has(obs.variantId)) return null;
+  if (obs.openMaxHoldMs === undefined || obs.openMaxHoldMs !== variantMaxHoldMs(obs.variantId)) return null;
+  const hours = Math.round(obs.openMaxHoldMs / (60 * 60 * 1000));
+  return `${obs.variantId}@${hours}H-v1`;
+}
+
 function isFreshValidObs(obs: CurrentGuardVariantMatrixObservation): boolean {
   return (
     (obs.status === "CLOSED_WIN" || obs.status === "CLOSED_LOSS") &&
@@ -4029,7 +4066,14 @@ function isFreshValidObs(obs: CurrentGuardVariantMatrixObservation): boolean {
     // width — because maxHoldHours changed since it opened, whether it went on to resolve organically
     // or was force-closed by that exact change — silently drops out of current evidence rather than
     // being re-chained under a width it was never actually measured against.
-    (obs.openMaxHoldMs === undefined || obs.openMaxHoldMs === variantMaxHoldMs(obs.variantId))
+    //
+    // 2026-08-05 legacy-evidence reset (EVIDENCE_RESET_CUTOVER_VARIANT_IDS, see its own doc comment
+    // just above): for the 3 named lanes specifically, `undefined` does NOT grandfather in — those
+    // lanes' entire pre-reset population (all of it undefined, since it predates openMaxHoldMs
+    // existing at all) must earn its way back in only by matching, never by absence of a field.
+    (EVIDENCE_RESET_CUTOVER_VARIANT_IDS.has(obs.variantId)
+      ? obs.openMaxHoldMs !== undefined && obs.openMaxHoldMs === variantMaxHoldMs(obs.variantId)
+      : obs.openMaxHoldMs === undefined || obs.openMaxHoldMs === variantMaxHoldMs(obs.variantId))
   );
 }
 
