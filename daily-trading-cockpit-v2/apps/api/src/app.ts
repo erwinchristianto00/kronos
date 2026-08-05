@@ -253,7 +253,7 @@ import {
   type FourBrainOutcomeHorizon,
 } from "./lib/four-brain-outcome-ledger.js";
 import { loadPendingLedgerSnapshot, savePendingLedgerSnapshot } from "./lib/four-brain-pending-ledger-store.js";
-import { resolveFourBrainInstanceId, fourBrainInstanceAllowed, fourBrainShadowActive, type FourBrainBindingDeps } from "./lib/four-brain-live-gather-bindings.js";
+import { resolveFourBrainInstanceId, fourBrainInstanceAllowed, fourBrainShadowActive, FOUR_BRAIN_LIVE_INSTANCE_PORT, type FourBrainBindingDeps } from "./lib/four-brain-live-gather-bindings.js";
 import { FRESHNESS_TTL_MS } from "./lib/four-brain-live-gather.js";
 import { staticAllocationContext, unavailableMarketContext } from "./lib/authority-contract.js";
 import { ExecutiveReviewStore } from "./lib/executive-review-store.js";
@@ -763,8 +763,48 @@ export interface UnifiedRegimeEntryGateDeps {
  * The two existing escape hatches (`LIVE_REGIME_NO_TRADE_OVERRIDE=1`,
  * `REGIME_ENGINE_EXECUTION_GATE_ENABLED=0`) keep their exact names/positions/semantics, still
  * short-circuiting BEFORE the (now-redirected) canonical-regime check — an operator relying on
- * either today sees no behavior change from this redirect.
+ * either today sees no behavior change from this redirect UNLESS they are on the live instance
+ * (3103), where 2026-08's regime-escape-hatch hardening (see
+ * `regimeGateEscapeHatchAllowedOnInstance` immediately below) now hard-blocks both, structurally,
+ * regardless of what either env var is set to.
  */
+
+/**
+ * 2026-08 regime-escape-hatch hardening. Both `LIVE_REGIME_NO_TRADE_OVERRIDE` and
+ * `REGIME_ENGINE_EXECUTION_GATE_ENABLED=0` are pre-existing, deliberate operator escape hatches
+ * that fully disable canonical-regime new-entry protection — but as originally written they were
+ * honored identically on every instance, including 3103 (the one real-money mainnet box), with no
+ * visibility, expiry, or audit trail. Investigation found zero evidence anywhere in this repo's
+ * history, comments, tests, or docs that 3103 has ever legitimately relied on either var (both were
+ * introduced as an undiscussed one-liner buried in an unrelated batch commit), so this hard-removes
+ * eligibility on 3103 specifically rather than adding a reason/expiry/audit fallback — matching the
+ * repo-wide convention (`fourBrainInstanceAllowed`, `crisis-mode-instance-guard.ts`'s
+ * `canApplyCrisisModeActions`) that any authority/execution-risk concern hard-blocks 3103
+ * unconditionally, never via an overridable exception.
+ *
+ * Reuses `resolveFourBrainInstanceId`/`FOUR_BRAIN_LIVE_INSTANCE_PORT` — the SAME instance-identity
+ * resolver five other modules in this repo already import by direct reference for exactly this kind
+ * of "am I 3103" check (forward-causal-collection.ts, lane-context-journal-binding.ts,
+ * cortex-collection-status.ts, direction-entry-reconciler.ts, cortex-instance-diagnosis.ts) — never
+ * reimplemented, so this can never independently drift from the one place that already tracks it.
+ * Deliberately does NOT call `fourBrainInstanceAllowed()` itself: that additionally applies
+ * `FOUR_BRAIN_INSTANCE_ALLOWLIST`, a four-brain-specific config knob unrelated to this gate — reusing
+ * it here would silently couple an operator's four-brain allowlist edit to this gate's escape-hatch
+ * eligibility.
+ *
+ * Belt-and-suspenders (mirrors `fourBrainInstanceAllowed`'s own dual check): blocks if EITHER the
+ * resolved instance id OR the raw serving `PORT` is 3103, so a stray `FOUR_BRAIN_INSTANCE_ID` that
+ * relabels the live box can never smuggle the escape hatch back onto real money. Fails closed on a
+ * missing `PORT` too — `resolveFourBrainInstanceId` falls back to `FOUR_BRAIN_DEFAULT_PORT` ("3101"),
+ * matching `server.ts`'s own `Number(process.env.PORT ?? 3101)` default, so an unset-PORT process is
+ * correctly treated as 3101 (override-eligible), never as an unrecognized/blocked id.
+ */
+export function regimeGateEscapeHatchAllowedOnInstance(env: NodeJS.ProcessEnv): boolean {
+  const instanceId = resolveFourBrainInstanceId(env);
+  const rawPort = (env.PORT ?? "").toString().trim();
+  return instanceId !== FOUR_BRAIN_LIVE_INSTANCE_PORT && rawPort !== FOUR_BRAIN_LIVE_INSTANCE_PORT;
+}
+
 export function buildUnifiedRegimeEntryGate(
   deps: UnifiedRegimeEntryGateDeps,
 ): () => LiveNewEntryGateDecision {
@@ -778,7 +818,10 @@ export function buildUnifiedRegimeEntryGate(
       };
     }
     const env = deps.env ?? process.env;
-    if (env.LIVE_REGIME_NO_TRADE_OVERRIDE === "1" || env.REGIME_ENGINE_EXECUTION_GATE_ENABLED === "0") {
+    if (
+      regimeGateEscapeHatchAllowedOnInstance(env) &&
+      (env.LIVE_REGIME_NO_TRADE_OVERRIDE === "1" || env.REGIME_ENGINE_EXECUTION_GATE_ENABLED === "0")
+    ) {
       return { allowed: true, reason: null };
     }
     const decision = canonicalMarketRegimeExecutionPolicy({
