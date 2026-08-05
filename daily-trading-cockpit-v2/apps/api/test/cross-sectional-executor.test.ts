@@ -1725,6 +1725,33 @@ describe("closeBasket under cross-basket netting", () => {
     expect(executor.getStatus().accountingIncompleteBaskets.map((b) => b.basketId)).toEqual(["flat"]);
   });
 
+  it("[NORMAL-CLOSE-NOT-FLAGGED] a real close with a genuinely flat (near-zero) outcome is NOT flagged — detection keys on HOW the leg closed, never on the size of the result", async () => {
+    const { executor, client, store } = makeExecutor();
+    // Deliberately NO rejectReduceOnlyOn/positionAmtBySymbol scripted for SOLUSDT — this is a
+    // plain, successful reduceOnly close that never throws, so it can never even reach the -2022
+    // branch, let alone the staleBookReconciled reconciliation inside it.
+    client.fillPriceBySymbol.set("SOLUSDT", 100); // exit price === entry price: zero price movement
+    store.getState().baskets.push(
+      basket("flat-but-real", [{ symbol: "SOLUSDT", side: "LONG", qty: 1, entryPrice: 100 }], NOW_MS - 60_000),
+    );
+
+    await executor.tick();
+
+    const closed = store.getState().baskets.find((x) => x.basketId === "flat-but-real")!;
+    expect(closed.status).toBe("CLOSED"); // NOT "ABORTED" — the normal finalization path ran
+    expect(closed.grossPnlUsd).toBe(0); // genuinely zero price move
+    // Real, computed, non-null net P&L (fees-only, taker-flat estimate): (100+100)*1*0.0005.
+    // The exact number matters less than that it IS a real number, not null.
+    expect(closed.netPnlUsd).toBeCloseTo(-0.1, 6);
+    expect(closed.legs[0]!.exitPrice).toBe(100); // a genuine resolved fill price, not null
+    expect(closed.legs[0]!.exitOrderId).not.toBe("POSITION_ALREADY_FLAT");
+    // The core assertion: a small/flat REAL outcome must never be mistaken for the "genuinely
+    // unknown, closed out-of-band" case — accountingStatus stays unset for a normal close no
+    // matter how close its result lands to zero.
+    expect(closed.accountingStatus).toBeUndefined();
+    expect(executor.getStatus().accountingIncompleteBaskets).toHaveLength(0);
+  });
+
   it("[RETRY-PNL] finalizing after a partial close counts the ALREADY-exited legs' P&L", async () => {
     const { executor, client, store } = makeExecutor();
     client.fillPriceBySymbol.set("ADAUSDT", 0.9);
@@ -1845,6 +1872,96 @@ describe("[ACCOUNTING-INCOMPLETE] every closed-basket P&L consumer excludes an A
     const rsc = executor.getRegimeSkewCounterfactual();
     expect(rsc.skewedCount).toBe(1); // only "normal" — "flagged-closed" would double this if leaked
     expect(rsc.skewedMeanNetUsd).toBe(5); // (5+1000)/2 = 502.5 if leaked
+  });
+
+  // 2026-08-05: the two tests above (and the STALE-BOOK-RECONCILE test) prove the flag exists and
+  // is excluded. These two prove WHY exclusion — as opposed to keeping today's `status==="CLOSED"`
+  // filter and just trusting getClosedSummary/getStatus's own pre-existing `?? 0` fallback to
+  // "handle" a null — is load-bearing, not cosmetic. Both fixtures use the REALISTIC shape
+  // closeBasket's staleBookReconciled branch actually writes: netPnlUsd stays makeBasket()'s null
+  // default (never overridden, unlike "flagged-closed" above's deliberately-large 1000), with
+  // status:"CLOSED" standing in for design risk #1's hypothetical — some future change repoints
+  // that branch to status="CLOSED" without also carrying the accountingStatus filter.
+  it("[ADVERSARIAL] getClosedSummary(): a zero-fill-and-include alternative would still sum P&L correctly by coincidence, but would misclassify the unknown outcome as a LOSS and inflate the trade count — exactly the fabrication the operator's spec forbids", () => {
+    const { executor, store } = makeExecutor();
+    const normal = makeBasket({
+      basketId: "normal",
+      closedAt: "2026-07-02T01:00:00.000Z",
+      legs: [closedLeg("SOLUSDT", 100, 110)],
+      grossPnlUsd: 5.5,
+      feeEstimateUsd: 0.5,
+      netPnlUsd: 5,
+    });
+    const flaggedNullPnl = makeBasket({
+      basketId: "flagged-null",
+      closedAt: "2026-07-02T02:00:00.000Z",
+      legs: [closedLeg("RNDRUSDT", 10, 20)],
+      accountingStatus: "ACCOUNTING_INCOMPLETE",
+      // grossPnlUsd/feeEstimateUsd/netPnlUsd all stay makeBasket()'s real, unmodified null default.
+    });
+    store.getState().baskets.push(normal, flaggedNullPnl);
+
+    const real = executor.getClosedSummary(); // the actual, fixed code
+
+    // The forbidden alternative, replicated inline (never calling the real function twice): keep
+    // the `status === "CLOSED"` filter but drop the accountingStatus exclusion, relying only on
+    // the SAME `net = b.netPnlUsd ?? 0` this file's own getClosedSummary() already has.
+    const naiveClosed = store.getState().baskets.filter((b) => b.status === "CLOSED");
+    let naiveRealized = 0;
+    let naiveWins = 0;
+    let naiveLosses = 0;
+    for (const b of naiveClosed) {
+      const net = b.netPnlUsd ?? 0;
+      naiveRealized += net;
+      if (net > 0) naiveWins += 1;
+      else naiveLosses += 1;
+    }
+
+    // The sum is deceptive on its own — a null coalesced to 0 contributes nothing to a sum either
+    // way, so realizedPnlUsd looks identical whether the basket was excluded or zero-filled-in:
+    expect(real.realizedPnlUsd).toBe(5);
+    expect(naiveRealized).toBe(5);
+    // ...but the trade COUNT and win/loss CLASSIFICATION — exactly what win-rate/profit-factor
+    // consume — silently corrupt under zero-fill: the unknown-outcome basket gets counted as a
+    // real trade AND misclassified as a LOSS (0 is not > 0).
+    expect(real.closedCount).toBe(1);
+    expect(real.losses).toBe(0);
+    expect(naiveClosed.length).toBe(2);
+    expect(naiveLosses).toBe(1);
+    // The load-bearing proof itself: replacing exclusion with zero-fill changes the answer.
+    expect(real.closedCount).not.toBe(naiveClosed.length);
+    expect(real.losses).not.toBe(naiveLosses);
+  });
+
+  it("[ADVERSARIAL] getStatus(): totalNetPnlUsd would land on the SAME number under zero-fill (sum alone proves nothing), but the per-trade average it supports would be silently diluted by a fabricated trade", () => {
+    const { executor, store } = makeExecutor();
+    const normal = makeBasket({
+      basketId: "normal",
+      closedAt: "2026-07-02T01:00:00.000Z",
+      legs: [closedLeg("SOLUSDT", 100, 110)],
+      grossPnlUsd: 5.5,
+      feeEstimateUsd: 0.5,
+      netPnlUsd: 5,
+    });
+    const flaggedNullPnl = makeBasket({
+      basketId: "flagged-null",
+      closedAt: "2026-07-02T02:00:00.000Z",
+      legs: [closedLeg("RNDRUSDT", 10, 20)],
+      accountingStatus: "ACCOUNTING_INCOMPLETE",
+    });
+    store.getState().baskets.push(normal, flaggedNullPnl);
+
+    const status = executor.getStatus();
+    const naiveClosed = store.getState().baskets.filter((b) => b.status === "CLOSED");
+    const naiveTotalNetPnlUsd = naiveClosed.reduce((s, b) => s + (b.netPnlUsd ?? 0), 0);
+
+    expect(status.totalNetPnlUsd).toBe(5);
+    expect(naiveTotalNetPnlUsd).toBe(5); // sum matches by coincidence — null zero-fills to nothing
+    // Average P&L per trade — the shape edge-quality/PF math actually reads — is where the
+    // fabrication surfaces: real trade count (1) vs. one fabricated "trade" diluting it (2).
+    expect(status.totalNetPnlUsd / status.closedCount).toBe(5);
+    expect(naiveTotalNetPnlUsd / naiveClosed.length).toBe(2.5);
+    expect(status.closedCount).not.toBe(naiveClosed.length);
   });
 });
 
