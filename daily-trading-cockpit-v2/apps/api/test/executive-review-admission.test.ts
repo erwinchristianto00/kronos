@@ -50,6 +50,7 @@ function causalIdentity(overrides: Partial<CausalIdentity> = {}): CausalIdentity
     opportunityId: "opportunity-1",
     outcomeId: null,
     instanceId: "3101",
+    logicalRole: null,
     laneId: "LANE",
     symbolOrBasketId: "BTCUSDT",
     direction: "LONG",

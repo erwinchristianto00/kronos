@@ -10,7 +10,7 @@ import { createHash } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 
-import { resolveFourBrainInstanceId } from "../lib/four-brain-live-gather-bindings.js";
+import { resolveFourBrainInstanceId, resolveFourBrainLogicalRole, type FourBrainLogicalRole } from "../lib/four-brain-live-gather-bindings.js";
 import type { CortexDecisionSnapshot } from "../lib/cortex-decision-snapshot.js";
 import { CORTEX_FEATURE_DIM, CORTEX_FEATURE_SCHEMA_VERSION } from "../lib/cortex-brain.js";
 import {
@@ -29,7 +29,16 @@ export interface CausalIdentity {
   decisionId: string;
   opportunityId: string;
   outcomeId: string | null;
+  /** ALWAYS the honest physical serving port (resolveFourBrainInstanceId) — never relabeled to claim
+   *  to be a different instance. A staging mirror physically on 3111/3112 persists "3111"/"3112" here,
+   *  never "3101"/"3102", even when logicalRole below authorizes it to act as RESEARCH/TESTNET. See
+   *  FourBrainLogicalRole's own doc comment for why this distinction is the identity-spoofing fix. */
   instanceId: string;
+  /** The role this instance was authorized under at mint time — RESEARCH/TESTNET, or `null` when
+   *  instanceId itself is directly in the allowlist (production 3101/3102, no explicit grant needed).
+   *  Persisted so provenance always shows BOTH who physically ran this AND what it was authorized to
+   *  validate, rather than collapsing the two into one (spoofable) field. */
+  logicalRole: FourBrainLogicalRole | null;
   laneId: string;
   symbolOrBasketId: string;
   direction: CausalDirection;
@@ -52,6 +61,9 @@ export interface CausalIdentity {
 export interface CausalCollectionActivation {
   active: boolean;
   instanceId: string;
+  /** Non-null only when authorization came from an explicit role grant rather than instanceId itself
+   *  being in the allowlist — see CausalIdentity.logicalRole's own doc comment. */
+  logicalRole: FourBrainLogicalRole | null;
   reason: "shadow-active" | "mode-off" | "live-3103-blocked" | "unknown-instance-fail-closed";
 }
 
@@ -189,16 +201,30 @@ const validCortexSnapshot = (order: ForwardPaperOrderLike, openedAtMs: number): 
   return snapshot;
 };
 
-/** Strict gate owned by this feature. Unlike the older lane journal, it has no COLLECT_ONLY exception for 3103. */
+/**
+ * Strict gate owned by this feature. Unlike the older lane journal, it has no COLLECT_ONLY exception
+ * for 3103.
+ *
+ * 2026-08-05 (identity-spoofing fix): instanceId is ALWAYS the honest physical port — this function
+ * never relabels it. An instance whose own physical id is outside {3101,3102} (e.g. an isolated
+ * staging mirror on 3111/3102) is authorized ONLY via an explicit resolveFourBrainLogicalRole grant,
+ * never by lying to resolveFourBrainInstanceId about which instance it is. Before this fix, the ONLY
+ * way to validate this feature on a staging mirror was FOUR_BRAIN_INSTANCE_ID=3101/3102 — which meant
+ * instanceId itself became false, and every event this function's callers emitted persisted that false
+ * identity into the journal permanently. The 3103 hard-block is checked FIRST, unconditionally, against
+ * the PHYSICAL id/port only — a role grant can never reach it.
+ */
 export function resolveCausalCollectionActivation(env: NodeJS.ProcessEnv = process.env): CausalCollectionActivation {
   const instanceId = resolveFourBrainInstanceId(env);
   const rawPort = (env.PORT ?? "").toString().trim();
-  if (instanceId === "3103" || rawPort === "3103") return { active: false, instanceId: "3103", reason: "live-3103-blocked" };
+  if (instanceId === "3103" || rawPort === "3103") return { active: false, instanceId: "3103", logicalRole: null, reason: "live-3103-blocked" };
   if ((env.CAUSAL_EXPERIENCE_COLLECTION_MODE ?? "").toString().trim().toLowerCase() !== "shadow")
-    return { active: false, instanceId, reason: "mode-off" };
-  if (instanceId !== "3101" && instanceId !== "3102")
-    return { active: false, instanceId, reason: "unknown-instance-fail-closed" };
-  return { active: true, instanceId, reason: "shadow-active" };
+    return { active: false, instanceId, logicalRole: null, reason: "mode-off" };
+  if (instanceId === "3101" || instanceId === "3102")
+    return { active: true, instanceId, logicalRole: null, reason: "shadow-active" };
+  const logicalRole = resolveFourBrainLogicalRole(env);
+  if (logicalRole === null) return { active: false, instanceId, logicalRole: null, reason: "unknown-instance-fail-closed" };
+  return { active: true, instanceId, logicalRole, reason: "shadow-active" };
 }
 
 /**
@@ -242,6 +268,10 @@ export function isCausalIdentityCurrentlyValid(
 ): boolean {
   if (!activation.active || activation.instanceId === "3103") return false;
   if (identity.instanceId !== activation.instanceId) return false;
+  // A role grant can change (widened, narrowed, revoked) independently of the physical instance —
+  // an identity minted under a since-changed role is exactly as stale as one minted under a since-
+  // changed policy version, and must not be silently reused under the new role's authority.
+  if (identity.logicalRole !== activation.logicalRole) return false;
   if (identity.laneId !== order.selectedLaneId) return false;
   if (identity.symbolOrBasketId !== order.symbol) return false;
   if (identity.direction !== order.direction) return false;
@@ -301,6 +331,7 @@ export function prepareForwardCausalIdentity(order: ForwardPaperOrderLike, env: 
     opportunityId: `causal-opportunity-${hash([activation.instanceId, order.paperOrderId])}`,
     outcomeId: null,
     instanceId: activation.instanceId,
+    logicalRole: activation.logicalRole,
     laneId: order.selectedLaneId,
     symbolOrBasketId: order.symbol,
     direction: order.direction,
@@ -545,6 +576,7 @@ const validIdentity = (value: unknown, outcomeId: string | null): value is Causa
       identity.decisionPolicyVersion, identity.executionPolicyVersion, identity.evidencePolicyVersion,
       identity.evidenceEra, identity.policyDeploymentAt].every(nonEmpty) &&
     ["LONG", "SHORT", "NEUTRAL", "BOTH"].includes(identity.direction) &&
+    (identity.logicalRole === null || identity.logicalRole === "RESEARCH" || identity.logicalRole === "TESTNET") &&
     nullableString(identity.cortexDecisionId) && nullableString(identity.allocationSnapshotId) && nullableString(identity.canonicalCortexLaneId) &&
     (identity.cortexFeatureSchemaVersion === null || identity.cortexFeatureSchemaVersion === CORTEX_FEATURE_SCHEMA_VERSION) &&
     (identity.cortexDecisionId === null

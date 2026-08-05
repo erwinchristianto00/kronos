@@ -53,6 +53,31 @@ describe("binding — instance isolation + 3103 block + mode gate", () => {
     expect(laneJournalPaths("3101", "/b").resolutions).not.toBe(laneJournalPaths("3102", "/b").resolutions);
     expect(laneJournalPaths("3102", "/b").checkpoint).toContain("/3102/");
   });
+
+  // 2026-08-05 (identity-spoofing fix): an isolated staging mirror physically on 3111/3112 is
+  // authorized via an explicit FOUR_BRAIN_LOGICAL_ROLE grant — instanceId stays honest (3111/3112),
+  // never relabeled to 3101/3102. Before this fix the only way to activate this feature on a staging
+  // mirror was FOUR_BRAIN_INSTANCE_ID=3101/3102, which produced a REAL `lane-context/3101/` directory
+  // physically inside a 3111 deployment.
+  it("[role-based staging authorization] instanceId=3111/3112 activates ONLY via an explicit role grant, and always reports its own honest instanceId", () => {
+    expect(resolveLaneJournalActivation({ LANE_CONTEXT_JOURNAL_MODE: "shadow", PORT: "3111" } as never))
+      .toMatchObject({ active: false, instanceId: "3111", logicalRole: null, reason: "unknown-instance-fail-closed" });
+    const research = resolveLaneJournalActivation({ LANE_CONTEXT_JOURNAL_MODE: "shadow", PORT: "3111", FOUR_BRAIN_LOGICAL_ROLE: "RESEARCH" } as never);
+    expect(research).toMatchObject({ active: true, instanceId: "3111", logicalRole: "RESEARCH", reason: "shadow-active" });
+    expect(research.instanceId).not.toBe("3101");
+    const testnet = resolveLaneJournalActivation({ LANE_CONTEXT_JOURNAL_MODE: "shadow", PORT: "3112", FOUR_BRAIN_LOGICAL_ROLE: "TESTNET" } as never);
+    expect(testnet).toMatchObject({ active: true, instanceId: "3112", logicalRole: "TESTNET", reason: "shadow-active" });
+    expect(testnet.instanceId).not.toBe("3102");
+    // per-instance paths for the role-authorized activation key off the HONEST instanceId, so a
+    // staging journal can never physically land inside a real instance's own directory.
+    expect(laneJournalPaths(research.instanceId, "/b").resolutions).toContain("/3111/");
+    expect(laneJournalPaths(testnet.instanceId, "/b").resolutions).toContain("/3112/");
+  });
+
+  it("[fail-closed] a role grant can never reach the live instance — 3103 stays hard-blocked even with FOUR_BRAIN_LOGICAL_ROLE set", () => {
+    expect(resolveLaneJournalActivation({ LANE_CONTEXT_JOURNAL_MODE: "shadow", PORT: "3103", FOUR_BRAIN_LOGICAL_ROLE: "RESEARCH" } as never))
+      .toMatchObject({ active: false, reason: "live-3103-blocked" });
+  });
   it("mode OFF performs ZERO filesystem I/O (throwing fs never touched)", () => {
     const r = runResolutionScan(mkDeps({ LANE_CONTEXT_JOURNAL_MODE: "off", FOUR_BRAIN_INSTANCE_ID: "3102" }, THROW_FS, [outcome()]));
     expect(r.ran).toBe(false);

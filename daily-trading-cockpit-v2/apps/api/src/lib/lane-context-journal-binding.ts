@@ -10,12 +10,22 @@
  * 3101/3102. Live 3103 is hard-blocked by BOTH the resolved id AND the raw serving PORT; an unknown instance
  * FAILS CLOSED (no journal). Mode off / blocked / unknown ⇒ ZERO filesystem I/O for this feature.
  */
-import { resolveFourBrainInstanceId, FOUR_BRAIN_LIVE_INSTANCE_PORT } from "./four-brain-live-gather-bindings.js";
+import { resolveFourBrainInstanceId, resolveFourBrainLogicalRole, FOUR_BRAIN_LIVE_INSTANCE_PORT, type FourBrainLogicalRole } from "./four-brain-live-gather-bindings.js";
 import { resolveLaneContextMode, buildLaneContextSnapshot, type LaneContextSnapshot } from "./lane-context-journal.js";
 import { planResolutions, parseCheckpoint, rebuildConsumedFromRecords, type ResolutionCheckpoint, type ClosedOutcomeInput, type ResolutionRecord } from "./lane-outcome-processor.js";
 import { stableHash } from "./replay-provenance.js";
 
-export interface LaneJournalActivation { instanceId: string; active: boolean; reason: string; collectOnly: boolean; }
+export interface LaneJournalActivation {
+  /** ALWAYS the honest physical serving port — see FourBrainLogicalRole's own doc comment for why this
+   *  must never be relabeled. laneJournalPaths below keys the journal DIRECTORY off this value, so a
+   *  spoofed instanceId here would physically misplace a staging mirror's journal inside what looks
+   *  like the real 3101/3102's own directory — exactly the bug this field's honesty prevents. */
+  instanceId: string;
+  logicalRole: FourBrainLogicalRole | null;
+  active: boolean;
+  reason: string;
+  collectOnly: boolean;
+}
 
 /**
  * Explicit, default-OFF collect-only gate. This is the ONLY switch that lifts the live-3103 report-only-collection
@@ -28,19 +38,27 @@ export function resolveCollectOnly(env: NodeJS.ProcessEnv = process.env): boolea
   return v === "1" || v === "true";
 }
 
-/** Resolve activation. 3101/3102 activate on shadow mode; live 3103 stays HARD-blocked EXCEPT under an explicit
- *  COLLECT_ONLY flag, which activates report-only collection ONLY (its own isolated "3103" journal namespace). */
+/**
+ * Resolve activation. 3101/3102 activate on shadow mode; an instance whose own physical id is outside
+ * that pair activates ONLY under an explicit resolveFourBrainLogicalRole grant (2026-08-05 identity-
+ * spoofing fix — instanceId is never relabeled to claim to be 3101/3102, see LaneJournalActivation's
+ * own doc comment). Live 3103 stays HARD-blocked EXCEPT under an explicit COLLECT_ONLY flag, which
+ * activates report-only collection ONLY (its own isolated "3103" journal namespace) — checked first,
+ * against the physical id/port only, so no role grant can ever reach it.
+ */
 export function resolveLaneJournalActivation(env: NodeJS.ProcessEnv = process.env): LaneJournalActivation {
   const instanceId = resolveFourBrainInstanceId(env);
   const collectOnly = resolveCollectOnly(env);
-  if (resolveLaneContextMode(env.LANE_CONTEXT_JOURNAL_MODE) !== "shadow") return { instanceId, active: false, reason: "mode-off", collectOnly };
+  if (resolveLaneContextMode(env.LANE_CONTEXT_JOURNAL_MODE) !== "shadow") return { instanceId, logicalRole: null, active: false, reason: "mode-off", collectOnly };
   // Live 3103 (resolved id OR raw serving port): blocked by default; report-only collection ONLY under COLLECT_ONLY.
   if (instanceId === FOUR_BRAIN_LIVE_INSTANCE_PORT || (env.PORT ?? "").toString().trim() === FOUR_BRAIN_LIVE_INSTANCE_PORT) {
-    if (collectOnly) return { instanceId: "3103", active: true, reason: "collect-only-3103", collectOnly: true };
-    return { instanceId: "3103", active: false, reason: "live-3103-blocked", collectOnly };
+    if (collectOnly) return { instanceId: "3103", logicalRole: null, active: true, reason: "collect-only-3103", collectOnly: true };
+    return { instanceId: "3103", logicalRole: null, active: false, reason: "live-3103-blocked", collectOnly };
   }
-  if (instanceId !== "3101" && instanceId !== "3102") return { instanceId, active: false, reason: "unknown-instance-fail-closed", collectOnly };
-  return { instanceId, active: true, reason: "shadow-active", collectOnly };
+  if (instanceId === "3101" || instanceId === "3102") return { instanceId, logicalRole: null, active: true, reason: "shadow-active", collectOnly };
+  const logicalRole = resolveFourBrainLogicalRole(env);
+  if (logicalRole === null) return { instanceId, logicalRole: null, active: false, reason: "unknown-instance-fail-closed", collectOnly };
+  return { instanceId, logicalRole, active: true, reason: "shadow-active", collectOnly };
 }
 
 export interface LaneJournalPaths { dir: string; resolutions: string; checkpoint: string; snapshots: string; }

@@ -342,6 +342,23 @@ describe("Four-Brain incumbent parity", () => {
     expect(fourBrainInstanceAllowed({ PORT: "9999" } as NodeJS.ProcessEnv)).toBe(false);
   });
 
+  // 2026-08-05 (identity-spoofing fix): an isolated staging mirror physically running on 3111/3112 is
+  // authorized via an explicit FOUR_BRAIN_LOGICAL_ROLE grant, never by relabeling its own instanceId.
+  it("[role-based staging authorization] an explicit FOUR_BRAIN_LOGICAL_ROLE grant authorizes an instance whose own PORT is honestly outside the allowlist, without needing FOUR_BRAIN_INSTANCE_ID at all", () => {
+    expect(fourBrainInstanceAllowed({ PORT: "3111" } as NodeJS.ProcessEnv)).toBe(false); // no grant: fails closed
+    expect(fourBrainInstanceAllowed({ PORT: "3111", FOUR_BRAIN_LOGICAL_ROLE: "RESEARCH" } as NodeJS.ProcessEnv)).toBe(true);
+    expect(fourBrainInstanceAllowed({ PORT: "3112", FOUR_BRAIN_LOGICAL_ROLE: "TESTNET" } as NodeJS.ProcessEnv)).toBe(true);
+    // instanceId reported by the resolver itself is unaffected — the role grants authorization, it
+    // never relabels identity.
+    expect(resolveFourBrainInstanceId({ PORT: "3111", FOUR_BRAIN_LOGICAL_ROLE: "RESEARCH" } as NodeJS.ProcessEnv)).toBe("3111");
+    expect(resolveFourBrainInstanceId({ PORT: "3111", FOUR_BRAIN_LOGICAL_ROLE: "RESEARCH" } as NodeJS.ProcessEnv)).not.toBe("3101");
+  });
+
+  it("[fail-closed] a role grant can never reach the live instance — 3103 stays hard-blocked even with FOUR_BRAIN_LOGICAL_ROLE set", () => {
+    expect(fourBrainInstanceAllowed({ PORT: "3103", FOUR_BRAIN_LOGICAL_ROLE: "RESEARCH" } as NodeJS.ProcessEnv)).toBe(false);
+    expect(fourBrainInstanceAllowed({ PORT: "3103", FOUR_BRAIN_LOGICAL_ROLE: "TESTNET" } as NodeJS.ProcessEnv)).toBe(false);
+  });
+
   // Regression (2026-07-23): app.ts used to expose fourBrainMetricsRef/fourBrainRecentDecisionsRef to the
   // /api/shadow/four-brain route unconditionally inside its `if (!isTest)` wiring block — i.e. on EVERY
   // non-test process regardless of FOUR_BRAIN_MODE — so the route's `enabled: health !== null` was really

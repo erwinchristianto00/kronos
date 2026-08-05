@@ -84,6 +84,92 @@ describe("forward causal collection", () => {
     expect(resolveCausalCollectionActivation({ ...env, PORT: "3103", CAUSAL_EXPERIENCE_COLLECTION_MODE: "shadow" }).reason).toBe("live-3103-blocked");
   });
 
+  // 2026-08-05 (identity-spoofing fix): the ONLY correct way to authorize an isolated staging mirror
+  // physically running on a non-3101/3102 port is an explicit FOUR_BRAIN_LOGICAL_ROLE grant — never
+  // FOUR_BRAIN_INSTANCE_ID=3101/3102, which makes resolveFourBrainInstanceId LIE and propagates a
+  // false identity into the journal permanently. See CausalIdentity.logicalRole's own doc comment.
+  describe("staging identity — role-based authorization, never relabeled instanceId", () => {
+    it("[fail-closed] instanceId=3111, no role grant: activation fails closed, never mints, never emits instanceId=3101", () => {
+      const dir = mkdtempSync(join(tmpdir(), "causal-role-none-")); dirs.push(dir);
+      const env: NodeJS.ProcessEnv = { PORT: "3111", CAUSAL_EXPERIENCE_COLLECTION_MODE: "shadow", CAUSAL_EXPERIENCE_COLLECTION_DIR: dir, END_TO_END_CORRECTNESS_DEPLOYED_AT: DEPLOYMENT_AT };
+      const activation = resolveCausalCollectionActivation(env);
+      expect(activation).toMatchObject({ active: false, instanceId: "3111", logicalRole: null, reason: "unknown-instance-fail-closed" });
+      expect(prepareForwardCausalIdentity(order(), env)).toBeNull();
+      expect(recordForwardOpportunity(order(), env)).toBe(false);
+      expect(existsSync(join(dir, "causal-experience"))).toBe(false);
+    });
+
+    it("[research-staging] instanceId=3111 + FOUR_BRAIN_LOGICAL_ROLE=RESEARCH: activates, and every emitted identity/journal event carries instanceId=3111 — NEVER 3101", () => {
+      const dir = mkdtempSync(join(tmpdir(), "causal-role-research-")); dirs.push(dir);
+      const env: NodeJS.ProcessEnv = { PORT: "3111", FOUR_BRAIN_LOGICAL_ROLE: "RESEARCH", CAUSAL_EXPERIENCE_COLLECTION_MODE: "shadow", CAUSAL_EXPERIENCE_COLLECTION_DIR: dir, END_TO_END_CORRECTNESS_DEPLOYED_AT: DEPLOYMENT_AT };
+      const activation = resolveCausalCollectionActivation(env);
+      expect(activation).toMatchObject({ active: true, instanceId: "3111", logicalRole: "RESEARCH", reason: "shadow-active" });
+      const identity = prepareForwardCausalIdentity(order(), env);
+      expect(identity).toMatchObject({ instanceId: "3111", logicalRole: "RESEARCH" });
+      expect(identity!.instanceId).not.toBe("3101");
+      const o = order(); o.causalIdentity = identity;
+      expect(recordForwardOpportunity(o, env)).toBe(true);
+      const events = readFileSync(forwardCausalJournalPath(env)!, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+      expect(events.length).toBeGreaterThan(0);
+      for (const event of events) {
+        expect(event.identity.instanceId).toBe("3111");
+        expect(event.identity.instanceId).not.toBe("3101");
+        expect(event.identity.logicalRole).toBe("RESEARCH");
+      }
+    });
+
+    it("[testnet-staging] instanceId=3112 + FOUR_BRAIN_LOGICAL_ROLE=TESTNET: activates, and every emitted identity/journal event carries instanceId=3112 — NEVER 3102", () => {
+      const dir = mkdtempSync(join(tmpdir(), "causal-role-testnet-")); dirs.push(dir);
+      const env: NodeJS.ProcessEnv = { PORT: "3112", FOUR_BRAIN_LOGICAL_ROLE: "TESTNET", CAUSAL_EXPERIENCE_COLLECTION_MODE: "shadow", CAUSAL_EXPERIENCE_COLLECTION_DIR: dir, END_TO_END_CORRECTNESS_DEPLOYED_AT: DEPLOYMENT_AT };
+      const activation = resolveCausalCollectionActivation(env);
+      expect(activation).toMatchObject({ active: true, instanceId: "3112", logicalRole: "TESTNET", reason: "shadow-active" });
+      const identity = prepareForwardCausalIdentity(order(), env);
+      expect(identity).toMatchObject({ instanceId: "3112", logicalRole: "TESTNET" });
+      expect(identity!.instanceId).not.toBe("3102");
+      const o = order(); o.causalIdentity = identity;
+      expect(recordForwardOpportunity(o, env)).toBe(true);
+      const events = readFileSync(forwardCausalJournalPath(env)!, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+      expect(events.length).toBeGreaterThan(0);
+      for (const event of events) {
+        expect(event.identity.instanceId).toBe("3112");
+        expect(event.identity.instanceId).not.toBe("3102");
+        expect(event.identity.logicalRole).toBe("TESTNET");
+      }
+    });
+
+    it("[fail-closed, 3103 survives a role grant] a role grant can never reach the live instance — instanceId=3103 stays hard-blocked even with FOUR_BRAIN_LOGICAL_ROLE set, and even when PORT alone (id unset) says 3103", () => {
+      const dir = mkdtempSync(join(tmpdir(), "causal-role-3103-")); dirs.push(dir);
+      const base = { CAUSAL_EXPERIENCE_COLLECTION_MODE: "shadow", CAUSAL_EXPERIENCE_COLLECTION_DIR: dir, END_TO_END_CORRECTNESS_DEPLOYED_AT: DEPLOYMENT_AT } as const;
+      expect(resolveCausalCollectionActivation({ ...base, PORT: "3103", FOUR_BRAIN_LOGICAL_ROLE: "RESEARCH" } as NodeJS.ProcessEnv))
+        .toMatchObject({ active: false, reason: "live-3103-blocked" });
+      expect(resolveCausalCollectionActivation({ ...base, PORT: "3103", FOUR_BRAIN_LOGICAL_ROLE: "TESTNET" } as NodeJS.ProcessEnv))
+        .toMatchObject({ active: false, reason: "live-3103-blocked" });
+      expect(prepareForwardCausalIdentity(order(), { ...base, PORT: "3103", FOUR_BRAIN_LOGICAL_ROLE: "RESEARCH" } as NodeJS.ProcessEnv)).toBeNull();
+    });
+
+    it("[fail-closed, unknown role string] an unrecognized FOUR_BRAIN_LOGICAL_ROLE value is treated as no grant at all — never a silent wildcard authorization", () => {
+      const dir = mkdtempSync(join(tmpdir(), "causal-role-unknown-")); dirs.push(dir);
+      const env: NodeJS.ProcessEnv = { PORT: "3111", FOUR_BRAIN_LOGICAL_ROLE: "ADMIN", CAUSAL_EXPERIENCE_COLLECTION_MODE: "shadow", CAUSAL_EXPERIENCE_COLLECTION_DIR: dir, END_TO_END_CORRECTNESS_DEPLOYED_AT: DEPLOYMENT_AT };
+      expect(resolveCausalCollectionActivation(env)).toMatchObject({ active: false, reason: "unknown-instance-fail-closed" });
+    });
+
+    it("[restart, role-based] a persisted role-authorized identity is re-validated on every read, exactly like the 3101/3102 path — a role that has since been revoked or changed invalidates it, never silently reused", () => {
+      const dir = mkdtempSync(join(tmpdir(), "causal-role-restart-")); dirs.push(dir);
+      const env: NodeJS.ProcessEnv = { PORT: "3111", FOUR_BRAIN_LOGICAL_ROLE: "RESEARCH", CAUSAL_EXPERIENCE_COLLECTION_MODE: "shadow", CAUSAL_EXPERIENCE_COLLECTION_DIR: dir, END_TO_END_CORRECTNESS_DEPLOYED_AT: DEPLOYMENT_AT };
+      const o = order();
+      o.causalIdentity = prepareForwardCausalIdentity(o, env);
+      expect(o.causalIdentity).not.toBeNull();
+      // "Restart" with the exact same role: identity is reused byte-for-byte, never re-minted.
+      expect(prepareForwardCausalIdentity(o, env)).toEqual(o.causalIdentity);
+      // "Restart" with the role since revoked (operator turned the grant off): the persisted identity
+      // is now stale and must not be reused — mirrors the existing policy-version staleness behavior.
+      const { FOUR_BRAIN_LOGICAL_ROLE: _drop, ...revoked } = env;
+      expect(prepareForwardCausalIdentity(o, revoked as NodeJS.ProcessEnv)).toBeNull();
+      // "Restart" with the role changed to TESTNET: also stale, never silently migrated to the new role.
+      expect(prepareForwardCausalIdentity(o, { ...env, FOUR_BRAIN_LOGICAL_ROLE: "TESTNET" })).toBeNull();
+    });
+  });
+
   it("refuses to mint a forward identity without all exact current policy stamps", () => {
     const dir = mkdtempSync(join(tmpdir(), "causal-policy-")); dirs.push(dir);
     const env = shadowEnv(dir);

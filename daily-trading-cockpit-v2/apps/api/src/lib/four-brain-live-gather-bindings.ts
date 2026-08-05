@@ -618,9 +618,37 @@ export const FOUR_BRAIN_DEFAULT_INSTANCE_ALLOWLIST: readonly string[] = ["3101",
 /** The serving port that identifies the LIVE money instance — hard-blocked no matter what. */
 export const FOUR_BRAIN_LIVE_INSTANCE_PORT = "3103";
 
-/** True only if this instance is BOTH in the allowlist AND not the hard-blocked live instance (3103). The
- *  live block keys off BOTH the resolved id AND the raw serving PORT, so a stray FOUR_BRAIN_INSTANCE_ID that
- *  relabels the live box can never smuggle the tick onto real-money 3103. */
+/**
+ * 2026-08-05 (identity-spoofing fix): an instance's role in this system, DISTINCT from its physical
+ * identity (resolveFourBrainInstanceId, always the real serving port — see that function's own doc
+ * comment). Before this type existed, the only way to authorize an isolated validation instance
+ * physically running on a non-3101/3102 port (e.g. staging mirrors on 3111/3112) was to set
+ * FOUR_BRAIN_INSTANCE_ID=3101/3102 — making resolveFourBrainInstanceId LIE about which physical
+ * instance it was, propagating a false "3101"/"3102" identity into every journal path, provenance
+ * record, and log line downstream. That is real spoofing, not a label: it produced, for real, a
+ * `data/lane-context/3101/` directory physically inside the 3111 staging deployment. This type lets
+ * an operator grant authorization WITHOUT relabeling identity — resolveFourBrainInstanceId keeps
+ * reporting the honest physical port; only fourBrainInstanceAllowed's verdict changes.
+ */
+export type FourBrainLogicalRole = "RESEARCH" | "TESTNET";
+const FOUR_BRAIN_LOGICAL_ROLE_ENV_KEY = "FOUR_BRAIN_LOGICAL_ROLE";
+
+/** Resolves an EXPLICIT, operator-set role only — never inferred from instanceId, never defaulted, never
+ *  a relabeling. `null` for anything else, including on the live instance: the 3103 hard-block in every
+ *  caller checks the PHYSICAL id/PORT independently (see fourBrainInstanceAllowed below) and must never
+ *  become bypassable through a role grant alone. */
+export function resolveFourBrainLogicalRole(env: NodeJS.ProcessEnv = process.env): FourBrainLogicalRole | null {
+  const raw = (env[FOUR_BRAIN_LOGICAL_ROLE_ENV_KEY] ?? "").toString().trim().toUpperCase();
+  return raw === "RESEARCH" || raw === "TESTNET" ? raw : null;
+}
+
+/** True if this instance is authorized to run the shadow tick: EITHER its own honest physical id is in
+ *  the allowlist (production 3101/3102, unchanged from before this fix — zero behavior change there),
+ *  OR an operator has explicitly granted it a logical role (an isolated staging mirror honestly
+ *  reporting its own 3111/3112 identity while validated to act as RESEARCH/TESTNET). Either path is
+ *  still subject to the SAME 3103 hard-block, checked first and unconditionally, so neither the
+ *  allowlist nor a role grant can ever smuggle the tick onto real-money live — a stray
+ *  FOUR_BRAIN_INSTANCE_ID or FOUR_BRAIN_LOGICAL_ROLE relabeling the live box changes nothing. */
 export function fourBrainInstanceAllowed(env: NodeJS.ProcessEnv = process.env): boolean {
   // Belt-and-suspenders: block if EITHER the resolved id OR the actual serving port is the live instance.
   if (resolveFourBrainInstanceId(env) === FOUR_BRAIN_LIVE_INSTANCE_PORT) return false;
@@ -628,7 +656,8 @@ export function fourBrainInstanceAllowed(env: NodeJS.ProcessEnv = process.env): 
   const id = resolveFourBrainInstanceId(env);
   const raw = (env.FOUR_BRAIN_INSTANCE_ALLOWLIST ?? FOUR_BRAIN_DEFAULT_INSTANCE_ALLOWLIST.join(",")).trim();
   const allow = new Set(raw.split(",").map((s) => s.trim()).filter(Boolean));
-  return allow.has(id);
+  if (allow.has(id)) return true;
+  return resolveFourBrainLogicalRole(env) !== null;
 }
 
 /** True only when the four-brain shadow cycle is actually configured to run on THIS instance — BOTH

@@ -283,6 +283,7 @@ describe("CORTEX <-> Four-Brain production causal chain (e2e, real functions onl
           opportunityId: "causal-opportunity-legacy-1",
           outcomeId: null,
           instanceId: "3102",
+          logicalRole: null,
           laneId: "LANE",
           symbolOrBasketId: "BTCUSDT",
           direction: "LONG",
