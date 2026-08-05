@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -82,6 +82,96 @@ describe("forward causal collection", () => {
     expect(recordForwardOpportunity(o, env)).toBe(false);
     expect(existsSync(join(dir, "causal-experience"))).toBe(false);
     expect(resolveCausalCollectionActivation({ ...env, PORT: "3103", CAUSAL_EXPERIENCE_COLLECTION_MODE: "shadow" }).reason).toBe("live-3103-blocked");
+  });
+
+  // 2026-08-05 hotfix, found during Phase 1 closure verification against REAL active-instance data:
+  // adding logicalRole to CausalIdentity (identity-spoofing fix) broke every identity persisted
+  // before that field existed — confirmed live, active 3102's real causal journal had 11,370 of
+  // 11,432 events (everything predating the fix, spanning 2026-08-01 through the fix's deploy) go
+  // FORWARD_CAUSAL_SCHEMA_MISMATCH, an all-or-nothing gate that also silently rejected the handful of
+  // genuinely NEW, correctly-shaped events in the same file. This test constructs the EXACT legacy
+  // shape (a real pre-fix event has no `logicalRole` key at all, not merely `null`) and proves both
+  // affected paths now accept it: the strict reader, and identity reuse across a simulated restart.
+  it("[2026-08-05 hotfix] a legacy identity written before logicalRole existed (key absent, not null) is accepted by the strict reader and reused (not re-minted) on the next call — never treated as schema-mismatched or stale", () => {
+    const dir = mkdtempSync(join(tmpdir(), "causal-legacy-role-")); dirs.push(dir);
+    const env = shadowEnv(dir);
+    const o = order();
+    o.causalIdentity = prepareForwardCausalIdentity(o, env);
+    expect(recordForwardOpportunity(o, env)).toBe(true);
+    const journal = forwardCausalJournalPath(env)!;
+
+    // Rewrite the journal to the REAL legacy shape: strip logicalRole from every event's identity
+    // entirely (delete the key, not set it to null) — exactly what a pre-2026-08-05 writer produced.
+    const rows = readFileSync(journal, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    for (const row of rows) delete row.identity.logicalRole;
+    writeFileSync(journal, `${rows.map((r) => JSON.stringify(r)).join("\n")}\n`);
+
+    // The strict reader (operator-facing, gates learning eligibility) must accept this file, not
+    // reject the whole thing as FORWARD_CAUSAL_SCHEMA_MISMATCH.
+    const strict = readForwardCausalEventsStrict(journal);
+    expect(strict.status).toBe("VALID");
+    expect(strict.events.length).toBe(rows.length);
+
+    // Identity reuse: an order rehydrated with this legacy-shaped (key-absent) identity, on an
+    // instance whose activation resolves logicalRole:null (3102, direct allowlist match — no grant
+    // needed), must be treated as CURRENT, not stale — reused byte-for-byte, never re-minted.
+    const legacyOrder = { ...o, causalIdentity: JSON.parse(JSON.stringify(rows[0].identity)) };
+    expect("logicalRole" in legacyOrder.causalIdentity).toBe(false);
+    const reused = prepareForwardCausalIdentity(legacyOrder, env);
+    expect(reused).toEqual(legacyOrder.causalIdentity);
+  });
+
+  // 2026-08-05 hotfix, found in the SAME real-journal check as the logicalRole one above (3,666 of
+  // 11,432 real events on active 3102): a "no CORTEX link" identity from before
+  // allocationSnapshotId/canonicalCortexLaneId/cortexFeatureSchemaVersion were all consistently
+  // written together set only cortexDecisionId to explicit null, leaving the other three ABSENT
+  // rather than also null.
+  it("[2026-08-05 hotfix] a legacy 'no CORTEX link' identity (cortexDecisionId: null, the other 3 cortex fields absent, not null) is accepted by the strict reader", () => {
+    const dir = mkdtempSync(join(tmpdir(), "causal-legacy-cortex-")); dirs.push(dir);
+    const env = shadowEnv(dir);
+    const o = order();
+    o.causalIdentity = prepareForwardCausalIdentity(o, env);
+    expect(recordForwardOpportunity(o, env)).toBe(true);
+    const journal = forwardCausalJournalPath(env)!;
+
+    const rows = readFileSync(journal, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    for (const row of rows) {
+      expect(row.identity.cortexDecisionId).toBeNull(); // sanity: this fixture never had a cortex snapshot
+      delete row.identity.allocationSnapshotId;
+      delete row.identity.canonicalCortexLaneId;
+      delete row.identity.cortexFeatureSchemaVersion;
+    }
+    writeFileSync(journal, `${rows.map((r) => JSON.stringify(r)).join("\n")}\n`);
+
+    const strict = readForwardCausalEventsStrict(journal);
+    expect(strict.status).toBe("VALID");
+    expect(strict.events.length).toBe(rows.length);
+  });
+
+  // 2026-08-05 hotfix (3rd instance of the same class, found in the SAME real-journal check
+  // immediately after the two above): 1,404 of the 11,432 real events on active 3102 are
+  // DECISION_SNAPSHOT rows whose cortexTraining.status is "MISSING" with every other field explicit
+  // null but snapshotAtMs simply absent — the MISSING-branch literal that builds this object predates
+  // snapshotAtMs being included in it (every other MISSING field reported zero problems on the real
+  // journal, confirmed via a per-field diagnostic before writing this fix, not guessed).
+  it("[2026-08-05 hotfix] a legacy 'no CORTEX snapshot' decision event (cortexTraining.status: MISSING, snapshotAtMs absent, not null) is accepted by the strict reader", () => {
+    const dir = mkdtempSync(join(tmpdir(), "causal-legacy-snapshot-")); dirs.push(dir);
+    const env = shadowEnv(dir);
+    const o = order();
+    o.causalIdentity = prepareForwardCausalIdentity(o, env);
+    expect(recordForwardOpportunity(o, env)).toBe(true);
+    const journal = forwardCausalJournalPath(env)!;
+
+    const rows = readFileSync(journal, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    const decision = rows.find((r) => r.eventType === "DECISION_SNAPSHOT");
+    expect(decision.cortexTraining.status).toBe("MISSING"); // sanity: this fixture never had a cortex snapshot
+    expect(decision.cortexTraining.snapshotAtMs).toBeNull();
+    delete decision.cortexTraining.snapshotAtMs;
+    writeFileSync(journal, `${rows.map((r) => JSON.stringify(r)).join("\n")}\n`);
+
+    const strict = readForwardCausalEventsStrict(journal);
+    expect(strict.status).toBe("VALID");
+    expect(strict.events.length).toBe(rows.length);
   });
 
   // 2026-08-05 (identity-spoofing fix): the ONLY correct way to authorize an isolated staging mirror

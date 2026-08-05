@@ -271,7 +271,17 @@ export function isCausalIdentityCurrentlyValid(
   // A role grant can change (widened, narrowed, revoked) independently of the physical instance —
   // an identity minted under a since-changed role is exactly as stale as one minted under a since-
   // changed policy version, and must not be silently reused under the new role's authority.
-  if (identity.logicalRole !== activation.logicalRole) return false;
+  //
+  // 2026-08-05 hotfix: `undefined` (every identity persisted before logicalRole existed — confirmed
+  // on active 3101/3102's real journals, which predate this field by days) is treated as exactly
+  // `null` here, never as a mismatch against a `null`-role activation. An identity that predates the
+  // field could ONLY have been minted on an instance directly in the 3101/3102 allowlist (the role
+  // system exists to authorize instances OUTSIDE that allowlist, which didn't exist yet when these
+  // were written) — so "field absent" and "field explicitly null" are the same fact, not two
+  // different ones. Without this, `undefined !== null` unconditionally staled every pre-existing
+  // identity the instant this field shipped, exactly mirroring openMaxHoldMs's own grandfather
+  // clause in current-guard-variant-matrix.ts for the identical reason.
+  if ((identity.logicalRole ?? null) !== activation.logicalRole) return false;
   if (identity.laneId !== order.selectedLaneId) return false;
   if (identity.symbolOrBasketId !== order.symbol) return false;
   if (identity.direction !== order.direction) return false;
@@ -567,6 +577,13 @@ export interface ForwardCausalStrictRead { status: ForwardCausalStrictStatus; ev
 const nonEmpty = (value: unknown): value is string => typeof value === "string" && value.length > 0;
 const nullableString = (value: unknown): value is string | null => value === null || nonEmpty(value);
 const nullableFinite = (value: unknown): value is number | null => value === null || finite(value);
+/** 2026-08-05 hotfix: `undefined` treated as exactly `null` — for fields that predate a schema
+ *  addition, "key absent" and "key explicitly null" are the same fact on disk, never two different
+ *  ones. Scoped to the specific optional CORTEX-link fields below; every other nullableString/
+ *  nullableFinite caller keeps the original strict null-only contract. */
+const isNullish = (value: unknown): value is null | undefined => value === null || value === undefined;
+const nullableOptString = (value: unknown): value is string | null | undefined => isNullish(value) || nonEmpty(value);
+const nullableOptFinite = (value: unknown): value is number | null | undefined => isNullish(value) || finite(value);
 const validIdentity = (value: unknown, outcomeId: string | null): value is CausalIdentity => {
   if (!value || typeof value !== "object") return false;
   const identity = value as CausalIdentity;
@@ -576,12 +593,30 @@ const validIdentity = (value: unknown, outcomeId: string | null): value is Causa
       identity.decisionPolicyVersion, identity.executionPolicyVersion, identity.evidencePolicyVersion,
       identity.evidenceEra, identity.policyDeploymentAt].every(nonEmpty) &&
     ["LONG", "SHORT", "NEUTRAL", "BOTH"].includes(identity.direction) &&
-    (identity.logicalRole === null || identity.logicalRole === "RESEARCH" || identity.logicalRole === "TESTNET") &&
-    nullableString(identity.cortexDecisionId) && nullableString(identity.allocationSnapshotId) && nullableString(identity.canonicalCortexLaneId) &&
-    (identity.cortexFeatureSchemaVersion === null || identity.cortexFeatureSchemaVersion === CORTEX_FEATURE_SCHEMA_VERSION) &&
-    (identity.cortexDecisionId === null
-      ? identity.allocationSnapshotId === null && identity.canonicalCortexLaneId === null && identity.cortexFeatureSchemaVersion === null
-      : identity.allocationSnapshotId !== null && identity.canonicalCortexLaneId !== null && identity.cortexFeatureSchemaVersion === CORTEX_FEATURE_SCHEMA_VERSION) &&
+    // 2026-08-05 hotfix: `undefined` (every identity persisted before this field existed) accepted
+    // exactly like explicit `null` — see isCausalIdentityCurrentlyValid's identical fix, same
+    // rationale. Without this, the strict reader rejected the ENTIRE pre-existing production causal
+    // journal (11,370 of 11,432 real events on active 3102 alone) as FORWARD_CAUSAL_SCHEMA_MISMATCH
+    // the instant this field shipped, which is an all-or-nothing gate: it blocks EVERY row in the
+    // file, not just the ones missing the field.
+    (identity.logicalRole === undefined || identity.logicalRole === null ||
+      identity.logicalRole === "RESEARCH" || identity.logicalRole === "TESTNET") &&
+    // 2026-08-05 hotfix (same class as logicalRole above, found immediately after it against the
+    // SAME real journal): a "no CORTEX link" identity from before these 4 fields were all
+    // consistently written together only set cortexDecisionId to explicit null and left
+    // allocationSnapshotId/canonicalCortexLaneId/cortexFeatureSchemaVersion absent rather than also
+    // null — confirmed on 3,666 real events on active 3102 (100% attributable to
+    // canonicalCortexLaneId specifically in that dataset, but all four are structurally parallel
+    // "present only when an exact CORTEX snapshot was handed to admission" fields per CausalIdentity's
+    // own doc comment, so all four get the same undefined-as-null treatment rather than patching only
+    // the one field that happened to surface first). `nullableOptString`/`isNullish` below subsume
+    // nullableString for exactly these 4 checks; nullableString itself is untouched for every other
+    // caller (event-level fields where the OLD null-only contract still holds and is correct).
+    nullableOptString(identity.cortexDecisionId) && nullableOptString(identity.allocationSnapshotId) && nullableOptString(identity.canonicalCortexLaneId) &&
+    (isNullish(identity.cortexFeatureSchemaVersion) || identity.cortexFeatureSchemaVersion === CORTEX_FEATURE_SCHEMA_VERSION) &&
+    (isNullish(identity.cortexDecisionId)
+      ? isNullish(identity.allocationSnapshotId) && isNullish(identity.canonicalCortexLaneId) && isNullish(identity.cortexFeatureSchemaVersion)
+      : !isNullish(identity.allocationSnapshotId) && !isNullish(identity.canonicalCortexLaneId) && identity.cortexFeatureSchemaVersion === CORTEX_FEATURE_SCHEMA_VERSION) &&
     identity.outcomeId === outcomeId;
 };
 const validDecisionEvent = (event: unknown): event is DecisionSnapshotEvent => {
@@ -592,7 +627,15 @@ const validDecisionEvent = (event: unknown): event is DecisionSnapshotEvent => {
     [value.entryDecision.entryPrice, value.entryDecision.stopLoss, value.entryDecision.plannedStopDistanceBps].every(finite) &&
     Array.isArray(value.entryDecision.takeProfitLevels) && value.entryDecision.takeProfitLevels.every(finite) &&
     c != null && ["PRESENT", "MISSING"].includes(c.status) && nullableString(c.decisionId) &&
-    nullableFinite(c.snapshotAtMs) && (c.featureSchemaVersion === null || c.featureSchemaVersion === CORTEX_FEATURE_SCHEMA_VERSION) &&
+    // 2026-08-05 hotfix (3rd instance of the same class, found immediately after the identity ones
+    // above against the SAME real 3102 journal): 1,404 real legacy DECISION_SNAPSHOT rows have
+    // cortexTraining.status === "MISSING" with every other field explicit `null` but snapshotAtMs
+    // simply absent — the MISSING-branch literal that writes this object predates snapshotAtMs being
+    // included in it. nullableOptFinite/isNullish accept that absence exactly like explicit `null`,
+    // matching every other field in the same MISSING literal; the PRESENT-branch `finite(c.snapshotAtMs)`
+    // below is untouched since a present snapshot's timestamp is a positive contract, not a
+    // predates-the-writer gap, and 0 real rows failed it.
+    nullableOptFinite(c.snapshotAtMs) && (c.featureSchemaVersion === null || c.featureSchemaVersion === CORTEX_FEATURE_SCHEMA_VERSION) &&
     (c.featureVector === null || (Array.isArray(c.featureVector) && c.featureVector.every(finite))) &&
     ((c.status === "PRESENT" && (
       nonEmpty(c.decisionId) && nonEmpty(value.identity.cortexDecisionId) && c.decisionId === value.identity.cortexDecisionId &&
@@ -602,7 +645,7 @@ const validDecisionEvent = (event: unknown): event is DecisionSnapshotEvent => {
       nonEmpty(c.regimeFamily) && c.regimeFamily.trim().toUpperCase() !== "UNKNOWN" &&
       finite(c.finalPct) && finite(c.evalFinalPct) && typeof c.eligible === "boolean"
     )) || (c.status === "MISSING" && c.decisionId === null && c.featureSchemaVersion === null && c.featureVector === null &&
-      c.snapshotAtMs === null && c.regimeFamily === null && c.eligible === null && c.finalPct === null && c.evalFinalPct === null));
+      isNullish(c.snapshotAtMs) && c.regimeFamily === null && c.eligible === null && c.finalPct === null && c.evalFinalPct === null));
 };
 const validOpenEvent = (event: unknown): event is OpportunityOpenEvent => {
   const value = event as OpportunityOpenEvent;
