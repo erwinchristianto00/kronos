@@ -4311,7 +4311,7 @@ function orderByEpisodeTime(a: CurrentGuardVariantMatrixObservation, b: CurrentG
 
 /** One observation reduced to exactly what episode identity needs, and nothing else.
  *  `symbol` is deliberately absent: it is not, and must never become, part of any grouping key. */
-interface EpisodeIdentityRow {
+export interface EpisodeIdentityRow {
   /** The proof clock (openedAt). `null` = unparseable ⇒ the fail-closed shared bucket. */
   episodeMs: number | null;
   observationId: string;
@@ -4552,8 +4552,33 @@ class EpisodeAccumulator {
  */
 function computeEffectiveN(obs: readonly CurrentGuardVariantMatrixObservation[], blockWidthMs: number): number {
   if (obs.length === 0) return 0;
-  const rows = obs.map(episodeIdentityRowOf);
-  rows.sort((a, b) => {
+  return countIndependentEpisodes(obs.map(episodeIdentityRowOf), blockWidthMs);
+}
+
+/**
+ * THE independent-episode count for any already-identity-mapped cohort — the exact rule
+ * `computeEffectiveN` uses, exposed for report-only consumers whose rows do not live in the variant
+ * matrix (research/telemetry over a lane-specific store, which has its own row shape but must never
+ * get its own second definition of "independent draw").
+ *
+ * Deliberately generic over `EpisodeIdentityRow` rather than `CurrentGuardVariantMatrixObservation`:
+ * `EpisodeAccumulator` already only ever needed {episodeMs, observationId, batchId, episodeId}, so a
+ * caller adapts its rows once and inherits the union-find merge rules, the fail-closed undated
+ * bucket, and the defensive sort unchanged. `computeEffectiveN` now delegates here, so there is
+ * exactly ONE implementation — the same discipline EpisodeAccumulator's own doc comment states
+ * ("Written twice they would eventually disagree").
+ *
+ * Deterministic and restart-stable: a pure function of the rows and the width. The sort is a total
+ * order (episodeMs, then observationId), so the result is independent of input permutation, and
+ * nothing here reads a clock, a store, or any mutable module state.
+ */
+export function countIndependentEpisodes(
+  rows: readonly EpisodeIdentityRow[],
+  blockWidthMs: number,
+): number {
+  if (rows.length === 0) return 0;
+  const sorted = rows.slice();
+  sorted.sort((a, b) => {
     if (a.episodeMs === null || b.episodeMs === null) {
       if (a.episodeMs !== b.episodeMs) return a.episodeMs === null ? 1 : -1;
     } else if (a.episodeMs !== b.episodeMs) {
@@ -4564,7 +4589,7 @@ function computeEffectiveN(obs: readonly CurrentGuardVariantMatrixObservation[],
     return 0;
   });
   const accumulator = new EpisodeAccumulator(blockWidthMs);
-  for (const row of rows) accumulator.push(row);
+  for (const row of sorted) accumulator.push(row);
   return accumulator.count();
 }
 
