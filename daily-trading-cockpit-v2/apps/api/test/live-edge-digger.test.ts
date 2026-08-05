@@ -18,7 +18,15 @@ import {
   type EdgeRule,
 } from "../src/lib/live-edge-digger-grammar.js";
 import {
+  MAX_ACTIVE_GENERATED,
+  MAX_GENERATED_PER_CYCLE,
+  MAX_GENERATED_PER_DAY,
+  MAX_GENERATED_PREDICATES,
+  generateHypotheses,
+} from "../src/lib/live-edge-digger-hypotheses.js";
+import {
   EPISODE_BLOCK_WIDTH_MS,
+  MIN_EPISODES_TO_JUDGE,
   buildCandidateReport,
   buildLiveEdgeDiggerReport,
   candidateMetrics,
@@ -31,6 +39,7 @@ import {
 } from "../src/lib/live-edge-digger.js";
 import {
   LiveEdgeDiggerStore,
+  buildLiveEdgeDiggerReportFromStore,
   runLiveEdgeDiggerCycle,
   _resetLiveEdgeDiggerCycleLatchForTests,
 } from "../src/lib/live-edge-digger-cycle.js";
@@ -387,18 +396,27 @@ describe("live-edge-digger", () => {
           });
         }
       }
-      const report = buildCandidateReport(freezeCandidate(EDGE_RULE_FRONTIER[0]!, "2026-08-06T00:00:00.000Z"),
+      // Freeze anchor must PRECEDE the rows, or freeze integrity (correctly) disqualifies the
+      // candidate and this test stops isolating what it claims to test. The previous anchor was
+      // 2026-08-06, a full 5 days AFTER these rows open — the old single REJECT verdict hid that,
+      // because a gate shortfall and a freeze violation both collapsed into the same word.
+      const report = buildCandidateReport(freezeCandidate(EDGE_RULE_FRONTIER[0]!, new Date(BASE - HOUR).toISOString()),
         rows.map((r) => ({ ...r, candidateId: candidateIdFor(EDGE_RULE_FRONTIER[0]!) })));
+      expect(report.freezeIntegrity.ok).toBe(true);
       const dev = report.partitions.find((p) => p.partition === "DEV")!;
       expect(dev.rows).toBe(60);
       expect(dev.episodes).toBe(3);
       const devGate = report.gates.find((g) => g.id === "dev_episodes")!;
       expect(devGate.current).toBe(3); // episodes, NOT 60 rows
       expect(devGate.pass).toBe(false);
-      expect(report.decision).toBe("REJECT");
+      // 60 rows collapsing to 3 episodes is IMMATURITY, not a verdict against the rule: the gate is
+      // unmet, so it cannot be CANDIDATE, but nothing here disqualifies it either.
+      expect(report.lifecycle).toBe("COLLECTING");
+      expect(report.rejectionReasons).toEqual([]);
+      expect(report.evidenceStillNeeded.join(" ")).toContain("DEV episodes");
     });
 
-    it("a candidate with no evidence REJECTs with an explicit reason and never becomes the best", () => {
+    it("[LIFECYCLE-ZERO] a candidate with NO evidence is DORMANT, never REJECTED — absence of evidence is not evidence of absence", () => {
       const report = buildLiveEdgeDiggerReport({
         generatedAt: "2026-08-06T00:00:00.000Z",
         observations: [],
@@ -413,9 +431,19 @@ describe("live-edge-digger", () => {
       expect(report.recommendation).toBeNull();
       expect(report.candidates.length).toBe(EDGE_RULE_FRONTIER.length);
       for (const c of report.candidates) {
-        expect(c.decision).toBe("REJECT");
-        expect(c.rejectionReasons.join(" ")).toContain("no resolved forward evidence");
+        // THE DEFECT THIS TEST NOW PINS: every rule previously read REJECT from its first cycle,
+        // because "no resolved forward evidence yet" was pushed into the same list as a genuine
+        // economic failure. A rule that has never fired has told us something about the MARKET, and
+        // nothing whatsoever about its own edge.
+        expect(c.lifecycle).toBe("DORMANT");
+        expect(c.rejectionReasons).toEqual([]);
+        expect(c.lifecycleReason).toContain("have not occurred");
+        expect(c.evidenceStillNeeded.join(" ")).toContain("have not occurred in the live market yet");
       }
+      // And the census agrees: nothing is rejected on an empty store.
+      expect(report.lifecycleCounts.DORMANT).toBe(EDGE_RULE_FRONTIER.length);
+      expect(report.lifecycleCounts.REJECTED).toBe(0);
+      expect(report.lifecycleCounts.RECOMMENDED_FOR_3102_REVIEW).toBe(0);
     });
 
     it("the report is self-describing as report-only and live-blocked", () => {
@@ -607,7 +635,7 @@ describe("live-edge-digger", () => {
         freezeCandidate(rule, null, 1, "UNKNOWN_PRE_MIGRATION"), [row],
       );
       expect(legacy.freezeIntegrity.ok).toBe(false);
-      expect(legacy.decision).toBe("REJECT");
+      expect(legacy.lifecycle).toBe("REJECTED"); // structural: freeze integrity needs no sample size
       expect(legacy.rejectionReasons.some((r) => r.startsWith("freeze integrity:"))).toBe(true);
 
       // And an anchor set AFTER the row it claims to precede is caught, not rounded away.
@@ -616,7 +644,7 @@ describe("live-edge-digger", () => {
       );
       expect(backdated.freezeIntegrity.rowsOpenedBeforeFreeze).toBe(1);
       expect(backdated.freezeIntegrity.ok).toBe(false);
-      expect(backdated.decision).toBe("REJECT");
+      expect(backdated.lifecycle).toBe("REJECTED");
     });
 
     it("[FREEZE-ANCHOR] a pre-migration store re-keys to candidateId with a null anchor", () => {
@@ -656,6 +684,373 @@ describe("live-edge-digger", () => {
       store.add(mk("open-1", "OPEN", BASE + 99 * HOUR));
       store.save();
       expect(store.all.some((o) => o.observationId === "open-1")).toBe(true);
+    });
+  });
+
+  // =========================================================================
+  // LIFECYCLE — the defect this engine shipped with: every rule read REJECT from
+  // its first cycle, before any outcome could exist.
+  // =========================================================================
+  describe("lifecycle", () => {
+    const RULE = EDGE_RULE_FRONTIER[0]!;
+    const CID = candidateIdFor(RULE);
+    const FROZEN = new Date(BASE - HOUR).toISOString();
+
+    /** One resolved row. `cycle` controls episode identity; `netR` the economics. */
+    const row = (id: string, cycle: string, netR: number, symbol = "AUSDT", atMs = BASE): ShadowObservation => ({
+      observationId: id, candidateId: CID, contentHash: "h", symbol,
+      direction: "LONG", cycleId: cycle,
+      openedAt: new Date(atMs).toISOString(), openedAtMs: atMs,
+      entryPrice: 100, stopPrice: 98, targetPrice: 103, stopDistanceBps: 200, maxHoldHours: 24,
+      regimeAtEntry: "r", features: {} as never,
+      status: netR > 0 ? "CLOSED_WIN" : "CLOSED_LOSS", resolvedAt: "x",
+      exitPrice: 103, exitReason: netR > 0 ? "TARGET" : "STOP",
+      grossR: netR + 0.1, costR: -0.1, netR, holdHours: 1,
+    } as ShadowObservation);
+
+    const openRow = (id: string): ShadowObservation => ({
+      ...row(id, "cycle-open", 1), status: "OPEN", resolvedAt: undefined, netR: undefined, grossR: undefined,
+    } as unknown as ShadowObservation);
+
+    it("[LIFECYCLE-DORMANT] a rule that has never fired is DORMANT with no rejection reasons", () => {
+      const r = buildCandidateReport(freezeCandidate(RULE, FROZEN), []);
+      expect(r.lifecycle).toBe("DORMANT");
+      expect(r.rejectionReasons).toEqual([]);
+      // The finding is about the MARKET, and the report says so rather than blaming the rule.
+      expect(r.lifecycleReason).toContain("have not occurred");
+    });
+
+    it("[LIFECYCLE-OPEN] a rule whose every row is still unresolved is OPEN, never REJECTED", () => {
+      const r = buildCandidateReport(freezeCandidate(RULE, FROZEN), [openRow("o1"), openRow("o2")]);
+      expect(r.lifecycle).toBe("OPEN");
+      expect(r.openRows).toBe(2);
+      expect(r.resolvedRows).toBe(0);
+      expect(r.rejectionReasons).toEqual([]);
+      expect(r.evidenceStillNeeded.join(" ")).toContain("still open");
+    });
+
+    it("[LIFECYCLE-NO-REJECT-ON-EMPTY] a LOSING but tiny sample is COLLECTING — too few episodes to conclude", () => {
+      // Two losing episodes. Under the old code the negative expectancy alone produced REJECT; a
+      // rule must not be discarded for being unlucky in its first two looks.
+      const rows = [row("a", "c1", -1), row("b", "c2", -1)];
+      const r = buildCandidateReport(freezeCandidate(RULE, FROZEN), rows);
+      expect(r.independentEpisodes).toBeLessThan(MIN_EPISODES_TO_JUDGE);
+      expect(r.metrics.netExpectancyR).toBeLessThan(0);
+      expect(r.lifecycle).toBe("COLLECTING");
+      expect(r.rejectionReasons).toEqual([]);
+      expect(r.evidenceStillNeeded.join(" ")).toContain("before economics may be judged");
+    });
+
+    it("[LIFECYCLE-REJECT] a losing sample LARGE enough to judge is REJECTED, with the shortfall named", () => {
+      const rows = Array.from({ length: MIN_EPISODES_TO_JUDGE }, (_, i) =>
+        row(`x${i}`, `c${i}`, -1, `S${i}USDT`, BASE + i * 50 * HOUR));
+      const r = buildCandidateReport(freezeCandidate(RULE, FROZEN), rows);
+      expect(r.independentEpisodes).toBeGreaterThanOrEqual(MIN_EPISODES_TO_JUDGE);
+      expect(r.lifecycle).toBe("REJECTED");
+      expect(r.rejectionReasons.join(" ")).toContain("expectancy");
+      // Crucially it names the population it concluded from — not a bare verdict.
+      expect(r.rejectionReasons.join(" ")).toContain("independent episodes");
+    });
+
+    it("[LIFECYCLE-POSITIVE-STAYS-COLLECTING] a provisionally POSITIVE result below the floors is never promoted", () => {
+      const rows = [row("a", "c1", 2), row("b", "c2", 2)];
+      const r = buildCandidateReport(freezeCandidate(RULE, FROZEN), rows);
+      expect(r.metrics.netExpectancyR).toBeGreaterThan(0);
+      expect(r.lifecycle).toBe("COLLECTING");
+      // The report says the positive number is not a finding, in words, where a reader will see it.
+      expect(r.lifecycleReason).toContain("not a finding yet");
+    });
+
+    it("[LIFECYCLE-EMPTY-PARTITION] an empty validation partition is not read as sign disagreement", () => {
+      // All rows land in DEV; VALIDATION/RECENT are empty. An empty side must never manufacture a
+      // "splits disagree" rejection — absence is not disagreement.
+      const rows = Array.from({ length: MIN_EPISODES_TO_JUDGE + 2 }, (_, i) =>
+        row(`p${i}`, `c${i}`, 1, `S${i}USDT`, BASE + i * 50 * HOUR));
+      const r = buildCandidateReport(freezeCandidate(RULE, FROZEN), rows);
+      expect(r.rejectionReasons.join(" ")).not.toContain("disagree in sign");
+    });
+
+    it("[LIFECYCLE-COUNTS] the report census never shows REJECTED on an empty store", () => {
+      const report = buildLiveEdgeDiggerReport({
+        generatedAt: "2026-08-06T00:00:00.000Z",
+        observations: [], attempts: [],
+        scanner: {
+          cyclesRun: 3, lastCycleAt: null, lastError: null, universeSize: 21, regime: null,
+          regimeFamily: null, breadth: null, cohesion: null, dispersion: null,
+        },
+      });
+      expect(report.lifecycleCounts.REJECTED).toBe(0);
+      expect(report.lifecycleCounts.DORMANT).toBe(EDGE_RULE_FRONTIER.length);
+      expect(report.verdict).toBe("NO_PROVEN_EDGE_YET");
+    });
+  });
+
+  // =========================================================================
+  // HYPOTHESIS GENERATION
+  // =========================================================================
+  describe("bounded hypothesis generation", () => {
+    /** A market with a real compression cluster, crowded funding and a breadth extreme. */
+    function richMarket(overrides: Partial<Parameters<typeof buildMarketFeatures>[0]> = {}) {
+      const asOf = BASE + 200 * HOUR;
+      const symbols: SymbolCycleInput[] = Array.from({ length: 12 }, (_, i) =>
+        symbolInput(`S${i}USDT`, { asOfMs: asOf, drift: i < 9 ? 0.002 : -0.001, fundingBps: i < 4 ? 6 : 1 }));
+      return buildMarketFeatures({
+        asOfMs: asOf, regime: "Bullish expansion", regimeFamily: "BULLISH",
+        benchmarkSymbol: "S0USDT", symbols, ...overrides,
+      });
+    }
+
+    it("[GEN-BASIC] generates interpretable rules from live structure, each with a thesis and rejection rules", () => {
+      const { generated } = generateHypotheses({
+        market: richMarket(), cycleId: "cycle-1", atIso: "2026-08-06T00:00:00.000Z",
+        existingContentHashes: new Set(EDGE_RULE_FRONTIER.map(ruleContentHash)),
+        existingGenerated: [],
+      });
+      expect(generated.length).toBeGreaterThan(0);
+      expect(generated.length).toBeLessThanOrEqual(MAX_GENERATED_PER_CYCLE);
+      for (const g of generated) {
+        expect(g.rule.thesis.length).toBeGreaterThan(40);
+        expect(g.rule.rejectionRules.length).toBeGreaterThan(0);
+        expect(g.candidateId).toContain(g.rule.ruleId);
+        // Provenance: the live observation that motivated it, never an outcome.
+        expect(g.originObservation.length).toBeGreaterThan(0);
+        // Grammar/complexity ceiling holds.
+        const predicateCount = Object.keys(g.rule.predicates)
+          .filter((k) => !["regimeFamilies", "maxSpreadBps", "minQuoteVolume24hUsd"].includes(k)).length;
+        expect(predicateCount).toBeLessThanOrEqual(MAX_GENERATED_PREDICATES);
+      }
+    });
+
+    it("[GEN-NO-LEAKAGE] no generated predicate names an outcome-only field", () => {
+      const { generated } = generateHypotheses({
+        market: richMarket(), cycleId: "c", atIso: "2026-08-06T00:00:00.000Z",
+        existingContentHashes: new Set(), existingGenerated: [],
+      });
+      for (const g of generated) {
+        expect(() => assertDecisionTimeSafe(Object.keys(g.rule.predicates), g.rule.ruleId)).not.toThrow();
+        for (const field of OUTCOME_ONLY_FIELDS) {
+          expect(Object.keys(g.rule.predicates)).not.toContain(field);
+        }
+      }
+    });
+
+    it("[GEN-DEDUP] the same market can never generate the same rule twice — repeated cycles saturate instead of re-freezing", () => {
+      // Cycles beyond the per-cycle budget DEFER the remaining proposals rather than discarding
+      // them, so the honest invariant is not "the second cycle generates nothing" but "no rule is
+      // ever generated twice". Re-freezing a known rule would restart its clock and double-count it
+      // in the multiple-testing denominator, which is the failure this guards.
+      const market = richMarket();
+      const seen = new Set(EDGE_RULE_FRONTIER.map(ruleContentHash));
+      const accumulated: ReturnType<typeof generateHypotheses>["generated"][number][] = [];
+      let sawDuplicateSuppression = false;
+
+      for (let cycle = 0; cycle < 8; cycle++) {
+        const res = generateHypotheses({
+          market, cycleId: `c${cycle}`, atIso: `2026-08-0${(cycle % 9) + 1}T00:00:00.000Z`,
+          existingContentHashes: seen,
+          existingGenerated: accumulated,
+        });
+        for (const g of res.generated) {
+          const hash = ruleContentHash(g.rule);
+          // THE INVARIANT: never seen before, in any earlier cycle.
+          expect(seen.has(hash)).toBe(false);
+          seen.add(hash);
+          accumulated.push(g);
+        }
+        if (res.suppressed.some((s) => s.reason === "DUPLICATE")) sawDuplicateSuppression = true;
+      }
+
+      // It generated something, then saturated on this one unchanging market state...
+      expect(accumulated.length).toBeGreaterThan(0);
+      // ...and every candidateId is distinct — the property that actually matters.
+      expect(new Set(accumulated.map((g) => g.candidateId)).size).toBe(accumulated.length);
+      // ...and once saturated it reports duplicates rather than silently doing nothing.
+      expect(sawDuplicateSuppression).toBe(true);
+    });
+
+    it("[GEN-CAPS] per-cycle, per-day and total-active caps each stop generation and say which one bound", () => {
+      const market = richMarket();
+      const base = { market, cycleId: "c", existingContentHashes: new Set<string>() };
+      // Per-cycle: never more than the budget in one call.
+      const cycle = generateHypotheses({ ...base, atIso: "2026-08-06T00:00:00.000Z", existingGenerated: [] });
+      expect(cycle.generated.length).toBeLessThanOrEqual(MAX_GENERATED_PER_CYCLE);
+
+      const fake = (n: number, day: string) => Array.from({ length: n }, (_, i) => ({
+        rule: { ...EDGE_RULE_FRONTIER[0]!, ruleId: `FAKE_${day}_${i}` },
+        candidateId: `FAKE_${day}_${i}`, generatedAt: `${day}T00:00:00.000Z`,
+        originCycleId: "c", originObservation: "x",
+      }));
+      // Daily cap.
+      const daily = generateHypotheses({
+        ...base, atIso: "2026-08-06T12:00:00.000Z", existingGenerated: fake(MAX_GENERATED_PER_DAY, "2026-08-06"),
+      });
+      expect(daily.generated.length).toBe(0);
+      expect(daily.suppressed[0]!.reason).toBe("DAILY_CAP");
+      // Total-active cap dominates even on a fresh day.
+      const total = generateHypotheses({
+        ...base, atIso: "2026-09-01T00:00:00.000Z", existingGenerated: fake(MAX_ACTIVE_GENERATED, "2026-08-01"),
+      });
+      expect(total.generated.length).toBe(0);
+      expect(total.suppressed[0]!.reason).toBe("TOTAL_ACTIVE_CAP");
+    });
+
+    it("[GEN-DETERMINISTIC] the same market and the same known-set produce the same rules — the freeze anchor means something", () => {
+      const args = {
+        market: richMarket(), cycleId: "c", atIso: "2026-08-06T00:00:00.000Z",
+        existingContentHashes: new Set<string>(), existingGenerated: [],
+      };
+      const a = generateHypotheses(args);
+      const b = generateHypotheses(args);
+      expect(b.generated.map((g) => g.candidateId)).toEqual(a.generated.map((g) => g.candidateId));
+    });
+
+    it("[GEN-EDIT-NEW-ID] editing a generated rule's threshold mints a new candidateId, never reusing the old clock", () => {
+      const { generated } = generateHypotheses({
+        market: richMarket(), cycleId: "c", atIso: "2026-08-06T00:00:00.000Z",
+        existingContentHashes: new Set(), existingGenerated: [],
+      });
+      const original = generated[0]!;
+      const edited: EdgeRule = {
+        ...original.rule,
+        geometry: { ...original.rule.geometry, stopAtrMultiple: original.rule.geometry.stopAtrMultiple + 0.5 },
+      };
+      expect(candidateIdFor(edited)).not.toBe(original.candidateId);
+      // Prose-only edits do NOT mint a new identity — the line between clarifying and changing.
+      const reworded: EdgeRule = { ...original.rule, thesis: `${original.rule.thesis} (clarified)` };
+      expect(candidateIdFor(reworded)).toBe(original.candidateId);
+    });
+
+    it("[GEN-THIN-TAPE] a thin or unclassified cross-section generates nothing — fails closed", () => {
+      const asOf = BASE + 200 * HOUR;
+      const thin = buildMarketFeatures({
+        asOfMs: asOf, regime: "x", regimeFamily: "BULLISH", benchmarkSymbol: "S0USDT",
+        symbols: [symbolInput("S0USDT", { asOfMs: asOf }), symbolInput("S1USDT", { asOfMs: asOf })],
+      });
+      expect(generateHypotheses({
+        market: thin, cycleId: "c", atIso: "2026-08-06T00:00:00.000Z",
+        existingContentHashes: new Set(), existingGenerated: [],
+      }).generated.length).toBe(0);
+
+      const unknown = buildMarketFeatures({
+        asOfMs: asOf, regime: null, regimeFamily: "UNKNOWN", benchmarkSymbol: "S0USDT",
+        symbols: Array.from({ length: 12 }, (_, i) => symbolInput(`S${i}USDT`, { asOfMs: asOf })),
+      });
+      expect(generateHypotheses({
+        market: unknown, cycleId: "c", atIso: "2026-08-06T00:00:00.000Z",
+        existingContentHashes: new Set(), existingGenerated: [],
+      }).generated.length).toBe(0);
+    });
+  });
+
+  // =========================================================================
+  // COVERAGE TRANSPARENCY
+  // =========================================================================
+  describe("coverage transparency", () => {
+    it("[COVERAGE] a partial scan reports the canonical universe, the exclusions, and never implies full coverage", async () => {
+      const dir = tmpDir();
+      const now = BASE + 200 * HOUR;
+      // 40 symbols in the universe; only some have enough history.
+      const universe = Array.from({ length: 40 }, (_, i) => `S${i}USDT`);
+      const store = new LiveEdgeDiggerStore(join(dir, "led.json"));
+      await runLiveEdgeDiggerCycle({
+        store, now,
+        resolveUniverse: async () => ({
+          symbols: universe,
+          perSymbolMeta: Object.fromEntries(universe.map((s) => [s, { quoteVolume24hUsd: 1e9, spreadBps: 2, openInterestUsd: 1e8 }])),
+        }),
+        getRegime: async () => ({ regime: "Bullish expansion", regimeFamily: "BULLISH" as const }),
+        fetchCandles: async (symbol: string, interval: string) => {
+          // Every 5th symbol has too little history — a real, itemisable exclusion.
+          const idx = Number(symbol.replace(/\D/g, ""));
+          const intervalMs = interval === "15m" ? 900_000 : HOUR;
+          const bars = interval === "15m" ? 8 : (idx % 5 === 0 ? 5 : 120);
+          return candles(bars, now - bars * intervalMs, 100, 0.001, intervalMs);
+        },
+        fetchFunding: async () => ({ fundingBps: 1, basisBps: null }),
+      });
+      const report = buildLiveEdgeDiggerReportFromStore(store, "2026-08-06T00:00:00.000Z");
+      const cov = report.coverage!;
+      expect(cov.canonicalUniverseSize).toBe(40);
+      // The engine cap means it never even looked at most of them, and that is stated as an ENGINE
+      // fact rather than a market one.
+      expect(cov.scannedSymbols).toBeLessThan(40);
+      expect(cov.excludedSymbols).toBeGreaterThan(0);
+      expect(cov.exclusionReasons.some((r) => r.reason.includes("LIVE_EDGE_DIGGER_MAX_SYMBOLS"))).toBe(true);
+      expect(cov.exclusionReasons.some((r) => r.reason.includes("insufficient hourly history"))).toBe(true);
+      // Missing features are itemised, not silently null.
+      expect(cov.featureGaps.some((g) => g.feature === "basisBps")).toBe(true);
+      expect(cov.cycleMs).not.toBeNull();
+      expect(cov.completedCandleWatermark).not.toBeNull();
+      // And the note refuses to let the number be read as full coverage.
+      expect(cov.coverageNote).toContain("NOT full-universe coverage");
+    });
+
+    it("[COVERAGE-PERSIST] coverage and generated rules survive a restart from disk", async () => {
+      const dir = tmpDir();
+      const now = BASE + 200 * HOUR;
+      const file = join(dir, "led.json");
+      const universe = Array.from({ length: 14 }, (_, i) => `S${i}USDT`);
+      const deps = (store: LiveEdgeDiggerStore) => ({
+        store, now,
+        resolveUniverse: async () => ({
+          symbols: universe,
+          perSymbolMeta: Object.fromEntries(universe.map((s) => [s, { quoteVolume24hUsd: 1e9, spreadBps: 2, openInterestUsd: 1e8 }])),
+        }),
+        getRegime: async () => ({ regime: "Bullish expansion", regimeFamily: "BULLISH" as const }),
+        fetchCandles: async (symbol: string, interval: string) => {
+          const intervalMs = interval === "15m" ? 900_000 : HOUR;
+          const bars = interval === "15m" ? 8 : 120;
+          const idx = Number(symbol.replace(/\D/g, ""));
+          return candles(bars, now - bars * intervalMs, 100, idx < 10 ? 0.003 : -0.001, intervalMs);
+        },
+        fetchFunding: async (s: string) => ({ fundingBps: Number(s.replace(/\D/g, "")) < 4 ? 6 : 1, basisBps: 2 }),
+      });
+      await runLiveEdgeDiggerCycle(deps(new LiveEdgeDiggerStore(file)));
+      const before = buildLiveEdgeDiggerReportFromStore(new LiveEdgeDiggerStore(file), "2026-08-06T00:00:00.000Z");
+
+      // A genuinely new store object over the same file — the restart path.
+      const after = buildLiveEdgeDiggerReportFromStore(new LiveEdgeDiggerStore(file), "2026-08-06T00:00:00.000Z");
+      expect(after.generation.generatedRuleCount).toBe(before.generation.generatedRuleCount);
+      expect(after.coverage!.canonicalUniverseSize).toBe(before.coverage!.canonicalUniverseSize);
+      expect(after.candidates.map((c) => c.candidate.candidateId))
+        .toEqual(before.candidates.map((c) => c.candidate.candidateId));
+      // Generated rules are reported separately from the seeds — never conflated.
+      expect(after.seedRuleCount).toBe(EDGE_RULE_FRONTIER.length);
+      expect(after.rulesEnumerated).toBe(EDGE_RULE_FRONTIER.length + after.generation.generatedRuleCount);
+    });
+
+    it("[GEN-FROZEN-BEFORE-OBSERVATION] every generated rule is frozen at or before its first observation", async () => {
+      const dir = tmpDir();
+      const now = BASE + 200 * HOUR;
+      const file = join(dir, "led.json");
+      const universe = Array.from({ length: 14 }, (_, i) => `S${i}USDT`);
+      const store = new LiveEdgeDiggerStore(file);
+      await runLiveEdgeDiggerCycle({
+        store, now,
+        resolveUniverse: async () => ({
+          symbols: universe,
+          perSymbolMeta: Object.fromEntries(universe.map((s) => [s, { quoteVolume24hUsd: 1e9, spreadBps: 2, openInterestUsd: 1e8 }])),
+        }),
+        getRegime: async () => ({ regime: "Bullish expansion", regimeFamily: "BULLISH" as const }),
+        fetchCandles: async (symbol: string, interval: string) => {
+          const intervalMs = interval === "15m" ? 900_000 : HOUR;
+          const bars = interval === "15m" ? 8 : 120;
+          const idx = Number(symbol.replace(/\D/g, ""));
+          return candles(bars, now - bars * intervalMs, 100, idx < 10 ? 0.003 : -0.001, intervalMs);
+        },
+        fetchFunding: async (s: string) => ({ fundingBps: Number(s.replace(/\D/g, "")) < 4 ? 6 : 1, basisBps: 2 }),
+      });
+      const report = buildLiveEdgeDiggerReportFromStore(store, "2026-08-06T00:00:00.000Z");
+      for (const c of report.candidates) {
+        // Whatever the lifecycle, no candidate may hold evidence that predates its own freeze.
+        expect(c.freezeIntegrity.rowsOpenedBeforeFreeze).toBe(0);
+        if (c.rawRows > 0) expect(c.freezeIntegrity.ok).toBe(true);
+      }
+      // Generated rules are persisted even when they never fire — the multiple-testing denominator
+      // must count what was really tried, not only what happened to trigger.
+      for (const g of report.generation.rules) {
+        expect(report.candidates.some((c) => c.candidate.candidateId === g.candidateId)).toBe(true);
+      }
     });
   });
 });

@@ -1196,9 +1196,14 @@ interface LiveEdgeDiscoveryCandidate {
   bootstrap: { clusters: number; lowerBound95: number | null; upperBound95: number | null };
   partitions: { partition: string; rows: number; episodes: number; netExpectancyR: number | null }[];
   gates: { id: string; label: string; current: number | null; required: number; comparator: string; pass: boolean }[];
-  decision: 'CANDIDATE' | 'REJECT';
+  /** Six-state lifecycle. `decision` (CANDIDATE|REJECT) is the pre-2026-08-06 shape, kept only so an
+   *  instance still running the old build renders instead of blanking. */
+  lifecycle?: 'DORMANT' | 'OPEN' | 'COLLECTING' | 'REJECTED' | 'CANDIDATE' | 'RECOMMENDED_FOR_3102_REVIEW';
+  lifecycleReason?: string;
+  decision?: 'CANDIDATE' | 'REJECT';
   rejectionReasons: string[];
   evidenceStillNeeded: string[];
+  multipleTesting?: { attemptsTotal: number; cyclesEvaluated: number; cyclesFired: number; note: string };
 }
 
 interface LiveEdgeDiscoveryReport {
@@ -1209,9 +1214,30 @@ interface LiveEdgeDiscoveryReport {
     universeSize: number | null; regime: string | null; regimeFamily: string | null;
     breadth: number | null; cohesion: number | null; dispersion: number | null;
   };
+  /** Search coverage. Deliberately separate from scanner.universeSize, which is only what was
+   *  SCANNED — rendering that as the universe presented a 21-of-N search as full coverage. */
+  coverage?: {
+    canonicalUniverseSize: number | null;
+    scannedSymbols: number | null;
+    excludedSymbols: number | null;
+    exclusionReasons: { reason: string; count: number }[];
+    featureGaps: { feature: string; missing: number }[];
+    cycleMs: number | null;
+    completedCandleWatermark: string | null;
+    coverageNote: string;
+  } | null;
+  generation?: {
+    generatedRuleCount: number;
+    rules: { candidateId: string; ruleId: string; title: string; thesis: string; generatedAt: string; originObservation: string }[];
+    suppressed: { reason: string; detail: string }[];
+    caps: { perCycle: number; perDay: number; totalActive: number; maxPredicates: number };
+    note: string;
+  };
   attemptRegistry: { ruleId: string; cyclesEvaluated: number; cyclesFired: number; observationsEmitted: number }[];
   rulesEnumerated: number;
+  seedRuleCount?: number;
   candidates: LiveEdgeDiscoveryCandidate[];
+  lifecycleCounts?: Record<string, number>;
   bestCandidateId: string | null;
   recommendation: string | null;
   verdict: 'NO_PROVEN_EDGE_YET' | 'CANDIDATE_READY_FOR_HUMAN_REVIEW';
@@ -2050,13 +2076,44 @@ export default function NeuralMindmap() {
                 It can recommend, never enable.
               </p>
               <small>
-                cycles {edgeDiscovery.scanner.cyclesRun} · universe {edgeDiscovery.scanner.universeSize ?? 'n/a'}
+                cycles {edgeDiscovery.scanner.cyclesRun}
+                {/* COVERAGE, not "universe": scanned-of-canonical, so a partial search can never read
+                    as full-market coverage. Falls back to the old field only on an older instance. */}
+                {edgeDiscovery.coverage?.canonicalUniverseSize != null
+                  ? ` · scanned ${edgeDiscovery.coverage.scannedSymbols ?? '?'}/${edgeDiscovery.coverage.canonicalUniverseSize} symbols (${edgeDiscovery.coverage.excludedSymbols ?? 0} excluded)`
+                  : ` · scanned ${edgeDiscovery.scanner.universeSize ?? 'n/a'} symbols (canonical universe not reported)`}
                 {' '}· regime {edgeDiscovery.scanner.regime ?? 'n/a'} ({edgeDiscovery.scanner.regimeFamily ?? 'n/a'})
                 {' '}· breadth {fmtNumber(edgeDiscovery.scanner.breadth)} · cohesion {fmtNumber(edgeDiscovery.scanner.cohesion)}
                 {' '}· dispersion {fmtNumber(edgeDiscovery.scanner.dispersion, 4)}
+                {edgeDiscovery.coverage?.cycleMs != null ? ` · cycle ${edgeDiscovery.coverage.cycleMs}ms` : ''}
+                {edgeDiscovery.coverage?.completedCandleWatermark
+                  ? ` · candles closed through ${edgeDiscovery.coverage.completedCandleWatermark.slice(0, 16).replace('T', ' ')}Z`
+                  : ''}
                 {edgeDiscovery.scanner.lastCycleAt ? ` · last cycle ${edgeDiscovery.scanner.lastCycleAt.slice(0, 19).replace('T', ' ')}Z` : ' · never run'}
                 {edgeDiscovery.scanner.lastError ? ` · ERROR ${edgeDiscovery.scanner.lastError}` : ''}
               </small>
+              {edgeDiscovery.coverage?.coverageNote && (
+                <p className="neural-evidence-gate-blockers">{edgeDiscovery.coverage.coverageNote}</p>
+              )}
+              {edgeDiscovery.lifecycleCounts && (
+                <small>
+                  lifecycle:{' '}
+                  {(['DORMANT', 'OPEN', 'COLLECTING', 'REJECTED', 'CANDIDATE', 'RECOMMENDED_FOR_3102_REVIEW'] as const)
+                    .map((k) => `${k} ${edgeDiscovery.lifecycleCounts?.[k] ?? 0}`)
+                    .join(' · ')}
+                  {edgeDiscovery.seedRuleCount != null
+                    ? ` · rules ${edgeDiscovery.rulesEnumerated} (${edgeDiscovery.seedRuleCount} seed + ${edgeDiscovery.generation?.generatedRuleCount ?? 0} generated)`
+                    : ''}
+                </small>
+              )}
+              {edgeDiscovery.generation && edgeDiscovery.generation.generatedRuleCount > 0 && (
+                <p className="neural-evidence-gate-blockers">
+                  Generated from live structure (caps {edgeDiscovery.generation.caps.perCycle}/cycle,{' '}
+                  {edgeDiscovery.generation.caps.perDay}/day, {edgeDiscovery.generation.caps.totalActive} active):{' '}
+                  {edgeDiscovery.generation.rules.slice(0, 4).map((r) => r.ruleId).join(', ')}
+                  {edgeDiscovery.generation.rules.length > 4 ? ` +${edgeDiscovery.generation.rules.length - 4} more` : ''}
+                </p>
+              )}
             </div>
 
             <div className="neural-evidence-version-list">
@@ -2072,10 +2129,19 @@ export default function NeuralMindmap() {
                       <div className="neural-evidence-version-head">
                         <span>{c.candidate.title}</span>
                         <strong>{c.candidate.candidateId}</strong>
-                        <span className={`neural-cutover-source-badge source-${c.decision === 'CANDIDATE' ? 'canonical' : 'inferred'}`}>
-                          {c.decision}
+                        <span className={`neural-cutover-source-badge source-${
+                          // Only a real disqualification or a real pass gets a strong colour. DORMANT/
+                          // OPEN/COLLECTING are states of the EVIDENCE, not verdicts on the rule, and
+                          // must not read as one — that conflation was the original defect.
+                          (c.lifecycle ?? c.decision) === 'CANDIDATE' || c.lifecycle === 'RECOMMENDED_FOR_3102_REVIEW'
+                            ? 'canonical' : 'inferred'}`}
+                        >
+                          {c.lifecycle ?? c.decision ?? 'UNKNOWN'}
                         </span>
                       </div>
+                      {c.lifecycleReason && (
+                        <p className="neural-evidence-gate-blockers">Why: {c.lifecycleReason}</p>
+                      )}
                       <div className="neural-evidence-gate-metrics">
                         <div><span>Rule frozen at</span>
                           <strong className={c.freezeIntegrity.ok ? 'tone-healthy' : 'tone-critical'}>

@@ -44,6 +44,12 @@ import {
   type EdgeRule,
 } from "./live-edge-digger-grammar.js";
 import type { Direction, MarketFeatures, SymbolFeatures } from "./live-edge-digger-types.js";
+import {
+  MAX_ACTIVE_GENERATED,
+  MAX_GENERATED_PER_CYCLE,
+  MAX_GENERATED_PER_DAY,
+  MAX_GENERATED_PREDICATES,
+} from "./live-edge-digger-hypotheses.js";
 import type { Candle } from "@dtc/shared";
 
 export const LIVE_EDGE_DIGGER_VERSION = "live-edge-digger-v1" as const;
@@ -529,6 +535,36 @@ function gate(
   return { id, label, current, required, comparator, pass, source };
 }
 
+/**
+ * The candidate's position in the discovery lifecycle.
+ *
+ * WHY THIS REPLACED A BOOLEAN. The engine previously reported `CANDIDATE | REJECT` and pushed
+ * "no resolved forward evidence yet" into the same `rejectionReasons` list as a genuine economic
+ * failure. Every rule therefore read REJECT from its very first cycle — before a single outcome
+ * existed — which is the one conclusion the evidence could not support. A rule that has never fired
+ * and a rule that fired and lost are opposite findings; collapsing them into one word destroyed the
+ * only thing a discovery scanner is for.
+ *
+ * The states are ordered by how much is known, and only ONE of them is a verdict against the rule:
+ *  - DORMANT   — evaluated, never fired. Says something about the MARKET (these conditions have not
+ *                occurred), nothing about the rule's edge.
+ *  - OPEN      — fired; every observation is still unresolved. Outcomes are not yet knowable.
+ *  - COLLECTING— has resolved evidence, still short of the canonical floors. Includes POSITIVE
+ *                provisional results: a good-looking mean on 2 episodes is not a finding.
+ *  - REJECTED  — a real, evidence-backed disqualification (integrity broken, or the economics/
+ *                statistics failed on a population large enough to say so). Never assigned for
+ *                absence of evidence.
+ *  - CANDIDATE — every canonical gate passes.
+ *  - RECOMMENDED_FOR_3102_REVIEW — the engine's MAXIMUM output. A human decides; nothing auto-enables.
+ */
+export type CandidateLifecycle =
+  | "DORMANT"
+  | "OPEN"
+  | "COLLECTING"
+  | "REJECTED"
+  | "CANDIDATE"
+  | "RECOMMENDED_FOR_3102_REVIEW";
+
 export interface CandidateReport {
   readonly candidate: FrozenCandidate;
   readonly rawRows: number;
@@ -552,9 +588,24 @@ export interface CandidateReport {
   readonly comparisons: readonly { label: string; netExpectancyR: number | null; beatsCandidate: boolean }[];
   readonly gates: readonly EdgeGate[];
   readonly freezeIntegrity: FreezeIntegrity;
-  readonly decision: "CANDIDATE" | "REJECT";
+  readonly lifecycle: CandidateLifecycle;
+  /** One sentence naming the BINDING fact behind `lifecycle` — never a list to interpret. */
+  readonly lifecycleReason: string;
+  /**
+   * Disqualifying findings ONLY: integrity breaks, and economics/statistics that failed on a
+   * population large enough to conclude from. An empty list here with a non-CANDIDATE lifecycle
+   * means "not yet known", which is the normal early state and is never a mark against the rule.
+   */
   readonly rejectionReasons: readonly string[];
+  /** What must still ACCUMULATE. Immaturity lives here, never in `rejectionReasons`. */
   readonly evidenceStillNeeded: readonly string[];
+  /** Multiple-testing context: how many rules were tested for this one to be reported. */
+  readonly multipleTesting: {
+    readonly attemptsTotal: number;
+    readonly cyclesEvaluated: number;
+    readonly cyclesFired: number;
+    readonly note: string;
+  };
 }
 
 /**
@@ -629,9 +680,24 @@ function splitBy(
     .sort((a, b) => (a.key < b.key ? -1 : 1));
 }
 
+/**
+ * The smallest independent-episode population this engine is willing to call a LOSS on.
+ *
+ * Rejecting on fewer would discard rules for being unlucky in their first look or two — the classic
+ * way a discovery process destroys its own frontier before it has learned anything, and the mirror
+ * of the mistake this whole file exists to prevent (concluding from too few independent draws). Set
+ * at STABLE_MIN_HOLDOUT_EFFECTIVE_N: the same number the canonical machinery already considers the
+ * minimum for an out-of-sample statement in either direction.
+ *
+ * Below this, an ugly-looking expectancy is reported as COLLECTING with the shortfall named — never
+ * as REJECTED. Freeze-integrity failures are exempt: those are structural, not statistical.
+ */
+export const MIN_EPISODES_TO_JUDGE = STABLE_MIN_HOLDOUT_EFFECTIVE_N;
+
 export function buildCandidateReport(
   candidate: FrozenCandidate,
   allRows: readonly ShadowObservation[],
+  attemptContext?: { attemptsTotal: number; cyclesEvaluated: number; cyclesFired: number },
 ): CandidateReport {
   const rows = allRows.filter((r) => r.candidateId === candidate.candidateId);
   const resolved = rows.filter((r) => r.status !== "OPEN" && typeof r.netR === "number");
@@ -693,43 +759,61 @@ export function buildCandidateReport(
     gate("pf", "Profit factor", metrics.pf, PF_FLOOR, ">=", "PF_FLOOR"),
   ];
 
+  // ── DISQUALIFICATIONS ────────────────────────────────────────────────────────────────────────
+  // Every entry below is a POSITIVE finding against the rule, backed by evidence that exists. The
+  // absence of evidence is deliberately not representable here — it belongs in evidenceStillNeeded.
+  //
+  // The economic/statistical tests additionally require a minimum population before they may
+  // conclude anything: an expectancy computed on one or two episodes is noise, and rejecting on it
+  // would discard rules for having been unlucky early, which is the classic way a discovery process
+  // destroys its own frontier. MIN_EPISODES_TO_JUDGE is the smallest population this file is willing
+  // to call a loss on.
   const rejectionReasons: string[] = [];
-  if (resolved.length === 0) rejectionReasons.push("no resolved forward evidence yet");
-  if (metrics.netExpectancyR !== null && metrics.netExpectancyR <= 0) {
-    rejectionReasons.push(`after-cost expectancy ${metrics.netExpectancyR.toFixed(4)}R <= 0`);
-  }
-  if (metrics.pf !== null && metrics.pf <= PF_FLOOR) {
-    rejectionReasons.push(`PF ${metrics.pf.toFixed(3)} <= ${PF_FLOOR}`);
-  }
-  if (bootstrap.lowerBound95 !== null && bootstrap.lowerBound95 <= 0) {
-    rejectionReasons.push(`clustered 95% lower bound ${bootstrap.lowerBound95.toFixed(4)}R <= 0`);
-  }
-  if (bootstrap.lowerBound95 === null && resolved.length > 0) {
-    rejectionReasons.push(`clustered interval undefined (${bootstrap.clusters} independent episode(s))`);
-  }
-  if (topSymbolShare !== null && topSymbolShare > MAX_TOP_SYMBOL_SHARE) {
-    rejectionReasons.push(`concentration: top-symbol share ${topSymbolShare} > ${MAX_TOP_SYMBOL_SHARE}`);
-  }
-  // Split instability: DEV and VALIDATION disagreeing in SIGN means the result is regime-specific,
-  // not an edge. Only meaningful once both sides actually have evidence.
-  if (dev.netExpectancyR !== null && val.netExpectancyR !== null &&
-      Math.sign(dev.netExpectancyR) !== Math.sign(val.netExpectancyR)) {
-    rejectionReasons.push("unstable splits: DEV and validation/OOS expectancy disagree in sign");
-  }
-  if (comparisons[0]!.beatsCandidate) rejectionReasons.push("NO_TRADE (flat) beats the candidate after cost");
-  // Evidence gathered under a rule that cannot be shown to have been frozen first is not forward
-  // evidence at all, however good it looks. This is checked BEFORE the numeric gates matter.
+
+  // Freeze integrity is the ONE disqualification that does not need a large sample: evidence
+  // gathered under a rule that cannot be shown to have been frozen first is not forward evidence at
+  // all, however good or bad it looks.
   const freezeIntegrity = checkFreezeIntegrity(candidate, rows);
   if (!freezeIntegrity.ok) rejectionReasons.push(`freeze integrity: ${freezeIntegrity.note}`);
-  for (const g of gates) {
-    if (!g.pass) {
+
+  const judgeable = episodes >= MIN_EPISODES_TO_JUDGE;
+  if (judgeable) {
+    if (metrics.netExpectancyR !== null && metrics.netExpectancyR <= 0) {
       rejectionReasons.push(
-        `gate ${g.id}: ${g.current === null ? "not computable" : `${g.current} ${g.comparator === "<=" ? ">" : "<"} ${g.required}`}`,
+        `after-cost expectancy ${metrics.netExpectancyR.toFixed(4)}R <= 0 over ${episodes} independent episodes`,
       );
+    }
+    if (metrics.pf !== null && metrics.pf <= PF_FLOOR) {
+      rejectionReasons.push(`PF ${metrics.pf.toFixed(3)} <= ${PF_FLOOR} over ${episodes} independent episodes`);
+    }
+    if (bootstrap.lowerBound95 !== null && bootstrap.lowerBound95 <= 0) {
+      rejectionReasons.push(`clustered 95% lower bound ${bootstrap.lowerBound95.toFixed(4)}R <= 0`);
+    }
+    if (topSymbolShare !== null && topSymbolShare > MAX_TOP_SYMBOL_SHARE) {
+      rejectionReasons.push(`concentration: top-symbol share ${topSymbolShare} > ${MAX_TOP_SYMBOL_SHARE}`);
+    }
+    // Split instability: DEV and VALIDATION disagreeing in SIGN means the result is regime-specific,
+    // not an edge. Only meaningful once BOTH sides have their own real evidence — a partition that
+    // is merely empty must never be read as disagreement.
+    if (dev.netExpectancyR !== null && val.netExpectancyR !== null &&
+        dev.rows > 0 && val.rows > 0 &&
+        Math.sign(dev.netExpectancyR) !== Math.sign(val.netExpectancyR)) {
+      rejectionReasons.push("unstable splits: DEV and validation/OOS expectancy disagree in sign");
     }
   }
 
   const evidenceStillNeeded: string[] = [];
+  if (resolved.length > 0 && !judgeable) {
+    evidenceStillNeeded.push(
+      `${MIN_EPISODES_TO_JUDGE - episodes} more independent episode(s) before economics may be judged ` +
+        `(have ${episodes}; an expectancy on fewer is noise)`,
+    );
+  }
+  if (bootstrap.lowerBound95 === null && resolved.length > 0) {
+    evidenceStillNeeded.push(
+      `a clustered confidence interval is not yet computable (${bootstrap.clusters} independent episode(s))`,
+    );
+  }
   if (dev.episodes < STABLE_MIN_EFFECTIVE_N) {
     evidenceStillNeeded.push(`${STABLE_MIN_EFFECTIVE_N - dev.episodes} more independent DEV episodes (have ${dev.episodes})`);
   }
@@ -741,6 +825,37 @@ export function buildCandidateReport(
   }
   if (rows.length > 0 && resolved.length < rows.length) {
     evidenceStillNeeded.push(`${rows.length - resolved.length} shadow position(s) still open — outcomes not yet knowable`);
+  }
+  if (rows.length === 0) {
+    evidenceStillNeeded.push("the rule's entry conditions have not occurred in the live market yet");
+  }
+
+  // ── LIFECYCLE ────────────────────────────────────────────────────────────────────────────────
+  // Ordered most-conclusive first. Only a non-empty `rejectionReasons` — which by construction can
+  // only be populated by evidence that EXISTS — can produce REJECTED.
+  const allGatesPass = gates.every((g) => g.pass);
+  let lifecycle: CandidateLifecycle;
+  let lifecycleReason: string;
+  if (rejectionReasons.length > 0) {
+    lifecycle = "REJECTED";
+    lifecycleReason = rejectionReasons[0]!;
+  } else if (allGatesPass && judgeable) {
+    // CANDIDATE is as far as this function goes. The promotion to RECOMMENDED_FOR_3102_REVIEW is
+    // made once per report (only the single best candidate is ever recommended), never per-row.
+    lifecycle = "CANDIDATE";
+    lifecycleReason = "every canonical gate passes on frozen, after-cost forward evidence";
+  } else if (resolved.length > 0) {
+    lifecycle = "COLLECTING";
+    lifecycleReason = metrics.netExpectancyR !== null && metrics.netExpectancyR > 0
+      // Said explicitly, because this is exactly where a discovery engine talks itself into a result.
+      ? `provisionally positive (${metrics.netExpectancyR.toFixed(4)}R over ${episodes} episode(s)) but below the canonical floors — not a finding yet`
+      : `${resolved.length} resolved observation(s) over ${episodes} independent episode(s); canonical floors not yet met`;
+  } else if (rows.length > 0) {
+    lifecycle = "OPEN";
+    lifecycleReason = `${rows.length} shadow observation(s) open; no outcome is knowable yet`;
+  } else {
+    lifecycle = "DORMANT";
+    lifecycleReason = "evaluated every cycle; the rule's conditions have not occurred in the live market yet";
   }
 
   return {
@@ -766,9 +881,18 @@ export function buildCandidateReport(
     },
     comparisons,
     gates,
-    decision: rejectionReasons.length === 0 ? "CANDIDATE" : "REJECT",
+    lifecycle,
+    lifecycleReason,
     rejectionReasons,
     evidenceStillNeeded,
+    multipleTesting: {
+      attemptsTotal: attemptContext?.attemptsTotal ?? 0,
+      cyclesEvaluated: attemptContext?.cyclesEvaluated ?? 0,
+      cyclesFired: attemptContext?.cyclesFired ?? 0,
+      note:
+        "This candidate is one of many rules under simultaneous test. Read any single positive " +
+        "result against the total attempt count — the best of N tries is expected to look good.",
+    },
   };
 }
 
@@ -814,10 +938,47 @@ export interface LiveEdgeDiggerReport {
     readonly cohesion: number | null;
     readonly dispersion: number | null;
   };
+  /**
+   * Search coverage. Separate from `scanner.universeSize` because that field is what the cycle
+   * SCANNED, and reporting it as the universe let a 21-of-N search present as full-market coverage.
+   * Null before the first cycle written by a build that records it.
+   */
+  readonly coverage: {
+    readonly canonicalUniverseSize: number | null;
+    readonly scannedSymbols: number | null;
+    readonly excludedSymbols: number | null;
+    readonly exclusionReasons: readonly { reason: string; count: number }[];
+    readonly featureGaps: readonly { feature: string; missing: number }[];
+    readonly cycleMs: number | null;
+    readonly completedCandleWatermark: string | null;
+    /** Explicit, so no reader has to infer it from two numbers. */
+    readonly coverageNote: string;
+  } | null;
+  /** Hypotheses this engine proposed from live structure, and what it refused to propose. */
+  readonly generation: {
+    readonly generatedRuleCount: number;
+    readonly rules: readonly {
+      readonly candidateId: string;
+      readonly ruleId: string;
+      readonly title: string;
+      readonly thesis: string;
+      readonly generatedAt: string;
+      readonly originCycleId: string;
+      readonly originObservation: string;
+    }[];
+    readonly suppressed: readonly { reason: string; detail: string }[];
+    readonly caps: { perCycle: number; perDay: number; totalActive: number; maxPredicates: number };
+    readonly note: string;
+  };
   /** Multiple-testing control: EVERY rule ever enumerated, fired or not. */
   readonly attemptRegistry: readonly AttemptRegistryEntry[];
   readonly rulesEnumerated: number;
+  /** Split of `rulesEnumerated` so the seed frontier and generated rules are never conflated. */
+  readonly seedRuleCount: number;
   readonly candidates: readonly CandidateReport[];
+  /** Headline lifecycle census. With zero resolved outcomes this must read as DORMANT + OPEN only —
+   *  any REJECTED here means a real disqualification was found, never an absence of evidence. */
+  readonly lifecycleCounts: Record<CandidateLifecycle, number>;
   readonly bestCandidateId: string | null;
   /** null until a candidate passes every canonical gate. */
   readonly recommendation: string | null;
@@ -831,8 +992,26 @@ export function buildLiveEdgeDiggerReport(input: {
   attempts: readonly AttemptRegistryEntry[];
   scanner: LiveEdgeDiggerReport["scanner"];
   frontier?: readonly EdgeRule[];
+  coverage?: {
+    canonicalUniverseSize: number | null;
+    scannedSymbols: number | null;
+    excludedSymbols: number | null;
+    exclusionReasons: readonly { reason: string; count: number }[];
+    featureGaps: readonly { feature: string; missing: number }[];
+    cycleMs: number | null;
+    completedCandleWatermark: string | null;
+  } | null;
+  generatedRules?: readonly {
+    candidateId: string;
+    generatedAt: string;
+    originCycleId: string;
+    originObservation: string;
+    rule: EdgeRule;
+  }[];
+  suppressedProposals?: readonly { reason: string; detail: string }[];
 }): LiveEdgeDiggerReport {
   const frontier = input.frontier ?? EDGE_RULE_FRONTIER;
+  const generatedRules = input.generatedRules ?? [];
   // The freeze anchor is READ from the persisted registry, never minted here. Keyed by candidateId
   // (rule id + content hash) so editing a threshold starts a new clock instead of inheriting the
   // previous rule's history.
@@ -844,13 +1023,17 @@ export function buildLiveEdgeDiggerReport(input: {
       const source: FrozenAtSource = frozenAt !== null
         ? "FIRST_EVALUATED"
         : entry === undefined ? "NOT_YET_EVALUATED" : "UNKNOWN_PRE_MIGRATION";
-      return buildCandidateReport(freezeCandidate(rule, frozenAt, 1, source), input.observations);
+      return buildCandidateReport(freezeCandidate(rule, frozenAt, 1, source), input.observations, {
+        attemptsTotal: input.attempts.length,
+        cyclesEvaluated: entry?.cyclesEvaluated ?? 0,
+        cyclesFired: entry?.cyclesFired ?? 0,
+      });
     })
     // Report every rule, including ones with zero evidence — a rule that never fired is itself a
     // finding, and hiding it would understate the number of tests run.
     .sort((a, b) => b.independentEpisodes - a.independentEpisodes);
 
-  const passing = candidates.filter((c) => c.decision === "CANDIDATE");
+  const passing = candidates.filter((c) => c.lifecycle === "CANDIDATE");
   // Ranking is by ROBUST FORWARD EVIDENCE — the clustered lower bound, not headline PnL. A high mean
   // on two correlated episodes must never outrank a modest mean on many independent ones.
   const ranked = passing.slice().sort((a, b) => {
@@ -860,15 +1043,74 @@ export function buildLiveEdgeDiggerReport(input: {
   });
   const best = ranked[0] ?? null;
 
+  // Only the single best candidate is ever promoted to the engine's maximum output, and even that is
+  // a REQUEST for human review — nothing here enables anything. Every other passing candidate stays
+  // CANDIDATE so the report cannot read as a slate of recommendations.
+  const withRecommendation = best
+    ? candidates.map((c): CandidateReport =>
+        c.candidate.candidateId === best.candidate.candidateId
+          ? {
+              ...c,
+              lifecycle: "RECOMMENDED_FOR_3102_REVIEW",
+              lifecycleReason:
+                "highest clustered lower bound among candidates passing every canonical gate — " +
+                "submitted for human review; this engine cannot enable it",
+            }
+          : c,
+      )
+    : candidates;
+
+  const lifecycleCounts = withRecommendation.reduce<Record<CandidateLifecycle, number>>(
+    (acc, c) => { acc[c.lifecycle] += 1; return acc; },
+    { DORMANT: 0, OPEN: 0, COLLECTING: 0, REJECTED: 0, CANDIDATE: 0, RECOMMENDED_FOR_3102_REVIEW: 0 },
+  );
+
   return {
     version: LIVE_EDGE_DIGGER_VERSION,
     generatedAt: input.generatedAt,
     reportOnly: true,
     liveBlocked: true,
     scanner: input.scanner,
+    coverage: input.coverage
+      ? {
+          ...input.coverage,
+          coverageNote:
+            input.coverage.canonicalUniverseSize !== null && input.coverage.scannedSymbols !== null
+              ? `Searched ${input.coverage.scannedSymbols} of ${input.coverage.canonicalUniverseSize} ` +
+                `universe symbols (${input.coverage.excludedSymbols ?? 0} excluded). Findings describe ` +
+                "the scanned subset only — this is NOT full-universe coverage."
+              : "Coverage accounting not yet recorded by a completed cycle.",
+        }
+      : null,
+    generation: {
+      generatedRuleCount: generatedRules.length,
+      rules: generatedRules.map((g) => ({
+        candidateId: g.candidateId,
+        ruleId: g.rule.ruleId,
+        title: g.rule.title,
+        thesis: g.rule.thesis,
+        generatedAt: g.generatedAt,
+        originCycleId: g.originCycleId,
+        originObservation: g.originObservation,
+      })),
+      suppressed: input.suppressedProposals ?? [],
+      caps: {
+        perCycle: MAX_GENERATED_PER_CYCLE,
+        perDay: MAX_GENERATED_PER_DAY,
+        totalActive: MAX_ACTIVE_GENERATED,
+        maxPredicates: MAX_GENERATED_PREDICATES,
+      },
+      note:
+        "Generated from decision-time market structure only — no resolved outcome, MFE/MAE, realized " +
+        "cost or future candle is reachable from the generator. Each is frozen by content hash at " +
+        "first evaluation, before it can emit a single observation, and counts toward the same " +
+        "multiple-testing denominator as the seed rules.",
+    },
     attemptRegistry: input.attempts,
     rulesEnumerated: frontier.length,
-    candidates,
+    seedRuleCount: EDGE_RULE_FRONTIER.length,
+    candidates: withRecommendation,
+    lifecycleCounts,
     bestCandidateId: best?.candidate.candidateId ?? null,
     recommendation: best
       ? `Bounded 3102 (testnet) experiment for ${best.candidate.candidateId} — HUMAN REVIEW REQUIRED. ` +

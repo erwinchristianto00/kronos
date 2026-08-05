@@ -24,6 +24,8 @@ import {
 } from "./live-edge-digger.js";
 import { buildMarketFeatures, type SymbolCycleInput } from "./live-edge-digger-features.js";
 import type { RegimeFamily } from "./live-edge-digger-types.js";
+import { EDGE_RULE_FRONTIER, ruleContentHash, type EdgeRule } from "./live-edge-digger-grammar.js";
+import { generateHypotheses, type GeneratedRuleRecord } from "./live-edge-digger-hypotheses.js";
 
 /** Bounds the per-cycle API cost. The universe resolver returns up to 60 symbols; ranking quality
  *  barely improves past ~30 and every extra symbol is another premium-index call every 7 minutes. */
@@ -38,10 +40,40 @@ const BENCHMARK_SYMBOL = "BTCUSDT";
 // Store — report-only, atomic write, corrupt file starts empty.
 // ---------------------------------------------------------------------------
 
+/**
+ * Per-cycle coverage accounting.
+ *
+ * WHY IT IS SEPARATE FROM `lastUniverseSize`. That field is the count of symbols the cycle actually
+ * BUILT FEATURES FOR, and it was being reported to the dashboard as "universeSize" — so a run that
+ * scanned 21 of several hundred tradable symbols presented as if it had covered the market. A
+ * discovery engine that silently searches 7% of the universe and reports full coverage is making a
+ * claim it did not test. Every number below is recorded so the gap is visible rather than implied.
+ */
+interface CoverageMeta {
+  /** Symbols the universe resolver returned BEFORE this engine's own cap was applied. */
+  canonicalUniverseSize: number | null;
+  /** Symbols features were successfully built for — the real search width. */
+  scannedSymbols: number | null;
+  /** canonicalUniverseSize - scannedSymbols, itemised below. */
+  excludedSymbols: number | null;
+  /** Exclusion counts by cause, so "we only scanned 21" is always attributable. */
+  exclusionReasons: { reason: string; count: number }[];
+  /** Symbols dropped for missing/stale inputs, by feature. */
+  featureGaps: { feature: string; missing: number }[];
+  /** Wall-clock cost of the cycle. A scanner that silently got slower is a scanner covering less. */
+  cycleMs: number | null;
+  /** Newest CLOSED candle any symbol contributed — the decision-time watermark. */
+  completedCandleWatermark: string | null;
+}
+
 interface StoreState {
   version: 1;
   observations: ShadowObservation[];
   attempts: Record<string, AttemptRegistryEntry>;
+  /** Generated hypotheses, persisted so they survive restart and keep their freeze anchors. */
+  generated: GeneratedRuleRecord[];
+  /** Proposals refused by caps/dedup this cycle — reported, never silently dropped. */
+  lastSuppressed: { reason: string; detail: string }[];
   cycleMeta: {
     lastCycleAt: string | null;
     cycles: number;
@@ -54,17 +86,26 @@ interface StoreState {
     lastBreadth: number | null;
     lastCohesion: number | null;
     lastDispersion: number | null;
+    coverage: CoverageMeta;
   };
 }
+
+const emptyCoverage = (): CoverageMeta => ({
+  canonicalUniverseSize: null, scannedSymbols: null, excludedSymbols: null,
+  exclusionReasons: [], featureGaps: [], cycleMs: null, completedCandleWatermark: null,
+});
 
 const emptyState = (): StoreState => ({
   version: 1,
   observations: [],
   attempts: {},
+  generated: [],
+  lastSuppressed: [],
   cycleMeta: {
     lastCycleAt: null, cycles: 0, recordedTotal: 0, resolvedTotal: 0, lastCycleError: null,
     lastUniverseSize: null, lastRegime: null, lastRegimeFamily: null,
     lastBreadth: null, lastCohesion: null, lastDispersion: null,
+    coverage: emptyCoverage(),
   },
 });
 
@@ -108,7 +149,15 @@ export class LiveEdgeDiggerStore {
           version: 1,
           observations: Array.isArray(parsed.observations) ? parsed.observations : [],
           attempts: migrateAttempts(parsed.attempts),
-          cycleMeta: { ...emptyState().cycleMeta, ...(parsed.cycleMeta ?? {}) },
+          // Generated rules survive restart with their identities intact; a store written before
+          // generation existed simply has none, which is the correct empty state, not a migration.
+          generated: Array.isArray(parsed.generated) ? parsed.generated : [],
+          lastSuppressed: Array.isArray(parsed.lastSuppressed) ? parsed.lastSuppressed : [],
+          cycleMeta: {
+            ...emptyState().cycleMeta,
+            ...(parsed.cycleMeta ?? {}),
+            coverage: { ...emptyCoverage(), ...(parsed.cycleMeta?.coverage ?? {}) },
+          },
         };
       }
     } catch {
@@ -121,6 +170,26 @@ export class LiveEdgeDiggerStore {
   get all(): readonly ShadowObservation[] { return this.state.observations; }
   get attempts(): readonly AttemptRegistryEntry[] { return Object.values(this.state.attempts); }
   get cycleMeta(): StoreState["cycleMeta"] { return this.state.cycleMeta; }
+  get generated(): readonly GeneratedRuleRecord[] { return this.state.generated; }
+  get lastSuppressed(): readonly { reason: string; detail: string }[] { return this.state.lastSuppressed; }
+
+  /** Appends newly generated hypotheses. Append-only by content hash: a rule already present is
+   *  never re-added, so its freeze anchor and attempt history cannot be restarted. */
+  addGenerated(records: readonly GeneratedRuleRecord[]): number {
+    const known = new Set(this.state.generated.map((g) => g.candidateId));
+    let added = 0;
+    for (const r of records) {
+      if (known.has(r.candidateId)) continue;
+      known.add(r.candidateId);
+      this.state.generated.push(r);
+      added += 1;
+    }
+    return added;
+  }
+
+  recordSuppressed(entries: readonly { reason: string; detail: string }[]): void {
+    this.state.lastSuppressed = [...entries];
+  }
   has(observationId: string): boolean {
     return this.state.observations.some((o) => o.observationId === observationId);
   }
@@ -226,6 +295,8 @@ export interface LiveEdgeDiggerCycleResult {
   readonly emitted: number;
   readonly resolved: number;
   readonly stillOpen: number;
+  /** New hypotheses generated this cycle (0 on most cycles — the caps make that the normal case). */
+  readonly generated: number;
 }
 
 export async function runLiveEdgeDiggerCycle(deps: LiveEdgeDiggerDeps): Promise<LiveEdgeDiggerCycleResult> {
@@ -257,8 +328,20 @@ export async function runLiveEdgeDiggerCycle(deps: LiveEdgeDiggerDeps): Promise<
   }
 
   // ---- 2. SCAN.
+  const cycleStartedMs = Date.now();
   const universe = await deps.resolveUniverse();
+  const canonicalUniverseSize = universe.symbols.length;
   const working = universe.symbols.slice(0, LIVE_EDGE_DIGGER_MAX_SYMBOLS);
+  // Coverage accounting starts here, at the FIRST place symbols are dropped. Counted rather than
+  // described, so the report can never imply a search width the cycle did not have.
+  const exclusionCounts = new Map<string, number>();
+  const bumpExclusion = (reason: string, n = 1): void => {
+    if (n > 0) exclusionCounts.set(reason, (exclusionCounts.get(reason) ?? 0) + n);
+  };
+  bumpExclusion(
+    `beyond LIVE_EDGE_DIGGER_MAX_SYMBOLS (${LIVE_EDGE_DIGGER_MAX_SYMBOLS}) — engine cap, not a market fact`,
+    Math.max(0, canonicalUniverseSize - working.length),
+  );
   const symbolSet = new Set<string>([...working, BENCHMARK_SYMBOL]);
   const { regime, regimeFamily } = await deps.getRegime();
 
@@ -275,18 +358,35 @@ export async function runLiveEdgeDiggerCycle(deps: LiveEdgeDiggerDeps): Promise<
   };
 
   const inputs: SymbolCycleInput[] = [];
+  const featureGapCounts = new Map<string, number>();
+  const bumpGap = (feature: string): void => {
+    featureGapCounts.set(feature, (featureGapCounts.get(feature) ?? 0) + 1);
+  };
+  let watermarkMs: number | null = null;
   for (const symbol of symbolSet) {
     const hourly = await fetchHourly(symbol);
-    if (hourly.length < 30) continue; // fail closed: too little history to compute anything honest
+    if (hourly.length < 30) {
+      // fail closed: too little history to compute anything honest — and now counted, because a
+      // symbol silently skipped here is a symbol the search never actually covered.
+      bumpExclusion("insufficient hourly history (<30 closed bars)");
+      continue;
+    }
+    const newestClose = hourly[hourly.length - 1]?.openTime ?? null;
+    if (newestClose !== null && (watermarkMs === null || newestClose > watermarkMs)) watermarkMs = newestClose;
     let fifteenMin: Candle[] = [];
     try {
       fifteenMin = await deps.fetchCandles(symbol, LIVE_EDGE_DIGGER_SHOCK_INTERVAL, 8);
     } catch { /* shock proxy simply unavailable for this symbol */ }
+    if (fifteenMin.length === 0) bumpGap("shockAtrUnits (15m candles unavailable)");
     let funding: { fundingBps: number | null; basisBps: number | null } = { fundingBps: null, basisBps: null };
     try {
       funding = await deps.fetchFunding(symbol);
     } catch { /* rules requiring funding fail closed on null */ }
+    if (funding.fundingBps === null) bumpGap("fundingBps");
+    if (funding.basisBps === null) bumpGap("basisBps");
     const meta = universe.perSymbolMeta[symbol] ?? {};
+    if ((meta.quoteVolume24hUsd ?? null) === null) bumpGap("quoteVolume24hUsd");
+    if ((meta.spreadBps ?? null) === null) bumpGap("spreadBps");
     inputs.push({
       symbol,
       hourly,
@@ -310,10 +410,26 @@ export async function runLiveEdgeDiggerCycle(deps: LiveEdgeDiggerDeps): Promise<
     symbols: inputs,
   });
 
-  // ---- 3. EMIT. cycleId is the shared-cause key: one market look, one episode, however many
-  // symbols or rules it triggers.
+  // ---- 3. GENERATE. Strictly BEFORE emission, and from `market` alone — the decision-time
+  // cross-section. A rule proposed now is frozen by the same recordAttempts call that anchors the
+  // seeds, so it is frozen before it can possibly produce an observation of its own.
+  const knownRules: EdgeRule[] = [...EDGE_RULE_FRONTIER, ...deps.store.generated.map((g) => g.rule)];
+  const { generated, suppressed } = generateHypotheses({
+    market,
+    cycleId: `cycle-${deps.now}`,
+    atIso,
+    existingContentHashes: new Set(knownRules.map(ruleContentHash)),
+    existingGenerated: deps.store.generated,
+  });
+  const newlyGenerated = deps.store.addGenerated(generated);
+  deps.store.recordSuppressed(suppressed);
+
+  // ---- 4. EMIT. cycleId is the shared-cause key: one market look, one episode, however many
+  // symbols or rules it triggers. Generated rules are evaluated alongside the seeds from the very
+  // cycle they are born in — their first evaluation IS their freeze anchor.
   const cycleId = `cycle-${deps.now}`;
-  const { observations, attempts } = emitShadowSignals(market, cycleId, atIso);
+  const activeRules: EdgeRule[] = [...EDGE_RULE_FRONTIER, ...deps.store.generated.map((g) => g.rule)];
+  const { observations, attempts } = emitShadowSignals(market, cycleId, atIso, activeRules);
   let emitted = 0;
   for (const obs of observations) {
     if (deps.store.add(obs)) emitted += 1;
@@ -322,22 +438,37 @@ export async function runLiveEdgeDiggerCycle(deps: LiveEdgeDiggerDeps): Promise<
   // at or before every observation this same cycle emits.
   deps.store.recordAttempts(attempts, atIso);
 
+  const scannedSymbols = market.universeSize;
   deps.store.recordCycle(atIso, {
     resolvedTotal: deps.store.cycleMeta.resolvedTotal + resolvedCount,
-    lastUniverseSize: market.universeSize,
+    lastUniverseSize: scannedSymbols,
     lastRegime: market.regime,
     lastRegimeFamily: market.regimeFamily,
     lastBreadth: market.breadth,
     lastCohesion: market.cohesion,
     lastDispersion: market.dispersion,
+    coverage: {
+      canonicalUniverseSize,
+      scannedSymbols,
+      excludedSymbols: Math.max(0, canonicalUniverseSize - scannedSymbols),
+      exclusionReasons: [...exclusionCounts.entries()]
+        .map(([reason, count]) => ({ reason, count }))
+        .sort((a, b) => b.count - a.count),
+      featureGaps: [...featureGapCounts.entries()]
+        .map(([feature, missing]) => ({ feature, missing }))
+        .sort((a, b) => b.missing - a.missing),
+      cycleMs: Date.now() - cycleStartedMs,
+      completedCandleWatermark: watermarkMs !== null ? new Date(watermarkMs).toISOString() : null,
+    },
   }, null);
   deps.store.save();
 
   return {
-    scanned: market.universeSize,
+    scanned: scannedSymbols,
     emitted,
     resolved: resolvedCount,
     stillOpen: deps.store.all.filter((o) => o.status === "OPEN").length,
+    generated: newlyGenerated,
   };
 }
 
@@ -387,5 +518,11 @@ export function buildLiveEdgeDiggerReportFromStore(
       cohesion: meta.lastCohesion,
       dispersion: meta.lastDispersion,
     },
+    coverage: meta.coverage,
+    // Seeds first, then generated — so the report reads as "the frozen frontier, plus what the
+    // engine proposed", and a generated rule can never be mistaken for one a human wrote.
+    frontier: [...EDGE_RULE_FRONTIER, ...store.generated.map((g) => g.rule)],
+    generatedRules: store.generated,
+    suppressedProposals: store.lastSuppressed,
   });
 }
