@@ -4,6 +4,9 @@ import './neural-mindmap.css';
 const TELEMETRY_TIMEOUT_MS = 15_000;
 
 type NeuralHealth = 'HEALTHY' | 'ACTIVE' | 'WARNING' | 'CRITICAL' | 'IDLE' | 'COLLECTING' | 'QUARANTINE' | 'DIAGNOSTIC';
+/** Mirror of the API's NeuralPfStatus. Display-only — never gate/sort/rank/color; `pf` is already
+ *  null (not a sentinel) whenever this isn't 'COMPUTED'. */
+type NeuralPfStatus = 'COMPUTED' | 'NO_LOSSES_YET' | 'NO_WINS_YET' | 'NO_DATA';
 type LaneMaturitySectionKey = 'LONG' | 'SHORT' | 'MULTI' | 'REGIME';
 type NeuralDiagnosisCategory =
   | 'HEALTHY_FLOW'
@@ -119,6 +122,7 @@ interface NeuralLane {
   promotionProof?: NeuralStageProof | null;
   netAvgR: number | null;
   pf: number | null;
+  pfStatus?: NeuralPfStatus;
   wr: number | null;
   statsSource: 'VM_SIM' | 'PAPER_BOOK' | 'H6_RESEARCH' | 'REGIME_DIAGNOSTIC';
   /** Evidence-version split — see the API's LaneEvidenceVersionSummary doc. Null/zero for any lane
@@ -128,6 +132,9 @@ interface NeuralLane {
   legacyExcludedRows?: number;
   legacyExclusionReasons?: { reason: string; count: number }[];
   previousEvidenceVersion?: string | null;
+  policyVersion?: string | null;
+  /** 'INFERRED' for every lane today — see the API's resolveCanonicalCutoverMetadata doc comment. */
+  cutoverSource?: 'CANONICAL' | 'INFERRED';
   cohorts?: {
     LONG: LaneCohortStats | null;
     SHORT: LaneCohortStats | null;
@@ -480,6 +487,16 @@ function fmtNumber(value: number | null, digits = 2): string {
 function fmtR(value: number | null): string {
   if (value === null || !Number.isFinite(value)) return 'n/a';
   return `${value >= 0 ? '+' : ''}${value.toFixed(3)}R`;
+}
+
+/** 2026-08-05 fix: `pf` is null (never a 999999-style sentinel) whenever pfStatus !== 'COMPUTED' —
+ *  this picks the honest wording for WHY, so a lane with one lucky winning trade and zero loss data
+ *  reads as "insufficient sample", never as an implausibly perfect profit factor. Display-only: the
+ *  underlying null already fails every `pf > threshold` gate on its own. */
+function fmtPf(pf: number | null, pfStatus: NeuralPfStatus | undefined): string {
+  if (pfStatus === 'NO_LOSSES_YET') return 'N/A — no losing outcome yet (insufficient sample)';
+  if (pfStatus === 'NO_WINS_YET') return 'N/A — no winning outcome yet (insufficient sample)';
+  return fmtNumber(pf);
 }
 
 function fmtCohort(cohort: LaneCohortStats | null | undefined): string {
@@ -852,12 +869,12 @@ function laneMilestone(lane: NeuralLane): { stage: MilestoneStage; reason: strin
     if (lane.active) {
       return {
         stage: 'HEADLINE_ACTIVE',
-        reason: `Paper-book lane clears headline floor: fresh-valid ${freshValid}/${watchableMin}, net ${fmtR(lane.netAvgR)}, PF ${fmtNumber(lane.pf)}.`,
+        reason: `Paper-book lane clears headline floor: fresh-valid ${freshValid}/${watchableMin}, net ${fmtR(lane.netAvgR)}, PF ${fmtPf(lane.pf, lane.pfStatus)}.`,
       };
     }
     return {
       stage: 'HEADLINE_READY',
-      reason: `Paper-book lane clears headline floor: fresh-valid ${freshValid}/${watchableMin}, net ${fmtR(lane.netAvgR)}, PF ${fmtNumber(lane.pf)}.`,
+      reason: `Paper-book lane clears headline floor: fresh-valid ${freshValid}/${watchableMin}, net ${fmtR(lane.netAvgR)}, PF ${fmtPf(lane.pf, lane.pfStatus)}.`,
     };
   }
   if (status.includes('PROMOTION_CANDIDATE')) {
@@ -881,7 +898,7 @@ function laneMilestone(lane: NeuralLane): { stage: MilestoneStage; reason: strin
     }
     return {
       stage: 'HEADLINE_READY',
-      reason: `Telemetry status is WATCHABLE: fresh-valid ${freshValid}/${watchableMin}, net ${fmtR(lane.netAvgR)}, PF ${fmtNumber(lane.pf)}. Eligible for headline paper, but not the active lane right now.`,
+      reason: `Telemetry status is WATCHABLE: fresh-valid ${freshValid}/${watchableMin}, net ${fmtR(lane.netAvgR)}, PF ${fmtPf(lane.pf, lane.pfStatus)}. Eligible for headline paper, but not the active lane right now.`,
     };
   }
   if (status.includes('REJECT')) {
@@ -893,7 +910,7 @@ function laneMilestone(lane: NeuralLane): { stage: MilestoneStage; reason: strin
   if (lane.closed > 0 || lane.open > 0) {
     return {
       stage: 'PAPER_EVIDENCE',
-      reason: `Telemetry still says COLLECTING, but paper evidence already exists. It has not reached WATCHABLE yet: fresh-valid ${freshValid}/${watchableMin}, net ${fmtR(lane.netAvgR)}, PF ${fmtNumber(lane.pf)}.`,
+      reason: `Telemetry still says COLLECTING, but paper evidence already exists. It has not reached WATCHABLE yet: fresh-valid ${freshValid}/${watchableMin}, net ${fmtR(lane.netAvgR)}, PF ${fmtPf(lane.pf, lane.pfStatus)}.`,
     };
   }
   return {
@@ -1160,7 +1177,11 @@ function fmtRowsPerEpisode(rows: number, effectiveN: number): string {
 
 /** One dev-or-holdout side of a stage gate. All current/required numbers and the comparator come
  *  from the API (policyThresholds / the proof itself) — nothing here is a hardcoded floor. */
-function renderGateSide(
+/** Metrics grid only — no title/badge, the caller (renderExplicitMaturitySection) owns those, since
+ *  2026-08-05 restructures this from a "STABLE/PROMOTION gate with two sides" pairing into three
+ *  independently-headed sections (DEV/Validation-OOS/Recent-Live-Testnet), each showing exactly one
+ *  side of exactly one proof. */
+function renderGateMetrics(
   side: 'dev' | 'holdout',
   proof: NeuralStageProof,
   required: { rows: number; effectiveN: number },
@@ -1174,88 +1195,106 @@ function renderGateSide(
   const distinctSymbolCount = side === 'dev' ? proof.devDistinctSymbolCount : proof.holdoutDistinctSymbolCount;
   const topSymbolPnlShare = side === 'dev' ? proof.devTopSymbolPnlShare : null;
   const concentrationWarning = topSymbolPnlShare !== null && topSymbolPnlShare > maxTopSymbolPnlShare;
-  // holdout has a real backend verdict (size floors AND computable economics AND non-negative);
-  // dev has no equivalent single boolean upstream (its economics are folded into the stage-level
-  // `ok`), so dev's badge is the floor check ONLY, explicitly labeled as such rather than implying
-  // a full verdict that doesn't exist at that granularity.
-  const sideOk = side === 'holdout' ? proof.holdoutSufficient : rowsOk && episodesOk;
-  const sideLabel = side === 'holdout' && !proof.holdoutSufficient && rowsOk && episodesOk
-    ? 'SIZE OK · ECONOMICS BLOCKED'
-    : sideOk ? 'PASS' : 'BLOCKED';
   return (
-    <div className="neural-evidence-gate-side" key={side}>
-      <span className="neural-evidence-gate-side-title">
-        {side === 'dev' ? 'Development' : 'Holdout (OOS)'}
-        <b className={sideOk ? 'tone-healthy' : 'tone-warning'}>{sideLabel}</b>
-      </span>
-      <div className="neural-evidence-gate-metrics">
-        <div>
-          <span>Raw rows</span>
-          <strong className={rowsOk ? 'tone-healthy' : ''}>{rows} {comparator} {required.rows}</strong>
-        </div>
-        <div>
-          <span>Independent episodes</span>
-          <strong className={episodesOk ? 'tone-healthy' : ''}>{effectiveN} {comparator} {required.effectiveN}</strong>
-        </div>
-        <div>
-          <span>Rows / episode</span>
-          <strong>{fmtRowsPerEpisode(rows, effectiveN)}</strong>
-        </div>
-        {side === 'dev' && (
-          <div>
-            <span>Calendar days</span>
-            <strong>{proof.devCalendarDays ?? 'n/a'}</strong>
-          </div>
-        )}
-        <div>
-          <span>Distinct symbols</span>
-          <strong>{distinctSymbolCount}</strong>
-        </div>
-        {side === 'dev' && (
-          <div>
-            <span>Distinct regimes</span>
-            <strong>{proof.devDistinctRegimes}</strong>
-          </div>
-        )}
-        {side === 'dev' && (
-          <div>
-            <span>Top-symbol PnL share</span>
-            <strong className={concentrationWarning ? 'tone-warning' : ''}>
-              {pctShare(topSymbolPnlShare)} {concentrationWarning ? `(> ${pctShare(maxTopSymbolPnlShare)} floor)` : ''}
-            </strong>
-          </div>
-        )}
+    <div className="neural-evidence-gate-metrics">
+      <div>
+        <span>Raw rows</span>
+        <strong className={rowsOk ? 'tone-healthy' : ''}>{rows} {comparator} {required.rows}</strong>
       </div>
+      <div>
+        <span>Independent episodes</span>
+        <strong className={episodesOk ? 'tone-healthy' : ''}>{effectiveN} {comparator} {required.effectiveN}</strong>
+      </div>
+      <div>
+        <span>Rows / episode</span>
+        <strong>{fmtRowsPerEpisode(rows, effectiveN)}</strong>
+      </div>
+      {side === 'dev' && (
+        <div>
+          <span>Calendar days</span>
+          <strong>{proof.devCalendarDays ?? 'n/a'}</strong>
+        </div>
+      )}
+      <div>
+        <span>Distinct symbols</span>
+        <strong>{distinctSymbolCount}</strong>
+      </div>
+      {side === 'dev' && (
+        <div>
+          <span>Distinct regimes</span>
+          <strong>{proof.devDistinctRegimes}</strong>
+        </div>
+      )}
+      {side === 'dev' && (
+        <div>
+          <span>Top-symbol PnL share</span>
+          <strong className={concentrationWarning ? 'tone-warning' : ''}>
+            {pctShare(topSymbolPnlShare)} {concentrationWarning ? `(> ${pctShare(maxTopSymbolPnlShare)} floor)` : ''}
+          </strong>
+        </div>
+      )}
     </div>
   );
 }
 
-function renderStageGate(
-  label: 'STABLE' | 'PROMOTION',
+/**
+ * 2026-08-05: three explicit, separately-headed canonical sections instead of a "STABLE/PROMOTION
+ * gate, each with a dev+holdout pairing" grouping — the goal's own critique of the prior shape was
+ * that recent/live/testnet maturity was buried inside blocker text rather than its own visible gate.
+ *
+ * The mapping is a faithful, non-fabricated read of the REAL backend structure (there is no third
+ * backend stage — this is documented here, not hidden):
+ *  - DEV                    = stableProof.dev      (thresholds.stable:    minDevRows/minDevEffectiveN)
+ *  - Validation / OOS       = stableProof.holdout   (thresholds.stable:    minHoldoutRows/minHoldoutEffectiveN)
+ *  - Recent / Live / Testnet = promotionProof.holdout (thresholds.promotion: minHoldoutRows/minHoldoutEffectiveN)
+ *    — PROMOTION's holdout is the backend's own "open-ended, keeps a promoted lane under permanent
+ *    live verification" window (see VariantMatrixStageProof's own doc comment), which is the closest
+ *    real concept to "recent/live/testnet maturity" this codebase has. promotionProof.dev is
+ *    deliberately NOT one of the three sections: it subsumes the whole of stableProof's window rather
+ *    than being a distinct phase, so showing it as a fourth "DEV" would double-count the same rows
+ *    under two different section headers.
+ */
+function renderExplicitMaturitySection(
+  title: 'DEV' | 'Validation / OOS' | 'Recent / Live / Testnet',
+  sourceLabel: string,
   proof: NeuralStageProof | null | undefined,
-  thresholds: NeuralMapPolicyThresholds | undefined,
+  side: 'dev' | 'holdout',
+  required: { rows: number; effectiveN: number } | null,
+  comparator: NeuralMapPolicyThresholds['comparator'],
+  maxTopSymbolPnlShare: number,
 ) {
-  const t = thresholds ? (label === 'STABLE' ? thresholds.stable : thresholds.promotion) : null;
+  const frozen = proof?.frozen === true;
+  const rows = proof ? (side === 'dev' ? proof.devRows : proof.holdoutRows) : 0;
+  const effectiveN = proof ? (side === 'dev' ? proof.devEffectiveN : proof.holdoutEffectiveN) : 0;
+  const rowsOk = required !== null && (comparator === '>=' ? rows >= required.rows : rows > required.rows);
+  const episodesOk = required !== null && (comparator === '>=' ? effectiveN >= required.effectiveN : effectiveN > required.effectiveN);
+  // Holdout sides have a real backend verdict (size floors AND computable economics AND
+  // non-negative); dev has no equivalent single boolean upstream, so DEV's PASS/BLOCKED is the size
+  // floors only — explicitly labeled as such rather than implying an economics verdict that doesn't
+  // exist at this granularity (mirrors the same distinction the prior per-side badges already made).
+  const sufficient = side === 'holdout' ? proof?.holdoutSufficient === true : rowsOk && episodesOk;
+  const sectionOk = frozen && sufficient;
+  const label = !frozen ? 'NOT FROZEN' : side === 'holdout' && !proof?.holdoutSufficient && rowsOk && episodesOk
+    ? 'SIZE OK · ECONOMICS BLOCKED'
+    : sectionOk ? 'PASS' : 'BLOCKED';
+  // Blockers are prefixed by stage label + "dev"/"holdout" (e.g. "STABLE dev effectiveN 1 < 10
+  // independent episodes") — filtering on the side name attributes each blocker to the ONE section
+  // it actually describes, rather than repeating the full list under every section.
+  const blockers = (proof?.blockers ?? []).filter((b) => b.toLowerCase().includes(side));
   return (
-    <div className="neural-evidence-gate" key={label}>
+    <div className="neural-evidence-gate" key={title}>
       <div className="neural-evidence-gate-head">
-        <span>{label} gate</span>
-        {!proof || !proof.frozen ? (
-          <b className="tone-measure">NOT FROZEN</b>
-        ) : (
-          <b className={proof.ok ? 'tone-healthy' : 'tone-warning'}>{proof.ok ? 'PASS' : 'BLOCKED'}</b>
-        )}
+        <span>{title}</span>
+        <small>{sourceLabel}</small>
+        <b className={!frozen ? 'tone-measure' : sectionOk ? 'tone-healthy' : 'tone-warning'}>{label}</b>
       </div>
-      {!proof || !t ? (
+      {!proof || !required ? (
         <p className="neural-evidence-gate-empty">No proof window yet — this is a paper-book-only lane or has produced no VM evidence.</p>
       ) : (
         <>
-          <div className="neural-evidence-gate-sides">
-            {renderGateSide('dev', proof, { rows: t.minDevRows, effectiveN: t.minDevEffectiveN }, thresholds!.comparator, thresholds!.maxTopSymbolPnlShare)}
-            {renderGateSide('holdout', proof, { rows: t.minHoldoutRows, effectiveN: t.minHoldoutEffectiveN }, thresholds!.comparator, thresholds!.maxTopSymbolPnlShare)}
-          </div>
-          {proof.blockers.length > 0 && (
-            <p className="neural-evidence-gate-blockers">Blocking: {proof.blockers.join('; ')}</p>
+          {renderGateMetrics(side, proof, required, comparator, maxTopSymbolPnlShare)}
+          {blockers.length > 0 && (
+            <p className="neural-evidence-gate-blockers">Blocking: {blockers.join('; ')}</p>
           )}
         </>
       )}
@@ -1273,6 +1312,17 @@ function renderLaneEvidenceVersionCard(lane: NeuralLane, thresholds: NeuralMapPo
         {lane.resetCutoverAt && (
           <small>Active since {new Date(lane.resetCutoverAt).toISOString().slice(0, 16).replace('T', ' ')} UTC</small>
         )}
+        <span
+          className={`neural-cutover-source-badge source-${(lane.cutoverSource ?? 'INFERRED').toLowerCase()}`}
+          title={
+            lane.cutoverSource === 'CANONICAL'
+              ? 'Read from a stored evidence-reset registry entry.'
+              : 'No stored evidence-reset registry exists for this lane family — derived from row data (exact openMaxHoldMs config match), fail-closed against ambiguous pre-reset rows.'
+          }
+        >
+          cutoverSource: {lane.cutoverSource ?? 'INFERRED'}
+        </span>
+        {lane.policyVersion && <small>policy {lane.policyVersion}</small>}
       </div>
       <div className="neural-evidence-version-current">
         <span className="neural-evidence-version-label">Current (this version only)</span>
@@ -1282,7 +1332,7 @@ function renderLaneEvidenceVersionCard(lane: NeuralLane, thresholds: NeuralMapPo
           <div><span>Open</span><strong>{lane.open}</strong></div>
           <div><span>Closed</span><strong>{lane.closed}</strong></div>
           <div><span>Net R</span><strong className={lane.netAvgR == null ? '' : lane.netAvgR >= 0 ? 'tone-healthy' : 'tone-critical'}>{fmtR(lane.netAvgR)}</strong></div>
-          <div><span>PF</span><strong>{fmtNumber(lane.pf)}</strong></div>
+          <div><span>PF</span><strong>{fmtPf(lane.pf, lane.pfStatus)}</strong></div>
           <div><span>WR</span><strong>{lane.wr === null ? 'n/a' : `${(lane.wr * 100).toFixed(1)}%`}</strong></div>
         </div>
       </div>
@@ -1300,8 +1350,21 @@ function renderLaneEvidenceVersionCard(lane: NeuralLane, thresholds: NeuralMapPo
         </div>
       )}
       <div className="neural-evidence-gate-sides neural-evidence-gate-sides-stacked">
-        {renderStageGate('STABLE', lane.stableProof, thresholds)}
-        {renderStageGate('PROMOTION', lane.promotionProof, thresholds)}
+        {renderExplicitMaturitySection(
+          'DEV', 'STABLE proof, development side', lane.stableProof, 'dev',
+          thresholds ? { rows: thresholds.stable.minDevRows, effectiveN: thresholds.stable.minDevEffectiveN } : null,
+          thresholds?.comparator ?? '>=', thresholds?.maxTopSymbolPnlShare ?? 0,
+        )}
+        {renderExplicitMaturitySection(
+          'Validation / OOS', 'STABLE proof, holdout side', lane.stableProof, 'holdout',
+          thresholds ? { rows: thresholds.stable.minHoldoutRows, effectiveN: thresholds.stable.minHoldoutEffectiveN } : null,
+          thresholds?.comparator ?? '>=', thresholds?.maxTopSymbolPnlShare ?? 0,
+        )}
+        {renderExplicitMaturitySection(
+          'Recent / Live / Testnet', 'PROMOTION proof, holdout side (open-ended)', lane.promotionProof, 'holdout',
+          thresholds ? { rows: thresholds.promotion.minHoldoutRows, effectiveN: thresholds.promotion.minHoldoutEffectiveN } : null,
+          thresholds?.comparator ?? '>=', thresholds?.maxTopSymbolPnlShare ?? 0,
+        )}
       </div>
     </section>
   );
@@ -1535,7 +1598,7 @@ export default function NeuralMindmap() {
       rows: [
         { label: 'Open / closed', value: `${selectedLane.open} / ${selectedLane.closed}` },
         { label: 'Net Avg R', value: fmtR(selectedLane.netAvgR), tone: (selectedLane.netAvgR ?? 0) >= 0 ? 'tone-healthy' : 'tone-critical' },
-        { label: 'PF / WR', value: `${fmtNumber(selectedLane.pf)} / ${selectedLane.wr === null ? 'n/a' : `${(selectedLane.wr * 100).toFixed(1)}%`}` },
+        { label: 'PF / WR', value: `${fmtPf(selectedLane.pf, selectedLane.pfStatus)} / ${selectedLane.wr === null ? 'n/a' : `${(selectedLane.wr * 100).toFixed(1)}%`}` },
         { label: 'Payoff / +10bps', value: `${fmtNumber(selectedLane.payoffRatio)} / ${selectedLane.plus10bpsStillPositive == null ? 'n/a' : selectedLane.plus10bpsStillPositive ? 'pass' : 'fail'}` },
         { label: 'OOS thirds / regimes', value: `${selectedLane.allThreeOosPositive == null ? 'n/a' : selectedLane.allThreeOosPositive ? 'all positive' : 'not yet'} / ${selectedLane.distinctRegimes ?? 'n/a'}` },
         { label: 'Drawdown / concentration', value: `${fmtR(selectedLane.approxMaxDrawdownR)} / ${pctShare(selectedLane.topSymbolPnlShare)}` },
@@ -1970,7 +2033,7 @@ export default function NeuralMindmap() {
                         <td className="neural-missing-cell">{progress.blockers[0] ?? 'None'}</td>
                         <td className="neural-best-use-cell">{bestContextLabel(lane)}</td>
                         <td className={lane.netAvgR == null ? '' : lane.netAvgR >= 0 ? 'tone-healthy' : 'tone-critical'}>{fmtR(lane.netAvgR)}</td>
-                        <td>{fmtNumber(lane.pf)}</td>
+                        <td>{fmtPf(lane.pf, lane.pfStatus)}</td>
                         <td>{lane.wr === null ? 'n/a' : `${(lane.wr * 100).toFixed(1)}%`}</td>
                         <td className="tone-measure">{fmtUsdt(lane.diagnosticUnrealizedPnl)}</td>
                         <td className={livePnl === 0 ? '' : livePnl > 0 ? 'tone-healthy' : 'tone-critical'}>

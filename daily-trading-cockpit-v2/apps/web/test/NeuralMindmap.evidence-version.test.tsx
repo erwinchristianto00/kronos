@@ -54,17 +54,32 @@ function baseTelemetry(lanes: unknown[]) {
   };
 }
 
+// Matches the REAL fixed backend exactly: a lane with 1 winning close and ZERO losing closes has
+// devPf/holdoutPf = null (profitFactor() has never used a sentinel — see current-guard-variant-
+// matrix.ts) and every raw/independent-episode count sits at the tiny end (1 row, 1 episode dev-side;
+// 0 rows, 0 episodes holdout-side) — this is the goal's own "750 legacy + 1 winner + 0 losses"
+// regression fixture, expressed at the stage-proof level.
 function stageProof(stage: "stable" | "promotion") {
   const label = stage === "stable" ? "STABLE" : "PROMOTION";
+  const minDevRows = stage === "stable" ? 40 : 90;
+  const minDevEffectiveN = stage === "stable" ? 10 : 20;
+  const minHoldoutRows = stage === "stable" ? 20 : 40;
+  const minHoldoutEffectiveN = stage === "stable" ? 5 : 10;
   return {
     stage, frozen: true, ok: false,
     devRows: 1, devEffectiveN: 1, devDistinctSymbolCount: 1, devDistinctRegimes: 1,
-    devCalendarDays: 1, devTopSymbolPnlShare: 1, devNetAvgR: 0.6, devPf: 999_999,
+    devCalendarDays: 1, devTopSymbolPnlShare: 1, devNetAvgR: 0.6, devPf: null,
     holdoutRows: 0, holdoutEffectiveN: 0, holdoutStressableRows: 0, holdoutDistinctSymbolCount: 0,
     holdoutNetAvgR: null, holdoutPf: null, holdoutStressNetAvgR: null, holdoutSufficient: false, holdoutNegative: false,
-    // Distinct per stage — a real backend blocker string is always stage-labelled
-    // (`${t.label} dev effectiveN ...`), never shared verbatim between stable/promotion.
-    blockers: [`${label} dev effectiveN 1 < 10 independent episodes`, `${label} dev rows 1 < 40`],
+    // Distinct per stage AND per side — a real backend blocker string is always stage+side-labelled
+    // (`${t.label} dev effectiveN ...` / `${t.label} holdout rows ...`), never shared verbatim
+    // between stable/promotion or between dev/holdout.
+    blockers: [
+      `${label} dev effectiveN 1 < ${minDevEffectiveN} independent episodes`,
+      `${label} dev rows 1 < ${minDevRows}`,
+      `${label} holdout rows 0 < ${minHoldoutRows}`,
+      `${label} holdout effectiveN 0 < ${minHoldoutEffectiveN} independent episodes`,
+    ],
   };
 }
 
@@ -75,7 +90,7 @@ function resetLaneFixture() {
     health: "COLLECTING", evidenceHealth: "COLLECTING", active: true,
     open: 0, closed: 1, oosFreshValid: 1, oosThreshold: 10,
     stableProof: stageProof("stable"), promotionProof: stageProof("promotion"),
-    netAvgR: 0.6, pf: 999_999, wr: 1, statsSource: "VM_SIM",
+    netAvgR: 0.6, pf: null, pfStatus: "NO_LOSSES_YET", wr: 1, statsSource: "VM_SIM",
     evidenceVersion: "CG_WIDE_FAST_LONG@36H-v1",
     resetCutoverAt: CUTOVER_ISO,
     legacyExcludedRows: 750,
@@ -83,6 +98,8 @@ function resetLaneFixture() {
       { reason: "openMaxHoldMs absent (pre-reset row, written before this field existed)", count: 750 },
     ],
     previousEvidenceVersion: "~72H (measured from legacy MAX_HOLD_MTM closes)",
+    policyVersion: "current-guard-variant-matrix-v1",
+    cutoverSource: "INFERRED",
     payoffRatio: null, plus10bpsStillPositive: true, allThreeOosPositive: true, oosThirds: null,
     approxMaxDrawdownR: 0, topSymbolPnlShare: 1, calendarDays: 1, distinctRegimes: 1, infraReady: true,
     blockers: ["freshValid 1 < 10"], cautions: [],
@@ -107,6 +124,8 @@ function nonResetLaneFixture() {
     legacyExcludedRows: 0,
     legacyExclusionReasons: [],
     previousEvidenceVersion: null,
+    policyVersion: null,
+    cutoverSource: "INFERRED",
   };
 }
 
@@ -137,6 +156,22 @@ describe("NeuralMindmap — evidence version panel", () => {
     const currentBlock = screen.getByText("Current (this version only)").closest("div")!;
     const freshValidLabel = within(currentBlock).getByText("Fresh-valid");
     expect(freshValidLabel.nextElementSibling?.textContent).toBe("1");
+    const statusLabel = within(currentBlock).getByText("Status");
+    expect(statusLabel.nextElementSibling?.textContent).toBe("COLLECTING");
+  });
+
+  // Goal issue A: PF with zero gross loss must never render as a numeric sentinel (999999) and must
+  // never read as an implausibly perfect/exceptional result.
+  it("PF with zero losses renders as an explicit insufficient-sample message, never as 999999 or any large numeric sentinel", async () => {
+    vi.stubGlobal("fetch", mockFetch(baseTelemetry([resetLaneFixture()])));
+    const { container } = render(<NeuralMindmap />);
+
+    await waitFor(() => expect(screen.getByText("CG_WIDE_FAST_LONG@36H-v1")).toBeTruthy());
+
+    expect(container.textContent).not.toMatch(/999[,_]?999/);
+    const currentBlock = screen.getByText("Current (this version only)").closest("div")!;
+    const pfLabel = within(currentBlock).getByText("PF");
+    expect(pfLabel.nextElementSibling?.textContent).toBe("N/A — no losing outcome yet (insufficient sample)");
   });
 
   it("labels legacy evidence HISTORICAL_REFERENCE_ONLY with the not-used-for note, and shows the exclusion reason/count", async () => {
@@ -150,21 +185,45 @@ describe("NeuralMindmap — evidence version panel", () => {
     expect(screen.getByText(/~72H \(measured from legacy MAX_HOLD_MTM closes\)/)).toBeTruthy();
   });
 
-  it("renders independent maturity gates using the API's own policy thresholds — never a hardcoded number", async () => {
+  // Goal issue B: DEV / validation-OOS / recent-live-testnet must each be their own explicit,
+  // separately-headed section — not folded into blocker text under a single STABLE/PROMOTION badge.
+  it("renders DEV, Validation / OOS, and Recent / Live / Testnet as three separate explicit sections, each independently BLOCKED, using the API's own policy thresholds", async () => {
     vi.stubGlobal("fetch", mockFetch(baseTelemetry([resetLaneFixture()])));
     render(<NeuralMindmap />);
 
-    await waitFor(() => expect(screen.getByText("STABLE gate")).toBeTruthy());
-    expect(screen.getByText("PROMOTION gate")).toBeTruthy();
-    // devRows=1 vs STABLE minDevRows=40 and PROMOTION minDevRows=90 (both from policyThresholds,
-    // never a UI literal) -> two DIFFERENT rendered thresholds prove the value came from the API.
+    await waitFor(() => expect(screen.getByText("DEV")).toBeTruthy());
+    expect(screen.getByText("Validation / OOS")).toBeTruthy();
+    expect(screen.getByText("Recent / Live / Testnet")).toBeTruthy();
+
+    // Three DIFFERENT threshold pairs prove each section reads its OWN policyThresholds entry, never
+    // a shared/hardcoded literal: DEV (stable.dev) 1>=40/1>=10, Validation/OOS (stable.holdout)
+    // 0>=20/0>=5, Recent/Live/Testnet (promotion.holdout) 0>=40/0>=10.
     expect(screen.getByText("1 >= 40")).toBeTruthy();
-    expect(screen.getByText("1 >= 90")).toBeTruthy();
     expect(screen.getByText("1 >= 10")).toBeTruthy();
-    expect(screen.getByText("1 >= 20")).toBeTruthy();
-    expect(screen.getAllByText("BLOCKED").length).toBeGreaterThan(0);
+    expect(screen.getByText("0 >= 20")).toBeTruthy();
+    expect(screen.getByText("0 >= 5")).toBeTruthy();
+    expect(screen.getByText("0 >= 40")).toBeTruthy();
+    expect(screen.getByText("0 >= 10")).toBeTruthy();
+
+    // Each section shows its OWN blocking reason, not another section's text bleeding through.
     expect(screen.getByText(/STABLE dev rows 1 < 40/)).toBeTruthy();
-    expect(screen.getByText(/PROMOTION dev rows 1 < 40/)).toBeTruthy();
+    expect(screen.getByText(/STABLE holdout rows 0 < 20/)).toBeTruthy();
+    expect(screen.getByText(/PROMOTION holdout rows 0 < 40/)).toBeTruthy();
+
+    // All three sections BLOCKED (goal's regression acceptance: "DEV, validation/OOS, recent/live
+    // gates separately BLOCKED") — at least 3 BLOCKED badges, one per section.
+    expect(screen.getAllByText("BLOCKED").length).toBeGreaterThanOrEqual(3);
+  });
+
+  // Goal issue C: cutoverSource must be visible for auditability — INFERRED today (no canonical
+  // registry exists), never silently presented as if it were a stored fact.
+  it("exposes cutoverSource=INFERRED and the policy version for auditability", async () => {
+    vi.stubGlobal("fetch", mockFetch(baseTelemetry([resetLaneFixture()])));
+    render(<NeuralMindmap />);
+
+    await waitFor(() => expect(screen.getByText("CG_WIDE_FAST_LONG@36H-v1")).toBeTruthy());
+    expect(screen.getByText("cutoverSource: INFERRED")).toBeTruthy();
+    expect(screen.getByText("policy current-guard-variant-matrix-v1")).toBeTruthy();
   });
 
   it("does not render the evidence-version panel at all when no lane has an active reset", async () => {
@@ -186,5 +245,22 @@ describe("NeuralMindmap — evidence version panel", () => {
 
     await waitFor(() => expect(screen.getByLabelText("Evidence version and independent maturity")).toBeTruthy());
     expect(screen.getByText("no current-version evidence yet")).toBeTruthy();
+  });
+
+  // Goal issue A, ranking/coloring half: a lane whose ONLY apparent strength is an undefined PF
+  // (zero losses on one win) must not be classified as a headline/watchable success. The milestone
+  // table's own status pill is driven by `lane.status` (COLLECTING here, from the fixture) plus
+  // paperBookClearsHeadline() for paper-book-only lanes — this fixture is VM_SIM sourced (has a
+  // stableProof), so it is never even eligible for that path; asserting COLLECTING end-to-end proves
+  // the fix, not just the removed sentinel in isolation.
+  it("a lane with an undefined PF (one win, zero losses) is never classified as exceptional/headline — status stays COLLECTING", async () => {
+    vi.stubGlobal("fetch", mockFetch(baseTelemetry([resetLaneFixture()])));
+    render(<NeuralMindmap />);
+
+    await waitFor(() => expect(screen.getByText("CG_WIDE_FAST_LONG@36H-v1")).toBeTruthy());
+    const currentBlock = screen.getByText("Current (this version only)").closest("div")!;
+    const statusLabel = within(currentBlock).getByText("Status");
+    expect(statusLabel.nextElementSibling?.textContent).toBe("COLLECTING");
+    expect(screen.queryByText("WATCHABLE")).toBeNull();
   });
 });
