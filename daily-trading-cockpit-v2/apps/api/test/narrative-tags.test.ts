@@ -26,7 +26,7 @@ function obs(id: string, longs: Array<[string, number, number | null]>, shorts: 
   };
 }
 
-function basket(id: string, legs: Array<{ symbol: string; side: "LONG" | "SHORT"; entryPrice: number; exitPrice: number | null }>, status: "OPEN" | "CLOSED" | "ABORTED" = "CLOSED"): ExecutorBasket {
+function basket(id: string, legs: Array<{ symbol: string; side: "LONG" | "SHORT"; entryPrice: number; exitPrice: number | null }>, status: "OPEN" | "CLOSED" | "ABORTED" = "CLOSED", accountingStatus?: "ACCOUNTING_INCOMPLETE"): ExecutorBasket {
   return {
     basketId: id,
     sourceObservationId: `src-${id}`,
@@ -43,6 +43,7 @@ function basket(id: string, legs: Array<{ symbol: string; side: "LONG" | "SHORT"
     closedAt: status === "CLOSED" ? NOW : null,
     closeReason: status === "CLOSED" ? "HORIZON" : null,
     grossPnlUsd: null, feeEstimateUsd: null, netPnlUsd: null,
+    accountingStatus,
   };
 }
 
@@ -116,6 +117,22 @@ describe("narrative tags", () => {
     expect(report.executed.baskets).toBe(1);
     const untagged = report.executed.edge.find((r) => r.narrative === "UNTAGGED")!;
     expect(untagged.long.meanAdjReturn).toBeCloseTo(0.1, 9);
+    expect(report.executed.edge.find((r) => r.narrative === "AI")).toBeUndefined();
+  });
+
+  it("[2026-08-05 second-audit finding] excludes an ACCOUNTING_INCOMPLETE basket even when status is not ABORTED — defensive, in case that coupling is ever loosened", () => {
+    const report = buildNarrativeTiltReport({
+      measuredObservations: [],
+      executedBaskets: [
+        // status:"CLOSED" (NOT "ABORTED") deliberately, to prove this exclusion is not just a
+        // side effect of the pre-existing status!=="ABORTED" filter — accountingStatus alone
+        // must be sufficient to exclude a basket whose real close price is unknown.
+        basket("flattened", [{ symbol: "FETUSDT", side: "LONG", entryPrice: 100, exitPrice: 90 }], "CLOSED", "ACCOUNTING_INCOMPLETE"),
+        basket("ok", [{ symbol: "FOOUSDT", side: "LONG", entryPrice: 10, exitPrice: 11 }]),
+      ],
+      nowIso: NOW,
+    });
+    expect(report.executed.baskets).toBe(1);
     expect(report.executed.edge.find((r) => r.narrative === "AI")).toBeUndefined();
   });
 });
