@@ -284,6 +284,7 @@ import {
   buildFundingCarryCrowdingV2Report,
   getFundingCarryCrowdingV2Store,
 } from "../lib/funding-carry-crowding-v2.js";
+import { buildEdgeDiggerReport } from "../lib/edge-digger.js";
 import {
   runMetaLabelCycleGuarded,
   buildMetaLabelReport,
@@ -1874,6 +1875,16 @@ export async function registerShadowRoutes(
 
   app.get("/api/shadow/funding-carry-crowding-v2", async () => {
     return { generatedAt: new Date().toISOString(), ...buildFundingCarryCrowdingV2Report() };
+  });
+
+  // Edge Digger (2026-08-06) — READ-ONLY research pipeline over already-recorded forward evidence.
+  // It discovers nothing by itself: it evaluates exactly three FROZEN hypothesis families against
+  // the canonical gates and returns REJECT/CANDIDATE with the numeric reason for each. It writes
+  // nothing, enables nothing, and its maximum output is a recommendation an operator must act on.
+  // Every count it reports is BOTH raw rows and independent episodes, because raw rows have
+  // repeatedly flattered this book by an order of magnitude. See edge-digger.ts.
+  app.get("/api/shadow/edge-digger", async () => {
+    return buildEdgeDiggerReport();
   });
 
   // Meta-label per-signal gate report (2026-07-22) — report-only shadow scorer; nothing reads the
