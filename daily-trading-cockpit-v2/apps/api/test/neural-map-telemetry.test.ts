@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { buildNeuralMapTelemetry, buildPaperUnrealizedSnapshot } from "../src/lib/neural-map-telemetry.js";
+import { emptyVariantMatrixStageProof } from "../src/lib/current-guard-variant-matrix.js";
 
 function baseInput(): Parameters<typeof buildNeuralMapTelemetry>[0] {
   return {
@@ -61,6 +62,10 @@ function baseInput(): Parameters<typeof buildNeuralMapTelemetry>[0] {
       baselineVariantId: "CG_BASELINE_CURRENT",
       rows: [{
         variantId: "CG_WIDE_STOP_TP_WIDE", label: "Wide", exitRule: "tp1_full", fillMode: "taker", costModel: "taker",
+        evidenceVersionSummary: {
+          evidenceVersion: null, resetCutoverAt: null, resetCutoverAtMs: null,
+          legacyExcludedRows: 0, legacyExclusionReasons: [], previousEvidenceVersion: null,
+        },
         total: 20, open: 0, resolved: 20, freshValid: 20, rejected: 0, noFill: 0, expired: 0, dataFailure: 0,
         netAvgR: 0.8, grossAvgR: 0.9, pf: 3, wr: 0.7, avgWinR: 1, avgLossR: -0.5,
         payoffRatio: 2, breakEvenWR: 1 / 3, actualWR: 0.7, avgCostR: 0.1, costDragR: 0.1,
@@ -111,6 +116,44 @@ function baseInput(): Parameters<typeof buildNeuralMapTelemetry>[0] {
 }
 
 describe("neural map telemetry", () => {
+  // The dashboard used to render `freshValid` against hardcoded STABLE_MIN_FRESH(100) /
+  // PROMOTION_MIN_FRESH(200) copies as a maturity bar. `freshValid` is the FULL fresh-valid
+  // population and grows without bound, while STABLE/PROMOTION are gated on frozen stage-proof
+  // windows that `deriveVariantStatus` reads instead — so a deep, unproven lane pinned those bars
+  // at 100%, i.e. wrong in the UNSAFE direction. The payload must therefore carry the proof verdict
+  // itself, and it must fail closed when no proof exists.
+  it("carries the stage-proof verdict so deep-but-unproven lanes cannot render as mature", () => {
+    const input = baseInput();
+    const row = input.variantMatrix.rows[0]! as Record<string, unknown>;
+    // 3,000 raw closes — 30x STABLE_MIN_FRESH, 15x PROMOTION_MIN_FRESH — with NO frozen window.
+    row.freshValid = 3000;
+    row.stableProof = emptyVariantMatrixStageProof("stable", ["STABLE dev: no window frozen yet"]);
+    row.promotionProof = emptyVariantMatrixStageProof("promotion", ["PROMOTION dev: no window frozen yet"]);
+
+    const lane = buildNeuralMapTelemetry(input).lanes.find(
+      (candidate) => candidate.id === "CG_VARIANT_MATRIX:CG_WIDE_STOP_TP_WIDE",
+    );
+
+    // Raw depth is still published — it legitimately gates WATCHABLE — but it is not the verdict.
+    expect(lane?.oosFreshValid).toBe(3000);
+    expect(lane?.stableProof).toMatchObject({ stage: "stable", frozen: false, ok: false });
+    expect(lane?.promotionProof).toMatchObject({ stage: "promotion", frozen: false, ok: false });
+    expect(lane?.stableProof?.blockers).toContain("STABLE dev: no window frozen yet");
+    // Fail-closed counts: nothing here may read as evidence while the window is unfrozen.
+    expect(lane?.stableProof?.devEffectiveN).toBe(0);
+    expect(lane?.stableProof?.holdoutRows).toBe(0);
+  });
+
+  it("nulls the stage proofs when a lane has no VM evidence row, never substituting a row count", () => {
+    // baseInput()'s fixture row predates the stage-proof fields entirely — the same shape an older
+    // instance's report would send. Absent proof must surface as null ("no proof"), not as passed.
+    const lane = buildNeuralMapTelemetry(baseInput()).lanes.find(
+      (candidate) => candidate.id === "CG_VARIANT_MATRIX:CG_WIDE_STOP_TP_WIDE",
+    );
+    expect(lane?.stableProof).toBeNull();
+    expect(lane?.promotionProof).toBeNull();
+  });
+
   it("keeps safety locks visible and marks the active healthy lane", () => {
     const result = buildNeuralMapTelemetry(baseInput());
     expect(result.safety).toEqual({ liveBlocked: true, microPilotAllowed: false, paperOnly: true });
@@ -635,6 +678,100 @@ describe("neural map telemetry", () => {
     expect(lane?.cohorts.SHORT).toBeNull();
     expect(lane?.blockers).toEqual(["freshValid 20 < 100 for stable"]);
     expect(lane?.cautions.join(" ")).toContain("VM-only OOS/payoff/stress");
+  });
+
+  // 2026-08-05 evidence-version fix: laneEconomics()/PaperOrder has no knowledge of
+  // EVIDENCE_RESET_CUTOVER_VARIANT_IDS/openMaxHoldMs (that field lives only on the VM observation
+  // type) — a reset lane's real production paper-order history includes hundreds of pre-reset rows,
+  // which usePaperEvidence would otherwise silently promote to "current" evidence. These tests prove
+  // the fix (cutover-based order filtering, sourced from the lane's OWN VM evidenceVersionSummary)
+  // without breaking the pre-existing "paper book promotes a lane the VM row hasn't caught up to"
+  // test just above, which deliberately has NO derivable cutover (freshValid:0) and must keep pooling
+  // every order unfiltered.
+  describe("evidence-version cutover filtering for reset-lane paper-book economics", () => {
+    const CUTOVER_ISO = "2026-06-05T00:00:00.000Z";
+    const resetLaneRow = () => ({
+      variantId: "CG_WIDE_FAST_LONG", label: "Wide Fast Long", exitRule: "tp1_full" as const,
+      fillMode: "taker" as const, costModel: "taker" as const,
+      evidenceVersionSummary: {
+        evidenceVersion: "CG_WIDE_FAST_LONG@36H-v1", resetCutoverAt: CUTOVER_ISO,
+        resetCutoverAtMs: Date.parse(CUTOVER_ISO), legacyExcludedRows: 750,
+        legacyExclusionReasons: [{ reason: "openMaxHoldMs absent (pre-reset row, written before this field existed)", count: 750 }],
+        previousEvidenceVersion: null,
+      },
+      total: 1, open: 0, resolved: 1, freshValid: 1, rejected: 0, noFill: 0, expired: 0, dataFailure: 0,
+      netAvgR: 0.6, grossAvgR: 0.7, pf: 999_999, wr: 1, avgWinR: 0.6, avgLossR: null,
+      payoffRatio: null, breakEvenWR: null, actualWR: 1, avgCostR: 0.1, costDragR: 0.1,
+      noFillRate: 0, expiredRate: 0, avgHoldingMinutes: 60, approxMaxDrawdownR: 0,
+      maxAdverseStreak: 0, topSymbolPnlShare: 1, plus10bpsNetAvgR: 0.5, plus10bpsStillPositive: true,
+      calendarDays: 1, distinctRegimes: 1, byRegime: [], byEntryVariant: [], oosThirds: null,
+      allThreeOosPositive: true, rolling: [], status: "COLLECTING", statusReason: "freshValid 1 < 10",
+      blockers: ["freshValid 1 < 10"], cautions: [],
+    });
+    const paperOrder = (id: string, openedAt: string) => ({
+      id, observationId: `obs-${id}`,
+      sourceObservationKey: `BTCUSDT|LONG|${openedAt}`,
+      sourceType: "ALLOCATOR_LANE",
+      selectedLaneId: "CG_LONG_VARIANT_MATRIX:CG_WIDE_FAST_LONG",
+      symbol: "BTCUSDT", direction: "LONG", regime: "Bullish expansion",
+      entryPrice: 100, stopLoss: 97, takeProfitLevels: [101.5],
+      paperStatus: "PAPER_CLOSED_WIN", netR: 0.4, netPnlAmount: 4, plannedStopDistanceBps: 300,
+      openedAt, updatedAt: openedAt, closedAt: openedAt,
+      paperOrderMode: "HEADLINE", paperRiskLabel: "EXPERIMENTAL", reportOnly: true, paperOnly: true,
+    });
+
+    it("orders opened BEFORE the lane's own resetCutoverAt are excluded from paper-book economics; orders at/after it count normally", () => {
+      const input = baseInput();
+      input.variantMatrix.rows = [resetLaneRow() as never];
+      input.orders = [
+        paperOrder("legacy-1", "2026-06-01T00:00:00.000Z"),
+        paperOrder("legacy-2", "2026-06-02T00:00:00.000Z"),
+        paperOrder("legacy-3", "2026-06-03T00:00:00.000Z"),
+        paperOrder("current-1", "2026-06-05T00:00:00.000Z"), // exactly at cutover — inclusive (>=)
+        paperOrder("current-2", "2026-06-06T00:00:00.000Z"),
+      ] as never;
+
+      const lane = buildNeuralMapTelemetry(input).lanes.find((l) => l.id === "CG_LONG_VARIANT_MATRIX:CG_WIDE_FAST_LONG");
+      expect(lane?.statsSource).toBe("PAPER_BOOK");
+      expect(lane?.closed).toBe(2); // NOT 5 — the 3 pre-cutover orders must not count
+      expect(lane?.legacyExcludedRows).toBe(750); // still surfaced from the VM row's own summary
+      expect(lane?.evidenceVersion).toBe("CG_WIDE_FAST_LONG@36H-v1");
+    });
+
+    it("a reset lane with a known cutover but ZERO orders at/after it falls back to the VM row — never shows the legacy-only pool as current", () => {
+      const input = baseInput();
+      input.variantMatrix.rows = [resetLaneRow() as never];
+      input.orders = [
+        paperOrder("legacy-1", "2026-06-01T00:00:00.000Z"),
+        paperOrder("legacy-2", "2026-06-02T00:00:00.000Z"),
+      ] as never;
+
+      const lane = buildNeuralMapTelemetry(input).lanes.find((l) => l.id === "CG_LONG_VARIANT_MATRIX:CG_WIDE_FAST_LONG");
+      expect(lane?.statsSource).toBe("VM_SIM"); // usePaperEvidence never triggers: 0 orders survive the filter
+      expect(lane?.closed).toBe(1); // the VM row's own freshValid, not 2 legacy paper closes
+      expect(lane?.status).toBe("COLLECTING");
+    });
+
+    it("REGRESSION: a non-reset lane with the identical legacy+current order split still pools every order — cutover filtering applies only to EVIDENCE_RESET_CUTOVER_VARIANT_IDS lanes", () => {
+      const input = baseInput();
+      input.variantMatrix.rows = [{
+        ...resetLaneRow(),
+        variantId: "CG_WIDE_STOP_TP_WIDE",
+        evidenceVersionSummary: {
+          evidenceVersion: null, resetCutoverAt: null, resetCutoverAtMs: null,
+          legacyExcludedRows: 0, legacyExclusionReasons: [], previousEvidenceVersion: null,
+        },
+      } as never];
+      input.orders = [
+        paperOrder("legacy-1", "2026-06-01T00:00:00.000Z"),
+        paperOrder("legacy-2", "2026-06-02T00:00:00.000Z"),
+        paperOrder("current-1", "2026-06-06T00:00:00.000Z"),
+      ].map((order) => ({ ...order, selectedLaneId: "CG_LONG_VARIANT_MATRIX:CG_WIDE_STOP_TP_WIDE" })) as never;
+
+      const lane = buildNeuralMapTelemetry(input).lanes.find((l) => l.id === "CG_LONG_VARIANT_MATRIX:CG_WIDE_STOP_TP_WIDE");
+      expect(lane?.statsSource).toBe("PAPER_BOOK");
+      expect(lane?.closed).toBe(3); // unfiltered — no reset applies to this lane
+    });
   });
 
   it("classifies a diagnostic-only loss as DIAGNOSTIC (neutral) — no critical/warning alert", () => {

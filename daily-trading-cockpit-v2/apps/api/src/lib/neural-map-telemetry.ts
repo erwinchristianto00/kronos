@@ -2,13 +2,25 @@ import type { CoreScanAutoRefreshStatus } from "./core-scan-auto-refresh.js";
 import {
   BULL_SCALEOUT_VARIANT_ID,
   BULL_TREND_VARIANT_ID,
+  EVIDENCE_RESET_CUTOVER_VARIANT_IDS,
+  MAX_TOP_SYMBOL_SHARE,
   PF_STRONG,
+  PROMOTION_MIN_DEV_ROWS,
+  PROMOTION_MIN_EFFECTIVE_N,
+  PROMOTION_MIN_HOLDOUT_ROWS,
+  PROMOTION_MIN_HOLDOUT_EFFECTIVE_N,
+  STABLE_MIN_DEV_ROWS,
+  STABLE_MIN_EFFECTIVE_N,
   STABLE_MIN_FRESH,
+  STABLE_MIN_HOLDOUT_ROWS,
+  STABLE_MIN_HOLDOUT_EFFECTIVE_N,
   VARIANT_MATRIX_DEFINITIONS,
   WATCHABLE_MIN_FRESH,
   type CurrentGuardVariantMatrixReport,
+  type LaneEvidenceVersionSummary,
   type VariantBreakdownRow,
   type VariantContextEvidenceRow,
+  type VariantMatrixStageProof,
 } from "./current-guard-variant-matrix.js";
 import type { MixedBudgetForwardValidationReport, MixedRegimeReport, OpenOrderStaleAudit } from "./mixed-regime-router.js";
 import type { PaperOrder, PaperPerformanceReport } from "./paper-execution-router.js";
@@ -81,6 +93,55 @@ export interface NeuralLaneCohortStats {
   statusReason?: string | null;
 }
 
+/**
+ * Display projection of one immutable stage-proof window (`VariantMatrixStageProof`).
+ *
+ * This exists because raw row counts stopped being the STABLE/PROMOTION gate. `freshValid` is the
+ * FULL fresh-valid population and grows without bound, so "freshValid vs STABLE_MIN_FRESH(100)" is
+ * no longer a maturity measure — a lane can sit at thousands of rows with no frozen window at all.
+ * `deriveVariantStatus` reads `ok` here and nothing else, so this is the only honest source for
+ * "how far is this lane from the next stage".
+ */
+export interface NeuralLaneStageProof {
+  stage: "stable" | "promotion";
+  /** False ⇒ no window frozen for this stage yet; `ok` is false and every count below is 0. */
+  frozen: boolean;
+  /** The gate verdict. Dev floors AND dev economics AND holdout sufficiency, all ANDed. */
+  ok: boolean;
+  devRows: number;
+  devEffectiveN: number;
+  /** Distinct symbols contributing to the dev slice. Diversity input to the dev gate. */
+  devDistinctSymbolCount: number;
+  /** Distinct regime EPISODES (run-length-encoded, not distinct string labels) in the dev slice. */
+  devDistinctRegimes: number;
+  /** Calendar-day span of the dev slice. Null while unfrozen or the slice is empty. */
+  devCalendarDays: number | null;
+  /** Fraction of dev-slice PnL attributable to the single largest-PnL symbol — the concentration
+   *  term MAX_TOP_SYMBOL_SHARE gates. Compare against policyThresholds.maxTopSymbolPnlShare on the
+   *  top-level telemetry response; never hardcode the 0.4 floor in a consumer. */
+  devTopSymbolPnlShare: number | null;
+  devNetAvgR: number | null;
+  devPf: number | null;
+  holdoutRows: number;
+  holdoutEffectiveN: number;
+  /** Rows for which the stress figure is genuinely computable — see VariantMatrixStageHoldoutEvidence's
+   *  own doc. Can be less than holdoutRows; `sufficient` already accounts for this, exposed here only
+   *  as a diagnostic so a caller can explain a `sufficient:false` holdout that still has plenty of rows. */
+  holdoutStressableRows: number;
+  holdoutDistinctSymbolCount: number;
+  holdoutNetAvgR: number | null;
+  holdoutPf: number | null;
+  holdoutStressNetAvgR: number | null;
+  /** THE holdout proof — all five terms ANDed. Redundant with `ok` at the aggregate level (ok is
+   *  dev floors AND dev economics AND this), exposed separately so a caller can tell "dev is fine,
+   *  holdout isn't" apart from "dev itself is short". */
+  holdoutSufficient: boolean;
+  /** Diagnostic split-out of holdout economics: net, PF, or stress reads actively negative. */
+  holdoutNegative: boolean;
+  /** One entry per failing term, each already carrying its numeric shortfall. */
+  blockers: string[];
+}
+
 export interface NeuralMapLane {
   id: string;
   label: string;
@@ -89,12 +150,29 @@ export interface NeuralMapLane {
   active: boolean;
   open: number;
   closed: number;
-  /** VM-sim freshValid (CLOSED_WIN+CLOSED_LOSS) for this lane's geometry, vs the
-   *  threshold to leave SHADOW_ONLY. This is the REAL per-lane OOS maturity meter,
-   *  distinct from the mixed-regime guardrail OOS (inactive outside a Mixed regime).
+  /** VM-sim freshValid (CLOSED_WIN+CLOSED_LOSS) for this lane's geometry: the RAW DEPTH of the full
+   *  fresh-valid population, which grows for as long as the lane trades.
+   *
+   *  NOT a maturity meter beyond WATCHABLE. It gates exactly one rung — `oosThreshold`
+   *  (WATCHABLE_MIN_FRESH), the floor to leave SHADOW_ONLY. STABLE/PROMOTION are gated on the frozen
+   *  stage windows below, whose independence floors are on a ~1000x different scale, so rendering
+   *  this count against STABLE_MIN_FRESH(100)/PROMOTION_MIN_FRESH(200) reads as "proven" for a lane
+   *  the gate still rejects. Use `stableProof`/`promotionProof` for stage progress.
    *  null for paper-evidence lanes that have no VM row. */
   oosFreshValid: number | null;
+  /** WATCHABLE_MIN_FRESH only — the one rung `oosFreshValid` legitimately measures. */
   oosThreshold: number;
+  /**
+   * The two immutable stage-proof windows behind `status`. Both are the AGGREGATE row's copies,
+   * which is the self-consistent pairing: `status` here is the aggregate diagnostic status, and
+   * `deriveVariantStatus` produced it by reading these exact structs. Per-context proof (the copy
+   * that gates live eligibility) is surfaced separately through `cohorts`.
+   *
+   * null for paper-book lanes with no VM evidence row — the dashboard must render "no proof" there
+   * and must never substitute a raw row count.
+   */
+  stableProof: NeuralLaneStageProof | null;
+  promotionProof: NeuralLaneStageProof | null;
   netAvgR: number | null;
   pf: number | null;
   wr: number | null;
@@ -103,6 +181,17 @@ export interface NeuralMapLane {
    * a sim/research netAvgR rendered next to paper PnL dollars reads as one dataset (audit finding).
    */
   statsSource: NeuralLaneStatsSource;
+  /**
+   * Lane's evidence-version split — see LaneEvidenceVersionSummary's own doc. All-null/zero for any
+   * lane with no active reset (nothing to split). netAvgR/pf/wr/closed above are ALREADY current-only
+   * for a reset lane (isFreshValidObs enforces that at the source); these fields exist to make that
+   * split visible and auditable, not to gate anything themselves.
+   */
+  evidenceVersion: string | null;
+  resetCutoverAt: string | null;
+  legacyExcludedRows: number;
+  legacyExclusionReasons: { reason: string; count: number }[];
+  previousEvidenceVersion: string | null;
   cohorts: {
     LONG: NeuralLaneCohortStats | null;
     SHORT: NeuralLaneCohortStats | null;
@@ -194,10 +283,24 @@ export interface DiagnosticDirectionStats {
   wr: number | null;
 }
 
+/** The exact independent-episode/row thresholds each stage's proof is gated on, read directly from
+ *  current-guard-variant-matrix.ts's own exported constants — never duplicated as separate literals
+ *  here or in any consumer. `comparator` is the exact relation `ok`/`blockers` are computed with
+ *  (effectiveN/rows compared against these floors); do not assume `>` or `>=` without reading it. */
+export interface NeuralMapPolicyThresholds {
+  comparator: ">=";
+  stable: { minDevRows: number; minDevEffectiveN: number; minHoldoutRows: number; minHoldoutEffectiveN: number };
+  promotion: { minDevRows: number; minDevEffectiveN: number; minHoldoutRows: number; minHoldoutEffectiveN: number };
+  /** Dev-slice concentration floor (fraction of PnL from the single largest symbol). A dev slice at
+   *  or under this is fine; strictly over it is one of the dev blockers. */
+  maxTopSymbolPnlShare: number;
+}
+
 export interface NeuralMapTelemetry {
   version: "neural-map-v1";
   generatedAt: string;
   staleAfterSec: number;
+  policyThresholds: NeuralMapPolicyThresholds;
   controller: {
     regime: string | null;
     mode: string;
@@ -412,6 +515,41 @@ function cohortFromContextEvidence(row: VariantContextEvidenceRow | undefined): 
     payoffRatio: row.payoffRatio,
     status: row.status,
     statusReason: row.statusReason,
+  };
+}
+
+/**
+ * Project a stage proof for display. `undefined` in (paper-book lane with no VM row, or a report
+ * shape that predates the stage-proof fields) ⇒ null out, so the dashboard shows "no proof". It must
+ * never fall back to a row count: that substitution is the exact failure this projection removes.
+ */
+function neuralStageProof(
+  stage: NeuralLaneStageProof["stage"],
+  proof: VariantMatrixStageProof | undefined,
+): NeuralLaneStageProof | null {
+  if (!proof) return null;
+  return {
+    stage,
+    frozen: proof.frozen === true,
+    ok: proof.ok === true,
+    devRows: proof.dev?.rows ?? 0,
+    devEffectiveN: proof.dev?.effectiveN ?? 0,
+    devDistinctSymbolCount: proof.dev?.distinctSymbolCount ?? 0,
+    devDistinctRegimes: proof.dev?.distinctRegimes ?? 0,
+    devCalendarDays: proof.dev?.calendarDays ?? null,
+    devTopSymbolPnlShare: proof.dev?.topSymbolPnlShare ?? null,
+    devNetAvgR: proof.dev?.netAvgR ?? null,
+    devPf: proof.dev?.pf ?? null,
+    holdoutRows: proof.holdout?.rows ?? 0,
+    holdoutEffectiveN: proof.holdout?.effectiveN ?? 0,
+    holdoutStressableRows: proof.holdout?.stressableRows ?? 0,
+    holdoutDistinctSymbolCount: proof.holdout?.distinctSymbolCount ?? 0,
+    holdoutNetAvgR: proof.holdout?.netAvgR ?? null,
+    holdoutPf: proof.holdout?.pf ?? null,
+    holdoutStressNetAvgR: proof.holdout?.stressNetAvgR ?? null,
+    holdoutSufficient: proof.holdout?.sufficient === true,
+    holdoutNegative: proof.holdout?.negative === true,
+    blockers: Array.isArray(proof.blockers) ? proof.blockers : [],
   };
 }
 
@@ -1212,7 +1350,27 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
 
   const paperAndVmLanes = laneIds.map((id): NeuralMapLane => {
     const row = rowsById.get(id);
-    const economics = laneEconomics(input.orders, id);
+    // 2026-08-05 evidence-version fix: laneEconomics() pools PaperOrder history with NO knowledge of
+    // EVIDENCE_RESET_CUTOVER_VARIANT_IDS/openMaxHoldMs (that field lives on the VM observation type,
+    // not PaperOrder) — a reset lane with pre-reset paper-order history (all 3 reset lanes have
+    // hundreds of such rows in production) would silently show that legacy-inclusive pool as
+    // "current" evidence downstream via usePaperEvidence, the exact false-readiness bug this closes.
+    // Filtered at the SOURCE (laneEconomics' own input) rather than by disabling usePaperEvidence
+    // outright, so the pre-existing "paper book promotes a lane the VM row hasn't caught up to" path
+    // (deliberately tested with freshValid:0 + real paper orders) keeps working unchanged whenever no
+    // cutover is knowable yet — there is nothing proven current/legacy to split in that case.
+    // cutoverAtMs is null until this lane's OWN VM evidence proves at least one genuinely post-reset
+    // row (see LaneEvidenceVersionSummary.resetCutoverAtMs) — never guessed from a wall-clock date.
+    const cutoverAtMs = row?.evidenceVersionSummary?.resetCutoverAtMs ?? null;
+    const isResetLane = row != null && EVIDENCE_RESET_CUTOVER_VARIANT_IDS.has(row.variantId);
+    const ordersForEconomics =
+      isResetLane && cutoverAtMs !== null
+        ? input.orders.filter((order) => {
+            const openedMs = Date.parse(order.openedAt);
+            return Number.isFinite(openedMs) && openedMs >= cutoverAtMs;
+          })
+        : input.orders;
+    const economics = laneEconomics(ordersForEconomics, id);
     const unrealized = input.paperUnrealized?.lanes[id] ?? null;
     // LONG lanes are admitted from fresh scan candidates into the paper book.
     // Once that book has evidence, it is the honest source of truth; the VM row
@@ -1281,10 +1439,25 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
       closed: evidenceRow?.freshValid ?? economics.closed,
       oosFreshValid: evidenceRow?.freshValid ?? null,
       oosThreshold: WATCHABLE_MIN_FRESH,
+      // Fail closed on a row that predates the stage-proof fields (older report shape, or a
+      // hand-built evidence object): absent proof renders as "no proof", never as satisfied.
+      stableProof: neuralStageProof("stable", evidenceRow?.stableProof),
+      promotionProof: neuralStageProof("promotion", evidenceRow?.promotionProof),
       netAvgR,
       pf: evidenceRow?.pf ?? economics.pf,
       wr: evidenceRow?.wr ?? economics.wr,
       statsSource,
+      // Read from the raw VM row (not the conditionally-nulled evidenceRow) — the version split is
+      // diagnostic about the LANE, independent of which source netAvgR/pf/wr/closed above are drawn
+      // from this cycle. All-null/zero when row is absent or carries no active reset.
+      // Optional-chained past evidenceVersionSummary itself, not just row: some report shapes in this
+      // codebase (test fixtures, older callers) hand-build a row-shaped object without it, and this
+      // must fail closed to "no version split" rather than throw.
+      evidenceVersion: row?.evidenceVersionSummary?.evidenceVersion ?? null,
+      resetCutoverAt: row?.evidenceVersionSummary?.resetCutoverAt ?? null,
+      legacyExcludedRows: row?.evidenceVersionSummary?.legacyExcludedRows ?? 0,
+      legacyExclusionReasons: row?.evidenceVersionSummary?.legacyExclusionReasons ?? [],
+      previousEvidenceVersion: row?.evidenceVersionSummary?.previousEvidenceVersion ?? null,
       cohorts: {
         LONG: cohortFromBreakdown(directionRows.find((candidate) => candidate.key === "LONG")) ?? paperOnlyLongCohort,
         SHORT: cohortFromBreakdown(directionRows.find((candidate) => candidate.key === "SHORT")) ?? paperOnlyShortCohort,
@@ -1637,6 +1810,22 @@ export function buildNeuralMapTelemetry(input: NeuralMapTelemetryInput): NeuralM
     version: "neural-map-v1",
     generatedAt,
     staleAfterSec: 30,
+    policyThresholds: {
+      comparator: ">=",
+      stable: {
+        minDevRows: STABLE_MIN_DEV_ROWS,
+        minDevEffectiveN: STABLE_MIN_EFFECTIVE_N,
+        minHoldoutRows: STABLE_MIN_HOLDOUT_ROWS,
+        minHoldoutEffectiveN: STABLE_MIN_HOLDOUT_EFFECTIVE_N,
+      },
+      promotion: {
+        minDevRows: PROMOTION_MIN_DEV_ROWS,
+        minDevEffectiveN: PROMOTION_MIN_EFFECTIVE_N,
+        minHoldoutRows: PROMOTION_MIN_HOLDOUT_ROWS,
+        minHoldoutEffectiveN: PROMOTION_MIN_HOLDOUT_EFFECTIVE_N,
+      },
+      maxTopSymbolPnlShare: MAX_TOP_SYMBOL_SHARE,
+    },
     controller: {
       regime: input.controller.currentRegime,
       mode: input.controller.controllerMode,
