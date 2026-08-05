@@ -201,9 +201,62 @@ Never restarted, never deployed to, never had its `.env`/config/data touched. No
 document targeted only `/root/kronos-research-staging/`, `/root/kronos-testnet-staging/`, and (for
 the read-only, immutable backups in §7) `/root/kronos-releases/` and `/root/kronos-testnet-releases/`.
 
-## 10. Status at time of writing
+## 10. Promotion execution (Task E) — completed
 
-Tasks A (legacy-evidence reset mechanism), B (staging identity spoofing), C (causal chain proof/
-honest reporting), and this document (D) are complete. Task E (promotion execution to active
-3101/3102) and Task F (final leakage/confusion/bypass audit) are the remaining gates before a
-`KRONOS_ACTIVE_RESEARCH_TESTNET_PROMOTION_READY` verdict can be returned.
+Commit `2c93a9c` (`bc3c586` + `docs` commit `2c93a9c` itself) promoted to both active instances via
+new versioned release directories, mirroring the existing convention exactly:
+
+- **3102 (testnet):** `/root/kronos-testnet-releases/2c93a9c/`. Structural diff against the prior
+  active release (`72b9a1a`) showed only two differences, both benign: the new `RELEASE_SHA` marker
+  file (intentional) and an absent `apps/api/dist/` (unused — the server runs via `tsx` directly
+  against `src/`, never `dist/`, confirmed by `deploy/run-api.sh`'s own content). `.env` byte-identical
+  (SHA256 match) to the prior release. Both `data` symlinks (top-level and `apps/api/data`) point to
+  the exact same stable anchor (`128b09f`) the prior release used — verified via `readlink`, not
+  assumed. `node_modules` entry count matches exactly (120=120); workspace symlinks inside it are
+  relative (`../../packages/shared` etc.), so copying the directory into a new release path resolves
+  correctly without edits. Typechecked clean in place (`npx tsc --noEmit`) before any restart.
+  Promoted via `pm2 delete dtc-api-testnet && pm2 start <new-run-api.sh> --name dtc-api-testnet`.
+- **3101 (research):** identical procedure, `/root/kronos-releases/2c93a9c/`. Same verification
+  results (`.env` hash match, symlink match, node_modules 120=120, clean typecheck).
+
+**Post-promotion verification, both instances:**
+- Health: `GET /api/health` → 200 on both.
+- No new error-log entries after restart (last pre-restart entries dated 2026-08-04).
+- `GET /api/shadow/cortex-collection-status`: `instanceId` reports the instance's own honest physical
+  port (`"3101"`/`"3102"`) with `logicalRole: null` (direct allowlist match, no role grant needed —
+  correct for real production instances), `status: "shadow-active"`, existing journal found and
+  validated clean (`journalBadLines: 0`).
+- File hashes for 4 key files (`app.ts`, `current-guard-variant-matrix.ts`,
+  `forward-causal-collection.ts`, `four-brain-live-gather-bindings.ts`) — byte-identical between the
+  two promoted releases, and `RELEASE_SHA` on both reads `2c93a9cd226ad6834b9b55cf9434549d0daf0c59`.
+  `app.ts`'s hash also matches the value recorded in §5 for the pre-promotion staging snapshot at
+  `b885a99` — expected and correct, since no later commit touched that file.
+- **Legacy-evidence reset verified against REAL production data, not a test fixture**: ran
+  `buildCurrentGuardVariantMatrixReport` directly (via `tsx`, the exact code path the server itself
+  uses) against the live store on each freshly-promoted instance.
+  - `CG_WIDE_FAST_LONG`, `CG_BE_AFTER_05`, `BL_TREND_SCALEOUT_STOP200`: **freshValid = 0** on both
+    3101 and 3102 — down from the pre-promotion contaminated counts in §7 (251/524/270 and
+    237/499/261). Confirms the reset is genuinely active and reading real data, not a no-op.
+  - Control (`CG_WIDE_STOP_TP_WIDE`, not in the reset set), checked on 3102: **freshValid = 16** —
+    confirms the reset is narrowly scoped, not a blanket change to evidence handling.
+
+`dtc-api-live` restart count throughout this entire promotion sequence: **8378, unchanged** (checked
+immediately before and after each of the two restarts above).
+
+## 11. Final audit (Task F)
+
+Re-checked every consumer this session's commits touch against each named risk:
+
+| Risk | Finding | Evidence |
+|---|---|---|
+| Legacy-row leakage | Closed | §10 — real 0-count confirmed on live production data for all 3 reset lanes |
+| Identity confusion | Closed | §10 — `instanceId` honest on both promoted instances; the 3111/3112 spoofing that caused it is gone (§4) |
+| Authority bypass | Closed | `CORTEX_LIVE_BETA` hardcoded `=0` (not env-configurable); campaigns confirmed `configured:false` live on all 4 instances checked this session |
+| Episode inflation | Closed | The `openMaxHoldMs` mechanism (§1, commit `b885a99`) is the direct fix for this exact failure mode |
+| ACCOUNTING_INCOMPLETE inclusion | Confirmed still excluded | `narrative-tags.ts:156` — `b.accountingStatus !== "ACCOUNTING_INCOMPLETE"`, unchanged by any commit this session |
+| Stale reservations | Covered | `account-exposure-coordinator.test.ts` + integration suite, 78/78 passing fresh this session |
+| Any 3103 path | No new bypass | Exhaustive grep for every literal `"3103"` across all 5 files this session modified — every occurrence is a blocking check, checked first/unconditionally; the one pre-existing narrow exception (`lane-context-journal-binding.ts`'s `COLLECT_ONLY` report-only carve-out) predates this session and grants no trading authority (`COLLECT_ONLY=true ⇒ REPORT_ONLY`, journaling only) |
+
+## 12. Status at time of writing
+
+All of A-F complete. Verdict: **`KRONOS_ACTIVE_RESEARCH_TESTNET_PROMOTION_READY`**.
