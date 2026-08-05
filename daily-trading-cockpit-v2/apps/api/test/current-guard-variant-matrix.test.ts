@@ -13,6 +13,7 @@ import {
   EVIDENCE_RESET_CUTOVER_VARIANT_IDS,
   evidenceVersionLabel,
   summarizeLaneEvidenceVersion,
+  CURRENT_GUARD_VARIANT_MATRIX_POLICY_VERSION,
   CurrentGuardVariantMatrixStore,
   getCurrentGuardVariantMatrixStore,
   _resetCurrentGuardVariantMatrixStoreForTests,
@@ -2718,13 +2719,19 @@ describe("current-guard-variant-matrix", () => {
       expect(summarizeLaneEvidenceVersion(untouchedLane, obsForVariant)).toEqual({
         evidenceVersion: null, resetCutoverAt: null, resetCutoverAtMs: null,
         legacyExcludedRows: 0, legacyExclusionReasons: [], previousEvidenceVersion: null,
+        // A non-reset lane has nothing to split — no policy version or cutover source is meaningful
+        // for it either, since EVIDENCE_RESET_CUTOVER_VARIANT_IDS never applies.
+        policyVersion: null, cutoverSource: "INFERRED",
       });
     });
 
-    it("a reset lane with ZERO rows returns the all-null/zero summary — not an exception, not a fabricated version", () => {
+    it("a reset lane with ZERO rows returns the all-null/zero EVIDENCE summary, but a real policyVersion — no canonical registry exists yet, so cutoverSource is INFERRED even with nothing to infer from", () => {
       expect(summarizeLaneEvidenceVersion("CG_WIDE_FAST_LONG", [])).toEqual({
         evidenceVersion: null, resetCutoverAt: null, resetCutoverAtMs: null,
         legacyExcludedRows: 0, legacyExclusionReasons: [], previousEvidenceVersion: null,
+        // policyVersion is NOT evidence-dependent — it names the policy this reset LANE operates
+        // under, which is true even with zero rows on tape. Only the row-derived fields are null.
+        policyVersion: CURRENT_GUARD_VARIANT_MATRIX_POLICY_VERSION, cutoverSource: "INFERRED",
       });
     });
 
@@ -2848,6 +2855,12 @@ describe("current-guard-variant-matrix", () => {
         );
         expect(row.evidenceVersionSummary).toEqual(directSummary);
         expect(row.evidenceVersionSummary.legacyExcludedRows).toBe(750);
+        // Goal's exact regression fixture (750 legacy + 1 post-reset winner, addResolvedContextCohort's
+        // netR: () => 1 means every row including the 1 current one is a winner — zero losses):
+        // cutoverSource must read INFERRED (no canonical registry exists for this lane family yet)
+        // and policyVersion must be the real, non-fabricated lane-family constant.
+        expect(row.evidenceVersionSummary.cutoverSource).toBe("INFERRED");
+        expect(row.evidenceVersionSummary.policyVersion).toBe(CURRENT_GUARD_VARIANT_MATRIX_POLICY_VERSION);
       } finally {
         if (originalMaxHoldHours === undefined) delete def.maxHoldHours;
         else def.maxHoldHours = originalMaxHoldHours;

@@ -4081,6 +4081,16 @@ export interface LaneEvidenceVersionSummary {
    *  a real observation of the previous width, not an inferred guess. Null when no such row exists —
    *  never fabricated from a remembered/assumed number. */
   previousEvidenceVersion: string | null;
+  /** The lane-family-wide policy version stamped on every observation (variantVersion /
+   *  CURRENT_GUARD_VARIANT_MATRIX_POLICY_VERSION) — the closest REAL, canonical value available
+   *  today. Not reset-event-specific (this codebase has no per-reset policy-version stamp; see
+   *  resolveCanonicalCutoverMetadata's own doc comment for why). Null only for non-reset lanes. */
+  policyVersion: string | null;
+  /** CANONICAL only if resolveCanonicalCutoverMetadata found a stored registry entry; INFERRED
+   *  whenever evidenceVersion/resetCutoverAt were derived from row data instead (the only path that
+   *  exists today — see that function's doc comment). Exposed so a caller/dashboard can distinguish
+   *  a stored fact from a computed one rather than silently trusting whichever happened to run. */
+  cutoverSource: "CANONICAL" | "INFERRED";
 }
 
 const NO_RESET_EVIDENCE_VERSION_SUMMARY: LaneEvidenceVersionSummary = {
@@ -4090,7 +4100,36 @@ const NO_RESET_EVIDENCE_VERSION_SUMMARY: LaneEvidenceVersionSummary = {
   legacyExcludedRows: 0,
   legacyExclusionReasons: [],
   previousEvidenceVersion: null,
+  policyVersion: null,
+  cutoverSource: "INFERRED",
 };
+
+interface CanonicalCutoverMetadata {
+  evidenceVersion: string;
+  cutoverAt: string;
+  policyVersion: string;
+}
+
+/**
+ * 2026-08-05: the ONE preferred source for a lane's evidence-version identity — checked FIRST,
+ * before any row-level inference is attempted. Returns `null` for every lane today: this codebase
+ * has no stored evidence-reset registry for the variant-matrix lane family (confirmed by direct
+ * search — no resetRegistry/evidenceRegistry file, no per-observation evidencePolicyVersion/
+ * evidenceEra/policyDeploymentAt stamp of the kind forward-causal-collection.ts's CausalIdentity
+ * uses, and current-guard-variant-matrix.json's own persisted shape is exactly
+ * `{observations, resolverMeta}` — nothing else round-trips through flush()).
+ * EVIDENCE_RESET_CUTOVER_VARIANT_IDS + openMaxHoldMs was a deliberate, narrower design choice
+ * instead (see that constant's own doc comment) — a genuine registry (the codebase already knows
+ * this pattern: base-route-current-guard-frozen.ts's FrozenCriteriaSnapshot stores a real
+ * version+frozenAt+policyVersion once, for a different lane family) was never built for this reset.
+ *
+ * This function is the single place a future registry would be wired in — every caller already
+ * reads `cutoverSource` rather than assuming, so adding a real implementation here is the ONLY
+ * change that would ever be needed to switch every consumer from INFERRED to CANONICAL.
+ */
+function resolveCanonicalCutoverMetadata(_variantId: VariantMatrixVariantId): CanonicalCutoverMetadata | null {
+  return null;
+}
 
 export function summarizeLaneEvidenceVersion(
   variantId: VariantMatrixVariantId,
@@ -4109,6 +4148,11 @@ export function summarizeLaneEvidenceVersion(
     // re-checking the non-version terms) — the version-specific branch below still delegates the
     // CURRENT/legacy split to the exact same `openMaxHoldMs === variantMaxHoldMs(...)` test
     // isFreshValidObs itself uses, so the two functions cannot silently disagree on that test.
+    //
+    // This classification loop runs REGARDLESS of canonical-vs-inferred below: legacyExcludedRows is
+    // a row COUNT, not a registry fact, and there is no canonical source for it even conceptually
+    // (a stored registry would supply evidenceVersion/cutoverAt/policyVersion, never a live count of
+    // how many rows a growing store currently excludes).
     const wouldBeFreshIgnoringVersion =
       (obs.status === "CLOSED_WIN" || obs.status === "CLOSED_LOSS") &&
       obs.isFreshValid === true &&
@@ -4144,16 +4188,34 @@ export function summarizeLaneEvidenceVersion(
       count: excludedStale,
     });
   }
+  const legacyExcludedRows = excludedAbsent + excludedStale;
+  const previousEvidenceVersion =
+    maxLegacyMaxHoldMtmMinutes !== null
+      ? `~${Math.round(maxLegacyMaxHoldMtmMinutes / 60)}H (measured from legacy MAX_HOLD_MTM closes)`
+      : null;
+
+  const canonical = resolveCanonicalCutoverMetadata(variantId);
+  if (canonical) {
+    return {
+      evidenceVersion: canonical.evidenceVersion,
+      resetCutoverAt: canonical.cutoverAt,
+      resetCutoverAtMs: toMs(canonical.cutoverAt),
+      legacyExcludedRows,
+      legacyExclusionReasons,
+      previousEvidenceVersion,
+      policyVersion: canonical.policyVersion,
+      cutoverSource: "CANONICAL",
+    };
+  }
   return {
     evidenceVersion,
     resetCutoverAt: earliestCurrentMs !== null ? new Date(earliestCurrentMs).toISOString() : null,
     resetCutoverAtMs: earliestCurrentMs,
-    legacyExcludedRows: excludedAbsent + excludedStale,
+    legacyExcludedRows,
     legacyExclusionReasons,
-    previousEvidenceVersion:
-      maxLegacyMaxHoldMtmMinutes !== null
-        ? `~${Math.round(maxLegacyMaxHoldMtmMinutes / 60)}H (measured from legacy MAX_HOLD_MTM closes)`
-        : null,
+    previousEvidenceVersion,
+    policyVersion: CURRENT_GUARD_VARIANT_MATRIX_POLICY_VERSION,
+    cutoverSource: "INFERRED",
   };
 }
 
