@@ -3707,6 +3707,11 @@ export interface CurrentGuardVariantMatrixRow {
   fillMode: VariantFillMode;
   costModel: VariantFillMode;
 
+  /** See LaneEvidenceVersionSummary. All-null/zero for every lane outside
+   *  EVIDENCE_RESET_CUTOVER_VARIANT_IDS — dashboards should treat that as "no version split applies"
+   *  and render current-population fields as-is, never as a false COLLECTING/legacy state. */
+  evidenceVersionSummary: LaneEvidenceVersionSummary;
+
   total: number;
   open: number;
   resolved: number;
@@ -4047,6 +4052,109 @@ export function evidenceVersionLabel(obs: CurrentGuardVariantMatrixObservation):
   if (obs.openMaxHoldMs === undefined || obs.openMaxHoldMs !== variantMaxHoldMs(obs.variantId)) return null;
   const hours = Math.round(obs.openMaxHoldMs / (60 * 60 * 1000));
   return `${obs.variantId}@${hours}H-v1`;
+}
+
+/** Dashboard/telemetry-only summary of a lane's evidence-version split. Never used by any admission,
+ *  sizing, or eligibility decision — those all read `isFreshValidObs`/`freshValid` directly, and this
+ *  function's CURRENT branch is verified to agree with `isFreshValidObs` by construction below (same
+ *  reset-lane exact-match test, applied to the same field). All-zero/null for every lane outside
+ *  EVIDENCE_RESET_CUTOVER_VARIANT_IDS — there is nothing to split for a lane with no reset. */
+export interface LaneEvidenceVersionSummary {
+  /** evidenceVersionLabel() of the most recent CURRENT row, or null if this lane has none yet
+   *  (reset shipped but no post-reset row has closed fresh-valid) or is not a reset lane at all. */
+  evidenceVersion: string | null;
+  /** ISO openedAt of the EARLIEST currently-counting (CURRENT) row — i.e. when this lane's active
+   *  evidence version empirically began. There is no stored wall-clock cutover constant (the reset
+   *  keys on an exact openMaxHoldMs config match, never a timestamp), so this is derived from data,
+   *  not a policy value. Null until at least one CURRENT row exists. */
+  resetCutoverAt: string | null;
+  resetCutoverAtMs: number | null;
+  /** Rows that satisfy every fresh-valid criterion EXCEPT the version match — i.e. would count under
+   *  the general (non-reset) grandfather rule, excluded here solely by EVIDENCE_RESET_CUTOVER_VARIANT_IDS.
+   *  Never conflated with rows excluded for unrelated reasons (OPEN/REJECTED/EXPIRED/DATA_FAILURE, or
+   *  isFreshValid false/null) — those are not "legacy version" exclusions and do not count here. */
+  legacyExcludedRows: number;
+  legacyExclusionReasons: { reason: string; count: number }[];
+  /** Best-effort, MEASURED (not configured — no prior width is stored anywhere once superseded) from
+   *  legacy rows whose resolutionSource is exactly "MAX_HOLD_MTM": such a close happens, by
+   *  definition, at the max-hold boundary that was live when it was opened, so its durationMinutes is
+   *  a real observation of the previous width, not an inferred guess. Null when no such row exists —
+   *  never fabricated from a remembered/assumed number. */
+  previousEvidenceVersion: string | null;
+}
+
+const NO_RESET_EVIDENCE_VERSION_SUMMARY: LaneEvidenceVersionSummary = {
+  evidenceVersion: null,
+  resetCutoverAt: null,
+  resetCutoverAtMs: null,
+  legacyExcludedRows: 0,
+  legacyExclusionReasons: [],
+  previousEvidenceVersion: null,
+};
+
+export function summarizeLaneEvidenceVersion(
+  variantId: VariantMatrixVariantId,
+  obsForVariant: readonly CurrentGuardVariantMatrixObservation[],
+): LaneEvidenceVersionSummary {
+  if (!EVIDENCE_RESET_CUTOVER_VARIANT_IDS.has(variantId)) return NO_RESET_EVIDENCE_VERSION_SUMMARY;
+  const currentMaxHoldMs = variantMaxHoldMs(variantId);
+  let evidenceVersion: string | null = null;
+  let earliestCurrentMs: number | null = null;
+  let excludedAbsent = 0;
+  let excludedStale = 0;
+  let maxLegacyMaxHoldMtmMinutes: number | null = null;
+  for (const obs of obsForVariant) {
+    // Every OTHER fresh-valid criterion, deliberately duplicated from isFreshValidObs rather than
+    // called (there is no way to ask "would this pass ignoring only the version term" without
+    // re-checking the non-version terms) — the version-specific branch below still delegates the
+    // CURRENT/legacy split to the exact same `openMaxHoldMs === variantMaxHoldMs(...)` test
+    // isFreshValidObs itself uses, so the two functions cannot silently disagree on that test.
+    const wouldBeFreshIgnoringVersion =
+      (obs.status === "CLOSED_WIN" || obs.status === "CLOSED_LOSS") &&
+      obs.isFreshValid === true &&
+      typeof obs.grossR === "number" && Number.isFinite(obs.grossR) &&
+      typeof obs.netR === "number" && Number.isFinite(obs.netR);
+    if (!wouldBeFreshIgnoringVersion) continue;
+    if (obs.openMaxHoldMs !== undefined && obs.openMaxHoldMs === currentMaxHoldMs) {
+      const label = evidenceVersionLabel(obs);
+      if (label) evidenceVersion = label;
+      const openedMs = toMs(obs.openedAt);
+      if (openedMs !== null && (earliestCurrentMs === null || openedMs < earliestCurrentMs)) earliestCurrentMs = openedMs;
+      continue;
+    }
+    if (obs.openMaxHoldMs === undefined) {
+      excludedAbsent++;
+      if (obs.resolutionSource === "MAX_HOLD_MTM" && typeof obs.durationMinutes === "number" && Number.isFinite(obs.durationMinutes)) {
+        maxLegacyMaxHoldMtmMinutes = Math.max(maxLegacyMaxHoldMtmMinutes ?? 0, obs.durationMinutes);
+      }
+    } else {
+      excludedStale++;
+    }
+  }
+  const legacyExclusionReasons: { reason: string; count: number }[] = [];
+  if (excludedAbsent > 0) {
+    legacyExclusionReasons.push({
+      reason: "openMaxHoldMs absent (pre-reset row, written before this field existed)",
+      count: excludedAbsent,
+    });
+  }
+  if (excludedStale > 0) {
+    legacyExclusionReasons.push({
+      reason: "openMaxHoldMs stale (recorded value no longer matches this lane's current config)",
+      count: excludedStale,
+    });
+  }
+  return {
+    evidenceVersion,
+    resetCutoverAt: earliestCurrentMs !== null ? new Date(earliestCurrentMs).toISOString() : null,
+    resetCutoverAtMs: earliestCurrentMs,
+    legacyExcludedRows: excludedAbsent + excludedStale,
+    legacyExclusionReasons,
+    previousEvidenceVersion:
+      maxLegacyMaxHoldMtmMinutes !== null
+        ? `~${Math.round(maxLegacyMaxHoldMtmMinutes / 60)}H (measured from legacy MAX_HOLD_MTM closes)`
+        : null,
+  };
 }
 
 function isFreshValidObs(obs: CurrentGuardVariantMatrixObservation): boolean {
@@ -5730,6 +5838,7 @@ function buildRow(
     exitRule: def.exitRule,
     fillMode: def.fillMode,
     costModel: def.costModel,
+    evidenceVersionSummary: summarizeLaneEvidenceVersion(def.id, obsForVariant),
     total,
     open,
     resolved: resolvedObs.length,

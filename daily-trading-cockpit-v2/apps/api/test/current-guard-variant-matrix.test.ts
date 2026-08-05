@@ -12,6 +12,7 @@ import {
   BULL_SCALEOUT_VARIANT_ID,
   EVIDENCE_RESET_CUTOVER_VARIANT_IDS,
   evidenceVersionLabel,
+  summarizeLaneEvidenceVersion,
   CurrentGuardVariantMatrixStore,
   getCurrentGuardVariantMatrixStore,
   _resetCurrentGuardVariantMatrixStoreForTests,
@@ -2650,6 +2651,207 @@ describe("current-guard-variant-matrix", () => {
       });
       const nonResetObs = controlStore.all.find((o) => o.variantId === "CG_WIDE_STOP_TP_WIDE")!;
       expect(evidenceVersionLabel(nonResetObs)).toBeNull();
+    });
+  });
+
+  // 2026-08-05 dashboard evidence-visibility: summarizeLaneEvidenceVersion is the ONE canonical
+  // source the dashboard/telemetry layer reads for the current/legacy split — never reconstructed
+  // in neural-map-telemetry.ts or the UI. Every CURRENT branch below is proven to agree with
+  // isFreshValidObs (via the identical exact-match test), not merely asserted independently.
+  describe("summarizeLaneEvidenceVersion — dashboard current/legacy evidence-version split", () => {
+    const RESET_LANES = ["CG_WIDE_FAST_LONG", "CG_BE_AFTER_05", BULL_SCALEOUT_VARIANT_ID] as const;
+
+    for (const variantId of RESET_LANES) {
+      it(`[${variantId}] the goal's exact acceptance fixture: 750 legacy rows + 1 post-reset valid row -> legacyExcludedRows=750, evidenceVersion set, resetCutoverAt matches the 1 valid row`, () => {
+        const def = VARIANT_MATRIX_DEFINITIONS.find((d) => d.id === variantId)!;
+        const originalMaxHoldHours = def.maxHoldHours;
+        def.maxHoldHours = 36;
+        try {
+          const store = new CurrentGuardVariantMatrixStore(tmpDir());
+          addResolvedContextCohort(store, {
+            variantId, direction: "LONG", regime: "Bullish expansion",
+            count: 750, netR: () => 1, prefix: `fixture-legacy-${variantId}`,
+          });
+          for (const obs of store.all) {
+            if (obs.variantId === variantId) store.update(obs.observationId, { openMaxHoldMs: undefined });
+          }
+          addResolvedContextCohort(store, {
+            variantId, direction: "LONG", regime: "Bullish expansion",
+            count: 1, netR: () => 1, prefix: `fixture-current-${variantId}`,
+            baseOpenedAtMs: Date.UTC(2026, 7, 5), baseResolvedAtMs: Date.UTC(2026, 7, 6),
+          });
+
+          const obsForVariant = store.all.filter((o) => o.variantId === variantId);
+          expect(obsForVariant.length).toBe(751);
+          const summary = summarizeLaneEvidenceVersion(variantId, obsForVariant);
+
+          expect(summary.legacyExcludedRows).toBe(750);
+          expect(summary.evidenceVersion).toBe(`${variantId}@36H-v1`);
+          const currentObs = obsForVariant.find((o) => o.observationId.startsWith(`fixture-current-${variantId}`))!;
+          expect(summary.resetCutoverAt).toBe(currentObs.openedAt);
+
+          // Cross-check against the report's own aggregate: the SAME 1-row current population,
+          // never two different numbers for "how much current evidence does this lane have".
+          const report = buildCurrentGuardVariantMatrixReport(store);
+          const row = report.rows.find((r) => r.variantId === variantId)!;
+          const totalFreshAcrossContexts = Object.values(row.contextRows ?? {}).reduce(
+            (sum, ctx) => sum + (ctx?.freshValid ?? 0),
+            0,
+          );
+          expect(totalFreshAcrossContexts).toBe(1);
+        } finally {
+          if (originalMaxHoldHours === undefined) delete def.maxHoldHours;
+          else def.maxHoldHours = originalMaxHoldHours;
+        }
+      });
+    }
+
+    it("a non-reset lane always returns the all-null/zero summary, regardless of how much data it has", () => {
+      const store = new CurrentGuardVariantMatrixStore(tmpDir());
+      const untouchedLane = "CG_WIDE_STOP_TP_WIDE";
+      expect(EVIDENCE_RESET_CUTOVER_VARIANT_IDS.has(untouchedLane)).toBe(false);
+      addResolvedContextCohort(store, {
+        variantId: untouchedLane, direction: "LONG", regime: "Bullish expansion",
+        count: 50, netR: () => 1, prefix: "summary-control",
+      });
+      const obsForVariant = store.all.filter((o) => o.variantId === untouchedLane);
+      expect(summarizeLaneEvidenceVersion(untouchedLane, obsForVariant)).toEqual({
+        evidenceVersion: null, resetCutoverAt: null, resetCutoverAtMs: null,
+        legacyExcludedRows: 0, legacyExclusionReasons: [], previousEvidenceVersion: null,
+      });
+    });
+
+    it("a reset lane with ZERO rows returns the all-null/zero summary — not an exception, not a fabricated version", () => {
+      expect(summarizeLaneEvidenceVersion("CG_WIDE_FAST_LONG", [])).toEqual({
+        evidenceVersion: null, resetCutoverAt: null, resetCutoverAtMs: null,
+        legacyExcludedRows: 0, legacyExclusionReasons: [], previousEvidenceVersion: null,
+      });
+    });
+
+    it("distinguishes 'openMaxHoldMs absent' from 'openMaxHoldMs stale' as two separate exclusion reasons with independent counts", () => {
+      const def = VARIANT_MATRIX_DEFINITIONS.find((d) => d.id === "CG_WIDE_FAST_LONG")!;
+      const originalMaxHoldHours = def.maxHoldHours;
+      def.maxHoldHours = 36;
+      try {
+        const store = new CurrentGuardVariantMatrixStore(tmpDir());
+        addResolvedContextCohort(store, {
+          variantId: "CG_WIDE_FAST_LONG", direction: "LONG", regime: "Bullish expansion",
+          count: 10, netR: () => 1, prefix: "reason-absent",
+        });
+        for (const obs of store.all) {
+          if (obs.variantId === "CG_WIDE_FAST_LONG") store.update(obs.observationId, { openMaxHoldMs: undefined });
+        }
+        addResolvedContextCohort(store, {
+          variantId: "CG_WIDE_FAST_LONG", direction: "LONG", regime: "Bullish expansion",
+          count: 5, netR: () => 1, prefix: "reason-stale",
+          baseOpenedAtMs: Date.UTC(2026, 6, 1), baseResolvedAtMs: Date.UTC(2026, 6, 2),
+        });
+        for (const obs of store.all) {
+          // A recorded value that is neither undefined NOR the current (36h) config — e.g. an
+          // intermediate width the lane briefly carried between two reconfigurations.
+          if (obs.variantId === "CG_WIDE_FAST_LONG" && obs.observationId.startsWith("reason-stale")) {
+            store.update(obs.observationId, { openMaxHoldMs: 48 * 60 * 60 * 1000 });
+          }
+        }
+
+        const obsForVariant = store.all.filter((o) => o.variantId === "CG_WIDE_FAST_LONG");
+        const summary = summarizeLaneEvidenceVersion("CG_WIDE_FAST_LONG", obsForVariant);
+        expect(summary.legacyExcludedRows).toBe(15);
+        expect(summary.legacyExclusionReasons).toEqual(
+          expect.arrayContaining([
+            { reason: "openMaxHoldMs absent (pre-reset row, written before this field existed)", count: 10 },
+            { reason: "openMaxHoldMs stale (recorded value no longer matches this lane's current config)", count: 5 },
+          ]),
+        );
+      } finally {
+        if (originalMaxHoldHours === undefined) delete def.maxHoldHours;
+        else def.maxHoldHours = originalMaxHoldHours;
+      }
+    });
+
+    it("rows excluded for unrelated reasons (OPEN/REJECTED, or ambiguous freshness) are never counted as legacyExcludedRows", () => {
+      const store = new CurrentGuardVariantMatrixStore(tmpDir());
+      // REJECTED rows (no fill) — never fresh-valid for any reason, must not inflate the legacy count.
+      addResolvedContextCohort(store, {
+        variantId: "CG_WIDE_FAST_LONG", direction: "LONG", regime: "Bullish expansion",
+        count: 5, netR: () => 1, prefix: "unrelated-ambiguous", isFreshValid: null,
+      });
+      for (const obs of store.all) {
+        if (obs.variantId === "CG_WIDE_FAST_LONG") store.update(obs.observationId, { openMaxHoldMs: undefined });
+      }
+      const obsForVariant = store.all.filter((o) => o.variantId === "CG_WIDE_FAST_LONG");
+      expect(obsForVariant.every((o) => o.isFreshValid !== true)).toBe(true);
+      const summary = summarizeLaneEvidenceVersion("CG_WIDE_FAST_LONG", obsForVariant);
+      expect(summary.legacyExcludedRows).toBe(0);
+      expect(summary.legacyExclusionReasons).toEqual([]);
+    });
+
+    it("previousEvidenceVersion is MEASURED from a legacy MAX_HOLD_MTM close's real durationMinutes, never a remembered/assumed number", () => {
+      const store = new CurrentGuardVariantMatrixStore(tmpDir());
+      addResolvedContextCohort(store, {
+        variantId: "CG_WIDE_FAST_LONG", direction: "LONG", regime: "Bullish expansion",
+        count: 3, netR: () => 1, prefix: "prev-version",
+      });
+      const legacyIds = store.all.filter((o) => o.variantId === "CG_WIDE_FAST_LONG").map((o) => o.observationId);
+      for (const id of legacyIds) store.update(id, { openMaxHoldMs: undefined });
+      // Exactly one row is tagged as a genuine max-hold-boundary close, with a real measured duration
+      // of 72h (4320 minutes) — the other two legacy rows are NOT MAX_HOLD_MTM and must not contribute.
+      store.update(legacyIds[0]!, { resolutionSource: "MAX_HOLD_MTM", durationMinutes: 4320 });
+
+      const obsForVariant = store.all.filter((o) => o.variantId === "CG_WIDE_FAST_LONG");
+      const summary = summarizeLaneEvidenceVersion("CG_WIDE_FAST_LONG", obsForVariant);
+      expect(summary.previousEvidenceVersion).toBe("~72H (measured from legacy MAX_HOLD_MTM closes)");
+    });
+
+    it("previousEvidenceVersion is null (not fabricated) when no legacy row has a MAX_HOLD_MTM resolution source", () => {
+      const store = new CurrentGuardVariantMatrixStore(tmpDir());
+      addResolvedContextCohort(store, {
+        variantId: "CG_WIDE_FAST_LONG", direction: "LONG", regime: "Bullish expansion",
+        count: 3, netR: () => 1, prefix: "prev-version-none",
+      });
+      for (const obs of store.all) {
+        if (obs.variantId === "CG_WIDE_FAST_LONG") store.update(obs.observationId, { openMaxHoldMs: undefined });
+      }
+      const obsForVariant = store.all.filter((o) => o.variantId === "CG_WIDE_FAST_LONG");
+      expect(obsForVariant.every((o) => o.resolutionSource !== "MAX_HOLD_MTM")).toBe(true);
+      const summary = summarizeLaneEvidenceVersion("CG_WIDE_FAST_LONG", obsForVariant);
+      expect(summary.previousEvidenceVersion).toBeNull();
+    });
+
+    // 2026-08-05 mutation-shape regression: proves the CurrentGuardVariantMatrixRow this function
+    // populates is reachable from the real report builder, not just the standalone function — a
+    // caller reading report.rows must see the identical summary summarizeLaneEvidenceVersion
+    // computes directly, never a second, silently-diverging computation.
+    it("buildCurrentGuardVariantMatrixReport wires evidenceVersionSummary onto each row using this exact function — not a re-derived copy", () => {
+      const def = VARIANT_MATRIX_DEFINITIONS.find((d) => d.id === "CG_WIDE_FAST_LONG")!;
+      const originalMaxHoldHours = def.maxHoldHours;
+      def.maxHoldHours = 36;
+      try {
+        const store = new CurrentGuardVariantMatrixStore(tmpDir());
+        addResolvedContextCohort(store, {
+          variantId: "CG_WIDE_FAST_LONG", direction: "LONG", regime: "Bullish expansion",
+          count: 750, netR: () => 1, prefix: "wired-legacy",
+        });
+        for (const obs of store.all) {
+          if (obs.variantId === "CG_WIDE_FAST_LONG") store.update(obs.observationId, { openMaxHoldMs: undefined });
+        }
+        addResolvedContextCohort(store, {
+          variantId: "CG_WIDE_FAST_LONG", direction: "LONG", regime: "Bullish expansion",
+          count: 1, netR: () => 1, prefix: "wired-current",
+          baseOpenedAtMs: Date.UTC(2026, 7, 5), baseResolvedAtMs: Date.UTC(2026, 7, 6),
+        });
+        const report = buildCurrentGuardVariantMatrixReport(store);
+        const row = report.rows.find((r) => r.variantId === "CG_WIDE_FAST_LONG")!;
+        const directSummary = summarizeLaneEvidenceVersion(
+          "CG_WIDE_FAST_LONG",
+          store.all.filter((o) => o.variantId === "CG_WIDE_FAST_LONG"),
+        );
+        expect(row.evidenceVersionSummary).toEqual(directSummary);
+        expect(row.evidenceVersionSummary.legacyExcludedRows).toBe(750);
+      } finally {
+        if (originalMaxHoldHours === undefined) delete def.maxHoldHours;
+        else def.maxHoldHours = originalMaxHoldHours;
+      }
     });
   });
 
