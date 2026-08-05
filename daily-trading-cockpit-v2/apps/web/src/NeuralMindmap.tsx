@@ -1170,6 +1170,46 @@ interface ShortFadeReport {
   } | null;
 }
 
+/** Mirror of the API's LiveEdgeDiggerReport (read-only research scanner). Every field is optional-
+ *  tolerant because an instance that has not shipped the scanner simply returns nothing. */
+interface LiveEdgeDiscoveryCandidate {
+  candidate: { candidateId: string; ruleId: string; title: string; thesis: string; direction: string };
+  rawRows: number;
+  openRows: number;
+  resolvedRows: number;
+  independentEpisodes: number;
+  rowsPerEpisode: number | null;
+  distinctSymbols: number;
+  calendarDays: number | null;
+  metrics: {
+    n: number; netExpectancyR: number | null; medianNetR: number | null;
+    pf: number | null; pfStatus: string; wr: number | null; payoffRatio: number | null;
+    worstNetR: number | null; maxDrawdownR: number | null;
+  };
+  bootstrap: { clusters: number; lowerBound95: number | null; upperBound95: number | null };
+  partitions: { partition: string; rows: number; episodes: number; netExpectancyR: number | null }[];
+  gates: { id: string; label: string; current: number | null; required: number; comparator: string; pass: boolean }[];
+  decision: 'CANDIDATE' | 'REJECT';
+  rejectionReasons: string[];
+  evidenceStillNeeded: string[];
+}
+
+interface LiveEdgeDiscoveryReport {
+  version: string;
+  generatedAt: string;
+  scanner: {
+    cyclesRun: number; lastCycleAt: string | null; lastError: string | null;
+    universeSize: number | null; regime: string | null; regimeFamily: string | null;
+    breadth: number | null; cohesion: number | null; dispersion: number | null;
+  };
+  attemptRegistry: { ruleId: string; cyclesEvaluated: number; cyclesFired: number; observationsEmitted: number }[];
+  rulesEnumerated: number;
+  candidates: LiveEdgeDiscoveryCandidate[];
+  bestCandidateId: string | null;
+  recommendation: string | null;
+  verdict: 'NO_PROVEN_EDGE_YET' | 'CANDIDATE_READY_FOR_HUMAN_REVIEW';
+}
+
 interface LiveLaneExposure {
   laneId: string;
   sourceOrderCount: number;
@@ -1457,6 +1497,7 @@ export default function NeuralMindmap() {
   const [liveAccount, setLiveAccount] = useState<LiveAccount | null>(null);
   const [liveAccountReceivedAt, setLiveAccountReceivedAt] = useState<number | null>(null);
   const [shortFade, setShortFade] = useState<ShortFadeReport | null>(null);
+  const [edgeDiscovery, setEdgeDiscovery] = useState<LiveEdgeDiscoveryReport | null>(null);
   const [chatEnabled, setChatEnabled] = useState(false);
   const [chatStatusLoaded, setChatStatusLoaded] = useState(false);
   const [chatStatusReason, setChatStatusReason] = useState<string | null>(null);
@@ -1544,6 +1585,16 @@ export default function NeuralMindmap() {
     }
   }
 
+  async function loadEdgeDiscovery() {
+    try {
+      const response = await fetch('/api/shadow/live-edge-digger', { cache: 'no-store' });
+      if (!response.ok) return;
+      setEdgeDiscovery(await response.json() as LiveEdgeDiscoveryReport);
+    } catch {
+      // non-critical research surface — silently skip if the scanner has not shipped to this instance
+    }
+  }
+
   async function loadChatStatus() {
     try {
       const response = await fetch('/api/trading-assistant/status', { cache: 'no-store' });
@@ -1594,6 +1645,7 @@ export default function NeuralMindmap() {
     void loadTelemetry();
     void loadLiveAccount();
     void loadShortFade();
+    void loadEdgeDiscovery();
     void loadChatStatus();
   }, []);
 
@@ -1603,6 +1655,7 @@ export default function NeuralMindmap() {
       void loadTelemetry();
       void loadLiveAccount();
       void loadShortFade();
+      void loadEdgeDiscovery();
     }, 5_000);
     return () => window.clearInterval(timer);
   }, [autoRefresh]);
@@ -1969,6 +2022,112 @@ export default function NeuralMindmap() {
             {' '}· Tight large-cap: {telemetry.h6Trend.tightLargeCap.freshValid} fresh-valid, net R {fmtR(telemetry.h6Trend.tightLargeCap.netAvgR)}
           </p>
         </section>
+      )}
+
+      {edgeDiscovery && (
+          <section className="neural-evidence-version-panel" aria-label="Live edge discovery">
+            <div className="neural-evidence-version-panel-head">
+              <span>Live edge discovery</span>
+              <strong>
+                {edgeDiscovery.verdict === 'NO_PROVEN_EDGE_YET'
+                  ? 'NO PROVEN EDGE YET'
+                  : `Candidate ready for human review — ${edgeDiscovery.bestCandidateId}`}
+              </strong>
+              <p>
+                A read-only scanner. Each cycle it evaluates a FIXED frontier of{' '}
+                <b>{edgeDiscovery.rulesEnumerated}</b> interpretable rules against decision-time data and
+                records non-executable shadow positions for whichever ones the live market fires. Rules are
+                frozen before any outcome exists and are never selected or dropped by their results; every
+                rule ever evaluated stays in the attempt registry below, so a claimed edge is read against
+                the real number of tests. Evidence is counted in <b>independent episodes</b>, never raw rows.
+                It can recommend, never enable.
+              </p>
+              <small>
+                cycles {edgeDiscovery.scanner.cyclesRun} · universe {edgeDiscovery.scanner.universeSize ?? 'n/a'}
+                {' '}· regime {edgeDiscovery.scanner.regime ?? 'n/a'} ({edgeDiscovery.scanner.regimeFamily ?? 'n/a'})
+                {' '}· breadth {fmtNumber(edgeDiscovery.scanner.breadth)} · cohesion {fmtNumber(edgeDiscovery.scanner.cohesion)}
+                {' '}· dispersion {fmtNumber(edgeDiscovery.scanner.dispersion, 4)}
+                {edgeDiscovery.scanner.lastCycleAt ? ` · last cycle ${edgeDiscovery.scanner.lastCycleAt.slice(0, 19).replace('T', ' ')}Z` : ' · never run'}
+                {edgeDiscovery.scanner.lastError ? ` · ERROR ${edgeDiscovery.scanner.lastError}` : ''}
+              </small>
+            </div>
+
+            <div className="neural-evidence-version-list">
+              {edgeDiscovery.candidates
+                .filter((c) => c.rawRows > 0)
+                .slice(0, 8)
+                .map((c) => {
+                  const dev = c.partitions.find((p) => p.partition === 'DEV');
+                  const val = c.partitions.find((p) => p.partition === 'VALIDATION_OOS');
+                  const recent = c.partitions.find((p) => p.partition === 'RECENT');
+                  return (
+                    <section className="neural-evidence-version-card" key={c.candidate.candidateId}>
+                      <div className="neural-evidence-version-head">
+                        <span>{c.candidate.title}</span>
+                        <strong>{c.candidate.candidateId}</strong>
+                        <span className={`neural-cutover-source-badge source-${c.decision === 'CANDIDATE' ? 'canonical' : 'inferred'}`}>
+                          {c.decision}
+                        </span>
+                      </div>
+                      <div className="neural-evidence-gate-metrics">
+                        <div><span>Raw rows</span><strong>{c.rawRows} ({c.openRows} open)</strong></div>
+                        <div><span>Independent episodes</span><strong className="tone-warning">{c.independentEpisodes}</strong></div>
+                        <div><span>Rows / episode</span><strong>{c.rowsPerEpisode ?? 'n/a'}</strong></div>
+                        <div><span>After-cost expectancy</span>
+                          <strong className={c.metrics.netExpectancyR == null ? '' : c.metrics.netExpectancyR > 0 ? 'tone-healthy' : 'tone-critical'}>
+                            {fmtR(c.metrics.netExpectancyR)}
+                          </strong>
+                        </div>
+                        <div><span>Median netR</span><strong>{fmtR(c.metrics.medianNetR)}</strong></div>
+                        <div><span>PF</span><strong>{c.metrics.pf === null ? `N/A (${c.metrics.pfStatus})` : fmtNumber(c.metrics.pf)}</strong></div>
+                        <div><span>WR</span><strong>{c.metrics.wr === null ? 'n/a' : `${(c.metrics.wr * 100).toFixed(1)}%`}</strong></div>
+                        <div><span>Clustered 95% CI</span>
+                          <strong>{c.bootstrap.lowerBound95 === null ? `undefined (${c.bootstrap.clusters} episode)` : `${fmtR(c.bootstrap.lowerBound95)} … ${fmtR(c.bootstrap.upperBound95)}`}</strong>
+                        </div>
+                        <div><span>Worst / max DD</span><strong>{fmtR(c.metrics.worstNetR)} / {fmtR(c.metrics.maxDrawdownR)}</strong></div>
+                      </div>
+                      <div className="neural-evidence-gate-metrics">
+                        <div><span>DEV episodes</span><strong>{dev?.episodes ?? 0} ({dev?.rows ?? 0} rows)</strong></div>
+                        <div><span>Validation / OOS</span><strong>{val?.episodes ?? 0} ({val?.rows ?? 0} rows)</strong></div>
+                        <div><span>Recent</span><strong>{recent?.episodes ?? 0} ({recent?.rows ?? 0} rows)</strong></div>
+                        <div><span>Distinct symbols</span><strong>{c.distinctSymbols}</strong></div>
+                        <div><span>Calendar days</span><strong>{c.calendarDays ?? 'n/a'}</strong></div>
+                      </div>
+                      {c.rejectionReasons.length > 0 && (
+                        <p className="neural-evidence-gate-blockers">Blocking: {c.rejectionReasons.slice(0, 4).join('; ')}</p>
+                      )}
+                      {c.evidenceStillNeeded.length > 0 && (
+                        <p className="neural-evidence-version-legacy-reason">Still needed: {c.evidenceStillNeeded.slice(0, 3).join('; ')}</p>
+                      )}
+                    </section>
+                  );
+                })}
+              {edgeDiscovery.candidates.every((c) => c.rawRows === 0) && (
+                <p className="neural-evidence-gate-empty">
+                  No rule has fired yet — the scanner is running but the live market has not produced a
+                  matching setup. Every rule below is still being evaluated each cycle.
+                </p>
+              )}
+            </div>
+
+            <div className="neural-evidence-version-legacy">
+              <span className="neural-evidence-version-legacy-label">ATTEMPT REGISTRY (multiple-testing control)</span>
+              <small>EVERY RULE EVALUATED, INCLUDING THOSE THAT NEVER FIRED</small>
+              {edgeDiscovery.attemptRegistry.length === 0 ? (
+                <p>No cycle has completed yet.</p>
+              ) : (
+                edgeDiscovery.attemptRegistry.map((a) => (
+                  <p className="neural-evidence-version-legacy-reason" key={a.ruleId}>
+                    {a.ruleId}: evaluated {a.cyclesEvaluated}× · fired {a.cyclesFired}× · emitted {a.observationsEmitted}
+                  </p>
+                ))
+              )}
+            </div>
+
+            {edgeDiscovery.recommendation && (
+              <p className="neural-evidence-gate-blockers">{edgeDiscovery.recommendation}</p>
+            )}
+          </section>
       )}
 
       {telemetry && telemetry.lanes.some(laneHasEvidenceVersionSplit) && (

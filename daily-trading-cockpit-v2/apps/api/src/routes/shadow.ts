@@ -286,6 +286,13 @@ import {
 } from "../lib/funding-carry-crowding-v2.js";
 import { buildEdgeDiggerReport } from "../lib/edge-digger.js";
 import {
+  buildLiveEdgeDiggerReportFromStore,
+  getLiveEdgeDiggerStore,
+  runLiveEdgeDiggerCycleGuarded,
+} from "../lib/live-edge-digger-cycle.js";
+import { resolveCanonicalMarketRegimeUniverse } from "../lib/canonical-market-regime-universe.js";
+import { getCanonicalMarketRegimeSnapshot } from "../lib/canonical-market-regime-engine.js";
+import {
   runMetaLabelCycleGuarded,
   buildMetaLabelReport,
   getMetaLabelStore,
@@ -1887,6 +1894,15 @@ export async function registerShadowRoutes(
     return buildEdgeDiggerReport();
   });
 
+  // LIVE EDGE DISCOVERY (2026-08-06) — read-only view of the running discovery scanner: regime and
+  // universe, the full attempt registry (every rule ever enumerated, fired or not, so a claimed edge
+  // can be read against the real number of tests), raw rows vs INDEPENDENT episodes per candidate,
+  // DEV/OOS/recent progress, after-cost metrics with a clustered interval, and either the best
+  // candidate or NO_PROVEN_EDGE_YET. Reports only; enables nothing.
+  app.get("/api/shadow/live-edge-digger", async () => {
+    return buildLiveEdgeDiggerReportFromStore(getLiveEdgeDiggerStore());
+  });
+
   // Meta-label per-signal gate report (2026-07-22) — report-only shadow scorer; nothing reads the
   // score on any admission/resolution/allocation/live path. Model status + transparent per-feature
   // weights, feature coverage (% non-null), and the counterfactual cohort table: for each τ, what
@@ -2702,6 +2718,36 @@ export async function registerShadowRoutes(
             store: getQueueImbalanceToxicFlowStore(),
             client: opts.binanceClient,
             now: Date.now(),
+          }).catch(() => undefined);
+        }
+        // LIVE EDGE DIGGER (2026-08-06): read-only discovery scanner. Each cycle it computes a
+        // decision-time feature snapshot over the canonical universe, evaluates a FIXED frontier of
+        // 12 interpretable rules, and records non-executable shadow positions for whichever rules the
+        // live market actually fires — then resolves earlier ones against later completed candles.
+        // It never places an order, never touches an executor or allocator, and never enables
+        // anything: its maximum output is a lane SPECIFICATION a human must act on. Rules are frozen
+        // before any outcome exists and are never selected or dropped by their results.
+        if (process.env.LIVE_EDGE_DIGGER_DISABLED !== "1") {
+          const ledClient = opts.binanceClient;
+          void runLiveEdgeDiggerCycleGuarded({
+            store: getLiveEdgeDiggerStore(),
+            now: Date.now(),
+            resolveUniverse: async () => {
+              const snapshot = await resolveCanonicalMarketRegimeUniverse({ nowMs: Date.now(), ctx: ledClient });
+              return { symbols: snapshot.symbols, perSymbolMeta: snapshot.perSymbolMeta };
+            },
+            getRegime: async () => {
+              const snapshot = getCanonicalMarketRegimeSnapshot("data", Date.now(), process.env);
+              return { regime: snapshot.projection, regimeFamily: snapshot.regimeFamily };
+            },
+            fetchCandles: (symbol, interval, limit) => ledClient.getCandles(symbol, interval, limit),
+            fetchFunding: async (symbol) => {
+              const premium = await ledClient.getFuturesPremiumIndex(symbol);
+              return {
+                fundingBps: typeof premium.fundingRate === "number" ? premium.fundingRate * 10_000 : null,
+                basisBps: typeof premium.basisPct === "number" ? premium.basisPct * 10_000 : null,
+              };
+            },
           }).catch(() => undefined);
         }
         // META-LABEL PER-SIGNAL GATE (2026-07-22): López-de-Prado-style secondary classifier that
