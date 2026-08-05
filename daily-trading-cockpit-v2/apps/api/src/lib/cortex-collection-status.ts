@@ -10,7 +10,7 @@ import { CORTEX_LIVE_BETA, CORTEX_WIN_HURDLE_R } from "./cortex-brain.js";
 import { CORTEX_ATTR_MIN_EXAMPLES_ACTIVE } from "./cortex-attribution.js";
 import { readCortexJournalTail } from "./cortex-journal-reader.js";
 import { getLatestCortexRefitReport } from "./cortex-refit-runner-bindings.js";
-import { resolveFourBrainInstanceId } from "./four-brain-live-gather-bindings.js";
+import { resolveCausalCollectionActivation, forwardCausalJournalPath } from "../experience-engine/forward-causal-collection.js";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -246,23 +246,24 @@ function readJson(path: string): JsonRecord | null {
   }
 }
 
+/**
+ * 2026-08-05: this used to be an independent reimplementation of forward-causal-collection.ts's own
+ * resolveCausalCollectionActivation — a second copy of the exact same gating logic, justified at the
+ * time by a comment insisting "so the two can never disagree". They disagreed anyway: when
+ * resolveCausalCollectionActivation gained role-based authorization for isolated staging mirrors
+ * (FourBrainLogicalRole), this copy had no way to know, and silently kept reporting
+ * unknown-instance-fail-closed for an instance the real writer had already started collecting on —
+ * exactly the drift the comment warned about, caused by there being two places to update instead of
+ * one. Delegates to the canonical functions directly now; there is no second copy left to drift.
+ */
 function resolveCollectionStatus(env: NodeJS.ProcessEnv, dataDir: string) {
-  // Must resolve the instance the SAME way the actual journal writer does
-  // (forward-causal-collection.ts's resolveCausalCollectionActivation), so the two can never disagree
-  // about which instance/journal is active. resolveFourBrainInstanceId checks FOUR_BRAIN_INSTANCE_ID
-  // first, falling back to PORT — reading env.PORT directly here would silently diverge from the
-  // writer if FOUR_BRAIN_INSTANCE_ID were ever set to something other than PORT.
-  const instanceId = resolveFourBrainInstanceId(env);
-  if (instanceId === "3103") return { active: false, instanceId, reason: "live-3103-blocked" as const, journalPath: null };
-  if ((env.CAUSAL_EXPERIENCE_COLLECTION_MODE ?? "").toString().trim().toLowerCase() !== "shadow")
-    return { active: false, instanceId, reason: "mode-off" as const, journalPath: null };
-  if (instanceId !== "3101" && instanceId !== "3102")
-    return { active: false, instanceId, reason: "unknown-instance-fail-closed" as const, journalPath: null };
+  const activation = resolveCausalCollectionActivation(env);
   return {
-    active: true,
-    instanceId,
-    reason: "shadow-active" as const,
-    journalPath: resolve(dataDir, "causal-experience", instanceId, "events.jsonl"),
+    active: activation.active,
+    instanceId: activation.instanceId,
+    logicalRole: activation.logicalRole,
+    reason: activation.reason,
+    journalPath: activation.active ? forwardCausalJournalPath({ ...env, CAUSAL_EXPERIENCE_COLLECTION_DIR: dataDir }) : null,
   };
 }
 
@@ -301,6 +302,7 @@ export function buildCortexCollectionStatus(options: {
     collection: {
       mode: activation.active ? "shadow" : "off",
       instanceId: activation.instanceId,
+      logicalRole: activation.logicalRole,
       status: activation.reason,
       journalPresent: Boolean(activation.journalPath && existsSync(activation.journalPath)),
       journalBadLines: acc.badLines,
