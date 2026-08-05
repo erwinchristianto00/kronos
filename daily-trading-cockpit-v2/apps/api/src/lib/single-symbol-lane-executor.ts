@@ -1072,6 +1072,22 @@ export class SingleSymbolLaneExecutor {
     };
   }
 
+  /** 2026-08-05 (critical fix): non-recursive exposure surface -- laneId + OPEN positions only,
+   *  read directly from the store, WITHOUT calling isAllowed() the way getStatus() does. For
+   *  innovation executors, isAllowed is wired (app.ts) to innovationAllowed(laneId) ->
+   *  innovationCampaignAdmissionForLane -> computeInnovationExposure(), which needs to read every
+   *  sibling executor's open exposure. computeInnovationExposure used to call getStatus() for
+   *  that, which recomputes isAllowed(), which calls back into computeInnovationExposure() again
+   *  -- infinite mutual recursion, confirmed reproduced ("Maximum call stack size exceeded"),
+   *  silently breaking LiveExecutionEngine.reconcile()/manageLifecycle()/kill-switch-retry every
+   *  tick by default on testnet. Mirrors getOpenUnexitedLegs()'s identical rationale in
+   *  cross-sectional-executor.ts. Use this, never getStatus(), anywhere that only needs raw open
+   *  exposure and must not risk depending on isAllowed(). */
+  getExposureSnapshot(): { laneId: string; openPositions: SingleSymbolPosition[] } {
+    const open = this.store.getState().positions.filter((p) => p.status === "OPEN");
+    return { laneId: this.laneId, openPositions: open };
+  }
+
   /** Same rationale as CrossSectionalExecutor.getClosedSummary(): the engine's realized ledger
    *  excludes these positions (external-managed claims, not engine intents), so this feeds the
    *  account snapshot's closedLanes merge. */

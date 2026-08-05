@@ -543,27 +543,35 @@ export function computeInnovationExposure(
     totalOpenNotionalUsd += notionalUsd;
   };
 
+  // 2026-08-05 (critical fix): reads each executor's narrow getExposureSnapshot(), never
+  // getStatus() -- getStatus() unconditionally computes allowed: this.isAllowed(), and for
+  // innovation executors isAllowed is wired (app.ts) back to innovationAllowed ->
+  // innovationCampaignAdmissionForLane -> this function, so calling getStatus() here was infinite
+  // mutual recursion (confirmed reproduced: "Maximum call stack size exceeded", and confirmed live
+  // via a real deployed instance's every-tick reconcile() silently failing as a result). Neither
+  // accessor below depends on isAllowed()/entryHealth() in any way -- see each method's own doc
+  // comment in single-symbol-lane-executor.ts / cross-sectional-executor.ts.
   for (const exec of basketExecutors) {
     if (!exec) continue;
-    const status = exec.getStatus();
-    for (const basket of status.openBaskets) {
+    const snap = exec.getExposureSnapshot();
+    for (const basket of snap.openBaskets) {
       const notional = basket.legs.reduce(
         (sum, leg) => sum + (leg.exitOrderId === null ? Math.abs(leg.qty * leg.entryPrice) : 0),
         0,
       );
-      bump(status.laneId, 1, notional);
+      bump(snap.laneId, 1, notional);
     }
-    for (const orphan of status.orphanedLegs) {
-      bump(status.laneId, 1, Math.abs(orphan.qty * orphan.entryPrice));
+    for (const orphan of snap.orphanedLegs) {
+      bump(snap.laneId, 1, Math.abs(orphan.qty * orphan.entryPrice));
     }
   }
 
   for (const exec of singleSymbolExecutors) {
     if (!exec) continue;
-    const status = exec.getStatus();
-    for (const pos of status.openPositions) {
+    const snap = exec.getExposureSnapshot();
+    for (const pos of snap.openPositions) {
       if (pos.exitOrderId !== null) continue;
-      bump(status.laneId, 1, Math.abs(pos.qty * pos.entryPrice));
+      bump(snap.laneId, 1, Math.abs(pos.qty * pos.entryPrice));
     }
   }
 

@@ -746,6 +746,21 @@ export class CrossSectionalExecutor {
     return out;
   }
 
+  /** 2026-08-05 (critical fix): non-recursive exposure surface -- laneId + open baskets/orphaned
+   *  legs only, read directly from the store, WITHOUT calling isAllowed()/entryHealth() the way
+   *  getStatus() does. Same rationale as getOpenUnexitedLegs() just above (which already avoids
+   *  getStatus() for an analogous reason) -- see single-symbol-lane-executor.ts's
+   *  getExposureSnapshot() for the full recursion this closes: computeInnovationExposure()
+   *  (innovation-campaign.ts) used to call getStatus() here, which recomputes
+   *  isAllowed()/entryHealth(), which for innovation executors calls back into
+   *  computeInnovationExposure() again -- infinite mutual recursion, confirmed reproduced. Use
+   *  this, never getStatus(), anywhere that only needs raw open exposure. */
+  getExposureSnapshot(): { laneId: string; openBaskets: ExecutorBasket[]; orphanedLegs: OrphanedLeg[] } {
+    const st = this.store.getState();
+    const openBaskets = st.baskets.filter((b) => this.isBasketLive(b));
+    return { laneId: this.laneId, openBaskets, orphanedLegs: st.orphanedLegs ?? [] };
+  }
+
   /** 2026-07-19 real-money audit fix: this instance's OWN open (un-exited) basket legs' notional
    *  on `symbol` — existingNotionalForSymbolFn only ever sums OTHER executor instances (see its own
    *  doc comment), and MAX_OPEN_BASKETS can exceed 1, so THIS instance alone could hold multiple

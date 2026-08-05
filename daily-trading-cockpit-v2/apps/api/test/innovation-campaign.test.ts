@@ -18,7 +18,12 @@ import {
 } from "../src/lib/innovation-campaign.js";
 import { EXECUTABLE_INNOVATION_LANE_IDS } from "../src/lib/innovation-testnet-execution.js";
 import type { CrossSectionalExecutor, ExecutorBasket, ExecutorLeg, OrphanedLeg } from "../src/lib/cross-sectional-executor.js";
-import type { SingleSymbolLaneExecutor, SingleSymbolPosition } from "../src/lib/single-symbol-lane-executor.js";
+import {
+  SingleSymbolLaneExecutor,
+  SingleSymbolLaneExecutorStore,
+  makeFixedRewardExitPolicy,
+  type SingleSymbolPosition,
+} from "../src/lib/single-symbol-lane-executor.js";
 
 // Pull 3 real lane ids out of the actual roster rather than hardcoding string literals — if the
 // roster is ever renamed/reordered, this file tracks it instead of silently testing stale ids.
@@ -796,7 +801,11 @@ describe("computeInnovationExposure", () => {
     };
   }
   function fakeBasketExecutor(laneId: string, openBaskets: ExecutorBasket[], orphanedLegs: OrphanedLeg[] = []): CrossSectionalExecutor {
-    return { getStatus: () => ({ laneId, openBaskets, orphanedLegs }) } as unknown as CrossSectionalExecutor;
+    // 2026-08-05: computeInnovationExposure reads getExposureSnapshot(), never getStatus() (see the
+    // critical-fix comment on that function) -- this fake implements ONLY that narrow surface, same
+    // as the real class, so these tests can never accidentally pass by exercising a getStatus() path
+    // computeInnovationExposure no longer calls.
+    return { getExposureSnapshot: () => ({ laneId, openBaskets, orphanedLegs }) } as unknown as CrossSectionalExecutor;
   }
   function position(over: Partial<SingleSymbolPosition> = {}): SingleSymbolPosition {
     return {
@@ -811,7 +820,8 @@ describe("computeInnovationExposure", () => {
     };
   }
   function fakeSingleExecutor(laneId: string, openPositions: SingleSymbolPosition[]): SingleSymbolLaneExecutor {
-    return { getStatus: () => ({ laneId, openPositions }) } as unknown as SingleSymbolLaneExecutor;
+    // 2026-08-05: same rationale as fakeBasketExecutor above.
+    return { getExposureSnapshot: () => ({ laneId, openPositions }) } as unknown as SingleSymbolLaneExecutor;
   }
 
   it("returns all-zero totals and an empty perLane map for two empty arrays", () => {
@@ -887,6 +897,62 @@ describe("computeInnovationExposure", () => {
     expect(sumPositions).toBe(exposure.totalOpenPositions);
     expect(exposure.totalOpenNotionalUsd).toBeCloseTo(220, 9);
     expect(exposure.totalOpenPositions).toBe(3);
+  });
+
+  // -----------------------------------------------------------------------------------------------
+  // 2026-08-05 CRITICAL REGRESSION: computeInnovationExposure <-> getStatus() infinite recursion.
+  //
+  // Found live: this session's runtime-validation gate deployed a build where computeInnovationExposure
+  // read exec.getStatus() (not getExposureSnapshot()) for every innovation executor. getStatus()
+  // unconditionally computes `allowed: this.isAllowed()`. In production (app.ts), an innovation
+  // executor's isAllowed closure is wired to innovationAllowed(laneId) ->
+  // innovationCampaignAdmissionForLane(laneId) -> computeInnovationExposure(...) again -- so calling
+  // getStatus() from inside computeInnovationExposure recursed forever ("Maximum call stack size
+  // exceeded"), confirmed on the live instance via LiveExecutionEngine.reconcile() silently failing
+  // every tick (reconcile -> computeExternalManagedNetQty -> .getStatus() on the same executor list).
+  //
+  // Every OTHER test in this describe block uses fakeBasketExecutor/fakeSingleExecutor, which stub
+  // getExposureSnapshot() directly and could NEVER have caught this -- the recursion only exists when
+  // isAllowed is wired back to computeInnovationExposure the way app.ts actually wires it. This test
+  // constructs a REAL SingleSymbolLaneExecutor with that exact real wiring shape and proves calling
+  // getStatus() on it terminates without throwing.
+  // -----------------------------------------------------------------------------------------------
+  it("[CRITICAL REGRESSION] a REAL SingleSymbolLaneExecutor whose isAllowed is wired back to computeInnovationExposure (the exact app.ts shape) does not recurse when getStatus() is called", () => {
+    const dir = tmpDir();
+    const store = new SingleSymbolLaneExecutorStore(dir, "test.json");
+    let executor: SingleSymbolLaneExecutor | null = null;
+    // Mirrors app.ts's real shape exactly: innovationAllowed(laneId) calls
+    // innovationCampaignAdmissionForLane(laneId), which calls computeInnovationExposure(...) over
+    // the SAME executor array this executor itself is a member of.
+    const innovationAllowed = (laneId: string): boolean => {
+      const exposure = computeInnovationExposure([], [executor]);
+      return exposure.perLane.get(laneId) === undefined || true; // value doesn't matter, only that it returns
+    };
+    executor = new SingleSymbolLaneExecutor({
+      client: { getExchangeFilters: async () => new Map(), setLeverage: async () => {}, getPositions: async () => [], placeOrder: async () => { throw new Error("not used"); }, placeAlgoOrder: async () => { throw new Error("not used"); }, cancelAlgoOrder: async () => {}, getUserTrades: async () => [] } as never,
+      store,
+      laneId: LANE_1,
+      direction: "LONG",
+      getOpenSignals: () => [],
+      exitPolicy: makeFixedRewardExitPolicy({ rewardMultiple: 0.5, maxHoldMs: 48 * 3_600_000 }),
+      isAllowed: () => innovationAllowed(LANE_1),
+      laneWeightPct: () => 100,
+      legUsd: () => 25,
+      leverage: () => 3,
+      maxOpenPositions: () => 1,
+      dailyMaxLossUsd: () => 0,
+      nowIso: () => "2026-08-05T00:00:00.000Z",
+      fillConfirmRetryDelayMs: 0,
+      existingNotionalForSymbol: () => 0,
+      maxNotionalPerSymbolAcrossLanes: () => 0,
+      existingClusterOpenSymbols: () => new Set<string>(),
+      maxClusterPositionsAcrossLanes: () => 0,
+    });
+    expect(() => executor!.getStatus()).not.toThrow();
+    expect(executor!.getStatus().laneId).toBe(LANE_1);
+    // The narrow accessor itself must also terminate and return the right shape.
+    expect(() => executor!.getExposureSnapshot()).not.toThrow();
+    expect(executor!.getExposureSnapshot()).toEqual({ laneId: LANE_1, openPositions: [] });
   });
 });
 
