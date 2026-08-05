@@ -418,3 +418,166 @@ form of fabricated readiness.
   safety-critical fix in §13.1 (`forward-causal-collection.ts` + its test file only)
 - 3103 confirmed untouched: restart count 8378 unchanged, no file read for write under
   `/root/kronos-live/`, no restart, no deploy, at any point in this closure session
+
+## 14. Release normalization — single reproducible commit on 3101/3102
+
+§13's closure left active 3101/3102 on a **mixed-SHA** tree: the `2c93a9c` release directory with
+`forward-causal-collection.ts` manually overlaid from `6a9bf83`. This section replaces that with a
+single clean release built from one exact commit, with git-tree-level proof of reproduction before
+any activation.
+
+### 14.1 Final source
+
+Target commit: **`edc3f31609492d082f42ba7eeffa67a270bf73e1`** (HEAD at normalization time, pushed,
+same commit §13.6 already cites as "final commit"). Confirmed `6a9bf83` is an ancestor
+(`git merge-base --is-ancestor 6a9bf83 HEAD` → true). Tag `kronos-phase-1-closed` already resolves to
+this exact commit (`git rev-list -n1 kronos-phase-1-closed` → `edc3f31...`) — it does not need to move
+and was left untouched, so it continues to name precisely the commit whose tree is now deployed.
+Archived via `git archive --format=tar.gz edc3f31 -- daily-trading-cockpit-v2` from the repo root —
+reads the git object database directly, so the local worktree's own unrelated dirty files (a
+concurrent agent's uncommitted changes to `current-guard-variant-matrix.ts`,
+`neural-map-telemetry.ts`, and 3 other files — never staged, never part of any commit here) have no
+effect on the archive contents.
+
+### 14.2 Clean release build
+
+New versioned release directories: `/root/kronos-releases/edc3f31/` and
+`/root/kronos-testnet-releases/edc3f31/`, extracted from the same archive.
+
+- **`apps/api/data` tar-extraction gotcha, handled**: the archive's one git-tracked file under that
+  path (`regime-engine-validation/BTCUSDT-2026-07-01T13-56-22-111Z.json`) materializes a real,
+  non-empty directory at `apps/api/data` on extraction, in both release directories. Removed
+  (`rm -rf`) before symlinking, in both, matching the established procedure — confirmed via `find`
+  before deletion that the only content was that one known file.
+- **Symlinks recreated explicitly, verified against the ALREADY-WORKING `2c93a9c` release rather than
+  assumed**: top-level `data` → `.../128b09f/daily-trading-cockpit-v2/data`; `apps/api/data` →
+  `.../128b09f/daily-trading-cockpit-v2/apps/api/data`. These are two **different** paths inside the
+  same stable anchor, not one path reused twice — the anchor has two separate real data directories at
+  those two depths (top-level: `scan-history*`, `shadow-positions.json`, …; `apps/api/data`:
+  `causal-experience/`, `current-guard-variant-matrix.json`, `cortex-brain.json`, …). First attempt
+  pointed both new-release symlinks at the same (top-level) target; §14.3's pre-activation journal
+  check caught this immediately (`FORWARD_CAUSAL_JOURNAL_CORRUPTED` — reading the wrong, unrelated
+  directory's data) before any PM2 action. Fixed by re-deriving each target from `readlink` on the
+  live `2c93a9c` release rather than re-guessing, then re-verified — this is exactly the failure mode
+  §3's pre-activation gate exists to catch, and it worked as designed.
+- `.env`: copied byte-exact from the active `2c93a9c` release (VPS-to-VPS, never transited through
+  this session's local machine or chat). SHA256 verified equal, old vs. new, both instances
+  (3101: `70a1b435…`; 3102: `29ec5211…`); line counts unchanged (126, 258).
+- `node_modules`: copied from the active `2c93a9c` release (`cp -a`, preserving the relative
+  `@dtc/{api,shared,web}` workspace symlinks, which resolve correctly from the new path since they're
+  relative, not absolute). Entry count 120=120 both, both releases; `node_modules/@dtc/api` confirmed
+  to resolve to a real `package.json` post-copy.
+- `RELEASE_SHA` marker written as the exact full commit hash, both releases:
+  `edc3f31609492d082f42ba7eeffa67a270bf73e1`.
+- `packages/shared` built (`tsc -p tsconfig.json`) and `apps/api` typechecked
+  (`npx tsc --noEmit -p .`) in place, in both new release directories — all four commands clean, zero
+  errors.
+
+### 14.3 Pre-activation validation
+
+**Git-tree ⇔ deployed-file SHA256, exhaustive, not spot-checked.** `git ls-tree -r edc3f31 --
+daily-trading-cockpit-v2` lists 857 files. Extracted the same archive locally, hashed all 857 with
+`shasum -a 256`, and separately hashed every non-`node_modules`/non-`dist` file under each deployed
+release directory (856 each — `RELEASE_SHA` and `.env` are deploy-time artifacts, not git-tracked, so
+excluded from this comparison and checked separately above; the one `apps/api/data/...` file
+superseded by the live-data symlink, per §14.2, is the sole intentional 857→856 exclusion on both
+sides of the comparison). Result: **all 856 comparable files are byte-identical** — local git-tree
+extraction ⇔ 3101 deployed tree ⇔ 3102 deployed tree, all three pairwise diffs empty.
+
+**Strict causal-journal reader, run from the new release against the real active journals** (via a
+standalone `tsx` script, never the running server, at this stage): after the symlink fix in §14.2 —
+3101: `status=VALID events=409 malformed=0 duplicates=0`; 3102: `status=VALID events=11918
+malformed=0 duplicates=0`. Matches §13's fix exactly (same code, correctly relocated).
+
+**Reset-lane legacy-evidence exclusion, re-checked against real data via the new release's own
+`buildCurrentGuardVariantMatrixReport`**: `freshValid` is no longer uniformly 0 as it was immediately
+post-reset (§10/§13) — real elapsed time (~5 hours) means real new evidence has accumulated:
+`CG_WIDE_FAST_LONG` → 1, `CG_BE_AFTER_05` → 1, `BL_TREND_SCALEOUT_STOP200` → 0, control
+(`CG_WIDE_STOP_TP_WIDE`) → 24 (up from 16 in §10, also organic growth on an unrestricted lane). Verified
+by direct row inspection, not assumed: every row on any of the 3 reset lanes carrying a defined
+`openMaxHoldMs` has `createdAt` between `2026-08-05T09:06:52.854Z` and `2026-08-05T12:14:54.941Z` —
+i.e. all of them were opened hours after the reset was promoted, none of them predates it. Each of the
+2 nonzero lanes has exactly one genuinely-new, correctly-`openMaxHoldMs`-tagged `CLOSED_WIN` row;
+`BL_TREND_SCALEOUT_STOP200`'s own single post-reset `CLOSED_WIN` row fails a different,
+pre-existing, unrelated field check inside `isFreshValidObs` that predates this session's work —
+noted as an observation, deliberately not investigated further (would be a new bug hunt outside this
+goal's scope, and the direction of the discrepancy is "undercounts," not leakage). The population of
+legacy (`openMaxHoldMs === undefined`) rows per lane (753/735/781 of 791/773/819 total) remains, as
+designed, entirely excluded from every count above. No leakage found.
+
+**Secret/config drift**: none — covered by the `.env` hash-equality check in §14.2 (only channel
+through which secrets reach the runtime; no other config file differs, per the full tree-hash
+comparison above).
+
+### 14.4 Controlled activation
+
+PM2 process definitions backed up before any change: `pm2 jlist` snapshot at
+`/root/kronos-pm2-backups/pm2-jlist-pre-normalize-2026-08-05.json` (pulled to this session's local
+scratchpad as a second copy) plus `pm2 save --force` (`/root/.pm2/dump.pm2`). Pre-normalization
+state recorded: `dtc-api` → `2c93a9c`, restarts 0; `dtc-api-testnet` → `2c93a9c`, restarts 0;
+`dtc-api-live` → `/root/kronos-live/...` (never a versioned release dir), restarts 8378.
+
+**3102 activated first** (`pm2 delete dtc-api-testnet` + `pm2 start
+/root/kronos-testnet-releases/edc3f31/.../run-api.sh --name dtc-api-testnet --interpreter bash`).
+Clean startup log (`.env` loaded, 179 vars; `PAPER_AUTO_CYCLE on`; `canonical-market-regime-universe`
+resolved 60 symbols; `cortex-refit examples=0 blindCapital=100%`), no errors. Verified on the live,
+now-running process itself (not a standalone script):
+- Health: `{"ok":true}`.
+- Identity: `instanceId: "3102"`, `logicalRole: null` (honest, direct allowlist match).
+- Causal status: `journalBadLines: 0`, `totalEvents: 11932` (growing live), `outcomesResolved: 1128`.
+- CORTEX: `liveBeta: 0`, `blindCapitalPct: 100`, `cumulativeResolved: 0`.
+- Campaigns: `configured: false`, `active: false`.
+- Scheduler: `canonical-market-regime-history.json` mtime 25s old at check time — actively running,
+  not stale.
+
+**Only after 3102 passed, 3101 activated** the same way. Same clean-startup evidence. Same checks,
+all passing: health OK; `instanceId: "3101"`, `logicalRole: null`; `journalBadLines: 0`,
+`totalEvents: 409`, `outcomesResolved: 105`; CORTEX `liveBeta: 0` / `blindCapitalPct: 100` /
+`cumulativeResolved: 0`; campaigns `configured: false`; scheduler history file confirmed updating
+across two checks 20s apart (mtime advanced both times) — continuously live, not a one-shot write.
+
+No data store was modified by this activation — both `data` symlinks point at the same, unchanged,
+persistent `128b09f` anchor the prior release used; only the code serving requests changed.
+
+Rollback readiness: the prior `2c93a9c` release directories were left in place (not deleted) on both
+instances as an immediate rollback target; rollback was not needed — both activations passed on the
+first attempt after the symlink fix in §14.2.
+
+### 14.5 Closure
+
+- **Git commit = RELEASE_SHA = deployed file hashes = evidence manifest**: all four agree. Commit
+  `edc3f31609492d082f42ba7eeffa67a270bf73e1` is what `git archive` read; the same hash is the literal
+  content of `RELEASE_SHA` on both instances; the same hash is what both PM2 processes' `script path`
+  now resolves under (`.../edc3f31/daily-trading-cockpit-v2/deploy/run-api.sh`); and §14.3's
+  856-file SHA256 comparison is the evidence manifest proving the deployed trees equal that commit's
+  tree, not merely claim to.
+- Journals: **VALID, malformed 0**, both instances, confirmed twice — once via a standalone script
+  pre-activation (§14.3), once via the live running server post-activation (§14.4).
+- Reset lanes: **no legacy-evidence leakage** — §14.3's row-level inspection.
+- Campaigns **OFF**, CORTEX **OBSERVE_ONLY** (`liveBeta: 0`) — both instances, confirmed live
+  post-activation.
+- **No strategy, entry, exit, config, or data-store change** — this section is a code/deploy-identity
+  normalization only; the only files that differ from §13's state are `forward-causal-collection.ts`
+  and its test (already committed and reasoned about in §13.1 — now simply the release's single
+  source of truth instead of a manual overlay) plus this documentation.
+- **3103 confirmed untouched**: restart count 8378, unchanged across this entire section; script path
+  still `/root/kronos-live/daily-trading-cockpit-v2/deploy/run-api.sh`, never a versioned release
+  directory; no file under `/root/kronos-live/` read for write at any point.
+
+### 14.6 Verdict
+
+**`KRONOS_PHASE_1_CLOSED_AND_RELEASE_NORMALIZED`**
+
+- Final commit: `edc3f31609492d082f42ba7eeffa67a270bf73e1`; tag `kronos-phase-1-closed` → same commit
+  (unmoved — already correct)
+- Active RELEASE_SHA on 3101/3102: `edc3f31609492d082f42ba7eeffa67a270bf73e1` (both — identical,
+  single-commit, no overlay)
+- Hash verification: 856/856 git-tracked files (of 857; 1 intentionally superseded by the live-data
+  symlink, both sides) byte-identical across git tree ⇔ 3101 ⇔ 3102
+- Journal validation: 3101 `VALID malformed=0` (409 events, 105 resolved outcomes); 3102 `VALID
+  malformed=0` (11932 events, 1128 resolved outcomes) — both confirmed live, post-activation
+- Health/scheduler/CORTEX/campaign status: all OK, both instances (§14.4)
+- Reset-lane leakage status: none found; small organic post-reset growth (1/1/0, control 24) verified
+  genuine by row-level timestamp inspection, not assumed
+- No config/data/strategy changes: confirmed (§14.5)
+- 3103 untouched: confirmed, restart count 8378 unchanged throughout
