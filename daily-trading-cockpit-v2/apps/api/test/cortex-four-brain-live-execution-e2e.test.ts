@@ -56,8 +56,8 @@ import {
   runFourBrainTickForOrder,
   policyFor,
   CANONICAL_CORTEX_LANE_ID,
-} from "./cortex-four-brain-causal-chain-e2e.test.js";
-import { FakeLiveClient, makePaperStore, makeEngine } from "./live-execution-engine.test.js";
+} from "./helpers/cortex-four-brain-causal-chain-e2e-fixtures.js";
+import { FakeLiveClient, makePaperStore, makeEngine } from "./helpers/live-execution-engine-fixtures.js";
 
 // ── Local temp-dir bookkeeping for the LiveExecutionStore instances this file creates directly
 // (never routed through live-execution-engine.test.ts's own private `tmp()`/`dirs`, so cleanup stays
