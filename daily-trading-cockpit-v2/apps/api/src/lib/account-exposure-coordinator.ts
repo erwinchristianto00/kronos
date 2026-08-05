@@ -902,19 +902,32 @@ export class AccountExposureCoordinator {
    * an API call to investigate; the next sweep picks them up once they cross the threshold.
    *
    * Four outcomes per stale row (queried via queryOrderByClientId(symbol, clientOrderId)):
-   *   1. FILLED/PARTIALLY_FILLED with executedQty>0 → COMMITTED from the real executedQty/avgPrice.
-   *      A report-only log line flags that the OWNING executor's own position/basket store should be
+   *   1. executedQty>0, ANY status → COMMITTED from the real executedQty/avgPrice. Checked FIRST,
+   *      independent of the order's overall terminal status string (see 2026-08-05 note below). A
+   *      report-only log line flags that the OWNING executor's own position/basket store should be
    *      checked for a matching record — this alone does not recreate a missing position record (see
    *      this file's header comment; that repair is out of scope for this coordinator).
-   *   2. Terminal with no fill (CANCELED/CANCELLED/EXPIRED/REJECTED, or a defensive
-   *      FILLED-with-executedQty<=0) → RELEASED "RECONCILED_NOT_FILLED".
+   *   2. Terminal with no fill (CANCELED/CANCELLED/EXPIRED/REJECTED/FILLED, all with executedQty<=0
+   *      by construction — outcome 1 already claimed every executedQty>0 case) → RELEASED
+   *      "RECONCILED_NOT_FILLED".
    *   3. The query itself fails with BinanceFuturesPrivateError.binanceCode===-2013 ("order does not
    *      exist") → Binance has no record at all, the order never reached the exchange → RELEASED
    *      "RECONCILED_NEVER_REACHED_EXCHANGE".
-   *   4. Anything else (network error, timeout, any other Binance code, malformed response, an
-   *      unrecognized/ambiguous order status such as NEW or a contradictory PARTIALLY_FILLED with
-   *      executedQty<=0, or no queryOrderByClientId wired at all) → genuinely INCONCLUSIVE: left
-   *      RESERVED unchanged, logged, retried next sweep indefinitely.
+   *   4. Anything else (network error, timeout, any other Binance code, malformed response, or an
+   *      unrecognized/ambiguous order status such as NEW, all with executedQty<=0, or no
+   *      queryOrderByClientId wired at all) → genuinely INCONCLUSIVE: left RESERVED unchanged,
+   *      logged, retried next sweep indefinitely.
+   *
+   * 2026-08-05 (adversarial-review fix): executedQty>0 used to be gated on
+   * status==="FILLED"||"PARTIALLY_FILLED", so a Binance Futures MARKET order that partially matched
+   * thin book depth and terminated its unfilled remainder with status EXPIRED (sometimes CANCELED) —
+   * a real, documented Binance quirk — was misclassified into outcome 2: RELEASED capacity that was
+   * actually live on the exchange, and the fill was never recorded anywhere. Same bug, independently
+   * implemented, was found and fixed the same day in cross-sectional-executor.ts's
+   * reconcilePlannedLeg; this brings that convention here (executedQty alone, no status gate).
+   * Purely additive/widening — every case the OLD condition already classified COMMITTED is still
+   * COMMITTED (a strict subset), so this cannot change the outcome for any status/executedQty
+   * combination the existing test suite already covered before this fix.
    */
   async reconcileStaleReservations(): Promise<ReconcileSweepResult> {
     const staleMs = this.reservationStaleMsFn();
@@ -938,7 +951,7 @@ export class AccountExposureCoordinator {
         const order = await this.queryOrderByClientIdFn(r.symbol, r.clientOrderId);
         const status = (order.status ?? "").trim().toUpperCase();
         const executedQty = Number.isFinite(order.executedQty) ? order.executedQty : 0;
-        if ((status === "FILLED" || status === "PARTIALLY_FILLED") && executedQty > 0) {
+        if (executedQty > 0) {
           r.committedQty = executedQty;
           r.committedNotionalUsd = executedQty * order.avgPrice;
           r.committedAt = this.nowIsoFn();
@@ -953,7 +966,7 @@ export class AccountExposureCoordinator {
           status === "CANCELLED" ||
           status === "EXPIRED" ||
           status === "REJECTED" ||
-          (status === "FILLED" && executedQty <= 0)
+          status === "FILLED"
         ) {
           r.status = "RELEASED";
           r.releasedAt = this.nowIsoFn();

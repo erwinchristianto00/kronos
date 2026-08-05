@@ -694,6 +694,28 @@ describe("reconcileStaleReservations / reconcileOnStartup", () => {
     }
   });
 
+  it("terminal-no-fill status with executedQty>0 (Binance partial-then-terminate quirk) -> COMMITTED, not RELEASED", async () => {
+    // Binance Futures MARKET orders that only partially match thin book depth can terminate the
+    // unfilled remainder with a terminal status (EXPIRED, sometimes CANCELED/REJECTED) while still
+    // reporting the genuinely executed portion via a nonzero executedQty. Status string must never
+    // override a nonzero fill — same rule as cross-sectional-executor.ts's reconcilePlannedLeg.
+    for (const status of ["CANCELED", "CANCELLED", "EXPIRED", "REJECTED"]) {
+      const dir = tmpDir();
+      const store = new AccountExposureReservationStore(dir);
+      const row = pushRawReservation(store, { clientOrderId: `term-fill-${status}` });
+      const coord = makeCoordinator({
+        dataDir: dir,
+        store,
+        queryOrderByClientId: async () => fakeOrder({ status, executedQty: 0.002, avgPrice: 60000 }),
+      });
+      const result = await coord.reconcileStaleReservations();
+      expect(result).toEqual({ checked: 1, committed: 1, released: 0, inconclusive: 0 });
+      expect(row.status).toBe("COMMITTED");
+      expect(row.committedQty).toBe(0.002);
+      expect(row.committedNotionalUsd).toBeCloseTo(120, 6);
+    }
+  });
+
   it("a defensive FILLED-with-executedQty===0 is also treated as RECONCILED_NOT_FILLED", async () => {
     const dir = tmpDir();
     const store = new AccountExposureReservationStore(dir);
