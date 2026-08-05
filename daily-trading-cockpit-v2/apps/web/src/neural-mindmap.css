@@ -443,6 +443,230 @@
   cursor: default;
 }
 
+.neural-evidence-version-panel {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+  border-bottom: 1px solid #20313a;
+  background:
+    radial-gradient(circle at 12% 12%, rgba(111, 183, 201, 0.08), transparent 30%),
+    linear-gradient(180deg, #09141a 0%, #0b171d 100%);
+}
+
+.neural-evidence-version-panel-head {
+  border: 1px solid #243740;
+  border-radius: 8px;
+  background: rgba(7, 16, 22, 0.76);
+  padding: 14px;
+}
+
+.neural-evidence-version-panel-head span {
+  display: block;
+  color: #70858f;
+  font: 600 10px/1.3 "IBM Plex Mono", "Cascadia Code", monospace;
+  text-transform: uppercase;
+}
+
+.neural-evidence-version-panel-head strong {
+  display: block;
+  margin-top: 8px;
+  color: #e6f4ee;
+  font-size: 17px;
+  line-height: 1.15;
+}
+
+.neural-evidence-version-panel-head p {
+  margin: 8px 0 0;
+  color: #9ab0b9;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.neural-evidence-version-list {
+  display: grid;
+  gap: 12px;
+}
+
+.neural-evidence-version-card {
+  display: grid;
+  gap: 10px;
+  padding: 12px 14px;
+  border: 1px solid rgba(111, 183, 201, 0.35);
+  border-radius: 8px;
+  background: rgba(7, 16, 22, 0.76);
+}
+
+.neural-evidence-version-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.neural-evidence-version-head span {
+  color: #e7eef8;
+  font-weight: 700;
+  font-size: 13px;
+}
+
+.neural-evidence-version-head strong {
+  color: #6fb7c9;
+  font: 700 11px/1.3 "IBM Plex Mono", "Cascadia Code", monospace;
+  letter-spacing: 0.02em;
+}
+
+.neural-evidence-version-head small {
+  color: #70858f;
+  font-size: 10px;
+}
+
+.neural-evidence-version-label {
+  display: block;
+  color: #728993;
+  font: 700 9px/1.25 "IBM Plex Mono", "Cascadia Code", monospace;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.neural-evidence-version-current {
+  display: grid;
+  gap: 6px;
+}
+
+.neural-evidence-version-legacy {
+  display: grid;
+  gap: 4px;
+  padding: 10px 12px;
+  border: 1px dashed rgba(243, 191, 90, 0.4);
+  border-radius: 6px;
+  background: rgba(91, 66, 12, 0.16);
+}
+
+.neural-evidence-version-legacy-label {
+  color: #f3bf5a;
+  font: 800 10px/1.3 "IBM Plex Mono", "Cascadia Code", monospace;
+  letter-spacing: 0.05em;
+}
+
+.neural-evidence-version-legacy small {
+  display: block;
+  color: #ffdca0;
+  font-size: 9px;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+
+.neural-evidence-version-legacy p {
+  margin: 2px 0 0;
+  color: #d8c39a;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.neural-evidence-version-legacy-reason {
+  color: #b9a687 !important;
+  font-size: 10.5px !important;
+}
+
+.neural-evidence-gate-sides-stacked {
+  grid-template-columns: 1fr;
+}
+
+.neural-evidence-gate {
+  display: grid;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid #243740;
+  border-radius: 6px;
+  background: rgba(9, 20, 26, 0.6);
+}
+
+.neural-evidence-gate-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.neural-evidence-gate-head span {
+  color: #9ab0b9;
+  font: 700 11px/1.3 "IBM Plex Mono", "Cascadia Code", monospace;
+  text-transform: uppercase;
+}
+
+.neural-evidence-gate-head b {
+  font-size: 10px;
+  letter-spacing: 0.04em;
+}
+
+.neural-evidence-gate-empty {
+  margin: 0;
+  color: #70858f;
+  font-size: 11px;
+}
+
+.neural-evidence-gate-sides {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.neural-evidence-gate-side {
+  display: grid;
+  gap: 6px;
+  padding: 8px 10px;
+  border: 1px solid #1c2a31;
+  border-radius: 6px;
+  background: rgba(7, 16, 22, 0.5);
+}
+
+.neural-evidence-gate-side-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: #7d929f;
+  font: 700 9px/1.3 "IBM Plex Mono", "Cascadia Code", monospace;
+  text-transform: uppercase;
+}
+
+.neural-evidence-gate-side-title b {
+  font-size: 9px;
+}
+
+.neural-evidence-gate-metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+  gap: 8px;
+}
+
+.neural-evidence-gate-metrics span {
+  display: block;
+  color: #70858f;
+  font: 600 9px/1.3 "IBM Plex Mono", "Cascadia Code", monospace;
+  text-transform: uppercase;
+}
+
+.neural-evidence-gate-metrics strong {
+  display: block;
+  margin-top: 2px;
+  color: #e6f4ee;
+  font-size: 12px;
+}
+
+.neural-evidence-gate-blockers {
+  margin: 0;
+  color: #ffdca0;
+  font-size: 10.5px;
+  line-height: 1.5;
+}
+
+@media (max-width: 720px) {
+  .neural-evidence-gate-sides {
+    grid-template-columns: 1fr;
+  }
+}
+
 .neural-milestone-panel {
   display: grid;
   gap: 12px;
@@ -779,6 +1003,34 @@
 .neural-milestone-table-wrap .neural-shortlist-cell {
   min-width: 210px;
   max-width: 270px;
+}
+
+/* Stage-proof verdict cell. Only a PASSED frozen proof gets the green "proven" read; an unfrozen
+   or absent window is deliberately neutral grey, NOT green — it must never look like progress
+   toward promotion, which is how the old raw-row bars misread. */
+.neural-milestone-table-wrap .neural-proof-cell {
+  min-width: 150px;
+  max-width: 210px;
+  white-space: normal;
+}
+
+.neural-milestone-table-wrap .neural-proof-cell small {
+  display: block;
+  margin-top: 2px;
+  color: #7f8f96;
+  font: 500 10px/1.3 "IBM Plex Mono", "Cascadia Code", monospace;
+}
+
+.neural-milestone-table-wrap .neural-proof-cell.proof-ok {
+  color: #5ce4a6;
+}
+
+.neural-milestone-table-wrap .neural-proof-cell.proof-blocked {
+  color: #f3bf5a;
+}
+
+.neural-milestone-table-wrap .neural-proof-cell.proof-none {
+  color: #9aa7ad;
 }
 
 .rotation-empty {
