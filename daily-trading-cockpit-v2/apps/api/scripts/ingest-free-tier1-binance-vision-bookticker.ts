@@ -21,7 +21,9 @@ import type { ValidatedFoundryRow } from "../src/research/foundry/semantic-valid
 const HOUR_MS = 3_600_000;
 const SYMBOLS = ["BTCUSDT", "ETHUSDT"];
 const WARMUP_START_MS = Date.UTC(2023, 3, 1);
-const START_MS = Date.UTC(2023, 4, 1);
+// Binance Vision's May bookTicker begins milliseconds after midnight, so the
+// first source-complete one-hour PIT snapshot is 01:00 UTC.
+const START_MS = Date.UTC(2023, 4, 1, 1);
 const END_MS = Date.UTC(2024, 3, 1);
 const archiveRoot = process.argv[2];
 const sourceRetrievedAtMs = Number(process.argv[3]);
@@ -69,6 +71,6 @@ const minimumHistory = generateMinimumHistoryEligibilityArtifact({ listingRows: 
 const risk = generatePitPortfolioRiskArtifact({ candles: allCandles.map((row) => ({ symbol: row.symbol!, openTimeMs: row.openTimeMs as number, closeTimeMs: row.closeTimeMs as number, open: row.open as number, high: row.high as number, low: row.low as number, close: row.close as number, volume: row.volume as number })), expectedCoverage: executionCoverage, asOfTimesMs: decisionTimesMs, lookbackBars: 168, minimumObservations: 120, closeIntervalMs: HOUR_MS, snapshotIntervalMs: HOUR_MS, source: "Derived from exact-timestamp aligned Binance Vision completed closes strictly before each decision", ...derived("pit-beta-correlation-btceth-2023-05_to_2024-03", [warmup.manifest.semanticManifestHash, candles.manifest.semanticManifestHash], "pit-aligned-prior-return-risk-v1", { lookbackBars: 168, minimumObservations: 120, closeIntervalMs: HOUR_MS }), generatedAtMs, generationSha: gitCommit }); persist({ rows: risk.canonicalRows, manifest: risk.manifest });
 
 const bboSource = archiveSource({ path: raw, include: (path) => (path.startsWith("bookTicker/") || path.startsWith("klines/")) && (path.endsWith(".zip") || path.endsWith(".zip.CHECKSUM")), datasetId: "futures-um-monthly-bookTicker-plus-klines-btceth-2023-05_to_2024-03", schemaVersion: "binance-vision-bookTicker-and-kline-csv-v1" });
-const liquidity = await importBinanceVisionUsdMRawBookTickerLiquidityArchive({ root: raw, expectedCoverage: executionCoverage, candleRows: candles.rows as ValidatedFoundryRow[], maxQuoteAgeMs: HOUR_MS, source: "Binance Vision USD-M bookTicker BBO plus prior completed volume", sourceProvenance: bboSource, generatedAtMs, generationSha: gitCommit }); persist(liquidity);
+const liquidity = await importBinanceVisionUsdMRawBookTickerLiquidityArchive({ root: raw, expectedCoverage: executionCoverage, candleRows: allCandles, maxQuoteAgeMs: HOUR_MS, source: "Binance Vision USD-M bookTicker BBO plus prior completed volume", sourceProvenance: bboSource, generatedAtMs, generationSha: gitCommit }); persist(liquidity);
 
 console.log(JSON.stringify({ scope: { symbols: SYMBOLS, warmupStartMs: WARMUP_START_MS, startMs: START_MS, endMs: END_MS, timeframeMs: HOUR_MS }, artifacts: [warmup, candles, funding, listing, futures, minimumHistory, risk, liquidity].map((artifact) => ({ artifactKind: artifact.manifest.artifactKind, semanticManifestHash: artifact.manifest.semanticManifestHash, rowsHash: artifact.manifest.rowsHash, archiveBundleHash: artifact.manifest.archiveBundle?.archiveBundleHash ?? null, parentSemanticManifestHashes: artifact.manifest.derivation?.parentSemanticManifestHashes ?? [], rowCount: artifact.manifest.rowCount, coverageGaps: artifact.manifest.missingDataReport })) }, null, 2));

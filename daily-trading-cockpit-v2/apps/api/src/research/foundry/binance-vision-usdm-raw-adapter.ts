@@ -84,7 +84,7 @@ function waitFor(child: ReturnType<typeof spawn>, label: string): Promise<void> 
 
 async function bookTickerSamples(input: { path: string; relativePath: string; symbol: string; startMs: number; endMs: number; sourceHash: string; maxQuoteAgeMs: number }): Promise<BookTickerSample[]> {
   const awk = [
-    'BEGIN { target = start + interval - 1; have = 0; prior = -1 }',
+    'BEGIN { target = start; have = 0; prior = -1 }',
     'NR == 1 { if ($0 != "update_id,best_bid_price,best_bid_qty,best_ask_price,best_ask_qty,transaction_time,event_time") { print "HEADERS" > "/dev/stderr"; exit 2 } next }',
     '{ time = $7 + 0; if (time <= 0 || (prior >= 0 && time < prior)) { print "TIMESTAMP" > "/dev/stderr"; exit 3 } prior = time; while (target < end && time > target) { if (!have) { print "LEADING_GAP" > "/dev/stderr"; exit 4 } print target "\\t" lastTime "\\t" lastBidPrice "\\t" lastBidQty "\\t" lastAskPrice "\\t" lastAskQty; target += interval } lastTime = time; lastBidPrice = $2; lastBidQty = $3; lastAskPrice = $4; lastAskQty = $5; have = 1 }',
     'END { while (target < end) { if (!have) { print "TRAILING_GAP" > "/dev/stderr"; exit 5 } print target "\\t" lastTime "\\t" lastBidPrice "\\t" lastBidQty "\\t" lastAskPrice "\\t" lastAskQty; target += interval } }',
@@ -113,11 +113,11 @@ export async function importBinanceVisionUsdMRawBookTickerLiquidityArchive(input
     if (startMs < endMs) samples.push(...await bookTickerSamples({ path: resolve(input.root, file.relativePath), relativePath: file.relativePath, symbol, startMs, endMs, sourceHash: file.fileHash, maxQuoteAgeMs: input.maxQuoteAgeMs }));
   }
   const candles = new Map(input.candleRows.map((row) => [`${row.symbol}:${row.openTimeMs}`, row])); const rows = samples.map((sample) => {
-    const candle = candles.get(`${sample.symbol}:${sample.asOfMs - HOUR_MS + 1}`) as (ValidatedFoundryRow & { volume: number; closeTimeMs: number }) | undefined;
-    if (!candle || candle.closeTimeMs !== sample.asOfMs) throw new Error(`FOUNDRY_BINANCE_VISION_BOOKTICKER_CANDLE_MISSING_${sample.symbol}_${sample.asOfMs}`);
+    const candle = candles.get(`${sample.symbol}:${sample.asOfMs - HOUR_MS}`) as (ValidatedFoundryRow & { volume: number; closeTimeMs: number }) | undefined;
+    if (!candle || candle.closeTimeMs !== sample.asOfMs - 1) throw new Error(`FOUNDRY_BINANCE_VISION_BOOKTICKER_CANDLE_MISSING_${sample.symbol}_${sample.asOfMs}`);
     const midpoint = (sample.askPrice + sample.bidPrice) / 2;
-    return { symbol: sample.symbol, asOfMs: sample.asOfMs, validUntilMs: sample.asOfMs, volume: candle.volume, liquidityNotional: Math.min(sample.askPrice * sample.askQuantity, sample.bidPrice * sample.bidQuantity), spreadBps: ((sample.askPrice - sample.bidPrice) / midpoint) * 10_000, sourceHash: tournamentHash({ bookTicker: sample.sourceHash, candle: candle.sourceHash, eventTimeMs: sample.eventTimeMs }) };
+    return { symbol: sample.symbol, asOfMs: sample.asOfMs, validUntilMs: sample.asOfMs + HOUR_MS - 1, volume: candle.volume, liquidityNotional: Math.min(sample.askPrice * sample.askQuantity, sample.bidPrice * sample.bidQuantity), spreadBps: ((sample.askPrice - sample.bidPrice) / midpoint) * 10_000, sourceHash: tournamentHash({ bookTicker: sample.sourceHash, candle: candle.sourceHash, eventTimeMs: sample.eventTimeMs }) };
   }).sort((a, b) => a.asOfMs - b.asOfMs || a.symbol.localeCompare(b.symbol));
-  const built = buildFoundryArtifact({ artifactKind: "PIT_LIQUIDITY_SPREAD", schemaVersion: FOUNDRY_SCHEMA_V1, source: input.source, sourceProvenance: input.sourceProvenance, archiveBundle, units: { asOfMs: "unix_ms", validUntilMs: "unix_ms", volume: "base_asset_prior_completed_1h", liquidityNotional: "USDT_min_best_bid_ask_notional", spreadBps: "inside_bbo_bps", policy: "binance-vision-usdm-bookticker-hourly-v1" }, generatedAtMs: input.generatedAtMs, generationSha: input.generationSha, expectedCoverage: { ...input.expectedCoverage, maxSnapshotAgeMs: 0 }, rows });
+  const built = buildFoundryArtifact({ artifactKind: "PIT_LIQUIDITY_SPREAD", schemaVersion: FOUNDRY_SCHEMA_V1, source: input.source, sourceProvenance: input.sourceProvenance, archiveBundle, units: { asOfMs: "unix_ms", validUntilMs: "unix_ms", volume: "base_asset_prior_completed_1h", liquidityNotional: "USDT_min_best_bid_ask_notional", spreadBps: "inside_bbo_bps", policy: "binance-vision-usdm-bookticker-hourly-v1" }, generatedAtMs: input.generatedAtMs, generationSha: input.generationSha, expectedCoverage: { ...input.expectedCoverage, maxSnapshotAgeMs: input.maxQuoteAgeMs }, rows });
   return { rows: built.canonicalRows, manifest: built.manifest };
 }
