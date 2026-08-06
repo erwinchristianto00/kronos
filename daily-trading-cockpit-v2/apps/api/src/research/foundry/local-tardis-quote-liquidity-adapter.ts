@@ -54,7 +54,7 @@ export function importLocalTardisQuoteLiquidityArchive(input: {
   }
   const foundSymbols = new Set([...quotes, ...candles].map((row) => row.symbol)); if (input.expectedCoverage.symbols.some((symbol) => !foundSymbols.has(symbol))) throw new Error("FOUNDRY_TARDIS_LIQUIDITY_SYMBOL_COVERAGE_INVALID");
   const output: unknown[] = [];
-  for (const symbol of [...input.expectedCoverage.symbols].sort()) for (let asOfMs = input.expectedCoverage.startMs; asOfMs < input.expectedCoverage.endMs; asOfMs += input.expectedCoverage.cadenceMs) {
+  for (let asOfMs = input.expectedCoverage.startMs; asOfMs < input.expectedCoverage.endMs; asOfMs += input.expectedCoverage.cadenceMs) for (const symbol of [...input.expectedCoverage.symbols].sort()) {
     const quote = quotes.filter((row) => row.symbol === symbol && row.timestampUs <= asOfMs * 1_000).sort((a, b) => a.timestampUs - b.timestampUs).at(-1);
     const candle = candles.find((row) => row.symbol === symbol && row.closeTimeMs === asOfMs - 1);
     if (!quote || !candle || asOfMs * 1_000 - quote.timestampUs > input.maxQuoteAgeMs * 1_000) throw new Error(`FOUNDRY_TARDIS_LIQUIDITY_PIT_COVERAGE_MISSING_${symbol}_${asOfMs}`);
