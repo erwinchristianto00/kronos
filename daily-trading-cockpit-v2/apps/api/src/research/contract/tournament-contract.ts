@@ -27,10 +27,11 @@ export function tournamentHash(value: unknown): string {
 }
 
 export function assertValidTournamentDataset(dataset: TournamentDatasetManifest): void {
-  if (!dataset.candlesHash || !dataset.executionInputsHash || !dataset.historicalUniverseHash || !dataset.canonicalEpisodeHash || !dataset.portfolioRiskHash || dataset.artifactManifestHashes.length === 0) {
+  if (!dataset.candlesHash || !dataset.executionInputsHash || !dataset.historicalUniverseHash || !dataset.canonicalEpisodeHash || !dataset.portfolioRiskHash || dataset.artifactSemanticManifestHashes.length === 0) {
     throw new Error("TOURNAMENT_DATASET_HASH_MISSING");
   }
   if (dataset.dataRange.startMs >= dataset.dataRange.endMs) throw new Error("TOURNAMENT_DATA_RANGE_INVALID");
+  if (!Number.isInteger(dataset.timeframeMs) || dataset.timeframeMs <= 0 || dataset.dataRange.startMs % dataset.timeframeMs !== 0 || dataset.dataRange.endMs % dataset.timeframeMs !== 0) throw new Error("TOURNAMENT_TIMEFRAME_CLOCK_INVALID");
   if (dataset.universeSnapshots.length === 0) throw new Error("TOURNAMENT_POINT_IN_TIME_UNIVERSE_MISSING");
   let prior = -Infinity;
   for (const snapshot of dataset.universeSnapshots) {

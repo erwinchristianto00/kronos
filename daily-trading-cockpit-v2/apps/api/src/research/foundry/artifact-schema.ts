@@ -1,56 +1,55 @@
 import { tournamentHash } from "../contract/tournament-contract.js";
+import { assertExpectedCoverage, deriveFoundryCoverage, type DerivedFoundryCoverage, type FoundryExpectedCoverage } from "./derived-coverage.js";
+import { FOUNDRY_SCHEMA_V1, validateFoundryRows } from "./semantic-validators.js";
 
 export const DATASET_FOUNDRY_VERSION = "kronos-dataset-foundry-v1" as const;
-
 export type FoundryArtifactKind =
   | "COMPLETED_CANDLES" | "FUNDING_SETTLEMENTS" | "LISTING_DELISTING_TIMELINE"
   | "FUTURES_AVAILABILITY_TIMELINE" | "MINIMUM_HISTORY_ELIGIBILITY" | "PIT_LIQUIDITY_SPREAD"
   | "FEE_ASSUMPTIONS" | "PORTFOLIO_RISK_SNAPSHOTS" | "CANONICAL_EPISODES"
   | "KRONOS_DECISION_LEDGER";
 
-export interface FoundryCoverage {
-  expectedStartMs: number;
-  expectedEndMs: number;
-  coveredStartMs: number | null;
-  coveredEndMs: number | null;
-  coveredSymbols: string[];
-  missingIntervals: Array<{ startMs: number; endMs: number; reason: string }>;
-  missingSymbols: string[];
-}
-
 export interface FoundryArtifactManifest {
   foundryVersion: typeof DATASET_FOUNDRY_VERSION;
   artifactKind: FoundryArtifactKind;
-  schemaVersion: string;
+  schemaVersion: typeof FOUNDRY_SCHEMA_V1;
   source: string;
+  units: Record<string, string>;
   generatedAtMs: number;
   generationSha: string;
+  expectedCoverage: FoundryExpectedCoverage;
+  derivedCoverage: DerivedFoundryCoverage;
   timeRange: { startMs: number; endMs: number };
   rowCount: number;
-  contentHash: string;
-  coverage: FoundryCoverage;
+  rowsHash: string;
+  semanticManifestHash: string;
   missingDataReport: string[];
 }
 
-export function buildFoundryArtifactManifest(input: Omit<FoundryArtifactManifest, "foundryVersion" | "contentHash" | "rowCount"> & { rows: readonly unknown[] }): FoundryArtifactManifest {
-  const contentHash = tournamentHash(input.rows);
-  return {
-    foundryVersion: DATASET_FOUNDRY_VERSION,
-    artifactKind: input.artifactKind,
-    schemaVersion: input.schemaVersion,
-    source: input.source,
-    generatedAtMs: input.generatedAtMs,
-    generationSha: input.generationSha,
-    timeRange: { ...input.timeRange },
-    rowCount: input.rows.length,
-    contentHash,
-    coverage: { ...input.coverage, coveredSymbols: [...input.coverage.coveredSymbols].sort(), missingIntervals: input.coverage.missingIntervals.map((interval) => ({ ...interval })), missingSymbols: [...input.coverage.missingSymbols].sort() },
-    missingDataReport: [...input.missingDataReport],
-  };
+export function buildFoundryArtifactManifest(input: {
+  artifactKind: FoundryArtifactKind;
+  schemaVersion: typeof FOUNDRY_SCHEMA_V1;
+  source: string;
+  units: Record<string, string>;
+  generatedAtMs: number;
+  generationSha: string;
+  expectedCoverage: FoundryExpectedCoverage;
+  rows: readonly unknown[];
+}): FoundryArtifactManifest {
+  if (!input.source || !input.generationSha || !Number.isInteger(input.generatedAtMs) || input.generatedAtMs < 0 || Object.keys(input.units).length === 0) throw new Error("FOUNDRY_ARTIFACT_PROVENANCE_INVALID");
+  const normalizedRows = validateFoundryRows(input.artifactKind, input.schemaVersion, input.rows).sort((a, b) => (a.timestampMs - b.timestampMs) || (a.symbol ?? "").localeCompare(b.symbol ?? ""));
+  const derivedCoverage = deriveFoundryCoverage(input.artifactKind, normalizedRows, input.expectedCoverage);
+  const rowsHash = tournamentHash(normalizedRows);
+  const missingDataReport = [
+    ...derivedCoverage.missingSymbols.map((symbol) => `SYMBOL:${symbol}`),
+    ...derivedCoverage.missingIntervals.map((interval) => `INTERVAL:${interval.startMs}-${interval.endMs}:${interval.reason}`),
+  ];
+  const identity = { foundryVersion: DATASET_FOUNDRY_VERSION, artifactKind: input.artifactKind, schemaVersion: input.schemaVersion, source: input.source, units: input.units, generatedAtMs: input.generatedAtMs, generationSha: input.generationSha, expectedCoverage: input.expectedCoverage, derivedCoverage, timeRange: { startMs: input.expectedCoverage.startMs, endMs: input.expectedCoverage.endMs }, rowCount: normalizedRows.length, rowsHash };
+  return { ...identity, semanticManifestHash: tournamentHash(identity), missingDataReport };
 }
 
 export function assertCompleteFoundryArtifact(manifest: FoundryArtifactManifest): void {
-  if (manifest.foundryVersion !== DATASET_FOUNDRY_VERSION || !manifest.schemaVersion || !manifest.source || !manifest.generationSha || !manifest.contentHash || manifest.rowCount < 0) throw new Error("FOUNDRY_ARTIFACT_PROVENANCE_INVALID");
-  if (manifest.timeRange.startMs >= manifest.timeRange.endMs) throw new Error("FOUNDRY_ARTIFACT_RANGE_INVALID");
-  if (manifest.coverage.missingIntervals.length > 0 || manifest.coverage.missingSymbols.length > 0 || manifest.missingDataReport.length > 0) throw new Error(`FOUNDRY_ARTIFACT_COVERAGE_INCOMPLETE_${manifest.artifactKind}`);
+  if (manifest.foundryVersion !== DATASET_FOUNDRY_VERSION || manifest.schemaVersion !== FOUNDRY_SCHEMA_V1 || !manifest.source || !manifest.generationSha || !manifest.rowsHash || !manifest.semanticManifestHash || manifest.rowCount <= 0) throw new Error("FOUNDRY_ARTIFACT_PROVENANCE_INVALID");
+  assertExpectedCoverage(manifest.derivedCoverage);
+  if (manifest.missingDataReport.length) throw new Error(`FOUNDRY_ARTIFACT_COVERAGE_INCOMPLETE_${manifest.artifactKind}`);
 }

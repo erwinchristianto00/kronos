@@ -23,6 +23,22 @@ A valid archival input must supply:
 - frozen current-Kronos signal and regime ledgers, each with its own source hash;
 - point-in-time fee/slippage functions for `EXPECTED` execution.
 
+## Dataset Foundry semantics
+
+Every artifact is validated as schema `v1` before it receives a manifest. The
+validator rejects malformed/unknown rows, non-normalized symbols, invalid OHLC,
+non-finite values, duplicate keys, unordered timestamps, invalid effective
+bounds, and unknown schema versions. Coverage is derived from rows against an
+explicit expected contract: symbols, cadence, gaps, funding settlement gaps,
+and PIT snapshot age are recorded exactly. Caller-declared completeness is not
+accepted.
+
+Artifacts persist both `rowsHash` and `semanticManifestHash`. The latter binds
+kind, schema, source, generation SHA/time, units, expected and derived coverage,
+range, row count, and `rowsHash`; tournament manifests reference semantic hashes.
+The canonical experiment clock is `dataRange × timeframeMs`: every eligible
+symbol needs a completed candle or a sourced validated absence on each tick.
+
 `runTournamentMatrix` runs CASH, BTC hold, equal-weight hold, Donchian, MACD,
 EMA, RSI, random timing control, and frozen current Kronos under one supplied
 data/risk/execution contract. `withKronosRegimeGate` provides the paired
@@ -48,3 +64,8 @@ The locally archived 2026-01 through 2026-06 BTCUSDT/ETHUSDT candles and
 funding rows are useful raw inputs, but they are not that artifact: they carry
 neither decision-time listing/delisting state nor volume, spread, futures
 availability, execution-liquidity, or frozen-Kronos signal/regime ledgers.
+
+`local-binance-archive-adapter.ts` can turn those CSV exports into deterministic
+candle/funding Foundry artifacts and `tier1-capability.ts` reports their exact
+Tier-1 blockers. It never invents unavailable listing, eligibility, episode, or
+portfolio-risk history.

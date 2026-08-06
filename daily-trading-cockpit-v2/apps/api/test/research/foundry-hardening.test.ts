@@ -16,7 +16,7 @@ const universeSnapshot = { asOfMs: 0, eligibleSymbols: symbols, sourceHash: "uni
 function spec(overrides: Partial<TournamentExperimentSpec> = {}): TournamentExperimentSpec {
   return {
     tournamentVersion: "kronos-research-tournament-v1", gitCommit: "fixture", strategyVersion: "fixture", randomSeed: 1, capabilityTier: "TIER_2_EXPECTED_EXECUTION",
-    dataset: { provider: "fixture", dataRange: { startMs: 0, endMs: 8 * H }, candlesHash: "candles", fundingHash: "funding", executionInputsHash: "execution", historicalUniverseHash: "universe", canonicalEpisodeHash: "episodes", portfolioRiskHash: "risk", artifactManifestHashes: ["artifact"], artifactKinds: ["COMPLETED_CANDLES", "FUNDING_SETTLEMENTS", "LISTING_DELISTING_TIMELINE", "FUTURES_AVAILABILITY_TIMELINE", "MINIMUM_HISTORY_ELIGIBILITY", "CANONICAL_EPISODES", "PORTFOLIO_RISK_SNAPSHOTS", "PIT_LIQUIDITY_SPREAD", "FEE_ASSUMPTIONS"], timeframe: "1h", universeSnapshots: [universeSnapshot] },
+    dataset: { provider: "fixture", dataRange: { startMs: 0, endMs: 4 * H }, candlesHash: "candles", fundingHash: "funding", executionInputsHash: "execution", historicalUniverseHash: "universe", canonicalEpisodeHash: "episodes", portfolioRiskHash: "risk", artifactSemanticManifestHashes: ["artifact"], artifactKinds: ["COMPLETED_CANDLES", "FUNDING_SETTLEMENTS", "LISTING_DELISTING_TIMELINE", "FUTURES_AVAILABILITY_TIMELINE", "MINIMUM_HISTORY_ELIGIBILITY", "CANONICAL_EPISODES", "PORTFOLIO_RISK_SNAPSHOTS", "PIT_LIQUIDITY_SPREAD", "FEE_ASSUMPTIONS"], timeframe: "1h", timeframeMs: H, universeSnapshots: [universeSnapshot] },
     costs: { makerFeeBps: 0, takerFeeBps: 0, baseSlippageBps: 0, pessimisticSlippageMultiplier: 2, fundingEnabled: false, fillMode: "NEXT_OPEN", intrabarAmbiguity: "STOP_FIRST" },
     portfolio: { startingCapital: 10_000, riskPerTradeFraction: 0.01, maxPositions: 2, maxGrossExposureFraction: 1, maxNetExposureFraction: 1, maxBtcBetaFraction: 1, maxCorrelationClusterFraction: 1, liquidationBufferFraction: 0.2, initialMarginFraction: 0.1, maxPortfolioRiskSnapshotAgeMs: 10 * H },
     validation: { trainBars: 2, testBars: 2, stepBars: 1, purgeBars: 0, embargoBars: 0, sealedHoldoutStartMs: 6 * H, minIndependentEpisodes: 2, minOosProfitabilityFraction: 0.5 }, parameters: {}, ...overrides,
@@ -34,8 +34,8 @@ const holdStrategy = (id: "BTC_BUY_AND_HOLD" | "EQUAL_WEIGHT_HOLD" = "BTC_BUY_AN
 
 function risk(snapshots = [{ asOfMs: 0, validUntilMs: 10 * H, sourceHash: "risk", btcBetaBySymbol: { BTCUSDT: 1, ETHUSDT: 0 }, correlationClusterBySymbol: { BTCUSDT: "BTC", ETHUSDT: "ETH" } }]) { return new PointInTimePortfolioRisk(snapshots); }
 function run(input: { strategy?: TournamentStrategy; candles?: TournamentCandle[]; experiment?: TournamentExperimentSpec; portfolioRisk?: PointInTimePortfolioRisk; episode?: ((symbol: string, time: number) => string | null) | undefined; fundingSettlements?: Parameters<typeof runTournament>[0]["fundingSettlements"]; fundingSettlementScheduleBySymbol?: Parameters<typeof runTournament>[0]["fundingSettlementScheduleBySymbol"] }) {
-  const experiment = input.experiment ?? spec(); const strategy = input.strategy ?? holdStrategy();
-  return runTournament({ manifest: buildRunManifest({ spec: experiment, strategyId: strategy.id, executionMode: "CONSERVATIVE", parameterSet: {}, createdAtMs: 0 }), strategy, candles: input.candles ?? candles(), universe: new PointInTimeUniverse([universeSnapshot]), portfolioRisk: input.portfolioRisk ?? risk(), canonicalEpisodeIdAt: input.episode ?? ((symbol, time) => `${symbol}:${time}`), fundingSettlements: input.fundingSettlements, fundingSettlementScheduleBySymbol: input.fundingSettlementScheduleBySymbol });
+  const experiment = input.experiment ?? spec(); const strategy = input.strategy ?? holdStrategy(); const rows = input.candles ?? candles(); const eligibleSymbols = [...new Set(rows.map((row) => row.symbol))];
+  return runTournament({ manifest: buildRunManifest({ spec: experiment, strategyId: strategy.id, executionMode: "CONSERVATIVE", parameterSet: {}, createdAtMs: 0 }), strategy, candles: rows, universe: new PointInTimeUniverse([{ ...universeSnapshot, eligibleSymbols }]), portfolioRisk: input.portfolioRisk ?? risk(), canonicalEpisodeIdAt: input.episode ?? ((symbol, time) => `${symbol}:${time}`), fundingSettlements: input.fundingSettlements, fundingSettlementScheduleBySymbol: input.fundingSettlementScheduleBySymbol });
 }
 
 describe("Dataset Foundry and methodology hardening", () => {
@@ -47,6 +47,7 @@ describe("Dataset Foundry and methodology hardening", () => {
     expect(result.metrics.sharpe).not.toBeNull();
     expect(result.metrics.maxDrawdown).toBeGreaterThan(0.35);
     expect(result.navLedger.some((point) => point.unrealizedPnl < -3_000)).toBe(true);
+    expect(result.navLedger.slice(1).every((point, index) => point.timestampMs - result.navLedger[index]!.timestampMs === H)).toBe(true);
   });
 
   it("fails episode-dependent gates closed without canonical provenance instead of calendar buckets", () => {
@@ -83,9 +84,9 @@ describe("Dataset Foundry and methodology hardening", () => {
   it("prevents tier overclaiming and creates deterministic complete Foundry artifacts", () => {
     expect(() => assertTierAllowsRun({ tier: "TIER_1_BASELINE", strategyId: "CASH", executionMode: "EXPECTED" })).toThrow("TOURNAMENT_TIER_1_CONSERVATIVE_ONLY");
     expect(() => assertTierAllowsRun({ tier: "TIER_2_EXPECTED_EXECUTION", strategyId: "KRONOS_CURRENT", executionMode: "CONSERVATIVE" })).toThrow("TOURNAMENT_TIER_EXACT_KRONOS_LEDGER_REQUIRED");
-    const base = { artifactKind: "COMPLETED_CANDLES" as const, schemaVersion: "1", source: "fixture", generatedAtMs: 1, generationSha: "abc", timeRange: { startMs: 0, endMs: H }, coverage: { expectedStartMs: 0, expectedEndMs: H, coveredStartMs: 0, coveredEndMs: H, coveredSymbols: ["BTCUSDT"], missingIntervals: [], missingSymbols: [] }, missingDataReport: [], rows: [{ a: 1 }] };
-    const first = buildFoundryArtifactManifest(base); const second = buildFoundryArtifactManifest({ ...base, rows: [{ a: 1 }] });
-    expect(first.contentHash).toBe(second.contentHash); expect(() => assertCompleteFoundryArtifact(first)).not.toThrow();
+    const base = { artifactKind: "COMPLETED_CANDLES" as const, schemaVersion: "v1" as const, source: "fixture", units: { price: "USDT", volume: "BTC" }, generatedAtMs: 1, generationSha: "abc", expectedCoverage: { startMs: 0, endMs: H, symbols: ["BTCUSDT"], cadenceMs: H }, rows: [{ symbol: "BTCUSDT", openTimeMs: 0, closeTimeMs: H - 1, open: 1, high: 2, low: 1, close: 2, volume: 1, sourceHash: "source" }] };
+    const first = buildFoundryArtifactManifest(base); const second = buildFoundryArtifactManifest({ ...base, rows: [{ ...base.rows[0] }] });
+    expect(first.semanticManifestHash).toBe(second.semanticManifestHash); expect(() => assertCompleteFoundryArtifact(first)).not.toThrow();
     expect(buildFoundryCoverageReport([first])).toMatchObject({ complete: true, artifactCount: 1 });
     expect(() => assertCompleteFoundryArtifact({ ...first, missingDataReport: ["missing"] })).toThrow("FOUNDRY_ARTIFACT_COVERAGE_INCOMPLETE");
     expect(() => buildRunManifest({ spec: { ...spec(), capabilityTier: "TIER_3_EXACT_KRONOS" }, strategyId: "KRONOS_CURRENT", executionMode: "CONSERVATIVE", parameterSet: {}, createdAtMs: 0 })).toThrow("TOURNAMENT_TIER_ARTIFACT_MISSING_KRONOS_DECISION_LEDGER");

@@ -14,12 +14,14 @@ import {
 import type { TournamentStrategy } from "../strategies/challengers.js";
 import { PointInTimePortfolioRisk } from "../risk/point-in-time-portfolio-risk.js";
 import { PointInTimeUniverse } from "../universe/point-in-time-universe.js";
+import { assertCandlesCoverCanonicalClock, buildCanonicalClock, type ValidatedAbsence } from "../foundry/canonical-clock.js";
 
 export interface TournamentExecutionInput {
   manifest: TournamentRunManifest;
   strategy: TournamentStrategy;
   candles: readonly TournamentCandle[];
   universe: PointInTimeUniverse;
+  validatedAbsences?: readonly ValidatedAbsence[];
   /** Canonical persisted event ID. Missing provenance invalidates the run. */
   canonicalEpisodeIdAt?: (symbol: string, decisionTimeMs: number) => string | null;
   portfolioRisk: PointInTimePortfolioRisk;
@@ -113,12 +115,13 @@ export function runTournament(input: TournamentExecutionInput): TournamentRunRes
   if (input.candles.length === 0) invalidReasons.push("TOURNAMENT_NO_CANDLES");
   if (manifest.executionMode === "EXPECTED" && (!input.expectedSlippageBpsAt || !input.expectedFeeBpsAt)) invalidReasons.push("TOURNAMENT_EXPECTED_LIQUIDITY_EXECUTION_MISSING");
   if (spec.costs.fundingEnabled && (!input.fundingSettlements || !input.fundingSettlementScheduleBySymbol)) invalidReasons.push("TOURNAMENT_FUNDING_SETTLEMENT_DATA_MISSING");
+  try { assertCandlesCoverCanonicalClock({ clock: buildCanonicalClock({ startMs: spec.dataset.dataRange.startMs, endMs: spec.dataset.dataRange.endMs, timeframeMs: spec.dataset.timeframeMs }), candles: input.candles, universe, absences: input.validatedAbsences }); } catch (error) { invalidReasons.push(error instanceof Error ? error.message : "FOUNDRY_CANONICAL_CLOCK_INVALID"); }
   const emptyNav: TournamentNavPoint[] = [];
   if (invalidReasons.length) { const strategyMetrics = calculateMetrics([], emptyNav, spec.portfolio.startingCapital, false); return { manifest, trades: [], navLedger: emptyNav, strategyMetrics, portfolioMetrics: emptyPortfolioMetrics(spec), metrics: strategyMetrics, warnings, valid: false, invalidReasons }; }
 
   const grouped = groupedCandles(input.candles); const times = [...grouped.keys()].sort((a, b) => a - b); const symbols = [...new Set(input.candles.map((candle) => candle.symbol))].sort();
   const history = new Map(symbols.map((symbol) => [symbol, [] as TournamentCandle[]])); const indexBySymbol = new Map(symbols.map((symbol) => [symbol, 0]));
-  const pending = new Map<number, TournamentIntent[]>(); const open: OpenPosition[] = []; const trades: TournamentTrade[] = []; const navLedger: TournamentNavPoint[] = [{ timestampMs: times[0]! - 1, cash: spec.portfolio.startingCapital, realizedPnl: 0, unrealizedPnl: 0, equity: spec.portfolio.startingCapital, grossExposure: 0, netExposure: 0, marginUsage: 0, liquidationBuffer: spec.portfolio.startingCapital * spec.portfolio.liquidationBufferFraction }];
+  const pending = new Map<number, TournamentIntent[]>(); const open: OpenPosition[] = []; const trades: TournamentTrade[] = []; const navLedger: TournamentNavPoint[] = [{ timestampMs: times[0]! - spec.dataset.timeframeMs, cash: spec.portfolio.startingCapital, realizedPnl: 0, unrealizedPnl: 0, equity: spec.portfolio.startingCapital, grossExposure: 0, netExposure: 0, marginUsage: 0, liquidationBuffer: spec.portfolio.startingCapital * spec.portfolio.liquidationBufferFraction }];
   const costs = modeCost(manifest.executionMode, spec); const portfolioMetrics = emptyPortfolioMetrics(spec); let cash = spec.portfolio.startingCapital; let equityForAdmission = spec.portfolio.startingCapital;
   const fundingByKey = new Map((input.fundingSettlements ?? []).map((settlement) => [`${settlement.symbol}:${settlement.settlementTimeMs}`, settlement]));
 

@@ -64,9 +64,11 @@ export interface TournamentDatasetManifest {
   canonicalEpisodeHash: string;
   portfolioRiskHash: string;
   /** Immutable Dataset Foundry artifact manifests used in this exact run. */
-  artifactManifestHashes: string[];
+  /** References Foundry semanticManifestHash values, never rows-only hashes. */
+  artifactSemanticManifestHashes: string[];
   artifactKinds: TournamentDatasetArtifactKind[];
   timeframe: string;
+  timeframeMs: number;
   universeSnapshots: PointInTimeUniverseSnapshot[];
 }
 

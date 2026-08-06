@@ -1,6 +1,8 @@
 import { readFileSync } from "node:fs";
 
-import { buildFoundryArtifactManifest, type FoundryArtifactKind, type FoundryArtifactManifest, type FoundryCoverage } from "./artifact-schema.js";
+import { buildFoundryArtifactManifest, type FoundryArtifactKind, type FoundryArtifactManifest } from "./artifact-schema.js";
+import { FOUNDRY_SCHEMA_V1 } from "./semantic-validators.js";
+import type { FoundryExpectedCoverage } from "./derived-coverage.js";
 
 /**
  * Import only explicit export files. This adapter neither fetches current
@@ -9,18 +11,16 @@ import { buildFoundryArtifactManifest, type FoundryArtifactKind, type FoundryArt
 export function importFoundryJsonArtifact(input: {
   path: string;
   artifactKind: FoundryArtifactKind;
-  schemaVersion: string;
+  schemaVersion: typeof FOUNDRY_SCHEMA_V1;
   source: string;
+  units: Record<string, string>;
   generatedAtMs: number;
   generationSha: string;
-  timeRange: { startMs: number; endMs: number };
-  coverage: FoundryCoverage;
+  expectedCoverage: FoundryExpectedCoverage;
 }): { rows: unknown[]; manifest: FoundryArtifactManifest } {
   const parsed: unknown = JSON.parse(readFileSync(input.path, "utf8"));
   if (!Array.isArray(parsed)) throw new Error("FOUNDRY_IMPORT_ROWS_MUST_BE_ARRAY");
-  const manifest = buildFoundryArtifactManifest({ ...input, rows: parsed, missingDataReport: [
-    ...input.coverage.missingIntervals.map((interval) => `INTERVAL:${interval.startMs}-${interval.endMs}:${interval.reason}`),
-    ...input.coverage.missingSymbols.map((symbol) => `SYMBOL:${symbol}`),
-  ] });
+  const { path: _path, ...metadata } = input;
+  const manifest = buildFoundryArtifactManifest({ ...metadata, rows: parsed });
   return { rows: parsed, manifest };
 }
