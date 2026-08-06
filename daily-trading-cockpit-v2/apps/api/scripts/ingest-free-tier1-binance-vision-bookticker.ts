@@ -59,7 +59,12 @@ const funding = importBinanceVisionUsdMRawFundingArchive({ root: fundingRoot, ex
 const announcementRoot = resolve(raw, "binance-support-announcements"); const announcementBundle = readArchiveBundle({ root: announcementRoot, include: (path) => path.endsWith(".json") });
 const article = JSON.parse(announcementBundle.contents.get("article-360036964392.json")?.toString("utf8") ?? "") as { data?: { code?: string; title?: string; publishDate?: number; body?: string } };
 const launchTimeMs = article.data?.publishDate; const body = article.data?.body ?? "";
-if (article.data?.code !== "360036964392" || article.data?.title !== "Binance Futures Launches ETH/USDT Perpetual Contract - Up to 50x Leverage" || !Number.isSafeInteger(launchTimeMs) || !body.includes("ETH/USDT") || !body.includes("existing BTC/USDT contract")) throw new Error("FOUNDRY_BINANCE_SUPPORT_LAUNCH_EVIDENCE_INVALID");
+const originalEnglishLaunchEvidence = [
+  "Binance Futures has launched its second perpetual contract",
+  "How to switch from BTC/USDT contract to ETH/USDT contract",
+  "2019/11/29",
+].every((phrase) => body.includes(phrase));
+if (article.data?.code !== "360036964392" || article.data?.title !== "Binance Futures Launches ETH/USDT Perpetual Contract - Up to 50x Leverage" || !Number.isSafeInteger(launchTimeMs) || !originalEnglishLaunchEvidence) throw new Error("FOUNDRY_BINANCE_SUPPORT_LAUNCH_EVIDENCE_INVALID");
 const announcementSource: FoundrySourceProvenance = { provenanceType: "EXCHANGE_HISTORICAL_EXPORT", provider: "Binance Support CMS", exchange: "BINANCE_USD_M", datasetId: "original-english-article-360036964392-and-catalog-48-page-97", retrievedAtMs: sourceRetrievedAtMs, rawFileHash: announcementBundle.archiveBundleHash, schemaVersion: "binance-support-cms-json-v1", generationToolSha: gitCommit };
 const launchSourceHash = tournamentHash({ articleFileHash: announcementBundle.files.find((file) => file.relativePath === "article-360036964392.json")?.fileHash, catalogFileHash: announcementBundle.files.find((file) => file.relativePath === "catalog-48-page-97.json")?.fileHash, launchTimeMs });
 const timelineRows = SYMBOLS.map((symbol) => ({ symbol, effectiveTimeMs: launchTimeMs, sourceHash: launchSourceHash }));
