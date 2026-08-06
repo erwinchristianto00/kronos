@@ -22,6 +22,7 @@ export function persistTournamentRun(rootDir: string, result: TournamentRunResul
   mkdirSync(runDirectory, { recursive: true });
   atomicWrite(resolve(runDirectory, "manifest.json"), result.manifest);
   atomicWrite(resolve(runDirectory, "trade-ledger.json"), result.trades);
+  atomicWrite(resolve(runDirectory, "nav-ledger.json"), result.navLedger);
   atomicWrite(resolve(runDirectory, "result.json"), { strategyMetrics: result.strategyMetrics, portfolioMetrics: result.portfolioMetrics, warnings: result.warnings, valid: result.valid, invalidReasons: result.invalidReasons });
   const registryPath = resolve(root, "run-registry.json");
   const registry = existsSync(registryPath) ? JSON.parse(readFileSync(registryPath, "utf8")) as TournamentRunRegistryEntry[] : [];

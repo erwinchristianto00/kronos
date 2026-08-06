@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import {
   TOURNAMENT_VERSION,
   type TournamentDatasetManifest,
+  type TournamentDatasetArtifactKind,
   type TournamentExperimentSpec,
   type TournamentExecutionMode,
   type TournamentHardGateVerdict,
@@ -26,7 +27,7 @@ export function tournamentHash(value: unknown): string {
 }
 
 export function assertValidTournamentDataset(dataset: TournamentDatasetManifest): void {
-  if (!dataset.candlesHash || !dataset.executionInputsHash || !dataset.historicalUniverseHash) {
+  if (!dataset.candlesHash || !dataset.executionInputsHash || !dataset.historicalUniverseHash || !dataset.canonicalEpisodeHash || !dataset.portfolioRiskHash || dataset.artifactManifestHashes.length === 0) {
     throw new Error("TOURNAMENT_DATASET_HASH_MISSING");
   }
   if (dataset.dataRange.startMs >= dataset.dataRange.endMs) throw new Error("TOURNAMENT_DATA_RANGE_INVALID");
@@ -48,6 +49,13 @@ export function assertValidTournamentSpec(spec: TournamentExperimentSpec): void 
   if (spec.tournamentVersion !== TOURNAMENT_VERSION) throw new Error("TOURNAMENT_VERSION_MISMATCH");
   if (!spec.gitCommit || !spec.strategyVersion) throw new Error("TOURNAMENT_PROVENANCE_MISSING");
   assertValidTournamentDataset(spec.dataset);
+  const tierRequired: Record<TournamentExperimentSpec["capabilityTier"], TournamentDatasetArtifactKind[]> = {
+    TIER_1_BASELINE: ["COMPLETED_CANDLES", "FUNDING_SETTLEMENTS", "LISTING_DELISTING_TIMELINE", "FUTURES_AVAILABILITY_TIMELINE", "MINIMUM_HISTORY_ELIGIBILITY", "CANONICAL_EPISODES", "PORTFOLIO_RISK_SNAPSHOTS"],
+    TIER_2_EXPECTED_EXECUTION: ["COMPLETED_CANDLES", "FUNDING_SETTLEMENTS", "LISTING_DELISTING_TIMELINE", "FUTURES_AVAILABILITY_TIMELINE", "MINIMUM_HISTORY_ELIGIBILITY", "CANONICAL_EPISODES", "PORTFOLIO_RISK_SNAPSHOTS", "PIT_LIQUIDITY_SPREAD", "FEE_ASSUMPTIONS"],
+    TIER_3_EXACT_KRONOS: ["COMPLETED_CANDLES", "FUNDING_SETTLEMENTS", "LISTING_DELISTING_TIMELINE", "FUTURES_AVAILABILITY_TIMELINE", "MINIMUM_HISTORY_ELIGIBILITY", "CANONICAL_EPISODES", "PORTFOLIO_RISK_SNAPSHOTS", "PIT_LIQUIDITY_SPREAD", "FEE_ASSUMPTIONS", "KRONOS_DECISION_LEDGER"],
+  };
+  const missingTierArtifact = tierRequired[spec.capabilityTier].find((kind) => !spec.dataset.artifactKinds.includes(kind));
+  if (missingTierArtifact) throw new Error(`TOURNAMENT_TIER_ARTIFACT_MISSING_${missingTierArtifact}`);
   if (spec.portfolio.startingCapital <= 0 || spec.portfolio.riskPerTradeFraction <= 0) {
     throw new Error("TOURNAMENT_PORTFOLIO_RISK_INVALID");
   }
@@ -56,12 +64,19 @@ export function assertValidTournamentSpec(spec: TournamentExperimentSpec): void 
     || spec.portfolio.maxGrossExposureFraction <= 0
     || spec.portfolio.maxNetExposureFraction <= 0
     || spec.portfolio.maxBtcBetaFraction <= 0
-    || spec.portfolio.maxCorrelationClusterFraction <= 0) {
+    || spec.portfolio.maxCorrelationClusterFraction <= 0
+    || spec.portfolio.initialMarginFraction <= 0 || spec.portfolio.initialMarginFraction > 1
+    || spec.portfolio.maxPortfolioRiskSnapshotAgeMs < 0) {
     throw new Error("TOURNAMENT_PORTFOLIO_CONSTRAINTS_INVALID");
   }
   if (spec.validation.purgeBars < 0 || spec.validation.embargoBars < 0 || spec.validation.sealedHoldoutStartMs <= 0) {
     throw new Error("TOURNAMENT_VALIDATION_SPEC_INVALID");
   }
+}
+
+export function assertTierAllowsRun(input: { tier: TournamentExperimentSpec["capabilityTier"]; strategyId: TournamentStrategyId; executionMode: TournamentExecutionMode }): void {
+  if (input.tier === "TIER_1_BASELINE" && input.executionMode !== "CONSERVATIVE") throw new Error("TOURNAMENT_TIER_1_CONSERVATIVE_ONLY");
+  if (input.tier !== "TIER_3_EXACT_KRONOS" && input.strategyId === "KRONOS_CURRENT") throw new Error("TOURNAMENT_TIER_EXACT_KRONOS_LEDGER_REQUIRED");
 }
 
 export function buildRunManifest(input: {
@@ -73,6 +88,7 @@ export function buildRunManifest(input: {
   createdAtMs: number;
 }): TournamentRunManifest {
   assertValidTournamentSpec(input.spec);
+  assertTierAllowsRun({ tier: input.spec.capabilityTier, strategyId: input.strategyId, executionMode: input.executionMode });
   const inputHash = tournamentHash({
     spec: input.spec,
     strategyId: input.strategyId,
@@ -118,6 +134,7 @@ export function hardGate(metrics: TournamentMetrics, input: {
   const failures: string[] = [];
   if (metrics.expectancyAfterCost <= 0) failures.push("OOS_EXPECTANCY_NON_POSITIVE");
   if (metrics.independentEpisodes < input.minIndependentEpisodes) failures.push("INDEPENDENT_EVIDENCE_INSUFFICIENT");
+  if (!metrics.canonicalEpisodeProvenanceComplete) failures.push("CANONICAL_EPISODE_PROVENANCE_MISSING");
   if (metrics.profitFactor === null || metrics.profitFactor < input.minProfitFactor) failures.push("PROFIT_FACTOR_INSUFFICIENT");
   if (metrics.maxDrawdown > input.maxDrawdown) failures.push("DRAWDOWN_EXCESSIVE");
   if (metrics.profitableAssetRatio === null || metrics.profitableAssetRatio < input.minProfitableAssetRatio) failures.push("CROSS_ASSET_BREADTH_INSUFFICIENT");

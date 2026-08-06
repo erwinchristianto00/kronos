@@ -3,6 +3,18 @@
 This directory is a research-only, fail-closed backtest desk. It has no import
 path from the runtime server or execution engines.
 
+## Capability tiers
+
+| Tier | Required Foundry inputs | Allowed claim |
+|---|---|---|
+| `TIER_1_BASELINE` | candles, PIT universe, actual funding settlements, canonical episodes, PIT portfolio risk | conservative simple-baseline comparison only |
+| `TIER_2_EXPECTED_EXECUTION` | Tier 1 plus PIT liquidity/spread and fee artifacts | execution-sensitivity results for simple strategies |
+| `TIER_3_EXACT_KRONOS` | Tier 2 plus frozen Kronos decision ledger | exact Kronos incremental-value comparison and ablations |
+
+Tier 1 accepts only Conservative execution. Current Kronos cannot be run below
+Tier 3. Missing artifact kinds fail manifest creation, so a report cannot claim
+more evidence than its Foundry inputs supply.
+
 A valid archival input must supply:
 
 - candle, funding, Expected-execution, and historical-universe artifact hashes;
@@ -23,7 +35,9 @@ unless their planned count, direction mix, templates, sizing inputs, and
 concurrency distribution match the frozen reference plan.
 
 Persist each `TournamentRunResult` through `persistTournamentRun` to write the
-manifest, immutable trade ledger, result, and append-only registry. Rank only
+manifest, immutable trade ledger, fixed-interval NAV ledger, result, and
+append-only registry. NAV return series—not trade-close returns—drives Sharpe,
+drawdown, and Calmar. Funding accrues only from exact settlement rows. Rank only
 hard-gate survivors; do not use a raw weighted score as a promotion decision.
 
 Do not infer historical-universe eligibility from today's exchange listing or

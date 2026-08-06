@@ -13,6 +13,7 @@ import { assertRandomControlPlanParity, randomTimingControl, type TournamentStra
 import { runTournamentMatrix } from "../../src/research/tournament-runner.js";
 import type { TournamentCandle, TournamentExperimentSpec } from "../../src/research/tournament-types.js";
 import { PointInTimeUniverse } from "../../src/research/universe/point-in-time-universe.js";
+import { PointInTimePortfolioRisk } from "../../src/research/risk/point-in-time-portfolio-risk.js";
 import { assertNoValidationLeakage, buildWalkForwardPlan, cartesianParameterGrid } from "../../src/research/validation/walk-forward.js";
 
 const H = 3_600_000;
@@ -25,14 +26,18 @@ const snapshot = {
 
 function spec(): TournamentExperimentSpec {
   return {
-    tournamentVersion: "kronos-research-tournament-v1", gitCommit: "abc123", strategyVersion: "test-v1", randomSeed: 17,
-    dataset: { provider: "fixture", dataRange: { startMs: 0, endMs: 4 * H }, candlesHash: "candles", fundingHash: "funding", executionInputsHash: "execution-inputs", historicalUniverseHash: "universe", timeframe: "1h", universeSnapshots: [snapshot] },
+    tournamentVersion: "kronos-research-tournament-v1", gitCommit: "abc123", strategyVersion: "test-v1", randomSeed: 17, capabilityTier: "TIER_2_EXPECTED_EXECUTION",
+    dataset: { provider: "fixture", dataRange: { startMs: 0, endMs: 4 * H }, candlesHash: "candles", fundingHash: "funding", executionInputsHash: "execution-inputs", historicalUniverseHash: "universe", canonicalEpisodeHash: "episodes", portfolioRiskHash: "portfolio-risk", artifactManifestHashes: ["foundry-manifest"], artifactKinds: ["COMPLETED_CANDLES", "FUNDING_SETTLEMENTS", "LISTING_DELISTING_TIMELINE", "FUTURES_AVAILABILITY_TIMELINE", "MINIMUM_HISTORY_ELIGIBILITY", "CANONICAL_EPISODES", "PORTFOLIO_RISK_SNAPSHOTS", "PIT_LIQUIDITY_SPREAD", "FEE_ASSUMPTIONS"], timeframe: "1h", universeSnapshots: [snapshot] },
     costs: { makerFeeBps: 0, takerFeeBps: 0, baseSlippageBps: 0, pessimisticSlippageMultiplier: 2, fundingEnabled: false, fillMode: "NEXT_OPEN", intrabarAmbiguity: "STOP_FIRST" },
-    portfolio: { startingCapital: 10_000, riskPerTradeFraction: 0.01, maxPositions: 2, maxGrossExposureFraction: 1, maxNetExposureFraction: 1, maxBtcBetaFraction: 1, maxCorrelationClusterFraction: 1, liquidationBufferFraction: 0.2 },
+    portfolio: { startingCapital: 10_000, riskPerTradeFraction: 0.01, maxPositions: 2, maxGrossExposureFraction: 1, maxNetExposureFraction: 1, maxBtcBetaFraction: 1, maxCorrelationClusterFraction: 1, liquidationBufferFraction: 0.2, initialMarginFraction: 0.1, maxPortfolioRiskSnapshotAgeMs: 2 * H },
     validation: { trainBars: 10, testBars: 5, stepBars: 5, purgeBars: 1, embargoBars: 1, sealedHoldoutStartMs: 3 * H, minIndependentEpisodes: 2, minOosProfitabilityFraction: 0.5 },
     parameters: {},
   };
 }
+
+const portfolioRisk = new PointInTimePortfolioRisk([{ asOfMs: 0, validUntilMs: 100 * H, sourceHash: "risk", btcBetaBySymbol: { BTCUSDT: 1, ETHUSDT: 0.8 }, correlationClusterBySymbol: { BTCUSDT: "BTC", ETHUSDT: "BTC" } }]);
+const canonicalEpisode = (symbol: string, time: number): string => `${symbol}:${Math.floor(time / H)}`;
+function executionBase() { return { portfolioRisk, canonicalEpisodeIdAt: canonicalEpisode }; }
 
 function candle(index: number, values: Partial<Pick<TournamentCandle, "open" | "high" | "low" | "close">> = {}): TournamentCandle {
   const open = values.open ?? 100;
@@ -94,7 +99,7 @@ describe("Kronos Research Tournament v1 contract", () => {
       onCompletedBar: (bar) => bar.index === 0 && bar.nextOpenTimeMs !== null ? [{ strategyId: "DONCHIAN", symbol: bar.symbol, side: "LONG", decisionTimeMs: bar.candle.closeTimeMs, entryAtOpenTimeMs: bar.nextOpenTimeMs, stopFraction: 0.01, targetFraction: 0.01, maxHoldBars: 9, exitTemplate: "FIXTURE", score: 1, metadata: {} }] : [],
     };
     const manifest = buildRunManifest({ spec: spec(), strategyId: "DONCHIAN", executionMode: "CONSERVATIVE", parameterSet: {}, createdAtMs: 0 });
-    const result = runTournament({ manifest, strategy, universe: new PointInTimeUniverse([snapshot]), candles: [candle(0), candle(1), candle(2, { high: 102, low: 98, close: 100 })] });
+    const result = runTournament({ manifest, strategy, universe: new PointInTimeUniverse([snapshot]), candles: [candle(0), candle(1), candle(2, { high: 102, low: 98, close: 100 })], ...executionBase() });
     expect(result.valid).toBe(true);
     expect(result.trades).toHaveLength(1);
     expect(result.trades[0]!.entryTimeMs).toBe(H);
@@ -104,7 +109,7 @@ describe("Kronos Research Tournament v1 contract", () => {
   it("fails EXPECTED execution closed without point-in-time fee and liquidity models", () => {
     const strategy: TournamentStrategy = { id: "CASH", version: "fixture", parameters: {}, onCompletedBar: () => [] };
     const manifest = buildRunManifest({ spec: spec(), strategyId: "CASH", executionMode: "EXPECTED", parameterSet: {}, createdAtMs: 0 });
-    const result = runTournament({ manifest, strategy, universe: new PointInTimeUniverse([snapshot]), candles: [candle(0), candle(1)] });
+    const result = runTournament({ manifest, strategy, universe: new PointInTimeUniverse([snapshot]), candles: [candle(0), candle(1)], ...executionBase() });
     expect(result.valid).toBe(false);
     expect(result.invalidReasons).toContain("TOURNAMENT_EXPECTED_LIQUIDITY_EXECUTION_MISSING");
   });
@@ -113,7 +118,7 @@ describe("Kronos Research Tournament v1 contract", () => {
     const strategy: TournamentStrategy = { id: "CASH", version: "fixture", parameters: {}, onCompletedBar: () => [] };
     const matrix = runTournamentMatrix({
       spec: spec(), strategies: [strategy], createdAtMs: 0, modes: ["CONSERVATIVE", "EXPECTED"],
-      execution: { universe: new PointInTimeUniverse([snapshot]), candles: [candle(0), candle(1)], expectedFeeBpsAt: () => 1, expectedSlippageBpsAt: () => 2 },
+      execution: { universe: new PointInTimeUniverse([snapshot]), candles: [candle(0), candle(1)], expectedFeeBpsAt: () => 1, expectedSlippageBpsAt: () => 2, ...executionBase() },
     });
     expect(matrix.runs).toHaveLength(2);
     expect(matrix.runs.every((run) => run.valid)).toBe(true);
@@ -126,18 +131,19 @@ describe("Kronos Research Tournament v1 contract", () => {
       const second = persistTournamentRun(root, matrix.runs[0]!);
       expect(second.registryHash).toBe(first.registryHash);
       expect(JSON.parse(readFileSync(join(root, "run-registry.json"), "utf8"))).toHaveLength(1);
+      expect(JSON.parse(readFileSync(join(first.runDirectory, "nav-ledger.json"), "utf8"))).toHaveLength(3);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
   it("rejects a challenger that mutates the shared completed-candle input", () => {
     const mutator: TournamentStrategy = { id: "CASH", version: "bad", parameters: {}, onCompletedBar: (bar) => { bar.candle.close = 0; return []; } };
-    expect(() => runTournamentMatrix({ spec: spec(), strategies: [mutator], createdAtMs: 0, modes: ["CONSERVATIVE"], execution: { universe: new PointInTimeUniverse([snapshot]), candles: [candle(0), candle(1)] } })).toThrow();
+    expect(() => runTournamentMatrix({ spec: spec(), strategies: [mutator], createdAtMs: 0, modes: ["CONSERVATIVE"], execution: { universe: new PointInTimeUniverse([snapshot]), candles: [candle(0), candle(1)], ...executionBase() } })).toThrow();
   });
 
   it("reports OOS degradation and cost sensitivity only from valid paired ledgers", () => {
     const strategy: TournamentStrategy = { id: "CASH", version: "fixture", parameters: {}, onCompletedBar: () => [] };
-    const conservative = runTournament({ manifest: buildRunManifest({ spec: spec(), strategyId: "CASH", executionMode: "CONSERVATIVE", parameterSet: {}, createdAtMs: 0 }), strategy, universe: new PointInTimeUniverse([snapshot]), candles: [candle(0), candle(1)] });
-    const expected = runTournament({ manifest: buildRunManifest({ spec: spec(), strategyId: "CASH", executionMode: "EXPECTED", parameterSet: {}, createdAtMs: 0 }), strategy, universe: new PointInTimeUniverse([snapshot]), candles: [candle(0), candle(1)], expectedFeeBpsAt: () => 1, expectedSlippageBpsAt: () => 1 });
+    const conservative = runTournament({ manifest: buildRunManifest({ spec: spec(), strategyId: "CASH", executionMode: "CONSERVATIVE", parameterSet: {}, createdAtMs: 0 }), strategy, universe: new PointInTimeUniverse([snapshot]), candles: [candle(0), candle(1)], ...executionBase() });
+    const expected = runTournament({ manifest: buildRunManifest({ spec: spec(), strategyId: "CASH", executionMode: "EXPECTED", parameterSet: {}, createdAtMs: 0 }), strategy, universe: new PointInTimeUniverse([snapshot]), candles: [candle(0), candle(1)], expectedFeeBpsAt: () => 1, expectedSlippageBpsAt: () => 1, ...executionBase() });
     const oos = summarizeOosWindows([{ foldId: "wf-1", inSampleExpectancyAfterCost: 0.5, result: conservative }]);
     expect(oos.profitableWindowRatio).toBe(0);
     expect(oos.oosExpectancyDegradation).toBe(-0.5);
@@ -145,7 +151,7 @@ describe("Kronos Research Tournament v1 contract", () => {
   });
 
   it("allows an ablation only when its fairness contract matches", () => {
-    const metrics = { tradeCount: 1, independentEpisodes: 1, expectancyAfterCost: 1, profitFactor: 1, winRate: 1, payoffRatio: null, sharpe: null, calmar: null, maxDrawdown: 0, netPnl: 1, returnFraction: 0.01, profitableAssetRatio: 1, concentration: { topSymbolNetPnlShare: 1, topRegimeNetPnlShare: 1, topYearNetPnlShare: 1 } };
+    const metrics = { tradeCount: 1, independentEpisodes: 1, expectancyAfterCost: 1, profitFactor: 1, winRate: 1, payoffRatio: null, sharpe: null, calmar: null, maxDrawdown: 0, netPnl: 1, returnFraction: 0.01, profitableAssetRatio: 1, concentration: { topSymbolNetPnlShare: 1, topRegimeNetPnlShare: 1, topYearNetPnlShare: 1 }, canonicalEpisodeProvenanceComplete: true };
     expect(pairedAblation({ comparison: "regime", baselineFairnessHash: "fair", treatmentFairnessHash: "fair", sameDataExecutionRiskAndPortfolio: true, baseline: metrics, treatment: { ...metrics, netPnl: 2 } }).comparable).toBe(true);
     expect(pairedAblation({ comparison: "regime", baselineFairnessHash: "a", treatmentFairnessHash: "b", sameDataExecutionRiskAndPortfolio: true, baseline: metrics, treatment: metrics }).comparable).toBe(false);
   });
@@ -171,7 +177,7 @@ describe("Kronos Research Tournament v1 contract", () => {
       { parameters: { fast: 12, slow: 48 }, oosExpectancy: 0.2, conservativePass: true, profitableWindowFraction: 1, crossAssetRatio: 1 },
     ], { fast: 12, slow: 48 });
     expect(plateau.isolatedPeak).toBe(true);
-    const ranked = rankTournamentCandidates([{ strategyId: "MACD", metrics: { tradeCount: 40, independentEpisodes: 40, expectancyAfterCost: 0.1, profitFactor: 1.5, winRate: 0.5, payoffRatio: 1.5, sharpe: 1, calmar: 1, maxDrawdown: 0.1, netPnl: 100, returnFraction: 0.01, profitableAssetRatio: 1, concentration: { topSymbolNetPnlShare: 1, topRegimeNetPnlShare: 1, topYearNetPnlShare: 1 } }, conservativePass: false, plateauPass: false, sealedHoldoutPass: false }]);
+    const ranked = rankTournamentCandidates([{ strategyId: "MACD", metrics: { tradeCount: 40, independentEpisodes: 40, expectancyAfterCost: 0.1, profitFactor: 1.5, winRate: 0.5, payoffRatio: 1.5, sharpe: 1, calmar: 1, maxDrawdown: 0.1, netPnl: 100, returnFraction: 0.01, profitableAssetRatio: 1, concentration: { topSymbolNetPnlShare: 1, topRegimeNetPnlShare: 1, topYearNetPnlShare: 1 }, canonicalEpisodeProvenanceComplete: true }, conservativePass: false, plateauPass: false, sealedHoldoutPass: false }]);
     expect(ranked[0]!.rankScore).toBeNull();
     expect(ranked[0]!.hardGate.failures).toContain("CONSERVATIVE_EXECUTION_FAIL");
   });

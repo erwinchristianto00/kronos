@@ -8,6 +8,8 @@
 export const TOURNAMENT_VERSION = "kronos-research-tournament-v1" as const;
 
 export type TournamentExecutionMode = "CONSERVATIVE" | "EXPECTED" | "OPTIMISTIC";
+export type TournamentCapabilityTier = "TIER_1_BASELINE" | "TIER_2_EXPECTED_EXECUTION" | "TIER_3_EXACT_KRONOS";
+export type TournamentDatasetArtifactKind = "COMPLETED_CANDLES" | "FUNDING_SETTLEMENTS" | "LISTING_DELISTING_TIMELINE" | "FUTURES_AVAILABILITY_TIMELINE" | "MINIMUM_HISTORY_ELIGIBILITY" | "PIT_LIQUIDITY_SPREAD" | "FEE_ASSUMPTIONS" | "PORTFOLIO_RISK_SNAPSHOTS" | "CANONICAL_EPISODES" | "KRONOS_DECISION_LEDGER";
 export type TournamentSide = "LONG" | "SHORT";
 export type TournamentExitReason = "STOP" | "TARGET" | "TIME" | "END_OF_DATA" | "REBALANCE";
 export type TournamentStrategyId =
@@ -59,6 +61,11 @@ export interface TournamentDatasetManifest {
   /** Hash of point-in-time fee/slippage inputs used by EXPECTED execution. */
   executionInputsHash: string;
   historicalUniverseHash: string;
+  canonicalEpisodeHash: string;
+  portfolioRiskHash: string;
+  /** Immutable Dataset Foundry artifact manifests used in this exact run. */
+  artifactManifestHashes: string[];
+  artifactKinds: TournamentDatasetArtifactKind[];
   timeframe: string;
   universeSnapshots: PointInTimeUniverseSnapshot[];
 }
@@ -83,6 +90,10 @@ export interface TournamentPortfolioConstraints {
   maxBtcBetaFraction: number;
   maxCorrelationClusterFraction: number;
   liquidationBufferFraction: number;
+  /** Initial margin reserved per unit of gross notional; no implicit leverage. */
+  initialMarginFraction: number;
+  /** A risk snapshot older than this is invalid, never silently reused. */
+  maxPortfolioRiskSnapshotAgeMs: number;
 }
 
 export interface TournamentValidationSpec {
@@ -101,6 +112,7 @@ export interface TournamentExperimentSpec {
   gitCommit: string;
   strategyVersion: string;
   randomSeed: number;
+  capabilityTier: TournamentCapabilityTier;
   dataset: TournamentDatasetManifest;
   costs: TournamentCostModel;
   portfolio: TournamentPortfolioConstraints;
@@ -146,6 +158,34 @@ export interface TournamentTrade {
   regime: string | null;
 }
 
+export interface TournamentNavPoint {
+  timestampMs: number;
+  cash: number;
+  realizedPnl: number;
+  unrealizedPnl: number;
+  equity: number;
+  grossExposure: number;
+  netExposure: number;
+  marginUsage: number;
+  liquidationBuffer: number;
+}
+
+export interface FundingSettlement {
+  symbol: string;
+  settlementTimeMs: number;
+  /** Signed rate: a positive rate is paid by LONG and received by SHORT. */
+  rate: number;
+  sourceHash: string;
+}
+
+export interface PointInTimePortfolioRiskSnapshot {
+  asOfMs: number;
+  validUntilMs: number;
+  sourceHash: string;
+  btcBetaBySymbol: Record<string, number>;
+  correlationClusterBySymbol: Record<string, string>;
+}
+
 export interface TournamentMetrics {
   tradeCount: number;
   independentEpisodes: number;
@@ -164,6 +204,7 @@ export interface TournamentMetrics {
     topRegimeNetPnlShare: number | null;
     topYearNetPnlShare: number | null;
   };
+  canonicalEpisodeProvenanceComplete: boolean;
 }
 
 /** Portfolio-path observability is reported separately from trade-quality metrics. */
@@ -173,6 +214,7 @@ export interface TournamentPortfolioMetrics {
   peakAbsoluteNetExposureFraction: number;
   peakBtcBetaFraction: number;
   liquidationBufferFraction: number;
+  navPointCount: number;
 }
 
 export interface TournamentRunManifest {
@@ -193,6 +235,7 @@ export interface TournamentRunResult {
   portfolioMetrics: TournamentPortfolioMetrics;
   /** Alias retained for rank/report consumers; equals strategyMetrics. */
   metrics: TournamentMetrics;
+  navLedger: TournamentNavPoint[];
   trades: TournamentTrade[];
   warnings: string[];
   valid: boolean;

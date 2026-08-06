@@ -30,7 +30,7 @@ function immutableCandles(candles: readonly TournamentCandle[]): readonly Tourna
  * execution adapters, risk caps and archival timestamp.
  */
 export function runTournamentMatrix(input: TournamentMatrixInput): TournamentMatrixResult {
-  const modes = input.modes ?? ["CONSERVATIVE", "EXPECTED", "OPTIMISTIC"] as const;
+  const modes = input.modes ?? (input.spec.capabilityTier === "TIER_1_BASELINE" ? ["CONSERVATIVE"] : ["CONSERVATIVE", "EXPECTED", "OPTIMISTIC"] as const);
   if (new Set(input.strategies.map((strategy) => strategy.id)).size !== input.strategies.length) throw new Error("TOURNAMENT_DUPLICATE_STRATEGY_ID");
   const fairnessHashByMode = new Map<TournamentExecutionMode, string>();
   const runs: TournamentRunResult[] = [];
