@@ -1,11 +1,13 @@
 import { mkdirSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { gzipSync } from "node:zlib";
 import { describe, expect, it } from "vitest";
 
 import { assertCandlesCoverCanonicalClock, buildCanonicalClock } from "../../src/research/foundry/canonical-clock.js";
 import { assertCompleteFoundryArtifact, buildFoundryArtifactManifest } from "../../src/research/foundry/artifact-schema.js";
 import { importLocalBinanceCandleArchive, importLocalBinanceFundingArchive } from "../../src/research/foundry/local-binance-archive-adapter.js";
+import { importLocalTardisQuoteLiquidityArchive } from "../../src/research/foundry/local-tardis-quote-liquidity-adapter.js";
 import { persistFoundryArtifact } from "../../src/research/foundry/artifact-store.js";
 import { buildTier1CapabilityReport } from "../../src/research/foundry/tier1-capability.js";
 import { FOUNDRY_SCHEMA_V1, validateFoundryRows } from "../../src/research/foundry/semantic-validators.js";
@@ -83,6 +85,21 @@ describe("Foundry semantic strictness", () => {
       const funding = importLocalBinanceFundingArchive({ root: fundingRoot, expectedCoverage: window, source: "windowed-funding", sourceProvenance: { ...fixtureSourceProvenance("windowed-funding", "0000000"), rawFileHash: fundingRawFileHash }, generatedAtMs: 1, generationSha: "sha" });
       expect(candles.rows).toHaveLength(1); expect(candles.rows[0]).toMatchObject({ openTimeMs: H, close: 101 }); expect(candles.manifest.archiveBundle?.files).toHaveLength(1);
       expect(funding.rows).toHaveLength(1); expect(funding.rows[0]).toMatchObject({ canonicalSettlementTimeMs: H, observedSettlementTimeMs: H + 8 }); expect(funding.manifest.archiveBundle?.files).toHaveLength(1);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("derives PIT BBO spread and prior completed volume without future-quote leakage", () => {
+    const root = mkdtempSync(join(tmpdir(), "foundry-tardis-bbo-")); const symbols = ["BTCUSDT", "ETHUSDT"];
+    const quoteCsv = (symbol: string, timestampUs: number) => `exchange,symbol,timestamp,local_timestamp,ask_amount,ask_price,bid_price,bid_amount\nbinance-futures,${symbol},${timestampUs},${timestampUs + 1},3,102,100,2\n`;
+    const candleCsv = "open_time,open,high,low,close,volume,close_time\n0,100,101,99,100,7,3599999\n";
+    const provenance = () => ({ provenanceType: "EXCHANGE_HISTORICAL_EXPORT" as const, provider: "Tardis + Binance Vision", exchange: "BINANCE_USD_M", datasetId: "quotes-plus-prior-candle-volume", retrievedAtMs: 1, rawFileHash: readArchiveBundle({ root, include: (relativePath) => relativePath.endsWith(".csv") || relativePath.endsWith(".csv.gz") }).archiveBundleHash, schemaVersion: "tardis-quotes-v1", generationToolSha: "abcdef0" });
+    const input = () => ({ root, expectedCoverage: { startMs: H, endMs: 2 * H, symbols, cadenceMs: H }, maxQuoteAgeMs: 60_000, source: "Tardis BBO plus Binance completed volume", sourceProvenance: provenance(), generatedAtMs: 1, generationSha: "abcdef0" });
+    try {
+      for (const symbol of symbols) { const quoteDirectory = join(root, "quotes", symbol); const candleDirectory = join(root, "candles", symbol, "1h"); mkdirSync(quoteDirectory, { recursive: true }); mkdirSync(candleDirectory, { recursive: true }); writeFileSync(join(quoteDirectory, "2026-01-01.csv.gz"), gzipSync(quoteCsv(symbol, H * 1_000 - 1_000))); writeFileSync(join(candleDirectory, "2026-01.csv"), candleCsv); }
+      const first = importLocalTardisQuoteLiquidityArchive(input()); const second = importLocalTardisQuoteLiquidityArchive(input());
+      expect(first.rows).toHaveLength(2); expect(first.rows[0]).toMatchObject({ asOfMs: H, validUntilMs: 2 * H - 1, volume: 7, liquidityNotional: 200 }); expect(first.manifest.semanticManifestHash).toBe(second.manifest.semanticManifestHash);
+      for (const symbol of symbols) writeFileSync(join(root, "quotes", symbol, "2026-01-01.csv.gz"), gzipSync(quoteCsv(symbol, H * 1_000 + 1)));
+      expect(() => importLocalTardisQuoteLiquidityArchive(input())).toThrow("FOUNDRY_TARDIS_LIQUIDITY_PIT_COVERAGE_MISSING");
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 });
