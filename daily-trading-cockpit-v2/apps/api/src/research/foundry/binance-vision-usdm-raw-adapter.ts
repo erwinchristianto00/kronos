@@ -91,7 +91,10 @@ async function bookTickerSamples(input: { path: string; relativePath: string; sy
   ].join(" ");
   const unzip = spawn("unzip", ["-p", input.path], { stdio: ["ignore", "pipe", "pipe"] }); const sampler = spawn("awk", ["-F,", "-v", `start=${input.startMs}`, "-v", `end=${input.endMs}`, "-v", `interval=${HOUR_MS}`, awk], { stdio: ["pipe", "pipe", "pipe"] });
   const unzipDone = waitFor(unzip, `UNZIP_${input.relativePath}`); const samplerDone = waitFor(sampler, `AWK_${input.relativePath}`);
-  unzip.stdout.pipe(sampler.stdin); const stderr: Buffer[] = []; unzip.stderr.on("data", (value: Buffer) => stderr.push(value)); sampler.stderr.on("data", (value: Buffer) => stderr.push(value));
+  const stderr: Buffer[] = []; const pipeErrors: Error[] = [];
+  unzip.stderr.on("data", (value: Buffer) => stderr.push(value)); sampler.stderr.on("data", (value: Buffer) => stderr.push(value));
+  sampler.stdin.on("error", (error: NodeJS.ErrnoException) => { if (error.code !== "EPIPE") pipeErrors.push(error); });
+  unzip.stdout.pipe(sampler.stdin);
   const output: BookTickerSample[] = []; const lines = createInterface({ input: sampler.stdout, crlfDelay: Infinity });
   for await (const line of lines) {
     const values = line.split("\t"); if (values.length !== 6) throw new Error(`FOUNDRY_BINANCE_VISION_BOOKTICKER_OUTPUT_INVALID_${input.relativePath}`);
@@ -99,7 +102,11 @@ async function bookTickerSamples(input: { path: string; relativePath: string; sy
     if (eventTimeMs > asOfMs || asOfMs - eventTimeMs > input.maxQuoteAgeMs || parsedBidPrice <= 0 || parsedAskPrice <= 0 || parsedBidQuantity < 0 || parsedAskQuantity < 0 || parsedAskPrice < parsedBidPrice) throw new Error(`FOUNDRY_BINANCE_VISION_BOOKTICKER_PIT_INVALID_${input.symbol}_${asOfMs}`);
     output.push({ symbol: input.symbol, asOfMs, eventTimeMs, bidPrice: parsedBidPrice, bidQuantity: parsedBidQuantity, askPrice: parsedAskPrice, askQuantity: parsedAskQuantity, sourceHash: tournamentHash({ policyVersion: "binance-vision-usdm-bookticker-hourly-v1", archiveFileHash: input.sourceHash, eventTimeMs, bidPrice: parsedBidPrice, bidQuantity: parsedBidQuantity, askPrice: parsedAskPrice, askQuantity: parsedAskQuantity }) });
   }
-  await Promise.all([unzipDone, samplerDone]); if (stderr.length) throw new Error(`FOUNDRY_BINANCE_VISION_BOOKTICKER_PARSE_INVALID_${input.relativePath}_${Buffer.concat(stderr).toString("utf8").trim()}`);
+  const [unzipResult, samplerResult] = await Promise.all([unzipDone.then(() => null, (error: Error) => error), samplerDone.then(() => null, (error: Error) => error)]);
+  const parserDiagnostics = Buffer.concat(stderr).toString("utf8").trim();
+  if (samplerResult || parserDiagnostics) throw new Error(`FOUNDRY_BINANCE_VISION_BOOKTICKER_PARSE_INVALID_${input.relativePath}_${parserDiagnostics || samplerResult!.message}`);
+  if (unzipResult) throw unzipResult;
+  if (pipeErrors.length) throw pipeErrors[0]!;
   return output;
 }
 

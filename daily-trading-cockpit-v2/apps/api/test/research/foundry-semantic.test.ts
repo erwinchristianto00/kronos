@@ -125,6 +125,9 @@ describe("Foundry semantic strictness", () => {
       expect(imported.rows).toEqual(expect.arrayContaining([expect.objectContaining({ asOfMs: startMs, validUntilMs: startMs + H - 1, volume: 7, liquidityNotional: 200 }), expect.objectContaining({ asOfMs: startMs + H, volume: 8, liquidityNotional: 404 })]));
       expect(imported.manifest.archiveBundle?.archiveBundleHash).toBe(bboBundle.archiveBundleHash);
       await expect(importBinanceVisionUsdMRawBookTickerLiquidityArchive({ root, expectedCoverage: coverage, candleRows: priorCandles.rows as never[], maxQuoteAgeMs: 0, source: "Binance Vision BBO plus completed volume", sourceProvenance: provenance(bboBundle.archiveBundleHash), generatedAtMs: 1, generationSha: "abcdef0" })).rejects.toThrow("FOUNDRY_BINANCE_VISION_BOOKTICKER_PIT_INVALID");
+      archive(join(bboDirectory, "BTCUSDT-bookTicker-2023-05.zip"), "unexpected,headers\n");
+      const malformedBundle = inspectArchiveBundle({ root, include: (path) => (path.startsWith("bookTicker/") || path.startsWith("klines/")) && (path.endsWith(".zip") || path.endsWith(".zip.CHECKSUM")) });
+      await expect(importBinanceVisionUsdMRawBookTickerLiquidityArchive({ root, expectedCoverage: coverage, candleRows: priorCandles.rows as never[], maxQuoteAgeMs: H, source: "Binance Vision BBO plus completed volume", sourceProvenance: provenance(malformedBundle.archiveBundleHash), generatedAtMs: 1, generationSha: "abcdef0" })).rejects.toThrow("FOUNDRY_BINANCE_VISION_BOOKTICKER_PARSE_INVALID");
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 });
