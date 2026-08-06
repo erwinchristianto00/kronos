@@ -93,7 +93,14 @@ async function bookTickerSamples(input: { path: string; relativePath: string; sy
   const unzipDone = waitFor(unzip, `UNZIP_${input.relativePath}`); const samplerDone = waitFor(sampler, `AWK_${input.relativePath}`);
   const stderr: Buffer[] = []; const pipeErrors: Error[] = [];
   unzip.stderr.on("data", (value: Buffer) => stderr.push(value)); sampler.stderr.on("data", (value: Buffer) => stderr.push(value));
-  sampler.stdin.on("error", (error: NodeJS.ErrnoException) => { if (error.code !== "EPIPE") pipeErrors.push(error); });
+  sampler.stdin.on("error", (error: NodeJS.ErrnoException) => {
+    if (error.code !== "EPIPE") { pipeErrors.push(error); return; }
+    // A fail-closed sampler rejection closes stdin before a multi-gigabyte ZIP
+    // is exhausted. Stop its upstream reader too; otherwise unzip blocks forever
+    // on the closed pipe and hides the actual parser diagnostic.
+    unzip.stdout.unpipe(sampler.stdin);
+    if (!unzip.killed) unzip.kill("SIGTERM");
+  });
   unzip.stdout.pipe(sampler.stdin);
   const output: BookTickerSample[] = []; const lines = createInterface({ input: sampler.stdout, crlfDelay: Infinity });
   for await (const line of lines) {
