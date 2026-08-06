@@ -38,6 +38,12 @@ import {
   type ShadowObservation,
 } from "../src/lib/live-edge-digger.js";
 import {
+  COLLECTION_POLICY_VERSION,
+  admitUnderPolicyV2,
+  isJudgeableEvidence,
+  isMatured,
+} from "../src/lib/live-edge-digger-collection-policy.js";
+import {
   LiveEdgeDiggerStore,
   buildLiveEdgeDiggerReportFromStore,
   runLiveEdgeDiggerCycle,
@@ -391,7 +397,8 @@ describe("live-edge-digger", () => {
             direction: "LONG", cycleId: `cycle-${c}`,
             openedAt: new Date(BASE + c * 50 * HOUR).toISOString(), openedAtMs: BASE + c * 50 * HOUR,
             entryPrice: 100, stopPrice: 98, targetPrice: 103, stopDistanceBps: 200, maxHoldHours: 24,
-            regimeAtEntry: "r", features: {} as never, status: "CLOSED_WIN", resolvedAt: "x",
+            regimeAtEntry: "r", features: {} as never, collectionPolicyVersion: 2,
+            status: "CLOSED_WIN", resolvedAt: "x",
             exitPrice: 103, exitReason: "TARGET", grossR: 1.5, costR: -0.1, netR: 1.4, holdHours: 1,
           });
         }
@@ -401,7 +408,9 @@ describe("live-edge-digger", () => {
       // 2026-08-06, a full 5 days AFTER these rows open — the old single REJECT verdict hid that,
       // because a gate shortfall and a freeze violation both collapsed into the same word.
       const report = buildCandidateReport(freezeCandidate(EDGE_RULE_FRONTIER[0]!, new Date(BASE - HOUR).toISOString()),
-        rows.map((r) => ({ ...r, candidateId: candidateIdFor(EDGE_RULE_FRONTIER[0]!) })));
+        rows.map((r) => ({ ...r, candidateId: candidateIdFor(EDGE_RULE_FRONTIER[0]!) })),
+        // Evaluated after every row's horizon has elapsed: gates only see matured evidence now.
+        undefined, BASE + 5000 * HOUR);
       expect(report.freezeIntegrity.ok).toBe(true);
       const dev = report.partitions.find((p) => p.partition === "DEV")!;
       expect(dev.rows).toBe(60);
@@ -702,18 +711,22 @@ describe("live-edge-digger", () => {
       direction: "LONG", cycleId: cycle,
       openedAt: new Date(atMs).toISOString(), openedAtMs: atMs,
       entryPrice: 100, stopPrice: 98, targetPrice: 103, stopDistanceBps: 200, maxHoldHours: 24,
-      regimeAtEntry: "r", features: {} as never,
+      regimeAtEntry: "r", features: {} as never, collectionPolicyVersion: 2,
       status: netR > 0 ? "CLOSED_WIN" : "CLOSED_LOSS", resolvedAt: "x",
       exitPrice: 103, exitReason: netR > 0 ? "TARGET" : "STOP",
       grossR: netR + 0.1, costR: -0.1, netR, holdHours: 1,
     } as ShadowObservation);
+
+    /** Far enough past every fixture row's 24h horizon that the whole cohort is matured. Verdicts
+     *  are only reachable on matured evidence, so lifecycle tests must evaluate at such an instant. */
+    const MATURED_AT = BASE + 400 * HOUR;
 
     const openRow = (id: string): ShadowObservation => ({
       ...row(id, "cycle-open", 1), status: "OPEN", resolvedAt: undefined, netR: undefined, grossR: undefined,
     } as unknown as ShadowObservation);
 
     it("[LIFECYCLE-DORMANT] a rule that has never fired is DORMANT with no rejection reasons", () => {
-      const r = buildCandidateReport(freezeCandidate(RULE, FROZEN), []);
+      const r = buildCandidateReport(freezeCandidate(RULE, FROZEN), [], undefined, MATURED_AT);
       expect(r.lifecycle).toBe("DORMANT");
       expect(r.rejectionReasons).toEqual([]);
       // The finding is about the MARKET, and the report says so rather than blaming the rule.
@@ -721,7 +734,7 @@ describe("live-edge-digger", () => {
     });
 
     it("[LIFECYCLE-OPEN] a rule whose every row is still unresolved is OPEN, never REJECTED", () => {
-      const r = buildCandidateReport(freezeCandidate(RULE, FROZEN), [openRow("o1"), openRow("o2")]);
+      const r = buildCandidateReport(freezeCandidate(RULE, FROZEN), [openRow("o1"), openRow("o2")], undefined, MATURED_AT);
       expect(r.lifecycle).toBe("OPEN");
       expect(r.openRows).toBe(2);
       expect(r.resolvedRows).toBe(0);
@@ -744,7 +757,7 @@ describe("live-edge-digger", () => {
     it("[LIFECYCLE-REJECT] a losing sample LARGE enough to judge is REJECTED, with the shortfall named", () => {
       const rows = Array.from({ length: MIN_EPISODES_TO_JUDGE }, (_, i) =>
         row(`x${i}`, `c${i}`, -1, `S${i}USDT`, BASE + i * 50 * HOUR));
-      const r = buildCandidateReport(freezeCandidate(RULE, FROZEN), rows);
+      const r = buildCandidateReport(freezeCandidate(RULE, FROZEN), rows, undefined, MATURED_AT);
       expect(r.independentEpisodes).toBeGreaterThanOrEqual(MIN_EPISODES_TO_JUDGE);
       expect(r.lifecycle).toBe("REJECTED");
       expect(r.rejectionReasons.join(" ")).toContain("expectancy");
@@ -772,7 +785,7 @@ describe("live-edge-digger", () => {
 
     it("[LIFECYCLE-COUNTS] the report census never shows REJECTED on an empty store", () => {
       const report = buildLiveEdgeDiggerReport({
-        generatedAt: "2026-08-06T00:00:00.000Z",
+        generatedAt: new Date(MATURED_AT).toISOString(),
         observations: [], attempts: [],
         scanner: {
           cyclesRun: 3, lastCycleAt: null, lastError: null, universeSize: 21, regime: null,
@@ -1051,6 +1064,305 @@ describe("live-edge-digger", () => {
       for (const g of report.generation.rules) {
         expect(report.candidates.some((c) => c.candidate.candidateId === g.candidateId)).toBe(true);
       }
+    });
+  });
+
+  // =========================================================================
+  // COLLECTION POLICY v2 + CENSORING
+  // =========================================================================
+  describe("collection policy v2 and censoring", () => {
+    const cycleDeps = (dir: string, now: number, store?: LiveEdgeDiggerStore) => ({
+      store: store ?? new LiveEdgeDiggerStore(join(dir, "led.json")),
+      now,
+      resolveUniverse: async () => ({
+        symbols: ["BTCUSDT", "ETHUSDT", "SOLUSDT", "ADAUSDT"],
+        perSymbolMeta: {
+          BTCUSDT: { quoteVolume24hUsd: 9e9, spreadBps: 1, openInterestUsd: 1e9 },
+          ETHUSDT: { quoteVolume24hUsd: 5e9, spreadBps: 1, openInterestUsd: 5e8 },
+          SOLUSDT: { quoteVolume24hUsd: 1e9, spreadBps: 2, openInterestUsd: 2e8 },
+          ADAUSDT: { quoteVolume24hUsd: 5e8, spreadBps: 3, openInterestUsd: 1e8 },
+        },
+      }),
+      getRegime: async () => ({ regime: "Bullish expansion", regimeFamily: "BULLISH" as const }),
+      fetchCandles: async (symbol: string, interval: string) => {
+        const drift = symbol === "BTCUSDT" ? 0.0005 : symbol === "SOLUSDT" ? 0.004 : -0.002;
+        const intervalMs = interval === "15m" ? 900_000 : HOUR;
+        const bars = interval === "15m" ? 8 : 120;
+        return candles(bars, now - bars * intervalMs, 100, drift, intervalMs);
+      },
+      fetchFunding: async () => ({ fundingBps: 1, basisBps: 2 }),
+    });
+
+    const row = (over: Partial<ShadowObservation> & { observationId: string; openedAtMs: number }): ShadowObservation => ({
+      candidateId: "cand@v1-aaaa", contentHash: "h", symbol: "BTCUSDT", direction: "LONG",
+      cycleId: `cycle-${over.openedAtMs}`, openedAt: new Date(over.openedAtMs).toISOString(),
+      entryPrice: 100, stopPrice: 98, targetPrice: 103, stopDistanceBps: 200, maxHoldHours: 24,
+      regimeAtEntry: "MIXED", features: {} as never, collectionPolicyVersion: 2,
+      status: "OPEN", resolvedAt: null, exitPrice: null, exitReason: null,
+      grossR: null, costR: null, netR: null, holdHours: null,
+      ...over,
+    });
+
+    // ---- A. ADMISSION -----------------------------------------------------------------------
+    it("[OVERLAP] a signal persisting across 12 cycles emits ONE row per candidate+symbol", () => {
+      // The exact v1 defect: entryPrice is the last CLOSED 1h candle, so 12 cycles 7 minutes apart
+      // all see the same price and each minted a distinct observationId.
+      let existing: ShadowObservation[] = [];
+      let admittedTotal = 0;
+      const suppressedReasons: string[] = [];
+      for (let i = 0; i < 12; i++) {
+        const t = BASE + i * 7 * 60_000;
+        const proposal = row({ observationId: `o-${i}`, openedAtMs: t });
+        const res = admitUnderPolicyV2([proposal], existing, EPISODE_BLOCK_WIDTH_MS);
+        admittedTotal += res.admitted.length;
+        suppressedReasons.push(...res.suppressed.map((x) => x.reason));
+        existing = [...existing, ...res.admitted];
+      }
+      expect(admittedTotal).toBe(1);
+      expect(existing).toHaveLength(1);
+      expect(suppressedReasons).toHaveLength(11);
+      expect(new Set(suppressedReasons)).toEqual(new Set(["OPEN_POSITION_EXISTS"]));
+    });
+
+    it("[OVERLAP] closing inside the same episode does NOT permit re-entry", () => {
+      const closed = row({
+        observationId: "o-1", openedAtMs: BASE,
+        status: "CLOSED_LOSS", resolvedAt: new Date(BASE + HOUR).toISOString(),
+        exitPrice: 98, exitReason: "STOP", grossR: -1, costR: -0.11, netR: -1.11, holdHours: 1,
+      });
+      // 2h later: the position is CLOSED, but the 36h episode block has not ended.
+      const next = row({ observationId: "o-2", openedAtMs: BASE + 2 * HOUR });
+      const res = admitUnderPolicyV2([next], [closed], EPISODE_BLOCK_WIDTH_MS);
+      expect(res.admitted).toHaveLength(0);
+      expect(res.suppressed[0]!.reason).toBe("ALREADY_ENTERED_THIS_EPISODE");
+    });
+
+    it("[OVERLAP] a NEW canonical episode permits re-entry", () => {
+      const closed = row({
+        observationId: "o-1", openedAtMs: BASE,
+        status: "CLOSED_LOSS", resolvedAt: new Date(BASE + HOUR).toISOString(),
+        exitPrice: 98, exitReason: "STOP", grossR: -1, costR: -0.11, netR: -1.11, holdHours: 1,
+      });
+      const next = row({ observationId: "o-2", openedAtMs: BASE + EPISODE_BLOCK_WIDTH_MS + 1 });
+      const res = admitUnderPolicyV2([next], [closed], EPISODE_BLOCK_WIDTH_MS);
+      expect(res.admitted).toHaveLength(1);
+      expect(res.suppressed).toHaveLength(0);
+    });
+
+    it("[OVERLAP] an exact observationId collision is reported as DUPLICATE, not as overlap", () => {
+      const first = row({ observationId: "dup", openedAtMs: BASE });
+      const res = admitUnderPolicyV2([row({ observationId: "dup", openedAtMs: BASE })], [first], EPISODE_BLOCK_WIDTH_MS);
+      expect(res.suppressed[0]!.reason).toBe("DUPLICATE_OBSERVATION");
+    });
+
+    it("[OVERLAP] two proposals for the same key in ONE batch cannot both slip through", () => {
+      const res = admitUnderPolicyV2(
+        [row({ observationId: "a", openedAtMs: BASE }), row({ observationId: "b", openedAtMs: BASE + 60_000 })],
+        [], EPISODE_BLOCK_WIDTH_MS,
+      );
+      expect(res.admitted).toHaveLength(1);
+      expect(res.suppressed).toHaveLength(1);
+    });
+
+    it("[POLICY] a v1 row never blocks a v2 entry", () => {
+      // v1 rows were collected while re-entry was unrestricted. Letting one block admission would
+      // import the old defect into the new evidence.
+      const v1 = { ...row({ observationId: "old", openedAtMs: BASE }), collectionPolicyVersion: undefined };
+      const res = admitUnderPolicyV2([row({ observationId: "new", openedAtMs: BASE + 60_000 })], [v1], EPISODE_BLOCK_WIDTH_MS);
+      expect(res.admitted).toHaveLength(1);
+    });
+
+    it("[POLICY] seed and generated rules go through the SAME admission path", async () => {
+      const dir = tmpDir();
+      const now = BASE + 200 * HOUR;
+      const store = new LiveEdgeDiggerStore(join(dir, "led.json"));
+      await runLiveEdgeDiggerCycle(cycleDeps(dir, now, store));
+      await runLiveEdgeDiggerCycle(cycleDeps(dir, now + 7 * 60_000, store));
+      // Whatever fired — seed or GEN_ — must be one row per candidate+symbol.
+      const keys = store.all.map((o) => `${o.candidateId}|${o.symbol}`);
+      expect(new Set(keys).size).toBe(keys.length);
+      expect(store.all.every((o) => o.collectionPolicyVersion === 2)).toBe(true);
+    });
+
+    it("[CLUSTERING] the LIVE cycle blocks re-entry for a CLOSED row inside the same episode", async () => {
+      // Guards the CALL SITE, not just the pure function: the cycle must hand admission the same
+      // episode width the evidence is clustered on. A narrower width there would let the engine
+      // re-enter inside one market look and then have the clustering silently merge the rows away
+      // — inflating n exactly as v1 did. Closing the rows first removes the OPEN guard, so the
+      // episode width is the ONLY thing that can still refuse the second entry.
+      const dir = tmpDir();
+      const now = BASE + 200 * HOUR;
+      const store = new LiveEdgeDiggerStore(join(dir, "led.json"));
+      await runLiveEdgeDiggerCycle(cycleDeps(dir, now, store));
+      const afterFirst = store.all.map((o) => `${o.candidateId}|${o.symbol}`);
+      expect(afterFirst.length).toBeGreaterThan(0);
+
+      for (const o of store.all) {
+        store.replace(o.observationId, {
+          ...o, status: "CLOSED_LOSS", resolvedAt: new Date(now + HOUR).toISOString(),
+          exitPrice: o.stopPrice, exitReason: "STOP", grossR: -1, costR: -0.11, netR: -1.11, holdHours: 1,
+        });
+      }
+      // 3h later — well inside the 36h episode block, and every prior row is CLOSED.
+      await runLiveEdgeDiggerCycle(cycleDeps(dir, now + 3 * HOUR, store));
+
+      const keys = store.all.map((o) => `${o.candidateId}|${o.symbol}`);
+      expect(new Set(keys).size).toBe(keys.length);
+      for (const k of afterFirst) {
+        expect(keys.filter((x) => x === k)).toHaveLength(1);
+      }
+      expect(store.cycleMeta.suppressedTotals.ALREADY_ENTERED_THIS_EPISODE ?? 0).toBeGreaterThan(0);
+    });
+
+    it("[RESTART] suppression state and the v2 cutover survive a restart", async () => {
+      const dir = tmpDir();
+      const file = join(dir, "led.json");
+      const now = BASE + 200 * HOUR;
+      const store = new LiveEdgeDiggerStore(file);
+      await runLiveEdgeDiggerCycle(cycleDeps(dir, now, store));
+      await runLiveEdgeDiggerCycle(cycleDeps(dir, now + 7 * 60_000, store));
+      store.save();
+      const cutover = store.cycleMeta.collectionPolicyV2CutoverAt;
+      const totals = { ...store.cycleMeta.suppressedTotals };
+      expect(cutover).not.toBeNull();
+
+      const reloaded = new LiveEdgeDiggerStore(file);
+      expect(reloaded.cycleMeta.collectionPolicyV2CutoverAt).toBe(cutover);
+      expect(reloaded.cycleMeta.suppressedTotals).toEqual(totals);
+      // And the reloaded store still refuses the duplicates — dedup state IS the persisted rows.
+      await runLiveEdgeDiggerCycle(cycleDeps(dir, now + 14 * 60_000, reloaded));
+      const keys = reloaded.all.map((o) => `${o.candidateId}|${o.symbol}`);
+      expect(new Set(keys).size).toBe(keys.length);
+      expect(reloaded.cycleMeta.collectionPolicyV2CutoverAt).toBe(cutover); // never rewritten
+    });
+
+    // ---- B. CENSORING -----------------------------------------------------------------------
+    const censoredFixture = (): { rows: ShadowObservation[]; nowMs: number } => {
+      // The exact 3101 shape: early stops resolved, everything else still inside its horizon.
+      const rows: ShadowObservation[] = [];
+      for (let i = 0; i < 4; i++) {
+        const at = BASE + i * 15 * 60_000;
+        rows.push(row({
+          observationId: `stop-${i}`, openedAtMs: at,
+          symbol: `S${i}USDT`, cycleId: `c-${i}`,
+          status: "CLOSED_LOSS", resolvedAt: new Date(at + HOUR).toISOString(),
+          exitPrice: 98, exitReason: "STOP", grossR: -1, costR: -0.11, netR: -1.11, holdHours: 1,
+        }));
+      }
+      // "now" is 2h in: each row stopped out after 1h, but its 24h horizon is still running, so the
+      // farther target has not had the chance the nearer stop had. Exactly the 3101 shape.
+      return { rows, nowMs: BASE + 2 * HOUR };
+    };
+
+    it("[CENSOR] early stops with unresolved rows are CENSORED, never a negative verdict", () => {
+      const { rows, nowMs } = censoredFixture();
+      const report = buildCandidateReport(
+        freezeCandidate(EDGE_RULE_FRONTIER[0]!, new Date(BASE - HOUR).toISOString()),
+        rows.map((r) => ({ ...r, candidateId: candidateIdFor(EDGE_RULE_FRONTIER[0]!) })),
+        undefined, nowMs,
+      );
+      expect(report.lifecycle).toBe("CENSORED");
+      expect(report.rejectionReasons).toHaveLength(0);          // NOT a disqualification
+      expect(report.evidenceCohorts.matured.rows).toBe(0);
+      expect(report.evidenceCohorts.matured.netExpectancyR).toBeNull();
+      // The censored figure is still visible, but labelled and excluded from the verdict.
+      expect(report.evidenceCohorts.provisionalResolvedOnly.rows).toBe(4);
+      expect(report.evidenceCohorts.provisionalResolvedOnly.netExpectancyR).toBeLessThan(0);
+      expect(report.evidenceCohorts.provisionalResolvedOnly.label).toBe("CENSORED / NOT JUDGEABLE");
+      // and it never reaches the gates
+      expect(report.metrics.netExpectancyR).toBeNull();
+      expect(report.independentEpisodes).toBe(0);
+    });
+
+    it("[CENSOR] once horizons elapse the matured cohort becomes the canonical evidence", () => {
+      const { rows } = censoredFixture();
+      const matureNow = BASE + 48 * HOUR; // every 24h horizon has now elapsed
+      const report = buildCandidateReport(
+        freezeCandidate(EDGE_RULE_FRONTIER[0]!, new Date(BASE - HOUR).toISOString()),
+        rows.map((r) => ({ ...r, candidateId: candidateIdFor(EDGE_RULE_FRONTIER[0]!) })),
+        undefined, matureNow,
+      );
+      expect(report.evidenceCohorts.matured.rows).toBe(4);
+      expect(report.evidenceCohorts.matured.netExpectancyR).toBeCloseTo(-1.11, 6);
+      expect(report.metrics.netExpectancyR).toBeCloseTo(-1.11, 6);  // now canonical
+      // Minutes apart, so ONE canonical episode however many rows — the clustering is unchanged.
+      expect(report.independentEpisodes).toBe(1);
+      expect(report.lifecycle).not.toBe("CENSORED");
+      // cost components are attributable on matured evidence
+      expect(report.evidenceCohorts.matured.feeR).toBeLessThan(0);
+      expect(report.evidenceCohorts.matured.stopSlippageR).toBeLessThan(0);
+      expect(report.evidenceCohorts.matured.fundingR).toBe(-0);
+    });
+
+    it("[POLICY] v1 rows stay visible but never enter a v2 gate", () => {
+      const { rows } = censoredFixture();
+      const matureNow = BASE + 48 * HOUR;
+      const asV1 = rows.map((r) => ({
+        ...r, candidateId: candidateIdFor(EDGE_RULE_FRONTIER[0]!), collectionPolicyVersion: undefined,
+      }));
+      const report = buildCandidateReport(
+        freezeCandidate(EDGE_RULE_FRONTIER[0]!, new Date(BASE - HOUR).toISOString()),
+        asV1, undefined, matureNow,
+      );
+      expect(report.evidenceCohorts.v1Rows).toBe(4);
+      expect(report.evidenceCohorts.v2Rows).toBe(0);
+      expect(report.evidenceCohorts.provisionalResolvedOnly.rows).toBe(4); // visible
+      expect(report.evidenceCohorts.matured.rows).toBe(0);                 // but never judged
+      expect(report.metrics.netExpectancyR).toBeNull();
+      expect(report.independentEpisodes).toBe(0);
+      expect(report.lifecycle).toBe("CENSORED");
+      expect(report.rejectionReasons).toHaveLength(0);
+    });
+
+    it("[CENSOR] the book headline is CENSORED, not a negative-edge verdict", () => {
+      const { rows, nowMs } = censoredFixture();
+      const report = buildLiveEdgeDiggerReport({
+        generatedAt: new Date(nowMs).toISOString(),
+        observations: rows.map((r) => ({ ...r, candidateId: candidateIdFor(EDGE_RULE_FRONTIER[0]!) })),
+        attempts: [], coverage: null,
+        scanner: {
+          cyclesRun: 4, lastCycleAt: null, lastError: null, universeSize: 4,
+          regime: "MIXED", regimeFamily: "MIXED", breadth: 0.5, cohesion: 0.5, dispersion: 0.02,
+        },
+      });
+      expect(report.verdict).toBe("CENSORED_NO_MATURED_FORWARD_EVIDENCE");
+      expect(report.collection.judgeableRows).toBe(0);
+      expect(report.collection.policyVersion).toBe(2);
+      expect(report.bestCandidateId).toBeNull();
+      expect(report.recommendation).toBeNull();
+    });
+
+    it("[CENSOR] a censored candidate can never be ranked, recommended or promoted", () => {
+      const { rows, nowMs } = censoredFixture();
+      const report = buildLiveEdgeDiggerReport({
+        generatedAt: new Date(nowMs).toISOString(),
+        observations: rows.map((r) => ({ ...r, candidateId: candidateIdFor(EDGE_RULE_FRONTIER[0]!) })),
+        attempts: [], coverage: null,
+        scanner: {
+          cyclesRun: 4, lastCycleAt: null, lastError: null, universeSize: 4,
+          regime: "MIXED", regimeFamily: "MIXED", breadth: 0.5, cohesion: 0.5, dispersion: 0.02,
+        },
+      });
+      expect(report.candidates.every((c) => c.lifecycle !== "CANDIDATE")).toBe(true);
+      expect(report.candidates.every((c) => c.lifecycle !== "RECOMMENDED_FOR_3102_REVIEW")).toBe(true);
+      expect(report.lifecycleCounts.CANDIDATE).toBe(0);
+      expect(report.lifecycleCounts.RECOMMENDED_FOR_3102_REVIEW).toBe(0);
+    });
+
+    it("[MATURITY] maturity is elapsed TIME, not resolution", () => {
+      const openRow = row({ observationId: "o", openedAtMs: BASE, maxHoldHours: 24 });
+      expect(isMatured(openRow, BASE + 23 * HOUR)).toBe(false);
+      expect(isMatured(openRow, BASE + 24 * HOUR)).toBe(true);
+      // A row that stopped out in 20 minutes is RESOLVED but not matured — its farther target
+      // never got the chance the nearer stop did.
+      const fastStop = row({
+        observationId: "s", openedAtMs: BASE, maxHoldHours: 24,
+        status: "CLOSED_LOSS", resolvedAt: new Date(BASE + 20 * 60_000).toISOString(),
+        exitPrice: 98, exitReason: "STOP", grossR: -1, costR: -0.11, netR: -1.11, holdHours: 0.33,
+      });
+      expect(isMatured(fastStop, BASE + HOUR)).toBe(false);
+      expect(isJudgeableEvidence(fastStop, BASE + HOUR)).toBe(false);
+      expect(isJudgeableEvidence(fastStop, BASE + 25 * HOUR)).toBe(true);
     });
   });
 });

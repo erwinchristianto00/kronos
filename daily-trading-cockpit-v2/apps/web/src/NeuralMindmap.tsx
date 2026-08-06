@@ -1181,6 +1181,27 @@ interface LiveEdgeDiscoveryCandidate {
     frozenAt: string | null; frozenAtSource: string; earliestObservationAt: string | null;
     rowsOpenedBeforeFreeze: number; ok: boolean; note: string;
   };
+  evidenceCohorts: {
+    policyVersion: number;
+    v1Rows: number; v2Rows: number; maxOverlapDepth: number;
+    census: {
+      raw: number; open: number; resolved: number; matured: number;
+      maturedPendingResolution: number; judgeable: number;
+      resolvedFraction: number | null; earliestNextMaturityAt: string | null;
+      openAgeHoursMedian: number | null; openRemainingHoursMin: number | null;
+    };
+    provisionalResolvedOnly: { rows: number; netExpectancyR: number | null; label: string; note: string };
+    matured: {
+      rows: number; episodes: number; netExpectancyR: number | null;
+      episodeWeightedExpectancyR: number | null; pf: number | null; pfStatus: string;
+      grossExpectancyR: number | null; feeR: number | null; stopSlippageR: number | null; fundingR: number | null;
+    };
+    openExposure: {
+      rows: number; medianAgeHours: number | null; minRemainingHours: number | null;
+      earliestNextMaturityAt: string | null;
+    };
+    exitDistribution: { exitReason: string; rows: number; netExpectancyR: number | null }[];
+  };
   rawRows: number;
   openRows: number;
   resolvedRows: number;
@@ -1240,7 +1261,14 @@ interface LiveEdgeDiscoveryReport {
   lifecycleCounts?: Record<string, number>;
   bestCandidateId: string | null;
   recommendation: string | null;
-  verdict: 'NO_PROVEN_EDGE_YET' | 'CANDIDATE_READY_FOR_HUMAN_REVIEW';
+  verdict: 'CENSORED_NO_MATURED_FORWARD_EVIDENCE' | 'NO_PROVEN_EDGE_YET' | 'CANDIDATE_READY_FOR_HUMAN_REVIEW';
+  collection: {
+    policyVersion: number; cutoverAt: string | null;
+    v1Rows: number; v2Rows: number; maturedRows: number; judgeableRows: number; openRows: number;
+    resolvedFraction: number | null; maxOverlapDepth: number; earliestNextMaturityAt: string | null;
+    suppressed: { reason: string; count: number }[];
+    note: string;
+  };
 }
 
 interface LiveLaneExposure {
@@ -2062,9 +2090,11 @@ export default function NeuralMindmap() {
             <div className="neural-evidence-version-panel-head">
               <span>Live edge discovery</span>
               <strong>
-                {edgeDiscovery.verdict === 'NO_PROVEN_EDGE_YET'
-                  ? 'NO PROVEN EDGE YET'
-                  : `Candidate ready for human review — ${edgeDiscovery.bestCandidateId}`}
+                {edgeDiscovery.verdict === 'CENSORED_NO_MATURED_FORWARD_EVIDENCE'
+                  ? 'CENSORED — NO MATURED FORWARD EVIDENCE'
+                  : edgeDiscovery.verdict === 'NO_PROVEN_EDGE_YET'
+                    ? 'NO PROVEN EDGE YET'
+                    : `Candidate ready for human review — ${edgeDiscovery.bestCandidateId}`}
               </strong>
               <p>
                 A read-only scanner. Each cycle it evaluates a FIXED frontier of{' '}
@@ -2092,6 +2122,48 @@ export default function NeuralMindmap() {
                 {edgeDiscovery.scanner.lastCycleAt ? ` · last cycle ${edgeDiscovery.scanner.lastCycleAt.slice(0, 19).replace('T', ' ')}Z` : ' · never run'}
                 {edgeDiscovery.scanner.lastError ? ` · ERROR ${edgeDiscovery.scanner.lastError}` : ''}
               </small>
+              {edgeDiscovery.collection && (
+                <>
+                  <div className="neural-evidence-gate-metrics">
+                    <div><span>Collection policy</span><strong>v{edgeDiscovery.collection.policyVersion}</strong></div>
+                    <div><span>Cutover</span>
+                      <strong>{edgeDiscovery.collection.cutoverAt
+                        ? `${edgeDiscovery.collection.cutoverAt.slice(0, 19).replace('T', ' ')}Z`
+                        : 'not yet'}</strong>
+                    </div>
+                    <div><span>Rows v1 / v2</span><strong>{edgeDiscovery.collection.v1Rows} / {edgeDiscovery.collection.v2Rows}</strong></div>
+                    <div><span>Open</span><strong>{edgeDiscovery.collection.openRows}</strong></div>
+                    <div><span>Matured</span><strong>{edgeDiscovery.collection.maturedRows}</strong></div>
+                    <div><span>Judgeable</span>
+                      <strong className={edgeDiscovery.collection.judgeableRows > 0 ? 'tone-healthy' : 'tone-warning'}>
+                        {edgeDiscovery.collection.judgeableRows}
+                      </strong>
+                    </div>
+                    <div><span>Resolved fraction</span>
+                      <strong>{edgeDiscovery.collection.resolvedFraction === null
+                        ? 'n/a'
+                        : `${(edgeDiscovery.collection.resolvedFraction * 100).toFixed(1)}%`}</strong>
+                    </div>
+                    <div><span>Max overlap depth</span>
+                      <strong className={edgeDiscovery.collection.maxOverlapDepth === 0 ? 'tone-healthy' : 'tone-warning'}>
+                        {edgeDiscovery.collection.maxOverlapDepth}
+                      </strong>
+                    </div>
+                    <div><span>Next horizon completes</span>
+                      <strong>{edgeDiscovery.collection.earliestNextMaturityAt
+                        ? `${edgeDiscovery.collection.earliestNextMaturityAt.slice(0, 16).replace('T', ' ')}Z`
+                        : 'n/a'}</strong>
+                    </div>
+                  </div>
+                  {edgeDiscovery.collection.suppressed.length > 0 && (
+                    <small>
+                      suppressed since cutover:{' '}
+                      {edgeDiscovery.collection.suppressed.map((x) => `${x.reason} ${x.count}`).join(' · ')}
+                    </small>
+                  )}
+                  <p className="neural-cutover-note">{edgeDiscovery.collection.note}</p>
+                </>
+              )}
               {edgeDiscovery.coverage?.coverageNote && (
                 <p className="neural-evidence-gate-blockers">{edgeDiscovery.coverage.coverageNote}</p>
               )}
@@ -2156,6 +2228,56 @@ export default function NeuralMindmap() {
                           </strong>
                         </div>
                         <div><span>Raw rows</span><strong>{c.rawRows} ({c.openRows} open)</strong></div>
+                        {c.evidenceCohorts && (
+                          <>
+                            <div><span>Matured / judgeable</span>
+                              <strong className={c.evidenceCohorts.matured.rows > 0 ? 'tone-healthy' : 'tone-warning'}>
+                                {c.evidenceCohorts.census.matured} / {c.evidenceCohorts.matured.rows}
+                              </strong>
+                            </div>
+                            <div><span>Matured episodes</span><strong>{c.evidenceCohorts.matured.episodes}</strong></div>
+                            <div><span>Rows v1 / v2</span><strong>{c.evidenceCohorts.v1Rows} / {c.evidenceCohorts.v2Rows}</strong></div>
+                            <div><span>Max overlap depth</span>
+                              <strong className={c.evidenceCohorts.maxOverlapDepth === 0 ? 'tone-healthy' : 'tone-warning'}>
+                                {c.evidenceCohorts.maxOverlapDepth}
+                              </strong>
+                            </div>
+                            <div><span>Resolved-only (CENSORED)</span>
+                              <strong className="tone-warning">
+                                {fmtR(c.evidenceCohorts.provisionalResolvedOnly.netExpectancyR)} on {c.evidenceCohorts.provisionalResolvedOnly.rows} row(s) — not judgeable
+                              </strong>
+                            </div>
+                            <div><span>MATURED net / episode-weighted</span>
+                              <strong className={c.evidenceCohorts.matured.netExpectancyR == null
+                                ? ''
+                                : c.evidenceCohorts.matured.netExpectancyR > 0 ? 'tone-healthy' : 'tone-critical'}>
+                                {fmtR(c.evidenceCohorts.matured.netExpectancyR)} / {fmtR(c.evidenceCohorts.matured.episodeWeightedExpectancyR)}
+                              </strong>
+                            </div>
+                            <div><span>MATURED PF</span>
+                              <strong>{c.evidenceCohorts.matured.pf === null
+                                ? `N/A (${c.evidenceCohorts.matured.pfStatus})`
+                                : fmtNumber(c.evidenceCohorts.matured.pf)}</strong>
+                            </div>
+                            <div><span>MATURED gross / fee / slip / fund</span>
+                              <strong>
+                                {fmtR(c.evidenceCohorts.matured.grossExpectancyR)} / {fmtR(c.evidenceCohorts.matured.feeR)}
+                                {' '}/ {fmtR(c.evidenceCohorts.matured.stopSlippageR)} / {fmtR(c.evidenceCohorts.matured.fundingR)}
+                              </strong>
+                            </div>
+                            <div><span>Exit mix</span>
+                              <strong>{c.evidenceCohorts.exitDistribution.length === 0
+                                ? 'none resolved'
+                                : c.evidenceCohorts.exitDistribution.map((e) => `${e.exitReason} ${e.rows}`).join(' · ')}</strong>
+                            </div>
+                            <div><span>Open exposure</span>
+                              <strong>{c.evidenceCohorts.openExposure.rows} row(s)
+                                {c.evidenceCohorts.openExposure.medianAgeHours === null ? '' : `, median age ${c.evidenceCohorts.openExposure.medianAgeHours}h`}
+                                {c.evidenceCohorts.openExposure.minRemainingHours === null ? '' : `, ${c.evidenceCohorts.openExposure.minRemainingHours}h to first maturity`}
+                              </strong>
+                            </div>
+                          </>
+                        )}
                         <div><span>Independent episodes</span><strong className="tone-warning">{c.independentEpisodes}</strong></div>
                         <div><span>Rows / episode</span><strong>{c.rowsPerEpisode ?? 'n/a'}</strong></div>
                         <div><span>After-cost expectancy</span>

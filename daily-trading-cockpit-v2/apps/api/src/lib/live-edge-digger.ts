@@ -45,6 +45,16 @@ import {
 } from "./live-edge-digger-grammar.js";
 import type { Direction, MarketFeatures, SymbolFeatures } from "./live-edge-digger-types.js";
 import {
+  COLLECTION_POLICY_VERSION,
+  isJudgeableEvidence,
+  isPolicyV2,
+  maturityCensus,
+  maxOverlapDepth,
+  policyVersionOf,
+  type CollectionPolicyVersion,
+  type MaturityCensus,
+} from "./live-edge-digger-collection-policy.js";
+import {
   MAX_ACTIVE_GENERATED,
   MAX_GENERATED_PER_CYCLE,
   MAX_GENERATED_PER_DAY,
@@ -143,6 +153,13 @@ export interface ShadowObservation {
   readonly maxHoldHours: number;
   readonly regimeAtEntry: string | null;
   readonly features: SymbolFeatures;
+  /**
+   * The collection policy this row was gathered under. ABSENT on rows written before the field
+   * existed, and absent means v1 — those were collected while re-entry was unrestricted, so their
+   * row count means something different from a v2 row's. Never back-filled: a v1 row cannot be
+   * retroactively made to have been collected under rules that did not exist.
+   */
+  readonly collectionPolicyVersion?: CollectionPolicyVersion;
   // ---- outcome (null until resolved)
   readonly status: ShadowStatus;
   readonly resolvedAt: string | null;
@@ -225,6 +242,7 @@ export function emitShadowSignals(
         maxHoldHours: rule.geometry.maxHoldHours,
         regimeAtEntry: market.regime,
         features: s,
+        collectionPolicyVersion: COLLECTION_POLICY_VERSION,
         status: "OPEN",
         resolvedAt: null,
         exitPrice: null,
@@ -560,6 +578,9 @@ function gate(
 export type CandidateLifecycle =
   | "DORMANT"
   | "OPEN"
+  /** Resolved rows exist but none may be judged — pre-policy-v2, or the hold horizon has not
+   *  elapsed. Strictly less permissive than COLLECTING: it can never satisfy a gate. */
+  | "CENSORED"
   | "COLLECTING"
   | "REJECTED"
   | "CANDIDATE"
@@ -588,6 +609,11 @@ export interface CandidateReport {
   readonly comparisons: readonly { label: string; netExpectancyR: number | null; beatsCandidate: boolean }[];
   readonly gates: readonly EdgeGate[];
   readonly freezeIntegrity: FreezeIntegrity;
+  /**
+   * Collection-policy and censoring accounting. Everything a reader needs to tell "this rule lost"
+   * apart from "this rule has not been measured yet" — the distinction the v1 report could not make.
+   */
+  readonly evidenceCohorts: EvidenceCohorts;
   readonly lifecycle: CandidateLifecycle;
   /** One sentence naming the BINDING fact behind `lifecycle` — never a list to interpret. */
   readonly lifecycleReason: string;
@@ -605,6 +631,145 @@ export interface CandidateReport {
     readonly cyclesEvaluated: number;
     readonly cyclesFired: number;
     readonly note: string;
+  };
+}
+
+/**
+ * The three populations a candidate's rows fall into, kept strictly apart.
+ *
+ * The v1 report had ONE number — expectancy over resolved rows — and it was the most misleading
+ * number it could have shown. In a book younger than its hold horizon the resolved rows are the
+ * fast losers and nothing else, so that figure read as "this rule loses" when the correct statement
+ * was "this rule has not been measured".
+ */
+export interface EvidenceCohorts {
+  readonly policyVersion: CollectionPolicyVersion;
+  /** Rows collected under each policy. v1 rows stay visible; they never feed a gate. */
+  readonly v1Rows: number;
+  readonly v2Rows: number;
+  readonly census: MaturityCensus;
+  /** Deepest concurrent overlap seen for this candidate — 0 under a correctly working policy v2. */
+  readonly maxOverlapDepth: number;
+  /**
+   * Expectancy over ALL resolved rows regardless of maturity or policy. DIAGNOSTIC ONLY. It is
+   * censored by construction and must never satisfy, reject, rank, recommend or promote.
+   */
+  readonly provisionalResolvedOnly: {
+    readonly rows: number;
+    readonly netExpectancyR: number | null;
+    readonly label: "CENSORED / NOT JUDGEABLE";
+    readonly note: string;
+  };
+  /** The only population a verdict may rest on: policy-v2, full horizon elapsed, scored. */
+  readonly matured: {
+    readonly rows: number;
+    readonly episodes: number;
+    readonly netExpectancyR: number | null;
+    readonly episodeWeightedExpectancyR: number | null;
+    readonly pf: number | null;
+    readonly pfStatus: PfStatus;
+    readonly grossExpectancyR: number | null;
+    readonly feeR: number | null;
+    readonly stopSlippageR: number | null;
+    readonly fundingR: number | null;
+  };
+  readonly openExposure: {
+    readonly rows: number;
+    readonly medianAgeHours: number | null;
+    readonly minRemainingHours: number | null;
+    readonly earliestNextMaturityAt: string | null;
+  };
+  readonly exitDistribution: readonly { exitReason: string; rows: number; netExpectancyR: number | null }[];
+}
+
+/**
+ * Mean cost components over a row set, re-derived with the engine's own formulas.
+ *
+ * Reconstructed rather than stored because `costR` is a single folded number; a reader cannot tell a
+ * fee-dominated loss from a slippage-dominated one without the split. The formulas are the ones in
+ * `resolveShadowObservation`, so the parts always sum back to the stored total.
+ */
+function meanCostComponents(rows: readonly ShadowObservation[]): {
+  feeR: number | null; stopSlippageR: number | null; fundingR: number | null;
+} {
+  const scored = rows.filter((r) => typeof r.costR === "number" && typeof r.holdHours === "number" && r.stopDistanceBps > 0);
+  if (scored.length === 0) return { feeR: null, stopSlippageR: null, fundingR: null };
+  let fee = 0, slip = 0, fund = 0;
+  for (const r of scored) {
+    const stopBps = r.stopDistanceBps;
+    fee += TAKER_ROUNDTRIP_BPS / stopBps;
+    if (r.exitReason === "STOP" || r.exitReason === "AMBIGUOUS_STOP_FIRST") slip += STOP_SLIPPAGE_BPS / stopBps;
+    const periods = Math.floor((r.holdHours as number) / 8);
+    if (periods > 0) fund += (periods * FUNDING_BPS_PER_8H) / stopBps;
+  }
+  const n = scored.length;
+  return { feeR: -(fee / n), stopSlippageR: -(slip / n), fundingR: -(fund / n) };
+}
+
+/** Equal weight per episode rather than per row — one market look is one draw. */
+function episodeWeightedExpectancy(rows: readonly ShadowObservation[]): number | null {
+  const scored = rows.filter((r) => typeof r.netR === "number" && Number.isFinite(r.netR));
+  if (scored.length === 0) return null;
+  const byEpisode = new Map<string, number[]>();
+  for (const r of scored) {
+    const key = r.resolvedAt ?? r.cycleId;
+    const list = byEpisode.get(key);
+    if (list) list.push(r.netR as number); else byEpisode.set(key, [r.netR as number]);
+  }
+  const perEpisode = [...byEpisode.values()].map((xs) => xs.reduce((a, b) => a + b, 0) / xs.length);
+  return perEpisode.reduce((a, b) => a + b, 0) / perEpisode.length;
+}
+
+function buildEvidenceCohorts(rows: readonly ShadowObservation[], nowMs: number): EvidenceCohorts {
+  const census = maturityCensus(rows, nowMs);
+  const resolvedAll = rows.filter((r) => r.status !== "OPEN" && typeof r.netR === "number");
+  const judgeable = rows.filter((r) => isJudgeableEvidence(r, nowMs));
+  const jm = candidateMetrics(judgeable);
+  const cost = meanCostComponents(judgeable);
+
+  const byExit = new Map<string, ShadowObservation[]>();
+  for (const r of resolvedAll) {
+    const k = r.exitReason ?? "UNKNOWN";
+    const list = byExit.get(k);
+    if (list) list.push(r); else byExit.set(k, [r]);
+  }
+
+  return {
+    policyVersion: COLLECTION_POLICY_VERSION,
+    v1Rows: rows.filter((r) => !isPolicyV2(r)).length,
+    v2Rows: rows.filter(isPolicyV2).length,
+    census,
+    maxOverlapDepth: maxOverlapDepth(rows, nowMs),
+    provisionalResolvedOnly: {
+      rows: resolvedAll.length,
+      netExpectancyR: candidateMetrics(resolvedAll).netExpectancyR,
+      label: "CENSORED / NOT JUDGEABLE",
+      note: "every resolved row regardless of maturity or collection policy. In a book younger than " +
+        "its hold horizon the nearer barrier (the stop) resolves first, so this figure is the " +
+        "fast-losing tail by construction and cannot support or refute an edge.",
+    },
+    matured: {
+      rows: judgeable.length,
+      episodes: independentEpisodes(judgeable),
+      netExpectancyR: jm.netExpectancyR,
+      episodeWeightedExpectancyR: episodeWeightedExpectancy(judgeable),
+      pf: jm.pf,
+      pfStatus: jm.pfStatus,
+      grossExpectancyR: jm.grossExpectancyR,
+      ...cost,
+    },
+    openExposure: {
+      rows: census.open,
+      medianAgeHours: census.openAgeHoursMedian,
+      minRemainingHours: census.openRemainingHoursMin,
+      earliestNextMaturityAt: census.earliestNextMaturityAt,
+    },
+    exitDistribution: [...byExit.entries()]
+      .map(([exitReason, g]) => ({
+        exitReason, rows: g.length,
+        netExpectancyR: candidateMetrics(g).netExpectancyR,
+      }))
+      .sort((a, b) => b.rows - a.rows),
   };
 }
 
@@ -698,9 +863,23 @@ export function buildCandidateReport(
   candidate: FrozenCandidate,
   allRows: readonly ShadowObservation[],
   attemptContext?: { attemptsTotal: number; cyclesEvaluated: number; cyclesFired: number },
+  nowMs: number = Date.now(),
 ): CandidateReport {
   const rows = allRows.filter((r) => r.candidateId === candidate.candidateId);
-  const resolved = rows.filter((r) => r.status !== "OPEN" && typeof r.netR === "number");
+  const evidenceCohorts = buildEvidenceCohorts(rows, nowMs);
+
+  // THE ONE LINE THAT DECIDES WHAT MAY BE CONCLUDED.
+  //
+  // `resolved` used to be every row with a netR, and every gate, metric, interval and lifecycle
+  // below was computed from it. That set is censored — the nearer barrier resolves first, so early
+  // on it holds the fast losers and nothing else — and it mixes v1 rows collected while re-entry was
+  // unrestricted (measured: 80-deep overlap) with v2 rows collected one-per-episode. Judging on it
+  // produced "-1.03R, 0% win rate" for rules that had not actually been measured once.
+  //
+  // Everything downstream now reads ONLY policy-v2 rows whose full hold horizon has elapsed. v1 and
+  // still-censored rows remain fully visible in `evidenceCohorts`, and are never deleted — they just
+  // cannot vote.
+  const resolved = rows.filter((r) => isJudgeableEvidence(r, nowMs));
   const episodes = independentEpisodes(resolved);
   const metrics = candidateMetrics(resolved);
   const bootstrap = clusterBootstrap(resolved);
@@ -823,8 +1002,22 @@ export function buildCandidateReport(
   if (recent.episodes < PROMOTION_MIN_HOLDOUT_EFFECTIVE_N) {
     evidenceStillNeeded.push(`${PROMOTION_MIN_HOLDOUT_EFFECTIVE_N - recent.episodes} more recent episodes (have ${recent.episodes})`);
   }
-  if (rows.length > 0 && resolved.length < rows.length) {
-    evidenceStillNeeded.push(`${rows.length - resolved.length} shadow position(s) still open — outcomes not yet knowable`);
+  if (evidenceCohorts.census.open > 0) {
+    evidenceStillNeeded.push(`${evidenceCohorts.census.open} shadow position(s) still open — outcomes not yet knowable`);
+  }
+  const immature = evidenceCohorts.v2Rows - evidenceCohorts.census.matured;
+  if (immature > 0) {
+    evidenceStillNeeded.push(
+      `${immature} policy-v2 row(s) have not completed their hold horizon` +
+        `${evidenceCohorts.census.earliestNextMaturityAt === null ? "" : ` (earliest ${evidenceCohorts.census.earliestNextMaturityAt})`}` +
+        ` — judging before then measures only the nearer barrier`,
+    );
+  }
+  if (evidenceCohorts.v1Rows > 0) {
+    evidenceStillNeeded.push(
+      `${evidenceCohorts.v1Rows} row(s) predate collection policy v2 and are retained as historical ` +
+        `diagnostics only — they were collected while re-entry was unrestricted`,
+    );
   }
   if (rows.length === 0) {
     evidenceStillNeeded.push("the rule's entry conditions have not occurred in the live market yet");
@@ -849,7 +1042,19 @@ export function buildCandidateReport(
     lifecycleReason = metrics.netExpectancyR !== null && metrics.netExpectancyR > 0
       // Said explicitly, because this is exactly where a discovery engine talks itself into a result.
       ? `provisionally positive (${metrics.netExpectancyR.toFixed(4)}R over ${episodes} episode(s)) but below the canonical floors — not a finding yet`
-      : `${resolved.length} resolved observation(s) over ${episodes} independent episode(s); canonical floors not yet met`;
+      : `${resolved.length} matured observation(s) over ${episodes} independent episode(s); canonical floors not yet met`;
+  } else if (evidenceCohorts.provisionalResolvedOnly.rows > 0) {
+    // Rows HAVE resolved, but none of them may be judged: they are v1, or their hold horizon has not
+    // elapsed so the farther target never got the chance the nearer stop did. Before this state
+    // existed such a candidate showed COLLECTING next to a large negative expectancy, which read as
+    // a verdict. It is not one, and this state says so.
+    lifecycle = "CENSORED";
+    const next = evidenceCohorts.census.earliestNextMaturityAt;
+    lifecycleReason =
+      `${evidenceCohorts.provisionalResolvedOnly.rows} resolved row(s) exist but NONE is judgeable yet ` +
+      `(${evidenceCohorts.v1Rows} pre-policy-v2, ${evidenceCohorts.census.matured} matured of ${evidenceCohorts.v2Rows} v2). ` +
+      `A stop resolves sooner than a farther target, so an early expectancy is the losing tail, not an edge` +
+      `${next === null ? "" : `; earliest horizon completion ${next}`}`;
   } else if (rows.length > 0) {
     lifecycle = "OPEN";
     lifecycleReason = `${rows.length} shadow observation(s) open; no outcome is knowable yet`;
@@ -861,8 +1066,11 @@ export function buildCandidateReport(
   return {
     candidate,
     rawRows: rows.length,
-    openRows: rows.length - resolved.length,
-    resolvedRows: resolved.length,
+    // Real open count. Previously `rows.length - resolved.length`, which silently became wrong the
+    // moment `resolved` narrowed to the judgeable subset — it would have counted every censored
+    // resolved row as if it were still open.
+    openRows: evidenceCohorts.census.open,
+    resolvedRows: evidenceCohorts.census.resolved,
     independentEpisodes: episodes,
     rowsPerEpisode: episodes > 0 ? Math.round((resolved.length / episodes) * 100) / 100 : null,
     largestEpisodeShare: resolved.length > 0 ? Math.round((largest / resolved.length) * 1000) / 1000 : null,
@@ -881,6 +1089,7 @@ export function buildCandidateReport(
     },
     comparisons,
     gates,
+    evidenceCohorts,
     lifecycle,
     lifecycleReason,
     rejectionReasons,
@@ -982,7 +1191,27 @@ export interface LiveEdgeDiggerReport {
   readonly bestCandidateId: string | null;
   /** null until a candidate passes every canonical gate. */
   readonly recommendation: string | null;
-  readonly verdict: "NO_PROVEN_EDGE_YET" | "CANDIDATE_READY_FOR_HUMAN_REVIEW";
+  readonly verdict:
+    /** No policy-v2 row has completed its hold horizon, so nothing has been measured yet. This is
+     *  NOT a negative result and must never be presented as one. */
+    | "CENSORED_NO_MATURED_FORWARD_EVIDENCE"
+    | "NO_PROVEN_EDGE_YET"
+    | "CANDIDATE_READY_FOR_HUMAN_REVIEW";
+  /** Book-wide collection-policy and censoring accounting. */
+  readonly collection: {
+    readonly policyVersion: CollectionPolicyVersion;
+    readonly cutoverAt: string | null;
+    readonly v1Rows: number;
+    readonly v2Rows: number;
+    readonly maturedRows: number;
+    readonly judgeableRows: number;
+    readonly openRows: number;
+    readonly resolvedFraction: number | null;
+    readonly maxOverlapDepth: number;
+    readonly earliestNextMaturityAt: string | null;
+    readonly suppressed: readonly { reason: string; count: number }[];
+    readonly note: string;
+  };
   readonly notes: readonly string[];
 }
 
@@ -1009,6 +1238,10 @@ export function buildLiveEdgeDiggerReport(input: {
     rule: EdgeRule;
   }[];
   suppressedProposals?: readonly { reason: string; detail: string }[];
+  /** First cycle that ran under collection policy v2. Persisted once, never rewritten. */
+  collectionPolicyCutoverAt?: string | null;
+  /** Cumulative suppression counts by reason since cutover. */
+  suppressedTotals?: Readonly<Record<string, number>>;
 }): LiveEdgeDiggerReport {
   const frontier = input.frontier ?? EDGE_RULE_FRONTIER;
   const generatedRules = input.generatedRules ?? [];
@@ -1027,7 +1260,7 @@ export function buildLiveEdgeDiggerReport(input: {
         attemptsTotal: input.attempts.length,
         cyclesEvaluated: entry?.cyclesEvaluated ?? 0,
         cyclesFired: entry?.cyclesFired ?? 0,
-      });
+      }, Number.isFinite(Date.parse(input.generatedAt)) ? Date.parse(input.generatedAt) : Date.now());
     })
     // Report every rule, including ones with zero evidence — a rule that never fired is itself a
     // finding, and hiding it would understate the number of tests run.
@@ -1060,9 +1293,44 @@ export function buildLiveEdgeDiggerReport(input: {
       )
     : candidates;
 
+  // ── BOOK-WIDE COLLECTION + CENSORING CENSUS ─────────────────────────────────────────────────
+  const nowMs = Number.isFinite(Date.parse(input.generatedAt)) ? Date.parse(input.generatedAt) : Date.now();
+  const allRows = input.observations;
+  const bookCensus = maturityCensus(allRows, nowMs);
+  // CUMULATIVE totals since cutover, not this cycle's — "policy v2 has prevented N duplicate
+  // entries" is the number that shows the fix working. Falls back to counting the last cycle's
+  // detail list on a store written before the totals were persisted.
+  const suppressedCounts = new Map<string, number>();
+  if (input.suppressedTotals && Object.keys(input.suppressedTotals).length > 0) {
+    for (const [reason, count] of Object.entries(input.suppressedTotals)) suppressedCounts.set(reason, count);
+  } else {
+    for (const s of input.suppressedProposals ?? []) {
+      suppressedCounts.set(s.reason, (suppressedCounts.get(s.reason) ?? 0) + 1);
+    }
+  }
+  const collection = {
+    policyVersion: COLLECTION_POLICY_VERSION,
+    cutoverAt: input.collectionPolicyCutoverAt ?? null,
+    v1Rows: allRows.filter((r) => !isPolicyV2(r)).length,
+    v2Rows: allRows.filter(isPolicyV2).length,
+    maturedRows: bookCensus.matured,
+    judgeableRows: bookCensus.judgeable,
+    openRows: bookCensus.open,
+    resolvedFraction: bookCensus.resolvedFraction,
+    maxOverlapDepth: maxOverlapDepth(allRows, nowMs),
+    earliestNextMaturityAt: bookCensus.earliestNextMaturityAt,
+    suppressed: [...suppressedCounts.entries()]
+      .map(([reason, count]) => ({ reason, count }))
+      .sort((a, b) => b.count - a.count),
+    note:
+      "Only policy-v2 rows whose FULL hold horizon has elapsed may inform a verdict. A stop sits " +
+      "nearer than a target, so an expectancy taken before maturity measures which barrier was " +
+      "closer, not whether the rule has edge. v1 rows remain visible and are never rewritten.",
+  };
+
   const lifecycleCounts = withRecommendation.reduce<Record<CandidateLifecycle, number>>(
     (acc, c) => { acc[c.lifecycle] += 1; return acc; },
-    { DORMANT: 0, OPEN: 0, COLLECTING: 0, REJECTED: 0, CANDIDATE: 0, RECOMMENDED_FOR_3102_REVIEW: 0 },
+    { DORMANT: 0, OPEN: 0, CENSORED: 0, COLLECTING: 0, REJECTED: 0, CANDIDATE: 0, RECOMMENDED_FOR_3102_REVIEW: 0 },
   );
 
   return {
@@ -1116,7 +1384,16 @@ export function buildLiveEdgeDiggerReport(input: {
       ? `Bounded 3102 (testnet) experiment for ${best.candidate.candidateId} — HUMAN REVIEW REQUIRED. ` +
         "This engine cannot enable it; campaigns stay OFF until an operator acts."
       : null,
-    verdict: best ? "CANDIDATE_READY_FOR_HUMAN_REVIEW" : "NO_PROVEN_EDGE_YET",
+    collection,
+    // CENSORED is specifically the state where outcomes EXIST but none may be judged — the shape
+    // that produced "-1.03R across the board" from rows that had only measured which barrier was
+    // nearer. An empty book is not censored (nothing was withheld), so it keeps the plain
+    // "nothing proven yet" headline; saying CENSORED there would imply suppressed evidence.
+    verdict: best
+      ? "CANDIDATE_READY_FOR_HUMAN_REVIEW"
+      : collection.judgeableRows === 0 && bookCensus.resolved > 0
+        ? "CENSORED_NO_MATURED_FORWARD_EVIDENCE"
+        : "NO_PROVEN_EDGE_YET",
     notes: [
       `Frontier is fixed at ${frontier.length} rules; every one is forward-tested and reported, ` +
         "including those that never fired. Rules are never selected or dropped by their outcomes.",

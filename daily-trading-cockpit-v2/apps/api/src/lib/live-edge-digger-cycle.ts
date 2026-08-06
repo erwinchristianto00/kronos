@@ -15,6 +15,7 @@ import { dirname, resolve as resolvePath } from "node:path";
 import type { Candle } from "@dtc/shared";
 
 import {
+  EPISODE_BLOCK_WIDTH_MS,
   buildLiveEdgeDiggerReport,
   emitShadowSignals,
   resolveShadowObservation,
@@ -22,6 +23,7 @@ import {
   type LiveEdgeDiggerReport,
   type ShadowObservation,
 } from "./live-edge-digger.js";
+import { admitUnderPolicyV2 } from "./live-edge-digger-collection-policy.js";
 import { buildMarketFeatures, type SymbolCycleInput } from "./live-edge-digger-features.js";
 import type { RegimeFamily } from "./live-edge-digger-types.js";
 import { EDGE_RULE_FRONTIER, ruleContentHash, type EdgeRule } from "./live-edge-digger-grammar.js";
@@ -87,6 +89,15 @@ interface StoreState {
     lastCohesion: number | null;
     lastDispersion: number | null;
     coverage: CoverageMeta;
+    /**
+     * First cycle that ran under collection policy v2. Written ONCE and never rewritten — like the
+     * freeze anchor, it is only a meaningful boundary if it cannot move. Null on a store whose
+     * cycles all predate v2.
+     */
+    collectionPolicyV2CutoverAt: string | null;
+    /** CUMULATIVE suppression totals by reason. Cumulative, not per-cycle: the whole point is to be
+     *  able to say how many duplicate entries policy v2 has prevented since cutover. */
+    suppressedTotals: Record<string, number>;
   };
 }
 
@@ -106,6 +117,8 @@ const emptyState = (): StoreState => ({
     lastUniverseSize: null, lastRegime: null, lastRegimeFamily: null,
     lastBreadth: null, lastCohesion: null, lastDispersion: null,
     coverage: emptyCoverage(),
+    collectionPolicyV2CutoverAt: null,
+    suppressedTotals: {},
   },
 });
 
@@ -157,6 +170,17 @@ export class LiveEdgeDiggerStore {
             ...emptyState().cycleMeta,
             ...(parsed.cycleMeta ?? {}),
             coverage: { ...emptyCoverage(), ...(parsed.cycleMeta?.coverage ?? {}) },
+            // A store written before policy v2 has neither field. Absent means "no cutover yet" and
+            // "nothing suppressed yet" — never back-filled with load time, which would invent a
+            // boundary the evidence cannot support.
+            collectionPolicyV2CutoverAt:
+              typeof parsed.cycleMeta?.collectionPolicyV2CutoverAt === "string"
+                ? parsed.cycleMeta.collectionPolicyV2CutoverAt
+                : null,
+            suppressedTotals:
+              parsed.cycleMeta?.suppressedTotals && typeof parsed.cycleMeta.suppressedTotals === "object"
+                ? { ...parsed.cycleMeta.suppressedTotals }
+                : {},
           },
         };
       }
@@ -189,6 +213,20 @@ export class LiveEdgeDiggerStore {
 
   recordSuppressed(entries: readonly { reason: string; detail: string }[]): void {
     this.state.lastSuppressed = [...entries];
+  }
+
+  /** Accumulates admission suppressions and stamps the v2 cutover on first use. Both are persisted,
+   *  so the dedup accounting survives restart exactly like the evidence it describes. */
+  recordAdmission(suppressed: readonly { reason: string; detail: string }[], atIso: string): void {
+    const totals = { ...this.state.cycleMeta.suppressedTotals };
+    for (const s of suppressed) totals[s.reason] = (totals[s.reason] ?? 0) + 1;
+    this.state.cycleMeta = {
+      ...this.state.cycleMeta,
+      suppressedTotals: totals,
+      // Written once. A moving cutover would make "collected under v2" unfalsifiable.
+      collectionPolicyV2CutoverAt: this.state.cycleMeta.collectionPolicyV2CutoverAt ?? atIso,
+    };
+    this.state.lastSuppressed = [...this.state.lastSuppressed, ...suppressed];
   }
   has(observationId: string): boolean {
     return this.state.observations.some((o) => o.observationId === observationId);
@@ -430,8 +468,20 @@ export async function runLiveEdgeDiggerCycle(deps: LiveEdgeDiggerDeps): Promise<
   const cycleId = `cycle-${deps.now}`;
   const activeRules: EdgeRule[] = [...EDGE_RULE_FRONTIER, ...deps.store.generated.map((g) => g.rule)];
   const { observations, attempts } = emitShadowSignals(market, cycleId, atIso, activeRules);
+
+  // ---- COLLECTION POLICY v2. Emission is a pure function of the snapshot and cannot see what is
+  // already open; admission is where that is enforced. The dedup state IS the store's own rows, so
+  // it survives restart for free and can never disagree with the evidence it constrains.
+  const admission = admitUnderPolicyV2(observations, deps.store.all, EPISODE_BLOCK_WIDTH_MS);
+  deps.store.recordAdmission(
+    admission.suppressed.map((x) => ({
+      reason: x.reason,
+      detail: `${x.candidateId.split("@")[0]} ${x.symbol}: ${x.detail}`,
+    })),
+    atIso,
+  );
   let emitted = 0;
-  for (const obs of observations) {
+  for (const obs of admission.admitted) {
     if (deps.store.add(obs)) emitted += 1;
   }
   // `atIso` is the DECISION instant of this cycle, so a candidate first evaluated now is anchored
@@ -524,5 +574,7 @@ export function buildLiveEdgeDiggerReportFromStore(
     frontier: [...EDGE_RULE_FRONTIER, ...store.generated.map((g) => g.rule)],
     generatedRules: store.generated,
     suppressedProposals: store.lastSuppressed,
+    collectionPolicyCutoverAt: meta.collectionPolicyV2CutoverAt,
+    suppressedTotals: meta.suppressedTotals,
   });
 }
