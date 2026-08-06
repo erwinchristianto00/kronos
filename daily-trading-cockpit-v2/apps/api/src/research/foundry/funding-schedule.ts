@@ -23,6 +23,14 @@ export interface FundingSettlementAlignment {
   scheduleProvenance: Pick<FundingScheduleMetadata, "kind" | "source" | "sourceHash" | "alignmentToleranceMs">;
 }
 
+export interface ObservedFundingSettlement {
+  symbol: string;
+  observedSettlementTimeMs: number;
+  fundingIntervalMs: number;
+  rate: number;
+  sourceHash: string;
+}
+
 const EIGHT_HOURS = 8 * 60 * 60 * 1_000;
 
 function assertSchedule(metadata: FundingScheduleMetadata): void {
@@ -43,12 +51,16 @@ export function expectedFundingSettlementTimes(metadata: FundingScheduleMetadata
 
 export function alignFundingSettlements(input: { rows: readonly ValidatedFoundryRow[]; metadata: FundingScheduleMetadata; startMs: number; endMs: number }): FundingSettlementAlignment {
   const expected = expectedFundingSettlementTimes(input.metadata, input.startMs, input.endMs);
-  const actual = input.rows.filter((row) => row.symbol === input.metadata.symbol).map((row) => row.timestampMs).sort((a, b) => a - b);
+  const sourceRows = input.rows.filter((row) => row.symbol === input.metadata.symbol).map((row) => row as ValidatedFoundryRow & { canonicalSettlementTimeMs: number; observedSettlementTimeMs: number; alignmentOffsetMs: number; scheduleSourceHash: string });
+  for (const row of sourceRows) {
+    if (row.scheduleSourceHash !== input.metadata.sourceHash || row.timestampMs !== row.canonicalSettlementTimeMs || row.observedSettlementTimeMs - row.canonicalSettlementTimeMs !== row.alignmentOffsetMs || Math.abs(row.alignmentOffsetMs) > input.metadata.alignmentToleranceMs) throw new Error(`FOUNDRY_FUNDING_CANONICAL_IDENTITY_INVALID_${input.metadata.symbol}_${row.timestampMs}`);
+  }
+  const actual = sourceRows.map((row) => row.observedSettlementTimeMs).sort((a, b) => a - b);
   const matched = new Set<number>(); const offsets: Record<string, number> = {}; const excess: number[] = [];
-  for (const timestamp of actual) {
-    const candidate = expected.find((time) => !matched.has(time) && Math.abs(timestamp - time) <= input.metadata.alignmentToleranceMs);
-    if (candidate === undefined) excess.push(timestamp);
-    else { matched.add(candidate); offsets[String(candidate)] = timestamp - candidate; }
+  for (const row of sourceRows) {
+    const timestamp = row.observedSettlementTimeMs; const candidate = row.canonicalSettlementTimeMs;
+    if (!expected.includes(candidate) || matched.has(candidate) || Math.abs(timestamp - candidate) > input.metadata.alignmentToleranceMs) { excess.push(timestamp); continue; }
+    matched.add(candidate); offsets[String(candidate)] = row.alignmentOffsetMs;
   }
   return {
     symbol: input.metadata.symbol, expectedSettlementTimesMs: expected, actualSettlementTimesMs: actual,
@@ -56,4 +68,23 @@ export function alignFundingSettlements(input: { rows: readonly ValidatedFoundry
     alignmentOffsetsMs: offsets,
     scheduleProvenance: { kind: input.metadata.kind, source: input.metadata.source, sourceHash: input.metadata.sourceHash, alignmentToleranceMs: input.metadata.alignmentToleranceMs },
   };
+}
+
+/** Converts observed exchange timestamps into the sole canonical settlement identity. */
+export function canonicalizeFundingSettlements(input: { rows: readonly ObservedFundingSettlement[]; schedules: readonly FundingScheduleMetadata[]; startMs: number; endMs: number }): Array<ObservedFundingSettlement & { canonicalSettlementTimeMs: number; alignmentOffsetMs: number; scheduleSourceHash: string }> {
+  const output: Array<ObservedFundingSettlement & { canonicalSettlementTimeMs: number; alignmentOffsetMs: number; scheduleSourceHash: string }> = [];
+  const claimed = new Set<string>();
+  for (const row of input.rows) {
+    const schedule = input.schedules.find((candidate) => candidate.symbol === row.symbol);
+    if (!schedule) throw new Error(`FOUNDRY_FUNDING_SCHEDULE_SYMBOL_MISSING_${row.symbol}`);
+    const candidates = expectedFundingSettlementTimes(schedule, input.startMs, input.endMs).filter((time) => Math.abs(row.observedSettlementTimeMs - time) <= schedule.alignmentToleranceMs);
+    if (candidates.length !== 1) throw new Error(`FOUNDRY_FUNDING_ALIGNMENT_OUT_OF_TOLERANCE_OR_AMBIGUOUS_${row.symbol}_${row.observedSettlementTimeMs}`);
+    const canonicalSettlementTimeMs = candidates[0]!; const key = `${row.symbol}:${canonicalSettlementTimeMs}`;
+    if (claimed.has(key)) throw new Error(`FOUNDRY_FUNDING_DUPLICATE_CANONICAL_SETTLEMENT_${key}`);
+    claimed.add(key); output.push({ ...row, canonicalSettlementTimeMs, alignmentOffsetMs: row.observedSettlementTimeMs - canonicalSettlementTimeMs, scheduleSourceHash: schedule.sourceHash });
+  }
+  for (const schedule of input.schedules) for (const canonicalSettlementTimeMs of expectedFundingSettlementTimes(schedule, input.startMs, input.endMs)) {
+    if (!claimed.has(`${schedule.symbol}:${canonicalSettlementTimeMs}`)) throw new Error(`FOUNDRY_FUNDING_SETTLEMENT_MISSING_${schedule.symbol}_${canonicalSettlementTimeMs}`);
+  }
+  return output.sort((a, b) => a.canonicalSettlementTimeMs - b.canonicalSettlementTimeMs || a.symbol.localeCompare(b.symbol));
 }

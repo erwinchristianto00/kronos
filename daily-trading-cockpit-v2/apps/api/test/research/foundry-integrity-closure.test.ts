@@ -15,17 +15,17 @@ import { PointInTimeUniverse } from "../../src/research/universe/point-in-time-u
 const H = 3_600_000;
 const schedule = { schemaVersion: "v1" as const, symbol: "BTCUSDT", kind: "UTC_8H_BOUNDARIES" as const, source: "exchange-schedule", sourceHash: "schedule", alignmentToleranceMs: 60_000 };
 const coverage = { startMs: 0, endMs: 16 * H, symbols: ["BTCUSDT"], fundingSchedules: [schedule] };
-const funding = (time: number) => ({ symbol: "BTCUSDT", settlementTimeMs: time, fundingIntervalMs: 8 * H, rate: 0.001, sourceHash: "funding" });
+const funding = (canonicalSettlementTimeMs: number, observedSettlementTimeMs = canonicalSettlementTimeMs) => ({ symbol: "BTCUSDT", canonicalSettlementTimeMs, observedSettlementTimeMs, alignmentOffsetMs: observedSettlementTimeMs - canonicalSettlementTimeMs, scheduleSourceHash: "schedule", fundingIntervalMs: 8 * H, rate: 0.001, sourceHash: "funding" });
 const candle = (time: number) => ({ symbol: "BTCUSDT", openTimeMs: time, closeTimeMs: time + H - 1, open: 100, high: 101, low: 99, close: 100, volume: 1, sourceHash: "candle" });
 const universe = new PointInTimeUniverse([{ asOfMs: 0, eligibleSymbols: ["BTCUSDT"], sourceHash: "universe", evidence: { listedThen: true, sufficientHistoryThen: true, liquidityVolumeEligibleThen: true, spreadEligibleThen: true, futuresAvailableThen: true, delistingCheckedThen: true } }]);
 
 describe("Foundry integrity closure", () => {
   it("aligns real settlement boundary timestamps rather than anchoring generic cadence at first arrival", () => {
-    const rows = validateFoundryRows("FUNDING_SETTLEMENTS", FOUNDRY_SCHEMA_V1, [funding(8), funding(8 * H + 8), funding(16 * H + 3)].filter((row) => row.settlementTimeMs < coverage.endMs));
+    const rows = validateFoundryRows("FUNDING_SETTLEMENTS", FOUNDRY_SCHEMA_V1, [funding(0, 8), funding(8 * H, 8 * H + 8)]);
     const aligned = alignFundingSettlements({ rows, metadata: schedule, startMs: 0, endMs: coverage.endMs });
     expect(aligned.missingSettlementTimesMs).toEqual([]);
     expect(aligned.excessSettlementTimesMs).toEqual([]);
-    const completeRows = validateFoundryRows("FUNDING_SETTLEMENTS", FOUNDRY_SCHEMA_V1, [funding(8)]);
+    const completeRows = validateFoundryRows("FUNDING_SETTLEMENTS", FOUNDRY_SCHEMA_V1, [funding(0, 8)]);
     const partial = deriveFoundryCoverage("FUNDING_SETTLEMENTS", completeRows, { ...coverage, startMs: 0, endMs: 16 * H });
     expect(partial.missingIntervals).toHaveLength(1);
     expect(() => deriveFoundryCoverage("FUNDING_SETTLEMENTS", completeRows, { startMs: 0, endMs: 16 * H, symbols: ["BTCUSDT"], cadenceMs: 8 * H })).toThrow("FOUNDRY_FUNDING_SCHEDULE_METADATA_MISSING");

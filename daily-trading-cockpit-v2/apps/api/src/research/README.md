@@ -39,6 +39,20 @@ range, row count, and `rowsHash`; tournament manifests reference semantic hashes
 The canonical experiment clock is `dataRange × timeframeMs`: every eligible
 symbol needs a completed candle or a sourced validated absence on each tick.
 
+Funding rows retain both `canonicalSettlementTimeMs` (the only coverage and
+execution lookup key) and the exchange-observed timestamp/offset. A schedule
+maps an observed row once or rejects it; execution never uses the raw timestamp.
+At a final HALTED mark, the NAV ledger is retained but no executable close is
+invented: the run exposes `terminalOpenPositions` and fails all verdicts.
+
+`tier1-pit-artifacts.ts` accepts authoritative listing/futures historical
+exports, derives minimum-history eligibility from prior completed bars, imports
+only persisted canonical Kronos market-cause episode IDs, and derives risk
+snapshots from returns strictly before each `asOfMs`. `tier1-assembler.ts`
+verified-loads immutable artifacts and can run the listed baseline smoke matrix
+only when its capability report is complete; its label is always
+`TIER_1_BASELINE — NOT COMPARABLE TO EXACT KRONOS`.
+
 `runTournamentMatrix` runs CASH, BTC hold, equal-weight hold, Donchian, MACD,
 EMA, RSI, random timing control, and frozen current Kronos under one supplied
 data/risk/execution contract. `withKronosRegimeGate` provides the paired

@@ -24,14 +24,14 @@ const boolean = (value: unknown, field: string): boolean => { if (typeof value !
 
 function timestampFor(kind: FoundryArtifactKind, row: Record<string, unknown>): number {
   if (kind === "COMPLETED_CANDLES") return positiveTime(row.openTimeMs, "OPEN_TIME_MS");
-  if (kind === "FUNDING_SETTLEMENTS") return positiveTime(row.settlementTimeMs, "SETTLEMENT_TIME_MS");
+  if (kind === "FUNDING_SETTLEMENTS") return positiveTime(row.canonicalSettlementTimeMs, "CANONICAL_SETTLEMENT_TIME_MS");
   return positiveTime(row.asOfMs ?? row.effectiveTimeMs ?? row.decisionTimeMs, "EFFECTIVE_TIME_MS");
 }
 
 function identity(kind: FoundryArtifactKind, row: Record<string, unknown>): string {
   const s = row.symbol === undefined ? "*" : symbol(row.symbol);
   if (kind === "COMPLETED_CANDLES") return `${s}:${positiveTime(row.openTimeMs, "OPEN_TIME_MS")}`;
-  if (kind === "FUNDING_SETTLEMENTS") return `${s}:${positiveTime(row.settlementTimeMs, "SETTLEMENT_TIME_MS")}`;
+  if (kind === "FUNDING_SETTLEMENTS") return `${s}:${positiveTime(row.canonicalSettlementTimeMs, "CANONICAL_SETTLEMENT_TIME_MS")}`;
   if (kind === "CANONICAL_EPISODES") return `${s}:${positiveTime(row.decisionTimeMs, "DECISION_TIME_MS")}`;
   return `${s}:${timestampFor(kind, row)}`;
 }
@@ -43,7 +43,11 @@ function validateByKind(kind: FoundryArtifactKind, row: Record<string, unknown>)
     if (closeTimeMs <= openTimeMs || high < Math.max(open, close) || low > Math.min(open, close) || high < low) throw new Error("FOUNDRY_CANDLE_OHLC_INVALID");
     return { symbol: symbol(row.symbol), timestampMs: openTimeMs, openTimeMs, closeTimeMs, open, high, low, close, volume, sourceHash };
   }
-  if (kind === "FUNDING_SETTLEMENTS") return { symbol: symbol(row.symbol), timestampMs: positiveTime(row.settlementTimeMs, "SETTLEMENT_TIME_MS"), settlementTimeMs: positiveTime(row.settlementTimeMs, "SETTLEMENT_TIME_MS"), fundingIntervalMs: positiveTime(row.fundingIntervalMs, "FUNDING_INTERVAL_MS"), rate: number(row.rate, "RATE"), sourceHash };
+  if (kind === "FUNDING_SETTLEMENTS") {
+    const canonicalSettlementTimeMs = positiveTime(row.canonicalSettlementTimeMs, "CANONICAL_SETTLEMENT_TIME_MS"); const observedSettlementTimeMs = positiveTime(row.observedSettlementTimeMs, "OBSERVED_SETTLEMENT_TIME_MS"); const alignmentOffsetMs = number(row.alignmentOffsetMs, "ALIGNMENT_OFFSET_MS");
+    if (observedSettlementTimeMs - canonicalSettlementTimeMs !== alignmentOffsetMs) throw new Error("FOUNDRY_FUNDING_ALIGNMENT_OFFSET_INVALID");
+    return { symbol: symbol(row.symbol), timestampMs: canonicalSettlementTimeMs, canonicalSettlementTimeMs, observedSettlementTimeMs, alignmentOffsetMs, scheduleSourceHash: text(row.scheduleSourceHash, "SCHEDULE_SOURCE_HASH"), fundingIntervalMs: positiveTime(row.fundingIntervalMs, "FUNDING_INTERVAL_MS"), rate: number(row.rate, "RATE"), sourceHash };
+  }
   if (kind === "LISTING_DELISTING_TIMELINE") { const status = text(row.status, "STATUS"); if (status !== "LISTED" && status !== "DELISTED") throw new Error("FOUNDRY_LISTING_STATUS_INVALID"); const effectiveTimeMs = positiveTime(row.effectiveTimeMs, "EFFECTIVE_TIME_MS"); return { symbol: symbol(row.symbol), timestampMs: effectiveTimeMs, effectiveTimeMs, status, sourceHash }; }
   if (kind === "FUTURES_AVAILABILITY_TIMELINE") { const effectiveTimeMs = positiveTime(row.effectiveTimeMs, "EFFECTIVE_TIME_MS"); return { symbol: symbol(row.symbol), timestampMs: effectiveTimeMs, effectiveTimeMs, available: boolean(row.available, "AVAILABLE"), sourceHash }; }
   if (kind === "MINIMUM_HISTORY_ELIGIBILITY") { const asOfMs = positiveTime(row.asOfMs, "AS_OF_MS"); return { symbol: symbol(row.symbol), timestampMs: asOfMs, asOfMs, eligible: boolean(row.eligible, "ELIGIBLE"), sourceHash }; }

@@ -9,6 +9,7 @@ import {
   type TournamentPortfolioMetrics,
   type TournamentRunManifest,
   type TournamentRunResult,
+  type TournamentTerminalOpenPosition,
   type TournamentTrade,
 } from "../tournament-types.js";
 import type { TournamentStrategy } from "../strategies/challengers.js";
@@ -75,7 +76,7 @@ function groupedCandles(candles: readonly TournamentCandle[]): Map<number, Map<s
   return grouped;
 }
 
-function calculateMetrics(trades: TournamentTrade[], nav: readonly TournamentNavPoint[], startingCapital: number, canonicalEpisodeProvenanceComplete: boolean): TournamentMetrics {
+function calculateMetrics(trades: TournamentTrade[], nav: readonly TournamentNavPoint[], startingCapital: number, canonicalEpisodeProvenanceComplete: boolean, terminalPositionsResolved = true): TournamentMetrics {
   const net = trades.map((trade) => trade.netPnl); const wins = net.filter((value) => value > 0); const losses = net.filter((value) => value < 0);
   const grossWin = wins.reduce((sum, value) => sum + value, 0); const grossLoss = -losses.reduce((sum, value) => sum + value, 0);
   const navReturns = nav.map((point, index) => (index ? nav[index - 1]!.equity : startingCapital) > 0 ? point.equity / (index ? nav[index - 1]!.equity : startingCapital) - 1 : 0);
@@ -98,7 +99,7 @@ function calculateMetrics(trades: TournamentTrade[], nav: readonly TournamentNav
     sharpe, calmar, maxDrawdown, netPnl: total, returnFraction: finalEquity / startingCapital - 1,
     profitableAssetRatio: bySymbol.size ? [...bySymbol.values()].filter((value) => value > 0).length / bySymbol.size : null,
     concentration: { topSymbolNetPnlShare: topShare(bySymbol.values()), topRegimeNetPnlShare: topShare(byRegime.values()), topYearNetPnlShare: topShare(byYear.values()) },
-    canonicalEpisodeProvenanceComplete,
+    canonicalEpisodeProvenanceComplete, terminalPositionsResolved,
   };
 }
 
@@ -118,13 +119,20 @@ export function runTournament(input: TournamentExecutionInput): TournamentRunRes
   const clock = buildCanonicalClock({ startMs: spec.dataset.dataRange.startMs, endMs: spec.dataset.dataRange.endMs, timeframeMs: spec.dataset.timeframeMs }); let marks = new Map<string, number>();
   try { marks = canonicalMarks({ clock, candles: input.candles, universe, absences: input.validatedAbsences }); } catch (error) { invalidReasons.push(error instanceof Error ? error.message : "FOUNDRY_CANONICAL_CLOCK_INVALID"); }
   const emptyNav: TournamentNavPoint[] = [];
-  if (invalidReasons.length) { const strategyMetrics = calculateMetrics([], emptyNav, spec.portfolio.startingCapital, false); return { manifest, trades: [], navLedger: emptyNav, strategyMetrics, portfolioMetrics: emptyPortfolioMetrics(spec), metrics: strategyMetrics, warnings, valid: false, invalidReasons }; }
+  if (invalidReasons.length) { const strategyMetrics = calculateMetrics([], emptyNav, spec.portfolio.startingCapital, false); return { manifest, trades: [], terminalOpenPositions: [], navLedger: emptyNav, strategyMetrics, portfolioMetrics: emptyPortfolioMetrics(spec), metrics: strategyMetrics, warnings, valid: false, invalidReasons }; }
 
   const grouped = groupedCandles(input.candles); const times = clock.timestamps; const symbols = [...new Set(input.candles.map((candle) => candle.symbol))].sort();
   const history = new Map(symbols.map((symbol) => [symbol, [] as TournamentCandle[]])); const indexBySymbol = new Map(symbols.map((symbol) => [symbol, 0]));
   const pending = new Map<number, TournamentIntent[]>(); const open: OpenPosition[] = []; const trades: TournamentTrade[] = []; const navLedger: TournamentNavPoint[] = [];
   const costs = modeCost(manifest.executionMode, spec); const portfolioMetrics = emptyPortfolioMetrics(spec); let cash = spec.portfolio.startingCapital; let equityForAdmission = spec.portfolio.startingCapital;
-  const fundingByKey = new Map((input.fundingSettlements ?? []).map((settlement) => [`${settlement.symbol}:${settlement.settlementTimeMs}`, settlement]));
+  const fundingByKey = new Map<string, FundingSettlement>();
+  for (const settlement of input.fundingSettlements ?? []) {
+    const key = `${settlement.symbol}:${settlement.canonicalSettlementTimeMs}`; const schedule = input.fundingSettlementScheduleBySymbol?.get(settlement.symbol) ?? [];
+    if (!Number.isInteger(settlement.canonicalSettlementTimeMs) || !Number.isInteger(settlement.observedSettlementTimeMs) || settlement.observedSettlementTimeMs - settlement.canonicalSettlementTimeMs !== settlement.alignmentOffsetMs || !settlement.scheduleSourceHash || !settlement.sourceHash || !finite(settlement.rate) || !schedule.includes(settlement.canonicalSettlementTimeMs)) invalidReasons.push(`TOURNAMENT_FUNDING_CANONICAL_IDENTITY_INVALID_${key}`);
+    if (fundingByKey.has(key)) invalidReasons.push(`TOURNAMENT_FUNDING_DUPLICATE_CANONICAL_SETTLEMENT_${key}`);
+    fundingByKey.set(key, settlement);
+  }
+  if (invalidReasons.length) { const strategyMetrics = calculateMetrics([], emptyNav, spec.portfolio.startingCapital, false); return { manifest, trades: [], terminalOpenPositions: [], navLedger: emptyNav, strategyMetrics, portfolioMetrics: emptyPortfolioMetrics(spec), metrics: strategyMetrics, warnings, valid: false, invalidReasons }; }
 
   const fillCosts = (symbol: string, timestampMs: number, side: "LONG" | "SHORT", notional: number): { feeBps: number; slipBps: number } => {
     if (manifest.executionMode !== "EXPECTED") return costs;
@@ -139,7 +147,7 @@ export function runTournament(input: TournamentExecutionInput): TournamentRunRes
     for (const settlementTimeMs of schedule) {
       if (settlementTimeMs <= position.entryTimeMs || settlementTimeMs > throughMs || position.settledFundingTimes.has(settlementTimeMs)) continue;
       const settlement = fundingByKey.get(`${position.intent.symbol}:${settlementTimeMs}`);
-      if (!settlement || !finite(settlement.rate) || !settlement.sourceHash) { invalidReasons.push(`TOURNAMENT_FUNDING_SETTLEMENT_MISSING_${position.intent.symbol}_${settlementTimeMs}`); return false; }
+      if (!settlement || settlement.canonicalSettlementTimeMs !== settlementTimeMs || !finite(settlement.rate) || !settlement.sourceHash || !settlement.scheduleSourceHash) { invalidReasons.push(`TOURNAMENT_FUNDING_SETTLEMENT_MISSING_${position.intent.symbol}_${settlementTimeMs}`); return false; }
       position.fundingCost += position.notional * settlement.rate * sideSign(position.intent.side); position.settledFundingTimes.add(settlementTimeMs);
     }
     return true;
@@ -205,7 +213,19 @@ export function runTournament(input: TournamentExecutionInput): TournamentRunRes
     }
     recordNav(time, frame);
   }
+  const terminalOpenPositions: TournamentTerminalOpenPosition[] = [];
+  const terminalTime = times.at(-1)!; const terminalFrame = grouped.get(terminalTime) ?? new Map<string, TournamentCandle>();
+  for (const position of open) {
+    const rawMark = terminalFrame.get(position.intent.symbol)?.close ?? marks.get(`${position.intent.symbol}:${terminalTime}`);
+    if (!finite(rawMark)) { invalidReasons.push(`FOUNDRY_CANONICAL_CLOCK_POSITION_MARK_MISSING_${position.intent.symbol}_${terminalTime}`); continue; }
+    const exitCosts = fillCosts(position.intent.symbol, terminalTime + spec.dataset.timeframeMs - 1, position.intent.side, position.notional); const mark = adversePrice(rawMark, position.intent.side, false, exitCosts.slipBps);
+    const unrealizedPnl = (mark - position.entryPrice) * position.quantity * sideSign(position.intent.side) - position.entryFee - position.entrySlippage - position.notional * bps(exitCosts.feeBps) - Math.abs(mark - rawMark) * position.quantity - position.fundingCost;
+    terminalOpenPositions.push({ symbol: position.intent.symbol, side: position.intent.side, notional: position.notional, unrealizedPnl, blocker: "TERMINAL_POSITION_UNRESOLVED" });
+  }
+  if (terminalOpenPositions.length) invalidReasons.push("TERMINAL_POSITION_UNRESOLVED");
+  const terminalUnrealizedPnl = terminalOpenPositions.reduce((sum, position) => sum + position.unrealizedPnl, 0);
+  if (terminalOpenPositions.length && Math.abs((navLedger.at(-1)?.unrealizedPnl ?? 0) - terminalUnrealizedPnl) > 1e-8) invalidReasons.push("TERMINAL_POSITION_LEDGER_RECONCILIATION_FAILED");
   if (manifest.executionMode === "OPTIMISTIC") warnings.push("OPTIMISTIC_DIAGNOSTIC_ONLY");
-  const strategyMetrics = calculateMetrics(trades, navLedger, spec.portfolio.startingCapital, trades.every((trade) => trade.marketEpisodeId !== "UNPROVEN"));
-  return { manifest, navLedger, strategyMetrics, portfolioMetrics, metrics: strategyMetrics, trades, warnings, valid: invalidReasons.length === 0, invalidReasons };
+  const strategyMetrics = calculateMetrics(trades, navLedger, spec.portfolio.startingCapital, trades.every((trade) => trade.marketEpisodeId !== "UNPROVEN"), terminalOpenPositions.length === 0);
+  return { manifest, navLedger, strategyMetrics, portfolioMetrics, metrics: strategyMetrics, trades, terminalOpenPositions, warnings, valid: invalidReasons.length === 0, invalidReasons };
 }

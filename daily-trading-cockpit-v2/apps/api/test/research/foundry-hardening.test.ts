@@ -61,6 +61,20 @@ describe("Dataset Foundry and methodology hardening", () => {
     expect(run({ candles: withoutThird, absences: [{ symbol: "BTCUSDT", openTimeMs: 2 * H, reason: "DATA_UNAVAILABLE", sourceHash: "no-data" }] }).valid).toBe(false);
   });
 
+  it("does not invent an END_OF_DATA fill from a final HALTED mark", () => {
+    const all = candles("BTCUSDT", [100, 100, 75, 50]); const withoutHalts = all.filter((row) => row.openTimeMs < 2 * H);
+    const result = run({ candles: withoutHalts, absences: [
+      { symbol: "BTCUSDT", openTimeMs: 2 * H, reason: "HALTED", sourceHash: "halt-2", markPrice: 75, markPolicy: "OFFICIAL_HALT_MARK" },
+      { symbol: "BTCUSDT", openTimeMs: 3 * H, reason: "HALTED", sourceHash: "halt-3", markPrice: 50, markPolicy: "OFFICIAL_HALT_MARK" },
+    ] });
+    expect(result.valid).toBe(false); expect(result.invalidReasons).toContain("TERMINAL_POSITION_UNRESOLVED");
+    expect(result.terminalOpenPositions).toMatchObject([{ symbol: "BTCUSDT", blocker: "TERMINAL_POSITION_UNRESOLVED" }]);
+    expect(result.trades).toHaveLength(0); expect(result.navLedger).toHaveLength(4);
+    expect(result.terminalOpenPositions[0]!.unrealizedPnl).toBe(result.navLedger.at(-1)!.unrealizedPnl);
+    expect(result.metrics.terminalPositionsResolved).toBe(false);
+    expect(hardGate(result.metrics, { minIndependentEpisodes: 0, minProfitFactor: 0, maxDrawdown: 1, minProfitableAssetRatio: 0, conservativePass: true, stablePlateau: true, sealedHoldoutPass: true, maxTopSymbolNetPnlShare: 1, maxTopRegimeNetPnlShare: 1, maxTopYearNetPnlShare: 1 }).failures).toContain("TERMINAL_POSITION_UNRESOLVED");
+  });
+
   it("fails episode-dependent gates closed without canonical provenance instead of calendar buckets", () => {
     const result = run({ episode: () => null });
     expect(result.valid).toBe(true);
@@ -72,10 +86,11 @@ describe("Dataset Foundry and methodology hardening", () => {
 
   it("accrues exactly the actual funding settlements and invalidates a missing required one", () => {
     const experiment = spec({ costs: { ...spec().costs, fundingEnabled: true } });
-    const settled = run({ experiment, fundingSettlements: [{ symbol: "BTCUSDT", settlementTimeMs: 2 * H, rate: 0.01, sourceHash: "funding" }, { symbol: "BTCUSDT", settlementTimeMs: 3 * H, rate: 0.02, sourceHash: "funding" }], fundingSettlementScheduleBySymbol: new Map([["BTCUSDT", [2 * H, 3 * H]]]) });
+    const settlement = (canonicalSettlementTimeMs: number, rate: number, observedSettlementTimeMs = canonicalSettlementTimeMs) => ({ symbol: "BTCUSDT", canonicalSettlementTimeMs, observedSettlementTimeMs, alignmentOffsetMs: observedSettlementTimeMs - canonicalSettlementTimeMs, scheduleSourceHash: "schedule", rate, sourceHash: "funding" });
+    const settled = run({ experiment, fundingSettlements: [settlement(2 * H, 0.01, 2 * H + 8), settlement(3 * H, 0.02)], fundingSettlementScheduleBySymbol: new Map([["BTCUSDT", [2 * H, 3 * H]]]) });
     expect(settled.valid).toBe(true);
     expect(settled.trades[0]!.fundingCost).toBeCloseTo(240);
-    const missing = run({ experiment, fundingSettlements: [{ symbol: "BTCUSDT", settlementTimeMs: 2 * H, rate: 0.01, sourceHash: "funding" }], fundingSettlementScheduleBySymbol: new Map([["BTCUSDT", [2 * H, 3 * H]]]) });
+    const missing = run({ experiment, fundingSettlements: [settlement(2 * H, 0.01)], fundingSettlementScheduleBySymbol: new Map([["BTCUSDT", [2 * H, 3 * H]]]) });
     expect(missing.valid).toBe(false);
     expect(missing.invalidReasons).toContain("TOURNAMENT_FUNDING_SETTLEMENT_MISSING_BTCUSDT_10800000");
   });

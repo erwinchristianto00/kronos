@@ -174,7 +174,12 @@ export interface TournamentNavPoint {
 
 export interface FundingSettlement {
   symbol: string;
-  settlementTimeMs: number;
+  /** Exchange schedule identity used by both coverage and execution. */
+  canonicalSettlementTimeMs: number;
+  /** Source-observed timestamp; may differ from canonical identity only within contract tolerance. */
+  observedSettlementTimeMs: number;
+  alignmentOffsetMs: number;
+  scheduleSourceHash: string;
   /** Signed rate: a positive rate is paid by LONG and received by SHORT. */
   rate: number;
   sourceHash: string;
@@ -207,6 +212,16 @@ export interface TournamentMetrics {
     topYearNetPnlShare: number | null;
   };
   canonicalEpisodeProvenanceComplete: boolean;
+  /** False when a HALTED final mark leaves an unexecutable open position. */
+  terminalPositionsResolved?: boolean;
+}
+
+export interface TournamentTerminalOpenPosition {
+  symbol: string;
+  side: TournamentSide;
+  notional: number;
+  unrealizedPnl: number;
+  blocker: "TERMINAL_POSITION_UNRESOLVED";
 }
 
 /** Portfolio-path observability is reported separately from trade-quality metrics. */
@@ -239,6 +254,7 @@ export interface TournamentRunResult {
   metrics: TournamentMetrics;
   navLedger: TournamentNavPoint[];
   trades: TournamentTrade[];
+  terminalOpenPositions: TournamentTerminalOpenPosition[];
   warnings: string[];
   valid: boolean;
   invalidReasons: string[];

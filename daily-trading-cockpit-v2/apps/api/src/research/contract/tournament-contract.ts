@@ -136,6 +136,7 @@ export function hardGate(metrics: TournamentMetrics, input: {
   if (metrics.expectancyAfterCost <= 0) failures.push("OOS_EXPECTANCY_NON_POSITIVE");
   if (metrics.independentEpisodes < input.minIndependentEpisodes) failures.push("INDEPENDENT_EVIDENCE_INSUFFICIENT");
   if (!metrics.canonicalEpisodeProvenanceComplete) failures.push("CANONICAL_EPISODE_PROVENANCE_MISSING");
+  if (metrics.terminalPositionsResolved === false) failures.push("TERMINAL_POSITION_UNRESOLVED");
   if (metrics.profitFactor === null || metrics.profitFactor < input.minProfitFactor) failures.push("PROFIT_FACTOR_INSUFFICIENT");
   if (metrics.maxDrawdown > input.maxDrawdown) failures.push("DRAWDOWN_EXCESSIVE");
   if (metrics.profitableAssetRatio === null || metrics.profitableAssetRatio < input.minProfitableAssetRatio) failures.push("CROSS_ASSET_BREADTH_INSUFFICIENT");
