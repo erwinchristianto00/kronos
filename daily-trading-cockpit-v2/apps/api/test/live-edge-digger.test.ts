@@ -636,7 +636,8 @@ describe("live-edge-digger", () => {
         observationId: "o1", candidateId: cid, contentHash: "h", symbol: "BTCUSDT", direction: "LONG",
         cycleId: "c1", openedAt: new Date(BASE).toISOString(), openedAtMs: BASE,
         entryPrice: 100, stopPrice: 98, targetPrice: 103, stopDistanceBps: 200, maxHoldHours: 24,
-        regimeAtEntry: "r", features: {} as never, status: "CLOSED_WIN", resolvedAt: "x",
+        regimeAtEntry: "r", features: {} as never, collectionPolicyVersion: 2,
+        status: "CLOSED_WIN", resolvedAt: "x",
         exitPrice: 103, exitReason: "TARGET", grossR: 1.5, costR: -0.1, netR: 1.4, holdHours: 1,
       };
       // A legacy registry entry: it predates `firstEvaluatedAt`, so the anchor is genuinely unknown.
@@ -1261,14 +1262,15 @@ describe("live-edge-digger", () => {
         rows.map((r) => ({ ...r, candidateId: candidateIdFor(EDGE_RULE_FRONTIER[0]!) })),
         undefined, nowMs,
       );
-      expect(report.lifecycle).toBe("CENSORED");
+      // COLLECTING, with the CENSORING carried by the statistic label rather than the lifecycle.
+      expect(report.lifecycle).toBe("COLLECTING");
       expect(report.rejectionReasons).toHaveLength(0);          // NOT a disqualification
-      expect(report.evidenceCohorts.matured.rows).toBe(0);
-      expect(report.evidenceCohorts.matured.netExpectancyR).toBeNull();
+      expect(report.evidenceCohorts.current.judgeable).toBe(0);
+      expect(report.evidenceCohorts.current.matured_metrics.netExpectancyR).toBeNull();
       // The censored figure is still visible, but labelled and excluded from the verdict.
-      expect(report.evidenceCohorts.provisionalResolvedOnly.rows).toBe(4);
-      expect(report.evidenceCohorts.provisionalResolvedOnly.netExpectancyR).toBeLessThan(0);
-      expect(report.evidenceCohorts.provisionalResolvedOnly.label).toBe("CENSORED / NOT JUDGEABLE");
+      expect(report.evidenceCohorts.current.resolved).toBe(4);
+      expect(report.evidenceCohorts.current.provisionalResolvedOnlyR).toBeLessThan(0);
+      expect(report.evidenceCohorts.current.statisticLabel).toBe("CENSORED / NOT JUDGEABLE");
       // and it never reaches the gates
       expect(report.metrics.netExpectancyR).toBeNull();
       expect(report.independentEpisodes).toBe(0);
@@ -1282,16 +1284,16 @@ describe("live-edge-digger", () => {
         rows.map((r) => ({ ...r, candidateId: candidateIdFor(EDGE_RULE_FRONTIER[0]!) })),
         undefined, matureNow,
       );
-      expect(report.evidenceCohorts.matured.rows).toBe(4);
-      expect(report.evidenceCohorts.matured.netExpectancyR).toBeCloseTo(-1.11, 6);
+      expect(report.evidenceCohorts.current.judgeable).toBe(4);
+      expect(report.evidenceCohorts.current.statisticLabel).toBe("MATURED");
+      expect(report.evidenceCohorts.current.matured_metrics.netExpectancyR).toBeCloseTo(-1.11, 6);
       expect(report.metrics.netExpectancyR).toBeCloseTo(-1.11, 6);  // now canonical
       // Minutes apart, so ONE canonical episode however many rows — the clustering is unchanged.
       expect(report.independentEpisodes).toBe(1);
-      expect(report.lifecycle).not.toBe("CENSORED");
       // cost components are attributable on matured evidence
-      expect(report.evidenceCohorts.matured.feeR).toBeLessThan(0);
-      expect(report.evidenceCohorts.matured.stopSlippageR).toBeLessThan(0);
-      expect(report.evidenceCohorts.matured.fundingR).toBe(-0);
+      expect(report.evidenceCohorts.current.matured_metrics.feeR).toBeLessThan(0);
+      expect(report.evidenceCohorts.current.matured_metrics.stopSlippageR).toBeLessThan(0);
+      expect(report.evidenceCohorts.current.matured_metrics.fundingR).toBe(-0);
     });
 
     it("[POLICY] v1 rows stay visible but never enter a v2 gate", () => {
@@ -1304,15 +1306,15 @@ describe("live-edge-digger", () => {
         freezeCandidate(EDGE_RULE_FRONTIER[0]!, new Date(BASE - HOUR).toISOString()),
         asV1, undefined, matureNow,
       );
-      expect(report.evidenceCohorts.v1Rows).toBe(4);
-      expect(report.evidenceCohorts.v2Rows).toBe(0);
-      // The v2-only depth is what proves the collection fix; the all-rows figure keeps v1 history.
-      expect(report.evidenceCohorts.maxOverlapDepthV2).toBe(0);
-      expect(report.evidenceCohorts.provisionalResolvedOnly.rows).toBe(4); // visible
-      expect(report.evidenceCohorts.matured.rows).toBe(0);                 // but never judged
+      expect(report.evidenceCohorts.legacy.raw).toBe(4);
+      expect(report.evidenceCohorts.current.raw).toBe(0);
+      // The current-cohort depth is what proves the collection fix; legacy keeps the v1 history.
+      expect(report.evidenceCohorts.current.maxOverlapDepth).toBe(0);
+      expect(report.evidenceCohorts.legacy.resolved).toBe(4);             // visible
+      expect(report.evidenceCohorts.current.judgeable).toBe(0);            // but never judged
       expect(report.metrics.netExpectancyR).toBeNull();
       expect(report.independentEpisodes).toBe(0);
-      expect(report.lifecycle).toBe("CENSORED");
+      expect(report.lifecycle).toBe("DORMANT");   // no CURRENT evidence at all
       expect(report.rejectionReasons).toHaveLength(0);
     });
 
@@ -1328,7 +1330,9 @@ describe("live-edge-digger", () => {
         },
       });
       expect(report.verdict).toBe("CENSORED_NO_MATURED_FORWARD_EVIDENCE");
-      expect(report.collection.judgeableRows).toBe(0);
+      expect(report.collection.current.judgeable).toBe(0);
+      expect(report.collection.current.resolved).toBeGreaterThan(0);
+      expect(report.collection.current.statisticLabel).toBe("CENSORED / NOT JUDGEABLE");
       expect(report.collection.policyVersion).toBe(2);
       expect(report.bestCandidateId).toBeNull();
       expect(report.recommendation).toBeNull();
@@ -1349,6 +1353,195 @@ describe("live-edge-digger", () => {
       expect(report.candidates.every((c) => c.lifecycle !== "RECOMMENDED_FOR_3102_REVIEW")).toBe(true);
       expect(report.lifecycleCounts.CANDIDATE).toBe(0);
       expect(report.lifecycleCounts.RECOMMENDED_FOR_3102_REVIEW).toBe(0);
+    });
+
+
+    // ---- COHORT ISOLATION ---------------------------------------------------------------------
+    describe("cohort isolation", () => {
+      const RULE = EDGE_RULE_FRONTIER[0]!;
+      const CID = candidateIdFor(RULE);
+      const CUTOVER = BASE + 100 * HOUR;
+      const FROZEN = new Date(BASE - HOUR).toISOString();
+
+      /** A legacy row: no version stamp, resolved long ago, opened BEFORE the cutover. */
+      const legacyRow = (i: number): ShadowObservation => ({
+        observationId: `v1-${i}`, candidateId: CID, contentHash: "h", symbol: `L${i % 7}USDT`,
+        direction: "LONG", cycleId: `v1c-${i % 11}`,
+        openedAt: new Date(BASE + i * 60_000).toISOString(), openedAtMs: BASE + i * 60_000,
+        entryPrice: 100, stopPrice: 98, targetPrice: 103, stopDistanceBps: 200, maxHoldHours: 24,
+        regimeAtEntry: "MIXED", features: {} as never,
+        status: "CLOSED_LOSS", resolvedAt: new Date(BASE + i * 60_000 + HOUR).toISOString(),
+        exitPrice: 98, exitReason: "STOP", grossR: -1, costR: -0.11, netR: -1.11, holdHours: 1,
+      } as ShadowObservation);
+
+      /** A current-policy row: stamped v2, opened AFTER the cutover, still OPEN. */
+      const v2Open = (i: number): ShadowObservation => ({
+        observationId: `v2-${i}`, candidateId: CID, contentHash: "h", symbol: `C${i}USDT`,
+        direction: "LONG", cycleId: `v2c-${i}`,
+        openedAt: new Date(CUTOVER + i * 60_000).toISOString(), openedAtMs: CUTOVER + i * 60_000,
+        entryPrice: 100, stopPrice: 98, targetPrice: 103, stopDistanceBps: 200, maxHoldHours: 24,
+        regimeAtEntry: "MIXED", features: {} as never, collectionPolicyVersion: 2,
+        status: "OPEN", resolvedAt: null, exitPrice: null, exitReason: null,
+        grossR: null, costR: null, netR: null, holdHours: null,
+      } as ShadowObservation);
+
+      const bigLegacy = Array.from({ length: 1000 }, (_, i) => legacyRow(i));
+      const smallV2 = Array.from({ length: 15 }, (_, i) => v2Open(i));
+      // 2h after the last v2 entry: every v2 row is open and inside its 24h horizon.
+      const NOW = CUTOVER + 2 * HOUR;
+
+      it("[ISOLATION] 1,000 resolved v1 rows + 15 open v2 rows => v2 resolvedFraction 0, lifecycle OPEN", () => {
+        const r = buildCandidateReport(
+          freezeCandidate(RULE, FROZEN), [...bigLegacy, ...smallV2], undefined, NOW, CUTOVER,
+        );
+        const cur = r.evidenceCohorts.current;
+        expect(cur.raw).toBe(15);
+        expect(cur.open).toBe(15);
+        expect(cur.resolved).toBe(0);
+        expect(cur.resolvedFraction).toBe(0);        // NOT 0.25 from the legacy rows
+        expect(cur.matured).toBe(0);
+        expect(cur.judgeable).toBe(0);
+        expect(cur.statisticLabel).toBe("NO_EVIDENCE_YET");
+        expect(r.lifecycle).toBe("OPEN");            // NOT CENSORED/COLLECTING off legacy outcomes
+        expect(r.rejectionReasons).toHaveLength(0);
+        // and the legacy cohort is fully visible
+        expect(r.evidenceCohorts.legacy.raw).toBe(1000);
+        expect(r.evidenceCohorts.legacy.resolved).toBe(1000);
+        expect(r.evidenceCohorts.allTime.raw).toBe(1015);
+      });
+
+      it("[ISOLATION] the earliest horizon comes from v2 rows ONLY", () => {
+        const r = buildCandidateReport(
+          freezeCandidate(RULE, FROZEN), [...bigLegacy, ...smallV2], undefined, NOW, CUTOVER,
+        );
+        // Legacy rows opened at BASE with a 24h hold: their horizons are ~100h earlier and are
+        // already past. Taking the min over all rows would surface one of those.
+        const earliestV2 = Math.min(...smallV2.map((o) => o.openedAtMs + o.maxHoldHours * 3_600_000));
+        expect(r.evidenceCohorts.current.earliestHorizonCompletionAt)
+          .toBe(new Date(earliestV2).toISOString());
+        expect(Date.parse(r.evidenceCohorts.current.earliestHorizonCompletionAt!))
+          .toBeGreaterThan(BASE + 24 * HOUR);
+      });
+
+      it("[ISOLATION] resolved v1 rows cannot produce COLLECTING or REJECTED for v2", () => {
+        // 1,000 legacy rows all at -1.11R over many episodes: more than enough to trip every
+        // economic gate if a single one of them reached the judgeable set.
+        const r = buildCandidateReport(
+          freezeCandidate(RULE, FROZEN), [...bigLegacy, ...smallV2], undefined, NOW, CUTOVER,
+        );
+        expect(r.lifecycle).not.toBe("REJECTED");
+        expect(r.lifecycle).not.toBe("COLLECTING");
+        expect(r.lifecycle).toBe("OPEN");
+        expect(r.rejectionReasons).toHaveLength(0);
+        expect(r.independentEpisodes).toBe(0);
+        expect(r.metrics.netExpectancyR).toBeNull();
+        expect(r.bootstrap.lowerBound95).toBeNull();
+        expect(r.gates.every((g) => g.current === null || g.current === 0)).toBe(true);
+      });
+
+      it("[ISOLATION] legacy expectancy never enters current metrics, gates, blockers or ranking", () => {
+        const r = buildCandidateReport(
+          freezeCandidate(RULE, FROZEN), [...bigLegacy, ...smallV2], undefined, NOW, CUTOVER,
+        );
+        // The legacy number exists, and is clearly labelled as legacy.
+        expect(r.evidenceCohorts.legacy.resolvedOnlyExpectancyR).toBeCloseTo(-1.11, 6);
+        expect(r.evidenceCohorts.legacy.exclusionNote).toContain("excluded from every current");
+        // ...and appears nowhere that can influence a decision.
+        expect(r.evidenceCohorts.current.provisionalResolvedOnlyR).toBeNull();
+        expect(r.evidenceCohorts.current.matured_metrics.netExpectancyR).toBeNull();
+        expect(r.metrics.netExpectancyR).toBeNull();
+        expect(r.lifecycleReason).not.toContain("1.11");
+        expect(r.rejectionReasons.join(" ")).not.toContain("1.11");
+      });
+
+      it("[ISOLATION] a v2-stamped row opened BEFORE the cutover is legacy, not current", () => {
+        // The stamp and the boundary disagreeing is exactly the case that must fail closed.
+        const preCutoverV2 = { ...v2Open(99), observationId: "v2-pre", openedAtMs: CUTOVER - HOUR,
+          openedAt: new Date(CUTOVER - HOUR).toISOString() } as ShadowObservation;
+        const r = buildCandidateReport(
+          freezeCandidate(RULE, FROZEN), [preCutoverV2, ...smallV2], undefined, NOW, CUTOVER,
+        );
+        expect(r.evidenceCohorts.current.raw).toBe(15);
+        expect(r.evidenceCohorts.legacy.raw).toBe(1);
+      });
+
+      it("[ISOLATION] a legacy row PREDATING the freeze anchor cannot reject a clean v2 cohort", () => {
+        // Freeze integrity is a disqualification, so it is the shortest path by which a legacy row
+        // can reach the lifecycle. The anchor here sits AFTER the legacy rows and BEFORE every
+        // current row: judged over all rows the candidate is REJECTED for a v1 provenance problem;
+        // judged over the current cohort it is clean, which is the truthful reading.
+        const anchorAfterLegacy = new Date(BASE + 50 * HOUR).toISOString();
+        const r = buildCandidateReport(
+          freezeCandidate(RULE, anchorAfterLegacy), [...bigLegacy, ...smallV2], undefined, NOW, CUTOVER,
+        );
+        expect(r.freezeIntegrity.ok).toBe(true);
+        expect(r.freezeIntegrity.rowsOpenedBeforeFreeze).toBe(0);
+        expect(r.lifecycle).toBe("OPEN");
+        expect(r.rejectionReasons).toHaveLength(0);
+        // The legacy rows really do predate the anchor — the fixture is discriminating.
+        expect(bigLegacy.some((o) => o.openedAtMs < Date.parse(anchorAfterLegacy))).toBe(true);
+      });
+
+      it("[ISOLATION] legacy rows only, zero v2 => DORMANT", () => {
+        const r = buildCandidateReport(freezeCandidate(RULE, FROZEN), bigLegacy, undefined, NOW, CUTOVER);
+        expect(r.evidenceCohorts.current.raw).toBe(0);
+        expect(r.lifecycle).toBe("DORMANT");
+        expect(r.lifecycleReason).toContain("legacy");
+        expect(r.rejectionReasons).toHaveLength(0);
+      });
+
+      it("[ISOLATION] the BOOK headline and collection block are cohort-isolated", () => {
+        const report = buildLiveEdgeDiggerReport({
+          generatedAt: new Date(NOW).toISOString(),
+          observations: [...bigLegacy, ...smallV2],
+          attempts: [{
+            ruleId: RULE.ruleId, candidateId: CID, cyclesEvaluated: 5, cyclesFired: 5,
+            observationsEmitted: 15, firstEvaluatedAt: new Date(BASE - HOUR).toISOString(),
+          }],
+          coverage: null,
+          collectionPolicyCutoverAt: new Date(CUTOVER).toISOString(),
+          scanner: {
+            cyclesRun: 5, lastCycleAt: null, lastError: null, universeSize: 4,
+            regime: "MIXED", regimeFamily: "MIXED", breadth: 0.5, cohesion: 0.5, dispersion: 0.02,
+          },
+        });
+        const c = report.collection;
+        expect(c.current.raw).toBe(15);
+        expect(c.current.open).toBe(15);
+        expect(c.current.resolved).toBe(0);
+        expect(c.current.resolvedFraction).toBe(0);
+        expect(c.current.judgeable).toBe(0);
+        expect(c.current.maxOverlapDepth).toBe(0);
+        expect(c.current.statisticLabel).toBe("NO_EVIDENCE_YET");
+        expect(c.legacy.raw).toBe(1000);
+        expect(c.legacy.resolved).toBe(1000);
+        expect(c.allTime.storeRows).toBe(1015);
+        // Nothing has been measured under the current policy, so nothing may be recommended.
+        expect(report.bestCandidateId).toBeNull();
+        expect(report.recommendation).toBeNull();
+        expect(report.lifecycleCounts.REJECTED).toBe(0);
+        expect(report.lifecycleCounts.CANDIDATE).toBe(0);
+      });
+
+      it("[ISOLATION] CENSORED is a statistic label on the cohort, never a lifecycle state", () => {
+        // A v2 row that resolved early but has not matured.
+        const earlyStop = {
+          ...v2Open(0), observationId: "v2-stop",
+          status: "CLOSED_LOSS", resolvedAt: new Date(CUTOVER + HOUR).toISOString(),
+          exitPrice: 98, exitReason: "STOP", grossR: -1, costR: -0.11, netR: -1.11, holdHours: 1,
+        } as ShadowObservation;
+        const r = buildCandidateReport(
+          freezeCandidate(RULE, FROZEN), [...bigLegacy, earlyStop, ...smallV2.slice(1)], undefined, NOW, CUTOVER,
+        );
+        expect(r.evidenceCohorts.current.statisticLabel).toBe("CENSORED / NOT JUDGEABLE");
+        expect(r.evidenceCohorts.current.resolved).toBe(1);
+        expect(r.evidenceCohorts.current.judgeable).toBe(0);
+        // The LIFECYCLE is COLLECTING — the rule is not "censored", its statistics are.
+        expect(r.lifecycle).toBe("COLLECTING");
+        expect(r.lifecycleReason).toContain("CENSORED / NOT JUDGEABLE");
+        expect(r.rejectionReasons).toHaveLength(0);
+        expect((r.lifecycle as string)).not.toBe("CENSORED");
+      });
     });
 
     it("[MATURITY] maturity is elapsed TIME, not resolution", () => {

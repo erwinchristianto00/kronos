@@ -53,6 +53,25 @@ export function policyVersionOf(o: ShadowObservation): CollectionPolicyVersion {
 
 export const isPolicyV2 = (o: ShadowObservation): boolean => policyVersionOf(o) === 2;
 
+/**
+ * Membership of the CURRENT-POLICY cohort — the only rows any "current" number may aggregate.
+ *
+ * Two conditions, not one. The version stamp is the primary test, and the cutover instant is the
+ * belt-and-braces second: a v2-stamped row opened before the cutover would mean the stamp and the
+ * boundary disagree, and this returns false rather than trusting either alone. Requiring both makes
+ * the boundary a thing a test can assert instead of a thing the writer promises.
+ */
+export function isCurrentPolicyRow(o: ShadowObservation, cutoverAtMs: number | null): boolean {
+  if (!isPolicyV2(o)) return false;
+  if (cutoverAtMs !== null && Number.isFinite(cutoverAtMs) && o.openedAtMs < cutoverAtMs) return false;
+  return true;
+}
+
+/** The legacy cohort: everything the current cohort excludes. Diagnostic only, never a gate input. */
+export function isLegacyRow(o: ShadowObservation, cutoverAtMs: number | null): boolean {
+  return !isCurrentPolicyRow(o, cutoverAtMs);
+}
+
 export type SuppressionReason =
   /** A row for this candidate+symbol is still OPEN. One live position at a time. */
   | "OPEN_POSITION_EXISTS"
@@ -167,9 +186,13 @@ export function isMatured(o: ShadowObservation, nowMs: number): boolean {
   return nowMs >= maturesAtMs(o);
 }
 
-/** Matured AND scored — the only rows a verdict may rest on. */
-export function isJudgeableEvidence(o: ShadowObservation, nowMs: number): boolean {
-  return isPolicyV2(o) && isMatured(o, nowMs)
+/** Matured AND scored AND in the current-policy cohort — the only rows a verdict may rest on. */
+export function isJudgeableEvidence(
+  o: ShadowObservation,
+  nowMs: number,
+  cutoverAtMs: number | null = null,
+): boolean {
+  return isCurrentPolicyRow(o, cutoverAtMs) && isMatured(o, nowMs)
     && o.status !== "OPEN" && typeof o.netR === "number" && Number.isFinite(o.netR);
 }
 
@@ -189,11 +212,21 @@ export interface MaturityCensus {
   readonly openRemainingHoursMin: number | null;
 }
 
+/**
+ * Census over WHATEVER ROW SET IT IS GIVEN. It does no cohort filtering of its own — deliberately,
+ * because the previous version silently described the whole store while its output was rendered
+ * under a "current policy" heading. Measured on 3101 at `280cf56`: it reported resolvedFraction
+ * 0.252 and an earliest horizon of 2026-08-06T18:01Z when the v2 cohort's true values were 0.000
+ * and 2026-08-07T04:09Z. Callers now pass a pre-filtered cohort and the caller is where the cohort
+ * is named.
+ */
 export function maturityCensus(rows: readonly ShadowObservation[], nowMs: number): MaturityCensus {
   const open = rows.filter((r) => r.status === "OPEN");
   const resolved = rows.filter((r) => r.status !== "OPEN" && typeof r.netR === "number");
   const matured = rows.filter((r) => isMatured(r, nowMs));
-  const judgeable = rows.filter((r) => isJudgeableEvidence(r, nowMs));
+  // No cohort filter here: `rows` IS the cohort. See the note above.
+  const judgeable = rows.filter((r) => isMatured(r, nowMs)
+    && r.status !== "OPEN" && typeof r.netR === "number" && Number.isFinite(r.netR));
   const pending = matured.filter((r) => r.status === "OPEN" || typeof r.netR !== "number");
 
   const immature = rows.filter((r) => !isMatured(r, nowMs));

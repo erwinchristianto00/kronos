@@ -1183,24 +1183,26 @@ interface LiveEdgeDiscoveryCandidate {
   };
   evidenceCohorts: {
     policyVersion: number;
-    v1Rows: number; v2Rows: number; maxOverlapDepth: number; maxOverlapDepthV2: number;
-    census: {
-      raw: number; open: number; resolved: number; matured: number;
-      maturedPendingResolution: number; judgeable: number;
-      resolvedFraction: number | null; earliestNextMaturityAt: string | null;
-      openAgeHoursMedian: number | null; openRemainingHoursMin: number | null;
+    cutoverAt: string | null;
+    current: {
+      raw: number; open: number; resolved: number; matured: number; judgeable: number;
+      resolvedFraction: number | null; independentMaturedEpisodes: number; maxOverlapDepth: number;
+      earliestHorizonCompletionAt: string | null;
+      openMedianAgeHours: number | null; openMinRemainingHours: number | null;
+      statisticLabel: string;
+      provisionalResolvedOnlyR: number | null;
+      matured_metrics: {
+        netExpectancyR: number | null; episodeWeightedExpectancyR: number | null;
+        pf: number | null; pfStatus: string; grossExpectancyR: number | null;
+        feeR: number | null; stopSlippageR: number | null; fundingR: number | null;
+      };
+      exitDistribution: { exitReason: string; rows: number; netExpectancyR: number | null }[];
     };
-    provisionalResolvedOnly: { rows: number; netExpectancyR: number | null; label: string; note: string };
-    matured: {
-      rows: number; episodes: number; netExpectancyR: number | null;
-      episodeWeightedExpectancyR: number | null; pf: number | null; pfStatus: string;
-      grossExpectancyR: number | null; feeR: number | null; stopSlippageR: number | null; fundingR: number | null;
+    legacy: {
+      raw: number; open: number; resolved: number; maxOverlapDepth: number;
+      resolvedOnlyExpectancyR: number | null; exclusionNote: string;
     };
-    openExposure: {
-      rows: number; medianAgeHours: number | null; minRemainingHours: number | null;
-      earliestNextMaturityAt: string | null;
-    };
-    exitDistribution: { exitReason: string; rows: number; netExpectancyR: number | null }[];
+    allTime: { raw: number };
   };
   rawRows: number;
   openRows: number;
@@ -1264,10 +1266,18 @@ interface LiveEdgeDiscoveryReport {
   verdict: 'CENSORED_NO_MATURED_FORWARD_EVIDENCE' | 'NO_PROVEN_EDGE_YET' | 'CANDIDATE_READY_FOR_HUMAN_REVIEW';
   collection: {
     policyVersion: number; cutoverAt: string | null;
-    v1Rows: number; v2Rows: number; maturedRows: number; judgeableRows: number; openRows: number;
-    resolvedFraction: number | null; maxOverlapDepth: number; maxOverlapDepthV2: number;
-    earliestNextMaturityAt: string | null;
-    suppressed: { reason: string; count: number }[];
+    current: {
+      raw: number; open: number; resolved: number; matured: number; judgeable: number;
+      resolvedFraction: number | null; independentMaturedEpisodes: number; maxOverlapDepth: number;
+      earliestHorizonCompletionAt: string | null;
+      suppressed: { reason: string; count: number }[];
+      statisticLabel: string;
+    };
+    legacy: {
+      raw: number; open: number; resolved: number; maxOverlapDepth: number;
+      resolvedOnlyExpectancyR: number | null; exclusionNote: string;
+    };
+    allTime: { storeRows: number };
     note: string;
   };
 }
@@ -2125,43 +2135,64 @@ export default function NeuralMindmap() {
               </small>
               {edgeDiscovery.collection && (
                 <>
-                  <div className="neural-evidence-gate-metrics">
-                    <div><span>Collection policy</span><strong>v{edgeDiscovery.collection.policyVersion}</strong></div>
-                    <div><span>Cutover</span>
-                      <strong>{edgeDiscovery.collection.cutoverAt
+                  <div className="neural-evidence-version-head">
+                    <span>CURRENT POLICY v{edgeDiscovery.collection.policyVersion}</span>
+                    <strong>{edgeDiscovery.collection.current.statisticLabel}</strong>
+                    <span className="neural-cutover-source-badge source-canonical">
+                      cutover {edgeDiscovery.collection.cutoverAt
                         ? `${edgeDiscovery.collection.cutoverAt.slice(0, 19).replace('T', ' ')}Z`
-                        : 'not yet'}</strong>
-                    </div>
-                    <div><span>Rows v1 / v2</span><strong>{edgeDiscovery.collection.v1Rows} / {edgeDiscovery.collection.v2Rows}</strong></div>
-                    <div><span>Open</span><strong>{edgeDiscovery.collection.openRows}</strong></div>
-                    <div><span>Matured</span><strong>{edgeDiscovery.collection.maturedRows}</strong></div>
+                        : 'not yet'}
+                    </span>
+                  </div>
+                  <div className="neural-evidence-gate-metrics">
+                    <div><span>Raw / open</span><strong>{edgeDiscovery.collection.current.raw} / {edgeDiscovery.collection.current.open}</strong></div>
+                    <div><span>Resolved / matured</span><strong>{edgeDiscovery.collection.current.resolved} / {edgeDiscovery.collection.current.matured}</strong></div>
                     <div><span>Judgeable</span>
-                      <strong className={edgeDiscovery.collection.judgeableRows > 0 ? 'tone-healthy' : 'tone-warning'}>
-                        {edgeDiscovery.collection.judgeableRows}
+                      <strong className={edgeDiscovery.collection.current.judgeable > 0 ? 'tone-healthy' : 'tone-warning'}>
+                        {edgeDiscovery.collection.current.judgeable}
                       </strong>
                     </div>
                     <div><span>Resolved fraction</span>
-                      <strong>{edgeDiscovery.collection.resolvedFraction === null
+                      <strong>{edgeDiscovery.collection.current.resolvedFraction === null
                         ? 'n/a'
-                        : `${(edgeDiscovery.collection.resolvedFraction * 100).toFixed(1)}%`}</strong>
+                        : `${(edgeDiscovery.collection.current.resolvedFraction * 100).toFixed(1)}%`}</strong>
                     </div>
-                    <div><span>Overlap depth v2 / all-time</span>
-                      <strong className={edgeDiscovery.collection.maxOverlapDepthV2 === 0 ? 'tone-healthy' : 'tone-critical'}>
-                        {edgeDiscovery.collection.maxOverlapDepthV2} / {edgeDiscovery.collection.maxOverlapDepth}
+                    <div><span>Independent matured episodes</span><strong>{edgeDiscovery.collection.current.independentMaturedEpisodes}</strong></div>
+                    <div><span>Overlap depth</span>
+                      <strong className={edgeDiscovery.collection.current.maxOverlapDepth === 0 ? 'tone-healthy' : 'tone-critical'}>
+                        {edgeDiscovery.collection.current.maxOverlapDepth}
                       </strong>
                     </div>
-                    <div><span>Next horizon completes</span>
-                      <strong>{edgeDiscovery.collection.earliestNextMaturityAt
-                        ? `${edgeDiscovery.collection.earliestNextMaturityAt.slice(0, 16).replace('T', ' ')}Z`
+                    <div><span>Earliest v2 horizon</span>
+                      <strong>{edgeDiscovery.collection.current.earliestHorizonCompletionAt
+                        ? `${edgeDiscovery.collection.current.earliestHorizonCompletionAt.slice(0, 16).replace('T', ' ')}Z`
                         : 'n/a'}</strong>
                     </div>
                   </div>
-                  {edgeDiscovery.collection.suppressed.length > 0 && (
+                  {edgeDiscovery.collection.current.suppressed.length > 0 && (
                     <small>
                       suppressed since cutover:{' '}
-                      {edgeDiscovery.collection.suppressed.map((x) => `${x.reason} ${x.count}`).join(' · ')}
+                      {edgeDiscovery.collection.current.suppressed.map((x) => `${x.reason} ${x.count}`).join(' · ')}
                     </small>
                   )}
+                  <div className="neural-evidence-version-head">
+                    <span>LEGACY v1 — DIAGNOSTIC ONLY</span>
+                    <strong>excluded from every current statistic</strong>
+                  </div>
+                  <div className="neural-evidence-gate-metrics">
+                    <div><span>Raw / open / resolved</span>
+                      <strong>{edgeDiscovery.collection.legacy.raw} / {edgeDiscovery.collection.legacy.open} / {edgeDiscovery.collection.legacy.resolved}</strong>
+                    </div>
+                    <div><span>Overlap depth</span><strong className="tone-warning">{edgeDiscovery.collection.legacy.maxOverlapDepth}</strong></div>
+                    <div><span>Resolved-only expectancy</span>
+                      <strong className="tone-warning">{fmtR(edgeDiscovery.collection.legacy.resolvedOnlyExpectancyR)}</strong>
+                    </div>
+                  </div>
+                  <p className="neural-cutover-note">{edgeDiscovery.collection.legacy.exclusionNote}</p>
+                  <small>
+                    ALL-TIME OPERATIONAL · store rows {edgeDiscovery.collection.allTime.storeRows}
+                    {' '}· scanner {edgeDiscovery.scanner.lastError ? 'ERROR' : 'healthy'}
+                  </small>
                   <p className="neural-cutover-note">{edgeDiscovery.collection.note}</p>
                 </>
               )}
@@ -2231,56 +2262,66 @@ export default function NeuralMindmap() {
                         <div><span>Raw rows</span><strong>{c.rawRows} ({c.openRows} open)</strong></div>
                         {c.evidenceCohorts && (
                           <>
-                            <div><span>Matured / judgeable</span>
-                              <strong className={c.evidenceCohorts.matured.rows > 0 ? 'tone-healthy' : 'tone-warning'}>
-                                {c.evidenceCohorts.census.matured} / {c.evidenceCohorts.matured.rows}
+                            <div><span>v2 raw / open / resolved</span>
+                              <strong>{c.evidenceCohorts.current.raw} / {c.evidenceCohorts.current.open} / {c.evidenceCohorts.current.resolved}</strong>
+                            </div>
+                            <div><span>v2 matured / judgeable</span>
+                              <strong className={c.evidenceCohorts.current.judgeable > 0 ? 'tone-healthy' : 'tone-warning'}>
+                                {c.evidenceCohorts.current.matured} / {c.evidenceCohorts.current.judgeable}
                               </strong>
                             </div>
-                            <div><span>Matured episodes</span><strong>{c.evidenceCohorts.matured.episodes}</strong></div>
-                            <div><span>Rows v1 / v2</span><strong>{c.evidenceCohorts.v1Rows} / {c.evidenceCohorts.v2Rows}</strong></div>
-                            <div><span>Overlap depth v2 / all-time</span>
-                              <strong className={c.evidenceCohorts.maxOverlapDepthV2 === 0 ? 'tone-healthy' : 'tone-critical'}>
-                                {c.evidenceCohorts.maxOverlapDepthV2} / {c.evidenceCohorts.maxOverlapDepth}
+                            <div><span>v2 resolved fraction</span>
+                              <strong>{c.evidenceCohorts.current.resolvedFraction === null
+                                ? 'n/a'
+                                : `${(c.evidenceCohorts.current.resolvedFraction * 100).toFixed(1)}%`}</strong>
+                            </div>
+                            <div><span>v2 matured episodes</span><strong>{c.evidenceCohorts.current.independentMaturedEpisodes}</strong></div>
+                            <div><span>v2 overlap depth</span>
+                              <strong className={c.evidenceCohorts.current.maxOverlapDepth === 0 ? 'tone-healthy' : 'tone-critical'}>
+                                {c.evidenceCohorts.current.maxOverlapDepth}
                               </strong>
                             </div>
-                            <div><span>Resolved-only (CENSORED)</span>
-                              <strong className="tone-warning">
-                                {fmtR(c.evidenceCohorts.provisionalResolvedOnly.netExpectancyR)} on {c.evidenceCohorts.provisionalResolvedOnly.rows} row(s) — not judgeable
+                            <div><span>v2 earliest horizon</span>
+                              <strong>{c.evidenceCohorts.current.earliestHorizonCompletionAt
+                                ? `${c.evidenceCohorts.current.earliestHorizonCompletionAt.slice(0, 16).replace('T', ' ')}Z`
+                                : 'n/a'}</strong>
+                            </div>
+                            <div><span>v2 statistics</span>
+                              <strong className={c.evidenceCohorts.current.statisticLabel === 'MATURED' ? 'tone-healthy' : 'tone-warning'}>
+                                {c.evidenceCohorts.current.statisticLabel}
                               </strong>
                             </div>
-                            <div><span>MATURED net / episode-weighted</span>
-                              <strong className={c.evidenceCohorts.matured.netExpectancyR == null
+                            <div><span>v2 MATURED net / episode-weighted</span>
+                              <strong className={c.evidenceCohorts.current.matured_metrics.netExpectancyR == null
                                 ? ''
-                                : c.evidenceCohorts.matured.netExpectancyR > 0 ? 'tone-healthy' : 'tone-critical'}>
-                                {fmtR(c.evidenceCohorts.matured.netExpectancyR)} / {fmtR(c.evidenceCohorts.matured.episodeWeightedExpectancyR)}
+                                : c.evidenceCohorts.current.matured_metrics.netExpectancyR > 0 ? 'tone-healthy' : 'tone-critical'}>
+                                {fmtR(c.evidenceCohorts.current.matured_metrics.netExpectancyR)} / {fmtR(c.evidenceCohorts.current.matured_metrics.episodeWeightedExpectancyR)}
                               </strong>
                             </div>
-                            <div><span>MATURED PF</span>
-                              <strong>{c.evidenceCohorts.matured.pf === null
-                                ? `N/A (${c.evidenceCohorts.matured.pfStatus})`
-                                : fmtNumber(c.evidenceCohorts.matured.pf)}</strong>
+                            <div><span>v2 MATURED PF</span>
+                              <strong>{c.evidenceCohorts.current.matured_metrics.pf === null
+                                ? `N/A (${c.evidenceCohorts.current.matured_metrics.pfStatus})`
+                                : fmtNumber(c.evidenceCohorts.current.matured_metrics.pf)}</strong>
                             </div>
-                            <div><span>MATURED gross / fee / slip / fund</span>
+                            <div><span>v2 MATURED gross / fee / slip / fund</span>
                               <strong>
-                                {fmtR(c.evidenceCohorts.matured.grossExpectancyR)} / {fmtR(c.evidenceCohorts.matured.feeR)}
-                                {' '}/ {fmtR(c.evidenceCohorts.matured.stopSlippageR)} / {fmtR(c.evidenceCohorts.matured.fundingR)}
+                                {fmtR(c.evidenceCohorts.current.matured_metrics.grossExpectancyR)} / {fmtR(c.evidenceCohorts.current.matured_metrics.feeR)}
+                                {' '}/ {fmtR(c.evidenceCohorts.current.matured_metrics.stopSlippageR)} / {fmtR(c.evidenceCohorts.current.matured_metrics.fundingR)}
                               </strong>
                             </div>
-                            <div><span>Exit mix</span>
-                              <strong>{c.evidenceCohorts.exitDistribution.length === 0
+                            <div><span>v2 exit mix</span>
+                              <strong>{c.evidenceCohorts.current.exitDistribution.length === 0
                                 ? 'none resolved'
-                                : c.evidenceCohorts.exitDistribution.map((e) => `${e.exitReason} ${e.rows}`).join(' · ')}</strong>
+                                : c.evidenceCohorts.current.exitDistribution.map((e) => `${e.exitReason} ${e.rows}`).join(' · ')}</strong>
                             </div>
-                            <div><span>Open exposure</span>
-                              <strong>{c.evidenceCohorts.openExposure.rows} row(s)
-                                {c.evidenceCohorts.openExposure.medianAgeHours === null ? '' : `, median age ${c.evidenceCohorts.openExposure.medianAgeHours}h`}
-                                {c.evidenceCohorts.openExposure.minRemainingHours === null ? '' : `, ${c.evidenceCohorts.openExposure.minRemainingHours}h to first maturity`}
+                            <div><span>LEGACY v1 (diagnostic)</span>
+                              <strong className="tone-warning">
+                                {c.evidenceCohorts.legacy.raw} rows, {c.evidenceCohorts.legacy.resolved} resolved,
+                                {' '}{fmtR(c.evidenceCohorts.legacy.resolvedOnlyExpectancyR)}, depth {c.evidenceCohorts.legacy.maxOverlapDepth} — excluded
                               </strong>
                             </div>
                           </>
                         )}
-                        <div><span>Independent episodes</span><strong className="tone-warning">{c.independentEpisodes}</strong></div>
-                        <div><span>Rows / episode</span><strong>{c.rowsPerEpisode ?? 'n/a'}</strong></div>
                         <div><span>After-cost expectancy</span>
                           <strong className={c.metrics.netExpectancyR == null ? '' : c.metrics.netExpectancyR > 0 ? 'tone-healthy' : 'tone-critical'}>
                             {fmtR(c.metrics.netExpectancyR)}
