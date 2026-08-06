@@ -16,9 +16,9 @@ const CANDLE_HEADERS = ["open_time", "open", "high", "low", "close", "volume", "
 interface Quote { symbol: string; timestampUs: number; askAmount: number; askPrice: number; bidPrice: number; bidAmount: number; sourceHash: string; }
 interface CandleVolume { symbol: string; closeTimeMs: number; volume: number; sourceHash: string; }
 
-function rows(bytes: Buffer, path: string, headers: readonly string[]): Array<Record<string, string>> {
+function rows(bytes: Buffer, path: string, headers: readonly string[], exactHeaders: boolean): Array<Record<string, string>> {
   const decoded = path.endsWith(".gz") ? gunzipSync(bytes).toString("utf8") : bytes.toString("utf8"); const lines = decoded.trim().split(/\r?\n/); const header = lines.shift()?.split(",") ?? [];
-  if (header.length !== headers.length || header.some((value, index) => value !== headers[index])) throw new Error(`FOUNDRY_TARDIS_OR_BINANCE_HEADERS_INVALID_${path}`);
+  if ((exactHeaders && (header.length !== headers.length || header.some((value, index) => value !== headers[index]))) || (!exactHeaders && headers.some((value) => !header.includes(value)))) throw new Error(`FOUNDRY_TARDIS_OR_BINANCE_HEADERS_INVALID_${path}`);
   return lines.filter(Boolean).map((line) => { const cells = line.split(","); if (cells.length !== header.length) throw new Error(`FOUNDRY_TARDIS_OR_BINANCE_COLUMNS_INVALID_${path}`); return Object.fromEntries(header.map((key, index) => [key, cells[index]! ])); });
 }
 function finite(value: string, field: string, path: string): number { const parsed = Number(value); if (!Number.isFinite(parsed)) throw new Error(`FOUNDRY_TARDIS_OR_BINANCE_VALUE_INVALID_${field}_${path}`); return parsed; }
@@ -39,13 +39,13 @@ export function importLocalTardisQuoteLiquidityArchive(input: {
   for (const file of archiveBundle.files) {
     const content = archiveBundle.contents.get(file.relativePath)!; const quoteSymbol = file.relativePath.match(quotePath)?.[1]; const candleSymbol = file.relativePath.match(candlePath)?.[1];
     if (quoteSymbol) {
-      for (const row of rows(content, file.relativePath, QUOTE_HEADERS)) {
+      for (const row of rows(content, file.relativePath, QUOTE_HEADERS, true)) {
         const symbol = row.symbol!; const timestampUs = safeInteger(row.timestamp!, "QUOTE_TIMESTAMP_US", file.relativePath); const askAmount = finite(row.ask_amount!, "ASK_AMOUNT", file.relativePath); const askPrice = finite(row.ask_price!, "ASK_PRICE", file.relativePath); const bidPrice = finite(row.bid_price!, "BID_PRICE", file.relativePath); const bidAmount = finite(row.bid_amount!, "BID_AMOUNT", file.relativePath);
         if (symbol !== quoteSymbol || symbol !== symbol.toUpperCase() || askAmount < 0 || bidAmount < 0 || askPrice <= 0 || bidPrice <= 0 || askPrice < bidPrice) throw new Error(`FOUNDRY_TARDIS_BBO_INVALID_${file.relativePath}_${timestampUs}`);
         quotes.push({ symbol, timestampUs, askAmount, askPrice, bidPrice, bidAmount, sourceHash: file.fileHash });
       }
     } else if (candleSymbol) {
-      for (const row of rows(content, file.relativePath, CANDLE_HEADERS)) {
+      for (const row of rows(content, file.relativePath, CANDLE_HEADERS, false)) {
         const closeTimeMs = safeInteger(row.close_time!, "CANDLE_CLOSE_TIME_MS", file.relativePath); const volume = finite(row.volume!, "CANDLE_VOLUME", file.relativePath);
         if (volume < 0) throw new Error(`FOUNDRY_TARDIS_CANDLE_VOLUME_INVALID_${file.relativePath}_${closeTimeMs}`);
         candles.push({ symbol: candleSymbol, closeTimeMs, volume, sourceHash: file.fileHash });
