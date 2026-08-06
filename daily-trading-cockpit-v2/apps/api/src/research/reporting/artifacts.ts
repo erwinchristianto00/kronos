@@ -19,10 +19,12 @@ function atomicWrite(path: string, value: unknown): void {
  */
 export function persistTournamentRun(rootDir: string, result: TournamentRunResult): { runDirectory: string; registryHash: string } {
   const next = registryEntry(result.manifest, result.valid);
+  if (!result.episodeLedger || !result.metrics.canonicalEpisodeProvenanceComplete) throw new Error("TOURNAMENT_POST_TRADE_EPISODE_LEDGER_REQUIRED");
   const root = resolve(rootDir); const runDirectory = resolve(root, "runs", result.manifest.runId);
   mkdirSync(runDirectory, { recursive: true });
   atomicWrite(resolve(runDirectory, "manifest.json"), result.manifest);
   atomicWrite(resolve(runDirectory, "trade-ledger.json"), result.trades);
+  atomicWrite(resolve(runDirectory, "episode-ledger.json"), result.episodeLedger);
   atomicWrite(resolve(runDirectory, "nav-ledger.json"), result.navLedger);
   atomicWrite(resolve(runDirectory, "result.json"), { strategyMetrics: result.strategyMetrics, portfolioMetrics: result.portfolioMetrics, warnings: result.warnings, valid: result.valid, invalidReasons: result.invalidReasons });
   const registryPath = resolve(root, "run-registry.json");

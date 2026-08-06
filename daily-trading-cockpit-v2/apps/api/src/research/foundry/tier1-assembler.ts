@@ -12,11 +12,12 @@ import type { ValidatedFoundryRow } from "./semantic-validators.js";
 import { PointInTimeLiquiditySpread, type Tier1LiquiditySpreadPolicy } from "./liquidity-eligibility.js";
 import { verifyArchiveBundle } from "./archive-bundle.js";
 import { runTournamentMatrix, type TournamentMatrixResult } from "../tournament-runner.js";
-import type { FundingSettlement, PointInTimeUniverseSnapshot, TournamentCandle, TournamentExperimentSpec, TournamentResearchMode } from "../tournament-types.js";
+import { canonicalPostTradeEpisodePolicy } from "../post-trade-episodes.js";
+import type { FundingSettlement, PointInTimeUniverseSnapshot, TournamentCandle, TournamentEpisodePolicy, TournamentExperimentSpec, TournamentResearchMode } from "../tournament-types.js";
 import { buyAndHoldStrategy, cashStrategy, donchianStrategy, emaCrossStrategy, equalWeightHoldStrategy, macdStrategy, randomTimingControl, rsiMeanReversionStrategy, type RandomControlReference } from "../strategies/challengers.js";
 
-const REQUIRED = ["COMPLETED_CANDLES", "FUNDING_SETTLEMENTS", "LISTING_DELISTING_TIMELINE", "FUTURES_AVAILABILITY_TIMELINE", "MINIMUM_HISTORY_ELIGIBILITY", "PIT_LIQUIDITY_SPREAD", "CANONICAL_EPISODES", "PORTFOLIO_RISK_SNAPSHOTS"] as const;
-export const TIER1_ASSEMBLY_VERSION = "kronos-tier1-assembly-v1" as const;
+const REQUIRED = ["COMPLETED_CANDLES", "FUNDING_SETTLEMENTS", "LISTING_DELISTING_TIMELINE", "FUTURES_AVAILABILITY_TIMELINE", "MINIMUM_HISTORY_ELIGIBILITY", "PIT_LIQUIDITY_SPREAD", "PORTFOLIO_RISK_SNAPSHOTS"] as const;
+export const TIER1_ASSEMBLY_VERSION = "kronos-tier1-assembly-v2" as const;
 type RequiredKind = typeof REQUIRED[number];
 export interface Tier1LoadedArtifact { manifest: FoundryArtifactManifest; rows: ValidatedFoundryRow[]; }
 const verifiedReloadArtifacts = new WeakSet<Tier1LoadedArtifact>();
@@ -39,7 +40,7 @@ export interface Tier1Assembly {
   canonicalCandles: readonly TournamentCandle[];
   canonicalFundingSettlements: readonly FundingSettlement[];
   fundingScheduleBySymbol: Readonly<Record<string, readonly number[]>>;
-  canonicalEpisodeIdAt: (symbol: string, decisionTimeMs: number) => string | null;
+  postTradeEpisodePolicy: Readonly<TournamentEpisodePolicy>;
   portfolioRisk: PointInTimePortfolioRisk;
   liquidityPolicy: Readonly<Tier1LiquiditySpreadPolicy>;
   archiveBundleIdentities: Readonly<Record<string, unknown>>;
@@ -109,17 +110,14 @@ export function assembleTier1Baseline(input: { artifacts: readonly Tier1LoadedAr
     return { asOfMs, eligibleSymbols, sourceHash: tournamentHash(universeProvenance), universeProvenance, evidence: { listedThen: true as const, sufficientHistoryThen: true as const, liquidityVolumeEligibleThen: true as const, spreadEligibleThen: true as const, futuresAvailableThen: true as const, delistingCheckedThen: true as const } };
   });
   const funding = indexed.get("FUNDING_SETTLEMENTS")!; const fundingScheduleBySymbol = immutableSchedule(funding.rows, input.symbols); const canonicalFundingSettlements = immutable(fundingSettlementsFromRows(funding.rows).map((row) => ({ ...row })));
-  const episodes = indexed.get("CANONICAL_EPISODES")!; const episodeByKey = new Map(episodes.rows.map((row) => [`${row.symbol}:${row.decisionTimeMs}`, row.episodeId as string]));
-  if (input.researchMode === "REAL_TIER1" && !episodes.manifest.canonicalEpisodeCoverage) throw new Error("FOUNDRY_REAL_TIER1_CANONICAL_EPISODE_COVERAGE_MISSING");
-  for (const snapshot of universeSnapshots) for (const symbol of snapshot.eligibleSymbols) if (!episodeByKey.get(`${symbol}:${snapshot.asOfMs}`)) throw new Error(`FOUNDRY_CANONICAL_EPISODE_COVERAGE_MISSING_${symbol}_${snapshot.asOfMs}`);
   const risk = indexed.get("PORTFOLIO_RISK_SNAPSHOTS")!; const candles = indexed.get("COMPLETED_CANDLES")!;
   const canonicalCandles = immutable(candles.rows.map((row) => ({ symbol: row.symbol!, openTimeMs: row.openTimeMs as number, closeTimeMs: row.closeTimeMs as number, open: row.open as number, high: row.high as number, low: row.low as number, close: row.close as number, volume: row.volume as number })));
   const immutableSnapshots = immutable(universeSnapshots.map((snapshot) => structuredClone(snapshot))); const immutablePolicy = immutable({ ...input.liquidityPolicy }); const artifactSemanticHashes = immutable([...capability.artifactSemanticHashes].sort());
   const archiveBundleIdentities = immutable(Object.fromEntries(input.artifacts.map((artifact) => [artifact.manifest.artifactKind, artifact.manifest.archiveBundle ?? null])));
-  const universeSnapshotHash = tournamentHash(immutableSnapshots); const fundingScheduleIdentity = tournamentHash(fundingScheduleBySymbol); const episodePolicyHash = tournamentHash(episodes.manifest.canonicalEpisodeCoverage ?? episodes.manifest.semanticManifestHash); const portfolioRiskIdentity = risk.manifest.semanticManifestHash; const liquidityPolicyHash = tournamentHash(immutablePolicy);
+  const universeSnapshotHash = tournamentHash(immutableSnapshots); const fundingScheduleIdentity = tournamentHash(fundingScheduleBySymbol); const postTradeEpisodePolicy = immutable(canonicalPostTradeEpisodePolicy(input.timeframeMs)); const episodePolicyHash = tournamentHash(postTradeEpisodePolicy); const portfolioRiskIdentity = risk.manifest.semanticManifestHash; const liquidityPolicyHash = tournamentHash(immutablePolicy);
   const bindingCore = { assemblyVersion: TIER1_ASSEMBLY_VERSION, artifactSemanticHashes, universeSnapshotHash, liquidityPolicyHash, fundingScheduleIdentity, episodePolicyHash, portfolioRiskIdentity };
   const tier1AssemblyHash = tournamentHash({ ...bindingCore, range: { startMs: input.startMs, endMs: input.endMs }, timeframeMs: input.timeframeMs, archiveBundleIdentities }); const binding = immutable({ ...bindingCore, tier1AssemblyHash });
-  const assembly = immutable({ label, researchMode: input.researchMode ?? "FIXTURE_SMOKE", assemblyVersion: TIER1_ASSEMBLY_VERSION, tier1AssemblyHash, binding, capability, universe: new PointInTimeUniverse(immutableSnapshots.map((snapshot) => structuredClone(snapshot))), universeSnapshots: immutableSnapshots, canonicalCandles, canonicalFundingSettlements, fundingScheduleBySymbol, canonicalEpisodeIdAt: (symbol: string, decisionTimeMs: number) => episodeByKey.get(`${symbol}:${decisionTimeMs}`) ?? null, portfolioRisk: new PointInTimePortfolioRisk(riskSnapshotsFromArtifactRows(risk.rows, input.symbols)), liquidityPolicy: immutablePolicy, archiveBundleIdentities, artifactSemanticHashes, range: immutable({ startMs: input.startMs, endMs: input.endMs }), timeframeMs: input.timeframeMs });
+  const assembly = immutable({ label, researchMode: input.researchMode ?? "FIXTURE_SMOKE", assemblyVersion: TIER1_ASSEMBLY_VERSION, tier1AssemblyHash, binding, capability, universe: new PointInTimeUniverse(immutableSnapshots.map((snapshot) => structuredClone(snapshot))), universeSnapshots: immutableSnapshots, canonicalCandles, canonicalFundingSettlements, fundingScheduleBySymbol, postTradeEpisodePolicy, portfolioRisk: new PointInTimePortfolioRisk(riskSnapshotsFromArtifactRows(risk.rows, input.symbols)), liquidityPolicy: immutablePolicy, archiveBundleIdentities, artifactSemanticHashes, range: immutable({ startMs: input.startMs, endMs: input.endMs }), timeframeMs: input.timeframeMs });
   if (input.researchMode === "REAL_TIER1") {
     verifiedRealAssemblies.add(assembly);
     verifiedRealAssemblyInputs.set(assembly, {
@@ -180,7 +178,7 @@ export function runTier1BaselineSmoke(input: {
   assertTier1AssemblyCanRun(input.assembly);
   if (input.spec.capabilityTier !== "TIER_1_BASELINE" || input.spec.researchMode !== "FIXTURE_SMOKE") throw new Error("FOUNDRY_TIER1_SMOKE_FIXTURE_MODE_REQUIRED");
   const strategies = [cashStrategy(), buyAndHoldStrategy(), equalWeightHoldStrategy(), donchianStrategy(), macdStrategy(), emaCrossStrategy(), rsiMeanReversionStrategy(), randomTimingControl({ reference: input.randomReference, eligibleEntryTimesBySymbol: input.eligibleEntryTimesBySymbol, seed: input.spec.randomSeed })];
-  const result = runTournamentMatrix({ spec: input.spec, strategies, createdAtMs: input.createdAtMs, modes: ["CONSERVATIVE"], execution: { candles: input.candles, universe: input.assembly.universe, portfolioRisk: input.assembly.portfolioRisk, canonicalEpisodeIdAt: input.assembly.canonicalEpisodeIdAt, fundingSettlements: fundingSettlementsFromRows(input.fundingRows), fundingSettlementScheduleBySymbol: scheduleMap(input.assembly.fundingScheduleBySymbol) } });
+  const result = runTournamentMatrix({ spec: input.spec, strategies, createdAtMs: input.createdAtMs, modes: ["CONSERVATIVE"], postTradeEpisodePolicy: input.assembly.postTradeEpisodePolicy, execution: { candles: input.candles, universe: input.assembly.universe, portfolioRisk: input.assembly.portfolioRisk, fundingSettlements: fundingSettlementsFromRows(input.fundingRows), fundingSettlementScheduleBySymbol: scheduleMap(input.assembly.fundingScheduleBySymbol) } });
   if (result.runs.some((run) => run.manifest.strategyId === "KRONOS_CURRENT")) throw new Error("FOUNDRY_TIER1_SMOKE_KRONOS_FORBIDDEN");
   return { label: input.assembly.label, result };
 }
@@ -195,8 +193,8 @@ export function runRealTier1Conservative(input: { assembly: Tier1Assembly; spec:
   const random = canonicalRandomControl(input.assembly, input.spec.randomSeed); if (input.spec.parameters.tier1RandomControlIdentity !== undefined && input.spec.parameters.tier1RandomControlIdentity !== random.identity) throw new Error("FOUNDRY_REAL_TIER1_RANDOM_CONTROL_IDENTITY_MISMATCH");
   const bound = bindRealTier1ExperimentSpec(input.assembly, input.spec); const spec = { ...bound, parameters: { ...bound.parameters, tier1AssemblyHash: input.assembly.tier1AssemblyHash, tier1RandomControlIdentity: random.identity, tier1RandomControlPolicyVersion: "tier1-random-control-from-donchian-v1" } };
   const strategies = [cashStrategy(), buyAndHoldStrategy(), equalWeightHoldStrategy(), donchianStrategy(), macdStrategy(), emaCrossStrategy(), rsiMeanReversionStrategy(), randomTimingControl({ reference: random.reference, eligibleEntryTimesBySymbol: random.eligibleEntryTimesBySymbol, seed: spec.randomSeed })];
-  const result = runTournamentMatrix({ spec, strategies, createdAtMs: input.createdAtMs, modes: ["CONSERVATIVE"], execution: { candles: input.assembly.canonicalCandles, universe: input.assembly.universe, portfolioRisk: input.assembly.portfolioRisk, canonicalEpisodeIdAt: input.assembly.canonicalEpisodeIdAt, fundingSettlements: input.assembly.canonicalFundingSettlements, fundingSettlementScheduleBySymbol: scheduleMap(input.assembly.fundingScheduleBySymbol) } });
+  const result = runTournamentMatrix({ spec, strategies, createdAtMs: input.createdAtMs, modes: ["CONSERVATIVE"], postTradeEpisodePolicy: input.assembly.postTradeEpisodePolicy, execution: { candles: input.assembly.canonicalCandles, universe: input.assembly.universe, portfolioRisk: input.assembly.portfolioRisk, fundingSettlements: input.assembly.canonicalFundingSettlements, fundingSettlementScheduleBySymbol: scheduleMap(input.assembly.fundingScheduleBySymbol) } });
   if (result.runs.some((run) => run.manifest.strategyId === "KRONOS_CURRENT" || run.manifest.executionMode !== "CONSERVATIVE")) throw new Error("FOUNDRY_REAL_TIER1_BASELINE_CONTRACT_BREACH");
-  if (result.runs.some((run) => !run.valid || run.terminalOpenPositions.length)) throw new Error("FOUNDRY_REAL_TIER1_EMPIRICAL_GATE_INVALID_RUN");
+  if (result.runs.some((run) => !run.valid || run.terminalOpenPositions.length || !run.episodeLedger || !run.metrics.canonicalEpisodeProvenanceComplete)) throw new Error("FOUNDRY_REAL_TIER1_EMPIRICAL_GATE_INVALID_RUN");
   return { label: input.assembly.label, result: { ...result, runs: result.runs.map((run) => ({ ...run, manifest: { ...run.manifest, empiricalGatePassed: true } })) } };
 }

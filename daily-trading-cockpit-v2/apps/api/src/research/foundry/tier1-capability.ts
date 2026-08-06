@@ -1,6 +1,6 @@
 import { assertCompleteFoundryArtifact, type FoundryArtifactManifest } from "./artifact-schema.js";
 
-const TIER_1_REQUIRED = ["COMPLETED_CANDLES", "FUNDING_SETTLEMENTS", "LISTING_DELISTING_TIMELINE", "FUTURES_AVAILABILITY_TIMELINE", "MINIMUM_HISTORY_ELIGIBILITY", "PIT_LIQUIDITY_SPREAD", "CANONICAL_EPISODES", "PORTFOLIO_RISK_SNAPSHOTS"] as const;
+const TIER_1_REQUIRED = ["COMPLETED_CANDLES", "FUNDING_SETTLEMENTS", "LISTING_DELISTING_TIMELINE", "FUTURES_AVAILABILITY_TIMELINE", "MINIMUM_HISTORY_ELIGIBILITY", "PIT_LIQUIDITY_SPREAD", "PORTFOLIO_RISK_SNAPSHOTS"] as const;
 
 export interface Tier1CapabilityReport { tier: "TIER_1_BASELINE"; canRun: boolean; supportedArtifacts: string[]; blockers: string[]; artifactSemanticHashes: string[]; }
 

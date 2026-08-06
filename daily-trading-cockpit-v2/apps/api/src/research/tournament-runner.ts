@@ -4,6 +4,8 @@ import type { TournamentCandle, TournamentExecutionMode, TournamentExperimentSpe
 import type { TournamentStrategy } from "./strategies/challengers.js";
 import { assertNoValidationLeakage, buildWalkForwardPlan, type WalkForwardFold } from "./validation/walk-forward.js";
 import { assessCostSensitivity, summarizeOosWindows, type CostSensitivityFinding, type OosSummary } from "./reporting/oos.js";
+import { attachCanonicalPostTradeEpisodes, canonicalPostTradeEpisodePolicy } from "./post-trade-episodes.js";
+import type { TournamentEpisodePolicy } from "./tournament-types.js";
 
 export interface TournamentMatrixInput {
   spec: TournamentExperimentSpec;
@@ -12,6 +14,8 @@ export interface TournamentMatrixInput {
   /** Explicitly supplied archival timestamp; never obtain wall-clock state. */
   createdAtMs: number;
   modes?: readonly TournamentExecutionMode[];
+  /** Bound by Tier1Assembly for empirical runs; generic research gets the canonical timeframe policy. */
+  postTradeEpisodePolicy?: TournamentEpisodePolicy;
 }
 
 export interface TournamentMatrixResult {
@@ -50,7 +54,8 @@ export function runTournamentMatrix(input: TournamentMatrixInput): TournamentMat
       runs.push(runTournament({ ...input.execution, candles, manifest, strategy }));
     }
   }
-  return { fairnessHashByMode, runs, costSensitivity: assessCostSensitivity(runs) };
+  const episodeRuns = attachCanonicalPostTradeEpisodes({ runs, policy: input.postTradeEpisodePolicy ?? canonicalPostTradeEpisodePolicy(input.spec.dataset.timeframeMs) });
+  return { fairnessHashByMode, runs: episodeRuns, costSensitivity: assessCostSensitivity(episodeRuns) };
 }
 
 export interface WalkForwardTournamentInput {
@@ -66,6 +71,7 @@ export interface WalkForwardTournamentInput {
   execution: Omit<TournamentExecutionInput, "manifest" | "strategy" | "candles">;
   createdAtMs: number;
   executionMode: Exclude<TournamentExecutionMode, "OPTIMISTIC">;
+  postTradeEpisodePolicy?: TournamentEpisodePolicy;
 }
 
 export interface WalkForwardTournamentResult {
@@ -91,7 +97,9 @@ export function runWalkForwardTournament(input: WalkForwardTournamentInput): Wal
       parameterSet: selection.parameters,
       createdAtMs: input.createdAtMs,
     });
-    results.push({ foldId: fold.foldId, strategyId: strategy.id, parameters: selection.parameters, inSampleExpectancyAfterCost: selection.inSampleExpectancyAfterCost, result: runTournament({ ...input.execution, candles: input.candles.filter((candle) => testTimes.has(candle.openTimeMs)), manifest, strategy }) });
+    const raw = runTournament({ ...input.execution, candles: input.candles.filter((candle) => testTimes.has(candle.openTimeMs)), manifest, strategy });
+    const [result] = attachCanonicalPostTradeEpisodes({ runs: [raw], policy: input.postTradeEpisodePolicy ?? canonicalPostTradeEpisodePolicy(input.spec.dataset.timeframeMs) });
+    results.push({ foldId: fold.foldId, strategyId: strategy.id, parameters: selection.parameters, inSampleExpectancyAfterCost: selection.inSampleExpectancyAfterCost, result: result! });
   }
   return { folds: results, oosSummary: summarizeOosWindows(results.map((fold) => ({ foldId: fold.foldId, inSampleExpectancyAfterCost: fold.inSampleExpectancyAfterCost, result: fold.result }))) };
 }

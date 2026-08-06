@@ -23,8 +23,6 @@ export interface TournamentExecutionInput {
   candles: readonly TournamentCandle[];
   universe: PointInTimeUniverse;
   validatedAbsences?: readonly ValidatedAbsence[];
-  /** Canonical persisted event ID. Missing provenance invalidates the run. */
-  canonicalEpisodeIdAt?: (symbol: string, decisionTimeMs: number) => string | null;
   portfolioRisk: PointInTimePortfolioRisk;
   /** Actual exchange settlement times/rates, never an exit-time extrapolation. */
   fundingSettlements?: readonly FundingSettlement[];
@@ -154,12 +152,10 @@ export function runTournament(input: TournamentExecutionInput): TournamentRunRes
   };
   const close = (position: OpenPosition, candle: TournamentCandle, exitRaw: number, reason: TournamentTrade["exitReason"]): boolean => {
     if (!accrueFundingThrough(position, candle.closeTimeMs)) return false;
-    const episode = input.canonicalEpisodeIdAt?.(position.intent.symbol, position.intent.decisionTimeMs) ?? null;
-    if (!episode) warnings.push(`TOURNAMENT_CANONICAL_EPISODE_MISSING_${position.intent.symbol}_${position.intent.decisionTimeMs}`);
     const exitCosts = fillCosts(position.intent.symbol, candle.closeTimeMs, position.intent.side, position.notional); const exitPrice = adversePrice(exitRaw, position.intent.side, false, exitCosts.slipBps);
     const gross = (exitPrice - position.entryPrice) * position.quantity * sideSign(position.intent.side); const exitFee = position.notional * bps(exitCosts.feeBps); const fee = position.entryFee + exitFee;
     const net = gross - fee - position.entrySlippage - Math.abs(exitPrice - exitRaw) * position.quantity - position.fundingCost; cash += net;
-    trades.push({ tradeId: `${position.intent.strategyId}:${position.intent.symbol}:${position.entryTimeMs}:${trades.length}`, strategyId: position.intent.strategyId, symbol: position.intent.symbol, side: position.intent.side, entryTimeMs: position.entryTimeMs, exitTimeMs: candle.closeTimeMs, entryPrice: position.entryPrice, exitPrice, quantity: position.quantity, notionalAtEntry: position.notional, grossPnl: gross, feeCost: fee, slippageCost: position.entrySlippage + Math.abs(exitPrice - exitRaw) * position.quantity, fundingCost: position.fundingCost, netPnl: net, exitReason: reason, holdingBars: Math.max(1, indexBySymbol.get(position.intent.symbol)! - position.entryIndex), marketEpisodeId: episode ?? "UNPROVEN", regime: typeof position.intent.metadata.regime === "string" ? position.intent.metadata.regime : null });
+    trades.push({ tradeId: `${position.intent.strategyId}:${position.intent.symbol}:${position.entryTimeMs}:${trades.length}`, strategyId: position.intent.strategyId, symbol: position.intent.symbol, side: position.intent.side, decisionTimeMs: position.intent.decisionTimeMs, entryTimeMs: position.entryTimeMs, exitTimeMs: candle.closeTimeMs, entryPrice: position.entryPrice, exitPrice, quantity: position.quantity, notionalAtEntry: position.notional, grossPnl: gross, feeCost: fee, slippageCost: position.entrySlippage + Math.abs(exitPrice - exitRaw) * position.quantity, fundingCost: position.fundingCost, netPnl: net, exitReason: reason, holdingBars: Math.max(1, indexBySymbol.get(position.intent.symbol)! - position.entryIndex), canonicalCycleId: position.intent.canonicalCycleId ?? null, canonicalCycleSourceHash: position.intent.canonicalCycleSourceHash ?? null, persistedMarketCauseId: position.intent.persistedMarketCauseId ?? null, persistedMarketCauseSourceHash: position.intent.persistedMarketCauseSourceHash ?? null, marketEpisodeId: "POST_TRADE_PENDING", regime: typeof position.intent.metadata.regime === "string" ? position.intent.metadata.regime : null });
     return true;
   };
   const recordNav = (time: number, frame: Map<string, TournamentCandle>): void => {
@@ -226,6 +222,8 @@ export function runTournament(input: TournamentExecutionInput): TournamentRunRes
   const terminalUnrealizedPnl = terminalOpenPositions.reduce((sum, position) => sum + position.unrealizedPnl, 0);
   if (terminalOpenPositions.length && Math.abs((navLedger.at(-1)?.unrealizedPnl ?? 0) - terminalUnrealizedPnl) > 1e-8) invalidReasons.push("TERMINAL_POSITION_LEDGER_RECONCILIATION_FAILED");
   if (manifest.executionMode === "OPTIMISTIC") warnings.push("OPTIMISTIC_DIAGNOSTIC_ONLY");
-  const strategyMetrics = calculateMetrics(trades, navLedger, spec.portfolio.startingCapital, trades.every((trade) => trade.marketEpisodeId !== "UNPROVEN"), terminalOpenPositions.length === 0);
+  // The canonical episode ledger is deliberately attached by tournament-runner
+  // after every strategy has emitted and completed its immutable trades.
+  const strategyMetrics = calculateMetrics(trades, navLedger, spec.portfolio.startingCapital, false, terminalOpenPositions.length === 0);
   return { manifest, navLedger, strategyMetrics, portfolioMetrics, metrics: strategyMetrics, trades, terminalOpenPositions, warnings, valid: invalidReasons.length === 0, invalidReasons };
 }

@@ -170,6 +170,12 @@ export interface TournamentIntent {
   exitTemplate: string;
   score: number;
   metadata: Record<string, string | number | boolean | null>;
+  /** Source-backed canonical scan/cycle identity when an upstream source supplies one. */
+  canonicalCycleId?: string | null;
+  canonicalCycleSourceHash?: string | null;
+  /** Source-backed market cause when available; it may merge, never split, time-chain episodes. */
+  persistedMarketCauseId?: string | null;
+  persistedMarketCauseSourceHash?: string | null;
 }
 
 export interface TournamentTrade {
@@ -190,8 +196,41 @@ export interface TournamentTrade {
   netPnl: number;
   exitReason: TournamentExitReason;
   holdingBars: number;
+  /** Actual completed-bar decision used by post-trade canonical clustering. */
+  decisionTimeMs: number;
+  canonicalCycleId: string | null;
+  canonicalCycleSourceHash: string | null;
+  persistedMarketCauseId: string | null;
+  persistedMarketCauseSourceHash: string | null;
   marketEpisodeId: string;
   regime: string | null;
+}
+
+export interface TournamentEpisodePolicy {
+  algorithm: "KRONOS_EPISODE_ACCUMULATOR_V1";
+  algorithmVersion: string;
+  policyVersion: string;
+  blockWidthMs: number;
+}
+
+/** Immutable association between one completed trade and a canonical episode. */
+export interface TournamentEpisodeAssignment {
+  tradeId: string;
+  episodeId: string;
+  decisionTimeMs: number;
+  entryTimeMs: number;
+  canonicalCycleId: string | null;
+  canonicalCycleSourceHash: string | null;
+  persistedMarketCauseId: string | null;
+  persistedMarketCauseSourceHash: string | null;
+}
+
+/** Persisted post-trade proof that reuses the existing Kronos accumulator. */
+export interface TournamentEpisodeLedger {
+  policy: TournamentEpisodePolicy;
+  inputHash: string;
+  outputHash: string;
+  assignments: readonly TournamentEpisodeAssignment[];
 }
 
 export interface TournamentNavPoint {
@@ -292,6 +331,8 @@ export interface TournamentRunResult {
   metrics: TournamentMetrics;
   navLedger: TournamentNavPoint[];
   trades: TournamentTrade[];
+  /** Null only before the runner completes canonical post-trade assignment. */
+  episodeLedger?: TournamentEpisodeLedger;
   terminalOpenPositions: TournamentTerminalOpenPosition[];
   warnings: string[];
   valid: boolean;

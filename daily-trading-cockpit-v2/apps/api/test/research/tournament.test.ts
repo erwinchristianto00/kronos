@@ -36,8 +36,7 @@ function spec(endMs = 4 * H): TournamentExperimentSpec {
 }
 
 const portfolioRisk = new PointInTimePortfolioRisk([{ asOfMs: 0, validUntilMs: 100 * H, sourceHash: "risk", btcBetaBySymbol: { BTCUSDT: 1, ETHUSDT: 0.8 }, correlationClusterBySymbol: { BTCUSDT: "BTC", ETHUSDT: "BTC" } }]);
-const canonicalEpisode = (symbol: string, time: number): string => `${symbol}:${Math.floor(time / H)}`;
-function executionBase() { return { portfolioRisk, canonicalEpisodeIdAt: canonicalEpisode }; }
+function executionBase() { return { portfolioRisk }; }
 
 function candle(index: number, values: Partial<Pick<TournamentCandle, "open" | "high" | "low" | "close">> = {}): TournamentCandle {
   const open = values.open ?? 100;

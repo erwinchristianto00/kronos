@@ -7,8 +7,8 @@ path from the runtime server or execution engines.
 
 | Tier | Required Foundry inputs | Allowed claim |
 |---|---|---|
-| `TIER_1_BASELINE` | candles, PIT universe, actual funding settlements, canonical episodes, PIT portfolio risk | conservative simple-baseline comparison only |
-| `TIER_2_EXPECTED_EXECUTION` | Tier 1 plus PIT liquidity/spread and fee artifacts | execution-sensitivity results for simple strategies |
+| `TIER_1_BASELINE` | candles, PIT universe, actual funding settlements, PIT liquidity/spread, PIT portfolio risk, post-trade canonical episode ledger | conservative simple-baseline comparison only |
+| `TIER_2_EXPECTED_EXECUTION` | Tier 1 plus PIT fee artifacts | execution-sensitivity results for simple strategies |
 | `TIER_3_EXACT_KRONOS` | Tier 2 plus frozen Kronos decision ledger | exact Kronos incremental-value comparison and ablations |
 
 Tier 1 accepts only Conservative execution. Current Kronos cannot be run below

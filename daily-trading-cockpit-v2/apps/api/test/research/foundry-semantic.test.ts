@@ -67,7 +67,7 @@ describe("Foundry semantic strictness", () => {
       expect(first.manifest.rowsHash).toBe(second.manifest.rowsHash); expect(first.manifest.semanticManifestHash).toBe(second.manifest.semanticManifestHash);
       expect(JSON.stringify(first.rows)).toBe(JSON.stringify(second.rows)); expect(JSON.stringify(first.manifest)).toBe(JSON.stringify(second.manifest));
       expect(persistFoundryArtifact({ rootDir: root, manifest: first.manifest, rows: first.rows })).toContain(first.manifest.semanticManifestHash);
-      expect(buildTier1CapabilityReport([first.manifest])).toMatchObject({ canRun: false, blockers: expect.arrayContaining(["MISSING_ARTIFACT:FUNDING_SETTLEMENTS", "MISSING_ARTIFACT:CANONICAL_EPISODES"]) });
+      expect(buildTier1CapabilityReport([first.manifest])).toMatchObject({ canRun: false, blockers: expect.arrayContaining(["MISSING_ARTIFACT:FUNDING_SETTLEMENTS", "MISSING_ARTIFACT:PIT_LIQUIDITY_SPREAD"]) });
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 });

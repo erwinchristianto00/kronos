@@ -35,9 +35,9 @@ const holdStrategy = (id: "BTC_BUY_AND_HOLD" | "EQUAL_WEIGHT_HOLD" = "BTC_BUY_AN
 });
 
 function risk(snapshots = [{ asOfMs: 0, validUntilMs: 10 * H, sourceHash: "risk", btcBetaBySymbol: { BTCUSDT: 1, ETHUSDT: 0 }, correlationClusterBySymbol: { BTCUSDT: "BTC", ETHUSDT: "ETH" } }]) { return new PointInTimePortfolioRisk(snapshots); }
-function run(input: { strategy?: TournamentStrategy; candles?: TournamentCandle[]; experiment?: TournamentExperimentSpec; portfolioRisk?: PointInTimePortfolioRisk; episode?: ((symbol: string, time: number) => string | null) | undefined; fundingSettlements?: Parameters<typeof runTournament>[0]["fundingSettlements"]; fundingSettlementScheduleBySymbol?: Parameters<typeof runTournament>[0]["fundingSettlementScheduleBySymbol"]; absences?: readonly ValidatedAbsence[] }) {
+function run(input: { strategy?: TournamentStrategy; candles?: TournamentCandle[]; experiment?: TournamentExperimentSpec; portfolioRisk?: PointInTimePortfolioRisk; fundingSettlements?: Parameters<typeof runTournament>[0]["fundingSettlements"]; fundingSettlementScheduleBySymbol?: Parameters<typeof runTournament>[0]["fundingSettlementScheduleBySymbol"]; absences?: readonly ValidatedAbsence[] }) {
   const experiment = input.experiment ?? spec(); const strategy = input.strategy ?? holdStrategy(); const rows = input.candles ?? candles(); const eligibleSymbols = [...new Set(rows.map((row) => row.symbol))];
-  return runTournament({ manifest: buildRunManifest({ spec: experiment, strategyId: strategy.id, executionMode: "CONSERVATIVE", parameterSet: {}, createdAtMs: 0 }), strategy, candles: rows, universe: new PointInTimeUniverse([{ ...universeSnapshot, eligibleSymbols }]), portfolioRisk: input.portfolioRisk ?? risk(), canonicalEpisodeIdAt: input.episode ?? ((symbol, time) => `${symbol}:${time}`), fundingSettlements: input.fundingSettlements, fundingSettlementScheduleBySymbol: input.fundingSettlementScheduleBySymbol, validatedAbsences: input.absences });
+  return runTournament({ manifest: buildRunManifest({ spec: experiment, strategyId: strategy.id, executionMode: "CONSERVATIVE", parameterSet: {}, createdAtMs: 0 }), strategy, candles: rows, universe: new PointInTimeUniverse([{ ...universeSnapshot, eligibleSymbols }]), portfolioRisk: input.portfolioRisk ?? risk(), fundingSettlements: input.fundingSettlements, fundingSettlementScheduleBySymbol: input.fundingSettlementScheduleBySymbol, validatedAbsences: input.absences });
 }
 
 describe("Dataset Foundry and methodology hardening", () => {
@@ -76,12 +76,12 @@ describe("Dataset Foundry and methodology hardening", () => {
     expect(hardGate(result.metrics, { minIndependentEpisodes: 0, minProfitFactor: 0, maxDrawdown: 1, minProfitableAssetRatio: 0, conservativePass: true, stablePlateau: true, sealedHoldoutPass: true, maxTopSymbolNetPnlShare: 1, maxTopRegimeNetPnlShare: 1, maxTopYearNetPnlShare: 1 }).failures).toContain("TERMINAL_POSITION_UNRESOLVED");
   });
 
-  it("fails episode-dependent gates closed without canonical provenance instead of calendar buckets", () => {
-    const result = run({ episode: () => null });
+  it("leaves direct execution provisional until the canonical post-trade ledger is attached", () => {
+    const result = run({});
     expect(result.valid).toBe(true);
     expect(result.metrics.canonicalEpisodeProvenanceComplete).toBe(false);
     expect(result.metrics.independentEpisodes).toBe(0);
-    expect(result.trades[0]!.marketEpisodeId).toBe("UNPROVEN");
+    expect(result.trades[0]!.marketEpisodeId).toBe("POST_TRADE_PENDING");
     expect(hardGate(result.metrics, { minIndependentEpisodes: 1, minProfitFactor: 0, maxDrawdown: 1, minProfitableAssetRatio: 0, conservativePass: true, stablePlateau: true, sealedHoldoutPass: true, maxTopSymbolNetPnlShare: 1, maxTopRegimeNetPnlShare: 1, maxTopYearNetPnlShare: 1 }).failures).toContain("CANONICAL_EPISODE_PROVENANCE_MISSING");
   });
 
