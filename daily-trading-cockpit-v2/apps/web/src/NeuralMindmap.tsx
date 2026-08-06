@@ -1183,7 +1183,7 @@ interface LiveEdgeDiscoveryCandidate {
   };
   evidenceCohorts: {
     policyVersion: number;
-    v1Rows: number; v2Rows: number; maxOverlapDepth: number;
+    v1Rows: number; v2Rows: number; maxOverlapDepth: number; maxOverlapDepthV2: number;
     census: {
       raw: number; open: number; resolved: number; matured: number;
       maturedPendingResolution: number; judgeable: number;
@@ -1265,7 +1265,8 @@ interface LiveEdgeDiscoveryReport {
   collection: {
     policyVersion: number; cutoverAt: string | null;
     v1Rows: number; v2Rows: number; maturedRows: number; judgeableRows: number; openRows: number;
-    resolvedFraction: number | null; maxOverlapDepth: number; earliestNextMaturityAt: string | null;
+    resolvedFraction: number | null; maxOverlapDepth: number; maxOverlapDepthV2: number;
+    earliestNextMaturityAt: string | null;
     suppressed: { reason: string; count: number }[];
     note: string;
   };
@@ -2144,9 +2145,9 @@ export default function NeuralMindmap() {
                         ? 'n/a'
                         : `${(edgeDiscovery.collection.resolvedFraction * 100).toFixed(1)}%`}</strong>
                     </div>
-                    <div><span>Max overlap depth</span>
-                      <strong className={edgeDiscovery.collection.maxOverlapDepth === 0 ? 'tone-healthy' : 'tone-warning'}>
-                        {edgeDiscovery.collection.maxOverlapDepth}
+                    <div><span>Overlap depth v2 / all-time</span>
+                      <strong className={edgeDiscovery.collection.maxOverlapDepthV2 === 0 ? 'tone-healthy' : 'tone-critical'}>
+                        {edgeDiscovery.collection.maxOverlapDepthV2} / {edgeDiscovery.collection.maxOverlapDepth}
                       </strong>
                     </div>
                     <div><span>Next horizon completes</span>
@@ -2237,9 +2238,9 @@ export default function NeuralMindmap() {
                             </div>
                             <div><span>Matured episodes</span><strong>{c.evidenceCohorts.matured.episodes}</strong></div>
                             <div><span>Rows v1 / v2</span><strong>{c.evidenceCohorts.v1Rows} / {c.evidenceCohorts.v2Rows}</strong></div>
-                            <div><span>Max overlap depth</span>
-                              <strong className={c.evidenceCohorts.maxOverlapDepth === 0 ? 'tone-healthy' : 'tone-warning'}>
-                                {c.evidenceCohorts.maxOverlapDepth}
+                            <div><span>Overlap depth v2 / all-time</span>
+                              <strong className={c.evidenceCohorts.maxOverlapDepthV2 === 0 ? 'tone-healthy' : 'tone-critical'}>
+                                {c.evidenceCohorts.maxOverlapDepthV2} / {c.evidenceCohorts.maxOverlapDepth}
                               </strong>
                             </div>
                             <div><span>Resolved-only (CENSORED)</span>

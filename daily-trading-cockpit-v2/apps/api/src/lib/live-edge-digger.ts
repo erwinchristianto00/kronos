@@ -648,8 +648,12 @@ export interface EvidenceCohorts {
   readonly v1Rows: number;
   readonly v2Rows: number;
   readonly census: MaturityCensus;
-  /** Deepest concurrent overlap seen for this candidate — 0 under a correctly working policy v2. */
+  /** Deepest concurrent overlap across ALL rows, including the pre-v2 era. Stays high forever
+   *  because v1 evidence is never rewritten — it is history, not a live measurement. */
   readonly maxOverlapDepth: number;
+  /** Deepest concurrent overlap among POLICY-V2 rows only. This is the one that measures whether
+   *  the collection fix is working, and it must be 0. */
+  readonly maxOverlapDepthV2: number;
   /**
    * Expectancy over ALL resolved rows regardless of maturity or policy. DIAGNOSTIC ONLY. It is
    * censored by construction and must never satisfy, reject, rank, recommend or promote.
@@ -740,6 +744,7 @@ function buildEvidenceCohorts(rows: readonly ShadowObservation[], nowMs: number)
     v2Rows: rows.filter(isPolicyV2).length,
     census,
     maxOverlapDepth: maxOverlapDepth(rows, nowMs),
+    maxOverlapDepthV2: maxOverlapDepth(rows.filter(isPolicyV2), nowMs),
     provisionalResolvedOnly: {
       rows: resolvedAll.length,
       netExpectancyR: candidateMetrics(resolvedAll).netExpectancyR,
@@ -1208,6 +1213,8 @@ export interface LiveEdgeDiggerReport {
     readonly openRows: number;
     readonly resolvedFraction: number | null;
     readonly maxOverlapDepth: number;
+    /** Policy-v2 rows only — must be 0. The all-rows figure above keeps the v1 history. */
+    readonly maxOverlapDepthV2: number;
     readonly earliestNextMaturityAt: string | null;
     readonly suppressed: readonly { reason: string; count: number }[];
     readonly note: string;
@@ -1318,6 +1325,7 @@ export function buildLiveEdgeDiggerReport(input: {
     openRows: bookCensus.open,
     resolvedFraction: bookCensus.resolvedFraction,
     maxOverlapDepth: maxOverlapDepth(allRows, nowMs),
+    maxOverlapDepthV2: maxOverlapDepth(allRows.filter(isPolicyV2), nowMs),
     earliestNextMaturityAt: bookCensus.earliestNextMaturityAt,
     suppressed: [...suppressedCounts.entries()]
       .map(([reason, count]) => ({ reason, count }))

@@ -1306,6 +1306,8 @@ describe("live-edge-digger", () => {
       );
       expect(report.evidenceCohorts.v1Rows).toBe(4);
       expect(report.evidenceCohorts.v2Rows).toBe(0);
+      // The v2-only depth is what proves the collection fix; the all-rows figure keeps v1 history.
+      expect(report.evidenceCohorts.maxOverlapDepthV2).toBe(0);
       expect(report.evidenceCohorts.provisionalResolvedOnly.rows).toBe(4); // visible
       expect(report.evidenceCohorts.matured.rows).toBe(0);                 // but never judged
       expect(report.metrics.netExpectancyR).toBeNull();
