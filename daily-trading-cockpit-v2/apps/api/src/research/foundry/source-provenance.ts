@@ -1,4 +1,4 @@
-export type FoundryProvenanceType = "EXCHANGE_HISTORICAL_EXPORT" | "KRONOS_CANONICAL_LEDGER" | "DERIVED_FROM_FOUNDRY_ARTIFACTS" | "FIXTURE";
+export type FoundryProvenanceType = "EXCHANGE_HISTORICAL_EXPORT" | "KRONOS_CANONICAL_LEDGER" | "DERIVED_FROM_FOUNDRY_ARTIFACTS" | "FIXTURE" | "SYNTHETIC";
 
 /** Immutable origin metadata bound into every Foundry semantic identity. */
 export interface FoundrySourceProvenance {

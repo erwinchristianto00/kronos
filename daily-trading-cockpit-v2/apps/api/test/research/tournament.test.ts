@@ -125,7 +125,7 @@ describe("Kronos Research Tournament v1 contract", () => {
   it("runs every matrix contender against one shared contract and persists an append-only artifact registry", () => {
     const strategy: TournamentStrategy = { id: "CASH", version: "fixture", parameters: {}, onCompletedBar: () => [] };
     const matrix = runTournamentMatrix({
-      spec: { ...spec(2 * H), researchMode: "REAL_TIER1" }, strategies: [strategy], createdAtMs: 0, modes: ["CONSERVATIVE", "EXPECTED"],
+      spec: spec(2 * H), strategies: [strategy], createdAtMs: 0, modes: ["CONSERVATIVE", "EXPECTED"],
       execution: { universe: new PointInTimeUniverse([snapshot]), candles: [candle(0), candle(1)], expectedFeeBpsAt: () => 1, expectedSlippageBpsAt: () => 2, ...executionBase() },
     });
     expect(matrix.runs).toHaveLength(2);
@@ -135,11 +135,7 @@ describe("Kronos Research Tournament v1 contract", () => {
     expect(matrix.fairnessHashByMode.get("CONSERVATIVE")).not.toBe(matrix.fairnessHashByMode.get("EXPECTED"));
     const root = mkdtempSync(join(tmpdir(), "krtv1-"));
     try {
-      const first = persistTournamentRun(root, matrix.runs[0]!);
-      const second = persistTournamentRun(root, matrix.runs[0]!);
-      expect(second.registryHash).toBe(first.registryHash);
-      expect(JSON.parse(readFileSync(join(root, "run-registry.json"), "utf8"))).toHaveLength(1);
-      expect(JSON.parse(readFileSync(join(first.runDirectory, "nav-ledger.json"), "utf8"))).toHaveLength(2);
+      expect(() => persistTournamentRun(root, matrix.runs[0]!)).toThrow("TOURNAMENT_EMPIRICAL_REGISTRY_FIXTURE_FORBIDDEN");
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
@@ -185,7 +181,7 @@ describe("Kronos Research Tournament v1 contract", () => {
       { parameters: { fast: 12, slow: 48 }, oosExpectancy: 0.2, conservativePass: true, profitableWindowFraction: 1, crossAssetRatio: 1 },
     ], { fast: 12, slow: 48 });
     expect(plateau.isolatedPeak).toBe(true);
-    const ranked = rankTournamentCandidates([{ strategyId: "MACD", metrics: { tradeCount: 40, independentEpisodes: 40, expectancyAfterCost: 0.1, profitFactor: 1.5, winRate: 0.5, payoffRatio: 1.5, sharpe: 1, calmar: 1, maxDrawdown: 0.1, netPnl: 100, returnFraction: 0.01, profitableAssetRatio: 1, concentration: { topSymbolNetPnlShare: 1, topRegimeNetPnlShare: 1, topYearNetPnlShare: 1 }, canonicalEpisodeProvenanceComplete: true }, researchMode: "REAL_TIER1", conservativePass: false, plateauPass: false, sealedHoldoutPass: false }]);
+    const ranked = rankTournamentCandidates([{ strategyId: "MACD", metrics: { tradeCount: 40, independentEpisodes: 40, expectancyAfterCost: 0.1, profitFactor: 1.5, winRate: 0.5, payoffRatio: 1.5, sharpe: 1, calmar: 1, maxDrawdown: 0.1, netPnl: 100, returnFraction: 0.01, profitableAssetRatio: 1, concentration: { topSymbolNetPnlShare: 1, topRegimeNetPnlShare: 1, topYearNetPnlShare: 1 }, canonicalEpisodeProvenanceComplete: true }, researchMode: "REAL_TIER1", capabilityTier: "TIER_2_EXPECTED_EXECUTION", conservativePass: false, plateauPass: false, sealedHoldoutPass: false }]);
     expect(ranked[0]!.rankScore).toBeNull();
     expect(ranked[0]!.hardGate.failures).toContain("CONSERVATIVE_EXECUTION_FAIL");
   });

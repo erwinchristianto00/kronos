@@ -18,6 +18,7 @@ function atomicWrite(path: string, value: unknown): void {
  * content for an existing ID is an integrity error, never silently overwritten.
  */
 export function persistTournamentRun(rootDir: string, result: TournamentRunResult): { runDirectory: string; registryHash: string } {
+  const next = registryEntry(result.manifest, result.valid);
   const root = resolve(rootDir); const runDirectory = resolve(root, "runs", result.manifest.runId);
   mkdirSync(runDirectory, { recursive: true });
   atomicWrite(resolve(runDirectory, "manifest.json"), result.manifest);
@@ -27,7 +28,6 @@ export function persistTournamentRun(rootDir: string, result: TournamentRunResul
   const registryPath = resolve(root, "run-registry.json");
   const registry = existsSync(registryPath) ? JSON.parse(readFileSync(registryPath, "utf8")) as TournamentRunRegistryEntry[] : [];
   if (!Array.isArray(registry)) throw new Error("TOURNAMENT_REGISTRY_CORRUPT");
-  const next = registryEntry(result.manifest, result.valid);
   const existing = registry.find((entry) => entry.runId === next.runId);
   if (existing && JSON.stringify(existing) !== JSON.stringify(next)) throw new Error("TOURNAMENT_REGISTRY_RUN_ID_CONFLICT");
   if (!existing) atomicWrite(registryPath, [...registry, next]);

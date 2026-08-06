@@ -4,9 +4,10 @@ import { tmpdir } from "node:os";
 import { describe, expect, it } from "vitest";
 
 import { buildFoundryArtifact } from "../../src/research/foundry/artifact-schema.js";
+import { buildRunManifest } from "../../src/research/contract/tournament-contract.js";
 import { loadFoundryArtifact, persistFoundryArtifact } from "../../src/research/foundry/artifact-store.js";
 import { canonicalizeFundingSettlements } from "../../src/research/foundry/funding-schedule.js";
-import { assembleTier1Baseline, assertTier1AssemblyCanRun, loadTier1Artifacts, runTier1BaselineSmoke } from "../../src/research/foundry/tier1-assembler.js";
+import { assembleTier1Baseline, assertTier1AssemblyCanRun, bindRealTier1ExperimentSpec, deriveTier1RandomControlIdentity, loadTier1Artifacts, runRealTier1Conservative, runTier1BaselineSmoke } from "../../src/research/foundry/tier1-assembler.js";
 import { buildAuthoritativeTimelineArtifact, buildCanonicalEpisodeArtifact, generateMinimumHistoryEligibilityArtifact, generatePitPortfolioRiskArtifact } from "../../src/research/foundry/tier1-pit-artifacts.js";
 import { FOUNDRY_SCHEMA_V1, validateFoundryRows } from "../../src/research/foundry/semantic-validators.js";
 import { fixtureSourceProvenance, type FoundryDerivationIdentity } from "../../src/research/foundry/source-provenance.js";
@@ -61,7 +62,7 @@ describe("Tier-1 artifact assembly", () => {
     const artifacts = [funding, listing, futures, minimum, liquidity, episodes, risk, candles].map(({ manifest, canonicalRows }) => ({ manifest, rows: canonicalRows }));
     const policy = { version: "tier1-liquidity-v1", minVolume: 1, minLiquidityNotional: 1, maxSpreadBps: 10, maxAgeMs: H };
     const assembled = assembleTier1Baseline({ artifacts, symbols, startMs: H, endMs: 2 * H, timeframeMs: H, liquidityPolicy: policy }); assertTier1AssemblyCanRun(assembled);
-    expect(assembled.label).toBe("TIER_1_BASELINE — NOT COMPARABLE TO EXACT KRONOS"); expect(assembled.fundingSettlementScheduleBySymbol.get("BTCUSDT")).toEqual([H]);
+    expect(assembled.label).toBe("TIER_1_BASELINE — NOT COMPARABLE TO EXACT KRONOS"); expect(assembled.fundingScheduleBySymbol.BTCUSDT).toEqual([H]);
     const smokeSpec: TournamentExperimentSpec = {
       tournamentVersion: "kronos-research-tournament-v1", gitCommit: "fixture", strategyVersion: "fixture", randomSeed: 1, capabilityTier: "TIER_1_BASELINE", researchMode: "FIXTURE_SMOKE",
       dataset: { provider: "fixture", dataRange: { startMs: H, endMs: 2 * H }, candlesHash: candles.manifest.rowsHash, fundingHash: funding.manifest.rowsHash, executionInputsHash: "conservative", historicalUniverseHash: assembled.universeSnapshots[0]!.sourceHash, canonicalEpisodeHash: episodes.manifest.semanticManifestHash, portfolioRiskHash: risk.manifest.semanticManifestHash, artifactSemanticManifestHashes: assembled.artifactSemanticHashes, artifactKinds: artifacts.map((artifact) => artifact.manifest.artifactKind), timeframe: "1h", timeframeMs: H, universeSnapshots: assembled.universeSnapshots },
@@ -71,6 +72,28 @@ describe("Tier-1 artifact assembly", () => {
     };
     const smoke = runTier1BaselineSmoke({ assembly: assembled, spec: smokeSpec, candles: candles.canonicalRows.map((row) => ({ symbol: row.symbol!, openTimeMs: row.openTimeMs as number, closeTimeMs: row.closeTimeMs as number, open: row.open as number, high: row.high as number, low: row.low as number, close: row.close as number, volume: row.volume as number })), fundingRows: funding.canonicalRows, createdAtMs: 0, randomReference: [], eligibleEntryTimesBySymbol: new Map([["BTCUSDT", []]]) });
     expect(smoke.label).toBe("TIER_1_BASELINE — NOT COMPARABLE TO EXACT KRONOS"); expect(smoke.result.runs).toHaveLength(8); expect(smoke.result.runs.every((run) => run.manifest.executionMode === "CONSERVATIVE" && run.manifest.strategyId !== "KRONOS_CURRENT")).toBe(true);
+    const realSpec: TournamentExperimentSpec = { ...smokeSpec, researchMode: "REAL_TIER1", dataset: { ...smokeSpec.dataset, provider: "source-backed", historicalUniverseHash: assembled.binding.universeSnapshotHash, canonicalEpisodeHash: assembled.binding.episodePolicyHash, portfolioRiskHash: assembled.binding.portfolioRiskIdentity, universeSnapshots: structuredClone(assembled.universeSnapshots), tier1AssemblyBinding: structuredClone(assembled.binding) } };
+    expect(bindRealTier1ExperimentSpec(assembled, realSpec).dataset.tier1AssemblyBinding).toEqual(assembled.binding);
+    for (const field of ["assemblyVersion", "tier1AssemblyHash", "artifactSemanticHashes", "universeSnapshotHash", "liquidityPolicyHash", "fundingScheduleIdentity", "episodePolicyHash", "portfolioRiskIdentity"]) {
+      const mismatch = structuredClone(realSpec); const binding = mismatch.dataset.tier1AssemblyBinding! as unknown as Record<string, unknown>;
+      binding[field] = field === "artifactSemanticHashes" ? ["different-artifact"] : "different-identity";
+      expect(() => bindRealTier1ExperimentSpec(assembled, mismatch)).toThrow("FOUNDRY_REAL_TIER1_ASSEMBLY_BINDING_MISMATCH");
+    }
+    const rangeMismatch = structuredClone(realSpec); rangeMismatch.dataset.dataRange.endMs += H;
+    expect(() => bindRealTier1ExperimentSpec(assembled, rangeMismatch)).toThrow("FOUNDRY_REAL_TIER1_SPEC_ASSEMBLY_DATASET_MISMATCH");
+    const universeMismatch = structuredClone(realSpec); universeMismatch.dataset.universeSnapshots[0]!.eligibleSymbols = ["ETHUSDT"];
+    expect(() => bindRealTier1ExperimentSpec(assembled, universeMismatch)).toThrow("FOUNDRY_REAL_TIER1_SPEC_ASSEMBLY_IDENTITY_MISMATCH");
+    const manifest = buildRunManifest({ spec: realSpec, strategyId: "CASH", executionMode: "CONSERVATIVE", parameterSet: {}, createdAtMs: 0 });
+    expect(manifest.tier1AssemblyHash).toBe(assembled.tier1AssemblyHash); expect(manifest.inputHash).toHaveLength(64);
+    const changedAssemblySpec = structuredClone(realSpec); changedAssemblySpec.dataset.tier1AssemblyBinding!.tier1AssemblyHash = "different-assembly";
+    expect(buildRunManifest({ spec: changedAssemblySpec, strategyId: "CASH", executionMode: "CONSERVATIVE", parameterSet: {}, createdAtMs: 0 }).inputHash).not.toBe(manifest.inputHash);
+    expect(deriveTier1RandomControlIdentity(assembled, 1)).not.toBe(deriveTier1RandomControlIdentity(assembled, 2));
+    const changedPolicyAssembly = assembleTier1Baseline({ artifacts, symbols, startMs: H, endMs: 2 * H, timeframeMs: H, liquidityPolicy: { ...policy, maxSpreadBps: 11 } }); assertTier1AssemblyCanRun(changedPolicyAssembly);
+    expect(deriveTier1RandomControlIdentity(assembled, 1)).not.toBe(deriveTier1RandomControlIdentity(changedPolicyAssembly, 1));
+    expect(Object.isFrozen(assembled)).toBe(true); expect(Object.isFrozen(assembled.canonicalCandles)).toBe(true); expect(() => (assembled.canonicalCandles as unknown as unknown[]).push({})).toThrow();
+    expect(() => runRealTier1Conservative({ assembly: assembled, spec: realSpec, createdAtMs: 0 })).toThrow("FOUNDRY_REAL_TIER1_ASSEMBLY_NOT_PROVENANCE_VERIFIED");
+    expect(() => runRealTier1Conservative({ assembly: assembled, spec: realSpec, createdAtMs: 0, candles: [] } as never)).toThrow("FOUNDRY_REAL_TIER1_ASSEMBLY_NOT_PROVENANCE_VERIFIED");
+    expect(() => assembleTier1Baseline({ artifacts, symbols, startMs: H, endMs: 2 * H, timeframeMs: H, liquidityPolicy: policy, researchMode: "REAL_TIER1" })).toThrow("FOUNDRY_REAL_TIER1_VERIFIED_RELOAD_REQUIRED");
     const incomplete = assembleTier1Baseline({ artifacts: artifacts.filter((artifact) => artifact.manifest.artifactKind !== "CANONICAL_EPISODES"), symbols, startMs: H, endMs: 2 * H, timeframeMs: H, liquidityPolicy: policy });
     expect(() => assertTier1AssemblyCanRun(incomplete)).toThrow("FOUNDRY_TIER1_INCOMPLETE_CANNOT_RUN_OR_RANK");
     expect(() => assembleTier1Baseline({ artifacts: artifacts.map((artifact) => artifact.manifest.artifactKind === "FUTURES_AVAILABILITY_TIMELINE" ? { ...artifact, rows: validateFoundryRows("FUTURES_AVAILABILITY_TIMELINE", FOUNDRY_SCHEMA_V1, [{ symbol: "BTCUSDT", effectiveTimeMs: H, available: false, sourceHash: "futures" }]) } : artifact), symbols, startMs: H, endMs: 2 * H, timeframeMs: H, liquidityPolicy: policy })).toThrow("FOUNDRY_ELIGIBILITY_TIMELINE_CONFLICT");

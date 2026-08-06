@@ -91,6 +91,17 @@ export interface TournamentDatasetManifest {
   timeframe: string;
   timeframeMs: number;
   universeSnapshots: PointInTimeUniverseSnapshot[];
+  /** Required for REAL_TIER1: exact immutable assembly used for execution. */
+  tier1AssemblyBinding?: {
+    assemblyVersion: string;
+    tier1AssemblyHash: string;
+    artifactSemanticHashes: string[];
+    universeSnapshotHash: string;
+    liquidityPolicyHash: string;
+    fundingScheduleIdentity: string;
+    episodePolicyHash: string;
+    portfolioRiskIdentity: string;
+  };
 }
 
 export interface TournamentCostModel {
@@ -261,6 +272,9 @@ export interface TournamentRunManifest {
   runId: string;
   createdAtMs: number;
   empiricalClassification: TournamentEmpiricalClassification;
+  tier1AssemblyHash: string | null;
+  /** Set only after the real Tier-1 entry point verifies the complete matrix. */
+  empiricalGatePassed: boolean;
   spec: TournamentExperimentSpec;
   executionMode: TournamentExecutionMode;
   strategyId: TournamentStrategyId;

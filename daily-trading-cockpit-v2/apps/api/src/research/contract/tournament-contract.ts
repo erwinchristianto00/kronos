@@ -51,6 +51,7 @@ export function assertValidTournamentSpec(spec: TournamentExperimentSpec): void 
   if (!spec.gitCommit || !spec.strategyVersion) throw new Error("TOURNAMENT_PROVENANCE_MISSING");
   if (spec.researchMode !== "FIXTURE_SMOKE" && spec.researchMode !== "REAL_TIER1") throw new Error("TOURNAMENT_RESEARCH_MODE_INVALID");
   assertValidTournamentDataset(spec.dataset);
+  if (spec.researchMode === "REAL_TIER1" && (!spec.dataset.tier1AssemblyBinding || !spec.dataset.tier1AssemblyBinding.tier1AssemblyHash)) throw new Error("TOURNAMENT_REAL_TIER1_ASSEMBLY_BINDING_MISSING");
   const tierRequired: Record<TournamentExperimentSpec["capabilityTier"], TournamentDatasetArtifactKind[]> = {
     TIER_1_BASELINE: ["COMPLETED_CANDLES", "FUNDING_SETTLEMENTS", "LISTING_DELISTING_TIMELINE", "FUTURES_AVAILABILITY_TIMELINE", "MINIMUM_HISTORY_ELIGIBILITY", "PIT_LIQUIDITY_SPREAD", "CANONICAL_EPISODES", "PORTFOLIO_RISK_SNAPSHOTS"],
     TIER_2_EXPECTED_EXECUTION: ["COMPLETED_CANDLES", "FUNDING_SETTLEMENTS", "LISTING_DELISTING_TIMELINE", "FUTURES_AVAILABILITY_TIMELINE", "MINIMUM_HISTORY_ELIGIBILITY", "CANONICAL_EPISODES", "PORTFOLIO_RISK_SNAPSHOTS", "PIT_LIQUIDITY_SPREAD", "FEE_ASSUMPTIONS"],
@@ -101,6 +102,8 @@ export function buildRunManifest(input: {
     runId: `krtv1-${inputHash.slice(0, 20)}`,
     createdAtMs: input.createdAtMs,
     empiricalClassification: input.spec.researchMode === "REAL_TIER1" ? "REAL_SOURCE_BACKED" : "TEST_ONLY_NON_EMPIRICAL",
+    tier1AssemblyHash: input.spec.dataset.tier1AssemblyBinding?.tier1AssemblyHash ?? null,
+    empiricalGatePassed: false,
     spec: input.spec,
     strategyId: input.strategyId,
     executionMode: input.executionMode,
@@ -109,9 +112,11 @@ export function buildRunManifest(input: {
   };
 }
 
-/** Registry intentionally receives every attempted parameter set, including failures. */
+/** The empirical registry accepts only a fully verified, valid REAL_TIER1 result. */
 export function registryEntry(manifest: TournamentRunManifest, valid: boolean): TournamentRunRegistryEntry {
   if (manifest.spec.researchMode !== "REAL_TIER1") throw new Error("TOURNAMENT_EMPIRICAL_REGISTRY_FIXTURE_FORBIDDEN");
+  if (!manifest.tier1AssemblyHash || !manifest.empiricalGatePassed) throw new Error("TOURNAMENT_EMPIRICAL_REGISTRY_GATE_REQUIRED");
+  if (!valid) throw new Error("TOURNAMENT_EMPIRICAL_REGISTRY_INVALID_RUN");
   return {
     runId: manifest.runId,
     inputHash: manifest.inputHash,
