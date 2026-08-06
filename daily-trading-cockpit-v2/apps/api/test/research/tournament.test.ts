@@ -92,6 +92,17 @@ describe("Kronos Research Tournament v1 contract", () => {
     expect(result.failures).toContain("CONCURRENCY_PROFILE");
   });
 
+  it("keeps the canonical reference timing when a short archive has no parity-safe shuffle", () => {
+    const strategy = randomTimingControl({
+      reference: [{ referenceId: "short", symbol: "BTCUSDT", referenceEntryTimeMs: H, side: "LONG", stopFraction: 0.01, targetFraction: 0.02, maxHoldBars: 48, exitTemplate: "SAME_EXIT", score: 1, metadata: {} }],
+      eligibleEntryTimesBySymbol: new Map([["BTCUSDT", [H, 2 * H, 3 * H]]]),
+      seed: 1_000_000,
+    });
+    const produced = [0, 1, 2].flatMap((index) => strategy.onCompletedBar({ symbol: "BTCUSDT", index, candle: candle(index), history: [], eligibleSymbols: new Set(["BTCUSDT"]), nextOpenTimeMs: (index + 1) * H }));
+    expect(strategy.parameters.timingMode).toBe("PARITY_CONSTRAINED_REFERENCE_TIMING");
+    expect(produced.map((intent) => intent.entryAtOpenTimeMs)).toEqual([H]);
+  });
+
   it("uses next-open entry and stop-first ambiguity in CONSERVATIVE mode", () => {
     const strategy: TournamentStrategy = {
       id: "DONCHIAN", version: "fixture", parameters: {},

@@ -296,10 +296,28 @@ export function randomTimingControl(input: { reference: readonly RandomControlRe
     planned.set(selected, [...(planned.get(selected) ?? []), reference]);
     plan.push({ ...reference, entryTimeMs: selected });
   }
-  const parity = assertRandomControlPlanParity({ reference: input.reference, planned: plan, timeline });
+  let parity = assertRandomControlPlanParity({ reference: input.reference, planned: plan, timeline });
+  let timingMode: "SEEDED_PERMUTATION" | "PARITY_CONSTRAINED_REFERENCE_TIMING" = "SEEDED_PERMUTATION";
+  /*
+   * A short archive can make a timing permutation impossible without changing
+   * the visible concurrency distribution (for example, a 48-bar hold inside a
+   * 23-bar replay). Preserve the reference timing in that constrained case;
+   * accepting a non-parity shuffle would make the control incomparable.
+   */
+  if (!parity.passes && parity.failures.every((failure) => failure === "CONCURRENCY_PROFILE")) {
+    planned.clear(); plan.length = 0;
+    for (const reference of input.reference) {
+      const candidates = input.eligibleEntryTimesBySymbol.get(reference.symbol) ?? [];
+      if (!candidates.includes(reference.referenceEntryTimeMs)) throw new Error(`TOURNAMENT_RANDOM_CONTROL_REFERENCE_TIME_INELIGIBLE_${reference.referenceId}`);
+      planned.set(reference.referenceEntryTimeMs, [...(planned.get(reference.referenceEntryTimeMs) ?? []), reference]);
+      plan.push({ ...reference, entryTimeMs: reference.referenceEntryTimeMs });
+    }
+    parity = assertRandomControlPlanParity({ reference: input.reference, planned: plan, timeline });
+    timingMode = "PARITY_CONSTRAINED_REFERENCE_TIMING";
+  }
   if (!parity.passes) throw new Error(`TOURNAMENT_RANDOM_CONTROL_PARITY_FAIL_${parity.failures.join("_")}`);
   return {
-    id: "RANDOM_CONTROL", version: "random-timing-control-v1", parameters: { seed: input.seed, referenceTrades: input.reference.length },
+    id: "RANDOM_CONTROL", version: "random-timing-control-v2", parameters: { seed: input.seed, referenceTrades: input.reference.length, timingMode },
     onCompletedBar: (bar) => (planned.get(bar.nextOpenTimeMs ?? -1) ?? [])
       .filter((reference) => reference.symbol === bar.symbol && bar.eligibleSymbols.has(reference.symbol) && bar.nextOpenTimeMs !== null)
       .map((reference) => ({ strategyId: "RANDOM_CONTROL" as const, symbol: reference.symbol, side: reference.side, decisionTimeMs: bar.candle.closeTimeMs, entryAtOpenTimeMs: bar.nextOpenTimeMs!, stopFraction: reference.stopFraction, targetFraction: reference.targetFraction, maxHoldBars: reference.maxHoldBars, exitTemplate: reference.exitTemplate, score: reference.score, metadata: { ...reference.metadata, randomised: true, randomReferenceId: reference.referenceId } })),
