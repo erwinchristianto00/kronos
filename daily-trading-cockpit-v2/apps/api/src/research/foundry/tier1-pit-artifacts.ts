@@ -5,12 +5,13 @@ import type { FoundryExpectedCoverage } from "./derived-coverage.js";
 import { FOUNDRY_SCHEMA_V1, type ValidatedFoundryRow } from "./semantic-validators.js";
 import { futuresTimeline, listingTimeline } from "./stateful-timeline.js";
 import { assertFoundrySourceProvenance, type FoundrySourceProvenance } from "./source-provenance.js";
+import type { ArchiveBundleIdentity } from "./archive-bundle.js";
 
 type TimelineKind = "LISTING_DELISTING_TIMELINE" | "FUTURES_AVAILABILITY_TIMELINE";
 const finite = (value: number): boolean => Number.isFinite(value);
 
 /** Imports only a named historical export; caller must retain its immutable source hash per event. */
-export function buildAuthoritativeTimelineArtifact(input: { artifactKind: TimelineKind; source: string; sourceProvenance: FoundrySourceProvenance; generatedAtMs: number; generationSha: string; expectedCoverage: FoundryExpectedCoverage; rows: readonly unknown[] }): BuiltFoundryArtifact {
+export function buildAuthoritativeTimelineArtifact(input: { artifactKind: TimelineKind; source: string; sourceProvenance: FoundrySourceProvenance; archiveBundle?: ArchiveBundleIdentity; generatedAtMs: number; generationSha: string; expectedCoverage: FoundryExpectedCoverage; rows: readonly unknown[] }): BuiltFoundryArtifact {
   assertFoundrySourceProvenance(input.sourceProvenance);
   if (input.sourceProvenance.provenanceType !== "EXCHANGE_HISTORICAL_EXPORT") throw new Error("FOUNDRY_TIMELINE_SOURCE_NOT_AUTHORITATIVE");
   return buildFoundryArtifact({ ...input, schemaVersion: FOUNDRY_SCHEMA_V1, units: { effectiveTimeMs: "unix_ms", state: "exchange_historical_event" } });
@@ -26,6 +27,7 @@ export function generateMinimumHistoryEligibilityArtifact(input: {
   minimumCompletedBars: number;
   source: string;
   sourceProvenance: FoundrySourceProvenance;
+  derivation: import("./source-provenance.js").FoundryDerivationIdentity;
   generatedAtMs: number;
   generationSha: string;
 }): BuiltFoundryArtifact {
@@ -44,21 +46,27 @@ export function generateMinimumHistoryEligibilityArtifact(input: {
       }
     }
   }
-  return buildFoundryArtifact({ artifactKind: "MINIMUM_HISTORY_ELIGIBILITY", schemaVersion: FOUNDRY_SCHEMA_V1, source: input.source, sourceProvenance: input.sourceProvenance, units: { asOfMs: "unix_ms", eligible: "boolean", completedBars: "count" }, generatedAtMs: input.generatedAtMs, generationSha: input.generationSha, expectedCoverage: input.expectedCoverage, rows });
+  return buildFoundryArtifact({ artifactKind: "MINIMUM_HISTORY_ELIGIBILITY", schemaVersion: FOUNDRY_SCHEMA_V1, source: input.source, sourceProvenance: input.sourceProvenance, derivation: input.derivation, units: { asOfMs: "unix_ms", eligible: "boolean", completedBars: "count" }, generatedAtMs: input.generatedAtMs, generationSha: input.generationSha, expectedCoverage: input.expectedCoverage, rows });
 }
 
 /** Canonical episode IDs must already originate from Kronos clustering/market-cause evidence. */
 export function buildCanonicalEpisodeArtifact(input: {
   source: string;
   sourceProvenance: FoundrySourceProvenance;
+  archiveBundle?: ArchiveBundleIdentity;
+  canonicalPolicy: { algorithmVersion: string; policyVersion: string; blockWidthMs: number };
   generatedAtMs: number;
   generationSha: string;
   expectedCoverage: FoundryExpectedCoverage;
   events: readonly { symbol: string; decisionTimeMs: number; marketEpisodeId: string; sourceHash: string; canonicalAlgorithm: "KRONOS_EPISODE_ACCUMULATOR_V1" | "PERSISTED_MARKET_CAUSE" }[];
 }): BuiltFoundryArtifact {
   assertFoundrySourceProvenance(input.sourceProvenance);
-  if (input.sourceProvenance.provenanceType !== "KRONOS_CANONICAL_LEDGER" || input.events.some((event) => !event.marketEpisodeId || !event.sourceHash || !event.canonicalAlgorithm)) throw new Error("FOUNDRY_CANONICAL_EPISODE_SOURCE_INVALID");
-  return buildFoundryArtifact({ artifactKind: "CANONICAL_EPISODES", schemaVersion: FOUNDRY_SCHEMA_V1, source: input.source, sourceProvenance: input.sourceProvenance, units: { decisionTimeMs: "unix_ms", episodeId: "canonical_market_cause" }, generatedAtMs: input.generatedAtMs, generationSha: input.generationSha, expectedCoverage: input.expectedCoverage, rows: input.events.map((event) => ({ symbol: event.symbol, decisionTimeMs: event.decisionTimeMs, episodeId: event.marketEpisodeId, sourceHash: event.sourceHash })) });
+  if (input.sourceProvenance.provenanceType !== "KRONOS_CANONICAL_LEDGER") throw new Error("FOUNDRY_CANONICAL_EPISODE_SOURCE_INVALID");
+  const expectedTimes: number[] = []; if (!input.expectedCoverage.cadenceMs) throw new Error("FOUNDRY_CANONICAL_EPISODE_CADENCE_REQUIRED"); for (let openTimeMs = input.expectedCoverage.startMs; openTimeMs < input.expectedCoverage.endMs; openTimeMs += input.expectedCoverage.cadenceMs) expectedTimes.push(openTimeMs + input.expectedCoverage.cadenceMs - 1);
+  const expectedKeys = input.expectedCoverage.symbols.slice().sort().flatMap((symbol) => expectedTimes.map((decisionTimeMs) => `${symbol}:${decisionTimeMs}`)); const eventKeys = input.events.map((event) => `${event.symbol}:${event.decisionTimeMs}`).sort(); const events = input.events.slice().sort((a, b) => a.decisionTimeMs - b.decisionTimeMs || a.symbol.localeCompare(b.symbol));
+  if (!input.canonicalPolicy.algorithmVersion || !input.canonicalPolicy.policyVersion || !Number.isInteger(input.canonicalPolicy.blockWidthMs) || input.canonicalPolicy.blockWidthMs <= 0 || events.some((event) => !event.marketEpisodeId || !event.sourceHash || !event.canonicalAlgorithm) || JSON.stringify(eventKeys) !== JSON.stringify(expectedKeys)) throw new Error("FOUNDRY_CANONICAL_EPISODE_COVERAGE_INCOMPLETE");
+  const sourceHashes = [...new Set(events.map((event) => event.sourceHash))].sort();
+  return buildFoundryArtifact({ artifactKind: "CANONICAL_EPISODES", schemaVersion: FOUNDRY_SCHEMA_V1, source: input.source, sourceProvenance: input.sourceProvenance, ...(input.archiveBundle ? { archiveBundle: input.archiveBundle } : {}), canonicalEpisodeCoverage: { mode: "COMPLETE_SYMBOL_DECISION_MAP", canonicalAlgorithm: events[0]!.canonicalAlgorithm, algorithmVersion: input.canonicalPolicy.algorithmVersion, policyVersion: input.canonicalPolicy.policyVersion, blockWidthMs: input.canonicalPolicy.blockWidthMs, decisionKeyCount: expectedKeys.length, decisionKeysHash: tournamentHash(expectedKeys), sourceHashes }, units: { decisionTimeMs: "unix_ms", episodeId: "canonical_market_cause" }, generatedAtMs: input.generatedAtMs, generationSha: input.generationSha, expectedCoverage: input.expectedCoverage, rows: events.map((event) => ({ symbol: event.symbol, decisionTimeMs: event.decisionTimeMs, episodeId: event.marketEpisodeId, sourceHash: event.sourceHash })) });
 }
 
 function returnsBefore(candles: readonly TournamentCandle[], asOfMs: number, lookbackBars: number, closeIntervalMs: number, symbol: string): Map<number, { value: number; sourceHash: string }> {
@@ -83,6 +91,7 @@ export function generatePitPortfolioRiskArtifact(input: {
   snapshotIntervalMs: number;
   source: string;
   sourceProvenance: FoundrySourceProvenance;
+  derivation: import("./source-provenance.js").FoundryDerivationIdentity;
   generatedAtMs: number;
   generationSha: string;
 }): BuiltFoundryArtifact {
@@ -103,7 +112,7 @@ export function generatePitPortfolioRiskArtifact(input: {
       rows.push({ symbol, asOfMs, validUntilMs: asOfMs + input.snapshotIntervalMs - 1, alignedStartMs: timestamps[0]!, alignedEndMs: timestamps.at(-1)!, alignedObservationCount: timestamps.length, alignedTimestampHash, alignedSourceHashes, btcBeta: cov / alignedVariance, correlationCluster: symbol === "BTCUSDT" ? "BTC" : corr >= 0.7 ? "BTC_CORRELATED" : "DIVERSIFIER", sourceHash: tournamentHash({ source: input.source, symbol, asOfMs, lookbackBars: input.lookbackBars, minimumObservations: input.minimumObservations, closeIntervalMs: input.closeIntervalMs, alignedTimestampHash, alignedSourceHashes }) });
     }
   }
-  return buildFoundryArtifact({ artifactKind: "PORTFOLIO_RISK_SNAPSHOTS", schemaVersion: FOUNDRY_SCHEMA_V1, source: input.source, sourceProvenance: input.sourceProvenance, units: { asOfMs: "unix_ms", validUntilMs: "unix_ms", btcBeta: "return_beta", correlationCluster: "derived_prior_return_cluster" }, generatedAtMs: input.generatedAtMs, generationSha: input.generationSha, expectedCoverage: input.expectedCoverage, rows });
+  return buildFoundryArtifact({ artifactKind: "PORTFOLIO_RISK_SNAPSHOTS", schemaVersion: FOUNDRY_SCHEMA_V1, source: input.source, sourceProvenance: input.sourceProvenance, derivation: input.derivation, units: { asOfMs: "unix_ms", validUntilMs: "unix_ms", btcBeta: "return_beta", correlationCluster: "derived_prior_return_cluster" }, generatedAtMs: input.generatedAtMs, generationSha: input.generationSha, expectedCoverage: input.expectedCoverage, rows });
 }
 
 export function riskSnapshotsFromArtifactRows(rows: readonly ValidatedFoundryRow[], symbols: readonly string[]): PointInTimePortfolioRiskSnapshot[] {

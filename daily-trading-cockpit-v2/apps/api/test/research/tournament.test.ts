@@ -26,7 +26,7 @@ const snapshot = {
 
 function spec(endMs = 4 * H): TournamentExperimentSpec {
   return {
-    tournamentVersion: "kronos-research-tournament-v1", gitCommit: "abc123", strategyVersion: "test-v1", randomSeed: 17, capabilityTier: "TIER_2_EXPECTED_EXECUTION",
+    tournamentVersion: "kronos-research-tournament-v1", gitCommit: "abc123", strategyVersion: "test-v1", randomSeed: 17, capabilityTier: "TIER_2_EXPECTED_EXECUTION", researchMode: "FIXTURE_SMOKE",
     dataset: { provider: "fixture", dataRange: { startMs: 0, endMs }, candlesHash: "candles", fundingHash: "funding", executionInputsHash: "execution-inputs", historicalUniverseHash: "universe", canonicalEpisodeHash: "episodes", portfolioRiskHash: "portfolio-risk", artifactSemanticManifestHashes: ["foundry-semantic-manifest"], artifactKinds: ["COMPLETED_CANDLES", "FUNDING_SETTLEMENTS", "LISTING_DELISTING_TIMELINE", "FUTURES_AVAILABILITY_TIMELINE", "MINIMUM_HISTORY_ELIGIBILITY", "CANONICAL_EPISODES", "PORTFOLIO_RISK_SNAPSHOTS", "PIT_LIQUIDITY_SPREAD", "FEE_ASSUMPTIONS"], timeframe: "1h", timeframeMs: H, universeSnapshots: [snapshot] },
     costs: { makerFeeBps: 0, takerFeeBps: 0, baseSlippageBps: 0, pessimisticSlippageMultiplier: 2, fundingEnabled: false, fillMode: "NEXT_OPEN", intrabarAmbiguity: "STOP_FIRST" },
     portfolio: { startingCapital: 10_000, riskPerTradeFraction: 0.01, maxPositions: 2, maxGrossExposureFraction: 1, maxNetExposureFraction: 1, maxBtcBetaFraction: 1, maxCorrelationClusterFraction: 1, liquidationBufferFraction: 0.2, initialMarginFraction: 0.1, maxPortfolioRiskSnapshotAgeMs: 2 * H },
@@ -125,7 +125,7 @@ describe("Kronos Research Tournament v1 contract", () => {
   it("runs every matrix contender against one shared contract and persists an append-only artifact registry", () => {
     const strategy: TournamentStrategy = { id: "CASH", version: "fixture", parameters: {}, onCompletedBar: () => [] };
     const matrix = runTournamentMatrix({
-      spec: spec(2 * H), strategies: [strategy], createdAtMs: 0, modes: ["CONSERVATIVE", "EXPECTED"],
+      spec: { ...spec(2 * H), researchMode: "REAL_TIER1" }, strategies: [strategy], createdAtMs: 0, modes: ["CONSERVATIVE", "EXPECTED"],
       execution: { universe: new PointInTimeUniverse([snapshot]), candles: [candle(0), candle(1)], expectedFeeBpsAt: () => 1, expectedSlippageBpsAt: () => 2, ...executionBase() },
     });
     expect(matrix.runs).toHaveLength(2);
@@ -185,7 +185,7 @@ describe("Kronos Research Tournament v1 contract", () => {
       { parameters: { fast: 12, slow: 48 }, oosExpectancy: 0.2, conservativePass: true, profitableWindowFraction: 1, crossAssetRatio: 1 },
     ], { fast: 12, slow: 48 });
     expect(plateau.isolatedPeak).toBe(true);
-    const ranked = rankTournamentCandidates([{ strategyId: "MACD", metrics: { tradeCount: 40, independentEpisodes: 40, expectancyAfterCost: 0.1, profitFactor: 1.5, winRate: 0.5, payoffRatio: 1.5, sharpe: 1, calmar: 1, maxDrawdown: 0.1, netPnl: 100, returnFraction: 0.01, profitableAssetRatio: 1, concentration: { topSymbolNetPnlShare: 1, topRegimeNetPnlShare: 1, topYearNetPnlShare: 1 }, canonicalEpisodeProvenanceComplete: true }, conservativePass: false, plateauPass: false, sealedHoldoutPass: false }]);
+    const ranked = rankTournamentCandidates([{ strategyId: "MACD", metrics: { tradeCount: 40, independentEpisodes: 40, expectancyAfterCost: 0.1, profitFactor: 1.5, winRate: 0.5, payoffRatio: 1.5, sharpe: 1, calmar: 1, maxDrawdown: 0.1, netPnl: 100, returnFraction: 0.01, profitableAssetRatio: 1, concentration: { topSymbolNetPnlShare: 1, topRegimeNetPnlShare: 1, topYearNetPnlShare: 1 }, canonicalEpisodeProvenanceComplete: true }, researchMode: "REAL_TIER1", conservativePass: false, plateauPass: false, sealedHoldoutPass: false }]);
     expect(ranked[0]!.rankScore).toBeNull();
     expect(ranked[0]!.hardGate.failures).toContain("CONSERVATIVE_EXECUTION_FAIL");
   });

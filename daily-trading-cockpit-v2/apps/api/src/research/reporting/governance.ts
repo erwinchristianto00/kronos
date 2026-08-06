@@ -1,5 +1,5 @@
 import { hardGate } from "../contract/tournament-contract.js";
-import type { TournamentHardGateVerdict, TournamentMetrics, TournamentStrategyId } from "../tournament-types.js";
+import type { TournamentHardGateVerdict, TournamentMetrics, TournamentResearchMode, TournamentStrategyId } from "../tournament-types.js";
 
 export interface SensitivityPoint {
   parameters: Record<string, string | number | boolean>;
@@ -50,10 +50,12 @@ function percentile(value: number, population: number[]): number {
 export function rankTournamentCandidates(input: Array<{
   strategyId: TournamentStrategyId;
   metrics: TournamentMetrics;
+  researchMode: TournamentResearchMode;
   conservativePass: boolean;
   plateauPass: boolean;
   sealedHoldoutPass: boolean;
 }>): RankedTournamentCandidate[] {
+  if (input.some((candidate) => candidate.researchMode !== "REAL_TIER1")) throw new Error("TOURNAMENT_FIXTURE_RANKING_FORBIDDEN");
   const candidates = input.map((candidate) => ({ ...candidate, hardGate: hardGate(candidate.metrics, {
     minIndependentEpisodes: 30,
     minProfitFactor: 1.05,

@@ -9,6 +9,8 @@ export const TOURNAMENT_VERSION = "kronos-research-tournament-v1" as const;
 
 export type TournamentExecutionMode = "CONSERVATIVE" | "EXPECTED" | "OPTIMISTIC";
 export type TournamentCapabilityTier = "TIER_1_BASELINE" | "TIER_2_EXPECTED_EXECUTION" | "TIER_3_EXACT_KRONOS";
+export type TournamentResearchMode = "FIXTURE_SMOKE" | "REAL_TIER1";
+export type TournamentEmpiricalClassification = "TEST_ONLY_NON_EMPIRICAL" | "REAL_SOURCE_BACKED";
 export type TournamentDatasetArtifactKind = "COMPLETED_CANDLES" | "FUNDING_SETTLEMENTS" | "LISTING_DELISTING_TIMELINE" | "FUTURES_AVAILABILITY_TIMELINE" | "MINIMUM_HISTORY_ELIGIBILITY" | "PIT_LIQUIDITY_SPREAD" | "FEE_ASSUMPTIONS" | "PORTFOLIO_RISK_SNAPSHOTS" | "CANONICAL_EPISODES" | "KRONOS_DECISION_LEDGER";
 export type TournamentSide = "LONG" | "SHORT";
 export type TournamentExitReason = "STOP" | "TARGET" | "TIME" | "END_OF_DATA" | "REBALANCE";
@@ -134,6 +136,8 @@ export interface TournamentExperimentSpec {
   strategyVersion: string;
   randomSeed: number;
   capabilityTier: TournamentCapabilityTier;
+  /** Fixture smoke output is permanently non-empirical and cannot enter governance. */
+  researchMode: TournamentResearchMode;
   dataset: TournamentDatasetManifest;
   costs: TournamentCostModel;
   portfolio: TournamentPortfolioConstraints;
@@ -256,6 +260,7 @@ export interface TournamentPortfolioMetrics {
 export interface TournamentRunManifest {
   runId: string;
   createdAtMs: number;
+  empiricalClassification: TournamentEmpiricalClassification;
   spec: TournamentExperimentSpec;
   executionMode: TournamentExecutionMode;
   strategyId: TournamentStrategyId;

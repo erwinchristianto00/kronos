@@ -49,6 +49,7 @@ export function assertValidTournamentDataset(dataset: TournamentDatasetManifest)
 export function assertValidTournamentSpec(spec: TournamentExperimentSpec): void {
   if (spec.tournamentVersion !== TOURNAMENT_VERSION) throw new Error("TOURNAMENT_VERSION_MISMATCH");
   if (!spec.gitCommit || !spec.strategyVersion) throw new Error("TOURNAMENT_PROVENANCE_MISSING");
+  if (spec.researchMode !== "FIXTURE_SMOKE" && spec.researchMode !== "REAL_TIER1") throw new Error("TOURNAMENT_RESEARCH_MODE_INVALID");
   assertValidTournamentDataset(spec.dataset);
   const tierRequired: Record<TournamentExperimentSpec["capabilityTier"], TournamentDatasetArtifactKind[]> = {
     TIER_1_BASELINE: ["COMPLETED_CANDLES", "FUNDING_SETTLEMENTS", "LISTING_DELISTING_TIMELINE", "FUTURES_AVAILABILITY_TIMELINE", "MINIMUM_HISTORY_ELIGIBILITY", "PIT_LIQUIDITY_SPREAD", "CANONICAL_EPISODES", "PORTFOLIO_RISK_SNAPSHOTS"],
@@ -99,6 +100,7 @@ export function buildRunManifest(input: {
   return {
     runId: `krtv1-${inputHash.slice(0, 20)}`,
     createdAtMs: input.createdAtMs,
+    empiricalClassification: input.spec.researchMode === "REAL_TIER1" ? "REAL_SOURCE_BACKED" : "TEST_ONLY_NON_EMPIRICAL",
     spec: input.spec,
     strategyId: input.strategyId,
     executionMode: input.executionMode,
@@ -109,6 +111,7 @@ export function buildRunManifest(input: {
 
 /** Registry intentionally receives every attempted parameter set, including failures. */
 export function registryEntry(manifest: TournamentRunManifest, valid: boolean): TournamentRunRegistryEntry {
+  if (manifest.spec.researchMode !== "REAL_TIER1") throw new Error("TOURNAMENT_EMPIRICAL_REGISTRY_FIXTURE_FORBIDDEN");
   return {
     runId: manifest.runId,
     inputHash: manifest.inputHash,

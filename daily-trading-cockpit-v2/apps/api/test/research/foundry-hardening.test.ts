@@ -17,7 +17,7 @@ const universeSnapshot = { asOfMs: 0, eligibleSymbols: symbols, sourceHash: "uni
 
 function spec(overrides: Partial<TournamentExperimentSpec> = {}): TournamentExperimentSpec {
   return {
-    tournamentVersion: "kronos-research-tournament-v1", gitCommit: "fixture", strategyVersion: "fixture", randomSeed: 1, capabilityTier: "TIER_2_EXPECTED_EXECUTION",
+    tournamentVersion: "kronos-research-tournament-v1", gitCommit: "fixture", strategyVersion: "fixture", randomSeed: 1, capabilityTier: "TIER_2_EXPECTED_EXECUTION", researchMode: "FIXTURE_SMOKE",
     dataset: { provider: "fixture", dataRange: { startMs: 0, endMs: 4 * H }, candlesHash: "candles", fundingHash: "funding", executionInputsHash: "execution", historicalUniverseHash: "universe", canonicalEpisodeHash: "episodes", portfolioRiskHash: "risk", artifactSemanticManifestHashes: ["artifact"], artifactKinds: ["COMPLETED_CANDLES", "FUNDING_SETTLEMENTS", "LISTING_DELISTING_TIMELINE", "FUTURES_AVAILABILITY_TIMELINE", "MINIMUM_HISTORY_ELIGIBILITY", "CANONICAL_EPISODES", "PORTFOLIO_RISK_SNAPSHOTS", "PIT_LIQUIDITY_SPREAD", "FEE_ASSUMPTIONS"], timeframe: "1h", timeframeMs: H, universeSnapshots: [universeSnapshot] },
     costs: { makerFeeBps: 0, takerFeeBps: 0, baseSlippageBps: 0, pessimisticSlippageMultiplier: 2, fundingEnabled: false, fillMode: "NEXT_OPEN", intrabarAmbiguity: "STOP_FIRST" },
     portfolio: { startingCapital: 10_000, riskPerTradeFraction: 0.01, maxPositions: 2, maxGrossExposureFraction: 1, maxNetExposureFraction: 1, maxBtcBetaFraction: 1, maxCorrelationClusterFraction: 1, liquidationBufferFraction: 0.2, initialMarginFraction: 0.1, maxPortfolioRiskSnapshotAgeMs: 10 * H },

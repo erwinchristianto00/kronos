@@ -12,6 +12,7 @@ import { FOUNDRY_SCHEMA_V1, validateFoundryRows } from "../../src/research/found
 import { fixtureSourceProvenance } from "../../src/research/foundry/source-provenance.js";
 import { PointInTimeUniverse } from "../../src/research/universe/point-in-time-universe.js";
 import { assertEligibilityTimelineConsistency } from "../../src/research/foundry/cross-artifact-validator.js";
+import { readArchiveBundle } from "../../src/research/foundry/archive-bundle.js";
 
 const H = 3_600_000;
 const expected = { startMs: 0, endMs: 2 * H, symbols: ["BTCUSDT"], cadenceMs: H };
@@ -61,7 +62,8 @@ describe("Foundry semantic strictness", () => {
     try {
       mkdirSync(symbolDir, { recursive: true });
       const path = join(symbolDir, "fixture.csv"); writeFileSync(path, `open_time,open,high,low,close,volume,close_time\n0,100,101,99,100,1,3599999\n3600000,100,101,99,100,1,7199999\n`);
-      const first = importLocalBinanceCandleArchive({ root, expectedCoverage: expected, source: "local-fixture", sourceProvenance: fixtureSourceProvenance("local-fixture", "0000000"), generatedAtMs: 1, generationSha: "sha" }); const second = importLocalBinanceCandleArchive({ root, expectedCoverage: expected, source: "local-fixture", sourceProvenance: fixtureSourceProvenance("local-fixture", "0000000"), generatedAtMs: 1, generationSha: "sha" });
+      const rawFileHash = readArchiveBundle({ root, include: (relativePath) => relativePath.endsWith(".csv") }).archiveBundleHash; const sourceProvenance = { ...fixtureSourceProvenance("local-fixture", "0000000"), rawFileHash };
+      const first = importLocalBinanceCandleArchive({ root, expectedCoverage: expected, source: "local-fixture", sourceProvenance, generatedAtMs: 1, generationSha: "sha" }); const second = importLocalBinanceCandleArchive({ root, expectedCoverage: expected, source: "local-fixture", sourceProvenance, generatedAtMs: 1, generationSha: "sha" });
       expect(first.manifest.rowsHash).toBe(second.manifest.rowsHash); expect(first.manifest.semanticManifestHash).toBe(second.manifest.semanticManifestHash);
       expect(JSON.stringify(first.rows)).toBe(JSON.stringify(second.rows)); expect(JSON.stringify(first.manifest)).toBe(JSON.stringify(second.manifest));
       expect(persistFoundryArtifact({ rootDir: root, manifest: first.manifest, rows: first.rows })).toContain(first.manifest.semanticManifestHash);
