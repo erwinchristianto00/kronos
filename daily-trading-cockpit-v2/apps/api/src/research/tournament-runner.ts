@@ -3,6 +3,7 @@ import { runTournament, type TournamentExecutionInput } from "./execution/shared
 import type { TournamentCandle, TournamentExecutionMode, TournamentExperimentSpec, TournamentRunResult, TournamentStrategyId } from "./tournament-types.js";
 import type { TournamentStrategy } from "./strategies/challengers.js";
 import { assertNoValidationLeakage, buildWalkForwardPlan, type WalkForwardFold } from "./validation/walk-forward.js";
+import { assessCostSensitivity, summarizeOosWindows, type CostSensitivityFinding, type OosSummary } from "./reporting/oos.js";
 
 export interface TournamentMatrixInput {
   spec: TournamentExperimentSpec;
@@ -16,6 +17,11 @@ export interface TournamentMatrixInput {
 export interface TournamentMatrixResult {
   fairnessHashByMode: ReadonlyMap<TournamentExecutionMode, string>;
   runs: TournamentRunResult[];
+  costSensitivity: CostSensitivityFinding[];
+}
+
+function immutableCandles(candles: readonly TournamentCandle[]): readonly TournamentCandle[] {
+  return Object.freeze(candles.map((candle) => Object.freeze({ ...candle })));
 }
 
 /**
@@ -28,6 +34,9 @@ export function runTournamentMatrix(input: TournamentMatrixInput): TournamentMat
   if (new Set(input.strategies.map((strategy) => strategy.id)).size !== input.strategies.length) throw new Error("TOURNAMENT_DUPLICATE_STRATEGY_ID");
   const fairnessHashByMode = new Map<TournamentExecutionMode, string>();
   const runs: TournamentRunResult[] = [];
+  // A strategy that tries to mutate an input fails rather than contaminating a
+  // later challenger in the same tournament matrix.
+  const candles = immutableCandles(input.execution.candles);
   for (const mode of modes) {
     fairnessHashByMode.set(mode, tournamentHash({
       dataset: input.spec.dataset,
@@ -38,17 +47,21 @@ export function runTournamentMatrix(input: TournamentMatrixInput): TournamentMat
     }));
     for (const strategy of input.strategies) {
       const manifest = buildRunManifest({ spec: input.spec, strategyId: strategy.id, executionMode: mode, parameterSet: strategy.parameters, createdAtMs: input.createdAtMs });
-      runs.push(runTournament({ ...input.execution, manifest, strategy }));
+      runs.push(runTournament({ ...input.execution, candles, manifest, strategy }));
     }
   }
-  return { fairnessHashByMode, runs };
+  return { fairnessHashByMode, runs, costSensitivity: assessCostSensitivity(runs) };
 }
 
 export interface WalkForwardTournamentInput {
   spec: TournamentExperimentSpec;
   candles: readonly TournamentCandle[];
   /** The tuner receives training data only. It never sees test/purge/embargo/holdout. */
-  chooseParameters: (input: { fold: WalkForwardFold; trainCandles: readonly TournamentCandle[] }) => Record<string, string | number | boolean>;
+  chooseParameters: (input: { fold: WalkForwardFold; trainCandles: readonly TournamentCandle[] }) => {
+    parameters: Record<string, string | number | boolean>;
+    /** Persisted training metric; it is never calculated from the OOS slice. */
+    inSampleExpectancyAfterCost: number;
+  };
   buildStrategy: (parameters: Record<string, string | number | boolean>) => TournamentStrategy;
   execution: Omit<TournamentExecutionInput, "manifest" | "strategy" | "candles">;
   createdAtMs: number;
@@ -56,7 +69,8 @@ export interface WalkForwardTournamentInput {
 }
 
 export interface WalkForwardTournamentResult {
-  folds: Array<{ foldId: string; strategyId: TournamentStrategyId; parameters: Record<string, string | number | boolean>; result: TournamentRunResult }>;
+  folds: Array<{ foldId: string; strategyId: TournamentStrategyId; parameters: Record<string, string | number | boolean>; inSampleExpectancyAfterCost: number; result: TournamentRunResult }>;
+  oosSummary: OosSummary;
 }
 
 /** Runs only out-of-sample tests selected from prior training windows; the sealed holdout is untouched. */
@@ -68,16 +82,16 @@ export function runWalkForwardTournament(input: WalkForwardTournamentInput): Wal
   for (const fold of plan.folds) {
     const trainTimes = new Set(timestamps.slice(fold.train.startIndex, fold.train.endExclusive));
     const testTimes = new Set(timestamps.slice(fold.test.startIndex, fold.test.endExclusive));
-    const parameters = input.chooseParameters({ fold, trainCandles: input.candles.filter((candle) => trainTimes.has(candle.openTimeMs)) });
-    const strategy = input.buildStrategy(parameters);
+    const selection = input.chooseParameters({ fold, trainCandles: input.candles.filter((candle) => trainTimes.has(candle.openTimeMs)) });
+    const strategy = input.buildStrategy(selection.parameters);
     const manifest = buildRunManifest({
-      spec: { ...input.spec, parameters: { ...input.spec.parameters, ...parameters, foldId: fold.foldId } },
+      spec: { ...input.spec, parameters: { ...input.spec.parameters, ...selection.parameters, foldId: fold.foldId } },
       strategyId: strategy.id,
       executionMode: input.executionMode,
-      parameterSet: parameters,
+      parameterSet: selection.parameters,
       createdAtMs: input.createdAtMs,
     });
-    results.push({ foldId: fold.foldId, strategyId: strategy.id, parameters, result: runTournament({ ...input.execution, candles: input.candles.filter((candle) => testTimes.has(candle.openTimeMs)), manifest, strategy }) });
+    results.push({ foldId: fold.foldId, strategyId: strategy.id, parameters: selection.parameters, inSampleExpectancyAfterCost: selection.inSampleExpectancyAfterCost, result: runTournament({ ...input.execution, candles: input.candles.filter((candle) => testTimes.has(candle.openTimeMs)), manifest, strategy }) });
   }
-  return { folds: results };
+  return { folds: results, oosSummary: summarizeOosWindows(results.map((fold) => ({ foldId: fold.foldId, inSampleExpectancyAfterCost: fold.inSampleExpectancyAfterCost, result: fold.result }))) };
 }

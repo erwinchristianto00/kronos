@@ -4,6 +4,7 @@ import {
   type TournamentExperimentSpec,
   type TournamentIntent,
   type TournamentMetrics,
+  type TournamentPortfolioMetrics,
   type TournamentRunManifest,
   type TournamentRunResult,
   type TournamentTrade,
@@ -117,6 +118,10 @@ function calculateMetrics(trades: TournamentTrade[], startingCapital: number): T
   };
 }
 
+function emptyPortfolioMetrics(spec: TournamentExperimentSpec): TournamentPortfolioMetrics {
+  return { peakOpenPositions: 0, peakGrossExposureFraction: 0, peakAbsoluteNetExposureFraction: 0, peakBtcBetaFraction: 0, liquidationBufferFraction: spec.portfolio.liquidationBufferFraction };
+}
+
 /** Shared wallet, fill, funding and stop-first ambiguity engine for every challenger. */
 export function runTournament(input: TournamentExecutionInput): TournamentRunResult {
   const { manifest, strategy, universe } = input;
@@ -128,7 +133,10 @@ export function runTournament(input: TournamentExecutionInput): TournamentRunRes
   if (manifest.executionMode === "EXPECTED" && (!input.expectedSlippageBpsAt || !input.expectedFeeBpsAt)) {
     invalidReasons.push("TOURNAMENT_EXPECTED_LIQUIDITY_EXECUTION_MISSING");
   }
-  if (invalidReasons.length) return { manifest, trades: [], metrics: calculateMetrics([], spec.portfolio.startingCapital), warnings, valid: false, invalidReasons };
+  if (invalidReasons.length) {
+    const strategyMetrics = calculateMetrics([], spec.portfolio.startingCapital);
+    return { manifest, trades: [], strategyMetrics, portfolioMetrics: emptyPortfolioMetrics(spec), metrics: strategyMetrics, warnings, valid: false, invalidReasons };
+  }
 
   const grouped = groupedCandles(input.candles);
   const times = [...grouped.keys()].sort((a, b) => a - b);
@@ -139,6 +147,18 @@ export function runTournament(input: TournamentExecutionInput): TournamentRunRes
   const open: OpenPosition[] = []; const trades: TournamentTrade[] = [];
   const costs = modeCost(manifest.executionMode, spec);
   let equity = spec.portfolio.startingCapital;
+  const portfolioMetrics = emptyPortfolioMetrics(spec);
+
+  const observePortfolio = (): void => {
+    const gross = open.reduce((sum, position) => sum + position.notional, 0);
+    const net = open.reduce((sum, position) => sum + position.notional * sideSign(position.intent.side), 0);
+    const beta = open.reduce((sum, position) => sum + position.notional * Math.abs(input.btcBetaBySymbol?.get(position.intent.symbol) ?? (position.intent.symbol === "BTCUSDT" ? 1 : 0)), 0);
+    const usableCapital = Math.max(1, equity * (1 - spec.portfolio.liquidationBufferFraction));
+    portfolioMetrics.peakOpenPositions = Math.max(portfolioMetrics.peakOpenPositions, open.length);
+    portfolioMetrics.peakGrossExposureFraction = Math.max(portfolioMetrics.peakGrossExposureFraction, gross / usableCapital);
+    portfolioMetrics.peakAbsoluteNetExposureFraction = Math.max(portfolioMetrics.peakAbsoluteNetExposureFraction, Math.abs(net) / usableCapital);
+    portfolioMetrics.peakBtcBetaFraction = Math.max(portfolioMetrics.peakBtcBetaFraction, beta / usableCapital);
+  };
 
   const fillCosts = (symbol: string, timestampMs: number, side: "LONG" | "SHORT", notional: number): { feeBps: number; slipBps: number } => {
     if (manifest.executionMode !== "EXPECTED") return costs;
@@ -196,6 +216,7 @@ export function runTournament(input: TournamentExecutionInput): TournamentRunRes
       const entryPrice = adversePrice(candle.open, intent.side, true, entryCosts.slipBps);
       const quantity = notional / entryPrice; const entryFee = notional * bps(entryCosts.feeBps);
       open.push({ intent, entryTimeMs: candle.openTimeMs, entryPrice, quantity, notional, entryFee, entrySlippage: Math.abs(entryPrice - candle.open) * quantity, entryIndex: indexBySymbol.get(intent.symbol)! });
+      observePortfolio();
     }
     pending.delete(time);
 
@@ -212,7 +233,7 @@ export function runTournament(input: TournamentExecutionInput): TournamentRunRes
       else if (stopHit) exit = { price: stop!, reason: "STOP" };
       else if (targetHit) exit = { price: target!, reason: "TARGET" };
       else if (index - position.entryIndex >= position.intent.maxHoldBars) exit = { price: candle.close, reason: "TIME" };
-      if (exit && close(position, candle, exit.price, exit.reason)) open.splice(open.indexOf(position), 1);
+      if (exit && close(position, candle, exit.price, exit.reason)) { open.splice(open.indexOf(position), 1); observePortfolio(); }
     }
 
     // Completed-candle strategy evaluation; current bar can only create next-open intents.
@@ -233,6 +254,6 @@ export function runTournament(input: TournamentExecutionInput): TournamentRunRes
   const finalTime = times.at(-1)!; const finalFrame = grouped.get(finalTime)!;
   for (const position of [...open]) { const candle = finalFrame.get(position.intent.symbol); if (candle) close(position, candle, candle.close, "END_OF_DATA"); }
   if (manifest.executionMode === "OPTIMISTIC") warnings.push("OPTIMISTIC_DIAGNOSTIC_ONLY");
-  const metrics = calculateMetrics(trades, spec.portfolio.startingCapital);
-  return { manifest, metrics, trades, warnings, valid: invalidReasons.length === 0, invalidReasons };
+  const strategyMetrics = calculateMetrics(trades, spec.portfolio.startingCapital);
+  return { manifest, strategyMetrics, portfolioMetrics, metrics: strategyMetrics, trades, warnings, valid: invalidReasons.length === 0, invalidReasons };
 }

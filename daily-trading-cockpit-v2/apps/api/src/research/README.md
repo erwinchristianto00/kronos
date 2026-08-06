@@ -29,3 +29,8 @@ hard-gate survivors; do not use a raw weighted score as a promotion decision.
 Do not infer historical-universe eligibility from today's exchange listing or
 from candle availability. Until a historical point-in-time universe artifact is
 provided, the intended outcome is a blocked run rather than a result.
+
+The locally archived 2026-01 through 2026-06 BTCUSDT/ETHUSDT candles and
+funding rows are useful raw inputs, but they are not that artifact: they carry
+neither decision-time listing/delisting state nor volume, spread, futures
+availability, execution-liquidity, or frozen-Kronos signal/regime ledgers.

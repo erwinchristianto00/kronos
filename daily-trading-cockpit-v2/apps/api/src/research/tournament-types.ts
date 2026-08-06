@@ -166,6 +166,15 @@ export interface TournamentMetrics {
   };
 }
 
+/** Portfolio-path observability is reported separately from trade-quality metrics. */
+export interface TournamentPortfolioMetrics {
+  peakOpenPositions: number;
+  peakGrossExposureFraction: number;
+  peakAbsoluteNetExposureFraction: number;
+  peakBtcBetaFraction: number;
+  liquidationBufferFraction: number;
+}
+
 export interface TournamentRunManifest {
   runId: string;
   createdAtMs: number;
@@ -178,6 +187,11 @@ export interface TournamentRunManifest {
 
 export interface TournamentRunResult {
   manifest: TournamentRunManifest;
+  /** Trade-quality result for this strategy before portfolio-cap observability. */
+  strategyMetrics: TournamentMetrics;
+  /** Shared-wallet portfolio observability for exactly this strategy run. */
+  portfolioMetrics: TournamentPortfolioMetrics;
+  /** Alias retained for rank/report consumers; equals strategyMetrics. */
   metrics: TournamentMetrics;
   trades: TournamentTrade[];
   warnings: string[];

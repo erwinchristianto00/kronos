@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -8,6 +8,7 @@ import { runTournament } from "../../src/research/execution/shared-executor.js";
 import { assessParameterPlateau, rankTournamentCandidates } from "../../src/research/reporting/governance.js";
 import { pairedAblation } from "../../src/research/reporting/ablations.js";
 import { persistTournamentRun } from "../../src/research/reporting/artifacts.js";
+import { assessCostSensitivity, summarizeOosWindows } from "../../src/research/reporting/oos.js";
 import { assertRandomControlPlanParity, randomTimingControl, type TournamentStrategy } from "../../src/research/strategies/challengers.js";
 import { runTournamentMatrix } from "../../src/research/tournament-runner.js";
 import type { TournamentCandle, TournamentExperimentSpec } from "../../src/research/tournament-types.js";
@@ -116,13 +117,31 @@ describe("Kronos Research Tournament v1 contract", () => {
     });
     expect(matrix.runs).toHaveLength(2);
     expect(matrix.runs.every((run) => run.valid)).toBe(true);
+    expect(matrix.costSensitivity).toEqual([expect.objectContaining({ strategyId: "CASH", comparable: true })]);
+    expect(matrix.runs[0]!.portfolioMetrics.liquidationBufferFraction).toBe(0.2);
     expect(matrix.fairnessHashByMode.get("CONSERVATIVE")).not.toBe(matrix.fairnessHashByMode.get("EXPECTED"));
     const root = mkdtempSync(join(tmpdir(), "krtv1-"));
     try {
       const first = persistTournamentRun(root, matrix.runs[0]!);
       const second = persistTournamentRun(root, matrix.runs[0]!);
       expect(second.registryHash).toBe(first.registryHash);
+      expect(JSON.parse(readFileSync(join(root, "run-registry.json"), "utf8"))).toHaveLength(1);
     } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("rejects a challenger that mutates the shared completed-candle input", () => {
+    const mutator: TournamentStrategy = { id: "CASH", version: "bad", parameters: {}, onCompletedBar: (bar) => { bar.candle.close = 0; return []; } };
+    expect(() => runTournamentMatrix({ spec: spec(), strategies: [mutator], createdAtMs: 0, modes: ["CONSERVATIVE"], execution: { universe: new PointInTimeUniverse([snapshot]), candles: [candle(0), candle(1)] } })).toThrow();
+  });
+
+  it("reports OOS degradation and cost sensitivity only from valid paired ledgers", () => {
+    const strategy: TournamentStrategy = { id: "CASH", version: "fixture", parameters: {}, onCompletedBar: () => [] };
+    const conservative = runTournament({ manifest: buildRunManifest({ spec: spec(), strategyId: "CASH", executionMode: "CONSERVATIVE", parameterSet: {}, createdAtMs: 0 }), strategy, universe: new PointInTimeUniverse([snapshot]), candles: [candle(0), candle(1)] });
+    const expected = runTournament({ manifest: buildRunManifest({ spec: spec(), strategyId: "CASH", executionMode: "EXPECTED", parameterSet: {}, createdAtMs: 0 }), strategy, universe: new PointInTimeUniverse([snapshot]), candles: [candle(0), candle(1)], expectedFeeBpsAt: () => 1, expectedSlippageBpsAt: () => 1 });
+    const oos = summarizeOosWindows([{ foldId: "wf-1", inSampleExpectancyAfterCost: 0.5, result: conservative }]);
+    expect(oos.profitableWindowRatio).toBe(0);
+    expect(oos.oosExpectancyDegradation).toBe(-0.5);
+    expect(assessCostSensitivity([conservative, expected])[0]).toMatchObject({ strategyId: "CASH", comparable: true, conservativeMinusExpected: 0 });
   });
 
   it("allows an ablation only when its fairness contract matches", () => {
