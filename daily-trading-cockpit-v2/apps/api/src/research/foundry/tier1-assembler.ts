@@ -9,17 +9,19 @@ import { futuresTimeline, listingTimeline, minimumHistoryTimeline } from "./stat
 import { buildTier1CapabilityReport, type Tier1CapabilityReport } from "./tier1-capability.js";
 import { riskSnapshotsFromArtifactRows } from "./tier1-pit-artifacts.js";
 import type { ValidatedFoundryRow } from "./semantic-validators.js";
+import { PointInTimeLiquiditySpread, type Tier1LiquiditySpreadPolicy } from "./liquidity-eligibility.js";
 import { runTournamentMatrix, type TournamentMatrixResult } from "../tournament-runner.js";
-import type { FundingSettlement, TournamentCandle, TournamentExperimentSpec } from "../tournament-types.js";
+import type { FundingSettlement, PointInTimeUniverseSnapshot, TournamentCandle, TournamentExperimentSpec } from "../tournament-types.js";
 import { buyAndHoldStrategy, cashStrategy, donchianStrategy, emaCrossStrategy, equalWeightHoldStrategy, macdStrategy, randomTimingControl, rsiMeanReversionStrategy, type RandomControlReference } from "../strategies/challengers.js";
 
-const REQUIRED = ["COMPLETED_CANDLES", "FUNDING_SETTLEMENTS", "LISTING_DELISTING_TIMELINE", "FUTURES_AVAILABILITY_TIMELINE", "MINIMUM_HISTORY_ELIGIBILITY", "CANONICAL_EPISODES", "PORTFOLIO_RISK_SNAPSHOTS"] as const;
+const REQUIRED = ["COMPLETED_CANDLES", "FUNDING_SETTLEMENTS", "LISTING_DELISTING_TIMELINE", "FUTURES_AVAILABILITY_TIMELINE", "MINIMUM_HISTORY_ELIGIBILITY", "PIT_LIQUIDITY_SPREAD", "CANONICAL_EPISODES", "PORTFOLIO_RISK_SNAPSHOTS"] as const;
 type RequiredKind = typeof REQUIRED[number];
 export interface Tier1LoadedArtifact { manifest: FoundryArtifactManifest; rows: ValidatedFoundryRow[]; }
 export interface Tier1Assembly {
   label: "TIER_1_BASELINE — NOT COMPARABLE TO EXACT KRONOS";
   capability: Tier1CapabilityReport;
   universe: PointInTimeUniverse;
+  universeSnapshots: PointInTimeUniverseSnapshot[];
   fundingSettlementScheduleBySymbol: ReadonlyMap<string, readonly number[]>;
   canonicalEpisodeIdAt: (symbol: string, decisionTimeMs: number) => string | null;
   portfolioRisk: PointInTimePortfolioRisk;
@@ -34,27 +36,33 @@ export function loadTier1Artifacts(input: { rootDir: string; semanticManifestHas
 }
 
 /** Builds Tier-1 execution adapters only if every source-backed artifact is complete and coherent. */
-export function assembleTier1Baseline(input: { artifacts: readonly Tier1LoadedArtifact[]; symbols: readonly string[]; startMs: number; endMs: number; timeframeMs: number; universeEvidenceSourceHash: string }): Tier1Assembly | { label: "TIER_1_BASELINE — NOT COMPARABLE TO EXACT KRONOS"; capability: Tier1CapabilityReport } {
+export function assembleTier1Baseline(input: { artifacts: readonly Tier1LoadedArtifact[]; symbols: readonly string[]; startMs: number; endMs: number; timeframeMs: number; liquidityPolicy: Tier1LiquiditySpreadPolicy }): Tier1Assembly | { label: "TIER_1_BASELINE — NOT COMPARABLE TO EXACT KRONOS"; capability: Tier1CapabilityReport } {
   const capability = buildTier1CapabilityReport(input.artifacts.map((artifact) => artifact.manifest)); const label = "TIER_1_BASELINE — NOT COMPARABLE TO EXACT KRONOS" as const;
   if (!capability.canRun) return { label, capability };
-  if (!input.universeEvidenceSourceHash) throw new Error("FOUNDRY_TIER1_UNIVERSE_EVIDENCE_SOURCE_MISSING");
   const indexed = byKind(input.artifacts);
   for (const kind of REQUIRED) {
     const artifact = indexed.get(kind)!; assertCompleteFoundryArtifact(artifact.manifest);
     if (artifact.manifest.timeRange.startMs !== input.startMs || artifact.manifest.timeRange.endMs !== input.endMs || JSON.stringify([...artifact.manifest.expectedCoverage.symbols].sort()) !== JSON.stringify([...input.symbols].sort())) throw new Error(`FOUNDRY_TIER1_ARTIFACT_RANGE_OR_SYMBOL_MISMATCH_${kind}`);
   }
-  const listing = indexed.get("LISTING_DELISTING_TIMELINE")!; const futures = indexed.get("FUTURES_AVAILABILITY_TIMELINE")!; const eligibility = indexed.get("MINIMUM_HISTORY_ELIGIBILITY")!;
+  const listing = indexed.get("LISTING_DELISTING_TIMELINE")!; const futures = indexed.get("FUTURES_AVAILABILITY_TIMELINE")!; const eligibility = indexed.get("MINIMUM_HISTORY_ELIGIBILITY")!; const liquidityArtifact = indexed.get("PIT_LIQUIDITY_SPREAD")!;
   assertEligibilityTimelineConsistency({ listingRows: listing.rows, futuresRows: futures.rows, minimumHistoryRows: eligibility.rows });
-  const listings = listingTimeline(listing.rows); const future = futuresTimeline(futures.rows); const history = minimumHistoryTimeline(eligibility.rows); const clock = buildCanonicalClock(input);
+  const listings = listingTimeline(listing.rows); const future = futuresTimeline(futures.rows); const history = minimumHistoryTimeline(eligibility.rows); const liquidity = new PointInTimeLiquiditySpread(liquidityArtifact.rows, input.liquidityPolicy); const clock = buildCanonicalClock(input);
   const universeSnapshots = clock.timestamps.map((openTimeMs) => {
-    const asOfMs = openTimeMs + input.timeframeMs - 1; const eligibleSymbols = input.symbols.filter((symbol) => listings.at(symbol, asOfMs).value === "LISTED" && future.at(symbol, asOfMs).value && history.at(symbol, asOfMs).value).sort();
+    const asOfMs = openTimeMs + input.timeframeMs - 1;
+    const symbolEvidence = input.symbols.slice().sort().map((symbol) => {
+      const listingState = listings.at(symbol, asOfMs); const futuresState = future.at(symbol, asOfMs); const historyState = history.at(symbol, asOfMs); const liquidityState = liquidity.at(symbol, asOfMs);
+      const reason = listingState.value !== "LISTED" ? "NOT_LISTED" : !futuresState.value ? "FUTURES_UNAVAILABLE" : !historyState.value ? "MINIMUM_HISTORY_INSUFFICIENT" : liquidityState.reason;
+      return { symbol, eligible: reason === "ELIGIBLE", reason, listingState: listingState.value, listingSourceHash: listingState.sourceHash, futuresAvailable: futuresState.value, futuresSourceHash: futuresState.sourceHash, minimumHistoryEligible: historyState.value, minimumHistorySourceHash: historyState.sourceHash, liquidityReason: liquidityState.reason, liquiditySourceHash: liquidityState.sourceHash };
+    });
+    const eligibleSymbols = symbolEvidence.filter((state) => state.eligible).map((state) => state.symbol);
     if (!eligibleSymbols.length) throw new Error(`FOUNDRY_TIER1_UNIVERSE_EMPTY_${asOfMs}`);
-    return { asOfMs, eligibleSymbols, sourceHash: tournamentHash({ universeEvidenceSourceHash: input.universeEvidenceSourceHash, listing: listings.at(eligibleSymbols[0]!, asOfMs).sourceHash, futures: future.at(eligibleSymbols[0]!, asOfMs).sourceHash, eligibility: history.at(eligibleSymbols[0]!, asOfMs).sourceHash }), evidence: { listedThen: true as const, sufficientHistoryThen: true as const, liquidityVolumeEligibleThen: true as const, spreadEligibleThen: true as const, futuresAvailableThen: true as const, delistingCheckedThen: true as const } };
+    const universeProvenance = { decisionTimeMs: asOfMs, policyVersion: input.liquidityPolicy.version, thresholds: { minVolume: input.liquidityPolicy.minVolume, minLiquidityNotional: input.liquidityPolicy.minLiquidityNotional, maxSpreadBps: input.liquidityPolicy.maxSpreadBps, maxAgeMs: input.liquidityPolicy.maxAgeMs }, symbols: symbolEvidence };
+    return { asOfMs, eligibleSymbols, sourceHash: tournamentHash(universeProvenance), universeProvenance, evidence: { listedThen: true as const, sufficientHistoryThen: true as const, liquidityVolumeEligibleThen: true as const, spreadEligibleThen: true as const, futuresAvailableThen: true as const, delistingCheckedThen: true as const } };
   });
   const funding = indexed.get("FUNDING_SETTLEMENTS")!; const fundingSettlementScheduleBySymbol = new Map(input.symbols.map((symbol) => [symbol, funding.rows.filter((row) => row.symbol === symbol).map((row) => row.canonicalSettlementTimeMs as number).sort((a, b) => a - b)]));
   const episodes = indexed.get("CANONICAL_EPISODES")!; const episodeByKey = new Map(episodes.rows.map((row) => [`${row.symbol}:${row.decisionTimeMs}`, row.episodeId as string]));
   const risk = indexed.get("PORTFOLIO_RISK_SNAPSHOTS")!;
-  return { label, capability, universe: new PointInTimeUniverse(universeSnapshots), fundingSettlementScheduleBySymbol, canonicalEpisodeIdAt: (symbol, decisionTimeMs) => episodeByKey.get(`${symbol}:${decisionTimeMs}`) ?? null, portfolioRisk: new PointInTimePortfolioRisk(riskSnapshotsFromArtifactRows(risk.rows, input.symbols)), artifactSemanticHashes: capability.artifactSemanticHashes };
+  return { label, capability, universe: new PointInTimeUniverse(universeSnapshots), universeSnapshots, fundingSettlementScheduleBySymbol, canonicalEpisodeIdAt: (symbol, decisionTimeMs) => episodeByKey.get(`${symbol}:${decisionTimeMs}`) ?? null, portfolioRisk: new PointInTimePortfolioRisk(riskSnapshotsFromArtifactRows(risk.rows, input.symbols)), artifactSemanticHashes: capability.artifactSemanticHashes };
 }
 
 /** Ranking is forbidden for an incomplete Tier-1 assembly. */

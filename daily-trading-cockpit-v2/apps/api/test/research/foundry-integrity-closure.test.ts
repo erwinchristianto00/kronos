@@ -10,6 +10,7 @@ import { deriveFoundryCoverage } from "../../src/research/foundry/derived-covera
 import { alignFundingSettlements } from "../../src/research/foundry/funding-schedule.js";
 import { EffectiveStateTimeline } from "../../src/research/foundry/stateful-timeline.js";
 import { FOUNDRY_SCHEMA_V1, validateFoundryRows } from "../../src/research/foundry/semantic-validators.js";
+import { fixtureSourceProvenance } from "../../src/research/foundry/source-provenance.js";
 import { PointInTimeUniverse } from "../../src/research/universe/point-in-time-universe.js";
 
 const H = 3_600_000;
@@ -43,7 +44,7 @@ describe("Foundry integrity closure", () => {
   });
 
   it("persists canonical sorted rows only and detects row or manifest tampering", () => {
-    const built = buildFoundryArtifact({ artifactKind: "COMPLETED_CANDLES", schemaVersion: FOUNDRY_SCHEMA_V1, source: "fixture", units: { price: "USDT", volume: "base" }, generatedAtMs: 1, generationSha: "sha", expectedCoverage: { startMs: 0, endMs: 2 * H, symbols: ["BTCUSDT"], cadenceMs: H }, rows: [candle(0), candle(H)] });
+    const built = buildFoundryArtifact({ artifactKind: "COMPLETED_CANDLES", schemaVersion: FOUNDRY_SCHEMA_V1, source: "fixture", sourceProvenance: fixtureSourceProvenance("fixture", "0000000"), units: { price: "USDT", volume: "base" }, generatedAtMs: 1, generationSha: "sha", expectedCoverage: { startMs: 0, endMs: 2 * H, symbols: ["BTCUSDT"], cadenceMs: H }, rows: [candle(0), candle(H)] });
     const root = mkdtempSync(join(tmpdir(), "foundry-integrity-"));
     try {
       const directory = persistFoundryArtifact({ rootDir: root, manifest: built.manifest, rows: built.canonicalRows });

@@ -51,6 +51,25 @@ export interface PointInTimeUniverseSnapshot {
     futuresAvailableThen: true;
     delistingCheckedThen: true;
   };
+  /** Tier-1 assembler persists every included/excluded symbol decision into the snapshot identity. */
+  universeProvenance?: {
+    decisionTimeMs: number;
+    policyVersion: string;
+    thresholds: Record<string, number | string>;
+    symbols: Array<{
+      symbol: string;
+      eligible: boolean;
+      reason: string;
+      listingState: string;
+      listingSourceHash: string;
+      futuresAvailable: boolean;
+      futuresSourceHash: string;
+      minimumHistoryEligible: boolean;
+      minimumHistorySourceHash: string;
+      liquidityReason: string;
+      liquiditySourceHash: string | null;
+    }>;
+  };
 }
 
 export interface TournamentDatasetManifest {

@@ -9,6 +9,7 @@ import type { TournamentCandle, TournamentExperimentSpec } from "../../src/resea
 import type { TournamentStrategy } from "../../src/research/strategies/challengers.js";
 import { PointInTimeUniverse } from "../../src/research/universe/point-in-time-universe.js";
 import type { ValidatedAbsence } from "../../src/research/foundry/canonical-clock.js";
+import { fixtureSourceProvenance } from "../../src/research/foundry/source-provenance.js";
 
 const H = 3_600_000;
 const symbols = ["BTCUSDT", "ETHUSDT"];
@@ -110,7 +111,7 @@ describe("Dataset Foundry and methodology hardening", () => {
   it("prevents tier overclaiming and creates deterministic complete Foundry artifacts", () => {
     expect(() => assertTierAllowsRun({ tier: "TIER_1_BASELINE", strategyId: "CASH", executionMode: "EXPECTED" })).toThrow("TOURNAMENT_TIER_1_CONSERVATIVE_ONLY");
     expect(() => assertTierAllowsRun({ tier: "TIER_2_EXPECTED_EXECUTION", strategyId: "KRONOS_CURRENT", executionMode: "CONSERVATIVE" })).toThrow("TOURNAMENT_TIER_EXACT_KRONOS_LEDGER_REQUIRED");
-    const base = { artifactKind: "COMPLETED_CANDLES" as const, schemaVersion: "v1" as const, source: "fixture", units: { price: "USDT", volume: "BTC" }, generatedAtMs: 1, generationSha: "abc", expectedCoverage: { startMs: 0, endMs: H, symbols: ["BTCUSDT"], cadenceMs: H }, rows: [{ symbol: "BTCUSDT", openTimeMs: 0, closeTimeMs: H - 1, open: 1, high: 2, low: 1, close: 2, volume: 1, sourceHash: "source" }] };
+    const base = { artifactKind: "COMPLETED_CANDLES" as const, schemaVersion: "v1" as const, source: "fixture", sourceProvenance: fixtureSourceProvenance("fixture", "0000000"), units: { price: "USDT", volume: "BTC" }, generatedAtMs: 1, generationSha: "abc", expectedCoverage: { startMs: 0, endMs: H, symbols: ["BTCUSDT"], cadenceMs: H }, rows: [{ symbol: "BTCUSDT", openTimeMs: 0, closeTimeMs: H - 1, open: 1, high: 2, low: 1, close: 2, volume: 1, sourceHash: "source" }] };
     const first = buildFoundryArtifactManifest(base); const second = buildFoundryArtifactManifest({ ...base, rows: [{ ...base.rows[0] }] });
     expect(first.semanticManifestHash).toBe(second.semanticManifestHash); expect(() => assertCompleteFoundryArtifact(first)).not.toThrow();
     expect(buildFoundryCoverageReport([first])).toMatchObject({ complete: true, artifactCount: 1 });

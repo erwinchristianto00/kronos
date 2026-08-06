@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { buildFoundryArtifact, type FoundryArtifactKind, type FoundryArtifactManifest } from "./artifact-schema.js";
 import { FOUNDRY_SCHEMA_V1 } from "./semantic-validators.js";
 import type { FoundryExpectedCoverage } from "./derived-coverage.js";
+import type { FoundrySourceProvenance } from "./source-provenance.js";
 
 /**
  * Import only explicit export files. This adapter neither fetches current
@@ -13,6 +14,7 @@ export function importFoundryJsonArtifact(input: {
   artifactKind: FoundryArtifactKind;
   schemaVersion: typeof FOUNDRY_SCHEMA_V1;
   source: string;
+  sourceProvenance: FoundrySourceProvenance;
   units: Record<string, string>;
   generatedAtMs: number;
   generationSha: string;

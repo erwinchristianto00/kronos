@@ -9,13 +9,14 @@ import { importLocalBinanceCandleArchive } from "../../src/research/foundry/loca
 import { persistFoundryArtifact } from "../../src/research/foundry/artifact-store.js";
 import { buildTier1CapabilityReport } from "../../src/research/foundry/tier1-capability.js";
 import { FOUNDRY_SCHEMA_V1, validateFoundryRows } from "../../src/research/foundry/semantic-validators.js";
+import { fixtureSourceProvenance } from "../../src/research/foundry/source-provenance.js";
 import { PointInTimeUniverse } from "../../src/research/universe/point-in-time-universe.js";
 import { assertEligibilityTimelineConsistency } from "../../src/research/foundry/cross-artifact-validator.js";
 
 const H = 3_600_000;
 const expected = { startMs: 0, endMs: 2 * H, symbols: ["BTCUSDT"], cadenceMs: H };
 const candle = (time: number) => ({ symbol: "BTCUSDT", openTimeMs: time, closeTimeMs: time + H - 1, open: 100, high: 101, low: 99, close: 100, volume: 1, sourceHash: "row-source" });
-const base = (rows: unknown[], source = "fixture", coverage = expected) => buildFoundryArtifactManifest({ artifactKind: "COMPLETED_CANDLES", schemaVersion: FOUNDRY_SCHEMA_V1, source, units: { price: "USDT", volume: "base" }, generatedAtMs: 1, generationSha: "sha", expectedCoverage: coverage, rows });
+const base = (rows: unknown[], source = "fixture", coverage = expected) => buildFoundryArtifactManifest({ artifactKind: "COMPLETED_CANDLES", schemaVersion: FOUNDRY_SCHEMA_V1, source, sourceProvenance: fixtureSourceProvenance(source, "0000000"), units: { price: "USDT", volume: "base" }, generatedAtMs: 1, generationSha: "sha", expectedCoverage: coverage, rows });
 
 describe("Foundry semantic strictness", () => {
   it("fails malformed rows for every artifact kind and unknown schema versions", () => {
@@ -60,7 +61,7 @@ describe("Foundry semantic strictness", () => {
     try {
       mkdirSync(symbolDir, { recursive: true });
       const path = join(symbolDir, "fixture.csv"); writeFileSync(path, `open_time,open,high,low,close,volume,close_time\n0,100,101,99,100,1,3599999\n3600000,100,101,99,100,1,7199999\n`);
-      const first = importLocalBinanceCandleArchive({ root, expectedCoverage: expected, source: "local-fixture", generatedAtMs: 1, generationSha: "sha" }); const second = importLocalBinanceCandleArchive({ root, expectedCoverage: expected, source: "local-fixture", generatedAtMs: 1, generationSha: "sha" });
+      const first = importLocalBinanceCandleArchive({ root, expectedCoverage: expected, source: "local-fixture", sourceProvenance: fixtureSourceProvenance("local-fixture", "0000000"), generatedAtMs: 1, generationSha: "sha" }); const second = importLocalBinanceCandleArchive({ root, expectedCoverage: expected, source: "local-fixture", sourceProvenance: fixtureSourceProvenance("local-fixture", "0000000"), generatedAtMs: 1, generationSha: "sha" });
       expect(first.manifest.rowsHash).toBe(second.manifest.rowsHash); expect(first.manifest.semanticManifestHash).toBe(second.manifest.semanticManifestHash);
       expect(JSON.stringify(first.rows)).toBe(JSON.stringify(second.rows)); expect(JSON.stringify(first.manifest)).toBe(JSON.stringify(second.manifest));
       expect(persistFoundryArtifact({ rootDir: root, manifest: first.manifest, rows: first.rows })).toContain(first.manifest.semanticManifestHash);
