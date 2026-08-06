@@ -39,7 +39,7 @@ function identity(kind: FoundryArtifactKind, row: Record<string, unknown>): stri
 function validateByKind(kind: FoundryArtifactKind, row: Record<string, unknown>): ValidatedFoundryRow {
   const sourceHash = source(row);
   if (kind === "COMPLETED_CANDLES") {
-    const openTimeMs = positiveTime(row.openTimeMs, "OPEN_TIME_MS"); const closeTimeMs = positiveTime(row.closeTimeMs, "CLOSE_TIME_MS"); const open = number(row.open, "OPEN", 0); const high = number(row.high, "HIGH", 0); const low = number(row.low, "LOW", 0); const close = number(row.close, "CLOSE", 0); const volume = number(row.volume, "VOLUME", 0);
+    const openTimeMs = positiveTime(row.openTimeMs, "OPEN_TIME_MS"); const closeTimeMs = positiveTime(row.closeTimeMs, "CLOSE_TIME_MS"); const open = number(row.open, "OPEN", Number.MIN_VALUE); const high = number(row.high, "HIGH", Number.MIN_VALUE); const low = number(row.low, "LOW", Number.MIN_VALUE); const close = number(row.close, "CLOSE", Number.MIN_VALUE); const volume = number(row.volume, "VOLUME", 0);
     if (closeTimeMs <= openTimeMs || high < Math.max(open, close) || low > Math.min(open, close) || high < low) throw new Error("FOUNDRY_CANDLE_OHLC_INVALID");
     return { symbol: symbol(row.symbol), timestampMs: openTimeMs, openTimeMs, closeTimeMs, open, high, low, close, volume, sourceHash };
   }
@@ -64,6 +64,14 @@ export function validateFoundryRows(kind: FoundryArtifactKind, schemaVersion: st
     const raw = object(rows[index]); const key = identity(kind, raw);
     if (seen.has(key)) throw new Error(`FOUNDRY_DUPLICATE_OR_CONFLICTING_ROW_${key}`); seen.add(key);
     if (row.timestampMs < prior) throw new Error("FOUNDRY_TIMESTAMPS_NOT_MONOTONIC"); prior = row.timestampMs;
+  }
+  if (["LISTING_DELISTING_TIMELINE", "FUTURES_AVAILABILITY_TIMELINE", "MINIMUM_HISTORY_ELIGIBILITY", "FEE_ASSUMPTIONS"].includes(kind)) {
+    const lastState = new Map<string, unknown>();
+    for (const row of output) {
+      const key = row.symbol ?? "*"; const state = kind === "LISTING_DELISTING_TIMELINE" ? row.status : kind === "FUTURES_AVAILABILITY_TIMELINE" ? row.available : kind === "MINIMUM_HISTORY_ELIGIBILITY" ? row.eligible : `${row.makerFeeBps}:${row.takerFeeBps}`;
+      if (lastState.has(key) && lastState.get(key) === state) throw new Error(`FOUNDRY_TIMELINE_REDUNDANT_TRANSITION_${key}_${row.timestampMs}`);
+      lastState.set(key, state);
+    }
   }
   return output;
 }

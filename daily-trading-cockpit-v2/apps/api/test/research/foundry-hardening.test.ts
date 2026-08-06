@@ -8,6 +8,7 @@ import { PointInTimePortfolioRisk } from "../../src/research/risk/point-in-time-
 import type { TournamentCandle, TournamentExperimentSpec } from "../../src/research/tournament-types.js";
 import type { TournamentStrategy } from "../../src/research/strategies/challengers.js";
 import { PointInTimeUniverse } from "../../src/research/universe/point-in-time-universe.js";
+import type { ValidatedAbsence } from "../../src/research/foundry/canonical-clock.js";
 
 const H = 3_600_000;
 const symbols = ["BTCUSDT", "ETHUSDT"];
@@ -33,9 +34,9 @@ const holdStrategy = (id: "BTC_BUY_AND_HOLD" | "EQUAL_WEIGHT_HOLD" = "BTC_BUY_AN
 });
 
 function risk(snapshots = [{ asOfMs: 0, validUntilMs: 10 * H, sourceHash: "risk", btcBetaBySymbol: { BTCUSDT: 1, ETHUSDT: 0 }, correlationClusterBySymbol: { BTCUSDT: "BTC", ETHUSDT: "ETH" } }]) { return new PointInTimePortfolioRisk(snapshots); }
-function run(input: { strategy?: TournamentStrategy; candles?: TournamentCandle[]; experiment?: TournamentExperimentSpec; portfolioRisk?: PointInTimePortfolioRisk; episode?: ((symbol: string, time: number) => string | null) | undefined; fundingSettlements?: Parameters<typeof runTournament>[0]["fundingSettlements"]; fundingSettlementScheduleBySymbol?: Parameters<typeof runTournament>[0]["fundingSettlementScheduleBySymbol"] }) {
+function run(input: { strategy?: TournamentStrategy; candles?: TournamentCandle[]; experiment?: TournamentExperimentSpec; portfolioRisk?: PointInTimePortfolioRisk; episode?: ((symbol: string, time: number) => string | null) | undefined; fundingSettlements?: Parameters<typeof runTournament>[0]["fundingSettlements"]; fundingSettlementScheduleBySymbol?: Parameters<typeof runTournament>[0]["fundingSettlementScheduleBySymbol"]; absences?: readonly ValidatedAbsence[] }) {
   const experiment = input.experiment ?? spec(); const strategy = input.strategy ?? holdStrategy(); const rows = input.candles ?? candles(); const eligibleSymbols = [...new Set(rows.map((row) => row.symbol))];
-  return runTournament({ manifest: buildRunManifest({ spec: experiment, strategyId: strategy.id, executionMode: "CONSERVATIVE", parameterSet: {}, createdAtMs: 0 }), strategy, candles: rows, universe: new PointInTimeUniverse([{ ...universeSnapshot, eligibleSymbols }]), portfolioRisk: input.portfolioRisk ?? risk(), canonicalEpisodeIdAt: input.episode ?? ((symbol, time) => `${symbol}:${time}`), fundingSettlements: input.fundingSettlements, fundingSettlementScheduleBySymbol: input.fundingSettlementScheduleBySymbol });
+  return runTournament({ manifest: buildRunManifest({ spec: experiment, strategyId: strategy.id, executionMode: "CONSERVATIVE", parameterSet: {}, createdAtMs: 0 }), strategy, candles: rows, universe: new PointInTimeUniverse([{ ...universeSnapshot, eligibleSymbols }]), portfolioRisk: input.portfolioRisk ?? risk(), canonicalEpisodeIdAt: input.episode ?? ((symbol, time) => `${symbol}:${time}`), fundingSettlements: input.fundingSettlements, fundingSettlementScheduleBySymbol: input.fundingSettlementScheduleBySymbol, validatedAbsences: input.absences });
 }
 
 describe("Dataset Foundry and methodology hardening", () => {
@@ -48,6 +49,16 @@ describe("Dataset Foundry and methodology hardening", () => {
     expect(result.metrics.maxDrawdown).toBeGreaterThan(0.35);
     expect(result.navLedger.some((point) => point.unrealizedPnl < -3_000)).toBe(true);
     expect(result.navLedger.slice(1).every((point, index) => point.timestampMs - result.navLedger[index]!.timestampMs === H)).toBe(true);
+  });
+
+  it("records exactly one NAV point for every canonical tick, including sourced HALTED marks", () => {
+    const all = candles("BTCUSDT", [100, 100, 50, 100]); const withoutThird = all.filter((row) => row.openTimeMs !== 2 * H);
+    const result = run({ candles: withoutThird, absences: [{ symbol: "BTCUSDT", openTimeMs: 2 * H, reason: "HALTED", sourceHash: "halt-evidence", markPrice: 50, markPolicy: "OFFICIAL_HALT_MARK" }] });
+    expect(result.valid).toBe(true);
+    expect(result.navLedger).toHaveLength(4);
+    expect(result.navLedger.map((point) => point.timestampMs)).toEqual([0, H, 2 * H, 3 * H]);
+    expect(result.navLedger[2]!.unrealizedPnl).toBeLessThan(-3_000);
+    expect(run({ candles: withoutThird, absences: [{ symbol: "BTCUSDT", openTimeMs: 2 * H, reason: "DATA_UNAVAILABLE", sourceHash: "no-data" }] }).valid).toBe(false);
   });
 
   it("fails episode-dependent gates closed without canonical provenance instead of calendar buckets", () => {

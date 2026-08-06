@@ -14,7 +14,7 @@ import {
 import type { TournamentStrategy } from "../strategies/challengers.js";
 import { PointInTimePortfolioRisk } from "../risk/point-in-time-portfolio-risk.js";
 import { PointInTimeUniverse } from "../universe/point-in-time-universe.js";
-import { assertCandlesCoverCanonicalClock, buildCanonicalClock, type ValidatedAbsence } from "../foundry/canonical-clock.js";
+import { canonicalMarks, buildCanonicalClock, type ValidatedAbsence } from "../foundry/canonical-clock.js";
 
 export interface TournamentExecutionInput {
   manifest: TournamentRunManifest;
@@ -78,12 +78,12 @@ function groupedCandles(candles: readonly TournamentCandle[]): Map<number, Map<s
 function calculateMetrics(trades: TournamentTrade[], nav: readonly TournamentNavPoint[], startingCapital: number, canonicalEpisodeProvenanceComplete: boolean): TournamentMetrics {
   const net = trades.map((trade) => trade.netPnl); const wins = net.filter((value) => value > 0); const losses = net.filter((value) => value < 0);
   const grossWin = wins.reduce((sum, value) => sum + value, 0); const grossLoss = -losses.reduce((sum, value) => sum + value, 0);
-  const navReturns = nav.slice(1).map((point, index) => nav[index]!.equity > 0 ? point.equity / nav[index]!.equity - 1 : 0);
+  const navReturns = nav.map((point, index) => (index ? nav[index - 1]!.equity : startingCapital) > 0 ? point.equity / (index ? nav[index - 1]!.equity : startingCapital) - 1 : 0);
   const average = navReturns.length ? navReturns.reduce((sum, value) => sum + value, 0) / navReturns.length : 0;
   const variance = navReturns.length ? navReturns.reduce((sum, value) => sum + (value - average) ** 2, 0) / navReturns.length : 0;
   const intervalsPerYear = nav.length > 1 ? (365 * DAY) / ((nav.at(-1)!.timestampMs - nav[0]!.timestampMs) / (nav.length - 1)) : 0;
   const sharpe = variance > 0 && intervalsPerYear > 0 ? average / Math.sqrt(variance) * Math.sqrt(intervalsPerYear) : null;
-  let peak = nav[0]?.equity ?? startingCapital; let maxDrawdown = 0;
+  let peak = startingCapital; let maxDrawdown = 0;
   for (const point of nav) { peak = Math.max(peak, point.equity); maxDrawdown = Math.max(maxDrawdown, peak > 0 ? (peak - point.equity) / peak : 1); }
   const elapsedMs = (nav.at(-1)?.timestampMs ?? 0) - (nav[0]?.timestampMs ?? 0); const years = Math.max(1 / 365, elapsedMs / (365 * DAY));
   const finalEquity = nav.at(-1)?.equity ?? startingCapital; const annualized = finalEquity > 0 ? (finalEquity / startingCapital) ** (1 / years) - 1 : null;
@@ -115,13 +115,14 @@ export function runTournament(input: TournamentExecutionInput): TournamentRunRes
   if (input.candles.length === 0) invalidReasons.push("TOURNAMENT_NO_CANDLES");
   if (manifest.executionMode === "EXPECTED" && (!input.expectedSlippageBpsAt || !input.expectedFeeBpsAt)) invalidReasons.push("TOURNAMENT_EXPECTED_LIQUIDITY_EXECUTION_MISSING");
   if (spec.costs.fundingEnabled && (!input.fundingSettlements || !input.fundingSettlementScheduleBySymbol)) invalidReasons.push("TOURNAMENT_FUNDING_SETTLEMENT_DATA_MISSING");
-  try { assertCandlesCoverCanonicalClock({ clock: buildCanonicalClock({ startMs: spec.dataset.dataRange.startMs, endMs: spec.dataset.dataRange.endMs, timeframeMs: spec.dataset.timeframeMs }), candles: input.candles, universe, absences: input.validatedAbsences }); } catch (error) { invalidReasons.push(error instanceof Error ? error.message : "FOUNDRY_CANONICAL_CLOCK_INVALID"); }
+  const clock = buildCanonicalClock({ startMs: spec.dataset.dataRange.startMs, endMs: spec.dataset.dataRange.endMs, timeframeMs: spec.dataset.timeframeMs }); let marks = new Map<string, number>();
+  try { marks = canonicalMarks({ clock, candles: input.candles, universe, absences: input.validatedAbsences }); } catch (error) { invalidReasons.push(error instanceof Error ? error.message : "FOUNDRY_CANONICAL_CLOCK_INVALID"); }
   const emptyNav: TournamentNavPoint[] = [];
   if (invalidReasons.length) { const strategyMetrics = calculateMetrics([], emptyNav, spec.portfolio.startingCapital, false); return { manifest, trades: [], navLedger: emptyNav, strategyMetrics, portfolioMetrics: emptyPortfolioMetrics(spec), metrics: strategyMetrics, warnings, valid: false, invalidReasons }; }
 
-  const grouped = groupedCandles(input.candles); const times = [...grouped.keys()].sort((a, b) => a - b); const symbols = [...new Set(input.candles.map((candle) => candle.symbol))].sort();
+  const grouped = groupedCandles(input.candles); const times = clock.timestamps; const symbols = [...new Set(input.candles.map((candle) => candle.symbol))].sort();
   const history = new Map(symbols.map((symbol) => [symbol, [] as TournamentCandle[]])); const indexBySymbol = new Map(symbols.map((symbol) => [symbol, 0]));
-  const pending = new Map<number, TournamentIntent[]>(); const open: OpenPosition[] = []; const trades: TournamentTrade[] = []; const navLedger: TournamentNavPoint[] = [{ timestampMs: times[0]! - spec.dataset.timeframeMs, cash: spec.portfolio.startingCapital, realizedPnl: 0, unrealizedPnl: 0, equity: spec.portfolio.startingCapital, grossExposure: 0, netExposure: 0, marginUsage: 0, liquidationBuffer: spec.portfolio.startingCapital * spec.portfolio.liquidationBufferFraction }];
+  const pending = new Map<number, TournamentIntent[]>(); const open: OpenPosition[] = []; const trades: TournamentTrade[] = []; const navLedger: TournamentNavPoint[] = [];
   const costs = modeCost(manifest.executionMode, spec); const portfolioMetrics = emptyPortfolioMetrics(spec); let cash = spec.portfolio.startingCapital; let equityForAdmission = spec.portfolio.startingCapital;
   const fundingByKey = new Map((input.fundingSettlements ?? []).map((settlement) => [`${settlement.symbol}:${settlement.settlementTimeMs}`, settlement]));
 
@@ -156,9 +157,10 @@ export function runTournament(input: TournamentExecutionInput): TournamentRunRes
   const recordNav = (time: number, frame: Map<string, TournamentCandle>): void => {
     let unrealizedPnl = 0; let grossExposure = 0; let netExposure = 0; let btcBetaExposure = 0;
     for (const position of open) {
-      const candle = frame.get(position.intent.symbol); if (!candle || !accrueFundingThrough(position, candle.closeTimeMs)) continue;
-      const exitCosts = fillCosts(position.intent.symbol, candle.closeTimeMs, position.intent.side, position.notional); const mark = adversePrice(candle.close, position.intent.side, false, exitCosts.slipBps);
-      unrealizedPnl += (mark - position.entryPrice) * position.quantity * sideSign(position.intent.side) - position.entryFee - position.entrySlippage - position.notional * bps(exitCosts.feeBps) - Math.abs(mark - candle.close) * position.quantity - position.fundingCost;
+      const candle = frame.get(position.intent.symbol); const rawMark = candle?.close ?? marks.get(`${position.intent.symbol}:${time}`);
+      if (!finite(rawMark) || !accrueFundingThrough(position, time + spec.dataset.timeframeMs - 1)) { invalidReasons.push(`FOUNDRY_CANONICAL_CLOCK_POSITION_MARK_MISSING_${position.intent.symbol}_${time}`); continue; }
+      const exitCosts = fillCosts(position.intent.symbol, time + spec.dataset.timeframeMs - 1, position.intent.side, position.notional); const mark = adversePrice(rawMark, position.intent.side, false, exitCosts.slipBps);
+      unrealizedPnl += (mark - position.entryPrice) * position.quantity * sideSign(position.intent.side) - position.entryFee - position.entrySlippage - position.notional * bps(exitCosts.feeBps) - Math.abs(mark - rawMark) * position.quantity - position.fundingCost;
       grossExposure += position.notional; netExposure += position.notional * sideSign(position.intent.side);
       try { btcBetaExposure += position.notional * Math.abs(input.portfolioRisk.at(position.intent.symbol, time, spec.portfolio.maxPortfolioRiskSnapshotAgeMs).btcBeta); } catch (error) { invalidReasons.push(error instanceof Error ? error.message : "TOURNAMENT_PORTFOLIO_RISK_MISSING"); }
     }
@@ -168,7 +170,7 @@ export function runTournament(input: TournamentExecutionInput): TournamentRunRes
   };
 
   for (let timeIndex = 0; timeIndex < times.length; timeIndex += 1) {
-    const time = times[timeIndex]!; const frame = grouped.get(time)!;
+    const time = times[timeIndex]!; const frame = grouped.get(time) ?? new Map<string, TournamentCandle>();
     for (const intent of pending.get(time) ?? []) {
       const candle = frame.get(intent.symbol); if (!candle || open.some((position) => position.intent.symbol === intent.symbol) || open.length >= spec.portfolio.maxPositions) continue;
       const usable = equityForAdmission * (1 - spec.portfolio.liquidationBufferFraction); const gross = open.reduce((sum, position) => sum + position.notional, 0); const net = open.reduce((sum, position) => sum + position.notional * sideSign(position.intent.side), 0);
@@ -197,9 +199,12 @@ export function runTournament(input: TournamentExecutionInput): TournamentRunRes
       for (const candidate of intents) { if (candidate.decisionTimeMs !== candle.closeTimeMs || candidate.entryAtOpenTimeMs !== nextCandle?.openTimeMs) throw new Error("TOURNAMENT_LOOKAHEAD_OR_NON_NEXT_OPEN_INTENT"); pending.set(candidate.entryAtOpenTimeMs, [...(pending.get(candidate.entryAtOpenTimeMs) ?? []), candidate]); }
       series.push(candle); indexBySymbol.set(symbol, index + 1);
     }
+    if (timeIndex === times.length - 1) for (const position of [...open]) {
+      const candle = frame.get(position.intent.symbol);
+      if (candle && close(position, candle, candle.close, "END_OF_DATA")) open.splice(open.indexOf(position), 1);
+    }
     recordNav(time, frame);
   }
-  const finalTime = times.at(-1)!; const finalFrame = grouped.get(finalTime)!; for (const position of [...open]) { const candle = finalFrame.get(position.intent.symbol); if (candle && close(position, candle, candle.close, "END_OF_DATA")) open.splice(open.indexOf(position), 1); }
   if (manifest.executionMode === "OPTIMISTIC") warnings.push("OPTIMISTIC_DIAGNOSTIC_ONLY");
   const strategyMetrics = calculateMetrics(trades, navLedger, spec.portfolio.startingCapital, trades.every((trade) => trade.marketEpisodeId !== "UNPROVEN"));
   return { manifest, navLedger, strategyMetrics, portfolioMetrics, metrics: strategyMetrics, trades, warnings, valid: invalidReasons.length === 0, invalidReasons };

@@ -1,5 +1,6 @@
 import type { FoundryArtifactKind } from "./artifact-schema.js";
 import type { ValidatedFoundryRow } from "./semantic-validators.js";
+import { alignFundingSettlements, type FundingScheduleMetadata } from "./funding-schedule.js";
 
 export interface FoundryExpectedCoverage {
   startMs: number;
@@ -7,6 +8,8 @@ export interface FoundryExpectedCoverage {
   symbols: string[];
   cadenceMs?: number;
   maxSnapshotAgeMs?: number;
+  /** Required for funding: exchange or historical schedule provenance. */
+  fundingSchedules?: readonly FundingScheduleMetadata[];
 }
 
 export interface DerivedFoundryCoverage {
@@ -20,6 +23,7 @@ export interface DerivedFoundryCoverage {
   missingSymbols: string[];
   duplicateKeys: string[];
   perSymbolGaps: Record<string, Array<{ startMs: number; endMs: number; reason: string }>>;
+  fundingScheduleCoverage?: Record<string, ReturnType<typeof alignFundingSettlements>>;
 }
 
 function grouped(rows: readonly ValidatedFoundryRow[]): Map<string, ValidatedFoundryRow[]> {
@@ -38,14 +42,26 @@ export function deriveFoundryCoverage(kind: FoundryArtifactKind, rows: readonly 
   if (expected.startMs >= expected.endMs || expected.symbols.length === 0) throw new Error("FOUNDRY_EXPECTED_COVERAGE_INVALID");
   const coveredSymbols = [...new Set(rows.flatMap((row) => row.symbol && row.symbol !== "*" ? [row.symbol] : []))].sort(); const bySymbol = grouped(rows);
   const cadenceMs = expected.cadenceMs ?? inferredCadence(rows); const missingIntervals: DerivedFoundryCoverage["missingIntervals"] = []; const perSymbolGaps: DerivedFoundryCoverage["perSymbolGaps"] = {};
-  const missingSymbols = expected.symbols.filter((symbol) => !coveredSymbols.includes(symbol)).sort();
+  const missingSymbols = expected.symbols.filter((symbol) => !coveredSymbols.includes(symbol) && !(kind === "FEE_ASSUMPTIONS" && bySymbol.has("*"))).sort();
+  const fundingScheduleCoverage: NonNullable<DerivedFoundryCoverage["fundingScheduleCoverage"]> = {};
+  if (kind === "FUNDING_SETTLEMENTS" && !expected.fundingSchedules?.length) throw new Error("FOUNDRY_FUNDING_SCHEDULE_METADATA_MISSING");
   for (const symbol of expected.symbols) {
-    const symbolRows = (bySymbol.get(symbol) ?? []).filter((row) => row.timestampMs >= expected.startMs && row.timestampMs < expected.endMs).sort((a, b) => a.timestampMs - b.timestampMs);
+    const rowsForSymbol = bySymbol.get(symbol) ?? (kind === "FEE_ASSUMPTIONS" ? bySymbol.get("*") : undefined) ?? [];
+    const symbolRows = rowsForSymbol.filter((row) => row.timestampMs >= expected.startMs && row.timestampMs < expected.endMs).sort((a, b) => a.timestampMs - b.timestampMs);
     const gaps: Array<{ startMs: number; endMs: number; reason: string }> = [];
-    if (symbolRows.length === 0) gaps.push({ startMs: expected.startMs, endMs: expected.endMs, reason: "NO_ROWS" });
-    else if (cadenceMs && (kind === "COMPLETED_CANDLES" || kind === "FUNDING_SETTLEMENTS")) {
+    if (["LISTING_DELISTING_TIMELINE", "FUTURES_AVAILABILITY_TIMELINE", "MINIMUM_HISTORY_ELIGIBILITY", "FEE_ASSUMPTIONS"].includes(kind)) {
+      const allSymbolRows = rowsForSymbol.sort((a, b) => a.timestampMs - b.timestampMs);
+      if (!allSymbolRows.some((row) => row.timestampMs <= expected.startMs)) gaps.push({ startMs: expected.startMs, endMs: expected.startMs, reason: "INITIAL_STATE_MISSING" });
+    } else if (symbolRows.length === 0) gaps.push({ startMs: expected.startMs, endMs: expected.endMs, reason: "NO_ROWS" });
+    else if (kind === "FUNDING_SETTLEMENTS") {
+      const schedule = expected.fundingSchedules!.find((candidate) => candidate.symbol === symbol);
+      if (!schedule) throw new Error(`FOUNDRY_FUNDING_SCHEDULE_SYMBOL_MISSING_${symbol}`);
+      const alignment = alignFundingSettlements({ rows, metadata: schedule, startMs: expected.startMs, endMs: expected.endMs }); fundingScheduleCoverage[symbol] = alignment;
+      for (const time of alignment.missingSettlementTimesMs) gaps.push({ startMs: time, endMs: time, reason: "FUNDING_SETTLEMENT_GAP" });
+      for (const time of alignment.excessSettlementTimesMs) gaps.push({ startMs: time, endMs: time, reason: "FUNDING_SETTLEMENT_EXCESS_OR_ALIGNMENT_ERROR" });
+    } else if (cadenceMs && kind === "COMPLETED_CANDLES") {
       const timestamps = new Set(symbolRows.map((row) => row.timestampMs));
-      for (let time = expected.startMs; time < expected.endMs; time += cadenceMs) if (!timestamps.has(time)) gaps.push({ startMs: time, endMs: Math.min(time + cadenceMs, expected.endMs), reason: kind === "FUNDING_SETTLEMENTS" ? "FUNDING_SETTLEMENT_GAP" : "CANDLE_GAP" });
+      for (let time = expected.startMs; time < expected.endMs; time += cadenceMs) if (!timestamps.has(time)) gaps.push({ startMs: time, endMs: Math.min(time + cadenceMs, expected.endMs), reason: "CANDLE_GAP" });
     } else if (expected.maxSnapshotAgeMs !== undefined) {
       for (let time = expected.startMs; time < expected.endMs; time += Math.max(1, expected.cadenceMs ?? expected.maxSnapshotAgeMs)) {
         const latest = [...symbolRows].reverse().find((row) => row.timestampMs <= time);
@@ -57,9 +73,9 @@ export function deriveFoundryCoverage(kind: FoundryArtifactKind, rows: readonly 
     }
     if (gaps.length) { perSymbolGaps[symbol] = gaps; missingIntervals.push(...gaps.map((gap) => ({ ...gap, reason: `${symbol}:${gap.reason}` }))); }
   }
-  return { expectedStartMs: expected.startMs, expectedEndMs: expected.endMs, coveredStartMs: rows.length ? Math.min(...rows.map((row) => row.timestampMs)) : null, coveredEndMs: rows.length ? Math.max(...rows.map((row) => row.timestampMs)) : null, coveredSymbols, cadenceMs, missingIntervals, missingSymbols, duplicateKeys: [], perSymbolGaps };
+  return { expectedStartMs: expected.startMs, expectedEndMs: expected.endMs, coveredStartMs: rows.length ? Math.min(...rows.map((row) => row.timestampMs)) : null, coveredEndMs: rows.length ? Math.max(...rows.map((row) => row.timestampMs)) : null, coveredSymbols, cadenceMs, missingIntervals, missingSymbols, duplicateKeys: [], perSymbolGaps, ...(kind === "FUNDING_SETTLEMENTS" ? { fundingScheduleCoverage } : {}) };
 }
 
 export function assertExpectedCoverage(coverage: DerivedFoundryCoverage): void {
-  if (coverage.missingSymbols.length || coverage.missingIntervals.length || coverage.coveredStartMs !== coverage.expectedStartMs || coverage.coveredEndMs === null) throw new Error("FOUNDRY_DERIVED_COVERAGE_MISMATCH");
+  if (coverage.missingSymbols.length || coverage.missingIntervals.length || coverage.coveredStartMs === null || coverage.coveredEndMs === null) throw new Error("FOUNDRY_DERIVED_COVERAGE_MISMATCH");
 }

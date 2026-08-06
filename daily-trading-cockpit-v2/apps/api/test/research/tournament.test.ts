@@ -139,7 +139,7 @@ describe("Kronos Research Tournament v1 contract", () => {
       const second = persistTournamentRun(root, matrix.runs[0]!);
       expect(second.registryHash).toBe(first.registryHash);
       expect(JSON.parse(readFileSync(join(root, "run-registry.json"), "utf8"))).toHaveLength(1);
-      expect(JSON.parse(readFileSync(join(first.runDirectory, "nav-ledger.json"), "utf8"))).toHaveLength(3);
+      expect(JSON.parse(readFileSync(join(first.runDirectory, "nav-ledger.json"), "utf8"))).toHaveLength(2);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 

@@ -62,6 +62,7 @@ describe("Foundry semantic strictness", () => {
       const path = join(symbolDir, "fixture.csv"); writeFileSync(path, `open_time,open,high,low,close,volume,close_time\n0,100,101,99,100,1,3599999\n3600000,100,101,99,100,1,7199999\n`);
       const first = importLocalBinanceCandleArchive({ root, expectedCoverage: expected, source: "local-fixture", generatedAtMs: 1, generationSha: "sha" }); const second = importLocalBinanceCandleArchive({ root, expectedCoverage: expected, source: "local-fixture", generatedAtMs: 1, generationSha: "sha" });
       expect(first.manifest.rowsHash).toBe(second.manifest.rowsHash); expect(first.manifest.semanticManifestHash).toBe(second.manifest.semanticManifestHash);
+      expect(JSON.stringify(first.rows)).toBe(JSON.stringify(second.rows)); expect(JSON.stringify(first.manifest)).toBe(JSON.stringify(second.manifest));
       expect(persistFoundryArtifact({ rootDir: root, manifest: first.manifest, rows: first.rows })).toContain(first.manifest.semanticManifestHash);
       expect(buildTier1CapabilityReport([first.manifest])).toMatchObject({ canRun: false, blockers: expect.arrayContaining(["MISSING_ARTIFACT:FUNDING_SETTLEMENTS", "MISSING_ARTIFACT:CANONICAL_EPISODES"]) });
     } finally { rmSync(root, { recursive: true, force: true }); }
