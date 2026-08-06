@@ -5,7 +5,7 @@ import { describe, expect, it } from "vitest";
 
 import { assertCandlesCoverCanonicalClock, buildCanonicalClock } from "../../src/research/foundry/canonical-clock.js";
 import { assertCompleteFoundryArtifact, buildFoundryArtifactManifest } from "../../src/research/foundry/artifact-schema.js";
-import { importLocalBinanceCandleArchive } from "../../src/research/foundry/local-binance-archive-adapter.js";
+import { importLocalBinanceCandleArchive, importLocalBinanceFundingArchive } from "../../src/research/foundry/local-binance-archive-adapter.js";
 import { persistFoundryArtifact } from "../../src/research/foundry/artifact-store.js";
 import { buildTier1CapabilityReport } from "../../src/research/foundry/tier1-capability.js";
 import { FOUNDRY_SCHEMA_V1, validateFoundryRows } from "../../src/research/foundry/semantic-validators.js";
@@ -68,6 +68,21 @@ describe("Foundry semantic strictness", () => {
       expect(JSON.stringify(first.rows)).toBe(JSON.stringify(second.rows)); expect(JSON.stringify(first.manifest)).toBe(JSON.stringify(second.manifest));
       expect(persistFoundryArtifact({ rootDir: root, manifest: first.manifest, rows: first.rows })).toContain(first.manifest.semanticManifestHash);
       expect(buildTier1CapabilityReport([first.manifest])).toMatchObject({ canRun: false, blockers: expect.arrayContaining(["MISSING_ARTIFACT:FUNDING_SETTLEMENTS", "MISSING_ARTIFACT:PIT_LIQUIDITY_SPREAD"]) });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("binds the whole raw archive while importing only the exact experiment window", () => {
+    const root = mkdtempSync(join(tmpdir(), "foundry-windowed-")); const candleRoot = join(root, "candles"); const fundingRoot = join(root, "funding");
+    try {
+      const candleDirectory = join(candleRoot, "BTCUSDT", "1h"); const fundingDirectory = join(fundingRoot, "fundingRate", "BTCUSDT"); mkdirSync(candleDirectory, { recursive: true }); mkdirSync(fundingDirectory, { recursive: true });
+      writeFileSync(join(candleDirectory, "source.csv"), `open_time,open,high,low,close,volume,close_time\n0,100,101,99,100,1,3599999\n3600000,101,102,100,101,2,7199999\n`);
+      writeFileSync(join(fundingDirectory, "source.csv"), "calc_time,funding_interval_hours,last_funding_rate\n0,8,0.001\n3600008,8,0.002\n");
+      const window = { startMs: H, endMs: 2 * H, symbols: ["BTCUSDT"], cadenceMs: H, fundingSchedules: [{ schemaVersion: "v1" as const, symbol: "BTCUSDT", kind: "EXPLICIT_HISTORICAL" as const, source: "fixture-schedule", sourceHash: "fixture-schedule-hash", alignmentToleranceMs: 60_000, settlementTimesMs: [H] }] };
+      const candleRawFileHash = readArchiveBundle({ root: candleRoot, include: (relativePath) => relativePath.endsWith(".csv") }).archiveBundleHash; const fundingRawFileHash = readArchiveBundle({ root: fundingRoot, include: (relativePath) => relativePath.endsWith(".csv") }).archiveBundleHash;
+      const candles = importLocalBinanceCandleArchive({ root: candleRoot, expectedCoverage: window, source: "windowed-candles", sourceProvenance: { ...fixtureSourceProvenance("windowed-candles", "0000000"), rawFileHash: candleRawFileHash }, generatedAtMs: 1, generationSha: "sha" });
+      const funding = importLocalBinanceFundingArchive({ root: fundingRoot, expectedCoverage: window, source: "windowed-funding", sourceProvenance: { ...fixtureSourceProvenance("windowed-funding", "0000000"), rawFileHash: fundingRawFileHash }, generatedAtMs: 1, generationSha: "sha" });
+      expect(candles.rows).toHaveLength(1); expect(candles.rows[0]).toMatchObject({ openTimeMs: H, close: 101 }); expect(candles.manifest.archiveBundle?.files).toHaveLength(1);
+      expect(funding.rows).toHaveLength(1); expect(funding.rows[0]).toMatchObject({ canonicalSettlementTimeMs: H, observedSettlementTimeMs: H + 8 }); expect(funding.manifest.archiveBundle?.files).toHaveLength(1);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 });
