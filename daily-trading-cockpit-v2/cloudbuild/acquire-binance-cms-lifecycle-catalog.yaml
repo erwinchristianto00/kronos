@@ -1,0 +1,167 @@
+# Cloud-only, immutable acquisition of Binance's public announcement catalogue.
+# This is intentionally raw evidence only.  It never turns an announcement
+# index into a historical lifecycle state without a complete source-backed
+# transition record.
+steps:
+  - name: gcr.io/google.com/cloudsdktool/google-cloud-cli:slim
+    id: acquire-binance-cms-catalog-48
+    entrypoint: bash
+    env:
+      - _STUDY=${_STUDY}
+      - _GENERATION_SHA=${_GENERATION_SHA}
+    args:
+      - -ceu
+      - |
+        python3 - <<'PY'
+        import hashlib
+        import json
+        import os
+        import pathlib
+        import subprocess
+        import time
+        from urllib.error import HTTPError, URLError
+        from urllib.parse import urlencode
+        from urllib.request import Request, urlopen
+
+        study = os.environ["_STUDY"]
+        generation_sha = os.environ["_GENERATION_SHA"]
+        if len(generation_sha) < 7 or any(ch not in "0123456789abcdef" for ch in generation_sha.lower()):
+            raise RuntimeError("LIFECYCLE_CATALOG_GENERATION_SHA_INVALID")
+
+        root = pathlib.Path("/workspace/binance-cms-lifecycle")
+        pages_root = root / "pages"
+        details_root = root / "details"
+        pages_root.mkdir(parents=True)
+        details_root.mkdir(parents=True)
+        endpoint = "https://www.binance.com/bapi/composite/v1/public/cms/article/list/query"
+        detail_endpoint = "https://www.binance.com/bapi/composite/v1/public/cms/article/detail/query"
+        headers = {"User-Agent": "Kronos-Research-Foundry/1.0", "clienttype": "web", "Accept": "application/json"}
+        request_spacing_seconds = 1.25
+        last_request_at = 0.0
+        requests = []
+
+        def sha256(value):
+            return hashlib.sha256(value).hexdigest()
+
+        def stable(value):
+            return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+        def get_json(url, relative_path):
+            global last_request_at
+            elapsed = time.monotonic() - last_request_at
+            if elapsed < request_spacing_seconds:
+                time.sleep(request_spacing_seconds - elapsed)
+            for attempt in range(6):
+                requested_at_ms = int(time.time() * 1000)
+                try:
+                    response = urlopen(Request(url, headers=headers), timeout=45)
+                    status = response.status
+                    payload = response.read()
+                    last_request_at = time.monotonic()
+                    if status != 200:
+                        raise RuntimeError(f"LIFECYCLE_CATALOG_HTTP_{status}")
+                    parsed = json.loads(payload.decode("utf8"))
+                    target = root / relative_path
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(payload)
+                    requests.append({"relativePath": relative_path, "url": url, "httpStatus": status, "retrievedAtMs": requested_at_ms, "sizeBytes": len(payload), "fileHash": sha256(payload)})
+                    return parsed
+                except HTTPError as error:
+                    last_request_at = time.monotonic()
+                    if error.code not in (429, 500, 502, 503, 504) or attempt == 5:
+                        raise RuntimeError(f"LIFECYCLE_CATALOG_HTTP_{error.code}") from error
+                    retry_after = error.headers.get("Retry-After")
+                    time.sleep(float(retry_after) if retry_after and retry_after.isdigit() else min(60, 5 * (2 ** attempt)))
+                except (URLError, TimeoutError) as error:
+                    last_request_at = time.monotonic()
+                    if attempt == 5:
+                        raise RuntimeError("LIFECYCLE_CATALOG_NETWORK_FAILURE") from error
+                    time.sleep(min(60, 5 * (2 ** attempt)))
+
+        def catalog_page(page_no):
+            query = urlencode({"type": "1", "catalogId": "48", "pageNo": str(page_no), "pageSize": "10"})
+            payload = get_json(endpoint + "?" + query, f"pages/catalog-48-page-{page_no:04d}.json")
+            if payload.get("code") != "000000" or payload.get("success") is not True:
+                raise RuntimeError("LIFECYCLE_CATALOG_RESPONSE_INVALID")
+            catalogs = ((payload.get("data") or {}).get("catalogs") or [])
+            if len(catalogs) != 1 or catalogs[0].get("catalogId") != 48 or not isinstance(catalogs[0].get("articles"), list):
+                raise RuntimeError("LIFECYCLE_CATALOG_SHAPE_INVALID")
+            return catalogs[0]
+
+        first = catalog_page(1)
+        total = first.get("total")
+        if not isinstance(total, int) or total <= 0:
+            raise RuntimeError("LIFECYCLE_CATALOG_TOTAL_INVALID")
+        total_pages = (total + 9) // 10
+        articles = []
+        for page_no in range(1, total_pages + 1):
+            catalog = first if page_no == 1 else catalog_page(page_no)
+            if catalog.get("total") != total or catalog.get("catalogName") != first.get("catalogName"):
+                raise RuntimeError("LIFECYCLE_CATALOG_CHANGED_DURING_CRAWL")
+            for article in catalog["articles"]:
+                if not isinstance(article.get("id"), int) or not isinstance(article.get("code"), str) or len(article["code"]) < 16 or not isinstance(article.get("title"), str) or not isinstance(article.get("releaseDate"), int):
+                    raise RuntimeError("LIFECYCLE_CATALOG_ARTICLE_INVALID")
+                articles.append(article)
+        if len(articles) != total or len({article["id"] for article in articles}) != total or len({article["code"] for article in articles}) != total:
+            raise RuntimeError("LIFECYCLE_CATALOG_COVERAGE_INVALID")
+
+        # Retain exact official bodies for relevant futures lifecycle candidates.
+        def candidate(article):
+            title = article["title"].upper()
+            pair = "BTC/USDT" in title or "ETH/USDT" in title or "BTCUSDT" in title or "ETHUSDT" in title
+            return ("FUTURES" in title and pair) or ("FUTURES" in title and "DELIST" in title)
+        selected = sorted((article for article in articles if candidate(article)), key=lambda article: (article["releaseDate"], article["code"]))
+        for article in selected:
+            query = urlencode({"articleCode": article["code"]})
+            detail = get_json(detail_endpoint + "?" + query, f"details/{article['code']}.json")
+            data = detail.get("data") or {}
+            if detail.get("code") != "000000" or data.get("id") != article["id"] or data.get("title") != article["title"] or not isinstance(data.get("body"), str):
+                raise RuntimeError("LIFECYCLE_CATALOG_DETAIL_INVALID")
+
+        requests.sort(key=lambda entry: entry["relativePath"])
+        bundle_hash = sha256(stable([{"relativePath": entry["relativePath"], "fileHash": entry["fileHash"]} for entry in requests]).encode())
+        titles = [article["title"] for article in articles]
+        evidence = {
+            "schemaVersion": "KronosBinanceCmsLifecycleRaw/v1",
+            "status": "RAW_CATALOG_ACQUIRED_NOT_A_TIMELINE",
+            "provider": "Binance",
+            "exchange": "BINANCE_USDM",
+            "datasetId": "binance-cms-public-announcements-catalog-48",
+            "catalog": {"catalogId": 48, "catalogName": first.get("catalogName"), "articleCount": total, "pageCount": total_pages, "pageSize": 10},
+            "generation": {"generationToolSha": generation_sha, "generatedAtMs": int(time.time() * 1000)},
+            "requests": requests,
+            "archiveBundleHash": bundle_hash,
+            "candidateArticleCodes": [article["code"] for article in selected],
+            "candidateSummary": {
+                "btcOrEthFuturesTitleCount": sum(1 for title in titles if "FUTURES" in title.upper() and ("BTC/USDT" in title.upper() or "ETH/USDT" in title.upper() or "BTCUSDT" in title.upper() or "ETHUSDT" in title.upper())),
+                "futuresDelistTitleCount": sum(1 for title in titles if "FUTURES" in title.upper() and "DELIST" in title.upper()),
+            },
+            "limitations": [
+                "Catalog 48 is raw official announcement evidence, not an asserted exhaustive futures-delisting feed.",
+                "No listing/delisting or futures-availability timeline is produced by this acquisition alone.",
+                "REAL_TIER1 remains forbidden until an authoritative complete lifecycle transition source is validated.",
+            ],
+        }
+        evidence_bytes = (stable(evidence) + "\n").encode()
+        evidence_hash = sha256(evidence_bytes)
+        (root / "acquisition-manifest.json").write_bytes(evidence_bytes)
+        target = f"{study}/raw/lifecycle-binance-cms-catalog-48/v1/{bundle_hash}"
+        for path in sorted(root.rglob("*")):
+            if not path.is_file():
+                continue
+            relative = path.relative_to(root).as_posix()
+            remote = f"{target}/{relative}"
+            result = subprocess.run(["gcloud", "storage", "cp", str(path), remote, "--if-generation-match=0"], text=True, capture_output=True)
+            if result.returncode != 0:
+                existing = pathlib.Path("/workspace/existing") / hashlib.sha256(remote.encode()).hexdigest()
+                existing.parent.mkdir(parents=True, exist_ok=True)
+                subprocess.check_call(["gcloud", "storage", "cp", remote, str(existing)])
+                if sha256(existing.read_bytes()) != sha256(path.read_bytes()):
+                    raise RuntimeError(f"LIFECYCLE_CATALOG_IMMUTABLE_CONFLICT_{relative}")
+        publication = {"status": "PASS", "rawRoot": target, "archiveBundleHash": bundle_hash, "acquisitionManifestHash": evidence_hash, "objectCount": len(requests), "candidateArticleCodes": evidence["candidateArticleCodes"], "candidateSummary": evidence["candidateSummary"], "realTier1StillForbidden": True}
+        print(json.dumps(publication, sort_keys=True))
+        PY
+timeout: 1800s
+substitutions:
+  _STUDY: gs://bucket-coin-yuhu/kronos-tier1-archives/binance-vision-usdm-bookticker-free-walkforward-v1
+  _GENERATION_SHA: unknown
