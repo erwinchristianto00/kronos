@@ -1,0 +1,40 @@
+steps:
+  - name: gcr.io/google.com/cloudsdktool/google-cloud-cli:slim
+    id: stage-generation-pinned-btc-may-bookticker
+    entrypoint: bash
+    args:
+      - -ceu
+      - |
+        mkdir -p /workspace/raw/bookTicker/BTCUSDT
+        manifest="${_STUDY}/acquisition-manifests/v2/${_BBO_RAW_BUNDLE_HASH}.json"
+        manifest_generation="$(gcloud storage objects describe "$manifest" --format='value(generation)')"
+        gcloud storage cp "${manifest}#${manifest_generation}" /workspace/raw/acquisition-manifest.json
+        python3 - <<'PY' >/workspace/object-uri.txt
+        import json
+        manifest = json.load(open('/workspace/raw/acquisition-manifest.json', encoding='utf8'))
+        entry = next(item for item in manifest['objects'] if item['relativePath'] == 'BTCUSDT/BTCUSDT-bookTicker-2023-05.zip')
+        print(f"{entry['canonical']['uri']}#{entry['canonical']['generation']}")
+        print(f"{entry['companion']['uri']}#{entry['companion']['generation']}")
+        PY
+        sed -n '1p' /workspace/object-uri.txt | xargs -I{} gcloud storage cp {} /workspace/raw/bookTicker/BTCUSDT/BTCUSDT-bookTicker-2023-05.zip
+        sed -n '2p' /workspace/object-uri.txt | xargs -I{} gcloud storage cp {} /workspace/raw/bookTicker/BTCUSDT/BTCUSDT-bookTicker-2023-05.zip.CHECKSUM
+  - name: node:22-bookworm
+    id: reproduce-btc-pit-mark
+    entrypoint: bash
+    env:
+      - RAW_ROOT=/workspace/raw
+      - GENERATION_SHA=${_GENERATION_SHA}
+    args:
+      - -ceu
+      - |
+        apt-get update -qq
+        apt-get install -y --no-install-recommends unzip
+        npm ci --ignore-scripts
+        npm run build -w @dtc/shared
+        npm run build -w @dtc/api
+        node scripts/research/diagnose-binance-vision-bookticker-pit.mjs
+timeout: 3600s
+substitutions:
+  _STUDY: gs://bucket-coin-yuhu/kronos-tier1-archives/binance-vision-usdm-bookticker-free-walkforward-v1
+  _BBO_RAW_BUNDLE_HASH: 3338e528944869fec5b2ce112cdeedac7aa1fe031563a141a57babf4ad39584a
+  _GENERATION_SHA: unknown
