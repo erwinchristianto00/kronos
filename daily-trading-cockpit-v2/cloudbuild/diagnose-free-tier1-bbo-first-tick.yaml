@@ -22,6 +22,13 @@ steps:
         import subprocess
         import zipfile
 
+        def sha256_file(path):
+            digest = hashlib.sha256()
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            return digest.hexdigest()
+
         study = os.environ["_STUDY"]
         bundle_hash = os.environ["_BBO_RAW_BUNDLE_HASH"]
         manifest_uri = f"{study}/acquisition-manifests/v2/{bundle_hash}.json"
@@ -37,7 +44,7 @@ steps:
             raise RuntimeError("BBO_DIAGNOSTIC_OBJECT_MISSING")
         local = pathlib.Path("/workspace/btcusdt-bookticker-2023-05.zip")
         subprocess.check_call(["gcloud", "storage", "cp", "--do-not-decompress", f"{entry['canonical']['uri']}#{entry['canonical']['generation']}", str(local)])
-        actual_hash = hashlib.sha256(local.read_bytes()).hexdigest()
+        actual_hash = sha256_file(local)
         if actual_hash != entry["canonical"]["sha256"] or entry.get("officialChecksum") != actual_hash:
             raise RuntimeError("BBO_DIAGNOSTIC_CANONICAL_HASH_MISMATCH")
 
