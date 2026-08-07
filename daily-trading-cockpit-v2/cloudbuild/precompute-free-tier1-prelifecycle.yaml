@@ -1,0 +1,234 @@
+# Converts already-verified cloud archives into reusable Foundry inputs. It is
+# research-only: no runtime, deployment, or empirical tournament execution.
+steps:
+  - name: gcr.io/google.com/cloudsdktool/google-cloud-cli:slim
+    id: stage-generation-pinned-raw
+    entrypoint: bash
+    env:
+      - _STUDY=${_STUDY}
+      - _BBO_RAW_BUNDLE_HASH=${_BBO_RAW_BUNDLE_HASH}
+    args:
+      - -ceu
+      - |
+        python3 - <<'PY'
+        import json
+        import os
+        import pathlib
+        import subprocess
+
+        study = os.environ["_STUDY"]
+        raw_root = pathlib.Path("/workspace/raw")
+        raw_root.mkdir(parents=True, exist_ok=True)
+        bbo_hash = os.environ["_BBO_RAW_BUNDLE_HASH"]
+
+        def run(*args):
+            return subprocess.check_output(args, text=True)
+
+        def describe(uri):
+            return json.loads(run("gcloud", "storage", "objects", "describe", uri, "--format=json"))
+
+        def copy(uri, generation, destination):
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            subprocess.check_call(["gcloud", "storage", "cp", "--do-not-decompress", f"{uri}#{generation}", str(destination)])
+
+        inventory = {"schemaVersion": "KronosFreeTier1PrelifecycleGcsInventory/v1", "study": study, "objects": []}
+        manifest_uri = f"{study}/acquisition-manifests/v2/{bbo_hash}.json"
+        manifest_meta = describe(manifest_uri)
+        copy(manifest_uri, str(manifest_meta["generation"]), raw_root / "bbo-raw-acquisition-manifest.json")
+        inventory["objects"].append({"role": "bookTickerRawManifest", "uri": manifest_uri, "generation": str(manifest_meta["generation"]), "sizeBytes": int(manifest_meta["size"]), "relativePath": "bbo-raw-acquisition-manifest.json"})
+        manifest = json.loads((raw_root / "bbo-raw-acquisition-manifest.json").read_text(encoding="utf8"))
+        if manifest.get("schemaVersion") != "KronosFreeTier1RawAcquisition/v2" or manifest.get("canonicalRawBookTickerBundleHash") != bbo_hash or len(manifest.get("objects", [])) != 22:
+            raise RuntimeError("frozen BBO raw manifest is invalid")
+        for entry in manifest["objects"]:
+            zip_meta = entry["canonical"]
+            checksum_meta = entry["companion"]
+            relative = entry["relativePath"]
+            copy(zip_meta["uri"], str(zip_meta["generation"]), raw_root / "bookTicker" / relative)
+            copy(checksum_meta["uri"], str(checksum_meta["generation"]), raw_root / "bookTicker" / f"{relative}.CHECKSUM")
+            inventory["objects"].append({"role": "bookTicker", "uri": zip_meta["uri"], "generation": str(zip_meta["generation"]), "sizeBytes": int(zip_meta["sizeBytes"]), "relativePath": f"bookTicker/{relative}"})
+            inventory["objects"].append({"role": "bookTickerChecksum", "uri": checksum_meta["uri"], "generation": str(checksum_meta["generation"]), "sizeBytes": int(checksum_meta["sizeBytes"]), "relativePath": f"bookTicker/{relative}.CHECKSUM"})
+
+        months = [*(f"2023-{month:02d}" for month in range(4, 13)), *(f"2024-{month:02d}" for month in range(1, 4))]
+        funding_months = [*(f"2023-{month:02d}" for month in range(5, 13)), *(f"2024-{month:02d}" for month in range(1, 4))]
+        for symbol in ("BTCUSDT", "ETHUSDT"):
+            for month in months:
+                name = f"{symbol}-1h-{month}.zip"
+                uri = f"{study}/raw/klines/{symbol}/1h/{name}"
+                meta = describe(uri)
+                checksum_uri = f"{uri}.CHECKSUM"; checksum_meta = describe(checksum_uri)
+                copy(uri, str(meta["generation"]), raw_root / "klines" / symbol / "1h" / name)
+                copy(checksum_uri, str(checksum_meta["generation"]), raw_root / "klines" / symbol / "1h" / f"{name}.CHECKSUM")
+                inventory["objects"].extend([
+                    {"role": "kline", "uri": uri, "generation": str(meta["generation"]), "sizeBytes": int(meta["size"]), "relativePath": f"klines/{symbol}/1h/{name}"},
+                    {"role": "klineChecksum", "uri": checksum_uri, "generation": str(checksum_meta["generation"]), "sizeBytes": int(checksum_meta["size"]), "relativePath": f"klines/{symbol}/1h/{name}.CHECKSUM"},
+                ])
+            for month in funding_months:
+                name = f"{symbol}-fundingRate-{month}.zip"
+                uri = f"{study}/raw/fundingRate/{symbol}/{name}"
+                meta = describe(uri)
+                checksum_uri = f"{uri}.CHECKSUM"; checksum_meta = describe(checksum_uri)
+                copy(uri, str(meta["generation"]), raw_root / "fundingRate" / symbol / name)
+                copy(checksum_uri, str(checksum_meta["generation"]), raw_root / "fundingRate" / symbol / f"{name}.CHECKSUM")
+                inventory["objects"].extend([
+                    {"role": "funding", "uri": uri, "generation": str(meta["generation"]), "sizeBytes": int(meta["size"]), "relativePath": f"fundingRate/{symbol}/{name}"},
+                    {"role": "fundingChecksum", "uri": checksum_uri, "generation": str(checksum_meta["generation"]), "sizeBytes": int(checksum_meta["size"]), "relativePath": f"fundingRate/{symbol}/{name}.CHECKSUM"},
+                ])
+        inventory["objects"].sort(key=lambda entry: (entry["relativePath"], entry["role"]))
+        (raw_root / "source-gcs-inventory.json").write_text(json.dumps(inventory, sort_keys=True, separators=(",", ":")), encoding="utf8")
+        PY
+  - name: node:22-bookworm
+    id: build-prelifecycle-artifacts
+    entrypoint: bash
+    env:
+      - RAW_ROOT=/workspace/raw
+      - ARTIFACT_ROOT=/workspace/foundry-artifacts
+      - REPORT_PATH=/workspace/prelifecycle-report.json
+      - GENERATED_AT_MS=${_GENERATED_AT_MS}
+      - GENERATION_SHA=${_GENERATION_SHA}
+      - BBO_RAW_BUNDLE_HASH=${_BBO_RAW_BUNDLE_HASH}
+    args:
+      - -ceu
+      - |
+        apt-get update -qq
+        apt-get install -y --no-install-recommends unzip
+        npm ci --ignore-scripts
+        npm run build -w @dtc/shared
+        npm run build -w @dtc/api
+        node scripts/research/precompute-free-tier1-prelifecycle.mjs build
+  - name: gcr.io/google.com/cloudsdktool/google-cloud-cli:slim
+    id: persist-and-reload-artifacts
+    entrypoint: bash
+    env:
+      - _STUDY=${_STUDY}
+    args:
+      - -ceu
+      - |
+        python3 - <<'PY'
+        import hashlib
+        import os
+        import pathlib
+        import subprocess
+
+        root = pathlib.Path("/workspace/foundry-artifacts")
+        partial_root = os.environ["_STUDY"] + "/foundry-partials/v1"
+        target_root = partial_root + "/artifacts"
+        reload_root = pathlib.Path("/workspace/foundry-reload")
+
+        def sha256(path):
+            digest = hashlib.sha256()
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            return digest.hexdigest()
+
+        def immutable_upload(source, target):
+            result = subprocess.run(["gcloud", "storage", "cp", str(source), target, "--if-generation-match=0"], text=True, capture_output=True)
+            if result.returncode == 0:
+                return
+            existing = pathlib.Path("/workspace/existing") / hashlib.sha256(target.encode()).hexdigest()
+            existing.parent.mkdir(parents=True, exist_ok=True)
+            subprocess.check_call(["gcloud", "storage", "cp", target, str(existing)])
+            if sha256(existing) != sha256(source):
+                raise RuntimeError(f"immutable object conflict: {target}")
+
+        inventory = pathlib.Path("/workspace/raw/source-gcs-inventory.json")
+        immutable_upload(inventory, partial_root + "/input-manifests/" + sha256(inventory) + ".json")
+        for artifact_dir in sorted(path for path in root.iterdir() if path.is_dir()):
+            for name in ("manifest.json", "rows.json"):
+                source = artifact_dir / name
+                if not source.is_file():
+                    raise RuntimeError(f"artifact file missing: {source}")
+                target = f"{target_root}/{artifact_dir.name}/{name}"
+                immutable_upload(source, target)
+                destination = reload_root / artifact_dir.name / name
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                subprocess.check_call(["gcloud", "storage", "cp", target, str(destination)])
+        PY
+  - name: node:22-bookworm
+    id: verify-gcs-reload
+    entrypoint: bash
+    env:
+      - RELOAD_ROOT=/workspace/foundry-reload
+      - REPORT_PATH=/workspace/prelifecycle-report.json
+      - FINAL_REPORT_PATH=/workspace/prelifecycle-report-gcs-reloaded.json
+    args:
+      - -ceu
+      - |
+        node scripts/research/precompute-free-tier1-prelifecycle.mjs verify
+  - name: gcr.io/google.com/cloudsdktool/google-cloud-cli:slim
+    id: persist-final-report
+    entrypoint: bash
+    env:
+      - _STUDY=${_STUDY}
+    args:
+      - -ceu
+      - |
+        python3 - <<'PY'
+        import hashlib
+        import json
+        import os
+        import pathlib
+        import subprocess
+
+        study = os.environ["_STUDY"]
+        partial_root = study + "/foundry-partials/v1"
+        report = pathlib.Path("/workspace/prelifecycle-report-gcs-reloaded.json")
+        payload = json.loads(report.read_text(encoding="utf8"))
+
+        def sha256(path):
+            digest = hashlib.sha256()
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            return digest.hexdigest()
+
+        def immutable_upload(source, target):
+            result = subprocess.run(["gcloud", "storage", "cp", str(source), target, "--if-generation-match=0"], text=True, capture_output=True)
+            if result.returncode == 0:
+                return
+            existing = pathlib.Path("/workspace/existing-final") / hashlib.sha256(target.encode()).hexdigest()
+            existing.parent.mkdir(parents=True, exist_ok=True)
+            subprocess.check_call(["gcloud", "storage", "cp", target, str(existing)])
+            if sha256(existing) != sha256(source):
+                raise RuntimeError(f"immutable object conflict: {target}")
+
+        def describe(uri):
+            return json.loads(subprocess.check_output(["gcloud", "storage", "objects", "describe", uri, "--format=json"], text=True))
+
+        report_target = partial_root + f"/reports/{payload['reportHash']}.json"
+        immutable_upload(report, report_target)
+        report_meta = describe(report_target)
+        artifact_objects = []
+        for artifact in payload["artifacts"]:
+            for name in ("manifest.json", "rows.json"):
+                source = pathlib.Path("/workspace/foundry-artifacts") / artifact["semanticManifestHash"] / name
+                target = partial_root + f"/artifacts/{artifact['semanticManifestHash']}/{name}"
+                meta = describe(target)
+                artifact_objects.append({"artifactRole": artifact["name"], "semanticManifestHash": artifact["semanticManifestHash"], "name": name, "uri": target, "generation": str(meta["generation"]), "sizeBytes": int(meta["size"]), "sha256": sha256(source)})
+        publication_core = {
+            "schemaVersion": "KronosFreeTier1PrelifecyclePublication/v1",
+            "status": payload["status"],
+            "sourceGcsInventoryHash": payload["sourceGcsInventoryHash"],
+            "rawBookTickerBundleHash": payload["frozenBookTicker"]["rawManifestBundleHash"],
+            "report": {"reportHash": payload["reportHash"], "uri": report_target, "generation": str(report_meta["generation"]), "sizeBytes": int(report_meta["size"]), "sha256": sha256(report)},
+            "artifactObjects": sorted(artifact_objects, key=lambda entry: (entry["semanticManifestHash"], entry["name"])),
+            "realTier1Blockers": payload["realTier1Blockers"],
+            "empiricalExecutionForbidden": True,
+        }
+        publication_hash = hashlib.sha256(json.dumps(publication_core, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        publication = {**publication_core, "publicationHash": publication_hash}
+        publication_path = pathlib.Path("/workspace/prelifecycle-publication.json")
+        publication_path.write_text(json.dumps(publication, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf8")
+        publication_target = partial_root + f"/publications/{publication_hash}.json"
+        immutable_upload(publication_path, publication_target)
+        print(json.dumps({"status": "PASS", "report": report_target, "reportHash": payload["reportHash"], "publication": publication_target, "publicationHash": publication_hash}, sort_keys=True))
+        PY
+options:
+  diskSizeGb: 200
+  machineType: E2_HIGHCPU_8
+timeout: 10800s
+substitutions:
+  _STUDY: gs://bucket-coin-yuhu/kronos-tier1-archives/binance-vision-usdm-bookticker-free-walkforward-v1
+  _BBO_RAW_BUNDLE_HASH: 3338e528944869fec5b2ce112cdeedac7aa1fe031563a141a57babf4ad39584a
+  _GENERATED_AT_MS: "1786118676317"
+  _GENERATION_SHA: unknown
