@@ -71,6 +71,6 @@ describe("real Tier-1 provenance gate", () => {
 
   it("reports exact acquisition blockers instead of fabricating external history", () => {
     const report = buildExternalAcquisitionBlockerReport({ expectedCoverage: expected, availableArtifactKinds: [] });
-    expect(report.canAssembleRealTier1).toBe(false); expect(report.blockers).toEqual(expect.arrayContaining(["EXTERNAL_EXPORT_REQUIRED:LISTING_DELISTING_TIMELINE:symbol listing and delisting events", "EXTERNAL_EXPORT_REQUIRED:PIT_LIQUIDITY_SPREAD:timestamped volume, liquidity notional, and spread"])); expect(report.contracts.every((contract) => contract.range.startMs === 0 && contract.range.endMs === H && contract.retrievalCommand)).toBe(true);
+    expect(report.canAssembleRealTier1).toBe(false); expect(report.blockers).toEqual(expect.arrayContaining(["EXTERNAL_EXPORT_REQUIRED:LISTING_DELISTING_TIMELINE:symbol listing and delisting state intervals", "EXTERNAL_EXPORT_REQUIRED:PIT_LIQUIDITY_SPREAD:timestamped volume, liquidity notional, and spread"])); expect(report.contracts.every((contract) => contract.range.startMs === 0 && contract.range.endMs === H && contract.retrievalCommand)).toBe(true);
   });
 });
