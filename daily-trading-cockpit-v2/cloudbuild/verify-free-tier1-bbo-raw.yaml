@@ -18,6 +18,7 @@ steps:
         import os
         import pathlib
         import re
+        import shutil
         import subprocess
         import zipfile
 
@@ -104,6 +105,10 @@ steps:
                     "companion": {"uri": checksum_uri, "generation": str(checksum_meta["generation"]), "sizeBytes": int(checksum_meta["size"]), "sha256": computed_checksum, "bytes": companion},
                     "verificationMarker": {"uri": marker_uri, "generation": str(marker_meta["generation"]), "sha256": computed_marker, "verifiedAt": marker["verifiedAt"], "verifierTemplateSha256": marker["verifierTemplateSha256"], "verifierSourceRevision": marker["verifierSourceRevision"]},
                 })
+                # The inventory retains only immutable identity. Reclaim the exact
+                # generation-pinned bytes after this pass has fully hashed and tested
+                # them so the second pass is a fresh GCS read rather than a local copy.
+                shutil.rmtree(directory)
             return sorted(inventory, key=lambda entry: entry["relativePath"])
 
         first = inventory_pass("first")
