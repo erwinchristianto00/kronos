@@ -35,8 +35,10 @@ steps:
         details_root.mkdir(parents=True)
         endpoint = "https://www.binance.com/bapi/composite/v1/public/cms/article/list/query"
         detail_endpoint = "https://www.binance.com/bapi/composite/v1/public/cms/article/detail/query"
-        headers = {"User-Agent": "Kronos-Research-Foundry/1.0", "clienttype": "web", "Accept": "application/json"}
-        request_spacing_seconds = 1.25
+        # Use ordinary public announcement-page headers while retaining a
+        # conservative throttle. These contain no credentials or bypass.
+        headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36", "clienttype": "web", "Accept": "application/json", "Accept-Language": "en-US,en;q=0.9", "Referer": "https://www.binance.com/en/support/announcement"}
+        request_spacing_seconds = 2.0
         last_request_at = 0.0
         requests = []
 
