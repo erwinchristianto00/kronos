@@ -9,6 +9,7 @@ steps:
     env:
       - _STUDY=${_STUDY}
       - _GENERATION_SHA=${_GENERATION_SHA}
+      - _CATALOG_ID=${_CATALOG_ID}
     args:
       - -ceu
       - |
@@ -25,8 +26,12 @@ steps:
 
         study = os.environ["_STUDY"]
         generation_sha = os.environ["_GENERATION_SHA"]
+        catalog_id_text = os.environ["_CATALOG_ID"]
         if len(generation_sha) < 7 or any(ch not in "0123456789abcdef" for ch in generation_sha.lower()):
             raise RuntimeError("LIFECYCLE_CATALOG_GENERATION_SHA_INVALID")
+        if not catalog_id_text.isdigit() or int(catalog_id_text) <= 0:
+            raise RuntimeError("LIFECYCLE_CATALOG_ID_INVALID")
+        catalog_id = int(catalog_id_text)
 
         root = pathlib.Path("/workspace/binance-cms-lifecycle")
         pages_root = root / "pages"
@@ -81,12 +86,12 @@ steps:
                     time.sleep(min(60, 5 * (2 ** attempt)))
 
         def catalog_page(page_no):
-            query = urlencode({"type": "1", "catalogId": "48", "pageNo": str(page_no), "pageSize": "10"})
-            payload = get_json(endpoint + "?" + query, f"pages/catalog-48-page-{page_no:04d}.json")
+            query = urlencode({"type": "1", "catalogId": str(catalog_id), "pageNo": str(page_no), "pageSize": "10"})
+            payload = get_json(endpoint + "?" + query, f"pages/catalog-{catalog_id}-page-{page_no:04d}.json")
             if payload.get("code") != "000000" or payload.get("success") is not True:
                 raise RuntimeError("LIFECYCLE_CATALOG_RESPONSE_INVALID")
             catalogs = ((payload.get("data") or {}).get("catalogs") or [])
-            if len(catalogs) != 1 or catalogs[0].get("catalogId") != 48 or not isinstance(catalogs[0].get("articles"), list):
+            if len(catalogs) != 1 or catalogs[0].get("catalogId") != catalog_id or not isinstance(catalogs[0].get("articles"), list):
                 raise RuntimeError("LIFECYCLE_CATALOG_SHAPE_INVALID")
             return catalogs[0]
 
@@ -139,8 +144,8 @@ steps:
             "status": "RAW_CATALOG_ACQUIRED_NOT_A_TIMELINE",
             "provider": "Binance",
             "exchange": "BINANCE_USDM",
-            "datasetId": "binance-cms-public-announcements-catalog-48",
-            "catalog": {"catalogId": 48, "catalogName": first.get("catalogName"), "articleCount": total, "pageCount": total_pages, "pageSize": 10},
+            "datasetId": f"binance-cms-public-announcements-catalog-{catalog_id}",
+            "catalog": {"catalogId": catalog_id, "catalogName": first.get("catalogName"), "articleCount": total, "pageCount": total_pages, "pageSize": 10},
             "generation": {"generationToolSha": generation_sha, "generatedAtMs": int(time.time() * 1000)},
             "requests": requests,
             "archiveBundleHash": bundle_hash,
@@ -158,7 +163,7 @@ steps:
         evidence_bytes = (stable(evidence) + "\n").encode()
         evidence_hash = sha256(evidence_bytes)
         (root / "acquisition-manifest.json").write_bytes(evidence_bytes)
-        target = f"{study}/raw/lifecycle-binance-cms-catalog-48/v1/{bundle_hash}"
+        target = f"{study}/raw/lifecycle-binance-cms-catalog-{catalog_id}/v1/{bundle_hash}"
         for path in sorted(root.rglob("*")):
             if not path.is_file():
                 continue
@@ -177,4 +182,5 @@ steps:
 timeout: 1800s
 substitutions:
   _STUDY: gs://bucket-coin-yuhu/kronos-tier1-archives/binance-vision-usdm-bookticker-free-walkforward-v1
+  _CATALOG_ID: "48"
   _GENERATION_SHA: unknown
