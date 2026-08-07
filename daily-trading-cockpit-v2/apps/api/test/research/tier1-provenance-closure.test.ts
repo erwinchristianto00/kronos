@@ -17,8 +17,8 @@ const build = (kind: Parameters<typeof buildFoundryArtifact>[0]["artifactKind"],
 
 function artifacts(ethSpreadBps = 2) {
   const funding = build("FUNDING_SETTLEMENTS", canonicalizeFundingSettlements({ rows: symbols.map((symbol) => ({ symbol, observedSettlementTimeMs: H + 8, fundingIntervalMs: 8 * H, rate: 0, sourceHash: `funding-${symbol}` })), schedules: symbols.map(schedule), startMs: H, endMs: 2 * H }));
-  const listing = build("LISTING_DELISTING_TIMELINE", symbols.map((symbol) => ({ symbol, effectiveTimeMs: H, status: "LISTED", sourceHash: `listing-${symbol}` })));
-  const futures = build("FUTURES_AVAILABILITY_TIMELINE", symbols.map((symbol) => ({ symbol, effectiveTimeMs: H, available: true, sourceHash: `futures-${symbol}` })));
+  const listing = build("LISTING_DELISTING_TIMELINE", symbols.map((symbol) => ({ symbol, effectiveTimeMs: H, validUntilMs: 2 * H - 1, status: "LISTED", sourceHash: `listing-${symbol}` })));
+  const futures = build("FUTURES_AVAILABILITY_TIMELINE", symbols.map((symbol) => ({ symbol, effectiveTimeMs: H, validUntilMs: 2 * H - 1, available: true, sourceHash: `futures-${symbol}` })));
   const history = build("MINIMUM_HISTORY_ELIGIBILITY", symbols.map((symbol) => ({ symbol, asOfMs: H, eligible: true, sourceHash: `history-${symbol}` })));
   const liquidity = build("PIT_LIQUIDITY_SPREAD", [{ symbol: "BTCUSDT", asOfMs: H, validUntilMs: 2 * H - 1, volume: 100, liquidityNotional: 1_000, spreadBps: 1, sourceHash: "liq-btc" }, { symbol: "ETHUSDT", asOfMs: H, validUntilMs: 2 * H - 1, volume: 100, liquidityNotional: 1_000, spreadBps: ethSpreadBps, sourceHash: "liq-eth" }]);
   const episodes = build("CANONICAL_EPISODES", [

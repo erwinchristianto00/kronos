@@ -52,6 +52,21 @@ export function deriveFoundryCoverage(kind: FoundryArtifactKind, rows: readonly 
     if (["LISTING_DELISTING_TIMELINE", "FUTURES_AVAILABILITY_TIMELINE", "MINIMUM_HISTORY_ELIGIBILITY", "FEE_ASSUMPTIONS"].includes(kind)) {
       const allSymbolRows = rowsForSymbol.sort((a, b) => a.timestampMs - b.timestampMs);
       if (!allSymbolRows.some((row) => row.timestampMs <= expected.startMs)) gaps.push({ startMs: expected.startMs, endMs: expected.startMs, reason: "INITIAL_STATE_MISSING" });
+      if (["LISTING_DELISTING_TIMELINE", "FUTURES_AVAILABILITY_TIMELINE"].includes(kind)) {
+        const timelineRows = allSymbolRows.filter((row) => row.timestampMs <= expected.endMs - 1);
+        let coveredUntilMs: number | null = null;
+        for (const row of timelineRows) {
+          const validUntilMs = row.validUntilMs;
+          if (typeof validUntilMs !== "number" || !Number.isSafeInteger(validUntilMs) || validUntilMs < row.timestampMs) {
+            gaps.push({ startMs: Math.max(expected.startMs, row.timestampMs), endMs: Math.min(expected.endMs, Math.max(expected.startMs, row.timestampMs + 1)), reason: "STATE_VALIDITY_MISSING_OR_INVALID" });
+            continue;
+          }
+          if (row.timestampMs > expected.startMs && (coveredUntilMs === null || row.timestampMs > coveredUntilMs + 1)) gaps.push({ startMs: Math.max(expected.startMs, (coveredUntilMs ?? expected.startMs - 1) + 1), endMs: row.timestampMs, reason: "STATE_PROVENANCE_GAP" });
+          if (coveredUntilMs !== null && row.timestampMs <= coveredUntilMs) gaps.push({ startMs: row.timestampMs, endMs: Math.min(expected.endMs, coveredUntilMs + 1), reason: "STATE_PROVENANCE_OVERLAP" });
+          coveredUntilMs = Math.max(coveredUntilMs ?? -1, validUntilMs);
+        }
+        if (coveredUntilMs === null || coveredUntilMs < expected.endMs - 1) gaps.push({ startMs: Math.max(expected.startMs, (coveredUntilMs ?? expected.startMs - 1) + 1), endMs: expected.endMs, reason: "STATE_PROVENANCE_TRAILING_GAP" });
+      }
     } else if (symbolRows.length === 0) gaps.push({ startMs: expected.startMs, endMs: expected.endMs, reason: "NO_ROWS" });
     else if (kind === "FUNDING_SETTLEMENTS") {
       const schedule = expected.fundingSchedules!.find((candidate) => candidate.symbol === symbol);

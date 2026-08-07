@@ -31,9 +31,9 @@ describe("Tier-1 artifact assembly", () => {
   });
 
   it("requires authoritative timeline events and derives minimum history from prior completed bars only", () => {
-    expect(() => buildAuthoritativeTimelineArtifact({ artifactKind: "LISTING_DELISTING_TIMELINE", source: "current-exchange-state", sourceProvenance: fixtureSourceProvenance("current", "0000000"), generatedAtMs: 0, generationSha: "x", expectedCoverage: expected, rows: [{ symbol: "BTCUSDT", effectiveTimeMs: 0, status: "LISTED", sourceHash: "s" }] })).toThrow("FOUNDRY_TIMELINE_SOURCE_NOT_AUTHORITATIVE");
-    const listing = validateFoundryRows("LISTING_DELISTING_TIMELINE", FOUNDRY_SCHEMA_V1, [{ symbol: "BTCUSDT", effectiveTimeMs: 0, status: "LISTED", sourceHash: "listing" }]);
-    const futures = validateFoundryRows("FUTURES_AVAILABILITY_TIMELINE", FOUNDRY_SCHEMA_V1, [{ symbol: "BTCUSDT", effectiveTimeMs: 0, available: true, sourceHash: "futures" }]);
+    expect(() => buildAuthoritativeTimelineArtifact({ artifactKind: "LISTING_DELISTING_TIMELINE", source: "current-exchange-state", sourceProvenance: fixtureSourceProvenance("current", "0000000"), generatedAtMs: 0, generationSha: "x", expectedCoverage: expected, rows: [{ symbol: "BTCUSDT", effectiveTimeMs: 0, validUntilMs: 2 * H - 1, status: "LISTED", sourceHash: "s" }] })).toThrow("FOUNDRY_TIMELINE_SOURCE_NOT_AUTHORITATIVE");
+    const listing = validateFoundryRows("LISTING_DELISTING_TIMELINE", FOUNDRY_SCHEMA_V1, [{ symbol: "BTCUSDT", effectiveTimeMs: 0, validUntilMs: 3 * H - 1, status: "LISTED", sourceHash: "listing" }]);
+    const futures = validateFoundryRows("FUTURES_AVAILABILITY_TIMELINE", FOUNDRY_SCHEMA_V1, [{ symbol: "BTCUSDT", effectiveTimeMs: 0, validUntilMs: 3 * H - 1, available: true, sourceHash: "futures" }]);
     const candles = validateFoundryRows("COMPLETED_CANDLES", FOUNDRY_SCHEMA_V1, [candle(0, 100), candle(H, 101)]);
     const minimum = generateMinimumHistoryEligibilityArtifact({ listingRows: listing, futuresRows: futures, candleRows: candles, expectedCoverage: { ...expected, endMs: 3 * H }, decisionTimesMs: [0, H, 2 * H], minimumCompletedBars: 1, source: "derived:prior-completed-bars", sourceProvenance: { ...fixtureSourceProvenance("minimum", "0000000"), provenanceType: "DERIVED_FROM_FOUNDRY_ARTIFACTS" }, derivation: derivation("minimum-v1"), generatedAtMs: 0, generationSha: "x" });
     expect(minimum.canonicalRows.map((row) => [row.asOfMs, row.eligible])).toEqual([[0, false], [H, true]]);
@@ -52,8 +52,8 @@ describe("Tier-1 artifact assembly", () => {
   it("assembles only complete coherent artifacts and rejects conflicts or incomplete ranking", () => {
     const completeSchedule = { ...schedule, settlementTimesMs: [H] }; const completeExpected = { startMs: H, endMs: 2 * H, symbols, cadenceMs: H, fundingSchedules: [completeSchedule] };
     const funding = build("FUNDING_SETTLEMENTS", canonicalizeFundingSettlements({ rows: [{ symbol: "BTCUSDT", observedSettlementTimeMs: H, fundingIntervalMs: 8 * H, rate: 0, sourceHash: "funding" }], schedules: [completeSchedule], startMs: H, endMs: 2 * H }), completeExpected);
-    const listing = build("LISTING_DELISTING_TIMELINE", [{ symbol: "BTCUSDT", effectiveTimeMs: H, status: "LISTED", sourceHash: "listing" }], completeExpected);
-    const futures = build("FUTURES_AVAILABILITY_TIMELINE", [{ symbol: "BTCUSDT", effectiveTimeMs: H, available: true, sourceHash: "futures" }], completeExpected);
+    const listing = build("LISTING_DELISTING_TIMELINE", [{ symbol: "BTCUSDT", effectiveTimeMs: H, validUntilMs: 2 * H - 1, status: "LISTED", sourceHash: "listing" }], completeExpected);
+    const futures = build("FUTURES_AVAILABILITY_TIMELINE", [{ symbol: "BTCUSDT", effectiveTimeMs: H, validUntilMs: 2 * H - 1, available: true, sourceHash: "futures" }], completeExpected);
     const minimum = build("MINIMUM_HISTORY_ELIGIBILITY", [{ symbol: "BTCUSDT", asOfMs: H, eligible: true, sourceHash: "minimum" }], completeExpected);
     const liquidity = build("PIT_LIQUIDITY_SPREAD", [{ symbol: "BTCUSDT", asOfMs: H, validUntilMs: 2 * H - 1, volume: 100, liquidityNotional: 100, spreadBps: 1, sourceHash: "liquidity" }], { ...completeExpected, maxSnapshotAgeMs: H });
     const risk = build("PORTFOLIO_RISK_SNAPSHOTS", [{ symbol: "BTCUSDT", asOfMs: H, validUntilMs: 2 * H - 1, alignedStartMs: 0, alignedEndMs: H - 1, alignedObservationCount: 2, alignedTimestampHash: "timestamps", alignedSourceHashes: ["risk-source"], btcBeta: 1, correlationCluster: "BTC", sourceHash: "risk" }], completeExpected);
@@ -95,6 +95,6 @@ describe("Tier-1 artifact assembly", () => {
     expect(() => assembleTier1Baseline({ artifacts, symbols, startMs: H, endMs: 2 * H, timeframeMs: H, liquidityPolicy: policy, researchMode: "REAL_TIER1" })).toThrow("FOUNDRY_REAL_TIER1_VERIFIED_RELOAD_REQUIRED");
     const incomplete = assembleTier1Baseline({ artifacts: artifacts.filter((artifact) => artifact.manifest.artifactKind !== "PORTFOLIO_RISK_SNAPSHOTS"), symbols, startMs: H, endMs: 2 * H, timeframeMs: H, liquidityPolicy: policy });
     expect(() => assertTier1AssemblyCanRun(incomplete)).toThrow("FOUNDRY_TIER1_INCOMPLETE_CANNOT_RUN_OR_RANK");
-    expect(() => assembleTier1Baseline({ artifacts: artifacts.map((artifact) => artifact.manifest.artifactKind === "FUTURES_AVAILABILITY_TIMELINE" ? { ...artifact, rows: validateFoundryRows("FUTURES_AVAILABILITY_TIMELINE", FOUNDRY_SCHEMA_V1, [{ symbol: "BTCUSDT", effectiveTimeMs: H, available: false, sourceHash: "futures" }]) } : artifact), symbols, startMs: H, endMs: 2 * H, timeframeMs: H, liquidityPolicy: policy })).toThrow("FOUNDRY_ELIGIBILITY_TIMELINE_CONFLICT");
+    expect(() => assembleTier1Baseline({ artifacts: artifacts.map((artifact) => artifact.manifest.artifactKind === "FUTURES_AVAILABILITY_TIMELINE" ? { ...artifact, rows: validateFoundryRows("FUTURES_AVAILABILITY_TIMELINE", FOUNDRY_SCHEMA_V1, [{ symbol: "BTCUSDT", effectiveTimeMs: H, validUntilMs: 2 * H - 1, available: false, sourceHash: "futures" }]) } : artifact), symbols, startMs: H, endMs: 2 * H, timeframeMs: H, liquidityPolicy: policy })).toThrow("FOUNDRY_ELIGIBILITY_TIMELINE_CONFLICT");
   });
 });

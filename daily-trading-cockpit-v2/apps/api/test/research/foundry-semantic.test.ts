@@ -56,8 +56,8 @@ describe("Foundry semantic strictness", () => {
   });
 
   it("rejects conflicts between listing, futures availability, and eligibility timelines", () => {
-    const listing = validateFoundryRows("LISTING_DELISTING_TIMELINE", FOUNDRY_SCHEMA_V1, [{ symbol: "BTCUSDT", effectiveTimeMs: 0, status: "DELISTED", sourceHash: "s" }]);
-    const futures = validateFoundryRows("FUTURES_AVAILABILITY_TIMELINE", FOUNDRY_SCHEMA_V1, [{ symbol: "BTCUSDT", effectiveTimeMs: 0, available: false, sourceHash: "s" }]);
+    const listing = validateFoundryRows("LISTING_DELISTING_TIMELINE", FOUNDRY_SCHEMA_V1, [{ symbol: "BTCUSDT", effectiveTimeMs: 0, validUntilMs: H, status: "DELISTED", sourceHash: "s" }]);
+    const futures = validateFoundryRows("FUTURES_AVAILABILITY_TIMELINE", FOUNDRY_SCHEMA_V1, [{ symbol: "BTCUSDT", effectiveTimeMs: 0, validUntilMs: H, available: false, sourceHash: "s" }]);
     const eligibility = validateFoundryRows("MINIMUM_HISTORY_ELIGIBILITY", FOUNDRY_SCHEMA_V1, [{ symbol: "BTCUSDT", asOfMs: 0, eligible: true, sourceHash: "s" }]);
     expect(() => assertEligibilityTimelineConsistency({ listingRows: listing, futuresRows: futures, minimumHistoryRows: eligibility })).toThrow("FOUNDRY_ELIGIBILITY_TIMELINE_CONFLICT");
   });
