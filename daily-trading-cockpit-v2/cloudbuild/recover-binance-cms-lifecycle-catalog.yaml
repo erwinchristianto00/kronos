@@ -1,0 +1,18 @@
+# Repairs only a timeout-interrupted CMS raw upload.  It does not touch or
+# re-download any Binance Vision archive: absent article bodies must reproduce
+# their pre-timeout manifest hashes byte-for-byte or the build fails closed.
+steps:
+  - name: gcr.io/google.com/cloudsdktool/google-cloud-cli:slim
+    id: recover-exact-cms-objects
+    entrypoint: bash
+    env:
+      - _RAW_ROOT=${_RAW_ROOT}
+      - _GENERATION_SHA=${_GENERATION_SHA}
+    args:
+      - -ceu
+      - |
+        python3 scripts/research/recover-binance-cms-lifecycle-catalog.py
+timeout: 3600s
+substitutions:
+  _RAW_ROOT: ""
+  _GENERATION_SHA: unknown
