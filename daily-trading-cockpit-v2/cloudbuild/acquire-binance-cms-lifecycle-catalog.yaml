@@ -10,6 +10,7 @@ steps:
       - _STUDY=${_STUDY}
       - _GENERATION_SHA=${_GENERATION_SHA}
       - _CATALOG_ID=${_CATALOG_ID}
+      - _FETCH_ALL_DETAILS=${_FETCH_ALL_DETAILS}
     args:
       - -ceu
       - |
@@ -27,11 +28,15 @@ steps:
         study = os.environ["_STUDY"]
         generation_sha = os.environ["_GENERATION_SHA"]
         catalog_id_text = os.environ["_CATALOG_ID"]
+        fetch_all_details_text = os.environ["_FETCH_ALL_DETAILS"]
         if len(generation_sha) < 7 or any(ch not in "0123456789abcdef" for ch in generation_sha.lower()):
             raise RuntimeError("LIFECYCLE_CATALOG_GENERATION_SHA_INVALID")
         if not catalog_id_text.isdigit() or int(catalog_id_text) <= 0:
             raise RuntimeError("LIFECYCLE_CATALOG_ID_INVALID")
+        if fetch_all_details_text not in ("true", "false"):
+            raise RuntimeError("LIFECYCLE_CATALOG_FETCH_ALL_DETAILS_INVALID")
         catalog_id = int(catalog_id_text)
+        fetch_all_details = fetch_all_details_text == "true"
 
         root = pathlib.Path("/workspace/binance-cms-lifecycle")
         pages_root = root / "pages"
@@ -123,12 +128,16 @@ steps:
         if len(articles) != total or len({article["id"] for article in articles}) != total or len({article["code"] for article in articles}) != total:
             raise RuntimeError("LIFECYCLE_CATALOG_COVERAGE_INVALID")
 
-        # Retain exact official bodies for relevant futures lifecycle candidates.
+        # A raw catalogue index alone cannot establish whether an instrument is
+        # named inside a delisting announcement body.  The full-detail mode is
+        # deliberately available for the Delisting catalogue: it retains every
+        # official body so a later lifecycle parser never concludes from a title
+        # omission.  Other calls may retain only direct futures candidates.
         def candidate(article):
             title = article["title"].upper()
             pair = "BTC/USDT" in title or "ETH/USDT" in title or "BTCUSDT" in title or "ETHUSDT" in title
             return ("FUTURES" in title and pair) or ("FUTURES" in title and "DELIST" in title)
-        selected = sorted((article for article in articles if candidate(article)), key=lambda article: (article["releaseDate"], article["code"]))
+        selected = sorted((articles if fetch_all_details else (article for article in articles if candidate(article))), key=lambda article: (article["releaseDate"], article["code"]))
         for article in selected:
             query = urlencode({"articleCode": article["code"]})
             detail = get_json(detail_endpoint + "?" + query, f"details/{article['code']}.json")
@@ -140,7 +149,7 @@ steps:
         bundle_hash = sha256(stable([{"relativePath": entry["relativePath"], "fileHash": entry["fileHash"]} for entry in requests]).encode())
         titles = [article["title"] for article in articles]
         evidence = {
-            "schemaVersion": "KronosBinanceCmsLifecycleRaw/v1",
+            "schemaVersion": "KronosBinanceCmsLifecycleRaw/v2",
             "status": "RAW_CATALOG_ACQUIRED_NOT_A_TIMELINE",
             "provider": "Binance",
             "exchange": "BINANCE_USDM",
@@ -149,13 +158,15 @@ steps:
             "generation": {"generationToolSha": generation_sha, "generatedAtMs": int(time.time() * 1000)},
             "requests": requests,
             "archiveBundleHash": bundle_hash,
+            "detailCoverage": {"mode": "ALL_CATALOG_ARTICLES" if fetch_all_details else "FUTURES_TITLE_CANDIDATES", "detailArticleCount": len(selected)},
             "candidateArticleCodes": [article["code"] for article in selected],
             "candidateSummary": {
                 "btcOrEthFuturesTitleCount": sum(1 for title in titles if "FUTURES" in title.upper() and ("BTC/USDT" in title.upper() or "ETH/USDT" in title.upper() or "BTCUSDT" in title.upper() or "ETHUSDT" in title.upper())),
                 "futuresDelistTitleCount": sum(1 for title in titles if "FUTURES" in title.upper() and "DELIST" in title.upper()),
             },
             "limitations": [
-                "Catalog 48 is raw official announcement evidence, not an asserted exhaustive futures-delisting feed.",
+                "The raw catalogue is official announcement evidence, not an asserted lifecycle timeline.",
+                "A full-detail Delisting corpus can support body-level instrument matching, but does not by itself establish unannounced availability changes.",
                 "No listing/delisting or futures-availability timeline is produced by this acquisition alone.",
                 "REAL_TIER1 remains forbidden until an authoritative complete lifecycle transition source is validated.",
             ],
@@ -183,4 +194,5 @@ timeout: 1800s
 substitutions:
   _STUDY: gs://bucket-coin-yuhu/kronos-tier1-archives/binance-vision-usdm-bookticker-free-walkforward-v1
   _CATALOG_ID: "48"
+  _FETCH_ALL_DETAILS: "false"
   _GENERATION_SHA: unknown
