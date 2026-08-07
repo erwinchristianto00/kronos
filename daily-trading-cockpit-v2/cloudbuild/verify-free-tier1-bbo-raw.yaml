@@ -87,7 +87,7 @@ steps:
                 if marker.get("companionSha256") != computed_checksum or marker.get("publisherCompanionSha256") != computed_checksum:
                     raise RuntimeError(f"checksum companion SHA-256 mismatch: {name}")
                 companion = checksum_path.read_text(encoding="utf8").strip()
-                checksum_match = re.fullmatch(r"([a-fA-F0-9]{64})\\s+([^\\s]+)", companion)
+                checksum_match = re.fullmatch(r"([a-fA-F0-9]{64})\s+([^\s]+)", companion)
                 if checksum_match is None or checksum_match.group(1).lower() != computed_zip or checksum_match.group(2) != name:
                     raise RuntimeError(f"publisher checksum bytes invalid: {name}")
                 inventory.append({
