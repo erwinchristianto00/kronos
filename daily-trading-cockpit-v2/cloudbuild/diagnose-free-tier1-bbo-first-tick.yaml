@@ -1,0 +1,88 @@
+# One-off cloud-only diagnosis for a fail-closed BBO import.  It reads exactly
+# one generation-pinned canonical ZIP and emits no Foundry artifact or runtime
+# output.  Its purpose is to expose the source field that makes the first
+# canonical decision tick invalid before changing parsing policy.
+steps:
+  - name: gcr.io/google.com/cloudsdktool/google-cloud-cli:slim
+    id: diagnose-canonical-btcusdt-bookticker-first-tick
+    entrypoint: bash
+    env:
+      - _STUDY=${_STUDY}
+      - _BBO_RAW_BUNDLE_HASH=${_BBO_RAW_BUNDLE_HASH}
+    args:
+      - -ceu
+      - |
+        python3 - <<'PY'
+        import csv
+        import hashlib
+        import io
+        import json
+        import os
+        import pathlib
+        import subprocess
+        import zipfile
+
+        study = os.environ["_STUDY"]
+        bundle_hash = os.environ["_BBO_RAW_BUNDLE_HASH"]
+        manifest_uri = f"{study}/acquisition-manifests/v2/{bundle_hash}.json"
+        manifest_path = pathlib.Path("/workspace/raw-manifest.json")
+        subprocess.check_call(["gcloud", "storage", "cp", manifest_uri, str(manifest_path)])
+        manifest_bytes = manifest_path.read_bytes()
+        manifest = json.loads(manifest_bytes)
+        if manifest.get("canonicalRawBookTickerBundleHash") != bundle_hash:
+            raise RuntimeError("BBO_DIAGNOSTIC_MANIFEST_INVALID")
+        relative = "BTCUSDT/BTCUSDT-bookTicker-2023-05.zip"
+        entry = next((item for item in manifest["objects"] if item.get("relativePath") == relative), None)
+        if not entry:
+            raise RuntimeError("BBO_DIAGNOSTIC_OBJECT_MISSING")
+        local = pathlib.Path("/workspace/btcusdt-bookticker-2023-05.zip")
+        subprocess.check_call(["gcloud", "storage", "cp", "--do-not-decompress", f"{entry['canonical']['uri']}#{entry['canonical']['generation']}", str(local)])
+        actual_hash = hashlib.sha256(local.read_bytes()).hexdigest()
+        if actual_hash != entry["canonical"]["sha256"] or entry.get("officialChecksum") != actual_hash:
+            raise RuntimeError("BBO_DIAGNOSTIC_CANONICAL_HASH_MISMATCH")
+
+        as_of = 1684238400000  # 2023-05-16T12:00:00.000Z
+        hour = 3_600_000
+        source_start = 1682899200000  # 2023-05-01T00:00:00.000Z
+        source_end = 1685577600000    # 2023-06-01T00:00:00.000Z
+        header = ["update_id", "best_bid_price", "best_bid_qty", "best_ask_price", "best_ask_qty", "transaction_time", "event_time"]
+        base = None
+        selected = None
+        total_rows = 0
+        invalid_rows = 0
+        with zipfile.ZipFile(local) as archive:
+            if archive.testzip() is not None or len(archive.infolist()) != 1:
+                raise RuntimeError("BBO_DIAGNOSTIC_ZIP_INVALID")
+            with archive.open(archive.infolist()[0]) as raw:
+                reader = csv.reader(io.TextIOWrapper(raw, encoding="utf8", newline=""))
+                if next(reader, None) != header:
+                    raise RuntimeError("BBO_DIAGNOSTIC_HEADER_INVALID")
+                for row in reader:
+                    total_rows += 1
+                    if len(row) != 7:
+                        raise RuntimeError("BBO_DIAGNOSTIC_COLUMNS_INVALID")
+                    update, bid, bid_qty, ask, ask_qty, _, event = row
+                    update_id = int(update); event_ms = int(event)
+                    bid_price = float(bid); ask_price = float(ask); bid_quantity = float(bid_qty); ask_quantity = float(ask_qty)
+                    valid = update_id > 0 and event_ms > 0 and bid_price > 0 and ask_price > 0 and bid_quantity >= 0 and ask_quantity >= 0 and ask_price >= bid_price
+                    if not valid:
+                        invalid_rows += 1
+                        raise RuntimeError(f"BBO_DIAGNOSTIC_RAW_VALUE_INVALID_{event_ms}")
+                    if event_ms < source_start or event_ms >= source_end:
+                        continue
+                    candidate = {"eventTimeMs": event_ms, "updateId": update_id, "bidPrice": bid_price, "bidQuantity": bid_quantity, "askPrice": ask_price, "askQuantity": ask_quantity}
+                    if event_ms < as_of and (base is None or (event_ms, update_id) > (base["eventTimeMs"], base["updateId"])):
+                        base = candidate
+                    target = ((event_ms + hour - 1) // hour) * hour
+                    if target == as_of and (selected is None or (event_ms, update_id) > (selected["eventTimeMs"], selected["updateId"])):
+                        selected = candidate
+        active = selected or base
+        if not active:
+            raise RuntimeError("BBO_DIAGNOSTIC_ACTIVE_MARK_MISSING")
+        result = {"status": "PASS", "rawSha256": actual_hash, "totalRows": total_rows, "invalidRows": invalid_rows, "asOfMs": as_of, "base": base, "selected": selected, "active": active, "eventAfterAsOf": active["eventTimeMs"] > as_of, "ageMs": as_of - active["eventTimeMs"], "staleBeyondOneHour": as_of - active["eventTimeMs"] > hour, "nonPositiveUpdateId": active["updateId"] <= 0}
+        print(json.dumps(result, sort_keys=True))
+        PY
+timeout: 3600s
+substitutions:
+  _STUDY: gs://bucket-coin-yuhu/kronos-tier1-archives/binance-vision-usdm-bookticker-free-walkforward-v1
+  _BBO_RAW_BUNDLE_HASH: 3338e528944869fec5b2ce112cdeedac7aa1fe031563a141a57babf4ad39584a
