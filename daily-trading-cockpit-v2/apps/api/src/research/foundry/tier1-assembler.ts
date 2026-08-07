@@ -84,12 +84,20 @@ export function loadTier1Artifacts(input: { rootDir: string; semanticManifestHas
 }
 
 /** Builds Tier-1 execution adapters only if every source-backed artifact is complete and coherent. */
-export function assembleTier1Baseline(input: { artifacts: readonly Tier1LoadedArtifact[]; symbols: readonly string[]; startMs: number; endMs: number; timeframeMs: number; liquidityPolicy: Tier1LiquiditySpreadPolicy; researchMode?: TournamentResearchMode; archiveRoots?: Partial<Record<FoundryArtifactKind, string>> }): Tier1Assembly | { label: "TIER_1_BASELINE — NOT COMPARABLE TO EXACT KRONOS"; capability: Tier1CapabilityReport } {
+export function assembleTier1Baseline(input: { artifacts: readonly Tier1LoadedArtifact[]; provenanceParents?: readonly Tier1LoadedArtifact[]; symbols: readonly string[]; startMs: number; endMs: number; timeframeMs: number; liquidityPolicy: Tier1LiquiditySpreadPolicy; researchMode?: TournamentResearchMode; archiveRoots?: Partial<Record<FoundryArtifactKind, string>> }): Tier1Assembly | { label: "TIER_1_BASELINE — NOT COMPARABLE TO EXACT KRONOS"; capability: Tier1CapabilityReport } {
   const capability = buildTier1CapabilityReport(input.artifacts.map((artifact) => artifact.manifest)); const label = "TIER_1_BASELINE — NOT COMPARABLE TO EXACT KRONOS" as const;
   if (!capability.canRun) return { label, capability };
+  const provenanceParents = input.provenanceParents ?? [];
+  const executionHashes = new Set(input.artifacts.map((artifact) => artifact.manifest.semanticManifestHash));
+  if (provenanceParents.some((artifact) => executionHashes.has(artifact.manifest.semanticManifestHash))) throw new Error("FOUNDRY_TIER1_PROVENANCE_PARENT_DUPLICATE");
+  const provenanceArtifacts = [...input.artifacts, ...provenanceParents];
+  const provenanceHashes = new Set(provenanceArtifacts.map((artifact) => artifact.manifest.semanticManifestHash));
+  if (provenanceHashes.size !== provenanceArtifacts.length) throw new Error("FOUNDRY_TIER1_PROVENANCE_ARTIFACT_DUPLICATE");
+  const referencedParents = new Set(provenanceArtifacts.flatMap((artifact) => artifact.manifest.derivation?.parentSemanticManifestHashes ?? []));
+  if (provenanceParents.some((artifact) => !referencedParents.has(artifact.manifest.semanticManifestHash))) throw new Error("FOUNDRY_TIER1_PROVENANCE_PARENT_UNUSED");
   if (input.researchMode === "REAL_TIER1") {
-    if (input.artifacts.some((artifact) => !verifiedReloadArtifacts.has(artifact))) throw new Error("FOUNDRY_REAL_TIER1_VERIFIED_RELOAD_REQUIRED");
-    assertRealTier1ArtifactProvenance(input.artifacts, input.archiveRoots ?? {});
+    if (provenanceArtifacts.some((artifact) => !verifiedReloadArtifacts.has(artifact))) throw new Error("FOUNDRY_REAL_TIER1_VERIFIED_RELOAD_REQUIRED");
+    assertRealTier1ArtifactProvenance(provenanceArtifacts, input.archiveRoots ?? {});
   }
   const indexed = byKind(input.artifacts);
   for (const kind of REQUIRED) {
@@ -114,8 +122,8 @@ export function assembleTier1Baseline(input: { artifacts: readonly Tier1LoadedAr
   const funding = indexed.get("FUNDING_SETTLEMENTS")!; const fundingScheduleBySymbol = immutableSchedule(funding.rows, input.symbols); const canonicalFundingSettlements = immutable(fundingSettlementsFromRows(funding.rows).map((row) => ({ ...row })));
   const risk = indexed.get("PORTFOLIO_RISK_SNAPSHOTS")!; const candles = indexed.get("COMPLETED_CANDLES")!;
   const canonicalCandles = immutable(candles.rows.map((row) => ({ symbol: row.symbol!, openTimeMs: row.openTimeMs as number, closeTimeMs: row.closeTimeMs as number, open: row.open as number, high: row.high as number, low: row.low as number, close: row.close as number, volume: row.volume as number })));
-  const immutableSnapshots = immutable(universeSnapshots.map((snapshot) => structuredClone(snapshot))); const immutablePolicy = immutable({ ...input.liquidityPolicy }); const artifactSemanticHashes = immutable([...capability.artifactSemanticHashes].sort());
-  const archiveBundleIdentities = immutable(Object.fromEntries(input.artifacts.map((artifact) => [artifact.manifest.artifactKind, artifact.manifest.archiveBundle ?? null])));
+  const immutableSnapshots = immutable(universeSnapshots.map((snapshot) => structuredClone(snapshot))); const immutablePolicy = immutable({ ...input.liquidityPolicy }); const artifactSemanticHashes = immutable([...provenanceHashes].sort());
+  const archiveBundleIdentities = immutable(Object.fromEntries(provenanceArtifacts.map((artifact) => [artifact.manifest.semanticManifestHash, artifact.manifest.archiveBundle ?? null])));
   const universeSnapshotHash = tournamentHash(immutableSnapshots); const fundingScheduleIdentity = tournamentHash(fundingScheduleBySymbol); const postTradeEpisodePolicy = immutable(canonicalPostTradeEpisodePolicy(input.timeframeMs)); const episodePolicyHash = tournamentHash(postTradeEpisodePolicy); const portfolioRiskIdentity = risk.manifest.semanticManifestHash; const liquidityPolicyHash = tournamentHash(immutablePolicy);
   const bindingCore = { assemblyVersion: TIER1_ASSEMBLY_VERSION, artifactSemanticHashes, universeSnapshotHash, liquidityPolicyHash, fundingScheduleIdentity, episodePolicyHash, portfolioRiskIdentity };
   const tier1AssemblyHash = tournamentHash({ ...bindingCore, range: { startMs: input.startMs, endMs: input.endMs }, timeframeMs: input.timeframeMs, archiveBundleIdentities }); const binding = immutable({ ...bindingCore, tier1AssemblyHash });
@@ -123,8 +131,8 @@ export function assembleTier1Baseline(input: { artifacts: readonly Tier1LoadedAr
   if (input.researchMode === "REAL_TIER1") {
     verifiedRealAssemblies.add(assembly);
     verifiedRealAssemblyInputs.set(assembly, {
-      foundryArtifacts: immutable(input.artifacts.map((artifact) => ({ rootDir: verifiedArtifactStoreRoots.get(artifact)!, semanticManifestHash: artifact.manifest.semanticManifestHash }))),
-      provenanceArtifacts: immutable(input.artifacts.map((artifact) => ({ manifest: structuredClone(artifact.manifest), rows: [] }))),
+      foundryArtifacts: immutable(provenanceArtifacts.map((artifact) => ({ rootDir: verifiedArtifactStoreRoots.get(artifact)!, semanticManifestHash: artifact.manifest.semanticManifestHash }))),
+      provenanceArtifacts: immutable(provenanceArtifacts.map((artifact) => ({ manifest: structuredClone(artifact.manifest), rows: [] }))),
       archiveRoots: immutable({ ...(input.archiveRoots ?? {}) }),
     });
   }

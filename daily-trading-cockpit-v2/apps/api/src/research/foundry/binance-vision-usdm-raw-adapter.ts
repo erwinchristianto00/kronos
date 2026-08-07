@@ -169,3 +169,33 @@ export async function importBinanceVisionUsdMRawBookTickerLiquidityArchive(input
   const built = buildFoundryArtifact({ artifactKind: "PIT_LIQUIDITY_SPREAD", schemaVersion: FOUNDRY_SCHEMA_V1, source: input.source, sourceProvenance: input.sourceProvenance, archiveBundle, units: { asOfMs: "unix_ms", validUntilMs: "unix_ms", volume: "base_asset_prior_completed_1h", liquidityNotional: "USDT_min_best_bid_ask_notional", spreadBps: "inside_bbo_bps", policy: BOOK_TICKER_HOURLY_POLICY_VERSION, archiveEndTailToleranceMs: `${BOOK_TICKER_ARCHIVE_END_TAIL_TOLERANCE_MS}ms` }, generatedAtMs: input.generatedAtMs, generationSha: input.generationSha, expectedCoverage: { ...input.expectedCoverage, maxSnapshotAgeMs: input.maxQuoteAgeMs }, rows });
   return { rows: built.canonicalRows, manifest: built.manifest };
 }
+
+/**
+ * Reads the exact same checksum-verified BBO stream as the liquidity importer,
+ * but retains every source age so an invalid proposed scope can be diagnosed
+ * before it is made into a Foundry artifact. It never loosens the importer
+ * contract or creates eligibility evidence from a stale quote.
+ */
+export async function inspectBinanceVisionUsdMRawBookTickerCoverage(input: { root: string; expectedCoverage: FoundryExpectedCoverage; maxQuoteAgeMs: number }): Promise<{ archiveBundle: ArchiveBundleIdentity; samples: Array<{ symbol: string; asOfMs: number; eventTimeMs: number; quoteAgeMs: number; withinMaxQuoteAge: boolean; sourceHash: string }> }> {
+  if (input.expectedCoverage.cadenceMs !== HOUR_MS || !Number.isInteger(input.maxQuoteAgeMs) || input.maxQuoteAgeMs < 0) throw new Error("FOUNDRY_BINANCE_VISION_BOOKTICKER_CONTRACT_INVALID");
+  const archiveBundle = sourceArchive({ root: input.root, required: (path) => path.startsWith("bookTicker/") && archiveFile(path) });
+  const filesBySymbol = new Map<string, typeof archiveBundle.files>();
+  for (const file of archiveBundle.files.filter((file) => zip(file.relativePath)).sort((a, b) => a.relativePath.localeCompare(b.relativePath))) {
+    const symbol = symbolFromPath(file.relativePath, "bookTicker"); filesBySymbol.set(symbol, [...(filesBySymbol.get(symbol) ?? []), file]);
+  }
+  const expectedSymbols = [...input.expectedCoverage.symbols].sort();
+  if (JSON.stringify([...filesBySymbol.keys()].sort()) !== JSON.stringify(expectedSymbols)) throw new Error("FOUNDRY_BINANCE_VISION_BOOKTICKER_SYMBOL_COVERAGE_INVALID");
+  const samples = (await Promise.all(expectedSymbols.map(async (symbol) => {
+    const symbolSamples: BookTickerSample[] = []; let carry: BookTickerState | undefined;
+    for (const file of filesBySymbol.get(symbol)!) {
+      const month = monthRange(file.relativePath); const startMs = Math.max(input.expectedCoverage.startMs, month.startMs); const endMs = Math.min(input.expectedCoverage.endMs, month.endMs);
+      const establishesBoundaryCarry = month.endMs === input.expectedCoverage.startMs && carry === undefined;
+      if (startMs < endMs || establishesBoundaryCarry) { const imported = await bookTickerSamples({ path: resolve(input.root, file.relativePath), relativePath: file.relativePath, symbol, startMs, endMs, sourceStartMs: month.startMs, sourceEndMs: month.endMs, sourceHash: file.fileHash, maxQuoteAgeMs: Number.MAX_SAFE_INTEGER, initialState: carry }); symbolSamples.push(...imported.samples); carry = imported.carry; }
+    }
+    return symbolSamples;
+  }))).flat().sort((left, right) => left.asOfMs - right.asOfMs || left.symbol.localeCompare(right.symbol));
+  const expectedCount = expectedSymbols.length * ((input.expectedCoverage.endMs - input.expectedCoverage.startMs) / HOUR_MS);
+  const keys = new Set(samples.map((sample) => `${sample.symbol}:${sample.asOfMs}`));
+  if (samples.length !== expectedCount || keys.size !== expectedCount || samples.some((sample) => sample.eventTimeMs > sample.asOfMs)) throw new Error("FOUNDRY_BINANCE_VISION_BOOKTICKER_COVERAGE_OUTPUT_INVALID");
+  return { archiveBundle, samples: samples.map((sample) => ({ symbol: sample.symbol, asOfMs: sample.asOfMs, eventTimeMs: sample.eventTimeMs, quoteAgeMs: sample.asOfMs - sample.eventTimeMs, withinMaxQuoteAge: sample.asOfMs - sample.eventTimeMs <= input.maxQuoteAgeMs, sourceHash: sample.sourceHash })) };
+}

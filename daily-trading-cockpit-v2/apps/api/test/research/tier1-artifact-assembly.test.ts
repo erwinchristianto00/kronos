@@ -49,6 +49,26 @@ describe("Tier-1 artifact assembly", () => {
     expect(risk.manifest.rowsHash).toBe(withFuture.manifest.rowsHash);
   });
 
+  it("binds verified warm-up parents into the assembly without letting them replace executable candles", () => {
+    const completeSchedule = { ...schedule, settlementTimesMs: [H] }; const completeExpected = { startMs: H, endMs: 2 * H, symbols, cadenceMs: H, fundingSchedules: [completeSchedule] };
+    const funding = build("FUNDING_SETTLEMENTS", canonicalizeFundingSettlements({ rows: [{ symbol: "BTCUSDT", observedSettlementTimeMs: H, fundingIntervalMs: 8 * H, rate: 0, sourceHash: "funding" }], schedules: [completeSchedule], startMs: H, endMs: 2 * H }), completeExpected);
+    const listing = build("LISTING_DELISTING_TIMELINE", [{ symbol: "BTCUSDT", effectiveTimeMs: H, validUntilMs: 2 * H - 1, status: "LISTED", sourceHash: "listing" }], completeExpected);
+    const futures = build("FUTURES_AVAILABILITY_TIMELINE", [{ symbol: "BTCUSDT", effectiveTimeMs: H, validUntilMs: 2 * H - 1, available: true, sourceHash: "futures" }], completeExpected);
+    const minimum = build("MINIMUM_HISTORY_ELIGIBILITY", [{ symbol: "BTCUSDT", asOfMs: H, eligible: true, sourceHash: "minimum" }], completeExpected);
+    const liquidity = build("PIT_LIQUIDITY_SPREAD", [{ symbol: "BTCUSDT", asOfMs: H, validUntilMs: 2 * H - 1, volume: 100, liquidityNotional: 100, spreadBps: 1, sourceHash: "liquidity" }], { ...completeExpected, maxSnapshotAgeMs: H });
+    const candles = build("COMPLETED_CANDLES", [candle(H, 100)], completeExpected);
+    const warmup = build("COMPLETED_CANDLES", [candle(0, 99)], { startMs: 0, endMs: H, symbols, cadenceMs: H });
+    const risk = buildFoundryArtifact({ artifactKind: "PORTFOLIO_RISK_SNAPSHOTS", schemaVersion: FOUNDRY_SCHEMA_V1, source: "derived:strict-prior-warmup", sourceProvenance: { ...fixtureSourceProvenance("risk-parent", "0000000"), provenanceType: "DERIVED_FROM_FOUNDRY_ARTIFACTS" }, derivation: { version: "foundry-derivation-v1", policyVersion: "strict-prior-v1", parameters: { warmup: true }, parentSemanticManifestHashes: [warmup.manifest.semanticManifestHash] }, units: { snapshot: "fixture" }, generatedAtMs: 0, generationSha: "fixture", expectedCoverage: { ...completeExpected, maxSnapshotAgeMs: H }, rows: [{ symbol: "BTCUSDT", asOfMs: H, validUntilMs: 2 * H - 1, alignedStartMs: 0, alignedEndMs: H - 1, alignedObservationCount: 2, alignedTimestampHash: "aligned", alignedSourceHashes: ["risk-source"], btcBeta: 1, correlationCluster: "BTC", sourceHash: "risk" }] });
+    const artifacts = [funding, listing, futures, minimum, liquidity, risk, candles].map(({ manifest, canonicalRows }) => ({ manifest, rows: canonicalRows }));
+    const policy = { version: "tier1-liquidity-v1", minVolume: 1, minLiquidityNotional: 1, maxSpreadBps: 10, maxAgeMs: H };
+    expect(() => assembleTier1Baseline({ artifacts, provenanceParents: [{ manifest: warmup.manifest, rows: warmup.canonicalRows }], symbols, startMs: H, endMs: 2 * H, timeframeMs: H, liquidityPolicy: policy })).not.toThrow();
+    const assembly = assembleTier1Baseline({ artifacts, provenanceParents: [{ manifest: warmup.manifest, rows: warmup.canonicalRows }], symbols, startMs: H, endMs: 2 * H, timeframeMs: H, liquidityPolicy: policy }); assertTier1AssemblyCanRun(assembly);
+    expect(assembly.artifactSemanticHashes).toContain(warmup.manifest.semanticManifestHash);
+    expect(assembly.canonicalCandles.map((row) => row.openTimeMs)).toEqual([H]);
+    const unrelated = build("COMPLETED_CANDLES", [candle(2 * H, 98)], { startMs: 2 * H, endMs: 3 * H, symbols, cadenceMs: H });
+    expect(() => assembleTier1Baseline({ artifacts, provenanceParents: [{ manifest: unrelated.manifest, rows: unrelated.canonicalRows }], symbols, startMs: H, endMs: 2 * H, timeframeMs: H, liquidityPolicy: policy })).toThrow("FOUNDRY_TIER1_PROVENANCE_PARENT_UNUSED");
+  });
+
   it("assembles only complete coherent artifacts and rejects conflicts or incomplete ranking", () => {
     const completeSchedule = { ...schedule, settlementTimesMs: [H] }; const completeExpected = { startMs: H, endMs: 2 * H, symbols, cadenceMs: H, fundingSchedules: [completeSchedule] };
     const funding = build("FUNDING_SETTLEMENTS", canonicalizeFundingSettlements({ rows: [{ symbol: "BTCUSDT", observedSettlementTimeMs: H, fundingIntervalMs: 8 * H, rate: 0, sourceHash: "funding" }], schedules: [completeSchedule], startMs: H, endMs: 2 * H }), completeExpected);

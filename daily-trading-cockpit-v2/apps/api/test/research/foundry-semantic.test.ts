@@ -17,7 +17,7 @@ import { fixtureSourceProvenance } from "../../src/research/foundry/source-prove
 import { PointInTimeUniverse } from "../../src/research/universe/point-in-time-universe.js";
 import { assertEligibilityTimelineConsistency } from "../../src/research/foundry/cross-artifact-validator.js";
 import { inspectArchiveBundle, readArchiveBundle } from "../../src/research/foundry/archive-bundle.js";
-import { importBinanceVisionUsdMRawBookTickerLiquidityArchive, importBinanceVisionUsdMRawCandleArchive } from "../../src/research/foundry/binance-vision-usdm-raw-adapter.js";
+import { importBinanceVisionUsdMRawBookTickerLiquidityArchive, importBinanceVisionUsdMRawCandleArchive, inspectBinanceVisionUsdMRawBookTickerCoverage } from "../../src/research/foundry/binance-vision-usdm-raw-adapter.js";
 
 const H = 3_600_000;
 const expected = { startMs: 0, endMs: 2 * H, symbols: ["BTCUSDT"], cadenceMs: H };
@@ -130,6 +130,9 @@ describe("Foundry semantic strictness", () => {
       const imported = await importBinanceVisionUsdMRawBookTickerLiquidityArchive({ root, expectedCoverage: coverage, candleRows: priorCandles.rows as never[], maxQuoteAgeMs: H, source: "Binance Vision BBO plus completed volume", sourceProvenance: provenance(bboBundle.archiveBundleHash), generatedAtMs: 1, generationSha: "abcdef0" });
       expect(imported.rows).toEqual(expect.arrayContaining([expect.objectContaining({ asOfMs: startMs, validUntilMs: startMs + H - 1, volume: 7, liquidityNotional: 200 }), expect.objectContaining({ asOfMs: startMs + H, volume: 8, liquidityNotional: 404 })]));
       expect(imported.manifest.archiveBundle?.archiveBundleHash).toBe(bboBundle.archiveBundleHash);
+      const inspected = await inspectBinanceVisionUsdMRawBookTickerCoverage({ root, expectedCoverage: coverage, maxQuoteAgeMs: H });
+      expect(inspected.archiveBundle.files.map((file) => file.relativePath)).toEqual(["bookTicker/BTCUSDT/BTCUSDT-bookTicker-2023-05.zip", "bookTicker/BTCUSDT/BTCUSDT-bookTicker-2023-05.zip.CHECKSUM"]);
+      expect(inspected.samples.map((sample) => [sample.asOfMs, sample.quoteAgeMs, sample.withinMaxQuoteAge])).toEqual([[startMs, 26, true], [startMs + H, H - 1, true]]);
       await expect(importBinanceVisionUsdMRawBookTickerLiquidityArchive({ root, expectedCoverage: coverage, candleRows: priorCandles.rows as never[], maxQuoteAgeMs: 0, source: "Binance Vision BBO plus completed volume", sourceProvenance: provenance(bboBundle.archiveBundleHash), generatedAtMs: 1, generationSha: "abcdef0" })).rejects.toThrow("FOUNDRY_BINANCE_VISION_BOOKTICKER_PIT_INVALID");
       archive(join(bboDirectory, "BTCUSDT-bookTicker-2023-05.zip"), "unexpected,headers\n");
       const malformedBundle = inspectArchiveBundle({ root, include: (path) => (path.startsWith("bookTicker/") || path.startsWith("klines/")) && (path.endsWith(".zip") || path.endsWith(".zip.CHECKSUM")) });

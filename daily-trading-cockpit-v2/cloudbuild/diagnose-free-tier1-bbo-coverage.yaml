@@ -1,0 +1,89 @@
+# Cloud-only coverage audit of already checksum-verified Binance Vision BBO.
+# It never writes a Foundry eligibility artifact or executes a tournament.
+steps:
+  - name: gcr.io/google.com/cloudsdktool/google-cloud-cli:slim
+    id: stage-generation-pinned-bookticker
+    entrypoint: bash
+    env:
+      - _STUDY=${_STUDY}
+      - _BBO_RAW_BUNDLE_HASH=${_BBO_RAW_BUNDLE_HASH}
+    args:
+      - -ceu
+      - |
+        python3 - <<'PY'
+        import json, os, pathlib, subprocess
+
+        study = os.environ["_STUDY"]
+        bundle_hash = os.environ["_BBO_RAW_BUNDLE_HASH"]
+        root = pathlib.Path("/workspace/raw")
+        root.mkdir(parents=True, exist_ok=True)
+
+        def describe(uri):
+            return json.loads(subprocess.check_output(["gcloud", "storage", "objects", "describe", uri, "--format=json"], text=True))
+
+        def copy(uri, generation, destination):
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            subprocess.check_call(["gcloud", "storage", "cp", "--do-not-decompress", f"{uri}#{generation}", str(destination)])
+
+        manifest_uri = f"{study}/acquisition-manifests/v2/{bundle_hash}.json"
+        manifest_meta = describe(manifest_uri)
+        copy(manifest_uri, str(manifest_meta["generation"]), root / "bbo-raw-acquisition-manifest.json")
+        manifest = json.loads((root / "bbo-raw-acquisition-manifest.json").read_text(encoding="utf8"))
+        if manifest.get("schemaVersion") != "KronosFreeTier1RawAcquisition/v2" or manifest.get("canonicalRawBookTickerBundleHash") != bundle_hash or len(manifest.get("objects", [])) != 22:
+            raise RuntimeError("frozen BBO raw manifest is invalid")
+        for entry in manifest["objects"]:
+            canonical = entry["canonical"]
+            companion = entry["companion"]
+            relative = entry["relativePath"]
+            copy(canonical["uri"], str(canonical["generation"]), root / "bookTicker" / relative)
+            copy(companion["uri"], str(companion["generation"]), root / "bookTicker" / f"{relative}.CHECKSUM")
+        PY
+  - name: node:22-bookworm
+    id: audit-exact-bbo-coverage
+    entrypoint: bash
+    env:
+      - RAW_ROOT=/workspace/raw
+      - REPORT_PATH=/workspace/bbo-coverage-audit.json
+      - GENERATED_AT_MS=${_GENERATED_AT_MS}
+      - GENERATION_SHA=${_GENERATION_SHA}
+      - BBO_RAW_BUNDLE_HASH=${_BBO_RAW_BUNDLE_HASH}
+    args:
+      - -ceu
+      - |
+        apt-get update -qq
+        apt-get install -y --no-install-recommends unzip
+        npm ci --ignore-scripts
+        npm run build -w @dtc/shared
+        npm run build -w @dtc/api
+        node scripts/research/diagnose-free-tier1-bbo-coverage.mjs
+  - name: gcr.io/google.com/cloudsdktool/google-cloud-cli:slim
+    id: persist-immutable-audit
+    entrypoint: bash
+    env:
+      - _STUDY=${_STUDY}
+    args:
+      - -ceu
+      - |
+        python3 - <<'PY'
+        import hashlib, json, os, pathlib, subprocess
+
+        report = pathlib.Path("/workspace/bbo-coverage-audit.json")
+        payload = json.loads(report.read_text(encoding="utf8"))
+        target = os.environ["_STUDY"] + f"/foundry-partials/v2/bbo-coverage-diagnostics/{payload['reportHash']}.json"
+        result = subprocess.run(["gcloud", "storage", "cp", str(report), target, "--if-generation-match=0"], text=True, capture_output=True)
+        if result.returncode:
+            existing = pathlib.Path("/workspace/existing-audit.json")
+            subprocess.check_call(["gcloud", "storage", "cp", target, str(existing)])
+            if hashlib.sha256(existing.read_bytes()).digest() != hashlib.sha256(report.read_bytes()).digest():
+                raise RuntimeError("immutable BBO coverage audit conflict")
+        print(json.dumps({"status": "PASS", "report": target, "reportHash": payload["reportHash"], "coverageStatus": payload["status"]}, sort_keys=True))
+        PY
+options:
+  diskSizeGb: 200
+  machineType: E2_HIGHCPU_8
+timeout: 10800s
+substitutions:
+  _STUDY: gs://bucket-coin-yuhu/kronos-tier1-archives/binance-vision-usdm-bookticker-free-walkforward-v1
+  _BBO_RAW_BUNDLE_HASH: 3338e528944869fec5b2ce112cdeedac7aa1fe031563a141a57babf4ad39584a
+  _GENERATED_AT_MS: "1786135111584"
+  _GENERATION_SHA: unknown
