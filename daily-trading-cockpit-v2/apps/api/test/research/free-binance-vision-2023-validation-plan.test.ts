@@ -28,6 +28,12 @@ describe("free Binance Vision BTCUSDT/ETHUSDT 2023 validation plan", () => {
     expect(plan.executionPolicy.executionModes).toEqual(["CONSERVATIVE"]);
     expect(plan.executionPolicy.baselineAllowlist).toEqual(FREE_BINANCE_VISION_2023_05_TO_2024_03_BASELINE_ALLOWLIST);
     expect(plan.executionPolicy.kronosCurrentForbidden).toBe(true);
+    expect(plan.tier1EligibilityPolicy).toEqual({
+      minimumHistory: { version: "free-binance-vision-prior-completed-bars-v1", minimumCompletedBars: 168, strictlyPrior: true },
+      liquiditySpread: { version: "free-binance-vision-bbo-liquidity-spread-v1", minVolume: 0, minLiquidityNotional: 50_000, maxSpreadBps: 5, maxAgeMs: HOUR_MS },
+    });
+    expect(plan.tier1ConservativeExecution).toMatchObject({ takerFeeBps: 4, baseSlippageBps: 2, pessimisticSlippageMultiplier: 2, fundingEnabled: true, fillMode: "NEXT_OPEN", intrabarAmbiguity: "STOP_FIRST" });
+    expect(plan.tier1Portfolio).toMatchObject({ startingCapital: 10_000, maxPositions: 2, maxPortfolioRiskSnapshotAgeMs: HOUR_MS });
     expect(plan.sourceScopeSelection).toMatchObject({
       requestedStartMs: Date.UTC(2023, 4, 1, 1),
       selectedStartMs: Date.UTC(2023, 4, 16, 12),

@@ -27,7 +27,7 @@ const FREE_SCOPE_TOTAL_BARS = (FREE_SCOPE_END_MS - FREE_SCOPE_START_MS) / HOUR_M
 const SEALED_HOLDOUT_MINIMUM_BARS = 60 * DAY_BARS;
 const SEALED_HOLDOUT_BARS = Math.max(SEALED_HOLDOUT_MINIMUM_BARS, Math.ceil(FREE_SCOPE_TOTAL_BARS * 0.2));
 
-export const FREE_BINANCE_VISION_2023_05_TO_2024_03_VALIDATION_PLAN_VERSION = "free-binance-vision-btceth-1h-real-tier1-validation-plan-v2" as const;
+export const FREE_BINANCE_VISION_2023_05_TO_2024_03_VALIDATION_PLAN_VERSION = "free-binance-vision-btceth-1h-real-tier1-validation-plan-v3" as const;
 
 export const FREE_BINANCE_VISION_2023_05_TO_2024_03_BASELINE_ALLOWLIST = [
   "CASH",
@@ -107,6 +107,51 @@ const artifactPayload = {
     rankingForbidden: true,
     promotionForbidden: true,
   },
+  /**
+   * Frozen before empirical execution. Every decision still needs a PIT BBO
+   * row; candle presence can never assert liquidity. The US$50k min-side
+   * displayed depth is five times the fixed US$10k paper wallet, providing a
+   * depth cushion without treating displayed liquidity as a fill guarantee.
+   */
+  tier1EligibilityPolicy: {
+    minimumHistory: {
+      version: "free-binance-vision-prior-completed-bars-v1",
+      minimumCompletedBars: 168,
+      strictlyPrior: true,
+    },
+    liquiditySpread: {
+      version: "free-binance-vision-bbo-liquidity-spread-v1",
+      minVolume: 0,
+      minLiquidityNotional: 50_000,
+      maxSpreadBps: 5,
+      maxAgeMs: HOUR_MS,
+    },
+  },
+  /**
+   * Tier 1 lacks an account-specific historical fee-tier artifact. These are
+   * fixed Conservative research assumptions, not a claim about fee history.
+   */
+  tier1ConservativeExecution: {
+    makerFeeBps: 0,
+    takerFeeBps: 4,
+    baseSlippageBps: 2,
+    pessimisticSlippageMultiplier: 2,
+    fundingEnabled: true,
+    fillMode: "NEXT_OPEN",
+    intrabarAmbiguity: "STOP_FIRST",
+  },
+  tier1Portfolio: {
+    startingCapital: 10_000,
+    riskPerTradeFraction: 0.01,
+    maxPositions: 2,
+    maxGrossExposureFraction: 1,
+    maxNetExposureFraction: 1,
+    maxBtcBetaFraction: 1,
+    maxCorrelationClusterFraction: 1,
+    liquidationBufferFraction: 0.2,
+    initialMarginFraction: 0.1,
+    maxPortfolioRiskSnapshotAgeMs: HOUR_MS,
+  },
   challengerHoldingHorizon: {
     tacticalStrategyIds: [...TACTICAL_CHALLENGERS.map((strategy) => strategy.id), "RANDOM_CONTROL"],
     directionalStrategyVersions: TACTICAL_CHALLENGERS.map((strategy) => ({ id: strategy.id, version: strategy.version, maxHoldBars: maxHoldBars(strategy) })),
@@ -147,6 +192,9 @@ export function assertFreeBinanceVision2023ValidationPlan(): void {
   if (plan.validation.purgeBars < plan.challengerHoldingHorizon.maxTacticalHoldBars || plan.validation.embargoBars < plan.challengerHoldingHorizon.maxTacticalHoldBars) throw new Error("FREE_TIER1_VALIDATION_HOLDING_HORIZON_LEAKAGE_GUARD_INVALID");
   if (plan.sealedHoldout.actualBars < plan.sealedHoldout.minimumBars || plan.sealedHoldout.actualFraction < 0.2) throw new Error("FREE_TIER1_VALIDATION_SEALED_HOLDOUT_TOO_SHORT");
   if (plan.executionPolicy.executionModes.length !== 1 || plan.executionPolicy.executionModes[0] !== "CONSERVATIVE" || (plan.executionPolicy.baselineAllowlist as readonly TournamentStrategyId[]).includes("KRONOS_CURRENT")) throw new Error("FREE_TIER1_VALIDATION_EXECUTION_POLICY_INVALID");
+  if (plan.tier1EligibilityPolicy.minimumHistory.minimumCompletedBars !== 168 || !plan.tier1EligibilityPolicy.minimumHistory.strictlyPrior || plan.tier1EligibilityPolicy.liquiditySpread.minLiquidityNotional !== 50_000 || plan.tier1EligibilityPolicy.liquiditySpread.maxSpreadBps !== 5 || plan.tier1EligibilityPolicy.liquiditySpread.maxAgeMs !== HOUR_MS) throw new Error("FREE_TIER1_VALIDATION_ELIGIBILITY_POLICY_INVALID");
+  if (plan.tier1ConservativeExecution.takerFeeBps !== 4 || plan.tier1ConservativeExecution.baseSlippageBps !== 2 || plan.tier1ConservativeExecution.pessimisticSlippageMultiplier !== 2 || !plan.tier1ConservativeExecution.fundingEnabled || plan.tier1ConservativeExecution.fillMode !== "NEXT_OPEN" || plan.tier1ConservativeExecution.intrabarAmbiguity !== "STOP_FIRST") throw new Error("FREE_TIER1_VALIDATION_CONSERVATIVE_EXECUTION_INVALID");
+  if (plan.tier1Portfolio.startingCapital !== 10_000 || plan.tier1Portfolio.maxPositions !== 2 || plan.tier1Portfolio.maxPortfolioRiskSnapshotAgeMs !== HOUR_MS) throw new Error("FREE_TIER1_VALIDATION_PORTFOLIO_POLICY_INVALID");
   if (plan.evidenceGates.minimumOosWindows < 3 || plan.evidenceGates.minimumCompletedTradesPerInterpretedStrategy < 20 || plan.evidenceGates.minimumCanonicalIndependentEpisodes < 10 || plan.evidenceGates.maximumInvalidFolds !== 0 || plan.evidenceGates.maximumTerminalUnresolvedPositions !== 0) throw new Error("FREE_TIER1_VALIDATION_EVIDENCE_GATE_WEAKENED");
   if (plan.artifactHash !== tournamentHash(artifactPayload)) throw new Error("FREE_TIER1_VALIDATION_PLAN_HASH_MISMATCH");
 }
