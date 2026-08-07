@@ -101,7 +101,17 @@ steps:
             if catalog.get("total") != total or catalog.get("catalogName") != first.get("catalogName"):
                 raise RuntimeError("LIFECYCLE_CATALOG_CHANGED_DURING_CRAWL")
             for article_index, article in enumerate(catalog["articles"]):
-                if not isinstance(article.get("id"), int) or not isinstance(article.get("code"), str) or len(article["code"]) < 16 or not isinstance(article.get("title"), str) or not isinstance(article.get("releaseDate"), int):
+                # `code` is the CMS's opaque article identifier.  The official
+                # catalogue contains both 12- and 16-digit values, so a
+                # made-up minimum length would reject valid source evidence.
+                # Retain it verbatim while still rejecting absent/oversized IDs
+                # and malformed semantic fields.
+                if (
+                    not isinstance(article.get("id"), int) or article["id"] <= 0
+                    or not isinstance(article.get("code"), str) or not article["code"] or len(article["code"]) > 256
+                    or not isinstance(article.get("title"), str) or not article["title"].strip() or len(article["title"]) > 4096
+                    or not isinstance(article.get("releaseDate"), int) or article["releaseDate"] <= 0
+                ):
                     print(json.dumps({"status": "REJECT", "reason": "LIFECYCLE_CATALOG_ARTICLE_INVALID", "pageNo": page_no, "articleIndex": article_index, "article": article}, sort_keys=True))
                     raise RuntimeError(f"LIFECYCLE_CATALOG_ARTICLE_INVALID_PAGE_{page_no}_INDEX_{article_index}")
                 articles.append(article)
