@@ -102,7 +102,7 @@ async function bookTickerSamples(input: { path: string; relativePath: string; sy
   ].join(" ");
   const initial = input.initialState;
   const unzip = spawn("unzip", ["-p", input.path], { stdio: ["ignore", "pipe", "pipe"] }); const sampler = spawn("awk", ["-F,", "-v", `start=${input.startMs}`, "-v", `end=${input.endMs}`, "-v", `sourceStart=${input.sourceStartMs}`, "-v", `sourceEnd=${input.sourceEndMs}`, "-v", `archiveEndTail=${BOOK_TICKER_ARCHIVE_END_TAIL_TOLERANCE_MS}`, "-v", `interval=${HOUR_MS}`, "-v", `initialTime=${initial?.eventTimeMs ?? 0}`, "-v", `initialUpdate=${initial?.updateId ?? 0}`, "-v", `initialBidPrice=${initial?.bidPrice ?? 0}`, "-v", `initialBidQty=${initial?.bidQuantity ?? 0}`, "-v", `initialAskPrice=${initial?.askPrice ?? 0}`, "-v", `initialAskQty=${initial?.askQuantity ?? 0}`, awk], { stdio: ["pipe", "pipe", "pipe"] });
-  const unzipDone = waitFor(unzip, `UNZIP_${input.relativePath}`); const samplerDone = waitFor(sampler, `AWK_${input.relativePath}`);
+  const unzipDone = waitFor(unzip, `UNZIP_${input.relativePath}`).then(() => null, (error: Error) => error); const samplerDone = waitFor(sampler, `AWK_${input.relativePath}`).then(() => null, (error: Error) => error);
   const stderr: Buffer[] = []; const pipeErrors: Error[] = [];
   unzip.stderr.on("data", (value: Buffer) => stderr.push(value)); sampler.stderr.on("data", (value: Buffer) => stderr.push(value));
   sampler.stdin.on("error", (error: NodeJS.ErrnoException) => {
@@ -125,7 +125,7 @@ async function bookTickerSamples(input: { path: string; relativePath: string; sy
       const [event, updateId, bidPrice, bidQuantity, askPrice, askQuantity] = values; carry = { eventTimeMs: integer(event!, "EVENT_TIME_MS", input.relativePath), updateId: integer(updateId!, "UPDATE_ID", input.relativePath), bidPrice: finite(bidPrice!, "BID_PRICE", input.relativePath), bidQuantity: finite(bidQuantity!, "BID_QUANTITY", input.relativePath), askPrice: finite(askPrice!, "ASK_PRICE", input.relativePath), askQuantity: finite(askQuantity!, "ASK_QUANTITY", input.relativePath), sourceHash: input.sourceHash };
     } else throw new Error(`FOUNDRY_BINANCE_VISION_BOOKTICKER_OUTPUT_INVALID_${input.relativePath}`);
   }
-  const [unzipResult, samplerResult] = await Promise.all([unzipDone.then(() => null, (error: Error) => error), samplerDone.then(() => null, (error: Error) => error)]);
+  const [unzipResult, samplerResult] = await Promise.all([unzipDone, samplerDone]);
   const parserDiagnostics = Buffer.concat(stderr).toString("utf8").trim();
   if (samplerResult || parserDiagnostics) throw new Error(`FOUNDRY_BINANCE_VISION_BOOKTICKER_PARSE_INVALID_${input.relativePath}_${parserDiagnostics || samplerResult!.message}`);
   if (unzipResult) throw unzipResult;
