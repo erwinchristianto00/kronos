@@ -138,12 +138,23 @@ async function bookTickerSamples(input: { path: string; relativePath: string; sy
 export async function importBinanceVisionUsdMRawBookTickerLiquidityArchive(input: { root: string; expectedCoverage: FoundryExpectedCoverage; candleRows: readonly ValidatedFoundryRow[]; maxQuoteAgeMs: number; source: string; sourceProvenance: FoundrySourceProvenance; generatedAtMs: number; generationSha: string }): Promise<{ rows: unknown[]; manifest: FoundryArtifactManifest }> {
   if (input.expectedCoverage.cadenceMs !== HOUR_MS || !Number.isInteger(input.maxQuoteAgeMs) || input.maxQuoteAgeMs < 0) throw new Error("FOUNDRY_BINANCE_VISION_BOOKTICKER_CONTRACT_INVALID");
   const archiveBundle = sourceArchive({ root: input.root, required: (path) => (path.startsWith("bookTicker/") || path.startsWith("klines/")) && archiveFile(path) });
-  const samples: BookTickerSample[] = []; const carryBySymbol = new Map<string, BookTickerState>();
+  const filesBySymbol = new Map<string, typeof archiveBundle.files>();
   for (const file of archiveBundle.files.filter((file) => zip(file.relativePath) && file.relativePath.startsWith("bookTicker/")).sort((a, b) => a.relativePath.localeCompare(b.relativePath))) {
-    const symbol = symbolFromPath(file.relativePath, "bookTicker"); const month = monthRange(file.relativePath); const startMs = Math.max(input.expectedCoverage.startMs, month.startMs); const endMs = Math.min(input.expectedCoverage.endMs, month.endMs);
-    const establishesBoundaryCarry = month.endMs === input.expectedCoverage.startMs && !carryBySymbol.has(symbol);
-    if (startMs < endMs || establishesBoundaryCarry) { const imported = await bookTickerSamples({ path: resolve(input.root, file.relativePath), relativePath: file.relativePath, symbol, startMs, endMs, sourceStartMs: month.startMs, sourceEndMs: month.endMs, sourceHash: file.fileHash, maxQuoteAgeMs: input.maxQuoteAgeMs, initialState: carryBySymbol.get(symbol) }); samples.push(...imported.samples); carryBySymbol.set(symbol, imported.carry); }
+    const symbol = symbolFromPath(file.relativePath, "bookTicker"); filesBySymbol.set(symbol, [...(filesBySymbol.get(symbol) ?? []), file]);
   }
+  // Months must remain serial per symbol because each archive supplies the
+  // next archive's carry mark. Independent symbols have no shared state, so
+  // stream them concurrently on the high-CPU cloud worker. Rows are sorted
+  // canonically below; scheduling can never alter artifact identity.
+  const samples = (await Promise.all([...filesBySymbol.entries()].sort(([left], [right]) => left.localeCompare(right)).map(async ([symbol, files]) => {
+    const symbolSamples: BookTickerSample[] = []; let carry: BookTickerState | undefined;
+    for (const file of files) {
+      const month = monthRange(file.relativePath); const startMs = Math.max(input.expectedCoverage.startMs, month.startMs); const endMs = Math.min(input.expectedCoverage.endMs, month.endMs);
+      const establishesBoundaryCarry = month.endMs === input.expectedCoverage.startMs && carry === undefined;
+      if (startMs < endMs || establishesBoundaryCarry) { const imported = await bookTickerSamples({ path: resolve(input.root, file.relativePath), relativePath: file.relativePath, symbol, startMs, endMs, sourceStartMs: month.startMs, sourceEndMs: month.endMs, sourceHash: file.fileHash, maxQuoteAgeMs: input.maxQuoteAgeMs, initialState: carry }); symbolSamples.push(...imported.samples); carry = imported.carry; }
+    }
+    return symbolSamples;
+  }))).flat();
   const candles = new Map(input.candleRows.map((row) => [`${row.symbol}:${row.openTimeMs}`, row])); const rows = samples.map((sample) => {
     const candle = candles.get(`${sample.symbol}:${sample.asOfMs - HOUR_MS}`) as (ValidatedFoundryRow & { volume: number; closeTimeMs: number }) | undefined;
     if (!candle || candle.closeTimeMs !== sample.asOfMs - 1) throw new Error(`FOUNDRY_BINANCE_VISION_BOOKTICKER_CANDLE_MISSING_${sample.symbol}_${sample.asOfMs}`);

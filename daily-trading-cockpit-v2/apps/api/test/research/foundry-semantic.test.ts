@@ -137,6 +137,26 @@ describe("Foundry semantic strictness", () => {
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
+  it("keeps parallel per-symbol bookTicker imports canonically deterministic", async () => {
+    const root = mkdtempSync(join(tmpdir(), "foundry-binance-vision-bookticker-parallel-")); const monthStartMs = Date.UTC(2023, 4, 1); const startMs = monthStartMs + H; const endMs = startMs + H; const symbols = ["BTCUSDT", "ETHUSDT"];
+    const archive = (zipPath: string, body: string) => {
+      const source = `${zipPath}.csv`; writeFileSync(source, body); execFileSync("zip", ["-j", zipPath, source], { stdio: "ignore" }); unlinkSync(source);
+      const hash = createHash("sha256").update(readFileSync(zipPath)).digest("hex"); writeFileSync(`${zipPath}.CHECKSUM`, `${hash}  ${basename(zipPath)}\n`);
+    };
+    try {
+      for (const [index, symbol] of symbols.entries()) {
+        const klineDirectory = join(root, "klines", symbol, "1h"); const bboDirectory = join(root, "bookTicker", symbol); mkdirSync(klineDirectory, { recursive: true }); mkdirSync(bboDirectory, { recursive: true });
+        const bid = 100 + index; archive(join(klineDirectory, `${symbol}-1h-2023-05.zip`), `open_time,open,high,low,close,volume,close_time,quote_volume,count,taker_buy_volume,taker_buy_quote_volume,ignore\n${monthStartMs},${bid},${bid + 1},${bid - 1},${bid},7,${monthStartMs + H - 1},700,4,3,300,0\n${startMs},${bid},${bid + 1},${bid - 1},${bid},8,${startMs + H - 1},800,5,4,400,0\n`);
+        archive(join(bboDirectory, `${symbol}-bookTicker-2023-05.zip`), `update_id,best_bid_price,best_bid_qty,best_ask_price,best_ask_qty,transaction_time,event_time\n${2850015973062 + index},${bid},2,${bid + 1},3,${startMs - 1},${startMs - 1}\n`);
+      }
+      const coverage = { startMs, endMs, symbols, cadenceMs: H }; const candleRoot = join(root, "klines"); const candleBundle = inspectArchiveBundle({ root: candleRoot, include: (path) => path.endsWith(".zip") || path.endsWith(".zip.CHECKSUM") }); const allBundle = inspectArchiveBundle({ root, include: (path) => (path.startsWith("bookTicker/") || path.startsWith("klines/")) && (path.endsWith(".zip") || path.endsWith(".zip.CHECKSUM")) }); const provenance = (rawFileHash: string) => ({ provenanceType: "EXCHANGE_HISTORICAL_EXPORT" as const, provider: "Binance Vision", exchange: "BINANCE_USD_M", datasetId: "parallel-monthly-bookticker-fixture", retrievedAtMs: 1, rawFileHash, schemaVersion: "binance-vision-bookTicker-csv-v1", generationToolSha: "abcdef0" });
+      const candles = importBinanceVisionUsdMRawCandleArchive({ root: candleRoot, expectedCoverage: { ...coverage, startMs: monthStartMs }, source: "Binance Vision kline", sourceProvenance: provenance(candleBundle.archiveBundleHash), generatedAtMs: 1, generationSha: "abcdef0" });
+      const input = () => ({ root, expectedCoverage: coverage, candleRows: candles.rows as never[], maxQuoteAgeMs: H, source: "Binance Vision BBO", sourceProvenance: provenance(allBundle.archiveBundleHash), generatedAtMs: 1, generationSha: "abcdef0" });
+      const first = await importBinanceVisionUsdMRawBookTickerLiquidityArchive(input()); const second = await importBinanceVisionUsdMRawBookTickerLiquidityArchive(input());
+      expect(first.rows).toEqual(second.rows); expect(first.manifest.semanticManifestHash).toBe(second.manifest.semanticManifestHash); expect(first.rows.map((row) => (row as { symbol: string }).symbol)).toEqual(symbols);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   it("carries the last source-backed BBO across a monthly boundary", async () => {
     const root = mkdtempSync(join(tmpdir(), "foundry-binance-vision-bbo-boundary-")); const mayStartMs = Date.UTC(2023, 4, 1); const juneStartMs = Date.UTC(2023, 5, 1);
     const archive = (zipPath: string, body: string) => {
