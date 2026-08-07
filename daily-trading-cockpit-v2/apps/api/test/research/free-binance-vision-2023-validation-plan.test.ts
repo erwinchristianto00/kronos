@@ -18,9 +18,9 @@ describe("free Binance Vision BTCUSDT/ETHUSDT 2023 validation plan", () => {
       symbols: ["BTCUSDT", "ETHUSDT"],
       timeframe: "1h",
       timeframeMs: HOUR_MS,
-      startMs: Date.UTC(2023, 4, 1, 1),
+      startMs: Date.UTC(2023, 4, 16, 12),
       endMs: Date.UTC(2024, 3, 1),
-      totalBars: 8_063,
+      totalBars: 7_692,
     });
     expect(FREE_BINANCE_VISION_2023_05_TO_2024_03_BASELINE_ALLOWLIST).toEqual([
       "CASH", "BTC_BUY_AND_HOLD", "EQUAL_WEIGHT_HOLD", "DONCHIAN", "MACD", "EMA_CROSS", "RSI_MEAN_REVERSION", "RANDOM_CONTROL",
@@ -28,6 +28,11 @@ describe("free Binance Vision BTCUSDT/ETHUSDT 2023 validation plan", () => {
     expect(plan.executionPolicy.executionModes).toEqual(["CONSERVATIVE"]);
     expect(plan.executionPolicy.baselineAllowlist).toEqual(FREE_BINANCE_VISION_2023_05_TO_2024_03_BASELINE_ALLOWLIST);
     expect(plan.executionPolicy.kronosCurrentForbidden).toBe(true);
+    expect(plan.sourceScopeSelection).toMatchObject({
+      requestedStartMs: Date.UTC(2023, 4, 1, 1),
+      selectedStartMs: Date.UTC(2023, 4, 16, 12),
+      rawBookTickerBundleHash: "3338e528944869fec5b2ce112cdeedac7aa1fe031563a141a57babf4ad39584a",
+    });
     expect(plan.evidenceGates).toEqual({
       minimumOosWindows: 3,
       minimumCompletedTradesPerInterpretedStrategy: 20,
@@ -57,10 +62,10 @@ describe("free Binance Vision BTCUSDT/ETHUSDT 2023 validation plan", () => {
     expect(plan.sealedHoldout).toEqual({
       allocation: "LATEST_20_PERCENT_OF_CANONICAL_1H_CLOCK",
       minimumBars: 60 * 24,
-      actualBars: 1_613,
-      actualFraction: 1_613 / 8_063,
+      actualBars: 1_539,
+      actualFraction: 1_539 / 7_692,
     });
-    expect(plan.validation.sealedHoldoutStartMs).toBe(Date.UTC(2024, 0, 24, 19));
+    expect(plan.validation.sealedHoldoutStartMs).toBe(Date.UTC(2024, 0, 27, 21));
   });
 
   it("is deep-frozen and has a deterministic self-excluding artifact hash", () => {

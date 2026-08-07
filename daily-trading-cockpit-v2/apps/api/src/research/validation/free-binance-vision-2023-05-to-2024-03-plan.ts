@@ -16,13 +16,18 @@ import type { TournamentStrategyId, TournamentValidationSpec } from "../tourname
 
 const HOUR_MS = 3_600_000;
 const DAY_BARS = 24;
-const FREE_SCOPE_START_MS = Date.UTC(2023, 4, 1, 1);
+// The raw verified Binance Vision BBO bundle has no BTCUSDT/ETHUSDT common
+// observation before this tick (both May archives first observe 11:49:47Z on
+// May 16). This v2 plan is frozen before result generation and replaces the
+// unavailable May 1 candidate rather than silently treating missing BBO as
+// eligibility.
+const FREE_SCOPE_START_MS = Date.UTC(2023, 4, 16, 12);
 const FREE_SCOPE_END_MS = Date.UTC(2024, 3, 1);
 const FREE_SCOPE_TOTAL_BARS = (FREE_SCOPE_END_MS - FREE_SCOPE_START_MS) / HOUR_MS;
 const SEALED_HOLDOUT_MINIMUM_BARS = 60 * DAY_BARS;
 const SEALED_HOLDOUT_BARS = Math.max(SEALED_HOLDOUT_MINIMUM_BARS, Math.ceil(FREE_SCOPE_TOTAL_BARS * 0.2));
 
-export const FREE_BINANCE_VISION_2023_05_TO_2024_03_VALIDATION_PLAN_VERSION = "free-binance-vision-btceth-1h-real-tier1-validation-plan-v1" as const;
+export const FREE_BINANCE_VISION_2023_05_TO_2024_03_VALIDATION_PLAN_VERSION = "free-binance-vision-btceth-1h-real-tier1-validation-plan-v2" as const;
 
 export const FREE_BINANCE_VISION_2023_05_TO_2024_03_BASELINE_ALLOWLIST = [
   "CASH",
@@ -74,7 +79,7 @@ const artifactPayload = {
   artifactKind: "TOURNAMENT_VALIDATION_PLAN",
   schemaVersion: "v1",
   planVersion: FREE_BINANCE_VISION_2023_05_TO_2024_03_VALIDATION_PLAN_VERSION,
-  studyId: "free-binance-vision-usdm-btceth-1h-2023-05_to_2024-03",
+  studyId: "free-binance-vision-usdm-btceth-1h-2023-05-16_to_2024-03",
   scope: {
     symbols: ["BTCUSDT", "ETHUSDT"],
     timeframe: "1h",
@@ -82,6 +87,16 @@ const artifactPayload = {
     startMs: FREE_SCOPE_START_MS,
     endMs: FREE_SCOPE_END_MS,
     totalBars: FREE_SCOPE_TOTAL_BARS,
+  },
+  sourceScopeSelection: {
+    policyVersion: "binance-vision-usdm-bookticker-common-start-v1",
+    requestedStartMs: Date.UTC(2023, 4, 1, 1),
+    selectedStartMs: FREE_SCOPE_START_MS,
+    rawBookTickerBundleHash: "3338e528944869fec5b2ce112cdeedac7aa1fe031563a141a57babf4ad39584a",
+    firstObservedEventTimeBySymbol: {
+      BTCUSDT: { eventTimeMs: 1684237787214, rawObjectSha256: "93a787d1c1f69118f04b40fcc99607ab1f6504cb790672725359a2b94509251e" },
+      ETHUSDT: { eventTimeMs: 1684237787207, rawObjectSha256: "7c39ed37defad7b62df39f7a8c901dd5858a2db91f6dd28454e238977c5d0d61" },
+    },
   },
   executionPolicy: {
     researchMode: "REAL_TIER1",
