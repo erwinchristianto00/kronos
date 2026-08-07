@@ -19,7 +19,12 @@ import { loadFoundryArtifact, persistFoundryArtifact } from "../../apps/api/dist
 import { generatePitPortfolioRiskArtifact } from "../../apps/api/dist/research/foundry/tier1-pit-artifacts.js";
 
 const HOUR_MS = 3_600_000;
-const STUDY_START_MS = Date.UTC(2023, 4, 1, 1);
+// Binance Vision's first common BTCUSDT/ETHUSDT bookTicker observations are
+// in the May files at 2023-05-16T11:49:47.214Z / .207Z respectively.  The
+// original 2023-05-01 candidate is therefore not BBO-complete.  This is the
+// first canonical hour with a source-backed BBO mark for both symbols.
+const REQUESTED_STUDY_START_MS = Date.UTC(2023, 4, 1, 1);
+const STUDY_START_MS = Date.UTC(2023, 4, 16, 12);
 const STUDY_END_MS = Date.UTC(2024, 3, 1);
 const WARMUP_START_MS = Date.UTC(2023, 3, 1);
 const WARMUP_END_MS = STUDY_START_MS;
@@ -27,6 +32,15 @@ const SYMBOLS = ["BTCUSDT", "ETHUSDT"];
 const BBO_MAX_AGE_MS = HOUR_MS;
 const RISK_LOOKBACK_BARS = 168;
 const RISK_MINIMUM_OBSERVATIONS = 120;
+const BBO_SCOPE_SELECTION = {
+  policyVersion: "binance-vision-usdm-bookticker-common-start-v1",
+  requestedStartMs: REQUESTED_STUDY_START_MS,
+  selectedStartMs: STUDY_START_MS,
+  diagnostics: [
+    { symbol: "BTCUSDT", rawObjectPath: "BTCUSDT/BTCUSDT-bookTicker-2023-05.zip", rawObjectSha256: "93a787d1c1f69118f04b40fcc99607ab1f6504cb790672725359a2b94509251e", firstObservedEventTimeMs: 1684237787214, diagnosticBuildId: "267e0406-459d-4b6f-9d40-86da4417b2c3" },
+    { symbol: "ETHUSDT", rawObjectPath: "ETHUSDT/ETHUSDT-bookTicker-2023-05.zip", rawObjectSha256: "7c39ed37defad7b62df39f7a8c901dd5858a2db91f6dd28454e238977c5d0d61", firstObservedEventTimeMs: 1684237787207, diagnosticBuildId: "8936c795-9b7d-4ae5-878d-ead95cdcacb4" },
+  ],
+};
 const HASH = /^[a-f0-9]{64}$/;
 const SHA = /^[a-f0-9]{7,64}$/;
 
@@ -248,7 +262,7 @@ async function build() {
   const reportCore = {
     schemaVersion: "KronosFreeTier1PrelifecycleFoundry/v1",
     status: "PARTIAL_ARTIFACTS_READY_REAL_TIER1_EXECUTION_FORBIDDEN",
-    study: { symbols: SYMBOLS, timeframeMs: HOUR_MS, startMs: STUDY_START_MS, endMs: STUDY_END_MS },
+    study: { symbols: SYMBOLS, timeframeMs: HOUR_MS, startMs: STUDY_START_MS, endMs: STUDY_END_MS, scopeSelection: BBO_SCOPE_SELECTION },
     generation: { generatedAtMs, generationSha },
     sourceGcsInventoryHash: inventoryHash,
     frozenBookTicker: { rawManifestBundleHash: bboRawBundleHash, rawManifestSchemaVersion: bboManifest.schemaVersion, objectCount: bboManifest.objects.length },

@@ -110,7 +110,7 @@ steps:
         import subprocess
 
         root = pathlib.Path("/workspace/foundry-artifacts")
-        partial_root = os.environ["_STUDY"] + "/foundry-partials/v1"
+        partial_root = os.environ["_STUDY"] + "/foundry-partials/v2"
         target_root = partial_root + "/artifacts"
         reload_root = pathlib.Path("/workspace/foundry-reload")
 
@@ -171,7 +171,7 @@ steps:
         import subprocess
 
         study = os.environ["_STUDY"]
-        partial_root = study + "/foundry-partials/v1"
+        partial_root = study + "/foundry-partials/v2"
         report = pathlib.Path("/workspace/prelifecycle-report-gcs-reloaded.json")
         payload = json.loads(report.read_text(encoding="utf8"))
 
