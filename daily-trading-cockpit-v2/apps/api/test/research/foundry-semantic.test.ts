@@ -137,6 +137,29 @@ describe("Foundry semantic strictness", () => {
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
+  it("keeps distinct 13-digit hourly ticks out of AWK's low-precision array-key collisions", async () => {
+    const root = mkdtempSync(join(tmpdir(), "foundry-binance-vision-bookticker-exact-key-")); const monthStartMs = Date.UTC(2023, 4, 1); const startMs = Date.UTC(2023, 4, 16, 14); const endMs = startMs + 3 * H;
+    const archive = (zipPath: string, body: string) => {
+      const source = `${zipPath}.csv`; writeFileSync(source, body); execFileSync("zip", ["-j", zipPath, source], { stdio: "ignore" }); unlinkSync(source);
+      const hash = createHash("sha256").update(readFileSync(zipPath)).digest("hex"); writeFileSync(`${zipPath}.CHECKSUM`, `${hash}  ${basename(zipPath)}\n`);
+    };
+    try {
+      const bboDirectory = join(root, "bookTicker", "BTCUSDT"); mkdirSync(bboDirectory, { recursive: true });
+      archive(join(bboDirectory, "BTCUSDT-bookTicker-2023-05.zip"), `update_id,best_bid_price,best_bid_qty,best_ask_price,best_ask_qty,transaction_time,event_time\n1,99,1,100,1,${monthStartMs + 1},${monthStartMs + 1}\n2,100,2,101,3,${startMs - 1},${startMs - 1}\n3,101,4,102,5,${startMs + 1},${startMs + 1}\n4,102,6,103,7,${startMs + H + 1},${startMs + H + 1}\n5,103,8,104,9,${startMs + 2 * H - 3},${startMs + 2 * H - 3}\n`);
+      const bundle = inspectArchiveBundle({ root, include: (path) => path.startsWith("bookTicker/") && (path.endsWith(".zip") || path.endsWith(".zip.CHECKSUM")) });
+      const rows = (await importBinanceVisionUsdMRawBookTickerLiquidityArchive({ root, expectedCoverage: { startMs, endMs, symbols: ["BTCUSDT"], cadenceMs: H }, candleRows: [
+        { symbol: "BTCUSDT", openTimeMs: startMs - H, closeTimeMs: startMs - 1, volume: 7, sourceHash: "prior-13" },
+        { symbol: "BTCUSDT", openTimeMs: startMs, closeTimeMs: startMs + H - 1, volume: 8, sourceHash: "prior-14" },
+        { symbol: "BTCUSDT", openTimeMs: startMs + H, closeTimeMs: startMs + 2 * H - 1, volume: 9, sourceHash: "prior-15" },
+      ] as never[], maxQuoteAgeMs: H, source: "Binance Vision BBO exact-tick-key", sourceProvenance: { provenanceType: "EXCHANGE_HISTORICAL_EXPORT", provider: "Binance Vision", exchange: "BINANCE_USD_M", datasetId: "bookTicker-exact-tick-key-fixture", retrievedAtMs: 1, rawFileHash: bundle.archiveBundleHash, schemaVersion: "binance-vision-bookTicker-csv-v1", generationToolSha: "abcdef0" }, generatedAtMs: 1, generationSha: "abcdef0" })).rows as Array<{ asOfMs: number; liquidityNotional: number }>;
+      expect(rows).toEqual([
+        expect.objectContaining({ asOfMs: startMs, liquidityNotional: 200 }),
+        expect.objectContaining({ asOfMs: startMs + H, liquidityNotional: 404 }),
+        expect.objectContaining({ asOfMs: startMs + 2 * H, liquidityNotional: 824 }),
+      ]);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   it("keeps parallel per-symbol bookTicker imports canonically deterministic", async () => {
     const root = mkdtempSync(join(tmpdir(), "foundry-binance-vision-bookticker-parallel-")); const monthStartMs = Date.UTC(2023, 4, 1); const startMs = monthStartMs + H; const endMs = startMs + H; const symbols = ["BTCUSDT", "ETHUSDT"];
     const archive = (zipPath: string, body: string) => {
