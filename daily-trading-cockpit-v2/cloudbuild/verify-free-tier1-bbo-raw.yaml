@@ -120,7 +120,7 @@ steps:
         if first_hash != second_hash or first_bytes != second_bytes:
             raise RuntimeError("second inventory pass differs from first")
         manifest = {
-            "schemaVersion": "KronosFreeTier1RawAcquisition/v1",
+            "schemaVersion": "KronosFreeTier1RawAcquisition/v2",
             "scope": {"symbols": ["BTCUSDT", "ETHUSDT"], "start": "2023-05", "end": "2024-03", "objectCount": 22},
             "canonicalRawBookTickerBundleHash": first_hash,
             "inventoryPassHash": first_hash,
@@ -129,8 +129,8 @@ steps:
             "objects": first,
         }
         output = work / f"{first_hash}.json"
-        output.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\\n", encoding="utf8")
-        target = f"{study}/acquisition-manifests/{first_hash}.json"
+        output.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf8")
+        target = f"{study}/acquisition-manifests/v2/{first_hash}.json"
         try:
             subprocess.check_call(["gcloud", "storage", "cp", str(output), target, "--if-generation-match=0"])
         except subprocess.CalledProcessError:
