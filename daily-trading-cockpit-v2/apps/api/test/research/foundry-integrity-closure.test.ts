@@ -9,7 +9,7 @@ import { assertCandlesCoverCanonicalClock, buildCanonicalClock } from "../../src
 import { deriveFoundryCoverage } from "../../src/research/foundry/derived-coverage.js";
 import { alignFundingSettlements } from "../../src/research/foundry/funding-schedule.js";
 import { EffectiveStateTimeline } from "../../src/research/foundry/stateful-timeline.js";
-import { FOUNDRY_SCHEMA_V1, validateFoundryRows } from "../../src/research/foundry/semantic-validators.js";
+import { FOUNDRY_SCHEMA_V1, FOUNDRY_SCHEMA_V2, validateFoundryRows } from "../../src/research/foundry/semantic-validators.js";
 import { fixtureSourceProvenance } from "../../src/research/foundry/source-provenance.js";
 import { PointInTimeUniverse } from "../../src/research/universe/point-in-time-universe.js";
 
@@ -38,12 +38,13 @@ describe("Foundry integrity closure", () => {
     expect(() => timeline.at("ETHUSDT", 2 * H)).toThrow("FOUNDRY_TIMELINE_INITIAL_STATE_MISSING");
     expect(() => new EffectiveStateTimeline([{ symbol: "BTCUSDT", effectiveTimeMs: 0, value: true, sourceHash: "a" }, { symbol: "BTCUSDT", effectiveTimeMs: H, value: true, sourceHash: "b" }])).toThrow("FOUNDRY_TIMELINE_REDUNDANT_TRANSITION");
     expect(() => new EffectiveStateTimeline([{ symbol: "BTCUSDT", effectiveTimeMs: H, value: true, sourceHash: "a" }, { symbol: "BTCUSDT", effectiveTimeMs: H, value: false, sourceHash: "b" }])).toThrow("FOUNDRY_TIMELINE_CONTRADICTORY_TRANSITION");
-    const listingRows = validateFoundryRows("LISTING_DELISTING_TIMELINE", FOUNDRY_SCHEMA_V1, [{ symbol: "BTCUSDT", effectiveTimeMs: H, validUntilMs: 8 * H - 1, status: "LISTED", sourceHash: "listing" }]);
-    expect(deriveFoundryCoverage("LISTING_DELISTING_TIMELINE", listingRows, { startMs: 2 * H, endMs: 8 * H, symbols: ["BTCUSDT"] }).missingIntervals).toEqual([]);
-    expect(deriveFoundryCoverage("LISTING_DELISTING_TIMELINE", listingRows, { startMs: 0, endMs: 8 * H, symbols: ["BTCUSDT"] }).missingIntervals[0]?.reason).toBe("BTCUSDT:INITIAL_STATE_MISSING");
-    expect(() => validateFoundryRows("LISTING_DELISTING_TIMELINE", FOUNDRY_SCHEMA_V1, [{ symbol: "BTCUSDT", effectiveTimeMs: H, status: "LISTED", sourceHash: "listing" }])).toThrow("FOUNDRY_INVALID_VALID_UNTIL_MS");
-    const expired = validateFoundryRows("LISTING_DELISTING_TIMELINE", FOUNDRY_SCHEMA_V1, [{ symbol: "BTCUSDT", effectiveTimeMs: H, validUntilMs: 3 * H - 1, status: "LISTED", sourceHash: "listing" }]);
-    expect(deriveFoundryCoverage("LISTING_DELISTING_TIMELINE", expired, { startMs: 2 * H, endMs: 8 * H, symbols: ["BTCUSDT"] }).missingIntervals).toEqual(expect.arrayContaining([expect.objectContaining({ reason: "BTCUSDT:STATE_PROVENANCE_TRAILING_GAP" })]));
+    const listingRows = validateFoundryRows("LISTING_DELISTING_TIMELINE", FOUNDRY_SCHEMA_V2, [{ symbol: "BTCUSDT", effectiveTimeMs: H, validUntilMs: 8 * H - 1, status: "LISTED", sourceHash: "listing" }]);
+    expect(deriveFoundryCoverage("LISTING_DELISTING_TIMELINE", listingRows, { startMs: 2 * H, endMs: 8 * H, symbols: ["BTCUSDT"] }, FOUNDRY_SCHEMA_V2).missingIntervals).toEqual([]);
+    expect(deriveFoundryCoverage("LISTING_DELISTING_TIMELINE", listingRows, { startMs: 0, endMs: 8 * H, symbols: ["BTCUSDT"] }, FOUNDRY_SCHEMA_V2).missingIntervals[0]?.reason).toBe("BTCUSDT:INITIAL_STATE_MISSING");
+    expect(() => validateFoundryRows("LISTING_DELISTING_TIMELINE", FOUNDRY_SCHEMA_V2, [{ symbol: "BTCUSDT", effectiveTimeMs: H, status: "LISTED", sourceHash: "listing" }])).toThrow("FOUNDRY_INVALID_VALID_UNTIL_MS");
+    expect(validateFoundryRows("LISTING_DELISTING_TIMELINE", FOUNDRY_SCHEMA_V1, [{ symbol: "BTCUSDT", effectiveTimeMs: H, status: "LISTED", sourceHash: "listing" }])).toEqual([expect.objectContaining({ symbol: "BTCUSDT", timestampMs: H, status: "LISTED" })]);
+    const expired = validateFoundryRows("LISTING_DELISTING_TIMELINE", FOUNDRY_SCHEMA_V2, [{ symbol: "BTCUSDT", effectiveTimeMs: H, validUntilMs: 3 * H - 1, status: "LISTED", sourceHash: "listing" }]);
+    expect(deriveFoundryCoverage("LISTING_DELISTING_TIMELINE", expired, { startMs: 2 * H, endMs: 8 * H, symbols: ["BTCUSDT"] }, FOUNDRY_SCHEMA_V2).missingIntervals).toEqual(expect.arrayContaining([expect.objectContaining({ reason: "BTCUSDT:STATE_PROVENANCE_TRAILING_GAP" })]));
     expect(() => new EffectiveStateTimeline([{ symbol: "BTCUSDT", effectiveTimeMs: H, validUntilMs: 3 * H - 1, value: "LISTED" as const, sourceHash: "listing" }]).at("BTCUSDT", 4 * H)).toThrow("FOUNDRY_TIMELINE_STATE_PROVENANCE_EXPIRED");
   });
 

@@ -9,6 +9,7 @@ import { futuresTimeline, listingTimeline, minimumHistoryTimeline } from "./stat
 import { buildTier1CapabilityReport, type Tier1CapabilityReport } from "./tier1-capability.js";
 import { riskSnapshotsFromArtifactRows } from "./tier1-pit-artifacts.js";
 import type { ValidatedFoundryRow } from "./semantic-validators.js";
+import { FOUNDRY_SCHEMA_V2 } from "./semantic-validators.js";
 import { PointInTimeLiquiditySpread, type Tier1LiquiditySpreadPolicy } from "./liquidity-eligibility.js";
 import { verifyArchiveBundle } from "./archive-bundle.js";
 import { runTournamentMatrix, type TournamentMatrixResult } from "../tournament-runner.js";
@@ -59,6 +60,7 @@ export function assertRealTier1ArtifactProvenance(artifacts: readonly Tier1Loade
   const hashes = new Set(artifacts.map((artifact) => artifact.manifest.semanticManifestHash));
   for (const artifact of artifacts) {
     const manifest = artifact.manifest; const provenance = manifest.sourceProvenance;
+    if ((manifest.artifactKind === "LISTING_DELISTING_TIMELINE" || manifest.artifactKind === "FUTURES_AVAILABILITY_TIMELINE") && manifest.schemaVersion !== FOUNDRY_SCHEMA_V2) throw new Error(`FOUNDRY_REAL_TIER1_BOUNDED_TIMELINE_SCHEMA_REQUIRED_${manifest.artifactKind}`);
     if (provenance.provenanceType === "FIXTURE" || provenance.provenanceType === "SYNTHETIC" || provenance.provider === "test-fixture" || provenance.exchange === "TEST" || provenance.rawFileHash === "0".repeat(64)) throw new Error(`FOUNDRY_REAL_TIER1_FIXTURE_OR_PLACEHOLDER_${manifest.artifactKind}`);
     if (provenance.provenanceType === "DERIVED_FROM_FOUNDRY_ARTIFACTS") {
       if (manifest.archiveBundle || !manifest.derivation || manifest.derivation.parentSemanticManifestHashes.some((hash) => !hashes.has(hash))) throw new Error(`FOUNDRY_REAL_TIER1_DERIVATION_INVALID_${manifest.artifactKind}`);

@@ -1,6 +1,13 @@
 import type { FoundryArtifactKind } from "./artifact-schema.js";
 
 export const FOUNDRY_SCHEMA_V1 = "v1" as const;
+/**
+ * v1 remains readable for the already-persisted smoke archive. v2 makes a
+ * validity watermark part of every stateful lifecycle row so a new empirical
+ * assembly cannot treat an old transition as evidence for an unbounded future.
+ */
+export const FOUNDRY_SCHEMA_V2 = "v2" as const;
+export type FoundrySchemaVersion = typeof FOUNDRY_SCHEMA_V1 | typeof FOUNDRY_SCHEMA_V2;
 
 export interface ValidatedFoundryRow {
   readonly symbol?: string;
@@ -36,7 +43,17 @@ function identity(kind: FoundryArtifactKind, row: Record<string, unknown>): stri
   return `${s}:${timestampFor(kind, row)}`;
 }
 
-function validateByKind(kind: FoundryArtifactKind, row: Record<string, unknown>): ValidatedFoundryRow {
+function timelineValidUntil(row: Record<string, unknown>, effectiveTimeMs: number, required: boolean): number | undefined {
+  if (row.validUntilMs === undefined) {
+    if (required) throw new Error("FOUNDRY_INVALID_VALID_UNTIL_MS");
+    return undefined;
+  }
+  const validUntilMs = positiveTime(row.validUntilMs, "VALID_UNTIL_MS");
+  if (validUntilMs < effectiveTimeMs) throw new Error("FOUNDRY_TIMELINE_EFFECTIVE_BOUNDS_INVALID");
+  return validUntilMs;
+}
+
+function validateByKind(kind: FoundryArtifactKind, row: Record<string, unknown>, schemaVersion: FoundrySchemaVersion): ValidatedFoundryRow {
   const sourceHash = source(row);
   if (kind === "COMPLETED_CANDLES") {
     const openTimeMs = positiveTime(row.openTimeMs, "OPEN_TIME_MS"); const closeTimeMs = positiveTime(row.closeTimeMs, "CLOSE_TIME_MS"); const open = number(row.open, "OPEN", Number.MIN_VALUE); const high = number(row.high, "HIGH", Number.MIN_VALUE); const low = number(row.low, "LOW", Number.MIN_VALUE); const close = number(row.close, "CLOSE", Number.MIN_VALUE); const volume = number(row.volume, "VOLUME", 0);
@@ -48,8 +65,8 @@ function validateByKind(kind: FoundryArtifactKind, row: Record<string, unknown>)
     if (observedSettlementTimeMs - canonicalSettlementTimeMs !== alignmentOffsetMs) throw new Error("FOUNDRY_FUNDING_ALIGNMENT_OFFSET_INVALID");
     return { symbol: symbol(row.symbol), timestampMs: canonicalSettlementTimeMs, canonicalSettlementTimeMs, observedSettlementTimeMs, alignmentOffsetMs, scheduleSourceHash: text(row.scheduleSourceHash, "SCHEDULE_SOURCE_HASH"), fundingIntervalMs: positiveTime(row.fundingIntervalMs, "FUNDING_INTERVAL_MS"), rate: number(row.rate, "RATE"), sourceHash };
   }
-  if (kind === "LISTING_DELISTING_TIMELINE") { const status = text(row.status, "STATUS"); if (status !== "LISTED" && status !== "DELISTED") throw new Error("FOUNDRY_LISTING_STATUS_INVALID"); const effectiveTimeMs = positiveTime(row.effectiveTimeMs, "EFFECTIVE_TIME_MS"); const validUntilMs = positiveTime(row.validUntilMs, "VALID_UNTIL_MS"); if (validUntilMs < effectiveTimeMs) throw new Error("FOUNDRY_TIMELINE_EFFECTIVE_BOUNDS_INVALID"); return { symbol: symbol(row.symbol), timestampMs: effectiveTimeMs, effectiveTimeMs, validUntilMs, status, sourceHash }; }
-  if (kind === "FUTURES_AVAILABILITY_TIMELINE") { const effectiveTimeMs = positiveTime(row.effectiveTimeMs, "EFFECTIVE_TIME_MS"); const validUntilMs = positiveTime(row.validUntilMs, "VALID_UNTIL_MS"); if (validUntilMs < effectiveTimeMs) throw new Error("FOUNDRY_TIMELINE_EFFECTIVE_BOUNDS_INVALID"); return { symbol: symbol(row.symbol), timestampMs: effectiveTimeMs, effectiveTimeMs, validUntilMs, available: boolean(row.available, "AVAILABLE"), sourceHash }; }
+  if (kind === "LISTING_DELISTING_TIMELINE") { const status = text(row.status, "STATUS"); if (status !== "LISTED" && status !== "DELISTED") throw new Error("FOUNDRY_LISTING_STATUS_INVALID"); const effectiveTimeMs = positiveTime(row.effectiveTimeMs, "EFFECTIVE_TIME_MS"); const validUntilMs = timelineValidUntil(row, effectiveTimeMs, schemaVersion === FOUNDRY_SCHEMA_V2); return { symbol: symbol(row.symbol), timestampMs: effectiveTimeMs, effectiveTimeMs, ...(validUntilMs === undefined ? {} : { validUntilMs }), status, sourceHash }; }
+  if (kind === "FUTURES_AVAILABILITY_TIMELINE") { const effectiveTimeMs = positiveTime(row.effectiveTimeMs, "EFFECTIVE_TIME_MS"); const validUntilMs = timelineValidUntil(row, effectiveTimeMs, schemaVersion === FOUNDRY_SCHEMA_V2); return { symbol: symbol(row.symbol), timestampMs: effectiveTimeMs, effectiveTimeMs, ...(validUntilMs === undefined ? {} : { validUntilMs }), available: boolean(row.available, "AVAILABLE"), sourceHash }; }
   if (kind === "MINIMUM_HISTORY_ELIGIBILITY") { const asOfMs = positiveTime(row.asOfMs, "AS_OF_MS"); return { symbol: symbol(row.symbol), timestampMs: asOfMs, asOfMs, eligible: boolean(row.eligible, "ELIGIBLE"), sourceHash }; }
   if (kind === "PIT_LIQUIDITY_SPREAD") { const asOfMs = positiveTime(row.asOfMs, "AS_OF_MS"); const validUntilMs = positiveTime(row.validUntilMs, "VALID_UNTIL_MS"); if (validUntilMs < asOfMs) throw new Error("FOUNDRY_LIQUIDITY_EFFECTIVE_BOUNDS_INVALID"); return { symbol: symbol(row.symbol), timestampMs: asOfMs, asOfMs, validUntilMs, volume: number(row.volume, "VOLUME", 0), liquidityNotional: number(row.liquidityNotional, "LIQUIDITY_NOTIONAL", 0), spreadBps: number(row.spreadBps, "SPREAD_BPS", 0), sourceHash }; }
   if (kind === "FEE_ASSUMPTIONS") { const asOfMs = positiveTime(row.asOfMs, "AS_OF_MS"); const scope = row.symbol === "*" ? "*" : symbol(row.symbol); return { symbol: scope, timestampMs: asOfMs, asOfMs, makerFeeBps: number(row.makerFeeBps, "MAKER_FEE_BPS", 0), takerFeeBps: number(row.takerFeeBps, "TAKER_FEE_BPS", 0), sourceHash }; }
@@ -60,9 +77,9 @@ function validateByKind(kind: FoundryArtifactKind, row: Record<string, unknown>)
 }
 
 export function validateFoundryRows(kind: FoundryArtifactKind, schemaVersion: string, rows: readonly unknown[]): ValidatedFoundryRow[] {
-  if (schemaVersion !== FOUNDRY_SCHEMA_V1) throw new Error(`FOUNDRY_SCHEMA_VERSION_UNSUPPORTED_${schemaVersion}`);
+  if (schemaVersion !== FOUNDRY_SCHEMA_V1 && schemaVersion !== FOUNDRY_SCHEMA_V2) throw new Error(`FOUNDRY_SCHEMA_VERSION_UNSUPPORTED_${schemaVersion}`);
   if (!Array.isArray(rows) || rows.length === 0) throw new Error("FOUNDRY_ROWS_EMPTY_OR_INVALID");
-  const output = rows.map((value) => validateByKind(kind, object(value)));
+  const output = rows.map((value) => validateByKind(kind, object(value), schemaVersion));
   const seen = new Set<string>(); let prior = -Infinity;
   for (const [index, row] of output.entries()) {
     const raw = object(rows[index]); const key = identity(kind, raw);

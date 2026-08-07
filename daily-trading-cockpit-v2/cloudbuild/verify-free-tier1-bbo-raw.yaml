@@ -1,0 +1,128 @@
+# Cloud-only, generation-pinned re-verification of the frozen free BBO scope.
+# It never reads the laptop, modifies a raw object, or deletes staging/local data.
+steps:
+  - name: gcr.io/google.com/cloudsdktool/google-cloud-cli:slim
+    entrypoint: bash
+    args:
+      - -ceu
+      - |
+        python3 - <<'PY'
+        import hashlib
+        import json
+        import os
+        import pathlib
+        import re
+        import subprocess
+        import zipfile
+
+        study = os.environ["_STUDY"]
+        work = pathlib.Path("/workspace/generation-pinned-bbo")
+        work.mkdir(parents=True, exist_ok=True)
+        pairs = [(symbol, f"2023-{month:02d}") for symbol in ("BTCUSDT", "ETHUSDT") for month in range(5, 13)]
+        pairs += [(symbol, f"2024-{month:02d}") for symbol in ("BTCUSDT", "ETHUSDT") for month in range(1, 4)]
+        if len(pairs) != 22:
+            raise RuntimeError("Kronos BBO scope must contain exactly 22 monthly ZIPs")
+
+        def run(*args):
+            return subprocess.check_output(args, text=True)
+
+        def describe(uri):
+            return json.loads(run("gcloud", "storage", "objects", "describe", uri, "--format=json"))
+
+        def sha256(path):
+            digest = hashlib.sha256()
+            with open(path, "rb") as handle:
+                for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+                    digest.update(chunk)
+            return digest.hexdigest()
+
+        def download(uri, generation, destination):
+            run("gcloud", "storage", "cp", f"{uri}#{generation}", str(destination))
+
+        def inventory_pass(download_bytes):
+            inventory = []
+            for symbol, month in pairs:
+                name = f"{symbol}-bookTicker-{month}.zip"
+                zip_uri = f"{study}/raw/bookTicker/{symbol}/{name}"
+                checksum_uri = f"{zip_uri}.CHECKSUM"
+                marker_uri = f"{study}/raw/bookTicker/transfer-verification-v2/{symbol}/{name}.json"
+                zip_meta = describe(zip_uri)
+                checksum_meta = describe(checksum_uri)
+                marker_meta = describe(marker_uri)
+                directory = work / symbol / month
+                directory.mkdir(parents=True, exist_ok=True)
+                zip_path = directory / name
+                checksum_path = directory / f"{name}.CHECKSUM"
+                marker_path = directory / f"{name}.marker.json"
+                if download_bytes:
+                    download(zip_uri, str(zip_meta["generation"]), zip_path)
+                    download(checksum_uri, str(checksum_meta["generation"]), checksum_path)
+                    download(marker_uri, str(marker_meta["generation"]), marker_path)
+                if not (zip_path.is_file() and checksum_path.is_file() and marker_path.is_file()):
+                    raise RuntimeError(f"generation-pinned object not materialized: {name}")
+                computed_zip = sha256(zip_path)
+                computed_checksum = sha256(checksum_path)
+                computed_marker = sha256(marker_path)
+                with zipfile.ZipFile(zip_path) as archive:
+                    bad_member = archive.testzip()
+                    if bad_member is not None:
+                        raise RuntimeError(f"ZIP integrity failed {name}: {bad_member}")
+                marker = json.loads(marker_path.read_text(encoding="utf8"))
+                if marker.get("schemaVersion") != "KronosRawBookTickerVerification/v2":
+                    raise RuntimeError(f"marker schema invalid: {name}")
+                if marker.get("sourceKey") != f"data/futures/um/monthly/bookTicker/{symbol}/{name}":
+                    raise RuntimeError(f"marker source key mismatch: {name}")
+                if marker.get("finalUri") != zip_uri or str(marker.get("finalGeneration")) != str(zip_meta["generation"]):
+                    raise RuntimeError(f"marker canonical generation mismatch: {name}")
+                if marker.get("companionUri") != checksum_uri or str(marker.get("companionGeneration")) != str(checksum_meta["generation"]):
+                    raise RuntimeError(f"marker checksum generation mismatch: {name}")
+                if int(marker.get("finalSizeBytes", -1)) != int(zip_meta["size"]) or int(marker.get("companionSizeBytes", -1)) != int(checksum_meta["size"]):
+                    raise RuntimeError(f"marker size mismatch: {name}")
+                if marker.get("computedFinalSha256") != computed_zip or marker.get("officialSha256") != computed_zip:
+                    raise RuntimeError(f"ZIP SHA-256 mismatch: {name}")
+                if marker.get("companionSha256") != computed_checksum or marker.get("publisherCompanionSha256") != computed_checksum:
+                    raise RuntimeError(f"checksum companion SHA-256 mismatch: {name}")
+                companion = checksum_path.read_text(encoding="utf8").strip()
+                checksum_match = re.fullmatch(r"([a-fA-F0-9]{64})\\s+([^\\s]+)", companion)
+                if checksum_match is None or checksum_match.group(1).lower() != computed_zip or checksum_match.group(2) != name:
+                    raise RuntimeError(f"publisher checksum bytes invalid: {name}")
+                inventory.append({
+                    "relativePath": f"{symbol}/{name}",
+                    "sourceKey": marker["sourceKey"],
+                    "canonical": {"uri": zip_uri, "generation": str(zip_meta["generation"]), "sizeBytes": int(zip_meta["size"]), "sha256": computed_zip},
+                    "officialChecksum": marker["officialSha256"],
+                    "companion": {"uri": checksum_uri, "generation": str(checksum_meta["generation"]), "sizeBytes": int(checksum_meta["size"]), "sha256": computed_checksum, "bytes": companion},
+                    "verificationMarker": {"uri": marker_uri, "generation": str(marker_meta["generation"]), "sha256": computed_marker, "verifiedAt": marker["verifiedAt"], "verifierTemplateSha256": marker["verifierTemplateSha256"], "verifierSourceRevision": marker["verifierSourceRevision"]},
+                })
+            return sorted(inventory, key=lambda entry: entry["relativePath"])
+
+        first = inventory_pass(download_bytes=True)
+        second = inventory_pass(download_bytes=False)
+        first_bytes = json.dumps(first, sort_keys=True, separators=(",", ":")).encode()
+        second_bytes = json.dumps(second, sort_keys=True, separators=(",", ":")).encode()
+        first_hash = hashlib.sha256(first_bytes).hexdigest()
+        second_hash = hashlib.sha256(second_bytes).hexdigest()
+        if first_hash != second_hash or first_bytes != second_bytes:
+            raise RuntimeError("second inventory pass differs from first")
+        manifest = {
+            "schemaVersion": "KronosFreeTier1RawAcquisition/v1",
+            "scope": {"symbols": ["BTCUSDT", "ETHUSDT"], "start": "2023-05", "end": "2024-03", "objectCount": 22},
+            "canonicalRawBookTickerBundleHash": first_hash,
+            "inventoryPassHash": first_hash,
+            "secondInventoryPassHash": second_hash,
+            "verification": {"zipIntegrity": "python.zipfile.testzip", "passCount": 2, "verifierSourceRevision": os.environ["_VERIFIER_SOURCE_REVISION"], "verifierTemplateSha256": os.environ["_VERIFIER_TEMPLATE_SHA256"]},
+            "objects": first,
+        }
+        output = work / f"{first_hash}.json"
+        output.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\\n", encoding="utf8")
+        target = f"{study}/acquisition-manifests/{first_hash}.json"
+        subprocess.check_call(["gcloud", "storage", "cp", str(output), target, "--if-generation-match=0"])
+        print(json.dumps({"status": "PASS", "objectCount": len(first), "canonicalRawBookTickerBundleHash": first_hash, "manifest": target}, sort_keys=True))
+        PY
+options:
+  diskSizeGb: 200
+  machineType: E2_HIGHCPU_8
+substitutions:
+  _STUDY: gs://bucket-coin-yuhu/kronos-tier1-archives/binance-vision-usdm-bookticker-free-walkforward-v1
+  _VERIFIER_SOURCE_REVISION: unknown
+  _VERIFIER_TEMPLATE_SHA256: unknown

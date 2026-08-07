@@ -1,6 +1,6 @@
 import { tournamentHash } from "../contract/tournament-contract.js";
 import { assertExpectedCoverage, deriveFoundryCoverage, type DerivedFoundryCoverage, type FoundryExpectedCoverage } from "./derived-coverage.js";
-import { FOUNDRY_SCHEMA_V1, validateFoundryRows, type ValidatedFoundryRow } from "./semantic-validators.js";
+import { FOUNDRY_SCHEMA_V1, FOUNDRY_SCHEMA_V2, validateFoundryRows, type FoundrySchemaVersion, type ValidatedFoundryRow } from "./semantic-validators.js";
 import { assertArchiveBundleIdentity, type ArchiveBundleIdentity } from "./archive-bundle.js";
 import { assertFoundryDerivationIdentity, assertFoundrySourceProvenance, type FoundryDerivationIdentity, type FoundrySourceProvenance } from "./source-provenance.js";
 
@@ -25,7 +25,7 @@ export interface CanonicalEpisodeCoverageEvidence {
 export interface FoundryArtifactManifest {
   foundryVersion: typeof DATASET_FOUNDRY_VERSION;
   artifactKind: FoundryArtifactKind;
-  schemaVersion: typeof FOUNDRY_SCHEMA_V1;
+  schemaVersion: FoundrySchemaVersion;
   source: string;
   sourceProvenance: FoundrySourceProvenance;
   archiveBundle?: ArchiveBundleIdentity;
@@ -47,7 +47,7 @@ export interface BuiltFoundryArtifact { manifest: FoundryArtifactManifest; canon
 
 export interface FoundryArtifactBuildInput {
   artifactKind: FoundryArtifactKind;
-  schemaVersion: typeof FOUNDRY_SCHEMA_V1;
+  schemaVersion: FoundrySchemaVersion;
   source: string;
   sourceProvenance: FoundrySourceProvenance;
   archiveBundle?: ArchiveBundleIdentity;
@@ -69,7 +69,7 @@ export function buildFoundryArtifact(input: FoundryArtifactBuildInput): BuiltFou
   if (input.canonicalEpisodeCoverage && (input.artifactKind !== "CANONICAL_EPISODES" || input.canonicalEpisodeCoverage.mode !== "COMPLETE_SYMBOL_DECISION_MAP" || !input.canonicalEpisodeCoverage.algorithmVersion || !input.canonicalEpisodeCoverage.policyVersion || !Number.isInteger(input.canonicalEpisodeCoverage.blockWidthMs) || input.canonicalEpisodeCoverage.blockWidthMs <= 0 || !Number.isInteger(input.canonicalEpisodeCoverage.decisionKeyCount) || input.canonicalEpisodeCoverage.decisionKeyCount <= 0 || !input.canonicalEpisodeCoverage.decisionKeysHash || input.canonicalEpisodeCoverage.sourceHashes.length === 0)) throw new Error("FOUNDRY_CANONICAL_EPISODE_COVERAGE_INVALID");
   const normalizedRows = validateFoundryRows(input.artifactKind, input.schemaVersion, input.rows).sort((a, b) => (a.timestampMs - b.timestampMs) || (a.symbol ?? "").localeCompare(b.symbol ?? ""));
   if (input.artifactKind === "COMPLETED_CANDLES" && input.expectedCoverage.cadenceMs && normalizedRows.some((row) => { const candle = row as ValidatedFoundryRow & { openTimeMs: number; closeTimeMs: number }; return candle.closeTimeMs !== candle.openTimeMs + input.expectedCoverage.cadenceMs! - 1; })) throw new Error("FOUNDRY_CANDLE_DURATION_INVALID");
-  const derivedCoverage = deriveFoundryCoverage(input.artifactKind, normalizedRows, input.expectedCoverage);
+  const derivedCoverage = deriveFoundryCoverage(input.artifactKind, normalizedRows, input.expectedCoverage, input.schemaVersion);
   const rowsHash = tournamentHash(normalizedRows);
   const missingDataReport = [
     ...derivedCoverage.missingSymbols.map((symbol) => `SYMBOL:${symbol}`),
@@ -96,7 +96,7 @@ export function assertFoundryArtifactIdentity(manifest: FoundryArtifactManifest,
 }
 
 export function assertCompleteFoundryArtifact(manifest: FoundryArtifactManifest): void {
-  if (manifest.foundryVersion !== DATASET_FOUNDRY_VERSION || manifest.schemaVersion !== FOUNDRY_SCHEMA_V1 || !manifest.source || !manifest.generationSha || !manifest.rowsHash || !manifest.semanticManifestHash || manifest.rowCount <= 0) throw new Error("FOUNDRY_ARTIFACT_PROVENANCE_INVALID");
+  if (manifest.foundryVersion !== DATASET_FOUNDRY_VERSION || (manifest.schemaVersion !== FOUNDRY_SCHEMA_V1 && manifest.schemaVersion !== FOUNDRY_SCHEMA_V2) || !manifest.source || !manifest.generationSha || !manifest.rowsHash || !manifest.semanticManifestHash || manifest.rowCount <= 0) throw new Error("FOUNDRY_ARTIFACT_PROVENANCE_INVALID");
   assertFoundrySourceProvenance(manifest.sourceProvenance);
   if (manifest.sourceProvenance.provenanceType === "DERIVED_FROM_FOUNDRY_ARTIFACTS") assertFoundryDerivationIdentity(manifest.derivation);
   assertExpectedCoverage(manifest.derivedCoverage);

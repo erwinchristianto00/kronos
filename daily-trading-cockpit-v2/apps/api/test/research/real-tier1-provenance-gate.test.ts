@@ -11,7 +11,7 @@ import { loadFoundryArtifact, persistFoundryArtifact } from "../../src/research/
 import { importLocalBinanceCandleArchive } from "../../src/research/foundry/local-binance-archive-adapter.js";
 import { buildCanonicalEpisodeArtifact } from "../../src/research/foundry/tier1-pit-artifacts.js";
 import { assertRealTier1ArtifactProvenance } from "../../src/research/foundry/tier1-assembler.js";
-import { FOUNDRY_SCHEMA_V1 } from "../../src/research/foundry/semantic-validators.js";
+import { FOUNDRY_SCHEMA_V1, FOUNDRY_SCHEMA_V2 } from "../../src/research/foundry/semantic-validators.js";
 import { fixtureSourceProvenance, type FoundryDerivationIdentity } from "../../src/research/foundry/source-provenance.js";
 import { rankTournamentCandidates } from "../../src/research/reporting/governance.js";
 
@@ -57,6 +57,15 @@ describe("real Tier-1 provenance gate", () => {
     expect(() => registryEntry(relabeledFixture, true)).toThrow("TOURNAMENT_EMPIRICAL_REGISTRY_GATE_REQUIRED");
     expect(() => rankTournamentCandidates([{ strategyId: "CASH", researchMode: "FIXTURE_SMOKE", capabilityTier: "TIER_1_BASELINE", metrics: { tradeCount: 0, independentEpisodes: 0, expectancyAfterCost: 0, profitFactor: null, winRate: 0, payoffRatio: null, sharpe: null, calmar: null, maxDrawdown: 0, netPnl: 0, returnFraction: 0, profitableAssetRatio: null, concentration: { topSymbolNetPnlShare: null, topRegimeNetPnlShare: null, topYearNetPnlShare: null }, canonicalEpisodeProvenanceComplete: false }, conservativePass: true, plateauPass: true, sealedHoldoutPass: true }])).toThrow("TOURNAMENT_FIXTURE_RANKING_FORBIDDEN");
     expect(() => rankTournamentCandidates([{ strategyId: "CASH", researchMode: "REAL_TIER1", capabilityTier: "TIER_1_BASELINE", metrics: { tradeCount: 0, independentEpisodes: 0, expectancyAfterCost: 0, profitFactor: null, winRate: 0, payoffRatio: null, sharpe: null, calmar: null, maxDrawdown: 0, netPnl: 0, returnFraction: 0, profitableAssetRatio: null, concentration: { topSymbolNetPnlShare: null, topRegimeNetPnlShare: null, topYearNetPnlShare: null }, canonicalEpisodeProvenanceComplete: false }, conservativePass: true, plateauPass: true, sealedHoldoutPass: true }])).toThrow("TOURNAMENT_TIER1_RANKING_FORBIDDEN");
+  });
+
+  it("requires bounded v2 provenance for every real lifecycle timeline while retaining v1 artifact readability", () => {
+    const sourceProvenance = realProvenance("a".repeat(64), "historical-lifecycle-export");
+    const legacy = buildFoundryArtifact({ artifactKind: "LISTING_DELISTING_TIMELINE", schemaVersion: FOUNDRY_SCHEMA_V1, source: "legacy lifecycle", sourceProvenance, units: { effectiveTimeMs: "unix_ms", state: "exchange_historical_event" }, generatedAtMs: 1, generationSha: "abcdef0", expectedCoverage: expected, rows: [{ symbol: "BTCUSDT", effectiveTimeMs: 0, status: "LISTED", sourceHash: "legacy-row" }] });
+    expect(legacy.canonicalRows).toEqual([expect.objectContaining({ status: "LISTED" })]);
+    expect(() => assertRealTier1ArtifactProvenance([{ manifest: legacy.manifest, rows: legacy.canonicalRows }], {})).toThrow("FOUNDRY_REAL_TIER1_BOUNDED_TIMELINE_SCHEMA_REQUIRED_LISTING_DELISTING_TIMELINE");
+    const bounded = buildFoundryArtifact({ artifactKind: "LISTING_DELISTING_TIMELINE", schemaVersion: FOUNDRY_SCHEMA_V2, source: "bounded lifecycle", sourceProvenance, units: { effectiveTimeMs: "unix_ms", validUntilMs: "unix_ms", state: "exchange_historical_event" }, generatedAtMs: 1, generationSha: "abcdef0", expectedCoverage: expected, rows: [{ symbol: "BTCUSDT", effectiveTimeMs: 0, validUntilMs: H - 1, status: "LISTED", sourceHash: "bounded-row" }] });
+    expect(bounded.manifest.schemaVersion).toBe(FOUNDRY_SCHEMA_V2);
   });
 
   it("requires a complete persisted canonical map, shares market causes across symbols, and is deterministic", () => {

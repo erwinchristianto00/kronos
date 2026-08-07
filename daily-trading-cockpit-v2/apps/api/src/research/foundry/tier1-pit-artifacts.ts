@@ -2,7 +2,7 @@ import { tournamentHash } from "../contract/tournament-contract.js";
 import type { TournamentCandle, PointInTimePortfolioRiskSnapshot } from "../tournament-types.js";
 import { buildFoundryArtifact, type BuiltFoundryArtifact, type FoundryArtifactKind } from "./artifact-schema.js";
 import type { FoundryExpectedCoverage } from "./derived-coverage.js";
-import { FOUNDRY_SCHEMA_V1, type ValidatedFoundryRow } from "./semantic-validators.js";
+import { FOUNDRY_SCHEMA_V1, FOUNDRY_SCHEMA_V2, type FoundrySchemaVersion, type ValidatedFoundryRow } from "./semantic-validators.js";
 import { futuresTimeline, listingTimeline } from "./stateful-timeline.js";
 import { assertFoundrySourceProvenance, type FoundrySourceProvenance } from "./source-provenance.js";
 import type { ArchiveBundleIdentity } from "./archive-bundle.js";
@@ -11,10 +11,10 @@ type TimelineKind = "LISTING_DELISTING_TIMELINE" | "FUTURES_AVAILABILITY_TIMELIN
 const finite = (value: number): boolean => Number.isFinite(value);
 
 /** Imports only a named historical export; caller must retain its immutable source hash per event. */
-export function buildAuthoritativeTimelineArtifact(input: { artifactKind: TimelineKind; source: string; sourceProvenance: FoundrySourceProvenance; archiveBundle?: ArchiveBundleIdentity; generatedAtMs: number; generationSha: string; expectedCoverage: FoundryExpectedCoverage; rows: readonly unknown[] }): BuiltFoundryArtifact {
+export function buildAuthoritativeTimelineArtifact(input: { artifactKind: TimelineKind; schemaVersion?: FoundrySchemaVersion; source: string; sourceProvenance: FoundrySourceProvenance; archiveBundle?: ArchiveBundleIdentity; generatedAtMs: number; generationSha: string; expectedCoverage: FoundryExpectedCoverage; rows: readonly unknown[] }): BuiltFoundryArtifact {
   assertFoundrySourceProvenance(input.sourceProvenance);
   if (input.sourceProvenance.provenanceType !== "EXCHANGE_HISTORICAL_EXPORT") throw new Error("FOUNDRY_TIMELINE_SOURCE_NOT_AUTHORITATIVE");
-  return buildFoundryArtifact({ ...input, schemaVersion: FOUNDRY_SCHEMA_V1, units: { effectiveTimeMs: "unix_ms", state: "exchange_historical_event" } });
+  return buildFoundryArtifact({ ...input, schemaVersion: input.schemaVersion ?? FOUNDRY_SCHEMA_V2, units: { effectiveTimeMs: "unix_ms", validUntilMs: "unix_ms", state: "exchange_historical_event" } });
 }
 
 /** Eligibility is derived from prior completed bars plus source-backed listing/futures state only. */

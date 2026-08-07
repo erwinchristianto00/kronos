@@ -1,5 +1,5 @@
 import type { FoundryArtifactKind } from "./artifact-schema.js";
-import type { ValidatedFoundryRow } from "./semantic-validators.js";
+import { FOUNDRY_SCHEMA_V2, type FoundrySchemaVersion, type ValidatedFoundryRow } from "./semantic-validators.js";
 import { alignFundingSettlements, type FundingScheduleMetadata } from "./funding-schedule.js";
 
 export interface FoundryExpectedCoverage {
@@ -38,7 +38,7 @@ function inferredCadence(rows: readonly ValidatedFoundryRow[]): number | null {
 }
 
 /** Coverage is derived only from normalized rows and an explicit expected contract. */
-export function deriveFoundryCoverage(kind: FoundryArtifactKind, rows: readonly ValidatedFoundryRow[], expected: FoundryExpectedCoverage): DerivedFoundryCoverage {
+export function deriveFoundryCoverage(kind: FoundryArtifactKind, rows: readonly ValidatedFoundryRow[], expected: FoundryExpectedCoverage, schemaVersion: FoundrySchemaVersion = "v1"): DerivedFoundryCoverage {
   if (expected.startMs >= expected.endMs || expected.symbols.length === 0) throw new Error("FOUNDRY_EXPECTED_COVERAGE_INVALID");
   const coveredSymbols = [...new Set(rows.flatMap((row) => row.symbol && row.symbol !== "*" ? [row.symbol] : []))].sort(); const bySymbol = grouped(rows);
   const cadenceMs = expected.cadenceMs ?? inferredCadence(rows); const missingIntervals: DerivedFoundryCoverage["missingIntervals"] = []; const perSymbolGaps: DerivedFoundryCoverage["perSymbolGaps"] = {};
@@ -52,7 +52,7 @@ export function deriveFoundryCoverage(kind: FoundryArtifactKind, rows: readonly 
     if (["LISTING_DELISTING_TIMELINE", "FUTURES_AVAILABILITY_TIMELINE", "MINIMUM_HISTORY_ELIGIBILITY", "FEE_ASSUMPTIONS"].includes(kind)) {
       const allSymbolRows = rowsForSymbol.sort((a, b) => a.timestampMs - b.timestampMs);
       if (!allSymbolRows.some((row) => row.timestampMs <= expected.startMs)) gaps.push({ startMs: expected.startMs, endMs: expected.startMs, reason: "INITIAL_STATE_MISSING" });
-      if (["LISTING_DELISTING_TIMELINE", "FUTURES_AVAILABILITY_TIMELINE"].includes(kind)) {
+      if (schemaVersion === FOUNDRY_SCHEMA_V2 && ["LISTING_DELISTING_TIMELINE", "FUTURES_AVAILABILITY_TIMELINE"].includes(kind)) {
         const timelineRows = allSymbolRows.filter((row) => row.timestampMs <= expected.endMs - 1);
         let coveredUntilMs: number | null = null;
         for (const row of timelineRows) {
