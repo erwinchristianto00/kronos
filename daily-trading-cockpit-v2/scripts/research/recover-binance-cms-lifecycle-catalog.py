@@ -53,7 +53,7 @@ def gcs_exists(uri):
     result = subprocess.run(["gcloud", "storage", "objects", "describe", uri, "--format=json"], text=True, capture_output=True)
     if result.returncode == 0:
         return json.loads(result.stdout)
-    if "matched no objects" in result.stderr or "No URLs matched" in result.stderr:
+    if "matched no objects" in result.stderr or "No URLs matched" in result.stderr or "not found: 404" in result.stderr:
         return None
     raise RuntimeError(f"LIFECYCLE_RECOVERY_GCS_DESCRIBE_FAILED_{uri}_{result.stderr.strip()}")
 
