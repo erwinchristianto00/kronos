@@ -12,7 +12,10 @@ steps:
       - -ceu
       - |
         python3 scripts/research/recover-binance-cms-lifecycle-catalog.py
-timeout: 3600s
+# A first recovery can validly contain hundreds of small, immutable CMS
+# responses. Both required full GCS byte-verification passes must finish before
+# marker publication; this changes only worker time, never source scope/bytes.
+timeout: 10800s
 substitutions:
   _RAW_ROOT: ""
   _GENERATION_SHA: unknown
