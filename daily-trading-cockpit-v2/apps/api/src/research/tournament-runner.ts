@@ -68,7 +68,8 @@ export interface WalkForwardTournamentInput {
     inSampleExpectancyAfterCost: number;
   };
   buildStrategy: (parameters: Record<string, string | number | boolean>) => TournamentStrategy;
-  execution: Omit<TournamentExecutionInput, "manifest" | "strategy" | "candles">;
+  /** History is derived from the immutable candle input, never caller supplied. */
+  execution: Omit<TournamentExecutionInput, "manifest" | "strategy" | "candles" | "historyCandles">;
   createdAtMs: number;
   executionMode: Exclude<TournamentExecutionMode, "OPTIMISTIC">;
   postTradeEpisodePolicy?: TournamentEpisodePolicy;
@@ -88,16 +89,25 @@ export function runWalkForwardTournament(input: WalkForwardTournamentInput): Wal
   for (const fold of plan.folds) {
     const trainTimes = new Set(timestamps.slice(fold.train.startIndex, fold.train.endExclusive));
     const testTimes = new Set(timestamps.slice(fold.test.startIndex, fold.test.endExclusive));
+    const testStartMs = timestamps[fold.test.startIndex]!; const testEndMs = timestamps[fold.test.endExclusive - 1]! + input.spec.dataset.timeframeMs;
+    const testCandles = input.candles.filter((candle) => testTimes.has(candle.openTimeMs));
+    const historyCandles = input.candles.filter((candle) => candle.closeTimeMs < testStartMs);
+    const foldSnapshots = input.spec.dataset.universeSnapshots.filter((snapshot) => snapshot.asOfMs >= testStartMs && snapshot.asOfMs < testEndMs);
+    if (foldSnapshots.length === 0) throw new Error(`TOURNAMENT_WALK_FORWARD_UNIVERSE_COVERAGE_MISSING_${fold.foldId}`);
     const selection = input.chooseParameters({ fold, trainCandles: input.candles.filter((candle) => trainTimes.has(candle.openTimeMs)) });
     const strategy = input.buildStrategy(selection.parameters);
+    const foldSpec: TournamentExperimentSpec = {
+      ...input.spec,
+      dataset: { ...input.spec.dataset, dataRange: { startMs: testStartMs, endMs: testEndMs }, universeSnapshots: structuredClone(foldSnapshots) },
+    };
     const manifest = buildRunManifest({
-      spec: { ...input.spec, parameters: { ...input.spec.parameters, ...selection.parameters, foldId: fold.foldId } },
+      spec: { ...foldSpec, parameters: { ...foldSpec.parameters, ...selection.parameters, foldId: fold.foldId, walkForwardParentDataRange: structuredClone(input.spec.dataset.dataRange), walkForwardParentAssemblyHash: input.spec.dataset.tier1AssemblyBinding?.tier1AssemblyHash ?? null } },
       strategyId: strategy.id,
       executionMode: input.executionMode,
       parameterSet: selection.parameters,
       createdAtMs: input.createdAtMs,
     });
-    const raw = runTournament({ ...input.execution, candles: input.candles.filter((candle) => testTimes.has(candle.openTimeMs)), manifest, strategy });
+    const raw = runTournament({ ...input.execution, candles: testCandles, historyCandles, manifest, strategy });
     const [result] = attachCanonicalPostTradeEpisodes({ runs: [raw], policy: input.postTradeEpisodePolicy ?? canonicalPostTradeEpisodePolicy(input.spec.dataset.timeframeMs) });
     results.push({ foldId: fold.foldId, strategyId: strategy.id, parameters: selection.parameters, inSampleExpectancyAfterCost: selection.inSampleExpectancyAfterCost, result: result! });
   }

@@ -10,7 +10,7 @@ import { pairedAblation } from "../../src/research/reporting/ablations.js";
 import { persistTournamentRun } from "../../src/research/reporting/artifacts.js";
 import { assessCostSensitivity, summarizeOosWindows } from "../../src/research/reporting/oos.js";
 import { assertRandomControlPlanParity, randomTimingControl, type TournamentStrategy } from "../../src/research/strategies/challengers.js";
-import { runTournamentMatrix } from "../../src/research/tournament-runner.js";
+import { runTournamentMatrix, runWalkForwardTournament } from "../../src/research/tournament-runner.js";
 import type { TournamentCandle, TournamentExperimentSpec } from "../../src/research/tournament-types.js";
 import { PointInTimeUniverse } from "../../src/research/universe/point-in-time-universe.js";
 import { PointInTimePortfolioRisk } from "../../src/research/risk/point-in-time-portfolio-risk.js";
@@ -180,6 +180,31 @@ describe("Kronos Research Tournament v1 contract", () => {
       ...plan,
       folds: [{ ...plan.folds[0]!, purge: { startIndex: 77, endExclusive: 79 }, test: { startIndex: 79, endExclusive: plan.sealedHoldout.startIndex + 1 }, embargo: { startIndex: plan.sealedHoldout.startIndex + 1, endExclusive: plan.sealedHoldout.startIndex + 2 } }],
     })).toThrow("TOURNAMENT_SEALED_HOLDOUT_LEAK");
+  });
+
+  it("runs every OOS fold on its own fixed clock with strictly prior indicator history", () => {
+    const endMs = 20 * H; const walkSpec = spec(endMs);
+    walkSpec.validation = { ...walkSpec.validation, trainBars: 5, testBars: 3, stepBars: 3, purgeBars: 0, embargoBars: 0, sealedHoldoutStartMs: 16 * H };
+    walkSpec.portfolio = { ...walkSpec.portfolio, maxPortfolioRiskSnapshotAgeMs: 100 * H };
+    walkSpec.dataset.universeSnapshots = Array.from({ length: 20 }, (_unused, index) => ({ ...snapshot, asOfMs: (index + 1) * H - 1 }));
+    const candles = Array.from({ length: 20 }, (_unused, index) => candle(index)); const priorHistoryCounts: number[] = [];
+    const output = runWalkForwardTournament({
+      spec: walkSpec, candles, createdAtMs: 0, executionMode: "CONSERVATIVE", execution: { universe: new PointInTimeUniverse(walkSpec.dataset.universeSnapshots), ...executionBase() },
+      chooseParameters: ({ trainCandles }) => ({ parameters: {}, inSampleExpectancyAfterCost: trainCandles.length }),
+      buildStrategy: () => ({ id: "DONCHIAN", version: "walk-forward-fixture", parameters: {}, onCompletedBar: (bar) => {
+        if (bar.index === 0) priorHistoryCounts.push(bar.history.length);
+        return bar.index === 0 && bar.nextOpenTimeMs !== null ? [{ strategyId: "DONCHIAN", symbol: bar.symbol, side: "LONG", decisionTimeMs: bar.candle.closeTimeMs, entryAtOpenTimeMs: bar.nextOpenTimeMs, stopFraction: 0.01, targetFraction: 0.01, maxHoldBars: 1, exitTemplate: "FIXTURE", score: 1, metadata: {} }] : [];
+      } }),
+    });
+    expect(output.folds).toHaveLength(3);
+    expect(output.folds.map((fold) => ({ valid: fold.result.valid, invalidReasons: fold.result.invalidReasons }))).toEqual([
+      { valid: true, invalidReasons: [] }, { valid: true, invalidReasons: [] }, { valid: true, invalidReasons: [] },
+    ]);
+    expect(output.folds.map((fold) => fold.result.navLedger.length)).toEqual([3, 3, 3]);
+    expect(output.folds.map((fold) => fold.result.manifest.spec.dataset.dataRange)).toEqual([
+      { startMs: 5 * H, endMs: 8 * H }, { startMs: 8 * H, endMs: 11 * H }, { startMs: 11 * H, endMs: 14 * H },
+    ]);
+    expect(priorHistoryCounts).toEqual([5, 8, 11]);
   });
 
   it("persists every parameter combination and rejects an isolated optimistic peak before ranking", () => {

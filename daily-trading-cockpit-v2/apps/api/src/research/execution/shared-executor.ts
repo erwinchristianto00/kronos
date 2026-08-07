@@ -21,6 +21,13 @@ export interface TournamentExecutionInput {
   manifest: TournamentRunManifest;
   strategy: TournamentStrategy;
   candles: readonly TournamentCandle[];
+  /**
+   * Optional completed bars strictly before this run's canonical clock. They
+   * warm strategy indicators only: no mark, order, funding, NAV, or position
+   * may be created from them. Walk-forward folds derive this internally from
+   * the immutable parent candle ledger.
+   */
+  historyCandles?: readonly TournamentCandle[];
   universe: PointInTimeUniverse;
   validatedAbsences?: readonly ValidatedAbsence[];
   portfolioRisk: PointInTimePortfolioRisk;
@@ -74,6 +81,19 @@ function groupedCandles(candles: readonly TournamentCandle[]): Map<number, Map<s
   return grouped;
 }
 
+function seededCompletedHistory(input: { candles: readonly TournamentCandle[]; symbols: readonly string[]; startMs: number; timeframeMs: number }): Map<string, TournamentCandle[]> {
+  const knownSymbols = new Set(input.symbols); const result = new Map(input.symbols.map((symbol) => [symbol, [] as TournamentCandle[]])); const seen = new Set<string>();
+  for (const candle of input.candles.slice().sort((left, right) => left.openTimeMs - right.openTimeMs || left.symbol.localeCompare(right.symbol))) {
+    const key = `${candle.symbol}:${candle.openTimeMs}`;
+    if (!knownSymbols.has(candle.symbol) || seen.has(key) || candle.openTimeMs < 0 || candle.openTimeMs % input.timeframeMs !== 0 || candle.closeTimeMs !== candle.openTimeMs + input.timeframeMs - 1 || candle.closeTimeMs >= input.startMs || !finite(candle.open) || !finite(candle.high) || !finite(candle.low) || !finite(candle.close) || candle.open <= 0 || candle.high < candle.low) throw new Error(`TOURNAMENT_HISTORY_CANDLE_INVALID_${candle.symbol}_${candle.openTimeMs}`);
+    seen.add(key); result.get(candle.symbol)!.push({ ...candle });
+  }
+  for (const [symbol, candles] of result) for (let index = 1; index < candles.length; index += 1) {
+    if (candles[index]!.openTimeMs - candles[index - 1]!.openTimeMs !== input.timeframeMs) throw new Error(`TOURNAMENT_HISTORY_CANDLE_GAP_${symbol}_${candles[index]!.openTimeMs}`);
+  }
+  return result;
+}
+
 function calculateMetrics(trades: TournamentTrade[], nav: readonly TournamentNavPoint[], startingCapital: number, canonicalEpisodeProvenanceComplete: boolean, terminalPositionsResolved = true): TournamentMetrics {
   const net = trades.map((trade) => trade.netPnl); const wins = net.filter((value) => value > 0); const losses = net.filter((value) => value < 0);
   const grossWin = wins.reduce((sum, value) => sum + value, 0); const grossLoss = -losses.reduce((sum, value) => sum + value, 0);
@@ -120,7 +140,9 @@ export function runTournament(input: TournamentExecutionInput): TournamentRunRes
   if (invalidReasons.length) { const strategyMetrics = calculateMetrics([], emptyNav, spec.portfolio.startingCapital, false); return { manifest, trades: [], terminalOpenPositions: [], navLedger: emptyNav, strategyMetrics, portfolioMetrics: emptyPortfolioMetrics(spec), metrics: strategyMetrics, warnings, valid: false, invalidReasons }; }
 
   const grouped = groupedCandles(input.candles); const times = clock.timestamps; const symbols = [...new Set(input.candles.map((candle) => candle.symbol))].sort();
-  const history = new Map(symbols.map((symbol) => [symbol, [] as TournamentCandle[]])); const indexBySymbol = new Map(symbols.map((symbol) => [symbol, 0]));
+  let history: Map<string, TournamentCandle[]>;
+  try { history = seededCompletedHistory({ candles: input.historyCandles ?? [], symbols, startMs: spec.dataset.dataRange.startMs, timeframeMs: spec.dataset.timeframeMs }); } catch (error) { invalidReasons.push(error instanceof Error ? error.message : "TOURNAMENT_HISTORY_INVALID"); history = new Map(symbols.map((symbol) => [symbol, []])); }
+  const indexBySymbol = new Map(symbols.map((symbol) => [symbol, 0]));
   const pending = new Map<number, TournamentIntent[]>(); const open: OpenPosition[] = []; const trades: TournamentTrade[] = []; const navLedger: TournamentNavPoint[] = [];
   const costs = modeCost(manifest.executionMode, spec); const portfolioMetrics = emptyPortfolioMetrics(spec); let cash = spec.portfolio.startingCapital; let equityForAdmission = spec.portfolio.startingCapital;
   const fundingByKey = new Map<string, FundingSettlement>();
