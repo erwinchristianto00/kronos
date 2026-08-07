@@ -67,7 +67,7 @@ export interface WalkForwardTournamentInput {
     /** Persisted training metric; it is never calculated from the OOS slice. */
     inSampleExpectancyAfterCost: number;
   };
-  buildStrategy: (parameters: Record<string, string | number | boolean>) => TournamentStrategy;
+  buildStrategy: (parameters: Record<string, string | number | boolean>, fold: WalkForwardFold) => TournamentStrategy;
   /** History is derived from the immutable candle input, never caller supplied. */
   execution: Omit<TournamentExecutionInput, "manifest" | "strategy" | "candles" | "historyCandles">;
   createdAtMs: number;
@@ -95,7 +95,7 @@ export function runWalkForwardTournament(input: WalkForwardTournamentInput): Wal
     const foldSnapshots = input.spec.dataset.universeSnapshots.filter((snapshot) => snapshot.asOfMs >= testStartMs && snapshot.asOfMs < testEndMs);
     if (foldSnapshots.length === 0) throw new Error(`TOURNAMENT_WALK_FORWARD_UNIVERSE_COVERAGE_MISSING_${fold.foldId}`);
     const selection = input.chooseParameters({ fold, trainCandles: input.candles.filter((candle) => trainTimes.has(candle.openTimeMs)) });
-    const strategy = input.buildStrategy(selection.parameters);
+    const strategy = input.buildStrategy(selection.parameters, fold);
     const foldSpec: TournamentExperimentSpec = {
       ...input.spec,
       dataset: { ...input.spec.dataset, dataRange: { startMs: testStartMs, endMs: testEndMs }, universeSnapshots: structuredClone(foldSnapshots) },

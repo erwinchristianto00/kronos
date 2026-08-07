@@ -150,21 +150,41 @@ export function bindRealTier1ExperimentSpec(assembly: Tier1Assembly, spec: Tourn
   return structuredClone(spec);
 }
 
-function canonicalRandomControl(assembly: Tier1Assembly, seed: number): { reference: readonly RandomControlReference[]; eligibleEntryTimesBySymbol: ReadonlyMap<string, readonly number[]>; identity: string } {
+export interface Tier1RandomControlPlan {
+  readonly reference: readonly RandomControlReference[];
+  readonly eligibleEntryTimesBySymbol: ReadonlyMap<string, readonly number[]>;
+  readonly identity: string;
+  readonly entryRange: Readonly<{ startMs: number; endMs: number }>;
+}
+
+/**
+ * Derives the control exclusively from immutable assembly candles and PIT
+ * universe state. A bounded range is used only for walk-forward OOS folds;
+ * prior candles seed Donchian history but cannot become reference or random
+ * entry candidates. No caller can submit a favorable schedule.
+ */
+export function deriveTier1RandomControl(assembly: Tier1Assembly, seed: number, range: { startMs: number; endMs: number } = assembly.range): Tier1RandomControlPlan {
+  if (!Number.isInteger(range.startMs) || !Number.isInteger(range.endMs) || range.startMs < assembly.range.startMs || range.endMs > assembly.range.endMs || range.startMs >= range.endMs || range.startMs % assembly.timeframeMs !== 0 || range.endMs % assembly.timeframeMs !== 0) throw new Error("FOUNDRY_TIER1_RANDOM_CONTROL_RANGE_INVALID");
   const bySymbol = new Map<string, TournamentCandle[]>(); for (const candle of assembly.canonicalCandles) bySymbol.set(candle.symbol, [...(bySymbol.get(candle.symbol) ?? []), candle]);
   const eligible = new Map<string, number[]>(); const reference: RandomControlReference[] = []; const donor = donchianStrategy();
   for (const [symbol, candles] of [...bySymbol.entries()].sort(([a], [b]) => a.localeCompare(b))) {
     const history: TournamentCandle[] = []; const entries: number[] = [];
-    for (let index = 0; index < candles.length; index += 1) { const candle = candles[index]!; const next = candles[index + 1] ?? null; const eligibleSymbols = assembly.universe.at(candle.closeTimeMs); if (next && eligibleSymbols.has(symbol)) entries.push(next.openTimeMs); for (const intent of donor.onCompletedBar({ symbol, index, candle, history, eligibleSymbols, nextOpenTimeMs: next?.openTimeMs ?? null })) reference.push({ referenceId: `donchian:${symbol}:${intent.decisionTimeMs}`, symbol, referenceEntryTimeMs: intent.entryAtOpenTimeMs, side: intent.side, stopFraction: intent.stopFraction, targetFraction: intent.targetFraction, maxHoldBars: intent.maxHoldBars, exitTemplate: intent.exitTemplate, score: intent.score, metadata: { ...intent.metadata } }); history.push(candle); }
+    for (let index = 0; index < candles.length; index += 1) {
+      const candle = candles[index]!; const next = candles[index + 1] ?? null; const eligibleSymbols = assembly.universe.at(candle.closeTimeMs); const entryTimeMs = next?.openTimeMs ?? null;
+      const inRange = entryTimeMs !== null && candle.openTimeMs >= range.startMs && entryTimeMs < range.endMs;
+      if (inRange && eligibleSymbols.has(symbol)) entries.push(entryTimeMs);
+      for (const intent of donor.onCompletedBar({ symbol, index, candle, history, eligibleSymbols, nextOpenTimeMs: entryTimeMs })) if (inRange) reference.push({ referenceId: `donchian:${symbol}:${intent.decisionTimeMs}`, symbol, referenceEntryTimeMs: intent.entryAtOpenTimeMs, side: intent.side, stopFraction: intent.stopFraction, targetFraction: intent.targetFraction, maxHoldBars: intent.maxHoldBars, exitTemplate: intent.exitTemplate, score: intent.score, metadata: { ...intent.metadata } });
+      history.push(candle); if (candle.openTimeMs >= range.endMs) break;
+    }
     eligible.set(symbol, entries);
   }
-  const frozenReference = immutable(reference.map((entry) => ({ ...entry, metadata: { ...entry.metadata } }))); const frozenEligible = new Map([...eligible.entries()].map(([symbol, times]) => [symbol, immutable([...times])])); const identity = tournamentHash({ policyVersion: "tier1-random-control-from-donchian-v2", tier1AssemblyHash: assembly.tier1AssemblyHash, seed, reference: frozenReference, eligibleEntryTimesBySymbol: [...frozenEligible.entries()] });
-  return { reference: frozenReference, eligibleEntryTimesBySymbol: frozenEligible, identity };
+  const frozenReference = immutable(reference.map((entry) => ({ ...entry, metadata: { ...entry.metadata } }))); const frozenEligible = new Map([...eligible.entries()].map(([symbol, times]) => [symbol, immutable([...times])])); const entryRange = immutable({ ...range }); const identity = tournamentHash({ policyVersion: "tier1-random-control-from-donchian-v3", tier1AssemblyHash: assembly.tier1AssemblyHash, seed, entryRange, reference: frozenReference, eligibleEntryTimesBySymbol: [...frozenEligible.entries()] });
+  return { reference: frozenReference, eligibleEntryTimesBySymbol: frozenEligible, identity, entryRange };
 }
 
 /** Stable audit identity for the assembly-derived random-control schedule. */
 export function deriveTier1RandomControlIdentity(assembly: Tier1Assembly, seed: number): string {
-  return canonicalRandomControl(assembly, seed).identity;
+  return deriveTier1RandomControl(assembly, seed).identity;
 }
 
 /** Conservative-only baseline smoke; never includes Kronos or produces a rank/winner. */
@@ -192,8 +212,8 @@ export function runRealTier1Conservative(input: { assembly: Tier1Assembly; spec:
   for (const artifact of verifiedInputs.foundryArtifacts) loadFoundryArtifact(artifact);
   assertRealTier1ArtifactProvenance(verifiedInputs.provenanceArtifacts, verifiedInputs.archiveRoots);
   assertTier1AssemblyCanRun(input.assembly);
-  const random = canonicalRandomControl(input.assembly, input.spec.randomSeed); if (input.spec.parameters.tier1RandomControlIdentity !== undefined && input.spec.parameters.tier1RandomControlIdentity !== random.identity) throw new Error("FOUNDRY_REAL_TIER1_RANDOM_CONTROL_IDENTITY_MISMATCH");
-  const bound = bindRealTier1ExperimentSpec(input.assembly, input.spec); const spec = { ...bound, parameters: { ...bound.parameters, tier1AssemblyHash: input.assembly.tier1AssemblyHash, tier1RandomControlIdentity: random.identity, tier1RandomControlPolicyVersion: "tier1-random-control-from-donchian-v2" } };
+  const random = deriveTier1RandomControl(input.assembly, input.spec.randomSeed); if (input.spec.parameters.tier1RandomControlIdentity !== undefined && input.spec.parameters.tier1RandomControlIdentity !== random.identity) throw new Error("FOUNDRY_REAL_TIER1_RANDOM_CONTROL_IDENTITY_MISMATCH");
+  const bound = bindRealTier1ExperimentSpec(input.assembly, input.spec); const spec = { ...bound, parameters: { ...bound.parameters, tier1AssemblyHash: input.assembly.tier1AssemblyHash, tier1RandomControlIdentity: random.identity, tier1RandomControlPolicyVersion: "tier1-random-control-from-donchian-v3" } };
   const strategies = [cashStrategy(), buyAndHoldStrategy(), equalWeightHoldStrategy(), donchianStrategy(), macdStrategy(), emaCrossStrategy(), rsiMeanReversionStrategy(), randomTimingControl({ reference: random.reference, eligibleEntryTimesBySymbol: random.eligibleEntryTimesBySymbol, seed: spec.randomSeed })];
   const result = runTournamentMatrix({ spec, strategies, createdAtMs: input.createdAtMs, modes: ["CONSERVATIVE"], postTradeEpisodePolicy: input.assembly.postTradeEpisodePolicy, execution: { candles: input.assembly.canonicalCandles, universe: input.assembly.universe, portfolioRisk: input.assembly.portfolioRisk, fundingSettlements: input.assembly.canonicalFundingSettlements, fundingSettlementScheduleBySymbol: scheduleMap(input.assembly.fundingScheduleBySymbol) } });
   if (result.runs.some((run) => run.manifest.strategyId === "KRONOS_CURRENT" || run.manifest.executionMode !== "CONSERVATIVE")) throw new Error("FOUNDRY_REAL_TIER1_BASELINE_CONTRACT_BREACH");

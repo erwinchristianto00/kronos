@@ -7,7 +7,7 @@ import { buildFoundryArtifact } from "../../src/research/foundry/artifact-schema
 import { buildRunManifest } from "../../src/research/contract/tournament-contract.js";
 import { loadFoundryArtifact, persistFoundryArtifact } from "../../src/research/foundry/artifact-store.js";
 import { canonicalizeFundingSettlements } from "../../src/research/foundry/funding-schedule.js";
-import { assembleTier1Baseline, assertTier1AssemblyCanRun, bindRealTier1ExperimentSpec, deriveTier1RandomControlIdentity, loadTier1Artifacts, runRealTier1Conservative, runTier1BaselineSmoke } from "../../src/research/foundry/tier1-assembler.js";
+import { assembleTier1Baseline, assertTier1AssemblyCanRun, bindRealTier1ExperimentSpec, deriveTier1RandomControl, deriveTier1RandomControlIdentity, loadTier1Artifacts, runRealTier1Conservative, runTier1BaselineSmoke } from "../../src/research/foundry/tier1-assembler.js";
 import { buildAuthoritativeTimelineArtifact, buildCanonicalEpisodeArtifact, generateMinimumHistoryEligibilityArtifact, generatePitPortfolioRiskArtifact } from "../../src/research/foundry/tier1-pit-artifacts.js";
 import { FOUNDRY_SCHEMA_V1, validateFoundryRows } from "../../src/research/foundry/semantic-validators.js";
 import { fixtureSourceProvenance, type FoundryDerivationIdentity } from "../../src/research/foundry/source-provenance.js";
@@ -87,6 +87,7 @@ describe("Tier-1 artifact assembly", () => {
     const changedAssemblySpec = structuredClone(realSpec); changedAssemblySpec.dataset.tier1AssemblyBinding!.tier1AssemblyHash = "different-assembly";
     expect(buildRunManifest({ spec: changedAssemblySpec, strategyId: "CASH", executionMode: "CONSERVATIVE", parameterSet: {}, createdAtMs: 0 }).inputHash).not.toBe(manifest.inputHash);
     expect(deriveTier1RandomControlIdentity(assembled, 1)).not.toBe(deriveTier1RandomControlIdentity(assembled, 2));
+    expect(() => deriveTier1RandomControl(assembled, 1, { startMs: 0, endMs: 2 * H })).toThrow("FOUNDRY_TIER1_RANDOM_CONTROL_RANGE_INVALID");
     const changedPolicyAssembly = assembleTier1Baseline({ artifacts, symbols, startMs: H, endMs: 2 * H, timeframeMs: H, liquidityPolicy: { ...policy, maxSpreadBps: 11 } }); assertTier1AssemblyCanRun(changedPolicyAssembly);
     expect(deriveTier1RandomControlIdentity(assembled, 1)).not.toBe(deriveTier1RandomControlIdentity(changedPolicyAssembly, 1));
     expect(Object.isFrozen(assembled)).toBe(true); expect(Object.isFrozen(assembled.canonicalCandles)).toBe(true); expect(() => (assembled.canonicalCandles as unknown as unknown[]).push({})).toThrow();
