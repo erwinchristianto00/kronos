@@ -37,6 +37,18 @@ function assertFrozenBookTickerManifest(path, expectedBundleHash) {
   return manifest;
 }
 
+function expectedDailyRepairPaths() {
+  return ["BTCUSDT", "ETHUSDT"].flatMap((symbol) => ["2023-05-16", "2023-05-17", "2023-09-22"].map((day) => `${symbol}/${symbol}-bookTicker-${day}.zip`)).sort();
+}
+
+function assertDailyRepairManifest(path, expectedBundleHash, expectedMonthlyBundleHash, study) {
+  const bytes = readFileSync(path); const manifest = JSON.parse(bytes.toString("utf8")); const paths = manifest.objects?.map((entry) => entry.relativePath) ?? [];
+  if (!bytes.toString("utf8").endsWith("\n") || manifest.schemaVersion !== "KronosFreeTier1DailyBookTickerRepair/v1" || manifest.baseMonthlyRawBundleHash !== expectedMonthlyBundleHash || manifest.scope?.objectCount !== 6 || JSON.stringify(paths) !== JSON.stringify(expectedDailyRepairPaths()) || manifest.canonicalDailyRepairBundleHash !== expectedBundleHash || sha256(Buffer.from(stable(manifest.objects))) !== expectedBundleHash) throw new Error("FREE_TIER1_BBO_DAILY_REPAIR_MANIFEST_INVALID");
+  const base = manifest.baseMonthlyAcquisitionManifest;
+  if (!base || base.uri !== `${study}/acquisition-manifests/v2/${expectedMonthlyBundleHash}.json` || !SHA.test(base.sha256) || !/^[0-9]+$/.test(base.generation)) throw new Error("FREE_TIER1_BBO_DAILY_REPAIR_PARENT_INVALID");
+  return manifest;
+}
+
 function coalescedIntervals(samples) {
   const intervals = [];
   for (const sample of samples.sort((left, right) => left.asOfMs - right.asOfMs)) {
@@ -48,9 +60,10 @@ function coalescedIntervals(samples) {
 }
 
 async function main() {
-  const rawRoot = required("RAW_ROOT"); const reportPath = required("REPORT_PATH"); const generatedAtMs = positiveInteger("GENERATED_AT_MS"); const generationSha = required("GENERATION_SHA"); const bboRawBundleHash = required("BBO_RAW_BUNDLE_HASH");
-  if (!HASH.test(bboRawBundleHash) || !SHA.test(generationSha)) throw new Error("FREE_TIER1_BBO_COVERAGE_IDENTITY_INVALID");
+  const rawRoot = required("RAW_ROOT"); const reportPath = required("REPORT_PATH"); const study = required("STUDY"); const generatedAtMs = positiveInteger("GENERATED_AT_MS"); const generationSha = required("GENERATION_SHA"); const bboRawBundleHash = required("BBO_RAW_BUNDLE_HASH"); const dailyRepairBundleHash = required("BBO_DAILY_REPAIR_BUNDLE_HASH");
+  if (!HASH.test(bboRawBundleHash) || !HASH.test(dailyRepairBundleHash) || !SHA.test(generationSha)) throw new Error("FREE_TIER1_BBO_COVERAGE_IDENTITY_INVALID");
   const rawManifestPath = resolve(rawRoot, "bbo-raw-acquisition-manifest.json"); const rawManifestBytes = readFileSync(rawManifestPath); const rawManifest = assertFrozenBookTickerManifest(rawManifestPath, bboRawBundleHash);
+  const dailyRepairManifestPath = resolve(rawRoot, "bbo-daily-repair-acquisition-manifest.json"); const dailyRepairManifestBytes = readFileSync(dailyRepairManifestPath); const dailyRepairManifest = assertDailyRepairManifest(dailyRepairManifestPath, dailyRepairBundleHash, bboRawBundleHash, study);
   const inspected = await inspectBinanceVisionUsdMRawBookTickerCoverage({ root: rawRoot, expectedCoverage: { startMs: STUDY_START_MS, endMs: STUDY_END_MS, symbols: SYMBOLS, cadenceMs: HOUR_MS }, maxQuoteAgeMs: BBO_MAX_AGE_MS });
   const byKey = new Map(inspected.samples.map((sample) => [`${sample.symbol}:${sample.asOfMs}`, sample]));
   const invalidBySymbol = Object.fromEntries(SYMBOLS.map((symbol) => [symbol, inspected.samples.filter((sample) => sample.symbol === symbol && !sample.withinMaxQuoteAge).map((sample) => ({ asOfMs: sample.asOfMs, eventTimeMs: sample.eventTimeMs, quoteAgeMs: sample.quoteAgeMs, sourceHash: sample.sourceHash }))]));
@@ -66,12 +79,17 @@ async function main() {
   }
   if (openWindowStartMs !== null) commonWindows.push({ startMs: openWindowStartMs, endMs: STUDY_END_MS, bars: (STUDY_END_MS - openWindowStartMs) / HOUR_MS });
   const reportCore = {
-    schemaVersion: "KronosFreeTier1BboCoverageAudit/v1",
+    schemaVersion: "KronosFreeTier1BboCoverageAudit/v2",
     status: commonInvalid.length ? "BBO_COVERAGE_GAPS_DETECTED_REAL_TIER1_EXECUTION_FORBIDDEN" : "BBO_COVERAGE_COMPLETE_PENDING_FOUNDRY_INGEST",
     study: { symbols: SYMBOLS, timeframeMs: HOUR_MS, startMs: STUDY_START_MS, endMs: STUDY_END_MS },
     generation: { generatedAtMs, generationSha },
     policy: { version: "binance-vision-usdm-bookticker-hourly-v3", maxQuoteAgeMs: BBO_MAX_AGE_MS, selectionRule: "latest event-time quote at or before canonical hourly decision timestamp" },
-    raw: { rawManifestSha256: sha256(rawManifestBytes), rawManifestBundleHash: rawManifest.canonicalRawBookTickerBundleHash, rawManifestObjectCount: rawManifest.objects.length, inspectedArchiveBundleHash: inspected.archiveBundle.archiveBundleHash, inspectedArchiveFileCount: inspected.archiveBundle.fileCount },
+    raw: {
+      rawManifestSha256: sha256(rawManifestBytes), rawManifestBundleHash: rawManifest.canonicalRawBookTickerBundleHash, rawManifestObjectCount: rawManifest.objects.length,
+      dailyRepairManifestSha256: sha256(dailyRepairManifestBytes), dailyRepairBundleHash: dailyRepairManifest.canonicalDailyRepairBundleHash, dailyRepairObjectCount: dailyRepairManifest.objects.length,
+      mergedRawIdentityHash: tournamentHash({ monthlyRawBundleHash: rawManifest.canonicalRawBookTickerBundleHash, dailyRepairBundleHash: dailyRepairManifest.canonicalDailyRepairBundleHash }),
+      inspectedArchiveBundleHash: inspected.archiveBundle.archiveBundleHash, inspectedArchiveFileCount: inspected.archiveBundle.fileCount,
+    },
     coverage: {
       expectedTicksPerSymbol: (STUDY_END_MS - STUDY_START_MS) / HOUR_MS,
       invalidBySymbol: Object.fromEntries(SYMBOLS.map((symbol) => [symbol, { count: invalidBySymbol[symbol].length, intervals: coalescedIntervals(invalidBySymbol[symbol]) }])),

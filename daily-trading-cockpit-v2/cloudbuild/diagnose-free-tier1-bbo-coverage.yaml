@@ -7,6 +7,7 @@ steps:
     env:
       - _STUDY=${_STUDY}
       - _BBO_RAW_BUNDLE_HASH=${_BBO_RAW_BUNDLE_HASH}
+      - _BBO_DAILY_REPAIR_BUNDLE_HASH=${_BBO_DAILY_REPAIR_BUNDLE_HASH}
     args:
       - -ceu
       - |
@@ -15,6 +16,7 @@ steps:
 
         study = os.environ["_STUDY"]
         bundle_hash = os.environ["_BBO_RAW_BUNDLE_HASH"]
+        repair_bundle_hash = os.environ["_BBO_DAILY_REPAIR_BUNDLE_HASH"]
         root = pathlib.Path("/workspace/raw")
         root.mkdir(parents=True, exist_ok=True)
 
@@ -37,6 +39,19 @@ steps:
             relative = entry["relativePath"]
             copy(canonical["uri"], str(canonical["generation"]), root / "bookTicker" / relative)
             copy(companion["uri"], str(companion["generation"]), root / "bookTicker" / f"{relative}.CHECKSUM")
+
+        repair_manifest_uri = f"{study}/acquisition-manifests/daily-repair-v1/{repair_bundle_hash}.json"
+        repair_manifest_meta = describe(repair_manifest_uri)
+        copy(repair_manifest_uri, str(repair_manifest_meta["generation"]), root / "bbo-daily-repair-acquisition-manifest.json")
+        repair_manifest = json.loads((root / "bbo-daily-repair-acquisition-manifest.json").read_text(encoding="utf8"))
+        if repair_manifest.get("schemaVersion") != "KronosFreeTier1DailyBookTickerRepair/v1" or repair_manifest.get("baseMonthlyRawBundleHash") != bundle_hash or repair_manifest.get("canonicalDailyRepairBundleHash") != repair_bundle_hash or len(repair_manifest.get("objects", [])) != 6:
+            raise RuntimeError("frozen daily BBO repair manifest is invalid")
+        for entry in repair_manifest["objects"]:
+            canonical = entry["canonical"]
+            companion = entry["companion"]
+            relative = entry["relativePath"]
+            copy(canonical["uri"], str(canonical["generation"]), root / "bookTicker-daily-repair" / "v1" / relative)
+            copy(companion["uri"], str(companion["generation"]), root / "bookTicker-daily-repair" / "v1" / f"{relative}.CHECKSUM")
         PY
   - name: node:22-bookworm
     id: audit-exact-bbo-coverage
@@ -44,9 +59,11 @@ steps:
     env:
       - RAW_ROOT=/workspace/raw
       - REPORT_PATH=/workspace/bbo-coverage-audit.json
+      - STUDY=${_STUDY}
       - GENERATED_AT_MS=${_GENERATED_AT_MS}
       - GENERATION_SHA=${_GENERATION_SHA}
       - BBO_RAW_BUNDLE_HASH=${_BBO_RAW_BUNDLE_HASH}
+      - BBO_DAILY_REPAIR_BUNDLE_HASH=${_BBO_DAILY_REPAIR_BUNDLE_HASH}
     args:
       - -ceu
       - |
@@ -88,5 +105,6 @@ timeout: 21600s
 substitutions:
   _STUDY: gs://bucket-coin-yuhu/kronos-tier1-archives/binance-vision-usdm-bookticker-free-walkforward-v1
   _BBO_RAW_BUNDLE_HASH: 3338e528944869fec5b2ce112cdeedac7aa1fe031563a141a57babf4ad39584a
+  _BBO_DAILY_REPAIR_BUNDLE_HASH: unknown
   _GENERATED_AT_MS: "1786135111584"
   _GENERATION_SHA: unknown
