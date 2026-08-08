@@ -210,6 +210,7 @@ steps:
                     source_validated = None
                     if checksum_meta is None:
                         raise RuntimeError(f"verified daily object is missing its checksum companion {name}")
+                    gcs_copy(companion_uri, str(checksum_meta["generation"]), checksum_path)
 
             if int(final_meta["size"]) != zip_path.stat().st_size or int(checksum_meta["size"]) != checksum_path.stat().st_size:
                 raise RuntimeError(f"canonical size mismatch for {name}")
