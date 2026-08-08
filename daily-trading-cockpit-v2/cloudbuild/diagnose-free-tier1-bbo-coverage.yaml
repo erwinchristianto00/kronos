@@ -81,7 +81,10 @@ steps:
 options:
   diskSizeGb: 200
   machineType: E2_HIGHCPU_8
-timeout: 10800s
+# The verified bundle is approximately 80 GB compressed. The audit streams all
+# 22 ZIPs twice at most (one serial carry chain per symbol) and must finish its
+# full source-coverage report rather than timing out mid-corpus.
+timeout: 21600s
 substitutions:
   _STUDY: gs://bucket-coin-yuhu/kronos-tier1-archives/binance-vision-usdm-bookticker-free-walkforward-v1
   _BBO_RAW_BUNDLE_HASH: 3338e528944869fec5b2ce112cdeedac7aa1fe031563a141a57babf4ad39584a
