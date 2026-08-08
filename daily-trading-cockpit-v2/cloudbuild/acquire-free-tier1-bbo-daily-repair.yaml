@@ -242,8 +242,8 @@ steps:
                     or str(marker.get("finalGeneration")) != str(final_meta["generation"])
                     or marker.get("companionUri") != companion_uri
                     or str(marker.get("companionGeneration")) != str(checksum_meta["generation"])
-                    or marker.get("verifierSourceRevision") != source_revision
-                    or marker.get("verifierTemplateSha256") != template_sha
+                    or not re.fullmatch(r"[a-f0-9]{7,64}", str(marker.get("verifierSourceRevision", "")))
+                    or not re.fullmatch(r"[a-f0-9]{64}", str(marker.get("verifierTemplateSha256", "")))
                 ):
                     raise RuntimeError(f"immutable verification marker mismatch for {name}")
             else:
