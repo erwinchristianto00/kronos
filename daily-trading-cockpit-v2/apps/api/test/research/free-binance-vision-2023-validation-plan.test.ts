@@ -47,6 +47,21 @@ describe("free Binance Vision BTCUSDT/ETHUSDT 2023 validation plan", () => {
       maximumTerminalUnresolvedPositions: 0,
       insufficientEvidenceVerdict: "INCONCLUSIVE",
     });
+    expect(plan.robustness.costFundingStress).toEqual({
+      scenarioId: "CONSERVATIVE_FEE_SLIPPAGE_AND_FUNDING_STRESS",
+      executionMode: "CONSERVATIVE",
+      takerFeeBps: 6,
+      baseSlippageBps: 3,
+      pessimisticSlippageMultiplier: 2,
+      fundingRateMultiplier: 2,
+      policy: "REPLAY_SAME_IMMUTABLE_PIT_INPUTS_WITH_ADVERSE_COST_TRANSFORM_ONLY",
+    });
+    expect(plan.robustness.candidateVerdictPolicy).toEqual({
+      requiresBaseOosAndHoldoutEvidence: true,
+      requiresCostFundingStress: true,
+      requiresParameterNeighborhoodAssessment: true,
+      verdictWhenAnyRequirementMissing: "INCONCLUSIVE",
+    });
   });
 
   it("uses fixed 120d/30d/30d windows and purges plus embargoes every tactical challenger horizon", () => {
@@ -81,8 +96,20 @@ describe("free Binance Vision BTCUSDT/ETHUSDT 2023 validation plan", () => {
     expect(Object.isFrozen(plan.scope)).toBe(true);
     expect(Object.isFrozen(plan.scope.symbols)).toBe(true);
     expect(Object.isFrozen(plan.executionPolicy.baselineAllowlist)).toBe(true);
+    expect(Object.isFrozen(plan.robustness.parameterNeighborhoods.DONCHIAN)).toBe(true);
     expect(artifactHash).toBe(tournamentHash(payload));
     expect(() => assertFreeBinanceVision2023ValidationPlan()).not.toThrow();
+  });
+
+  it("predeclares adverse cost/funding and one-axis tactical neighborhoods before data results exist", () => {
+    const plan = FREE_BINANCE_VISION_2023_05_TO_2024_03_VALIDATION_PLAN;
+    expect(plan.robustness.costFundingStress.takerFeeBps).toBeGreaterThanOrEqual(plan.tier1ConservativeExecution.takerFeeBps);
+    expect(plan.robustness.costFundingStress.baseSlippageBps).toBeGreaterThanOrEqual(plan.tier1ConservativeExecution.baseSlippageBps);
+    expect(plan.robustness.costFundingStress.fundingRateMultiplier).toBeGreaterThanOrEqual(1);
+    for (const parameterSets of Object.values(plan.robustness.parameterNeighborhoods).filter(Array.isArray)) {
+      expect(parameterSets).toHaveLength(7);
+      expect(parameterSets.every((parameters) => parameters.maxHoldBars === FREE_BINANCE_VISION_2023_05_TO_2024_03_MAX_TACTICAL_HOLD_BARS)).toBe(true);
+    }
   });
 
   it("produces at least three sealed-safe OOS folds before its held-out interval", () => {
