@@ -76,7 +76,8 @@ async function main() {
   const commonInvalid = [];
   const commonWindows = [];
   let openWindowStartMs = null;
-  for (let asOfMs = STUDY_START_MS; asOfMs < STUDY_END_MS; asOfMs += HOUR_MS) {
+  for (let openTimeMs = STUDY_START_MS; openTimeMs < STUDY_END_MS; openTimeMs += HOUR_MS) {
+    const asOfMs = openTimeMs + HOUR_MS - 1;
     const observations = SYMBOLS.map((symbol) => byKey.get(`${symbol}:${asOfMs}`));
     const valid = observations.every((sample) => sample?.withinMaxQuoteAge === true);
     if (valid) { if (openWindowStartMs === null) openWindowStartMs = asOfMs; continue; }
@@ -89,7 +90,7 @@ async function main() {
     status: commonInvalid.length ? "BBO_COVERAGE_GAPS_DETECTED_REAL_TIER1_EXECUTION_FORBIDDEN" : "BBO_COVERAGE_COMPLETE_PENDING_FOUNDRY_INGEST",
     study: { symbols: SYMBOLS, timeframeMs: HOUR_MS, startMs: STUDY_START_MS, endMs: STUDY_END_MS },
     generation: { generatedAtMs, generationSha },
-    policy: { version: "binance-vision-usdm-bookticker-hourly-v3", maxQuoteAgeMs: BBO_MAX_AGE_MS, selectionRule: "latest event-time quote at or before canonical hourly decision timestamp" },
+    policy: { version: "binance-vision-usdm-bookticker-hourly-v4", maxQuoteAgeMs: BBO_MAX_AGE_MS, decisionTimeRule: "completed_candle_close_ms", selectionRule: "latest event-time quote at or before each completed-candle close decision timestamp" },
     raw: {
       rawManifestSha256: sha256(rawManifestBytes), rawManifestBundleHash: rawManifest.canonicalRawBookTickerBundleHash, rawManifestObjectCount: rawManifest.objects.length,
       dailyRepairManifestSha256: sha256(dailyRepairManifestBytes), dailyRepairBundleHash: dailyRepairManifest.canonicalDailyRepairBundleHash, dailyRepairObjectCount: dailyRepairManifest.objects.length,

@@ -39,6 +39,16 @@ describe("Foundry semantic strictness", () => {
     expect(() => base([candle(0), { ...candle(0), close: 101 }])).toThrow("FOUNDRY_DUPLICATE_OR_CONFLICTING_ROW");
   });
 
+  it("treats PIT liquidity coverage as completed-candle decision timestamps", () => {
+    const coverage = { startMs: 0, endMs: 2 * H, symbols: ["BTCUSDT"], cadenceMs: H, maxSnapshotAgeMs: H };
+    const built = buildFoundryArtifactManifest({ artifactKind: "PIT_LIQUIDITY_SPREAD", schemaVersion: FOUNDRY_SCHEMA_V1, source: "fixture-close-decision-bbo", sourceProvenance: fixtureSourceProvenance("fixture-close-decision-bbo", "0000000"), units: { decisionTime: "completed_candle_close" }, generatedAtMs: 1, generationSha: "sha", expectedCoverage: coverage, rows: [
+      { symbol: "BTCUSDT", asOfMs: H - 1, validUntilMs: H - 1, volume: 1, liquidityNotional: 100, spreadBps: 1, sourceHash: "close-1" },
+      { symbol: "BTCUSDT", asOfMs: 2 * H - 1, validUntilMs: 2 * H - 1, volume: 1, liquidityNotional: 100, spreadBps: 1, sourceHash: "close-2" },
+    ] });
+    expect(() => assertCompleteFoundryArtifact(built)).not.toThrow();
+    expect(built.derivedCoverage.perSymbolGaps).toEqual({});
+  });
+
   it("binds semantic identity to kind/schema/source/units/coverage as well as normalized rows", () => {
     const rows = [candle(0), candle(H)]; const first = base(rows); const sourceChanged = base(rows, "other-source"); const coverageChanged = base(rows, "fixture", { ...expected, endMs: 3 * H });
     expect(first.rowsHash).toBe(sourceChanged.rowsHash);
@@ -124,7 +134,7 @@ describe("Foundry semantic strictness", () => {
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
-  it("streams checksum-verified Binance Vision bookTicker ZIPs into exact canonical hourly PIT marks", async () => {
+  it("streams checksum-verified Binance Vision bookTicker ZIPs into exact completed-candle PIT marks", async () => {
     const root = mkdtempSync(join(tmpdir(), "foundry-binance-vision-bookticker-")); const monthStartMs = Date.UTC(2023, 4, 1); const startMs = Date.UTC(2023, 4, 16, 12); const endMs = startMs + 2 * H;
     const archive = (zipPath: string, body: string) => {
       const source = `${zipPath}.csv`; writeFileSync(source, body); execFileSync("zip", ["-j", zipPath, source], { stdio: "ignore" }); unlinkSync(source);
@@ -137,21 +147,24 @@ describe("Foundry semantic strictness", () => {
       // Binance Vision's bookTicker exports are not guaranteed to be event-time
       // ordered. The sampler must choose the latest source quote per tick, not
       // depend on file row order.
-      // This is the first BTCUSDT source mark in the real May-2023 archive:
-      // its 13-digit event timestamp is 26 ms before the 12:00 canonical tick
-      // and its 13-digit update ID must not be rounded by the awk wire format.
+      // The 13-digit update ID must not be rounded by the awk wire format. A
+      // quote at the next open belongs to the next candle-close decision, not
+      // the just-completed bar.
       archive(join(bboDirectory, "BTCUSDT-bookTicker-2023-05.zip"), `update_id,best_bid_price,best_bid_qty,best_ask_price,best_ask_qty,transaction_time,event_time\n3,102,6,103,7,${startMs + H + 1},${startMs + H + 1}\n1,100,2,101,3,${monthStartMs + 1},${monthStartMs + 1}\n2850015973062,100,2,101,3,${startMs - 26},${startMs - 26}\n2,101,4,102,5,${startMs + 1},${startMs + 1}\n`);
       const coverage = { startMs, endMs, symbols: ["BTCUSDT"], cadenceMs: H }; const candleRoot = join(root, "klines"); const candleBundle = inspectArchiveBundle({ root: candleRoot, include: (path) => path.endsWith(".zip") || path.endsWith(".zip.CHECKSUM") });
       const candles = importBinanceVisionUsdMRawCandleArchive({ root: candleRoot, expectedCoverage: coverage, source: "Binance Vision kline", sourceProvenance: provenance(candleBundle.archiveBundleHash), generatedAtMs: 1, generationSha: "abcdef0" });
       const priorCandles = importBinanceVisionUsdMRawCandleArchive({ root: candleRoot, expectedCoverage: { ...coverage, startMs: monthStartMs }, source: "Binance Vision kline plus prior bar", sourceProvenance: provenance(candleBundle.archiveBundleHash), generatedAtMs: 1, generationSha: "abcdef0" });
       const bboBundle = inspectArchiveBundle({ root, include: (path) => (path.startsWith("bookTicker/") || path.startsWith("klines/")) && (path.endsWith(".zip") || path.endsWith(".zip.CHECKSUM")) });
       const imported = await importBinanceVisionUsdMRawBookTickerLiquidityArchive({ root, expectedCoverage: coverage, candleRows: priorCandles.rows as never[], maxQuoteAgeMs: H, source: "Binance Vision BBO plus completed volume", sourceProvenance: provenance(bboBundle.archiveBundleHash), generatedAtMs: 1, generationSha: "abcdef0" });
-      expect(imported.rows).toEqual(expect.arrayContaining([expect.objectContaining({ asOfMs: startMs, validUntilMs: startMs + H - 1, volume: 7, liquidityNotional: 200 }), expect.objectContaining({ asOfMs: startMs + H, volume: 8, liquidityNotional: 404 })]));
+      expect(imported.rows).toEqual(expect.arrayContaining([expect.objectContaining({ asOfMs: startMs + H - 1, validUntilMs: startMs + H - 1, volume: 8, liquidityNotional: 404 }), expect.objectContaining({ asOfMs: startMs + 2 * H - 1, volume: 9, liquidityNotional: 612 })]));
       expect(imported.manifest.archiveBundle?.archiveBundleHash).toBe(bboBundle.archiveBundleHash);
       const inspected = await inspectBinanceVisionUsdMRawBookTickerCoverage({ root, expectedCoverage: coverage, maxQuoteAgeMs: H });
       expect(inspected.archiveBundle.files.map((file) => file.relativePath)).toEqual(["bookTicker/BTCUSDT/BTCUSDT-bookTicker-2023-05.zip", "bookTicker/BTCUSDT/BTCUSDT-bookTicker-2023-05.zip.CHECKSUM"]);
-      expect(inspected.samples.map((sample) => [sample.asOfMs, sample.quoteAgeMs, sample.withinMaxQuoteAge])).toEqual([[startMs, 26, true], [startMs + H, H - 1, true]]);
+      expect(inspected.samples.map((sample) => [sample.asOfMs, sample.quoteAgeMs, sample.withinMaxQuoteAge])).toEqual([[startMs + H - 1, H - 2, true], [startMs + 2 * H - 1, H - 2, true]]);
       await expect(importBinanceVisionUsdMRawBookTickerLiquidityArchive({ root, expectedCoverage: coverage, candleRows: priorCandles.rows as never[], maxQuoteAgeMs: 0, source: "Binance Vision BBO plus completed volume", sourceProvenance: provenance(bboBundle.archiveBundleHash), generatedAtMs: 1, generationSha: "abcdef0" })).rejects.toThrow("FOUNDRY_BINANCE_VISION_BOOKTICKER_PIT_INVALID");
+      archive(join(bboDirectory, "BTCUSDT-bookTicker-2023-05.zip"), `update_id,best_bid_price,best_bid_qty,best_ask_price,best_ask_qty,transaction_time,event_time\n1,100,2,101,3,${startMs - 2},${startMs - 2}\n`);
+      const closeStaleBundle = inspectArchiveBundle({ root, include: (path) => (path.startsWith("bookTicker/") || path.startsWith("klines/")) && (path.endsWith(".zip") || path.endsWith(".zip.CHECKSUM")) });
+      await expect(importBinanceVisionUsdMRawBookTickerLiquidityArchive({ root, expectedCoverage: coverage, candleRows: priorCandles.rows as never[], maxQuoteAgeMs: H, source: "Binance Vision BBO plus completed volume", sourceProvenance: provenance(closeStaleBundle.archiveBundleHash), generatedAtMs: 1, generationSha: "abcdef0" })).rejects.toThrow("FOUNDRY_BINANCE_VISION_BOOKTICKER_PIT_INVALID");
       archive(join(bboDirectory, "BTCUSDT-bookTicker-2023-05.zip"), "unexpected,headers\n");
       const malformedBundle = inspectArchiveBundle({ root, include: (path) => (path.startsWith("bookTicker/") || path.startsWith("klines/")) && (path.endsWith(".zip") || path.endsWith(".zip.CHECKSUM")) });
       await expect(importBinanceVisionUsdMRawBookTickerLiquidityArchive({ root, expectedCoverage: coverage, candleRows: priorCandles.rows as never[], maxQuoteAgeMs: H, source: "Binance Vision BBO plus completed volume", sourceProvenance: provenance(malformedBundle.archiveBundleHash), generatedAtMs: 1, generationSha: "abcdef0" })).rejects.toThrow("FOUNDRY_BINANCE_VISION_BOOKTICKER_PARSE_INVALID");
@@ -159,7 +172,7 @@ describe("Foundry semantic strictness", () => {
   });
 
   it("overlays an immutable daily bookTicker repair only where it has a real event", async () => {
-    const root = mkdtempSync(join(tmpdir(), "foundry-binance-vision-bookticker-repair-")); const dayStartMs = Date.UTC(2023, 4, 16); const startMs = dayStartMs; const endMs = startMs + 3 * H;
+    const root = mkdtempSync(join(tmpdir(), "foundry-binance-vision-bookticker-repair-")); const dayStartMs = Date.UTC(2023, 4, 16); const startMs = dayStartMs; const endMs = startMs + 2 * H;
     const archive = (zipPath: string, body: string) => {
       const source = `${zipPath}.csv`; writeFileSync(source, body); execFileSync("zip", ["-j", zipPath, source], { stdio: "ignore" }); unlinkSync(source);
       const hash = createHash("sha256").update(readFileSync(zipPath)).digest("hex"); writeFileSync(`${zipPath}.CHECKSUM`, `${hash}  ${basename(zipPath)}\n`);
@@ -174,9 +187,9 @@ describe("Foundry semantic strictness", () => {
       archive(join(repairDirectory, "BTCUSDT-bookTicker-2023-05-16.zip"), `update_id,best_bid_price,best_bid_qty,best_ask_price,best_ask_qty,transaction_time,event_time\n1,110,2,111,3,${startMs + 1},${startMs + 1}\n2,120,2,121,3,${startMs + H + 1},${startMs + H + 1}\n`);
       const coverage = { startMs, endMs, symbols: ["BTCUSDT"], cadenceMs: H }; const bundle = inspectArchiveBundle({ root, include: (path) => (path.startsWith("bookTicker/") || path.startsWith("bookTicker-daily-repair/") || path.startsWith("klines/")) && (path.endsWith(".zip") || path.endsWith(".zip.CHECKSUM")) }); const provenance = { provenanceType: "EXCHANGE_HISTORICAL_EXPORT" as const, provider: "Binance Vision", exchange: "BINANCE_USD_M", datasetId: "monthly-plus-daily-bookticker-repair-fixture", retrievedAtMs: 1, rawFileHash: bundle.archiveBundleHash, schemaVersion: "binance-vision-bookTicker-csv-v1", generationToolSha: "abcdef0" };
       const imported = await importBinanceVisionUsdMRawBookTickerLiquidityArchive({ root, expectedCoverage: coverage, candleRows: [{ symbol: "BTCUSDT", openTimeMs: startMs - H, closeTimeMs: startMs - 1, volume: 7, sourceHash: "prior-1" }, { symbol: "BTCUSDT", openTimeMs: startMs, closeTimeMs: startMs + H - 1, volume: 8, sourceHash: "prior-2" }, { symbol: "BTCUSDT", openTimeMs: startMs + H, closeTimeMs: startMs + 2 * H - 1, volume: 9, sourceHash: "prior-3" }] as never[], maxQuoteAgeMs: H, source: "Binance Vision monthly plus daily repair", sourceProvenance: provenance, generatedAtMs: 1, generationSha: "abcdef0" });
-      expect(imported.rows).toEqual([expect.objectContaining({ asOfMs: startMs, liquidityNotional: 200 }), expect.objectContaining({ asOfMs: startMs + H, liquidityNotional: 260 }), expect.objectContaining({ asOfMs: startMs + 2 * H, liquidityNotional: 240 })]);
+      expect(imported.rows).toEqual([expect.objectContaining({ asOfMs: startMs + H - 1, liquidityNotional: 260 }), expect.objectContaining({ asOfMs: startMs + 2 * H - 1, liquidityNotional: 240 })]);
       const inspected = await inspectBinanceVisionUsdMRawBookTickerCoverage({ root, expectedCoverage: coverage, maxQuoteAgeMs: H });
-      expect(inspected.samples.map((sample) => [sample.asOfMs, sample.withinMaxQuoteAge])).toEqual([[startMs, true], [startMs + H, true], [startMs + 2 * H, true]]);
+      expect(inspected.samples.map((sample) => [sample.asOfMs, sample.withinMaxQuoteAge])).toEqual([[startMs + H - 1, true], [startMs + 2 * H - 1, true]]);
       expect(inspected.archiveBundle.files.map((file) => file.relativePath)).toEqual(expect.arrayContaining(["bookTicker-daily-repair/v1/BTCUSDT/BTCUSDT-bookTicker-2023-05-16.zip"]));
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
@@ -203,17 +216,18 @@ describe("Foundry semantic strictness", () => {
     };
     try {
       const bboDirectory = join(root, "bookTicker", "BTCUSDT"); mkdirSync(bboDirectory, { recursive: true });
-      archive(join(bboDirectory, "BTCUSDT-bookTicker-2023-05.zip"), `update_id,best_bid_price,best_bid_qty,best_ask_price,best_ask_qty,transaction_time,event_time\n1,99,1,100,1,${monthStartMs + 1},${monthStartMs + 1}\n2,100,2,101,3,${startMs - 1},${startMs - 1}\n3,101,4,102,5,${startMs + 1},${startMs + 1}\n4,102,6,103,7,${startMs + H + 1},${startMs + H + 1}\n5,103,8,104,9,${startMs + 2 * H - 3},${startMs + 2 * H - 3}\n`);
+      archive(join(bboDirectory, "BTCUSDT-bookTicker-2023-05.zip"), `update_id,best_bid_price,best_bid_qty,best_ask_price,best_ask_qty,transaction_time,event_time\n1,99,1,100,1,${monthStartMs + 1},${monthStartMs + 1}\n2,100,2,101,3,${startMs - 1},${startMs - 1}\n3,101,4,102,5,${startMs + 1},${startMs + 1}\n4,102,6,103,7,${startMs + H + 1},${startMs + H + 1}\n5,103,8,104,9,${startMs + 2 * H + 3},${startMs + 2 * H + 3}\n`);
       const bundle = inspectArchiveBundle({ root, include: (path) => path.startsWith("bookTicker/") && (path.endsWith(".zip") || path.endsWith(".zip.CHECKSUM")) });
       const rows = (await importBinanceVisionUsdMRawBookTickerLiquidityArchive({ root, expectedCoverage: { startMs, endMs, symbols: ["BTCUSDT"], cadenceMs: H }, candleRows: [
         { symbol: "BTCUSDT", openTimeMs: startMs - H, closeTimeMs: startMs - 1, volume: 7, sourceHash: "prior-13" },
         { symbol: "BTCUSDT", openTimeMs: startMs, closeTimeMs: startMs + H - 1, volume: 8, sourceHash: "prior-14" },
         { symbol: "BTCUSDT", openTimeMs: startMs + H, closeTimeMs: startMs + 2 * H - 1, volume: 9, sourceHash: "prior-15" },
+        { symbol: "BTCUSDT", openTimeMs: startMs + 2 * H, closeTimeMs: startMs + 3 * H - 1, volume: 10, sourceHash: "prior-16" },
       ] as never[], maxQuoteAgeMs: H, source: "Binance Vision BBO exact-tick-key", sourceProvenance: { provenanceType: "EXCHANGE_HISTORICAL_EXPORT", provider: "Binance Vision", exchange: "BINANCE_USD_M", datasetId: "bookTicker-exact-tick-key-fixture", retrievedAtMs: 1, rawFileHash: bundle.archiveBundleHash, schemaVersion: "binance-vision-bookTicker-csv-v1", generationToolSha: "abcdef0" }, generatedAtMs: 1, generationSha: "abcdef0" })).rows as Array<{ asOfMs: number; liquidityNotional: number }>;
       expect(rows).toEqual([
-        expect.objectContaining({ asOfMs: startMs, liquidityNotional: 200 }),
-        expect.objectContaining({ asOfMs: startMs + H, liquidityNotional: 404 }),
-        expect.objectContaining({ asOfMs: startMs + 2 * H, liquidityNotional: 824 }),
+        expect.objectContaining({ asOfMs: startMs + H - 1, liquidityNotional: 404 }),
+        expect.objectContaining({ asOfMs: startMs + 2 * H - 1, liquidityNotional: 612 }),
+        expect.objectContaining({ asOfMs: startMs + 3 * H - 1, liquidityNotional: 824 }),
       ]);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
@@ -246,21 +260,21 @@ describe("Foundry semantic strictness", () => {
     };
     try {
       const klineDirectory = join(root, "klines", "BTCUSDT", "1h"); const bboDirectory = join(root, "bookTicker", "BTCUSDT"); mkdirSync(klineDirectory, { recursive: true }); mkdirSync(bboDirectory, { recursive: true });
-      archive(join(klineDirectory, "BTCUSDT-1h-2023-05.zip"), `open_time,open,high,low,close,volume,close_time,quote_volume,count,taker_buy_volume,taker_buy_quote_volume,ignore\n${juneStartMs - H},100,101,99,100,7,${juneStartMs - 1},700,4,3,300,0\n`);
+      archive(join(klineDirectory, "BTCUSDT-1h-2023-05.zip"), `open_time,open,high,low,close,volume,close_time,quote_volume,count,taker_buy_volume,taker_buy_quote_volume,ignore\n${juneStartMs},100,101,99,100,7,${juneStartMs + H - 1},700,4,3,300,0\n${juneStartMs + H},100,101,99,100,8,${juneStartMs + 2 * H - 1},800,5,4,400,0\n`);
       // The verified Binance Vision May-2023 archive has one boundary-tail row
       // at the next month's first millisecond. It must be ignored rather than
       // becoming a future carry for June's first canonical mark.
-      archive(join(bboDirectory, "BTCUSDT-bookTicker-2023-05.zip"), `update_id,best_bid_price,best_bid_qty,best_ask_price,best_ask_qty,transaction_time,event_time\n1,100,2,101,3,${juneStartMs - 1_000},${juneStartMs - 1_000}\n99,1000,20,1001,20,${juneStartMs + 1},${juneStartMs + 1}\n`);
-      archive(join(bboDirectory, "BTCUSDT-bookTicker-2023-06.zip"), `update_id,best_bid_price,best_bid_qty,best_ask_price,best_ask_qty,transaction_time,event_time\n2,101,4,102,5,${juneStartMs + 8},${juneStartMs + 8}\n`);
-      const coverage = { startMs: juneStartMs, endMs: juneStartMs + H, symbols: ["BTCUSDT"], cadenceMs: H }; const bundle = inspectArchiveBundle({ root, include: (path) => (path.startsWith("bookTicker/") || path.startsWith("klines/")) && (path.endsWith(".zip") || path.endsWith(".zip.CHECKSUM")) });
+      archive(join(bboDirectory, "BTCUSDT-bookTicker-2023-05.zip"), `update_id,best_bid_price,best_bid_qty,best_ask_price,best_ask_qty,transaction_time,event_time\n1,100,2,101,3,${juneStartMs - 1},${juneStartMs - 1}\n99,1000,20,1001,20,${juneStartMs + 1},${juneStartMs + 1}\n`);
+      archive(join(bboDirectory, "BTCUSDT-bookTicker-2023-06.zip"), `update_id,best_bid_price,best_bid_qty,best_ask_price,best_ask_qty,transaction_time,event_time\n2,101,4,102,5,${juneStartMs + H + 8},${juneStartMs + H + 8}\n`);
+      const coverage = { startMs: juneStartMs, endMs: juneStartMs + 2 * H, symbols: ["BTCUSDT"], cadenceMs: H }; const bundle = inspectArchiveBundle({ root, include: (path) => (path.startsWith("bookTicker/") || path.startsWith("klines/")) && (path.endsWith(".zip") || path.endsWith(".zip.CHECKSUM")) });
       const provenance = { provenanceType: "EXCHANGE_HISTORICAL_EXPORT" as const, provider: "Binance Vision", exchange: "BINANCE_USD_M", datasetId: "monthly-bookticker-boundary-fixture", retrievedAtMs: 1, rawFileHash: bundle.archiveBundleHash, schemaVersion: "binance-vision-bookTicker-csv-v1", generationToolSha: "abcdef0" };
-      const [row] = (await importBinanceVisionUsdMRawBookTickerLiquidityArchive({ root, expectedCoverage: coverage, candleRows: [{ symbol: "BTCUSDT", openTimeMs: juneStartMs - H, closeTimeMs: juneStartMs - 1, volume: 7, sourceHash: "prior-candle" }] as never[], maxQuoteAgeMs: H, source: "Binance Vision BBO boundary", sourceProvenance: provenance, generatedAtMs: 1, generationSha: "abcdef0" })).rows;
-      expect(row).toMatchObject({ asOfMs: juneStartMs, volume: 7, liquidityNotional: 200 });
+      const rows = (await importBinanceVisionUsdMRawBookTickerLiquidityArchive({ root, expectedCoverage: coverage, candleRows: [{ symbol: "BTCUSDT", openTimeMs: juneStartMs, closeTimeMs: juneStartMs + H - 1, volume: 7, sourceHash: "first-candle" }, { symbol: "BTCUSDT", openTimeMs: juneStartMs + H, closeTimeMs: juneStartMs + 2 * H - 1, volume: 8, sourceHash: "second-candle" }] as never[], maxQuoteAgeMs: H, source: "Binance Vision BBO boundary", sourceProvenance: provenance, generatedAtMs: 1, generationSha: "abcdef0" })).rows;
+      expect(rows).toEqual([expect.objectContaining({ asOfMs: juneStartMs + H - 1, volume: 7, liquidityNotional: 200 }), expect.objectContaining({ asOfMs: juneStartMs + 2 * H - 1, volume: 8, liquidityNotional: 404 })]);
       const inspected = await inspectBinanceVisionUsdMRawBookTickerCoverage({ root, expectedCoverage: coverage, maxQuoteAgeMs: H });
-      expect(inspected.samples).toEqual([expect.objectContaining({ symbol: "BTCUSDT", asOfMs: juneStartMs, eventTimeMs: juneStartMs - 1_000, quoteAgeMs: 1_000, withinMaxQuoteAge: true })]);
-      archive(join(bboDirectory, "BTCUSDT-bookTicker-2023-05.zip"), `update_id,best_bid_price,best_bid_qty,best_ask_price,best_ask_qty,transaction_time,event_time\n1,100,2,101,3,${juneStartMs - 1_000},${juneStartMs - 1_000}\n99,1000,20,1001,20,${juneStartMs + 1_001},${juneStartMs + 1_001}\n`);
+      expect(inspected.samples).toEqual([expect.objectContaining({ symbol: "BTCUSDT", asOfMs: juneStartMs + H - 1, eventTimeMs: juneStartMs - 1, quoteAgeMs: H, withinMaxQuoteAge: true }), expect.objectContaining({ symbol: "BTCUSDT", asOfMs: juneStartMs + 2 * H - 1, eventTimeMs: juneStartMs + H + 8, quoteAgeMs: H - 9, withinMaxQuoteAge: true })]);
+      archive(join(bboDirectory, "BTCUSDT-bookTicker-2023-05.zip"), `update_id,best_bid_price,best_bid_qty,best_ask_price,best_ask_qty,transaction_time,event_time\n1,100,2,101,3,${juneStartMs - 1},${juneStartMs - 1}\n99,1000,20,1001,20,${juneStartMs + 1_001},${juneStartMs + 1_001}\n`);
       const invalidBundle = inspectArchiveBundle({ root, include: (path) => (path.startsWith("bookTicker/") || path.startsWith("klines/")) && (path.endsWith(".zip") || path.endsWith(".zip.CHECKSUM")) });
-      await expect(importBinanceVisionUsdMRawBookTickerLiquidityArchive({ root, expectedCoverage: coverage, candleRows: [{ symbol: "BTCUSDT", openTimeMs: juneStartMs - H, closeTimeMs: juneStartMs - 1, volume: 7, sourceHash: "prior-candle" }] as never[], maxQuoteAgeMs: H, source: "Binance Vision BBO boundary", sourceProvenance: { ...provenance, rawFileHash: invalidBundle.archiveBundleHash }, generatedAtMs: 1, generationSha: "abcdef0" })).rejects.toThrow("FOUNDRY_BINANCE_VISION_BOOKTICKER_PARSE_INVALID");
+      await expect(importBinanceVisionUsdMRawBookTickerLiquidityArchive({ root, expectedCoverage: coverage, candleRows: [{ symbol: "BTCUSDT", openTimeMs: juneStartMs, closeTimeMs: juneStartMs + H - 1, volume: 7, sourceHash: "first-candle" }, { symbol: "BTCUSDT", openTimeMs: juneStartMs + H, closeTimeMs: juneStartMs + 2 * H - 1, volume: 8, sourceHash: "second-candle" }] as never[], maxQuoteAgeMs: H, source: "Binance Vision BBO boundary", sourceProvenance: { ...provenance, rawFileHash: invalidBundle.archiveBundleHash }, generatedAtMs: 1, generationSha: "abcdef0" })).rejects.toThrow("FOUNDRY_BINANCE_VISION_BOOKTICKER_PARSE_INVALID");
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 });

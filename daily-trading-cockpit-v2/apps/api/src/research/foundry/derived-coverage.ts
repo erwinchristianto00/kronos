@@ -78,9 +78,13 @@ export function deriveFoundryCoverage(kind: FoundryArtifactKind, rows: readonly 
       const timestamps = new Set(symbolRows.map((row) => row.timestampMs));
       for (let time = expected.startMs; time < expected.endMs; time += cadenceMs) if (!timestamps.has(time)) gaps.push({ startMs: time, endMs: Math.min(time + cadenceMs, expected.endMs), reason: "CANDLE_GAP" });
     } else if (expected.maxSnapshotAgeMs !== undefined) {
+      // Liquidity is consumed by strategy decisions at the completed candle
+      // close. Its artifact range remains aligned to the canonical candle-open
+      // range, while each source-backed BBO row is keyed by that decision time.
+      const decisionOffsetMs = kind === "PIT_LIQUIDITY_SPREAD" && cadenceMs ? cadenceMs - 1 : 0;
       for (let time = expected.startMs; time < expected.endMs; time += Math.max(1, expected.cadenceMs ?? expected.maxSnapshotAgeMs)) {
-        const latest = [...symbolRows].reverse().find((row) => row.timestampMs <= time);
-        if (!latest || time - latest.timestampMs > expected.maxSnapshotAgeMs) gaps.push({ startMs: time, endMs: Math.min(time + (expected.cadenceMs ?? expected.maxSnapshotAgeMs), expected.endMs), reason: "PIT_SNAPSHOT_STALE_OR_MISSING" });
+        const decisionTimeMs = time + decisionOffsetMs; const latest = [...symbolRows].reverse().find((row) => row.timestampMs <= decisionTimeMs);
+        if (!latest || decisionTimeMs - latest.timestampMs > expected.maxSnapshotAgeMs) gaps.push({ startMs: time, endMs: Math.min(time + (expected.cadenceMs ?? expected.maxSnapshotAgeMs), expected.endMs), reason: "PIT_SNAPSHOT_STALE_OR_MISSING" });
       }
     } else {
       if (symbolRows[0]!.timestampMs > expected.startMs) gaps.push({ startMs: expected.startMs, endMs: symbolRows[0]!.timestampMs, reason: "LEADING_GAP" });

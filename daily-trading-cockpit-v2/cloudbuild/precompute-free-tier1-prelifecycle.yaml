@@ -284,14 +284,14 @@ steps:
         print(json.dumps({"status": "PASS", "report": report_target, "reportHash": payload["reportHash"], "publication": publication_target, "publicationHash": publication_hash}, sort_keys=True))
         PY
   # OOS is persisted and re-read from immutable GCS before the sealed holdout
-  # process is even started.  Both use only the verified local staging from the
-  # preceding Foundry build and never accept a caller market-data payload.
+  # process is even started. Both use only the immutable Foundry artifact copy
+  # downloaded back from GCS after the persist-and-reload verification step.
   - name: node:22-bookworm
     id: run-oos-walk-forward
     entrypoint: bash
     env:
       - RAW_ROOT=/workspace/raw
-      - ARTIFACT_ROOT=/workspace/foundry-artifacts
+      - ARTIFACT_ROOT=/workspace/foundry-reload
       - FOUNDRY_REPORT_PATH=/workspace/prelifecycle-report-gcs-reloaded.json
       - RUN_ROOT=/workspace/oos-runs
       - REPORT_PATH=/workspace/oos-freeze.json
@@ -378,7 +378,7 @@ steps:
     entrypoint: bash
     env:
       - RAW_ROOT=/workspace/raw
-      - ARTIFACT_ROOT=/workspace/foundry-artifacts
+      - ARTIFACT_ROOT=/workspace/foundry-reload
       - FOUNDRY_REPORT_PATH=/workspace/prelifecycle-report-gcs-reloaded.json
       - OOS_FREEZE_REPORT_PATH=/workspace/oos-freeze-gcs-reloaded.json
       - RUN_ROOT=/workspace/holdout-runs
@@ -467,7 +467,7 @@ steps:
     entrypoint: bash
     env:
       - RAW_ROOT=/workspace/raw
-      - ARTIFACT_ROOT=/workspace/foundry-artifacts
+      - ARTIFACT_ROOT=/workspace/foundry-reload
       - FOUNDRY_REPORT_PATH=/workspace/prelifecycle-report-gcs-reloaded.json
       - OOS_FREEZE_REPORT_PATH=/workspace/oos-freeze-gcs-reloaded.json
       - SEALED_HOLDOUT_REPORT_PATH=/workspace/sealed-holdout-gcs-reloaded.json
