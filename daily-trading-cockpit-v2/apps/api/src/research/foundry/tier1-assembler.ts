@@ -14,6 +14,7 @@ import { PointInTimeLiquiditySpread, type Tier1LiquiditySpreadPolicy } from "./l
 import { verifyArchiveBundle } from "./archive-bundle.js";
 import { runTournamentMatrix, type TournamentMatrixResult } from "../tournament-runner.js";
 import { canonicalPostTradeEpisodePolicy } from "../post-trade-episodes.js";
+import { assertNoValidationLeakage, buildWalkForwardPlan, type WalkForwardFold } from "../validation/walk-forward.js";
 import type { FundingSettlement, PointInTimeUniverseSnapshot, TournamentCandle, TournamentEpisodePolicy, TournamentExperimentSpec, TournamentResearchMode } from "../tournament-types.js";
 import { buyAndHoldStrategy, cashStrategy, donchianStrategy, emaCrossStrategy, equalWeightHoldStrategy, macdStrategy, randomTimingControl, rsiMeanReversionStrategy, type RandomControlReference } from "../strategies/challengers.js";
 
@@ -148,6 +149,29 @@ function fundingSettlementsFromRows(rows: readonly ValidatedFoundryRow[]): Fundi
   return rows.map((row) => ({ symbol: row.symbol!, canonicalSettlementTimeMs: row.canonicalSettlementTimeMs as number, observedSettlementTimeMs: row.observedSettlementTimeMs as number, alignmentOffsetMs: row.alignmentOffsetMs as number, scheduleSourceHash: row.scheduleSourceHash as string, rate: row.rate as number, sourceHash: row.sourceHash }));
 }
 
+function assertVerifiedRealAssembly(assembly: Tier1Assembly): void {
+  const verifiedInputs = verifiedRealAssemblyInputs.get(assembly);
+  if (assembly.researchMode !== "REAL_TIER1" || !verifiedRealAssemblies.has(assembly) || !verifiedInputs) throw new Error("FOUNDRY_REAL_TIER1_ASSEMBLY_NOT_PROVENANCE_VERIFIED");
+  for (const artifact of verifiedInputs.foundryArtifacts) loadFoundryArtifact(artifact);
+  assertRealTier1ArtifactProvenance(verifiedInputs.provenanceArtifacts, verifiedInputs.archiveRoots);
+  assertTier1AssemblyCanRun(assembly);
+}
+
+function baselineStrategies(assembly: Tier1Assembly, spec: TournamentExperimentSpec, range?: { startMs: number; endMs: number }) {
+  const random = deriveTier1RandomControl(assembly, spec.randomSeed, range);
+  return {
+    random,
+    strategies: [cashStrategy(), buyAndHoldStrategy(), equalWeightHoldStrategy(), donchianStrategy(), macdStrategy(), emaCrossStrategy(), rsiMeanReversionStrategy(), randomTimingControl({ reference: random.reference, eligibleEntryTimesBySymbol: random.eligibleEntryTimesBySymbol, seed: spec.randomSeed })],
+  };
+}
+
+function assertConservativeBaselineRuns(runs: TournamentMatrixResult["runs"]): void {
+  const expected = ["BTC_BUY_AND_HOLD", "CASH", "DONCHIAN", "EMA_CROSS", "EQUAL_WEIGHT_HOLD", "MACD", "RANDOM_CONTROL", "RSI_MEAN_REVERSION"];
+  const actual = runs.map((run) => run.manifest.strategyId).sort();
+  if (JSON.stringify(actual) !== JSON.stringify(expected) || runs.some((run) => run.manifest.executionMode !== "CONSERVATIVE" || run.manifest.strategyId === "KRONOS_CURRENT")) throw new Error("FOUNDRY_REAL_TIER1_BASELINE_CONTRACT_BREACH");
+  if (runs.some((run) => !run.valid || run.terminalOpenPositions.length || !run.episodeLedger || !run.metrics.canonicalEpisodeProvenanceComplete)) throw new Error("FOUNDRY_REAL_TIER1_EMPIRICAL_GATE_INVALID_RUN");
+}
+
 /** Ensures an empirical spec names this exact immutable assembly before any run manifest is built. */
 export function bindRealTier1ExperimentSpec(assembly: Tier1Assembly, spec: TournamentExperimentSpec): TournamentExperimentSpec {
   if (spec.researchMode !== "REAL_TIER1" || spec.capabilityTier !== "TIER_1_BASELINE") throw new Error("FOUNDRY_REAL_TIER1_MODE_REQUIRED");
@@ -215,16 +239,67 @@ export function runTier1BaselineSmoke(input: {
 
 /** The only executable empirical entry point. It is Conservative-only and still produces no ranking. */
 export function runRealTier1Conservative(input: { assembly: Tier1Assembly; spec: TournamentExperimentSpec; createdAtMs: number }): { label: Tier1Assembly["label"]; result: TournamentMatrixResult } {
-  const verifiedInputs = verifiedRealAssemblyInputs.get(input.assembly);
-  if (input.assembly.researchMode !== "REAL_TIER1" || !verifiedRealAssemblies.has(input.assembly) || !verifiedInputs) throw new Error("FOUNDRY_REAL_TIER1_ASSEMBLY_NOT_PROVENANCE_VERIFIED");
-  for (const artifact of verifiedInputs.foundryArtifacts) loadFoundryArtifact(artifact);
-  assertRealTier1ArtifactProvenance(verifiedInputs.provenanceArtifacts, verifiedInputs.archiveRoots);
-  assertTier1AssemblyCanRun(input.assembly);
+  assertVerifiedRealAssembly(input.assembly);
   const random = deriveTier1RandomControl(input.assembly, input.spec.randomSeed); if (input.spec.parameters.tier1RandomControlIdentity !== undefined && input.spec.parameters.tier1RandomControlIdentity !== random.identity) throw new Error("FOUNDRY_REAL_TIER1_RANDOM_CONTROL_IDENTITY_MISMATCH");
   const bound = bindRealTier1ExperimentSpec(input.assembly, input.spec); const spec = { ...bound, parameters: { ...bound.parameters, tier1AssemblyHash: input.assembly.tier1AssemblyHash, tier1RandomControlIdentity: random.identity, tier1RandomControlPolicyVersion: "tier1-random-control-from-donchian-v3" } };
-  const strategies = [cashStrategy(), buyAndHoldStrategy(), equalWeightHoldStrategy(), donchianStrategy(), macdStrategy(), emaCrossStrategy(), rsiMeanReversionStrategy(), randomTimingControl({ reference: random.reference, eligibleEntryTimesBySymbol: random.eligibleEntryTimesBySymbol, seed: spec.randomSeed })];
+  const { strategies } = baselineStrategies(input.assembly, spec);
   const result = runTournamentMatrix({ spec, strategies, createdAtMs: input.createdAtMs, modes: ["CONSERVATIVE"], postTradeEpisodePolicy: input.assembly.postTradeEpisodePolicy, execution: { candles: input.assembly.canonicalCandles, universe: input.assembly.universe, portfolioRisk: input.assembly.portfolioRisk, fundingSettlements: input.assembly.canonicalFundingSettlements, fundingSettlementScheduleBySymbol: scheduleMap(input.assembly.fundingScheduleBySymbol) } });
-  if (result.runs.some((run) => run.manifest.strategyId === "KRONOS_CURRENT" || run.manifest.executionMode !== "CONSERVATIVE")) throw new Error("FOUNDRY_REAL_TIER1_BASELINE_CONTRACT_BREACH");
-  if (result.runs.some((run) => !run.valid || run.terminalOpenPositions.length || !run.episodeLedger || !run.metrics.canonicalEpisodeProvenanceComplete)) throw new Error("FOUNDRY_REAL_TIER1_EMPIRICAL_GATE_INVALID_RUN");
+  assertConservativeBaselineRuns(result.runs);
   return { label: input.assembly.label, result: { ...result, runs: result.runs.map((run) => ({ ...run, manifest: { ...run.manifest, empiricalGatePassed: true } })) } };
+}
+
+export interface RealTier1WalkForwardFoldResult {
+  fold: WalkForwardFold;
+  testRange: Readonly<{ startMs: number; endMs: number }>;
+  randomControlIdentity: string;
+  fairnessHash: string;
+  result: TournamentMatrixResult;
+}
+
+/**
+ * The only empirical walk-forward entry point.  It binds the full immutable
+ * assembly first, then derives every OOS fold, warm-up slice, universe slice,
+ * funding schedule, and random-control schedule from that assembly.  It has
+ * no caller-provided market payload or tuning input.
+ */
+export function runRealTier1WalkForwardConservative(input: { assembly: Tier1Assembly; spec: TournamentExperimentSpec; createdAtMs: number }): { label: Tier1Assembly["label"]; folds: readonly RealTier1WalkForwardFoldResult[] } {
+  assertVerifiedRealAssembly(input.assembly);
+  if (input.spec.parameters.tier1RandomControlIdentity !== undefined) throw new Error("FOUNDRY_REAL_TIER1_WALK_FORWARD_CALLER_RANDOM_IDENTITY_FORBIDDEN");
+  const bound = bindRealTier1ExperimentSpec(input.assembly, input.spec);
+  const timestamps = [...new Set(input.assembly.canonicalCandles.map((candle) => candle.openTimeMs))].sort((left, right) => left - right);
+  const plan = buildWalkForwardPlan(timestamps, bound.validation); assertNoValidationLeakage(plan);
+  if (plan.folds.length < 3) throw new Error("FOUNDRY_REAL_TIER1_WALK_FORWARD_MINIMUM_OOS_FOLDS_UNMET");
+  const folds = plan.folds.map((fold) => {
+    const testStartMs = timestamps[fold.test.startIndex]!; const testEndMs = timestamps[fold.test.endExclusive - 1]! + input.assembly.timeframeMs;
+    const testRange = Object.freeze({ startMs: testStartMs, endMs: testEndMs });
+    const snapshots = input.assembly.universeSnapshots.filter((snapshot) => snapshot.asOfMs >= testStartMs && snapshot.asOfMs < testEndMs);
+    const candles = input.assembly.canonicalCandles.filter((candle) => candle.openTimeMs >= testStartMs && candle.openTimeMs < testEndMs);
+    const historyCandles = input.assembly.canonicalCandles.filter((candle) => candle.closeTimeMs < testStartMs);
+    if (!snapshots.length || !candles.length) throw new Error(`FOUNDRY_REAL_TIER1_WALK_FORWARD_COVERAGE_MISSING_${fold.foldId}`);
+    const { random, strategies } = baselineStrategies(input.assembly, bound, testRange);
+    const foldSpec: TournamentExperimentSpec = {
+      ...bound,
+      dataset: { ...bound.dataset, dataRange: testRange, universeSnapshots: structuredClone(snapshots) },
+      parameters: {
+        ...bound.parameters,
+        tier1AssemblyHash: input.assembly.tier1AssemblyHash,
+        walkForwardFoldId: fold.foldId,
+        walkForwardParentDataRange: structuredClone(bound.dataset.dataRange),
+        tier1RandomControlIdentity: random.identity,
+        tier1RandomControlPolicyVersion: "tier1-random-control-from-donchian-v3",
+      },
+    };
+    const result = runTournamentMatrix({
+      spec: foldSpec,
+      strategies,
+      createdAtMs: input.createdAtMs,
+      modes: ["CONSERVATIVE"],
+      postTradeEpisodePolicy: input.assembly.postTradeEpisodePolicy,
+      execution: { candles, historyCandles, universe: input.assembly.universe, portfolioRisk: input.assembly.portfolioRisk, fundingSettlements: input.assembly.canonicalFundingSettlements, fundingSettlementScheduleBySymbol: scheduleMap(input.assembly.fundingScheduleBySymbol) },
+    });
+    assertConservativeBaselineRuns(result.runs);
+    const fairnessHash = result.fairnessHashByMode.get("CONSERVATIVE"); if (!fairnessHash) throw new Error(`FOUNDRY_REAL_TIER1_WALK_FORWARD_FAIRNESS_MISSING_${fold.foldId}`);
+    return Object.freeze({ fold: structuredClone(fold), testRange, randomControlIdentity: random.identity, fairnessHash, result: { ...result, runs: result.runs.map((run) => ({ ...run, manifest: { ...run.manifest, empiricalGatePassed: true } })) } });
+  });
+  return { label: input.assembly.label, folds: Object.freeze(folds) };
 }
