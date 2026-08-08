@@ -173,19 +173,21 @@ async function collectBookTickerSamples(input: { root: string; expectedCoverage:
       const imported = await bookTickerSamples({ path: resolve(input.root, plan.file.relativePath), relativePath: plan.file.relativePath, symbol, startMs, endMs, sourceStartMs: plan.startMs, sourceEndMs: plan.endMs, sourceHash: plan.file.fileHash, maxQuoteAgeMs: Number.MAX_SAFE_INTEGER, initialState: monthlyCarry });
       for (const sample of imported.samples) merged.set(sample.asOfMs, sample); monthlyCarry = imported.carry;
     }
-    let repairCarry: BookTickerState | undefined; let priorRepairEndMs: number | undefined;
     for (const plan of repairs) {
       const startMs = Math.max(input.expectedCoverage.startMs, plan.startMs); const endMs = Math.min(input.expectedCoverage.endMs, plan.endMs);
-      if (priorRepairEndMs !== plan.startMs) repairCarry = undefined;
       if (startMs < endMs) {
-        const imported = await bookTickerSamples({ path: resolve(input.root, plan.file.relativePath), relativePath: plan.file.relativePath, symbol, startMs, endMs, sourceStartMs: plan.startMs, sourceEndMs: plan.endMs, sourceHash: plan.file.fileHash, maxQuoteAgeMs: Number.MAX_SAFE_INTEGER, initialState: repairCarry });
+        // A daily repair is an overlay, not an independent full-day quote
+        // stream. It may legitimately begin after 00:00 UTC. Select only
+        // ticks for which that ZIP supplies an actual event; all other ticks
+        // retain the monthly source mark and still face the final age gate.
+        // Filling the repair from its first future event would be PIT-invalid;
+        // requiring a leading repair quote would reject a valid monthly base.
+        const imported = await bookTickerSamples({ path: resolve(input.root, plan.file.relativePath), relativePath: plan.file.relativePath, symbol, startMs, endMs, sourceStartMs: plan.startMs, sourceEndMs: plan.endMs, sourceHash: plan.file.fileHash, maxQuoteAgeMs: Number.MAX_SAFE_INTEGER, outputMode: "SELECTIONS" });
         for (const sample of imported.samples) {
           if (!merged.has(sample.asOfMs)) throw new Error(`FOUNDRY_BINANCE_VISION_BOOKTICKER_REPAIR_OUTSIDE_BASE_${symbol}_${sample.asOfMs}`);
           merged.set(sample.asOfMs, sample);
         }
-        repairCarry = imported.carry;
       }
-      priorRepairEndMs = plan.endMs;
     }
     const rows: BookTickerSample[] = [];
     for (let asOfMs = input.expectedCoverage.startMs; asOfMs < input.expectedCoverage.endMs; asOfMs += HOUR_MS) {
