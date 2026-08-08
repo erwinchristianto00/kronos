@@ -274,6 +274,8 @@ export interface TournamentMetrics {
   winRate: number;
   payoffRatio: number | null;
   sharpe: number | null;
+  /** Annualized downside-risk-adjusted return from the fixed-interval NAV ledger. */
+  sortino: number | null;
   calmar: number | null;
   maxDrawdown: number;
   netPnl: number;

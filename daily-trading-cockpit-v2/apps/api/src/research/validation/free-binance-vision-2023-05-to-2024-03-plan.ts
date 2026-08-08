@@ -27,7 +27,7 @@ const FREE_SCOPE_TOTAL_BARS = (FREE_SCOPE_END_MS - FREE_SCOPE_START_MS) / HOUR_M
 const SEALED_HOLDOUT_MINIMUM_BARS = 60 * DAY_BARS;
 const SEALED_HOLDOUT_BARS = Math.max(SEALED_HOLDOUT_MINIMUM_BARS, Math.ceil(FREE_SCOPE_TOTAL_BARS * 0.2));
 
-export const FREE_BINANCE_VISION_2023_05_TO_2024_03_VALIDATION_PLAN_VERSION = "free-binance-vision-btceth-1h-real-tier1-validation-plan-v4" as const;
+export const FREE_BINANCE_VISION_2023_05_TO_2024_03_VALIDATION_PLAN_VERSION = "free-binance-vision-btceth-1h-real-tier1-validation-plan-v5" as const;
 
 export const FREE_BINANCE_VISION_2023_05_TO_2024_03_BASELINE_ALLOWLIST = [
   "CASH",
@@ -180,7 +180,7 @@ const artifactPayload = {
    * strategy after inspecting OOS or sealed-holdout results.
    */
   robustness: {
-    version: "free-binance-vision-tier1-robustness-v1",
+    version: "free-binance-vision-tier1-robustness-v2",
     costFundingStress: {
       scenarioId: "CONSERVATIVE_FEE_SLIPPAGE_AND_FUNDING_STRESS",
       executionMode: "CONSERVATIVE",
@@ -229,6 +229,19 @@ const artifactPayload = {
         { period: 18, oversold: 30, overbought: 70, stopAtr: 2, targetAtr: 3, maxHoldBars: 48 },
       ],
     },
+    /**
+     * The frozen default parameter set must sit on an OOS-only plateau. The
+     * sealed holdout is deliberately excluded here so it can remain a final
+     * evaluation rather than a source of parameter selection.
+     */
+    parameterStability: {
+      policyVersion: "oos-only-neighborhood-plateau-v1",
+      decisionBasis: "OOS_ONLY",
+      minimumStableNeighbourFraction: 0.6,
+      requiresSelectedConfigurationEvidenceGate: true,
+      requiresSelectedConfigurationPositiveExpectancy: true,
+      insufficientEvidenceVerdict: "INCONCLUSIVE",
+    },
     candidateVerdictPolicy: {
       requiresBaseOosAndHoldoutEvidence: true,
       requiresCostFundingStress: true,
@@ -260,7 +273,7 @@ export function assertFreeBinanceVision2023ValidationPlan(): void {
   if (plan.evidenceGates.minimumOosWindows < 3 || plan.evidenceGates.minimumCompletedTradesPerInterpretedStrategy < 20 || plan.evidenceGates.minimumCanonicalIndependentEpisodes < 10 || plan.evidenceGates.maximumInvalidFolds !== 0 || plan.evidenceGates.maximumTerminalUnresolvedPositions !== 0) throw new Error("FREE_TIER1_VALIDATION_EVIDENCE_GATE_WEAKENED");
   if (plan.robustness.costFundingStress.executionMode !== "CONSERVATIVE" || plan.robustness.costFundingStress.takerFeeBps < plan.tier1ConservativeExecution.takerFeeBps || plan.robustness.costFundingStress.baseSlippageBps < plan.tier1ConservativeExecution.baseSlippageBps || plan.robustness.costFundingStress.pessimisticSlippageMultiplier < plan.tier1ConservativeExecution.pessimisticSlippageMultiplier || plan.robustness.costFundingStress.fundingRateMultiplier < 1) throw new Error("FREE_TIER1_VALIDATION_ROBUSTNESS_STRESS_WEAKENED");
   const requiredNeighborhoods = ["DONCHIAN", "MACD", "EMA_CROSS", "RSI_MEAN_REVERSION"] as const;
-  if (requiredNeighborhoods.some((strategyId) => plan.robustness.parameterNeighborhoods[strategyId].length < 5) || !plan.robustness.candidateVerdictPolicy.requiresBaseOosAndHoldoutEvidence || !plan.robustness.candidateVerdictPolicy.requiresCostFundingStress || !plan.robustness.candidateVerdictPolicy.requiresParameterNeighborhoodAssessment || plan.robustness.candidateVerdictPolicy.verdictWhenAnyRequirementMissing !== "INCONCLUSIVE") throw new Error("FREE_TIER1_VALIDATION_ROBUSTNESS_POLICY_INVALID");
+  if (requiredNeighborhoods.some((strategyId) => plan.robustness.parameterNeighborhoods[strategyId].length < 5) || plan.robustness.parameterStability.policyVersion !== "oos-only-neighborhood-plateau-v1" || plan.robustness.parameterStability.decisionBasis !== "OOS_ONLY" || plan.robustness.parameterStability.minimumStableNeighbourFraction !== 0.6 || !plan.robustness.parameterStability.requiresSelectedConfigurationEvidenceGate || !plan.robustness.parameterStability.requiresSelectedConfigurationPositiveExpectancy || plan.robustness.parameterStability.insufficientEvidenceVerdict !== "INCONCLUSIVE" || !plan.robustness.candidateVerdictPolicy.requiresBaseOosAndHoldoutEvidence || !plan.robustness.candidateVerdictPolicy.requiresCostFundingStress || !plan.robustness.candidateVerdictPolicy.requiresParameterNeighborhoodAssessment || plan.robustness.candidateVerdictPolicy.verdictWhenAnyRequirementMissing !== "INCONCLUSIVE") throw new Error("FREE_TIER1_VALIDATION_ROBUSTNESS_POLICY_INVALID");
   if (plan.artifactHash !== tournamentHash(artifactPayload)) throw new Error("FREE_TIER1_VALIDATION_PLAN_HASH_MISMATCH");
 }
 

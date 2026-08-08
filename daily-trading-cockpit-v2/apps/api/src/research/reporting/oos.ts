@@ -59,6 +59,6 @@ export function assessCostSensitivity(runs: readonly TournamentRunResult[]): Cos
   });
 }
 
-export function metricSummary(metrics: TournamentMetrics): Pick<TournamentMetrics, "expectancyAfterCost" | "profitFactor" | "winRate" | "payoffRatio" | "sharpe" | "calmar" | "maxDrawdown"> {
-  return { expectancyAfterCost: metrics.expectancyAfterCost, profitFactor: metrics.profitFactor, winRate: metrics.winRate, payoffRatio: metrics.payoffRatio, sharpe: metrics.sharpe, calmar: metrics.calmar, maxDrawdown: metrics.maxDrawdown };
+export function metricSummary(metrics: TournamentMetrics): Pick<TournamentMetrics, "expectancyAfterCost" | "profitFactor" | "winRate" | "payoffRatio" | "sharpe" | "sortino" | "calmar" | "maxDrawdown"> {
+  return { expectancyAfterCost: metrics.expectancyAfterCost, profitFactor: metrics.profitFactor, winRate: metrics.winRate, payoffRatio: metrics.payoffRatio, sharpe: metrics.sharpe, sortino: metrics.sortino, calmar: metrics.calmar, maxDrawdown: metrics.maxDrawdown };
 }

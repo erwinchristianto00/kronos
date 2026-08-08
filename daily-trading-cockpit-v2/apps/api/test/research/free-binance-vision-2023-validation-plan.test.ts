@@ -62,6 +62,14 @@ describe("free Binance Vision BTCUSDT/ETHUSDT 2023 validation plan", () => {
       requiresParameterNeighborhoodAssessment: true,
       verdictWhenAnyRequirementMissing: "INCONCLUSIVE",
     });
+    expect(plan.robustness.parameterStability).toEqual({
+      policyVersion: "oos-only-neighborhood-plateau-v1",
+      decisionBasis: "OOS_ONLY",
+      minimumStableNeighbourFraction: 0.6,
+      requiresSelectedConfigurationEvidenceGate: true,
+      requiresSelectedConfigurationPositiveExpectancy: true,
+      insufficientEvidenceVerdict: "INCONCLUSIVE",
+    });
   });
 
   it("uses fixed 120d/30d/30d windows and purges plus embargoes every tactical challenger horizon", () => {

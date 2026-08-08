@@ -47,6 +47,8 @@ describe("Dataset Foundry and methodology hardening", () => {
     expect(result.trades).toHaveLength(1);
     expect(result.trades[0]!.netPnl).toBe(0);
     expect(result.metrics.sharpe).not.toBeNull();
+    expect(result.metrics.sortino).not.toBeNull();
+    expect(result.metrics.sortino).toBeGreaterThan(result.metrics.sharpe!);
     expect(result.metrics.maxDrawdown).toBeGreaterThan(0.35);
     expect(result.navLedger.some((point) => point.unrealizedPnl < -3_000)).toBe(true);
     expect(result.navLedger.slice(1).every((point, index) => point.timestampMs - result.navLedger[index]!.timestampMs === H)).toBe(true);

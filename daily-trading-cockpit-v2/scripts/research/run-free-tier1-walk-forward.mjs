@@ -10,6 +10,7 @@ import { resolve } from "node:path";
 import { tournamentHash } from "../../apps/api/src/research/contract/tournament-contract.ts";
 import { assembleTier1Baseline, assertTier1AssemblyCanRun, assertVerifiedRealTier1Assembly, bindRealTier1ExperimentSpec, deriveTier1RandomControl, loadTier1Artifacts, runRealTier1SealedHoldoutConservative, runRealTier1WalkForwardConservative } from "../../apps/api/src/research/foundry/tier1-assembler.ts";
 import { persistTournamentRun } from "../../apps/api/src/research/reporting/artifacts.ts";
+import { assessParameterPlateau } from "../../apps/api/src/research/reporting/governance.ts";
 import { runTournamentMatrix } from "../../apps/api/src/research/tournament-runner.ts";
 import { FREE_BINANCE_VISION_2023_05_TO_2024_03_VALIDATION_PLAN as PLAN } from "../../apps/api/src/research/validation/free-binance-vision-2023-05-to-2024-03-plan.ts";
 import { assertNoValidationLeakage, buildWalkForwardPlan } from "../../apps/api/src/research/validation/walk-forward.ts";
@@ -61,27 +62,41 @@ function assertFoundryReport(report, artifactRoot) {
   }
 }
 
-function summarize(runs) {
+function summarize(runs, { requireOosWindows = true } = {}) {
   const groups = new Map();
   for (const run of runs) groups.set(run.manifest.strategyId, [...(groups.get(run.manifest.strategyId) ?? []), run]);
   return [...groups.entries()].sort(([left], [right]) => left.localeCompare(right)).map(([strategyId, strategyRuns]) => {
     const trades = strategyRuns.flatMap((run) => run.trades);
     const episodes = new Set(strategyRuns.flatMap((run) => run.episodeLedger?.assignments.map((assignment) => assignment.episodeId) ?? []));
-    const valid = strategyRuns.every((run) => run.valid && run.terminalOpenPositions.length === 0);
-    const mean = (field) => strategyRuns.length ? strategyRuns.reduce((sum, run) => sum + (run.metrics[field] ?? 0), 0) / strategyRuns.length : null;
+    const invalidRunCount = strategyRuns.filter((run) => !run.valid).length;
+    const terminalUnresolvedPositionCount = strategyRuns.reduce((sum, run) => sum + run.terminalOpenPositions.length, 0);
+    const valid = invalidRunCount === 0 && terminalUnresolvedPositionCount === 0;
+    const mean = (field) => {
+      const values = strategyRuns.map((run) => run.metrics[field]).filter(Number.isFinite);
+      return values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : null;
+    };
     const gates = [];
-    if (strategyRuns.length < PLAN.evidenceGates.minimumOosWindows) gates.push(`OOS_WINDOWS_LT_${PLAN.evidenceGates.minimumOosWindows}`);
+    if (requireOosWindows && strategyRuns.length < PLAN.evidenceGates.minimumOosWindows) gates.push(`OOS_WINDOWS_LT_${PLAN.evidenceGates.minimumOosWindows}`);
     if (trades.length < PLAN.evidenceGates.minimumCompletedTradesPerInterpretedStrategy) gates.push(`TRADES_LT_${PLAN.evidenceGates.minimumCompletedTradesPerInterpretedStrategy}`);
     if (episodes.size < PLAN.evidenceGates.minimumCanonicalIndependentEpisodes) gates.push(`EPISODES_LT_${PLAN.evidenceGates.minimumCanonicalIndependentEpisodes}`);
-    if (!valid) gates.push("INVALID_OR_TERMINAL_RUN");
+    if (invalidRunCount > PLAN.evidenceGates.maximumInvalidFolds) gates.push(`INVALID_RUNS_GT_${PLAN.evidenceGates.maximumInvalidFolds}`);
+    if (terminalUnresolvedPositionCount > PLAN.evidenceGates.maximumTerminalUnresolvedPositions) gates.push(`TERMINAL_POSITIONS_GT_${PLAN.evidenceGates.maximumTerminalUnresolvedPositions}`);
     return {
       strategyId,
       foldCount: strategyRuns.length,
       completedTrades: trades.length,
       independentEpisodes: episodes.size,
+      validFoldCount: strategyRuns.length - invalidRunCount,
+      invalidRunCount,
+      terminalUnresolvedPositionCount,
       totalNetPnl: trades.reduce((sum, trade) => sum + trade.netPnl, 0),
       meanFoldReturnFraction: mean("returnFraction"),
       meanFoldExpectancyAfterCost: mean("expectancyAfterCost"),
+      meanFoldSharpe: mean("sharpe"),
+      meanFoldSortino: mean("sortino"),
+      meanFoldCalmar: mean("calmar"),
+      meanFoldMaxDrawdown: mean("maxDrawdown"),
+      meanFoldProfitableAssetRatio: mean("profitableAssetRatio"),
       profitableFoldFraction: strategyRuns.length ? strategyRuns.filter((run) => run.metrics.netPnl > 0).length / strategyRuns.length : null,
       verdict: gates.length ? "INCONCLUSIVE" : "EVIDENCE_GATE_MET",
       gateFailures: gates,
@@ -208,7 +223,7 @@ function holdout(input) {
     holdoutRange: run.holdoutRange,
     fairnessHash: run.fairnessHash,
     randomControlIdentity: run.randomControlIdentity,
-    holdoutSummary: summarize(run.result.runs),
+    holdoutSummary: summarize(run.result.runs, { requireOosWindows: false }),
     runs: run.result.runs.map((result) => ({ strategyId: result.manifest.strategyId, runId: result.manifest.runId, inputHash: result.manifest.inputHash, metrics: result.metrics, navPointCount: result.navLedger.length, episodeLedgerHash: result.episodeLedger?.outputHash ?? null })),
     registryHash: persistedOutput.registryHash,
     persistedRuns: persistedOutput.entries,
@@ -351,6 +366,43 @@ function runParameterNeighborhoods(prepared, bound, ranges, createdAtMs) {
   });
 }
 
+/**
+ * Scores only the frozen default against its one-axis OOS neighbours. The
+ * sealed holdout is intentionally absent: it remains a final evaluation and
+ * cannot influence the stability verdict or any parameter choice.
+ */
+function assessParameterNeighborhoodStability(neighborhood) {
+  const policy = PLAN.robustness.parameterStability;
+  const defaultParameters = strategyForNeighborhood(neighborhood.strategyId, {}).parameters;
+  const variants = neighborhood.variants.map((variant) => ({
+    ...variant,
+    oosSummary: summarize(variant.oos.flatMap((fold) => fold.runs)),
+  }));
+  const selected = variants.find((variant) => tournamentHash(variant.parameters) === tournamentHash(defaultParameters));
+  if (!selected) throw new Error(`FREE_TIER1_ROBUSTNESS_DEFAULT_NEIGHBORHOOD_MISSING_${neighborhood.strategyId}`);
+  const points = variants.map((variant) => ({
+    parameters: variant.parameters,
+    oosExpectancy: variant.oosSummary.meanFoldExpectancyAfterCost ?? Number.NEGATIVE_INFINITY,
+    conservativePass: variant.oosSummary.verdict === "EVIDENCE_GATE_MET",
+    profitableWindowFraction: variant.oosSummary.profitableFoldFraction ?? 0,
+    crossAssetRatio: variant.oosSummary.meanFoldProfitableAssetRatio,
+  }));
+  const plateau = assessParameterPlateau(points, selected.parameters);
+  const failures = [];
+  if (policy.decisionBasis !== "OOS_ONLY") failures.push("STABILITY_DECISION_BASIS_INVALID");
+  if (policy.requiresSelectedConfigurationEvidenceGate && selected.oosSummary.verdict !== "EVIDENCE_GATE_MET") failures.push("SELECTED_OOS_EVIDENCE_GATE_UNMET");
+  if (policy.requiresSelectedConfigurationPositiveExpectancy && !(selected.oosSummary.meanFoldExpectancyAfterCost > 0)) failures.push("SELECTED_OOS_EXPECTANCY_NON_POSITIVE");
+  if (!plateau.plateauPass || plateau.stableNeighbourFraction < policy.minimumStableNeighbourFraction) failures.push("OOS_PARAMETER_PLATEAU_UNSTABLE");
+  return {
+    strategyId: neighborhood.strategyId,
+    policy: { ...policy },
+    selected: { ordinal: selected.ordinal, parameterHash: selected.parameterHash, parameters: selected.parameters, oosSummary: selected.oosSummary },
+    plateau,
+    verdict: failures.length ? policy.insufficientEvidenceVerdict : "OOS_PARAMETER_STABILITY_MET",
+    gateFailures: failures,
+  };
+}
+
 function runRefs(runs) {
   return runs.map((run) => ({ strategyId: run.manifest.strategyId, runId: run.manifest.runId, inputHash: run.manifest.inputHash, metrics: run.metrics, navPointCount: run.navLedger.length, episodeLedgerHash: run.episodeLedger?.outputHash ?? null }));
 }
@@ -362,11 +414,12 @@ function robustness(input) {
   if (frozenOos.foundryReportHash !== prepared.foundryReport.reportHash || sealedHoldout.foundryReportHash !== prepared.foundryReport.reportHash || frozenOos.tier1AssemblyHash !== prepared.assembly.tier1AssemblyHash || sealedHoldout.tier1AssemblyHash !== prepared.assembly.tier1AssemblyHash || frozenOos.validationPlan?.artifactHash !== PLAN.artifactHash || sealedHoldout.validationPlan?.artifactHash !== PLAN.artifactHash) throw new Error("FREE_TIER1_ROBUSTNESS_BASELINE_BINDING_MISMATCH");
   const bound = bindRealTier1ExperimentSpec(prepared.assembly, prepared.spec); const ranges = walkForwardRanges(prepared.assembly, bound);
   const costFundingStress = runCostFundingStress(prepared, bound, ranges, input.createdAtMs); const parameterNeighborhoods = runParameterNeighborhoods(prepared, bound, ranges, input.createdAtMs);
+  const parameterNeighborhoodStability = parameterNeighborhoods.map(assessParameterNeighborhoodStability);
   const stressOosRuns = costFundingStress.oos.flatMap((fold) => fold.runs); const stressHoldoutRuns = costFundingStress.holdout.runs;
   const neighborhoodRuns = parameterNeighborhoods.flatMap((neighborhood) => neighborhood.variants.flatMap((variant) => [...variant.oos.flatMap((fold) => fold.runs), ...variant.holdout.runs]));
   const persistedOutput = persisted(input.runRoot, [...stressOosRuns, ...stressHoldoutRuns, ...neighborhoodRuns]);
   const core = {
-    schemaVersion: "KronosFreeTier1RobustnessAssessment/v1",
+    schemaVersion: "KronosFreeTier1RobustnessAssessment/v2",
     status: "ROBUSTNESS_ASSESSED_NO_AUTOMATIC_CANDIDATE_CLAIM",
     empiricalClassification: "REAL_SOURCE_BACKED",
     label: prepared.assembly.label,
@@ -383,13 +436,14 @@ function robustness(input) {
       policy: costFundingStress.policy,
       oos: costFundingStress.oos.map((fold) => ({ foldId: fold.foldId, fairnessHash: fold.fairnessHash, runs: runRefs(fold.runs) })),
       oosSummary: summarize(stressOosRuns),
-      holdout: { fairnessHash: costFundingStress.holdout.fairnessHash, runs: runRefs(stressHoldoutRuns), summary: summarize(stressHoldoutRuns) },
+      holdout: { fairnessHash: costFundingStress.holdout.fairnessHash, runs: runRefs(stressHoldoutRuns), summary: summarize(stressHoldoutRuns, { requireOosWindows: false }) },
     },
     parameterNeighborhoods: parameterNeighborhoods.map((neighborhood) => ({
       strategyId: neighborhood.strategyId,
       policyVersion: neighborhood.policyVersion,
-      variants: neighborhood.variants.map((variant) => ({ ordinal: variant.ordinal, parameterHash: variant.parameterHash, parameters: variant.parameters, oos: variant.oos.map((fold) => ({ foldId: fold.foldId, fairnessHash: fold.fairnessHash, runs: runRefs(fold.runs) })), oosSummary: summarize(variant.oos.flatMap((fold) => fold.runs)), holdout: { fairnessHash: variant.holdout.fairnessHash, runs: runRefs(variant.holdout.runs), summary: summarize(variant.holdout.runs) } })),
+      variants: neighborhood.variants.map((variant) => ({ ordinal: variant.ordinal, parameterHash: variant.parameterHash, parameters: variant.parameters, oos: variant.oos.map((fold) => ({ foldId: fold.foldId, fairnessHash: fold.fairnessHash, runs: runRefs(fold.runs) })), oosSummary: summarize(variant.oos.flatMap((fold) => fold.runs)), holdout: { fairnessHash: variant.holdout.fairnessHash, runs: runRefs(variant.holdout.runs), summary: summarize(variant.holdout.runs, { requireOosWindows: false }) } })),
     })),
+    parameterNeighborhoodStability,
     registryHash: persistedOutput.registryHash,
     persistedRuns: persistedOutput.entries,
     candidateEdgeVerdict: "NO_AUTOMATIC_CANDIDATE_CLAIM_REQUIRES_SEPARATE_PREDECLARED_EVIDENCE_REVIEW",

@@ -165,7 +165,7 @@ describe("Kronos Research Tournament v1 contract", () => {
   });
 
   it("allows an ablation only when its fairness contract matches", () => {
-    const metrics = { tradeCount: 1, independentEpisodes: 1, expectancyAfterCost: 1, profitFactor: 1, winRate: 1, payoffRatio: null, sharpe: null, calmar: null, maxDrawdown: 0, netPnl: 1, returnFraction: 0.01, profitableAssetRatio: 1, concentration: { topSymbolNetPnlShare: 1, topRegimeNetPnlShare: 1, topYearNetPnlShare: 1 }, canonicalEpisodeProvenanceComplete: true };
+    const metrics = { tradeCount: 1, independentEpisodes: 1, expectancyAfterCost: 1, profitFactor: 1, winRate: 1, payoffRatio: null, sharpe: null, sortino: null, calmar: null, maxDrawdown: 0, netPnl: 1, returnFraction: 0.01, profitableAssetRatio: 1, concentration: { topSymbolNetPnlShare: 1, topRegimeNetPnlShare: 1, topYearNetPnlShare: 1 }, canonicalEpisodeProvenanceComplete: true };
     expect(pairedAblation({ comparison: "regime", baselineFairnessHash: "fair", treatmentFairnessHash: "fair", sameDataExecutionRiskAndPortfolio: true, baseline: metrics, treatment: { ...metrics, netPnl: 2 } }).comparable).toBe(true);
     expect(pairedAblation({ comparison: "regime", baselineFairnessHash: "a", treatmentFairnessHash: "b", sameDataExecutionRiskAndPortfolio: true, baseline: metrics, treatment: metrics }).comparable).toBe(false);
   });
@@ -216,7 +216,7 @@ describe("Kronos Research Tournament v1 contract", () => {
       { parameters: { fast: 12, slow: 48 }, oosExpectancy: 0.2, conservativePass: true, profitableWindowFraction: 1, crossAssetRatio: 1 },
     ], { fast: 12, slow: 48 });
     expect(plateau.isolatedPeak).toBe(true);
-    const ranked = rankTournamentCandidates([{ strategyId: "MACD", metrics: { tradeCount: 40, independentEpisodes: 40, expectancyAfterCost: 0.1, profitFactor: 1.5, winRate: 0.5, payoffRatio: 1.5, sharpe: 1, calmar: 1, maxDrawdown: 0.1, netPnl: 100, returnFraction: 0.01, profitableAssetRatio: 1, concentration: { topSymbolNetPnlShare: 1, topRegimeNetPnlShare: 1, topYearNetPnlShare: 1 }, canonicalEpisodeProvenanceComplete: true }, researchMode: "REAL_TIER1", capabilityTier: "TIER_2_EXPECTED_EXECUTION", conservativePass: false, plateauPass: false, sealedHoldoutPass: false }]);
+    const ranked = rankTournamentCandidates([{ strategyId: "MACD", metrics: { tradeCount: 40, independentEpisodes: 40, expectancyAfterCost: 0.1, profitFactor: 1.5, winRate: 0.5, payoffRatio: 1.5, sharpe: 1, sortino: 1, calmar: 1, maxDrawdown: 0.1, netPnl: 100, returnFraction: 0.01, profitableAssetRatio: 1, concentration: { topSymbolNetPnlShare: 1, topRegimeNetPnlShare: 1, topYearNetPnlShare: 1 }, canonicalEpisodeProvenanceComplete: true }, researchMode: "REAL_TIER1", capabilityTier: "TIER_2_EXPECTED_EXECUTION", conservativePass: false, plateauPass: false, sealedHoldoutPass: false }]);
     expect(ranked[0]!.rankScore).toBeNull();
     expect(ranked[0]!.hardGate.failures).toContain("CONSERVATIVE_EXECUTION_FAIL");
   });

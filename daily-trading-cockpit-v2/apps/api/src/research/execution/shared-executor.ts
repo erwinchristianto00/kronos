@@ -102,6 +102,11 @@ function calculateMetrics(trades: TournamentTrade[], nav: readonly TournamentNav
   const variance = navReturns.length ? navReturns.reduce((sum, value) => sum + (value - average) ** 2, 0) / navReturns.length : 0;
   const intervalsPerYear = nav.length > 1 ? (365 * DAY) / ((nav.at(-1)!.timestampMs - nav[0]!.timestampMs) / (nav.length - 1)) : 0;
   const sharpe = variance > 0 && intervalsPerYear > 0 ? average / Math.sqrt(variance) * Math.sqrt(intervalsPerYear) : null;
+  // Sortino is intentionally derived from this same fixed-interval NAV series,
+  // not from trade-close outcomes. Zero and positive returns do not contribute
+  // to downside deviation.
+  const downsideVariance = navReturns.length ? navReturns.reduce((sum, value) => sum + Math.min(0, value) ** 2, 0) / navReturns.length : 0;
+  const sortino = downsideVariance > 0 && intervalsPerYear > 0 ? average / Math.sqrt(downsideVariance) * Math.sqrt(intervalsPerYear) : null;
   let peak = startingCapital; let maxDrawdown = 0;
   for (const point of nav) { peak = Math.max(peak, point.equity); maxDrawdown = Math.max(maxDrawdown, peak > 0 ? (peak - point.equity) / peak : 1); }
   const elapsedMs = (nav.at(-1)?.timestampMs ?? 0) - (nav[0]?.timestampMs ?? 0); const years = Math.max(1 / 365, elapsedMs / (365 * DAY));
@@ -114,7 +119,7 @@ function calculateMetrics(trades: TournamentTrade[], nav: readonly TournamentNav
     tradeCount: trades.length, independentEpisodes: canonicalEpisodeProvenanceComplete ? new Set(trades.map((trade) => trade.marketEpisodeId)).size : 0,
     expectancyAfterCost: trades.length ? total / trades.length : 0, profitFactor: grossLoss > 0 ? grossWin / grossLoss : grossWin > 0 ? Infinity : null,
     winRate: trades.length ? wins.length / trades.length : 0, payoffRatio: wins.length && losses.length ? (grossWin / wins.length) / (grossLoss / losses.length) : null,
-    sharpe, calmar, maxDrawdown, netPnl: total, returnFraction: finalEquity / startingCapital - 1,
+    sharpe, sortino, calmar, maxDrawdown, netPnl: total, returnFraction: finalEquity / startingCapital - 1,
     profitableAssetRatio: bySymbol.size ? [...bySymbol.values()].filter((value) => value > 0).length / bySymbol.size : null,
     concentration: { topSymbolNetPnlShare: topShare(bySymbol.values()), topRegimeNetPnlShare: topShare(byRegime.values()), topYearNetPnlShare: topShare(byYear.values()) },
     canonicalEpisodeProvenanceComplete, terminalPositionsResolved,
