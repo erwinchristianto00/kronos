@@ -7,10 +7,10 @@
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 
-import { tournamentHash } from "../../apps/api/dist/research/contract/tournament-contract.js";
-import { assembleTier1Baseline, assertTier1AssemblyCanRun, loadTier1Artifacts, runRealTier1SealedHoldoutConservative, runRealTier1WalkForwardConservative } from "../../apps/api/dist/research/foundry/tier1-assembler.js";
-import { persistTournamentRun } from "../../apps/api/dist/research/reporting/artifacts.js";
-import { FREE_BINANCE_VISION_2023_05_TO_2024_03_VALIDATION_PLAN as PLAN } from "../../apps/api/dist/research/validation/free-binance-vision-2023-05-to-2024-03-plan.js";
+import { tournamentHash } from "../../apps/api/src/research/contract/tournament-contract.ts";
+import { assembleTier1Baseline, assertTier1AssemblyCanRun, loadTier1Artifacts, runRealTier1SealedHoldoutConservative, runRealTier1WalkForwardConservative } from "../../apps/api/src/research/foundry/tier1-assembler.ts";
+import { persistTournamentRun } from "../../apps/api/src/research/reporting/artifacts.ts";
+import { FREE_BINANCE_VISION_2023_05_TO_2024_03_VALIDATION_PLAN as PLAN } from "../../apps/api/src/research/validation/free-binance-vision-2023-05-to-2024-03-plan.ts";
 
 const HASH = /^[a-f0-9]{64}$/;
 const SHA = /^[a-f0-9]{7,64}$/;

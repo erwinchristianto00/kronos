@@ -151,9 +151,10 @@ steps:
         apt-get update -qq
         apt-get install -y --no-install-recommends unzip
         npm ci --ignore-scripts
-        npm run build -w @dtc/shared
-        npm run build -w @dtc/api
-        node scripts/research/precompute-free-tier1-prelifecycle.mjs build
+        # Execute pinned TypeScript sources directly. The preceding GCS stage
+        # contains the immutable 90 GB corpus, so a redundant declaration build
+        # must not sit between raw verification and Foundry processing.
+        npx --no-install tsx scripts/research/precompute-free-tier1-prelifecycle.mjs build
   - name: gcr.io/google.com/cloudsdktool/google-cloud-cli:slim
     id: persist-and-reload-artifacts
     entrypoint: bash
@@ -213,7 +214,7 @@ steps:
     args:
       - -ceu
       - |
-        node scripts/research/precompute-free-tier1-prelifecycle.mjs verify
+        npx --no-install tsx scripts/research/precompute-free-tier1-prelifecycle.mjs verify
   - name: gcr.io/google.com/cloudsdktool/google-cloud-cli:slim
     id: persist-final-report
     entrypoint: bash
@@ -299,7 +300,7 @@ steps:
     args:
       - -ceu
       - |
-        node scripts/research/run-free-tier1-walk-forward.mjs oos
+        npx --no-install tsx scripts/research/run-free-tier1-walk-forward.mjs oos
   - name: gcr.io/google.com/cloudsdktool/google-cloud-cli:slim
     id: persist-and-reload-oos-freeze
     entrypoint: bash
@@ -387,7 +388,7 @@ steps:
     args:
       - -ceu
       - |
-        node scripts/research/run-free-tier1-walk-forward.mjs holdout
+        npx --no-install tsx scripts/research/run-free-tier1-walk-forward.mjs holdout
   - name: gcr.io/google.com/cloudsdktool/google-cloud-cli:slim
     id: persist-sealed-holdout
     entrypoint: bash

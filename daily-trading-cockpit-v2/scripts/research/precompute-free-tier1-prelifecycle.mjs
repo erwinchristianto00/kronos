@@ -9,16 +9,16 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 
-import { tournamentHash } from "../../apps/api/dist/research/contract/tournament-contract.js";
-import { inspectArchiveBundle } from "../../apps/api/dist/research/foundry/archive-bundle.js";
+import { tournamentHash } from "../../apps/api/src/research/contract/tournament-contract.ts";
+import { inspectArchiveBundle } from "../../apps/api/src/research/foundry/archive-bundle.ts";
 import {
   importBinanceVisionUsdMRawBookTickerLiquidityArchive,
   importBinanceVisionUsdMRawCandleArchive,
   importBinanceVisionUsdMRawFundingArchive,
-} from "../../apps/api/dist/research/foundry/binance-vision-usdm-raw-adapter.js";
-import { loadFoundryArtifact, persistFoundryArtifact } from "../../apps/api/dist/research/foundry/artifact-store.js";
-import { importBinanceCmsBoundedUsdMLifecycle } from "../../apps/api/dist/research/foundry/binance-cms-lifecycle-adapter.js";
-import { generateMinimumHistoryEligibilityArtifact, generatePitPortfolioRiskArtifact } from "../../apps/api/dist/research/foundry/tier1-pit-artifacts.js";
+} from "../../apps/api/src/research/foundry/binance-vision-usdm-raw-adapter.ts";
+import { loadFoundryArtifact, persistFoundryArtifact } from "../../apps/api/src/research/foundry/artifact-store.ts";
+import { importBinanceCmsBoundedUsdMLifecycle } from "../../apps/api/src/research/foundry/binance-cms-lifecycle-adapter.ts";
+import { generateMinimumHistoryEligibilityArtifact, generatePitPortfolioRiskArtifact } from "../../apps/api/src/research/foundry/tier1-pit-artifacts.ts";
 
 const HOUR_MS = 3_600_000;
 // Binance Vision's first common BTCUSDT/ETHUSDT bookTicker observations are
