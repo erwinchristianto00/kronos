@@ -9,8 +9,14 @@ import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 
-import { tournamentHash } from "../../apps/api/dist/research/contract/tournament-contract.js";
-import { inspectBinanceVisionUsdMRawBookTickerCoverage } from "../../apps/api/dist/research/foundry/binance-vision-usdm-raw-adapter.js";
+// This cloud diagnostic deliberately executes the Foundry source with `tsx`.
+// Compiling the entire API after staging the 90 GB immutable corpus has proven
+// unnecessarily fragile in Cloud Build; the diagnostic itself is JavaScript
+// and does not create any runtime artifact. The Cloud Build invocation pins
+// `tsx` through package-lock.json and still runs the exact source modules that
+// the API build typechecks in CI.
+import { tournamentHash } from "../../apps/api/src/research/contract/tournament-contract.ts";
+import { inspectBinanceVisionUsdMRawBookTickerCoverage } from "../../apps/api/src/research/foundry/binance-vision-usdm-raw-adapter.ts";
 
 const HOUR_MS = 3_600_000;
 const STUDY_START_MS = Date.UTC(2023, 4, 16, 12);

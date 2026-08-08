@@ -70,9 +70,10 @@ steps:
         apt-get update -qq
         apt-get install -y --no-install-recommends unzip
         npm ci --ignore-scripts
-        npm run build -w @dtc/shared
-        npm run build -w @dtc/api
-        node scripts/research/diagnose-free-tier1-bbo-coverage.mjs
+        # This is a source-only audit. Execute the pinned TypeScript sources
+        # directly so the 90 GB raw staging directory cannot interfere with a
+        # redundant API declaration build before the audit starts.
+        npx tsx scripts/research/diagnose-free-tier1-bbo-coverage.mjs
   - name: gcr.io/google.com/cloudsdktool/google-cloud-cli:slim
     id: persist-immutable-audit
     entrypoint: bash
