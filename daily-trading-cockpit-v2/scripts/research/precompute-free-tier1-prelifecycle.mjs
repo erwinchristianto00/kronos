@@ -2,7 +2,8 @@
 /*
  * Cloud-only, non-empirical preprocessing for the frozen Binance Vision
  * BTCUSDT/ETHUSDT study.  This deliberately persists only source-backed
- * Foundry inputs that do not require a historical instrument lifecycle.
+ * Foundry inputs.  It never runs an empirical tournament: a later, separate
+ * assembly must reload these immutable artifacts and bind the frozen plan.
  */
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -16,7 +17,8 @@ import {
   importBinanceVisionUsdMRawFundingArchive,
 } from "../../apps/api/dist/research/foundry/binance-vision-usdm-raw-adapter.js";
 import { loadFoundryArtifact, persistFoundryArtifact } from "../../apps/api/dist/research/foundry/artifact-store.js";
-import { generatePitPortfolioRiskArtifact } from "../../apps/api/dist/research/foundry/tier1-pit-artifacts.js";
+import { importBinanceCmsBoundedUsdMLifecycle } from "../../apps/api/dist/research/foundry/binance-cms-lifecycle-adapter.js";
+import { generateMinimumHistoryEligibilityArtifact, generatePitPortfolioRiskArtifact } from "../../apps/api/dist/research/foundry/tier1-pit-artifacts.js";
 
 const HOUR_MS = 3_600_000;
 // Binance Vision's first common BTCUSDT/ETHUSDT bookTicker observations are
@@ -32,6 +34,7 @@ const SYMBOLS = ["BTCUSDT", "ETHUSDT"];
 const BBO_MAX_AGE_MS = HOUR_MS;
 const RISK_LOOKBACK_BARS = 168;
 const RISK_MINIMUM_OBSERVATIONS = 120;
+const MINIMUM_COMPLETED_BARS = 168;
 const BBO_SCOPE_SELECTION = {
   policyVersion: "binance-vision-usdm-bookticker-common-start-v1",
   requestedStartMs: REQUESTED_STUDY_START_MS,
@@ -118,6 +121,24 @@ function assertDailyBookTickerRepairManifest(input) {
   return manifest;
 }
 
+function assertCmsCatalogManifest(input) {
+  const raw = readFileSync(input.path, "utf8");
+  if (!raw.endsWith("\n")) throw new Error("FREE_TIER1_CMS_MANIFEST_TERMINAL_NEWLINE_REQUIRED");
+  const manifest = JSON.parse(raw);
+  if (
+    manifest.schemaVersion !== input.schemaVersion
+    || manifest.status !== "RAW_CATALOG_ACQUIRED_NOT_A_TIMELINE"
+    || manifest.provider !== "Binance"
+    || manifest.exchange !== "BINANCE_USDM"
+    || manifest.datasetId !== `binance-cms-public-announcements-catalog-${input.catalogId}`
+    || manifest.catalog?.catalogId !== input.catalogId
+    || manifest.archiveBundleHash !== input.expectedBundleHash
+    || !Array.isArray(manifest.requests)
+    || manifest.requests.length === 0
+  ) throw new Error(`FREE_TIER1_CMS_MANIFEST_INVALID_${input.catalogId}`);
+  return { manifest, manifestSha256: sha256(Buffer.from(raw, "utf8")) };
+}
+
 function coverage(startMs, endMs, extra = {}) {
   return { startMs, endMs, symbols: [...SYMBOLS], cadenceMs: HOUR_MS, ...extra };
 }
@@ -190,7 +211,9 @@ async function build() {
   const generationSha = required("GENERATION_SHA");
   const bboRawBundleHash = required("BBO_RAW_BUNDLE_HASH");
   const bboDailyRepairBundleHash = required("BBO_DAILY_REPAIR_BUNDLE_HASH");
-  if (!SHA.test(generationSha) || !HASH.test(bboRawBundleHash) || !HASH.test(bboDailyRepairBundleHash)) throw new Error("FREE_TIER1_PRELIFECYCLE_GENERATION_IDENTITY_INVALID");
+  const lifecycleLaunchBundleHash = required("LIFECYCLE_LAUNCH_BUNDLE_HASH");
+  const lifecycleDelistingBundleHash = required("LIFECYCLE_DELISTING_BUNDLE_HASH");
+  if (!SHA.test(generationSha) || !HASH.test(bboRawBundleHash) || !HASH.test(bboDailyRepairBundleHash) || !HASH.test(lifecycleLaunchBundleHash) || !HASH.test(lifecycleDelistingBundleHash)) throw new Error("FREE_TIER1_PRELIFECYCLE_GENERATION_IDENTITY_INVALID");
 
   const gcsInventoryPath = resolve(rawRoot, "source-gcs-inventory.json");
   const inventoryBytes = readFileSync(gcsInventoryPath);
@@ -199,6 +222,10 @@ async function build() {
   if (inventory.schemaVersion !== "KronosFreeTier1PrelifecycleGcsInventory/v1") throw new Error("FREE_TIER1_PRELIFECYCLE_GCS_INVENTORY_INVALID");
   const bboManifest = assertFrozenBookTickerManifest({ path: resolve(rawRoot, "bbo-raw-acquisition-manifest.json"), expectedBundleHash: bboRawBundleHash });
   const dailyRepairManifest = assertDailyBookTickerRepairManifest({ path: resolve(rawRoot, "bbo-daily-repair-acquisition-manifest.json"), study: inventory.study, expectedMonthlyBundleHash: bboRawBundleHash, expectedRepairBundleHash: bboDailyRepairBundleHash });
+  const launchRoot = resolve(rawRoot, "lifecycle-binance-cms-catalog-48", "v1", lifecycleLaunchBundleHash);
+  const delistingRoot = resolve(rawRoot, "lifecycle-binance-cms-catalog-161", "v2", lifecycleDelistingBundleHash);
+  const launchCms = assertCmsCatalogManifest({ path: resolve(launchRoot, "acquisition-manifest.json"), schemaVersion: "KronosBinanceCmsLifecycleRaw/v1", catalogId: 48, expectedBundleHash: lifecycleLaunchBundleHash });
+  const delistingCms = assertCmsCatalogManifest({ path: resolve(delistingRoot, "acquisition-manifest.json"), schemaVersion: "KronosBinanceCmsLifecycleRaw/v2", catalogId: 161, expectedBundleHash: lifecycleDelistingBundleHash });
 
   const warmupCoverage = coverage(WARMUP_START_MS, WARMUP_END_MS);
   const executionCoverage = coverage(STUDY_START_MS, STUDY_END_MS);
@@ -245,7 +272,40 @@ async function build() {
     generationSha,
   });
 
+  const lifecycle = importBinanceCmsBoundedUsdMLifecycle({
+    launchRoot,
+    delistingRoot,
+    expectedCoverage: executionCoverage,
+    generatedAtMs,
+    generationSha,
+  });
   const allCandles = [...warmupCandles.rows, ...executionCandles.rows];
+  const decisionTimesMs = executionCandles.rows.map((row) => row.closeTimeMs).sort((left, right) => left - right);
+  const minimumHistoryParents = [
+    lifecycle.listing.manifest.semanticManifestHash,
+    lifecycle.futuresAvailability.manifest.semanticManifestHash,
+    warmupCandles.manifest.semanticManifestHash,
+    executionCandles.manifest.semanticManifestHash,
+  ];
+  const minimumHistoryDerivation = derivation(
+    "free-binance-vision-prior-completed-bars-v1",
+    { minimumCompletedBars: MINIMUM_COMPLETED_BARS, strictlyPrior: true, timeframeMs: HOUR_MS },
+    minimumHistoryParents,
+  );
+  const minimumHistory = generateMinimumHistoryEligibilityArtifact({
+    listingRows: lifecycle.listing.canonicalRows,
+    futuresRows: lifecycle.futuresAvailability.canonicalRows,
+    candleRows: allCandles,
+    expectedCoverage: executionCoverage,
+    decisionTimesMs,
+    minimumCompletedBars: MINIMUM_COMPLETED_BARS,
+    source: "Derived only from verified Binance CMS lifecycle state and strictly prior Binance Vision completed candles",
+    sourceProvenance: derivedProvenance({ datasetId: "free-binance-vision-minimum-history-btceth-v1", parentSemanticManifestHashes: minimumHistoryParents, policyVersion: minimumHistoryDerivation.policyVersion, parameters: minimumHistoryDerivation.parameters, generatedAtMs, generationSha }),
+    derivation: minimumHistoryDerivation,
+    generatedAtMs,
+    generationSha,
+  });
+
   const liquidity = await importBinanceVisionUsdMRawBookTickerLiquidityArchive({
     root: rawRoot,
     expectedCoverage: executionCoverage,
@@ -278,6 +338,9 @@ async function build() {
     { name: "warmup_candles", built: warmupCandles },
     { name: "execution_candles", built: executionCandles },
     { name: "funding_settlements", built: funding },
+    { name: "listing_delisting_timeline", built: lifecycle.listing },
+    { name: "futures_availability_timeline", built: lifecycle.futuresAvailability },
+    { name: "minimum_history_eligibility", built: minimumHistory },
     { name: "pit_liquidity_spread", built: liquidity },
     { name: "pit_portfolio_risk", built: risk },
   ];
@@ -288,16 +351,21 @@ async function build() {
   }
 
   const reportCore = {
-    schemaVersion: "KronosFreeTier1PrelifecycleFoundry/v1",
-    status: "PARTIAL_ARTIFACTS_READY_REAL_TIER1_EXECUTION_FORBIDDEN",
+    schemaVersion: "KronosFreeTier1FoundryArtifacts/v2",
+    status: "COMPLETE_TIER1_ARTIFACTS_READY_FOR_IMMUTABLE_ASSEMBLY",
     study: { symbols: SYMBOLS, timeframeMs: HOUR_MS, startMs: STUDY_START_MS, endMs: STUDY_END_MS, scopeSelection: BBO_SCOPE_SELECTION },
     generation: { generatedAtMs, generationSha },
     sourceGcsInventoryHash: inventoryHash,
     frozenBookTicker: { rawManifestBundleHash: bboRawBundleHash, rawManifestSchemaVersion: bboManifest.schemaVersion, objectCount: bboManifest.objects.length, dailyRepairBundleHash: bboDailyRepairBundleHash, dailyRepairManifestSchemaVersion: dailyRepairManifest.schemaVersion, dailyRepairObjectCount: dailyRepairManifest.objects.length, mergedRawIdentityHash: mergedBboRawIdentity },
-    policies: { bboMaxQuoteAgeMs: BBO_MAX_AGE_MS, pitRisk: { lookbackBars: RISK_LOOKBACK_BARS, minimumObservations: RISK_MINIMUM_OBSERVATIONS, closeIntervalMs: HOUR_MS, snapshotIntervalMs: HOUR_MS, strictlyPrior: true } },
+    frozenLifecycle: {
+      launch: { catalogId: 48, rawBundleHash: lifecycleLaunchBundleHash, manifestSha256: launchCms.manifestSha256, requestCount: launchCms.manifest.requests.length },
+      delisting: { catalogId: 161, rawBundleHash: lifecycleDelistingBundleHash, manifestSha256: delistingCms.manifestSha256, requestCount: delistingCms.manifest.requests.length },
+      combinedSourceArchiveBundleHash: lifecycle.sourceArchiveBundle.archiveBundleHash,
+    },
+    policies: { bboMaxQuoteAgeMs: BBO_MAX_AGE_MS, minimumHistory: { minimumCompletedBars: MINIMUM_COMPLETED_BARS, strictlyPrior: true }, pitRisk: { lookbackBars: RISK_LOOKBACK_BARS, minimumObservations: RISK_MINIMUM_OBSERVATIONS, closeIntervalMs: HOUR_MS, snapshotIntervalMs: HOUR_MS, strictlyPrior: true } },
     artifacts: artifacts.map(({ name, built }) => artifactRecord(name, built)),
     localVerifiedReload: true,
-    realTier1Blockers: ["MISSING_ARTIFACT:LISTING_DELISTING_TIMELINE", "MISSING_ARTIFACT:FUTURES_AVAILABILITY_TIMELINE", "MISSING_ARTIFACT:MINIMUM_HISTORY_ELIGIBILITY"],
+    realTier1Blockers: [],
     empiricalExecutionForbidden: true,
   };
   const report = { ...reportCore, reportHash: tournamentHash(reportCore) };
