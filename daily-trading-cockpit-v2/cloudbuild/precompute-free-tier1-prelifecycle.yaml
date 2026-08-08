@@ -7,6 +7,7 @@ steps:
     env:
       - _STUDY=${_STUDY}
       - _BBO_RAW_BUNDLE_HASH=${_BBO_RAW_BUNDLE_HASH}
+      - _BBO_DAILY_REPAIR_BUNDLE_HASH=${_BBO_DAILY_REPAIR_BUNDLE_HASH}
     args:
       - -ceu
       - |
@@ -20,6 +21,7 @@ steps:
         raw_root = pathlib.Path("/workspace/raw")
         raw_root.mkdir(parents=True, exist_ok=True)
         bbo_hash = os.environ["_BBO_RAW_BUNDLE_HASH"]
+        repair_hash = os.environ["_BBO_DAILY_REPAIR_BUNDLE_HASH"]
 
         def run(*args):
             return subprocess.check_output(args, text=True)
@@ -47,6 +49,24 @@ steps:
             copy(checksum_meta["uri"], str(checksum_meta["generation"]), raw_root / "bookTicker" / f"{relative}.CHECKSUM")
             inventory["objects"].append({"role": "bookTicker", "uri": zip_meta["uri"], "generation": str(zip_meta["generation"]), "sizeBytes": int(zip_meta["sizeBytes"]), "relativePath": f"bookTicker/{relative}"})
             inventory["objects"].append({"role": "bookTickerChecksum", "uri": checksum_meta["uri"], "generation": str(checksum_meta["generation"]), "sizeBytes": int(checksum_meta["sizeBytes"]), "relativePath": f"bookTicker/{relative}.CHECKSUM"})
+
+        repair_manifest_uri = f"{study}/acquisition-manifests/daily-repair-v1/{repair_hash}.json"
+        repair_manifest_meta = describe(repair_manifest_uri)
+        copy(repair_manifest_uri, str(repair_manifest_meta["generation"]), raw_root / "bbo-daily-repair-acquisition-manifest.json")
+        inventory["objects"].append({"role": "bookTickerDailyRepairManifest", "uri": repair_manifest_uri, "generation": str(repair_manifest_meta["generation"]), "sizeBytes": int(repair_manifest_meta["size"]), "relativePath": "bbo-daily-repair-acquisition-manifest.json"})
+        repair_manifest = json.loads((raw_root / "bbo-daily-repair-acquisition-manifest.json").read_text(encoding="utf8"))
+        if repair_manifest.get("schemaVersion") != "KronosFreeTier1DailyBookTickerRepair/v1" or repair_manifest.get("baseMonthlyRawBundleHash") != bbo_hash or repair_manifest.get("canonicalDailyRepairBundleHash") != repair_hash or len(repair_manifest.get("objects", [])) != 6:
+            raise RuntimeError("frozen daily BBO repair manifest is invalid")
+        for entry in repair_manifest["objects"]:
+            zip_meta = entry["canonical"]
+            checksum_meta = entry["companion"]
+            relative = entry["relativePath"]
+            copy(zip_meta["uri"], str(zip_meta["generation"]), raw_root / "bookTicker-daily-repair" / "v1" / relative)
+            copy(checksum_meta["uri"], str(checksum_meta["generation"]), raw_root / "bookTicker-daily-repair" / "v1" / f"{relative}.CHECKSUM")
+            inventory["objects"].extend([
+                {"role": "bookTickerDailyRepair", "uri": zip_meta["uri"], "generation": str(zip_meta["generation"]), "sizeBytes": int(zip_meta["sizeBytes"]), "relativePath": f"bookTicker-daily-repair/v1/{relative}"},
+                {"role": "bookTickerDailyRepairChecksum", "uri": checksum_meta["uri"], "generation": str(checksum_meta["generation"]), "sizeBytes": int(checksum_meta["sizeBytes"]), "relativePath": f"bookTicker-daily-repair/v1/{relative}.CHECKSUM"},
+            ])
 
         months = [*(f"2023-{month:02d}" for month in range(4, 13)), *(f"2024-{month:02d}" for month in range(1, 4))]
         funding_months = [*(f"2023-{month:02d}" for month in range(5, 13)), *(f"2024-{month:02d}" for month in range(1, 4))]
@@ -86,6 +106,7 @@ steps:
       - GENERATED_AT_MS=${_GENERATED_AT_MS}
       - GENERATION_SHA=${_GENERATION_SHA}
       - BBO_RAW_BUNDLE_HASH=${_BBO_RAW_BUNDLE_HASH}
+      - BBO_DAILY_REPAIR_BUNDLE_HASH=${_BBO_DAILY_REPAIR_BUNDLE_HASH}
     args:
       - -ceu
       - |
@@ -230,5 +251,6 @@ timeout: 10800s
 substitutions:
   _STUDY: gs://bucket-coin-yuhu/kronos-tier1-archives/binance-vision-usdm-bookticker-free-walkforward-v1
   _BBO_RAW_BUNDLE_HASH: 3338e528944869fec5b2ce112cdeedac7aa1fe031563a141a57babf4ad39584a
+  _BBO_DAILY_REPAIR_BUNDLE_HASH: unknown
   _GENERATED_AT_MS: "1786118676317"
   _GENERATION_SHA: unknown

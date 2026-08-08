@@ -96,6 +96,28 @@ function assertFrozenBookTickerManifest(input) {
   return manifest;
 }
 
+function expectedDailyRepairPaths() {
+  return SYMBOLS.flatMap((symbol) => ["2023-05-16", "2023-05-17", "2023-09-22"].map((day) => `${symbol}/${symbol}-bookTicker-${day}.zip`)).sort();
+}
+
+function assertDailyBookTickerRepairManifest(input) {
+  const raw = readFileSync(input.path, "utf8");
+  if (!raw.endsWith("\n")) throw new Error("FREE_TIER1_BBO_DAILY_REPAIR_MANIFEST_TERMINAL_NEWLINE_REQUIRED");
+  const manifest = JSON.parse(raw); const paths = manifest.objects?.map((entry) => entry.relativePath) ?? [];
+  if (
+    manifest.schemaVersion !== "KronosFreeTier1DailyBookTickerRepair/v1"
+    || manifest.baseMonthlyRawBundleHash !== input.expectedMonthlyBundleHash
+    || manifest.scope?.objectCount !== 6
+    || JSON.stringify(paths) !== JSON.stringify(expectedDailyRepairPaths())
+    || manifest.canonicalDailyRepairBundleHash !== input.expectedRepairBundleHash
+    || sha256(Buffer.from(stable(manifest.objects))) !== input.expectedRepairBundleHash
+    || manifest.baseMonthlyAcquisitionManifest?.uri !== `${input.study}/acquisition-manifests/v2/${input.expectedMonthlyBundleHash}.json`
+    || !HASH.test(manifest.baseMonthlyAcquisitionManifest?.sha256 ?? "")
+    || !/^[0-9]+$/.test(manifest.baseMonthlyAcquisitionManifest?.generation ?? "")
+  ) throw new Error("FREE_TIER1_BBO_DAILY_REPAIR_MANIFEST_INVALID");
+  return manifest;
+}
+
 function coverage(startMs, endMs, extra = {}) {
   return { startMs, endMs, symbols: [...SYMBOLS], cadenceMs: HOUR_MS, ...extra };
 }
@@ -167,7 +189,8 @@ async function build() {
   const generatedAtMs = positiveInteger("GENERATED_AT_MS");
   const generationSha = required("GENERATION_SHA");
   const bboRawBundleHash = required("BBO_RAW_BUNDLE_HASH");
-  if (!SHA.test(generationSha) || !HASH.test(bboRawBundleHash)) throw new Error("FREE_TIER1_PRELIFECYCLE_GENERATION_IDENTITY_INVALID");
+  const bboDailyRepairBundleHash = required("BBO_DAILY_REPAIR_BUNDLE_HASH");
+  if (!SHA.test(generationSha) || !HASH.test(bboRawBundleHash) || !HASH.test(bboDailyRepairBundleHash)) throw new Error("FREE_TIER1_PRELIFECYCLE_GENERATION_IDENTITY_INVALID");
 
   const gcsInventoryPath = resolve(rawRoot, "source-gcs-inventory.json");
   const inventoryBytes = readFileSync(gcsInventoryPath);
@@ -175,16 +198,21 @@ async function build() {
   const inventoryHash = sha256(inventoryBytes);
   if (inventory.schemaVersion !== "KronosFreeTier1PrelifecycleGcsInventory/v1") throw new Error("FREE_TIER1_PRELIFECYCLE_GCS_INVENTORY_INVALID");
   const bboManifest = assertFrozenBookTickerManifest({ path: resolve(rawRoot, "bbo-raw-acquisition-manifest.json"), expectedBundleHash: bboRawBundleHash });
+  const dailyRepairManifest = assertDailyBookTickerRepairManifest({ path: resolve(rawRoot, "bbo-daily-repair-acquisition-manifest.json"), study: inventory.study, expectedMonthlyBundleHash: bboRawBundleHash, expectedRepairBundleHash: bboDailyRepairBundleHash });
 
   const warmupCoverage = coverage(WARMUP_START_MS, WARMUP_END_MS);
   const executionCoverage = coverage(STUDY_START_MS, STUDY_END_MS);
   const candleRoot = resolve(rawRoot, "klines");
   const fundingRoot = resolve(rawRoot, "fundingRate");
-  const bboArchive = inspectArchiveBundle({ root: rawRoot, include: (relativePath) => (relativePath.startsWith("bookTicker/") || relativePath.startsWith("klines/")) && (relativePath.endsWith(".zip") || relativePath.endsWith(".zip.CHECKSUM")) });
+  const bboArchive = inspectArchiveBundle({ root: rawRoot, include: (relativePath) => (relativePath.startsWith("bookTicker/") || relativePath.startsWith("bookTicker-daily-repair/v1/") || relativePath.startsWith("klines/")) && (relativePath.endsWith(".zip") || relativePath.endsWith(".zip.CHECKSUM")) });
   const bboFiles = new Map(bboArchive.files.map((file) => [file.relativePath, file.fileHash]));
   for (const object of bboManifest.objects) {
     if (bboFiles.get(`bookTicker/${object.relativePath}`) !== object.canonical.sha256 || bboFiles.get(`bookTicker/${object.relativePath}.CHECKSUM`) !== object.companion.sha256 || object.officialChecksum !== object.canonical.sha256) throw new Error(`FREE_TIER1_BBO_STAGED_GENERATION_OR_HASH_MISMATCH_${object.relativePath}`);
   }
+  for (const object of dailyRepairManifest.objects) {
+    if (bboFiles.get(`bookTicker-daily-repair/v1/${object.relativePath}`) !== object.canonical.sha256 || bboFiles.get(`bookTicker-daily-repair/v1/${object.relativePath}.CHECKSUM`) !== object.companion.sha256 || object.officialChecksum !== object.canonical.sha256) throw new Error(`FREE_TIER1_BBO_DAILY_REPAIR_STAGED_GENERATION_OR_HASH_MISMATCH_${object.relativePath}`);
+  }
+  const mergedBboRawIdentity = tournamentHash({ monthlyRawBundleHash: bboRawBundleHash, dailyRepairBundleHash: bboDailyRepairBundleHash });
   const candleArchive = inspectArchiveBundle({ root: candleRoot, include: () => true });
   const fundingArchive = inspectArchiveBundle({ root: fundingRoot, include: () => true });
 
@@ -223,8 +251,8 @@ async function build() {
     expectedCoverage: executionCoverage,
     candleRows: allCandles,
     maxQuoteAgeMs: BBO_MAX_AGE_MS,
-    source: `Binance Vision verified monthly bookTicker BBO plus prior completed volume; raw bundle ${bboRawBundleHash}`,
-    sourceProvenance: sourceProvenance({ provenanceType: "EXCHANGE_HISTORICAL_EXPORT", datasetId: `binance-vision-usdm-bookticker-prelifecycle-v1:${bboRawBundleHash}`, rawFileHash: bboArchive.archiveBundleHash, inventoryHash, generatedAtMs, generationSha }),
+    source: `Binance Vision verified monthly bookTicker plus exact daily BBO repairs and prior completed volume; raw identity ${mergedBboRawIdentity}`,
+    sourceProvenance: sourceProvenance({ provenanceType: "EXCHANGE_HISTORICAL_EXPORT", datasetId: `binance-vision-usdm-bookticker-prelifecycle-v2:${mergedBboRawIdentity}`, rawFileHash: bboArchive.archiveBundleHash, inventoryHash, generatedAtMs, generationSha }),
     generatedAtMs,
     generationSha,
   });
@@ -265,7 +293,7 @@ async function build() {
     study: { symbols: SYMBOLS, timeframeMs: HOUR_MS, startMs: STUDY_START_MS, endMs: STUDY_END_MS, scopeSelection: BBO_SCOPE_SELECTION },
     generation: { generatedAtMs, generationSha },
     sourceGcsInventoryHash: inventoryHash,
-    frozenBookTicker: { rawManifestBundleHash: bboRawBundleHash, rawManifestSchemaVersion: bboManifest.schemaVersion, objectCount: bboManifest.objects.length },
+    frozenBookTicker: { rawManifestBundleHash: bboRawBundleHash, rawManifestSchemaVersion: bboManifest.schemaVersion, objectCount: bboManifest.objects.length, dailyRepairBundleHash: bboDailyRepairBundleHash, dailyRepairManifestSchemaVersion: dailyRepairManifest.schemaVersion, dailyRepairObjectCount: dailyRepairManifest.objects.length, mergedRawIdentityHash: mergedBboRawIdentity },
     policies: { bboMaxQuoteAgeMs: BBO_MAX_AGE_MS, pitRisk: { lookbackBars: RISK_LOOKBACK_BARS, minimumObservations: RISK_MINIMUM_OBSERVATIONS, closeIntervalMs: HOUR_MS, snapshotIntervalMs: HOUR_MS, strictlyPrior: true } },
     artifacts: artifacts.map(({ name, built }) => artifactRecord(name, built)),
     localVerifiedReload: true,
