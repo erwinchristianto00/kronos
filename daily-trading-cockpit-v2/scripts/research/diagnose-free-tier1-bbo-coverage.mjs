@@ -44,12 +44,12 @@ function assertFrozenBookTickerManifest(path, expectedBundleHash) {
 }
 
 function expectedDailyRepairPaths() {
-  return ["BTCUSDT", "ETHUSDT"].flatMap((symbol) => ["2023-05-16", "2023-05-17", "2023-09-22"].map((day) => `${symbol}/${symbol}-bookTicker-${day}.zip`)).sort();
+  return ["BTCUSDT", "ETHUSDT"].flatMap((symbol) => ["2023-05-16", "2023-05-17", "2023-09-21", "2023-09-22"].map((day) => `${symbol}/${symbol}-bookTicker-${day}.zip`)).sort();
 }
 
 function assertDailyRepairManifest(path, expectedBundleHash, expectedMonthlyBundleHash, study) {
   const bytes = readFileSync(path); const manifest = JSON.parse(bytes.toString("utf8")); const paths = manifest.objects?.map((entry) => entry.relativePath) ?? [];
-  if (!bytes.toString("utf8").endsWith("\n") || manifest.schemaVersion !== "KronosFreeTier1DailyBookTickerRepair/v1" || manifest.baseMonthlyRawBundleHash !== expectedMonthlyBundleHash || manifest.scope?.objectCount !== 6 || JSON.stringify(paths) !== JSON.stringify(expectedDailyRepairPaths()) || manifest.canonicalDailyRepairBundleHash !== expectedBundleHash || sha256(Buffer.from(stable(manifest.objects))) !== expectedBundleHash) throw new Error("FREE_TIER1_BBO_DAILY_REPAIR_MANIFEST_INVALID");
+  if (!bytes.toString("utf8").endsWith("\n") || manifest.schemaVersion !== "KronosFreeTier1DailyBookTickerRepair/v1" || manifest.baseMonthlyRawBundleHash !== expectedMonthlyBundleHash || manifest.scope?.objectCount !== 8 || JSON.stringify(paths) !== JSON.stringify(expectedDailyRepairPaths()) || manifest.canonicalDailyRepairBundleHash !== expectedBundleHash || sha256(Buffer.from(stable(manifest.objects))) !== expectedBundleHash) throw new Error("FREE_TIER1_BBO_DAILY_REPAIR_MANIFEST_INVALID");
   const base = manifest.baseMonthlyAcquisitionManifest;
   if (!base || base.uri !== `${study}/acquisition-manifests/v2/${expectedMonthlyBundleHash}.json` || !SHA.test(base.sha256) || !/^[0-9]+$/.test(base.generation)) throw new Error("FREE_TIER1_BBO_DAILY_REPAIR_PARENT_INVALID");
   return manifest;

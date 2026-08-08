@@ -42,6 +42,7 @@ steps:
         repairs = [
             ("BTCUSDT", "2023-05-16"), ("ETHUSDT", "2023-05-16"),
             ("BTCUSDT", "2023-05-17"), ("ETHUSDT", "2023-05-17"),
+            ("BTCUSDT", "2023-09-21"), ("ETHUSDT", "2023-09-21"),
             ("BTCUSDT", "2023-09-22"), ("ETHUSDT", "2023-09-22"),
         ]
         repairs.sort()
@@ -314,7 +315,7 @@ steps:
             "schemaVersion": "KronosFreeTier1DailyBookTickerRepair/v1",
             "baseMonthlyRawBundleHash": base_bundle,
             "baseMonthlyAcquisitionManifest": base_monthly_manifest,
-            "scope": {"symbols": ["BTCUSDT", "ETHUSDT"], "days": ["2023-05-16", "2023-05-17", "2023-09-22"], "objectCount": len(objects)},
+            "scope": {"symbols": ["BTCUSDT", "ETHUSDT"], "days": ["2023-05-16", "2023-05-17", "2023-09-21", "2023-09-22"], "objectCount": len(objects)},
             "canonicalDailyRepairBundleHash": bundle_hash,
             "verification": {"zipIntegrity": "python.zipfile.testzip", "verifierSourceRevision": source_revision, "verifierTemplateSha256": template_sha},
             "objects": objects,

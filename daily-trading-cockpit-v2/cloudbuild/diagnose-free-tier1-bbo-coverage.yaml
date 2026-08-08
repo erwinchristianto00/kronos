@@ -44,7 +44,7 @@ steps:
         repair_manifest_meta = describe(repair_manifest_uri)
         copy(repair_manifest_uri, str(repair_manifest_meta["generation"]), root / "bbo-daily-repair-acquisition-manifest.json")
         repair_manifest = json.loads((root / "bbo-daily-repair-acquisition-manifest.json").read_text(encoding="utf8"))
-        if repair_manifest.get("schemaVersion") != "KronosFreeTier1DailyBookTickerRepair/v1" or repair_manifest.get("baseMonthlyRawBundleHash") != bundle_hash or repair_manifest.get("canonicalDailyRepairBundleHash") != repair_bundle_hash or len(repair_manifest.get("objects", [])) != 6:
+        if repair_manifest.get("schemaVersion") != "KronosFreeTier1DailyBookTickerRepair/v1" or repair_manifest.get("baseMonthlyRawBundleHash") != bundle_hash or repair_manifest.get("canonicalDailyRepairBundleHash") != repair_bundle_hash or len(repair_manifest.get("objects", [])) != 8:
             raise RuntimeError("frozen daily BBO repair manifest is invalid")
         for entry in repair_manifest["objects"]:
             canonical = entry["canonical"]

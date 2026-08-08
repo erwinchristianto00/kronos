@@ -100,7 +100,7 @@ function assertFrozenBookTickerManifest(input) {
 }
 
 function expectedDailyRepairPaths() {
-  return SYMBOLS.flatMap((symbol) => ["2023-05-16", "2023-05-17", "2023-09-22"].map((day) => `${symbol}/${symbol}-bookTicker-${day}.zip`)).sort();
+  return SYMBOLS.flatMap((symbol) => ["2023-05-16", "2023-05-17", "2023-09-21", "2023-09-22"].map((day) => `${symbol}/${symbol}-bookTicker-${day}.zip`)).sort();
 }
 
 function assertDailyBookTickerRepairManifest(input) {
@@ -110,7 +110,7 @@ function assertDailyBookTickerRepairManifest(input) {
   if (
     manifest.schemaVersion !== "KronosFreeTier1DailyBookTickerRepair/v1"
     || manifest.baseMonthlyRawBundleHash !== input.expectedMonthlyBundleHash
-    || manifest.scope?.objectCount !== 6
+    || manifest.scope?.objectCount !== 8
     || JSON.stringify(paths) !== JSON.stringify(expectedDailyRepairPaths())
     || manifest.canonicalDailyRepairBundleHash !== input.expectedRepairBundleHash
     || sha256(Buffer.from(stable(manifest.objects))) !== input.expectedRepairBundleHash
