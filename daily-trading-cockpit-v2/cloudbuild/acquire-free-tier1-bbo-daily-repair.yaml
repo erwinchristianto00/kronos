@@ -6,15 +6,14 @@
 steps:
   - name: gcr.io/google.com/cloudsdktool/google-cloud-cli:slim
     id: acquire-verify-free-tier1-daily-bookticker-repairs
-    entrypoint: bash
     env:
       - _STUDY=${_STUDY}
       - _BASE_MONTHLY_BUNDLE_HASH=${_BASE_MONTHLY_BUNDLE_HASH}
       - _VERIFIER_SOURCE_REVISION=${_VERIFIER_SOURCE_REVISION}
       - _VERIFIER_TEMPLATE_SHA256=${_VERIFIER_TEMPLATE_SHA256}
-    args:
-      - -ceu
-      - |
+    script: |
+        #!/usr/bin/env bash
+        set -ceu
         python3 - <<'PY'
         import datetime
         import hashlib
