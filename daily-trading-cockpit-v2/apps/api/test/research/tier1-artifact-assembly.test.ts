@@ -7,7 +7,7 @@ import { buildFoundryArtifact } from "../../src/research/foundry/artifact-schema
 import { buildRunManifest } from "../../src/research/contract/tournament-contract.js";
 import { loadFoundryArtifact, persistFoundryArtifact } from "../../src/research/foundry/artifact-store.js";
 import { canonicalizeFundingSettlements } from "../../src/research/foundry/funding-schedule.js";
-import { assembleTier1Baseline, assertTier1AssemblyCanRun, bindRealTier1ExperimentSpec, deriveTier1RandomControl, deriveTier1RandomControlIdentity, loadTier1Artifacts, runRealTier1Conservative, runRealTier1WalkForwardConservative, runTier1BaselineSmoke } from "../../src/research/foundry/tier1-assembler.js";
+import { assembleTier1Baseline, assertTier1AssemblyCanRun, bindRealTier1ExperimentSpec, deriveTier1RandomControl, deriveTier1RandomControlIdentity, loadTier1Artifacts, runRealTier1Conservative, runRealTier1SealedHoldoutConservative, runRealTier1WalkForwardConservative, runTier1BaselineSmoke } from "../../src/research/foundry/tier1-assembler.js";
 import { buildAuthoritativeTimelineArtifact, buildCanonicalEpisodeArtifact, generateMinimumHistoryEligibilityArtifact, generatePitPortfolioRiskArtifact } from "../../src/research/foundry/tier1-pit-artifacts.js";
 import { FOUNDRY_SCHEMA_V1, validateFoundryRows } from "../../src/research/foundry/semantic-validators.js";
 import { fixtureSourceProvenance, type FoundryDerivationIdentity } from "../../src/research/foundry/source-provenance.js";
@@ -114,6 +114,7 @@ describe("Tier-1 artifact assembly", () => {
     expect(() => runRealTier1Conservative({ assembly: assembled, spec: realSpec, createdAtMs: 0 })).toThrow("FOUNDRY_REAL_TIER1_ASSEMBLY_NOT_PROVENANCE_VERIFIED");
     expect(() => runRealTier1Conservative({ assembly: assembled, spec: realSpec, createdAtMs: 0, candles: [] } as never)).toThrow("FOUNDRY_REAL_TIER1_ASSEMBLY_NOT_PROVENANCE_VERIFIED");
     expect(() => runRealTier1WalkForwardConservative({ assembly: assembled, spec: realSpec, createdAtMs: 0, candles: [] } as never)).toThrow("FOUNDRY_REAL_TIER1_ASSEMBLY_NOT_PROVENANCE_VERIFIED");
+    expect(() => runRealTier1SealedHoldoutConservative({ assembly: assembled, spec: realSpec, createdAtMs: 0, oosFreezeReportHash: "a".repeat(64), candles: [] } as never)).toThrow("FOUNDRY_REAL_TIER1_ASSEMBLY_NOT_PROVENANCE_VERIFIED");
     expect(() => assembleTier1Baseline({ artifacts, symbols, startMs: H, endMs: 2 * H, timeframeMs: H, liquidityPolicy: policy, researchMode: "REAL_TIER1" })).toThrow("FOUNDRY_REAL_TIER1_VERIFIED_RELOAD_REQUIRED");
     const incomplete = assembleTier1Baseline({ artifacts: artifacts.filter((artifact) => artifact.manifest.artifactKind !== "PORTFOLIO_RISK_SNAPSHOTS"), symbols, startMs: H, endMs: 2 * H, timeframeMs: H, liquidityPolicy: policy });
     expect(() => assertTier1AssemblyCanRun(incomplete)).toThrow("FOUNDRY_TIER1_INCOMPLETE_CANNOT_RUN_OR_RANK");

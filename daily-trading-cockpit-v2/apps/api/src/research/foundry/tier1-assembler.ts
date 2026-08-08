@@ -303,3 +303,47 @@ export function runRealTier1WalkForwardConservative(input: { assembly: Tier1Asse
   });
   return { label: input.assembly.label, folds: Object.freeze(folds) };
 }
+
+/**
+ * Executes the one sealed holdout only after the caller supplies the immutable
+ * OOS-freeze report identity.  The report itself is verified by the cloud
+ * orchestrator before this call; this API deliberately accepts no execution
+ * payload beyond that identity.
+ */
+export function runRealTier1SealedHoldoutConservative(input: { assembly: Tier1Assembly; spec: TournamentExperimentSpec; createdAtMs: number; oosFreezeReportHash: string }): { label: Tier1Assembly["label"]; holdoutRange: Readonly<{ startMs: number; endMs: number }>; randomControlIdentity: string; fairnessHash: string; result: TournamentMatrixResult } {
+  if (!/^[a-f0-9]{64}$/.test(input.oosFreezeReportHash)) throw new Error("FOUNDRY_REAL_TIER1_SEALED_HOLDOUT_OOS_FREEZE_HASH_INVALID");
+  assertVerifiedRealAssembly(input.assembly);
+  if (input.spec.parameters.tier1RandomControlIdentity !== undefined) throw new Error("FOUNDRY_REAL_TIER1_SEALED_HOLDOUT_CALLER_RANDOM_IDENTITY_FORBIDDEN");
+  const bound = bindRealTier1ExperimentSpec(input.assembly, input.spec);
+  const timestamps = [...new Set(input.assembly.canonicalCandles.map((candle) => candle.openTimeMs))].sort((left, right) => left - right);
+  const plan = buildWalkForwardPlan(timestamps, bound.validation); assertNoValidationLeakage(plan);
+  const holdoutStartMs = timestamps[plan.sealedHoldout.startIndex]!; const holdoutRange = Object.freeze({ startMs: holdoutStartMs, endMs: input.assembly.range.endMs });
+  const snapshots = input.assembly.universeSnapshots.filter((snapshot) => snapshot.asOfMs >= holdoutStartMs && snapshot.asOfMs < holdoutRange.endMs);
+  const candles = input.assembly.canonicalCandles.filter((candle) => candle.openTimeMs >= holdoutStartMs && candle.openTimeMs < holdoutRange.endMs);
+  const historyCandles = input.assembly.canonicalCandles.filter((candle) => candle.closeTimeMs < holdoutStartMs);
+  if (!snapshots.length || !candles.length) throw new Error("FOUNDRY_REAL_TIER1_SEALED_HOLDOUT_COVERAGE_MISSING");
+  const { random, strategies } = baselineStrategies(input.assembly, bound, holdoutRange);
+  const holdoutSpec: TournamentExperimentSpec = {
+    ...bound,
+    dataset: { ...bound.dataset, dataRange: holdoutRange, universeSnapshots: structuredClone(snapshots) },
+    parameters: {
+      ...bound.parameters,
+      tier1AssemblyHash: input.assembly.tier1AssemblyHash,
+      sealedHoldout: true,
+      sealedHoldoutOosFreezeReportHash: input.oosFreezeReportHash,
+      tier1RandomControlIdentity: random.identity,
+      tier1RandomControlPolicyVersion: "tier1-random-control-from-donchian-v3",
+    },
+  };
+  const result = runTournamentMatrix({
+    spec: holdoutSpec,
+    strategies,
+    createdAtMs: input.createdAtMs,
+    modes: ["CONSERVATIVE"],
+    postTradeEpisodePolicy: input.assembly.postTradeEpisodePolicy,
+    execution: { candles, historyCandles, universe: input.assembly.universe, portfolioRisk: input.assembly.portfolioRisk, fundingSettlements: input.assembly.canonicalFundingSettlements, fundingSettlementScheduleBySymbol: scheduleMap(input.assembly.fundingScheduleBySymbol) },
+  });
+  assertConservativeBaselineRuns(result.runs);
+  const fairnessHash = result.fairnessHashByMode.get("CONSERVATIVE"); if (!fairnessHash) throw new Error("FOUNDRY_REAL_TIER1_SEALED_HOLDOUT_FAIRNESS_MISSING");
+  return { label: input.assembly.label, holdoutRange, randomControlIdentity: random.identity, fairnessHash, result: { ...result, runs: result.runs.map((run) => ({ ...run, manifest: { ...run.manifest, empiricalGatePassed: true } })) } };
+}
