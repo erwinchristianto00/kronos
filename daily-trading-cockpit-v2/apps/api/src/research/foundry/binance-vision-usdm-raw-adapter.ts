@@ -152,6 +152,22 @@ async function bookTickerSamples(input: { path: string; relativePath: string; sy
 interface BookTickerArchivePlan { file: ArchiveBundleIdentity["files"][number]; symbol: string; startMs: number; endMs: number; isDailyRepair: boolean; }
 
 /**
+ * A repair archive is supplemental evidence, not a higher-priority feed. For
+ * one canonical tick the PIT mark is always the latest actual event, with the
+ * exchange update id breaking an exact event-time tie. Equal exchange keys
+ * that disagree on the BBO are irreconcilable source evidence and must not be
+ * resolved by archive order.
+ */
+function mergeBookTickerRepairSample(input: { current: BookTickerSample; repair: BookTickerSample; symbol: string }): BookTickerSample {
+  const { current, repair, symbol } = input;
+  if (repair.eventTimeMs > current.eventTimeMs || (repair.eventTimeMs === current.eventTimeMs && repair.updateId > current.updateId)) return repair;
+  if (repair.eventTimeMs === current.eventTimeMs && repair.updateId === current.updateId && (repair.bidPrice !== current.bidPrice || repair.bidQuantity !== current.bidQuantity || repair.askPrice !== current.askPrice || repair.askQuantity !== current.askQuantity)) {
+    throw new Error(`FOUNDRY_BINANCE_VISION_BOOKTICKER_REPAIR_CONFLICT_${symbol}_${repair.asOfMs}_EVENT_${repair.eventTimeMs}_UPDATE_${repair.updateId}`);
+  }
+  return current;
+}
+
+/**
  * Reads a monthly base stream and applies a separately checksum-verified daily
  * repair only to the repair day's canonical ticks. The monthly files never get
  * rewritten; a daily file cannot affect another date or silently fill a gap.
@@ -184,8 +200,9 @@ async function collectBookTickerSamples(input: { root: string; expectedCoverage:
         // requiring a leading repair quote would reject a valid monthly base.
         const imported = await bookTickerSamples({ path: resolve(input.root, plan.file.relativePath), relativePath: plan.file.relativePath, symbol, startMs, endMs, sourceStartMs: plan.startMs, sourceEndMs: plan.endMs, sourceHash: plan.file.fileHash, maxQuoteAgeMs: Number.MAX_SAFE_INTEGER, outputMode: "SELECTIONS" });
         for (const sample of imported.samples) {
-          if (!merged.has(sample.asOfMs)) throw new Error(`FOUNDRY_BINANCE_VISION_BOOKTICKER_REPAIR_OUTSIDE_BASE_${symbol}_${sample.asOfMs}`);
-          merged.set(sample.asOfMs, sample);
+          const current = merged.get(sample.asOfMs);
+          if (!current) throw new Error(`FOUNDRY_BINANCE_VISION_BOOKTICKER_REPAIR_OUTSIDE_BASE_${symbol}_${sample.asOfMs}`);
+          merged.set(sample.asOfMs, mergeBookTickerRepairSample({ current, repair: sample, symbol }));
         }
       }
     }

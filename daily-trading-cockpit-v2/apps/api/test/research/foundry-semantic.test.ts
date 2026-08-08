@@ -167,14 +167,31 @@ describe("Foundry semantic strictness", () => {
     try {
       const klineDirectory = join(root, "klines", "BTCUSDT", "1h"); const monthlyDirectory = join(root, "bookTicker", "BTCUSDT"); const repairDirectory = join(root, "bookTicker-daily-repair", "v1", "BTCUSDT"); mkdirSync(klineDirectory, { recursive: true }); mkdirSync(monthlyDirectory, { recursive: true }); mkdirSync(repairDirectory, { recursive: true });
       archive(join(klineDirectory, "BTCUSDT-1h-2023-05.zip"), `open_time,open,high,low,close,volume,close_time,quote_volume,count,taker_buy_volume,taker_buy_quote_volume,ignore\n${startMs - H},100,101,99,100,7,${startMs - 1},700,4,3,300,0\n${startMs},100,102,99,101,8,${startMs + H - 1},800,5,4,400,0\n${startMs + H},101,103,100,102,9,${startMs + 2 * H - 1},900,6,5,500,0\n`);
-      archive(join(monthlyDirectory, "BTCUSDT-bookTicker-2023-05.zip"), `update_id,best_bid_price,best_bid_qty,best_ask_price,best_ask_qty,transaction_time,event_time\n1,100,2,101,3,${startMs - 1},${startMs - 1}\n`);
+      // The monthly stream has a later real quote for the same H tick than
+      // the repair stream. A repair must not win merely because it is an
+      // overlay archive: the canonical PIT mark remains the latest event.
+      archive(join(monthlyDirectory, "BTCUSDT-bookTicker-2023-05.zip"), `update_id,best_bid_price,best_bid_qty,best_ask_price,best_ask_qty,transaction_time,event_time\n1,100,2,101,3,${startMs - 1},${startMs - 1}\n3,130,2,131,3,${startMs + H - 5},${startMs + H - 5}\n`);
       archive(join(repairDirectory, "BTCUSDT-bookTicker-2023-05-16.zip"), `update_id,best_bid_price,best_bid_qty,best_ask_price,best_ask_qty,transaction_time,event_time\n1,110,2,111,3,${startMs + 1},${startMs + 1}\n2,120,2,121,3,${startMs + H + 1},${startMs + H + 1}\n`);
       const coverage = { startMs, endMs, symbols: ["BTCUSDT"], cadenceMs: H }; const bundle = inspectArchiveBundle({ root, include: (path) => (path.startsWith("bookTicker/") || path.startsWith("bookTicker-daily-repair/") || path.startsWith("klines/")) && (path.endsWith(".zip") || path.endsWith(".zip.CHECKSUM")) }); const provenance = { provenanceType: "EXCHANGE_HISTORICAL_EXPORT" as const, provider: "Binance Vision", exchange: "BINANCE_USD_M", datasetId: "monthly-plus-daily-bookticker-repair-fixture", retrievedAtMs: 1, rawFileHash: bundle.archiveBundleHash, schemaVersion: "binance-vision-bookTicker-csv-v1", generationToolSha: "abcdef0" };
       const imported = await importBinanceVisionUsdMRawBookTickerLiquidityArchive({ root, expectedCoverage: coverage, candleRows: [{ symbol: "BTCUSDT", openTimeMs: startMs - H, closeTimeMs: startMs - 1, volume: 7, sourceHash: "prior-1" }, { symbol: "BTCUSDT", openTimeMs: startMs, closeTimeMs: startMs + H - 1, volume: 8, sourceHash: "prior-2" }, { symbol: "BTCUSDT", openTimeMs: startMs + H, closeTimeMs: startMs + 2 * H - 1, volume: 9, sourceHash: "prior-3" }] as never[], maxQuoteAgeMs: H, source: "Binance Vision monthly plus daily repair", sourceProvenance: provenance, generatedAtMs: 1, generationSha: "abcdef0" });
-      expect(imported.rows).toEqual([expect.objectContaining({ asOfMs: startMs, liquidityNotional: 200 }), expect.objectContaining({ asOfMs: startMs + H, liquidityNotional: 220 }), expect.objectContaining({ asOfMs: startMs + 2 * H, liquidityNotional: 240 })]);
+      expect(imported.rows).toEqual([expect.objectContaining({ asOfMs: startMs, liquidityNotional: 200 }), expect.objectContaining({ asOfMs: startMs + H, liquidityNotional: 260 }), expect.objectContaining({ asOfMs: startMs + 2 * H, liquidityNotional: 240 })]);
       const inspected = await inspectBinanceVisionUsdMRawBookTickerCoverage({ root, expectedCoverage: coverage, maxQuoteAgeMs: H });
       expect(inspected.samples.map((sample) => [sample.asOfMs, sample.withinMaxQuoteAge])).toEqual([[startMs, true], [startMs + H, true], [startMs + 2 * H, true]]);
       expect(inspected.archiveBundle.files.map((file) => file.relativePath)).toEqual(expect.arrayContaining(["bookTicker-daily-repair/v1/BTCUSDT/BTCUSDT-bookTicker-2023-05-16.zip"]));
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("fails closed when a daily repair contradicts a monthly BBO at the same exchange identity", async () => {
+    const root = mkdtempSync(join(tmpdir(), "foundry-binance-vision-bookticker-repair-conflict-")); const dayStartMs = Date.UTC(2023, 4, 16); const startMs = dayStartMs; const endMs = startMs + 2 * H;
+    const archive = (zipPath: string, body: string) => {
+      const source = `${zipPath}.csv`; writeFileSync(source, body); execFileSync("zip", ["-j", zipPath, source], { stdio: "ignore" }); unlinkSync(source);
+      const hash = createHash("sha256").update(readFileSync(zipPath)).digest("hex"); writeFileSync(`${zipPath}.CHECKSUM`, `${hash}  ${basename(zipPath)}\n`);
+    };
+    try {
+      const monthlyDirectory = join(root, "bookTicker", "BTCUSDT"); const repairDirectory = join(root, "bookTicker-daily-repair", "v1", "BTCUSDT"); mkdirSync(monthlyDirectory, { recursive: true }); mkdirSync(repairDirectory, { recursive: true });
+      archive(join(monthlyDirectory, "BTCUSDT-bookTicker-2023-05.zip"), `update_id,best_bid_price,best_bid_qty,best_ask_price,best_ask_qty,transaction_time,event_time\n1,100,2,101,3,${startMs - 1},${startMs - 1}\n7,100,2,101,3,${startMs + 1},${startMs + 1}\n`);
+      archive(join(repairDirectory, "BTCUSDT-bookTicker-2023-05-16.zip"), `update_id,best_bid_price,best_bid_qty,best_ask_price,best_ask_qty,transaction_time,event_time\n7,110,2,111,3,${startMs + 1},${startMs + 1}\n`);
+      await expect(inspectBinanceVisionUsdMRawBookTickerCoverage({ root, expectedCoverage: { startMs, endMs, symbols: ["BTCUSDT"], cadenceMs: H }, maxQuoteAgeMs: H })).rejects.toThrow("FOUNDRY_BINANCE_VISION_BOOKTICKER_REPAIR_CONFLICT");
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
