@@ -71,14 +71,14 @@ steps:
             ])
 
         lifecycle_catalogs = [
-            (48, "v1", os.environ["_LIFECYCLE_LAUNCH_BUNDLE_HASH"]),
-            (161, "v2", os.environ["_LIFECYCLE_DELISTING_BUNDLE_HASH"]),
+            (48, "v1", os.environ["_LIFECYCLE_LAUNCH_BUNDLE_HASH"], "launch"),
+            (161, "v2", os.environ["_LIFECYCLE_DELISTING_BUNDLE_HASH"], "delisting"),
         ]
-        for catalog_id, version, bundle_hash in lifecycle_catalogs:
+        for catalog_id, version, bundle_hash, bundle_role in lifecycle_catalogs:
             lifecycle_prefix = f"{study}/raw/lifecycle-binance-cms-catalog-{catalog_id}/{version}/{bundle_hash}"
             lifecycle_manifest_uri = f"{lifecycle_prefix}/acquisition-manifest.json"
             lifecycle_manifest_meta = describe(lifecycle_manifest_uri)
-            lifecycle_root = raw_root / f"lifecycle-binance-cms-catalog-{catalog_id}" / version / bundle_hash
+            lifecycle_root = raw_root / "lifecycle" / bundle_role
             lifecycle_manifest_path = lifecycle_root / "acquisition-manifest.json"
             copy(lifecycle_manifest_uri, str(lifecycle_manifest_meta["generation"]), lifecycle_manifest_path)
             lifecycle_manifest = json.loads(lifecycle_manifest_path.read_text(encoding="utf8"))

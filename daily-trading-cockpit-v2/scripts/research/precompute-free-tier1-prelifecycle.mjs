@@ -222,8 +222,11 @@ async function build() {
   if (inventory.schemaVersion !== "KronosFreeTier1PrelifecycleGcsInventory/v1") throw new Error("FREE_TIER1_PRELIFECYCLE_GCS_INVENTORY_INVALID");
   const bboManifest = assertFrozenBookTickerManifest({ path: resolve(rawRoot, "bbo-raw-acquisition-manifest.json"), expectedBundleHash: bboRawBundleHash });
   const dailyRepairManifest = assertDailyBookTickerRepairManifest({ path: resolve(rawRoot, "bbo-daily-repair-acquisition-manifest.json"), study: inventory.study, expectedMonthlyBundleHash: bboRawBundleHash, expectedRepairBundleHash: bboDailyRepairBundleHash });
-  const launchRoot = resolve(rawRoot, "lifecycle-binance-cms-catalog-48", "v1", lifecycleLaunchBundleHash);
-  const delistingRoot = resolve(rawRoot, "lifecycle-binance-cms-catalog-161", "v2", lifecycleDelistingBundleHash);
+  // These relative names must match the source archive bundle created by the
+  // lifecycle adapter, so a later REAL_TIER1 assembly can independently
+  // reverify `launch/...` and `delisting/...` without remapping files.
+  const launchRoot = resolve(rawRoot, "lifecycle", "launch");
+  const delistingRoot = resolve(rawRoot, "lifecycle", "delisting");
   const launchCms = assertCmsCatalogManifest({ path: resolve(launchRoot, "acquisition-manifest.json"), schemaVersion: "KronosBinanceCmsLifecycleRaw/v1", catalogId: 48, expectedBundleHash: lifecycleLaunchBundleHash });
   const delistingCms = assertCmsCatalogManifest({ path: resolve(delistingRoot, "acquisition-manifest.json"), schemaVersion: "KronosBinanceCmsLifecycleRaw/v2", catalogId: 161, expectedBundleHash: lifecycleDelistingBundleHash });
 
