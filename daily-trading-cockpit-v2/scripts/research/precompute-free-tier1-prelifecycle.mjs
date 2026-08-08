@@ -13,11 +13,11 @@ import { tournamentHash } from "../../apps/api/src/research/contract/tournament-
 import { inspectArchiveBundle } from "../../apps/api/src/research/foundry/archive-bundle.ts";
 import {
   importBinanceVisionUsdMRawBookTickerLiquidityArchive,
+  importBinanceVisionUsdMRawBookTickerObservedTradabilityTimelines,
   importBinanceVisionUsdMRawCandleArchive,
   importBinanceVisionUsdMRawFundingArchive,
 } from "../../apps/api/src/research/foundry/binance-vision-usdm-raw-adapter.ts";
 import { loadFoundryArtifact, persistFoundryArtifact } from "../../apps/api/src/research/foundry/artifact-store.ts";
-import { importBinanceCmsBoundedUsdMLifecycle } from "../../apps/api/src/research/foundry/binance-cms-lifecycle-adapter.ts";
 import { generateMinimumHistoryEligibilityArtifact, generatePitPortfolioRiskArtifact } from "../../apps/api/src/research/foundry/tier1-pit-artifacts.ts";
 
 const HOUR_MS = 3_600_000;
@@ -121,24 +121,6 @@ function assertDailyBookTickerRepairManifest(input) {
   return manifest;
 }
 
-function assertCmsCatalogManifest(input) {
-  const raw = readFileSync(input.path, "utf8");
-  if (!raw.endsWith("\n")) throw new Error("FREE_TIER1_CMS_MANIFEST_TERMINAL_NEWLINE_REQUIRED");
-  const manifest = JSON.parse(raw);
-  if (
-    manifest.schemaVersion !== input.schemaVersion
-    || manifest.status !== "RAW_CATALOG_ACQUIRED_NOT_A_TIMELINE"
-    || manifest.provider !== "Binance"
-    || manifest.exchange !== "BINANCE_USDM"
-    || manifest.datasetId !== `binance-cms-public-announcements-catalog-${input.catalogId}`
-    || manifest.catalog?.catalogId !== input.catalogId
-    || manifest.archiveBundleHash !== input.expectedBundleHash
-    || !Array.isArray(manifest.requests)
-    || manifest.requests.length === 0
-  ) throw new Error(`FREE_TIER1_CMS_MANIFEST_INVALID_${input.catalogId}`);
-  return { manifest, manifestSha256: sha256(Buffer.from(raw, "utf8")) };
-}
-
 function coverage(startMs, endMs, extra = {}) {
   return { startMs, endMs, symbols: [...SYMBOLS], cadenceMs: HOUR_MS, ...extra };
 }
@@ -211,9 +193,7 @@ async function build() {
   const generationSha = required("GENERATION_SHA");
   const bboRawBundleHash = required("BBO_RAW_BUNDLE_HASH");
   const bboDailyRepairBundleHash = required("BBO_DAILY_REPAIR_BUNDLE_HASH");
-  const lifecycleLaunchBundleHash = required("LIFECYCLE_LAUNCH_BUNDLE_HASH");
-  const lifecycleDelistingBundleHash = required("LIFECYCLE_DELISTING_BUNDLE_HASH");
-  if (!SHA.test(generationSha) || !HASH.test(bboRawBundleHash) || !HASH.test(bboDailyRepairBundleHash) || !HASH.test(lifecycleLaunchBundleHash) || !HASH.test(lifecycleDelistingBundleHash)) throw new Error("FREE_TIER1_PRELIFECYCLE_GENERATION_IDENTITY_INVALID");
+  if (!SHA.test(generationSha) || !HASH.test(bboRawBundleHash) || !HASH.test(bboDailyRepairBundleHash)) throw new Error("FREE_TIER1_PRELIFECYCLE_GENERATION_IDENTITY_INVALID");
 
   const gcsInventoryPath = resolve(rawRoot, "source-gcs-inventory.json");
   const inventoryBytes = readFileSync(gcsInventoryPath);
@@ -222,18 +202,12 @@ async function build() {
   if (inventory.schemaVersion !== "KronosFreeTier1PrelifecycleGcsInventory/v1") throw new Error("FREE_TIER1_PRELIFECYCLE_GCS_INVENTORY_INVALID");
   const bboManifest = assertFrozenBookTickerManifest({ path: resolve(rawRoot, "bbo-raw-acquisition-manifest.json"), expectedBundleHash: bboRawBundleHash });
   const dailyRepairManifest = assertDailyBookTickerRepairManifest({ path: resolve(rawRoot, "bbo-daily-repair-acquisition-manifest.json"), study: inventory.study, expectedMonthlyBundleHash: bboRawBundleHash, expectedRepairBundleHash: bboDailyRepairBundleHash });
-  // These relative names must match the source archive bundle created by the
-  // lifecycle adapter, so a later REAL_TIER1 assembly can independently
-  // reverify `launch/...` and `delisting/...` without remapping files.
-  const launchRoot = resolve(rawRoot, "lifecycle", "launch");
-  const delistingRoot = resolve(rawRoot, "lifecycle", "delisting");
-  const launchCms = assertCmsCatalogManifest({ path: resolve(launchRoot, "acquisition-manifest.json"), schemaVersion: "KronosBinanceCmsLifecycleRaw/v1", catalogId: 48, expectedBundleHash: lifecycleLaunchBundleHash });
-  const delistingCms = assertCmsCatalogManifest({ path: resolve(delistingRoot, "acquisition-manifest.json"), schemaVersion: "KronosBinanceCmsLifecycleRaw/v2", catalogId: 161, expectedBundleHash: lifecycleDelistingBundleHash });
 
   const warmupCoverage = coverage(WARMUP_START_MS, WARMUP_END_MS);
   const executionCoverage = coverage(STUDY_START_MS, STUDY_END_MS);
   const candleRoot = resolve(rawRoot, "klines");
   const fundingRoot = resolve(rawRoot, "fundingRate");
+  const bboTimelineArchive = inspectArchiveBundle({ root: rawRoot, include: (relativePath) => (relativePath.startsWith("bookTicker/") || relativePath.startsWith("bookTicker-daily-repair/v1/")) && (relativePath.endsWith(".zip") || relativePath.endsWith(".zip.CHECKSUM")) });
   const bboArchive = inspectArchiveBundle({ root: rawRoot, include: (relativePath) => (relativePath.startsWith("bookTicker/") || relativePath.startsWith("bookTicker-daily-repair/v1/") || relativePath.startsWith("klines/")) && (relativePath.endsWith(".zip") || relativePath.endsWith(".zip.CHECKSUM")) });
   const bboFiles = new Map(bboArchive.files.map((file) => [file.relativePath, file.fileHash]));
   for (const object of bboManifest.objects) {
@@ -275,10 +249,12 @@ async function build() {
     generationSha,
   });
 
-  const lifecycle = importBinanceCmsBoundedUsdMLifecycle({
-    launchRoot,
-    delistingRoot,
+  const lifecycle = await importBinanceVisionUsdMRawBookTickerObservedTradabilityTimelines({
+    root: rawRoot,
     expectedCoverage: executionCoverage,
+    maxQuoteAgeMs: BBO_MAX_AGE_MS,
+    source: `Binance Vision verified USD-M bookTicker observed tradability at every completed-candle decision; raw identity ${mergedBboRawIdentity}`,
+    sourceProvenance: sourceProvenance({ provenanceType: "EXCHANGE_HISTORICAL_EXPORT", datasetId: `binance-vision-usdm-bookticker-observed-tradability-v1:${mergedBboRawIdentity}`, rawFileHash: bboTimelineArchive.archiveBundleHash, inventoryHash, generatedAtMs, generationSha }),
     generatedAtMs,
     generationSha,
   });
@@ -302,7 +278,7 @@ async function build() {
     expectedCoverage: executionCoverage,
     decisionTimesMs,
     minimumCompletedBars: MINIMUM_COMPLETED_BARS,
-    source: "Derived only from verified Binance CMS lifecycle state and strictly prior Binance Vision completed candles",
+    source: "Derived only from verified Binance Vision BBO observed-tradability state and strictly prior Binance Vision completed candles",
     sourceProvenance: derivedProvenance({ datasetId: "free-binance-vision-minimum-history-btceth-v1", parentSemanticManifestHashes: minimumHistoryParents, policyVersion: minimumHistoryDerivation.policyVersion, parameters: minimumHistoryDerivation.parameters, generatedAtMs, generationSha }),
     derivation: minimumHistoryDerivation,
     generatedAtMs,
@@ -360,12 +336,8 @@ async function build() {
     generation: { generatedAtMs, generationSha },
     sourceGcsInventoryHash: inventoryHash,
     frozenBookTicker: { rawManifestBundleHash: bboRawBundleHash, rawManifestSchemaVersion: bboManifest.schemaVersion, objectCount: bboManifest.objects.length, dailyRepairBundleHash: bboDailyRepairBundleHash, dailyRepairManifestSchemaVersion: dailyRepairManifest.schemaVersion, dailyRepairObjectCount: dailyRepairManifest.objects.length, mergedRawIdentityHash: mergedBboRawIdentity },
-    frozenLifecycle: {
-      launch: { catalogId: 48, rawBundleHash: lifecycleLaunchBundleHash, manifestSha256: launchCms.manifestSha256, requestCount: launchCms.manifest.requests.length },
-      delisting: { catalogId: 161, rawBundleHash: lifecycleDelistingBundleHash, manifestSha256: delistingCms.manifestSha256, requestCount: delistingCms.manifest.requests.length },
-      combinedSourceArchiveBundleHash: lifecycle.sourceArchiveBundle.archiveBundleHash,
-    },
-    policies: { bboMaxQuoteAgeMs: BBO_MAX_AGE_MS, minimumHistory: { minimumCompletedBars: MINIMUM_COMPLETED_BARS, strictlyPrior: true }, pitRisk: { lookbackBars: RISK_LOOKBACK_BARS, minimumObservations: RISK_MINIMUM_OBSERVATIONS, closeIntervalMs: HOUR_MS, snapshotIntervalMs: HOUR_MS, strictlyPrior: true } },
+    observedTradability: { rawBookTickerArchiveBundleHash: lifecycle.archiveBundle.archiveBundleHash, policyVersion: "binance-vision-usdm-bookticker-observed-tradability-v1", bootstrapDecisionTimeMs: STUDY_START_MS - 1, maxQuoteAgeMs: BBO_MAX_AGE_MS },
+    policies: { bboMaxQuoteAgeMs: BBO_MAX_AGE_MS, observedTradability: { source: "official_binance_vision_bookticker", decisionTimeRule: "completed_candle_close_ms", bootstrapRule: "strictly_prior_quote_at_range_start_minus_1ms", rejectsStaleOrMissingDecisionQuotes: true }, minimumHistory: { minimumCompletedBars: MINIMUM_COMPLETED_BARS, strictlyPrior: true }, pitRisk: { lookbackBars: RISK_LOOKBACK_BARS, minimumObservations: RISK_MINIMUM_OBSERVATIONS, closeIntervalMs: HOUR_MS, snapshotIntervalMs: HOUR_MS, strictlyPrior: true } },
     artifacts: artifacts.map(({ name, built }) => artifactRecord(name, built)),
     localVerifiedReload: true,
     realTier1Blockers: [],

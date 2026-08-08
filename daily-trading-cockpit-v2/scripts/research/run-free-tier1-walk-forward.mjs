@@ -125,8 +125,8 @@ function prepare(input) {
   const archiveRoots = {
     COMPLETED_CANDLES: resolve(input.rawRoot, "klines"),
     FUNDING_SETTLEMENTS: resolve(input.rawRoot, "fundingRate"),
-    LISTING_DELISTING_TIMELINE: resolve(input.rawRoot, "lifecycle"),
-    FUTURES_AVAILABILITY_TIMELINE: resolve(input.rawRoot, "lifecycle"),
+    LISTING_DELISTING_TIMELINE: input.rawRoot,
+    FUTURES_AVAILABILITY_TIMELINE: input.rawRoot,
     PIT_LIQUIDITY_SPREAD: input.rawRoot,
   };
   const assembly = assembleTier1Baseline({ artifacts, provenanceParents: parents, symbols: SYMBOLS, startMs: START_MS, endMs: END_MS, timeframeMs: HOUR_MS, liquidityPolicy, researchMode: "REAL_TIER1", archiveRoots });
@@ -151,7 +151,7 @@ function prepare(input) {
     capabilityTier: "TIER_1_BASELINE",
     researchMode: "REAL_TIER1",
     dataset: {
-      provider: "Binance Vision + Binance CMS official exports",
+      provider: "Binance Vision official USD-M historical exports",
       dataRange: { startMs: START_MS, endMs: END_MS },
       candlesHash: candles.manifest.rowsHash,
       fundingHash: funding.manifest.rowsHash,

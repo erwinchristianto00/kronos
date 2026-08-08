@@ -8,8 +8,6 @@ steps:
       - _STUDY=${_STUDY}
       - _BBO_RAW_BUNDLE_HASH=${_BBO_RAW_BUNDLE_HASH}
       - _BBO_DAILY_REPAIR_BUNDLE_HASH=${_BBO_DAILY_REPAIR_BUNDLE_HASH}
-      - _LIFECYCLE_LAUNCH_BUNDLE_HASH=${_LIFECYCLE_LAUNCH_BUNDLE_HASH}
-      - _LIFECYCLE_DELISTING_BUNDLE_HASH=${_LIFECYCLE_DELISTING_BUNDLE_HASH}
     args:
       - -ceu
       - |
@@ -70,40 +68,6 @@ steps:
                 {"role": "bookTickerDailyRepairChecksum", "uri": checksum_meta["uri"], "generation": str(checksum_meta["generation"]), "sizeBytes": int(checksum_meta["sizeBytes"]), "relativePath": f"bookTicker-daily-repair/v1/{relative}.CHECKSUM"},
             ])
 
-        lifecycle_catalogs = [
-            (48, "v1", os.environ["_LIFECYCLE_LAUNCH_BUNDLE_HASH"], "launch"),
-            (161, "v2", os.environ["_LIFECYCLE_DELISTING_BUNDLE_HASH"], "delisting"),
-        ]
-        for catalog_id, version, bundle_hash, bundle_role in lifecycle_catalogs:
-            lifecycle_prefix = f"{study}/raw/lifecycle-binance-cms-catalog-{catalog_id}/{version}/{bundle_hash}"
-            lifecycle_manifest_uri = f"{lifecycle_prefix}/acquisition-manifest.json"
-            lifecycle_manifest_meta = describe(lifecycle_manifest_uri)
-            lifecycle_root = raw_root / "lifecycle" / bundle_role
-            lifecycle_manifest_path = lifecycle_root / "acquisition-manifest.json"
-            copy(lifecycle_manifest_uri, str(lifecycle_manifest_meta["generation"]), lifecycle_manifest_path)
-            lifecycle_manifest = json.loads(lifecycle_manifest_path.read_text(encoding="utf8"))
-            if (
-                lifecycle_manifest.get("status") != "RAW_CATALOG_ACQUIRED_NOT_A_TIMELINE"
-                or lifecycle_manifest.get("provider") != "Binance"
-                or lifecycle_manifest.get("exchange") != "BINANCE_USDM"
-                or lifecycle_manifest.get("datasetId") != f"binance-cms-public-announcements-catalog-{catalog_id}"
-                or lifecycle_manifest.get("catalog", {}).get("catalogId") != catalog_id
-                or lifecycle_manifest.get("archiveBundleHash") != bundle_hash
-                or not lifecycle_manifest.get("requests")
-            ):
-                raise RuntimeError(f"frozen lifecycle catalog manifest is invalid: {catalog_id}")
-            inventory["objects"].append({"role": f"lifecycleCatalog{catalog_id}Manifest", "uri": lifecycle_manifest_uri, "generation": str(lifecycle_manifest_meta["generation"]), "sizeBytes": int(lifecycle_manifest_meta["size"]), "relativePath": str(lifecycle_manifest_path.relative_to(raw_root))})
-            for request in lifecycle_manifest["requests"]:
-                relative = request.get("relativePath")
-                if not relative or relative == "acquisition-manifest.json" or relative.startswith("/") or ".." in pathlib.PurePosixPath(relative).parts:
-                    raise RuntimeError(f"lifecycle manifest request path is invalid: {catalog_id}")
-                request_uri = f"{lifecycle_prefix}/{relative}"
-                request_meta = describe(request_uri)
-                if int(request_meta["size"]) != int(request.get("sizeBytes", -1)):
-                    raise RuntimeError(f"lifecycle GCS object size mismatches immutable manifest: {catalog_id}/{relative}")
-                copy(request_uri, str(request_meta["generation"]), lifecycle_root / relative)
-                inventory["objects"].append({"role": f"lifecycleCatalog{catalog_id}Request", "uri": request_uri, "generation": str(request_meta["generation"]), "sizeBytes": int(request_meta["size"]), "relativePath": str((lifecycle_root / relative).relative_to(raw_root))})
-
         months = [*(f"2023-{month:02d}" for month in range(4, 13)), *(f"2024-{month:02d}" for month in range(1, 4))]
         funding_months = [*(f"2023-{month:02d}" for month in range(5, 13)), *(f"2024-{month:02d}" for month in range(1, 4))]
         for symbol in ("BTCUSDT", "ETHUSDT"):
@@ -143,8 +107,6 @@ steps:
       - GENERATION_SHA=${_GENERATION_SHA}
       - BBO_RAW_BUNDLE_HASH=${_BBO_RAW_BUNDLE_HASH}
       - BBO_DAILY_REPAIR_BUNDLE_HASH=${_BBO_DAILY_REPAIR_BUNDLE_HASH}
-      - LIFECYCLE_LAUNCH_BUNDLE_HASH=${_LIFECYCLE_LAUNCH_BUNDLE_HASH}
-      - LIFECYCLE_DELISTING_BUNDLE_HASH=${_LIFECYCLE_DELISTING_BUNDLE_HASH}
     args:
       - -ceu
       - |
@@ -559,7 +521,5 @@ substitutions:
   _STUDY: gs://bucket-coin-yuhu/kronos-tier1-archives/binance-vision-usdm-bookticker-free-walkforward-v1
   _BBO_RAW_BUNDLE_HASH: 3338e528944869fec5b2ce112cdeedac7aa1fe031563a141a57babf4ad39584a
   _BBO_DAILY_REPAIR_BUNDLE_HASH: unknown
-  _LIFECYCLE_LAUNCH_BUNDLE_HASH: 838e1fcc1fdc5f79f95dc7f6b3a065f7ea1273020b463b8d897dd963a0f3a7cb
-  _LIFECYCLE_DELISTING_BUNDLE_HASH: 65058e687a0a6832de5d57a461b763a14ad20dcc7468e55e1e584687b746dff8
   _GENERATED_AT_MS: "1786118676317"
   _GENERATION_SHA: unknown

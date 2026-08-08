@@ -7,8 +7,9 @@ import { buildFoundryArtifact, type FoundryArtifactManifest } from "./artifact-s
 import { inspectArchiveBundle, readArchiveBundle, type ArchiveBundleIdentity } from "./archive-bundle.js";
 import type { FoundryExpectedCoverage } from "./derived-coverage.js";
 import { canonicalizeFundingSettlements, expectedFundingSettlementTimes } from "./funding-schedule.js";
-import { FOUNDRY_SCHEMA_V1, type ValidatedFoundryRow } from "./semantic-validators.js";
+import { FOUNDRY_SCHEMA_V1, FOUNDRY_SCHEMA_V2, type ValidatedFoundryRow } from "./semantic-validators.js";
 import type { FoundrySourceProvenance } from "./source-provenance.js";
+import { buildAuthoritativeTimelineArtifact } from "./tier1-pit-artifacts.js";
 
 const HOUR_MS = 3_600_000;
 // Binance Vision's first USD-M bookTicker monthly export has one verified
@@ -238,6 +239,41 @@ export async function importBinanceVisionUsdMRawBookTickerLiquidityArchive(input
   }).sort((a, b) => a.asOfMs - b.asOfMs || a.symbol.localeCompare(b.symbol));
   const built = buildFoundryArtifact({ artifactKind: "PIT_LIQUIDITY_SPREAD", schemaVersion: FOUNDRY_SCHEMA_V1, source: input.source, sourceProvenance: input.sourceProvenance, archiveBundle, units: { asOfMs: "unix_ms_completed_candle_close", validUntilMs: "unix_ms_exact_decision", volume: "base_asset_completed_decision_1h", liquidityNotional: "USDT_min_best_bid_ask_notional", spreadBps: "inside_bbo_bps", policy: BOOK_TICKER_HOURLY_POLICY_VERSION, archiveEndTailToleranceMs: `${BOOK_TICKER_ARCHIVE_END_TAIL_TOLERANCE_MS}ms` }, generatedAtMs: input.generatedAtMs, generationSha: input.generationSha, expectedCoverage: { ...input.expectedCoverage, maxSnapshotAgeMs: input.maxQuoteAgeMs }, rows });
   return { rows: built.canonicalRows, manifest: built.manifest };
+}
+
+/**
+ * Builds bounded availability evidence only from actual Binance Vision USD-M
+ * bookTicker events. This is deliberately not an inference from candles or a
+ * current exchangeInfo response: a positive interval exists only after a
+ * source quote establishes the pre-range state and every subsequent completed
+ * candle-close decision has a non-stale official BBO mark. One stale or
+ * missing decision mark rejects both timeline artifacts.
+ */
+export async function importBinanceVisionUsdMRawBookTickerObservedTradabilityTimelines(input: { root: string; expectedCoverage: FoundryExpectedCoverage; maxQuoteAgeMs: number; source: string; sourceProvenance: FoundrySourceProvenance; generatedAtMs: number; generationSha: string }): Promise<{ listing: ReturnType<typeof buildAuthoritativeTimelineArtifact>; futuresAvailability: ReturnType<typeof buildAuthoritativeTimelineArtifact>; archiveBundle: ArchiveBundleIdentity }> {
+  if (input.expectedCoverage.cadenceMs !== HOUR_MS || !Number.isInteger(input.maxQuoteAgeMs) || input.maxQuoteAgeMs < 0 || input.expectedCoverage.startMs < HOUR_MS) throw new Error("FOUNDRY_BINANCE_VISION_BOOKTICKER_TRADABILITY_CONTRACT_INVALID");
+  // Read one completed hour before the requested range so the first decision
+  // has a direct, strictly-prior source event to establish its state. This is
+  // a bootstrap observation, not a synthetic timestamp or a future fill.
+  const collected = await collectBookTickerSamples({ root: input.root, expectedCoverage: { ...input.expectedCoverage, startMs: input.expectedCoverage.startMs - HOUR_MS } });
+  const expectedDecisionStartMs = input.expectedCoverage.startMs + HOUR_MS - 1;
+  const expectedDecisionCount = (input.expectedCoverage.endMs - input.expectedCoverage.startMs) / HOUR_MS;
+  const rows = input.expectedCoverage.symbols.slice().sort().map((symbol) => {
+    const symbolSamples = collected.samples.filter((sample) => sample.symbol === symbol);
+    const bootstrap = symbolSamples.find((sample) => sample.asOfMs === input.expectedCoverage.startMs - 1);
+    const decisions = symbolSamples.filter((sample) => sample.asOfMs >= expectedDecisionStartMs && sample.asOfMs < input.expectedCoverage.endMs);
+    if (!bootstrap || bootstrap.eventTimeMs > bootstrap.asOfMs || decisions.length !== expectedDecisionCount || decisions.some((sample, index) => sample.asOfMs !== expectedDecisionStartMs + index * HOUR_MS)) throw new Error(`FOUNDRY_BINANCE_VISION_BOOKTICKER_TRADABILITY_COVERAGE_INVALID_${symbol}`);
+    const evidence = [bootstrap, ...decisions]; assertBookTickerAge(evidence, input.maxQuoteAgeMs);
+    // The interval is bounded by verified, exact decision-tick observations.
+    // Its hash names every source event used, so changing an event, archive, or
+    // quote-age policy changes both timeline artifact identities.
+    const sourceHash = tournamentHash({ policyVersion: "binance-vision-usdm-bookticker-observed-tradability-v1", symbol, maxQuoteAgeMs: input.maxQuoteAgeMs, bootstrap: { asOfMs: bootstrap.asOfMs, eventTimeMs: bootstrap.eventTimeMs, updateId: bootstrap.updateId, sourceHash: bootstrap.sourceHash }, decisions: decisions.map((sample) => ({ asOfMs: sample.asOfMs, eventTimeMs: sample.eventTimeMs, updateId: sample.updateId, sourceHash: sample.sourceHash })) });
+    return { symbol, effectiveTimeMs: bootstrap.eventTimeMs, validUntilMs: input.expectedCoverage.endMs - 1, sourceHash };
+  });
+  const archiveBundle = collected.archiveBundle;
+  const common = { schemaVersion: FOUNDRY_SCHEMA_V2, source: input.source, sourceProvenance: input.sourceProvenance, archiveBundle, generatedAtMs: input.generatedAtMs, generationSha: input.generationSha, expectedCoverage: input.expectedCoverage };
+  const listing = buildAuthoritativeTimelineArtifact({ ...common, artifactKind: "LISTING_DELISTING_TIMELINE", rows: rows.map((row) => ({ ...row, status: "LISTED" })) });
+  const futuresAvailability = buildAuthoritativeTimelineArtifact({ ...common, artifactKind: "FUTURES_AVAILABILITY_TIMELINE", rows: rows.map((row) => ({ ...row, available: true })) });
+  return { listing, futuresAvailability, archiveBundle };
 }
 
 /** Reads the same checksum-verified merged BBO stream as the liquidity importer without turning a stale quote into eligibility evidence. */
