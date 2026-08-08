@@ -46,7 +46,7 @@ function exactChecksum(bundle: ArchiveBundleIdentity, root: string): void {
 }
 function csvText(path: string): string { return execFileSync("/bin/cat", [path], { encoding: "utf8", maxBuffer: 1024 * 1024 }); }
 function symbolFromPath(relativePath: string, kind: "kline" | "funding" | "bookTicker"): string {
-  const expression = kind === "kline" ? /^([A-Z0-9]+)\/1h\/\1-1h-\d{4}-\d{2}\.zip$/ : kind === "funding" ? /^([A-Z0-9]+)\/\1-fundingRate-\d{4}-\d{2}\.zip$/ : /^bookTicker\/([A-Z0-9]+)\/\1-bookTicker-\d{4}-\d{2}\.zip$/;
+  const expression = kind === "kline" ? /^([A-Z0-9]+)\/1h\/\1-1h-\d{4}-\d{2}\.zip$/ : kind === "funding" ? /^([A-Z0-9]+)\/\1-fundingRate-\d{4}-\d{2}\.zip$/ : /^(?:bookTicker|bookTicker-daily-repair\/v1)\/([A-Z0-9]+)\/\1-bookTicker-\d{4}-\d{2}(?:-\d{2})?\.zip$/;
   const match = relativePath.match(expression); if (!match) throw new Error(`FOUNDRY_BINANCE_VISION_ARCHIVE_PATH_INVALID_${relativePath}`); return match[1]!;
 }
 function sourceHash(bundle: ArchiveBundleIdentity, relativePath: string): string { const value = bundle.files.find((file) => file.relativePath === relativePath)?.fileHash; if (!value) throw new Error(`FOUNDRY_BINANCE_VISION_ARCHIVE_FILE_MISSING_${relativePath}`); return value; }
@@ -81,10 +81,14 @@ export function importBinanceVisionUsdMRawFundingArchive(input: { root: string; 
   return { rows: built.canonicalRows, manifest: built.manifest };
 }
 
-function monthRange(relativePath: string): { startMs: number; endMs: number } {
-  const date = relativePath.match(/-(\d{4})-(\d{2})\.zip$/); if (!date) throw new Error(`FOUNDRY_BINANCE_VISION_MONTH_INVALID_${relativePath}`);
-  const year = Number(date[1]); const month = Number(date[2]); if (month < 1 || month > 12) throw new Error(`FOUNDRY_BINANCE_VISION_MONTH_INVALID_${relativePath}`);
-  return { startMs: Date.UTC(year, month - 1, 1), endMs: Date.UTC(year, month, 1) };
+function isBookTickerArchive(relativePath: string): boolean { return relativePath.startsWith("bookTicker/") || relativePath.startsWith("bookTicker-daily-repair/v1/"); }
+function bookTickerRange(relativePath: string): { startMs: number; endMs: number; isDailyRepair: boolean } {
+  const date = relativePath.match(/-(\d{4})-(\d{2})(?:-(\d{2}))?\.zip$/); if (!date) throw new Error(`FOUNDRY_BINANCE_VISION_BOOKTICKER_RANGE_INVALID_${relativePath}`);
+  const year = Number(date[1]); const month = Number(date[2]); const day = date[3] === undefined ? undefined : Number(date[3]);
+  if (month < 1 || month > 12 || (day !== undefined && (day < 1 || day > 31))) throw new Error(`FOUNDRY_BINANCE_VISION_BOOKTICKER_RANGE_INVALID_${relativePath}`);
+  const startMs = Date.UTC(year, month - 1, day ?? 1); const expected = day === undefined ? { year, month } : { year, month, day };
+  const actual = new Date(startMs); if (actual.getUTCFullYear() !== expected.year || actual.getUTCMonth() + 1 !== expected.month || (day !== undefined && actual.getUTCDate() !== day)) throw new Error(`FOUNDRY_BINANCE_VISION_BOOKTICKER_RANGE_INVALID_${relativePath}`);
+  return { startMs, endMs: day === undefined ? Date.UTC(year, month, 1) : startMs + 24 * HOUR_MS, isDailyRepair: relativePath.startsWith("bookTicker-daily-repair/v1/") };
 }
 function waitFor(child: ReturnType<typeof spawn>, label: string): Promise<void> { return new Promise((resolvePromise, reject) => { child.once("error", reject); child.once("exit", (code) => code === 0 ? resolvePromise() : reject(new Error(`FOUNDRY_BINANCE_VISION_PROCESS_FAILED_${label}_${code ?? "SIGNAL"}`))); }); }
 
@@ -145,28 +149,65 @@ async function bookTickerSamples(input: { path: string; relativePath: string; sy
   return { samples: output, carry, ...(base ? { base } : {}) };
 }
 
-/** Streams official monthly bookTicker ZIPs into one exact BBO mark per canonical hourly decision tick. */
+interface BookTickerArchivePlan { file: ArchiveBundleIdentity["files"][number]; symbol: string; startMs: number; endMs: number; isDailyRepair: boolean; }
+
+/**
+ * Reads a monthly base stream and applies a separately checksum-verified daily
+ * repair only to the repair day's canonical ticks. The monthly files never get
+ * rewritten; a daily file cannot affect another date or silently fill a gap.
+ */
+async function collectBookTickerSamples(input: { root: string; expectedCoverage: FoundryExpectedCoverage }): Promise<{ archiveBundle: ArchiveBundleIdentity; samples: BookTickerSample[] }> {
+  const archiveBundle = sourceArchive({ root: input.root, required: (path) => isBookTickerArchive(path) && archiveFile(path) });
+  const plans = archiveBundle.files.filter((file) => zip(file.relativePath)).map((file): BookTickerArchivePlan => {
+    const { startMs, endMs, isDailyRepair } = bookTickerRange(file.relativePath); return { file, symbol: symbolFromPath(file.relativePath, "bookTicker"), startMs, endMs, isDailyRepair };
+  });
+  const expectedSymbols = [...input.expectedCoverage.symbols].sort(); const actualSymbols = [...new Set(plans.map((plan) => plan.symbol))].sort();
+  if (JSON.stringify(actualSymbols) !== JSON.stringify(expectedSymbols)) throw new Error("FOUNDRY_BINANCE_VISION_BOOKTICKER_SYMBOL_COVERAGE_INVALID");
+  const grouped = await Promise.all(expectedSymbols.map(async (symbol) => {
+    const all = plans.filter((plan) => plan.symbol === symbol); const monthly = all.filter((plan) => !plan.isDailyRepair).sort((left, right) => left.startMs - right.startMs || left.file.relativePath.localeCompare(right.file.relativePath)); const repairs = all.filter((plan) => plan.isDailyRepair).sort((left, right) => left.startMs - right.startMs || left.file.relativePath.localeCompare(right.file.relativePath));
+    if (!monthly.length || repairs.some((plan, index) => index > 0 && repairs[index - 1]!.endMs > plan.startMs)) throw new Error(`FOUNDRY_BINANCE_VISION_BOOKTICKER_REPAIR_PLAN_INVALID_${symbol}`);
+    const merged = new Map<number, BookTickerSample>(); let monthlyCarry: BookTickerState | undefined;
+    for (const plan of monthly) {
+      const startMs = Math.max(input.expectedCoverage.startMs, plan.startMs); const endMs = Math.min(input.expectedCoverage.endMs, plan.endMs); const establishesBoundaryCarry = plan.endMs === input.expectedCoverage.startMs && monthlyCarry === undefined;
+      if (startMs >= endMs && !establishesBoundaryCarry) continue;
+      const imported = await bookTickerSamples({ path: resolve(input.root, plan.file.relativePath), relativePath: plan.file.relativePath, symbol, startMs, endMs, sourceStartMs: plan.startMs, sourceEndMs: plan.endMs, sourceHash: plan.file.fileHash, maxQuoteAgeMs: Number.MAX_SAFE_INTEGER, initialState: monthlyCarry });
+      for (const sample of imported.samples) merged.set(sample.asOfMs, sample); monthlyCarry = imported.carry;
+    }
+    let repairCarry: BookTickerState | undefined; let priorRepairEndMs: number | undefined;
+    for (const plan of repairs) {
+      const startMs = Math.max(input.expectedCoverage.startMs, plan.startMs); const endMs = Math.min(input.expectedCoverage.endMs, plan.endMs);
+      if (priorRepairEndMs !== plan.startMs) repairCarry = undefined;
+      if (startMs < endMs) {
+        const imported = await bookTickerSamples({ path: resolve(input.root, plan.file.relativePath), relativePath: plan.file.relativePath, symbol, startMs, endMs, sourceStartMs: plan.startMs, sourceEndMs: plan.endMs, sourceHash: plan.file.fileHash, maxQuoteAgeMs: Number.MAX_SAFE_INTEGER, initialState: repairCarry });
+        for (const sample of imported.samples) {
+          if (!merged.has(sample.asOfMs)) throw new Error(`FOUNDRY_BINANCE_VISION_BOOKTICKER_REPAIR_OUTSIDE_BASE_${symbol}_${sample.asOfMs}`);
+          merged.set(sample.asOfMs, sample);
+        }
+        repairCarry = imported.carry;
+      }
+      priorRepairEndMs = plan.endMs;
+    }
+    const rows: BookTickerSample[] = [];
+    for (let asOfMs = input.expectedCoverage.startMs; asOfMs < input.expectedCoverage.endMs; asOfMs += HOUR_MS) {
+      const sample = merged.get(asOfMs); if (!sample) throw new Error(`FOUNDRY_BINANCE_VISION_BOOKTICKER_LEADING_COVERAGE_GAP_${symbol}_${asOfMs}`); rows.push(sample);
+    }
+    return rows;
+  }));
+  const samples = grouped.flat().sort((left, right) => left.asOfMs - right.asOfMs || left.symbol.localeCompare(right.symbol)); const expectedCount = expectedSymbols.length * ((input.expectedCoverage.endMs - input.expectedCoverage.startMs) / HOUR_MS); const keys = new Set(samples.map((sample) => `${sample.symbol}:${sample.asOfMs}`));
+  if (samples.length !== expectedCount || keys.size !== expectedCount || samples.some((sample) => sample.eventTimeMs > sample.asOfMs)) throw new Error("FOUNDRY_BINANCE_VISION_BOOKTICKER_COVERAGE_OUTPUT_INVALID");
+  return { archiveBundle, samples };
+}
+
+function assertBookTickerAge(samples: readonly BookTickerSample[], maxQuoteAgeMs: number): void {
+  for (const sample of samples) if (sample.asOfMs - sample.eventTimeMs > maxQuoteAgeMs) throw new Error(`FOUNDRY_BINANCE_VISION_BOOKTICKER_PIT_INVALID_${sample.symbol}_${sample.asOfMs}_EVENT_${sample.eventTimeMs}_AGE_${sample.asOfMs - sample.eventTimeMs}_MAX_AGE_${maxQuoteAgeMs}`);
+}
+
+/** Streams official monthly bookTicker ZIPs plus explicit immutable daily repairs into one exact BBO mark per canonical hourly decision tick. */
 export async function importBinanceVisionUsdMRawBookTickerLiquidityArchive(input: { root: string; expectedCoverage: FoundryExpectedCoverage; candleRows: readonly ValidatedFoundryRow[]; maxQuoteAgeMs: number; source: string; sourceProvenance: FoundrySourceProvenance; generatedAtMs: number; generationSha: string }): Promise<{ rows: unknown[]; manifest: FoundryArtifactManifest }> {
   if (input.expectedCoverage.cadenceMs !== HOUR_MS || !Number.isInteger(input.maxQuoteAgeMs) || input.maxQuoteAgeMs < 0) throw new Error("FOUNDRY_BINANCE_VISION_BOOKTICKER_CONTRACT_INVALID");
-  const archiveBundle = sourceArchive({ root: input.root, required: (path) => (path.startsWith("bookTicker/") || path.startsWith("klines/")) && archiveFile(path) });
-  const filesBySymbol = new Map<string, typeof archiveBundle.files>();
-  for (const file of archiveBundle.files.filter((file) => zip(file.relativePath) && file.relativePath.startsWith("bookTicker/")).sort((a, b) => a.relativePath.localeCompare(b.relativePath))) {
-    const symbol = symbolFromPath(file.relativePath, "bookTicker"); filesBySymbol.set(symbol, [...(filesBySymbol.get(symbol) ?? []), file]);
-  }
-  // Months must remain serial per symbol because each archive supplies the
-  // next archive's carry mark. Independent symbols have no shared state, so
-  // stream them concurrently on the high-CPU cloud worker. Rows are sorted
-  // canonically below; scheduling can never alter artifact identity.
-  const samples = (await Promise.all([...filesBySymbol.entries()].sort(([left], [right]) => left.localeCompare(right)).map(async ([symbol, files]) => {
-    const symbolSamples: BookTickerSample[] = []; let carry: BookTickerState | undefined;
-    for (const file of files) {
-      const month = monthRange(file.relativePath); const startMs = Math.max(input.expectedCoverage.startMs, month.startMs); const endMs = Math.min(input.expectedCoverage.endMs, month.endMs);
-      const establishesBoundaryCarry = month.endMs === input.expectedCoverage.startMs && carry === undefined;
-      if (startMs < endMs || establishesBoundaryCarry) { const imported = await bookTickerSamples({ path: resolve(input.root, file.relativePath), relativePath: file.relativePath, symbol, startMs, endMs, sourceStartMs: month.startMs, sourceEndMs: month.endMs, sourceHash: file.fileHash, maxQuoteAgeMs: input.maxQuoteAgeMs, initialState: carry }); symbolSamples.push(...imported.samples); carry = imported.carry; }
-    }
-    return symbolSamples;
-  }))).flat();
-  const candles = new Map(input.candleRows.map((row) => [`${row.symbol}:${row.openTimeMs}`, row])); const rows = samples.map((sample) => {
+  const collected = await collectBookTickerSamples({ root: input.root, expectedCoverage: input.expectedCoverage }); assertBookTickerAge(collected.samples, input.maxQuoteAgeMs);
+  const archiveBundle = sourceArchive({ root: input.root, required: (path) => (isBookTickerArchive(path) || path.startsWith("klines/")) && archiveFile(path) });
+  const candles = new Map(input.candleRows.map((row) => [`${row.symbol}:${row.openTimeMs}`, row])); const rows = collected.samples.map((sample) => {
     const candle = candles.get(`${sample.symbol}:${sample.asOfMs - HOUR_MS}`) as (ValidatedFoundryRow & { volume: number; closeTimeMs: number }) | undefined;
     if (!candle || candle.closeTimeMs !== sample.asOfMs - 1) throw new Error(`FOUNDRY_BINANCE_VISION_BOOKTICKER_CANDLE_MISSING_${sample.symbol}_${sample.asOfMs}`);
     const midpoint = (sample.askPrice + sample.bidPrice) / 2;
@@ -176,50 +217,9 @@ export async function importBinanceVisionUsdMRawBookTickerLiquidityArchive(input
   return { rows: built.canonicalRows, manifest: built.manifest };
 }
 
-/**
- * Reads the exact same checksum-verified BBO stream as the liquidity importer,
- * but retains every source age so an invalid proposed scope can be diagnosed
- * before it is made into a Foundry artifact. It never loosens the importer
- * contract or creates eligibility evidence from a stale quote.
- */
+/** Reads the same checksum-verified merged BBO stream as the liquidity importer without turning a stale quote into eligibility evidence. */
 export async function inspectBinanceVisionUsdMRawBookTickerCoverage(input: { root: string; expectedCoverage: FoundryExpectedCoverage; maxQuoteAgeMs: number }): Promise<{ archiveBundle: ArchiveBundleIdentity; samples: Array<{ symbol: string; asOfMs: number; eventTimeMs: number; quoteAgeMs: number; withinMaxQuoteAge: boolean; sourceHash: string }> }> {
   if (input.expectedCoverage.cadenceMs !== HOUR_MS || !Number.isInteger(input.maxQuoteAgeMs) || input.maxQuoteAgeMs < 0) throw new Error("FOUNDRY_BINANCE_VISION_BOOKTICKER_CONTRACT_INVALID");
-  const archiveBundle = sourceArchive({ root: input.root, required: (path) => path.startsWith("bookTicker/") && archiveFile(path) });
-  const filesBySymbol = new Map<string, typeof archiveBundle.files>();
-  for (const file of archiveBundle.files.filter((file) => zip(file.relativePath)).sort((a, b) => a.relativePath.localeCompare(b.relativePath))) {
-    const symbol = symbolFromPath(file.relativePath, "bookTicker"); filesBySymbol.set(symbol, [...(filesBySymbol.get(symbol) ?? []), file]);
-  }
-  const expectedSymbols = [...input.expectedCoverage.symbols].sort();
-  if (JSON.stringify([...filesBySymbol.keys()].sort()) !== JSON.stringify(expectedSymbols)) throw new Error("FOUNDRY_BINANCE_VISION_BOOKTICKER_SYMBOL_COVERAGE_INVALID");
-  const scheduled = expectedSymbols.flatMap((symbol) => filesBySymbol.get(symbol)!.map((file) => ({ symbol, file })));
-  const selections: Array<{ symbol: string; startMs: number; endMs: number; samples: BookTickerSample[]; carry: BookTickerState; base?: BookTickerState }> = new Array(scheduled.length);
-  let cursor = 0;
-  await Promise.all(Array.from({ length: Math.min(8, scheduled.length) }, async () => {
-    while (true) {
-      const index = cursor; cursor += 1; if (index >= scheduled.length) return;
-      const { symbol, file } = scheduled[index]!; const month = monthRange(file.relativePath); const startMs = Math.max(input.expectedCoverage.startMs, month.startMs); const endMs = Math.min(input.expectedCoverage.endMs, month.endMs); const establishesBoundaryCarry = month.endMs === input.expectedCoverage.startMs;
-      if (startMs < endMs || establishesBoundaryCarry) {
-        const imported = await bookTickerSamples({ path: resolve(input.root, file.relativePath), relativePath: file.relativePath, symbol, startMs, endMs, sourceStartMs: month.startMs, sourceEndMs: month.endMs, sourceHash: file.fileHash, maxQuoteAgeMs: Number.MAX_SAFE_INTEGER, outputMode: "SELECTIONS" });
-        selections[index] = { symbol, startMs, endMs, samples: imported.samples, carry: imported.carry, ...(imported.base ? { base: imported.base } : {}) };
-      }
-    }
-  }));
-  const samples: BookTickerSample[] = [];
-  for (const symbol of expectedSymbols) {
-    let carry: BookTickerState | undefined;
-    for (const entry of selections.filter((selection) => selection?.symbol === symbol).sort((left, right) => left.startMs - right.startMs)) {
-      let active = entry.base ?? carry; const selected = new Map(entry.samples.map((sample) => [sample.asOfMs, sample]));
-      for (let asOfMs = entry.startMs; asOfMs < entry.endMs; asOfMs += HOUR_MS) {
-        active = selected.get(asOfMs) ?? active;
-        if (!active) throw new Error(`FOUNDRY_BINANCE_VISION_BOOKTICKER_LEADING_COVERAGE_GAP_${symbol}_${asOfMs}`);
-        samples.push({ symbol, asOfMs, eventTimeMs: active.eventTimeMs, updateId: active.updateId, bidPrice: active.bidPrice, bidQuantity: active.bidQuantity, askPrice: active.askPrice, askQuantity: active.askQuantity, sourceHash: active.sourceHash });
-      }
-      carry = entry.carry;
-    }
-  }
-  samples.sort((left, right) => left.asOfMs - right.asOfMs || left.symbol.localeCompare(right.symbol));
-  const expectedCount = expectedSymbols.length * ((input.expectedCoverage.endMs - input.expectedCoverage.startMs) / HOUR_MS);
-  const keys = new Set(samples.map((sample) => `${sample.symbol}:${sample.asOfMs}`));
-  if (samples.length !== expectedCount || keys.size !== expectedCount || samples.some((sample) => sample.eventTimeMs > sample.asOfMs)) throw new Error("FOUNDRY_BINANCE_VISION_BOOKTICKER_COVERAGE_OUTPUT_INVALID");
-  return { archiveBundle, samples: samples.map((sample) => ({ symbol: sample.symbol, asOfMs: sample.asOfMs, eventTimeMs: sample.eventTimeMs, quoteAgeMs: sample.asOfMs - sample.eventTimeMs, withinMaxQuoteAge: sample.asOfMs - sample.eventTimeMs <= input.maxQuoteAgeMs, sourceHash: sample.sourceHash })) };
+  const collected = await collectBookTickerSamples({ root: input.root, expectedCoverage: input.expectedCoverage });
+  return { archiveBundle: collected.archiveBundle, samples: collected.samples.map((sample) => ({ symbol: sample.symbol, asOfMs: sample.asOfMs, eventTimeMs: sample.eventTimeMs, quoteAgeMs: sample.asOfMs - sample.eventTimeMs, withinMaxQuoteAge: sample.asOfMs - sample.eventTimeMs <= input.maxQuoteAgeMs, sourceHash: sample.sourceHash })) };
 }

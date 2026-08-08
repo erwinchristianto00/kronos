@@ -11,9 +11,10 @@ steps:
       - _BASE_MONTHLY_BUNDLE_HASH=${_BASE_MONTHLY_BUNDLE_HASH}
       - _VERIFIER_SOURCE_REVISION=${_VERIFIER_SOURCE_REVISION}
       - _VERIFIER_TEMPLATE_SHA256=${_VERIFIER_TEMPLATE_SHA256}
+      - BUILD_ID=${BUILD_ID}
     script: |
         #!/usr/bin/env bash
-        set -ceu
+        set -eu
         python3 - <<'PY'
         import datetime
         import hashlib
