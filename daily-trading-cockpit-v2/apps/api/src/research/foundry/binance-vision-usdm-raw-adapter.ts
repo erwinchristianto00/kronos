@@ -22,7 +22,7 @@ const archiveFile = (path: string): boolean => zip(path) || checksum(path);
 
 interface BinanceVisionKline { symbol: string; openTimeMs: number; closeTimeMs: number; open: number; high: number; low: number; close: number; volume: number; sourceHash: string; }
 interface BinanceVisionFunding { symbol: string; observedSettlementTimeMs: number; fundingIntervalMs: number; rate: number; sourceHash: string; }
-interface BookTickerSample { symbol: string; asOfMs: number; eventTimeMs: number; bidPrice: number; bidQuantity: number; askPrice: number; askQuantity: number; sourceHash: string; }
+interface BookTickerSample { symbol: string; asOfMs: number; eventTimeMs: number; updateId: number; bidPrice: number; bidQuantity: number; askPrice: number; askQuantity: number; sourceHash: string; }
 interface BookTickerState { eventTimeMs: number; updateId: number; bidPrice: number; bidQuantity: number; askPrice: number; askQuantity: number; sourceHash: string; }
 
 function finite(value: string, field: string, path: string): number { const parsed = Number(value); if (!Number.isFinite(parsed)) throw new Error(`FOUNDRY_BINANCE_VISION_VALUE_INVALID_${field}_${path}`); return parsed; }
@@ -88,7 +88,7 @@ function monthRange(relativePath: string): { startMs: number; endMs: number } {
 }
 function waitFor(child: ReturnType<typeof spawn>, label: string): Promise<void> { return new Promise((resolvePromise, reject) => { child.once("error", reject); child.once("exit", (code) => code === 0 ? resolvePromise() : reject(new Error(`FOUNDRY_BINANCE_VISION_PROCESS_FAILED_${label}_${code ?? "SIGNAL"}`))); }); }
 
-async function bookTickerSamples(input: { path: string; relativePath: string; symbol: string; startMs: number; endMs: number; sourceStartMs: number; sourceEndMs: number; sourceHash: string; maxQuoteAgeMs: number; initialState?: BookTickerState }): Promise<{ samples: BookTickerSample[]; carry: BookTickerState }> {
+async function bookTickerSamples(input: { path: string; relativePath: string; symbol: string; startMs: number; endMs: number; sourceStartMs: number; sourceEndMs: number; sourceHash: string; maxQuoteAgeMs: number; initialState?: BookTickerState; outputMode?: "FILLED" | "SELECTIONS" }): Promise<{ samples: BookTickerSample[]; carry: BookTickerState; base?: BookTickerState }> {
   const awk = [
     'BEGIN { baseTime = initialTime + 0; baseUpdate = initialUpdate + 0; baseBidPrice = initialBidPrice + 0; baseBidQty = initialBidQty + 0; baseAskPrice = initialAskPrice + 0; baseAskQty = initialAskQty + 0; baseOrigin = baseTime > 0 ? "P" : ""; carryTime = 0 }',
     'NR == 1 { if ($0 != "update_id,best_bid_price,best_bid_qty,best_ask_price,best_ask_qty,transaction_time,event_time") { print "HEADERS" > "/dev/stderr"; exit 2 } next }',
@@ -103,10 +103,10 @@ async function bookTickerSamples(input: { path: string; relativePath: string; sy
     // which can turn a valid quote into a (false) future PIT mark.  Print the
     // wire protocol explicitly: time/update fields are exact decimal integers,
     // while price/quantity fields retain round-trippable floating-point values.
-    'END { if (carryTime == 0) { print "EMPTY" > "/dev/stderr"; exit 6 } activeTime = baseTime; activeUpdate = baseUpdate; activeBidPrice = baseBidPrice; activeBidQty = baseBidQty; activeAskPrice = baseAskPrice; activeAskQty = baseAskQty; activeOrigin = baseOrigin; for (target = start; target < end; target += interval) { targetKey = sprintf("%.0f", target); if (targetKey in selectedTime) { activeTime = selectedTime[targetKey]; activeUpdate = selectedUpdate[targetKey]; activeBidPrice = selectedBidPrice[targetKey]; activeBidQty = selectedBidQty[targetKey]; activeAskPrice = selectedAskPrice[targetKey]; activeAskQty = selectedAskQty[targetKey]; activeOrigin = "C" } if (activeTime == 0) { print "LEADING_GAP" > "/dev/stderr"; exit 7 } printf "ROW\\t%.0f\\t%s\\t%.0f\\t%.0f\\t%.17g\\t%.17g\\t%.17g\\t%.17g\\n", target, activeOrigin, activeTime, activeUpdate, activeBidPrice, activeBidQty, activeAskPrice, activeAskQty } printf "CARRY\\t%.0f\\t%.0f\\t%.17g\\t%.17g\\t%.17g\\t%.17g\\n", carryTime, carryUpdate, carryBidPrice, carryBidQty, carryAskPrice, carryAskQty }',
+    'END { if (carryTime == 0) { print "EMPTY" > "/dev/stderr"; exit 6 } if (mode == "SELECTIONS") { if (baseTime > 0) printf "BASE\\t%.0f\\t%.0f\\t%.17g\\t%.17g\\t%.17g\\t%.17g\\n", baseTime, baseUpdate, baseBidPrice, baseBidQty, baseAskPrice, baseAskQty; for (target = start; target < end; target += interval) { targetKey = sprintf("%.0f", target); if (targetKey in selectedTime) printf "SELECT\\t%.0f\\t%.0f\\t%.0f\\t%.17g\\t%.17g\\t%.17g\\t%.17g\\n", target, selectedTime[targetKey], selectedUpdate[targetKey], selectedBidPrice[targetKey], selectedBidQty[targetKey], selectedAskPrice[targetKey], selectedAskQty[targetKey] } printf "CARRY\\t%.0f\\t%.0f\\t%.17g\\t%.17g\\t%.17g\\t%.17g\\n", carryTime, carryUpdate, carryBidPrice, carryBidQty, carryAskPrice, carryAskQty } else { activeTime = baseTime; activeUpdate = baseUpdate; activeBidPrice = baseBidPrice; activeBidQty = baseBidQty; activeAskPrice = baseAskPrice; activeAskQty = baseAskQty; activeOrigin = baseOrigin; for (target = start; target < end; target += interval) { targetKey = sprintf("%.0f", target); if (targetKey in selectedTime) { activeTime = selectedTime[targetKey]; activeUpdate = selectedUpdate[targetKey]; activeBidPrice = selectedBidPrice[targetKey]; activeBidQty = selectedBidQty[targetKey]; activeAskPrice = selectedAskPrice[targetKey]; activeAskQty = selectedAskQty[targetKey]; activeOrigin = "C" } if (activeTime == 0) { print "LEADING_GAP" > "/dev/stderr"; exit 7 } printf "ROW\\t%.0f\\t%s\\t%.0f\\t%.0f\\t%.17g\\t%.17g\\t%.17g\\t%.17g\\n", target, activeOrigin, activeTime, activeUpdate, activeBidPrice, activeBidQty, activeAskPrice, activeAskQty } printf "CARRY\\t%.0f\\t%.0f\\t%.17g\\t%.17g\\t%.17g\\t%.17g\\n", carryTime, carryUpdate, carryBidPrice, carryBidQty, carryAskPrice, carryAskQty } }',
   ].join(" ");
-  const initial = input.initialState;
-  const unzip = spawn("unzip", ["-p", input.path], { stdio: ["ignore", "pipe", "pipe"] }); const sampler = spawn("awk", ["-F,", "-v", `start=${input.startMs}`, "-v", `end=${input.endMs}`, "-v", `sourceStart=${input.sourceStartMs}`, "-v", `sourceEnd=${input.sourceEndMs}`, "-v", `archiveEndTail=${BOOK_TICKER_ARCHIVE_END_TAIL_TOLERANCE_MS}`, "-v", `interval=${HOUR_MS}`, "-v", `initialTime=${initial?.eventTimeMs ?? 0}`, "-v", `initialUpdate=${initial?.updateId ?? 0}`, "-v", `initialBidPrice=${initial?.bidPrice ?? 0}`, "-v", `initialBidQty=${initial?.bidQuantity ?? 0}`, "-v", `initialAskPrice=${initial?.askPrice ?? 0}`, "-v", `initialAskQty=${initial?.askQuantity ?? 0}`, awk], { stdio: ["pipe", "pipe", "pipe"] });
+  const initial = input.initialState; const selectionMode = input.outputMode === "SELECTIONS";
+  const unzip = spawn("unzip", ["-p", input.path], { stdio: ["ignore", "pipe", "pipe"] }); const sampler = spawn("awk", ["-F,", "-v", `start=${input.startMs}`, "-v", `end=${input.endMs}`, "-v", `sourceStart=${input.sourceStartMs}`, "-v", `sourceEnd=${input.sourceEndMs}`, "-v", `archiveEndTail=${BOOK_TICKER_ARCHIVE_END_TAIL_TOLERANCE_MS}`, "-v", `interval=${HOUR_MS}`, "-v", `mode=${selectionMode ? "SELECTIONS" : "FILLED"}`, "-v", `initialTime=${initial?.eventTimeMs ?? 0}`, "-v", `initialUpdate=${initial?.updateId ?? 0}`, "-v", `initialBidPrice=${initial?.bidPrice ?? 0}`, "-v", `initialBidQty=${initial?.bidQuantity ?? 0}`, "-v", `initialAskPrice=${initial?.askPrice ?? 0}`, "-v", `initialAskQty=${initial?.askQuantity ?? 0}`, awk], { stdio: ["pipe", "pipe", "pipe"] });
   const unzipDone = waitFor(unzip, `UNZIP_${input.relativePath}`).then(() => null, (error: Error) => error); const samplerDone = waitFor(sampler, `AWK_${input.relativePath}`).then(() => null, (error: Error) => error);
   const stderr: Buffer[] = []; const pipeErrors: Error[] = [];
   unzip.stderr.on("data", (value: Buffer) => stderr.push(value)); sampler.stderr.on("data", (value: Buffer) => stderr.push(value));
@@ -119,13 +119,19 @@ async function bookTickerSamples(input: { path: string; relativePath: string; sy
     if (!unzip.killed) unzip.kill("SIGTERM");
   });
   unzip.stdout.pipe(sampler.stdin);
-  const output: BookTickerSample[] = []; let carry: BookTickerState | undefined; const lines = createInterface({ input: sampler.stdout, crlfDelay: Infinity });
+  const output: BookTickerSample[] = []; let carry: BookTickerState | undefined; let base: BookTickerState | undefined; const lines = createInterface({ input: sampler.stdout, crlfDelay: Infinity });
   for await (const line of lines) {
     const values = line.split("\t"); const kind = values.shift();
-    if (kind === "ROW" && values.length === 8) {
+    if (kind === "ROW" && !selectionMode && values.length === 8) {
       const [asOf, origin, event, updateId, bidPrice, bidQuantity, askPrice, askQuantity] = values; const asOfMs = integer(asOf!, "AS_OF_MS", input.relativePath); const eventTimeMs = integer(event!, "EVENT_TIME_MS", input.relativePath); const parsedUpdateId = integer(updateId!, "UPDATE_ID", input.relativePath); const parsedBidPrice = finite(bidPrice!, "BID_PRICE", input.relativePath); const parsedBidQuantity = finite(bidQuantity!, "BID_QUANTITY", input.relativePath); const parsedAskPrice = finite(askPrice!, "ASK_PRICE", input.relativePath); const parsedAskQuantity = finite(askQuantity!, "ASK_QUANTITY", input.relativePath); const rowSourceHash = origin === "P" ? initial?.sourceHash : origin === "C" ? input.sourceHash : undefined;
       if (!rowSourceHash || eventTimeMs > asOfMs || asOfMs - eventTimeMs > input.maxQuoteAgeMs || parsedUpdateId <= 0 || parsedBidPrice <= 0 || parsedAskPrice <= 0 || parsedBidQuantity < 0 || parsedAskQuantity < 0 || parsedAskPrice < parsedBidPrice) throw new Error(`FOUNDRY_BINANCE_VISION_BOOKTICKER_PIT_INVALID_${input.symbol}_${asOfMs}_EVENT_${eventTimeMs}_AGE_${asOfMs - eventTimeMs}_MAX_AGE_${input.maxQuoteAgeMs}_UPDATE_${parsedUpdateId}_BID_${parsedBidPrice}_${parsedBidQuantity}_ASK_${parsedAskPrice}_${parsedAskQuantity}`);
-      output.push({ symbol: input.symbol, asOfMs, eventTimeMs, bidPrice: parsedBidPrice, bidQuantity: parsedBidQuantity, askPrice: parsedAskPrice, askQuantity: parsedAskQuantity, sourceHash: tournamentHash({ policyVersion: BOOK_TICKER_HOURLY_POLICY_VERSION, archiveEndTailToleranceMs: BOOK_TICKER_ARCHIVE_END_TAIL_TOLERANCE_MS, archiveFileHash: rowSourceHash, eventTimeMs, updateId: parsedUpdateId, bidPrice: parsedBidPrice, bidQuantity: parsedBidQuantity, askPrice: parsedAskPrice, askQuantity: parsedAskQuantity }) });
+      output.push({ symbol: input.symbol, asOfMs, eventTimeMs, updateId: parsedUpdateId, bidPrice: parsedBidPrice, bidQuantity: parsedBidQuantity, askPrice: parsedAskPrice, askQuantity: parsedAskQuantity, sourceHash: tournamentHash({ policyVersion: BOOK_TICKER_HOURLY_POLICY_VERSION, archiveEndTailToleranceMs: BOOK_TICKER_ARCHIVE_END_TAIL_TOLERANCE_MS, archiveFileHash: rowSourceHash, eventTimeMs, updateId: parsedUpdateId, bidPrice: parsedBidPrice, bidQuantity: parsedBidQuantity, askPrice: parsedAskPrice, askQuantity: parsedAskQuantity }) });
+    } else if (kind === "SELECT" && selectionMode && values.length === 7) {
+      const [asOf, event, updateId, bidPrice, bidQuantity, askPrice, askQuantity] = values; const asOfMs = integer(asOf!, "AS_OF_MS", input.relativePath); const eventTimeMs = integer(event!, "EVENT_TIME_MS", input.relativePath); const parsedUpdateId = integer(updateId!, "UPDATE_ID", input.relativePath); const parsedBidPrice = finite(bidPrice!, "BID_PRICE", input.relativePath); const parsedBidQuantity = finite(bidQuantity!, "BID_QUANTITY", input.relativePath); const parsedAskPrice = finite(askPrice!, "ASK_PRICE", input.relativePath); const parsedAskQuantity = finite(askQuantity!, "ASK_QUANTITY", input.relativePath);
+      if (eventTimeMs > asOfMs || parsedUpdateId <= 0 || parsedBidPrice <= 0 || parsedAskPrice <= 0 || parsedBidQuantity < 0 || parsedAskQuantity < 0 || parsedAskPrice < parsedBidPrice) throw new Error(`FOUNDRY_BINANCE_VISION_BOOKTICKER_SELECTION_INVALID_${input.relativePath}_${asOfMs}`);
+      output.push({ symbol: input.symbol, asOfMs, eventTimeMs, updateId: parsedUpdateId, bidPrice: parsedBidPrice, bidQuantity: parsedBidQuantity, askPrice: parsedAskPrice, askQuantity: parsedAskQuantity, sourceHash: tournamentHash({ policyVersion: BOOK_TICKER_HOURLY_POLICY_VERSION, archiveEndTailToleranceMs: BOOK_TICKER_ARCHIVE_END_TAIL_TOLERANCE_MS, archiveFileHash: input.sourceHash, eventTimeMs, updateId: parsedUpdateId, bidPrice: parsedBidPrice, bidQuantity: parsedBidQuantity, askPrice: parsedAskPrice, askQuantity: parsedAskQuantity }) });
+    } else if (kind === "BASE" && selectionMode && values.length === 6) {
+      const [event, updateId, bidPrice, bidQuantity, askPrice, askQuantity] = values; base = { eventTimeMs: integer(event!, "EVENT_TIME_MS", input.relativePath), updateId: integer(updateId!, "UPDATE_ID", input.relativePath), bidPrice: finite(bidPrice!, "BID_PRICE", input.relativePath), bidQuantity: finite(bidQuantity!, "BID_QUANTITY", input.relativePath), askPrice: finite(askPrice!, "ASK_PRICE", input.relativePath), askQuantity: finite(askQuantity!, "ASK_QUANTITY", input.relativePath), sourceHash: input.sourceHash };
     } else if (kind === "CARRY" && values.length === 6) {
       const [event, updateId, bidPrice, bidQuantity, askPrice, askQuantity] = values; carry = { eventTimeMs: integer(event!, "EVENT_TIME_MS", input.relativePath), updateId: integer(updateId!, "UPDATE_ID", input.relativePath), bidPrice: finite(bidPrice!, "BID_PRICE", input.relativePath), bidQuantity: finite(bidQuantity!, "BID_QUANTITY", input.relativePath), askPrice: finite(askPrice!, "ASK_PRICE", input.relativePath), askQuantity: finite(askQuantity!, "ASK_QUANTITY", input.relativePath), sourceHash: input.sourceHash };
     } else throw new Error(`FOUNDRY_BINANCE_VISION_BOOKTICKER_OUTPUT_INVALID_${input.relativePath}`);
@@ -136,7 +142,7 @@ async function bookTickerSamples(input: { path: string; relativePath: string; sy
   if (unzipResult) throw unzipResult;
   if (pipeErrors.length) throw pipeErrors[0]!;
   if (!carry) throw new Error(`FOUNDRY_BINANCE_VISION_BOOKTICKER_CARRY_MISSING_${input.relativePath}`);
-  return { samples: output, carry };
+  return { samples: output, carry, ...(base ? { base } : {}) };
 }
 
 /** Streams official monthly bookTicker ZIPs into one exact BBO mark per canonical hourly decision tick. */
@@ -185,15 +191,33 @@ export async function inspectBinanceVisionUsdMRawBookTickerCoverage(input: { roo
   }
   const expectedSymbols = [...input.expectedCoverage.symbols].sort();
   if (JSON.stringify([...filesBySymbol.keys()].sort()) !== JSON.stringify(expectedSymbols)) throw new Error("FOUNDRY_BINANCE_VISION_BOOKTICKER_SYMBOL_COVERAGE_INVALID");
-  const samples = (await Promise.all(expectedSymbols.map(async (symbol) => {
-    const symbolSamples: BookTickerSample[] = []; let carry: BookTickerState | undefined;
-    for (const file of filesBySymbol.get(symbol)!) {
-      const month = monthRange(file.relativePath); const startMs = Math.max(input.expectedCoverage.startMs, month.startMs); const endMs = Math.min(input.expectedCoverage.endMs, month.endMs);
-      const establishesBoundaryCarry = month.endMs === input.expectedCoverage.startMs && carry === undefined;
-      if (startMs < endMs || establishesBoundaryCarry) { const imported = await bookTickerSamples({ path: resolve(input.root, file.relativePath), relativePath: file.relativePath, symbol, startMs, endMs, sourceStartMs: month.startMs, sourceEndMs: month.endMs, sourceHash: file.fileHash, maxQuoteAgeMs: Number.MAX_SAFE_INTEGER, initialState: carry }); symbolSamples.push(...imported.samples); carry = imported.carry; }
+  const scheduled = expectedSymbols.flatMap((symbol) => filesBySymbol.get(symbol)!.map((file) => ({ symbol, file })));
+  const selections: Array<{ symbol: string; startMs: number; endMs: number; samples: BookTickerSample[]; carry: BookTickerState; base?: BookTickerState }> = new Array(scheduled.length);
+  let cursor = 0;
+  await Promise.all(Array.from({ length: Math.min(8, scheduled.length) }, async () => {
+    while (true) {
+      const index = cursor; cursor += 1; if (index >= scheduled.length) return;
+      const { symbol, file } = scheduled[index]!; const month = monthRange(file.relativePath); const startMs = Math.max(input.expectedCoverage.startMs, month.startMs); const endMs = Math.min(input.expectedCoverage.endMs, month.endMs); const establishesBoundaryCarry = month.endMs === input.expectedCoverage.startMs;
+      if (startMs < endMs || establishesBoundaryCarry) {
+        const imported = await bookTickerSamples({ path: resolve(input.root, file.relativePath), relativePath: file.relativePath, symbol, startMs, endMs, sourceStartMs: month.startMs, sourceEndMs: month.endMs, sourceHash: file.fileHash, maxQuoteAgeMs: Number.MAX_SAFE_INTEGER, outputMode: "SELECTIONS" });
+        selections[index] = { symbol, startMs, endMs, samples: imported.samples, carry: imported.carry, ...(imported.base ? { base: imported.base } : {}) };
+      }
     }
-    return symbolSamples;
-  }))).flat().sort((left, right) => left.asOfMs - right.asOfMs || left.symbol.localeCompare(right.symbol));
+  }));
+  const samples: BookTickerSample[] = [];
+  for (const symbol of expectedSymbols) {
+    let carry: BookTickerState | undefined;
+    for (const entry of selections.filter((selection) => selection?.symbol === symbol).sort((left, right) => left.startMs - right.startMs)) {
+      let active = entry.base ?? carry; const selected = new Map(entry.samples.map((sample) => [sample.asOfMs, sample]));
+      for (let asOfMs = entry.startMs; asOfMs < entry.endMs; asOfMs += HOUR_MS) {
+        active = selected.get(asOfMs) ?? active;
+        if (!active) throw new Error(`FOUNDRY_BINANCE_VISION_BOOKTICKER_LEADING_COVERAGE_GAP_${symbol}_${asOfMs}`);
+        samples.push({ symbol, asOfMs, eventTimeMs: active.eventTimeMs, updateId: active.updateId, bidPrice: active.bidPrice, bidQuantity: active.bidQuantity, askPrice: active.askPrice, askQuantity: active.askQuantity, sourceHash: active.sourceHash });
+      }
+      carry = entry.carry;
+    }
+  }
+  samples.sort((left, right) => left.asOfMs - right.asOfMs || left.symbol.localeCompare(right.symbol));
   const expectedCount = expectedSymbols.length * ((input.expectedCoverage.endMs - input.expectedCoverage.startMs) / HOUR_MS);
   const keys = new Set(samples.map((sample) => `${sample.symbol}:${sample.asOfMs}`));
   if (samples.length !== expectedCount || keys.size !== expectedCount || samples.some((sample) => sample.eventTimeMs > sample.asOfMs)) throw new Error("FOUNDRY_BINANCE_VISION_BOOKTICKER_COVERAGE_OUTPUT_INVALID");
