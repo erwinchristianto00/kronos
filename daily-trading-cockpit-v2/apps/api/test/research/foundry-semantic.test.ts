@@ -91,7 +91,7 @@ describe("Foundry semantic strictness", () => {
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
-  it("derives PIT BBO spread and prior completed volume without future-quote leakage", () => {
+  it("streams PIT BBO spread and prior completed volume without future-quote leakage", async () => {
     const root = mkdtempSync(join(tmpdir(), "foundry-tardis-bbo-")); const symbols = ["BTCUSDT", "ETHUSDT"];
     const quoteCsv = (symbol: string, timestampUs: number) => `exchange,symbol,timestamp,local_timestamp,ask_amount,ask_price,bid_price,bid_amount\nbinance-futures,${symbol},${timestampUs},${timestampUs + 1},3,102,100,2\nbinance-futures,${symbol},${timestampUs + H * 1_000},${timestampUs + H * 1_000 + 1},4,103,101,3\n`;
     const candleCsv = "open_time,open,high,low,close,volume,close_time,quote_volume,count,taker_buy_volume,taker_buy_quote_volume,ignore\n0,100,101,99,100,7,3599999,700,4,3,300,0\n3600000,100,102,99,101,8,7199999,800,5,4,400,0\n";
@@ -99,10 +99,28 @@ describe("Foundry semantic strictness", () => {
     const input = () => ({ root, expectedCoverage: { startMs: H, endMs: 3 * H, symbols, cadenceMs: H }, maxQuoteAgeMs: 60_000, source: "Tardis BBO plus Binance completed volume", sourceProvenance: provenance(), generatedAtMs: 1, generationSha: "abcdef0" });
     try {
       for (const symbol of symbols) { const quoteDirectory = join(root, "quotes", symbol); const candleDirectory = join(root, "candles", symbol, "1h"); mkdirSync(quoteDirectory, { recursive: true }); mkdirSync(candleDirectory, { recursive: true }); writeFileSync(join(quoteDirectory, "2026-01-01.csv.gz"), gzipSync(quoteCsv(symbol, H * 1_000 - 1_000))); writeFileSync(join(candleDirectory, "2026-01.csv"), candleCsv); }
-      const first = importLocalTardisQuoteLiquidityArchive(input()); const second = importLocalTardisQuoteLiquidityArchive(input());
+      const first = await importLocalTardisQuoteLiquidityArchive(input()); const second = await importLocalTardisQuoteLiquidityArchive(input());
       expect(first.rows).toHaveLength(4); expect(first.rows[0]).toMatchObject({ symbol: "BTCUSDT", asOfMs: H, validUntilMs: 2 * H - 1, volume: 7, liquidityNotional: 200 }); expect(first.rows[2]).toMatchObject({ symbol: "BTCUSDT", asOfMs: 2 * H, volume: 8 }); expect(first.manifest.semanticManifestHash).toBe(second.manifest.semanticManifestHash);
       for (const symbol of symbols) writeFileSync(join(root, "quotes", symbol, "2026-01-01.csv.gz"), gzipSync(quoteCsv(symbol, H * 1_000 + 1)));
-      expect(() => importLocalTardisQuoteLiquidityArchive(input())).toThrow("FOUNDRY_TARDIS_LIQUIDITY_PIT_COVERAGE_MISSING");
+      await expect(importLocalTardisQuoteLiquidityArchive(input())).rejects.toThrow("FOUNDRY_TARDIS_LIQUIDITY_PIT_COVERAGE_MISSING");
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("carries source-backed BBO state across compressed Tardis files and rejects a globally reversed stream", async () => {
+    const root = mkdtempSync(join(tmpdir(), "foundry-tardis-bbo-boundary-")); const symbol = "BTCUSDT";
+    const quoteCsv = (timestampUs: number, bid: number, ask: number) => `exchange,symbol,timestamp,local_timestamp,ask_amount,ask_price,bid_price,bid_amount\nbinance-futures,${symbol},${timestampUs},${timestampUs + 1},3,${ask},${bid},2\n`;
+    const candleCsv = "open_time,open,high,low,close,volume,close_time,quote_volume,count,taker_buy_volume,taker_buy_quote_volume,ignore\n0,100,101,99,100,7,3599999,700,4,3,300,0\n3600000,100,102,99,101,8,7199999,800,5,4,400,0\n";
+    const input = () => ({ root, expectedCoverage: { startMs: H, endMs: 3 * H, symbols: [symbol], cadenceMs: H }, maxQuoteAgeMs: 60_000, source: "Tardis split BBO plus Binance completed volume", sourceProvenance: { provenanceType: "EXCHANGE_HISTORICAL_EXPORT" as const, provider: "Tardis + Binance Vision", exchange: "BINANCE_USD_M", datasetId: "split-tardis-quotes", retrievedAtMs: 1, rawFileHash: readArchiveBundle({ root, include: (relativePath) => relativePath.endsWith(".csv") || relativePath.endsWith(".csv.gz") }).archiveBundleHash, schemaVersion: "tardis-quotes-v1", generationToolSha: "abcdef0" }, generatedAtMs: 1, generationSha: "abcdef0" });
+    try {
+      const quoteDirectory = join(root, "quotes", symbol); const candleDirectory = join(root, "candles", symbol, "1h"); mkdirSync(quoteDirectory, { recursive: true }); mkdirSync(candleDirectory, { recursive: true });
+      writeFileSync(join(quoteDirectory, "2026-01-01.csv.gz"), gzipSync(quoteCsv(H * 1_000 - 1_000, 100, 102)));
+      writeFileSync(join(quoteDirectory, "2026-01-02.csv.gz"), gzipSync(quoteCsv(2 * H * 1_000 - 1_000, 101, 103)));
+      writeFileSync(join(candleDirectory, "2026-01.csv"), candleCsv);
+      const first = await importLocalTardisQuoteLiquidityArchive(input()); const second = await importLocalTardisQuoteLiquidityArchive(input());
+      expect(first.rows).toEqual([expect.objectContaining({ asOfMs: H, liquidityNotional: 200 }), expect.objectContaining({ asOfMs: 2 * H, liquidityNotional: 202 })]);
+      expect(first.manifest.semanticManifestHash).toBe(second.manifest.semanticManifestHash);
+      writeFileSync(join(quoteDirectory, "2026-01-03.csv.gz"), gzipSync(quoteCsv(H * 1_000 - 2_000, 99, 101)));
+      await expect(importLocalTardisQuoteLiquidityArchive(input())).rejects.toThrow("FOUNDRY_TARDIS_BBO_INVALID");
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
