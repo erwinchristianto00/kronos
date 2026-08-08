@@ -30,10 +30,13 @@ steps:
         base_bundle = os.environ["_BASE_MONTHLY_BUNDLE_HASH"]
         source_revision = os.environ["_VERIFIER_SOURCE_REVISION"]
         template_sha = os.environ["_VERIFIER_TEMPLATE_SHA256"]
+        build_id = os.environ.get("BUILD_ID")
         if not re.fullmatch(r"[a-f0-9]{64}", base_bundle):
             raise RuntimeError("daily repair requires the frozen monthly raw bundle hash")
         if not re.fullmatch(r"[a-f0-9]{7,64}", source_revision) or not re.fullmatch(r"[a-f0-9]{64}", template_sha):
             raise RuntimeError("daily repair verifier provenance is invalid")
+        if not build_id or not re.fullmatch(r"[A-Za-z0-9-]+", build_id):
+            raise RuntimeError("daily repair build identity is invalid")
 
         repairs = [
             ("BTCUSDT", "2023-05-16"), ("ETHUSDT", "2023-05-16"),
@@ -69,9 +72,55 @@ steps:
         def sha256_bytes(value):
             return hashlib.sha256(value).hexdigest()
 
+        def assert_active_verifier_template():
+            build = json.loads(run("gcloud", "builds", "describe", build_id, "--format=json"))
+            script = next((step.get("script") for step in build.get("steps", []) if step.get("id") == "acquire-verify-free-tier1-daily-bookticker-repairs"), None)
+            if not isinstance(script, str) or sha256_bytes(script.encode()) != template_sha:
+                raise RuntimeError("active daily repair verifier template hash mismatch")
+
         def gcs_copy(uri, generation, destination):
             destination.parent.mkdir(parents=True, exist_ok=True)
             subprocess.check_call(["gcloud", "storage", "cp", "--do-not-decompress", f"{uri}#{generation}", str(destination)])
+
+        def assert_frozen_monthly_manifest():
+            uri = f"{study}/acquisition-manifests/v2/{base_bundle}.json"
+            metadata = describe(uri)
+            local = work / "base-monthly-acquisition-manifest.json"
+            gcs_copy(uri, str(metadata["generation"]), local)
+            bytes_value = local.read_bytes()
+            if not bytes_value.endswith(b"\n"):
+                raise RuntimeError("frozen monthly acquisition manifest has no terminal newline")
+            manifest = json.loads(bytes_value)
+            expected_paths = sorted(
+                f"{symbol}/{symbol}-bookTicker-{month}.zip"
+                for symbol in ("BTCUSDT", "ETHUSDT")
+                for month in [*(f"2023-{number:02d}" for number in range(5, 13)), *(f"2024-{number:02d}" for number in range(1, 4))]
+            )
+            objects = manifest.get("objects")
+            if (
+                manifest.get("schemaVersion") != "KronosFreeTier1RawAcquisition/v2"
+                or manifest.get("canonicalRawBookTickerBundleHash") != base_bundle
+                or manifest.get("inventoryPassHash") != base_bundle
+                or manifest.get("secondInventoryPassHash") != base_bundle
+                or manifest.get("scope", {}).get("objectCount") != 22
+                or not isinstance(objects, list)
+                or [entry.get("relativePath") for entry in objects] != expected_paths
+                or sha256_bytes(json.dumps(objects, sort_keys=True, separators=(",", ":")).encode()) != base_bundle
+            ):
+                raise RuntimeError("frozen monthly acquisition manifest identity invalid")
+            for entry in objects:
+                canonical = entry.get("canonical", {})
+                companion = entry.get("companion", {})
+                canonical_meta = describe(canonical.get("uri", ""))
+                companion_meta = describe(companion.get("uri", ""))
+                if (
+                    str(canonical_meta.get("generation")) != str(canonical.get("generation"))
+                    or int(canonical_meta.get("size", -1)) != int(canonical.get("sizeBytes", -2))
+                    or str(companion_meta.get("generation")) != str(companion.get("generation"))
+                    or int(companion_meta.get("size", -1)) != int(companion.get("sizeBytes", -2))
+                ):
+                    raise RuntimeError(f"frozen monthly canonical generation mismatch {entry.get('relativePath')}")
+            return {"uri": uri, "generation": str(metadata["generation"]), "sha256": sha256_bytes(bytes_value)}
 
         def immutable_upload(source, uri):
             result = subprocess.run(["gcloud", "storage", "cp", str(source), uri, "--if-generation-match=0"], text=True, capture_output=True)
@@ -101,8 +150,10 @@ steps:
                         shutil.copyfileobj(response, handle, length=8 * 1024 * 1024)
                 return metadata
 
-        def validate_pair(zip_path, checksum_path, name):
+        def validate_pair(zip_path, checksum_path, name, expected_checksum_bytes=None):
             checksum_bytes = checksum_path.read_bytes()
+            if expected_checksum_bytes is not None and checksum_bytes != expected_checksum_bytes:
+                raise RuntimeError(f"canonical checksum companion differs from official source {name}")
             try:
                 checksum = checksum_bytes.decode("utf8").strip()
             except UnicodeDecodeError as error:
@@ -118,6 +169,9 @@ steps:
                 if bad_member is not None:
                     raise RuntimeError(f"ZIP integrity failed {name}: {bad_member}")
             return {"computedZipSha256": computed, "checksumBytes": checksum_bytes, "officialSha256": match.group(1).lower()}
+
+        assert_active_verifier_template()
+        base_monthly_manifest = assert_frozen_monthly_manifest()
 
         def canonical_entry(symbol, day):
             name = f"{symbol}-bookTicker-{day}.zip"
@@ -137,24 +191,38 @@ steps:
             if final_meta is None:
                 source_zip = source_request(source_url, zip_path)
                 source_checksum = source_request(checksum_url, checksum_path)
-                validated = validate_pair(zip_path, checksum_path, name)
+                source_validated = validate_pair(zip_path, checksum_path, name)
                 final_meta = immutable_upload(zip_path, final_uri)
                 checksum_meta = immutable_upload(checksum_path, companion_uri)
             else:
                 gcs_copy(final_uri, str(final_meta["generation"]), zip_path)
-                if checksum_meta is None:
+                if marker_meta is None:
+                    source_zip = source_request(source_url)
                     source_checksum = source_request(checksum_url, checksum_path)
-                    checksum_meta = immutable_upload(checksum_path, companion_uri)
+                    source_validated = validate_pair(zip_path, checksum_path, name)
+                    if checksum_meta is None:
+                        checksum_meta = immutable_upload(checksum_path, companion_uri)
                 else:
-                    gcs_copy(companion_uri, str(checksum_meta["generation"]), checksum_path)
+                    source_zip = None
                     source_checksum = None
-                validated = validate_pair(zip_path, checksum_path, name)
-                source_zip = None
+                    source_validated = None
+                    if checksum_meta is None:
+                        raise RuntimeError(f"verified daily object is missing its checksum companion {name}")
 
             if int(final_meta["size"]) != zip_path.stat().st_size or int(checksum_meta["size"]) != checksum_path.stat().st_size:
                 raise RuntimeError(f"canonical size mismatch for {name}")
-            if sha256(checksum_path) != sha256_bytes(validated["checksumBytes"]):
-                raise RuntimeError(f"canonical companion hash mismatch for {name}")
+            canonical_zip_path = local_root / f"canonical-{name}"
+            canonical_checksum_path = local_root / f"canonical-{name}.CHECKSUM"
+            gcs_copy(final_uri, str(final_meta["generation"]), canonical_zip_path)
+            gcs_copy(companion_uri, str(checksum_meta["generation"]), canonical_checksum_path)
+            validated = validate_pair(
+                canonical_zip_path,
+                canonical_checksum_path,
+                name,
+                source_validated["checksumBytes"] if source_validated is not None else None,
+            )
+            if int(final_meta["size"]) != canonical_zip_path.stat().st_size or int(checksum_meta["size"]) != canonical_checksum_path.stat().st_size:
+                raise RuntimeError(f"canonical GCS readback size mismatch for {name}")
 
             if marker_meta is not None:
                 marker_path = local_root / f"{name}.marker.json"
@@ -166,6 +234,7 @@ steps:
                     or marker.get("sourceUrl") != source_url
                     or marker.get("officialSha256") != validated["officialSha256"]
                     or marker.get("computedFinalSha256") != validated["computedZipSha256"]
+                    or marker.get("companionSha256") != sha256(canonical_checksum_path)
                     or marker.get("finalUri") != final_uri
                     or str(marker.get("finalGeneration")) != str(final_meta["generation"])
                     or marker.get("companionUri") != companion_uri
@@ -187,7 +256,7 @@ steps:
                     "sourceChecksum": source_checksum,
                     "officialSha256": validated["officialSha256"],
                     "computedFinalSha256": validated["computedZipSha256"],
-                    "companionSha256": sha256(checksum_path),
+                    "companionSha256": sha256(canonical_checksum_path),
                     "finalUri": final_uri,
                     "finalGeneration": str(final_meta["generation"]),
                     "finalSizeBytes": int(final_meta["size"]),
@@ -195,12 +264,11 @@ steps:
                     "companionGeneration": str(checksum_meta["generation"]),
                     "companionSizeBytes": int(checksum_meta["size"]),
                     "zipIntegrity": "python.zipfile.testzip",
-                    "verifiedAt": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
                     "verifierSourceRevision": source_revision,
                     "verifierTemplateSha256": template_sha,
                 }
                 marker_path = local_root / f"{name}.marker.json"
-                marker_path.write_text(json.dumps(marker, sort_keys=True, separators=(",", ":")) + "\\n", encoding="utf8")
+                marker_path.write_text(json.dumps(marker, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf8")
                 marker_meta = immutable_upload(marker_path, marker_uri)
                 marker_path.unlink()
                 gcs_copy(marker_uri, str(marker_meta["generation"]), marker_path)
@@ -211,13 +279,31 @@ steps:
             if not marker_path.exists():
                 gcs_copy(marker_uri, str(marker_meta["generation"]), marker_path)
             marker_hash = sha256(marker_path)
+            audit = {
+                "schemaVersion": "KronosFreeTier1DailyBookTickerRepairAudit/v1",
+                "buildId": build_id,
+                "auditedAt": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
+                "sourceKey": source_key,
+                "sourceZip": source_zip,
+                "sourceChecksum": source_checksum,
+                "finalUri": final_uri,
+                "finalGeneration": str(final_meta["generation"]),
+                "computedFinalSha256": validated["computedZipSha256"],
+                "markerUri": marker_uri,
+                "markerGeneration": str(marker_meta["generation"]),
+                "markerSha256": marker_hash,
+            }
+            audit_path = local_root / f"{name}.audit.json"
+            audit_path.write_text(json.dumps(audit, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf8")
+            audit_uri = f"{study}/raw/bookTicker-daily-repair/v1/verification-audits/{build_id}/{symbol}/{name}.json"
+            immutable_upload(audit_path, audit_uri)
             return {
                 "relativePath": f"{symbol}/{name}",
                 "sourceKey": source_key,
                 "sourceUrl": source_url,
                 "canonical": {"uri": final_uri, "generation": str(final_meta["generation"]), "sizeBytes": int(final_meta["size"]), "sha256": validated["computedZipSha256"]},
                 "officialChecksum": validated["officialSha256"],
-                "companion": {"uri": companion_uri, "generation": str(checksum_meta["generation"]), "sizeBytes": int(checksum_meta["size"]), "sha256": sha256(checksum_path), "bytes": validated["checksumBytes"].decode("utf8").strip()},
+                "companion": {"uri": companion_uri, "generation": str(checksum_meta["generation"]), "sizeBytes": int(checksum_meta["size"]), "sha256": sha256(canonical_checksum_path), "bytes": validated["checksumBytes"].decode("utf8").strip()},
                 "verificationMarker": {"uri": marker_uri, "generation": str(marker_meta["generation"]), "sha256": marker_hash},
             }
 
@@ -226,13 +312,14 @@ steps:
         manifest = {
             "schemaVersion": "KronosFreeTier1DailyBookTickerRepair/v1",
             "baseMonthlyRawBundleHash": base_bundle,
+            "baseMonthlyAcquisitionManifest": base_monthly_manifest,
             "scope": {"symbols": ["BTCUSDT", "ETHUSDT"], "days": ["2023-05-16", "2023-05-17", "2023-09-22"], "objectCount": len(objects)},
             "canonicalDailyRepairBundleHash": bundle_hash,
             "verification": {"zipIntegrity": "python.zipfile.testzip", "verifierSourceRevision": source_revision, "verifierTemplateSha256": template_sha},
             "objects": objects,
         }
         output = work / f"{bundle_hash}.json"
-        output.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\\n", encoding="utf8")
+        output.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf8")
         target = f"{study}/acquisition-manifests/daily-repair-v1/{bundle_hash}.json"
         immutable_upload(output, target)
         manifest_meta = describe(target)
