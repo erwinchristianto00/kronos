@@ -8,9 +8,12 @@ import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 import { tournamentHash } from "../../apps/api/src/research/contract/tournament-contract.ts";
-import { assembleTier1Baseline, assertTier1AssemblyCanRun, loadTier1Artifacts, runRealTier1SealedHoldoutConservative, runRealTier1WalkForwardConservative } from "../../apps/api/src/research/foundry/tier1-assembler.ts";
+import { assembleTier1Baseline, assertTier1AssemblyCanRun, assertVerifiedRealTier1Assembly, bindRealTier1ExperimentSpec, deriveTier1RandomControl, loadTier1Artifacts, runRealTier1SealedHoldoutConservative, runRealTier1WalkForwardConservative } from "../../apps/api/src/research/foundry/tier1-assembler.ts";
 import { persistTournamentRun } from "../../apps/api/src/research/reporting/artifacts.ts";
+import { runTournamentMatrix } from "../../apps/api/src/research/tournament-runner.ts";
 import { FREE_BINANCE_VISION_2023_05_TO_2024_03_VALIDATION_PLAN as PLAN } from "../../apps/api/src/research/validation/free-binance-vision-2023-05-to-2024-03-plan.ts";
+import { assertNoValidationLeakage, buildWalkForwardPlan } from "../../apps/api/src/research/validation/walk-forward.ts";
+import { buyAndHoldStrategy, cashStrategy, donchianStrategy, emaCrossStrategy, equalWeightHoldStrategy, macdStrategy, randomTimingControl, rsiMeanReversionStrategy } from "../../apps/api/src/research/strategies/challengers.ts";
 
 const HASH = /^[a-f0-9]{64}$/;
 const SHA = /^[a-f0-9]{7,64}$/;
@@ -214,9 +217,190 @@ function holdout(input) {
   const report = { ...core, reportHash: tournamentHash(core) }; writeJson(input.reportPath, report); console.log(JSON.stringify({ status: report.status, reportHash: report.reportHash, holdoutRange: report.holdoutRange, assemblyHash: report.tier1AssemblyHash }, null, 2));
 }
 
+function baselineStrategies(assembly, spec, range) {
+  const random = deriveTier1RandomControl(assembly, spec.randomSeed, range);
+  return {
+    random,
+    strategies: [cashStrategy(), buyAndHoldStrategy(), equalWeightHoldStrategy(), donchianStrategy(), macdStrategy(), emaCrossStrategy(), rsiMeanReversionStrategy(), randomTimingControl({ reference: random.reference, eligibleEntryTimesBySymbol: random.eligibleEntryTimesBySymbol, seed: spec.randomSeed })],
+  };
+}
+
+function strategyForNeighborhood(strategyId, parameters) {
+  if (strategyId === "DONCHIAN") return donchianStrategy(parameters);
+  if (strategyId === "MACD") return macdStrategy(parameters);
+  if (strategyId === "EMA_CROSS") return emaCrossStrategy(parameters);
+  if (strategyId === "RSI_MEAN_REVERSION") return rsiMeanReversionStrategy(parameters);
+  throw new Error(`FREE_TIER1_ROBUSTNESS_UNKNOWN_TACTICAL_STRATEGY_${strategyId}`);
+}
+
+function assertEmpiricalRuns(runs, expectedStrategyIds, context) {
+  const actual = runs.map((run) => run.manifest.strategyId).sort(); const expected = [...expectedStrategyIds].sort();
+  if (JSON.stringify(actual) !== JSON.stringify(expected) || runs.some((run) => run.manifest.executionMode !== "CONSERVATIVE" || run.manifest.strategyId === "KRONOS_CURRENT" || !run.valid || run.terminalOpenPositions.length || !run.episodeLedger || !run.metrics.canonicalEpisodeProvenanceComplete)) throw new Error(`FREE_TIER1_ROBUSTNESS_EMPIRICAL_RUN_INVALID_${context}`);
+  return runs.map((run) => ({ ...run, manifest: { ...run.manifest, empiricalGatePassed: true } }));
+}
+
+function runRangeMatrix(input) {
+  const snapshots = input.prepared.assembly.universeSnapshots.filter((snapshot) => snapshot.asOfMs >= input.range.startMs && snapshot.asOfMs < input.range.endMs);
+  const candles = input.prepared.assembly.canonicalCandles.filter((candle) => candle.openTimeMs >= input.range.startMs && candle.openTimeMs < input.range.endMs);
+  const historyCandles = input.prepared.assembly.canonicalCandles.filter((candle) => candle.closeTimeMs < input.range.startMs);
+  if (!snapshots.length || !candles.length) throw new Error(`FREE_TIER1_ROBUSTNESS_RANGE_COVERAGE_MISSING_${input.context}`);
+  const fundingMultiplier = input.fundingRateMultiplier ?? 1;
+  if (!Number.isFinite(fundingMultiplier) || fundingMultiplier < 1) throw new Error("FREE_TIER1_ROBUSTNESS_FUNDING_MULTIPLIER_INVALID");
+  const fundingSettlements = input.prepared.assembly.canonicalFundingSettlements.map((settlement) => ({ ...settlement, rate: settlement.rate * fundingMultiplier }));
+  const scenario = {
+    version: PLAN.robustness.version,
+    context: input.context,
+    range: input.range,
+    fundingRateMultiplier: fundingMultiplier,
+    policyHash: tournamentHash(PLAN.robustness),
+    ...(input.scenario ?? {}),
+  };
+  const spec = {
+    ...input.bound,
+    strategyVersion: `${input.bound.strategyVersion}+${PLAN.robustness.version}`,
+    dataset: {
+      ...input.bound.dataset,
+      dataRange: { ...input.range },
+      universeSnapshots: structuredClone(snapshots),
+      executionInputsHash: tournamentHash({ baseExecutionInputsHash: input.bound.dataset.executionInputsHash, costs: input.bound.costs, scenario }),
+    },
+    parameters: {
+      ...input.bound.parameters,
+      tier1AssemblyHash: input.prepared.assembly.tier1AssemblyHash,
+      robustnessScenario: scenario,
+      ...(input.extraParameters ?? {}),
+    },
+  };
+  const matrix = runTournamentMatrix({
+    spec,
+    strategies: input.strategies,
+    createdAtMs: input.createdAtMs,
+    modes: ["CONSERVATIVE"],
+    postTradeEpisodePolicy: input.prepared.assembly.postTradeEpisodePolicy,
+    execution: {
+      candles,
+      historyCandles,
+      universe: input.prepared.assembly.universe,
+      portfolioRisk: input.prepared.assembly.portfolioRisk,
+      fundingSettlements,
+      fundingSettlementScheduleBySymbol: new Map(Object.entries(input.prepared.assembly.fundingScheduleBySymbol).map(([symbol, times]) => [symbol, [...times]])),
+    },
+  });
+  return { runs: assertEmpiricalRuns(matrix.runs, input.strategies.map((strategy) => strategy.id), input.context), fairnessHash: matrix.fairnessHashByMode.get("CONSERVATIVE") ?? null };
+}
+
+function walkForwardRanges(assembly, bound) {
+  const timestamps = [...new Set(assembly.canonicalCandles.map((candle) => candle.openTimeMs))].sort((left, right) => left - right);
+  const plan = buildWalkForwardPlan(timestamps, bound.validation); assertNoValidationLeakage(plan);
+  if (plan.folds.length < PLAN.evidenceGates.minimumOosWindows) throw new Error("FREE_TIER1_ROBUSTNESS_OOS_FOLD_GATE_UNMET");
+  const folds = plan.folds.map((fold) => {
+    const startMs = timestamps[fold.test.startIndex]; const lastOpenMs = timestamps[fold.test.endExclusive - 1];
+    if (!Number.isSafeInteger(startMs) || !Number.isSafeInteger(lastOpenMs)) throw new Error(`FREE_TIER1_ROBUSTNESS_FOLD_CLOCK_INVALID_${fold.foldId}`);
+    return { foldId: fold.foldId, range: { startMs, endMs: lastOpenMs + assembly.timeframeMs } };
+  });
+  const holdoutStartMs = timestamps[plan.sealedHoldout.startIndex];
+  if (!Number.isSafeInteger(holdoutStartMs)) throw new Error("FREE_TIER1_ROBUSTNESS_HOLDOUT_CLOCK_INVALID");
+  return { folds, holdout: { startMs: holdoutStartMs, endMs: assembly.range.endMs } };
+}
+
+function runCostFundingStress(prepared, bound, ranges, createdAtMs) {
+  const policy = PLAN.robustness.costFundingStress;
+  const stressBound = {
+    ...bound,
+    costs: {
+      ...bound.costs,
+      makerFeeBps: bound.costs.makerFeeBps,
+      takerFeeBps: policy.takerFeeBps,
+      baseSlippageBps: policy.baseSlippageBps,
+      pessimisticSlippageMultiplier: policy.pessimisticSlippageMultiplier,
+    },
+  };
+  const execute = (range, context) => {
+    const { random, strategies } = baselineStrategies(prepared.assembly, stressBound, range);
+    return runRangeMatrix({ prepared, bound: stressBound, range, strategies, createdAtMs, fundingRateMultiplier: policy.fundingRateMultiplier, context, scenario: { kind: "COST_FUNDING_STRESS", scenarioId: policy.scenarioId, policy }, extraParameters: { tier1RandomControlIdentity: random.identity, tier1RandomControlPolicyVersion: "tier1-random-control-from-donchian-v3" } });
+  };
+  return {
+    policy,
+    oos: ranges.folds.map((fold) => ({ foldId: fold.foldId, ...execute(fold.range, `cost-funding-stress:${fold.foldId}`) })),
+    holdout: execute(ranges.holdout, "cost-funding-stress:sealed-holdout"),
+  };
+}
+
+function runParameterNeighborhoods(prepared, bound, ranges, createdAtMs) {
+  const policy = PLAN.robustness.parameterNeighborhoods;
+  const entries = Object.entries(policy).filter(([strategyId]) => strategyId !== "policyVersion");
+  return entries.map(([strategyId, parameterSets]) => {
+    if (!Array.isArray(parameterSets)) throw new Error(`FREE_TIER1_ROBUSTNESS_NEIGHBORHOOD_INVALID_${strategyId}`);
+    const variants = parameterSets.map((parameters, ordinal) => {
+      const parameterHash = tournamentHash({ policyVersion: policy.policyVersion, strategyId, parameters });
+      const execute = (range, context) => runRangeMatrix({
+        prepared,
+        bound,
+        range,
+        strategies: [strategyForNeighborhood(strategyId, parameters)],
+        createdAtMs,
+        context,
+        scenario: { kind: "PARAMETER_NEIGHBORHOOD", policyVersion: policy.policyVersion, strategyId, parameterHash, ordinal },
+        extraParameters: { tier1ParameterNeighborhood: { policyVersion: policy.policyVersion, strategyId, parameterHash, ordinal, parameters } },
+      });
+      const oos = ranges.folds.map((fold) => ({ foldId: fold.foldId, ...execute(fold.range, `parameter-neighborhood:${strategyId}:${ordinal}:${fold.foldId}`) }));
+      const holdout = execute(ranges.holdout, `parameter-neighborhood:${strategyId}:${ordinal}:sealed-holdout`);
+      return { ordinal, parameterHash, parameters, oos, holdout };
+    });
+    return { strategyId, policyVersion: policy.policyVersion, variants };
+  });
+}
+
+function runRefs(runs) {
+  return runs.map((run) => ({ strategyId: run.manifest.strategyId, runId: run.manifest.runId, inputHash: run.manifest.inputHash, metrics: run.metrics, navPointCount: run.navLedger.length, episodeLedgerHash: run.episodeLedger?.outputHash ?? null }));
+}
+
+function robustness(input) {
+  const frozenOos = hashCheckedReport(required("OOS_FREEZE_REPORT_PATH")); const sealedHoldout = hashCheckedReport(required("SEALED_HOLDOUT_REPORT_PATH"));
+  if (frozenOos.status !== "OOS_FROZEN_PENDING_SEALED_HOLDOUT" || sealedHoldout.status !== "SEALED_HOLDOUT_EVALUATED_NO_CANDIDATE_CLAIM" || frozenOos.reportHash !== sealedHoldout.oosFreezeReportHash) throw new Error("FREE_TIER1_ROBUSTNESS_BASELINE_REPORT_INVALID");
+  const prepared = prepare(input); assertVerifiedRealTier1Assembly(prepared.assembly);
+  if (frozenOos.foundryReportHash !== prepared.foundryReport.reportHash || sealedHoldout.foundryReportHash !== prepared.foundryReport.reportHash || frozenOos.tier1AssemblyHash !== prepared.assembly.tier1AssemblyHash || sealedHoldout.tier1AssemblyHash !== prepared.assembly.tier1AssemblyHash || frozenOos.validationPlan?.artifactHash !== PLAN.artifactHash || sealedHoldout.validationPlan?.artifactHash !== PLAN.artifactHash) throw new Error("FREE_TIER1_ROBUSTNESS_BASELINE_BINDING_MISMATCH");
+  const bound = bindRealTier1ExperimentSpec(prepared.assembly, prepared.spec); const ranges = walkForwardRanges(prepared.assembly, bound);
+  const costFundingStress = runCostFundingStress(prepared, bound, ranges, input.createdAtMs); const parameterNeighborhoods = runParameterNeighborhoods(prepared, bound, ranges, input.createdAtMs);
+  const stressOosRuns = costFundingStress.oos.flatMap((fold) => fold.runs); const stressHoldoutRuns = costFundingStress.holdout.runs;
+  const neighborhoodRuns = parameterNeighborhoods.flatMap((neighborhood) => neighborhood.variants.flatMap((variant) => [...variant.oos.flatMap((fold) => fold.runs), ...variant.holdout.runs]));
+  const persistedOutput = persisted(input.runRoot, [...stressOosRuns, ...stressHoldoutRuns, ...neighborhoodRuns]);
+  const core = {
+    schemaVersion: "KronosFreeTier1RobustnessAssessment/v1",
+    status: "ROBUSTNESS_ASSESSED_NO_AUTOMATIC_CANDIDATE_CLAIM",
+    empiricalClassification: "REAL_SOURCE_BACKED",
+    label: prepared.assembly.label,
+    createdAtMs: input.createdAtMs,
+    generationSha: input.generationSha,
+    validationPlan: { version: PLAN.planVersion, artifactHash: PLAN.artifactHash, robustnessPolicyHash: tournamentHash(PLAN.robustness) },
+    foundryReportHash: prepared.foundryReport.reportHash,
+    oosFreezeReportHash: frozenOos.reportHash,
+    sealedHoldoutReportHash: sealedHoldout.reportHash,
+    tier1AssemblyHash: prepared.assembly.tier1AssemblyHash,
+    artifactSemanticManifestHashes: prepared.assembly.artifactSemanticHashes,
+    baseEvidence: { oosSummary: frozenOos.oosSummary, holdoutSummary: sealedHoldout.holdoutSummary },
+    costFundingStress: {
+      policy: costFundingStress.policy,
+      oos: costFundingStress.oos.map((fold) => ({ foldId: fold.foldId, fairnessHash: fold.fairnessHash, runs: runRefs(fold.runs) })),
+      oosSummary: summarize(stressOosRuns),
+      holdout: { fairnessHash: costFundingStress.holdout.fairnessHash, runs: runRefs(stressHoldoutRuns), summary: summarize(stressHoldoutRuns) },
+    },
+    parameterNeighborhoods: parameterNeighborhoods.map((neighborhood) => ({
+      strategyId: neighborhood.strategyId,
+      policyVersion: neighborhood.policyVersion,
+      variants: neighborhood.variants.map((variant) => ({ ordinal: variant.ordinal, parameterHash: variant.parameterHash, parameters: variant.parameters, oos: variant.oos.map((fold) => ({ foldId: fold.foldId, fairnessHash: fold.fairnessHash, runs: runRefs(fold.runs) })), oosSummary: summarize(variant.oos.flatMap((fold) => fold.runs)), holdout: { fairnessHash: variant.holdout.fairnessHash, runs: runRefs(variant.holdout.runs), summary: summarize(variant.holdout.runs) } })),
+    })),
+    registryHash: persistedOutput.registryHash,
+    persistedRuns: persistedOutput.entries,
+    candidateEdgeVerdict: "NO_AUTOMATIC_CANDIDATE_CLAIM_REQUIRES_SEPARATE_PREDECLARED_EVIDENCE_REVIEW",
+  };
+  const report = { ...core, reportHash: tournamentHash(core) }; writeJson(input.reportPath, report); console.log(JSON.stringify({ status: report.status, reportHash: report.reportHash, stressOosRunCount: stressOosRuns.length, stressHoldoutRunCount: stressHoldoutRuns.length, neighborhoodRunCount: neighborhoodRuns.length, assemblyHash: report.tier1AssemblyHash }, null, 2));
+}
+
 const mode = process.argv[2];
 const input = { rawRoot: required("RAW_ROOT"), artifactRoot: required("ARTIFACT_ROOT"), foundryReportPath: required("FOUNDRY_REPORT_PATH"), runRoot: required("RUN_ROOT"), reportPath: required("REPORT_PATH"), createdAtMs: integer("CREATED_AT_MS"), generationSha: required("GENERATION_SHA") };
 if (!SHA.test(input.generationSha)) throw new Error("FREE_TIER1_WALK_FORWARD_GENERATION_SHA_INVALID");
 if (mode === "oos") oos(input);
 else if (mode === "holdout") holdout(input);
-else throw new Error("FREE_TIER1_WALK_FORWARD_MODE_REQUIRED_oos_or_holdout");
+else if (mode === "robustness") robustness(input);
+else throw new Error("FREE_TIER1_WALK_FORWARD_MODE_REQUIRED_oos_holdout_or_robustness");

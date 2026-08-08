@@ -149,7 +149,8 @@ function fundingSettlementsFromRows(rows: readonly ValidatedFoundryRow[]): Fundi
   return rows.map((row) => ({ symbol: row.symbol!, canonicalSettlementTimeMs: row.canonicalSettlementTimeMs as number, observedSettlementTimeMs: row.observedSettlementTimeMs as number, alignmentOffsetMs: row.alignmentOffsetMs as number, scheduleSourceHash: row.scheduleSourceHash as string, rate: row.rate as number, sourceHash: row.sourceHash }));
 }
 
-function assertVerifiedRealAssembly(assembly: Tier1Assembly): void {
+/** Re-verifies immutable artifacts and archive bundles before an empirical replay. */
+export function assertVerifiedRealTier1Assembly(assembly: Tier1Assembly): void {
   const verifiedInputs = verifiedRealAssemblyInputs.get(assembly);
   if (assembly.researchMode !== "REAL_TIER1" || !verifiedRealAssemblies.has(assembly) || !verifiedInputs) throw new Error("FOUNDRY_REAL_TIER1_ASSEMBLY_NOT_PROVENANCE_VERIFIED");
   for (const artifact of verifiedInputs.foundryArtifacts) loadFoundryArtifact(artifact);
@@ -239,7 +240,7 @@ export function runTier1BaselineSmoke(input: {
 
 /** The only executable empirical entry point. It is Conservative-only and still produces no ranking. */
 export function runRealTier1Conservative(input: { assembly: Tier1Assembly; spec: TournamentExperimentSpec; createdAtMs: number }): { label: Tier1Assembly["label"]; result: TournamentMatrixResult } {
-  assertVerifiedRealAssembly(input.assembly);
+  assertVerifiedRealTier1Assembly(input.assembly);
   const random = deriveTier1RandomControl(input.assembly, input.spec.randomSeed); if (input.spec.parameters.tier1RandomControlIdentity !== undefined && input.spec.parameters.tier1RandomControlIdentity !== random.identity) throw new Error("FOUNDRY_REAL_TIER1_RANDOM_CONTROL_IDENTITY_MISMATCH");
   const bound = bindRealTier1ExperimentSpec(input.assembly, input.spec); const spec = { ...bound, parameters: { ...bound.parameters, tier1AssemblyHash: input.assembly.tier1AssemblyHash, tier1RandomControlIdentity: random.identity, tier1RandomControlPolicyVersion: "tier1-random-control-from-donchian-v3" } };
   const { strategies } = baselineStrategies(input.assembly, spec);
@@ -263,7 +264,7 @@ export interface RealTier1WalkForwardFoldResult {
  * no caller-provided market payload or tuning input.
  */
 export function runRealTier1WalkForwardConservative(input: { assembly: Tier1Assembly; spec: TournamentExperimentSpec; createdAtMs: number }): { label: Tier1Assembly["label"]; folds: readonly RealTier1WalkForwardFoldResult[] } {
-  assertVerifiedRealAssembly(input.assembly);
+  assertVerifiedRealTier1Assembly(input.assembly);
   if (input.spec.parameters.tier1RandomControlIdentity !== undefined) throw new Error("FOUNDRY_REAL_TIER1_WALK_FORWARD_CALLER_RANDOM_IDENTITY_FORBIDDEN");
   const bound = bindRealTier1ExperimentSpec(input.assembly, input.spec);
   const timestamps = [...new Set(input.assembly.canonicalCandles.map((candle) => candle.openTimeMs))].sort((left, right) => left - right);
@@ -312,7 +313,7 @@ export function runRealTier1WalkForwardConservative(input: { assembly: Tier1Asse
  */
 export function runRealTier1SealedHoldoutConservative(input: { assembly: Tier1Assembly; spec: TournamentExperimentSpec; createdAtMs: number; oosFreezeReportHash: string }): { label: Tier1Assembly["label"]; holdoutRange: Readonly<{ startMs: number; endMs: number }>; randomControlIdentity: string; fairnessHash: string; result: TournamentMatrixResult } {
   if (!/^[a-f0-9]{64}$/.test(input.oosFreezeReportHash)) throw new Error("FOUNDRY_REAL_TIER1_SEALED_HOLDOUT_OOS_FREEZE_HASH_INVALID");
-  assertVerifiedRealAssembly(input.assembly);
+  assertVerifiedRealTier1Assembly(input.assembly);
   if (input.spec.parameters.tier1RandomControlIdentity !== undefined) throw new Error("FOUNDRY_REAL_TIER1_SEALED_HOLDOUT_CALLER_RANDOM_IDENTITY_FORBIDDEN");
   const bound = bindRealTier1ExperimentSpec(input.assembly, input.spec);
   const timestamps = [...new Set(input.assembly.canonicalCandles.map((candle) => candle.openTimeMs))].sort((left, right) => left - right);
