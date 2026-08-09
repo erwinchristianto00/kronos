@@ -1,0 +1,146 @@
+# Cloud-only schema and coverage diagnostic for the exact Binance Vision
+# bookDepth dates that remain stale after the verified bookTicker repair.
+# It downloads neither the 80 GB BBO corpus nor writes a Foundry artifact.
+steps:
+  - name: gcr.io/google.com/cloudsdktool/google-cloud-cli:slim
+    id: verify-and-inspect-official-bookdepth-gap-objects
+    entrypoint: bash
+    env:
+      - _STUDY=${_STUDY}
+      - _GENERATED_AT_MS=${_GENERATED_AT_MS}
+      - _GENERATION_SHA=${_GENERATION_SHA}
+    args:
+      - -ceu
+      - |
+        python3 - <<'PY'
+        import csv
+        import hashlib
+        import io
+        import json
+        import pathlib
+        import re
+        import urllib.request
+        import zipfile
+        from collections import deque
+
+        study = __import__("os").environ["_STUDY"]
+        generated_at_ms = int(__import__("os").environ["_GENERATED_AT_MS"])
+        generation_sha = __import__("os").environ["_GENERATION_SHA"]
+        if generated_at_ms < 0 or not re.fullmatch(r"[0-9a-f]{40}", generation_sha):
+            raise RuntimeError("FREE_TIER1_BOOKDEPTH_DIAGNOSTIC_IDENTITY_INVALID")
+
+        base = "https://s3-ap-northeast-1.amazonaws.com/data.binance.vision"
+        pairs = [(symbol, day) for symbol in ("BTCUSDT", "ETHUSDT") for day in ("2023-05-16", "2023-05-17", "2023-09-21", "2023-09-22")]
+        raw_root = pathlib.Path("/workspace/bookdepth")
+        raw_root.mkdir(parents=True, exist_ok=True)
+
+        def request(url, method="GET"):
+            req = urllib.request.Request(url, method=method)
+            with urllib.request.urlopen(req) as response:
+                return response.status, dict(response.headers.items()), response.read()
+
+        def sha256(path):
+            digest = hashlib.sha256()
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            return digest.hexdigest()
+
+        objects = []
+        for symbol, day in pairs:
+            relative = f"data/futures/um/daily/bookDepth/{symbol}/{symbol}-bookDepth-{day}.zip"
+            url = f"{base}/{relative}"
+            zip_status, zip_headers, zip_bytes = request(url)
+            checksum_status, checksum_headers, checksum_bytes = request(f"{url}.CHECKSUM")
+            official_match = re.search(rb"\b([0-9a-fA-F]{64})\b", checksum_bytes)
+            if zip_status != 200 or checksum_status != 200 or not official_match:
+                raise RuntimeError(f"FREE_TIER1_BOOKDEPTH_DIAGNOSTIC_SOURCE_INVALID_{symbol}_{day}")
+            local = raw_root / f"{symbol}-{day}.zip"
+            local.write_bytes(zip_bytes)
+            computed = sha256(local)
+            official = official_match.group(1).decode("ascii").lower()
+            if computed != official:
+                raise RuntimeError(f"FREE_TIER1_BOOKDEPTH_DIAGNOSTIC_CHECKSUM_MISMATCH_{symbol}_{day}")
+            with zipfile.ZipFile(local) as archive:
+                members = archive.infolist()
+                if archive.testzip() is not None or len(members) != 1:
+                    raise RuntimeError(f"FREE_TIER1_BOOKDEPTH_DIAGNOSTIC_ZIP_INVALID_{symbol}_{day}")
+                with archive.open(members[0]) as member:
+                    reader = csv.reader(io.TextIOWrapper(member, encoding="utf-8", newline=""))
+                    header = next(reader, None)
+                    if not header:
+                        raise RuntimeError(f"FREE_TIER1_BOOKDEPTH_DIAGNOSTIC_HEADER_MISSING_{symbol}_{day}")
+                    first = []
+                    last = deque(maxlen=3)
+                    row_count = 0
+                    column_counts = set()
+                    for row in reader:
+                        row_count += 1
+                        column_counts.add(len(row))
+                        if len(first) < 3:
+                            first.append(row)
+                        last.append(row)
+                    if row_count == 0 or column_counts != {len(header)}:
+                        raise RuntimeError(f"FREE_TIER1_BOOKDEPTH_DIAGNOSTIC_CSV_INVALID_{symbol}_{day}")
+            objects.append({
+                "symbol": symbol,
+                "day": day,
+                "sourceKey": relative,
+                "sourceUrl": url,
+                "sourceZip": {"httpStatus": zip_status, "contentLength": zip_headers.get("Content-length"), "lastModified": zip_headers.get("Last-modified")},
+                "sourceChecksum": {"httpStatus": checksum_status, "contentLength": checksum_headers.get("Content-length"), "lastModified": checksum_headers.get("Last-modified"), "sha256": hashlib.sha256(checksum_bytes).hexdigest()},
+                "officialSha256": official,
+                "computedSha256": computed,
+                "sizeBytes": len(zip_bytes),
+                "zipIntegrity": "python.zipfile.testzip",
+                "member": members[0].filename,
+                "header": header,
+                "rowCount": row_count,
+                "firstRows": first,
+                "lastRows": list(last),
+            })
+
+        core = {
+            "schemaVersion": "KronosFreeTier1BookDepthGapDiagnostic/v1",
+            "status": "OFFICIAL_BOOKDEPTH_GAP_OBJECTS_VERIFIED_PENDING_SCHEMA_ADMISSION",
+            "study": study,
+            "generation": {"generatedAtMs": generated_at_ms, "generationSha": generation_sha},
+            "objects": sorted(objects, key=lambda item: (item["symbol"], item["day"])),
+            "empiricalExecutionForbidden": True,
+            "nextStep": "Admit bookDepth only if its validated schema yields actual PIT top-of-book marks within the unchanged one-hour maximum age policy.",
+        }
+        report = {**core, "reportHash": hashlib.sha256(json.dumps(core, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()}
+        pathlib.Path("/workspace/bookdepth-gap-diagnostic.json").write_text(json.dumps(report, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+        print(json.dumps({"status": report["status"], "reportHash": report["reportHash"], "objects": len(report["objects"])}, sort_keys=True))
+        PY
+  - name: gcr.io/google.com/cloudsdktool/google-cloud-cli:slim
+    id: persist-immutable-bookdepth-diagnostic
+    entrypoint: bash
+    env:
+      - _STUDY=${_STUDY}
+    args:
+      - -ceu
+      - |
+        python3 - <<'PY'
+        import hashlib
+        import json
+        import os
+        import pathlib
+        import subprocess
+
+        report = pathlib.Path("/workspace/bookdepth-gap-diagnostic.json")
+        payload = json.loads(report.read_text(encoding="utf-8"))
+        target = os.environ["_STUDY"] + f"/foundry-partials/v2/bookdepth-gap-diagnostics/{payload['reportHash']}.json"
+        result = subprocess.run(["gcloud", "storage", "cp", str(report), target, "--if-generation-match=0"], text=True, capture_output=True)
+        if result.returncode:
+            existing = pathlib.Path("/workspace/existing-bookdepth-diagnostic.json")
+            subprocess.check_call(["gcloud", "storage", "cp", target, str(existing)])
+            if hashlib.sha256(existing.read_bytes()).digest() != hashlib.sha256(report.read_bytes()).digest():
+                raise RuntimeError("FREE_TIER1_BOOKDEPTH_DIAGNOSTIC_IMMUTABLE_CONFLICT")
+        print(json.dumps({"status": "PASS", "report": target, "reportHash": payload["reportHash"]}, sort_keys=True))
+        PY
+timeout: 1800s
+substitutions:
+  _STUDY: gs://bucket-coin-yuhu/kronos-tier1-archives/binance-vision-usdm-bookticker-free-walkforward-v1
+  _GENERATED_AT_MS: "0"
+  _GENERATION_SHA: unknown
