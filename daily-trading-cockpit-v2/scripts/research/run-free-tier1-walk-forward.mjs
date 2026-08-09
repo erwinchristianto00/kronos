@@ -6,6 +6,7 @@
  */
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { tournamentHash } from "../../apps/api/src/research/contract/tournament-contract.ts";
 import { assembleTier1Baseline, assertTier1AssemblyCanRun, assertVerifiedRealTier1Assembly, bindRealTier1ExperimentSpec, deriveTier1RandomControl, loadTier1Artifacts, runRealTier1SealedHoldoutConservative, runRealTier1WalkForwardConservative } from "../../apps/api/src/research/foundry/tier1-assembler.ts";
@@ -22,6 +23,8 @@ const HOUR_MS = 3_600_000;
 const SYMBOLS = ["BTCUSDT", "ETHUSDT"];
 const START_MS = Date.UTC(2023, 4, 16, 12);
 const END_MS = Date.UTC(2024, 3, 1);
+export const FREE_TIER1_REAL_FOUNDRY_REPORT_STATUS = "REAL_TIER1_FOUNDRY_READY_FOR_WALK_FORWARD";
+export const FREE_TIER1_REAL_WALK_FORWARD_AUTHORIZATION_VERSION = "free-tier1-real-walk-forward-authorization-v1";
 
 function required(name) { const value = process.env[name]; if (!value) throw new Error(`FREE_TIER1_WALK_FORWARD_ENV_REQUIRED_${name}`); return value; }
 function integer(name) { const value = Number(required(name)); if (!Number.isSafeInteger(value) || value <= 0) throw new Error(`FREE_TIER1_WALK_FORWARD_ENV_INVALID_${name}`); return value; }
@@ -44,11 +47,12 @@ function selectedArtifacts(report) {
   return names.map((name) => artifactByName(report, name));
 }
 
-function assertFoundryReport(report, artifactRoot) {
+export function assertFoundryReport(report, artifactRoot) {
   if (
     report.schemaVersion !== "KronosFreeTier1FoundryArtifacts/v2"
-    || report.status !== "COMPLETE_TIER1_ARTIFACTS_READY_FOR_IMMUTABLE_ASSEMBLY"
-    || report.empiricalExecutionForbidden !== true
+    || report.status !== FREE_TIER1_REAL_FOUNDRY_REPORT_STATUS
+    || report.empiricalExecutionForbidden !== false
+    || report.gcsVerifiedReload !== true
     || JSON.stringify(report.realTier1Blockers) !== JSON.stringify([])
     || report.study?.startMs !== START_MS
     || report.study?.endMs !== END_MS
@@ -56,6 +60,22 @@ function assertFoundryReport(report, artifactRoot) {
     || JSON.stringify(report.study?.symbols) !== JSON.stringify(SYMBOLS)
     || report.generation?.generationSha === undefined
   ) throw new Error("FREE_TIER1_WALK_FORWARD_FOUNDRY_REPORT_INVALID");
+  const authorization = report.realTier1WalkForwardAuthorization;
+  if (
+    !authorization
+    || authorization.version !== FREE_TIER1_REAL_WALK_FORWARD_AUTHORIZATION_VERSION
+    || !HASH.test(authorization.scopeFreezeReportHash ?? "")
+    || !HASH.test(authorization.rawBookTickerBundleHash ?? "")
+    || !HASH.test(authorization.dailyRepairBundleHash ?? "")
+    || !HASH.test(authorization.listingSemanticManifestHash ?? "")
+    || !HASH.test(authorization.futuresAvailabilitySemanticManifestHash ?? "")
+  ) throw new Error("FREE_TIER1_WALK_FORWARD_AUTHORIZATION_INVALID");
+  if (
+    authorization.rawBookTickerBundleHash !== report.frozenBookTicker?.rawManifestBundleHash
+    || authorization.dailyRepairBundleHash !== report.frozenBookTicker?.dailyRepairBundleHash
+    || authorization.listingSemanticManifestHash !== artifactByName(report, "listing_delisting_timeline").semanticManifestHash
+    || authorization.futuresAvailabilitySemanticManifestHash !== artifactByName(report, "futures_availability_timeline").semanticManifestHash
+  ) throw new Error("FREE_TIER1_WALK_FORWARD_AUTHORIZATION_BINDING_MISMATCH");
   const entries = new Set(readdirSync(artifactRoot));
   for (const artifact of [...selectedArtifacts(report), artifactByName(report, "warmup_candles")]) {
     if (!entries.has(artifact.semanticManifestHash)) throw new Error(`FREE_TIER1_WALK_FORWARD_ARTIFACT_STORE_MISSING_${artifact.name}`);
@@ -451,10 +471,12 @@ function robustness(input) {
   const report = { ...core, reportHash: tournamentHash(core) }; writeJson(input.reportPath, report); console.log(JSON.stringify({ status: report.status, reportHash: report.reportHash, stressOosRunCount: stressOosRuns.length, stressHoldoutRunCount: stressHoldoutRuns.length, neighborhoodRunCount: neighborhoodRuns.length, assemblyHash: report.tier1AssemblyHash }, null, 2));
 }
 
-const mode = process.argv[2];
-const input = { rawRoot: required("RAW_ROOT"), artifactRoot: required("ARTIFACT_ROOT"), foundryReportPath: required("FOUNDRY_REPORT_PATH"), runRoot: required("RUN_ROOT"), reportPath: required("REPORT_PATH"), createdAtMs: integer("CREATED_AT_MS"), generationSha: required("GENERATION_SHA") };
-if (!SHA.test(input.generationSha)) throw new Error("FREE_TIER1_WALK_FORWARD_GENERATION_SHA_INVALID");
-if (mode === "oos") oos(input);
-else if (mode === "holdout") holdout(input);
-else if (mode === "robustness") robustness(input);
-else throw new Error("FREE_TIER1_WALK_FORWARD_MODE_REQUIRED_oos_holdout_or_robustness");
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  const mode = process.argv[2];
+  const input = { rawRoot: required("RAW_ROOT"), artifactRoot: required("ARTIFACT_ROOT"), foundryReportPath: required("FOUNDRY_REPORT_PATH"), runRoot: required("RUN_ROOT"), reportPath: required("REPORT_PATH"), createdAtMs: integer("CREATED_AT_MS"), generationSha: required("GENERATION_SHA") };
+  if (!SHA.test(input.generationSha)) throw new Error("FREE_TIER1_WALK_FORWARD_GENERATION_SHA_INVALID");
+  if (mode === "oos") oos(input);
+  else if (mode === "holdout") holdout(input);
+  else if (mode === "robustness") robustness(input);
+  else throw new Error("FREE_TIER1_WALK_FORWARD_MODE_REQUIRED_oos_holdout_or_robustness");
+}
