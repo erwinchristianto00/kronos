@@ -81,6 +81,17 @@ type ClosedBasket = {
   legs: ClosedLeg[];
 };
 type ClosedLane = { lane: string; laneId: string; closedBaskets: number; baskets: ClosedBasket[] };
+type CrossSectionalPnl = {
+  openBasketCount: number;
+  openLegCount: number;
+  grossUnrealizedUsd: number | null;
+  unrealizedAfterSlippageUsd: number | null;
+  estimatedSlippageUsd: number | null;
+  realizedBeforeSlippageUsd: number;
+  netRealizedProfitUsd: number;
+  estimatedCloseCostPct: number;
+  slippageCaveat: string;
+};
 type ClosedResponse = {
   generatedAt: string;
   reportStartAt?: string | null;
@@ -88,6 +99,7 @@ type ClosedResponse = {
   feeCaveat?: string;
   totalClosed: number;
   reason: string | null;
+  crossSectionalPnl?: CrossSectionalPnl;
   lanes: ClosedLane[];
 };
 
@@ -217,6 +229,13 @@ function ClosedCrossBasketReport({ apiPrefix }: { apiPrefix: string }) {
     <div style={{ padding: '8px 12px', color: C.dim, fontSize: 11, lineHeight: 1.5 }}>
       Scope: {data?.reportStartAt ? `baskets opened from ${formatDate(data.reportStartAt)} onward` : 'all stored history'}. Gross profit, fee/cost, long/short return, realized net per symbol, and open/close timestamps. Fee/cost comes from the basket ledger; separate slippage is not currently stored independently. Per-symbol fee is allocated by notional touched.
     </div>
+    {data?.crossSectionalPnl && <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, minmax(150px, 1fr))', borderTop: `1px solid ${C.border}`, borderBottom: `1px solid ${C.border}` }}>
+      <Stat label="Gross unrealized" value={money(data.crossSectionalPnl.grossUnrealizedUsd)} color={tone(data.crossSectionalPnl.grossUnrealizedUsd)} />
+      <Stat label="Unrealized setelah slippage" value={money(data.crossSectionalPnl.unrealizedAfterSlippageUsd)} color={tone(data.crossSectionalPnl.unrealizedAfterSlippageUsd)} />
+      <Stat label="Realized sebelum slippage" value={money(data.crossSectionalPnl.realizedBeforeSlippageUsd)} color={tone(data.crossSectionalPnl.realizedBeforeSlippageUsd)} />
+      <Stat label="Net realized profit" value={money(data.crossSectionalPnl.netRealizedProfitUsd)} color={tone(data.crossSectionalPnl.netRealizedProfitUsd)} />
+    </div>}
+    {data?.crossSectionalPnl && <div style={{ padding: '7px 12px', color: C.dim, fontSize: 11 }}>{data.crossSectionalPnl.openBasketCount} basket aktif · {data.crossSectionalPnl.openLegCount} leg aktif · {data.crossSectionalPnl.slippageCaveat}</div>}
     {error ? <div style={{ padding: 12, color: C.bad }}>Closed-basket report fetch failed.</div> : baskets.length ? <div style={{ padding: '0 12px 12px' }}>
       {baskets.map(({ lane, basket }) => <ClosedBasketBlock key={basket.basketId} lane={lane} basket={basket} />)}
     </div> : <div style={{ padding: 12, color: C.dim }}>{data?.reason ? 'Belum ada cross-sectional basket yang sudah open dan close di exchange.' : 'Loading closed basket history…'}</div>}

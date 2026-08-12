@@ -1298,6 +1298,41 @@ export async function registerLiveRoutes(
           baskets: closed,
         };
       });
+    const filteredExecutor = opts.crossSectionalExecutor?.() ?? null;
+    const filteredOpenBaskets = filteredExecutor?.getStatus().openBaskets.filter((basket) => inReportEra(basket.openedAt)) ?? [];
+    const filteredClosedBaskets = filteredExecutor
+      ? closedBasketRealizedBreakdown(filteredExecutor.getClosedBaskets()).filter((basket) => inReportEra(basket.openedAt))
+      : [];
+    const estimatedCloseCostPct = Number.isFinite(Number(process.env.LIVE_ESTIMATED_CLOSE_COST_PCT))
+      ? Number(process.env.LIVE_ESTIMATED_CLOSE_COST_PCT)
+      : 0.0022;
+    let grossUnrealizedUsd: number | null = filteredOpenBaskets.length === 0 ? 0 : null;
+    let unrealizedMarkNotionalUsd = 0;
+    if (filteredOpenBaskets.length > 0 && engine) {
+      const account = await engine.getAccountSnapshot();
+      const markBySymbol = new Map(account.positions.flatMap((position) =>
+        position.markPrice != null ? [[position.symbol, position.markPrice] as const] : [],
+      ));
+      let gross = 0;
+      let complete = true;
+      for (const basket of filteredOpenBaskets) {
+        for (const leg of basket.legs) {
+          if (leg.exitOrderId !== null) continue;
+          const mark = markBySymbol.get(leg.symbol);
+          if (mark == null || !Number.isFinite(mark)) {
+            complete = false;
+            continue;
+          }
+          const direction = leg.side === "LONG" ? 1 : -1;
+          gross += (mark - leg.entryPrice) * leg.qty * direction;
+          unrealizedMarkNotionalUsd += mark * leg.qty;
+        }
+      }
+      grossUnrealizedUsd = complete ? gross : null;
+    }
+    const estimatedSlippageUsd = grossUnrealizedUsd == null ? null : unrealizedMarkNotionalUsd * Math.max(0, estimatedCloseCostPct);
+    const realizedBeforeSlippageUsd = filteredClosedBaskets.reduce((sum, basket) => sum + (basket.grossPnlUsd ?? 0), 0);
+    const netRealizedProfitUsd = filteredClosedBaskets.reduce((sum, basket) => sum + (basket.netPnlUsd ?? 0), 0);
     const totalClosed = lanes.reduce((sum, l) => sum + l.closedBaskets, 0);
     return {
       generatedAt: new Date().toISOString(),
@@ -1308,6 +1343,17 @@ export async function registerLiveRoutes(
       reason: totalClosed === 0
         ? "no cross-sectional basket has opened AND closed on the exchange yet — an empty list here means the lane has not traded, not that it broke even"
         : null,
+      crossSectionalPnl: {
+        openBasketCount: filteredOpenBaskets.length,
+        openLegCount: filteredOpenBaskets.reduce((sum, basket) => sum + basket.legs.filter((leg) => leg.exitOrderId === null).length, 0),
+        grossUnrealizedUsd,
+        unrealizedAfterSlippageUsd: grossUnrealizedUsd == null ? null : grossUnrealizedUsd - (estimatedSlippageUsd ?? 0),
+        estimatedSlippageUsd,
+        realizedBeforeSlippageUsd,
+        netRealizedProfitUsd,
+        estimatedCloseCostPct,
+        slippageCaveat: "Slippage fill aktual tidak disimpan terpisah; unrealized after slippage memakai estimasi biaya close LIVE_ESTIMATED_CLOSE_COST_PCT.",
+      },
       lanes,
     };
   });
