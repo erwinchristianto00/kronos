@@ -118,7 +118,14 @@ type OpenBasketUnrealized = {
   signal: string;
   variant: string;
   openedAt: string;
-  legs: Array<{ symbol: string; side: 'LONG' | 'SHORT' }>;
+  legs: Array<{
+    symbol: string;
+    side: 'LONG' | 'SHORT';
+    qty: number;
+    entryPrice: number;
+    markPrice: number | null;
+    grossUnrealizedUsd: number | null;
+  }>;
   grossUnrealizedUsd: number | null;
   unrealizedAfterEstimatedCloseCostUsd: number | null;
   unrealizedExtrema: UnrealizedExtrema | null;
@@ -221,6 +228,12 @@ function money(value: number | null | undefined) {
   return value == null || !Number.isFinite(value) ? '—' : `${value >= 0 ? '+' : ''}${value.toFixed(4)} USDT`;
 }
 
+function price(value: number | null | undefined) {
+  if (value == null || !Number.isFinite(value)) return '—';
+  const decimals = value >= 1_000 ? 2 : value >= 1 ? 4 : value >= 0.01 ? 6 : 8;
+  return value.toFixed(decimals);
+}
+
 function UnrealizedExtremaBlock({ extrema }: { extrema: UnrealizedExtrema | null | undefined }) {
   if (!extrema) return <div style={{ padding: '7px 12px', color: C.dim, fontSize: 11 }}>ATH/ATL unrealized mulai direkam saat report ini aktif.</div>;
   return <div style={{ padding: '8px 12px', display: 'grid', gap: 5, fontSize: 12, borderBottom: `1px solid ${C.border}` }}>
@@ -292,6 +305,18 @@ function OpenBasketUnrealizedBlock({ basket }: { basket: OpenBasketUnrealized })
       <span style={{ color: C.bad }}>Short: {short.join(', ')}</span>
       <span>Gross sekarang: <strong style={{ color: tone(basket.grossUnrealizedUsd) }}>{money(basket.grossUnrealizedUsd)}</strong></span>
       <span>Setelah biaya close: <strong style={{ color: tone(basket.unrealizedAfterEstimatedCloseCostUsd) }}>{money(basket.unrealizedAfterEstimatedCloseCostUsd)}</strong></span>
+    </div>
+    <div style={{ fontSize: 12, borderBottom: `1px solid ${C.border}` }}>
+      <div style={{ display: 'grid', gridTemplateColumns: 'minmax(105px, 1.2fr) minmax(72px, .7fr) repeat(3, minmax(92px, 1fr))', gap: 8, padding: '7px 12px', color: C.dim, fontSize: 11 }}>
+        <span>Symbol</span><span>Arah</span><span>Entry</span><span>Mark sekarang</span><span>Unrealized P&amp;L</span>
+      </div>
+      {basket.legs.map((leg) => <div key={`${basket.basketId}-${leg.symbol}-${leg.side}`} style={{ display: 'grid', gridTemplateColumns: 'minmax(105px, 1.2fr) minmax(72px, .7fr) repeat(3, minmax(92px, 1fr))', gap: 8, padding: '7px 12px', borderTop: `1px solid ${C.border}` }}>
+        <strong style={{ color: C.text }}>{leg.symbol}</strong>
+        <span style={{ color: leg.side === 'LONG' ? C.good : C.bad }}>{leg.side}</span>
+        <span>{price(leg.entryPrice)}</span>
+        <span>{price(leg.markPrice)}</span>
+        <strong style={{ color: tone(leg.grossUnrealizedUsd) }}>{money(leg.grossUnrealizedUsd)}</strong>
+      </div>)}
     </div>
     <UnrealizedExtremaBlock extrema={basket.unrealizedExtrema} />
   </div>;

@@ -1370,6 +1370,14 @@ export async function registerLiveRoutes(
     let grossUnrealizedUsd: number | null = filteredOpenBaskets.length === 0 ? 0 : null;
     let unrealizedMarkNotionalUsd = 0;
     const openBasketUnrealized = new Map<string, { grossUsd: number; afterEstimatedCloseCostUsd: number }>();
+    const openBasketLegs = new Map<string, Array<{
+      symbol: string;
+      side: "LONG" | "SHORT";
+      qty: number;
+      entryPrice: number;
+      markPrice: number | null;
+      grossUnrealizedUsd: number | null;
+    }>>();
     if (filteredOpenBaskets.length > 0 && engine) {
       const account = await engine.getAccountSnapshot();
       const markBySymbol = new Map(account.positions.flatMap((position) =>
@@ -1381,16 +1389,40 @@ export async function registerLiveRoutes(
         let basketGross = 0;
         let basketMarkNotional = 0;
         let basketComplete = true;
+        const legs: Array<{
+          symbol: string;
+          side: "LONG" | "SHORT";
+          qty: number;
+          entryPrice: number;
+          markPrice: number | null;
+          grossUnrealizedUsd: number | null;
+        }> = [];
         for (const leg of basket.legs) {
           if (leg.exitOrderId !== null) continue;
           const mark = markBySymbol.get(leg.symbol);
           if (mark == null || !Number.isFinite(mark)) {
             complete = false;
             basketComplete = false;
+            legs.push({
+              symbol: leg.symbol,
+              side: leg.side,
+              qty: leg.qty,
+              entryPrice: leg.entryPrice,
+              markPrice: null,
+              grossUnrealizedUsd: null,
+            });
             continue;
           }
           const direction = leg.side === "LONG" ? 1 : -1;
           const legGross = (mark - leg.entryPrice) * leg.qty * direction;
+          legs.push({
+            symbol: leg.symbol,
+            side: leg.side,
+            qty: leg.qty,
+            entryPrice: leg.entryPrice,
+            markPrice: mark,
+            grossUnrealizedUsd: legGross,
+          });
           gross += legGross;
           basketGross += legGross;
           const markNotional = mark * leg.qty;
@@ -1403,6 +1435,7 @@ export async function registerLiveRoutes(
             afterEstimatedCloseCostUsd: basketGross - basketMarkNotional * Math.max(0, estimatedCloseCostPct),
           });
         }
+        openBasketLegs.set(basket.basketId, legs);
       }
       grossUnrealizedUsd = complete ? gross : null;
     }
@@ -1476,7 +1509,16 @@ export async function registerLiveRoutes(
           signal: basket.signal,
           variant: basket.variant,
           openedAt: basket.openedAt,
-          legs: basket.legs.map((leg) => ({ symbol: leg.symbol, side: leg.side })),
+          legs: openBasketLegs.get(basket.basketId) ?? basket.legs
+            .filter((leg) => leg.exitOrderId === null)
+            .map((leg) => ({
+              symbol: leg.symbol,
+              side: leg.side,
+              qty: leg.qty,
+              entryPrice: leg.entryPrice,
+              markPrice: null,
+              grossUnrealizedUsd: null,
+            })),
           grossUnrealizedUsd: current?.grossUsd ?? null,
           unrealizedAfterEstimatedCloseCostUsd: current?.afterEstimatedCloseCostUsd ?? null,
           unrealizedExtrema: unrealizedExtremaByBasket[basket.basketId] ?? null,
