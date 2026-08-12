@@ -80,6 +80,7 @@ import {
   isDirectionalTechnicalSignalFresh,
   type SymbolVolatilityCacheStore,
 } from "./directional-symbol-sizing.js";
+import { isTestnetCrossSectionalHorizonLaneAllowed } from "./live-executor-wiring.js";
 
 // ─── config ──────────────────────────────────────────────────────────────────
 
@@ -155,6 +156,8 @@ export interface LiveExecutionConfig {
   maxPaperOrderAgeMs: number;
   /** Testnet-only: mirror every open paper order, including diagnostic lanes and pre-restart orders. */
   mirrorAllPaperOrders: boolean;
+  /** Testnet-only rollout lock: no non-cross-sectional lane may create a new mirror/copy. */
+  testnetOnlyCrossSectionalHorizon: boolean;
   /**
    * Testnet-only collector policy. Interleaves fresh sources by their
    * lane × direction × entry-regime exposure and never pyramids a source from
@@ -326,6 +329,8 @@ export function parseLiveExecutionConfig(env: NodeJS.ProcessEnv = process.env): 
     maxNotionalPerTrade: envNum(env.LIVE_MAX_NOTIONAL_PER_TRADE, 250),
     maxPaperOrderAgeMs: Math.floor(envNum(env.LIVE_MAX_PAPER_ORDER_AGE_MS, 10 * 60 * 1000)),
     mirrorAllPaperOrders: env.LIVE_MIRROR_ALL_PAPER === "1" && liveEnv === "testnet",
+    testnetOnlyCrossSectionalHorizon:
+      liveEnv === "testnet" && env.TESTNET_ONLY_CROSS_SECTIONAL_HORIZON === "1",
     testnetStratifiedCollection:
       env.LIVE_TESTNET_STRATIFIED_COLLECTION === "1" && liveEnv === "testnet",
     mirrorProvenSymbolsOnly: isMirrorProvenSymbolsOnly(env),
@@ -5285,6 +5290,7 @@ export class LiveExecutionEngine {
    *  plain allow-list (null = all lanes, [] = pause all new mirrors). Matches
    *  selectedLaneId as full id or variant suffix. */
   private laneAllowedForMirror(paper: PaperOrder): boolean {
+    if (!isTestnetCrossSectionalHorizonLaneAllowed(this.config.env, paper.selectedLaneId)) return false;
     // LIVE_MIRROR_ALL_PAPER is parsed as testnet-only. Collection mode mirrors
     // every fresh diagnostic source so lane selection cannot starve CORTEX data.
     if (this.config.mirrorAllPaperOrders) return true;
@@ -5299,6 +5305,7 @@ export class LiveExecutionEngine {
    *  Status, dedup, stop/TP geometry, entry quality, cluster caps and every risk check below remain
    *  unchanged. Returning null from paperLaneGate preserves the legacy source rules exactly. */
   private paperSourceEligibleForMirror(paper: PaperOrder, nowIso: string): boolean {
+    if (!isTestnetCrossSectionalHorizonLaneAllowed(this.config.env, paper.selectedLaneId)) return false;
     // Testnet collection is broader than orchestration. Still require a fresh
     // source, but do not let an old unified-recipe verdict suppress it.
     if (this.config.mirrorAllPaperOrders) return this.isFreshPaperOrder(paper, nowIso);
@@ -5403,6 +5410,7 @@ export class LiveExecutionEngine {
   /** Admission-only manual override. A paper signal must still be fresh and carry valid geometry;
    * this merely bypasses maturity/book/regime policy after the operator selected that directional lane. */
   isManualEntryAllowedForPaper(paper: Pick<PaperOrder, "selectedLaneId" | "direction">): boolean {
+    if (!isTestnetCrossSectionalHorizonLaneAllowed(this.config.env, paper.selectedLaneId)) return false;
     const decision = this.manualEntryDecision;
     return this.isManualDirectionalEntryEnabled() &&
       decision?.directionalBias === paper.direction &&
@@ -5616,6 +5624,9 @@ export class LiveExecutionEngine {
     sourceEnv?: string | null;
     idempotencyKey?: string | null;
   }): Promise<{ ok: boolean; reason: string | null; intent?: LiveIntent }> {
+    if (!isTestnetCrossSectionalHorizonLaneAllowed(this.config.env, req.sourceLaneId)) {
+      return { ok: false, reason: "testnet is locked to the cross-sectional horizon lane" };
+    }
     const idempotencyKey =
       typeof req.idempotencyKey === "string" && req.idempotencyKey.trim().length > 0
         ? req.idempotencyKey.trim()

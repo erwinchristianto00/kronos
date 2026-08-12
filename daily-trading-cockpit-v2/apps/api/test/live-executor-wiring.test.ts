@@ -6,6 +6,7 @@ import {
   computeClusterOpenSymbols,
   maxClusterPositionsAcrossLanes,
   isNewExecutorLaneAllowed,
+  isTestnetCrossSectionalHorizonLaneAllowed,
   rollingNetEntryHealth,
   type LiveExecutorGateEngine,
 } from "../src/lib/live-executor-wiring.js";
@@ -73,6 +74,22 @@ describe("isNewExecutorLaneAllowed", () => {
 
   it("null engine: blocked on testnet too (explicit inclusion defaults to false with no engine)", () => {
     expect(isNewExecutorLaneAllowed("MY_LANE", "testnet", null)).toBe(false);
+  });
+});
+
+describe("testnet cross-sectional horizon rollout lock", () => {
+  const locked = { TESTNET_ONLY_CROSS_SECTIONAL_HORIZON: "1" } as NodeJS.ProcessEnv;
+
+  it("allows only the market-neutral cross-sectional horizon lane on testnet", () => {
+    expect(isTestnetCrossSectionalHorizonLaneAllowed("testnet", "CROSS_SECTIONAL_MARKET_NEUTRAL", locked)).toBe(true);
+    expect(isTestnetCrossSectionalHorizonLaneAllowed("testnet", "CROSS_SECTIONAL_TREND", locked)).toBe(false);
+    expect(isTestnetCrossSectionalHorizonLaneAllowed("testnet", "REGIME_COMPOSITE_CONFIRMATION_LONG", locked)).toBe(false);
+    expect(isTestnetCrossSectionalHorizonLaneAllowed("testnet", null, locked)).toBe(false);
+  });
+
+  it("does not change mainnet or an unlocked testnet", () => {
+    expect(isTestnetCrossSectionalHorizonLaneAllowed("mainnet", "REGIME_COMPOSITE_CONFIRMATION_LONG", locked)).toBe(true);
+    expect(isTestnetCrossSectionalHorizonLaneAllowed("testnet", "REGIME_COMPOSITE_CONFIRMATION_LONG", {})).toBe(true);
   });
 });
 

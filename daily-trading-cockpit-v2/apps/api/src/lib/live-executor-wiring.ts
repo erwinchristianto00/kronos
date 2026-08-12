@@ -15,6 +15,18 @@ export interface LiveExecutorGateEngine {
   laneSelectionAllowsLane(laneId: string): boolean;
 }
 
+export const TESTNET_CROSS_SECTIONAL_HORIZON_ONLY_ENV = "TESTNET_ONLY_CROSS_SECTIONAL_HORIZON";
+export const CROSS_SECTIONAL_HORIZON_LANE_ID = "CROSS_SECTIONAL_MARKET_NEUTRAL";
+
+/** Testnet rollout switch: only the FILTERED cross-sectional horizon executor may open new risk. */
+export function isTestnetCrossSectionalHorizonLaneAllowed(
+  env: "testnet" | "mainnet" | null,
+  laneId: string | null | undefined,
+  envVars: NodeJS.ProcessEnv = process.env,
+): boolean {
+  return env !== "testnet" || envVars[TESTNET_CROSS_SECTIONAL_HORIZON_ONLY_ENV] !== "1" || laneId === CROSS_SECTIONAL_HORIZON_LANE_ID;
+}
+
 /**
  * Master permission gate for a newly-wired executor instance (cross-sectional TREND/MIXED, or a
  * SingleSymbolLaneExecutor). Requires, in order: armed (bypassed on testnet), EXPLICIT allocation
@@ -50,6 +62,9 @@ export function newExecutorLaneGate(
 ): { allowed: boolean; reason: string | null } {
   if (!engine?.isArmed()) return { allowed: false, reason: "engine is not ARMED" };
   if (!engine.canOpenNewEntries()) return { allowed: false, reason: "new-entry drain is active (operator paused new entries)" };
+  if (!isTestnetCrossSectionalHorizonLaneAllowed(env, laneId)) {
+    return { allowed: false, reason: "testnet is locked to the cross-sectional horizon lane" };
+  }
   if (
     env === "mainnet" &&
     opts.mainnetEntryEligible === false &&

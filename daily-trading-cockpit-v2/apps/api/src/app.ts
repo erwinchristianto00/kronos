@@ -138,7 +138,7 @@ import {
   buildCompositeEstimatorReport,
   type CEBucket,
 } from "./lib/composite-estimator-edge.js";
-import { computeExternalManagedNetQty, computeNotionalPerSymbol, maxNotionalPerSymbolAcrossLanes, computeClusterOpenSymbols, maxClusterPositionsAcrossLanes, isNewExecutorLaneAllowed, newExecutorLaneGate, rollingNetEntryHealth, sumExternalRealizedPnlUsd } from "./lib/live-executor-wiring.js";
+import { computeExternalManagedNetQty, computeNotionalPerSymbol, maxNotionalPerSymbolAcrossLanes, computeClusterOpenSymbols, maxClusterPositionsAcrossLanes, isNewExecutorLaneAllowed, isTestnetCrossSectionalHorizonLaneAllowed, newExecutorLaneGate, rollingNetEntryHealth, sumExternalRealizedPnlUsd } from "./lib/live-executor-wiring.js";
 import { clusterOf } from "./lib/correlation-clusters.js";
 import { RegimeAutopilot, isRegimeAutopilotEnabled } from "./lib/regime-autopilot.js";
 import { getRegimeEngineStore } from "./lib/regime-engine-service.js";
@@ -1319,9 +1319,10 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       laneId: string,
       direction: "LONG" | "SHORT",
       fallback: () => boolean,
-    ): boolean => unifiedOrchestrator?.isEnabled()
-      ? unifiedOrchestrator.allowsLegacySingleSymbolEntry(laneId, direction)
-      : fallback();
+    ): boolean => isTestnetCrossSectionalHorizonLaneAllowed(liveConfig.env, laneId)
+      && (unifiedOrchestrator?.isEnabled()
+        ? unifiedOrchestrator.allowsLegacySingleSymbolEntry(laneId, direction)
+        : fallback());
 
     /**
      * The explanation half of legacyEntryAllowed: which rule is actually holding this lane's
@@ -1493,8 +1494,10 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         // canOpenNewEntriesIgnoringManualDirectional) — see
         // isCrossSectionalTrendMixedAdmissionIndependent's doc comment for why. Off by default;
         // the rest of this ternary is untouched, so disabling the flag is a byte-for-byte revert.
-        isAllowed: () => isCrossSectionalTrendMixedAdmissionIndependent()
-          ? (engineForGate?.canOpenNewEntriesIgnoringManualDirectional() ?? false)
+        isAllowed: () => !isTestnetCrossSectionalHorizonLaneAllowed(liveConfig.env, CROSS_SECTIONAL_TREND_LANE_ID)
+          ? false
+          : isCrossSectionalTrendMixedAdmissionIndependent()
+            ? (engineForGate?.canOpenNewEntriesIgnoringManualDirectional() ?? false)
           : unifiedOrchestrator?.isEnabled()
             ? unifiedOrchestrator.allowsCrossSectionalLane(CROSS_SECTIONAL_TREND_LANE_ID)
             : isNewExecutorLaneAllowed(CROSS_SECTIONAL_TREND_LANE_ID, liveConfig.env === "testnet" ? "testnet" : "mainnet", engineForGate, { mainnetEntryEligible: false }),
@@ -1524,8 +1527,10 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         laneId: CROSS_SECTIONAL_MIXED_LANE_ID,
         // Same 2026-07-08 fix as CROSS_SECTIONAL_TREND above, plus the same 2026-07-22
         // admission-independence bypass (see CROSS_SECTIONAL_TREND's isAllowed above).
-        isAllowed: () => isCrossSectionalTrendMixedAdmissionIndependent()
-          ? (engineForGate?.canOpenNewEntriesIgnoringManualDirectional() ?? false)
+        isAllowed: () => !isTestnetCrossSectionalHorizonLaneAllowed(liveConfig.env, CROSS_SECTIONAL_MIXED_LANE_ID)
+          ? false
+          : isCrossSectionalTrendMixedAdmissionIndependent()
+            ? (engineForGate?.canOpenNewEntriesIgnoringManualDirectional() ?? false)
           : unifiedOrchestrator?.isEnabled()
             ? unifiedOrchestrator.allowsCrossSectionalLane(CROSS_SECTIONAL_MIXED_LANE_ID)
             : isNewExecutorLaneAllowed(CROSS_SECTIONAL_MIXED_LANE_ID, liveConfig.env === "testnet" ? "testnet" : "mainnet", engineForGate, { mainnetEntryEligible: false }),
@@ -1980,6 +1985,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     if (liveEngine && isInnovationTestnetExecutionEnabled(liveConfig.env)) {
       const engineForGate = liveEngine;
       const innovationAllowed = (): boolean =>
+        isTestnetCrossSectionalHorizonLaneAllowed(liveConfig.env, "INNOVATION") &&
         innovationTestnetAdmissionAllowed(engineForGate.canOpenNewEntriesIgnoringManualDirectional());
       const innovationWeight = (laneId: string): number => {
         const selected = engineForGate.laneSelectionWeightPctForLane(laneId);

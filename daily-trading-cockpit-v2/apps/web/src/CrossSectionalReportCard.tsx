@@ -244,11 +244,11 @@ export default function CrossSectionalReportCard({ apiPrefix = '/testnet/api' }:
 
   return <>
   <section className="testnet-panel testnet-wide-panel" id="cross-sectional-definitions">
-    <header><div><span>Cross-basket terms</span><strong>How to read this report</strong></div><span className="tone-measure">testnet only</span></header>
+    <header><div><span>Istilah cross-basket</span><strong>Cara membaca report ini</strong></div><span className="tone-measure">khusus testnet</span></header>
     <div style={{ padding: '10px 12px', display: 'grid', gap: 8, color: C.dim, fontSize: 12, lineHeight: 1.5 }}>
-      <div><strong style={{ color: C.text }}>RAW</strong> = baseline signal universe. It ranks the full eligible basket pool without the measured per-symbol FILTERED allow/block rules. It is the comparison baseline, not automatically the live execution choice.</div>
-      <div><strong style={{ color: C.text }}>FILTERED</strong> = the same cross-sectional momentum idea after liquidity, score-gap, operator allow/block, and measured symbol filters. The live market-neutral executor currently consumes this variant.</div>
-      <div><strong style={{ color: C.text }}>MOM36_FILTERED</strong> = FILTERED signal using momentum over the last 36 completed 1-hour bars. The <strong style={{ color: C.accent }}>36</strong> is the lookback, not the holding time; the current basket horizon is shown beside the report title and is configured separately.</div>
+      <div><strong style={{ color: C.text }}>RAW</strong> = universe sinyal dasar. Sistem merangking seluruh pool basket yang eligible tanpa aturan allow/block FILTERED per simbol yang sudah diukur. Ini adalah baseline pembanding, bukan otomatis pilihan eksekusi live.</div>
+      <div><strong style={{ color: C.text }}>FILTERED</strong> = ide momentum cross-sectional yang sama setelah melewati filter likuiditas, selisih skor, allow/block operator, dan filter performa per simbol. Executor market-neutral live saat ini memakai varian ini.</div>
+      <div><strong style={{ color: C.text }}>MOM36_FILTERED</strong> = sinyal FILTERED dengan momentum dari 36 candle 1 jam yang sudah selesai. Angka <strong style={{ color: C.accent }}>36</strong> adalah lookback, bukan durasi holding; horizon basket saat ini ditampilkan terpisah di sebelah judul report dan dikonfigurasi secara terpisah.</div>
     </div>
   </section>
   <section className="testnet-panel testnet-wide-panel" id="cross-sectional-report">
@@ -257,10 +257,10 @@ export default function CrossSectionalReportCard({ apiPrefix = '/testnet/api' }:
         <span>Cross-sectional horizon report</span>
         <strong>{report ? `${report.horizonBars}h horizon · ${report.signal}` : 'loading…'}</strong>
       </div>
-      <span className="tone-measure">testnet measurement</span>
+      <span className="tone-measure">pengukuran testnet</span>
     </header>
     <div style={{ padding: '8px 12px', color: C.dim, fontSize: 12 }}>
-      {error ? 'Report fetch failed — showing last available data.' : report ? `${report.lastCycleAt ? `last cycle ${ago(report.lastCycleAt)} ago` : 'no cycle yet'} · next resolution ${duration(report.nextResolveInMs)} · scope from ${data?.reportStartAt ? formatDate(data.reportStartAt) : 'all history'}` : 'Loading cross-sectional report…'}
+      {error ? 'Pengambilan report gagal — menampilkan data terakhir yang tersedia.' : report ? `${report.lastCycleAt ? `siklus terakhir ${ago(report.lastCycleAt)} lalu` : 'belum ada siklus'} · resolusi berikutnya ${duration(report.nextResolveInMs)} · cakupan mulai ${data?.reportStartAt ? formatDate(data.reportStartAt) : 'seluruh histori'}` : 'Memuat report cross-sectional…'}
     </div>
     <div style={{ display: 'flex', gap: 8, padding: '0 12px 8px' }}>
       <button type="button" onClick={() => setVariant('RAW')} style={{ opacity: variant === 'RAW' ? 1 : 0.65 }}>RAW</button>
