@@ -5,6 +5,8 @@
  * these routes report { enabled:false } without touching anything. Keys are never
  * echoed by any endpoint.
  */
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
 import type { FastifyInstance } from "fastify";
 
 import type { LiveExecutionEngine } from "../lib/live-execution-engine.js";
@@ -63,6 +65,94 @@ const OPERATOR_ALLOCATION_LANE_IDS = [
 ];
 
 type LiveAccountSnapshot = Awaited<ReturnType<LiveExecutionEngine["getAccountSnapshot"]>>;
+
+type CrossSectionalUnrealizedExtrema = {
+  grossHighUsd: number;
+  grossLowUsd: number;
+  afterEstimatedCloseCostHighUsd: number;
+  afterEstimatedCloseCostLowUsd: number;
+  firstRecordedAt: string;
+  lastRecordedAt: string;
+  closedAt?: string;
+};
+
+type CrossSectionalUnrealizedExtremaStore = {
+  version: 1;
+  baskets: Record<string, CrossSectionalUnrealizedExtrema>;
+};
+
+/**
+ * Persist per-basket unrealized extrema separately from the executor's trade ledger.  The ledger
+ * records fills and realized P&L; this sampler records the mark-to-market path shown in the report.
+ * Keeping it in its own small file lets older open/closed executor records gain this audit trail
+ * without rewriting their original order history.
+ */
+function crossSectionalUnrealizedExtremaFile(): string {
+  return resolve(process.cwd(), process.env.CROSS_SECTIONAL_UNREALIZED_EXTREMA_FILE ?? "data/cross-sectional-unrealized-extrema.json");
+}
+
+function readCrossSectionalUnrealizedExtremaStore(): CrossSectionalUnrealizedExtremaStore {
+  const file = crossSectionalUnrealizedExtremaFile();
+  try {
+    if (!existsSync(file)) return { version: 1, baskets: {} };
+    const parsed = JSON.parse(readFileSync(file, "utf8")) as Partial<CrossSectionalUnrealizedExtremaStore>;
+    return parsed.version === 1 && parsed.baskets && typeof parsed.baskets === "object"
+      ? { version: 1, baskets: parsed.baskets }
+      : { version: 1, baskets: {} };
+  } catch {
+    // Reporting must not become unavailable just because its optional historical sampler file is
+    // corrupt or unreadable. Start a new record rather than inventing values from bad input.
+    return { version: 1, baskets: {} };
+  }
+}
+
+function writeCrossSectionalUnrealizedExtremaStore(store: CrossSectionalUnrealizedExtremaStore): void {
+  const file = crossSectionalUnrealizedExtremaFile();
+  mkdirSync(dirname(file), { recursive: true });
+  const temp = `${file}.tmp`;
+  writeFileSync(temp, JSON.stringify(store, null, 2));
+  renameSync(temp, file);
+}
+
+function recordCrossSectionalUnrealizedExtrema(
+  samples: Array<{ basketId: string; grossUsd: number; afterEstimatedCloseCostUsd: number }>,
+  closed: Array<{ basketId: string; closedAt: string }>,
+  nowIso: string,
+): Record<string, CrossSectionalUnrealizedExtrema> {
+  const store = readCrossSectionalUnrealizedExtremaStore();
+  let changed = false;
+  for (const sample of samples) {
+    if (!Number.isFinite(sample.grossUsd) || !Number.isFinite(sample.afterEstimatedCloseCostUsd)) continue;
+    const previous = store.baskets[sample.basketId];
+    store.baskets[sample.basketId] = previous
+      ? {
+        ...previous,
+        grossHighUsd: Math.max(previous.grossHighUsd, sample.grossUsd),
+        grossLowUsd: Math.min(previous.grossLowUsd, sample.grossUsd),
+        afterEstimatedCloseCostHighUsd: Math.max(previous.afterEstimatedCloseCostHighUsd, sample.afterEstimatedCloseCostUsd),
+        afterEstimatedCloseCostLowUsd: Math.min(previous.afterEstimatedCloseCostLowUsd, sample.afterEstimatedCloseCostUsd),
+        lastRecordedAt: nowIso,
+      }
+      : {
+        grossHighUsd: sample.grossUsd,
+        grossLowUsd: sample.grossUsd,
+        afterEstimatedCloseCostHighUsd: sample.afterEstimatedCloseCostUsd,
+        afterEstimatedCloseCostLowUsd: sample.afterEstimatedCloseCostUsd,
+        firstRecordedAt: nowIso,
+        lastRecordedAt: nowIso,
+      };
+    changed = true;
+  }
+  for (const basket of closed) {
+    const previous = store.baskets[basket.basketId];
+    if (previous && previous.closedAt !== basket.closedAt) {
+      store.baskets[basket.basketId] = { ...previous, closedAt: basket.closedAt };
+      changed = true;
+    }
+  }
+  if (changed) writeCrossSectionalUnrealizedExtremaStore(store);
+  return store.baskets;
+}
 
 export function annotateCrossSectionalAccount(
   snapshot: LiveAccountSnapshot,
@@ -1269,6 +1359,64 @@ export async function registerLiveRoutes(
       { label: "MIXED_MEAN_REVERSION", executor: opts.crossSectionalMixedExecutor?.() ?? null },
       ...(opts.innovationBasketExecutors?.() ?? []).map((executor, i) => ({ label: `INNOVATION_${i + 1}`, executor })),
     ];
+    const filteredExecutor = opts.crossSectionalExecutor?.() ?? null;
+    const filteredOpenBaskets = filteredExecutor?.getStatus().openBaskets.filter((basket) => inReportEra(basket.openedAt)) ?? [];
+    const filteredClosedBaskets = filteredExecutor
+      ? closedBasketRealizedBreakdown(filteredExecutor.getClosedBaskets()).filter((basket) => inReportEra(basket.openedAt))
+      : [];
+    const estimatedCloseCostPct = Number.isFinite(Number(process.env.LIVE_ESTIMATED_CLOSE_COST_PCT))
+      ? Number(process.env.LIVE_ESTIMATED_CLOSE_COST_PCT)
+      : 0.0022;
+    let grossUnrealizedUsd: number | null = filteredOpenBaskets.length === 0 ? 0 : null;
+    let unrealizedMarkNotionalUsd = 0;
+    const openBasketUnrealized = new Map<string, { grossUsd: number; afterEstimatedCloseCostUsd: number }>();
+    if (filteredOpenBaskets.length > 0 && engine) {
+      const account = await engine.getAccountSnapshot();
+      const markBySymbol = new Map(account.positions.flatMap((position) =>
+        position.markPrice != null ? [[position.symbol, position.markPrice] as const] : [],
+      ));
+      let gross = 0;
+      let complete = true;
+      for (const basket of filteredOpenBaskets) {
+        let basketGross = 0;
+        let basketMarkNotional = 0;
+        let basketComplete = true;
+        for (const leg of basket.legs) {
+          if (leg.exitOrderId !== null) continue;
+          const mark = markBySymbol.get(leg.symbol);
+          if (mark == null || !Number.isFinite(mark)) {
+            complete = false;
+            basketComplete = false;
+            continue;
+          }
+          const direction = leg.side === "LONG" ? 1 : -1;
+          const legGross = (mark - leg.entryPrice) * leg.qty * direction;
+          gross += legGross;
+          basketGross += legGross;
+          const markNotional = mark * leg.qty;
+          unrealizedMarkNotionalUsd += markNotional;
+          basketMarkNotional += markNotional;
+        }
+        if (basketComplete) {
+          openBasketUnrealized.set(basket.basketId, {
+            grossUsd: basketGross,
+            afterEstimatedCloseCostUsd: basketGross - basketMarkNotional * Math.max(0, estimatedCloseCostPct),
+          });
+        }
+      }
+      grossUnrealizedUsd = complete ? gross : null;
+    }
+    const estimatedSlippageUsd = grossUnrealizedUsd == null ? null : unrealizedMarkNotionalUsd * Math.max(0, estimatedCloseCostPct);
+    const nowIso = new Date().toISOString();
+    const unrealizedExtremaByBasket = recordCrossSectionalUnrealizedExtrema(
+      [...openBasketUnrealized.entries()].map(([basketId, value]) => ({ basketId, ...value })),
+      filteredClosedBaskets.map((basket) => ({ basketId: basket.basketId, closedAt: basket.closedAt })),
+      nowIso,
+    );
+    const withUnrealizedExtrema = <T extends { basketId: string }>(basket: T) => ({
+      ...basket,
+      unrealizedExtrema: unrealizedExtremaByBasket[basket.basketId] ?? null,
+    });
     const lanes = instances
       .filter((row): row is { label: string; executor: CrossSectionalExecutor } => row.executor !== null)
       .map((row) => {
@@ -1295,47 +1443,14 @@ export async function registerLiveRoutes(
           )
             .map(([symbol, row]) => ({ symbol, ...row }))
             .sort((a, b) => a.netPnlUsd - b.netPnlUsd),
-          baskets: closed,
+          baskets: closed.map(withUnrealizedExtrema),
         };
       });
-    const filteredExecutor = opts.crossSectionalExecutor?.() ?? null;
-    const filteredOpenBaskets = filteredExecutor?.getStatus().openBaskets.filter((basket) => inReportEra(basket.openedAt)) ?? [];
-    const filteredClosedBaskets = filteredExecutor
-      ? closedBasketRealizedBreakdown(filteredExecutor.getClosedBaskets()).filter((basket) => inReportEra(basket.openedAt))
-      : [];
-    const estimatedCloseCostPct = Number.isFinite(Number(process.env.LIVE_ESTIMATED_CLOSE_COST_PCT))
-      ? Number(process.env.LIVE_ESTIMATED_CLOSE_COST_PCT)
-      : 0.0022;
-    let grossUnrealizedUsd: number | null = filteredOpenBaskets.length === 0 ? 0 : null;
-    let unrealizedMarkNotionalUsd = 0;
-    if (filteredOpenBaskets.length > 0 && engine) {
-      const account = await engine.getAccountSnapshot();
-      const markBySymbol = new Map(account.positions.flatMap((position) =>
-        position.markPrice != null ? [[position.symbol, position.markPrice] as const] : [],
-      ));
-      let gross = 0;
-      let complete = true;
-      for (const basket of filteredOpenBaskets) {
-        for (const leg of basket.legs) {
-          if (leg.exitOrderId !== null) continue;
-          const mark = markBySymbol.get(leg.symbol);
-          if (mark == null || !Number.isFinite(mark)) {
-            complete = false;
-            continue;
-          }
-          const direction = leg.side === "LONG" ? 1 : -1;
-          gross += (mark - leg.entryPrice) * leg.qty * direction;
-          unrealizedMarkNotionalUsd += mark * leg.qty;
-        }
-      }
-      grossUnrealizedUsd = complete ? gross : null;
-    }
-    const estimatedSlippageUsd = grossUnrealizedUsd == null ? null : unrealizedMarkNotionalUsd * Math.max(0, estimatedCloseCostPct);
     const realizedBeforeSlippageUsd = filteredClosedBaskets.reduce((sum, basket) => sum + (basket.grossPnlUsd ?? 0), 0);
     const netRealizedProfitUsd = filteredClosedBaskets.reduce((sum, basket) => sum + (basket.netPnlUsd ?? 0), 0);
     const totalClosed = lanes.reduce((sum, l) => sum + l.closedBaskets, 0);
     return {
-      generatedAt: new Date().toISOString(),
+      generatedAt: nowIso,
       reportStartAt,
       source: "executor stores (real exchange fills) — NOT the measurement store",
       feeCaveat: "per-leg fees are APPORTIONED from the basket total by notional touched, not measured per leg",
@@ -1354,6 +1469,19 @@ export async function registerLiveRoutes(
         estimatedCloseCostPct,
         slippageCaveat: "Slippage fill aktual tidak disimpan terpisah; unrealized after slippage memakai estimasi biaya close LIVE_ESTIMATED_CLOSE_COST_PCT.",
       },
+      openBaskets: filteredOpenBaskets.map((basket) => {
+        const current = openBasketUnrealized.get(basket.basketId) ?? null;
+        return {
+          basketId: basket.basketId,
+          signal: basket.signal,
+          variant: basket.variant,
+          openedAt: basket.openedAt,
+          legs: basket.legs.map((leg) => ({ symbol: leg.symbol, side: leg.side })),
+          grossUnrealizedUsd: current?.grossUsd ?? null,
+          unrealizedAfterEstimatedCloseCostUsd: current?.afterEstimatedCloseCostUsd ?? null,
+          unrealizedExtrema: unrealizedExtremaByBasket[basket.basketId] ?? null,
+        };
+      }),
       lanes,
     };
   });

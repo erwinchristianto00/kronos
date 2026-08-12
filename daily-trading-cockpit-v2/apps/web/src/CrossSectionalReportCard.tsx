@@ -98,9 +98,29 @@ type ClosedBasket = {
   feeSource: string | null;
   netPnlUsd: number | null;
   allPricesConfirmed: boolean;
+  unrealizedExtrema?: UnrealizedExtrema | null;
   legs: ClosedLeg[];
 };
 type ClosedLane = { lane: string; laneId: string; closedBaskets: number; baskets: ClosedBasket[] };
+type UnrealizedExtrema = {
+  grossHighUsd: number;
+  grossLowUsd: number;
+  afterEstimatedCloseCostHighUsd: number;
+  afterEstimatedCloseCostLowUsd: number;
+  firstRecordedAt: string;
+  lastRecordedAt: string;
+  closedAt?: string;
+};
+type OpenBasketUnrealized = {
+  basketId: string;
+  signal: string;
+  variant: string;
+  openedAt: string;
+  legs: Array<{ symbol: string; side: 'LONG' | 'SHORT' }>;
+  grossUnrealizedUsd: number | null;
+  unrealizedAfterEstimatedCloseCostUsd: number | null;
+  unrealizedExtrema: UnrealizedExtrema | null;
+};
 type CrossSectionalPnl = {
   openBasketCount: number;
   openLegCount: number;
@@ -120,6 +140,7 @@ type ClosedResponse = {
   totalClosed: number;
   reason: string | null;
   crossSectionalPnl?: CrossSectionalPnl;
+  openBaskets?: OpenBasketUnrealized[];
   lanes: ClosedLane[];
 };
 
@@ -194,6 +215,20 @@ function money(value: number | null | undefined) {
   return value == null || !Number.isFinite(value) ? '—' : `${value >= 0 ? '+' : ''}${value.toFixed(4)} USDT`;
 }
 
+function UnrealizedExtremaBlock({ extrema }: { extrema: UnrealizedExtrema | null | undefined }) {
+  if (!extrema) return <div style={{ padding: '7px 12px', color: C.dim, fontSize: 11 }}>ATH/ATL unrealized mulai direkam saat report ini aktif.</div>;
+  return <div style={{ padding: '8px 12px', display: 'grid', gap: 5, fontSize: 12, borderBottom: `1px solid ${C.border}` }}>
+    <strong style={{ color: C.text }}>ATH / ATL unrealized terekam</strong>
+    <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap' }}>
+      <span>Gross high: <strong style={{ color: tone(extrema.grossHighUsd) }}>{money(extrema.grossHighUsd)}</strong></span>
+      <span>Gross low: <strong style={{ color: tone(extrema.grossLowUsd) }}>{money(extrema.grossLowUsd)}</strong></span>
+      <span>Setelah biaya close high: <strong style={{ color: tone(extrema.afterEstimatedCloseCostHighUsd) }}>{money(extrema.afterEstimatedCloseCostHighUsd)}</strong></span>
+      <span>Setelah biaya close low: <strong style={{ color: tone(extrema.afterEstimatedCloseCostLowUsd) }}>{money(extrema.afterEstimatedCloseCostLowUsd)}</strong></span>
+    </div>
+    <small style={{ color: C.dim }}>Direkam sejak {formatDate(extrema.firstRecordedAt)} · sampel terakhir {formatDate(extrema.lastRecordedAt)}. Saat basket masih open, biaya close adalah estimasi; setelah close, angka ATH/ATL tetap disimpan sebagai histori mark-to-market.</small>
+  </div>;
+}
+
 function ClosedBasketBlock({ basket, lane }: { basket: ClosedBasket; lane: string }) {
   const longReturn = sideReturn(basket, 'LONG');
   const shortReturn = sideReturn(basket, 'SHORT');
@@ -213,6 +248,7 @@ function ClosedBasketBlock({ basket, lane }: { basket: ClosedBasket; lane: strin
       <span>Long return: <strong style={{ color: tone(longReturn) }}>{pct(longReturn)}</strong></span>
       <span>Short return: <strong style={{ color: tone(shortReturn) }}>{pct(shortReturn)}</strong></span>
     </div>
+    <UnrealizedExtremaBlock extrema={basket.unrealizedExtrema} />
     <div style={{ overflowX: 'auto' }}>
       <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
         <thead><tr style={{ color: C.dim, textAlign: 'left' }}>
@@ -233,6 +269,25 @@ function ClosedBasketBlock({ basket, lane }: { basket: ClosedBasket; lane: strin
       </table>
     </div>
     <div style={{ padding: '7px 12px', color: C.dim, fontSize: 11 }}>Close reason: {basket.closeReason ?? '—'}</div>
+  </div>;
+}
+
+function OpenBasketUnrealizedBlock({ basket }: { basket: OpenBasketUnrealized }) {
+  const long = basket.legs.filter((leg) => leg.side === 'LONG').map((leg) => leg.symbol);
+  const short = basket.legs.filter((leg) => leg.side === 'SHORT').map((leg) => leg.symbol);
+  return <div style={{ border: `1px solid ${C.border}`, borderRadius: 6, marginTop: 10, overflow: 'hidden' }}>
+    <div style={{ padding: '9px 12px', background: C.sub, display: 'flex', gap: 14, flexWrap: 'wrap', alignItems: 'baseline' }}>
+      <strong style={{ color: C.text }}>{basket.basketId}</strong>
+      <span style={{ color: C.dim }}>{basket.variant} · {basket.signal}</span>
+      <span style={{ color: C.dim }}>open {formatDate(basket.openedAt)}</span>
+    </div>
+    <div style={{ padding: '8px 12px', display: 'flex', gap: 16, flexWrap: 'wrap', fontSize: 12, borderBottom: `1px solid ${C.border}` }}>
+      <span style={{ color: C.good }}>Long: {long.join(', ')}</span>
+      <span style={{ color: C.bad }}>Short: {short.join(', ')}</span>
+      <span>Gross sekarang: <strong style={{ color: tone(basket.grossUnrealizedUsd) }}>{money(basket.grossUnrealizedUsd)}</strong></span>
+      <span>Setelah biaya close: <strong style={{ color: tone(basket.unrealizedAfterEstimatedCloseCostUsd) }}>{money(basket.unrealizedAfterEstimatedCloseCostUsd)}</strong></span>
+    </div>
+    <UnrealizedExtremaBlock extrema={basket.unrealizedExtrema} />
   </div>;
 }
 
@@ -262,6 +317,10 @@ function ClosedCrossBasketReport({ apiPrefix }: { apiPrefix: string }) {
       <Stat label="Net realized profit" value={money(data.crossSectionalPnl.netRealizedProfitUsd)} color={tone(data.crossSectionalPnl.netRealizedProfitUsd)} />
     </div>}
     {data?.crossSectionalPnl && <div style={{ padding: '7px 12px', color: C.dim, fontSize: 11 }}>{data.crossSectionalPnl.openBasketCount} basket aktif · {data.crossSectionalPnl.openLegCount} leg aktif · {data.crossSectionalPnl.slippageCaveat}</div>}
+    {(data?.openBaskets?.length ?? 0) > 0 && <div style={{ padding: '0 12px 12px' }}>
+      <div style={{ color: C.dim, fontSize: 12, marginTop: 10 }}>Open basket · unrealized P&amp;L path</div>
+      {data!.openBaskets!.map((basket) => <OpenBasketUnrealizedBlock key={basket.basketId} basket={basket} />)}
+    </div>}
     {error ? <div style={{ padding: 12, color: C.bad }}>Closed-basket report fetch failed.</div> : baskets.length ? <div style={{ padding: '0 12px 12px' }}>
       {baskets.map(({ lane, basket }) => <ClosedBasketBlock key={basket.basketId} lane={lane} basket={basket} />)}
     </div> : <div style={{ padding: 12, color: C.dim }}>{data?.reason ? 'Belum ada cross-sectional basket yang sudah open dan close di exchange.' : 'Loading closed basket history…'}</div>}
