@@ -3,6 +3,7 @@ import './neural-mindmap.css';
 // 2026-07-23 dashboard consolidation (23 sections -> 7 composites + 2 always-on zones): shared
 // table/accordion primitives also used by the Research dashboard's InnovationLanesCard.
 import { Disclosure, LaneMaturityTable, laneEdgeBadge, type LaneMaturityRow } from './LaneMaturityTable';
+import CrossSectionalReportCard from './CrossSectionalReportCard';
 
 const REFRESH_MS = 5_000;
 const TESTNET_API_PREFIX = '/testnet/api';
@@ -2186,6 +2187,8 @@ export default function TestnetExchangeDashboard() {
           </div>}
         </div>
       </section>
+
+      {!isLivePage && <CrossSectionalReportCard apiPrefix={TESTNET_API_PREFIX} />}
 
       <main className="testnet-grid">
         {/* ===== Composite 3: Open Positions (2026-07-23 dashboard consolidation) =====

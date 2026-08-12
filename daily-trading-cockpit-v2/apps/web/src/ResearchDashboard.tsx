@@ -10,23 +10,6 @@ import { Disclosure } from './LaneMaturityTable';
 // Served at /research. Surfaces LIVENESS (cycle ran when, funnel, countdowns) so "all 0" is obviously
 // "alive but waiting", not "broken". These lanes accrue slowly — empty/thin is normal until mature.
 
-type XSecReport = {
-  signal: string; variant?: 'RAW' | 'FILTERED'; horizonBars: number; k: number; open: number; closed: number; expired: number;
-  netAvgReturn: number; grossAvgReturn: number; winRate: number; totalNetReturn: number;
-  sharpeLike: number | null; longLegAvgReturn: number; shortLegAvgReturn: number;
-  targetGrossReturn?: number; edgeReady?: boolean;
-  lastCycleAt: string | null; nextResolveInMs: number | null; recentNetReturns: number[];
-};
-type XSecBasket = { openedAt: string; resolvedAt?: string | null; signal: string; scoreGap?: number | null; netReturnPct?: number | null; grossReturnPct?: number | null; long: string[]; short: string[] };
-type XSec = {
-  report: XSecReport;
-  filteredReport?: XSecReport;
-  filteredConfig?: { minScoreGap: number; targetGrossReturn: number; longAllowlist: string[]; shortAllowlist: string[]; shortBlocklist: string[] };
-  openBaskets: XSecBasket[];
-  filteredOpenBaskets?: XSecBasket[];
-  recentClosed: XSecBasket[];
-  filteredRecentClosed?: XSecBasket[];
-};
 type LanePerf = { n: number; netAvgR: number; winRate: number; profitFactor: number | null };
 type RGL = {
   totalObs: number; totalGateEligible?: number; totalGatedOut: number;
@@ -57,7 +40,6 @@ const C = {
   bg: '#0b1418', card: '#14222a', sub: '#0f1c23', border: '#20313a', text: '#dbe7ec', dim: '#7d97a3',
   good: '#46d39a', bad: '#ff6b6b', measure: '#6fb3d6', accent: '#f0b54b', track: '#1c2c34',
 };
-const pct = (x: number | null | undefined, d = 3) => (x == null ? '—' : `${(x * 100).toFixed(d)}%`);
 const pctRaw = (x: number | null | undefined, d = 2) => (x == null ? '—' : `${x.toFixed(d)}%`);
 const tone = (x: number | null | undefined) => (x == null ? C.measure : x > 0 ? C.good : x < 0 ? C.bad : C.dim);
 const ago = (ts: string) => {
@@ -110,32 +92,8 @@ function Card({ title, subtitle, right, children }: { title: string; subtitle?: 
     </section>
   );
 }
-function HBar({ label, value, max, color, valueText }: { label: string; value: number; max: number; color: string; valueText?: string }) {
-  const frac = max > 0 ? Math.abs(value) / max : 0;
-  return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: 10, fontSize: 13, padding: '3px 0' }}>
-      <span style={{ width: 150, color: C.text, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{label}</span>
-      <div style={{ flex: 1, height: 14, background: C.track, borderRadius: 3, overflow: 'hidden' }}>
-        <div style={{ width: `${Math.min(100, frac * 100)}%`, height: '100%', background: color }} />
-      </div>
-      <span style={{ width: 64, textAlign: 'right', color, fontWeight: 600 }}>{valueText ?? value}</span>
-    </div>
-  );
-}
-function Spark({ values }: { values: number[] }) {
-  if (!values.length) return <span style={{ color: C.dim, fontSize: 12 }}>no closed baskets yet</span>;
-  const max = Math.max(0.0001, ...values.map((v) => Math.abs(v)));
-  return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: 2, height: 40 }}>
-      {values.map((v, i) => (
-        <div key={i} title={pct(v)} style={{ width: 8, height: `${(Math.abs(v) / max) * 18 + 2}px`, background: v >= 0 ? C.good : C.bad, alignSelf: v >= 0 ? 'flex-end' : 'flex-start', borderRadius: 1 }} />
-      ))}
-    </div>
-  );
-}
 const rfmt = (x: number | null | undefined) => (x == null ? '—' : `${x >= 0 ? '+' : ''}${x.toFixed(3)}`);
-/** Shared style for the plain button+useState toggles (2026-07-23 declutter): Lane Performance's
- *  By Symbol/Direction vs By Regime Gate, and Cross-sectional's RAW vs FILTERED. */
+/** Shared style for the plain button+useState lane-table toggle. */
 const tabButtonStyle = (active: boolean): React.CSSProperties => ({
   background: active ? C.track : 'none',
   border: `1px solid ${C.border}`,
@@ -215,7 +173,6 @@ export default function ResearchDashboard() {
 }
 
 function ResearchDashboardInner() {
-  const [xsec, setXsec] = useState<XSec | null>(null);
   const [rgl, setRgl] = useState<RGL | null>(null);
   const [psle, setPsle] = useState<PSLE | null>(null);
   const [wcf, setWcf] = useState<WinnersCf | null>(null);
@@ -223,10 +180,8 @@ function ResearchDashboardInner() {
   const [radar, setRadar] = useState<NewCoinRadar | null>(null);
   const [updated, setUpdated] = useState<number | null>(null);
   const [err, setErr] = useState<string | null>(null);
-  // 2026-07-23 declutter: toggles for the merged composites (Lane Performance & Edge Readiness,
-  // Cross-sectional RAW/FILTERED) and the new-coin-radar truncation controls.
+  // 2026-07-23 declutter: toggles for Lane Performance & Edge Readiness and new-coin-radar controls.
   const [laneTableTab, setLaneTableTab] = useState<'symbol' | 'regime'>('symbol');
-  const [xsecVariant, setXsecVariant] = useState<'RAW' | 'FILTERED'>('RAW');
   const [radarShowAll, setRadarShowAll] = useState(false);
   const [radarExpandedDescs, setRadarExpandedDescs] = useState<Set<string>>(new Set());
   const toggleRadarDesc = (symbol: string) =>
@@ -250,19 +205,17 @@ function ResearchDashboardInner() {
         return (await res.json()) as T;
       } catch { return null; }
     };
-    const [a, c, d, m, r] = await Promise.all([
-      grab<XSec>('/api/shadow/cross-sectional-report'),
+    const [c, d, m, r] = await Promise.all([
       grab<RGL>('/api/shadow/regime-gated-lanes'),
       grab<PSLE>('/api/shadow/per-symbol-lane-edge'),
       grab<Moonshot>('/api/shadow/moonshot-report'),
       grab<NewCoinRadar>('/api/shadow/new-coin-radar'),
     ]);
-    if (a) setXsec(a);
     if (c) setRgl(c);
     if (d) setPsle(d);
     if (m) setMoon(m);
     if (r) setRadar(r);
-    const failed = [a === null && 'cross-sectional', c === null && 'regime-gated', d === null && 'per-symbol-edge', m === null && 'moonshot'].filter(Boolean);
+    const failed = [c === null && 'regime-gated', d === null && 'per-symbol-edge', m === null && 'moonshot'].filter(Boolean);
     setErr(failed.length ? `unreachable: ${failed.join(', ')}` : null);
     if (failed.length < 4) setUpdated(Date.now());
   }
@@ -277,11 +230,6 @@ function ResearchDashboardInner() {
   }
   useEffect(() => { void load(); const t = window.setInterval(() => void load(), 10_000); return () => window.clearInterval(t); }, []);
   useEffect(() => { void loadWcf(); const t = window.setInterval(() => void loadWcf(), 60_000); return () => window.clearInterval(t); }, []);
-
-  const r = xsec?.report;
-  const rf = xsec?.filteredReport;
-  const legMax = Math.max(0.0001, Math.abs(r?.longLegAvgReturn ?? 0), Math.abs(r?.shortLegAvgReturn ?? 0));
-  const filteredLegMax = Math.max(0.0001, Math.abs(rf?.longLegAvgReturn ?? 0), Math.abs(rf?.shortLegAvgReturn ?? 0));
 
   return (
     <div style={{ background: C.bg, minHeight: '100vh', color: C.text, fontFamily: 'ui-sans-serif, system-ui, sans-serif', padding: '20px 24px' }}>
@@ -416,131 +364,6 @@ function ResearchDashboardInner() {
           </Card>
         );
       })()}
-
-      {/* 4 — Cross-Sectional Market-Neutral (2026-07-23 declutter): merges the RAW and FILTERED
-          variants (previously 2 stacked full Cards) behind one RAW/FILTERED toggle. This strategy is
-          LIVE-EXECUTING — its positions show up on the Exchange Dashboard's Open Positions table
-          under Book/Type = Basket — so it's placed ahead of the pure-shadow Innovation Lanes below. */}
-      <Card
-        title="Cross-sectional market-neutral"
-        subtitle="Long-top / short-bottom beta-cancelled dispersion. Live-executing — positions from this strategy show up on the Exchange Dashboard's Open Positions table under Book/Type = Basket."
-      >
-        <div style={{ padding: '8px 16px', display: 'flex', gap: 8, borderBottom: `1px solid ${C.border}` }}>
-          <button onClick={() => setXsecVariant('RAW')} style={tabButtonStyle(xsecVariant === 'RAW')}>RAW</button>
-          <button onClick={() => setXsecVariant('FILTERED')} style={tabButtonStyle(xsecVariant === 'FILTERED')}>
-            FILTERED{rf?.edgeReady ? ' — edge ready' : ''}
-          </button>
-        </div>
-
-        {xsecVariant === 'RAW' && (
-          <>
-            <div style={{ padding: '8px 16px', fontSize: 11, color: C.dim, borderBottom: `1px solid ${C.border}` }}>
-              {r ? <>{r.signal} · long-top-{r.k} / short-bottom-{r.k} · {r.horizonBars}-bar horizon · beta-cancelled dispersion · {r.lastCycleAt ? `cycle ${ago(r.lastCycleAt)} ago` : 'no cycle yet'}{r.nextResolveInMs != null && <> · <span style={{ color: C.accent }}>first resolves in {dur(r.nextResolveInMs)}</span></>}</> : 'loading…'}
-            </div>
-            {r ? (
-              <>
-                <div style={{ display: 'flex', flexWrap: 'wrap', borderBottom: `1px solid ${C.border}` }}>
-                  <Stat label="Closed" value={`${r.closed}`} />
-                  <Stat label="Open" value={`${r.open}`} />
-                  <Stat label="Net avg return" value={pct(r.netAvgReturn)} color={tone(r.netAvgReturn)} />
-                  <Stat label="Win rate" value={r.closed ? `${Math.round(r.winRate * 100)}%` : '—'} />
-                  <Stat label="Sharpe-like" value={r.sharpeLike == null ? '—' : r.sharpeLike.toFixed(2)} color={tone(r.sharpeLike)} />
-                  <Stat label="Total net" value={pct(r.totalNetReturn, 2)} color={tone(r.totalNetReturn)} />
-                </div>
-                <div style={{ display: 'flex', gap: 24, padding: '14px 16px', flexWrap: 'wrap', borderBottom: `1px solid ${C.border}` }}>
-                  <div style={{ flex: '1 1 280px', minWidth: 240 }}>
-                    <div style={{ fontSize: 12, color: C.dim, marginBottom: 6 }}>Leg contribution (the dispersion = both legs winning)</div>
-                    <HBar label="Long leg avg" value={r.longLegAvgReturn} max={legMax} color={tone(r.longLegAvgReturn)} valueText={pct(r.longLegAvgReturn)} />
-                    <HBar label="Short leg avg" value={r.shortLegAvgReturn} max={legMax} color={tone(r.shortLegAvgReturn)} valueText={pct(r.shortLegAvgReturn)} />
-                  </div>
-                  <div style={{ flex: '1 1 240px', minWidth: 200 }}>
-                    <div style={{ fontSize: 12, color: C.dim, marginBottom: 6 }}>Closed-basket net returns</div>
-                    <Spark values={r.recentNetReturns} />
-                  </div>
-                </div>
-                <div style={{ padding: '12px 16px' }}>
-                  <div style={{ color: C.dim, fontSize: 12, marginBottom: 6 }}>
-                    {r.closed === 0 ? `${r.open} open baskets accruing — none matured yet (each resolves after the ${r.horizonBars}h horizon)` : 'Recent closed baskets'}
-                  </div>
-                  {(xsec?.recentClosed ?? []).slice(-6).reverse().map((b, i) => (
-                    <div key={i} style={{ display: 'flex', gap: 12, fontSize: 13, padding: '4px 0', borderTop: i ? `1px solid ${C.border}` : undefined }}>
-                      <span style={{ color: tone(b.netReturnPct), fontWeight: 600, width: 64 }}>{pctRaw(b.netReturnPct)}</span>
-                      <span style={{ color: C.good }}>L: {b.long.join(', ')}</span>
-                      <span style={{ color: C.bad }}>S: {b.short.join(', ')}</span>
-                      <span style={{ color: C.dim, marginLeft: 'auto' }}>{b.resolvedAt ? `${ago(b.resolvedAt)} ago` : ''}</span>
-                    </div>
-                  ))}
-                  {(xsec?.openBaskets ?? []).slice(-3).reverse().map((b, i) => (
-                    <div key={`o${i}`} style={{ display: 'flex', gap: 12, fontSize: 13, padding: '4px 0', borderTop: `1px solid ${C.border}`, opacity: 0.65 }}>
-                      <span style={{ color: C.measure, width: 64 }}>OPEN</span>
-                      <span style={{ color: C.good }}>L: {b.long.join(', ')}</span>
-                      <span style={{ color: C.bad }}>S: {b.short.join(', ')}</span>
-                      <span style={{ color: C.dim, marginLeft: 'auto' }}>{ago(b.openedAt)} ago</span>
-                    </div>
-                  ))}
-                </div>
-              </>
-            ) : <div style={{ padding: 16, color: C.dim }}>loading…</div>}
-          </>
-        )}
-
-        {xsecVariant === 'FILTERED' && (
-          <>
-            <div style={{ padding: '8px 16px', fontSize: 11, color: C.dim, borderBottom: `1px solid ${C.border}` }}>
-              {rf ? <>{rf.signal} · symbol-filtered · score gap &gt;= {pctRaw((xsec?.filteredConfig?.minScoreGap ?? 0) * 100, 2)} · target gross {pct(xsec?.filteredConfig?.targetGrossReturn ?? rf.targetGrossReturn ?? 0, 2)} · <span style={{ color: rf.edgeReady ? C.good : C.accent }}>{rf.edgeReady ? 'edge ready' : 'collecting filtered OOS'}</span></> : 'loading…'}
-            </div>
-            {rf ? (
-              <>
-                <div style={{ display: 'flex', flexWrap: 'wrap', borderBottom: `1px solid ${C.border}` }}>
-                  <Stat label="Closed" value={`${rf.closed}`} />
-                  <Stat label="Open" value={`${rf.open}`} />
-                  <Stat label="Net avg return" value={pct(rf.netAvgReturn)} color={tone(rf.netAvgReturn)} />
-                  <Stat label="Gross avg return" value={pct(rf.grossAvgReturn)} color={tone(rf.grossAvgReturn)} />
-                  <Stat label="Win rate" value={rf.closed ? `${Math.round(rf.winRate * 100)}%` : '—'} />
-                  <Stat label="Total net" value={pct(rf.totalNetReturn, 2)} color={tone(rf.totalNetReturn)} />
-                </div>
-                <div style={{ padding: '14px 16px', borderBottom: `1px solid ${C.border}` }}>
-                  <div style={{ fontSize: 12, color: C.dim, marginBottom: 6 }}>Filtered leg contribution</div>
-                  <HBar label="Long leg avg" value={rf.longLegAvgReturn} max={filteredLegMax} color={tone(rf.longLegAvgReturn)} valueText={pct(rf.longLegAvgReturn)} />
-                  <HBar label="Short leg avg" value={rf.shortLegAvgReturn} max={filteredLegMax} color={tone(rf.shortLegAvgReturn)} valueText={pct(rf.shortLegAvgReturn)} />
-                </div>
-                <div style={{ padding: '12px 16px' }}>
-                  <div style={{ color: C.dim, fontSize: 12, marginBottom: 6 }}>
-                    {rf.closed === 0 ? `${rf.open} filtered baskets accruing — first resolved sample needs the ${rf.horizonBars}h horizon` : 'Recent filtered baskets'}
-                  </div>
-                  {(xsec?.filteredRecentClosed ?? []).slice(-6).reverse().map((b, i) => (
-                    <div key={i} style={{ display: 'flex', gap: 12, fontSize: 13, padding: '4px 0', borderTop: i ? `1px solid ${C.border}` : undefined }}>
-                      <span style={{ color: tone(b.netReturnPct), fontWeight: 600, width: 64 }}>{pctRaw(b.netReturnPct)}</span>
-                      <span style={{ color: C.good }}>L: {b.long.join(', ')}</span>
-                      <span style={{ color: C.bad }}>S: {b.short.join(', ')}</span>
-                      <span style={{ color: C.dim, marginLeft: 'auto' }}>{b.resolvedAt ? `${ago(b.resolvedAt)} ago` : ''}</span>
-                    </div>
-                  ))}
-                  {(xsec?.filteredOpenBaskets ?? []).slice(-3).reverse().map((b, i) => (
-                    <div key={`fo${i}`} style={{ display: 'flex', gap: 12, fontSize: 13, padding: '4px 0', borderTop: `1px solid ${C.border}`, opacity: 0.7 }}>
-                      <span style={{ color: C.measure, width: 64 }}>OPEN</span>
-                      <span style={{ color: C.good }}>L: {b.long.join(', ')}</span>
-                      <span style={{ color: C.bad }}>S: {b.short.join(', ')}</span>
-                      <span style={{ color: C.dim, marginLeft: 'auto' }}>{ago(b.openedAt)} ago</span>
-                    </div>
-                  ))}
-                </div>
-              </>
-            ) : <div style={{ padding: 16, color: C.dim }}>loading…</div>}
-          </>
-        )}
-
-        {/* Filter rules (active) — ALWAYS VISIBLE regardless of RAW/FILTERED toggle: unique to the
-            filtered variant, must not disappear when RAW is selected. */}
-        {xsec && (
-          <div style={{ padding: '12px 16px', borderTop: `1px solid ${C.border}`, fontSize: 12, color: C.dim, lineHeight: 1.55 }}>
-            <div style={{ fontWeight: 700, color: C.text, marginBottom: 4 }}>Filter rules (active)</div>
-            <div><span style={{ color: C.good }}>Long allow:</span> {(xsec.filteredConfig?.longAllowlist ?? []).join(', ')}</div>
-            <div><span style={{ color: C.bad }}>Short allow:</span> {(xsec.filteredConfig?.shortAllowlist ?? []).join(', ')}</div>
-            <div><span style={{ color: C.accent }}>Short blocked:</span> {(xsec.filteredConfig?.shortBlocklist ?? []).join(', ')}</div>
-          </div>
-        )}
-      </Card>
 
       <Card
         title="Winners-only counterfactual"
