@@ -151,6 +151,21 @@ export const CROSS_SECTIONAL_FILTERED_MIN_SCORE_GAP = envNumNonNeg("CROSS_SECTIO
 // the basket is supposed to be. Caps how many of a side's selected legs may share a cluster
 // (BTC/ETH majors exempt, same convention as the directional concentration cap). 0 disables.
 export const CROSS_SECTIONAL_FILTERED_MAX_PER_CLUSTER = envNumNonNeg("CROSS_SECTIONAL_FILTERED_MAX_PER_CLUSTER", 2);
+// 2026-08-12: liquidity floor for the FILTERED basket's candidate pool, in USD of quote volume per
+// 1h bar (median over the trailing window). 0 = DISABLED, which is the default on purpose — this
+// module is shared by research/testnet/live via rsync, so a non-zero default here would silently
+// narrow live's trading universe (see the CROSS_SECTIONAL_MIXED_WIDE_LONG_POOL block above for the
+// same reasoning). Exists because widening the allowlists — the change this ships alongside — hands
+// the ranking the WHOLE universe, including names thin enough that a basket leg would move them.
+// A 187-day replay of this module's own functions over real 1h klines measured the widened pool at
+// +0.270%/day and the widened pool PLUS this floor at +0.287%/day with the worst drawdown improving
+// from -8.4% to -7.0%; the floor's real job is that drawdown number, not the mean.
+export const CROSS_SECTIONAL_LIQUIDITY_FLOOR_USD_PER_HOUR = envNumNonNeg("CROSS_SECTIONAL_LIQUIDITY_FLOOR_USD_PER_HOUR", 0);
+// 168 bars = 7d of 1h candles. NOT 720 (~30d): runCrossSectionalCycleGuarded's caller fetches
+// `CROSS_SECTIONAL_MOMENTUM_BARS + 5` candles per symbol, so a lookback longer than what is
+// actually fetched silently starves the median and every symbol fails the sample test — see the
+// minSamples note in liquidCrossSectionalSymbols for what that produced on testnet 2026-08-12.
+export const CROSS_SECTIONAL_LIQUIDITY_LOOKBACK_BARS = envNumPos("CROSS_SECTIONAL_LIQUIDITY_LOOKBACK_BARS", 168);
 export const CROSS_SECTIONAL_FILTERED_MIN_GROSS_BPS = envNumNonNeg("CROSS_SECTIONAL_FILTERED_MIN_GROSS_BPS", 25); // proof target
 export const CROSS_SECTIONAL_ADAPTIVE_MIN_GROSS_BPS = envNumNonNeg("CROSS_SECTIONAL_ADAPTIVE_MIN_GROSS_BPS", 35); // safer proof target
 export const CROSS_SECTIONAL_TREND_MIN_SCORE_GAP = envNumNonNeg("CROSS_SECTIONAL_TREND_MIN_SCORE_GAP", 0.035);
@@ -654,6 +669,79 @@ export function buildCrossSectionalBasket(
     shortLegReturn: null,
     resolvedAt: null,
   };
+}
+
+/**
+ * Symbols whose MEDIAN quote volume per bar clears `floorUsd`, over the trailing `bars` candles.
+ * Median, not mean: one listing-day or liquidation-cascade bar can carry a thin symbol's mean past
+ * any floor, and that is exactly the symbol this is meant to exclude.
+ *
+ * A symbol with fewer than `bars / 4` usable candles is EXCLUDED, not admitted — too new or too
+ * gappy to have a liquidity history is the same risk as being thin, and the fail-closed direction
+ * is the one that cannot surprise the executor.
+ */
+export function liquidCrossSectionalSymbols(
+  candlesBySymbol: Record<string, Candle[]>,
+  floorUsd: number,
+  bars = CROSS_SECTIONAL_LIQUIDITY_LOOKBACK_BARS,
+): Set<string> {
+  const out = new Set<string>();
+  if (!(floorUsd > 0)) {
+    for (const symbol of Object.keys(candlesBySymbol)) out.add(symbol.toUpperCase());
+    return out;
+  }
+  // 2026-08-12 (caught on testnet within one cycle of shipping this): this was `bars / 4`, i.e. 180
+  // samples against the 720-bar default. The cycle's caller only fetches MOMENTUM_BARS + 5 candles
+  // per symbol (41 at the time), so EVERY symbol failed the sample test, the liquid set came back
+  // EMPTY, and an empty allowlist means "allow everything" — the floor didn't just fail to bind, it
+  // deleted the allowlists too. ARKMUSDT ($0.05M/h, the thinnest name in the universe) was on the
+  // very first basket. Judge on whatever history is available, but never on less than a day of it.
+  const minSamples = Math.max(1, Math.min(24, bars));
+  for (const [symbol, candles] of Object.entries(candlesBySymbol)) {
+    if (!Array.isArray(candles) || candles.length === 0) continue;
+    const quote: number[] = [];
+    for (const c of candles.slice(-bars)) {
+      const q = c.close * c.volume;
+      if (Number.isFinite(q) && q > 0) quote.push(q);
+    }
+    if (quote.length < minSamples) continue;
+    quote.sort((a, b) => a - b);
+    if (quote[Math.floor(quote.length / 2)]! >= floorUsd) out.add(symbol.toUpperCase());
+  }
+  return out;
+}
+
+/**
+ * Narrow one side's allowlist to the liquid set.
+ *
+ * The empty-list case is the whole reason this is a named function: `allowed()` treats an EMPTY
+ * allowlist as "allow EVERY symbol", so a naive intersection of [] with the liquid set yields []
+ * — which reads as "allow everything" again and silently discards the floor. When the incoming
+ * allowlist is empty (the widened-pool configuration), the liquid set BECOMES the allowlist.
+ */
+export function narrowAllowlistToLiquid(allow: readonly string[], liquid: ReadonlySet<string> | null): Set<string> {
+  if (liquid === null) return new Set(allow);
+  if (allow.length === 0) return new Set(liquid);
+  return new Set(allow.filter((s) => liquid.has(s.toUpperCase())));
+}
+
+/**
+ * Whether the liquidity floor has narrowed a side to nothing, in which case NO basket may be built.
+ *
+ * Fail-closed, and the reason is the same empty-list trap narrowAllowlistToLiquid exists for, one
+ * level up: an empty allowlist reaching allowed() means "allow EVERY symbol", so building anyway
+ * would not merely ignore the floor — it would DELETE the operator's allowlists and hand the
+ * ranking the entire universe, thin names included. Strictly worse than not applying the floor at
+ * all, and completely silent. Returns false when the floor is disabled (liquid === null), so the
+ * un-floored path is untouched.
+ */
+export function crossSectionalLiquidityStarved(
+  longAllow: ReadonlySet<string>,
+  shortAllow: ReadonlySet<string>,
+  liquid: ReadonlySet<string> | null,
+): boolean {
+  if (liquid === null) return false;
+  return longAllow.size === 0 || shortAllow.size === 0;
 }
 
 // ── Auto-updating symbol filters (operator: "ikutin filtered symbol, auto update
@@ -1180,7 +1268,22 @@ export async function runCrossSectionalCycle(opts: {
       minEligiblePerSideLong: skew?.longK,
       minEligiblePerSideShort: skew?.shortK,
     });
-    const basket = buildFilteredCrossSectionalBasket(scored, {
+    // Liquidity floor (default OFF — see CROSS_SECTIONAL_LIQUIDITY_FLOOR_USD_PER_HOUR). Applied to
+    // the ALLOWLISTS rather than to `scored`, so it narrows only the FILTERED basket: RAW stays the
+    // unmodified OOS control, and TREND/MIXED keep reading their own env lists untouched.
+    const liquid = CROSS_SECTIONAL_LIQUIDITY_FLOOR_USD_PER_HOUR > 0
+      ? liquidCrossSectionalSymbols(candlesBySymbol, CROSS_SECTIONAL_LIQUIDITY_FLOOR_USD_PER_HOUR)
+      : null;
+    const longAllow = narrowAllowlistToLiquid(adaptive.longAllowlist, liquid);
+    const shortAllow = narrowAllowlistToLiquid(adaptive.shortAllowlist, liquid);
+    // FAIL CLOSED. An EMPTY allowlist reaches allowed() as "allow EVERY symbol", so a liquidity
+    // floor that admits nothing would not merely fail to bind — it would DELETE the operator's
+    // allowlists and hand the ranking the whole universe, thin names included. That is strictly
+    // worse than the un-floored configuration, and it is silent. When the floor is on, an empty
+    // side means "no eligible candidates this cycle": skip the basket, same fail-closed convention
+    // buildCrossSectionalBasket already uses when a side cannot fill k legs.
+    const liquidityStarved = crossSectionalLiquidityStarved(longAllow, shortAllow, liquid);
+    const basket = liquidityStarved ? null : buildFilteredCrossSectionalBasket(scored, {
       k: CROSS_SECTIONAL_K,
       longK: skew?.longK,
       shortK: skew?.shortK,
@@ -1188,8 +1291,8 @@ export async function runCrossSectionalCycle(opts: {
       openedAtMs: opts.now,
       horizonMs: CROSS_SECTIONAL_HORIZON_MS,
       regimeContext,
-      longAllowlist: new Set(adaptive.longAllowlist),
-      shortAllowlist: new Set(adaptive.shortAllowlist),
+      longAllowlist: longAllow,
+      shortAllowlist: shortAllow,
       shortBlocklist: new Set(adaptive.shortBlocklist),
     });
     if (basket) {

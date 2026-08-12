@@ -375,6 +375,8 @@ import {
   isCrossSectionalEdgeDisabled,
   CROSS_SECTIONAL_INTERVAL,
   CROSS_SECTIONAL_MOMENTUM_BARS,
+  CROSS_SECTIONAL_LIQUIDITY_FLOOR_USD_PER_HOUR,
+  CROSS_SECTIONAL_LIQUIDITY_LOOKBACK_BARS,
   CROSS_SECTIONAL_UNIVERSE,
   buildCrossSectionalRegimeContext,
   deriveAdaptiveSymbolFilters,
@@ -2850,8 +2852,20 @@ export async function registerShadowRoutes(
             // spot pair under that name — fetch the bare spot symbol instead. Returns are price
             // RATIOS, so the 1000x scaling cancels; the rest of the pipeline (scoring, allowlist
             // matching, executor order symbol) keeps using the real futures name throughout.
+            // Depth is MAX(momentum lookback, liquidity lookback): the liquidity floor takes a
+            // MEDIAN over its own window, and a window deeper than what is fetched here silently
+            // starves it (2026-08-12 testnet incident — see liquidCrossSectionalSymbols). Only
+            // deepened when the floor is actually enabled, so the un-floored default fetches
+            // exactly what it always did.
             fetchCandles: async (symbol: string) =>
-              _xsc.getCandles(spotSymbolForCandles(symbol), CROSS_SECTIONAL_INTERVAL, CROSS_SECTIONAL_MOMENTUM_BARS + 5),
+              _xsc.getCandles(
+                spotSymbolForCandles(symbol),
+                CROSS_SECTIONAL_INTERVAL,
+                Math.max(
+                  CROSS_SECTIONAL_MOMENTUM_BARS + 5,
+                  CROSS_SECTIONAL_LIQUIDITY_FLOOR_USD_PER_HOUR > 0 ? CROSS_SECTIONAL_LIQUIDITY_LOOKBACK_BARS : 0,
+                ),
+              ),
           }).catch(() => undefined);
         }
       }

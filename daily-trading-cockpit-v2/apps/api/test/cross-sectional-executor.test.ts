@@ -17,6 +17,7 @@ import {
   isCrossSectionalTrendMixedAdmissionIndependent,
   type CrossSectionalExecClient,
   type ExecutorBasket,
+  closedBasketRealizedBreakdown,
 } from "../src/lib/cross-sectional-executor.js";
 import { CortexRealAttributionStore } from "../src/lib/cortex-real-attribution.js";
 
@@ -1538,5 +1539,76 @@ describe("[2026-07-22 CORTEX capital-coverage diagnosis] isCrossSectionalTrendMi
 
   it("is independent of CROSS_SECTIONAL_ALLOCATION_INDEPENDENT — the two flags gate different lanes and must not leak into each other", () => {
     expect(isCrossSectionalTrendMixedAdmissionIndependent({ CROSS_SECTIONAL_ALLOCATION_INDEPENDENT: "1" } as NodeJS.ProcessEnv)).toBe(false);
+  });
+});
+
+describe("cross-sectional-executor — per-token realized breakdown (2026-08-12)", () => {
+  const leg = (over: Partial<any> = {}) => ({
+    symbol: "AUSDT", side: "LONG" as const, qty: 10, entryPrice: 100, entryOrderId: "e1",
+    entryPriceConfirmed: true, exitPrice: 110, exitOrderId: "x1", exitPriceConfirmed: true, ...over,
+  });
+  const basket = (over: Partial<any> = {}) => ({
+    basketId: "xb-1", sourceObservationId: "obs-1", signal: "MOM36_FILTERED", variant: "FILTERED",
+    openedAt: "2026-08-10T00:00:00.000Z", closesAtMs: 0, legs: [leg()], status: "CLOSED" as const,
+    closedAt: "2026-08-12T00:00:00.000Z", closeReason: "HORIZON", grossPnlUsd: 100,
+    feeEstimateUsd: 2, netPnlUsd: 98, ...over,
+  });
+
+  it("[REALIZED-SIDE] LONG and SHORT legs are signed by their own direction", () => {
+    const [b] = closedBasketRealizedBreakdown([
+      basket({ legs: [leg(), leg({ symbol: "BUSDT", side: "SHORT" })], feeEstimateUsd: 0 }),
+    ]);
+    const bySym = Object.fromEntries(b!.legs.map((l) => [l.symbol, l.grossPnlUsd]));
+    expect(bySym["AUSDT"]).toBeCloseTo(100, 9);   // long 100 -> 110 on qty 10
+    expect(bySym["BUSDT"]).toBeCloseTo(-100, 9);  // same move, shorted, so it LOSES
+  });
+
+  it("[REALIZED-TIMES] reports open time, close time and the hold in hours", () => {
+    const [b] = closedBasketRealizedBreakdown([basket()]);
+    expect(b!.openedAt).toBe("2026-08-10T00:00:00.000Z");
+    expect(b!.closedAt).toBe("2026-08-12T00:00:00.000Z");
+    expect(b!.holdHours).toBeCloseTo(48, 9);
+  });
+
+  it("[REALIZED-FEE-SPLIT] the basket fee is apportioned by notional touched and fully consumed", () => {
+    const [b] = closedBasketRealizedBreakdown([
+      basket({ legs: [leg(), leg({ symbol: "BUSDT", qty: 30 })], feeEstimateUsd: 8 }),
+    ]);
+    const fees = Object.fromEntries(b!.legs.map((l) => [l.symbol, l.feeAllocatedUsd]));
+    expect(fees["AUSDT"]! + fees["BUSDT"]!).toBeCloseTo(8, 9); // nothing lost or invented
+    expect(fees["BUSDT"]).toBeCloseTo(fees["AUSDT"]! * 3, 9);  // 3x the qty, 3x the fee
+    for (const l of b!.legs) expect(l.netPnlUsd).toBeCloseTo(l.grossPnlUsd - l.feeAllocatedUsd, 9);
+  });
+
+  it("[REALIZED-UNCONFIRMED] an unconfirmed fill price is flagged, not silently averaged in", () => {
+    const [b] = closedBasketRealizedBreakdown([
+      basket({ legs: [leg(), leg({ symbol: "BUSDT", exitPriceConfirmed: false })] }),
+    ]);
+    expect(b!.legs.find((l) => l.symbol === "BUSDT")!.priceConfirmed).toBe(false);
+    expect(b!.allPricesConfirmed).toBe(false); // one bad leg taints the basket-level flag
+  });
+
+  it("[REALIZED-EXCLUDES] OPEN and ABORTED baskets never appear — only real closed round-trips", () => {
+    const rows = closedBasketRealizedBreakdown([
+      basket({ basketId: "open", status: "OPEN", closedAt: null }),
+      basket({ basketId: "aborted", status: "ABORTED" }),
+      basket({ basketId: "closed" }),
+    ]);
+    expect(rows.map((r) => r.basketId)).toEqual(["closed"]);
+  });
+
+  it("[REALIZED-UNPRICED] a leg with no exit price is skipped rather than counted as zero P&L", () => {
+    const [b] = closedBasketRealizedBreakdown([
+      basket({ legs: [leg(), leg({ symbol: "BUSDT", exitPrice: null, exitPriceConfirmed: null })] }),
+    ]);
+    expect(b!.legs.map((l) => l.symbol)).toEqual(["AUSDT"]);
+  });
+
+  it("[REALIZED-ORDER] newest close first", () => {
+    const rows = closedBasketRealizedBreakdown([
+      basket({ basketId: "older", closedAt: "2026-08-11T00:00:00.000Z" }),
+      basket({ basketId: "newer", closedAt: "2026-08-12T00:00:00.000Z" }),
+    ]);
+    expect(rows.map((r) => r.basketId)).toEqual(["newer", "older"]);
   });
 });

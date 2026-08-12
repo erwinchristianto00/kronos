@@ -8,7 +8,7 @@
 import type { FastifyInstance } from "fastify";
 
 import type { LiveExecutionEngine } from "../lib/live-execution-engine.js";
-import { type CrossSectionalExecutor } from "../lib/cross-sectional-executor.js";
+import { closedBasketRealizedBreakdown, type CrossSectionalExecutor } from "../lib/cross-sectional-executor.js";
 import type { SingleSymbolLaneExecutor } from "../lib/single-symbol-lane-executor.js";
 import {
   EXECUTABLE_INNOVATION_LANE_IDS,
@@ -1244,6 +1244,66 @@ export async function registerLiveRoutes(
     // 2026-07-12 (profitability Stage 3): attach the report-only regime-skew counterfactual so the
     // operator can see whether CROSS_SECTIONAL_REGIME_SKEW's same-direction tilt is being rewarded.
     return { ...executor.getStatus(), regimeSkewCounterfactual: executor.getRegimeSkewCounterfactual() };
+  });
+
+  /**
+   * 2026-08-12 (operator request): every CLOSED cross-sectional basket with its realized P&L broken
+   * out PER TOKEN, plus when it opened and closed.
+   *
+   * REAL FILLS ONLY. This reads the executor stores, not the measurement store — so a basket appears
+   * here only once it has actually opened and closed on the exchange. An empty list is reported with
+   * an explicit reason rather than as an empty success, because "no rows" here has historically been
+   * misread as "the lane lost nothing" when it in fact meant "the lane never traded".
+   * See closedBasketRealizedBreakdown for the two provenance caveats (fees are APPORTIONED per leg,
+   * and an unconfirmed fill price makes that leg's figure unreliable) — both are in the payload.
+   */
+  app.get("/api/live/cross-sectional-closed-baskets", async () => {
+    const instances: Array<{ label: string; executor: CrossSectionalExecutor | null }> = [
+      { label: "FILTERED", executor: opts.crossSectionalExecutor?.() ?? null },
+      { label: "TREND_BETA_VOL", executor: opts.crossSectionalTrendExecutor?.() ?? null },
+      { label: "MIXED_MEAN_REVERSION", executor: opts.crossSectionalMixedExecutor?.() ?? null },
+      ...(opts.innovationBasketExecutors?.() ?? []).map((executor, i) => ({ label: `INNOVATION_${i + 1}`, executor })),
+    ];
+    const lanes = instances
+      .filter((row): row is { label: string; executor: CrossSectionalExecutor } => row.executor !== null)
+      .map((row) => {
+        const status = row.executor.getStatus();
+        const closed = closedBasketRealizedBreakdown(row.executor.getClosedBaskets());
+        return {
+          lane: row.label,
+          laneId: status.laneId,
+          closedBaskets: closed.length,
+          openBaskets: status.openBaskets?.length ?? 0,
+          totalNetPnlUsd: closed.reduce((sum, b) => sum + (b.netPnlUsd ?? 0), 0),
+          /** Realized net per token, summed across every closed basket of this lane. */
+          perToken: Object.entries(
+            closed
+              .flatMap((b) => b.legs)
+              .reduce<Record<string, { legs: number; grossPnlUsd: number; feeAllocatedUsd: number; netPnlUsd: number }>>((acc, leg) => {
+                const row = (acc[leg.symbol] ??= { legs: 0, grossPnlUsd: 0, feeAllocatedUsd: 0, netPnlUsd: 0 });
+                row.legs += 1;
+                row.grossPnlUsd += leg.grossPnlUsd;
+                row.feeAllocatedUsd += leg.feeAllocatedUsd;
+                row.netPnlUsd += leg.netPnlUsd;
+                return acc;
+              }, {}),
+          )
+            .map(([symbol, row]) => ({ symbol, ...row }))
+            .sort((a, b) => a.netPnlUsd - b.netPnlUsd),
+          baskets: closed,
+        };
+      });
+    const totalClosed = lanes.reduce((sum, l) => sum + l.closedBaskets, 0);
+    return {
+      generatedAt: new Date().toISOString(),
+      source: "executor stores (real exchange fills) — NOT the measurement store",
+      feeCaveat: "per-leg fees are APPORTIONED from the basket total by notional touched, not measured per leg",
+      totalClosed,
+      reason: totalClosed === 0
+        ? "no cross-sectional basket has opened AND closed on the exchange yet — an empty list here means the lane has not traded, not that it broke even"
+        : null,
+      lanes,
+    };
   });
 
   // 2026-07-08: sibling status endpoints for the two additional variant-targeted instances (same

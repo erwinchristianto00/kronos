@@ -30,6 +30,11 @@ import {
   getCrossSectionalAdaptiveConfig,
   regimeSkewedK,
   regimeSkewCounterfactual,
+  liquidCrossSectionalSymbols,
+  narrowAllowlistToLiquid,
+  CROSS_SECTIONAL_LIQUIDITY_FLOOR_USD_PER_HOUR,
+  CROSS_SECTIONAL_LIQUIDITY_LOOKBACK_BARS,
+  crossSectionalLiquidityStarved,
   type ScoredSymbol,
   type CrossSectionalObservation,
 } from "../src/lib/cross-sectional-edge.js";
@@ -1029,5 +1034,115 @@ describe("deriveAdaptiveSymbolFilters — demotes toxic symbols inside hard oper
     // The correctly-named contract should still be reachable where the old lists referenced it.
     expect(CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST.has("1000PEPEUSDT")).toBe(true);
     expect(CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST.has("1000PEPEUSDT")).toBe(true);
+  });
+});
+
+describe("cross-sectional-edge — liquidity floor (2026-08-12)", () => {
+  // quote volume per bar = close * volume, so these are $/bar directly
+  const bars = (perBar: number, n = 400): Candle[] =>
+    Array.from({ length: n }, () => ({ openTime: 0, open: 1, high: 1, low: 1, close: 1, volume: perBar }));
+
+  it("[LIQ-DEFAULT] ships DISABLED — a non-zero default would silently narrow live's universe", () => {
+    expect(CROSS_SECTIONAL_LIQUIDITY_FLOOR_USD_PER_HOUR).toBe(0);
+  });
+
+  it("[LIQ-OFF] floor of 0 admits every symbol, thin ones included", () => {
+    const out = liquidCrossSectionalSymbols({ FATUSDT: bars(5_000_000), THINUSDT: bars(1) }, 0);
+    expect(out.has("FATUSDT")).toBe(true);
+    expect(out.has("THINUSDT")).toBe(true);
+  });
+
+  it("[LIQ-FLOOR] keeps symbols at/above the floor and drops the ones below", () => {
+    const out = liquidCrossSectionalSymbols(
+      { FATUSDT: bars(5_000_000), EDGEUSDT: bars(1_000_000), THINUSDT: bars(50_000) },
+      1_000_000,
+    );
+    expect([...out].sort()).toEqual(["EDGEUSDT", "FATUSDT"]); // >= is inclusive
+  });
+
+  it("[LIQ-MEDIAN] uses the MEDIAN, so one fat bar cannot rescue a thin symbol", () => {
+    const spiky = bars(1_000, 400);
+    spiky[399] = { openTime: 0, open: 1, high: 1, low: 1, close: 1, volume: 10_000_000_000 };
+    const mean = spiky.reduce((s, c) => s + c.close * c.volume, 0) / spiky.length;
+    expect(mean).toBeGreaterThan(1_000_000); // the mean WOULD have passed
+    expect(liquidCrossSectionalSymbols({ SPIKYUSDT: spiky }, 1_000_000).has("SPIKYUSDT")).toBe(false);
+  });
+
+  it("[LIQ-THIN-HISTORY] under a day of bars is EXCLUDED, but a day is enough to judge on", () => {
+    const floor = 1_000;
+    expect(liquidCrossSectionalSymbols({ NEWUSDT: bars(9_000_000, 10) }, floor).has("NEWUSDT")).toBe(false);
+    expect(liquidCrossSectionalSymbols({ NEWUSDT: bars(9_000_000, 24) }, floor).has("NEWUSDT")).toBe(true);
+    expect(liquidCrossSectionalSymbols({ EMPTYUSDT: [] }, floor).has("EMPTYUSDT")).toBe(false);
+  });
+
+  it("[LIQ-FETCH-DEPTH] judges on whatever history the caller fetched — a deep window must not starve it", () => {
+    // THE 2026-08-12 TESTNET BUG. The sample minimum was bars/4 (180 of the 720-bar default) while
+    // runCrossSectionalCycleGuarded's caller fetches only MOMENTUM_BARS + 5 candles. Every symbol
+    // failed, the liquid set came back EMPTY, and an empty allowlist is "allow everything" — so the
+    // floor deleted the allowlists instead of narrowing them. ARKMUSDT ($0.05M/h) traded on the
+    // very first basket. 41 bars is what the caller actually supplies; it must be judged, not skipped.
+    const fetched = 41;
+    const fat = liquidCrossSectionalSymbols({ FATUSDT: bars(5_000_000, fetched) }, 1_000_000, 720);
+    expect(fat.has("FATUSDT")).toBe(true);
+    const thin = liquidCrossSectionalSymbols({ THINUSDT: bars(50_000, fetched) }, 1_000_000, 720);
+    expect(thin.has("THINUSDT")).toBe(false);
+  });
+
+  it("[LIQ-LOOKBACK-DEFAULT] the default window is not deeper than a cycle plausibly fetches", () => {
+    expect(CROSS_SECTIONAL_LIQUIDITY_LOOKBACK_BARS).toBeLessThanOrEqual(168);
+  });
+
+  it("[LIQ-NULL] a null liquid set is a byte-for-byte passthrough, including the empty list", () => {
+    expect([...narrowAllowlistToLiquid(["AUSDT", "BUSDT"], null)]).toEqual(["AUSDT", "BUSDT"]);
+    expect([...narrowAllowlistToLiquid([], null)]).toEqual([]); // stays "allow everything"
+  });
+
+  it("[LIQ-EMPTY-TRAP] an EMPTY allowlist means allow-everything, so the liquid set BECOMES the allowlist", () => {
+    const liquid = new Set(["AUSDT", "BUSDT"]);
+    // the bug this guards: intersecting [] with liquid yields [], which allowed() reads as
+    // "allow every symbol" — silently discarding the floor on exactly the widened-pool config
+    // this feature exists for.
+    expect([...narrowAllowlistToLiquid([], liquid)].sort()).toEqual(["AUSDT", "BUSDT"]);
+  });
+
+  it("[LIQ-INTERSECT] a non-empty allowlist is intersected, never widened", () => {
+    const liquid = new Set(["AUSDT", "CUSDT"]);
+    expect([...narrowAllowlistToLiquid(["AUSDT", "BUSDT"], liquid)]).toEqual(["AUSDT"]);
+    expect([...narrowAllowlistToLiquid(["ausdt"], liquid)]).toEqual(["ausdt"]); // case-insensitive match
+  });
+
+  it("[LIQ-STARVED] a floor that admits nothing blocks the basket instead of widening it", () => {
+    const empty = new Set<string>();
+    const some = new Set(["AUSDT"]);
+    // floor OFF -> never starved, the un-floored path must be untouched
+    expect(crossSectionalLiquidityStarved(empty, empty, null)).toBe(false);
+    // floor ON and a side narrowed to nothing -> starved, because building would read that empty
+    // list as "allow everything" and trade the WHOLE universe, thin names included
+    expect(crossSectionalLiquidityStarved(empty, some, new Set(["AUSDT"]))).toBe(true);
+    expect(crossSectionalLiquidityStarved(some, empty, new Set(["AUSDT"]))).toBe(true);
+    expect(crossSectionalLiquidityStarved(some, some, new Set(["AUSDT"]))).toBe(false);
+  });
+
+  it("[LIQ-BASKET] fail-without/pass-with: the floor keeps a thin top-ranked symbol OUT of the legs", () => {
+    // SEIUSDT is the strongest short candidate here and is on the FILTERED short allowlist.
+    const rows = scored([
+      ["ETHUSDT", 0.09, 100], ["SOLUSDT", 0.08, 100], ["BNBUSDT", 0.07, 100], ["ADAUSDT", 0.06, 100],
+      ["SEIUSDT", -0.09, 100], ["WLDUSDT", -0.08, 100], ["ARBUSDT", -0.07, 100], ["XRPUSDT", -0.06, 100],
+    ]);
+    const opts = {
+      k: 3, now: T0, openedAtMs: T0ms, horizonMs: CROSS_SECTIONAL_HORIZON_MS,
+      longAllowlist: new Set<string>(), shortBlocklist: new Set<string>(), maxPerCluster: 0,
+    };
+    const withoutFloor = buildFilteredCrossSectionalBasket(rows, {
+      ...opts, shortAllowlist: narrowAllowlistToLiquid([], null),
+    })!;
+    expect(withoutFloor.shortLeg.map((l) => l.symbol)).toContain("SEIUSDT");
+
+    const liquid = new Set(["ETHUSDT", "SOLUSDT", "BNBUSDT", "ADAUSDT", "WLDUSDT", "ARBUSDT", "XRPUSDT"]);
+    const withFloor = buildFilteredCrossSectionalBasket(rows, {
+      ...opts, longAllowlist: narrowAllowlistToLiquid([], liquid), shortAllowlist: narrowAllowlistToLiquid([], liquid),
+    })!;
+    expect(withFloor.shortLeg.map((l) => l.symbol)).not.toContain("SEIUSDT");
+    expect(withFloor.shortLeg).toHaveLength(3); // still forms a full basket from what remains
   });
 });

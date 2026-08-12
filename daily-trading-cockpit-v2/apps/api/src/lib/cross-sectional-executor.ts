@@ -179,6 +179,108 @@ export interface ExecutorLeg {
   exitPriceConfirmed: boolean | null;
 }
 
+/**
+ * Per-token realized P&L for CLOSED baskets, plus when each basket opened and closed.
+ *
+ * Built for the operator question "which TOKEN actually made or lost the money in this basket" —
+ * the store keeps P&L at the BASKET level only (grossPnlUsd/feeEstimateUsd/netPnlUsd), so per-leg
+ * numbers have to be derived from the recorded fills.
+ *
+ * TWO honesty constraints, both surfaced in the output rather than hidden in the arithmetic:
+ *
+ *  1. FEES ARE ALLOCATED, NOT MEASURED, PER LEG. closeBasket() sums commission across the whole
+ *     basket; nothing attributes a commission row to one leg. Each leg is charged the basket fee in
+ *     proportion to the notional it touched (entry + exit), which is exactly how a flat taker rate
+ *     would fall — but on an EXCHANGE-sourced fee it is an apportionment, so `feeAllocated` is
+ *     named for what it is and `feeSource` rides along at basket level.
+ *  2. AN UNCONFIRMED FILL PRICE MAKES THE LEG'S NUMBER FICTION. entryPrice falls back to the
+ *     pre-trade reference when the exchange never confirmed a fill (see resolveFillPrice), so a leg
+ *     with entryPriceConfirmed/exitPriceConfirmed false has a realized figure computed against a
+ *     price that may never have executed. Reported per leg AND aggregated per basket, so a caller
+ *     can drop those rows instead of averaging them in unknowingly.
+ *
+ * ABORTED baskets are excluded: they never held a complete hedge, so a per-token realized figure
+ * would describe a position the lane never actually ran. Legs with no exit price are skipped.
+ */
+export interface ClosedBasketLegRealized {
+  symbol: string;
+  side: "LONG" | "SHORT";
+  qty: number;
+  entryPrice: number;
+  exitPrice: number;
+  notionalTouchedUsd: number;
+  grossPnlUsd: number;
+  feeAllocatedUsd: number;
+  netPnlUsd: number;
+  priceConfirmed: boolean;
+}
+
+export interface ClosedBasketRealized {
+  basketId: string;
+  variant: string;
+  signal: string;
+  openedAt: string;
+  closedAt: string;
+  holdHours: number;
+  closeReason: string | null;
+  grossPnlUsd: number | null;
+  feeEstimateUsd: number | null;
+  feeSource: string | null;
+  netPnlUsd: number | null;
+  /** False when ANY leg's entry or exit price was never confirmed by the exchange. */
+  allPricesConfirmed: boolean;
+  legs: ClosedBasketLegRealized[];
+}
+
+export function closedBasketRealizedBreakdown(
+  baskets: readonly ExecutorBasket[],
+): ClosedBasketRealized[] {
+  const out: ClosedBasketRealized[] = [];
+  for (const b of baskets) {
+    if (b.status !== "CLOSED" || !b.closedAt) continue;
+    const priced = b.legs.filter((l) => l.exitPrice !== null && l.entryPrice > 0 && l.qty > 0);
+    const notionalOf = (l: ExecutorLeg) => l.qty * (l.entryPrice + (l.exitPrice ?? l.entryPrice));
+    const totalNotional = priced.reduce((sum, l) => sum + notionalOf(l), 0);
+    const basketFee = Number.isFinite(b.feeEstimateUsd ?? NaN) ? b.feeEstimateUsd! : 0;
+    const legs: ClosedBasketLegRealized[] = priced.map((l) => {
+      const exit = l.exitPrice!;
+      const gross = l.side === "LONG" ? (exit - l.entryPrice) * l.qty : (l.entryPrice - exit) * l.qty;
+      const share = totalNotional > 0 ? notionalOf(l) / totalNotional : (priced.length > 0 ? 1 / priced.length : 0);
+      const fee = basketFee * share;
+      return {
+        symbol: l.symbol,
+        side: l.side,
+        qty: l.qty,
+        entryPrice: l.entryPrice,
+        exitPrice: exit,
+        notionalTouchedUsd: notionalOf(l),
+        grossPnlUsd: gross,
+        feeAllocatedUsd: fee,
+        netPnlUsd: gross - fee,
+        priceConfirmed: l.entryPriceConfirmed === true && l.exitPriceConfirmed === true,
+      };
+    });
+    const openedMs = new Date(b.openedAt).getTime();
+    const closedMs = new Date(b.closedAt).getTime();
+    out.push({
+      basketId: b.basketId,
+      variant: b.variant,
+      signal: b.signal,
+      openedAt: b.openedAt,
+      closedAt: b.closedAt,
+      holdHours: Number.isFinite(openedMs) && Number.isFinite(closedMs) ? (closedMs - openedMs) / 3_600_000 : 0,
+      closeReason: b.closeReason,
+      grossPnlUsd: b.grossPnlUsd,
+      feeEstimateUsd: b.feeEstimateUsd,
+      feeSource: (b as { feeSource?: string }).feeSource ?? null,
+      netPnlUsd: b.netPnlUsd,
+      allPricesConfirmed: legs.length > 0 && legs.every((l) => l.priceConfirmed),
+      legs,
+    });
+  }
+  return out.sort((a, b) => new Date(b.closedAt).getTime() - new Date(a.closedAt).getTime());
+}
+
 export interface ExecutorBasket {
   basketId: string;
   sourceObservationId: string;
