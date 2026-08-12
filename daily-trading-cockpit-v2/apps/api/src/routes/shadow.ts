@@ -985,10 +985,18 @@ export async function registerShadowRoutes(
       filteredConfig: (() => {
         const configured = getCrossSectionalFilteredConfig();
         const execution = getCrossSectionalFilteredExecutionFilters(store);
+        const executionUniverse = new Set(CROSS_SECTIONAL_UNIVERSE);
+        // The testnet deployment can narrow CROSS_SECTIONAL_UNIVERSE for an exchange constraint
+        // (for example BTC's minimum notional). Reflect that same universe in the report so an
+        // allowlist entry is never presented as executable when the runner cannot select it.
+        const executable = (symbols: readonly string[]) => symbols.filter((symbol) => executionUniverse.has(symbol));
+        const configuredSymbols = new Set([...configured.longAllowlist, ...configured.shortAllowlist]);
         return {
           ...configured,
-          executionLongAllowlist: execution.longAllowlist,
-          executionShortAllowlist: execution.shortAllowlist,
+          executionUniverse: [...CROSS_SECTIONAL_UNIVERSE],
+          executionExcludedSymbols: [...configuredSymbols].filter((symbol) => !executionUniverse.has(symbol)),
+          executionLongAllowlist: executable(execution.longAllowlist),
+          executionShortAllowlist: executable(execution.shortAllowlist),
           executionShortBlocklist: execution.shortBlocklist,
           adaptiveDemotionActive: !execution.adaptiveDisabled,
         };

@@ -48,6 +48,8 @@ type FilteredConfig = {
   executionLongAllowlist: string[];
   executionShortAllowlist: string[];
   executionShortBlocklist: string[];
+  executionUniverse?: string[];
+  executionExcludedSymbols?: string[];
   adaptiveDemotionActive: boolean;
 };
 type AdaptiveSymbolFilters = {
@@ -195,12 +197,16 @@ function BasketRows({ baskets, open }: { baskets: XSecBasket[]; open?: boolean }
     <span style={{ color: open ? C.measure : tone(basket.netReturnPct), fontWeight: 600, width: 64 }}>{open ? 'OPEN' : pctRaw(basket.netReturnPct)}</span>
     <span style={{ color: C.good }}>L: {basket.long.join(', ')}</span>
     <span style={{ color: C.bad }}>S: {basket.short.join(', ')}</span>
-    <span style={{ color: C.dim, marginLeft: 'auto' }}>{open ? `${ago(basket.openedAt)} ago` : basket.resolvedAt ? `${ago(basket.resolvedAt)} ago` : 'unresolved'}</span>
+    <span style={{ color: C.dim, marginLeft: 'auto' }}>Dibuat: {formatDate(basket.openedAt)}{open ? '' : ` · Ditutup: ${formatDate(basket.resolvedAt)}`}</span>
   </div>)}</>;
 }
 
 function formatDate(ts: string | null | undefined) {
-  return ts ? new Date(ts).toLocaleString() : '—';
+  return ts ? new Intl.DateTimeFormat('id-ID', {
+    dateStyle: 'medium',
+    timeStyle: 'medium',
+    timeZone: 'Asia/Taipei',
+  }).format(new Date(ts)) : '—';
 }
 
 function sideReturn(basket: ClosedBasket, side: 'LONG' | 'SHORT') {
@@ -370,6 +376,7 @@ export default function CrossSectionalReportCard({ apiPrefix = '/testnet/api' }:
           <div><strong style={{ color: C.good }}>POOL SHORT OPERATOR ({executionShort.length})</strong><SymbolList symbols={executionShort} color={C.good} /></div>
           <div><strong style={{ color: C.bad }}>BLOCKED SHORT EKSPLISIT ({executionShortBlocked.length})</strong><SymbolList symbols={executionShortBlocked} color={C.bad} /></div>
           <div><strong style={{ color: C.measure }}>SHORT ELIGIBLE SEKARANG ({activeShort.length})</strong><SymbolList symbols={activeShort} color={C.measure} /></div>
+          {!!config.executionExcludedSymbols?.length && <div><strong style={{ color: C.accent }}>DIKELUARKAN SEMENTARA DARI EXECUTOR ({config.executionExcludedSymbols.length})</strong><SymbolList symbols={config.executionExcludedSymbols} color={C.accent} /></div>}
         </> : <div>Memuat konfigurasi FILTERED…</div>}
       </div>
       {historical && <div style={{ display: 'grid', gap: 8, padding: '8px 10px', border: `1px solid ${C.border}`, background: C.sub }}>
