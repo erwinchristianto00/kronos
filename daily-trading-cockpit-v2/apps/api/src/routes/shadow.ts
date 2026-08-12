@@ -963,15 +963,19 @@ export async function registerShadowRoutes(
       longWeights: o.longLeg.map((l) => ({ symbol: l.symbol, weight: l.weight ?? null })),
       shortWeights: o.shortLeg.map((l) => ({ symbol: l.symbol, weight: l.weight ?? null })),
     });
+    // The active horizon is MOM36. Keep the report era clean when the deployment changes the
+    // momentum lookback: older MOM24 observations may still be in the retained measurement store,
+    // but they must not inflate the current RAW/FILTERED horizon counts or basket lists.
+    const rawSignal = `MOM${CROSS_SECTIONAL_MOMENTUM_BARS}`;
     const filteredSignal = getCrossSectionalFilteredConfig().signal;
-    const raw = store.all.filter((o) => o.signal !== filteredSignal && o.signal !== CROSS_SECTIONAL_TREND_SIGNAL && o.signal !== CROSS_SECTIONAL_MIXED_SIGNAL);
-    const filtered = store.all.filter((o) => o.signal === getCrossSectionalFilteredConfig().signal);
+    const raw = store.all.filter((o) => o.signal === rawSignal);
+    const filtered = store.all.filter((o) => o.signal === filteredSignal);
     const trend = store.all.filter((o) => o.signal === CROSS_SECTIONAL_TREND_SIGNAL);
     const mixed = store.all.filter((o) => o.signal === CROSS_SECTIONAL_MIXED_SIGNAL);
     return {
       reportStartAt,
-      report: buildCrossSectionalReport(store, Date.now(), { sinceMs: reportSinceMs }),
-      filteredReport: buildCrossSectionalReport(store, Date.now(), { variant: "FILTERED", sinceMs: reportSinceMs }),
+      report: buildCrossSectionalReport(store, Date.now(), { signal: rawSignal, sinceMs: reportSinceMs }),
+      filteredReport: buildCrossSectionalReport(store, Date.now(), { signal: filteredSignal, sinceMs: reportSinceMs }),
       trendReport: buildCrossSectionalReport(store, Date.now(), { variant: "TREND_BETA_VOL", sinceMs: reportSinceMs }),
       mixedReport: buildCrossSectionalReport(store, Date.now(), { variant: "MIXED_MEAN_REVERSION", sinceMs: reportSinceMs }),
       // filteredConfig shows the EFFECTIVE (auto-updated) lists — what new FILTERED
