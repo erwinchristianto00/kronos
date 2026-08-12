@@ -12,10 +12,6 @@ const C = {
   accent: '#f0b54b',
 };
 
-const FILTERED_LONG_RULES = ['1000PEPEUSDT', 'ADAUSDT', 'BTCUSDT', 'DOGEUSDT', 'ETHUSDT', 'LINKUSDT', 'SOLUSDT', 'SUIUSDT', 'UNIUSDT', 'WLDUSDT', 'XRPUSDT'];
-const FILTERED_SHORT_RULES = ['ADAUSDT', 'BTCUSDT', 'DOGEUSDT', 'ETHUSDT', 'TAOUSDT', 'UNIUSDT'];
-const FILTERED_SHORT_BLOCKED_RULES = ['1000PEPEUSDT', 'AAVEUSDT', 'APTUSDT', 'ARBUSDT', 'ARKMUSDT', 'AVAXUSDT', 'BNBUSDT', 'FETUSDT', 'INJUSDT', 'LDOUSDT', 'LINKUSDT', 'NEARUSDT', 'RNDRUSDT', 'SEIUSDT', 'SOLUSDT', 'SUIUSDT', 'WIFUSDT', 'WLDUSDT', 'XRPUSDT'];
-
 type XSecReport = {
   signal: string;
   horizonBars: number;
@@ -43,11 +39,35 @@ type XSecBasket = {
   long: string[];
   short: string[];
 };
+type FilteredConfig = {
+  minScoreGap: number;
+  targetGrossReturn: number;
+  longAllowlist: string[];
+  shortAllowlist: string[];
+  shortBlocklist: string[];
+  executionLongAllowlist: string[];
+  executionShortAllowlist: string[];
+  executionShortBlocklist: string[];
+  adaptiveDemotionActive: boolean;
+};
+type AdaptiveSymbolFilters = {
+  longAllowlist: string[];
+  shortAllowlist: string[];
+  longBlocklist: string[];
+  shortBlocklist: string[];
+  executionUsesThis: boolean;
+  provenance: {
+    closedBaskets: number;
+    demotedLong: string[];
+    demotedShort: string[];
+  };
+};
 type XSecResponse = {
   reportStartAt?: string | null;
   report: XSecReport;
   filteredReport?: XSecReport;
-  filteredConfig?: { minScoreGap: number; targetGrossReturn: number; longAllowlist: string[]; shortAllowlist: string[]; shortBlocklist: string[] };
+  filteredConfig?: FilteredConfig;
+  adaptiveSymbolFilters?: AdaptiveSymbolFilters;
   openBaskets: XSecBasket[];
   filteredOpenBaskets?: XSecBasket[];
   recentClosed: XSecBasket[];
@@ -139,6 +159,12 @@ function LegBars({ report }: { report: XSecReport }) {
         <span style={{ width: 64, textAlign: 'right', color: tone(n), fontWeight: 600 }}>{pct(n)}</span>
       </div>;
     })}
+  </div>;
+}
+
+function SymbolList({ symbols, color = C.dim, empty = 'Tidak ada' }: { symbols: string[]; color?: string; empty?: string }) {
+  return <div style={{ display: 'grid', gap: 2, paddingLeft: 12, marginTop: 3 }}>
+    {symbols.length ? symbols.map((symbol) => <div key={symbol} style={{ color }}>{symbol}</div>) : <div style={{ color: C.dim }}>{empty}</div>}
   </div>;
 }
 
@@ -264,19 +290,35 @@ export default function CrossSectionalReportCard({ apiPrefix = '/testnet/api' }:
   const closed = variant === 'FILTERED' ? data?.filteredRecentClosed ?? [] : data?.recentClosed ?? [];
   const open = variant === 'FILTERED' ? data?.filteredOpenBaskets ?? [] : data?.openBaskets ?? [];
   const config = data?.filteredConfig;
+  const historical = data?.adaptiveSymbolFilters;
+  const executionLong = config?.executionLongAllowlist ?? config?.longAllowlist ?? [];
+  const executionShort = config?.executionShortAllowlist ?? config?.shortAllowlist ?? [];
+  const executionShortBlocked = config?.executionShortBlocklist ?? config?.shortBlocklist ?? [];
+  const activeShort = executionShort.filter((symbol) => !executionShortBlocked.includes(symbol));
+  const historicalBadLong = historical?.provenance.demotedLong.filter((symbol) => executionLong.includes(symbol)) ?? [];
+  const historicalBadShort = historical?.provenance.demotedShort.filter((symbol) => executionShort.includes(symbol)) ?? [];
 
   return <>
   <section className="testnet-panel testnet-wide-panel" id="cross-sectional-definitions">
     <header><div><span>Istilah cross-basket</span><strong>Cara membaca report ini</strong></div><span className="tone-measure">khusus testnet</span></header>
     <div style={{ padding: '10px 12px', display: 'grid', gap: 8, color: C.dim, fontSize: 12, lineHeight: 1.5 }}>
       <div><strong style={{ color: C.text }}>RAW</strong> = universe sinyal dasar. Sistem merangking seluruh pool basket yang eligible tanpa aturan allow/block FILTERED per simbol yang sudah diukur. Ini adalah baseline pembanding, bukan otomatis pilihan eksekusi live.</div>
-      <div><strong style={{ color: C.text }}>FILTERED</strong> = ide momentum cross-sectional yang sama setelah melewati filter likuiditas, selisih skor, allow/block operator, dan filter performa per simbol. Executor market-neutral live saat ini memakai varian ini.</div>
+      <div><strong style={{ color: C.text }}>FILTERED</strong> = ide momentum cross-sectional yang sama setelah melewati filter likuiditas, selisih skor, serta allow/block operator. Executor market-neutral testnet saat ini memakai varian ini.</div>
       <div style={{ display: 'grid', gap: 8, marginTop: 2, padding: '8px 10px', border: `1px solid ${C.border}`, background: C.sub }}>
-        <strong style={{ color: C.text }}>Aturan FILTERED saat ini</strong>
-        <div><strong style={{ color: C.good }}>LONG</strong>{FILTERED_LONG_RULES.map((symbol) => <div key={`long-${symbol}`} style={{ paddingLeft: 12 }}>{symbol}</div>)}</div>
-        <div><strong style={{ color: C.good }}>SHORT</strong>{FILTERED_SHORT_RULES.map((symbol) => <div key={`short-${symbol}`} style={{ paddingLeft: 12 }}>{symbol}</div>)}</div>
-        <div><strong style={{ color: C.bad }}>BLOCKED SHORT</strong>{FILTERED_SHORT_BLOCKED_RULES.map((symbol) => <div key={`blocked-short-${symbol}`} style={{ paddingLeft: 12 }}>{symbol}</div>)}</div>
+        <strong style={{ color: C.text }}>Pool FILTERED yang dipakai sekarang</strong>
+        {config ? <>
+          <div><strong style={{ color: C.good }}>POOL LONG OPERATOR ({executionLong.length})</strong><SymbolList symbols={executionLong} color={C.good} /></div>
+          <div><strong style={{ color: C.good }}>POOL SHORT OPERATOR ({executionShort.length})</strong><SymbolList symbols={executionShort} color={C.good} /></div>
+          <div><strong style={{ color: C.bad }}>BLOCKED SHORT EKSPLISIT ({executionShortBlocked.length})</strong><SymbolList symbols={executionShortBlocked} color={C.bad} /></div>
+          <div><strong style={{ color: C.measure }}>SHORT ELIGIBLE SEKARANG ({activeShort.length})</strong><SymbolList symbols={activeShort} color={C.measure} /></div>
+        </> : <div>Memuat konfigurasi FILTERED…</div>}
       </div>
+      {historical && <div style={{ display: 'grid', gap: 8, padding: '8px 10px', border: `1px solid ${C.border}`, background: C.sub }}>
+        <strong style={{ color: C.text }}>Simbol buruk menurut histori lama — audit saja</strong>
+        <div style={{ color: C.dim }}>Dinilai dari {historical.provenance.closedBaskets} closed basket yang tersimpan. {historical.executionUsesThis ? 'Saat ini ikut memengaruhi executor.' : 'Tidak dipakai untuk membatasi executor MOM36 saat ini.'}</div>
+        <div><strong style={{ color: C.bad }}>BURUK DI LONG, DARI POOL OPERATOR ({historicalBadLong.length})</strong><SymbolList symbols={historicalBadLong} color={C.bad} empty="Belum ada simbol pool ini yang dinilai buruk." /></div>
+        <div><strong style={{ color: C.bad }}>BURUK DI SHORT, DARI POOL OPERATOR ({historicalBadShort.length})</strong><SymbolList symbols={historicalBadShort} color={C.bad} empty="Belum ada simbol pool ini yang dinilai buruk." /></div>
+      </div>}
       <div><strong style={{ color: C.text }}>MOM36_FILTERED</strong> = sinyal FILTERED dengan momentum dari 36 candle 1 jam yang sudah selesai. Angka <strong style={{ color: C.accent }}>36</strong> adalah lookback, bukan durasi holding; horizon basket saat ini ditampilkan terpisah di sebelah judul report dan dikonfigurasi secara terpisah.</div>
     </div>
   </section>
@@ -310,7 +352,7 @@ export default function CrossSectionalReportCard({ apiPrefix = '/testnet/api' }:
         {!!open.length && <><div style={{ color: C.dim, fontSize: 12, margin: '10px 0 5px' }}>Open baskets</div><BasketRows baskets={open} open /></>}
       </div>
       {config && <div style={{ padding: '10px 12px', borderTop: `1px solid ${C.border}`, color: C.dim, fontSize: 11, lineHeight: 1.5 }}>
-        <strong style={{ color: C.text }}>Filtered rules:</strong> long {config.longAllowlist.join(', ')} · short {config.shortAllowlist.join(', ')} · blocked short {config.shortBlocklist.join(', ')}
+        Pool yang dipakai executor: long {executionLong.length} · short {executionShort.length} · short eligible {activeShort.length}. Auto-demotion historis {config.adaptiveDemotionActive ? 'aktif' : 'nonaktif'}.
       </div>}
     </> : <div style={{ padding: 16, color: C.dim }}>{error ? 'No report data available.' : 'Loading…'}</div>}
   </section>

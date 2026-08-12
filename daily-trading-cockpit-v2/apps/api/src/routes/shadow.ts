@@ -380,6 +380,7 @@ import {
   CROSS_SECTIONAL_UNIVERSE,
   buildCrossSectionalRegimeContext,
   deriveAdaptiveSymbolFilters,
+  getCrossSectionalFilteredExecutionFilters,
   CROSS_SECTIONAL_TREND_SIGNAL,
   CROSS_SECTIONAL_MIXED_SIGNAL,
 } from "../lib/cross-sectional-edge.js";
@@ -978,21 +979,30 @@ export async function registerShadowRoutes(
       filteredReport: buildCrossSectionalReport(store, Date.now(), { signal: filteredSignal, sinceMs: reportSinceMs }),
       trendReport: buildCrossSectionalReport(store, Date.now(), { variant: "TREND_BETA_VOL", sinceMs: reportSinceMs }),
       mixedReport: buildCrossSectionalReport(store, Date.now(), { variant: "MIXED_MEAN_REVERSION", sinceMs: reportSinceMs }),
-      // filteredConfig shows the EFFECTIVE (auto-updated) lists — what new FILTERED
-      // baskets actually use — so /research always displays the live white/blacklists.
+      // Keep operator configuration distinct from the historical adaptive assessment.  The latter
+      // can contain closes from a previous momentum/lookback era and is therefore evidence, not
+      // necessarily the filter that this testnet executor is using today.
       filteredConfig: (() => {
-        const adaptive = deriveAdaptiveSymbolFilters(store);
+        const configured = getCrossSectionalFilteredConfig();
+        const execution = getCrossSectionalFilteredExecutionFilters(store);
         return {
-          ...getCrossSectionalFilteredConfig(),
-          longAllowlist: adaptive.longAllowlist,
-          shortAllowlist: adaptive.shortAllowlist,
-          shortBlocklist: adaptive.shortBlocklist,
+          ...configured,
+          executionLongAllowlist: execution.longAllowlist,
+          executionShortAllowlist: execution.shortAllowlist,
+          executionShortBlocklist: execution.shortBlocklist,
+          adaptiveDemotionActive: !execution.adaptiveDisabled,
         };
       })(),
       adaptiveConfig: getCrossSectionalAdaptiveConfig(),
-      // Auto-updating symbol filters ACTUALLY used to mint new FILTERED baskets
-      // (env lists = prior, measured per-leg returns promote/demote each cycle) + provenance.
-      adaptiveSymbolFilters: deriveAdaptiveSymbolFilters(store),
+      // Retained for audit only.  Do not label this the active FILTERED pool without checking
+      // filteredConfig.adaptiveDemotionActive above.
+      adaptiveSymbolFilters: (() => {
+        const adaptive = deriveAdaptiveSymbolFilters(store);
+        return {
+          ...adaptive,
+          executionUsesThis: !getCrossSectionalFilteredExecutionFilters(store).adaptiveDisabled,
+        };
+      })(),
       openBaskets: raw.filter((o) => inReportEra(o) && o.status === "OPEN").map(slim),
       filteredOpenBaskets: filtered.filter((o) => inReportEra(o) && o.status === "OPEN").map(slim),
       trendOpenBaskets: trend.filter((o) => inReportEra(o) && o.status === "OPEN").map(slim),
