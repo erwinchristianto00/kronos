@@ -12,6 +12,10 @@ const C = {
   accent: '#f0b54b',
 };
 
+const FILTERED_LONG_RULES = ['1000PEPEUSDT', 'ADAUSDT', 'BTCUSDT', 'DOGEUSDT', 'ETHUSDT', 'LINKUSDT', 'SOLUSDT', 'SUIUSDT', 'UNIUSDT', 'WLDUSDT', 'XRPUSDT'];
+const FILTERED_SHORT_RULES = ['ADAUSDT', 'BTCUSDT', 'DOGEUSDT', 'ETHUSDT', 'TAOUSDT', 'UNIUSDT'];
+const FILTERED_SHORT_BLOCKED_RULES = ['1000PEPEUSDT', 'AAVEUSDT', 'APTUSDT', 'ARBUSDT', 'ARKMUSDT', 'AVAXUSDT', 'BNBUSDT', 'FETUSDT', 'INJUSDT', 'LDOUSDT', 'LINKUSDT', 'NEARUSDT', 'RNDRUSDT', 'SEIUSDT', 'SOLUSDT', 'SUIUSDT', 'WIFUSDT', 'WLDUSDT', 'XRPUSDT'];
+
 type XSecReport = {
   signal: string;
   horizonBars: number;
@@ -248,6 +252,12 @@ export default function CrossSectionalReportCard({ apiPrefix = '/testnet/api' }:
     <div style={{ padding: '10px 12px', display: 'grid', gap: 8, color: C.dim, fontSize: 12, lineHeight: 1.5 }}>
       <div><strong style={{ color: C.text }}>RAW</strong> = universe sinyal dasar. Sistem merangking seluruh pool basket yang eligible tanpa aturan allow/block FILTERED per simbol yang sudah diukur. Ini adalah baseline pembanding, bukan otomatis pilihan eksekusi live.</div>
       <div><strong style={{ color: C.text }}>FILTERED</strong> = ide momentum cross-sectional yang sama setelah melewati filter likuiditas, selisih skor, allow/block operator, dan filter performa per simbol. Executor market-neutral live saat ini memakai varian ini.</div>
+      <div style={{ display: 'grid', gap: 8, marginTop: 2, padding: '8px 10px', border: `1px solid ${C.border}`, background: C.sub }}>
+        <strong style={{ color: C.text }}>Aturan FILTERED saat ini</strong>
+        <div><strong style={{ color: C.good }}>LONG</strong>{FILTERED_LONG_RULES.map((symbol) => <div key={`long-${symbol}`} style={{ paddingLeft: 12 }}>{symbol}</div>)}</div>
+        <div><strong style={{ color: C.good }}>SHORT</strong>{FILTERED_SHORT_RULES.map((symbol) => <div key={`short-${symbol}`} style={{ paddingLeft: 12 }}>{symbol}</div>)}</div>
+        <div><strong style={{ color: C.bad }}>BLOCKED SHORT</strong>{FILTERED_SHORT_BLOCKED_RULES.map((symbol) => <div key={`blocked-short-${symbol}`} style={{ paddingLeft: 12 }}>{symbol}</div>)}</div>
+      </div>
       <div><strong style={{ color: C.text }}>MOM36_FILTERED</strong> = sinyal FILTERED dengan momentum dari 36 candle 1 jam yang sudah selesai. Angka <strong style={{ color: C.accent }}>36</strong> adalah lookback, bukan durasi holding; horizon basket saat ini ditampilkan terpisah di sebelah judul report dan dikonfigurasi secara terpisah.</div>
     </div>
   </section>
