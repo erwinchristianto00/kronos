@@ -1,7 +1,8 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import type { Candle } from "@dtc/shared";
 import {
   deriveAdaptiveSymbolFilters,
+  getCrossSectionalFilteredExecutionFilters,
   crossSectionalMomentumScore,
   buildCrossSectionalBasket,
   buildFilteredCrossSectionalBasket,
@@ -18,6 +19,7 @@ import {
   buildCrossSectionalRegimeContext,
   CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST,
   CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST,
+  CROSS_SECTIONAL_FILTERED_SHORT_BLOCKLIST,
   CROSS_SECTIONAL_TREND_LONG_ALLOWLIST,
   CROSS_SECTIONAL_TREND_LONG_BLOCKLIST,
   CROSS_SECTIONAL_TREND_SHORT_ALLOWLIST,
@@ -888,6 +890,23 @@ describe("[CLUSTER-CAP] buildCrossSectionalBasket with maxPerCluster (2026-07-08
 const BAR_FUDGE = 60 * 60_000 + 1000; // one 1h bar + a little, to push past the horizon
 
 describe("deriveAdaptiveSymbolFilters — demotes toxic symbols inside hard operator lists", () => {
+
+  it("[STATIC-POOL] disables old-book auto-demotion when the operator flag is on", () => {
+    const store = freshStore();
+    for (let i = 0; i < 3; i++) {
+      store.add(closedObs(`static-${i}`, [], [["DOGEUSDT", 1, 1.02]]) as never);
+    }
+    vi.stubEnv("CROSS_SECTIONAL_ADAPTIVE_DISABLED", "1");
+    try {
+      const f = getCrossSectionalFilteredExecutionFilters(store);
+      expect(f.adaptiveDisabled).toBe(true);
+      expect(f.longAllowlist).toEqual([...CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST]);
+      expect(f.shortAllowlist).toEqual([...CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST]);
+      expect(f.shortBlocklist).toEqual([...CROSS_SECTIONAL_FILTERED_SHORT_BLOCKLIST]);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
 
   function closedObs(id: string, longLegs: Array<[string, number, number]>, shortLegs: Array<[string, number, number]>) {
     return {

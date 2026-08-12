@@ -888,6 +888,45 @@ export function deriveAdaptiveSymbolFilters(
   };
 }
 
+/**
+ * Effective FILTERED execution pools for the current cycle.
+ *
+ * The measured per-leg demotion logic is useful for a mature book, but it must not silently
+ * re-curate a newly widened pool using results from the old narrow configuration. When the
+ * operator sets CROSS_SECTIONAL_ADAPTIVE_DISABLED=1 (testnet-only during this rollout), the
+ * static operator allow/block lists remain the complete pool; the measurement/provenance store
+ * is still left intact for reporting and later comparison.
+ */
+export function getCrossSectionalFilteredExecutionFilters(
+  store: CrossSectionalStore,
+  opts: {
+    minEligiblePerSideLong?: number;
+    minEligiblePerSideShort?: number;
+  } = {},
+): {
+  longAllowlist: string[];
+  shortAllowlist: string[];
+  shortBlocklist: string[];
+  adaptiveDisabled: boolean;
+} {
+  const adaptiveDisabled = isCrossSectionalAdaptiveDisabled();
+  if (adaptiveDisabled) {
+    return {
+      longAllowlist: [...CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST],
+      shortAllowlist: [...CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST],
+      shortBlocklist: [...CROSS_SECTIONAL_FILTERED_SHORT_BLOCKLIST],
+      adaptiveDisabled: true,
+    };
+  }
+  const adaptive = deriveAdaptiveSymbolFilters(store, opts);
+  return {
+    longAllowlist: adaptive.longAllowlist,
+    shortAllowlist: adaptive.shortAllowlist,
+    shortBlocklist: adaptive.shortBlocklist,
+    adaptiveDisabled: false,
+  };
+}
+
 export function buildFilteredCrossSectionalBasket(
   scored: ScoredSymbol[],
   opts: Omit<CrossSectionalBasketOpts, "variant" | "signal" | "longAllowlist" | "shortAllowlist" | "shortBlocklist" | "minScoreGap"> &
@@ -1264,7 +1303,7 @@ export async function runCrossSectionalCycle(opts: {
     // buildFilteredCrossSectionalBasket actually requires, with the floor never noticing (3
     // eligible symbols isn't "under 3", but it IS under a skewed requirement of 4).
     const skew = isCrossSectionalRegimeSkewEnabled() ? regimeSkewedK(CROSS_SECTIONAL_K, opts.axisScore ?? null) : null;
-    const adaptive = deriveAdaptiveSymbolFilters(opts.store, {
+    const adaptive = getCrossSectionalFilteredExecutionFilters(opts.store, {
       minEligiblePerSideLong: skew?.longK,
       minEligiblePerSideShort: skew?.shortK,
     });

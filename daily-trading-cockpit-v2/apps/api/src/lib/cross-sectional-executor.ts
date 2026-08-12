@@ -25,6 +25,7 @@ import { fillFromUserTrade, type ExecutionFill, type ExecutionFillRecorder, type
 import {
   CROSS_SECTIONAL_ROUNDTRIP_BPS,
   deriveAdaptiveSymbolFilters,
+  isCrossSectionalAdaptiveDisabled,
   regimeSkewCounterfactual,
   type RegimeSkewCounterfactual,
   type CrossSectionalObservation,
@@ -100,6 +101,38 @@ export function crossSectionalMarketNeutralIsAllowed(deps: {
   return deps.unifiedOrchestratorEnabled
     ? deps.canOpenNewEntries() && deps.allowsCrossSectionalLane()
     : deps.canOpenNewEntries() && deps.laneSelectionAllowsLane();
+}
+
+/**
+ * Operator override that lets the cross-sectional executor open baskets while its rolling-evidence
+ * gate says NO. Default OFF. Scoped to THIS lane on purpose: rollingNetEntryHealth is shared, and a
+ * bypass inside it would silently unblock every lane that consumes it.
+ *
+ * The gate exists because a lane whose recent measured edge is negative should not be sending
+ * orders. Turning this on trades DELIBERATELY WITHOUT that evidence — which is a legitimate thing
+ * to do on testnet, where the point is to generate the evidence in the first place, and a very
+ * different thing to do on an account with real money.
+ *
+ * It is deliberately LOUD rather than silent: the gate's own verdict is preserved verbatim in the
+ * reason string and re-reported by getStatus() as entryHealthBypassed + entryHealthVerdict, so
+ * "this lane is trading" can never later be misread as "this lane proved itself". It can only ever
+ * turn a NO into a yes — a gate that already passes is returned untouched, so the flag cannot
+ * accidentally mask a genuine pass or invert into a block.
+ */
+export function isCrossSectionalEntryHealthBypassed(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.CROSS_SECTIONAL_EXEC_FORCE_IGNORE_ENTRY_HEALTH === "1";
+}
+
+export function applyEntryHealthBypass(
+  gate: { allowed: boolean; reason: string | null },
+  env: NodeJS.ProcessEnv = process.env,
+): { allowed: boolean; reason: string | null } {
+  if (gate.allowed) return gate;
+  if (!isCrossSectionalEntryHealthBypassed(env)) return gate;
+  return {
+    allowed: true,
+    reason: `ENTRY-HEALTH GATE BYPASSED BY OPERATOR — the evidence still says: ${gate.reason ?? "blocked"}`,
+  };
 }
 
 const LEG_USD = () => {
@@ -648,6 +681,11 @@ export class CrossSectionalExecutor {
   }
 
   private entryHealth(): { allowed: boolean; reason: string | null } {
+    return applyEntryHealthBypass(this.rawEntryHealth());
+  }
+
+  /** The gate's OWN verdict, before any operator bypass — what the evidence actually says. */
+  private rawEntryHealth(): { allowed: boolean; reason: string | null } {
     try {
       const decision = this.entryHealthGate();
       return decision && typeof decision.allowed === "boolean"
@@ -754,6 +792,13 @@ export class CrossSectionalExecutor {
     /** Realized basket P&L for the current UTC day + the safety-breaker limit (0 = disabled). */
     dailyRealizedUsd: number;
     dailyMaxLossUsd: number;
+    /** True while CROSS_SECTIONAL_EXEC_FORCE_IGNORE_ENTRY_HEALTH=1 is overriding a FAILING gate.
+     *  When true, this lane is trading WITHOUT evidence backing — never read `allowed: true`
+     *  alongside this as "the edge is proven". */
+    entryHealthBypassed: boolean;
+    /** The rolling-evidence gate's OWN verdict, before any bypass. Survives the override so the
+     *  real state is always readable. */
+    entryHealthVerdict: { allowed: boolean; reason: string | null };
     /** Non-null while the daily-loss breaker is holding NEW opens (open baskets unaffected). */
     openHalted: string | null;
     openBasket: ExecutorBasket | null;
@@ -777,6 +822,7 @@ export class CrossSectionalExecutor {
      *  see deriveAdaptiveSymbolFilters's floor). Recomputed live from the signal store, so this
      *  reflects the CURRENT cycle, not a stale snapshot. */
     adaptiveFilters: ReturnType<typeof deriveAdaptiveSymbolFilters>["provenance"];
+    adaptiveFiltersDisabled: boolean;
     /** 2026-07-19 real-money audit fix (BUG 1, HIGH — real-money risk): real, still-open exchange
      *  exposure this executor's normal HORIZON/PROFIT_BANK close paths can no longer reach — see
      *  OrphanedLeg's doc comment. retryOrphanedLegFlattens() retries every tick automatically, but
@@ -798,6 +844,8 @@ export class CrossSectionalExecutor {
     return {
       enabled: this.enabledFn(),
       allowed: this.isAllowed() && this.entryHealth().allowed,
+      entryHealthBypassed: !this.rawEntryHealth().allowed && isCrossSectionalEntryHealthBypassed(),
+      entryHealthVerdict: this.rawEntryHealth(),
       laneId: this.laneId,
       legUsd: this.effectiveLegUsd(),
       baseLegUsd: this.legUsdFn(),
@@ -818,6 +866,7 @@ export class CrossSectionalExecutor {
       signalMaxAgeMs,
       signalStale: signalAgeMs === null || signalAgeMs > signalMaxAgeMs,
       adaptiveFilters: deriveAdaptiveSymbolFilters(this.signalStore as CrossSectionalStore).provenance,
+      adaptiveFiltersDisabled: isCrossSectionalAdaptiveDisabled(),
       orphanedLegs: st.orphanedLegs ?? [],
     };
   }

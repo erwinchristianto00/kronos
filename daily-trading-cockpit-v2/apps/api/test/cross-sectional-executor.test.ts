@@ -18,6 +18,8 @@ import {
   type CrossSectionalExecClient,
   type ExecutorBasket,
   closedBasketRealizedBreakdown,
+  applyEntryHealthBypass,
+  isCrossSectionalEntryHealthBypassed,
 } from "../src/lib/cross-sectional-executor.js";
 import { CortexRealAttributionStore } from "../src/lib/cortex-real-attribution.js";
 
@@ -1610,5 +1612,43 @@ describe("cross-sectional-executor — per-token realized breakdown (2026-08-12)
       basket({ basketId: "newer", closedAt: "2026-08-12T00:00:00.000Z" }),
     ]);
     expect(rows.map((r) => r.basketId)).toEqual(["newer", "older"]);
+  });
+});
+
+describe("cross-sectional-executor — operator entry-health bypass (2026-08-12)", () => {
+  const OFF = {} as NodeJS.ProcessEnv;
+  const ON = { CROSS_SECTIONAL_EXEC_FORCE_IGNORE_ENTRY_HEALTH: "1" } as NodeJS.ProcessEnv;
+  const blocked = { allowed: false, reason: "rolling edge negative: last8=0.530%, last30=-0.615%" };
+  const passing = { allowed: true, reason: null };
+
+  it("[BYPASS-DEFAULT] ships OFF — an unset env must leave a failing gate failing", () => {
+    expect(isCrossSectionalEntryHealthBypassed(OFF)).toBe(false);
+    expect(applyEntryHealthBypass(blocked, OFF)).toEqual(blocked);
+  });
+
+  it("[BYPASS-ONLY-EXACT-1] any value other than \"1\" is NOT a bypass", () => {
+    for (const v of ["0", "", "true", "yes", "TRUE"]) {
+      expect(isCrossSectionalEntryHealthBypassed({ CROSS_SECTIONAL_EXEC_FORCE_IGNORE_ENTRY_HEALTH: v } as NodeJS.ProcessEnv)).toBe(false);
+    }
+  });
+
+  it("[BYPASS-ON] turns a blocked gate into allowed, and KEEPS the gate's verdict in the reason", () => {
+    const out = applyEntryHealthBypass(blocked, ON);
+    expect(out.allowed).toBe(true);
+    // the whole point: the override must never erase what the evidence said
+    expect(out.reason).toContain("BYPASSED BY OPERATOR");
+    expect(out.reason).toContain("last30=-0.615%");
+  });
+
+  it("[BYPASS-NEVER-INVERTS] a PASSING gate is returned untouched, bypass on or off", () => {
+    expect(applyEntryHealthBypass(passing, ON)).toEqual(passing);
+    expect(applyEntryHealthBypass(passing, OFF)).toEqual(passing);
+  });
+
+  it("[BYPASS-COVERS-THROW] a gate that failed by THROWING is also overridable, reason preserved", () => {
+    const crashed = { allowed: false, reason: "cross-sectional entry-health failed: boom" };
+    const out = applyEntryHealthBypass(crashed, ON);
+    expect(out.allowed).toBe(true);
+    expect(out.reason).toContain("boom");
   });
 });
