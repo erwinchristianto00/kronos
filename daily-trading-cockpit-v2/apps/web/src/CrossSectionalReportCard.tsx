@@ -48,6 +48,42 @@ type XSecResponse = {
   recentClosed: XSecBasket[];
   filteredRecentClosed?: XSecBasket[];
 };
+type ClosedLeg = {
+  symbol: string;
+  side: 'LONG' | 'SHORT';
+  qty: number;
+  entryPrice: number;
+  exitPrice: number;
+  notionalTouchedUsd: number;
+  grossPnlUsd: number;
+  feeAllocatedUsd: number;
+  netPnlUsd: number;
+  priceConfirmed: boolean;
+};
+type ClosedBasket = {
+  basketId: string;
+  variant: string;
+  signal: string;
+  openedAt: string;
+  closedAt: string;
+  holdHours: number;
+  closeReason: string | null;
+  grossPnlUsd: number | null;
+  feeEstimateUsd: number | null;
+  feeSource: string | null;
+  netPnlUsd: number | null;
+  allPricesConfirmed: boolean;
+  legs: ClosedLeg[];
+};
+type ClosedLane = { lane: string; laneId: string; closedBaskets: number; baskets: ClosedBasket[] };
+type ClosedResponse = {
+  generatedAt: string;
+  source: string;
+  feeCaveat?: string;
+  totalClosed: number;
+  reason: string | null;
+  lanes: ClosedLane[];
+};
 
 const pct = (x: number | null | undefined, d = 3) => x == null ? '—' : `${(x * 100).toFixed(d)}%`;
 const pctRaw = (x: number | null | undefined, d = 2) => x == null ? '—' : `${x.toFixed(d)}%`;
@@ -98,6 +134,89 @@ function BasketRows({ baskets, open }: { baskets: XSecBasket[]; open?: boolean }
   </div>)}</>;
 }
 
+function formatDate(ts: string | null | undefined) {
+  return ts ? new Date(ts).toLocaleString() : '—';
+}
+
+function sideReturn(basket: ClosedBasket, side: 'LONG' | 'SHORT') {
+  const legs = basket.legs.filter((leg) => leg.side === side && leg.entryPrice > 0);
+  if (!legs.length) return null;
+  return legs.reduce((sum, leg) => sum + (side === 'LONG'
+    ? (leg.exitPrice - leg.entryPrice) / leg.entryPrice
+    : (leg.entryPrice - leg.exitPrice) / leg.entryPrice), 0) / legs.length;
+}
+
+function money(value: number | null | undefined) {
+  return value == null || !Number.isFinite(value) ? '—' : `${value >= 0 ? '+' : ''}${value.toFixed(4)} USDT`;
+}
+
+function ClosedBasketBlock({ basket, lane }: { basket: ClosedBasket; lane: string }) {
+  const longReturn = sideReturn(basket, 'LONG');
+  const shortReturn = sideReturn(basket, 'SHORT');
+  return <div style={{ border: `1px solid ${C.border}`, borderRadius: 6, marginTop: 10, overflow: 'hidden' }}>
+    <div style={{ padding: '9px 12px', background: C.sub, display: 'flex', gap: 14, flexWrap: 'wrap', alignItems: 'baseline' }}>
+      <strong style={{ color: C.text }}>{basket.basketId}</strong>
+      <span style={{ color: C.dim }}>{lane} · {basket.variant} · {basket.signal}</span>
+      <span style={{ color: C.dim }}>hold {basket.holdHours.toFixed(2)}h</span>
+      <span style={{ color: basket.allPricesConfirmed ? C.good : C.accent }}>{basket.allPricesConfirmed ? 'fills confirmed' : 'unconfirmed fill price'}</span>
+    </div>
+    <div style={{ padding: '8px 12px', display: 'flex', gap: 16, flexWrap: 'wrap', fontSize: 12, borderBottom: `1px solid ${C.border}` }}>
+      <span>Open: <strong>{formatDate(basket.openedAt)}</strong></span>
+      <span>Close: <strong>{formatDate(basket.closedAt)}</strong></span>
+      <span>Gross: <strong style={{ color: tone(basket.grossPnlUsd) }}>{money(basket.grossPnlUsd)}</strong></span>
+      <span>Fee/cost: <strong style={{ color: C.accent }}>{money(basket.feeEstimateUsd)}</strong> <small style={{ color: C.dim }}>({basket.feeSource ?? 'unknown'})</small></span>
+      <span>Realized net: <strong style={{ color: tone(basket.netPnlUsd) }}>{money(basket.netPnlUsd)}</strong></span>
+      <span>Long return: <strong style={{ color: tone(longReturn) }}>{pct(longReturn)}</strong></span>
+      <span>Short return: <strong style={{ color: tone(shortReturn) }}>{pct(shortReturn)}</strong></span>
+    </div>
+    <div style={{ overflowX: 'auto' }}>
+      <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
+        <thead><tr style={{ color: C.dim, textAlign: 'left' }}>
+          <th style={{ padding: 7 }}>Symbol</th><th>Side</th><th>Qty</th><th>Entry</th><th>Close</th><th>Return</th><th>Gross</th><th>Fee allocated</th><th>Realized</th>
+        </tr></thead>
+        <tbody>{basket.legs.map((leg) => {
+          const ret = leg.entryPrice > 0 ? (leg.side === 'LONG' ? leg.exitPrice - leg.entryPrice : leg.entryPrice - leg.exitPrice) / leg.entryPrice : null;
+          return <tr key={`${basket.basketId}-${leg.symbol}`} style={{ borderTop: `1px solid ${C.border}` }}>
+            <td style={{ padding: 7, color: C.text, fontWeight: 600 }}>{leg.symbol}</td>
+            <td style={{ color: leg.side === 'LONG' ? C.good : C.bad }}>{leg.side}</td>
+            <td>{leg.qty}</td><td>{leg.entryPrice}</td><td>{leg.exitPrice}</td>
+            <td style={{ color: tone(ret) }}>{pct(ret)}</td>
+            <td style={{ color: tone(leg.grossPnlUsd) }}>{money(leg.grossPnlUsd)}</td>
+            <td style={{ color: C.accent }}>{money(leg.feeAllocatedUsd)}</td>
+            <td style={{ color: tone(leg.netPnlUsd) }}>{money(leg.netPnlUsd)} {!leg.priceConfirmed && <span title="Entry or close fill price was not exchange-confirmed">⚠</span>}</td>
+          </tr>;
+        })}</tbody>
+      </table>
+    </div>
+    <div style={{ padding: '7px 12px', color: C.dim, fontSize: 11 }}>Close reason: {basket.closeReason ?? '—'}</div>
+  </div>;
+}
+
+function ClosedCrossBasketReport({ apiPrefix }: { apiPrefix: string }) {
+  const [data, setData] = useState<ClosedResponse | null>(null);
+  const [error, setError] = useState(false);
+  async function load() {
+    try {
+      const response = await fetch(`${apiPrefix}/live/cross-sectional-closed-baskets`, { cache: 'no-store' });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      setData(await response.json() as ClosedResponse);
+      setError(false);
+    } catch { setError(true); }
+  }
+  useEffect(() => { void load(); const timer = window.setInterval(() => void load(), 15_000); return () => window.clearInterval(timer); }, [apiPrefix]);
+  const lanes = (data?.lanes ?? []).filter((lane) => lane.laneId.startsWith('CROSS_SECTIONAL_'));
+  const baskets = lanes.flatMap((lane) => lane.baskets.map((basket) => ({ lane: lane.lane, basket }))).sort((a, b) => new Date(b.basket.closedAt).getTime() - new Date(a.basket.closedAt).getTime());
+  return <section className="testnet-panel testnet-wide-panel" id="cross-sectional-closed-report">
+    <header><div><span>Closed cross-basket realized report</span><strong>{baskets.length} closed basket{baskets.length === 1 ? '' : 's'}</strong></div><span className="tone-measure">grouped per basket · real fills</span></header>
+    <div style={{ padding: '8px 12px', color: C.dim, fontSize: 11, lineHeight: 1.5 }}>
+      Gross profit, fee/cost, long/short return, realized net per symbol, and open/close timestamps. Fee/cost comes from the basket ledger; separate slippage is not currently stored independently. Per-symbol fee is allocated by notional touched.
+    </div>
+    {error ? <div style={{ padding: 12, color: C.bad }}>Closed-basket report fetch failed.</div> : baskets.length ? <div style={{ padding: '0 12px 12px' }}>
+      {baskets.map(({ lane, basket }) => <ClosedBasketBlock key={basket.basketId} lane={lane} basket={basket} />)}
+    </div> : <div style={{ padding: 12, color: C.dim }}>{data?.reason ? 'Belum ada cross-sectional basket yang sudah open dan close di exchange.' : 'Loading closed basket history…'}</div>}
+  </section>;
+}
+
 export default function CrossSectionalReportCard({ apiPrefix = '/testnet/api' }: { apiPrefix?: string }) {
   const [data, setData] = useState<XSecResponse | null>(null);
   const [variant, setVariant] = useState<'RAW' | 'FILTERED'>('FILTERED');
@@ -121,7 +240,16 @@ export default function CrossSectionalReportCard({ apiPrefix = '/testnet/api' }:
   const open = variant === 'FILTERED' ? data?.filteredOpenBaskets ?? [] : data?.openBaskets ?? [];
   const config = data?.filteredConfig;
 
-  return <section className="testnet-panel testnet-wide-panel" id="cross-sectional-report">
+  return <>
+  <section className="testnet-panel testnet-wide-panel" id="cross-sectional-definitions">
+    <header><div><span>Cross-basket terms</span><strong>How to read this report</strong></div><span className="tone-measure">testnet only</span></header>
+    <div style={{ padding: '10px 12px', display: 'grid', gap: 8, color: C.dim, fontSize: 12, lineHeight: 1.5 }}>
+      <div><strong style={{ color: C.text }}>RAW</strong> = baseline signal universe. It ranks the full eligible basket pool without the measured per-symbol FILTERED allow/block rules. It is the comparison baseline, not automatically the live execution choice.</div>
+      <div><strong style={{ color: C.text }}>FILTERED</strong> = the same cross-sectional momentum idea after liquidity, score-gap, operator allow/block, and measured symbol filters. The live market-neutral executor currently consumes this variant.</div>
+      <div><strong style={{ color: C.text }}>MOM36_FILTERED</strong> = FILTERED signal using momentum over the last 36 completed 1-hour bars. The <strong style={{ color: C.accent }}>36</strong> is the lookback, not the holding time; the current basket horizon is shown beside the report title and is configured separately.</div>
+    </div>
+  </section>
+  <section className="testnet-panel testnet-wide-panel" id="cross-sectional-report">
     <header>
       <div>
         <span>Cross-sectional horizon report</span>
@@ -154,5 +282,7 @@ export default function CrossSectionalReportCard({ apiPrefix = '/testnet/api' }:
         <strong style={{ color: C.text }}>Filtered rules:</strong> long {config.longAllowlist.join(', ')} · short {config.shortAllowlist.join(', ')} · blocked short {config.shortBlocklist.join(', ')}
       </div>}
     </> : <div style={{ padding: 16, color: C.dim }}>{error ? 'No report data available.' : 'Loading…'}</div>}
-  </section>;
+  </section>
+  <ClosedCrossBasketReport apiPrefix={apiPrefix} />
+  </>;
 }
