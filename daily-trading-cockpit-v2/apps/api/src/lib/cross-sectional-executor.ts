@@ -19,7 +19,7 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 
-import { resolveConfirmedFillPrice, type BinanceFuturesPrivateClient, type FillPriceResolution } from "./binance-futures-private.js";
+import { resolveConfirmedFillPrice, roundToStep, type BinanceFuturesPrivateClient, type FillPriceResolution, type FuturesSymbolFilters } from "./binance-futures-private.js";
 import type { CortexRealAttributionStore } from "./cortex-real-attribution.js";
 import { fillFromUserTrade, type ExecutionFill, type ExecutionFillRecorder, type ExecutionFillRole } from "./execution-fill-recorder.js";
 import {
@@ -139,6 +139,27 @@ const LEG_USD = () => {
   const n = Number.parseFloat(process.env.CROSS_SECTIONAL_EXEC_LEG_USD ?? "");
   return Number.isFinite(n) && n > 0 ? n : 25;
 };
+
+/**
+ * Size one entry so the exchange's structural floors cannot turn a planned 6-leg basket into a
+ * reduced hedge. The configured leg notional remains the target; only a symbol whose exchange
+ * minNotional/minQty is higher is lifted to the smallest valid step-rounded quantity. This is a
+ * sizing adjustment, not an admission bypass: the resulting notional is still checked by the
+ * shared per-symbol cap before any order is reserved or placed.
+ */
+export function sizeCrossSectionalLeg(
+  legUsd: number,
+  entryPrice: number,
+  filters: Pick<FuturesSymbolFilters, "stepSize" | "minQty" | "minNotional">,
+): number | null {
+  if (!(legUsd > 0) || !(entryPrice > 0) || !(filters.stepSize > 0)) return null;
+  const minNotional = Number.isFinite(filters.minNotional) && filters.minNotional > 0 ? filters.minNotional : 0;
+  const minQty = Number.isFinite(filters.minQty) && filters.minQty > 0 ? filters.minQty : 0;
+  const targetQty = Math.max(legUsd, minNotional) / entryPrice;
+  const qty = roundToStep(Math.max(targetQty, minQty), filters.stepSize, "up");
+  if (!(qty > 0) || qty < minQty || qty * entryPrice + 1e-9 < minNotional) return null;
+  return Number(qty.toFixed(8));
+}
 const EXEC_LEVERAGE = () => {
   const n = Number.parseInt(process.env.CROSS_SECTIONAL_EXEC_LEVERAGE ?? "", 10);
   return Number.isFinite(n) && n >= 1 ? Math.floor(n) : 3;
@@ -1404,9 +1425,8 @@ export class CrossSectionalExecutor {
       for (const leg of legs) {
         const f = filters.get(leg.symbol);
         if (!f || !(leg.entryPrice > 0)) return; // missing filters/price ⇒ skip whole basket
-        const rawQty = legUsd / leg.entryPrice;
-        const qty = Math.floor(rawQty / f.stepSize) * f.stepSize;
-        if (!(qty >= f.minQty)) return; // any un-sizeable leg ⇒ skip whole basket (hedge integrity)
+        const qty = sizeCrossSectionalLeg(legUsd, leg.entryPrice, f);
+        if (qty === null) return; // any un-sizeable leg ⇒ skip whole basket (hedge integrity)
         // 2026-07-19 real-money audit fix: this leg's notional, ADDED to whatever every OTHER
         // executor sharing this netted account (the 9 single-symbol lanes AND this instance's own
         // 2 cross-sectional siblings, PLUS this instance's own already-open legs on the symbol)

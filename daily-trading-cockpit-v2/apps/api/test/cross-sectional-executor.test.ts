@@ -20,11 +20,25 @@ import {
   closedBasketRealizedBreakdown,
   applyEntryHealthBypass,
   isCrossSectionalEntryHealthBypassed,
+  sizeCrossSectionalLeg,
 } from "../src/lib/cross-sectional-executor.js";
 import { CortexRealAttributionStore } from "../src/lib/cortex-real-attribution.js";
 
 const NOW = "2026-07-02T03:00:00.000Z";
 const NOW_MS = new Date(NOW).getTime();
+
+describe("exchange-floor-aware cross-sectional sizing", () => {
+  it("lifts only a leg below Binance minNotional to the smallest valid step", () => {
+    const qty = sizeCrossSectionalLeg(25, 64_108.81, { stepSize: 0.0001, minQty: 0.0001, minNotional: 50 });
+    expect(qty).toBe(0.0008);
+    expect(qty! * 64_108.81).toBeGreaterThanOrEqual(50);
+  });
+
+  it("keeps the configured target when exchange floors are lower", () => {
+    const qty = sizeCrossSectionalLeg(25, 100, { stepSize: 0.01, minQty: 0.01, minNotional: 5 });
+    expect(qty).toBe(0.25);
+  });
+});
 
 const dirs: string[] = [];
 let n = 0;
