@@ -1483,10 +1483,13 @@ function groupStats<T extends string>(
 export function buildCrossSectionalReport(
   store: CrossSectionalStore,
   nowMs: number = Date.now(),
-  opts: { variant?: CrossSectionalVariant; signal?: string } = {},
+  opts: { variant?: CrossSectionalVariant; signal?: string; sinceMs?: number } = {},
 ): CrossSectionalReport {
   const variant = opts.variant ?? (opts.signal === CROSS_SECTIONAL_FILTERED_SIGNAL ? "FILTERED" : "RAW");
-  const all = store.all.filter((o) => opts.signal ? o.signal === opts.signal : observationVariant(o) === variant);
+  const all = store.all.filter((o) =>
+    (opts.signal ? o.signal === opts.signal : observationVariant(o) === variant) &&
+    (opts.sinceMs === undefined || o.openedAtMs >= opts.sinceMs),
+  );
   const closed = all.filter((o) => o.status === "CLOSED" && o.netReturn !== null);
   const nets = closed.map((o) => o.netReturn!);
   const gross = closed.map((o) => o.grossReturn ?? 0);

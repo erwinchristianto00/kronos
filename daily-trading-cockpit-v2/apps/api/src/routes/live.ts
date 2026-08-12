@@ -1258,6 +1258,11 @@ export async function registerLiveRoutes(
    * and an unconfirmed fill price makes that leg's figure unreliable) — both are in the payload.
    */
   app.get("/api/live/cross-sectional-closed-baskets", async () => {
+    const configuredReportStartAt = process.env.CROSS_SECTIONAL_REPORT_START_AT ?? null;
+    const parsedReportStartMs = configuredReportStartAt ? Date.parse(configuredReportStartAt) : NaN;
+    const reportSinceMs = Number.isFinite(parsedReportStartMs) ? parsedReportStartMs : undefined;
+    const reportStartAt = reportSinceMs === undefined ? null : new Date(reportSinceMs).toISOString();
+    const inReportEra = (openedAt: string): boolean => reportSinceMs === undefined || new Date(openedAt).getTime() >= reportSinceMs;
     const instances: Array<{ label: string; executor: CrossSectionalExecutor | null }> = [
       { label: "FILTERED", executor: opts.crossSectionalExecutor?.() ?? null },
       { label: "TREND_BETA_VOL", executor: opts.crossSectionalTrendExecutor?.() ?? null },
@@ -1268,12 +1273,12 @@ export async function registerLiveRoutes(
       .filter((row): row is { label: string; executor: CrossSectionalExecutor } => row.executor !== null)
       .map((row) => {
         const status = row.executor.getStatus();
-        const closed = closedBasketRealizedBreakdown(row.executor.getClosedBaskets());
+        const closed = closedBasketRealizedBreakdown(row.executor.getClosedBaskets()).filter((basket) => inReportEra(basket.openedAt));
         return {
           lane: row.label,
           laneId: status.laneId,
           closedBaskets: closed.length,
-          openBaskets: status.openBaskets?.length ?? 0,
+          openBaskets: status.openBaskets?.filter((basket) => inReportEra(basket.openedAt)).length ?? 0,
           totalNetPnlUsd: closed.reduce((sum, b) => sum + (b.netPnlUsd ?? 0), 0),
           /** Realized net per token, summed across every closed basket of this lane. */
           perToken: Object.entries(
@@ -1296,6 +1301,7 @@ export async function registerLiveRoutes(
     const totalClosed = lanes.reduce((sum, l) => sum + l.closedBaskets, 0);
     return {
       generatedAt: new Date().toISOString(),
+      reportStartAt,
       source: "executor stores (real exchange fills) — NOT the measurement store",
       feeCaveat: "per-leg fees are APPORTIONED from the basket total by notional touched, not measured per leg",
       totalClosed,

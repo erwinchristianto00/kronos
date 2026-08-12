@@ -40,6 +40,7 @@ type XSecBasket = {
   short: string[];
 };
 type XSecResponse = {
+  reportStartAt?: string | null;
   report: XSecReport;
   filteredReport?: XSecReport;
   filteredConfig?: { minScoreGap: number; targetGrossReturn: number; longAllowlist: string[]; shortAllowlist: string[]; shortBlocklist: string[] };
@@ -78,6 +79,7 @@ type ClosedBasket = {
 type ClosedLane = { lane: string; laneId: string; closedBaskets: number; baskets: ClosedBasket[] };
 type ClosedResponse = {
   generatedAt: string;
+  reportStartAt?: string | null;
   source: string;
   feeCaveat?: string;
   totalClosed: number;
@@ -209,7 +211,7 @@ function ClosedCrossBasketReport({ apiPrefix }: { apiPrefix: string }) {
   return <section className="testnet-panel testnet-wide-panel" id="cross-sectional-closed-report">
     <header><div><span>Closed cross-basket realized report</span><strong>{baskets.length} closed basket{baskets.length === 1 ? '' : 's'}</strong></div><span className="tone-measure">grouped per basket · real fills</span></header>
     <div style={{ padding: '8px 12px', color: C.dim, fontSize: 11, lineHeight: 1.5 }}>
-      Gross profit, fee/cost, long/short return, realized net per symbol, and open/close timestamps. Fee/cost comes from the basket ledger; separate slippage is not currently stored independently. Per-symbol fee is allocated by notional touched.
+      Scope: {data?.reportStartAt ? `baskets opened from ${formatDate(data.reportStartAt)} onward` : 'all stored history'}. Gross profit, fee/cost, long/short return, realized net per symbol, and open/close timestamps. Fee/cost comes from the basket ledger; separate slippage is not currently stored independently. Per-symbol fee is allocated by notional touched.
     </div>
     {error ? <div style={{ padding: 12, color: C.bad }}>Closed-basket report fetch failed.</div> : baskets.length ? <div style={{ padding: '0 12px 12px' }}>
       {baskets.map(({ lane, basket }) => <ClosedBasketBlock key={basket.basketId} lane={lane} basket={basket} />)}
@@ -258,7 +260,7 @@ export default function CrossSectionalReportCard({ apiPrefix = '/testnet/api' }:
       <span className="tone-measure">testnet measurement</span>
     </header>
     <div style={{ padding: '8px 12px', color: C.dim, fontSize: 12 }}>
-      {error ? 'Report fetch failed — showing last available data.' : report ? `${report.lastCycleAt ? `last cycle ${ago(report.lastCycleAt)} ago` : 'no cycle yet'} · next resolution ${duration(report.nextResolveInMs)}` : 'Loading cross-sectional report…'}
+      {error ? 'Report fetch failed — showing last available data.' : report ? `${report.lastCycleAt ? `last cycle ${ago(report.lastCycleAt)} ago` : 'no cycle yet'} · next resolution ${duration(report.nextResolveInMs)} · scope from ${data?.reportStartAt ? formatDate(data.reportStartAt) : 'all history'}` : 'Loading cross-sectional report…'}
     </div>
     <div style={{ display: 'flex', gap: 8, padding: '0 12px 8px' }}>
       <button type="button" onClick={() => setVariant('RAW')} style={{ opacity: variant === 'RAW' ? 1 : 0.65 }}>RAW</button>

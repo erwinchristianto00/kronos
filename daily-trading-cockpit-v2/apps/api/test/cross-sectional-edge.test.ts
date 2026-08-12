@@ -313,6 +313,10 @@ describe("cross-sectional-edge — market-neutral measurement lane", () => {
     const filtered = buildCrossSectionalReport(store, T0ms, { variant: "FILTERED" });
     expect(filtered.closed).toBe(1);
     expect(filtered.netAvgReturn).toBeCloseTo(0.5, 9);
+    store.add({ ...close(0.04), observationId: "xsec:new-era", openedAt: new Date(T0ms + 1).toISOString(), openedAtMs: T0ms + 1 });
+    const freshEra = buildCrossSectionalReport(store, T0ms + 2, { variant: "RAW", sinceMs: T0ms + 1 });
+    expect(freshEra.closed).toBe(1);
+    expect(freshEra.totalNetReturn).toBeCloseTo(0.04, 9);
   });
 });
 

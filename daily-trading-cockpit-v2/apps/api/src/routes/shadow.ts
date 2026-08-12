@@ -916,6 +916,14 @@ export async function registerShadowRoutes(
   // Cross-sectional market-neutral measurement lane — report + open/closed baskets (report-only).
   app.get("/api/shadow/cross-sectional-report", async () => {
     const store = getCrossSectionalStore();
+    // Testnet can deliberately start a fresh evidence era without deleting the older store. The
+    // cutoff is configured per deployment via CROSS_SECTIONAL_REPORT_START_AT; absent/invalid means
+    // the historical report behavior remains unchanged (important for mainnet and local research).
+    const configuredReportStartAt = process.env.CROSS_SECTIONAL_REPORT_START_AT ?? null;
+    const parsedReportStartMs = configuredReportStartAt ? Date.parse(configuredReportStartAt) : NaN;
+    const reportSinceMs = Number.isFinite(parsedReportStartMs) ? parsedReportStartMs : undefined;
+    const reportStartAt = reportSinceMs === undefined ? null : new Date(reportSinceMs).toISOString();
+    const inReportEra = (o: { openedAtMs: number }): boolean => reportSinceMs === undefined || o.openedAtMs >= reportSinceMs;
     const slim = (o: {
       openedAt: string;
       resolvedAt: string | null;
@@ -961,10 +969,11 @@ export async function registerShadowRoutes(
     const trend = store.all.filter((o) => o.signal === CROSS_SECTIONAL_TREND_SIGNAL);
     const mixed = store.all.filter((o) => o.signal === CROSS_SECTIONAL_MIXED_SIGNAL);
     return {
-      report: buildCrossSectionalReport(store),
-      filteredReport: buildCrossSectionalReport(store, Date.now(), { variant: "FILTERED" }),
-      trendReport: buildCrossSectionalReport(store, Date.now(), { variant: "TREND_BETA_VOL" }),
-      mixedReport: buildCrossSectionalReport(store, Date.now(), { variant: "MIXED_MEAN_REVERSION" }),
+      reportStartAt,
+      report: buildCrossSectionalReport(store, Date.now(), { sinceMs: reportSinceMs }),
+      filteredReport: buildCrossSectionalReport(store, Date.now(), { variant: "FILTERED", sinceMs: reportSinceMs }),
+      trendReport: buildCrossSectionalReport(store, Date.now(), { variant: "TREND_BETA_VOL", sinceMs: reportSinceMs }),
+      mixedReport: buildCrossSectionalReport(store, Date.now(), { variant: "MIXED_MEAN_REVERSION", sinceMs: reportSinceMs }),
       // filteredConfig shows the EFFECTIVE (auto-updated) lists — what new FILTERED
       // baskets actually use — so /research always displays the live white/blacklists.
       filteredConfig: (() => {
@@ -980,14 +989,14 @@ export async function registerShadowRoutes(
       // Auto-updating symbol filters ACTUALLY used to mint new FILTERED baskets
       // (env lists = prior, measured per-leg returns promote/demote each cycle) + provenance.
       adaptiveSymbolFilters: deriveAdaptiveSymbolFilters(store),
-      openBaskets: raw.filter((o) => o.status === "OPEN").map(slim),
-      filteredOpenBaskets: filtered.filter((o) => o.status === "OPEN").map(slim),
-      trendOpenBaskets: trend.filter((o) => o.status === "OPEN").map(slim),
-      mixedOpenBaskets: mixed.filter((o) => o.status === "OPEN").map(slim),
-      recentClosed: raw.filter((o) => o.status === "CLOSED").slice(-15).map(slim),
-      filteredRecentClosed: filtered.filter((o) => o.status === "CLOSED").slice(-15).map(slim),
-      trendRecentClosed: trend.filter((o) => o.status === "CLOSED").slice(-15).map(slim),
-      mixedRecentClosed: mixed.filter((o) => o.status === "CLOSED").slice(-15).map(slim),
+      openBaskets: raw.filter((o) => inReportEra(o) && o.status === "OPEN").map(slim),
+      filteredOpenBaskets: filtered.filter((o) => inReportEra(o) && o.status === "OPEN").map(slim),
+      trendOpenBaskets: trend.filter((o) => inReportEra(o) && o.status === "OPEN").map(slim),
+      mixedOpenBaskets: mixed.filter((o) => inReportEra(o) && o.status === "OPEN").map(slim),
+      recentClosed: raw.filter((o) => inReportEra(o) && o.status === "CLOSED").slice(-15).map(slim),
+      filteredRecentClosed: filtered.filter((o) => inReportEra(o) && o.status === "CLOSED").slice(-15).map(slim),
+      trendRecentClosed: trend.filter((o) => inReportEra(o) && o.status === "CLOSED").slice(-15).map(slim),
+      mixedRecentClosed: mixed.filter((o) => inReportEra(o) && o.status === "CLOSED").slice(-15).map(slim),
     };
   });
 
