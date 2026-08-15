@@ -41,9 +41,12 @@ export interface SymbolEligibilityInput {
 export interface EligibilityThresholds {
   /** C1 — execution cost. Already the deployed CROSS_SECTIONAL_LIQUIDITY_FLOOR_USD_PER_HOUR. */
   minLiquidityUsdPerHour: number;
-  /** C2 — one minimum lot must not exceed this fraction of the target leg. */
+  /** C2 — one minimum lot must not exceed this fraction of the target leg.
+   *  The LEG ITSELF is not here on purpose: it is a runtime value
+   *  (baseLegUsd x sizeMultiplier) that changes whenever sizing changes, and a stale copy of it
+   *  silently loosens this criterion. It is a required argument to evaluateSymbolEligibility
+   *  instead, so it cannot be forgotten. */
   maxLotFractionOfLeg: number;
-  targetLegUsd: number;
   /** C3 — enough history to be scored by the momentum window AND measured afterwards. */
   minListedDays: number;
   /** C4 — funding paid over one hold, in bps, and how many funding periods that hold spans. */
@@ -58,7 +61,7 @@ export interface EligibilityThresholds {
  * preference wearing a number's clothes.
  *
  *  C1 200_000/h  — the floor already deployed; unchanged so this cannot loosen an existing control.
- *  C2 0.50 of leg — measured 2026-08-15: sizing only ever rounds UP, so a symbol whose one lot
+ *  C2 0.50 of the EFFECTIVE leg (passed in, never stored) — measured 2026-08-15: sizing only ever rounds UP, so a symbol whose one lot
  *                   exceeds the target leg is lifted to a full lot. At a $26 leg that put AVAX at
  *                   +88% and UNI at +49% over target and drove basket imbalance from ~1% to 4.9-10%.
  *                   Half a leg leaves room for the rounding to land inside tolerance.
@@ -72,7 +75,6 @@ export interface EligibilityThresholds {
 export const DEFAULT_ELIGIBILITY: EligibilityThresholds = {
   minLiquidityUsdPerHour: 200_000,
   maxLotFractionOfLeg: 0.5,
-  targetLegUsd: 26,
   minListedDays: 120,
   maxFundingCarryBps: 8,
   fundingPeriodsPerHold: 6,
@@ -114,9 +116,33 @@ export function oneLotNotionalUsd(input: Pick<SymbolEligibilityInput, "price" | 
   return Math.max(fromQty, fromNotional);
 }
 
+/**
+ * The leg C2 must be judged against: base size scaled by whatever multiplier sizing is running.
+ *
+ * Measured 2026-08-16 on the deployed testnet config: base $25, learning multiplier 0.7, so the
+ * real leg is $17.50 and C2's ceiling is $8.75 — NOT the $13 that a hardcoded full-size $26 leg
+ * would have allowed. AAVE's one lot is $8.66, i.e. it clears the true ceiling by nine cents and
+ * would have cleared a stale one comfortably. That gap is the whole reason this is derived at
+ * evaluation time rather than stored.
+ *
+ * Returns null when either input is unusable, and C2 then FAILS like every other unmeasurable
+ * criterion.
+ */
+export function effectiveLegUsd(baseLegUsd: number | null, sizeMultiplier: number | null): number | null {
+  if (!num(baseLegUsd) || baseLegUsd <= 0) return null;
+  if (!num(sizeMultiplier) || sizeMultiplier <= 0) return null;
+  const leg = baseLegUsd * sizeMultiplier;
+  return leg > 0 ? leg : null;
+}
+
+/**
+ * `targetLegUsd` is REQUIRED and deliberately not defaulted — see effectiveLegUsd. Pass
+ * `effectiveLegUsd(baseLegUsd, sizeMultiplier)` from whatever is actually sizing legs.
+ */
 export function evaluateSymbolEligibility(
   input: SymbolEligibilityInput,
   nowMs: number,
+  targetLegUsd: number | null,
   thresholds: EligibilityThresholds = DEFAULT_ELIGIBILITY,
 ): EligibilityVerdict {
   const failures: EligibilityFailure[] = [];
@@ -128,10 +154,12 @@ export function evaluateSymbolEligibility(
   }
 
   const lot = oneLotNotionalUsd(input);
-  const lotCeiling = thresholds.maxLotFractionOfLeg * thresholds.targetLegUsd;
-  if (lot === null) failures.push({ code: "C2_LOT_TOO_LARGE", detail: "filter lot/harga tidak terbaca" });
-  else if (lot > lotCeiling) {
-    failures.push({ code: "C2_LOT_TOO_LARGE", detail: `satu lot $${lot.toFixed(2)} > $${lotCeiling.toFixed(2)} (${(thresholds.maxLotFractionOfLeg * 100).toFixed(0)}% dari leg $${thresholds.targetLegUsd})` });
+  const legOk = num(targetLegUsd) && targetLegUsd > 0;
+  const lotCeiling = legOk ? thresholds.maxLotFractionOfLeg * (targetLegUsd as number) : null;
+  if (!legOk) failures.push({ code: "C2_LOT_TOO_LARGE", detail: "ukuran leg efektif tidak diketahui" });
+  else if (lot === null) failures.push({ code: "C2_LOT_TOO_LARGE", detail: "filter lot/harga tidak terbaca" });
+  else if (lot > (lotCeiling as number)) {
+    failures.push({ code: "C2_LOT_TOO_LARGE", detail: `satu lot $${lot.toFixed(2)} > $${(lotCeiling as number).toFixed(2)} (${(thresholds.maxLotFractionOfLeg * 100).toFixed(0)}% dari leg $${(targetLegUsd as number).toFixed(2)})` });
   }
 
   const listedDays = num(input.listedAtMs) && num(nowMs) ? (nowMs - input.listedAtMs) / 86_400_000 : null;

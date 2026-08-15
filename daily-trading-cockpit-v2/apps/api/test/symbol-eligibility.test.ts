@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
-  evaluateSymbolEligibility, oneLotNotionalUsd, diffPool, DEFAULT_ELIGIBILITY,
+  evaluateSymbolEligibility, oneLotNotionalUsd, diffPool, DEFAULT_ELIGIBILITY, effectiveLegUsd,
   type SymbolEligibilityInput,
 } from "../src/lib/symbol-eligibility.js";
 
@@ -17,11 +17,12 @@ const OK = (o: Partial<SymbolEligibilityInput> = {}): SymbolEligibilityInput => 
   maxCorrelationToAccepted: 0.5,
   ...o,
 });
-const codes = (i: SymbolEligibilityInput) => evaluateSymbolEligibility(i, NOW).failures.map(f => f.code);
+const LEG = 17.5;   // config terdeploy: base $25 x multiplier 0.7
+const codes = (i: SymbolEligibilityInput) => evaluateSymbolEligibility(i, NOW, LEG).failures.map(f => f.code);
 
 describe("acuan", () => {
   it("simbol yang sehat LOLOS", () => {
-    const v = evaluateSymbolEligibility(OK(), NOW);
+    const v = evaluateSymbolEligibility(OK(), NOW, LEG);
     expect(v.eligible).toBe(true);
     expect(v.failures).toEqual([]);
   });
@@ -54,8 +55,7 @@ describe("C2 ukuran lot", () => {
     expect(codes(OK({ price: 63000, stepSize: 0.001, minQty: 0.001 }))).toContain("C2_LOT_TOO_LARGE");
   });
   it("[ANGKA NYATA] BTC LOLOS pada leg $130", () => {
-    const v = evaluateSymbolEligibility(OK({ price: 63000, stepSize: 0.001, minQty: 0.001 }), NOW,
-      { ...DEFAULT_ELIGIBILITY, targetLegUsd: 130 });
+    const v = evaluateSymbolEligibility(OK({ price: 63000, stepSize: 0.001, minQty: 0.001 }), NOW, 130);
     expect(v.failures.map(f => f.code)).not.toContain("C2_LOT_TOO_LARGE");
   });
   it("minNotional besar juga menggagalkan, bukan cuma stepSize", () => {
@@ -104,7 +104,7 @@ describe("C5 redundansi", () => {
 
 describe("verdict membawa angka terukur untuk audit", () => {
   it("mencatat apa yang diukur, bukan cuma lolos/gagal", () => {
-    const v = evaluateSymbolEligibility(OK({ price: 63000, stepSize: 0.001, minQty: 0.001 }), NOW);
+    const v = evaluateSymbolEligibility(OK({ price: 63000, stepSize: 0.001, minQty: 0.001 }), NOW, LEG);
     expect(v.measured.oneLotUsd).toBeCloseTo(63, 0);
     expect(v.measured.liquidityUsdPerHour).toBeCloseTo(1_000_000, 0);
     expect(v.measured.fundingCarryBps).toBeCloseTo(3, 1);
@@ -114,9 +114,9 @@ describe("verdict membawa angka terukur untuk audit", () => {
 
 describe("diffPool", () => {
   const vs = [
-    evaluateSymbolEligibility(OK({ symbol: "AUSDT" }), NOW),
-    evaluateSymbolEligibility(OK({ symbol: "BUSDT", quoteVolume24hUsd: 0 }), NOW),
-    evaluateSymbolEligibility(OK({ symbol: "CUSDT" }), NOW),
+    evaluateSymbolEligibility(OK({ symbol: "AUSDT" }), NOW, LEG),
+    evaluateSymbolEligibility(OK({ symbol: "BUSDT", quoteVolume24hUsd: 0 }), NOW, LEG),
+    evaluateSymbolEligibility(OK({ symbol: "CUSDT" }), NOW, LEG),
   ];
   it("membagi masuk / keluar / tetap", () => {
     const d = diffPool(vs, ["BUSDT", "CUSDT"]);
@@ -131,5 +131,30 @@ describe("diffPool", () => {
   });
   it("simbol yang tidak ada di pool sekarang tidak muncul sebagai alasan pengeluaran", () => {
     expect(Object.keys(diffPool(vs, ["CUSDT"]).removalReasons)).toEqual([]);
+  });
+});
+
+describe("[LEG WAJIB] ukuran leg diturunkan, bukan disimpan", () => {
+  it("effectiveLegUsd = base x multiplier (config terdeploy: 25 x 0.7)", () => {
+    expect(effectiveLegUsd(25, 0.7)).toBeCloseTo(17.5, 10);
+  });
+  it("masukan tak sah -> null", () => {
+    expect(effectiveLegUsd(null, 0.7)).toBeNull();
+    expect(effectiveLegUsd(25, 0)).toBeNull();
+    expect(effectiveLegUsd(-25, 0.7)).toBeNull();
+    expect(effectiveLegUsd(25, Number.NaN)).toBeNull();
+  });
+  it("[INTI] leg tidak diketahui -> C2 GAGAL, bukan lolos", () => {
+    expect(evaluateSymbolEligibility(OK(), NOW, null).failures.map(f => f.code)).toContain("C2_LOT_TOO_LARGE");
+    expect(evaluateSymbolEligibility(OK(), NOW, 0).failures.map(f => f.code)).toContain("C2_LOT_TOO_LARGE");
+  });
+  it("[ANGKA NYATA] AAVE $8.66 lolos di leg $17.50 (plafon $8.75) — sembilan sen", () => {
+    const aave = OK({ symbol: "AAVEUSDT", price: 86.59, stepSize: 0.1, minQty: 0.1, minNotionalUsd: 5 });
+    expect(oneLotNotionalUsd(aave)).toBeCloseTo(8.659, 3);
+    expect(evaluateSymbolEligibility(aave, NOW, 17.5).failures.map(f => f.code)).not.toContain("C2_LOT_TOO_LARGE");
+  });
+  it("[ANGKA NYATA] AAVE GAGAL kalau leg mengecil ke $16", () => {
+    const aave = OK({ symbol: "AAVEUSDT", price: 86.59, stepSize: 0.1, minQty: 0.1, minNotionalUsd: 5 });
+    expect(evaluateSymbolEligibility(aave, NOW, 16).failures.map(f => f.code)).toContain("C2_LOT_TOO_LARGE");
   });
 });
