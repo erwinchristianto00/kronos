@@ -892,7 +892,37 @@ interface OverlayCfPayload {
   lanes: Record<string, OverlayCfLane>;
 }
 let overlayCfCache: { atMs: number; payload: unknown } | null = null;
-let poolViewCache: { atMs: number; html: string } | null = null;
+/** Criteria verdict for one symbol, plus what the ACTIVE pool currently does with it. Shared by the
+ *  standalone page and the dashboard panel so the two can never disagree about the same symbol. */
+interface PoolReportRow {
+  symbol: string;
+  liquidityUsdPerHour: number | null;
+  oneLotUsd: number | null;
+  /** C1/C2 only. C3-C5 are not evaluated here and are reported as unevaluated, never as passes. */
+  failures: Array<{ code: string; detail: string }>;
+  passesEvaluated: boolean;
+  inPool: boolean;
+  shortBlocked: boolean;
+  /** false when the ACTIVE pool and the criteria disagree about this symbol. */
+  agreesWithCriteria: boolean;
+}
+interface PoolReport {
+  generatedAt: string;
+  /** When false the exchange read failed, EVERY criterion is unmeasured, and the rows below say
+   *  nothing about eligibility. Without this flag a failed fetch renders as "every symbol fails",
+   *  which is the most misleading thing this page could possibly show. */
+  measured: boolean;
+  leg: { baseUsd: number; multiplier: number; effectiveUsd: number | null; oneLotCeilingUsd: number | null };
+  thresholds: { minLiquidityUsdPerHour: number; maxLotFractionOfLeg: number; minListedDays: number; maxFundingCarryBps: number; maxCorrelation: number };
+  counts: { universe: number; passesEvaluated: number; poolLong: number; poolShort: number; shortBlocked: number; shortEligible: number };
+  rows: PoolReportRow[];
+  mismatch: string[];
+  blockedInPool: string[];
+  /** Evaluated separately because BTC is not in the universe and so has no row above. */
+  btc: { oneLotUsd: number | null; legNeededUsd: number | null };
+  unevaluatedCriteria: Array<{ code: string; why: string }>;
+}
+let poolReportCache: { atMs: number; report: PoolReport } | null = null;
 
 export async function registerLiveRoutes(
   app: FastifyInstance,
@@ -1738,13 +1768,9 @@ export async function registerLiveRoutes(
    * Served by the API, like the counterfactual page, so no dashboard bundle is rebuilt and nothing
    * the other agent deployed can be overwritten.
    */
-  app.get("/api/live/cross-sectional-pool/view", async (_request, reply) => {
+  const buildPoolReport = async (): Promise<PoolReport> => {
     const now = Date.now();
-    if (poolViewCache && now - poolViewCache.atMs < 15 * 60_000) {
-      reply.type("text/html; charset=utf-8");
-      return poolViewCache.html;
-    }
-    const esc = (v: unknown): string => String(v).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c] ?? c));
+    if (poolReportCache && now - poolReportCache.atMs < 15 * 60_000) return poolReportCache.report;
     const list = (k: string): string[] => (process.env[k] ?? "").split(",").map((x) => x.trim()).filter(Boolean);
     const universe = list("CROSS_SECTIONAL_UNIVERSE");
     const longAllow = new Set(list("CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST"));
@@ -1754,8 +1780,9 @@ export async function registerLiveRoutes(
     const mult = Number.parseFloat(process.env.CROSS_SECTIONAL_TESTNET_LEARNING_LEG_MULTIPLIER ?? "") || 1;
     const leg = effectiveLegUsd(baseLeg, mult);
 
-    let filters = new Map<string, { minNotional: number | null; stepSize: number | null; minQty: number | null }>();
-    let ticks = new Map<string, { price: number; quoteVolume: number }>();
+    const filters = new Map<string, { minNotional: number | null; stepSize: number | null; minQty: number | null }>();
+    const ticks = new Map<string, { price: number; quoteVolume: number }>();
+    let measured = false;
     try {
       const info = (await (await fetch("https://fapi.binance.com/fapi/v1/exchangeInfo")).json()) as { symbols?: Array<Record<string, unknown>> };
       for (const sym of info.symbols ?? []) {
@@ -1770,7 +1797,8 @@ export async function registerLiveRoutes(
       }
       const tk = (await (await fetch("https://fapi.binance.com/fapi/v1/ticker/24hr")).json()) as Array<Record<string, unknown>>;
       for (const t of tk) ticks.set(String(t.symbol), { price: Number(t.lastPrice), quoteVolume: Number(t.quoteVolume) });
-    } catch { /* biarkan kosong; setiap kriteria yang tak terukur akan GAGAL, bukan lolos */ }
+      measured = filters.size > 0 && ticks.size > 0;
+    } catch { /* measured stays false — see PoolReport.measured for why that is not the same as failing */ }
 
     const verdicts: EligibilityVerdict[] = universe.map((symbol) => {
       const f = filters.get(symbol);
@@ -1792,24 +1820,98 @@ export async function registerLiveRoutes(
     });
 
     const c12Fail = (v: EligibilityVerdict) => v.failures.filter((x) => x.code === "C1_LIQUIDITY" || x.code === "C2_LOT_TOO_LARGE");
-    const rows = verdicts.map((v) => {
+    const reportRows: PoolReportRow[] = verdicts.map((v) => {
       const fails = c12Fail(v);
       const inPool = longAllow.has(v.symbol);
-      const blocked = shortBlock.has(v.symbol);
-      const agree = (fails.length === 0) === inPool;
-      return `<tr class="${fails.length ? "out" : ""}">
-        <td class="sym">${esc(v.symbol.replace("USDT", ""))}</td>
-        <td class="num">${v.measured.liquidityUsdPerHour === null ? "—" : "$" + Math.round(v.measured.liquidityUsdPerHour / 1000) + "k"}</td>
-        <td class="num">${v.measured.oneLotUsd === null ? "—" : "$" + v.measured.oneLotUsd.toFixed(2)}</td>
-        <td>${fails.length ? `<span class="bad">${fails.map((f) => esc(f.detail)).join("; ")}</span>` : `<span class="ok">memenuhi C1 &amp; C2</span>`}</td>
-        <td>${inPool ? "<b>di pool</b>" : "<span class=\"muted\">di luar</span>"}${agree ? "" : ' <span class="warn">&#9888; tidak sesuai kriteria</span>'}</td>
-        <td>${blocked ? '<span class="warn">short diblokir</span>' : ""}</td>
-      </tr>`;
-    }).join("");
+      const passes = fails.length === 0;
+      return {
+        symbol: v.symbol,
+        liquidityUsdPerHour: v.measured.liquidityUsdPerHour,
+        oneLotUsd: v.measured.oneLotUsd,
+        failures: fails.map((f) => ({ code: f.code, detail: f.detail })),
+        passesEvaluated: passes,
+        inPool,
+        shortBlocked: shortBlock.has(v.symbol),
+        // With no exchange read there is nothing to agree or disagree WITH, so an unmeasured run
+        // must not manufacture 20 mismatches out of its own missing data.
+        agreesWithCriteria: measured ? passes === inPool : true,
+      };
+    });
 
-    const eligible = verdicts.filter((v) => c12Fail(v).length === 0).map((v) => v.symbol);
-    const mismatch = verdicts.filter((v) => (c12Fail(v).length === 0) !== longAllow.has(v.symbol));
-    const blockedInPool = [...shortBlock].filter((s) => longAllow.has(s));
+    const btcLot = measured && ticks.get("BTCUSDT")
+      ? oneLotNotionalUsd({
+          price: ticks.get("BTCUSDT")!.price,
+          minNotionalUsd: filters.get("BTCUSDT")?.minNotional ?? null,
+          stepSize: filters.get("BTCUSDT")?.stepSize ?? null,
+          minQty: filters.get("BTCUSDT")?.minQty ?? null,
+        })
+      : null;
+
+    const report: PoolReport = {
+      generatedAt: new Date(now).toISOString(),
+      measured,
+      leg: {
+        baseUsd: baseLeg,
+        multiplier: mult,
+        effectiveUsd: leg,
+        oneLotCeilingUsd: leg === null ? null : leg * DEFAULT_ELIGIBILITY.maxLotFractionOfLeg,
+      },
+      thresholds: {
+        minLiquidityUsdPerHour: DEFAULT_ELIGIBILITY.minLiquidityUsdPerHour,
+        maxLotFractionOfLeg: DEFAULT_ELIGIBILITY.maxLotFractionOfLeg,
+        minListedDays: DEFAULT_ELIGIBILITY.minListedDays,
+        maxFundingCarryBps: DEFAULT_ELIGIBILITY.maxFundingCarryBps,
+        maxCorrelation: DEFAULT_ELIGIBILITY.maxCorrelation,
+      },
+      counts: {
+        universe: universe.length,
+        passesEvaluated: reportRows.filter((r) => r.passesEvaluated).length,
+        poolLong: longAllow.size,
+        poolShort: shortAllow.size,
+        shortBlocked: shortBlock.size,
+        shortEligible: [...shortAllow].filter((s) => !shortBlock.has(s)).length,
+      },
+      rows: reportRows,
+      mismatch: reportRows.filter((r) => !r.agreesWithCriteria).map((r) => r.symbol),
+      blockedInPool: [...shortBlock].filter((s) => longAllow.has(s)),
+      btc: {
+        oneLotUsd: btcLot,
+        legNeededUsd: btcLot === null ? null : btcLot / DEFAULT_ELIGIBILITY.maxLotFractionOfLeg,
+      },
+      unevaluatedCriteria: [
+        { code: "C3_LISTING_AGE", why: "butuh satu panggilan riwayat per simbol" },
+        { code: "C4_FUNDING_CARRY", why: "butuh riwayat funding per simbol" },
+        { code: "C5_CORRELATION", why: "butuh riwayat harga seluruh pool" },
+      ],
+    };
+    poolReportCache = { atMs: now, report };
+    return report;
+  };
+
+  /** Same report as the page below, as JSON, so the dashboard panel renders MEASURED numbers rather
+   *  than prose someone typed once and nobody re-checked. One cache, one source of truth. */
+  app.get("/api/live/cross-sectional-pool", async () => buildPoolReport());
+
+  app.get("/api/live/cross-sectional-pool/view", async (_request, reply) => {
+    const report = await buildPoolReport();
+    const now = Date.parse(report.generatedAt);
+    const esc = (v: unknown): string => String(v).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c] ?? c));
+    const { measured, leg: legInfo, counts, mismatch: mismatchSyms, blockedInPool } = report;
+    const leg = legInfo.effectiveUsd;
+    const baseLeg = legInfo.baseUsd;
+    const mult = legInfo.multiplier;
+    const shortBlock = report.rows.filter((r) => r.shortBlocked).map((r) => r.symbol);
+    const universe = report.rows.map((r) => r.symbol);
+    const eligible = report.rows.filter((r) => r.passesEvaluated);
+    const mismatch = report.rows.filter((r) => !r.agreesWithCriteria);
+    const rows = report.rows.map((r) => `<tr class="${r.passesEvaluated ? "" : "out"}">
+        <td class="sym">${esc(r.symbol.replace("USDT", ""))}</td>
+        <td class="num">${r.liquidityUsdPerHour === null ? "—" : "$" + Math.round(r.liquidityUsdPerHour / 1000) + "k"}</td>
+        <td class="num">${r.oneLotUsd === null ? "—" : "$" + r.oneLotUsd.toFixed(2)}</td>
+        <td>${!measured ? '<span class="muted">tidak terukur</span>' : r.failures.length ? `<span class="bad">${r.failures.map((f) => esc(f.detail)).join("; ")}</span>` : `<span class="ok">memenuhi C1 &amp; C2</span>`}</td>
+        <td>${r.inPool ? "<b>di pool</b>" : "<span class=\"muted\">di luar</span>"}${r.agreesWithCriteria ? "" : ' <span class="warn">&#9888; tidak sesuai kriteria</span>'}</td>
+        <td>${r.shortBlocked ? '<span class="warn">short diblokir</span>' : ""}</td>
+      </tr>`).join("");
 
     const html = `<!doctype html><html lang="id"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Pool Cross-Sectional</title><style>
@@ -1836,10 +1938,14 @@ th{color:var(--mut);font-weight:600;font-size:11.5px;text-transform:uppercase;le
   <div><span>plafon satu lot (C2)</span><b>$${leg === null ? "—" : (leg * DEFAULT_ELIGIBILITY.maxLotFractionOfLeg).toFixed(2)}</b></div>
   <div><span>universe</span><b>${universe.length}</b></div>
   <div><span>memenuhi C1 &amp; C2</span><b>${eligible.length}</b></div>
-  <div><span>pool aktif (long)</span><b>${longAllow.size}</b></div>
+  <div><span>pool aktif (long)</span><b>${counts.poolLong}</b></div>
 </div>
 
-${mismatch.length ? `<div class="note">&#9888; <b>${mismatch.length} simbol tidak sesuai kriteria</b>: ${mismatch.map((v) => esc(v.symbol.replace("USDT", ""))).join(", ")}. Pool aktif dan hasil kriteria berbeda — salah satunya perlu diperbarui.</div>` : `<div class="note" style="background:transparent;color:var(--ok);padding-left:0">&#10003; Pool aktif sama persis dengan hasil kriteria.</div>`}
+${!measured
+  ? `<div class="note">&#9888; <b>Kriteria tidak bisa diukur sekarang</b> &mdash; pembacaan exchange gagal, jadi kolom likuiditas, satu lot dan status di bawah kosong. Ini BUKAN berarti simbol-simbol itu gagal kriteria; belum ada yang diuji. Pool aktif tetap ditampilkan apa adanya.</div>`
+  : mismatch.length
+    ? `<div class="note">&#9888; <b>${mismatch.length} simbol tidak sesuai kriteria</b>: ${mismatch.map((v) => esc(v.symbol.replace("USDT", ""))).join(", ")}. Pool aktif dan hasil kriteria berbeda — salah satunya perlu diperbarui.</div>`
+    : `<div class="note" style="background:transparent;color:var(--ok);padding-left:0">&#10003; Pool aktif sama persis dengan hasil kriteria.</div>`}
 
 <h2>Per simbol</h2>
 <div class="wrapx"><table><thead><tr>
@@ -1863,14 +1969,13 @@ ${blockedInPool.length ? ` Saat ini ${blockedInPool.length} di antaranya ada di 
 Diukur 2026-08-16 pada pool 20 simbol, biayanya <b>&minus;0,8 bps median</b> &mdash; jadi pertanyaannya bukan biaya, tapi konsistensi.</div>
 
 <h2>Kenapa BTC di luar</h2>
-<p>Bukan &ldquo;sementara&rdquo;. Satu lot minimum BTC adalah <b>$${(ticks.get("BTCUSDT") ? (oneLotNotionalUsd({ price: ticks.get("BTCUSDT")!.price, minNotionalUsd: filters.get("BTCUSDT")?.minNotional ?? null, stepSize: filters.get("BTCUSDT")?.stepSize ?? null, minQty: filters.get("BTCUSDT")?.minQty ?? null }) ?? 0).toFixed(2) : "—")}</b>,
-sementara plafon C2 pada leg $${leg === null ? "—" : leg.toFixed(2)} adalah $${leg === null ? "—" : (leg * DEFAULT_ELIGIBILITY.maxLotFractionOfLeg).toFixed(2)}. Itu berlaku selama leg-nya sebesar ini &mdash; BTC baru bisa masuk kalau leg dinaikkan ke sekitar $126, dan itu keputusan ukuran posisi, bukan sesuatu yang hilang sendiri.</p>
+<p>Bukan &ldquo;sementara&rdquo;. Satu lot minimum BTC adalah <b>$${report.btc.oneLotUsd === null ? "—" : report.btc.oneLotUsd.toFixed(2)}</b>,
+sementara plafon C2 pada leg $${leg === null ? "—" : leg.toFixed(2)} adalah $${legInfo.oneLotCeilingUsd === null ? "—" : legInfo.oneLotCeilingUsd.toFixed(2)}. Itu berlaku selama leg-nya sebesar ini &mdash; BTC baru bisa masuk kalau leg dinaikkan ke sekitar $${report.btc.legNeededUsd === null ? "—" : Math.ceil(report.btc.legNeededUsd)}, dan itu keputusan ukuran posisi, bukan sesuatu yang hilang sendiri.</p>
 
 <p class="muted" style="margin-top:26px;border-top:1px solid var(--line);padding-top:14px">
 dibuat ${esc(new Date(now).toISOString())} &middot; di-cache 15 menit &middot; disajikan API, bukan dari <code>dist/</code>, supaya deploy dashboard tidak menimpanya
 </p></div></body></html>`;
 
-    poolViewCache = { atMs: now, html };
     reply.type("text/html; charset=utf-8");
     return html;
   });

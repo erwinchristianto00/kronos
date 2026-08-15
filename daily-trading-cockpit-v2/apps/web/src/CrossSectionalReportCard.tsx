@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, type ReactNode } from 'react';
 
 const C = {
   card: '#14222a',
@@ -237,6 +237,128 @@ function SymbolList({ symbols, color = C.dim, empty = 'Tidak ada' }: { symbols: 
 
 function InlineSymbolList({ symbols, color = C.dim, empty = 'Tidak ada' }: { symbols: string[]; color?: string; empty?: string }) {
   return <div style={{ color, paddingLeft: 12, marginTop: 3, lineHeight: 1.5 }}>{symbols.length ? symbols.join(', ') : empty}</div>;
+}
+
+/* ── Pool panel ───────────────────────────────────────────────────────────────────────────────
+   This used to read "POOL LONG OPERATOR" / "POOL SHORT OPERATOR", which stopped being true the
+   moment the list became criteria-derived, and it named exclusions without ever saying why. A pool
+   view that cannot answer "why is this symbol in, and that one out" is how a hand-picked list
+   survives for months without anyone being able to question it.
+
+   Every number below is MEASURED and comes from /api/live/cross-sectional-pool, not typed in here.
+   The one list that genuinely has no criterion — the short blocklist — is labelled as exactly that
+   rather than sharing a heading with the criteria-derived pools. */
+type PoolReport = {
+  measured: boolean;
+  leg: { baseUsd: number; multiplier: number; effectiveUsd: number | null; oneLotCeilingUsd: number | null };
+  thresholds: { minLiquidityUsdPerHour: number; maxLotFractionOfLeg: number; minListedDays: number; maxFundingCarryBps: number; maxCorrelation: number };
+  counts: { universe: number; passesEvaluated: number; poolLong: number; poolShort: number; shortBlocked: number; shortEligible: number };
+  rows: Array<{ symbol: string; passesEvaluated: boolean; inPool: boolean; shortBlocked: boolean; agreesWithCriteria: boolean; failures: Array<{ code: string; detail: string }> }>;
+  mismatch: string[];
+  blockedInPool: string[];
+  btc: { oneLotUsd: number | null; legNeededUsd: number | null };
+  unevaluatedCriteria: Array<{ code: string; why: string }>;
+};
+
+const usd = (v: number | null | undefined, dp = 2) => (v == null ? '—' : `$${v.toFixed(dp)}`);
+
+function Banner({ tone, children }: { tone: 'warn' | 'ok'; children: ReactNode }) {
+  return <div style={{
+    color: tone === 'warn' ? C.accent : C.good, background: tone === 'warn' ? '#2a2110' : 'transparent',
+    border: `1px solid ${tone === 'warn' ? C.accent : 'transparent'}`, borderRadius: 4,
+    padding: tone === 'warn' ? '6px 9px' : '2px 0', fontSize: 11.5, lineHeight: 1.5,
+  }}>{children}</div>;
+}
+
+function PoolPanel({ apiPrefix, executionLong, executionShort, executionShortBlocked, executionExcluded }: {
+  apiPrefix: string;
+  executionLong: string[]; executionShort: string[]; executionShortBlocked: string[]; executionExcluded: string[];
+}) {
+  const [pool, setPool] = useState<PoolReport | null>(null);
+  const [poolError, setPoolError] = useState(false);
+
+  useEffect(() => {
+    let alive = true;
+    async function loadPool() {
+      try {
+        const response = await fetch(`${apiPrefix}/live/cross-sectional-pool`, { cache: 'no-store' });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const parsed = await response.json() as PoolReport;
+        if (alive) { setPool(parsed); setPoolError(false); }
+      } catch {
+        if (alive) setPoolError(true);
+      }
+    }
+    void loadPool();
+    // The report is cached 15 min on the API; polling faster only burns requests for the same bytes.
+    const timer = window.setInterval(() => void loadPool(), 5 * 60_000);
+    return () => { alive = false; window.clearInterval(timer); };
+  }, [apiPrefix]);
+
+  const activeShort = executionShort.filter((symbol) => !executionShortBlocked.includes(symbol));
+  const poolsIdentical = executionLong.length === executionShort.length
+    && executionLong.every((symbol) => executionShort.includes(symbol));
+  // The executor reads its allowlists from env; so does the criteria report. If the two disagree the
+  // panel is describing a pool the executor is not using, which must never pass silently.
+  const countDrift = pool && (pool.counts.poolLong !== executionLong.length || pool.counts.poolShort !== executionShort.length);
+
+  const label = (text: string, n: number, color: string) => <strong style={{ color }}>{text} ({n})</strong>;
+
+  return <div style={{ display: 'grid', gap: 8, marginTop: 2, padding: '8px 10px', border: `1px solid ${C.border}`, background: C.sub }}>
+    <div>
+      <strong style={{ color: C.text }}>Pool FILTERED yang dipakai sekarang</strong>
+      <div style={{ color: C.dim, fontSize: 11.5, marginTop: 2, lineHeight: 1.5 }}>
+        Daftar long dan short <b style={{ color: C.text }}>diturunkan dari kriteria</b>, bukan dipilih tangan.
+        {pool?.measured && <> Leg efektif <b style={{ color: C.text }}>{usd(pool.leg.effectiveUsd)}</b> ({usd(pool.leg.baseUsd, 0)} × {pool.leg.multiplier}) ·
+        C1 likuiditas ≥ ${Math.round(pool.thresholds.minLiquidityUsdPerHour / 1000)}k/jam ·
+        C2 satu lot ≤ {usd(pool.leg.oneLotCeilingUsd)} ({(pool.thresholds.maxLotFractionOfLeg * 100).toFixed(0)}% leg)</>}
+      </div>
+    </div>
+
+    {poolError && <Banner tone="warn">Kriteria tidak bisa dibaca (endpoint pool gagal). Daftar di bawah tetap yang dipakai executor, tapi belum diuji terhadap kriteria apa pun.</Banner>}
+    {pool && !pool.measured && <Banner tone="warn">⚠ Kriteria tidak bisa diukur sekarang — pembacaan exchange gagal. Ini <b>bukan</b> berarti simbol-simbolnya gagal kriteria; belum ada yang diuji.</Banner>}
+    {pool?.measured && pool.mismatch.length > 0 && <Banner tone="warn">
+      ⚠ {pool.mismatch.length} simbol tidak sesuai kriteria: {pool.mismatch.map((s) => s.replace('USDT', '')).join(', ')}. Pool aktif dan hasil kriteria berbeda — salah satunya perlu diperbarui.
+    </Banner>}
+    {pool?.measured && pool.mismatch.length === 0 && <Banner tone="ok">✓ Ke-{pool.counts.poolLong} simbol pool sama persis dengan hasil kriteria C1 &amp; C2.</Banner>}
+    {countDrift && <Banner tone="warn">⚠ Kriteria menghitung {pool.counts.poolLong} long / {pool.counts.poolShort} short, executor memakai {executionLong.length} / {executionShort.length}. Panel ini dan executor tidak membaca daftar yang sama.</Banner>}
+
+    <div>{label('POOL LONG — hasil kriteria C1 & C2', executionLong.length, C.good)}<InlineSymbolList symbols={executionLong} color={C.good} /></div>
+    <div>
+      {label('POOL SHORT — hasil kriteria C1 & C2', executionShort.length, C.good)}
+      {poolsIdentical
+        ? <div style={{ color: C.dim, paddingLeft: 12, marginTop: 3, fontSize: 11.5 }}>Sama persis dengan pool long — satu-satunya beda sisi short adalah blocklist di bawah.</div>
+        : <InlineSymbolList symbols={executionShort} color={C.good} />}
+    </div>
+
+    <div>
+      {label('BLOCKED SHORT — daftar tangan, TANPA kriteria', executionShortBlocked.length, C.bad)}
+      <InlineSymbolList symbols={executionShortBlocked} color={C.bad} />
+      <div style={{ color: C.dim, paddingLeft: 12, marginTop: 3, fontSize: 11.5, lineHeight: 1.5 }}>
+        Satu-satunya daftar yang masih dipilih manual. Tidak ada alasan tercatat kenapa simbol ini tidak boleh di-short,
+        dan tidak ada aturan untuk menambah atau mengeluarkan anggotanya. Diukur 2026-08-16 pada pool 20 simbol,
+        biayanya <b style={{ color: C.text }}>−0,8 bps median</b> — jadi pertanyaannya konsistensi, bukan biaya.
+        {!!pool?.blockedInPool.length && <> Saat ini {pool.blockedInPool.length} di antaranya ada di pool aktif, jadi hanya bisa dipakai di sisi long.</>}
+      </div>
+    </div>
+
+    <div>{label('SHORT ELIGIBLE SEKARANG', activeShort.length, C.measure)}<InlineSymbolList symbols={activeShort} color={C.measure} /></div>
+
+    {!!executionExcluded.length && <div>
+      {label('DIKELUARKAN DARI EXECUTOR', executionExcluded.length, C.accent)}
+      <InlineSymbolList symbols={executionExcluded} color={C.accent} />
+    </div>}
+
+    {pool?.measured && <div style={{ color: C.dim, fontSize: 11.5, lineHeight: 1.5, borderTop: `1px solid ${C.border}`, paddingTop: 6 }}>
+      {pool.btc.oneLotUsd !== null && <>
+        <b style={{ color: C.text }}>BTC di luar pool secara permanen pada leg ini</b>, bukan &ldquo;sementara&rdquo;: satu lot minimumnya {usd(pool.btc.oneLotUsd)} vs plafon {usd(pool.leg.oneLotCeilingUsd)}.
+        Baru bisa masuk kalau leg dinaikkan ke sekitar {usd(pool.btc.legNeededUsd, 0)} — itu keputusan ukuran posisi, bukan sesuatu yang hilang sendiri.<br />
+      </>}
+      <b style={{ color: C.text }}>C3 umur listing, C4 carry funding, C5 korelasi tidak diukur</b> di panel ini ({pool.unevaluatedCriteria.map((c) => c.code.split('_')[0]).join(', ')}),
+      jadi ketiganya tidak ikut menentukan status di atas — dinyatakan, bukan disembunyikan. Pada universe {pool.counts.universe} simbol saat ini hanya C1 dan C2 yang menyaring.
+      {' '}<a href={`${apiPrefix}/live/cross-sectional-pool/view`} target="_blank" rel="noreferrer" style={{ color: C.measure }}>Rincian per simbol →</a>
+    </div>}
+  </div>;
 }
 
 function BasketRows({ baskets, open }: { baskets: XSecBasket[]; open?: boolean }) {
@@ -583,16 +705,18 @@ export default function CrossSectionalReportCard({ apiPrefix = '/testnet/api' }:
     <div style={{ padding: '10px 12px', display: 'grid', gap: 8, color: C.dim, fontSize: 12, lineHeight: 1.5 }}>
       <div><strong style={{ color: C.text }}>RAW</strong> = universe sinyal dasar. Sistem merangking seluruh pool basket yang eligible tanpa aturan allow/block FILTERED per simbol yang sudah diukur. Ini adalah baseline pembanding, bukan otomatis pilihan eksekusi live.</div>
       <div><strong style={{ color: C.text }}>FILTERED</strong> = ide momentum cross-sectional yang sama setelah melewati filter likuiditas, selisih skor, serta allow/block operator. Executor market-neutral testnet saat ini memakai varian ini.</div>
-      <div style={{ display: 'grid', gap: 8, marginTop: 2, padding: '8px 10px', border: `1px solid ${C.border}`, background: C.sub }}>
-        <strong style={{ color: C.text }}>Pool FILTERED yang dipakai sekarang</strong>
-        {config ? <>
-          <div><strong style={{ color: C.good }}>POOL LONG OPERATOR ({executionLong.length})</strong><InlineSymbolList symbols={executionLong} color={C.good} /></div>
-          <div><strong style={{ color: C.good }}>POOL SHORT OPERATOR ({executionShort.length})</strong><InlineSymbolList symbols={executionShort} color={C.good} /></div>
-          <div><strong style={{ color: C.bad }}>BLOCKED SHORT EKSPLISIT ({executionShortBlocked.length})</strong><InlineSymbolList symbols={executionShortBlocked} color={C.bad} /></div>
-          <div><strong style={{ color: C.measure }}>SHORT ELIGIBLE SEKARANG ({activeShort.length})</strong><InlineSymbolList symbols={activeShort} color={C.measure} /></div>
-          {!!config.executionExcludedSymbols?.length && <div><strong style={{ color: C.accent }}>DIKELUARKAN SEMENTARA DARI EXECUTOR ({config.executionExcludedSymbols.length})</strong><InlineSymbolList symbols={config.executionExcludedSymbols} color={C.accent} /></div>}
-        </> : <div>Memuat konfigurasi FILTERED…</div>}
-      </div>
+      {config
+        ? <PoolPanel
+            apiPrefix={apiPrefix}
+            executionLong={executionLong}
+            executionShort={executionShort}
+            executionShortBlocked={executionShortBlocked}
+            executionExcluded={config.executionExcludedSymbols ?? []}
+          />
+        : <div style={{ display: 'grid', gap: 8, marginTop: 2, padding: '8px 10px', border: `1px solid ${C.border}`, background: C.sub }}>
+            <strong style={{ color: C.text }}>Pool FILTERED yang dipakai sekarang</strong>
+            <div>Memuat konfigurasi FILTERED…</div>
+          </div>}
       <div><strong style={{ color: C.text }}>MOM36_FILTERED</strong> = sinyal FILTERED dengan momentum dari 36 candle 1 jam yang sudah selesai. Angka <strong style={{ color: C.accent }}>36</strong> adalah lookback, bukan durasi holding; horizon basket saat ini ditampilkan terpisah di sebelah judul report dan dikonfigurasi secara terpisah.</div>
     </div>
   </section>
