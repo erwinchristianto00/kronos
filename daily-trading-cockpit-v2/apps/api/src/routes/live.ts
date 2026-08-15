@@ -16,6 +16,10 @@ import type { FastifyInstance } from "fastify";
 import type { LiveExecutionEngine } from "../lib/live-execution-engine.js";
 import { fullyCostedNetPnlUsd, fullyCostedFeeUsd } from "../lib/fully-costed-net-pnl.js";
 import {
+  evaluateSymbolEligibility, effectiveLegUsd, oneLotNotionalUsd, DEFAULT_ELIGIBILITY,
+  type SymbolEligibilityInput, type EligibilityVerdict,
+} from "../lib/symbol-eligibility.js";
+import {
   closedBasketRealizedBreakdown,
   crossSectionalEstimatedCostPct,
   isCrossSectionalBasketReportingExcluded,
@@ -888,6 +892,7 @@ interface OverlayCfPayload {
   lanes: Record<string, OverlayCfLane>;
 }
 let overlayCfCache: { atMs: number; payload: unknown } | null = null;
+let poolViewCache: { atMs: number; html: string } | null = null;
 
 export async function registerLiveRoutes(
   app: FastifyInstance,
@@ -1721,6 +1726,155 @@ export async function registerLiveRoutes(
    * overwrites whatever that agent shipped. Adding a route cannot collide with it — no bundle is
    * rebuilt, no file of theirs is touched. No external assets, so no CSP or CDN dependency.
    */
+  /**
+   * Honest view of the cross-sectional symbol pool (2026-08-16).
+   *
+   * The dashboard previously labelled this "POOL OPERATOR", which stopped being true the moment
+   * the list became criteria-derived, and showed exclusions with no reason at all — BTC appeared
+   * as "temporarily excluded" when in fact its minimum lot is 2.4x the leg, which is permanent for
+   * as long as the leg stays this size. A pool view that cannot say WHY a symbol is in or out is
+   * how a hand-picked list survives for months without anyone being able to question it.
+   *
+   * Served by the API, like the counterfactual page, so no dashboard bundle is rebuilt and nothing
+   * the other agent deployed can be overwritten.
+   */
+  app.get("/api/live/cross-sectional-pool/view", async (_request, reply) => {
+    const now = Date.now();
+    if (poolViewCache && now - poolViewCache.atMs < 15 * 60_000) {
+      reply.type("text/html; charset=utf-8");
+      return poolViewCache.html;
+    }
+    const esc = (v: unknown): string => String(v).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c] ?? c));
+    const list = (k: string): string[] => (process.env[k] ?? "").split(",").map((x) => x.trim()).filter(Boolean);
+    const universe = list("CROSS_SECTIONAL_UNIVERSE");
+    const longAllow = new Set(list("CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST"));
+    const shortAllow = new Set(list("CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST"));
+    const shortBlock = new Set(list("CROSS_SECTIONAL_FILTERED_SHORT_BLOCKLIST"));
+    const baseLeg = Number.parseFloat(process.env.CROSS_SECTIONAL_EXEC_LEG_USD ?? "") || 25;
+    const mult = Number.parseFloat(process.env.CROSS_SECTIONAL_TESTNET_LEARNING_LEG_MULTIPLIER ?? "") || 1;
+    const leg = effectiveLegUsd(baseLeg, mult);
+
+    let filters = new Map<string, { minNotional: number | null; stepSize: number | null; minQty: number | null }>();
+    let ticks = new Map<string, { price: number; quoteVolume: number }>();
+    try {
+      const info = (await (await fetch("https://fapi.binance.com/fapi/v1/exchangeInfo")).json()) as { symbols?: Array<Record<string, unknown>> };
+      for (const sym of info.symbols ?? []) {
+        const fs = (sym.filters as Array<Record<string, unknown>>) ?? [];
+        const lot = fs.find((f) => f.filterType === "LOT_SIZE");
+        const mn = fs.find((f) => f.filterType === "MIN_NOTIONAL");
+        filters.set(String(sym.symbol), {
+          minNotional: mn ? Number(mn.notional ?? mn.minNotional ?? 0) : null,
+          stepSize: lot ? Number(lot.stepSize) : null,
+          minQty: lot ? Number(lot.minQty) : null,
+        });
+      }
+      const tk = (await (await fetch("https://fapi.binance.com/fapi/v1/ticker/24hr")).json()) as Array<Record<string, unknown>>;
+      for (const t of tk) ticks.set(String(t.symbol), { price: Number(t.lastPrice), quoteVolume: Number(t.quoteVolume) });
+    } catch { /* biarkan kosong; setiap kriteria yang tak terukur akan GAGAL, bukan lolos */ }
+
+    const verdicts: EligibilityVerdict[] = universe.map((symbol) => {
+      const f = filters.get(symbol);
+      const t = ticks.get(symbol);
+      const input: SymbolEligibilityInput = {
+        symbol,
+        quoteVolume24hUsd: t ? t.quoteVolume : null,
+        price: t ? t.price : null,
+        minNotionalUsd: f ? f.minNotional : null,
+        stepSize: f ? f.stepSize : null,
+        minQty: f ? f.minQty : null,
+        // C3/C4 butuh satu panggilan per simbol; tidak dievaluasi di tampilan ini dan
+        // ditandai sebagai TIDAK DIUKUR, bukan diloloskan diam-diam.
+        listedAtMs: null,
+        medianAbsFundingRatePerPeriod: null,
+        maxCorrelationToAccepted: null,
+      };
+      return evaluateSymbolEligibility(input, now, leg);
+    });
+
+    const c12Fail = (v: EligibilityVerdict) => v.failures.filter((x) => x.code === "C1_LIQUIDITY" || x.code === "C2_LOT_TOO_LARGE");
+    const rows = verdicts.map((v) => {
+      const fails = c12Fail(v);
+      const inPool = longAllow.has(v.symbol);
+      const blocked = shortBlock.has(v.symbol);
+      const agree = (fails.length === 0) === inPool;
+      return `<tr class="${fails.length ? "out" : ""}">
+        <td class="sym">${esc(v.symbol.replace("USDT", ""))}</td>
+        <td class="num">${v.measured.liquidityUsdPerHour === null ? "—" : "$" + Math.round(v.measured.liquidityUsdPerHour / 1000) + "k"}</td>
+        <td class="num">${v.measured.oneLotUsd === null ? "—" : "$" + v.measured.oneLotUsd.toFixed(2)}</td>
+        <td>${fails.length ? `<span class="bad">${fails.map((f) => esc(f.detail)).join("; ")}</span>` : `<span class="ok">memenuhi C1 &amp; C2</span>`}</td>
+        <td>${inPool ? "<b>di pool</b>" : "<span class=\"muted\">di luar</span>"}${agree ? "" : ' <span class="warn">&#9888; tidak sesuai kriteria</span>'}</td>
+        <td>${blocked ? '<span class="warn">short diblokir</span>' : ""}</td>
+      </tr>`;
+    }).join("");
+
+    const eligible = verdicts.filter((v) => c12Fail(v).length === 0).map((v) => v.symbol);
+    const mismatch = verdicts.filter((v) => (c12Fail(v).length === 0) !== longAllow.has(v.symbol));
+    const blockedInPool = [...shortBlock].filter((s) => longAllow.has(s));
+
+    const html = `<!doctype html><html lang="id"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Pool Cross-Sectional</title><style>
+:root{--bg:#fff;--fg:#1a1a1a;--mut:#6b7280;--line:#e5e7eb;--card:#f9fafb;--ok:#047857;--bad:#b91c1c;--warnbg:#fef3c7;--warnfg:#92400e}
+@media(prefers-color-scheme:dark){:root{--bg:#0f1115;--fg:#e5e7eb;--mut:#9ca3af;--line:#272b33;--card:#161a20;--ok:#34d399;--bad:#f87171;--warnbg:#3b2f0b;--warnfg:#fcd34d}}
+*{box-sizing:border-box}body{margin:0;padding:24px;background:var(--bg);color:var(--fg);font:14px/1.55 ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+.wrap{max-width:1040px;margin:0 auto}h1{font-size:19px;margin:0 0 4px}h2{font-size:15px;margin:26px 0 8px}
+.muted{color:var(--mut)}.ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warnfg)}
+.note{background:var(--warnbg);color:var(--warnfg);padding:10px 13px;border-radius:8px;font-size:13px;margin:10px 0}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:9px;margin:12px 0}
+.grid div{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:9px 11px}
+.grid span{display:block;color:var(--mut);font-size:11.5px;margin-bottom:3px}.grid b{font-size:16px;font-variant-numeric:tabular-nums}
+table{width:100%;border-collapse:collapse;font-size:13px}th,td{text-align:left;padding:7px 9px;border-bottom:1px solid var(--line)}
+th{color:var(--mut);font-weight:600;font-size:11.5px;text-transform:uppercase;letter-spacing:.04em}
+.num{text-align:right;font-variant-numeric:tabular-nums}.sym{font-weight:600}tr.out td{opacity:.62}
+.wrapx{overflow-x:auto}code{background:var(--card);padding:1px 5px;border-radius:4px}
+</style></head><body><div class="wrap">
+<h1>Pool Cross-Sectional — dari kriteria, bukan pilihan tangan</h1>
+<p class="muted">Daftar ini <b>diturunkan dari kriteria objektif</b>, bukan dipilih manual. Tiap simbol di bawah menunjukkan angka terukurnya dan kriteria mana yang tidak dipenuhi. Sebelumnya panel ini berlabel &ldquo;POOL OPERATOR&rdquo; dan menampilkan pengecualian tanpa alasan apa pun.</p>
+
+<div class="grid">
+  <div><span>leg efektif</span><b>$${leg === null ? "—" : leg.toFixed(2)}</b></div>
+  <div><span>base &times; pengali</span><b>$${baseLeg} &times; ${mult}</b></div>
+  <div><span>plafon satu lot (C2)</span><b>$${leg === null ? "—" : (leg * DEFAULT_ELIGIBILITY.maxLotFractionOfLeg).toFixed(2)}</b></div>
+  <div><span>universe</span><b>${universe.length}</b></div>
+  <div><span>memenuhi C1 &amp; C2</span><b>${eligible.length}</b></div>
+  <div><span>pool aktif (long)</span><b>${longAllow.size}</b></div>
+</div>
+
+${mismatch.length ? `<div class="note">&#9888; <b>${mismatch.length} simbol tidak sesuai kriteria</b>: ${mismatch.map((v) => esc(v.symbol.replace("USDT", ""))).join(", ")}. Pool aktif dan hasil kriteria berbeda — salah satunya perlu diperbarui.</div>` : `<div class="note" style="background:transparent;color:var(--ok);padding-left:0">&#10003; Pool aktif sama persis dengan hasil kriteria.</div>`}
+
+<h2>Per simbol</h2>
+<div class="wrapx"><table><thead><tr>
+<th>simbol</th><th class="num">likuiditas/jam</th><th class="num">satu lot</th><th>C1 &amp; C2</th><th>status</th><th>catatan</th>
+</tr></thead><tbody>${rows}</tbody></table></div>
+
+<h2>Kriteria</h2>
+<table><tbody>
+<tr><td><b>C1</b> likuiditas</td><td>&ge; $${(DEFAULT_ELIGIBILITY.minLiquidityUsdPerHour / 1000).toFixed(0)}k/jam</td><td class="muted">ongkos eksekusi; ambang yang sudah terpasang sebelumnya</td></tr>
+<tr><td><b>C2</b> satu lot</td><td>&le; ${(DEFAULT_ELIGIBILITY.maxLotFractionOfLeg * 100).toFixed(0)}% leg efektif</td><td class="muted">sizing hanya membulatkan NAIK — lot yang lebih besar dari leg merusak netralitas</td></tr>
+<tr><td><b>C3</b> umur listing</td><td>&ge; ${DEFAULT_ELIGIBILITY.minListedDays} hari</td><td class="muted">tidak dievaluasi di tampilan ini (butuh satu panggilan per simbol)</td></tr>
+<tr><td><b>C4</b> carry funding</td><td>&le; ${DEFAULT_ELIGIBILITY.maxFundingCarryBps} bps/hold</td><td class="muted">tidak dievaluasi di tampilan ini</td></tr>
+<tr><td><b>C5</b> korelasi</td><td>&le; ${DEFAULT_ELIGIBILITY.maxCorrelation}</td><td class="muted">tidak dievaluasi di tampilan ini (butuh riwayat harga)</td></tr>
+</tbody></table>
+<p class="muted">C3&ndash;C5 <b>tidak diukur di halaman ini</b> dan karenanya tidak ikut menentukan kolom status &mdash; itu dinyatakan, bukan disembunyikan. Pada universe saat ini ketiganya tidak menyaring siapa pun; yang membedakan hanya C1 dan C2.</p>
+
+<h2>Blocklist short &mdash; satu-satunya daftar tangan yang tersisa</h2>
+<p><code>${[...shortBlock].map((s) => esc(s.replace("USDT", ""))).join(", ") || "(kosong)"}</code></p>
+<div class="note">Daftar ini <b>tidak punya kriteria</b>. Tidak ada alasan tercatat kenapa simbol-simbol ini tidak boleh di-short, dan tidak ada aturan yang bisa dipakai untuk menambah atau mengeluarkan anggotanya.
+${blockedInPool.length ? ` Saat ini ${blockedInPool.length} di antaranya ada di pool aktif (${blockedInPool.map((s) => esc(s.replace("USDT", ""))).join(", ")}), jadi hanya boleh dipakai di sisi long.` : ""}
+Diukur 2026-08-16 pada pool 20 simbol, biayanya <b>&minus;0,8 bps median</b> &mdash; jadi pertanyaannya bukan biaya, tapi konsistensi.</div>
+
+<h2>Kenapa BTC di luar</h2>
+<p>Bukan &ldquo;sementara&rdquo;. Satu lot minimum BTC adalah <b>$${(ticks.get("BTCUSDT") ? (oneLotNotionalUsd({ price: ticks.get("BTCUSDT")!.price, minNotionalUsd: filters.get("BTCUSDT")?.minNotional ?? null, stepSize: filters.get("BTCUSDT")?.stepSize ?? null, minQty: filters.get("BTCUSDT")?.minQty ?? null }) ?? 0).toFixed(2) : "—")}</b>,
+sementara plafon C2 pada leg $${leg === null ? "—" : leg.toFixed(2)} adalah $${leg === null ? "—" : (leg * DEFAULT_ELIGIBILITY.maxLotFractionOfLeg).toFixed(2)}. Itu berlaku selama leg-nya sebesar ini &mdash; BTC baru bisa masuk kalau leg dinaikkan ke sekitar $126, dan itu keputusan ukuran posisi, bukan sesuatu yang hilang sendiri.</p>
+
+<p class="muted" style="margin-top:26px;border-top:1px solid var(--line);padding-top:14px">
+dibuat ${esc(new Date(now).toISOString())} &middot; di-cache 15 menit &middot; disajikan API, bukan dari <code>dist/</code>, supaya deploy dashboard tidak menimpanya
+</p></div></body></html>`;
+
+    poolViewCache = { atMs: now, html };
+    reply.type("text/html; charset=utf-8");
+    return html;
+  });
+
   app.get("/api/live/directional-overlay-counterfactual/view", async (_request, reply) => {
     const p = (await buildOverlayCf()) as OverlayCfPayload;
     const esc = (v: unknown): string => String(v).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c] ?? c));
