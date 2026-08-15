@@ -28,7 +28,7 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 
-import type { PendingDirectionRow, PendingEntryRow } from "./four-brain-outcome-ledger.js";
+import type { FourBrainOutcomeCanonicalRegimeFamily, PendingDirectionRow, PendingEntryRow } from "./four-brain-outcome-ledger.js";
 
 const SNAPSHOT_VERSION = 1;
 
@@ -57,6 +57,28 @@ const optNum = (v: unknown): number | null | undefined => (v === null || v === u
 const HORIZONS = new Set(["SCALP", "INTRADAY", "SWING"]);
 const DIRECTION_ACTIONS = new Set(["LONG", "SHORT", "FLAT", "BOTH"]);
 const ENTRY_SIDES = new Set(["LONG", "SHORT"]);
+const CANONICAL_REGIMES = new Set(["BULLISH", "BEARISH", "MIXED", "UNKNOWN"]);
+
+function optionalLineage(r: Record<string, unknown>): {
+  canonicalRegimeFamily?: FourBrainOutcomeCanonicalRegimeFamily | null;
+  scannerRegime?: string | null;
+  marketContextSnapshotId?: string | null;
+} {
+  const out: {
+    canonicalRegimeFamily?: FourBrainOutcomeCanonicalRegimeFamily | null;
+    scannerRegime?: string | null;
+    marketContextSnapshotId?: string | null;
+  } = {};
+  if ("canonicalRegimeFamily" in r) {
+    const value = r.canonicalRegimeFamily;
+    out.canonicalRegimeFamily = value === null ? null : (str(value) && CANONICAL_REGIMES.has(str(value)!)
+      ? str(value)! as FourBrainOutcomeCanonicalRegimeFamily
+      : null);
+  }
+  if ("scannerRegime" in r) out.scannerRegime = str(r.scannerRegime);
+  if ("marketContextSnapshotId" in r) out.marketContextSnapshotId = str(r.marketContextSnapshotId);
+  return out;
+}
 
 function parseDirectionRow(v: unknown): PendingDirectionRow | null {
   if (!v || typeof v !== "object") return null;
@@ -76,6 +98,7 @@ function parseDirectionRow(v: unknown): PendingDirectionRow | null {
     horizon: horizon as PendingDirectionRow["horizon"],
     action: action as PendingDirectionRow["action"],
     expectedDirectionalR,
+    ...optionalLineage(r),
   };
 }
 
@@ -103,6 +126,7 @@ function parseEntryRow(v: unknown): PendingEntryRow | null {
     targetEntry,
     initialStopPrice,
     expectedNetR,
+    ...optionalLineage(r),
   };
   // signalId is optional in the row type (absent on legacy journal rows) — preserve the distinction
   // between "absent" and "explicitly null", because Tier 1 identity matching reads it.

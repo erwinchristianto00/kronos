@@ -12,6 +12,10 @@
  * as a documented gap — supported, not silently excluded.
  */
 import { CORTEX_LANE_ROSTER, type CortexLaneDirection } from "./cortex-live-gather.js";
+import {
+  CROSS_SECTIONAL_DIRECTIONAL_LONG_LANE_ID,
+  CROSS_SECTIONAL_DIRECTIONAL_SHORT_LANE_ID,
+} from "./cross-sectional-directional-regime.js";
 
 export const PROFIT_CORE_SHORT_TRAIL_LANE_ID = "PROFIT_CORE_SHORT_TRAIL";
 
@@ -46,6 +50,22 @@ export const FOUR_BRAIN_LANE_SUPPORT: readonly FourBrainLaneSupport[] = [
     exitPositionsWired: true,
     note: ENTRY_SIGNAL_BUILDER_LANES.has(e.laneId) ? undefined : "entry via preset/basket pipeline (no single-symbol signal builder)",
   })),
+  // Testnet directional cross-sectional is a real single-symbol executor pair,
+  // not a neutral basket. Keep LONG/SHORT as independent Four-Brain cohorts.
+  {
+    laneId: CROSS_SECTIONAL_DIRECTIONAL_LONG_LANE_ID,
+    direction: "LONG",
+    entrySignalsWired: true,
+    exitPositionsWired: true,
+    note: "testnet directional sectional long cohort",
+  },
+  {
+    laneId: CROSS_SECTIONAL_DIRECTIONAL_SHORT_LANE_ID,
+    direction: "SHORT",
+    entrySignalsWired: true,
+    exitPositionsWired: true,
+    note: "testnet directional sectional short cohort",
+  },
   {
     laneId: PROFIT_CORE_SHORT_TRAIL_LANE_ID,
     direction: "SHORT",

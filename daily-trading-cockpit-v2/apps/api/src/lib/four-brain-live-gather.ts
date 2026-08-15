@@ -14,7 +14,7 @@
  *   • unknown lanes are surfaced (not silently dropped) and duplicate identities are REJECTED from the tick
  *     and recorded.
  */
-import { classifySource, type DirectionHorizon, type MarketBias, type SourceStatus } from "./four-brain-types.js";
+import { classifySource, type DirectionHorizon, type FourBrainExecutionReinforcement, type MarketBias, type MarketStateAuthority, type SourceStatus } from "./four-brain-types.js";
 import type { MarketSafetyEvent, MarketStateInput } from "./market-state-brain.js";
 import type { DirectionInput } from "./direction-brain.js";
 import type { EntryInput } from "./entry-brain.js";
@@ -181,6 +181,8 @@ export interface ExecContext {
   marketContext: MarketContextLineage;
   laneEligibleIncumbent: boolean;
   directionHurdlePassed?: boolean;
+  /** Exact Tier-1 testnet-fill evidence, advisory-only and never an execution authority. */
+  executionReinforcement?: FourBrainExecutionReinforcement | null;
   killLatched: boolean;
   riskBlockedReason: string | null; // edge veto / concentration / daily-loss — incumbent rail block
   hardExitTriggered?: boolean;
@@ -292,6 +294,7 @@ export interface FourBrainGatherInput {
   nowMs: number;
   supportedLanes: ReadonlySet<string>;
   marketState: MarketStateRawReadings;
+  marketStateAuthority?: MarketStateAuthority | null;
   directions: DirectionRawReadings[];
   entryCandidatesRaw: EntryCandidateRaw[];
   exitCandidatesRaw: ExitCandidateRaw[];
@@ -312,6 +315,7 @@ export interface FourBrainGatheredTick {
   instanceId: string;
   asOfMs: number;
   marketStateInput: MarketStateInput;
+  marketStateAuthority: MarketStateAuthority | null;
   marketReadings: SourceReading[];
   directionInputs: { horizon: DirectionHorizon; input: DirectionInput; readings: SourceReading[] }[];
   entryCandidates: AssembledEntryCandidate[];
@@ -486,6 +490,7 @@ export function assembleFourBrainTick(input: FourBrainGatherInput): FourBrainGat
     instanceId: input.instanceId,
     asOfMs: nowMs,
     marketStateInput,
+    marketStateAuthority: input.marketStateAuthority ?? null,
     marketReadings,
     directionInputs,
     entryCandidates,

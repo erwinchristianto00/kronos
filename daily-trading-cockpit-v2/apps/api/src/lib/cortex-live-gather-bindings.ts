@@ -31,6 +31,7 @@ import {
 } from "./composite-estimator-edge.js";
 import {
   buildCrossSectionalReport,
+  getCrossSectionalReportSinceMs,
   getCrossSectionalStore,
   type CrossSectionalVariant,
 } from "./cross-sectional-edge.js";
@@ -190,7 +191,10 @@ function liveXsecReport(laneId: string, dataDir: string, nowMs: number): CortexX
   const variant = XSEC_VARIANT_BY_LANE_ID[laneId];
   if (!variant) return null;
   try {
-    const r = buildCrossSectionalReport(getCrossSectionalStore(dataDir), nowMs, { variant });
+    const r = buildCrossSectionalReport(getCrossSectionalStore(dataDir), nowMs, {
+      variant,
+      sinceMs: getCrossSectionalReportSinceMs(),
+    });
     // r.netAvgReturn is mean(nets) and FABRICATES 0 on an empty set — gate on r.closed so a no-basket
     // variant reports null, not a fake 0 (the pure gather's xsecReturnToR also nulls at n===0, but we
     // null the numerator here too so the journal never records a phantom return).

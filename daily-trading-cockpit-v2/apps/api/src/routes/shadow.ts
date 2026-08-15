@@ -133,7 +133,6 @@ import {
   type AllocatorLaneState,
 } from "../lib/paper-opportunity-allocator.js";
 import { getLatestScanCandidates } from "../lib/latest-scan-candidates-cache.js";
-import { cortexDecisionSnapshotsForScan } from "../lib/cortex-decision-snapshot.js";
 import {
   getLatestScanTimingDiagnostics,
   recordAdmissionTimingTrace,
@@ -237,6 +236,7 @@ import {
   getExitBrainShadowStore,
   resolvedTradesFromShadowPositions,
   runExitBrainShadowCycleGuarded,
+  type ExitBrainShadowReport,
 } from "../lib/exit-brain-shadow.js";
 import { getPositionPathRecorder, resolvedTradesFromRecordedPaths } from "../lib/position-path-recorder.js";
 import {
@@ -284,14 +284,6 @@ import {
   buildFundingCarryCrowdingV2Report,
   getFundingCarryCrowdingV2Store,
 } from "../lib/funding-carry-crowding-v2.js";
-import { buildEdgeDiggerReport } from "../lib/edge-digger.js";
-import {
-  buildLiveEdgeDiggerReportFromStore,
-  getLiveEdgeDiggerStore,
-  runLiveEdgeDiggerCycleGuarded,
-} from "../lib/live-edge-digger-cycle.js";
-import { resolveCanonicalMarketRegimeUniverse } from "../lib/canonical-market-regime-universe.js";
-import { getCanonicalMarketRegimeSnapshot } from "../lib/canonical-market-regime-engine.js";
 import {
   runMetaLabelCycleGuarded,
   buildMetaLabelReport,
@@ -377,6 +369,7 @@ import {
 } from "../lib/current-guard-variant-matrix.js";
 import {
   getCrossSectionalStore,
+  getCrossSectionalReportSinceMs,
   runCrossSectionalCycleGuarded,
   buildCrossSectionalReport,
   getCrossSectionalFilteredConfig,
@@ -384,9 +377,12 @@ import {
   isCrossSectionalEdgeDisabled,
   CROSS_SECTIONAL_INTERVAL,
   CROSS_SECTIONAL_MOMENTUM_BARS,
+  CROSS_SECTIONAL_LIQUIDITY_FLOOR_USD_PER_HOUR,
+  CROSS_SECTIONAL_LIQUIDITY_LOOKBACK_BARS,
   CROSS_SECTIONAL_UNIVERSE,
   buildCrossSectionalRegimeContext,
   deriveAdaptiveSymbolFilters,
+  getCrossSectionalFilteredExecutionFilters,
   CROSS_SECTIONAL_TREND_SIGNAL,
   CROSS_SECTIONAL_MIXED_SIGNAL,
 } from "../lib/cross-sectional-edge.js";
@@ -428,18 +424,19 @@ import {
   buildPriceImpactEfficiencyReport,
 } from "../lib/price-impact-efficiency.js";
 import type { FourBrainMetricsSummary } from "../lib/four-brain-metrics.js";
+import type { FourBrainActualFillBindingStoreStatus } from "../lib/four-brain-actual-fill-binding.js";
+import type { FourBrainExecutionReinforcementStatus } from "../lib/four-brain-execution-reinforcement.js";
 import type { DirectionEntryOutcomeReport } from "../lib/direction-entry-outcome-store.js";
 import { judgeFourBrainReadiness, rollUpFourBrainReadiness, exitBrainReadinessFromReport } from "../lib/four-brain-readiness.js";
-// Cross-caller mutual exclusion for Surface B (paper admission/resolution) of the 2026-08
-// concurrency remediation — see the module doc comment for the join-semantics contract.
-import { runExclusiveForStore } from "../lib/store-mutation-single-flight.js";
+import { buildFourBrainLearningPipelineHealth } from "../lib/four-brain-learning-pipeline-health.js";
 
 // Fail-open shape for /api/shadow/four-brain's `health` field on any instance where the four-brain
 // metrics aggregator was never constructed (mode off, test harness, etc.) — every count is honestly 0,
 // never fabricated, and the shape always matches FourBrainMetricsSummary so the frontend never has to
 // special-case a missing field.
 const EMPTY_FOUR_BRAIN_HEALTH: FourBrainMetricsSummary = {
-  ticks: { attempted: 0, completed: 0, skippedSingleFlight: 0, gatherErrors: 0, exceptions: 0, journalErrors: 0, brainErrors: 0, invariantFailures: 0 },
+  ticks: { attempted: 0, completed: 0, skippedSingleFlight: 0, gatherErrors: 0, exceptions: 0, wiringErrors: 0, journalErrors: 0, brainErrors: 0, invariantFailures: 0 },
+  heartbeat: { lastAttemptAtMs: null, lastCompletedAtMs: null, lastFailureAtMs: null, lastCycleReason: null, lastFailureReason: null },
   decisions: { total: 0, duplicateDecisionIds: 0, unknownLanes: 0, duplicateIdentities: 0 },
   coverage: { lastLaneCoverage: 0, maxLaneCoverage: 0, lastPositionCoverage: 0, maxPositionCoverage: 0 },
   sourceQuality: {},
@@ -491,6 +488,8 @@ export async function registerShadowRoutes(
     /** Lazy getter for the live-execution engine (created after this registration). Used READ-ONLY
      *  (sync getStatus, no I/O) to compute the order-reconciliation readiness gate. */
     liveEngineGetter?: () => { getStatus: () => unknown } | null;
+    /** Testnet only: prevents a newly ranked FILTERED basket from reusing a live losing leg. */
+    crossSectionalReentryBlocksGetter?: () => Promise<{ longBlocklist: string[]; shortBlocklist: string[] }>;
     /** Lazy getter for the four-brain shadow tick's metrics aggregator (created after this
      *  registration, inside app.ts's `if (!isTest)` block, on instances that even construct it).
      *  null on any instance where four-brain shadow mode has never enabled (fail-open — see the
@@ -505,6 +504,12 @@ export async function registerShadowRoutes(
      *  reconciler's own 3-layer gate (directionEntryReconcilerActive) is not active — fail-open, exactly
      *  like fourBrainMetricsGetter above; never a 500. */
     directionEntryOutcomeReportGetter?: () => DirectionEntryOutcomeReport | null;
+    /** Testnet pilot audit only. No route consumer can mutate the bridge or execution state. */
+    fourBrainBridgeGetter?: () => unknown;
+    /** Exact Four-Brain decision -> executor fill lifecycle counts for the focused testnet cohort. */
+    fourBrainActualFillBindingStatusGetter?: () => FourBrainActualFillBindingStoreStatus | null;
+    /** Read-only proof that persisted exact-fill outcomes are visible to shadow ranking. */
+    fourBrainExecutionReinforcementStatusGetter?: () => FourBrainExecutionReinforcementStatus | null;
   } = {},
 ): Promise<void> {
   const overlayStore = new JsonExternalRotationOverlayStore(opts.externalOverlayDataDir ?? "data");
@@ -915,8 +920,8 @@ export async function registerShadowRoutes(
     return {
       ok: true,
       ...buildNarrativeTiltReport({
-        measuredObservations: getCrossSectionalStore().all,
-        executedBaskets: executorStore.getState().baskets,
+        measuredObservations: getCrossSectionalStore().reportable,
+        executedBaskets: executorStore.getReportableBaskets(),
         variant: q.variant ?? "FILTERED",
         nowIso: new Date().toISOString(),
       }),
@@ -926,6 +931,12 @@ export async function registerShadowRoutes(
   // Cross-sectional market-neutral measurement lane — report + open/closed baskets (report-only).
   app.get("/api/shadow/cross-sectional-report", async () => {
     const store = getCrossSectionalStore();
+    // Testnet can deliberately start a fresh evidence era without deleting the older store. The
+    // cutoff is configured per deployment via CROSS_SECTIONAL_REPORT_START_AT; absent/invalid means
+    // the historical report behavior remains unchanged (important for mainnet and local research).
+    const reportSinceMs = getCrossSectionalReportSinceMs();
+    const reportStartAt = reportSinceMs === undefined ? null : new Date(reportSinceMs).toISOString();
+    const inReportEra = (o: { openedAtMs: number }): boolean => reportSinceMs === undefined || o.openedAtMs >= reportSinceMs;
     const slim = (o: {
       openedAt: string;
       resolvedAt: string | null;
@@ -965,39 +976,61 @@ export async function registerShadowRoutes(
       longWeights: o.longLeg.map((l) => ({ symbol: l.symbol, weight: l.weight ?? null })),
       shortWeights: o.shortLeg.map((l) => ({ symbol: l.symbol, weight: l.weight ?? null })),
     });
+    // The active horizon is MOM36. Keep the report era clean when the deployment changes the
+    // momentum lookback: older MOM24 observations may still be in the retained measurement store,
+    // but they must not inflate the current RAW/FILTERED horizon counts or basket lists.
+    const rawSignal = `MOM${CROSS_SECTIONAL_MOMENTUM_BARS}`;
     const filteredSignal = getCrossSectionalFilteredConfig().signal;
-    const raw = store.all.filter((o) => o.signal !== filteredSignal && o.signal !== CROSS_SECTIONAL_TREND_SIGNAL && o.signal !== CROSS_SECTIONAL_MIXED_SIGNAL);
-    const filtered = store.all.filter((o) => o.signal === getCrossSectionalFilteredConfig().signal);
-    const trend = store.all.filter((o) => o.signal === CROSS_SECTIONAL_TREND_SIGNAL);
-    const mixed = store.all.filter((o) => o.signal === CROSS_SECTIONAL_MIXED_SIGNAL);
+    const raw = store.reportable.filter((o) => o.signal === rawSignal);
+    const filtered = store.reportable.filter((o) => o.signal === filteredSignal);
+    const trend = store.reportable.filter((o) => o.signal === CROSS_SECTIONAL_TREND_SIGNAL);
+    const mixed = store.reportable.filter((o) => o.signal === CROSS_SECTIONAL_MIXED_SIGNAL);
     return {
-      report: buildCrossSectionalReport(store),
-      filteredReport: buildCrossSectionalReport(store, Date.now(), { variant: "FILTERED" }),
-      trendReport: buildCrossSectionalReport(store, Date.now(), { variant: "TREND_BETA_VOL" }),
-      mixedReport: buildCrossSectionalReport(store, Date.now(), { variant: "MIXED_MEAN_REVERSION" }),
-      // filteredConfig shows the EFFECTIVE (auto-updated) lists — what new FILTERED
-      // baskets actually use — so /research always displays the live white/blacklists.
+      reportStartAt,
+      report: buildCrossSectionalReport(store, Date.now(), { signal: rawSignal, sinceMs: reportSinceMs }),
+      filteredReport: buildCrossSectionalReport(store, Date.now(), { signal: filteredSignal, sinceMs: reportSinceMs }),
+      trendReport: buildCrossSectionalReport(store, Date.now(), { variant: "TREND_BETA_VOL", sinceMs: reportSinceMs }),
+      mixedReport: buildCrossSectionalReport(store, Date.now(), { variant: "MIXED_MEAN_REVERSION", sinceMs: reportSinceMs }),
+      // Keep operator configuration distinct from the historical adaptive assessment.  The latter
+      // can contain closes from a previous momentum/lookback era and is therefore evidence, not
+      // necessarily the filter that this testnet executor is using today.
       filteredConfig: (() => {
-        const adaptive = deriveAdaptiveSymbolFilters(store);
+        const configured = getCrossSectionalFilteredConfig();
+        const execution = getCrossSectionalFilteredExecutionFilters(store);
+        const executionUniverse = new Set(CROSS_SECTIONAL_UNIVERSE);
+        // The testnet deployment can narrow CROSS_SECTIONAL_UNIVERSE for an exchange constraint
+        // (for example BTC's minimum notional). Reflect that same universe in the report so an
+        // allowlist entry is never presented as executable when the runner cannot select it.
+        const executable = (symbols: readonly string[]) => symbols.filter((symbol) => executionUniverse.has(symbol));
+        const configuredSymbols = new Set([...configured.longAllowlist, ...configured.shortAllowlist]);
         return {
-          ...getCrossSectionalFilteredConfig(),
-          longAllowlist: adaptive.longAllowlist,
-          shortAllowlist: adaptive.shortAllowlist,
-          shortBlocklist: adaptive.shortBlocklist,
+          ...configured,
+          executionUniverse: [...CROSS_SECTIONAL_UNIVERSE],
+          executionExcludedSymbols: [...configuredSymbols].filter((symbol) => !executionUniverse.has(symbol)),
+          executionLongAllowlist: executable(execution.longAllowlist),
+          executionShortAllowlist: executable(execution.shortAllowlist),
+          executionShortBlocklist: execution.shortBlocklist,
+          adaptiveDemotionActive: !execution.adaptiveDisabled,
         };
       })(),
       adaptiveConfig: getCrossSectionalAdaptiveConfig(),
-      // Auto-updating symbol filters ACTUALLY used to mint new FILTERED baskets
-      // (env lists = prior, measured per-leg returns promote/demote each cycle) + provenance.
-      adaptiveSymbolFilters: deriveAdaptiveSymbolFilters(store),
-      openBaskets: raw.filter((o) => o.status === "OPEN").map(slim),
-      filteredOpenBaskets: filtered.filter((o) => o.status === "OPEN").map(slim),
-      trendOpenBaskets: trend.filter((o) => o.status === "OPEN").map(slim),
-      mixedOpenBaskets: mixed.filter((o) => o.status === "OPEN").map(slim),
-      recentClosed: raw.filter((o) => o.status === "CLOSED").slice(-15).map(slim),
-      filteredRecentClosed: filtered.filter((o) => o.status === "CLOSED").slice(-15).map(slim),
-      trendRecentClosed: trend.filter((o) => o.status === "CLOSED").slice(-15).map(slim),
-      mixedRecentClosed: mixed.filter((o) => o.status === "CLOSED").slice(-15).map(slim),
+      // Retained for audit only.  Do not label this the active FILTERED pool without checking
+      // filteredConfig.adaptiveDemotionActive above.
+      adaptiveSymbolFilters: (() => {
+        const adaptive = deriveAdaptiveSymbolFilters(store);
+        return {
+          ...adaptive,
+          executionUsesThis: !getCrossSectionalFilteredExecutionFilters(store).adaptiveDisabled,
+        };
+      })(),
+      openBaskets: raw.filter((o) => inReportEra(o) && o.status === "OPEN").map(slim),
+      filteredOpenBaskets: filtered.filter((o) => inReportEra(o) && o.status === "OPEN").map(slim),
+      trendOpenBaskets: trend.filter((o) => inReportEra(o) && o.status === "OPEN").map(slim),
+      mixedOpenBaskets: mixed.filter((o) => inReportEra(o) && o.status === "OPEN").map(slim),
+      recentClosed: raw.filter((o) => inReportEra(o) && o.status === "CLOSED").slice(-15).map(slim),
+      filteredRecentClosed: filtered.filter((o) => inReportEra(o) && o.status === "CLOSED").slice(-15).map(slim),
+      trendRecentClosed: trend.filter((o) => inReportEra(o) && o.status === "CLOSED").slice(-15).map(slim),
+      mixedRecentClosed: mixed.filter((o) => inReportEra(o) && o.status === "CLOSED").slice(-15).map(slim),
     };
   });
 
@@ -1730,7 +1763,44 @@ export async function registerShadowRoutes(
       enabled: health !== null,
       health: health ?? EMPTY_FOUR_BRAIN_HEALTH,
       recentDecisions,
+      bridge: opts.fourBrainBridgeGetter?.() ?? null,
+      actualFillBindings: opts.fourBrainActualFillBindingStatusGetter?.() ?? null,
     };
+  });
+
+  // End-to-end observer health: a single "0 errors" counter cannot prove collection → decision →
+  // attribution → outcome → feedback actually advances.  This route combines only existing,
+  // report-only stores and exposes BLOCKED vs normal WAITING explicitly.  Getter failures become a
+  // visible unavailable stage, never a 500 or a fabricated green check.
+  app.get("/api/shadow/learning-pipeline-health", async () => {
+    const safe = <T>(getter: (() => T | null | undefined) | undefined): T | null => {
+      try {
+        return getter?.() ?? null;
+      } catch {
+        return null;
+      }
+    };
+    const health = safe(opts.fourBrainMetricsGetter);
+    const recent = safe(opts.fourBrainRecentDecisionsGetter) ?? [];
+    const outcomeReport = safe(opts.directionEntryOutcomeReportGetter);
+    const actualFillBindings = safe(opts.fourBrainActualFillBindingStatusGetter);
+    const reinforcement = safe(opts.fourBrainExecutionReinforcementStatusGetter);
+    let exitReport: ExitBrainShadowReport | null = null;
+    try {
+      exitReport = getExitBrainShadowStore().buildReport();
+    } catch {
+      exitReport = null;
+    }
+    return buildFourBrainLearningPipelineHealth({
+      nowMs: Date.now(),
+      enabled: health !== null,
+      health,
+      recentDecisions: recent,
+      outcomeReport,
+      actualFillBindings,
+      exitReport,
+      reinforcement,
+    });
   });
 
   // Direction + Entry Brain counterfactual outcome report (2026-07-23) — report-only, two independent
@@ -1747,9 +1817,10 @@ export async function registerShadowRoutes(
     // Every input was already computed here; only the judgement was missing. Purely additive.
     //
     // measuredBasis is the load-bearing field. DIRECTION is REAL: its outcome is whether the price
-    // actually moved the way it called, and that move happened. ENTRY Tier 2 is SIMULATED: a forward
-    // candle walk of a trade that was never placed — it can never qualify the brain, which is why
-    // Tier 1 (real fills, currently 0) is read separately and Tier 2 is judged on its own line.
+    // actually moved the way it called, and that move happened. ENTRY readiness is stricter: only a
+    // DIRECT, valid ENTER_NOW decision with its exact confirmed exchange fill can qualify. The older
+    // reconciler's Tier 1 rows are real matched outcomes, but may be WAIT/SKIP observations of an
+    // executor-owned fill; they remain audit-only and must never inflate Entry readiness.
     const readiness = (() => {
       if (!report) return null;
       try {
@@ -1767,15 +1838,19 @@ export async function registerShadowRoutes(
               }),
             ),
         );
-        const cov = (report.entry?.coverage ?? {}) as Record<string, unknown>;
-        const tier1N = typeof cov.resolvedRealMatch === "number" ? cov.resolvedRealMatch : 0;
+        const directBindings = opts.fourBrainActualFillBindingStatusGetter?.() ?? null;
+        const directTier1N = typeof directBindings?.measured === "number" && Number.isFinite(directBindings.measured)
+          ? directBindings.measured
+          : 0;
         const entry = [
           judgeFourBrainReadiness("ENTRY", {
-            scope: "TIER1/ENTER_NOW (real fills)",
-            effectiveN: tier1N,
+            scope: "DIRECT/ENTER_NOW exact-fill",
+            effectiveN: directTier1N,
             meanNetR: null,
             meanCalibrationGapR: null,
-            measuredBasis: tier1N > 0 ? "REAL" : "NONE",
+            // This is a real-fill cohort even while it has zero closes. Passing NONE would make
+            // the generic helper label an empty direct cohort as "simulated only", which is false.
+            measuredBasis: "REAL",
           }),
         ];
         return {
@@ -1882,25 +1957,6 @@ export async function registerShadowRoutes(
 
   app.get("/api/shadow/funding-carry-crowding-v2", async () => {
     return { generatedAt: new Date().toISOString(), ...buildFundingCarryCrowdingV2Report() };
-  });
-
-  // Edge Digger (2026-08-06) — READ-ONLY research pipeline over already-recorded forward evidence.
-  // It discovers nothing by itself: it evaluates exactly three FROZEN hypothesis families against
-  // the canonical gates and returns REJECT/CANDIDATE with the numeric reason for each. It writes
-  // nothing, enables nothing, and its maximum output is a recommendation an operator must act on.
-  // Every count it reports is BOTH raw rows and independent episodes, because raw rows have
-  // repeatedly flattered this book by an order of magnitude. See edge-digger.ts.
-  app.get("/api/shadow/edge-digger", async () => {
-    return buildEdgeDiggerReport();
-  });
-
-  // LIVE EDGE DISCOVERY (2026-08-06) — read-only view of the running discovery scanner: regime and
-  // universe, the full attempt registry (every rule ever enumerated, fired or not, so a claimed edge
-  // can be read against the real number of tests), raw rows vs INDEPENDENT episodes per candidate,
-  // DEV/OOS/recent progress, after-cost metrics with a clustered interval, and either the best
-  // candidate or NO_PROVEN_EDGE_YET. Reports only; enables nothing.
-  app.get("/api/shadow/live-edge-digger", async () => {
-    return buildLiveEdgeDiggerReportFromStore(getLiveEdgeDiggerStore());
   });
 
   // Meta-label per-signal gate report (2026-07-22) — report-only shadow scorer; nothing reads the
@@ -2720,36 +2776,6 @@ export async function registerShadowRoutes(
             now: Date.now(),
           }).catch(() => undefined);
         }
-        // LIVE EDGE DIGGER (2026-08-06): read-only discovery scanner. Each cycle it computes a
-        // decision-time feature snapshot over the canonical universe, evaluates a FIXED frontier of
-        // 12 interpretable rules, and records non-executable shadow positions for whichever rules the
-        // live market actually fires — then resolves earlier ones against later completed candles.
-        // It never places an order, never touches an executor or allocator, and never enables
-        // anything: its maximum output is a lane SPECIFICATION a human must act on. Rules are frozen
-        // before any outcome exists and are never selected or dropped by their results.
-        if (process.env.LIVE_EDGE_DIGGER_DISABLED !== "1") {
-          const ledClient = opts.binanceClient;
-          void runLiveEdgeDiggerCycleGuarded({
-            store: getLiveEdgeDiggerStore(),
-            now: Date.now(),
-            resolveUniverse: async () => {
-              const snapshot = await resolveCanonicalMarketRegimeUniverse({ nowMs: Date.now(), ctx: ledClient });
-              return { symbols: snapshot.symbols, perSymbolMeta: snapshot.perSymbolMeta };
-            },
-            getRegime: async () => {
-              const snapshot = getCanonicalMarketRegimeSnapshot("data", Date.now(), process.env);
-              return { regime: snapshot.projection, regimeFamily: snapshot.regimeFamily };
-            },
-            fetchCandles: (symbol, interval, limit) => ledClient.getCandles(symbol, interval, limit),
-            fetchFunding: async (symbol) => {
-              const premium = await ledClient.getFuturesPremiumIndex(symbol);
-              return {
-                fundingBps: typeof premium.fundingRate === "number" ? premium.fundingRate * 10_000 : null,
-                basisBps: typeof premium.basisPct === "number" ? premium.basisPct * 10_000 : null,
-              };
-            },
-          }).catch(() => undefined);
-        }
         // META-LABEL PER-SIGNAL GATE (2026-07-22): López-de-Prado-style secondary classifier that
         // scores EVERY new paper order (the signal stream) with p(win | features at signal time),
         // labels it when the paper resolver closes it, and reports the counterfactual "score ≥ τ"
@@ -2907,12 +2933,25 @@ export async function registerShadowRoutes(
             now: Date.now(),
             regimeContext: crossSectionalRegimeContext,
             axisScore,
+            filteredEntryBlocks: opts.crossSectionalReentryBlocksGetter,
             // spotSymbolForCandles: 1000x-multiplier futures contracts (1000PEPEUSDT, …) have no
             // spot pair under that name — fetch the bare spot symbol instead. Returns are price
             // RATIOS, so the 1000x scaling cancels; the rest of the pipeline (scoring, allowlist
             // matching, executor order symbol) keeps using the real futures name throughout.
+            // Depth is MAX(momentum lookback, liquidity lookback): the liquidity floor takes a
+            // MEDIAN over its own window, and a window deeper than what is fetched here silently
+            // starves it (2026-08-12 testnet incident — see liquidCrossSectionalSymbols). Only
+            // deepened when the floor is actually enabled, so the un-floored default fetches
+            // exactly what it always did.
             fetchCandles: async (symbol: string) =>
-              _xsc.getCandles(spotSymbolForCandles(symbol), CROSS_SECTIONAL_INTERVAL, CROSS_SECTIONAL_MOMENTUM_BARS + 5),
+              _xsc.getCandles(
+                spotSymbolForCandles(symbol),
+                CROSS_SECTIONAL_INTERVAL,
+                Math.max(
+                  CROSS_SECTIONAL_MOMENTUM_BARS + 5,
+                  CROSS_SECTIONAL_LIQUIDITY_FLOOR_USD_PER_HOUR > 0 ? CROSS_SECTIONAL_LIQUIDITY_LOOKBACK_BARS : 0,
+                ),
+              ),
           }).catch(() => undefined);
         }
       }
@@ -3007,19 +3046,8 @@ export async function registerShadowRoutes(
       let admissionTrace: AdmissionTimingTrace | null = null;
       if (request.query?.paper === "1" && opts.binanceClient && variantMatrixReport) {
         const _pbc = opts.binanceClient;
-        // Cross-caller mutual exclusion (Surface B, 2026-08 concurrency remediation): this
-        // whole block (admitPaperOpportunities followed by runPaperAdmissionAndResolution,
-        // both against the SAME paperStore singleton, plus the post-resolve reconciliation
-        // that reads/writes the same store) is one logical pass against one store, not
-        // independent operations safe to let a second, uncoordinated request interleave with.
-        // paperStore is fetched here, before the lock, so the singleton itself can serve as
-        // the lock's own key (see store-mutation-single-flight.ts). A joining caller's own
-        // local variables (allocatorReport, admissionTrace, paperReport, etc.) are populated
-        // from the joined promise's resolved value right after the lock below, not left at
-        // their pre-block defaults.
-        const paperStore = getPaperExecutionRouterStore();
-        const _paperBlockResult = await runExclusiveForStore(paperStore, async () => {
         try {
+          const paperStore = getPaperExecutionRouterStore();
           const _paperRouter = buildAdaptiveLaneRouterReport({
             generatedAt,
             regimeReport,
@@ -3145,7 +3173,6 @@ export async function registerShadowRoutes(
               candidates: cached?.candidates ?? [],
               scanBatchId: cached?.scanBatchId ?? "no-scan",
               scanFinishedAt: cached?.scanFinishedAt ?? paperNow,
-              cortexDecisionSnapshots: cached ? cortexDecisionSnapshotsForScan(cached.scanBatchId) : [],
               marketRegime: cached?.marketRegime ?? null,
               vmReport: variantMatrixReport,
               routerReport: _paperRouter,
@@ -3517,36 +3544,6 @@ export async function registerShadowRoutes(
             } catch { /* mixed router must never break the brief */ }
           } catch { /* reconciliation failure must never break the brief */ }
         } catch { /* paper=1 failure must never break the brief */ }
-        // Carries this pass's outcome back to whichever caller(s) are awaiting
-        // `_paperBlockResult` below — the original caller (whose closure variables above were
-        // just mutated in place) and any joiner alike, so both assign identical values.
-        return {
-          paperReport,
-          allocatorReport,
-          provenanceAudit,
-          shadowGateReport,
-          diagnosticShadowGateReport,
-          latencyDiagnostics,
-          mixedRegimeReport,
-          mixedBudgetForwardValidation,
-          admissionTrace,
-        };
-        });
-        // Populate this request's own local variables from the pass's result — required for a
-        // JOINING caller, whose own callback above never ran (it joined the in-flight promise
-        // instead), and harmless/idempotent for the caller that actually ran the pass (its
-        // closure variables already hold these exact values).
-        ({
-          paperReport,
-          allocatorReport,
-          provenanceAudit,
-          shadowGateReport,
-          diagnosticShadowGateReport,
-          latencyDiagnostics,
-          mixedRegimeReport,
-          mixedBudgetForwardValidation,
-          admissionTrace,
-        } = _paperBlockResult);
       }
       if (request.query?.headless === "1") {
         void reply.type("application/json");

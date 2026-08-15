@@ -5,11 +5,24 @@
  * these routes report { enabled:false } without touching anything. Keys are never
  * echoed by any endpoint.
  */
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
 import type { FastifyInstance } from "fastify";
 
 import type { LiveExecutionEngine } from "../lib/live-execution-engine.js";
-import { type CrossSectionalExecutor } from "../lib/cross-sectional-executor.js";
+import {
+  closedBasketRealizedBreakdown,
+  isCrossSectionalBasketReportingExcluded,
+  type CrossSectionalExecutor,
+} from "../lib/cross-sectional-executor.js";
 import type { SingleSymbolLaneExecutor } from "../lib/single-symbol-lane-executor.js";
+import {
+  CROSS_SECTIONAL_DIRECTIONAL_LONG_LANE_ID,
+  CROSS_SECTIONAL_DIRECTIONAL_SHORT_LANE_ID,
+  DIRECTIONAL_REGIME_MFE_PROFIT_LOCK_NET_RETURN,
+  DIRECTIONAL_REGIME_STATIC_TP_MAX_NET_RETURN,
+  type CrossSectionalDirectionalDecision,
+} from "../lib/cross-sectional-directional-regime.js";
 import {
   EXECUTABLE_INNOVATION_LANE_IDS,
   INNOVATION_POLICY_ONLY_IDS,
@@ -28,6 +41,7 @@ import { buildLiveWalletReconciliationReport, resolveDayUtc } from "../lib/walle
 import { getCortexRealAttributionStore } from "../lib/cortex-real-attribution.js";
 import { getFundingFeeRecorder, withFundingFeeRecording } from "../lib/funding-fee-recorder.js";
 import { sumExternalClosedFeesUsd, sumExternalRealizedPnlUsd } from "../lib/live-executor-wiring.js";
+import { getCrossSectionalReportSinceMs } from "../lib/cross-sectional-edge.js";
 import type { UnifiedTestnetOrchestrator } from "../lib/unified-testnet-orchestrator.js";
 import type { UnifiedTestnetProposalStore } from "../lib/unified-testnet-proposal-source.js";
 import {
@@ -53,6 +67,8 @@ const OPERATOR_ALLOCATION_LANE_IDS = [
   "CROSS_SECTIONAL_MARKET_NEUTRAL",
   "CROSS_SECTIONAL_TREND",
   "CROSS_SECTIONAL_MIXED",
+  CROSS_SECTIONAL_DIRECTIONAL_LONG_LANE_ID,
+  CROSS_SECTIONAL_DIRECTIONAL_SHORT_LANE_ID,
   PROFIT_CORE_SHORT_TRAIL_LANE_ID,
   SF_PAPER_LANE_ID,
   IM_PAPER_LANE_ID,
@@ -64,6 +80,186 @@ const OPERATOR_ALLOCATION_LANE_IDS = [
 ];
 
 type LiveAccountSnapshot = Awaited<ReturnType<LiveExecutionEngine["getAccountSnapshot"]>>;
+
+type CrossSectionalUnrealizedExtrema = {
+  grossHighUsd: number;
+  grossLowUsd: number;
+  afterEstimatedCloseCostHighUsd: number;
+  afterEstimatedCloseCostLowUsd: number;
+  firstRecordedAt: string;
+  lastRecordedAt: string;
+  closedAt?: string;
+  /** Keyed by side+symbol because a symbol may legally appear on both sides in different legs. */
+  legs?: Record<string, CrossSectionalLegUnrealizedExtrema>;
+};
+
+type CrossSectionalLegUnrealizedExtrema = {
+  grossHighUsd: number;
+  grossLowUsd: number;
+  afterEstimatedCloseCostHighUsd: number;
+  afterEstimatedCloseCostLowUsd: number;
+  /** Basket open time: the known zero-P&L baseline for this leg. */
+  entryAt: string;
+  firstRecordedAt: string;
+  lastRecordedAt: string;
+  closedAt?: string;
+};
+
+type CrossSectionalUnrealizedExtremaStore = {
+  version: 1;
+  baskets: Record<string, CrossSectionalUnrealizedExtrema>;
+};
+
+function crossSectionalUnrealizedExtremaFile(): string {
+  return resolve(process.cwd(), process.env.CROSS_SECTIONAL_UNREALIZED_EXTREMA_FILE ?? "data/cross-sectional-unrealized-extrema.json");
+}
+
+function readCrossSectionalUnrealizedExtremaStore(): CrossSectionalUnrealizedExtremaStore {
+  const file = crossSectionalUnrealizedExtremaFile();
+  try {
+    if (!existsSync(file)) return { version: 1, baskets: {} };
+    const parsed = JSON.parse(readFileSync(file, "utf8")) as Partial<CrossSectionalUnrealizedExtremaStore>;
+    return parsed.version === 1 && parsed.baskets && typeof parsed.baskets === "object"
+      ? { version: 1, baskets: parsed.baskets }
+      : { version: 1, baskets: {} };
+  } catch {
+    return { version: 1, baskets: {} };
+  }
+}
+
+function writeCrossSectionalUnrealizedExtremaStore(store: CrossSectionalUnrealizedExtremaStore): void {
+  const file = crossSectionalUnrealizedExtremaFile();
+  mkdirSync(dirname(file), { recursive: true });
+  const temp = `${file}.tmp`;
+  writeFileSync(temp, JSON.stringify(store, null, 2));
+  renameSync(temp, file);
+}
+
+/** Presentation-only baseline for a fresh testnet evaluation era. The carried
+ * XRP position remains visible and managed; only its pre-reset P&L is excluded
+ * from the new-era headline. */
+type TestnetPnlEra = {
+  version: 1;
+  startedAt: string;
+  carriedDirectionalUnrealizedUsd: number;
+  carriedSymbols: string[];
+};
+
+function testnetPnlEraFile(): string {
+  return resolve(process.cwd(), process.env.TESTNET_PNL_ERA_FILE ?? "data/testnet-pnl-era.json");
+}
+
+function readTestnetPnlEra(): TestnetPnlEra | null {
+  try {
+    const parsed = JSON.parse(readFileSync(testnetPnlEraFile(), "utf8")) as Partial<TestnetPnlEra>;
+    return parsed.version === 1 && typeof parsed.startedAt === "string" &&
+      typeof parsed.carriedDirectionalUnrealizedUsd === "number" && Array.isArray(parsed.carriedSymbols)
+      ? {
+        version: 1,
+        startedAt: parsed.startedAt,
+        carriedDirectionalUnrealizedUsd: parsed.carriedDirectionalUnrealizedUsd,
+        carriedSymbols: parsed.carriedSymbols.map(String),
+      }
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function recordCrossSectionalUnrealizedExtrema(
+  samples: Array<{
+    basketId: string;
+    grossUsd: number;
+    afterEstimatedCloseCostUsd: number;
+    legs: Array<{
+      symbol: string;
+      side: "LONG" | "SHORT";
+      grossUsd: number;
+      afterEstimatedCloseCostUsd: number;
+      /** Closing this leg immediately at its entry price already costs money. */
+      entryAfterEstimatedCloseCostUsd: number;
+      entryAt: string;
+    }>;
+  }>,
+  closed: Array<{ basketId: string; closedAt: string }>,
+  nowIso: string,
+): Record<string, CrossSectionalUnrealizedExtrema> {
+  const store = readCrossSectionalUnrealizedExtremaStore();
+  let changed = false;
+  for (const sample of samples) {
+    if (!Number.isFinite(sample.grossUsd) || !Number.isFinite(sample.afterEstimatedCloseCostUsd)) continue;
+    const previous = store.baskets[sample.basketId];
+    const basket = previous
+      ? {
+        ...previous,
+        grossHighUsd: Math.max(previous.grossHighUsd, sample.grossUsd),
+        grossLowUsd: Math.min(previous.grossLowUsd, sample.grossUsd),
+        afterEstimatedCloseCostHighUsd: Math.max(previous.afterEstimatedCloseCostHighUsd, sample.afterEstimatedCloseCostUsd),
+        afterEstimatedCloseCostLowUsd: Math.min(previous.afterEstimatedCloseCostLowUsd, sample.afterEstimatedCloseCostUsd),
+        lastRecordedAt: nowIso,
+      }
+      : {
+        grossHighUsd: sample.grossUsd,
+        grossLowUsd: sample.grossUsd,
+        afterEstimatedCloseCostHighUsd: sample.afterEstimatedCloseCostUsd,
+        afterEstimatedCloseCostLowUsd: sample.afterEstimatedCloseCostUsd,
+        firstRecordedAt: nowIso,
+        lastRecordedAt: nowIso,
+      };
+    const legs = { ...(previous?.legs ?? {}) };
+    for (const leg of sample.legs) {
+      if (!Number.isFinite(leg.grossUsd) || !Number.isFinite(leg.afterEstimatedCloseCostUsd)) continue;
+      const key = `${leg.side}:${leg.symbol}`;
+      const priorLeg = legs[key];
+      // Gross P&L is exactly zero at entry. Net-after-close-cost is NOT: closing immediately
+      // incurs the estimated close cost. Do not give the after-cost path a fictional zero baseline.
+      const entryAfterCost = Number.isFinite(leg.entryAfterEstimatedCloseCostUsd)
+        ? leg.entryAfterEstimatedCloseCostUsd
+        : leg.afterEstimatedCloseCostUsd;
+      // Older records incorrectly clamped the after-cost baseline to zero. A zero high/low on a
+      // leg with a negative entry-after-cost is therefore migrated to the honest entry baseline.
+      const previousAfterHigh = priorLeg?.afterEstimatedCloseCostHighUsd === 0 && entryAfterCost < 0
+        ? entryAfterCost
+        : priorLeg?.afterEstimatedCloseCostHighUsd;
+      const previousAfterLow = priorLeg?.afterEstimatedCloseCostLowUsd === 0 && entryAfterCost < 0
+        ? entryAfterCost
+        : priorLeg?.afterEstimatedCloseCostLowUsd;
+      legs[key] = priorLeg
+        ? {
+          ...priorLeg,
+          grossHighUsd: Math.max(priorLeg.grossHighUsd, leg.grossUsd),
+          grossLowUsd: Math.min(priorLeg.grossLowUsd, leg.grossUsd),
+          afterEstimatedCloseCostHighUsd: Math.max(previousAfterHigh ?? entryAfterCost, leg.afterEstimatedCloseCostUsd),
+          afterEstimatedCloseCostLowUsd: Math.min(previousAfterLow ?? entryAfterCost, leg.afterEstimatedCloseCostUsd),
+          lastRecordedAt: nowIso,
+        }
+        : {
+          grossHighUsd: Math.max(0, leg.grossUsd),
+          grossLowUsd: Math.min(0, leg.grossUsd),
+          afterEstimatedCloseCostHighUsd: Math.max(entryAfterCost, leg.afterEstimatedCloseCostUsd),
+          afterEstimatedCloseCostLowUsd: Math.min(entryAfterCost, leg.afterEstimatedCloseCostUsd),
+          entryAt: leg.entryAt,
+          firstRecordedAt: nowIso,
+          lastRecordedAt: nowIso,
+        };
+    }
+    store.baskets[sample.basketId] = { ...basket, legs };
+    changed = true;
+  }
+  for (const basket of closed) {
+    const previous = store.baskets[basket.basketId];
+    if (previous && previous.closedAt !== basket.closedAt) {
+      store.baskets[basket.basketId] = {
+        ...previous,
+        closedAt: basket.closedAt,
+        legs: Object.fromEntries(Object.entries(previous.legs ?? {}).map(([key, leg]) => [key, { ...leg, closedAt: basket.closedAt }])),
+      };
+      changed = true;
+    }
+  }
+  if (changed) writeCrossSectionalUnrealizedExtremaStore(store);
+  return store.baskets;
+}
 
 export function annotateCrossSectionalAccount(
   snapshot: LiveAccountSnapshot,
@@ -282,11 +478,35 @@ export type SingleSymbolLanePositionRow = {
   qty: number;
   entryPrice: number;
   stopPrice: number;
+  /** Frozen signal target when this lane opened with a fixed TP. Null means the
+   *  lane is managed by its dynamic exit policy, not that a target fetch failed. */
+  targetPrice: number | null;
+  /** Direction-aware distance from the current mark to a frozen fixed target. */
+  targetTpGapPct: number | null;
+  /** Whether TP columns represent a fixed exchange target, MFE profit lock, or no target. */
+  targetMode: "FIXED" | "MFE_PROFIT_LOCK" | "DYNAMIC";
+  /** Active directional MFE lock, calculated from entry + configured estimated close cost. */
+  mfeProfitLockPrice: number | null;
+  mfeProfitLockGapPct: number | null;
+  mfeProfitLockNetReturn: number | null;
+  /** Informational maximum for future static defaults; it is never a live TP by itself. */
+  staticTpMaxNetReturn: number | null;
   markPrice: number | null;
   unrealizedPnl: number | null;
+  /** Exchange leverage for this bound lane position. Never guess from config. */
+  leverage: number | null;
+  /** Pro-rata share of the exchange position's current estimated close cost.
+   *  Null when the lane cannot be safely bound to the exchange position. */
+  estimatedCloseCostUsd: number | null;
+  unrealizedAfterEstimatedCloseCostUsd: number | null;
   peakFavorableR: number;
   openedAt: string;
 };
+
+type SingleSymbolExchangePositionContext = Pick<
+  LiveAccountSnapshot["positions"][number],
+  "direction" | "quantity" | "markPrice" | "leverage" | "estimatedCloseCostUsd"
+>;
 
 /** One row per lane's OWN open position (2026-07-10: operator wants to inspect/close each lane's
  *  position on a symbol independently — two lanes holding the same symbol net into one exchange
@@ -296,28 +516,87 @@ export type SingleSymbolLanePositionRow = {
  *  aggregates — every open SingleSymbolPosition across every executor gets its own row. */
 export function flattenSingleSymbolPositions(
   executors: SingleSymbolLaneExecutor[],
-  markBySymbol: Map<string, number>,
+  exchangeBySymbol: Map<string, SingleSymbolExchangePositionContext>,
 ): SingleSymbolLanePositionRow[] {
-  return executors.flatMap((exec) => {
+  const tracked = executors.flatMap((exec) => {
     const laneId = exec.getStatus().laneId;
-    return exec.getStatus().openPositions.map((p) => {
-      const markPrice = markBySymbol.get(p.symbol) ?? null;
-      const dir = p.direction === "LONG" ? 1 : -1;
-      const unrealizedPnl = markPrice !== null ? (markPrice - p.entryPrice) * p.qty * dir : null;
-      return {
-        laneId,
-        positionId: p.positionId,
-        symbol: p.symbol,
-        direction: p.direction,
-        qty: p.qty,
-        entryPrice: p.entryPrice,
-        stopPrice: p.stopPrice,
-        markPrice,
-        unrealizedPnl,
-        peakFavorableR: p.peakFavorableR,
-        openedAt: p.openedAt,
-      };
-    });
+    return exec.getStatus().openPositions.map((position) => ({ laneId, position }));
+  });
+
+  // A symbol can be shared by several same-side lane claims. Cost allocation is
+  // only reportable when their durable quantities fit inside the exchange-side
+  // net position; otherwise rendering a pro-rata fee would fabricate attribution.
+  const trackedQtyBySymbolSide = new Map<string, number>();
+  for (const { position } of tracked) {
+    const key = `${position.symbol}:${position.direction}`;
+    trackedQtyBySymbolSide.set(key, (trackedQtyBySymbolSide.get(key) ?? 0) + Math.abs(position.qty));
+  }
+
+  return tracked.map(({ laneId, position: p }) => {
+    const exchange = exchangeBySymbol.get(p.symbol) ?? null;
+    const markPrice = exchange?.markPrice ?? null;
+    const dir = p.direction === "LONG" ? 1 : -1;
+    const unrealizedPnl = markPrice !== null ? (markPrice - p.entryPrice) * p.qty * dir : null;
+    const exchangeQty = Math.abs(Number(exchange?.quantity ?? 0));
+    const trackedQty = trackedQtyBySymbolSide.get(`${p.symbol}:${p.direction}`) ?? 0;
+    const safelyBound =
+      exchange?.direction === p.direction &&
+      Number.isFinite(exchangeQty) &&
+      exchangeQty > 0 &&
+      trackedQty <= exchangeQty + 1e-8;
+    const costShare = safelyBound ? Math.min(1, Math.abs(p.qty) / exchangeQty) : null;
+    const estimatedCloseCostUsd =
+      costShare !== null && Number.isFinite(exchange?.estimatedCloseCostUsd)
+        ? exchange!.estimatedCloseCostUsd * costShare
+        : null;
+    const targetPrice = typeof p.targetPrice === "number" && Number.isFinite(p.targetPrice) && p.targetPrice > 0
+      ? p.targetPrice
+      : null;
+    const targetTpGapPct =
+      targetPrice !== null && markPrice !== null && markPrice > 0
+        ? ((targetPrice - markPrice) / markPrice) * dir * 100
+        : null;
+    const directionalMfe = laneId === CROSS_SECTIONAL_DIRECTIONAL_LONG_LANE_ID || laneId === CROSS_SECTIONAL_DIRECTIONAL_SHORT_LANE_ID;
+    const mfeProfitLockNetReturn = directionalMfe && targetPrice === null
+      ? DIRECTIONAL_REGIME_MFE_PROFIT_LOCK_NET_RETURN()
+      : null;
+    const estimatedCloseCostPctRaw = Number(process.env.LIVE_ESTIMATED_CLOSE_COST_PCT);
+    const estimatedCloseCostPct = Number.isFinite(estimatedCloseCostPctRaw) && estimatedCloseCostPctRaw >= 0
+      ? estimatedCloseCostPctRaw
+      : 0.0022;
+    const mfeProfitLockPrice = mfeProfitLockNetReturn !== null && p.entryPrice > 0
+      ? p.entryPrice * (dir === 1
+        ? 1 + mfeProfitLockNetReturn + estimatedCloseCostPct
+        : 1 - mfeProfitLockNetReturn - estimatedCloseCostPct)
+      : null;
+    const mfeProfitLockGapPct =
+      mfeProfitLockPrice !== null && markPrice !== null && markPrice > 0
+        ? ((mfeProfitLockPrice - markPrice) / markPrice) * dir * 100
+        : null;
+    return {
+      laneId,
+      positionId: p.positionId,
+      symbol: p.symbol,
+      direction: p.direction,
+      qty: p.qty,
+      entryPrice: p.entryPrice,
+      stopPrice: p.stopPrice,
+      targetPrice,
+      targetTpGapPct,
+      targetMode: targetPrice !== null ? "FIXED" : mfeProfitLockPrice !== null ? "MFE_PROFIT_LOCK" : "DYNAMIC",
+      mfeProfitLockPrice,
+      mfeProfitLockGapPct,
+      mfeProfitLockNetReturn,
+      staticTpMaxNetReturn: directionalMfe ? DIRECTIONAL_REGIME_STATIC_TP_MAX_NET_RETURN() : null,
+      markPrice,
+      unrealizedPnl,
+      leverage: safelyBound && Number.isFinite(exchange?.leverage) ? exchange!.leverage : null,
+      estimatedCloseCostUsd,
+      unrealizedAfterEstimatedCloseCostUsd:
+        unrealizedPnl !== null && estimatedCloseCostUsd !== null ? unrealizedPnl - estimatedCloseCostUsd : null,
+      peakFavorableR: p.peakFavorableR,
+      openedAt: p.openedAt,
+    };
   });
 }
 
@@ -588,6 +867,9 @@ export async function registerLiveRoutes(
     // (e.g. disabled, or an older deploy) without affecting the other's routes.
     crossSectionalTrendExecutor?: () => CrossSectionalExecutor | null;
     crossSectionalMixedExecutor?: () => CrossSectionalExecutor | null;
+    directionalRegimeDecision?: () => CrossSectionalDirectionalDecision;
+    crossSectionalDirectionalLongExecutor?: () => SingleSymbolLaneExecutor | null;
+    crossSectionalDirectionalShortExecutor?: () => SingleSymbolLaneExecutor | null;
     // 2026-07-08: SHORT_FADE_EXHAUSTION / INTRADAY_MOMENTUM_BREAKOUT single-symbol executors.
     // Same optional/independent contract as the cross-sectional getters above.
     shortFadeExecutor?: () => SingleSymbolLaneExecutor | null;
@@ -648,6 +930,8 @@ export async function registerLiveRoutes(
       opts.compositeEstimatorFastLongExecutor?.() ?? null,
       opts.compositeEstimatorFastShortExecutor?.() ?? null,
       opts.panicWashoutExecutor?.() ?? null,
+      opts.crossSectionalDirectionalLongExecutor?.() ?? null,
+      opts.crossSectionalDirectionalShortExecutor?.() ?? null,
       ...(opts.innovationSingleSymbolExecutors?.() ?? []),
     ].filter((exec): exec is SingleSymbolLaneExecutor => exec !== null);
   app.get("/api/live/status", async () => {
@@ -1123,10 +1407,16 @@ export async function registerLiveRoutes(
     }
     try {
       const snapshot = await engine.getAccountSnapshot();
-      const markBySymbol = new Map(
-        snapshot.positions.filter((p) => p.markPrice !== null).map((p) => [p.symbol, p.markPrice as number]),
+      const exchangeBySymbol = new Map<string, SingleSymbolExchangePositionContext>(
+        snapshot.positions.map((p) => [p.symbol, {
+          direction: p.direction,
+          quantity: p.quantity,
+          markPrice: p.markPrice,
+          leverage: p.leverage,
+          estimatedCloseCostUsd: p.estimatedCloseCostUsd,
+        }]),
       );
-      const rows = flattenSingleSymbolPositions(allSingleSymbolExecutors(), markBySymbol);
+      const rows = flattenSingleSymbolPositions(allSingleSymbolExecutors(), exchangeBySymbol);
       return { ok: true, positions: rows };
     } catch (err) {
       reply.code(502);
@@ -1249,6 +1539,432 @@ export async function registerLiveRoutes(
     return { ...executor.getStatus(), regimeSkewCounterfactual: executor.getRegimeSkewCounterfactual() };
   });
 
+  // Testnet-only emergency/operator close for the ORIGINAL market-neutral executor.
+  // This is deliberately narrower than an account flatten: it requires a loopback caller,
+  // an exact basket id, and exactly one live basket in THIS executor before it invokes the
+  // executor's netting-aware reduce-only close path. Trend, mixed, innovation, and all
+  // single-symbol/directional executors are unreachable from here.
+  app.post("/api/live/cross-sectional-close", async (request, reply) => {
+    if (process.env.LIVE_BINANCE_ENV !== "testnet") {
+      reply.code(403);
+      return { ok: false, reason: "testnet only" };
+    }
+    if (!isLoopbackAddress(request.ip)) {
+      reply.code(403);
+      return { ok: false, reason: "loopback caller required" };
+    }
+    const body = (request.body ?? {}) as { confirm?: string; basketId?: string };
+    if (body.confirm !== "CLOSE_ONLY_THIS_CROSS_SECTIONAL_BASKET" || !body.basketId) {
+      reply.code(400);
+      return {
+        ok: false,
+        reason: 'close requires body {"confirm":"CLOSE_ONLY_THIS_CROSS_SECTIONAL_BASKET","basketId":"..."}',
+      };
+    }
+    const executor = opts.crossSectionalExecutor?.() ?? null;
+    if (!executor) {
+      reply.code(503);
+      return { ok: false, reason: "cross-sectional executor disabled" };
+    }
+
+    const before = executor.getStatus();
+    const liveBaskets = before.openBaskets;
+    const target = liveBaskets.find((basket) => basket.basketId === body.basketId);
+    if (!target) {
+      reply.code(404);
+      return { ok: false, reason: "target basket is not open in the market-neutral executor", basketId: body.basketId };
+    }
+    // closeAllBasketsOrderly is intentionally the executor's established safe close path, but
+    // it closes every live basket owned by that executor. Refuse rather than accidentally widen
+    // a request for one basket into a bulk close.
+    if (liveBaskets.length !== 1) {
+      reply.code(409);
+      return {
+        ok: false,
+        reason: "refused: more than one market-neutral basket is open; no basket was closed",
+        basketId: body.basketId,
+        openBasketIds: liveBaskets.map((basket) => basket.basketId),
+      };
+    }
+
+    const result = await executor.closeAllBasketsOrderly(`OPERATOR_SCOPED_CLOSE:${body.basketId}`);
+    const after = executor.getStatus();
+    const stillOpen = after.openBaskets.some((basket) => basket.basketId === body.basketId);
+    if (result.closed !== 1 || result.failed !== 0 || stillOpen) {
+      reply.code(409);
+      return {
+        ok: false,
+        reason: "close did not complete cleanly; inspect executor status before retrying",
+        basketId: body.basketId,
+        result,
+        openBasketIds: after.openBaskets.map((basket) => basket.basketId),
+      };
+    }
+    return {
+      ok: true,
+      laneId: before.laneId,
+      basketId: body.basketId,
+      result,
+      openBasketIds: after.openBaskets.map((basket) => basket.basketId),
+    };
+  });
+
+  // Testnet-only operational probe: invokes the exact same executor tick used
+  // by the scheduled loop. It never bypasses arm, market-neutral admission,
+  // sizing, or all-leg abort safeguards.
+  app.post("/api/live/cross-sectional-tick", async (request, reply) => {
+    if (process.env.LIVE_BINANCE_ENV !== "testnet") {
+      reply.code(403);
+      return { ok: false, reason: "testnet only" };
+    }
+    const body = (request.body ?? {}) as { confirm?: string };
+    if (body.confirm !== "TICK_CROSS_SECTIONAL") {
+      reply.code(400);
+      return { ok: false, reason: 'tick requires body {"confirm":"TICK_CROSS_SECTIONAL"}' };
+    }
+    const executor = opts.crossSectionalExecutor?.() ?? null;
+    if (!executor) {
+      reply.code(503);
+      return { ok: false, reason: "cross-sectional executor disabled" };
+    }
+    await executor.tick();
+    return { ok: true, ...executor.getStatus() };
+  });
+
+  // Testnet-only operational probe for the scanner-led directional companions.
+  // It calls the same guarded tick used by the automatic scheduler; it cannot
+  // bypass the arm, fresh-signal, stop, exposure, or reversal rules.
+  app.post("/api/live/cross-sectional-directional-tick", async (request, reply) => {
+    if (process.env.LIVE_BINANCE_ENV !== "testnet") {
+      reply.code(403);
+      return { ok: false, reason: "testnet only" };
+    }
+    const body = (request.body ?? {}) as { confirm?: string };
+    if (body.confirm !== "TICK_DIRECTIONAL") {
+      reply.code(400);
+      return { ok: false, reason: 'tick requires body {"confirm":"TICK_DIRECTIONAL"}' };
+    }
+    const shortExecutor = opts.crossSectionalDirectionalShortExecutor?.() ?? null;
+    const longExecutor = opts.crossSectionalDirectionalLongExecutor?.() ?? null;
+    if (!shortExecutor && !longExecutor) {
+      reply.code(503);
+      return { ok: false, reason: "directional executors disabled" };
+    }
+    await shortExecutor?.tick();
+    await longExecutor?.tick();
+    return {
+      ok: true,
+      decision: opts.directionalRegimeDecision?.() ?? null,
+      short: shortExecutor?.getStatus() ?? null,
+      long: longExecutor?.getStatus() ?? null,
+    };
+  });
+
+  /**
+   * 2026-08-12 (operator request): every CLOSED cross-sectional basket with its realized P&L broken
+   * out PER TOKEN, plus when it opened and closed.
+   *
+   * REAL FILLS ONLY. This reads the executor stores, not the measurement store — so a basket appears
+   * here only once it has actually opened and closed on the exchange. An empty list is reported with
+   * an explicit reason rather than as an empty success, because "no rows" here has historically been
+   * misread as "the lane lost nothing" when it in fact meant "the lane never traded".
+   * See closedBasketRealizedBreakdown for the two provenance caveats (fees are APPORTIONED per leg,
+   * and an unconfirmed fill price makes that leg's figure unreliable) — both are in the payload.
+   */
+  app.get("/api/live/cross-sectional-closed-baskets", async () => {
+    const reportSinceMs = getCrossSectionalReportSinceMs();
+    const reportStartAt = reportSinceMs === undefined ? null : new Date(reportSinceMs).toISOString();
+    const inReportEra = (openedAt: string): boolean => reportSinceMs === undefined || new Date(openedAt).getTime() >= reportSinceMs;
+    const instances: Array<{ label: string; executor: CrossSectionalExecutor | null }> = [
+      { label: "FILTERED", executor: opts.crossSectionalExecutor?.() ?? null },
+      { label: "TREND_BETA_VOL", executor: opts.crossSectionalTrendExecutor?.() ?? null },
+      { label: "MIXED_MEAN_REVERSION", executor: opts.crossSectionalMixedExecutor?.() ?? null },
+      ...(opts.innovationBasketExecutors?.() ?? []).map((executor, i) => ({ label: `INNOVATION_${i + 1}`, executor })),
+    ];
+    const filteredExecutor = opts.crossSectionalExecutor?.() ?? null;
+    const filteredOpenBaskets = filteredExecutor?.getStatus().openBaskets.filter((basket) => inReportEra(basket.openedAt)) ?? [];
+    const filteredClosedBaskets = filteredExecutor
+      ? closedBasketRealizedBreakdown(filteredExecutor.getClosedBaskets()).filter((basket) => inReportEra(basket.openedAt))
+      : [];
+    const estimatedCloseCostPct = Number.isFinite(Number(process.env.LIVE_ESTIMATED_CLOSE_COST_PCT))
+      ? Number(process.env.LIVE_ESTIMATED_CLOSE_COST_PCT)
+      : 0.0022;
+    let grossUnrealizedUsd: number | null = filteredOpenBaskets.length === 0 ? 0 : null;
+    let unrealizedMarkNotionalUsd = 0;
+    const openBasketUnrealized = new Map<string, { grossUsd: number; afterEstimatedCloseCostUsd: number }>();
+    const openBasketLegs = new Map<string, Array<{
+      symbol: string;
+      side: "LONG" | "SHORT";
+      qty: number;
+      entryPrice: number;
+      markPrice: number | null;
+      grossUnrealizedUsd: number | null;
+      afterEstimatedCloseCostUsd: number | null;
+    }>>();
+    if (filteredOpenBaskets.length > 0 && engine) {
+      const account = await engine.getAccountSnapshot();
+      const markBySymbol = new Map(account.positions.flatMap((position) =>
+        position.markPrice != null ? [[position.symbol, position.markPrice] as const] : [],
+      ));
+      // Binance omits a contract from account positions when independent basket legs net to zero
+      // (the active book has BNB long in one basket and BNB short in another). Its market price is
+      // still real and needed to value EACH basket from its own entry; fetch only those missing
+      // symbols from the public mark-price endpoint rather than rendering the entire basket as —.
+      const missingSymbols = [...new Set(filteredOpenBaskets.flatMap((basket) => basket.legs
+        .filter((leg) => leg.exitOrderId === null && !markBySymbol.has(leg.symbol))
+        .map((leg) => leg.symbol)))];
+      if (missingSymbols.length) {
+        const futuresBase = process.env.LIVE_BINANCE_ENV === "testnet"
+          ? "https://testnet.binancefuture.com"
+          : "https://fapi.binance.com";
+        await Promise.allSettled(missingSymbols.map(async (symbol) => {
+          const response = await fetch(`${futuresBase}/fapi/v1/premiumIndex?symbol=${encodeURIComponent(symbol)}`);
+          if (!response.ok) return;
+          const payload = await response.json() as { markPrice?: unknown };
+          const mark = Number(payload.markPrice);
+          if (Number.isFinite(mark) && mark > 0) markBySymbol.set(symbol, mark);
+        }));
+        // A public price miss leaves only that leg unavailable; never fail the report route or
+        // fabricate a zero P&L.
+      }
+      let gross = 0;
+      let complete = true;
+      for (const basket of filteredOpenBaskets) {
+        let basketGross = 0;
+        let basketMarkNotional = 0;
+        let basketComplete = true;
+        const legs: Array<{
+          symbol: string;
+          side: "LONG" | "SHORT";
+          qty: number;
+          entryPrice: number;
+          markPrice: number | null;
+          grossUnrealizedUsd: number | null;
+          afterEstimatedCloseCostUsd: number | null;
+        }> = [];
+        for (const leg of basket.legs) {
+          if (leg.exitOrderId !== null) continue;
+          const mark = markBySymbol.get(leg.symbol);
+          if (mark == null || !Number.isFinite(mark)) {
+            complete = false;
+            basketComplete = false;
+            legs.push({
+              symbol: leg.symbol,
+              side: leg.side,
+              qty: leg.qty,
+              entryPrice: leg.entryPrice,
+              markPrice: null,
+              grossUnrealizedUsd: null,
+              afterEstimatedCloseCostUsd: null,
+            });
+            continue;
+          }
+          const direction = leg.side === "LONG" ? 1 : -1;
+          const legGross = (mark - leg.entryPrice) * leg.qty * direction;
+          legs.push({
+            symbol: leg.symbol,
+            side: leg.side,
+            qty: leg.qty,
+            entryPrice: leg.entryPrice,
+            markPrice: mark,
+            grossUnrealizedUsd: legGross,
+            afterEstimatedCloseCostUsd: legGross - mark * leg.qty * Math.max(0, estimatedCloseCostPct),
+          });
+          gross += legGross;
+          basketGross += legGross;
+          const markNotional = mark * leg.qty;
+          unrealizedMarkNotionalUsd += markNotional;
+          basketMarkNotional += markNotional;
+        }
+        if (basketComplete) {
+          openBasketUnrealized.set(basket.basketId, {
+            grossUsd: basketGross,
+            afterEstimatedCloseCostUsd: basketGross - basketMarkNotional * Math.max(0, estimatedCloseCostPct),
+          });
+        }
+        openBasketLegs.set(basket.basketId, legs);
+      }
+      grossUnrealizedUsd = complete ? gross : null;
+    }
+    const estimatedSlippageUsd = grossUnrealizedUsd == null ? null : unrealizedMarkNotionalUsd * Math.max(0, estimatedCloseCostPct);
+    const nowIso = new Date().toISOString();
+    const unrealizedExtremaByBasket = recordCrossSectionalUnrealizedExtrema(
+      [...openBasketUnrealized.entries()].map(([basketId, value]) => ({
+        basketId,
+        ...value,
+        legs: (openBasketLegs.get(basketId) ?? []).flatMap((leg) =>
+          leg.grossUnrealizedUsd != null && leg.afterEstimatedCloseCostUsd != null
+            ? [{
+              symbol: leg.symbol,
+              side: leg.side,
+              grossUsd: leg.grossUnrealizedUsd,
+              afterEstimatedCloseCostUsd: leg.afterEstimatedCloseCostUsd,
+              entryAfterEstimatedCloseCostUsd: -leg.entryPrice * leg.qty * Math.max(0, estimatedCloseCostPct),
+              entryAt: filteredOpenBaskets.find((basket) => basket.basketId === basketId)?.openedAt ?? nowIso,
+            }]
+            : [],
+        ),
+      })),
+      filteredClosedBaskets.map((basket) => ({ basketId: basket.basketId, closedAt: basket.closedAt })),
+      nowIso,
+    );
+    const withUnrealizedExtrema = <T extends { basketId: string; legs: Array<{ symbol: string; side: "LONG" | "SHORT" }> }>(basket: T) => ({
+      ...basket,
+      unrealizedExtrema: unrealizedExtremaByBasket[basket.basketId] ?? null,
+      legs: basket.legs.map((leg) => ({
+        ...leg,
+        unrealizedExtrema: unrealizedExtremaByBasket[basket.basketId]?.legs?.[`${leg.side}:${leg.symbol}`] ?? null,
+      })),
+    });
+    // Keep the active testnet cohort strictly cutoff-scoped, but do not make real, settled
+    // pre-cutoff fills disappear from the operator's ledger.  This is an audit-only history:
+    // it never feeds execution, edge filters, P&L *today*, or Four-Brain learning.  In
+    // particular, OPERATOR_VOID remains excluded even here; its raw exchange audit is kept in
+    // the executor store but must not be silently reinstated in normal reporting.
+    const auditHistoryLanes = reportSinceMs === undefined
+      ? []
+      : instances
+        .filter((row): row is { label: string; executor: CrossSectionalExecutor } => row.executor !== null)
+        .map((row) => {
+          const status = row.executor.getStatus();
+          const baskets = closedBasketRealizedBreakdown(
+            row.executor.getClosedBasketsForAudit().filter((basket) =>
+              basket.accountingStatus !== "ACCOUNTING_INCOMPLETE" &&
+              !isCrossSectionalBasketReportingExcluded(basket),
+            ),
+          )
+            .filter((basket) => !inReportEra(basket.openedAt))
+            .map(withUnrealizedExtrema);
+          return {
+            lane: row.label,
+            laneId: status.laneId,
+            closedBaskets: baskets.length,
+            baskets,
+          };
+        })
+        .filter((lane) => lane.closedBaskets > 0);
+    const auditHistoryTotalNetPnlUsd = auditHistoryLanes
+      .flatMap((lane) => lane.baskets)
+      .reduce((sum, basket) => sum + (basket.netPnlUsd ?? 0), 0);
+    // A basket must never briefly render in the old "no ATH/ATL yet" shape.
+    // The durable path starts at the first report sample, but the entry point
+    // itself is already known: gross P&L is zero and an immediate close has a
+    // real (negative) estimated close cost.  Return that honest baseline until
+    // the first durable observation is written.
+    const responseOpenBaskets = filteredOpenBaskets.map((basket) => {
+      const current = openBasketUnrealized.get(basket.basketId) ?? null;
+      const legs = (openBasketLegs.get(basket.basketId) ?? basket.legs
+        .filter((leg) => leg.exitOrderId === null)
+        .map((leg) => ({ symbol: leg.symbol, side: leg.side, qty: leg.qty, entryPrice: leg.entryPrice, markPrice: null, grossUnrealizedUsd: null, afterEstimatedCloseCostUsd: null })));
+      const stored = unrealizedExtremaByBasket[basket.basketId] ?? null;
+      const complete = current !== null && legs.every((leg) =>
+        Number.isFinite(leg.grossUnrealizedUsd) && Number.isFinite(leg.afterEstimatedCloseCostUsd),
+      );
+      const entryAfterCostUsd = -legs.reduce((sum, leg) => sum + leg.entryPrice * leg.qty * Math.max(0, estimatedCloseCostPct), 0);
+      const fallback = complete && current
+        ? {
+          grossHighUsd: Math.max(0, current.grossUsd),
+          grossLowUsd: Math.min(0, current.grossUsd),
+          afterEstimatedCloseCostHighUsd: Math.max(entryAfterCostUsd, current.afterEstimatedCloseCostUsd),
+          afterEstimatedCloseCostLowUsd: Math.min(entryAfterCostUsd, current.afterEstimatedCloseCostUsd),
+          firstRecordedAt: basket.openedAt,
+          lastRecordedAt: nowIso,
+          legs: Object.fromEntries(legs.map((leg) => {
+            const entryAfterCost = -leg.entryPrice * leg.qty * Math.max(0, estimatedCloseCostPct);
+            const gross = leg.grossUnrealizedUsd as number;
+            const afterCost = leg.afterEstimatedCloseCostUsd as number;
+            return [`${leg.side}:${leg.symbol}`, {
+              grossHighUsd: Math.max(0, gross),
+              grossLowUsd: Math.min(0, gross),
+              afterEstimatedCloseCostHighUsd: Math.max(entryAfterCost, afterCost),
+              afterEstimatedCloseCostLowUsd: Math.min(entryAfterCost, afterCost),
+              entryAt: basket.openedAt,
+              firstRecordedAt: basket.openedAt,
+              lastRecordedAt: nowIso,
+            }];
+          })),
+        }
+        : null;
+      const extrema = stored ?? fallback;
+      return {
+        basketId: basket.basketId,
+        signal: basket.signal,
+        variant: basket.variant,
+        openedAt: basket.openedAt,
+        grossUnrealizedUsd: current?.grossUsd ?? null,
+        unrealizedAfterEstimatedCloseCostUsd: current?.afterEstimatedCloseCostUsd ?? null,
+        unrealizedExtrema: extrema,
+        legs: legs.map((leg) => ({
+          ...leg,
+          unrealizedExtrema: extrema?.legs?.[`${leg.side}:${leg.symbol}`] ?? null,
+        })),
+      };
+    });
+    const lanes = instances
+      .filter((row): row is { label: string; executor: CrossSectionalExecutor } => row.executor !== null)
+      .map((row) => {
+        const status = row.executor.getStatus();
+        const closed = closedBasketRealizedBreakdown(row.executor.getClosedBaskets()).filter((basket) => inReportEra(basket.openedAt));
+        return {
+          lane: row.label,
+          laneId: status.laneId,
+          closedBaskets: closed.length,
+          openBaskets: status.openBaskets?.filter((basket) => inReportEra(basket.openedAt)).length ?? 0,
+          totalNetPnlUsd: closed.reduce((sum, b) => sum + (b.netPnlUsd ?? 0), 0),
+          perToken: Object.entries(
+            closed
+              .flatMap((b) => b.legs)
+              .reduce<Record<string, { legs: number; grossPnlUsd: number; feeAllocatedUsd: number; netPnlUsd: number }>>((acc, leg) => {
+                const row = (acc[leg.symbol] ??= { legs: 0, grossPnlUsd: 0, feeAllocatedUsd: 0, netPnlUsd: 0 });
+                row.legs += 1;
+                row.grossPnlUsd += leg.grossPnlUsd;
+                row.feeAllocatedUsd += leg.feeAllocatedUsd;
+                row.netPnlUsd += leg.netPnlUsd;
+                return acc;
+              }, {}),
+          )
+            .map(([symbol, row]) => ({ symbol, ...row }))
+            .sort((a, b) => a.netPnlUsd - b.netPnlUsd),
+          baskets: closed.map(withUnrealizedExtrema),
+        };
+      });
+    const realizedBeforeSlippageUsd = filteredClosedBaskets.reduce((sum, basket) => sum + (basket.grossPnlUsd ?? 0), 0);
+    const netRealizedProfitUsd = filteredClosedBaskets.reduce((sum, basket) => sum + (basket.netPnlUsd ?? 0), 0);
+    const totalClosed = lanes.reduce((sum, l) => sum + l.closedBaskets, 0);
+    return {
+      generatedAt: nowIso,
+      reportStartAt,
+      source: "executor stores (real exchange fills) — NOT the measurement store",
+      feeCaveat: "per-leg fees are APPORTIONED from the basket total by notional touched, not measured per leg",
+      totalClosed,
+      reason: totalClosed === 0
+        ? "no cross-sectional basket has opened AND closed on the exchange yet — an empty list here means the lane has not traded, not that it broke even"
+        : null,
+      crossSectionalPnl: {
+        openBasketCount: filteredOpenBaskets.length,
+        openLegCount: filteredOpenBaskets.reduce((sum, basket) => sum + basket.legs.filter((leg) => leg.exitOrderId === null).length, 0),
+        grossUnrealizedUsd,
+        unrealizedAfterSlippageUsd: grossUnrealizedUsd == null ? null : grossUnrealizedUsd - (estimatedSlippageUsd ?? 0),
+        estimatedSlippageUsd,
+        realizedBeforeSlippageUsd,
+        netRealizedProfitUsd,
+        estimatedCloseCostPct,
+        slippageCaveat: "Slippage fill aktual tidak disimpan terpisah; unrealized after slippage memakai estimasi biaya close LIVE_ESTIMATED_CLOSE_COST_PCT.",
+      },
+      openBaskets: responseOpenBaskets,
+      lanes,
+      auditHistory: auditHistoryLanes.length > 0
+        ? {
+          excludedFromActiveCohort: true,
+          reason: "Real exchange-filled baskets before the active cohort cutoff. Audit-only: excluded from active edge, learning, execution, and daily P&L.",
+          totalClosed: auditHistoryLanes.reduce((sum, lane) => sum + lane.closedBaskets, 0),
+          totalNetPnlUsd: auditHistoryTotalNetPnlUsd,
+          lanes: auditHistoryLanes,
+        }
+        : null,
+    };
+  });
+
   // 2026-07-08: sibling status endpoints for the two additional variant-targeted instances (same
   // shape as the FILTERED endpoint above, just a different underlying executor).
   app.get("/api/live/cross-sectional-executor-trend", async () => {
@@ -1265,6 +1981,22 @@ export async function registerLiveRoutes(
     }
     return executor.getStatus();
   });
+  app.get("/api/live/cross-sectional-directional-regime", async () => ({
+    ...(opts.directionalRegimeDecision?.() ?? {
+      enabled: false,
+      mode: "NO_TRADE",
+      marketRegime: null,
+      scanBatchId: null,
+      scanFinishedAt: null,
+      longPicks: [],
+      shortPicks: [],
+      longAverageScore: null,
+      shortAverageScore: null,
+      reason: "Directional cross-sectional lane belum diaktifkan.",
+    }),
+    longExecutor: opts.crossSectionalDirectionalLongExecutor?.()?.getStatus() ?? null,
+    shortExecutor: opts.crossSectionalDirectionalShortExecutor?.()?.getStatus() ?? null,
+  }));
 
   // 2026-07-08: single-symbol executor status (SHORT_FADE_EXHAUSTION / INTRADAY_MOMENTUM_BREAKOUT).
   app.get("/api/live/short-fade-executor", async () => {
@@ -1518,7 +2250,16 @@ export async function registerLiveRoutes(
       // counting; sumExternalRealizedPnlUsd is also reused as-is by the kill-switch and wallet-
       // reconciliation, which DO want the combined cross-sectional+single-symbol total.)
       const singleSymbolExecutorRealizedPnlUsd = sumExternalRealizedPnlUsd([], allSingleSymbolExecutors());
-      return { ok: true, ...snapshot, singleSymbolExecutorRealizedPnlUsd };
+      const pnlEra = process.env.LIVE_BINANCE_ENV === "testnet" ? readTestnetPnlEra() : null;
+      return {
+        ok: true,
+        ...snapshot,
+        singleSymbolExecutorRealizedPnlUsd,
+        testnetPnlEra: pnlEra && {
+          ...pnlEra,
+          unrealizedSinceStartUsd: snapshot.unrealizedPnl - pnlEra.carriedDirectionalUnrealizedUsd,
+        },
+      };
     } catch (err) {
       reply.code(502);
       return { ok: false, reason: err instanceof Error ? err.message : "account snapshot failed" };
@@ -1622,21 +2363,74 @@ export async function registerLiveRoutes(
       reply.code(503);
       return { ok: false, reason: "live execution disabled" };
     }
-    const query = (request.query ?? {}) as { view?: string; period?: string; anchor?: string; regime?: string };
+    const query = (request.query ?? {}) as {
+      view?: string;
+      period?: string;
+      anchor?: string;
+      regime?: string;
+      cohort?: string;
+    };
     try {
+      // The XRP/WLD MFE rollout is deliberately a fresh, symbol-scoped cohort. Do not blend it
+      // with older CG_MFE_GIVEBACK orders from symbols that were never approved for this rollout.
+      const mfeRollout = query.cohort === "testnet_mfe_giveback_xrp_wld";
+      const configuredMfeRolloutStartAt = process.env.TESTNET_MFE_GIVEBACK_ROLLOUT_START_AT ?? null;
       let series = engine.getLanePerformanceSeries({
         view: query.view,
         period: query.period,
         anchor: query.anchor,
         regime: query.regime,
+        ...(mfeRollout
+          ? {
+            laneIds: ["CG_VARIANT_MATRIX:CG_MFE_GIVEBACK"],
+            symbols: ["XRPUSDT", "WLDUSDT"],
+            since: configuredMfeRolloutStartAt,
+          }
+          : {}),
       });
-      for (const executor of allCrossSectionalExecutors()) {
-        series = mergeCrossSectionalIntoLaneSeries(series, executor);
+      if (!mfeRollout) {
+        for (const executor of allCrossSectionalExecutors()) {
+          series = mergeCrossSectionalIntoLaneSeries(series, executor);
+        }
+        for (const executor of allSingleSymbolExecutors()) {
+          series = mergeSingleSymbolIntoLaneSeries(series, executor);
+        }
       }
-      for (const executor of allSingleSymbolExecutors()) {
-        series = mergeSingleSymbolIntoLaneSeries(series, executor);
-      }
-      return { ok: true, ...series };
+      // The chart is intentionally calendar-scoped: a basket closed on 13 Aug must not be
+      // painted into the 14 Aug hourly curve just to make the current view non-zero. Surface the
+      // carried audit total separately so a zero current-day chart is never misread as lost
+      // history; `getClosedBaskets()` keeps OPERATOR_VOID and incomplete rows out of both paths.
+      const crossSectionalAuditBeforePeriod = !mfeRollout
+        ? (() => {
+          const sinceMs = Date.parse(series.since);
+          if (!Number.isFinite(sinceMs)) return null;
+          let closedBaskets = 0;
+          let totalNetPnlUsd = 0;
+          let lastClosedAt: string | null = null;
+          for (const executor of allCrossSectionalExecutors()) {
+            for (const basket of executor.getClosedBaskets()) {
+              const closedMs = Date.parse(basket.closedAt ?? "");
+              if (!Number.isFinite(closedMs) || closedMs >= sinceMs || basket.netPnlUsd === null) continue;
+              closedBaskets += 1;
+              totalNetPnlUsd += basket.netPnlUsd;
+              if (lastClosedAt === null || (basket.closedAt ?? "") > lastClosedAt) lastClosedAt = basket.closedAt;
+            }
+          }
+          return closedBaskets > 0 ? { closedBaskets, totalNetPnlUsd, lastClosedAt } : null;
+        })()
+        : null;
+      return {
+        ok: true,
+        ...series,
+        crossSectionalAuditBeforePeriod,
+        cohort: mfeRollout
+          ? {
+            id: "testnet_mfe_giveback_xrp_wld",
+            label: "CG_MFE_GIVEBACK — XRP/WLD rollout",
+            rolloutStartAt: configuredMfeRolloutStartAt,
+          }
+          : null,
+      };
     } catch (err) {
       reply.code(500);
       return { ok: false, reason: err instanceof Error ? err.message : "lane performance series failed" };

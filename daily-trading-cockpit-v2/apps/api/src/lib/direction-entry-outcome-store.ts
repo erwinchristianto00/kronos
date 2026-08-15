@@ -59,14 +59,11 @@ import type {
 
 /** Newest-N detail records kept on disk per section (aggregates keep counting past this). */
 /**
- * THIS CAP DECIDES WHETHER THE FOUR-BRAIN CAN EVER INFLUENCE A DECISION (2026-07-28).
+ * THIS CAP RETAINS MARKET-DIRECTION CALIBRATION (2026-08-13).
  *
- * The four-brain is a measurement layer with exactly ONE wire into anything decisional:
- * direction-brain.ts:189/:216 halves the LONG/SHORT score when
- * `fourBrainLongVeto`/`fourBrainShortVeto` is set. That flag comes from
- * fourBrainEdgeVerdict(...) === "VETO_NEGATIVE", which requires
- * `effectiveN >= MIN_SAMPLES` (= EDGE_MIN_SAMPLES = 30), where effectiveN counts DISTINCT
- * `floor(asOfMs / HORIZON_MS)` blocks — not rows.
+ * Direction outcomes use BTCUSDT as a market proxy. They are retained for an auditable
+ * canonical-regime × direction × horizon calibration report, but do not alter a candidate score.
+ * Candidate recommendation reinforcement is separate and accepts only exact Tier-1 testnet fills.
  *
  * So the veto needs 30 x 4h = 120h of retained coverage for INTRADAY and 30 x 24h = 720h for
  * SWING. At the observed decision rate 800 records spanned ~53h. The gate was therefore
@@ -74,15 +71,15 @@ import type {
  * ~18 minutes: the system measured LONG/INTRADAY at -0.475R over n=305 and reported it to the
  * operator as "insufficient evidence", because the evidence had already been evicted.
  *
- * Note the asymmetry this replaces: MAX_ENTRY_RECORDS was 2500 while the DIRECTION side — the
- * only one wired to a decision — got 800. Nothing documented that choice.
+ * Note the asymmetry this replaces: MAX_ENTRY_RECORDS was 2500 while the Direction calibration side
+ * had only 800, making its horizon report arithmetically unreachable.
  *
  * 2000 records is ~120h at the observed rate (~15/h), i.e. INTRADAY becomes reachable and the
  * veto can finally be EVALUATED. SWING stays out of reach on purpose: it would need ~11k records
  * (~30MB), and there is no point paying that until INTRADAY shows the wire works at all.
  *
  * Raising this does NOT connect the brains to execution — the four-brain remains report-only, and
- * on mainnet it is off entirely (FOUR_BRAIN_MODE=off). It only makes a designed gate observable
+ * on mainnet it is off entirely (FOUR_BRAIN_MODE=off). It makes the calibration leg observable
  * instead of arithmetically impossible.
  */
 export function maxDirectionRecords(env: NodeJS.ProcessEnv = process.env): number {
@@ -132,6 +129,10 @@ export interface DirectionOutcomeRecord {
   win: 0 | 1 | null;
   regretR: number | null;
   calibrationGapR: number | null;
+  /** Decision-time lineage; optional so legacy records remain readable but never get reclassified. */
+  canonicalRegimeFamily?: "BULLISH" | "BEARISH" | "MIXED" | "UNKNOWN" | null;
+  scannerRegime?: string | null;
+  marketContextSnapshotId?: string | null;
 }
 
 export interface EntryOutcomeRecord {
@@ -146,9 +147,10 @@ export interface EntryOutcomeRecord {
   status: TerminalOutcomeStatus;
   expectedNetR: number | null;
   realizedNetR: number | null;
-  /** Tier 1 only: "engine" (NET) vs "executor" (RAW) — see entry-brain-tier1-realized-resolver.ts. Null
-   *  for Tier 2 (simulated netR already nets ENTRY_ROUNDTRIP_COST_BPS, a third, separate convention). */
-  realizedRSource: "engine" | "executor" | null;
+  /** Tier 1 provenance. "actual_fill_binding" is the current exact, executor-at-open binding:
+   * it is always exchange-settled NET P&L divided by the frozen actual risk, unlike the legacy
+   * window matcher whose engine/executor writers have different conventions. Null for Tier 2. */
+  realizedRSource: "engine" | "executor" | "actual_fill_binding" | null;
   /** Tier 2 only — see entry-brain-tier2-simulated-resolver.ts's own doc. Null for Tier 1 (n/a) and for
    *  EXPIRED_UNRESOLVABLE rows that never reached a tier. */
   horizonTruncated: boolean | null;
@@ -166,6 +168,10 @@ export interface EntryOutcomeRecord {
    *  this cross-cycle memory the same real close could be double-booked against two different decisions.
    *  Null for Tier 2 and for EXPIRED_UNRESOLVABLE rows that never reached a tier. */
   matchedCloseKey: string | null;
+  /** Decision-time lineage for exact-fill reinforcement. Legacy records remain unclassified. */
+  canonicalRegimeFamily?: "BULLISH" | "BEARISH" | "MIXED" | "UNKNOWN" | null;
+  scannerRegime?: string | null;
+  marketContextSnapshotId?: string | null;
 }
 
 interface RateAggregate {
@@ -277,8 +283,14 @@ interface EntrySectionState {
   resolvedRealMatchCount: number; // Tier 1 cumulative
   resolvedSimulatedCount: number; // Tier 2 cumulative
   expiredUnresolvableCount: number;
-  /** Current-cycle GAUGE — see DirectionSectionState.currentInstrumentDataMissingByHorizon. */
+  /** Current-cycle GAUGE — only rows whose Tier-2 candle request was actually attempted and could
+   *  not produce a usable outcome.  Scheduler deferrals are deliberately kept separate below: a
+   *  bounded worker queue is not an instrument-data failure. */
   currentInstrumentDataMissing: number;
+  /** Current-cycle GAUGE — due Tier-2 rows intentionally deferred by the per-cycle work bound.
+   *  They remain pending and will be retried; this is backlog transparency, never a data-quality
+   *  error and never a cumulative counter. */
+  currentTier2Deferred: number;
   /** Latest reconciliation-cycle Tier-1 join diagnostics. This is a gauge, not a cumulative counter. */
   tier1Diagnostics: EntryBrainTier1Diagnostics | null;
   processedDecisionIds: string[];
@@ -328,6 +340,7 @@ function emptyEntrySection(): EntrySectionState {
     resolvedSimulatedCount: 0,
     expiredUnresolvableCount: 0,
     currentInstrumentDataMissing: 0,
+    currentTier2Deferred: 0,
     tier1Diagnostics: null,
     processedDecisionIds: [],
     claimedTier1CloseKeys: [],
@@ -663,6 +676,7 @@ export class DirectionEntryOutcomeStore {
           resolvedSimulatedCount: nonNegInt(re.resolvedSimulatedCount),
           expiredUnresolvableCount: nonNegInt(re.expiredUnresolvableCount),
           currentInstrumentDataMissing: nonNegInt(re.currentInstrumentDataMissing),
+          currentTier2Deferred: nonNegInt(re.currentTier2Deferred),
           tier1Diagnostics: sanitizeTier1Diagnostics(re.tier1Diagnostics),
           processedDecisionIds: Array.isArray(re.processedDecisionIds)
             ? re.processedDecisionIds.filter((id): id is string => typeof id === "string").slice(-MAX_PROCESSED_ENTRY_IDS)
@@ -853,6 +867,16 @@ export class DirectionEntryOutcomeStore {
     }
   }
 
+  /** Overwrite the current-cycle count of Tier-2 rows deferred solely by the scheduler cap. */
+  setCurrentEntryTier2Deferred(count: number, opts?: { deferSave?: boolean }): void {
+    try {
+      this.state.entry.currentTier2Deferred = nonNegInt(count);
+      if (!opts?.deferSave) this._save();
+    } catch {
+      /* gauge bookkeeping never throws */
+    }
+  }
+
   setTier1Diagnostics(diagnostics: EntryBrainTier1Diagnostics, opts?: { deferSave?: boolean }): void {
     try {
       this.state.entry.tier1Diagnostics = sanitizeTier1Diagnostics(diagnostics);
@@ -903,12 +927,14 @@ export interface DirectionEntryOutcomeReport {
     recent: DirectionOutcomeRecord[];
   };
   entry: {
-    coverage: {
-      pending: number;
-      resolvedRealMatch: number;
-      resolvedSimulated: number;
-      instrumentDataMissing: number;
-      expiredUnresolvable: number;
+      coverage: {
+        pending: number;
+        resolvedRealMatch: number;
+        resolvedSimulated: number;
+        instrumentDataMissing: number;
+        /** Due Tier-2 rows deferred by the bounded scheduler in the latest cycle; not missing data. */
+        tier2Deferred: number;
+        expiredUnresolvable: number;
       note: string;
     };
     tier1Diagnostics: EntryBrainTier1Diagnostics | null;
@@ -984,9 +1010,12 @@ export function buildDirectionEntryOutcomeReport(
     }
   }
 
+  const pendingDirectionHorizonNote = perHorizonCoverage
+    .map((row) => row.horizon + "=" + row.pending + (row.horizon === "SCALP" ? " (1 jam)" : row.horizon === "INTRADAY" ? " (4 jam)" : " (24 jam)"))
+    .join("; ");
   const directionNote =
     d.evaluatedCount + d.expiredUnresolvableCount === 0
-      ? "No Direction decisions resolved yet."
+      ? "Belum ada keputusan Direction yang selesai. Menunggu menurut horizon yang sudah dikunci saat keputusan dibuat: " + pendingDirectionHorizonNote + "."
       : `${d.evaluatedCount} evaluated, ${d.expiredUnresolvableCount} expired unresolvable across all horizons (cumulative).`;
 
   // ── Entry ──
@@ -1049,6 +1078,7 @@ export function buildDirectionEntryOutcomeReport(
         resolvedRealMatch: e.resolvedRealMatchCount,
         resolvedSimulated: e.resolvedSimulatedCount,
         instrumentDataMissing: e.currentInstrumentDataMissing,
+        tier2Deferred: e.currentTier2Deferred,
         expiredUnresolvable: e.expiredUnresolvableCount,
         note: entryNote,
       },
@@ -1063,11 +1093,17 @@ export function buildDirectionEntryOutcomeReport(
   };
 }
 
-let singleton: DirectionEntryOutcomeStore | null = null;
+/** Stores are process-local and keyed by data root so an advisory rollout can stay isolated. */
+const storesByDataDir = new Map<string, DirectionEntryOutcomeStore>();
 export function getDirectionEntryOutcomeStore(dataDir = "data"): DirectionEntryOutcomeStore {
-  if (!singleton) singleton = new DirectionEntryOutcomeStore(dataDir);
-  return singleton;
+  const key = resolve(dataDir);
+  let store = storesByDataDir.get(key);
+  if (!store) {
+    store = new DirectionEntryOutcomeStore(dataDir);
+    storesByDataDir.set(key, store);
+  }
+  return store;
 }
 export function _resetDirectionEntryOutcomeStoreForTests(): void {
-  singleton = null;
+  storesByDataDir.clear();
 }

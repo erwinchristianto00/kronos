@@ -18,6 +18,7 @@ import {
   fourBrainDecisionId,
   type DirectionDecision,
   type EntryDecision,
+  type FourBrainExecutionReinforcement,
   type ExecutiveCandidateStatus,
   type ExecutiveDecision,
   type ExitDecision,
@@ -56,6 +57,8 @@ export interface ExecutiveInput {
   marketContext?: MarketContextLineage;
   /** Did direction clear its hurdle (a real directional preference)? Defaults to (action is directional). */
   directionHurdlePassed?: boolean;
+  /** Exact, closed Tier-1 testnet-fill evidence. Advisory recommendation only; never execution authority. */
+  executionReinforcement?: FourBrainExecutionReinforcement | null;
 
   /** Risk rails. killLatched OR any riskBlockedReason ⇒ BLOCKED_BY_RISK (overrides all brain approvals). */
   killLatched?: boolean;
@@ -97,6 +100,13 @@ export function buildExecutiveDecision(input: ExecutiveInput): ExecutiveDecision
   const entry = input.entry;
   const allocationContext = input.allocationContext ?? staticAllocationContext(null);
   const marketContext = input.marketContext ?? unavailableMarketContext(input.nowMs);
+  const executionReinforcement = input.executionReinforcement ?? null;
+  const baseExpectedNetR = entry && Number.isFinite(entry.expectedNetR) ? entry.expectedNetR : null;
+  const reinforcementAdjustment =
+    executionReinforcement?.scope === "EXACT_LANE_REGIME_SYMBOL" && Number.isFinite(executionReinforcement.adjustment)
+      ? executionReinforcement.adjustment
+      : 0;
+  const adjustedExpectedNetR = baseExpectedNetR === null ? null : baseExpectedNetR + reinforcementAdjustment;
   const reasons: string[] = [];
   const disagreements = detectDisagreements(input);
 
@@ -125,6 +135,14 @@ export function buildExecutiveDecision(input: ExecutiveInput): ExecutiveDecision
   } else if (entry.action.startsWith("WAIT")) {
     candidateStatus = "WAIT";
     reasons.push(`Entry Brain ${entry.action}`);
+  } else if (executionReinforcement?.verdict === "NEGATIVE") {
+    // A sufficiently sampled, exact real-fill cohort says this same lane/regime/symbol/side loses.
+    // This changes only the Four-Brain SHADOW recommendation, never incumbent routing or an order.
+    candidateStatus = "SKIP";
+    reasons.push(
+      `exact Tier-1 testnet reinforcement NEGATIVE (${executionReinforcement.effectiveN} independent blocks, ` +
+        `${executionReinforcement.avgNetR?.toFixed(3) ?? "n/a"}R) — advisory skip`,
+    );
   } else {
     // Entry approval is an advisory quality verdict. Allocation is recorded for audit only;
     // incumbent routing and risk rails remain the sole execution authorities.
@@ -132,6 +150,12 @@ export function buildExecutiveDecision(input: ExecutiveInput): ExecutiveDecision
     if (hurdlePassed && eligible) {
       candidateStatus = "VALID";
       reasons.push("direction + incumbent eligibility + entry pass — ADVISORY ONLY; incumbent and rails retain authority");
+      if (executionReinforcement?.verdict === "POSITIVE") {
+        reasons.push(
+          `exact Tier-1 testnet reinforcement POSITIVE (${executionReinforcement.effectiveN} independent blocks, ` +
+            `${executionReinforcement.avgNetR?.toFixed(3) ?? "n/a"}R, adjustment ${executionReinforcement.adjustment.toFixed(3)})`,
+        );
+      }
     } else {
       candidateStatus = "INCUMBENT_ONLY";
       const missing: string[] = [];
@@ -162,6 +186,16 @@ export function buildExecutiveDecision(input: ExecutiveInput): ExecutiveDecision
     marketContext,
     laneId: input.laneId ?? null,
     symbolOrBasketId: input.symbolOrBasketId ?? null,
+    executionReinforcement,
+    shadowRanking: entry
+      ? {
+          baseExpectedNetR,
+          reinforcementAdjustment,
+          adjustedExpectedNetR,
+          rank: null,
+          rankEligible: false,
+        }
+      : null,
     candidateStatus,
     disagreements,
     reasons,

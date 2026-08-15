@@ -517,6 +517,45 @@ export class BinanceClient {
     return completedCandles(candles, interval, Date.now());
   }
 
+  /**
+   * Public USD-M candles for audit/reconciliation paths.  Do not route
+   * futures-only perpetual symbols through the spot `/api/v3/klines` endpoint:
+   * a spot 404 would otherwise be misclassified upstream as missing outcome
+   * data.  This deliberately remains a public, read-only request and does not
+   * use exchange credentials or the testnet order client.
+   */
+  async getFuturesCandles(symbol: string, interval: string, limit: number, options?: { startTime?: number; endTime?: number }): Promise<Candle[]> {
+    const stage = `futures_candles_${interval}`;
+    const payload = await this.getJson<BinanceKline[]>(
+      symbol,
+      stage,
+      "/fapi/v1/klines",
+      {
+        symbol,
+        interval,
+        limit: String(limit),
+        ...(options?.startTime ? { startTime: String(options.startTime) } : {}),
+        ...(options?.endTime ? { endTime: String(options.endTime) } : {}),
+      },
+      BINANCE_FUTURES_BASE_URL,
+      false,
+    );
+
+    if (!Array.isArray(payload) || payload.some((entry) => !Array.isArray(entry) || entry.length < 6)) {
+      throw new BinanceRequestError("invalid_response", stage, `invalid_response: Binance futures klines were malformed for ${symbol} ${interval}`);
+    }
+
+    const candles = payload.map((entry) => ({
+      openTime: entry[0],
+      open: Number(entry[1]),
+      high: Number(entry[2]),
+      low: Number(entry[3]),
+      close: Number(entry[4]),
+      volume: Number(entry[5]),
+    }));
+    return completedCandles(candles, interval, Date.now());
+  }
+
   async getTicker24h(symbol: string): Promise<Ticker24hSnapshot> {
     const payload = await this.getJson<BinanceTicker24h>(
       symbol,

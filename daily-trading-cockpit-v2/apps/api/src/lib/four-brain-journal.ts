@@ -79,6 +79,8 @@ export function buildExecutiveDecisionRecord(exec: ExecutiveDecision, ctx: Execu
     },
     laneId: exec.laneId,
     symbolOrBasketId: exec.symbolOrBasketId,
+    executionReinforcement: exec.executionReinforcement ?? null,
+    shadowRanking: exec.shadowRanking ?? null,
     signalId: ctx.signalId ?? null,
     positionId: ctx.positionId ?? null,
     horizon: ctx.horizon ?? exec.direction?.horizon ?? null,

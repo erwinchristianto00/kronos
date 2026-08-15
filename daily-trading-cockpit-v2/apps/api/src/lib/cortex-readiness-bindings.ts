@@ -33,6 +33,7 @@ import {
   CORTEX_LANE_ROSTER,
 } from "./cortex-refit-runner-bindings.js";
 import { cortexEffectiveRosterSize, cortexRetiredLaneIds } from "./cortex-live-gather.js";
+import { resolveCortexTestnetFocus } from "./cortex-testnet-focus.js";
 import {
   computeCortexReadiness,
   getCortexReadinessHistoryStore,
@@ -89,6 +90,7 @@ export function buildLocalCortexReadiness(deps: {
   const env = deps.env ?? process.env;
   const dataDir = deps.dataDir ?? "data";
   const nowMs = deps.nowMs ?? Date.now();
+  const focus = resolveCortexTestnetFocus(env);
 
   let brain: CortexReadinessBrainInput | null = null;
   try {
@@ -156,8 +158,8 @@ export function buildLocalCortexReadiness(deps: {
     collection,
     decisionAlpha,
     history: historyStore.all(),
-    rosterSize: cortexEffectiveRosterSize(),
-    retiredLaneCount: cortexRetiredLaneIds().size,
+    rosterSize: focus ? focus.laneIds.size : cortexEffectiveRosterSize(),
+    retiredLaneCount: focus ? 0 : cortexRetiredLaneIds().size,
     nowMs,
   });
 

@@ -14,7 +14,10 @@ import {
   CrossSectionalExecutorStore,
   CROSS_SECTIONAL_TREND_LANE_ID,
   crossSectionalMarketNeutralIsAllowed,
+  evaluateCrossSectionalOverlap,
+  crossSectionalSymbolNettingConflict,
   isCrossSectionalTrendMixedAdmissionIndependent,
+  voidClosedCrossSectionalBasketForReporting,
   type CrossSectionalExecClient,
   type ExecutorBasket,
 } from "../src/lib/cross-sectional-executor.js";
@@ -67,7 +70,42 @@ function signalObs(openedAtMs: number): CrossSectionalObservation {
     longLegReturn: null,
     shortLegReturn: null,
     resolvedAt: null,
+    riskDistanceAtOpen: 0.01,
   };
+}
+
+function attachSmartFormation(observation: CrossSectionalObservation, invalidated = false): CrossSectionalObservation {
+  observation.longLeg[0]!.volatilityAtOpen = 0.01;
+  observation.shortLeg[0]!.volatilityAtOpen = 0.01;
+  observation.smartFormation = {
+    version: "SMART_BASKET_V1",
+    candidatePoolSize: 2,
+    axisScore: 0,
+    objectiveScore: 1,
+    candidates: [
+      {
+        symbol: "SOLUSDT",
+        side: "LONG",
+        score: invalidated ? -0.02 : 0.02,
+        fastSupport: invalidated ? -0.6 : 0.6,
+        adverseExtensionVol: 0,
+        utility: 1,
+        selected: true,
+        cluster: "L1",
+      },
+      {
+        symbol: "DOGEUSDT",
+        side: "SHORT",
+        score: invalidated ? 0.02 : -0.02,
+        fastSupport: invalidated ? -0.6 : 0.6,
+        adverseExtensionVol: 0,
+        utility: 1,
+        selected: true,
+        cluster: "MEME",
+      },
+    ],
+  };
+  return observation;
 }
 
 class FakeExecClient implements CrossSectionalExecClient {
@@ -219,7 +257,8 @@ class FakeExecClient implements CrossSectionalExecClient {
   }
 }
 
-function makeExecutor(opts: { client?: FakeExecClient; allowed?: boolean; laneWeightPct?: number; rawLaneWeightPct?: number; cortexRealAttribution?: CortexRealAttributionStore; laneId?: string; signalMs?: number; dailyMaxLossUsd?: number; entryHealthAllowed?: boolean; siblingOpenLegs?: () => Array<{ symbol: string; side: "LONG" | "SHORT"; qty: number }>; existingNotionalForSymbol?: (symbol: string) => number; maxNotionalPerSymbolAcrossLanes?: number; respectSignalRiskGeometry?: boolean;
+function makeExecutor(opts: { client?: FakeExecClient; allowed?: boolean; laneWeightPct?: number; rawLaneWeightPct?: number; cortexRealAttribution?: CortexRealAttributionStore; laneId?: string; signalMs?: number; dailyMaxLossUsd?: number; entryHealthAllowed?: boolean; entryHealthReason?: string | null; siblingOpenLegs?: () => Array<{ symbol: string; side: "LONG" | "SHORT"; qty: number }>; existingNotionalForSymbol?: (symbol: string) => number; maxNotionalPerSymbolAcrossLanes?: number; respectSignalRiskGeometry?: boolean;
+  smartBasketEnabled?: boolean; smartMaxAdverseEntryDriftVol?: number; smartMinAdverseEntryDriftPct?: number; smartInvalidationScans?: number; smartMfeArmNetReturn?: number; smartMfeGivebackFraction?: number;
   reserveExposure?: (req: { executorId: string; symbol: string; direction: "LONG" | "SHORT"; requestedNotionalUsd: number; clientOrderId: string; basketId?: string }) => { ok: boolean; reservationId: string | null; reason?: string };
   commitExposureReservation?: (reservationId: string, filled: { qty: number; avgPrice: number }) => void;
   releaseExposureReservation?: (reservationId: string, reason: string) => void;
@@ -245,7 +284,7 @@ function makeExecutor(opts: { client?: FakeExecClient; allowed?: boolean; laneWe
     // Injected (not process.env) — env mutation in tests leaks across vitest worker threads.
     ...(opts.dailyMaxLossUsd !== undefined ? { dailyMaxLossUsd: () => opts.dailyMaxLossUsd! } : {}),
     ...(opts.entryHealthAllowed !== undefined
-      ? { entryHealthGate: () => ({ allowed: opts.entryHealthAllowed!, reason: opts.entryHealthAllowed ? null : "rolling edge negative" }) }
+      ? { entryHealthGate: () => ({ allowed: opts.entryHealthAllowed!, reason: opts.entryHealthAllowed ? null : (opts.entryHealthReason ?? "rolling edge negative") }) }
       : {}),
     ...(opts.siblingOpenLegs !== undefined ? { siblingOpenLegs: opts.siblingOpenLegs } : {}),
     ...(opts.existingNotionalForSymbol !== undefined ? { existingNotionalForSymbol: opts.existingNotionalForSymbol } : {}),
@@ -255,6 +294,12 @@ function makeExecutor(opts: { client?: FakeExecClient; allowed?: boolean; laneWe
     ...(opts.respectSignalRiskGeometry !== undefined
       ? { respectSignalRiskGeometry: opts.respectSignalRiskGeometry }
       : {}),
+    ...(opts.smartBasketEnabled !== undefined ? { smartBasketEnabled: () => opts.smartBasketEnabled! } : {}),
+    ...(opts.smartMaxAdverseEntryDriftVol !== undefined ? { smartMaxAdverseEntryDriftVol: () => opts.smartMaxAdverseEntryDriftVol! } : {}),
+    ...(opts.smartMinAdverseEntryDriftPct !== undefined ? { smartMinAdverseEntryDriftPct: () => opts.smartMinAdverseEntryDriftPct! } : {}),
+    ...(opts.smartInvalidationScans !== undefined ? { smartInvalidationScans: () => opts.smartInvalidationScans! } : {}),
+    ...(opts.smartMfeArmNetReturn !== undefined ? { smartMfeArmNetReturn: () => opts.smartMfeArmNetReturn! } : {}),
+    ...(opts.smartMfeGivebackFraction !== undefined ? { smartMfeGivebackFraction: () => opts.smartMfeGivebackFraction! } : {}),
     ...(opts.reserveExposure ? { reserveExposure: opts.reserveExposure } : {}),
     ...(opts.commitExposureReservation ? { commitExposureReservation: opts.commitExposureReservation } : {}),
     ...(opts.releaseExposureReservation ? { releaseExposureReservation: opts.releaseExposureReservation } : {}),
@@ -304,6 +349,96 @@ function makeFakeReservationLedger() {
     },
   };
 }
+
+function overlapSignal(side: "LONG" | "SHORT", scoreAtOpen: number): CrossSectionalObservation {
+  const observation = signalObs(NOW_MS);
+  const leg = { symbol: "SOLUSDT", entryPrice: 100, exitPrice: null, scoreAtOpen, volatilityAtOpen: 0.01 };
+  observation.longLeg = side === "LONG" ? [leg] : [];
+  observation.shortLeg = side === "SHORT" ? [leg] : [];
+  return observation;
+}
+
+function overlapBasket(side: "LONG" | "SHORT", scoreAtOpen?: number | null): ExecutorBasket {
+  return {
+    basketId: "legacy-open-basket",
+    sourceObservationId: "legacy-observation",
+    signal: "MOM36_FILTERED",
+    variant: "FILTERED",
+    openedAt: NOW,
+    closesAtMs: NOW_MS + 24 * 3_600_000,
+    legs: [{
+      symbol: "SOLUSDT",
+      side,
+      qty: 1,
+      entryPrice: 100,
+      entryOrderId: "legacy-order",
+      entryPriceConfirmed: true,
+      exitPrice: null,
+      exitOrderId: null,
+      exitPriceConfirmed: null,
+      ...(scoreAtOpen === undefined ? {} : { scoreAtOpen }),
+    }],
+    status: "COMPLETE",
+    closedAt: null,
+    closeReason: null,
+    grossPnlUsd: null,
+    feeEstimateUsd: null,
+    netPnlUsd: null,
+  };
+}
+
+describe("cross-sectional overlap guard legacy-score compatibility", () => {
+  const limits = {
+    maxTotal: 2,
+    maxPerSide: 1,
+    minScoreDelta: 0.005,
+    minAbsScore: 0.03,
+    maxAdverseExtensionVol: 1,
+    minAdverseExtensionPct: 0.006,
+    maxSignalDriftVol: 0.5,
+    minSignalDriftPct: 0.0035,
+  };
+
+  it("allows a positive same-side legacy repeat only when the fresh score clears the stronger fallback", () => {
+    const basket = overlapBasket("LONG"); // deliberately no historical score
+    const result = evaluateCrossSectionalOverlap(
+      overlapSignal("LONG", 0.04),
+      [basket],
+      { SOLUSDT: 100.2 }, // positive after the estimated close cost and still inside normal range
+      0.001,
+      limits,
+    );
+
+    expect(result).toEqual({ allowed: true, reason: null, repeatedSymbols: ["SOLUSDT LONG"] });
+    expect(basket.legs[0]!.scoreAtOpen).toBeUndefined(); // never fabricate legacy history
+  });
+
+  it("keeps a legacy repeat blocked when the fresh score is not stronger than the fallback floor", () => {
+    const result = evaluateCrossSectionalOverlap(
+      overlapSignal("LONG", 0.034), // normal floor 0.030 + required legacy margin 0.005
+      [overlapBasket("LONG")],
+      { SOLUSDT: 100.2 },
+      0.001,
+      limits,
+    );
+
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toBe("overlap guard: SOLUSDT legacy predecessor requires stronger continuation conviction");
+  });
+
+  it("still refuses a legacy row when the candidate would create opposite-side exposure", () => {
+    const result = evaluateCrossSectionalOverlap(
+      overlapSignal("SHORT", -0.05),
+      [overlapBasket("LONG")],
+      { SOLUSDT: 99.8 },
+      0.001,
+      limits,
+    );
+
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toBe("overlap guard: SOLUSDT already has opposite-side exposure");
+  });
+});
 
 describe("CrossSectionalExecutor — account-exposure reservation wiring (2026-08-04)", () => {
   it("reserves both legs upfront (same basketId, per-leg clientOrderId matching what placeOrder submits) and commits each from its actual fill", async () => {
@@ -364,6 +499,13 @@ describe("CrossSectionalExecutor — account-exposure reservation wiring (2026-0
     expect(sol.req.symbol).toBe("SOLUSDT");
     expect(sol.status).toBe("RELEASED");
     expect(sol.releaseReason).toBe("SIBLING_LEG_RESERVE_FAILED:DOGEUSDT: forced test rejection");
+    expect(executor.getStatus().entryAttemptAudit.latest).toMatchObject({
+      stage: "EXPOSURE_RESERVATION",
+      outcome: "SKIPPED",
+      sourceObservationId: `xsec:MOM24:${NOW_MS - 5 * 60_000}`,
+      reason: "DOGEUSDT shared exposure reservation rejected: DOGEUSDT: forced test rejection",
+      watermarkAdvanced: true,
+    });
   });
 
   it("[AMBIGUOUS FAILURE, RECONCILED NOT_PLACED] releases the failed leg's reservation once THIS tick's own exchange reconciliation confirms it never reached the exchange, still decides hedge/rollback the SAME tick", async () => {
@@ -557,12 +699,12 @@ describe("[LIVE-TICK RECONCILIATION] an ambiguous entry-leg failure reconciles a
     await executor.tick();
 
     const basket = store.getState().baskets[0]!;
-    expect(basket.status).toBe("COMPLETE"); // kept as a smaller, still-balanced hedge, not aborted
+    expect(basket.status).toBe("ABORTED");
     expect(basket.legs).toHaveLength(2);
     expect(basket.legs.map((l) => l.symbol).sort()).toEqual(["DOGEUSDT", "SOLUSDT"]);
     expect(basket.plan![2]).toMatchObject({ symbol: "RNDRUSDT", status: "FAILED" });
-    expect(client.placed.filter((p) => p.reduceOnly)).toHaveLength(0); // neither open leg unwound
-    expect(client.queryOrderByClientIdCallCount).toBe(1); // reconciled BEFORE deciding hedge-vs-rollback
+    expect(client.placed.filter((p) => p.reduceOnly)).toHaveLength(2); // every earlier fill is unwound
+    expect(client.queryOrderByClientIdCallCount).toBe(1); // reconciled before the rollback decision
     const rndr = [...ledger.reservations.values()].find((r) => r.req.symbol === "RNDRUSDT")!;
     expect(rndr.status).toBe("RELEASED");
     expect(rndr.releaseReason).toMatch(/^ENTRY_FAILED_RECONCILED_NOT_PLACED:/);
@@ -766,6 +908,12 @@ describe("cross-sectional executor (basket execution, testnet-first)", () => {
       { symbol: "SOLUSDT", leverage: 3 },
       { symbol: "DOGEUSDT", leverage: 3 },
     ]);
+    expect(executor.getStatus().entryAttemptAudit.latest).toMatchObject({
+      stage: "BASKET_RESERVED",
+      outcome: "ADMITTED",
+      sourceObservationId: `xsec:MOM24:${NOW_MS - 5 * 60_000}`,
+      watermarkAdvanced: true,
+    });
     // Watermark advanced — a second tick does NOT reopen the same signal.
     await executor.tick();
     expect(store.getState().baskets.length).toBe(1);
@@ -795,6 +943,152 @@ describe("cross-sectional executor (basket execution, testnet-first)", () => {
     expect(store.getState().baskets[0]!.closeReason).toBe("SIGNAL_STOP");
   });
 
+  it("[SMART BASKET V1] refreshes the live mark before sizing and defers only a run-away adverse entry", async () => {
+    const client = new FakeExecClient();
+    const { executor, signalStore, store, storeDir } = makeExecutor({
+      client,
+      signalMs: NOW_MS - 5 * 60_000,
+      smartBasketEnabled: true,
+      smartMaxAdverseEntryDriftVol: 0.5,
+      smartMinAdverseEntryDriftPct: 0.001,
+    });
+    attachSmartFormation(signalStore.all[0]!);
+    client.markPriceBySymbol.set("SOLUSDT", 101); // +1%, 1.0σ adverse for a LONG chase
+    client.markPriceBySymbol.set("DOGEUSDT", 0.1);
+
+    await executor.tick();
+
+    expect(client.placed).toHaveLength(0);
+    expect(store.getState().baskets).toHaveLength(0);
+    expect(executor.getStatus().openHalted).toContain("await next fresh scan");
+    expect(executor.getStatus().entryAttemptAudit.latest).toMatchObject({
+      stage: "SMART_ENTRY_REVALIDATION",
+      outcome: "SKIPPED",
+      sourceObservationId: `xsec:MOM24:${NOW_MS - 5 * 60_000}`,
+      // Revalidation stops on the first run-away leg; it must not pretend it checked DOGE too.
+      referencePrices: { SOLUSDT: 101 },
+      watermarkAdvanced: true,
+    });
+    // The reason survives a process restart; it is not merely tick-local openHalted text.
+    const reloaded = new CrossSectionalExecutorStore(storeDir);
+    expect(reloaded.getState().entryAttempts?.[0]).toMatchObject({
+      stage: "SMART_ENTRY_REVALIDATION",
+      outcome: "SKIPPED",
+    });
+  });
+
+  it("[SMART BASKET V1] records a two-scan context invalidation, but leaves the first warning alone", async () => {
+    const client = new FakeExecClient();
+    client.fillPriceBySymbol.set("SOLUSDT", 100);
+    client.fillPriceBySymbol.set("DOGEUSDT", 0.1);
+    const { executor, signalStore, store } = makeExecutor({
+      client,
+      signalMs: NOW_MS - 5 * 60_000,
+      smartBasketEnabled: true,
+      respectSignalRiskGeometry: true,
+      smartInvalidationScans: 2,
+      smartMfeArmNetReturn: 0.02, // exercise context invalidation rather than MFE giveback
+    });
+    attachSmartFormation(signalStore.all[0]!);
+    signalStore.all[0]!.takeProfitReturn = null;
+    await executor.tick();
+    const basket = store.getState().baskets[0]!;
+    expect(basket.status).toBe("COMPLETE");
+
+    client.markPriceBySymbol.set("SOLUSDT", 99);
+    client.markPriceBySymbol.set("DOGEUSDT", 0.101);
+    client.fillPriceBySymbol.set("SOLUSDT", 99);
+    client.fillPriceBySymbol.set("DOGEUSDT", 0.101);
+    signalStore.add(attachSmartFormation(signalObs(NOW_MS - 4 * 60_000), true));
+    await executor.tick();
+    expect(basket.status).toBe("COMPLETE");
+    expect(basket.smartBasket!.consecutiveInvalidationScans).toBe(1);
+
+    signalStore.add(attachSmartFormation(signalObs(NOW_MS - 3 * 60_000), true));
+    await executor.tick();
+    expect(basket.status).toBe("CLOSED");
+    expect(basket.closeReason).toBe("SMART_CONTEXT_INVALIDATION");
+  });
+
+  it("[SMART BASKET V1] closes a losing regime flip only after two fresh confirming scans", async () => {
+    const before = process.env.CROSS_SECTIONAL_SMART_REGIME_LOSS_EXIT;
+    try {
+      process.env.CROSS_SECTIONAL_SMART_REGIME_LOSS_EXIT = "1";
+      const client = new FakeExecClient();
+      client.fillPriceBySymbol.set("SOLUSDT", 100);
+      client.fillPriceBySymbol.set("DOGEUSDT", 0.1);
+      const { executor, signalStore, store } = makeExecutor({
+        client,
+        signalMs: NOW_MS - 5 * 60_000,
+        smartBasketEnabled: true,
+        respectSignalRiskGeometry: true,
+        smartInvalidationScans: 2,
+      });
+      attachSmartFormation(signalStore.all[0]!);
+      signalStore.all[0]!.regimeClassAtOpen = "MIXED_CHOP";
+      signalStore.all[0]!.takeProfitReturn = null;
+      await executor.tick();
+      const basket = store.getState().baskets[0]!;
+
+      client.markPriceBySymbol.set("SOLUSDT", 99);
+      client.markPriceBySymbol.set("DOGEUSDT", 0.101);
+      client.fillPriceBySymbol.set("SOLUSDT", 99);
+      client.fillPriceBySymbol.set("DOGEUSDT", 0.101);
+      const first = attachSmartFormation(signalObs(NOW_MS - 4 * 60_000));
+      first.regimeClassAtOpen = "TREND_SHORT";
+      signalStore.add(first);
+      await executor.tick();
+      expect(basket.status).toBe("COMPLETE");
+      expect(basket.smartBasket!.consecutiveRegimeLossScans).toBe(1);
+
+      const second = attachSmartFormation(signalObs(NOW_MS - 3 * 60_000));
+      second.regimeClassAtOpen = "TREND_SHORT";
+      signalStore.add(second);
+      await executor.tick();
+      expect(basket.status).toBe("CLOSED");
+      expect(basket.closeReason).toBe("SMART_REGIME_LOSS_EXIT");
+    } finally {
+      if (before === undefined) delete process.env.CROSS_SECTIONAL_SMART_REGIME_LOSS_EXIT;
+      else process.env.CROSS_SECTIONAL_SMART_REGIME_LOSS_EXIT = before;
+    }
+  });
+
+  it("[SMART BASKET V1] banks a verified MFE giveback only after the same two-scan invalidation", async () => {
+    const client = new FakeExecClient();
+    client.fillPriceBySymbol.set("SOLUSDT", 100);
+    client.fillPriceBySymbol.set("DOGEUSDT", 0.1);
+    const { executor, signalStore, store } = makeExecutor({
+      client,
+      signalMs: NOW_MS - 5 * 60_000,
+      smartBasketEnabled: true,
+      respectSignalRiskGeometry: true,
+      smartInvalidationScans: 2,
+      smartMfeArmNetReturn: 0.002,
+      smartMfeGivebackFraction: 0.5,
+    });
+    attachSmartFormation(signalStore.all[0]!);
+    signalStore.all[0]!.takeProfitReturn = null;
+    await executor.tick();
+    const basket = store.getState().baskets[0]!;
+
+    client.markPriceBySymbol.set("SOLUSDT", 101);
+    client.markPriceBySymbol.set("DOGEUSDT", 0.099);
+    await executor.tick();
+    expect(basket.smartBasket!.maxNetReturn).toBeGreaterThan(0.002);
+
+    client.markPriceBySymbol.set("SOLUSDT", 99);
+    client.markPriceBySymbol.set("DOGEUSDT", 0.101);
+    client.fillPriceBySymbol.set("SOLUSDT", 99);
+    client.fillPriceBySymbol.set("DOGEUSDT", 0.101);
+    signalStore.add(attachSmartFormation(signalObs(NOW_MS - 4 * 60_000), true));
+    await executor.tick();
+    signalStore.add(attachSmartFormation(signalObs(NOW_MS - 3 * 60_000), true));
+    await executor.tick();
+
+    expect(basket.status).toBe("CLOSED");
+    expect(basket.closeReason).toBe("SMART_MFE_GIVEBACK");
+  });
+
   it("skips stale signals (older than the freshness window)", async () => {
     const { executor, store } = makeExecutor({ signalMs: NOW_MS - 60 * 60_000 });
     await executor.tick();
@@ -812,6 +1106,59 @@ describe("cross-sectional executor (basket execution, testnet-first)", () => {
     await executor.tick();
     expect(store.getState().baskets.length).toBe(0);
     expect(executor.getStatus()).toMatchObject({ allowed: false, openHalted: "rolling edge negative" });
+  });
+
+  it("[TRAFFIC LIGHT] turns only a Smart Basket V1 cold start into a reduced-size testnet basket, not a global bypass", async () => {
+    const keys = [
+      "LIVE_BINANCE_ENV",
+      "CROSS_SECTIONAL_ENTRY_TRAFFIC_LIGHT",
+      "CROSS_SECTIONAL_TESTNET_LEARNING_COHORT",
+      "CROSS_SECTIONAL_TESTNET_LEARNING_LEG_MULTIPLIER",
+      "CROSS_SECTIONAL_TESTNET_LEARNING_MAX_OPEN",
+      "CROSS_SECTIONAL_EXEC_FORCE_IGNORE_ENTRY_HEALTH",
+    ] as const;
+    const before = new Map(keys.map((key) => [key, process.env[key]]));
+    try {
+      Object.assign(process.env, {
+        LIVE_BINANCE_ENV: "testnet",
+        CROSS_SECTIONAL_ENTRY_TRAFFIC_LIGHT: "1",
+        CROSS_SECTIONAL_TESTNET_LEARNING_COHORT: "1",
+        CROSS_SECTIONAL_TESTNET_LEARNING_LEG_MULTIPLIER: "0.35",
+        CROSS_SECTIONAL_TESTNET_LEARNING_MAX_OPEN: "2",
+        CROSS_SECTIONAL_EXEC_FORCE_IGNORE_ENTRY_HEALTH: "0",
+      });
+      const client = new FakeExecClient();
+      client.fillPriceBySymbol.set("SOLUSDT", 100);
+      client.fillPriceBySymbol.set("DOGEUSDT", 0.1);
+      const { executor, signalStore, store } = makeExecutor({
+        client,
+        signalMs: NOW_MS - 5 * 60_000,
+        entryHealthAllowed: false,
+        entryHealthReason: "rolling evidence incomplete: 0/8 recent closes",
+        smartBasketEnabled: true,
+      });
+      attachSmartFormation(signalStore.all[0]!);
+
+      await executor.tick();
+
+      const basket = store.getState().baskets[0]!;
+      expect(basket.status).toBe("COMPLETE");
+      expect(basket.entryAdmission).toMatchObject({ tier: "YELLOW", learning: true, sizeMultiplier: 0.35 });
+      // $25 normal leg × 35% learning size: SOL rounds $8.75/100 up to 0.09 on its 0.01 step.
+      expect(basket.legs.find((leg) => leg.symbol === "SOLUSDT")!.qty).toBeCloseTo(0.09, 9);
+      expect(executor.getStatus()).toMatchObject({
+        allowed: true,
+        entryHealthBypassed: false,
+        entryAdmission: { tier: "YELLOW", allowed: true, learning: true },
+        entryAdmissionAudit: { yellowAdmitted: 1 },
+      });
+    } finally {
+      for (const key of keys) {
+        const value = before.get(key);
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
   });
 
   // ── 2026-08-04 fail-closed innovation campaign control ────────────────────────────────────
@@ -1241,6 +1588,32 @@ describe("cross-sectional executor (basket execution, testnet-first)", () => {
     await executor.tick();
 
     expect(basket.status).toBe("COMPLETE");
+  });
+
+  it("records a restart-durable per-leg MFE/MAE path from real marks without changing basket exits", async () => {
+    const client = new FakeExecClient();
+    client.fillPriceBySymbol.set("SOLUSDT", 100);
+    client.fillPriceBySymbol.set("DOGEUSDT", 0.1);
+    const { executor, store, storeDir } = makeExecutor({ client, signalMs: NOW_MS - 5 * 60_000 });
+    await executor.tick();
+    const basket = store.getState().baskets[0]!;
+
+    client.markPriceBySymbol.set("SOLUSDT", 100.5); // long +0.5R at a 1% frozen risk
+    client.markPriceBySymbol.set("DOGEUSDT", 0.101); // short -1R
+    await executor.tick();
+
+    const sol = basket.legs.find((leg) => leg.symbol === "SOLUSDT")!;
+    const doge = basket.legs.find((leg) => leg.symbol === "DOGEUSDT")!;
+    expect(sol.maxFavorableR).toBeCloseTo(0.5, 9);
+    expect(sol.maxAdverseR).toBe(0);
+    expect(doge.maxFavorableR).toBe(0);
+    expect(doge.maxAdverseR).toBeCloseTo(1, 9);
+    expect(sol.lastMarkPrice).toBe(100.5);
+    expect(sol.pathStartedAt).toBeTruthy();
+    expect(basket.status).toBe("COMPLETE");
+
+    const reloaded = new CrossSectionalExecutorStore(storeDir);
+    expect(reloaded.getState().baskets[0]!.legs.find((leg) => leg.symbol === "SOLUSDT")!.maxFavorableR).toBeCloseTo(0.5, 9);
   });
 
   it("PROFIT BANK: never forces a decision on incomplete mark-price data (one leg missing)", async () => {
@@ -1864,6 +2237,42 @@ describe("[ACCOUNTING-INCOMPLETE] every closed-basket P&L consumer excludes an A
     seed(store);
     const closed = executor.getClosedBaskets();
     expect(closed.map((b) => b.basketId)).toEqual(["normal"]);
+  });
+
+  it("[OPERATOR-VOID] excludes one known closed basket from P&L, timeline, and edge readers while preserving its raw audit row", () => {
+    const { executor, store } = makeExecutor();
+    seed(store);
+    const voided = makeBasket({
+      basketId: "operator-void",
+      closedAt: "2026-07-02T02:30:00.000Z",
+      legs: [closedLeg("NEARUSDT", 10, 1)],
+      grossPnlUsd: -9,
+      feeEstimateUsd: 1,
+      netPnlUsd: -10,
+    });
+    store.getState().baskets.push(voided);
+
+    const result = voidClosedCrossSectionalBasketForReporting(store, "operator-void", {
+      reason: "operator-scoped close was declared invalid for the testnet cohort",
+      voidedAt: NOW,
+    });
+    expect(result).toMatchObject({ ok: true, alreadyVoided: false, basketId: "operator-void", sourceObservationId: "src-operator-void" });
+    expect(store.getState().baskets.find((basket) => basket.basketId === "operator-void")?.reportingExclusion).toMatchObject({
+      kind: "OPERATOR_VOID",
+      voidedAt: NOW,
+    });
+
+    const status = executor.getStatus();
+    expect(status.closedCount).toBe(1);
+    expect(status.totalNetPnlUsd).toBe(5);
+    expect(status.dailyRealizedUsd).toBe(5);
+    expect(status.recent.some((basket) => basket.basketId === "operator-void")).toBe(false);
+    expect(executor.getClosedBaskets().map((basket) => basket.basketId)).toEqual(["normal"]);
+    expect(executor.getClosedSummary()).toMatchObject({ closedCount: 1, realizedPnlUsd: 5, feesUsd: 0.5 });
+    expect(executor.getRegimeSkewCounterfactual().skewedCount).toBe(1);
+    // Raw audit remains available and contains the void marker rather than an erased order history.
+    expect(executor.getClosedBasketsForAudit().map((basket) => basket.basketId)).toContain("operator-void");
+    expect(voidClosedCrossSectionalBasketForReporting(store, "operator-void", { reason: "ignored on retry" })).toMatchObject({ ok: true, alreadyVoided: true });
   });
 
   it("getRegimeSkewCounterfactual(): its skewed cohort excludes it even though it IS skewed with a resolved exit price", () => {
@@ -2563,25 +2972,25 @@ describe("[TP-MATH FIX] closeBasketsHittingProfitTarget skips lopsided (non-two-
       client, signalStore, store, isAllowed: () => true, nowIso: () => NOW, fillConfirmRetryDelayMs: 0,
     });
 
-    await executor.tick(); // opens, fails on RNDR — kept COMPLETE as a 2-long/1-short reduced hedge
+    await executor.tick(); // opens, fails on RNDR — all already-filled legs must roll back
 
     const basket = store.getState().baskets[0]!;
-    expect(basket.status).toBe("COMPLETE");
+    expect(basket.status).toBe("ABORTED");
     expect(basket.legs).toHaveLength(3);
     expect(basket.legs.filter((l) => l.side === "LONG")).toHaveLength(2);
     expect(basket.legs.filter((l) => l.side === "SHORT")).toHaveLength(1); // unequal — not the plan's shape
     expect(basket.plan).toHaveLength(4);
 
-    // Try to trivially trigger PROFIT_BANK: a huge implied gain on every real leg.
+    // A terminal ABORTED basket is never scored for PROFIT_BANK.
     client.markPriceBySymbol.set("SOLUSDT", 1000);
     client.markPriceBySymbol.set("ADAUSDT", 1000);
     client.markPriceBySymbol.set("DOGEUSDT", 0.001);
     await executor.tick();
 
-    expect(basket.status).toBe("COMPLETE"); // never closed
-    expect(basket.closeReason).toBeNull();
+    expect(basket.status).toBe("ABORTED");
+    expect(basket.closeReason).toMatch(/OPEN_FAILED/);
     expect(basket.lastNetReturn).toBeUndefined(); // never even stamped — skipped entirely, not scored
-    expect(client.placed.filter((p) => p.reduceOnly)).toHaveLength(0); // no close order ever fired
+    expect(client.placed.filter((p) => p.reduceOnly)).toHaveLength(3); // every earlier fill was rolled back
   });
 
   it("[REVIEW ROUND 3 FIX] a genuinely two-sided COMPLETE basket with MULTIPLE legs per side that fully matches its own plan is unaffected — still scores and PROFIT_BANKs normally", async () => {
@@ -2986,11 +3395,9 @@ describe("[CRITICAL LATCH] unresolved orphaned exposure blocks new baskets, neve
   });
 });
 
-describe("[HEDGE-OR-ROLLBACK] partial-failure decision: keep an already-balanced partial hedge, still roll back a one-sided one", () => {
-  /** A 3-leg signal (1 long, 2 short) so a failure on the LAST leg leaves the already-filled subset
-   *  genuinely balanced (1 long + 1 short) — plan order is every LONG first, then every SHORT (see
-   *  maybeOpenBasket's own sizing loop), so this is the minimal shape where "safe to hedge" can
-   *  ever be true after a failure. */
+describe("[ROLLBACK ON ANY LEG FAILURE] partial-failure decision", () => {
+  /** A 3-leg signal (1 long, 2 short) where the last-leg failure follows one long and one short
+   * fill. Even this apparently balanced subset must be flattened: it is not the selected basket. */
   function threeLegSignal(openedAtMs: number): CrossSectionalObservation {
     return {
       observationId: `xsec:MOM24:${openedAtMs}`,
@@ -3015,7 +3422,7 @@ describe("[HEDGE-OR-ROLLBACK] partial-failure decision: keep an already-balanced
     };
   }
 
-  it("keeps a reduced basket OPEN as a genuine hedge when the failed leg's already-filled siblings span both sides", async () => {
+  it("aborts and flattens when the failed leg's already-filled siblings span both sides", async () => {
     const client = new FakeExecClient();
     client.fillPriceBySymbol.set("SOLUSDT", 100);
     client.fillPriceBySymbol.set("DOGEUSDT", 0.1);
@@ -3032,24 +3439,20 @@ describe("[HEDGE-OR-ROLLBACK] partial-failure decision: keep an already-balanced
     await executor.tick();
 
     const basket = store.getState().baskets[0]!;
-    // FAIL-WITHOUT-FIX: before this fix, ANY leg failure unconditionally flattened every
-    // already-filled leg, even when — as here — they already formed a genuine, balanced hedge.
-    expect(basket.status).toBe("COMPLETE"); // kept as a smaller, still-balanced hedge, not aborted
-    expect(basket.closedAt).toBeNull();
+    expect(basket.status).toBe("ABORTED");
+    expect(basket.closedAt).toBe(NOW);
     expect(basket.legs).toHaveLength(2);
     expect(basket.legs.map((l) => l.symbol).sort()).toEqual(["DOGEUSDT", "SOLUSDT"]);
-    // Neither already-open leg was unwound.
-    expect(client.placed.filter((p) => p.reduceOnly)).toHaveLength(0);
+    // Both already-open legs were unwound.
+    expect(client.placed.filter((p) => p.reduceOnly)).toHaveLength(2);
     // The failed leg is durably marked, never silently retried or guessed at.
     expect(basket.plan![2]).toMatchObject({ symbol: "RNDRUSDT", status: "FAILED" });
-    // A COMPLETE basket is outside recoverIncompleteBaskets' RESERVED/PLACING/PARTIALLY_FILLED
-    // filter — a later tick must never try to place the abandoned RNDR leg, even once the
-    // injected failure is gone (proves this is a genuine "never revisited" outcome, not merely
-    // "still failing the same way").
+    // A terminal ABORTED basket must never try to place the abandoned RNDR leg later.
     client.failOnSymbol = null;
     await executor.tick();
     expect(client.placed.filter((p) => p.symbol === "RNDRUSDT")).toHaveLength(0);
     expect(store.getState().baskets).toHaveLength(1);
+    expect(store.getState().baskets[0]!.status).toBe("ABORTED");
     expect(store.getState().baskets[0]!.legs).toHaveLength(2);
     expect(store.getState().baskets[0]!.plan![2]).toMatchObject({ symbol: "RNDRUSDT", status: "FAILED" });
   });
@@ -4289,5 +4692,48 @@ describe("[RESTART-RECOVERY: KILL-SWITCH RELEASES THE WHOLE NEVER-ATTEMPTED TAIL
     // FAIL-WITHOUT-FIX: `released` would be empty — BOTH reservations leaked.
     expect(released.map((r) => r.reservationId).sort()).toEqual(["res-doge-2", "res-sol-2"]);
     expect(basket.plan!.every((p) => p.status === "NEVER_ATTEMPTED")).toBe(true);
+  });
+});
+
+describe("cross-sectional-executor — pre-open netting guard (2026-08-15)", () => {
+  it("[NETTING-REAL] replays 2026-08-14: intending LONG while the account already nets SHORT", () => {
+    // directional lane held ETHUSDT SHORT 0.013; no sibling BASKET held ETH, so nothing explains it
+    expect(crossSectionalSymbolNettingConflict("LONG", -0.013, 0)).toBe(true);
+  });
+
+  it("[NETTING-CLEAN] exposure on OUR OWN side is never a conflict", () => {
+    expect(crossSectionalSymbolNettingConflict("LONG", 0.013, 0)).toBe(false);
+    expect(crossSectionalSymbolNettingConflict("SHORT", -0.013, 0)).toBe(false);
+    expect(crossSectionalSymbolNettingConflict("LONG", 999, 0)).toBe(false);
+  });
+
+  it("[NETTING-SIBLING] a sibling BASKET holding the other side is the designed-for case, not a conflict", () => {
+    expect(crossSectionalSymbolNettingConflict("LONG", -0.011, 0.011)).toBe(false);
+    expect(crossSectionalSymbolNettingConflict("SHORT", 0.011, 0.011)).toBe(false);
+    // one step beyond what siblings account for IS unexplained
+    expect(crossSectionalSymbolNettingConflict("LONG", -0.012, 0.011)).toBe(true);
+    expect(crossSectionalSymbolNettingConflict("SHORT", 0.012, 0.011)).toBe(true);
+  });
+
+  it("[NETTING-FLAT] a flat symbol is free to open on either side", () => {
+    expect(crossSectionalSymbolNettingConflict("LONG", 0, 0)).toBe(false);
+    expect(crossSectionalSymbolNettingConflict("SHORT", 0, 0)).toBe(false);
+  });
+
+  it("[NETTING-GARBAGE] unusable numbers never fabricate a conflict", () => {
+    expect(crossSectionalSymbolNettingConflict("LONG", Number.NaN, 0)).toBe(false);
+    expect(crossSectionalSymbolNettingConflict("LONG", -1, Number.NaN)).toBe(true);
+  });
+
+  it("[NETTING-WIRED] an opposite exchange position on a signal symbol skips the basket BEFORE any order", async () => {
+    const client = new FakeExecClient();
+    // signal wants SOLUSDT LONG; the account already nets SHORT 1 SOL from a lane this executor cannot see
+    client.positionAmtBySymbol.set("SOLUSDT", -1);
+    const { executor, store } = makeExecutor({ client, signalMs: NOW_MS - 5 * 60_000 });
+    await executor.tick();
+    expect(store.getState().baskets.length).toBe(0);
+    expect(client.placed.length).toBe(0); // prevention, not repair — nothing was ever sent
+    expect(executor.getStatus().openHalted).toContain("netting guard");
+    expect(executor.getStatus().openHalted).toContain("SOLUSDT");
   });
 });

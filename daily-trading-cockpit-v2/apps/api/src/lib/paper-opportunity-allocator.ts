@@ -84,6 +84,11 @@ import {
   type LaneSymbolCurationTier,
   type PerSymbolLaneBookEdgeReport,
 } from "./per-symbol-lane-book-edge.js";
+import {
+  isMfeGivebackLaneId,
+  isTestnetCrossSectionalHorizonSourceAllowed,
+  isTestnetMfeGivebackSymbolAllowed,
+} from "./live-executor-wiring.js";
 
 // ─── public report types ──────────────────────────────────────────────────────
 
@@ -1825,6 +1830,28 @@ export function buildPaperOpportunityAllocatorReport(
           : `CG_VARIANT_MATRIX:${def.id}`;
       if (bullTrendCollection && laneId !== `CG_LONG_VARIANT_MATRIX:${def.id}`) {
         recordReject(symbol, direction, def.id, "BULL_TREND_LANE_ID_MISMATCH", rowFresh, rowNet);
+        continue;
+      }
+      // Testnet diagnostic collection may stay broad for research, but the
+      // executable CG_MFE_GIVEBACK rollout is not a broad research lane. Do
+      // not even create a new paper candidate unless BOTH its lane namespace
+      // and symbol are explicitly approved. Historical rows stay untouched for
+      // audit; this only governs forward admission.
+      if (
+        testnetCollectAllLanes &&
+        isMfeGivebackLaneId(laneId) &&
+        !isTestnetCrossSectionalHorizonSourceAllowed("testnet", laneId, symbol)
+      ) {
+        recordReject(
+          symbol,
+          direction,
+          def.id,
+          isTestnetMfeGivebackSymbolAllowed("testnet", laneId, symbol)
+            ? "TESTNET_MFE_GIVEBACK_LANE_NOT_ALLOWED"
+            : "TESTNET_MFE_GIVEBACK_SYMBOL_NOT_ALLOWED",
+          rowFresh,
+          rowNet,
+        );
         continue;
       }
       if (!testnetCollectAllLanes && manualQuarantinedPaperLanes.has(laneId)) {

@@ -60,6 +60,22 @@ export interface CortexRealAttributionRecord {
   cortexUsd: number;
 }
 
+/**
+ * One deliberate reporting exclusion. The original record stays immutable in `records`; these
+ * frozen contribution values let buildReport subtract it from rolling all-time aggregates even
+ * after the detail list has pruned older rows.
+ */
+interface CortexRealAttributionReportingExclusion {
+  recordId: string;
+  laneId: string;
+  aggregateLaneId: string;
+  closedAtIso: string;
+  realizedPnlUsd: number;
+  cortexUsd: number;
+  excludedAt: string;
+  reason: string;
+}
+
 interface CortexRealAttributionAggregate {
   n: number;
   cortexUsd: number;
@@ -75,6 +91,8 @@ interface CortexRealAttributionState {
   perLane: Record<string, CortexRealAttributionAggregate>;
   /** Bounded FIFO of already-booked recordIds (dedup for retried sweeps / restarts). */
   attributedRecordIds: string[];
+  /** Manual report/learning voids. Raw records and exchange fills are intentionally retained. */
+  reportingExclusions?: Record<string, CortexRealAttributionReportingExclusion>;
 }
 
 export interface CortexRealAttributionReport {
@@ -99,7 +117,7 @@ function emptyAggregate(): CortexRealAttributionAggregate {
 }
 
 function emptyState(): CortexRealAttributionState {
-  return { version: 1, records: [], allTime: emptyAggregate(), perLane: {}, attributedRecordIds: [] };
+  return { version: 1, records: [], allTime: emptyAggregate(), perLane: {}, attributedRecordIds: [], reportingExclusions: {} };
 }
 
 function sanitizeAggregate(raw: unknown): CortexRealAttributionAggregate {
@@ -109,6 +127,36 @@ function sanitizeAggregate(raw: unknown): CortexRealAttributionAggregate {
     cortexUsd: Number.isFinite(candidate.cortexUsd) ? (candidate.cortexUsd as number) : 0,
     realizedPnlUsd: Number.isFinite(candidate.realizedPnlUsd) ? (candidate.realizedPnlUsd as number) : 0,
   };
+}
+
+function sanitizeReportingExclusions(raw: unknown): Record<string, CortexRealAttributionReportingExclusion> {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const out: Record<string, CortexRealAttributionReportingExclusion> = {};
+  for (const [recordId, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (!value || typeof value !== "object") continue;
+    const candidate = value as Partial<CortexRealAttributionReportingExclusion>;
+    if (
+      candidate.recordId !== recordId ||
+      typeof candidate.laneId !== "string" ||
+      typeof candidate.aggregateLaneId !== "string" ||
+      typeof candidate.closedAtIso !== "string" ||
+      typeof candidate.excludedAt !== "string" ||
+      typeof candidate.reason !== "string" ||
+      !Number.isFinite(candidate.realizedPnlUsd) ||
+      !Number.isFinite(candidate.cortexUsd)
+    ) continue;
+    out[recordId] = {
+      recordId,
+      laneId: candidate.laneId,
+      aggregateLaneId: candidate.aggregateLaneId,
+      closedAtIso: candidate.closedAtIso,
+      realizedPnlUsd: candidate.realizedPnlUsd as number,
+      cortexUsd: candidate.cortexUsd as number,
+      excludedAt: candidate.excludedAt,
+      reason: candidate.reason,
+    };
+  }
+  return out;
 }
 
 export class CortexRealAttributionStore {
@@ -162,6 +210,7 @@ export class CortexRealAttributionStore {
           attributedRecordIds: Array.isArray(raw.attributedRecordIds)
             ? raw.attributedRecordIds.filter((id): id is string => typeof id === "string").slice(-MAX_ATTRIBUTED_IDS)
             : [],
+          reportingExclusions: sanitizeReportingExclusions(raw.reportingExclusions),
         };
       }
     } catch {
@@ -177,6 +226,40 @@ export class CortexRealAttributionStore {
 
   hasRecorded(recordId: string): boolean {
     return this.attributedIdSet.has(recordId);
+  }
+
+  /**
+   * Remove one known record from normal attribution output while retaining the raw record and its
+   * dedup identity. This is intentionally an explicit operator correction, never an automatic
+   * trading outcome rule.
+   */
+  excludeRecordForReporting(
+    recordId: string,
+    opts: { reason: string; excludedAt?: string },
+  ): { ok: true; alreadyExcluded: boolean } | { ok: false; reason: string } {
+    const normalizedRecordId = recordId.trim();
+    const reason = opts.reason.trim();
+    if (!normalizedRecordId) return { ok: false, reason: "recordId is required" };
+    if (!reason) return { ok: false, reason: "exclusion reason is required" };
+    const exclusions = (this.state.reportingExclusions ??= {});
+    if (exclusions[normalizedRecordId]) return { ok: true, alreadyExcluded: true };
+    const record = this.state.records.find((candidate) => candidate.recordId === normalizedRecordId);
+    if (!record) return { ok: false, reason: `record ${normalizedRecordId} is not retained for a safe reporting exclusion` };
+    // `record.laneId` is the normal bucket. A legacy record could have been folded into OTHER at
+    // write time, in which case subtract from the same aggregate bucket instead of inventing one.
+    const aggregateLaneId = record.laneId in this.state.perLane ? record.laneId : OVERFLOW_LANE_ID;
+    exclusions[record.recordId] = {
+      recordId: record.recordId,
+      laneId: record.laneId,
+      aggregateLaneId,
+      closedAtIso: record.closedAtIso,
+      realizedPnlUsd: record.realizedPnlUsd,
+      cortexUsd: record.cortexUsd,
+      excludedAt: opts.excludedAt ?? new Date().toISOString(),
+      reason,
+    };
+    this._save();
+    return { ok: true, alreadyExcluded: false };
   }
 
   /** Book one closed trade's CORTEX share. Idempotent per recordId; silently skips non-finite
@@ -247,20 +330,42 @@ export class CortexRealAttributionStore {
   buildReport(nowIso = new Date().toISOString()): CortexRealAttributionReport {
     const dateUtc = nowIso.slice(0, 10);
     const today = emptyAggregate();
+    const exclusions = Object.values(this.state.reportingExclusions ?? {});
+    const excludedIds = new Set(exclusions.map((exclusion) => exclusion.recordId));
     for (const record of this.state.records) {
+      if (excludedIds.has(record.recordId)) continue;
       if (typeof record.closedAtIso === "string" && record.closedAtIso.slice(0, 10) === dateUtc) {
         today.n += 1;
         today.cortexUsd += record.cortexUsd;
         today.realizedPnlUsd += record.realizedPnlUsd;
       }
     }
+    // allTime/perLane deliberately remain running raw aggregates on disk, so history that has
+    // fallen out of the bounded detail list is not lost. Subtract explicit void contributions at
+    // read time instead of mutating/deleting that raw bookkeeping.
+    const allTime = { ...this.state.allTime };
+    const perLane = Object.fromEntries(
+      Object.entries(this.state.perLane).map(([laneId, aggregate]) => [laneId, { ...aggregate }]),
+    ) as Record<string, CortexRealAttributionAggregate>;
+    for (const exclusion of exclusions) {
+      allTime.n = Math.max(0, allTime.n - 1);
+      allTime.cortexUsd -= exclusion.cortexUsd;
+      allTime.realizedPnlUsd -= exclusion.realizedPnlUsd;
+      const lane = perLane[exclusion.aggregateLaneId];
+      if (lane) {
+        lane.n = Math.max(0, lane.n - 1);
+        lane.cortexUsd -= exclusion.cortexUsd;
+        lane.realizedPnlUsd -= exclusion.realizedPnlUsd;
+      }
+    }
     return {
       today: { dateUtc, ...today },
-      allTime: { ...this.state.allTime },
-      perLane: Object.entries(this.state.perLane)
-        .map(([laneId, agg]) => ({ laneId, ...agg }))
+      allTime,
+      perLane: Object.entries(perLane)
+        .filter(([, aggregate]) => aggregate.n > 0)
+        .map(([laneId, aggregate]) => ({ laneId, ...aggregate }))
         .sort((a, b) => Math.abs(b.cortexUsd) - Math.abs(a.cortexUsd)),
-      recent: this.state.records.slice(-20),
+      recent: this.state.records.filter((record) => !excludedIds.has(record.recordId)).slice(-20),
     };
   }
 

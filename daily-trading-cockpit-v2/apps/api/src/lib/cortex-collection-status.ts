@@ -10,6 +10,7 @@ import { CORTEX_LIVE_BETA, CORTEX_WIN_HURDLE_R } from "./cortex-brain.js";
 import { CORTEX_ATTR_MIN_EXAMPLES_ACTIVE } from "./cortex-attribution.js";
 import { readCortexJournalTail } from "./cortex-journal-reader.js";
 import { getLatestCortexRefitReport } from "./cortex-refit-runner-bindings.js";
+import { isInCortexTestnetFocus, resolveCortexTestnetFocus, type CortexTestnetFocus } from "./cortex-testnet-focus.js";
 import { resolveCausalCollectionActivation, forwardCausalJournalPath } from "../experience-engine/forward-causal-collection.js";
 
 type JsonRecord = Record<string, unknown>;
@@ -199,13 +200,25 @@ function readNewLinesFrom(path: string, fromOffset: number, size: number): { chu
   }
 }
 
-function getOrBuildLineageAccumulator(path: string | null): LineageAccumulator {
+function eventLaneId(row: JsonRecord): string | null {
+  return isRecord(row.identity) ? text(row.identity.laneId) : null;
+}
+
+function eventEpochMs(row: JsonRecord): number | null {
+  const candidate = row.eventType === "DECISION_SNAPSHOT" ? row.asOfMs : row.openedAtMs;
+  return finite(candidate) ? candidate : null;
+}
+
+function getOrBuildLineageAccumulator(path: string | null, focus: CortexTestnetFocus | null): LineageAccumulator {
   if (!path || !existsSync(path)) {
-    if (path) lineageAccumulators.delete(path);
+    if (path) {
+      for (const key of lineageAccumulators.keys()) if (key.startsWith(`${path}\u0000`)) lineageAccumulators.delete(key);
+    }
     return freshAccumulator();
   }
   const size = statSync(path).size;
-  let acc = lineageAccumulators.get(path);
+  const accumulatorKey = `${path}\u0000${focus?.sinceMs ?? "all"}\u0000${focus ? [...focus.laneIds].join(",") : "all"}`;
+  let acc = lineageAccumulators.get(accumulatorKey);
   if (!acc || size < acc.byteOffset) {
     // First read for this path, or the file shrank underneath us (rotated/truncated externally) —
     // never keep stale/mismatched offsets, rebuild from scratch.
@@ -217,22 +230,22 @@ function getOrBuildLineageAccumulator(path: string | null): LineageAccumulator {
     try {
       ({ chunk, consumedTo } = readNewLinesFrom(path, acc.byteOffset, size));
     } catch {
-      lineageAccumulators.set(path, acc);
+      lineageAccumulators.set(accumulatorKey, acc);
       return acc; // transient read error — surface what we already have, never throw through
     }
     for (const line of chunk.split("\n")) {
       if (!line.trim()) continue;
       try {
         const parsed: unknown = JSON.parse(line);
-        if (isRecord(parsed)) foldRow(acc, parsed);
-        else acc.badLines += 1;
+        if (!isRecord(parsed)) acc.badLines += 1;
+        else if (isInCortexTestnetFocus(focus, eventLaneId(parsed), eventEpochMs(parsed))) foldRow(acc, parsed);
       } catch {
         acc.badLines += 1;
       }
     }
     acc.byteOffset = consumedTo;
   }
-  lineageAccumulators.set(path, acc);
+  lineageAccumulators.set(accumulatorKey, acc);
   return acc;
 }
 
@@ -277,8 +290,9 @@ export function buildCortexCollectionStatus(options: {
   const env = options.env ?? process.env;
   const dataDir = options.dataDir ?? env.CAUSAL_EXPERIENCE_COLLECTION_DIR ?? "data";
   const nowMs = options.nowMs ?? Date.now();
+  const focus = resolveCortexTestnetFocus(env);
   const activation = resolveCollectionStatus(env, dataDir);
-  const acc = getOrBuildLineageAccumulator(activation.journalPath);
+  const acc = getOrBuildLineageAccumulator(activation.journalPath, focus);
 
   const recentOutcomes = [...acc.recentOutcomes].sort(
     (a, b) => Date.parse(b.resolvedAt ?? "") - Date.parse(a.resolvedAt ?? ""),
@@ -306,6 +320,7 @@ export function buildCortexCollectionStatus(options: {
       status: activation.reason,
       journalPresent: Boolean(activation.journalPath && existsSync(activation.journalPath)),
       journalBadLines: acc.badLines,
+      cohort: focus ? { label: focus.label, since: focus.sinceIso, laneIds: [...focus.laneIds] } : null,
     },
     lineage: {
       totalEvents: acc.totalEvents,

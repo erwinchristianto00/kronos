@@ -48,6 +48,11 @@ import {
   type ExitBrainParams,
   type ExitBrainPathTick,
 } from "./exit-brain-policy.js";
+import {
+  resolveFourBrainTestnetCohort,
+  scopeExitTradeToFourBrainTestnetCohort,
+  type FourBrainTestnetCohort,
+} from "./four-brain-testnet-cohort.js";
 
 /** Newest-N detail records kept on disk (aggregates keep counting past this). */
 const MAX_RECORDS = 1500;
@@ -218,8 +223,18 @@ export interface ExitBrainTierBlock {
   banked: number;
 }
 
+/** What universe is allowed to contribute to this Exit Brain report. */
+export interface ExitBrainReportScope {
+  mode: "GLOBAL" | "FOUR_BRAIN_TESTNET_COHORT";
+  label: string;
+  sinceIso: string | null;
+  laneIds: string[];
+}
+
 export interface ExitBrainShadowReport {
   reportOnly: true;
+  /** Explicitly states whether historical/global paths were excluded. */
+  scope: ExitBrainReportScope;
   coverage: {
     processed: number;
     evaluated: number;
@@ -298,8 +313,11 @@ export class ExitBrainShadowStore {
   private readonly file: string;
   private state: ExitBrainShadowState;
   private processedIdSet: Set<string>;
+  /** Null on every normal/global instance; immutable for this store's lifetime. */
+  readonly cohort: FourBrainTestnetCohort | null;
 
-  constructor(dataDir = "data") {
+  constructor(dataDir = "data", cohort: FourBrainTestnetCohort | null = null) {
+    this.cohort = cohort;
     this.file = resolve(dataDir, "exit-brain-shadow.json");
     try {
       mkdirSync(dirname(this.file), { recursive: true });
@@ -516,6 +534,14 @@ export class ExitBrainShadowStore {
           : `${(coverageRatio! * 100).toFixed(1)}% of resolved trades were dense enough to score (min ${DEFAULT_EXIT_BRAIN_PARAMS.minEvaluableTicks} ticks). The rest are 4-point skeletons from executors that write no ticks — coverage is bounded by which executor ran the trade, never by the threshold.`;
     return {
       reportOnly: true,
+      scope: this.cohort === null
+        ? { mode: "GLOBAL", label: "all available exit paths", sinceIso: null, laneIds: [] }
+        : {
+            mode: "FOUR_BRAIN_TESTNET_COHORT",
+            label: this.cohort.label,
+            sinceIso: this.cohort.sinceIso,
+            laneIds: [...this.cohort.laneIds],
+          },
       coverage: {
         processed,
         evaluated: ev.n,
@@ -566,12 +592,36 @@ export class ExitBrainShadowStore {
 }
 
 let singleton: ExitBrainShadowStore | null = null;
-export function getExitBrainShadowStore(dataDir = "data"): ExitBrainShadowStore {
-  if (!singleton) singleton = new ExitBrainShadowStore(dataDir);
+let singletonKey: string | null = null;
+
+/**
+ * Focused testnet evidence is persisted separately from the historic/global
+ * Exit ledger. That lets the report re-read valid post-cutoff paths without
+ * deleting the old audit trail or mixing it into the new cohort's verdict.
+ */
+export function exitBrainShadowDataDirForCohort(
+  dataDir = "data",
+  cohort: FourBrainTestnetCohort | null = resolveFourBrainTestnetCohort(),
+): string {
+  return cohort === null ? dataDir : resolve(dataDir, "four-brain-testnet-focus");
+}
+
+export function getExitBrainShadowStore(
+  dataDir = "data",
+  env: NodeJS.ProcessEnv = process.env,
+): ExitBrainShadowStore {
+  const cohort = resolveFourBrainTestnetCohort(env);
+  const scopedDataDir = exitBrainShadowDataDirForCohort(dataDir, cohort);
+  const key = scopedDataDir + "|" + (cohort?.sinceMs ?? "GLOBAL");
+  if (!singleton || singletonKey !== key) {
+    singleton = new ExitBrainShadowStore(scopedDataDir, cohort);
+    singletonKey = key;
+  }
   return singleton;
 }
 export function _resetExitBrainShadowStoreForTests(): void {
   singleton = null;
+  singletonKey = null;
 }
 
 // ── shadow-position adapter (v1 production reader source) ────────────────────
@@ -633,6 +683,8 @@ export function resolvedTradesFromShadowPositions(positions: ShadowPosition[]): 
 export interface ExitBrainShadowCycleDeps {
   store: ExitBrainShadowStore;
   readResolvedTrades: ExitBrainTradeReader;
+  /** Override only for a deterministic test; omitted uses the store's immutable scope. */
+  cohort?: FourBrainTestnetCohort | null;
   now?: number;
   params?: ExitBrainParams;
   maxTradesPerCycle?: number;
@@ -657,11 +709,18 @@ export async function runExitBrainShadowCycle(deps: ExitBrainShadowCycleDeps): P
   const now = deps.now ?? Date.now();
   const params = deps.params ?? DEFAULT_EXIT_BRAIN_PARAMS;
   const maxPerCycle = deps.maxTradesPerCycle ?? DEFAULT_MAX_TRADES_PER_CYCLE;
+  const cohort = deps.cohort === undefined ? deps.store.cohort : deps.cohort;
   const result: ExitBrainShadowCycleResult = { ok: true, processed: 0, evaluated: 0, insufficient: 0, skippedAlreadyProcessed: 0, error: null };
   try {
     const trades = await deps.readResolvedTrades();
-    for (const trade of Array.isArray(trades) ? trades : []) {
+    for (const rawTrade of Array.isArray(trades) ? trades : []) {
       if (result.processed >= maxPerCycle) break;
+      if (!rawTrade) continue;
+      // The focused testnet can only learn from its five canonical lane ids
+      // and its declared deployment boundary. Global data remains on disk for
+      // audit but is never admitted to this separate store.
+      const trade = scopeExitTradeToFourBrainTestnetCohort(rawTrade, cohort);
+      if (trade === null) continue;
       if (!trade || typeof trade.tradeId !== "string" || trade.tradeId.length === 0) continue;
       if (deps.store.hasProcessed(trade.tradeId)) {
         result.skippedAlreadyProcessed += 1;

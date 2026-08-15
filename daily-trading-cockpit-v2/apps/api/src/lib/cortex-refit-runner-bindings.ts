@@ -55,6 +55,7 @@ import {
 } from "./cortex-learning-epoch.js";
 import { forwardCausalJournalPath, readForwardCausalEvents, resolveCanonicalPolicyContext } from "../experience-engine/forward-causal-collection.js";
 import { buildCortexExperienceBridge } from "../experience-engine/cortex-experience-bridge.js";
+import { isInCortexTestnetFocus, resolveCortexTestnetFocus } from "./cortex-testnet-focus.js";
 
 /** Only pull outcomes resolved within this window — older ones can't attribute (their decisions rotated
  *  out of the ~26-day journal) and the refit's recency decay makes them ~zero weight anyway. Bounds the
@@ -599,6 +600,7 @@ export function gatherCortexRefitInputs(deps: {
   const journal = readCortexDecisionRows([`${deps.journalFile}.1`, deps.journalFile]);
 
   if (!cortexRawStoreTrainingEnabled(deps.env)) {
+    const focus = resolveCortexTestnetFocus(deps.env ?? process.env);
     const causalJournal = forwardCausalJournalPath(deps.env ?? process.env);
     // A missing canonical policy context (unset/malformed/future deployment stamp) is treated
     // exactly like a missing journal: no bridge, zero rows. It must never fall back to reading
@@ -607,8 +609,12 @@ export function gatherCortexRefitInputs(deps: {
     const bridge = (causalJournal && expectedPolicy)
       ? buildCortexExperienceBridge(readForwardCausalEvents(causalJournal), expectedPolicy)
       : null;
-    const decisions = (bridge?.decisions ?? []).filter((row) => row.atMs >= sinceMs);
-    const outcomes = (bridge?.outcomes ?? []).filter((row) => row.openedAtMs >= sinceMs && row.resolvedAtMs >= sinceMs);
+    const decisions = (bridge?.decisions ?? []).filter((row) =>
+      row.atMs >= sinceMs && (!focus || [...row.lanes.keys()].some((laneId) => isInCortexTestnetFocus(focus, laneId, row.atMs))),
+    );
+    const outcomes = (bridge?.outcomes ?? []).filter((row) =>
+      row.openedAtMs >= sinceMs && row.resolvedAtMs >= sinceMs && isInCortexTestnetFocus(focus, row.laneId, row.openedAtMs),
+    );
     const directLaneIds = new Set(outcomes.map((outcome) => outcome.laneId));
     const emptyRouter = emptyCortexCgRouterSummary();
     return {
@@ -616,7 +622,8 @@ export function gatherCortexRefitInputs(deps: {
       // Store bridge. Missing lineage yields zero examples, never a TTL guess.
       decisions,
       outcomes,
-      roster: buildCortexAttrRoster(deps.staticWeightPctForLane, (laneId) => directLaneIds.has(laneId)),
+      roster: buildCortexAttrRoster(deps.staticWeightPctForLane, (laneId) => directLaneIds.has(laneId))
+        .filter((lane) => !focus || focus.laneIds.has(lane.laneId)),
       nowMs: deps.nowMs,
       nowIso: deps.nowIso,
       currentSchemaVersion: CORTEX_FEATURE_SCHEMA_VERSION,
@@ -686,7 +693,7 @@ export function gatherCortexRefitInputs(deps: {
   // TREND/MIXED) regardless of how much real measurement/execution data existed. Use the shared
   // singleton (matches every other store factory in this function) so this also picks up any
   // not-yet-persisted in-process state, not just what's on disk.
-  const xsecAll = getCrossSectionalStore(deps.dataDir).all;
+  const xsecAll = getCrossSectionalStore(deps.dataDir).reportable;
   const xsec: { laneId: string; obs: RawXsecObs[] }[] = Object.entries(XSEC_STORE_VARIANTS).map(([laneId, variant]) => ({
     laneId,
     obs: xsecAll

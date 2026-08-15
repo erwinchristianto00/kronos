@@ -151,6 +151,36 @@ export const CROSS_SECTIONAL_FILTERED_MIN_SCORE_GAP = envNumNonNeg("CROSS_SECTIO
 // the basket is supposed to be. Caps how many of a side's selected legs may share a cluster
 // (BTC/ETH majors exempt, same convention as the directional concentration cap). 0 disables.
 export const CROSS_SECTIONAL_FILTERED_MAX_PER_CLUSTER = envNumNonNeg("CROSS_SECTIONAL_FILTERED_MAX_PER_CLUSTER", 2);
+/**
+ * Smart Basket v1 stays deliberately narrow: it only changes which already-eligible FILTERED
+ * names form a 3×3 hedge.  It never changes K, the allow/block lists, score-gap admission, or
+ * the 50/50 long-short capital split.  The env switch is intentionally off outside the testnet
+ * cohort, so a stored SMART_BASKET_V1 observation is explicit evidence of the policy at entry.
+ */
+export function isCrossSectionalSmartBasketV1Enabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.CROSS_SECTIONAL_SMART_BASKET_V1 === "1";
+}
+const CROSS_SECTIONAL_SMART_CANDIDATE_POOL = Math.max(
+  CROSS_SECTIONAL_K,
+  Math.floor(envNumPos("CROSS_SECTIONAL_SMART_CANDIDATE_POOL", 5)),
+);
+const CROSS_SECTIONAL_SMART_FAST_BARS = Math.max(1, Math.floor(envNumPos("CROSS_SECTIONAL_SMART_FAST_BARS", 4)));
+const CROSS_SECTIONAL_SMART_EXTENSION_BARS = Math.max(2, Math.floor(envNumPos("CROSS_SECTIONAL_SMART_EXTENSION_BARS", 8)));
+// 2026-08-12: liquidity floor for the FILTERED basket's candidate pool, in USD of quote volume per
+// 1h bar (median over the trailing window). 0 = DISABLED, which is the default on purpose — this
+// module is shared by research/testnet/live via rsync, so a non-zero default here would silently
+// narrow live's trading universe (see the CROSS_SECTIONAL_MIXED_WIDE_LONG_POOL block above for the
+// same reasoning). Exists because widening the allowlists — the change this ships alongside — hands
+// the ranking the WHOLE universe, including names thin enough that a basket leg would move them.
+// A 187-day replay of this module's own functions over real 1h klines measured the widened pool at
+// +0.270%/day and the widened pool PLUS this floor at +0.287%/day with the worst drawdown improving
+// from -8.4% to -7.0%; the floor's real job is that drawdown number, not the mean.
+export const CROSS_SECTIONAL_LIQUIDITY_FLOOR_USD_PER_HOUR = envNumNonNeg("CROSS_SECTIONAL_LIQUIDITY_FLOOR_USD_PER_HOUR", 0);
+// 168 bars = 7d of 1h candles. NOT 720 (~30d): runCrossSectionalCycleGuarded's caller fetches
+// `CROSS_SECTIONAL_MOMENTUM_BARS + 5` candles per symbol, so a lookback longer than what is
+// actually fetched silently starves the median and every symbol fails the sample test — see the
+// minSamples note in liquidCrossSectionalSymbols for what that produced on testnet 2026-08-12.
+export const CROSS_SECTIONAL_LIQUIDITY_LOOKBACK_BARS = envNumPos("CROSS_SECTIONAL_LIQUIDITY_LOOKBACK_BARS", 168);
 export const CROSS_SECTIONAL_FILTERED_MIN_GROSS_BPS = envNumNonNeg("CROSS_SECTIONAL_FILTERED_MIN_GROSS_BPS", 25); // proof target
 export const CROSS_SECTIONAL_ADAPTIVE_MIN_GROSS_BPS = envNumNonNeg("CROSS_SECTIONAL_ADAPTIVE_MIN_GROSS_BPS", 35); // safer proof target
 export const CROSS_SECTIONAL_TREND_MIN_SCORE_GAP = envNumNonNeg("CROSS_SECTIONAL_TREND_MIN_SCORE_GAP", 0.035);
@@ -392,6 +422,15 @@ export interface CrossSectionalLeg {
   exitPrice: number | null;
   /** Fraction of total basket capital assigned to this leg. Missing means legacy equal-weight. */
   weight?: number | null;
+  /** Frozen rank inputs make later sizing evaluation auditable without reconstructing old scans. */
+  scoreAtOpen?: number;
+  volatilityAtOpen?: number | null;
+  /** Short-horizon confirmation frozen at formation. Positive is favorable for LONG; see the
+   * corresponding signed diagnostic in smartFormation for SHORT. Optional keeps legacy reports
+   * honest instead of backfilling a history that was never observed. */
+  fastReturnAtOpen?: number | null;
+  /** Price extension from its short trailing mean, expressed in own realized-vol units. */
+  extensionVolAtOpen?: number | null;
 }
 
 export interface CrossSectionalRegimeContext {
@@ -401,6 +440,33 @@ export interface CrossSectionalRegimeContext {
   confidence: string | null;
   capturedAt: string | null;
   regimeClass: CrossSectionalRegimeClass;
+}
+
+export interface CrossSectionalSmartFormationCandidate {
+  symbol: string;
+  side: "LONG" | "SHORT";
+  /** Raw MOM score — retained for audit; the optimizer never replaces the underlying ranking. */
+  score: number;
+  /** Signed to the candidate's side: positive supports continuation, negative contradicts it. */
+  fastSupport: number | null;
+  /** Signed to the candidate's side: positive means the entry is extended/adverse. */
+  adverseExtensionVol: number | null;
+  utility: number;
+  selected: boolean;
+  cluster: string;
+}
+
+/**
+ * Formation provenance for the testnet-only Smart Basket policy.  This is not a new filter: the
+ * raw-score candidate pool is still the source of truth.  It records enough to audit why a close
+ * candidate was preferred over a very similarly-ranked but stretched/reversing name later.
+ */
+export interface CrossSectionalSmartFormation {
+  version: "SMART_BASKET_V1";
+  candidatePoolSize: number;
+  axisScore: number | null;
+  objectiveScore: number;
+  candidates: CrossSectionalSmartFormationCandidate[];
 }
 
 export interface CrossSectionalObservation {
@@ -425,7 +491,7 @@ export interface CrossSectionalObservation {
   regimeClassAtOpen?: CrossSectionalRegimeClass | null;
   longCapitalWeight?: number | null;
   shortCapitalWeight?: number | null;
-  weightingModel?: "EQUAL_NOTIONAL" | "BETA_VOL_PROXY" | null;
+  weightingModel?: "EQUAL_NOTIONAL" | "BETA_VOL_PROXY" | "CAPPED_INVERSE_VOL" | null;
   takeProfitReturn?: number | null;
   stopLossReturn?: number | null;
   /** The R-denominator FROZEN at open (fraction). CORTEX #218 divides realized netReturn by THIS to get
@@ -435,6 +501,8 @@ export interface CrossSectionalObservation {
    *  basket (the SAME divisor the x-side CORTEX_XSEC_STOP_RETURN uses, kept consistent + config-proof). */
   riskDistanceAtOpen?: number | null;
   regimeFlipExit?: boolean | null;
+  /** Present only on newly formed, testnet-enabled FILTERED baskets. */
+  smartFormation?: CrossSectionalSmartFormation | null;
   exitReason?: CrossSectionalExitReason | null;
   /** Return on deployed capital after market-beta cancels = the cross-sectional dispersion. */
   grossReturn: number | null;
@@ -443,12 +511,33 @@ export interface CrossSectionalObservation {
   longLegReturn: number | null;
   shortLegReturn: number | null;
   resolvedAt: string | null;
+  /** Retains the raw measured observation, but removes it from normal reports, adaptive filters,
+   * Cortex learning, and Four-Brain measurement projections after an explicit operator void. */
+  reportingExclusion?: {
+    kind: "OPERATOR_VOID";
+    voidedAt: string;
+    reason: string;
+    sourceBasketId?: string;
+  } | null;
+}
+
+/** Raw observations remain auditable on disk; only this explicit marker removes one from learning/report readers. */
+export function isCrossSectionalObservationReportingExcluded(
+  observation: Pick<CrossSectionalObservation, "reportingExclusion">,
+): boolean {
+  return observation.reportingExclusion?.kind === "OPERATOR_VOID";
 }
 
 export interface ScoredSymbol {
   symbol: string;
   score: number;
   price: number;
+  /** Current short-horizon return, independent of the slower MOM rank. */
+  fastReturn?: number | null;
+  /** Realized volatility over the same input candles, used only to normalize soft diagnostics. */
+  volatility?: number | null;
+  /** Price versus its short trailing mean, in volatility units. */
+  extensionVol?: number | null;
 }
 
 interface CrossSectionalBasketOpts {
@@ -475,13 +564,15 @@ interface CrossSectionalBasketOpts {
   maxPerCluster?: number;
   longCapitalWeight?: number;
   shortCapitalWeight?: number;
-  weightingModel?: "EQUAL_NOTIONAL" | "BETA_VOL_PROXY";
+  weightingModel?: "EQUAL_NOTIONAL" | "BETA_VOL_PROXY" | "CAPPED_INVERSE_VOL";
   volBySymbol?: Record<string, number>;
   takeProfitReturn?: number | null;
   stopLossReturn?: number | null;
   /** Override the frozen-at-open R-denominator. Defaults to stopLossReturn, else the config stop-unit. */
   riskDistanceAtOpen?: number | null;
   regimeFlipExit?: boolean;
+  /** Soft candidate-combination optimizer for the FILTERED testnet cohort. */
+  smartFormation?: { enabled: boolean; axisScore?: number | null } | null;
 }
 
 function mean(xs: number[]): number {
@@ -508,6 +599,156 @@ function selectWithClusterCap(sorted: ScoredSymbol[], k: number, maxPerCluster?:
   return selected;
 }
 
+function finiteOrNull(value: number | null | undefined): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function clamp(value: number, lo: number, hi: number): number {
+  return Math.max(lo, Math.min(hi, value));
+}
+
+/** The candidate's short-horizon return expressed in its own realized-vol units and signed to
+ * the proposed side.  Missing volatility simply means "no extra opinion", never exclusion. */
+function smartFastSupport(candidate: ScoredSymbol, side: "LONG" | "SHORT"): number | null {
+  const fast = finiteOrNull(candidate.fastReturn);
+  if (fast === null) return null;
+  const vol = finiteOrNull(candidate.volatility);
+  const normalized = vol !== null && vol > 0 ? fast / vol : fast;
+  return side === "LONG" ? normalized : -normalized;
+}
+
+/** Positive means that entry would chase an already extended move for this side. */
+function smartAdverseExtensionVol(candidate: ScoredSymbol, side: "LONG" | "SHORT"): number | null {
+  const extension = finiteOrNull(candidate.extensionVol);
+  if (extension === null) return null;
+  return side === "LONG" ? extension : -extension;
+}
+
+function sampleStd(values: number[]): number {
+  if (values.length < 2) return 0;
+  const m = mean(values);
+  return Math.sqrt(values.reduce((sum, value) => sum + (value - m) ** 2, 0) / values.length);
+}
+
+function smartCandidateUtility(
+  candidate: ScoredSymbol,
+  pool: readonly ScoredSymbol[],
+  side: "LONG" | "SHORT",
+  axisScore: number | null | undefined,
+): number {
+  const directional = (value: ScoredSymbol): number => side === "LONG" ? value.score : -value.score;
+  const scores = pool.map(directional);
+  const scale = Math.max(sampleStd(scores), 1e-6);
+  // The raw cross-sectional rank remains dominant.  Fast confirmation and extension are bounded
+  // tie-breakers, deliberately too small to turn a clearly inferior raw score into a selection.
+  const rawRank = (directional(candidate) - mean(scores)) / scale;
+  const fastSupport = smartFastSupport(candidate, side);
+  const adverseExtension = smartAdverseExtensionVol(candidate, side);
+  let utility = rawRank;
+  if (fastSupport !== null) utility += 0.22 * clamp(fastSupport, -2, 2);
+  if (adverseExtension !== null) utility -= 0.20 * Math.max(0, clamp(adverseExtension, -2, 3));
+  // When the canonical axis leans against one hedge side, do not veto that side (this remains a
+  // market-neutral basket).  Reward only the names on that side whose *own* fast move confirms
+  // them, instead of mechanically buying a rebound just because its slower MOM score is high.
+  const axis = finiteOrNull(axisScore);
+  const sideSign = side === "LONG" ? 1 : -1;
+  const counterAxis = axis !== null && axis * sideSign < -0.12;
+  if (counterAxis && fastSupport !== null) utility += 0.08 * clamp(fastSupport, -2, 2);
+  return utility;
+}
+
+function combinations<T>(values: readonly T[], k: number): T[][] {
+  if (k <= 0) return [[]];
+  const out: T[][] = [];
+  const walk = (start: number, chosen: T[]): void => {
+    if (chosen.length === k) {
+      out.push(chosen);
+      return;
+    }
+    for (let index = start; index <= values.length - (k - chosen.length); index++) {
+      walk(index + 1, [...chosen, values[index]!]);
+    }
+  };
+  walk(0, []);
+  return out;
+}
+
+function respectsClusterCap(candidates: readonly ScoredSymbol[], maxPerCluster?: number): boolean {
+  if (!maxPerCluster || maxPerCluster <= 0) return true;
+  const counts = new Map<string, number>();
+  for (const candidate of candidates) {
+    const cluster = clusterOf(candidate.symbol);
+    if (isMajorCluster(cluster)) continue;
+    const next = (counts.get(cluster) ?? 0) + 1;
+    if (next > maxPerCluster) return false;
+    counts.set(cluster, next);
+  }
+  return true;
+}
+
+function smartClusterPenalty(candidates: readonly ScoredSymbol[]): number {
+  const counts = new Map<string, number>();
+  for (const candidate of candidates) {
+    const cluster = clusterOf(candidate.symbol);
+    if (!isMajorCluster(cluster)) counts.set(cluster, (counts.get(cluster) ?? 0) + 1);
+  }
+  // Existing max-per-cluster is still the hard safety rail.  This small extra term only decides
+  // close calls, so two correlated L1 names can remain selected when their raw scores truly win.
+  return [...counts.values()].reduce((sum, count) => sum + Math.max(0, count - 1) * 0.18, 0);
+}
+
+interface SmartSelection {
+  selected: ScoredSymbol[];
+  objective: number;
+  candidates: CrossSectionalSmartFormationCandidate[];
+}
+
+function selectSmartWithClusterCap(
+  sorted: ScoredSymbol[],
+  k: number,
+  side: "LONG" | "SHORT",
+  maxPerCluster: number | undefined,
+  axisScore: number | null | undefined,
+): SmartSelection {
+  const poolSize = Math.max(k, CROSS_SECTIONAL_SMART_CANDIDATE_POOL);
+  const pool = sorted.slice(0, poolSize);
+  // A concentrated top-five must be allowed to look one or two places deeper to find a valid
+  // cluster-capped combination; otherwise Smart Basket would accidentally make the pool stricter.
+  for (let index = pool.length; index < sorted.length && selectWithClusterCap(pool, k, maxPerCluster).length < k; index++) {
+    pool.push(sorted[index]!);
+  }
+  const utilityBySymbol = new Map(pool.map((candidate) => [candidate.symbol, smartCandidateUtility(candidate, pool, side, axisScore)]));
+  let selected: ScoredSymbol[] | null = null;
+  let objective = Number.NEGATIVE_INFINITY;
+  for (const choice of combinations(pool, k)) {
+    if (!respectsClusterCap(choice, maxPerCluster)) continue;
+    const value = choice.reduce((sum, candidate) => sum + (utilityBySymbol.get(candidate.symbol) ?? 0), 0) - smartClusterPenalty(choice);
+    if (value > objective) {
+      selected = choice;
+      objective = value;
+    }
+  }
+  const fallback = selectWithClusterCap(sorted, k, maxPerCluster);
+  const chosen = selected && selected.length === k ? selected : fallback;
+  const chosenSet = new Set(chosen.map((candidate) => candidate.symbol));
+  return {
+    selected: chosen,
+    objective: Number.isFinite(objective)
+      ? objective
+      : chosen.reduce((sum, candidate) => sum + (utilityBySymbol.get(candidate.symbol) ?? 0), 0) - smartClusterPenalty(chosen),
+    candidates: pool.map((candidate) => ({
+      symbol: candidate.symbol,
+      side,
+      score: candidate.score,
+      fastSupport: smartFastSupport(candidate, side),
+      adverseExtensionVol: smartAdverseExtensionVol(candidate, side),
+      utility: utilityBySymbol.get(candidate.symbol) ?? 0,
+      selected: chosenSet.has(candidate.symbol),
+      cluster: clusterOf(candidate.symbol),
+    })),
+  };
+}
+
 function allowed(symbol: string, allowlist?: ReadonlySet<string> | null, blocklist?: ReadonlySet<string> | null): boolean {
   const s = symbol.toUpperCase();
   if (blocklist?.has(s)) return false;
@@ -525,12 +766,42 @@ function scoreGapFor(longLeg: ScoredSymbol[], shortLeg: ScoredSymbol[]): number 
 function weightedLegs(
   legs: ScoredSymbol[],
   sideCapital: number,
-  opts: { weightingModel?: "EQUAL_NOTIONAL" | "BETA_VOL_PROXY"; volBySymbol?: Record<string, number> },
+  opts: { weightingModel?: "EQUAL_NOTIONAL" | "BETA_VOL_PROXY" | "CAPPED_INVERSE_VOL"; volBySymbol?: Record<string, number> },
 ): CrossSectionalLeg[] {
   if (legs.length === 0) return [];
   const equalWeight = sideCapital / legs.length;
   if (opts.weightingModel !== "BETA_VOL_PROXY") {
-    return legs.map((s) => ({ symbol: s.symbol, entryPrice: s.price, exitPrice: null, weight: equalWeight }));
+    if (opts.weightingModel !== "CAPPED_INVERSE_VOL") {
+      return legs.map((s) => ({
+        symbol: s.symbol,
+        entryPrice: s.price,
+        exitPrice: null,
+        weight: equalWeight,
+        scoreAtOpen: s.score,
+        volatilityAtOpen: opts.volBySymbol?.[s.symbol] ?? s.volatility ?? null,
+        fastReturnAtOpen: finiteOrNull(s.fastReturn),
+        extensionVolAtOpen: finiteOrNull(s.extensionVol),
+      }));
+    }
+    // Inverse-vol within each side, but clip to 0.75–1.25x equal sizing before normalizing.
+    // Risk parity must not become a hidden concentration trade in the calmest constituent.
+    const raw = legs.map((s) => {
+      const vol = opts.volBySymbol?.[s.symbol];
+      return Number.isFinite(vol) && vol! > 0 ? 1 / vol! : 1;
+    });
+    const rawMean = raw.reduce((a, b) => a + b, 0) / raw.length || 1;
+    const clipped = raw.map((value) => Math.max(0.75, Math.min(1.25, value / rawMean)));
+    const denom = clipped.reduce((a, b) => a + b, 0) || legs.length;
+    return legs.map((s, i) => ({
+      symbol: s.symbol,
+      entryPrice: s.price,
+      exitPrice: null,
+      weight: sideCapital * clipped[i]! / denom,
+      scoreAtOpen: s.score,
+      volatilityAtOpen: opts.volBySymbol?.[s.symbol] ?? s.volatility ?? null,
+      fastReturnAtOpen: finiteOrNull(s.fastReturn),
+      extensionVolAtOpen: finiteOrNull(s.extensionVol),
+    }));
   }
   const raw = legs.map((s) => {
     const vol = opts.volBySymbol?.[s.symbol];
@@ -541,7 +812,11 @@ function weightedLegs(
     symbol: s.symbol,
     entryPrice: s.price,
     exitPrice: null,
-    weight: sideCapital * raw[i]! / denom,
+      weight: sideCapital * raw[i]! / denom,
+      scoreAtOpen: s.score,
+      volatilityAtOpen: opts.volBySymbol?.[s.symbol] ?? s.volatility ?? null,
+      fastReturnAtOpen: finiteOrNull(s.fastReturn),
+      extensionVolAtOpen: finiteOrNull(s.extensionVol),
   }));
 }
 
@@ -600,16 +875,47 @@ export function buildCrossSectionalBasket(
   // Ties (the common unskewed 3/3 case) keep the original long-first order unchanged.
   let selectedLongs: ScoredSymbol[];
   let selectedShorts: ScoredSymbol[];
+  const smartEnabled = opts.smartFormation?.enabled === true && (opts.variant ?? "RAW") === "FILTERED" && mode === "MOMENTUM";
+  const smartCandidates: CrossSectionalSmartFormationCandidate[] = [];
+  let smartObjective = 0;
   if (shortK > longK) {
-    selectedShorts = selectWithClusterCap(shortSortedAll, shortK, opts.maxPerCluster);
+    if (smartEnabled) {
+      const shortSelection = selectSmartWithClusterCap(shortSortedAll, shortK, "SHORT", opts.maxPerCluster, opts.smartFormation?.axisScore);
+      selectedShorts = shortSelection.selected;
+      smartCandidates.push(...shortSelection.candidates);
+      smartObjective += shortSelection.objective;
+    } else {
+      selectedShorts = selectWithClusterCap(shortSortedAll, shortK, opts.maxPerCluster);
+    }
     const shortSymbols = new Set(selectedShorts.map((s) => s.symbol));
     const longRemaining = longSortedAll.filter((s) => !shortSymbols.has(s.symbol));
-    selectedLongs = selectWithClusterCap(longRemaining, longK, opts.maxPerCluster);
+    if (smartEnabled) {
+      const longSelection = selectSmartWithClusterCap(longRemaining, longK, "LONG", opts.maxPerCluster, opts.smartFormation?.axisScore);
+      selectedLongs = longSelection.selected;
+      smartCandidates.push(...longSelection.candidates);
+      smartObjective += longSelection.objective;
+    } else {
+      selectedLongs = selectWithClusterCap(longRemaining, longK, opts.maxPerCluster);
+    }
   } else {
-    selectedLongs = selectWithClusterCap(longSortedAll, longK, opts.maxPerCluster);
+    if (smartEnabled) {
+      const longSelection = selectSmartWithClusterCap(longSortedAll, longK, "LONG", opts.maxPerCluster, opts.smartFormation?.axisScore);
+      selectedLongs = longSelection.selected;
+      smartCandidates.push(...longSelection.candidates);
+      smartObjective += longSelection.objective;
+    } else {
+      selectedLongs = selectWithClusterCap(longSortedAll, longK, opts.maxPerCluster);
+    }
     const longSymbols = new Set(selectedLongs.map((s) => s.symbol));
     const shortRemaining = shortSortedAll.filter((s) => !longSymbols.has(s.symbol));
-    selectedShorts = selectWithClusterCap(shortRemaining, shortK, opts.maxPerCluster);
+    if (smartEnabled) {
+      const shortSelection = selectSmartWithClusterCap(shortRemaining, shortK, "SHORT", opts.maxPerCluster, opts.smartFormation?.axisScore);
+      selectedShorts = shortSelection.selected;
+      smartCandidates.push(...shortSelection.candidates);
+      smartObjective += shortSelection.objective;
+    } else {
+      selectedShorts = selectWithClusterCap(shortRemaining, shortK, opts.maxPerCluster);
+    }
   }
   if (selectedLongs.length < longK || selectedShorts.length < shortK) return null;
   const scoreGap = scoreGapFor(selectedLongs, selectedShorts);
@@ -646,6 +952,15 @@ export function buildCrossSectionalBasket(
     // process-frozen config stop-unit — the SAME quantity CORTEX's x-side uses, so netR is symmetric.
     riskDistanceAtOpen: opts.riskDistanceAtOpen ?? opts.stopLossReturn ?? CROSS_SECTIONAL_BASKET_STOP_LOSS_BPS / 10_000,
     regimeFlipExit: opts.regimeFlipExit ?? false,
+    smartFormation: smartEnabled
+      ? {
+          version: "SMART_BASKET_V1",
+          candidatePoolSize: CROSS_SECTIONAL_SMART_CANDIDATE_POOL,
+          axisScore: finiteOrNull(opts.smartFormation?.axisScore),
+          objectiveScore: smartObjective,
+          candidates: smartCandidates,
+        }
+      : null,
     exitReason: null,
     grossReturn: null,
     costReturn: null,
@@ -654,6 +969,79 @@ export function buildCrossSectionalBasket(
     shortLegReturn: null,
     resolvedAt: null,
   };
+}
+
+/**
+ * Symbols whose MEDIAN quote volume per bar clears `floorUsd`, over the trailing `bars` candles.
+ * Median, not mean: one listing-day or liquidation-cascade bar can carry a thin symbol's mean past
+ * any floor, and that is exactly the symbol this is meant to exclude.
+ *
+ * A symbol with fewer than `bars / 4` usable candles is EXCLUDED, not admitted — too new or too
+ * gappy to have a liquidity history is the same risk as being thin, and the fail-closed direction
+ * is the one that cannot surprise the executor.
+ */
+export function liquidCrossSectionalSymbols(
+  candlesBySymbol: Record<string, Candle[]>,
+  floorUsd: number,
+  bars = CROSS_SECTIONAL_LIQUIDITY_LOOKBACK_BARS,
+): Set<string> {
+  const out = new Set<string>();
+  if (!(floorUsd > 0)) {
+    for (const symbol of Object.keys(candlesBySymbol)) out.add(symbol.toUpperCase());
+    return out;
+  }
+  // 2026-08-12 (caught on testnet within one cycle of shipping this): this was `bars / 4`, i.e. 180
+  // samples against the 720-bar default. The cycle's caller only fetches MOMENTUM_BARS + 5 candles
+  // per symbol (41 at the time), so EVERY symbol failed the sample test, the liquid set came back
+  // EMPTY, and an empty allowlist means "allow everything" — the floor didn't just fail to bind, it
+  // deleted the allowlists too. ARKMUSDT ($0.05M/h, the thinnest name in the universe) was on the
+  // very first basket. Judge on whatever history is available, but never on less than a day of it.
+  const minSamples = Math.max(1, Math.min(24, bars));
+  for (const [symbol, candles] of Object.entries(candlesBySymbol)) {
+    if (!Array.isArray(candles) || candles.length === 0) continue;
+    const quote: number[] = [];
+    for (const c of candles.slice(-bars)) {
+      const q = c.close * c.volume;
+      if (Number.isFinite(q) && q > 0) quote.push(q);
+    }
+    if (quote.length < minSamples) continue;
+    quote.sort((a, b) => a - b);
+    if (quote[Math.floor(quote.length / 2)]! >= floorUsd) out.add(symbol.toUpperCase());
+  }
+  return out;
+}
+
+/**
+ * Narrow one side's allowlist to the liquid set.
+ *
+ * The empty-list case is the whole reason this is a named function: `allowed()` treats an EMPTY
+ * allowlist as "allow EVERY symbol", so a naive intersection of [] with the liquid set yields []
+ * — which reads as "allow everything" again and silently discards the floor. When the incoming
+ * allowlist is empty (the widened-pool configuration), the liquid set BECOMES the allowlist.
+ */
+export function narrowAllowlistToLiquid(allow: readonly string[], liquid: ReadonlySet<string> | null): Set<string> {
+  if (liquid === null) return new Set(allow);
+  if (allow.length === 0) return new Set(liquid);
+  return new Set(allow.filter((s) => liquid.has(s.toUpperCase())));
+}
+
+/**
+ * Whether the liquidity floor has narrowed a side to nothing, in which case NO basket may be built.
+ *
+ * Fail-closed, and the reason is the same empty-list trap narrowAllowlistToLiquid exists for, one
+ * level up: an empty allowlist reaching allowed() means "allow EVERY symbol", so building anyway
+ * would not merely ignore the floor — it would DELETE the operator's allowlists and hand the
+ * ranking the entire universe, thin names included. Strictly worse than not applying the floor at
+ * all, and completely silent. Returns false when the floor is disabled (liquid === null), so the
+ * un-floored path is untouched.
+ */
+export function crossSectionalLiquidityStarved(
+  longAllow: ReadonlySet<string>,
+  shortAllow: ReadonlySet<string>,
+  liquid: ReadonlySet<string> | null,
+): boolean {
+  if (liquid === null) return false;
+  return longAllow.size === 0 || shortAllow.size === 0;
 }
 
 // ── Auto-updating symbol filters (operator: "ikutin filtered symbol, auto update
@@ -674,9 +1062,20 @@ export interface AdaptiveSymbolFilters {
   shortAllowlist: string[];
   longBlocklist: string[];
   shortBlocklist: string[];
+  /** In the soft phase, measured post-cutoff per-leg outcomes nudge the rank instead of silently
+   * deleting a symbol from the candidate pool. Values are signed momentum-score offsets. */
+  longScoreAdjustmentBySymbol: Record<string, number>;
+  shortScoreAdjustmentBySymbol: Record<string, number>;
   provenance: {
     closedBaskets: number;
     minLegSamples: number;
+    /** Evidence-era cutoff. Null means the legacy all-history behavior is intentionally in use. */
+    sinceMs: number | null;
+    mode: CrossSectionalAdaptiveMode;
+    /** True only when the policy has enough new-cohort data to apply hard demotions. */
+    hardDemotionsActive: boolean;
+    hardMinLegSamples: number;
+    hardMinClosedBaskets: number;
     promotedLong: string[];
     promotedShort: string[];
     demotedLong: string[];
@@ -693,11 +1092,73 @@ export interface AdaptiveSymbolFilters {
   };
 }
 
+/**
+ * Freeze the adaptive symbol filters at the operator's configured lists — no promotion, no demotion.
+ * Default OFF.
+ *
+ * WHY (2026-08-12): the demotion machinery judges a symbol on the per-leg returns recorded in the
+ * store's CLOSED baskets, and after a configuration change those closed baskets belong to the OLD
+ * configuration. Widening the pool and switching to a 36-bar lookback, then letting 24-bar leg
+ * history demote symbols out of it, applies the old rules' verdict to the new rules' universe — the
+ * short side went from 17 eligible symbols to 6 within one cycle, quietly rebuilding the narrow
+ * pool the widening exists to remove. Freezing lets a changed configuration be measured as
+ * configured; unfreeze once its own closed baskets dominate the store.
+ *
+ * Deliberately NOT a way to escape the operator lists: the frozen result is exactly the configured
+ * env allow/blocklists, so this can only ever widen back to what the operator already approved.
+ */
+export function isCrossSectionalAdaptiveDemotionFrozen(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.CROSS_SECTIONAL_ADAPTIVE_DEMOTION_FROZEN === "1";
+}
+
+/**
+ * HARD preserves the historical behavior: a symbol with the normal sample floor can be removed
+ * from execution immediately.  SOFT only adjusts rank.  SOFT_THEN_HARD begins with rank nudges
+ * and graduates to hard removal only after the current evidence era has enough independent basket
+ * closes *and* the individual symbol has a deeper sample.  The testnet rollout uses the last mode.
+ */
+export type CrossSectionalAdaptiveMode = "HARD" | "SOFT" | "SOFT_THEN_HARD";
+
+function positiveWholeEnv(value: string | undefined, fallback: number): number {
+  const parsed = Number.parseInt(value ?? "", 10);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
+}
+
+export function getCrossSectionalAdaptiveMode(env: NodeJS.ProcessEnv = process.env): CrossSectionalAdaptiveMode {
+  const configured = (env.CROSS_SECTIONAL_ADAPTIVE_MODE ?? "HARD").trim().toUpperCase();
+  return configured === "SOFT" || configured === "SOFT_THEN_HARD" ? configured : "HARD";
+}
+
+/** Defaults to the report-era boundary so old configurations cannot curate a newly deployed
+ * testnet cohort. An explicit adaptive boundary exists for the rare case reports and curation
+ * genuinely need different eras. */
+export function getCrossSectionalAdaptiveSinceMs(env: NodeJS.ProcessEnv = process.env): number | undefined {
+  const explicit = env.CROSS_SECTIONAL_ADAPTIVE_START_AT ?? null;
+  const parsed = explicit ? Date.parse(explicit) : NaN;
+  return Number.isFinite(parsed) ? parsed : getCrossSectionalReportSinceMs(env);
+}
+
+function crossSectionalAdaptiveHardMinLegSamples(env: NodeJS.ProcessEnv = process.env): number {
+  return positiveWholeEnv(env.CROSS_SECTIONAL_ADAPTIVE_HARD_MIN_LEG_SAMPLES, 6);
+}
+
+function crossSectionalAdaptiveHardMinClosedBaskets(env: NodeJS.ProcessEnv = process.env): number {
+  return positiveWholeEnv(env.CROSS_SECTIONAL_ADAPTIVE_HARD_MIN_CLOSED_BASKETS, 8);
+}
+
+function crossSectionalAdaptiveSoftScoreWeight(env: NodeJS.ProcessEnv = process.env): number {
+  const parsed = Number.parseFloat(env.CROSS_SECTIONAL_ADAPTIVE_SOFT_SCORE_WEIGHT ?? "");
+  return Number.isFinite(parsed) && parsed >= 0 ? Math.min(1, parsed) : 0.35;
+}
+
 export function deriveAdaptiveSymbolFilters(
   store: CrossSectionalStore,
   opts: {
     minLegSamples?: number;
     minEligiblePerSide?: number;
+    /** Override the evidence era for callers/tests. Undefined follows CROSS_SECTIONAL_ADAPTIVE_START_AT
+     * then CROSS_SECTIONAL_REPORT_START_AT, preserving legacy all-history behavior when neither is set. */
+    sinceMs?: number;
     /** Per-side overrides — thread the REGIME-SKEWED longK/shortK through here (not just the base
      *  CROSS_SECTIONAL_K) when regime skew is enabled. 2026-07-11: the floor below used to always
      *  check against the unskewed base K on both sides, so when skew raised e.g. shortK from 3 to
@@ -713,6 +1174,33 @@ export function deriveAdaptiveSymbolFilters(
 ): AdaptiveSymbolFilters {
   const minLegSamples = opts.minLegSamples ?? 3;
   const minEligiblePerSide = opts.minEligiblePerSide ?? CROSS_SECTIONAL_K;
+  const mode = getCrossSectionalAdaptiveMode();
+  const sinceMs = opts.sinceMs ?? getCrossSectionalAdaptiveSinceMs();
+  const hardMinLegSamples = Math.max(minLegSamples, crossSectionalAdaptiveHardMinLegSamples());
+  const hardMinClosedBaskets = crossSectionalAdaptiveHardMinClosedBaskets();
+  if (isCrossSectionalAdaptiveDemotionFrozen()) {
+    return {
+      longAllowlist: [...CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST].sort(),
+      shortAllowlist: [...CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST].sort(),
+      longBlocklist: [],
+      shortBlocklist: [...CROSS_SECTIONAL_FILTERED_SHORT_BLOCKLIST].sort(),
+      longScoreAdjustmentBySymbol: {},
+      shortScoreAdjustmentBySymbol: {},
+      provenance: {
+        closedBaskets: 0, minLegSamples, promotedLong: [], promotedShort: [],
+        demotedLong: [], demotedShort: [],
+        sinceMs: sinceMs ?? null,
+        mode,
+        hardDemotionsActive: false,
+        hardMinLegSamples,
+        hardMinClosedBaskets,
+        minEligiblePerSide,
+        minEligiblePerSideLong: opts.minEligiblePerSideLong ?? minEligiblePerSide,
+        minEligiblePerSideShort: opts.minEligiblePerSideShort ?? minEligiblePerSide,
+        longFloorApplied: false, shortFloorApplied: false,
+      },
+    };
+  }
   const minEligiblePerSideLong = opts.minEligiblePerSideLong ?? minEligiblePerSide;
   const minEligiblePerSideShort = opts.minEligiblePerSideShort ?? minEligiblePerSide;
   const perf = new Map<string, { longN: number; longSum: number; shortN: number; shortSum: number }>();
@@ -729,8 +1217,9 @@ export function deriveAdaptiveSymbolFilters(
   };
 
   let closedBaskets = 0;
-  for (const obs of store.all) {
+  for (const obs of store.reportable) {
     if (obs.status !== "CLOSED") continue;
+    if (sinceMs !== undefined && obs.openedAtMs < sinceMs) continue;
     closedBaskets += 1;
     for (const leg of obs.longLeg) {
       if (leg.exitPrice !== null && leg.entryPrice > 0) bump(leg.symbol, "long", leg.exitPrice / leg.entryPrice - 1);
@@ -744,21 +1233,35 @@ export function deriveAdaptiveSymbolFilters(
   const promotedShort: string[] = [];
   const demotedLong: string[] = [];
   const demotedShort: string[] = [];
+  const hardDemotedLong: string[] = [];
+  const hardDemotedShort: string[] = [];
+  const longScoreAdjustmentBySymbol: Record<string, number> = {};
+  const shortScoreAdjustmentBySymbol: Record<string, number> = {};
+  const hardDemotionsActive = mode === "HARD" || (mode === "SOFT_THEN_HARD" && closedBaskets >= hardMinClosedBaskets);
+  const softWeight = crossSectionalAdaptiveSoftScoreWeight();
   for (const [symbol, row] of perf) {
     if (row.longN >= minLegSamples) {
-      if (row.longSum / row.longN > 0) promotedLong.push(symbol);
+      const avg = row.longSum / row.longN;
+      if (avg > 0) promotedLong.push(symbol);
       else demotedLong.push(symbol);
+      if (mode !== "HARD") longScoreAdjustmentBySymbol[symbol] = Math.max(-0.02, Math.min(0.02, avg * softWeight));
+      if (hardDemotionsActive && avg <= 0 && (mode === "HARD" || row.longN >= hardMinLegSamples)) hardDemotedLong.push(symbol);
     }
     if (row.shortN >= minLegSamples) {
-      if (row.shortSum / row.shortN > 0) promotedShort.push(symbol);
+      const avg = row.shortSum / row.shortN;
+      if (avg > 0) promotedShort.push(symbol);
       else demotedShort.push(symbol);
+      // A better short is a more negative momentum score; invert the measured short return so a
+      // positive outcome improves its rank and a loss only nudges it upward toward exclusion.
+      if (mode !== "HARD") shortScoreAdjustmentBySymbol[symbol] = Math.max(-0.02, Math.min(0.02, -avg * softWeight));
+      if (hardDemotionsActive && avg <= 0 && (mode === "HARD" || row.shortN >= hardMinLegSamples)) hardDemotedShort.push(symbol);
     }
   }
 
   const longAllowRaw = new Set<string>([...CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST]);
-  for (const s of demotedLong) longAllowRaw.delete(s);
+  for (const s of hardDemotedLong) longAllowRaw.delete(s);
   const shortAllowRaw = new Set<string>([...CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST]);
-  for (const s of demotedShort) shortAllowRaw.delete(s);
+  for (const s of hardDemotedShort) shortAllowRaw.delete(s);
 
   // Floor (2026-07-07 audit): demotion has no natural recovery path — a demoted symbol only
   // regains eligibility once NEW closed baskets remeasure it positive, but no new baskets can
@@ -775,18 +1278,25 @@ export function deriveAdaptiveSymbolFilters(
   const shortAllow = shortFloorApplied ? new Set(CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST) : shortAllowRaw;
   const shortBlock = new Set<string>([
     ...CROSS_SECTIONAL_FILTERED_SHORT_BLOCKLIST,
-    ...(shortFloorApplied ? [] : demotedShort),
+    ...(shortFloorApplied ? [] : hardDemotedShort),
   ]);
-  const longBlock = new Set<string>(longFloorApplied ? [] : demotedLong);
+  const longBlock = new Set<string>(longFloorApplied ? [] : hardDemotedLong);
 
   return {
     longAllowlist: [...longAllow].sort(),
     shortAllowlist: [...shortAllow].sort(),
     longBlocklist: [...longBlock].sort(),
     shortBlocklist: [...shortBlock].sort(),
+    longScoreAdjustmentBySymbol,
+    shortScoreAdjustmentBySymbol,
     provenance: {
       closedBaskets,
       minLegSamples,
+      sinceMs: sinceMs ?? null,
+      mode,
+      hardDemotionsActive,
+      hardMinLegSamples,
+      hardMinClosedBaskets,
       promotedLong: promotedLong.sort(),
       promotedShort: promotedShort.sort(),
       demotedLong: demotedLong.sort(),
@@ -800,20 +1310,87 @@ export function deriveAdaptiveSymbolFilters(
   };
 }
 
+/**
+ * Effective FILTERED execution pools for the current cycle.
+ *
+ * The measured per-leg demotion logic is useful for a mature book, but it must not silently
+ * re-curate a newly widened pool using results from the old narrow configuration. When the
+ * operator sets CROSS_SECTIONAL_ADAPTIVE_DISABLED=1 (testnet-only during this rollout), the
+ * static operator allow/block lists remain the complete pool; the measurement/provenance store
+ * is still left intact for reporting and later comparison.
+ */
+export function getCrossSectionalFilteredExecutionFilters(
+  store: CrossSectionalStore,
+  opts: {
+    minEligiblePerSideLong?: number;
+    minEligiblePerSideShort?: number;
+  } = {},
+): {
+  longAllowlist: string[];
+  shortAllowlist: string[];
+  shortBlocklist: string[];
+  longScoreAdjustmentBySymbol: Record<string, number>;
+  shortScoreAdjustmentBySymbol: Record<string, number>;
+  adaptiveMode: CrossSectionalAdaptiveMode;
+  adaptiveDisabled: boolean;
+} {
+  const adaptiveDisabled = isCrossSectionalAdaptiveDisabled();
+  if (adaptiveDisabled) {
+    return {
+      longAllowlist: [...CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST],
+      shortAllowlist: [...CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST],
+      shortBlocklist: [...CROSS_SECTIONAL_FILTERED_SHORT_BLOCKLIST],
+      longScoreAdjustmentBySymbol: {},
+      shortScoreAdjustmentBySymbol: {},
+      adaptiveMode: getCrossSectionalAdaptiveMode(),
+      adaptiveDisabled: true,
+    };
+  }
+  const adaptive = deriveAdaptiveSymbolFilters(store, opts);
+  return {
+    longAllowlist: adaptive.longAllowlist,
+    shortAllowlist: adaptive.shortAllowlist,
+    shortBlocklist: adaptive.shortBlocklist,
+    longScoreAdjustmentBySymbol: adaptive.longScoreAdjustmentBySymbol,
+    shortScoreAdjustmentBySymbol: adaptive.shortScoreAdjustmentBySymbol,
+    adaptiveMode: adaptive.provenance.mode,
+    adaptiveDisabled: false,
+  };
+}
+
+/** Applies the early-stage adaptive policy without deleting candidates. FILTERED is momentum
+ * dispersion, so a long candidate benefits from a positive long-side outcome (raise score), while
+ * a short candidate benefits from a positive short-side outcome (make score more negative). */
+export function applyCrossSectionalAdaptiveRanking(
+  scored: ScoredSymbol[],
+  adaptive: Pick<ReturnType<typeof getCrossSectionalFilteredExecutionFilters>, "adaptiveMode" | "longScoreAdjustmentBySymbol" | "shortScoreAdjustmentBySymbol">,
+): ScoredSymbol[] {
+  if (adaptive.adaptiveMode === "HARD") return scored;
+  return scored.map((row) => {
+    const adjustment = row.score >= 0
+      ? adaptive.longScoreAdjustmentBySymbol[row.symbol] ?? 0
+      : adaptive.shortScoreAdjustmentBySymbol[row.symbol] ?? 0;
+    return adjustment === 0 ? row : { ...row, score: row.score + adjustment };
+  });
+}
+
 export function buildFilteredCrossSectionalBasket(
   scored: ScoredSymbol[],
-  opts: Omit<CrossSectionalBasketOpts, "variant" | "signal" | "longAllowlist" | "shortAllowlist" | "shortBlocklist" | "minScoreGap"> &
-    Partial<Pick<CrossSectionalBasketOpts, "signal" | "longAllowlist" | "shortAllowlist" | "shortBlocklist" | "minScoreGap">>,
+  opts: Omit<CrossSectionalBasketOpts, "variant" | "signal" | "longAllowlist" | "longBlocklist" | "shortAllowlist" | "shortBlocklist" | "minScoreGap"> &
+    Partial<Pick<CrossSectionalBasketOpts, "signal" | "longAllowlist" | "longBlocklist" | "shortAllowlist" | "shortBlocklist" | "minScoreGap">>,
 ): CrossSectionalObservation | null {
   return buildCrossSectionalBasket(scored, {
     ...opts,
     signal: opts.signal ?? CROSS_SECTIONAL_FILTERED_SIGNAL,
     variant: "FILTERED",
     longAllowlist: opts.longAllowlist ?? CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST,
+    longBlocklist: opts.longBlocklist,
     shortAllowlist: opts.shortAllowlist ?? CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST,
     shortBlocklist: opts.shortBlocklist ?? CROSS_SECTIONAL_FILTERED_SHORT_BLOCKLIST,
     minScoreGap: opts.minScoreGap ?? CROSS_SECTIONAL_FILTERED_MIN_SCORE_GAP,
     maxPerCluster: opts.maxPerCluster ?? CROSS_SECTIONAL_FILTERED_MAX_PER_CLUSTER,
+    weightingModel: opts.weightingModel ?? "CAPPED_INVERSE_VOL",
+    smartFormation: opts.smartFormation ?? (isCrossSectionalSmartBasketV1Enabled() ? { enabled: true } : undefined),
   });
 }
 
@@ -1025,6 +1602,12 @@ export class CrossSectionalStore {
     return this.state.observations;
   }
 
+  /** Reporting/learning projection. Execution continues to read `all` so a reporting correction
+   * can never alter an already-admitted order lifecycle. */
+  get reportable(): CrossSectionalObservation[] {
+    return this.state.observations.filter((observation) => !isCrossSectionalObservationReportingExcluded(observation));
+  }
+
   get lastCycleAt(): string | null {
     return this.state.lastCycleAt;
   }
@@ -1040,6 +1623,32 @@ export class CrossSectionalStore {
   replace(observationId: string, next: CrossSectionalObservation): void {
     const idx = this.state.observations.findIndex((o) => o.observationId === observationId);
     if (idx >= 0) this.state.observations[idx] = next;
+  }
+
+  /** Mark the exact measured source observation as excluded without deleting its raw audit record. */
+  voidObservationForReporting(
+    observationId: string,
+    opts: { reason: string; voidedAt?: string; sourceBasketId?: string },
+  ):
+    | { ok: true; alreadyVoided: boolean; observationId: string }
+    | { ok: false; reason: string } {
+    const normalizedObservationId = observationId.trim();
+    const reason = opts.reason.trim();
+    if (!normalizedObservationId) return { ok: false, reason: "observationId is required" };
+    if (!reason) return { ok: false, reason: "void reason is required" };
+    const observation = this.state.observations.find((candidate) => candidate.observationId === normalizedObservationId);
+    if (!observation) return { ok: false, reason: `observation ${normalizedObservationId} not found` };
+    if (isCrossSectionalObservationReportingExcluded(observation)) {
+      return { ok: true, alreadyVoided: true, observationId: observation.observationId };
+    }
+    observation.reportingExclusion = {
+      kind: "OPERATOR_VOID",
+      voidedAt: opts.voidedAt ?? new Date().toISOString(),
+      reason,
+      sourceBasketId: opts.sourceBasketId,
+    };
+    this.save();
+    return { ok: true, alreadyVoided: false, observationId: observation.observationId };
   }
 
   private prune(): void {
@@ -1106,6 +1715,8 @@ export async function runCrossSectionalCycle(opts: {
    *  CROSS_SECTIONAL_REGIME_SKEW_ENABLED=1 to tilt the FILTERED (executed) basket's leg counts
    *  toward the regime-favored side. Omit/null -> unskewed 3/3-style symmetry, same as before. */
   axisScore?: number | null;
+  /** Execution-owned blocks for losing same-symbol/same-side open exposure. */
+  filteredEntryBlocks?: () => Promise<{ longBlocklist: string[]; shortBlocklist: string[] }>;
 }): Promise<CrossSectionalCycleResult> {
   const result: CrossSectionalCycleResult = { opened: 0, resolved: 0, expired: 0 };
   const nowIso = new Date(opts.now).toISOString();
@@ -1133,7 +1744,21 @@ export async function runCrossSectionalCycle(opts: {
     const vol = realizedVolatility(candles);
     if (vol !== null && vol > 0) volBySymbol[symbol] = vol;
     const sc = crossSectionalMomentumScore(candles, CROSS_SECTIONAL_MOMENTUM_BARS);
-    if (sc) scored.push({ symbol, score: sc.score, price: sc.price });
+    if (sc) {
+      const fastStart = candles[candles.length - 1 - CROSS_SECTIONAL_SMART_FAST_BARS];
+      const fastReturn = fastStart && fastStart.close > 0 ? (sc.price - fastStart.close) / fastStart.close : null;
+      const extensionCloses = candles.slice(-CROSS_SECTIONAL_SMART_EXTENSION_BARS).map((candle) => candle.close).filter((close) => close > 0);
+      const extensionMean = extensionCloses.length ? mean(extensionCloses) : 0;
+      const extensionVol = extensionMean > 0 && vol !== null && vol > 0 ? (sc.price - extensionMean) / extensionMean / vol : null;
+      scored.push({
+        symbol,
+        score: sc.score,
+        price: sc.price,
+        fastReturn,
+        volatility: vol,
+        extensionVol,
+      });
+    }
   }
 
   // 1. resolve matured open baskets against the latest closes
@@ -1176,11 +1801,38 @@ export async function runCrossSectionalCycle(opts: {
     // buildFilteredCrossSectionalBasket actually requires, with the floor never noticing (3
     // eligible symbols isn't "under 3", but it IS under a skewed requirement of 4).
     const skew = isCrossSectionalRegimeSkewEnabled() ? regimeSkewedK(CROSS_SECTIONAL_K, opts.axisScore ?? null) : null;
-    const adaptive = deriveAdaptiveSymbolFilters(opts.store, {
+    const adaptive = getCrossSectionalFilteredExecutionFilters(opts.store, {
       minEligiblePerSideLong: skew?.longK,
       minEligiblePerSideShort: skew?.shortK,
     });
-    const basket = buildFilteredCrossSectionalBasket(scored, {
+    // In the new-cohort soft phase, evidence changes ranking but not eligibility. This preserves
+    // momentum opportunity while still steering a tie/near-tie away from a measured loser; only the
+    // graduated hard phase below is permitted to remove a symbol altogether.
+    const adaptiveRanked = applyCrossSectionalAdaptiveRanking(scored, adaptive);
+    // Liquidity floor (default OFF — see CROSS_SECTIONAL_LIQUIDITY_FLOOR_USD_PER_HOUR). Applied to
+    // the ALLOWLISTS rather than to `scored`, so it narrows only the FILTERED basket: RAW stays the
+    // unmodified OOS control, and TREND/MIXED keep reading their own env lists untouched.
+    const liquid = CROSS_SECTIONAL_LIQUIDITY_FLOOR_USD_PER_HOUR > 0
+      ? liquidCrossSectionalSymbols(candlesBySymbol, CROSS_SECTIONAL_LIQUIDITY_FLOOR_USD_PER_HOUR)
+      : null;
+    const longAllow = narrowAllowlistToLiquid(adaptive.longAllowlist, liquid);
+    const shortAllow = narrowAllowlistToLiquid(adaptive.shortAllowlist, liquid);
+    // FAIL CLOSED. An EMPTY allowlist reaches allowed() as "allow EVERY symbol", so a liquidity
+    // floor that admits nothing would not merely fail to bind — it would DELETE the operator's
+    // allowlists and hand the ranking the whole universe, thin names included. That is strictly
+    // worse than the un-floored configuration, and it is silent. When the floor is on, an empty
+    // side means "no eligible candidates this cycle": skip the basket, same fail-closed convention
+    // buildCrossSectionalBasket already uses when a side cannot fill k legs.
+    const liquidityStarved = crossSectionalLiquidityStarved(longAllow, shortAllow, liquid);
+    let dynamicBlocks: { longBlocklist: string[]; shortBlocklist: string[] } = { longBlocklist: [], shortBlocklist: [] };
+    try {
+      dynamicBlocks = await opts.filteredEntryBlocks?.() ?? dynamicBlocks;
+    } catch {
+      // If current marks cannot be read, fail closed for FILTERED rather than emitting a signal
+      // which might duplicate a losing open leg before the executor gets a second chance to stop it.
+      dynamicBlocks = { longBlocklist: [...longAllow], shortBlocklist: [...shortAllow] };
+    }
+    const basket = liquidityStarved ? null : buildFilteredCrossSectionalBasket(adaptiveRanked, {
       k: CROSS_SECTIONAL_K,
       longK: skew?.longK,
       shortK: skew?.shortK,
@@ -1188,9 +1840,14 @@ export async function runCrossSectionalCycle(opts: {
       openedAtMs: opts.now,
       horizonMs: CROSS_SECTIONAL_HORIZON_MS,
       regimeContext,
-      longAllowlist: new Set(adaptive.longAllowlist),
-      shortAllowlist: new Set(adaptive.shortAllowlist),
-      shortBlocklist: new Set(adaptive.shortBlocklist),
+      longAllowlist: longAllow,
+      longBlocklist: new Set(dynamicBlocks.longBlocklist),
+      shortAllowlist: shortAllow,
+      shortBlocklist: new Set([...adaptive.shortBlocklist, ...dynamicBlocks.shortBlocklist]),
+      volBySymbol,
+      smartFormation: isCrossSectionalSmartBasketV1Enabled()
+        ? { enabled: true, axisScore: opts.axisScore ?? null }
+        : undefined,
     });
     if (basket) {
       opts.store.add(basket);
@@ -1248,6 +1905,7 @@ export async function runCrossSectionalCycleGuarded(opts: {
   fetchCandles: (symbol: string) => Promise<Candle[]>;
   regimeContext?: CrossSectionalRegimeContext | null;
   axisScore?: number | null;
+  filteredEntryBlocks?: () => Promise<{ longBlocklist: string[]; shortBlocklist: string[] }>;
 }): Promise<CrossSectionalCycleResult | null> {
   if (cycleRunning) return null;
   cycleRunning = true;
@@ -1341,10 +1999,13 @@ function groupStats<T extends string>(
 export function buildCrossSectionalReport(
   store: CrossSectionalStore,
   nowMs: number = Date.now(),
-  opts: { variant?: CrossSectionalVariant; signal?: string } = {},
+  opts: { variant?: CrossSectionalVariant; signal?: string; sinceMs?: number } = {},
 ): CrossSectionalReport {
   const variant = opts.variant ?? (opts.signal === CROSS_SECTIONAL_FILTERED_SIGNAL ? "FILTERED" : "RAW");
-  const all = store.all.filter((o) => opts.signal ? o.signal === opts.signal : observationVariant(o) === variant);
+  const all = store.reportable.filter((o) =>
+    (opts.signal ? o.signal === opts.signal : observationVariant(o) === variant) &&
+    (opts.sinceMs === undefined || o.openedAtMs >= opts.sinceMs),
+  );
   const closed = all.filter((o) => o.status === "CLOSED" && o.netReturn !== null);
   const nets = closed.map((o) => o.netReturn!);
   const gross = closed.map((o) => o.grossReturn ?? 0);
@@ -1382,6 +2043,20 @@ export function buildCrossSectionalReport(
     byRegime,
     exits,
   };
+}
+
+/**
+ * Single cutoff source for every cross-sectional consumer.  Testnet deployments set
+ * CROSS_SECTIONAL_REPORT_START_AT to the beginning of the active evidence era; reports,
+ * Cortex summaries, and entry gates must all use this same boundary so historical closes
+ * cannot affect the current deployment's admission decision.
+ */
+export function getCrossSectionalReportSinceMs(
+  env: NodeJS.ProcessEnv = process.env,
+): number | undefined {
+  const configured = env.CROSS_SECTIONAL_REPORT_START_AT ?? null;
+  const parsed = configured ? Date.parse(configured) : NaN;
+  return Number.isFinite(parsed) ? parsed : undefined;
 }
 
 export function isCrossSectionalEdgeDisabled(env: NodeJS.ProcessEnv = process.env): boolean {

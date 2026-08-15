@@ -15,9 +15,10 @@ import { calculateTimeframeIndicators, type Candle } from "@dtc/shared";
 import { deriveDirectionVeto, CORTEX_LANE_ROSTER, type CortexLaneDirection } from "./cortex-live-gather.js";
 import { FOUR_BRAIN_LANE_SUPPORT, FOUR_BRAIN_SUPPORTED_LANES as SUPPORTED_LANES } from "./four-brain-lane-support.js";
 import type { MarketSafetyEvent } from "./market-state-brain.js";
-import { fourBrainMode, type DirectionHorizon } from "./four-brain-types.js";
+import { fourBrainMode, type DirectionHorizon, type MarketStateAuthority } from "./four-brain-types.js";
 import { staticAllocationContext, unavailableMarketContext, type AllocationContext, type MarketContextLineage } from "./authority-contract.js";
-import { getFourBrainEdgeMemory, fourBrainEdgeVerdict } from "./four-brain-edge-memory.js";
+import { getFourBrainExecutionReinforcement } from "./four-brain-execution-reinforcement.js";
+import { fourBrainTestnetCohortHorizon } from "./four-brain-testnet-cohort.js";
 import {
   FRESHNESS_TTL_MS,
   type EntryCandidateRaw,
@@ -72,6 +73,11 @@ const SCALP_ELIGIBLE = (id: string): boolean => id.includes("FAST");
  */
 export function laneHorizon(laneId: string, opts?: { scalpEnabled?: boolean }): DirectionHorizon {
   const id = laneId.toUpperCase();
+  // The active testnet cohort must not rely on the legacy naming heuristic.
+  // Directional sectional + MFE Giveback are 4h tactical observations; the
+  // neutral basket is deliberately and explicitly SWING.
+  const explicitCohortHorizon = fourBrainTestnetCohortHorizon(id);
+  if (explicitCohortHorizon !== null) return explicitCohortHorizon;
   if (id.includes("INTRADAY") || id.includes("SHORT_FADE") || id.includes("PANIC") || id.includes("FAST")) {
     return opts?.scalpEnabled === true && SCALP_ELIGIBLE(id) ? "SCALP" : "INTRADAY";
   }
@@ -127,6 +133,21 @@ export interface EntryOrderflowSnapshot {
   expectedSlippageBpsSell: number | null;
   bookDepthOkBuy: boolean | null;
   bookDepthOkSell: boolean | null;
+  /** Top-of-book notional imbalance in [-1,+1]; positive = bid pressure. */
+  bookImbalance?: number | null;
+  observedAtMs: number | null;
+}
+
+/** Fresh, completed-candle exit evidence. Null means the source is genuinely unavailable/stale. */
+export interface ExitLiveSignals {
+  momentumDecay: boolean | null;
+  volumeExhaustion: boolean | null;
+  failedNewExtreme: boolean | null;
+  structureBreak: boolean | null;
+  orderFlowReversal: boolean | null;
+  volTransition: boolean | null;
+  regimeTransition: boolean | null;
+  thesisIntact: boolean | null;
   observedAtMs: number | null;
 }
 
@@ -140,6 +161,8 @@ export interface TimeframeIndicatorLike {
   atr: number | null;
   isFresh: boolean;
   lastOpenTime: number | null;
+  /** Optional for backwards-compatible pure callers. Runtime adapters supply the completed bar close. */
+  lastCloseTime?: number | null;
 }
 
 /** Convert a fresh TimeframeIndicator snapshot + last close into the Entry Brain's microstructure. Pure. */
@@ -157,7 +180,14 @@ export function microstructureFromIndicators(
     breakoutConfirmed: side === "LONG" ? ind.breakoutHigh : ind.breakoutLow,
     volumeConfirmed: finite(ind.volumeRatio) ? ind.volumeRatio! >= volumeConfirmThreshold : null,
     candleFresh: ind.isFresh === true,
-    observedAtMs: finite(ind.lastOpenTime) ? ind.lastOpenTime : null,
+    // A completed bar cannot be used at its open. Stamping it with the open time made a fresh 15m
+    // candle look 15 minutes older than it really was and unnecessarily aged out Entry Brain's
+    // chase window.
+    observedAtMs: finite(ind.lastCloseTime)
+      ? ind.lastCloseTime!
+      : finite(ind.lastOpenTime)
+        ? ind.lastOpenTime
+        : null,
     spreadBps: null,
     expectedSlippageBps: null,
     bookDepthOk: null,
@@ -207,13 +237,14 @@ export function makeEntryMicrostructureAccessor(
       return null;
     }
     const openTime = finite(snap.lastOpenTime) ? snap.lastOpenTime : null;
+    const closeTime = openTime === null ? null : openTime + timeframeMs(tf);
     const hasFutureCandle = candles.some((candle) => candle.openTime > deps.nowMs);
     // candleFresh = the STRICTER of two budgets so a stale bar can NEVER ENTER_NOW:
     //   (a) causal + within the four-brain candle TTL ceiling (FRESHNESS_TTL_MS.candle, ~1h-bar budget), AND
     //   (b) the shared indicator's OWN timeframe-aware grace (snap.isFresh = timeframeMs(tf)×3 — e.g. 45min
     //       for 15m). The fixed ceiling alone would treat a 15m bar up to 90min (6 bars) old as fresh; ANDing
     //       the timeframe-aware grace keeps it tight per the operator's stale-candle requirement.
-    const causalWithinTtl = openTime !== null && openTime <= deps.nowMs + 60_000 && deps.nowMs - openTime <= candleTtlMs;
+    const causalWithinTtl = closeTime !== null && closeTime <= deps.nowMs + 60_000 && deps.nowMs - closeTime <= candleTtlMs;
     const candleFresh = !hasFutureCandle && causalWithinTtl && snap.isFresh === true;
     const ms = microstructureFromIndicators(
       {
@@ -225,6 +256,7 @@ export function makeEntryMicrostructureAccessor(
         atr: snap.atr14,
         isFresh: candleFresh,
         lastOpenTime: openTime,
+        lastCloseTime: closeTime,
       },
       side,
       // The microstructure decision uses the same completed-candle price as
@@ -255,9 +287,101 @@ export function makeEntryMicrostructureAccessor(
   };
 }
 
+function timeframeMs(tf: "5m" | "15m" | "1h"): number {
+  return tf === "5m" ? 5 * 60_000 : tf === "1h" ? 60 * 60_000 : 15 * 60_000;
+}
+
+export interface ExitLiveSignalsAccessorDeps {
+  candlesFor: (symbol: string) => Candle[] | null;
+  orderflowFor?: (symbol: string) => EntryOrderflowSnapshot | null;
+  canonicalRegimeFamily?: "BULLISH" | "BEARISH" | "MIXED" | "UNKNOWN" | null;
+  timeframe?: "5m" | "15m" | "1h";
+  nowMs: number;
+}
+
+/**
+ * Build conservative live Exit-Brain evidence from completed candles and the same prewarmed USD-M
+ * order book used by Entry Brain.  The accessor returns null rather than manufacturing an absence
+ * as "false" whenever there is not a sufficiently fresh, completed candle path.
+ */
+export function makeExitLiveSignalsAccessor(
+  deps: ExitLiveSignalsAccessorDeps,
+): (symbol: string, side: "LONG" | "SHORT") => ExitLiveSignals | null {
+  const tf = deps.timeframe ?? "15m";
+  const barMs = timeframeMs(tf);
+  return (symbol, side) => {
+    let raw: Candle[] | null = null;
+    try {
+      raw = deps.candlesFor(symbol);
+    } catch {
+      return null;
+    }
+    if (!raw || raw.length < 16) return null;
+    const candles = raw
+      .filter((candle) => finite(candle.openTime) && candle.openTime + barMs <= deps.nowMs)
+      .filter((candle) => finite(candle.open) && finite(candle.high) && finite(candle.low) && finite(candle.close) && finite(candle.volume))
+      .sort((left, right) => left.openTime - right.openTime);
+    if (candles.length < 16) return null;
+    const last = candles[candles.length - 1]!;
+    const lastCloseTime = last.openTime + barMs;
+    if (lastCloseTime > deps.nowMs + 60_000 || deps.nowMs - lastCloseTime > FRESHNESS_TTL_MS.candle) return null;
+    const previous = candles.slice(-4, -1);
+    if (previous.length < 3) return null;
+    const prev = previous[previous.length - 1]!;
+    const prev2 = previous[previous.length - 2]!;
+    const priorFive = candles.slice(-6, -1);
+    const priorThree = candles.slice(-4, -1);
+    const priorEight = candles.slice(-9, -1);
+    const priorTwelve = candles.slice(-13, -1);
+    const maxHigh = Math.max(...priorFive.map((candle) => candle.high));
+    const minLow = Math.min(...priorFive.map((candle) => candle.low));
+    const structureLow = Math.min(...priorThree.map((candle) => candle.low));
+    const structureHigh = Math.max(...priorThree.map((candle) => candle.high));
+    const averageVolume = priorEight.reduce((sum, candle) => sum + candle.volume, 0) / priorEight.length;
+    const lastRange = Math.max(0, last.high - last.low);
+    const averageRange = priorTwelve.reduce((sum, candle) => sum + Math.max(0, candle.high - candle.low), 0) / priorTwelve.length;
+    const momentumDecay = side === "LONG"
+      ? last.close < prev.close && prev.close < prev2.close
+      : last.close > prev.close && prev.close > prev2.close;
+    const failedNewExtreme = side === "LONG"
+      ? last.high >= maxHigh && last.close < last.open
+      : last.low <= minLow && last.close > last.open;
+    const structureBreak = side === "LONG" ? last.close < structureLow : last.close > structureHigh;
+    const volumeExhaustion = averageVolume > 0 ? last.volume < averageVolume * 0.7 : null;
+    const volTransition = averageRange > 0 ? lastRange >= averageRange * 1.7 : null;
+    let flow: EntryOrderflowSnapshot | null = null;
+    try {
+      flow = deps.orderflowFor?.(symbol) ?? null;
+    } catch {
+      flow = null;
+    }
+    const flowFresh = finite(flow?.observedAtMs) && flow!.observedAtMs! <= deps.nowMs + 60_000 && deps.nowMs - flow!.observedAtMs! <= FRESHNESS_TTL_MS.orderflow;
+    const imbalance = flowFresh && finite(flow?.bookImbalance) ? flow!.bookImbalance! : null;
+    const orderFlowReversal = imbalance === null ? null : side === "LONG" ? imbalance <= -0.25 : imbalance >= 0.25;
+    const regime = deps.canonicalRegimeFamily ?? null;
+    const regimeTransition = regime === "BULLISH" ? side === "SHORT" : regime === "BEARISH" ? side === "LONG" : null;
+    // The thesis is only asserted when completed-candle structural evidence exists.  Flow stays a
+    // separate input: missing depth must not turn into a fabricated "thesis intact" verdict.
+    const thesisIntact = !(momentumDecay || failedNewExtreme || structureBreak);
+    return {
+      momentumDecay,
+      volumeExhaustion,
+      failedNewExtreme,
+      structureBreak,
+      orderFlowReversal,
+      volTransition,
+      regimeTransition,
+      thesisIntact,
+      observedAtMs: lastCloseTime,
+    };
+  };
+}
+
 export interface FourBrainBindingDeps {
   instanceId: string;
   nowMs: number;
+  /** Optional isolated outcome root for an advisory rollout cohort. Absent preserves `data/`. */
+  fourBrainOutcomeDataDir?: string;
   horizons?: DirectionHorizon[];
   /** How many outcomes each horizon has ever resolved. An explicit 0 unlocks the Direction Brain's
    *  cold-start exploration — see direction-brain.ts's coldStart. Absent ⇒ undefined per horizon,
@@ -275,10 +399,21 @@ export interface FourBrainBindingDeps {
   atrAtMs: number | null;
   advancersPct: number | null; // 0..1
   breadthAtMs: number | null;
+  /** BTC USD-M order-book execution-cost proxy, normalized so 1 = inexpensive/deep and 0 = too costly or too thin. */
+  marketLiquidityScore?: number | null;
+  marketLiquidityAtMs?: number | null;
+  /** Quantitative conflict-news volume score; 0 = no measured in-window records. */
+  eventRiskScore?: number | null;
+  eventRiskAtMs?: number | null;
+  /** Provenance is dynamic only when the primary public provider falls back to RSS. */
+  eventRiskSourceId?: string | null;
+  eventRiskMissingReason?: string | null;
   sentiment: number | null; // −1..1 or null
   sentimentAtMs: number | null;
   safetyEvents: MarketSafetyEvent[];
   marketValidityMs?: number;
+  /** Testnet executor regime is authoritative for the visible/actionable state. */
+  marketStateAuthority?: MarketStateAuthority | null;
 
   // ── Direction (regime-level) ──
   regimeRaw: string | null;
@@ -335,6 +470,8 @@ export interface FourBrainBindingDeps {
   crowdingStateForSymbol?: (symbol: string) => "BUILDING" | "EXHAUSTING" | "UNWINDING" | "NEUTRAL" | null;
   /** Candle-microstructure (adapter B). null ⇒ no candle data for the symbol (micro stays MISSING). */
   entryMicrostructure?: (symbol: string, side: "LONG" | "SHORT") => EntryMicrostructure | null;
+  /** Fresh completed-candle/orderflow Exit-Brain evidence for an open position. */
+  exitSignals?: (symbol: string, side: "LONG" | "SHORT") => ExitLiveSignals | null;
 
   // ── Exit candidates (open positions) ──
   openPositions: Array<{ paperOrderId: string; laneId: string; symbol: string; direction: "LONG" | "SHORT"; entryPrice: number; stopPrice: number; mfeR: number | null; maeR: number | null; createdAtMs: number }>;
@@ -360,6 +497,27 @@ const reading = (sourceId: string, normalized: number | null, unit: string, obse
   sourceId, raw: rawOverride !== undefined ? rawOverride : normalized, normalized, unit, observedAtMs, freshnessClass, missingReason: normalized == null ? (reason ?? "absent") : null,
 });
 const finite = (n: unknown): n is number => typeof n === "number" && Number.isFinite(n);
+const unitInterval = (n: unknown): number | null => finite(n) && n >= 0 && n <= 1 ? n : null;
+
+/**
+ * Convert a real BTC USD-M depth snapshot into the Market State Brain's 0..1 liquidity input.
+ *
+ * This is deliberately an execution-cost proxy, not a claim about all-market liquidity: it only
+ * says how expensive/deep the observable BTC book is for the same reference notional used by
+ * Entry Brain. A visible best bid/ask plus an unfillable side is concrete thin-book evidence and
+ * maps to 0; a missing/invalid spread is still MISSING, never a manufactured zero.
+ */
+export function marketLiquidityScoreFromExecutionCost(
+  input: { spreadBps: number | null; expectedSlippageBpsBuy: number | null; expectedSlippageBpsSell: number | null },
+  maxAcceptableCostBps = 25,
+): number | null {
+  if (!finite(input.spreadBps) || input.spreadBps < 0 || !finite(maxAcceptableCostBps) || !(maxAcceptableCostBps > 0)) return null;
+  if (input.expectedSlippageBpsBuy === null || input.expectedSlippageBpsSell === null) return 0;
+  if (!finite(input.expectedSlippageBpsBuy) || input.expectedSlippageBpsBuy < 0) return null;
+  if (!finite(input.expectedSlippageBpsSell) || input.expectedSlippageBpsSell < 0) return null;
+  const executionCostBps = Math.max(input.spreadBps, input.expectedSlippageBpsBuy, input.expectedSlippageBpsSell);
+  return Math.max(0, Math.min(1, 1 - executionCostBps / maxAcceptableCostBps));
+}
 
 /** Edge-memory avgNetR (R), mapping the n===0 emptyStat fabricated-0 to null (no proven edge ≠ zero edge). */
 function edgeR(dep: FourBrainBindingDeps, direction: "LONG" | "SHORT"): number | null {
@@ -422,10 +580,17 @@ export function buildFourBrainGatherInput(dep: FourBrainBindingDeps): FourBrainG
   const marketState = {
     trend: reading("regime-axis-score", finite(dep.axisScore) ? dep.axisScore : null, "-1..1", dep.axisAtMs, "regime"),
     volatility: reading("btc-atr-percentile", finite(dep.btcAtrPercentile) ? dep.btcAtrPercentile / 100 : null, "0..1", dep.atrAtMs, "candle", "BTC ATR%ile proxy (no market-wide vol source)", finite(dep.btcAtrPercentile) ? dep.btcAtrPercentile : null),
-    liquidity: missing("order-book-depth", "0..1", "orderflow", "no market liquidity/depth feed in repo (UNAVAILABLE)"),
+    liquidity: reading("btc-usdm-execution-cost-liquidity-proxy", unitInterval(dep.marketLiquidityScore), "0..1", dep.marketLiquidityAtMs ?? null, "orderflow", "BTC USD-M execution-cost snapshot unavailable"),
     breadth: reading("breadth-advancers", finite(dep.advancersPct) ? dep.advancersPct * 2 - 1 : null, "-1..1", dep.breadthAtMs, "regime", undefined, finite(dep.advancersPct) ? dep.advancersPct : null),
     momentum: reading("regime-axis-slope", finite(dep.axisSlopePerHour) ? Math.max(-1, Math.min(1, dep.axisSlopePerHour / 0.05)) : null, "-1..1", dep.axisAtMs, "regime", undefined, finite(dep.axisSlopePerHour) ? dep.axisSlopePerHour : null),
-    eventRisk: missing("event-risk", "0..1", "sentiment", "no live event-risk producer (cortex-enrichment UNAVAILABLE)"),
+    eventRisk: reading(
+      dep.eventRiskSourceId ?? "gdelt-conflict-news-volume-risk",
+      unitInterval(dep.eventRiskScore),
+      "0..1",
+      dep.eventRiskAtMs ?? null,
+      "sentiment",
+      dep.eventRiskMissingReason ?? "Conflict-news snapshot unavailable",
+    ),
     sentiment: reading("sentiment", finite(dep.sentiment) ? dep.sentiment : null, "-1..1", dep.sentimentAtMs, "sentiment", "sentiment thin/STALE_PRONE"),
     safetyEvents: dep.safetyEvents,
     validityMs,
@@ -443,14 +608,7 @@ export function buildFourBrainGatherInput(dep: FourBrainBindingDeps): FourBrainG
   const shortVeto = deriveDirectionVeto({ direction: "SHORT" as CortexLaneDirection, edgeMemory: dep.edgeMemory, regimeRaw: dep.regimeRaw });
   const longLane = dep.bestLaneReportForDirection("LONG");
   const shortLane = dep.bestLaneReportForDirection("SHORT");
-  // Four-brain's OWN self-referential edge memory (four-brain-edge-memory.ts) — a SECOND, independent
-  // proven-negative signal from the incumbent's longVeto/shortVeto above, derived from the Direction
-  // Brain's OWN resolved LONG/SHORT outcomes (direction-entry-outcome-store.ts). Horizon-scoped (unlike
-  // longVeto/shortVeto, which are regime-level only), so it is computed per-horizon inside the map below.
-  const fbEdge = getFourBrainEdgeMemory();
   const directions = horizons.map((horizon) => {
-    const fourBrainLongVeto = fourBrainEdgeVerdict(fbEdge, dep.regimeRaw, "LONG", horizon).verdict === "VETO_NEGATIVE";
-    const fourBrainShortVeto = fourBrainEdgeVerdict(fbEdge, dep.regimeRaw, "SHORT", horizon).verdict === "VETO_NEGATIVE";
     return {
       horizon,
       marketBias: "NEUTRAL" as const, // placeholder — the tick overrides from the Market State Brain
@@ -471,8 +629,11 @@ export function buildFourBrainGatherInput(dep: FourBrainBindingDeps): FourBrainG
       leansShort: dep.allowsShort,
       longVeto,
       shortVeto,
-      fourBrainLongVeto,
-      fourBrainShortVeto,
+      // The old self-outcome lane was resolved against a BTC proxy.  It remains available as
+      // market-direction calibration only, but cannot change a candidate recommendation.  Exact
+      // lane × regime × symbol × side Tier-1 fills are wired below instead.
+      fourBrainLongVeto: false,
+      fourBrainShortVeto: false,
       horizonResolvedN: dep.directionResolvedNByHorizon?.[horizon],
       validityMs,
     };
@@ -486,6 +647,8 @@ export function buildFourBrainGatherInput(dep: FourBrainBindingDeps): FourBrainG
   };
 
   // ── Entry candidates (from open signals) ──
+  const exactFillReinforcement = getFourBrainExecutionReinforcement(dep.fourBrainOutcomeDataDir);
+  const canonicalRegimeFamily = dep.marketStateAuthority?.canonicalRegimeFamily ?? null;
   const entryCandidatesRaw: EntryCandidateRaw[] = dep.openSignals.map((s) => {
     const identity: FourBrainIdentity = {
       instanceId: dep.instanceId, laneId: s.laneId, symbolOrBasketId: s.symbol, side: s.direction,
@@ -496,6 +659,12 @@ export function buildFourBrainGatherInput(dep: FourBrainBindingDeps): FourBrainG
       allocationContext: dep.allocationContextForLane?.(s.laneId, { signalId: s.observationId, direction: s.direction }) ?? staticAllocationContext(null),
       marketContext: dep.marketContext ?? unavailableMarketContext(nowMs),
       laneEligibleIncumbent: dep.laneEligibleIncumbent(s.laneId),
+      executionReinforcement: exactFillReinforcement.lookup({
+        canonicalRegimeFamily,
+        laneId: s.laneId,
+        symbolOrBasketId: s.symbol,
+        side: s.direction,
+      }),
       killLatched: dep.killLatched,
       riskBlockedReason: riskBlockedReason(s.laneId, s.direction),
     };
@@ -563,6 +732,7 @@ export function buildFourBrainGatherInput(dep: FourBrainBindingDeps): FourBrainG
       riskBlockedReason: dep.killLatched ? dep.killReason ?? "kill switch latched" : null,
       hardExitTriggered: hardExit,
     };
+    const exitSignals = dep.exitSignals?.(p.symbol, p.direction) ?? null;
     return {
       identity, side: p.direction,
       entryPrice: finite(p.entryPrice) ? p.entryPrice : null,
@@ -576,8 +746,16 @@ export function buildFourBrainGatherInput(dep: FourBrainBindingDeps): FourBrainG
       hardStopPrice: finite(p.stopPrice) ? p.stopPrice : null,
       killLatched: dep.killLatched,
       decay: {
-        // No live decay/reversal signal producer yet — the Exit Brain is null-safe; emit undefined (MISSING).
-        thesisIntact: null,
+        momentumDecay: exitSignals?.momentumDecay ?? null,
+        volumeExhaustion: exitSignals?.volumeExhaustion ?? null,
+        failedNewExtreme: exitSignals?.failedNewExtreme ?? null,
+        structureBreak: exitSignals?.structureBreak ?? null,
+        orderFlowReversal: exitSignals?.orderFlowReversal ?? null,
+        volTransition: exitSignals?.volTransition ?? null,
+        regimeTransition: exitSignals?.regimeTransition ?? null,
+        // Divergence / liquidity target / event decay remain MISSING until a dedicated validated
+        // producer exists; they are not guessed from the candle path.
+        thesisIntact: exitSignals?.thesisIntact ?? null,
       },
       validityMs,
       exec,
@@ -589,6 +767,7 @@ export function buildFourBrainGatherInput(dep: FourBrainBindingDeps): FourBrainG
     nowMs,
     supportedLanes: FOUR_BRAIN_SUPPORTED_LANES,
     marketState,
+    marketStateAuthority: dep.marketStateAuthority ?? null,
     directions,
     entryCandidatesRaw,
     exitCandidatesRaw,

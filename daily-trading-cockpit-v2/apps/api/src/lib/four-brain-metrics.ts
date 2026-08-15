@@ -32,9 +32,20 @@ export interface FourBrainMetricsSummary {
     skippedSingleFlight: number;
     gatherErrors: number;
     exceptions: number;
+    /** Failures in the async wiring around the synchronous tick. */
+    wiringErrors?: number;
     journalErrors: number;
     brainErrors: number;
     invariantFailures: number;
+  };
+  /** Last lifecycle events. Counts alone cannot distinguish a healthy current cycle from an old,
+   * recovered fault, so the operator health route uses these timestamps fail-closed. */
+  heartbeat?: {
+    lastAttemptAtMs: number | null;
+    lastCompletedAtMs: number | null;
+    lastFailureAtMs: number | null;
+    lastCycleReason: string | null;
+    lastFailureReason: string | null;
   };
   decisions: { total: number; duplicateDecisionIds: number; unknownLanes: number; duplicateIdentities: number };
   coverage: { lastLaneCoverage: number; maxLaneCoverage: number; lastPositionCoverage: number; maxPositionCoverage: number };
@@ -55,6 +66,7 @@ export class FourBrainMetricsAggregator {
   private skipped = 0;
   private gatherErrors = 0;
   private exceptions = 0;
+  private wiringErrors = 0;
   private journalErrors = 0;
   private brainErrors = 0;
   private invariantFailures = 0;
@@ -72,12 +84,32 @@ export class FourBrainMetricsAggregator {
   private gatherRing = new Ring();
   private inferenceRing = new Ring();
   private journalRing = new Ring();
+  private lastAttemptAtMs: number | null = null;
+  private lastCompletedAtMs: number | null = null;
+  private lastFailureAtMs: number | null = null;
+  private lastCycleReason: string | null = null;
+  private lastFailureReason: string | null = null;
 
   /** Fold one tick's metrics + its terminal reason into the running totals. */
-  record(m: FourBrainTickMetrics, reason: "mode-off" | "single-flight-skip" | "gather-error" | "exception" | "ok"): void {
+  record(
+    m: FourBrainTickMetrics,
+    reason: "mode-off" | "single-flight-skip" | "gather-error" | "exception" | "ok",
+    observedAtMs?: number,
+  ): void {
     if (reason === "mode-off") return; // a gated-off tick is not an attempt
+    const atMs = typeof observedAtMs === "number" && Number.isFinite(observedAtMs)
+      ? Math.floor(observedAtMs)
+      : null;
+    if (atMs !== null) this.lastAttemptAtMs = atMs;
+    this.lastCycleReason = reason;
     this.attempted += m.attempted;
-    if (reason === "ok") this.completed += 1;
+    if (reason === "ok") {
+      this.completed += 1;
+      if (atMs !== null) this.lastCompletedAtMs = atMs;
+    } else if (reason === "gather-error" || reason === "exception") {
+      if (atMs !== null) this.lastFailureAtMs = atMs;
+      this.lastFailureReason = reason;
+    }
     this.skipped += m.skippedSingleFlight;
     this.gatherErrors += m.gatherErrors;
     if (reason === "exception") this.exceptions += 1;
@@ -104,6 +136,22 @@ export class FourBrainMetricsAggregator {
     this.journalRing.push(m.journalMs);
   }
 
+  /** The async prewarm/wiring shell failed before it could produce tick metrics.  Record it explicitly
+   * so a report-only fail-open catch cannot look like a silently healthy collector. */
+  recordWiringFailure(observedAtMs: number | null | undefined, reason = "cycle-wiring-exception"): void {
+    const atMs = typeof observedAtMs === "number" && Number.isFinite(observedAtMs)
+      ? Math.floor(observedAtMs)
+      : null;
+    this.wiringErrors += 1;
+    this.exceptions += 1;
+    if (atMs !== null) {
+      this.lastAttemptAtMs = atMs;
+      this.lastFailureAtMs = atMs;
+    }
+    this.lastCycleReason = reason;
+    this.lastFailureReason = reason;
+  }
+
   summary(): FourBrainMetricsSummary {
     const sourceQuality: FourBrainMetricsSummary["sourceQuality"] = {};
     for (const [cls, a] of Object.entries(this.freshness)) {
@@ -124,9 +172,17 @@ export class FourBrainMetricsAggregator {
         skippedSingleFlight: this.skipped,
         gatherErrors: this.gatherErrors,
         exceptions: this.exceptions,
+        wiringErrors: this.wiringErrors,
         journalErrors: this.journalErrors,
         brainErrors: this.brainErrors,
         invariantFailures: this.invariantFailures,
+      },
+      heartbeat: {
+        lastAttemptAtMs: this.lastAttemptAtMs,
+        lastCompletedAtMs: this.lastCompletedAtMs,
+        lastFailureAtMs: this.lastFailureAtMs,
+        lastCycleReason: this.lastCycleReason,
+        lastFailureReason: this.lastFailureReason,
       },
       decisions: { total: this.decisions, duplicateDecisionIds: this.dupDecisionIds, unknownLanes: this.unknownLanes, duplicateIdentities: this.dupIdentities },
       coverage: {

@@ -57,6 +57,8 @@ import { fetchCrowdingSnapshot, type CrowdSide, type CrowdingState } from "./der
 import { clusterOf, isMajorSymbol } from "./correlation-clusters.js";
 import type { CortexRealAttributionStore } from "./cortex-real-attribution.js";
 import { fillFromUserTrade, type ExecutionFill, type ExecutionFillRecorder, type ExecutionFillRole } from "./execution-fill-recorder.js";
+import type { FourBrainActualFillBindingStore } from "./four-brain-actual-fill-binding.js";
+import { normalizeFourBrainTestnetLane, type FourBrainBridgeCandidate, type FourBrainBridgeDecision } from "./four-brain-testnet-bridge.js";
 import type { PositionPathRecorder } from "./position-path-recorder.js";
 import type { BinanceClient } from "./binance.js";
 import type { PaperOrder } from "./paper-execution-router.js";
@@ -80,6 +82,11 @@ import {
   isDirectionalTechnicalSignalFresh,
   type SymbolVolatilityCacheStore,
 } from "./directional-symbol-sizing.js";
+import {
+  isMfeGivebackLaneId,
+  isTestnetCrossSectionalHorizonSourceAllowed,
+  isTestnetMfeGivebackSymbolAllowed,
+} from "./live-executor-wiring.js";
 
 // ─── config ──────────────────────────────────────────────────────────────────
 
@@ -155,6 +162,8 @@ export interface LiveExecutionConfig {
   maxPaperOrderAgeMs: number;
   /** Testnet-only: mirror every open paper order, including diagnostic lanes and pre-restart orders. */
   mirrorAllPaperOrders: boolean;
+  /** Testnet-only rollout lock: no non-cross-sectional lane may create a new mirror/copy. */
+  testnetOnlyCrossSectionalHorizon: boolean;
   /**
    * Testnet-only collector policy. Interleaves fresh sources by their
    * lane × direction × entry-regime exposure and never pyramids a source from
@@ -326,6 +335,8 @@ export function parseLiveExecutionConfig(env: NodeJS.ProcessEnv = process.env): 
     maxNotionalPerTrade: envNum(env.LIVE_MAX_NOTIONAL_PER_TRADE, 250),
     maxPaperOrderAgeMs: Math.floor(envNum(env.LIVE_MAX_PAPER_ORDER_AGE_MS, 10 * 60 * 1000)),
     mirrorAllPaperOrders: env.LIVE_MIRROR_ALL_PAPER === "1" && liveEnv === "testnet",
+    testnetOnlyCrossSectionalHorizon:
+      liveEnv === "testnet" && env.TESTNET_ONLY_CROSS_SECTIONAL_HORIZON === "1",
     testnetStratifiedCollection:
       env.LIVE_TESTNET_STRATIFIED_COLLECTION === "1" && liveEnv === "testnet",
     mirrorProvenSymbolsOnly: isMirrorProvenSymbolsOnly(env),
@@ -971,6 +982,10 @@ interface LiveExecutionState {
   newEntriesPaused: boolean;
   newEntriesPausedAt: string | null;
   newEntriesPauseReason: string | null;
+  /** Symbol"yy re-entry time after a responsive MFE reversal exit. */
+  mfeReversalReentryBlockedUntil: Record<string, string>;
+  /** Symbol+uR last responsive MFE reversal exit; caps churn exits to one per 2h. */
+  mfeReversalLastExitAt: Record<string, string>;
 }
 
 export interface LiveNewEntryGateDecision {
@@ -1063,6 +1078,8 @@ export class LiveExecutionStore {
       newEntriesPaused: false,
       newEntriesPausedAt: null,
       newEntriesPauseReason: null,
+      mfeReversalReentryBlockedUntil: {},
+      mfeReversalLastExitAt: {},
     };
   }
 
@@ -1256,6 +1273,10 @@ export interface LiveExecutionEngineOptions {
    *  optional-dep posture as the two recorders above: omit and the engine is byte-for-byte
    *  unchanged; every use is wrapped so a failure can NEVER affect trading. */
   executionFillRecorder?: ExecutionFillRecorder;
+  /** Exact Four-Brain decision -> fill lineage for the narrowly-scoped testnet cohort. */
+  fourBrainActualFillBindings?: FourBrainActualFillBindingStore;
+  /** Negative-evidence pilot gate. Omitted on every environment outside the focused testnet. */
+  fourBrainEntryGate?: (candidate: FourBrainBridgeCandidate) => FourBrainBridgeDecision;
   /** Optional shadow-only Executive Review resolver sink. app.ts never injects it on 3103. */
   executiveReviewStore?: ExecutiveReviewStore;
 }
@@ -1855,6 +1876,54 @@ export function shouldCapPyramidAdd(
 }
 
 /**
+ * MFE-giveback is an exit experiment, not permission to enter or average into a
+ * thesis that the newest scanner observation has already withdrawn. A
+ * WAIT/conflict or an opposing Kronos bias blocks NEW MFE exposure; existing
+ * positions keep their exchange-side stop/TP and lifecycle management.
+ */
+export function mfeGivebackSignalBlockReason(
+  direction: "LONG" | "SHORT",
+  papers: readonly Pick<PaperOrder, "provenance">[],
+): string | null {
+  for (const paper of papers) {
+    const provenance = paper.provenance;
+    if (provenance?.sourceStatus?.trim().toUpperCase() === "WAIT") return "mfe_signal_wait";
+    if (provenance?.sourceConflict === true) return "mfe_signal_source_conflict";
+    if (provenance?.directionConflict === true) return "mfe_signal_direction_conflict";
+
+    const kronosBias = provenance?.kronosBias?.trim().toUpperCase();
+    if ((kronosBias === "LONG" || kronosBias === "SHORT") && kronosBias !== direction) {
+      return "mfe_signal_kronos_opposes";
+    }
+  }
+  return null;
+}
+
+export const MFE_REVERSAL_CONFIRMATIONS_REQUIRED = 2;
+export const MFE_REVERSAL_REENTRY_COOLDOWN_MS = 15 * 60 * 1000;
+export const MFE_REVERSAL_EXIT_COOLDOWN_MS = 2 * 60 * 60 * 1000;
+
+/** Two independent fresh observations must agree before a responsive MFE exit. */
+export function mfeResponsiveReversalConfirmed(
+  direction: "LONG" | "SHORT",
+  papers: readonly Pick<PaperOrder, "sourceObservationId" | "createdAt" | "provenance">[],
+): boolean {
+  const opposite = direction === "LONG" ? "SHORT" : "LONG";
+  const oppositeWhale = direction === "LONG" ? "BEARISH" : "BULLISH";
+  const newestByObservation = new Map<string, Pick<PaperOrder, "sourceObservationId" | "createdAt" | "provenance">>();
+  for (const paper of [...papers].sort((a, b) => b.createdAt.localeCompare(a.createdAt))) {
+    if (!newestByObservation.has(paper.sourceObservationId)) newestByObservation.set(paper.sourceObservationId, paper);
+  }
+  const confirmations = [...newestByObservation.values()].slice(0, MFE_REVERSAL_CONFIRMATIONS_REQUIRED);
+  return confirmations.length === MFE_REVERSAL_CONFIRMATIONS_REQUIRED && confirmations.every((paper) => {
+    const provenance = paper.provenance;
+    return provenance?.sourceStatus?.trim().toUpperCase() === "WAIT" &&
+      provenance.kronosBias?.trim().toUpperCase() === opposite &&
+      provenance.whaleSignal?.trim().toUpperCase() === oppositeWhale;
+  });
+}
+
+/**
  * 2026-07-19 real-money audit fix (BUG 4, HIGH): worst-case combined notional a directional
  * allocation list (one side — long or short — of setManualDirectionalLaneAllocations) could deploy
  * SIMULTANEOUSLY if every listed lane's signal fired at once. Each lane sizes independently to its
@@ -1956,6 +2025,8 @@ export class LiveExecutionEngine {
   private readonly cortexRealAttribution: CortexRealAttributionStore | null;
   private readonly positionPathRecorder: PositionPathRecorder | null;
   private readonly executionFillRecorder: ExecutionFillRecorder | null;
+  private readonly fourBrainActualFillBindings: FourBrainActualFillBindingStore | null;
+  private readonly fourBrainEntryGate: ((candidate: FourBrainBridgeCandidate) => FourBrainBridgeDecision) | null;
   private readonly executiveReviewStore: ExecutiveReviewStore | null;
 
   /** In-memory ONLY — restart always boots disarmed. */
@@ -2021,6 +2092,8 @@ export class LiveExecutionEngine {
     this.cortexRealAttribution = options.cortexRealAttribution ?? null;
     this.positionPathRecorder = options.positionPathRecorder ?? null;
     this.executionFillRecorder = options.executionFillRecorder ?? null;
+    this.fourBrainActualFillBindings = options.fourBrainActualFillBindings ?? null;
+    this.fourBrainEntryGate = options.fourBrainEntryGate ?? null;
     this.executiveReviewStore = options.executiveReviewStore ?? null;
     // Auto-arm must NOT punch through a latched kill: a restart preserves the kill until an
     // explicit resetKill(). (arm() already enforces this; the constructor path bypassed it.)
@@ -2883,6 +2956,11 @@ export class LiveExecutionEngine {
     period?: string | null;
     anchor?: string | null;
     regime?: string | null;
+    /** Optional narrow cohort. Empty means the complete, auditable live ledger. */
+    laneIds?: readonly string[] | null;
+    symbols?: readonly string[] | null;
+    /** Optional lower bound for an explicit deployment cohort, in addition to the selected view. */
+    since?: string | null;
   } = {}): LiveLanePerformanceSeriesReport {
     const view = normalizePerformanceView(options.view);
     const period = normalizePerformancePeriod(options.period);
@@ -2895,6 +2973,12 @@ export class LiveExecutionEngine {
       anchor: options.anchor,
       nowMs: safeNowMs,
     });
+    const requestedSinceMs = options.since ? Date.parse(options.since) : Number.NaN;
+    const cohortSinceMs = Number.isFinite(requestedSinceMs)
+      ? Math.max(window.sinceMs, requestedSinceMs)
+      : window.sinceMs;
+    const requestedLaneIds = new Set((options.laneIds ?? []).map((laneId) => laneId.trim()).filter(Boolean));
+    const requestedSymbols = new Set((options.symbols ?? []).map((symbol) => symbol.trim().toUpperCase()).filter(Boolean));
     const bucketStarts = window.bucketStartsMs.map((bucketMs) => new Date(bucketMs).toISOString());
 
     const paperById = this.paperOrderById();
@@ -2913,7 +2997,8 @@ export class LiveExecutionEngine {
       if (intent.realizedPnlUsd === null) continue;
       const closedAt = intent.closedAt ?? intent.updatedAt;
       const closedMs = new Date(closedAt).getTime();
-      if (!Number.isFinite(closedMs) || closedMs < window.sinceMs || closedMs >= window.untilMs) continue;
+      if (!Number.isFinite(closedMs) || closedMs < cohortSinceMs || closedMs >= window.untilMs) continue;
+      if (requestedSymbols.size > 0 && !requestedSymbols.has(intent.symbol.toUpperCase())) continue;
 
       const bucketStartMs = window.bucketForMs(closedMs);
       if (bucketStartMs === null) continue;
@@ -2938,6 +3023,7 @@ export class LiveExecutionEngine {
       }
 
       for (const [laneId, laneSources] of sourcesByLane) {
+        if (requestedLaneIds.size > 0 && !requestedLaneIds.has(laneId)) continue;
         const laneQty = laneSources.reduce((sum, source) => sum + source.qty, 0);
         const share = totalQty > 0 ? laneQty / totalQty : 1 / Math.max(sourcesByLane.size, 1);
         const representative = laneSources[0]!;
@@ -3024,7 +3110,7 @@ export class LiveExecutionEngine {
       periodLabel: window.periodLabel,
       bucketLabel: viewConfig.bucketLabel,
       bucketMs: window.bucketMs,
-      since: new Date(window.sinceMs).toISOString(),
+      since: new Date(cohortSinceMs).toISOString(),
       until: new Date(window.untilMs).toISOString(),
       anchor: window.anchor,
       regimeFilter,
@@ -3093,6 +3179,10 @@ export class LiveExecutionEngine {
       // comment). Runs right after lifecycle management so a close is handed to the Exit Brain's
       // reader on the same tick it settles.
       this.sweepPositionPathRecorder();
+
+      // 3.61. Exact Four-Brain decision -> actual-fill outcome sweep. Independent from the path
+      // recorder so causal Tier-1 learning remains active even when dense path telemetry is off.
+      this.sweepFourBrainActualFillBindings();
 
       // 3.65. Exact Executive Review intent -> position linkage. This is shadow bookkeeping only:
       // it cannot create an outcome from USD P&L, cannot change an order, and is never injected on 3103.
@@ -3670,6 +3760,22 @@ export class LiveExecutionEngine {
           if (liveBreakeven.closed) continue;
         }
 
+
+        // The testnet XRP/WLD CG_MFE_GIVEBACK rollout is deliberately a
+        // pure-geometry exit experiment. Regime harvest, USD profit-bank,
+        // breakeven, and losing-hold overlays already skip this cohort; keep
+        // the responsive-reversal overlay out too so its policy-managed exit
+        // cannot be pre-empted by MFE_RESPONSIVE_REVERSAL_EXIT. Exchange-side
+        // protective stop reconciliation remains intact.
+        if (
+          pos &&
+          intent.state === "OPEN" &&
+          !(this.config.env === "testnet" && this.isCgmfeGivebackIntent(intent))
+        ) {
+          const reversal = await this.maybeCloseMfeResponsiveReversal(intent, amt);
+          if (reversal.changed) dirty = true;
+          if (reversal.closed) continue;
+        }
         if (
           pos &&
           intent.state === "OPEN" &&
@@ -4595,6 +4701,65 @@ export class LiveExecutionEngine {
     return { changed: true, closed: true };
   }
 
+  private isCgmfeGivebackIntent(intent: LiveIntent): boolean {
+    return this.intentExitRule(intent) === "mfe_giveback" && this.intentSources(intent).some((source) =>
+      source.laneId === "CG_MFE_GIVEBACK" || source.laneId.endsWith(":CG_MFE_GIVEBACK"),
+    );
+  }
+
+  private async maybeCloseMfeResponsiveReversal(intent: LiveIntent, amt: number): Promise<{ changed: boolean; closed: boolean }> {
+    if (!this.isCgmfeGivebackIntent(intent)) return { changed: false, closed: false };
+    const st = this.store.getState();
+    const nowMs = Date.parse(this.nowIso());
+    const lastExitMs = Date.parse(st.mfeReversalLastExitAt[intent.symbol] ?? "");
+    if (Number.isFinite(lastExitMs) && nowMs - lastExitMs < MFE_REVERSAL_EXIT_COOLDOWN_MS) return { changed: false, closed: false };
+
+    const openedAtMs = Date.parse(intent.createdAt);
+    const observations = this.paperStore.all.filter((paper) =>
+      paper.symbol === intent.symbol &&
+      this.paperExitRule(paper) === "mfe_giveback" &&
+      (paper.selectedLaneId === "CG_MFE_GIVEBACK" || paper.selectedLaneId.endsWith(":CG_MFE_GIVEBACK")) &&
+      Number.isFinite(Date.parse(paper.createdAt)) && Date.parse(paper.createdAt) > openedAtMs,
+    );
+    if (!mfeResponsiveReversalConfirmed(intent.direction, observations)) return { changed: false, closed: false };
+
+    try {
+      if (intent.stopOrderId !== null) await this.client.cancelAlgoOrder(intent.stopOrderId);
+      if (intent.tp1OrderId !== null) await this.client.cancelOrder(intent.symbol, intent.tp1OrderId);
+      if (intent.beStopOrderId !== null) await this.client.cancelAlgoOrder(intent.beStopOrderId);
+    } catch {
+      // The reduce-only close below is the safety action; exit-order cleanup is best-effort.
+    }
+    const flat = await this.client.placeOrder({
+      symbol: intent.symbol,
+      side: amt > 0 ? "SELL" : "BUY",
+      type: "MARKET",
+      quantity: Math.abs(amt),
+      reduceOnly: true,
+      newClientOrderId: `dtc-${intent.paperOrderId.slice(-18)}-rev`,
+    });
+    try {
+      await this.client.cancelAllOrders(intent.symbol);
+      await this.client.cancelAllAlgoOrders(intent.symbol);
+    } catch {
+      // best-effort after the reduce-only close
+    }
+    const settled = await this.settleIntentAfterClose(intent, [flat.orderId]);
+    const net = settled?.netUsd ?? null;
+    intent.realizedPnlUsd = net;
+    intent.feesUsd = settled?.feesUsd ?? null;
+    intent.feeSource = settled?.feeSource ?? undefined;
+    intent.state = "CLOSED";
+    intent.closedAt = this.nowIso();
+    this.stampExitControllerSnapshot(intent);
+    intent.updatedAt = this.nowIso();
+    intent.closeReason = "MFE_RESPONSIVE_REVERSAL_EXIT";
+    this.applyRealizedToLedger(net);
+    st.mfeReversalLastExitAt[intent.symbol] = intent.closedAt;
+    st.mfeReversalReentryBlockedUntil[intent.symbol] = new Date(nowMs + MFE_REVERSAL_REENTRY_COOLDOWN_MS).toISOString();
+    return { changed: true, closed: true };
+  }
+
   private async manageMfeGiveback(intent: LiveIntent, pos: FuturesPosition, amt: number): Promise<{ changed: boolean; closed: boolean }> {
     const entry = intent.filledEntryPrice ?? intent.plannedEntryPrice;
     const risk = Math.abs(entry - intent.stopLossPrice);
@@ -5167,6 +5332,72 @@ export class LiveExecutionEngine {
     return `intent:${intent.paperOrderId}:${intent.createdAt}`;
   }
 
+  /** A netted/multi-source intent cannot honestly belong to one Entry Brain decision. */
+  private exactFourBrainSource(intent: LiveIntent): LiveIntentSource | null {
+    const sources = intent.sourcePaperOrders ?? [];
+    if (sources.length !== 1) return null;
+    const source = sources[0]!;
+    return typeof source.sourceObservationId === "string" && source.sourceObservationId.length > 0 ? source : null;
+  }
+
+  private bindFourBrainActualFill(intent: LiveIntent): void {
+    try {
+      const source = this.exactFourBrainSource(intent);
+      const entry = intent.filledEntryPrice;
+      const openedAtMs = Date.parse(intent.entryFilledAt ?? "");
+      const riskUsd = typeof entry === "number" && Number.isFinite(entry)
+        ? Math.abs(entry - intent.stopLossPrice) * intent.qty
+        : null;
+      if (!source || !Number.isFinite(openedAtMs)) return;
+      this.fourBrainActualFillBindings?.bindActualFill({
+        bindingKey: this.positionPathKeyForIntent(intent),
+        source: "ENGINE",
+        laneId: normalizeFourBrainTestnetLane(source.laneId, intent.direction),
+        symbol: intent.symbol,
+        side: intent.direction,
+        signalId: source.sourceObservationId!,
+        openedAtMs,
+        entryPrice: entry,
+        entryPriceConfirmed: intent.entryPriceConfirmed === true,
+        riskUsd,
+      });
+    } catch {
+      // Exchange execution remains authoritative even if shadow provenance fails.
+    }
+  }
+
+  /**
+   * One terminal sweep covers every engine close path.  It deliberately accepts only complete,
+   * exchange-sourced settlement and a confirmed original entry fill; all other direct bindings are
+   * terminally UNMEASURED and never fall through into a simulated outcome.
+   */
+  private sweepFourBrainActualFillBindings(): void {
+    if (!this.fourBrainActualFillBindings) return;
+    try {
+      for (const intent of this.store.getState().intents) {
+        if (OPEN_INTENT_STATES.has(intent.state) || !this.exactFourBrainSource(intent)) continue;
+        const measured =
+          intent.entryPriceConfirmed === true &&
+          intent.settlementFetchComplete === true &&
+          intent.pageSaturated !== true &&
+          intent.feeSource === "EXCHANGE" &&
+          Array.isArray(intent.confirmedEntryFills) &&
+          intent.confirmedEntryFills.length > 0 &&
+          typeof intent.realizedPnlUsd === "number" &&
+          Number.isFinite(intent.realizedPnlUsd);
+        this.fourBrainActualFillBindings.completeActualFill({
+          bindingKey: this.positionPathKeyForIntent(intent),
+          closedAtMs: Date.parse(intent.closedAt ?? intent.updatedAt),
+          netPnlUsd: measured ? intent.realizedPnlUsd : null,
+          settlementConfirmed: measured,
+          reason: measured ? intent.closeReason : "EXCHANGE_SETTLEMENT_INCOMPLETE",
+        });
+      }
+    } catch {
+      // Causal bookkeeping cannot affect live lifecycle management.
+    }
+  }
+
   /** Dense R-path sample for one OPEN intent (2026-07-22, report-only — see
    *  position-path-recorder.ts). currentR uses the exact formula manageMfeGiveback derives its
    *  favorableR from (entry vs mark over the entry→stop risk distance, sign-normalized so
@@ -5419,6 +5650,7 @@ export class LiveExecutionEngine {
    *  plain allow-list (null = all lanes, [] = pause all new mirrors). Matches
    *  selectedLaneId as full id or variant suffix. */
   private laneAllowedForMirror(paper: PaperOrder): boolean {
+    if (!isTestnetCrossSectionalHorizonSourceAllowed(this.config.env, paper.selectedLaneId, paper.symbol)) return false;
     // LIVE_MIRROR_ALL_PAPER is parsed as testnet-only. Collection mode mirrors
     // every fresh diagnostic source so lane selection cannot starve CORTEX data.
     if (this.config.mirrorAllPaperOrders) return true;
@@ -5427,12 +5659,31 @@ export class LiveExecutionEngine {
     return this.laneSelectionAllowsLane(paper.selectedLaneId ?? "");
   }
 
+  /**
+   * The XRP/WLD MFE rollout is an explicit testnet cohort, not a general
+   * "unproven symbol" override. Its source is already locked by the exact
+   * lane+symbol gate, so it may pass the generic book-proof filter and collect
+   * its own real outcomes. All other unproven sources remain blocked.
+   */
+  private isApprovedTestnetMfeGivebackPaper(
+    paper: Pick<PaperOrder, "selectedLaneId" | "symbol">,
+  ): boolean {
+    return this.config.env === "testnet" &&
+      isMfeGivebackLaneId(paper.selectedLaneId) &&
+      isTestnetCrossSectionalHorizonSourceAllowed(
+        this.config.env,
+        paper.selectedLaneId,
+        paper.symbol,
+      );
+  }
+
   /** Unified orchestration deliberately consumes a chosen diagnostic recipe directly instead of
    *  waiting for the old promotion ladder to relabel it HEADLINE. This bypass is narrow: the
    *  central lane gate must explicitly accept the recipe and the source must still be fresh.
    *  Status, dedup, stop/TP geometry, entry quality, cluster caps and every risk check below remain
    *  unchanged. Returning null from paperLaneGate preserves the legacy source rules exactly. */
   private paperSourceEligibleForMirror(paper: PaperOrder, nowIso: string): boolean {
+    if (!isTestnetCrossSectionalHorizonSourceAllowed(this.config.env, paper.selectedLaneId, paper.symbol)) return false;
     // Testnet collection is broader than orchestration. Still require a fresh
     // source, but do not let an old unified-recipe verdict suppress it.
     if (this.config.mirrorAllPaperOrders) return this.isFreshPaperOrder(paper, nowIso);
@@ -5536,7 +5787,8 @@ export class LiveExecutionEngine {
 
   /** Admission-only manual override. A paper signal must still be fresh and carry valid geometry;
    * this merely bypasses maturity/book/regime policy after the operator selected that directional lane. */
-  isManualEntryAllowedForPaper(paper: Pick<PaperOrder, "selectedLaneId" | "direction">): boolean {
+  isManualEntryAllowedForPaper(paper: Pick<PaperOrder, "selectedLaneId" | "direction" | "symbol">): boolean {
+    if (!isTestnetCrossSectionalHorizonSourceAllowed(this.config.env, paper.selectedLaneId, paper.symbol)) return false;
     const decision = this.manualEntryDecision;
     return this.isManualDirectionalEntryEnabled() &&
       decision?.directionalBias === paper.direction &&
@@ -5750,6 +6002,9 @@ export class LiveExecutionEngine {
     sourceEnv?: string | null;
     idempotencyKey?: string | null;
   }): Promise<{ ok: boolean; reason: string | null; intent?: LiveIntent }> {
+    if (!isTestnetCrossSectionalHorizonSourceAllowed(this.config.env, req.sourceLaneId, req.symbol)) {
+      return { ok: false, reason: "testnet is locked to the cross-sectional horizon lane" };
+    }
     const idempotencyKey =
       typeof req.idempotencyKey === "string" && req.idempotencyKey.trim().length > 0
         ? req.idempotencyKey.trim()
@@ -5976,6 +6231,9 @@ export class LiveExecutionEngine {
         if (!this.isPaperOrderLiveEligible(o, now)) return "not_live_eligible";
       }
       if (!this.config.mirrorAllPaperOrders && o.diagnosticLabel != null) return "diagnostic_label";
+      if (!isTestnetMfeGivebackSymbolAllowed(this.config.env, o.selectedLaneId, o.symbol)) {
+        return "mfe_symbol_not_allowed";
+      }
       if (!this.laneAllowedForMirror(o)) return "lane_not_allowed";
       if (!MIRRORABLE_PAPER_STATUSES.has(o.paperStatus)) return `status_${o.paperStatus}`;
       if (!this.config.mirrorAllPaperOrders && !(o.createdAt > st.lastSeenCreatedAt)) return "behind_watermark";
@@ -6041,7 +6299,9 @@ export class LiveExecutionEngine {
     };
     if (provenOnly) {
       for (const c of ranked) {
-        if (c.tier > 1) latchReason(c.paper.paperOrderId, "unproven_symbol");
+        if (c.tier > 1 && !this.isApprovedTestnetMfeGivebackPaper(c.paper)) {
+          latchReason(c.paper.paperOrderId, "unproven_symbol");
+        }
       }
     }
     const priorityOrderedCandidates = ranked
@@ -6049,7 +6309,7 @@ export class LiveExecutionEngine {
       // (tier 0/1) may open the directional slot; an unproven-symbol candidate is dropped rather
       // than admitted last. This is the ONE deliberate exception to "never rejects, only reorders"
       // (flag off = the default reorder-only behavior is unchanged).
-      .filter((c) => !provenOnly || c.tier <= 1)
+      .filter((c) => !provenOnly || c.tier <= 1 || this.isApprovedTestnetMfeGivebackPaper(c.paper))
       .sort((a, b) => {
         // Priority tier first (0=curated whitelist, 1=proven-elsewhere, 2=no data), then BEST
         // measured book performance within the tier ("buka simbol dengan performa terbaik, bukan
@@ -6196,6 +6456,43 @@ export class LiveExecutionEngine {
           for (const paper of papers) latchReason(paper.paperOrderId, "entry_regime_isolated_open_intent");
         }
         continue;
+      }
+      // First Four-Brain execution bridge: consider only a genuinely new, single-source intent.
+      // A pyramid add or a netted multi-source order has no one-decision causal identity, so it
+      // stays entirely under the incumbent engine until a future, separately validated design.
+      if (!oppositeIntent && lanePapers.length === 1 && this.fourBrainEntryGate) {
+        const candidate = lanePapers[0]!;
+        if (candidate.sourceObservationId) {
+          const bridge = this.fourBrainEntryGate({
+            laneId: candidate.selectedLaneId ?? "UNKNOWN",
+            symbol: candidate.symbol,
+            side: candidate.direction,
+            signalId: candidate.sourceObservationId,
+            nowMs,
+            entryPrice: candidate.entryPrice,
+            stopPrice: candidate.stopLoss,
+            openedAtMs: nowMs,
+          });
+          if (!bridge.allowed) {
+            latchReason(candidate.paperOrderId, "four_brain_pilot_negative_veto");
+            continue;
+          }
+        }
+      }
+      const isMfeGiveback = oppositeIntent
+        ? this.intentExitRule(oppositeIntent) === "mfe_giveback"
+        : lanePapers.some((paper) => this.paperExitRule(paper) === "mfe_giveback");
+      if (isMfeGiveback) {
+        const blockReason = mfeGivebackSignalBlockReason(oppositeIntent?.direction ?? first.direction, lanePapers);
+        const reentryBlockedUntilMs = Date.parse(st.mfeReversalReentryBlockedUntil[first.symbol] ?? "");
+        if (!oppositeIntent && Number.isFinite(reentryBlockedUntilMs) && nowMs < reentryBlockedUntilMs) {
+          for (const paper of lanePapers) latchReason(paper.paperOrderId, "mfe_reversal_reentry_cooldown");
+          continue;
+        }
+        if (blockReason !== null) {
+          for (const paper of lanePapers) latchReason(paper.paperOrderId, blockReason);
+          continue;
+        }
       }
 
       const filters = await this.getFilters(first.symbol);
@@ -6640,6 +6937,7 @@ export class LiveExecutionEngine {
       intent.state = "ENTRY_PLACED";
       intent.updatedAt = this.nowIso();
       this.store.save();
+      this.bindFourBrainActualFill(intent);
 
       // Protect at the REPRICED stop/target (derived from the ACTUAL fill, already stored on the
       // intent above), never the stale paper-entry geometry in `plan`. When price gaps past the

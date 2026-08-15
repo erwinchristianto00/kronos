@@ -4693,41 +4693,6 @@ export function countIndependentEpisodes(
   return describeIndependentEpisodes(rows, blockWidthMs).episodes;
 }
 
-/**
- * The canonical independent-episode partition, exposed for research consumers
- * that need to persist a per-row assignment after their observations exist.
- *
- * This is deliberately a partition rather than a second episode-ID algorithm:
- * the returned numeric component is only meaningful within this invocation.
- * Callers that need a durable ID must hash their own non-strategy identity
- * inputs together with their versioned policy.  `observationId` is used only
- * as a stable row binding/tie-breaker and never as an episode identity key.
- */
-export function partitionIndependentEpisodes(
-  rows: readonly EpisodeIdentityRow[],
-  blockWidthMs: number,
-): ReadonlyMap<string, number> {
-  const sorted = rows.slice();
-  const seen = new Set<string>();
-  for (const row of sorted) {
-    if (!row.observationId || seen.has(row.observationId)) throw new Error("EPISODE_PARTITION_OBSERVATION_ID_INVALID");
-    seen.add(row.observationId);
-  }
-  sorted.sort((a, b) => {
-    if (a.episodeMs === null || b.episodeMs === null) {
-      if (a.episodeMs !== b.episodeMs) return a.episodeMs === null ? 1 : -1;
-    } else if (a.episodeMs !== b.episodeMs) {
-      return a.episodeMs - b.episodeMs;
-    }
-    if (a.observationId < b.observationId) return -1;
-    if (a.observationId > b.observationId) return 1;
-    return 0;
-  });
-  const accumulator = new EpisodeAccumulator(blockWidthMs);
-  const nodes = sorted.map((row) => accumulator.push(row));
-  return new Map(sorted.map((row, index) => [row.observationId, accumulator.rootOf(nodes[index]!)]));
-}
-
 /** The independent-episode partition of a cohort, described rather than merely counted.
  *
  *  `episodes` is bit-for-bit what `countIndependentEpisodes` returns (that function delegates here),
@@ -4745,16 +4710,32 @@ export function describeIndependentEpisodes(
   blockWidthMs: number,
 ): { episodes: number; largestEpisodeRows: number } {
   if (rows.length === 0) return { episodes: 0, largestEpisodeRows: 0 };
-  const partition = partitionIndependentEpisodes(rows, blockWidthMs);
+  const sorted = rows.slice();
+  sorted.sort((a, b) => {
+    if (a.episodeMs === null || b.episodeMs === null) {
+      if (a.episodeMs !== b.episodeMs) return a.episodeMs === null ? 1 : -1;
+    } else if (a.episodeMs !== b.episodeMs) {
+      return a.episodeMs - b.episodeMs;
+    }
+    if (a.observationId < b.observationId) return -1;
+    if (a.observationId > b.observationId) return 1;
+    return 0;
+  });
+  const accumulator = new EpisodeAccumulator(blockWidthMs);
+  // Nodes are collected first and resolved to roots only after EVERY row is pushed: a merge arriving
+  // later can still fuse two nodes that were separate earlier, exactly as `rootOf`'s doc warns.
+  const nodes: number[] = [];
+  for (const row of sorted) nodes.push(accumulator.push(row));
   const rowsPerRoot = new Map<number, number>();
-  for (const root of partition.values()) {
+  for (const node of nodes) {
+    const root = accumulator.rootOf(node);
     rowsPerRoot.set(root, (rowsPerRoot.get(root) ?? 0) + 1);
   }
   let largestEpisodeRows = 0;
   for (const count of rowsPerRoot.values()) {
     if (count > largestEpisodeRows) largestEpisodeRows = count;
   }
-  return { episodes: rowsPerRoot.size, largestEpisodeRows };
+  return { episodes: accumulator.count(), largestEpisodeRows };
 }
 
 /**

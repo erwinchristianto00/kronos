@@ -1,5 +1,5 @@
 import Fastify, { type FastifyInstance } from "fastify";
-import { DECISION_PIPELINE_POLICY_VERSION, completedCandles } from "@dtc/shared";
+import { DECISION_PIPELINE_POLICY_VERSION, completedCandles, type Candle } from "@dtc/shared";
 import { BinanceClient } from "./lib/binance.js";
 import { HttpKronosClient } from "./lib/kronos.js";
 import { HttpForecastChallengerClient } from "./lib/forecast-challenger.js";
@@ -36,7 +36,7 @@ import {
   isCrossSectionalTrendMixedAdmissionIndependent,
   crossSectionalMarketNeutralIsAllowed,
 } from "./lib/cross-sectional-executor.js";
-import { buildCrossSectionalReport, getCrossSectionalStore } from "./lib/cross-sectional-edge.js";
+import { buildCrossSectionalReport, getCrossSectionalReportSinceMs, getCrossSectionalStore } from "./lib/cross-sectional-edge.js";
 import {
   SingleSymbolLaneExecutor,
   SingleSymbolLaneExecutorStore,
@@ -138,7 +138,25 @@ import {
   buildCompositeEstimatorReport,
   type CEBucket,
 } from "./lib/composite-estimator-edge.js";
-import { computeExternalManagedNetQty, computeNotionalPerSymbol, maxNotionalPerSymbolAcrossLanes, computeClusterOpenSymbols, maxClusterPositionsAcrossLanes, isNewExecutorLaneAllowed, newExecutorLaneGate, rollingNetEntryHealth, sumExternalRealizedPnlUsd } from "./lib/live-executor-wiring.js";
+import { computeExternalManagedNetQty, computeNotionalPerSymbol, maxNotionalPerSymbolAcrossLanes, computeClusterOpenSymbols, maxClusterPositionsAcrossLanes, isNewExecutorLaneAllowed, isTestnetCrossSectionalHorizonLaneAllowed, newExecutorLaneGate, rollingNetEntryHealth, sumExternalRealizedPnlUsd } from "./lib/live-executor-wiring.js";
+import {
+  CROSS_SECTIONAL_DIRECTIONAL_LONG_LANE_ID,
+  CROSS_SECTIONAL_DIRECTIONAL_SHORT_LANE_ID,
+  DIRECTIONAL_REGIME_DAILY_MAX_LOSS_USD,
+  DIRECTIONAL_REGIME_LEG_USD,
+  DIRECTIONAL_REGIME_LEVERAGE,
+  DIRECTIONAL_REGIME_MAX_HOLD_HOURS,
+  DIRECTIONAL_REGIME_MAX_OPEN_POSITIONS,
+  DIRECTIONAL_REGIME_MAX_SIGNAL_AGE_MS,
+  DIRECTIONAL_REGIME_MFE_ARM_R,
+  DIRECTIONAL_REGIME_MFE_GIVEBACK_FRACTION,
+  DIRECTIONAL_REGIME_MFE_PROFIT_LOCK_NET_RETURN,
+  DirectionalReversalStateStore,
+  buildCrossSectionalDirectionalRegimeDecision,
+  confirmCrossSectionalDirectionalRegime,
+  crossSectionalDirectionalOpenSignals,
+  isCrossSectionalDirectionalRegimeExecEnabled,
+} from "./lib/cross-sectional-directional-regime.js";
 import {
   AccountExposureCoordinator,
   AccountExposureReservationStore,
@@ -237,14 +255,18 @@ import { runFourBrainShadowCycle } from "./lib/four-brain-live-wiring.js";
 import { classifyIncumbentLanes } from "./lib/four-brain-lane-support.js";
 import { buildLaneContextSnapshotInputs } from "./lib/lane-context-snapshot-source.js";
 import {
+  computeDepthImbalance,
   computeExpectedSlippageBps,
   computeSpreadBps,
   parseDepthPayload,
 } from "./lib/order-flow-microstructure.js";
+import { fetchGdeltDocEventRisk } from "./lib/four-brain-gdelt-doc-event-risk.js";
+import { fetchGoogleNewsRssEventRisk } from "./lib/four-brain-google-news-rss-event-risk.js";
 import { journalLaneSnapshots, laneJournalActive } from "./lib/lane-context-journal-runtime.js";
 import { FourBrainMetricsAggregator } from "./lib/four-brain-metrics.js";
 import {
   FourBrainRecentDecisionsBuffer,
+  hydrateFourBrainRecentDecisionsBuffer,
   wrapFourBrainJournalAppendForRecentDecisions,
 } from "./lib/four-brain-recent-decisions.js";
 import {
@@ -253,9 +275,21 @@ import {
   wrapFourBrainJournalAppendForOutcomeLedger,
   type FourBrainOutcomeHorizon,
 } from "./lib/four-brain-outcome-ledger.js";
+import { buildExecutiveDecisionRecord } from "./lib/four-brain-journal.js";
 import { loadPendingLedgerSnapshot, savePendingLedgerSnapshot } from "./lib/four-brain-pending-ledger-store.js";
-import { resolveFourBrainInstanceId, fourBrainInstanceAllowed, fourBrainShadowActive, FOUR_BRAIN_LIVE_INSTANCE_PORT, type FourBrainBindingDeps } from "./lib/four-brain-live-gather-bindings.js";
-import { FRESHNESS_TTL_MS } from "./lib/four-brain-live-gather.js";
+import {
+  buildFourBrainGatherInput,
+  fourBrainInstanceAllowed,
+  fourBrainShadowActive,
+  FOUR_BRAIN_LIVE_INSTANCE_PORT,
+  makeEntryMicrostructureAccessor,
+  marketLiquidityScoreFromExecutionCost,
+  resolveFourBrainInstanceId,
+  type EntryOrderflowSnapshot,
+  type FourBrainBindingDeps,
+} from "./lib/four-brain-live-gather-bindings.js";
+import { assembleFourBrainTick, FRESHNESS_TTL_MS } from "./lib/four-brain-live-gather.js";
+import { evaluateFourBrainPreEntryCandidate } from "./lib/four-brain-shadow-tick.js";
 import { staticAllocationContext, unavailableMarketContext } from "./lib/authority-contract.js";
 import { ExecutiveReviewStore } from "./lib/executive-review-store.js";
 import { attachExecutiveReviewToExactPaperOrder } from "./lib/executive-review-admission.js";
@@ -265,11 +299,25 @@ import { fourBrainMode } from "./lib/four-brain-types.js";
 import { getBtcAtrPercentileCacheStore, refreshBtcAtrPercentileCache, BTC_ATR_PERCENTILE_SYMBOL, BTC_ATR_PERCENTILE_INTERVAL, BTC_ATR_PERCENTILE_CANDLES_NEEDED } from "./lib/btc-atr-percentile-cache.js";
 import { buildLiveBestLaneReportForDirection } from "./lib/four-brain-best-lane-report.js";
 import { getLiveMarkPriceCacheStore, refreshLiveMarkPriceCache } from "./lib/live-mark-price-cache.js";
-import { CORTEX_LANE_ROSTER, gatherCortexContext, normalizeCortexStaticWeightPctForLane } from "./lib/cortex-live-gather.js";
+import {
+  CORTEX_CG_MFE_GIVEBACK_LONG_LANE_ID,
+  CORTEX_CG_MFE_GIVEBACK_SHORT_LANE_ID,
+  CORTEX_LANE_ROSTER,
+  gatherCortexContext,
+  normalizeCortexStaticWeightPctForLane,
+} from "./lib/cortex-live-gather.js";
 import { buildLiveCortexGatherDeps } from "./lib/cortex-live-gather-bindings.js";
 import { getCortexRealAttributionStore } from "./lib/cortex-real-attribution.js";
 import { getExecutionFillRecorder } from "./lib/execution-fill-recorder.js";
 import { getPositionPathRecorder } from "./lib/position-path-recorder.js";
+import { getFourBrainActualFillBindingStore, type FourBrainActualFillBindingStore } from "./lib/four-brain-actual-fill-binding.js";
+import { getFourBrainExecutionReinforcement, type FourBrainExecutionReinforcementStatus } from "./lib/four-brain-execution-reinforcement.js";
+import {
+  FourBrainTestnetBridge,
+  normalizeFourBrainTestnetLane,
+  type FourBrainBridgeCandidate,
+} from "./lib/four-brain-testnet-bridge.js";
+import { resolveFourBrainExactFillCohortSinceMs } from "./lib/four-brain-testnet-cohort.js";
 import { getDirectionEntryOutcomeStore, buildDirectionEntryOutcomeReport, DIRECTION_ENTRY_MIN_EXAMPLES_ACTIVE, type DirectionEntryOutcomeReport } from "./lib/direction-entry-outcome-store.js";
 import {
   runDirectionEntryReconciliationCycleGuarded,
@@ -305,6 +353,17 @@ export interface AppOptions {
 }
 
 const DEFAULT_KRONOS_BASE_URL = "http://localhost:8001";
+
+/**
+ * Exit Brain's MAE convention is a signed adverse R: 0 when a position has never gone adverse and
+ * negative below entry. The engine already persists that convention, while the two executor stores
+ * deliberately retain a positive magnitude for their own reports. Convert only at the Four-Brain
+ * read boundary, preserving each executor's stored schema and never manufacturing a path sample.
+ */
+export function normalizeFourBrainMaeR(value: unknown): number | null {
+  if (typeof value !== "number" || !Number.isFinite(value)) return null;
+  return value > 0 ? -value : value;
+}
 
 /**
  * Pure builder for the four-brain shadow-tick EXECUTIVE_DECISION journal context. Bug fix: the
@@ -981,10 +1040,25 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
   // instance/test run that never constructs them.
   let fourBrainMetricsRef: FourBrainMetricsAggregator | null = null;
   let fourBrainRecentDecisionsRef: FourBrainRecentDecisionsBuffer | null = null;
+  // Scoped testnet-only causal-fill store + the narrow negative-evidence bridge. These remain
+  // null everywhere else, so neither mainnet nor research receives an execution dependency.
+  let fourBrainActualFillBindingsRef: FourBrainActualFillBindingStore | null = null;
+  // Deliberate immutable repair boundary for exact-fill attribution.  The shadow route is
+  // registered before live wiring, so it reads this by lazy closure after assignment below.
+  let fourBrainExactFillCohortSinceMs: number | null = null;
+  let fourBrainTestnetBridgeRef: FourBrainTestnetBridge | null = null;
+  /**
+   * Report-only pre-submit tap. Its return is ignored by the gate, so this observer can never
+   * relax, block, size, or otherwise alter an incumbent entry.
+   */
+  let fourBrainPreEntryObserverRef: ((candidate: FourBrainBridgeCandidate) => void) | null = null;
   // Same threading pattern, for the Direction/Entry counterfactual outcome reconciler's own report.
   // Stays null (⇒ the route fails open to an empty/disabled shape) unless directionEntryReconcilerActive
   // (its own 3-layer gate — see direction-entry-reconciler.ts) is true on this instance.
   let directionEntryOutcomeReportGetterRef: (() => DirectionEntryOutcomeReport | null) | null = null;
+  // Read-only status of the persisted actual-fill feedback that shadow ranking consumes.  Kept as
+  // a getter because the isolated testnet cohort data root is chosen later during engine wiring.
+  let fourBrainExecutionReinforcementStatusGetterRef: (() => FourBrainExecutionReinforcementStatus | null) | null = null;
   // Read-only capture of the engine's execution store so the report-only four-brain shadow tick can
   // enumerate FULL open intents (getStatus().openIntents is a reduced shape). Assigned during engine
   // construction below; stays null on instances that build no engine (e.g. 3101 research). READ-ONLY —
@@ -995,6 +1069,12 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
   // FILTERED foundation instance above (see cross-sectional-executor.ts's targetVariant/laneId).
   let crossSectionalTrendExecutor: CrossSectionalExecutor | null = null;
   let crossSectionalMixedExecutor: CrossSectionalExecutor | null = null;
+  // Testnet-only directional companions of the market-neutral cross-sectional lane. These use the
+  // core scan's existing score/quality evidence and are mutually exclusive with new 3x3 baskets.
+  let crossSectionalDirectionalLongExecutor: SingleSymbolLaneExecutor | null = null;
+  let crossSectionalDirectionalShortExecutor: SingleSymbolLaneExecutor | null = null;
+  let crossSectionalDirectionalDecisionRef = () =>
+    buildCrossSectionalDirectionalRegimeDecision(getLatestScanCandidates());
   // 2026-07-08: SHORT_FADE_EXHAUSTION / INTRADAY_MOMENTUM_BREAKOUT — independent, single-symbol
   // measurement lanes with their OWN entry signals (not the shared scanner candidate every CG_*
   // variant rides on), so each gets its own SingleSymbolLaneExecutor instance instead of being
@@ -1075,6 +1155,8 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     compositeEstimatorFastLongExecutor,
     compositeEstimatorFastShortExecutor,
     panicWashoutExecutor,
+    crossSectionalDirectionalLongExecutor,
+    crossSectionalDirectionalShortExecutor,
     ...innovationSingleSymbolExecutors,
   ];
   /** Notional already committed to `symbol` by every OTHER single-symbol executor (excludes
@@ -1131,10 +1213,20 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     coreScanAutoRefreshController,
     notificationService,
     liveEngineGetter: () => liveEngine,
+    crossSectionalReentryBlocksGetter: async () => {
+      const blocks = await crossSectionalExecutor?.getLossReentryBlocks() ?? [];
+      return {
+        longBlocklist: blocks.filter((block) => block.side === "LONG").map((block) => block.symbol),
+        shortBlocklist: blocks.filter((block) => block.side === "SHORT").map((block) => block.symbol),
+      };
+    },
     kronosClient,
     fourBrainMetricsGetter: () => fourBrainMetricsRef?.summary() ?? null,
     fourBrainRecentDecisionsGetter: () => fourBrainRecentDecisionsRef?.getAll() ?? null,
     directionEntryOutcomeReportGetter: () => directionEntryOutcomeReportGetterRef?.() ?? null,
+    fourBrainBridgeGetter: () => fourBrainTestnetBridgeRef?.getStatus() ?? null,
+    fourBrainActualFillBindingStatusGetter: () => fourBrainActualFillBindingsRef?.getStatus({ sinceMs: fourBrainExactFillCohortSinceMs }) ?? null,
+    fourBrainExecutionReinforcementStatusGetter: () => fourBrainExecutionReinforcementStatusGetterRef?.() ?? null,
   });
   await registerNotificationRoutes(app, notificationService);
   await registerTradingAssistantRoutes(app);
@@ -1143,6 +1235,12 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
   // no private client is constructed, no loop runs, nothing else in the app changes.
   // Strategy code is untouched — the engine only READS the paper store's decisions.
   const liveConfig = parseLiveExecutionConfig();
+  // This cohort boundary is shared by the execution wiring and the shadow/outcome wiring below.
+  // Defining it at app scope prevents the two paths from accidentally writing separate cohorts.
+  const fourBrainTestnetFocusEnabled =
+    !isTest && liveConfig.env === "testnet" && process.env.FOUR_BRAIN_TESTNET_FOCUS === "1";
+  const fourBrainOutcomeDataDirRuntime = fourBrainTestnetFocusEnabled ? "data/four-brain-testnet-focus" : "data";
+  fourBrainExactFillCohortSinceMs = resolveFourBrainExactFillCohortSinceMs();
   if (liveConfig.enabled && liveConfig.configErrors.length === 0 && liveConfig.env) {
     const liveClient = new BinanceFuturesPrivateClient({
       apiKey: liveConfig.apiKey,
@@ -1388,6 +1486,29 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     // narrow eligibility.
     const getCanonicalMarketRegimeSnapshot = (): CanonicalMarketRegimeSnapshot | null =>
       getLatestCanonicalMarketRegimeEngineSnapshot();
+    // The direct-fill ledger is isolated to the user-selected testnet cohort. It starts empty at
+    // this deployment boundary and is never constructed for research/mainnet. The bridge itself
+    // is still fail-open unless its separate `pilot` switch is explicitly present in the testnet
+    // environment.
+    if (fourBrainTestnetFocusEnabled) {
+      fourBrainActualFillBindingsRef = getFourBrainActualFillBindingStore(fourBrainOutcomeDataDirRuntime);
+      fourBrainTestnetBridgeRef = new FourBrainTestnetBridge({
+        dataDir: fourBrainOutcomeDataDirRuntime,
+        getCanonicalRegimeFamily: () => getCanonicalMarketRegimeSnapshot()?.regimeFamily ?? null,
+      });
+    }
+    const fourBrainPilotEntryGate = fourBrainTestnetBridgeRef
+      ? (candidate: Parameters<FourBrainTestnetBridge["evaluate"]>[0]) => {
+          // Capture exact identity/geometry while the candidate is still on the executor path. The
+          // observer is fail-open and discarded; evaluate() remains the only value the executor uses.
+          try {
+            fourBrainPreEntryObserverRef?.(candidate);
+          } catch {
+            // Shadow audit must never alter an incumbent order decision.
+          }
+          return fourBrainTestnetBridgeRef!.evaluate(candidate);
+        }
+      : undefined;
     const unifiedRegimeEntryGate = buildUnifiedRegimeEntryGate({
       getUnifiedOrchestrator: () => unifiedOrchestrator,
       getCanonicalMarketRegimeSnapshot,
@@ -1437,6 +1558,8 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       // currently not one exit fill price persisted anywhere. No new exchange call: the rows are
       // the ones settlement already matched. Same singleton as the executors below.
       executionFillRecorder: getExecutionFillRecorder(),
+      fourBrainActualFillBindings: fourBrainActualFillBindingsRef ?? undefined,
+      fourBrainEntryGate: fourBrainPilotEntryGate,
       executiveReviewStore: executiveReviewStore ?? undefined,
       // Crowding-exit SHADOW measurement only (getStatus().crowdingExitShadow) — read-only market
       // data, never touches order placement. Reuses the same market-data client scan.ts uses.
@@ -1676,7 +1799,10 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           }
         }
       }
-      const xsecReport = buildCrossSectionalReport(getCrossSectionalStore(), nowMs, { variant: "FILTERED" });
+      const xsecReport = buildCrossSectionalReport(getCrossSectionalStore(), nowMs, {
+        variant: "FILTERED",
+        sinceMs: getCrossSectionalReportSinceMs(),
+      });
       const xsecHealth = rollingNetEntryHealth(xsecReport.recentNetReturns);
       const capturedAt = controller?.capturedAt ?? new Date(nowMs).toISOString();
       const sampleId = controller?.capturedAt ?? `fallback:${Math.floor(nowMs / (15 * 60_000))}:${primaryDirection}`;
@@ -1869,9 +1995,10 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       laneId: string,
       direction: "LONG" | "SHORT",
       fallback: () => boolean,
-    ): boolean => unifiedOrchestrator?.isEnabled()
-      ? unifiedOrchestrator.allowsLegacySingleSymbolEntry(laneId, direction)
-      : fallback();
+    ): boolean => isTestnetCrossSectionalHorizonLaneAllowed(liveConfig.env, laneId)
+      && (unifiedOrchestrator?.isEnabled()
+        ? unifiedOrchestrator.allowsLegacySingleSymbolEntry(laneId, direction)
+        : fallback());
 
     /**
      * The explanation half of legacyEntryAllowed: which rule is actually holding this lane's
@@ -1966,6 +2093,58 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       : undefined;
     if (!isTest) liveEngine.start();
 
+    crossSectionalDirectionalDecisionRef = () => {
+      const canonical = canonicalMarketRegimeExecutionPolicy({
+        snapshot: getCanonicalMarketRegimeSnapshot(),
+        nowMs: Date.now(),
+      });
+      const basketOwnedLegs = [
+        ...(crossSectionalExecutor?.getOpenUnexitedLegs() ?? []),
+        ...(crossSectionalTrendExecutor?.getOpenUnexitedLegs() ?? []),
+        ...(crossSectionalMixedExecutor?.getOpenUnexitedLegs() ?? []),
+      ];
+      return confirmCrossSectionalDirectionalRegime(
+        buildCrossSectionalDirectionalRegimeDecision(getLatestScanCandidates(), {
+          // Opposite basket side is never rankable. Same side reaches the
+          // live P&L admission check below and is rejected while underwater.
+          excludedLongSymbols: new Set(basketOwnedLegs.filter((leg) => leg.side === "SHORT").map((leg) => leg.symbol)),
+          excludedShortSymbols: new Set(basketOwnedLegs.filter((leg) => leg.side === "LONG").map((leg) => leg.symbol)),
+        }),
+        {
+          allowed: canonical.allowed,
+          requireRetest: canonical.requireRetest,
+          regimeFamily: canonical.regimeFamily,
+          reason: canonical.reason,
+        },
+      );
+    };
+    const crossSectionalDirectionalDecision = () => crossSectionalDirectionalDecisionRef();
+    // Directional conviction and a market-neutral hedge are distinct decisions.
+    // A valid canonical MIXED regime may have an inconclusive directional scan;
+    // in that case keep directional lanes flat but let the fully hedged 3x3
+    // executor evaluate its own independent FILTERED signal and safeguards.
+    const directionalRegimeAllowsBalancedBasket = () => {
+      if (!isCrossSectionalDirectionalRegimeExecEnabled()) return true;
+      const decision = crossSectionalDirectionalDecision();
+      return decision.mode === "BALANCED_3X3" ||
+        (decision.mode === "NO_TRADE" && decision.canonicalAllowed === true && decision.canonicalRegimeFamily === "MIXED");
+    };
+    const directionalReversalStore = new DirectionalReversalStateStore("data");
+    const directionalRegimeExitPolicy = (activeMode: "BEAR_SHORT_3" | "BULL_LONG_3"): SingleSymbolExitPolicy => (ctx) => {
+      const risk = Math.abs(ctx.entryPrice - ctx.stopPrice);
+      const r = risk > 0
+        ? (ctx.direction === "LONG" ? ctx.currentPrice - ctx.entryPrice : ctx.entryPrice - ctx.currentPrice) / risk
+        : 0;
+      const nextPeakFavorableR = Math.max(ctx.peakFavorableR, r);
+      const decision = crossSectionalDirectionalDecision();
+      const reversal = directionalReversalStore.observe(ctx.symbol, activeMode, decision, Date.now());
+      return {
+        shouldExit: reversal.shouldExit,
+        reason: reversal.reason,
+        nextPeakFavorableR,
+      };
+    };
+
     // Cross-sectional market-neutral EXECUTOR (testnet-first). Env-gated; on mainnet
     // it additionally requires the engine to be ARMED, so the flag alone can never
     // trade real money. Consumes the same store the measurement lane writes.
@@ -1984,7 +2163,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         // sizing exemption above and skip the lane-selector check ENTIRELY (armed/killed/drain only,
         // via canOpenNewEntriesIgnoringManualDirectional()) — otherwise fall back to the original,
         // fully-coupled behavior so disabling the flag really does disable independence, not just sizing.
-        isAllowed: () => crossSectionalMarketNeutralIsAllowed({
+        isAllowed: () => directionalRegimeAllowsBalancedBasket() && crossSectionalMarketNeutralIsAllowed({
           allocationIndependent: isCrossSectionalAllocationIndependent(),
           canOpenIgnoringManualDirectional: () => engineForGate?.canOpenNewEntriesIgnoringManualDirectional() ?? false,
           canOpenNewEntries: () => engineForGate?.canOpenNewEntries() ?? false,
@@ -2003,8 +2182,13 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         // commissions and discards every other field of every matched row; this persists them.
         // No new exchange call. Same singleton as the engine and the single-symbol lanes.
         executionFillRecorder: getExecutionFillRecorder(),
+        fourBrainActualFillBindings: fourBrainActualFillBindingsRef ?? undefined,
+        fourBrainEntryGate: fourBrainPilotEntryGate,
         entryHealthGate: () => {
-          const report = buildCrossSectionalReport(getCrossSectionalStore(), Date.now(), { variant: "FILTERED" });
+          const report = buildCrossSectionalReport(getCrossSectionalStore(), Date.now(), {
+            variant: "FILTERED",
+            sinceMs: getCrossSectionalReportSinceMs(),
+          });
           const rolling = rollingNetEntryHealth(report.recentNetReturns);
           if (!rolling.allowed) return rolling; // existing PnL-rolling-health gate wins first, unchanged
           // 2026-08 canonical-market-regime addition (requirement #7): an ADDITIONAL AND-ed term,
@@ -2079,8 +2263,10 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         // canOpenNewEntriesIgnoringManualDirectional) — see
         // isCrossSectionalTrendMixedAdmissionIndependent's doc comment for why. Off by default;
         // the rest of this ternary is untouched, so disabling the flag is a byte-for-byte revert.
-        isAllowed: () => isCrossSectionalTrendMixedAdmissionIndependent()
-          ? (engineForGate?.canOpenNewEntriesIgnoringManualDirectional() ?? false)
+        isAllowed: () => !isTestnetCrossSectionalHorizonLaneAllowed(liveConfig.env, CROSS_SECTIONAL_TREND_LANE_ID)
+          ? false
+          : isCrossSectionalTrendMixedAdmissionIndependent()
+            ? (engineForGate?.canOpenNewEntriesIgnoringManualDirectional() ?? false)
           : unifiedOrchestrator?.isEnabled()
             ? unifiedOrchestrator.allowsCrossSectionalLane(CROSS_SECTIONAL_TREND_LANE_ID)
             : isNewExecutorLaneAllowed(CROSS_SECTIONAL_TREND_LANE_ID, liveConfig.env === "testnet" ? "testnet" : "mainnet", engineForGate, { mainnetEntryEligible: false }),
@@ -2111,8 +2297,10 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         laneId: CROSS_SECTIONAL_MIXED_LANE_ID,
         // Same 2026-07-08 fix as CROSS_SECTIONAL_TREND above, plus the same 2026-07-22
         // admission-independence bypass (see CROSS_SECTIONAL_TREND's isAllowed above).
-        isAllowed: () => isCrossSectionalTrendMixedAdmissionIndependent()
-          ? (engineForGate?.canOpenNewEntriesIgnoringManualDirectional() ?? false)
+        isAllowed: () => !isTestnetCrossSectionalHorizonLaneAllowed(liveConfig.env, CROSS_SECTIONAL_MIXED_LANE_ID)
+          ? false
+          : isCrossSectionalTrendMixedAdmissionIndependent()
+            ? (engineForGate?.canOpenNewEntriesIgnoringManualDirectional() ?? false)
           : unifiedOrchestrator?.isEnabled()
             ? unifiedOrchestrator.allowsCrossSectionalLane(CROSS_SECTIONAL_MIXED_LANE_ID)
             : isNewExecutorLaneAllowed(CROSS_SECTIONAL_MIXED_LANE_ID, liveConfig.env === "testnet" ? "testnet" : "mainnet", engineForGate, { mainnetEntryEligible: false }),
@@ -2144,6 +2332,141 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         setInterval(trendTick, 5 * 60_000);
         setTimeout(mixedTick, 150_000);
         setInterval(mixedTick, 5 * 60_000);
+      }
+    }
+
+    // Directional cross-sectional sublanes (testnet only). The selector is mutually exclusive:
+    // BEAR_SHORT_3 opens the three highest-quality relative-model weak shorts; BULL_LONG_3 is
+    // symmetric; BALANCED_3X3 leaves this pair flat and permits the existing complete hedge.
+    // A changed, stale, contradictory, or incomplete scan yields NO_TRADE and blocks new
+    // directional entries while its exchange STOP_MARKET remains live. An open directional
+    // position closes from this overlay only after two distinct scans confirm the opposite mode.
+    if (isCrossSectionalDirectionalRegimeExecEnabled()) {
+      const engineForGate = liveEngine;
+      const laneAllowed = (laneId: string, mode: "BEAR_SHORT_3" | "BULL_LONG_3") =>
+        isTestnetCrossSectionalHorizonLaneAllowed(liveConfig.env, laneId) &&
+        crossSectionalDirectionalDecision().mode === mode &&
+        (engineForGate?.canOpenNewEntriesIgnoringManualDirectional() ?? false);
+      const laneReason = (mode: "BEAR_SHORT_3" | "BULL_LONG_3") => {
+        const decision = crossSectionalDirectionalDecision();
+        return decision.mode === mode ? null : decision.reason;
+      };
+      const common = {
+        client: liveClient,
+        exitPolicy: makeMfeGivebackExitPolicy({
+          armR: DIRECTIONAL_REGIME_MFE_ARM_R(),
+          givebackFrac: DIRECTIONAL_REGIME_MFE_GIVEBACK_FRACTION(),
+          profitLockNetReturn: DIRECTIONAL_REGIME_MFE_PROFIT_LOCK_NET_RETURN(),
+          estimatedCloseCostPct: liveConfig.estimatedCloseCostPct,
+          maxHoldMs: DIRECTIONAL_REGIME_MAX_HOLD_HOURS() * 3_600_000,
+        }),
+        laneWeightPct: () => 100,
+        rawLaneWeightPct: () => 100,
+        cortexRealAttribution: getCortexRealAttributionStore(),
+        positionPathRecorder: getPositionPathRecorder(),
+        executionFillRecorder: getExecutionFillRecorder(),
+        fourBrainActualFillBindings: fourBrainActualFillBindingsRef ?? undefined,
+        fourBrainEntryGate: fourBrainPilotEntryGate,
+        legUsd: DIRECTIONAL_REGIME_LEG_USD,
+        leverage: DIRECTIONAL_REGIME_LEVERAGE,
+        maxOpenPositions: DIRECTIONAL_REGIME_MAX_OPEN_POSITIONS,
+        maxSignalAgeMs: DIRECTIONAL_REGIME_MAX_SIGNAL_AGE_MS,
+        dailyMaxLossUsd: DIRECTIONAL_REGIME_DAILY_MAX_LOSS_USD,
+        maxNotionalPerSymbolAcrossLanes,
+        maxClusterPositionsAcrossLanes: clusterCapAcrossLanes,
+        currentPrice: currentPublicPrice,
+        readPublicQuote,
+        sharedGetPositions,
+        // The selector may revisit the same symbol on later scans, but SHORT/LONG 3
+        // means three distinct symbols, never three independent copies of BNB/XRP.
+        preventSameSymbolPyramiding: true,
+        // Binance reports realized P&L on the account-netted symbol. Directional
+        // results must use the lot's own entry/exit economics when a basket shares it,
+        // otherwise dashboard/CORTEX/Four-Brain can learn a basket's P&L as theirs.
+        useOwnLotPnlAttribution: true,
+        allowSameDirectionExistingPosition: async (symbol: string, direction: "LONG" | "SHORT") => {
+          const basketLegs = [
+            ...(crossSectionalExecutor?.getOpenUnexitedLegsWithEntry() ?? []),
+            ...(crossSectionalTrendExecutor?.getOpenUnexitedLegsWithEntry() ?? []),
+            ...(crossSectionalMixedExecutor?.getOpenUnexitedLegsWithEntry() ?? []),
+          ].filter((leg) => leg.symbol === symbol);
+          if (basketLegs.length === 0) {
+            return { allowed: false, reason: `${symbol}: existing position is not owned by a live basket` };
+          }
+          if (basketLegs.some((leg) => leg.side !== direction)) {
+            return { allowed: false, reason: `${symbol}: basket has opposite-side leg; directional entry would net/reverse it` };
+          }
+          const mark = await currentPublicPrice(symbol).catch(() => null);
+          if (!(typeof mark === "number" && Number.isFinite(mark) && mark > 0)) {
+            return { allowed: false, reason: `${symbol}: harga live tidak tersedia untuk verifikasi P&L basket` };
+          }
+          const configuredCost = Number.parseFloat(process.env.LIVE_ESTIMATED_CLOSE_COST_PCT ?? "");
+          const estimatedCloseCostPct = Number.isFinite(configuredCost) && configuredCost >= 0 ? configuredCost : 0.0022;
+          const netAfterCloseCost = basketLegs.reduce((sum, leg) => {
+            const gross = (direction === "LONG" ? mark - leg.entryPrice : leg.entryPrice - mark) * leg.qty;
+            return sum + gross - mark * leg.qty * estimatedCloseCostPct;
+          }, 0);
+          if (!(netAfterCloseCost > 0)) {
+            return {
+              allowed: false,
+              reason: `${symbol}: basket ${direction} masih ${netAfterCloseCost.toFixed(4)} USDT setelah estimasi biaya; directional tidak boleh menambah posisi kalah`,
+            };
+          }
+          return { allowed: true };
+        },
+        onPositionClosed: (netUsd: number) => engineForGate?.recordExternalConsecutiveLossOutcome(netUsd),
+        onPositionClosedDetail: ({ symbol, reason }: { symbol: string; reason: string }) => {
+          if (reason.startsWith("DIRECTIONAL_REVERSAL_CONFIRMED:")) {
+            directionalReversalStore.recordConfirmedReversalExit(symbol, Date.now());
+          }
+        },
+        ...singleSymbolEntryClaims,
+        ...sharedExposureReservation,
+      };
+      crossSectionalDirectionalShortExecutor = new SingleSymbolLaneExecutor({
+        ...common,
+        store: new SingleSymbolLaneExecutorStore("data", "cross-sectional-directional-short-executor.json"),
+        laneId: CROSS_SECTIONAL_DIRECTIONAL_SHORT_LANE_ID,
+        direction: "SHORT",
+        // Use the same confirmed decision as isAllowed(): canonical MIXED may reduce
+        // scanner-led exposure to one/two slots, so signals must not re-expand to three.
+        getOpenSignals: () => crossSectionalDirectionalOpenSignals(getLatestScanCandidates(), "SHORT", crossSectionalDirectionalDecision())
+          .filter((signal) => directionalReversalStore.canOpen(signal.symbol, Date.now())),
+        portfolioExitPolicy: directionalRegimeExitPolicy("BEAR_SHORT_3"),
+        isAllowed: () => laneAllowed(CROSS_SECTIONAL_DIRECTIONAL_SHORT_LANE_ID, "BEAR_SHORT_3"),
+        isAllowedReason: () => laneReason("BEAR_SHORT_3"),
+        existingNotionalForSymbol: (symbol) => notionalForSymbolExcluding(crossSectionalDirectionalShortExecutor, symbol),
+        existingClusterOpenSymbols: (symbol, direction) =>
+          clusterOpenSymbolsExcluding(crossSectionalDirectionalShortExecutor, symbol, direction),
+      });
+      crossSectionalDirectionalLongExecutor = new SingleSymbolLaneExecutor({
+        ...common,
+        store: new SingleSymbolLaneExecutorStore("data", "cross-sectional-directional-long-executor.json"),
+        laneId: CROSS_SECTIONAL_DIRECTIONAL_LONG_LANE_ID,
+        direction: "LONG",
+        // See the matching SHORT executor above: pass the confirmed, sized decision.
+        getOpenSignals: () => crossSectionalDirectionalOpenSignals(getLatestScanCandidates(), "LONG", crossSectionalDirectionalDecision())
+          .filter((signal) => directionalReversalStore.canOpen(signal.symbol, Date.now())),
+        portfolioExitPolicy: directionalRegimeExitPolicy("BULL_LONG_3"),
+        isAllowed: () => laneAllowed(CROSS_SECTIONAL_DIRECTIONAL_LONG_LANE_ID, "BULL_LONG_3"),
+        isAllowedReason: () => laneReason("BULL_LONG_3"),
+        existingNotionalForSymbol: (symbol) => notionalForSymbolExcluding(crossSectionalDirectionalLongExecutor, symbol),
+        existingClusterOpenSymbols: (symbol, direction) =>
+          clusterOpenSymbolsExcluding(crossSectionalDirectionalLongExecutor, symbol, direction),
+      });
+      // Testnet is an execution environment too.  Previously these ticks only
+      // ran outside testnet, leaving the directional lane permanently unable
+      // to collect any sample even after a fresh scan became eligible.
+      const directionalTickIntervalMs = isTest ? 30_000 : 5 * 60_000;
+      const shortDirectionalInitialDelayMs = isTest ? 15_000 : 130_000;
+      const longDirectionalInitialDelayMs = isTest ? 20_000 : 160_000;
+      {
+        const shortTick = () => void crossSectionalDirectionalShortExecutor?.tick();
+        const longTick = () => void crossSectionalDirectionalLongExecutor?.tick();
+        setTimeout(shortTick, shortDirectionalInitialDelayMs);
+        setInterval(shortTick, directionalTickIntervalMs);
+        setTimeout(longTick, longDirectionalInitialDelayMs);
+        setInterval(longTick, directionalTickIntervalMs);
       }
     }
 
@@ -2583,6 +2906,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       // admits (enabled, within window, named in allowedLaneIds, under every cap) can ever reach
       // that engine check at all.
       const innovationAllowed = (laneId: string): boolean =>
+        isTestnetCrossSectionalHorizonLaneAllowed(liveConfig.env, laneId) &&
         innovationCampaignAdmissionForLane(laneId).allowed &&
         innovationTestnetAdmissionAllowed(
           engineForGate.canOpenNewEntriesIgnoringManualDirectional(),
@@ -2962,10 +3286,33 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
   if (!isTest) {
     const fourBrainJournal = new CortexDecisionJournal("data/four-brain-decision-journal.jsonl");
     const fourBrainMetrics = new FourBrainMetricsAggregator();
+    /** See collectFourBrainOpenSignals below: this scope is testnet/advisory-only. */
+    const fourBrainTestnetFocus = fourBrainTestnetFocusEnabled;
+    const fourBrainFocusSinceMs = (() => {
+      const parsed = Date.parse(process.env.FOUR_BRAIN_TESTNET_FOCUS_SINCE ?? "");
+      return Number.isFinite(parsed) ? parsed : Date.now();
+    })();
+    // A clean persisted cohort: never read legacy outcomes/pending rows, while retaining only
+    // post-cutoff decisions across a testnet restart.
+    const fourBrainOutcomeDataDir = fourBrainOutcomeDataDirRuntime;
+    const focusedFourBrainLaneIds = new Set<string>([
+      CROSS_SECTIONAL_MARKET_NEUTRAL_LANE_ID,
+      CROSS_SECTIONAL_DIRECTIONAL_LONG_LANE_ID,
+      CROSS_SECTIONAL_DIRECTIONAL_SHORT_LANE_ID,
+      CORTEX_CG_MFE_GIVEBACK_LONG_LANE_ID,
+      CORTEX_CG_MFE_GIVEBACK_SHORT_LANE_ID,
+    ]);
     // Bounded ring buffer (last 100) of recent MARKET_SNAPSHOT / EXECUTIVE_DECISION journal records, fed
     // at journal-append time below (see wrapFourBrainJournalAppendForRecentDecisions) — the operator
     // dashboard's /api/shadow/four-brain route reads this, NEVER the journal file, on every request.
     const fourBrainRecentDecisions = new FourBrainRecentDecisionsBuffer({ capacity: 100 });
+    if (fourBrainShadowActive(process.env)) {
+      const restored = hydrateFourBrainRecentDecisionsBuffer(
+        fourBrainRecentDecisions,
+        "data/four-brain-decision-journal.jsonl",
+      );
+      if (restored > 0) console.log(`[four-brain-shadow] restored ${restored} recent dashboard decisions after restart`);
+    }
     // Bounded FIFO ledger (Direction cap 2000 / Entry cap 10000) of pending DIRECTION + ENTRY decisions,
     // fed at journal-append time below (see wrapFourBrainJournalAppendForOutcomeLedger) — the FOUNDATION
     // for a follow-up Direction/Entry Brain counterfactual outcome-resolution phase (not built here).
@@ -2977,7 +3324,11 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     // store itself is safe to construct unconditionally (pure bookkeeping, mirrors every other
     // report-only store in this codebase); only the RECONCILER INTERVAL and the report getter below are
     // gated.
-    const directionEntryOutcomeStore = getDirectionEntryOutcomeStore();
+    const directionEntryOutcomeStore = getDirectionEntryOutcomeStore(fourBrainOutcomeDataDir);
+    if (fourBrainTestnetFocus) {
+      fourBrainExecutionReinforcementStatusGetterRef = () =>
+        getFourBrainExecutionReinforcement(fourBrainOutcomeDataDir).getStatus();
+    }
     if (directionEntryReconcilerActive(process.env)) {
       // Durable snapshot FIRST (2026-07-28). The journal replay below can only see ~2.4h — the two
       // journal files together — so INTRADAY (4h) and SWING (24h) rows could never survive a restart,
@@ -2985,7 +3336,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       // holds the pending rows themselves and has no such window. Journal replay still runs after, as
       // a second source; ids restored here are fed through its existing hasProcessed* predicates so a
       // row present in both is admitted exactly once (pushEntry, unlike pushDirection, does not dedup).
-      const snapshot = loadPendingLedgerSnapshot();
+      const snapshot = loadPendingLedgerSnapshot(fourBrainOutcomeDataDir);
       for (const row of snapshot.direction) fourBrainOutcomeLedger.pushDirection(row);
       for (const row of snapshot.entry) fourBrainOutcomeLedger.pushEntry(row);
       const restoredDirectionIds = new Set(snapshot.direction.map((r) => r.decisionId));
@@ -2993,9 +3344,9 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       console.log(
         `[four-brain-pending-snapshot] instance=${resolveFourBrainInstanceId(process.env)} ` +
           `direction=${snapshot.direction.length} entry=${snapshot.entry.length} ` +
-          `skipped=${snapshot.skippedReason ?? "none"}`,
+          `root=${fourBrainOutcomeDataDir} skipped=${snapshot.skippedReason ?? "none"}`,
       );
-      const rehydrated = rehydrateFourBrainOutcomeLedgerFromJournals({
+      const rehydrated = fourBrainTestnetFocus ? null : rehydrateFourBrainOutcomeLedgerFromJournals({
         ledger: fourBrainOutcomeLedger,
         journalFiles: [
           "data/four-brain-decision-journal.jsonl.1",
@@ -3006,7 +3357,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         hasProcessedEntry: (decisionId) =>
           restoredEntryIds.has(decisionId) || directionEntryOutcomeStore.hasProcessedEntry(decisionId),
       });
-      console.log(
+      if (rehydrated) console.log(
         `[four-brain-outcome-rehydrate] instance=${resolveFourBrainInstanceId(process.env)} ` +
           `direction=${rehydrated.directionPendingRestored}/${rehydrated.directionEligibleUnprocessed} ` +
           `entry=${rehydrated.entryPendingRestored}/${rehydrated.entryEligibleUnprocessed} ` +
@@ -3061,6 +3412,17 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       crowdAlignLong: number | null;
       atMs: number;
     } | null = null;
+    // Market State receives two additional report-only sources. Both retain their producer's own
+    // observation time; a failed refresh preserves the old cache so normal freshness rules can
+    // mark it STALE instead of silently minting a fresh neutral value.
+    let fourBrainBtcLiquidityCache: {
+      score: number | null;
+      spreadBps: number | null;
+      expectedSlippageBpsBuy: number | null;
+      expectedSlippageBpsSell: number | null;
+      atMs: number;
+    } | null = null;
+    let fourBrainEventRiskCache: { score: number | null; atMs: number; sourceId: string } | null = null;
     const ratioToSigned = (ratio: number | null): number | null =>
       typeof ratio === "number" && Number.isFinite(ratio) && ratio > 0
         ? Math.max(-1, Math.min(1, (ratio - 1) / (ratio + 1)))
@@ -3080,15 +3442,97 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     // lastPaperOrderOwnershipIndex's identical per-cycle retention contract immediately above.
     let lastLiveIntentIndexByPaperOrderId: ReturnType<typeof buildLiveIntentIndexByPaperOrderId> | null = null;
 
-    const collectFourBrainOpenSignals = (): FourBrainBindingDeps["openSignals"] => {
+    /**
+     * Testnet experiment scope.  Four-Brain starts with exactly the three
+     * currently executable cohorts and an explicit deployment cut, so old
+     * CG/legacy evidence cannot leak into the new learning population.
+     * It is collection/advisory-only; this flag is never consulted by any
+     * execution, sizing, stop, or exit code.
+     */
+    const collectFourBrainOpenSignals = (nowMs = Date.now()): FourBrainBindingDeps["openSignals"] => {
       const out: FourBrainBindingDeps["openSignals"] = [];
+      // An already-open basket/position is Exit-Brain material, not a new Entry-Brain opportunity.
+      // Keeping it here through a long position horizon caused every 5-minute tick to recount a
+      // stale signal as a fresh Entry decision.
+      const entrySignalFresh = (openedAtMs: number): boolean =>
+        Number.isFinite(openedAtMs)
+          && openedAtMs <= nowMs + 60_000
+          && nowMs - openedAtMs <= FRESHNESS_TTL_MS.signal;
       const add = (
         laneId: string,
         direction: "LONG" | "SHORT",
         sigs: { observationId: string; symbol: string; entryPrice: number; stopPrice: number; openedAtMs: number }[],
       ): void => {
-        for (const s of sigs) out.push({ laneId, symbol: s.symbol, direction, observationId: s.observationId, openedAtMs: s.openedAtMs, entryPrice: s.entryPrice, stopPrice: s.stopPrice });
+        for (const s of sigs) {
+          if (fourBrainTestnetFocus && !entrySignalFresh(s.openedAtMs)) continue;
+          out.push({ laneId, symbol: s.symbol, direction, observationId: s.observationId, openedAtMs: s.openedAtMs, entryPrice: s.entryPrice, stopPrice: s.stopPrice });
+        }
       };
+      if (fourBrainTestnetFocus) {
+        // Cross-horizon FILTERED/MOM36. Its frozen riskDistanceAtOpen is the
+        // only honest per-leg invalidation proxy available in the observation;
+        // a stopless/invalid row is skipped rather than invented.
+        try {
+          for (const basket of getCrossSectionalStore().reportable) {
+            if (
+              basket.status !== "OPEN"
+              || basket.variant !== "FILTERED"
+              || basket.openedAtMs < fourBrainFocusSinceMs
+              || !entrySignalFresh(basket.openedAtMs)
+            ) continue;
+            const risk = basket.riskDistanceAtOpen;
+            if (!(typeof risk === "number" && Number.isFinite(risk) && risk > 0 && risk < 0.5)) continue;
+            for (const leg of basket.longLeg) {
+              const stopPrice = leg.entryPrice * (1 - risk);
+              if (stopPrice > 0) add(CROSS_SECTIONAL_MARKET_NEUTRAL_LANE_ID, "LONG", [{
+                observationId: `${basket.observationId}:LONG:${leg.symbol}`,
+                symbol: leg.symbol,
+                entryPrice: leg.entryPrice,
+                stopPrice,
+                openedAtMs: basket.openedAtMs,
+              }]);
+            }
+            for (const leg of basket.shortLeg) {
+              const stopPrice = leg.entryPrice * (1 + risk);
+              if (stopPrice > leg.entryPrice) add(CROSS_SECTIONAL_MARKET_NEUTRAL_LANE_ID, "SHORT", [{
+                observationId: `${basket.observationId}:SHORT:${leg.symbol}`,
+                symbol: leg.symbol,
+                entryPrice: leg.entryPrice,
+                stopPrice,
+                openedAtMs: basket.openedAtMs,
+              }]);
+            }
+          }
+        } catch { /* unavailable cross-sectional store => no fabricated signal */ }
+
+        // Directional sectional is already guarded by the live selector. Feed
+        // only its exact chosen candidates, retaining the scan fingerprint in
+        // observationId so future outcomes can join causally.
+        try {
+          const decision = crossSectionalDirectionalDecisionRef();
+          add(CROSS_SECTIONAL_DIRECTIONAL_LONG_LANE_ID, "LONG", crossSectionalDirectionalOpenSignals(getLatestScanCandidates(), "LONG", decision));
+          add(CROSS_SECTIONAL_DIRECTIONAL_SHORT_LANE_ID, "SHORT", crossSectionalDirectionalOpenSignals(getLatestScanCandidates(), "SHORT", decision));
+        } catch { /* stale/missing scan => no directional signal */ }
+
+        // CG MFE Giveback: only the active XRP/WLD rollout, split by side so
+        // one direction can never borrow evidence from the other.
+        try {
+          for (const signal of variantMatrixOpenSignals(getCurrentGuardVariantMatrixStore())) {
+            if (
+              signal.laneId !== "CG_MFE_GIVEBACK"
+              || !["XRPUSDT", "WLDUSDT"].includes(signal.symbol)
+              || signal.openedAtMs < fourBrainFocusSinceMs
+              || !entrySignalFresh(signal.openedAtMs)
+            ) continue;
+            out.push({
+              ...signal,
+              laneId: signal.direction === "LONG" ? CORTEX_CG_MFE_GIVEBACK_LONG_LANE_ID : CORTEX_CG_MFE_GIVEBACK_SHORT_LANE_ID,
+              sourceKind: "VARIANT_MATRIX_SHADOW",
+            });
+          }
+        } catch { /* unavailable matrix store => no CG signal */ }
+        return out;
+      }
       try { add(SF_PAPER_LANE_ID, "SHORT", shortFadeOpenSignals(getShortFadeStore())); } catch { /* lane store unavailable ⇒ skip (no fabrication) */ }
       try { add(IM_PAPER_LANE_ID, "LONG", intradayMomentumOpenSignals(getIntradayMomentumStore())); } catch { /* */ }
       try { add(RC_PAPER_LANE_ID, "LONG", regimeCompositeOpenSignals(getRegimeCompositeStore())); } catch { /* */ }
@@ -3176,13 +3620,18 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     };
 
     const activeFourBrainAllocation = (): { laneId: string; weightPct: number }[] => {
+      if (fourBrainTestnetFocus) {
+        // Reporting scope only. These rows are the whole Four-Brain cohort on
+        // testnet; they never write back into LiveExecutionEngine allocation.
+        return [...focusedFourBrainLaneIds].map((laneId) => ({ laneId, weightPct: 100 }));
+      }
       const allocs = liveEngine?.getStatus().laneSelection?.laneAllocations;
       if (allocs && allocs.length > 0) return allocs.map((a) => ({ laneId: a.laneId, weightPct: a.weightPct }));
       // allocations OFF or no engine ⇒ treat every roster lane as active at 100 (degenerate all-lanes case)
       return CORTEX_LANE_ROSTER.map((e) => ({ laneId: e.laneId, weightPct: 100 }));
     };
 
-    const buildFourBrainDeps = (nowMs: number): Omit<FourBrainBindingDeps, "entryMicrostructure"> => {
+    const buildFourBrainDeps = (nowMs: number): Omit<FourBrainBindingDeps, "entryMicrostructure" | "exitSignals"> => {
       const engine = liveEngine; // null on 3101 ⇒ engine-dependent fields degrade
       const status = engine ? engine.getStatus() : null;
       const snaps = getRegimeEngineStore().snapshots;
@@ -3190,6 +3639,10 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       const axis = buildRegimeAxisTimeline(snaps);
       const scanCached = getLatestScanCandidates();
       const regime = scanCached?.marketRegime ?? latestSnap?.regime ?? null;
+      // Testnet Four-Brain observes the three executable cohorts. It may
+      // analyse technical features, but the executor's canonical regime owns
+      // the visible/actionable market state.
+      const canonicalForFourBrain = fourBrainTestnetFocus ? getLatestCanonicalMarketRegimeEngineSnapshot() : null;
       const edgeMem = getRegimeEdgeMemory();
       // 2026-07-26 PROVENANCE FIX — every Direction reading below used to be stamped `axisAtMs`, the
       // regime AXIS's clock, no matter which producer the value actually came from. These two carry
@@ -3219,7 +3672,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       });
       const intents = liveExecutionStore ? liveExecutionStore.getState().intents : [];
       const openStates = new Set(["MIRRORED", "ENTRY_PLACED", "OPEN", "TP1_FILLED_BE_SET"]);
-      const openPositions = intents
+      const intentOpenPositions: FourBrainBindingDeps["openPositions"] = intents
         .filter((i) => openStates.has(i.state))
         .map((i) => ({
           paperOrderId: i.paperOrderId,
@@ -3229,9 +3682,72 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           entryPrice: i.filledEntryPrice ?? i.plannedEntryPrice,
           stopPrice: i.stopLossPrice,
           mfeR: i.maxFavorableR ?? null,
-          maeR: i.maxAdverseR ?? null,
+          maeR: normalizeFourBrainMaeR(i.maxAdverseR),
           createdAtMs: Date.parse(i.createdAt),
         }));
+      /**
+       * The live-intent store owns CG, but cross baskets and directional sectional positions are
+       * persisted by their own executors. Reading only intents made Four-Brain report zero open
+       * positions while the testnet held a real six-leg cross basket: Entry saw candidates, Exit
+       * saw nothing. Adapt those executor-owned positions here, read-only and testnet-focus scoped.
+       *
+       * Cross legs use the exact source observation's frozen risk distance to derive the same
+       * per-leg stop proxy used by the testnet Four-Brain entry cohort. If that immutable geometry
+       * is unavailable, skip rather than invent a stop/R denominator. This is shadow telemetry;
+       * no Four-Brain decision is fed to an executor or exchange client.
+       */
+      const executorOpenPositions: FourBrainBindingDeps["openPositions"] = [];
+      if (fourBrainTestnetFocus) {
+        try {
+          const observationsById = new Map(getCrossSectionalStore().all.map((observation) => [observation.observationId, observation]));
+          for (const basket of crossSectionalExecutor?.getStatus().openBaskets ?? []) {
+            const observation = observationsById.get(basket.sourceObservationId);
+            const risk = observation?.riskDistanceAtOpen;
+            const createdAtMs = Date.parse(basket.openedAt);
+            if (!(typeof risk === "number" && Number.isFinite(risk) && risk > 0 && risk < 0.5 && Number.isFinite(createdAtMs))) continue;
+            for (const leg of basket.legs) {
+              if (leg.exitOrderId !== null || !(leg.entryPrice > 0)) continue;
+              const stopPrice = leg.side === "LONG" ? leg.entryPrice * (1 - risk) : leg.entryPrice * (1 + risk);
+              if (!(stopPrice > 0)) continue;
+              executorOpenPositions.push({
+                paperOrderId: `xsec:${basket.basketId}:${leg.symbol}:${leg.side}`,
+                laneId: CROSS_SECTIONAL_MARKET_NEUTRAL_LANE_ID,
+                symbol: leg.symbol,
+                direction: leg.side,
+                entryPrice: leg.entryPrice,
+                stopPrice,
+                mfeR: leg.maxFavorableR ?? null,
+                maeR: normalizeFourBrainMaeR(leg.maxAdverseR),
+                createdAtMs,
+              });
+            }
+          }
+        } catch { /* executor/store unavailable => do not fabricate a position */ }
+        for (const [laneId, executor] of [
+          [CROSS_SECTIONAL_DIRECTIONAL_LONG_LANE_ID, crossSectionalDirectionalLongExecutor],
+          [CROSS_SECTIONAL_DIRECTIONAL_SHORT_LANE_ID, crossSectionalDirectionalShortExecutor],
+        ] as const) {
+          try {
+            for (const position of executor?.getStatus().openPositions ?? []) {
+              const createdAtMs = Date.parse(position.openedAt);
+              if (!(position.entryPrice > 0 && position.stopPrice > 0 && Number.isFinite(createdAtMs))) continue;
+              executorOpenPositions.push({
+                paperOrderId: position.positionId,
+                laneId,
+                symbol: position.symbol,
+                direction: position.direction,
+                entryPrice: position.entryPrice,
+                stopPrice: position.stopPrice,
+                mfeR: position.peakFavorableR ?? null,
+                maeR: normalizeFourBrainMaeR(position.peakAdverseR),
+                createdAtMs,
+              });
+            }
+          } catch { /* executor/store unavailable => do not fabricate a position */ }
+        }
+      }
+      const openPositions = [...intentOpenPositions, ...executorOpenPositions]
+        .filter((position) => !fourBrainTestnetFocus || focusedFourBrainLaneIds.has(position.laneId));
       const crowdingShadow = status?.crowdingExitShadow ?? {};
       // Built ONCE per gather/tick (same PER-CALL contract as ceBucketsOnce below) from the current
       // PaperOrder list, so every lane's allocationContextForLane call this tick shares one O(orders)
@@ -3261,6 +3777,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       return {
         instanceId: resolveFourBrainInstanceId(process.env),
         nowMs,
+        fourBrainOutcomeDataDir,
         axisScore: axis.current?.score ?? null,
         axisAtMs: axis.current?.at ? Date.parse(axis.current.at) : null,
         axisSlopePerHour: axis.slopePerHour ?? null,
@@ -3271,6 +3788,21 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         atrAtMs: btcAtrPercentileCache.get().atMs,
         advancersPct: latestSnap?.breadth.advancersPct ?? null,
         breadthAtMs: latestSnap?.at ? Date.parse(latestSnap.at) : null,
+        // BTC USD-M depth is an explicitly labelled global execution-cost proxy, not a fabricated
+        // all-symbol depth number. `score=null` stays MISSING; an observed too-thin book is a real 0.
+        marketLiquidityScore: fourBrainBtcLiquidityCache?.score ?? null,
+        marketLiquidityAtMs: fourBrainBtcLiquidityCache?.score !== null
+          ? fourBrainBtcLiquidityCache?.atMs ?? null
+          : null,
+        // Quantitative conflict-news volume. GDELT DOC is primary and Google News RSS is a labelled
+        // fallback only when GDELT is unavailable/rate-limited. This remains Market State context:
+        // it never calls a live executor or changes sizing, stops, or admission policy.
+        eventRiskScore: fourBrainEventRiskCache?.score ?? null,
+        eventRiskAtMs: fourBrainEventRiskCache?.score !== null
+          ? fourBrainEventRiskCache?.atMs ?? null
+          : null,
+        eventRiskSourceId: fourBrainEventRiskCache?.sourceId ?? "gdelt-conflict-news-volume-risk",
+        eventRiskMissingReason: "GDELT DOC / Google News RSS conflict-news snapshots unavailable",
         // BTC USD-M global long/short ratio mapped monotonically from (0,+inf) to (-1,+1).
         // This is a measured derivatives proxy, not fabricated market-wide certainty.
         sentiment: fourBrainBtcFlowCache?.sentiment ?? null,
@@ -3278,6 +3810,12 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           ? fourBrainBtcFlowCache?.atMs ?? null
           : null,
         safetyEvents: [],
+        marketStateAuthority: canonicalForFourBrain ? {
+          source: "TESTNET_EXECUTOR",
+          canonicalRegimeFamily: canonicalForFourBrain.regimeFamily,
+          scannerRegime: scanCached?.marketRegime ?? null,
+          capturedAtMs: canonicalForFourBrain.atMs,
+        } : null,
         regimeRaw: regime,
         edgeMemory: edgeMem,
         edgeMemoryUpdatedAtMs,
@@ -3341,7 +3879,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           const ph = directionEntryOutcomeStore.getState().direction.perHorizon;
           return { SCALP: ph.SCALP?.n ?? 0, INTRADAY: ph.INTRADAY?.n ?? 0, SWING: ph.SWING?.n ?? 0 };
         })(),
-        openSignals: collectFourBrainOpenSignals(),
+        openSignals: collectFourBrainOpenSignals(nowMs),
         maxSignalAgeMs: 50 * 60_000,
         crowdingStateForSymbol: (symbol) => crowdingShadow[symbol]?.crowdingState ?? null,
         openPositions,
@@ -3445,45 +3983,152 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     // Retained handle: the EXACT gather-deps snapshot buildFourBrainDeps produced for the in-flight cycle,
     // captured here so journalContext (below) reports the SAME per-tick feature snapshot the brains just
     // decided from — never a separately re-derived (and potentially drifted) recomputation.
-    let lastFourBrainGatherBase: Omit<FourBrainBindingDeps, "entryMicrostructure"> | null = null;
-    const buildFourBrainDepsForCycle = (nowMs: number): Omit<FourBrainBindingDeps, "entryMicrostructure"> => {
+    let lastFourBrainGatherBase: Omit<FourBrainBindingDeps, "entryMicrostructure" | "exitSignals"> | null = null;
+    const buildFourBrainDepsForCycle = (nowMs: number): Omit<FourBrainBindingDeps, "entryMicrostructure" | "exitSignals"> => {
       const built = buildFourBrainDeps(nowMs);
       lastFourBrainGatherBase = built;
       return built;
     };
 
+    /**
+     * The pre-submit observer is intentionally synchronous and cache-only: an executor must never
+     * wait on public market data just to produce shadow telemetry. The periodic shadow cycle is the
+     * sole network warmer. Values are timestamped so a stale cache becomes MISSING rather than being
+     * silently reused as current entry evidence.
+     */
+    type FourBrainMarketCacheRow<T> = { value: T; fetchedAtMs: number };
+    const fourBrainCandleCache = new Map<string, FourBrainMarketCacheRow<Candle[] | null>>();
+    const fourBrainOrderflowCache = new Map<string, FourBrainMarketCacheRow<EntryOrderflowSnapshot | null>>();
+    const readFreshFourBrainCache = <T>(
+      cache: Map<string, FourBrainMarketCacheRow<T>>,
+      symbol: string,
+      nowMs: number,
+      ttlMs: number,
+    ): T | null => {
+      const row = cache.get(symbol.trim().toUpperCase());
+      if (!row || row.fetchedAtMs > nowMs + 60_000 || nowMs - row.fetchedAtMs > ttlMs) return null;
+      return row.value;
+    };
+    const fetchFourBrainFuturesCandles = async (symbol: string): Promise<Candle[] | null> => {
+      const normalized = symbol.trim().toUpperCase();
+      const value = await binanceClient.getFuturesCandles(normalized, "15m", 150).catch(() => null);
+      fourBrainCandleCache.set(normalized, { value, fetchedAtMs: Date.now() });
+      return value;
+    };
+    const fetchFourBrainOrderflow = async (symbol: string): Promise<EntryOrderflowSnapshot | null> => {
+      const normalized = symbol.trim().toUpperCase();
+      let value: EntryOrderflowSnapshot | null = null;
+      try {
+        const payload = await binanceClient.getFuturesDepth(normalized, 100);
+        const depth = parseDepthPayload(payload);
+        const bestBid = depth.bids[0]?.price ?? null;
+        const bestAsk = depth.asks[0]?.price ?? null;
+        const configured = Number(process.env.FOUR_BRAIN_REFERENCE_NOTIONAL_USD ?? "250");
+        const referenceNotionalUsd = Number.isFinite(configured)
+          ? Math.min(5_000, Math.max(25, configured))
+          : 250;
+        const buySlip = computeExpectedSlippageBps(depth, "BUY", referenceNotionalUsd);
+        const sellSlip = computeExpectedSlippageBps(depth, "SELL", referenceNotionalUsd);
+        const depthImbalance =
+          bestBid !== null && bestAsk !== null
+            ? computeDepthImbalance(depth, bestBid, bestAsk, 10).imbalance
+            : null;
+        value = {
+          spreadBps: bestBid !== null && bestAsk !== null ? computeSpreadBps(bestBid, bestAsk) : null,
+          expectedSlippageBpsBuy: buySlip,
+          expectedSlippageBpsSell: sellSlip,
+          bookDepthOkBuy: buySlip !== null,
+          bookDepthOkSell: sellSlip !== null,
+          bookImbalance: depthImbalance,
+          observedAtMs: Date.now(),
+        };
+      } catch {
+        value = null;
+      }
+      fourBrainOrderflowCache.set(normalized, { value, fetchedAtMs: Date.now() });
+      return value;
+    };
+    const appendFourBrainJournal = wrapFourBrainJournalAppendForOutcomeLedger(
+      wrapFourBrainJournalAppendForRecentDecisions(
+        (record) => fourBrainJournal.append(record),
+        fourBrainRecentDecisions,
+      ),
+      fourBrainOutcomeLedger,
+    );
+
+    if (fourBrainTestnetFocus) {
+      fourBrainPreEntryObserverRef = (candidate) => {
+        try {
+          const bindings = fourBrainActualFillBindingsRef;
+          const nowMs = candidate.nowMs;
+          const entryPrice = candidate.entryPrice;
+          const stopPrice = candidate.stopPrice;
+          const openedAtMs = candidate.openedAtMs;
+          const signalId = candidate.signalId?.trim() ?? "";
+          if (
+            !bindings
+            || !Number.isFinite(nowMs)
+            || !(typeof entryPrice === "number" && entryPrice > 0)
+            || !(typeof stopPrice === "number" && stopPrice > 0)
+            || !(typeof openedAtMs === "number" && Number.isFinite(openedAtMs))
+            || !signalId
+          ) return;
+          const laneId = normalizeFourBrainTestnetLane(candidate.laneId, candidate.side);
+          if (!focusedFourBrainLaneIds.has(laneId)) return;
+          const preEntryDeps: Omit<FourBrainBindingDeps, "entryMicrostructure" | "exitSignals"> = {
+            ...buildFourBrainDeps(nowMs),
+            nowMs,
+            openSignals: [{
+              laneId,
+              symbol: candidate.symbol,
+              direction: candidate.side,
+              observationId: signalId,
+              openedAtMs,
+              entryPrice,
+              stopPrice,
+            }],
+            openPositions: [],
+          };
+          const entryMicrostructure = makeEntryMicrostructureAccessor({
+            candlesFor: (symbol) => readFreshFourBrainCache(fourBrainCandleCache, symbol, nowMs, FRESHNESS_TTL_MS.candle),
+            orderflowFor: (symbol) => readFreshFourBrainCache(fourBrainOrderflowCache, symbol, nowMs, FRESHNESS_TTL_MS.orderflow),
+            timeframe: "15m",
+            nowMs,
+          });
+          const gathered = assembleFourBrainTick(buildFourBrainGatherInput({
+            ...preEntryDeps,
+            entryMicrostructure,
+            exitSignals: () => null,
+          }));
+          const evaluation = evaluateFourBrainPreEntryCandidate(gathered);
+          if (!evaluation) return;
+          bindings.observeExecutiveDecision(evaluation.executive, { signalId }, { source: "PRE_ENTRY_EXECUTOR" });
+          appendFourBrainJournal({
+            ...buildExecutiveDecisionRecord(evaluation.executive, {
+              ...buildFourBrainJournalContext(preEntryDeps, activeFourBrainAllocation()),
+              invariantViolations: evaluation.invariantViolations,
+              signalId,
+            }),
+            captureStage: "PRE_ENTRY_EXECUTOR",
+          });
+        } catch {
+          // All telemetry failure paths are intentionally ignored by the incumbent executor.
+        }
+      };
+    }
+
     const fourBrainCycle = (): void => {
       void runFourBrainShadowCycle({
         buildDeps: buildFourBrainDepsForCycle,
-        fetchCandles: (symbol) => binanceClient.getCandles(symbol, "15m", 150).catch(() => null),
-        fetchOrderflow: async (symbol) => {
-          try {
-            const payload = await binanceClient.getFuturesDepth(symbol, 100);
-            const depth = parseDepthPayload(payload);
-            const bestBid = depth.bids[0]?.price ?? null;
-            const bestAsk = depth.asks[0]?.price ?? null;
-            const configured = Number(process.env.FOUR_BRAIN_REFERENCE_NOTIONAL_USD ?? "250");
-            const referenceNotionalUsd = Number.isFinite(configured)
-              ? Math.min(5_000, Math.max(25, configured))
-              : 250;
-            const observedAtMs = Date.now();
-            const buySlip = computeExpectedSlippageBps(depth, "BUY", referenceNotionalUsd);
-            const sellSlip = computeExpectedSlippageBps(depth, "SELL", referenceNotionalUsd);
-            return {
-              spreadBps:
-                bestBid !== null && bestAsk !== null
-                  ? computeSpreadBps(bestBid, bestAsk)
-                  : null,
-              expectedSlippageBpsBuy: buySlip,
-              expectedSlippageBpsSell: sellSlip,
-              bookDepthOkBuy: buySlip !== null,
-              bookDepthOkSell: sellSlip !== null,
-              observedAtMs,
-            };
-          } catch {
-            return null;
-          }
-        },
+        fetchCandles: fetchFourBrainFuturesCandles,
+        fetchOrderflow: fetchFourBrainOrderflow,
+        prewarmSymbols: () => fourBrainTestnetFocus
+          ? [
+              ...(getLatestScanCandidates()?.candidates ?? []).map((candidate) => candidate.symbol),
+              "XRPUSDT",
+              "WLDUSDT",
+            ]
+          : [],
         candleTimeframe: "15m",
         activeAllocation: activeFourBrainAllocation,
         // Wrapped so the SAME journalAppend call that writes the real file also mirrors records into two
@@ -3492,13 +4137,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         // the real file append (fourBrainJournal.append, innermost) stays the single unconditional/
         // unaltered call; see four-brain-recent-decisions.ts / four-brain-outcome-ledger.ts's own doc
         // comments.
-        journalAppend: wrapFourBrainJournalAppendForOutcomeLedger(
-          wrapFourBrainJournalAppendForRecentDecisions(
-            (r) => fourBrainJournal.append(r),
-            fourBrainRecentDecisions,
-          ),
-          fourBrainOutcomeLedger,
-        ),
+        journalAppend: appendFourBrainJournal,
         // Bug fix: previously unsupplied ⇒ every journaled EXECUTIVE_DECISION had instanceId/rawFeatures/
         // normalizedFeatures/sourceStatuses/missingReasons/incumbent hard-null. Built from this cycle's own
         // captured gather deps (never fabricated) + the live incumbent lane allocation.
@@ -3507,6 +4146,9 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
             ? buildFourBrainJournalContext(lastFourBrainGatherBase, activeFourBrainAllocation())
             : { instanceId: resolveFourBrainInstanceId(process.env) },
         onExecutiveDecision: (executive, identity) => {
+          // Scheduled rows remain shadow/review audit only. Exact actual-fill attribution is
+          // captured exclusively by the synchronous pre-submit observer above, so a later periodic
+          // scan cannot be misrepresented as the decision that caused an exchange fill.
           if (!executiveReviewStore) return;
           try {
             const paperStore = peekPaperExecutionRouterStore();
@@ -3609,7 +4251,14 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     };
     // Arm the interval ONLY where the tick could actually run — 3103 (live) never even schedules it.
     if (fourBrainShadowActive(process.env)) {
-      setTimeout(fourBrainCycle, 90_000);
+      // Run once as soon as bootstrap completes. The bounded prewarm in
+      // four-brain-live-wiring keeps this report-only startup read from
+      // blocking the service, while avoiding an empty dashboard after restart.
+      console.log(`[four-brain-shadow] scheduling immediate startup cycle instance=${resolveFourBrainInstanceId(process.env)}`);
+      setTimeout(() => {
+        console.log(`[four-brain-shadow] starting immediate startup cycle instance=${resolveFourBrainInstanceId(process.env)}`);
+        fourBrainCycle();
+      }, 0);
       setInterval(fourBrainCycle, 5 * 60_000);
 
       // BTC ATR-percentile refresh — ATR-percentile is slow-moving (7d rolling window), so a 15min cadence is
@@ -3635,9 +4284,71 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       };
       setTimeout(runBtcAtrPercentileRefresh, 10_000);
       setInterval(runBtcAtrPercentileRefresh, 15 * 60_000);
+      // Global liquidity proxy: one BTC USD-M depth snapshot per minute. It uses the same 25..5000
+      // USD reference-notional clamp as Entry Brain's per-symbol depth read, but remains advisory
+      // Market State telemetry and never feeds an executor directly.
+      const refreshFourBrainBtcLiquidity = (): void => {
+        void binanceClient.getFuturesDepth("BTCUSDT", 100)
+          .then((payload) => {
+            const depth = parseDepthPayload(payload);
+            const bestBid = depth.bids[0]?.price ?? null;
+            const bestAsk = depth.asks[0]?.price ?? null;
+            const configured = Number(process.env.FOUR_BRAIN_REFERENCE_NOTIONAL_USD ?? "250");
+            const referenceNotionalUsd = Number.isFinite(configured)
+              ? Math.min(5_000, Math.max(25, configured))
+              : 250;
+            const spreadBps = bestBid !== null && bestAsk !== null
+              ? computeSpreadBps(bestBid, bestAsk)
+              : null;
+            const expectedSlippageBpsBuy = computeExpectedSlippageBps(depth, "BUY", referenceNotionalUsd);
+            const expectedSlippageBpsSell = computeExpectedSlippageBps(depth, "SELL", referenceNotionalUsd);
+            fourBrainBtcLiquidityCache = {
+              score: marketLiquidityScoreFromExecutionCost({ spreadBps, expectedSlippageBpsBuy, expectedSlippageBpsSell }),
+              spreadBps,
+              expectedSlippageBpsBuy,
+              expectedSlippageBpsSell,
+              atMs: Date.now(),
+            };
+          })
+          .catch(() => {
+            // Keep the last actual observation; freshness logic owns the eventual STALE state.
+          });
+      };
+      setTimeout(refreshFourBrainBtcLiquidity, 15_000);
+      setInterval(refreshFourBrainBtcLiquidity, 60_000);
       // Offset from the ATR refresh so the two BTC producers never fire in the same tick.
       setTimeout(runKronosBtcAnchorRefresh, 20_000);
       setInterval(runKronosBtcAnchorRefresh, 15 * 60_000);
+
+      // GDELT DOC is primary; Google News RSS is the labelled fallback when the public GDELT API
+      // rate-limits this server. Both are transparent article-volume proxies (not LLM classifiers),
+      // isolated to this testnet-only shadow source. An error leaves the cache untouched rather than
+      // publishing a made-up zero.
+      const refreshFourBrainEventRisk = (): void => {
+        void (async () => {
+          const primary = await fetchGdeltDocEventRisk();
+          if (primary.ok) {
+            fourBrainEventRiskCache = {
+              score: primary.risk.score,
+              atMs: primary.risk.observedAtMs,
+              sourceId: "gdelt-conflict-news-volume-risk",
+            };
+            return;
+          }
+          const fallback = await fetchGoogleNewsRssEventRisk();
+          if (!fallback.ok) return;
+          fourBrainEventRiskCache = {
+            score: fallback.risk.score,
+            atMs: fallback.risk.observedAtMs,
+            sourceId: "google-news-rss-conflict-volume-risk",
+          };
+        })()
+          .catch(() => {
+            // The cache remains at its last measured value and naturally becomes STALE.
+          });
+      };
+      setTimeout(refreshFourBrainEventRisk, 40_000);
+      setInterval(refreshFourBrainEventRisk, 15 * 60_000);
 
       if (challengerTestnetEnabled) {
         // The Python process uses a global inference lock. These offsets also
@@ -3708,11 +4419,12 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           ledger: fourBrainOutcomeLedger,
           store: directionEntryOutcomeStore,
           listClosedPositionPaths: () => getPositionPathRecorder().listClosedPaths(),
-          fetchDirectionCandles: () => binanceClient.getCandles("BTCUSDT", "1h", 500).catch(() => null),
+          fetchDirectionCandles: () => binanceClient.getFuturesCandles("BTCUSDT", "1h", 500).catch(() => null),
           fetchEntryTier2Candles: (symbol, sinceMs) =>
             binanceClient
-              .getCandles(symbol, "15m", ENTRY_TIER2_HORIZON_BARS + ENTRY_TIER2_WAIT_WINDOW_BARS + 1, { startTime: sinceMs })
+              .getFuturesCandles(symbol, "15m", ENTRY_TIER2_HORIZON_BARS + ENTRY_TIER2_WAIT_WINDOW_BARS + 1, { startTime: sinceMs })
               .catch(() => null),
+          actualFillBindings: fourBrainActualFillBindingsRef ?? undefined,
           now: () => Date.now(),
         })
           .then((res) => {
@@ -3724,10 +4436,11 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
             savePendingLedgerSnapshot({
               direction: fourBrainOutcomeLedger.getPendingDirectionRows(),
               entry: fourBrainOutcomeLedger.getPendingEntryRows(),
-            });
+            }, fourBrainOutcomeDataDir);
             console.log(
               `[direction-entry-reconciler] instance=${resolveFourBrainInstanceId(process.env)} ` +
                 `directionProcessed=${res.directionProcessed} entryProcessed=${res.entryProcessed} ` +
+                `directActualFill=${res.directActualFillProcessed} ` +
                 `tier1Matched=${res.tier1Diagnostics?.matchedRows ?? 0} ` +
                 `tier1NoIdentityClose=${res.tier1Diagnostics?.rejectionReasons.NO_EXACT_LANE_SYMBOL_SIDE_CLOSE ?? 0} ` +
                 `tier1SignalMismatch=${res.tier1Diagnostics?.rejectionReasons.SIGNAL_ID_MISMATCH ?? 0} ` +
@@ -3747,6 +4460,9 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
     crossSectionalExecutor: () => crossSectionalExecutor,
     crossSectionalTrendExecutor: () => crossSectionalTrendExecutor,
     crossSectionalMixedExecutor: () => crossSectionalMixedExecutor,
+    directionalRegimeDecision: () => crossSectionalDirectionalDecisionRef(),
+    crossSectionalDirectionalLongExecutor: () => crossSectionalDirectionalLongExecutor,
+    crossSectionalDirectionalShortExecutor: () => crossSectionalDirectionalShortExecutor,
     shortFadeExecutor: () => shortFadeExecutor,
     intradayMomentumExecutor: () => intradayMomentumExecutor,
     regimeCompositeExecutor: () => regimeCompositeExecutor,

@@ -52,6 +52,19 @@ export type MarketBias = "BULLISH" | "BEARISH" | "MIXED" | "NEUTRAL";
 export type VolatilityBand = "LOW" | "NORMAL" | "HIGH" | "EXTREME";
 export type LiquidityBand = "THIN" | "NORMAL" | "DEEP" | "UNKNOWN";
 
+/**
+ * On the focussed testnet rollout, the executor's canonical regime is the
+ * authority for an actionable market label. The Four-Brain technical
+ * classifier remains available for audit, but may not silently relabel the
+ * same market as an independent execution regime.
+ */
+export interface MarketStateAuthority {
+  source: "TESTNET_EXECUTOR";
+  canonicalRegimeFamily: "BULLISH" | "BEARISH" | "MIXED" | "UNKNOWN";
+  scannerRegime: string | null;
+  capturedAtMs: number | null;
+}
+
 export interface MarketStateDecision {
   schemaVersion: string;
   decisionId: string;
@@ -74,6 +87,8 @@ export interface MarketStateDecision {
   };
   reasons: string[];
   sourceStatuses: SourceStatuses;
+  /** Present only where an executor regime is explicitly authoritative. */
+  authority?: MarketStateAuthority | null;
 }
 
 export type DirectionHorizon = "SCALP" | "INTRADAY" | "SWING";
@@ -119,6 +134,31 @@ export interface DirectionDecision {
 export type EntryAction = "ENTER_NOW" | "WAIT_PULLBACK" | "WAIT_BREAKOUT" | "WAIT_CONFIRMATION" | "SKIP";
 export type EntrySide = "LONG" | "SHORT";
 export type EntryOrderType = "MARKET" | "LIMIT" | "STOP_LIMIT";
+
+/**
+ * Read-only reinforcement earned from CLOSED, exact testnet fills.  It is
+ * deliberately a recommendation-quality adjustment, never an allocation,
+ * sizing, or order authority.
+ */
+export type FourBrainReinforcementVerdict = "INSUFFICIENT" | "NEUTRAL" | "POSITIVE" | "NEGATIVE";
+export interface FourBrainExecutionReinforcement {
+  source: "TIER1_REALIZED";
+  verdict: FourBrainReinforcementVerdict;
+  /** Only exact lane × canonical-regime × symbol × side evidence may earn a non-zero adjustment. */
+  scope: "EXACT_LANE_REGIME_SYMBOL" | "NONE";
+  canonicalRegimeFamily: "BULLISH" | "BEARISH" | "MIXED" | "UNKNOWN" | null;
+  laneId: string | null;
+  symbolOrBasketId: string | null;
+  side: "LONG" | "SHORT";
+  /** Raw matched-fill count, kept separately from the conservative block count. */
+  n: number;
+  /** Non-overlapping four-hour decision blocks; this is the sufficiency gate. */
+  effectiveN: number;
+  winRate: number | null;
+  avgNetR: number | null;
+  /** Bounded [-0.10, +0.10], advisory-only. */
+  adjustment: number;
+}
 
 export interface EntryDecision {
   schemaVersion: string;
@@ -181,6 +221,20 @@ export interface ExecutiveDecision {
   marketContext: MarketContextLineage;
   laneId: string | null;
   symbolOrBasketId: string | null;
+  /** Exact-fill reinforcement snapshot consumed for this advisory review, if one exists. */
+  executionReinforcement?: FourBrainExecutionReinforcement | null;
+  /**
+   * Shadow-only rank data.  It is deliberately separate from candidateStatus: a positive exact
+   * actual-fill cohort can reorder otherwise-valid Four-Brain candidates, but it cannot alter an
+   * incumbent allocation, size, stop, or entry gate by itself.
+   */
+  shadowRanking?: {
+    baseExpectedNetR: number | null;
+    reinforcementAdjustment: number;
+    adjustedExpectedNetR: number | null;
+    rank: number | null;
+    rankEligible: boolean;
+  } | null;
   candidateStatus: ExecutiveCandidateStatus;
   disagreements: string[];
   reasons: string[];

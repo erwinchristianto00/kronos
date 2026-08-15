@@ -22,6 +22,89 @@ export interface LiveExecutorGateEngine {
   newEntryBlockReason?(): string | null;
 }
 
+export const TESTNET_CROSS_SECTIONAL_HORIZON_ONLY_ENV = "TESTNET_ONLY_CROSS_SECTIONAL_HORIZON";
+export const CROSS_SECTIONAL_HORIZON_LANE_ID = "CROSS_SECTIONAL_MARKET_NEUTRAL";
+export const CROSS_SECTIONAL_DIRECTIONAL_REGIME_EXEC_ENABLED_ENV = "CROSS_SECTIONAL_DIRECTIONAL_REGIME_EXEC_ENABLED";
+export const CROSS_SECTIONAL_DIRECTIONAL_SHORT_LANE_ID = "CROSS_SECTIONAL_DIRECTIONAL_SHORT";
+export const CROSS_SECTIONAL_DIRECTIONAL_LONG_LANE_ID = "CROSS_SECTIONAL_DIRECTIONAL_LONG";
+export const TESTNET_CROSS_SECTIONAL_EXTRA_LANES_ENV = "TESTNET_CROSS_SECTIONAL_EXTRA_LANES";
+export const TESTNET_CROSS_SECTIONAL_EXTRA_SYMBOLS_ENV = "TESTNET_CROSS_SECTIONAL_EXTRA_SYMBOLS";
+/** Dedicated execution scope for the only CG MFE Giveback rollout approved on testnet. */
+export const TESTNET_MFE_GIVEBACK_SYMBOLS_ENV = "TESTNET_MFE_GIVEBACK_SYMBOLS";
+export const TESTNET_MFE_GIVEBACK_VARIANT_ID = "CG_MFE_GIVEBACK";
+
+function csvSet(value: string | undefined): ReadonlySet<string> {
+  return new Set((value ?? "").split(",").map((part) => part.trim().toUpperCase()).filter(Boolean));
+}
+
+function laneMatchesAllowlist(laneId: string | null | undefined, allowlist: ReadonlySet<string>): boolean {
+  if (!laneId) return false;
+  const normalized = laneId.trim().toUpperCase();
+  const variantId = normalized.split(":").pop() ?? normalized;
+  return allowlist.has(normalized) || allowlist.has(variantId);
+}
+
+/** True for either raw or namespaced CG MFE Giveback lane IDs. */
+export function isMfeGivebackLaneId(laneId: string | null | undefined): boolean {
+  return laneMatchesAllowlist(laneId, new Set([TESTNET_MFE_GIVEBACK_VARIANT_ID]));
+}
+
+/**
+ * During the cross-sectional testnet rollout, CG_MFE_GIVEBACK has its OWN
+ * symbol scope. It is deliberately separate from presentation/cohort filters:
+ * every candidate and every execution path must enforce the same XRP/WLD-only
+ * boundary. Missing configuration fails closed while the rollout lock is on.
+ */
+export function isTestnetMfeGivebackSymbolAllowed(
+  env: "testnet" | "mainnet" | null,
+  laneId: string | null | undefined,
+  symbol: string | null | undefined,
+  envVars: NodeJS.ProcessEnv = process.env,
+): boolean {
+  if (
+    env !== "testnet" ||
+    envVars[TESTNET_CROSS_SECTIONAL_HORIZON_ONLY_ENV] !== "1" ||
+    !isMfeGivebackLaneId(laneId)
+  ) return true;
+  const normalizedSymbol = symbol?.trim().toUpperCase();
+  // Keep the dedicated variable authoritative, while retaining the previously
+  // deployed extra-symbol value as a backward-compatible fallback.
+  const allowed = csvSet(
+    envVars[TESTNET_MFE_GIVEBACK_SYMBOLS_ENV] ??
+      envVars[TESTNET_CROSS_SECTIONAL_EXTRA_SYMBOLS_ENV],
+  );
+  return Boolean(normalizedSymbol && allowed.has(normalizedSymbol));
+}
+
+/** Testnet rollout switch: only the FILTERED cross-sectional horizon executor may open new risk. */
+export function isTestnetCrossSectionalHorizonLaneAllowed(
+  env: "testnet" | "mainnet" | null,
+  laneId: string | null | undefined,
+  envVars: NodeJS.ProcessEnv = process.env,
+): boolean {
+  if (env !== "testnet" || envVars[TESTNET_CROSS_SECTIONAL_HORIZON_ONLY_ENV] !== "1") return true;
+  if (laneId === CROSS_SECTIONAL_HORIZON_LANE_ID) return true;
+  const directionalAllowed = envVars[CROSS_SECTIONAL_DIRECTIONAL_REGIME_EXEC_ENABLED_ENV] === "1" &&
+    (laneId === CROSS_SECTIONAL_DIRECTIONAL_SHORT_LANE_ID || laneId === CROSS_SECTIONAL_DIRECTIONAL_LONG_LANE_ID);
+  if (directionalAllowed) return true;
+  return laneMatchesAllowlist(laneId, csvSet(envVars[TESTNET_CROSS_SECTIONAL_EXTRA_LANES_ENV]));
+}
+
+/** Extra testnet lanes remain fail-closed unless the symbol is explicitly allowlisted too. */
+export function isTestnetCrossSectionalHorizonSourceAllowed(
+  env: "testnet" | "mainnet" | null,
+  laneId: string | null | undefined,
+  symbol: string | null | undefined,
+  envVars: NodeJS.ProcessEnv = process.env,
+): boolean {
+  if (!isTestnetMfeGivebackSymbolAllowed(env, laneId, symbol, envVars)) return false;
+  if (env !== "testnet" || envVars[TESTNET_CROSS_SECTIONAL_HORIZON_ONLY_ENV] !== "1") return true;
+  if (laneId === CROSS_SECTIONAL_HORIZON_LANE_ID) return true;
+  if (!isTestnetCrossSectionalHorizonLaneAllowed(env, laneId, envVars)) return false;
+  const normalizedSymbol = symbol?.trim().toUpperCase();
+  return Boolean(normalizedSymbol && csvSet(envVars[TESTNET_CROSS_SECTIONAL_EXTRA_SYMBOLS_ENV]).has(normalizedSymbol));
+}
+
 /**
  * Master permission gate for a newly-wired executor instance (cross-sectional TREND/MIXED, or a
  * SingleSymbolLaneExecutor). Requires, in order: armed (bypassed on testnet), EXPLICIT allocation
@@ -64,6 +147,9 @@ export function newExecutorLaneGate(
     // reports the actual condition that bound; the drain string remains the fallback for engines
     // (or test fakes) that don't define it.
     return { allowed: false, reason: engine.newEntryBlockReason?.() ?? "new-entry drain is active (operator paused new entries)" };
+  }
+  if (!isTestnetCrossSectionalHorizonLaneAllowed(env, laneId)) {
+    return { allowed: false, reason: "testnet is locked to the cross-sectional horizon lane" };
   }
   if (
     env === "mainnet" &&
