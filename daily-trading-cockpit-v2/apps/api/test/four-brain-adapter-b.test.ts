@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
+  makeExitLiveSignalsAccessor,
   microstructureFromIndicators,
   makeEntryMicrostructureAccessor,
   type TimeframeIndicatorLike,
@@ -115,5 +116,61 @@ describe("Adapter B — makeEntryMicrostructureAccessor (TTL + robustness)", () 
     expect(m.expectedSlippageBps).toBe(2.1);
     expect(m.bookDepthOk).toBe(true);
     expect(m.orderflowObservedAtMs).toBe(NOW - 1_000);
+  });
+});
+
+describe("Exit Brain live-signal adapter", () => {
+  it("derives fresh completed-candle and order-flow reversal evidence without fabricating unavailable sources", () => {
+    const candles = makeCandles(20, NOW - MinutesMs(15));
+    for (const candle of candles.slice(-13, -1)) {
+      candle.open = 103;
+      candle.high = 104;
+      candle.low = 102;
+      candle.close = 103;
+      candle.volume = 100;
+    }
+    const prior = candles.slice(-4, -1);
+    prior[0]!.close = 106;
+    prior[1]!.close = 104;
+    prior[2]!.close = 102;
+    const last = candles[candles.length - 1]!;
+    last.open = 103;
+    last.high = 108;
+    last.low = 100;
+    last.close = 100;
+    last.volume = 10;
+    const signals = makeExitLiveSignalsAccessor({
+      candlesFor: () => candles,
+      orderflowFor: () => ({
+        spreadBps: 1,
+        expectedSlippageBpsBuy: 2,
+        expectedSlippageBpsSell: 2,
+        bookDepthOkBuy: true,
+        bookDepthOkSell: true,
+        bookImbalance: -0.5,
+        observedAtMs: NOW - 1_000,
+      }),
+      canonicalRegimeFamily: "BEARISH",
+      nowMs: NOW,
+    })("ETHUSDT", "LONG");
+
+    expect(signals).toMatchObject({
+      momentumDecay: true,
+      volumeExhaustion: true,
+      failedNewExtreme: true,
+      structureBreak: true,
+      orderFlowReversal: true,
+      volTransition: true,
+      regimeTransition: true,
+      thesisIntact: false,
+    });
+  });
+
+  it("returns null when completed-candle data is stale rather than reporting a false thesis", () => {
+    const acc = makeExitLiveSignalsAccessor({
+      candlesFor: () => makeCandles(20, NOW - MinutesMs(120)),
+      nowMs: NOW,
+    });
+    expect(acc("ETHUSDT", "LONG")).toBeNull();
   });
 });

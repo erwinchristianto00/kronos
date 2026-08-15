@@ -147,6 +147,30 @@ describe("CortexRealAttributionStore", () => {
     expect(report.perLane[1]).toMatchObject({ laneId: "LANE_B", n: 1 });
   });
 
+  it("[OPERATOR-VOID] subtracts one retained raw record from today, all-time, per-lane, and recent reporting", () => {
+    const dir = tmp();
+    const store = new CortexRealAttributionStore(dir);
+    store.recordClose(input({ recordId: "keep", laneId: "LANE_X", realizedPnlUsd: 2, appliedWeightPct: 10, rawStaticWeightPct: 8 }));
+    store.recordClose(input({ recordId: "void", laneId: "LANE_X", realizedPnlUsd: -10, appliedWeightPct: 10, rawStaticWeightPct: 8 }));
+
+    const excluded = store.excludeRecordForReporting("void", {
+      reason: "operator-scoped invalid basket",
+      excludedAt: "2026-07-21T12:00:00.000Z",
+    });
+    expect(excluded).toEqual({ ok: true, alreadyExcluded: false });
+    expect(store.getState().records.map((record) => record.recordId)).toEqual(["keep", "void"]); // raw audit retained
+
+    const report = store.buildReport("2026-07-21T18:00:00.000Z");
+    expect(report.today).toMatchObject({ n: 1, realizedPnlUsd: 2 });
+    expect(report.allTime).toMatchObject({ n: 1, realizedPnlUsd: 2 });
+    expect(report.perLane).toEqual([expect.objectContaining({ laneId: "LANE_X", n: 1, realizedPnlUsd: 2 })]);
+    expect(report.recent.map((record) => record.recordId)).toEqual(["keep"]);
+    expect(store.excludeRecordForReporting("void", { reason: "retry" })).toEqual({ ok: true, alreadyExcluded: true });
+
+    const reloaded = new CortexRealAttributionStore(dir);
+    expect(reloaded.buildReport("2026-07-21T18:00:00.000Z").allTime).toMatchObject({ n: 1, realizedPnlUsd: 2 });
+  });
+
   it("[REGRESSION 2026-07-22] perLane never exceeds MAX_LANES=300 distinct keys, even counting the overflow bucket", () => {
     const store = new CortexRealAttributionStore(tmp());
     // 301 distinct, never-before-seen lane ids — one more than the documented strict cap of 300,

@@ -66,6 +66,37 @@ describe("Executive Decision layer", () => {
     expect(checkExecutiveInvariants(exec).ok).toBe(true);
   });
 
+  it("uses an earned exact positive cohort as a bounded advisory boost, never as allocation or execution authority", () => {
+    const exec = buildExecutiveDecision({
+      nowMs: NOW, marketState: ms(), direction: dirLong(), entry: decideEntry(entryInput()), exit: null,
+      laneId: "RC", symbolOrBasketId: "BTCUSDT", laneEligibleIncumbent: true,
+      executionReinforcement: {
+        source: "TIER1_REALIZED", verdict: "POSITIVE", scope: "EXACT_LANE_REGIME_SYMBOL",
+        canonicalRegimeFamily: "BULLISH", laneId: "RC", symbolOrBasketId: "BTCUSDT", side: "LONG",
+        n: 10, effectiveN: 8, winRate: 0.75, avgNetR: 0.2, adjustment: 0.04,
+      },
+    });
+    expect(exec.candidateStatus).toBe("VALID");
+    expect(exec.executionReinforcement?.verdict).toBe("POSITIVE");
+    expect(exec.reasons.join(" ")).toContain("reinforcement POSITIVE");
+    expect(exec.reportOnly).toBe(true);
+  });
+
+  it("lets a sufficiently sampled exact losing cohort reject only the SHADOW recommendation", () => {
+    const exec = buildExecutiveDecision({
+      nowMs: NOW, marketState: ms(), direction: dirLong(), entry: decideEntry(entryInput()), exit: null,
+      laneId: "RC", symbolOrBasketId: "BTCUSDT", laneEligibleIncumbent: true,
+      executionReinforcement: {
+        source: "TIER1_REALIZED", verdict: "NEGATIVE", scope: "EXACT_LANE_REGIME_SYMBOL",
+        canonicalRegimeFamily: "BULLISH", laneId: "RC", symbolOrBasketId: "BTCUSDT", side: "LONG",
+        n: 10, effectiveN: 8, winRate: 0.2, avgNetR: -0.2, adjustment: -0.04,
+      },
+    });
+    expect(exec.candidateStatus).toBe("SKIP");
+    expect(exec.reasons.join(" ")).toContain("advisory skip");
+    expect(exec.advisoryOnly).toBe(true);
+  });
+
   it("market state UNKNOWN does NOT hard-block a candidate that otherwise passes", () => {
     const unknownState = decideMarketState(marketInput({ trend: src(null), volatility: src(null), momentum: src(null) }));
     expect(unknownState.family).toBe("UNKNOWN");

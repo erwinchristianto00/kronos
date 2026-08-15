@@ -157,6 +157,9 @@ describe("Four-Brain shadow-tick journal — Bug 2 fail-without/pass-with", () =
     expect((execRecord.incumbent as Record<string, unknown>).laneAllocations).toEqual([
       { laneId: "REGIME_COMPOSITE_CONFIRMATION_LONG", weightPct: 55 },
     ]);
+    // Exact-fill reinforcement is journaled with the decision so a later close can be audited against
+    // the recommendation that actually saw the cohort, rather than a rebuilt/live value.
+    expect(execRecord.executionReinforcement).toMatchObject({ source: "TIER1_REALIZED" });
   });
 });
 

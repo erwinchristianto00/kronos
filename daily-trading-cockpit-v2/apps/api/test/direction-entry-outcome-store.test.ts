@@ -74,6 +74,20 @@ describe("DIRECTION_ENTRY_MIN_EXAMPLES_ACTIVE reuses CORTEX_ATTR_MIN_EXAMPLES_AC
   });
 });
 
+describe("Direction pending transparency", () => {
+  it("shows the stamped wait time for each horizon before the first outcome resolves", () => {
+    const store = new DirectionEntryOutcomeStore(tmp());
+    const report = buildDirectionEntryOutcomeReport(store.getState(), {
+      directionByHorizon: { SCALP: 0, INTRADAY: 3, SWING: 209 },
+      entry: 0,
+    });
+    expect(report.direction.coverage.note).toContain("SCALP=0 (1 jam)");
+    expect(report.direction.coverage.note).toContain("INTRADAY=3 (4 jam)");
+    expect(report.direction.coverage.note).toContain("SWING=209 (24 jam)");
+    expect(report.direction.coverage.note).toContain("sudah dikunci saat keputusan dibuat");
+  });
+});
+
 describe("DirectionEntryOutcomeStore — idempotent per-decisionId booking", () => {
   it("recordDirectionOutcome is a no-op (returns false, no double count) on a decisionId already booked", () => {
     const store = new DirectionEntryOutcomeStore(tmp());

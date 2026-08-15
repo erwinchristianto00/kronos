@@ -57,4 +57,17 @@ describe("FourBrainMetricsAggregator", () => {
     expect(s.coverage.lastLaneCoverage).toBe(2);
     expect(s.coverage.maxPositionCoverage).toBe(3);
   });
+
+  it("keeps a current heartbeat and exposes a wiring failure instead of hiding it", () => {
+    const agg = new FourBrainMetricsAggregator();
+    agg.record(m(), "ok", 1_000);
+    agg.recordWiringFailure(2_000);
+    const s = agg.summary();
+    expect(s.heartbeat).toMatchObject({
+      lastCompletedAtMs: 1_000,
+      lastFailureAtMs: 2_000,
+      lastFailureReason: "cycle-wiring-exception",
+    });
+    expect(s.ticks.wiringErrors).toBe(1);
+  });
 });

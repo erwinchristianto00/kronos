@@ -2323,6 +2323,45 @@ i.health-diagnostic {
   line-height: 1.55;
 }
 
+/* Cross-sectional cards have dense inline financial values. Do not inherit the
+   dashboard's title-only span/strong layout inside their report body. */
+.cross-sectional-report span,
+.cross-sectional-report strong {
+  display: inline;
+  margin-top: 0;
+  color: inherit;
+  font: inherit;
+  text-transform: none;
+}
+
+.cross-sectional-report > header > div > span,
+.cross-sectional-report > header > span {
+  display: block;
+  color: #70858f;
+  font: 600 10px/1.3 "IBM Plex Mono", "Cascadia Code", monospace;
+  text-transform: uppercase;
+}
+
+.cross-sectional-report > header > div > strong {
+  display: block;
+  margin-top: 6px;
+  color: #e6f4ee;
+  font-size: 16px;
+}
+
+.cross-open-basket-table th,
+.cross-open-basket-table td {
+  padding: 8px 10px;
+  white-space: nowrap;
+  vertical-align: middle;
+}
+
+.cross-open-basket-table th {
+  color: #70858f;
+  font: 700 10px/1.3 "IBM Plex Mono", "Cascadia Code", monospace;
+  text-transform: uppercase;
+}
+
 .testnet-kpis {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));

@@ -237,6 +237,8 @@ function makeExecutor(opts: {
   sharedGetPositions?: () => ReturnType<FakeClient["getPositions"]>;
   tryClaimEntrySymbol?: (symbol: string) => boolean;
   releaseEntrySymbol?: (symbol: string) => void;
+  preventSameSymbolPyramiding?: boolean;
+  useOwnLotPnlAttribution?: boolean;
   timelineEntryGate?: (signal: SingleSymbolFreshSignal, direction: "LONG" | "SHORT") => Promise<{ allowed: boolean; reason: string | null }>;
   reserveExposure?: (req: {
     executorId: string;
@@ -276,6 +278,8 @@ function makeExecutor(opts: {
     ...(opts.sharedGetPositions ? { sharedGetPositions: opts.sharedGetPositions } : {}),
     ...(opts.tryClaimEntrySymbol ? { tryClaimEntrySymbol: opts.tryClaimEntrySymbol } : {}),
     ...(opts.releaseEntrySymbol ? { releaseEntrySymbol: opts.releaseEntrySymbol } : {}),
+    ...(opts.preventSameSymbolPyramiding ? { preventSameSymbolPyramiding: true } : {}),
+    ...(opts.useOwnLotPnlAttribution ? { useOwnLotPnlAttribution: true } : {}),
     ...(opts.timelineEntryGate ? { timelineEntryGate: opts.timelineEntryGate } : {}),
     ...(opts.reserveExposure ? { reserveExposure: opts.reserveExposure } : {}),
     ...(opts.commitExposureReservation ? { commitExposureReservation: opts.commitExposureReservation } : {}),
@@ -568,6 +572,23 @@ describe("makeMfeGivebackExitPolicy (INTRADAY_MOMENTUM_BREAKOUT geometry)", () =
     const d = policy({ direction: "LONG", entryPrice: 100, stopPrice: 90, currentPrice: 100.5, peakFavorableR: 0.1, msHeld: 24 * 3_600_000 });
     expect(d.shouldExit).toBe(true);
     expect(d.reason).toBe("MAX_HOLD_MTM");
+  });
+
+  it("locks a +0.50% estimated-net winner only after it has first run above the lock", () => {
+    const lockPolicy = makeMfeGivebackExitPolicy({
+      armR: 10,
+      givebackFrac: 0.5,
+      maxHoldMs: 24 * 3_600_000,
+      profitLockNetReturn: 0.005,
+      estimatedCloseCostPct: 0.002,
+    });
+    // Risk = 1% of entry.  100.80 = +0.80% gross / +0.60% net: runner stays open.
+    const running = lockPolicy({ direction: "LONG", entryPrice: 100, stopPrice: 99, currentPrice: 100.8, peakFavorableR: 0, msHeld: 0 });
+    expect(running.shouldExit).toBe(false);
+    // It then returns to +0.70% gross / +0.50% net: lock is enforced.
+    const locked = lockPolicy({ direction: "LONG", entryPrice: 100, stopPrice: 99, currentPrice: 100.7, peakFavorableR: running.nextPeakFavorableR, msHeld: 60_000 });
+    expect(locked.shouldExit).toBe(true);
+    expect(locked.reason).toBe("MFE_PROFIT_LOCK");
   });
 });
 
@@ -983,6 +1004,26 @@ describe("SingleSymbolLaneExecutor — entry", () => {
     await executor.tick();
     expect(store.getState().positions.filter((p) => p.status === "OPEN").length).toBe(1);
     expect(store.getState().positions.length).toBe(1); // no 2nd position record created at all
+  });
+
+  it("[DIRECTIONAL NO-PYRAMID] refuses a fresh second observation for a symbol this lane already owns", async () => {
+    const signals: SingleSymbolFreshSignal[] = [signal({ observationId: "sf:BTCUSDT:first", openedAtMs: NOW_MS - 4 * 60_000 })];
+    const { executor, client, store } = makeExecutor({
+      signals,
+      legUsd: 10_000,
+      maxOpenPositions: 3,
+      preventSameSymbolPyramiding: true,
+    });
+
+    await executor.tick();
+    expect(store.getState().positions.filter((p) => p.status === "OPEN")).toHaveLength(1);
+    signals.push(signal({ observationId: "sf:BTCUSDT:second", openedAtMs: NOW_MS - 1 * 60_000 }));
+
+    await executor.tick();
+
+    expect(store.getState().positions.filter((p) => p.status === "OPEN")).toHaveLength(1);
+    expect(client.placed).toHaveLength(1);
+    expect(executor.getStatus().lastEntrySkipReason).toMatch(/same-symbol directional position.*no pyramiding/i);
   });
 
   it("[MAX-OPEN-DIAGNOSTIC, 2026-07-19 fix] sets lastEntrySkipReason (instead of silently leaving it null) when the maxOpenPositions cap blocks a fresh candidate", async () => {
@@ -1792,5 +1833,41 @@ describe("SingleSymbolLaneExecutor — getUserTrades fee window (2026-07-26 fix)
     // ...and therefore exactly the OLD (mis-recording) outcome: the entry row was filtered out.
     expect(closed.entryCommissionUsd).toBeUndefined();
     expect(closed.feeEstimateUsd).toBeCloseTo(0.03, 9);
+  });
+});
+
+describe("SingleSymbolLaneExecutor — own-lot P&L attribution", () => {
+  it("reports a directional lot from its own fills instead of the account-netted exchange realizedPnl", async () => {
+    const client = new FakeClient();
+    client.fillPriceBySymbol.set("BTCUSDT", 60_000);
+    const { executor, store } = makeExecutor({
+      client,
+      signals: [signal()],
+      legUsd: 60_000, // exactly one BTC in this fixture
+      useOwnLotPnlAttribution: true,
+    });
+
+    await executor.tick();
+    const open = store.getState().positions[0]!;
+    client.seedTrade(open.entryOrderId, { price: 60_000, qty: 1, commission: 0.02, realizedPnl: 0 });
+    // The exchange's account-netted realizedPnl is deliberately positive because
+    // a sibling basket had an older, lower-price short. This directional lot was
+    // actually closed higher and therefore lost $100 before its own fees.
+    client.fillPriceBySymbol.set("BTCUSDT", 60_100);
+    client.seedTrade("101", { price: 60_100, qty: 1, commission: 0.03, realizedPnl: 7 });
+
+    const result = await executor.manualClosePosition(open.positionId);
+    const durable = store.getState().positions[0]!;
+    const reported = executor.getClosedPositions()[0]!;
+
+    expect(durable.netPnlUsd).toBeCloseTo(6.95, 9); // raw exchange-account settlement, retained for audit
+    expect(result.netPnlUsd).toBeCloseTo(-100.05, 9);
+    expect(reported.netPnlUsd).toBeCloseTo(-100.05, 9);
+    expect(reported.grossPnlUsd).toBeCloseTo(-100, 9);
+    expect(reported.feeEstimateUsd).toBeCloseTo(0.05, 9);
+    expect(reported.exchangeAccountNetPnlUsd).toBeCloseTo(6.95, 9);
+    expect(reported.pnlAttribution).toBe("OWN_LOT");
+    expect(reported.pnlAttributionComplete).toBe(true);
+    expect(executor.getStatus().totalNetPnlUsd).toBeCloseTo(-100.05, 9);
   });
 });

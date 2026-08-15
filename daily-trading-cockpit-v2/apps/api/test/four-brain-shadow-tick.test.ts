@@ -148,6 +148,21 @@ describe("Four-Brain shadow tick — decisions + journal + determinism", () => {
     }
   });
 
+  it("testnet canonical regime overrides the technical directional bias", () => {
+    const dep = fakeDeps({
+      marketStateAuthority: {
+        source: "TESTNET_EXECUTOR",
+        canonicalRegimeFamily: "MIXED",
+        scannerRegime: "Mixed rotation",
+        capturedAtMs: NOW - MIN,
+      },
+    });
+    const r = runFourBrainShadowTick({ mode: "shadow", nowMs: NOW, gather: gatherFrom(dep), journalAppend: () => {}, tickId: "canonical-authority" });
+    expect(r.ran).toBe(true);
+    expect(r.marketState?.bias).toBe("MIXED");
+    expect(r.marketState?.authority).toMatchObject({ canonicalRegimeFamily: "MIXED", scannerRegime: "Mixed rotation" });
+  });
+
   it("[REGRESSION 2026-07-22] one candidate's decideEntry throwing does NOT abort the whole tick — the market snapshot + the exit candidate's decision still journal, and it's counted (not silently lost)", () => {
     forceEntryBrainThrow = true;
     try {

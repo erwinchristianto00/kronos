@@ -146,6 +146,92 @@ describe("registerLiveRoutes — /api/live/account wires ALL 5 executor instance
   });
 });
 
+describe("[operator close] /api/live/cross-sectional-close stays scoped to one market-neutral basket", () => {
+  const basket = (basketId: string): ExecutorBasket => ({
+    basketId, sourceObservationId: "o1", signal: "MOM24", variant: "FILTERED",
+    openedAt: "2026-07-08T00:00:00.000Z", closesAtMs: 0,
+    legs: [{ symbol: "AUSDT", side: "LONG", qty: 5, entryPrice: 1, entryOrderId: 1, entryPriceConfirmed: true, exitPrice: null, exitOrderId: null, exitPriceConfirmed: null }],
+    status: "COMPLETE", closedAt: null, closeReason: null, grossPnlUsd: null, feeEstimateUsd: null, netPnlUsd: null,
+  });
+
+  it("uses only the market-neutral executor, and only when its exact target is the sole open basket", async () => {
+    const previousEnv = process.env.LIVE_BINANCE_ENV;
+    process.env.LIVE_BINANCE_ENV = "testnet";
+    try {
+      const target = basket("only-core-basket");
+      let targetOpen = true;
+      let closeCalls = 0;
+      let closeReason = "";
+      let directionalGetterCalls = 0;
+      const coreExecutor = {
+        getStatus: () => ({ laneId: "CROSS_SECTIONAL_MARKET_NEUTRAL", openBaskets: targetOpen ? [target] : [] }),
+        closeAllBasketsOrderly: async (reason: string) => {
+          closeCalls += 1;
+          closeReason = reason;
+          targetOpen = false;
+          return { closed: 1, failed: 0 };
+        },
+      } as unknown as CrossSectionalExecutor;
+
+      app = Fastify();
+      await registerLiveRoutes(app, null, {
+        crossSectionalExecutor: () => coreExecutor,
+        crossSectionalDirectionalShortExecutor: () => {
+          directionalGetterCalls += 1;
+          return fakeSingleSymbolExecutor("CROSS_SECTIONAL_DIRECTIONAL_SHORT", "SUSDT");
+        },
+      });
+      await app.ready();
+      const res = await app.inject({
+        method: "POST",
+        url: "/api/live/cross-sectional-close",
+        remoteAddress: "127.0.0.1",
+        payload: { confirm: "CLOSE_ONLY_THIS_CROSS_SECTIONAL_BASKET", basketId: target.basketId },
+      });
+      expect(res.statusCode).toBe(200);
+      expect(res.json()).toMatchObject({ ok: true, basketId: target.basketId, openBasketIds: [] });
+      expect(closeCalls).toBe(1);
+      expect(closeReason).toBe(`OPERATOR_SCOPED_CLOSE:${target.basketId}`);
+      expect(directionalGetterCalls).toBe(0);
+    } finally {
+      if (previousEnv === undefined) delete process.env.LIVE_BINANCE_ENV;
+      else process.env.LIVE_BINANCE_ENV = previousEnv;
+    }
+  });
+
+  it("refuses to turn a one-basket request into a bulk cross-sectional close", async () => {
+    const previousEnv = process.env.LIVE_BINANCE_ENV;
+    process.env.LIVE_BINANCE_ENV = "testnet";
+    try {
+      const target = basket("target-basket");
+      let closeCalls = 0;
+      const coreExecutor = {
+        getStatus: () => ({ laneId: "CROSS_SECTIONAL_MARKET_NEUTRAL", openBaskets: [target, basket("another-basket")] }),
+        closeAllBasketsOrderly: async () => {
+          closeCalls += 1;
+          return { closed: 2, failed: 0 };
+        },
+      } as unknown as CrossSectionalExecutor;
+
+      app = Fastify();
+      await registerLiveRoutes(app, null, { crossSectionalExecutor: () => coreExecutor });
+      await app.ready();
+      const res = await app.inject({
+        method: "POST",
+        url: "/api/live/cross-sectional-close",
+        remoteAddress: "127.0.0.1",
+        payload: { confirm: "CLOSE_ONLY_THIS_CROSS_SECTIONAL_BASKET", basketId: target.basketId },
+      });
+      expect(res.statusCode).toBe(409);
+      expect(res.json()).toMatchObject({ ok: false, basketId: target.basketId, openBasketIds: [target.basketId, "another-basket"] });
+      expect(closeCalls).toBe(0);
+    } finally {
+      if (previousEnv === undefined) delete process.env.LIVE_BINANCE_ENV;
+      else process.env.LIVE_BINANCE_ENV = previousEnv;
+    }
+  });
+});
+
 describe("registerLiveRoutes — /api/live/lane-performance-series wires ALL 5 executor instances", () => {
   it("merges closed-basket/closed-position lanes from all 5 instances into the 'all' regime view", async () => {
     // Give each executor at least one CLOSED basket/position so it contributes a lane row —

@@ -93,10 +93,10 @@ describe("foldDirectionOutcomeRecordsForEdgeMemory — pure fold (diagnostic-exc
       directionRecord(4, { action: "LONG", horizon: "SWING", chosenNetR: 0.3 }),
     ];
     const buckets = foldDirectionOutcomeRecordsForEdgeMemory(records);
-    expect(buckets.get("LONG::INTRADAY")).toMatchObject({ n: 2, sumNetR: 0.1 });
-    expect(buckets.get("SHORT::INTRADAY")).toMatchObject({ n: 1, sumNetR: 0.05 });
-    expect(buckets.get("LONG::SWING")).toMatchObject({ n: 1, sumNetR: 0.3 });
-    expect(buckets.get("SHORT::SWING")).toBeUndefined();
+    expect(buckets.get("UNKNOWN::LONG::INTRADAY")).toMatchObject({ n: 2, sumNetR: 0.1 });
+    expect(buckets.get("UNKNOWN::SHORT::INTRADAY")).toMatchObject({ n: 1, sumNetR: 0.05 });
+    expect(buckets.get("UNKNOWN::LONG::SWING")).toMatchObject({ n: 1, sumNetR: 0.3 });
+    expect(buckets.get("UNKNOWN::SHORT::SWING")).toBeUndefined();
   });
 
   it("excludes EXPIRED_UNRESOLVABLE rows (never a real chosenNetR)", () => {
@@ -105,7 +105,7 @@ describe("foldDirectionOutcomeRecordsForEdgeMemory — pure fold (diagnostic-exc
       directionRecord(2, { action: "LONG", chosenNetR: 0.1 }),
     ];
     const buckets = foldDirectionOutcomeRecordsForEdgeMemory(records);
-    expect(buckets.get("LONG::INTRADAY")).toMatchObject({ n: 1, sumNetR: 0.1 });
+    expect(buckets.get("UNKNOWN::LONG::INTRADAY")).toMatchObject({ n: 1, sumNetR: 0.1 });
   });
 
   it("excludes FLAT rows (chosenNetR is pinned to exactly 0 — not a real directional outcome)", () => {
@@ -115,7 +115,7 @@ describe("foldDirectionOutcomeRecordsForEdgeMemory — pure fold (diagnostic-exc
     ];
     const buckets = foldDirectionOutcomeRecordsForEdgeMemory(records);
     expect(buckets.size).toBe(1);
-    expect(buckets.get("LONG::INTRADAY")).toMatchObject({ n: 1, sumNetR: 0.1 });
+    expect(buckets.get("UNKNOWN::LONG::INTRADAY")).toMatchObject({ n: 1, sumNetR: 0.1 });
   });
 
   it("excludes BOTH rows (chosenNetR is a blended mean, not attributable to either single side)", () => {
@@ -125,7 +125,19 @@ describe("foldDirectionOutcomeRecordsForEdgeMemory — pure fold (diagnostic-exc
     ];
     const buckets = foldDirectionOutcomeRecordsForEdgeMemory(records);
     expect(buckets.size).toBe(1);
-    expect(buckets.get("SHORT::INTRADAY")).toMatchObject({ n: 1, sumNetR: -0.2 });
+    expect(buckets.get("UNKNOWN::SHORT::INTRADAY")).toMatchObject({ n: 1, sumNetR: -0.2 });
+  });
+
+  it("keeps canonical regimes isolated; a legacy UNKNOWN row cannot poison BULLISH/Bearish calibration", () => {
+    const records: DirectionOutcomeRecord[] = [
+      directionRecord(1, { canonicalRegimeFamily: "BULLISH", chosenNetR: -0.2 }),
+      directionRecord(2, { canonicalRegimeFamily: "BEARISH", chosenNetR: 0.2 }),
+      directionRecord(3, { chosenNetR: -0.9 }), // legacy: explicitly UNKNOWN, never guessed
+    ];
+    const buckets = foldDirectionOutcomeRecordsForEdgeMemory(records);
+    expect(buckets.get("BULLISH::LONG::INTRADAY")).toMatchObject({ n: 1, sumNetR: -0.2 });
+    expect(buckets.get("BEARISH::LONG::INTRADAY")).toMatchObject({ n: 1, sumNetR: 0.2 });
+    expect(buckets.get("UNKNOWN::LONG::INTRADAY")).toMatchObject({ n: 1, sumNetR: -0.9 });
   });
 });
 
@@ -222,7 +234,7 @@ describe("getFourBrainEdgeMemory — singleton + rebuild-on-read", () => {
   });
 });
 
-describe("End-to-end wiring: buildFourBrainGatherInput derives fourBrainLongVeto/fourBrainShortVeto from real resolved outcomes", () => {
+describe("End-to-end wiring: BTC-proxy Direction outcomes stay calibration-only", () => {
   const edgeStub = {
     lookup: (_r: string | null, _d: "LONG" | "SHORT") => ({ avgNetR: 0, n: 0 }),
     verdict: () => ({ decision: "ALLOW_PROVEN" }),
@@ -261,7 +273,7 @@ describe("End-to-end wiring: buildFourBrainGatherInput derives fourBrainLongVeto
     }
   });
 
-  it("PASS-WITH: >=MIN_SAMPLES proven-negative LONG outcomes for ONE horizon ⇒ fourBrainLongVeto true ONLY for that horizon", () => {
+  it("does not feed even a proven BTC-proxy loss into candidate direction scores", () => {
     const dir = tmp();
     seed(getDirectionEntryOutcomeStore(dir), MIN_SAMPLES, { action: "LONG", horizon: "INTRADAY", chosenNetR: -0.08 });
     getFourBrainEdgeMemory(dir); // rebuild against the seeded store
@@ -269,9 +281,9 @@ describe("End-to-end wiring: buildFourBrainGatherInput derives fourBrainLongVeto
     const input = buildFourBrainGatherInput(baseDeps());
     const intraday = input.directions.find((d) => d.horizon === "INTRADAY")!;
     const swing = input.directions.find((d) => d.horizon === "SWING")!;
-    expect(intraday.fourBrainLongVeto).toBe(true);
-    expect(intraday.fourBrainShortVeto).toBe(false); // SHORT bucket untouched
-    expect(swing.fourBrainLongVeto).toBe(false); // different horizon ⇒ still insufficient
+    expect(intraday.fourBrainLongVeto).toBe(false);
+    expect(intraday.fourBrainShortVeto).toBe(false);
+    expect(swing.fourBrainLongVeto).toBe(false);
   });
 });
 

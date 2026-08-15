@@ -84,13 +84,14 @@ describe("the trigger is wired to INTRADAY's own sample count", () => {
 /**
  * CORRECTION (2026-07-28). Everything above calls laneHorizon with ROSTER lane ids. Production never
  * does. The ids that actually reach it are variant-matrix ids, observed in the four-brain journal on
- * both instances, and against those the "INTRADAY keeps a population" guarantee is empty: enabling
- * SCALP moved every INTRADAY row to SCALP and left the horizon at zero. The stores agree to the
- * minute — INTRADAY's last decision 07-27 23:48 / 07-28 01:12, SCALP's first 07-28 04:00 on both.
+ * both instances, and against those the "INTRADAY keeps a population" guarantee used to be empty:
+ * enabling SCALP moved every INTRADAY row to SCALP and left the horizon at zero. The focused testnet
+ * cohort now makes CG_MFE_GIVEBACK an explicit INTRADAY exception, leaving a real tactical population
+ * while preserving the staged FAST promotion.
  *
- * These tests pin the TRUTH so the guarantee above is never read as protection again.
+ * These tests pin the repaired policy rather than the old empty-horizon behavior.
  */
-describe("against the ids production actually sends, INTRADAY empties", () => {
+describe("against the ids production actually sends, the focused cohort retains INTRADAY", () => {
   /** Verbatim from the executive-decision journal on research and testnet, most frequent first. */
   const REAL_CANDIDATE_IDS = [
     "CG_WIDE_STOP_TP_WIDE", "CG_TRAIL_AFTER_TP1", "CG_TIGHT_FAST_05", "CG_BE_AFTER_05",
@@ -109,15 +110,16 @@ describe("against the ids production actually sends, INTRADAY empties", () => {
     }
   });
 
-  it("before the promotion, INTRADAY's whole population is the FAST variants", () => {
-    expect(partition(false).INTRADAY).toEqual(["CG_TIGHT_FAST_05", "CG_BASELINE_FAST_05", "CG_MAKER_FAST_05"]);
+  it("before the promotion, INTRADAY contains FAST variants plus explicit MFE Giveback", () => {
+    expect(partition(false).INTRADAY).toEqual([
+      "CG_TIGHT_FAST_05", "CG_MFE_GIVEBACK", "CG_BASELINE_FAST_05", "CG_MAKER_FAST_05",
+    ]);
   });
 
-  /** THE CORRECTION. Not "INTRADAY survives with a smaller population" — it survives with none. */
-  it("after the promotion INTRADAY is EMPTY, and every one of its ids is now SCALP", () => {
+  it("after the promotion MFE Giveback remains INTRADAY while only FAST variants move to SCALP", () => {
     const after = partition(true);
-    expect(after.INTRADAY).toEqual([]);
+    expect(after.INTRADAY).toEqual(["CG_MFE_GIVEBACK"]);
     expect(after.SCALP).toEqual(["CG_TIGHT_FAST_05", "CG_BASELINE_FAST_05", "CG_MAKER_FAST_05"]);
-    expect(after.SWING).toEqual(partition(false).SWING); // SWING is untouched by the switch
+    expect(after.SWING).toEqual(partition(false).SWING); // SWING remains untouched by the switch
   });
 });

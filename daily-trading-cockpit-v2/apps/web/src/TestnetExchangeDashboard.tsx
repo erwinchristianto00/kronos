@@ -3,6 +3,7 @@ import './neural-mindmap.css';
 // 2026-07-23 dashboard consolidation (23 sections -> 7 composites + 2 always-on zones): shared
 // table/accordion primitives also used by the Research dashboard's InnovationLanesCard.
 import { Disclosure, LaneMaturityTable, laneEdgeBadge, type LaneMaturityRow } from './LaneMaturityTable';
+import CrossSectionalReportCard from './CrossSectionalReportCard';
 
 const REFRESH_MS = 5_000;
 const TESTNET_API_PREFIX = '/testnet/api';
@@ -209,6 +210,11 @@ interface LiveStatus {
   };
   consecutiveLosses?: number;
   totalRealizedPnlUsd?: number;
+  /** Realized total with operator-voided closes removed — for DISPLAY only. The raw
+   *  totalRealizedPnlUsd above stays exchange-true and is what the kill-switches read. */
+  totalRealizedPnlUsdExcludingVoids?: number;
+  reportingExcluded?: { count: number; realizedPnlUsd: number; feesUsd: number };
+  reportingExcludedToday?: { count: number; realizedPnlUsd: number; feesUsd: number };
   unifiedOrchestrator?: {
     enabled: boolean;
     mode: 'UNIFIED_TESTNET' | 'DISABLED';
@@ -336,7 +342,10 @@ interface LanePerformanceSeries {
   until: string;
   anchor: string | null;
   regimeFilter: string;
+  /** Closed cross-basket audit P&L before the selected chart period; never blended into its curve. */
+  crossSectionalAuditBeforePeriod?: { closedBaskets: number; totalNetPnlUsd: number; lastClosedAt: string | null } | null;
   regimeOptions: Array<{ value: string; label: string }>;
+  cohort?: { id: string; label: string; rolloutStartAt: string | null } | null;
   bucketStarts: string[];
   lanes: Array<{
     laneId: string;
@@ -454,6 +463,22 @@ function formatWinRate(value: number | null | undefined): string {
   return `${value.toFixed(1)}%`;
 }
 
+function xsecEntryAttemptStageLabel(stage: string): string {
+  const labels: Record<string, string> = {
+    ENTRY_ADMISSION: 'admission',
+    FOUR_BRAIN_BRIDGE: 'Four-Brain bridge',
+    LOSS_REENTRY_GUARD: 'guard re-entry rugi',
+    OVERLAP_GUARD: 'guard overlap',
+    SMART_ENTRY_REVALIDATION: 'cek harga Smart Basket',
+    EXCHANGE_FILTERS: 'filter Binance',
+    SIZING: 'sizing leg',
+    NOTIONAL_CAP: 'batas notional bersama',
+    EXPOSURE_RESERVATION: 'reservasi eksposur',
+    BASKET_RESERVED: 'basket sudah direservasi',
+  };
+  return labels[stage] ?? stage;
+}
+
 function formatBucketLabel(iso: string, view: string): string {
   const date = new Date(iso);
   if (Number.isNaN(date.getTime())) return iso;
@@ -521,6 +546,29 @@ type XsecExecStatus = {
   dailyMaxLossUsd?: number;
   openHalted?: string | null;
   lastError?: string | null;
+  entryAttemptAudit?: {
+    latest?: {
+      at: string;
+      sourceObservationId: string;
+      longSymbols: string[];
+      shortSymbols: string[];
+      stage: string;
+      outcome: 'ADMITTED' | 'DEFERRED' | 'SKIPPED';
+      reason: string | null;
+    } | null;
+    unattributedConsumedSignal?: {
+      sourceObservationId: string;
+      openedAt: string;
+      reason: string;
+    } | null;
+  };
+  formationEvaluation?: {
+    activationClosedBaskets: number;
+    closedBaskets: number;
+    status: 'COLLECTING' | 'EVALUATING';
+    autoSwitch: false;
+    metrics: Array<{ model: string; samples: number; meanNetReturnPct: number | null; winRatePct: number | null; worstNetReturnPct: number | null }>;
+  };
   openBaskets?: Array<{
     basketId: string;
     openedAt: string;
@@ -539,8 +587,18 @@ type SingleSymbolLanePosition = {
   qty: number;
   entryPrice: number;
   stopPrice: number;
+  targetPrice: number | null;
+  targetTpGapPct: number | null;
+  targetMode: 'FIXED' | 'MFE_PROFIT_LOCK' | 'DYNAMIC';
+  mfeProfitLockPrice: number | null;
+  mfeProfitLockGapPct: number | null;
+  mfeProfitLockNetReturn: number | null;
+  staticTpMaxNetReturn: number | null;
   markPrice: number | null;
   unrealizedPnl: number | null;
+  leverage: number | null;
+  estimatedCloseCostUsd: number | null;
+  unrealizedAfterEstimatedCloseCostUsd: number | null;
   peakFavorableR: number;
   openedAt: string;
 };
@@ -1076,6 +1134,12 @@ type PsleReport = {
 
 export default function TestnetExchangeDashboard() {
   const isLivePage = window.location.pathname.startsWith('/live');
+  // Temporary testnet presentation guard. These panels remain available on the live page and
+  // do not alter any scanner, execution, or risk-control behaviour.
+  const showTestnetEngineControls = false;
+  const showTestnetRegimeDirection = false;
+  const showTestnetSingleSymbolTimeline = false;
+  const showTestnetLaneResearch = false;
   const pageApiPrefix = isLivePage ? LIVE_API_PREFIX : TESTNET_API_PREFIX;
   const pageName = isLivePage ? 'LIVE' : 'Testnet';
   const pageSubtitle = isLivePage ? 'Binance mainnet mirror' : 'Binance testnet mirror';
@@ -1085,6 +1149,7 @@ export default function TestnetExchangeDashboard() {
   const [account, setAccount] = useState<LiveAccount | null>(null);
   const [status, setStatus] = useState<LiveStatus | null>(null);
   const [laneSeries, setLaneSeries] = useState<LanePerformanceSeries | null>(null);
+  const [mfeRolloutSeries, setMfeRolloutSeries] = useState<LanePerformanceSeries | null>(null);
   // Guards against the view-filter effect and the 5s auto-refresh timer racing: only the result
   // of the MOST RECENTLY STARTED loadExchangeOnly() call is ever applied, so a slower older
   // request can't resolve after a newer one and overwrite fresher wallet/position/P&L state.
@@ -1385,15 +1450,21 @@ export default function TestnetExchangeDashboard() {
         regime: performanceRegime,
       });
       if (anchor) seriesParams.set('anchor', anchor);
-      const [nextStatus, nextAccount, nextLaneSeries] = await Promise.all([
+      const mfeRolloutParams = new URLSearchParams(seriesParams);
+      mfeRolloutParams.set('cohort', 'testnet_mfe_giveback_xrp_wld');
+      const [nextStatus, nextAccount, nextLaneSeries, nextMfeRolloutSeries] = await Promise.all([
         fetchJson<LiveStatus>(`${pageApiPrefix}/live/status`),
         fetchJson<LiveAccount>(`${pageApiPrefix}/live/account`),
         fetchJson<LanePerformanceSeries>(`${pageApiPrefix}/live/lane-performance-series?${seriesParams.toString()}`),
+        !isLivePage
+          ? fetchJson<LanePerformanceSeries>(`${pageApiPrefix}/live/lane-performance-series?${mfeRolloutParams.toString()}`)
+          : Promise.resolve(null),
       ]);
       if (seq !== exchangeLoadSeqRef.current) return; // a newer call already superseded this one
       setStatus(nextStatus);
       setAccount(nextAccount);
       setLaneSeries(nextLaneSeries);
+      setMfeRolloutSeries(nextMfeRolloutSeries);
       setError(null);
       setLastLoadedAt(new Date().toISOString());
     } catch (nextError) {
@@ -1788,7 +1859,23 @@ export default function TestnetExchangeDashboard() {
   const healthTone = status?.armed ? 'tone-healthy' : status?.health?.lastTickError ? 'tone-warning' : 'tone-measure';
   const totalSourceEntries = account?.positions.reduce((sum, position) => sum + position.sourceOrderCount, 0) ?? 0;
   const regimeOptions = laneSeries?.regimeOptions ?? FALLBACK_REGIME_OPTIONS;
-  const chartTotal = laneSeries?.lanes.reduce((sum, lane) => sum + lane.realizedPnlUsd, 0) ?? 0;
+  // Testnet is currently scoped to cross-sectional work plus the explicitly approved
+  // XRP/WLD CG_MFE_GIVEBACK rollout. Keep the live page's full history, while the testnet
+  // performance timeline shows the cross-sectional variants and this one approved CG lane.
+  const isTestnetTimelineLane = (laneId: string) => laneId.startsWith('CROSS_SECTIONAL_');
+  const timelineSeries = !isLivePage && laneSeries
+    ? {
+      ...laneSeries,
+      lanes: [
+        ...laneSeries.lanes.filter((lane) => isTestnetTimelineLane(lane.laneId)),
+        ...(mfeRolloutSeries?.lanes ?? []).map((lane) => ({
+          ...lane,
+          laneId: mfeRolloutSeries?.cohort?.label ?? 'CG_MFE_GIVEBACK — XRP/WLD rollout',
+        })),
+      ],
+    }
+    : laneSeries;
+  const chartTotal = timelineSeries?.lanes.reduce((sum, lane) => sum + lane.realizedPnlUsd, 0) ?? 0;
   // 2026-07-09: was CROSS_SECTIONAL_MARKET_NEUTRAL-only — missed the TREND/MIXED instances wired
   // 2026-07-08, so their basket legs fell through to the directional/foundation split as if they
   // were plain directional intents instead of hedge-managed cross-sectional legs.
@@ -1800,6 +1887,12 @@ export default function TestnetExchangeDashboard() {
   // rendered as an untouchable, timed basket leg — when they're actually a single real position with
   // its own exchange-side stop, no sibling leg, and no "naked directional bet" risk from closing it.
   const isSingleSymbolExecutorPosition = (laneIds: string[]) =>
+    // Directional cross-sectional uses SingleSymbolLaneExecutor too. It has an
+    // owned stop and can be closed independently, so it must never also be
+    // rendered as an auto-exit-only basket merely because its account mirror
+    // carries basketQty/basketUnrealizedPnl compatibility fields.
+    laneIds.includes('CROSS_SECTIONAL_DIRECTIONAL_LONG') ||
+    laneIds.includes('CROSS_SECTIONAL_DIRECTIONAL_SHORT') ||
     laneIds.includes('SHORT_FADE_EXHAUSTION_CROWDED') ||
     laneIds.includes('INTRADAY_MOMENTUM_BREAKOUT_LONG') ||
     laneIds.includes('REGIME_COMPOSITE_CONFIRMATION_LONG') ||
@@ -1903,6 +1996,10 @@ export default function TestnetExchangeDashboard() {
           <span>Execution</span>
           <strong className={healthTone}>{status?.armed ? 'Armed' : 'Disarmed'}</strong>
           <small>{status?.env ?? 'loading'} · {status?.enabled === false ? 'disabled' : 'live engine'}</small>
+          <div style={{ display: 'flex', gap: 6, marginTop: 6 }}>
+            <button type="button" disabled={controlBusy || status?.armed === true} onClick={armCurrent}>Arm</button>
+            <button type="button" disabled={controlBusy || status?.armed !== true} onClick={() => void disarmCurrent()}>Disarm</button>
+          </div>
         </div>
         <div>
           <span>Regime</span>
@@ -1965,9 +2062,11 @@ export default function TestnetExchangeDashboard() {
             const basketsAllTime = ['CROSS_SECTIONAL_MARKET_NEUTRAL', 'CROSS_SECTIONAL_TREND', 'CROSS_SECTIONAL_MIXED']
               .reduce((sum, laneId) => sum + (account?.closedLanes?.find((l) => l.laneId === laneId)?.realizedPnlUsd ?? 0), 0);
             const singleSymbolAllTime = account?.singleSymbolExecutorRealizedPnlUsd?.allTime;
-            const mirrorAllTime = status?.totalRealizedPnlUsd;
+            const mirrorAllTime = status?.totalRealizedPnlUsdExcludingVoids ?? status?.totalRealizedPnlUsd;
             const allTime = mirrorAllTime != null ? mirrorAllTime + basketsAllTime + (singleSymbolAllTime ?? 0) : undefined;
-            const mirrorToday = status?.closedToday?.realizedPnlUsd;
+            const rawMirrorToday = status?.closedToday?.realizedPnlUsd;
+            const voidedToday = status?.reportingExcludedToday?.realizedPnlUsd ?? 0;
+            const mirrorToday = rawMirrorToday != null ? rawMirrorToday - voidedToday : undefined;
             // 2026-07-11: was FILTERED-only (xsecExec?.dailyRealizedUsd) — TREND/MIXED's own daily
             // realized P&L never moved this "today" figure even though basketsAllTime above already
             // correctly folds all 3 in via account.closedLanes.
@@ -1980,7 +2079,17 @@ export default function TestnetExchangeDashboard() {
             return (
               <>
                 <strong className={tone(today)}>{signed(today)}</strong>
-                <small>mirror {signed(mirrorToday)} · baskets {signed(basketsToday)} · single-symbol {signed(singleSymbolToday)} · all-time {signed(allTime)}</small>
+                <small>
+                  today — mirror {signed(mirrorToday)} · baskets {signed(basketsToday)} · single-symbol {signed(singleSymbolToday)}
+                  <br />
+                  all-time — total {signed(allTime)} · mirror {signed(mirrorAllTime)} · baskets {signed(basketsAllTime)} · single-symbol {signed(singleSymbolAllTime)}
+                  {(status?.reportingExcluded?.count ?? 0) > 0 && (
+                    <>
+                      <br />
+                      operator void — {status?.reportingExcluded?.count} close dikecualikan dari tampilan ({signed(status?.reportingExcluded?.realizedPnlUsd)}); kill-switch tetap memakai angka penuh {signed(status?.totalRealizedPnlUsd)}
+                    </>
+                  )}
+                </small>
               </>
             );
           })()}
@@ -2061,6 +2170,7 @@ export default function TestnetExchangeDashboard() {
         {pageScope} — reads only `{pageApiPrefix}/live/status` and `{pageApiPrefix}/live/account`; Binance positions are netted per symbol (one exchange position can carry multiple mirrored source entries).
       </p>
 
+      {(isLivePage || showTestnetEngineControls) && (
       <section className="testnet-panel">
         <header>
           <span>Engine Controls</span>
@@ -2074,11 +2184,6 @@ export default function TestnetExchangeDashboard() {
           </p>
         )}
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 16, alignItems: 'flex-end' }}>
-          <div>
-            <small style={{ display: 'block', marginBottom: 4 }}>{pageName} engine{isLivePage ? ' (real money)' : ''}</small>
-            <button type="button" disabled={controlBusy || status?.armed === true} onClick={armCurrent}>Arm</button>{' '}
-            <button type="button" disabled={controlBusy || status?.armed !== true} onClick={() => void disarmCurrent()}>Disarm</button>
-          </div>
           <div>
             <small style={{ display: 'block', marginBottom: 4 }}>
               New entries <strong className={status?.newEntries?.allowed ? 'tone-healthy' : 'tone-critical'}>
@@ -2186,6 +2291,9 @@ export default function TestnetExchangeDashboard() {
           </div>}
         </div>
       </section>
+      )}
+
+      {!isLivePage && <CrossSectionalReportCard apiPrefix={TESTNET_API_PREFIX} />}
 
       <main className="testnet-grid">
         {/* ===== Composite 3: Open Positions (2026-07-23 dashboard consolidation) =====
@@ -2213,9 +2321,38 @@ export default function TestnetExchangeDashboard() {
           {xsecInstances.map(({ label, status: xs }) => xs?.openHalted && (
             <p key={`halt-${label}`} className="tone-warning" style={{ margin: '4px 0', fontSize: 12 }}>⛔ [{label}] {xs.openHalted}</p>
           ))}
+          {xsecInstances.map(({ label, status: xs }) => {
+            const latest = xs?.entryAttemptAudit?.latest ?? null;
+            const legacy = xs?.entryAttemptAudit?.unattributedConsumedSignal ?? null;
+            if (latest?.outcome === 'ADMITTED' || (!latest && !legacy)) return null;
+            if (latest) {
+              const outcome = latest.outcome === 'DEFERRED' ? 'ditunda' : 'dilewati';
+              return (
+                <p key={`attempt-${label}`} className="tone-warning" style={{ margin: '4px 0', fontSize: 12 }}>
+                  ⚠ [{label}] Kandidat basket terakhir {outcome} {timeAgo(latest.at)} — {xsecEntryAttemptStageLabel(latest.stage)}:
+                  {' '}{latest.reason ?? 'tanpa alasan tercatat'}.
+                  {' '}Long: {latest.longSymbols.join(', ') || '—'} · Short: {latest.shortSymbols.join(', ') || '—'}.
+                  {latest.outcome === 'SKIPPED' ? ' Menunggu scan baru.' : ' Akan diperiksa lagi pada tick berikutnya.'}
+                </p>
+              );
+            }
+            return (
+              <p key={`attempt-legacy-${label}`} className="tone-warning" style={{ margin: '4px 0', fontSize: 12 }}>
+                ℹ [{label}] Sinyal terakhir sudah dikonsumsi {timeAgo(legacy!.openedAt)}, tetapi itu terjadi sebelum audit entry dipasang.
+                {' '}{legacy!.reason}
+              </p>
+            );
+          })}
           {xsecInstances.map(({ label, status: xs }) => xs?.lastError && (
             <p key={`err-${label}`} className="tone-critical" style={{ margin: '4px 0', fontSize: 12 }}>executor error [{label}]: {xs.lastError}</p>
           ))}
+          {xsecExec?.formationEvaluation && (
+            <p style={{ margin: '4px 0', fontSize: 12 }} className={xsecExec.formationEvaluation.status === 'EVALUATING' ? 'tone-healthy' : 'tone-muted'}>
+              Evaluasi pembentukan FILTERED: {xsecExec.formationEvaluation.closedBaskets}/{xsecExec.formationEvaluation.activationClosedBaskets} closed
+              {' · '}{xsecExec.formationEvaluation.status === 'EVALUATING' ? 'aktif (report-only, tidak auto-ganti)' : 'mengumpulkan cohort'}
+              {xsecExec.formationEvaluation.status === 'EVALUATING' && ` · ${xsecExec.formationEvaluation.metrics.map((m) => `${m.model}: ${m.meanNetReturnPct == null ? '—' : `${m.meanNetReturnPct.toFixed(3)}%`} net`).join(' | ')}`}
+            </p>
+          )}
           {xsecInstances.map(({ label, staleSince }) => staleSince && (
             <p key={`stale-${label}`} className="tone-warning" style={{ margin: '4px 0', fontSize: 12 }}>
               ⚠ [{label}] fetch gagal sejak {timeAgo(staleSince)} — data di bawah bisa basi.
@@ -2398,6 +2535,8 @@ export default function TestnetExchangeDashboard() {
                       const dirSign = p.direction === 'LONG' ? 1 : -1;
                       const currentR = p.markPrice != null && risk > 0 ? ((p.markPrice - p.entryPrice) / risk) * dirSign : null;
                       const busyKey = `ssle:${p.positionId}`;
+                      const hasFixedTarget = p.targetPrice != null && p.targetPrice > 0;
+                      const hasMfeProfitLock = p.targetMode === 'MFE_PROFIT_LOCK' && p.mfeProfitLockPrice != null;
                       return (
                         <tr key={`single-${p.positionId}`}>
                           <td>Single-symbol</td>
@@ -2406,15 +2545,24 @@ export default function TestnetExchangeDashboard() {
                           <td>{p.qty}</td>
                           <td>{price(p.entryPrice)}</td>
                           <td>{price(p.markPrice)}</td>
-                          <td>—</td>
-                          <td>—</td>
+                          <td>{hasFixedTarget ? price(p.targetPrice) : hasMfeProfitLock ? <>
+                            <strong>MFE lock {percent((p.mfeProfitLockNetReturn ?? 0) * 100)}</strong>
+                            <small style={{ display: 'block' }}>guide {price(p.mfeProfitLockPrice)} · static cap {percent((p.staticTpMaxNetReturn ?? 0) * 100)}</small>
+                          </> : 'dynamic exit'}</td>
+                          <td className={tone(hasFixedTarget ? p.targetTpGapPct : p.mfeProfitLockGapPct)}>{hasFixedTarget
+                            ? percent(p.targetTpGapPct)
+                            : hasMfeProfitLock
+                              ? `${percent(p.mfeProfitLockGapPct)} to lock`
+                              : 'dynamic exit'}</td>
                           <td>—</td>
                           <td>{price(p.stopPrice)}</td>
                           <td className={tone(currentR ?? 0)}>{currentR == null ? '—' : `${currentR.toFixed(2)}R`} / {p.peakFavorableR.toFixed(2)}R</td>
                           <td>—</td>
                           <td className={tone(p.unrealizedPnl ?? 0)}>{p.unrealizedPnl == null ? '—' : signed(p.unrealizedPnl)}</td>
-                          <td>—</td>
-                          <td>—</td>
+                          <td className={tone(p.unrealizedAfterEstimatedCloseCostUsd)}>
+                            {p.unrealizedAfterEstimatedCloseCostUsd == null ? 'exchange position not bound' : signed(p.unrealizedAfterEstimatedCloseCostUsd)}
+                          </td>
+                          <td>{p.leverage == null ? 'exchange position not bound' : `${p.leverage}x`}</td>
                           <td>—</td>
                           <td>{compactLane(p.laneId)}</td>
                           <td>{new Date(p.openedAt).toLocaleString()}</td>
@@ -2443,6 +2591,7 @@ export default function TestnetExchangeDashboard() {
            current score/Entry Decision, expanded-summary by default (the preset buttons write real
            lane allocation, so they stay zero-click) — full per-feature vote table + full 1/3/6h
            forecast chart behind one Disclosure. */}
+        {(isLivePage || showTestnetRegimeDirection) && (
         <section className="testnet-panel testnet-wide-panel">
           <header>
             <span>Regime &amp; Direction</span>
@@ -2615,10 +2764,12 @@ export default function TestnetExchangeDashboard() {
             <RegimeAxisChart data={regimeAxis} mode="chart" />
           </Disclosure>
         </section>
+        )}
 
         {/* ===== Composite 5: Single-symbol execution timeline ===== unchanged component, just
            relocated; the Keputusan-trade line + entry/exit reason stay outside the per-symbol
            chart Disclosure (see SingleSymbolPriceTimelineChart above). */}
+        {(isLivePage || showTestnetSingleSymbolTimeline) && (
         <section className="testnet-panel testnet-wide-panel">
           <header>
             <span>BTC / ETH / SOL Execution Timeline</span>
@@ -2638,10 +2789,12 @@ export default function TestnetExchangeDashboard() {
           )}
           <SingleSymbolPriceTimelineChart data={singleSymbolTimeline} positions={account?.positions} />
         </section>
+        )}
 
         {/* ===== Composite 6: Lane Research & Edge Status ===== lane-evaluation + book-proven
            symbols expanded by default (both real-money-relevant); the 3 Tier-1-3 R&D shadow lanes
            (none wired to execution) behind a Disclosure, rendered via the shared LaneMaturityTable. */}
+        {(isLivePage || showTestnetLaneResearch) && (
         <section className="testnet-panel testnet-wide-panel">
           <header><span>Lane Research &amp; Edge Status</span><strong>{laneEvaluation.length} lane · {rndLanes.filter(Boolean).length}/3 R&amp;D</strong></header>
 
@@ -2731,6 +2884,7 @@ export default function TestnetExchangeDashboard() {
             <LaneMaturityTable rows={rndLaneRows} />
           </Disclosure>
         </section>
+        )}
 
         {/* ===== Composite 7: Lane Performance Timeline ===== merges LanePerformanceChart with the
            old closed-lane-performance table; ported that table's one non-duplicate field
@@ -2782,16 +2936,21 @@ export default function TestnetExchangeDashboard() {
               </label>
             </div>
           </header>
-          <LanePerformanceChart series={laneSeries} />
+          {!isLivePage && timelineSeries?.crossSectionalAuditBeforePeriod && (
+            <p className="tone-measure" style={{ margin: '7px 0 0', fontSize: 12 }}>
+              Histori cross-basket sebelum periode ini: {timelineSeries.crossSectionalAuditBeforePeriod.closedBaskets} closed basket · {signed(timelineSeries.crossSectionalAuditBeforePeriod.totalNetPnlUsd)} · terakhir {timeAgo(timelineSeries.crossSectionalAuditBeforePeriod.lastClosedAt)}. Tidak dicampur ke kurva {timelineSeries.periodLabel}; pilih tanggal close-nya untuk melihat titik chart.
+            </p>
+          )}
+          <LanePerformanceChart series={timelineSeries} />
           <div className="testnet-table-wrap testnet-performance-table">
             <table>
               <thead>
                 <tr><th>Lane</th><th>Closed</th><th>W / L</th><th>WR</th><th>Realized</th><th>Fees</th><th>Regime mix</th><th>Symbols</th><th>Last close</th></tr>
               </thead>
               <tbody>
-                {(laneSeries?.lanes ?? []).length === 0 ? (
+                {(timelineSeries?.lanes ?? []).length === 0 ? (
                   <tr><td colSpan={9}>No closed lane performance in this period/regime filter.</td></tr>
-                ) : laneSeries!.lanes.map((lane) => (
+                ) : timelineSeries!.lanes.map((lane) => (
                   <tr key={lane.laneId}>
                     <td>{compactLane(lane.laneId)}</td>
                     <td>{lane.closedCount}</td>

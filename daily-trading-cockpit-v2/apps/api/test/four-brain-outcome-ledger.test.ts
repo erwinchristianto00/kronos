@@ -427,6 +427,20 @@ describe("extractPendingDirectionRow / extractPendingEntryRow", () => {
     });
   });
 
+  it("captures canonical regime and snapshot lineage from the same executive record, never from a later tick", () => {
+    const rec = executiveRecord({ decisionId: "exec-lineage", asOfMs: 1000, laneId: "CROSS_SECTIONAL_DIRECTIONAL_LONG", symbolOrBasketId: "ETHUSDT" });
+    (rec.brains as Record<string, unknown>).marketState = {
+      authority: { canonicalRegimeFamily: "BULLISH", scannerRegime: "BULLISH_EXPANSION" },
+    };
+    rec.marketContext = { marketContextSnapshotId: "snapshot-at-decision" };
+    expect(extractPendingDirectionRow(rec)).toMatchObject({
+      canonicalRegimeFamily: "BULLISH", scannerRegime: "BULLISH_EXPANSION", marketContextSnapshotId: "snapshot-at-decision",
+    });
+    expect(extractPendingEntryRow(rec)).toMatchObject({
+      canonicalRegimeFamily: "BULLISH", scannerRegime: "BULLISH_EXPANSION", marketContextSnapshotId: "snapshot-at-decision",
+    });
+  });
+
   it("preserves an optional top-level signalId for exact causal matching", () => {
     const rec = {
       ...executiveRecord({

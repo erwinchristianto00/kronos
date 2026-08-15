@@ -36,6 +36,8 @@ import {
   type LiveIntent,
   type LivePrivateClient,
   type PaperStoreReader,
+  isLiveIntentReportingExcluded,
+  sumLiveIntentReportingExclusions,
 } from "../src/lib/live-execution-engine.js";
 import {
   SingleSymbolLaneExecutor,
@@ -6256,5 +6258,52 @@ describe("LiveIntent.confirmedEntryFills (exact confirmed-fill identity)", () =>
     expect(closed.confirmedEntryFills).toHaveLength(1);
     expect(closed.confirmedEntryFills![0]!.orderId).toBe(originalEntryOrderId);
     expect(closed.confirmedEntryFills!.some((f) => f.orderId === pyramidAddOrderId)).toBe(false);
+  });
+});
+
+describe("live-execution-engine — operator reporting void (2026-08-15)", () => {
+  const voided = (realized: number, fees: number) => ({
+    reportingExclusion: { kind: "OPERATOR_VOID" as const, voidedAt: "2026-08-15T04:40:00.000Z",
+      reason: "config change forced the exit", excludedRealizedPnlUsd: realized, excludedFeesUsd: fees },
+  });
+
+  it("[VOID-FLAG] only an explicit OPERATOR_VOID excludes an intent", () => {
+    expect(isLiveIntentReportingExcluded(voided(-4.21, 0.48))).toBe(true);
+    expect(isLiveIntentReportingExcluded({})).toBe(false);
+    expect(isLiveIntentReportingExcluded({ reportingExclusion: null })).toBe(false);
+  });
+
+  it("[VOID-SUM] sums only voided intents, and reports the amount rather than hiding it", () => {
+    const out = sumLiveIntentReportingExclusions([
+      voided(-4.21, 0.48), {}, voided(-1.0, 0.1), { reportingExclusion: null },
+    ]);
+    expect(out.count).toBe(2);
+    expect(out.realizedPnlUsd).toBeCloseTo(-5.21, 9);
+    expect(out.feesUsd).toBeCloseTo(0.58, 9);
+  });
+
+  it("[VOID-OTHER-KIND] an exclusion of some OTHER kind must NOT be treated as an operator void", () => {
+    // guards the `kind` check itself: without it, any future exclusion kind (e.g. an accounting
+    // marker) would silently start subtracting itself from the reported totals.
+    const other: any = { reportingExclusion: { kind: "ACCOUNTING_INCOMPLETE",
+      voidedAt: "x", reason: "y", excludedRealizedPnlUsd: -99, excludedFeesUsd: 9 } };
+    expect(isLiveIntentReportingExcluded(other)).toBe(false);
+    expect(sumLiveIntentReportingExclusions([other])).toEqual({ count: 0, realizedPnlUsd: 0, feesUsd: 0 });
+  });
+
+  it("[VOID-EMPTY] nothing voided yields a clean zero, never NaN", () => {
+    const out = sumLiveIntentReportingExclusions([{}, { reportingExclusion: null }]);
+    expect(out).toEqual({ count: 0, realizedPnlUsd: 0, feesUsd: 0 });
+  });
+
+  it("[VOID-GARBAGE] an unusable amount is counted but never poisons the total with NaN", () => {
+    const out = sumLiveIntentReportingExclusions([
+      { reportingExclusion: { kind: "OPERATOR_VOID" as const, voidedAt: "x", reason: "y",
+        excludedRealizedPnlUsd: Number.NaN, excludedFeesUsd: Number.NaN } },
+      voided(-2, 0.2),
+    ]);
+    expect(out.count).toBe(2);
+    expect(out.realizedPnlUsd).toBeCloseTo(-2, 9);
+    expect(Number.isNaN(out.feesUsd)).toBe(false);
   });
 });

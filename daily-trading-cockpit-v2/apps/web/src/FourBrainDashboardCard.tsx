@@ -1,7 +1,7 @@
 import { useState } from 'react';
-import { useShadowReport } from './InnovationLanesCard';
+import { useShadowReport, type ExitBrainReport } from './InnovationLanesCard';
 import { Disclosure } from './LaneMaturityTable';
-import { ReadinessVerdict, type FourBrainReadinessBlock } from './ReadinessVerdict';
+import { ReadinessVerdict, readinessColor, readinessLabel, type FourBrainReadinessBlock } from './ReadinessVerdict';
 
 /** Module-level constant: a fresh object literal here would be a new effect dependency every render. */
 const DIRECTION_TESTNET_ONLY = { testnetOnly: true } as const;
@@ -41,6 +41,12 @@ type FourBrainHealth = {
   };
 };
 
+type MarketStateAuthorityView = {
+  source: 'TESTNET_EXECUTOR';
+  canonicalRegimeFamily: 'BULLISH' | 'BEARISH' | 'MIXED' | 'UNKNOWN';
+  scannerRegime: string | null;
+  capturedAtMs: number | null;
+};
 type MarketStateBrainView = {
   family: string;
   bias: string;
@@ -48,6 +54,8 @@ type MarketStateBrainView = {
   liquidity: string;
   confidence: number;
   transitionRisk: number;
+  sourceStatuses?: Record<string, string>;
+  authority?: MarketStateAuthorityView | null;
 } | null;
 type DirectionBrainView = { action: string; confidence: number; horizon: string; expectedDirectionalR: number | null } | null;
 type EntryBrainView = { action: string; confidence: number; expectedNetR: number | null } | null;
@@ -72,7 +80,21 @@ type FourBrainReport = {
   enabled: boolean;
   health: FourBrainHealth;
   recentDecisions: RecentRecord[];
+  bridge?: { active?: boolean; mode?: string; evaluations?: number; blocked?: number } | null;
+  actualFillBindings?: {
+    candidates: number; open: number; measured: number; unmeasured: number; unbound: number;
+    entryAdmission?: { observed: number; enterNow: number; validEnterNow: number; exactCandidatesRecorded: number };
+    preEntryAdmission?: { observed: number; enterNow: number; validEnterNow: number; exactCandidatesRecorded: number };
+  } | null;
 };
+
+function marketStateLabel(state: MarketStateBrainView): string {
+  if (!state) return '—';
+  if (state.authority?.source === 'TESTNET_EXECUTOR') {
+    return `Canonical ${state.authority.canonicalRegimeFamily} · Scanner ${state.authority.scannerRegime ?? '—'}`;
+  }
+  return `${state.family}/${state.bias}`;
+}
 
 // Direction + Entry Brain counterfactual outcome report (2026-07-23) — GET /api/shadow/direction-entry-outcomes.
 // Mirrors direction-entry-outcome-store.ts's DirectionEntryOutcomeReport shape (only the fields this card
@@ -167,8 +189,18 @@ function SourceBadge({ source, unreachable }: { source: 'testnet' | 'local' | nu
   );
 }
 
+const ACTIVE_TESTNET_LANE_PREFIXES = [
+  'CROSS_SECTIONAL_MARKET_NEUTRAL',
+  'CROSS_SECTIONAL_DIRECTIONAL_',
+] as const;
+
 const isExecutiveDecision = (r: RecentRecord): r is ExecutiveDecisionRecord => r.kind === 'EXECUTIVE_DECISION';
 const isMarketSnapshot = (r: RecentRecord): r is MarketSnapshotRecord => r.kind === 'MARKET_SNAPSHOT';
+const isFocusedTestnetLane = (laneId: string | null) =>
+  laneId != null && (
+    ACTIVE_TESTNET_LANE_PREFIXES.some((prefix) => laneId.startsWith(prefix)) ||
+    laneId.includes('CG_MFE_GIVEBACK')
+  );
 
 const C = { card: '#14222a', sub: '#0f1c23', border: '#20313a', text: '#dbe7ec', dim: '#7d97a3', good: '#46d39a', bad: '#ff6b6b', measure: '#6fb3d6', accent: '#f0b54b', track: '#1c2c34' };
 
@@ -194,12 +226,107 @@ function StatRow({ label, value, color, title }: { label: string; value: string;
   );
 }
 
+type BrainReadinessProgress = {
+  pct: number;
+  label: string;
+  detail: string;
+  color: string;
+  evidence: number;
+  target: number;
+};
+
+const clampPct = (value: number) => Math.round(Math.min(100, Math.max(0, value)));
+
+function measuredReadinessProgress(block: FourBrainReadinessBlock | null | undefined): BrainReadinessProgress {
+  if (!block) return { pct: 0, label: 'MENUNGGU DATA', detail: 'Belum ada verdict readiness dari testnet.', color: C.dim, evidence: 0, target: 0 };
+  const realScopes = block.perScope.filter((scope) => scope.measuredBasis !== 'SIMULATED');
+  const scopes = realScopes.length > 0 ? realScopes : block.perScope;
+  const evidenceGates = scopes
+    .map((scope) => scope.gates.find((gate) => gate.gate === 'EVIDENCE'))
+    .filter((gate): gate is NonNullable<typeof gate> => gate != null);
+  const evidence = evidenceGates.reduce((sum, gate) => sum + (typeof gate.value === 'number' ? gate.value : 0), 0);
+  const target = evidenceGates.reduce((sum, gate) => {
+    const match = /need\s*[≥>=]+\s*(\d+)/i.exec(gate.detail);
+    return sum + (match ? Number(match[1]) : 20);
+  }, 0);
+  const evidencePct = target > 0 ? clampPct((evidence / target) * 100) : 0;
+  const failed = scopes.flatMap((scope) => scope.gates.filter((gate) => gate.passed === false).map((gate) => gate.gate));
+  if (block.verdict === 'READY') return { pct: 100, label: readinessLabel(block.verdict), detail: `Semua gate lolos pada ${evidence}/${target} bukti nyata.`, color: readinessColor(block.verdict), evidence, target };
+  if (block.verdict === 'NOT_READY') return { pct: 0, label: readinessLabel(block.verdict), detail: `Bukti ${evidence}/${target} ada, tetapi ${[...new Set(failed)].join(' + ') || 'gate'} gagal.`, color: readinessColor(block.verdict), evidence, target };
+  if (block.verdict === 'NOT_READY_SIMULATED_ONLY') return { pct: 0, label: readinessLabel(block.verdict), detail: 'Simulasi tidak dihitung sebagai izin untuk memengaruhi executor.', color: readinessColor(block.verdict), evidence, target };
+  return { pct: evidencePct, label: readinessLabel(block.verdict), detail: `Bukti nyata ${evidence}/${target} sampel independen.`, color: readinessColor(block.verdict), evidence, target };
+}
+
+function marketStateDataProgress(state: MarketStateBrainView): BrainReadinessProgress {
+  const statuses = Object.values(state?.sourceStatuses ?? {});
+  const fresh = statuses.filter((status) => status === 'FRESH').length;
+  const total = statuses.length;
+  const pct = total > 0 ? clampPct((fresh / total) * 100) : 0;
+  const color = pct >= 80 ? C.good : pct >= 50 ? C.accent : C.bad;
+  return {
+    pct,
+    label: total === 0 ? 'MENUNGGU SNAPSHOT' : pct >= 80 ? 'DATA KUAT' : pct >= 50 ? 'DATA PARSIAL' : 'DATA LEMAH',
+    detail: total === 0 ? 'Belum ada input market-state terbaru.' : `${fresh}/${total} input market-state fresh pada snapshot terakhir.`,
+    color,
+    evidence: fresh,
+    target: total,
+  };
+}
+
+function exactFillEntryProgress(
+  readiness: FourBrainReadinessBlock | null | undefined,
+  bindings: FourBrainReport['actualFillBindings'],
+): BrainReadinessProgress {
+  const base = measuredReadinessProgress(readiness);
+  if (!bindings) return base;
+  const preEntry = bindings.preEntryAdmission ?? bindings.entryAdmission;
+  const target = base.target || 20;
+  const pct = readiness?.verdict === 'READY'
+    ? 100
+    : readiness?.verdict === 'NOT_READY' || readiness?.verdict === 'NOT_READY_SIMULATED_ONLY'
+      ? 0
+      : clampPct((bindings.measured / target) * 100);
+  return {
+    ...base,
+    pct,
+    detail: preEntry && preEntry.observed === 0
+      ? 'Belum ada kandidat baru yang benar-benar sampai ke jalur submit executor sejak cohort exact-fill dimulai.'
+      : `Cohort exact-fill baru: ${bindings.measured}/${target} close lengkap · ${bindings.open} masih open · legacy tidak dihitung.`,
+    evidence: bindings.measured,
+    target,
+  };
+}
+
+function BrainReadinessTile({ name, progress, title }: { name: string; progress: BrainReadinessProgress; title: string }) {
+  return (
+    <div title={title} style={{ minWidth: 0, padding: '10px 11px', borderRadius: 7, background: C.sub, border: `1px solid ${C.border}` }}>
+      <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: 8 }}>
+        <span style={{ fontSize: 11, color: C.dim, textTransform: 'uppercase', letterSpacing: 0.35 }}>{name}</span>
+        <b style={{ fontSize: 18, color: progress.color }}>{progress.pct}%</b>
+      </div>
+      <div style={{ marginTop: 7 }}><Bar pct={progress.pct} color={progress.color} /></div>
+      <div style={{ marginTop: 7, fontSize: 11, fontWeight: 700, color: progress.color }}>{progress.label}</div>
+      <div style={{ marginTop: 3, minHeight: 28, fontSize: 11, lineHeight: 1.3, color: C.dim }}>{progress.detail}</div>
+    </div>
+  );
+}
+
+function FocusCell({ label, value, detail, color = C.text }: { label: string; value: string; detail: string; color?: string }) {
+  return (
+    <div style={{ minWidth: 0, padding: '10px 11px', borderRadius: 7, background: C.sub, border: `1px solid ${C.border}` }}>
+      <div style={{ fontSize: 10, color: C.dim, textTransform: 'uppercase', letterSpacing: 0.4 }}>{label}</div>
+      <div style={{ marginTop: 4, fontSize: 13, lineHeight: 1.28, fontWeight: 700, color, overflowWrap: 'anywhere' }}>{value}</div>
+      <div style={{ marginTop: 4, minHeight: 28, fontSize: 11, lineHeight: 1.3, color: C.dim }}>{detail}</div>
+    </div>
+  );
+}
+
 const agoShort = (iso: string) => {
   const s = Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / 1000));
   return s < 60 ? `${s}s` : s < 3600 ? `${Math.round(s / 60)}m` : `${Math.round(s / 3600)}h`;
 };
 
-const deTierLabel = (t: DEEntryTier) => (t === 'TIER1_REALIZED' ? 'TIER 1 — REAL FILL' : 'TIER 2 — SIMULATED');
+const deTierLabel = (t: DEEntryTier) => (t === 'TIER1_REALIZED' ? 'TIER 1 — REAL-MATCH AUDIT' : 'TIER 2 — SIMULATED');
 const deTierColor = (t: DEEntryTier) => (t === 'TIER1_REALIZED' ? C.good : C.measure);
 
 /** One RateView rendered inline — honest about INSUFFICIENT_DATA / n=0, never a blank or fabricated number
@@ -234,7 +361,7 @@ function RateStatsInline({ rv, dim }: { rv: RateView; dim?: boolean }) {
   );
 }
 
-export function FourBrainDashboardCard() {
+export function FourBrainDashboardCard({ grouped = false }: { grouped?: boolean } = {}) {
   const report = useShadowReport<FourBrainReport>('four-brain');
   // TESTNET ONLY, deliberately (2026-07-28). Research's edge memory holds 3 samples against testnet's
   // 19, and none in the regime family the market is in — its Direction longEdge/shortEdge can never
@@ -242,37 +369,51 @@ export function FourBrainDashboardCard() {
   // blink swapped the answer for a different one with nothing on screen saying so, which is also what
   // made this panel look like it was flipping between two datasets by itself.
   const directionEntry = useShadowReport<DirectionEntryOutcomesResponse>('direction-entry-outcomes', DIRECTION_TESTNET_ONLY);
+  const exitBrain = useShadowReport<ExitBrainReport>('exit-brain', DIRECTION_TESTNET_ONLY);
   const r = report.data;
   const [showAllDecisions, setShowAllDecisions] = useState(false);
   const [showEntryTier2, setShowEntryTier2] = useState(false);
 
   if (!r) {
     return (
-      <section style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 10, marginBottom: 18, padding: 16, color: C.dim }}>
+      <section style={{ background: C.card, border: grouped ? 'none' : `1px solid ${C.border}`, borderRadius: grouped ? 0 : 10, marginBottom: grouped ? 0 : 18, padding: 16, color: C.dim }}>
         Four-Brain: loading…
       </section>
     );
   }
 
   const h = r.health;
-  const decisionRows = r.recentDecisions.filter(isExecutiveDecision).slice(0, 30);
+  const decisionRows = r.recentDecisions.filter(isExecutiveDecision).filter((row) => isFocusedTestnetLane(row.laneId)).slice(0, 30);
   const visibleDecisionRows = showAllDecisions ? decisionRows : decisionRows.slice(0, 8);
+  const latestDecision = decisionRows.find((row) => row.brains.direction != null || row.brains.entry != null || row.brains.exit != null) ?? decisionRows[0] ?? null;
   const latestSnapshot = r.recentDecisions.find(isMarketSnapshot) ?? null;
+  const latestMarketState = latestSnapshot?.marketState ?? decisionRows.find((row) => row.brains.marketState)?.brains.marketState ?? null;
   const sourceLabel = report.source === 'testnet' ? 'sumber: testnet (3102)' : report.source === 'local' ? 'sumber: instance ini' : null;
   const deo = directionEntry.data;
   const deReport = deo?.report ?? null;
+  const marketReadiness = marketStateDataProgress(latestMarketState);
+  const directionReadiness = measuredReadinessProgress(deo?.readiness?.direction);
+  const entryReadiness = exactFillEntryProgress(deo?.readiness?.entry, r.actualFillBindings);
+  const exitReadiness = measuredReadinessProgress(exitBrain.data?.readiness);
   // Health rollup (2026-07-23 declutter): the ~11-chip breakdown moved behind a Disclosure —
   // this badge is the at-a-glance summary so collapsed state still communicates something.
   const healthErrorCount = h.ticks.gatherErrors + h.ticks.exceptions + h.ticks.journalErrors;
   const healthWarningCount = h.ticks.brainErrors + h.ticks.invariantFailures;
   const sourceFreshPcts = Object.values(h.sourceQuality).map((q) => q.freshPct);
   const avgFreshPct = sourceFreshPcts.length ? sourceFreshPcts.reduce((a, b) => a + b, 0) / sourceFreshPcts.length : null;
+  const entryAdmission = r.actualFillBindings?.preEntryAdmission ?? r.actualFillBindings?.entryAdmission;
+  const blockers = [
+    marketReadiness.pct < 100 ? `Market State: ${marketReadiness.detail}` : null,
+    directionReadiness.pct < 100 ? `Direction: ${directionReadiness.detail}` : null,
+    entryReadiness.pct < 100 ? `Entry: ${entryReadiness.detail}` : null,
+    exitReadiness.pct < 100 ? `Exit: ${exitReadiness.detail}` : null,
+  ].filter((value): value is string => value != null);
 
   return (
-    <section style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 10, overflow: 'hidden', marginBottom: 18 }}>
+    <section style={{ background: C.card, border: grouped ? 'none' : `1px solid ${C.border}`, borderRadius: grouped ? 0 : 10, overflow: 'hidden', marginBottom: grouped ? 0 : 18 }}>
       <header style={{ padding: '12px 16px', borderBottom: `1px solid ${C.border}`, display: 'flex', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
         <div>
-          <h2 style={{ margin: 0, fontSize: 16, color: C.text }}>Four-Brain (shadow decision layer)</h2>
+          <h2 style={{ margin: 0, fontSize: 16, color: C.text }}>Four-Brain — ringkasan keputusan</h2>
           <div style={{ color: C.dim, fontSize: 12, marginTop: 3 }}>
             Market State / Direction / Entry / Exit brain — 100% shadow, tidak pernah eksekusi/allocate. {sourceLabel && <span style={{ color: C.measure }}>{sourceLabel}</span>}
             {report.unreachable && report.data != null && <span style={{ color: C.accent }}> · koneksi putus — data terakhir</span>}
@@ -281,16 +422,81 @@ export function FourBrainDashboardCard() {
         <span style={{ color: C.dim, fontSize: 12 }}>refresh 60s</span>
       </header>
 
+      <div style={{ padding: '14px 16px', borderBottom: `1px solid ${C.border}` }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', gap: 10, flexWrap: 'wrap', marginBottom: 9 }}>
+          <div style={{ fontSize: 12, color: C.dim, textTransform: 'uppercase', letterSpacing: 0.4 }}>Sekarang · 3 lane testnet</div>
+          <div style={{ fontSize: 11, color: C.dim }}>{latestDecision ? `keputusan ${agoShort(new Date(latestDecision.asOfMs).toISOString())} lalu` : 'belum ada candidate aktif'}</div>
+        </div>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(185px, 1fr))', gap: 8 }}>
+          <FocusCell
+            label="Market"
+            value={marketStateLabel(latestMarketState)}
+            detail={latestMarketState ? `confidence ${fmtPct(latestMarketState.confidence * 100)} · transition risk ${fmtPct(latestMarketState.transitionRisk * 100)}` : 'Belum ada market snapshot terbaru.'}
+            color={marketReadiness.color}
+          />
+          <FocusCell
+            label="Direction shadow"
+            value={latestDecision?.brains.direction ? `${latestDecision.brains.direction.action} · ${fmtPct(latestDecision.brains.direction.confidence * 100)}` : 'Belum ada candidate'}
+            detail={latestDecision?.brains.direction ? `${latestDecision.brains.direction.horizon} · ${latestDecision.laneId ?? 'lane —'} / ${latestDecision.symbolOrBasketId ?? 'symbol —'}` : 'Menunggu keputusan pada cross-sectional, directional, atau CG.'}
+            color={latestDecision?.brains.direction?.action === 'LONG' ? C.good : latestDecision?.brains.direction?.action === 'SHORT' ? C.bad : C.dim}
+          />
+          <FocusCell
+            label="Entry shadow"
+            value={latestDecision?.brains.entry?.action ?? 'Belum ada keputusan'}
+            detail={entryAdmission ? `${entryAdmission.validEnterNow} ENTER_NOW valid · ${entryAdmission.exactCandidatesRecorded} exact candidate pre-submit` : 'Cohort exact-fill belum tersedia.'}
+            color={latestDecision?.brains.entry?.action === 'ENTER_NOW' ? C.good : C.accent}
+          />
+          <FocusCell
+            label="Pengaruh ke executor"
+            value={r.bridge?.active ? 'PILOT VETO SAJA' : 'SHADOW ONLY'}
+            detail={r.bridge?.active ? `${r.bridge.evaluations ?? 0} evaluasi · ${r.bridge.blocked ?? 0} veto · tidak membuka order.` : 'Tidak membuka, menutup, atau mengalokasikan posisi.'}
+            color={r.bridge?.active ? C.accent : C.measure}
+          />
+        </div>
+        <div style={{ marginTop: 8, padding: '8px 10px', borderRadius: 6, background: C.sub, border: `1px solid ${C.border}`, fontSize: 11, lineHeight: 1.4, color: C.dim }}>
+          <b style={{ color: C.text }}>{latestDecision ? 'Mengapa:' : 'Status:'}</b>{' '}
+          {latestDecision?.reasons?.[0] ?? 'Belum ada keputusan pada tiga lane testnet yang sedang menjadi fokus.'}
+        </div>
+      </div>
+
+      <div style={{ padding: '14px 16px', borderBottom: `1px solid ${C.border}` }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', gap: 10, flexWrap: 'wrap', marginBottom: 9 }}>
+          <div style={{ fontSize: 12, color: C.dim, textTransform: 'uppercase', letterSpacing: 0.4 }}>Kesiapan menuju pengaruh testnet</div>
+          <div style={{ fontSize: 11, color: C.dim }}>bukti nyata · bukan confidence sinyal</div>
+        </div>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(205px, 1fr))', gap: 8 }}>
+          <BrainReadinessTile name="Market State" progress={marketReadiness} title="Kesiapan data input market-state; bukan izin eksekusi." />
+          <BrainReadinessTile name="Direction" progress={directionReadiness} title="Bukti arah dari outcome nyata testnet." />
+          <BrainReadinessTile name="Entry" progress={entryReadiness} title="Hanya cohort exact actual-fill baru yang dihitung." />
+          <BrainReadinessTile name="Exit" progress={exitReadiness} title="Jumlah sampel saja tidak cukup: edge harus lolos." />
+        </div>
+        <div style={{ marginTop: 9, fontSize: 11, lineHeight: 1.35, color: C.dim }}>
+          100% berarti boleh dipertimbangkan untuk tahap pengaruh berikutnya.{' '}
+          Bridge pilot: <b style={{ color: r.bridge?.active ? C.good : C.dim }}>{r.bridge?.active ? 'aktif' : 'belum aktif'}</b>
+          {r.bridge?.active && <> · {r.bridge.evaluations ?? 0} evaluasi · {r.bridge.blocked ?? 0} veto</>}
+          {' '}· hanya bukti negatif matang yang dapat memveto entry; boost positif tetap ranking shadow.
+        </div>
+        {blockers.length > 0 && (
+          <div style={{ marginTop: 8, fontSize: 11, lineHeight: 1.45, color: C.dim }}>
+            <b style={{ color: C.accent }}>Yang kurang sekarang:</b> {blockers.join(' · ')}
+          </div>
+        )}
+      </div>
+
       {!r.enabled ? (
         <div style={{ padding: 16, color: C.dim, fontSize: 12 }}>
           Belum ada data — four-brain shadow mode belum aktif di instance ini (atau belum ada tick yang selesai).
         </div>
       ) : (
-        <>
+        <div style={{ padding: '10px 16px 14px' }}>
+          <Disclosure
+            summary={<><b style={{ color: C.measure }}>Bukti & audit detail</b><span style={{ color: C.dim }}> · {decisionRows.length} keputusan pada 3 lane · {healthErrorCount} error / {healthWarningCount} warning</span></>}
+          >
+            <div style={{ marginTop: 10, border: `1px solid ${C.border}`, borderRadius: 8, overflow: 'hidden' }}>
           {/* Health — rollup badge always visible, full ~11-chip breakdown behind a Disclosure
               (2026-07-23 declutter). */}
           <div style={{ padding: '12px 16px', borderBottom: `1px solid ${C.border}` }}>
-            <div style={{ fontSize: 12, color: C.dim, textTransform: 'uppercase', letterSpacing: 0.4, marginBottom: 6 }}>Health</div>
+            <div style={{ fontSize: 12, color: C.dim, textTransform: 'uppercase', letterSpacing: 0.4, marginBottom: 6 }}>Kesehatan runtime</div>
             <span style={{ fontSize: 13, fontWeight: 700, color: healthErrorCount > 0 ? C.bad : healthWarningCount > 0 ? C.accent : C.good }}>
               {healthErrorCount} errors / {healthWarningCount} warnings{avgFreshPct != null ? `, ${Math.round(avgFreshPct)}% fresh` : ''}
             </span>
@@ -331,10 +537,11 @@ export function FourBrainDashboardCard() {
           {/* Recent decisions */}
           <div style={{ padding: '12px 16px', borderBottom: `1px solid ${C.border}` }}>
             <div style={{ fontSize: 12, color: C.dim, textTransform: 'uppercase', letterSpacing: 0.4, marginBottom: 6 }}>
-              Recent decisions
+              Audit keputusan terbaru · 3 lane testnet
               {latestSnapshot?.marketState && (
                 <span style={{ marginLeft: 8, textTransform: 'none', color: C.dim, fontWeight: 400 }}>
-                  · Market State terakhir: <b style={{ color: C.text }}>{latestSnapshot.marketState.family}</b> / {latestSnapshot.marketState.bias} (conf {fmtPct(latestSnapshot.marketState.confidence * 100)})
+                  · State executor: <b style={{ color: C.text }}>{marketStateLabel(latestSnapshot.marketState)}</b>
+                  {latestSnapshot.marketState.authority && <> · teknikal {latestSnapshot.marketState.family} (audit)</>}
                 </span>
               )}
             </div>
@@ -359,7 +566,7 @@ export function FourBrainDashboardCard() {
                       <tr key={`${d.asOfMs}-${d.laneId ?? ''}-${d.symbolOrBasketId ?? ''}`} style={{ borderTop: `1px solid ${C.border}` }}>
                         <td style={{ padding: '4px 6px', color: C.text, whiteSpace: 'nowrap' }}>{d.laneId ?? '—'} / {d.symbolOrBasketId ?? '—'}</td>
                         <td style={{ padding: '4px 6px', color: C.dim, whiteSpace: 'nowrap' }}>
-                          {d.brains.marketState ? `${d.brains.marketState.family}/${d.brains.marketState.bias}` : '—'}
+                          {marketStateLabel(d.brains.marketState)}
                         </td>
                         <td style={{ padding: '4px 6px', color: C.dim, whiteSpace: 'nowrap' }}>
                           {d.brains.direction ? `${d.brains.direction.action} (${fmtPct(d.brains.direction.confidence * 100)})` : '—'}
@@ -381,7 +588,7 @@ export function FourBrainDashboardCard() {
                     onClick={() => setShowAllDecisions((v) => !v)}
                     style={{ marginTop: 8, background: 'none', border: `1px solid ${C.border}`, borderRadius: 4, color: C.measure, cursor: 'pointer', fontSize: 11, padding: '3px 8px' }}
                   >
-                    {showAllDecisions ? 'show fewer' : `show all ${decisionRows.length}`}
+                    {showAllDecisions ? 'tampilkan ringkas' : `tampilkan semua ${decisionRows.length}`}
                   </button>
                 )}
               </div>
@@ -459,12 +666,11 @@ export function FourBrainDashboardCard() {
             )}
           </div>
 
-          {/* Performance — Entry Brain: Tier 1 (real fill) vs Tier 2 (simulated) ALWAYS two separate
-              blocks, never one blended number (requirement: visibly distinct). WAIT/SKIP rows (confidence
-              EXPERIMENTAL_COST_OF_CAUTION) are dimmed + footnoted relative to ENTER_NOW (MEASURED). */}
+          {/* Entry readiness is DIRECT/ENTER_NOW exact-fill only. The audit below intentionally keeps
+              legacy real-match and simulated outcomes visible, but neither can inflate readiness. */}
           <div style={{ padding: '12px 16px' }}>
             <div style={{ fontSize: 12, color: C.dim, textTransform: 'uppercase', letterSpacing: 0.4, marginBottom: 6 }}>
-              Performance — Entry Brain (measured, Tier 1 real fill + Tier 2 simulated — tidak pernah digabung)
+              Audit Entry Brain (real-match executor + Tier 2 simulated — bukan cohort readiness)
               <SourceBadge source={directionEntry.source} unreachable={directionEntry.unreachable} />
             </div>
             <ReadinessVerdict block={deo?.readiness?.entry} title="Vonis kesiapan" />
@@ -476,9 +682,18 @@ export function FourBrainDashboardCard() {
               </div>
             ) : (
               <>
+                <div style={{ fontSize: 11, color: C.dim, lineHeight: 1.45, marginBottom: 8 }}>
+                  Readiness hanya menghitung keputusan <span style={{ color: C.measure }}>DIRECT/ENTER_NOW</span> dengan exact actual-fill.
+                  Audit di bawah dapat berisi WAIT/SKIP yang dicocokkan ke fill executor; itu tidak menambah readiness atau reinforcement.
+                </div>
                 <div style={{ display: 'flex', flexWrap: 'wrap', gap: 14 }}>
                   <StatRow label="pending" value={String(deReport.entry.coverage.pending)} />
-                  <StatRow label="Tier 1 resolved" value={String(deReport.entry.coverage.resolvedRealMatch)} color={C.good} />
+                  <StatRow
+                    label="real-match audit"
+                    value={String(deReport.entry.coverage.resolvedRealMatch)}
+                    color={C.good}
+                    title="Real exchange outcome yang dicocokkan ke keputusan Four-Brain, termasuk WAIT/SKIP; bukan DIRECT/ENTER_NOW exact-fill."
+                  />
                   <StatRow label="Tier 2 resolved" value={String(deReport.entry.coverage.resolvedSimulated)} color={C.measure} />
                   <StatRow
                     label="instrument data missing"
@@ -492,8 +707,8 @@ export function FourBrainDashboardCard() {
                   <div style={{ fontSize: 12, color: C.dim, marginTop: 8 }}>{deReport.entry.coverage.note}</div>
                 ) : (
                   <>
-                    {/* Tier 1 (real fill) always visible; Tier 2 (simulated) behind an explicit
-                        toggle — never rendered blended into one number (2026-07-23 declutter). */}
+                    {/* Tier 1 real-match audit is always visible; Tier 2 stays behind an explicit
+                        toggle. Neither audit tier is blended into the direct exact-fill readiness cohort. */}
                     {(showEntryTier2 ? (['TIER1_REALIZED', 'TIER2_SIMULATED'] as const) : (['TIER1_REALIZED'] as const)).map((tier) => {
                       const rows = deReport.entry.perAction.filter((a) => a.tier === tier && a.n > 0);
                       const calib = deReport.entry.calibration.find((c) => c.tier === tier) ?? null;
@@ -551,7 +766,9 @@ export function FourBrainDashboardCard() {
               </div>
             )}
           </div>
-        </>
+            </div>
+          </Disclosure>
+        </div>
       )}
     </section>
   );

@@ -733,6 +733,27 @@ export interface LiveIntent {
    *  terminal intent and a double-booking (FIFO eviction, LIVE_MAX_STORED_INTENTS raised above the
    *  FIFO cap, or a lost/corrupt attribution file are all covered by this flag). */
   cortexAttributed?: boolean;
+  /**
+   * A deliberate operator void for REPORTING only — same contract as
+   * isCrossSectionalBasketReportingExcluded in cross-sectional-executor.ts.
+   *
+   * The Binance orders, fills and this intent's own realizedPnlUsd/feesUsd stay untouched, so the
+   * ledger can always be reconciled back against the exchange. Lane performance, the timeline and
+   * the displayed realized total act as though the close never happened.
+   *
+   * DELIBERATELY NOT subtracted from dailyLedger/totalRealizedPnlUsd: those accumulators feed the
+   * daily-loss, consecutive-loss and drawdown KILL SWITCHES, on the same code path that runs
+   * live/3103 with real money. Voiding a real loss out of a safety accumulator would make the
+   * protection less sensitive than the account actually warrants. The excluded amount is carried
+   * here so a reader can subtract it for DISPLAY and still show both numbers.
+   */
+  reportingExclusion?: {
+    kind: "OPERATOR_VOID";
+    voidedAt: string;
+    reason: string;
+    excludedRealizedPnlUsd: number;
+    excludedFeesUsd: number;
+  } | null;
   /** Optional immutable review lineage. Its absence never blocks incumbent execution. */
   executiveReviewLink?: ExecutiveReviewExecutionLink;
   /** Immutable CORTEX/PaperOrder lineage identity, copied verbatim from the PRIMARY paper.causalIdentity
@@ -1180,6 +1201,47 @@ export type LivePrivateClient = Pick<
   | "getUserTrades"
   | "getIncomeHistory"
 >;
+
+/** Same as sumLiveIntentReportingExclusions but scoped to ONE UTC day, so a "today" headline can be
+ *  corrected without also subtracting voids from earlier days. Matches how dailyLedger rolls. */
+export function sumLiveIntentReportingExclusionsForDate(
+  intents: ReadonlyArray<{ closedAt?: string | null; updatedAt?: string | null; reportingExclusion?: { kind: "OPERATOR_VOID"; excludedRealizedPnlUsd: number; excludedFeesUsd: number } | null }>,
+  dateUtc: string,
+): { count: number; realizedPnlUsd: number; feesUsd: number } {
+  let count = 0, realizedPnlUsd = 0, feesUsd = 0;
+  for (const intent of intents) {
+    const ex = intent.reportingExclusion;
+    if (ex?.kind !== "OPERATOR_VOID") continue;
+    const closed = intent.closedAt ?? intent.updatedAt ?? null;
+    if (typeof closed !== "string" || closed.slice(0, 10) !== dateUtc) continue;
+    count += 1;
+    if (Number.isFinite(ex.excludedRealizedPnlUsd)) realizedPnlUsd += ex.excludedRealizedPnlUsd;
+    if (Number.isFinite(ex.excludedFeesUsd)) feesUsd += ex.excludedFeesUsd;
+  }
+  return { count, realizedPnlUsd, feesUsd };
+}
+
+/** True when a closed intent is retained for audit but must never influence reporting or learning. */
+export function isLiveIntentReportingExcluded(
+  intent: { reportingExclusion?: { kind: "OPERATOR_VOID" } | null },
+): boolean {
+  return intent.reportingExclusion?.kind === "OPERATOR_VOID";
+}
+
+/** What the operator has voided out of reporting, so a display can subtract it AND show it. */
+export function sumLiveIntentReportingExclusions(
+  intents: ReadonlyArray<{ reportingExclusion?: { kind: "OPERATOR_VOID"; excludedRealizedPnlUsd: number; excludedFeesUsd: number } | null }>,
+): { count: number; realizedPnlUsd: number; feesUsd: number } {
+  let count = 0, realizedPnlUsd = 0, feesUsd = 0;
+  for (const intent of intents) {
+    const ex = intent.reportingExclusion;
+    if (ex?.kind !== "OPERATOR_VOID") continue;
+    count += 1;
+    if (Number.isFinite(ex.excludedRealizedPnlUsd)) realizedPnlUsd += ex.excludedRealizedPnlUsd;
+    if (Number.isFinite(ex.excludedFeesUsd)) feesUsd += ex.excludedFeesUsd;
+  }
+  return { count, realizedPnlUsd, feesUsd };
+}
 
 export interface LiveExecutionEngineOptions {
   config: LiveExecutionConfig;
@@ -2579,6 +2641,12 @@ export class LiveExecutionEngine {
       closedToday: st.dailyLedger,
       consecutiveLosses: st.consecutiveLosses,
       totalRealizedPnlUsd: st.totalRealizedPnlUsd,
+      // Raw accumulator above is the KILL-SWITCH number and stays exchange-true. The two fields
+      // below let a display show the cohort figure without ever hiding what really happened.
+      reportingExcluded: sumLiveIntentReportingExclusions(st.intents),
+      reportingExcludedToday: sumLiveIntentReportingExclusionsForDate(st.intents, st.dailyLedger.dateUtc),
+      totalRealizedPnlUsdExcludingVoids:
+        st.totalRealizedPnlUsd - sumLiveIntentReportingExclusions(st.intents).realizedPnlUsd,
       limits: {
         riskUsdPerTrade: this.config.riskUsdPerTrade,
         maxConcurrentPositions: this.config.maxConcurrentPositions,
@@ -2879,6 +2947,7 @@ export class LiveExecutionEngine {
     }>();
     for (const intent of liveState.intents) {
       if (intent.realizedPnlUsd === null) continue;
+      if (isLiveIntentReportingExcluded(intent)) continue;
       const sources = this.intentSources(intent, paperById);
       const totalQty = sources.reduce((sum, source) => sum + source.qty, 0);
       const realized = intent.realizedPnlUsd;
@@ -2995,6 +3064,7 @@ export class LiveExecutionEngine {
 
     for (const intent of this.store.getState().intents) {
       if (intent.realizedPnlUsd === null) continue;
+      if (isLiveIntentReportingExcluded(intent)) continue;
       const closedAt = intent.closedAt ?? intent.updatedAt;
       const closedMs = new Date(closedAt).getTime();
       if (!Number.isFinite(closedMs) || closedMs < cohortSinceMs || closedMs >= window.untilMs) continue;

@@ -47,6 +47,26 @@ describe("BinanceClient", () => {
     expect(summary.stageTimings.candles_5m?.cacheHitCount).toBe(1);
   });
 
+  it("uses the public USD-M endpoint for futures outcome candles", async () => {
+    const successPayload = makeKlinePayload();
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input));
+      expect(url.host).toBe("fapi.binance.com");
+      expect(url.pathname).toBe("/fapi/v1/klines");
+      expect(url.searchParams.get("symbol")).toBe("1000PEPEUSDT");
+      expect(url.searchParams.get("interval")).toBe("15m");
+      expect(url.searchParams.get("limit")).toBe("37");
+      expect(url.searchParams.get("startTime")).toBe("1700000000000");
+      return new Response(JSON.stringify(successPayload), { status: 200 });
+    });
+
+    const client = new BinanceClient(fetchImpl as typeof fetch);
+    const candles = await client.getFuturesCandles("1000PEPEUSDT", "15m", 37, { startTime: 1_700_000_000_000 });
+
+    expect(candles).toHaveLength(3);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
   it("emits typed failures when no cache exists", async () => {
     const fetchImpl = vi.fn(async () => new Response("missing", { status: 404 }));
     const client = new BinanceClient(fetchImpl as typeof fetch);
