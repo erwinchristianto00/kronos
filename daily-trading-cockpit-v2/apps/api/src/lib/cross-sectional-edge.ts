@@ -175,6 +175,46 @@ const CROSS_SECTIONAL_SMART_EXTENSION_BARS = Math.max(2, Math.floor(envNumPos("C
 // A 187-day replay of this module's own functions over real 1h klines measured the widened pool at
 // +0.270%/day and the widened pool PLUS this floor at +0.287%/day with the worst drawdown improving
 // from -8.4% to -7.0%; the floor's real job is that drawdown number, not the mean.
+/**
+ * Guard against a PRICE-SCALE mismatch between a leg's entry and its exit.
+ *
+ * 2026-08-15: 15 baskets booked `1000PEPEUSDT` with entry at the 1000x-multiplier contract price
+ * (~0.0028) and exit at the bare PEPE spot price (~0.0000027). Returns are ratios so the 1000x
+ * normally cancels — but only when BOTH ends come from the same series. Each such SHORT leg booked
+ * as +99.9%, and the lane's measured average read +975bps instead of its true +146bps. It sat
+ * undetected in the store for three days and was only caught because the number was too good to be
+ * a market move.
+ *
+ * Deliberately RATIO-based, not return-based: a 50x price ratio is arithmetically impossible for a
+ * liquid perp over one horizon, whereas a return threshold would also fire on genuine violent moves
+ * in a meme coin. This catches unit errors and nothing else.
+ */
+export const CROSS_SECTIONAL_LEG_SCALE_MAX_RATIO = envNumPos("CROSS_SECTIONAL_LEG_SCALE_MAX_RATIO", 50);
+
+export function crossSectionalLegScaleAnomaly(
+  entryPrice: number,
+  exitPrice: number | null,
+  maxRatio: number = CROSS_SECTIONAL_LEG_SCALE_MAX_RATIO,
+): boolean {
+  if (!(entryPrice > 0) || exitPrice === null || !(exitPrice > 0) || !(maxRatio > 1)) return false;
+  const ratio = entryPrice / exitPrice;
+  return ratio > maxRatio || ratio < 1 / maxRatio;
+}
+
+/** Human-readable descriptions of every scale-mismatched leg, for the void reason. Empty = clean. */
+export function crossSectionalScaleAnomalies(
+  legs: ReadonlyArray<{ symbol: string; entryPrice: number; exitPrice: number | null }>,
+  maxRatio: number = CROSS_SECTIONAL_LEG_SCALE_MAX_RATIO,
+): string[] {
+  const out: string[] = [];
+  for (const leg of legs) {
+    if (crossSectionalLegScaleAnomaly(leg.entryPrice, leg.exitPrice, maxRatio)) {
+      out.push(leg.symbol + " entry=" + leg.entryPrice + " exit=" + leg.exitPrice);
+    }
+  }
+  return out;
+}
+
 export const CROSS_SECTIONAL_LIQUIDITY_FLOOR_USD_PER_HOUR = envNumNonNeg("CROSS_SECTIONAL_LIQUIDITY_FLOOR_USD_PER_HOUR", 0);
 // 168 bars = 7d of 1h candles. NOT 720 (~30d): runCrossSectionalCycleGuarded's caller fetches
 // `CROSS_SECTIONAL_MOMENTUM_BARS + 5` candles per symbol, so a lookback longer than what is
@@ -1546,6 +1586,7 @@ export function resolveCrossSectional(
           : ageMs >= obs.horizonMs ? "HORIZON"
             : null;
   if (exitReason === null) return obs;
+  const scaleAnomalies = crossSectionalScaleAnomalies([...longLeg, ...shortLeg]);
   return {
     ...obs,
     longLeg,
@@ -1558,6 +1599,21 @@ export function resolveCrossSectional(
     longLegReturn,
     shortLegReturn,
     resolvedAt: now,
+    // Scale guard: a leg whose entry and exit came from different price scales produces a fake
+    // ~100% return. Still resolved (so nothing hangs OPEN forever) and the raw numbers are kept for
+    // audit, but voided from reports/learning the instant it is detected rather than three days
+    // later. Reuses the existing OPERATOR_VOID marker because that is the only kind the readers
+    // honour; the reason states plainly that this one was automatic, not an operator decision.
+    ...(scaleAnomalies.length > 0
+      ? {
+          reportingExclusion: {
+            kind: "OPERATOR_VOID" as const,
+            voidedAt: now,
+            reason: "AUTOMATIC SCALE GUARD (not an operator decision): entry/exit price scale mismatch on " +
+              scaleAnomalies.join("; "),
+          },
+        }
+      : {}),
   };
 }
 
