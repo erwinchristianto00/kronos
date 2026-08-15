@@ -14,6 +14,7 @@ import { dirname, resolve } from "node:path";
 import type { FastifyInstance } from "fastify";
 
 import type { LiveExecutionEngine } from "../lib/live-execution-engine.js";
+import { fullyCostedNetPnlUsd, fullyCostedFeeUsd } from "../lib/fully-costed-net-pnl.js";
 import {
   closedBasketRealizedBreakdown,
   crossSectionalEstimatedCostPct,
@@ -801,17 +802,27 @@ export function mergeSingleSymbolIntoLaneSeries(
     }
     if (bucketIdx < 0) continue;
     const key = report.bucketStarts[bucketIdx]!;
+    // 2026-08-15: present the FULLY COSTED economics. pos.netPnlUsd is deliberately exit-side only
+    // — it is what the daily-loss gate and the consecutive-loss kill switch read, and
+    // FOLD_ENTRY_LEG_INTO_PNL exists so an operator decides when those gates start seeing the entry
+    // commission. Nothing is rewritten in the store and no gate input moves; this is a READ-side
+    // reconstruction from fields the record already carries, and it declines to reconstruct when
+    // the flag is undefined (the flat-estimate arm already models both sides — adding there would
+    // double-count). Measured on the XSEC directional lanes: 13 closed positions, all
+    // entryLegFoldedIntoPnl=false, the presented net overstating by 23% of the SHORT lane's total.
+    const netUsd = fullyCostedNetPnlUsd(pos) ?? pos.netPnlUsd;
+    const feeUsd = fullyCostedFeeUsd(pos) ?? pos.feeEstimateUsd ?? 0;
     const bucket = perBucket.get(key) ?? { realizedPnlUsd: 0, closedCount: 0, wins: 0, losses: 0 };
-    bucket.realizedPnlUsd += pos.netPnlUsd;
+    bucket.realizedPnlUsd += netUsd;
     bucket.closedCount += 1;
-    if (pos.netPnlUsd > 0) bucket.wins += 1;
-    if (pos.netPnlUsd < 0) bucket.losses += 1;
+    if (netUsd > 0) bucket.wins += 1;
+    if (netUsd < 0) bucket.losses += 1;
     perBucket.set(key, bucket);
-    realizedPnlUsd += pos.netPnlUsd;
-    feesUsd += pos.feeEstimateUsd ?? 0;
+    realizedPnlUsd += netUsd;
+    feesUsd += feeUsd;
     closedCount += 1;
-    if (pos.netPnlUsd > 0) wins += 1;
-    if (pos.netPnlUsd < 0) losses += 1;
+    if (netUsd > 0) wins += 1;
+    if (netUsd < 0) losses += 1;
     symbols.add(pos.symbol);
   }
   if (closedCount === 0) return report;
