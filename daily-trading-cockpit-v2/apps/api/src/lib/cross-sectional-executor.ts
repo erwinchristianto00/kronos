@@ -16,6 +16,11 @@
  *  - Consumes the SAME store the measurement lane writes (getCrossSectionalStore)
  *    so what executes is exactly what was measured — no separate signal path.
  */
+import {
+  buildSubmitRefBase,
+  stampSubmitRef,
+  type SubmitRef,
+} from "./submit-reference-quote.js";
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 
@@ -443,6 +448,11 @@ export interface ExecutorLeg {
   lastMarkAt?: string | null;
   /** Path starts only at the first observed mark; legacy legs never get invented history. */
   pathStartedAt?: string | null;
+  /** Two-sided book quote captured immediately before this leg's placeOrder, so execution
+   *  cost can be split into the spread it had to cross and the slippage it actually took.
+   *  Absent when no fresh quote was available — never back-filled from mark, which would
+   *  silently fold half the spread into 'slippage'. See submit-reference-quote.ts. */
+  submitRef?: SubmitRef | null;
 }
 
 export interface SmartBasketRuntime {
@@ -1252,6 +1262,11 @@ export interface CrossSectionalExecutorOptions {
   /** Operator lane allocation weight. 100 = normal leg size; 0 = blocked. */
   laneWeightPct?: () => number;
   nowIso?: () => string;
+  /** Synchronous, zero-I/O read of the shared per-symbol quote cache (app.ts). */
+  readPublicQuote?: (symbol: string) => { bid: number | null; ask: number | null; mid: number; atMs: number; venue?: string } | null;
+  /** Populates that cache for one symbol. Awaited immediately before placeOrder so the
+   *  reference belongs to THIS submission; failure is swallowed and the order proceeds. */
+  warmPublicQuote?: (symbol: string) => Promise<unknown>;
   /** Delay between queryOrder confirmation retries in resolveFillPrice. Default 400ms; tests pass 0. */
   fillConfirmRetryDelayMs?: number;
   /** Daily basket loss breaker limit override (tests inject; default reads
@@ -1407,6 +1422,8 @@ export class CrossSectionalExecutor {
   private readonly fillConfirmRetryDelayMs: number;
   private readonly laneWeightPct: () => number;
   private readonly nowIso: () => string;
+  private readonly readPublicQuoteFn: CrossSectionalExecutorOptions["readPublicQuote"] | null;
+  private readonly warmPublicQuoteFn: CrossSectionalExecutorOptions["warmPublicQuote"] | null;
   private readonly targetVariant: string;
   private readonly laneId: string;
   private ticking = false;
@@ -1465,6 +1482,8 @@ export class CrossSectionalExecutor {
     this.targetVariant = opts.targetVariant ?? EXEC_VARIANT();
     this.laneId = opts.laneId ?? CROSS_SECTIONAL_MARKET_NEUTRAL_LANE_ID;
     this.nowIso = opts.nowIso ?? (() => new Date().toISOString());
+    this.readPublicQuoteFn = opts.readPublicQuote ?? null;
+    this.warmPublicQuoteFn = opts.warmPublicQuote ?? null;
     this.fillConfirmRetryDelayMs = opts.fillConfirmRetryDelayMs ?? 400;
     this.existingNotionalForSymbolFn = opts.existingNotionalForSymbol ?? (() => 0);
     this.maxNotionalPerSymbolAcrossLanesFn = opts.maxNotionalPerSymbolAcrossLanes ?? (() => 0);
@@ -3672,6 +3691,25 @@ export class CrossSectionalExecutor {
    */
   private async placeRemainingLegsLocked(basket: ExecutorBasket, startIndex: number): Promise<void> {
     const plan = basket.plan ?? [];
+    // 2026-08-15: warm the shared quote cache for every leg still to place, ONCE and in PARALLEL,
+    // before any order goes out. Warming per-leg instead would put a book fetch (up to ~750ms)
+    // between consecutive placements and stretch a 6-leg basket's open window from ~1s to ~4.5s —
+    // more time for the market to move between legs, which is a real execution cost paid to obtain
+    // a measurement. One parallel fetch costs a single round trip; the reference is then slightly
+    // older for later legs, and `ageAtSubmitMs` records exactly how much so a report can filter on
+    // it rather than be misled by it. Fail-open throughout: no quote simply means no submitRef.
+    const quoteObserveStartMs = Date.parse(this.nowIso());
+    if (this.warmPublicQuoteFn) {
+      const pending = plan
+        .slice(startIndex)
+        .filter((p) => p.status !== "FILLED")
+        .map((p) => p.symbol);
+      await Promise.all(
+        [...new Set(pending)].map((symbol) =>
+          this.warmPublicQuoteFn!(symbol).catch(() => null),
+        ),
+      ).catch(() => null);
+    }
     for (let i = startIndex; i < plan.length; i++) {
       const planned = plan[i]!;
       if (planned.status === "FILLED") continue; // idempotent — already resolved (e.g. by recovery)
@@ -3698,6 +3736,18 @@ export class CrossSectionalExecutor {
         } catch {
           // best-effort (already set / position exists)
         }
+        // 2026-08-15: submit-time reference quote. Captured HERE — after setLeverage, immediately
+        // before the order — so `ageAtSubmitMs` measures what it claims to. Best-effort in every
+        // direction: a failed warm, a missing cache entry, or a stale quote all yield no submitRef
+        // and the order proceeds untouched. It must never be able to block or delay a placement.
+        const submitRef = stampSubmitRef(
+          buildSubmitRefBase(
+            this.readPublicQuoteFn ? this.readPublicQuoteFn(planned.symbol) : null,
+            quoteObserveStartMs,
+            planned.side,
+          ),
+          Date.parse(this.nowIso()),
+        );
         const order = await this.client.placeOrder({
           symbol: planned.symbol,
           side: planned.side === "LONG" ? "BUY" : "SELL",
@@ -3725,6 +3775,7 @@ export class CrossSectionalExecutor {
           entryPrice: resolvedEntry.price,
           entryOrderId: order.orderId,
           entryPriceConfirmed: resolvedEntry.confirmed,
+          ...(submitRef ? { submitRef } : {}),
           exitPrice: null,
           exitOrderId: null,
           exitPriceConfirmed: null,

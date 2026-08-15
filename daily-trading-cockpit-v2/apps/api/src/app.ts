@@ -2176,6 +2176,16 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         // cortex-real-attribution.ts at all (see CrossSectionalExecutorOptions.rawLaneWeightPct /
         // .cortexRealAttribution doc comments) — same pattern as every other lane below.
         rawLaneWeightPct: () => engineForGate?.rawLaneAllocationWeightPctForLane(CROSS_SECTIONAL_MARKET_NEUTRAL_LANE_ID) ?? 100,
+        // 2026-08-15: submit-time reference quote for every basket leg. `warmPublicQuote` is the
+        // SAME currentPublicPrice the single-symbol lanes already use — it fetches the USD-M book
+        // ticker and populates the shared cache as a side effect — and `readPublicQuote` is the
+        // synchronous read of that cache. Cross-basket previously had only Binance's MARK price
+        // (via getPositions), which is not the book: a market BUY lifts the ask, so `fill - mark`
+        // folds half the spread into what looks like slippage and the two cannot be separated
+        // afterwards. Both are optional in the executor and every failure path is swallowed there,
+        // so this can only ever add a record — never block or delay a placement.
+        readPublicQuote,
+        warmPublicQuote: currentPublicPrice,
         cortexRealAttribution: getCortexRealAttributionStore(),
         // Per-fill execution recorder (2026-07-27, report-only — see execution-fill-recorder.ts).
         // closeBasket() already fetches one getUserTrades page per unique symbol to sum the real
