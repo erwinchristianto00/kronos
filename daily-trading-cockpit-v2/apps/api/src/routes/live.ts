@@ -6,6 +6,10 @@
  * echoed by any endpoint.
  */
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import {
+  isOverlayClose, realisedNetR, replayOwnExit, positionCostR, summariseCounterfactual,
+  ownExitParamsFromEnv, type DirectionalClosedPosition, type Bar, type CounterfactualRow,
+} from "../lib/directional-overlay-counterfactual.js";
 import { dirname, resolve } from "node:path";
 import type { FastifyInstance } from "fastify";
 
@@ -856,6 +860,23 @@ export function mergeSingleSymbolIntoLaneSeries(
   return report;
 }
 
+interface OverlayCfLane {
+  error?: string;
+  summary: {
+    n: number; independentEpisodes: number; distinctDays: number;
+    actualMeanR: number | null; counterfactualMeanR: number | null; deltaMeanR: number | null;
+    stopsHit: number; exitMix: Record<string, number>; verdict: string;
+  } | null;
+  rows: CounterfactualRow[];
+}
+interface OverlayCfPayload {
+  generatedAt: string;
+  measuredCostBps: number;
+  ownExitParams: { armR: number; givebackFraction: number; profitLockNetReturn: number; staticTpMaxNetReturn: number; maxHoldHours: number };
+  lanes: Record<string, OverlayCfLane>;
+}
+let overlayCfCache: { atMs: number; payload: unknown } | null = null;
+
 export async function registerLiveRoutes(
   app: FastifyInstance,
   engine: LiveExecutionEngine | null,
@@ -1671,6 +1692,147 @@ export async function registerLiveRoutes(
    * See closedBasketRealizedBreakdown for the two provenance caveats (fees are APPORTIONED per leg,
    * and an unconfirmed fill price makes that leg's figure unreliable) — both are in the payload.
    */
+  /**
+   * Shadow counterfactual for the XSEC directional lanes (REPORT-ONLY, 2026-08-15).
+   *
+   * For every position the regime overlay closed, replays the lane's OWN exits forward over real
+   * 5m candles and reports what it would have returned instead. Places no orders, mutates no store,
+   * and no execution path imports it. Cached 5 minutes so refreshing cannot hammer the exchange.
+   */
+  app.get("/api/live/directional-overlay-counterfactual", async () => buildOverlayCf());
+
+  /**
+   * Same data, rendered as a self-contained page (2026-08-15).
+   *
+   * Served BY THE API on purpose: the dashboard bundle under /root/kronos-web-current is built and
+   * deployed by the other agent, and this repo's own rule is that a `dist/` deploy silently
+   * overwrites whatever that agent shipped. Adding a route cannot collide with it — no bundle is
+   * rebuilt, no file of theirs is touched. No external assets, so no CSP or CDN dependency.
+   */
+  app.get("/api/live/directional-overlay-counterfactual/view", async (_request, reply) => {
+    const p = (await buildOverlayCf()) as OverlayCfPayload;
+    const esc = (v: unknown): string => String(v).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c] ?? c));
+    const r3 = (v: number | null | undefined): string => (v == null ? "n/a" : (v >= 0 ? "+" : "") + v.toFixed(3));
+
+    const laneBlocks = Object.entries(p.lanes).map(([lane, v]) => {
+      if (!v.summary) return `<section><h2>${esc(lane)}</h2><p class="muted">${esc(v.error ?? "no data")}</p></section>`;
+      const s2 = v.summary;
+      const undecided = s2.verdict.startsWith("NOT DECIDABLE") || s2.verdict.startsWith("INCOMPLETE");
+      const rows = v.rows.map((r) => `<tr>
+        <td>${esc(r.symbol)}</td><td class="mono">${esc(r.openedAt.slice(0, 16))}</td>
+        <td class="num ${r.actualNetR >= 0 ? "pos" : "neg"}">${r3(r.actualNetR)}</td>
+        <td class="num ${r.counterfactualNetR >= 0 ? "pos" : "neg"}">${r3(r.counterfactualNetR)}</td>
+        <td class="num ${r.deltaR >= 0 ? "pos" : "neg"}">${r3(r.deltaR)}</td>
+        <td>${esc(r.counterfactualExit)}</td><td class="num">${r.counterfactualHoldHours.toFixed(1)}</td>
+      </tr>`).join("");
+      return `<section>
+        <h2>${esc(lane)}</h2>
+        <div class="verdict ${undecided ? "warn" : "ok"}">${esc(s2.verdict)}</div>
+        <div class="grid">
+          <div><span>posisi</span><b>${s2.n}</b></div>
+          <div><span>episode independen</span><b>${s2.independentEpisodes}</b></div>
+          <div><span>hari</span><b>${s2.distinctDays}</b></div>
+          <div><span>stop kena</span><b>${s2.stopsHit}</b></div>
+          <div><span>nyata (ditutup overlay)</span><b class="${(s2.actualMeanR ?? 0) >= 0 ? "pos" : "neg"}">${r3(s2.actualMeanR)}R</b></div>
+          <div><span>tanpa overlay</span><b class="${(s2.counterfactualMeanR ?? 0) >= 0 ? "pos" : "neg"}">${r3(s2.counterfactualMeanR)}R</b></div>
+          <div><span>selisih</span><b class="${(s2.deltaMeanR ?? 0) >= 0 ? "pos" : "neg"}">${r3(s2.deltaMeanR)}R</b></div>
+        </div>
+        ${v.rows.length ? `<table><thead><tr><th>simbol</th><th>dibuka</th><th class="num">nyata R</th><th class="num">tanpa overlay R</th><th class="num">selisih</th><th>exit</th><th class="num">jam</th></tr></thead><tbody>${rows}</tbody></table>` : ""}
+      </section>`;
+    }).join("");
+
+    reply.type("text/html; charset=utf-8");
+    return `<!doctype html><html lang="id"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Overlay Counterfactual</title><style>
+:root{--bg:#fff;--fg:#1a1a1a;--mut:#6b7280;--line:#e5e7eb;--card:#f9fafb;--pos:#047857;--neg:#b91c1c;--warnbg:#fef3c7;--warnfg:#92400e;--okbg:#d1fae5;--okfg:#065f46}
+@media(prefers-color-scheme:dark){:root{--bg:#0f1115;--fg:#e5e7eb;--mut:#9ca3af;--line:#272b33;--card:#161a20;--pos:#34d399;--neg:#f87171;--warnbg:#3b2f0b;--warnfg:#fcd34d;--okbg:#06301f;--okfg:#6ee7b7}}
+*{box-sizing:border-box}body{margin:0;padding:24px;background:var(--bg);color:var(--fg);font:14px/1.55 ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+h1{font-size:19px;margin:0 0 4px}h2{font-size:15px;margin:26px 0 10px;letter-spacing:.02em}
+.muted{color:var(--mut);font-size:12.5px}.mono{font-variant-numeric:tabular-nums;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+.verdict{padding:10px 13px;border-radius:8px;font-size:13px;margin-bottom:12px;line-height:1.45}
+.verdict.warn{background:var(--warnbg);color:var(--warnfg)}.verdict.ok{background:var(--okbg);color:var(--okfg)}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:9px;margin-bottom:14px}
+.grid div{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:9px 11px}
+.grid span{display:block;color:var(--mut);font-size:11.5px;margin-bottom:3px}.grid b{font-size:16px;font-variant-numeric:tabular-nums}
+table{width:100%;border-collapse:collapse;font-size:13px}th,td{text-align:left;padding:7px 9px;border-bottom:1px solid var(--line)}
+th{color:var(--mut);font-weight:600;font-size:11.5px;text-transform:uppercase;letter-spacing:.04em}
+.num{text-align:right;font-variant-numeric:tabular-nums}.pos{color:var(--pos)}.neg{color:var(--neg)}
+.wrap{max-width:1000px;margin:0 auto}.foot{margin-top:26px;padding-top:14px;border-top:1px solid var(--line)}
+</style></head><body><div class="wrap">
+<h1>Overlay Counterfactual — XSEC directional</h1>
+<p class="muted">Apa yang <em>akan</em> dihasilkan posisi kalau overlay rezim tidak menutupnya, dan hanya exit lane sendiri yang berlaku. <b>Report-only</b> — overlay tetap menutup posisi nyata; halaman ini tidak mengubah apa pun.</p>
+${laneBlocks}
+<div class="foot muted">
+dibuat ${esc(p.generatedAt)} · ongkos terukur ${esc(p.measuredCostBps)} bps ·
+arm ${esc(p.ownExitParams.armR)}R · giveback ${esc(p.ownExitParams.givebackFraction)} ·
+profit-lock ${esc(p.ownExitParams.profitLockNetReturn)} · static TP ${esc(p.ownExitParams.staticTpMaxNetReturn)} ·
+max-hold ${esc(p.ownExitParams.maxHoldHours)} jam<br>
+Replay memakai candle 5m Binance asli. Exit lane dipicu <b>hanya oleh harga close</b> (bukan wick); stop dicek lebih dulu dan boleh kena wick karena ia resting order.
+</div></div></body></html>`;
+  });
+
+  async function buildOverlayCf(): Promise<unknown> {
+    const now = Date.now();
+    if (overlayCfCache && now - overlayCfCache.atMs < 5 * 60_000) return overlayCfCache.payload;
+
+    const params = ownExitParamsFromEnv();
+    const costBps = Number.parseFloat(process.env.CROSS_SECTIONAL_MEASURED_COST_BPS ?? "") || 7.99;
+    const lanes: Array<{ lane: string; file: string }> = [
+      { lane: "SHORT", file: "data/cross-sectional-directional-short-executor.json" },
+      { lane: "LONG", file: "data/cross-sectional-directional-long-executor.json" },
+    ];
+
+    const perLane: Record<string, unknown> = {};
+    for (const { lane, file } of lanes) {
+      let positions: DirectionalClosedPosition[] = [];
+      try {
+        positions = (JSON.parse(readFileSync(file, "utf-8")) as { positions?: DirectionalClosedPosition[] }).positions ?? [];
+      } catch {
+        perLane[lane] = { error: "store unreadable", rows: [], summary: null };
+        continue;
+      }
+      const overlayClosed = positions.filter((p) => p.status === "CLOSED" && isOverlayClose(p.closeReason));
+      const rows: CounterfactualRow[] = [];
+      for (const p of overlayClosed) {
+        const actual = realisedNetR(p);
+        const costR = positionCostR(p, costBps);
+        if (actual === null || costR === null) continue;
+        const openMs = Date.parse(p.openedAt);
+        if (!Number.isFinite(openMs)) continue;
+        let bars: Bar[] = [];
+        try {
+          const url = `https://fapi.binance.com/fapi/v1/klines?symbol=${p.symbol}&interval=5m&startTime=${openMs}&endTime=${openMs + params.maxHoldHours * 3600e3}&limit=500`;
+          const raw = (await (await fetch(url)).json()) as unknown[];
+          if (!Array.isArray(raw)) continue;
+          bars = raw.map((k) => {
+            const a = k as [number, string, string, string, string];
+            return { openTimeMs: a[0], open: Number(a[1]), high: Number(a[2]), low: Number(a[3]), close: Number(a[4]) };
+          });
+        } catch { continue; }
+        const sim = replayOwnExit(bars, p, params, costR);
+        if (!sim) continue;
+        rows.push({
+          positionId: p.positionId, symbol: p.symbol, direction: p.direction,
+          openedAt: p.openedAt, closedAt: p.closedAt,
+          actualNetR: actual, counterfactualNetR: sim.netR, deltaR: sim.netR - actual,
+          counterfactualExit: sim.exitReason, counterfactualHoldHours: sim.holdHours, stopHit: sim.stopHit,
+        });
+      }
+      perLane[lane] = { summary: summariseCounterfactual(rows), rows };
+    }
+
+    const payload = {
+      generatedAt: new Date(now).toISOString(),
+      note: "REPORT-ONLY. The overlay still closes real positions; this records only what holding to the lane's own exit would have returned.",
+      ownExitParams: params,
+      measuredCostBps: costBps,
+      lanes: perLane,
+    };
+    overlayCfCache = { atMs: now, payload };
+    return payload;
+  }
+
   app.get("/api/live/cross-sectional-closed-baskets", async () => {
     const reportSinceMs = getCrossSectionalReportSinceMs();
     const reportStartAt = reportSinceMs === undefined ? null : new Date(reportSinceMs).toISOString();
