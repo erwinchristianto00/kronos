@@ -16,6 +16,7 @@ import type { FastifyInstance } from "fastify";
 import type { LiveExecutionEngine } from "../lib/live-execution-engine.js";
 import {
   closedBasketRealizedBreakdown,
+  crossSectionalEstimatedCostPct,
   isCrossSectionalBasketReportingExcluded,
   type CrossSectionalExecutor,
 } from "../lib/cross-sectional-executor.js";
@@ -1848,9 +1849,10 @@ Replay memakai candle 5m Binance asli. Exit lane dipicu <b>hanya oleh harga clos
     const filteredClosedBaskets = filteredExecutor
       ? closedBasketRealizedBreakdown(filteredExecutor.getClosedBaskets()).filter((basket) => inReportEra(basket.openedAt))
       : [];
-    const estimatedCloseCostPct = Number.isFinite(Number(process.env.LIVE_ESTIMATED_CLOSE_COST_PCT))
-      ? Number(process.env.LIVE_ESTIMATED_CLOSE_COST_PCT)
-      : 0.0022;
+    // Cross-basket carries its OWN measured cost, not the system-wide 22bps blend — see
+    // crossSectionalEstimatedCostPct's doc comment for the three-way measurement behind it.
+    // Applying the global constant here overstated a basket's cost by ~1.9x.
+    const estimatedCloseCostPct = crossSectionalEstimatedCostPct();
     let grossUnrealizedUsd: number | null = filteredOpenBaskets.length === 0 ? 0 : null;
     let unrealizedMarkNotionalUsd = 0;
     const openBasketUnrealized = new Map<string, { grossUsd: number; afterEstimatedCloseCostUsd: number }>();

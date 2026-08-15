@@ -309,6 +309,47 @@ const OVERLAP_MIN_SIGNAL_DRIFT_PCT = () => Math.max(0, Number(process.env.CROSS_
 export function isCrossSectionalLossReentryGuardEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return env.CROSS_SECTIONAL_LOSS_REENTRY_GUARD_ENABLED === "1";
 }
+/**
+ * Round-trip cost of ONE cross-sectional basket, as a fraction of DEPLOYED notional.
+ *
+ * The system-wide `LIVE_ESTIMATED_CLOSE_COST_PCT` (default 0.0022 = 22bps) is a single blended
+ * entry+exit fee AND slippage constant — see current-guard-variant-matrix.ts's
+ * PRODUCTION_BREAKEVEN_CONTROL_COST_PCT doc. It is calibrated for MAINNET single-symbol lanes,
+ * where taker is 5bps/side and a stop-market exit can slip badly. Applied to a testnet 6-leg
+ * basket exiting on market orders at a calm moment it overstates cost by ~1.9x, which makes every
+ * open basket look worse than it is and invites closing a working position early.
+ *
+ * MEASURED 2026-08-15 on testnet, three independent ways that agree:
+ *   1. Code: closeBasket() sums getUserTrades commissions over BOTH entryOrderId and exitOrderId,
+ *      so the stored feeEstimateUsd is already a full round trip (unlike the directional lanes,
+ *      whose feeEstimateUsd holds only the exit side while entryCommissionUsd goes unbooked).
+ *   2. Per-fill exchange records (execution-fills.json, 66 fills, fetchComplete, not truncated):
+ *      commission/touched-notional = 4.015 bps per side; ENTRY 36 fills and EXIT 30 fills both
+ *      4.015. Round trip on deployed notional = 8.03 bps.
+ *   3. Rate constancy: median 4.0000, min 3.9997, max 5.0000, only 2 distinct values — a flat
+ *      taker rate, not a blend. Cross-checked against the basket-level field on all five closed
+ *      baskets: 8.019 / 8.001 / 7.940 / 8.037 / 8.241 bps.
+ *
+ * Slippage, measured separately: entry 2.83 bps (n=23 legs, vs the scan reference price), exit
+ * 0.93 bps mean / 0.76 median (n=30 legs, vs the 1m bar). The exit figure is NOISY (range -36 to
+ * +61 bps) because a fill lands at one instant inside a moving bar, so the median is the honest
+ * read; either way it is small, not the ~11 bps that would have justified 22.
+ *
+ * Total measured = 8.03 fee + 2.83 entry + 0.93 exit = 11.79 bps. The default below is 13 bps:
+ * the fee component is exact, the slippage components are not, and understating cost is the more
+ * dangerous error for a lane that may one day see real money. The margin is deliberate and stated
+ * rather than hidden in a rounded-up figure.
+ *
+ * TESTNET-SCOPED. Mainnet taker was measured at 5bps/side on 2026-07-27 (→10bps fee) and its fee
+ * ledger under-counts ~50%, so a mainnet basket costs materially more. Set the env explicitly
+ * before this lane is ever pointed at a real account.
+ */
+export function crossSectionalEstimatedCostPct(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = Number.parseFloat(env.CROSS_SECTIONAL_ESTIMATED_COST_PCT ?? "");
+  if (Number.isFinite(raw) && raw >= 0) return raw;
+  return 0.0013;
+}
+
 const REENTRY_ESTIMATED_CLOSE_COST_PCT = () => {
   const configured = Number(
     process.env.CROSS_SECTIONAL_REENTRY_ESTIMATED_CLOSE_COST_PCT ??
