@@ -221,6 +221,51 @@ export function sizeCrossSectionalLeg(
   if (!(qty > 0) || qty < minQty || qty * entryPrice + 1e-9 < minNotional) return null;
   return Number(qty.toFixed(8));
 }
+
+/**
+ * Notional imbalance of a PLANNED basket, as a fraction of total planned notional.
+ *
+ * 2026-08-15: `sizeCrossSectionalLeg` can only ever ROUND UP — a symbol whose one-lot notional
+ * exceeds its target leg (stepSize=1 coins priced above the leg size, e.g. AVAX at $13.44 against a
+ * $7.16 target) is lifted to a full lot, and the two sides stop matching. Measured across the 9
+ * baskets this executor has actually opened: at full leg size the imbalance is 0.40% / 0.93% /
+ * 2.18%, but under the 0.35 learning multiplier it is 4.92% / 5.22% / 10.00%. A "market-neutral"
+ * basket carrying 5-10% net directional exposure books market beta as though it were the lane's
+ * cross-sectional edge — the measurement, not just the risk, is what breaks.
+ *
+ * Pure and side-effect free so the threshold can be exercised without an exchange.
+ */
+export function crossSectionalPlanNotionalImbalance(
+  legs: ReadonlyArray<{ side: "LONG" | "SHORT"; requestedQty: number; refPrice: number }>,
+): number {
+  let longUsd = 0;
+  let shortUsd = 0;
+  for (const leg of legs) {
+    const notional = Math.abs(leg.requestedQty * leg.refPrice);
+    if (!Number.isFinite(notional)) continue;
+    if (leg.side === "LONG") longUsd += notional;
+    else shortUsd += notional;
+  }
+  const total = longUsd + shortUsd;
+  if (!(total > 0)) return 0;
+  return Math.abs(longUsd - shortUsd) / total;
+}
+
+/** Operator ceiling for the above, as a FRACTION. `0` (or unset/invalid) disables the guard. */
+export function crossSectionalMaxPlanImbalance(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = Number.parseFloat(env.CROSS_SECTIONAL_MAX_PLAN_IMBALANCE_PCT ?? "");
+  if (!Number.isFinite(raw) || raw <= 0) return 0;
+  return raw / 100;
+}
+
+/** True ⇒ this plan is too lopsided to be booked as market-neutral. Never throws. */
+export function crossSectionalPlanImbalanceExceeded(
+  legs: ReadonlyArray<{ side: "LONG" | "SHORT"; requestedQty: number; refPrice: number }>,
+  maxFraction: number,
+): boolean {
+  if (!(maxFraction > 0)) return false;
+  return crossSectionalPlanNotionalImbalance(legs) > maxFraction;
+}
 const EXEC_LEVERAGE = () => {
   const n = Number.parseInt(process.env.CROSS_SECTIONAL_EXEC_LEVERAGE ?? "", 10);
   return Number.isFinite(n) && n >= 1 ? Math.floor(n) : 3;
@@ -3337,6 +3382,22 @@ export class CrossSectionalExecutor {
           failureReason: null,
         });
       }
+    }
+    // 2026-08-15 neutrality guard — see crossSectionalPlanNotionalImbalance's doc comment. Runs
+    // AFTER every leg is sized (so it sees the real, lot-rounded notionals) and BEFORE any order is
+    // placed. Skip-only: it never resizes, never cancels, never opens anything. Disabled by default
+    // (threshold 0) so enabling it is an explicit operator act.
+    const plannedImbalanceMax = crossSectionalMaxPlanImbalance();
+    if (crossSectionalPlanImbalanceExceeded(plannedLegs, plannedImbalanceMax)) {
+      const pct = (100 * crossSectionalPlanNotionalImbalance(plannedLegs)).toFixed(2);
+      releasePlannedSoFar("PLAN_NOTIONAL_IMBALANCE");
+      this.skipSignal(
+        signal,
+        "SIZING",
+        `planned basket is ${pct}% long/short imbalanced after lot rounding (ceiling ${(100 * plannedImbalanceMax).toFixed(2)}%) — not market-neutral`,
+        smartEntry.referencePrices,
+      );
+      return;
     }
     if (plannedLegs.length !== signal.longLeg.length + signal.shortLeg.length) {
       releasePlannedSoFar("PLANNED_LEG_COUNT_MISMATCH");
