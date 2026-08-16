@@ -1974,73 +1974,268 @@ sementara plafon C2 pada leg $${leg === null ? "—" : leg.toFixed(2)} adalah $$
 
 <p class="muted" style="margin-top:26px;border-top:1px solid var(--line);padding-top:14px">
 dibuat ${esc(new Date(now).toISOString())} &middot; di-cache 15 menit &middot; disajikan API, bukan dari <code>dist/</code>, supaya deploy dashboard tidak menimpanya
-</p></div></body></html>`;
+</p>
+</div></body></html>`;
 
     reply.type("text/html; charset=utf-8");
     return html;
   });
 
+  /**
+   * Catatan trade lane CROSS_SECTIONAL_DIRECTIONAL — every position, open and closed (2026-08-17).
+   *
+   * REPURPOSED from the overlay counterfactual, which had frozen: the overlay's last close was
+   * 2026-08-14T04:27 and every close since has been the lane's own exit, so the page it fed had
+   * stopped accumulating rows and its question — "what would the lane's own exits have returned
+   * instead" — stopped being a live decision. The counterfactual JSON endpoint is untouched for
+   * anyone who still wants it; this URL now answers the question actually being asked of it, which
+   * is what these lanes are doing and which exit is closing them.
+   *
+   * Reads the executor stores directly, so a row exists only once a position really opened on the
+   * exchange. Numbers are FULLY COSTED via fullyCostedNetPnlUsd — 13 of the first 14 positions have
+   * entryLegFoldedIntoPnl false, meaning their stored netPnlUsd excludes the entry leg and reads
+   * about 0.027R too generous.
+   */
   app.get("/api/live/directional-overlay-counterfactual/view", async (_request, reply) => {
-    const p = (await buildOverlayCf()) as OverlayCfPayload;
     const esc = (v: unknown): string => String(v).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c] ?? c));
-    const r3 = (v: number | null | undefined): string => (v == null ? "n/a" : (v >= 0 ? "+" : "") + v.toFixed(3));
+    const r3 = (v: number | null | undefined): string => (v == null ? "—" : (v >= 0 ? "+" : "") + v.toFixed(3));
+    const usd = (v: number | null | undefined): string => (v == null ? "—" : (v >= 0 ? "+" : "") + v.toFixed(4));
 
-    const laneBlocks = Object.entries(p.lanes).map(([lane, v]) => {
-      if (!v.summary) return `<section><h2>${esc(lane)}</h2><p class="muted">${esc(v.error ?? "no data")}</p></section>`;
-      const s2 = v.summary;
-      const undecided = s2.verdict.startsWith("NOT DECIDABLE") || s2.verdict.startsWith("INCOMPLETE");
-      const rows = v.rows.map((r) => `<tr>
-        <td>${esc(r.symbol)}</td><td class="mono">${esc(r.openedAt.slice(0, 16))}</td>
-        <td class="num ${r.actualNetR >= 0 ? "pos" : "neg"}">${r3(r.actualNetR)}</td>
-        <td class="num ${r.counterfactualNetR >= 0 ? "pos" : "neg"}">${r3(r.counterfactualNetR)}</td>
-        <td class="num ${r.deltaR >= 0 ? "pos" : "neg"}">${r3(r.deltaR)}</td>
-        <td>${esc(r.counterfactualExit)}</td><td class="num">${r.counterfactualHoldHours.toFixed(1)}</td>
-      </tr>`).join("");
-      return `<section>
-        <h2>${esc(lane)}</h2>
-        <div class="verdict ${undecided ? "warn" : "ok"}">${esc(s2.verdict)}</div>
-        <div class="grid">
-          <div><span>posisi</span><b>${s2.n}</b></div>
-          <div><span>episode independen</span><b>${s2.independentEpisodes}</b></div>
-          <div><span>hari</span><b>${s2.distinctDays}</b></div>
-          <div><span>stop kena</span><b>${s2.stopsHit}</b></div>
-          <div><span>nyata (ditutup overlay)</span><b class="${(s2.actualMeanR ?? 0) >= 0 ? "pos" : "neg"}">${r3(s2.actualMeanR)}R</b></div>
-          <div><span>tanpa overlay</span><b class="${(s2.counterfactualMeanR ?? 0) >= 0 ? "pos" : "neg"}">${r3(s2.counterfactualMeanR)}R</b></div>
-          <div><span>selisih</span><b class="${(s2.deltaMeanR ?? 0) >= 0 ? "pos" : "neg"}">${r3(s2.deltaMeanR)}R</b></div>
-        </div>
-        ${v.rows.length ? `<table><thead><tr><th>simbol</th><th>dibuka</th><th class="num">nyata R</th><th class="num">tanpa overlay R</th><th class="num">selisih</th><th>exit</th><th class="num">jam</th></tr></thead><tbody>${rows}</tbody></table>` : ""}
-      </section>`;
-    }).join("");
+    interface LedgerRow {
+      lane: string; symbol: string; direction: string; status: string;
+      openedAt: string; closedAt: string | null; closeReason: string | null;
+      entryPrice: number; exitPrice: number | null; stopPrice: number;
+      stopPct: number | null; netUsd: number | null; netR: number | null; costR: number | null;
+      peakR: number | null; holdHours: number | null; makerPct: number | null; qty: number;
+      slipBps: number | null; spreadBps: number | null; quoteAgeMs: number | null; venueOk: boolean | null;
+    }
 
-    reply.type("text/html; charset=utf-8");
-    return `<!doctype html><html lang="id"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Overlay Counterfactual</title><style>
-:root{--bg:#fff;--fg:#1a1a1a;--mut:#6b7280;--line:#e5e7eb;--card:#f9fafb;--pos:#047857;--neg:#b91c1c;--warnbg:#fef3c7;--warnfg:#92400e;--okbg:#d1fae5;--okfg:#065f46}
-@media(prefers-color-scheme:dark){:root{--bg:#0f1115;--fg:#e5e7eb;--mut:#9ca3af;--line:#272b33;--card:#161a20;--pos:#34d399;--neg:#f87171;--warnbg:#3b2f0b;--warnfg:#fcd34d;--okbg:#06301f;--okfg:#6ee7b7}}
+    const rows: LedgerRow[] = [];
+    let unreadable: string | null = null;
+    for (const [lane, file] of [
+      ["SHORT", "data/cross-sectional-directional-short-executor.json"],
+      ["LONG", "data/cross-sectional-directional-long-executor.json"],
+    ] as const) {
+      let positions: Array<Record<string, unknown>> = [];
+      try {
+        positions = (JSON.parse(readFileSync(file, "utf-8")) as { positions?: Array<Record<string, unknown>> }).positions ?? [];
+      } catch { unreadable = `${unreadable ?? ""}${lane} `; continue; }
+      for (const p of positions) {
+        const entry = Number(p.entryPrice); const stop = Number(p.stopPrice); const qty = Number(p.qty);
+        const riskUsd = Number.isFinite(entry) && Number.isFinite(stop) && Number.isFinite(qty) ? Math.abs(entry - stop) * qty : Number.NaN;
+        const netUsd = fullyCostedNetPnlUsd(p as never);
+        const feeUsd = fullyCostedFeeUsd(p as never);
+        const openMs = Date.parse(String(p.openedAt ?? ""));
+        const closeMs = p.closedAt ? Date.parse(String(p.closedAt)) : Number.NaN;
+        const liq = p.entryLiquidity as { makerQty?: number; takerQty?: number } | undefined;
+        const liqTotal = liq ? (liq.makerQty ?? 0) + (liq.takerQty ?? 0) : 0;
+        rows.push({
+          lane, symbol: String(p.symbol ?? "?"), direction: String(p.direction ?? "?"),
+          status: String(p.status ?? "?"), openedAt: String(p.openedAt ?? ""),
+          closedAt: p.closedAt ? String(p.closedAt) : null,
+          closeReason: p.closeReason ? String(p.closeReason) : null,
+          entryPrice: entry, exitPrice: p.exitPrice == null ? null : Number(p.exitPrice), stopPrice: stop,
+          stopPct: Number.isFinite(entry) && entry > 0 ? Math.abs(entry - stop) / entry * 100 : null,
+          netUsd, qty,
+          netR: netUsd != null && riskUsd > 0 ? netUsd / riskUsd : null,
+          // What the round trip costs as a share of the risk unit. This is the number the stop
+          // floor exists to move: it is 8bps/stopWidth and nothing else.
+          costR: Number.isFinite(feeUsd as number) && riskUsd > 0 ? (feeUsd as number) / riskUsd : null,
+          peakR: typeof p.peakFavorableR === "number" ? p.peakFavorableR : null,
+          holdHours: Number.isFinite(openMs) && Number.isFinite(closeMs) ? (closeMs - openMs) / 3600e3 : null,
+          makerPct: liqTotal > 0 ? ((liq!.makerQty ?? 0) / liqTotal) * 100 : null,
+          // Entry quality, from the book quote captured immediately before the order went out.
+          // SHORT sells into the bid, LONG buys the ask; anything worse than that touch is slippage.
+          ...(() => {
+            const sr = p.submitRef as { bid?: number; ask?: number; mid?: number; ageAtSubmitMs?: number; venueMatchesExecution?: boolean } | undefined;
+            const bid = sr?.bid; const ask = sr?.ask; const mid = sr?.mid;
+            const touch = String(p.direction) === "SHORT" ? bid : ask;
+            const ok = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v) && v > 0;
+            return {
+              slipBps: ok(touch) && ok(entry) && ok(mid)
+                ? ((String(p.direction) === "SHORT" ? touch - entry : entry - touch) / mid) * 10000 : null,
+              spreadBps: ok(bid) && ok(ask) && ok(mid) ? ((ask - bid) / mid) * 10000 : null,
+              quoteAgeMs: typeof sr?.ageAtSubmitMs === "number" ? sr.ageAtSubmitMs : null,
+              venueOk: typeof sr?.venueMatchesExecution === "boolean" ? sr.venueMatchesExecution : null,
+            };
+          })(),
+        });
+      }
+    }
+    rows.sort((a, b) => (b.openedAt > a.openedAt ? 1 : b.openedAt < a.openedAt ? -1 : 0));
+
+    const closed = rows.filter((r) => r.status === "CLOSED" && r.netR != null);
+    const open = rows.filter((r) => r.status !== "CLOSED");
+    const mean = (v: number[]) => (v.length ? v.reduce((a, b) => a + b, 0) / v.length : Number.NaN);
+
+    // Episodes, not rows. Signals fire in bursts from one market reading; counting rows as
+    // independent is how every SE in this system ends up understated.
+    const opens = rows.map((r) => Date.parse(r.openedAt)).filter(Number.isFinite).sort((a, b) => a - b);
+    const episodes = opens.length ? 1 + opens.slice(1).filter((t, i) => t - opens[i]! >= 86400e3).length : 0;
+    const spanDays = opens.length > 1 ? (opens[opens.length - 1]! - opens[0]!) / 86400e3 : 0;
+
+    const byReason = new Map<string, LedgerRow[]>();
+    for (const r of closed) {
+      const k = (r.closeReason ?? "?").split(":")[0]!;
+      byReason.set(k, [...(byReason.get(k) ?? []), r]);
+    }
+    const bySymbol = new Map<string, LedgerRow[]>();
+    for (const r of closed) bySymbol.set(r.symbol, [...(bySymbol.get(r.symbol) ?? []), r]);
+
+    // Plain-language reading of each close reason. The enum names describe the MECHANISM; these say
+    // what actually happened to the trade, which is what an operator is asking when they read the
+    // table. Anything unrecognised falls through with the raw name rather than a made-up gloss.
+    const REASON_PLAIN: Record<string, string> = {
+      DIRECTIONAL_REVERSAL_CONFIRMED: "Dipotong overlay rezim. Dua scan berturut-turut memastikan arah pasar berbalik melawan posisi, jadi ditutup lebih awal — bukan karena kena target maupun stop.",
+      MFE_PROFIT_LOCK: "Untung dikunci. Harga sempat melewati level kunci 0,50R lalu turun balik menembusnya, jadi laba diamankan sebelum sempat hilang.",
+      MFE_GIVEBACK: "Untung menyusut. Puncaknya melewati 0,75R lalu harga mengembalikan 30% dari puncak itu, jadi ditutup supaya sisanya tidak ikut hilang.",
+      MAX_HOLD_MTM: "Waktu habis. 24 jam berlalu tanpa kena target maupun stop, jadi ditutup di harga pasar apa adanya — untung atau rugi seadanya.",
+      INITIAL_STOP: "Kena stop. Harga menembus batas rugi −1R.",
+      STATIC_TP: "Kena target tetap.",
+      PROFIT_BANK: "Diambil profit-bank saat laba bersih melewati ambang operator.",
+    };
+    const OWN = new Set(["MFE_PROFIT_LOCK", "MFE_GIVEBACK", "MAX_HOLD_MTM", "INITIAL_STOP", "STATIC_TP"]);
+    const ownExits = closed.filter((r) => OWN.has((r.closeReason ?? "").split(":")[0]!));
+
+    const groupRows = (m: Map<string, LedgerRow[]>, explain = false) => [...m.entries()]
+      .sort((a, b) => b[1].length - a[1].length)
+      .map(([k, v]) => `<tr><td class="mono">${esc(k)}${explain ? `<div class="plain">${esc(REASON_PLAIN[k] ?? "Alasan ini belum punya penjelasan awam — nama enumnya ditampilkan apa adanya.")}</div>` : ""}</td><td class="num">${v.length}</td>
+        <td class="num ${mean(v.map((x) => x.netR!)) >= 0 ? "pos" : "neg"}">${r3(mean(v.map((x) => x.netR!)))}</td>
+        <td class="num">${usd(v.reduce((a, x) => a + (x.netUsd ?? 0), 0))}</td>
+        <td class="num">${mean(v.map((x) => x.holdHours ?? 0)).toFixed(1)}j</td></tr>`).join("");
+
+    const ledger = rows.map((r) => `<tr class="${r.status === "CLOSED" ? "" : "open"}">
+      <td class="mono">${esc(r.openedAt.slice(0, 16))}</td>
+      <td class="sym">${esc(r.symbol.replace("USDT", ""))}</td>
+      <td class="${r.direction === "SHORT" ? "neg" : "pos"}">${esc(r.direction)}</td>
+      <td class="num">${r.stopPct == null ? "—" : r.stopPct.toFixed(2) + "%"}</td>
+      <td class="num">${r.costR == null ? "—" : r.costR.toFixed(3)}</td>
+      <td class="num">${r3(r.peakR)}</td>
+      <td class="num ${(r.netR ?? 0) >= 0 ? "pos" : "neg"}">${r3(r.netR)}</td>
+      <td class="num">${usd(r.netUsd)}</td>
+      <td class="num">${r.holdHours == null ? "—" : r.holdHours.toFixed(1) + "j"}</td>
+      <td>${r.status === "CLOSED" ? esc(r.closeReason ?? "—") : '<b class="warn">MASIH TERBUKA</b>'}</td>
+      <td class="num">${r.makerPct == null ? '<span class="muted">taker</span>' : r.makerPct.toFixed(0) + "% mkr"}</td>
+    </tr>`).join("");
+
+    // Per-position verdicts, one row per hypothesis an operator actually asks about. Every verdict
+    // is derived from a stored field; where the store cannot separate two explanations, it says so
+    // instead of picking the tidier one.
+    const symbolMean = new Map<string, number>();
+    for (const [sym, v] of bySymbol) symbolMean.set(sym, mean(v.map((x) => x.netR!)));
+    const LOCK_R = 0.5;
+
+    const verdict = (tag: "ya" | "tidak" | "abu", text: string) =>
+      `<span class="v-${tag}">${tag === "ya" ? "YA" : tag === "tidak" ? "tidak" : "tak terpisah"}</span> ${esc(text)}`;
+
+    const diagnose = (r: LedgerRow): string => {
+      const out: Array<[string, string]> = [];
+      const overlay = (r.closeReason ?? "").startsWith("DIRECTIONAL_REVERSAL_CONFIRMED");
+      const peak = r.peakR ?? 0;
+
+      out.push(["salah entry", r.slipBps == null
+        ? verdict("abu", "submitRef tidak tercatat — kualitas entry tidak bisa dinilai untuk posisi ini")
+        : Math.abs(r.slipBps) <= 0.5 && r.venueOk !== false
+          ? verdict("tidak", `terisi ${r.slipBps >= 0 ? "tepat di" : "lebih buruk dari"} harga sentuh (slippage ${r.slipBps.toFixed(2)} bps, spread ${r.spreadBps?.toFixed(2) ?? "—"} bps, kutipan ${((r.quoteAgeMs ?? 0) / 1000).toFixed(1)} dtk)`)
+          : verdict("ya", `slippage ${r.slipBps.toFixed(2)} bps dari harga sentuh${r.venueOk === false ? ", dan venue kutipan BEDA dari venue eksekusi" : ""}`)]);
+
+      const symMean = symbolMean.get(r.symbol);
+      const symN = (bySymbol.get(r.symbol) ?? []).length;
+      out.push(["salah simbol", symN < 3
+        ? verdict("abu", `${r.symbol.replace("USDT", "")} baru ${symN} posisi tertutup — terlalu sedikit untuk menyalahkan simbolnya`)
+        : (symMean ?? 0) < -0.1
+          ? verdict("ya", `${r.symbol.replace("USDT", "")} rata-rata ${r3(symMean)}R atas ${symN} posisi`)
+          : verdict("tidak", `${r.symbol.replace("USDT", "")} rata-rata ${r3(symMean)}R atas ${symN} posisi`)]);
+
+      out.push(["regime berbalik", overlay
+        ? verdict("ya", `ditutup overlay setelah ${(r.holdHours ?? 0).toFixed(1)} jam — exit lane sendiri tidak pernah dapat giliran`)
+        : verdict("tidak", "exit lane sendiri yang menutup, overlay tidak ikut campur")]);
+
+      out.push(["masuk terlalu cepat / salah arah", peak <= 0.05
+        ? verdict("abu", `harga tidak pernah bergerak ke arah kita (puncak ${r3(r.peakR)}R). Store hanya menyimpan puncaknya, bukan jalurnya — "arah salah" dan "masuk kepagian" tidak bisa dipisahkan dari data ini`)
+        : verdict("tidak", `sempat untung ${r3(r.peakR)}R dulu, jadi arahnya sempat benar dan ini bukan pembalikan seketika`)]);
+
+      out.push(["geometri TP", peak >= LOCK_R
+        ? verdict("tidak", `puncak ${r3(r.peakR)}R melewati kunci ${LOCK_R}R — geometrinya benar-benar diuji di posisi ini`)
+        : verdict("abu", `puncak ${r3(r.peakR)}R, kunci ada di ${LOCK_R}R — tidak pernah dekat, jadi geometri TP belum teruji di sini`)]);
+
+      out.push(["ongkos", r.costR == null
+        ? verdict("abu", "ongkos tidak tercatat")
+        : r.costR >= 0.10
+          ? verdict("ya", `${r.costR.toFixed(3)}R dimakan komisi — stop ${r.stopPct?.toFixed(2)}% terlalu sempit relatif ongkos`)
+          : r.costR >= 0.05
+            ? verdict("abu", `${r.costR.toFixed(3)}R, tidak kecil: sebanding ${(r.costR / Math.max(Math.abs(r.netR ?? 0), 1e-9) * 100).toFixed(0)}% dari hasil bersihnya`)
+            : verdict("tidak", `${r.costR.toFixed(3)}R pada stop ${r.stopPct?.toFixed(2)}%`)]);
+
+      return `<details class="diag"><summary><b>${esc(r.symbol.replace("USDT", ""))}</b> ${esc(r.direction)} · ${esc(r.openedAt.slice(0, 16))} · <span class="${(r.netR ?? 0) >= 0 ? "pos" : "neg"}">${r3(r.netR)}R</span> · ${esc((r.closeReason ?? "").split(":")[0] || "—")}</summary>
+        <div class="plain" style="margin:6px 0 8px">${esc(REASON_PLAIN[(r.closeReason ?? "").split(":")[0]!] ?? "")}</div>
+        <table><tbody>${out.map(([k, v]) => `<tr><td class="dk">${esc(k)}</td><td>${v}</td></tr>`).join("")}</tbody></table></details>`;
+    };
+
+    const html = `<!doctype html><html lang="id"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Catatan Trade Directional</title><style>
+:root{--bg:#fff;--fg:#1a1a1a;--mut:#6b7280;--line:#e5e7eb;--card:#f9fafb;--pos:#047857;--neg:#b91c1c;--warnbg:#fef3c7;--warnfg:#92400e}
+@media(prefers-color-scheme:dark){:root{--bg:#0f1115;--fg:#e5e7eb;--mut:#9ca3af;--line:#272b33;--card:#161a20;--pos:#34d399;--neg:#f87171;--warnbg:#3b2f0b;--warnfg:#fcd34d}}
 *{box-sizing:border-box}body{margin:0;padding:24px;background:var(--bg);color:var(--fg);font:14px/1.55 ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
-h1{font-size:19px;margin:0 0 4px}h2{font-size:15px;margin:26px 0 10px;letter-spacing:.02em}
-.muted{color:var(--mut);font-size:12.5px}.mono{font-variant-numeric:tabular-nums;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
-.verdict{padding:10px 13px;border-radius:8px;font-size:13px;margin-bottom:12px;line-height:1.45}
-.verdict.warn{background:var(--warnbg);color:var(--warnfg)}.verdict.ok{background:var(--okbg);color:var(--okfg)}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:9px;margin-bottom:14px}
+.wrap{max-width:1180px;margin:0 auto}h1{font-size:19px;margin:0 0 4px}h2{font-size:15px;margin:26px 0 8px}
+.muted{color:var(--mut)}.pos{color:var(--pos)}.neg{color:var(--neg)}.warn{color:var(--warnfg)}
+.note{background:var(--warnbg);color:var(--warnfg);padding:10px 13px;border-radius:8px;font-size:13px;margin:10px 0}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(132px,1fr));gap:9px;margin:12px 0}
 .grid div{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:9px 11px}
 .grid span{display:block;color:var(--mut);font-size:11.5px;margin-bottom:3px}.grid b{font-size:16px;font-variant-numeric:tabular-nums}
-table{width:100%;border-collapse:collapse;font-size:13px}th,td{text-align:left;padding:7px 9px;border-bottom:1px solid var(--line)}
-th{color:var(--mut);font-weight:600;font-size:11.5px;text-transform:uppercase;letter-spacing:.04em}
-.num{text-align:right;font-variant-numeric:tabular-nums}.pos{color:var(--pos)}.neg{color:var(--neg)}
-.wrap{max-width:1000px;margin:0 auto}.foot{margin-top:26px;padding-top:14px;border-top:1px solid var(--line)}
+table{width:100%;border-collapse:collapse;font-size:12.5px}th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line)}
+th{color:var(--mut);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.03em;white-space:nowrap}
+.num{text-align:right;font-variant-numeric:tabular-nums}.sym{font-weight:600}.mono{font-family:ui-monospace,Menlo,monospace;font-size:11.5px}
+tr.open td{background:var(--card)}.wrapx{overflow-x:auto}
+.plain{color:var(--mut);font-size:11.5px;line-height:1.5;font-weight:400;white-space:normal;max-width:52ch}
+.diag{border:1px solid var(--line);border-radius:6px;padding:8px 11px;margin:6px 0;background:var(--card)}
+.diag summary{cursor:pointer;font-size:13px}.diag td{border:0;padding:3px 6px;vertical-align:top}
+.diag .dk{color:var(--mut);white-space:nowrap;width:1%;font-size:11.5px}
+.v-ya{color:var(--neg);font-weight:600}.v-tidak{color:var(--pos);font-weight:600}.v-abu{color:var(--warnfg);font-weight:600}
 </style></head><body><div class="wrap">
-<h1>Overlay Counterfactual — XSEC directional</h1>
-<p class="muted">Apa yang <em>akan</em> dihasilkan posisi kalau overlay rezim tidak menutupnya, dan hanya exit lane sendiri yang berlaku. <b>Report-only</b> — overlay tetap menutup posisi nyata; halaman ini tidak mengubah apa pun.</p>
-${laneBlocks}
-<div class="foot muted">
-dibuat ${esc(p.generatedAt)} · ongkos terukur ${esc(p.measuredCostBps)} bps ·
-arm ${esc(p.ownExitParams.armR)}R · giveback ${esc(p.ownExitParams.givebackFraction)} ·
-profit-lock ${esc(p.ownExitParams.profitLockNetReturn)} · static TP ${esc(p.ownExitParams.staticTpMaxNetReturn)} ·
-max-hold ${esc(p.ownExitParams.maxHoldHours)} jam<br>
-Replay memakai candle 5m Binance asli. Exit lane dipicu <b>hanya oleh harga close</b> (bukan wick); stop dicek lebih dulu dan boleh kena wick karena ia resting order.
-</div></div></body></html>`;
+<h1>Catatan Trade — CROSS_SECTIONAL_DIRECTIONAL</h1>
+<p class="muted">Setiap posisi yang benar-benar dibuka di exchange, terbuka maupun tertutup. Angka <b>sudah berongkos penuh</b>
+(<code>fullyCostedNetPnlUsd</code>) — 13 dari 14 posisi pertama menyimpan <code>netPnlUsd</code> tanpa kaki masuk, kira-kira 0,027R terlalu murah hati.</p>
+
+<div class="grid">
+  <div><span>posisi</span><b>${rows.length}</b></div>
+  <div><span>tertutup</span><b>${closed.length}</b></div>
+  <div><span>terbuka</span><b>${open.length}</b></div>
+  <div><span>episode independen</span><b>${episodes}</b></div>
+  <div><span>rentang</span><b>${spanDays.toFixed(1)} hari</b></div>
+  <div><span>mean netR</span><b class="${mean(closed.map((r) => r.netR!)) >= 0 ? "pos" : "neg"}">${r3(mean(closed.map((r) => r.netR!)))}</b></div>
+  <div><span>total USD</span><b class="${closed.reduce((a, r) => a + (r.netUsd ?? 0), 0) >= 0 ? "pos" : "neg"}">${usd(closed.reduce((a, r) => a + (r.netUsd ?? 0), 0))}</b></div>
+  <div><span>exit lane sendiri</span><b>${ownExits.length}/${closed.length}</b></div>
+</div>
+
+<div class="note">${episodes < 20
+  ? `<b>Belum bisa disimpulkan.</b> ${episodes} episode independen atas ${spanDays.toFixed(1)} hari — sinyal menyala berkelompok dari satu pembacaan pasar, jadi ${closed.length} baris ini BUKAN ${closed.length} pengamatan bebas. Butuh ~20 episode lintas ≥7 hari sebelum mean di atas berarti apa pun.`
+  : `${episodes} episode independen atas ${spanDays.toFixed(1)} hari.`}</div>
+
+<h2>Ditutup oleh apa</h2>
+<p class="muted">Pertanyaan yang paling sering ditanyakan ke lane ini. <code>DIRECTIONAL_REVERSAL_CONFIRMED</code> = overlay rezim memotong; sisanya exit lane sendiri.</p>
+<div class="wrapx"><table><thead><tr><th>alasan tutup</th><th class="num">n</th><th class="num">mean netR</th><th class="num">total USD</th><th class="num">tahan</th></tr></thead>
+<tbody>${groupRows(byReason, true) || '<tr><td colspan="5" class="muted">belum ada yang tertutup</td></tr>'}</tbody></table></div>
+
+<h2>Per simbol</h2>
+<div class="wrapx"><table><thead><tr><th>simbol</th><th class="num">n</th><th class="num">mean netR</th><th class="num">total USD</th><th class="num">tahan</th></tr></thead>
+<tbody>${groupRows(bySymbol) || '<tr><td colspan="5" class="muted">belum ada</td></tr>'}</tbody></table></div>
+
+<h2>Seluruh posisi</h2>
+<p class="muted"><b>ongkos R</b> = komisi bolak-balik dibagi satuan risiko, yaitu 8bps/lebar-stop — makin sempit stop, makin besar porsi yang dimakan ongkos. Itulah angka yang lantai stop 2% ada untuk menggesernya.</p>
+<div class="wrapx"><table><thead><tr>
+<th>dibuka</th><th>simbol</th><th>arah</th><th class="num">stop%</th><th class="num">ongkos R</th><th class="num">peak R</th><th class="num">net R</th><th class="num">net USD</th><th class="num">tahan</th><th>ditutup oleh</th><th class="num">likuiditas</th>
+</tr></thead><tbody>${ledger || '<tr><td colspan="11" class="muted">belum ada posisi</td></tr>'}</tbody></table></div>
+
+<h2>Evaluasi per posisi</h2>
+<p class="muted">Tiap posisi tertutup diuji terhadap dugaan yang sama. Verdict diturunkan dari field tersimpan; kalau store tidak bisa memisahkan dua penjelasan, ia mengatakannya alih-alih memilih yang lebih rapi.</p>
+${closed.map(diagnose).join("") || '<p class="muted">belum ada posisi tertutup</p>'}
+
+${unreadable ? `<div class="note">Store lane ${esc(unreadable)}tidak terbaca — baris lane itu HILANG dari halaman ini, bukan nol.</div>` : ""}
+</div></body></html>`;
+
+    reply.type("text/html; charset=utf-8");
+    return html;
   });
 
   async function buildOverlayCf(): Promise<unknown> {
