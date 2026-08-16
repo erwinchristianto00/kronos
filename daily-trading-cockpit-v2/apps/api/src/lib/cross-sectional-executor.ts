@@ -571,6 +571,17 @@ export interface PlannedLeg {
    *  leave recovery querying the maker id, finding it CANCELED, and never discovering a fallback
    *  order that did reach the exchange — the exact "invisible naked position" this file's
    *  reconciliation was built to prevent. */
+  /** Set by the parallel pre-place pass: the post-only order for this leg is ALREADY resting on
+   *  the exchange. The sequential loop then skips straight to cancel/re-query/fallback instead of
+   *  placing a second one. Persisted because a crash between the pre-place and the loop must leave
+   *  recovery able to find the resting order — which it does via entryClientOrderId, unchanged. */
+  makerRestingOrderId?: string;
+  /** Limit price the resting order was posted at, kept so a fill whose avgPrice never confirms can
+   *  still be booked at the price we actually rested at rather than a guess. */
+  makerRestingPrice?: number;
+  /** submitRef captured at PRE-PLACE time. Without this the loop would stamp it minutes later and
+   *  `ageAtSubmitMs` would describe a quote the order never saw. */
+  makerSubmitRef?: SubmitRef | null;
   takerFallbackClientOrderId?: string;
   /** Report-only record of how this leg was actually filled, so the maker/taker split can be read
    *  back from the basket store without joining to exchange trades. */
@@ -1896,13 +1907,112 @@ export class CrossSectionalExecutor {
    * loop's existing ambiguous-failure reconciliation, which already knows how to recover a leg by
    * client id and must stay the single owner of that decision.
    */
+  /**
+   * Post every leg's maker order AT ONCE, then wait for all of them ONCE.
+   *
+   * WHY THIS EXISTS. Placing legs sequentially with a per-leg timeout multiplies the wait: six legs
+   * at 20s each is up to two minutes, and at the 5-minute wait the fill data actually favours it
+   * would be half an hour. Every second between the first and last leg is drift the basket carries
+   * as directional exposure, so the sequential shape put fill rate and neutrality in direct
+   * opposition. Posting in parallel makes the total wait ONE timeout regardless of leg count, which
+   * is what lets the timeout be long enough to matter — measured, 65% of orders fill within a
+   * minute and 81% within five, with adverse selection flat at about -1.0 bps throughout.
+   *
+   * DELIBERATELY DOES NOT BOOK ANYTHING. It places and waits; the existing sequential loop still
+   * owns cancelling, re-querying, the taker fallback, reservations, partial fills and every
+   * ambiguous-failure path. That loop's recovery invariants are the most carefully built part of
+   * this file and this change does not touch them — placeEntryLegMakerFirst simply notices the
+   * order is already resting and skips its own placement.
+   *
+   * CRASH SAFETY. planned.status is set to PLACING and SAVED before any order is sent, exactly as
+   * the sequential path does, so a crash mid-flight leaves every leg recoverable by
+   * entryClientOrderId. A resting order reconciles as INCONCLUSIVE, which keeps the leg PLACING and
+   * has recoverIncompleteBaskets revisit it — and because the client order id is unchanged, a retry
+   * that re-places is idempotent at the exchange rather than a second position.
+   */
+  private async preplaceMakerLegs(plan: PlannedLeg[]): Promise<void> {
+    const pending = plan.filter((p) => p.status === "PENDING" && !p.makerRestingOrderId);
+    if (pending.length === 0) return;
+
+    // Mark and persist FIRST. If the process dies between here and the exchange, every leg is
+    // already marked PLACING and therefore recoverable; marking after placing would lose that.
+    for (const planned of pending) planned.status = "PLACING";
+    this.store.save();
+
+    const quoteObserveStartMs = Date.parse(this.nowIso());
+    await Promise.allSettled(pending.map(async (planned) => {
+      try {
+        try { await this.client.setLeverage(planned.symbol, this.leverageFn()); } catch { /* already set */ }
+        const submitRef = stampSubmitRef(
+          buildSubmitRefBase(
+            this.readPublicQuoteFn ? this.readPublicQuoteFn(planned.symbol) : null,
+            quoteObserveStartMs,
+            planned.side,
+          ),
+          Date.parse(this.nowIso()),
+        );
+        planned.makerSubmitRef = submitRef ?? null;
+        const limitPrice = this.client.cancelOrder ? makerLimitPrice(planned.side, submitRef?.bid ?? null, submitRef?.ask ?? null) : null;
+        // No usable book, or a client that cannot cancel: leave this leg entirely to the sequential
+        // loop, which will cross for it. Never post what we cannot retract.
+        if (limitPrice === null) return;
+        const order = await this.client.placeOrder({
+          symbol: planned.symbol,
+          side: planned.side === "LONG" ? "BUY" : "SELL",
+          type: "LIMIT",
+          timeInForce: "GTX",
+          price: limitPrice,
+          quantity: planned.requestedQty,
+          newClientOrderId: planned.entryClientOrderId,
+        });
+        planned.makerRestingOrderId = order.orderId;
+        planned.makerRestingPrice = limitPrice;
+      } catch {
+        // A rejected or failed pre-place is NOT an error here. The leg keeps status PLACING with no
+        // resting id, so the sequential loop treats it exactly as it would have without this pass —
+        // including its own ambiguous-failure reconciliation, which is the only thing that may
+        // decide whether an order reached the exchange.
+      } finally {
+        this.store.save();
+      }
+    }));
+
+    // ONE wait for all of them. Poll every second and stop early the moment nothing is still
+    // resting — a basket whose legs all filled must not sit here burning the rest of the timeout.
+    const resting = pending.filter((p) => p.makerRestingOrderId);
+    if (resting.length === 0) return;
+    const waitMs = crossSectionalMakerWaitMs();
+    const deadline = Date.parse(this.nowIso()) + waitMs;
+    const terminal = new Set(["FILLED", "CANCELED", "EXPIRED", "REJECTED"]);
+    // Bounded by POLL COUNT as well as by the clock. nowIso() is injectable, and a frozen or
+    // non-advancing clock would otherwise leave this spinning forever — which is exactly what the
+    // first run of the parallel test did before this bound existed.
+    const maxPolls = Math.max(1, Math.ceil(waitMs / 1_000));
+    for (let poll = 0; poll < maxPolls && Date.parse(this.nowIso()) < deadline; poll++) {
+      await new Promise((r) => setTimeout(r, 1_000));
+      const states = await Promise.allSettled(
+        resting.map((p) => this.client.queryOrder(p.symbol, p.makerRestingOrderId as string)),
+      );
+      const stillResting = states.some(
+        (x) => x.status === "fulfilled" && !terminal.has(String(x.value.status).toUpperCase()),
+      );
+      if (!stillResting) return;
+    }
+  }
+
   private async placeEntryLegMakerFirst(
     planned: PlannedLeg,
     side: "BUY" | "SELL",
     refBid: number | null,
     refAsk: number | null,
   ): Promise<{ orderId: string; avgPrice: number; executedQty: number }> {
-    const limitPrice = this.client.cancelOrder ? makerLimitPrice(planned.side, refBid, refAsk) : null;
+    // Pre-placed by preplaceMakerLegs? Then the order is already resting and the wait already
+    // happened — go straight to cancel/re-query/resolve. Placing a second one here would be a
+    // duplicate position, which is why this check comes before everything else.
+    const preplaced = planned.makerRestingOrderId
+      ? { orderId: planned.makerRestingOrderId, price: planned.makerRestingPrice ?? null }
+      : null;
+    const limitPrice = preplaced?.price ?? (this.client.cancelOrder ? makerLimitPrice(planned.side, refBid, refAsk) : null);
     if (limitPrice === null) {
       // No usable book: cross, exactly as before. A limit derived from a broken book would rest far
       // from the market and never fill, which is worse than paying the taker fee once.
@@ -1914,17 +2024,28 @@ export class CrossSectionalExecutor {
       return { orderId: order.orderId, avgPrice: order.avgPrice, executedQty: order.executedQty };
     }
 
-    const maker = await this.client.placeOrder({
-      symbol: planned.symbol, side, type: "LIMIT", timeInForce: "GTX",
-      price: limitPrice, quantity: planned.requestedQty, newClientOrderId: planned.entryClientOrderId,
-    });
+    const maker = preplaced
+      ? await this.client.queryOrder(planned.symbol, preplaced.orderId)
+      : await this.client.placeOrder({
+          symbol: planned.symbol, side, type: "LIMIT", timeInForce: "GTX",
+          price: limitPrice, quantity: planned.requestedQty, newClientOrderId: planned.entryClientOrderId,
+        });
 
-    const deadline = Date.parse(this.nowIso()) + crossSectionalMakerWaitMs();
     let latest = maker;
-    while (!["FILLED", "CANCELED", "EXPIRED", "REJECTED"].includes(String(latest.status).toUpperCase())) {
-      if (Date.parse(this.nowIso()) >= deadline) break;
-      await new Promise((r) => setTimeout(r, 1_000));
-      try { latest = await this.client.queryOrder(planned.symbol, maker.orderId); } catch { break; }
+    // A pre-placed leg has ALREADY served its wait in preplaceMakerLegs — waiting again here would
+    // reintroduce exactly the per-leg multiplication that pass exists to remove.
+    if (!preplaced) {
+      const waitMs = crossSectionalMakerWaitMs();
+      const deadline = Date.parse(this.nowIso()) + waitMs;
+      // Same poll bound as preplaceMakerLegs, for the same reason: never rely on an injected clock
+      // advancing to terminate a loop.
+      const maxPolls = Math.max(1, Math.ceil(waitMs / 1_000));
+      for (let poll = 0; poll < maxPolls; poll++) {
+        if (["FILLED", "CANCELED", "EXPIRED", "REJECTED"].includes(String(latest.status).toUpperCase())) break;
+        if (Date.parse(this.nowIso()) >= deadline) break;
+        await new Promise((r) => setTimeout(r, 1_000));
+        try { latest = await this.client.queryOrder(planned.symbol, maker.orderId); } catch { break; }
+      }
     }
 
     // Cancel first, THEN read. Best-effort: a cancel that fails because the order already reached a
@@ -3858,6 +3979,14 @@ export class CrossSectionalExecutor {
         ),
       ).catch(() => null);
     }
+    // Post every maker leg AT ONCE and serve ONE wait for all of them, before the sequential loop
+    // starts resolving them. Without this the timeout multiplies by leg count, and the delay
+    // between the first and last leg is drift the basket carries as directional exposure — which is
+    // what forced the timeout to stay too short to be useful. Books nothing; the loop below still
+    // owns every fill, reservation, fallback and recovery decision exactly as before.
+    if (isCrossSectionalMakerEntryEnabled()) {
+      await this.preplaceMakerLegs(plan.slice(startIndex));
+    }
     for (let i = startIndex; i < plan.length; i++) {
       const planned = plan[i]!;
       if (planned.status === "FILLED") continue; // idempotent — already resolved (e.g. by recovery)
@@ -3888,14 +4017,18 @@ export class CrossSectionalExecutor {
         // before the order — so `ageAtSubmitMs` measures what it claims to. Best-effort in every
         // direction: a failed warm, a missing cache entry, or a stale quote all yield no submitRef
         // and the order proceeds untouched. It must never be able to block or delay a placement.
-        const submitRef = stampSubmitRef(
-          buildSubmitRefBase(
-            this.readPublicQuoteFn ? this.readPublicQuoteFn(planned.symbol) : null,
-            quoteObserveStartMs,
-            planned.side,
-          ),
-          Date.parse(this.nowIso()),
-        );
+        // A pre-placed leg's quote was captured when the order was actually sent; re-stamping it
+        // here would describe a book the order never saw and make ageAtSubmitMs a fiction.
+        const submitRef = planned.makerSubmitRef !== undefined
+          ? planned.makerSubmitRef
+          : stampSubmitRef(
+              buildSubmitRefBase(
+                this.readPublicQuoteFn ? this.readPublicQuoteFn(planned.symbol) : null,
+                quoteObserveStartMs,
+                planned.side,
+              ),
+              Date.parse(this.nowIso()),
+            );
         // Maker-first when enabled, otherwise the unchanged MARKET path. submitRef already holds
         // the submit-time book, so the post-only price comes from the SAME quote the execution
         // record is audited against rather than a second, later read.

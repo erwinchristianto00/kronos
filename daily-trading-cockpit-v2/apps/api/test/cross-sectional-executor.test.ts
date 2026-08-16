@@ -262,6 +262,7 @@ function makeExecutor(opts: { client?: FakeExecClient; allowed?: boolean; laneWe
   reserveExposure?: (req: { executorId: string; symbol: string; direction: "LONG" | "SHORT"; requestedNotionalUsd: number; clientOrderId: string; basketId?: string }) => { ok: boolean; reservationId: string | null; reason?: string };
   commitExposureReservation?: (reservationId: string, filled: { qty: number; avgPrice: number }) => void;
   releaseExposureReservation?: (reservationId: string, reason: string) => void;
+  readPublicQuote?: (symbol: string) => { bid: number | null; ask: number | null; mid: number; atMs: number; venue: string } | null;
 } = {}) {
   const client = opts.client ?? new FakeExecClient();
   const signalStore = new CrossSectionalStore(tmpDir());
@@ -272,6 +273,7 @@ function makeExecutor(opts: { client?: FakeExecClient; allowed?: boolean; laneWe
   if (opts.signalMs !== undefined) signalStore.add(signalObs(opts.signalMs));
   const executor = new CrossSectionalExecutor({
     client,
+    ...(opts.readPublicQuote ? { readPublicQuote: opts.readPublicQuote } : {}),
     signalStore,
     store,
     isAllowed: () => opts.allowed ?? true,
@@ -441,6 +443,66 @@ describe("cross-sectional overlap guard legacy-score compatibility", () => {
 });
 
 describe("CrossSectionalExecutor — account-exposure reservation wiring (2026-08-04)", () => {
+  it("[MAKER-PARALLEL] posts every leg post-only ONCE and serves a single wait, never a second order per leg", async () => {
+    // THE INVARIANT: a leg pre-placed by preplaceMakerLegs must not be placed again by the
+    // sequential loop. A second GTX for the same leg is a duplicate position, which is the whole
+    // reason the pre-place records its resting order id instead of just its wait.
+    const prev = process.env.CROSS_SECTIONAL_MAKER_ENTRY_ENABLED;
+    const prevWait = process.env.CROSS_SECTIONAL_MAKER_WAIT_MS;
+    process.env.CROSS_SECTIONAL_MAKER_ENTRY_ENABLED = "1";
+    process.env.CROSS_SECTIONAL_MAKER_WAIT_MS = "1000"; // one poll, so the test stays fast
+    try {
+      const client = new FakeExecClient() as FakeExecClient & {
+        cancelOrder: (symbol: string, orderId: string) => Promise<void>;
+        cancelled: string[];
+      };
+      client.cancelled = [];
+      client.cancelOrder = async (_symbol: string, orderId: string) => { client.cancelled.push(orderId); };
+      client.fillPriceBySymbol.set("SOLUSDT", 100);
+      client.fillPriceBySymbol.set("DOGEUSDT", 0.1);
+
+      const { executor, store } = makeExecutor({
+        client,
+        signalMs: NOW_MS - 5 * 60_000,
+        // a two-sided book is what makes a post-only price derivable at all
+        readPublicQuote: (symbol: string) => ({
+          bid: symbol === "SOLUSDT" ? 99.99 : 0.0999,
+          ask: symbol === "SOLUSDT" ? 100.01 : 0.1001,
+          mid: symbol === "SOLUSDT" ? 100 : 0.1,
+          atMs: NOW_MS,
+          venue: "TEST_BOOK",
+        }),
+      });
+
+      await executor.tick();
+
+      // GUARD AGAINST A VACUOUS TEST: without a wired quote the executor falls back to MARKET and
+      // every assertion below passes without the maker path ever running. Prove GTX went out first.
+      const gtx = client.placed.filter((o) => (o as { timeInForce?: string }).timeInForce === "GTX");
+      expect(gtx.length, "no GTX order was placed — the maker path did not run").toBeGreaterThan(0);
+      expect(client.cancelled.length, "nothing was cancelled — the wait/cancel path did not run").toBeGreaterThan(0);
+
+      const basket = store.getState().baskets[0]!;
+      // One GTX per leg, never two. The MARKET rows are the taker fallback for what did not fill.
+      const perLeg = new Map<string, number>();
+      for (const o of client.placed) perLeg.set(o.newClientOrderId ?? "?", (perLeg.get(o.newClientOrderId ?? "?") ?? 0) + 1);
+      for (const [clientOrderId, n] of perLeg) {
+        expect(n, `clientOrderId ${clientOrderId} placed ${n} times`).toBe(1);
+      }
+      // Each leg's maker order and its fallback are DISTINCT identities — sharing one would make
+      // the exchange reject the fallback as a duplicate and silently leave the leg unfilled.
+      const ids = client.placed.map((o) => o.newClientOrderId);
+      expect(new Set(ids).size).toBe(ids.length);
+      // and the basket still resolves through the unchanged sequential path
+      expect(["COMPLETE", "PARTIALLY_FILLED", "ABORTED"]).toContain(basket.status);
+    } finally {
+      if (prev === undefined) delete process.env.CROSS_SECTIONAL_MAKER_ENTRY_ENABLED;
+      else process.env.CROSS_SECTIONAL_MAKER_ENTRY_ENABLED = prev;
+      if (prevWait === undefined) delete process.env.CROSS_SECTIONAL_MAKER_WAIT_MS;
+      else process.env.CROSS_SECTIONAL_MAKER_WAIT_MS = prevWait;
+    }
+  });
+
   it("reserves both legs upfront (same basketId, per-leg clientOrderId matching what placeOrder submits) and commits each from its actual fill", async () => {
     const ledger = makeFakeReservationLedger();
     const client = new FakeExecClient();
