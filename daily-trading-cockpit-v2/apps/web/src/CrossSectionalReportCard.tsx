@@ -377,6 +377,9 @@ type PoolReport = {
   counts: { universe: number; passesEvaluated: number; poolLong: number; poolShort: number; shortBlocked: number; shortEligible: number };
   rows: Array<{ symbol: string; passesEvaluated: boolean; inPool: boolean; shortBlocked: boolean; agreesWithCriteria: boolean; failures: Array<{ code: string; detail: string }> }>;
   mismatch: string[];
+  /** The actionable verdict, hysteresis-aware. `mismatch` above is the RAW threshold comparison —
+   *  true per symbol, but not a reason to change anything on its own. */
+  reconciliation?: { changed: boolean; adds: string[]; drops: string[]; held: Array<{ symbol: string; action: string; reason: string }>; unmeasured: boolean };
   blockedInPool: string[];
   btc: { oneLotUsd: number | null; legNeededUsd: number | null };
   unevaluatedCriteria: Array<{ code: string; why: string }>;
@@ -439,10 +442,20 @@ function PoolPanel({ apiPrefix, executionLong, executionShort, executionShortBlo
 
     {poolError && <Banner tone="warn">Kriteria tidak bisa dibaca (endpoint pool gagal). Daftar di bawah tetap yang dipakai executor, tapi belum diuji terhadap kriteria apa pun.</Banner>}
     {pool && !pool.measured && <Banner tone="warn">⚠ Kriteria tidak bisa diukur sekarang — pembacaan exchange gagal. Ini <b>bukan</b> berarti simbol-simbolnya gagal kriteria; belum ada yang diuji.</Banner>}
-    {pool?.measured && pool.mismatch.length > 0 && <Banner tone="warn">
-      ⚠ {pool.mismatch.length} simbol tidak sesuai kriteria: {pool.mismatch.map((s) => s.replace('USDT', '')).join(', ')}. Pool aktif dan hasil kriteria berbeda — salah satunya perlu diperbarui.
+    {/* Reads the RECONCILIATION, not the raw mismatch. This panel used to compute its own verdict
+        from `mismatch` and cried wolf over WIF — $199,118 against a $200,000 floor, 0.44% under —
+        while the API page's hysteresis said nothing needed changing. Two surfaces, two answers,
+        same symbol. The decision now lives in one place and both read it. */}
+    {pool?.measured && pool.reconciliation?.changed && <Banner tone="warn">
+      ⚠ Pool perlu diubah: {[
+        ...pool.reconciliation.adds.map((s) => `tambah ${s.replace('USDT', '')}`),
+        ...pool.reconciliation.drops.map((s) => `keluarkan ${s.replace('USDT', '')}`),
+      ].join(' · ')}. Penerapan manual — allowlist dibaca sekali saat proses start.
     </Banner>}
-    {pool?.measured && pool.mismatch.length === 0 && <Banner tone="ok">✓ Ke-{pool.counts.poolLong} simbol pool sama persis dengan hasil kriteria C1 &amp; C2.</Banner>}
+    {pool?.measured && pool.reconciliation && !pool.reconciliation.changed && pool.reconciliation.held.length > 0 && <Banner tone="ok">
+      ● Tidak ada yang perlu diubah. {pool.reconciliation.held.map((d) => d.symbol.replace('USDT', '')).join(', ')} di bawah ambang mentah tetapi <strong style={{ color: C.text }}>di dalam pita histeresis ±10%</strong>, jadi keanggotaannya sengaja dipertahankan — tanpa pita, simbol di garis batas keluar-masuk tiap beberapa jam dan menulis ulang pool yang dibandingkan overlap guard.
+    </Banner>}
+    {pool?.measured && pool.reconciliation && !pool.reconciliation.changed && pool.reconciliation.held.length === 0 && <Banner tone="ok">✓ Ke-{pool.counts.poolLong} simbol pool sama persis dengan hasil kriteria C1 &amp; C2.</Banner>}
     {countDrift && <Banner tone="warn">⚠ Kriteria menghitung {pool.counts.poolLong} long / {pool.counts.poolShort} short, executor memakai {executionLong.length} / {executionShort.length}. Panel ini dan executor tidak membaca daftar yang sama.</Banner>}
 
     <div>{label('POOL LONG — hasil kriteria C1 & C2', executionLong.length, C.good)}<InlineSymbolList symbols={executionLong} color={C.good} /></div>

@@ -921,6 +921,17 @@ interface PoolReport {
   blockedInPool: string[];
   /** Evaluated separately because BTC is not in the universe and so has no row above. */
   btc: { oneLotUsd: number | null; legNeededUsd: number | null };
+  /** THE actionable verdict, hysteresis-aware. `mismatch` above is the RAW threshold comparison and
+   *  is kept only because it is a fact per symbol; consumers deciding whether anything must CHANGE
+   *  must read this instead. Both the API page and the dashboard panel had their own copy of that
+   *  decision and disagreed about WIF, so it lives here now — one computation, one answer. */
+  reconciliation: {
+    changed: boolean;
+    adds: string[];
+    drops: string[];
+    held: Array<{ symbol: string; action: string; reason: string }>;
+    unmeasured: boolean;
+  };
   unevaluatedCriteria: Array<{ code: string; why: string }>;
 }
 let poolReportCache: { atMs: number; report: PoolReport } | null = null;
@@ -1879,6 +1890,25 @@ export async function registerLiveRoutes(
         oneLotUsd: btcLot,
         legNeededUsd: btcLot === null ? null : btcLot / DEFAULT_ELIGIBILITY.maxLotFractionOfLeg,
       },
+      reconciliation: (() => {
+        const pl = poolReconciliationPlan(
+          reportRows.map((r) => ({
+            symbol: r.symbol, liquidityUsdPerHour: r.liquidityUsdPerHour,
+            oneLotUsd: r.oneLotUsd, inPool: r.inPool, hasOpenPosition: false,
+          })),
+          {
+            minLiquidityUsdPerHour: DEFAULT_ELIGIBILITY.minLiquidityUsdPerHour,
+            maxOneLotUsd: leg === null ? Number.POSITIVE_INFINITY : leg * DEFAULT_ELIGIBILITY.maxLotFractionOfLeg,
+            hysteresisFraction: 0.10,
+            minPoolSize: 8,
+          },
+        );
+        return {
+          changed: pl.changed, adds: pl.adds, drops: pl.drops,
+          held: pl.heldDespiteFailure.map((d) => ({ symbol: d.symbol, action: d.action, reason: d.reason })),
+          unmeasured: pl.unmeasured,
+        };
+      })(),
       unevaluatedCriteria: [
         { code: "C3_LISTING_AGE", why: "butuh satu panggilan riwayat per simbol" },
         { code: "C4_FUNDING_CARRY", why: "butuh riwayat funding per simbol" },
@@ -1904,23 +1934,10 @@ export async function registerLiveRoutes(
     const shortBlock = report.rows.filter((r) => r.shortBlocked).map((r) => r.symbol);
     const universe = report.rows.map((r) => r.symbol);
     const eligible = report.rows.filter((r) => r.passesEvaluated);
-    // ONE reconciliation, used by the banner AND the per-row markers. They were computed separately
-    // before, so the page carried two verdicts on the same symbol: the banner said WIF needed
-    // updating while the plan below said nothing needed to change. Hysteresis is the actionable
-    // answer, so it is the one the banner reports.
-    const plan = poolReconciliationPlan(
-      report.rows.map((r) => ({
-        symbol: r.symbol, liquidityUsdPerHour: r.liquidityUsdPerHour,
-        oneLotUsd: r.oneLotUsd, inPool: r.inPool, hasOpenPosition: false,
-      })),
-      {
-        minLiquidityUsdPerHour: report.thresholds.minLiquidityUsdPerHour,
-        maxOneLotUsd: report.leg.oneLotCeilingUsd ?? Number.POSITIVE_INFINITY,
-        hysteresisFraction: 0.10,
-        minPoolSize: 8,
-      },
-    );
-    const actionFor = new Map(plan.decisions.map((d) => [d.symbol, d]));
+    // Computed once inside buildPoolReport and shared with the dashboard panel via JSON, so the
+    // two surfaces cannot drift into disagreeing about the same symbol again.
+    const plan = report.reconciliation;
+    const actionFor = new Map(plan.held.map((d) => [d.symbol, d]));
     const needsAction = new Set([...plan.adds, ...plan.drops]);
     const rows = report.rows.map((r) => `<tr class="${r.passesEvaluated ? "" : "out"}">
         <td class="sym">${esc(r.symbol.replace("USDT", ""))}</td>
@@ -1966,8 +1983,8 @@ ${!measured
   ? `<div class="note">&#9888; <b>Kriteria tidak bisa diukur sekarang</b> &mdash; pembacaan exchange gagal, jadi kolom likuiditas, satu lot dan status di bawah kosong. Ini BUKAN berarti simbol-simbol itu gagal kriteria; belum ada yang diuji. Pool aktif tetap ditampilkan apa adanya.</div>`
   : plan.changed
     ? `<div class="note">&#9888; <b>Pool perlu diubah</b>: ${[...plan.adds.map((x) => "tambah " + esc(x.replace("USDT", ""))), ...plan.drops.map((x) => "keluarkan " + esc(x.replace("USDT", "")))].join(" &middot; ")}. Rinciannya di Rekonsiliasi pool di bawah.</div>`
-    : plan.heldDespiteFailure.length
-      ? `<div class="note">&#9679; <b>Tidak ada yang perlu diubah.</b> ${plan.heldDespiteFailure.map((d) => esc(d.symbol.replace("USDT", ""))).join(", ")} berada di bawah ambang mentah tetapi <b>di dalam pita histeresis</b>, jadi keanggotaannya sengaja dipertahankan &mdash; tanpa pita, simbol di garis batas akan keluar-masuk tiap beberapa jam. Kolom status di bawah tetap menampilkan vonis kriteria mentahnya, karena itu memang fakta.</div>`
+    : plan.held.length
+      ? `<div class="note">&#9679; <b>Tidak ada yang perlu diubah.</b> ${plan.held.map((d) => esc(d.symbol.replace("USDT", ""))).join(", ")} berada di bawah ambang mentah tetapi <b>di dalam pita histeresis</b>, jadi keanggotaannya sengaja dipertahankan &mdash; tanpa pita, simbol di garis batas akan keluar-masuk tiap beberapa jam. Kolom status di bawah tetap menampilkan vonis kriteria mentahnya, karena itu memang fakta.</div>`
       : `<div class="note" style="background:transparent;color:var(--ok);padding-left:0">&#10003; Pool aktif sama persis dengan hasil kriteria.</div>`}
 
 <h2>Per simbol</h2>
@@ -1976,7 +1993,7 @@ ${!measured
 </tr></thead><tbody>${rows}</tbody></table></div>
 
 ${(() => {
-  const act = plan.decisions.filter((d) => d.action === "ADD" || d.action === "DROP" || d.action.startsWith("HOLD"));
+  const act = [...plan.adds.map((x) => ({ symbol: x, action: "ADD", reason: "melewati batas masuk" })), ...plan.drops.map((x) => ({ symbol: x, action: "DROP", reason: "di bawah batas keluar" })), ...plan.held];
   if (plan.unmeasured) return `<h2>Rekonsiliasi pool</h2><div class="note">Tidak ada simbol yang terukur — tidak ada keputusan yang bisa dipercaya, dan rencana ini TIDAK boleh diterapkan.</div>`;
   return `<h2>Rekonsiliasi pool</h2>
 <p class="muted">Pita histeresis <b>&plusmn;10%</b>: masuk perlu &ge; $${Math.round(report.thresholds.minLiquidityUsdPerHour * 1.1).toLocaleString("en-US")}/jam, keluar baru di bawah $${Math.round(report.thresholds.minLiquidityUsdPerHour * 0.9).toLocaleString("en-US")}/jam. Simbol di antara keduanya <b>mempertahankan keanggotaannya</b>. Penerapan masih MANUAL &mdash; allowlist adalah const yang dibaca sekali saat proses start, jadi perubahan butuh edit <code>.env</code> lalu restart.</p>
