@@ -1930,7 +1930,7 @@ export class CrossSectionalExecutor {
    * has recoverIncompleteBaskets revisit it — and because the client order id is unchanged, a retry
    * that re-places is idempotent at the exchange rather than a second position.
    */
-  private async preplaceMakerLegs(plan: PlannedLeg[]): Promise<void> {
+  private async preplaceMakerLegs(plan: PlannedLeg[], quoteObserveStartMs: number): Promise<void> {
     const pending = plan.filter((p) => p.status === "PENDING" && !p.makerRestingOrderId);
     if (pending.length === 0) return;
 
@@ -1939,7 +1939,11 @@ export class CrossSectionalExecutor {
     for (const planned of pending) planned.status = "PLACING";
     this.store.save();
 
-    const quoteObserveStartMs = Date.parse(this.nowIso());
+    // The caller's observe-start, NOT a fresh one. buildSubmitRefBase rejects any quote stamped
+    // BEFORE observeStartMs, so re-reading the clock here — after the warm has already run — marked
+    // every warmed quote as too old, produced no submitRef, and left makerLimitPrice with nothing to
+    // work from. Every leg then took the NO_BOOK branch and crossed the spread: the maker path could
+    // not fire at all, and said so only as "no usable submit-time quote" on each leg.
     await Promise.allSettled(pending.map(async (planned) => {
       try {
         try { await this.client.setLeverage(planned.symbol, this.leverageFn()); } catch { /* already set */ }
@@ -4016,7 +4020,7 @@ export class CrossSectionalExecutor {
     // what forced the timeout to stay too short to be useful. Books nothing; the loop below still
     // owns every fill, reservation, fallback and recovery decision exactly as before.
     if (isCrossSectionalMakerEntryEnabled()) {
-      await this.preplaceMakerLegs(plan.slice(startIndex));
+      await this.preplaceMakerLegs(plan.slice(startIndex), quoteObserveStartMs);
     }
     for (let i = startIndex; i < plan.length; i++) {
       const planned = plan[i]!;

@@ -238,6 +238,57 @@ type EntryLiquidity = { makerQty: number; takerQty: number; reason: string } | n
  * certainty into a mystery. Exits are still MARKET on every path, so there is no exit badge —
  * that fact is stated once per panel instead of repeated on every row.
  */
+/** Modal yang benar-benar dipakai basket: jumlah notional entry seluruh kakinya.
+ *
+ *  Returns null unless EVERY leg is priced. A partial sum would understate the denominator and
+ *  quietly inflate every percentage built on it — better to show no percentage than a flattering
+ *  one. Margin is notional/leverage, so this is exposure, not cash locked; the label says so. */
+function basketNotionalUsd(legs: ReadonlyArray<{ qty: number; entryPrice: number }>): number | null {
+  let total = 0;
+  for (const l of legs) {
+    if (!(l.qty > 0) || !(l.entryPrice > 0)) return null;
+    total += l.qty * l.entryPrice;
+  }
+  return total > 0 ? total : null;
+}
+
+/** The six gross/after-cost figures as ONE horizontal strip, each with its share of basket capital.
+ *
+ *  Was two separate copies — six wide tiles in the closed panel, six wrapping cells in the open one
+ *  — which pushed everything else below the fold and gave the numbers no scale: "+0.72 USDT" says
+ *  nothing until you know it sits on $105. Same component both places now, so the two can no longer
+ *  drift apart, and the percentage is always against the same denominator. */
+function ExtremaStrip({ rows, capitalUsd }: {
+  rows: ReadonlyArray<readonly [string, number | null | undefined]>;
+  capitalUsd: number | null;
+}) {
+  const pct = (v: number | null | undefined) =>
+    capitalUsd && capitalUsd > 0 && v != null && Number.isFinite(v)
+      ? `${v >= 0 ? '+' : ''}${(v / capitalUsd * 100).toFixed(3)}%`
+      : null;
+  return <div style={{
+    display: 'grid', gridTemplateColumns: `repeat(${rows.length}, minmax(84px, 1fr))`,
+    borderTop: `1px solid ${C.border}`, borderBottom: `1px solid ${C.border}`, overflowX: 'auto',
+  }}>
+    {rows.map(([label, value], i) => (
+      <div key={label} style={{ padding: '5px 8px', borderLeft: i ? `1px solid ${C.border}` : undefined }}>
+        <small style={{ display: 'block', color: C.dim, fontSize: 9.5, lineHeight: 1.3, whiteSpace: 'nowrap' }}>{label}</small>
+        <strong style={{ color: tone(value), fontSize: 12.5, fontVariantNumeric: 'tabular-nums' }}>{money(value)}</strong>
+        {pct(value) && <small style={{ display: 'block', color: C.dim, fontSize: 9.5, fontVariantNumeric: 'tabular-nums' }}>{pct(value)}</small>}
+      </div>
+    ))}
+  </div>;
+}
+
+/** Modal line for a basket header. */
+function CapitalNote({ legs }: { legs: ReadonlyArray<{ qty: number; entryPrice: number }> }) {
+  const n = basketNotionalUsd(legs);
+  if (n === null) return <span style={{ color: C.dim, fontSize: 11 }}>modal — (ada kaki tanpa harga)</span>;
+  return <span style={{ color: C.dim, fontSize: 11 }}>
+    modal <strong style={{ color: C.text }}>${n.toFixed(2)}</strong> · {legs.length} kaki · ~${(n / legs.length).toFixed(2)}/kaki
+  </span>;
+}
+
 function LiquidityBadge({ liq, compact = false }: { liq: EntryLiquidity; compact?: boolean }) {
   const label = (text: string, color: string, title: string) => (
     <span title={title} style={{
@@ -514,16 +565,17 @@ function ClosedBasketBlock({ basket, lane }: { basket: ClosedBasket; lane: strin
       <span style={{ color: C.good }}>Long: {long.join(', ')}</span>
       <span style={{ color: C.bad }}>Short: {short.join(', ')}</span>
       <span style={{ color: C.dim }}>hold {basket.holdHours.toFixed(2)}h · reason {basket.closeReason ?? '—'}</span>
+      <CapitalNote legs={basket.legs} />
       <BasketLiquiditySummary legs={basket.legs} />
     </div>
-    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(6, minmax(130px, 1fr))', borderBottom: `1px solid ${C.border}`, overflowX: 'auto' }}>
-      <Stat label="Gross realized" value={money(basket.grossPnlUsd)} color={tone(basket.grossPnlUsd)} />
-      <Stat label="Setelah biaya" value={money(basket.netPnlUsd)} color={tone(basket.netPnlUsd)} />
-      <Stat label="ATH gross" value={money(extrema?.grossHighUsd)} color={tone(extrema?.grossHighUsd)} />
-      <Stat label="ATH setelah biaya" value={money(extrema?.afterEstimatedCloseCostHighUsd)} color={tone(extrema?.afterEstimatedCloseCostHighUsd)} />
-      <Stat label="ATL gross" value={money(extrema?.grossLowUsd)} color={tone(extrema?.grossLowUsd)} />
-      <Stat label="ATL setelah biaya" value={money(extrema?.afterEstimatedCloseCostLowUsd)} color={tone(extrema?.afterEstimatedCloseCostLowUsd)} />
-    </div>
+    <ExtremaStrip capitalUsd={basketNotionalUsd(basket.legs)} rows={[
+      ['Gross realized', basket.grossPnlUsd],
+      ['Setelah biaya', basket.netPnlUsd],
+      ['ATH gross', extrema?.grossHighUsd],
+      ['ATH stlh biaya', extrema?.afterEstimatedCloseCostHighUsd],
+      ['ATL gross', extrema?.grossLowUsd],
+      ['ATL stlh biaya', extrema?.afterEstimatedCloseCostLowUsd],
+    ]} />
     <div style={{ overflowX: 'auto' }}>
       <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
         <thead><tr style={{ color: C.dim, textAlign: 'left' }}>
@@ -562,27 +614,23 @@ function OpenBasketUnrealizedBlock({ basket }: { basket: OpenBasketUnrealized })
     ['Gross sekarang', basket.grossUnrealizedUsd],
     ['Setelah biaya', basket.unrealizedAfterEstimatedCloseCostUsd],
     ['ATH gross', extrema?.grossHighUsd],
-    ['ATH setelah biaya', extrema?.afterEstimatedCloseCostHighUsd],
+    ['ATH stlh biaya', extrema?.afterEstimatedCloseCostHighUsd],
     ['ATL gross', extrema?.grossLowUsd],
-    ['ATL setelah biaya', extrema?.afterEstimatedCloseCostLowUsd],
+    ['ATL stlh biaya', extrema?.afterEstimatedCloseCostLowUsd],
   ] as const;
   return <div style={{ border: `1px solid ${C.border}`, borderRadius: 6, marginTop: 10, overflow: 'hidden' }}>
     <div style={{ padding: '9px 12px', background: C.sub, display: 'flex', gap: 14, flexWrap: 'wrap', alignItems: 'baseline' }}>
       <strong style={{ color: C.text }}>{basket.basketId}</strong>
       <span style={{ color: C.dim }}>{basket.variant} · {basket.signal}</span>
       <span style={{ color: C.dim }}>open {formatDate(basket.openedAt)}</span>
-          <BasketLiquiditySummary legs={basket.legs} />
+      <CapitalNote legs={basket.legs} />
+      <BasketLiquiditySummary legs={basket.legs} />
     </div>
     <div style={{ padding: '8px 12px 4px', display: 'flex', gap: 12, flexWrap: 'wrap', fontSize: 12 }}>
       <span style={{ color: C.good }}>Long: {long.join(', ')}</span>
       <span style={{ color: C.bad }}>Short: {short.join(', ')}</span>
     </div>
-    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(128px, 1fr))', borderBottom: `1px solid ${C.border}`, fontSize: 11 }}>
-      {summary.map(([label, value]) => <div key={label} style={{ padding: '7px 10px', borderTop: `1px solid ${C.border}` }}>
-        <small style={{ display: 'block', color: C.dim, marginBottom: 2 }}>{label}</small>
-        <strong style={{ color: tone(value) }}>{money(value)}</strong>
-      </div>)}
-    </div>
+    <ExtremaStrip capitalUsd={basketNotionalUsd(basket.legs)} rows={summary} />
     {!extrema && <small style={{ display: 'block', padding: '6px 10px', color: C.dim }}>ATH/ATL mulai direkam sejak report ini aktif.</small>}
     <div style={{ overflowX: 'auto' }}>
       <table className="cross-open-basket-table" style={{ width: '100%', minWidth: 1180, borderCollapse: 'collapse', fontSize: 11 }}>

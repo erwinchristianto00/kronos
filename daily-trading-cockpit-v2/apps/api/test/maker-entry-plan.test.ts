@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { makerLimitPrice, resolveMakerLeg, commissionBpsByLiquidity } from "../src/lib/maker-entry-plan.js";
+import { buildSubmitRefBase } from "../src/lib/submit-reference-quote.js";
 
 describe("makerLimitPrice", () => {
   it("[MAKER-PX] joins the near touch, which is the only price GTX will accept", () => {
@@ -124,5 +125,31 @@ describe("commissionBpsByLiquidity", () => {
   it("[MAKER-BPS] an empty or unusable set yields null, never NaN or a fabricated zero", () => {
     expect(commissionBpsByLiquidity([]).taker.bps).toBeNull();
     expect(commissionBpsByLiquidity([{ price: 0, qty: 1, commission: 1, maker: false }]).taker.bps).toBeNull();
+  });
+});
+
+describe("submit-time quote freshness — the rule that made maker entry inert", () => {
+  const quote = (atMs: number) => ({ bid: 99.99, ask: 100.01, mid: 100, atMs, venue: "BINANCE_USDM_BOOK_TICKER" });
+
+  it("[QUOTE-AGE] a quote warmed BEFORE the observe-start is rejected, and that is correct", () => {
+    // buildSubmitRefBase's own rule: atMs < observeStartMs means the quote cannot belong to this
+    // submission. Sound on its own — the bug was a CALLER re-reading the clock after the warm.
+    expect(buildSubmitRefBase(quote(1_000), 2_000, "SHORT")).toBeNull();
+  });
+
+  it("[QUOTE-AGE] a quote warmed AFTER the observe-start is accepted with both sides", () => {
+    // This is the shape preplaceMakerLegs must produce: observe-start taken by the caller BEFORE
+    // the warm, so the warmed quote is newer and a post-only price can be derived from it.
+    const ref = buildSubmitRefBase(quote(2_000), 1_000, "SHORT");
+    expect(ref).not.toBeNull();
+    expect(ref!.bid).toBe(99.99);
+    expect(ref!.ask).toBe(100.01);
+    expect(makerLimitPrice("SHORT", ref!.bid, ref!.ask)).toBe(100.01);
+    expect(makerLimitPrice("LONG", ref!.bid, ref!.ask)).toBe(99.99);
+  });
+
+  it("[QUOTE-AGE] no quote means no maker price — the leg must cross, never guess one", () => {
+    expect(buildSubmitRefBase(null, 1_000, "SHORT")).toBeNull();
+    expect(makerLimitPrice("SHORT", null, null)).toBeNull();
   });
 });
