@@ -41,6 +41,9 @@ export interface OwnExitParams {
   armR: number;
   givebackFraction: number;
   profitLockNetReturn: number;
+  /** R-denominated lock. When > 0 it REPLACES profitLockNetReturn and staticTpMaxNetReturn,
+   *  matching what production does once CROSS_SECTIONAL_DIRECTIONAL_MFE_PROFIT_LOCK_R is set. */
+  profitLockR?: number;
   staticTpMaxNetReturn: number;
   maxHoldHours: number;
 }
@@ -49,6 +52,7 @@ export const DEFAULT_OWN_EXIT: OwnExitParams = {
   armR: 0.2,
   givebackFraction: 0.3,
   profitLockNetReturn: 0.005,
+  profitLockR: 0,
   staticTpMaxNetReturn: 0.0065,
   maxHoldHours: 24,
 };
@@ -62,6 +66,7 @@ export function ownExitParamsFromEnv(env: NodeJS.ProcessEnv = process.env): OwnE
     armR: num(env.CROSS_SECTIONAL_DIRECTIONAL_MFE_ARM_R, DEFAULT_OWN_EXIT.armR),
     givebackFraction: num(env.CROSS_SECTIONAL_DIRECTIONAL_MFE_GIVEBACK_FRACTION, DEFAULT_OWN_EXIT.givebackFraction),
     profitLockNetReturn: num(env.CROSS_SECTIONAL_DIRECTIONAL_MFE_PROFIT_LOCK_NET_RETURN, DEFAULT_OWN_EXIT.profitLockNetReturn),
+    profitLockR: num(env.CROSS_SECTIONAL_DIRECTIONAL_MFE_PROFIT_LOCK_R, DEFAULT_OWN_EXIT.profitLockR ?? 0),
     staticTpMaxNetReturn: num(env.CROSS_SECTIONAL_DIRECTIONAL_STATIC_TP_MAX_NET_RETURN, DEFAULT_OWN_EXIT.staticTpMaxNetReturn),
     maxHoldHours: num(env.CROSS_SECTIONAL_DIRECTIONAL_MAX_HOLD_HOURS, DEFAULT_OWN_EXIT.maxHoldHours),
   };
@@ -148,11 +153,25 @@ export function replayOwnExit(bars: readonly Bar[], p: Pick<DirectionalClosedPos
     // 1) stop — resting order, fills on the wick, checked first (pessimistic)
     if ((isShort && bar.high >= stop) || (!isShort && bar.low <= stop)) return done(stop, "STOP", bar.openTimeMs);
     // 2-4) lane exits — CLOSE-triggered only
-    const closeRet = retOf(bar.close);
-    if (closeRet >= params.staticTpMaxNetReturn) return done(bar.close, "STATIC_TP", bar.openTimeMs);
-    if (closeRet >= params.profitLockNetReturn) return done(bar.close, "PROFIT_LOCK", bar.openTimeMs);
-    const barPeak = Math.max(peakR, rOf(bar.close));
-    if (barPeak >= params.armR && rOf(bar.close) <= barPeak * (1 - params.givebackFraction)) {
+    const barR = rOf(bar.close);
+    if ((params.profitLockR ?? 0) > 0) {
+      // PRODUCTION SEMANTICS. makeMfeGivebackExitPolicy's lock arms on the PEAK and fires only once
+      // price retraces back THROUGH the level; the net-return branch below instead takes profit the
+      // first time price crosses it on the way UP. Those are different rules, and the old branch is
+      // the more generous of the two — every "held would have returned" figure produced before
+      // profitLockR was set is optimistic by that difference. Reported, not silently corrected,
+      // because the historical rows were computed under it.
+      const lockR = params.profitLockR as number;
+      if (Math.max(peakR, barR) >= lockR && barR <= lockR) {
+        return done(bar.close, "PROFIT_LOCK", bar.openTimeMs);
+      }
+    } else {
+      const closeRet = retOf(bar.close);
+      if (closeRet >= params.staticTpMaxNetReturn) return done(bar.close, "STATIC_TP", bar.openTimeMs);
+      if (closeRet >= params.profitLockNetReturn) return done(bar.close, "PROFIT_LOCK", bar.openTimeMs);
+    }
+    const barPeak = Math.max(peakR, barR);
+    if (barPeak >= params.armR && barR <= barPeak * (1 - params.givebackFraction)) {
       return done(bar.close, "MFE_GIVEBACK", bar.openTimeMs);
     }
     peakR = barPeak;

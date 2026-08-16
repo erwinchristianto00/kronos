@@ -135,9 +135,23 @@ export function makeMfeGivebackExitPolicy(opts: {
   armR: number;
   givebackFrac: number;
   maxHoldMs: number;
-  /** Optional profit-lock, as a fraction of entry after estimated close cost. Not a static TP. */
+  /** Optional profit-lock, as a fraction of entry after estimated close cost. Not a static TP.
+   *
+   *  MEASURED DEFECT (2026-08-16): this is denominated in PRICE, while `armR` and the stop are
+   *  denominated in R, so one config produces a different reward:risk on every position. Across 14
+   *  real directional closes the stop width ranged 0.47%-2.18% of entry, which turned a single
+   *  `profitLockNetReturn: 0.005` into a lock at 1.15R on ETH and 0.25R on SOL — reward:risk varying
+   *  4.6x by nothing but the symbol's volatility at entry. Prefer `profitLockR` below. */
   profitLockNetReturn?: number;
-  /** One-way estimated close cost used to express the lock in net terms. */
+  /** Profit-lock in R, the same unit as `armR` and the stop: arm once peak favorable-R reaches this
+   *  level, exit if price retraces back through it.
+   *
+   *  Takes precedence over `profitLockNetReturn` when set, and needs neither `riskFraction` nor
+   *  `estimatedCloseCostPct` to be interpreted — the geometry is the same on every symbol and at
+   *  every volatility, which is the entire point. Additive on purpose: lanes that pass only
+   *  `profitLockNetReturn` keep their existing behavior byte for byte. */
+  profitLockR?: number;
+  /** One-way estimated close cost used to express the lock in net terms. Unused by `profitLockR`. */
   estimatedCloseCostPct?: number;
 }): SingleSymbolExitPolicy {
   return (ctx) => {
@@ -151,6 +165,20 @@ export function makeMfeGivebackExitPolicy(opts: {
     const lockNet = Number.isFinite(opts.profitLockNetReturn) && opts.profitLockNetReturn! > 0
       ? opts.profitLockNetReturn!
       : null;
+    // R-denominated lock wins when set: same unit as armR and the stop, so no conversion and no
+    // dependence on how wide this particular position's stop happens to be.
+    const lockR = Number.isFinite(opts.profitLockR) && opts.profitLockR! > 0 ? opts.profitLockR! : null;
+    if (lockR !== null) {
+      if (nextPeakFavorableR >= lockR && r <= lockR) {
+        return { shouldExit: true, reason: "MFE_PROFIT_LOCK", nextPeakFavorableR };
+      }
+      if (nextPeakFavorableR >= opts.armR) {
+        const givebackLineR = nextPeakFavorableR * (1 - opts.givebackFrac);
+        if (r <= givebackLineR) return { shouldExit: true, reason: "MFE_GIVEBACK", nextPeakFavorableR };
+      }
+      if (ctx.msHeld >= opts.maxHoldMs) return { shouldExit: true, reason: "MAX_HOLD_MTM", nextPeakFavorableR };
+      return { shouldExit: false, reason: null, nextPeakFavorableR };
+    }
     // `peak` is stored in R while the operator target is a net return. Convert both from the
     // same frozen entry/stop geometry so the lock is invariant to mark-price scale and direction.
     const peakNetReturn = nextPeakFavorableR * riskFraction - costFraction;

@@ -69,6 +69,12 @@ export const DIRECTIONAL_REGIME_MFE_ARM_R = (): number => envNumber("CROSS_SECTI
 export const DIRECTIONAL_REGIME_MFE_GIVEBACK_FRACTION = (): number => envNumber("CROSS_SECTIONAL_DIRECTIONAL_MFE_GIVEBACK_FRACTION", 0.5);
 /** Profit is locked only after a runner has first earned this estimated-net return; it is not a full TP. */
 export const DIRECTIONAL_REGIME_MFE_PROFIT_LOCK_NET_RETURN = (): number => envNumber("CROSS_SECTIONAL_DIRECTIONAL_MFE_PROFIT_LOCK_NET_RETURN", 0.005);
+/** Profit-lock in R. Default 0 = unset, so the price-denominated lock above stays in force until an
+ *  operator opts in. Set it and the lock becomes scale-free: 0.5R means 0.5R on every symbol,
+ *  instead of 1.15R on ETH and 0.25R on SOL as the price-% form measurably did. Keep it BELOW
+ *  DIRECTIONAL_REGIME_MFE_ARM_R so the two mechanisms tile rather than shadow each other — the lock
+ *  catches peaks between itself and the arm, the giveback trails everything above the arm. */
+export const DIRECTIONAL_REGIME_MFE_PROFIT_LOCK_R = (): number => envNumber("CROSS_SECTIONAL_DIRECTIONAL_MFE_PROFIT_LOCK_R", 0);
 /** Ceiling for any future static default TP. The active directional policy remains MFE-managed. */
 export const DIRECTIONAL_REGIME_STATIC_TP_MAX_NET_RETURN = (): number => envNumber("CROSS_SECTIONAL_DIRECTIONAL_STATIC_TP_MAX_NET_RETURN", 0.0065);
 export const DIRECTIONAL_REGIME_MAX_HOLD_HOURS = (): number => envNumber("CROSS_SECTIONAL_DIRECTIONAL_MAX_HOLD_HOURS", 24);

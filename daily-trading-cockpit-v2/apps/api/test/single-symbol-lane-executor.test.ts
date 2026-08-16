@@ -549,6 +549,81 @@ describe("makeFixedRewardExitPolicy (SHORT_FADE_EXHAUSTION geometry)", () => {
   });
 });
 
+describe("makeMfeGivebackExitPolicy — profitLockR (R-denominated, 2026-08-16)", () => {
+  // THE DEFECT THIS CLOSES, in the two real shapes it took on testnet:
+  //   ETHUSDT stop 0.47% of entry -> profitLockNetReturn 0.005 meant a 1.15R lock
+  //   SOLUSDT stop 2.18% of entry -> the SAME config meant a 0.25R lock
+  // Same operator intent, reward:risk 4.6x apart, decided by volatility rather than by anyone.
+  const tight = { entryPrice: 100, stopPrice: 99.53 };   // 0.47% stop, like the ETH position
+  const wide = { entryPrice: 100, stopPrice: 97.82 };    // 2.18% stop, like the SOL position
+  const atR = (g: { entryPrice: number; stopPrice: number }, r: number) =>
+    g.entryPrice + r * (g.entryPrice - g.stopPrice);
+
+  const priced = makeMfeGivebackExitPolicy({
+    armR: 0.75, givebackFrac: 0.3, maxHoldMs: 24 * 3_600_000,
+    profitLockNetReturn: 0.005, estimatedCloseCostPct: 0.0004,
+  });
+  const inR = makeMfeGivebackExitPolicy({
+    armR: 0.75, givebackFrac: 0.3, maxHoldMs: 24 * 3_600_000, profitLockR: 0.5,
+  });
+
+  it("[LOCK-R] the price-denominated lock fires at a different R on each stop width", () => {
+    // Pins the DEFECT itself, so it fails loudly if the old behavior is ever changed silently.
+    // IDENTICAL geometry in R on both: peaked at 0.6R, now retraced to 0.24R, giveback unarmed
+    // (0.6 < armR 0.75). The only difference is how wide the stop happens to be.
+    const ctx = (g: { entryPrice: number; stopPrice: number }) =>
+      ({ direction: "LONG" as const, ...g, currentPrice: atR(g, 0.24), peakFavorableR: 0.6, msHeld: 0 });
+    // wide stop -> the 0.5% lock lands at ~0.25R, which 0.6R cleared and 0.24R has fallen back through
+    const w = priced(ctx(wide));
+    expect(w.shouldExit).toBe(true);
+    expect(w.reason).toBe("MFE_PROFIT_LOCK");
+    // tight stop -> the SAME 0.5% lock lands at ~1.15R, so a 0.6R peak never armed it at all
+    expect(priced(ctx(tight)).shouldExit).toBe(false);
+    // and profitLockR removes the divergence: same input, same verdict on both widths
+    expect(inR(ctx(wide)).reason).toBe(inR(ctx(tight)).reason);
+  });
+
+  it("[LOCK-R] profitLockR gives BOTH stop widths the identical 0.5R geometry", () => {
+    for (const g of [tight, wide]) {
+      // peak reached the lock and price came back through it -> exit, on either width
+      const hit = inR({ direction: "LONG", ...g, currentPrice: atR(g, 0.5), peakFavorableR: 0.6, msHeld: 0 });
+      expect(hit.shouldExit).toBe(true);
+      expect(hit.reason).toBe("MFE_PROFIT_LOCK");
+      // peak never reached the lock -> hold, on either width
+      expect(inR({ direction: "LONG", ...g, currentPrice: atR(g, 0.3), peakFavorableR: 0.45, msHeld: 0 }).shouldExit).toBe(false);
+    }
+  });
+
+  it("[LOCK-R] SHORT geometry is identical, not mirrored by accident", () => {
+    const g = { entryPrice: 100, stopPrice: 102 };
+    const px = (r: number) => g.entryPrice - r * (g.stopPrice - g.entryPrice);
+    const hit = inR({ direction: "SHORT", ...g, currentPrice: px(0.5), peakFavorableR: 0.6, msHeld: 0 });
+    expect(hit.reason).toBe("MFE_PROFIT_LOCK");
+    expect(inR({ direction: "SHORT", ...g, currentPrice: px(0.3), peakFavorableR: 0.45, msHeld: 0 }).shouldExit).toBe(false);
+  });
+
+  it("[LOCK-R] lock 0.5 and arm 0.75 TILE — a big peak trails on giveback, never snaps back to the lock", () => {
+    // peak 2R, giveback line = 2*0.7 = 1.4R. At 1.5R nothing fires; at 1.4R the giveback does.
+    // If the lock shadowed the giveback this runner would have been cut at 0.5R instead of 1.4R.
+    expect(inR({ direction: "LONG", ...wide, currentPrice: atR(wide, 1.5), peakFavorableR: 2, msHeld: 0 }).shouldExit).toBe(false);
+    const gb = inR({ direction: "LONG", ...wide, currentPrice: atR(wide, 1.4), peakFavorableR: 2, msHeld: 0 });
+    expect(gb.shouldExit).toBe(true);
+    expect(gb.reason).toBe("MFE_GIVEBACK");
+  });
+
+  it("[LOCK-R] stop and max-hold still win, and an unset profitLockR changes nothing", () => {
+    expect(inR({ direction: "LONG", ...wide, currentPrice: wide.stopPrice, peakFavorableR: 2, msHeld: 0 }).reason).toBe("INITIAL_STOP");
+    expect(inR({ direction: "LONG", ...wide, currentPrice: atR(wide, 0.1), peakFavorableR: 0.1, msHeld: 24 * 3_600_000 }).reason).toBe("MAX_HOLD_MTM");
+    // additive guarantee: lanes that never pass profitLockR keep byte-identical behavior
+    const legacy = makeMfeGivebackExitPolicy({ armR: 0.75, givebackFrac: 0.3, maxHoldMs: 24 * 3_600_000, profitLockNetReturn: 0.005, estimatedCloseCostPct: 0.0004 });
+    const zero = makeMfeGivebackExitPolicy({ armR: 0.75, givebackFrac: 0.3, maxHoldMs: 24 * 3_600_000, profitLockNetReturn: 0.005, estimatedCloseCostPct: 0.0004, profitLockR: 0 });
+    for (const r of [0.2, 0.5, 0.9, 1.2]) {
+      const ctx = { direction: "LONG" as const, ...wide, currentPrice: atR(wide, r), peakFavorableR: Math.max(r, 0.8), msHeld: 0 };
+      expect(zero(ctx)).toEqual(legacy(ctx));
+    }
+  });
+});
+
 describe("makeMfeGivebackExitPolicy (INTRADAY_MOMENTUM_BREAKOUT geometry)", () => {
   const policy = makeMfeGivebackExitPolicy({ armR: 0.75, givebackFrac: 0.5, maxHoldMs: 24 * 3_600_000 });
 
