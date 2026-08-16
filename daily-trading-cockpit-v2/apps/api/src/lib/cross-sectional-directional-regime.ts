@@ -75,6 +75,47 @@ export const DIRECTIONAL_REGIME_MFE_PROFIT_LOCK_NET_RETURN = (): number => envNu
  *  DIRECTIONAL_REGIME_MFE_ARM_R so the two mechanisms tile rather than shadow each other — the lock
  *  catches peaks between itself and the arm, the giveback trails everything above the arm. */
 export const DIRECTIONAL_REGIME_MFE_PROFIT_LOCK_R = (): number => envNumber("CROSS_SECTIONAL_DIRECTIONAL_MFE_PROFIT_LOCK_R", 0);
+/** Floor on how far the stop sits from entry, as a PERCENT of entry. 0 = off (scanner stop used
+ *  verbatim, the behaviour every deployment had before 2026-08-16).
+ *
+ *  A FLOOR, not a multiplier, and that choice is the whole point. Commission is a fixed 8 bps round
+ *  trip while 1R is the stop distance, so the fee's share of risk is 8bps/stopWidth — measured
+ *  0.170R at the tightest scanner stop seen (0.47%) against 0.040R at 2%. A multiplier would also
+ *  inflate the stops that are already wide enough, adding risk where there was no problem; a floor
+ *  touches only the tight ones, which are exactly the ones where the fee is eating the trade.
+ *
+ *  RAISING THIS RAISES DOLLAR RISK unless the leg shrinks with it: this lane sizes by NOTIONAL
+ *  (CROSS_SECTIONAL_DIRECTIONAL_LEG_USD), not by risk, so a 2x wider stop is a 2x bigger loss when
+ *  it hits. Halve the leg when you double the floor and dollar risk is unchanged while the fee's
+ *  share halves — that is the only version of this change that is free. */
+export const DIRECTIONAL_REGIME_MIN_STOP_PCT = (): number => envNumber("CROSS_SECTIONAL_DIRECTIONAL_MIN_STOP_PCT", 0);
+
+/**
+ * The stop this lane will actually use: the scanner's own, unless it sits closer than `minStopPct`.
+ *
+ * Only ever moves the stop FURTHER from entry, so a stop that was on the correct side stays on it
+ * and validStop() cannot be broken by widening. Returns the scanner value untouched when the floor
+ * is off, unusable, or already satisfied — no rounding, no drift, byte-identical to the old path.
+ *
+ * KNOWN SIDE EFFECT, not a bug and not avoidable: two entry gates in single-symbol-lane-executor.ts
+ * measure drift in R against this same distance — the entry-chase limit and the stop-crossed
+ * invalidation. A wider stop makes both more permissive, so widening admits trades that used to be
+ * refused. The stop-width sweep that motivated this held entries FIXED and therefore says nothing
+ * about those extra trades.
+ */
+export function effectiveDirectionalStop(
+  direction: "LONG" | "SHORT",
+  entryPrice: number,
+  scannerStop: number,
+  minStopPct: number,
+): number {
+  const ok = (v: number) => typeof v === "number" && Number.isFinite(v) && v > 0;
+  if (!ok(entryPrice) || !ok(scannerStop) || !ok(minStopPct)) return scannerStop;
+  const floor = entryPrice * (minStopPct / 100);
+  return direction === "LONG"
+    ? Math.min(scannerStop, entryPrice - floor)
+    : Math.max(scannerStop, entryPrice + floor);
+}
 /** Ceiling for any future static default TP. The active directional policy remains MFE-managed. */
 export const DIRECTIONAL_REGIME_STATIC_TP_MAX_NET_RETURN = (): number => envNumber("CROSS_SECTIONAL_DIRECTIONAL_STATIC_TP_MAX_NET_RETURN", 0.0065);
 export const DIRECTIONAL_REGIME_MAX_HOLD_HOURS = (): number => envNumber("CROSS_SECTIONAL_DIRECTIONAL_MAX_HOLD_HOURS", 24);
@@ -483,7 +524,12 @@ export function crossSectionalDirectionalOpenSignals(
     observationId: `xsec-directional:${snapshot.scanBatchId}:${direction}:${pick.symbol}:${pick.candidate.candidateFingerprint.value}`,
     symbol: pick.symbol,
     entryPrice: pick.candidate.currentPrice!,
-    stopPrice: pick.candidate.stopLoss!,
+    stopPrice: effectiveDirectionalStop(
+      direction,
+      pick.candidate.currentPrice!,
+      pick.candidate.stopLoss!,
+      DIRECTIONAL_REGIME_MIN_STOP_PCT(),
+    ),
     openedAtMs,
   }));
 }
