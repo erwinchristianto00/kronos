@@ -2175,6 +2175,9 @@ Replay memakai candle 5m Binance asli. Exit lane dipicu <b>hanya oleh harga clos
           markPrice: number | null;
           grossUnrealizedUsd: number | null;
           afterEstimatedCloseCostUsd: number | null;
+          /** Entry liquidity split. null = leg predates maker entry, which by construction of the
+           *  code at that time means it was filled entirely as taker — never "unknown". */
+          entryLiquidity: { makerQty: number; takerQty: number; reason: string } | null;
         }> = [];
         for (const leg of basket.legs) {
           if (leg.exitOrderId !== null) continue;
@@ -2190,6 +2193,7 @@ Replay memakai candle 5m Binance asli. Exit lane dipicu <b>hanya oleh harga clos
               markPrice: null,
               grossUnrealizedUsd: null,
               afterEstimatedCloseCostUsd: null,
+                          entryLiquidity: (leg as { entryLiquidity?: { makerQty: number; takerQty: number; reason: string } | null }).entryLiquidity ?? null,
             });
             continue;
           }
@@ -2203,6 +2207,7 @@ Replay memakai candle 5m Binance asli. Exit lane dipicu <b>hanya oleh harga clos
             markPrice: mark,
             grossUnrealizedUsd: legGross,
             afterEstimatedCloseCostUsd: legGross - mark * leg.qty * Math.max(0, estimatedCloseCostPct),
+                      entryLiquidity: (leg as { entryLiquidity?: { makerQty: number; takerQty: number; reason: string } | null }).entryLiquidity ?? null,
           });
           gross += legGross;
           basketGross += legGross;

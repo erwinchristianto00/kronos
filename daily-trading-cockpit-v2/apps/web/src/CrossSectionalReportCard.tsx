@@ -86,6 +86,7 @@ type ClosedLeg = {
   feeAllocatedUsd: number;
   netPnlUsd: number;
   priceConfirmed: boolean;
+  entryLiquidity?: { makerQty: number; takerQty: number; reason: string } | null;
   unrealizedExtrema?: LegUnrealizedExtrema | null;
 };
 type ClosedBasket = {
@@ -144,6 +145,7 @@ type OpenBasketUnrealized = {
     markPrice: number | null;
     grossUnrealizedUsd: number | null;
     afterEstimatedCloseCostUsd: number | null;
+    entryLiquidity?: { makerQty: number; takerQty: number; reason: string } | null;
     unrealizedExtrema?: LegUnrealizedExtrema | null;
   }>;
   grossUnrealizedUsd: number | null;
@@ -214,6 +216,58 @@ const duration = (ms: number | null) => {
   const minutes = Math.round((ms % 3_600_000) / 60_000);
   return hours > 0 ? `${hours}h ${minutes}m` : `${minutes}m`;
 };
+
+type EntryLiquidity = { makerQty: number; takerQty: number; reason: string } | null | undefined;
+
+/**
+ * How a leg's ENTRY was filled, split by liquidity.
+ *
+ * EXACT, not an estimate. Binance rejects a GTX order outright if it would cross, so it can only
+ * ever fill as maker; a MARKET order can only ever fill as taker. Which order filled which quantity
+ * therefore IS the split — no per-fill lookup needed to make it true.
+ *
+ * An ABSENT field is not unknown: legs opened before 2026-08-16 could only be placed as MARKET, so
+ * absence means taker and is rendered as taker. Rendering it as "—" would turn a code-level
+ * certainty into a mystery. Exits are still MARKET on every path, so there is no exit badge —
+ * that fact is stated once per panel instead of repeated on every row.
+ */
+function LiquidityBadge({ liq, compact = false }: { liq: EntryLiquidity; compact?: boolean }) {
+  const label = (text: string, color: string, title: string) => (
+    <span title={title} style={{
+      color, border: `1px solid ${color}`, borderRadius: 3, padding: '0 4px',
+      fontSize: compact ? 9.5 : 10, letterSpacing: 0.3, whiteSpace: 'nowrap',
+    }}>{text}</span>
+  );
+  if (!liq) return label('TAKER', C.dim, 'Leg dibuka sebelum mode maker — saat itu kode hanya bisa memasang MARKET, jadi pasti taker');
+  const total = liq.makerQty + liq.takerQty;
+  if (total <= 0) return label('TAKER', C.dim, liq.reason);
+  const makerPct = (liq.makerQty / total) * 100;
+  if (makerPct >= 99.9) return label('MAKER', C.good, `Terisi penuh sebagai maker (GTX post-only). ${liq.reason}`);
+  if (makerPct <= 0.1) return label('TAKER', C.accent, `Post-only tidak terisi, disilang ke MARKET. ${liq.reason}`);
+  return label(`${makerPct.toFixed(0)}% MAKER`, C.measure, `Sebagian maker, sisanya disilang ke MARKET. ${liq.reason}`);
+}
+
+/** Basket-level roll-up: what share of the ENTRY notional was added rather than taken. */
+function BasketLiquiditySummary({ legs }: { legs: ReadonlyArray<{ qty: number; entryPrice: number; entryLiquidity?: EntryLiquidity }> }) {
+  let makerNotional = 0;
+  let total = 0;
+  for (const l of legs) {
+    const px = l.entryPrice;
+    if (!(px > 0) || !(l.qty > 0)) continue;
+    total += px * l.qty;
+    const liq = l.entryLiquidity;
+    if (liq && liq.makerQty + liq.takerQty > 0) makerNotional += px * liq.makerQty;
+  }
+  if (total <= 0) return null;
+  const pctMaker = (makerNotional / total) * 100;
+  // Commission is the only part that is certain: 2.00 bps maker vs 4.00 taker, measured on this
+  // account. The spread saved and the adverse selection paid are NOT included and never claimed.
+  const entryBps = 2 * (pctMaker / 100) + 4 * (1 - pctMaker / 100);
+  return <span style={{ color: C.dim, fontSize: 10.5 }}>
+    entry <strong style={{ color: pctMaker >= 99.9 ? C.good : pctMaker > 0 ? C.measure : C.dim }}>{pctMaker.toFixed(0)}% maker</strong>
+    {' · komisi masuk ~'}{entryBps.toFixed(2)} bps{' · exit MARKET = taker 4,00 bps'}
+  </span>;
+}
 
 function Stat({ label, value, color }: { label: string; value: string; color?: string }) {
   return <div style={{ padding: '8px 14px', borderRight: `1px solid ${C.border}` }}>
@@ -453,6 +507,7 @@ function ClosedBasketBlock({ basket, lane }: { basket: ClosedBasket; lane: strin
       <span style={{ color: C.good }}>Long: {long.join(', ')}</span>
       <span style={{ color: C.bad }}>Short: {short.join(', ')}</span>
       <span style={{ color: C.dim }}>hold {basket.holdHours.toFixed(2)}h · reason {basket.closeReason ?? '—'}</span>
+      <BasketLiquiditySummary legs={basket.legs} />
     </div>
     <div style={{ display: 'grid', gridTemplateColumns: 'repeat(6, minmax(130px, 1fr))', borderBottom: `1px solid ${C.border}`, overflowX: 'auto' }}>
       <Stat label="Gross realized" value={money(basket.grossPnlUsd)} color={tone(basket.grossPnlUsd)} />
@@ -471,7 +526,9 @@ function ClosedBasketBlock({ basket, lane }: { basket: ClosedBasket; lane: strin
           const ret = leg.entryPrice > 0 ? (leg.side === 'LONG' ? leg.exitPrice - leg.entryPrice : leg.entryPrice - leg.exitPrice) / leg.entryPrice : null;
           const path = leg.unrealizedExtrema;
           return <tr key={`${basket.basketId}-${leg.symbol}`} style={{ borderTop: `1px solid ${C.border}` }}>
-              <td style={{ padding: 7, color: C.text, fontWeight: 600 }}>{leg.symbol}</td>
+              <td style={{ padding: 7, color: C.text, fontWeight: 600 }}>
+                {leg.symbol}{' '}<LiquidityBadge liq={leg.entryLiquidity} compact />
+              </td>
               <td style={{ color: leg.side === 'LONG' ? C.good : C.bad }}>{leg.side}</td>
               <td>{leg.qty}</td><td>{leg.entryPrice}</td><td>{leg.exitPrice}</td>
               <td style={{ color: tone(ret) }}>{pct(ret)}</td>
@@ -507,6 +564,7 @@ function OpenBasketUnrealizedBlock({ basket }: { basket: OpenBasketUnrealized })
       <strong style={{ color: C.text }}>{basket.basketId}</strong>
       <span style={{ color: C.dim }}>{basket.variant} · {basket.signal}</span>
       <span style={{ color: C.dim }}>open {formatDate(basket.openedAt)}</span>
+          <BasketLiquiditySummary legs={basket.legs} />
     </div>
     <div style={{ padding: '8px 12px 4px', display: 'flex', gap: 12, flexWrap: 'wrap', fontSize: 12 }}>
       <span style={{ color: C.good }}>Long: {long.join(', ')}</span>
@@ -527,7 +585,9 @@ function OpenBasketUnrealizedBlock({ basket }: { basket: OpenBasketUnrealized })
         <tbody>{basket.legs.map((leg) => {
           const path = leg.unrealizedExtrema;
           return <tr key={`${basket.basketId}-${leg.symbol}-${leg.side}`} style={{ borderTop: `1px solid ${C.border}` }}>
-            <td style={{ padding: 7, color: C.text, fontWeight: 600 }}>{leg.symbol}</td>
+            <td style={{ padding: 7, color: C.text, fontWeight: 600 }}>
+              {leg.symbol}{' '}<LiquidityBadge liq={leg.entryLiquidity} compact />
+            </td>
             <td style={{ color: leg.side === 'LONG' ? C.good : C.bad }}>{leg.side}</td>
             <td>{price(leg.entryPrice)}</td>
             <td>{price(leg.markPrice)}</td>

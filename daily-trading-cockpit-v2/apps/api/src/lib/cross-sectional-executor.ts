@@ -481,6 +481,16 @@ export interface ExecutorLeg {
    *  Absent when no fresh quote was available — never back-filled from mark, which would
    *  silently fold half the spread into 'slippage'. See submit-reference-quote.ts. */
   submitRef?: SubmitRef | null;
+  /** How this leg's ENTRY was actually filled, split by liquidity.
+   *
+   *  EXACT, not an estimate: a GTX order is rejected outright by Binance if it would cross, so it
+   *  can only ever fill as maker; a MARKET order can only ever fill as taker. The split therefore
+   *  follows from which order filled which quantity, and needs no per-fill lookup to be true.
+   *
+   *  ABSENT on every leg opened before 2026-08-16 — the code could place nothing but MARKET then,
+   *  so absence means taker, and readers must render it as such rather than as unknown. Exits are
+   *  still MARKET on every path, so there is deliberately no exit counterpart to this field. */
+  entryLiquidity?: { makerQty: number; takerQty: number; reason: string } | null;
 }
 
 export interface SmartBasketRuntime {
@@ -603,6 +613,9 @@ export interface ClosedBasketLegRealized {
   feeAllocatedUsd: number;
   netPnlUsd: number;
   priceConfirmed: boolean;
+  /** Entry liquidity split. `null` means this leg predates maker entry, which by construction of
+   *  the code at the time means it was filled entirely as taker — never "unknown". */
+  entryLiquidity: { makerQty: number; takerQty: number; reason: string } | null;
 }
 
 export interface ClosedBasketRealized {
@@ -648,6 +661,7 @@ export function closedBasketRealizedBreakdown(
         feeAllocatedUsd: fee,
         netPnlUsd: gross - fee,
         priceConfirmed: l.entryPriceConfirmed === true && l.exitPriceConfirmed === true,
+        entryLiquidity: l.entryLiquidity ?? null,
       };
     });
     const openedMs = new Date(b.openedAt).getTime();
@@ -3920,6 +3934,9 @@ export class CrossSectionalExecutor {
           entryOrderId: order.orderId,
           entryPriceConfirmed: resolvedEntry.confirmed,
           ...(submitRef ? { submitRef } : {}),
+          ...(planned.makerOutcome
+            ? { entryLiquidity: { makerQty: planned.makerOutcome.makerQty, takerQty: planned.makerOutcome.takerQty, reason: planned.makerOutcome.reason } }
+            : {}),
           exitPrice: null,
           exitOrderId: null,
           exitPriceConfirmed: null,
