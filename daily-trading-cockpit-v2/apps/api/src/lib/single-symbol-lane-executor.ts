@@ -385,6 +385,13 @@ export interface SingleSymbolPosition {
    *  when it is false. This flag stays independent of both so the before/after shift attributable to
    *  enabling the fold stays unambiguous. */
   feeSource?: "EXCHANGE" | "ESTIMATE_TAKER_FLAT";
+  /** The exit geometry this position was OPENED under, frozen at open.
+   *
+   *  Without it a reader can only show today's levels against a historical position, which reads as
+   *  fact and is not: positions opened 2026-08-13/14 ran armR 0.20 with a price-denominated lock,
+   *  nothing like the current 0.75/0.15R. Absent on every position opened before 2026-08-17, and a
+   *  reader must render those as unknown rather than substitute the running config. */
+  exitGeometryAtOpen?: { armR: number; givebackFrac: number; profitLockR: number | null; staticTpR: number | null };
   /** How the ENTRY was actually filled, split by liquidity. Exact, not an estimate: Binance rejects
    *  a GTX order that would cross, so it can only fill as maker, and a MARKET order can only fill as
    *  taker — which order filled which quantity IS the split. Absent on every position opened before
@@ -631,6 +638,9 @@ export interface SingleSymbolLaneExecutorOptions {
    *  resting EXIT never fills you still hold the position and it keeps losing — and exits fire
    *  precisely when price is moving, which is when a passive order is least likely to fill. The
    *  stop is a real STOP_MARKET and cannot be passive at all. */
+  /** Freeze the exit geometry onto each position at open, so a report can show the levels that
+   *  actually applied instead of substituting whatever is configured when the page is rendered. */
+  exitGeometrySnapshot?: () => { armR: number; givebackFrac: number; profitLockR: number | null; staticTpR: number | null };
   makerEntry?: () => boolean;
   /** How long a post-only entry may rest before it is cancelled and crossed. */
   makerEntryWaitMs?: () => number;
@@ -853,6 +863,7 @@ export class SingleSymbolLaneExecutor {
   private readonly executionFillRecorder: ExecutionFillRecorder | null;
   private readonly fourBrainActualFillBindings: FourBrainActualFillBindingStore | null;
   private readonly fourBrainEntryGate: ((candidate: FourBrainBridgeCandidate) => FourBrainBridgeDecision) | null;
+  private readonly exitGeometrySnapshotFn: (() => { armR: number; givebackFrac: number; profitLockR: number | null; staticTpR: number | null }) | null;
   private readonly makerEntryFn: () => boolean;
   private readonly makerEntryWaitMsFn: () => number;
   private readonly legUsdFn: () => number;
@@ -916,6 +927,7 @@ export class SingleSymbolLaneExecutor {
     this.executionFillRecorder = opts.executionFillRecorder ?? null;
     this.fourBrainActualFillBindings = opts.fourBrainActualFillBindings ?? null;
     this.fourBrainEntryGate = opts.fourBrainEntryGate ?? null;
+    this.exitGeometrySnapshotFn = opts.exitGeometrySnapshot ?? null;
     this.makerEntryFn = opts.makerEntry ?? (() => false);
     this.makerEntryWaitMsFn = opts.makerEntryWaitMs ?? (() => 120_000);
     this.legUsdFn = opts.legUsd;
@@ -2653,6 +2665,7 @@ export class SingleSymbolLaneExecutor {
           cortexRawStaticWeightPct,
           submitRef,
           ...("liquidity" in order ? { entryLiquidity: order.liquidity } : {}),
+          ...(this.exitGeometrySnapshotFn ? { exitGeometryAtOpen: this.exitGeometrySnapshotFn() } : {}),
         };
         st.positions.push(position);
         this.store.save();

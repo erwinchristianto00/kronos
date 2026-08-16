@@ -2378,6 +2378,14 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         }),
         // Post-only entry, THESE TWO LANES ONLY. Every other SingleSymbolLaneExecutor keeps
         // crossing — none of them was analysed for maker fills.
+        // Frozen onto every position at open, so the ledger shows the levels that actually applied
+        // rather than today's config pasted over yesterday's trade.
+        exitGeometrySnapshot: () => ({
+          armR: DIRECTIONAL_REGIME_MFE_ARM_R(),
+          givebackFrac: DIRECTIONAL_REGIME_MFE_GIVEBACK_FRACTION(),
+          profitLockR: DIRECTIONAL_REGIME_MFE_PROFIT_LOCK_R() || null,
+          staticTpR: DIRECTIONAL_REGIME_STATIC_TP_R() || null,
+        }),
         makerEntry: DIRECTIONAL_REGIME_MAKER_ENTRY,
         makerEntryWaitMs: DIRECTIONAL_REGIME_MAKER_ENTRY_WAIT_MS,
         laneWeightPct: () => 100,
