@@ -4022,7 +4022,24 @@ export class CrossSectionalExecutor {
       const planned = plan[i]!;
       if (planned.status === "FILLED") continue; // idempotent — already resolved (e.g. by recovery)
 
-      if (!this.isAllowed() || basket.pendingKillReason) {
+      // THE REGIME GATE DECIDES WHETHER TO START A BASKET, NOT WHETHER TO FINISH ONE.
+      //
+      // It used to be re-read before every leg, so a scan landing mid-open aborted the basket with
+      // the rest of the plan untouched: measured, 3 of the first 10 baskets ended
+      // KILL_OR_DRAIN_MID_OPEN and two of those had already filled a single leg, which then had to
+      // be bought and sold again for nothing. Six legs take seconds; the regime does not
+      // meaningfully change inside that window, and once ANY leg is filled, completing the hedge is
+      // strictly safer than unwinding half of it — a half-open market-neutral basket IS directional
+      // exposure. Admission already applied this same gate before the basket was reserved.
+      //
+      // Keyed on legs.length rather than on the loop index on purpose: it gives the same answer to
+      // a basket resumed by recovery hours later, where index says "start" but real filled legs say
+      // "finish what you began".
+      //
+      // KILL AND DRAIN ARE DELIBERATELY NOT PART OF THIS. They stay checked before every leg,
+      // because a safety stop that only runs at basket start is not a safety stop.
+      const regimeStillDecides = basket.legs.length === 0;
+      if ((regimeStillDecides && !this.isAllowed()) || basket.pendingKillReason) {
         const reason = basket.pendingKillReason ?? "KILL_OR_DRAIN_MID_OPEN";
         basket.pendingKillReason = undefined;
         await this.markRemainingNeverAttempted(basket, i, `KILL_OR_DRAIN_BASKET_INTERRUPTED:${reason}`);

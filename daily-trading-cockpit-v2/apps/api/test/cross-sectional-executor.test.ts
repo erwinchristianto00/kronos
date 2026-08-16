@@ -3566,7 +3566,12 @@ describe("[ROLLBACK ON ANY LEG FAILURE] partial-failure decision", () => {
 });
 
 describe("[KILL/DRAIN MID-OPEN] the placement loop rechecks isAllowed() between every leg, not just once before it started", () => {
-  it("a kill/drain signal arriving between legs stops the loop, flattens what already filled, marks the rest NEVER_ATTEMPTED", async () => {
+  it("[REGIME-ONCE] a regime that closes AFTER the first leg fills does NOT abort — the hedge is completed", async () => {
+    // CHANGED DELIBERATELY 2026-08-16. This gate used to be re-read before every leg, so a scan
+    // landing mid-open threw the basket away after one fill: measured, 3 of the first 10 baskets
+    // ended KILL_OR_DRAIN_MID_OPEN and two had already filled a leg, which then had to be bought
+    // and sold again for nothing. A half-open market-neutral basket IS directional exposure, so
+    // once anything has filled, finishing is strictly safer than unwinding half of it.
     const client = new FakeExecClient();
     client.fillPriceBySymbol.set("SOLUSDT", 100);
     client.fillPriceBySymbol.set("DOGEUSDT", 0.1);
@@ -3577,8 +3582,7 @@ describe("[KILL/DRAIN MID-OPEN] the placement loop rechecks isAllowed() between 
     const originalPlaceOrder = client.placeOrder.bind(client);
     client.placeOrder = async (params) => {
       const result = await originalPlaceOrder(params);
-      // Kill/drain fires the instant SOL's (leg 0) entry confirms — before DOGE (leg 1) is ever
-      // attempted. `testOpts` is the EXACT object makeExecutor's `isAllowed` closure reads live.
+      // regime closes the instant SOL (leg 0) confirms — before DOGE (leg 1) is attempted
       if (params.symbol === "SOLUSDT" && !params.reduceOnly) testOpts.allowed = false;
       return result;
     };
@@ -3586,13 +3590,68 @@ describe("[KILL/DRAIN MID-OPEN] the placement loop rechecks isAllowed() between 
     await executor.tick();
 
     const basket = store.getState().baskets[0]!;
+    expect(basket.status).not.toBe("ABORTED");
+    expect(basket.legs).toHaveLength(2); // BOTH legs — the hedge is intact
+    expect(client.placed.filter((p) => p.symbol === "DOGEUSDT" && !p.reduceOnly)).toHaveLength(1);
+    // and nothing was rolled back, because nothing needed to be
+    expect(client.placed.filter((p) => p.reduceOnly)).toHaveLength(0);
+  });
+
+  it("[REGIME-ONCE] a regime already closed BEFORE any leg fills still aborts — it gates the START", async () => {
+    // The other half of the same rule. With nothing filled there is no hedge to protect and
+    // aborting costs nothing, so the gate must still bite here.
+    const client = new FakeExecClient();
+    client.fillPriceBySymbol.set("SOLUSDT", 100);
+    client.fillPriceBySymbol.set("DOGEUSDT", 0.1);
+    const testOpts: { client: FakeExecClient; signalMs: number; allowed?: boolean } = {
+      client, signalMs: NOW_MS - 5 * 60_000, allowed: true,
+    };
+    const { executor, store } = makeExecutor(testOpts);
+    const originalPlaceOrder = client.placeOrder.bind(client);
+    client.placeOrder = async (params) => {
+      // closes BEFORE the first leg is ever recorded as filled
+      testOpts.allowed = false;
+      return originalPlaceOrder(params);
+    };
+    (executor as unknown as { isAllowed: () => boolean }).isAllowed = () => testOpts.allowed ?? true;
+    testOpts.allowed = false;
+
+    await executor.tick();
+
+    const basket = store.getState().baskets[0];
+    if (basket) {
+      expect(basket.status).toBe("ABORTED");
+      expect(basket.legs).toHaveLength(0);
+    }
+    expect(client.placed.filter((p) => !p.reduceOnly)).toHaveLength(0);
+  });
+
+  it("[REGIME-ONCE] a real kill/drain mid-open STILL aborts and rolls back, regardless of fills", async () => {
+    // The safety property this change must not weaken. pendingKillReason is checked before EVERY
+    // leg, unlike the regime gate — a stop that only runs at basket start is not a stop.
+    const client = new FakeExecClient();
+    client.fillPriceBySymbol.set("SOLUSDT", 100);
+    client.fillPriceBySymbol.set("DOGEUSDT", 0.1);
+    const { executor, store } = makeExecutor({ client, signalMs: NOW_MS - 5 * 60_000, allowed: true });
+    const originalPlaceOrder = client.placeOrder.bind(client);
+    client.placeOrder = async (params) => {
+      const result = await originalPlaceOrder(params);
+      if (params.symbol === "SOLUSDT" && !params.reduceOnly) {
+        const b = store.getState().baskets[0];
+        if (b) b.pendingKillReason = "KILL_SWITCH_TEST";
+      }
+      return result;
+    };
+
+    await executor.tick();
+
+    const basket = store.getState().baskets[0]!;
     expect(basket.status).toBe("ABORTED");
-    expect(basket.closeReason).toBe("KILL_OR_DRAIN_MID_OPEN");
+    expect(basket.closeReason).toBe("KILL_SWITCH_TEST");
     expect(basket.legs).toHaveLength(1); // only SOL — DOGE never attempted
-    expect(client.placed.filter((p) => p.symbol === "DOGEUSDT")).toHaveLength(0);
     expect(basket.plan![1]).toMatchObject({ symbol: "DOGEUSDT", status: "NEVER_ATTEMPTED" });
     const flatten = client.placed.find((p) => p.symbol === "SOLUSDT" && p.reduceOnly);
-    expect(flatten).toBeTruthy(); // the real SOL leg was rolled back, not left open
+    expect(flatten).toBeTruthy(); // the real SOL leg WAS rolled back
   });
 });
 
