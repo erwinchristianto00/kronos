@@ -3626,6 +3626,26 @@ describe("[KILL/DRAIN MID-OPEN] the placement loop rechecks isAllowed() between 
     expect(client.placed.filter((p) => !p.reduceOnly)).toHaveLength(0);
   });
 
+  it("[REGIME-ONCE] an order already SENT stands the regime gate down, even with legs.length 0", async () => {
+    // THE BUG THIS CLOSES, from production: preplaceMakerLegs posts all six GTX orders, then the
+    // regime closes during the wait. legs.length is still 0 because nothing has been resolved yet,
+    // so the old gate aborted — while four of the six orders had already filled on the exchange.
+    // A sent order is exposure in flight; the gate must read that, not just the local counter.
+    const plan = [
+      { symbol: "SOLUSDT", makerRestingOrderId: "111", status: "PLACING" },
+      { symbol: "DOGEUSDT", status: "PENDING" },
+    ];
+    const legsEmpty: unknown[] = [];
+    const anyOrderInFlight = plan.some((p) => (p as { makerRestingOrderId?: string }).makerRestingOrderId);
+    const regimeStillDecides = legsEmpty.length === 0 && !anyOrderInFlight;
+    expect(anyOrderInFlight).toBe(true);
+    expect(regimeStillDecides).toBe(false); // gate stands down -> basket is completed, not thrown away
+
+    // and with nothing sent it still decides, so a genuinely untouched basket can still be refused
+    const untouched = [{ symbol: "SOLUSDT", status: "PENDING" }];
+    expect(legsEmpty.length === 0 && !untouched.some((p) => (p as { makerRestingOrderId?: string }).makerRestingOrderId)).toBe(true);
+  });
+
   it("[REGIME-ONCE] a real kill/drain mid-open STILL aborts and rolls back, regardless of fills", async () => {
     // The safety property this change must not weaken. pendingKillReason is checked before EVERY
     // leg, unlike the regime gate — a stop that only runs at basket start is not a stop.

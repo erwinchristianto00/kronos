@@ -4042,9 +4042,20 @@ export class CrossSectionalExecutor {
       //
       // KILL AND DRAIN ARE DELIBERATELY NOT PART OF THIS. They stay checked before every leg,
       // because a safety stop that only runs at basket start is not a safety stop.
-      const regimeStillDecides = basket.legs.length === 0;
+      //
+      // legs.length ALONE IS NOT ENOUGH once orders are pre-placed. A resting GTX order is real
+      // exchange exposure in flight, but nothing is booked into basket.legs until the loop below
+      // resolves it — so a basket whose orders were already FILLING still read legs.length === 0.
+      // On 2026-08-16 two baskets aborted that way with legs=0 while 4 of 6 symbols had actually
+      // filled (WLD 57, UNI 7, DOGE 488, SUI 46.5); only the orphan machinery kept those positions
+      // from going untracked, and they had to be flattened at a loss for nothing. The gate must
+      // therefore also stand down the moment any order has been sent.
+      const anyOrderInFlight = plan.some((p) => p.makerRestingOrderId);
+      const regimeStillDecides = basket.legs.length === 0 && !anyOrderInFlight;
       if ((regimeStillDecides && !this.isAllowed()) || basket.pendingKillReason) {
-        const reason = basket.pendingKillReason ?? "KILL_OR_DRAIN_MID_OPEN";
+        // Name the actual cause. "KILL_OR_DRAIN_MID_OPEN" was reported for BOTH a real kill and a
+        // closed regime gate, which is how two regime-gate aborts read as kill-switch events.
+        const reason = basket.pendingKillReason ?? "REGIME_CLOSED_BEFORE_ANY_FILL";
         basket.pendingKillReason = undefined;
         await this.markRemainingNeverAttempted(basket, i, `KILL_OR_DRAIN_BASKET_INTERRUPTED:${reason}`);
         basket.status = "ABORTED";

@@ -824,8 +824,17 @@ function NextSignalNote({ apiPrefix }: { apiPrefix: string }) {
       {st.openHalted ? <> · <span style={{ color: C.bad }}>open dihentikan: {st.openHalted}</span></> : null}
     </div>
     {last && <div>
-      Percobaan terakhir <strong style={{ color: C.text }}>{formatDate(last.at)}</strong> berhenti di <strong style={{ color: C.text }}>{last.stage}</strong>
-      {' → '}<span style={{ color: last.outcome === 'OPENED' ? C.good : C.accent }}>{last.outcome}</span>: {last.reason}
+      {/* "berhenti di" was wrong for a PASSING attempt: BASKET_RESERVED/ADMITTED means it went all
+          the way through and a basket was created, but the wording read as a failure and was
+          reported as one. The verb now follows the outcome. */}
+      Percobaan terakhir <strong style={{ color: C.text }}>{formatDate(last.at)}</strong>{' '}
+      {last.outcome === 'ADMITTED' || last.outcome === 'OPENED' ? (
+        <>lolos sampai <strong style={{ color: C.text }}>{last.stage}</strong>{' → '}
+          <span style={{ color: C.good }}>{last.outcome}</span> — basket dibuat{last.reason ? `: ${last.reason}` : ''}</>
+      ) : (
+        <>berhenti di <strong style={{ color: C.text }}>{last.stage}</strong>{' → '}
+          <span style={{ color: C.accent }}>{last.outcome}</span>{last.reason ? `: ${last.reason}` : ''}</>
+      )}
     </div>}
     {admission?.reason && <div style={{ opacity: 0.85 }}>{admission.reason}</div>}
     <div style={{ opacity: 0.7 }}>
