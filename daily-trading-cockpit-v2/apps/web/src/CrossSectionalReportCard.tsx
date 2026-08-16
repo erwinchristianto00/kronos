@@ -185,6 +185,13 @@ type XSecExecStatus = {
   entryAdmission?: { tier?: string; allowed?: boolean; reason?: string; maxLearningOpen?: number } | null;
   entryAttemptAudit?: { latest?: { at: string; stage: string; outcome: string; reason: string; longSymbols?: string[]; shortSymbols?: string[] } | null } | null;
 };
+type RegimeBreadth = {
+  advancersPct: number | null;
+  altAdvancersPct?: number | null;
+  percentAboveEma20: number | null;
+  btcReturn24h: number | null;
+  unavailableReason?: string | null;
+};
 type DirectionalPick = { symbol: string; sideScore: number; relativeEdge: number; confidence: number };
 type DirectionalExecutor = { openPositions?: unknown[]; dailyMaxLossUsd?: number; lastError?: string | null };
 type DirectionalRegimeResponse = {
@@ -618,6 +625,52 @@ function directionalModeColor(mode: DirectionalRegimeResponse['mode']): string {
 }
 
 /** Keputusan executor yang aktual, terpisah dari histori basket FILTERED di bawahnya. */
+/**
+ * The ACTUAL breadth numbers.
+ *
+ * The tile beside this used to be labelled "Scanner breadth" while displaying `marketRegime` — a
+ * discrete PATTERN name ("Mixed rotation"), not breadth at all. Sitting next to "Canonical regime:
+ * BEARISH" it read like the two disagreed, when they were answering different questions and the one
+ * number that reconciles them was not on the page: breadth itself, which is what the canonical
+ * engine reads. At 21% advancers, BEARISH is exactly what breadth says.
+ *
+ * Fetched separately rather than threaded through the directional-regime route, so no API shape
+ * changes and a failure here can never take the regime panel down with it.
+ */
+function BreadthRow({ apiPrefix }: { apiPrefix: string }) {
+  const [b, setB] = useState<RegimeBreadth | null>(null);
+  const [failed, setFailed] = useState(false);
+  useEffect(() => {
+    let alive = true;
+    async function load() {
+      try {
+        const r = await fetch(`${apiPrefix}/shadow/regime-engine-report`, { cache: 'no-store' });
+        if (!r.ok) throw new Error(String(r.status));
+        const j = await r.json() as { latest?: { breadth?: RegimeBreadth } };
+        if (alive) { setB(j.latest?.breadth ?? null); setFailed(false); }
+      } catch { if (alive) setFailed(true); }
+    }
+    void load();
+    const t = window.setInterval(() => void load(), 30_000);
+    return () => { alive = false; window.clearInterval(t); };
+  }, [apiPrefix]);
+
+  const pct = (v: number | null | undefined, d = 0) => (v == null ? '—' : `${(v * 100).toFixed(d)}%`);
+  const tint = (v: number | null | undefined) => (v == null ? C.dim : v >= 0.5 ? C.good : v <= 0.35 ? C.bad : C.measure);
+
+  if (failed) return <div style={{ padding: '7px 12px', color: C.bad, fontSize: 11, borderBottom: `1px solid ${C.border}` }}>Breadth tidak terbaca.</div>;
+  if (!b) return <div style={{ padding: '7px 12px', color: C.dim, fontSize: 11, borderBottom: `1px solid ${C.border}` }}>Memuat breadth…</div>;
+  if (b.unavailableReason) return <div style={{ padding: '7px 12px', color: C.accent, fontSize: 11, borderBottom: `1px solid ${C.border}` }}>Breadth tidak tersedia: {b.unavailableReason}</div>;
+
+  return <div style={{ padding: '7px 12px', color: C.dim, fontSize: 11.5, lineHeight: 1.6, borderBottom: `1px solid ${C.border}` }}>
+    <strong style={{ color: C.text }}>Breadth</strong>{' — angka yang dibaca canonical: '}
+    <strong style={{ color: tint(b.advancersPct) }}>{pct(b.advancersPct)}</strong> advancers
+    {b.altAdvancersPct != null && <> · <strong style={{ color: tint(b.altAdvancersPct) }}>{pct(b.altAdvancersPct)}</strong> advancers alt</>}
+    {' · '}<strong style={{ color: tint(b.percentAboveEma20) }}>{pct(b.percentAboveEma20)}</strong> di atas EMA20
+    {' · BTC 24j '}<strong style={{ color: tone(b.btcReturn24h) }}>{b.btcReturn24h == null ? '—' : `${(b.btcReturn24h * 100).toFixed(2)}%`}</strong>
+  </div>;
+}
+
 function DirectionalRegimeStatus({ apiPrefix }: { apiPrefix: string }) {
   const [data, setData] = useState<DirectionalRegimeResponse | null>(null);
   const [error, setError] = useState(false);
@@ -646,10 +699,14 @@ function DirectionalRegimeStatus({ apiPrefix }: { apiPrefix: string }) {
         <span style={{ color: C.dim }}>scan selesai {data.scanFinishedAt ? formatDate(data.scanFinishedAt) : 'belum ada'}</span>
       </div>
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(180px, 1fr))', borderBottom: `1px solid ${C.border}` }}>
-        <Stat label="Scanner breadth" value={data.marketRegime ?? '—'} color={data.marketRegime?.includes('Bearish') ? C.bad : data.marketRegime?.includes('Bullish') ? C.good : C.measure} />
+        {/* Was labelled "Scanner breadth" and showed a PATTERN name, which is not breadth. The
+            dashboard's own tooltip calls these patterns "BUKAN penilaian arah" — so the label now
+            says what the value is, and the real breadth appears in BreadthRow below. */}
+        <Stat label="Pola scanner (bukan arah)" value={data.marketRegime ?? '—'} color={C.measure} />
         <Stat label="Canonical regime" value={data.canonicalRegimeFamily} color={data.canonicalRegimeFamily === 'BEARISH' ? C.bad : data.canonicalRegimeFamily === 'BULLISH' ? C.good : C.measure} />
         <Stat label="Canonical gate" value={data.canonicalAllowed ? 'VALID' : data.canonicalAllowed === false ? 'BLOCKED' : 'MENUNGGU'} color={data.canonicalAllowed ? C.good : data.canonicalAllowed === false ? C.bad : C.measure} />
       </div>
+      <BreadthRow apiPrefix={apiPrefix} />
       <div style={{ padding: '10px 12px', fontSize: 12, lineHeight: 1.55 }}>
         <strong style={{ color: C.text }}>Mengapa:</strong> <span style={{ color: C.dim }}>{data.reason}</span>
         {data.canonicalReason && <div style={{ color: C.dim, marginTop: 4 }}>Canonical detail: {data.canonicalReason}</div>}
