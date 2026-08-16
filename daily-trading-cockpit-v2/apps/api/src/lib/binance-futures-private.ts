@@ -243,6 +243,11 @@ export interface FuturesUserTrade {
    * cross-sectional-executor.ts, so the real cost is 5.0 bps/side taker commission) is VERIFIED per
    * fill instead of assumed.
    *
+   * THAT ASSUMPTION IS NO LONGER UNIVERSAL (2026-08-16): cross-sectional-executor.ts can now place
+   * post-only GTX entry legs when CROSS_SECTIONAL_MAKER_ENTRY_ENABLED=1, so this flag stopped being
+   * a redundant confirmation and became the measurement — it is how the maker share and the real
+   * blended cost are read back. Measured rates on this account: maker 2.00, taker 4.00 bps/side.
+   *
    * OPTIONAL, and `undefined` means UNKNOWN — the exchange did not report a boolean for this row.
    * It is deliberately NOT defaulted to `false`: `false` is exactly the value we expect, so
    * defaulting would make "the field was missing" indistinguishable from "the exchange confirmed
@@ -293,7 +298,10 @@ export interface PlaceOrderParams {
   price?: number; // LIMIT
   stopPrice?: number; // STOP_MARKET / TAKE_PROFIT_MARKET
   reduceOnly?: boolean;
-  timeInForce?: "GTC" | "IOC" | "FOK";
+  /** GTX is Binance's post-only: the order is REJECTED outright if it would cross and take
+   *  liquidity, so it can only ever fill as maker. Added 2026-08-16 — this account's measured
+   *  rates are maker 2.00 bps vs taker 4.00 bps per side, i.e. exactly half. */
+  timeInForce?: "GTC" | "IOC" | "FOK" | "GTX";
   /** Engine-supplied idempotency key (derived from the paper order id). REQUIRED (2026-07-12 fix):
    *  this file's own top-of-file safety design ("POST/DELETE NEVER auto-retry... the engine passes
    *  newClientOrderId so a retry-by-engine is exchange-side idempotent") depended entirely on every

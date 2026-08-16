@@ -21,6 +21,7 @@ import {
   stampSubmitRef,
   type SubmitRef,
 } from "./submit-reference-quote.js";
+import { makerLimitPrice, resolveMakerLeg } from "./maker-entry-plan.js";
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 
@@ -47,6 +48,28 @@ import {
   type CrossSectionalStore,
 } from "./cross-sectional-edge.js";
 
+/**
+ * Post-only entry legs (2026-08-16). OFF by default — every existing deployment keeps crossing the
+ * spread until an operator turns this on for one instance.
+ *
+ * WHY: this account's own rates are maker 2.00 vs taker 4.00 bps per side (read from Binance's
+ * /fapi/v1/commissionRate, not assumed), and 231 recorded fills confirm every fill so far has been
+ * taker. Cross-basket's measured gross edge is ~11 bps against an 8.00 bps round-trip commission,
+ * so halving the commission is worth more than any signal change measured on this lane to date.
+ *
+ * NOT a free win, and the fill data is the point: a resting order fills preferentially when the
+ * market is moving against it. The commission saving is certain; the adverse-selection cost is not,
+ * and only shows up in realised basket P&L. Both must be read together before this goes near live.
+ */
+export function isCrossSectionalMakerEntryEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.CROSS_SECTIONAL_MAKER_ENTRY_ENABLED === "1";
+}
+/** How long a post-only leg may rest before it is cancelled and crossed. */
+export function crossSectionalMakerWaitMs(env: NodeJS.ProcessEnv = process.env): number {
+  const n = Number.parseInt(env.CROSS_SECTIONAL_MAKER_WAIT_MS ?? "", 10);
+  return Number.isFinite(n) && n >= 1_000 && n <= 120_000 ? n : 20_000;
+}
+
 export const CROSS_SECTIONAL_MARKET_NEUTRAL_LANE_ID = "CROSS_SECTIONAL_MARKET_NEUTRAL";
 /** 2026-07-08: lane ids for the two additional executor instances (see CrossSectionalExecutorOptions
  *  targetVariant/laneId) that mirror the TREND_BETA_VOL / MIXED_MEAN_REVERSION measured variants.
@@ -60,6 +83,11 @@ export const CROSS_SECTIONAL_MIXED_LANE_ID = "CROSS_SECTIONAL_MIXED";
 export type CrossSectionalExecClient = Pick<
   BinanceFuturesPrivateClient,
   "getExchangeFilters" | "placeOrder" | "setLeverage" | "getPositions" | "queryOrder" | "getUserTrades"
+> &
+  /** Optional so every existing fake client keeps compiling. Maker entry REFUSES to run without
+   *  it: a post-only order that cannot be cancelled has no safe way to stop resting, and leaving
+   *  one on the book past its wait is worse than paying the taker fee. */
+  Partial<Pick<BinanceFuturesPrivateClient, "cancelOrder">
 > & {
   /** Restart-recovery reconciliation only (see recoverIncompleteBaskets/reconcilePlannedLeg below) —
    *  deliberately OPTIONAL, not added to the Pick<...> list above, so every existing fake/test client
@@ -528,6 +556,15 @@ export interface PlannedLeg {
    *  this leg (original or resumed after a restart) submits as newClientOrderId, and the exact
    *  string a restart-recovery query looks up via queryOrderByClientId. */
   entryClientOrderId: string;
+  /** Set ONLY when maker entry is enabled and the post-only order did not fill in full, persisted
+   *  BEFORE the taker fallback is submitted. Without it a crash between the two placements would
+   *  leave recovery querying the maker id, finding it CANCELED, and never discovering a fallback
+   *  order that did reach the exchange — the exact "invisible naked position" this file's
+   *  reconciliation was built to prevent. */
+  takerFallbackClientOrderId?: string;
+  /** Report-only record of how this leg was actually filled, so the maker/taker split can be read
+   *  back from the basket store without joining to exchange trades. */
+  makerOutcome?: { action: string; reason: string; makerQty: number; takerQty: number };
   status: "PENDING" | "PLACING" | "FILLED" | "FAILED" | "NEVER_ATTEMPTED";
   failureReason: string | null;
 }
@@ -1824,6 +1861,101 @@ export class CrossSectionalExecutor {
   /** Thin wrapper over the shared resolveConfirmedFillPrice, injecting this executor's
    *  test-overridable retry delay and a lane-tagged log line. See binance-futures-private.ts
    *  for why this confirmation step exists (basket xb-mr2x7s6e's real-world avgPrice=0 case). */
+  /**
+   * Place ONE entry leg post-only, then cross the spread for whatever did not fill.
+   *
+   * Returns the same three fields the MARKET path returns — orderId, avgPrice, executedQty — with
+   * avgPrice already NOTIONAL-BLENDED across the maker and taker portions, so every downstream
+   * consumer (resolveFillPrice, the leg record, P&L) is untouched by how the leg was filled.
+   *
+   * THE SEQUENCE MATTERS, in this order and no other:
+   *   1. post-only GTX at the near touch. Binance rejects it outright rather than crossing, so a
+   *      "maker" order can never quietly become a taker one.
+   *   2. poll until terminal or the wait expires.
+   *   3. cancel, THEN re-query. The executedQty read BEFORE the cancel is worthless: an order can
+   *      fill in the window between the timeout and the cancel landing, and sizing the fallback
+   *      from the stale figure is exactly how that race doubles the position.
+   *   4. resolveMakerLeg decides. When it answers UNKNOWN_REQUERY no fallback is placed at all —
+   *      a missing leg costs a basket, a doubled one costs money.
+   *
+   * Any throw from the maker attempt is DELIBERATELY not caught here: it propagates to the entry
+   * loop's existing ambiguous-failure reconciliation, which already knows how to recover a leg by
+   * client id and must stay the single owner of that decision.
+   */
+  private async placeEntryLegMakerFirst(
+    planned: PlannedLeg,
+    side: "BUY" | "SELL",
+    refBid: number | null,
+    refAsk: number | null,
+  ): Promise<{ orderId: string; avgPrice: number; executedQty: number }> {
+    const limitPrice = this.client.cancelOrder ? makerLimitPrice(planned.side, refBid, refAsk) : null;
+    if (limitPrice === null) {
+      // No usable book: cross, exactly as before. A limit derived from a broken book would rest far
+      // from the market and never fill, which is worse than paying the taker fee once.
+      const order = await this.client.placeOrder({
+        symbol: planned.symbol, side, type: "MARKET",
+        quantity: planned.requestedQty, newClientOrderId: planned.entryClientOrderId,
+      });
+      planned.makerOutcome = { action: "NO_BOOK", reason: this.client.cancelOrder ? "no usable submit-time quote" : "client cannot cancel — maker unsafe", makerQty: 0, takerQty: planned.requestedQty };
+      return { orderId: order.orderId, avgPrice: order.avgPrice, executedQty: order.executedQty };
+    }
+
+    const maker = await this.client.placeOrder({
+      symbol: planned.symbol, side, type: "LIMIT", timeInForce: "GTX",
+      price: limitPrice, quantity: planned.requestedQty, newClientOrderId: planned.entryClientOrderId,
+    });
+
+    const deadline = Date.parse(this.nowIso()) + crossSectionalMakerWaitMs();
+    let latest = maker;
+    while (!["FILLED", "CANCELED", "EXPIRED", "REJECTED"].includes(String(latest.status).toUpperCase())) {
+      if (Date.parse(this.nowIso()) >= deadline) break;
+      await new Promise((r) => setTimeout(r, 1_000));
+      try { latest = await this.client.queryOrder(planned.symbol, maker.orderId); } catch { break; }
+    }
+
+    // Cancel first, THEN read. Best-effort: a cancel that fails because the order already reached a
+    // terminal state is not an error, and the re-query below is what actually decides.
+    if (!["FILLED", "CANCELED", "EXPIRED", "REJECTED"].includes(String(latest.status).toUpperCase())) {
+      try { await this.client.cancelOrder!(planned.symbol, maker.orderId); } catch { /* terminal already */ }
+    }
+    try { latest = await this.client.queryOrder(planned.symbol, maker.orderId); } catch { /* keep last known */ }
+
+    const decision = resolveMakerLeg(planned.requestedQty, latest.status, latest.executedQty);
+    planned.makerOutcome = {
+      action: decision.action, reason: decision.reason,
+      makerQty: decision.filledQty, takerQty: decision.fallbackQty,
+    };
+
+    if (decision.action !== "FALLBACK_TAKER") {
+      // DONE, or UNKNOWN_REQUERY — in which case no fallback may be sized. Returning the maker
+      // order's own numbers lets the caller's existing partial-fill handling book exactly what the
+      // exchange confirmed and orphan nothing it cannot see.
+      this.store.save();
+      return { orderId: maker.orderId, avgPrice: latest.avgPrice, executedQty: latest.executedQty };
+    }
+
+    // Persist the fallback identity BEFORE submitting it, so a crash in the next few hundred ms
+    // still leaves recovery something to query.
+    planned.takerFallbackClientOrderId = `${planned.entryClientOrderId}f`;
+    this.store.save();
+    const taker = await this.client.placeOrder({
+      symbol: planned.symbol, side, type: "MARKET",
+      quantity: decision.fallbackQty, newClientOrderId: planned.takerFallbackClientOrderId,
+    });
+
+    const makerQty = decision.filledQty;
+    const takerQty = Number.isFinite(taker.executedQty) && taker.executedQty > 0 ? taker.executedQty : decision.fallbackQty;
+    const makerPx = Number.isFinite(latest.avgPrice) && latest.avgPrice > 0 ? latest.avgPrice : limitPrice;
+    const takerPx = Number.isFinite(taker.avgPrice) && taker.avgPrice > 0 ? taker.avgPrice : 0;
+    const totalQty = makerQty + takerQty;
+    // Blend by NOTIONAL. An unconfirmed taker price (avgPrice 0 at ACK is routine) leaves the blend
+    // to resolveFillPrice rather than inventing one: returning 0 is what makes it re-query.
+    const avgPrice = takerPx > 0 && totalQty > 0 ? (makerQty * makerPx + takerQty * takerPx) / totalQty : 0;
+    // The MAKER order id is the leg's identity: it is what planned.entryClientOrderId maps to and
+    // what every existing recovery path already looks up.
+    return { orderId: maker.orderId, avgPrice, executedQty: totalQty };
+  }
+
   private async resolveFillPrice(
     symbol: string,
     orderId: string,
@@ -2500,7 +2632,9 @@ export class CrossSectionalExecutor {
     let sweepFrom = idx;
     if (ambiguous.status === "PLACING") {
       sweepFrom = idx + 1;
-      const resolution = await this.reconcilePlannedLeg(ambiguous.symbol, ambiguous.entryClientOrderId);
+      const resolution = ambiguous.takerFallbackClientOrderId
+            ? await this.reconcilePlannedLeg(ambiguous.symbol, ambiguous.takerFallbackClientOrderId)
+            : await this.reconcilePlannedLeg(ambiguous.symbol, ambiguous.entryClientOrderId);
       if (resolution.outcome === "NOT_PLACED") {
         // Unlike recoverIncompleteBaskets' own NOT_PLACED handling (which falls through to placing
         // this leg fresh, reusing the SAME reservation), this basket is being KILLED, not resumed —
@@ -3748,13 +3882,23 @@ export class CrossSectionalExecutor {
           ),
           Date.parse(this.nowIso()),
         );
-        const order = await this.client.placeOrder({
-          symbol: planned.symbol,
-          side: planned.side === "LONG" ? "BUY" : "SELL",
-          type: "MARKET",
-          quantity: planned.requestedQty,
-          newClientOrderId: planned.entryClientOrderId,
-        });
+        // Maker-first when enabled, otherwise the unchanged MARKET path. submitRef already holds
+        // the submit-time book, so the post-only price comes from the SAME quote the execution
+        // record is audited against rather than a second, later read.
+        const order = isCrossSectionalMakerEntryEnabled()
+          ? await this.placeEntryLegMakerFirst(
+              planned,
+              planned.side === "LONG" ? "BUY" : "SELL",
+              submitRef?.bid ?? null,
+              submitRef?.ask ?? null,
+            )
+          : await this.client.placeOrder({
+              symbol: planned.symbol,
+              side: planned.side === "LONG" ? "BUY" : "SELL",
+              type: "MARKET",
+              quantity: planned.requestedQty,
+              newClientOrderId: planned.entryClientOrderId,
+            });
         const resolvedEntry = await this.resolveFillPrice(planned.symbol, order.orderId, order.avgPrice, planned.refPrice);
         // 2026-07-19 real-money audit fix (BUG 3): a genuine partial MARKET fill (realistic on
         // thin-liquidity basket-universe symbols during volatility spikes — exactly what this
@@ -3808,7 +3952,9 @@ export class CrossSectionalExecutor {
         const isConfirmedRejection = error instanceof BinanceFuturesPrivateError && error.failureType === "binance_error";
 
         if (!isConfirmedRejection) {
-          const resolution = await this.reconcilePlannedLeg(planned.symbol, planned.entryClientOrderId);
+          const resolution = planned.takerFallbackClientOrderId
+            ? await this.reconcilePlannedLeg(planned.symbol, planned.takerFallbackClientOrderId)
+            : await this.reconcilePlannedLeg(planned.symbol, planned.entryClientOrderId);
 
           if (resolution.outcome === "FILLED") {
             // Adopt exactly like recoverIncompleteBaskets' own FILLED branch — the order actually
@@ -3972,7 +4118,9 @@ export class CrossSectionalExecutor {
         if (startIndex >= plan.length) continue; // defensive — nothing left to do
         const ambiguous = plan[startIndex]!;
         if (ambiguous.status === "PLACING") {
-          const resolution = await this.reconcilePlannedLeg(ambiguous.symbol, ambiguous.entryClientOrderId);
+          const resolution = ambiguous.takerFallbackClientOrderId
+            ? await this.reconcilePlannedLeg(ambiguous.symbol, ambiguous.takerFallbackClientOrderId)
+            : await this.reconcilePlannedLeg(ambiguous.symbol, ambiguous.entryClientOrderId);
           if (resolution.outcome === "INCONCLUSIVE") continue; // never guess — retry next tick
           if (resolution.outcome === "FILLED") {
             if (ambiguous.reservationId) {
