@@ -1904,13 +1904,33 @@ export async function registerLiveRoutes(
     const shortBlock = report.rows.filter((r) => r.shortBlocked).map((r) => r.symbol);
     const universe = report.rows.map((r) => r.symbol);
     const eligible = report.rows.filter((r) => r.passesEvaluated);
-    const mismatch = report.rows.filter((r) => !r.agreesWithCriteria);
+    // ONE reconciliation, used by the banner AND the per-row markers. They were computed separately
+    // before, so the page carried two verdicts on the same symbol: the banner said WIF needed
+    // updating while the plan below said nothing needed to change. Hysteresis is the actionable
+    // answer, so it is the one the banner reports.
+    const plan = poolReconciliationPlan(
+      report.rows.map((r) => ({
+        symbol: r.symbol, liquidityUsdPerHour: r.liquidityUsdPerHour,
+        oneLotUsd: r.oneLotUsd, inPool: r.inPool, hasOpenPosition: false,
+      })),
+      {
+        minLiquidityUsdPerHour: report.thresholds.minLiquidityUsdPerHour,
+        maxOneLotUsd: report.leg.oneLotCeilingUsd ?? Number.POSITIVE_INFINITY,
+        hysteresisFraction: 0.10,
+        minPoolSize: 8,
+      },
+    );
+    const actionFor = new Map(plan.decisions.map((d) => [d.symbol, d]));
+    const needsAction = new Set([...plan.adds, ...plan.drops]);
     const rows = report.rows.map((r) => `<tr class="${r.passesEvaluated ? "" : "out"}">
         <td class="sym">${esc(r.symbol.replace("USDT", ""))}</td>
         <td class="num">${r.liquidityUsdPerHour === null ? "—" : "$" + Math.round(r.liquidityUsdPerHour / 1000) + "k"}</td>
         <td class="num">${r.oneLotUsd === null ? "—" : "$" + r.oneLotUsd.toFixed(2)}</td>
         <td>${!measured ? '<span class="muted">tidak terukur</span>' : r.failures.length ? `<span class="bad">${r.failures.map((f) => esc(f.detail)).join("; ")}</span>` : `<span class="ok">memenuhi C1 &amp; C2</span>`}</td>
-        <td>${r.inPool ? "<b>di pool</b>" : "<span class=\"muted\">di luar</span>"}${r.agreesWithCriteria ? "" : ' <span class="warn">&#9888; tidak sesuai kriteria</span>'}</td>
+        <td>${r.inPool ? "<b>di pool</b>" : "<span class=\"muted\">di luar</span>"}${
+        needsAction.has(r.symbol) ? ' <span class="warn">&#9888; perlu diubah</span>'
+        : (actionFor.get(r.symbol)?.action ?? "").startsWith("HOLD") ? ' <span class="muted">&#9679; dalam pita, dipertahankan</span>'
+        : ""}</td>
         <td>${r.shortBlocked ? '<span class="warn">short diblokir</span>' : ""}</td>
       </tr>`).join("");
 
@@ -1944,9 +1964,11 @@ th{color:var(--mut);font-weight:600;font-size:11.5px;text-transform:uppercase;le
 
 ${!measured
   ? `<div class="note">&#9888; <b>Kriteria tidak bisa diukur sekarang</b> &mdash; pembacaan exchange gagal, jadi kolom likuiditas, satu lot dan status di bawah kosong. Ini BUKAN berarti simbol-simbol itu gagal kriteria; belum ada yang diuji. Pool aktif tetap ditampilkan apa adanya.</div>`
-  : mismatch.length
-    ? `<div class="note">&#9888; <b>${mismatch.length} simbol tidak sesuai kriteria</b>: ${mismatch.map((v) => esc(v.symbol.replace("USDT", ""))).join(", ")}. Pool aktif dan hasil kriteria berbeda — salah satunya perlu diperbarui.</div>`
-    : `<div class="note" style="background:transparent;color:var(--ok);padding-left:0">&#10003; Pool aktif sama persis dengan hasil kriteria.</div>`}
+  : plan.changed
+    ? `<div class="note">&#9888; <b>Pool perlu diubah</b>: ${[...plan.adds.map((x) => "tambah " + esc(x.replace("USDT", ""))), ...plan.drops.map((x) => "keluarkan " + esc(x.replace("USDT", "")))].join(" &middot; ")}. Rinciannya di Rekonsiliasi pool di bawah.</div>`
+    : plan.heldDespiteFailure.length
+      ? `<div class="note">&#9679; <b>Tidak ada yang perlu diubah.</b> ${plan.heldDespiteFailure.map((d) => esc(d.symbol.replace("USDT", ""))).join(", ")} berada di bawah ambang mentah tetapi <b>di dalam pita histeresis</b>, jadi keanggotaannya sengaja dipertahankan &mdash; tanpa pita, simbol di garis batas akan keluar-masuk tiap beberapa jam. Kolom status di bawah tetap menampilkan vonis kriteria mentahnya, karena itu memang fakta.</div>`
+      : `<div class="note" style="background:transparent;color:var(--ok);padding-left:0">&#10003; Pool aktif sama persis dengan hasil kriteria.</div>`}
 
 <h2>Per simbol</h2>
 <div class="wrapx"><table><thead><tr>
@@ -1954,29 +1976,11 @@ ${!measured
 </tr></thead><tbody>${rows}</tbody></table></div>
 
 ${(() => {
-  const plan = poolReconciliationPlan(
-    report.rows.map((r) => ({
-      symbol: r.symbol,
-      liquidityUsdPerHour: r.liquidityUsdPerHour,
-      oneLotUsd: r.oneLotUsd,
-      inPool: r.inPool,
-      hasOpenPosition: false,
-    })),
-    {
-      minLiquidityUsdPerHour: report.thresholds.minLiquidityUsdPerHour,
-      maxOneLotUsd: report.leg.oneLotCeilingUsd ?? Number.POSITIVE_INFINITY,
-      hysteresisFraction: 0.10,
-      minPoolSize: 8,
-    },
-  );
-  const act = plan.decisions.filter((d) => d.action === "ADD" || d.action === "DROP" || d.action === "HOLD_BAND" || d.action === "HOLD_MIN_SIZE" || d.action === "HOLD_OPEN");
+  const act = plan.decisions.filter((d) => d.action === "ADD" || d.action === "DROP" || d.action.startsWith("HOLD"));
   if (plan.unmeasured) return `<h2>Rekonsiliasi pool</h2><div class="note">Tidak ada simbol yang terukur — tidak ada keputusan yang bisa dipercaya, dan rencana ini TIDAK boleh diterapkan.</div>`;
   return `<h2>Rekonsiliasi pool</h2>
-<p class="muted">Pita histeresis <b>&plusmn;10%</b>: masuk perlu &ge; $${Math.round(report.thresholds.minLiquidityUsdPerHour * 1.1).toLocaleString("en-US")}/jam, keluar baru di bawah $${Math.round(report.thresholds.minLiquidityUsdPerHour * 0.9).toLocaleString("en-US")}/jam. Simbol di antara keduanya <b>mempertahankan keanggotaannya</b> — tanpa pita, satu simbol di garis batas akan keluar-masuk tiap beberapa jam dan menulis ulang pool yang dibandingkan overlap guard.</p>
-${plan.changed
-  ? `<div class="note">&#9888; Pool perlu diubah: ${plan.adds.length ? "tambah " + plan.adds.map((x) => esc(x.replace("USDT", ""))).join(", ") : ""}${plan.adds.length && plan.drops.length ? " · " : ""}${plan.drops.length ? "keluarkan " + plan.drops.map((x) => esc(x.replace("USDT", ""))).join(", ") : ""}. Penerapan masih MANUAL — allowlist adalah const yang dibaca sekali saat proses start, jadi perubahan butuh edit <code>.env</code> lalu restart.</div>`
-  : `<div class="note" style="background:transparent;color:var(--ok);padding-left:0">&#10003; Pool sudah sesuai kriteria setelah histeresis. Tidak ada perubahan yang perlu diterapkan.</div>`}
-${act.length ? `<div class="wrapx"><table><thead><tr><th>simbol</th><th>tindakan</th><th>alasan</th></tr></thead><tbody>${act.map((d) => `<tr><td class="sym">${esc(d.symbol.replace("USDT", ""))}</td><td class="mono">${esc(d.action)}</td><td class="muted">${esc(d.reason)}</td></tr>`).join("")}</tbody></table></div>` : ""}
+<p class="muted">Pita histeresis <b>&plusmn;10%</b>: masuk perlu &ge; $${Math.round(report.thresholds.minLiquidityUsdPerHour * 1.1).toLocaleString("en-US")}/jam, keluar baru di bawah $${Math.round(report.thresholds.minLiquidityUsdPerHour * 0.9).toLocaleString("en-US")}/jam. Simbol di antara keduanya <b>mempertahankan keanggotaannya</b>. Penerapan masih MANUAL &mdash; allowlist adalah const yang dibaca sekali saat proses start, jadi perubahan butuh edit <code>.env</code> lalu restart.</p>
+${act.length ? `<div class="wrapx"><table><thead><tr><th>simbol</th><th>tindakan</th><th>alasan</th></tr></thead><tbody>${act.map((d) => `<tr><td class="sym">${esc(d.symbol.replace("USDT", ""))}</td><td class="mono">${esc(d.action)}</td><td class="muted">${esc(d.reason)}</td></tr>`).join("")}</tbody></table></div>` : `<p class="muted">Tidak ada simbol yang butuh perhatian.</p>`}
 `;
 })()}
 
