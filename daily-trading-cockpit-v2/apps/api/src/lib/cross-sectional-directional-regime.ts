@@ -89,6 +89,17 @@ export const DIRECTIONAL_REGIME_MFE_PROFIT_LOCK_R = (): number => envNumber("CRO
  *  it hits. Halve the leg when you double the floor and dollar risk is unchanged while the fee's
  *  share halves — that is the only version of this change that is free. */
 export const DIRECTIONAL_REGIME_MIN_STOP_PCT = (): number => envNumber("CROSS_SECTIONAL_DIRECTIONAL_MIN_STOP_PCT", 0);
+/** Post-only ENTRY for the two directional lanes. Off by default; 18 executors share
+ *  SingleSymbolLaneExecutor and only these two were analysed for it.
+ *
+ *  Entry only, and the asymmetry is the reason: a resting ENTRY that never fills leaves you with no
+ *  position, while a resting EXIT that never fills leaves you holding a losing one — and exits fire
+ *  exactly when price is moving, which is when a passive order is least likely to fill. */
+export const DIRECTIONAL_REGIME_MAKER_ENTRY = (): boolean => process.env.CROSS_SECTIONAL_DIRECTIONAL_MAKER_ENTRY === "1";
+export const DIRECTIONAL_REGIME_MAKER_ENTRY_WAIT_MS = (): number => {
+  const n = Number.parseInt(process.env.CROSS_SECTIONAL_DIRECTIONAL_MAKER_ENTRY_WAIT_MS ?? "", 10);
+  return Number.isFinite(n) && n >= 1_000 && n <= 120_000 ? n : 120_000;
+};
 
 /**
  * The stop this lane will actually use: the scanner's own, unless it sits closer than `minStopPct`.

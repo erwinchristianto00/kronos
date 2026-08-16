@@ -42,6 +42,7 @@ import { BinanceFuturesPrivateError, resolveConfirmedFillPrice, roundToStep, typ
 import { clusterOf, isMajorSymbol } from "./correlation-clusters.js";
 import type { CortexRealAttributionStore } from "./cortex-real-attribution.js";
 import { fillFromUserTrade, type ExecutionFill, type ExecutionFillRecorder } from "./execution-fill-recorder.js";
+import { makerLimitPrice, resolveMakerLeg } from "./maker-entry-plan.js";
 import type { FourBrainActualFillBindingStore } from "./four-brain-actual-fill-binding.js";
 import type { FourBrainBridgeCandidate, FourBrainBridgeDecision } from "./four-brain-testnet-bridge.js";
 import type { PositionPathRecorder } from "./position-path-recorder.js";
@@ -57,7 +58,12 @@ export type SingleSymbolExecClient = Pick<
   | "getPositions"
   | "queryOrder"
   | "getUserTrades"
->;
+> &
+  /** Optional so every existing fake client keeps compiling. Maker entry REFUSES to run without it:
+   *  a post-only order that cannot be cancelled has no safe way to stop resting, and here that
+   *  matters more than on the basket path — a partially filled resting order means a LIVE, unstopped
+   *  position. */
+  Partial<Pick<BinanceFuturesPrivateClient, "cancelOrder">>;
 
 export interface SingleSymbolFreshSignal {
   observationId: string;
@@ -359,6 +365,11 @@ export interface SingleSymbolPosition {
    *  when it is false. This flag stays independent of both so the before/after shift attributable to
    *  enabling the fold stays unambiguous. */
   feeSource?: "EXCHANGE" | "ESTIMATE_TAKER_FLAT";
+  /** How the ENTRY was actually filled, split by liquidity. Exact, not an estimate: Binance rejects
+   *  a GTX order that would cross, so it can only fill as maker, and a MARKET order can only fill as
+   *  taker — which order filled which quantity IS the split. Absent on every position opened before
+   *  maker entry existed, which by construction of the code then means taker. */
+  entryLiquidity?: { makerQty: number; takerQty: number; reason: string } | null;
   netPnlUsd: number | null;
   /** Cumulative gross/fee P&L already realized from a PRIOR partial fill on this same position
    *  (2026-07-12 fix: a triggered stop can partially fill when a sibling executor's netting has
@@ -591,6 +602,18 @@ export interface SingleSymbolLaneExecutorOptions {
   /** Base position notional in USD, BEFORE allocation-weight scaling. */
   legUsd: () => number;
   leverage: () => number;
+  /** Post-only entry for THIS lane only. Default off; 18 executors share this class and only the
+   *  two directional ones were analysed for it. Measured on this account: maker 2.00 vs taker 4.00
+   *  bps per side, so entry-only takes the round trip from 8 to 6 bps — 0.040R to 0.030R at the 2%
+   *  stop floor.
+   *
+   *  ENTRY ONLY, deliberately. If a resting ENTRY never fills you simply hold no position; if a
+   *  resting EXIT never fills you still hold the position and it keeps losing — and exits fire
+   *  precisely when price is moving, which is when a passive order is least likely to fill. The
+   *  stop is a real STOP_MARKET and cannot be passive at all. */
+  makerEntry?: () => boolean;
+  /** How long a post-only entry may rest before it is cancelled and crossed. */
+  makerEntryWaitMs?: () => number;
   maxOpenPositions?: () => number;
   /** Only execute signals younger than this (a stale signal's edge has drifted). */
   maxSignalAgeMs?: () => number;
@@ -810,6 +833,8 @@ export class SingleSymbolLaneExecutor {
   private readonly executionFillRecorder: ExecutionFillRecorder | null;
   private readonly fourBrainActualFillBindings: FourBrainActualFillBindingStore | null;
   private readonly fourBrainEntryGate: ((candidate: FourBrainBridgeCandidate) => FourBrainBridgeDecision) | null;
+  private readonly makerEntryFn: () => boolean;
+  private readonly makerEntryWaitMsFn: () => number;
   private readonly legUsdFn: () => number;
   private readonly leverageFn: () => number;
   private readonly maxOpenPositionsFn: () => number;
@@ -871,6 +896,8 @@ export class SingleSymbolLaneExecutor {
     this.executionFillRecorder = opts.executionFillRecorder ?? null;
     this.fourBrainActualFillBindings = opts.fourBrainActualFillBindings ?? null;
     this.fourBrainEntryGate = opts.fourBrainEntryGate ?? null;
+    this.makerEntryFn = opts.makerEntry ?? (() => false);
+    this.makerEntryWaitMsFn = opts.makerEntryWaitMs ?? (() => 120_000);
     this.legUsdFn = opts.legUsd;
     this.leverageFn = opts.leverage;
     this.maxOpenPositionsFn = opts.maxOpenPositions ?? (() => 1);
@@ -1012,6 +1039,92 @@ export class SingleSymbolLaneExecutor {
     } catch {
       return null;
     }
+  }
+
+  /**
+   * Fill ONE entry post-only, then cross the spread for whatever did not fill.
+   *
+   * Returns the same three fields the MARKET path returns, with avgPrice already notional-blended,
+   * so every consumer downstream is untouched by how the entry was filled.
+   *
+   * THE DIFFERENCE FROM THE BASKET PATH, and why this is not a copy of it: here a partial fill means
+   * a LIVE, UNSTOPPED position. The caller places the STOP_MARKET only after this returns, so every
+   * second spent waiting out the rest of a partially-filled order is a second of naked exposure. The
+   * poll therefore BREAKS THE MOMENT ANY QUANTITY FILLS instead of serving out the timeout, which
+   * bounds the unprotected window to roughly one poll rather than the full wait. A basket leg can
+   * afford to wait for its remainder; a stopless position cannot.
+   *
+   * Any throw propagates to the caller's existing catch, which un-attempts the signal and retries
+   * next tick. This function deliberately owns no recovery of its own.
+   */
+  private async placeEntryMakerFirst(
+    symbol: string,
+    side: "BUY" | "SELL",
+    qty: number,
+    clientOrderId: string,
+    refBid: number | null,
+    refAsk: number | null,
+  ): Promise<{ orderId: string; avgPrice: number; executedQty: number; liquidity: { makerQty: number; takerQty: number; reason: string } }> {
+    const dir = side === "BUY" ? "LONG" : "SHORT";
+    const limitPrice = this.client.cancelOrder ? makerLimitPrice(dir, refBid, refAsk) : null;
+    if (limitPrice === null) {
+      const o = await this.client.placeOrder({ symbol, side, type: "MARKET", quantity: qty, newClientOrderId: clientOrderId });
+      return {
+        orderId: o.orderId, avgPrice: o.avgPrice, executedQty: o.executedQty,
+        liquidity: { makerQty: 0, takerQty: qty, reason: this.client.cancelOrder ? "no usable submit-time quote" : "client cannot cancel — maker unsafe" },
+      };
+    }
+
+    const maker = await this.client.placeOrder({
+      symbol, side, type: "LIMIT", timeInForce: "GTX", price: limitPrice, quantity: qty, newClientOrderId: clientOrderId,
+    });
+    const TERMINAL = ["FILLED", "CANCELED", "EXPIRED", "REJECTED"];
+    const waitMs = this.makerEntryWaitMsFn();
+    const deadline = this.nowMs() + waitMs;
+    // Bounded by poll count as well as by the clock: nowMs() is injectable, and a frozen test clock
+    // would otherwise spin here forever.
+    const maxPolls = Math.max(1, Math.ceil(waitMs / 1_000));
+    let latest = maker;
+    for (let poll = 0; poll < maxPolls; poll++) {
+      if (TERMINAL.includes(String(latest.status).toUpperCase())) break;
+      if (Number.isFinite(latest.executedQty) && latest.executedQty > 0) break; // live and unstopped
+      if (this.nowMs() >= deadline) break;
+      await new Promise((r) => setTimeout(r, 1_000));
+      try { latest = await this.client.queryOrder(symbol, maker.orderId); } catch { break; }
+    }
+
+    if (!TERMINAL.includes(String(latest.status).toUpperCase())) {
+      try { await this.client.cancelOrder!(symbol, maker.orderId); } catch { /* already terminal */ }
+    }
+    // Cancel, THEN read: the order can fill in the window between the two, and sizing a fallback
+    // from the pre-cancel figure is how that race doubles a position.
+    try { latest = await this.client.queryOrder(symbol, maker.orderId); } catch { /* keep last known */ }
+
+    const decision = resolveMakerLeg(qty, latest.status, latest.executedQty);
+    if (decision.action !== "FALLBACK_TAKER") {
+      // DONE, or UNKNOWN_REQUERY — in which case no fallback may be sized at all and the caller
+      // books exactly what the exchange confirmed.
+      return {
+        orderId: maker.orderId, avgPrice: latest.avgPrice, executedQty: latest.executedQty,
+        liquidity: { makerQty: decision.filledQty, takerQty: 0, reason: decision.reason },
+      };
+    }
+
+    const taker = await this.client.placeOrder({
+      symbol, side, type: "MARKET", quantity: decision.fallbackQty, newClientOrderId: `${clientOrderId}f`,
+    });
+    const makerQty = decision.filledQty;
+    const takerQty = Number.isFinite(taker.executedQty) && taker.executedQty > 0 ? taker.executedQty : decision.fallbackQty;
+    const makerPx = Number.isFinite(latest.avgPrice) && latest.avgPrice > 0 ? latest.avgPrice : limitPrice;
+    const takerPx = Number.isFinite(taker.avgPrice) && taker.avgPrice > 0 ? taker.avgPrice : 0;
+    const total = makerQty + takerQty;
+    // An unconfirmed taker price (avgPrice 0 at ACK is routine) returns 0 so resolveFillPrice
+    // re-queries, rather than inventing a blend from a price we do not have.
+    const avgPrice = takerPx > 0 && total > 0 ? (makerQty * makerPx + takerQty * takerPx) / total : 0;
+    return {
+      orderId: maker.orderId, avgPrice, executedQty: total,
+      liquidity: { makerQty, takerQty, reason: decision.reason },
+    };
   }
 
   private async resolveFillPrice(symbol: string, orderId: string, initialAvgPrice: number, fallbackPrice: number) {
@@ -2458,13 +2571,25 @@ export class SingleSymbolLaneExecutor {
         // See entryTradeWindowFromMs's doc comment. Cost on the order path: ONE clock read — same
         // Date arithmetic as the line above, no await, no I/O, nothing between it and placeOrder.
         const entryTradeWindowFromMs = this.nowMs() - FEE_WINDOW_SLACK_MS;
-        const order = await this.client.placeOrder({
-          symbol: signal.symbol,
-          side: this.direction === "LONG" ? "BUY" : "SELL",
-          type: "MARKET",
-          quantity: qty,
-          newClientOrderId: entryClientOrderId,
-        });
+        // Maker-first only when THIS lane opted in; otherwise the unchanged MARKET path. submitRef
+        // already holds the submit-time book, so the post-only price comes from the SAME quote the
+        // execution record is audited against rather than a second, later read.
+        const order = this.makerEntryFn()
+          ? await this.placeEntryMakerFirst(
+              signal.symbol,
+              this.direction === "LONG" ? "BUY" : "SELL",
+              qty,
+              entryClientOrderId,
+              submitRef?.bid ?? null,
+              submitRef?.ask ?? null,
+            )
+          : await this.client.placeOrder({
+              symbol: signal.symbol,
+              side: this.direction === "LONG" ? "BUY" : "SELL",
+              type: "MARKET",
+              quantity: qty,
+              newClientOrderId: entryClientOrderId,
+            });
         const resolvedEntry = await this.resolveFillPrice(signal.symbol, order.orderId, order.avgPrice, signal.entryPrice);
         // Commit the reservation from the ACTUAL fill — never the requested qty (order.executedQty
         // can legitimately fall short of `qty` on a genuine partial MARKET fill; falls back to the
@@ -2507,6 +2632,7 @@ export class SingleSymbolLaneExecutor {
           cortexAppliedWeightPct,
           cortexRawStaticWeightPct,
           submitRef,
+          ...("liquidity" in order ? { entryLiquidity: order.liquidity } : {}),
         };
         st.positions.push(position);
         this.store.save();

@@ -152,6 +152,8 @@ import {
   DIRECTIONAL_REGIME_MFE_GIVEBACK_FRACTION,
   DIRECTIONAL_REGIME_MFE_PROFIT_LOCK_NET_RETURN,
   DIRECTIONAL_REGIME_MFE_PROFIT_LOCK_R,
+  DIRECTIONAL_REGIME_MAKER_ENTRY,
+  DIRECTIONAL_REGIME_MAKER_ENTRY_WAIT_MS,
   DirectionalReversalStateStore,
   buildCrossSectionalDirectionalRegimeDecision,
   confirmCrossSectionalDirectionalRegime,
@@ -2372,6 +2374,10 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
           estimatedCloseCostPct: liveConfig.estimatedCloseCostPct,
           maxHoldMs: DIRECTIONAL_REGIME_MAX_HOLD_HOURS() * 3_600_000,
         }),
+        // Post-only entry, THESE TWO LANES ONLY. Every other SingleSymbolLaneExecutor keeps
+        // crossing — none of them was analysed for maker fills.
+        makerEntry: DIRECTIONAL_REGIME_MAKER_ENTRY,
+        makerEntryWaitMs: DIRECTIONAL_REGIME_MAKER_ENTRY_WAIT_MS,
         laneWeightPct: () => 100,
         rawLaneWeightPct: () => 100,
         cortexRealAttribution: getCortexRealAttributionStore(),
