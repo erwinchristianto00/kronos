@@ -173,6 +173,16 @@ type ClosedResponse = {
   lanes: ClosedLane[];
   auditHistory?: ClosedAuditHistory | null;
 };
+type XSecExecStatus = {
+  allowed: boolean;
+  enabled: boolean;
+  signalAgeMs: number | null;
+  signalMaxAgeMs: number | null;
+  signalStale: boolean;
+  openHalted?: string | null;
+  entryAdmission?: { tier?: string; allowed?: boolean; reason?: string; maxLearningOpen?: number } | null;
+  entryAttemptAudit?: { latest?: { at: string; stage: string; outcome: string; reason: string; longSymbols?: string[]; shortSymbols?: string[] } | null } | null;
+};
 type DirectionalPick = { symbol: string; sideScore: number; relativeEdge: number; confidence: number };
 type DirectionalExecutor = { openPositions?: unknown[]; dailyMaxLossUsd?: number; lastError?: string | null };
 type DirectionalRegimeResponse = {
@@ -597,6 +607,70 @@ function DirectionalRegimeStatus({ apiPrefix }: { apiPrefix: string }) {
   </section>;
 }
 
+/**
+ * Kapan basket baru bisa dibuka.
+ *
+ * DELIBERATELY NOT A COUNTDOWN TO A NEW BASKET. Only ONE part of this is on a clock: the current
+ * signal's expiry (signalAgeMs vs signalMaxAgeMs). Whether the next signal actually OPENS anything
+ * is decided by the overlap guard against the basket that came before it, which depends on how the
+ * ranking moved and cannot be predicted from a timestamp — measured, consecutive baskets share
+ * 4.94 of 6 symbols and the guard skips ~55% of attempts, so the lane averages one new basket every
+ * 2-3 days. Printing "next basket at HH:MM" would be a number the system cannot honour.
+ *
+ * So it shows the three things that ARE knowable: when the signal goes stale, what the last attempt
+ * actually did and why it stopped, and whether admission would even allow an open right now.
+ */
+function NextSignalNote({ apiPrefix }: { apiPrefix: string }) {
+  const [st, setSt] = useState<XSecExecStatus | null>(null);
+  const [failed, setFailed] = useState(false);
+  useEffect(() => {
+    let alive = true;
+    async function load() {
+      try {
+        const r = await fetch(`${apiPrefix}/live/cross-sectional-executor`, { cache: 'no-store' });
+        if (!r.ok) throw new Error(String(r.status));
+        const j = await r.json() as XSecExecStatus;
+        if (alive) { setSt(j); setFailed(false); }
+      } catch { if (alive) setFailed(true); }
+    }
+    void load();
+    const t = window.setInterval(() => void load(), 15_000);
+    return () => { alive = false; window.clearInterval(t); };
+  }, [apiPrefix]);
+
+  if (failed) return <div style={{ padding: '8px 12px', color: C.bad, fontSize: 11 }}>Status executor tidak terbaca — jadwal sinyal tidak diketahui.</div>;
+  if (!st) return <div style={{ padding: '8px 12px', color: C.dim, fontSize: 11 }}>Memuat jadwal sinyal…</div>;
+
+  const remainMs = st.signalMaxAgeMs != null && st.signalAgeMs != null ? st.signalMaxAgeMs - st.signalAgeMs : null;
+  const expiresAt = remainMs != null ? new Date(Date.now() + remainMs) : null;
+  const last = st.entryAttemptAudit?.latest ?? null;
+  const admission = st.entryAdmission ?? null;
+
+  return <div style={{ padding: '8px 12px', borderBottom: `1px solid ${C.border}`, background: C.sub, color: C.dim, fontSize: 11, lineHeight: 1.6 }}>
+    <div>
+      <strong style={{ color: C.text }}>Sinyal berikutnya</strong>
+      {' · '}
+      {st.signalStale
+        ? <span style={{ color: C.accent }}>sinyal sekarang SUDAH kedaluwarsa — menunggu siklus berikutnya</span>
+        : expiresAt
+          ? <>sinyal ini berlaku {duration(remainMs)} lagi, sampai <strong style={{ color: C.text }}>{expiresAt.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' })}</strong></>
+          : <span>umur sinyal tidak dilaporkan</span>}
+      {admission ? <>{' · admission '}<span style={{ color: admission.allowed ? C.good : C.bad }}>{admission.tier ?? (admission.allowed ? 'OK' : 'BLOK')}</span></> : null}
+      {st.openHalted ? <> · <span style={{ color: C.bad }}>open dihentikan: {st.openHalted}</span></> : null}
+    </div>
+    {last && <div>
+      Percobaan terakhir <strong style={{ color: C.text }}>{formatDate(last.at)}</strong> berhenti di <strong style={{ color: C.text }}>{last.stage}</strong>
+      {' → '}<span style={{ color: last.outcome === 'OPENED' ? C.good : C.accent }}>{last.outcome}</span>: {last.reason}
+    </div>}
+    {admission?.reason && <div style={{ opacity: 0.85 }}>{admission.reason}</div>}
+    <div style={{ opacity: 0.7 }}>
+      Hanya kedaluwarsa sinyal yang bisa dijadwalkan. Apakah sinyal berikutnya benar-benar MEMBUKA basket ditentukan
+      overlap guard terhadap basket sebelumnya — terukur, basket berurutan berbagi 4,94 dari 6 simbol dan guard menolak
+      ~55% percobaan, jadi rata-ratanya <strong style={{ color: C.text }}>1 basket baru per 2-3 hari</strong>. Jam pasti tidak bisa dijanjikan.
+    </div>
+  </div>;
+}
+
 function OpenCrossBasketReport({ apiPrefix }: { apiPrefix: string }) {
   const [data, setData] = useState<ClosedResponse | null>(null);
   const [error, setError] = useState(false);
@@ -612,6 +686,7 @@ function OpenCrossBasketReport({ apiPrefix }: { apiPrefix: string }) {
   const openBaskets = data?.openBaskets ?? [];
   return <section className="testnet-panel testnet-wide-panel cross-sectional-report" id="cross-sectional-open-report">
     <header><div><span>Open cross-basket · unrealized P&amp;L path</span><strong>{openBaskets.length} open basket{openBaskets.length === 1 ? '' : 's'}</strong></div><span className="tone-measure">grouped per basket · live marks</span></header>
+    <NextSignalNote apiPrefix={apiPrefix} />
     {error ? <div style={{ padding: 12, color: C.bad }}>Open-basket report fetch failed.</div> : data?.crossSectionalPnl ? <>
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(150px, 1fr))', borderTop: `1px solid ${C.border}`, borderBottom: `1px solid ${C.border}` }}>
         <Stat label="Gross unrealized" value={money(data.crossSectionalPnl.grossUnrealizedUsd)} color={tone(data.crossSectionalPnl.grossUnrealizedUsd)} />
@@ -643,30 +718,41 @@ function ClosedCrossBasketReport({ apiPrefix }: { apiPrefix: string }) {
   const auditBaskets = auditLanes
     .flatMap((lane) => lane.baskets.map((basket) => ({ lane: lane.lane, basket })))
     .sort((a, b) => new Date(b.basket.closedAt).getTime() - new Date(a.basket.closedAt).getTime());
+  // 2026-08-16: ONE chronological history. The audit rows used to sit in a collapsed section below
+  // the cohort, so the same lane's baskets appeared in two places ordered by a cutoff rather than
+  // by time, and the operator had to open a details pane to see half their own fills. Provenance is
+  // not lost — every pre-cutoff row still carries its `audit` marker inline, and the totals below
+  // still separate what the cohort counts from what the exchange actually did.
+  const allBaskets = [
+    ...baskets.map((b) => ({ ...b, audit: false })),
+    ...auditBaskets.map((b) => ({ ...b, audit: true })),
+  ].sort((a, b) => new Date(b.basket.closedAt).getTime() - new Date(a.basket.closedAt).getTime());
+  const cohortNet = data?.crossSectionalPnl?.netRealizedProfitUsd;
+  const auditNet = data?.auditHistory?.totalNetPnlUsd;
+  const allTimeNet = cohortNet != null || auditNet != null ? (cohortNet ?? 0) + (auditNet ?? 0) : undefined;
   return <section className="testnet-panel testnet-wide-panel cross-sectional-report" id="cross-sectional-closed-report">
-    <header><div><span>Closed cross-basket realized report</span><strong>{baskets.length} active cohort · {auditBaskets.length} audit history</strong></div><span className="tone-measure">grouped per basket · real fills</span></header>
+    <header><div><span>Closed cross-basket realized report</span><strong>{allBaskets.length} basket{allBaskets.length === 1 ? '' : 's'}{auditBaskets.length ? ` · ${auditBaskets.length} pra-cohort` : ''}</strong></div><span className="tone-measure">grouped per basket · real fills</span></header>
     <div style={{ padding: '8px 12px', color: C.dim, fontSize: 11, lineHeight: 1.5 }}>
       Scope: {data?.reportStartAt ? `baskets opened from ${formatDate(data.reportStartAt)} onward` : 'all stored history'}. Gross profit, fee/cost, long/short return, realized net per symbol, and open/close timestamps. Fee/cost comes from the basket ledger; separate slippage is not currently stored independently. Per-symbol fee is allocated by notional touched.
     </div>
     {data?.crossSectionalPnl && <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(150px, 1fr))', borderTop: `1px solid ${C.border}`, borderBottom: `1px solid ${C.border}` }}>
-      <Stat label="Realized sebelum slippage" value={money(data.crossSectionalPnl.realizedBeforeSlippageUsd)} color={tone(data.crossSectionalPnl.realizedBeforeSlippageUsd)} />
-      <Stat label="Net realized profit" value={money(data.crossSectionalPnl.netRealizedProfitUsd)} color={tone(data.crossSectionalPnl.netRealizedProfitUsd)} />
+      <Stat label="Net cohort aktif" value={money(cohortNet)} color={tone(cohortNet)} />
+      <Stat label="Net pra-cohort (audit)" value={money(auditNet)} color={tone(auditNet)} />
+      <Stat label="Net semua histori" value={money(allTimeNet)} color={tone(allTimeNet)} />
     </div>}
+    <div style={{ padding: '6px 12px', color: C.dim, fontSize: 11, lineHeight: 1.5 }}>
+      Daftar di bawah satu urutan waktu, cohort dan pra-cohort digabung. Baris bertanda <span style={{ color: C.accent }}>audit</span> adalah
+      fill exchange nyata dari sebelum batas cohort: tetap bisa diaudit, tapi <strong style={{ color: C.text }}>tidak</strong> masuk edge aktif,
+      pembelajaran Four-Brain, atau P&amp;L hari ini — itulah kenapa ketiga angka di atas dipisah.
+      {data?.auditHistory?.reason ? ` ${data.auditHistory.reason}` : ''}
+    </div>
     {error ? <div style={{ padding: 12, color: C.bad }}>Closed-basket report fetch failed.</div> : <>
-      {baskets.length ? <div style={{ padding: '0 12px 12px' }}>
-        {baskets.map(({ lane, basket }) => <ClosedBasketBlock key={basket.basketId} lane={lane} basket={basket} />)}
-      </div> : <div style={{ padding: 12, color: C.dim }}>{data?.reason ? 'Belum ada basket closed pada cohort aktif.' : 'Loading closed basket history…'}</div>}
-      {auditBaskets.length > 0 && <details style={{ margin: '0 12px 12px', border: `1px solid ${C.border}`, borderRadius: 6, overflow: 'hidden' }}>
-        <summary style={{ padding: '10px 12px', cursor: 'pointer', background: C.sub, color: C.measure }}>
-          Histori audit sebelum cohort aktif · {auditBaskets.length} basket · <strong style={{ color: tone(data?.auditHistory?.totalNetPnlUsd) }}>{money(data?.auditHistory?.totalNetPnlUsd)}</strong> · buka detail
-        </summary>
-        <div style={{ padding: '8px 12px', color: C.dim, fontSize: 11, lineHeight: 1.5, borderTop: `1px solid ${C.border}` }}>
-          {data?.auditHistory?.reason} Ini adalah fill exchange nyata yang tetap bisa diaudit, tetapi tidak dihitung sebagai hasil cohort aktif, pembelajaran Four-Brain, atau P&amp;L hari ini.
-        </div>
-        <div style={{ padding: '0 12px 12px' }}>
-          {auditBaskets.map(({ lane, basket }) => <ClosedBasketBlock key={`audit-${basket.basketId}`} lane={`${lane} · audit`} basket={basket} />)}
-        </div>
-      </details>}
+      {allBaskets.length ? <div style={{ padding: '0 12px 12px' }}>
+        {allBaskets.map(({ lane, basket, audit }) => (
+          <ClosedBasketBlock key={`${audit ? 'audit-' : ''}${basket.basketId}`} lane={audit ? `${lane} · audit` : lane} basket={basket} />
+        ))}
+      </div> : <div style={{ padding: 12, color: C.dim }}>{data?.reason ? 'Belum ada basket closed.' : 'Loading closed basket history…'}</div>}
+
     </>}
   </section>;
 }
