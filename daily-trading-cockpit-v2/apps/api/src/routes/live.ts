@@ -15,6 +15,7 @@ import type { FastifyInstance } from "fastify";
 
 import type { LiveExecutionEngine } from "../lib/live-execution-engine.js";
 import { fullyCostedNetPnlUsd, fullyCostedFeeUsd } from "../lib/fully-costed-net-pnl.js";
+import { poolReconciliationPlan } from "../lib/symbol-pool-reconciliation.js";
 import {
   evaluateSymbolEligibility, effectiveLegUsd, oneLotNotionalUsd, DEFAULT_ELIGIBILITY,
   type SymbolEligibilityInput, type EligibilityVerdict,
@@ -1952,6 +1953,33 @@ ${!measured
 <th>simbol</th><th class="num">likuiditas/jam</th><th class="num">satu lot</th><th>C1 &amp; C2</th><th>status</th><th>catatan</th>
 </tr></thead><tbody>${rows}</tbody></table></div>
 
+${(() => {
+  const plan = poolReconciliationPlan(
+    report.rows.map((r) => ({
+      symbol: r.symbol,
+      liquidityUsdPerHour: r.liquidityUsdPerHour,
+      oneLotUsd: r.oneLotUsd,
+      inPool: r.inPool,
+      hasOpenPosition: false,
+    })),
+    {
+      minLiquidityUsdPerHour: report.thresholds.minLiquidityUsdPerHour,
+      maxOneLotUsd: report.leg.oneLotCeilingUsd ?? Number.POSITIVE_INFINITY,
+      hysteresisFraction: 0.10,
+      minPoolSize: 8,
+    },
+  );
+  const act = plan.decisions.filter((d) => d.action === "ADD" || d.action === "DROP" || d.action === "HOLD_BAND" || d.action === "HOLD_MIN_SIZE" || d.action === "HOLD_OPEN");
+  if (plan.unmeasured) return `<h2>Rekonsiliasi pool</h2><div class="note">Tidak ada simbol yang terukur — tidak ada keputusan yang bisa dipercaya, dan rencana ini TIDAK boleh diterapkan.</div>`;
+  return `<h2>Rekonsiliasi pool</h2>
+<p class="muted">Pita histeresis <b>&plusmn;10%</b>: masuk perlu &ge; $${Math.round(report.thresholds.minLiquidityUsdPerHour * 1.1).toLocaleString("en-US")}/jam, keluar baru di bawah $${Math.round(report.thresholds.minLiquidityUsdPerHour * 0.9).toLocaleString("en-US")}/jam. Simbol di antara keduanya <b>mempertahankan keanggotaannya</b> — tanpa pita, satu simbol di garis batas akan keluar-masuk tiap beberapa jam dan menulis ulang pool yang dibandingkan overlap guard.</p>
+${plan.changed
+  ? `<div class="note">&#9888; Pool perlu diubah: ${plan.adds.length ? "tambah " + plan.adds.map((x) => esc(x.replace("USDT", ""))).join(", ") : ""}${plan.adds.length && plan.drops.length ? " · " : ""}${plan.drops.length ? "keluarkan " + plan.drops.map((x) => esc(x.replace("USDT", ""))).join(", ") : ""}. Penerapan masih MANUAL — allowlist adalah const yang dibaca sekali saat proses start, jadi perubahan butuh edit <code>.env</code> lalu restart.</div>`
+  : `<div class="note" style="background:transparent;color:var(--ok);padding-left:0">&#10003; Pool sudah sesuai kriteria setelah histeresis. Tidak ada perubahan yang perlu diterapkan.</div>`}
+${act.length ? `<div class="wrapx"><table><thead><tr><th>simbol</th><th>tindakan</th><th>alasan</th></tr></thead><tbody>${act.map((d) => `<tr><td class="sym">${esc(d.symbol.replace("USDT", ""))}</td><td class="mono">${esc(d.action)}</td><td class="muted">${esc(d.reason)}</td></tr>`).join("")}</tbody></table></div>` : ""}
+`;
+})()}
+
 <h2>Kriteria</h2>
 <table><tbody>
 <tr><td><b>C1</b> likuiditas</td><td>&ge; $${(DEFAULT_ELIGIBILITY.minLiquidityUsdPerHour / 1000).toFixed(0)}k/jam</td><td class="muted">ongkos eksekusi; ambang yang sudah terpasang sebelumnya</td></tr>
@@ -2115,7 +2143,7 @@ dibuat ${esc(new Date(now).toISOString())} &middot; di-cache 15 menit &middot; d
       <td class="num">${usd(r.netUsd)}</td>
       <td class="num">${r.holdHours == null ? "—" : r.holdHours.toFixed(1) + "j"}</td>
       <td>${r.status === "CLOSED" ? esc(r.closeReason ?? "—") : '<b class="warn">MASIH TERBUKA</b>'}</td>
-      <td class="num">${r.makerPct == null ? '<span class="muted">taker</span>' : r.makerPct.toFixed(0) + "% mkr"}</td>
+      <td class="num">${r.makerPct == null ? '<span class="muted">taker</span>' : r.makerPct.toFixed(0) + "% mkr"}<span class="muted"> / taker</span></td>
     </tr>`).join("");
 
     // Per-position verdicts, one row per hypothesis an operator actually asks about. Every verdict
@@ -2222,9 +2250,9 @@ tr.open td{background:var(--card)}.wrapx{overflow-x:auto}
 <tbody>${groupRows(bySymbol) || '<tr><td colspan="5" class="muted">belum ada</td></tr>'}</tbody></table></div>
 
 <h2>Seluruh posisi</h2>
-<p class="muted"><b>ongkos R</b> = komisi bolak-balik dibagi satuan risiko, yaitu 8bps/lebar-stop — makin sempit stop, makin besar porsi yang dimakan ongkos. Itulah angka yang lantai stop 2% ada untuk menggesernya.</p>
+<p class="muted"><b>masuk / keluar</b> = likuiditas tiap sisi. Keluar SELALU taker: exit lane ini memakai MARKET dan stop-nya STOP_MARKET, yang menurut definisi tidak bisa pasif. <b>ongkos R</b> = komisi bolak-balik dibagi satuan risiko, yaitu 8bps/lebar-stop — makin sempit stop, makin besar porsi yang dimakan ongkos. Itulah angka yang lantai stop 2% ada untuk menggesernya.</p>
 <div class="wrapx"><table><thead><tr>
-<th>dibuka</th><th>simbol</th><th>arah</th><th class="num">stop%</th><th class="num">ongkos R</th><th class="num">peak R</th><th class="num">net R</th><th class="num">net USD</th><th class="num">tahan</th><th>ditutup oleh</th><th class="num">likuiditas</th>
+<th>dibuka</th><th>simbol</th><th>arah</th><th class="num">stop%</th><th class="num">ongkos R</th><th class="num">peak R</th><th class="num">net R</th><th class="num">net USD</th><th class="num">tahan</th><th>ditutup oleh</th><th class="num">masuk / keluar</th>
 </tr></thead><tbody>${ledger || '<tr><td colspan="11" class="muted">belum ada posisi</td></tr>'}</tbody></table></div>
 
 <h2>Evaluasi per posisi</h2>
