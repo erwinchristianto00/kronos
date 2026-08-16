@@ -2944,6 +2944,22 @@ export default function TestnetExchangeDashboard() {
               Histori cross-basket sebelum periode ini: {timelineSeries.crossSectionalAuditBeforePeriod.closedBaskets} closed basket · {signed(timelineSeries.crossSectionalAuditBeforePeriod.totalNetPnlUsd)} · terakhir {timeAgo(timelineSeries.crossSectionalAuditBeforePeriod.lastClosedAt)}. Tidak dicampur ke kurva {timelineSeries.periodLabel}; pilih tanggal close-nya untuk melihat titik chart.
             </p>
           )}
+          {/* The timeline plots lane CURVES; this is the per-position record behind the directional
+              ones — which exit closed each trade, and the same seven-hypothesis verdict per close.
+              Linked rather than inlined: it is a full ledger, not a summary, and it lives on the API
+              so no dashboard bundle carries it. Testnet-only, same as the note above. */}
+          {!isLivePage && (
+            <p className="tone-measure" style={{ margin: '5px 0 0', fontSize: 12 }}>
+              <a
+                href={`${pageApiPrefix}/live/directional-overlay-counterfactual/view`}
+                target="_blank"
+                rel="noreferrer"
+                style={{ color: 'inherit' }}
+              >
+                Catatan trade directional — tiap posisi, ditutup oleh apa, evaluasi per posisi →
+              </a>
+            </p>
+          )}
           <LanePerformanceChart series={timelineSeries} />
           <div className="testnet-table-wrap testnet-performance-table">
             <table>
