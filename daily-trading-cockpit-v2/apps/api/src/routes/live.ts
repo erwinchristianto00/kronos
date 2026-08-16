@@ -2132,10 +2132,35 @@ dibuat ${esc(new Date(now).toISOString())} &middot; di-cache 15 menit &middot; d
         <td class="num">${usd(v.reduce((a, x) => a + (x.netUsd ?? 0), 0))}</td>
         <td class="num">${mean(v.map((x) => x.holdHours ?? 0)).toFixed(1)}j</td></tr>`).join("");
 
+    // Level harga dari geometri yang BERLAKU SEKARANG. The store keeps no per-position record of
+    // the config it ran under, so a closed position's real levels cannot be reconstructed — these
+    // are "where it would exit today", exact for the open position and a reference for the rest.
+    // Labelled as such rather than presented as history.
+    const geo = ownExitParamsFromEnv();
+    const lockR = geo.profitLockR && geo.profitLockR > 0 ? geo.profitLockR : null;
+    const tpR = Number.parseFloat(process.env.CROSS_SECTIONAL_DIRECTIONAL_STATIC_TP_R ?? "") || 0;
+    const priceAtR = (r: LedgerRow, atR: number): number | null => {
+      if (!Number.isFinite(r.entryPrice) || !Number.isFinite(r.stopPrice)) return null;
+      const risk = Math.abs(r.entryPrice - r.stopPrice);
+      if (!(risk > 0)) return null;
+      return r.direction === "SHORT" ? r.entryPrice - atR * risk : r.entryPrice + atR * risk;
+    };
+    const px = (v: number | null | undefined): string => {
+      if (v == null || !Number.isFinite(v)) return "—";
+      const abs = Math.abs(v);
+      return abs >= 1000 ? v.toFixed(2) : abs >= 1 ? v.toFixed(4) : v.toPrecision(5);
+    };
+
     const ledger = rows.map((r) => `<tr class="${r.status === "CLOSED" ? "" : "open"}">
       <td class="mono">${esc(r.openedAt.slice(0, 16))}</td>
       <td class="sym">${esc(r.symbol.replace("USDT", ""))}</td>
       <td class="${r.direction === "SHORT" ? "neg" : "pos"}">${esc(r.direction)}</td>
+      <td class="num">${px(r.entryPrice)}</td>
+      <td class="num">${r.exitPrice == null ? '<span class="muted">terbuka</span>' : px(r.exitPrice)}</td>
+      <td class="num neg">${px(r.stopPrice)}</td>
+      <td class="num pos">${lockR == null ? "—" : px(priceAtR(r, lockR))}</td>
+      <td class="num pos">${px(priceAtR(r, geo.armR))}</td>
+      <td class="num pos">${tpR > 0 ? px(priceAtR(r, tpR)) : "—"}</td>
       <td class="num">${r.stopPct == null ? "—" : r.stopPct.toFixed(2) + "%"}</td>
       <td class="num">${r.costR == null ? "—" : r.costR.toFixed(3)}</td>
       <td class="num">${r3(r.peakR)}</td>
@@ -2250,9 +2275,11 @@ tr.open td{background:var(--card)}.wrapx{overflow-x:auto}
 <tbody>${groupRows(bySymbol) || '<tr><td colspan="5" class="muted">belum ada</td></tr>'}</tbody></table></div>
 
 <h2>Seluruh posisi</h2>
-<p class="muted"><b>masuk / keluar</b> = likuiditas tiap sisi. Keluar SELALU taker: exit lane ini memakai MARKET dan stop-nya STOP_MARKET, yang menurut definisi tidak bisa pasif. <b>ongkos R</b> = komisi bolak-balik dibagi satuan risiko, yaitu 8bps/lebar-stop — makin sempit stop, makin besar porsi yang dimakan ongkos. Itulah angka yang lantai stop 2% ada untuk menggesernya.</p>
+<p class="muted"><b>entry / close / stop</b> = harga sungguhan dari store. <b>lock</b> dan <b>arm</b> = level harga dari geometri yang <b>berlaku sekarang</b> (lock ${lockR ?? "—"}R, arm ${geo.armR}R) — store tidak menyimpan config per posisi, jadi untuk posisi yang sudah tutup ini "di mana ia akan keluar hari ini", bukan level yang benar-benar berlaku saat itu. ${tpR > 0
+  ? `<b>TP ${tpR}R menutup SELURUH posisi</b> — bukan sebagian, jadi tidak ada sisa yang jalan terus. Di antara arm dan TP, yang memanen adalah MFE giveback: ia menjejak dan keluar setelah harga mengembalikan ${Math.round(geo.givebackFraction * 100)}% dari puncaknya, jadi harga keluarnya bergantung puncak dan tidak bisa dipatok di muka. Terukur, TP ${tpR}R netral terhadap hasil (&minus;0,0000R) tetapi memperpendek tahan dan mempersempit sebaran; TP di bawah 1,5R merugikan.`
+  : `<b>Lane ini tidak punya full TP</b>: pemanen atasnya adalah MFE giveback yang mulai menjejak di arm, lalu keluar setelah harga mengembalikan ${Math.round(geo.givebackFraction * 100)}% dari puncaknya.`} <b>masuk / keluar</b> = likuiditas tiap sisi. Keluar SELALU taker: exit lane ini memakai MARKET dan stop-nya STOP_MARKET, yang menurut definisi tidak bisa pasif. <b>ongkos R</b> = komisi bolak-balik dibagi satuan risiko, yaitu 8bps/lebar-stop — makin sempit stop, makin besar porsi yang dimakan ongkos. Itulah angka yang lantai stop 2% ada untuk menggesernya.</p>
 <div class="wrapx"><table><thead><tr>
-<th>dibuka</th><th>simbol</th><th>arah</th><th class="num">stop%</th><th class="num">ongkos R</th><th class="num">peak R</th><th class="num">net R</th><th class="num">net USD</th><th class="num">tahan</th><th>ditutup oleh</th><th class="num">masuk / keluar</th>
+<th>dibuka</th><th>simbol</th><th>arah</th><th class="num">entry</th><th class="num">close</th><th class="num">stop</th><th class="num">lock ${lockR ?? "—"}R</th><th class="num">arm ${geo.armR}R</th><th class="num">${tpR > 0 ? `TP ${tpR}R` : "TP —"}</th><th class="num">stop%</th><th class="num">ongkos R</th><th class="num">peak R</th><th class="num">net R</th><th class="num">net USD</th><th class="num">tahan</th><th>ditutup oleh</th><th class="num">masuk / keluar</th>
 </tr></thead><tbody>${ledger || '<tr><td colspan="11" class="muted">belum ada posisi</td></tr>'}</tbody></table></div>
 
 <h2>Evaluasi per posisi</h2>

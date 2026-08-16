@@ -89,6 +89,10 @@ export const DIRECTIONAL_REGIME_MFE_PROFIT_LOCK_R = (): number => envNumber("CRO
  *  it hits. Halve the leg when you double the floor and dollar risk is unchanged while the fee's
  *  share halves — that is the only version of this change that is free. */
 export const DIRECTIONAL_REGIME_MIN_STOP_PCT = (): number => envNumber("CROSS_SECTIONAL_DIRECTIONAL_MIN_STOP_PCT", 0);
+/** Full take-profit in R. 0 = off, which is what this lane ran with until 2026-08-17.
+ *  Measured: harmful below 1.5R, exactly neutral at 1.5R, noise above. See staticTpR's doc comment
+ *  in single-symbol-lane-executor.ts for why 1.5R buys variance rather than return. */
+export const DIRECTIONAL_REGIME_STATIC_TP_R = (): number => envNumber("CROSS_SECTIONAL_DIRECTIONAL_STATIC_TP_R", 0);
 /** Post-only ENTRY for the two directional lanes. Off by default; 18 executors share
  *  SingleSymbolLaneExecutor and only these two were analysed for it.
  *

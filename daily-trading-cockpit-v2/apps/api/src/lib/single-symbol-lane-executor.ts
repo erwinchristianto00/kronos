@@ -157,6 +157,20 @@ export function makeMfeGivebackExitPolicy(opts: {
    *  every volatility, which is the entire point. Additive on purpose: lanes that pass only
    *  `profitLockNetReturn` keep their existing behavior byte for byte. */
   profitLockR?: number;
+  /** Full take-profit in R — closes the WHOLE position the moment favorable-R reaches it. There is
+   *  no remainder: this is not a partial. Unset/0 = no TP, which is what every lane had before.
+   *
+   *  MEASURED (250 days, neutral entries, stop 2%, arm 0.75/giveback 0.30): a TP is HARMFUL below
+   *  1.5R — at 0.50R it removes 97% of the result, because it caps every winner at 0.5R while stops
+   *  still take a full −1R. At 1.5R it is exactly return-NEUTRAL (−0.0000R) and converts 14 points
+   *  of uncertain GIVEBACK exits into certain ones, shortening holds and narrowing the spread. Above
+   *  that the gain is inside the noise. So: 1.5R buys variance, not return, and anything tighter
+   *  costs real money.
+   *
+   *  FIRES ON TICK, not intrabar. The simulation that produced those numbers used candle high/low;
+   *  this policy sees whatever price the tick passes it, so in production the TP will trigger later
+   *  and less often than measured. Treat the measured figures as an upper bound. */
+  staticTpR?: number;
   /** One-way estimated close cost used to express the lock in net terms. Unused by `profitLockR`. */
   estimatedCloseCostPct?: number;
 }): SingleSymbolExitPolicy {
@@ -171,6 +185,12 @@ export function makeMfeGivebackExitPolicy(opts: {
     const lockNet = Number.isFinite(opts.profitLockNetReturn) && opts.profitLockNetReturn! > 0
       ? opts.profitLockNetReturn!
       : null;
+    // Full TP is checked BEFORE the lock and the giveback: it is the highest level of the three, so
+    // if price is there the other two would only ever book less.
+    const tpR = Number.isFinite(opts.staticTpR) && opts.staticTpR! > 0 ? opts.staticTpR! : null;
+    if (tpR !== null && r >= tpR) {
+      return { shouldExit: true, reason: "STATIC_TP", nextPeakFavorableR };
+    }
     // R-denominated lock wins when set: same unit as armR and the stop, so no conversion and no
     // dependence on how wide this particular position's stop happens to be.
     const lockR = Number.isFinite(opts.profitLockR) && opts.profitLockR! > 0 ? opts.profitLockR! : null;

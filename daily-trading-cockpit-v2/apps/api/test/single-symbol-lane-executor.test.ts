@@ -549,6 +549,49 @@ describe("makeFixedRewardExitPolicy (SHORT_FADE_EXHAUSTION geometry)", () => {
   });
 });
 
+describe("makeMfeGivebackExitPolicy — staticTpR (full TP, 2026-08-17)", () => {
+  const g = { entryPrice: 100, stopPrice: 98 };            // stop 2% -> 1R = 2.00
+  const atR = (r: number) => g.entryPrice + r * (g.entryPrice - g.stopPrice);
+  const tp = makeMfeGivebackExitPolicy({ armR: 0.75, givebackFrac: 0.3, maxHoldMs: 24 * 3_600_000, profitLockR: 0.15, staticTpR: 1.5 });
+  const noTp = makeMfeGivebackExitPolicy({ armR: 0.75, givebackFrac: 0.3, maxHoldMs: 24 * 3_600_000, profitLockR: 0.15 });
+
+  it("[TP-R] closes the WHOLE position at the level — there is no remainder", () => {
+    const d = tp({ direction: "LONG", ...g, currentPrice: atR(1.5), peakFavorableR: 1.5, msHeld: 0 });
+    expect(d.shouldExit).toBe(true);
+    expect(d.reason).toBe("STATIC_TP");
+  });
+
+  it("[TP-R] fires BEFORE lock and giveback — it is the highest level of the three", () => {
+    // Peak 2R, price back at 1.5R: the giveback line sits at 1.4R and the lock at 0.15R, so without
+    // the TP this path books strictly less. Checking the TP first is what makes it worth having.
+    const withTp = tp({ direction: "LONG", ...g, currentPrice: atR(1.5), peakFavorableR: 2, msHeld: 0 });
+    expect(withTp.reason).toBe("STATIC_TP");
+    const without = noTp({ direction: "LONG", ...g, currentPrice: atR(1.5), peakFavorableR: 2, msHeld: 0 });
+    expect(without.shouldExit).toBe(false); // 1.5R is above the 1.4R giveback line — still running
+  });
+
+  it("[TP-R] does nothing below the level, and unset behaves exactly as before", () => {
+    expect(tp({ direction: "LONG", ...g, currentPrice: atR(1.49), peakFavorableR: 1.49, msHeld: 0 }).shouldExit).toBe(false);
+    for (const r of [0.5, 1.0, 1.49]) {
+      const ctx = { direction: "LONG" as const, ...g, currentPrice: atR(r), peakFavorableR: r, msHeld: 0 };
+      expect(tp(ctx)).toEqual(noTp(ctx));
+    }
+  });
+
+  it("[TP-R] SHORT reaches it by falling, not rising", () => {
+    const sg = { entryPrice: 100, stopPrice: 102 };
+    const px = (r: number) => sg.entryPrice - r * (sg.stopPrice - sg.entryPrice);
+    const t2 = makeMfeGivebackExitPolicy({ armR: 0.75, givebackFrac: 0.3, maxHoldMs: 24 * 3_600_000, staticTpR: 1.5 });
+    expect(t2({ direction: "SHORT", ...sg, currentPrice: px(1.5), peakFavorableR: 1.5, msHeld: 0 }).reason).toBe("STATIC_TP");
+    expect(t2({ direction: "SHORT", ...sg, currentPrice: px(1.0), peakFavorableR: 1.0, msHeld: 0 }).shouldExit).toBe(false);
+  });
+
+  it("[TP-R] the stop still wins over the TP — it is checked first and must stay that way", () => {
+    const d = tp({ direction: "LONG", ...g, currentPrice: g.stopPrice, peakFavorableR: 2, msHeld: 0 });
+    expect(d.reason).toBe("INITIAL_STOP");
+  });
+});
+
 describe("makeMfeGivebackExitPolicy — profitLockR (R-denominated, 2026-08-16)", () => {
   // THE DEFECT THIS CLOSES, in the two real shapes it took on testnet:
   //   ETHUSDT stop 0.47% of entry -> profitLockNetReturn 0.005 meant a 1.15R lock
