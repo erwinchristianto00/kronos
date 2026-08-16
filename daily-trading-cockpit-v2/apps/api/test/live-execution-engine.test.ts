@@ -38,6 +38,7 @@ import {
   type PaperStoreReader,
   isLiveIntentReportingExcluded,
   sumLiveIntentReportingExclusions,
+  reportedDailyLedger,
 } from "../src/lib/live-execution-engine.js";
 import {
   SingleSymbolLaneExecutor,
@@ -6280,6 +6281,36 @@ describe("live-execution-engine — operator reporting void (2026-08-15)", () =>
     expect(out.count).toBe(2);
     expect(out.realizedPnlUsd).toBeCloseTo(-5.21, 9);
     expect(out.feesUsd).toBeCloseTo(0.58, 9);
+  });
+
+  it("[TODAY-STALE] a ledger from another day reports ZERO for today, not yesterday's number", () => {
+    // The real defect: dailyLedger only rolls inside rollDailyLedger(), which the kill-switch path
+    // calls before every read and the status path never did. So on a day with no closes the card
+    // printed YESTERDAY's realized under the label "today" — for as many quiet days as followed.
+    const yesterday = { dateUtc: "2026-08-15", realizedPnlUsd: -4.21074343, wins: 0, losses: 1 };
+    const out = reportedDailyLedger(yesterday, "2026-08-16");
+    expect(out.realizedPnlUsd).toBe(0);
+    expect(out.wins).toBe(0);
+    expect(out.losses).toBe(0);
+    expect(out.dateUtc).toBe("2026-08-16");
+    // the stale date is CARRIED, so a reader can tell "no trades today" from "ledger is another day's"
+    expect(out.staleLedgerDateUtc).toBe("2026-08-15");
+  });
+
+  it("[TODAY-STALE] today's own ledger is returned untouched, including a profit", () => {
+    const today = { dateUtc: "2026-08-16", realizedPnlUsd: 12.5, wins: 3, losses: 1, scratches: 2 };
+    const out = reportedDailyLedger(today, "2026-08-16");
+    expect(out).toBe(today);
+    expect(out.staleLedgerDateUtc).toBeUndefined();
+  });
+
+  it("[TODAY-STALE] a stale PROFIT is zeroed too — this is not a loss-hiding rule", () => {
+    // Mirror of the case above with the sign flipped: a reporter that only zeroed losses would
+    // quietly flatter the card, which is the same defect wearing the opposite sign.
+    const out = reportedDailyLedger({ dateUtc: "2026-08-14", realizedPnlUsd: 31.4, wins: 5, losses: 0 }, "2026-08-16");
+    expect(out.realizedPnlUsd).toBe(0);
+    expect(out.wins).toBe(0);
+    expect(out.staleLedgerDateUtc).toBe("2026-08-14");
   });
 
   it("[VOID-OTHER-KIND] an exclusion of some OTHER kind must NOT be treated as an operator void", () => {

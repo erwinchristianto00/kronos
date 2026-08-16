@@ -893,7 +893,7 @@ export interface LiveLanePerformanceSeriesReport {
   lanes: LiveLanePerformanceSeriesLane[];
 }
 
-interface LiveDailyLedger {
+export interface LiveDailyLedger {
   dateUtc: string;
   realizedPnlUsd: number;
   wins: number;
@@ -1204,6 +1204,30 @@ export type LivePrivateClient = Pick<
 
 /** Same as sumLiveIntentReportingExclusions but scoped to ONE UTC day, so a "today" headline can be
  *  corrected without also subtracting voids from earlier days. Matches how dailyLedger rolls. */
+/**
+ * What "today" should REPORT, given a ledger that may not have rolled yet.
+ *
+ * `dailyLedger` only rolls inside `rollDailyLedger()`, which the kill-switch path calls before
+ * every read. The status endpoint does not — it returned `st.dailyLedger` verbatim, date field and
+ * all, and the dashboard printed `.realizedPnlUsd` under the label "today" without ever comparing
+ * that date to the actual date. So on any day the engine has not closed anything, the card showed
+ * YESTERDAY's realized P&L as today's, indefinitely: a quiet week after a -50 close would have
+ * displayed "today -50" seven days running. The kill switch was never affected — it rolls first —
+ * which is exactly why the two numbers could diverge without anything looking broken.
+ *
+ * Pure on purpose. The status path must not mutate the ledger the kill switch owns, so this
+ * returns what a reader should SEE and leaves `st.dailyLedger` alone; the next roll (or close)
+ * updates the real thing. `staleLedgerDateUtc` is carried so a reader can tell "no trades today"
+ * apart from "ledger belongs to another day", rather than inferring it from a zero.
+ */
+export function reportedDailyLedger(
+  ledger: LiveDailyLedger,
+  todayUtc: string,
+): LiveDailyLedger & { staleLedgerDateUtc?: string } {
+  if (ledger.dateUtc === todayUtc) return ledger;
+  return { dateUtc: todayUtc, realizedPnlUsd: 0, wins: 0, losses: 0, scratches: 0, staleLedgerDateUtc: ledger.dateUtc };
+}
+
 export function sumLiveIntentReportingExclusionsForDate(
   intents: ReadonlyArray<{ closedAt?: string | null; updatedAt?: string | null; reportingExclusion?: { kind: "OPERATOR_VOID"; excludedRealizedPnlUsd: number; excludedFeesUsd: number } | null }>,
   dateUtc: string,
@@ -2638,13 +2662,13 @@ export class LiveExecutionEngine {
               : null,
         };
       })(),
-      closedToday: st.dailyLedger,
+      closedToday: reportedDailyLedger(st.dailyLedger, this.nowIso().slice(0, 10)),
       consecutiveLosses: st.consecutiveLosses,
       totalRealizedPnlUsd: st.totalRealizedPnlUsd,
       // Raw accumulator above is the KILL-SWITCH number and stays exchange-true. The two fields
       // below let a display show the cohort figure without ever hiding what really happened.
       reportingExcluded: sumLiveIntentReportingExclusions(st.intents),
-      reportingExcludedToday: sumLiveIntentReportingExclusionsForDate(st.intents, st.dailyLedger.dateUtc),
+      reportingExcludedToday: sumLiveIntentReportingExclusionsForDate(st.intents, this.nowIso().slice(0, 10)),
       totalRealizedPnlUsdExcludingVoids:
         st.totalRealizedPnlUsd - sumLiveIntentReportingExclusions(st.intents).realizedPnlUsd,
       limits: {
