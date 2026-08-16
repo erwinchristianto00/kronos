@@ -2813,7 +2813,7 @@ export class CrossSectionalExecutor {
     // Every remaining plan entry has never been attempted by any process — release it now (see this
     // method's own 2026-08-05 doc-comment addendum above). No-op when sweepFrom === plan.length
     // (the common 2-leg-basket case: the ambiguous entry above was the last one, nothing left).
-    this.markRemainingNeverAttempted(basket, sweepFrom, "BASKET_CLOSED_BEFORE_RECOVERY:NEVER_ATTEMPTED");
+    await this.markRemainingNeverAttempted(basket, sweepFrom, "BASKET_CLOSED_BEFORE_RECOVERY:NEVER_ATTEMPTED");
     this.store.save();
   }
 
@@ -3823,11 +3823,42 @@ export class CrossSectionalExecutor {
    *  placeRemainingLegs interrupt paths (an ordinary leg failure calls this for everything AFTER
    *  the one it already marked FAILED itself; a kill/drain interrupt calls this starting AT the
    *  not-yet-attempted leg, since nothing failed — the loop simply stopped). */
-  private markRemainingNeverAttempted(basket: ExecutorBasket, fromIndex: number, releaseReason: string): void {
+  private async markRemainingNeverAttempted(basket: ExecutorBasket, fromIndex: number, releaseReason: string): Promise<void> {
     const plan = basket.plan ?? [];
     for (let j = fromIndex; j < plan.length; j++) {
       const entry = plan[j]!;
       if (entry.status === "FILLED") continue; // defensive — should be unreachable this far
+      // A pre-placed maker leg has a REAL order resting on the exchange. Marking it
+      // NEVER_ATTEMPTED without retracting it would leave an order that can still fill into a
+      // position no basket tracks — the invisible-naked-position class this file's reconciliation
+      // exists to prevent. Before parallel pre-placement this could not happen, because a leg that
+      // was never attempted genuinely had no order; it can now, and mid-open aborts are not rare
+      // (3 of the first 10 baskets ended KILL_OR_DRAIN_MID_OPEN).
+      if (entry.makerRestingOrderId && this.client.cancelOrder) {
+        try { await this.client.cancelOrder(entry.symbol, entry.makerRestingOrderId); } catch { /* already terminal */ }
+        // Cancel, THEN read — the order can fill in the window between the two, and only the
+        // post-cancel figure is final.
+        try {
+          const after = await this.client.queryOrder(entry.symbol, entry.makerRestingOrderId);
+          const executed = Number.isFinite(after.executedQty) && after.executedQty > 0 ? after.executedQty : 0;
+          if (executed > 0) {
+            // It DID fill. Hand it to the orphan machinery, which already flattens untracked
+            // exposure every tick — never silently drop it just because the basket is aborting.
+            this.recordOrphanedLeg(
+              basket,
+              {
+                symbol: entry.symbol, side: entry.side, qty: executed,
+                entryPrice: Number.isFinite(after.avgPrice) && after.avgPrice > 0 ? after.avgPrice : (entry.makerRestingPrice ?? 0),
+                entryOrderId: entry.makerRestingOrderId,
+                entryPriceConfirmed: Number.isFinite(after.avgPrice) && after.avgPrice > 0,
+                exitPrice: null, exitOrderId: null, exitPriceConfirmed: null, planIndex: j,
+              } as ExecutorLeg,
+              new Error(`maker leg filled ${executed} while the basket was aborting (${releaseReason})`),
+            );
+          }
+        } catch { /* unreadable — the resting order was still cancelled above */ }
+        entry.makerRestingOrderId = undefined;
+      }
       entry.status = "NEVER_ATTEMPTED";
       if (entry.reservationId) this.releaseExposureReservationFn(entry.reservationId, releaseReason);
     }
@@ -3994,7 +4025,7 @@ export class CrossSectionalExecutor {
       if (!this.isAllowed() || basket.pendingKillReason) {
         const reason = basket.pendingKillReason ?? "KILL_OR_DRAIN_MID_OPEN";
         basket.pendingKillReason = undefined;
-        this.markRemainingNeverAttempted(basket, i, `KILL_OR_DRAIN_BASKET_INTERRUPTED:${reason}`);
+        await this.markRemainingNeverAttempted(basket, i, `KILL_OR_DRAIN_BASKET_INTERRUPTED:${reason}`);
         basket.status = "ABORTED";
         basket.closedAt = this.nowIso();
         basket.closeReason = reason;
@@ -4178,7 +4209,7 @@ export class CrossSectionalExecutor {
         // Every leg planned AFTER the failed one was never even attempted (this loop is
         // sequential and stops at the first throw) — those reservations are unambiguously safe
         // to release now.
-        this.markRemainingNeverAttempted(basket, i + 1, "NEVER_ATTEMPTED_BASKET_ABORTED");
+        await this.markRemainingNeverAttempted(basket, i + 1, "NEVER_ATTEMPTED_BASKET_ABORTED");
         this.store.save();
 
         // A failed leg invalidates the selected basket even if the already-filled subset happens
