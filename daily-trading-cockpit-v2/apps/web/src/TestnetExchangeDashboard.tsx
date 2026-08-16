@@ -2059,36 +2059,39 @@ export default function TestnetExchangeDashboard() {
             // it. Operator caught it live ("kalo memang udah TP, kok all-time nya masih sama").
             // singleSymbolExecutorRealizedPnlUsd is backend-computed (routes/live.ts's /api/live/account)
             // over the live list of executors, so this never has to hardcode lane ids that drift.
+            // 2026-08-16 (operator decision, taken with the trade-off stated): the MIRROR lane is out
+            // of this card entirely. It is NOT decommissioned — newEntriesPaused is false and it can
+            // still open positions — so this card no longer reconciles with the exchange, and that is
+            // the accepted cost. Two things keep it from becoming a lie:
+            //   - the kill switch is untouched. status.totalRealizedPnlUsd still carries every mirror
+            //     close and still drives the daily-loss, consecutive-loss and drawdown trips, so what
+            //     is hidden here can never make the account less protected.
+            //   - the figure below is labelled by the lanes it COVERS, never as an account total. The
+            //     old "total" label would have been false the moment a lane left the sum.
+            // If the mirror lane is later disarmed, its history belongs in an audit section (the
+            // pattern annotateCrossSectionalAccount already uses), not silently deleted.
             const basketsAllTime = ['CROSS_SECTIONAL_MARKET_NEUTRAL', 'CROSS_SECTIONAL_TREND', 'CROSS_SECTIONAL_MIXED']
               .reduce((sum, laneId) => sum + (account?.closedLanes?.find((l) => l.laneId === laneId)?.realizedPnlUsd ?? 0), 0);
             const singleSymbolAllTime = account?.singleSymbolExecutorRealizedPnlUsd?.allTime;
-            const mirrorAllTime = status?.totalRealizedPnlUsdExcludingVoids ?? status?.totalRealizedPnlUsd;
-            const allTime = mirrorAllTime != null ? mirrorAllTime + basketsAllTime + (singleSymbolAllTime ?? 0) : undefined;
-            const rawMirrorToday = status?.closedToday?.realizedPnlUsd;
-            const voidedToday = status?.reportingExcludedToday?.realizedPnlUsd ?? 0;
-            const mirrorToday = rawMirrorToday != null ? rawMirrorToday - voidedToday : undefined;
+            const allTime = basketsAllTime + (singleSymbolAllTime ?? 0);
             // 2026-07-11: was FILTERED-only (xsecExec?.dailyRealizedUsd) — TREND/MIXED's own daily
             // realized P&L never moved this "today" figure even though basketsAllTime above already
             // correctly folds all 3 in via account.closedLanes.
             const basketsToday = [xsecExec?.dailyRealizedUsd, xsecExecTrend?.dailyRealizedUsd, xsecExecMixed?.dailyRealizedUsd]
               .reduce<number | undefined>((sum, v) => (v != null ? (sum ?? 0) + v : sum), undefined);
             const singleSymbolToday = account?.singleSymbolExecutorRealizedPnlUsd?.today;
-            const today = mirrorToday != null || basketsToday != null || singleSymbolToday != null
-              ? (mirrorToday ?? 0) + (basketsToday ?? 0) + (singleSymbolToday ?? 0)
+            const today = basketsToday != null || singleSymbolToday != null
+              ? (basketsToday ?? 0) + (singleSymbolToday ?? 0)
               : undefined;
             return (
               <>
                 <strong className={tone(today)}>{signed(today)}</strong>
                 <small>
-                  today — mirror {signed(mirrorToday)} · baskets {signed(basketsToday)} · single-symbol {signed(singleSymbolToday)}
+                  today — baskets {signed(basketsToday)} · single-symbol {signed(singleSymbolToday)}
                   <br />
-                  all-time — total {signed(allTime)} · mirror {signed(mirrorAllTime)} · baskets {signed(basketsAllTime)} · single-symbol {signed(singleSymbolAllTime)}
-                  {(status?.reportingExcluded?.count ?? 0) > 0 && (
-                    <>
-                      <br />
-                      operator void — {status?.reportingExcluded?.count} close dikecualikan dari tampilan ({signed(status?.reportingExcluded?.realizedPnlUsd)}); kill-switch tetap memakai angka penuh {signed(status?.totalRealizedPnlUsd)}
-                    </>
-                  )}
+                  all-time — baskets {signed(basketsAllTime)} · single-symbol {signed(singleSymbolAllTime)} · jumlah {signed(allTime)}
+                  <br />
+                  <span style={{ opacity: 0.7 }}>mencakup 2 lane ini saja — bukan total akun; kill-switch tetap memakai angka penuh seluruh lane</span>
                 </small>
               </>
             );
