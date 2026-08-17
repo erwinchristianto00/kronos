@@ -55,6 +55,7 @@ import {
 } from "./regime-flip-rescue.js";
 import { fetchCrowdingSnapshot, type CrowdSide, type CrowdingState } from "./derivatives-crowding.js";
 import { clusterOf, isMajorSymbol } from "./correlation-clusters.js";
+import { pendingEntryExplainsPosition } from "./live-executor-wiring.js";
 import type { CortexRealAttributionStore } from "./cortex-real-attribution.js";
 import { fillFromUserTrade, type ExecutionFill, type ExecutionFillRecorder, type ExecutionFillRole } from "./execution-fill-recorder.js";
 import type { FourBrainActualFillBindingStore } from "./four-brain-actual-fill-binding.js";
@@ -1293,6 +1294,11 @@ export interface LiveExecutionEngineOptions {
    *  disarmed, defeating auto-arm every boot). Positions fully explained by these claims are not
    *  orphans; anything beyond the claimed qty still disarms exactly as before. */
   externalManagedNetQty?: () => Map<string, number>;
+  /** Signed qty per symbol for external entry orders RESTING on the exchange but not yet filled
+   *  into a leg (post-only maker entry). Used ONLY to widen reconcile()'s orphan tolerance into a
+   *  band — never as a net claim, which would corrupt every netting consumer. See
+   *  live-executor-wiring.ts's computeExternalPendingEntryQty for why the split exists. */
+  externalPendingEntryQty?: () => Map<string, number>;
   /** Shared strategy/regime admission gate. It affects NEW exposure only; exits always continue. */
   newEntryGate?: () => LiveNewEntryGateDecision;
   /** 2026-08 manual-directional canonical-regime enforcement fix: an ADDITIONAL, independent gate
@@ -2103,6 +2109,7 @@ export class LiveExecutionEngine {
   private readonly marketDataClient?: Pick<BinanceClient, "getFuturesFlow" | "getCandles" | "getBookTicker">;
   private readonly fillConfirmRetryDelayMs: number;
   private readonly externalManagedNetQty: () => Map<string, number>;
+  private readonly externalPendingEntryQty: () => Map<string, number>;
   private readonly newEntryGate: () => LiveNewEntryGateDecision;
   private readonly regimeSafetyGate: () => LiveNewEntryGateDecision;
   private readonly getExternalRealizedPnlUsd: () => { today: number; allTime: number };
@@ -2170,6 +2177,7 @@ export class LiveExecutionEngine {
     this.marketDataClient = options.marketDataClient;
     this.fillConfirmRetryDelayMs = options.fillConfirmRetryDelayMs ?? 400;
     this.externalManagedNetQty = options.externalManagedNetQty ?? (() => new Map());
+    this.externalPendingEntryQty = options.externalPendingEntryQty ?? (() => new Map());
     this.newEntryGate = options.newEntryGate ?? (() => ({ allowed: true, reason: null }));
     this.regimeSafetyGate = options.regimeSafetyGate ?? (() => ({ allowed: true, reason: null }));
     this.getExternalRealizedPnlUsd = options.getExternalRealizedPnlUsd ?? (() => ({ today: 0, allTime: 0 }));
@@ -3768,10 +3776,18 @@ export class LiveExecutionEngine {
     // explained by an external executor's claim is NOT an orphan; a position exceeding the claim
     // still is (the unexplained remainder could be a manual/foreign position).
     const engineSymbols = new Set(st.intents.filter((i) => OPEN_INTENT_STATES.has(i.state)).map((i) => i.symbol));
+    const pendingEntry = this.externalPendingEntryQty();
     for (const pos of positions) {
       if (Math.abs(pos.positionAmt) <= 1e-12 || engineSymbols.has(pos.symbol)) continue;
       const claimed = external.get(pos.symbol) ?? 0;
       if (claimed !== 0 && Math.abs(pos.positionAmt - claimed) <= EXTERNAL_QTY_EPS) continue;
+      // 2026-08-17: an external entry order is RESTING on this symbol (post-only maker entry). Until
+      // it fills and is adopted onto a leg, the exchange can legitimately show anything from
+      // `claimed` (nothing new filled) through `claimed + pending` (filled in full) — every partial
+      // in between included. Explain the position iff it lies inside that band. Bounded by the qty
+      // WE requested and signed, so a position bigger than the plan, or on the opposite side of it,
+      // still disarms. Without this the account force-disarmed itself mid-basket and stayed down.
+      if (pendingEntryExplainsPosition(pos.positionAmt, claimed, pendingEntry.get(pos.symbol) ?? 0, EXTERNAL_QTY_EPS)) continue;
       issues.push(
         claimed !== 0
           ? `orphan exchange position ${pos.symbol} amt=${pos.positionAmt} (external executor claims only ${claimed})`

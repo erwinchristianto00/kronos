@@ -252,6 +252,73 @@ export function computeExternalManagedNetQty(
 }
 
 /**
+ * Signed qty per symbol for entry orders ALREADY RESTING on the exchange whose fill has not yet
+ * been adopted onto the basket. Post-only (maker) entry places the order on the book and waits:
+ * it can fill in one piece, in several pieces, or not at all, minutes after placement.
+ *
+ * 2026-08-17 testnet disarm. computeExternalManagedNetQty above reads `basket.legs` — the FILLED
+ * record. A basket is created with `legs: []` and its plan then goes out as resting GTX orders, so
+ * between "filled on the exchange" and "pushed to basket.legs" the position is REAL and claimed by
+ * nobody. reconcile() logged `orphan exchange position WLDUSDT amt=55 (not opened by engine)` and
+ * force-disarmed the account, which then sat disarmed for 6h24m because nothing re-arms. With taker
+ * entry that window was milliseconds; maker entry stretched it to the whole maker wait, and partial
+ * fills made it visible mid-flight — TAO was reported orphaned at 0.088 and again at 0.167 of a
+ * planned 0.167, i.e. the SAME leg caught twice while filling.
+ *
+ * Deliberately NOT folded into computeExternalManagedNetQty. A resting order is exposure the
+ * account MIGHT take, not exposure it has, and that map feeds every netting consumer (engine share
+ * = positionAmt − claim, the kill-switch's own share, the correlated-alt cap). Adding an unfilled
+ * qty there would make the engine believe it owns a NEGATIVE share of a symbol it is still trying
+ * to enter — a far worse failure than the disarm this fixes. reconcile() consumes this as a
+ * tolerance BAND instead, bounded by the qty we ourselves requested: a position larger than the
+ * plan, or on the opposite side of it, still disarms exactly as before.
+ */
+/**
+ * Is an exchange position fully explained by what an external executor has already filled
+ * (`claimed`) plus what it still has RESTING on the book (`pending`)?
+ *
+ * The band runs from `claimed` (the resting order has not filled at all) to `claimed + pending`
+ * (it filled in full), and every partial sits between the two. Both ends are inclusive within eps.
+ *
+ * What this must NOT do, and the tests pin each one: explain a position bigger than the plan,
+ * explain a position on the opposite side of the plan, or do anything at all when nothing is
+ * resting (pending === 0) — that last case is the pre-existing exact-match contract and must stay
+ * exactly as strict as it was, or the orphan check stops protecting the account.
+ */
+export function pendingEntryExplainsPosition(
+  positionAmt: number,
+  claimed: number,
+  pending: number,
+  eps: number,
+): boolean {
+  if (pending === 0) return false;
+  const lo = Math.min(claimed, claimed + pending) - eps;
+  const hi = Math.max(claimed, claimed + pending) + eps;
+  return positionAmt >= lo && positionAmt <= hi;
+}
+
+export function computeExternalPendingEntryQty(
+  crossSectionalExecutors: ReadonlyArray<CrossSectionalExecutor | null>,
+): Map<string, number> {
+  const pending = new Map<string, number>();
+  for (const exec of crossSectionalExecutors) {
+    if (!exec) continue;
+    for (const basket of exec.getStatus().openBaskets) {
+      const plan = Array.isArray(basket.plan) ? basket.plan : [];
+      for (const planned of plan) {
+        if (!planned.makerRestingOrderId) continue;
+        // Already adopted into basket.legs → it is a real filled claim and computeExternalManagedNetQty
+        // owns it. Counting it here too would double the band and start explaining foreign positions.
+        if (basket.legs.some((leg) => leg.planIndex === planned.planIndex)) continue;
+        const signed = planned.side === "LONG" ? planned.requestedQty : -planned.requestedQty;
+        pending.set(planned.symbol, (pending.get(planned.symbol) ?? 0) + signed);
+      }
+    }
+  }
+  return pending;
+}
+
+/**
  * Sums CURRENT notional (USD, qty*entryPrice, UNSIGNED — same-direction stacking is exactly what
  * this exists to catch, so long+long must ADD not cancel) per symbol across the given
  * single-symbol executors' OPEN positions (a leg with exitOrderId already set is excluded — its

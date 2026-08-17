@@ -138,7 +138,7 @@ import {
   buildCompositeEstimatorReport,
   type CEBucket,
 } from "./lib/composite-estimator-edge.js";
-import { computeExternalManagedNetQty, computeNotionalPerSymbol, maxNotionalPerSymbolAcrossLanes, computeClusterOpenSymbols, maxClusterPositionsAcrossLanes, isNewExecutorLaneAllowed, isTestnetCrossSectionalHorizonLaneAllowed, newExecutorLaneGate, rollingNetEntryHealth, sumExternalRealizedPnlUsd } from "./lib/live-executor-wiring.js";
+import { computeExternalManagedNetQty, computeExternalPendingEntryQty, computeNotionalPerSymbol, maxNotionalPerSymbolAcrossLanes, computeClusterOpenSymbols, maxClusterPositionsAcrossLanes, isNewExecutorLaneAllowed, isTestnetCrossSectionalHorizonLaneAllowed, newExecutorLaneGate, rollingNetEntryHealth, sumExternalRealizedPnlUsd } from "./lib/live-executor-wiring.js";
 import {
   CROSS_SECTIONAL_DIRECTIONAL_LONG_LANE_ID,
   CROSS_SECTIONAL_DIRECTIONAL_SHORT_LANE_ID,
@@ -1586,6 +1586,9 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
       // allSingleSymbolLaneExecutors() closures above instead of its own duplicated literal array.
       externalManagedNetQty: () =>
         computeExternalManagedNetQty(allCrossSectionalLaneExecutors(), allSingleSymbolLaneExecutors()),
+      // 2026-08-17 maker-entry disarm fix: resting post-only entry orders are not yet legs, so the
+      // net claim above cannot see them — reconcile() needs them as a separate tolerance band.
+      externalPendingEntryQty: () => computeExternalPendingEntryQty(allCrossSectionalLaneExecutors()),
       // 2026-07-11 real-money audit fix: same shared closures as externalManagedNetQty above, so the
       // account-wide kill-switch (killSwitchTrip) can finally see real losses/gains from these lanes
       // instead of only its own mirror/directional-slot ledger — see live-executor-wiring.ts's
