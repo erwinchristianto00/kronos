@@ -2127,6 +2127,9 @@ export class LiveExecutionEngine {
   private errorStreak = 0;
   private lastTickAt: string | null = null;
   private lastTickError: string | null = null;
+  /** Survives the `lastTickError` reset at the top of every tick, so the reason a latched disarm
+   *  happened is still readable from the API long after the exchange recovered. */
+  private lastDisarm: { at: string; reason: string } | null = null;
   private reconcileIssues: string[] = [];
   private timer: ReturnType<typeof setInterval> | null = null;
   private ticking = false;
@@ -2222,7 +2225,13 @@ export class LiveExecutionEngine {
 
   disarm(reason: string): void {
     this.armed = false;
+    this.lastDisarm = { at: this.nowIso(), reason };
     this.pushReconcileIssues(`disarmed: ${reason}`);
+    // 2026-08-17: a disarm is LATCHED (nothing re-arms — LIVE_AUTO_ARM=0) and every trace of it is
+    // in-memory: reconcileIssues dies on restart and `lastTickError` is cleared at the top of the
+    // NEXT tick, so one healthy tick erases the reason forever. Twice in one day the account was
+    // found disarmed with no way to tell why. pm2's log is the only record that outlives a restart.
+    console.error(`[live-engine] DISARMED at ${this.lastDisarm.at}: ${reason}`);
   }
 
   /** Appends to reconcileIssues WITHOUT letting it grow unbounded. A persistent condition (e.g.
@@ -2613,6 +2622,7 @@ export class LiveExecutionEngine {
         clockSkewMs: this.client.getClockSkewMs?.() ?? null,
         lastTickAt: this.lastTickAt,
         lastTickError: this.lastTickError,
+        lastDisarm: this.lastDisarm,
       },
       controller,
       reconcileIssues: this.reconcileIssues.slice(-10),
@@ -3317,8 +3327,14 @@ export class LiveExecutionEngine {
     } catch (error) {
       this.errorStreak += 1;
       this.lastTickError = (error as Error).message ?? "unknown";
+      // Log EVERY failure, not just the one that trips the latch. The tick runs every 25s and
+      // ERROR_STREAK_DISARM is 3, so ~75s of exchange trouble latches the account off — and until
+      // this line existed nothing anywhere recorded what the trouble was.
+      console.error(`[live-engine] tick failed (streak ${this.errorStreak}/${ERROR_STREAK_DISARM}): ${this.lastTickError}`);
       if (this.errorStreak >= ERROR_STREAK_DISARM && this.armed) {
-        this.disarm(`exchange error streak ${this.errorStreak} — trading blind is not allowed`);
+        // Carry the message INTO the reason — `lastTickError` is cleared at the top of the next
+        // tick, so a bare "streak 3" is unreadable the moment the exchange recovers.
+        this.disarm(`exchange error streak ${this.errorStreak} — trading blind is not allowed (last error: ${this.lastTickError})`);
       }
     } finally {
       this.lastTickAt = this.nowIso();
