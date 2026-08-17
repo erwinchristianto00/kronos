@@ -5,6 +5,7 @@ import {
   crossSectionalMomentumScore,
   buildCrossSectionalBasket,
   buildFilteredCrossSectionalBasket,
+  filteredWeightingModel,
   buildTrendCrossSectionalBasket,
   buildMixedCrossSectionalBasket,
   resolveCrossSectional,
@@ -69,6 +70,86 @@ describe("cross-sectional-edge — market-neutral measurement lane", () => {
     expect(b.longLeg.map((l) => l.symbol)).toEqual(["A"]); // highest score
     expect(b.shortLeg.map((l) => l.symbol)).toEqual(["D"]); // lowest score
     expect(b.status).toBe("OPEN");
+  });
+
+  describe("[SCORE-RANK] CAPPED_SCORE_RANK sizes by conviction, not by calmness", () => {
+    // 2026-08-17. The live basket xb-msw8ddsf-ltered sized WLD (+4.674% MOM36) at weight 0.132 and
+    // TAO (+0.051%) at 0.219 under CAPPED_INVERSE_VOL, because TAO was the calmest leg. These pin
+    // the reversal: the leg carrying the signal must get the most capital on BOTH sides.
+    const wlBasket = (model: "CAPPED_INVERSE_VOL" | "CAPPED_SCORE_RANK") =>
+      buildCrossSectionalBasket(
+        [
+          { symbol: "WLDUSDT", score: 0.04674, price: 0.3629, volatility: 0.009044, fastReturn: 0, extensionVol: 0 },
+          { symbol: "UNIUSDT", score: 0.02191, price: 3.306, volatility: 0.003762, fastReturn: 0, extensionVol: 0 },
+          { symbol: "TAOUSDT", score: 0.00051, price: 197.46, volatility: 0.001776, fastReturn: 0, extensionVol: 0 },
+          { symbol: "1000PEPEUSDT", score: -0.02264, price: 0.0025915, volatility: 0.004067, fastReturn: 0, extensionVol: 0 },
+          { symbol: "BNBUSDT", score: -0.00896, price: 606.36, volatility: 0.001281, fastReturn: 0, extensionVol: 0 },
+          { symbol: "SUIUSDT", score: -0.00850, price: 0.6771, volatility: 0.001896, fastReturn: 0, extensionVol: 0 },
+        ],
+        {
+          k: 3, signal: "MOM36", now: T0, openedAtMs: T0ms, horizonMs: CROSS_SECTIONAL_HORIZON_MS,
+          weightingModel: model,
+          volBySymbol: { WLDUSDT: 0.009044, UNIUSDT: 0.003762, TAOUSDT: 0.001776, "1000PEPEUSDT": 0.004067, BNBUSDT: 0.001281, SUIUSDT: 0.001896 },
+        },
+      )!;
+
+    it("reproduces the inversion under the OLD model — strongest signal, smallest weight", () => {
+      const b = wlBasket("CAPPED_INVERSE_VOL");
+      const w = Object.fromEntries(b.longLeg.map((l) => [l.symbol, l.weight!]));
+      expect(w.WLDUSDT!).toBeLessThan(w.TAOUSDT!); // the defect, pinned
+    });
+
+    it("REVERSES it: the strongest long score now carries the most capital", () => {
+      const b = wlBasket("CAPPED_SCORE_RANK");
+      const w = Object.fromEntries(b.longLeg.map((l) => [l.symbol, l.weight!]));
+      expect(w.WLDUSDT!).toBeGreaterThan(w.UNIUSDT!);
+      expect(w.UNIUSDT!).toBeGreaterThan(w.TAOUSDT!);
+    });
+
+    it("tilts the SHORT side toward the MOST NEGATIVE score, not the highest", () => {
+      const b = wlBasket("CAPPED_SCORE_RANK");
+      const w = Object.fromEntries(b.shortLeg.map((l) => [l.symbol, l.weight!]));
+      expect(w["1000PEPEUSDT"]!).toBeGreaterThan(w.BNBUSDT!); // -2.264% is the strongest short
+      expect(w["1000PEPEUSDT"]!).toBeGreaterThan(w.SUIUSDT!);
+    });
+
+    it("keeps each side's capital at 0.5 and respects the 0.75-1.25 clip (max 1.67x spread)", () => {
+      const b = wlBasket("CAPPED_SCORE_RANK");
+      for (const legs of [b.longLeg, b.shortLeg]) {
+        expect(legs.reduce((sum, l) => sum + l.weight!, 0)).toBeCloseTo(0.5, 9);
+        const ws = legs.map((l) => l.weight!);
+        expect(Math.max(...ws) / Math.min(...ws)).toBeLessThanOrEqual(1.25 / 0.75 + 1e-9);
+      }
+    });
+
+    it("equal scores on a side fall back to equal weights, never a divide-by-zero", () => {
+      const b = buildCrossSectionalBasket(
+        [
+          { symbol: "A", score: 0.05, price: 10, volatility: 0.01, fastReturn: 0, extensionVol: 0 },
+          { symbol: "B", score: 0.05, price: 10, volatility: 0.02, fastReturn: 0, extensionVol: 0 },
+          { symbol: "C", score: -0.05, price: 10, volatility: 0.01, fastReturn: 0, extensionVol: 0 },
+          { symbol: "D", score: -0.05, price: 10, volatility: 0.02, fastReturn: 0, extensionVol: 0 },
+        ],
+        { k: 2, signal: "MOM36", now: T0, openedAtMs: T0ms, horizonMs: CROSS_SECTIONAL_HORIZON_MS, weightingModel: "CAPPED_SCORE_RANK" },
+      )!;
+      for (const legs of [b.longLeg, b.shortLeg]) {
+        expect(legs[0]!.weight!).toBeCloseTo(legs[1]!.weight!, 12);
+        expect(legs.reduce((s, l) => s + l.weight!, 0)).toBeCloseTo(0.5, 12);
+      }
+    });
+  });
+
+  describe("[SCORE-RANK] filteredWeightingModel env selection", () => {
+    it("accepts the four real models, case-insensitively", () => {
+      expect(filteredWeightingModel({ CROSS_SECTIONAL_FILTERED_WEIGHTING: "CAPPED_SCORE_RANK" } as NodeJS.ProcessEnv)).toBe("CAPPED_SCORE_RANK");
+      expect(filteredWeightingModel({ CROSS_SECTIONAL_FILTERED_WEIGHTING: " equal_notional " } as NodeJS.ProcessEnv)).toBe("EQUAL_NOTIONAL");
+    });
+
+    it("falls back to the PREVIOUS production model on anything unrecognised — never equal-weight by accident", () => {
+      expect(filteredWeightingModel({} as NodeJS.ProcessEnv)).toBe("CAPPED_INVERSE_VOL");
+      expect(filteredWeightingModel({ CROSS_SECTIONAL_FILTERED_WEIGHTING: "typo" } as NodeJS.ProcessEnv)).toBe("CAPPED_INVERSE_VOL");
+      expect(filteredWeightingModel({ CROSS_SECTIONAL_FILTERED_WEIGHTING: "" } as NodeJS.ProcessEnv)).toBe("CAPPED_INVERSE_VOL");
+    });
   });
 
   it("[OPERATOR-VOID] retains a raw source observation but removes it from the report and future edge cohort", () => {

@@ -41,6 +41,12 @@ const INTERVAL_MS: Record<string, number> = {
 
 export const CROSS_SECTIONAL_INTERVAL = process.env.CROSS_SECTIONAL_INTERVAL || "1h";
 export const CROSS_SECTIONAL_MOMENTUM_BARS = envNumPos("CROSS_SECTIONAL_MOMENTUM_BARS", 24); // ROC lookback
+/** 2026-08-17: CAPPED_SCORE_RANK added. The three original models all size by volatility or not
+ *  at all, so the leg carrying the most signal can end up with the LEAST capital — measured on the
+ *  live 2026-08-16 basket, WLD (+4.674% MOM36) got weight 0.132 while TAO (+0.051%) got 0.219,
+ *  because TAO was the calmest. CAPPED_SCORE_RANK sizes by score RANK within the side instead. */
+export type CrossSectionalWeightingModel = "EQUAL_NOTIONAL" | "BETA_VOL_PROXY" | "CAPPED_INVERSE_VOL" | "CAPPED_SCORE_RANK";
+
 export const CROSS_SECTIONAL_K = envNumPos("CROSS_SECTIONAL_K", 3); // legs per side (long-k / short-k)
 
 // --- Regime-skewed composition (2026-07-08, operator-requested) ---
@@ -531,7 +537,7 @@ export interface CrossSectionalObservation {
   regimeClassAtOpen?: CrossSectionalRegimeClass | null;
   longCapitalWeight?: number | null;
   shortCapitalWeight?: number | null;
-  weightingModel?: "EQUAL_NOTIONAL" | "BETA_VOL_PROXY" | "CAPPED_INVERSE_VOL" | null;
+  weightingModel?: CrossSectionalWeightingModel | null;
   takeProfitReturn?: number | null;
   stopLossReturn?: number | null;
   /** The R-denominator FROZEN at open (fraction). CORTEX #218 divides realized netReturn by THIS to get
@@ -604,7 +610,7 @@ interface CrossSectionalBasketOpts {
   maxPerCluster?: number;
   longCapitalWeight?: number;
   shortCapitalWeight?: number;
-  weightingModel?: "EQUAL_NOTIONAL" | "BETA_VOL_PROXY" | "CAPPED_INVERSE_VOL";
+  weightingModel?: CrossSectionalWeightingModel;
   volBySymbol?: Record<string, number>;
   takeProfitReturn?: number | null;
   stopLossReturn?: number | null;
@@ -806,10 +812,40 @@ function scoreGapFor(longLeg: ScoredSymbol[], shortLeg: ScoredSymbol[]): number 
 function weightedLegs(
   legs: ScoredSymbol[],
   sideCapital: number,
-  opts: { weightingModel?: "EQUAL_NOTIONAL" | "BETA_VOL_PROXY" | "CAPPED_INVERSE_VOL"; volBySymbol?: Record<string, number> },
+  opts: { weightingModel?: CrossSectionalWeightingModel; volBySymbol?: Record<string, number>; side?: "LONG" | "SHORT" },
 ): CrossSectionalLeg[] {
   if (legs.length === 0) return [];
   const equalWeight = sideCapital / legs.length;
+  if (opts.weightingModel === "CAPPED_SCORE_RANK") {
+    // Size by score RANK within this side, not by volatility. `sign` makes "strongest" mean the
+    // HIGHEST score on the long side and the MOST NEGATIVE on the short side, so both sides tilt
+    // toward conviction rather than toward whichever name happens to be calm.
+    //
+    // Raw runs 0.5 (weakest leg) to 1.5 (strongest), then the SAME 0.75–1.25 clip as
+    // CAPPED_INVERSE_VOL. The clip is what keeps this from becoming a single-name bet: at k=3 the
+    // extremes always land on the clip, so the strongest leg gets 1.25/0.75 = 1.67x the weakest and
+    // never more. Measured over 2 years / 372 independent 48h blocks this beat CAPPED_INVERSE_VOL
+    // (+0.2126% vs +0.1602% per basket, blocked t 2.00 vs 1.75) and beat running a second k=2
+    // basket alongside (+0.1892%) at half the capital and half the fees.
+    const sign = opts.side === "SHORT" ? -1 : 1;
+    const directional = legs.map((s) => sign * s.score);
+    const lo = Math.min(...directional);
+    const hi = Math.max(...directional);
+    const raw = directional.map((value) => (hi <= lo ? 1 : (value - lo) / (hi - lo) + 0.5));
+    const rawMean = raw.reduce((a, b) => a + b, 0) / raw.length || 1;
+    const clipped = raw.map((value) => Math.max(0.75, Math.min(1.25, value / rawMean)));
+    const denom = clipped.reduce((a, b) => a + b, 0) || legs.length;
+    return legs.map((s, i) => ({
+      symbol: s.symbol,
+      entryPrice: s.price,
+      exitPrice: null,
+      weight: sideCapital * clipped[i]! / denom,
+      scoreAtOpen: s.score,
+      volatilityAtOpen: opts.volBySymbol?.[s.symbol] ?? s.volatility ?? null,
+      fastReturnAtOpen: finiteOrNull(s.fastReturn),
+      extensionVolAtOpen: finiteOrNull(s.extensionVol),
+    }));
+  }
   if (opts.weightingModel !== "BETA_VOL_PROXY") {
     if (opts.weightingModel !== "CAPPED_INVERSE_VOL") {
       return legs.map((s) => ({
@@ -977,8 +1013,8 @@ export function buildCrossSectionalBasket(
     k: opts.k,
     longK: selectedLongs.length,
     shortK: selectedShorts.length,
-    longLeg: weightedLegs(selectedLongs, normalizedLongCapital, { weightingModel, volBySymbol: opts.volBySymbol }),
-    shortLeg: weightedLegs(selectedShorts, normalizedShortCapital, { weightingModel, volBySymbol: opts.volBySymbol }),
+    longLeg: weightedLegs(selectedLongs, normalizedLongCapital, { weightingModel, volBySymbol: opts.volBySymbol, side: "LONG" }),
+    shortLeg: weightedLegs(selectedShorts, normalizedShortCapital, { weightingModel, volBySymbol: opts.volBySymbol, side: "SHORT" }),
     status: "OPEN",
     scoreGap,
     regimeContext: opts.regimeContext ?? null,
@@ -1414,6 +1450,17 @@ export function applyCrossSectionalAdaptiveRanking(
   });
 }
 
+/**
+ * Which weighting the FILTERED lane sizes with. Env-selectable so the 2026-08-17 switch to
+ * CAPPED_SCORE_RANK is reversible without a code deploy, and so an unrecognised value falls back to
+ * the previous production model rather than silently equal-weighting.
+ */
+export function filteredWeightingModel(env: NodeJS.ProcessEnv = process.env): CrossSectionalWeightingModel {
+  const raw = (env.CROSS_SECTIONAL_FILTERED_WEIGHTING ?? "").trim().toUpperCase();
+  const allowed: CrossSectionalWeightingModel[] = ["EQUAL_NOTIONAL", "BETA_VOL_PROXY", "CAPPED_INVERSE_VOL", "CAPPED_SCORE_RANK"];
+  return (allowed as string[]).includes(raw) ? (raw as CrossSectionalWeightingModel) : "CAPPED_INVERSE_VOL";
+}
+
 export function buildFilteredCrossSectionalBasket(
   scored: ScoredSymbol[],
   opts: Omit<CrossSectionalBasketOpts, "variant" | "signal" | "longAllowlist" | "longBlocklist" | "shortAllowlist" | "shortBlocklist" | "minScoreGap"> &
@@ -1429,7 +1476,7 @@ export function buildFilteredCrossSectionalBasket(
     shortBlocklist: opts.shortBlocklist ?? CROSS_SECTIONAL_FILTERED_SHORT_BLOCKLIST,
     minScoreGap: opts.minScoreGap ?? CROSS_SECTIONAL_FILTERED_MIN_SCORE_GAP,
     maxPerCluster: opts.maxPerCluster ?? CROSS_SECTIONAL_FILTERED_MAX_PER_CLUSTER,
-    weightingModel: opts.weightingModel ?? "CAPPED_INVERSE_VOL",
+    weightingModel: opts.weightingModel ?? filteredWeightingModel(),
     smartFormation: opts.smartFormation ?? (isCrossSectionalSmartBasketV1Enabled() ? { enabled: true } : undefined),
   });
 }
