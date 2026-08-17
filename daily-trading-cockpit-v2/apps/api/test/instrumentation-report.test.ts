@@ -37,7 +37,8 @@ describe("buildInstrumentationReport — rejected baskets", () => {
   });
 
   it("counts only near-misses (<=0.5pp) — those are the ones the exact level decided", () => {
-    const text = [rejection(NOW - H, 0.0195), rejection(NOW - H, 0.018), rejection(NOW - H, 0.005)].join("\n");
+    // Bucket jam harus berbeda: dedupe sengaja meruntuhkan penolakan dalam satu jam yang sama.
+    const text = [rejection(NOW - H, 0.0195), rejection(NOW - H - 3_600_000, 0.018), rejection(NOW - H - 7_200_000, 0.005)].join("\n");
     const r = buildInstrumentationReport(text, "", { nowMs: NOW, horizonMs: H });
     expect(r.rejected.count).toBe(3);
     expect(r.rejected.nearMisses).toBe(2);
@@ -49,6 +50,22 @@ describe("buildInstrumentationReport — rejected baskets", () => {
     const sorted = r.rejected.rows.slice().sort((a, b) => a.openedAtMs - b.openedAtMs);
     expect(sorted[0]!.horizonElapsed).toBe(true);
     expect(sorted[1]!.horizonElapsed).toBe(false);
+  });
+
+  it("collapses repeats inside ONE hourly bucket — the scanner cycles several times an hour", () => {
+    // The very first live rejection was logged TWICE with identical composition, because the
+    // `alreadyThisBucket` guard only covers the success path. Counting both would weight one
+    // refusal like two independent observations.
+    const base = Date.UTC(2026, 7, 17, 14, 32, 45);
+    const text = [rejection(base, 0.0195), rejection(base + 5 * 60_000, 0.0195), rejection(base + 20 * 60_000, 0.0195)].join("\n");
+    const r = buildInstrumentationReport(text, "", { nowMs: NOW, horizonMs: H });
+    expect(r.rejected.count).toBe(1);
+  });
+
+  it("keeps refusals in DIFFERENT buckets as separate rows", () => {
+    const base = Date.UTC(2026, 7, 17, 14, 32, 45);
+    const text = [rejection(base, 0.0195), rejection(base + 2 * 3_600_000, 0.019)].join("\n");
+    expect(buildInstrumentationReport(text, "", { nowMs: NOW, horizonMs: H }).rejected.count).toBe(2);
   });
 
   it("newest first, and tolerates a totally empty log", () => {

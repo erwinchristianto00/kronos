@@ -83,8 +83,15 @@ export function buildInstrumentationReport(
   const rejected = parseJsonl<RejectedBasketRow>(rejectedText).filter(
     (r) => Number.isFinite(r.openedAtMs) && Number.isFinite(r.scoreGap),
   );
-  const rows = rejected
-    .slice()
+  // Collapse repeats within one hourly bucket. The recorder now guards this in-memory, but a
+  // restart can still re-log a bucket, and the rows written before that guard existed are already
+  // on disk — without this, one refusal would be counted several times and weighted like several
+  // independent observations.
+  const byBucket = new Map<string, RejectedBasketRow>();
+  for (const r of rejected.slice().sort((a, b) => a.openedAtMs - b.openedAtMs)) {
+    byBucket.set(`${r.signal}:${Math.floor(r.openedAtMs / 3_600_000)}`, r);
+  }
+  const rows = Array.from(byBucket.values())
     .sort((a, b) => b.openedAtMs - a.openedAtMs)
     .map((r) => ({
       ...r,

@@ -27,6 +27,25 @@ import type { CrossSectionalGapRejection } from "./cross-sectional-edge.js";
 
 /** Rotates at this size so an append-only file cannot fill the disk (it is already at 94%). */
 const MAX_BYTES = 8 * 1024 * 1024;
+const BUCKET_MS = 60 * 60_000;
+
+/**
+ * One row per hourly bucket per signal.
+ *
+ * Found on the report page the moment it went live: the FIRST rejection was already logged TWICE
+ * with identical composition. The success path is guarded by `alreadyThisBucket`, but a rejected
+ * basket adds nothing to the store, so that guard stays false and the scanner — which cycles several
+ * times an hour — re-records the same refusal on every pass. Left alone the log would inflate the
+ * count several-fold and weight one bucket like several independent ones.
+ *
+ * In-memory on purpose: a restart may re-log one bucket, which the report's own dedupe absorbs.
+ */
+const seenBuckets = new Set<string>();
+
+/** Exported for the test: an hourly key, so repeats inside one bucket collapse. */
+export function rejectionBucketKey(info: Pick<CrossSectionalGapRejection, "openedAtMs" | "signal">): string {
+  return `${info.signal}:${Math.floor(info.openedAtMs / BUCKET_MS)}`;
+}
 
 export function rejectedBasketLogPath(): string {
   return process.env.CROSS_SECTIONAL_REJECTED_LOG ?? resolve(process.cwd(), "data", "cross-sectional-rejected.jsonl");
@@ -35,6 +54,13 @@ export function rejectedBasketLogPath(): string {
 /** One JSON line per rejection. Never throws — instrumentation must not break basket formation. */
 export function recordRejectedBasket(info: CrossSectionalGapRejection, path = rejectedBasketLogPath()): void {
   try {
+    const key = rejectionBucketKey(info);
+    if (seenBuckets.has(key)) return;
+    seenBuckets.add(key);
+    // Bound the set: 24*90 buckets is a season of history, far more than the dedupe needs.
+    if (seenBuckets.size > 2_160) {
+      for (const old of Array.from(seenBuckets).slice(0, 1_080)) seenBuckets.delete(old);
+    }
     mkdirSync(dirname(path), { recursive: true });
     if (existsSync(path) && statSync(path).size > MAX_BYTES) {
       renameSync(path, `${path}.1`);
