@@ -139,6 +139,48 @@ describe("cross-sectional-edge — market-neutral measurement lane", () => {
     });
   });
 
+  describe("[GAP-REJECT] the gate now records what it refused", () => {
+    // Before this hook a rejected basket was written nowhere, so the live store held ZERO
+    // observations below the 0.02 floor and the gate could never be evaluated from real data.
+    const scoredPair = (longScore: number, shortScore: number) => [
+      { symbol: "A", score: longScore, price: 10, volatility: 0.01, fastReturn: 0, extensionVol: 0 },
+      { symbol: "B", score: shortScore, price: 20, volatility: 0.02, fastReturn: 0, extensionVol: 0 },
+    ];
+    const opts = (extra: Record<string, unknown>) => ({
+      k: 1, signal: "MOM36_FILTERED", now: T0, openedAtMs: T0ms,
+      horizonMs: CROSS_SECTIONAL_HORIZON_MS, minScoreGap: 0.02, ...extra,
+    });
+
+    it("fires with the composition it WOULD have opened when the gap is too small", () => {
+      const seen: unknown[] = [];
+      const b = buildCrossSectionalBasket(scoredPair(0.005, -0.004), opts({ onGapReject: (i: unknown) => seen.push(i) }));
+      expect(b).toBeNull(); // still refused — the gate itself is unchanged
+      expect(seen).toHaveLength(1);
+      const info = seen[0] as { scoreGap: number; minScoreGap: number; longs: Array<{ symbol: string }>; shorts: Array<{ symbol: string }> };
+      expect(info.scoreGap).toBeCloseTo(0.009, 9);
+      expect(info.minScoreGap).toBe(0.02);
+      expect(info.longs.map((l) => l.symbol)).toEqual(["A"]);
+      expect(info.shorts.map((l) => l.symbol)).toEqual(["B"]);
+    });
+
+    it("does NOT fire when the gap passes — only refusals are recorded", () => {
+      const seen: unknown[] = [];
+      const b = buildCrossSectionalBasket(scoredPair(0.05, -0.05), opts({ onGapReject: (i: unknown) => seen.push(i) }));
+      expect(b).not.toBeNull();
+      expect(seen).toHaveLength(0);
+    });
+
+    it("behaves exactly as before when no hook is supplied", () => {
+      expect(buildCrossSectionalBasket(scoredPair(0.005, -0.004), opts({}))).toBeNull();
+    });
+
+    it("a THROWING hook never breaks basket formation", () => {
+      expect(() =>
+        buildCrossSectionalBasket(scoredPair(0.005, -0.004), opts({ onGapReject: () => { throw new Error("sink down"); } })),
+      ).not.toThrow();
+    });
+  });
+
   describe("[SCORE-RANK] filteredWeightingModel env selection", () => {
     it("accepts the four real models, case-insensitively", () => {
       expect(filteredWeightingModel({ CROSS_SECTIONAL_FILTERED_WEIGHTING: "CAPPED_SCORE_RANK" } as NodeJS.ProcessEnv)).toBe("CAPPED_SCORE_RANK");

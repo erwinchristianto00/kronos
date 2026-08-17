@@ -14,6 +14,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, copyFil
 import { dirname, resolve } from "node:path";
 
 import { clusterOf, isMajorCluster } from "./correlation-clusters.js";
+import { recordRejectedBasket } from "./rejected-basket-recorder.js";
 
 function envNumPos(key: string, fallback: number): number {
   const v = Number(process.env[key]);
@@ -458,6 +459,16 @@ const EXPIRY_MS = CROSS_SECTIONAL_HORIZON_MS * 3; // give up on a basket missing
 
 export type CrossSectionalStatus = "OPEN" | "CLOSED" | "EXPIRED";
 export type CrossSectionalVariant = "RAW" | "FILTERED" | "TREND_BETA_VOL" | "MIXED_MEAN_REVERSION";
+
+/** A basket the minScoreGap gate refused, captured for later evaluation of the gate itself. */
+export interface CrossSectionalGapRejection {
+  openedAtMs: number;
+  signal: string;
+  scoreGap: number;
+  minScoreGap: number;
+  longs: Array<{ symbol: string; score: number; price: number; volatility: number | null }>;
+  shorts: Array<{ symbol: string; score: number; price: number; volatility: number | null }>;
+}
 export type CrossSectionalStrategyFamily = "MOMENTUM_DISPERSION" | "MEAN_REVERSION";
 export type CrossSectionalRegimeClass = "TREND_LONG" | "TREND_SHORT" | "MIXED_CHOP" | "UNKNOWN";
 export type CrossSectionalExitReason = "HORIZON" | "TAKE_PROFIT" | "STOP_LOSS" | "REGIME_FLIP" | "EXPIRED";
@@ -605,6 +616,10 @@ interface CrossSectionalBasketOpts {
   shortAllowlist?: ReadonlySet<string> | null;
   shortBlocklist?: ReadonlySet<string> | null;
   minScoreGap?: number;
+  /** Fires INSTEAD of a silent `return null` when minScoreGap rejects the basket. Optional: when
+   *  absent, behaviour is byte-identical to before. See the call site for why this is a callback and
+   *  not a stored observation. */
+  onGapReject?: (info: CrossSectionalGapRejection) => void;
   /** Max legs per side allowed to share a correlation cluster (BTC/ETH majors exempt). Undefined/0
    *  disables — every existing caller (that never sets it) keeps today's pure top-k/bottom-k sort. */
   maxPerCluster?: number;
@@ -995,7 +1010,33 @@ export function buildCrossSectionalBasket(
   }
   if (selectedLongs.length < longK || selectedShorts.length < shortK) return null;
   const scoreGap = scoreGapFor(selectedLongs, selectedShorts);
-  if (opts.minScoreGap !== undefined && scoreGap < opts.minScoreGap) return null;
+  if (opts.minScoreGap !== undefined && scoreGap < opts.minScoreGap) {
+    // 2026-08-17: a rejected basket is never written anywhere, so "is this gate set correctly?" is
+    // unfalsifiable from the store no matter how long the lane runs — the data is not thin, it is
+    // never created. This hook records the composition it WOULD have opened. Deliberately a callback
+    // to a separate sink rather than an observation: adding one to the store would let
+    // `alreadyThisBucket` block a real basket later in the same hour (a behaviour change, not
+    // instrumentation), and `observationVariant` derives variant from the signal NAME, so any new
+    // variant silently reclassifies as RAW and contaminates the RAW report.
+    //
+    // Only the composition and timestamp are captured — the forward return is recomputed from
+    // klines at analysis time, so no resolution machinery is needed and nothing can go stale.
+    if (opts.onGapReject) {
+      try {
+        opts.onGapReject({
+          openedAtMs: opts.openedAtMs,
+          signal: opts.signal,
+          scoreGap,
+          minScoreGap: opts.minScoreGap,
+          longs: selectedLongs.map((s) => ({ symbol: s.symbol, score: s.score, price: s.price, volatility: finiteOrNull(s.volatility) })),
+          shorts: selectedShorts.map((s) => ({ symbol: s.symbol, score: s.score, price: s.price, volatility: finiteOrNull(s.volatility) })),
+        });
+      } catch {
+        // Instrumentation must never break basket formation.
+      }
+    }
+    return null;
+  }
   const longCapitalWeight = clampWeight(opts.longCapitalWeight ?? 0.5, 0.5);
   const shortCapitalWeight = clampWeight(opts.shortCapitalWeight ?? (1 - longCapitalWeight), 1 - longCapitalWeight);
   const totalCapital = longCapitalWeight + shortCapitalWeight;
@@ -1951,6 +1992,7 @@ export async function runCrossSectionalCycle(opts: {
       smartFormation: isCrossSectionalSmartBasketV1Enabled()
         ? { enabled: true, axisScore: opts.axisScore ?? null }
         : undefined,
+      onGapReject: recordRejectedBasket,
     });
     if (basket) {
       opts.store.add(basket);
