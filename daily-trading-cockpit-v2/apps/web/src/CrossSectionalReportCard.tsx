@@ -493,6 +493,15 @@ function PoolPanel({ apiPrefix, executionLong, executionShort, executionShortBlo
       jadi ketiganya tidak ikut menentukan status di atas — dinyatakan, bukan disembunyikan. Pada universe {pool.counts.universe} simbol saat ini hanya C1 dan C2 yang menyaring.
       {' '}<a href={`${apiPrefix}/live/cross-sectional-pool/view`} target="_blank" rel="noreferrer" style={{ color: C.measure }}>Rincian per simbol →</a>
     </div>}
+    {/* 2026-08-17: both recorders installed today answer questions that were previously
+        unanswerable because the data was never created — the basket the gate refuses was written
+        nowhere, and OI/depth have no usable history. Linked, not inlined: both are still
+        ACCUMULATING and putting them in a results panel would invite reading them as findings. */}
+    <div style={{ marginTop: 10, paddingTop: 9, borderTop: `1px solid ${C.border}`, fontSize: 11.5, color: C.dim }}>
+      Pencatatan baru (masih mengumpul, belum bisa disimpulkan): basket yang <b style={{ color: C.text }}>ditolak gerbang</b> dan
+      {' '}<b style={{ color: C.text }}>open interest + kedalaman orderbook</b>.
+      {' '}<a href={`${apiPrefix}/live/instrumentation/view`} target="_blank" rel="noreferrer" style={{ color: C.measure }}>Lihat pencatatan →</a>
+    </div>
   </div>;
 }
 

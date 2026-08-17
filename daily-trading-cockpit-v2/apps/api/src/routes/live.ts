@@ -5,12 +5,15 @@
  * these routes report { enabled:false } without touching anything. Keys are never
  * echoed by any endpoint.
  */
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import {
   isOverlayClose, realisedNetR, replayOwnExit, positionCostR, summariseCounterfactual,
   ownExitParamsFromEnv, type DirectionalClosedPosition, type Bar, type CounterfactualRow,
 } from "../lib/directional-overlay-counterfactual.js";
 import { dirname, resolve } from "node:path";
+
+import { buildInstrumentationReport } from "../lib/instrumentation-report.js";
+import { rejectedBasketLogPath } from "../lib/rejected-basket-recorder.js";
 import type { FastifyInstance } from "fastify";
 
 import type { LiveExecutionEngine } from "../lib/live-execution-engine.js";
@@ -52,7 +55,7 @@ import { buildLiveWalletReconciliationReport, resolveDayUtc } from "../lib/walle
 import { getCortexRealAttributionStore } from "../lib/cortex-real-attribution.js";
 import { getFundingFeeRecorder, withFundingFeeRecording } from "../lib/funding-fee-recorder.js";
 import { sumExternalClosedFeesUsd, sumExternalRealizedPnlUsd } from "../lib/live-executor-wiring.js";
-import { getCrossSectionalReportSinceMs } from "../lib/cross-sectional-edge.js";
+import { getCrossSectionalReportSinceMs, CROSS_SECTIONAL_HORIZON_MS } from "../lib/cross-sectional-edge.js";
 import type { UnifiedTestnetOrchestrator } from "../lib/unified-testnet-orchestrator.js";
 import type { UnifiedTestnetProposalStore } from "../lib/unified-testnet-proposal-source.js";
 import {
@@ -1922,6 +1925,105 @@ export async function registerLiveRoutes(
   /** Same report as the page below, as JSON, so the dashboard panel renders MEASURED numbers rather
    *  than prose someone typed once and nobody re-checked. One cache, one source of truth. */
   app.get("/api/live/cross-sectional-pool", async () => buildPoolReport());
+
+  // 2026-08-17: the two recorders installed today. Kept on their own page because both are
+  // ACCUMULATING — nothing here is conclusive yet, and mixing them into an existing panel would
+  // invite reading them as results.
+  const readInstrumentation = () => {
+    const readIf = (path: string): string => {
+      try { return existsSync(path) ? readFileSync(path, "utf8") : ""; } catch { return ""; }
+    };
+    const microDir = process.env.MICROSTRUCTURE_DIR ?? "/root/kronos-microstructure";
+    let microText = "";
+    try {
+      // The recorder rotates monthly; read every month present so the page keeps full coverage.
+      const files = existsSync(microDir)
+        ? readdirSync(microDir).filter((f) => f.startsWith("micro-") && f.endsWith(".jsonl")).sort()
+        : [];
+      microText = files.map((f) => readIf(resolve(microDir, f))).join("\n");
+    } catch { microText = ""; }
+    return buildInstrumentationReport(readIf(rejectedBasketLogPath()), microText, {
+      nowMs: Date.now(),
+      horizonMs: CROSS_SECTIONAL_HORIZON_MS,
+    });
+  };
+
+  app.get("/api/live/instrumentation", async () => ({ ok: true, report: readInstrumentation() }));
+
+  app.get("/api/live/instrumentation/view", async (_request, reply) => {
+    const r = readInstrumentation();
+    const esc = (v: unknown): string => String(v).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c] ?? c));
+    const pct = (v: number) => `${(v * 100).toFixed(3)}%`;
+    const legs = (xs: Array<{ symbol: string; score: number }>) =>
+      xs.map((x) => `<span class="sym">${esc(x.symbol.replace("USDT", ""))}</span> ${(x.score * 100 >= 0 ? "+" : "")}${(x.score * 100).toFixed(2)}%`).join(" &middot; ");
+    const short = (iso: string | null) => (iso ? esc(iso.slice(0, 16).replace("T", " ")) : "&mdash;");
+
+    const rejectedRows = r.rejected.rows.length === 0
+      ? `<tr><td colspan="5" class="muted">Belum ada basket yang ditolak sejak pencatatan dipasang. Gerbang 2% menolak sekitar 0,2% basket, jadi ini bisa butuh berhari-hari.</td></tr>`
+      : r.rejected.rows.map((x) => `<tr>
+<td>${short(new Date(x.openedAtMs).toISOString())}</td>
+<td class="num">${pct(x.scoreGap)}</td>
+<td class="num ${x.shortfallPp <= 0.5 ? "bad" : "muted"}">&minus;${x.shortfallPp.toFixed(3)}pp</td>
+<td>${legs(x.longs)}</td>
+<td>${legs(x.shorts)}</td>
+</tr>`).join("");
+
+    const microRows = r.micro.latest.length === 0
+      ? `<tr><td colspan="6" class="muted">Belum ada snapshot. Perekam jalan tiap jam di menit :47.</td></tr>`
+      : r.micro.latest.map((m) => `<tr>
+<td class="sym">${esc(m.sym.replace("USDT", ""))}</td>
+<td class="num">${m.oi === null || m.oi === undefined ? "&mdash;" : m.oi.toLocaleString("en-US", { maximumFractionDigits: 0 })}</td>
+<td class="num">${m.spreadBps === null || m.spreadBps === undefined ? "&mdash;" : m.spreadBps.toFixed(2)}</td>
+<td class="num">${m.bidUsd20 === undefined ? "&mdash;" : "$" + Math.round(m.bidUsd20).toLocaleString("en-US")}</td>
+<td class="num">${m.askUsd20 === undefined ? "&mdash;" : "$" + Math.round(m.askUsd20).toLocaleString("en-US")}</td>
+<td class="num ${(m.imb20 ?? 0) >= 0 ? "ok" : "bad"}">${m.imb20 === undefined ? "&mdash;" : (m.imb20 >= 0 ? "+" : "") + m.imb20.toFixed(3)}</td>
+</tr>`).join("");
+
+    const html = `<!doctype html><html lang="id"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Pencatatan Baru</title><style>
+:root{--bg:#fff;--fg:#1a1a1a;--mut:#6b7280;--line:#e5e7eb;--card:#f9fafb;--ok:#047857;--bad:#b91c1c;--warnbg:#fef3c7;--warnfg:#92400e}
+@media(prefers-color-scheme:dark){:root{--bg:#0f1115;--fg:#e5e7eb;--mut:#9ca3af;--line:#272b33;--card:#161a20;--ok:#34d399;--bad:#f87171;--warnbg:#3b2f0b;--warnfg:#fcd34d}}
+*{box-sizing:border-box}body{margin:0;padding:24px;background:var(--bg);color:var(--fg);font:14px/1.55 ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+.wrap{max-width:1040px;margin:0 auto}h1{font-size:19px;margin:0 0 4px}h2{font-size:15px;margin:26px 0 8px}
+.muted{color:var(--mut)}.ok{color:var(--ok)}.bad{color:var(--bad)}
+.note{background:var(--warnbg);color:var(--warnfg);padding:10px 13px;border-radius:8px;font-size:13px;margin:10px 0}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:9px;margin:12px 0}
+.grid div{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:9px 11px}
+.grid span{display:block;color:var(--mut);font-size:11.5px;margin-bottom:3px}.grid b{font-size:16px;font-variant-numeric:tabular-nums}
+table{width:100%;border-collapse:collapse;font-size:13px}th,td{text-align:left;padding:7px 9px;border-bottom:1px solid var(--line)}
+th{color:var(--mut);font-weight:600;font-size:11.5px;text-transform:uppercase;letter-spacing:.04em}
+.num{text-align:right;font-variant-numeric:tabular-nums}.sym{font-weight:600}
+.wrapx{overflow-x:auto}code{background:var(--card);padding:1px 5px;border-radius:4px}
+</style></head><body><div class="wrap">
+<h1>Pencatatan baru &mdash; dua pertanyaan yang tadinya tidak bisa dijawab</h1>
+<p class="muted">Dipasang 17 Agu 2026. Keduanya masih <b>mengumpul</b> &mdash; tidak ada kesimpulan di halaman ini, dan angkanya belum boleh dipakai untuk mengubah aturan.</p>
+
+<h2>1. Basket yang ditolak gerbang <code>minScoreGap</code></h2>
+<p class="muted">Sebelum ini, basket yang ditolak <b>tidak ditulis ke mana pun</b>. Store hidup memuat <b>nol</b> observasi di bawah ambang 0,02 (minimum tercatat: 0,0202 FILTERED / 0,0315 RAW), jadi pertanyaan &ldquo;apakah ambang 2% ini benar?&rdquo; tidak akan pernah terjawab dari data hidup, berapa lama pun lane berjalan. Datanya bukan langka &mdash; datanya tidak pernah dibuat.</p>
+<div class="grid">
+<div><span>Tercatat</span><b>${r.rejected.count}</b></div>
+<div><span>Selisih &le; 0,5pp</span><b>${r.rejected.nearMisses}</b></div>
+<div><span>Horizon evaluasi</span><b>${Math.round(r.rejected.horizonMs / 3_600_000)} jam</b></div>
+</div>
+<p class="muted">Kolom <b>selisih</b> menunjukkan seberapa jauh di bawah ambang. Ditolak 0,05pp itu fakta yang sangat berbeda dari ditolak 1,5pp &mdash; log mentah tidak membedakannya.</p>
+<div class="wrapx"><table><thead><tr><th>Waktu (UTC)</th><th class="num">Gap</th><th class="num">Selisih</th><th>Long yang batal</th><th>Short yang batal</th></tr></thead><tbody>${rejectedRows}</tbody></table></div>
+
+<h2>2. Open interest + kedalaman orderbook</h2>
+<p class="muted"><code>futures/data/*</code> hanya menyimpan ~30 hari (= 15 blok 48 jam) dan kedalaman orderbook tidak punya riwayat sama sekali, jadi keduanya <b>tidak bisa diuji retrospektif</b>. Satu-satunya jalan adalah mulai mencatat. Perekam berdiri di luar API trading, jadi nol risiko terhadap eksekusi.</p>
+<div class="grid">
+<div><span>Simbol</span><b>${r.micro.symbols}</b></div>
+<div><span>Snapshot</span><b>${r.micro.snapshots.toLocaleString("en-US")}</b></div>
+<div><span>Jam tercakup</span><b>${r.micro.hoursCovered.toFixed(1)}</b></div>
+<div><span>Blok 48j terkumpul</span><b>${r.micro.blocks} / ${r.micro.blocksNeeded}</b></div>
+</div>
+<div class="note">Butuh sekitar <b>${r.micro.blocksNeeded} blok</b> (&asymp;90 hari) sebelum sinyal dari data ini bisa dinilai. Sekarang <b>${r.micro.blocks}</b>. Sampai itu tercapai, tabel di bawah cuma snapshot terakhir &mdash; bukan bukti apa pun.</div>
+<p class="muted">Pertama: ${short(r.micro.firstAt)} &middot; terakhir: ${short(r.micro.lastAt)}. <code>imb20</code> positif = sisi beli lebih tebal pada 20 level teratas.</p>
+<div class="wrapx"><table><thead><tr><th>Simbol</th><th class="num">Open interest</th><th class="num">Spread (bps)</th><th class="num">Bid 20 lvl</th><th class="num">Ask 20 lvl</th><th class="num">imb20</th></tr></thead><tbody>${microRows}</tbody></table></div>
+
+<p class="muted" style="margin-top:22px">Dibuat ${esc(r.generatedAt)}. JSON: <code>/api/live/instrumentation</code></p>
+</div></body></html>`;
+    reply.type("text/html; charset=utf-8").send(html);
+  });
 
   app.get("/api/live/cross-sectional-pool/view", async (_request, reply) => {
     const report = await buildPoolReport();
