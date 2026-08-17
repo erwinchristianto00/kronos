@@ -1693,6 +1693,72 @@ describe("cross-sectional executor (basket execution, testnet-first)", () => {
     expect(basket.status).toBe("COMPLETE");
   });
 
+  it("PROFIT BANK: deleting the numeric env does NOT disable the TP — it silently becomes 0.60%", async () => {
+    // The trap this pair of tests exists to pin. The numeric reader falls back to 0.006 on
+    // absent/zero/negative input, so "remove the TP" via the numeric key quietly moves it instead.
+    delete process.env.CROSS_SECTIONAL_EXEC_TP_NET_RETURN;
+    delete process.env.CROSS_SECTIONAL_EXEC_TP_DISABLED;
+    const client = new FakeExecClient();
+    client.fillPriceBySymbol.set("SOLUSDT", 100);
+    client.fillPriceBySymbol.set("DOGEUSDT", 0.1);
+    const { executor, store } = makeExecutor({ client, signalMs: NOW_MS - 5 * 60_000 });
+    await executor.tick();
+    const basket = store.getState().baskets[0]!;
+    client.markPriceBySymbol.set("SOLUSDT", 104); // +2% net, clears the 0.60% fallback
+    client.markPriceBySymbol.set("DOGEUSDT", 0.1);
+    client.fillPriceBySymbol.set("SOLUSDT", 104);
+    client.fillPriceBySymbol.set("DOGEUSDT", 0.1);
+    await executor.tick();
+    expect(basket.closeReason).toBe("PROFIT_BANK"); // still banked — the TP was never off
+  });
+
+  it("PROFIT BANK: CROSS_SECTIONAL_EXEC_TP_DISABLED=1 rides to the horizon instead of banking", async () => {
+    process.env.CROSS_SECTIONAL_EXEC_TP_DISABLED = "1";
+    try {
+      const client = new FakeExecClient();
+      client.fillPriceBySymbol.set("SOLUSDT", 100);
+      client.fillPriceBySymbol.set("DOGEUSDT", 0.1);
+      const { executor, store } = makeExecutor({ client, signalMs: NOW_MS - 5 * 60_000 });
+      await executor.tick();
+      const basket = store.getState().baskets[0]!;
+      // The SAME +2% net move that banks above must now leave the basket open.
+      client.markPriceBySymbol.set("SOLUSDT", 104);
+      client.markPriceBySymbol.set("DOGEUSDT", 0.1);
+      client.fillPriceBySymbol.set("SOLUSDT", 104);
+      client.fillPriceBySymbol.set("DOGEUSDT", 0.1);
+      expect(basket.closesAtMs).toBeGreaterThan(NOW_MS); // horizon not reached
+      await executor.tick();
+      expect(basket.status).toBe("COMPLETE");
+      expect(basket.closeReason).toBeNull();
+      expect(executor.getStatus().tpDisabled).toBe(true);
+      expect(executor.getStatus().tpNetReturnPct).toBeNull();
+    } finally {
+      delete process.env.CROSS_SECTIONAL_EXEC_TP_DISABLED;
+    }
+  });
+
+  it("PROFIT BANK: a typo in the disable flag leaves the TP ON — fail-safe toward unchanged behaviour", async () => {
+    for (const bad of ["0", "true", "yes", "", "off"]) {
+      process.env.CROSS_SECTIONAL_EXEC_TP_DISABLED = bad;
+      try {
+        const client = new FakeExecClient();
+        client.fillPriceBySymbol.set("SOLUSDT", 100);
+        client.fillPriceBySymbol.set("DOGEUSDT", 0.1);
+        const { executor, store } = makeExecutor({ client, signalMs: NOW_MS - 5 * 60_000 });
+        await executor.tick();
+        const basket = store.getState().baskets[0]!;
+        client.markPriceBySymbol.set("SOLUSDT", 104);
+        client.markPriceBySymbol.set("DOGEUSDT", 0.1);
+        client.fillPriceBySymbol.set("SOLUSDT", 104);
+        client.fillPriceBySymbol.set("DOGEUSDT", 0.1);
+        await executor.tick();
+        expect(basket.closeReason, `flag=${bad}`).toBe("PROFIT_BANK");
+      } finally {
+        delete process.env.CROSS_SECTIONAL_EXEC_TP_DISABLED;
+      }
+    }
+  });
+
   it("PROFIT BANK: respects CROSS_SECTIONAL_EXEC_TP_NET_RETURN override", async () => {
     process.env.CROSS_SECTIONAL_EXEC_TP_NET_RETURN = "0.05"; // much higher bar
     try {

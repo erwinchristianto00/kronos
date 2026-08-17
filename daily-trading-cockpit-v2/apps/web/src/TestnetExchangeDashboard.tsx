@@ -541,7 +541,8 @@ function localMonthInput(date = new Date()): string {
 
 type XsecExecStatus = {
   enabled: boolean;
-  tpNetReturnPct?: number;
+  tpNetReturnPct?: number | null;
+  tpDisabled?: boolean;
   dailyRealizedUsd?: number;
   dailyMaxLossUsd?: number;
   openHalted?: string | null;
@@ -2387,7 +2388,7 @@ export default function TestnetExchangeDashboard() {
                   <div key={b.basketId} style={{ display: 'flex', gap: 14, padding: '2px 0', flexWrap: 'wrap' }}>
                     <span className="tone-measure">[{label}] {b.basketId}</span>
                     <span>net <strong className={net == null ? '' : net >= 0 ? 'tone-healthy' : 'tone-critical'}>{net == null ? '—' : `${net >= 0 ? '+' : ''}${net.toFixed(3)}%`}</strong></span>
-                    <span>TP gap <strong className={gap != null && gap <= 0 ? 'tone-healthy' : ''}>{gap == null ? '—' : gap <= 0 ? 'REACHED — closing' : `${gap.toFixed(3)}% lagi`}</strong></span>
+                    <span>TP gap <strong className={gap != null && gap <= 0 ? 'tone-healthy' : ''}>{xs?.tpDisabled ? 'TP off — tahan 48 jam' : gap == null ? '—' : gap <= 0 ? 'REACHED — closing' : `${gap.toFixed(3)}% lagi`}</strong></span>
                     <span className="tone-measure">horizon {hoursLeft.toFixed(1)}h lagi</span>
                     {stale && <span className="tone-warning">stamp basi &gt;15m — cek executor</span>}
                   </div>

@@ -412,7 +412,29 @@ const USER_TRADES_PAGE_LIMIT = 1000;
  * frees the basket slot for a fresh cycle sooner. Only ever fires on the profit side; a basket that
  * never reaches this still rides HORIZON (or an existing SL/regime-flip cut) exactly as before.
  */
+/**
+ * 2026-08-17: the profit-bank TP can now be switched OFF, which was previously impossible.
+ *
+ * The numeric reader below falls back to 0.006 on absent/zero/negative/unparseable input, so
+ * deleting the env line or setting it to 0 does NOT disable the TP — it silently moves it to 0.60%.
+ * A dedicated boolean is used instead of overloading the numeric key: no existing value changes
+ * meaning, and any typo (`=0`, `=true`, missing) leaves the TP exactly as it was rather than
+ * silently uncapping live baskets.
+ *
+ * Why off: measured on 2 years of hourly klines, one slot opening and closing repeatedly for real
+ * (not a ratio approximation), holding to the 48h horizon returns +68.4% over the period while
+ * banking at 0.45% returns −149.2%. The TP does free the slot sooner — 535 baskets instead of 346 —
+ * but each basket's expectancy is negative, so the extra turnover multiplies a loss. A paired test
+ * over the same baskets agrees independently: +0.373%/basket, blocked t=+5.24, same sign in every
+ * year and every quarter. Confirmed on this deployment's own 5 PROFIT_BANK closes, which gave up
+ * $2.96 against a lane that made $1.69 in total.
+ *
+ * POSITIVE_INFINITY reuses the disabled representation the respectSignalRiskGeometry path already
+ * relies on, so the comparison site needs no new branch.
+ */
+const TP_DISABLED = () => process.env.CROSS_SECTIONAL_EXEC_TP_DISABLED === "1";
 const TP_NET_RETURN = () => {
+  if (TP_DISABLED()) return Number.POSITIVE_INFINITY;
   const n = Number.parseFloat(process.env.CROSS_SECTIONAL_EXEC_TP_NET_RETURN ?? "");
   return Number.isFinite(n) && n > 0 ? n : 0.006;
 };
@@ -2184,7 +2206,10 @@ export class CrossSectionalExecutor {
     leverage: number;
     variant: string;
     /** Profit-bank threshold as % of deployed capital — shown next to each basket's TP gap. */
-    tpNetReturnPct: number;
+    /** null when the TP is switched off — Infinity would serialise to null anyway, so the
+     *  companion flag below is what makes "off" unambiguous to any reader. */
+    tpNetReturnPct: number | null;
+    tpDisabled: boolean;
     /** Realized basket P&L for the current UTC day + the safety-breaker limit (0 = disabled). */
     dailyRealizedUsd: number;
     dailyMaxLossUsd: number;
@@ -2317,7 +2342,8 @@ export class CrossSectionalExecutor {
       allocationWeightPct: this.allocationWeightPct(),
       leverage: this.leverageFn(),
       variant: targetVariant,
-      tpNetReturnPct: TP_NET_RETURN() * 100,
+      tpNetReturnPct: TP_DISABLED() ? null : TP_NET_RETURN() * 100,
+      tpDisabled: TP_DISABLED(),
       dailyRealizedUsd: this.dailyRealizedUsd(this.nowIso()),
       dailyMaxLossUsd: this.dailyMaxLossUsdFn(),
       openHalted: this.openHalted,
