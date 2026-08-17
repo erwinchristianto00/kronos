@@ -126,3 +126,24 @@ export function commissionBpsByLiquidity(
   };
   return { maker: bucket(true), taker: bucket(false), unreported: fills.filter((f) => f.maker === undefined).length };
 }
+
+/**
+ * Nets in-flight post-only ENTRY orders into a signed per-symbol claim: LONG positive, SHORT
+ * negative — the same convention positions and basket legs use, because reconcile() compares this
+ * against `positionAmt` straight off the exchange.
+ *
+ * 2026-08-17. Pure and exported for one reason: when this lived inline in the executor its only
+ * test faked the whole method, so a mutation that dropped the SHORT negation survived untouched.
+ * A resting SHORT counted as +qty makes reconcile explain a position on the WRONG SIDE of the book,
+ * which is the exact class of foreign position the orphan check exists to catch.
+ */
+export function signedMakerEntryQtyBySymbol(
+  entries: Iterable<{ symbol: string; direction: "LONG" | "SHORT"; qty: number }>,
+): Map<string, number> {
+  const out = new Map<string, number>();
+  for (const entry of entries) {
+    const signed = entry.direction === "LONG" ? entry.qty : -entry.qty;
+    out.set(entry.symbol, (out.get(entry.symbol) ?? 0) + signed);
+  }
+  return out;
+}

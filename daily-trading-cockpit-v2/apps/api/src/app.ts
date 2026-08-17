@@ -1588,7 +1588,8 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         computeExternalManagedNetQty(allCrossSectionalLaneExecutors(), allSingleSymbolLaneExecutors()),
       // 2026-08-17 maker-entry disarm fix: resting post-only entry orders are not yet legs, so the
       // net claim above cannot see them — reconcile() needs them as a separate tolerance band.
-      externalPendingEntryQty: () => computeExternalPendingEntryQty(allCrossSectionalLaneExecutors()),
+      externalPendingEntryQty: () =>
+        computeExternalPendingEntryQty(allCrossSectionalLaneExecutors(), allSingleSymbolLaneExecutors()),
       // 2026-07-11 real-money audit fix: same shared closures as externalManagedNetQty above, so the
       // account-wide kill-switch (killSwitchTrip) can finally see real losses/gains from these lanes
       // instead of only its own mirror/directional-slot ledger — see live-executor-wiring.ts's

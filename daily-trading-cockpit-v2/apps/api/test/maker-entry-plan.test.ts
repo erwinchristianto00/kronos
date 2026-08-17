@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { makerLimitPrice, resolveMakerLeg, commissionBpsByLiquidity } from "../src/lib/maker-entry-plan.js";
+import { makerLimitPrice, resolveMakerLeg, commissionBpsByLiquidity, signedMakerEntryQtyBySymbol } from "../src/lib/maker-entry-plan.js";
 import { buildSubmitRefBase } from "../src/lib/submit-reference-quote.js";
 
 describe("makerLimitPrice", () => {
@@ -151,5 +151,37 @@ describe("submit-time quote freshness — the rule that made maker entry inert",
   it("[QUOTE-AGE] no quote means no maker price — the leg must cross, never guess one", () => {
     expect(buildSubmitRefBase(null, 1_000, "SHORT")).toBeNull();
     expect(makerLimitPrice("SHORT", null, null)).toBeNull();
+  });
+});
+
+describe("signedMakerEntryQtyBySymbol (2026-08-17 directional-lane disarm hole)", () => {
+  it("[PENDING-SIGN] a resting SHORT entry is NEGATIVE, like the position it will become", () => {
+    const m = signedMakerEntryQtyBySymbol([{ symbol: "SOLUSDT", direction: "SHORT", qty: 12 }]);
+    expect(m.get("SOLUSDT")).toBeCloseTo(-12, 9);
+  });
+
+  it("[PENDING-SIGN] a resting LONG entry is POSITIVE", () => {
+    const m = signedMakerEntryQtyBySymbol([{ symbol: "WLDUSDT", direction: "LONG", qty: 40 }]);
+    expect(m.get("WLDUSDT")).toBeCloseTo(40, 9);
+  });
+
+  it("[PENDING-SIGN] opposite sides on one symbol NET, they do not stack", () => {
+    const m = signedMakerEntryQtyBySymbol([
+      { symbol: "SUIUSDT", direction: "LONG", qty: 30 },
+      { symbol: "SUIUSDT", direction: "SHORT", qty: 12 },
+    ]);
+    expect(m.get("SUIUSDT")).toBeCloseTo(18, 9);
+  });
+
+  it("[PENDING-SIGN] same side on one symbol ADDS", () => {
+    const m = signedMakerEntryQtyBySymbol([
+      { symbol: "UNIUSDT", direction: "SHORT", qty: 7 },
+      { symbol: "UNIUSDT", direction: "SHORT", qty: 3 },
+    ]);
+    expect(m.get("UNIUSDT")).toBeCloseTo(-10, 9);
+  });
+
+  it("[PENDING-SIGN] nothing in flight is an empty claim, never a zero-filled one", () => {
+    expect(signedMakerEntryQtyBySymbol([]).size).toBe(0);
   });
 });

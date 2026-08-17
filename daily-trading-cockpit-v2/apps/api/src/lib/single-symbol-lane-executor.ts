@@ -42,7 +42,7 @@ import { BinanceFuturesPrivateError, resolveConfirmedFillPrice, roundToStep, typ
 import { clusterOf, isMajorSymbol } from "./correlation-clusters.js";
 import type { CortexRealAttributionStore } from "./cortex-real-attribution.js";
 import { fillFromUserTrade, type ExecutionFill, type ExecutionFillRecorder } from "./execution-fill-recorder.js";
-import { makerLimitPrice, resolveMakerLeg } from "./maker-entry-plan.js";
+import { makerLimitPrice, resolveMakerLeg, signedMakerEntryQtyBySymbol } from "./maker-entry-plan.js";
 import type { FourBrainActualFillBindingStore } from "./four-brain-actual-fill-binding.js";
 import type { FourBrainBridgeCandidate, FourBrainBridgeDecision } from "./four-brain-testnet-bridge.js";
 import type { PositionPathRecorder } from "./position-path-recorder.js";
@@ -1089,7 +1089,40 @@ export class SingleSymbolLaneExecutor {
    * Any throw propagates to the caller's existing catch, which un-attempts the signal and retries
    * next tick. This function deliberately owns no recovery of its own.
    */
+  /** Keyed by entry clientOrderId. Registered the instant a post-only order is sent and removed the
+   *  instant this method returns — see pendingMakerEntryQtyBySymbol() for why reconcile needs it.
+   *  TODO(persistence): still in-memory only. A crash while an order rests loses the orderId, and
+   *  recovery has no record to query — the resulting fill becomes an unprotected naked position.
+   *  cross-sectional-executor.ts solves this by persisting makerRestingOrderId on the basket plan. */
+  private readonly inflightMakerEntries = new Map<string, { symbol: string; direction: "LONG" | "SHORT"; qty: number }>();
+
+  /**
+   * Registers the in-flight entry for the whole time an order of ours is out, then always clears it.
+   *
+   * The claim goes up BEFORE the first await, not after: `placeOrder` can time out on the RESPONSE
+   * while the order itself reached the exchange, and that is precisely the case where a position
+   * appears that nothing claims. Registering after the await would leave that hole open.
+   *
+   * Covers the MARKET path too — the claim is "this lane has an order out for qty on symbol", which
+   * is equally true there, just for a much shorter time.
+   */
   private async placeEntryMakerFirst(
+    symbol: string,
+    side: "BUY" | "SELL",
+    qty: number,
+    clientOrderId: string,
+    refBid: number | null,
+    refAsk: number | null,
+  ): Promise<{ orderId: string; avgPrice: number; executedQty: number; liquidity: { makerQty: number; takerQty: number; reason: string } }> {
+    this.inflightMakerEntries.set(clientOrderId, { symbol, direction: side === "BUY" ? "LONG" : "SHORT", qty });
+    try {
+      return await this.placeEntryMakerFirstInner(symbol, side, qty, clientOrderId, refBid, refAsk);
+    } finally {
+      this.inflightMakerEntries.delete(clientOrderId);
+    }
+  }
+
+  private async placeEntryMakerFirstInner(
     symbol: string,
     side: "BUY" | "SELL",
     qty: number,
@@ -1559,6 +1592,25 @@ export class SingleSymbolLaneExecutor {
   getExposureSnapshot(): { laneId: string; openPositions: SingleSymbolPosition[] } {
     const open = this.store.getState().positions.filter((p) => p.status === "OPEN");
     return { laneId: this.laneId, openPositions: open };
+  }
+
+  /**
+   * Post-only entry orders RESTING on the exchange right now, before any fill has been booked as a
+   * position. Signed like a position: LONG positive, SHORT negative.
+   *
+   * 2026-08-17. The cross-sectional lane force-disarmed the whole account for exactly this reason —
+   * a resting maker order that partially fills is REAL exchange exposure that nothing claims, so
+   * reconcile() reads it as an orphan "not opened by engine" and latches the engine off. This lane
+   * has the same shape, and a WIDER window: `CROSS_SECTIONAL_DIRECTIONAL_MAKER_ENTRY_WAIT_MS` is
+   * 120_000, so the order can sit on the book for two minutes filling in pieces.
+   *
+   * In-memory on purpose, and bounded by the wait: it exists to let reconcile TOLERATE a position
+   * it would otherwise call foreign, and a restart resolves that on its own (the order is gone from
+   * this map, and whatever filled is a real orphan that SHOULD be flagged). What a restart does NOT
+   * resolve is the order itself — see the class TODO on persisting it.
+   */
+  pendingMakerEntryQtyBySymbol(): Map<string, number> {
+    return signedMakerEntryQtyBySymbol(this.inflightMakerEntries.values());
   }
 
   /** Same rationale as CrossSectionalExecutor.getClosedSummary(): the engine's realized ledger

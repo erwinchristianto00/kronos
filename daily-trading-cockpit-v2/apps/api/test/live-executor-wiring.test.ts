@@ -3,6 +3,7 @@ import {
   computeExternalManagedNetQty,
   computeExternalPendingEntryQty,
   pendingEntryExplainsPosition,
+  shouldAutoRearm,
   computeNotionalPerSymbol,
   maxNotionalPerSymbolAcrossLanes,
   computeClusterOpenSymbols,
@@ -156,6 +157,9 @@ function fakePlannedLeg(
     ...(makerRestingOrderId === undefined ? {} : { makerRestingOrderId }),
   };
 }
+function fakeSingleSymbolExecutorWithPending(pending: Map<string, number>): SingleSymbolLaneExecutor {
+  return { pendingMakerEntryQtyBySymbol: () => pending } as unknown as SingleSymbolLaneExecutor;
+}
 function fakeBasketWithPlan(legs: ExecutorBasket["legs"], plan: NonNullable<ExecutorBasket["plan"]>): ExecutorBasket {
   return { ...fakeBasket(legs), plan, status: "PLACING" };
 }
@@ -262,6 +266,19 @@ describe("2026-08-17 maker-entry disarm: a RESTING entry order is not yet a leg"
       expect(computeExternalPendingEntryQty([fakeXsecExecutor([fakeBasket([fakeLeg("BTCUSDT", "LONG", 1)])])]).size).toBe(0);
     });
 
+    it("counts a directional lane's resting post-only entry too — same hole, wider window (120s)", () => {
+      const lane = fakeSingleSymbolExecutorWithPending(new Map([["SOLUSDT", -12], ["WLDUSDT", 40]]));
+      const pending = computeExternalPendingEntryQty([], [lane]);
+      expect(pending.get("SOLUSDT")).toBeCloseTo(-12, 9);
+      expect(pending.get("WLDUSDT")).toBeCloseTo(40, 9);
+    });
+
+    it("adds a directional lane's resting order to a basket's on the SAME symbol", () => {
+      const xsec = fakeXsecExecutor([fakeBasketWithPlan([], [fakePlannedLeg(0, "WLDUSDT", "LONG", 55, "mk-1")])]);
+      const lane = fakeSingleSymbolExecutorWithPending(new Map([["WLDUSDT", 40]]));
+      expect(computeExternalPendingEntryQty([xsec], [lane]).get("WLDUSDT")).toBeCloseTo(95, 9);
+    });
+
     it("sums two executors resting on the SAME symbol", () => {
       const a = fakeXsecExecutor([fakeBasketWithPlan([], [fakePlannedLeg(0, "UNIUSDT", "LONG", 7, "mk-a")])]);
       const b = fakeXsecExecutor([fakeBasketWithPlan([], [fakePlannedLeg(0, "UNIUSDT", "LONG", 3, "mk-b")])]);
@@ -312,6 +329,43 @@ describe("2026-08-17 maker-entry disarm: a RESTING entry order is not yet a leg"
       expect(pendingEntryExplainsPosition(19, 20, 35, EPS)).toBe(false);
       expect(pendingEntryExplainsPosition(56, 20, 35, EPS)).toBe(false);
     });
+  });
+});
+
+describe("2026-08-17 auto-rearm: only a transient exchange error recovers on its own", () => {
+  // The error-streak guard was right but LATCHED, and nothing re-arms (LIVE_AUTO_ARM=0), so ~75s of
+  // Binance trouble took testnet down until a human noticed hours later. Recovery is now allowed for
+  // that ONE cause. These tests exist to keep every other cause latched.
+  const REQ = 4, MAX = 3;
+
+  it("recovers once the exchange has been clean for the required run of ticks", () => {
+    expect(shouldAutoRearm(false, "TRANSIENT_EXCHANGE_ERROR", 4, 0, REQ, MAX)).toBe(true);
+    expect(shouldAutoRearm(false, "TRANSIENT_EXCHANGE_ERROR", 9, 1, REQ, MAX)).toBe(true);
+  });
+
+  it("waits — one good tick is not recovery", () => {
+    expect(shouldAutoRearm(false, "TRANSIENT_EXCHANGE_ERROR", 1, 0, REQ, MAX)).toBe(false);
+    expect(shouldAutoRearm(false, "TRANSIENT_EXCHANGE_ERROR", 3, 0, REQ, MAX)).toBe(false);
+  });
+
+  it("NEVER recovers a latched cause — orphan position, failed flatten, operator disarm, kill switch", () => {
+    expect(shouldAutoRearm(false, "LATCHED", 999, 0, REQ, MAX)).toBe(false);
+  });
+
+  it("NEVER recovers an unrecognised kind — a new disarm cause is latched until someone opts it in", () => {
+    expect(shouldAutoRearm(false, "SOMETHING_NEW", 999, 0, REQ, MAX)).toBe(false);
+    expect(shouldAutoRearm(false, null, 999, 0, REQ, MAX)).toBe(false);
+    expect(shouldAutoRearm(false, undefined, 999, 0, REQ, MAX)).toBe(false);
+  });
+
+  it("does nothing when the engine is already armed", () => {
+    expect(shouldAutoRearm(true, "TRANSIENT_EXCHANGE_ERROR", 999, 0, REQ, MAX)).toBe(false);
+  });
+
+  it("stops recovering once the flap budget is spent, so a flapping exchange cannot arm/disarm forever", () => {
+    expect(shouldAutoRearm(false, "TRANSIENT_EXCHANGE_ERROR", 999, 2, REQ, MAX)).toBe(true);
+    expect(shouldAutoRearm(false, "TRANSIENT_EXCHANGE_ERROR", 999, 3, REQ, MAX)).toBe(false);
+    expect(shouldAutoRearm(false, "TRANSIENT_EXCHANGE_ERROR", 999, 4, REQ, MAX)).toBe(false);
   });
 });
 

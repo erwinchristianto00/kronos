@@ -55,7 +55,7 @@ import {
 } from "./regime-flip-rescue.js";
 import { fetchCrowdingSnapshot, type CrowdSide, type CrowdingState } from "./derivatives-crowding.js";
 import { clusterOf, isMajorSymbol } from "./correlation-clusters.js";
-import { pendingEntryExplainsPosition } from "./live-executor-wiring.js";
+import { pendingEntryExplainsPosition, shouldAutoRearm } from "./live-executor-wiring.js";
 import type { CortexRealAttributionStore } from "./cortex-real-attribution.js";
 import { fillFromUserTrade, type ExecutionFill, type ExecutionFillRecorder, type ExecutionFillRole } from "./execution-fill-recorder.js";
 import type { FourBrainActualFillBindingStore } from "./four-brain-actual-fill-binding.js";
@@ -1373,7 +1373,18 @@ export interface LiveExecutionEngineOptions {
   executiveReviewStore?: ExecutiveReviewStore;
 }
 
-const ERROR_STREAK_DISARM = 3;
+/** 2026-08-17: was 3. tick() runs every 25s, so 3 meant ~75s of exchange trouble latched the account
+ *  off permanently — a single brief Binance blip took testnet down until a human noticed. 6 is ~2.5
+ *  minutes of SUSTAINED failure, which is a real outage rather than a hiccup. */
+const ERROR_STREAK_DISARM = 6;
+/** Why the engine disarmed. Only TRANSIENT_EXCHANGE_ERROR is allowed to recover on its own. */
+type DisarmKind = "TRANSIENT_EXCHANGE_ERROR" | "LATCHED";
+/** Consecutive clean ticks (~100s at a 25s interval) before a TRANSIENT_EXCHANGE_ERROR disarm is
+ *  allowed to recover on its own. Only that one cause recovers — see maybeAutoRearmAfterTransient. */
+const AUTO_REARM_HEALTHY_TICKS = 4;
+/** Flap guard. If the exchange keeps failing and recovering, auto-recovery would arm and disarm
+ *  forever; after this many self-recoveries the engine stays down until a human arms it. */
+const AUTO_REARM_MAX_PER_PROCESS = 3;
 const REGIME_EXIT_SNAPSHOT_MAX_AGE_MS = 15 * 60 * 1000;
 const OPEN_INTENT_STATES: ReadonlySet<LiveIntentState> = new Set(["MIRRORED", "ENTRY_PLACED", "OPEN", "TP1_FILLED_BE_SET"]);
 const MIRRORABLE_PAPER_STATUSES: ReadonlySet<string> = new Set(["CREATED", "PAPER_SUBMITTED"]);
@@ -2128,8 +2139,13 @@ export class LiveExecutionEngine {
   private lastTickAt: string | null = null;
   private lastTickError: string | null = null;
   /** Survives the `lastTickError` reset at the top of every tick, so the reason a latched disarm
-   *  happened is still readable from the API long after the exchange recovered. */
-  private lastDisarm: { at: string; reason: string } | null = null;
+   *  happened is still readable from the API long after the exchange recovered. `kind` is what
+   *  decides whether it may recover on its own: ONLY TRANSIENT_EXCHANGE_ERROR ever does. Every
+   *  other cause — kill switch, reconciliation mismatch, failed emergency flatten, an operator
+   *  pressing disarm — is LATCHED and waits for a human, which is the entire point of those paths. */
+  private lastDisarm: { at: string; reason: string; kind: DisarmKind } | null = null;
+  private healthyTickStreak = 0;
+  private autoRearmCount = 0;
   private reconcileIssues: string[] = [];
   private timer: ReturnType<typeof setInterval> | null = null;
   private ticking = false;
@@ -2223,15 +2239,72 @@ export class LiveExecutionEngine {
     return { ok: true, reason: null };
   }
 
-  disarm(reason: string): void {
+  disarm(reason: string, kind: DisarmKind = "LATCHED"): void {
     this.armed = false;
-    this.lastDisarm = { at: this.nowIso(), reason };
+    this.lastDisarm = { at: this.nowIso(), reason, kind };
     this.pushReconcileIssues(`disarmed: ${reason}`);
     // 2026-08-17: a disarm is LATCHED (nothing re-arms — LIVE_AUTO_ARM=0) and every trace of it is
     // in-memory: reconcileIssues dies on restart and `lastTickError` is cleared at the top of the
     // NEXT tick, so one healthy tick erases the reason forever. Twice in one day the account was
     // found disarmed with no way to tell why. pm2's log is the only record that outlives a restart.
     console.error(`[live-engine] DISARMED at ${this.lastDisarm.at}: ${reason}`);
+  }
+
+  /**
+   * Re-arms ONLY after a disarm the engine itself caused by losing sight of the exchange, and only
+   * once the exchange has been answering cleanly again for AUTO_REARM_HEALTHY_TICKS in a row.
+   *
+   * 2026-08-17. The error-streak guard is right — trading blind is not allowed — but it LATCHED,
+   * and nothing re-arms (LIVE_AUTO_ARM=0). So ~75s of Binance trouble took testnet down until a
+   * human noticed hours later. That is an availability bug wearing a safety guard's clothes: the
+   * condition it protects against (blind) is gone the moment ticks succeed again.
+   *
+   * Everything else stays latched, deliberately:
+   *   - kill switch      → `arm()` refuses while killedAt is set, so this cannot punch through it
+   *   - reconciliation mismatch (an orphan position) → a REAL unexplained position; needs a human
+   *   - failed emergency flatten                     → real unprotected exposure; needs a human
+   *   - operator pressed disarm                      → the operator's decision, not ours to undo
+   * All of those call disarm() with the default LATCHED kind, so they never reach the check below.
+   *
+   * Routing through arm() rather than setting `armed` directly is what buys the kill-switch and
+   * hedge-mode refusals for free — writing `this.armed = true` here would bypass both.
+   */
+  private async maybeAutoRearmAfterTransient(): Promise<void> {
+    const previous = this.lastDisarm;
+    if (
+      !previous ||
+      !shouldAutoRearm(
+        this.armed,
+        previous.kind,
+        this.healthyTickStreak,
+        this.autoRearmCount,
+        AUTO_REARM_HEALTHY_TICKS,
+        AUTO_REARM_MAX_PER_PROCESS,
+      )
+    ) {
+      return;
+    }
+    const result = await this.arm();
+    if (!result.ok) {
+      // Kill switch latched, or hedge mode — leave it down and say why, once per attempt.
+      console.error(`[live-engine] auto-rearm declined: ${result.reason}`);
+      return;
+    }
+    this.autoRearmCount += 1;
+    this.lastDisarm = null;
+    this.pushReconcileIssues(
+      `auto-rearmed after ${this.healthyTickStreak} healthy ticks (was: ${previous.reason})`,
+    );
+    console.error(
+      `[live-engine] AUTO-REARMED (${this.autoRearmCount}/${AUTO_REARM_MAX_PER_PROCESS}) after ` +
+        `${this.healthyTickStreak} healthy ticks — original disarm at ${previous.at}: ${previous.reason}`,
+    );
+    if (this.autoRearmCount >= AUTO_REARM_MAX_PER_PROCESS) {
+      console.error(
+        `[live-engine] auto-rearm budget spent — the exchange is flapping. Any further ` +
+          `transient-error disarm will STAY down until a human arms it.`,
+      );
+    }
   }
 
   /** Appends to reconcileIssues WITHOUT letting it grow unbounded. A persistent condition (e.g.
@@ -3324,6 +3397,8 @@ export class LiveExecutionEngine {
       await this.mirrorNewSignals();
 
       this.errorStreak = 0;
+      this.healthyTickStreak += 1;
+      await this.maybeAutoRearmAfterTransient();
     } catch (error) {
       this.errorStreak += 1;
       this.lastTickError = (error as Error).message ?? "unknown";
@@ -3331,10 +3406,14 @@ export class LiveExecutionEngine {
       // ERROR_STREAK_DISARM is 3, so ~75s of exchange trouble latches the account off — and until
       // this line existed nothing anywhere recorded what the trouble was.
       console.error(`[live-engine] tick failed (streak ${this.errorStreak}/${ERROR_STREAK_DISARM}): ${this.lastTickError}`);
+      this.healthyTickStreak = 0;
       if (this.errorStreak >= ERROR_STREAK_DISARM && this.armed) {
         // Carry the message INTO the reason — `lastTickError` is cleared at the top of the next
-        // tick, so a bare "streak 3" is unreadable the moment the exchange recovers.
-        this.disarm(`exchange error streak ${this.errorStreak} — trading blind is not allowed (last error: ${this.lastTickError})`);
+        // tick, so a bare "streak 6" is unreadable the moment the exchange recovers.
+        this.disarm(
+          `exchange error streak ${this.errorStreak} — trading blind is not allowed (last error: ${this.lastTickError})`,
+          "TRANSIENT_EXCHANGE_ERROR",
+        );
       }
     } finally {
       this.lastTickAt = this.nowIso();

@@ -2349,11 +2349,59 @@ describe("LiveExecutionEngine", () => {
   it("exchange error streak auto-disarms", async () => {
     const { engine, client } = makeEngine({});
     await engine.arm();
-    client.failNextTicks = 3;
-    await engine.tick();
-    await engine.tick();
-    await engine.tick();
+    client.failNextTicks = 6;
+    for (let i = 0; i < 6; i++) await engine.tick();
     expect(engine.isArmed()).toBe(false);
+  });
+
+  // 2026-08-17. The threshold was 3 and the disarm was LATCHED, so ~75s of Binance trouble took
+  // testnet down until a human noticed hours later — twice in one day. Recovery is now allowed, but
+  // ONLY for this cause; the tests below exist to keep every other cause latched.
+  describe("brief exchange trouble no longer latches the account off", () => {
+    it("survives a blip: 3 consecutive failures used to disarm, and must not any more", async () => {
+      const { engine, client } = makeEngine({});
+      await engine.arm();
+      client.failNextTicks = 3;
+      for (let i = 0; i < 3; i++) await engine.tick();
+      expect(engine.isArmed()).toBe(true);
+    });
+
+    it("re-arms itself once the exchange has answered cleanly again for a run of ticks", async () => {
+      const { engine, client } = makeEngine({});
+      await engine.arm();
+      client.failNextTicks = 6;
+      for (let i = 0; i < 6; i++) await engine.tick();
+      expect(engine.isArmed()).toBe(false);
+      await engine.tick();
+      expect(engine.isArmed()).toBe(false); // one good tick is not recovery
+      for (let i = 0; i < 3; i++) await engine.tick();
+      expect(engine.isArmed()).toBe(true);
+    });
+
+    it("NEVER undoes an operator disarm, however healthy the exchange gets", async () => {
+      const { engine } = makeEngine({});
+      await engine.arm();
+      engine.disarm("manual disarm via /api/live/disarm");
+      for (let i = 0; i < 20; i++) await engine.tick();
+      expect(engine.isArmed()).toBe(false);
+    });
+
+    it("NEVER undoes a reconciliation disarm — an orphan position needs a human, not a clean tick", async () => {
+      const { engine } = makeEngine({});
+      await engine.arm();
+      engine.disarm("reconciliation mismatch: orphan exchange position WLDUSDT amt=55 (not opened by engine)");
+      for (let i = 0; i < 20; i++) await engine.tick();
+      expect(engine.isArmed()).toBe(false);
+    });
+
+    it("reports why it went down, and keeps reporting after the exchange recovers", async () => {
+      const { engine, client } = makeEngine({});
+      await engine.arm();
+      client.failNextTicks = 6;
+      for (let i = 0; i < 6; i++) await engine.tick();
+      const health = (engine.getStatus() as { health: { lastDisarm: { reason: string } | null } }).health;
+      expect(health.lastDisarm?.reason).toMatch(/exchange error streak/);
+    });
   });
 
   it("refuses to arm in hedge mode", async () => {

@@ -274,6 +274,32 @@ export function computeExternalManagedNetQty(
  * plan, or on the opposite side of it, still disarms exactly as before.
  */
 /**
+ * May a disarmed engine re-arm itself right now?
+ *
+ * The ONLY recoverable cause is "TRANSIENT_EXCHANGE_ERROR" — the engine disarmed because it lost
+ * sight of the exchange, and the exchange is answering again. Every other cause (kill switch,
+ * an orphan position reconcile could not explain, a failed emergency flatten, an operator pressing
+ * disarm) waits for a human, because each of those means something real is wrong that a healthy
+ * tick does not fix. `kind` is compared exactly: an unrecognised kind never recovers.
+ *
+ * Extracted from the engine so the safety contract is executable rather than asserted in a comment.
+ */
+export function shouldAutoRearm(
+  armed: boolean,
+  lastDisarmKind: string | null | undefined,
+  healthyTickStreak: number,
+  autoRearmCount: number,
+  healthyTicksRequired: number,
+  maxPerProcess: number,
+): boolean {
+  if (armed) return false;
+  if (lastDisarmKind !== "TRANSIENT_EXCHANGE_ERROR") return false;
+  if (healthyTickStreak < healthyTicksRequired) return false;
+  if (autoRearmCount >= maxPerProcess) return false;
+  return true;
+}
+
+/**
  * Is an exchange position fully explained by what an external executor has already filled
  * (`claimed`) plus what it still has RESTING on the book (`pending`)?
  *
@@ -299,6 +325,7 @@ export function pendingEntryExplainsPosition(
 
 export function computeExternalPendingEntryQty(
   crossSectionalExecutors: ReadonlyArray<CrossSectionalExecutor | null>,
+  singleSymbolExecutors: ReadonlyArray<SingleSymbolLaneExecutor | null> = [],
 ): Map<string, number> {
   const pending = new Map<string, number>();
   for (const exec of crossSectionalExecutors) {
@@ -313,6 +340,15 @@ export function computeExternalPendingEntryQty(
         const signed = planned.side === "LONG" ? planned.requestedQty : -planned.requestedQty;
         pending.set(planned.symbol, (pending.get(planned.symbol) ?? 0) + signed);
       }
+    }
+  }
+  // The directional lanes run post-only entry too (CROSS_SECTIONAL_DIRECTIONAL_MAKER_ENTRY=1, a
+  // 120s wait), with the same hole: the order rests, fills in pieces, and nothing claims it until
+  // the position is booked. Same disarm, different lane.
+  for (const exec of singleSymbolExecutors) {
+    if (!exec) continue;
+    for (const [symbol, qty] of exec.pendingMakerEntryQtyBySymbol()) {
+      pending.set(symbol, (pending.get(symbol) ?? 0) + qty);
     }
   }
   return pending;
