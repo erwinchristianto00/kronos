@@ -954,6 +954,9 @@ function ClosedCrossBasketReport({ apiPrefix }: { apiPrefix: string }) {
 }
 
 export default function CrossSectionalReportCard({ apiPrefix = '/testnet/api' }: { apiPrefix?: string }) {
+  // 2026-08-18: apiPrefix IS the page discriminator ('/live/api' vs '/testnet/api'), so the card
+  // can label itself correctly instead of hardcoding "testnet" on whichever page renders it.
+  const isLive = apiPrefix.startsWith('/live');
   const [data, setData] = useState<XSecResponse | null>(null);
   const [variant, setVariant] = useState<'RAW' | 'FILTERED'>('FILTERED');
   const [error, setError] = useState(false);
@@ -983,7 +986,7 @@ export default function CrossSectionalReportCard({ apiPrefix = '/testnet/api' }:
   return <>
   <DirectionalRegimeStatus apiPrefix={apiPrefix} />
   <section className="testnet-panel testnet-wide-panel cross-sectional-report" id="cross-sectional-definitions">
-    <header><div><span>Istilah cross-basket</span><strong>Cara membaca report ini</strong></div><span className="tone-measure">khusus testnet</span></header>
+    <header><div><span>Istilah cross-basket</span><strong>Cara membaca report ini</strong></div><span className="tone-measure">khusus {isLive ? 'mainnet' : 'testnet'}</span></header>
     <div style={{ padding: '10px 12px', display: 'grid', gap: 8, color: C.dim, fontSize: 12, lineHeight: 1.5 }}>
       <div><strong style={{ color: C.text }}>RAW</strong> = universe sinyal dasar. Sistem merangking seluruh pool basket yang eligible tanpa aturan allow/block FILTERED per simbol yang sudah diukur. Ini adalah baseline pembanding, bukan otomatis pilihan eksekusi live.</div>
       <div><strong style={{ color: C.text }}>FILTERED</strong> = ide momentum cross-sectional yang sama setelah melewati filter likuiditas, selisih skor, serta allow/block operator. Executor market-neutral testnet saat ini memakai varian ini.</div>
@@ -1002,7 +1005,11 @@ export default function CrossSectionalReportCard({ apiPrefix = '/testnet/api' }:
       <div><strong style={{ color: C.text }}>MOM36_FILTERED</strong> = sinyal FILTERED dengan momentum dari 36 candle 1 jam yang sudah selesai. Angka <strong style={{ color: C.accent }}>36</strong> adalah lookback, bukan durasi holding; horizon basket saat ini ditampilkan terpisah di sebelah judul report dan dikonfigurasi secara terpisah.</div>
     </div>
   </section>
-  <section className="testnet-panel testnet-wide-panel cross-sectional-report" id="cross-sectional-report">
+  {/* 2026-08-18 (operator: "ga usah di live"): this card is the SHADOW measurement surface —
+      report-only RAW/FILTERED observations, not executed baskets. On mainnet it reads all zeros
+      and is labelled as a measurement, so it is testnet-only. The EXECUTED books stay on both
+      pages: OpenCrossBasketReport / ClosedCrossBasketReport below. */}
+  {!isLive && <section className="testnet-panel testnet-wide-panel cross-sectional-report" id="cross-sectional-report">
     <header>
       <div>
         <span>Cross-sectional horizon report</span>
@@ -1035,7 +1042,7 @@ export default function CrossSectionalReportCard({ apiPrefix = '/testnet/api' }:
         Pool yang dipakai executor: long {executionLong.length} · short {executionShort.length} · short eligible {activeShort.length}. Auto-demotion historis {config.adaptiveDemotionActive ? 'aktif' : 'nonaktif'}.
       </div>}
     </> : <div style={{ padding: 16, color: C.dim }}>{error ? 'No report data available.' : 'Loading…'}</div>}
-  </section>
+  </section>}
   <OpenCrossBasketReport apiPrefix={apiPrefix} />
   <ClosedCrossBasketReport apiPrefix={apiPrefix} />
   </>;

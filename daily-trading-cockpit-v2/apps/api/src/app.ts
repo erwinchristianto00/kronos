@@ -36,7 +36,7 @@ import {
   isCrossSectionalTrendMixedAdmissionIndependent,
   crossSectionalMarketNeutralIsAllowed,
 } from "./lib/cross-sectional-executor.js";
-import { buildCrossSectionalReport, getCrossSectionalReportSinceMs, getCrossSectionalStore } from "./lib/cross-sectional-edge.js";
+import { buildCrossSectionalReport, CROSS_SECTIONAL_FILTERED_SIGNAL, getCrossSectionalReportSinceMs, getCrossSectionalStore } from "./lib/cross-sectional-edge.js";
 import {
   SingleSymbolLaneExecutor,
   SingleSymbolLaneExecutorStore,
@@ -1808,7 +1808,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         }
       }
       const xsecReport = buildCrossSectionalReport(getCrossSectionalStore(), nowMs, {
-        variant: "FILTERED",
+        signal: CROSS_SECTIONAL_FILTERED_SIGNAL, // see entryHealthGate: variant alone mixes MOM24 with MOM36
         sinceMs: getCrossSectionalReportSinceMs(),
       });
       const xsecHealth = rollingNetEntryHealth(xsecReport.recentNetReturns);
@@ -2203,8 +2203,15 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
         fourBrainActualFillBindings: fourBrainActualFillBindingsRef ?? undefined,
         fourBrainEntryGate: fourBrainPilotEntryGate,
         entryHealthGate: () => {
+          // 2026-08-18: pass the SIGNAL, not just the variant. buildCrossSectionalReport matches on
+          // `observationVariant(o) === variant` when no signal is given, and "FILTERED" is the variant
+          // of MOM24_FILTERED and MOM36_FILTERED alike. On an instance whose CROSS_SECTIONAL_MOMENTUM_BARS
+          // changed, that scored the signal now being traded using the OLD signal's book: mainnet read
+          // last8 -0.400% / last30 -0.538% off 192 MOM24 closes and 0 MOM36 closes, and refused every
+          // basket — while the dashboard, which DOES pass a signal, showed "0 closed". Two surfaces, two
+          // answers, same lane. Now they agree.
           const report = buildCrossSectionalReport(getCrossSectionalStore(), Date.now(), {
-            variant: "FILTERED",
+            signal: CROSS_SECTIONAL_FILTERED_SIGNAL,
             sinceMs: getCrossSectionalReportSinceMs(),
           });
           const rolling = rollingNetEntryHealth(report.recentNetReturns);
