@@ -50,6 +50,26 @@ function snapshot(marketRegime: string, candidates: Candidate[]) {
   };
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// 2026-08-18 MERGE NOTE — the five cases below asserted the OPPOSITE before the
+// merge with research/phase3a-residual-generator, and were flipped on purpose.
+//
+// The two branches encoded two coherent, incompatible designs for this lane:
+//   this branch  — neutral/partial evidence means "trade smaller, keep holding"
+//   phase3a      — neutral/partial evidence means "do not open, and get out"
+//
+// phase3a won on evidence, not on seniority. Its reversal rule is the only one
+// with field data: DIRECTIONAL_REVERSAL_CONFIRMED:NO_TRADE appears in 9 real
+// testnet closes, and that string can only be produced by its variant — the
+// variant here had never executed once. It is also uniformly the safer side, and
+// a mode literally named BEAR_SHORT_3 / BULL_LONG_3 opening on a single pick made
+// its own name false. The lane's measured edge is t=0.71 on 13 independent
+// episodes, i.e. indistinguishable from zero, so the conservative reading costs
+// nothing it can be shown to earn.
+//
+// To restore the old design: revert the three functions in
+// cross-sectional-directional-regime.ts and flip these five back.
+// ─────────────────────────────────────────────────────────────────────────────
 describe("cross-sectional directional regime selector", () => {
   it("keeps every non-cross-sectional lane locked on testnet", () => {
     const env = {
@@ -108,7 +128,7 @@ describe("cross-sectional directional regime selector", () => {
     expect(crossSectionalDirectionalOpenSignals(s, "SHORT")).toEqual([]);
   });
 
-  it("opens only the one fully qualified pick in an explicit regime", () => {
+  it("fails closed in an explicit regime that cannot field three qualified picks", () => {
     const s = snapshot("Bullish continuation", [
       candidate("ETHUSDT", "LONG", 92),
       { ...candidate("SOLUSDT", "LONG", 91), confidence: 60 },
@@ -117,9 +137,9 @@ describe("cross-sectional directional regime selector", () => {
       candidate("DOGEUSDT", "SHORT", 89),
     ]);
     const decision = buildCrossSectionalDirectionalRegimeDecision(s);
-    expect(decision.mode).toBe("BULL_LONG_3");
-    expect(decision.longPicks.map((pick) => pick.symbol)).toEqual(["ETHUSDT"]);
-    expect(crossSectionalDirectionalOpenSignals(s, "LONG")).toHaveLength(1);
+    expect(decision.mode).toBe("NO_TRADE");
+    expect(decision.longPicks.length).toBeLessThan(3);
+    expect(crossSectionalDirectionalOpenSignals(s, "LONG")).toHaveLength(0);
   });
 
   it("does not execute a scanner-led WAIT candidate with direction conflict", () => {
@@ -145,16 +165,16 @@ describe("cross-sectional directional regime selector", () => {
     expect(decision.longPicks).toEqual([]);
   });
 
-  it("permits a clean profit-routable scanner-led WAIT candidate in an explicit regime", () => {
+  it("still fails closed when only a scanner-led WAIT candidate qualifies", () => {
     const s = snapshot("Bullish expansion", [
       { ...candidate("ETHUSDT", "LONG", 92), finalStatus: "WAIT", status: "WAIT" },
     ]);
     const decision = buildCrossSectionalDirectionalRegimeDecision(s);
-    expect(decision.mode).toBe("BULL_LONG_3");
-    expect(decision.longPicks.map((pick) => pick.symbol)).toEqual(["ETHUSDT"]);
+    expect(decision.mode).toBe("NO_TRADE");
+    expect(decision.longPicks.length).toBeLessThan(3);
   });
 
-  it("sizes a scanner-led short down to two slots when canonical is MIXED", () => {
+  it("refuses the short outright when canonical is MIXED, rather than sizing down", () => {
     const s = snapshot("Bearish pressure", [
       candidate("XRPUSDT", "SHORT", 91),
       candidate("NEARUSDT", "SHORT", 86),
@@ -168,9 +188,10 @@ describe("cross-sectional directional regime selector", () => {
       regimeFamily: "MIXED",
       reason: null,
     });
-    expect(confirmed.mode).toBe("BEAR_SHORT_3");
-    expect(confirmed.shortPicks.map((pick) => pick.symbol)).toEqual(["XRPUSDT", "NEARUSDT"]);
-    expect(crossSectionalDirectionalOpenSignals(s, "SHORT", confirmed).map((signal) => signal.symbol)).toEqual(["XRPUSDT", "NEARUSDT"]);
+    expect(confirmed.mode).toBe("NO_TRADE");
+    // picks are retained for display; MODE is what gates execution.
+      expect(confirmed.shortPicks.length).toBe(3);
+    expect(crossSectionalDirectionalOpenSignals(s, "SHORT", confirmed)).toHaveLength(0);
   });
 
   it("still vetoes a short when canonical is explicitly bullish", () => {
@@ -192,7 +213,7 @@ describe("cross-sectional directional regime selector", () => {
 describe("directional reversal confirmation", () => {
   const nowMs = Date.parse("2026-08-14T04:00:00.000Z");
 
-  it("does not close a short just because two fresh scans say NO_TRADE", () => {
+  it("closes a short after two distinct scans stop confirming it, NO_TRADE included", () => {
     const first = evaluateDirectionalReversal(null, "BEAR_SHORT_3", {
       mode: "NO_TRADE",
       scanBatchId: "scan-no-trade-1",
@@ -203,18 +224,18 @@ describe("directional reversal confirmation", () => {
     }, nowMs + 60_000);
 
     expect(first.shouldExit).toBe(false);
-    expect(second.shouldExit).toBe(false);
-    expect(second.next.invalidatingScanCount).toBe(0);
+    expect(second.shouldExit).toBe(true);
+    expect(second.next.invalidatingScanCount).toBe(2);
   });
 
-  it("does not treat a balanced 3x3 decision as an opposite directional reversal", () => {
+  it("counts a balanced 3x3 decision as one invalidating scan", () => {
     const result = evaluateDirectionalReversal(null, "BULL_LONG_3", {
       mode: "BALANCED_3X3",
       scanBatchId: "scan-balanced",
     }, nowMs);
 
     expect(result.shouldExit).toBe(false);
-    expect(result.next.invalidatingScanCount).toBe(0);
+    expect(result.next.invalidatingScanCount).toBe(1);
   });
 
   it("requires two distinct consecutive opposite-direction scans before closing", () => {

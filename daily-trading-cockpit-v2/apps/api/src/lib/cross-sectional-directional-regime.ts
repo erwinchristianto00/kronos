@@ -183,17 +183,8 @@ export function evaluateDirectionalReversal(
     next.invalidatingScanCount = 0;
     return { next, shouldExit: false, reason: null };
   }
-  const oppositeMode = activeMode === "BEAR_SHORT_3" ? "BULL_LONG_3" : "BEAR_SHORT_3";
-  if (decision.mode !== oppositeMode) {
-    // A neutral/missing/balanced decision blocks only fresh entries. It must also
-    // break an in-progress opposite-direction confirmation sequence so the two
-    // confirming scans are genuinely consecutive directional evidence.
-    next.activeMode = activeMode;
-    next.lastInvalidatingScanBatchId = null;
-    next.invalidatingScanCount = 0;
-    return { next, shouldExit: false, reason: null };
-  }
   if (!decision.scanBatchId) return { next, shouldExit: false, reason: null };
+
   if (next.activeMode !== activeMode) {
     next.activeMode = activeMode;
     next.lastInvalidatingScanBatchId = null;
@@ -209,7 +200,11 @@ export function evaluateDirectionalReversal(
   if (next.lastExitAtMs !== null && nowMs - next.lastExitAtMs < DIRECTIONAL_REVERSAL_EXIT_COOLDOWN_MS) {
     return { next, shouldExit: false, reason: null };
   }
-  return { next, shouldExit: true, reason: `DIRECTIONAL_REVERSAL_CONFIRMED:${oppositeMode}` };
+  return {
+    next,
+    shouldExit: true,
+    reason: `DIRECTIONAL_REVERSAL_CONFIRMED:${decision.mode}`,
+  };
 }
 
 interface DirectionalReversalPersistedState {
@@ -385,6 +380,18 @@ function emptyDecision(reason: string): CrossSectionalDirectionalDecision {
  * longs.  This makes a conflicting evidence set fail closed rather than flip
  * its direction simply because one scalar happened to be higher.
  */
+/* 2026-08-18 merge: diambil dari research/phase3a-residual-generator.
+ * Dua yang pertama lebih KETAT (fail-closed saat pick kurang dari tiga, dan saat canonical
+ * regime tidak setuju). evaluateDirectionalReversal diambil karena satu-satunya yang punya
+ * bukti lapangan: reason DIRECTIONAL_REVERSAL_CONFIRMED:NO_TRADE muncul 9 kali di close nyata
+ * testnet, dan string itu hanya bisa dihasilkan varian ini. Varian saya (hanya mode BERLAWANAN
+ * yang menghitung; NO_TRADE mereset) belum pernah dijalankan. Konsekuensi yang diterima:
+ * regime NO_TRADE yang bertahan menutup posisi - 9 dari 17 close yang terukur. */
+/* 2026-08-18 merge: badan fungsi ini milik saya (ia mengecualikan simbol yang sudah dipegang
+ * basket - fitur yang tidak ada di sisi seberang), TAPI ambangnya diambil dari
+ * research/phase3a-residual-generator: `=== 3`, bukan `>= 1`. Mode ini bernama BEAR_SHORT_3 /
+ * BULL_LONG_3; membukanya dengan satu pick saja membuat namanya berbohong dan mengubah lane
+ * bertiga-kaki jadi taruhan tunggal. Fail-closed adalah perilaku yang benar. */
 export function buildCrossSectionalDirectionalRegimeDecision(
   snapshot: CachedScanCandidates | null,
   opts: {
@@ -441,14 +448,14 @@ export function buildCrossSectionalDirectionalRegimeDecision(
   };
 
   if (explicitBear) {
-    return shortPicks.length >= 1
+    return shortPicks.length === 3
       ? { ...base, mode: "BEAR_SHORT_3", reason: `Regime bearish eksplisit dan ${shortPicks.length} short lolos skor, confidence, likuiditas, serta konfirmasi Kronos.` }
       : { ...base, mode: "NO_TRADE", reason: excludedShortSymbols.length
         ? `Regime bearish, tetapi kandidat short yang lolos sedang dipakai basket (${excludedShortSymbols.join(", ")}); tidak boleh netting/reverse posisi hedge. Menunggu kandidat short bebas.`
         : `Regime bearish, tetapi hanya ${shortPicks.length}/3 short yang lolos semua guard.` };
   }
   if (explicitBull) {
-    return longPicks.length >= 1
+    return longPicks.length === 3
       ? { ...base, mode: "BULL_LONG_3", reason: `Regime bullish eksplisit dan ${longPicks.length} long lolos skor, confidence, likuiditas, serta konfirmasi Kronos.` }
       : { ...base, mode: "NO_TRADE", reason: excludedLongSymbols.length
         ? `Regime bullish, tetapi kandidat long yang lolos sedang dipakai basket (${excludedLongSymbols.join(", ")}); tidak boleh netting/reverse posisi hedge. Menunggu kandidat long bebas.`
@@ -490,33 +497,11 @@ export function confirmCrossSectionalDirectionalRegime(
   if (canonical.requireRetest) {
     return { ...stamped, mode: "NO_TRADE", reason: "Canonical regime sedang transisi; menunggu retest sebelum entry directional." };
   }
-  if (decision.mode === "BEAR_SHORT_3" && canonical.regimeFamily === "BULLISH") {
+  if (decision.mode === "BEAR_SHORT_3" && canonical.regimeFamily !== "BEARISH") {
     return { ...stamped, mode: "NO_TRADE", reason: `Konflik arah: scan=${decision.marketRegime ?? "UNKNOWN"}, canonical=${canonical.regimeFamily}; tidak short.` };
   }
-  if (decision.mode === "BULL_LONG_3" && canonical.regimeFamily === "BEARISH") {
+  if (decision.mode === "BULL_LONG_3" && canonical.regimeFamily !== "BULLISH") {
     return { ...stamped, mode: "NO_TRADE", reason: `Konflik arah: scan=${decision.marketRegime ?? "UNKNOWN"}, canonical=${canonical.regimeFamily}; tidak long.` };
-  }
-  if (decision.mode === "BEAR_SHORT_3" && canonical.regimeFamily === "MIXED") {
-    const shortPicks = decision.shortPicks.slice(0, 2);
-    return {
-      ...stamped,
-      shortPicks,
-      longPicks: [],
-      shortAverageScore: average(shortPicks),
-      longAverageScore: null,
-      reason: `Scanner bearish eksplisit; canonical MIXED membatasi eksekusi menjadi ${shortPicks.length} short dengan sizing tereduksi.`,
-    };
-  }
-  if (decision.mode === "BULL_LONG_3" && canonical.regimeFamily === "MIXED") {
-    const longPicks = decision.longPicks.slice(0, 2);
-    return {
-      ...stamped,
-      longPicks,
-      shortPicks: [],
-      longAverageScore: average(longPicks),
-      shortAverageScore: null,
-      reason: `Scanner bullish eksplisit; canonical MIXED membatasi eksekusi menjadi ${longPicks.length} long dengan sizing tereduksi.`,
-    };
   }
   if (decision.mode === "BALANCED_3X3" && canonical.regimeFamily !== "MIXED") {
     return { ...stamped, mode: "NO_TRADE", reason: `Scan seimbang tetapi canonical=${canonical.regimeFamily}; tidak membuka basket netral.` };
