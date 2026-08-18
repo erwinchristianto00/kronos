@@ -2772,6 +2772,26 @@ export class SingleSymbolLaneExecutor {
         } catch {
           // best-effort (already set / position exists)
         }
+        // 2026-08-18: persist the handle BEFORE the order goes out. Placed ABOVE stampSubmitRef on
+        // purpose: addPendingMakerEntry does a SYNCHRONOUS store write, and the comment below is
+        // explicit that nothing may sit between that stamp and placeOrder — a disk write there
+        // would inflate ageAtSubmitMs and entryTradeWindowFromMs, the two numbers those stamps
+        // exist to keep honest. Being merely BEFORE placeOrder is all this handle requires. A post-only entry rests on the
+        // book for up to 120s; until this existed, a restart inside that window lost the only
+        // reference to a REAL resting order, and a later fill became a live position with no stop
+        // and no tracking. entryClientOrderId is deterministic and already computed above, so it
+        // stays searchable via queryOrderByClientId even if the response never arrives.
+        this.store.addPendingMakerEntry({
+          clientOrderId: entryClientOrderId,
+          symbol: signal.symbol,
+          direction: this.direction,
+          qty,
+          placedAt: this.nowIso(),
+          sourceObservationId: signal.observationId,
+          stopPrice: signal.stopPrice,
+          targetPrice: signal.targetPrice ?? null,
+          maxHoldMs: signal.maxHoldMs ?? null,
+        });
         // RECORDING-ONLY (2026-07-27). Freeze the reference's age at the LAST instant before the
         // real order goes out. Deliberately placed here and not in the position literal below:
         // that literal is built AFTER placeOrder AND after resolveFillPrice (which can burn
@@ -2791,22 +2811,6 @@ export class SingleSymbolLaneExecutor {
         // Maker-first only when THIS lane opted in; otherwise the unchanged MARKET path. submitRef
         // already holds the submit-time book, so the post-only price comes from the SAME quote the
         // execution record is audited against rather than a second, later read.
-        // 2026-08-18: persist the handle BEFORE the order goes out. A post-only entry rests on the
-        // book for up to 120s; until this existed, a restart inside that window lost the only
-        // reference to a REAL resting order, and a later fill became a live position with no stop
-        // and no tracking. entryClientOrderId is deterministic and already computed above, so it
-        // stays searchable via queryOrderByClientId even if the response never arrives.
-        this.store.addPendingMakerEntry({
-          clientOrderId: entryClientOrderId,
-          symbol: signal.symbol,
-          direction: this.direction,
-          qty,
-          placedAt: this.nowIso(),
-          sourceObservationId: signal.observationId,
-          stopPrice: signal.stopPrice,
-          targetPrice: signal.targetPrice ?? null,
-          maxHoldMs: signal.maxHoldMs ?? null,
-        });
         const order = this.makerEntryFn()
           ? await this.placeEntryMakerFirst(
               signal.symbol,
