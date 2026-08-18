@@ -1457,9 +1457,7 @@ export default function TestnetExchangeDashboard() {
         fetchJson<LiveStatus>(`${pageApiPrefix}/live/status`),
         fetchJson<LiveAccount>(`${pageApiPrefix}/live/account`),
         fetchJson<LanePerformanceSeries>(`${pageApiPrefix}/live/lane-performance-series?${seriesParams.toString()}`),
-        !isLivePage
-          ? fetchJson<LanePerformanceSeries>(`${pageApiPrefix}/live/lane-performance-series?${mfeRolloutParams.toString()}`)
-          : Promise.resolve(null),
+        fetchJson<LanePerformanceSeries>(`${pageApiPrefix}/live/lane-performance-series?${mfeRolloutParams.toString()}`),
       ]);
       if (seq !== exchangeLoadSeqRef.current) return; // a newer call already superseded this one
       setStatus(nextStatus);
@@ -1640,7 +1638,6 @@ export default function TestnetExchangeDashboard() {
   // CORTEX_REFIT_INTERVAL_MS cycle (minutes apart), and a tighter poll was a real contributor to the
   // 2026-07-20 testnet event-loop-starvation incident.
   async function loadCortexDecisionAlpha() {
-    if (isLivePage) return;
     const seq = ++cortexDecisionAlphaLoadSeqRef.current;
     try {
       const res = await fetch(`${pageApiPrefix}/shadow/cortex-decision-alpha`, { cache: 'no-store' });
@@ -1655,7 +1652,6 @@ export default function TestnetExchangeDashboard() {
   // CORTEX real-USDT attribution, testnet-only — same cadence + seq/keep-last pattern as
   // loadCortexDecisionAlpha above (the figure only moves when a tilted-lane trade closes).
   async function loadCortexRealAttribution() {
-    if (isLivePage) return;
     const seq = ++cortexRealAttributionLoadSeqRef.current;
     try {
       const res = await fetch(`${pageApiPrefix}/live/cortex-real-attribution`, { cache: 'no-store' });
@@ -1831,7 +1827,6 @@ export default function TestnetExchangeDashboard() {
   // CORTEX #219 shadow decision-alpha — own cadence (60s, not 15s): testnet-only, and the underlying
   // figure only changes once per refit cycle (minutes apart), so a faster poll would just be chatter.
   useEffect(() => {
-    if (isLivePage) return undefined;
     void loadCortexDecisionAlpha();
     void loadCortexRealAttribution();
     if (!autoRefresh) return undefined;
@@ -2106,7 +2101,7 @@ export default function TestnetExchangeDashboard() {
            extra <small> rows tucked under Realized P&L, easy to miss. Both numbers now share ONE
            always-visible line; the tooltip only adds the day/all-time breakdown, never hides either
            figure. */}
-        {!isLivePage && (
+        {(
           cortexDecisionAlpha && cortexRealAttribution ? (() => {
             const da = cortexDecisionAlpha.today.decisionAlpha;
             const r = da.cumulativeTiltDeltaR;
@@ -2178,7 +2173,7 @@ export default function TestnetExchangeDashboard() {
         {pageScope} — reads only `{pageApiPrefix}/live/status` and `{pageApiPrefix}/live/account`; Binance positions are netted per symbol (one exchange position can carry multiple mirrored source entries).
       </p>
 
-      {(isLivePage || showTestnetEngineControls) && (
+      {showTestnetEngineControls && (
       <section className="testnet-panel">
         <header>
           <span>Engine Controls</span>
@@ -2376,7 +2371,7 @@ export default function TestnetExchangeDashboard() {
               ⚠ single-symbol fetch gagal sejak {timeAgo(singleSymbolPositionsStaleSince)} — baris single-symbol di bawah bisa basi.
             </p>
           )}
-          {!isLivePage && orphanIntents.length > 0 && (
+          {orphanIntents.length > 0 && (
             <p className="tone-critical" style={{ margin: '4px 0', fontSize: 12 }}>
               ⚠ {orphanIntents.length} intent belum punya posisi Binance yang cocok (mirror/exchange desync) — tidak muncul di tabel di bawah:{' '}
               {orphanIntents.map((i) => `${i.symbol} (${i.state})`).join(', ')}. Cek reconcileIssues / quarantinedPaperOrders.
@@ -2447,13 +2442,13 @@ export default function TestnetExchangeDashboard() {
                   <th>Book</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Entry</th><th>Mark</th>
                   <th>TP target</th><th>TP gap</th><th>Liq / margin call</th><th>Stop</th><th>R now / peak</th>
                   <th>Basket horizon</th><th>Unrealized</th><th>After fee+slip</th><th>Lev</th><th>Source entries</th><th>Source lane</th><th>Opened</th>
-                  {!isLivePage && <th>Intent state</th>}
+                  <th>Intent state</th>
                   <th>Action</th>
                 </tr>
               </thead>
               <tbody>
                 {directionalPositions.length === 0 && foundationPositions.length === 0 && singleSymbolLanePositions.length === 0 ? (
-                  <tr><td colSpan={!isLivePage ? 20 : 19}>No open positions across any book.</td></tr>
+                  <tr><td colSpan={20}>No open positions across any book.</td></tr>
                 ) : (
                   <>
                     {directionalPositions.map((p) => {
@@ -2484,7 +2479,7 @@ export default function TestnetExchangeDashboard() {
                           <td>{p.sourceOrderCount}</td>
                           <td>{p.laneIds.length > 0 ? p.laneIds.map(compactLane).join(', ') : 'unattributed'}</td>
                           <td>—</td>
-                          {!isLivePage && <td>{intent.state}</td>}
+                          <td>{intent.state}</td>
                           <td>
                             <button
                               type="button"
@@ -2538,7 +2533,7 @@ export default function TestnetExchangeDashboard() {
                           <td>{p.sourceOrderCount}</td>
                           <td>{p.laneIds.length > 0 ? p.laneIds.map(compactLane).join(', ') : 'unattributed'}</td>
                           <td>—</td>
-                          {!isLivePage && <td>—</td>}
+                          <td>—</td>
                           <td className="tone-measure" title="Menutup satu leg basket akan membuat sisa basket jadi taruhan directional telanjang — tidak ada Close now di sini, sama seperti sebelumnya.">auto-exit only</td>
                         </tr>
                       );
@@ -2579,7 +2574,7 @@ export default function TestnetExchangeDashboard() {
                           <td>—</td>
                           <td>{compactLane(p.laneId)}</td>
                           <td>{new Date(p.openedAt).toLocaleString()}</td>
-                          {!isLivePage && <td>—</td>}
+                          <td>—</td>
                           <td>
                             <button
                               type="button"
@@ -2604,7 +2599,7 @@ export default function TestnetExchangeDashboard() {
            current score/Entry Decision, expanded-summary by default (the preset buttons write real
            lane allocation, so they stay zero-click) — full per-feature vote table + full 1/3/6h
            forecast chart behind one Disclosure. */}
-        {(isLivePage || showTestnetRegimeDirection) && (
+        {showTestnetRegimeDirection && (
         <section className="testnet-panel testnet-wide-panel">
           <header>
             <span>Regime &amp; Direction</span>
@@ -2621,7 +2616,7 @@ export default function TestnetExchangeDashboard() {
             </strong>
           </header>
 
-          {!isLivePage && status?.unifiedOrchestrator && (
+          {status?.unifiedOrchestrator && (
             <div style={{ marginBottom: 10 }}>
               <header>
                 <span>Unified Directional Core</span>
@@ -2750,7 +2745,7 @@ export default function TestnetExchangeDashboard() {
           <RegimeAxisChart data={regimeAxis} mode="entry" />
 
           <Disclosure summary="Per-feature vote table + full 1/3/6h forecast chart ▸">
-            {!isLivePage && status?.unifiedOrchestrator?.lastTrace?.votes.length ? (
+            {status?.unifiedOrchestrator?.lastTrace?.votes.length ? (
               <div className="testnet-table-wrap" style={{ marginBottom: 10 }}>
                 <table>
                   <thead><tr><th>Feature</th><th>Vote</th><th>Confidence</th><th>Reason</th></tr></thead>
@@ -2782,7 +2777,7 @@ export default function TestnetExchangeDashboard() {
         {/* ===== Composite 5: Single-symbol execution timeline ===== unchanged component, just
            relocated; the Keputusan-trade line + entry/exit reason stay outside the per-symbol
            chart Disclosure (see SingleSymbolPriceTimelineChart above). */}
-        {(isLivePage || showTestnetSingleSymbolTimeline) && (
+        {showTestnetSingleSymbolTimeline && (
         <section className="testnet-panel testnet-wide-panel">
           <header>
             <span>BTC / ETH / SOL Execution Timeline</span>
@@ -2807,7 +2802,7 @@ export default function TestnetExchangeDashboard() {
         {/* ===== Composite 6: Lane Research & Edge Status ===== lane-evaluation + book-proven
            symbols expanded by default (both real-money-relevant); the 3 Tier-1-3 R&D shadow lanes
            (none wired to execution) behind a Disclosure, rendered via the shared LaneMaturityTable. */}
-        {(isLivePage || showTestnetLaneResearch) && (
+        {showTestnetLaneResearch && (
         <section className="testnet-panel testnet-wide-panel">
           <header><span>Lane Research &amp; Edge Status</span><strong>{laneEvaluation.length} lane · {rndLanes.filter(Boolean).length}/3 R&amp;D</strong></header>
 
