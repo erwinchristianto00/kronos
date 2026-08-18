@@ -2240,6 +2240,10 @@ export class CrossSectionalExecutor {
      *  companion flag below is what makes "off" unambiguous to any reader. */
     tpNetReturnPct: number | null;
     tpDisabled: boolean;
+    /** Instance-level exit limits, all null/false when their switch is off. Exposed so the
+     *  dashboard states the ACTUAL exit contract instead of assuming hold-to-horizon. */
+    stopNetReturnPct: number | null;
+    maxHoldHours: number | null;
     /** Realized basket P&L for the current UTC day + the safety-breaker limit (0 = disabled). */
     dailyRealizedUsd: number;
     dailyMaxLossUsd: number;
@@ -2374,6 +2378,8 @@ export class CrossSectionalExecutor {
       variant: targetVariant,
       tpNetReturnPct: TP_DISABLED() ? null : TP_NET_RETURN() * 100,
       tpDisabled: TP_DISABLED(),
+      stopNetReturnPct: EXEC_STOP_NET_RETURN() > 0 ? EXEC_STOP_NET_RETURN() * 100 : null,
+      maxHoldHours: EXEC_MAX_HOLD_MS() > 0 ? EXEC_MAX_HOLD_MS() / 3_600_000 : null,
       dailyRealizedUsd: this.dailyRealizedUsd(this.nowIso()),
       dailyMaxLossUsd: this.dailyMaxLossUsdFn(),
       openHalted: this.openHalted,

@@ -543,6 +543,8 @@ type XsecExecStatus = {
   enabled: boolean;
   tpNetReturnPct?: number | null;
   tpDisabled?: boolean;
+  stopNetReturnPct?: number | null;
+  maxHoldHours?: number | null;
   dailyRealizedUsd?: number;
   dailyMaxLossUsd?: number;
   openHalted?: string | null;
@@ -2383,7 +2385,17 @@ export default function TestnetExchangeDashboard() {
                 const tp = xs?.tpNetReturnPct ?? null;
                 const net = b.lastNetReturn != null ? b.lastNetReturn * 100 : null;
                 const gap = tp != null && net != null ? tp - net : null;
-                const hoursLeft = Math.max(0, (b.closesAtMs - Date.now()) / 3600000);
+                const sl = xs?.stopNetReturnPct ?? null;
+                const slGap = sl != null && net != null ? net + sl : null;
+                // 2026-08-18: the countdown must respect CROSS_SECTIONAL_EXEC_MAX_HOLD_HOURS, which closes a
+                // basket BEFORE closesAtMs. Reading closesAtMs alone made the panel promise 20h left on a
+                // basket that actually had 8 — the cap shortened the trade but not the number on screen.
+                // Mirrors the executor's own Math.min so the two can never disagree.
+                const capMs = xs?.maxHoldHours != null ? xs.maxHoldHours * 3600000 : null;
+                const effectiveClose = capMs != null
+                  ? Math.min(b.closesAtMs, new Date(b.openedAt).getTime() + capMs)
+                  : b.closesAtMs;
+                const hoursLeft = Math.max(0, (effectiveClose - Date.now()) / 3600000);
                 // Stale = the 5-min TP tick hasn't stamped in >15m. A basket younger than
                 // 15m legitimately has no stamp yet — warning there is a false alarm.
                 const oldEnough = Date.now() - new Date(b.openedAt).getTime() > 15 * 60_000;
@@ -2392,8 +2404,9 @@ export default function TestnetExchangeDashboard() {
                   <div key={b.basketId} style={{ display: 'flex', gap: 14, padding: '2px 0', flexWrap: 'wrap' }}>
                     <span className="tone-measure">[{label}] {b.basketId}</span>
                     <span>net <strong className={net == null ? '' : net >= 0 ? 'tone-healthy' : 'tone-critical'}>{net == null ? '—' : `${net >= 0 ? '+' : ''}${net.toFixed(3)}%`}</strong></span>
-                    <span>TP gap <strong className={gap != null && gap <= 0 ? 'tone-healthy' : ''}>{xs?.tpDisabled ? 'TP off — tahan 48 jam' : gap == null ? '—' : gap <= 0 ? 'REACHED — closing' : `${gap.toFixed(3)}% lagi`}</strong></span>
-                    <span className="tone-measure">horizon {hoursLeft.toFixed(1)}h lagi</span>
+                    <span>ke TP <strong className={gap != null && gap <= 0 ? 'tone-healthy' : ''}>{xs?.tpDisabled ? 'TP mati' : gap == null ? '—' : `${gap.toFixed(2)}pp (${tp?.toFixed(1)}%)`}</strong></span>
+                    <span>ke stop <strong className={slGap != null && slGap <= 0 ? 'tone-critical' : ''}>{sl == null ? 'stop mati' : slGap == null ? '—' : `${slGap.toFixed(2)}pp (-${sl.toFixed(1)}%)`}</strong></span>
+                    <span className="tone-measure">tutup {hoursLeft.toFixed(1)}h lagi{xs?.maxHoldHours != null ? ` (cap ${xs.maxHoldHours}h)` : ''}</span>
                     {stale && <span className="tone-warning">stamp basi &gt;15m — cek executor</span>}
                   </div>
                 );
