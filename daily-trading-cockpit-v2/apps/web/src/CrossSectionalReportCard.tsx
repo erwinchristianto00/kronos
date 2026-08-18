@@ -1032,7 +1032,19 @@ export default function CrossSectionalReportCard({ apiPrefix = '/testnet/api' }:
         <Stat label="Open" value={`${report.open}`} />
         <Stat label="Net avg" value={pct(report.netAvgReturn)} color={tone(report.netAvgReturn)} />
         <Stat label="Win rate" value={report.closed ? `${Math.round(report.winRate * 100)}%` : '—'} />
-        <Stat label="Total net" value={pct(report.totalNetReturn, 2)} color={tone(report.totalNetReturn)} />
+        {/* 2026-08-18: was `label="Total net"` tinted green/red by tone(). It reads as profit and is
+            not: baskets open HOURLY and are held horizonBars hours, so these observations overlap
+            heavily — measured on the live store, ~18 ran concurrently with a peak of 36, against a
+            live cap of 2 open baskets. Summing them prices a portfolio nobody can hold. Renamed to
+            what it is and deliberately left uncoloured so it stops reading as a P&L figure. */}
+        <Stat label="Σ observasi (tumpang tindih)" value={pct(report.totalNetReturn, 2)} />
+      </div>
+      <div style={{ padding: '8px 12px', borderBottom: `1px solid ${C.border}`, color: C.dim, fontSize: 11, lineHeight: 1.5 }}>
+        Basket dibuka tiap jam dan ditahan {report.horizonBars} jam, jadi observasi ini <strong>saling tumpang tindih</strong> —
+        sampai ~{report.horizonBars} berjalan bersamaan. <strong>Σ observasi bukan return yang bisa direalisasikan</strong>:
+        untuk mendapatkannya Anda harus memegang semuanya sekaligus. Angka yang bisa dipakai adalah{' '}
+        <strong>Net avg per basket</strong>. Jumlah percobaan <em>independen</em> ≈ rentang waktu ÷ {report.horizonBars} jam,
+        jauh lebih kecil dari <em>Closed</em> — jangan hitung t-stat dari Closed.
       </div>
       <LegBars report={report} />
       <div style={{ padding: '10px 12px' }}>
