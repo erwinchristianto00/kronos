@@ -38,7 +38,24 @@ export function resolveLiveBinanceBaseUrl(env: LiveBinanceEnv): string {
 
 // ─── constants ───────────────────────────────────────────────────────────────
 
-const REQUEST_TIMEOUT_MS = 6_000;
+/**
+ * 2026-08-18: raised from 6_000 after measuring Binance's own behaviour during a testnet backend
+ * outage. Every authenticated endpoint (positionRisk, account, balance, openOrders) failed at a
+ * consistent ~8.08s with HTTP 408 / -1007, while the gateway itself answered a deliberately bad key
+ * in <100ms — so 8.08s is Binance's server-side ceiling, not network noise.
+ *
+ * A 6s client timeout sits BELOW that ceiling. During a degraded-but-alive period Binance would
+ * answer at ~7-8s and we would abort first, turning a knowable outcome into an unknown one. That
+ * matters most on POST: this timeout covers GET, POST and DELETE alike, and -1007 says outright
+ * "Send status unknown; execution status unknown" — aborting early on an order placement is exactly
+ * how this codebase's recurring "invisible naked position" class of bug starts.
+ *
+ * 10s clears the ceiling with margin. Safe against tick overrun: tick() runs every 25s behind an
+ * `if (this.ticking) return` re-entrancy guard, so a slow tick skips the next one rather than
+ * overlapping. During a FULL outage this changes nothing — the request fails either way, only the
+ * error text differs ("timed out after 10000ms" vs the -1007 Binance returns at 8.08s).
+ */
+export const REQUEST_TIMEOUT_MS = 10_000;
 const RECV_WINDOW_MS = 5_000;
 // Guard stays below RECV_WINDOW_MS so offset-compensated timestamps still land inside Binance's window.
 export const MAX_CLOCK_SKEW_MS = 4_000;
