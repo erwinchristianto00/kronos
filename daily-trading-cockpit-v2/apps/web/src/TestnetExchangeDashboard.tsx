@@ -1864,7 +1864,11 @@ export default function TestnetExchangeDashboard() {
   // XRP/WLD CG_MFE_GIVEBACK rollout. Keep the live page's full history, while the testnet
   // performance timeline shows the cross-sectional variants and this one approved CG lane.
   const isTestnetTimelineLane = (laneId: string) => laneId.startsWith('CROSS_SECTIONAL_');
-  const timelineSeries = !isLivePage && laneSeries
+  // 2026-08-18: dropped the `!isLivePage &&`. The section that renders this chart is already shown
+  // on /live (`isLivePage || showTestnetLaneResearch`), so gating the DATA here left live with a
+  // permanently empty chart. laneSeries is fetched on both pages; mfeRolloutSeries is testnet-only
+  // and already null-guarded below, so live simply gets the cross-sectional lanes.
+  const timelineSeries = laneSeries
     ? {
       ...laneSeries,
       lanes: [
@@ -2297,7 +2301,12 @@ export default function TestnetExchangeDashboard() {
       </section>
       )}
 
-      {!isLivePage && <CrossSectionalReportCard apiPrefix={TESTNET_API_PREFIX} />}
+      {/* 2026-08-18: was `!isLivePage && ... TESTNET_API_PREFIX`. The gate was there because the
+          card was hardcoded to testnet's prefix, NOT because /live must hide it — mainnet now runs
+          this same lane and serves every route the card reads (executor, closed-baskets, pool,
+          directional-regime, instrumentation, shadow reports: all 200 on 3103). pageApiPrefix makes
+          it follow whichever page it is rendered on. */}
+      <CrossSectionalReportCard apiPrefix={pageApiPrefix} />
 
       <main className="testnet-grid">
         {/* ===== Composite 3: Open Positions (2026-07-23 dashboard consolidation) =====
@@ -2940,7 +2949,7 @@ export default function TestnetExchangeDashboard() {
               </label>
             </div>
           </header>
-          {!isLivePage && timelineSeries?.crossSectionalAuditBeforePeriod && (
+          {timelineSeries?.crossSectionalAuditBeforePeriod && (
             <p className="tone-measure" style={{ margin: '7px 0 0', fontSize: 12 }}>
               Histori cross-basket sebelum periode ini: {timelineSeries.crossSectionalAuditBeforePeriod.closedBaskets} closed basket · {signed(timelineSeries.crossSectionalAuditBeforePeriod.totalNetPnlUsd)} · terakhir {timeAgo(timelineSeries.crossSectionalAuditBeforePeriod.lastClosedAt)}. Tidak dicampur ke kurva {timelineSeries.periodLabel}; pilih tanggal close-nya untuk melihat titik chart.
             </p>
@@ -2949,7 +2958,7 @@ export default function TestnetExchangeDashboard() {
               ones — which exit closed each trade, and the same seven-hypothesis verdict per close.
               Linked rather than inlined: it is a full ledger, not a summary, and it lives on the API
               so no dashboard bundle carries it. Testnet-only, same as the note above. */}
-          {!isLivePage && (
+          {(
             <p className="tone-measure" style={{ margin: '5px 0 0', fontSize: 12 }}>
               <a
                 href={`${pageApiPrefix}/live/directional-overlay-counterfactual/view`}
