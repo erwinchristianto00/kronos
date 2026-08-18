@@ -2104,6 +2104,15 @@ export interface CrossSectionalReport {
   nextResolveInMs: number | null;
   /** the net returns of recent closed baskets, for a distribution sparkline. */
   recentNetReturns: number[];
+  /** Closed observations that share NO holding period with each other — see
+   *  nonOverlappingClosedSample. These, not `closed`, are the independent trials. */
+  independentBlocks: number;
+  /** Mean/win-rate/t over the non-overlapping subsample. t is null below 2 blocks, because a
+   *  standard error over one sample is not a number, it is a hallucination. */
+  blockedNetAvgReturn: number | null;
+  blockedWinRate: number | null;
+  blockedTStat: number | null;
+  blockedNetReturns: number[];
   targetGrossReturn: number;
   edgeReady: boolean;
   byRegime: Array<{
@@ -2162,6 +2171,34 @@ function groupStats<T extends string>(
   });
 }
 
+/**
+ * Greedy non-overlapping subsample of closed observations.
+ *
+ * The lane opens a basket EVERY HOUR and holds each for `horizonMs` (48h), so consecutive
+ * observations share most of their life and most of their symbols — measured on the live store,
+ * ~18 ran concurrently with a peak of 36. Treating those rows as independent trials inflates any
+ * t-stat by roughly sqrt(overlap): a 4-day window read t=3.29 on 43 rows while containing under ONE
+ * non-overlapping 48h block.
+ *
+ * This walks the closed set in time order and keeps an observation only once the previously kept
+ * one has fully resolved. What comes back is a set of samples that genuinely do not share a holding
+ * period — the only set a standard error may be computed from. It is deliberately greedy-from-the-
+ * earliest rather than best-of: picking by return would select on the outcome being measured.
+ */
+export function nonOverlappingClosedSample<T extends { openedAtMs: number; horizonMs: number }>(
+  closed: readonly T[],
+): T[] {
+  const ordered = [...closed].sort((a, b) => a.openedAtMs - b.openedAtMs);
+  const kept: T[] = [];
+  let freeFromMs = Number.NEGATIVE_INFINITY;
+  for (const o of ordered) {
+    if (o.openedAtMs < freeFromMs) continue;
+    kept.push(o);
+    freeFromMs = o.openedAtMs + o.horizonMs;
+  }
+  return kept;
+}
+
 export function buildCrossSectionalReport(
   store: CrossSectionalStore,
   nowMs: number = Date.now(),
@@ -2174,6 +2211,17 @@ export function buildCrossSectionalReport(
   );
   const closed = all.filter((o) => o.status === "CLOSED" && o.netReturn !== null);
   const nets = closed.map((o) => o.netReturn!);
+  // The independent-trial view. `closed` counts rows; this counts trials that share no holding
+  // period, which is what any mean/t-stat has to be built from on an hourly-open / 48h-hold lane.
+  const blocked = nonOverlappingClosedSample(closed);
+  const blockedNets = blocked.map((o) => o.netReturn!);
+  const blockedMean = blockedNets.length ? mean(blockedNets) : null;
+  const blockedSd = blockedNets.length > 1
+    ? Math.sqrt(blockedNets.reduce((sum, x) => sum + (x - blockedMean!) ** 2, 0) / (blockedNets.length - 1))
+    : null;
+  const blockedTStat = blockedMean !== null && blockedSd !== null && blockedSd > 0
+    ? blockedMean / (blockedSd / Math.sqrt(blockedNets.length))
+    : null;
   const gross = closed.map((o) => o.grossReturn ?? 0);
   const m = mean(nets);
   const sd = nets.length > 1 ? Math.sqrt(mean(nets.map((x) => (x - m) ** 2))) : 0;
@@ -2190,6 +2238,11 @@ export function buildCrossSectionalReport(
     lastCycleAt: store.lastCycleAt,
     nextResolveInMs: openRemaining.length ? Math.min(...openRemaining) : null,
     recentNetReturns: nets.slice(-30),
+    independentBlocks: blocked.length,
+    blockedNetAvgReturn: blockedMean,
+    blockedWinRate: blockedNets.length ? blockedNets.filter((x) => x > 0).length / blockedNets.length : null,
+    blockedTStat,
+    blockedNetReturns: blockedNets,
     signal: opts.signal ?? reportSignalFor(variant),
     variant,
     horizonBars: CROSS_SECTIONAL_HORIZON_BARS,

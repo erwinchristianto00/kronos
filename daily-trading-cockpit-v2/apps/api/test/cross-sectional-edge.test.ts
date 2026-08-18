@@ -33,6 +33,7 @@ import {
   regimeSkewCounterfactual,
   type ScoredSymbol,
   type CrossSectionalObservation,
+  nonOverlappingClosedSample,
 } from "../src/lib/cross-sectional-edge.js";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -1271,5 +1272,43 @@ describe("deriveAdaptiveSymbolFilters — demotes toxic symbols inside hard oper
     // The correctly-named contract should still be reachable where the old lists referenced it.
     expect(CROSS_SECTIONAL_FILTERED_LONG_ALLOWLIST.has("1000PEPEUSDT")).toBe(true);
     expect(CROSS_SECTIONAL_FILTERED_SHORT_ALLOWLIST.has("1000PEPEUSDT")).toBe(true);
+  });
+});
+
+
+describe("nonOverlappingClosedSample — hourly opens, 48h holds", () => {
+  const H = 48 * 3_600_000;
+  const at = (hoursFromStart: number) => ({ openedAtMs: 1_000_000_000_000 + hoursFromStart * 3_600_000, horizonMs: H });
+
+  it("keeps ONE sample per horizon when baskets open every hour", () => {
+    // 96 hourly opens across 4 days. Naively that is 96 'trials'; only 2 of them
+    // fail to share a holding period with a kept neighbour.
+    const closed = Array.from({ length: 96 }, (_, i) => at(i));
+    const kept = nonOverlappingClosedSample(closed);
+    expect(kept.length).toBe(2);
+    expect(kept[0]!.openedAtMs).toBe(at(0).openedAtMs);
+    expect(kept[1]!.openedAtMs).toBe(at(48).openedAtMs);
+  });
+
+  it("never keeps two samples whose holding periods touch", () => {
+    const closed = Array.from({ length: 200 }, (_, i) => at(i * 0.5));
+    const kept = nonOverlappingClosedSample(closed);
+    for (const [a, b] of kept.slice(0, -1).map((x, i) => [x, kept[i + 1]!] as const)) {
+      expect(b.openedAtMs).toBeGreaterThanOrEqual(a.openedAtMs + a.horizonMs);
+    }
+  });
+
+  it("does not depend on input order — it sorts by open time", () => {
+    const forward = [at(0), at(1), at(48), at(49), at(96)];
+    const shuffled = [at(49), at(96), at(0), at(48), at(1)];
+    expect(nonOverlappingClosedSample(shuffled).map((o) => o.openedAtMs))
+      .toEqual(nonOverlappingClosedSample(forward).map((o) => o.openedAtMs));
+    expect(nonOverlappingClosedSample(forward).length).toBe(3);
+  });
+
+  it("returns every row when they already do not overlap, and handles 0/1 rows", () => {
+    expect(nonOverlappingClosedSample([]).length).toBe(0);
+    expect(nonOverlappingClosedSample([at(0)]).length).toBe(1);
+    expect(nonOverlappingClosedSample([at(0), at(48), at(96)]).length).toBe(3);
   });
 });

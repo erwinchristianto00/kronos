@@ -30,6 +30,11 @@ type XSecReport = {
   lastCycleAt: string | null;
   nextResolveInMs: number | null;
   recentNetReturns: number[];
+  independentBlocks: number;
+  blockedNetAvgReturn: number | null;
+  blockedWinRate: number | null;
+  blockedTStat: number | null;
+  blockedNetReturns: number[];
 };
 type XSecBasket = {
   openedAt: string;
@@ -211,6 +216,21 @@ type DirectionalRegimeResponse = {
 
 const pct = (x: number | null | undefined, d = 3) => x == null ? '—' : `${(x * 100).toFixed(d)}%`;
 const pctRaw = (x: number | null | undefined, d = 2) => x == null ? '—' : `${x.toFixed(d)}%`;
+/** Two-sided 95% critical |t| for df = n-1. A t-stat is meaningless without its degrees of
+ *  freedom: at 2 blocks (df=1) the bar is 12.71, not 2.0 — colouring t=2.37 green there would
+ *  repeat exactly the overlap mistake this row exists to correct. Falls back to 2.0 for large n. */
+const T_CRIT_95: Record<number, number> = {
+  1: 12.71, 2: 4.30, 3: 3.18, 4: 2.78, 5: 2.57, 6: 2.45, 7: 2.36, 8: 2.31,
+  9: 2.26, 10: 2.23, 12: 2.18, 15: 2.13, 20: 2.09, 25: 2.06, 30: 2.04, 40: 2.02,
+};
+function tCritical95(blocks: number): number | null {
+  const df = blocks - 1;
+  if (df < 1) return null;
+  const keys = Object.keys(T_CRIT_95).map(Number).sort((a, b) => a - b);
+  for (const k of keys) if (df <= k) return T_CRIT_95[k]!;
+  return 2.0;
+}
+
 const tone = (x: number | null | undefined) => x == null ? C.measure : x > 0 ? C.good : x < 0 ? C.bad : C.dim;
 const ago = (ts: string) => {
   const seconds = Math.max(0, Math.round((Date.now() - new Date(ts).getTime()) / 1000));
@@ -1039,12 +1059,41 @@ export default function CrossSectionalReportCard({ apiPrefix = '/testnet/api' }:
             what it is and deliberately left uncoloured so it stops reading as a P&L figure. */}
         <Stat label="Σ observasi (tumpang tindih)" value={pct(report.totalNetReturn, 2)} />
       </div>
+      {/* 2026-08-18: the row above counts ROWS. The lane opens hourly and holds horizonBars hours,
+          so those rows share holding periods and symbols — they are not independent trials, and a
+          t-stat computed from them is inflated by roughly sqrt(overlap). The row below is the same
+          book resampled so no two entries share a holding period (nonOverlappingClosedSample), which
+          is the only set a mean and a standard error may honestly be built from. */}
+      <div style={{ display: 'flex', flexWrap: 'wrap', borderBottom: `1px solid ${C.border}`, background: 'rgba(255,255,255,0.02)' }}>
+        <Stat label="Blok independen" value={`${report.independentBlocks}`} />
+        <Stat
+          label="Net avg / blok"
+          value={report.blockedNetAvgReturn === null ? '—' : pct(report.blockedNetAvgReturn)}
+          color={report.blockedNetAvgReturn === null ? undefined : tone(report.blockedNetAvgReturn)}
+        />
+        <Stat
+          label="Win rate / blok"
+          value={report.blockedWinRate === null ? '—' : `${Math.round(report.blockedWinRate * 100)}%`}
+        />
+        {(() => {
+          const crit = tCritical95(report.independentBlocks);
+          const t = report.blockedTStat;
+          const passes = t !== null && crit !== null && Math.abs(t) >= crit;
+          return <Stat
+            label={crit === null ? 't-stat' : `t-stat (butuh ${crit.toFixed(2)})`}
+            value={t === null ? '— (butuh ≥2 blok)' : t.toFixed(2)}
+            color={passes ? C.good : C.dim}
+          />;
+        })()}
+      </div>
       <div style={{ padding: '8px 12px', borderBottom: `1px solid ${C.border}`, color: C.dim, fontSize: 11, lineHeight: 1.5 }}>
-        Basket dibuka tiap jam dan ditahan {report.horizonBars} jam, jadi observasi ini <strong>saling tumpang tindih</strong> —
-        sampai ~{report.horizonBars} berjalan bersamaan. <strong>Σ observasi bukan return yang bisa direalisasikan</strong>:
-        untuk mendapatkannya Anda harus memegang semuanya sekaligus. Angka yang bisa dipakai adalah{' '}
-        <strong>Net avg per basket</strong>. Jumlah percobaan <em>independen</em> ≈ rentang waktu ÷ {report.horizonBars} jam,
-        jauh lebih kecil dari <em>Closed</em> — jangan hitung t-stat dari Closed.
+        Basket dibuka tiap jam dan ditahan {report.horizonBars} jam, jadi baris <em>Closed</em> di atas{' '}
+        <strong>saling tumpang tindih</strong> — mereka berbagi periode tahan dan sebagian besar simbol, jadi{' '}
+        <strong>bukan {report.closed} percobaan bebas</strong>. Baris kedua memakai ulang buku yang sama tetapi hanya
+        mengambil observasi yang <strong>tidak berbagi periode tahan</strong> sama sekali: itulah percobaan yang sebenarnya.
+        Pakai <strong>Net avg / blok</strong> dan <strong>t-stat</strong> untuk menilai — dan bandingkan t dengan
+        ambang yang tertera, bukan dengan 2,0: ambang itu bergantung pada jumlah blok (pada 2 blok ambangnya 12,71).
+        {report.independentBlocks < 2 && ' Saat ini blok independennya < 2, jadi belum ada kesimpulan statistik yang bisa ditarik dari jendela ini.'}
       </div>
       <LegBars report={report} />
       <div style={{ padding: '10px 12px' }}>
