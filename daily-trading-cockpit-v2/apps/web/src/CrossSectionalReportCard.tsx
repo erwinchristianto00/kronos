@@ -742,6 +742,8 @@ function BreadthRow({ apiPrefix }: { apiPrefix: string }) {
 }
 
 function DirectionalRegimeStatus({ apiPrefix }: { apiPrefix: string }) {
+  // sama seperti CrossSectionalReportCard: apiPrefix sudah membedakan halaman, jangan hardcode 'testnet'.
+  const isLiveDR = apiPrefix.startsWith('/live');
   const [data, setData] = useState<DirectionalRegimeResponse | null>(null);
   const [error, setError] = useState(false);
   const [lastGoodAt, setLastGoodAt] = useState<string | null>(null);
@@ -758,7 +760,7 @@ function DirectionalRegimeStatus({ apiPrefix }: { apiPrefix: string }) {
   const picks = data?.mode === 'BEAR_SHORT_3' ? data.shortPicks : data?.mode === 'BULL_LONG_3' ? data.longPicks : [];
   const isStale = error && data !== null;
   return <section className="testnet-panel testnet-wide-panel cross-sectional-report" id="cross-sectional-directional-decision">
-    <header><div><span>Keputusan arah cross-sectional</span><strong>{data ? directionalModeLabel(data.mode, picks.length) : 'Memuat keputusan…'}</strong></div><span className="tone-measure">khusus testnet · executor source of truth</span></header>
+    <header><div><span>Keputusan arah cross-sectional</span><strong>{data ? directionalModeLabel(data.mode, picks.length) : 'Memuat keputusan…'}</strong></div><span className="tone-measure">khusus {isLiveDR ? 'mainnet' : 'testnet'} · executor source of truth</span></header>
     {error && <div style={{ padding: '9px 12px', color: C.bad, borderBottom: `1px solid ${C.border}`, fontSize: 12 }}>
       <strong>{isStale ? 'DATA TERAKHIR — BUKAN DATA LIVE. ' : 'DATA TIDAK TERSEDIA. '}</strong>
       Fetch keputusan executor gagal; jangan gunakan card ini untuk menilai arah atau membuka entry.{lastGoodAt ? ` Terakhir berhasil dimuat ${ago(lastGoodAt)} lalu.` : ''}
