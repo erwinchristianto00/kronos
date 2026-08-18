@@ -63,7 +63,9 @@ export type SingleSymbolExecClient = Pick<
    *  a post-only order that cannot be cancelled has no safe way to stop resting, and here that
    *  matters more than on the basket path — a partially filled resting order means a LIVE, unstopped
    *  position. */
-  Partial<Pick<BinanceFuturesPrivateClient, "cancelOrder">>;
+  /** 2026-08-18: also optional. Without it reconcilePendingMakerEntries cannot resolve a resting
+   *  order after a restart, so it degrades to leaving the handle pending rather than guessing. */
+  Partial<Pick<BinanceFuturesPrivateClient, "cancelOrder" | "queryOrderByClientId">>;
 
 export interface SingleSymbolFreshSignal {
   observationId: string;
@@ -491,9 +493,39 @@ export interface SingleSymbolPosition {
   submitRef?: SubmitReferenceQuote | null;
 }
 
+/**
+ * An entry order that has been SENT but whose outcome is not yet booked as a position.
+ *
+ * 2026-08-18. Post-only entry rests on the book for up to CROSS_SECTIONAL_DIRECTIONAL_MAKER_ENTRY_-
+ * WAIT_MS (120s in production) while `placeEntryMakerFirst` polls it. Until today the orderId lived
+ * only in a local variable, so a restart inside that window lost the only handle to it: the order
+ * stays REAL on the exchange, nothing knows it exists, and if it fills the result is a live position
+ * with no stop and no tracking — the "invisible naked position" class this file's own reconciliation
+ * was built to prevent. cross-sectional-executor.ts already persists makerRestingOrderId on the
+ * basket plan; this is the same protection for the directional lanes.
+ *
+ * Written BEFORE the order is sent, so even a crash between send and response leaves the handle.
+ * The handle is `clientOrderId`, which is deterministic and computed before placement, so it stays
+ * searchable via queryOrderByClientId no matter what happened to the response.
+ */
+export interface PendingMakerEntry {
+  clientOrderId: string;
+  symbol: string;
+  direction: "LONG" | "SHORT";
+  qty: number;
+  placedAt: string;
+  sourceObservationId: string;
+  /** Everything needed to build a real, STOPPED position if the order turns out to have filled. */
+  stopPrice: number;
+  targetPrice?: number | null;
+  maxHoldMs?: number | null;
+}
+
 interface SingleSymbolExecutorState {
   version: number;
   positions: SingleSymbolPosition[];
+  /** Optional so state files written before 2026-08-18 still load unchanged. */
+  pendingMakerEntries?: PendingMakerEntry[];
   lastSeenSignalMs: number;
   /** 2026-07-09 fix: per-signal dedup by observationId, bounded to the most recent 500. Replaces
    *  lastSeenSignalMs-only filtering for candidate selection, which had a real incident: when
@@ -548,6 +580,23 @@ export class SingleSymbolLaneExecutorStore {
 
   getState(): SingleSymbolExecutorState {
     return this.state;
+  }
+
+  /** Persist an entry order BEFORE it is sent. Bounded: a stuck record cannot accumulate because
+   *  reconcilePendingMakerEntries drops anything the exchange says never existed. */
+  addPendingMakerEntry(entry: PendingMakerEntry): void {
+    const list = this.state.pendingMakerEntries ?? [];
+    if (!list.some((e) => e.clientOrderId === entry.clientOrderId)) list.push(entry);
+    this.state.pendingMakerEntries = list.slice(-50);
+    this.save();
+  }
+
+  /** Called once the order's outcome is known — filled, rejected, or proven absent. */
+  clearPendingMakerEntry(clientOrderId: string): void {
+    const list = this.state.pendingMakerEntries;
+    if (!list || list.length === 0) return;
+    this.state.pendingMakerEntries = list.filter((e) => e.clientOrderId !== clientOrderId);
+    this.save();
   }
 
   private prune(): void {
@@ -1706,10 +1755,94 @@ export class SingleSymbolLaneExecutor {
   }
 
   /** Single-flight tick: settle stop-triggered/policy-decided exits, then consider a new entry. */
+  /**
+   * Resolve every entry order that was sent but never booked — the crash-inside-the-maker-window
+   * case. Runs FIRST, before monitorOpenPositions, so an order that filled while the process was
+   * down becomes a tracked, stopped position before anything else reads the book.
+   *
+   * Deliberately mirrors cross-sectional-executor.ts's reconcilePlannedLeg: an ambiguous answer is
+   * never treated as "no order". Only Binance saying the order does not exist (-2013), or reporting
+   * it terminal with zero fill, drops the handle; anything else keeps it for the next tick.
+   */
+  private async reconcilePendingMakerEntries(): Promise<void> {
+    const pending = this.store.getState().pendingMakerEntries ?? [];
+    if (pending.length === 0 || !this.client.queryOrderByClientId) return;
+    for (const entry of [...pending]) {
+      let order: Awaited<ReturnType<NonNullable<SingleSymbolExecClient["queryOrderByClientId"]>>>;
+      try {
+        order = await this.client.queryOrderByClientId(entry.symbol, entry.clientOrderId);
+      } catch (error) {
+        // -2013 = order does not exist. That is PROOF it never reached the book, so the handle can
+        // go. Any other error leaves it pending rather than guessing.
+        if (error instanceof BinanceFuturesPrivateError && error.binanceCode === -2013) {
+          this.store.clearPendingMakerEntry(entry.clientOrderId);
+        }
+        continue;
+      }
+      const executed = Number.isFinite(order.executedQty) ? order.executedQty : 0;
+      const status = (order.status ?? "").trim().toUpperCase();
+      if (executed > 0) {
+        // It filled while nobody was watching. Adopt it as a real position and stop it THIS tick —
+        // an unstopped live position is the whole reason this path exists.
+        const already = this.store.getState().positions.some((p) => p.entryOrderId === order.orderId);
+        if (!already) {
+          const position: SingleSymbolPosition = {
+            positionId: `ssle-recovered-${entry.clientOrderId}`,
+            sourceObservationId: entry.sourceObservationId,
+            symbol: entry.symbol,
+            direction: entry.direction,
+            qty: executed,
+            entryPrice: order.avgPrice,
+            entryOrderId: order.orderId,
+            entryPriceConfirmed: Number.isFinite(order.avgPrice) && order.avgPrice > 0,
+            stopPrice: entry.stopPrice,
+            targetPrice: entry.targetPrice ?? null,
+            maxHoldMs: entry.maxHoldMs ?? null,
+            stopAlgoOrderId: null,
+            stopFailureCount: 0,
+            stopUnprotectedSinceIso: null,
+            closeFailureCount: 0,
+            closeFailureSinceIso: null,
+            peakFavorableR: 0,
+            openedAt: entry.placedAt,
+            status: "OPEN",
+            closedAt: null,
+            closeReason: null,
+            exitPrice: null,
+            exitOrderId: null,
+            exitPriceConfirmed: null,
+            grossPnlUsd: null,
+            feeEstimateUsd: null,
+            netPnlUsd: null,
+          };
+          this.store.getState().positions.push(position);
+          this.store.save();
+          console.error(
+            `[${this.laneId}] RECOVERED a filled entry nobody was tracking: ${entry.symbol} ${entry.direction} ` +
+              `qty=${executed} order=${order.orderId} — placing its stop now.`,
+          );
+          try {
+            await this.ensureStopOrder(position);
+          } catch (error) {
+            this.lastError = `recovered position stop failed: ${(error as Error).message}`;
+          }
+        }
+        this.store.clearPendingMakerEntry(entry.clientOrderId);
+        continue;
+      }
+      // Terminal with nothing filled = it is over and created no exposure.
+      if (["CANCELED", "CANCELLED", "EXPIRED", "REJECTED"].includes(status)) {
+        this.store.clearPendingMakerEntry(entry.clientOrderId);
+      }
+      // Anything else (NEW / PARTIALLY_FILLED with 0 executed / unknown) stays pending.
+    }
+  }
+
   async tick(): Promise<void> {
     if (this.ticking) return;
     this.ticking = true;
     try {
+      await this.reconcilePendingMakerEntries();
       await this.monitorOpenPositions();
       if (this.isAllowed()) await this.maybeOpenPosition();
       this.lastError = null;
@@ -2658,6 +2791,22 @@ export class SingleSymbolLaneExecutor {
         // Maker-first only when THIS lane opted in; otherwise the unchanged MARKET path. submitRef
         // already holds the submit-time book, so the post-only price comes from the SAME quote the
         // execution record is audited against rather than a second, later read.
+        // 2026-08-18: persist the handle BEFORE the order goes out. A post-only entry rests on the
+        // book for up to 120s; until this existed, a restart inside that window lost the only
+        // reference to a REAL resting order, and a later fill became a live position with no stop
+        // and no tracking. entryClientOrderId is deterministic and already computed above, so it
+        // stays searchable via queryOrderByClientId even if the response never arrives.
+        this.store.addPendingMakerEntry({
+          clientOrderId: entryClientOrderId,
+          symbol: signal.symbol,
+          direction: this.direction,
+          qty,
+          placedAt: this.nowIso(),
+          sourceObservationId: signal.observationId,
+          stopPrice: signal.stopPrice,
+          targetPrice: signal.targetPrice ?? null,
+          maxHoldMs: signal.maxHoldMs ?? null,
+        });
         const order = this.makerEntryFn()
           ? await this.placeEntryMakerFirst(
               signal.symbol,
@@ -2721,6 +2870,8 @@ export class SingleSymbolLaneExecutor {
         };
         st.positions.push(position);
         this.store.save();
+        // Outcome is booked as a real position — the handle is no longer needed.
+        this.store.clearPendingMakerEntry(entryClientOrderId);
         this.bindFourBrainActualFill(position);
         this.seedPositionPathAtEntry(position);
         // this comment used to claim the stop is placed on the VERY NEXT tick, contradicting this
@@ -2751,6 +2902,12 @@ export class SingleSymbolLaneExecutor {
         // Mirrors cross-sectional-executor.ts's basket-abort catch — same reasoning, same guard.
         if (reservationId && error instanceof BinanceFuturesPrivateError && error.failureType === "binance_error") {
           this.releaseExposureReservationFn(reservationId, `ENTRY_FAILED:${(error as Error).message}`);
+        }
+        // Same split as the reservation above: only an UNAMBIGUOUS in-band rejection proves no order
+        // exists, so only then is the handle safe to drop. Every ambiguous failure keeps it, and the
+        // next tick's reconcilePendingMakerEntries resolves it against the exchange.
+        if (error instanceof BinanceFuturesPrivateError && error.failureType === "binance_error") {
+          this.store.clearPendingMakerEntry(entryClientOrderId);
         }
       }
       } finally {

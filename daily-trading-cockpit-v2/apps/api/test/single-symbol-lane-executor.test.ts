@@ -145,6 +145,14 @@ class FakeClient implements SingleSymbolExecClient {
     const avgPrice = this.fillPriceBySymbol.get(params.symbol) ?? 0;
     return this.buildOrder(params.symbol, params.side, params.quantity, params.reduceOnly, orderId, avgPrice);
   }
+  /** 2026-08-18: drives reconcilePendingMakerEntries. Default THROWS -2013 ("order does not
+   *  exist"), which is the honest default for an order that was never placed in a test. */
+  byClientId = new Map<string, FuturesOrder>();
+  async queryOrderByClientId(symbol: string, origClientOrderId: string): Promise<FuturesOrder> {
+    const hit = this.byClientId.get(origClientOrderId);
+    if (hit) return hit;
+    throw new BinanceFuturesPrivateError("binance_error", "Order does not exist.", { httpStatus: 404, binanceCode: -2013 });
+  }
   async queryOrder(symbol: string, orderId: string): Promise<FuturesOrder> {
     const avgPrice = this.queryOrderAvgPriceBySymbol.get(symbol) ?? 0;
     return this.buildOrder(symbol, "BUY", 0, false, orderId, avgPrice);
@@ -1989,3 +1997,118 @@ describe("SingleSymbolLaneExecutor — own-lot P&L attribution", () => {
     expect(executor.getStatus().totalNetPnlUsd).toBeCloseTo(-100.05, 9);
   });
 });
+
+describe("[SS-PENDING] an entry order that filled while the process was down", () => {
+    // Before 2026-08-18 the resting order's id lived only in a local variable inside
+    // placeEntryMakerFirst. A restart inside the 120s post-only window lost it: the order stayed
+    // REAL on the exchange, and a later fill became a live position with no stop and no tracking.
+    const pending = (clientOrderId: string) => ({
+      clientOrderId, symbol: "BTCUSDT", direction: "SHORT" as const, qty: 0.01,
+      // Fresh: a recovered position whose maxHold already elapsed is CORRECTLY closed on the same
+      // tick, so a stale timestamp here would measure the max-hold path instead of adoption.
+      placedAt: new Date().toISOString(), sourceObservationId: "obs-1",
+      stopPrice: 61000, targetPrice: 58000, maxHoldMs: 3_600_000,
+    });
+    const restart = (dir: string, file: string, client: FakeClient) =>
+      new SingleSymbolLaneExecutor({
+        client, store: new SingleSymbolLaneExecutorStore(dir, file),
+        laneId: "SHORT_FADE_EXHAUSTION_CROWDED", direction: "SHORT",
+        getOpenSignals: () => [],
+        exitPolicy: makeFixedRewardExitPolicy({ rewardMultiple: 0.5, maxHoldMs: 48 * 3_600_000 }),
+        isAllowed: () => false,
+      });
+
+    it("is ADOPTED as a tracked position and stopped, instead of staying invisible", async () => {
+      const dir = tmpDir(), file = "pending-fill.json";
+      const s1 = new SingleSymbolLaneExecutorStore(dir, file);
+      s1.addPendingMakerEntry(pending("ssle-abc-e"));   // process dies here
+
+      const client = new FakeClient();
+      // Mark == entry: no PnL, so the exit policy cannot legitimately close it this same tick and
+      // the assertion below measures ADOPTION rather than the exit path.
+      client.markPriceBySymbol.set("BTCUSDT", 60500);
+      // The exchange must also REPORT the position, otherwise monitorOpenPositions correctly
+      // reconciles the freshly adopted row away as a position that is not really there.
+      client.positionAmtBySymbol.set("BTCUSDT", -0.01);
+      client.byClientId.set("ssle-abc-e", {
+        orderId: "777", symbol: "BTCUSDT", side: "SELL", status: "FILLED",
+        executedQty: 0.01, avgPrice: 60500, price: 60500, clientOrderId: "ssle-abc-e",
+      } as unknown as FuturesOrder);
+
+      const ex = restart(dir, file, client);
+      await ex.tick();
+
+      const st = new SingleSymbolLaneExecutorStore(dir, file).getState();
+      const pos = st.positions.find((p) => p.entryOrderId === "777");
+      expect(pos, "the filled order must become a tracked position").toBeTruthy();
+      expect(pos!.status).toBe("OPEN");
+      expect(pos!.qty).toBe(0.01);
+      expect(pos!.stopPrice).toBe(61000);   // carried from the pending record, not invented
+      expect(st.pendingMakerEntries ?? []).toHaveLength(0); // handle consumed
+      expect(client.algosPlaced.length, "a recovered position must be STOPPED").toBeGreaterThan(0);
+    });
+
+    it("is RECORDED before the order is sent, and SURVIVES an ambiguous failure", async () => {
+      // The scenario the whole mechanism exists for. placeOrder times out: we do not know whether
+      // the order reached the book. The handle must already be on disk, and must NOT be dropped —
+      // only an unambiguous in-band rejection proves no order exists.
+      const client = new FakeClient();
+      client.markPriceBySymbol.set("BTCUSDT", 60000);
+      client.placeOrder = async () => {
+        throw new BinanceFuturesPrivateError("timeout", "request timed out after 10000ms");
+      };
+      const { executor, store } = makeExecutor({ client, signals: [signal()], legUsd: 1_000 });
+      await executor.tick();
+      const pending = store.getState().pendingMakerEntries ?? [];
+      expect(pending, "an ambiguous placement must leave a searchable handle").toHaveLength(1);
+      expect(pending[0]!.symbol).toBe("BTCUSDT");
+      expect(pending[0]!.stopPrice).toBe(61800); // carried from the signal, ready to stop a fill
+    });
+
+    it("DROPS the handle when Binance explicitly rejects the order in-band", async () => {
+      // The mirror case: Binance answered "no", so no order exists and the handle is noise.
+      const client = new FakeClient();
+      client.markPriceBySymbol.set("BTCUSDT", 60000);
+      client.placeOrder = async () => {
+        throw new BinanceFuturesPrivateError("binance_error", "Margin is insufficient.", { binanceCode: -2019 });
+      };
+      const { executor, store } = makeExecutor({ client, signals: [signal()], legUsd: 1_000 });
+      await executor.tick();
+      expect(store.getState().pendingMakerEntries ?? []).toHaveLength(0);
+    });
+
+    it("drops the handle when Binance proves the order never existed (-2013)", async () => {
+      const dir = tmpDir(), file = "pending-absent.json";
+      new SingleSymbolLaneExecutorStore(dir, file).addPendingMakerEntry(pending("ssle-gone-e"));
+      const client = new FakeClient(); // byClientId empty -> throws -2013
+      await restart(dir, file, client).tick();
+      const st = new SingleSymbolLaneExecutorStore(dir, file).getState();
+      expect(st.pendingMakerEntries ?? []).toHaveLength(0);
+      expect(st.positions).toHaveLength(0); // nothing invented
+    });
+
+    it("KEEPS the handle when the answer is ambiguous — never guesses the order away", async () => {
+      const dir = tmpDir(), file = "pending-unknown.json";
+      new SingleSymbolLaneExecutorStore(dir, file).addPendingMakerEntry(pending("ssle-wait-e"));
+      const client = new FakeClient();
+      client.queryOrderByClientId = async () => { throw new Error("network down"); };
+      await restart(dir, file, client).tick();
+      const st = new SingleSymbolLaneExecutorStore(dir, file).getState();
+      expect(st.pendingMakerEntries ?? []).toHaveLength(1); // still pending, retried next tick
+      expect(st.positions).toHaveLength(0);
+    });
+
+    it("keeps the handle while the order is still RESTING with nothing filled", async () => {
+      const dir = tmpDir(), file = "pending-resting.json";
+      new SingleSymbolLaneExecutorStore(dir, file).addPendingMakerEntry(pending("ssle-rest-e"));
+      const client = new FakeClient();
+      client.byClientId.set("ssle-rest-e", {
+        orderId: "888", symbol: "BTCUSDT", side: "SELL", status: "NEW",
+        executedQty: 0, avgPrice: 0, price: 60500, clientOrderId: "ssle-rest-e",
+      } as unknown as FuturesOrder);
+      await restart(dir, file, client).tick();
+      const st = new SingleSymbolLaneExecutorStore(dir, file).getState();
+      expect(st.pendingMakerEntries ?? []).toHaveLength(1);
+      expect(st.positions).toHaveLength(0);
+    });
+  });
