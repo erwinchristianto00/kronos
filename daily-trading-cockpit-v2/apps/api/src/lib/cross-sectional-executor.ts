@@ -441,6 +441,24 @@ const TP_DISABLED = () => process.env.CROSS_SECTIONAL_EXEC_TP_DISABLED === "1";
  *  -1.50%. The paired t against hold-to-horizon is +1.96 — just under the bar, so this is a
  *  promising-not-proven change, and the reason it is a switch rather than a default. The same sweep
  *  showed EVERY take-profit and every trailing-giveback variant losing, so no TP ships with it. */
+/** Caps how long the executor holds a basket, INDEPENDENTLY of the signal horizon. 0 / unset = off,
+ *  so the basket runs to closesAtMs exactly as it does today.
+ *
+ *  Why a separate key instead of lowering CROSS_SECTIONAL_HORIZON_BARS: that constant also sets the
+ *  SHADOW observation horizon, and the signal name encodes MOMENTUM bars, not horizon bars — so
+ *  dropping it 48 -> 36 would silently mix 48h and 36h observations under one unchanged
+ *  "MOM36_FILTERED" label with nothing to tell them apart afterwards. That is the same cohort trap
+ *  MOM24 -> MOM36 sprang this morning, only invisible. This key leaves the MEASUREMENT at 48h and
+ *  moves only the TRADE.
+ *
+ *  Measured 2026-08-18 on 364 non-overlapping blocks: per-basket return at 36h is statistically
+ *  identical to 48h (paired t = +0.03) — nothing is given up — but the slot frees 12h earlier, worth
+ *  +35% per unit time (2.593%/month -> 3.495%/month at one basket per horizon). 32h-38h is a broad
+ *  plateau rather than a single lucky point, which is the main reason this is worth shipping at all. */
+const EXEC_MAX_HOLD_MS = () => {
+  const n = Number.parseFloat(process.env.CROSS_SECTIONAL_EXEC_MAX_HOLD_HOURS ?? "");
+  return Number.isFinite(n) && n > 0 ? n * 3_600_000 : 0;
+};
 const EXEC_STOP_NET_RETURN = () => {
   const n = Number.parseFloat(process.env.CROSS_SECTIONAL_EXEC_STOP_NET_RETURN ?? "");
   return Number.isFinite(n) && n > 0 ? n : 0;
@@ -3076,7 +3094,15 @@ export class CrossSectionalExecutor {
       // finish or abort it; if it's genuinely stuck (e.g. persistently INCONCLUSIVE reconciliation),
       // it now stays visibly incomplete past its horizon instead of being silently mis-closed.
       if (basket.status !== "COMPLETE") continue;
-      if (nowMs < basket.closesAtMs) continue;
+      // 2026-08-18: instance-level hold cap that may fire BEFORE the signal's own horizon. Read from
+      // the env and this tick's clock, never from a field stamped at entry, so switching it on binds
+      // on baskets that are already open.
+      const holdCapMs = EXEC_MAX_HOLD_MS();
+      const openedMs = Date.parse(basket.openedAt);
+      const cappedDue = holdCapMs > 0 && Number.isFinite(openedMs)
+        ? Math.min(basket.closesAtMs, openedMs + holdCapMs)
+        : basket.closesAtMs;
+      if (nowMs < cappedDue) continue;
       // 2026-07-19 real-money audit fix (BUG 2): same per-basket isolation as
       // closeBasketsHittingProfitTarget above — one basket's HORIZON close failing must not block
       // every OTHER due basket from being closed this tick.

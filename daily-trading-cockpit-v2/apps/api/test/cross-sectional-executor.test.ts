@@ -5005,3 +5005,68 @@ describe("[EXEC STOP] CROSS_SECTIONAL_EXEC_STOP_NET_RETURN", () => {
     expect(b.status).not.toBe("CLOSED");
   });
 });
+
+
+describe("[EXEC HOLD CAP] CROSS_SECTIONAL_EXEC_MAX_HOLD_HOURS", () => {
+  // Basket whose signal horizon is still 48h away — only the instance-level cap can close it.
+  // Stamped with no cap of its own, i.e. what a basket opened before the switch existed looks like.
+  function longHorizon(basketId: string, openedAgoHours: number): ExecutorBasket {
+    return {
+      basketId,
+      sourceObservationId: `manual:${basketId}`,
+      signal: "MOM36_FILTERED",
+      variant: "FILTERED",
+      openedAt: new Date(NOW_MS - openedAgoHours * 3_600_000).toISOString(),
+      closesAtMs: NOW_MS - openedAgoHours * 3_600_000 + 48 * 3_600_000,
+      legs: [
+        { symbol: "AAAUSDT", side: "LONG", qty: 10, entryPrice: 100, entryOrderId: `e1-${basketId}`,
+          entryPriceConfirmed: true, exitPrice: null, exitOrderId: null, exitPriceConfirmed: null },
+        { symbol: "BBBUSDT", side: "SHORT", qty: 10, entryPrice: 100, entryOrderId: `e2-${basketId}`,
+          entryPriceConfirmed: true, exitPrice: null, exitOrderId: null, exitPriceConfirmed: null },
+      ],
+      status: "COMPLETE",
+      closedAt: null, closeReason: null, grossPnlUsd: null, feeEstimateUsd: null, netPnlUsd: null,
+    } as ExecutorBasket;
+  }
+  const run = async (cap: string | undefined, agoHours: number) => {
+    const prev = process.env.CROSS_SECTIONAL_EXEC_MAX_HOLD_HOURS;
+    if (cap === undefined) delete process.env.CROSS_SECTIONAL_EXEC_MAX_HOLD_HOURS;
+    else process.env.CROSS_SECTIONAL_EXEC_MAX_HOLD_HOURS = cap;
+    try {
+      const client = new FakeExecClient();
+      for (const s of ["AAAUSDT", "BBBUSDT"]) {
+        client.markPriceBySymbol.set(s, 100);
+        client.fillPriceBySymbol.set(s, 100);
+      }
+      const { executor, store } = makeExecutor({ client });
+      store.getState().baskets.push(longHorizon("xb-cap", agoHours));
+      store.save();
+      await executor.tick();
+      return store.getState().baskets.find((b) => b.basketId === "xb-cap")!;
+    } finally {
+      if (prev === undefined) delete process.env.CROSS_SECTIONAL_EXEC_MAX_HOLD_HOURS;
+      else process.env.CROSS_SECTIONAL_EXEC_MAX_HOLD_HOURS = prev;
+    }
+  };
+
+  it("unset leaves the basket running to its own 48h horizon", async () => {
+    const b = await run(undefined, 40);
+    expect(b.status).not.toBe("CLOSED");
+  });
+
+  it("closes once the basket is older than the cap, well before its horizon", async () => {
+    const b = await run("36", 40);
+    expect(b.status).toBe("CLOSED");
+    expect(b.closeReason).toBe("HORIZON");
+  });
+
+  it("leaves a basket younger than the cap alone", async () => {
+    const b = await run("36", 20);
+    expect(b.status).not.toBe("CLOSED");
+  });
+
+  it("never EXTENDS a basket past its own horizon when the cap is larger", async () => {
+    const b = await run("72", 50);   // horizon already passed at 48h; cap of 72h must not rescue it
+    expect(b.status).toBe("CLOSED");
+  });
+});
