@@ -433,6 +433,18 @@ const USER_TRADES_PAGE_LIMIT = 1000;
  * relies on, so the comparison site needs no new branch.
  */
 const TP_DISABLED = () => process.env.CROSS_SECTIONAL_EXEC_TP_DISABLED === "1";
+/** Basket-level stop as a NET return, after the SAME cost model the TP check uses. 0 / unset = off,
+ *  so an instance that never sets it keeps today's hold-to-horizon behaviour exactly.
+ *
+ *  Measured 2026-08-18 on 363 non-overlapping 48h blocks rebuilt from 2y of hourly Binance klines:
+ *  a 1.5% stop lifted mean/block from +0.2102% to +0.3305% and cut the WORST block from -9.27% to
+ *  -1.50%. The paired t against hold-to-horizon is +1.96 — just under the bar, so this is a
+ *  promising-not-proven change, and the reason it is a switch rather than a default. The same sweep
+ *  showed EVERY take-profit and every trailing-giveback variant losing, so no TP ships with it. */
+const EXEC_STOP_NET_RETURN = () => {
+  const n = Number.parseFloat(process.env.CROSS_SECTIONAL_EXEC_STOP_NET_RETURN ?? "");
+  return Number.isFinite(n) && n > 0 ? n : 0;
+};
 const TP_NET_RETURN = () => {
   if (TP_DISABLED()) return Number.POSITIVE_INFINITY;
   const n = Number.parseFloat(process.env.CROSS_SECTIONAL_EXEC_TP_NET_RETURN ?? "");
@@ -2964,6 +2976,22 @@ export class CrossSectionalExecutor {
           await this.closeBasket(basket, smartExit);
         } catch (error) {
           this.lastError = (error as Error).message ?? "smart basket close failed";
+        }
+        continue;
+      }
+      // 2026-08-18 (operator: "gw mau ini berlaku juga untuk basket yang lagi open"): the stop is
+      // evaluated from THIS tick's netReturn and the env, never from a field stamped at entry, so
+      // switching it on takes effect on baskets that are already open. It is deliberately not gated
+      // on respectSignalRiskGeometry — that flag governs the SIGNAL's own geometry, and this is an
+      // instance-level risk limit that has to hold whether or not a signal supplied one. Checked
+      // before the take-profit branch: at a loss deep enough to stop, no TP threshold can also be
+      // true, and ordering it first keeps the loss path independent of TP configuration.
+      const execStop = EXEC_STOP_NET_RETURN();
+      if (execStop > 0 && netReturn <= -execStop) {
+        try {
+          await this.closeBasket(basket, "EXEC_STOP");
+        } catch (error) {
+          this.lastError = (error as Error).message ?? "exec-stop close failed";
         }
         continue;
       }

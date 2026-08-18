@@ -4944,3 +4944,64 @@ describe("cross-sectional-executor — pre-open netting guard (2026-08-15)", () 
     expect(executor.getStatus().openHalted).toContain("SOLUSDT");
   });
 });
+
+describe("[EXEC STOP] CROSS_SECTIONAL_EXEC_STOP_NET_RETURN", () => {
+  // A two-leg basket stamped with NO stopLossReturn and NO takeProfitReturn — i.e. exactly what a
+  // basket that was already open before this switch existed looks like on disk. The stop has to
+  // bind on it anyway, which is the behaviour the operator asked for.
+  function lossBasket(basketId: string): ExecutorBasket {
+    return {
+      basketId,
+      sourceObservationId: `manual:${basketId}`,
+      signal: "MOM36_FILTERED",
+      variant: "FILTERED",
+      openedAt: NOW,
+      closesAtMs: NOW_MS + 48 * 3_600_000,   // horizon far away: only the stop can close this
+      legs: [
+        { symbol: "AAAUSDT", side: "LONG", qty: 10, entryPrice: 100, entryOrderId: `e1-${basketId}`,
+          entryPriceConfirmed: true, exitPrice: null, exitOrderId: null, exitPriceConfirmed: null },
+        { symbol: "BBBUSDT", side: "SHORT", qty: 10, entryPrice: 100, entryOrderId: `e2-${basketId}`,
+          entryPriceConfirmed: true, exitPrice: null, exitOrderId: null, exitPriceConfirmed: null },
+      ],
+      status: "COMPLETE",
+      closedAt: null, closeReason: null, grossPnlUsd: null, feeEstimateUsd: null, netPnlUsd: null,
+    } as ExecutorBasket;
+  }
+
+  const run = async (stop: string | undefined, longMark: number) => {
+    const prev = process.env.CROSS_SECTIONAL_EXEC_STOP_NET_RETURN;
+    if (stop === undefined) delete process.env.CROSS_SECTIONAL_EXEC_STOP_NET_RETURN;
+    else process.env.CROSS_SECTIONAL_EXEC_STOP_NET_RETURN = stop;
+    try {
+      const client = new FakeExecClient();
+      client.markPriceBySymbol.set("AAAUSDT", longMark);   // long leg moves against us
+      client.markPriceBySymbol.set("BBBUSDT", 100);        // short leg flat
+      client.fillPriceBySymbol.set("AAAUSDT", longMark);
+      client.fillPriceBySymbol.set("BBBUSDT", 100);
+      const { executor, store } = makeExecutor({ client });
+      store.getState().baskets.push(lossBasket("xb-stop"));
+      store.save();
+      await executor.tick();
+      return store.getState().baskets.find((b) => b.basketId === "xb-stop")!;
+    } finally {
+      if (prev === undefined) delete process.env.CROSS_SECTIONAL_EXEC_STOP_NET_RETURN;
+      else process.env.CROSS_SECTIONAL_EXEC_STOP_NET_RETURN = prev;
+    }
+  };
+
+  it("unset leaves hold-to-horizon exactly as it is, even at a deep loss", async () => {
+    const b = await run(undefined, 90);          // long -10% => net ~ -5.1%
+    expect(b.status).not.toBe("CLOSED");
+  });
+
+  it("closes with EXEC_STOP once the NET return breaches the level", async () => {
+    const b = await run("0.015", 90);            // net ~ -5.1%, well past 1.5%
+    expect(b.status).toBe("CLOSED");
+    expect(b.closeReason).toBe("EXEC_STOP");
+  });
+
+  it("leaves a basket that has not breached the level alone", async () => {
+    const b = await run("0.015", 99.6);          // long -0.4% => net ~ -0.32%
+    expect(b.status).not.toBe("CLOSED");
+  });
+});
