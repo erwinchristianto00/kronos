@@ -15,6 +15,7 @@ import { dirname, resolve } from "node:path";
 
 import { clusterOf, isMajorCluster } from "./correlation-clusters.js";
 import { recordRejectedBasket } from "./rejected-basket-recorder.js";
+import { evaluateMarketStandDown, standDownThresholdPct } from "./market-drawdown-standdown.js";
 
 function envNumPos(key: string, fallback: number): number {
   const v = Number(process.env[key]);
@@ -1836,6 +1837,9 @@ export function _resetCrossSectionalStoreForTests(): void {
 // ─── cycle ─────────────────────────────────────────────────────────────────
 
 export interface CrossSectionalCycleResult {
+  /** True when the 14d drawdown gate skipped basket formation this cycle. */
+  standDown?: boolean;
+  standDownMarketReturn?: number | null;
   opened: number;
   openedRaw?: number;
   openedFiltered?: number;
@@ -1976,7 +1980,24 @@ export async function runCrossSectionalCycle(opts: {
       // which might duplicate a losing open leg before the executor gets a second chance to stop it.
       dynamicBlocks = { longBlocklist: [...longAllow], shortBlocklist: [...shortAllow] };
     }
-    const basket = liquidityStarved ? null : buildFilteredCrossSectionalBasket(adaptiveRanked, {
+    // 2026-08-18: stand down while the universe sits in a deep multi-week drawdown. Measured over
+    // 2 years, the lane returns -0.71%/basket in the bottom decile of trailing 14d market return
+    // and +0.22% everywhere else, and that sign held in EVERY year — the only regime result in the
+    // whole sweep that did. Disabled unless CROSS_SECTIONAL_STAND_DOWN_14D_PCT is set negative, and
+    // it FAILS OPEN on a measurement problem: a short candle history must never look like a calm
+    // market's opposite and silently halt the lane.
+    const standDown = evaluateMarketStandDown(
+      Object.fromEntries(Object.entries(candlesBySymbol).map(([sym, cs]) => [sym, cs.map((c) => c.close)])),
+      standDownThresholdPct(),
+    );
+    if (standDown.standDown) {
+      // Logged, never silent: a gate that skips without a trace is the exact class of defect the
+      // rejected-basket recorder was added for on 2026-08-17.
+      console.error(`[cross-sectional] STAND-DOWN: ${standDown.reason} (${standDown.measuredSymbols} symbols measured)`);
+      result.standDown = true;
+      result.standDownMarketReturn = standDown.marketReturn;
+    }
+    const basket = (liquidityStarved || standDown.standDown) ? null : buildFilteredCrossSectionalBasket(adaptiveRanked, {
       k: CROSS_SECTIONAL_K,
       longK: skew?.longK,
       shortK: skew?.shortK,

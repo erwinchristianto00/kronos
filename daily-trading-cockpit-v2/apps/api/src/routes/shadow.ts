@@ -367,6 +367,7 @@ import {
   type CurrentGuardVariantMatrixReport,
   type KlineTuple as VariantMatrixKlineTuple,
 } from "../lib/current-guard-variant-matrix.js";
+import { standDownThresholdPct, STAND_DOWN_LOOKBACK_BARS } from "../lib/market-drawdown-standdown.js";
 import {
   getCrossSectionalStore,
   getCrossSectionalReportSinceMs,
@@ -2950,6 +2951,11 @@ export async function registerShadowRoutes(
                 Math.max(
                   CROSS_SECTIONAL_MOMENTUM_BARS + 5,
                   CROSS_SECTIONAL_LIQUIDITY_FLOOR_USD_PER_HOUR > 0 ? CROSS_SECTIONAL_LIQUIDITY_LOOKBACK_BARS : 0,
+                  // 2026-08-18: the 14d stand-down gate needs 336 bars. Deepened ONLY when that gate
+                  // is armed, so the default fetch stays exactly what it was — and asking for a
+                  // lookback longer than what is fetched is precisely the silent starvation recorded
+                  // on 2026-08-12 (see CROSS_SECTIONAL_LIQUIDITY_LOOKBACK_BARS' own comment).
+                  standDownThresholdPct() < 0 ? STAND_DOWN_LOOKBACK_BARS + 1 : 0,
                 ),
               ),
           }).catch(() => undefined);
